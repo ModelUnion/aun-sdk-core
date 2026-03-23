@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aun-sdk-core"
+version = "0.1.0"
+description = "AUN Protocol Core SDK — 连接、认证、密钥管理、E2EE"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.10",
+    "cryptography>=43.0",
+    "websockets>=15.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
