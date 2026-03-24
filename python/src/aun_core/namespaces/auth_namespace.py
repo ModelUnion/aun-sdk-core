@@ -17,12 +17,12 @@ class AuthNamespace:
         well_known_url = params.get("well_known_url")
         if well_known_url:
             return await self._client._discovery.discover(str(well_known_url))
-        # 尝试从 AID 的 issuer 域名推导 well-known URL
-        # AID 格式: name.issuer（如 alice.aid.com，issuer = aid.com）
+        # 尝试从 AID 推导 well-known URL
+        # AID 格式: name.issuer（如 alice.aid.com）
+        # Well-Known URL: https://{aid}/.well-known/aun-gateway
         aid = params.get("aid") or self._client._aid
-        if aid and "." in aid:
-            issuer = aid.split(".", 1)[1]
-            url = f"https://{issuer}/.well-known/aun-gateway"
+        if aid:
+            url = f"https://{aid}/.well-known/aun-gateway"
             return await self._client._discovery.discover(url)
         raise ValidationError(
             "authenticate/create_aid requires 'gateway' or 'well_known_url' in params"

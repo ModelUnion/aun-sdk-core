@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aun-sdk-core"
+name = "aun-core"
 version = "0.1.0"
 description = "AUN Protocol Core SDK — 连接、认证、密钥管理、E2EE"
 requires-python = ">=3.11"
