@@ -269,6 +269,7 @@ class AuthFlow:
             return existing
         identity = self._crypto.generate_identity()
         identity["aid"] = aid
+        self._keystore.save_identity(aid, identity)  # 立即持久化 keypair，避免服务端拒绝后丢失
         self._aid = aid
         return identity
 
