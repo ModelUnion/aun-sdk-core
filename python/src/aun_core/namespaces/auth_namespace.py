@@ -9,30 +9,28 @@ class AuthNamespace:
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    async def _resolve_gateway(self, params: dict[str, Any]) -> str:
-        """从 params 获取 gateway，或通过 well_known_url 发现。"""
-        gateway = params.get("gateway")
-        if gateway:
-            return str(gateway)
-        well_known_url = params.get("well_known_url")
-        if well_known_url:
-            return await self._client._discovery.discover(str(well_known_url))
-        # 尝试从 AID 推导 well-known URL
-        # AID 格式: name.issuer（如 alice.aid.com）
-        # Well-Known URL: https://{aid}/.well-known/aun-gateway
-        aid = params.get("aid") or self._client._aid
-        if aid:
-            url = f"https://{aid}/.well-known/aun-gateway"
+    async def _resolve_gateway(self, aid: str | None = None) -> str:
+        """解析 gateway URL。优先使用已预置的 _gateway_url，否则基于 AID 自动发现。
+
+        本方法不接受外部 gateway 参数。本地开发时应预置 client._gateway_url
+        以跳过 DNS 发现。
+        """
+        if self._client._gateway_url:
+            return str(self._client._gateway_url)
+        resolved_aid = aid or self._client._aid
+        if resolved_aid:
+            url = f"https://{resolved_aid}/.well-known/aun-gateway"
             return await self._client._discovery.discover(url)
         raise ValidationError(
-            "authenticate/create_aid requires 'gateway' or 'well_known_url' in params"
+            "unable to resolve gateway: set client._gateway_url or provide 'aid' for auto-discovery"
         )
 
     async def create_aid(self, params: dict[str, Any]) -> dict[str, Any]:
         aid = str((params or {}).get("aid") or "")
         if not aid:
             raise ValueError("auth.create_aid requires 'aid'")
-        gateway_url = await self._resolve_gateway(params)
+        gateway_url = await self._resolve_gateway(aid)
+        self._client._gateway_url = gateway_url
         result = await self._client._auth.create_aid(gateway_url, aid)
         self._client._aid = result["aid"]
         self._client._identity = self._client._auth.load_identity_or_none(result["aid"])
@@ -45,7 +43,8 @@ class AuthNamespace:
     async def authenticate(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
         request = dict(params or {})
         aid = request.get("aid")
-        gateway_url = await self._resolve_gateway(request)
+        gateway_url = await self._resolve_gateway(aid)
+        self._client._gateway_url = gateway_url
         result = await self._client._auth.authenticate(gateway_url, aid=aid)
         self._client._aid = result["aid"]
         self._client._identity = self._client._auth.load_identity_or_none(result["aid"])

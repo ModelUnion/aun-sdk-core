@@ -87,6 +87,7 @@ class AUNClient:
             crypto=raw_config.get("crypto") or CryptoProvider(),
             aid=None,
             connection_factory=connection_factory,
+            root_ca_path=raw_config.get("root_ca_path"),
         )
         self._transport = RPCTransport(
             event_dispatcher=self._dispatcher,
@@ -365,7 +366,7 @@ class AUNClient:
         access_token = str(request.get("access_token") or "")
         if not access_token:
             raise StateError("connect requires non-empty access_token")
-        gateway = str(request.get("gateway") or "")
+        gateway = str(request.get("gateway") or self._gateway_url or "")
         if not gateway:
             raise StateError("connect requires non-empty gateway")
         request["access_token"] = access_token

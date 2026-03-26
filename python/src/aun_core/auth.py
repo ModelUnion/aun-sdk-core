@@ -1,15 +1,38 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import secrets
 import time
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
+import aiohttp
 import websockets
+from cryptography import x509
+from cryptography.x509 import ocsp
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from .crypto import CryptoProvider
-from .errors import AuthError, StateError, ValidationError, map_remote_error
+from .errors import AuthError, StateError, ValidationError, map_remote_error, AUNError
 from .keystore.file import FileKeyStore
+
+
+def _verify_signature(public_key: Any, sig_bytes: bytes, data_bytes: bytes) -> None:
+    if isinstance(public_key, ed25519.Ed25519PublicKey):
+        public_key.verify(sig_bytes, data_bytes)
+        return
+    if isinstance(public_key, ec.EllipticCurvePublicKey):
+        if isinstance(public_key.curve, ec.SECP384R1):
+            public_key.verify(sig_bytes, data_bytes, ec.ECDSA(hashes.SHA384()))
+        else:
+            public_key.verify(sig_bytes, data_bytes, ec.ECDSA(hashes.SHA256()))
+        return
+    raise AuthError(f"unsupported identity public key type: {type(public_key)!r}")
 
 
 class AuthFlow:
@@ -20,11 +43,17 @@ class AuthFlow:
         crypto: CryptoProvider,
         aid: str | None = None,
         connection_factory=None,
+        root_ca_path: str | None = None,
     ) -> None:
         self._keystore = keystore
         self._crypto = crypto
         self._aid = aid
         self._connection_factory = connection_factory or self._default_connection_factory
+        self._root_ca_path = root_ca_path
+        self._root_certs = self._load_root_certs(root_ca_path)
+        self._gateway_chain_cache: dict[str, list[str]] = {}
+        self._gateway_crl_cache: dict[str, dict[str, Any]] = {}
+        self._gateway_ocsp_cache: dict[str, dict[str, dict[str, Any]]] = {}
 
     def load_identity(self, aid: str | None = None) -> dict[str, Any]:
         identity = self._load_identity_or_raise(aid)
@@ -51,16 +80,65 @@ class AuthFlow:
         identity = self._ensure_local_identity(aid)
         if identity.get("cert"):
             return {"aid": identity["aid"], "cert": identity["cert"]}
-        created = await self._create_aid(gateway_url, identity)
-        identity.update(created)
+
+        # 本地有密钥但无证书 — 可能是上次 create_aid 网络失败后的残留状态，
+        # 也可能是服务端已注册但本地证书丢失。两种情况都先尝试注册。
+        try:
+            created = await self._create_aid(gateway_url, identity)
+            identity.update(created)
+        except AUNError as e:
+            if "already exists" not in str(e):
+                raise
+            # AID 已在服务端注册，本地有密钥但证书丢失。
+            # 通过 HTTP PKI 端点下载已注册的证书，验证公钥匹配后恢复。
+            try:
+                identity = await self._recover_cert_via_download(gateway_url, identity)
+            except Exception:
+                raise StateError(
+                    f"AID {aid} already registered on server but local certificate is missing. "
+                    f"Certificate download recovery failed. Options: "
+                    f"(1) use a different AID name, or "
+                    f"(2) restart Kite server to clear registration."
+                ) from e
         self._keystore.save_identity(identity["aid"], identity)
         self._aid = identity["aid"]
         return {"aid": identity["aid"], "cert": identity["cert"]}
 
+    async def _recover_cert_via_download(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
+        """本地有密钥但无证书、服务端已注册 — 通过 PKI HTTP 端点下载证书恢复。"""
+        cert_url = self._gateway_http_url(gateway_url, f"/pki/cert/{identity['aid']}")
+        cert_pem = await self._fetch_text(cert_url)
+        if not cert_pem or "BEGIN CERTIFICATE" not in cert_pem:
+            raise AuthError(f"failed to download certificate for {identity['aid']}")
+
+        # 验证下载的证书公钥与本地密钥对匹配
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        cert_pub_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        local_pub_der = base64.b64decode(identity["public_key_der_b64"])
+        if cert_pub_der != local_pub_der:
+            raise AuthError(
+                f"downloaded certificate public key does not match local key pair for {identity['aid']}. "
+                f"The server has a different key registered — this AID cannot be recovered with the current key."
+            )
+
+        identity["cert"] = cert_pem
+        return identity
+
     async def authenticate(self, gateway_url: str, *, aid: str | None = None) -> dict[str, Any]:
         identity = self._load_identity_or_raise(aid)
         if not identity.get("cert"):
-            raise StateError("missing local certificate, call auth.create_aid() first")
+            # 本地有密钥但无证书 — 尝试从 PKI 下载恢复
+            try:
+                identity = await self._recover_cert_via_download(gateway_url, identity)
+                self._keystore.save_identity(identity["aid"], identity)
+            except Exception as e:
+                raise StateError(
+                    f"local certificate missing and recovery failed: {e}. "
+                    f"Run auth.create_aid() to register a new identity."
+                ) from e
         login = await self._login(gateway_url, identity)
         self._remember_tokens(identity, login)
         self._keystore.save_identity(identity["aid"], identity)
@@ -190,11 +268,13 @@ class AuthFlow:
         return {"cert": response["cert"]}
 
     async def _login(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
+        client_nonce = self._crypto.new_client_nonce()
         phase1 = await self._short_rpc(gateway_url, "auth.aid_login1", {
             "aid": identity["aid"],
             "cert": identity["cert"],
-            "client_nonce": self._crypto.new_client_nonce(),
+            "client_nonce": client_nonce,
         })
+        await self._verify_phase1_response(gateway_url, phase1, client_nonce)
         signature, client_time = self._crypto.sign_login_nonce(identity["private_key_pem"], phase1["nonce"])
         phase2 = await self._short_rpc(gateway_url, "auth.aid_login2", {
             "aid": identity["aid"],
@@ -236,6 +316,316 @@ class AuthFlow:
         if result.get("success") is False:
             raise AuthError(str(result.get("error", f"{method} failed")))
         return result
+
+    async def _verify_phase1_response(self, gateway_url: str, result: dict[str, Any], client_nonce: str) -> None:
+        identity_cert_pem = str(result.get("identity_cert") or "")
+        signature_b64 = str(result.get("client_nonce_signature") or "")
+        if not identity_cert_pem:
+            raise AuthError("aid_login1 missing identity_cert")
+        if not signature_b64:
+            raise AuthError("aid_login1 missing client_nonce_signature")
+
+        try:
+            identity_cert = x509.load_pem_x509_certificate(identity_cert_pem.encode("utf-8"))
+        except Exception as exc:
+            raise AuthError("aid_login1 returned invalid identity_cert") from exc
+
+        await self._verify_identity_cert_chain(gateway_url, identity_cert)
+        await self._verify_identity_cert_revocation(gateway_url, identity_cert)
+        await self._verify_identity_cert_ocsp(gateway_url, identity_cert)
+
+        try:
+            signature = base64.b64decode(signature_b64)
+            _verify_signature(identity_cert.public_key(), signature, client_nonce.encode("utf-8"))
+        except (ValueError, InvalidSignature, AuthError) as exc:
+            raise AuthError("aid_login1 server identity signature verification failed") from exc
+
+    async def _verify_identity_cert_chain(self, gateway_url: str, identity_cert: x509.Certificate) -> None:
+        now = time.time()
+        self._ensure_cert_time_valid(identity_cert, "identity certificate", now)
+
+        chain = await self._load_gateway_ca_chain(gateway_url)
+        if not chain:
+            raise AuthError("unable to verify identity certificate chain: missing CA chain")
+
+        current = identity_cert
+        for index, ca_cert in enumerate(chain):
+            self._ensure_cert_time_valid(ca_cert, f"CA certificate[{index}]", now)
+            if current.issuer != ca_cert.subject:
+                raise AuthError(f"identity certificate issuer mismatch at chain level {index}")
+            try:
+                _verify_signature(
+                    ca_cert.public_key(),
+                    current.signature,
+                    current.tbs_certificate_bytes,
+                )
+            except Exception as exc:
+                raise AuthError(f"identity certificate chain verification failed at level {index}") from exc
+            try:
+                constraints = ca_cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+            except x509.ExtensionNotFound as exc:
+                raise AuthError(f"CA certificate[{index}] missing BasicConstraints") from exc
+            if not constraints.ca:
+                raise AuthError(f"CA certificate[{index}] is not marked as CA")
+            current = ca_cert
+
+        root = chain[-1]
+        if root.issuer != root.subject:
+            raise AuthError("identity certificate chain root is not self-signed")
+        try:
+            _verify_signature(root.public_key(), root.signature, root.tbs_certificate_bytes)
+        except Exception as exc:
+            raise AuthError("identity certificate chain root self-signature verification failed") from exc
+
+        trusted_roots = self._load_trusted_roots()
+        root_der = root.public_bytes(serialization.Encoding.DER)
+        if not any(
+            trusted.public_bytes(serialization.Encoding.DER) == root_der
+            for trusted in trusted_roots
+        ):
+            raise AuthError("identity certificate chain is not anchored by a trusted root")
+
+    async def _load_gateway_ca_chain(self, gateway_url: str) -> list[x509.Certificate]:
+        cached = self._gateway_chain_cache.get(gateway_url)
+        if cached is None:
+            cached = await self._fetch_gateway_ca_chain(gateway_url)
+            self._gateway_chain_cache[gateway_url] = cached
+        return self._load_cert_bundle(cached)
+
+    async def _verify_identity_cert_revocation(self, gateway_url: str, identity_cert: x509.Certificate) -> None:
+        chain = await self._load_gateway_ca_chain(gateway_url)
+        if not chain:
+            raise AuthError("unable to verify identity certificate revocation: missing issuer certificate")
+        revoked_serials = await self._load_gateway_revoked_serials(gateway_url, chain[0])
+        serial_hex = format(identity_cert.serial_number, "x").lower()
+        if serial_hex in revoked_serials:
+            raise AuthError("identity certificate has been revoked")
+
+    async def _verify_identity_cert_ocsp(self, gateway_url: str, identity_cert: x509.Certificate) -> None:
+        chain = await self._load_gateway_ca_chain(gateway_url)
+        if not chain:
+            raise AuthError("unable to verify identity certificate OCSP status: missing issuer certificate")
+        status = await self._load_gateway_ocsp_status(gateway_url, identity_cert, chain[0])
+        if status == "revoked":
+            raise AuthError("identity certificate OCSP status is revoked")
+        if status != "good":
+            raise AuthError(f"identity certificate OCSP status is {status}")
+
+    async def _load_gateway_revoked_serials(
+        self,
+        gateway_url: str,
+        issuer_cert: x509.Certificate,
+    ) -> set[str]:
+        cached = self._gateway_crl_cache.get(gateway_url)
+        now = time.time()
+        if cached is None or float(cached.get("next_refresh_at") or 0.0) <= now:
+            cached = await self._fetch_gateway_crl(gateway_url, issuer_cert)
+            self._gateway_crl_cache[gateway_url] = cached
+        return set(cached.get("revoked_serials") or [])
+
+    async def _load_gateway_ocsp_status(
+        self,
+        gateway_url: str,
+        identity_cert: x509.Certificate,
+        issuer_cert: x509.Certificate,
+    ) -> str:
+        serial_hex = format(identity_cert.serial_number, "x").lower()
+        gateway_cache = self._gateway_ocsp_cache.setdefault(gateway_url, {})
+        cached = gateway_cache.get(serial_hex)
+        now = time.time()
+        if cached is None or float(cached.get("next_refresh_at") or 0.0) <= now:
+            cached = await self._fetch_gateway_ocsp_status(gateway_url, identity_cert, issuer_cert)
+            gateway_cache[serial_hex] = cached
+        return str(cached.get("status") or "unknown")
+
+    def _load_trusted_roots(self) -> list[x509.Certificate]:
+        if not self._root_certs:
+            raise AuthError("no trusted roots available for identity certificate verification")
+        return self._root_certs
+
+    async def _fetch_gateway_ca_chain(self, gateway_url: str) -> list[str]:
+        url = self._gateway_http_url(gateway_url, "/pki/chain")
+        text = await self._fetch_text(url)
+        return self._split_pem_bundle(text)
+
+    async def _fetch_gateway_crl(
+        self,
+        gateway_url: str,
+        issuer_cert: x509.Certificate,
+    ) -> dict[str, Any]:
+        url = self._gateway_http_url(gateway_url, "/pki/crl.json")
+        payload = await self._fetch_json(url)
+        crl_pem = str(payload.get("crl_pem") or "")
+        if not crl_pem:
+            raise AuthError("gateway CRL endpoint returned no signed CRL")
+        try:
+            crl = x509.load_pem_x509_crl(crl_pem.encode("utf-8"))
+        except Exception as exc:
+            raise AuthError("gateway CRL endpoint returned invalid CRL") from exc
+        try:
+            _verify_signature(
+                issuer_cert.public_key(),
+                crl.signature,
+                crl.tbs_certlist_bytes,
+            )
+        except Exception as exc:
+            raise AuthError("gateway CRL signature verification failed") from exc
+
+        if crl.next_update_utc and time.time() > crl.next_update_utc.timestamp():
+            raise AuthError("gateway CRL has expired")
+
+        revoked_serials = {
+            format(revoked.serial_number, "x").lower()
+            for revoked in crl
+        }
+        next_refresh_at = crl.next_update_utc.timestamp() if crl.next_update_utc else time.time() + 300
+        return {
+            "revoked_serials": revoked_serials,
+            "next_refresh_at": next_refresh_at,
+        }
+
+    async def _fetch_gateway_ocsp_status(
+        self,
+        gateway_url: str,
+        identity_cert: x509.Certificate,
+        issuer_cert: x509.Certificate,
+    ) -> dict[str, Any]:
+        serial_hex = format(identity_cert.serial_number, "x").lower()
+        url = self._gateway_http_url(gateway_url, f"/pki/ocsp/{serial_hex}")
+        payload = await self._fetch_json(url)
+        status = str(payload.get("status") or "")
+        ocsp_b64 = str(payload.get("ocsp_response") or "")
+        if not ocsp_b64:
+            raise AuthError("gateway OCSP endpoint returned no ocsp_response")
+        try:
+            response = ocsp.load_der_ocsp_response(base64.b64decode(ocsp_b64))
+        except Exception as exc:
+            raise AuthError("gateway OCSP endpoint returned invalid OCSP response") from exc
+
+        if response.response_status is not ocsp.OCSPResponseStatus.SUCCESSFUL:
+            raise AuthError(f"gateway OCSP response status is {response.response_status.name.lower()}")
+        if response.serial_number != identity_cert.serial_number:
+            raise AuthError("gateway OCSP response serial mismatch")
+        expected_issuer_name_hash = hashlib.sha256(issuer_cert.subject.public_bytes()).digest()
+        expected_issuer_key_hash = hashlib.sha256(
+            issuer_cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).digest()
+        if response.issuer_name_hash != expected_issuer_name_hash:
+            raise AuthError("gateway OCSP issuer name hash mismatch")
+        if response.issuer_key_hash != expected_issuer_key_hash:
+            raise AuthError("gateway OCSP issuer key hash mismatch")
+        try:
+            _verify_signature(
+                issuer_cert.public_key(),
+                response.signature,
+                response.tbs_response_bytes,
+            )
+        except Exception as exc:
+            raise AuthError("gateway OCSP signature verification failed") from exc
+
+        now = time.time()
+        if response.this_update_utc and now < response.this_update_utc.timestamp() - 300:
+            raise AuthError("gateway OCSP response is not yet valid")
+        if response.next_update_utc and now > response.next_update_utc.timestamp():
+            raise AuthError("gateway OCSP response has expired")
+
+        cert_status = response.certificate_status
+        if cert_status == ocsp.OCSPCertStatus.GOOD:
+            effective_status = "good"
+        elif cert_status == ocsp.OCSPCertStatus.REVOKED:
+            effective_status = "revoked"
+        else:
+            effective_status = "unknown"
+        if status and status != effective_status:
+            raise AuthError("gateway OCSP status mismatch")
+
+        next_refresh_at = response.next_update_utc.timestamp() if response.next_update_utc else time.time() + 300
+        return {
+            "status": effective_status,
+            "next_refresh_at": next_refresh_at,
+        }
+
+    async def _fetch_text(self, url: str) -> str:
+        try:
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    return await response.text()
+        except Exception as exc:
+            raise AuthError(f"failed to fetch {url}") from exc
+
+    async def _fetch_json(self, url: str) -> dict[str, Any]:
+        try:
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+        except Exception as exc:
+            raise AuthError(f"failed to fetch {url}") from exc
+        if not isinstance(payload, dict):
+            raise AuthError(f"invalid JSON payload from {url}")
+        return payload
+
+    @staticmethod
+    def _gateway_http_url(gateway_url: str, path: str) -> str:
+        parsed = urlparse(gateway_url)
+        scheme = "https" if parsed.scheme == "wss" else "http"
+        return urlunparse((scheme, parsed.netloc, path, "", "", ""))
+
+    @staticmethod
+    def _split_pem_bundle(bundle_text: str) -> list[str]:
+        marker = "-----END CERTIFICATE-----"
+        certs: list[str] = []
+        for part in bundle_text.split(marker):
+            part = part.strip()
+            if not part:
+                continue
+            certs.append(f"{part}\n{marker}\n")
+        return certs
+
+    @staticmethod
+    def _load_cert_bundle(pems: list[str]) -> list[x509.Certificate]:
+        certs: list[x509.Certificate] = []
+        for pem in pems:
+            certs.append(x509.load_pem_x509_certificate(pem.encode("utf-8")))
+        return certs
+
+    @staticmethod
+    def _ensure_cert_time_valid(cert: x509.Certificate, label: str, now: float) -> None:
+        current_ts = now
+        if current_ts < cert.not_valid_before_utc.timestamp():
+            raise AuthError(f"{label} is not yet valid")
+        if current_ts > cert.not_valid_after_utc.timestamp():
+            raise AuthError(f"{label} has expired")
+
+    @staticmethod
+    def _load_root_certs(root_ca_path: str | None) -> list[x509.Certificate]:
+        candidate_paths: list[Path] = []
+        if root_ca_path:
+            candidate_paths.append(Path(root_ca_path))
+        bundled_dir = Path(__file__).resolve().parent / "certs"
+        if bundled_dir.exists():
+            candidate_paths.extend(sorted(bundled_dir.glob("*.crt")))
+
+        certs: list[x509.Certificate] = []
+        seen_der: set[bytes] = set()
+        for path in candidate_paths:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise AuthError(f"failed to read root certificate bundle: {path}") from exc
+            for cert in AuthFlow._load_cert_bundle(AuthFlow._split_pem_bundle(text)):
+                der = cert.public_bytes(serialization.Encoding.DER)
+                if der in seen_der:
+                    continue
+                seen_der.add(der)
+                certs.append(cert)
+        return certs
 
     @staticmethod
     def _remember_tokens(identity: dict[str, Any], auth_result: dict[str, Any]) -> None:
@@ -301,6 +691,7 @@ class AuthFlow:
                 raise StateError("no local identity found, call auth.create_aid() first")
             identity = self._crypto.generate_identity()
             identity["aid"] = self._aid
+            self._keystore.save_identity(self._aid, identity)  # 立即持久化，避免后续网络失败丢失密钥
             return identity
 
     async def _default_connection_factory(self, url: str):
