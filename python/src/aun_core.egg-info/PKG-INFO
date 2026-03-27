@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: aun-core
-Version: 0.1.0
-Summary: AUN Protocol Core SDK — 连接、认证、密钥管理、E2EE
-Requires-Python: >=3.11
-Requires-Dist: aiohttp>=3.10
-Requires-Dist: cryptography>=43.0
-Requires-Dist: websockets>=15.0
