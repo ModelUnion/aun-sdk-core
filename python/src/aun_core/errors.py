@@ -56,6 +56,22 @@ class SerializationError(AUNError):
     pass
 
 
+class SessionError(AUNError):
+    pass
+
+
+class GroupError(AUNError):
+    pass
+
+
+class GroupNotFoundError(GroupError):
+    pass
+
+
+class GroupStateError(GroupError):
+    pass
+
+
 class E2EEError(AUNError):
     def __init__(
         self,
@@ -140,16 +156,24 @@ def map_remote_error(error: dict[str, Any]) -> AUNError:
     if isinstance(data, dict):
         trace_id = data.get("trace_id") or data.get("traceId")
 
-    if code in {4001, 4010}:
+    if code in {4001, 4010, -32003}:
         cls = AuthError
-    elif code in {4030, 403, -32003}:
+    elif code in {4030, 403}:
         cls = PermissionError
     elif code in {4040, 404, -32004}:
         cls = NotFoundError
     elif code in {4290, 429, -32029}:
         cls = RateLimitError
+    elif code in {-32010, -32011, -32013}:
+        cls = SessionError
     elif code in {-32600, -32601, -32602, 4000}:
         cls = ValidationError
+    elif code == -33001:
+        cls = GroupNotFoundError
+    elif code in {-33002, -33003}:
+        cls = GroupStateError
+    elif -33009 <= code <= -33004:
+        cls = GroupError
     else:
         cls = AUNError
 

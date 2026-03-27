@@ -318,41 +318,41 @@ class AuthFlow:
         return result
 
     async def _verify_phase1_response(self, gateway_url: str, result: dict[str, Any], client_nonce: str) -> None:
-        identity_cert_pem = str(result.get("identity_cert") or "")
+        auth_cert_pem = str(result.get("auth_cert") or "")
         signature_b64 = str(result.get("client_nonce_signature") or "")
-        if not identity_cert_pem:
-            raise AuthError("aid_login1 missing identity_cert")
+        if not auth_cert_pem:
+            raise AuthError("aid_login1 missing auth_cert")
         if not signature_b64:
             raise AuthError("aid_login1 missing client_nonce_signature")
 
         try:
-            identity_cert = x509.load_pem_x509_certificate(identity_cert_pem.encode("utf-8"))
+            auth_cert = x509.load_pem_x509_certificate(auth_cert_pem.encode("utf-8"))
         except Exception as exc:
-            raise AuthError("aid_login1 returned invalid identity_cert") from exc
+            raise AuthError("aid_login1 returned invalid auth_cert") from exc
 
-        await self._verify_identity_cert_chain(gateway_url, identity_cert)
-        await self._verify_identity_cert_revocation(gateway_url, identity_cert)
-        await self._verify_identity_cert_ocsp(gateway_url, identity_cert)
+        await self._verify_auth_cert_chain(gateway_url, auth_cert)
+        await self._verify_auth_cert_revocation(gateway_url, auth_cert)
+        await self._verify_auth_cert_ocsp(gateway_url, auth_cert)
 
         try:
             signature = base64.b64decode(signature_b64)
-            _verify_signature(identity_cert.public_key(), signature, client_nonce.encode("utf-8"))
+            _verify_signature(auth_cert.public_key(), signature, client_nonce.encode("utf-8"))
         except (ValueError, InvalidSignature, AuthError) as exc:
-            raise AuthError("aid_login1 server identity signature verification failed") from exc
+            raise AuthError("aid_login1 server auth signature verification failed") from exc
 
-    async def _verify_identity_cert_chain(self, gateway_url: str, identity_cert: x509.Certificate) -> None:
+    async def _verify_auth_cert_chain(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
         now = time.time()
-        self._ensure_cert_time_valid(identity_cert, "identity certificate", now)
+        self._ensure_cert_time_valid(auth_cert, "auth certificate", now)
 
         chain = await self._load_gateway_ca_chain(gateway_url)
         if not chain:
-            raise AuthError("unable to verify identity certificate chain: missing CA chain")
+            raise AuthError("unable to verify auth certificate chain: missing CA chain")
 
-        current = identity_cert
+        current = auth_cert
         for index, ca_cert in enumerate(chain):
             self._ensure_cert_time_valid(ca_cert, f"CA certificate[{index}]", now)
             if current.issuer != ca_cert.subject:
-                raise AuthError(f"identity certificate issuer mismatch at chain level {index}")
+                raise AuthError(f"auth certificate issuer mismatch at chain level {index}")
             try:
                 _verify_signature(
                     ca_cert.public_key(),
@@ -360,7 +360,7 @@ class AuthFlow:
                     current.tbs_certificate_bytes,
                 )
             except Exception as exc:
-                raise AuthError(f"identity certificate chain verification failed at level {index}") from exc
+                raise AuthError(f"auth certificate chain verification failed at level {index}") from exc
             try:
                 constraints = ca_cert.extensions.get_extension_for_class(x509.BasicConstraints).value
             except x509.ExtensionNotFound as exc:
@@ -371,11 +371,11 @@ class AuthFlow:
 
         root = chain[-1]
         if root.issuer != root.subject:
-            raise AuthError("identity certificate chain root is not self-signed")
+            raise AuthError("auth certificate chain root is not self-signed")
         try:
             _verify_signature(root.public_key(), root.signature, root.tbs_certificate_bytes)
         except Exception as exc:
-            raise AuthError("identity certificate chain root self-signature verification failed") from exc
+            raise AuthError("auth certificate chain root self-signature verification failed") from exc
 
         trusted_roots = self._load_trusted_roots()
         root_der = root.public_bytes(serialization.Encoding.DER)
@@ -383,7 +383,7 @@ class AuthFlow:
             trusted.public_bytes(serialization.Encoding.DER) == root_der
             for trusted in trusted_roots
         ):
-            raise AuthError("identity certificate chain is not anchored by a trusted root")
+            raise AuthError("auth certificate chain is not anchored by a trusted root")
 
     async def _load_gateway_ca_chain(self, gateway_url: str) -> list[x509.Certificate]:
         cached = self._gateway_chain_cache.get(gateway_url)
@@ -392,24 +392,24 @@ class AuthFlow:
             self._gateway_chain_cache[gateway_url] = cached
         return self._load_cert_bundle(cached)
 
-    async def _verify_identity_cert_revocation(self, gateway_url: str, identity_cert: x509.Certificate) -> None:
+    async def _verify_auth_cert_revocation(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
         chain = await self._load_gateway_ca_chain(gateway_url)
         if not chain:
-            raise AuthError("unable to verify identity certificate revocation: missing issuer certificate")
+            raise AuthError("unable to verify auth certificate revocation: missing issuer certificate")
         revoked_serials = await self._load_gateway_revoked_serials(gateway_url, chain[0])
-        serial_hex = format(identity_cert.serial_number, "x").lower()
+        serial_hex = format(auth_cert.serial_number, "x").lower()
         if serial_hex in revoked_serials:
-            raise AuthError("identity certificate has been revoked")
+            raise AuthError("auth certificate has been revoked")
 
-    async def _verify_identity_cert_ocsp(self, gateway_url: str, identity_cert: x509.Certificate) -> None:
+    async def _verify_auth_cert_ocsp(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
         chain = await self._load_gateway_ca_chain(gateway_url)
         if not chain:
-            raise AuthError("unable to verify identity certificate OCSP status: missing issuer certificate")
-        status = await self._load_gateway_ocsp_status(gateway_url, identity_cert, chain[0])
+            raise AuthError("unable to verify auth certificate OCSP status: missing issuer certificate")
+        status = await self._load_gateway_ocsp_status(gateway_url, auth_cert, chain[0])
         if status == "revoked":
-            raise AuthError("identity certificate OCSP status is revoked")
+            raise AuthError("auth certificate OCSP status is revoked")
         if status != "good":
-            raise AuthError(f"identity certificate OCSP status is {status}")
+            raise AuthError(f"auth certificate OCSP status is {status}")
 
     async def _load_gateway_revoked_serials(
         self,
@@ -426,21 +426,21 @@ class AuthFlow:
     async def _load_gateway_ocsp_status(
         self,
         gateway_url: str,
-        identity_cert: x509.Certificate,
+        auth_cert: x509.Certificate,
         issuer_cert: x509.Certificate,
     ) -> str:
-        serial_hex = format(identity_cert.serial_number, "x").lower()
+        serial_hex = format(auth_cert.serial_number, "x").lower()
         gateway_cache = self._gateway_ocsp_cache.setdefault(gateway_url, {})
         cached = gateway_cache.get(serial_hex)
         now = time.time()
         if cached is None or float(cached.get("next_refresh_at") or 0.0) <= now:
-            cached = await self._fetch_gateway_ocsp_status(gateway_url, identity_cert, issuer_cert)
+            cached = await self._fetch_gateway_ocsp_status(gateway_url, auth_cert, issuer_cert)
             gateway_cache[serial_hex] = cached
         return str(cached.get("status") or "unknown")
 
     def _load_trusted_roots(self) -> list[x509.Certificate]:
         if not self._root_certs:
-            raise AuthError("no trusted roots available for identity certificate verification")
+            raise AuthError("no trusted roots available for auth certificate verification")
         return self._root_certs
 
     async def _fetch_gateway_ca_chain(self, gateway_url: str) -> list[str]:
@@ -487,10 +487,10 @@ class AuthFlow:
     async def _fetch_gateway_ocsp_status(
         self,
         gateway_url: str,
-        identity_cert: x509.Certificate,
+        auth_cert: x509.Certificate,
         issuer_cert: x509.Certificate,
     ) -> dict[str, Any]:
-        serial_hex = format(identity_cert.serial_number, "x").lower()
+        serial_hex = format(auth_cert.serial_number, "x").lower()
         url = self._gateway_http_url(gateway_url, f"/pki/ocsp/{serial_hex}")
         payload = await self._fetch_json(url)
         status = str(payload.get("status") or "")
@@ -504,7 +504,7 @@ class AuthFlow:
 
         if response.response_status is not ocsp.OCSPResponseStatus.SUCCESSFUL:
             raise AuthError(f"gateway OCSP response status is {response.response_status.name.lower()}")
-        if response.serial_number != identity_cert.serial_number:
+        if response.serial_number != auth_cert.serial_number:
             raise AuthError("gateway OCSP response serial mismatch")
         expected_issuer_name_hash = hashlib.sha256(issuer_cert.subject.public_bytes()).digest()
         expected_issuer_key_hash = hashlib.sha256(
@@ -641,6 +641,10 @@ class AuthFlow:
             identity["kite_token"] = auth_result["token"]
         if isinstance(expires_in, (int, float)):
             identity["access_token_expires_at"] = int(time.time() + float(expires_in))
+        # 协议要求：login2 响应含 new_cert 时（证书过半自动续期），客户端必须保存
+        new_cert = auth_result.get("new_cert")
+        if new_cert:
+            identity["cert"] = new_cert
 
     @staticmethod
     def _get_cached_access_token(identity: dict[str, Any]) -> str:
