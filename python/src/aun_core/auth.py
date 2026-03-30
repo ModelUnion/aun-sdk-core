@@ -44,6 +44,7 @@ class AuthFlow:
         aid: str | None = None,
         connection_factory=None,
         root_ca_path: str | None = None,
+        chain_cache_ttl: int = 86400,
     ) -> None:
         self._keystore = keystore
         self._crypto = crypto
@@ -54,6 +55,11 @@ class AuthFlow:
         self._gateway_chain_cache: dict[str, list[str]] = {}
         self._gateway_crl_cache: dict[str, dict[str, Any]] = {}
         self._gateway_ocsp_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        # 证书链验证结果缓存：cert_serial -> verified_at
+        self._chain_verified_cache: dict[str, float] = {}
+        self._chain_cache_ttl = chain_cache_ttl
+        # Gateway CA 链预验证标记：gateway_url -> verified
+        self._gateway_ca_verified: dict[str, bool] = {}
 
     def load_identity(self, aid: str | None = None) -> dict[str, Any]:
         identity = self._load_identity_or_raise(aid)
@@ -260,22 +266,38 @@ class AuthFlow:
             raise AuthError(f"initialize failed: {result}")
 
     async def _create_aid(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.perf_counter()
         response = await self._short_rpc(gateway_url, "auth.create_aid", {
             "aid": identity["aid"],
             "public_key": identity["public_key_der_b64"],
             "curve": identity.get("curve", "P-256"),
         })
+        t1 = time.perf_counter()
+        print(f"[perf] create_aid RPC: {(t1-t0)*1000:.1f}ms")
         return {"cert": response["cert"]}
 
     async def _login(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.perf_counter()
         client_nonce = self._crypto.new_client_nonce()
+        t1 = time.perf_counter()
+        print(f"[perf] generate nonce: {(t1-t0)*1000:.1f}ms")
+
         phase1 = await self._short_rpc(gateway_url, "auth.aid_login1", {
             "aid": identity["aid"],
             "cert": identity["cert"],
             "client_nonce": client_nonce,
         })
+        t2 = time.perf_counter()
+        print(f"[perf] aid_login1 RPC: {(t2-t1)*1000:.1f}ms")
+
         await self._verify_phase1_response(gateway_url, phase1, client_nonce)
+        t3 = time.perf_counter()
+        print(f"[perf] verify phase1: {(t3-t2)*1000:.1f}ms")
+
         signature, client_time = self._crypto.sign_login_nonce(identity["private_key_pem"], phase1["nonce"])
+        t4 = time.perf_counter()
+        print(f"[perf] sign nonce: {(t4-t3)*1000:.1f}ms")
+
         phase2 = await self._short_rpc(gateway_url, "auth.aid_login2", {
             "aid": identity["aid"],
             "request_id": phase1["request_id"],
@@ -283,6 +305,9 @@ class AuthFlow:
             "client_time": client_time,
             "signature": signature,
         })
+        t5 = time.perf_counter()
+        print(f"[perf] aid_login2 RPC: {(t5-t4)*1000:.1f}ms")
+        print(f"[perf] total login: {(t5-t0)*1000:.1f}ms")
         return phase2
 
     async def _refresh_access_token(self, gateway_url: str, refresh_token: str) -> dict[str, Any]:
@@ -294,17 +319,23 @@ class AuthFlow:
         return result
 
     async def _short_rpc(self, gateway_url: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.perf_counter()
         ws = await self._connection_factory(gateway_url)
+        t1 = time.perf_counter()
         try:
             await ws.recv()
+            t2 = time.perf_counter()
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
                 "id": f"pre-{method}",
                 "method": method,
                 "params": params,
             }))
+            t3 = time.perf_counter()
             raw = await ws.recv()
+            t4 = time.perf_counter()
             message = raw if isinstance(raw, dict) else json.loads(raw)
+            print(f"[perf]   _short_rpc {method}: connect={int((t1-t0)*1000)}ms, hello={int((t2-t1)*1000)}ms, send={int((t3-t2)*1000)}ms, recv={int((t4-t3)*1000)}ms")
         finally:
             await ws.close()
 
@@ -318,6 +349,7 @@ class AuthFlow:
         return result
 
     async def _verify_phase1_response(self, gateway_url: str, result: dict[str, Any], client_nonce: str) -> None:
+        t0 = time.perf_counter()
         auth_cert_pem = str(result.get("auth_cert") or "")
         signature_b64 = str(result.get("client_nonce_signature") or "")
         if not auth_cert_pem:
@@ -329,45 +361,92 @@ class AuthFlow:
             auth_cert = x509.load_pem_x509_certificate(auth_cert_pem.encode("utf-8"))
         except Exception as exc:
             raise AuthError("aid_login1 returned invalid auth_cert") from exc
+        t1 = time.perf_counter()
+        print(f"[perf]   parse cert: {(t1-t0)*1000:.1f}ms")
 
         await self._verify_auth_cert_chain(gateway_url, auth_cert)
+        t2 = time.perf_counter()
+        print(f"[perf]   verify chain: {(t2-t1)*1000:.1f}ms")
+
         await self._verify_auth_cert_revocation(gateway_url, auth_cert)
+        t3 = time.perf_counter()
+        print(f"[perf]   verify CRL: {(t3-t2)*1000:.1f}ms")
+
         await self._verify_auth_cert_ocsp(gateway_url, auth_cert)
+        t4 = time.perf_counter()
+        print(f"[perf]   verify OCSP: {(t4-t3)*1000:.1f}ms")
 
         try:
             signature = base64.b64decode(signature_b64)
             _verify_signature(auth_cert.public_key(), signature, client_nonce.encode("utf-8"))
         except (ValueError, InvalidSignature, AuthError) as exc:
             raise AuthError("aid_login1 server auth signature verification failed") from exc
+        t5 = time.perf_counter()
+        print(f"[perf]   verify signature: {(t5-t4)*1000:.1f}ms")
 
     async def _verify_auth_cert_chain(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
+        # 检查缓存：已验证过且未过期则跳过
+        cert_serial = format(auth_cert.serial_number, "x")
+        cached_at = self._chain_verified_cache.get(cert_serial)
+        if cached_at and time.time() - cached_at < self._chain_cache_ttl:
+            print(f"[perf]     chain cache hit")
+            return
+
+        t0 = time.perf_counter()
         now = time.time()
         self._ensure_cert_time_valid(auth_cert, "auth certificate", now)
 
         chain = await self._load_gateway_ca_chain(gateway_url)
+        t1 = time.perf_counter()
+        print(f"[perf]     load CA chain: {(t1-t0)*1000:.1f}ms")
+
         if not chain:
             raise AuthError("unable to verify auth certificate chain: missing CA chain")
 
+        # 如果 CA 链已预验证，只验证 auth_cert → Issuer（1层）
+        if self._gateway_ca_verified.get(gateway_url):
+            issuer = chain[0]
+            self._ensure_cert_time_valid(issuer, "Issuer CA", now)
+            if auth_cert.issuer != issuer.subject:
+                raise AuthError("auth certificate issuer mismatch")
+            try:
+                _verify_signature(issuer.public_key(), auth_cert.signature, auth_cert.tbs_certificate_bytes)
+            except Exception as exc:
+                raise AuthError("auth certificate signature verification failed") from exc
+            self._chain_verified_cache[cert_serial] = time.time()
+            t2 = time.perf_counter()
+            print(f"[perf]     verify auth_to_issuer: {(t2-t1)*1000:.1f}ms (CA链已预验证)")
+            return
+
+        # 首次验证：完整验证 + 预验证 CA 链
+        # 构建验证对（cert, issuer_ca, level）
         current = auth_cert
+        verify_pairs = []
         for index, ca_cert in enumerate(chain):
             self._ensure_cert_time_valid(ca_cert, f"CA certificate[{index}]", now)
             if current.issuer != ca_cert.subject:
                 raise AuthError(f"auth certificate issuer mismatch at chain level {index}")
-            try:
-                _verify_signature(
-                    ca_cert.public_key(),
-                    current.signature,
-                    current.tbs_certificate_bytes,
-                )
-            except Exception as exc:
-                raise AuthError(f"auth certificate chain verification failed at level {index}") from exc
-            try:
-                constraints = ca_cert.extensions.get_extension_for_class(x509.BasicConstraints).value
-            except x509.ExtensionNotFound as exc:
-                raise AuthError(f"CA certificate[{index}] missing BasicConstraints") from exc
-            if not constraints.ca:
-                raise AuthError(f"CA certificate[{index}] is not marked as CA")
+            verify_pairs.append((current, ca_cert, index))
             current = ca_cert
+
+        # 并行验证所有签名
+        import concurrent.futures
+        def verify_level(cert, issuer, level):
+            try:
+                _verify_signature(issuer.public_key(), cert.signature, cert.tbs_certificate_bytes)
+                constraints = issuer.extensions.get_extension_for_class(x509.BasicConstraints).value
+                if not constraints.ca:
+                    raise AuthError(f"CA certificate[{level}] is not marked as CA")
+            except x509.ExtensionNotFound:
+                raise AuthError(f"CA certificate[{level}] missing BasicConstraints")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(verify_pairs)) as executor:
+            futures = [executor.submit(verify_level, c, ca, i) for c, ca, i in verify_pairs]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()  # 抛出异常（如果有）
+
+        t2 = time.perf_counter()
+        print(f"[perf]     verify signatures: {(t2-t1)*1000:.1f}ms")
 
         root = chain[-1]
         if root.issuer != root.subject:
@@ -385,11 +464,31 @@ class AuthFlow:
         ):
             raise AuthError("auth certificate chain is not anchored by a trusted root")
 
+        # 验证成功，保存到缓存并标记 CA 链已预验证
+        self._chain_verified_cache[cert_serial] = time.time()
+        self._gateway_ca_verified[gateway_url] = True
+        t3 = time.perf_counter()
+        print(f"[perf]     verify root: {(t3-t2)*1000:.1f}ms (CA链已预验证，后续只验证 auth→Issuer)")
+
     async def _load_gateway_ca_chain(self, gateway_url: str) -> list[x509.Certificate]:
         cached = self._gateway_chain_cache.get(gateway_url)
         if cached is None:
             cached = await self._fetch_gateway_ca_chain(gateway_url)
             self._gateway_chain_cache[gateway_url] = cached
+            # 加载后立即预验证 CA 链
+            certs = self._load_cert_bundle(cached)
+            if len(certs) >= 2:
+                try:
+                    # 验证 Issuer → Registry → Root
+                    for i in range(len(certs) - 1):
+                        _verify_signature(certs[i+1].public_key(), certs[i].signature, certs[i].tbs_certificate_bytes)
+                    # 验证 Root 自签名
+                    root = certs[-1]
+                    _verify_signature(root.public_key(), root.signature, root.tbs_certificate_bytes)
+                    self._gateway_ca_verified[gateway_url] = True
+                    print(f"[perf] Gateway CA 链预验证成功")
+                except Exception:
+                    pass  # 预验证失败不影响后续完整验证
         return self._load_cert_bundle(cached)
 
     async def _verify_auth_cert_revocation(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
