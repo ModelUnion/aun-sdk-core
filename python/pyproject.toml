@@ -4,14 +4,36 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aun-core"
-version = "0.1.0"
-description = "AUN Protocol Core SDK — 连接、认证、密钥管理、E2EE"
+version = "0.1.4"
+description = "AUN Protocol Core SDK — identity, authentication, key management, E2EE"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+readme = "README.md"
+authors = [
+    { name = "AgentUnion", email = "dev@agentunion.ai" },
+]
+keywords = ["aun", "agent", "protocol", "authentication", "e2ee", "pki", "x509"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: AsyncIO",
+    "Typing :: Typed",
+]
 dependencies = [
     "aiohttp>=3.10",
     "cryptography>=43.0",
     "websockets>=15.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ModelUnion/aun-sdk-core"
+Repository = "https://github.com/ModelUnion/aun-sdk-core"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -20,7 +42,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"aun_core" = ["certs/*.crt"]
+"aun_core" = ["certs/*.crt", "docs/**/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

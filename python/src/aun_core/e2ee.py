@@ -3,12 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import secrets
+import time as _time_mod
 import uuid
-from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlparse, urlunparse
 
-import aiohttp
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -16,92 +14,244 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .errors import (
-    E2EEBadCounterError,
-    E2EEBadSignatureError,
     E2EEDecryptFailedError,
-    E2EEDowngradeBlockedError,
     E2EEError,
-    E2EENegotiationRejectedError,
-    E2EESessionExpiredError,
-    E2EESessionNotFoundError,
-    E2EEUnsupportedSuiteError,
-    ValidationError,
 )
 
 
 SUITE = "P256_HKDF_SHA256_AES_256_GCM"
-AAD_FIELDS = ("from", "to", "message_id", "timestamp", "session_id", "counter")
-AAD_MATCH_FIELDS = ("from", "to", "message_id", "session_id", "counter")
 
+# 加密模式
+MODE_PREKEY_ECDH = "prekey_ecdh"        # 优先：prekey ECDH
+MODE_LONG_TERM_KEY = "long_term_key"    # 降级：长期公钥加密
 
-@dataclass
-class PendingSession:
-    session_id: str
-    peer_aid: str
-    private_key: ec.EllipticCurvePrivateKey
-    public_key_b64: str
-    created_at: float
+# AAD 字段
+AAD_FIELDS_OFFLINE = (
+    "from", "to", "message_id", "timestamp",
+    "encryption_mode", "suite", "ephemeral_public_key",
+    "recipient_cert_fingerprint",
+)
+AAD_MATCH_FIELDS_OFFLINE = (
+    "from", "to", "message_id",
+    "encryption_mode", "suite", "ephemeral_public_key",
+    "recipient_cert_fingerprint",
+)
 
-
-@dataclass
-class ActiveSession:
-    session_id: str
-    peer_aid: str
-    key: bytes
-    established_at: float
-    expires_at: float
-    writable: bool = True
-    state: str = "active"
-    send_counter: int = 0
-    recv_counter: int = 0
+# prekey 私钥本地保留时间（秒）
+PREKEY_RETENTION_SECONDS = 7 * 24 * 3600  # 7 天
 
 
 class E2EEManager:
-    def __init__(self, client: Any) -> None:
-        self._client = client
-        self._sessions_by_peer: dict[str, ActiveSession] = {}
-        self._sessions_by_id: dict[str, ActiveSession] = {}
-        self._pending: dict[str, PendingSession] = {}
-        self._pending_by_peer: dict[str, str] = {}
-        self._accept_waiters: dict[str, Any] = {}
-        self._pull_cursor = 0
-        self._cert_cache: dict[str, bytes] = {}
-        self._deferred_messages: list[dict[str, Any]] = []
-        self._loaded_sessions_aid: str | None = None
-        self._last_error: E2EEError | None = None
+    """端到端加密工具类 — 纯密码学操作，无 I/O 依赖。
 
-    @property
-    def last_error(self) -> E2EEError | None:
-        return self._last_error
+    加密策略：prekey_ecdh → long_term_key 两层降级。
+    I/O（获取 prekey、证书）由调用方（AUNClient）负责。
+    内置本地防重放（seen set），裸 WebSocket 开发者无需额外实现。
+    """
 
-    async def encrypt_outbound(
+    def __init__(
+        self,
+        *,
+        identity_fn: Any,
+        keystore: Any,
+        prekey_cache_ttl: float = 3600.0,
+    ) -> None:
+        self._identity_fn = identity_fn
+        self._keystore_ref = keystore
+        # 本地防重放 seen set
+        self._seen_messages: dict[str, bool] = {}
+        self._seen_max_size = 5000
+        # prekey 内存缓存（TTL 默认 1 小时）
+        self._prekey_cache: dict[str, tuple[dict[str, Any], float]] = {}
+        self._prekey_cache_ttl = prekey_cache_ttl
+
+    # ── 便利方法 ──────────────────────────────────────────────
+
+    def encrypt_message(
+        self,
+        to_aid: str,
+        payload: dict[str, Any],
+        *,
+        peer_cert_pem: bytes,
+        prekey: dict[str, Any] | None = None,
+        message_id: str | None = None,
+        timestamp: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """加密消息（便利方法）。
+
+        调用方负责提前获取 peer_cert_pem 和 prekey（可选）。
+        有 prekey 时用 prekey_ecdh，无 prekey 时降级为 long_term_key。
+        """
+        message_id = message_id or str(uuid.uuid4())
+        timestamp = timestamp or int(_time_mod.time() * 1000)
+        return self.encrypt_outbound(
+            peer_aid=to_aid,
+            payload=payload,
+            peer_cert_pem=peer_cert_pem,
+            prekey=prekey,
+            message_id=message_id,
+            timestamp=timestamp,
+        )
+
+    def decrypt_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        """解密单条消息（便利方法，内置本地防重放）。"""
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            return message
+        payload_type = payload.get("type")
+        if payload_type != "e2ee.encrypted":
+            return message
+        if message.get("encrypted") is not True and "encrypted" in message:
+            return message
+
+        # 本地防重放
+        message_id = message.get("message_id", "")
+        from_aid = message.get("from", "")
+        if message_id and from_aid:
+            seen_key = f"{from_aid}:{message_id}"
+            if seen_key in self._seen_messages:
+                return None  # 重放消息
+            self._seen_messages[seen_key] = True
+            self._trim_seen_set()
+
+        return self._decrypt_message(message)
+
+    def _trim_seen_set(self) -> None:
+        if len(self._seen_messages) > self._seen_max_size:
+            trim_count = len(self._seen_messages) - int(self._seen_max_size * 0.8)
+            keys = list(self._seen_messages.keys())[:trim_count]
+            for k in keys:
+                del self._seen_messages[k]
+
+    # ── Prekey 缓存 ────────────────────────────────────────────
+
+    def cache_prekey(self, peer_aid: str, prekey: dict[str, Any]) -> None:
+        """缓存对方的 prekey（调用方获取后存入，后续 encrypt 自动复用）"""
+        self._prekey_cache[peer_aid] = (prekey, _time_mod.time() + self._prekey_cache_ttl)
+
+    def get_cached_prekey(self, peer_aid: str) -> dict[str, Any] | None:
+        """获取缓存的 prekey（过期返回 None）"""
+        cached = self._prekey_cache.get(peer_aid)
+        if cached is None:
+            return None
+        prekey, expire_at = cached
+        if _time_mod.time() >= expire_at:
+            del self._prekey_cache[peer_aid]
+            return None
+        return prekey
+
+    def invalidate_prekey_cache(self, peer_aid: str) -> None:
+        """使指定 peer 的 prekey 缓存失效"""
+        self._prekey_cache.pop(peer_aid, None)
+
+    # ── 加密 ─────────────────────────────────────────────────
+
+    def encrypt_outbound(
         self,
         peer_aid: str,
         payload: dict[str, Any],
         *,
+        peer_cert_pem: bytes,
+        prekey: dict[str, Any] | None = None,
         message_id: str,
         timestamp: int,
     ) -> tuple[dict[str, Any], bool]:
-        self._restore_sessions_if_needed()
-        session = await self._ensure_session(peer_aid)
-        if self._should_rekey(session):
-            session = await self._rekey_session(session)
+        """加密出站消息：有 prekey → prekey_ecdh，无 prekey → long_term_key。
+
+        prekey 传入时自动缓存；传入 None 时自动查缓存。
+        """
+        # 传入 prekey → 缓存；传入 None → 查缓存
+        if prekey is not None:
+            self.cache_prekey(peer_aid, prekey)
+        else:
+            prekey = self.get_cached_prekey(peer_aid)
+
+        if prekey:
+            try:
+                return self._encrypt_with_prekey(
+                    peer_aid, payload, prekey, peer_cert_pem,
+                    message_id=message_id, timestamp=timestamp,
+                )
+            except Exception:
+                pass
+
+        return self._encrypt_with_long_term_key(
+            peer_aid, payload, peer_cert_pem,
+            message_id=message_id, timestamp=timestamp,
+        )
+
+    def _encrypt_with_prekey(
+        self,
+        peer_aid: str,
+        payload: dict[str, Any],
+        prekey: dict[str, Any],
+        peer_cert_pem: bytes,
+        *,
+        message_id: str,
+        timestamp: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """使用对方 prekey 加密（prekey_ecdh 模式）"""
+        # 验证 prekey 签名
+        cert = x509.load_pem_x509_certificate(
+            peer_cert_pem if isinstance(peer_cert_pem, bytes) else peer_cert_pem.encode("utf-8")
+        )
+        peer_identity_public = cert.public_key()
+
+        sign_data = f"{prekey['prekey_id']}|{prekey['public_key']}".encode("utf-8")
+        signature_bytes = base64.b64decode(prekey["signature"])
+        try:
+            peer_identity_public.verify(signature_bytes, sign_data, ec.ECDSA(hashes.SHA256()))
+        except Exception as exc:
+            raise E2EEError(f"prekey signature verification failed: {exc}")
+
+        # 导入对方 prekey 公钥
+        peer_prekey_public = serialization.load_der_public_key(
+            base64.b64decode(prekey["public_key"])
+        )
+
+        # 生成临时 ECDH 密钥对
+        ephemeral_private = ec.generate_private_key(ec.SECP256R1())
+        ephemeral_public_bytes = ephemeral_private.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+
+        # ECDH + HKDF
+        shared_secret = ephemeral_private.exchange(ec.ECDH(), peer_prekey_public)
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(), length=32, salt=None,
+            info=f"aun-prekey:{prekey['prekey_id']}".encode("utf-8"),
+        )
+        message_key = hkdf.derive(shared_secret)
+
+        # AES-GCM 加密
         plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         nonce = secrets.token_bytes(12)
-        aesgcm = AESGCM(session.key)
-        counter = session.send_counter + 1
-        aad = self._build_outbound_aad(peer_aid, message_id, timestamp, session, counter)
-        ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes(aad))
+        aesgcm = AESGCM(message_key)
+
+        recipient_fingerprint = self._fingerprint_cert_pem(peer_cert_pem)
+        ephemeral_pk_b64 = base64.b64encode(ephemeral_public_bytes).decode("ascii")
+        aad = {
+            "from": self._current_aid(),
+            "to": peer_aid,
+            "message_id": message_id,
+            "timestamp": timestamp,
+            "encryption_mode": MODE_PREKEY_ECDH,
+            "suite": SUITE,
+            "ephemeral_public_key": ephemeral_pk_b64,
+            "recipient_cert_fingerprint": recipient_fingerprint,
+        }
+        ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
         ciphertext = ciphertext_with_tag[:-16]
         tag = ciphertext_with_tag[-16:]
-        session.send_counter = counter
-        self._persist_sessions()
+
         envelope = {
             "type": "e2ee.encrypted",
             "version": "1",
+            "encryption_mode": MODE_PREKEY_ECDH,
             "suite": SUITE,
-            "session_id": session.session_id,
-            "counter": counter,
+            "prekey_id": prekey["prekey_id"],
+            "ephemeral_public_key": ephemeral_pk_b64,
             "nonce": base64.b64encode(nonce).decode("ascii"),
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
             "tag": base64.b64encode(tag).decode("ascii"),
@@ -109,419 +259,365 @@ class E2EEManager:
         }
         return envelope, True
 
-    async def process_incoming_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        self._restore_sessions_if_needed()
-        business: list[dict[str, Any]] = []
-        for message in messages:
-            seq = int(message.get("seq") or 0)
-            if seq > self._pull_cursor:
-                self._pull_cursor = seq
-
-            payload = message.get("payload")
-            if not isinstance(payload, dict):
-                business.append(message)
-                continue
-
-            payload_type = payload.get("type")
-            if payload_type == "e2ee.negotiate":
-                await self._handle_negotiate(message)
-                continue
-            if payload_type == "e2ee.accept":
-                await self._handle_accept(message)
-                continue
-            if payload_type == "e2ee.reject":
-                self._handle_reject(message)
-                continue
-            if payload_type == "e2ee.close":
-                self._handle_close(message)
-                continue
-            if payload_type == "e2ee.encrypted" and (
-                message.get("encrypted") is True or "encrypted" not in message
-            ):
-                decrypted = self._decrypt_message(message)
-                if decrypted is not None:
-                    business.append(decrypted)
-                continue
-            business.append(message)
-        return business
-
-    async def _ensure_session(self, peer_aid: str) -> ActiveSession:
-        existing = self._sessions_by_peer.get(peer_aid)
-        if existing:
-            if self._is_session_expired(existing):
-                self._record_error(E2EESessionExpiredError())
-                await self._send_close(existing, reason="session_expired")
-                self.invalidate_session(session_id=existing.session_id)
-            else:
-                return existing
-
-        pending_session_id = self._pending_by_peer.get(peer_aid)
-        if pending_session_id:
-            waiter = self._accept_waiters.get(pending_session_id)
-            if waiter is not None:
-                await self._wait_for_accept(peer_aid, pending_session_id, waiter)
-                session = self._sessions_by_peer.get(peer_aid)
-                if session and not self._is_session_expired(session):
-                    return session
-            self._pending_by_peer.pop(peer_aid, None)
-
-        now = self._loop_time()
-
-        session_id = str(uuid.uuid4())
-        ephemeral = ec.generate_private_key(ec.SECP256R1())
-        public_der = ephemeral.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
+    def _encrypt_with_long_term_key(
+        self,
+        peer_aid: str,
+        payload: dict[str, Any],
+        peer_cert_pem: bytes,
+        *,
+        message_id: str,
+        timestamp: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """使用接收方长期公钥加密（long_term_key 模式）"""
+        cert = x509.load_pem_x509_certificate(
+            peer_cert_pem if isinstance(peer_cert_pem, bytes) else peer_cert_pem.encode("utf-8")
         )
-        public_key_b64 = base64.b64encode(public_der).decode("ascii")
-        nonce = secrets.token_bytes(16)
+        peer_public_key = cert.public_key()
 
-        pending = PendingSession(
-            session_id=session_id,
-            peer_aid=peer_aid,
-            private_key=ephemeral,
-            public_key_b64=public_key_b64,
-            created_at=now,
+        if not isinstance(peer_public_key, ec.EllipticCurvePublicKey):
+            raise E2EEError("Peer certificate does not contain EC public key")
+
+        session_key = secrets.token_bytes(32)
+        ephemeral_public_bytes, encrypted_session_key = self._encrypt_session_key_with_public_key(
+            session_key, peer_public_key
         )
-        self._pending[session_id] = pending
-        self._pending_by_peer[peer_aid] = session_id
 
-        canonical = self._canonical_handshake({
-            "type": "e2ee.negotiate",
-            "version": "1",
-            "session_id": session_id,
-            "supported_suites": [SUITE],
-            "ephemeral_public_key": public_key_b64,
-            "identity_key_fingerprint": self._local_identity_fingerprint(),
-            "nonce": base64.b64encode(nonce).decode("ascii"),
-        })
-        signature = self._sign_bytes(canonical)
-        waiter = self._client._loop.create_future()
-        self._accept_waiters[session_id] = waiter
+        plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(session_key)
 
-        await self._client.call("message.send", {
+        recipient_fingerprint = self._fingerprint_cert_pem(peer_cert_pem)
+        ephemeral_pk_b64 = base64.b64encode(ephemeral_public_bytes).decode("ascii")
+        aad = {
+            "from": self._current_aid(),
             "to": peer_aid,
-            "persist": True,
-            "payload": {
-                "type": "e2ee.negotiate",
-                "version": "1",
-                "session_id": session_id,
-                "supported_suites": [SUITE],
-                "ephemeral_public_key": public_key_b64,
-                "identity_key_fingerprint": self._local_identity_fingerprint(),
-                "nonce": base64.b64encode(nonce).decode("ascii"),
-                "signature": signature,
-            },
-        })
-
-        await self._wait_for_accept(peer_aid, session_id, waiter)
-        session = self._sessions_by_peer.get(peer_aid)
-        if not session:
-            raise E2EEError(f"failed to establish e2ee session with {peer_aid}")
-        return session
-
-    async def _wait_for_accept(self, peer_aid: str, session_id: str, waiter: Any) -> None:
-        deadline = self._client._loop.time() + 10.0
-        try:
-            while not waiter.done():
-                if self._client._loop.time() >= deadline:
-                    raise E2EEError(f"timeout waiting e2ee.accept from {peer_aid}")
-                result = await self._client.call("message.pull", {"after_seq": self._pull_cursor, "limit": 20})
-                raw_messages = result.get("messages", []) if isinstance(result, dict) else []
-                business = await self.process_incoming_messages(raw_messages)
-                if business:
-                    self._queue_deferred_messages(business)
-                if waiter.done():
-                    break
-            await waiter
-        except Exception:
-            self._discard_pending(session_id)
-            raise
-
-    async def _handle_negotiate(self, message: dict[str, Any]) -> None:
-        self._restore_sessions_if_needed()
-        payload = message["payload"]
-        from_aid = message["from"]
-        session_id = str(payload["session_id"])
-        if session_id in self._sessions_by_id:
-            return
-        previous = self._sessions_by_peer.get(from_aid)
-        if previous is not None and previous.state == "rekeying":
-            await self._send_reject(from_aid, session_id, "busy_rekeying")
-            return
-        supported = payload.get("supported_suites") or []
-        if SUITE not in supported:
-            await self._send_reject(from_aid, session_id, "no_common_suite", supported_suites=[SUITE])
-            return
-
-        await self.ensure_peer_cert(from_aid)
-        self._verify_peer_signature(
-            from_aid,
-            {
-                "type": "e2ee.negotiate",
-                "version": payload["version"],
-                "session_id": session_id,
-                "supported_suites": supported,
-                "ephemeral_public_key": payload["ephemeral_public_key"],
-                "identity_key_fingerprint": payload["identity_key_fingerprint"],
-                "nonce": payload["nonce"],
-            },
-            payload["signature"],
-        )
-
-        peer_public = serialization.load_der_public_key(base64.b64decode(payload["ephemeral_public_key"]))
-        our_private = ec.generate_private_key(ec.SECP256R1())
-        our_public_der = our_private.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        shared = our_private.exchange(ec.ECDH(), peer_public)
-        key = self._derive_key(shared, session_id)
-        now = self._loop_time()
-        previous = self._sessions_by_peer.get(from_aid)
-        if previous is not None:
-            previous.writable = False
-            previous.state = "rekeying"
-        active = ActiveSession(
-            session_id=session_id,
-            peer_aid=from_aid,
-            key=key,
-            established_at=now,
-            expires_at=now + self._session_ttl_seconds(),
-        )
-        self._sessions_by_peer[from_aid] = active
-        self._sessions_by_id[session_id] = active
-        self._persist_sessions()
-
-        nonce = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-        accept_doc = {
-            "type": "e2ee.accept",
-            "version": "1",
-            "session_id": session_id,
-            "selected_suite": SUITE,
-            "ephemeral_public_key": base64.b64encode(our_public_der).decode("ascii"),
-            "identity_key_fingerprint": self._local_identity_fingerprint(),
-            "nonce": nonce,
+            "message_id": message_id,
+            "timestamp": timestamp,
+            "encryption_mode": MODE_LONG_TERM_KEY,
+            "suite": SUITE,
+            "ephemeral_public_key": ephemeral_pk_b64,
+            "recipient_cert_fingerprint": recipient_fingerprint,
         }
-        signature = self._sign_bytes(self._canonical_handshake(accept_doc))
+        ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
+        ciphertext = ciphertext_with_tag[:-16]
+        tag = ciphertext_with_tag[-16:]
 
-        await self._client.call("message.send", {
-            "to": from_aid,
-            "persist": True,
-            "payload": {
-                **accept_doc,
-                "signature": signature,
-            },
-        })
+        envelope = {
+            "type": "e2ee.encrypted",
+            "version": "1",
+            "encryption_mode": MODE_LONG_TERM_KEY,
+            "suite": SUITE,
+            "ephemeral_public_key": ephemeral_pk_b64,
+            "encrypted_session_key": base64.b64encode(encrypted_session_key).decode("ascii"),
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+            "tag": base64.b64encode(tag).decode("ascii"),
+            "aad": aad,
+        }
+        return envelope, True
 
-    async def _handle_accept(self, message: dict[str, Any]) -> None:
-        self._restore_sessions_if_needed()
-        payload = message["payload"]
-        from_aid = message["from"]
-        session_id = str(payload["session_id"])
-        if session_id in self._sessions_by_id and session_id not in self._pending:
-            return
-        pending = self._pending.pop(session_id, None)
-        if pending is None:
-            return
-        self._pending_by_peer.pop(pending.peer_aid, None)
-
-        await self.ensure_peer_cert(from_aid)
-        self._verify_peer_signature(
-            from_aid,
-            {
-                "type": "e2ee.accept",
-                "version": payload["version"],
-                "session_id": session_id,
-                "selected_suite": payload["selected_suite"],
-                "ephemeral_public_key": payload["ephemeral_public_key"],
-                "identity_key_fingerprint": payload["identity_key_fingerprint"],
-                "nonce": payload["nonce"],
-            },
-            payload["signature"],
-        )
-
-        peer_public = serialization.load_der_public_key(base64.b64decode(payload["ephemeral_public_key"]))
-        shared = pending.private_key.exchange(ec.ECDH(), peer_public)
-        key = self._derive_key(shared, session_id)
-        now = self._loop_time()
-        previous = self._sessions_by_peer.get(from_aid)
-        if previous is not None:
-            previous.writable = False
-            previous.state = "rekeying"
-        active = ActiveSession(
-            session_id=session_id,
-            peer_aid=from_aid,
-            key=key,
-            established_at=now,
-            expires_at=now + self._session_ttl_seconds(),
-            writable=True,
-            state="active",
-        )
-        self._sessions_by_peer[from_aid] = active
-        self._sessions_by_id[session_id] = active
-        self._persist_sessions()
-        waiter = self._accept_waiters.pop(session_id, None)
-        if waiter is not None and not waiter.done():
-            waiter.set_result(True)
-
-    def _handle_reject(self, message: dict[str, Any]) -> None:
-        payload = message["payload"]
-        session_id = str(payload.get("session_id") or "")
-        if not session_id:
-            return
-        reason = str(payload.get("reason") or "rejected")
-        error = E2EENegotiationRejectedError(
-            f"e2ee negotiation rejected: {reason}",
-            reject_reason=reason,
-        )
-        self._record_error(error)
-        pending = self._pending.pop(session_id, None)
-        if pending is not None:
-            self._pending_by_peer.pop(pending.peer_aid, None)
-        waiter = self._accept_waiters.pop(session_id, None)
-        if waiter is not None and not waiter.done():
-            waiter.set_exception(error)
-
-    def _handle_close(self, message: dict[str, Any]) -> None:
-        payload = message["payload"]
-        session_id = str(payload.get("session_id") or "")
-        if not session_id:
-            return
-        reason = str(payload.get("reason") or "normal")
-        session = self._sessions_by_id.get(session_id)
-        if reason == "rekey" and session is not None:
-            session.writable = False
-            session.state = "closed"
-            current = self._sessions_by_peer.get(session.peer_aid)
-            if current is not None and current.session_id == session_id:
-                self._sessions_by_peer.pop(session.peer_aid, None)
-            self._persist_sessions()
-            return
-        self.invalidate_session(session_id=session_id)
+    # ── 解密 ─────────────────────────────────────────────────
 
     def _decrypt_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
         payload = message["payload"]
-        session_id = str(payload["session_id"])
-        session = self._sessions_by_id.get(session_id)
-        if not session:
-            self._record_error(E2EESessionNotFoundError())
+        encryption_mode = payload.get("encryption_mode", MODE_PREKEY_ECDH)
+
+        if encryption_mode == MODE_PREKEY_ECDH:
+            return self._decrypt_message_prekey(message)
+        elif encryption_mode == MODE_LONG_TERM_KEY:
+            return self._decrypt_message_long_term(message)
+        else:
             return None
 
+    def _decrypt_message_prekey(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        """解密 prekey_ecdh 模式的消息"""
+        payload = message["payload"]
         try:
-            if self._is_session_expired(session):
-                error = E2EESessionExpiredError()
-                self._record_error(error)
-                self._close_session_now(session, error.close_reason or "session_expired")
-                return None
-            counter = int(payload["counter"])
-            if counter <= session.recv_counter:
-                raise E2EEBadCounterError()
+            ephemeral_public_bytes = base64.b64decode(payload["ephemeral_public_key"])
+            prekey_id = payload.get("prekey_id", "")
             nonce = base64.b64decode(payload["nonce"])
             ciphertext = base64.b64decode(payload["ciphertext"])
             tag = base64.b64decode(payload["tag"])
-            aesgcm = AESGCM(session.key)
+
+            keystore = self._keystore()
+            if not keystore:
+                raise E2EEError("Keystore unavailable")
+            prekey_private_key = self._load_prekey_private_key(keystore, prekey_id)
+            if prekey_private_key is None:
+                raise E2EEError(f"prekey not found: {prekey_id}")
+
+            # ECDH + HKDF
+            ephemeral_public = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(), ephemeral_public_bytes
+            )
+            shared_secret = prekey_private_key.exchange(ec.ECDH(), ephemeral_public)
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(), length=32, salt=None,
+                info=f"aun-prekey:{prekey_id}".encode("utf-8"),
+            )
+            message_key = hkdf.derive(shared_secret)
+
+            # 验证 AAD 并解密
+            aesgcm = AESGCM(message_key)
             aad = payload.get("aad")
             if isinstance(aad, dict):
-                expected_aad = self._build_inbound_aad(message, session_id, counter)
-                if not self._aad_matches(expected_aad, aad):
+                expected_aad = self._build_inbound_aad_offline(message, payload)
+                if not self._aad_matches_offline(expected_aad, aad):
                     raise E2EEDecryptFailedError("aad mismatch")
-                aad_bytes = self._aad_bytes(aad)
+                aad_bytes = self._aad_bytes_offline(aad)
             else:
-                if not self._allow_legacy_envelope():
-                    raise E2EEDowngradeBlockedError()
-                aad_bytes = self._legacy_aad(session, counter)
+                aad_bytes = b""
             plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
-            session.recv_counter = counter
-            self._persist_sessions()
 
             decoded = json.loads(plaintext.decode("utf-8"))
             transformed = dict(message)
             transformed["payload"] = decoded
             transformed["encrypted"] = True
             transformed["e2ee"] = {
-                "session_id": session_id,
-                "suite": payload["suite"],
-                "counter": counter,
+                "encryption_mode": MODE_PREKEY_ECDH,
+                "suite": payload.get("suite", SUITE),
+                "prekey_id": prekey_id,
             }
             return transformed
-        except E2EEError as exc:
-            self._record_error(exc)
-            self._close_session_now(session, exc.close_reason or "normal")
+        except E2EEError:
             return None
-        except Exception as exc:
-            error = E2EEDecryptFailedError(str(exc))
-            self._record_error(error)
-            self._close_session_now(session, error.close_reason or "decrypt_failed")
+        except Exception:
             return None
 
-    async def _rekey_session(self, session: ActiveSession) -> ActiveSession:
-        session.writable = False
-        session.state = "rekeying"
-        current = self._sessions_by_peer.get(session.peer_aid)
-        if current is not None and current.session_id == session.session_id:
-            self._sessions_by_peer.pop(session.peer_aid, None)
-        self._persist_sessions()
-        new_session = await self._ensure_session(session.peer_aid)
-        await self._send_close(session, reason="rekey")
-        session.state = "closed"
-        self._persist_sessions()
-        return new_session
+    def _decrypt_message_long_term(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        """解密 long_term_key 模式的消息"""
+        payload = message["payload"]
+        try:
+            encrypted_session_key = base64.b64decode(payload["encrypted_session_key"])
+            ephemeral_public_bytes = base64.b64decode(payload["ephemeral_public_key"])
+            nonce = base64.b64decode(payload["nonce"])
+            ciphertext = base64.b64decode(payload["ciphertext"])
+            tag = base64.b64decode(payload["tag"])
 
-    def _build_outbound_aad(
-        self,
-        peer_aid: str,
-        message_id: str,
-        timestamp: int,
-        session: ActiveSession,
-        counter: int,
-    ) -> dict[str, Any]:
-        sender_aid = self._current_aid()
-        if not sender_aid:
-            raise E2EEError("local aid unavailable for e2ee aad")
-        return {
-            "from": sender_aid,
-            "to": peer_aid,
-            "message_id": message_id,
-            "timestamp": timestamp,
-            "session_id": session.session_id,
-            "counter": counter,
-        }
+            keystore = self._keystore()
+            if not keystore:
+                raise E2EEError("Keystore unavailable")
+            my_aid = self._current_aid()
+            key_pair = keystore.load_key_pair(my_aid)
+            if not key_pair or "private_key_pem" not in key_pair:
+                raise E2EEError("Private key not found")
+            private_key = serialization.load_pem_private_key(
+                key_pair["private_key_pem"].encode("utf-8"), password=None
+            )
+            if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+                raise E2EEError("Private key is not EC key")
 
-    def _build_inbound_aad(self, message: dict[str, Any], session_id: str, counter: int) -> dict[str, Any]:
+            session_key = self._decrypt_session_key_with_private_key(
+                encrypted_session_key, ephemeral_public_bytes, private_key
+            )
+
+            aesgcm = AESGCM(session_key)
+            aad = payload.get("aad")
+            if isinstance(aad, dict):
+                expected_aad = self._build_inbound_aad_offline(message, payload)
+                if not self._aad_matches_offline(expected_aad, aad):
+                    raise E2EEDecryptFailedError("aad mismatch")
+                aad_bytes = self._aad_bytes_offline(aad)
+            else:
+                aad_bytes = b""
+            plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
+
+            decoded = json.loads(plaintext.decode("utf-8"))
+            transformed = dict(message)
+            transformed["payload"] = decoded
+            transformed["encrypted"] = True
+            transformed["e2ee"] = {
+                "encryption_mode": MODE_LONG_TERM_KEY,
+                "suite": payload["suite"],
+            }
+            return transformed
+        except E2EEError:
+            return None
+        except Exception:
+            return None
+
+    # ── ECIES 会话密钥加解密（long_term_key 模式用）──────────
+
+    @staticmethod
+    def _encrypt_session_key_with_public_key(
+        session_key: bytes, recipient_public_key: ec.EllipticCurvePublicKey
+    ) -> tuple[bytes, bytes]:
+        ephemeral_private = ec.generate_private_key(ec.SECP256R1())
+        shared_secret = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
+        kdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"session_key_encryption")
+        encryption_key = kdf.derive(shared_secret)
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(encryption_key)
+        ciphertext_with_tag = aesgcm.encrypt(nonce, session_key, None)
+        ephemeral_public_bytes = ephemeral_private.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+        return ephemeral_public_bytes, nonce + ciphertext_with_tag
+
+    @staticmethod
+    def _decrypt_session_key_with_private_key(
+        encrypted_data: bytes, ephemeral_public_bytes: bytes,
+        recipient_private_key: ec.EllipticCurvePrivateKey,
+    ) -> bytes:
+        ephemeral_public = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), ephemeral_public_bytes
+        )
+        shared_secret = recipient_private_key.exchange(ec.ECDH(), ephemeral_public)
+        kdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"session_key_encryption")
+        decryption_key = kdf.derive(shared_secret)
+        nonce = encrypted_data[:12]
+        ciphertext_with_tag = encrypted_data[12:]
+        aesgcm = AESGCM(decryption_key)
+        return aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+
+    # ── AAD 工具 ─────────────────────────────────────────────
+
+    @staticmethod
+    def _aad_bytes_offline(aad: dict[str, Any]) -> bytes:
+        return json.dumps(
+            {field: aad.get(field) for field in AAD_FIELDS_OFFLINE},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+
+    @staticmethod
+    def _aad_matches_offline(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
+        return all(expected.get(field) == actual.get(field) for field in AAD_MATCH_FIELDS_OFFLINE)
+
+    def _build_inbound_aad_offline(self, message: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "from": message.get("from"),
             "to": message.get("to"),
             "message_id": message.get("message_id"),
             "timestamp": message.get("timestamp"),
-            "session_id": session_id,
-            "counter": counter,
+            "encryption_mode": payload.get("encryption_mode"),
+            "suite": payload.get("suite", SUITE),
+            "ephemeral_public_key": payload.get("ephemeral_public_key"),
+            "recipient_cert_fingerprint": self._local_cert_fingerprint(),
         }
 
-    @staticmethod
-    def _aad_matches(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
-        # The current gateway persists its own top-level timestamp for delivered
-        # messages, so strict outer-envelope timestamp equality would break
-        # decryption on real message.pull/history responses. Keep authenticating
-        # the sender-provided timestamp inside AEAD AAD, but only require the
-        # stable routing/identity fields to match the outer envelope.
-        return all(expected.get(field) == actual.get(field) for field in AAD_MATCH_FIELDS)
+    # ── Prekey 生成 ──────────────────────────────────────────
 
-    @staticmethod
-    def _aad_bytes(aad: dict[str, Any]) -> bytes:
-        return json.dumps(
-            {field: aad[field] for field in AAD_FIELDS},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+    def generate_prekey(self) -> dict[str, Any]:
+        """生成 prekey 材料并保存私钥到本地 keystore。
 
-    @staticmethod
-    def _legacy_aad(session: ActiveSession, counter: int) -> bytes:
-        return f"{session.session_id}:{counter}".encode("utf-8")
+        返回 dict 包含 prekey_id、public_key、signature，可直接用于 RPC 上传。
+        调用方负责调 transport.call("message.e2ee.put_prekey", result) 上传。
+        """
+        keystore = self._keystore()
+        if keystore is None:
+            raise E2EEError("Keystore unavailable for prekey generation")
+        aid = self._current_aid()
+        if not aid:
+            raise E2EEError("AID unavailable for prekey generation")
+
+        # 生成新 prekey
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_der = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        prekey_id = str(uuid.uuid4())
+        public_key_b64 = base64.b64encode(public_der).decode("ascii")
+        now_ms = int(_time_mod.time() * 1000)
+
+        # 签名：prekey_id|public_key
+        sign_data = f"{prekey_id}|{public_key_b64}".encode("utf-8")
+        signature = self._sign_bytes(sign_data)
+
+        # 保存私钥到本地 keystore
+        private_key_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode("utf-8")
+
+        metadata = keystore.load_metadata(aid) or {}
+        local_prekeys = metadata.get("e2ee_prekeys", {})
+        local_prekeys[prekey_id] = {
+            "private_key_pem": private_key_pem,
+            "created_at": now_ms,
+        }
+        metadata["e2ee_prekeys"] = local_prekeys
+        keystore.save_metadata(aid, metadata)
+
+        # 清理过期的旧 prekey 私钥
+        self._cleanup_expired_prekeys(keystore, aid)
+
+        return {
+            "prekey_id": prekey_id,
+            "public_key": public_key_b64,
+            "signature": signature,
+        }
+
+    def _cleanup_expired_prekeys(self, keystore: Any, aid: str) -> None:
+        """清理本地过期的 prekey 私钥"""
+        metadata = keystore.load_metadata(aid) or {}
+        local_prekeys = metadata.get("e2ee_prekeys", {})
+        if not local_prekeys:
+            return
+
+        now_ms = int(_time_mod.time() * 1000)
+        cutoff_ms = now_ms - PREKEY_RETENTION_SECONDS * 1000
+        expired = [pid for pid, data in local_prekeys.items()
+                   if data.get("created_at", 0) < cutoff_ms]
+        if expired:
+            for pid in expired:
+                del local_prekeys[pid]
+            metadata["e2ee_prekeys"] = local_prekeys
+            keystore.save_metadata(aid, metadata)
+
+    def _load_prekey_private_key(self, keystore: Any, prekey_id: str) -> ec.EllipticCurvePrivateKey | None:
+        """从 keystore 加载 prekey 私钥"""
+        aid = self._current_aid()
+        if not aid:
+            return None
+        metadata = keystore.load_metadata(aid) or {}
+        prekeys = metadata.get("e2ee_prekeys", {})
+        prekey_data = prekeys.get(prekey_id)
+        if not prekey_data:
+            return None
+        private_key_pem = prekey_data.get("private_key_pem")
+        if not private_key_pem:
+            return None
+
+        # 尝试加密存储（向后兼容）
+        key_pair = keystore.load_key_pair(aid)
+        if key_pair and "private_key_pem" in key_pair:
+            identity_key_hash = hashes.Hash(hashes.SHA256())
+            identity_key_hash.update(key_pair["private_key_pem"].encode("utf-8"))
+            encryption_password = identity_key_hash.finalize()[:32]
+            try:
+                pk = serialization.load_pem_private_key(
+                    private_key_pem.encode("utf-8"), password=encryption_password
+                )
+                if isinstance(pk, ec.EllipticCurvePrivateKey):
+                    return pk
+            except Exception:
+                pass
+
+        try:
+            pk = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+            if isinstance(pk, ec.EllipticCurvePrivateKey):
+                return pk
+        except Exception:
+            pass
+        return None
+
+    # ── 证书指纹工具 ────────────────────────────────────────
+
+    @classmethod
+    def _fingerprint_cert_pem(cls, cert_pem: bytes) -> str:
+        """从 PEM 证书计算公钥指纹"""
+        cert_bytes = cert_pem if isinstance(cert_pem, bytes) else cert_pem.encode("utf-8")
+        cert = x509.load_pem_x509_certificate(cert_bytes)
+        return cls._fingerprint_public_key(cert.public_key())
+
+    def _local_cert_fingerprint(self) -> str:
+        return self._local_identity_fingerprint()
 
     def _sign_bytes(self, data: bytes) -> str:
-        identity = self._client._identity or {}
+        identity = self._identity_fn()
         private_key_pem = identity.get("private_key_pem")
         if not private_key_pem:
             raise E2EEError("identity private key unavailable")
@@ -529,280 +625,8 @@ class E2EEManager:
         signature = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
         return base64.b64encode(signature).decode("ascii")
 
-    def _verify_peer_signature(self, aid: str, document: dict[str, Any], signature_b64: str) -> None:
-        cert_pem = self._cert_cache.get(aid)
-        if cert_pem is None:
-            raise E2EEError(f"peer certificate not cached for {aid}")
-        cert = x509.load_pem_x509_certificate(cert_pem)
-        expected_fingerprint = document.get("identity_key_fingerprint")
-        actual_fingerprint = self._fingerprint_public_key(cert.public_key())
-        if expected_fingerprint != actual_fingerprint:
-            raise E2EEBadSignatureError("identity fingerprint mismatch")
-        public_key = cert.public_key()
-        try:
-            public_key.verify(
-                base64.b64decode(signature_b64),
-                self._canonical_handshake(document),
-                ec.ECDSA(hashes.SHA256()),
-            )
-        except Exception as exc:
-            raise E2EEBadSignatureError(str(exc)) from exc
-
-    async def ensure_peer_cert(self, aid: str) -> None:
-        if aid in self._cert_cache:
-            return
-        gateway_url = self._client._gateway_url
-        if not gateway_url:
-            raise ValidationError("gateway url unavailable for e2ee cert fetch")
-        cert_url = self._build_cert_url(gateway_url, aid)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(cert_url) as response:
-                response.raise_for_status()
-                cert_pem = await response.text()
-        self._cert_cache[aid] = cert_pem.encode("utf-8")
-
-    async def preload_peer(self, aid: str) -> None:
-        await self.ensure_peer_cert(aid)
-
-    def drain_deferred_messages(self) -> list[dict[str, Any]]:
-        messages = list(self._deferred_messages)
-        self._deferred_messages.clear()
-        return messages
-
-    def _queue_deferred_messages(self, messages: list[dict[str, Any]]) -> None:
-        self._deferred_messages.extend(messages)
-        self._deferred_messages.sort(key=lambda item: int(item.get("seq") or 0))
-
-    def invalidate_session(self, *, peer_aid: str | None = None, session_id: str | None = None) -> None:
-        self._restore_sessions_if_needed()
-        active = None
-        if session_id:
-            active = self._sessions_by_id.pop(session_id, None)
-            if active is not None:
-                current = self._sessions_by_peer.get(active.peer_aid)
-                if current is not None and current.session_id == session_id:
-                    self._sessions_by_peer.pop(active.peer_aid, None)
-            self._discard_pending(session_id)
-        if peer_aid:
-            active = self._sessions_by_peer.pop(peer_aid, None)
-            if active is not None:
-                self._sessions_by_id.pop(active.session_id, None)
-                self._remove_read_only_sessions(active.peer_aid)
-            pending_session_id = self._pending_by_peer.pop(peer_aid, None)
-            if pending_session_id is not None:
-                self._discard_pending(pending_session_id)
-        self._persist_sessions()
-
-    def _discard_pending(self, session_id: str) -> None:
-        pending = self._pending.pop(session_id, None)
-        if pending is not None:
-            pending_peer_aid = getattr(pending, "peer_aid", None)
-            if pending_peer_aid:
-                mapped = self._pending_by_peer.get(pending_peer_aid)
-                if mapped == session_id:
-                    self._pending_by_peer.pop(pending_peer_aid, None)
-        waiter = self._accept_waiters.pop(session_id, None)
-        if waiter is not None and not waiter.done():
-            waiter.cancel()
-
-    def _is_session_expired(self, session: ActiveSession) -> bool:
-        return self._loop_time() >= session.expires_at
-
-    def _should_rekey(self, session: ActiveSession) -> bool:
-        if not session.writable:
-            return False
-        return session.expires_at - self._loop_time() <= self._session_rekey_before_seconds()
-
-    def _session_ttl_seconds(self) -> float:
-        config_model = getattr(self._client, "_config_model", None)
-        extra = getattr(config_model, "extra", {}) if config_model is not None else {}
-        raw_config = getattr(self._client, "config", {}) or {}
-        ttl = extra.get("e2ee_session_ttl", raw_config.get("e2ee_session_ttl", 86400.0))
-        return max(float(ttl), 1.0)
-
-    def _session_rekey_before_seconds(self) -> float:
-        config_model = getattr(self._client, "_config_model", None)
-        extra = getattr(config_model, "extra", {}) if config_model is not None else {}
-        raw_config = getattr(self._client, "config", {}) or {}
-        lead = extra.get("e2ee_rekey_before", raw_config.get("e2ee_rekey_before", 300.0))
-        ttl = self._session_ttl_seconds()
-        return max(min(float(lead), max(ttl - 1.0, 0.0)), 0.0)
-
-    def _allow_legacy_envelope(self) -> bool:
-        config_model = getattr(self._client, "_config_model", None)
-        extra = getattr(config_model, "extra", {}) if config_model is not None else {}
-        raw_config = getattr(self._client, "config", {}) or {}
-        return bool(extra.get("e2ee_allow_legacy_envelope", raw_config.get("e2ee_allow_legacy_envelope", False)))
-
-    def _loop_time(self) -> float:
-        loop = getattr(self._client, "_loop", None)
-        if loop is None:
-            raise E2EEError("event loop unavailable for e2ee manager")
-        return float(loop.time())
-
-    def _restore_sessions_if_needed(self) -> None:
-        aid = self._current_aid()
-        if not aid:
-            return
-        if self._loaded_sessions_aid == aid:
-            return
-        self._loaded_sessions_aid = aid
-        keystore = self._keystore()
-        if keystore is None:
-            return
-        metadata = keystore.load_metadata(aid) or {}
-        stored_sessions = metadata.get("e2ee_sessions")
-        if not isinstance(stored_sessions, list):
-            return
-
-        cleanup_required = False
-        for raw in stored_sessions:
-            if not isinstance(raw, dict):
-                cleanup_required = True
-                continue
-            try:
-                session_id = str(raw["session_id"])
-                peer_aid = str(raw["peer_aid"])
-                key = base64.b64decode(raw["key"])
-                established_at = float(raw["established_at"])
-                expires_at = float(raw["expires_at"])
-                send_counter = int(raw.get("send_counter", 0))
-                recv_counter = int(raw.get("recv_counter", 0))
-            except Exception:
-                if "key" in raw and isinstance(raw.get("key"), str):
-                    cleanup_required = True
-                continue
-            session = ActiveSession(
-                session_id=session_id,
-                peer_aid=peer_aid,
-                key=key,
-                established_at=established_at,
-                expires_at=expires_at,
-                writable=bool(raw.get("writable", True)),
-                state=str(raw.get("state") or "active"),
-                send_counter=send_counter,
-                recv_counter=recv_counter,
-            )
-            if self._is_session_expired(session):
-                cleanup_required = True
-                continue
-            self._sessions_by_id[session_id] = session
-            if session.writable:
-                self._sessions_by_peer[peer_aid] = session
-        if cleanup_required:
-            self._persist_sessions()
-
-    def _persist_sessions(self) -> None:
-        aid = self._current_aid()
-        if not aid:
-            return
-        keystore = self._keystore()
-        if keystore is None:
-            return
-        metadata = keystore.load_metadata(aid) or {}
-        serialized_sessions = []
-        expired_session_ids: list[str] = []
-        for session in list(self._sessions_by_id.values()):
-            if self._is_session_expired(session):
-                expired_session_ids.append(session.session_id)
-                continue
-            serialized_sessions.append({
-                "session_id": session.session_id,
-                "peer_aid": session.peer_aid,
-                "key": base64.b64encode(session.key).decode("ascii"),
-                "established_at": session.established_at,
-                "expires_at": session.expires_at,
-                "writable": session.writable,
-                "state": session.state,
-                "send_counter": session.send_counter,
-                "recv_counter": session.recv_counter,
-            })
-        for expired_session_id in expired_session_ids:
-            self._remove_active_session(expired_session_id)
-        if serialized_sessions:
-            metadata["e2ee_sessions"] = serialized_sessions
-        else:
-            metadata.pop("e2ee_sessions", None)
-        keystore.save_metadata(aid, metadata)
-
-    def _remove_active_session(self, session_id: str) -> None:
-        active = self._sessions_by_id.pop(session_id, None)
-        if active is None:
-            return
-        current = self._sessions_by_peer.get(active.peer_aid)
-        if current is not None and current.session_id == session_id:
-            self._sessions_by_peer.pop(active.peer_aid, None)
-
-    def _remove_read_only_sessions(self, peer_aid: str) -> None:
-        stale_ids = [
-            session_id
-            for session_id, session in self._sessions_by_id.items()
-            if session.peer_aid == peer_aid and not session.writable
-        ]
-        for stale_id in stale_ids:
-            self._remove_active_session(stale_id)
-
-    def _current_aid(self) -> str | None:
-        identity = getattr(self._client, "_identity", None) or {}
-        aid = identity.get("aid") or getattr(self._client, "_aid", None)
-        return str(aid) if aid else None
-
-    def _keystore(self) -> Any | None:
-        auth = getattr(self._client, "_auth", None)
-        return getattr(auth, "_keystore", None)
-
-    async def _send_close(self, session: ActiveSession, *, reason: str) -> None:
-        try:
-            await self._client.call("message.send", {
-                "to": session.peer_aid,
-                "persist": True,
-                "payload": {
-                    "type": "e2ee.close",
-                    "version": "1",
-                    "session_id": session.session_id,
-                    "reason": reason,
-                },
-            })
-        except Exception:
-            return
-
-    async def _send_reject(
-        self,
-        peer_aid: str,
-        session_id: str,
-        reason: str,
-        *,
-        supported_suites: list[str] | None = None,
-    ) -> None:
-        payload: dict[str, Any] = {
-            "type": "e2ee.reject",
-            "version": "1",
-            "session_id": session_id,
-            "reason": reason,
-        }
-        if supported_suites is not None:
-            payload["supported_suites"] = supported_suites
-        try:
-            await self._client.call("message.send", {
-                "to": peer_aid,
-                "persist": True,
-                "payload": payload,
-            })
-        except Exception:
-            return
-
-    def _close_session_now(self, session: ActiveSession, reason: str) -> None:
-        loop = getattr(self._client, "_loop", None)
-        is_running = getattr(loop, "is_running", lambda: False)
-        if loop is not None and is_running():
-            loop.create_task(self._send_close(session, reason=reason))
-        self.invalidate_session(session_id=session.session_id)
-
-    def _record_error(self, error: E2EEError) -> None:
-        self._last_error = error
-
     def _local_identity_fingerprint(self) -> str:
-        identity = getattr(self._client, "_identity", None) or {}
+        identity = self._identity_fn()
         public_key_der_b64 = identity.get("public_key_der_b64")
         if isinstance(public_key_der_b64, str) and public_key_der_b64:
             return self._fingerprint_der_public_key(base64.b64decode(public_key_der_b64))
@@ -830,24 +654,12 @@ class E2EEManager:
         digest.update(der)
         return f"sha256:{digest.finalize().hex()}"
 
-    @staticmethod
-    def _derive_key(shared_secret: bytes, session_id: str) -> bytes:
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=f"aun-e2ee:{session_id}".encode("utf-8"),
-        )
-        return hkdf.derive(shared_secret)
+    # ── 内部工具 ─────────────────────────────────────────────
 
-    @staticmethod
-    def _canonical_handshake(document: dict[str, Any]) -> bytes:
-        return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    def _current_aid(self) -> str | None:
+        identity = self._identity_fn()
+        aid = identity.get("aid")
+        return str(aid) if aid else None
 
-    @staticmethod
-    def _build_cert_url(gateway_url: str, aid: str) -> str:
-        parsed = urlparse(gateway_url)
-        scheme = "https" if parsed.scheme == "wss" else "http"
-        netloc = parsed.netloc
-        path = f"/pki/cert/{quote(aid, safe='')}"
-        return urlunparse((scheme, netloc, path, "", "", ""))
+    def _keystore(self) -> Any | None:
+        return self._keystore_ref

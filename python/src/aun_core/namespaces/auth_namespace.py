@@ -19,8 +19,24 @@ class AuthNamespace:
             return str(self._client._gateway_url)
         resolved_aid = aid or self._client._aid
         if resolved_aid:
-            url = f"https://{resolved_aid}/.well-known/aun-gateway"
-            return await self._client._discovery.discover(url)
+            # 提取 issuer domain（AID 的域名部分，第一个 '.' 之后）
+            parts = resolved_aid.split(".", 1)
+            issuer_domain = parts[1] if len(parts) > 1 else resolved_aid
+
+            # 发现端口：配置值或标准 HTTPS(443)
+            port = self._client._config_model.discovery_port
+            port_suffix = f":{port}" if port else ""
+
+            # 标准流程：先 https://{aid}/.well-known/aun-gateway（泛域名 nameservice）
+            primary_url = f"https://{resolved_aid}{port_suffix}/.well-known/aun-gateway"
+            try:
+                return await self._client._discovery.discover(primary_url)
+            except Exception:
+                pass
+
+            # Fallback：https://gateway.{issuer}/.well-known/aun-gateway（Gateway 直连）
+            fallback_url = f"https://gateway.{issuer_domain}{port_suffix}/.well-known/aun-gateway"
+            return await self._client._discovery.discover(fallback_url)
         raise ValidationError(
             "unable to resolve gateway: set client._gateway_url or provide 'aid' for auto-discovery"
         )

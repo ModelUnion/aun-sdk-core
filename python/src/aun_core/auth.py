@@ -266,38 +266,22 @@ class AuthFlow:
             raise AuthError(f"initialize failed: {result}")
 
     async def _create_aid(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
-        t0 = time.perf_counter()
         response = await self._short_rpc(gateway_url, "auth.create_aid", {
             "aid": identity["aid"],
             "public_key": identity["public_key_der_b64"],
             "curve": identity.get("curve", "P-256"),
         })
-        t1 = time.perf_counter()
-        print(f"[perf] create_aid RPC: {(t1-t0)*1000:.1f}ms")
         return {"cert": response["cert"]}
 
     async def _login(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
-        t0 = time.perf_counter()
         client_nonce = self._crypto.new_client_nonce()
-        t1 = time.perf_counter()
-        print(f"[perf] generate nonce: {(t1-t0)*1000:.1f}ms")
-
         phase1 = await self._short_rpc(gateway_url, "auth.aid_login1", {
             "aid": identity["aid"],
             "cert": identity["cert"],
             "client_nonce": client_nonce,
         })
-        t2 = time.perf_counter()
-        print(f"[perf] aid_login1 RPC: {(t2-t1)*1000:.1f}ms")
-
         await self._verify_phase1_response(gateway_url, phase1, client_nonce)
-        t3 = time.perf_counter()
-        print(f"[perf] verify phase1: {(t3-t2)*1000:.1f}ms")
-
         signature, client_time = self._crypto.sign_login_nonce(identity["private_key_pem"], phase1["nonce"])
-        t4 = time.perf_counter()
-        print(f"[perf] sign nonce: {(t4-t3)*1000:.1f}ms")
-
         phase2 = await self._short_rpc(gateway_url, "auth.aid_login2", {
             "aid": identity["aid"],
             "request_id": phase1["request_id"],
@@ -305,9 +289,6 @@ class AuthFlow:
             "client_time": client_time,
             "signature": signature,
         })
-        t5 = time.perf_counter()
-        print(f"[perf] aid_login2 RPC: {(t5-t4)*1000:.1f}ms")
-        print(f"[perf] total login: {(t5-t0)*1000:.1f}ms")
         return phase2
 
     async def _refresh_access_token(self, gateway_url: str, refresh_token: str) -> dict[str, Any]:
@@ -319,23 +300,17 @@ class AuthFlow:
         return result
 
     async def _short_rpc(self, gateway_url: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        t0 = time.perf_counter()
         ws = await self._connection_factory(gateway_url)
-        t1 = time.perf_counter()
         try:
             await ws.recv()
-            t2 = time.perf_counter()
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
                 "id": f"pre-{method}",
                 "method": method,
                 "params": params,
             }))
-            t3 = time.perf_counter()
             raw = await ws.recv()
-            t4 = time.perf_counter()
             message = raw if isinstance(raw, dict) else json.loads(raw)
-            print(f"[perf]   _short_rpc {method}: connect={int((t1-t0)*1000)}ms, hello={int((t2-t1)*1000)}ms, send={int((t3-t2)*1000)}ms, recv={int((t4-t3)*1000)}ms")
         finally:
             await ws.close()
 
@@ -349,7 +324,6 @@ class AuthFlow:
         return result
 
     async def _verify_phase1_response(self, gateway_url: str, result: dict[str, Any], client_nonce: str) -> None:
-        t0 = time.perf_counter()
         auth_cert_pem = str(result.get("auth_cert") or "")
         signature_b64 = str(result.get("client_nonce_signature") or "")
         if not auth_cert_pem:
@@ -361,44 +335,28 @@ class AuthFlow:
             auth_cert = x509.load_pem_x509_certificate(auth_cert_pem.encode("utf-8"))
         except Exception as exc:
             raise AuthError("aid_login1 returned invalid auth_cert") from exc
-        t1 = time.perf_counter()
-        print(f"[perf]   parse cert: {(t1-t0)*1000:.1f}ms")
 
         await self._verify_auth_cert_chain(gateway_url, auth_cert)
-        t2 = time.perf_counter()
-        print(f"[perf]   verify chain: {(t2-t1)*1000:.1f}ms")
-
         await self._verify_auth_cert_revocation(gateway_url, auth_cert)
-        t3 = time.perf_counter()
-        print(f"[perf]   verify CRL: {(t3-t2)*1000:.1f}ms")
-
         await self._verify_auth_cert_ocsp(gateway_url, auth_cert)
-        t4 = time.perf_counter()
-        print(f"[perf]   verify OCSP: {(t4-t3)*1000:.1f}ms")
 
         try:
             signature = base64.b64decode(signature_b64)
             _verify_signature(auth_cert.public_key(), signature, client_nonce.encode("utf-8"))
         except (ValueError, InvalidSignature, AuthError) as exc:
             raise AuthError("aid_login1 server auth signature verification failed") from exc
-        t5 = time.perf_counter()
-        print(f"[perf]   verify signature: {(t5-t4)*1000:.1f}ms")
 
     async def _verify_auth_cert_chain(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
         # 检查缓存：已验证过且未过期则跳过
         cert_serial = format(auth_cert.serial_number, "x")
         cached_at = self._chain_verified_cache.get(cert_serial)
         if cached_at and time.time() - cached_at < self._chain_cache_ttl:
-            print(f"[perf]     chain cache hit")
             return
 
-        t0 = time.perf_counter()
         now = time.time()
         self._ensure_cert_time_valid(auth_cert, "auth certificate", now)
 
         chain = await self._load_gateway_ca_chain(gateway_url)
-        t1 = time.perf_counter()
-        print(f"[perf]     load CA chain: {(t1-t0)*1000:.1f}ms")
 
         if not chain:
             raise AuthError("unable to verify auth certificate chain: missing CA chain")
@@ -414,8 +372,6 @@ class AuthFlow:
             except Exception as exc:
                 raise AuthError("auth certificate signature verification failed") from exc
             self._chain_verified_cache[cert_serial] = time.time()
-            t2 = time.perf_counter()
-            print(f"[perf]     verify auth_to_issuer: {(t2-t1)*1000:.1f}ms (CA链已预验证)")
             return
 
         # 首次验证：完整验证 + 预验证 CA 链
@@ -443,10 +399,7 @@ class AuthFlow:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(verify_pairs)) as executor:
             futures = [executor.submit(verify_level, c, ca, i) for c, ca, i in verify_pairs]
             for future in concurrent.futures.as_completed(futures):
-                future.result()  # 抛出异常（如果有）
-
-        t2 = time.perf_counter()
-        print(f"[perf]     verify signatures: {(t2-t1)*1000:.1f}ms")
+                future.result()
 
         root = chain[-1]
         if root.issuer != root.subject:
@@ -467,8 +420,6 @@ class AuthFlow:
         # 验证成功，保存到缓存并标记 CA 链已预验证
         self._chain_verified_cache[cert_serial] = time.time()
         self._gateway_ca_verified[gateway_url] = True
-        t3 = time.perf_counter()
-        print(f"[perf]     verify root: {(t3-t2)*1000:.1f}ms (CA链已预验证，后续只验证 auth→Issuer)")
 
     async def _load_gateway_ca_chain(self, gateway_url: str) -> list[x509.Certificate]:
         cached = self._gateway_chain_cache.get(gateway_url)
@@ -486,7 +437,6 @@ class AuthFlow:
                     root = certs[-1]
                     _verify_signature(root.public_key(), root.signature, root.tbs_certificate_bytes)
                     self._gateway_ca_verified[gateway_url] = True
-                    print(f"[perf] Gateway CA 链预验证成功")
                 except Exception:
                     pass  # 预验证失败不影响后续完整验证
         return self._load_cert_bundle(cached)
@@ -651,7 +601,7 @@ class AuthFlow:
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
+                async with session.get(url, ssl=False) as response:
                     response.raise_for_status()
                     return await response.text()
         except Exception as exc:
@@ -661,7 +611,7 @@ class AuthFlow:
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
+                async with session.get(url, ssl=False) as response:
                     response.raise_for_status()
                     payload = await response.json()
         except Exception as exc:

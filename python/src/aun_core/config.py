@@ -67,6 +67,7 @@ class AUNConfig:
     aun_path: Path = field(default_factory=_default_aun_path)
     root_ca_path: str | None = None
     encryption_seed: str | None = None
+    discovery_port: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "AUNConfig":
@@ -74,8 +75,10 @@ class AUNConfig:
         aun_path = data.get("aun_path")
         if aun_path is None:
             aun_path = _default_aun_path()
+        dp = data.get("discovery_port")
         return cls(
             aun_path=Path(aun_path).expanduser(),
             root_ca_path=data.get("root_ca_path"),
             encryption_seed=data.get("encryption_seed"),
+            discovery_port=int(dp) if dp is not None else None,
         )

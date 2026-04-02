@@ -86,26 +86,6 @@ class E2EEError(AUNError):
         self.close_reason = close_reason
 
 
-class E2EESessionNotFoundError(E2EEError):
-    def __init__(self, message: str = "e2ee session not found", **kwargs: Any) -> None:
-        super().__init__(message, local_code="E2EE_SESSION_NOT_FOUND", **kwargs)
-
-
-class E2EEBadSignatureError(E2EEError):
-    def __init__(self, message: str = "e2ee bad signature", **kwargs: Any) -> None:
-        super().__init__(message, local_code="E2EE_BAD_SIGNATURE", **kwargs)
-
-
-class E2EEBadCounterError(E2EEError):
-    def __init__(self, message: str = "e2ee bad counter", **kwargs: Any) -> None:
-        super().__init__(
-            message,
-            local_code="E2EE_BAD_COUNTER",
-            close_reason="counter_violation",
-            **kwargs,
-        )
-
-
 class E2EEDecryptFailedError(E2EEError):
     def __init__(self, message: str = "e2ee decrypt failed", **kwargs: Any) -> None:
         super().__init__(
@@ -114,38 +94,6 @@ class E2EEDecryptFailedError(E2EEError):
             close_reason="decrypt_failed",
             **kwargs,
         )
-
-
-class E2EEUnsupportedSuiteError(E2EEError):
-    def __init__(self, message: str = "e2ee unsupported suite", **kwargs: Any) -> None:
-        super().__init__(message, local_code="E2EE_UNSUPPORTED_SUITE", **kwargs)
-
-
-class E2EESessionExpiredError(E2EEError):
-    def __init__(self, message: str = "e2ee session expired", **kwargs: Any) -> None:
-        super().__init__(
-            message,
-            local_code="E2EE_SESSION_EXPIRED",
-            close_reason="session_expired",
-            **kwargs,
-        )
-
-
-class E2EEDowngradeBlockedError(E2EEError):
-    def __init__(self, message: str = "e2ee downgrade blocked", **kwargs: Any) -> None:
-        super().__init__(message, local_code="E2EE_DOWNGRADE_BLOCKED", **kwargs)
-
-
-class E2EENegotiationRejectedError(E2EEError):
-    def __init__(
-        self,
-        message: str = "e2ee negotiation rejected",
-        *,
-        reject_reason: str | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(message, local_code="E2EE_NEGOTIATION_REJECTED", **kwargs)
-        self.reject_reason = reject_reason
 
 
 def map_remote_error(error: dict[str, Any]) -> AUNError:

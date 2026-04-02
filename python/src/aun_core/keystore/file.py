@@ -72,10 +72,12 @@ class FileKeyStore(KeyStore):
     def load_key_pair(self, aid: str) -> dict | None:
         path = self._key_pair_path(aid)
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            key_pair = json.loads(path.read_text(encoding="utf-8"))
+            return self._restore_key_pair(aid, key_pair)
         legacy_key_path = self._load_legacy_split_file(aid, ".key.json")
         if legacy_key_path is not None:
-            return json.loads(legacy_key_path.read_text(encoding="utf-8"))
+            key_pair = json.loads(legacy_key_path.read_text(encoding="utf-8"))
+            return self._restore_key_pair(aid, key_pair)
         identity = self._load_legacy_identity(aid)
         if identity is None:
             return None
@@ -89,7 +91,21 @@ class FileKeyStore(KeyStore):
     def save_key_pair(self, aid: str, key_pair: dict) -> None:
         path = self._key_pair_path(aid)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(key_pair, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # 保护私钥
+        protected_key_pair = copy.deepcopy(key_pair)
+        scope = self._safe_aid(aid)
+        private_key_pem = protected_key_pair.pop("private_key_pem", None)
+        if isinstance(private_key_pem, str) and private_key_pem:
+            protected_key_pair["private_key_protection"] = self._secret_store.protect(
+                scope,
+                "identity/private_key",
+                private_key_pem.encode("utf-8"),
+            )
+        elif "private_key_protection" not in protected_key_pair:
+            self._secret_store.clear(scope, "identity/private_key")
+
+        path.write_text(json.dumps(protected_key_pair, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_cert(self, aid: str) -> str | None:
         path = self._cert_path(aid)
@@ -248,6 +264,28 @@ class FileKeyStore(KeyStore):
                     self._secret_store.clear(scope, secret_name)
                 sanitized_sessions.append(session)
             protected["e2ee_sessions"] = sanitized_sessions
+
+        # 保护 prekey 私钥
+        prekeys = protected.get("e2ee_prekeys")
+        if isinstance(prekeys, dict):
+            sanitized_prekeys: dict[str, dict[str, Any]] = {}
+            for prekey_id, prekey_data in prekeys.items():
+                if not isinstance(prekey_data, dict):
+                    continue
+                prekey = copy.deepcopy(prekey_data)
+                secret_name = f"e2ee_prekeys/{prekey_id}/private_key"
+                value = prekey.pop("private_key_pem", None)
+                if isinstance(value, str) and value:
+                    prekey["private_key_protection"] = self._secret_store.protect(
+                        scope,
+                        secret_name,
+                        value.encode("utf-8"),
+                    )
+                elif "private_key_protection" not in prekey:
+                    self._secret_store.clear(scope, secret_name)
+                sanitized_prekeys[prekey_id] = prekey
+            protected["e2ee_prekeys"] = sanitized_prekeys
+
         return protected
 
     def _restore_metadata(self, aid: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -275,6 +313,22 @@ class FileKeyStore(KeyStore):
                         raw["key"] = value.decode("utf-8")
                     else:
                         raw.pop("key", None)
+
+        # 恢复 prekey 私钥
+        prekeys = restored.get("e2ee_prekeys")
+        if isinstance(prekeys, dict):
+            for prekey_id, prekey_data in prekeys.items():
+                if not isinstance(prekey_data, dict):
+                    continue
+                record = prekey_data.get("private_key_protection")
+                secret_name = f"e2ee_prekeys/{prekey_id}/private_key"
+                if isinstance(record, dict):
+                    value = self._secret_store.reveal(scope, secret_name, record)
+                    if value is not None:
+                        prekey_data["private_key_pem"] = value.decode("utf-8")
+                    else:
+                        prekey_data.pop("private_key_pem", None)
+
         return restored
 
     @staticmethod
@@ -283,6 +337,19 @@ class FileKeyStore(KeyStore):
         if not session_id:
             return None
         return f"e2ee_sessions/{session_id}/key"
+
+    def _restore_key_pair(self, aid: str, key_pair: dict[str, Any]) -> dict[str, Any]:
+        """从 SecretStore 恢复身份私钥（如果被保护）"""
+        restored = copy.deepcopy(key_pair)
+        scope = self._safe_aid(aid)
+        record = restored.get("private_key_protection")
+        if isinstance(record, dict):
+            value = self._secret_store.reveal(scope, "identity/private_key", record)
+            if value is not None:
+                restored["private_key_pem"] = value.decode("utf-8")
+            else:
+                restored.pop("private_key_pem", None)
+        return restored
 
     @staticmethod
     def _prepare_root(preferred: Path, fallback: Path) -> Path:

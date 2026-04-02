@@ -136,7 +136,7 @@ def test_verify_phase1_response_accepts_valid_identity_chain(monkeypatch):
         flow._verify_phase1_response(
             "wss://gw.example/aun",
             {
-                "identity_cert": identity_pem,
+                "auth_cert": identity_pem,
                 "client_nonce_signature": base64.b64encode(signature).decode("ascii"),
             },
             client_nonce,
@@ -173,12 +173,12 @@ def test_verify_phase1_response_rejects_bad_signature(monkeypatch):
     monkeypatch.setattr(flow, "_fetch_gateway_crl", fake_fetch_gateway_crl)
     monkeypatch.setattr(flow, "_fetch_gateway_ocsp_status", fake_fetch_gateway_ocsp_status)
 
-    with pytest.raises(AuthError, match="server identity signature verification failed"):
+    with pytest.raises(AuthError, match="server auth signature verification failed"):
         asyncio.run(
             flow._verify_phase1_response(
                 "wss://gw.example/aun",
                 {
-                    "identity_cert": identity_pem,
+                    "auth_cert": identity_pem,
                     "client_nonce_signature": base64.b64encode(b"bad").decode("ascii"),
                 },
                 "nonce-123",
@@ -221,12 +221,12 @@ def test_verify_phase1_response_rejects_revoked_identity_cert(monkeypatch):
     client_nonce = base64.b64encode(b"nonce-123").decode("ascii")
     signature = identity_key.sign(client_nonce.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
 
-    with pytest.raises(AuthError, match="identity certificate has been revoked"):
+    with pytest.raises(AuthError, match="auth certificate has been revoked"):
         asyncio.run(
             flow._verify_phase1_response(
                 "wss://gw.example/aun",
                 {
-                    "identity_cert": identity_pem,
+                    "auth_cert": identity_pem,
                     "client_nonce_signature": base64.b64encode(signature).decode("ascii"),
                 },
                 client_nonce,

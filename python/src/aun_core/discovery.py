@@ -12,11 +12,14 @@ class GatewayDiscovery:
         try:
             client_timeout = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.get(well_known_url) as response:
+                async with session.get(well_known_url, ssl=False) as response:
                     response.raise_for_status()
                     payload: dict[str, Any] = await response.json()
         except Exception as exc:
-            raise ConnectionError(f"gateway discovery failed: {exc}", retryable=True) from exc
+            raise ConnectionError(
+                f"gateway discovery failed for {well_known_url}: {exc}",
+                retryable=True,
+            ) from exc
 
         gateways = payload.get("gateways", [])
         if not gateways:

@@ -49,12 +49,12 @@ def test_create_aid_caches_discovered_gateway(monkeypatch):
     client = AUNClient()
 
     async def fake_discover(url: str) -> str:
-        assert url == "https://demo.aid.com/.well-known/aun-gateway"
+        assert url == "https://gateway.agentid.pub/.well-known/aun-gateway"
         return "ws://gateway.example/aun"
 
     async def fake_create_aid(gateway_url: str, aid: str) -> dict:
         assert gateway_url == "ws://gateway.example/aun"
-        assert aid == "demo.aid.com"
+        assert aid == "demo.agentid.pub"
         return {"aid": aid, "cert": "CERT"}
 
     monkeypatch.setattr(client._discovery, "discover", fake_discover)
@@ -62,7 +62,7 @@ def test_create_aid_caches_discovered_gateway(monkeypatch):
     monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: None)
 
     result = asyncio.run(
-        client.auth.create_aid({"aid": "demo.aid.com"})
+        client.auth.create_aid({"aid": "demo.agentid.pub"})
     )
 
     assert result["gateway"] == "ws://gateway.example/aun"
@@ -73,12 +73,12 @@ def test_authenticate_caches_discovered_gateway(monkeypatch):
     client = AUNClient()
 
     async def fake_discover(url: str) -> str:
-        assert url == "https://demo.aid.com/.well-known/aun-gateway"
+        assert url == "https://gateway.agentid.pub/.well-known/aun-gateway"
         return "ws://gateway.example/aun"
 
     async def fake_authenticate(gateway_url: str, *, aid=None) -> dict:
         assert gateway_url == "ws://gateway.example/aun"
-        assert aid == "demo.aid.com"
+        assert aid == "demo.agentid.pub"
         return {
             "aid": aid,
             "access_token": "tok",
@@ -92,7 +92,7 @@ def test_authenticate_caches_discovered_gateway(monkeypatch):
     monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: None)
 
     result = asyncio.run(
-        client.auth.authenticate({"aid": "demo.aid.com"})
+        client.auth.authenticate({"aid": "demo.agentid.pub"})
     )
 
     assert result["gateway"] == "ws://gateway.example/aun"
@@ -109,7 +109,7 @@ def test_create_aid_requires_aid_when_gateway_missing():
 def test_authenticate_requires_aid_when_gateway_missing():
     client = AUNClient()
 
-    with pytest.raises(Exception, match="requires 'aid' when 'gateway' is not provided"):
+    with pytest.raises(Exception, match="unable to resolve gateway"):
         asyncio.run(client.auth.authenticate({}))
 
 

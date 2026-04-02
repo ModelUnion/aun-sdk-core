@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+recursive-include src/aun_core/certs *.crt
+recursive-include src/aun_core/docs *.md

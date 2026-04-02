@@ -150,7 +150,8 @@ class RPCTransport:
         if method.startswith("event/"):
             protocol_event = method.removeprefix("event/")
             sdk_event = EVENT_NAME_MAP.get(protocol_event, protocol_event)
-            await self._dispatcher.publish(sdk_event, message.get("params", {}))
+            # 发布为 _raw.{event}，由 AUNClient 处理后再发布用户可见的事件
+            await self._dispatcher.publish(f"_raw.{sdk_event}", message.get("params", {}))
             return
 
         await self._dispatcher.publish("notification", message)
