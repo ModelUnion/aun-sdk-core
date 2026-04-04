@@ -227,8 +227,8 @@ class AuthFlow:
                 identity["access_token"] = explicit_token
                 self._keystore.save_identity(identity["aid"], identity)
                 return {"token": explicit_token, "identity": identity}
-            except AuthError:
-                pass
+            except AuthError as exc:
+                _auth_log.debug("explicit_token 认证失败，尝试下一方式: %s", exc)
 
         if identity is None:
             auth_context = await self.ensure_authenticated(gateway_url)
@@ -241,8 +241,8 @@ class AuthFlow:
             try:
                 await self._initialize_session(transport, nonce, cached_token)
                 return {"token": cached_token, "identity": identity}
-            except AuthError:
-                pass
+            except AuthError as exc:
+                _auth_log.debug("cached_token 认证失败，尝试刷新: %s", exc)
 
         refresh_token = str(identity.get("refresh_token") or "")
         if refresh_token:
@@ -252,8 +252,8 @@ class AuthFlow:
                 if cached_token:
                     await self._initialize_session(transport, nonce, cached_token)
                     return {"token": cached_token, "identity": identity}
-            except AuthError:
-                pass
+            except AuthError as exc:
+                _auth_log.debug("refresh_token 认证失败，将重新登录: %s", exc)
 
         login = await self.authenticate(gateway_url, aid=identity.get("aid"))
         token = str(login.get("access_token") or "")

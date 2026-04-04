@@ -504,8 +504,8 @@ class E2EEManager:
             pk = cert.public_key()
             if isinstance(pk, ec.EllipticCurvePublicKey):
                 return pk
-        except Exception:
-            pass
+        except Exception as exc:
+            _e2ee_log.warning("加载发送方 %s 证书公钥失败: %s", aid, exc)
         return None
 
     def _decrypt_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -810,16 +810,17 @@ class E2EEManager:
                 if isinstance(pk, ec.EllipticCurvePrivateKey):
                     self._local_prekey_cache[prekey_id] = pk  # 回填内存缓存
                     return pk
-            except Exception:
-                pass
+            except Exception as exc:
+                _e2ee_log.debug("prekey %s 加密格式加载失败: %s", prekey_id, exc)
 
         try:
             pk = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
             if isinstance(pk, ec.EllipticCurvePrivateKey):
                 self._local_prekey_cache[prekey_id] = pk  # 回填内存缓存
                 return pk
-        except Exception:
-            pass
+        except Exception as exc:
+            _e2ee_log.debug("prekey %s 明文格式加载失败: %s", prekey_id, exc)
+        _e2ee_log.warning("prekey %s 私钥加载失败，所有格式均不可用", prekey_id)
         return None
 
     # ── 证书指纹工具 ────────────────────────────────────────

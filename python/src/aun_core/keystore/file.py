@@ -11,8 +11,12 @@ from typing import Any
 from .base import KeyStore
 from ..secret_store import SecretStore, create_default_secret_store
 
+import logging
+
+_log = logging.getLogger("aun_core.keystore")
 
 _SENSITIVE_TOKEN_FIELDS = ("access_token", "refresh_token", "kite_token")
+_CRITICAL_METADATA_KEYS = ("e2ee_prekeys", "e2ee_sessions", "group_secrets")
 
 
 def _secure_file_permissions(path: Path) -> None:
@@ -25,11 +29,19 @@ def _secure_file_permissions(path: Path) -> None:
 
 
 class FileKeyStore(KeyStore):
-    def __init__(self, root: str | Path | None = None, *, secret_store: SecretStore | None = None) -> None:
+    def __init__(
+        self,
+        root: str | Path | None = None,
+        *,
+        secret_store: SecretStore | None = None,
+        encryption_seed: str | None = None,
+    ) -> None:
         preferred = Path(root or Path.home() / ".aun")
         fallback = Path.cwd() / ".aun"
         resolved_root = self._prepare_root(preferred, fallback)
-        self._secret_store = secret_store or create_default_secret_store()
+        self._secret_store = secret_store or create_default_secret_store(
+            root=resolved_root, encryption_seed=encryption_seed,
+        )
         if resolved_root.name == "keys":
             self._root = resolved_root.parent
             self._legacy_roots = [resolved_root, self._root / "keys"]
@@ -38,15 +50,21 @@ class FileKeyStore(KeyStore):
             self._legacy_roots = [self._root / "keys", self._root]
         self._aids_root = self._root / "AIDs"
         self._aids_root.mkdir(parents=True, exist_ok=True)
+        self._sync_bundled_root_ca()
 
     def load_identity(self, aid: str) -> dict | None:
         identity = self._load_identity_from_split_files(aid)
         if identity is not None:
             return identity
         path = self._identity_path(aid)
-        if not path.exists():
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        # 兼容旧格式：~/.aun/{aid}/AIDs/{aid}/（旧版 SDK 按 cwd 生成子目录）
+        legacy_subdir = self._root / self._safe_aid(aid)
+        if legacy_subdir.is_dir():
+            legacy_ks = FileKeyStore(legacy_subdir, secret_store=self._secret_store)
+            return legacy_ks._load_identity_from_split_files(aid)
+        return None
 
     def save_identity(self, aid: str, identity: dict) -> None:
         key_pair = {
@@ -96,14 +114,12 @@ class FileKeyStore(KeyStore):
             key_pair = json.loads(legacy_key_path.read_text(encoding="utf-8"))
             return self._restore_key_pair(aid, key_pair)
         identity = self._load_legacy_identity(aid)
-        if identity is None:
-            return None
-        key_pair = {
-            key: identity[key]
-            for key in ("private_key_pem", "public_key_der_b64", "curve")
-            if key in identity
-        }
-        return key_pair or None
+        if identity is not None:
+            key_pair = {k: identity[k] for k in ("private_key_pem", "public_key_der_b64", "curve") if k in identity}
+            return key_pair or None
+        # fallback: 旧格式子目录 ~/.aun/{aid}/AIDs/{aid}/
+        lks = self._legacy_subdir_ks(aid)
+        return lks.load_key_pair(aid) if lks else None
 
     def save_key_pair(self, aid: str, key_pair: dict) -> None:
         path = self._key_pair_path(aid)
@@ -114,11 +130,17 @@ class FileKeyStore(KeyStore):
         scope = self._safe_aid(aid)
         private_key_pem = protected_key_pair.pop("private_key_pem", None)
         if isinstance(private_key_pem, str) and private_key_pem:
-            protected_key_pair["private_key_protection"] = self._secret_store.protect(
+            protection = self._secret_store.protect(
                 scope,
                 "identity/private_key",
                 private_key_pem.encode("utf-8"),
             )
+            if not protection.get("persisted"):
+                raise RuntimeError(
+                    f"SecretStore 无法持久化私钥 (scheme={protection.get('scheme')})。"
+                    f"私钥必须能跨进程重启保留，请检查密钥存储配置。"
+                )
+            protected_key_pair["private_key_protection"] = protection
         elif "private_key_protection" not in protected_key_pair:
             self._secret_store.clear(scope, "identity/private_key")
 
@@ -134,7 +156,10 @@ class FileKeyStore(KeyStore):
             return legacy_cert_path.read_text(encoding="utf-8")
         identity = self._load_legacy_identity(aid)
         cert = identity.get("cert") if identity else None
-        return cert if isinstance(cert, str) and cert else None
+        if isinstance(cert, str) and cert:
+            return cert
+        lks = self._legacy_subdir_ks(aid)
+        return lks.load_cert(aid) if lks else None
 
     def save_cert(self, aid: str, cert_pem: str) -> None:
         path = self._cert_path(aid)
@@ -149,17 +174,37 @@ class FileKeyStore(KeyStore):
         if legacy_meta_path is not None:
             return self._restore_metadata(aid, json.loads(legacy_meta_path.read_text(encoding="utf-8")))
         identity = self._load_legacy_identity(aid)
-        if identity is None:
-            return None
-        return self._restore_metadata(aid, {
-            key: value
-            for key, value in identity.items()
-            if key not in {"private_key_pem", "public_key_der_b64", "curve", "cert"}
-        })
+        if identity is not None:
+            return self._restore_metadata(aid, {
+                key: value
+                for key, value in identity.items()
+                if key not in {"private_key_pem", "public_key_der_b64", "curve", "cert"}
+            })
+        lks = self._legacy_subdir_ks(aid)
+        return lks.load_metadata(aid) if lks else None
 
     def save_metadata(self, aid: str, metadata: dict) -> None:
         path = self._metadata_path(aid)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 防御性检查：如果磁盘上已有关键数据，而传入的 metadata 中缺失，
+        # 说明调用方可能没有先 load_metadata 就直接写入——这会导致数据丢失。
+        # 此时先从磁盘还原已有值并合并到 metadata 中。
+        if path.exists():
+            try:
+                existing = self._restore_metadata(
+                    aid, json.loads(path.read_text(encoding="utf-8")),
+                )
+            except Exception:
+                existing = {}
+            for key in _CRITICAL_METADATA_KEYS:
+                if key in existing and existing[key] and key not in metadata:
+                    _log.warning(
+                        "save_metadata: 传入数据缺少 '%s' (aid=%s)，自动合并磁盘已有数据",
+                        key, aid,
+                    )
+                    metadata[key] = existing[key]
+
         protected = self._protect_metadata(aid, metadata)
         path.write_text(json.dumps(protected, ensure_ascii=False, indent=2), encoding="utf-8")
         _secure_file_permissions(path)
@@ -438,6 +483,22 @@ class FileKeyStore(KeyStore):
                 restored.pop("private_key_pem", None)
         return restored
 
+    def _sync_bundled_root_ca(self) -> None:
+        """将 SDK 内置根证书同步到 {aun_path}/CA/root/。"""
+        bundled_dir = Path(__file__).resolve().parent.parent / "certs"
+        if not bundled_dir.exists():
+            return
+        dest_dir = self._root / "CA" / "root"
+        for src in sorted(bundled_dir.glob("*.crt")):
+            dest = dest_dir / src.name
+            if dest.exists():
+                continue
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(src.read_bytes())
+            except OSError:
+                pass
+
     @staticmethod
     def _prepare_root(preferred: Path, fallback: Path) -> Path:
         try:
@@ -446,3 +507,12 @@ class FileKeyStore(KeyStore):
         except Exception:
             fallback.mkdir(parents=True, exist_ok=True)
             return fallback
+
+    def _legacy_subdir_ks(self, aid: str) -> "FileKeyStore | None":
+        """返回旧格式子目录的 FileKeyStore，不存在则返回 None。
+        旧版 SDK 把 aun_path 设为 ~/.aun/{aid}，数据在 ~/.aun/{aid}/AIDs/{aid}/。
+        """
+        subdir = self._root / self._safe_aid(aid)
+        if subdir.is_dir() and (subdir / "AIDs").is_dir():
+            return FileKeyStore(subdir, secret_store=self._secret_store)
+        return None

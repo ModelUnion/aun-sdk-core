@@ -137,6 +137,7 @@ class AUNClient:
         keystore = raw_config.get("keystore") or FileKeyStore(
             self._config_model.aun_path,
             secret_store=raw_config.get("secret_store"),
+            encryption_seed=self._config_model.encryption_seed,
         )
         self._keystore = keystore
         self._auth = AuthFlow(
@@ -264,8 +265,8 @@ class AUNClient:
                 "params_hash": params_hash,
                 "signature": base64.b64encode(sig).decode("ascii"),
             }
-        except Exception:
-            pass  # 签名失败不应阻断主流程
+        except Exception as exc:
+            _client_log.warning("客户端签名失败，继续发送无签名请求: %s", exc)
 
     async def call(self, method: str, params: dict | None = None) -> Any:
         if self._state != "connected":
@@ -422,8 +423,8 @@ class AUNClient:
                     "mode": encrypt_result.get("mode"),
                     "reason": encrypt_result.get("degradation_reason"),
                 })
-            except Exception:
-                pass
+            except Exception as exc:
+                _client_log.warning("发布 e2ee.degraded 事件失败: %s", exc)
 
         send_params: dict[str, Any] = {
             "to": to_aid,
@@ -620,8 +621,8 @@ class AUNClient:
                                 self._keystore, self._aid, group_id, epoch,
                                 secret_data["secret"], commitment, members,
                             )
-                except Exception:
-                    pass  # 回源失败不阻断主流程
+                except Exception as exc:
+                    _client_log.warning("群组 %s 成员列表回源失败: %s", group_id, exc)
 
             response = self._group_e2ee.handle_key_request_msg(actual_payload, members)
             if response:
@@ -633,8 +634,8 @@ class AUNClient:
                             "encrypt": True,
                             "persist": False,
                         })
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _client_log.warning("向 %s 回复群组密钥失败: %s", requester, exc)
 
         return True
 
@@ -670,6 +671,11 @@ class AUNClient:
             validated_at=now,
             refresh_after=now + _PEER_CERT_CACHE_TTL,
         )
+        # 同步写入 keystore，保证 E2EE 解密时 _get_sender_cert 能读到
+        try:
+            self._keystore.save_cert(aid, cert_pem)
+        except Exception as exc:
+            _client_log.error("写入证书到 keystore 失败 (aid=%s): %s", aid, exc)
         return cert_bytes
 
     async def _fetch_peer_prekey(self, peer_aid: str) -> dict[str, Any] | None:
@@ -753,7 +759,11 @@ class AUNClient:
                 # 确保发送方证书已缓存（签名验证需要）
                 from_aid = msg.get("from", "")
                 if from_aid:
-                    await self._ensure_sender_cert_cached(from_aid)
+                    cert_ready = await self._ensure_sender_cert_cached(from_aid)
+                    if not cert_ready:
+                        _client_log.warning("无法获取发送方 %s 的证书，跳过解密", from_aid)
+                        result.append(msg)
+                        continue
                 decrypted = self._e2ee._decrypt_message(msg)
                 result.append(decrypted if decrypted is not None else msg)
             else:
@@ -779,7 +789,10 @@ class AUNClient:
 
         # 确保发送方证书已缓存到 keystore（三路 ECDH + 签名验证需要）
         if from_aid:
-            await self._ensure_sender_cert_cached(from_aid)
+            cert_ready = await self._ensure_sender_cert_cached(from_aid)
+            if not cert_ready:
+                _client_log.warning("无法获取发送方 %s 的证书，跳过解密", from_aid)
+                return message
 
         # 密码学解密（E2EEManager.decrypt_message 内含本地防重放）
         decrypted = self._e2ee.decrypt_message(message)
@@ -975,7 +988,8 @@ class AUNClient:
                         "aid": identity.get("aid"),
                         "expires_at": identity.get("access_token_expires_at"),
                     })
-                except AuthError:
+                except AuthError as exc:
+                    _client_log.debug("token 刷新失败，下次重试: %s", exc)
                     continue
                 except Exception as exc:
                     await self._dispatcher.publish("connection.error", {"error": exc})
@@ -991,8 +1005,8 @@ class AUNClient:
                     continue
                 try:
                     await self._upload_prekey()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _client_log.warning("prekey 轮换失败: %s", exc)
         except asyncio.CancelledError:
             raise
 
@@ -1027,8 +1041,8 @@ class AUNClient:
             }
             rotate_params.update(self._build_rotation_signature(group_id, 0, 1))
             await self.call("group.e2ee.rotate_epoch", rotate_params)
-        except Exception:
-            pass  # 非致命：服务端可能已经是 1（幂等）
+        except Exception as exc:
+            _client_log.debug("同步 epoch 到服务端失败 (group=%s，可能已同步): %s", group_id, exc)
 
     async def _rotate_group_epoch(self, group_id: str) -> None:
         """为指定群组轮换 epoch 并分发新密钥。

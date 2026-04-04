@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
+_events_log = logging.getLogger("aun_core.events")
 
 EventHandler = Callable[[Any], Any]
 
@@ -44,5 +46,6 @@ class EventDispatcher:
                 result = handler(payload)
                 if inspect.isawaitable(result):
                     await result
-            except Exception:
+            except Exception as exc:
+                _events_log.warning("事件 %s 处理器 %s 执行异常: %s", event, getattr(handler, "__name__", handler), exc)
                 continue

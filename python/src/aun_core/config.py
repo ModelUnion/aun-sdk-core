@@ -1,95 +1,71 @@
 from __future__ import annotations
 
+import os
+import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 
-def _resolve_default_aun_path() -> Path:
-    home_root = Path.home() / ".aun"
-    cwd = Path.cwd().resolve()
-    app_dir = cwd.name or "aun-app"
-    return _bind_app_instance(home_root, app_dir, cwd)
+def get_device_id(aun_root: Path | str | None = None) -> str:
+    """获取本设备的稳定 ID。
 
+    存储在 ~/.aun/.device_id（或 aun_root/.device_id）。
+    首次调用时自动生成并持久化，后续调用返回同一值。
+    同一台机器上所有 SDK 实例共享同一个 device_id。
+    """
+    root = Path(aun_root) if aun_root else Path.home() / ".aun"
+    root.mkdir(parents=True, exist_ok=True)
+    device_id_path = root / ".device_id"
 
-def _bind_app_instance(home_root: Path, app_dir: str, app_path: Path) -> Path:
-    home_root.mkdir(parents=True, exist_ok=True)
-    candidate = home_root / app_dir
-    suffix = 0
-    while True:
-        current = candidate if suffix == 0 else home_root / f"{app_dir}~{suffix}"
-        bound = _read_bound_cwd(current)
-        if not current.exists():
-            current.mkdir(parents=True, exist_ok=True)
-            _write_bound_cwd(current, app_path)
-            return current
-        if bound is None:
-            _write_bound_cwd(current, app_path)
-            return current
-        if bound == app_path:
-            return current
-        suffix += 1
+    if device_id_path.exists():
+        try:
+            stored = device_id_path.read_text(encoding="utf-8").strip()
+            if stored:
+                return stored
+        except OSError:
+            pass
 
-
-def _bound_cwd_path(root: Path) -> Path:
-    return root / ".cwd"
-
-
-def _read_bound_cwd(root: Path) -> Path | None:
-    marker = _bound_cwd_path(root)
-    if not marker.exists():
-        return None
+    new_id = str(uuid.uuid4())
     try:
-        raw = marker.read_text(encoding="utf-8").strip()
+        device_id_path.write_text(new_id, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(device_id_path, 0o600)
     except OSError:
-        return None
-    if not raw:
-        return None
-    try:
-        return Path(raw).resolve()
-    except OSError:
-        return Path(raw)
-
-
-def _write_bound_cwd(root: Path, app_path: Path) -> None:
-    try:
-        _bound_cwd_path(root).write_text(str(app_path), encoding="utf-8")
-    except OSError:
-        return
-
-
-def _default_aun_path() -> Path:
-    return _resolve_default_aun_path()
+        pass
+    return new_id
 
 
 @dataclass(slots=True)
 class AUNConfig:
-    aun_path: Path = field(default_factory=_default_aun_path)
+    aun_path: Path = field(default_factory=lambda: Path.home() / ".aun")
     root_ca_path: str | None = None
     encryption_seed: str | None = None
     discovery_port: int | None = None
-    # 群组 E2EE 配置（group_e2ee 是必选能力，始终为 True）
     group_e2ee: bool = True
     rotate_on_join: bool = False
-    epoch_auto_rotate_interval: int = 0  # 秒，0=禁用
-    old_epoch_retention_seconds: int = 604800  # 7 天
-    verify_ssl: bool = True  # TLS 证书验证（开发环境可设为 False）
-    require_forward_secrecy: bool = True  # 严格模式：拒绝无前向保密的 E2EE 降级
-    replay_window_seconds: int = 300  # 防重放时间窗口（秒）
+    epoch_auto_rotate_interval: int = 0
+    old_epoch_retention_seconds: int = 604800
+    verify_ssl: bool = True
+    require_forward_secrecy: bool = True
+    replay_window_seconds: int = 300
+
+    @property
+    def device_id(self) -> str:
+        """当前设备的稳定 ID（首次自动生成，后续复用）。"""
+        return get_device_id(self.aun_path)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "AUNConfig":
         data = dict(raw or {})
-        aun_path = data.get("aun_path")
-        if aun_path is None:
-            aun_path = _default_aun_path()
+        aun_path = data.get("aun_path") or Path.home() / ".aun"
         dp = data.get("discovery_port")
         return cls(
             aun_path=Path(aun_path).expanduser(),
             root_ca_path=data.get("root_ca_path"),
             encryption_seed=data.get("encryption_seed"),
             discovery_port=int(dp) if dp is not None else None,
-            # group_e2ee 是必选能力，忽略用户传入值
             rotate_on_join=bool(data.get("rotate_on_join", False)),
             epoch_auto_rotate_interval=int(data.get("epoch_auto_rotate_interval", 0)),
             old_epoch_retention_seconds=int(data.get("old_epoch_retention_seconds", 604800)),
