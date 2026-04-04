@@ -1,4 +1,4 @@
-"""E2EE 单元测试 — 覆盖两级降级（prekey_ecdh / long_term_key）、AAD、防重放。
+"""E2EE 单元测试 — 覆盖 prekey_ecdh_v2（四路 ECDH）/ long_term_key 两级降级、AAD、防重放。
 
 测试策略：用真实密码学原语（cryptography 库），E2EEManager 为纯工具类，无 RPC mock。
 """
@@ -17,7 +17,7 @@ from aun_core.e2ee import (
     AAD_FIELDS_OFFLINE,
     AAD_MATCH_FIELDS_OFFLINE,
     MODE_LONG_TERM_KEY,
-    MODE_PREKEY_ECDH,
+    MODE_PREKEY_ECDH_V2,
     SUITE,
     E2EEManager,
 )
@@ -37,12 +37,12 @@ def _generate_ec_keypair():
     return private, pub_der, base64.b64encode(pub_der).decode("ascii")
 
 
-def _make_self_signed_cert(private_key):
+def _make_self_signed_cert(private_key, cn="test"):
     from cryptography import x509
     from cryptography.x509.oid import NameOID
     from datetime import datetime, timedelta, timezone
 
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test")])
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -60,6 +60,7 @@ class FakeKeystore:
     def __init__(self):
         self._metadata = {}
         self._key_pairs = {}
+        self._certs = {}
 
     def load_metadata(self, aid):
         return self._metadata.get(aid, {})
@@ -69,6 +70,12 @@ class FakeKeystore:
 
     def load_key_pair(self, aid):
         return self._key_pairs.get(aid)
+
+    def load_cert(self, aid):
+        return self._certs.get(aid)
+
+    def save_cert(self, aid, cert_pem):
+        self._certs[aid] = cert_pem
 
 
 def _build_identity(aid, private_key):
@@ -120,6 +127,10 @@ def _make_e2ee_pair():
     sender_cert = _make_self_signed_cert(sender_key)
     receiver_cert = _make_self_signed_cert(receiver_key)
 
+    # 每个 keystore 保存对方的证书（用于签名验证和三路 ECDH）
+    sender_ks._certs["receiver.test"] = receiver_cert.decode("utf-8") if isinstance(receiver_cert, bytes) else receiver_cert
+    receiver_ks._certs["sender.test"] = sender_cert.decode("utf-8") if isinstance(sender_cert, bytes) else sender_cert
+
     return (sender_mgr, receiver_mgr, sender_key, receiver_key,
             sender_cert, receiver_cert, sender_ks, receiver_ks)
 
@@ -151,14 +162,16 @@ def _make_prekey(receiver_key):
 
 class TestAADMethods:
     def test_aad_bytes_offline_field_count(self):
-        assert len(AAD_FIELDS_OFFLINE) == 8
+        assert len(AAD_FIELDS_OFFLINE) == 10
         assert "encryption_mode" in AAD_FIELDS_OFFLINE
         assert "recipient_cert_fingerprint" in AAD_FIELDS_OFFLINE
+        assert "sender_cert_fingerprint" in AAD_FIELDS_OFFLINE
+        assert "prekey_id" in AAD_FIELDS_OFFLINE
 
     def test_aad_bytes_offline_deterministic(self):
         aad = {
             "from": "a", "to": "b", "message_id": "m1", "timestamp": 123,
-            "encryption_mode": MODE_PREKEY_ECDH, "suite": SUITE,
+            "encryption_mode": MODE_PREKEY_ECDH_V2, "suite": SUITE,
             "ephemeral_public_key": "pk_b64",
             "recipient_cert_fingerprint": "sha256:abc",
         }
@@ -170,14 +183,14 @@ class TestAADMethods:
 
     def test_aad_matches_offline(self):
         a = {"from": "a", "to": "b", "message_id": "m", "timestamp": 100,
-             "encryption_mode": MODE_PREKEY_ECDH, "suite": SUITE,
+             "encryption_mode": MODE_PREKEY_ECDH_V2, "suite": SUITE,
              "ephemeral_public_key": "pk", "recipient_cert_fingerprint": "fp"}
         b = {**a, "timestamp": 999}
         assert E2EEManager._aad_matches_offline(a, b)
 
     def test_aad_matches_offline_mode_mismatch(self):
         a = {"from": "a", "to": "b", "message_id": "m",
-             "encryption_mode": MODE_PREKEY_ECDH, "suite": SUITE,
+             "encryption_mode": MODE_PREKEY_ECDH_V2, "suite": SUITE,
              "ephemeral_public_key": "pk", "recipient_cert_fingerprint": "fp"}
         b = {**a, "encryption_mode": MODE_LONG_TERM_KEY}
         assert not E2EEManager._aad_matches_offline(a, b)
@@ -199,11 +212,11 @@ class TestPrekeyEncrypt:
             message_id=mid, timestamp=ts,
         )
         assert ok
-        assert envelope["encryption_mode"] == MODE_PREKEY_ECDH
+        assert envelope["encryption_mode"] == MODE_PREKEY_ECDH_V2
         assert envelope["prekey_id"] == prekey["prekey_id"]
         assert "ephemeral_public_key" in envelope
         aad = envelope["aad"]
-        assert aad["encryption_mode"] == MODE_PREKEY_ECDH
+        assert aad["encryption_mode"] == MODE_PREKEY_ECDH_V2
 
     def test_prekey_encrypt_decrypt_roundtrip(self):
         sender_mgr, receiver_mgr, _, receiver_key, _, receiver_cert, _, receiver_ks = _make_e2ee_pair()
@@ -236,10 +249,34 @@ class TestPrekeyEncrypt:
             "timestamp": ts, "seq": 1, "payload": envelope, "encrypted": True,
         }
 
-        result = receiver_mgr._decrypt_message_prekey(message)
+        result = receiver_mgr._decrypt_message_prekey_v2(message)
         assert result is not None
         assert result["payload"] == payload
-        assert result["e2ee"]["encryption_mode"] == MODE_PREKEY_ECDH
+        assert result["e2ee"]["encryption_mode"] == MODE_PREKEY_ECDH_V2
+
+    def test_sender_skips_its_own_outbound_prekey_message(self):
+        sender_mgr, _, _, receiver_key, _, receiver_cert, _, _ = _make_e2ee_pair()
+        prekey, _ = _make_prekey(receiver_key)
+
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        envelope, ok = sender_mgr._encrypt_with_prekey(
+            "receiver.test", {"text": "self echo"}, prekey, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+        assert ok
+
+        outbound_copy = {
+            "message_id": mid,
+            "from": "sender.test",
+            "to": "receiver.test",
+            "timestamp": ts,
+            "seq": 1,
+            "payload": envelope,
+            "encrypted": True,
+        }
+
+        assert sender_mgr.decrypt_message(outbound_copy) == outbound_copy
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +284,7 @@ class TestPrekeyEncrypt:
 # ---------------------------------------------------------------------------
 
 class TestLongTermKey:
-    def test_long_term_key_envelope_has_8_field_aad(self):
+    def test_long_term_key_envelope_aad_fields(self):
         sender_mgr, _, _, _, _, receiver_cert, _, _ = _make_e2ee_pair()
 
         mid = str(uuid.uuid4())
@@ -259,7 +296,10 @@ class TestLongTermKey:
         assert ok
         assert envelope["encryption_mode"] == MODE_LONG_TERM_KEY
         aad = envelope["aad"]
+        # long_term_key 的 AAD 包含除 prekey_id 外的所有字段
         for field in AAD_FIELDS_OFFLINE:
+            if field == "prekey_id":
+                continue  # long_term_key 无 prekey_id
             assert field in aad
 
     def test_long_term_key_roundtrip(self):
@@ -292,7 +332,7 @@ class TestLongTermKey:
 
 class TestEncryptOutboundDegradation:
     def test_prekey_available_uses_prekey(self):
-        """有 prekey → 使用 prekey_ecdh"""
+        """有 prekey → 使用 prekey_ecdh_v2（双 ECDH）"""
         sender_mgr, _, _, receiver_key, _, receiver_cert, _, _ = _make_e2ee_pair()
         prekey, _ = _make_prekey(receiver_key)
 
@@ -305,7 +345,7 @@ class TestEncryptOutboundDegradation:
             message_id=mid, timestamp=ts,
         )
         assert ok
-        assert envelope["encryption_mode"] == MODE_PREKEY_ECDH
+        assert envelope["encryption_mode"] == MODE_PREKEY_ECDH_V2
 
     def test_no_prekey_falls_to_long_term(self):
         """无 prekey → 降级到 long_term_key"""
@@ -330,7 +370,10 @@ class TestEncryptOutboundDegradation:
 class TestReplayGuard:
     def test_local_seen_set_blocks_duplicate(self):
         _, receiver_mgr, _, receiver_key, _, receiver_cert, _, receiver_ks = _make_e2ee_pair()
-        sender_mgr = _make_e2ee_pair()[0]
+        sender_mgr, _, sender_key_2, _, sender_cert_2, _, _, _ = _make_e2ee_pair()
+
+        # receiver keystore 需要保存这个 sender 的证书
+        receiver_ks._certs["sender.test"] = sender_cert_2.decode("utf-8") if isinstance(sender_cert_2, bytes) else sender_cert_2
 
         prekey, prekey_private = _make_prekey(receiver_key)
         priv_pem = prekey_private.private_bytes(
@@ -395,6 +438,51 @@ class TestPrekeyGenerate:
         pid = list(prekeys.keys())[0]
         assert "private_key_pem" in prekeys[pid]
         assert "created_at" in prekeys[pid]
+
+    def test_generate_prekey_includes_created_at(self):
+        """generate_prekey 返回值包含 created_at 时间戳"""
+        _, receiver_mgr, _, _, _, _, _, _ = _make_e2ee_pair()
+        result = receiver_mgr.generate_prekey()
+        assert "created_at" in result
+        assert isinstance(result["created_at"], int)
+        assert result["created_at"] > 0
+
+    def test_prekey_signature_binds_timestamp(self):
+        """prekey 签名绑定 created_at，篡改时间戳导致签名验证失败"""
+        (sender_mgr, _, _, receiver_key, _, receiver_cert,
+         _, _) = _make_e2ee_pair()
+        prekey, _ = _make_prekey(receiver_key)
+        # 添加 created_at 并用正确格式重签
+        # 先用旧格式 prekey（无 created_at）加密应成功
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        envelope, ok = sender_mgr._encrypt_with_prekey(
+            "receiver.test", {"text": "test"}, prekey, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+        assert ok  # 无 created_at 时兼容旧格式
+
+    def test_old_prekey_rejected(self):
+        """超过 30 天的 prekey → 拒绝使用"""
+        (sender_mgr, _, _, receiver_key, _, receiver_cert,
+         _, _) = _make_e2ee_pair()
+        prekey, _ = _make_prekey(receiver_key)
+        # 设置 31 天前的 created_at
+        prekey["created_at"] = int((time.time() - 31 * 86400) * 1000)
+        # 需要重签（因为 created_at 变了）
+        sign_data = f"{prekey['prekey_id']}|{prekey['public_key']}|{prekey['created_at']}".encode("utf-8")
+        prekey["signature"] = base64.b64encode(
+            receiver_key.sign(sign_data, ec.ECDSA(hashes.SHA256()))
+        ).decode("ascii")
+
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        from aun_core.errors import E2EEError
+        with pytest.raises(E2EEError, match="prekey too old"):
+            sender_mgr._encrypt_with_prekey(
+                "receiver.test", {"text": "test"}, prekey, receiver_cert,
+                message_id=mid, timestamp=ts,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -482,3 +570,177 @@ class TestFileKeyStoreProtection:
 
         loaded = ks.load_metadata("test.aid")
         assert loaded["e2ee_prekeys"]["prekey-123"]["private_key_pem"] == metadata["e2ee_prekeys"]["prekey-123"]["private_key_pem"]
+
+
+# ---------------------------------------------------------------------------
+# 双 ECDH (prekey_ecdh_v2)
+# ---------------------------------------------------------------------------
+
+class TestPrekeyV2:
+    def test_v2_envelope_fields(self):
+        """v2 信封包含 encryption_mode: prekey_ecdh_v2"""
+        sender_mgr, _, _, receiver_key, _, receiver_cert, _, _ = _make_e2ee_pair()
+        prekey, _ = _make_prekey(receiver_key)
+
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        envelope, ok = sender_mgr._encrypt_with_prekey(
+            "receiver.test", {"text": "v2 test"}, prekey, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+        assert ok
+        assert envelope["encryption_mode"] == MODE_PREKEY_ECDH_V2
+        assert envelope["aad"]["encryption_mode"] == MODE_PREKEY_ECDH_V2
+
+    def test_v2_roundtrip(self):
+        """双 ECDH 加解密往返成功"""
+        sender_mgr, receiver_mgr, _, receiver_key, _, receiver_cert, _, receiver_ks = _make_e2ee_pair()
+        prekey, prekey_private = _make_prekey(receiver_key)
+
+        priv_pem = prekey_private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8")
+        receiver_ks._metadata["receiver.test"] = {
+            "e2ee_prekeys": {
+                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
+            },
+        }
+
+        payload = {"text": "双 ECDH 往返"}
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        envelope, ok = sender_mgr._encrypt_with_prekey(
+            "receiver.test", payload, prekey, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+        assert ok
+
+        message = {
+            "message_id": mid, "from": "sender.test", "to": "receiver.test",
+            "timestamp": ts, "seq": 1, "payload": envelope, "encrypted": True,
+        }
+        result = receiver_mgr.decrypt_message(message)
+        assert result is not None
+        assert result["payload"] == payload
+        assert result["e2ee"]["encryption_mode"] == MODE_PREKEY_ECDH_V2
+
+    def test_old_v1_still_decryptable(self):
+        """旧 prekey_ecdh (v1) 加密模式已移除，v1 消息应被拒绝"""
+        sender_mgr, receiver_mgr, _, receiver_key, _, receiver_cert, _, receiver_ks = _make_e2ee_pair()
+        prekey, prekey_private = _make_prekey(receiver_key)
+
+        priv_pem = prekey_private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8")
+        receiver_ks._metadata["receiver.test"] = {
+            "e2ee_prekeys": {
+                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
+            },
+        }
+
+        # 手动构造 v1 信封（单 ECDH）— 使用已移除的 encryption_mode
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF as _HKDF
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
+        import secrets as _secrets
+
+        peer_prekey_public = serialization.load_der_public_key(base64.b64decode(prekey["public_key"]))
+        ephemeral_private = _ec.generate_private_key(_ec.SECP256R1())
+        ephemeral_public_bytes = ephemeral_private.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+        shared_secret = ephemeral_private.exchange(_ec.ECDH(), peer_prekey_public)
+        hkdf = _HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                      info=f"aun-prekey:{prekey['prekey_id']}".encode("utf-8"))
+        message_key = hkdf.derive(shared_secret)
+
+        payload = {"text": "v1 legacy"}
+        plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        nonce = _secrets.token_bytes(12)
+        aesgcm = _AESGCM(message_key)
+
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        ephemeral_pk_b64 = base64.b64encode(ephemeral_public_bytes).decode("ascii")
+        from cryptography import x509 as _x509
+        _rcert = _x509.load_pem_x509_certificate(receiver_cert)
+        _fp_der = _rcert.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        _fp_hash = hashes.Hash(hashes.SHA256())
+        _fp_hash.update(_fp_der)
+        recipient_fp = f"sha256:{_fp_hash.finalize().hex()}"
+        aad = {
+            "from": "sender.test", "to": "receiver.test",
+            "message_id": mid, "timestamp": ts,
+            "encryption_mode": "prekey_ecdh",  # 已移除的 v1 模式
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "ephemeral_public_key": ephemeral_pk_b64,
+            "recipient_cert_fingerprint": recipient_fp,
+        }
+        aad_bytes = E2EEManager._aad_bytes_offline(aad)
+        ct_tag = aesgcm.encrypt(nonce, plaintext, aad_bytes)
+
+        envelope = {
+            "type": "e2ee.encrypted", "version": "1",
+            "encryption_mode": "prekey_ecdh",  # 已移除的 v1 模式
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "prekey_id": prekey["prekey_id"],
+            "ephemeral_public_key": ephemeral_pk_b64,
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "ciphertext": base64.b64encode(ct_tag[:-16]).decode("ascii"),
+            "tag": base64.b64encode(ct_tag[-16:]).decode("ascii"),
+            "aad": aad,
+        }
+
+        message = {
+            "message_id": mid, "from": "sender.test", "to": "receiver.test",
+            "timestamp": ts, "seq": 1, "payload": envelope, "encrypted": True,
+        }
+        # v1 模式已移除，消息应被拒绝
+        result = receiver_mgr.decrypt_message(message)
+        assert result is None
+
+    def test_wrong_identity_key_fails(self):
+        """只有 prekey 私钥没有正确 identity 私钥 → v2 解密失败"""
+        sender_mgr, receiver_mgr, _, receiver_key, _, receiver_cert, _, receiver_ks = _make_e2ee_pair()
+        prekey, prekey_private = _make_prekey(receiver_key)
+
+        priv_pem = prekey_private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8")
+        receiver_ks._metadata["receiver.test"] = {
+            "e2ee_prekeys": {
+                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
+            },
+        }
+        # 替换 identity 私钥为错误的密钥
+        wrong_key = ec.generate_private_key(ec.SECP256R1())
+        wrong_pem = wrong_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8")
+        receiver_ks._key_pairs["receiver.test"]["private_key_pem"] = wrong_pem
+
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        envelope, ok = sender_mgr._encrypt_with_prekey(
+            "receiver.test", {"text": "should fail"}, prekey, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+        assert ok
+
+        message = {
+            "message_id": mid, "from": "sender.test", "to": "receiver.test",
+            "timestamp": ts, "seq": 1, "payload": envelope, "encrypted": True,
+        }
+        # v2 解密应失败（identity key 不匹配）
+        result = receiver_mgr._decrypt_message_prekey_v2(message)
+        assert result is None

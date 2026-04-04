@@ -259,3 +259,187 @@ def test_fetch_gateway_ocsp_status_rejects_revoked_response():
         flow._fetch_gateway_ocsp_status("wss://gw.example/aun", identity_cert, issuer_cert)
     )
     assert result["status"] == "revoked"
+
+
+# ── P0-1: verify_peer_certificate 测试 ──────────────────────
+
+
+def test_verify_peer_cert_success():
+    """完整 PKI 验证通过（链 + CRL + OCSP + CN）"""
+    root_key, root_cert, root_pem = _build_cert("Test Root CA", ca=True)
+    issuer_key, issuer_cert, issuer_pem = _build_cert(
+        "Test Issuer CA", root_cert, root_key, ca=True
+    )
+    peer_key, peer_cert, peer_pem = _build_cert(
+        "alice.example.com", issuer_cert, issuer_key, ca=False
+    )
+
+    flow = _make_auth_flow(root_pem)
+
+    async def fake_chain(gw):
+        return [issuer_pem, root_pem]
+
+    # 直接 mock 顶层验证方法，避免内部网络调用
+    async def fake_revocation(gw, cert):
+        pass  # 未吊销
+
+    async def fake_ocsp(gw, cert):
+        pass  # OCSP good
+
+    flow._fetch_gateway_ca_chain = fake_chain
+    flow._verify_auth_cert_revocation = fake_revocation
+    flow._verify_auth_cert_ocsp = fake_ocsp
+
+    # 应该不抛异常
+    asyncio.run(flow.verify_peer_certificate("wss://gw.example/aun", peer_cert, "alice.example.com"))
+
+
+def test_verify_peer_cert_cn_mismatch():
+    """CN 不匹配时抛出 AuthError"""
+    root_key, root_cert, root_pem = _build_cert("Test Root CA", ca=True)
+    issuer_key, issuer_cert, issuer_pem = _build_cert(
+        "Test Issuer CA", root_cert, root_key, ca=True
+    )
+    peer_key, peer_cert, peer_pem = _build_cert(
+        "alice.example.com", issuer_cert, issuer_key, ca=False
+    )
+
+    flow = _make_auth_flow(root_pem)
+
+    async def fake_chain(gw):
+        return [issuer_pem, root_pem]
+
+    async def fake_revocation(gw, cert):
+        pass
+
+    async def fake_ocsp(gw, cert):
+        pass
+
+    flow._fetch_gateway_ca_chain = fake_chain
+    flow._verify_auth_cert_revocation = fake_revocation
+    flow._verify_auth_cert_ocsp = fake_ocsp
+
+    with pytest.raises(AuthError, match="peer cert CN mismatch"):
+        asyncio.run(flow.verify_peer_certificate("wss://gw.example/aun", peer_cert, "bob.example.com"))
+
+
+def test_verify_peer_cert_revoked():
+    """CRL 吊销的证书应被拒绝"""
+    root_key, root_cert, root_pem = _build_cert("Test Root CA", ca=True)
+    issuer_key, issuer_cert, issuer_pem = _build_cert(
+        "Test Issuer CA", root_cert, root_key, ca=True
+    )
+    peer_key, peer_cert, peer_pem = _build_cert(
+        "alice.example.com", issuer_cert, issuer_key, ca=False
+    )
+
+    flow = _make_auth_flow(root_pem)
+
+    async def fake_chain(gw):
+        return [issuer_pem, root_pem]
+
+    async def fake_revocation(gw, cert):
+        raise AuthError("auth certificate has been revoked")
+
+    flow._fetch_gateway_ca_chain = fake_chain
+    flow._verify_auth_cert_revocation = fake_revocation
+
+    with pytest.raises(AuthError, match="revoked"):
+        asyncio.run(flow.verify_peer_certificate("wss://gw.example/aun", peer_cert, "alice.example.com"))
+
+
+# ── P0-2: _validate_new_cert 测试 ───────────────────────────
+
+
+def test_new_cert_accepted_valid():
+    """合法的 new_cert 应被接受（无 gateway_url 时跳过链验证，只做 CN/公钥/时间）"""
+    key = ec.generate_private_key(ec.SECP256R1())
+    pub_der = key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "alice.test")]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "CA")]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+    root_key, _, root_pem = _build_cert("Root", ca=True)
+    flow = _make_auth_flow(root_pem)
+    identity = {
+        "aid": "alice.test",
+        "public_key_der_b64": base64.b64encode(pub_der).decode("ascii"),
+        "_pending_new_cert": cert_pem,
+    }
+    asyncio.run(flow._validate_new_cert(identity))
+    assert identity.get("cert") == cert_pem
+    assert "_pending_new_cert" not in identity
+
+
+def test_new_cert_rejected_cn_mismatch():
+    """CN 不匹配时 new_cert 被拒绝"""
+    key = ec.generate_private_key(ec.SECP256R1())
+    pub_der = key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "bob.test")]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "CA")]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+    root_key, _, root_pem = _build_cert("Root", ca=True)
+    flow = _make_auth_flow(root_pem)
+    identity = {
+        "aid": "alice.test",  # 与 cert CN "bob.test" 不匹配
+        "public_key_der_b64": base64.b64encode(pub_der).decode("ascii"),
+        "_pending_new_cert": cert_pem,
+    }
+    asyncio.run(flow._validate_new_cert(identity))
+    assert "cert" not in identity  # 被拒绝
+    assert "_pending_new_cert" not in identity  # 已清理
+
+
+def test_new_cert_rejected_key_mismatch():
+    """公钥不匹配时 new_cert 被拒绝"""
+    key = ec.generate_private_key(ec.SECP256R1())
+    different_key = ec.generate_private_key(ec.SECP256R1())
+    different_pub_der = different_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "alice.test")]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "CA")]))
+        .public_key(key.public_key())  # cert 的公钥与 identity 的不同
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+    root_key, _, root_pem = _build_cert("Root", ca=True)
+    flow = _make_auth_flow(root_pem)
+    identity = {
+        "aid": "alice.test",
+        "public_key_der_b64": base64.b64encode(different_pub_der).decode("ascii"),
+        "_pending_new_cert": cert_pem,
+    }
+    asyncio.run(flow._validate_new_cert(identity))
+    assert "cert" not in identity  # 被拒绝
+

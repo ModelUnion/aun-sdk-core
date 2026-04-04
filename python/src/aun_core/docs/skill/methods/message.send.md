@@ -21,7 +21,7 @@ result = await client.call("message.send", {
 | `payload` | object | 是 | — | 消息体，结构由 `type` 决定 |
 | `type` | string | 否 | `"text"` | 消息类型 |
 | `persist` | boolean | 否 | `false` | 是否持久化到数据库；`false` 时仅存临时缓冲 |
-| `encrypted` | boolean | 否 | `false` | 是否端到端加密 |
+| `encrypt` | boolean | 否 | `true` | 是否端到端加密（SDK 默认加密发送；明文时显式传 `false`）。底层传输信封中映射为 `encrypted` 字段 |
 | `message_id` | string | 否 | 服务端生成 | 客户端指定的幂等 ID，重复发送返回 `"duplicate"` |
 | `timestamp` | integer | 否 | 服务端时间 | 客户端时间戳（毫秒）。**服务端忽略此字段，始终使用服务端时间** |
 

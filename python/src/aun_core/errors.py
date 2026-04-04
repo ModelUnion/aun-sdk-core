@@ -96,6 +96,56 @@ class E2EEDecryptFailedError(E2EEError):
         )
 
 
+# ── 群组 E2EE 错误 ──────────────────────────────────────────
+
+class E2EEGroupSecretMissingError(E2EEError):
+    """缺少该群的 group_secret"""
+    def __init__(self, message: str = "group secret missing", **kwargs: Any) -> None:
+        super().__init__(message, code=-32040, local_code="E2EE_GROUP_SECRET_MISSING", **kwargs)
+
+
+class E2EEGroupEpochMismatchError(E2EEError):
+    """消息 epoch 与本地不匹配"""
+    def __init__(self, message: str = "group epoch mismatch", **kwargs: Any) -> None:
+        super().__init__(message, code=-32041, local_code="E2EE_GROUP_EPOCH_MISMATCH", **kwargs)
+
+
+class E2EEGroupCommitmentInvalidError(E2EEError):
+    """Membership Commitment 验证失败"""
+    def __init__(self, message: str = "group commitment invalid", **kwargs: Any) -> None:
+        super().__init__(message, code=-32042, local_code="E2EE_GROUP_COMMITMENT_INVALID", **kwargs)
+
+
+class E2EEGroupNotMemberError(E2EEError):
+    """密钥请求者不是群成员"""
+    def __init__(self, message: str = "not a group member", **kwargs: Any) -> None:
+        super().__init__(message, code=-32043, local_code="E2EE_GROUP_NOT_MEMBER", **kwargs)
+
+
+class E2EEGroupDecryptFailedError(E2EEError):
+    """群消息解密失败"""
+    def __init__(self, message: str = "group message decrypt failed", **kwargs: Any) -> None:
+        super().__init__(message, code=-32044, local_code="E2EE_GROUP_DECRYPT_FAILED", **kwargs)
+
+
+class CertificateRevokedError(AuthError):
+    """对端证书已被吊销"""
+    def __init__(self, message: str = "peer certificate has been revoked", **kwargs: Any) -> None:
+        super().__init__(message, code=-32050, **kwargs)
+
+
+class E2EEDegradedError(E2EEError):
+    """E2EE 降级（无前向保密）"""
+    def __init__(self, message: str = "e2ee degraded: no forward secrecy", **kwargs: Any) -> None:
+        super().__init__(message, local_code="E2EE_DEGRADED", **kwargs)
+
+
+class ClientSignatureError(ValidationError):
+    """客户端操作签名验证失败"""
+    def __init__(self, message: str = "client signature verification failed", **kwargs: Any) -> None:
+        super().__init__(message, code=-32051, **kwargs)
+
+
 def map_remote_error(error: dict[str, Any]) -> AUNError:
     code = int(error.get("code", -32603))
     message = str(error.get("message", "remote error"))

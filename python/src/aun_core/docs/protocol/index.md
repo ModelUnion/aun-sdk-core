@@ -17,6 +17,7 @@
 | 06 | [06-服务协议.md](06-服务协议.md) | 业务层：message.* / meta.* / search.* / task.* / group.* + 跨域消息路由 |
 | 07 | [07-错误码与状态机.md](07-错误码与状态机.md) | 错误码汇总、各模式状态机、重试分类 |
 | E2EE | [08-AUN-E2EE.md](08-AUN-E2EE.md) | 端到端加密安全层（横跨三种模式） |
+| E2EE-Group | [08-AUN-E2EE-Group.md](08-AUN-E2EE-Group.md) | 群组 E2EE：Epoch Group Key、Membership Commitment、密钥恢复 |
 | 09 | [09-安全考虑.md](09-安全考虑.md) | 威胁模型、防护措施、升级安全、验签时序 |
 | 10 | [10-Group-子协议.md](10-Group-子协议.md) | `group.*` 群组管理、群消息、邀请码、资源共享、在线状态 |
 
@@ -87,7 +88,10 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 错误码分层汇总（JSON-RPC 通用 + AUN 协议级 + Peer/Relay/Search/Task/升级扩展码）。三种连接模式状态机。任务状态机。可重试/不可重试分类。
 
 ### AUN-E2EE
-独立安全层，横跨三种连接模式。定义客户端间 E2EE 加解密（prekey_ecdh / long_term_key 两级降级）、prekey 管理、密文格式、AAD 防篡改、防重放保护。无需在线协商。
+独立安全层，横跨三种连接模式。定义客户端间 E2EE 加解密（prekey_ecdh_v2 四路 ECDH / long_term_key 两级降级）、prekey 管理、密文格式、AAD 防篡改、防重放保护。无需在线协商。
+
+### AUN-E2EE-Group
+群组端到端加密规范。Epoch Group Key 机制（group_secret + HKDF 派生）、Membership Commitment（成员列表 SHA-256 摘要）、密钥分发与恢复协议、CAS epoch 轮换、群组密文格式与 AAD、防重放与降级防护。
 
 ### 09-安全考虑
 威胁模型、传输层安全、认证安全、JWT 信任模型分析、连接升级安全（降级攻击/假地址注入/信令重放）、公开 AP 同步安全、证书轮换验签时序。

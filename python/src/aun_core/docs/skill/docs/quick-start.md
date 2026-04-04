@@ -57,17 +57,17 @@ asyncio.run(main())
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `aun_path` | `str` | AUN 工作目录，用于存储密钥、证书等本地数据 |
-| `root_ca_path` | `str` | 可选的额外 Root CA 证书 bundle 路径。SDK 默认内置根证书，并在 `auth.aid_login1` 时用本地信任根校验服务端 `identity_cert` 链；缺失的中间 CA 证书会通过 Gateway `/pki/chain` 下载补全，并通过签名 CRL/OCSP 检查服务端证书状态 |
+| `root_ca_path` | `str` | 可选的额外 Root CA 证书 bundle 路径。SDK 默认内置根证书，并在 `auth.aid_login1` 时用本地信任根校验服务端 `auth_cert` 链；缺失的中间 CA 证书会通过 Gateway `/pki/chain` 下载补全，并通过签名 CRL/OCSP 检查服务端证书状态 |
 | `encryption_seed` | `str` | 本地存储加密种子，保护密钥文件的对称加密密钥派生源 |
 
 ## 核心 API
 
 | API | 说明 |
 |-----|------|
-| `client.call(method, params)` | 调用任意 RPC 方法，返回结果或抛出异常。`message.send` 支持 `encrypt=True` 自动加密，`message.pull` 自动解密 |
+| `client.call(method, params)` | 调用任意 RPC 方法，返回结果或抛出异常。`message.send` / `group.send` 默认加密发送，`message.pull` / `group.pull` 自动解密 |
 | `client.on(event, handler)` | 订阅事件，`handler` 为异步回调函数 |
 | `client.auth` | 认证命名空间，提供 `create_aid()`、`authenticate()` 等方法 |
-| `client.e2ee` | E2EE 管理器（高级 API，裸 WebSocket 开发者使用）。`E2EEManager` 可独立于 `AUNClient` 实例化。普通开发者只需 `encrypt=True` |
+| `client.e2ee` | E2EE 管理器（高级 API，裸 WebSocket 开发者使用）。`E2EEManager` 可独立于 `AUNClient` 实例化。普通开发者无需额外操作，SDK 默认加密 |
 | `client.state` | 当前连接状态（`idle`、`connected`、`disconnected` 等） |
 | `client.aid` | 当前已认证的 AID 标识 |
 | `client.close()` | 关闭连接并释放资源 |
@@ -78,7 +78,7 @@ asyncio.run(main())
 |------|------|------|
 | `client.config` | `dict` | 构造时传入的原始配置字典（如 `client.config["aun_path"]`） |
 | `client.auth` | `AuthNamespace` | 认证命名空间（`create_aid`、`authenticate`、`renew_cert`、`rekey`） |
-| `client.e2ee` | `E2EEManager` | 端到端加密管理器（高级 API，可独立于 AUNClient 实例化）。普通开发者只需在 `call("message.send", ...)` 中传入 `encrypt=True` |
+| `client.e2ee` | `E2EEManager` | 端到端加密管理器（高级 API，可独立于 AUNClient 实例化）。普通开发者无需额外操作，SDK 默认加密发送 |
 | `client.state` | `str` | 连接状态：`"idle"` / `"connected"` / `"disconnected"` |
 | `client.aid` | `str \| None` | 当前已认证的 AID 标识 |
 

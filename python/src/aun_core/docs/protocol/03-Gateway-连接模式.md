@@ -89,6 +89,13 @@ WebSocket 连接建立
 | capabilities | object | 否 | 客户端能力声明 |
 | client | object | 否 | 客户端信息（名称、版本等） |
 
+**capabilities 字段说明**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `e2ee` | boolean | 是否支持 P2P E2EE（接收和发送） |
+| `group_e2ee` | boolean | 是否支持群组 E2EE（接收、解密、密钥协议处理）。所有现代客户端必须声明为 `true` |
+
 请求示例：
 
 ```json

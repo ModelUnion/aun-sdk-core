@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+import logging
+
 import aiohttp
 import websockets
 from cryptography import x509
@@ -20,6 +22,9 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from .crypto import CryptoProvider
 from .errors import AuthError, StateError, ValidationError, map_remote_error, AUNError
 from .keystore.file import FileKeyStore
+
+
+_auth_log = logging.getLogger("aun_core.auth")
 
 
 def _verify_signature(public_key: Any, sig_bytes: bytes, data_bytes: bytes) -> None:
@@ -45,12 +50,14 @@ class AuthFlow:
         connection_factory=None,
         root_ca_path: str | None = None,
         chain_cache_ttl: int = 86400,
+        verify_ssl: bool = False,
     ) -> None:
         self._keystore = keystore
         self._crypto = crypto
         self._aid = aid
         self._connection_factory = connection_factory or self._default_connection_factory
         self._root_ca_path = root_ca_path
+        self._verify_ssl = verify_ssl
         self._root_certs = self._load_root_certs(root_ca_path)
         self._gateway_chain_cache: dict[str, list[str]] = {}
         self._gateway_crl_cache: dict[str, dict[str, Any]] = {}
@@ -147,6 +154,7 @@ class AuthFlow:
                 ) from e
         login = await self._login(gateway_url, identity)
         self._remember_tokens(identity, login)
+        await self._validate_new_cert(identity, gateway_url)
         self._keystore.save_identity(identity["aid"], identity)
         self._aid = identity["aid"]
         return {
@@ -166,6 +174,7 @@ class AuthFlow:
 
         login = await self._login(gateway_url, identity)
         self._remember_tokens(identity, login)
+        await self._validate_new_cert(identity, gateway_url)
         self._keystore.save_identity(identity["aid"], identity)
 
         token = identity.get("access_token") or identity.get("token") or identity.get("kite_token")
@@ -179,6 +188,7 @@ class AuthFlow:
             raise AuthError("missing refresh_token")
         refreshed = await self._refresh_access_token(gateway_url, refresh_token)
         self._remember_tokens(identity, refreshed)
+        await self._validate_new_cert(identity, gateway_url)
         self._keystore.save_identity(identity["aid"], identity)
         return identity
 
@@ -260,6 +270,10 @@ class AuthFlow:
             "nonce": nonce,
             "auth": {"method": "kite_token", "token": token},
             "protocol": {"min": "1.0", "max": "1.0"},
+            "capabilities": {
+                "e2ee": True,
+                "group_e2ee": True,
+            },
         })
         status = (result or {}).get("status")
         if status != "ok":
@@ -361,10 +375,17 @@ class AuthFlow:
         if not chain:
             raise AuthError("unable to verify auth certificate chain: missing CA chain")
 
-        # 如果 CA 链已预验证，只验证 auth_cert → Issuer（1层）
+        # 如果 CA 链已通过完整验证（含受信根锚定），走快速路径：只验 auth_cert → Issuer
         if self._gateway_ca_verified.get(gateway_url):
             issuer = chain[0]
             self._ensure_cert_time_valid(issuer, "Issuer CA", now)
+            # 快速路径仍需检查 BasicConstraints
+            try:
+                bc = issuer.extensions.get_extension_for_class(x509.BasicConstraints).value
+                if not bc.ca:
+                    raise AuthError("Issuer CA is not marked as CA (fast path)")
+            except x509.ExtensionNotFound:
+                raise AuthError("Issuer CA missing BasicConstraints (fast path)")
             if auth_cert.issuer != issuer.subject:
                 raise AuthError("auth certificate issuer mismatch")
             try:
@@ -426,19 +447,8 @@ class AuthFlow:
         if cached is None:
             cached = await self._fetch_gateway_ca_chain(gateway_url)
             self._gateway_chain_cache[gateway_url] = cached
-            # 加载后立即预验证 CA 链
-            certs = self._load_cert_bundle(cached)
-            if len(certs) >= 2:
-                try:
-                    # 验证 Issuer → Registry → Root
-                    for i in range(len(certs) - 1):
-                        _verify_signature(certs[i+1].public_key(), certs[i].signature, certs[i].tbs_certificate_bytes)
-                    # 验证 Root 自签名
-                    root = certs[-1]
-                    _verify_signature(root.public_key(), root.signature, root.tbs_certificate_bytes)
-                    self._gateway_ca_verified[gateway_url] = True
-                except Exception:
-                    pass  # 预验证失败不影响后续完整验证
+            # 注意：此处只缓存 PEM 数据，不设置 _gateway_ca_verified。
+            # 信任标记只能在 _verify_auth_cert_chain 完整验证（含受信根锚定）通过后设置。
         return self._load_cert_bundle(cached)
 
     async def _verify_auth_cert_revocation(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
@@ -459,6 +469,29 @@ class AuthFlow:
             raise AuthError("auth certificate OCSP status is revoked")
         if status != "good":
             raise AuthError(f"auth certificate OCSP status is {status}")
+
+    async def verify_peer_certificate(
+        self, gateway_url: str, cert: x509.Certificate, expected_aid: str,
+    ) -> None:
+        """统一的对端证书验证入口：时间有效性 + 链验证 + CRL + OCSP + AID 绑定。"""
+        self._ensure_cert_time_valid(cert, "peer certificate", time.time())
+        await self._verify_auth_cert_chain(gateway_url, cert)
+        try:
+            await self._verify_auth_cert_revocation(gateway_url, cert)
+        except AuthError:
+            raise
+        except Exception as exc:
+            raise AuthError(f"peer cert CRL check failed: {exc}") from exc
+        try:
+            await self._verify_auth_cert_ocsp(gateway_url, cert)
+        except AuthError:
+            raise
+        except Exception as exc:
+            raise AuthError(f"peer cert OCSP check failed: {exc}") from exc
+        cn_attrs = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+        if not cn_attrs or cn_attrs[0].value != expected_aid:
+            cert_cn = cn_attrs[0].value if cn_attrs else "none"
+            raise AuthError(f"peer cert CN mismatch: expected {expected_aid}, got {cert_cn}")
 
     async def _load_gateway_revoked_serials(
         self,
@@ -528,6 +561,9 @@ class AuthFlow:
             for revoked in crl
         }
         next_refresh_at = crl.next_update_utc.timestamp() if crl.next_update_utc else time.time() + 300
+        # 客户端最大缓存 TTL：不信任服务端设置超过 24 小时的 next_update
+        max_refresh_at = time.time() + 86400
+        next_refresh_at = min(next_refresh_at, max_refresh_at)
         return {
             "revoked_serials": revoked_serials,
             "next_refresh_at": next_refresh_at,
@@ -592,6 +628,9 @@ class AuthFlow:
             raise AuthError("gateway OCSP status mismatch")
 
         next_refresh_at = response.next_update_utc.timestamp() if response.next_update_utc else time.time() + 300
+        # 客户端最大缓存 TTL：不信任服务端设置超过 24 小时的 next_update
+        max_refresh_at = time.time() + 86400
+        next_refresh_at = min(next_refresh_at, max_refresh_at)
         return {
             "status": effective_status,
             "next_refresh_at": next_refresh_at,
@@ -600,8 +639,9 @@ class AuthFlow:
     async def _fetch_text(self, url: str) -> str:
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
+            ssl_param = None if self._verify_ssl else False
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, ssl=False) as response:
+                async with session.get(url, ssl=ssl_param) as response:
                     response.raise_for_status()
                     return await response.text()
         except Exception as exc:
@@ -610,8 +650,9 @@ class AuthFlow:
     async def _fetch_json(self, url: str) -> dict[str, Any]:
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
+            ssl_param = None if self._verify_ssl else False
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, ssl=False) as response:
+                async with session.get(url, ssl=ssl_param) as response:
                     response.raise_for_status()
                     payload = await response.json()
         except Exception as exc:
@@ -691,9 +732,57 @@ class AuthFlow:
         if isinstance(expires_in, (int, float)):
             identity["access_token_expires_at"] = int(time.time() + float(expires_in))
         # 协议要求：login2 响应含 new_cert 时（证书过半自动续期），客户端必须保存
+        # 先暂存到 _pending_new_cert，由 _validate_new_cert 验证后再正式接受
         new_cert = auth_result.get("new_cert")
         if new_cert:
-            identity["cert"] = new_cert
+            identity["_pending_new_cert"] = new_cert
+
+    async def _validate_new_cert(self, identity: dict[str, Any], gateway_url: str = "") -> None:
+        """验证服务端返回的 new_cert，通过后才正式接受。
+
+        安全要点：除 CN/公钥/时间外，还必须做完整链验证 + 受信根锚定 + CRL/OCSP，
+        防止恶意网关塞入"同公钥但不受信链"的证书。
+        """
+        new_cert_pem = identity.pop("_pending_new_cert", None)
+        if not new_cert_pem:
+            return
+        try:
+            cert = x509.load_pem_x509_certificate(
+                new_cert_pem.encode("utf-8") if isinstance(new_cert_pem, str) else new_cert_pem
+            )
+            # 1. CN 必须匹配当前 AID
+            aid = identity.get("aid", "")
+            cn_attrs = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+            if not cn_attrs or cn_attrs[0].value != aid:
+                raise AuthError(
+                    f"new_cert CN mismatch: expected {aid}, got {cn_attrs[0].value if cn_attrs else 'none'}"
+                )
+            # 2. 公钥必须匹配本地私钥
+            cert_pub_der = cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            local_pub_b64 = identity.get("public_key_der_b64", "")
+            if local_pub_b64:
+                local_pub_der = base64.b64decode(local_pub_b64)
+                if cert_pub_der != local_pub_der:
+                    raise AuthError("new_cert public key does not match local identity key")
+            # 3. 时间有效性
+            self._ensure_cert_time_valid(cert, "new_cert", time.time())
+            # 4. 完整证书链验证 + 受信根锚定 + CRL/OCSP
+            if gateway_url:
+                await self._verify_auth_cert_chain(gateway_url, cert)
+                await self._verify_auth_cert_revocation(gateway_url, cert)
+                try:
+                    await self._verify_auth_cert_ocsp(gateway_url, cert)
+                except AuthError:
+                    pass  # OCSP 不可用时降级（CRL 已检查）
+            # 验证通过，正式接受
+            identity["cert"] = new_cert_pem if isinstance(new_cert_pem, str) else new_cert_pem.decode("utf-8")
+        except AuthError as exc:
+            _auth_log.warning("拒绝服务端返回的 new_cert (%s): %s", identity.get("aid"), exc)
+        except Exception as exc:
+            _auth_log.warning("new_cert 验证异常 (%s): %s", identity.get("aid"), exc)
 
     @staticmethod
     def _get_cached_access_token(identity: dict[str, Any]) -> str:

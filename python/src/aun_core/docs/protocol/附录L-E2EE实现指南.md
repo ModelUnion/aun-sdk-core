@@ -7,13 +7,14 @@
 
 AUN-E2EE 支持两种加密模式，SDK 实现应同时支持。
 
-### L.0.1 模式 1：prekey_ecdh（优先）
+### L.0.1 模式 1：prekey_ecdh_v2（优先）
 
-**机制**：发送方获取接收方预上传的 prekey，生成临时 ECDH 密钥对，通过 ECDH + HKDF 派生消息密钥。
+**机制**：发送方获取接收方预上传的 prekey，生成临时 ECDH 密钥对，通过四路 ECDH（ephemeral × prekey + ephemeral × identity + sender_identity × prekey + sender_identity × identity）+ HKDF 派生消息密钥。
 
 **优势**：
 - 前向安全（临时密钥用完即丢）
 - 一消息一密钥（每条消息独立临时密钥对）
+- 四路 ECDH 绑定双方身份，防止 prekey 替换攻击和中间人攻击
 - 支持接收方离线
 - 无需在线协商
 
@@ -22,28 +23,30 @@ AUN-E2EE 支持两种加密模式，SDK 实现应同时支持。
 
 ### L.0.2 模式 2：long_term_key（降级）
 
-**机制**：使用接收方长期公钥（从 X.509 证书获取），通过 ECIES 加密随机会话密钥。
+**机制**：使用接收方长期公钥（从 X.509 证书获取），生成临时 ECDH 密钥对，通过双 DH（ephemeral × recipient_identity + sender_identity × recipient_identity）+ HKDF 派生消息密钥。
 
 **优势**：
 - 支持接收方离线且无 prekey 时发送加密消息
-- 一消息一密钥（每条消息独立会话密钥）
+- 一消息一密钥（每条消息独立临时密钥对）
+- 双 DH 绑定双方身份
 
 **限制**：
-- 不提供前向安全性
+- 不提供严格意义上的前向安全性
 - 长期私钥泄露会导致历史消息被解密
+- Python SDK 默认 `require_forward_secrecy=true`，会拒绝此模式；需显式配置才允许降级
 
 ### L.0.3 模式选择策略
 
 SDK 按以下优先级自动选择：
 
-1. **优先**：prekey_ecdh（服务端有接收方 prekey）
+1. **优先**：prekey_ecdh_v2（服务端有接收方 prekey）
 2. **降级**：long_term_key（无 prekey 时）
 
 ---
 
 ## L.1 交互流程
 
-### L.1.1 prekey_ecdh 时序图
+### L.1.1 prekey_ecdh_v2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -52,22 +55,22 @@ sequenceDiagram
     participant Sender
 
     Note over Receiver: 上线时自动上传 prekey
-    Receiver->>Gateway: message.e2ee.put_prekey {prekey_id, public_key, signature}
+    Receiver->>Gateway: message.e2ee.put_prekey {prekey_id, public_key, signature, created_at}
 
     Note over Sender: 发送加密消息
     Sender->>Gateway: message.e2ee.get_prekey {aid: receiver}
-    Gateway-->>Sender: {prekey_id, public_key, signature}
+    Gateway-->>Sender: {prekey_id, public_key, signature, created_at}
 
     Note over Sender: 验证 prekey 签名（用 receiver 证书）
     Note over Sender: 生成临时 ECDH 密钥对
-    Note over Sender: ECDH(ephemeral_private, prekey_public) → shared_secret
-    Note over Sender: HKDF(shared_secret, "aun-prekey:{prekey_id}") → message_key
+    Note over Sender: 四路 ECDH：dh1 = ECDH(ephemeral, prekey), dh2 = ECDH(ephemeral, identity), dh3 = ECDH(sender_identity, prekey), dh4 = ECDH(sender_identity, identity)
+    Note over Sender: HKDF(dh1||dh2||dh3||dh4, "aun-prekey-v2:{prekey_id}") → message_key
     Note over Sender: AES-256-GCM(message_key, plaintext, AAD) → ciphertext
 
     Sender->>Gateway: message.send {encrypted: true, payload: envelope}
     Gateway->>Receiver: 推送或 pull
 
-    Note over Receiver: 用 prekey 私钥 + ephemeral_public → ECDH → message_key → 解密
+    Note over Receiver: 四路 ECDH(prekey_private + identity_private, ephemeral_public + sender_identity_public) → message_key → 解密
 ```
 
 ### L.1.2 long_term_key 时序图
@@ -83,14 +86,20 @@ sequenceDiagram
     Gateway-->>Sender: cert_pem
 
     Note over Sender: 从证书提取长期公钥
-    Note over Sender: 生成随机 session_key
-    Note over Sender: ECIES(recipient_public_key, session_key) → encrypted_session_key
-    Note over Sender: AES-256-GCM(session_key, plaintext, AAD) → ciphertext
+    Note over Sender: 生成临时 ECDH 密钥对
+    Note over Sender: DH1 = ECDH(ephemeral, recipient_identity)
+    Note over Sender: DH2 = ECDH(sender_identity, recipient_identity)
+    Note over Sender: HKDF(DH1 || DH2, info="aun-longterm-v2") → message_key
+    Note over Sender: AES-256-GCM(message_key, plaintext, AAD) → ciphertext
+    Note over Sender: ECDSA 签名(ciphertext + tag + aad_bytes) → sender_signature
 
     Sender->>Gateway: message.send {encrypted: true, payload: envelope}
     Gateway->>Receiver: 推送或 pull
 
-    Note over Receiver: ECIES 解密 session_key → AES-GCM 解密 → plaintext
+    Note over Receiver: 验证 sender_signature（用发送方证书）
+    Note over Receiver: DH1 = ECDH(identity_private, ephemeral)
+    Note over Receiver: DH2 = ECDH(identity_private, sender_identity)
+    Note over Receiver: HKDF → message_key → AES-GCM 解密 → plaintext
 ```
 
 ---
@@ -182,9 +191,9 @@ AUNClient 连接时自动上传 prekey，并定时轮换（默认每小时）。
 
 ### L.3.2 Prekey 签名
 
-签名格式：`ECDSA(identity_private_key, "prekey_id|public_key_b64")`
+签名格式：`ECDSA(identity_private_key, "prekey_id|public_key_b64|created_at")`
 
-接收方用身份私钥签名 prekey，发送方用接收方证书验证签名，防止服务端替换假 prekey。
+接收方用身份私钥签名 prekey（绑定时间戳防止旧 prekey 重放），发送方用接收方证书验证签名，防止服务端替换假 prekey。
 
 ### L.3.3 旧 Prekey 私钥保留
 
@@ -250,3 +259,9 @@ AES-GCM + AAD 验证保证消息完整性。AAD 包含以下字段（字典序 J
 3. **私钥保护**：Prekey 私钥通过 FileKeyStore 加密存储（Windows DPAPI / SecretStore）
 4. **证书验证**：发送方必须验证 prekey 签名，防止中间人替换
 5. **Prekey 轮换**：建议每小时轮换一次 prekey，旧私钥保留 7 天
+
+---
+
+## L.7 兼容性说明
+
+- 发送端 **MUST** 使用 `prekey_ecdh_v2`（四路 ECDH）模式发送新消息

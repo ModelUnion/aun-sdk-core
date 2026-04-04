@@ -15,7 +15,13 @@ import asyncio
 import random
 import sys
 import time
+import uuid
 from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -27,8 +33,19 @@ from aun_core.e2ee import E2EEManager
 # 辅助函数
 # ---------------------------------------------------------------------------
 
+_TEST_AUN_PATH = "./.aun_test"
+_TEST_GATEWAY_URL = "wss://127.0.0.1:20001/aun"
+
+
 def _make_client(tag: str) -> AUNClient:
-    return AUNClient({"aun_path": f"./.aun_test/{tag}-{random.randint(1000,9999)}"})
+    client = AUNClient({
+        "aun_path": _TEST_AUN_PATH,
+        "verify_ssl": False,
+        "require_forward_secrecy": False,
+    })
+    # Docker 本地测试固定直连 Gateway，避免代理变量或 hosts 缺失导致发现失败。
+    client._gateway_url = _TEST_GATEWAY_URL
+    return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
@@ -128,8 +145,9 @@ async def _sdk_recv_pull(client: AUNClient, from_aid: str, after_seq: int = 0) -
     return [m for m in msgs if m.get("from") == from_aid]
 
 
-def _run_id() -> int:
-    return random.randint(10000, 99999)
+def _run_id() -> str:
+    """生成唯一运行标识（UUID 前 12 位，避免 AID 碰撞）"""
+    return uuid.uuid4().hex[:12]
 
 
 def _assert_decrypted(msg: dict, expected_payload: dict, label: str = ""):

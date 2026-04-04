@@ -31,6 +31,19 @@
 - [get_cached_prekey()](#get_cached_prekeypeer_aid---dict--none) - 获取缓存的 prekey
 - [invalidate_prekey_cache()](#invalidate_prekey_cachepeer_aid---none) - 使 prekey 缓存失效
 
+### [GroupE2EEManager](#groupe2eemanager-clientgroup_e2ee)（高级 API，裸 WebSocket 开发者使用）
+- [构造函数](#构造函数群组-e2ee) - 独立实例化
+- [create_epoch()](#create_epochgroup_id-member_aids---dict) - 创建首个 epoch
+- [rotate_epoch()](#rotate_epochgroup_id-member_aids---dict) - 轮换 epoch
+- [rotate_epoch_to()](#rotate_epoch_togroup_id-target_epoch-member_aids---dict) - 指定目标 epoch 轮换（配合 CAS）
+- [encrypt()](#encryptgroup_id-payload--message_idnone-timestampnone---dict) - 加密群消息
+- [decrypt()](#decryptmessage-dict---dict--none) - 解密单条群消息
+- [decrypt_batch()](#decrypt_batchmessages---list) - 批量解密
+- [handle_incoming()](#handle_incomingpayload-dict---str--none) - 处理 P2P 密钥消息
+- [build_recovery_request()](#build_recovery_requestgroup_id-epoch--sender_aidnone---dict--none) - 构建密钥恢复请求
+- [handle_key_request_msg()](#handle_key_request_msgrequest_payload-current_members---dict--none) - 处理密钥请求
+- [has_secret()](#has_secretgroup_id---bool) / [current_epoch()](#current_epochgroup_id---int--none) / [get_member_aids()](#get_member_aidsgroup_id---list) - 状态查询
+
 ### [其他](#其他)
 - [Subscription](#subscription) - 事件订阅对象
 - [内置事件](#内置事件) - 事件列表
@@ -46,17 +59,27 @@
 
 **`AUNClient(config: dict | None)`**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `aun_path` | `str` | 否 | 数据存储目录，默认 `~/.aun/{cwd}` |
-| `root_ca_path` | `str` | 否 | 额外 Root CA 路径 |
-| `encryption_seed` | `str` | 否 | 本地加密种子 |
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `aun_path` | `str` | 否 | `~/.aun/{cwd}` | 应用级数据目录（AID 数据在 `{aun_path}/AIDs/{aid}/` 下） |
+| `root_ca_path` | `str` | 否 | `None` | 额外 Root CA 路径 |
+| `encryption_seed` | `str` | 否 | `None` | 本地加密种子 |
+| `discovery_port` | `int` | 否 | `None` | 自定义 Gateway 发现端口 |
+| `group_e2ee` | `bool` | 否 | `true` | 群组 E2EE 为必选能力；当前 Python SDK 固定启用，用户传入值被忽略 |
+| `rotate_on_join` | `bool` | 否 | `false` | 新成员加入时是否轮换 epoch |
+| `epoch_auto_rotate_interval` | `int` | 否 | `0` | 定时 epoch 轮换间隔（秒），0=禁用 |
+| `old_epoch_retention_seconds` | `int` | 否 | `604800` | 旧 epoch 密钥保留时间（默认 7 天） |
+| `keystore` | `KeyStore` | 否 | `FileKeyStore` | 自定义密钥存储实现 |
+| `secret_store` | `SecretStore` | 否 | 平台默认 | 自定义敏感数据存储（DPAPI/Keychain/libsecret） |
+| `connection_factory` | `callable` | 否 | 内置 WSS | 自定义 WebSocket 连接工厂 |
+| `crypto` | `CryptoProvider` | 否 | 内置 | 自定义密码学实现 |
+| `server_replay_guard` | `bool` | 否 | `false` | 启用服务端防重放（跨进程持久化） |
+| `prekey_refresh_interval` | `float` | 否 | `3600` | Prekey 自动轮换间隔（秒） |
 
 ```python
 client = AUNClient({
     "aun_path": "~/.aun/myapp",
-    "root_ca_path": None,
-    "encryption_seed": None,
+    "rotate_on_join": False,
 })
 ```
 
@@ -65,9 +88,10 @@ client = AUNClient({
 | 属性 | 类型 | 说明 |
 |------|------|------|
 | `aid` | `str \| None` | 当前连接的 AID |
-| `state` | `str` | 连接状态 (`disconnected` / `connecting` / `connected`) |
-| `auth` | `AUNClient.Auth` | 认证命名空间 |
-| `e2ee` | `AUNClient.E2EEManager` | E2EE 管理器 |
+| `state` | `str` | 连接状态 (`idle` / `connecting` / `connected` / `disconnected` / `closed`) |
+| `auth` | `AuthNamespace` | 认证命名空间 |
+| `e2ee` | `E2EEManager` | P2P E2EE 工具类 |
+| `group_e2ee` | `GroupE2EEManager` | 群组 E2EE 工具类（当前 Python SDK 固定可用） |
 
 ---
 
@@ -122,15 +146,15 @@ await client.connect(auth, {
 
 **E2EE 自动加密/解密**：
 
-- `message.send` 时传入 `encrypt=True`，SDK 自动加密消息后发送
-- `message.pull` 返回的消息已自动解密，加密消息带有 `encrypted=True` 标记
+- `message.send` 和 `group.send` **默认加密发送**（`encrypt` 默认 `True`），无需显式传参
+- 发送明文消息需显式传 `encrypt=False`
+- `message.pull` / `group.pull` 返回的消息已自动解密，加密消息带有 `encrypted=True` 标记
 
 ```python
-# 发送加密消息
+# 发送加密消息（默认行为，无需传 encrypt）
 await client.call("message.send", {
     "to": "bob.agentid.pub",
     "payload": {"text": "秘密消息"},
-    "encrypt": True,        # SDK 自动加密
     "persist": True,
 })
 
@@ -139,18 +163,19 @@ result = await client.call("message.pull", {"after_seq": 0, "limit": 50})
 for msg in result["messages"]:
     print(msg["payload"])   # 加密消息已自动解密
 
-# 发送明文消息
-result = await client.call("message.send", {
+# 发送明文消息（需显式关闭加密）
+await client.call("message.send", {
     "to": "bob.agentid.pub",
     "payload": {"text": "Hello"},
+    "encrypt": False,
 })
 ```
 
-**`message.send` 额外参数（当 `encrypt=True` 时）**：
+**`message.send` 额外参数**：
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `encrypt` | `bool` | 否 | 是否加密消息（默认 `false`） |
+| `encrypt` | `bool` | 否 | 是否加密消息（默认 `true`） |
 | `message_id` | `str` | 否 | 消息 ID（不传则自动生成） |
 | `timestamp` | `int` | 否 | 时间戳毫秒（不传则自动生成） |
 | `persist` | `bool` | 否 | 是否持久化（默认 `true`） |
@@ -316,9 +341,11 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 
 ## E2EEManager (`client.e2ee`)
 
-> **高级 API**：主要供裸 WebSocket 开发者使用。普通 SDK 开发者只需在 `call("message.send", ...)` 时传入 `encrypt=True`，SDK 会自动处理加密/解密，无需直接使用本节 API。
+> **高级 API**：主要供裸 WebSocket 开发者使用。普通 SDK 开发者无需额外操作——`call("message.send", ...)` 默认加密发送，SDK 会自动处理加密/解密，无需直接使用本节 API。
 >
 > `E2EEManager` 是纯密码学工具类，无 I/O 依赖，可独立于 `AUNClient` 实例化。
+>
+> 更详细的用法可参考 SDK 内部实现：`src/aun_core/client.py` 中 `_send_encrypted` / `_decrypt_message` 等方法。
 
 ### 构造函数（裸 WebSocket 开发者使用）
 
@@ -341,7 +368,7 @@ E2EEManager(
 
 ### `encrypt_message(to_aid, payload, *, peer_cert_pem, prekey=None, message_id=None, timestamp=None) -> tuple[Any, bool]`
 
-加密消息（便利方法，自动生成 message_id / timestamp）。有 prekey → prekey_ecdh，无 prekey → long_term_key。传入的 prekey 自动缓存。
+加密消息（便利方法，自动生成 message_id / timestamp）。有 prekey → prekey_ecdh_v2，无 prekey → long_term_key。传入的 prekey 自动缓存。
 
 **参数**
 
@@ -414,6 +441,193 @@ E2EEManager(
 ### `invalidate_prekey_cache(peer_aid) -> None`
 
 使指定 peer 的 prekey 缓存失效。
+
+---
+
+## GroupE2EEManager (`client.group_e2ee`)
+
+> **高级 API**：主要供裸 WebSocket 开发者使用。普通 SDK 开发者无需额外操作——`call("group.send", ...)` 默认加密发送，SDK 自动处理群组加密/解密和密钥管理。
+>
+> `GroupE2EEManager` 是纯密码学 + 本地状态工具类，零 I/O 依赖，可独立于 `AUNClient` 实例化。
+> 内置防重放、epoch 降级防护、密钥请求/响应频率限制。
+>
+> 更详细的用法可参考 SDK 内部实现：`src/aun_core/client.py` 中群组 E2EE 自动编排（`_rotate_group_epoch` / `_distribute_key_to_new_member` / `_try_handle_group_key_message` 等方法）。
+
+### 构造函数（群组 E2EE）
+
+```python
+GroupE2EEManager(
+    *,
+    identity_fn,            # () -> {aid, private_key_pem, ...}
+    keystore,               # KeyStore protocol 实现
+    request_cooldown=30.0,  # 密钥请求冷却时间（秒）
+    response_cooldown=30.0, # 密钥响应冷却时间（秒）
+)
+```
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `identity_fn` | `() -> dict` | 返回当前身份信息 |
+| `keystore` | `KeyStore` | 密钥存储实现 |
+| `request_cooldown` | `float` | 同一 group+epoch 密钥请求最小间隔，默认 30 秒 |
+| `response_cooldown` | `float` | 同一 group+requester 密钥响应最小间隔，默认 30 秒 |
+
+---
+
+### `create_epoch(group_id, member_aids) -> dict`
+
+创建首个 epoch（建群时调用）。生成群密钥，本地存储，返回分发信息。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | `str` | 是 | 群组 ID |
+| `member_aids` | `list[str]` | 是 | 初始成员 AID 列表 |
+
+**返回值**: `{epoch: 1, commitment: str, distributions: [{to: str, payload: dict}]}`
+
+调用方需将 `distributions` 中的每个 payload 通过 P2P E2EE 发送给对应成员。
+
+---
+
+### `rotate_epoch(group_id, member_aids) -> dict`
+
+轮换 epoch（踢人/定时轮换时调用）。自动递增 epoch 号，返回格式与 `create_epoch` 相同。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | `str` | 是 | 群组 ID |
+| `member_aids` | `list[str]` | 是 | 轮换后的成员列表（不含被踢成员） |
+
+**返回值**: `{epoch, commitment, distributions}`
+
+---
+
+### `rotate_epoch_to(group_id, target_epoch, member_aids) -> dict`
+
+指定目标 epoch 号轮换（配合服务端 CAS 使用）。当服务端通过 CAS 分配了 epoch 号后，用此方法生成对应密钥。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | `str` | 是 | 群组 ID |
+| `target_epoch` | `int` | 是 | 服务端 CAS 分配的 epoch 号 |
+| `member_aids` | `list[str]` | 是 | 成员列表 |
+
+**返回值**: `{epoch, commitment, distributions}`
+
+---
+
+### `encrypt(group_id, payload, *, message_id=None, timestamp=None) -> dict`
+
+加密群消息。使用当前 epoch 的群密钥加密。无密钥时抛 `E2EEGroupSecretMissingError`。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | `str` | 是 | 群组 ID |
+| `payload` | `dict` | 是 | 原始消息载荷 |
+| `message_id` | `str` | 否 | 消息 ID（不传则自动生成） |
+| `timestamp` | `int` | 否 | 时间戳毫秒（不传则自动生成） |
+
+**返回值**: 加密信封 `dict`（`type: "e2ee.group_encrypted"`）
+
+---
+
+### `decrypt(message: dict) -> dict | None`
+
+解密单条群消息。内置防重放 + 外层 `group_id` / `from` / `sender_aid` 校验。非加密消息原样返回，解密失败返回 `None`。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `message` | `dict` | 是 | 原始群消息（含 payload、group_id、from 等字段） |
+
+**返回值**: 解密后的消息，解密失败返回 `None`，非加密消息原样返回
+
+---
+
+### `decrypt_batch(messages) -> list`
+
+批量解密群消息（用于 `group.pull` 返回的消息列表）。解密失败的消息保留原始内容。
+
+---
+
+### `handle_incoming(payload: dict) -> str | None`
+
+处理已解密的 P2P 密钥消息（分发/请求/响应）。收到 P2P 消息后先解密，再将内层 payload 传入此方法。
+
+**返回值**:
+
+| 返回值 | 含义 |
+|--------|------|
+| `"distribution"` | 密钥分发已存储 |
+| `"distribution_rejected"` | epoch 降级被拒 |
+| `"request"` | 收到密钥请求，需调用 `handle_key_request_msg` 构建响应 |
+| `"response"` | 密钥恢复响应已存储 |
+| `"response_rejected"` | 响应被拒（epoch 降级） |
+| `None` | 不是密钥消息 |
+
+---
+
+### `build_recovery_request(group_id, epoch, *, sender_aid=None) -> dict | None`
+
+构建密钥恢复请求（缺密钥时调用）。受频率限制，冷却期内返回 `None`。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | `str` | 是 | 群组 ID |
+| `epoch` | `int` | 是 | 需要恢复的 epoch |
+| `sender_aid` | `str` | 否 | 消息发送者 AID（备选恢复目标） |
+
+**返回值**: `{to: str, payload: dict}` 或 `None`（限流/无目标时）
+
+调用方需将 `payload` 通过 P2P E2EE 发送给 `to`。
+
+---
+
+### `handle_key_request_msg(request_payload, current_members) -> dict | None`
+
+处理密钥请求并构建响应（受频率限制）。校验请求者是否在 `current_members` 中。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `request_payload` | `dict` | 是 | 密钥请求消息（含 requester_aid、group_id、epoch） |
+| `current_members` | `list[str]` | 是 | 当前群成员列表（用于校验请求者身份） |
+
+**返回值**: 响应 payload `dict`，或 `None`（非成员/限流/无密钥时）
+
+> **注意**：SDK 自动编排中，如果请求者不在本地 `member_aids` 中，会先回源查询 `group.get_members` 获取服务端最新成员列表后再调用此方法。裸 WebSocket 开发者也应实现类似逻辑。
+
+---
+
+### `has_secret(group_id) -> bool`
+
+查询指定群组是否有本地密钥。
+
+---
+
+### `current_epoch(group_id) -> int | None`
+
+获取指定群组的当前 epoch 号，无密钥时返回 `None`。
+
+---
+
+### `get_member_aids(group_id) -> list`
+
+获取指定群组当前 epoch 的本地成员列表，无密钥时返回空列表。
+
+> **注意**：返回的是本地保存的成员视图，不一定与服务端最新一致。需要最新列表时应查询 `group.get_members`。
 
 ---
 

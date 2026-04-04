@@ -310,7 +310,7 @@ extensions/services/evol/static/js/tests/
 
 1. aun服务模块: ../extensions/services
 2. docker发布环境 ../docker-deploy, 跑集成测试和E2E测试时如果aun服务模块的代码有修改，需要重新build和重启docker镜像
-3. 测试脚本目录 ../tests
+3. 测试脚本目录 ./python/tests
 4. aun协议文档目录 ../docs/aun文档/aun协议
 5. aun skill目录 ../../aun-skill/.claude/skills/aun-sdk
 6. aun sdk文档目录 ./python/docs

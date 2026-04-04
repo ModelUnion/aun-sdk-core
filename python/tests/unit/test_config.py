@@ -8,6 +8,9 @@ def test_from_dict_defaults():
     assert isinstance(cfg.aun_path, Path)
     assert cfg.root_ca_path is None
     assert cfg.encryption_seed is None
+    assert cfg.require_forward_secrecy is True  # 默认强制前向保密
+    assert cfg.group_e2ee is True
+    assert cfg.verify_ssl is True
 
 
 def test_from_dict_custom(tmp_path):

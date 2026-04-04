@@ -167,7 +167,7 @@ AUN 使用 JSON-RPC 2.0 原生三类消息：
 - **四级证书链**：Root CA → Registry CA → Issuer CA → Agent 证书，双向验证
 - **Challenge-Response**：Nonce 防重放 + 时间戳验证
 - **Token 体系**：access_token（短期）+ refresh_token（长期，一次性）
-- **E2EE**：支持多种密码学套件，默认 P-256 + HKDF-SHA256 + AES-256-GCM（MUST），亦支持 X25519 + ChaCha20-Poly1305（SHOULD）、P-384（MAY）、SM2 + SM4-GCM（MAY）。可叠加于任意连接模式
+- **E2EE**：协议层可扩展多种密码学套件，当前 Python SDK 仅实现 P-256 + HKDF-SHA256 + AES-256-GCM。可叠加于任意连接模式
 
 ### Gateway 模式连接流程
 
@@ -276,7 +276,7 @@ asyncio.run(main())
 | [02-WebSocket协议](02-WebSocket协议.md) | 握手流程、消息格式、裸 WebSocket 示例 |
 | [03-核心概念](03-核心概念.md) | AID、连接状态机、认证流程、E2EE |
 | [04-连接与认证](04-连接与认证.md) | 认证封装、call()、on()、网关发现 |
-| [05-E2EE加密通信](05-E2EE加密通信.md) | 端到端加密收发、会话管理、自定义存储 |
+| [05-E2EE加密通信](05-E2EE加密通信.md) | 端到端加密收发、密钥管理、自定义存储 |
 | [06-API手册](06-API手册.md) | AUNClient / AuthNamespace / E2EEManager 完整 API |
 | [07-错误处理](07-错误处理.md) | 错误类层级、错误码速查、重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等初始化、多 AID 隔离、资源清理 |

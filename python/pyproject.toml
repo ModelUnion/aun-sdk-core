@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aun-core"
-version = "0.1.4"
+version = "0.1.5"
 description = "AUN Protocol Core SDK — identity, authentication, key management, E2EE"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -42,7 +42,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"aun_core" = ["certs/*.crt", "docs/**/*.md"]
+"aun_core" = ["py.typed", "certs/*.crt", "docs/**/*.md", "docs/**/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -73,13 +73,13 @@
 底层协议细节。连接握手流程（challenge → auth.connect → hello-ok），消息格式（RPC 请求/响应/事件通知），裸 WebSocket 完整示例。适合在其他语言中实现客户端。
 
 ### 03-核心概念
-SDK 的核心抽象。AID 域名格式身份及本地密钥对管理；连接状态机及自动重连；认证流程（挑战-应答）；E2EE 三阶段流程。
+SDK 的核心抽象。AID 域名格式身份及本地密钥对管理；连接状态机及自动重连；认证流程（挑战-应答）；E2EE 两级离线加密流程。
 
 ### 04-连接与认证
 SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数（含自动重连、心跳、令牌刷新）；`client.call()` RPC 调用模式；`client.on()` 事件订阅。
 
 ### 05-E2EE加密通信
-E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；会话管理；自定义 `KeyStore` / `SecretStore` Protocol。
+E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
 
 ### 06-API手册
 完整 API 文档。AUNClient 构造函数/属性/方法；AuthNamespace 方法；E2EEManager 方法；内置事件列表；RPC 手册索引。

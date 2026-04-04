@@ -22,6 +22,7 @@ print(f"seq={msg['seq']}, id={msg['message_id']}")
 | `payload` | object | 是 | — | 消息体 |
 | `type` | string | 否 | `"text"` | 消息类型，仅允许 `"text"` / `"json"` / `"notice"` |
 | `attachments` | array | 否 | `[]` | 附件列表（storage 引用） |
+| `encrypt` | boolean | 否 | `true` | 是否端到端加密（SDK 默认加密发送；发送明文时显式传 `false`） |
 
 > **注意**：`type` 仅用于协议级分类。自定义业务类型请放在 `payload.kind` 中。
 

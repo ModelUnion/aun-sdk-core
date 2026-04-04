@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,15 @@ from ..secret_store import SecretStore, create_default_secret_store
 
 
 _SENSITIVE_TOKEN_FIELDS = ("access_token", "refresh_token", "kite_token")
+
+
+def _secure_file_permissions(path: Path) -> None:
+    """在 Unix 系统上将文件权限设为 0o600（仅属主可读写）"""
+    if sys.platform != "win32":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 class FileKeyStore(KeyStore):
@@ -48,14 +59,20 @@ class FileKeyStore(KeyStore):
         cert = identity.get("cert")
         if isinstance(cert, str) and cert:
             self.save_cert(aid, cert)
-        metadata = {
+        # 合并 metadata 而非覆盖：先加载已有数据，再更新 identity 中的字段
+        # 保护 e2ee_prekeys、group_secrets 等由其他流程写入的关键数据不被丢失
+        new_fields = {
             key: value
             for key, value in identity.items()
             if key not in {"private_key_pem", "public_key_der_b64", "curve", "cert"}
         }
-        self.save_metadata(aid, metadata)
+        existing = self.load_metadata(aid) or {}
+        existing.update(new_fields)
+        self.save_metadata(aid, existing)
 
     def delete_identity(self, aid: str) -> None:
+        scope = self._safe_aid(aid)
+        self._secret_store.clear(scope, "identity/private_key")
         self.delete_key_pair(aid)
         cert_path = self._cert_path(aid)
         if cert_path.exists():
@@ -106,6 +123,7 @@ class FileKeyStore(KeyStore):
             self._secret_store.clear(scope, "identity/private_key")
 
         path.write_text(json.dumps(protected_key_pair, ensure_ascii=False, indent=2), encoding="utf-8")
+        _secure_file_permissions(path)
 
     def load_cert(self, aid: str) -> str | None:
         path = self._cert_path(aid)
@@ -144,6 +162,7 @@ class FileKeyStore(KeyStore):
         path.parent.mkdir(parents=True, exist_ok=True)
         protected = self._protect_metadata(aid, metadata)
         path.write_text(json.dumps(protected, ensure_ascii=False, indent=2), encoding="utf-8")
+        _secure_file_permissions(path)
 
     def load_any_identity(self) -> dict | None:
         candidates: set[str] = set()
@@ -286,6 +305,44 @@ class FileKeyStore(KeyStore):
                 sanitized_prekeys[prekey_id] = prekey
             protected["e2ee_prekeys"] = sanitized_prekeys
 
+        # 保护 group_secret
+        group_secrets = protected.get("group_secrets")
+        if isinstance(group_secrets, dict):
+            sanitized_groups: dict[str, dict[str, Any]] = {}
+            for group_id, group_data in group_secrets.items():
+                if not isinstance(group_data, dict):
+                    continue
+                group = copy.deepcopy(group_data)
+                secret_name = f"group_secrets/{group_id}/secret"
+                value = group.pop("secret", None)
+                if isinstance(value, str) and value:
+                    group["secret_protection"] = self._secret_store.protect(
+                        scope, secret_name, value.encode("utf-8"),
+                    )
+                elif "secret_protection" not in group:
+                    self._secret_store.clear(scope, secret_name)
+                # 保护 old_epochs 中的 secret
+                old_epochs = group.get("old_epochs")
+                if isinstance(old_epochs, list):
+                    sanitized_old: list[dict[str, Any]] = []
+                    for old_data in old_epochs:
+                        if not isinstance(old_data, dict):
+                            continue
+                        old = copy.deepcopy(old_data)
+                        old_epoch = old.get("epoch", "?")
+                        old_secret_name = f"group_secrets/{group_id}/old/{old_epoch}"
+                        old_value = old.pop("secret", None)
+                        if isinstance(old_value, str) and old_value:
+                            old["secret_protection"] = self._secret_store.protect(
+                                scope, old_secret_name, old_value.encode("utf-8"),
+                            )
+                        elif "secret_protection" not in old:
+                            self._secret_store.clear(scope, old_secret_name)
+                        sanitized_old.append(old)
+                    group["old_epochs"] = sanitized_old
+                sanitized_groups[group_id] = group
+            protected["group_secrets"] = sanitized_groups
+
         return protected
 
     def _restore_metadata(self, aid: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -328,6 +385,36 @@ class FileKeyStore(KeyStore):
                         prekey_data["private_key_pem"] = value.decode("utf-8")
                     else:
                         prekey_data.pop("private_key_pem", None)
+
+        # 恢复 group_secret
+        group_secrets = restored.get("group_secrets")
+        if isinstance(group_secrets, dict):
+            for group_id, group_data in group_secrets.items():
+                if not isinstance(group_data, dict):
+                    continue
+                record = group_data.get("secret_protection")
+                secret_name = f"group_secrets/{group_id}/secret"
+                if isinstance(record, dict):
+                    value = self._secret_store.reveal(scope, secret_name, record)
+                    if value is not None:
+                        group_data["secret"] = value.decode("utf-8")
+                    else:
+                        group_data.pop("secret", None)
+                # 恢复 old_epochs 中的 secret
+                old_epochs = group_data.get("old_epochs")
+                if isinstance(old_epochs, list):
+                    for old_data in old_epochs:
+                        if not isinstance(old_data, dict):
+                            continue
+                        old_record = old_data.get("secret_protection")
+                        old_epoch = old_data.get("epoch", "?")
+                        old_secret_name = f"group_secrets/{group_id}/old/{old_epoch}"
+                        if isinstance(old_record, dict):
+                            old_value = self._secret_store.reveal(scope, old_secret_name, old_record)
+                            if old_value is not None:
+                                old_data["secret"] = old_value.decode("utf-8")
+                            else:
+                                old_data.pop("secret", None)
 
         return restored
 

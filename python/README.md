@@ -9,7 +9,7 @@ Provides identity management, PKI authentication, key storage, and end-to-end en
 - **Identity & Authentication** — X.509 certificate-based two-phase challenge-response (ECDSA P-256/P-384)
 - **Certificate Verification** — Full chain validation, CRL, OCSP, with caching and parallel verification
 - **Key Management** — File-based keystore with platform-native secret protection (Windows DPAPI)
-- **End-to-End Encryption** — Multiple cipher suites: P256\_HKDF\_SHA256\_AES\_256\_GCM (default), X25519\_HKDF\_SHA256\_CHACHA20\_POLY1305, P384, SM2\_SM4\_GCM. Session management and automatic rekeying
+- **End-to-End Encryption** — P256\_HKDF\_SHA256\_AES\_256\_GCM (protocol extensible). Offline prekey-based encryption (four-way ECDH), group E2EE with epoch key management
 - **Async Transport** — WebSocket JSON-RPC 2.0, auto-reconnect, heartbeat, token refresh
 
 ## Requirements

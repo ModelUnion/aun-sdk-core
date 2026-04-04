@@ -8,11 +8,15 @@ from .errors import ConnectionError, ValidationError
 
 
 class GatewayDiscovery:
+    def __init__(self, *, verify_ssl: bool = True) -> None:
+        self._verify_ssl = verify_ssl
+
     async def discover(self, well_known_url: str, *, timeout: float = 5.0) -> str:
         try:
             client_timeout = aiohttp.ClientTimeout(total=timeout)
+            ssl_param = None if self._verify_ssl else False
             async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.get(well_known_url, ssl=False) as response:
+                async with session.get(well_known_url, ssl=ssl_param) as response:
                     response.raise_for_status()
                     payload: dict[str, Any] = await response.json()
         except Exception as exc:

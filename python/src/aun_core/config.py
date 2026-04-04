@@ -68,6 +68,14 @@ class AUNConfig:
     root_ca_path: str | None = None
     encryption_seed: str | None = None
     discovery_port: int | None = None
+    # 群组 E2EE 配置（group_e2ee 是必选能力，始终为 True）
+    group_e2ee: bool = True
+    rotate_on_join: bool = False
+    epoch_auto_rotate_interval: int = 0  # 秒，0=禁用
+    old_epoch_retention_seconds: int = 604800  # 7 天
+    verify_ssl: bool = True  # TLS 证书验证（开发环境可设为 False）
+    require_forward_secrecy: bool = True  # 严格模式：拒绝无前向保密的 E2EE 降级
+    replay_window_seconds: int = 300  # 防重放时间窗口（秒）
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "AUNConfig":
@@ -81,4 +89,11 @@ class AUNConfig:
             root_ca_path=data.get("root_ca_path"),
             encryption_seed=data.get("encryption_seed"),
             discovery_port=int(dp) if dp is not None else None,
+            # group_e2ee 是必选能力，忽略用户传入值
+            rotate_on_join=bool(data.get("rotate_on_join", False)),
+            epoch_auto_rotate_interval=int(data.get("epoch_auto_rotate_interval", 0)),
+            old_epoch_retention_seconds=int(data.get("old_epoch_retention_seconds", 604800)),
+            verify_ssl=bool(data.get("verify_ssl", True)),
+            require_forward_secrecy=bool(data.get("require_forward_secrecy", True)),
+            replay_window_seconds=int(data.get("replay_window_seconds", 300)),
         )

@@ -4,7 +4,7 @@ E2EE 加密消息
 
 通过端到端加密发送消息，服务端无法解密内容。
 
-SDK 使用 prekey_ecdh（优先）或 long_term_key（降级）两级策略，
+SDK 使用 prekey_ecdh_v2（优先）或 long_term_key（降级）两级策略，
 每条消息独立临时密钥对，实现一消息一密钥。
 
 使用方法:
@@ -29,11 +29,10 @@ async def main():
     receiver_aid = await ensure_connected(receiver, f"demo-e2ee-reader-{RUN_ID}.agentid.pub")
     print(f"Sender:   {sender_aid}\nReceiver: {receiver_aid}\n")
 
-    # ── 1. Sender 发送加密消息（encrypt=True，SDK 自动处理） ──
+    # ── 1. Sender 发送加密消息（默认自动加密，SDK 自动处理） ──
     result = await sender.call("message.send", {
         "to": receiver_aid,
         "payload": {"text": "这是一条加密消息", "secret_data": "仅接收方可见"},
-        "encrypt": True,
         "persist": True,
     })
     print(f"[1] 发送完成: seq={result.get('seq')}")

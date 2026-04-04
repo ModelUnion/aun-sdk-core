@@ -39,7 +39,8 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 |------|------|
 | [06-服务协议.md](06-服务协议.md) | 业务层方法：message.* / meta.* / search.* / task.* / 跨域消息路由 / E2EE 摘要 |
 | [07-错误码与状态机.md](07-错误码与状态机.md) | 错误码分层汇总、各模式状态机、可重试/不可重试分类 |
-| [08-AUN-E2EE.md](08-AUN-E2EE.md) | 端到端加密安全层：握手、状态机、密文格式、重放保护（横跨三种模式） |
+| [08-AUN-E2EE.md](08-AUN-E2EE.md) | 端到端加密安全层：密文格式、签名、防重放、prekey 管理（横跨三种模式） |
+| [08-AUN-E2EE-Group.md](08-AUN-E2EE-Group.md) | 群组 E2EE：Epoch Group Key、Membership Commitment、密钥分发与恢复 |
 
 ### 附录
 

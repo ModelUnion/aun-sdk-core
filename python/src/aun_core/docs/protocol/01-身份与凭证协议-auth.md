@@ -13,7 +13,7 @@
 
 **不承担的职责**：
 
-- 连接模式协商和会话管理 — 由 `initialize` 握手完成（见 [04-协议握手](04-协议握手.md)）
+- 连接模式协商和会话管理 — 由 `auth.connect` 完成（见 [03-Gateway-连接模式](03-Gateway-连接模式.md)）
 - Peer / Relay 模式下的对等认证 — 由 `peer.*` 完成
 - Gateway 路由与转发逻辑 — Gateway 仅负责将 `auth.*` 请求转发到 Auth 服务
 
@@ -112,8 +112,9 @@ AID 命名规则：
 |------|------|:----:|------|
 | `aid` | string | 是 | Agent Identifier |
 | `cert` | string | 是 | 客户端 AID 证书（PEM 格式） |
-| `request_id` | string | 是 | 请求标识符，关联两阶段登录 |
 | `client_nonce` | string | 是 | 客户端随机 nonce（UUID），有效期 1 分钟 |
+
+> **注意**：`request_id` 由服务端在 Phase 1 响应中生成并返回，客户端在 Phase 2 中回传。客户端无需在 Phase 1 请求中提供 `request_id`。
 
 **请求**：
 
@@ -125,7 +126,6 @@ AID 命名规则：
   "params": {
     "aid": "alice.aid.pub",
     "cert": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
-    "request_id": "request-uuid-12345",
     "client_nonce": "550e8400-e29b-41d4-a716-446655440000"
   }
 }
@@ -138,6 +138,7 @@ AID 命名规则：
   "jsonrpc": "2.0",
   "id": 2,
   "result": {
+    "request_id": "req-a1b2c3d4e5f6",
     "nonce": "server_challenge_nonce",
     "server_time": 1735689600,
     "client_nonce_signature": "ecdsa_signature_of_client_nonce",
@@ -239,13 +240,15 @@ signature = ECDSA_sign(private_key, SHA256(message))
 4. 签名验证通过后，签发 JWT token
 
 **关键说明**：
-- `login2` 返回 token 但**不改变连接状态**，客户端需调用 `initialize(mode=gateway, token)` 完成认证握手（见 [04-协议握手](04-协议握手.md)）
+- `login2` 返回 token 但**不改变连接状态**，客户端需调用 `auth.connect` 完成会话初始化（见 [03-Gateway-连接模式](03-Gateway-连接模式.md)）
 - `client_time` 仅用于审计日志中的时钟偏移检查，不影响认证结果
 - 当 `new_cert` 存在时，客户端必须保存新证书替换旧证书，下次登录使用新证书
 
 ## 1.5 auth.refresh_token
 
-刷新 JWT token，在已认证连接上调用。
+刷新 JWT token。客户端显式提交 `refresh_token` 换取新的 `access_token` 和 `refresh_token`。
+
+> **注意**：此方法不要求在已认证连接上调用，可通过独立的 HTTP/WebSocket 请求调用（refresh token grant 模式）。
 
 **请求**：
 
@@ -254,7 +257,9 @@ signature = ECDSA_sign(private_key, SHA256(message))
   "jsonrpc": "2.0",
   "id": 4,
   "method": "auth.refresh_token",
-  "params": {}
+  "params": {
+    "refresh_token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9..."
+  }
 }
 ```
 
@@ -265,16 +270,19 @@ signature = ECDSA_sign(private_key, SHA256(message))
   "jsonrpc": "2.0",
   "id": 4,
   "result": {
-    "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "success": true,
+    "access_token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refresh_token": "new_refresh_token...",
     "expires_in": 3600
   }
 }
 ```
 
 **说明**：
-- 必须在已认证连接上调用
-- 旧 token 在其过期时间前仍然有效（JWT 标准行为），但客户端应立即停止使用
-- 建议在 token 过期前 5-10 分钟刷新
+- 调用时提交当前持有的 `refresh_token`
+- 服务端验证后吊销旧 `refresh_token`，签发新的 `access_token` 和 `refresh_token`
+- 旧 access_token 在其过期时间前仍然有效（JWT 标准行为），但客户端应立即切换到新 token
+- 建议在 access_token 过期前 60 秒刷新
 
 **刷新限制**：
 - 刷新链总时长不超过 30 天，或最多刷新 720 次
@@ -538,4 +546,4 @@ signature = ECDSA_sign(private_key, SHA256(message))
 - **JWT 非对称签名**：使用 ECDSA 签名，单一信任根（Auth 服务），所有验证方只需持有公钥
 - **开放注册策略由运营方决定**：协议不强制限制注册，运营方可根据业务需求实施审批、限流等策略
 
-> 完整威胁模型与防护措施见 [09-安全考虑](09-安全考虑.md)。证书层级与信任模型详见 [02-证书与信任体系](02-证书与信任体系.md)。连接模式与认证流程总览见 [03-连接与认证](03-连接与认证.md)。
+> 完整威胁模型与防护措施见 [09-安全考虑](09-安全考虑.md)。证书层级与信任模型详见 [02-证书与信任体系](02-证书与信任体系.md)。连接模式与认证流程总览见 [03-Gateway-连接模式](03-Gateway-连接模式.md)。
