@@ -539,8 +539,9 @@ class AuthFlow:
         return self._root_certs
 
     async def _fetch_gateway_ca_chain(self, gateway_url: str, chain_aid: str = "") -> list[str]:
-        path = f"/pki/chain/{chain_aid}" if chain_aid else "/pki/chain"
-        url = self._gateway_http_url(gateway_url, path)
+        # 始终用 /pki/chain（不带 AID），返回纯 CA 链
+        # 跨域时 gateway_url 已经是 peer 域的 URL
+        url = self._gateway_http_url(gateway_url, "/pki/chain")
         text = await self._fetch_text(url)
         return self._split_pem_bundle(text)
 
