@@ -642,14 +642,21 @@ class AUNClient:
     # ── E2EE 编排（从 E2EEManager 上提）─────────────────
 
     async def _fetch_peer_cert(self, aid: str) -> bytes:
-        """获取对方证书（带缓存 + 完整 PKI 验证：链 + CRL + OCSP + AID 绑定）"""
+        """获取对方证书（带缓存 + 完整 PKI 验证：链 + CRL + OCSP + AID 绑定）
+
+        跨域时自动将请求路由到 peer 所在域的 Gateway（URL 替换），
+        同时 Gateway 侧也有代理 fallback。
+        """
         cached = self._cert_cache.get(aid)
         if cached and time.time() < cached.refresh_after:
             return cached.cert_bytes
         gateway_url = self._gateway_url
         if not gateway_url:
             raise ValidationError("gateway url unavailable for e2ee cert fetch")
-        cert_url = self._build_cert_url(gateway_url, aid)
+
+        # 跨域时用 peer 所在域的 Gateway URL
+        peer_gateway_url = self._resolve_peer_gateway_url(gateway_url, aid)
+        cert_url = self._build_cert_url(peer_gateway_url, aid)
         ssl_param = None if self._config_model.verify_ssl else False
         async with aiohttp.ClientSession() as session:
             async with session.get(cert_url, ssl=ssl_param) as response:
@@ -658,10 +665,11 @@ class AUNClient:
         cert_bytes = cert_pem.encode("utf-8")
 
         # 完整 PKI 验证：链 + CRL + OCSP + AID 绑定
+        # 验证时也用 peer 的 Gateway URL（链/OCSP/CRL 都从 peer 域获取）
         from cryptography import x509 as _x509
         cert_obj = _x509.load_pem_x509_certificate(cert_bytes)
         try:
-            await self._auth.verify_peer_certificate(gateway_url, cert_obj, aid)
+            await self._auth.verify_peer_certificate(peer_gateway_url, cert_obj, aid)
         except Exception as exc:
             raise ValidationError(f"peer cert verification failed for {aid}: {exc}")
 
@@ -846,6 +854,25 @@ class AUNClient:
         path = f"/pki/cert/{quote(aid, safe='')}"
         return urlunparse((scheme, netloc, path, "", "", ""))
 
+    @staticmethod
+    def _resolve_peer_gateway_url(local_gateway_url: str, peer_aid: str) -> str:
+        """跨域时将 Gateway URL 替换为 peer 所在域的 Gateway URL。
+
+        例: local=wss://gateway.aid.com:20001/aun, peer=bob.aid.net
+        → wss://gateway.aid.net:20001/aun
+        """
+        if "." not in peer_aid:
+            return local_gateway_url
+        _, peer_issuer = peer_aid.split(".", 1)
+        import re
+        m = re.search(r"gateway\.([^:/]+)", local_gateway_url)
+        if not m:
+            return local_gateway_url
+        local_issuer = m.group(1)
+        if local_issuer == peer_issuer:
+            return local_gateway_url
+        return local_gateway_url.replace(f"gateway.{local_issuer}", f"gateway.{peer_issuer}")
+
     # ── 内部：连接 ────────────────────────────────────────
 
     async def _connect_once(self, params: dict[str, Any], *, allow_reauth: bool) -> None:
@@ -875,11 +902,11 @@ class AUNClient:
         await self._dispatcher.publish("connection.state", {"state": self._state, "gateway": gateway_url})
         self._start_background_tasks()
 
-        # 上线后自动上传 prekey（静默失败）
+        # 上线后自动上传 prekey（失败时记录日志）
         try:
             await self._upload_prekey()
-        except Exception:
-            pass
+        except Exception as exc:
+            _client_log.warning("prekey 上传失败: %s", exc)
 
     def _resolve_gateway(self, params: dict[str, Any]) -> str:
         topology = params.get("topology")

@@ -360,7 +360,7 @@ class AuthFlow:
         except (ValueError, InvalidSignature, AuthError) as exc:
             raise AuthError("aid_login1 server auth signature verification failed") from exc
 
-    async def _verify_auth_cert_chain(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
+    async def _verify_auth_cert_chain(self, gateway_url: str, auth_cert: x509.Certificate, chain_aid: str = "") -> None:
         # 检查缓存：已验证过且未过期则跳过
         cert_serial = format(auth_cert.serial_number, "x")
         cached_at = self._chain_verified_cache.get(cert_serial)
@@ -370,13 +370,14 @@ class AuthFlow:
         now = time.time()
         self._ensure_cert_time_valid(auth_cert, "auth certificate", now)
 
-        chain = await self._load_gateway_ca_chain(gateway_url)
+        chain = await self._load_gateway_ca_chain(gateway_url, chain_aid)
 
         if not chain:
             raise AuthError("unable to verify auth certificate chain: missing CA chain")
 
         # 如果 CA 链已通过完整验证（含受信根锚定），走快速路径：只验 auth_cert → Issuer
-        if self._gateway_ca_verified.get(gateway_url):
+        cache_key = f"{gateway_url}:{chain_aid}" if chain_aid else gateway_url
+        if self._gateway_ca_verified.get(cache_key):
             issuer = chain[0]
             self._ensure_cert_time_valid(issuer, "Issuer CA", now)
             # 快速路径仍需检查 BasicConstraints
@@ -440,28 +441,40 @@ class AuthFlow:
 
         # 验证成功，保存到缓存并标记 CA 链已预验证
         self._chain_verified_cache[cert_serial] = time.time()
-        self._gateway_ca_verified[gateway_url] = True
+        self._gateway_ca_verified[cache_key] = True
 
-    async def _load_gateway_ca_chain(self, gateway_url: str) -> list[x509.Certificate]:
-        cached = self._gateway_chain_cache.get(gateway_url)
+    async def _load_gateway_ca_chain(self, gateway_url: str, chain_aid: str = "") -> list[x509.Certificate]:
+        cache_key = f"{gateway_url}:{chain_aid}" if chain_aid else gateway_url
+        cached = self._gateway_chain_cache.get(cache_key)
         if cached is None:
-            cached = await self._fetch_gateway_ca_chain(gateway_url)
-            self._gateway_chain_cache[gateway_url] = cached
+            cached = await self._fetch_gateway_ca_chain(gateway_url, chain_aid)
+            self._gateway_chain_cache[cache_key] = cached
             # 注意：此处只缓存 PEM 数据，不设置 _gateway_ca_verified。
             # 信任标记只能在 _verify_auth_cert_chain 完整验证（含受信根锚定）通过后设置。
         return self._load_cert_bundle(cached)
 
-    async def _verify_auth_cert_revocation(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
-        chain = await self._load_gateway_ca_chain(gateway_url)
+    async def _verify_auth_cert_revocation(self, gateway_url: str, auth_cert: x509.Certificate, chain_aid: str = "") -> None:
+        chain = await self._load_gateway_ca_chain(gateway_url, chain_aid)
         if not chain:
             raise AuthError("unable to verify auth certificate revocation: missing issuer certificate")
-        revoked_serials = await self._load_gateway_revoked_serials(gateway_url, chain[0])
+
+        # 跨域 peer cert：CRL 请求发到 peer 所在域的 Gateway
+        crl_gateway_url = gateway_url
+        if chain_aid and "." in chain_aid:
+            _, peer_issuer = chain_aid.split(".", 1)
+            import re as _re
+            m = _re.search(r"gateway\.([^:/]+)", gateway_url)
+            local_issuer = m.group(1) if m else ""
+            if local_issuer and peer_issuer != local_issuer:
+                crl_gateway_url = gateway_url.replace(f"gateway.{local_issuer}", f"gateway.{peer_issuer}")
+
+        revoked_serials = await self._load_gateway_revoked_serials(crl_gateway_url, chain[0])
         serial_hex = format(auth_cert.serial_number, "x").lower()
         if serial_hex in revoked_serials:
             raise AuthError("auth certificate has been revoked")
 
-    async def _verify_auth_cert_ocsp(self, gateway_url: str, auth_cert: x509.Certificate) -> None:
-        chain = await self._load_gateway_ca_chain(gateway_url)
+    async def _verify_auth_cert_ocsp(self, gateway_url: str, auth_cert: x509.Certificate, chain_aid: str = "") -> None:
+        chain = await self._load_gateway_ca_chain(gateway_url, chain_aid)
         if not chain:
             raise AuthError("unable to verify auth certificate OCSP status: missing issuer certificate")
         status = await self._load_gateway_ocsp_status(gateway_url, auth_cert, chain[0])
@@ -475,15 +488,15 @@ class AuthFlow:
     ) -> None:
         """统一的对端证书验证入口：时间有效性 + 链验证 + CRL + OCSP + AID 绑定。"""
         self._ensure_cert_time_valid(cert, "peer certificate", time.time())
-        await self._verify_auth_cert_chain(gateway_url, cert)
+        await self._verify_auth_cert_chain(gateway_url, cert, chain_aid=expected_aid)
         try:
-            await self._verify_auth_cert_revocation(gateway_url, cert)
+            await self._verify_auth_cert_revocation(gateway_url, cert, chain_aid=expected_aid)
         except AuthError:
             raise
         except Exception as exc:
             raise AuthError(f"peer cert CRL check failed: {exc}") from exc
         try:
-            await self._verify_auth_cert_ocsp(gateway_url, cert)
+            await self._verify_auth_cert_ocsp(gateway_url, cert, chain_aid=expected_aid)
         except AuthError:
             raise
         except Exception as exc:
@@ -525,8 +538,9 @@ class AuthFlow:
             raise AuthError("no trusted roots available for auth certificate verification")
         return self._root_certs
 
-    async def _fetch_gateway_ca_chain(self, gateway_url: str) -> list[str]:
-        url = self._gateway_http_url(gateway_url, "/pki/chain")
+    async def _fetch_gateway_ca_chain(self, gateway_url: str, chain_aid: str = "") -> list[str]:
+        path = f"/pki/chain/{chain_aid}" if chain_aid else "/pki/chain"
+        url = self._gateway_http_url(gateway_url, path)
         text = await self._fetch_text(url)
         return self._split_pem_bundle(text)
 
