@@ -25,7 +25,7 @@ def _secure_file_permissions(path: Path) -> None:
         try:
             os.chmod(path, 0o600)
         except OSError:
-            pass
+            pass  # 平台兼容 fallback
 
 
 class FileKeyStore(KeyStore):
@@ -497,7 +497,7 @@ class FileKeyStore(KeyStore):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(src.read_bytes())
             except OSError:
-                pass
+                pass  # 平台兼容 fallback
 
     @staticmethod
     def _prepare_root(preferred: Path, fallback: Path) -> Path:

@@ -83,5 +83,5 @@ class FileSecretStore:
             try:
                 os.chmod(seed_path, 0o600)
             except OSError:
-                pass
+                pass  # 平台兼容 fallback
         return seed

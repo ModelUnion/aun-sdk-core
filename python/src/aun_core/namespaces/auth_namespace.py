@@ -30,8 +30,9 @@ class AuthNamespace:
             primary_url = f"https://{resolved_aid}{port_suffix}/.well-known/aun-gateway"
             try:
                 return await self._client._discovery.discover(primary_url)
-            except Exception:
-                pass
+            except Exception as _exc:
+                import logging as _logging
+                _logging.getLogger("aun_core").debug("gateway 发现失败: %s", _exc)
 
             fallback_url = f"https://gateway.{issuer_domain}{port_suffix}/.well-known/aun-gateway"
             return await self._client._discovery.discover(fallback_url)

@@ -111,4 +111,4 @@ class LibsecretSecretStore:
                 timeout=10,
             )
         except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
-            pass
+            pass  # 平台兼容 fallback

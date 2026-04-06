@@ -25,7 +25,7 @@ def get_device_id(aun_root: Path | str | None = None) -> str:
             if stored:
                 return stored
         except OSError:
-            pass
+            pass  # 平台兼容 fallback
 
     new_id = str(uuid.uuid4())
     try:
@@ -33,7 +33,7 @@ def get_device_id(aun_root: Path | str | None = None) -> str:
         if sys.platform != "win32":
             os.chmod(device_id_path, 0o600)
     except OSError:
-        pass
+        pass  # 平台兼容 fallback
     return new_id
 
 

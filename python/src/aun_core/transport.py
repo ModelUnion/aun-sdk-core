@@ -62,7 +62,7 @@ class RPCTransport:
             try:
                 await self._reader_task
             except asyncio.CancelledError:
-                pass
+                pass  # 任务取消，正常清理
             self._reader_task = None
         if self._ws is not None:
             await self._ws.close()

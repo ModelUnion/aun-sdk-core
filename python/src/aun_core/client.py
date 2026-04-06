@@ -221,7 +221,7 @@ class AUNClient:
             try:
                 await self._reconnect_task
             except asyncio.CancelledError:
-                pass
+                pass  # 任务取消，正常清理
             self._reconnect_task = None
         if self._state in {"idle", "closed"}:
             self._state = "closed"
@@ -490,8 +490,9 @@ class AUNClient:
 
             decrypted = await self._decrypt_single_message(msg)
             await self._dispatcher.publish("message.received", decrypted)
-        except Exception:
-            pass
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger("aun_core").debug("解密失败: %s", _exc)
 
     async def _on_raw_group_message_created(self, data: Any) -> None:
         """处理群组消息推送：自动解密后 re-publish。"""
@@ -522,8 +523,9 @@ class AUNClient:
             msg = dict(data)
             decrypted = await self._decrypt_group_message(msg)
             await self._dispatcher.publish("group.message_created", decrypted)
-        except Exception:
-            pass
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger("aun_core").debug("解密失败: %s", _exc)
 
     async def _decrypt_group_message(self, message: dict[str, Any]) -> dict[str, Any]:
         """解密单条群组消息。"""
@@ -560,8 +562,9 @@ class AUNClient:
                         "encrypt": True,
                         "persist": False,
                     })
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    import logging as _logging
+                    _logging.getLogger("aun_core").debug("操作失败: %s", _exc)
 
         return message
 
@@ -698,8 +701,9 @@ class AUNClient:
                 if prekey:
                     self._e2ee.cache_prekey(peer_aid, prekey)
                 return prekey
-        except Exception:
-            pass
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger("aun_core").debug("prekey 操作失败: %s", _exc)
         return None
 
     async def _upload_prekey(self) -> dict[str, Any]:
@@ -742,8 +746,9 @@ class AUNClient:
             })
             if isinstance(result, dict) and result.get("duplicate"):
                 return False
-        except Exception:
-            pass
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger("aun_core").debug("操作失败: %s", _exc)
         return True
 
     async def _decrypt_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -950,7 +955,7 @@ class AUNClient:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                pass  # 任务取消，正常清理
             setattr(self, attr, None)
 
     def _start_heartbeat_task(self) -> None:
@@ -1108,8 +1113,9 @@ class AUNClient:
                         "encrypt": True,
                         "persist": False,
                     })
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    import logging as _logging
+                    _logging.getLogger("aun_core").debug("操作失败: %s", _exc)
         except Exception as exc:
             self._log_e2ee_error("rotate_epoch", group_id, "", exc)
 
@@ -1199,8 +1205,9 @@ class AUNClient:
                     group_secrets = metadata.get("group_secrets", {})
                     for gid in list(group_secrets.keys()):
                         await self._rotate_group_epoch(gid)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    import logging as _logging
+                    _logging.getLogger("aun_core").debug("epoch 轮换失败: %s", _exc)
         except asyncio.CancelledError:
             raise
 
@@ -1220,8 +1227,9 @@ class AUNClient:
                     retention = self._config_model.old_epoch_retention_seconds
                     for gid in list(group_secrets.keys()):
                         self._group_e2ee.cleanup(gid, retention)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    import logging as _logging
+                    _logging.getLogger("aun_core").debug("epoch 轮换失败: %s", _exc)
         except asyncio.CancelledError:
             raise
 

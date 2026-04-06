@@ -112,4 +112,4 @@ class KeychainSecretStore:
                 timeout=10,
             )
         except (subprocess.CalledProcessError, OSError):
-            pass
+            pass  # 平台兼容 fallback

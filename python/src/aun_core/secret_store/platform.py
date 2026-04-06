@@ -41,8 +41,9 @@ class _MigratingSecretStore:
         if self._native:
             try:
                 self._native.clear(scope, name)
-            except Exception:
-                pass
+            except Exception as _exc:
+                import logging as _logging
+                _logging.getLogger("aun_core").debug("清除失败: %s", _exc)
 
 
 def create_default_secret_store(
