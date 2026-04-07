@@ -12,16 +12,16 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "aun-sdk-core", "python", "src"))
 
-from _helpers import make_client, ensure_connected, close_clients, RUN_ID
+from _helpers import make_client, ensure_connected, close_clients, DEVICE_SHORT
 
 
 
 async def main():
-    sender = make_client(f"pull-sender-{RUN_ID}")
-    receiver = make_client(f"pull-reader-{RUN_ID}")
+    sender = make_client("pull-sender")
+    receiver = make_client("pull-reader")
 
-    sender_aid = await ensure_connected(sender, f"demo-pull-sender-{RUN_ID}.agentid.pub")
-    receiver_aid = await ensure_connected(receiver, f"demo-pull-reader-{RUN_ID}.agentid.pub")
+    sender_aid = await ensure_connected(sender, f"demo-pull-sender-{DEVICE_SHORT}.agentid.pub")
+    receiver_aid = await ensure_connected(receiver, f"demo-pull-reader-{DEVICE_SHORT}.agentid.pub")
 
     # ── Sender 发送几条消息 ──
     for i in range(3):

@@ -306,6 +306,23 @@ extensions/services/evol/static/js/tests/
 - 环境变量、编码处理
 - 
 
+### 运行测试
+
+Windows 下 Python 默认使用 GBK 编码，中文输出会乱码。运行测试时必须加 `-X utf8` 选项：
+
+```bash
+# 单元测试
+python -X utf8 -m pytest tests/unit/ -v --tb=short
+
+# 集成测试（需要 Docker 单域环境运行中）
+python -X utf8 tests/integration_test_e2ee.py
+
+# E2E 测试（需要 Docker 单域环境运行中）
+python -X utf8 tests/e2e_test_group_e2ee.py
+```
+
+以上命令均在 `./python/` 目录下执行。
+
 ### 相关项目及文档位置
 
 1. aun服务模块: ../extensions/services
@@ -315,3 +332,7 @@ extensions/services/evol/static/js/tests/
 5. aun skill目录 ../../aun-skill/.claude/skills/aun-sdk
 6. aun sdk文档目录 ./python/docs
 7. ./python/src/aun-core/docs 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
+
+D:\modelunion\kite\aun-sdk-core\python\tests 下是aun sdk的单域环境的测试用例，包括单元测试及集成测试/e2e测试的。
+D:\modelunion\kite\docker-deploy\federation-test是aun sdk的双域测试环境用例，主要用于测试跨域通信
+D:\modelunion\kite\docker-deploy为上述两者的docker测试环境

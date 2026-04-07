@@ -12,16 +12,16 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "aun-sdk-core", "python", "src"))
 
-from _helpers import make_client, ensure_connected, close_clients, RUN_ID
+from _helpers import make_client, ensure_connected, close_clients, DEVICE_SHORT
 
 
 
 async def main():
-    sender = make_client(f"msg-sender-{RUN_ID}")
-    receiver = make_client(f"msg-receiver-{RUN_ID}")
+    sender = make_client("sender")
+    receiver = make_client("receiver")
 
-    sender_aid = await ensure_connected(sender, f"demo-msg-sender-{RUN_ID}.agentid.pub")
-    receiver_aid = await ensure_connected(receiver, f"demo-msg-receiver-{RUN_ID}.agentid.pub")
+    sender_aid = await ensure_connected(sender, f"demo-sender-{DEVICE_SHORT}.agentid.pub")
+    receiver_aid = await ensure_connected(receiver, f"demo-receiver-{DEVICE_SHORT}.agentid.pub")
     print(f"Sender:   {sender_aid}\nReceiver: {receiver_aid}\n")
 
     # ── 发送文本消息 ──

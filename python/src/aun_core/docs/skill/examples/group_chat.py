@@ -12,16 +12,16 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "aun-sdk-core", "python", "src"))
 
-from _helpers import make_client, ensure_connected, close_clients, RUN_ID
+from _helpers import make_client, ensure_connected, close_clients, DEVICE_SHORT
 
 
 
 async def main():
-    owner = make_client(f"gc-owner-{RUN_ID}")
-    member = make_client(f"gc-member-{RUN_ID}")
+    owner = make_client("gc-owner")
+    member = make_client("gc-member")
 
-    owner_aid = await ensure_connected(owner, f"demo-gc-owner-{RUN_ID}.agentid.pub")
-    member_aid = await ensure_connected(member, f"demo-gc-member-{RUN_ID}.agentid.pub")
+    owner_aid = await ensure_connected(owner, f"demo-gc-owner-{DEVICE_SHORT}.agentid.pub")
+    member_aid = await ensure_connected(member, f"demo-gc-member-{DEVICE_SHORT}.agentid.pub")
 
     # ── 创建群组，Member 加入 ──
     result = await owner.call("group.create", {

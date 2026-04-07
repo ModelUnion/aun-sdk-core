@@ -112,7 +112,7 @@ def test_verify_phase1_response_accepts_valid_identity_chain(monkeypatch):
 
     flow = _make_auth_flow(root_pem)
 
-    async def fake_fetch_gateway_ca_chain(gateway_url: str) -> list[str]:
+    async def fake_fetch_gateway_ca_chain(gateway_url: str, chain_aid: str = "") -> list[str]:
         return [issuer_pem, root_pem]
 
     async def fake_fetch_gateway_crl(gateway_url: str, issuer_cert: x509.Certificate) -> dict:
@@ -156,7 +156,7 @@ def test_verify_phase1_response_rejects_bad_signature(monkeypatch):
 
     flow = _make_auth_flow(root_pem)
 
-    async def fake_fetch_gateway_ca_chain(gateway_url: str) -> list[str]:
+    async def fake_fetch_gateway_ca_chain(gateway_url: str, chain_aid: str = "") -> list[str]:
         return [issuer_pem, root_pem]
 
     async def fake_fetch_gateway_crl(gateway_url: str, issuer_cert: x509.Certificate) -> dict:
@@ -198,7 +198,7 @@ def test_verify_phase1_response_rejects_revoked_identity_cert(monkeypatch):
 
     flow = _make_auth_flow(root_pem)
 
-    async def fake_fetch_gateway_ca_chain(gateway_url: str) -> list[str]:
+    async def fake_fetch_gateway_ca_chain(gateway_url: str, chain_aid: str = "") -> list[str]:
         return [issuer_pem, root_pem]
 
     async def fake_fetch_gateway_crl(gateway_url: str, issuer_cert: x509.Certificate) -> dict:
@@ -276,14 +276,14 @@ def test_verify_peer_cert_success():
 
     flow = _make_auth_flow(root_pem)
 
-    async def fake_chain(gw):
+    async def fake_chain(gw, chain_aid=""):
         return [issuer_pem, root_pem]
 
     # 直接 mock 顶层验证方法，避免内部网络调用
-    async def fake_revocation(gw, cert):
+    async def fake_revocation(gw, cert, chain_aid=""):
         pass  # 未吊销
 
-    async def fake_ocsp(gw, cert):
+    async def fake_ocsp(gw, cert, chain_aid=""):
         pass  # OCSP good
 
     flow._fetch_gateway_ca_chain = fake_chain
@@ -306,13 +306,13 @@ def test_verify_peer_cert_cn_mismatch():
 
     flow = _make_auth_flow(root_pem)
 
-    async def fake_chain(gw):
+    async def fake_chain(gw, chain_aid=""):
         return [issuer_pem, root_pem]
 
-    async def fake_revocation(gw, cert):
+    async def fake_revocation(gw, cert, chain_aid=""):
         pass
 
-    async def fake_ocsp(gw, cert):
+    async def fake_ocsp(gw, cert, chain_aid=""):
         pass
 
     flow._fetch_gateway_ca_chain = fake_chain
@@ -335,10 +335,10 @@ def test_verify_peer_cert_revoked():
 
     flow = _make_auth_flow(root_pem)
 
-    async def fake_chain(gw):
+    async def fake_chain(gw, chain_aid=""):
         return [issuer_pem, root_pem]
 
-    async def fake_revocation(gw, cert):
+    async def fake_revocation(gw, cert, chain_aid=""):
         raise AuthError("auth certificate has been revoked")
 
     flow._fetch_gateway_ca_chain = fake_chain

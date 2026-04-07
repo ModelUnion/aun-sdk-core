@@ -21,19 +21,19 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "aun-sdk-core", "python", "src"))
 
-from _helpers import make_client, ensure_connected, close_clients, RUN_ID
+from _helpers import make_client, ensure_connected, close_clients, DEVICE_SHORT
 
 
 async def main():
-    alice = make_client(f"ge-alice-{RUN_ID}")
-    bob = make_client(f"ge-bob-{RUN_ID}")
+    alice = make_client(f"ge-alice")
+    bob = make_client(f"ge-bob")
 
-    alice_aid = await ensure_connected(alice, f"demo-ge-alice-{RUN_ID}.agentid.pub")
-    bob_aid = await ensure_connected(bob, f"demo-ge-bob-{RUN_ID}.agentid.pub")
+    alice_aid = await ensure_connected(alice, f"demo-ge-alice-{DEVICE_SHORT}.agentid.pub")
+    bob_aid = await ensure_connected(bob, f"demo-ge-bob-{DEVICE_SHORT}.agentid.pub")
     print(f"Alice: {alice_aid}\nBob:   {bob_aid}\n")
 
     # ── 1. Alice 建群（SDK 自动创建 epoch 1 并同步到服务端） ──
-    result = await alice.call("group.create", {"name": f"E2EE群-{RUN_ID}"})
+    result = await alice.call("group.create", {"name": "E2EE群"})
     group_id = result["group"]["group_id"]
     print(f"[1] 群组创建: {group_id}")
     print(f"    epoch={alice.group_e2ee.current_epoch(group_id)}")

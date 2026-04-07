@@ -14,13 +14,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "aun-sdk-core", "python", "src"))
 
 import aiohttp
-from _helpers import make_client, ensure_connected, close_clients, RUN_ID
+from _helpers import make_client, ensure_connected, close_clients, DEVICE_SHORT
 
 
 
 async def main():
-    client = make_client(f"demo-storage-{RUN_ID}")
-    aid = await ensure_connected(client, f"demo-storage-{RUN_ID}.agentid.pub")
+    client = make_client("demo-storage")
+    aid = await ensure_connected(client, f"demo-storage-{DEVICE_SHORT}.agentid.pub")
     print(f"AID: {aid}\n")
 
     # ── 先上传一个测试文件 ──

@@ -18,15 +18,15 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "aun-sdk-core", "python", "src"))
 
-from _helpers import make_client, ensure_connected, close_clients, RUN_ID
+from _helpers import make_client, ensure_connected, close_clients, DEVICE_SHORT
 
 
 async def main():
-    sender = make_client(f"e2ee-sender-{RUN_ID}")
-    receiver = make_client(f"e2ee-reader-{RUN_ID}")
+    sender = make_client("e2ee-sender")
+    receiver = make_client("e2ee-reader")
 
-    sender_aid = await ensure_connected(sender, f"demo-e2ee-sender-{RUN_ID}.agentid.pub")
-    receiver_aid = await ensure_connected(receiver, f"demo-e2ee-reader-{RUN_ID}.agentid.pub")
+    sender_aid = await ensure_connected(sender, f"demo-e2ee-sender-{DEVICE_SHORT}.agentid.pub")
+    receiver_aid = await ensure_connected(receiver, f"demo-e2ee-reader-{DEVICE_SHORT}.agentid.pub")
     print(f"Sender:   {sender_aid}\nReceiver: {receiver_aid}\n")
 
     # ── 1. Sender 发送加密消息（默认自动加密，SDK 自动处理） ──

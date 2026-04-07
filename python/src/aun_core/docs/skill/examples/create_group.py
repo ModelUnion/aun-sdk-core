@@ -12,18 +12,18 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "aun-sdk-core", "python", "src"))
 
-from _helpers import make_client, ensure_connected, close_clients, RUN_ID
+from _helpers import make_client, ensure_connected, close_clients, DEVICE_SHORT
 
 
 
 async def main():
-    owner = make_client(f"grp-owner-{RUN_ID}")
-    member1 = make_client(f"grp-member1-{RUN_ID}")
-    member2 = make_client(f"grp-member2-{RUN_ID}")
+    owner = make_client("grp-owner")
+    member1 = make_client("grp-member1")
+    member2 = make_client("grp-member2")
 
-    owner_aid = await ensure_connected(owner, f"demo-grp-owner-{RUN_ID}.agentid.pub")
-    m1_aid = await ensure_connected(member1, f"demo-grp-m1-{RUN_ID}.agentid.pub")
-    m2_aid = await ensure_connected(member2, f"demo-grp-m2-{RUN_ID}.agentid.pub")
+    owner_aid = await ensure_connected(owner, f"demo-grp-owner-{DEVICE_SHORT}.agentid.pub")
+    m1_aid = await ensure_connected(member1, f"demo-grp-m1-{DEVICE_SHORT}.agentid.pub")
+    m2_aid = await ensure_connected(member2, f"demo-grp-m2-{DEVICE_SHORT}.agentid.pub")
     print(f"Owner:   {owner_aid}\nMember1: {m1_aid}\nMember2: {m2_aid}\n")
 
     # ── 创建群组 ──
