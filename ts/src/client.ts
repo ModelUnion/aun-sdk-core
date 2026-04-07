@@ -94,9 +94,8 @@ const DEFAULT_SESSION_OPTIONS: Record<string, unknown> = {
   heartbeat_interval: 30.0,
   token_refresh_before: 60.0,
   retry: {
-    max_attempts: 3,
     initial_delay: 0.5,
-    max_delay: 5.0,
+    max_delay: 30.0,
   },
   timeouts: {
     connect: 5.0,
@@ -1484,24 +1483,21 @@ export class AUNClient {
     this._startReconnect();
   }
 
-  /** 启动重连循环 */
+  /** 启动重连循环（无限重试 + 指数退避，仅在不可重试错误或 close() 时终止） */
   private _startReconnect(): void {
     if (this._reconnecting) return;
     this._reconnecting = true;
 
     const retry = (this._sessionOptions.retry ?? {}) as Record<string, unknown>;
-    const maxAttempts = Number(retry.max_attempts ?? 3);
     const initialDelay = Number(retry.initial_delay ?? 0.5) * 1000;
-    const maxDelay = Number(retry.max_delay ?? 5.0) * 1000;
+    const maxDelay = Number(retry.max_delay ?? 30.0) * 1000;
     let delay = initialDelay;
     let attempt = 0;
 
     const tryReconnect = async (): Promise<void> => {
       attempt++;
-      if (this._closing || attempt > maxAttempts) {
-        this._state = 'terminal_failed';
+      if (this._closing) {
         this._reconnecting = false;
-        await this._dispatcher.publish('connection.state', { state: this._state });
         return;
       }
 
@@ -1509,7 +1505,6 @@ export class AUNClient {
       await this._dispatcher.publish('connection.state', {
         state: this._state,
         attempt,
-        max_attempts: maxAttempts,
       });
 
       this._reconnectTimer = setTimeout(async () => {
@@ -1537,7 +1532,11 @@ export class AUNClient {
             return;
           }
           delay = Math.min(delay * 2, maxDelay);
-          tryReconnect();
+          if (!this._closing) {
+            tryReconnect();
+          } else {
+            this._reconnecting = false;
+          }
         }
       }, delay);
       this._unrefTimer(this._reconnectTimer);

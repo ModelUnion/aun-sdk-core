@@ -47,9 +47,8 @@ _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
     "heartbeat_interval": 30.0,
     "token_refresh_before": 60.0,
     "retry": {
-        "max_attempts": 3,
         "initial_delay": 0.5,
-        "max_delay": 5.0,
+        "max_delay": 30.0,
     },
     "timeouts": {
         "connect": 5.0,
@@ -1248,17 +1247,17 @@ class AUNClient:
 
     async def _reconnect_loop(self) -> None:
         retry = dict(self._session_options["retry"])
-        max_attempts = int(retry.get("max_attempts", 3))
         initial_delay = float(retry.get("initial_delay", 0.5))
-        max_delay = float(retry.get("max_delay", 5.0))
+        max_delay = float(retry.get("max_delay", 30.0))
         delay = initial_delay
+        attempt = 0
 
-        for attempt in range(1, max_attempts + 1):
+        while not self._closing:
+            attempt += 1
             self._state = "reconnecting"
             await self._dispatcher.publish("connection.state", {
                 "state": self._state,
                 "attempt": attempt,
-                "max_attempts": max_attempts,
             })
             try:
                 await asyncio.sleep(delay)
@@ -1284,10 +1283,6 @@ class AUNClient:
                     })
                     return
                 delay = min(delay * 2, max_delay)
-
-        self._state = "terminal_failed"
-        self._reconnect_task = None
-        await self._dispatcher.publish("connection.state", {"state": self._state})
 
     # ── 内部：参数处理 ────────────────────────────────────
 

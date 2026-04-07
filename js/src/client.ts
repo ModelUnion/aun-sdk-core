@@ -76,9 +76,8 @@ const DEFAULT_SESSION_OPTIONS = {
   heartbeat_interval: 30.0,
   token_refresh_before: 60.0,
   retry: {
-    max_attempts: 3,
     initial_delay: 0.5,
-    max_delay: 5.0,
+    max_delay: 30.0,
   },
   timeouts: {
     connect: 5.0,
@@ -1440,25 +1439,18 @@ export class AUNClient {
     this._safeAsync(this._reconnectLoop());
   }
 
-  /** 指数退避重连循环 */
+  /** 指数退避重连循环（无限重试，仅在不可重试错误或 close() 时终止） */
   private async _reconnectLoop(): Promise<void> {
     const retry = { ...this._sessionOptions.retry };
-    const maxAttempts = retry.max_attempts;
     const initialDelay = retry.initial_delay;
     const maxDelay = retry.max_delay;
     let delay = initialDelay;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (this._reconnectAbort?.signal.aborted) {
-        this._reconnectActive = false;
-        return;
-      }
-
+    for (let attempt = 1; !this._reconnectAbort?.signal.aborted; attempt++) {
       this._state = 'reconnecting';
       await this._dispatcher.publish('connection.state', {
         state: this._state,
         attempt,
-        max_attempts: maxAttempts,
       });
 
       try {
@@ -1495,10 +1487,8 @@ export class AUNClient {
       }
     }
 
-    this._state = 'terminal_failed';
     this._reconnectActive = false;
     this._reconnectAbort = null;
-    await this._dispatcher.publish('connection.state', { state: this._state });
   }
 
   /** 判断是否应重试重连 */

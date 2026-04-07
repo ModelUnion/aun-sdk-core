@@ -48,7 +48,6 @@ type ConnectOptions struct {
 
 // RetryConfig 重试配置
 type RetryConfig struct {
-	MaxAttempts  int     // 最大重试次数
 	InitialDelay float64 // 初始延迟（秒）
 	MaxDelay     float64 // 最大延迟（秒）
 }
@@ -178,9 +177,8 @@ func NewClient(config map[string]any) *AUNClient {
 			"heartbeat_interval":   30.0,
 			"token_refresh_before": 60.0,
 			"retry": map[string]any{
-				"max_attempts":  3,
 				"initial_delay": 0.5,
-				"max_delay":     5.0,
+				"max_delay":     30.0,
 			},
 			"timeouts": map[string]any{
 				"connect": 5.0,
@@ -371,7 +369,6 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 		}
 		if opts.Retry != nil {
 			params["retry"] = map[string]any{
-				"max_attempts":  opts.Retry.MaxAttempts,
 				"initial_delay": opts.Retry.InitialDelay,
 				"max_delay":     opts.Retry.MaxDelay,
 			}
@@ -1878,22 +1875,16 @@ func (c *AUNClient) handleTransportDisconnect(err error) {
 	go c.reconnectLoop()
 }
 
-// reconnectLoop 重连循环（指数退避）
+// reconnectLoop 重连循环（无限重试 + 指数退避，仅在不可重试错误或 close() 时终止）
 func (c *AUNClient) reconnectLoop() {
 	c.mu.RLock()
 	opts := c.sessionOptions
 	c.mu.RUnlock()
 
 	retryConfig, _ := opts["retry"].(map[string]any)
-	maxAttempts := 3
 	initialDelay := 0.5
-	maxDelay := 5.0
+	maxDelay := 30.0
 	if retryConfig != nil {
-		if v, ok := retryConfig["max_attempts"].(int); ok {
-			maxAttempts = v
-		} else if v, ok := retryConfig["max_attempts"].(float64); ok {
-			maxAttempts = int(v)
-		}
 		if v, ok := retryConfig["initial_delay"].(float64); ok {
 			initialDelay = v
 		}
@@ -1903,18 +1894,22 @@ func (c *AUNClient) reconnectLoop() {
 	}
 
 	delay := initialDelay
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for attempt := 1; !c.closing; attempt++ {
 		c.mu.Lock()
 		c.state = StateReconnecting
 		c.mu.Unlock()
 
 		c.events.Publish("connection.state", map[string]any{
-			"state":        "reconnecting",
-			"attempt":      attempt,
-			"max_attempts": maxAttempts,
+			"state":   "reconnecting",
+			"attempt": attempt,
 		})
 
 		time.Sleep(time.Duration(delay * float64(time.Second)))
+
+		// close() 可能在 sleep 期间被调用
+		if c.closing {
+			return
+		}
 
 		// 关闭旧连接
 		_ = c.transport.Close()
@@ -1958,11 +1953,6 @@ func (c *AUNClient) reconnectLoop() {
 			delay = maxDelay
 		}
 	}
-
-	c.mu.Lock()
-	c.state = StateTerminalFailed
-	c.mu.Unlock()
-	c.events.Publish("connection.state", map[string]any{"state": "terminal_failed"})
 }
 
 // shouldRetryReconnect 判断错误是否应该重试
@@ -2039,9 +2029,8 @@ func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 		"heartbeat_interval":   30.0,
 		"token_refresh_before": 60.0,
 		"retry": map[string]any{
-			"max_attempts":  3,
 			"initial_delay": 0.5,
-			"max_delay":     5.0,
+			"max_delay":     30.0,
 		},
 		"timeouts": map[string]any{
 			"connect": 5.0,
