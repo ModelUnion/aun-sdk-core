@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AUN Browser SDK 可视化测试</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; height: 100vh; background: #fafafa; }
+
+    /* ── 左侧操作面板 ── */
+    .control-panel {
+      width: 420px; min-width: 360px; background: #f5f5f5;
+      border-right: 1px solid #ddd; overflow-y: auto; padding: 16px 20px;
+    }
+    .control-panel h2 { font-size: 18px; margin-bottom: 12px; color: #333; }
+
+    .section {
+      margin: 12px 0; padding: 12px 14px; background: #fff;
+      border-radius: 8px; border: 1px solid #e8e8e8;
+    }
+    .section h3 {
+      margin: 0 0 10px; font-size: 13px; color: #888;
+      border-bottom: 1px solid #eee; padding-bottom: 6px;
+    }
+    .section .row { margin: 6px 0; display: flex; align-items: center; gap: 6px; }
+    .section label { font-size: 12px; color: #666; min-width: 70px; }
+    .section input[type="text"] {
+      flex: 1; padding: 5px 8px; font-size: 12px;
+      border: 1px solid #ccc; border-radius: 4px; font-family: monospace;
+    }
+
+    .btn-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+
+    button {
+      padding: 6px 14px; font-size: 12px; cursor: pointer;
+      border: 1px solid #ccc; border-radius: 4px; background: #fff;
+      transition: background .15s, border-color .15s;
+    }
+    button:hover { background: #e8e8e8; }
+    button:active { background: #ddd; }
+    button.running { background: #fff3cd; border-color: #ffc107; }
+    button.success { background: #d4edda; border-color: #28a745; }
+    button.failed  { background: #f8d7da; border-color: #dc3545; }
+    button.primary { background: #007bff; color: #fff; border-color: #0069d9; }
+    button.primary:hover { background: #0069d9; }
+    button.danger  { background: #dc3545; color: #fff; border-color: #c82333; }
+    button.danger:hover  { background: #c82333; }
+
+    .status-bar {
+      margin-top: 12px; padding: 10px 14px; font-size: 14px; font-weight: 600;
+      background: #fff; border-radius: 8px; border: 1px solid #e8e8e8; color: #333;
+    }
+
+    /* ── 右侧日志面板 ── */
+    .log-panel {
+      flex: 1; background: #1e1e1e; color: #d4d4d4;
+      font-family: 'Consolas', 'Menlo', 'Courier New', monospace;
+      font-size: 12px; overflow-y: auto; padding: 12px 16px;
+      display: flex; flex-direction: column;
+    }
+    .log-header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding-bottom: 8px; border-bottom: 1px solid #444; margin-bottom: 8px;
+    }
+    .log-header span { color: #888; font-size: 13px; }
+    .log-header button {
+      background: #333; color: #aaa; border-color: #555; font-size: 11px; padding: 3px 10px;
+    }
+    .log-header button:hover { background: #444; color: #ddd; }
+
+    .log-body { flex: 1; overflow-y: auto; }
+
+    .log-entry { padding: 2px 0; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
+    .log-entry.error   { color: #f44336; }
+    .log-entry.success { color: #4caf50; }
+    .log-entry.info    { color: #42a5f5; }
+    .log-entry.warn    { color: #ffa726; }
+    .log-entry.dim     { color: #666; }
+    .log-entry.sep     { color: #555; border-top: 1px solid #333; margin-top: 4px; padding-top: 4px; }
+  </style>
+</head>
+<body>
+
+<!-- ━━ 操作面板 ━━ -->
+<div class="control-panel">
+  <h2>AUN Browser SDK 可视化测试</h2>
+
+  <!-- AID 配置 -->
+  <div class="section">
+    <h3>AID 配置</h3>
+    <div class="row">
+      <label>Gateway:</label>
+      <input type="text" id="gatewayInput" value="" placeholder="留空则自动发现">
+    </div>
+    <div class="row">
+      <label>Alice AID:</label>
+      <input type="text" id="aliceAid" value="">
+    </div>
+    <div class="row">
+      <label>Bob AID:</label>
+      <input type="text" id="bobAid" value="">
+    </div>
+    <div class="btn-row">
+      <button onclick="generateRandomAids()">随机生成 AID</button>
+    </div>
+  </div>
+
+  <!-- 基础连接 -->
+  <div class="section">
+    <h3>基础连接</h3>
+    <div class="btn-row">
+      <button id="btn-createAid" onclick="stepCreateAid()">创建 AID</button>
+      <button id="btn-auth" onclick="stepAuthenticate()">认证</button>
+      <button id="btn-connect" onclick="stepConnect()">连接 Gateway</button>
+      <button id="btn-disconnect" onclick="stepDisconnect()" class="danger">断开</button>
+    </div>
+  </div>
+
+  <!-- P2P E2EE -->
+  <div class="section">
+    <h3>P2P E2EE</h3>
+    <div class="row">
+      <label>消息内容:</label>
+      <input type="text" id="p2pMsg" value="Hello from browser!">
+    </div>
+    <div class="btn-row">
+      <button id="btn-sendP2P" onclick="stepSendP2P()">发送加密消息</button>
+      <button id="btn-pullP2P" onclick="stepPullP2P()">拉取消息</button>
+      <button id="btn-sendP2PPt" onclick="stepSendP2PPlaintext()">发送明文消息</button>
+    </div>
+  </div>
+
+  <!-- 群组 E2EE -->
+  <div class="section">
+    <h3>群组 E2EE</h3>
+    <div class="row">
+      <label>群名:</label>
+      <input type="text" id="groupName" value="测试群组">
+    </div>
+    <div class="btn-row">
+      <button id="btn-createGroup" onclick="stepCreateGroup()">创建群组</button>
+      <button id="btn-addMember" onclick="stepAddMember()">添加 Bob</button>
+      <button id="btn-sendGroup" onclick="stepSendGroup()">发送群加密消息</button>
+      <button id="btn-pullGroup" onclick="stepPullGroup()">拉取群消息</button>
+      <button id="btn-sendGroupPt" onclick="stepSendGroupPlaintext()">发送群明文</button>
+      <button id="btn-kickMember" onclick="stepKickMember()">踢出 Bob</button>
+    </div>
+  </div>
+
+  <!-- 自动化测试 -->
+  <div class="section">
+    <h3>自动化测试</h3>
+    <div class="btn-row">
+      <button id="btn-testP2P" onclick="runP2PTest()" class="primary">运行 P2P 全链路</button>
+      <button id="btn-testGroup" onclick="runGroupTest()" class="primary">运行 Group 全链路</button>
+      <button id="btn-testAll" onclick="runAllTests()" class="primary">运行全部测试</button>
+    </div>
+  </div>
+
+  <div id="statusBar" class="status-bar">就绪</div>
+</div>
+
+<!-- ━━ 日志面板 ━━ -->
+<div class="log-panel">
+  <div class="log-header">
+    <span>实时日志</span>
+    <button onclick="clearLog()">清空日志</button>
+  </div>
+  <div class="log-body" id="logBody">
+    <div class="log-entry dim">等待操作...</div>
+  </div>
+</div>
+
+<!-- ━━ SDK 加载与逻辑 ━━ -->
+<script type="module">
+// ── SDK 加载 ────────────────────────────────────────
+import * as AUN from '../../dist/aun-core-browser.js';
+window.AUN = AUN;
+
+// ── 状态 ────────────────────────────────────────────
+let alice = null;
+let bob = null;
+let aliceAuth = null;
+let bobAuth = null;
+let groupId = null;
+let testResults = { passed: 0, failed: 0, total: 0 };
+
+// ── 日志系统 ────────────────────────────────────────
+const logBody = document.getElementById('logBody');
+
+function log(level, msg, data) {
+  const now = new Date();
+  const ts = now.toLocaleTimeString('zh-CN', {
+    hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry ' + level;
+  let text = '[' + ts + '] ' + msg;
+  if (data !== undefined && data !== null) {
+    const detail = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+    if (detail.length < 200) {
+      text += '  ' + detail;
+    } else {
+      text += '\n' + detail;
+    }
+  }
+  entry.textContent = text;
+  logBody.appendChild(entry);
+  logBody.scrollTop = logBody.scrollHeight;
+  // 同步输出到浏览器控制台
+  console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[' + level + ']', msg, data ?? '');
+}
+window.log = log;
+
+window.clearLog = function() {
+  logBody.innerHTML = '<div class="log-entry dim">日志已清空</div>';
+};
+
+function logSep(title) {
+  const entry = document.createElement('div');
+  entry.className = 'log-entry sep';
+  entry.textContent = '── ' + title + ' ──';
+  logBody.appendChild(entry);
+  logBody.scrollTop = logBody.scrollHeight;
+}
+
+// ── 状态显示 ────────────────────────────────────────
+function setStatus(text) {
+  document.getElementById('statusBar').textContent = text;
+}
+
+function markBtn(id, state) {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  btn.className = btn.className.replace(/\b(running|success|failed|primary|danger)\b/g, '').trim();
+  if (state) btn.className += ' ' + state;
+}
+
+// ── 通用步骤执行器 ──────────────────────────────────
+async function runStep(btnId, name, fn) {
+  markBtn(btnId, 'running');
+  log('info', '\u25b6 ' + name + '...');
+  try {
+    const result = await fn();
+    markBtn(btnId, 'success');
+    log('success', '\u2705 ' + name + ' 完成', result);
+    return result;
+  } catch (e) {
+    markBtn(btnId, 'failed');
+    log('error', '\u274c ' + name + ' 失败: ' + e.message);
+    throw e;
+  }
+}
+
+// ── 客户端工厂 ──────────────────────────────────────
+function makeClient(tag) {
+  const gw = document.getElementById('gatewayInput').value.trim();
+  const opts = {
+    verify_ssl: false,
+    require_forward_secrecy: false,
+  };
+  if (gw) opts.gateway = gw;
+  log('dim', '创建客户端 [' + tag + ']', { gateway: gw || '(自动发现)' });
+  return new AUN.AUNClient(opts);
+}
+
+// ── 随机 AID 生成 ───────────────────────────────────
+window.generateRandomAids = function() {
+  const rid = Math.random().toString(36).slice(2, 8);
+  document.getElementById('aliceAid').value = 'vis-a-' + rid + '.agentid.pub';
+  document.getElementById('bobAid').value = 'vis-b-' + rid + '.agentid.pub';
+  log('info', '随机 AID 已生成: ' + rid);
+};
+// 页面加载时自动生成
+generateRandomAids();
+
+// ── 手动测试步骤 ────────────────────────────────────
+
+window.stepCreateAid = async function() {
+  const aliceAidVal = document.getElementById('aliceAid').value.trim();
+  const bobAidVal = document.getElementById('bobAid').value.trim();
+  if (!aliceAidVal || !bobAidVal) {
+    log('error', '请先填写 Alice 和 Bob 的 AID'); return;
+  }
+
+  alice = makeClient('Alice');
+  bob = makeClient('Bob');
+
+  await runStep('btn-createAid', '创建 Alice AID: ' + aliceAidVal, async () => {
+    await alice.auth.createAid({ aid: aliceAidVal });
+    return { aid: aliceAidVal };
+  });
+  await runStep('btn-createAid', '创建 Bob AID: ' + bobAidVal, async () => {
+    await bob.auth.createAid({ aid: bobAidVal });
+    return { aid: bobAidVal };
+  });
+};
+
+window.stepAuthenticate = async function() {
+  if (!alice || !bob) { log('error', '请先创建 AID'); return; }
+  const aliceAidVal = document.getElementById('aliceAid').value.trim();
+  const bobAidVal = document.getElementById('bobAid').value.trim();
+
+  aliceAuth = await runStep('btn-auth', 'Alice 认证', async () => {
+    const result = await alice.auth.authenticate({ aid: aliceAidVal });
+    return { token: result.access_token ? '(已获取)' : '(无)', gateway: result.gateway };
+  });
+  aliceAuth = await alice.auth.authenticate({ aid: aliceAidVal });
+
+  bobAuth = await runStep('btn-auth', 'Bob 认证', async () => {
+    const result = await bob.auth.authenticate({ aid: bobAidVal });
+    return { token: result.access_token ? '(已获取)' : '(无)', gateway: result.gateway };
+  });
+  bobAuth = await bob.auth.authenticate({ aid: bobAidVal });
+};
+
+window.stepConnect = async function() {
+  if (!aliceAuth || !bobAuth) { log('error', '请先完成认证'); return; }
+
+  await runStep('btn-connect', 'Alice 连接 Gateway', async () => {
+    await alice.connect(aliceAuth);
+    return { state: alice.state, gateway: alice.gatewayUrl };
+  });
+  await runStep('btn-connect', 'Bob 连接 Gateway', async () => {
+    await bob.connect(bobAuth);
+    return { state: bob.state, gateway: bob.gatewayUrl };
+  });
+  setStatus('已连接 | Alice: ' + alice.aid + ' | Bob: ' + bob.aid);
+};
+
+window.stepDisconnect = async function() {
+  await runStep('btn-disconnect', '断开所有连接', async () => {
+    if (alice) { try { await alice.close(); } catch(e) { /* 忽略 */ } }
+    if (bob)   { try { await bob.close(); }   catch(e) { /* 忽略 */ } }
+    alice = bob = null; aliceAuth = bobAuth = null; groupId = null;
+    setStatus('已断开');
+    return { ok: true };
+  });
+};
+
+// ── P2P ─────────────────────────────────────────────
+
+window.stepSendP2P = async function() {
+  if (!alice || alice.state !== 'connected') { log('error', '请先连接 Alice'); return; }
+  const text = document.getElementById('p2pMsg').value;
+  const bobAidVal = document.getElementById('bobAid').value.trim();
+
+  await runStep('btn-sendP2P', '发送加密消息给 ' + bobAidVal, async () => {
+    const result = await alice.call('message.send', {
+      to: bobAidVal,
+      payload: { text: text },
+      encrypt: true,
+    });
+    return result;
+  });
+};
+
+window.stepSendP2PPlaintext = async function() {
+  if (!alice || alice.state !== 'connected') { log('error', '请先连接 Alice'); return; }
+  const text = document.getElementById('p2pMsg').value;
+  const bobAidVal = document.getElementById('bobAid').value.trim();
+
+  await runStep('btn-sendP2PPt', '发送明文消息给 ' + bobAidVal, async () => {
+    const result = await alice.call('message.send', {
+      to: bobAidVal,
+      payload: { text: text },
+      encrypt: false,
+    });
+    return result;
+  });
+};
+
+window.stepPullP2P = async function() {
+  if (!bob || bob.state !== 'connected') { log('error', '请先连接 Bob'); return; }
+
+  await runStep('btn-pullP2P', 'Bob 拉取消息', async () => {
+    const result = await bob.call('message.pull', { after_seq: 0, limit: 50 });
+    const msgs = result.messages || [];
+    log('info', '收到 ' + msgs.length + ' 条消息');
+    msgs.forEach(function(m, i) {
+      const e2eeInfo = m.e2ee
+        ? '已解密 (mode=' + (m.e2ee.encryption_mode || '?') + ')'
+        : (m.encrypted ? '加密(未解密)' : '明文');
+      const payloadStr = JSON.stringify(m.payload).slice(0, 120);
+      log('info', '  [' + i + '] ' + e2eeInfo + ': ' + payloadStr);
+    });
+    return { count: msgs.length };
+  });
+};
+
+// ── 群组 ────────────────────────────────────────────
+
+window.stepCreateGroup = async function() {
+  if (!alice || alice.state !== 'connected') { log('error', '请先连接 Alice'); return; }
+  const name = document.getElementById('groupName').value || '测试群组';
+
+  const result = await runStep('btn-createGroup', '创建群组: ' + name, async () => {
+    const r = await alice.call('group.create', { name: name });
+    return r;
+  });
+  const group = result && result.group;
+  if (group && group.group_id) {
+    groupId = group.group_id;
+    log('success', '群组 ID: ' + groupId);
+  }
+};
+
+window.stepAddMember = async function() {
+  if (!groupId) { log('error', '请先创建群组'); return; }
+  const bobAidVal = document.getElementById('bobAid').value.trim();
+
+  await runStep('btn-addMember', '添加成员: ' + bobAidVal, async () => {
+    return await alice.call('group.add_member', { group_id: groupId, aid: bobAidVal });
+  });
+  log('info', '等待密钥分发 (3s)...');
+  await new Promise(function(r) { setTimeout(r, 3000); });
+  log('success', '密钥分发等待完成');
+};
+
+window.stepSendGroup = async function() {
+  if (!groupId) { log('error', '请先创建群组'); return; }
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+  await runStep('btn-sendGroup', '发送群加密消息', async () => {
+    return await alice.call('group.send', {
+      group_id: groupId,
+      payload: { text: '群加密消息 ' + ts },
+      encrypt: true,
+    });
+  });
+};
+
+window.stepSendGroupPlaintext = async function() {
+  if (!groupId) { log('error', '请先创建群组'); return; }
+
+  await runStep('btn-sendGroupPt', '发送群明文消息', async () => {
+    return await alice.call('group.send', {
+      group_id: groupId,
+      payload: { text: '明文群消息' },
+      encrypt: false,
+    });
+  });
+};
+
+window.stepPullGroup = async function() {
+  if (!bob || bob.state !== 'connected') { log('error', '请先连接 Bob'); return; }
+  if (!groupId) { log('error', '请先创建群组并添加 Bob'); return; }
+
+  await runStep('btn-pullGroup', 'Bob 拉取群消息', async () => {
+    const result = await bob.call('group.pull', { group_id: groupId, after_seq: 0, limit: 50 });
+    const msgs = result.messages || [];
+    log('info', '收到 ' + msgs.length + ' 条群消息');
+    msgs.forEach(function(m, i) {
+      const e2eeInfo = m.e2ee
+        ? '已解密 (epoch=' + (m.e2ee.epoch || '?') + ', mode=' + (m.e2ee.encryption_mode || '?') + ')'
+        : (m.encrypted ? '加密(未解密)' : '明文');
+      const payloadStr = JSON.stringify(m.payload).slice(0, 120);
+      log('info', '  [' + i + '] ' + e2eeInfo + ': ' + payloadStr);
+    });
+    return { count: msgs.length };
+  });
+};
+
+window.stepKickMember = async function() {
+  if (!groupId) { log('error', '请先创建群组'); return; }
+  const bobAidVal = document.getElementById('bobAid').value.trim();
+
+  await runStep('btn-kickMember', '踢出: ' + bobAidVal, async () => {
+    return await alice.call('group.kick', { group_id: groupId, aid: bobAidVal });
+  });
+  log('info', '等待 epoch 轮换 (5s)...');
+  await new Promise(function(r) { setTimeout(r, 5000); });
+  log('success', 'epoch 轮换等待完成');
+};
+
+// ── 断言工具 ────────────────────────────────────────
+function assert(name, condition) {
+  testResults.total++;
+  if (condition) {
+    testResults.passed++;
+    log('success', '  \u2705 ' + name);
+  } else {
+    testResults.failed++;
+    log('error', '  \u274c ' + name);
+  }
+}
+
+function updateTestStatus(label) {
+  const t = testResults;
+  const icon = t.failed === 0 ? '\u2705' : '\u274c';
+  setStatus(icon + ' ' + label + ': ' + t.passed + '/' + t.total + ' 通过');
+}
+
+// ── 自动化: P2P 全链路 ─────────────────────────────
+window.runP2PTest = async function() {
+  testResults = { passed: 0, failed: 0, total: 0 };
+  const rid = Math.random().toString(36).slice(2, 8);
+  logSep('P2P 全链路测试');
+  log('info', '\u2550\u2550\u2550 P2P 全链路测试开始 [' + rid + '] \u2550\u2550\u2550');
+  markBtn('btn-testP2P', 'running');
+
+  let a = null, b = null;
+  try {
+    a = makeClient('A');
+    b = makeClient('B');
+    const aAid = 'auto-a-' + rid + '.agentid.pub';
+    const bAid = 'auto-b-' + rid + '.agentid.pub';
+
+    // 1. 创建 AID
+    log('info', '步骤 1: 创建 AID');
+    const t1 = Date.now();
+    log('dim', '  Alice AID: ' + aAid);
+    await a.auth.createAid({ aid: aAid });
+    log('dim', '  Alice 创建耗时: ' + (Date.now() - t1) + 'ms (含 gateway 发现)');
+    const t1b = Date.now();
+    log('dim', '  Bob AID: ' + bAid);
+    await b.auth.createAid({ aid: bAid });
+    log('dim', '  Bob 创建耗时: ' + (Date.now() - t1b) + 'ms');
+    assert('AID 创建成功', true);
+
+    // 2. 认证
+    log('info', '步骤 2: 认证');
+    const t2 = Date.now();
+    const aAuth = await a.auth.authenticate({ aid: aAid });
+    log('dim', '  Alice 认证耗时: ' + (Date.now() - t2) + 'ms, token 前缀: ' + String(aAuth.access_token || '').slice(0, 20) + '...');
+    const t2b = Date.now();
+    const bAuth = await b.auth.authenticate({ aid: bAid });
+    log('dim', '  Bob 认证耗时: ' + (Date.now() - t2b) + 'ms');
+    log('dim', '  Gateway: ' + (aAuth.gateway || '未知'));
+    assert('认证成功', !!(aAuth && aAuth.access_token && bAuth && bAuth.access_token));
+
+    // 3. 连接
+    log('info', '步骤 3: 连接 Gateway');
+    const t3 = Date.now();
+    await a.connect(aAuth);
+    log('dim', '  Alice 连接耗时: ' + (Date.now() - t3) + 'ms, state=' + a.state);
+    assert('Alice 连接成功', a.state === 'connected');
+    const t3b = Date.now();
+    await b.connect(bAuth);
+    log('dim', '  Bob 连接耗时: ' + (Date.now() - t3b) + 'ms, state=' + b.state);
+    assert('Bob 连接成功', b.state === 'connected');
+
+    // 4. 发送加密消息
+    log('info', '步骤 4: 发送加密消息');
+    const t4 = Date.now();
+    const sendResult = await a.call('message.send', {
+      to: bAid,
+      payload: { text: 'P2P自动测试' },
+      encrypt: true,
+    });
+    log('dim', '  发送耗时: ' + (Date.now() - t4) + 'ms, message_id=' + (sendResult.message_id || ''));
+    assert('消息发送成功', !!(sendResult && sendResult.message_id));
+
+    // 5. 拉取并验证
+    log('info', '步骤 5: 拉取消息');
+    await new Promise(function(r) { setTimeout(r, 1500); });
+    const t5 = Date.now();
+    const pullResult = await b.call('message.pull', { after_seq: 0, limit: 10 });
+    const msgs = pullResult.messages || [];
+    log('dim', '  拉取耗时: ' + (Date.now() - t5) + 'ms, 收到 ' + msgs.length + ' 条');
+    assert('消息接收成功', msgs.length > 0);
+
+    const decrypted = msgs.find(function(m) {
+      return m.payload && m.payload.text === 'P2P自动测试';
+    });
+    assert('消息解密成功', !!decrypted);
+
+    if (decrypted && decrypted.e2ee) {
+      log('info', '  加密模式: ' + (decrypted.e2ee.encryption_mode || '未知'));
+      log('dim', '  prekey_id: ' + (decrypted.e2ee.prekey_id || '无'));
+      log('dim', '  forward_secrecy: ' + (decrypted.e2ee.encryption_mode === 'prekey_ecdh_v2' ? '是' : '否'));
+    } else if (decrypted) {
+      log('dim', '  明文消息（未加密或已解密但无 e2ee 元数据）');
+    } else {
+      log('dim', '  消息列表: ' + JSON.stringify(msgs.map(function(m) { return { type: m.payload && m.payload.type, text: m.payload && m.payload.text }; })));
+    }
+  } catch (e) {
+    log('error', '测试异常: ' + e.message);
+  } finally {
+    if (a) { try { await a.close(); } catch(e) {} }
+    if (b) { try { await b.close(); } catch(e) {} }
+  }
+
+  markBtn('btn-testP2P', testResults.failed === 0 ? 'success' : 'failed');
+  updateTestStatus('P2P');
+  log('info', '\u2550\u2550\u2550 P2P 测试完成: ' + testResults.passed + '/' + testResults.total + ' \u2550\u2550\u2550');
+  return { ...testResults };
+};
+
+// ── 自动化: Group 全链路 ────────────────────────────
+window.runGroupTest = async function() {
+  testResults = { passed: 0, failed: 0, total: 0 };
+  const rid = Math.random().toString(36).slice(2, 8);
+  logSep('Group 全链路测试');
+  log('info', '\u2550\u2550\u2550 Group 全链路测试开始 [' + rid + '] \u2550\u2550\u2550');
+  markBtn('btn-testGroup', 'running');
+
+  let a = null, b = null;
+  try {
+    a = makeClient('A');
+    b = makeClient('B');
+    const aAid = 'gauto-a-' + rid + '.agentid.pub';
+    const bAid = 'gauto-b-' + rid + '.agentid.pub';
+
+    // 1. 连接
+    log('info', '步骤 1: 创建、认证、连接');
+    const t1 = Date.now();
+    log('dim', '  Alice AID: ' + aAid);
+    await a.auth.createAid({ aid: aAid });
+    log('dim', '  Alice createAid 耗时: ' + (Date.now() - t1) + 'ms');
+    const aAuth = await a.auth.authenticate({ aid: aAid });
+    log('dim', '  Alice 认证完成, gateway: ' + (aAuth.gateway || '未知'));
+    await a.connect(aAuth);
+
+    const t1b = Date.now();
+    log('dim', '  Bob AID: ' + bAid);
+    await b.auth.createAid({ aid: bAid });
+    log('dim', '  Bob createAid 耗时: ' + (Date.now() - t1b) + 'ms');
+    const bAuth = await b.auth.authenticate({ aid: bAid });
+    await b.connect(bAuth);
+    log('dim', '  步骤 1 总耗时: ' + (Date.now() - t1) + 'ms');
+    assert('双方连接成功', a.state === 'connected' && b.state === 'connected');
+
+    // 2. 建群
+    log('info', '步骤 2: 创建群组');
+    const t2 = Date.now();
+    const gr = await a.call('group.create', { name: 'auto-grp-' + rid });
+    const gid = gr.group.group_id;
+    assert('群组创建成功', !!gid);
+    log('dim', '  群组 ID: ' + gid);
+    log('dim', '  owner: ' + (gr.group.owner_aid || ''));
+    log('dim', '  建群耗时: ' + (Date.now() - t2) + 'ms');
+
+    // 3. 加人
+    log('info', '步骤 3: 添加成员 ' + bAid);
+    const t3 = Date.now();
+    await a.call('group.add_member', { group_id: gid, aid: bAid });
+    log('dim', '  add_member RPC 耗时: ' + (Date.now() - t3) + 'ms');
+    assert('添加成员成功', true);
+    log('dim', '  等待密钥分发 (3s)...');
+    await new Promise(function(r) { setTimeout(r, 3000); });
+    log('dim', '  密钥分发等待完成');
+
+    // 4. 发送加密群消息
+    log('info', '步骤 4: 发送群加密消息');
+    const t4 = Date.now();
+    await a.call('group.send', {
+      group_id: gid,
+      payload: { text: 'Group自动测试' },
+      encrypt: true,
+    });
+    log('dim', '  发送耗时: ' + (Date.now() - t4) + 'ms');
+    assert('群加密消息发送成功', true);
+    await new Promise(function(r) { setTimeout(r, 1500); });
+
+    // 5. Bob 拉取
+    log('info', '步骤 5: Bob 拉取群消息');
+    const t5 = Date.now();
+    const pr = await b.call('group.pull', { group_id: gid, after_seq: 0, limit: 10 });
+    const msgs = pr.messages || [];
+    log('dim', '  拉取耗时: ' + (Date.now() - t5) + 'ms, 收到 ' + msgs.length + ' 条');
+    assert('群消息接收成功', msgs.length > 0);
+
+    const decrypted = msgs.find(function(m) {
+      return m.payload && m.payload.text === 'Group自动测试';
+    });
+    assert('群消息解密成功', !!decrypted);
+
+    if (decrypted && decrypted.e2ee) {
+      log('info', '  加密模式: ' + (decrypted.e2ee.encryption_mode || '未知') + ', epoch=' + decrypted.e2ee.epoch);
+      log('dim', '  sender_verified: ' + (decrypted.e2ee.sender_verified || false));
+    } else {
+      log('dim', '  消息详情: ' + JSON.stringify(msgs.map(function(m) { return { type: m.payload && m.payload.type, text: m.payload && m.payload.text, e2ee: !!m.e2ee }; })));
+    }
+
+    // 6. 明文群消息
+    log('info', '步骤 6: 发送明文群消息');
+    const t6 = Date.now();
+    const ptResult = await a.call('group.send', {
+      group_id: gid,
+      payload: { text: '明文' },
+      encrypt: false,
+    });
+    log('dim', '  明文发送耗时: ' + (Date.now() - t6) + 'ms');
+    assert('明文群消息发送成功', !!(ptResult && (ptResult.message || ptResult.message_id)));
+
+  } catch (e) {
+    log('error', '测试异常: ' + e.message);
+  } finally {
+    if (a) { try { await a.close(); } catch(e) {} }
+    if (b) { try { await b.close(); } catch(e) {} }
+  }
+
+  markBtn('btn-testGroup', testResults.failed === 0 ? 'success' : 'failed');
+  updateTestStatus('Group');
+  log('info', '\u2550\u2550\u2550 Group 测试完成: ' + testResults.passed + '/' + testResults.total + ' \u2550\u2550\u2550');
+  return { ...testResults };
+};
+
+// ── 自动化: 全部测试 ────────────────────────────────
+window.runAllTests = async function() {
+  markBtn('btn-testAll', 'running');
+  logSep('全部测试');
+  log('info', '\u2550\u2550\u2550\u2550\u2550\u2550\u2550 全部测试开始 \u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+
+  const p2pResult = await runP2PTest();
+  const groupResult = await runGroupTest();
+
+  const total = {
+    passed: p2pResult.passed + groupResult.passed,
+    failed: p2pResult.failed + groupResult.failed,
+    total:  p2pResult.total  + groupResult.total,
+  };
+
+  const icon = total.failed === 0 ? '\u2705' : '\u274c';
+  const summary = icon + ' 全部: ' + total.passed + '/' + total.total + ' 通过'
+    + ' (P2P: ' + p2pResult.passed + '/' + p2pResult.total
+    + ', Group: ' + groupResult.passed + '/' + groupResult.total + ')';
+  setStatus(summary);
+
+  markBtn('btn-testAll', total.failed === 0 ? 'success' : 'failed');
+  log('info', '\u2550\u2550\u2550\u2550\u2550\u2550\u2550 全部测试完成: ' + total.passed + '/' + total.total + ' \u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+};
+
+// ── 初始化完成 ──────────────────────────────────────
+log('success', 'SDK 加载成功, 版本: ' + (AUN.__version__ || '未知'));
+log('info', '可用导出: ' + Object.keys(AUN).filter(function(k) { return !k.startsWith('_'); }).join(', '));
+</script>
+</body>
+</html>

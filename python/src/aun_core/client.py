@@ -252,7 +252,7 @@ class AUNClient:
             # 约定：签名覆盖所有非 _ 前缀且非 client_signature 的业务字段
             params_for_hash = {k: v for k, v in params.items()
                                if k != "client_signature" and not k.startswith("_")}
-            params_json = json.dumps(params_for_hash, sort_keys=True, separators=(",", ":"))
+            params_json = json.dumps(params_for_hash, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             params_hash = hashlib.sha256(params_json.encode("utf-8")).hexdigest()
             sign_data = f"{method}|{aid}|{ts}|{params_hash}".encode("utf-8")
             pk = _ser.load_pem_private_key(

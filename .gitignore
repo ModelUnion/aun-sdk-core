@@ -2,9 +2,18 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.egg
+
+# Go
+go/go.sum
+
+# Node.js / TypeScript / JavaScript
+node_modules/
 dist/
 build/
-*.egg
+*.tsbuildinfo
+test-results/
+playwright-report/
 
 # IDE
 .idea/

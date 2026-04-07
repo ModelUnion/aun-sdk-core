@@ -34,17 +34,15 @@ from aun_core.e2ee import E2EEManager
 # ---------------------------------------------------------------------------
 
 _TEST_AUN_PATH = "./.aun_test"
-_TEST_GATEWAY_URL = "wss://127.0.0.1:20001/aun"
 
 
 def _make_client(tag: str) -> AUNClient:
+    """创建测试客户端 — Gateway 通过 well-known 发现机制自动获取。"""
     client = AUNClient({
         "aun_path": _TEST_AUN_PATH,
         "verify_ssl": False,
         "require_forward_secrecy": False,
     })
-    # Docker 本地测试固定直连 Gateway，避免代理变量或 hosts 缺失导致发现失败。
-    client._gateway_url = _TEST_GATEWAY_URL
     return client
 
 

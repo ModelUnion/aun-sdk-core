@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AUN Browser SDK E2E Test</title>
+</head>
+<body>
+<h1>AUN Browser SDK E2E Test Page</h1>
+<script type="module">
+import * as AUN from '../../dist/aun-core-browser.js';
+// 暴露给 Playwright 的 page.evaluate() 使用
+window.AUN = AUN;
+window.testReady = true;
+</script>
+</body>
+</html>
