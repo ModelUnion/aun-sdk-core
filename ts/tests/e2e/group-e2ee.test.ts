@@ -24,6 +24,7 @@ import {
   handleKeyDistribution,
   loadAllGroupSecrets,
 } from '../../src/e2ee-group.js';
+import type { JsonObject, KeyStore, Message } from '../../src/types.js';
 
 // ── 常量 ──────────────────────────────────────────────────────
 
@@ -55,9 +56,9 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
 
 /** 创建群组，返回 group_id */
 async function createGroup(client: AUNClient, name: string): Promise<string> {
-  const result = await client.call('group.create', { name }) as Record<string, unknown>;
-  const group = result.group as Record<string, unknown>;
-  return group.group_id as string;
+  const result = await client.call('group.create', { name }) as JsonObject;
+  const group = result.group as JsonObject;
+  return String(group.group_id ?? '');
 }
 
 /** 添加群成员 */
@@ -72,9 +73,9 @@ async function kickMember(client: AUNClient, groupId: string, memberAid: string)
 
 /** 获取群成员 AID 列表 */
 async function getMembers(client: AUNClient, groupId: string): Promise<string[]> {
-  const result = await client.call('group.get_members', { group_id: groupId }) as Record<string, unknown>;
-  const members = (result.members ?? []) as Record<string, unknown>[];
-  return members.map(m => m.aid as string);
+  const result = await client.call('group.get_members', { group_id: groupId }) as JsonObject;
+  const members = (result.members ?? []) as JsonObject[];
+  return members.map(m => String(m.aid ?? ''));
 }
 
 /** 拉取群消息（经 client.call 自动解密） */
@@ -82,12 +83,12 @@ async function groupPull(
   client: AUNClient,
   groupId: string,
   afterSeq: number = 0,
-): Promise<Record<string, unknown>[]> {
+) : Promise<Message[]> {
   const result = await client.call('group.pull', {
     group_id: groupId,
     after_seq: afterSeq,
-  }) as Record<string, unknown>;
-  return (result.messages ?? []) as Record<string, unknown>[];
+  }) as JsonObject;
+  return (result.messages ?? []) as Message[];
 }
 
 /** 等待指定毫秒 */
@@ -116,24 +117,24 @@ async function waitFor(
 }
 
 /** 从消息列表中筛选自动解密的群 E2EE 消息 */
-function filterDecrypted(msgs: Record<string, unknown>[]): Record<string, unknown>[] {
+function filterDecrypted(msgs: Message[]): Message[] {
   return msgs.filter(m => {
-    const e2ee = m.e2ee as Record<string, unknown> | undefined;
+    const e2ee = m.e2ee as JsonObject | undefined;
     return e2ee?.encryption_mode === 'epoch_group_key';
   });
 }
 
 /** 从消息列表中筛选指定 epoch 的解密消息 */
-function filterByEpoch(msgs: Record<string, unknown>[], epoch: number): Record<string, unknown>[] {
+function filterByEpoch(msgs: Message[], epoch: number): Message[] {
   return msgs.filter(m => {
-    const e2ee = m.e2ee as Record<string, unknown> | undefined;
-    return (e2ee?.epoch as number) === epoch;
+    const e2ee = m.e2ee as JsonObject | undefined;
+    return Number(e2ee?.epoch ?? 0) === epoch;
   });
 }
 
 /** 获取客户端内部 keystore 引用 */
-function getKeystore(client: AUNClient): import('../../src/keystore/index.js').KeyStore {
-  return (client as unknown as Record<string, unknown>)._keystore as import('../../src/keystore/index.js').KeyStore;
+function getKeystore(client: AUNClient): KeyStore {
+  return (client as AUNClient & { _keystore: KeyStore })._keystore;
 }
 
 // ── 测试用例 ──────────────────────────────────────────────────
@@ -191,7 +192,7 @@ describe('Group E2EE E2E 测试', () => {
     // 验证自动解密成功
     const decrypted = filterDecrypted(msgs);
     expect(decrypted.length, '应有自动解密的消息').toBeGreaterThanOrEqual(1);
-    expect((decrypted[0].payload as Record<string, unknown>).text).toBe('加密群消息');
+    expect((decrypted[0].payload as JsonObject).text).toBe('加密群消息');
   }, TEST_TIMEOUT);
 
   // ── Test 2: 3人群组，A 发加密消息，B/C 都能解密 ────────────
@@ -230,7 +231,7 @@ describe('Group E2EE E2E 测试', () => {
       const decrypted = filterDecrypted(msgs);
       expect(decrypted.length, `${name}: 应有自动解密的消息`).toBeGreaterThanOrEqual(1);
       expect(
-        (decrypted[0].payload as Record<string, unknown>).text,
+        (decrypted[0].payload as JsonObject).text,
         `${name}: payload 不匹配`,
       ).toBe('三人群消息');
     }
@@ -281,7 +282,7 @@ describe('Group E2EE E2E 测试', () => {
     const msgsBob = await groupPull(bob, groupId);
     const decryptedBob = filterByEpoch(msgsBob, 2);
     expect(decryptedBob.length, 'Bob: 应有 epoch 2 的解密消息').toBeGreaterThanOrEqual(1);
-    expect((decryptedBob[0].payload as Record<string, unknown>).text).toBe('踢人后的消息');
+    expect((decryptedBob[0].payload as JsonObject).text).toBe('踢人后的消息');
 
     // Carol 没有 epoch 2 密钥（被踢后不会收到新密钥）
     const allCarol = loadAllGroupSecrets(getKeystore(carol), cAid, groupId);
@@ -326,7 +327,7 @@ describe('Group E2EE E2E 测试', () => {
     const msgs = await groupPull(carol, groupId);
     const decrypted = filterDecrypted(msgs);
     expect(decrypted.length, 'Carol: 应有自动解密的消息').toBeGreaterThanOrEqual(1);
-    expect((decrypted[0].payload as Record<string, unknown>).text).toBe('新成员能看到');
+    expect((decrypted[0].payload as JsonObject).text).toBe('新成员能看到');
   }, TEST_TIMEOUT);
 
   // ── Test 5: 连续发 5 条加密群消息 → 全部解密成功 ──────────
@@ -362,7 +363,7 @@ describe('Group E2EE E2E 测试', () => {
     const decrypted = filterDecrypted(msgs);
     expect(decrypted.length, `应解密 ${N} 条消息`).toBeGreaterThanOrEqual(N);
 
-    const texts = new Set(decrypted.map(m => (m.payload as Record<string, unknown>).text as string));
+    const texts = new Set(decrypted.map(m => String((m.payload as JsonObject).text ?? '')));
     const expected = new Set(Array.from({ length: N }, (_, i) => `burst_${i}`));
     expect(texts, '消息内容应完全匹配').toEqual(expected);
   }, TEST_TIMEOUT);
@@ -412,15 +413,15 @@ describe('Group E2EE E2E 测试', () => {
     // 加密消息已自动解密
     const decrypted = filterDecrypted(msgs);
     expect(decrypted.length, '应有加密消息').toBeGreaterThanOrEqual(1);
-    expect((decrypted[0].payload as Record<string, unknown>).text).toBe('密文');
+    expect((decrypted[0].payload as JsonObject).text).toBe('密文');
 
     // 明文消息直接可读
     const plaintext = msgs.filter(m => {
       if (m.e2ee) return false;
-      const payload = m.payload as Record<string, unknown> | undefined;
+      const payload = m.payload as JsonObject | undefined;
       return payload && typeof payload === 'object' && 'text' in payload;
     });
-    const plainTexts = new Set(plaintext.map(m => (m.payload as Record<string, unknown>).text as string));
+    const plainTexts = new Set(plaintext.map(m => String((m.payload as JsonObject).text ?? '')));
     expect(plainTexts.has('明文'), '应包含第一条明文').toBe(true);
     expect(plainTexts.has('又是明文'), '应包含第二条明文').toBe(true);
   }, TEST_TIMEOUT);
@@ -477,7 +478,7 @@ describe('Group E2EE E2E 测试', () => {
 
     // 手动轮换 epoch 2（模拟踢人后轮换）
     const info = alice.groupE2ee.rotateEpoch(groupId, [aAid, bAid]);
-    const distributions = (info.distributions ?? []) as { to: string; payload: Record<string, unknown> }[];
+    const distributions = (info.distributions ?? []) as { to: string; payload: JsonObject }[];
     for (const dist of distributions) {
       await alice.call('message.send', {
         to: dist.to,
@@ -501,7 +502,7 @@ describe('Group E2EE E2E 测试', () => {
     const decrypted = filterDecrypted(msgs);
     expect(decrypted.length, '应有至少 2 条解密消息').toBeGreaterThanOrEqual(2);
 
-    const texts = new Set(decrypted.map(m => (m.payload as Record<string, unknown>).text as string));
+    const texts = new Set(decrypted.map(m => String((m.payload as JsonObject).text ?? '')));
     expect(texts.has('epoch1消息'), '应包含 epoch1 消息').toBe(true);
     expect(texts.has('epoch2消息'), '应包含 epoch2 消息').toBe(true);
   }, TEST_TIMEOUT);
@@ -535,7 +536,7 @@ describe('Group E2EE E2E 测试', () => {
     const msgs = await groupPull(bob, groupId);
     const plaintextMsgs = msgs.filter(m => !m.encrypted);
     expect(plaintextMsgs.length, '应有明文消息').toBeGreaterThanOrEqual(1);
-    expect((plaintextMsgs[0].payload as Record<string, unknown>).text).toBe('这是一条明文消息');
+    expect((plaintextMsgs[0].payload as JsonObject).text).toBe('这是一条明文消息');
 
     // Alice 默认加密发送
     await alice.call('group.send', {
@@ -548,7 +549,7 @@ describe('Group E2EE E2E 测试', () => {
     const msgs2 = await groupPull(bob, groupId, lastSeq);
     const encryptedMsgs = filterDecrypted(msgs2);
     expect(encryptedMsgs.length, '应有加密消息').toBeGreaterThanOrEqual(1);
-    expect((encryptedMsgs[0].payload as Record<string, unknown>).text).toBe('这是一条加密消息');
+    expect((encryptedMsgs[0].payload as JsonObject).text).toBe('这是一条加密消息');
   }, TEST_TIMEOUT);
 
   // ── Test 13: 成员主动退群 → epoch 轮换 ───────────────────
@@ -610,7 +611,7 @@ describe('Group E2EE E2E 测试', () => {
     const msgsBob = await groupPull(bob, groupId);
     const decryptedBob = filterByEpoch(msgsBob, 2);
     expect(decryptedBob.length, 'Bob: 应有 epoch 2 的解密消息').toBeGreaterThanOrEqual(1);
-    expect((decryptedBob[0].payload as Record<string, unknown>).text).toBe('退群后的消息');
+    expect((decryptedBob[0].payload as JsonObject).text).toBe('退群后的消息');
 
     // Carol 不应有 epoch 2 密钥
     const allCarol = loadAllGroupSecrets(getKeystore(carol), cAid, groupId);

@@ -28,6 +28,7 @@ import {
   GroupE2EEManager,
 } from '../../src/e2ee-group.js';
 import { FakeKeystore, generateECKeypair, makeSelfSignedCert, buildIdentity } from './helpers.js';
+import type { GroupOldEpochRecord, JsonObject, Message } from '../../src/types.js';
 
 // ── 测试辅助 ──────────────────────────────────────────────────
 
@@ -112,8 +113,8 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
 
     const result = decryptGroupMessage(message, secrets, certPem);
     expect(result).not.toBeNull();
-    expect((result as Record<string, unknown>).payload).toEqual({ text: 'roundtrip' });
-    const e2ee = (result as Record<string, unknown>).e2ee as Record<string, unknown>;
+    expect((result as Message).payload).toEqual({ text: 'roundtrip' });
+    const e2ee = (result as Message).e2ee as JsonObject;
     expect(e2ee.encryption_mode).toBe('epoch_group_key');
     expect(e2ee.epoch).toBe(1);
     expect(e2ee.sender_verified).toBe(true);
@@ -282,18 +283,12 @@ describe('cleanupOldEpochs', () => {
     const gs2 = makeGroupSecret();
 
     storeGroupSecret(ks, 'a', 'grp-1', 1, gs1, 'c1', ['a']);
-    // 手动设置 old epoch 的时间为很久以前
-    const meta = ks.loadMetadata('a')!;
-    const groupData = (meta.group_secrets as Record<string, Record<string, unknown>>)['grp-1'];
     // 需要先升级 epoch 产生 old_epochs
     storeGroupSecret(ks, 'a', 'grp-1', 2, gs2, 'c2', ['a']);
 
-    // 手动修改 old_epochs 的 updated_at 为很久以前
-    const meta2 = ks.loadMetadata('a')!;
-    const gd2 = (meta2.group_secrets as Record<string, Record<string, unknown>>)['grp-1'];
-    const oldEpochs = gd2.old_epochs as Record<string, unknown>[];
+    // 手动修改结构化主存里的 old_epochs.updated_at 为很久以前
+    const oldEpochs = ks._groups['a']['grp-1'].old_epochs as GroupOldEpochRecord[];
     oldEpochs[0].updated_at = 0; // 很久以前
-    ks.saveMetadata('a', meta2);
 
     const removed = cleanupOldEpochs(ks, 'a', 'grp-1', 1); // 1 秒保留期
     expect(removed).toBe(1);

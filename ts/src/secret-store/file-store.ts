@@ -25,12 +25,13 @@ import {
 import { join } from 'node:path';
 
 import type { SecretStore } from './index.js';
+import type { SecretRecord } from '../types.js';
 
 export class FileSecretStore implements SecretStore {
   private _root: string;
   private _masterKey: Buffer;
 
-  constructor(root: string, encryptionSeed?: string) {
+  constructor(root: string, encryptionSeed?: string, sqliteBackup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null }) {
     this._root = root;
     mkdirSync(this._root, { recursive: true });
 
@@ -38,7 +39,7 @@ export class FileSecretStore implements SecretStore {
     if (encryptionSeed) {
       seedBytes = Buffer.from(encryptionSeed, 'utf-8');
     } else {
-      seedBytes = this._loadOrCreateSeed();
+      seedBytes = this._loadOrCreateSeed(sqliteBackup);
     }
 
     // PBKDF2 派生主密钥，与 Python SDK 参数完全一致
@@ -51,7 +52,7 @@ export class FileSecretStore implements SecretStore {
     );
   }
 
-  protect(scope: string, name: string, plaintext: Buffer): Record<string, unknown> {
+  protect(scope: string, name: string, plaintext: Buffer): SecretRecord {
     const key = this._deriveKey(scope, name);
     const nonce = randomBytes(12);
 
@@ -69,7 +70,7 @@ export class FileSecretStore implements SecretStore {
     };
   }
 
-  reveal(scope: string, name: string, record: Record<string, unknown>): Buffer | null {
+  reveal(scope: string, name: string, record: SecretRecord): Buffer | null {
     if (record.scheme !== 'file_aes') return null;
     if (String(record.name ?? '') !== name) return null;
 
@@ -93,11 +94,6 @@ export class FileSecretStore implements SecretStore {
     }
   }
 
-  clear(_scope: string, _name: string): void {
-    // 与 Python SDK 一致：file_aes 方案不需要额外清理
-    return;
-  }
-
   /** 使用 HMAC-SHA256 从主密钥派生子密钥 */
   private _deriveKey(scope: string, name: string): Buffer {
     return createHmac('sha256', this._masterKey)
@@ -105,21 +101,42 @@ export class FileSecretStore implements SecretStore {
       .digest();
   }
 
-  /** 加载或创建种子文件 */
-  private _loadOrCreateSeed(): Buffer {
+  /** 三级恢复：文件 → SQLite → 新建，双写确保一致 */
+  private _loadOrCreateSeed(backup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null }): Buffer {
     const seedPath = join(this._root, '.seed');
+    let source = '';
+
+    // 1. 先读文件
     if (existsSync(seedPath)) {
-      return readFileSync(seedPath);
+      const seed = readFileSync(seedPath);
+      source = 'file';
+      // 双写：确保 SQLite 也有
+      if (backup) backup.backupSeed(seed);
+      return seed;
     }
+
+    // 2. 文件不存在 → 读 SQLite
+    if (backup) {
+      const restored = backup.restoreSeed();
+      if (restored && restored.length > 0) {
+        source = 'sqlite';
+        console.log('从 SQLite 恢复 .seed 文件');
+        writeFileSync(seedPath, restored);
+        if (process.platform !== 'win32') {
+          try { chmodSync(seedPath, 0o600); } catch { /* ignore */ }
+        }
+        return restored;
+      }
+    }
+
+    // 3. 都没有 → 生成新 seed
     const seed = randomBytes(32);
     writeFileSync(seedPath, seed);
     if (process.platform !== 'win32') {
-      try {
-        chmodSync(seedPath, 0o600);
-      } catch {
-        // 平台兼容 fallback
-      }
+      try { chmodSync(seedPath, 0o600); } catch { /* ignore */ }
     }
+    // 双写：备份到 SQLite
+    if (backup) backup.backupSeed(seed);
     return seed;
   }
 }

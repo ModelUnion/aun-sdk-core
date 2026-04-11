@@ -10,7 +10,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -118,6 +120,38 @@ func testMakeE2EEPair(t *testing.T) (
 		Keystore:   receiverKS,
 	})
 	return
+}
+
+func testPrekeyWithCreatedAt(
+	t *testing.T,
+	identity map[string]any,
+	prekey map[string]any,
+	createdAt int64,
+) map[string]any {
+	t.Helper()
+
+	cloned := copyMapShallow(prekey)
+	cloned["created_at"] = createdAt
+
+	privPEM, _ := identity["private_key_pem"].(string)
+	if privPEM == "" {
+		t.Fatal("identity.private_key_pem 不应为空")
+	}
+	prekeyID, _ := cloned["prekey_id"].(string)
+	publicKey, _ := cloned["public_key"].(string)
+	signData := []byte(fmt.Sprintf("%s|%s|%d", prekeyID, publicKey, createdAt))
+
+	pk, err := parseECPrivateKeyPEM(privPEM)
+	if err != nil {
+		t.Fatalf("解析 identity 私钥失败: %v", err)
+	}
+	hash := sha256.Sum256(signData)
+	sig, err := ecdsa.SignASN1(rand.Reader, pk, hash[:])
+	if err != nil {
+		t.Fatalf("重签 prekey 失败: %v", err)
+	}
+	cloned["signature"] = base64.StdEncoding.EncodeToString(sig)
+	return cloned
 }
 
 // ── AAD 测试 ─────────────────────────────────────────────
@@ -285,6 +319,24 @@ func TestPrekeyEncryptDecryptRoundtrip(t *testing.T) {
 	}
 	if e2ee["encryption_mode"] != ModePrekeyECDHV2 {
 		t.Errorf("e2ee 元数据 encryption_mode 不正确: %v", e2ee["encryption_mode"])
+	}
+}
+
+func TestPrekeyEncryptRejectsCertFingerprintMismatch(t *testing.T) {
+	sender, receiver, _, receiverAID, _, _, _, receiverCertPEM := testMakeE2EEPair(t)
+
+	prekey, err := receiver.GeneratePrekey()
+	if err != nil {
+		t.Fatalf("生成 prekey 失败: %v", err)
+	}
+	prekey["cert_fingerprint"] = "sha256:" + strings.Repeat("0", 64)
+
+	_, err = sender.encryptWithPrekey(
+		receiverAID, map[string]any{"text": "hello"}, prekey,
+		[]byte(receiverCertPEM), "msg-fp-mismatch", time.Now().UnixMilli(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "prekey cert fingerprint mismatch") {
+		t.Fatalf("应返回 prekey cert fingerprint mismatch，实际: %v", err)
 	}
 }
 
@@ -477,6 +529,10 @@ func TestGeneratePrekeyStoresPrivateKey(t *testing.T) {
 	if !ok || sig == "" {
 		t.Error("prekey 应包含 signature")
 	}
+	fp, ok := prekey["cert_fingerprint"].(string)
+	if !ok || !strings.HasPrefix(fp, "sha256:") {
+		t.Errorf("prekey 应包含 cert_fingerprint: %v", prekey["cert_fingerprint"])
+	}
 }
 
 // TestGeneratePrekeyIncludesCreatedAt 验证生成的 prekey 包含 created_at
@@ -495,6 +551,123 @@ func TestGeneratePrekeyIncludesCreatedAt(t *testing.T) {
 	ts := toInt64(createdAt)
 	if ts <= 0 {
 		t.Errorf("created_at 应为正数: %v", createdAt)
+	}
+	fp, ok := prekey["cert_fingerprint"].(string)
+	if !ok || !strings.HasPrefix(fp, "sha256:") {
+		t.Errorf("prekey 应包含 cert_fingerprint: %v", prekey["cert_fingerprint"])
+	}
+}
+
+func TestGeneratePrekeyUsesStructuredKeyStoreInterface(t *testing.T) {
+	dir := t.TempDir()
+	backup := keystore.NewSQLiteBackup(filepath.Join(dir, ".aun_backup", "aun_backup.db"))
+	t.Cleanup(func() { backup.Close() })
+
+	receiverAID := "receiver.test"
+	receiverPriv, receiverPrivPEM, receiverPubB64 := testGenerateECKeypair(t)
+	receiverCertPEM := testMakeSelfSignedCert(t, receiverPriv, receiverAID)
+	receiverIdentity := testBuildIdentity(receiverAID, receiverPrivPEM, receiverPubB64, receiverCertPEM)
+
+	receiverKS, err := keystore.NewFileKeyStore(filepath.Join(dir, "receiver"), nil, "test-seed", backup)
+	if err != nil {
+		t.Fatalf("创建接收方 keystore 失败: %v", err)
+	}
+	if err := receiverKS.SaveIdentity(receiverAID, receiverIdentity); err != nil {
+		t.Fatalf("SaveIdentity 失败: %v", err)
+	}
+
+	receiver := NewE2EEManager(E2EEManagerConfig{
+		IdentityFn: func() map[string]any { return receiverIdentity },
+		Keystore:   receiverKS,
+	})
+
+	prekey, err := receiver.GeneratePrekey()
+	if err != nil {
+		t.Fatalf("GeneratePrekey 失败: %v", err)
+	}
+
+	prekeys, err := receiverKS.LoadE2EEPrekeys(receiverAID)
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
+	}
+	prekeyID := prekey["prekey_id"].(string)
+	if prekeys[prekeyID]["private_key_pem"] == nil {
+		t.Fatal("结构化 prekey 主存中缺少私钥")
+	}
+}
+
+func TestEncryptOutboundAcceptsOldPrekey(t *testing.T) {
+	sender, receiver, _, receiverAID, _, receiverIdentity, _, receiverCertPEM := testMakeE2EEPair(t)
+
+	basePrekey, err := receiver.GeneratePrekey()
+	if err != nil {
+		t.Fatalf("生成测试 prekey 失败: %v", err)
+	}
+	oldCreatedAt := time.Now().Add(-45 * 24 * time.Hour).UnixMilli()
+	oldPrekey := testPrekeyWithCreatedAt(t, receiverIdentity, basePrekey, oldCreatedAt)
+
+	envelope, info, err := sender.EncryptOutbound(
+		receiverAID,
+		map[string]any{"text": "old prekey still works"},
+		[]byte(receiverCertPEM),
+		oldPrekey,
+		"old-prekey-msg",
+		time.Now().UnixMilli(),
+	)
+	if err != nil {
+		t.Fatalf("旧 prekey 不应被发送端拒绝: %v", err)
+	}
+	if envelope["prekey_id"] != oldPrekey["prekey_id"] {
+		t.Fatalf("加密结果未使用指定 prekey: %v", envelope["prekey_id"])
+	}
+	if info["mode"] != ModePrekeyECDHV2 {
+		t.Fatalf("旧 prekey 仍应使用 prekey 模式: %v", info["mode"])
+	}
+}
+
+func TestGeneratePrekeyCleanupKeepsLatestSeven(t *testing.T) {
+	_, receiver, _, receiverAID, _, _, _, _ := testMakeE2EEPair(t)
+
+	structured, ok := receiver.keystore.(structuredKeyStore)
+	if !ok {
+		t.Fatal("receiver keystore 应支持 structuredKeyStore")
+	}
+
+	oldBase := time.Now().Add(-8 * 24 * time.Hour).UnixMilli()
+	for i := 0; i < 8; i++ {
+		err := structured.SaveE2EEPrekey(receiverAID, fmt.Sprintf("old-%d", i), map[string]any{
+			"private_key_pem": fmt.Sprintf("OLD-%d", i),
+			"created_at":      oldBase + int64(i),
+		})
+		if err != nil {
+			t.Fatalf("写入旧 prekey 失败: %v", err)
+		}
+	}
+
+	newPrekey, err := receiver.GeneratePrekey()
+	if err != nil {
+		t.Fatalf("生成新 prekey 失败: %v", err)
+	}
+
+	prekeys, err := structured.LoadE2EEPrekeys(receiverAID)
+	if err != nil {
+		t.Fatalf("读取 prekeys 失败: %v", err)
+	}
+	if len(prekeys) != 7 {
+		t.Fatalf("清理后应保留 7 个 prekey，实际 %d", len(prekeys))
+	}
+	if _, ok := prekeys["old-0"]; ok {
+		t.Fatal("最旧的 old-0 应被清理")
+	}
+	if _, ok := prekeys["old-1"]; ok {
+		t.Fatal("次旧的 old-1 应被清理")
+	}
+	if _, ok := prekeys["old-2"]; !ok {
+		t.Fatal("最新窗口内的 old-2 应被保留")
+	}
+	newPrekeyID, _ := newPrekey["prekey_id"].(string)
+	if _, ok := prekeys[newPrekeyID]; !ok {
+		t.Fatal("新生成的 prekey 应被保留")
 	}
 }
 

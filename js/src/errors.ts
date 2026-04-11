@@ -1,9 +1,11 @@
 // ── AUN 协议错误层级 ──────────────────────────────────────
 
+import { isJsonObject, type JsonObject, type JsonValue, type RpcErrorObject } from './types.js';
+
 /** AUN 基础错误类型 */
 export class AUNError extends Error {
   readonly code: number;
-  readonly data: unknown;
+  readonly data: JsonValue | null;
   readonly retryable: boolean;
   readonly traceId: string | null;
 
@@ -11,7 +13,7 @@ export class AUNError extends Error {
     message: string,
     opts?: {
       code?: number;
-      data?: unknown;
+      data?: JsonValue | null;
       retryable?: boolean;
       traceId?: string | null;
     },
@@ -229,11 +231,21 @@ export class ClientSignatureError extends ValidationError {
 // ── 远端错误映射 ──────────────────────────────────────────
 
 /** 将服务端返回的 JSON-RPC error 对象映射为 SDK 错误类型 */
-export function mapRemoteError(error: Record<string, unknown>): AUNError {
+export function mapRemoteError(error: RpcErrorObject): AUNError {
   const code = Number(error.code ?? -32603);
   const message = String(error.message ?? 'remote error');
-  const data = error.data as Record<string, unknown> | undefined;
-  const traceId = (data?.trace_id ?? data?.traceId ?? null) as string | null;
+  let data: JsonObject | null = null;
+  if (isJsonObject(error.data ?? null)) {
+    data = error.data as JsonObject;
+  }
+  let traceId: string | null = null;
+  if (data) {
+    if (typeof data.trace_id === 'string') {
+      traceId = data.trace_id;
+    } else if (typeof data.traceId === 'string') {
+      traceId = data.traceId;
+    }
+  }
 
   let Cls: typeof AUNError;
 

@@ -6,10 +6,47 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthropics/aun-sdk-core/go/keystore"
 	"github.com/anthropics/aun-sdk-core/go/secretstore"
 )
+
+func testNewFileKeyStoreWithSQLite(t *testing.T) *keystore.FileKeyStore {
+	t.Helper()
+	dir := t.TempDir()
+	ks, _ := testNewFileKeyStoreWithSQLiteAndDir(t, dir)
+	return ks
+}
+
+func testNewFileKeyStoreWithSQLiteAndDir(t *testing.T, dir string) (*keystore.FileKeyStore, string) {
+	t.Helper()
+	backup := keystore.NewSQLiteBackup(filepath.Join(dir, ".aun_backup", "aun_backup.db"))
+	t.Cleanup(func() {
+		backup.Close()
+	})
+	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed", backup)
+	if err != nil {
+		t.Fatalf("创建带 SQLite 的 FileKeyStore 失败: %v", err)
+	}
+	return ks, dir
+}
+
+func testSeedMetaOnly(t *testing.T, root, aid string, metadata map[string]any) {
+	t.Helper()
+	safeAid := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(aid)
+	metaDir := filepath.Join(root, "AIDs", safeAid, "tokens")
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatalf("创建 meta 目录失败: %v", err)
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("序列化 meta-only 数据失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, "meta.json"), data, 0o600); err != nil {
+		t.Fatalf("写入 meta-only 文件失败: %v", err)
+	}
+}
 
 // ── FileSecretStore 测试 ─────────────────────────────────
 
@@ -217,24 +254,112 @@ func TestFileKeyStore_SaveLoadIdentity(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_DeleteIdentity 验证删除身份
-func TestFileKeyStore_DeleteIdentity(t *testing.T) {
+// TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters 验证原子 metadata 更新不会互相覆盖
+func TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters(t *testing.T) {
+	dir := t.TempDir()
+	ks, err := keystore.NewFileKeyStore(dir, nil, "atomic-seed")
+	if err != nil {
+		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+	}
+	aid := "atomic.agent.example"
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	errCh := make(chan error, 2)
+
+	go func() {
+		_, err := ks.UpdateMetadata(aid, func(metadata map[string]any) (map[string]any, error) {
+			prekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
+			if prekeys == nil {
+				prekeys = make(map[string]any)
+			}
+			prekeys["pk1"] = map[string]any{"private_key_pem": "PK1"}
+			metadata["e2ee_prekeys"] = prekeys
+			close(firstEntered)
+			<-releaseFirst
+			return metadata, nil
+		})
+		errCh <- err
+	}()
+
+	<-firstEntered
+
+	go func() {
+		_, err := ks.UpdateMetadata(aid, func(metadata map[string]any) (map[string]any, error) {
+			prekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
+			if prekeys == nil {
+				prekeys = make(map[string]any)
+			}
+			prekeys["pk2"] = map[string]any{"private_key_pem": "PK2"}
+			metadata["e2ee_prekeys"] = prekeys
+			return metadata, nil
+		})
+		if err == nil {
+			close(secondDone)
+		}
+		errCh <- err
+	}()
+
+	select {
+	case <-secondDone:
+		t.Fatal("第二个 updateMetadata 不应在第一个释放前完成")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("UpdateMetadata 失败: %v", err)
+		}
+	}
+
+	loaded, err := ks.LoadMetadata(aid)
+	if err != nil {
+		t.Fatalf("LoadMetadata 失败: %v", err)
+	}
+	prekeys, _ := loaded["e2ee_prekeys"].(map[string]any)
+	if _, ok := prekeys["pk1"]; !ok {
+		t.Fatal("缺少 pk1")
+	}
+	if _, ok := prekeys["pk2"]; !ok {
+		t.Fatal("缺少 pk2")
+	}
+}
+
+// TestFileKeyStore_SaveIdentityPreservesExistingPrekeys 验证 SaveIdentity 不覆盖已有 prekey
+func TestFileKeyStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
 	ks := testNewFileKeyStore(t)
-	aid := "test-agent.example"
-	_, privPEM, pubB64 := testGenerateECKeypair(t)
+	aid := "identity-preserve.example"
 
-	identity := map[string]any{
-		"aid": aid, "private_key_pem": privPEM,
-		"public_key_der_b64": pubB64, "curve": "P-256",
-	}
-	_ = ks.SaveIdentity(aid, identity)
-	if err := ks.DeleteIdentity(aid); err != nil {
-		t.Fatalf("DeleteIdentity 失败: %v", err)
+	if err := ks.SaveMetadata(aid, map[string]any{
+		"e2ee_prekeys": map[string]any{
+			"pk1": map[string]any{"private_key_pem": "KEEP_ME"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveMetadata 失败: %v", err)
 	}
 
-	loaded, _ := ks.LoadIdentity(aid)
-	if loaded != nil {
-		t.Error("删除后身份应为 nil")
+	if err := ks.SaveIdentity(aid, map[string]any{
+		"aid":           aid,
+		"access_token":  "tok-new",
+		"refresh_token": "rt-new",
+	}); err != nil {
+		t.Fatalf("SaveIdentity 失败: %v", err)
+	}
+
+	loaded, err := ks.LoadMetadata(aid)
+	if err != nil {
+		t.Fatalf("LoadMetadata 失败: %v", err)
+	}
+	prekeys, _ := loaded["e2ee_prekeys"].(map[string]any)
+	if loaded["access_token"] != "tok-new" {
+		t.Fatalf("access_token 未更新: %v", loaded["access_token"])
+	}
+	pk1, _ := prekeys["pk1"].(map[string]any)
+	if pk1["private_key_pem"] != "KEEP_ME" {
+		t.Fatalf("prekey 被覆盖: %v", pk1["private_key_pem"])
 	}
 }
 
@@ -387,6 +512,139 @@ func TestGroupSecretPersistence(t *testing.T) {
 	}
 }
 
+func TestStructuredPrekeysPrimaryAndRecoverUnexpiredMeta(t *testing.T) {
+	dir := t.TempDir()
+	ks, root := testNewFileKeyStoreWithSQLiteAndDir(t, dir)
+	aid := "structured-prekeys.example"
+
+	nowMs := time.Now().UnixMilli()
+	testSeedMetaOnly(t, root, aid, map[string]any{
+		"e2ee_prekeys": map[string]any{
+			"pk-recover": map[string]any{
+				"private_key_pem": "META_RECOVER",
+				"created_at":      nowMs,
+				"updated_at":      nowMs,
+				"expires_at":      nowMs + int64(time.Minute/time.Millisecond),
+			},
+			"pk-expired": map[string]any{
+				"private_key_pem": "META_EXPIRED",
+				"created_at":      nowMs - int64(8*24*time.Hour/time.Millisecond),
+				"updated_at":      nowMs - int64(8*24*time.Hour/time.Millisecond),
+				"expires_at":      nowMs - 1,
+			},
+		},
+	})
+
+	if err := ks.SaveE2EEPrekey(aid, "pk-sql", map[string]any{
+		"private_key_pem": "SQLITE_SQL",
+		"created_at":      nowMs,
+	}); err != nil {
+		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
+	}
+
+	loaded, err := ks.LoadMetadata(aid)
+	if err != nil {
+		t.Fatalf("LoadMetadata 失败: %v", err)
+	}
+	prekeys, _ := loaded["e2ee_prekeys"].(map[string]any)
+	if _, ok := prekeys["pk-sql"]; !ok {
+		t.Fatal("缺少 sqlite 主存 prekey")
+	}
+	if _, ok := prekeys["pk-recover"]; !ok {
+		t.Fatal("缺少从 meta 回捞的未过期 prekey")
+	}
+	if _, ok := prekeys["pk-expired"]; ok {
+		t.Fatal("过期 prekey 不应被回捞")
+	}
+}
+
+func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
+	ks := testNewFileKeyStoreWithSQLite(t)
+	aid := "structured-prekeys-preserve.example"
+	nowMs := time.Now().UnixMilli()
+
+	if err := ks.SaveMetadata(aid, map[string]any{
+		"e2ee_prekeys": map[string]any{
+			"pk-meta": map[string]any{
+				"private_key_pem": "META_ONLY",
+				"created_at":      nowMs,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveMetadata 失败: %v", err)
+	}
+
+	if err := ks.SaveE2EEPrekey(aid, "pk-new", map[string]any{
+		"private_key_pem": "NEW_ONE",
+		"created_at":      nowMs,
+	}); err != nil {
+		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
+	}
+
+	prekeys, err := ks.LoadE2EEPrekeys(aid)
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
+	}
+	if prekeys["pk-meta"]["private_key_pem"] != "META_ONLY" {
+		t.Fatalf("meta-only prekey 被覆盖: %v", prekeys["pk-meta"]["private_key_pem"])
+	}
+	if prekeys["pk-new"]["private_key_pem"] != "NEW_ONE" {
+		t.Fatalf("新 prekey 未写入: %v", prekeys["pk-new"]["private_key_pem"])
+	}
+}
+
+func TestStructuredGroupSecretsPrimaryAndRecoverMetaEpochs(t *testing.T) {
+	dir := t.TempDir()
+	ks, root := testNewFileKeyStoreWithSQLiteAndDir(t, dir)
+	aid := "structured-group.example"
+	nowMs := time.Now().UnixMilli()
+
+	testSeedMetaOnly(t, root, aid, map[string]any{
+		"group_secrets": map[string]any{
+			"grp-1": map[string]any{
+				"epoch":       2,
+				"secret":      "META_CURRENT",
+				"updated_at":  nowMs,
+				"expires_at":  nowMs + int64(time.Minute/time.Millisecond),
+				"member_aids": []any{"alice"},
+				"old_epochs": []any{
+					map[string]any{
+						"epoch":      1,
+						"secret":     "META_OLD",
+						"updated_at": nowMs,
+						"expires_at": nowMs + int64(time.Minute/time.Millisecond),
+					},
+				},
+			},
+		},
+	})
+
+	backup := keystore.NewSQLiteBackup(filepath.Join(root, ".aun_backup", "aun_backup.db"))
+	t.Cleanup(func() {
+		backup.Close()
+	})
+	backup.ReplaceGroupEntries(aid, map[string]map[string]any{
+		"grp-1": {
+			"epoch":       3,
+			"secret":      "SQLITE_CURRENT",
+			"updated_at":  nowMs + 1000,
+			"member_aids": []any{"alice", "bob"},
+		},
+	})
+
+	loaded, err := ks.LoadGroupSecretState(aid, "grp-1")
+	if err != nil {
+		t.Fatalf("LoadGroupSecretState 失败: %v", err)
+	}
+	if int(toInt64(loaded["epoch"])) != 3 {
+		t.Fatalf("当前 epoch 应为 3，实际: %v", loaded["epoch"])
+	}
+	oldEpochs, _ := loaded["old_epochs"].([]any)
+	if len(oldEpochs) != 2 {
+		t.Fatalf("应保留两个 old epoch，实际: %d", len(oldEpochs))
+	}
+}
+
 // ── Metadata 合并保护测试 ────────────────────────────────
 
 // TestMetadataCriticalFieldsMerge 验证关键 metadata 字段不被覆盖
@@ -445,15 +703,6 @@ func TestFileKeyStore_LoadNonExistent(t *testing.T) {
 	}
 	if meta != nil {
 		t.Error("加载不存在的元数据应返回 nil")
-	}
-}
-
-// TestFileKeyStore_DeleteNonExistent 验证删除不存在的 AID 不报错
-func TestFileKeyStore_DeleteNonExistent(t *testing.T) {
-	ks := testNewFileKeyStore(t)
-	err := ks.DeleteIdentity("nonexistent.example")
-	if err != nil {
-		t.Errorf("删除不存在的身份不应报错: %v", err)
 	}
 }
 

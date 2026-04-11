@@ -37,7 +37,22 @@ function pemToArrayBuffer(pem: string): ArrayBuffer {
     .replace(/-----END [^-]+-----/, '')
     .replace(/\s/g, '');
   const bytes = base64ToUint8(b64);
-  return bytes.buffer;
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function toArrayBuffer(bytes: Uint8Array | ArrayBuffer | ArrayBufferLike): ArrayBuffer {
+  if (bytes instanceof ArrayBuffer) {
+    return bytes.slice(0);
+  }
+  const cloned = Uint8Array.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  return cloned.buffer.slice(cloned.byteOffset, cloned.byteOffset + cloned.byteLength) as ArrayBuffer;
+}
+
+function toBufferSource(bytes: Uint8Array | ArrayBuffer | ArrayBufferLike): BufferSource {
+  if (bytes instanceof ArrayBuffer) {
+    return bytes.slice(0);
+  }
+  return Uint8Array.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
 }
 
 /** 密码学提供者 — 使用浏览器 SubtleCrypto 实现 P-256 ECDSA */
@@ -157,4 +172,4 @@ function trimLeadingZeros(bytes: Uint8Array): Uint8Array {
 }
 
 // 导出工具函数，供其他模块使用
-export { uint8ToBase64, base64ToUint8, arrayBufferToPem, pemToArrayBuffer, p1363ToDer };
+export { uint8ToBase64, base64ToUint8, arrayBufferToPem, pemToArrayBuffer, p1363ToDer, toArrayBuffer, toBufferSource };

@@ -1,7 +1,8 @@
 // ── IndexedDB SecretStore 实现 ──────────────────────────
 
 import type { SecretStore } from './index.js';
-import { uint8ToBase64, base64ToUint8 } from '../crypto.js';
+import { uint8ToBase64, base64ToUint8, toBufferSource } from '../crypto.js';
+import type { SecretRecord } from '../types.js';
 
 const SECRET_DB_NAME = 'aun-secret-store';
 const SECRET_DB_VERSION = 1;
@@ -27,7 +28,7 @@ function openSecretDB(): Promise<IDBDatabase> {
 }
 
 /** 读取 */
-async function secretGet(storeName: string, key: string): Promise<unknown> {
+async function secretGet(storeName: string, key: string): Promise<string | SecretRecord | null> {
   const db = await openSecretDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readonly');
@@ -40,25 +41,12 @@ async function secretGet(storeName: string, key: string): Promise<unknown> {
 }
 
 /** 写入 */
-async function secretPut(storeName: string, key: string, value: unknown): Promise<void> {
+async function secretPut(storeName: string, key: string, value: string | SecretRecord): Promise<void> {
   const db = await openSecretDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readwrite');
     const store = tx.objectStore(storeName);
     const req = store.put(value, key);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-    tx.oncomplete = () => db.close();
-  });
-}
-
-/** 删除 */
-async function secretDelete(storeName: string, key: string): Promise<void> {
-  const db = await openSecretDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readwrite');
-    const store = tx.objectStore(storeName);
-    const req = store.delete(key);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
     tx.oncomplete = () => db.close();
@@ -111,7 +99,7 @@ export class IndexedDBSecretStore implements SecretStore {
     const encoder = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
       'raw',
-      encoder.encode(seed),
+      toBufferSource(encoder.encode(seed)),
       'PBKDF2',
       false,
       ['deriveKey'],
@@ -120,7 +108,7 @@ export class IndexedDBSecretStore implements SecretStore {
     return crypto.subtle.deriveKey(
       {
         name: 'PBKDF2',
-        salt: encoder.encode('aun-secret-store-salt'),
+        salt: toBufferSource(encoder.encode('aun-secret-store-salt')),
         iterations: 100000,
         hash: 'SHA-256',
       },
@@ -136,15 +124,15 @@ export class IndexedDBSecretStore implements SecretStore {
     scope: string,
     name: string,
     plaintext: Uint8Array,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<SecretRecord> {
     const masterKey = await this._getMasterKey();
     const iv = new Uint8Array(12);
     crypto.getRandomValues(iv);
 
     const ciphertext = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
+      { name: 'AES-GCM', iv: toBufferSource(iv) },
       masterKey,
-      plaintext,
+      toBufferSource(plaintext),
     );
 
     const record = {
@@ -165,7 +153,7 @@ export class IndexedDBSecretStore implements SecretStore {
   async reveal(
     scope: string,
     name: string,
-    record: Record<string, unknown>,
+    record: SecretRecord,
   ): Promise<Uint8Array | null> {
     if (record.scheme !== 'indexeddb_aes_gcm') return null;
     if (String(record.name ?? '') !== name) return null;
@@ -180,20 +168,14 @@ export class IndexedDBSecretStore implements SecretStore {
       const ciphertext = base64ToUint8(ctB64);
 
       const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv },
+        { name: 'AES-GCM', iv: toBufferSource(iv) },
         masterKey,
-        ciphertext,
+        toBufferSource(ciphertext),
       );
 
       return new Uint8Array(plaintext);
     } catch {
       return null;
     }
-  }
-
-  /** 清除 */
-  async clear(scope: string, name: string): Promise<void> {
-    const storeKey = `${scope}:${name}`;
-    await secretDelete(STORE_SECRETS, storeKey);
   }
 }

@@ -45,9 +45,6 @@ class DPAPISecretStore:
             return None
         return self._unprotect_bytes(base64.b64decode(blob_b64), self._entropy(scope, name))
 
-    def clear(self, scope: str, name: str) -> None:
-        return
-
     def _protect_bytes(self, plaintext: bytes, entropy: bytes) -> bytes:
         in_blob, in_buffer = self._make_blob(plaintext)
         entropy_blob, entropy_buffer = self._make_blob(entropy)

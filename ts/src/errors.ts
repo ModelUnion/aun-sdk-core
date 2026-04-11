@@ -4,13 +4,15 @@
  * 与 Python SDK 完全对齐，覆盖所有错误类型和远程错误映射逻辑。
  */
 
+import { isJsonObject, type JsonValue, type RpcErrorObject } from './types.js';
+
 // ── 基础错误 ──────────────────────────────────────────────────
 
 export class AUNError extends Error {
   /** JSON-RPC 错误码 */
   readonly code: number;
   /** 附加数据 */
-  readonly data: unknown;
+  readonly data: JsonValue | null;
   /** 是否可重试 */
   readonly retryable: boolean;
   /** 链路追踪 ID */
@@ -20,7 +22,7 @@ export class AUNError extends Error {
     message: string,
     opts: {
       code?: number;
-      data?: unknown;
+      data?: JsonValue | null;
       retryable?: boolean;
       traceId?: string;
     } = {},
@@ -28,7 +30,7 @@ export class AUNError extends Error {
     super(message);
     this.name = 'AUNError';
     this.code = opts.code ?? -1;
-    this.data = opts.data;
+    this.data = opts.data ?? null;
     this.retryable = opts.retryable ?? false;
     this.traceId = opts.traceId;
   }
@@ -234,14 +236,14 @@ export class ClientSignatureError extends ValidationError {
  * 将 JSON-RPC error 对象映射为具体的 AUNError 子类。
  * 与 Python SDK 的 map_remote_error 逻辑完全一致。
  */
-export function mapRemoteError(error: { code?: number; message?: string; data?: unknown }): AUNError {
+export function mapRemoteError(error: RpcErrorObject): AUNError {
   const code = Number(error.code ?? -32603);
   const message = String(error.message ?? 'remote error');
-  const data = error.data;
+  const data = error.data ?? null;
 
   let traceId: string | undefined;
-  if (data && typeof data === 'object' && !Array.isArray(data)) {
-    const d = data as Record<string, unknown>;
+  if (isJsonObject(data)) {
+    const d = data;
     traceId = (d.trace_id ?? d.traceId) as string | undefined;
   }
 

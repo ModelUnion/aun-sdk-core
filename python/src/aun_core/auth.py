@@ -90,8 +90,12 @@ class AuthFlow:
         return None
 
     async def create_aid(self, gateway_url: str, aid: str) -> dict[str, Any]:
+        self._validate_aid_name(aid)
         identity = self._ensure_local_identity(aid)
         if identity.get("cert"):
+            identity = await self._sync_existing_identity_cert(gateway_url, identity)
+            self._keystore.save_identity(identity["aid"], identity)
+            self._aid = identity["aid"]
             return {"aid": identity["aid"], "cert": identity["cert"]}
 
         # 本地有密钥但无证书 — 可能是上次 create_aid 网络失败后的残留状态，
@@ -117,11 +121,32 @@ class AuthFlow:
         self._aid = identity["aid"]
         return {"aid": identity["aid"], "cert": identity["cert"]}
 
+    async def _sync_existing_identity_cert(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
+        """本地已有 cert 时，校准服务端登记状态并必要时补签恢复。"""
+        cert_pem = await self._download_registered_cert(gateway_url, identity["aid"])
+        if cert_pem is None:
+            created = await self._create_aid(gateway_url, identity)
+            identity["cert"] = created["cert"]
+            return identity
+
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        cert_pub_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        local_pub_der = base64.b64decode(identity["public_key_der_b64"])
+        if cert_pub_der != local_pub_der:
+            raise StateError(
+                f"local identity key does not match server certificate for {identity['aid']}. "
+                f"This is a dirty data conflict and must be repaired manually."
+            )
+        identity["cert"] = cert_pem
+        return identity
+
     async def _recover_cert_via_download(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
         """本地有密钥但无证书、服务端已注册 — 通过 PKI HTTP 端点下载证书恢复。"""
-        cert_url = self._gateway_http_url(gateway_url, f"/pki/cert/{identity['aid']}")
-        cert_pem = await self._fetch_text(cert_url)
-        if not cert_pem or "BEGIN CERTIFICATE" not in cert_pem:
+        cert_pem = await self._download_registered_cert(gateway_url, identity["aid"])
+        if not cert_pem:
             raise AuthError(f"failed to download certificate for {identity['aid']}")
 
         # 验证下载的证书公钥与本地密钥对匹配
@@ -139,6 +164,25 @@ class AuthFlow:
 
         identity["cert"] = cert_pem
         return identity
+
+    async def _download_registered_cert(self, gateway_url: str, aid: str) -> str | None:
+        """下载服务端当前登记的证书；404 视为未登记，其它错误抛异常。"""
+        cert_url = self._gateway_http_url(gateway_url, f"/pki/cert/{aid}")
+        try:
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            ssl_param = None if self._verify_ssl else False
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(cert_url, ssl=ssl_param) as response:
+                    if response.status == 404:
+                        return None
+                    response.raise_for_status()
+                    cert_pem = await response.text()
+        except Exception as exc:
+            raise AuthError(f"failed to fetch {cert_url}") from exc
+
+        if "BEGIN CERTIFICATE" not in cert_pem:
+            raise AuthError(f"invalid certificate payload from {cert_url}")
+        return cert_pem
 
     async def authenticate(self, gateway_url: str, *, aid: str | None = None) -> dict[str, Any]:
         identity = self._load_identity_or_raise(aid)
@@ -819,6 +863,22 @@ class AuthFlow:
         self._keystore.save_identity(aid, identity)  # 立即持久化 keypair，避免服务端拒绝后丢失
         self._aid = aid
         return identity
+
+    # AID name 验证正则：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
+    import re as _re
+    _AID_NAME_RE = _re.compile(r'^[a-z0-9_][a-z0-9_-]{3,63}$')
+
+    @staticmethod
+    def _validate_aid_name(aid: str) -> None:
+        """验证 AID name 部分是否符合协议规范（4-64 字符）"""
+        name = aid.split(".")[0] if "." in aid else aid
+        if not AuthFlow._AID_NAME_RE.match(name):
+            raise ValidationError(
+                f"Invalid AID name '{name}': must be 4-64 characters, "
+                f"only [a-z0-9_-], cannot start with '-'"
+            )
+        if name.startswith("guest"):
+            raise ValidationError("AID name must not start with 'guest'")
 
     def _load_identity_or_raise(self, aid: str | None = None) -> dict[str, Any]:
         requested_aid = aid or self._aid

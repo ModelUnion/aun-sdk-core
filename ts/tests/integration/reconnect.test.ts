@@ -11,6 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
 import { AUNClient } from '../../src/index.js';
+import type { JsonObject, Message } from '../../src/types.js';
 
 const DOCKER_COMPOSE_DIR = path.resolve(__dirname, '../../../../docker-deploy');
 
@@ -92,7 +93,7 @@ describe('断线重连集成测试', () => {
     expect(reconnected).toBe(true);
 
     // 验证重连后功能正常
-    const result = await client.call('meta.ping') as Record<string, unknown>;
+    const result = await client.call('meta.ping') as JsonObject;
     expect(result).toBeTruthy();
   }, 120000);
 
@@ -134,13 +135,13 @@ describe('断线重连集成测试', () => {
     // 重连后发消息
     const result = await alice.call('message.send', {
       to: bAid, payload: { text: '重连后消息' }, encrypt: false,
-    }) as Record<string, unknown>;
+    }) as JsonObject;
     expect(result.message_id).toBeTruthy();
 
     // Bob 拉取
     await sleep(1000);
-    const pull = await bob.call('message.pull', { after_seq: 0, limit: 10 }) as Record<string, unknown>;
-    const msgs = (pull.messages ?? []) as Record<string, unknown>[];
+    const pull = await bob.call('message.pull', { after_seq: 0, limit: 10 }) as JsonObject;
+    const msgs = (pull.messages ?? []) as Message[];
     expect(msgs.length).toBeGreaterThan(0);
   }, 120000);
 

@@ -246,7 +246,7 @@ func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[
 // Decrypt 解密单条群组消息
 // 内置防重放 + 发送方验签 + 外层字段校验
 // 非加密消息原样返回，解密失败返回 nil
-func (m *GroupE2EEManager) Decrypt(message map[string]any) (map[string]any, error) {
+func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map[string]any, error) {
 	payload, ok := message["payload"].(map[string]any)
 	if !ok {
 		return message, nil
@@ -272,7 +272,7 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any) (map[string]any, erro
 	if msgID == "" {
 		msgID, _ = message["message_id"].(string)
 	}
-	if groupID != "" && sender != "" && msgID != "" {
+	if !skipReplay && groupID != "" && sender != "" && msgID != "" {
 		if m.replayGuard.IsSeen(groupID, sender, msgID) {
 			return message, nil // 已处理过，原样返回
 		}
@@ -297,7 +297,7 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any) (map[string]any, erro
 	}
 
 	result := DecryptGroupMessage(allSecrets, message, senderCertPEM, true)
-	if result != nil {
+	if result != nil && !skipReplay {
 		// 解密成功后记录防重放
 		finalMsgID := aadMsgID
 		if finalMsgID == "" {
@@ -311,10 +311,10 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any) (map[string]any, erro
 }
 
 // DecryptBatch 批量解密群组消息
-func (m *GroupE2EEManager) DecryptBatch(messages []map[string]any) []map[string]any {
+func (m *GroupE2EEManager) DecryptBatch(messages []map[string]any, skipReplay bool) []map[string]any {
 	results := make([]map[string]any, len(messages))
 	for i, msg := range messages {
-		decrypted, _ := m.Decrypt(msg)
+		decrypted, _ := m.Decrypt(msg, skipReplay)
 		if decrypted != nil {
 			results[i] = decrypted
 		} else {

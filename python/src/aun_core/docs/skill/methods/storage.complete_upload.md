@@ -45,7 +45,7 @@ result = await client.call("storage.complete_upload", {
     "content_type": "application/pdf",
     "sha256": "e3b0c44298fc1c149afbf4c8996fb924...",
     "version": 1,
-    "etag": "\"abc123\"",
+    "etag": "abc123",
     "updated_at": 1711234567890
 }
 ```
@@ -61,6 +61,11 @@ result = await client.call("storage.complete_upload", {
 | `version` | integer | 版本号 |
 | `etag` | string | 实体标签 |
 | `updated_at` | integer | 更新时间戳（毫秒） |
+
+## 当前实现说明
+
+- `storage.complete_upload` 当前只负责校验已上传 blob 并写入元数据
+- 当前实现不会自动发布 `event/storage.object_changed`
 
 ## 相关方法
 

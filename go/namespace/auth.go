@@ -2,9 +2,14 @@ package namespace
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,7 +36,9 @@ type ClientInterface interface {
 // 封装 AID 创建、认证、证书管理等操作。
 // 与 Python SDK namespaces/auth_namespace.py 对应。
 type AuthNamespace struct {
-	client ClientInterface
+	client         ClientInterface
+	httpClientOnce sync.Once
+	httpClient     *http.Client
 }
 
 // NewAuthNamespace 创建认证命名空间
@@ -139,6 +146,206 @@ func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any)
 	a.client.SetIdentity(identity)
 
 	return result, nil
+}
+
+func agentMDSchemeFromGateway(gatewayURL string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(gatewayURL)), "ws://") {
+		return "http"
+	}
+	return "https"
+}
+
+func agentMDAuthority(aid string, discoveryPort int) string {
+	host := strings.TrimSpace(aid)
+	if host == "" {
+		return ""
+	}
+	if discoveryPort > 0 && !strings.Contains(host, ":") {
+		return fmt.Sprintf("%s:%d", host, discoveryPort)
+	}
+	return host
+}
+
+func authAccessTokenExpiryUnix(identity map[string]any) int64 {
+	if identity == nil {
+		return 0
+	}
+	switch v := identity["access_token_expires_at"].(type) {
+	case int:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case int64:
+		return v
+	case float32:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
+func authUsableAccessToken(identity map[string]any) string {
+	if identity == nil {
+		return ""
+	}
+	token, _ := identity["access_token"].(string)
+	if token == "" {
+		return ""
+	}
+	expiresAt := authAccessTokenExpiryUnix(identity)
+	if expiresAt > 0 && time.Now().Unix()+30 >= expiresAt {
+		return ""
+	}
+	return token
+}
+
+func (a *AuthNamespace) resolveAgentMDURL(ctx context.Context, aid string) string {
+	gatewayURL := a.client.GetGatewayURL()
+	if gatewayURL == "" {
+		if resolved, err := a.resolveGateway(ctx, aid); err == nil {
+			gatewayURL = resolved
+		}
+	}
+	authority := agentMDAuthority(aid, a.client.GetConfigDiscoveryPort())
+	return fmt.Sprintf("%s://%s/agent.md", agentMDSchemeFromGateway(gatewayURL), authority)
+}
+
+func (a *AuthNamespace) agentMDHTTPClient() *http.Client {
+	a.httpClientOnce.Do(func() {
+		transport := &http.Transport{
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
+		}
+		if !a.client.GetConfigVerifySSL() {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		a.httpClient = &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: transport,
+		}
+	})
+	return a.httpClient
+}
+
+func (a *AuthNamespace) ensureAgentMDUploadToken(ctx context.Context, aid string) (string, error) {
+	identity := a.client.AuthLoadIdentityOrNil(aid)
+	if identity == nil {
+		return "", fmt.Errorf("no local identity found, call auth.create_aid() first")
+	}
+	if token := authUsableAccessToken(identity); token != "" {
+		return token, nil
+	}
+
+	result, err := a.Authenticate(ctx, map[string]any{"aid": aid})
+	if err != nil {
+		return "", err
+	}
+	token, _ := result["access_token"].(string)
+	if token == "" {
+		return "", fmt.Errorf("authenticate did not return access_token")
+	}
+	return token, nil
+}
+
+// UploadAgentMD 上传当前身份的 agent.md 文档。
+func (a *AuthNamespace) UploadAgentMD(ctx context.Context, content string) (map[string]any, error) {
+	aid := strings.TrimSpace(a.client.GetAID())
+	identity := a.client.AuthLoadIdentityOrNil(aid)
+	if identity == nil {
+		return nil, fmt.Errorf("no local identity found, call auth.create_aid() first")
+	}
+	if aid == "" {
+		if identityAID, ok := identity["aid"].(string); ok {
+			aid = strings.TrimSpace(identityAID)
+		}
+	}
+	if aid == "" {
+		return nil, fmt.Errorf("no local identity found, call auth.create_aid() first")
+	}
+
+	gatewayURL, err := a.resolveGateway(ctx, aid)
+	if err != nil {
+		return nil, fmt.Errorf("auth.upload_agent_md gateway 发现失败: %w", err)
+	}
+	a.client.SetGatewayURL(gatewayURL)
+
+	token, err := a.ensureAgentMDUploadToken(ctx, aid)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, a.resolveAgentMDURL(ctx, aid), strings.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "text/markdown; charset=utf-8")
+
+	resp, err := a.agentMDHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("agent.md endpoint not found for aid: %s", aid)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(string(body))
+		if message != "" {
+			return nil, fmt.Errorf("upload agent.md failed: HTTP %d - %s", resp.StatusCode, message)
+		}
+		return nil, fmt.Errorf("upload agent.md failed: HTTP %d", resp.StatusCode)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("upload agent.md failed: invalid JSON response: %w", err)
+	}
+	return result, nil
+}
+
+// DownloadAgentMD 匿名下载指定 AID 的 agent.md 文档。
+func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (string, error) {
+	targetAID := strings.TrimSpace(aid)
+	if targetAID == "" {
+		return "", fmt.Errorf("download_agent_md requires non-empty aid")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.resolveAgentMDURL(ctx, targetAID), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "text/markdown")
+
+	resp, err := a.agentMDHTTPClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("agent.md not found for aid: %s", targetAID)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(string(body))
+		if message != "" {
+			return "", fmt.Errorf("download agent.md failed: HTTP %d - %s", resp.StatusCode, message)
+		}
+		return "", fmt.Errorf("download agent.md failed: HTTP %d", resp.StatusCode)
+	}
+	return string(body), nil
 }
 
 // DownloadCert 下载证书

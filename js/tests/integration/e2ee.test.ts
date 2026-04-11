@@ -41,14 +41,13 @@ describe('E2EE Integration (Browser)', () => {
     //   4. 验证解密后的 payload 与原文一致，且标记 encrypted: true
   });
 
-  it.skip('SDK long_term_key 回退 — 对方离线时使用长期密钥加密', async () => {
-    // 对应 Python test_sdk_long_term_fallback
+  it.skip('SDK 无 prekey 时直接报错', async () => {
+    // 对应当前 SDK 语义：无 prekey 时停止发送并报错
     //
     // 流程：
     //   1. Sender 连接，Receiver 仅创建 AID 但不连接（无 prekey）
-    //   2. Sender 发送加密消息，应自动回退到 long_term_key 模式
-    //   3. Receiver 后续连接后 pull 消息并解密
-    //   4. 验证 encryption_mode 为 'long_term_key'
+    //   2. Sender 发送加密消息，应直接报 peer prekey not found
+    //   3. 不再降级到 long_term_key
   });
 
   it.skip('SDK 双向加密消息 — Alice 和 Bob 互发消息', async () => {

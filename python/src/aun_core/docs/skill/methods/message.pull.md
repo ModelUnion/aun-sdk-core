@@ -2,6 +2,8 @@
 
 增量拉取当前 AID 的收件箱消息。基于 `after_seq` 游标实现多设备各自进度。
 
+Python SDK 在 `client.call("message.pull", ...)` 返回后，会自动尝试解密 `e2ee.encrypted` 消息；若本地缺少可用证书或解密失败，则保留原始消息结构返回。
+
 ## 调用示例
 
 ```python

@@ -5,7 +5,7 @@ import {
   E2EEError,
   E2EEGroupSecretMissingError,
 } from './errors.js';
-import { uint8ToBase64, base64ToUint8, pemToArrayBuffer } from './crypto.js';
+import { uint8ToBase64, base64ToUint8, pemToArrayBuffer, toBufferSource } from './crypto.js';
 import {
   SUITE,
   _concatBytes as concatBytes,
@@ -21,6 +21,16 @@ import {
   _importPrivateKeyEcdsa as importPrivateKeyEcdsa,
 } from './e2ee.js';
 import type { KeyStore } from './keystore/index.js';
+import { updateKeyStoreMetadata } from './keystore/update.js';
+import {
+  isJsonObject,
+  type GroupOldEpochRecord,
+  type GroupSecretMap,
+  type GroupSecretRecord,
+  type IdentityRecord,
+  type JsonObject,
+  type Message,
+} from './types.js';
 
 const _encoder = new TextEncoder();
 const _decoder = new TextDecoder();
@@ -43,15 +53,81 @@ export const AAD_MATCH_FIELDS_GROUP = [
 /** 旧 epoch 默认保留时间（秒） */
 export const OLD_EPOCH_RETENTION_SECONDS = 7 * 24 * 3600;
 
+async function loadKeyStoreGroupState(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+): Promise<GroupSecretRecord | null> {
+  if (typeof keystore.loadGroupSecretState === 'function') {
+    return await keystore.loadGroupSecretState(aid, groupId);
+  }
+  const metadata = (await keystore.loadMetadata(aid)) ?? {};
+  const groupSecrets = (metadata.group_secrets ?? {}) as GroupSecretMap;
+  return groupSecrets[groupId] ?? null;
+}
+
+async function loadAllKeyStoreGroupStates(
+  keystore: KeyStore,
+  aid: string,
+): Promise<GroupSecretMap> {
+  if (typeof keystore.loadAllGroupSecretStates === 'function') {
+    return (await keystore.loadAllGroupSecretStates(aid)) ?? {};
+  }
+  const metadata = (await keystore.loadMetadata(aid)) ?? {};
+  return (metadata.group_secrets ?? {}) as GroupSecretMap;
+}
+
+async function saveKeyStoreGroupState(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+  entry: GroupSecretRecord,
+): Promise<void> {
+  if (typeof keystore.saveGroupSecretState === 'function') {
+    await keystore.saveGroupSecretState(aid, groupId, entry);
+    return;
+  }
+  await updateKeyStoreMetadata(keystore, aid, metadata => {
+    const groupSecrets = (metadata.group_secrets ?? {}) as GroupSecretMap;
+    groupSecrets[groupId] = { ...entry };
+    metadata.group_secrets = groupSecrets;
+    return metadata;
+  });
+}
+
+async function cleanupKeyStoreGroupOldEpochs(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+  cutoffMs: number,
+): Promise<number> {
+  if (typeof keystore.cleanupGroupOldEpochsState === 'function') {
+    return await keystore.cleanupGroupOldEpochsState(aid, groupId, cutoffMs);
+  }
+  let removed = 0;
+  await updateKeyStoreMetadata(keystore, aid, metadata => {
+    const groupSecrets = (metadata.group_secrets ?? {}) as GroupSecretMap;
+    const entry = groupSecrets[groupId];
+    if (!entry) return metadata;
+    const oldEpochs = (entry.old_epochs ?? []) as GroupOldEpochRecord[];
+    if (!oldEpochs.length) return metadata;
+    const remaining = oldEpochs.filter((old) => Number(old.updated_at ?? 0) >= cutoffMs);
+    removed = oldEpochs.length - remaining.length;
+    if (removed > 0) entry.old_epochs = remaining;
+    return metadata;
+  });
+  return removed;
+}
+
 // ── 群组 AAD 工具 ────────────────────────────────────────────
 
 /** 群组 AAD 序列化（排序键、紧凑 JSON） */
-function aadBytesGroup(aad: Record<string, unknown>): Uint8Array {
-  const obj: Record<string, unknown> = {};
+function aadBytesGroup(aad: JsonObject): Uint8Array {
+  const obj: JsonObject = {};
   for (const field of AAD_FIELDS_GROUP) {
     obj[field] = aad[field] ?? null;
   }
-  const sorted: Record<string, unknown> = {};
+  const sorted: JsonObject = {};
   for (const key of Object.keys(obj).sort()) {
     sorted[key] = obj[key];
   }
@@ -59,7 +135,7 @@ function aadBytesGroup(aad: Record<string, unknown>): Uint8Array {
 }
 
 /** 群组 AAD 字段匹配检查 */
-function aadMatchesGroup(expected: Record<string, unknown>, actual: Record<string, unknown>): boolean {
+function aadMatchesGroup(expected: JsonObject, actual: JsonObject): boolean {
   for (const f of AAD_MATCH_FIELDS_GROUP) {
     if (JSON.stringify(expected[f] ?? null) !== JSON.stringify(actual[f] ?? null)) {
       return false;
@@ -88,19 +164,19 @@ export async function encryptGroupMessage(
   groupId: string,
   epoch: number,
   groupSecret: Uint8Array,
-  payload: Record<string, unknown>,
+  payload: JsonObject,
   opts: {
     fromAid: string;
     messageId: string;
     timestamp: number;
     senderPrivateKeyPem?: string | null;
   },
-): Promise<Record<string, unknown>> {
+): Promise<JsonObject> {
   const msgKey = await deriveGroupMsgKey(groupSecret, groupId, opts.messageId);
   const plaintext = _encoder.encode(JSON.stringify(payload));
   const nonce = randomNonce();
 
-  const aad: Record<string, unknown> = {
+  const aad: JsonObject = {
     group_id: groupId,
     from: opts.fromAid,
     message_id: opts.messageId,
@@ -112,7 +188,7 @@ export async function encryptGroupMessage(
   const aadBytes = aadBytesGroup(aad);
   const [ciphertext, tag] = await aesGcmEncrypt(msgKey, nonce, plaintext, aadBytes);
 
-  const envelope: Record<string, unknown> = {
+  const envelope: JsonObject = {
     type: 'e2ee.group_encrypted',
     version: '1',
     encryption_mode: MODE_EPOCH_GROUP_KEY,
@@ -157,14 +233,14 @@ export async function encryptGroupMessage(
  * requireSignature: 为 true 时（默认），若消息缺少签名或无证书可验证则拒绝（零信任模式）。
  */
 export async function decryptGroupMessage(
-  message: Record<string, unknown>,
+  message: Message,
   groupSecrets: Map<number, Uint8Array>,
   senderCertPem?: string | null,
   opts?: { requireSignature?: boolean },
-): Promise<Record<string, unknown> | null> {
+): Promise<Message | null> {
   const requireSignature = opts?.requireSignature ?? true;
-  const payload = message.payload as Record<string, unknown> | undefined;
-  if (!payload || typeof payload !== 'object') return null;
+  const payload = isJsonObject(message.payload) ? message.payload : null;
+  if (payload === null) return null;
   if (payload.type !== 'e2ee.group_encrypted') return null;
 
   const epoch = payload.epoch as number | undefined;
@@ -178,13 +254,13 @@ export async function decryptGroupMessage(
 
   try {
     // 优先从 AAD 读取 group_id 和 message_id（SDK 加密时的原始值）
-    const aad = payload.aad as Record<string, unknown> | undefined;
+    const aad = isJsonObject(payload.aad) ? payload.aad : undefined;
     const outerGroupId = (message.group_id ?? '') as string;
     let groupId: string;
     let messageId: string;
     let aadFrom = '';
 
-    if (aad && typeof aad === 'object') {
+    if (aad) {
       groupId = (aad.group_id ?? outerGroupId) as string;
       messageId = (aad.message_id ?? message.message_id ?? '') as string;
       aadFrom = (aad.from ?? '') as string;
@@ -227,7 +303,7 @@ export async function decryptGroupMessage(
     const plaintext = await aesGcmDecrypt(msgKey, nonce, ciphertext, tag, aadBytes);
     const decoded = JSON.parse(_decoder.decode(plaintext));
 
-    const result: Record<string, unknown> = {
+    const result: Message = {
       ...message,
       payload: decoded,
       encrypted: true,
@@ -258,7 +334,7 @@ export async function decryptGroupMessage(
         console.warn(`群消息发送方签名验证失败: group=${groupId} from=${aadFrom}`);
         return null;
       }
-      (result.e2ee as Record<string, unknown>).sender_verified = true;
+      if (isJsonObject(result.e2ee)) result.e2ee.sender_verified = true;
     } else if (senderCertPem) {
       // 非零信任模式但提供了证书：有证书时强制验签
       if (!senderSigB64) {
@@ -270,7 +346,7 @@ export async function decryptGroupMessage(
         console.warn(`群消息发送方签名验证失败: group=${groupId} from=${aadFrom}`);
         return null;
       }
-      (result.e2ee as Record<string, unknown>).sender_verified = true;
+      if (isJsonObject(result.e2ee)) result.e2ee.sender_verified = true;
     }
 
     return result;
@@ -311,7 +387,7 @@ export function buildMembershipManifest(
     removed?: string[];
     initiatorAid?: string;
   },
-): Record<string, unknown> {
+): JsonObject {
   return {
     manifest_version: 1,
     group_id: groupId,
@@ -326,7 +402,7 @@ export function buildMembershipManifest(
 }
 
 /** 序列化 manifest 为签名输入 */
-function manifestSignData(manifest: Record<string, unknown>): Uint8Array {
+function manifestSignData(manifest: JsonObject): Uint8Array {
   const fields = [
     String(manifest.manifest_version ?? 1),
     (manifest.group_id ?? '') as string,
@@ -343,9 +419,9 @@ function manifestSignData(manifest: Record<string, unknown>): Uint8Array {
 
 /** 对 Membership Manifest 签名（异步），返回带 signature 字段的新 manifest */
 export async function signMembershipManifest(
-  manifest: Record<string, unknown>,
+  manifest: JsonObject,
   privateKeyPem: string,
-): Promise<Record<string, unknown>> {
+): Promise<JsonObject> {
   const signKey = await importPrivateKeyEcdsa(privateKeyPem);
   const data = manifestSignData(manifest);
   const sig = await ecdsaSignDer(signKey, data);
@@ -354,7 +430,7 @@ export async function signMembershipManifest(
 
 /** 验证 Membership Manifest 签名（异步） */
 export async function verifyMembershipManifest(
-  manifest: Record<string, unknown>,
+  manifest: JsonObject,
   initiatorCertPem: string,
 ): Promise<boolean> {
   const sigB64 = manifest.signature as string | undefined;
@@ -380,10 +456,10 @@ export async function computeMembershipCommitment(
 ): Promise<string> {
   const sortedAids = [...memberAids].sort();
   // SHA-256(group_secret)
-  const secretHash = await crypto.subtle.digest('SHA-256', groupSecret);
+  const secretHash = await crypto.subtle.digest('SHA-256', toBufferSource(groupSecret));
   const secretHex = Array.from(new Uint8Array(secretHash)).map(b => b.toString(16).padStart(2, '0')).join('');
   const data = sortedAids.join('|') + '|' + epoch + '|' + groupId + '|' + secretHex;
-  const digest = await crypto.subtle.digest('SHA-256', _encoder.encode(data));
+  const digest = await crypto.subtle.digest('SHA-256', toBufferSource(_encoder.encode(data)));
   return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -419,43 +495,35 @@ export async function storeGroupSecret(
   commitment: string,
   memberAids: string[],
 ): Promise<boolean> {
-  const metadata = (await keystore.loadMetadata(aid)) ?? {};
-  const groupSecrets = (metadata.group_secrets ?? {}) as Record<string, Record<string, unknown>>;
-  const existing = groupSecrets[groupId] as Record<string, unknown> | undefined;
-
-  // epoch 降级防护
-  if (existing && existing.epoch !== undefined && existing.epoch !== null) {
-    if (epoch < (existing.epoch as number)) return false;
+  const existing = await loadKeyStoreGroupState(keystore, aid, groupId);
+  if (existing && existing.epoch !== undefined && existing.epoch !== null && epoch < (existing.epoch as number)) {
+    return false;
   }
 
-  // 旧 epoch 移入 old_epochs
+  const current = existing ? { ...existing } : {};
   if (existing && existing.epoch !== epoch) {
-    const oldEpochs = (existing.old_epochs ?? []) as Record<string, unknown>[];
-    const oldEntry: Record<string, unknown> = {
+    const oldEpochs = (existing.old_epochs ?? []) as GroupOldEpochRecord[];
+    const oldEntry: GroupOldEpochRecord = {
       epoch: existing.epoch,
       secret: existing.secret,
       commitment: existing.commitment,
       member_aids: existing.member_aids,
-      updated_at: existing.updated_at,
+      updated_at: typeof existing.updated_at === 'number' ? existing.updated_at : undefined,
     };
     if ('secret_protection' in existing) {
       oldEntry.secret_protection = existing.secret_protection;
     }
-    oldEpochs.push(oldEntry);
-    existing.old_epochs = oldEpochs;
+    current.old_epochs = [...oldEpochs, oldEntry];
   }
 
-  const nowMs = Date.now();
-  groupSecrets[groupId] = {
+  await saveKeyStoreGroupState(keystore, aid, groupId, {
     epoch,
     secret: uint8ToBase64(groupSecret),
     commitment,
     member_aids: [...memberAids].sort(),
-    updated_at: nowMs,
-    old_epochs: (existing ?? {}).old_epochs ?? [],
-  };
-  metadata.group_secrets = groupSecrets;
-  await keystore.saveMetadata(aid, metadata);
+    updated_at: Date.now(),
+    old_epochs: (current.old_epochs as GroupOldEpochRecord[] | undefined) ?? [],
+  });
   return true;
 }
 
@@ -466,9 +534,7 @@ export async function loadGroupSecret(
   groupId: string,
   epoch?: number | null,
 ): Promise<{ epoch: number; secret: Uint8Array; commitment: string; member_aids: string[] } | null> {
-  const metadata = (await keystore.loadMetadata(aid)) ?? {};
-  const groupSecrets = (metadata.group_secrets ?? {}) as Record<string, Record<string, unknown>>;
-  const entry = groupSecrets[groupId] as Record<string, unknown> | undefined;
+  const entry = await loadKeyStoreGroupState(keystore, aid, groupId) ?? undefined;
   if (!entry) return null;
 
   if (epoch === undefined || epoch === null || entry.epoch === epoch) {
@@ -483,7 +549,7 @@ export async function loadGroupSecret(
   }
 
   // 查 old_epochs
-  for (const old of (entry.old_epochs ?? []) as Record<string, unknown>[]) {
+  for (const old of (entry.old_epochs ?? []) as GroupOldEpochRecord[]) {
     if (old.epoch === epoch) {
       const secretStr = old.secret as string | undefined;
       if (!secretStr) return null;
@@ -504,9 +570,8 @@ export async function loadAllGroupSecrets(
   aid: string,
   groupId: string,
 ): Promise<Map<number, Uint8Array>> {
-  const metadata = (await keystore.loadMetadata(aid)) ?? {};
-  const groupSecrets = (metadata.group_secrets ?? {}) as Record<string, Record<string, unknown>>;
-  const entry = groupSecrets[groupId] as Record<string, unknown> | undefined;
+  const groupSecrets = await loadAllKeyStoreGroupStates(keystore, aid);
+  const entry = groupSecrets[groupId];
   if (!entry) return new Map();
 
   const result = new Map<number, Uint8Array>();
@@ -514,7 +579,7 @@ export async function loadAllGroupSecrets(
   if (secretStr && entry.epoch !== undefined && entry.epoch !== null) {
     result.set(entry.epoch as number, base64ToUint8(secretStr));
   }
-  for (const old of (entry.old_epochs ?? []) as Record<string, unknown>[]) {
+  for (const old of (entry.old_epochs ?? []) as GroupOldEpochRecord[]) {
     const oldSecret = old.secret as string | undefined;
     if (oldSecret && old.epoch !== undefined && old.epoch !== null) {
       result.set(old.epoch as number, base64ToUint8(oldSecret));
@@ -530,23 +595,8 @@ export async function cleanupOldEpochs(
   groupId: string,
   retentionSeconds: number = OLD_EPOCH_RETENTION_SECONDS,
 ): Promise<number> {
-  const metadata = (await keystore.loadMetadata(aid)) ?? {};
-  const groupSecrets = (metadata.group_secrets ?? {}) as Record<string, Record<string, unknown>>;
-  const entry = groupSecrets[groupId] as Record<string, unknown> | undefined;
-  if (!entry) return 0;
-
-  const oldEpochs = (entry.old_epochs ?? []) as Record<string, unknown>[];
-  if (!oldEpochs.length) return 0;
-
   const cutoffMs = Date.now() - retentionSeconds * 1000;
-  const remaining = oldEpochs.filter(e => ((e.updated_at as number) ?? 0) >= cutoffMs);
-  const removed = oldEpochs.length - remaining.length;
-
-  if (removed > 0) {
-    entry.old_epochs = remaining;
-    await keystore.saveMetadata(aid, metadata);
-  }
-  return removed;
+  return await cleanupKeyStoreGroupOldEpochs(keystore, aid, groupId, cutoffMs);
 }
 
 // ── Group Key 分发与恢复协议 ────────────────────────────────
@@ -565,10 +615,10 @@ export async function buildKeyDistribution(
   groupSecret: Uint8Array,
   memberAids: string[],
   distributedBy: string,
-  manifest?: Record<string, unknown> | null,
-): Promise<Record<string, unknown>> {
+  manifest?: JsonObject | null,
+): Promise<JsonObject> {
   const commitment = await computeMembershipCommitment(memberAids, epoch, groupId, groupSecret);
-  const result: Record<string, unknown> = {
+  const result: JsonObject = {
     type: 'e2ee.group_key_distribution',
     group_id: groupId,
     epoch,
@@ -584,12 +634,14 @@ export async function buildKeyDistribution(
 
 /** 处理收到的 group key 分发消息（异步） */
 export async function handleKeyDistribution(
-  message: Record<string, unknown>,
+  message: Message | JsonObject,
   keystore: KeyStore,
   aid: string,
   initiatorCertPem?: string | null,
 ): Promise<boolean> {
-  const payload = ('group_id' in message) ? message : (message.payload ?? message) as Record<string, unknown>;
+  const payload = 'group_id' in message
+    ? message
+    : (isJsonObject(message.payload) ? message.payload : message);
 
   const groupId = payload.group_id as string | undefined;
   const epoch = payload.epoch as number | undefined;
@@ -600,7 +652,7 @@ export async function handleKeyDistribution(
   if (!groupId || epoch === undefined || epoch === null || !groupSecretB64 || !commitment) return false;
 
   // 验证 Membership Manifest 签名
-  const manifest = payload.manifest as Record<string, unknown> | undefined;
+  const manifest = isJsonObject(payload.manifest) ? payload.manifest : undefined;
   if (initiatorCertPem) {
     if (!manifest) {
       console.warn(`拒绝无 manifest 的密钥分发: group=${groupId} epoch=${epoch}`);
@@ -632,7 +684,7 @@ export function buildKeyRequest(
   groupId: string,
   epoch: number,
   requesterAid: string,
-): Record<string, unknown> {
+): JsonObject {
   return {
     type: 'e2ee.group_key_request',
     group_id: groupId,
@@ -643,12 +695,14 @@ export function buildKeyRequest(
 
 /** 处理收到的密钥请求（异步） */
 export async function handleKeyRequest(
-  request: Record<string, unknown>,
+  request: Message | JsonObject,
   keystore: KeyStore,
   aid: string,
   currentMembers: string[],
-): Promise<Record<string, unknown> | null> {
-  const payload = ('group_id' in request) ? request : (request.payload ?? request) as Record<string, unknown>;
+): Promise<JsonObject | null> {
+  const payload = 'group_id' in request
+    ? request
+    : (isJsonObject(request.payload) ? request.payload : request);
 
   const requesterAid = payload.requester_aid as string | undefined;
   const groupId = payload.group_id as string | undefined;
@@ -680,11 +734,13 @@ export async function handleKeyRequest(
 
 /** 处理收到的密钥响应（异步） */
 export async function handleKeyResponse(
-  response: Record<string, unknown>,
+  response: Message | JsonObject,
   keystore: KeyStore,
   aid: string,
 ): Promise<boolean> {
-  const payload = ('group_id' in response) ? response : (response.payload ?? response) as Record<string, unknown>;
+  const payload = 'group_id' in response
+    ? response
+    : (isJsonObject(response.payload) ? response.payload : response);
 
   const groupId = payload.group_id as string | undefined;
   const epoch = payload.epoch as number | undefined;
@@ -790,7 +846,7 @@ export class GroupKeyRequestThrottle {
  * 所有密码学操作均为异步。
  */
 export class GroupE2EEManager {
-  private _identityFn: () => Record<string, unknown>;
+  private _identityFn: () => IdentityRecord;
   private _keystoreRef: KeyStore;
   private _replayGuard: GroupReplayGuard;
   private _requestThrottle: GroupKeyRequestThrottle;
@@ -799,7 +855,7 @@ export class GroupE2EEManager {
   private _initiatorCertResolver: ((aid: string) => string | null) | null;
 
   constructor(opts: {
-    identityFn: () => Record<string, unknown>;
+    identityFn: () => IdentityRecord;
     keystore: KeyStore;
     requestCooldown?: number;
     responseCooldown?: number;
@@ -818,7 +874,7 @@ export class GroupE2EEManager {
   // ── 密钥管理 ──────────────────────────────────────
 
   /** 用当前身份私钥签名 manifest */
-  private async _signManifest(manifest: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async _signManifest(manifest: JsonObject): Promise<JsonObject> {
     const identity = this._identityFn();
     const pkPem = identity.private_key_pem as string | undefined;
     if (!pkPem) return manifest;
@@ -829,7 +885,7 @@ export class GroupE2EEManager {
   async createEpoch(
     groupId: string,
     memberAids: string[],
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     const aid = this._currentAid();
     const gs = generateGroupSecret();
     const epoch = 1;
@@ -850,7 +906,7 @@ export class GroupE2EEManager {
   async rotateEpoch(
     groupId: string,
     memberAids: string[],
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     const aid = this._currentAid();
     const current = await loadGroupSecret(this._keystoreRef, aid, groupId);
     const prevEpoch = current ? current.epoch : null;
@@ -874,7 +930,7 @@ export class GroupE2EEManager {
     groupId: string,
     targetEpoch: number,
     memberAids: string[],
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     const aid = this._currentAid();
     const gs = generateGroupSecret();
     const commitment = await computeMembershipCommitment(memberAids, targetEpoch, groupId, gs);
@@ -923,9 +979,9 @@ export class GroupE2EEManager {
   /** 加密群消息（含发送方签名）。无密钥时抛 E2EEGroupSecretMissingError。 */
   async encrypt(
     groupId: string,
-    payload: Record<string, unknown>,
+    payload: JsonObject,
     opts?: { messageId?: string; timestamp?: number },
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     const aid = this._currentAid();
     const secretData = await loadGroupSecret(this._keystoreRef, aid, groupId);
     if (!secretData) {
@@ -949,11 +1005,11 @@ export class GroupE2EEManager {
    * opts.skipReplay: 跳过防重放检查（用于 group.pull 场景）。
    */
   async decrypt(
-    message: Record<string, unknown>,
+    message: Message,
     opts?: { skipReplay?: boolean },
-  ): Promise<Record<string, unknown> | null> {
-    const payload = message.payload as Record<string, unknown> | undefined;
-    if (!payload || typeof payload !== 'object' || payload.type !== 'e2ee.group_encrypted') {
+  ): Promise<Message | null> {
+    const payload = isJsonObject(message.payload) ? message.payload : null;
+    if (payload === null || payload.type !== 'e2ee.group_encrypted') {
       return message;
     }
     const groupId = (message.group_id ?? '') as string;
@@ -961,7 +1017,7 @@ export class GroupE2EEManager {
     const skipReplay = opts?.skipReplay ?? false;
 
     // 防重放预检：优先使用 AAD 内 message_id
-    const aad = payload.aad as Record<string, unknown> | undefined;
+    const aad = isJsonObject(payload.aad) ? payload.aad : undefined;
     const aadMsgId = aad ? (aad.message_id ?? '') as string : '';
     const msgId = aadMsgId || (message.message_id ?? '') as string;
     if (!skipReplay && groupId && sender && msgId) {
@@ -999,10 +1055,10 @@ export class GroupE2EEManager {
 
   /** 批量解密 */
   async decryptBatch(
-    messages: Record<string, unknown>[],
+    messages: Message[],
     opts?: { skipReplay?: boolean },
-  ): Promise<Record<string, unknown>[]> {
-    const results: Record<string, unknown>[] = [];
+  ): Promise<Message[]> {
+    const results: Message[] = [];
     for (const m of messages) {
       results.push((await this.decrypt(m, opts)) ?? m);
     }
@@ -1018,8 +1074,7 @@ export class GroupE2EEManager {
    * 返回 "distribution_rejected"/"response_rejected" 表示被拒绝。
    * 返回 null 表示不是密钥消息。
    */
-  async handleIncoming(payload: Record<string, unknown>): Promise<string | null> {
-    if (!payload || typeof payload !== 'object') return null;
+  async handleIncoming(payload: JsonObject): Promise<string | null> {
     const msgType = (payload.type ?? '') as string;
     const aid = this._currentAid();
 
@@ -1048,7 +1103,7 @@ export class GroupE2EEManager {
     groupId: string,
     epoch: number,
     opts?: { senderAid?: string },
-  ): Promise<Record<string, unknown> | null> {
+  ): Promise<JsonObject | null> {
     const aid = this._currentAid();
     if (!this._requestThrottle.allow(`request:${groupId}:${epoch}`)) return null;
     let candidates: string[] = [];
@@ -1065,9 +1120,9 @@ export class GroupE2EEManager {
 
   /** 处理密钥请求（受频率限制 + 成员资格验证） */
   async handleKeyRequestMsg(
-    requestPayload: Record<string, unknown>,
+    requestPayload: JsonObject,
     currentMembers: string[],
-  ): Promise<Record<string, unknown> | null> {
+  ): Promise<JsonObject | null> {
     const requester = (requestPayload.requester_aid ?? '') as string;
     const groupId = (requestPayload.group_id ?? '') as string;
     if (!requester || !groupId) return null;

@@ -15,6 +15,7 @@ import {
   E2EEManager,
 } from '../../src/e2ee.js';
 import { makeE2EEPair, makePrekey, FakeKeystore } from './helpers.js';
+import type { JsonObject, Message } from '../../src/types.js';
 
 // ── AAD 测试 ──────────────────────────────────────────────────
 
@@ -54,7 +55,7 @@ describe('prekey_ecdh_v2 加密', () => {
     expect(envelope.encryption_mode).toBe(MODE_PREKEY_ECDH_V2);
     expect(envelope.prekey_id).toBe(prekey.prekey_id);
     expect(envelope.ephemeral_public_key).toBeTruthy();
-    const aad = envelope.aad as Record<string, unknown>;
+    const aad = envelope.aad as JsonObject;
     expect(aad.encryption_mode).toBe(MODE_PREKEY_ECDH_V2);
   });
 
@@ -64,10 +65,8 @@ describe('prekey_ecdh_v2 加密', () => {
 
     // 将 prekey 私钥存入 receiver keystore
     const privPem = prekeyPrivateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
-    receiverKs._metadata['receiver.test'] = {
-      e2ee_prekeys: {
-        [prekey.prekey_id as string]: { private_key_pem: privPem, created_at: Date.now() },
-      },
+    receiverKs._prekeys['receiver.test'] = {
+      [prekey.prekey_id as string]: { private_key_pem: privPem, created_at: Date.now() },
     };
 
     const payload = { text: 'prekey roundtrip' };
@@ -85,8 +84,8 @@ describe('prekey_ecdh_v2 加密', () => {
 
     const result = receiverMgr.decryptMessage(message);
     expect(result).not.toBeNull();
-    expect((result as Record<string, unknown>).payload).toEqual(payload);
-    const e2ee = (result as Record<string, unknown>).e2ee as Record<string, unknown>;
+    expect((result as Message).payload).toEqual(payload);
+    const e2ee = (result as Message).e2ee as JsonObject;
     expect(e2ee.encryption_mode).toBe(MODE_PREKEY_ECDH_V2);
   });
 });
@@ -104,7 +103,7 @@ describe('long_term_key 加密', () => {
     );
     expect(info.mode).toBe(MODE_LONG_TERM_KEY);
     expect(envelope.encryption_mode).toBe(MODE_LONG_TERM_KEY);
-    const aad = envelope.aad as Record<string, unknown>;
+    const aad = envelope.aad as JsonObject;
     // long_term_key 的 AAD 应包含除 prekey_id 外的所有字段
     for (const field of AAD_FIELDS_OFFLINE) {
       if (field === 'prekey_id') continue;
@@ -130,8 +129,8 @@ describe('long_term_key 加密', () => {
 
     const result = receiverMgr.decryptMessage(message);
     expect(result).not.toBeNull();
-    expect((result as Record<string, unknown>).payload).toEqual(payload);
-    const e2ee = (result as Record<string, unknown>).e2ee as Record<string, unknown>;
+    expect((result as Message).payload).toEqual(payload);
+    const e2ee = (result as Message).e2ee as JsonObject;
     expect(e2ee.encryption_mode).toBe(MODE_LONG_TERM_KEY);
   });
 });
@@ -189,7 +188,7 @@ describe('本地防重放', () => {
     // 第一次解密成功
     const result1 = receiverMgr.decryptMessage(message);
     expect(result1).not.toBeNull();
-    expect((result1 as Record<string, unknown>).payload).toEqual(payload);
+    expect((result1 as Message).payload).toEqual(payload);
 
     // 第二次重放被拦截（返回 null）
     const result2 = receiverMgr.decryptMessage(message);
@@ -223,10 +222,9 @@ describe('generatePrekey', () => {
     expect(result.prekey_id).toBeTruthy();
     expect(result.public_key).toBeTruthy();
     expect(result.signature).toBeTruthy();
+    expect(result.cert_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
 
-    const meta = receiverKs.loadMetadata('receiver.test');
-    expect(meta).not.toBeNull();
-    const prekeys = (meta as Record<string, unknown>).e2ee_prekeys as Record<string, Record<string, unknown>>;
+    const prekeys = receiverKs.loadE2EEPrekeys('receiver.test');
     expect(Object.keys(prekeys).length).toBe(1);
     const pid = Object.keys(prekeys)[0];
     expect(prekeys[pid].private_key_pem).toBeTruthy();
@@ -239,6 +237,46 @@ describe('generatePrekey', () => {
     expect(result.created_at).toBeTruthy();
     expect(typeof result.created_at).toBe('number');
     expect(result.created_at as number).toBeGreaterThan(0);
+    expect(result.cert_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it('本地清理应保留最新 7 个 prekey', () => {
+    const { receiverMgr, receiverKs } = makeE2EEPair();
+    const oldBase = Date.now() - (8 * 24 * 3600 * 1000);
+
+    for (let i = 0; i < 8; i += 1) {
+      receiverKs.saveE2EEPrekey('receiver.test', `old-${i}`, {
+        private_key_pem: `OLD-${i}`,
+        created_at: oldBase + i,
+      });
+    }
+
+    const prekey = receiverMgr.generatePrekey();
+    const prekeys = receiverKs.loadE2EEPrekeys('receiver.test');
+
+    expect(prekeys[prekey.prekey_id as string]).toBeDefined();
+    expect(Object.keys(prekeys)).toHaveLength(7);
+    expect(prekeys['old-0']).toBeUndefined();
+    expect(prekeys['old-1']).toBeUndefined();
+    expect(prekeys['old-2']).toBeDefined();
+  });
+
+  it('prekey 证书指纹不匹配时降级到 long_term_key', () => {
+    const { senderMgr, receiverKey, receiverCert } = makeE2EEPair();
+    const { prekey } = makePrekey(receiverKey);
+    prekey.cert_fingerprint = `sha256:${'0'.repeat(64)}`;
+
+    const [_envelope, info] = senderMgr.encryptOutbound(
+      'receiver.test',
+      { text: 'hello' },
+      receiverCert,
+      prekey,
+      crypto.randomUUID(),
+      Date.now(),
+    );
+    expect(info.mode).toBe('long_term_key');
+    expect(info.degraded).toBe(true);
+    expect(info.degradation_reason).toBe('prekey_encrypt_failed');
   });
 });
 
@@ -250,7 +288,7 @@ describe('decryptMessage', () => {
     const message = { seq: 1, payload: { text: 'hello' } };
     const result = receiverMgr.decryptMessage(message);
     expect(result).not.toBeNull();
-    expect((result as Record<string, unknown>).payload).toEqual({ text: 'hello' });
+    expect((result as Message).payload).toEqual({ text: 'hello' });
   });
 
   it('加密消息被自动解密', () => {
@@ -269,7 +307,7 @@ describe('decryptMessage', () => {
 
     const result = receiverMgr.decryptMessage(message);
     expect(result).not.toBeNull();
-    expect((result as Record<string, unknown>).payload).toEqual(payload);
+    expect((result as Message).payload).toEqual(payload);
   });
 
   it('发送方不解密自己发出的消息（目标不是自己）', () => {

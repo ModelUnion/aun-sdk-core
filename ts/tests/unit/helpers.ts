@@ -7,25 +7,38 @@
 import * as crypto from 'node:crypto';
 import type { KeyStore } from '../../src/keystore/index.js';
 import { E2EEManager } from '../../src/e2ee.js';
+import type {
+  GroupOldEpochRecord,
+  GroupSecretMap,
+  GroupSecretRecord,
+  IdentityRecord,
+  JsonObject,
+  KeyPairRecord,
+  MetadataRecord,
+  PrekeyMap,
+  PrekeyRecord,
+} from '../../src/types.js';
 
 // ── FakeKeystore ──────────────────────────────────────────────
 
 export class FakeKeystore implements KeyStore {
-  _metadata: Record<string, Record<string, unknown>> = {};
-  _keyPairs: Record<string, Record<string, unknown>> = {};
+  _metadata: Record<string, MetadataRecord> = {};
+  _keyPairs: Record<string, KeyPairRecord> = {};
   _certs: Record<string, string> = {};
-  _identities: Record<string, Record<string, unknown>> = {};
+  _identities: Record<string, IdentityRecord> = {};
+  _prekeys: Record<string, PrekeyMap> = {};
+  _groups: Record<string, GroupSecretMap> = {};
 
-  loadMetadata(aid: string): Record<string, unknown> | null {
+  loadMetadata(aid: string): MetadataRecord | null {
     return this._metadata[aid] ?? null;
   }
-  saveMetadata(aid: string, meta: Record<string, unknown>): void {
+  saveMetadata(aid: string, meta: MetadataRecord): void {
     this._metadata[aid] = meta;
   }
-  loadKeyPair(aid: string): Record<string, unknown> | null {
+  loadKeyPair(aid: string): KeyPairRecord | null {
     return this._keyPairs[aid] ?? null;
   }
-  saveKeyPair(aid: string, keyPair: Record<string, unknown>): void {
+  saveKeyPair(aid: string, keyPair: KeyPairRecord): void {
     this._keyPairs[aid] = keyPair;
   }
   loadCert(aid: string): string | null {
@@ -34,17 +47,60 @@ export class FakeKeystore implements KeyStore {
   saveCert(aid: string, certPem: string): void {
     this._certs[aid] = certPem;
   }
-  deleteKeyPair(aid: string): void {
-    delete this._keyPairs[aid];
-  }
-  loadIdentity(aid: string): Record<string, unknown> | null {
+  loadIdentity(aid: string): IdentityRecord | null {
     return this._identities[aid] ?? null;
   }
-  saveIdentity(aid: string, identity: Record<string, unknown>): void {
+  saveIdentity(aid: string, identity: IdentityRecord): void {
     this._identities[aid] = identity;
   }
-  deleteIdentity(aid: string): void {
-    delete this._identities[aid];
+  loadE2EEPrekeys(aid: string): PrekeyMap {
+    return JSON.parse(JSON.stringify(this._prekeys[aid] ?? {}));
+  }
+  saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord): void {
+    this._prekeys[aid] ??= {};
+    this._prekeys[aid][prekeyId] = JSON.parse(JSON.stringify(prekeyData));
+  }
+  cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest: number = 7): string[] {
+    const current = this._prekeys[aid] ?? {};
+    const retainedIds = new Set(
+      Object.entries(current)
+        .sort((left, right) => {
+          const leftMarker = Number(left[1].created_at ?? left[1].updated_at ?? left[1].expires_at ?? 0);
+          const rightMarker = Number(right[1].created_at ?? right[1].updated_at ?? right[1].expires_at ?? 0);
+          if (rightMarker !== leftMarker) return rightMarker - leftMarker;
+          return right[0].localeCompare(left[0]);
+        })
+        .slice(0, keepLatest)
+        .map(([prekeyId]) => prekeyId),
+    );
+    const removed: string[] = [];
+    for (const [prekeyId, data] of Object.entries(current)) {
+      const marker = Number(data.expires_at ?? data.created_at ?? data.updated_at ?? 0);
+      if (marker < cutoffMs && !retainedIds.has(prekeyId)) {
+        removed.push(prekeyId);
+        delete current[prekeyId];
+      }
+    }
+    return removed;
+  }
+  loadGroupSecretState(aid: string, groupId: string): GroupSecretRecord | null {
+    return JSON.parse(JSON.stringify(this._groups[aid]?.[groupId] ?? null));
+  }
+  loadAllGroupSecretStates(aid: string): GroupSecretMap {
+    return JSON.parse(JSON.stringify(this._groups[aid] ?? {}));
+  }
+  saveGroupSecretState(aid: string, groupId: string, entry: GroupSecretRecord): void {
+    this._groups[aid] ??= {};
+    this._groups[aid][groupId] = JSON.parse(JSON.stringify(entry));
+  }
+  cleanupGroupOldEpochsState(aid: string, groupId: string, cutoffMs: number): number {
+    const entry = this._groups[aid]?.[groupId];
+    if (!entry) return 0;
+    const oldEpochs = Array.isArray(entry.old_epochs) ? entry.old_epochs as GroupOldEpochRecord[] : [];
+    const remaining = oldEpochs.filter((old) => Number(old.updated_at ?? old.expires_at ?? 0) >= cutoffMs);
+    const removed = oldEpochs.length - remaining.length;
+    entry.old_epochs = remaining;
+    return removed;
   }
 }
 
@@ -77,7 +133,7 @@ export function makeSelfSignedCert(privateKey: crypto.KeyObject, cn: string = 't
 export function buildIdentity(
   aid: string,
   privateKey: crypto.KeyObject,
-): Record<string, unknown> {
+): IdentityRecord {
   const publicKey = crypto.createPublicKey(privateKey);
   const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
   const pubDer = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
@@ -85,6 +141,7 @@ export function buildIdentity(
     aid,
     private_key_pem: privPem,
     public_key_der_b64: pubDer.toString('base64'),
+    cert: makeSelfSignedCert(privateKey, aid),
   };
 }
 
@@ -98,8 +155,8 @@ export function makeE2EEPair(): {
   receiverCert: string;
   senderKs: FakeKeystore;
   receiverKs: FakeKeystore;
-  senderIdentity: Record<string, unknown>;
-  receiverIdentity: Record<string, unknown>;
+  senderIdentity: IdentityRecord;
+  receiverIdentity: IdentityRecord;
 } {
   const { privateKey: senderKey } = generateECKeypair();
   const { privateKey: receiverKey } = generateECKeypair();
@@ -128,8 +185,8 @@ export function makeE2EEPair(): {
     keystore: receiverKs,
   });
 
-  const senderCert = makeSelfSignedCert(senderKey, 'sender.test');
-  const receiverCert = makeSelfSignedCert(receiverKey, 'receiver.test');
+  const senderCert = senderIdentity.cert as string;
+  const receiverCert = receiverIdentity.cert as string;
 
   // 每个 keystore 保存对方的证书（用于签名验证）
   senderKs._certs['receiver.test'] = receiverCert;
@@ -148,7 +205,7 @@ export function makeE2EEPair(): {
 export function makePrekey(
   identityPrivateKey: crypto.KeyObject,
   opts?: { createdAt?: number },
-): { prekey: Record<string, unknown>; prekeyPrivateKey: crypto.KeyObject } {
+): { prekey: PrekeyRecord; prekeyPrivateKey: crypto.KeyObject } {
   const { privateKey: prekeyPrivateKey, publicKey: prekeyPublicKey } = generateECKeypair();
   const prekeyPubDer = prekeyPublicKey.export({ type: 'spki', format: 'der' }) as Buffer;
   const prekeyId = crypto.randomUUID();
@@ -167,7 +224,7 @@ export function makePrekey(
   signer.end();
   const signature = signer.sign(identityPrivateKey);
 
-  const prekey: Record<string, unknown> = {
+  const prekey: PrekeyRecord = {
     prekey_id: prekeyId,
     public_key: publicKeyB64,
     signature: signature.toString('base64'),

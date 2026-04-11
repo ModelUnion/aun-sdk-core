@@ -11,6 +11,8 @@
 
 import copy
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -167,13 +169,6 @@ class TestVolatileSecretStore:
         store2 = VolatileSecretStore()
         assert store2.reveal("s", "n", record) is None
 
-    def test_clear_removes_secret(self):
-        store = VolatileSecretStore()
-        record = store.protect("s", "n", b"secret")
-        store.clear("s", "n")
-        assert store.reveal("s", "n", record) is None
-
-
 # ── FileKeyStore 测试 ─────────────────────────────────────
 
 
@@ -265,18 +260,6 @@ class TestFileKeyStore:
 
         loaded_cert = ks2.load_cert(self.SAMPLE_AID)
         assert loaded_cert == self.SAMPLE_CERT
-
-    def test_delete_identity(self, tmp_path):
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
-        ks.save_identity(self.SAMPLE_AID, {
-            **self.SAMPLE_KEY_PAIR,
-            "cert": self.SAMPLE_CERT,
-            "aid": self.SAMPLE_AID,
-        })
-        ks.delete_identity(self.SAMPLE_AID)
-
-        assert ks.load_key_pair(self.SAMPLE_AID) is None
-        assert ks.load_cert(self.SAMPLE_AID) is None
 
     def test_multiple_aids(self, tmp_path):
         """多个 AID 互不干扰。"""
@@ -1040,3 +1023,337 @@ class TestMetadataNoOverwrite:
         assert final["access_token"] == "at1"
         assert final["e2ee_prekeys"]["pk1"]["private_key_pem"] == "PK1"
         assert final["group_secrets"]["g1"]["secret"] == "GS"
+
+    def test_update_metadata_serializes_concurrent_writers(self, tmp_path):
+        """update_metadata 必须在同一把锁内完成 load→修改→save。"""
+        ks = self._make_ks(tmp_path)
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_finished = threading.Event()
+
+        def first_updater(metadata):
+            metadata.setdefault("e2ee_prekeys", {})["pk1"] = {"private_key_pem": "PK1"}
+            first_entered.set()
+            assert release_first.wait(timeout=1)
+            return metadata
+
+        def second_updater(metadata):
+            metadata.setdefault("e2ee_prekeys", {})["pk2"] = {"private_key_pem": "PK2"}
+            return metadata
+
+        t1 = threading.Thread(target=lambda: ks.update_metadata(self.AID, first_updater))
+        t2 = threading.Thread(
+            target=lambda: (
+                ks.update_metadata(self.AID, second_updater),
+                second_finished.set(),
+            ),
+        )
+
+        t1.start()
+        assert first_entered.wait(timeout=1)
+        t2.start()
+        time.sleep(0.05)
+        assert not second_finished.is_set()
+
+        release_first.set()
+        t1.join(timeout=1)
+        t2.join(timeout=1)
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+
+        loaded = ks.load_metadata(self.AID)
+        assert loaded["e2ee_prekeys"]["pk1"]["private_key_pem"] == "PK1"
+        assert loaded["e2ee_prekeys"]["pk2"]["private_key_pem"] == "PK2"
+
+    def test_save_identity_preserves_existing_prekeys(self, tmp_path):
+        """save_identity 更新 token 时不应覆盖已有 e2ee_prekeys。"""
+        ks = self._make_ks(tmp_path)
+        ks.save_metadata(self.AID, {
+            "e2ee_prekeys": {
+                "pk1": {"private_key_pem": "KEEP_ME", "public_key_der_b64": "pub1"},
+            },
+        })
+
+        ks.save_identity(self.AID, {
+            "aid": self.AID,
+            "access_token": "tok_new",
+            "refresh_token": "rt_new",
+        })
+
+        loaded = ks.load_metadata(self.AID)
+        assert loaded["access_token"] == "tok_new"
+        assert loaded["refresh_token"] == "rt_new"
+        assert loaded["e2ee_prekeys"]["pk1"]["private_key_pem"] == "KEEP_ME"
+
+
+class _FakeSQLiteBackup:
+    def __init__(self):
+        self._available = True
+        self._seed = None
+        self._metadata: dict[str, str] = {}
+        self._prekeys: dict[str, dict[str, dict]] = {}
+        self._groups: dict[str, dict[str, dict]] = {}
+
+    def backup_seed(self, seed: bytes) -> None:
+        self._seed = seed
+
+    def restore_seed(self) -> bytes | None:
+        return self._seed
+
+    def backup_metadata(self, aid: str, data: str) -> None:
+        self._metadata[aid] = data
+
+    def restore_metadata(self, aid: str) -> str | None:
+        return self._metadata.get(aid)
+
+    def load_prekeys(self, aid: str) -> dict[str, dict]:
+        return copy.deepcopy(self._prekeys.get(aid, {}))
+
+    def replace_prekeys(self, aid: str, prekeys: dict[str, dict]) -> None:
+        self._prekeys[aid] = copy.deepcopy(prekeys)
+
+    def cleanup_prekeys_before(self, aid: str, cutoff_ms: int, keep_latest: int = 7) -> list[str]:
+        current = self._prekeys.get(aid, {})
+        retained_ids = {
+            prekey_id
+            for prekey_id, _marker in sorted(
+                (
+                    (
+                        prekey_id,
+                        int(
+                            prekey_data.get("created_at")
+                            or prekey_data.get("updated_at")
+                            or prekey_data.get("expires_at")
+                            or 0
+                        ),
+                    )
+                    for prekey_id, prekey_data in current.items()
+                    if isinstance(prekey_data, dict)
+                ),
+                key=lambda item: (item[1], item[0]),
+                reverse=True,
+            )[:keep_latest]
+        }
+        removed: list[str] = []
+        for prekey_id, prekey_data in list(current.items()):
+            marker = prekey_data.get("created_at") or prekey_data.get("updated_at") or prekey_data.get("expires_at") or 0
+            if (
+                prekey_id not in retained_ids
+                and isinstance(marker, (int, float))
+                and int(marker) < cutoff_ms
+            ):
+                removed.append(prekey_id)
+                current.pop(prekey_id, None)
+        return removed
+
+    def load_group_entries(self, aid: str) -> dict[str, dict]:
+        return copy.deepcopy(self._groups.get(aid, {}))
+
+    def replace_group_entries(self, aid: str, entries: dict[str, dict]) -> None:
+        self._groups[aid] = copy.deepcopy(entries)
+
+    def cleanup_group_old_epochs(self, aid: str, group_id: str, cutoff_ms: int) -> list[int]:
+        groups = self._groups.get(aid, {})
+        entry = groups.get(group_id)
+        if not isinstance(entry, dict):
+            return []
+        old_epochs = entry.get("old_epochs")
+        if not isinstance(old_epochs, list):
+            return []
+        removed: list[int] = []
+        remaining: list[dict] = []
+        for old in old_epochs:
+            if not isinstance(old, dict):
+                continue
+            marker = old.get("expires_at") or old.get("updated_at") or 0
+            if isinstance(marker, (int, float)) and int(marker) < cutoff_ms:
+                epoch = old.get("epoch")
+                if isinstance(epoch, (int, float)):
+                    removed.append(int(epoch))
+                continue
+            remaining.append(copy.deepcopy(old))
+        entry["old_epochs"] = remaining
+        return removed
+
+
+class TestSQLiteStructuredRecovery:
+    AID = "sqlite-recovery.agentid.pub"
+    GROUP_ID = "grp.sqlite.recovery"
+    MEMBERS = ["alice.aid.com", "bobb.aid.net"]
+
+    def _seed_meta_only(self, tmp_path: Path, metadata: dict) -> None:
+        ks = FileKeyStore(tmp_path, encryption_seed="seed", sqlite_backup=None)
+        ks.save_metadata(self.AID, metadata)
+
+    def _make_sqlite_ks(self, tmp_path: Path, backup: _FakeSQLiteBackup) -> FileKeyStore:
+        return FileKeyStore(tmp_path, encryption_seed="seed", sqlite_backup=backup)
+
+    def test_sqlite_prekeys_are_primary_and_only_recover_unexpired_meta(self, tmp_path):
+        now_ms = int(time.time() * 1000)
+        self._seed_meta_only(tmp_path, {
+            "e2ee_prekeys": {
+                "pk_sql": {
+                    "private_key_pem": "META_SQL",
+                    "created_at": now_ms - 1000,
+                    "updated_at": now_ms - 1000,
+                    "expires_at": now_ms + 60_000,
+                },
+                "pk_recover": {
+                    "private_key_pem": "META_RECOVER",
+                    "created_at": now_ms - 500,
+                    "updated_at": now_ms - 500,
+                    "expires_at": now_ms + 60_000,
+                },
+                "pk_expired": {
+                    "private_key_pem": "META_EXPIRED",
+                    "created_at": now_ms - 8 * 24 * 3600 * 1000,
+                    "updated_at": now_ms - 8 * 24 * 3600 * 1000,
+                    "expires_at": now_ms - 1,
+                },
+            },
+        })
+
+        backup = _FakeSQLiteBackup()
+        ks = self._make_sqlite_ks(tmp_path, backup)
+        backup.replace_prekeys(self.AID, ks._protect_prekeys(self.AID, {
+            "pk_sql": {
+                "private_key_pem": "SQLITE_SQL",
+                "created_at": now_ms - 2000,
+                "updated_at": now_ms + 1000,
+                "expires_at": now_ms + 120_000,
+            },
+        }))
+
+        loaded = ks.load_metadata(self.AID)
+        prekeys = loaded["e2ee_prekeys"]
+        assert prekeys["pk_sql"]["private_key_pem"] == "SQLITE_SQL"
+        assert prekeys["pk_recover"]["private_key_pem"] == "META_RECOVER"
+        assert "pk_expired" not in prekeys
+
+        sqlite_view = ks.load_e2ee_prekeys(self.AID)
+        assert set(sqlite_view) == {"pk_sql", "pk_recover"}
+
+    def test_save_e2ee_prekey_preserves_meta_only_recoverable_prekeys(self, tmp_path):
+        now_ms = int(time.time() * 1000)
+        self._seed_meta_only(tmp_path, {
+            "e2ee_prekeys": {
+                "pk_meta": {
+                    "private_key_pem": "META_ONLY",
+                    "created_at": now_ms - 1000,
+                    "updated_at": now_ms - 1000,
+                    "expires_at": now_ms + 60_000,
+                },
+            },
+        })
+
+        backup = _FakeSQLiteBackup()
+        ks = self._make_sqlite_ks(tmp_path, backup)
+        ks.save_e2ee_prekey(self.AID, "pk_new", {
+            "private_key_pem": "NEW_PREKEY",
+            "created_at": now_ms,
+            "updated_at": now_ms,
+            "expires_at": now_ms + 60_000,
+        })
+
+        loaded = ks.load_e2ee_prekeys(self.AID)
+        assert loaded["pk_meta"]["private_key_pem"] == "META_ONLY"
+        assert loaded["pk_new"]["private_key_pem"] == "NEW_PREKEY"
+
+    def test_group_meta_current_lower_than_sqlite_is_recovered_as_old_epoch(self, tmp_path):
+        now_ms = int(time.time() * 1000)
+        self._seed_meta_only(tmp_path, {
+            "group_secrets": {
+                self.GROUP_ID: {
+                    "epoch": 2,
+                    "secret": "META_EPOCH_2",
+                    "commitment": "meta-2",
+                    "member_aids": self.MEMBERS,
+                    "updated_at": now_ms - 1000,
+                    "expires_at": now_ms + 60_000,
+                    "old_epochs": [
+                        {
+                            "epoch": 1,
+                            "secret": "META_EPOCH_1",
+                            "commitment": "meta-1",
+                            "member_aids": self.MEMBERS,
+                            "updated_at": now_ms - 2000,
+                            "expires_at": now_ms + 60_000,
+                        },
+                    ],
+                },
+            },
+        })
+
+        backup = _FakeSQLiteBackup()
+        ks = self._make_sqlite_ks(tmp_path, backup)
+        backup.replace_group_entries(self.AID, ks._protect_group_secrets(self.AID, {
+            self.GROUP_ID: {
+                "epoch": 3,
+                "secret": "SQLITE_EPOCH_3",
+                "commitment": "sqlite-3",
+                "member_aids": self.MEMBERS,
+                "updated_at": now_ms,
+            },
+        }))
+
+        entry = ks.load_group_secret_state(self.AID, self.GROUP_ID)
+        assert entry["epoch"] == 3
+        assert entry["secret"] == "SQLITE_EPOCH_3"
+        old_by_epoch = {item["epoch"]: item for item in entry["old_epochs"]}
+        assert old_by_epoch[1]["secret"] == "META_EPOCH_1"
+        assert old_by_epoch[2]["secret"] == "META_EPOCH_2"
+
+    def test_group_meta_newer_current_promotes_and_keeps_previous_sqlite_current(self, tmp_path):
+        now_ms = int(time.time() * 1000)
+        self._seed_meta_only(tmp_path, {
+            "group_secrets": {
+                self.GROUP_ID: {
+                    "epoch": 4,
+                    "secret": "META_EPOCH_4",
+                    "commitment": "meta-4",
+                    "member_aids": self.MEMBERS,
+                    "updated_at": now_ms + 1000,
+                    "expires_at": now_ms + 60_000,
+                    "old_epochs": [
+                        {
+                            "epoch": 2,
+                            "secret": "META_EPOCH_2",
+                            "commitment": "meta-2",
+                            "member_aids": self.MEMBERS,
+                            "updated_at": now_ms - 2000,
+                            "expires_at": now_ms + 60_000,
+                        },
+                    ],
+                },
+            },
+        })
+
+        backup = _FakeSQLiteBackup()
+        ks = self._make_sqlite_ks(tmp_path, backup)
+        backup.replace_group_entries(self.AID, ks._protect_group_secrets(self.AID, {
+            self.GROUP_ID: {
+                "epoch": 3,
+                "secret": "SQLITE_EPOCH_3",
+                "commitment": "sqlite-3",
+                "member_aids": self.MEMBERS,
+                "updated_at": now_ms,
+                "old_epochs": [
+                    {
+                        "epoch": 1,
+                        "secret": "SQLITE_EPOCH_1",
+                        "commitment": "sqlite-1",
+                        "member_aids": self.MEMBERS,
+                        "updated_at": now_ms - 3000,
+                        "expires_at": now_ms + 60_000,
+                    },
+                ],
+            },
+        }))
+
+        entry = ks.load_group_secret_state(self.AID, self.GROUP_ID)
+        assert entry["epoch"] == 4
+        assert entry["secret"] == "META_EPOCH_4"
+        old_by_epoch = {item["epoch"]: item for item in entry["old_epochs"]}
+        assert old_by_epoch[1]["secret"] == "SQLITE_EPOCH_1"
+        assert old_by_epoch[2]["secret"] == "META_EPOCH_2"
+        assert old_by_epoch[3]["secret"] == "SQLITE_EPOCH_3"

@@ -5,6 +5,7 @@ package aun
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -219,6 +220,9 @@ func TestIntegrationPrekeyUploadAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("生成 prekey 失败: %v", err)
 	}
+	if fp, ok := prekeyMaterial["cert_fingerprint"].(string); !ok || !strings.HasPrefix(fp, "sha256:") {
+		t.Fatalf("prekey 应包含 cert_fingerprint: %v", prekeyMaterial["cert_fingerprint"])
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -241,6 +245,10 @@ func TestIntegrationPrekeyUploadAndGet(t *testing.T) {
 	found1, _ := pk1Map["found"].(bool)
 	if !found1 {
 		t.Fatalf("预期找到 prekey")
+	}
+	prekey1, _ := pk1Map["prekey"].(map[string]any)
+	if prekey1 == nil || prekey1["cert_fingerprint"] != prekeyMaterial["cert_fingerprint"] {
+		t.Fatalf("返回的 prekey cert_fingerprint 不正确: %#v", prekey1)
 	}
 
 	// 再次获取，应返回同一 prekey

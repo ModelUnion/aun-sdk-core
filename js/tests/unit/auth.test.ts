@@ -6,15 +6,16 @@ import { AuthFlow } from '../../src/auth.js';
 import { CryptoProvider } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
 import { StateError } from '../../src/errors.js';
+import type { IdentityRecord, JsonObject, KeyPairRecord, MetadataRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 
 // ── 内存 KeyStore mock ──────────────────────────────────
 
 function createMockKeyStore(): KeyStore {
-  const keyPairs = new Map<string, Record<string, unknown>>();
+  const keyPairs = new Map<string, KeyPairRecord>();
   const certs = new Map<string, string>();
-  const metadata = new Map<string, Record<string, unknown>>();
+  const metadata = new Map<string, MetadataRecord>();
   return {
     async loadKeyPair(aid) { return keyPairs.get(aid) ?? null; },
     async saveKeyPair(aid, kp) { keyPairs.set(aid, kp); },
@@ -22,7 +23,6 @@ function createMockKeyStore(): KeyStore {
     async saveCert(aid, cert) { certs.set(aid, cert); },
     async loadMetadata(aid) { return metadata.get(aid) ?? null; },
     async saveMetadata(aid, md) { metadata.set(aid, { ...md }); },
-    async deleteKeyPair(aid) { keyPairs.delete(aid); },
     async loadIdentity(aid) {
       const kp = keyPairs.get(aid);
       if (!kp) return null;
@@ -31,24 +31,19 @@ function createMockKeyStore(): KeyStore {
       return { ...kp, ...(md ?? {}), ...(cert ? { cert } : {}) };
     },
     async saveIdentity(aid, identity) {
-      const kp: Record<string, unknown> = {};
+      const kp: KeyPairRecord = {};
       for (const k of ['private_key_pem', 'public_key_der_b64', 'curve']) {
         if (k in identity) kp[k] = identity[k];
       }
       if (Object.keys(kp).length) keyPairs.set(aid, kp);
       if (identity.cert) certs.set(aid, identity.cert as string);
-      const md: Record<string, unknown> = {};
+      const md: MetadataRecord = {};
       for (const [k, v] of Object.entries(identity)) {
         if (!['private_key_pem', 'public_key_der_b64', 'curve', 'cert'].includes(k)) {
           md[k] = v;
         }
       }
       if (Object.keys(md).length) metadata.set(aid, md);
-    },
-    async deleteIdentity(aid) {
-      keyPairs.delete(aid);
-      certs.delete(aid);
-      metadata.delete(aid);
     },
   };
 }
@@ -81,7 +76,7 @@ describe('AuthFlow.loadIdentity', () => {
       const aid = 'test-user.example.com';
 
       await ks.saveIdentity(aid, {
-        ...(identity as unknown as Record<string, unknown>),
+        ...(identity as IdentityRecord),
         aid,
       });
 
@@ -100,6 +95,16 @@ describe('AuthFlow.loadIdentityOrNull', () => {
     const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider() });
 
     const result = await auth.loadIdentityOrNull();
+    expect(result).toBeNull();
+  });
+});
+
+describe('AuthFlow.loadIdentityOrNone', () => {
+  it('应作为 loadIdentityOrNull 的兼容别名返回 null', async () => {
+    const ks = createMockKeyStore();
+    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider() });
+
+    const result = await auth.loadIdentityOrNone();
     expect(result).toBeNull();
   });
 });

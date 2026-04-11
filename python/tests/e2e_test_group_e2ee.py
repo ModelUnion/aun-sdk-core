@@ -8,12 +8,12 @@
 
 前置条件：
   - Docker 环境运行中（docker compose up -d）
-  - hosts 文件映射 gateway.agentid.pub → 127.0.0.1
+  - 运行环境能解析 gateway.<issuer>（推荐使用 Docker network alias）
   - group_config.json 已添加 "e2ee.group_encrypted" 到 allowed_message_types
 """
 import asyncio
 import base64
-import random
+import os
 import secrets
 import sys
 import time
@@ -40,7 +40,58 @@ from aun_core.e2ee import (
 # 辅助函数
 # ---------------------------------------------------------------------------
 
-_TEST_AUN_PATH = "./.aun_test"
+_AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
+
+
+def _default_test_aun_path() -> str:
+    if _AUN_DATA_ROOT:
+        return f"{_AUN_DATA_ROOT}/single-domain/persistent"
+    return "./.aun_test"
+
+
+_TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).strip()
+_ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
+_ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
+_BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
+_CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
+_DAVE_AID = os.environ.get("AUN_TEST_DAVE_AID", f"dave.{_ISSUER}").strip()
+
+
+def _assert_fixed_aid_layout() -> None:
+    base = Path(_TEST_AUN_PATH)
+    if base.name != "persistent" or base.parent.name != "single-domain":
+        return
+
+    legacy_root = base.parent / "AIDs"
+    current_root = base / "AIDs"
+    fixed_aids = (_ALICE_AID, _BOBB_AID, _CHARLIE_AID, _DAVE_AID)
+
+    split_aids = [aid for aid in fixed_aids if (legacy_root / aid).exists()]
+    if split_aids:
+        joined = ", ".join(split_aids)
+        raise RuntimeError(
+            f"检测到固定 AID 旧目录残留：{joined}。"
+            f"固定身份只能使用 {current_root}，不能再与 {legacy_root} 分叉。"
+        )
+
+    incomplete_aids: list[str] = []
+    for aid in fixed_aids:
+        aid_dir = current_root / aid
+        if not aid_dir.exists():
+            continue
+        has_key = (aid_dir / "private" / "key.json").exists()
+        has_cert = (aid_dir / "public" / "cert.pem").exists()
+        if has_key != has_cert:
+            incomplete_aids.append(aid)
+    if incomplete_aids:
+        joined = ", ".join(incomplete_aids)
+        raise RuntimeError(
+            f"检测到固定 AID 身份材料不完整：{joined}。"
+            f"每个固定 AID 都必须在 {current_root} 同时具备 private/key.json 和 public/cert.pem。"
+        )
+
+
+_assert_fixed_aid_layout()
 
 
 def _make_client(tag: str, rid: str | None = None) -> AUNClient:
@@ -53,7 +104,9 @@ def _make_client(tag: str, rid: str | None = None) -> AUNClient:
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    await client.auth.create_aid({"aid": aid})
+    local = client._auth._keystore.load_identity(aid)
+    if local is None:
+        await client.auth.create_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     await client.connect(auth)
     return aid
@@ -118,8 +171,8 @@ async def test_group_encrypted_messaging():
     alice = _make_client("alice")
     bob = _make_client("bob")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         # Alice 建群（SDK 自动 create_epoch）
         group_id = await _create_group(alice, f"e2ee-test-{rid}")
@@ -163,9 +216,9 @@ async def test_multiple_members():
     rid = _run_id()
     alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
-        c_aid = await _ensure_connected(carol, f"ge-c-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
+        c_aid = await _ensure_connected(carol, _CHARLIE_AID)
 
         group_id = await _create_group(alice, f"e2ee-multi-{rid}")
         await _add_member(alice, group_id, b_aid)
@@ -205,9 +258,9 @@ async def test_epoch_rotation_on_kick():
     rid = _run_id()
     alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
-        c_aid = await _ensure_connected(carol, f"ge-c-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
+        c_aid = await _ensure_connected(carol, _CHARLIE_AID)
 
         group_id = await _create_group(alice, f"e2ee-kick-{rid}")
         await _add_member(alice, group_id, b_aid)
@@ -265,9 +318,9 @@ async def test_new_member_no_rotation():
     rid = _run_id()
     alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
-        c_aid = await _ensure_connected(carol, f"ge-c-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
+        c_aid = await _ensure_connected(carol, _CHARLIE_AID)
 
         group_id = await _create_group(alice, f"e2ee-join-{rid}")
         await _add_member(alice, group_id, b_aid)
@@ -310,8 +363,8 @@ async def test_burst_group_messages():
     rid = _run_id()
     alice, bob = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         group_id = await _create_group(alice, f"e2ee-burst-{rid}")
         await _add_member(alice, group_id, b_aid)
@@ -353,8 +406,8 @@ async def test_mixed_encrypted_plaintext():
     rid = _run_id()
     alice, bob = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         group_id = await _create_group(alice, f"e2ee-mixed-{rid}")
         await _add_member(alice, group_id, b_aid)
@@ -415,8 +468,8 @@ async def test_membership_commitment_verification():
     rid = _run_id()
     alice, bob = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         gs = generate_group_secret()
         members = [a_aid, b_aid]
@@ -448,8 +501,8 @@ async def test_old_epoch_still_decryptable():
     rid = _run_id()
     alice, bob = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         group_id = await _create_group(alice, f"e2ee-old-{rid}")
         await _add_member(alice, group_id, b_aid)
@@ -510,8 +563,8 @@ async def test_review_join_request_auto_distribute():
     rid = _run_id()
     alice, bob = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         # Alice 建群（默认 private → approval 模式，SDK 自动 create_epoch）
         group_id = await _create_group(alice, f"e2ee-review-{rid}")
@@ -581,8 +634,8 @@ async def test_invite_code_auto_recovery():
     rid = _run_id()
     alice, bob = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(alice, f"ge-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"ge-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         # 1. Alice 建群（SDK 自动 create_epoch）
         group_id = await _create_group(alice, f"e2ee-invite-{rid}")
@@ -659,14 +712,14 @@ async def test_capabilities_required_for_join():
 
     # 创建不声明 group_e2ee 的客户端（模拟旧版本）
     old_bob = AUNClient({
-        "aun_path": f"./.aun_test/old-bob-{rid}",
+        "aun_path": _TEST_AUN_PATH,
         "verify_ssl": False,
         "require_forward_secrecy": False,
     })
 
     try:
-        a_aid = await _ensure_connected(alice, f"cap-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(old_bob, f"cap-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(old_bob, _DAVE_AID)
 
         # Alice 建群
         group_id = await _create_group(alice, f"cap-test-{rid}")
@@ -694,8 +747,8 @@ async def test_plaintext_send_explicit():
     alice = _make_client("alice")
     bob = _make_client("bob")
     try:
-        a_aid = await _ensure_connected(alice, f"pt-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"pt-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         # Alice 建群 + 加 Bob
         group_id = await _create_group(alice, f"plaintext-test-{rid}")
@@ -744,9 +797,9 @@ async def test_epoch_rotation_on_leave():
     rid = _run_id()
     alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
     try:
-        a_aid = await _ensure_connected(alice, f"lv-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"lv-b-{rid}.agentid.pub")
-        c_aid = await _ensure_connected(carol, f"lv-c-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
+        c_aid = await _ensure_connected(carol, _CHARLIE_AID)
 
         group_id = await _create_group(alice, f"e2ee-leave-{rid}")
         await _add_member(alice, group_id, b_aid)
@@ -812,6 +865,69 @@ async def test_epoch_rotation_on_leave():
     finally:
         await alice.close(); await bob.close(); await carol.close()
 
+
+async def test_push_event_decrypt():
+    """Test 14: 推送事件带 payload 直接解密（不依赖 pull 兜底）
+
+    验证：
+    1. Alice 发送加密群消息后，Bob 通过 group.message_created 推送事件收到
+    2. SDK 自动解密推送消息（不调 group.pull）
+    3. 推送消息的 payload.text 正确
+    """
+    print("\n=== Test 14: Push event decrypts (no pull) ===")
+    rid = _run_id()
+    alice = _make_client("a")
+    bob = _make_client("b")
+    try:
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
+
+        group_id = await _create_group(alice, f"e2ee-push-{rid}")
+        await _add_member(alice, group_id, b_aid)
+        await asyncio.sleep(2)  # 等密钥分发
+
+        # 注册推送事件监听
+        push_msgs = []
+        push_event = asyncio.Event()
+
+        def handler(data):
+            if isinstance(data, dict) and data.get("group_id") == group_id:
+                push_msgs.append(data)
+                push_event.set()
+
+        sub = bob.on("group.message_created", handler)
+
+        # Alice 发加密消息
+        await alice.call("group.send", {
+            "group_id": group_id,
+            "payload": {"text": "推送测试"},
+            "encrypt": True,
+        })
+
+        # 等推送（不调 pull）
+        try:
+            await asyncio.wait_for(push_event.wait(), timeout=8.0)
+        except asyncio.TimeoutError:
+            pass
+        sub.unsubscribe()
+
+        assert len(push_msgs) >= 1, f"推送未收到：期望 >= 1 条，实际 {len(push_msgs)}"
+        first = push_msgs[0]
+        assert first.get("e2ee", {}).get("encryption_mode") == "epoch_group_key", \
+            f"推送消息未自动解密: e2ee={first.get('e2ee')}"
+        assert first.get("payload", {}).get("text") == "推送测试", \
+            f"推送消息内容不匹配: payload={first.get('payload')}"
+
+        print("[PASS] Test 14")
+        return True
+    except Exception as e:
+        print(f"[FAIL] Test 14: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        await alice.close(); await bob.close()
+
+
 async def main():
     print("=" * 60)
     print("Group E2EE E2E Tests")
@@ -831,6 +947,7 @@ async def main():
         ("11. Capabilities required for join",    test_capabilities_required_for_join),
         ("12. Explicit plaintext send",           test_plaintext_send_explicit),
         ("13. Epoch rotation on leave",           test_epoch_rotation_on_leave),
+        ("14. Push event decrypts (no pull)",     test_push_event_decrypt),
     ]
 
     results = []

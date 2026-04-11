@@ -24,11 +24,23 @@ import { AuthError, StateError, ValidationError, AUNError, mapRemoteError } from
 import type { CryptoProvider } from './crypto.js';
 import type { KeyStore } from './keystore/index.js';
 import type { RPCTransport } from './transport.js';
+import {
+  isJsonObject,
+  type IdentityRecord,
+  type JsonObject,
+  type RpcMessage,
+  type RpcParams,
+  type RpcResult,
+} from './types.js';
 
 // ── 日志辅助 ──────────────────────────────────────────────────
 
 /** 简易日志：前缀 [aun_core.auth] */
-function _authLog(level: string, msg: string, ...args: unknown[]): void {
+function _authLog(
+  level: string,
+  msg: string,
+  ...args: Array<string | number | boolean | null | undefined | Error | object>
+): void {
   const ts = new Date().toISOString();
   const formatted = args.reduce<string>((s, a) => s.replace('%s', String(a)), msg);
   // eslint-disable-next-line no-console
@@ -52,8 +64,8 @@ function _verifySignature(pubKey: crypto.KeyObject, signature: Buffer, data: Buf
 
   if (asymKeyDetails === 'ec') {
     // 通过导出公钥的 JWK 判断曲线
-    const jwk = pubKey.export({ format: 'jwk' });
-    const crv = (jwk as Record<string, unknown>).crv;
+    const jwk = pubKey.export({ format: 'jwk' }) as ExportedJwk;
+    const crv = jwk.crv;
     const alg = crv === 'P-384' ? 'SHA384' : 'SHA256';
     const ok = crypto.verify(alg, data, pubKey, signature);
     if (!ok) throw new AuthError(`ecdsa ${alg} signature verification failed`);
@@ -113,8 +125,9 @@ function _ensureCertTimeValid(cert: crypto.X509Certificate, label: string, nowMs
  */
 function _isCaCert(cert: crypto.X509Certificate): boolean {
   // Node.js X509Certificate 在 v20+ 提供 .ca 属性
-  if ('ca' in cert && typeof (cert as Record<string, unknown>).ca === 'boolean') {
-    return (cert as Record<string, unknown>).ca as boolean;
+  const compatCert = cert as crypto.X509Certificate & { ca?: boolean };
+  if (typeof compatCert.ca === 'boolean') {
+    return compatCert.ca;
   }
   // 降级：解析 cert 文本表示中的 BasicConstraints
   const text = cert.toString();
@@ -190,14 +203,14 @@ async function _fetchText(url: string, verifySsl: boolean): Promise<string> {
 }
 
 /** 发起 HTTP GET 请求，返回 JSON 对象 */
-async function _fetchJson(url: string, verifySsl: boolean): Promise<Record<string, unknown>> {
+async function _fetchJson(url: string, verifySsl: boolean): Promise<JsonObject> {
   const text = await _fetchText(url, verifySsl);
   try {
     const payload = JSON.parse(text);
-    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    if (!isJsonObject(payload)) {
       throw new AuthError(`invalid JSON payload from ${url}`);
     }
-    return payload as Record<string, unknown>;
+    return payload;
   } catch (err) {
     if (err instanceof AuthError) throw err;
     throw new AuthError(`invalid JSON from ${url}: ${err instanceof Error ? err.message : String(err)}`);
@@ -309,7 +322,7 @@ export class AuthFlow {
   // ── 公开方法 ────────────────────────────────────────────────
 
   /** 加载身份信息（密钥对 + 证书 + 元数据） */
-  loadIdentity(aid?: string): Record<string, unknown> {
+  loadIdentity(aid?: string): IdentityRecord {
     const identity = this._loadIdentityOrRaise(aid);
     const cert = this._keystore.loadCert(String(identity.aid));
     if (cert) identity.cert = cert;
@@ -319,7 +332,7 @@ export class AuthFlow {
   }
 
   /** 加载身份信息，不存在时返回 null */
-  loadIdentityOrNone(aid?: string): Record<string, unknown> | null {
+  loadIdentityOrNone(aid?: string): IdentityRecord | null {
     try {
       return this.loadIdentity(aid);
     } catch (e) {
@@ -328,8 +341,13 @@ export class AuthFlow {
     }
   }
 
+  /** 与 Browser/JS SDK 对齐的别名：加载身份信息，不存在时返回 null */
+  loadIdentityOrNull(aid?: string): IdentityRecord | null {
+    return this.loadIdentityOrNone(aid);
+  }
+
   /** 获取 access_token 的过期时间戳（秒） */
-  getAccessTokenExpiry(identity: Record<string, unknown>): number | null {
+  getAccessTokenExpiry(identity: IdentityRecord): number | null {
     const expiresAt = identity.access_token_expires_at;
     if (typeof expiresAt === 'number') return expiresAt;
     return null;
@@ -339,7 +357,8 @@ export class AuthFlow {
    * 创建 AID 并注册到 Gateway。
    * 如果 AID 已在服务端注册但本地证书丢失，尝试从 PKI 端点下载恢复。
    */
-  async createAid(gatewayUrl: string, aid: string): Promise<Record<string, unknown>> {
+  async createAid(gatewayUrl: string, aid: string): Promise<JsonObject> {
+    AuthFlow._validateAidName(aid);
     let identity = this._ensureLocalIdentity(aid);
     if (identity.cert) {
       return { aid: identity.aid, cert: identity.cert };
@@ -377,7 +396,7 @@ export class AuthFlow {
   async authenticate(
     gatewayUrl: string,
     opts?: { aid?: string },
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     let identity = this._loadIdentityOrRaise(opts?.aid);
     if (!identity.cert) {
       // 本地有密钥但无证书——尝试从 PKI 下载恢复
@@ -409,7 +428,7 @@ export class AuthFlow {
    * 确保已认证（自动创建 + 登录）。
    * 如果没有本地身份则创建，然后执行登录流程。
    */
-  async ensureAuthenticated(gatewayUrl: string): Promise<Record<string, unknown>> {
+  async ensureAuthenticated(gatewayUrl: string): Promise<AuthContext> {
     const identity = this._ensureIdentity();
     if (!identity.cert) {
       const created = await this._createAid(gatewayUrl, identity);
@@ -434,8 +453,8 @@ export class AuthFlow {
    */
   async refreshCachedTokens(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<IdentityRecord> {
     const refreshToken = String(identity.refresh_token || '');
     if (!refreshToken) {
       throw new AuthError('missing refresh_token');
@@ -453,7 +472,7 @@ export class AuthFlow {
    */
   async initializeWithToken(
     transport: RPCTransport,
-    challenge: Record<string, unknown> | null,
+    challenge: RpcMessage | null,
     accessToken: string,
   ): Promise<void> {
     const nonce = this._extractChallengeNonce(challenge);
@@ -466,13 +485,13 @@ export class AuthFlow {
    */
   async connectSession(
     transport: RPCTransport,
-    challenge: Record<string, unknown> | null,
+    challenge: RpcMessage | null,
     gatewayUrl: string,
     opts?: { accessToken?: string },
-  ): Promise<Record<string, unknown>> {
+  ): Promise<AuthContext> {
     const nonce = this._extractChallengeNonce(challenge);
 
-    let identity: Record<string, unknown> | null;
+    let identity: IdentityRecord | null;
     try {
       identity = this.loadIdentity();
     } catch {
@@ -584,8 +603,8 @@ export class AuthFlow {
   private async _shortRpc(
     gatewayUrl: string,
     method: string,
-    params: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    params: RpcParams,
+  ): Promise<JsonObject> {
     const ws = await this._connectionFactory(gatewayUrl);
     try {
       // 接收 challenge（第一条消息）
@@ -607,14 +626,14 @@ export class AuthFlow {
       if (message.error) {
         throw mapRemoteError(message.error);
       }
-      const result = message.result;
-      if (typeof result !== 'object' || result === null) {
+      const result = isJsonObject(message.result) ? message.result : null;
+      if (result === null) {
         throw new ValidationError(`invalid pre-auth response for ${method}`);
       }
       if (result.success === false) {
         throw new AuthError(String(result.error || `${method} failed`));
       }
-      return result as Record<string, unknown>;
+      return result;
     } finally {
       try {
         ws.close();
@@ -660,8 +679,8 @@ export class AuthFlow {
   /** 注册 AID 到 Gateway */
   private async _createAid(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<JsonObject> {
     const response = await this._shortRpc(gatewayUrl, 'auth.create_aid', {
       aid: identity.aid,
       public_key: identity.public_key_der_b64,
@@ -673,8 +692,8 @@ export class AuthFlow {
   /** 两阶段登录 */
   private async _login(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<JsonObject> {
     const clientNonce = this._crypto.newClientNonce();
 
     // Phase 1: 发送 AID + 证书 + 客户端 nonce
@@ -706,7 +725,7 @@ export class AuthFlow {
   private async _refreshAccessToken(
     gatewayUrl: string,
     refreshToken: string,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', {
       refresh_token: refreshToken,
     });
@@ -722,7 +741,7 @@ export class AuthFlow {
     nonce: string,
     token: string,
   ): Promise<void> {
-    const result = (await transport.call('auth.connect', {
+    const result = await transport.call('auth.connect', {
       nonce,
       auth: { method: 'kite_token', token },
       protocol: { min: '1.0', max: '1.0' },
@@ -730,9 +749,9 @@ export class AuthFlow {
         e2ee: true,
         group_e2ee: true,
       },
-    })) as Record<string, unknown> | undefined;
+    });
 
-    const status = (result ?? {}).status;
+    const status = isJsonObject(result) ? result.status : undefined;
     if (status !== 'ok') {
       throw new AuthError(`initialize failed: ${JSON.stringify(result)}`);
     }
@@ -748,7 +767,7 @@ export class AuthFlow {
    */
   private async _verifyPhase1Response(
     gatewayUrl: string,
-    result: Record<string, unknown>,
+    result: JsonObject,
     clientNonce: string,
   ): Promise<void> {
     const authCertPem = String(result.auth_cert || '');
@@ -979,7 +998,7 @@ export class AuthFlow {
       // CRL 解析失败时，降级使用 JSON 响应中的 revoked_serials（如果提供）
       const serialsArr = payload.revoked_serials;
       if (Array.isArray(serialsArr)) {
-        revokedSerials = new Set(serialsArr.map((s: unknown) => String(s).toLowerCase()));
+        revokedSerials = new Set(serialsArr.map((s) => String(s).toLowerCase()));
       }
       // 如果两者都没有，返回空集合（无吊销记录）
       _authLog('debug', 'CRL PEM 解析失败，使用 JSON revoked_serials 降级');
@@ -1414,8 +1433,8 @@ export class AuthFlow {
    */
   private async _recoverCertViaDownload(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<IdentityRecord> {
     const certUrl = _gatewayHttpUrl(gatewayUrl, `/pki/cert/${identity.aid}`);
     const certPem = await _fetchText(certUrl, this._verifySsl);
     if (!certPem || !certPem.includes('BEGIN CERTIFICATE')) {
@@ -1446,7 +1465,7 @@ export class AuthFlow {
    * 安全要点：CN/公钥/时间 + 完整链验证 + 受信根锚定 + CRL/OCSP。
    */
   private async _validateNewCert(
-    identity: Record<string, unknown>,
+    identity: IdentityRecord,
     gatewayUrl: string = '',
   ): Promise<void> {
     const newCertPem = identity._pending_new_cert;
@@ -1510,23 +1529,23 @@ export class AuthFlow {
    * 与 Python SDK 的 _remember_tokens 对齐。
    */
   private static _rememberTokens(
-    identity: Record<string, unknown>,
-    authResult: Record<string, unknown>,
+    identity: IdentityRecord,
+    authResult: JsonObject,
   ): void {
     const accessToken = authResult.access_token || authResult.token || authResult.kite_token;
     const refreshToken = authResult.refresh_token;
     const expiresIn = authResult.expires_in;
 
-    if (accessToken) identity.access_token = accessToken;
-    if (refreshToken) identity.refresh_token = refreshToken;
-    if (authResult.token) identity.kite_token = authResult.token;
+    if (typeof accessToken === 'string' && accessToken) identity.access_token = accessToken;
+    if (typeof refreshToken === 'string' && refreshToken) identity.refresh_token = refreshToken;
+    if (typeof authResult.token === 'string' && authResult.token) identity.kite_token = authResult.token;
     if (typeof expiresIn === 'number') {
       identity.access_token_expires_at = Math.floor(Date.now() / 1000 + expiresIn);
     }
     // 协议要求：login2 响应含 new_cert 时（证书过半自动续期），客户端必须保存
     // 先暂存到 _pending_new_cert，由 _validate_new_cert 验证后再正式接受
     const newCert = authResult.new_cert;
-    if (newCert) {
+    if (typeof newCert === 'string' && newCert) {
       identity._pending_new_cert = newCert;
     }
   }
@@ -1535,7 +1554,7 @@ export class AuthFlow {
    * 获取缓存的 access_token（30 秒提前过期余量）。
    * 返回空字符串表示 token 不可用。
    */
-  private static _getCachedAccessToken(identity: Record<string, unknown>): string {
+  private static _getCachedAccessToken(identity: IdentityRecord): string {
     const accessToken = String(identity.access_token || '');
     if (!accessToken) return '';
     const expiresAt = identity.access_token_expires_at;
@@ -1547,14 +1566,29 @@ export class AuthFlow {
 
   // ── 内部方法：身份管理 ─────────────────────────────────────
 
+  // AID name 验证：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
+  private static readonly _AID_NAME_RE = /^[a-z0-9_][a-z0-9_-]{3,63}$/;
+
+  private static _validateAidName(aid: string): void {
+    const name = aid.includes('.') ? aid.split('.')[0] : aid;
+    if (!AuthFlow._AID_NAME_RE.test(name)) {
+      throw new ValidationError(
+        `Invalid AID name '${name}': must be 4-64 characters, only [a-z0-9_-], cannot start with '-'`,
+      );
+    }
+    if (name.startsWith('guest')) {
+      throw new ValidationError("AID name must not start with 'guest'");
+    }
+  }
+
   /** 确保本地有指定 AID 的身份（不存在则创建密钥对） */
-  private _ensureLocalIdentity(aid: string): Record<string, unknown> {
+  private _ensureLocalIdentity(aid: string): IdentityRecord {
     const existing = this._keystore.loadIdentity(aid);
     if (existing) {
       this._aid = aid;
       return existing;
     }
-    const identity: Record<string, unknown> = this._crypto.generateIdentity();
+    const identity = this._crypto.generateIdentity() as IdentityRecord;
     identity.aid = aid;
     this._keystore.saveIdentity(aid, identity); // 立即持久化密钥对
     this._aid = aid;
@@ -1562,7 +1596,7 @@ export class AuthFlow {
   }
 
   /** 加载身份信息，不存在时抛出 StateError */
-  private _loadIdentityOrRaise(aid?: string): Record<string, unknown> {
+  private _loadIdentityOrRaise(aid?: string): IdentityRecord {
     const requestedAid = aid ?? this._aid;
     if (requestedAid) {
       const existing = this._keystore.loadIdentity(requestedAid);
@@ -1573,9 +1607,9 @@ export class AuthFlow {
       return existing;
     }
     // 尝试加载任意身份
-    const ks = this._keystore as Record<string, unknown>;
+    const ks = this._keystore as AnyIdentityKeyStore;
     if (typeof ks.loadAnyIdentity === 'function') {
-      const existing = (ks.loadAnyIdentity as () => Record<string, unknown> | null)();
+      const existing = ks.loadAnyIdentity();
       if (existing !== null && existing !== undefined) {
         const loadedAid = existing.aid;
         if (typeof loadedAid === 'string' && loadedAid) {
@@ -1588,7 +1622,7 @@ export class AuthFlow {
   }
 
   /** 确保有身份（不存在时自动创建密钥对） */
-  private _ensureIdentity(): Record<string, unknown> {
+  private _ensureIdentity(): IdentityRecord {
     try {
       return this._loadIdentityOrRaise();
     } catch (e) {
@@ -1596,7 +1630,7 @@ export class AuthFlow {
       if (!this._aid) {
         throw new StateError('no local identity found, call auth.createAid() first');
       }
-      const identity: Record<string, unknown> = this._crypto.generateIdentity();
+      const identity = this._crypto.generateIdentity() as IdentityRecord;
       identity.aid = this._aid;
       this._keystore.saveIdentity(this._aid, identity); // 立即持久化
       return identity;
@@ -1604,8 +1638,8 @@ export class AuthFlow {
   }
 
   /** 从 challenge 消息中提取 nonce */
-  private _extractChallengeNonce(challenge: Record<string, unknown> | null): string {
-    const params = (challenge?.params ?? {}) as Record<string, unknown>;
+  private _extractChallengeNonce(challenge: RpcMessage | null): string {
+    const params = isJsonObject(challenge?.params) ? challenge.params : {};
     const nonce = String(params.nonce || '');
     if (!nonce) {
       throw new AuthError('gateway challenge missing nonce');
@@ -1690,4 +1724,16 @@ export class AuthFlow {
 
     return certs;
   }
+}
+interface ExportedJwk extends JsonObject {
+  crv?: string;
+}
+
+interface AuthContext extends JsonObject {
+  token?: string;
+  identity?: IdentityRecord;
+}
+
+interface AnyIdentityKeyStore extends KeyStore {
+  loadAnyIdentity?: () => IdentityRecord | null;
 }

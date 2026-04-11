@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import base64
 import json
 import secrets
@@ -318,6 +319,48 @@ def _store_secret(ks, epoch=1, gs=None):
     return gs
 
 
+class StructuredGroupKeystore:
+    def __init__(self):
+        self._groups = {}
+
+    def load_metadata(self, aid):
+        raise AssertionError("structured group path should not use load_metadata")
+
+    def save_metadata(self, aid, meta):
+        raise AssertionError("structured group path should not use save_metadata")
+
+    def load_group_secret_state(self, aid, group_id):
+        entry = self._groups.get(aid, {}).get(group_id)
+        return copy.deepcopy(entry) if isinstance(entry, dict) else None
+
+    def load_all_group_secret_states(self, aid):
+        groups = self._groups.get(aid, {})
+        return copy.deepcopy(groups)
+
+    def save_group_secret_state(self, aid, group_id, entry):
+        self._groups.setdefault(aid, {})[group_id] = copy.deepcopy(entry)
+
+    def cleanup_group_old_epochs_state(self, aid, group_id, cutoff_ms):
+        entry = self._groups.get(aid, {}).get(group_id)
+        if not isinstance(entry, dict):
+            return 0
+        old_epochs = entry.get("old_epochs")
+        if not isinstance(old_epochs, list):
+            return 0
+        removed = 0
+        remaining = []
+        for old in old_epochs:
+            if not isinstance(old, dict):
+                continue
+            marker = old.get("updated_at") or old.get("expires_at") or 0
+            if isinstance(marker, (int, float)) and int(marker) < cutoff_ms:
+                removed += 1
+                continue
+            remaining.append(copy.deepcopy(old))
+        entry["old_epochs"] = remaining
+        return removed
+
+
 class TestStoreGroupSecret:
     def test_store_group_secret_protected(self, tmp_path):
         """group_secret 明文不出现在磁盘 JSON 中"""
@@ -396,6 +439,30 @@ class TestCleanupOldEpochs:
 
         all_secrets = load_all_group_secrets(ks, _AID, _GRP)
         assert len(all_secrets) == 2
+
+
+class TestStructuredGroupStateKeystore:
+    def test_store_load_and_cleanup_without_metadata_roundtrip(self):
+        """group secret 生命周期应优先走结构化接口。"""
+        ks = StructuredGroupKeystore()
+        gs1 = _store_secret(ks, epoch=1)
+        gs2 = _store_secret(ks, epoch=2)
+        ks._groups[_AID][_GRP]["old_epochs"][0]["updated_at"] = 0
+        ks._groups[_AID][_GRP]["old_epochs"][0]["expires_at"] = int(time.time() * 1000) - 1
+
+        current = load_group_secret(ks, _AID, _GRP)
+        assert current["epoch"] == 2
+        assert current["secret"] == gs2
+
+        old = load_group_secret(ks, _AID, _GRP, epoch=1)
+        assert old is not None
+        assert old["secret"] == gs1
+
+        removed = cleanup_old_epochs(ks, _AID, _GRP, retention_seconds=0)
+        assert removed == 1
+
+        all_secrets = load_all_group_secrets(ks, _AID, _GRP)
+        assert all_secrets == {2: gs2}
 
 
 class TestGroupReplayGuardUnit:
@@ -1271,4 +1338,3 @@ class TestCommitmentBindsGroupSecret:
         ks = _make_keystore(tmp_path)
         result = handle_key_distribution(dist, ks, _BOB, initiator_cert_pem=cert_pem)
         assert result is False  # commitment 不匹配
-

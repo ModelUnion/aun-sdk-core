@@ -6,13 +6,16 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -71,12 +74,26 @@ var internalOnlyMethods = map[string]bool{
 
 // 需要客户端签名的关键方法
 var signedMethods = map[string]bool{
-	"group.send":          true,
-	"group.kick":          true,
-	"group.add_member":    true,
-	"group.leave":         true,
-	"group.remove_member": true,
-	"group.update_rules":  true,
+	"group.send":                      true,
+	"group.kick":                      true,
+	"group.add_member":                true,
+	"group.leave":                     true,
+	"group.remove_member":             true,
+	"group.update_rules":              true,
+	"group.update":                    true,
+	"group.update_announcement":       true,
+	"group.update_join_requirements":  true,
+	"group.set_role":                  true,
+	"group.transfer_owner":            true,
+	"group.review_join_request":       true,
+	"group.batch_review_join_request": true,
+	"group.resources.put":             true,
+	"group.resources.update":          true,
+	"group.resources.delete":          true,
+	"group.resources.request_add":     true,
+	"group.resources.direct_add":      true,
+	"group.resources.approve_request": true,
+	"group.resources.reject_request":  true,
 }
 
 // 对端证书缓存 TTL（秒）
@@ -117,10 +134,16 @@ type AUNClient struct {
 	// 对端证书缓存
 	certCache   map[string]*cachedPeerCert
 	certCacheMu sync.RWMutex
+	prekeyReplenishInflight map[string]bool
+	prekeyReplenished       map[string]bool
+
+	// 消息序列号跟踪器（群消息 + P2P 空洞检测）
+	seqTracker *SeqTracker
 
 	// 后台任务上下文
 	ctx    context.Context
 	cancel context.CancelFunc
+	prekeyUploadHook func(context.Context) error
 
 	// Auth 命名空间
 	Auth *namespace.AuthNamespace
@@ -144,12 +167,12 @@ func NewClient(config map[string]any) *AUNClient {
 		}
 	}
 	if ks == nil {
-		// FileKeyStore 需要由调用方提供，或者使用默认参数创建
-		// 此处使用最简单的方式：尝试创建
-		fks, err := keystore.NewFileKeyStore(cfg.AUNPath, nil, cfg.EncryptionSeed)
+		backupPath := filepath.Join(cfg.AUNPath, ".aun_backup", "aun_backup.db")
+		backup := keystore.NewSQLiteBackup(backupPath)
+		fks, err := keystore.NewFileKeyStore(cfg.AUNPath, nil, cfg.EncryptionSeed, backup)
 		if err != nil {
 			log.Printf("创建默认 FileKeyStore 失败: %v, 使用空路径", err)
-			fks, _ = keystore.NewFileKeyStore(cfg.AUNPath, nil, "")
+			fks, _ = keystore.NewFileKeyStore(cfg.AUNPath, nil, "", backup)
 		}
 		ks = fks
 	}
@@ -171,7 +194,8 @@ func NewClient(config map[string]any) *AUNClient {
 		auth:        authFlow,
 		events:      events,
 		discovery:   NewGatewayDiscovery(cfg.VerifySSL),
-		certCache:   make(map[string]*cachedPeerCert),
+		certCache:    make(map[string]*cachedPeerCert),
+		seqTracker: NewSeqTracker(),
 		sessionOptions: map[string]any{
 			"auto_reconnect":       false,
 			"heartbeat_interval":   30.0,
@@ -186,6 +210,8 @@ func NewClient(config map[string]any) *AUNClient {
 				"http":    30.0,
 			},
 		},
+		prekeyReplenishInflight: make(map[string]bool),
+		prekeyReplenished:       make(map[string]bool),
 	}
 
 	// 创建 RPCTransport（使用断线回调）
@@ -219,8 +245,8 @@ func NewClient(config map[string]any) *AUNClient {
 		},
 		Keystore:              ks,
 		Config:                cfg,
-		SenderCertResolver:    func(aid string) string { return c.getVerifiedPeerCert(aid) },
-		InitiatorCertResolver: func(aid string) string { return c.getVerifiedPeerCert(aid) },
+		SenderCertResolver:    func(aid string) string { return c.getVerifiedPeerCert(aid, "") },
+		InitiatorCertResolver: func(aid string) string { return c.getVerifiedPeerCert(aid, "") },
 	})
 
 	// Auth 命名空间
@@ -413,12 +439,17 @@ func (c *AUNClient) Close() error {
 	cancelFn := c.cancel
 	c.mu.Unlock()
 
+	c.saveSeqTrackerState()
+
 	// 取消所有后台任务
 	if cancelFn != nil {
 		cancelFn()
 	}
 
 	if state == StateIdle || state == StateClosed {
+		if closer, ok := c.keyStore.(interface{ Close() }); ok {
+			closer.Close()
+		}
 		c.mu.Lock()
 		c.state = StateClosed
 		c.mu.Unlock()
@@ -428,6 +459,9 @@ func (c *AUNClient) Close() error {
 	// 关闭传输层
 	if err := c.transport.Close(); err != nil {
 		log.Printf("关闭传输层失败: %v", err)
+	}
+	if closer, ok := c.keyStore.(interface{ Close() }); ok {
+		closer.Close()
 	}
 
 	c.mu.Lock()
@@ -462,6 +496,9 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			copied[k] = v
 		}
 		params = copied
+	}
+	if err := c.validateOutboundCall(method, params); err != nil {
+		return nil, err
 	}
 
 	// 自动加密：message.send 默认加密
@@ -507,6 +544,19 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		if resultMap, ok := result.(map[string]any); ok {
 			if messages, ok := resultMap["messages"].([]any); ok && len(messages) > 0 {
 				resultMap["messages"] = c.decryptMessages(ctx, messages)
+				// 更新 SeqTracker
+				c.mu.RLock()
+				myAID := c.aid
+				c.mu.RUnlock()
+				if myAID != "" {
+					var pullMsgs []map[string]any
+					for _, raw := range messages {
+						if m, ok := raw.(map[string]any); ok {
+							pullMsgs = append(pullMsgs, m)
+						}
+					}
+					c.seqTracker.OnPullResult("p2p:"+myAID, pullMsgs)
+				}
 			}
 		}
 	}
@@ -516,6 +566,17 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		if resultMap, ok := result.(map[string]any); ok {
 			if messages, ok := resultMap["messages"].([]any); ok && len(messages) > 0 {
 				resultMap["messages"] = c.decryptGroupMessages(ctx, messages)
+				// 更新 SeqTracker
+				gid, _ := params["group_id"].(string)
+				if gid != "" {
+					var pullMsgs []map[string]any
+					for _, raw := range messages {
+						if m, ok := raw.(map[string]any); ok {
+							pullMsgs = append(pullMsgs, m)
+						}
+					}
+					c.seqTracker.OnPullResult("group:"+gid, pullMsgs)
+				}
 			}
 		}
 	}
@@ -656,11 +717,22 @@ func (c *AUNClient) signClientOperation(method string, params map[string]any) {
 		return
 	}
 
+	// 证书指纹
+	certFingerprint := ""
+	if certPEM, ok := identity["cert"].(string); ok && certPEM != "" {
+		block, _ := pem.Decode([]byte(certPEM))
+		if block != nil {
+			fp := sha256.Sum256(block.Bytes)
+			certFingerprint = "sha256:" + fmt.Sprintf("%x", fp)
+		}
+	}
+
 	params["client_signature"] = map[string]any{
-		"aid":         aidStr,
-		"timestamp":   ts,
-		"params_hash": paramsHash,
-		"signature":   base64.StdEncoding.EncodeToString(sig),
+		"aid":              aidStr,
+		"cert_fingerprint": certFingerprint,
+		"timestamp":        ts,
+		"params_hash":      paramsHash,
+		"signature":        base64.StdEncoding.EncodeToString(sig),
 	}
 }
 
@@ -669,6 +741,9 @@ func (c *AUNClient) signClientOperation(method string, params map[string]any) {
 // sendEncrypted 自动加密并发送 P2P 消息
 func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (any, error) {
 	toAID, _ := params["to"].(string)
+	if err := validateMessageRecipient(toAID); err != nil {
+		return nil, err
+	}
 	payload, _ := params["payload"].(map[string]any)
 	messageID, _ := params["message_id"].(string)
 	if messageID == "" {
@@ -679,14 +754,24 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 		timestamp = time.Now().UnixMilli()
 	}
 
-	// 获取对方证书
-	peerCertPEM, err := c.fetchPeerCert(ctx, toAID)
+	// 获取对方 prekey（可能没有）
+	var prekey map[string]any
+	prekey, err := c.fetchPeerPrekey(ctx, toAID)
+	if err != nil {
+		if _, ok := err.(*NotFoundError); !ok {
+			return nil, err
+		}
+		prekey = nil
+	}
+
+	peerCertFingerprint := ""
+	if prekey != nil {
+		peerCertFingerprint = strings.TrimSpace(strings.ToLower(getStr(prekey, "cert_fingerprint", "")))
+	}
+	peerCertPEM, err := c.fetchPeerCert(ctx, toAID, peerCertFingerprint)
 	if err != nil {
 		return nil, err
 	}
-
-	// 获取对方 prekey（可能没有）
-	prekey := c.fetchPeerPrekey(ctx, toAID)
 
 	envelope, encryptResult, err := c.e2ee.EncryptOutbound(
 		toAID, payload, peerCertPEM, prekey, messageID, timestamp,
@@ -810,6 +895,18 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 		return
 	}
 
+	// P2P 空洞检测
+	seq := int(toInt64(msg["seq"]))
+	c.mu.RLock()
+	myAID := c.aid
+	c.mu.RUnlock()
+	if seq > 0 && myAID != "" {
+		needPull := c.seqTracker.OnMessageSeq("p2p:"+myAID, seq)
+		if needPull {
+			go c.fillP2pGap()
+		}
+	}
+
 	ctx := context.Background()
 	decrypted := c.decryptSingleMessage(ctx, msg)
 	c.events.Publish("message.received", decrypted)
@@ -821,6 +918,9 @@ func (c *AUNClient) onRawGroupMessageCreated(data any) {
 }
 
 // processAndPublishGroupMessage 处理群组推送消息的 goroutine
+//
+// 带 payload 的事件（消息推送）：解密后 re-publish。
+// 不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
 func (c *AUNClient) processAndPublishGroupMessage(data any) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -835,28 +935,290 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 	}
 
 	msg := copyMapShallow(dataMap)
+	groupID, _ := msg["group_id"].(string)
+	seq := int(toInt64(msg["seq"]))
+
+	// 空洞检测（无论带不带 payload 都检查）
+	if groupID != "" && seq > 0 {
+		needPull := c.seqTracker.OnMessageSeq("group:"+groupID, seq)
+		if needPull {
+			go c.fillGroupGap(groupID)
+		}
+	}
+
+	// 检查是否带 payload
+	payload := msg["payload"]
+	hasPayload := false
+	if payload != nil {
+		if pm, ok := payload.(map[string]any); ok && len(pm) > 0 {
+			hasPayload = true
+		} else if _, ok := payload.(string); ok {
+			hasPayload = true
+		}
+	}
+
+	if !hasPayload {
+		// 不带 payload 的通知：自动 pull 最新消息
+		c.autoPullGroupMessages(msg)
+		return
+	}
+
 	ctx := context.Background()
 	decrypted := c.decryptGroupMessage(ctx, msg)
 	c.events.Publish("group.message_created", decrypted)
 }
 
-// onRawGroupChanged 处理群组变更事件
-func (c *AUNClient) onRawGroupChanged(data any) {
-	// 透传给用户
-	c.events.Publish("group.changed", data)
+// autoPullGroupMessages 收到不带 payload 的通知后自动 pull 最新消息
+func (c *AUNClient) autoPullGroupMessages(notification map[string]any) {
+	groupID, _ := notification["group_id"].(string)
+	if groupID == "" {
+		c.events.Publish("group.message_created", notification)
+		return
+	}
+	ns := "group:" + groupID
+	afterSeq := c.seqTracker.GetContiguousSeq(ns)
 
-	// 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
-	dataMap, ok := data.(map[string]any)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "group.pull", map[string]any{
+		"group_id":          groupID,
+		"after_message_seq": afterSeq,
+		"device_id":         c.configModel.DeviceID(),
+		"limit":             50,
+	})
+	if err != nil {
+		log.Printf("自动 pull 群消息失败: %v", err)
+		c.events.Publish("group.message_created", notification)
+		return
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		c.events.Publish("group.message_created", notification)
+		return
+	}
+	messages, ok := resultMap["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		c.events.Publish("group.message_created", notification)
+		return
+	}
+	// 更新 SeqTracker
+	var pullMsgs []map[string]any
+	for _, raw := range messages {
+		if m, ok := raw.(map[string]any); ok {
+			pullMsgs = append(pullMsgs, m)
+		}
+	}
+	c.seqTracker.OnPullResult(ns, pullMsgs)
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if ok {
+			c.events.Publish("group.message_created", msg)
+		}
+	}
+}
+
+// fillGroupGap 后台补齐群消息空洞
+func (c *AUNClient) fillGroupGap(groupID string) {
+	ns := "group:" + groupID
+	afterSeq := c.seqTracker.GetContiguousSeq(ns)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "group.pull", map[string]any{
+		"group_id":          groupID,
+		"after_message_seq": afterSeq,
+		"device_id":         c.configModel.DeviceID(),
+		"limit":             50,
+	})
+	if err != nil {
+		return
+	}
+	resultMap, ok := result.(map[string]any)
 	if !ok {
 		return
 	}
+	messages, ok := resultMap["messages"].([]any)
+	if !ok {
+		return
+	}
+	var pullMsgs []map[string]any
+	for _, raw := range messages {
+		if m, ok := raw.(map[string]any); ok {
+			pullMsgs = append(pullMsgs, m)
+		}
+	}
+	c.seqTracker.OnPullResult(ns, pullMsgs)
+	for _, raw := range messages {
+		if msg, ok := raw.(map[string]any); ok {
+			c.events.Publish("group.message_created", msg)
+		}
+	}
+}
+
+// fillGroupEventGap 后台补齐群事件空洞
+func (c *AUNClient) fillGroupEventGap(groupID string) {
+	ns := "group_event:" + groupID
+	afterSeq := c.seqTracker.GetContiguousSeq(ns)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "group.pull_events", map[string]any{
+		"group_id":        groupID,
+		"after_event_seq": afterSeq,
+		"device_id":       c.configModel.DeviceID(),
+		"limit":           50,
+	})
+	if err != nil {
+		return
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return
+	}
+	events, ok := resultMap["events"].([]any)
+	if !ok {
+		return
+	}
+	var pullEvts []map[string]any
+	for _, raw := range events {
+		if e, ok := raw.(map[string]any); ok {
+			pullEvts = append(pullEvts, e)
+		}
+	}
+	c.seqTracker.OnPullResult(ns, pullEvts)
+	for _, raw := range events {
+		if evt, ok := raw.(map[string]any); ok {
+			c.events.Publish("group.changed", evt)
+		}
+	}
+}
+
+// fillP2pGap 后台补齐 P2P 消息空洞
+func (c *AUNClient) fillP2pGap() {
+	c.mu.RLock()
+	myAID := c.aid
+	c.mu.RUnlock()
+	if myAID == "" {
+		return
+	}
+	ns := "p2p:" + myAID
+	afterSeq := c.seqTracker.GetContiguousSeq(ns)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "message.pull", map[string]any{
+		"after_seq": afterSeq,
+		"limit":     50,
+	})
+	if err != nil {
+		return
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return
+	}
+	messages, ok := resultMap["messages"].([]any)
+	if !ok {
+		return
+	}
+	var pullMsgs []map[string]any
+	for _, raw := range messages {
+		if m, ok := raw.(map[string]any); ok {
+			pullMsgs = append(pullMsgs, m)
+		}
+	}
+	c.seqTracker.OnPullResult(ns, pullMsgs)
+	for _, raw := range messages {
+		if msg, ok := raw.(map[string]any); ok {
+			c.events.Publish("message.received", msg)
+		}
+	}
+}
+
+// onRawGroupChanged 处理群组变更事件
+func (c *AUNClient) onRawGroupChanged(data any) {
+	dataMap, ok := data.(map[string]any)
+	if !ok {
+		c.events.Publish("group.changed", data)
+		return
+	}
+
+	// 验签：有 client_signature 就验，没有默认安全
+	if cs, ok := dataMap["client_signature"].(map[string]any); ok {
+		dataMap["_verified"] = c.verifyEventSignature(cs)
+	}
+
+	c.events.Publish("group.changed", dataMap)
+
+	// 收到事件推送后自动 pull 补齐
+	groupID, _ := dataMap["group_id"].(string)
+	if groupID != "" {
+		go c.fillGroupEventGap(groupID)
+	}
+
+	// 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
 	action, _ := dataMap["action"].(string)
 	if action == "member_left" || action == "member_removed" {
-		groupID, _ := dataMap["group_id"].(string)
 		if groupID != "" {
 			go c.rotateGroupEpoch(context.Background(), groupID)
 		}
 	}
+}
+
+// verifyEventSignature 验证群事件中的 client_signature。返回 true/false/"pending"。
+func (c *AUNClient) verifyEventSignature(cs map[string]any) any {
+	sigAID, _ := cs["aid"].(string)
+	method, _ := cs["_method"].(string)
+	if sigAID == "" || method == "" {
+		return "pending"
+	}
+	// 只用已缓存的证书，不阻塞
+	expectedFP := strings.TrimSpace(strings.ToLower(getStr(cs, "cert_fingerprint", "")))
+	c.certCacheMu.RLock()
+	cached := c.certCache[certCacheKey(sigAID, expectedFP)]
+	c.certCacheMu.RUnlock()
+	if cached == nil || len(cached.certBytes) == 0 {
+		// 异步触发证书获取
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			c.fetchPeerCert(ctx, sigAID, expectedFP)
+		}()
+		return "pending"
+	}
+	// 解析证书
+	block, _ := pem.Decode(cached.certBytes)
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	// cert_fingerprint 校验
+	if expectedFP != "" {
+		actualFP := "sha256:" + fmt.Sprintf("%x", sha256.Sum256(block.Bytes))
+		if actualFP != expectedFP {
+			log.Printf("验签失败：证书指纹不匹配 aid=%s", sigAID)
+			return false
+		}
+	}
+	// 验签
+	paramsHash, _ := cs["params_hash"].(string)
+	timestamp, _ := cs["timestamp"].(string)
+	signData := []byte(fmt.Sprintf("%s|%s|%s|%s", method, sigAID, timestamp, paramsHash))
+	sigB64, _ := cs["signature"].(string)
+	sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return false
+	}
+	hash := sha256.Sum256(signData)
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return false
+	}
+	if !ecdsa.VerifyASN1(pub, hash[:], sigBytes) {
+		log.Printf("群事件验签失败 aid=%s method=%s", sigAID, method)
+		return false
+	}
+	return true
 }
 
 // tryHandleGroupKeyMessage 尝试处理 P2P 传输的群组密钥消息。返回 true 表示已处理。
@@ -879,6 +1241,7 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 		if err != nil || decrypted == nil {
 			return false
 		}
+		c.schedulePrekeyReplenishIfConsumed(decrypted)
 		ap, ok := decrypted["payload"].(map[string]any)
 		if !ok {
 			return false
@@ -943,10 +1306,19 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 
 // ── E2EE 编排辅助 ────────────────────────────────────────
 
+func certCacheKey(aid, certFingerprint string) string {
+	normalized := strings.TrimSpace(strings.ToLower(certFingerprint))
+	if normalized == "" {
+		return aid
+	}
+	return aid + "#" + normalized
+}
+
 // fetchPeerCert 获取对方证书（带缓存 + 完整 PKI 验证）
-func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string) ([]byte, error) {
+func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerprint string) ([]byte, error) {
+	cacheKey := certCacheKey(aid, certFingerprint)
 	c.certCacheMu.RLock()
-	cached := c.certCache[aid]
+	cached := c.certCache[cacheKey]
 	c.certCacheMu.RUnlock()
 	if cached != nil && float64(time.Now().Unix()) < cached.refreshAfter {
 		return cached.certBytes, nil
@@ -961,7 +1333,7 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string) ([]byte, erro
 
 	// 跨域时用 peer 所在域的 Gateway URL
 	peerGatewayURL := resolvePeerGatewayURL(gatewayURL, aid)
-	certURL := buildCertURL(peerGatewayURL, aid)
+	certURL := buildCertURL(peerGatewayURL, aid, certFingerprint)
 
 	// HTTP GET 下载证书
 	transport := &http.Transport{}
@@ -995,49 +1367,45 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string) ([]byte, erro
 
 	now := float64(time.Now().Unix())
 	c.certCacheMu.Lock()
-	c.certCache[aid] = &cachedPeerCert{
+	c.certCache[cacheKey] = &cachedPeerCert{
 		certBytes:    certBytes,
 		validatedAt:  now,
 		refreshAfter: now + peerCertCacheTTL,
 	}
 	c.certCacheMu.Unlock()
 
-	// 同步写入 keystore
-	if err := c.keyStore.SaveCert(aid, string(certBytes)); err != nil {
-		log.Printf("写入证书到 keystore 失败 (aid=%s): %v", aid, err)
+	if strings.TrimSpace(certFingerprint) == "" {
+		// 仅 active_signing 路径写回 keystore，避免旧证书覆盖当前证书
+		if err := c.keyStore.SaveCert(aid, string(certBytes)); err != nil {
+			log.Printf("写入证书到 keystore 失败 (aid=%s): %v", aid, err)
+		}
 	}
 
 	return certBytes, nil
 }
 
 // fetchPeerPrekey 获取对方的 prekey
-func (c *AUNClient) fetchPeerPrekey(ctx context.Context, peerAID string) map[string]any {
+func (c *AUNClient) fetchPeerPrekey(ctx context.Context, peerAID string) (map[string]any, error) {
 	cached := c.e2ee.GetCachedPrekey(peerAID)
 	if cached != nil {
-		return cached
+		return cached, nil
 	}
 	result, err := c.transport.Call(ctx, "message.e2ee.get_prekey", map[string]any{"aid": peerAID})
+	prekey, err := parsePeerPrekeyResponse(peerAID, result, err)
 	if err != nil {
-		log.Printf("获取 prekey 失败 (%s): %v", peerAID, err)
-		return nil
+		return nil, err
 	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return nil
-	}
-	found, _ := resultMap["found"].(bool)
-	if !found {
-		return nil
-	}
-	prekey, _ := resultMap["prekey"].(map[string]any)
 	if prekey != nil {
 		c.e2ee.CachePrekey(peerAID, prekey)
 	}
-	return prekey
+	return prekey, nil
 }
 
 // uploadPrekey 生成 prekey 并上传到服务端
 func (c *AUNClient) uploadPrekey(ctx context.Context) error {
+	if c.prekeyUploadHook != nil {
+		return c.prekeyUploadHook(ctx)
+	}
 	prekeyMaterial, err := c.e2ee.GeneratePrekey()
 	if err != nil {
 		return err
@@ -1049,14 +1417,14 @@ func (c *AUNClient) uploadPrekey(ctx context.Context) error {
 // ensureSenderCertCached 确保发送方证书在本地 keystore 中可用
 func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string) bool {
 	c.certCacheMu.RLock()
-	cached := c.certCache[aid]
+	cached := c.certCache[certCacheKey(aid, "")]
 	c.certCacheMu.RUnlock()
 
 	if cached != nil && float64(time.Now().Unix()) < cached.refreshAfter {
 		return true
 	}
 
-	certBytes, err := c.fetchPeerCert(ctx, aid)
+	certBytes, err := c.fetchPeerCert(ctx, aid, "")
 	if err != nil {
 		// 刷新失败时：若内存缓存有 PKI 验证过的证书则继续用
 		if cached != nil && float64(time.Now().Unix()) < cached.validatedAt+peerCertCacheTTL*2 {
@@ -1074,9 +1442,9 @@ func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string) bool
 }
 
 // getVerifiedPeerCert 获取经过 PKI 验证的 peer 证书（零信任：仅信任内存缓存中已验证的证书）
-func (c *AUNClient) getVerifiedPeerCert(aid string) string {
+func (c *AUNClient) getVerifiedPeerCert(aid string, certFingerprint string) string {
 	c.certCacheMu.RLock()
-	cached := c.certCache[aid]
+	cached := c.certCache[certCacheKey(aid, certFingerprint)]
 	c.certCacheMu.RUnlock()
 	if cached != nil && float64(time.Now().Unix()) < cached.validatedAt+peerCertCacheTTL*2 {
 		return string(cached.certBytes)
@@ -1117,6 +1485,7 @@ func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string
 	if err != nil || decrypted == nil {
 		return message
 	}
+	c.schedulePrekeyReplenishIfConsumed(decrypted)
 	return decrypted
 }
 
@@ -1186,7 +1555,7 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 	}
 
 	// 尝试直接解密
-	result, err := c.groupE2EE.Decrypt(message)
+	result, err := c.groupE2EE.Decrypt(message, false)
 	if err == nil && result != nil {
 		if _, ok := result["e2ee"]; ok {
 			return result
@@ -1223,7 +1592,7 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 	return message
 }
 
-// decryptGroupMessages 批量解密群组消息（用于 group.pull）
+// decryptGroupMessages 批量解密群组消息（用于 group.pull，跳过防重放）
 func (c *AUNClient) decryptGroupMessages(ctx context.Context, messages []any) []any {
 	var result []any
 	for _, raw := range messages {
@@ -1232,8 +1601,32 @@ func (c *AUNClient) decryptGroupMessages(ctx context.Context, messages []any) []
 			result = append(result, raw)
 			continue
 		}
-		decrypted := c.decryptGroupMessage(ctx, msg)
-		result = append(result, decrypted)
+		payload, ok := msg["payload"].(map[string]any)
+		if !ok {
+			result = append(result, raw)
+			continue
+		}
+		payloadType, _ := payload["type"].(string)
+		if payloadType != "e2ee.group_encrypted" {
+			result = append(result, raw)
+			continue
+		}
+		senderAID, _ := msg["from"].(string)
+		if senderAID == "" {
+			senderAID, _ = msg["sender_aid"].(string)
+		}
+		if senderAID != "" {
+			if !c.ensureSenderCertCached(ctx, senderAID) {
+				result = append(result, raw)
+				continue
+			}
+		}
+		decrypted, err := c.groupE2EE.Decrypt(msg, true)
+		if err == nil && decrypted != nil {
+			result = append(result, decrypted)
+		} else {
+			result = append(result, raw)
+		}
 	}
 	return result
 }
@@ -1297,6 +1690,7 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 	c.events.Publish("connection.state", map[string]any{"state": "connected", "gateway": gatewayURL})
 
 	// 启动后台任务
+	c.restoreSeqTrackerState()
 	c.startBackgroundTasks(ctx)
 
 	// 上线后自动上传 prekey
@@ -1363,10 +1757,38 @@ func (c *AUNClient) startBackgroundTasks(parentCtx context.Context) {
 	go c.heartbeatLoop(ctx)
 	// Token 刷新循环
 	go c.tokenRefreshLoop(ctx)
-	// Prekey 刷新循环
-	go c.prekeyRefreshLoop(ctx)
 	// 群组 epoch 相关任务
 	c.startGroupEpochTasks(ctx)
+	// 上线/重连后一次性补齐群事件
+	go c.pullAllGroupEventsOnce()
+}
+
+// pullAllGroupEventsOnce 上线/重连后一次性补齐所有已加入群的事件
+func (c *AUNClient) pullAllGroupEventsOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "group.list", map[string]any{})
+	if err != nil {
+		return
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return
+	}
+	items, ok := resultMap["items"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range items {
+		g, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		gid, _ := g["group_id"].(string)
+		if gid != "" {
+			c.fillGroupEventGap(gid)
+		}
+	}
 }
 
 // heartbeatLoop 心跳循环
@@ -1512,34 +1934,7 @@ func (c *AUNClient) tokenRefreshLoop(ctx context.Context) {
 
 // prekeyRefreshLoop Prekey 定时轮换循环
 func (c *AUNClient) prekeyRefreshLoop(ctx context.Context) {
-	interval := 3600.0
-	if v, ok := c.config["prekey_refresh_interval"].(float64); ok && v > 0 {
-		interval = v
-	}
-
-	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.mu.RLock()
-			isClosing := c.closing
-			state := c.state
-			c.mu.RUnlock()
-			if isClosing {
-				return
-			}
-			if state != StateConnected {
-				continue
-			}
-			if err := c.uploadPrekey(ctx); err != nil {
-				log.Printf("prekey 轮换失败: %v", err)
-			}
-		}
-	}
+	return
 }
 
 // startGroupEpochTasks 启动群组 epoch 相关后台任务
@@ -1826,6 +2221,55 @@ func (c *AUNClient) distributeKeyToNewMember(ctx context.Context, groupID, newMe
 	}
 }
 
+// restoreSeqTrackerState 从 keystore metadata 恢复 SeqTracker 状态
+func (c *AUNClient) restoreSeqTrackerState() {
+	c.mu.RLock()
+	aid := c.aid
+	c.mu.RUnlock()
+	if aid == "" {
+		return
+	}
+	metadata, _ := c.keyStore.LoadMetadata(aid)
+	if metadata == nil {
+		return
+	}
+	state, ok := metadata["seq_tracker_state"].(map[string]any)
+	if !ok {
+		return
+	}
+	intState := make(map[string]int)
+	for ns, v := range state {
+		if seq, ok := v.(float64); ok && int(seq) > 0 {
+			intState[ns] = int(seq)
+		}
+	}
+	if len(intState) > 0 {
+		c.seqTracker.RestoreState(intState)
+	}
+}
+
+// saveSeqTrackerState 将 SeqTracker 状态保存到 keystore metadata
+func (c *AUNClient) saveSeqTrackerState() {
+	c.mu.RLock()
+	aid := c.aid
+	c.mu.RUnlock()
+	if aid == "" {
+		return
+	}
+	state := c.seqTracker.ExportState()
+	if len(state) == 0 {
+		return
+	}
+	anyState := make(map[string]any, len(state))
+	for ns, seq := range state {
+		anyState[ns] = seq
+	}
+	_, _ = c.keyStore.UpdateMetadata(aid, func(metadata map[string]any) (map[string]any, error) {
+		metadata["seq_tracker_state"] = anyState
+		return metadata, nil
+	})
+}
+
 // logE2EEError 记录 E2EE 自动编排错误
 func (c *AUNClient) logE2EEError(stage, groupID, aid string, err error) {
 	log.Printf("[e2ee] 编排错误: stage=%s group=%s aid=%s error=%v", stage, groupID, aid, err)
@@ -2066,8 +2510,120 @@ func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 
 // ── 静态辅助函数 ──────────────────────────────────────────
 
+func isGroupServiceAID(aid string) bool {
+	text := strings.TrimSpace(aid)
+	parts := strings.Split(text, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	return parts[0] == "group" && strings.Join(parts[1:], ".") != ""
+}
+
+func validateMessageRecipient(to any) error {
+	toAID := strings.TrimSpace(fmt.Sprint(to))
+	if isGroupServiceAID(toAID) {
+		return NewValidationError("message.send receiver cannot be group.{issuer}; use group.send instead")
+	}
+	return nil
+}
+
+func (c *AUNClient) validateOutboundCall(method string, params map[string]any) error {
+	if method == "message.send" {
+		return validateMessageRecipient(params["to"])
+	}
+	return nil
+}
+
+func extractPeerPrekeyMaterial(value any) (map[string]any, bool) {
+	prekey, ok := value.(map[string]any)
+	if !ok || prekey == nil {
+		return nil, false
+	}
+	prekeyID, ok := prekey["prekey_id"].(string)
+	if !ok || prekeyID == "" {
+		return nil, false
+	}
+	publicKey, ok := prekey["public_key"].(string)
+	if !ok || publicKey == "" {
+		return nil, false
+	}
+	signature, ok := prekey["signature"].(string)
+	if !ok || signature == "" {
+		return nil, false
+	}
+	return prekey, true
+}
+
+func parsePeerPrekeyResponse(peerAID string, result any, callErr error) (map[string]any, error) {
+	if callErr != nil {
+		return nil, NewValidationError(fmt.Sprintf("failed to fetch peer prekey for %s: %v", peerAID, callErr))
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok || resultMap == nil {
+		return nil, NewValidationError(fmt.Sprintf("invalid prekey response for %s", peerAID))
+	}
+	found, ok := resultMap["found"].(bool)
+	if !ok {
+		return nil, NewValidationError(fmt.Sprintf("invalid prekey response for %s", peerAID))
+	}
+	if !found {
+		return nil, NewNotFoundError(fmt.Sprintf("peer prekey not found for %s", peerAID))
+	}
+	prekey, ok := extractPeerPrekeyMaterial(resultMap["prekey"])
+	if !ok {
+		return nil, NewValidationError(fmt.Sprintf("invalid prekey response for %s", peerAID))
+	}
+	return prekey, nil
+}
+
+func extractConsumedPrekeyID(message map[string]any) string {
+	if message == nil {
+		return ""
+	}
+	e2ee, ok := message["e2ee"].(map[string]any)
+	if !ok || e2ee == nil {
+		return ""
+	}
+	mode, _ := e2ee["encryption_mode"].(string)
+	if mode != ModePrekeyECDHV2 {
+		return ""
+	}
+	prekeyID, _ := e2ee["prekey_id"].(string)
+	return strings.TrimSpace(prekeyID)
+}
+
+func (c *AUNClient) schedulePrekeyReplenishIfConsumed(message map[string]any) {
+	prekeyID := extractConsumedPrekeyID(message)
+	if prekeyID == "" {
+		return
+	}
+
+	c.mu.Lock()
+	if c.state != StateConnected || c.prekeyReplenished[prekeyID] || len(c.prekeyReplenishInflight) > 0 {
+		c.mu.Unlock()
+		return
+	}
+	c.prekeyReplenishInflight[prekeyID] = true
+	c.mu.Unlock()
+
+	go func() {
+		err := c.uploadPrekey(context.Background())
+
+		c.mu.Lock()
+		delete(c.prekeyReplenishInflight, prekeyID)
+		if err == nil {
+			c.prekeyReplenished[prekeyID] = true
+		}
+		c.mu.Unlock()
+
+		if err != nil {
+			log.Printf("消费 prekey %s 后补充 current prekey 失败: %v", prekeyID, err)
+		}
+	}()
+}
+
 // buildCertURL 构建证书下载 URL
-func buildCertURL(gatewayURL, aid string) string {
+func buildCertURL(gatewayURL, aid, certFingerprint string) string {
 	parsed, err := url.Parse(gatewayURL)
 	if err != nil {
 		return gatewayURL
@@ -2076,7 +2632,17 @@ func buildCertURL(gatewayURL, aid string) string {
 	if parsed.Scheme == "ws" {
 		scheme = "http"
 	}
-	return fmt.Sprintf("%s://%s/pki/cert/%s", scheme, parsed.Host, url.PathEscape(aid))
+	u := &url.URL{
+		Scheme: scheme,
+		Host:   parsed.Host,
+		Path:   "/pki/cert/" + url.PathEscape(aid),
+	}
+	if normalized := strings.TrimSpace(strings.ToLower(certFingerprint)); normalized != "" {
+		q := url.Values{}
+		q.Set("cert_fingerprint", normalized)
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 // resolvePeerGatewayURL 跨域时将 Gateway URL 替换为 peer 所在域的 Gateway URL

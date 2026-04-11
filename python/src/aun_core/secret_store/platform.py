@@ -36,25 +36,17 @@ class _MigratingSecretStore:
                 _log.warning("旧格式 %s 读取失败: %s", scheme, exc)
         return None
 
-    def clear(self, scope: str, name: str) -> None:
-        self._file.clear(scope, name)
-        if self._native:
-            try:
-                self._native.clear(scope, name)
-            except Exception as _exc:
-                import logging as _logging
-                _logging.getLogger("aun_core").debug("清除失败: %s", _exc)
-
 
 def create_default_secret_store(
     *,
     root: Path | None = None,
     encryption_seed: str | None = None,
+    sqlite_backup: Any = None,
 ) -> SecretStore:
     """所有平台写入用 FileSecretStore（可备份），读取兼容旧平台原生格式。"""
     from .file_store import FileSecretStore
     store_root = root or Path.home() / ".aun"
-    file_store = FileSecretStore(store_root, encryption_seed=encryption_seed)
+    file_store = FileSecretStore(store_root, encryption_seed=encryption_seed, sqlite_backup=sqlite_backup)
 
     native: SecretStore | None = None
     if sys.platform == "win32":

@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { JsonObject } from './types.js';
 
 // ── 设备 ID ──────────────────────────────────────────────────
 
@@ -97,7 +98,7 @@ export function defaultConfig(): AUNConfig {
 // ── 从字典构建配置 ───────────────────────────────────────────
 
 /** 从原始键值对构建配置（与 Python SDK 的 from_dict 对齐） */
-export function configFromMap(raw: Record<string, unknown>): AUNConfig {
+export function configFromMap(raw: JsonObject): AUNConfig {
   const def = defaultConfig();
   const aunPath = raw.aun_path ?? raw.aunPath;
   const dp = raw.discovery_port ?? raw.discoveryPort;

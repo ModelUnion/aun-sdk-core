@@ -204,6 +204,9 @@ func (a *AuthFlow) GetAccessTokenExpiry(identity map[string]any) float64 {
 // CreateAID 注册新 AID，返回 {aid, cert}。
 // 本地有密钥但无证书时，先尝试注册；若 AID 已存在则尝试下载证书恢复。
 func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
+	if err := validateAIDName(aid); err != nil {
+		return nil, err
+	}
 	identity := a.ensureLocalIdentity(aid)
 	if cert := authGetStr(identity, "cert"); cert != "" {
 		return map[string]any{"aid": identity["aid"], "cert": cert}, nil
@@ -1240,6 +1243,25 @@ func (a *AuthFlow) httpClient() *http.Client {
 }
 
 // ── 内部：身份管理 ──────────────────────────────────────────
+
+// aidNameRe AID name 验证：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
+var aidNameRe = regexp.MustCompile(`^[a-z0-9_][a-z0-9_-]{3,63}$`)
+
+// validateAIDName 验证 AID name 部分是否符合协议规范
+func validateAIDName(aid string) error {
+	name := aid
+	if idx := strings.Index(aid, "."); idx >= 0 {
+		name = aid[:idx]
+	}
+	if !aidNameRe.MatchString(name) {
+		return NewValidationError(fmt.Sprintf(
+			"invalid AID name '%s': must be 4-64 characters, only [a-z0-9_-], cannot start with '-'", name))
+	}
+	if strings.HasPrefix(name, "guest") {
+		return NewValidationError("AID name must not start with 'guest'")
+	}
+	return nil
+}
 
 // ensureLocalIdentity 确保本地有指定 AID 的密钥对（无则生成）
 func (a *AuthFlow) ensureLocalIdentity(aid string) map[string]any {

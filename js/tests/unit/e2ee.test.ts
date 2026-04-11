@@ -11,6 +11,7 @@ import {
 } from '../../src/e2ee.js';
 import { CryptoProvider, uint8ToBase64 } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
+import type { IdentityRecord, KeyPairRecord, MetadataRecord, PrekeyMap, PrekeyRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 
@@ -78,9 +79,10 @@ describe('E2EE 常量', () => {
 // ── 内存 KeyStore mock ──────────────────────────────────
 
 function createMockKeyStore(): KeyStore {
-  const keyPairs = new Map<string, Record<string, unknown>>();
+  const keyPairs = new Map<string, KeyPairRecord>();
   const certs = new Map<string, string>();
-  const metadata = new Map<string, Record<string, unknown>>();
+  const metadata = new Map<string, MetadataRecord>();
+  const prekeys = new Map<string, PrekeyMap>();
   return {
     async loadKeyPair(aid) { return keyPairs.get(aid) ?? null; },
     async saveKeyPair(aid, kp) { keyPairs.set(aid, kp); },
@@ -88,7 +90,36 @@ function createMockKeyStore(): KeyStore {
     async saveCert(aid, cert) { certs.set(aid, cert); },
     async loadMetadata(aid) { return metadata.get(aid) ?? null; },
     async saveMetadata(aid, md) { metadata.set(aid, { ...md }); },
-    async deleteKeyPair(aid) { keyPairs.delete(aid); },
+    async loadE2EEPrekeys(aid) { return JSON.parse(JSON.stringify(prekeys.get(aid) ?? {})); },
+    async saveE2EEPrekey(aid, prekeyId, prekeyData) {
+      const current = prekeys.get(aid) ?? {};
+      current[prekeyId] = JSON.parse(JSON.stringify(prekeyData));
+      prekeys.set(aid, current);
+    },
+    async cleanupE2EEPrekeys(aid, cutoffMs, keepLatest = 7) {
+      const current = prekeys.get(aid) ?? {};
+      const removed: string[] = [];
+      const retainedIds = new Set(
+        Object.entries(current)
+          .sort((left, right) => {
+            const leftMarker = Number(left[1].created_at ?? left[1].updated_at ?? left[1].expires_at ?? 0);
+            const rightMarker = Number(right[1].created_at ?? right[1].updated_at ?? right[1].expires_at ?? 0);
+            if (rightMarker !== leftMarker) return rightMarker - leftMarker;
+            return right[0].localeCompare(left[0]);
+          })
+          .slice(0, keepLatest)
+          .map(([prekeyId]) => prekeyId),
+      );
+      for (const [prekeyId, data] of Object.entries(current)) {
+        const marker = Number(data.expires_at ?? data.created_at ?? data.updated_at ?? 0);
+        if (marker < cutoffMs && !retainedIds.has(prekeyId)) {
+          removed.push(prekeyId);
+          delete current[prekeyId];
+        }
+      }
+      prekeys.set(aid, current);
+      return removed;
+    },
     async loadIdentity(aid) {
       const kp = keyPairs.get(aid);
       if (!kp) return null;
@@ -97,17 +128,12 @@ function createMockKeyStore(): KeyStore {
       return { ...kp, ...(md ?? {}), ...(cert ? { cert } : {}) };
     },
     async saveIdentity(aid, identity) {
-      const kp: Record<string, unknown> = {};
+      const kp: KeyPairRecord = {};
       for (const k of ['private_key_pem', 'public_key_der_b64', 'curve']) {
         if (k in identity) kp[k] = identity[k];
       }
       if (Object.keys(kp).length) keyPairs.set(aid, kp);
       if (identity.cert) certs.set(aid, identity.cert as string);
-    },
-    async deleteIdentity(aid) {
-      keyPairs.delete(aid);
-      certs.delete(aid);
-      metadata.delete(aid);
     },
   };
 }
@@ -157,15 +183,56 @@ describe('E2EEManager.generatePrekey', () => {
       expect(typeof prekey.created_at).toBe('number');
       expect(prekey.created_at as number).toBeGreaterThan(0);
 
-      // 验证私钥已保存到 metadata
-      const md = await keystore.loadMetadata(aid);
-      expect(md).not.toBeNull();
-      const prekeys = md!.e2ee_prekeys as Record<string, Record<string, unknown>>;
+      // 验证私钥已保存到结构化 prekey 存储
+      const prekeys = await keystore.loadE2EEPrekeys(aid);
       expect(prekeys).toBeDefined();
       expect(prekeys[prekey.prekey_id as string]).toBeDefined();
       expect(prekeys[prekey.prekey_id as string].private_key_pem).toContain('BEGIN PRIVATE KEY');
     },
   );
+
+  it.skipIf(!hasSubtleCrypto)(
+    '本地清理应保留最新 7 个 prekey',
+    async () => {
+      const keystore = createMockKeyStore();
+      const provider = new CryptoProvider();
+      const identity = await provider.generateIdentity();
+      const aid = 'alice.example.com';
+      const now = Date.now();
+      const oldBase = now - (8 * 24 * 3600 * 1000);
+
+      await keystore.saveKeyPair(aid, {
+        private_key_pem: identity.private_key_pem,
+        public_key_der_b64: identity.public_key_der_b64,
+        curve: identity.curve,
+      });
+
+      for (let i = 0; i < 8; i += 1) {
+        await keystore.saveE2EEPrekey!(aid, `old-${i}`, {
+          private_key_pem: `OLD-${i}`,
+          created_at: oldBase + i,
+        });
+      }
+
+      const manager = new E2EEManager({
+        identityFn: () => ({
+          aid,
+          private_key_pem: identity.private_key_pem,
+          public_key_der_b64: identity.public_key_der_b64,
+        }),
+        keystore,
+      });
+
+      await manager.generatePrekey();
+
+      const prekeys = await keystore.loadE2EEPrekeys!(aid);
+      expect(Object.keys(prekeys)).toHaveLength(7);
+      expect(prekeys['old-0']).toBeUndefined();
+      expect(prekeys['old-1']).toBeUndefined();
+      expect(prekeys['old-2']).toBeDefined();
+    },
+  );
+
 });
 
 // ── Prekey 缓存测试 ──────────────────────────────────────

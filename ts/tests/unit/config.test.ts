@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import { defaultConfig, configFromMap } from '../../src/config.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { JsonObject } from '../../src/types.js';
 
 describe('defaultConfig', () => {
   it('返回正确的默认值', () => {
@@ -65,7 +66,7 @@ describe('configFromMap', () => {
     });
     expect(cfg.aunPath).toBe('/tmp/test');
     // 未知键不应出现在配置中
-    expect((cfg as Record<string, unknown>).gateway).toBeUndefined();
-    expect((cfg as Record<string, unknown>).auto_reconnect).toBeUndefined();
+    expect((cfg as JsonObject).gateway).toBeUndefined();
+    expect((cfg as JsonObject).auto_reconnect).toBeUndefined();
   });
 });

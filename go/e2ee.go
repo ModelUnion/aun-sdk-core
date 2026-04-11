@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +35,8 @@ const (
 	ModeLongTermKey = "long_term_key"
 	// PrekeyRetentionSeconds prekey 私钥本地保留时间（7 天）
 	PrekeyRetentionSeconds = 7 * 24 * 3600
+	// PrekeyMinKeepCount 本地至少保留最新 7 个 prekey
+	PrekeyMinKeepCount = 7
 	// seenMaxSize 防重放集合最大容量
 	seenMaxSize = 50000
 )
@@ -59,14 +63,14 @@ var (
 // 加密策略：prekey_ecdh_v2（四路 ECDH）-> long_term_key（二路 ECDH）降级
 // I/O（获取 prekey、证书）由调用方负责，内置本地防重放
 type E2EEManager struct {
-	mu                 sync.RWMutex
-	identityFn         func() map[string]any // 获取当前身份的回调
-	keystore           keystore.KeyStore     // 密钥存储后端
-	prekeyCacheTTL     float64               // prekey 缓存 TTL（秒）
-	replayWindow       int                   // 防重放时间窗口（秒）
-	seenMessages       map[string]bool        // 防重放 seen set
-	prekeyCache        map[string]*cachedPrekey // 对端 prekey 缓存
-	localPrekeyCache   map[string]*ecdsa.PrivateKey // 本地 prekey 私钥内存缓存
+	mu               sync.RWMutex
+	identityFn       func() map[string]any        // 获取当前身份的回调
+	keystore         keystore.KeyStore            // 密钥存储后端
+	prekeyCacheTTL   float64                      // prekey 缓存 TTL（秒）
+	replayWindow     int                          // 防重放时间窗口（秒）
+	seenMessages     map[string]bool              // 防重放 seen set
+	prekeyCache      map[string]*cachedPrekey     // 对端 prekey 缓存
+	localPrekeyCache map[string]*ecdsa.PrivateKey // 本地 prekey 私钥内存缓存
 }
 
 // cachedPrekey 缓存的 prekey 条目
@@ -81,6 +85,155 @@ type E2EEManagerConfig struct {
 	Keystore         keystore.KeyStore     // 密钥存储后端
 	PrekeyCacheTTL   float64               // prekey 缓存 TTL（秒），默认 3600
 	ReplayWindowSecs int                   // 防重放时间窗口（秒），默认 300
+}
+
+type metadataAtomicUpdater interface {
+	UpdateMetadata(aid string, updater func(map[string]any) (map[string]any, error)) (map[string]any, error)
+}
+
+type structuredKeyStore interface {
+	LoadE2EEPrekeys(aid string) (map[string]map[string]any, error)
+	SaveE2EEPrekey(aid, prekeyID string, prekeyData map[string]any) error
+	CleanupE2EEPrekeys(aid string, cutoffMs int64, keepLatest int) ([]string, error)
+}
+
+func updateKeyStoreMetadata(
+	ks keystore.KeyStore,
+	aid string,
+	updater func(map[string]any) (map[string]any, error),
+) (map[string]any, error) {
+	if atomic, ok := ks.(metadataAtomicUpdater); ok {
+		return atomic.UpdateMetadata(aid, updater)
+	}
+	metadata, err := ks.LoadMetadata(aid)
+	if err != nil {
+		return nil, err
+	}
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	updated, err := updater(metadata)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		updated = metadata
+	}
+	return updated, ks.SaveMetadata(aid, updated)
+}
+
+func loadKeyStorePrekeys(ks keystore.KeyStore, aid string) map[string]map[string]any {
+	if structured, ok := ks.(structuredKeyStore); ok {
+		result, err := structured.LoadE2EEPrekeys(aid)
+		if err == nil && result != nil {
+			return result
+		}
+	}
+
+	metadata, err := ks.LoadMetadata(aid)
+	if err != nil || metadata == nil {
+		return map[string]map[string]any{}
+	}
+	raw, _ := metadata["e2ee_prekeys"].(map[string]any)
+	result := make(map[string]map[string]any, len(raw))
+	for prekeyID, item := range raw {
+		if data, ok := item.(map[string]any); ok {
+			result[prekeyID] = data
+		}
+	}
+	return result
+}
+
+func saveKeyStorePrekey(ks keystore.KeyStore, aid, prekeyID string, prekeyData map[string]any) error {
+	if structured, ok := ks.(structuredKeyStore); ok {
+		return structured.SaveE2EEPrekey(aid, prekeyID, prekeyData)
+	}
+	_, err := updateKeyStoreMetadata(ks, aid, func(metadata map[string]any) (map[string]any, error) {
+		localPrekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
+		if localPrekeys == nil {
+			localPrekeys = make(map[string]any)
+		}
+		localPrekeys[prekeyID] = copyMapShallow(prekeyData)
+		metadata["e2ee_prekeys"] = localPrekeys
+		return metadata, nil
+	})
+	return err
+}
+
+func prekeyCreatedMarker(prekeyData map[string]any) int64 {
+	return int64OrDefault(prekeyData["created_at"], prekeyData["updated_at"], prekeyData["expires_at"])
+}
+
+func latestPrekeyIDs(prekeys map[string]map[string]any, keepLatest int) map[string]bool {
+	if keepLatest <= 0 {
+		return map[string]bool{}
+	}
+	type prekeyEntry struct {
+		id     string
+		marker int64
+	}
+	entries := make([]prekeyEntry, 0, len(prekeys))
+	for prekeyID, prekeyData := range prekeys {
+		entries = append(entries, prekeyEntry{
+			id:     prekeyID,
+			marker: prekeyCreatedMarker(prekeyData),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].marker != entries[j].marker {
+			return entries[i].marker > entries[j].marker
+		}
+		return entries[i].id > entries[j].id
+	})
+	result := make(map[string]bool, keepLatest)
+	for idx, entry := range entries {
+		if idx >= keepLatest {
+			break
+		}
+		result[entry.id] = true
+	}
+	return result
+}
+
+func cleanupKeyStorePrekeys(ks keystore.KeyStore, aid string, cutoffMs int64, keepLatest int) []string {
+	if structured, ok := ks.(structuredKeyStore); ok {
+		result, err := structured.CleanupE2EEPrekeys(aid, cutoffMs, keepLatest)
+		if err == nil {
+			return result
+		}
+		return nil
+	}
+
+	var expired []string
+	_, err := updateKeyStoreMetadata(ks, aid, func(metadata map[string]any) (map[string]any, error) {
+		localPrekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
+		if len(localPrekeys) == 0 {
+			return metadata, nil
+		}
+		typedPrekeys := make(map[string]map[string]any, len(localPrekeys))
+		for pid, raw := range localPrekeys {
+			if prekeyData, ok := raw.(map[string]any); ok {
+				typedPrekeys[pid] = prekeyData
+			}
+		}
+		retainedIDs := latestPrekeyIDs(typedPrekeys, keepLatest)
+		for pid, data := range localPrekeys {
+			if pd, ok := data.(map[string]any); ok {
+				if prekeyCreatedMarker(pd) < cutoffMs && !retainedIDs[pid] {
+					expired = append(expired, pid)
+				}
+			}
+		}
+		for _, pid := range expired {
+			delete(localPrekeys, pid)
+		}
+		metadata["e2ee_prekeys"] = localPrekeys
+		return metadata, nil
+	})
+	if err != nil {
+		return nil
+	}
+	return expired
 }
 
 // NewE2EEManager 创建 P2P E2EE 管理器
@@ -202,6 +355,12 @@ func (m *E2EEManager) encryptWithPrekey(
 	if err != nil {
 		return nil, fmt.Errorf("解析对端证书失败: %w", err)
 	}
+	if expectedCertFingerprint, ok := prekey["cert_fingerprint"].(string); ok && strings.TrimSpace(expectedCertFingerprint) != "" {
+		actualCertFingerprint := certificateSHA256Fingerprint(peerCert)
+		if actualCertFingerprint != strings.TrimSpace(strings.ToLower(expectedCertFingerprint)) {
+			return nil, fmt.Errorf("prekey cert fingerprint mismatch")
+		}
+	}
 	peerIdentityPub, ok := peerCert.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
 		return nil, fmt.Errorf("对端证书非 EC 公钥")
@@ -220,11 +379,6 @@ func (m *E2EEManager) encryptWithPrekey(
 	if createdAt, hasCreatedAt := prekey["created_at"]; hasCreatedAt && createdAt != nil {
 		createdAtVal := toInt64(createdAt)
 		signData = []byte(fmt.Sprintf("%s|%s|%d", prekeyID, publicKeyB64, createdAtVal))
-		// 检查 prekey 年龄（30 天）
-		ageMs := time.Now().UnixMilli() - createdAtVal
-		if ageMs > 30*24*3600*1000 {
-			return nil, fmt.Errorf("prekey 过期: %ds", ageMs/1000)
-		}
 	} else {
 		signData = []byte(fmt.Sprintf("%s|%s", prekeyID, publicKeyB64))
 	}
@@ -323,15 +477,15 @@ func (m *E2EEManager) encryptWithPrekey(
 
 	envelope := map[string]any{
 		"type":                 "e2ee.encrypted",
-		"version":             "1",
-		"encryption_mode":     ModePrekeyECDHV2,
-		"suite":               SuiteP256,
-		"prekey_id":           prekeyID,
+		"version":              "1",
+		"encryption_mode":      ModePrekeyECDHV2,
+		"suite":                SuiteP256,
+		"prekey_id":            prekeyID,
 		"ephemeral_public_key": ephPkB64,
-		"nonce":               base64.StdEncoding.EncodeToString(nonce),
-		"ciphertext":          base64.StdEncoding.EncodeToString(ciphertext),
-		"tag":                 base64.StdEncoding.EncodeToString(tag),
-		"aad":                 aad,
+		"nonce":                base64.StdEncoding.EncodeToString(nonce),
+		"ciphertext":           base64.StdEncoding.EncodeToString(ciphertext),
+		"tag":                  base64.StdEncoding.EncodeToString(tag),
+		"aad":                  aad,
 	}
 
 	// 发送方签名：ciphertext + tag + aad_bytes（不可否认性）
@@ -432,14 +586,14 @@ func (m *E2EEManager) encryptWithLongTermKey(
 
 	envelope := map[string]any{
 		"type":                 "e2ee.encrypted",
-		"version":             "1",
-		"encryption_mode":     ModeLongTermKey,
-		"suite":               SuiteP256,
+		"version":              "1",
+		"encryption_mode":      ModeLongTermKey,
+		"suite":                SuiteP256,
 		"ephemeral_public_key": ephPkB64,
-		"nonce":               base64.StdEncoding.EncodeToString(nonce),
-		"ciphertext":          base64.StdEncoding.EncodeToString(ciphertext),
-		"tag":                 base64.StdEncoding.EncodeToString(tag),
-		"aad":                 aad,
+		"nonce":                base64.StdEncoding.EncodeToString(nonce),
+		"ciphertext":           base64.StdEncoding.EncodeToString(ciphertext),
+		"tag":                  base64.StdEncoding.EncodeToString(tag),
+		"aad":                  aad,
 	}
 
 	// 发送方签名
@@ -839,21 +993,10 @@ func (m *E2EEManager) GeneratePrekey() (map[string]any, error) {
 	}
 	privKeyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8Bytes}))
 
-	// 保存到 keystore metadata
-	metadata, err := ks.LoadMetadata(aid)
-	if err != nil || metadata == nil {
-		metadata = make(map[string]any)
-	}
-	localPrekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
-	if localPrekeys == nil {
-		localPrekeys = make(map[string]any)
-	}
-	localPrekeys[prekeyID] = map[string]any{
+	if err := saveKeyStorePrekey(ks, aid, prekeyID, map[string]any{
 		"private_key_pem": privKeyPEM,
 		"created_at":      nowMs,
-	}
-	metadata["e2ee_prekeys"] = localPrekeys
-	if err := ks.SaveMetadata(aid, metadata); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("保存 prekey 元数据失败: %w", err)
 	}
 
@@ -865,48 +1008,32 @@ func (m *E2EEManager) GeneratePrekey() (map[string]any, error) {
 	// 清理过期 prekey
 	m.cleanupExpiredPrekeys(ks, aid)
 
-	return map[string]any{
+	result := map[string]any{
 		"prekey_id":  prekeyID,
 		"public_key": pubKeyB64,
 		"signature":  sig,
 		"created_at": nowMs,
-	}, nil
+	}
+	if certFingerprint := m.localCertSHA256Fingerprint(); certFingerprint != "" {
+		result["cert_fingerprint"] = certFingerprint
+	}
+	return result, nil
 }
 
 // cleanupExpiredPrekeys 清理过期的本地 prekey 私钥
 func (m *E2EEManager) cleanupExpiredPrekeys(ks keystore.KeyStore, aid string) {
-	metadata, err := ks.LoadMetadata(aid)
-	if err != nil || metadata == nil {
-		return
-	}
-	localPrekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
-	if len(localPrekeys) == 0 {
-		return
-	}
-
 	nowMs := time.Now().UnixMilli()
 	cutoffMs := nowMs - PrekeyRetentionSeconds*1000
-
-	var expired []string
-	for pid, data := range localPrekeys {
-		if pd, ok := data.(map[string]any); ok {
-			createdAt := toInt64(pd["created_at"])
-			if createdAt < cutoffMs {
-				expired = append(expired, pid)
-			}
-		}
+	expired := cleanupKeyStorePrekeys(ks, aid, cutoffMs, PrekeyMinKeepCount)
+	if len(expired) == 0 {
+		return
 	}
 
-	if len(expired) > 0 {
-		m.mu.Lock()
-		for _, pid := range expired {
-			delete(localPrekeys, pid)
-			delete(m.localPrekeyCache, pid)
-		}
-		m.mu.Unlock()
-		metadata["e2ee_prekeys"] = localPrekeys
-		_ = ks.SaveMetadata(aid, metadata)
+	m.mu.Lock()
+	for _, pid := range expired {
+		delete(m.localPrekeyCache, pid)
 	}
+	m.mu.Unlock()
 }
 
 // loadPrekeyPrivateKey 从内存缓存或 keystore 加载 prekey 私钥
@@ -923,12 +1050,8 @@ func (m *E2EEManager) loadPrekeyPrivateKey(prekeyID string) *ecdsa.PrivateKey {
 	if aid == "" {
 		return nil
 	}
-	metadata, err := m.keystore.LoadMetadata(aid)
-	if err != nil || metadata == nil {
-		return nil
-	}
-	prekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
-	prekeyData, _ := prekeys[prekeyID].(map[string]any)
+	prekeys := loadKeyStorePrekeys(m.keystore, aid)
+	prekeyData := prekeys[prekeyID]
 	if prekeyData == nil {
 		return nil
 	}
@@ -1023,9 +1146,24 @@ func fingerprintCertPEM(certPEM []byte) string {
 	return internal.CertFingerprint(cert)
 }
 
+func certificateSHA256Fingerprint(cert *x509.Certificate) string {
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(cert.Raw))
+}
+
 // localCertFingerprint 返回当前身份的证书指纹
 func (m *E2EEManager) localCertFingerprint() string {
 	return m.localIdentityFingerprint()
+}
+
+func (m *E2EEManager) localCertSHA256Fingerprint() string {
+	identity := m.identityFn()
+	if certPEM, ok := identity["cert"].(string); ok && certPEM != "" {
+		cert, err := parseCertPEM([]byte(certPEM))
+		if err == nil {
+			return certificateSHA256Fingerprint(cert)
+		}
+	}
+	return ""
 }
 
 // localIdentityFingerprint 计算当前身份的公钥指纹
@@ -1277,6 +1415,15 @@ func toInt64(v any) int64 {
 	return 0
 }
 
+func int64OrDefault(values ...any) int64 {
+	for _, value := range values {
+		if converted := toInt64(value); converted != 0 {
+			return converted
+		}
+	}
+	return 0
+}
+
 // getTimestamp 从消息中提取 timestamp
 func getTimestamp(message, payload map[string]any) int64 {
 	if ts := toInt64(message["timestamp"]); ts > 0 {
@@ -1295,4 +1442,3 @@ func abs64(n int64) int64 {
 	}
 	return n
 }
-

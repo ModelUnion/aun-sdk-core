@@ -8,14 +8,12 @@
 
 前置条件：
   - Docker 环境运行中（docker compose up -d）
-  - hosts 文件映射 gateway.agentid.pub → 127.0.0.1
+  - 运行环境能解析 gateway.<issuer>（推荐使用 Docker network alias）
   - Gateway 地址由 SDK 通过 AID 的 issuer domain 自动发现
 """
 import asyncio
-import random
+import os
 import sys
-import time
-import uuid
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -33,7 +31,58 @@ from aun_core.e2ee import E2EEManager
 # 辅助函数
 # ---------------------------------------------------------------------------
 
-_TEST_AUN_PATH = "./.aun_test"
+_AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
+
+
+def _default_test_aun_path() -> str:
+    if _AUN_DATA_ROOT:
+        return f"{_AUN_DATA_ROOT}/single-domain/persistent"
+    return "./.aun_test"
+
+
+_TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).strip()
+_ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
+_ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
+_BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
+_CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
+_DAVE_AID = os.environ.get("AUN_TEST_DAVE_AID", f"dave.{_ISSUER}").strip()
+
+
+def _assert_fixed_aid_layout() -> None:
+    base = Path(_TEST_AUN_PATH)
+    if base.name != "persistent" or base.parent.name != "single-domain":
+        return
+
+    legacy_root = base.parent / "AIDs"
+    current_root = base / "AIDs"
+    fixed_aids = (_ALICE_AID, _BOBB_AID, _CHARLIE_AID, _DAVE_AID)
+
+    split_aids = [aid for aid in fixed_aids if (legacy_root / aid).exists()]
+    if split_aids:
+        joined = ", ".join(split_aids)
+        raise RuntimeError(
+            f"检测到固定 AID 旧目录残留：{joined}。"
+            f"固定身份只能使用 {current_root}，不能再与 {legacy_root} 分叉。"
+        )
+
+    incomplete_aids: list[str] = []
+    for aid in fixed_aids:
+        aid_dir = current_root / aid
+        if not aid_dir.exists():
+            continue
+        has_key = (aid_dir / "private" / "key.json").exists()
+        has_cert = (aid_dir / "public" / "cert.pem").exists()
+        if has_key != has_cert:
+            incomplete_aids.append(aid)
+    if incomplete_aids:
+        joined = ", ".join(incomplete_aids)
+        raise RuntimeError(
+            f"检测到固定 AID 身份材料不完整：{joined}。"
+            f"每个固定 AID 都必须在 {current_root} 同时具备 private/key.json 和 public/cert.pem。"
+        )
+
+
+_assert_fixed_aid_layout()
 
 
 def _make_client(tag: str) -> AUNClient:
@@ -47,7 +96,9 @@ def _make_client(tag: str) -> AUNClient:
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    await client.auth.create_aid({"aid": aid})
+    local = client._auth._keystore.load_identity(aid)
+    if local is None:
+        await client.auth.create_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     await client.connect(auth)
     return aid
@@ -114,13 +165,31 @@ async def _sdk_send(client: AUNClient, to_aid: str, payload: dict) -> dict:
 
 async def _sdk_recv_push(client: AUNClient, from_aid: str, timeout: float = 5.0) -> list[dict]:
     """SDK 通过推送事件接收，超时后 pull 兜底"""
+    return await _sdk_recv_push_after(client, from_aid, after_seq=0, timeout=timeout)
+
+
+async def _sdk_recv_push_after(
+    client: AUNClient, from_aid: str, *, after_seq: int = 0, timeout: float = 5.0,
+) -> list[dict]:
+    """SDK 通过推送事件接收，超时后按 after_seq pull 兜底。"""
     inbox = []
     event = asyncio.Event()
 
+    def _seq_of(message: dict) -> int:
+        try:
+            return int(message.get("seq") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def handler(data):
-        if isinstance(data, dict) and data.get("from") == from_aid:
-            inbox.append(data)
-            event.set()
+        if not isinstance(data, dict):
+            return
+        if data.get("from") != from_aid:
+            return
+        if _seq_of(data) <= after_seq:
+            return
+        inbox.append(data)
+        event.set()
 
     sub = client.on("message.received", handler)
     try:
@@ -130,10 +199,10 @@ async def _sdk_recv_push(client: AUNClient, from_aid: str, timeout: float = 5.0)
     sub.unsubscribe()
 
     if not inbox:
-        result = await client.call("message.pull", {"after_seq": 0, "limit": 50})
+        result = await client.call("message.pull", {"after_seq": after_seq, "limit": 50})
         msgs = result.get("messages", [])
         inbox.extend(m for m in msgs if m.get("from") == from_aid)
-    return inbox
+    return sorted(inbox, key=_seq_of)
 
 
 async def _sdk_recv_pull(client: AUNClient, from_aid: str, after_seq: int = 0) -> list[dict]:
@@ -143,9 +212,20 @@ async def _sdk_recv_pull(client: AUNClient, from_aid: str, after_seq: int = 0) -
     return [m for m in msgs if m.get("from") == from_aid]
 
 
-def _run_id() -> str:
-    """生成唯一运行标识（UUID 前 12 位，避免 AID 碰撞）"""
-    return uuid.uuid4().hex[:12]
+async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
+    """遍历当前消息游标，供固定 AID 场景按 after_seq 隔离本轮消息。"""
+    after_seq = 0
+    max_seq = 0
+    while True:
+        result = await client.call("message.pull", {"after_seq": after_seq, "limit": limit})
+        msgs = result.get("messages", [])
+        if not msgs:
+            return max_seq
+        for msg in msgs:
+            max_seq = max(max_seq, int(msg.get("seq") or 0))
+        if len(msgs) < limit:
+            return max_seq
+        after_seq = max_seq
 
 
 def _assert_decrypted(msg: dict, expected_payload: dict, label: str = ""):
@@ -161,19 +241,20 @@ def _assert_decrypted(msg: dict, expected_payload: dict, label: str = ""):
 
 async def test_prekey_upload_and_get():
     print("\n=== Test 1: Prekey upload/get ===")
-    rid = _run_id()
     alice, bob = _make_client("alice"), _make_client("bob")
     try:
-        alice_aid = await _ensure_connected(alice, f"e2ee-alice-{rid}.agentid.pub")
-        bob_aid = await _ensure_connected(bob, f"e2ee-bob-{rid}.agentid.pub")
+        alice_aid = await _ensure_connected(alice, _ALICE_AID)
+        bob_aid = await _ensure_connected(bob, _BOBB_AID)
 
         # generate_prekey + RPC upload
         prekey_material = bob.e2ee.generate_prekey()
+        assert prekey_material["cert_fingerprint"].startswith("sha256:")
         result = await bob._transport.call("message.e2ee.put_prekey", prekey_material)
         assert result.get("ok") or result.get("success", False) or "prekey_id" in result
 
         pk1 = await alice._transport.call("message.e2ee.get_prekey", {"aid": bob_aid})
         assert pk1["found"]
+        assert pk1["prekey"]["cert_fingerprint"] == prekey_material["cert_fingerprint"]
 
         pk2 = await alice._transport.call("message.e2ee.get_prekey", {"aid": bob_aid})
         assert pk2["found"]
@@ -191,14 +272,14 @@ async def test_prekey_upload_and_get():
 
 async def test_sdk_to_sdk_prekey():
     print("\n=== Test 2: SDK->SDK prekey ===")
-    rid = _run_id()
     sender, receiver = _make_client("s"), _make_client("r")
     try:
-        s_aid = await _ensure_connected(sender, f"e2ee-s-{rid}.agentid.pub")
-        r_aid = await _ensure_connected(receiver, f"e2ee-r-{rid}.agentid.pub")
+        s_aid = await _ensure_connected(sender, _ALICE_AID)
+        r_aid = await _ensure_connected(receiver, _BOBB_AID)
+        base_seq = await _current_max_seq(receiver)
 
         await _sdk_send(sender, r_aid, {"text": "sdk2sdk prekey", "n": 1})
-        msgs = await _sdk_recv_push(receiver, s_aid)
+        msgs = await _sdk_recv_push_after(receiver, s_aid, after_seq=base_seq)
         assert len(msgs) >= 1
         _assert_decrypted(msgs[0], {"text": "sdk2sdk prekey"})
 
@@ -213,19 +294,21 @@ async def test_sdk_to_sdk_prekey():
 
 
 async def test_sdk_long_term_fallback():
-    print("\n=== Test 3: SDK long_term_key fallback ===")
-    rid = _run_id()
+    print("\n=== Test 3: SDK long_term_key fallback (manual) ===")
     sender, receiver = _make_client("s"), _make_client("r")
     try:
-        s_aid = await _ensure_connected(sender, f"e2ee-s-{rid}.agentid.pub")
-        r_aid = f"e2ee-r-{rid}.agentid.pub"
-        await receiver.auth.create_aid({"aid": r_aid})
+        s_aid = await _ensure_connected(sender, _CHARLIE_AID)
+        r_aid = _DAVE_AID
+        local = receiver._auth._keystore.load_identity(r_aid)
+        if local is None:
+            await receiver.auth.create_aid({"aid": r_aid})
+        base_seq = await _current_max_seq(receiver)
 
         await _sdk_send(sender, r_aid, {"text": "fallback"})
 
         auth = await receiver.auth.authenticate({"aid": r_aid})
         await receiver.connect(auth)
-        msgs = await _sdk_recv_pull(receiver, s_aid)
+        msgs = await _sdk_recv_pull(receiver, s_aid, after_seq=base_seq)
         assert len(msgs) >= 1
         _assert_decrypted(msgs[0], {"text": "fallback"})
         assert msgs[0].get("e2ee", {}).get("encryption_mode") == "long_term_key"
@@ -242,15 +325,15 @@ async def test_sdk_long_term_fallback():
 
 async def test_raw_to_sdk():
     print("\n=== Test 4: Raw WS->SDK ===")
-    rid = _run_id()
     s_sdk, r_sdk = _make_client("rs"), _make_client("rr")
     try:
-        s_aid = await _ensure_connected(s_sdk, f"e2ee-rs-{rid}.agentid.pub")
-        r_aid = await _ensure_connected(r_sdk, f"e2ee-rr-{rid}.agentid.pub")
+        s_aid = await _ensure_connected(s_sdk, _ALICE_AID)
+        r_aid = await _ensure_connected(r_sdk, _BOBB_AID)
         s_e2ee = _make_raw_e2ee(s_sdk)
+        base_seq = await _current_max_seq(r_sdk)
 
         await _raw_send(s_sdk, s_e2ee, r_aid, {"text": "raw2sdk"})
-        msgs = await _sdk_recv_push(r_sdk, s_aid)
+        msgs = await _sdk_recv_push_after(r_sdk, s_aid, after_seq=base_seq)
         assert len(msgs) >= 1
         _assert_decrypted(msgs[0], {"text": "raw2sdk"})
 
@@ -271,16 +354,16 @@ async def test_raw_to_sdk():
 async def test_sdk_to_raw():
     """SDK encrypt -> Raw WS decrypt"""
     print("\n=== Test 5: SDK->Raw WS ===")
-    rid = _run_id()
     s_sdk, r_sdk = _make_client("s"), _make_client("r")
     try:
-        s_aid = await _ensure_connected(s_sdk, f"e2ee-s-{rid}.agentid.pub")
-        r_aid = await _ensure_connected(r_sdk, f"e2ee-r-{rid}.agentid.pub")
+        s_aid = await _ensure_connected(s_sdk, _ALICE_AID)
+        r_aid = await _ensure_connected(r_sdk, _BOBB_AID)
         r_e2ee = _make_raw_e2ee(r_sdk)
+        base_seq = await _current_max_seq(r_sdk)
 
         await _sdk_send(s_sdk, r_aid, {"text": "sdk2raw"})
         await asyncio.sleep(1)
-        msgs = await _raw_recv_pull(r_sdk, r_e2ee, s_aid)
+        msgs = await _raw_recv_pull(r_sdk, r_e2ee, s_aid, after_seq=base_seq)
         assert len(msgs) >= 1, f"expected >= 1 msg, got {len(msgs)}"
         _assert_decrypted(msgs[0], {"text": "sdk2raw"})
 
@@ -297,25 +380,26 @@ async def test_sdk_to_raw():
 async def test_raw_to_raw():
     """Raw WS <-> Raw WS"""
     print("\n=== Test 6: Raw WS<->Raw WS ===")
-    rid = _run_id()
     a_sdk, b_sdk = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(a_sdk, f"e2ee-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(b_sdk, f"e2ee-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(a_sdk, _ALICE_AID)
+        b_aid = await _ensure_connected(b_sdk, _BOBB_AID)
         a_e2ee = _make_raw_e2ee(a_sdk)
         b_e2ee = _make_raw_e2ee(b_sdk)
 
         # A -> B
+        base_seq_b = await _current_max_seq(b_sdk)
         await _raw_send(a_sdk, a_e2ee, b_aid, {"text": "raw_a2b"})
         await asyncio.sleep(1)
-        msgs_b = await _raw_recv_pull(b_sdk, b_e2ee, a_aid)
+        msgs_b = await _raw_recv_pull(b_sdk, b_e2ee, a_aid, after_seq=base_seq_b)
         assert len(msgs_b) >= 1, "B should receive A's message"
         _assert_decrypted(msgs_b[0], {"text": "raw_a2b"}, "A->B")
 
         # B -> A
+        base_seq_a = await _current_max_seq(a_sdk)
         await _raw_send(b_sdk, b_e2ee, a_aid, {"text": "raw_b2a"})
         await asyncio.sleep(1)
-        msgs_a = await _raw_recv_pull(a_sdk, a_e2ee, b_aid)
+        msgs_a = await _raw_recv_pull(a_sdk, a_e2ee, b_aid, after_seq=base_seq_a)
         assert len(msgs_a) >= 1, "A should receive B's message"
         _assert_decrypted(msgs_a[0], {"text": "raw_b2a"}, "B->A")
 
@@ -332,23 +416,24 @@ async def test_raw_to_raw():
 async def test_bidirectional_mixed():
     """SDK <-> Raw bidirectional"""
     print("\n=== Test 7: SDK<->Raw bidirectional ===")
-    rid = _run_id()
     sdk_client, raw_client = _make_client("sdk"), _make_client("raw")
     try:
-        sdk_aid = await _ensure_connected(sdk_client, f"e2ee-sdk-{rid}.agentid.pub")
-        raw_aid = await _ensure_connected(raw_client, f"e2ee-raw-{rid}.agentid.pub")
+        sdk_aid = await _ensure_connected(sdk_client, _ALICE_AID)
+        raw_aid = await _ensure_connected(raw_client, _BOBB_AID)
         raw_e2ee = _make_raw_e2ee(raw_client)
 
         # SDK -> Raw
+        raw_base_seq = await _current_max_seq(raw_client)
         await _sdk_send(sdk_client, raw_aid, {"text": "sdk2raw_bidir", "dir": "forward"})
         await asyncio.sleep(1)
-        msgs_raw = await _raw_recv_pull(raw_client, raw_e2ee, sdk_aid)
+        msgs_raw = await _raw_recv_pull(raw_client, raw_e2ee, sdk_aid, after_seq=raw_base_seq)
         assert len(msgs_raw) >= 1, "Raw should receive SDK's message"
         _assert_decrypted(msgs_raw[0], {"text": "sdk2raw_bidir"}, "SDK->Raw")
 
         # Raw -> SDK
+        sdk_base_seq = await _current_max_seq(sdk_client)
         await _raw_send(raw_client, raw_e2ee, sdk_aid, {"text": "raw2sdk_bidir", "dir": "reverse"})
-        msgs_sdk = await _sdk_recv_push(sdk_client, raw_aid)
+        msgs_sdk = await _sdk_recv_push_after(sdk_client, raw_aid, after_seq=sdk_base_seq)
         assert len(msgs_sdk) >= 1, "SDK should receive Raw's message"
         _assert_decrypted(msgs_sdk[0], {"text": "raw2sdk_bidir"}, "Raw->SDK")
 
@@ -365,18 +450,18 @@ async def test_bidirectional_mixed():
 async def test_multi_message_burst():
     """5 consecutive messages"""
     print("\n=== Test 8: Burst messages ===")
-    rid = _run_id()
     sender, receiver = _make_client("s"), _make_client("r")
     try:
-        s_aid = await _ensure_connected(sender, f"e2ee-s-{rid}.agentid.pub")
-        r_aid = await _ensure_connected(receiver, f"e2ee-r-{rid}.agentid.pub")
+        s_aid = await _ensure_connected(sender, _ALICE_AID)
+        r_aid = await _ensure_connected(receiver, _BOBB_AID)
+        base_seq = await _current_max_seq(receiver)
 
         N = 5
         for i in range(N):
             await _sdk_send(sender, r_aid, {"text": f"burst_{i}", "seq": i})
 
         await asyncio.sleep(2)
-        msgs = await _sdk_recv_pull(receiver, s_aid)
+        msgs = await _sdk_recv_pull(receiver, s_aid, after_seq=base_seq)
         assert len(msgs) >= N, f"expected {N}, got {len(msgs)}"
 
         received_texts = sorted(m["payload"]["text"] for m in msgs)
@@ -396,11 +481,11 @@ async def test_multi_message_burst():
 async def test_prekey_rotation_in_flight():
     """Old prekey messages still decryptable after rotation"""
     print("\n=== Test 9: Prekey rotation ===")
-    rid = _run_id()
     sender, receiver = _make_client("s"), _make_client("r")
     try:
-        s_aid = await _ensure_connected(sender, f"e2ee-s-{rid}.agentid.pub")
-        r_aid = await _ensure_connected(receiver, f"e2ee-r-{rid}.agentid.pub")
+        s_aid = await _ensure_connected(sender, _ALICE_AID)
+        r_aid = await _ensure_connected(receiver, _BOBB_AID)
+        base_seq = await _current_max_seq(receiver)
 
         await _sdk_send(sender, r_aid, {"text": "before_rotate", "phase": 1})
 
@@ -410,7 +495,7 @@ async def test_prekey_rotation_in_flight():
         await _sdk_send(sender, r_aid, {"text": "after_rotate", "phase": 2})
 
         await asyncio.sleep(2)
-        msgs = await _sdk_recv_pull(receiver, s_aid)
+        msgs = await _sdk_recv_pull(receiver, s_aid, after_seq=base_seq)
         assert len(msgs) >= 2, f"expected 2, got {len(msgs)}"
 
         texts = {m["payload"]["text"] for m in msgs}
@@ -430,19 +515,28 @@ async def test_prekey_rotation_in_flight():
 async def test_push_then_pull_no_duplicate():
     """Push + pull should not deliver duplicate"""
     print("\n=== Test 10: Push + pull no duplicate ===")
-    rid = _run_id()
     sender, receiver = _make_client("s"), _make_client("r")
     try:
-        s_aid = await _ensure_connected(sender, f"e2ee-s-{rid}.agentid.pub")
-        r_aid = await _ensure_connected(receiver, f"e2ee-r-{rid}.agentid.pub")
+        s_aid = await _ensure_connected(sender, _ALICE_AID)
+        r_aid = await _ensure_connected(receiver, _BOBB_AID)
+        base_seq = await _current_max_seq(receiver)
 
         push_msgs = []
         push_event = asyncio.Event()
 
         def handler(data):
-            if isinstance(data, dict) and data.get("from") == s_aid:
-                push_msgs.append(data)
-                push_event.set()
+            if not isinstance(data, dict):
+                return
+            if data.get("from") != s_aid:
+                return
+            try:
+                seq = int(data.get("seq") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            if seq <= base_seq:
+                return
+            push_msgs.append(data)
+            push_event.set()
 
         sub = receiver.on("message.received", handler)
 
@@ -460,7 +554,7 @@ async def test_push_then_pull_no_duplicate():
         assert len(push_msgs) == 1
         _assert_decrypted(push_msgs[0], {"text": "dup_test"}, "push")
 
-        pull_result = await receiver.call("message.pull", {"after_seq": 0, "limit": 50})
+        pull_result = await receiver.call("message.pull", {"after_seq": base_seq, "limit": 50})
         pull_msgs = [m for m in pull_result.get("messages", [])
                      if m.get("from") == s_aid and m.get("encrypted") is True]
         print(f"  push={len(push_msgs)}, pull={len(pull_msgs)}")
@@ -478,19 +572,20 @@ async def test_push_then_pull_no_duplicate():
 async def test_sdk_to_sdk_bidirectional():
     """SDK <-> SDK bidirectional"""
     print("\n=== Test 11: SDK<->SDK bidirectional ===")
-    rid = _run_id()
     alice, bob = _make_client("a"), _make_client("b")
     try:
-        a_aid = await _ensure_connected(alice, f"e2ee-a-{rid}.agentid.pub")
-        b_aid = await _ensure_connected(bob, f"e2ee-b-{rid}.agentid.pub")
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
+        bob_base_seq = await _current_max_seq(bob)
         await _sdk_send(alice, b_aid, {"text": "hello_bob", "from": "alice"})
-        msgs_bob = await _sdk_recv_push(bob, a_aid)
+        msgs_bob = await _sdk_recv_push_after(bob, a_aid, after_seq=bob_base_seq)
         assert len(msgs_bob) >= 1
         _assert_decrypted(msgs_bob[0], {"text": "hello_bob"}, "A->B")
 
+        alice_base_seq = await _current_max_seq(alice)
         await _sdk_send(bob, a_aid, {"text": "hello_alice", "from": "bob"})
-        msgs_alice = await _sdk_recv_push(alice, b_aid)
+        msgs_alice = await _sdk_recv_push_after(alice, b_aid, after_seq=alice_base_seq)
         assert len(msgs_alice) >= 1
         _assert_decrypted(msgs_alice[0], {"text": "hello_alice"}, "B->A")
 
@@ -507,20 +602,20 @@ async def test_sdk_to_sdk_bidirectional():
 async def test_raw_multi_message():
     """Raw WS burst messages"""
     print("\n=== Test 12: Raw WS burst ===")
-    rid = _run_id()
     s_sdk, r_sdk = _make_client("s"), _make_client("r")
     try:
-        s_aid = await _ensure_connected(s_sdk, f"e2ee-s-{rid}.agentid.pub")
-        r_aid = await _ensure_connected(r_sdk, f"e2ee-r-{rid}.agentid.pub")
+        s_aid = await _ensure_connected(s_sdk, _ALICE_AID)
+        r_aid = await _ensure_connected(r_sdk, _BOBB_AID)
         s_e2ee = _make_raw_e2ee(s_sdk)
         r_e2ee = _make_raw_e2ee(r_sdk)
+        base_seq = await _current_max_seq(r_sdk)
 
         N = 3
         for i in range(N):
             await _raw_send(s_sdk, s_e2ee, r_aid, {"text": f"raw_burst_{i}", "i": i})
 
         await asyncio.sleep(2)
-        msgs = await _raw_recv_pull(r_sdk, r_e2ee, s_aid)
+        msgs = await _raw_recv_pull(r_sdk, r_e2ee, s_aid, after_seq=base_seq)
         assert len(msgs) >= N, f"expected {N}, got {len(msgs)}"
 
         texts = sorted(m["payload"]["text"] for m in msgs)
@@ -548,18 +643,17 @@ async def main():
     print("=" * 60)
 
     tests = [
-        ("1.  Prekey upload/get",              test_prekey_upload_and_get),
-        ("2.  SDK->SDK prekey",                test_sdk_to_sdk_prekey),
-        ("3.  SDK long_term_key fallback",     test_sdk_long_term_fallback),
-        ("4.  Raw WS->SDK",                    test_raw_to_sdk),
-        ("5.  SDK->Raw WS",                    test_sdk_to_raw),
-        ("6.  Raw WS<->Raw WS",               test_raw_to_raw),
-        ("7.  SDK<->Raw bidirectional",        test_bidirectional_mixed),
-        ("8.  Burst messages",                 test_multi_message_burst),
-        ("9.  Prekey rotation",                test_prekey_rotation_in_flight),
-        ("10. Push+pull no duplicate",         test_push_then_pull_no_duplicate),
-        ("11. SDK<->SDK bidirectional",        test_sdk_to_sdk_bidirectional),
-        ("12. Raw WS burst",                   test_raw_multi_message),
+        ("Prekey upload/get",            test_prekey_upload_and_get),
+        ("SDK->SDK prekey",              test_sdk_to_sdk_prekey),
+        ("Raw WS->SDK",                  test_raw_to_sdk),
+        ("SDK->Raw WS",                  test_sdk_to_raw),
+        ("Raw WS<->Raw WS",              test_raw_to_raw),
+        ("SDK<->Raw bidirectional",      test_bidirectional_mixed),
+        ("Burst messages",               test_multi_message_burst),
+        ("Prekey rotation",              test_prekey_rotation_in_flight),
+        ("Push+pull no duplicate",       test_push_then_pull_no_duplicate),
+        ("SDK<->SDK bidirectional",      test_sdk_to_sdk_bidirectional),
+        ("Raw WS burst",                 test_raw_multi_message),
     ]
 
     results = []

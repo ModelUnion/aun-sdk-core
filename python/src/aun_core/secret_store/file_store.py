@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
+_log = logging.getLogger("aun_core.secret_store")
+
 
 class FileSecretStore:
-    def __init__(self, root: Path, *, encryption_seed: str | None = None) -> None:
+    def __init__(self, root: Path, *, encryption_seed: str | None = None, sqlite_backup: Any = None) -> None:
         self._root = root
         self._root.mkdir(parents=True, exist_ok=True)
+        self._sqlite_backup = sqlite_backup
         if encryption_seed:
             seed_bytes = encryption_seed.encode("utf-8")
         else:
@@ -62,9 +66,6 @@ class FileSecretStore:
         except Exception:
             return None
 
-    def clear(self, scope: str, name: str) -> None:
-        return
-
     def _derive_key(self, scope: str, name: str) -> bytes:
         import hmac
         return hmac.new(
@@ -75,13 +76,40 @@ class FileSecretStore:
 
     def _load_or_create_seed(self) -> bytes:
         seed_path = self._root / ".seed"
+        seed: bytes | None = None
+        source = ""
+
+        # 1. 先读文件
         if seed_path.exists():
-            return seed_path.read_bytes()
-        seed = os.urandom(32)
-        seed_path.write_bytes(seed)
-        if sys.platform != "win32":
-            try:
-                os.chmod(seed_path, 0o600)
-            except OSError:
-                pass  # 平台兼容 fallback
+            seed = seed_path.read_bytes()
+            source = "file"
+
+        # 2. 文件没有 → 读 SQLite
+        if seed is None and self._sqlite_backup:
+            seed = self._sqlite_backup.restore_seed()
+            if seed is not None:
+                source = "sqlite"
+                # 恢复到文件系统
+                seed_path.write_bytes(seed)
+                if sys.platform != "win32":
+                    try:
+                        os.chmod(seed_path, 0o600)
+                    except OSError:
+                        pass
+
+        # 3. 都没有 → 生成新 seed
+        if seed is None:
+            seed = os.urandom(32)
+            source = "new"
+            seed_path.write_bytes(seed)
+            if sys.platform != "win32":
+                try:
+                    os.chmod(seed_path, 0o600)
+                except OSError:
+                    pass
+
+        # 双写：确保 SQLite 中也有
+        if self._sqlite_backup and source != "sqlite":
+            self._sqlite_backup.backup_seed(seed)
+
         return seed

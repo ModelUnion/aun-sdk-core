@@ -1,5 +1,7 @@
 // ── SecretStore 接口定义（浏览器版 — 全异步）──────────────
 
+import type { SecretRecord } from '../types.js';
+
 /**
  * 密钥保护存储接口。
  *
@@ -8,11 +10,9 @@
  */
 export interface SecretStore {
   /** 保护（加密）敏感数据 */
-  protect(scope: string, name: string, plaintext: Uint8Array): Promise<Record<string, unknown>>;
+  protect(scope: string, name: string, plaintext: Uint8Array): Promise<SecretRecord>;
   /** 还原（解密）敏感数据 */
-  reveal(scope: string, name: string, record: Record<string, unknown>): Promise<Uint8Array | null>;
-  /** 清除保护记录 */
-  clear(scope: string, name: string): Promise<void>;
+  reveal(scope: string, name: string, record: SecretRecord): Promise<Uint8Array | null>;
 }
 
 /**

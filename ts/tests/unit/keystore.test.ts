@@ -9,6 +9,12 @@ import { tmpdir } from 'node:os';
 
 import { FileSecretStore } from '../../src/secret-store/file-store.js';
 import { FileKeyStore } from '../../src/keystore/file.js';
+import type {
+  GroupOldEpochRecord,
+  GroupSecretMap,
+  JsonObject,
+  PrekeyMap,
+} from '../../src/types.js';
 
 // ── FileSecretStore 测试 ────────────────────────────────────
 
@@ -94,11 +100,6 @@ describe('FileSecretStore', () => {
     expect(revealed!.toString('utf-8')).toBe('auto-seed');
   });
 
-  it('clear 不报错', () => {
-    const store = new FileSecretStore(tmpDir, 'seed');
-    // file_aes 方案的 clear 是 no-op
-    expect(() => store.clear('scope', 'name')).not.toThrow();
-  });
 });
 
 // ── FileKeyStore 测试 ────────────────────────────────────────
@@ -167,19 +168,6 @@ describe('FileKeyStore', () => {
     const loaded = ks2.loadKeyPair('persist.aid');
     expect(loaded).not.toBeNull();
     expect(loaded!.private_key_pem).toBe(identity.private_key_pem);
-  });
-
-  it('删除身份信息', () => {
-    const ks = new FileKeyStore(tmpDir);
-    ks.saveIdentity('del.aid', {
-      private_key_pem: '-----BEGIN PRIVATE KEY-----\ndelete-me\n-----END PRIVATE KEY-----',
-      public_key_der_b64: 'pub',
-      curve: 'P-256',
-    });
-    expect(ks.loadIdentity('del.aid')).not.toBeNull();
-
-    ks.deleteIdentity('del.aid');
-    expect(ks.loadIdentity('del.aid')).toBeNull();
   });
 
   it('多个 AID 互不干扰', () => {
@@ -256,7 +244,7 @@ describe('FileKeyStore', () => {
     expect(prekeyData.private_key_protection).toBeDefined();
 
     const loaded = ks.loadMetadata('prekey.aid');
-    expect((loaded!.e2ee_prekeys as Record<string, Record<string, unknown>>)['prekey-123'].private_key_pem).toBe(privPem);
+    expect((loaded!.e2ee_prekeys as PrekeyMap)['prekey-123']?.private_key_pem).toBe(privPem);
   });
 
   it('group_secret 不以明文保存在磁盘上', () => {
@@ -281,7 +269,7 @@ describe('FileKeyStore', () => {
     expect(groupData.secret_protection).toBeDefined();
 
     const loaded = ks.loadMetadata('group.aid');
-    const gs = (loaded!.group_secrets as Record<string, Record<string, unknown>>)['group-1'];
+    const gs = (loaded!.group_secrets as GroupSecretMap)['group-1'];
     expect(gs.secret).toBe(Buffer.from('group-secret-bytes').toString('base64'));
   });
 
@@ -332,6 +320,77 @@ describe('FileKeyStore', () => {
     expect(loaded!.e2ee_prekeys).toBeDefined();
   });
 
+  it('updateMetadata 应基于最新快照追加嵌套 prekey', () => {
+    const ks = new FileKeyStore(tmpDir);
+
+    ks.updateMetadata('atomic.aid', metadata => {
+      metadata.e2ee_prekeys = {
+        ...((metadata.e2ee_prekeys as PrekeyMap | undefined) ?? {}),
+        'pk-1': { private_key_pem: 'PK1' },
+      };
+      return metadata;
+    });
+    ks.updateMetadata('atomic.aid', metadata => {
+      metadata.e2ee_prekeys = {
+        ...((metadata.e2ee_prekeys as PrekeyMap | undefined) ?? {}),
+        'pk-2': { private_key_pem: 'PK2' },
+      };
+      return metadata;
+    });
+
+    const loaded = ks.loadMetadata('atomic.aid');
+    const prekeys = loaded!.e2ee_prekeys as PrekeyMap;
+    expect(prekeys['pk-1'].private_key_pem).toBe('PK1');
+    expect(prekeys['pk-2'].private_key_pem).toBe('PK2');
+  });
+
+  it('saveIdentity 更新 token 时不应覆盖已有 prekey', () => {
+    const ks = new FileKeyStore(tmpDir);
+    ks.saveMetadata('identity.aid', {
+      e2ee_prekeys: {
+        'pk-1': { private_key_pem: 'KEEP_ME' },
+      },
+    });
+
+    ks.saveIdentity('identity.aid', {
+      aid: 'identity.aid',
+      access_token: 'tok-new',
+      refresh_token: 'rt-new',
+    });
+
+    const loaded = ks.loadMetadata('identity.aid');
+    const prekeys = loaded!.e2ee_prekeys as PrekeyMap;
+    expect(loaded!.access_token).toBe('tok-new');
+    expect(loaded!.refresh_token).toBe('rt-new');
+    expect(prekeys['pk-1'].private_key_pem).toBe('KEEP_ME');
+  });
+
+  it('cleanupE2EEPrekeys 应仅清理超过 7 天且不在最新 7 个里的 prekey', () => {
+    const ks = new FileKeyStore(tmpDir);
+    const now = Date.now();
+    const cutoffMs = now - (7 * 24 * 3600 * 1000);
+
+    for (let i = 0; i < 8; i += 1) {
+      ks.saveE2EEPrekey('cleanup.aid', `old-${i}`, {
+        private_key_pem: `OLD-${i}`,
+        created_at: cutoffMs - 1000 - (8 - i),
+      });
+    }
+    ks.saveE2EEPrekey('cleanup.aid', 'current', {
+      private_key_pem: 'CURRENT',
+      created_at: now,
+    });
+
+    const removed = ks.cleanupE2EEPrekeys('cleanup.aid', cutoffMs, 7).sort();
+    expect(removed).toEqual(['old-0', 'old-1']);
+
+    const prekeys = ks.loadE2EEPrekeys('cleanup.aid');
+    expect(Object.keys(prekeys)).toHaveLength(7);
+    expect(prekeys['old-0']).toBeUndefined();
+    expect(prekeys['old-1']).toBeUndefined();
+    expect(prekeys.current.private_key_pem).toBe('CURRENT');
+  });
+
   it('e2ee_sessions 的 key 被保护', () => {
     const ks = new FileKeyStore(tmpDir);
     ks.saveMetadata('session.aid', {
@@ -347,20 +406,8 @@ describe('FileKeyStore', () => {
     expect(sess.key_protection).toBeDefined();
 
     const loaded = ks.loadMetadata('session.aid');
-    const sessions = loaded!.e2ee_sessions as Record<string, unknown>[];
+    const sessions = loaded!.e2ee_sessions as JsonObject[];
     expect(sessions[0].key).toBe('session-secret-key');
-  });
-
-  it('deleteKeyPair 删除密钥文件', () => {
-    const ks = new FileKeyStore(tmpDir);
-    ks.saveKeyPair('del.aid', {
-      private_key_pem: '-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----',
-      public_key_der_b64: 'pub',
-    });
-    expect(ks.loadKeyPair('del.aid')).not.toBeNull();
-
-    ks.deleteKeyPair('del.aid');
-    expect(ks.loadKeyPair('del.aid')).toBeNull();
   });
 
   it('old_epochs 中的 secret 也被保护', () => {
@@ -393,8 +440,8 @@ describe('FileKeyStore', () => {
     expect(oldEpoch.secret_protection).toBeDefined();
 
     const loaded = ks.loadMetadata('epoch.aid');
-    const gs = (loaded!.group_secrets as Record<string, Record<string, unknown>>)['group-1'];
-    const oldEpochs = gs.old_epochs as Record<string, unknown>[];
+    const gs = (loaded!.group_secrets as GroupSecretMap)['group-1'];
+    const oldEpochs = gs.old_epochs as GroupOldEpochRecord[];
     expect(oldEpochs[0].secret).toBe(Buffer.from('old-secret').toString('base64'));
   });
 });

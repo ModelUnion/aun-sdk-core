@@ -2,8 +2,10 @@
 // 所有密码学操作均为异步（SubtleCrypto API 要求）
 
 import { E2EEDecryptFailedError, E2EEError } from './errors.js';
-import { uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer } from './crypto.js';
+import { uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer, toArrayBuffer, toBufferSource } from './crypto.js';
 import type { KeyStore } from './keystore/index.js';
+import { updateKeyStoreMetadata } from './keystore/update.js';
+import type { IdentityRecord, JsonObject, Message, PrekeyRecord } from './types.js';
 
 /** 加密套件标识 */
 export const SUITE = 'P256_HKDF_SHA256_AES_256_GCM';
@@ -30,6 +32,46 @@ export const AAD_MATCH_FIELDS_OFFLINE = [
 
 /** prekey 私钥本地保留时间（秒） */
 export const PREKEY_RETENTION_SECONDS = 7 * 24 * 3600;
+export const PREKEY_MIN_KEEP_COUNT = 7;
+
+export interface PrekeyMaterial extends JsonObject {
+  prekey_id: string;
+  public_key: string;
+  signature: string;
+  created_at?: number;
+  cert_fingerprint?: string;
+}
+
+interface LocalPrekeyRecord extends PrekeyRecord {
+  private_key_pem?: string;
+  created_at?: number;
+  updated_at?: number;
+  expires_at?: number;
+}
+
+type LocalPrekeyStore = Record<string, LocalPrekeyRecord>;
+
+function prekeyCreatedMarker(prekeyData: LocalPrekeyRecord): number {
+  return Number(prekeyData.created_at ?? prekeyData.updated_at ?? prekeyData.expires_at ?? 0);
+}
+
+function latestPrekeyIds(
+  prekeys: LocalPrekeyStore,
+  keepLatest: number,
+): Set<string> {
+  if (keepLatest <= 0) return new Set();
+  return new Set(
+    Object.entries(prekeys)
+      .filter(([, data]) => typeof data === 'object' && data !== null)
+      .sort((left, right) => {
+        const markerDiff = prekeyCreatedMarker(right[1]) - prekeyCreatedMarker(left[1]);
+        if (markerDiff !== 0) return markerDiff;
+        return right[0].localeCompare(left[0]);
+      })
+      .slice(0, keepLatest)
+      .map(([prekeyId]) => prekeyId),
+  );
+}
 
 /** 加密结果信息 */
 export interface EncryptResult {
@@ -38,6 +80,64 @@ export interface EncryptResult {
   mode: string;
   degraded: boolean;
   degradation_reason?: string;
+}
+
+async function loadKeyStorePrekeys(
+  keystore: KeyStore,
+  aid: string,
+): Promise<LocalPrekeyStore> {
+  if (typeof keystore.loadE2EEPrekeys === 'function') {
+    return ((await keystore.loadE2EEPrekeys(aid)) ?? {}) as LocalPrekeyStore;
+  }
+  const metadata = (await keystore.loadMetadata(aid)) ?? {};
+  return (metadata.e2ee_prekeys ?? {}) as LocalPrekeyStore;
+}
+
+async function saveKeyStorePrekey(
+  keystore: KeyStore,
+  aid: string,
+  prekeyId: string,
+  prekeyData: LocalPrekeyRecord,
+): Promise<void> {
+  if (typeof keystore.saveE2EEPrekey === 'function') {
+    await keystore.saveE2EEPrekey(aid, prekeyId, prekeyData);
+    return;
+  }
+  await updateKeyStoreMetadata(keystore, aid, metadata => {
+    const localPrekeys = (metadata.e2ee_prekeys ?? {}) as LocalPrekeyStore;
+    localPrekeys[prekeyId] = { ...prekeyData };
+    metadata.e2ee_prekeys = localPrekeys;
+    return metadata;
+  });
+}
+
+async function cleanupKeyStorePrekeys(
+  keystore: KeyStore,
+  aid: string,
+  cutoffMs: number,
+  keepLatest = PREKEY_MIN_KEEP_COUNT,
+): Promise<string[]> {
+  if (typeof keystore.cleanupE2EEPrekeys === 'function') {
+    return (await keystore.cleanupE2EEPrekeys(aid, cutoffMs, keepLatest)) ?? [];
+  }
+
+  const expired: string[] = [];
+  await updateKeyStoreMetadata(keystore, aid, metadata => {
+    const localPrekeys = (metadata.e2ee_prekeys ?? {}) as LocalPrekeyStore;
+    if (!Object.keys(localPrekeys).length) return metadata;
+    const retainedIds = latestPrekeyIds(localPrekeys, keepLatest);
+    for (const [pid, data] of Object.entries(localPrekeys)) {
+      if (prekeyCreatedMarker(data) < cutoffMs && !retainedIds.has(pid)) {
+        expired.push(pid);
+      }
+    }
+    for (const pid of expired) {
+      delete localPrekeys[pid];
+    }
+    metadata.e2ee_prekeys = localPrekeys;
+    return metadata;
+  });
+  return expired;
 }
 
 // ── 工具函数 ────────────────────────────────────────────────
@@ -89,13 +189,13 @@ function derToP1363(der: Uint8Array, coordLen = 32): Uint8Array {
 }
 
 /** AAD 序列化（排序键、紧凑 JSON） */
-function aadBytesOffline(aad: Record<string, unknown>): Uint8Array {
-  const obj: Record<string, unknown> = {};
+function aadBytesOffline(aad: JsonObject): Uint8Array {
+  const obj: JsonObject = {};
   for (const field of AAD_FIELDS_OFFLINE) {
     obj[field] = aad[field] ?? null;
   }
   // 按键排序
-  const sorted: Record<string, unknown> = {};
+  const sorted: JsonObject = {};
   for (const key of Object.keys(obj).sort()) {
     sorted[key] = obj[key];
   }
@@ -103,7 +203,7 @@ function aadBytesOffline(aad: Record<string, unknown>): Uint8Array {
 }
 
 /** AAD 匹配检查（解密时校验） */
-function aadMatchesOffline(expected: Record<string, unknown>, actual: Record<string, unknown>): boolean {
+function aadMatchesOffline(expected: JsonObject, actual: JsonObject): boolean {
   for (const field of AAD_MATCH_FIELDS_OFFLINE) {
     // 宽松比较：JSON 序列化后对比
     if (JSON.stringify(expected[field] ?? null) !== JSON.stringify(actual[field] ?? null)) {
@@ -207,10 +307,18 @@ async function fingerprintCertPem(certPem: string): Promise<string> {
   return fingerprintSpki(spki);
 }
 
+/** 从 PEM 证书计算证书 SHA-256 指纹 */
+async function certificateSha256Fingerprint(certPem: string): Promise<string> {
+  const der = pemToArrayBuffer(certPem);
+  const hash = await crypto.subtle.digest('SHA-256', der);
+  const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `sha256:${hex}`;
+}
+
 /** 从 SPKI DER base64 计算公钥指纹 */
 async function fingerprintDerB64(derB64: string): Promise<string> {
   const der = base64ToUint8(derB64);
-  return fingerprintSpki(der.buffer);
+  return fingerprintSpki(toArrayBuffer(der));
 }
 
 /** 导入 PEM 证书公钥为 ECDSA CryptoKey */
@@ -237,7 +345,7 @@ async function importCertPublicKeyEcdh(certPem: string): Promise<CryptoKey> {
 async function importSpkiDerB64Ecdh(derB64: string): Promise<CryptoKey> {
   const der = base64ToUint8(derB64);
   return crypto.subtle.importKey(
-    'spki', der.buffer,
+    'spki', toArrayBuffer(der),
     { name: 'ECDH', namedCurve: 'P-256' },
     true, [],
   );
@@ -247,7 +355,7 @@ async function importSpkiDerB64Ecdh(derB64: string): Promise<CryptoKey> {
 async function importSpkiDerB64Ecdsa(derB64: string): Promise<CryptoKey> {
   const der = base64ToUint8(derB64);
   return crypto.subtle.importKey(
-    'spki', der.buffer,
+    'spki', toArrayBuffer(der),
     { name: 'ECDSA', namedCurve: 'P-256' },
     true, ['verify'],
   );
@@ -284,13 +392,13 @@ async function ecdhDeriveBits(privateKey: CryptoKey, publicKey: CryptoKey): Prom
 
 /** HKDF 派生密钥（256 位） */
 async function hkdfDerive(ikm: Uint8Array, info: string): Promise<Uint8Array> {
-  const ikmKey = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const ikmKey = await crypto.subtle.importKey('raw', toBufferSource(ikm), 'HKDF', false, ['deriveBits']);
   const bits = await crypto.subtle.deriveBits(
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt: new Uint8Array(0),
-      info: _encoder.encode(info),
+      salt: toBufferSource(new Uint8Array(0)),
+      info: toBufferSource(_encoder.encode(info)),
     },
     ikmKey, 256,
   );
@@ -301,10 +409,10 @@ async function hkdfDerive(ikm: Uint8Array, info: string): Promise<Uint8Array> {
 async function aesGcmEncrypt(
   key: Uint8Array, nonce: Uint8Array, plaintext: Uint8Array, aad: Uint8Array,
 ): Promise<[Uint8Array, Uint8Array]> {
-  const aesKey = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt']);
+  const aesKey = await crypto.subtle.importKey('raw', toBufferSource(key), 'AES-GCM', false, ['encrypt']);
   const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: 128 },
-    aesKey, plaintext,
+    { name: 'AES-GCM', iv: toBufferSource(nonce), additionalData: toBufferSource(aad), tagLength: 128 },
+    aesKey, toBufferSource(plaintext),
   );
   const arr = new Uint8Array(ct);
   // SubtleCrypto 将 16 字节 tag 附加到 ciphertext 末尾
@@ -315,12 +423,12 @@ async function aesGcmEncrypt(
 async function aesGcmDecrypt(
   key: Uint8Array, nonce: Uint8Array, ciphertext: Uint8Array, tag: Uint8Array, aad: Uint8Array,
 ): Promise<Uint8Array> {
-  const aesKey = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['decrypt']);
+  const aesKey = await crypto.subtle.importKey('raw', toBufferSource(key), 'AES-GCM', false, ['decrypt']);
   // SubtleCrypto 要求 ciphertext + tag 拼接传入
   const combined = concatBytes(ciphertext, tag);
   const pt = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: 128 },
-    aesKey, combined,
+    { name: 'AES-GCM', iv: toBufferSource(nonce), additionalData: toBufferSource(aad), tagLength: 128 },
+    aesKey, toBufferSource(combined),
   );
   return new Uint8Array(pt);
 }
@@ -329,7 +437,7 @@ async function aesGcmDecrypt(
 async function ecdsaSignDer(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Array> {
   const sig = await crypto.subtle.sign(
     { name: 'ECDSA', hash: 'SHA-256' },
-    privateKey, data,
+    privateKey, toBufferSource(data),
   );
   // SubtleCrypto 输出 P1363 格式，转换为 DER
   return p1363ToDer(new Uint8Array(sig));
@@ -343,7 +451,7 @@ async function ecdsaVerifyDer(
   const p1363 = derToP1363(signature);
   return crypto.subtle.verify(
     { name: 'ECDSA', hash: 'SHA-256' },
-    publicKey, p1363, data,
+    publicKey, toBufferSource(p1363), toBufferSource(data),
   );
 }
 
@@ -377,7 +485,7 @@ async function importUncompressedPointEcdh(pointBytes: Uint8Array): Promise<Cryp
   ]);
   const spki = concatBytes(spkiHeader, pointBytes);
   return crypto.subtle.importKey(
-    'spki', spki.buffer,
+    'spki', toArrayBuffer(spki),
     { name: 'ECDH', namedCurve: 'P-256' },
     true, [],
   );
@@ -395,13 +503,13 @@ async function importUncompressedPointEcdh(pointBytes: Uint8Array): Promise<Cryp
  * 所有密码学操作均为异步（SubtleCrypto 要求）。
  */
 export class E2EEManager {
-  private _identityFn: () => Record<string, unknown>;
+  private _identityFn: () => IdentityRecord;
   private _keystoreRef: KeyStore;
   /** 本地防重放 seen set */
   private _seenMessages: Map<string, boolean> = new Map();
   private _seenMaxSize = 50000;
   /** 对方 prekey 内存缓存 {peerAid: {prekey, expireAt}} */
-  private _prekeyCache: Map<string, { prekey: Record<string, unknown>; expireAt: number }> = new Map();
+  private _prekeyCache: Map<string, { prekey: PrekeyMaterial; expireAt: number }> = new Map();
   private _prekeyCacheTtl: number;
   /** 本地 prekey 私钥 PEM 内存缓存 {prekeyId: privateKeyPem} */
   private _localPrekeyCache: Map<string, string> = new Map();
@@ -409,7 +517,7 @@ export class E2EEManager {
   private _replayWindowSeconds: number;
 
   constructor(opts: {
-    identityFn: () => Record<string, unknown>;
+    identityFn: () => IdentityRecord;
     keystore: KeyStore;
     prekeyCacheTtl?: number;
     replayWindowSeconds?: number;
@@ -423,7 +531,7 @@ export class E2EEManager {
   // ── Prekey 缓存 ──────────────────────────────────
 
   /** 缓存对方的 prekey */
-  cachePrekey(peerAid: string, prekey: Record<string, unknown>): void {
+  cachePrekey(peerAid: string, prekey: PrekeyMaterial): void {
     this._prekeyCache.set(peerAid, {
       prekey,
       expireAt: Date.now() / 1000 + this._prekeyCacheTtl,
@@ -431,7 +539,7 @@ export class E2EEManager {
   }
 
   /** 获取缓存的 prekey（过期返回 null） */
-  getCachedPrekey(peerAid: string): Record<string, unknown> | null {
+  getCachedPrekey(peerAid: string): PrekeyMaterial | null {
     const cached = this._prekeyCache.get(peerAid);
     if (!cached) return null;
     if (Date.now() / 1000 >= cached.expireAt) {
@@ -454,14 +562,14 @@ export class E2EEManager {
    */
   async encryptMessage(
     toAid: string,
-    payload: Record<string, unknown>,
+    payload: JsonObject,
     opts: {
       peerCertPem: string;
-      prekey?: Record<string, unknown> | null;
+      prekey?: PrekeyMaterial | null;
       messageId?: string;
       timestamp?: number;
     },
-  ): Promise<[Record<string, unknown>, EncryptResult]> {
+  ): Promise<[JsonObject, EncryptResult]> {
     const messageId = opts.messageId ?? uuidV4();
     const timestamp = opts.timestamp ?? Date.now();
     return this.encryptOutbound(toAid, payload, {
@@ -482,14 +590,14 @@ export class E2EEManager {
    */
   async encryptOutbound(
     peerAid: string,
-    payload: Record<string, unknown>,
+    payload: JsonObject,
     opts: {
       peerCertPem: string;
-      prekey?: Record<string, unknown> | null;
+      prekey?: PrekeyMaterial | null;
       messageId: string;
       timestamp: number;
     },
-  ): Promise<[Record<string, unknown>, EncryptResult]> {
+  ): Promise<[JsonObject, EncryptResult]> {
     let prekey = opts.prekey ?? null;
 
     // 传入 prekey → 缓存；传入 null → 查缓存
@@ -541,34 +649,36 @@ export class E2EEManager {
    */
   private async _encryptWithPrekey(
     peerAid: string,
-    payload: Record<string, unknown>,
-    prekey: Record<string, unknown>,
+    payload: JsonObject,
+    prekey: PrekeyMaterial,
     peerCertPem: string,
     messageId: string,
     timestamp: number,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     // 导入对方 identity 公钥（ECDSA 用于验签，ECDH 用于密钥交换）
     const peerIdentityEcdsa = await importCertPublicKeyEcdsa(peerCertPem);
     const peerIdentityEcdh = await importCertPublicKeyEcdh(peerCertPem);
+    const expectedCertFingerprint = String(prekey.cert_fingerprint ?? '').trim().toLowerCase();
+    if (expectedCertFingerprint) {
+      const actualCertFingerprint = await certificateSha256Fingerprint(peerCertPem);
+      if (actualCertFingerprint !== expectedCertFingerprint) {
+        throw new E2EEError('prekey cert fingerprint mismatch');
+      }
+    }
 
     // 验证 prekey 签名
-    const prekeyId = prekey.prekey_id as string;
-    const prekeyPubB64 = prekey.public_key as string;
-    const createdAt = prekey.created_at as number | undefined;
+    const prekeyId = prekey.prekey_id;
+    const prekeyPubB64 = prekey.public_key;
+    const createdAt = prekey.created_at;
 
     let signData: Uint8Array;
     if (createdAt !== undefined) {
       signData = _encoder.encode(`${prekeyId}|${prekeyPubB64}|${createdAt}`);
-      // 检查 prekey 年龄（30 天）
-      const ageMs = Date.now() - createdAt;
-      if (ageMs > 30 * 24 * 3600 * 1000) {
-        throw new E2EEError(`prekey 过期: ${Math.floor(ageMs / 1000)}s`);
-      }
     } else {
       signData = _encoder.encode(`${prekeyId}|${prekeyPubB64}`);
     }
 
-    const sigBytes = base64ToUint8(prekey.signature as string);
+    const sigBytes = base64ToUint8(prekey.signature);
     const sigValid = await ecdsaVerifyDer(peerIdentityEcdsa, sigBytes, signData);
     if (!sigValid) {
       throw new E2EEError('prekey 签名验证失败');
@@ -607,7 +717,7 @@ export class E2EEManager {
     const recipientFingerprint = await fingerprintCertPem(peerCertPem);
     const ephPkB64 = uint8ToBase64(ephPublicBytes);
 
-    const aad: Record<string, unknown> = {
+    const aad: JsonObject = {
       from: this._currentAid(),
       to: peerAid,
       message_id: messageId,
@@ -622,7 +732,7 @@ export class E2EEManager {
     const aadBytes = aadBytesOffline(aad);
     const [ciphertext, tag] = await aesGcmEncrypt(messageKey, nonce, plaintext, aadBytes);
 
-    const envelope: Record<string, unknown> = {
+    const envelope: JsonObject = {
       type: 'e2ee.encrypted',
       version: '1',
       encryption_mode: MODE_PREKEY_ECDH_V2,
@@ -652,11 +762,11 @@ export class E2EEManager {
    */
   private async _encryptWithLongTermKey(
     peerAid: string,
-    payload: Record<string, unknown>,
+    payload: JsonObject,
     peerCertPem: string,
     messageId: string,
     timestamp: number,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     const peerIdentityEcdh = await importCertPublicKeyEcdh(peerCertPem);
     const senderIdentityEcdhKey = await this._loadSenderIdentityPrivateEcdh();
     const senderSignKey = await this._loadSenderIdentityPrivateEcdsa();
@@ -682,7 +792,7 @@ export class E2EEManager {
     const recipientFingerprint = await fingerprintCertPem(peerCertPem);
     const ephPkB64 = uint8ToBase64(ephPublicBytes);
 
-    const aad: Record<string, unknown> = {
+    const aad: JsonObject = {
       from: this._currentAid(),
       to: peerAid,
       message_id: messageId,
@@ -696,7 +806,7 @@ export class E2EEManager {
     const aadBytes = aadBytesOffline(aad);
     const [ciphertext, tag] = await aesGcmEncrypt(messageKey, nonce, plaintext, aadBytes);
 
-    const envelope: Record<string, unknown> = {
+    const envelope: JsonObject = {
       type: 'e2ee.encrypted',
       version: '1',
       encryption_mode: MODE_LONG_TERM_KEY,
@@ -727,10 +837,10 @@ export class E2EEManager {
    * opts.skipReplay: 跳过防重放和 timestamp 窗口检查（用于 message.pull 场景）。
    */
   async decryptMessage(
-    message: Record<string, unknown>,
+    message: Message,
     opts?: { skipReplay?: boolean },
-  ): Promise<Record<string, unknown> | null> {
-    const payload = message.payload as Record<string, unknown> | undefined;
+  ): Promise<Message | null> {
+    const payload = message.payload as JsonObject | undefined;
     if (!payload || typeof payload !== 'object') return message;
     if (payload.type !== 'e2ee.encrypted') return message;
     if (message.encrypted === false) return message;
@@ -740,7 +850,7 @@ export class E2EEManager {
 
     if (!skipReplay) {
       // timestamp 窗口检查
-      const ts = (message.timestamp ?? (payload.aad as Record<string, unknown> | undefined)?.timestamp) as number | undefined;
+      const ts = (message.timestamp ?? (payload.aad as JsonObject | undefined)?.timestamp) as number | undefined;
       if (typeof ts === 'number' && this._replayWindowSeconds > 0) {
         const nowMs = Date.now();
         const diffS = Math.abs(nowMs - ts) / 1000;
@@ -768,14 +878,14 @@ export class E2EEManager {
 
   /** 判断是否应该为当前 AID 解密（避免发送端回显消息误走解密） */
   private _shouldDecryptForCurrentAid(
-    message: Record<string, unknown>,
-    payload: Record<string, unknown>,
+    message: Message,
+    payload: JsonObject,
   ): boolean {
     const currentAid = this._currentAid();
     if (!currentAid) return true;
     const targetAid = (
       message.to
-      ?? (payload.aad as Record<string, unknown> | undefined)?.to
+      ?? (payload.aad as JsonObject | undefined)?.to
       ?? payload.to
     ) as string | undefined;
     if (!targetAid) return true;
@@ -784,9 +894,9 @@ export class E2EEManager {
 
   /** 内部解密分发 */
   private async _decryptMessageInternal(
-    message: Record<string, unknown>,
-  ): Promise<Record<string, unknown> | null> {
-    const payload = message.payload as Record<string, unknown>;
+    message: Message,
+  ): Promise<Message | null> {
+    const payload = message.payload as JsonObject;
 
     // 验证发送方签名（适用于所有模式）
     try {
@@ -809,8 +919,8 @@ export class E2EEManager {
 
   /** 验证发送方签名 */
   private async _verifySenderSignature(
-    payload: Record<string, unknown>,
-    message: Record<string, unknown>,
+    payload: JsonObject,
+    message: Message,
   ): Promise<void> {
     const senderSigB64 = payload.sender_signature as string | undefined;
     if (!senderSigB64) {
@@ -818,7 +928,7 @@ export class E2EEManager {
     }
 
     // 获取发送方公钥
-    const fromAid = (message.from ?? (payload.aad as Record<string, unknown> | undefined)?.from) as string;
+    const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
     if (!fromAid) throw new E2EEDecryptFailedError('from_aid missing in message');
 
     const senderCertPem = await this._getSenderCert(fromAid);
@@ -829,7 +939,7 @@ export class E2EEManager {
     // 重建签名载荷
     const ciphertext = base64ToUint8(payload.ciphertext as string);
     const tag = base64ToUint8(payload.tag as string);
-    const aad = payload.aad as Record<string, unknown> | undefined;
+    const aad = payload.aad as JsonObject | undefined;
     const aadBytes = aad ? aadBytesOffline(aad) : new Uint8Array(0);
     const signPayload = concatBytes(ciphertext, tag, aadBytes);
 
@@ -847,9 +957,9 @@ export class E2EEManager {
 
   /** 解密 prekey_ecdh_v2 模式的消息（四路 ECDH） */
   private async _decryptMessagePrekeyV2(
-    message: Record<string, unknown>,
-  ): Promise<Record<string, unknown> | null> {
-    const payload = message.payload as Record<string, unknown>;
+    message: Message,
+  ): Promise<Message | null> {
+    const payload = message.payload as JsonObject;
     try {
       const ephPublicBytes = base64ToUint8(payload.ephemeral_public_key as string);
       const prekeyId = (payload.prekey_id ?? '') as string;
@@ -870,7 +980,7 @@ export class E2EEManager {
       const myIdentityEcdh = await importPrivateKeyEcdh(keyPair.private_key_pem as string);
 
       // 获取发送方公钥（四路 ECDH 需要）
-      const fromAid = (message.from ?? (payload.aad as Record<string, unknown> | undefined)?.from) as string;
+      const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
       const senderCertPem = await this._getSenderCert(fromAid);
       if (!senderCertPem) throw new E2EEError(`sender public key not found for ${fromAid}`);
       const senderPubEcdh = await importCertPublicKeyEcdh(senderCertPem);
@@ -887,7 +997,7 @@ export class E2EEManager {
       const messageKey = await hkdfDerive(combined, `aun-prekey-v2:${prekeyId}`);
 
       // 验证 AAD 并解密
-      const aad = payload.aad as Record<string, unknown> | undefined;
+      const aad = payload.aad as JsonObject | undefined;
       let aadBytes: Uint8Array;
       if (aad) {
         const expectedAad = this._buildInboundAadOffline(message, payload);
@@ -923,9 +1033,9 @@ export class E2EEManager {
 
   /** 解密 long_term_key 模式的消息（2DH） */
   private async _decryptMessageLongTerm(
-    message: Record<string, unknown>,
-  ): Promise<Record<string, unknown> | null> {
-    const payload = message.payload as Record<string, unknown>;
+    message: Message,
+  ): Promise<Message | null> {
+    const payload = message.payload as JsonObject;
     try {
       const ephPublicBytes = base64ToUint8(payload.ephemeral_public_key as string);
       const nonce = base64ToUint8(payload.nonce as string);
@@ -940,7 +1050,7 @@ export class E2EEManager {
       const myIdentityEcdh = await importPrivateKeyEcdh(keyPair.private_key_pem as string);
 
       // 获取发送方公钥（2DH 需要）
-      const fromAid = (message.from ?? (payload.aad as Record<string, unknown> | undefined)?.from) as string;
+      const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
       const senderCertPem = await this._getSenderCert(fromAid);
       if (!senderCertPem) throw new E2EEError(`sender public key not found for ${fromAid}`);
       const senderPubEcdh = await importCertPublicKeyEcdh(senderCertPem);
@@ -955,7 +1065,7 @@ export class E2EEManager {
       const messageKey = await hkdfDerive(combined, 'aun-longterm-v2');
 
       // 验证 AAD 并解密
-      const aad = payload.aad as Record<string, unknown> | undefined;
+      const aad = payload.aad as JsonObject | undefined;
       let aadBytes: Uint8Array;
       if (aad) {
         const expectedAad = this._buildInboundAadOffline(message, payload);
@@ -992,10 +1102,10 @@ export class E2EEManager {
 
   /** 构建解密时的期望 AAD（接收方视角） */
   private _buildInboundAadOffline(
-    message: Record<string, unknown>,
-    payload: Record<string, unknown>,
-  ): Record<string, unknown> {
-    const aad = payload.aad as Record<string, unknown> | undefined;
+    message: Message,
+    payload: JsonObject,
+  ): JsonObject {
+    const aad = payload.aad as JsonObject | undefined;
     return {
       from: message.from,
       to: message.to,
@@ -1017,7 +1127,7 @@ export class E2EEManager {
    *
    * 返回 { prekey_id, public_key, signature, created_at }，可直接用于 RPC 上传。
    */
-  async generatePrekey(): Promise<Record<string, unknown>> {
+  async generatePrekey(): Promise<PrekeyMaterial> {
     const aid = this._currentAid();
     if (!aid) throw new E2EEError('AID unavailable for prekey generation');
 
@@ -1043,15 +1153,10 @@ export class E2EEManager {
     const sig = await ecdsaSignDer(senderSignKey, signData);
     const signatureB64 = uint8ToBase64(sig);
 
-    // 保存私钥到本地 keystore metadata
-    const metadata = (await this._keystoreRef.loadMetadata(aid)) ?? {};
-    const localPrekeys = (metadata.e2ee_prekeys ?? {}) as Record<string, Record<string, unknown>>;
-    localPrekeys[prekeyId] = {
+    await saveKeyStorePrekey(this._keystoreRef, aid, prekeyId, {
       private_key_pem: privateKeyPem,
       created_at: nowMs,
-    };
-    metadata.e2ee_prekeys = localPrekeys;
-    await this._keystoreRef.saveMetadata(aid, metadata);
+    });
 
     // 内存缓存私钥 PEM
     this._localPrekeyCache.set(prekeyId, privateKeyPem);
@@ -1059,35 +1164,28 @@ export class E2EEManager {
     // 清理过期的旧 prekey
     await this._cleanupExpiredPrekeys(aid);
 
-    return {
+    const result: PrekeyMaterial = {
       prekey_id: prekeyId,
       public_key: publicKeyB64,
       signature: signatureB64,
       created_at: nowMs,
     };
+    const certFingerprint = await this._localCertSha256Fingerprint();
+    if (certFingerprint) {
+      result.cert_fingerprint = certFingerprint;
+    }
+    return result;
   }
 
   /** 清理过期的本地 prekey 私钥 */
   private async _cleanupExpiredPrekeys(aid: string): Promise<void> {
-    const metadata = (await this._keystoreRef.loadMetadata(aid)) ?? {};
-    const localPrekeys = (metadata.e2ee_prekeys ?? {}) as Record<string, Record<string, unknown>>;
-    if (!Object.keys(localPrekeys).length) return;
-
     const nowMs = Date.now();
     const cutoffMs = nowMs - PREKEY_RETENTION_SECONDS * 1000;
-    const expired: string[] = [];
-    for (const [pid, data] of Object.entries(localPrekeys)) {
-      if (((data.created_at as number) ?? 0) < cutoffMs) {
-        expired.push(pid);
-      }
-    }
+    const expired = await cleanupKeyStorePrekeys(this._keystoreRef, aid, cutoffMs, PREKEY_MIN_KEEP_COUNT);
     if (expired.length > 0) {
       for (const pid of expired) {
-        delete localPrekeys[pid];
         this._localPrekeyCache.delete(pid);
       }
-      metadata.e2ee_prekeys = localPrekeys;
-      await this._keystoreRef.saveMetadata(aid, metadata);
     }
   }
 
@@ -1099,8 +1197,7 @@ export class E2EEManager {
 
     const aid = this._currentAid();
     if (!aid) return null;
-    const metadata = (await this._keystoreRef.loadMetadata(aid)) ?? {};
-    const prekeys = (metadata.e2ee_prekeys ?? {}) as Record<string, Record<string, unknown>>;
+    const prekeys = await loadKeyStorePrekeys(this._keystoreRef, aid);
     const prekeyData = prekeys[prekeyId];
     if (!prekeyData) return null;
     const pem = prekeyData.private_key_pem as string | undefined;
@@ -1164,6 +1261,14 @@ export class E2EEManager {
       return fingerprintSpki(spki);
     }
     throw new E2EEError('identity fingerprint unavailable');
+  }
+
+  /** 本地证书的 SHA-256 指纹（用于锁定证书版本） */
+  private async _localCertSha256Fingerprint(): Promise<string> {
+    const identity = this._identityFn();
+    const certPem = identity.cert as string | undefined;
+    if (!certPem) return '';
+    return certificateSha256Fingerprint(certPem);
   }
 
   /** 裁剪 seen set */

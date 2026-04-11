@@ -330,8 +330,9 @@ python -X utf8 tests/e2e_test_group_e2ee.py
 3. 测试脚本目录 ./python/tests
 4. aun协议文档目录 ../docs/aun文档/aun协议
 5. aun skill目录 ../../aun-skill/.claude/skills/aun-sdk
-6. aun sdk文档目录 ./python/docs
-7. ./python/src/aun-core/docs 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
+6. aun sdk文档目录 ./docs/sdk
+7. ./python/src/aun-core/docs/skill 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
+8. ./docs/protocol 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
 
 D:\modelunion\kite\aun-sdk-core\python\tests 下是aun sdk的单域环境的测试用例，包括单元测试及集成测试/e2e测试的。
 D:\modelunion\kite\docker-deploy\federation-test是aun sdk的双域测试环境用例，主要用于测试跨域通信

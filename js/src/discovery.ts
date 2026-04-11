@@ -1,6 +1,7 @@
 // ── Gateway 发现（浏览器 fetch API）──────────────────────
 
 import { ConnectionError, ValidationError } from './errors.js';
+import { isJsonObject, type GatewayDiscoveryDocument, type GatewayEntry, type JsonValue } from './types.js';
 
 /**
  * Gateway 发现服务 — 通过 .well-known 端点发现 Gateway WebSocket URL。
@@ -15,7 +16,7 @@ export class GatewayDiscovery {
    * 选择 priority 最小的网关。
    */
   async discover(wellKnownUrl: string, timeout = 5000): Promise<string> {
-    let payload: Record<string, unknown>;
+    let payload: GatewayDiscoveryDocument;
     try {
       const controller = new AbortController();
       const timer = globalThis.setTimeout(() => controller.abort(), timeout);
@@ -28,7 +29,11 @@ export class GatewayDiscovery {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
-      payload = (await response.json()) as Record<string, unknown>;
+      const rawPayload = await response.json() as JsonValue;
+      if (!isJsonObject(rawPayload)) {
+        throw new ValidationError('well-known returned invalid payload');
+      }
+      payload = rawPayload as GatewayDiscoveryDocument;
     } catch (exc) {
       throw new ConnectionError(
         `gateway discovery failed for ${wellKnownUrl}: ${exc}`,
@@ -43,7 +48,7 @@ export class GatewayDiscovery {
 
     // 按 priority 排序（低优先级数字 = 高优先级）
     const sorted = [...gateways].sort(
-      (a: Record<string, unknown>, b: Record<string, unknown>) =>
+      (a: GatewayEntry, b: GatewayEntry) =>
         (Number(a.priority ?? 999)) - (Number(b.priority ?? 999)),
     );
 

@@ -9,7 +9,7 @@
 
 前置条件：
   - Docker 环境运行中（docker compose up -d）
-  - hosts 文件映射 gateway.agentid.pub → 127.0.0.1
+  - 运行环境能解析 gateway.agentid.pub（推荐 Docker network alias，不使用 hosts 文件）
 """
 from __future__ import annotations
 

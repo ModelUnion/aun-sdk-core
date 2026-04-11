@@ -31,15 +31,17 @@ import {
 } from '../../src/e2ee-group.js';
 import { CryptoProvider, uint8ToBase64, base64ToUint8 } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
+import type { GroupOldEpochRecord, GroupSecretMap, JsonObject, KeyPairRecord, MetadataRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 
 // ── 内存 KeyStore mock ──────────────────────────────────
 
 function createMockKeyStore(): KeyStore {
-  const keyPairs = new Map<string, Record<string, unknown>>();
+  const keyPairs = new Map<string, KeyPairRecord>();
   const certs = new Map<string, string>();
-  const metadata = new Map<string, Record<string, unknown>>();
+  const metadata = new Map<string, MetadataRecord>();
+  const groups = new Map<string, GroupSecretMap>();
   return {
     async loadKeyPair(aid) { return keyPairs.get(aid) ?? null; },
     async saveKeyPair(aid, kp) { keyPairs.set(aid, kp); },
@@ -50,7 +52,26 @@ function createMockKeyStore(): KeyStore {
       return md ? JSON.parse(JSON.stringify(md)) : null;
     },
     async saveMetadata(aid, md) { metadata.set(aid, JSON.parse(JSON.stringify(md))); },
-    async deleteKeyPair(aid) { keyPairs.delete(aid); },
+    async loadGroupSecretState(aid, groupId) {
+      return JSON.parse(JSON.stringify(groups.get(aid)?.[groupId] ?? null));
+    },
+    async loadAllGroupSecretStates(aid) {
+      return JSON.parse(JSON.stringify(groups.get(aid) ?? {}));
+    },
+    async saveGroupSecretState(aid, groupId, entry) {
+      const current = groups.get(aid) ?? {};
+      current[groupId] = JSON.parse(JSON.stringify(entry));
+      groups.set(aid, current);
+    },
+    async cleanupGroupOldEpochsState(aid, groupId, cutoffMs) {
+      const entry = groups.get(aid)?.[groupId];
+      if (!entry) return 0;
+      const oldEpochs = Array.isArray(entry.old_epochs) ? entry.old_epochs as GroupOldEpochRecord[] : [];
+      const remaining = oldEpochs.filter((old) => Number(old.expires_at ?? old.updated_at ?? 0) >= cutoffMs);
+      const removed = oldEpochs.length - remaining.length;
+      entry.old_epochs = remaining;
+      return removed;
+    },
     async loadIdentity(aid) {
       const kp = keyPairs.get(aid);
       if (!kp) return null;
@@ -59,17 +80,12 @@ function createMockKeyStore(): KeyStore {
       return { ...kp, ...(md ?? {}), ...(cert ? { cert } : {}) };
     },
     async saveIdentity(aid, identity) {
-      const kp: Record<string, unknown> = {};
+      const kp: KeyPairRecord = {};
       for (const k of ['private_key_pem', 'public_key_der_b64', 'curve']) {
         if (k in identity) kp[k] = identity[k];
       }
       if (Object.keys(kp).length) keyPairs.set(aid, kp);
       if (identity.cert) certs.set(aid, identity.cert as string);
-    },
-    async deleteIdentity(aid) {
-      keyPairs.delete(aid);
-      certs.delete(aid);
-      metadata.delete(aid);
     },
   };
 }
@@ -481,10 +497,10 @@ describe('群组消息加密/解密往返', () => {
       const decrypted = await decryptGroupMessage(message, secrets, null, { requireSignature: false });
       expect(decrypted).not.toBeNull();
       expect(decrypted!.encrypted).toBe(true);
-      expect((decrypted!.payload as Record<string, unknown>).text).toBe('Hello, group!');
-      expect((decrypted!.payload as Record<string, unknown>).num).toBe(42);
-      expect((decrypted!.e2ee as Record<string, unknown>).encryption_mode).toBe(MODE_EPOCH_GROUP_KEY);
-      expect((decrypted!.e2ee as Record<string, unknown>).epoch).toBe(epoch);
+      expect((decrypted!.payload as JsonObject).text).toBe('Hello, group!');
+      expect((decrypted!.payload as JsonObject).num).toBe(42);
+      expect((decrypted!.e2ee as JsonObject).encryption_mode).toBe(MODE_EPOCH_GROUP_KEY);
+      expect((decrypted!.e2ee as JsonObject).epoch).toBe(epoch);
     },
   );
 
@@ -727,7 +743,7 @@ describe('GroupE2EEManager', () => {
       const result = await manager.createEpoch('g1', ['alice', 'bob']);
       expect(result.epoch).toBe(1);
       expect(result.commitment).toBeDefined();
-      const dists = result.distributions as Array<{ to: string; payload: Record<string, unknown> }>;
+      const dists = result.distributions as Array<{ to: string; payload: JsonObject }>;
       expect(dists.length).toBe(1); // 只分发给 bob（排除 alice 自己）
       expect(dists[0].to).toBe('bob');
 

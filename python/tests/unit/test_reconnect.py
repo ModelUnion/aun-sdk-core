@@ -27,7 +27,7 @@ from aun_core.errors import AuthError, ConnectionError, PermissionError
 
 def _make_client(auto_reconnect: bool = True) -> AUNClient:
     """创建已配置好的测试客户端（不实际连接）"""
-    client = AUNClient({"aun_path": "/tmp/test_reconnect"})
+    client = AUNClient({"aun_path": "/tmp/test_reconnect", "sqlite_backup": False})
     # 注入会话选项（模拟已连接状态）
     client._session_options = {
         "auto_reconnect": auto_reconnect,

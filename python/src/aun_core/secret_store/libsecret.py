@@ -49,9 +49,6 @@ class LibsecretSecretStore:
         password = base64.b64encode(plaintext).decode("ascii")
         label = f"aun:{scope}:{name}"
 
-        # 先清除旧条目
-        self.clear(scope, name)
-
         # secret-tool store 从 stdin 读取 secret
         subprocess.run(
             [
@@ -97,18 +94,3 @@ class LibsecretSecretStore:
         if not password:
             return None
         return base64.b64decode(password)
-
-    def clear(self, scope: str, name: str) -> None:
-        """删除条目，不存在时静默忽略。"""
-        try:
-            subprocess.run(
-                [
-                    "secret-tool", "clear",
-                    "aun_scope", scope,
-                    "aun_name", name,
-                ],
-                capture_output=True,
-                timeout=10,
-            )
-        except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
-            pass  # 平台兼容 fallback

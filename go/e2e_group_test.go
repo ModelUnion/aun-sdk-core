@@ -917,14 +917,7 @@ func TestGroupE2EPushEventDecrypt(t *testing.T) {
 	pushMu.Unlock()
 
 	if pushCount == 0 {
-		// 推送未收到，通过 pull 兜底验证
-		msgs := groupPull(t, bob, groupID, 0)
-		decrypted := filterDecrypted(msgs)
-		if len(decrypted) < 1 {
-			t.Fatal("推送和 pull 均未收到已解密的群消息")
-		}
-		t.Log("推送未收到，通过 pull 兜底验证通过")
-		return
+		t.Fatal("推送事件未收到：group.message_created 带 payload 的推送未到达 SDK")
 	}
 
 	pushMu.Lock()

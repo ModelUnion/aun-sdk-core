@@ -7,8 +7,9 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 import aiohttp
 import websockets
@@ -31,6 +32,7 @@ from .events import EventDispatcher, Subscription
 from .keystore.file import FileKeyStore
 from .namespaces.auth_namespace import AuthNamespace
 from .transport import RPCTransport
+from .seq_tracker import SeqTracker
 
 _INTERNAL_ONLY_METHODS = {
     "auth.login1",
@@ -106,6 +108,14 @@ class _CachedPeerCert:
     refresh_after: float
 
 
+def _is_group_service_aid(value: Any) -> bool:
+    text = str(value or "").strip()
+    if "." not in text:
+        return False
+    name, issuer = text.split(".", 1)
+    return name == "group" and bool(issuer)
+
+
 class AUNClient:
     """AUN Core SDK — 连接、认证、密钥管理、E2EE。"""
 
@@ -129,16 +139,30 @@ class AUNClient:
 
         # E2EE 编排状态（内存缓存，进程退出即清空）
         self._cert_cache: dict[str, _CachedPeerCert] = {}
+        self._prekey_replenish_inflight: set[str] = set()
+        self._prekey_replenished: set[str] = set()
 
         connection_factory = raw_config.get("connection_factory") or _make_connection_factory(
             self._config_model.verify_ssl
         )
+        # SQLite 备份层（仅在未提供自定义 keystore 时创建，可通过 sqlite_backup=False 禁用）
+        sqlite_backup = raw_config.get("sqlite_backup")
+        if sqlite_backup is False:
+            sqlite_backup = None
+        elif raw_config.get("keystore") is None and sqlite_backup is None:
+            from .keystore.sqlite_backup import SQLiteBackup
+            backup_dir = self._config_model.aun_path / ".aun_backup"
+            sqlite_backup = SQLiteBackup(backup_dir / "aun_backup.db")
         keystore = raw_config.get("keystore") or FileKeyStore(
             self._config_model.aun_path,
             secret_store=raw_config.get("secret_store"),
             encryption_seed=self._config_model.encryption_seed,
+            sqlite_backup=sqlite_backup,
         )
         self._keystore = keystore
+        # 获取并缓存 device_id
+        from .config import get_device_id
+        self._device_id = get_device_id(self._config_model.aun_path, sqlite_backup)
         self._auth = AuthFlow(
             keystore=keystore,
             crypto=raw_config.get("crypto") or CryptoProvider(),
@@ -166,6 +190,8 @@ class AUNClient:
         )
         self._group_epoch_rotate_task: asyncio.Task | None = None
         self._group_epoch_cleanup_task: asyncio.Task | None = None
+        # 消息序列号跟踪器（群消息 + P2P 共用，按命名空间隔离）
+        self._seq_tracker = SeqTracker()
 
         self.auth = AuthNamespace(self)
 
@@ -214,6 +240,8 @@ class AUNClient:
 
     async def close(self) -> None:
         self._closing = True
+        # 关闭前保存 SeqTracker 状态
+        self._save_seq_tracker_state()
         await self._stop_background_tasks()
         if self._reconnect_task is not None:
             self._reconnect_task.cancel()
@@ -223,9 +251,15 @@ class AUNClient:
                 pass  # 任务取消，正常清理
             self._reconnect_task = None
         if self._state in {"idle", "closed"}:
+            sqlite_backup = getattr(self._keystore, "_sqlite_backup", None)
+            if sqlite_backup and hasattr(sqlite_backup, "close"):
+                sqlite_backup.close()
             self._state = "closed"
             return
         await self._transport.close()
+        sqlite_backup = getattr(self._keystore, "_sqlite_backup", None)
+        if sqlite_backup and hasattr(sqlite_backup, "close"):
+            sqlite_backup.close()
         self._state = "closed"
         await self._dispatcher.publish("connection.state", {"state": self._state})
 
@@ -235,6 +269,14 @@ class AUNClient:
     _SIGNED_METHODS = frozenset({
         "group.send", "group.kick", "group.add_member",
         "group.leave", "group.remove_member", "group.update_rules",
+        "group.update", "group.update_announcement",
+        "group.update_join_requirements", "group.set_role",
+        "group.transfer_owner", "group.review_join_request",
+        "group.batch_review_join_request",
+        "group.resources.put", "group.resources.update",
+        "group.resources.delete", "group.resources.request_add",
+        "group.resources.direct_add", "group.resources.approve_request",
+        "group.resources.reject_request",
     })
 
     def _sign_client_operation(self, method: str, params: dict[str, Any]) -> None:
@@ -258,8 +300,16 @@ class AUNClient:
                 identity["private_key_pem"].encode("utf-8"), password=None,
             )
             sig = pk.sign(sign_data, _ec.ECDSA(_hashes.SHA256()))
+            # 证书指纹：用于锁定签名时使用的证书版本
+            cert_fingerprint = ""
+            cert_pem = identity.get("cert", "")
+            if cert_pem:
+                from cryptography import x509 as _x509
+                cert_obj = _x509.load_pem_x509_certificate(cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem)
+                cert_fingerprint = "sha256:" + cert_obj.fingerprint(_hashes.SHA256()).hex()
             params["client_signature"] = {
                 "aid": aid,
+                "cert_fingerprint": cert_fingerprint,
                 "timestamp": ts,
                 "params_hash": params_hash,
                 "signature": base64.b64encode(sig).decode("ascii"),
@@ -274,6 +324,7 @@ class AUNClient:
             raise AUNPermissionError(f"method is internal_only: {method}")
 
         params = dict(params) if params else {}
+        self._validate_outbound_call(method, params)
 
         # 自动加密：message.send 默认加密（encrypt 默认 True）
         if method == "message.send":
@@ -298,12 +349,17 @@ class AUNClient:
             messages = result.get("messages")
             if isinstance(messages, list) and messages:
                 result["messages"] = await self._decrypt_messages(messages)
+                if self._aid:
+                    self._seq_tracker.on_pull_result(f"p2p:{self._aid}", messages)
 
         # 自动解密：group.pull 返回的群消息
         if method == "group.pull" and isinstance(result, dict):
             messages = result.get("messages")
             if isinstance(messages, list) and messages:
                 result["messages"] = await self._decrypt_group_messages(messages)
+                gid = (params or {}).get("group_id", "")
+                if gid:
+                    self._seq_tracker.on_pull_result(f"group:{gid}", messages)
 
         # ── Group E2EE 自动编排 ────────────────────────────
         if self._config_model.group_e2ee:
@@ -386,15 +442,19 @@ class AUNClient:
         import uuid as _uuid
 
         to_aid = params.get("to")
+        self._validate_message_recipient(to_aid)
         payload = params.get("payload")
         message_id = params.get("message_id") or str(_uuid.uuid4())
         timestamp = params.get("timestamp") or int(_time.time() * 1000)
 
-        # 获取对方证书
-        peer_cert_pem = await self._fetch_peer_cert(to_aid)
-
         # 获取对方 prekey（可能没有）
         prekey = await self._fetch_peer_prekey(to_aid)
+
+        # 有 cert_fingerprint 时按 aid + cert_fingerprint 精确获取；否则回退 active_signing
+        peer_cert_fingerprint = ""
+        if isinstance(prekey, dict):
+            peer_cert_fingerprint = str(prekey.get("cert_fingerprint", "") or "").strip().lower()
+        peer_cert_pem = await self._fetch_peer_cert(to_aid, peer_cert_fingerprint or None)
 
         envelope, encrypt_result = self._e2ee.encrypt_outbound(
             peer_aid=to_aid,
@@ -487,6 +547,14 @@ class AUNClient:
             if await self._try_handle_group_key_message(msg):
                 return
 
+            # P2P 空洞检测
+            seq = msg.get("seq")
+            if seq is not None and self._aid:
+                need_pull = self._seq_tracker.on_message_seq(f"p2p:{self._aid}", int(seq))
+                if need_pull:
+                    loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+                    loop.create_task(self._fill_p2p_gap())
+
             decrypted = await self._decrypt_single_message(msg)
             await self._dispatcher.publish("message.received", decrypted)
         except Exception as _exc:
@@ -499,34 +567,212 @@ class AUNClient:
         loop.create_task(self._process_and_publish_group_message(data))
 
     async def _on_raw_group_changed(self, data: Any) -> None:
-        """处理群组变更事件：透传给用户，并在成员离开/被踢时自动触发 epoch 轮换。
+        """处理群组变更事件：验签 → 透传给用户 → 自动补齐 → epoch 轮换。
 
-        按协议，轮换由剩余在线 admin/owner 负责（离开者自身不执行）。
-        _rotate_group_epoch 内部通过服务端 CAS + 角色校验保证只有一方成功。
+        验签策略：有 client_signature 就验，没有默认安全（兼容旧版）。
         """
-        await self._dispatcher.publish("group.changed", data)
+        if isinstance(data, dict):
+            # 验签：有签名就验证操作者身份
+            cs = data.get("client_signature")
+            if cs and isinstance(cs, dict):
+                data["_verified"] = await self._verify_event_signature(data, cs)
+            # 发布给用户
+            await self._dispatcher.publish("group.changed", data)
 
-        # 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
-        if isinstance(data, dict) and data.get("action") in ("member_left", "member_removed"):
             group_id = data.get("group_id", "")
+            # 收到事件推送时自动 pull 补齐
             if group_id:
                 loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+                loop.create_task(self._fill_group_event_gap(group_id))
+
+            # 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
+            if data.get("action") in ("member_left", "member_removed") and group_id:
+                loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
                 loop.create_task(self._rotate_group_epoch(group_id))
+        else:
+            await self._dispatcher.publish("group.changed", data)
+
+    async def _verify_event_signature(self, event: dict, cs: dict) -> str | bool:
+        """验证群事件中的 client_signature。返回 True/False/"pending"。"""
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ec as _ec
+            from cryptography.hazmat.primitives import hashes as _hashes
+            from cryptography import x509 as _x509
+            sig_aid = cs.get("aid", "")
+            method = cs.get("_method", "")
+            expected_fp = str(cs.get("cert_fingerprint", "") or "").strip().lower()
+            if not sig_aid or not method:
+                return "pending"
+            # 优先用缓存，没有则限时拉取（避免网络阻塞卡住事件推送）
+            cert_pem = self._get_verified_peer_cert(sig_aid, expected_fp or None)
+            if not cert_pem:
+                try:
+                    cert_bytes = await asyncio.wait_for(
+                        self._fetch_peer_cert(sig_aid, expected_fp or None), timeout=3.0
+                    )
+                    cert_pem = cert_bytes.decode("utf-8") if isinstance(cert_bytes, bytes) else cert_bytes
+                except (asyncio.TimeoutError, Exception):
+                    return "pending"
+            if not cert_pem:
+                return "pending"
+            cert_obj = _x509.load_pem_x509_certificate(
+                cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem
+            )
+            # cert_fingerprint 校验
+            if expected_fp:
+                actual_fp = "sha256:" + cert_obj.fingerprint(_hashes.SHA256()).hex()
+                if actual_fp != expected_fp:
+                    _client_log.warning("验签失败：证书指纹不匹配 aid=%s", sig_aid)
+                    return False
+            # 验签
+            params_hash = cs.get("params_hash", "")
+            timestamp = cs.get("timestamp", "")
+            sign_data = f"{method}|{sig_aid}|{timestamp}|{params_hash}".encode("utf-8")
+            sig_bytes = base64.b64decode(cs.get("signature", ""))
+            pub_key = cert_obj.public_key()
+            pub_key.verify(sig_bytes, sign_data, _ec.ECDSA(_hashes.SHA256()))
+            return True
+        except Exception as exc:
+            sig_aid = cs.get("aid", "?")
+            method = cs.get("_method", "?")
+            _client_log.debug("群事件验签失败 aid=%s method=%s: %s", sig_aid, method, exc)
+            return False
 
     async def _process_and_publish_group_message(self, data: Any) -> None:
-        """处理群组推送消息的异步任务。"""
+        """处理群组推送消息的异步任务。
+
+        带 payload 的事件（消息推送）：解密后 re-publish。
+        不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
+        """
         try:
             if not isinstance(data, dict):
                 await self._dispatcher.publish("group.message_created", data)
                 return
             msg = dict(data)
+            group_id = msg.get("group_id", "")
+            seq = msg.get("seq")
+            payload = msg.get("payload")
+
+            # 空洞检测（无论带不带 payload 都检查）
+            if group_id and seq is not None:
+                need_pull = self._seq_tracker.on_message_seq(f"group:{group_id}", int(seq))
+                if need_pull:
+                    loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+                    loop.create_task(self._fill_group_gap(group_id))
+
+            if payload is None or (isinstance(payload, dict) and not payload):
+                # 不带 payload 的通知：自动 pull 最新消息
+                await self._auto_pull_group_messages(msg)
+                return
             decrypted = await self._decrypt_group_message(msg)
             await self._dispatcher.publish("group.message_created", decrypted)
         except Exception as _exc:
             import logging as _logging
             _logging.getLogger("aun_core").debug("解密失败: %s", _exc)
 
-    async def _decrypt_group_message(self, message: dict[str, Any]) -> dict[str, Any]:
+    async def _auto_pull_group_messages(self, notification: dict[str, Any]) -> None:
+        """收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息。"""
+        group_id = notification.get("group_id", "")
+        if not group_id:
+            await self._dispatcher.publish("group.message_created", notification)
+            return
+        after_seq = self._seq_tracker.get_contiguous_seq(f"group:{group_id}")
+        try:
+            result = await self.call("group.pull", {
+                "group_id": group_id,
+                "after_message_seq": after_seq,
+                "device_id": self._device_id,
+                "limit": 50,
+            })
+            if isinstance(result, dict):
+                messages = result.get("messages", [])
+                if isinstance(messages, list):
+                    self._seq_tracker.on_pull_result(f"group:{group_id}", messages)
+                    for msg in messages:
+                        if isinstance(msg, dict):
+                            await self._dispatcher.publish("group.message_created", msg)
+                    return
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger("aun_core").debug("自动 pull 群消息失败: %s", _exc)
+        # pull 失败时仍透传原始通知
+        await self._dispatcher.publish("group.message_created", notification)
+
+    async def _fill_group_gap(self, group_id: str) -> None:
+        """后台补齐群消息空洞。"""
+        after_seq = self._seq_tracker.get_contiguous_seq(f"group:{group_id}")
+        try:
+            result = await self.call("group.pull", {
+                "group_id": group_id,
+                "after_message_seq": after_seq,
+                "device_id": self._device_id,
+                "limit": 50,
+            })
+            if isinstance(result, dict):
+                messages = result.get("messages", [])
+                if isinstance(messages, list):
+                    self._seq_tracker.on_pull_result(f"group:{group_id}", messages)
+                    for msg in messages:
+                        if isinstance(msg, dict):
+                            await self._dispatcher.publish("group.message_created", msg)
+        except Exception:
+            pass  # 静默失败，下次空洞检测时重试
+
+    async def _fill_group_event_gap(self, group_id: str) -> None:
+        """后台补齐群事件空洞。"""
+        ns = f"group_event:{group_id}"
+        after_seq = self._seq_tracker.get_contiguous_seq(ns)
+        try:
+            result = await self.call("group.pull_events", {
+                "group_id": group_id,
+                "after_event_seq": after_seq,
+                "device_id": self._device_id,
+                "limit": 50,
+            })
+            if isinstance(result, dict):
+                events = result.get("events", [])
+                if isinstance(events, list):
+                    self._seq_tracker.on_pull_result(ns, events)
+                    for evt in events:
+                        if isinstance(evt, dict):
+                            await self._dispatcher.publish("group.changed", evt)
+        except Exception:
+            pass  # 静默失败，下次空洞检测时重试
+
+    async def _pull_all_group_events_once(self) -> None:
+        """上线/重连后一次性补齐所有已加入群的事件。"""
+        try:
+            result = await self.call("group.list", {})
+            groups = result.get("items", []) if isinstance(result, dict) else []
+            for g in groups:
+                gid = g.get("group_id", "") if isinstance(g, dict) else ""
+                if gid:
+                    await self._fill_group_event_gap(gid)
+        except Exception:
+            pass  # 静默失败
+
+    async def _fill_p2p_gap(self) -> None:
+        """后台补齐 P2P 消息空洞。"""
+        if not self._aid:
+            return
+        ns = f"p2p:{self._aid}"
+        after_seq = self._seq_tracker.get_contiguous_seq(ns)
+        try:
+            result = await self.call("message.pull", {
+                "after_seq": after_seq,
+                "limit": 50,
+            })
+            if isinstance(result, dict):
+                messages = result.get("messages", [])
+                if isinstance(messages, list):
+                    self._seq_tracker.on_pull_result(ns, messages)
+                    for msg in messages:
+                        if isinstance(msg, dict):
+                            await self._dispatcher.publish("message.received", msg)
+        except Exception:
+            pass
+
+    async def _decrypt_group_message(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any]:
         """解密单条群组消息。"""
         payload = message.get("payload")
         if not isinstance(payload, dict) or payload.get("type") != "e2ee.group_encrypted":
@@ -541,7 +787,7 @@ class AUNClient:
                 return message
 
         # 先尝试直接解密
-        result = self._group_e2ee.decrypt(message)
+        result = self._group_e2ee.decrypt(message, skip_replay=skip_replay)
         if result is not None and result.get("e2ee"):
             return result
 
@@ -568,10 +814,10 @@ class AUNClient:
         return message
 
     async def _decrypt_group_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """批量解密群组消息（用于 group.pull）。"""
+        """批量解密群组消息（用于 group.pull）。跳过防重放检查。"""
         result = []
         for msg in messages:
-            decrypted = await self._decrypt_group_message(msg)
+            decrypted = await self._decrypt_group_message(msg, skip_replay=True)
             result.append(decrypted)
         return result
 
@@ -592,6 +838,7 @@ class AUNClient:
             decrypted = self._e2ee._decrypt_message(message)
             if decrypted is None:
                 return False
+            self._schedule_prekey_replenish_if_consumed(decrypted)
             actual_payload = decrypted.get("payload", {})
             if not isinstance(actual_payload, dict):
                 return False
@@ -643,13 +890,19 @@ class AUNClient:
 
     # ── E2EE 编排（从 E2EEManager 上提）─────────────────
 
-    async def _fetch_peer_cert(self, aid: str) -> bytes:
+    @staticmethod
+    def _cert_cache_key(aid: str, cert_fingerprint: str | None = None) -> str:
+        normalized_fp = str(cert_fingerprint or "").strip().lower()
+        return aid if not normalized_fp else f"{aid}#{normalized_fp}"
+
+    async def _fetch_peer_cert(self, aid: str, cert_fingerprint: str | None = None) -> bytes:
         """获取对方证书（带缓存 + 完整 PKI 验证：链 + CRL + OCSP + AID 绑定）
 
         跨域时自动将请求路由到 peer 所在域的 Gateway（URL 替换），
         同时 Gateway 侧也有代理 fallback。
         """
-        cached = self._cert_cache.get(aid)
+        cache_key = self._cert_cache_key(aid, cert_fingerprint)
+        cached = self._cert_cache.get(cache_key)
         if cached and time.time() < cached.refresh_after:
             return cached.cert_bytes
         gateway_url = self._gateway_url
@@ -658,7 +911,7 @@ class AUNClient:
 
         # 跨域时用 peer 所在域的 Gateway URL
         peer_gateway_url = self._resolve_peer_gateway_url(gateway_url, aid)
-        cert_url = self._build_cert_url(peer_gateway_url, aid)
+        cert_url = self._build_cert_url(peer_gateway_url, aid, cert_fingerprint)
         ssl_param = None if self._config_model.verify_ssl else False
         async with aiohttp.ClientSession() as session:
             async with session.get(cert_url, ssl=ssl_param) as response:
@@ -676,16 +929,17 @@ class AUNClient:
             raise ValidationError(f"peer cert verification failed for {aid}: {exc}")
 
         now = time.time()
-        self._cert_cache[aid] = _CachedPeerCert(
+        self._cert_cache[cache_key] = _CachedPeerCert(
             cert_bytes=cert_bytes,
             validated_at=now,
             refresh_after=now + _PEER_CERT_CACHE_TTL,
         )
-        # 同步写入 keystore，保证 E2EE 解密时 _get_sender_cert 能读到
-        try:
-            self._keystore.save_cert(aid, cert_pem)
-        except Exception as exc:
-            _client_log.error("写入证书到 keystore 失败 (aid=%s): %s", aid, exc)
+        if not cert_fingerprint:
+            # 仅 active_signing 路径写回 keystore，避免旧证书覆盖当前证书
+            try:
+                self._keystore.save_cert(aid, cert_pem)
+            except Exception as exc:
+                _client_log.error("写入证书到 keystore 失败 (aid=%s): %s", aid, exc)
         return cert_bytes
 
     async def _fetch_peer_prekey(self, peer_aid: str) -> dict[str, Any] | None:
@@ -695,15 +949,19 @@ class AUNClient:
             return cached
         try:
             result = await self._transport.call("message.e2ee.get_prekey", {"aid": peer_aid})
-            if isinstance(result, dict) and result.get("found"):
-                prekey = result.get("prekey")
-                if prekey:
-                    self._e2ee.cache_prekey(peer_aid, prekey)
-                return prekey
-        except Exception as _exc:
-            import logging as _logging
-            _logging.getLogger("aun_core").debug("prekey 操作失败: %s", _exc)
-        return None
+        except Exception as exc:
+            raise ValidationError(f"failed to fetch peer prekey for {peer_aid}: {exc}") from exc
+        if not isinstance(result, dict):
+            raise ValidationError(f"invalid prekey response for {peer_aid}")
+        if result.get("found") is False:
+            return None
+        if result.get("found"):
+            prekey = result.get("prekey")
+            if not isinstance(prekey, dict):
+                raise ValidationError(f"invalid prekey response for {peer_aid}")
+            self._e2ee.cache_prekey(peer_aid, prekey)
+            return prekey
+        raise ValidationError(f"invalid prekey response for {peer_aid}")
 
     async def _upload_prekey(self) -> dict[str, Any]:
         """生成 prekey 并上传到服务端"""
@@ -768,6 +1026,9 @@ class AUNClient:
             if (isinstance(payload, dict)
                 and payload.get("type") == "e2ee.encrypted"
                 and (msg.get("encrypted") is True or "encrypted" not in msg)):
+                if not self._e2ee._should_decrypt_for_current_aid(msg, payload):
+                    result.append(msg)
+                    continue
                 # 确保发送方证书已缓存（签名验证需要）
                 from_aid = msg.get("from", "")
                 if from_aid:
@@ -777,6 +1038,7 @@ class AUNClient:
                         result.append(msg)
                         continue
                 decrypted = self._e2ee._decrypt_message(msg)
+                # pull 路径不触发 prekey 补充（历史消息，prekey 早在推送时消耗过）
                 result.append(decrypted if decrypted is not None else msg)
             else:
                 result.append(msg)
@@ -808,6 +1070,7 @@ class AUNClient:
 
         # 密码学解密（E2EEManager.decrypt_message 内含本地防重放）
         decrypted = self._e2ee.decrypt_message(message)
+        self._schedule_prekey_replenish_if_consumed(decrypted)
         return decrypted if decrypted is not None else message
 
     async def _ensure_sender_cert_cached(self, aid: str) -> bool:
@@ -819,7 +1082,8 @@ class AUNClient:
         返回 True 表示证书已就绪（PKI 验证通过），False 表示不可用。
         """
         # 内存缓存未过期 → 跳过（_fetch_peer_cert 已做完整 PKI 验证）
-        cached = self._cert_cache.get(aid)
+        cache_key = self._cert_cache_key(aid)
+        cached = self._cert_cache.get(cache_key)
         if cached and time.time() < cached.refresh_after:
             return True
         try:
@@ -839,24 +1103,27 @@ class AUNClient:
             )
             return False
 
-    def _get_verified_peer_cert(self, aid: str) -> str | None:
+    def _get_verified_peer_cert(self, aid: str, cert_fingerprint: str | None = None) -> str | None:
         """获取经过 PKI 验证的 peer 证书（仅信任内存缓存中已验证的证书）。
 
         零信任要求：只返回经 _fetch_peer_cert 完整 PKI 验证后缓存的证书，
         不直接信任 keystore 中可能由恶意服务端注入的证书。
         """
-        cached = self._cert_cache.get(aid)
+        cache_key = self._cert_cache_key(aid, cert_fingerprint)
+        cached = self._cert_cache.get(cache_key)
         if cached and time.time() < cached.validated_at + _PEER_CERT_CACHE_TTL * 2:
             return cached.cert_bytes.decode("utf-8") if isinstance(cached.cert_bytes, bytes) else cached.cert_bytes
         return None
 
     @staticmethod
-    def _build_cert_url(gateway_url: str, aid: str) -> str:
+    def _build_cert_url(gateway_url: str, aid: str, cert_fingerprint: str | None = None) -> str:
         parsed = urlparse(gateway_url)
         scheme = "https" if parsed.scheme == "wss" else "http"
         netloc = parsed.netloc
         path = f"/pki/cert/{quote(aid, safe='')}"
-        return urlunparse((scheme, netloc, path, "", "", ""))
+        normalized_fp = str(cert_fingerprint or "").strip().lower()
+        query = urlencode({"cert_fingerprint": normalized_fp}) if normalized_fp else ""
+        return urlunparse((scheme, netloc, path, "", query, ""))
 
     @staticmethod
     def _resolve_peer_gateway_url(local_gateway_url: str, peer_aid: str) -> str:
@@ -904,6 +1171,10 @@ class AUNClient:
             self._sync_identity_after_connect(str(params["access_token"]))
         self._state = "connected"
         await self._dispatcher.publish("connection.state", {"state": self._state, "gateway": gateway_url})
+
+        # 从 keystore 恢复 SeqTracker 状态
+        self._restore_seq_tracker_state()
+
         self._start_background_tasks()
 
         # 上线后自动上传 prekey（失败时记录日志）
@@ -941,8 +1212,10 @@ class AUNClient:
     def _start_background_tasks(self) -> None:
         self._start_heartbeat_task()
         self._start_token_refresh_task()
-        self._start_prekey_refresh_task()
         self._start_group_epoch_tasks()
+        # 上线/重连后一次性补齐群事件
+        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+        loop.create_task(self._pull_all_group_events_once())
 
     async def _stop_background_tasks(self) -> None:
         for attr in ("_heartbeat_task", "_token_refresh_task", "_prekey_refresh_task",
@@ -971,10 +1244,7 @@ class AUNClient:
         self._token_refresh_task = asyncio.create_task(self._token_refresh_loop())
 
     def _start_prekey_refresh_task(self) -> None:
-        if self._prekey_refresh_task is not None and not self._prekey_refresh_task.done():
-            return
-        interval = float(self.config.get("prekey_refresh_interval", 3600))
-        self._prekey_refresh_task = asyncio.create_task(self._prekey_refresh_loop(interval))
+        return
 
     async def _heartbeat_loop(self, interval: float) -> None:
         try:
@@ -1028,18 +1298,83 @@ class AUNClient:
             raise
 
     async def _prekey_refresh_loop(self, interval: float) -> None:
-        """定时轮换 prekey"""
+        return
+
+    @staticmethod
+    def _extract_consumed_prekey_id(message: dict[str, Any] | None) -> str:
+        if not isinstance(message, dict):
+            return ""
+        e2ee = message.get("e2ee")
+        if not isinstance(e2ee, dict):
+            return ""
+        if e2ee.get("encryption_mode") != "prekey_ecdh_v2":
+            return ""
+        return str(e2ee.get("prekey_id") or "").strip()
+
+    def _validate_message_recipient(self, to_aid: Any) -> None:
+        if _is_group_service_aid(to_aid):
+            raise ValidationError("message.send receiver cannot be group.{issuer}; use group.send instead")
+
+    def _validate_outbound_call(self, method: str, params: dict[str, Any]) -> None:
+        if method == "message.send":
+            self._validate_message_recipient(params.get("to"))
+
+    def _schedule_prekey_replenish_if_consumed(self, message: dict[str, Any] | None) -> None:
+        prekey_id = self._extract_consumed_prekey_id(message)
+        if not prekey_id or self._state != "connected":
+            return
+        if prekey_id in self._prekey_replenished:
+            return
+        # 全局只允许一个 put_prekey 请求 inflight，避免淹没 RPC 通道
+        if self._prekey_replenish_inflight:
+            return
+        self._prekey_replenish_inflight.add(prekey_id)
+
+        async def _replenish() -> None:
+            try:
+                await self._upload_prekey()
+            except Exception as exc:
+                _client_log.warning("消费 prekey %s 后补充 current prekey 失败: %s", prekey_id, exc)
+            else:
+                self._prekey_replenished.add(prekey_id)
+            finally:
+                self._prekey_replenish_inflight.discard(prekey_id)
+
+        loop = getattr(self, "_loop", None)
+        if loop and loop.is_running():
+            loop.create_task(_replenish())
+            return
         try:
-            while not self._closing:
-                await asyncio.sleep(interval)
-                if self._state != "connected":
-                    continue
-                try:
-                    await self._upload_prekey()
-                except Exception as exc:
-                    _client_log.warning("prekey 轮换失败: %s", exc)
-        except asyncio.CancelledError:
-            raise
+            asyncio.get_running_loop().create_task(_replenish())
+        except RuntimeError:
+            self._prekey_replenish_inflight.discard(prekey_id)
+
+    def _restore_seq_tracker_state(self) -> None:
+        """从 keystore metadata 恢复 SeqTracker 状态。"""
+        if not self._aid:
+            return
+        try:
+            metadata = self._keystore.load_metadata(self._aid)
+            if isinstance(metadata, dict):
+                state = metadata.get("seq_tracker_state")
+                if isinstance(state, dict):
+                    self._seq_tracker.restore_state(state)
+        except Exception as exc:
+            _client_log.debug("恢复 SeqTracker 状态失败: %s", exc)
+
+    def _save_seq_tracker_state(self) -> None:
+        """将 SeqTracker 状态保存到 keystore metadata。"""
+        if not self._aid:
+            return
+        state = self._seq_tracker.export_state()
+        if not state:
+            return
+        try:
+            def _merge(m: dict) -> None:
+                m["seq_tracker_state"] = state
+            self._keystore.update_metadata(self._aid, _merge)
+        except Exception as exc:
+            _client_log.debug("保存 SeqTracker 状态失败: %s", exc)
 
     def _build_rotation_signature(self, group_id: str, current_epoch: int, new_epoch: int = 0) -> dict[str, str]:
         """构建 epoch 轮换签名参数。"""

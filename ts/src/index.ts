@@ -45,7 +45,30 @@ export {
 export { EventDispatcher, Subscription, type EventHandler } from './events.js';
 
 // ── 类型 ─────────────────────────────────────────────────────
-export type { Message, SendResult, AckResult, PullResult } from './types.js';
+export {
+  type JsonValue,
+  type JsonObject,
+  type RpcParams,
+  type RpcResult,
+  type RpcErrorObject,
+  type RpcMessage,
+  type GatewayEntry,
+  type GatewayDiscoveryDocument,
+  type KeyPairRecord,
+  type PrekeyRecord,
+  type PrekeyMap,
+  type GroupOldEpochRecord,
+  type GroupSecretRecord,
+  type GroupSecretMap,
+  type MetadataRecord,
+  type IdentityRecord,
+  type SecretRecord,
+  type Message,
+  type SendResult,
+  type AckResult,
+  type PullResult,
+  isJsonObject,
+} from './types.js';
 
 // ── 密码学 ───────────────────────────────────────────────────
 export { CryptoProvider, type IdentityKeyPair } from './crypto.js';

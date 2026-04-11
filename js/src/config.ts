@@ -1,5 +1,28 @@
 // ── AUN 配置 ──────────────────────────────────────────────
 
+import { ValidationError } from './errors.js';
+import type { JsonObject } from './types.js';
+
+function readString(value: JsonObject[keyof JsonObject], fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function readOptionalString(value: JsonObject[keyof JsonObject], fallback: string | null): string | null {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function readOptionalNumber(value: JsonObject[keyof JsonObject], fallback: number | null): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function readBoolean(value: JsonObject[keyof JsonObject], fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function readNumber(value: JsonObject[keyof JsonObject], fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
 /**
  * 获取设备稳定 ID（浏览器环境使用 localStorage）。
  * 首次调用时自动生成 UUID 并持久化，后续返回同一值。
@@ -63,20 +86,26 @@ const DEFAULTS: AUNConfig = {
   replayWindowSeconds: 300,
 };
 
+type AUNConfigInput = Partial<AUNConfig> & JsonObject;
+
 /** 从字典创建 AUNConfig（兼容 snake_case 和 camelCase） */
-export function createConfig(raw?: Partial<AUNConfig> | Record<string, any> | null): AUNConfig {
-  const data = (raw ?? {}) as Record<string, any>;
+export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
+  const data = (raw ?? {}) as AUNConfigInput;
+  const verifySsl = readBoolean(data.verifySsl ?? data.verify_ssl, DEFAULTS.verifySsl);
+  if (!verifySsl) {
+    throw new ValidationError('browser SDK does not allow verify_ssl=false');
+  }
   return {
-    aunPath: data.aunPath ?? data.aun_path ?? DEFAULTS.aunPath,
-    rootCaPem: data.rootCaPem ?? data.root_ca_pem ?? data.root_ca_path ?? DEFAULTS.rootCaPem,
-    encryptionSeed: data.encryptionSeed ?? data.encryption_seed ?? DEFAULTS.encryptionSeed,
-    discoveryPort: data.discoveryPort ?? data.discovery_port ?? DEFAULTS.discoveryPort,
-    groupE2ee: data.groupE2ee ?? data.group_e2ee ?? DEFAULTS.groupE2ee,
-    rotateOnJoin: data.rotateOnJoin ?? data.rotate_on_join ?? DEFAULTS.rotateOnJoin,
-    epochAutoRotateInterval: data.epochAutoRotateInterval ?? data.epoch_auto_rotate_interval ?? DEFAULTS.epochAutoRotateInterval,
-    oldEpochRetentionSeconds: data.oldEpochRetentionSeconds ?? data.old_epoch_retention_seconds ?? DEFAULTS.oldEpochRetentionSeconds,
-    verifySsl: data.verifySsl ?? data.verify_ssl ?? DEFAULTS.verifySsl,
-    requireForwardSecrecy: data.requireForwardSecrecy ?? data.require_forward_secrecy ?? DEFAULTS.requireForwardSecrecy,
-    replayWindowSeconds: data.replayWindowSeconds ?? data.replay_window_seconds ?? DEFAULTS.replayWindowSeconds,
+    aunPath: readString(data.aunPath ?? data.aun_path, DEFAULTS.aunPath),
+    rootCaPem: readOptionalString(data.rootCaPem ?? data.root_ca_pem ?? data.root_ca_path, DEFAULTS.rootCaPem),
+    encryptionSeed: readOptionalString(data.encryptionSeed ?? data.encryption_seed, DEFAULTS.encryptionSeed),
+    discoveryPort: readOptionalNumber(data.discoveryPort ?? data.discovery_port, DEFAULTS.discoveryPort),
+    groupE2ee: readBoolean(data.groupE2ee ?? data.group_e2ee, DEFAULTS.groupE2ee),
+    rotateOnJoin: readBoolean(data.rotateOnJoin ?? data.rotate_on_join, DEFAULTS.rotateOnJoin),
+    epochAutoRotateInterval: readNumber(data.epochAutoRotateInterval ?? data.epoch_auto_rotate_interval, DEFAULTS.epochAutoRotateInterval),
+    oldEpochRetentionSeconds: readNumber(data.oldEpochRetentionSeconds ?? data.old_epoch_retention_seconds, DEFAULTS.oldEpochRetentionSeconds),
+    verifySsl,
+    requireForwardSecrecy: readBoolean(data.requireForwardSecrecy ?? data.require_forward_secrecy, DEFAULTS.requireForwardSecrecy),
+    replayWindowSeconds: readNumber(data.replayWindowSeconds ?? data.replay_window_seconds, DEFAULTS.replayWindowSeconds),
   };
 }

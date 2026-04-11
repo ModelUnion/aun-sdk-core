@@ -8,12 +8,20 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 
 	"golang.org/x/crypto/pbkdf2"
 )
+
+// SeedBackup seed 备份接口，避免循环依赖 keystore 包
+type SeedBackup interface {
+	BackupSeed(seed []byte)
+	RestoreSeed() []byte
+}
 
 // FileSecretStore 基于文件的 SecretStore（AES-256-GCM 加密）
 //
@@ -28,10 +36,16 @@ type FileSecretStore struct {
 }
 
 // NewFileSecretStore 创建基于文件的密钥存储
-func NewFileSecretStore(root string, encryptionSeed string) (*FileSecretStore, error) {
+// seedBackup 可为 nil（不启用 seed 备份）。
+func NewFileSecretStore(root string, encryptionSeed string, seedBackup ...SeedBackup) (*FileSecretStore, error) {
 	// 确保目录存在
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("创建密钥存储目录失败: %w", err)
+	}
+
+	var sb SeedBackup
+	if len(seedBackup) > 0 && !isNilSeedBackup(seedBackup[0]) {
+		sb = seedBackup[0]
 	}
 
 	var seedBytes []byte
@@ -39,7 +53,7 @@ func NewFileSecretStore(root string, encryptionSeed string) (*FileSecretStore, e
 		seedBytes = []byte(encryptionSeed)
 	} else {
 		var err error
-		seedBytes, err = loadOrCreateSeed(root)
+		seedBytes, err = loadOrCreateSeed(root, sb)
 		if err != nil {
 			return nil, err
 		}
@@ -52,6 +66,19 @@ func NewFileSecretStore(root string, encryptionSeed string) (*FileSecretStore, e
 		root:      root,
 		masterKey: masterKey,
 	}, nil
+}
+
+func isNilSeedBackup(backup SeedBackup) bool {
+	if backup == nil {
+		return true
+	}
+	value := reflect.ValueOf(backup)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 // Protect 保护明文数据（AES-256-GCM 加密）
@@ -144,11 +171,6 @@ func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) ([]b
 	return plaintext, nil
 }
 
-// Clear 清除保护记录（FileSecretStore 无需额外清理）
-func (f *FileSecretStore) Clear(scope, name string) error {
-	return nil
-}
-
 // deriveKey 从主密钥派生子密钥
 // 使用 HMAC-SHA256: key = HMAC(masterKey, "aun:{scope}:{name}\x01")
 func (f *FileSecretStore) deriveKey(scope, name string) []byte {
@@ -158,30 +180,55 @@ func (f *FileSecretStore) deriveKey(scope, name string) []byte {
 	return mac.Sum(nil)
 }
 
-// loadOrCreateSeed 从文件加载或创建随机 seed
-func loadOrCreateSeed(root string) ([]byte, error) {
+// loadOrCreateSeed 三级恢复：文件 → SQLite → 新建，双写确保一致
+func loadOrCreateSeed(root string, backup SeedBackup) ([]byte, error) {
 	seedPath := filepath.Join(root, ".seed")
+	source := ""
 
-	// 尝试读取已有 seed
+	// 1. 先读文件
 	data, err := os.ReadFile(seedPath)
 	if err == nil && len(data) > 0 {
+		source = "file"
+		// 双写：确保 SQLite 也有
+		if !isNilSeedBackup(backup) && source != "sqlite" {
+			backup.BackupSeed(data)
+		}
 		return data, nil
 	}
 
-	// 生成 32 字节随机 seed
+	// 2. 文件不存在 → 读 SQLite
+	if !isNilSeedBackup(backup) {
+		restored := backup.RestoreSeed()
+		if len(restored) > 0 {
+			source = "sqlite"
+			log.Printf("从 SQLite 恢复 .seed 文件")
+			// 恢复到文件系统
+			if err := os.WriteFile(seedPath, restored, 0o600); err != nil {
+				log.Printf("[WARN] 恢复 .seed 到文件失败: %v", err)
+			}
+			if runtime.GOOS != "windows" {
+				_ = os.Chmod(seedPath, 0o600)
+			}
+			return restored, nil
+		}
+	}
+
+	// 3. 都没有 → 生成新 seed
 	seed := make([]byte, 32)
 	if _, err := rand.Read(seed); err != nil {
 		return nil, fmt.Errorf("生成随机 seed 失败: %w", err)
 	}
 
-	// 写入文件
 	if err := os.WriteFile(seedPath, seed, 0o600); err != nil {
 		return nil, fmt.Errorf("写入 seed 文件失败: %w", err)
 	}
-
-	// 非 Windows 平台设置文件权限
 	if runtime.GOOS != "windows" {
 		_ = os.Chmod(seedPath, 0o600)
+	}
+
+	// 双写：备份到 SQLite
+	if !isNilSeedBackup(backup) {
+		backup.BackupSeed(seed)
 	}
 
 	return seed, nil

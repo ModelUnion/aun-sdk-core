@@ -18,10 +18,11 @@ from aun_core.e2ee import (
     AAD_MATCH_FIELDS_OFFLINE,
     MODE_LONG_TERM_KEY,
     MODE_PREKEY_ECDH_V2,
+    PREKEY_RETENTION_SECONDS,
     SUITE,
     E2EEManager,
 )
-from aun_core.errors import E2EEDecryptFailedError
+from aun_core.errors import E2EEDecryptFailedError, E2EEError
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,59 @@ class FakeKeystore:
         self._certs[aid] = cert_pem
 
 
+class StructuredPrekeyKeystore(FakeKeystore):
+    def __init__(self):
+        super().__init__()
+        self._prekeys = {}
+
+    def load_metadata(self, aid):
+        raise AssertionError("structured prekey path should not use load_metadata")
+
+    def save_metadata(self, aid, meta):
+        raise AssertionError("structured prekey path should not use save_metadata")
+
+    def load_e2ee_prekeys(self, aid):
+        prekeys = self._prekeys.get(aid, {})
+        return {key: dict(value) for key, value in prekeys.items()}
+
+    def save_e2ee_prekey(self, aid, prekey_id, prekey_data):
+        self._prekeys.setdefault(aid, {})[prekey_id] = dict(prekey_data)
+
+    def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7):
+        prekeys = self._prekeys.get(aid, {})
+        retained_ids = {
+            prekey_id
+            for prekey_id, _marker in sorted(
+                (
+                    (
+                        prekey_id,
+                        int(
+                            prekey_data.get("created_at")
+                            or prekey_data.get("updated_at")
+                            or prekey_data.get("expires_at")
+                            or 0
+                        ),
+                    )
+                    for prekey_id, prekey_data in prekeys.items()
+                    if isinstance(prekey_data, dict)
+                ),
+                key=lambda item: (item[1], item[0]),
+                reverse=True,
+            )[:keep_latest]
+        }
+        removed = []
+        for prekey_id, prekey_data in list(prekeys.items()):
+            marker = prekey_data.get("created_at") or prekey_data.get("updated_at") or prekey_data.get("expires_at") or 0
+            if (
+                prekey_id not in retained_ids
+                and isinstance(marker, (int, float))
+                and int(marker) < cutoff_ms
+            ):
+                removed.append(prekey_id)
+                prekeys.pop(prekey_id, None)
+        return removed
+
+
 def _build_identity(aid, private_key):
     priv_pem = private_key.private_bytes(
         serialization.Encoding.PEM,
@@ -92,6 +146,7 @@ def _build_identity(aid, private_key):
         "aid": aid,
         "private_key_pem": priv_pem,
         "public_key_der_b64": base64.b64encode(pub_der).decode("ascii"),
+        "cert": _make_self_signed_cert(private_key, aid).decode("utf-8"),
     }
 
 
@@ -124,12 +179,12 @@ def _make_e2ee_pair():
         keystore=receiver_ks,
     )
 
-    sender_cert = _make_self_signed_cert(sender_key)
-    receiver_cert = _make_self_signed_cert(receiver_key)
+    sender_cert = sender_identity["cert"]
+    receiver_cert = receiver_identity["cert"]
 
     # 每个 keystore 保存对方的证书（用于签名验证和三路 ECDH）
-    sender_ks._certs["receiver.test"] = receiver_cert.decode("utf-8") if isinstance(receiver_cert, bytes) else receiver_cert
-    receiver_ks._certs["sender.test"] = sender_cert.decode("utf-8") if isinstance(sender_cert, bytes) else sender_cert
+    sender_ks._certs["receiver.test"] = receiver_cert
+    receiver_ks._certs["sender.test"] = sender_cert
 
     return (sender_mgr, receiver_mgr, sender_key, receiver_key,
             sender_cert, receiver_cert, sender_ks, receiver_ks)
@@ -431,6 +486,7 @@ class TestPrekeyGenerate:
         assert "prekey_id" in result
         assert "public_key" in result
         assert "signature" in result
+        assert result["cert_fingerprint"].startswith("sha256:")
 
         meta = receiver_ks.load_metadata("receiver.test")
         prekeys = meta.get("e2ee_prekeys", {})
@@ -446,6 +502,52 @@ class TestPrekeyGenerate:
         assert "created_at" in result
         assert isinstance(result["created_at"], int)
         assert result["created_at"] > 0
+        assert result["cert_fingerprint"].startswith("sha256:")
+
+    def test_prekey_encrypt_rejects_cert_fingerprint_mismatch(self):
+        sender_mgr, _, _, receiver_key, _, receiver_cert, _, _ = _make_e2ee_pair()
+        prekey, _ = _make_prekey(receiver_key)
+        prekey["cert_fingerprint"] = "sha256:" + "0" * 64
+
+        with pytest.raises(E2EEError, match="prekey cert fingerprint mismatch"):
+            sender_mgr._encrypt_with_prekey(
+                peer_aid="receiver.test",
+                payload={"text": "hello"},
+                prekey=prekey,
+                peer_cert_pem=receiver_cert,
+                message_id=str(uuid.uuid4()),
+                timestamp=int(time.time() * 1000),
+            )
+
+    def test_generate_prekey_prefers_structured_keystore_api(self):
+        """存在结构化接口时，不应回退到 metadata 整块读改写。"""
+        receiver_key, _, _ = _generate_ec_keypair()
+        receiver_identity = _build_identity("receiver.test", receiver_key)
+        receiver_ks = StructuredPrekeyKeystore()
+        receiver_mgr = E2EEManager(
+            identity_fn=lambda: receiver_identity,
+            keystore=receiver_ks,
+        )
+
+        result = receiver_mgr.generate_prekey()
+        stored = receiver_ks.load_e2ee_prekeys("receiver.test")
+        assert result["prekey_id"] in stored
+        assert "private_key_pem" in stored[result["prekey_id"]]
+
+    def test_load_prekey_private_key_from_structured_keystore(self):
+        """_load_prekey_private_key 应能直接读取结构化 prekey 存储。"""
+        receiver_key, _, _ = _generate_ec_keypair()
+        receiver_identity = _build_identity("receiver.test", receiver_key)
+        receiver_ks = StructuredPrekeyKeystore()
+        receiver_mgr = E2EEManager(
+            identity_fn=lambda: receiver_identity,
+            keystore=receiver_ks,
+        )
+
+        result = receiver_mgr.generate_prekey()
+        receiver_mgr._local_prekey_cache.clear()
+        loaded = receiver_mgr._load_prekey_private_key(receiver_ks, result["prekey_id"])
+        assert isinstance(loaded, ec.EllipticCurvePrivateKey)
 
     def test_prekey_signature_binds_timestamp(self):
         """prekey 签名绑定 created_at，篡改时间戳导致签名验证失败"""
@@ -462,14 +564,12 @@ class TestPrekeyGenerate:
         )
         assert ok  # 无 created_at 时兼容旧格式
 
-    def test_old_prekey_rejected(self):
-        """超过 30 天的 prekey → 拒绝使用"""
+    def test_old_prekey_with_valid_signature_still_accepted(self):
+        """旧 prekey 只验签名，不再因为 created_at 过老而拒绝"""
         (sender_mgr, _, _, receiver_key, _, receiver_cert,
          _, _) = _make_e2ee_pair()
         prekey, _ = _make_prekey(receiver_key)
-        # 设置 31 天前的 created_at
         prekey["created_at"] = int((time.time() - 31 * 86400) * 1000)
-        # 需要重签（因为 created_at 变了）
         sign_data = f"{prekey['prekey_id']}|{prekey['public_key']}|{prekey['created_at']}".encode("utf-8")
         prekey["signature"] = base64.b64encode(
             receiver_key.sign(sign_data, ec.ECDSA(hashes.SHA256()))
@@ -477,12 +577,35 @@ class TestPrekeyGenerate:
 
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
-        from aun_core.errors import E2EEError
-        with pytest.raises(E2EEError, match="prekey too old"):
-            sender_mgr._encrypt_with_prekey(
-                "receiver.test", {"text": "test"}, prekey, receiver_cert,
-                message_id=mid, timestamp=ts,
-            )
+        envelope, ok = sender_mgr._encrypt_with_prekey(
+            "receiver.test", {"text": "test"}, prekey, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+
+        assert ok is True
+        assert envelope["prekey_id"] == prekey["prekey_id"]
+
+    def test_cleanup_expired_prekeys_keeps_latest_seven(self):
+        receiver_key, _, _ = _generate_ec_keypair()
+        receiver_identity = _build_identity("receiver.test", receiver_key)
+        receiver_ks = StructuredPrekeyKeystore()
+        receiver_mgr = E2EEManager(
+            identity_fn=lambda: receiver_identity,
+            keystore=receiver_ks,
+        )
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - PREKEY_RETENTION_SECONDS * 1000
+
+        for idx in range(8):
+            receiver_ks.save_e2ee_prekey("receiver.test", f"pk-{idx}", {
+                "private_key_pem": f"KEY-{idx}",
+                "created_at": cutoff_ms - 10_000 - idx,
+            })
+
+        receiver_mgr._cleanup_expired_prekeys(receiver_ks, "receiver.test")
+        remaining = receiver_ks.load_e2ee_prekeys("receiver.test")
+
+        assert sorted(remaining.keys()) == [f"pk-{idx}" for idx in range(7)]
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +791,7 @@ class TestPrekeyV2:
         ts = int(time.time() * 1000)
         ephemeral_pk_b64 = base64.b64encode(ephemeral_public_bytes).decode("ascii")
         from cryptography import x509 as _x509
-        _rcert = _x509.load_pem_x509_certificate(receiver_cert)
+        _rcert = _x509.load_pem_x509_certificate(receiver_cert.encode("utf-8"))
         _fp_der = _rcert.public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         _fp_hash = hashes.Hash(hashes.SHA256())

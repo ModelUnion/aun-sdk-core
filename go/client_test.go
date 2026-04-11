@@ -2,7 +2,13 @@ package aun
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/anthropics/aun-sdk-core/go/keystore"
 )
 
 // ── 客户端构造测试 ───────────────────────────────────────
@@ -10,6 +16,7 @@ import (
 // TestConstructNoArgs 验证使用空配置创建客户端
 func TestConstructNoArgs(t *testing.T) {
 	c := NewClient(map[string]any{})
+	defer func() { _ = c.Close() }()
 	if c == nil {
 		t.Fatal("NewClient 不应返回 nil")
 	}
@@ -27,11 +34,31 @@ func TestConstructWithAunPath(t *testing.T) {
 	c := NewClient(map[string]any{
 		"aun_path": tmpDir,
 	})
+	defer func() { _ = c.Close() }()
 	if c == nil {
 		t.Fatal("NewClient 不应返回 nil")
 	}
 	if c.configModel.AUNPath != tmpDir {
 		t.Errorf("AUNPath 不正确: %s", c.configModel.AUNPath)
+	}
+}
+
+func TestConstructDefaultSQLiteBackupUsesAUNPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	c := NewClient(map[string]any{
+		"aun_path": tmpDir,
+	})
+	defer func() { _ = c.Close() }()
+	fks, ok := c.keyStore.(*keystore.FileKeyStore)
+	if !ok {
+		t.Fatalf("默认 keystore 类型不正确: %T", c.keyStore)
+	}
+	if fks == nil {
+		t.Fatal("默认 FileKeyStore 不应为 nil")
+	}
+	backupPath := filepath.Join(tmpDir, ".aun_backup", "aun_backup.db")
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("默认 SQLite 备份文件未创建: %v", err)
 	}
 }
 
@@ -42,6 +69,7 @@ func TestConnectRequiresAccessToken(t *testing.T) {
 	c := NewClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
+	defer func() { _ = c.Close() }()
 	err := c.Connect(context.Background(), map[string]any{
 		"gateway": "ws://localhost:20001",
 	}, nil)
@@ -59,6 +87,7 @@ func TestConnectRequiresGateway(t *testing.T) {
 	c := NewClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
+	defer func() { _ = c.Close() }()
 	err := c.Connect(context.Background(), map[string]any{
 		"access_token": "test-token",
 	}, nil)
@@ -72,6 +101,7 @@ func TestConnectRequiresGateway(t *testing.T) {
 // TestClientState 验证客户端初始状态
 func TestClientState(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	if c.State() != StateIdle {
 		t.Errorf("初始状态应为 idle: %s", c.State())
 	}
@@ -82,6 +112,7 @@ func TestClientState(t *testing.T) {
 // TestCallNotConnected 验证未连接时调用 RPC 返回错误
 func TestCallNotConnected(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	_, err := c.Call(context.Background(), "meta.ping", nil)
 	if err == nil {
 		t.Error("未连接时调用应返回错误")
@@ -96,6 +127,7 @@ func TestCallInternalOnlyBlocked(t *testing.T) {
 	// 需要先让状态变为 Connected 才能测到 internalOnly 检查
 	// 由于无法真正连接，我们创建一个假连接状态
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.state = StateConnected
 	c.mu.Unlock()
@@ -123,11 +155,92 @@ func TestCallInternalOnlyBlocked(t *testing.T) {
 	}
 }
 
+func TestCallRejectsMessageSendToGroupService(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.state = StateConnected
+	c.mu.Unlock()
+
+	_, err := c.Call(context.Background(), "message.send", map[string]any{
+		"to":      "group.example.com",
+		"payload": map[string]any{"text": "hello"},
+		"encrypt": false,
+	})
+	if err == nil {
+		t.Fatal("向 group.{issuer} 发送 message.send 应被拦截")
+	}
+	if _, ok := err.(*ValidationError); !ok {
+		t.Fatalf("错误类型应为 ValidationError: %T", err)
+	}
+}
+
+func TestParsePeerPrekeyResponseSemantics(t *testing.T) {
+	prekey, err := parsePeerPrekeyResponse("bob.example.com", map[string]any{"found": false}, nil)
+	if prekey != nil {
+		t.Fatalf("found=false 应返回 nil prekey: %#v", prekey)
+	}
+	if _, ok := err.(*NotFoundError); !ok {
+		t.Fatalf("found=false 应返回 NotFoundError: %T", err)
+	}
+
+	if _, err := parsePeerPrekeyResponse("bob.example.com", nil, errors.New("boom")); err == nil {
+		t.Fatal("查询失败应返回错误")
+	}
+	if _, err := parsePeerPrekeyResponse("bob.example.com", map[string]any{"found": true}, nil); err == nil {
+		t.Fatal("非法响应应返回错误")
+	}
+}
+
+func TestSchedulePrekeyReplenishIfConsumedOnlyOnce(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	done := make(chan struct{}, 2)
+
+	c.mu.Lock()
+	c.state = StateConnected
+	c.prekeyUploadHook = func(ctx context.Context) error {
+		done <- struct{}{}
+		return nil
+	}
+	c.mu.Unlock()
+
+	message := map[string]any{
+		"e2ee": map[string]any{
+			"encryption_mode": ModePrekeyECDHV2,
+			"prekey_id":       "pk-1",
+		},
+	}
+
+	c.schedulePrekeyReplenishIfConsumed(message)
+	c.schedulePrekeyReplenishIfConsumed(message)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("首次消费后未触发 prekey 补充")
+	}
+
+	select {
+	case <-done:
+		t.Fatal("同一 prekey_id 不应重复补充")
+	case <-time.After(120 * time.Millisecond):
+	}
+
+	c.schedulePrekeyReplenishIfConsumed(message)
+	select {
+	case <-done:
+		t.Fatal("已补充过的 prekey_id 不应再次补充")
+	case <-time.After(120 * time.Millisecond):
+	}
+}
+
 // ── E2EE 属性测试 ────────────────────────────────────────
 
 // TestE2EEProperty 验证 E2EE 管理器属性
 func TestE2EEProperty(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	if c.E2EE() == nil {
 		t.Error("E2EE() 不应返回 nil")
 	}
@@ -165,6 +278,7 @@ func TestCloseIdempotent(t *testing.T) {
 // TestOnEventSubscription 验证通过客户端订阅事件
 func TestOnEventSubscription(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	var received any
 	sub := c.On("test.event", func(payload any) {
 		received = payload
@@ -186,6 +300,7 @@ func TestClientGroupE2EEConfig(t *testing.T) {
 		"aun_path":   t.TempDir(),
 		"group_e2ee": false,
 	})
+	defer func() { _ = c.Close() }()
 	if c.configModel.GroupE2EE {
 		t.Error("group_e2ee 应为 false")
 	}
@@ -197,6 +312,7 @@ func TestClientVerifySSLConfig(t *testing.T) {
 		"aun_path":   t.TempDir(),
 		"verify_ssl": false,
 	})
+	defer func() { _ = c.Close() }()
 	if c.configModel.VerifySSL {
 		t.Error("verify_ssl 应为 false")
 	}
@@ -207,6 +323,7 @@ func TestClientVerifySSLConfig(t *testing.T) {
 // TestClientGroupE2EE_EncryptNoSecret stub 测试：无密钥时加密返回错误
 func TestClientGroupE2EE_EncryptNoSecret(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.aid = "alice.test"
 	c.identity = map[string]any{"aid": "alice.test"}
@@ -221,6 +338,7 @@ func TestClientGroupE2EE_EncryptNoSecret(t *testing.T) {
 // TestClientGroupE2EE_HasSecret stub 测试：无密钥时返回 false
 func TestClientGroupE2EE_HasSecret(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.aid = "alice.test"
 	c.identity = map[string]any{"aid": "alice.test"}
@@ -234,6 +352,7 @@ func TestClientGroupE2EE_HasSecret(t *testing.T) {
 // TestClientGroupE2EE_CurrentEpoch stub 测试：无密钥时返回 nil
 func TestClientGroupE2EE_CurrentEpoch(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.aid = "alice.test"
 	c.identity = map[string]any{"aid": "alice.test"}
@@ -248,14 +367,19 @@ func TestClientGroupE2EE_CurrentEpoch(t *testing.T) {
 
 // TestBuildCertURL 验证证书 URL 构建
 func TestBuildCertURL(t *testing.T) {
-	url := buildCertURL("wss://gateway.example.com:20001", "alice.example.com")
+	url := buildCertURL("wss://gateway.example.com:20001", "alice.example.com", "")
 	if url != "https://gateway.example.com:20001/pki/cert/alice.example.com" {
 		t.Errorf("URL 不正确: %s", url)
 	}
 
-	url2 := buildCertURL("ws://gateway.local:20001", "bob.local")
+	url2 := buildCertURL("ws://gateway.local:20001", "bob.local", "")
 	if url2 != "http://gateway.local:20001/pki/cert/bob.local" {
 		t.Errorf("ws URL 不正确: %s", url2)
+	}
+
+	url3 := buildCertURL("wss://gateway.example.com:20001", "alice.example.com", "sha256:abc")
+	if url3 != "https://gateway.example.com:20001/pki/cert/alice.example.com?cert_fingerprint=sha256%3Aabc" {
+		t.Errorf("带 cert_fingerprint 的 URL 不正确: %s", url3)
 	}
 }
 

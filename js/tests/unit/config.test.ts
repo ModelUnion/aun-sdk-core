@@ -1,5 +1,6 @@
 // ── config 模块单元测试 ──────────────────────────────────────
 import { describe, it, expect, beforeEach } from 'vitest';
+import { ValidationError } from '../../src/errors.js';
 import { getDeviceId, createConfig } from '../../src/config.js';
 
 describe('getDeviceId', () => {
@@ -63,5 +64,15 @@ describe('createConfig', () => {
     // 未覆盖的字段保持默认
     expect(cfg.verifySsl).toBe(true);
     expect(cfg.rootCaPem).toBeNull();
+  });
+
+  it('不允许 verify_ssl=false', () => {
+    expect(() => createConfig({ verify_ssl: false }))
+      .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
+  });
+
+  it('不允许 verifySsl=false', () => {
+    expect(() => createConfig({ verifySsl: false }))
+      .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
   });
 });

@@ -7,7 +7,45 @@
  * 与 Python SDK 的 GatewayDiscovery 完全对齐。
  */
 
+import * as http from 'node:http';
+import * as https from 'node:https';
 import { ConnectionError, ValidationError } from './errors.js';
+import { isJsonObject, type GatewayDiscoveryDocument, type GatewayEntry, type JsonValue } from './types.js';
+
+function _httpGetJson(url: string, verifySsl: boolean, timeout: number): Promise<JsonValue> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const options: https.RequestOptions = { timeout };
+    if (!verifySsl) {
+      options.rejectUnauthorized = false;
+    }
+
+    const req = mod.get(url, options, (res: http.IncomingMessage) => {
+      if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+        reject(new Error(`HTTP ${res.statusCode}`));
+        res.resume();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')) as JsonValue);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      res.on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`timeout fetching ${url}`));
+    });
+  });
+}
 
 export class GatewayDiscovery {
   private _verifySsl: boolean;
@@ -24,23 +62,13 @@ export class GatewayDiscovery {
    * @returns Gateway WebSocket URL
    */
   async discover(wellKnownUrl: string, timeout = 5_000): Promise<string> {
-    let payload: Record<string, unknown>;
+    let payload: GatewayDiscoveryDocument;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
-
-      // 使用 Node.js 内置 fetch（18+ 支持）
-      // 注意：verify_ssl=false 时需要设置 NODE_TLS_REJECT_UNAUTHORIZED=0 环境变量
-      // 或通过自定义 Agent。这里仅标记，实际禁用需在应用层处理。
-      const response = await fetch(wellKnownUrl, {
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      const rawPayload = await _httpGetJson(wellKnownUrl, this._verifySsl, timeout);
+      if (!isJsonObject(rawPayload)) {
+        throw new ValidationError('well-known returned invalid payload');
       }
-      payload = (await response.json()) as Record<string, unknown>;
+      payload = rawPayload as GatewayDiscoveryDocument;
     } catch (err) {
       throw new ConnectionError(
         `gateway discovery failed for ${wellKnownUrl}: ${err instanceof Error ? err.message : String(err)}`,
@@ -55,7 +83,7 @@ export class GatewayDiscovery {
 
     // 按 priority 排序（数值越小优先级越高）
     const sorted = [...gateways].sort(
-      (a, b) => (Number(a?.priority ?? 999)) - (Number(b?.priority ?? 999)),
+      (a: GatewayEntry, b: GatewayEntry) => (Number(a.priority ?? 999)) - (Number(b.priority ?? 999)),
     );
 
     const url = sorted[0]?.url;

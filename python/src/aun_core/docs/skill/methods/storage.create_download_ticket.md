@@ -50,7 +50,7 @@ download_url = result["download_url"]
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `download_url` | string | 预签名下载 URL（HMAC-SHA256 签名） |
+| `download_url` | string | 下载 URL。签名/鉴权形式由底层 BlobStore 后端决定 |
 | `expire_at` | integer | URL 过期时间戳（Unix 秒） |
 | `file_name` | string | 文件名（从 object_key 提取） |
 | `size_bytes` | integer | 文件大小（字节） |
@@ -58,6 +58,11 @@ download_url = result["download_url"]
 | `sha256` | string | 文件 SHA-256 校验值 |
 | `version` | integer | 对象版本号 |
 | `etag` | string | 实体标签（用于缓存校验） |
+
+## 当前实现说明
+
+- 如果底层 BlobStore 返回 `127.0.0.1`、`localhost` 或其他 loopback 地址，storage 服务会把 URL 规范化为对外地址
+- 规范化优先使用 `KITE_STORAGE_EXTERNAL_URL`，否则按 `storage.{issuer}` 形式改写
 
 ## 相关方法
 

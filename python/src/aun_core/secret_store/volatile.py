@@ -23,6 +23,3 @@ class VolatileSecretStore:
         if str(record.get("name") or "") != name:
             return None
         return self._values.get((scope, name))
-
-    def clear(self, scope: str, name: str) -> None:
-        self._values.pop((scope, name), None)

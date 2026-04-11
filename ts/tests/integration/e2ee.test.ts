@@ -19,6 +19,7 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
 import { E2EEManager } from '../../src/e2ee.js';
+import type { JsonObject, Message, PrekeyRecord } from '../../src/types.js';
 
 // ── 常量 ──────────────────────────────────────────────────────
 
@@ -60,13 +61,13 @@ async function sdkRecvPush(
   client: AUNClient,
   fromAid: string,
   timeout: number = PUSH_TIMEOUT,
-): Promise<Record<string, unknown>[]> {
-  const inbox: Record<string, unknown>[] = [];
+): Promise<Message[]> {
+  const inbox: Message[] = [];
   let resolveWait: () => void;
   const waitPromise = new Promise<void>((r) => { resolveWait = r; });
 
   const sub = client.on('message.received', (data) => {
-    const msg = data as Record<string, unknown>;
+    const msg = data as Message;
     if (msg && msg.from === fromAid) {
       inbox.push(msg);
       resolveWait();
@@ -81,8 +82,8 @@ async function sdkRecvPush(
 
   // 推送未收到时用 pull 兜底
   if (inbox.length === 0) {
-    const result = await client.call('message.pull', { after_seq: 0, limit: 50 }) as Record<string, unknown>;
-    const msgs = (result.messages ?? []) as Record<string, unknown>[];
+    const result = await client.call('message.pull', { after_seq: 0, limit: 50 }) as JsonObject;
+    const msgs = (result.messages ?? []) as Message[];
     inbox.push(...msgs.filter((m) => m.from === fromAid));
   }
 
@@ -96,9 +97,9 @@ async function sdkRecvPull(
   client: AUNClient,
   fromAid: string,
   afterSeq: number = 0,
-): Promise<Record<string, unknown>[]> {
-  const result = await client.call('message.pull', { after_seq: afterSeq, limit: 50 }) as Record<string, unknown>;
-  const msgs = (result.messages ?? []) as Record<string, unknown>[];
+): Promise<Message[]> {
+  const result = await client.call('message.pull', { after_seq: afterSeq, limit: 50 }) as JsonObject;
+  const msgs = (result.messages ?? []) as Message[];
   return msgs.filter((m) => m.from === fromAid);
 }
 
@@ -106,8 +107,8 @@ async function sdkRecvPull(
 async function sdkSend(
   client: AUNClient,
   toAid: string,
-  payload: Record<string, unknown>,
-): Promise<unknown> {
+  payload: JsonObject,
+): Promise<JsonObject | null> {
   return await client.call('message.send', {
     to: toAid,
     payload,
@@ -120,21 +121,30 @@ async function sdkSend(
 
 /** AUNClient 内部 transport 引用的类型 */
 type InternalTransport = {
-  call: (method: string, params: Record<string, unknown>) => Promise<unknown>;
+  call: (method: string, params: JsonObject) => Promise<JsonObject | null>;
+};
+
+type ClientInternals = AUNClient & {
+  _identity: JsonObject | null;
+  _keystore: import('../../src/keystore/index.js').KeyStore;
+  _transport: InternalTransport;
+  _fetchPeerCert: (aid: string) => Promise<string>;
+  _fetchPeerPrekey: (aid: string) => Promise<PrekeyRecord>;
+  _uploadPrekey: () => Promise<JsonObject | null>;
 };
 
 /** 从已连接的 AUNClient 提取内部引用，创建独立 E2EEManager（模拟裸 WebSocket 开发者） */
 function makeRawE2ee(client: AUNClient): E2EEManager {
-  const internal = client as unknown as Record<string, unknown>;
+  const internal = client as ClientInternals;
   return new E2EEManager({
-    identityFn: () => (internal._identity as Record<string, unknown>) ?? {},
-    keystore: internal._keystore as import('../../src/keystore/index.js').KeyStore,
+    identityFn: () => internal._identity ?? {},
+    keystore: internal._keystore,
   });
 }
 
 /** 获取客户端的内部 transport */
 function getTransport(client: AUNClient): InternalTransport {
-  return (client as unknown as Record<string, unknown>)._transport as InternalTransport;
+  return (client as ClientInternals)._transport;
 }
 
 /**
@@ -145,14 +155,9 @@ async function rawSend(
   client: AUNClient,
   e2ee: E2EEManager,
   toAid: string,
-  payload: Record<string, unknown>,
-): Promise<unknown> {
-  const internal = client as unknown as {
-    _fetch_peer_cert?: (aid: string) => Promise<string>;
-    _fetchPeerCert: (aid: string) => Promise<string>;
-    _fetch_peer_prekey?: (aid: string) => Promise<Record<string, unknown> | null>;
-    _fetchPeerPrekey: (aid: string) => Promise<Record<string, unknown> | null>;
-  };
+  payload: JsonObject,
+): Promise<JsonObject | null> {
+  const internal = client as ClientInternals;
   // 获取对方证书（兼容 camelCase / snake_case）
   const fetchCert = internal._fetchPeerCert.bind(client);
   const fetchPrekey = internal._fetchPeerPrekey.bind(client);
@@ -168,9 +173,9 @@ async function rawSend(
     crypto.randomUUID(),
     Date.now(),
   );
-  expect((result as Record<string, unknown>).encrypted, '加密应成功').toBe(true);
+  expect((result as JsonObject).encrypted, '加密应成功').toBe(true);
 
-  const aad = (envelope.aad ?? {}) as Record<string, unknown>;
+  const aad = (envelope.aad ?? {}) as JsonObject;
   return await getTransport(client).call('message.send', {
     to: toAid,
     payload: envelope,
@@ -191,13 +196,13 @@ async function rawRecvPull(
   e2ee: E2EEManager,
   fromAid: string,
   afterSeq: number = 0,
-): Promise<Record<string, unknown>[]> {
+): Promise<Message[]> {
   const raw = await getTransport(client).call('message.pull', {
     after_seq: afterSeq,
     limit: 50,
-  }) as Record<string, unknown>;
-  const rawMsgs = (raw.messages ?? []) as Record<string, unknown>[];
-  const result: Record<string, unknown>[] = [];
+  }) as JsonObject;
+  const rawMsgs = (raw.messages ?? []) as Message[];
+  const result: Message[] = [];
   for (const msg of rawMsgs) {
     if (msg.from !== fromAid) continue;
     const decrypted = e2ee.decryptMessage(msg);
@@ -208,13 +213,13 @@ async function rawRecvPull(
 
 /** 断言消息已正确解密 */
 function assertDecrypted(
-  msg: Record<string, unknown>,
-  expectedPayload: Record<string, unknown>,
+  msg: Message,
+  expectedPayload: JsonObject,
   label: string = '',
 ): void {
   const prefix = label ? `[${label}] ` : '';
   expect(msg.encrypted, `${prefix}应标记为 encrypted`).toBe(true);
-  const payload = msg.payload as Record<string, unknown>;
+  const payload = msg.payload as JsonObject;
   for (const [k, v] of Object.entries(expectedPayload)) {
     expect(payload[k], `${prefix}payload.${k} 不匹配`).toBe(v);
   }
@@ -252,9 +257,10 @@ describe('E2EE 集成测试', () => {
 
     // Bob 生成 prekey 并上传
     const prekeyMaterial = bob.e2ee.generatePrekey();
+    expect(prekeyMaterial.cert_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
     // 通过内部 transport 直接调用（绕过 client.call 的 internal_only 限制）
-    const bobInternal = bob as unknown as Record<string, unknown>;
-    const transport = bobInternal._transport as { call: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown>> };
+    const bobInternal = bob as ClientInternals;
+    const transport = bobInternal._transport as { call: (method: string, params: JsonObject) => Promise<JsonObject> };
     const uploadResult = await transport.call('message.e2ee.put_prekey', prekeyMaterial);
     expect(
       uploadResult.ok || uploadResult.success || 'prekey_id' in uploadResult,
@@ -262,16 +268,17 @@ describe('E2EE 集成测试', () => {
     ).toBeTruthy();
 
     // Alice 获取 Bob 的 prekey
-    const aliceInternal = alice as unknown as Record<string, unknown>;
-    const aliceTransport = aliceInternal._transport as { call: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown>> };
+    const aliceInternal = alice as ClientInternals;
+    const aliceTransport = aliceInternal._transport as { call: (method: string, params: JsonObject) => Promise<JsonObject> };
     const pk1 = await aliceTransport.call('message.e2ee.get_prekey', { aid: bobAid });
     expect(pk1.found, '第一次应找到 prekey').toBeTruthy();
+    expect((pk1.prekey as PrekeyRecord).cert_fingerprint).toBe(prekeyMaterial.cert_fingerprint);
 
     // 再次获取应返回相同的 prekey
     const pk2 = await aliceTransport.call('message.e2ee.get_prekey', { aid: bobAid });
     expect(pk2.found, '第二次应找到 prekey').toBeTruthy();
-    const prekey1 = pk1.prekey as Record<string, unknown>;
-    const prekey2 = pk2.prekey as Record<string, unknown>;
+    const prekey1 = pk1.prekey as PrekeyRecord;
+    const prekey2 = pk2.prekey as PrekeyRecord;
     expect(prekey2.prekey_id, 'prekey_id 应一致').toBe(prekey1.prekey_id);
   }, TEST_TIMEOUT);
 
@@ -293,9 +300,9 @@ describe('E2EE 集成测试', () => {
     assertDecrypted(msgs[0], { text: 'sdk2sdk prekey' });
   }, TEST_TIMEOUT);
 
-  // ── 3. SDK long_term_key 降级 ──────────────────────────────
+  // ── 3. SDK 无 prekey 时降级到 long_term_key ─────────────────
 
-  it('SDK long_term_key 降级', async () => {
+  it('SDK 无 prekey 时降级到 long_term_key', async () => {
     const rid = runId();
     const sender = tracked();
     const receiver = tracked();
@@ -307,18 +314,15 @@ describe('E2EE 集成测试', () => {
     // Receiver 仅创建 AID，不连接（不上传 prekey）
     await receiver.auth.createAid({ aid: rAid });
 
-    // 发送消息（应降级到 long_term_key 模式）
-    await sdkSend(sender, rAid, { text: 'fallback' });
+    await sdkSend(sender, rAid, { text: 'missing-prekey' });
 
-    // 现在 receiver 连接并用 pull 接收
     const auth = await receiver.auth.authenticate({ aid: rAid });
     await receiver.connect(auth);
-    const msgs = await sdkRecvPull(receiver, sAid);
-    expect(msgs.length, '应收到至少 1 条消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgs[0], { text: 'fallback' });
 
-    const e2eeInfo = msgs[0].e2ee as Record<string, unknown>;
-    expect(e2eeInfo.encryption_mode, '应为 long_term_key 模式').toBe('long_term_key');
+    const msgs = await sdkRecvPull(receiver, sAid);
+    expect(msgs.length, '应收到至少 1 条降级消息').toBeGreaterThanOrEqual(1);
+    assertDecrypted(msgs[0], { text: 'missing-prekey' });
+    expect(((msgs[0].e2ee ?? {}) as JsonObject).encryption_mode).toBe('long_term_key');
   }, TEST_TIMEOUT);
 
   // ── 4. SDK 双向消息 ────────────────────────────────────────
@@ -368,7 +372,7 @@ describe('E2EE 集成测试', () => {
     const msgs = await sdkRecvPull(receiver, sAid);
     expect(msgs.length, `应收到 ${N} 条消息`).toBeGreaterThanOrEqual(N);
 
-    const receivedTexts = msgs.map((m) => (m.payload as Record<string, unknown>).text as string).sort();
+    const receivedTexts = msgs.map((m) => String((m.payload as JsonObject).text ?? '')).sort();
     const expectedTexts = Array.from({ length: N }, (_, i) => `burst_${i}`).sort();
     expect(receivedTexts, '消息内容应完全匹配').toEqual(expectedTexts);
   }, TEST_TIMEOUT);
@@ -389,7 +393,7 @@ describe('E2EE 集成测试', () => {
     await sdkSend(sender, rAid, { text: 'before_rotate', phase: 1 });
 
     // Receiver 轮换 prekey
-    const receiverInternal = receiver as unknown as { _uploadPrekey: () => Promise<unknown> };
+    const receiverInternal = receiver as ClientInternals;
     await receiverInternal._uploadPrekey();
 
     // 清除 sender 的 prekey 缓存，使其获取新 prekey
@@ -403,7 +407,7 @@ describe('E2EE 集成测试', () => {
     const msgs = await sdkRecvPull(receiver, sAid);
     expect(msgs.length, '应收到至少 2 条消息').toBeGreaterThanOrEqual(2);
 
-    const texts = new Set(msgs.map((m) => (m.payload as Record<string, unknown>).text));
+    const texts = new Set(msgs.map((m) => (m.payload as JsonObject).text));
     expect(texts.has('before_rotate'), '应包含轮换前的消息').toBe(true);
     expect(texts.has('after_rotate'), '应包含轮换后的消息').toBe(true);
   }, TEST_TIMEOUT);
@@ -421,11 +425,11 @@ describe('E2EE 集成测试', () => {
     await ensureConnected(receiver, rAid);
 
     // 订阅推送
-    const pushMsgs: Record<string, unknown>[] = [];
+    const pushMsgs: Message[] = [];
     let resolveWait: () => void;
     const waitPromise = new Promise<void>((r) => { resolveWait = r; });
     const sub = receiver.on('message.received', (data) => {
-      const msg = data as Record<string, unknown>;
+      const msg = data as Message;
       if (msg && msg.from === sAid) {
         pushMsgs.push(msg);
         resolveWait();
@@ -449,8 +453,8 @@ describe('E2EE 集成测试', () => {
     assertDecrypted(pushMsgs[0], { text: 'dup_test' }, 'push');
 
     // pull 不应重复解密已推送的消息（SDK 内置 seen set 防重放）
-    const pullResult = await receiver.call('message.pull', { after_seq: 0, limit: 50 }) as Record<string, unknown>;
-    const pullMsgs = ((pullResult.messages ?? []) as Record<string, unknown>[]).filter(
+    const pullResult = await receiver.call('message.pull', { after_seq: 0, limit: 50 }) as JsonObject;
+    const pullMsgs = ((pullResult.messages ?? []) as Message[]).filter(
       (m) => m.from === sAid && m.encrypted === true,
     );
     // 记录数量供调试
@@ -578,7 +582,7 @@ describe('E2EE 集成测试', () => {
     const msgs = await rawRecvPull(rClient, rE2ee, sAid);
     expect(msgs.length, `应收到 ${N} 条消息`).toBeGreaterThanOrEqual(N);
 
-    const texts = msgs.map((m) => (m.payload as Record<string, unknown>).text as string).sort();
+    const texts = msgs.map((m) => String((m.payload as JsonObject).text ?? '')).sort();
     const expected = Array.from({ length: N }, (_, i) => `raw_burst_${i}`).sort();
     expect(texts, '消息内容应完全匹配').toEqual(expected);
   }, TEST_TIMEOUT);

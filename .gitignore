@@ -26,8 +26,13 @@ playwright-report/
 Thumbs.db
 
 # Project local
+.*/
 .aun_test/
 .claude/
 .tmp/
+go/gocache_run_*/
+go/.codex_fed_reconnect_*
+ts/.codex_fed_reconnect_*
+go/**/*.go.[0-9]*
 AGENTS.md
 CLAUDE.md

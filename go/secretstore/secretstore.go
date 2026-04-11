@@ -15,7 +15,4 @@ type SecretStore interface {
 	// name: 密钥名称
 	// record: Protect 返回的加密记录
 	Reveal(scope, name string, record map[string]any) ([]byte, error)
-
-	// Clear 清除指定的保护记录
-	Clear(scope, name string) error
 }

@@ -1475,7 +1475,7 @@ test.describe('P2P E2EE 扩展测试', () => {
     }
   });
 
-  test('SDK long_term_key 降级 — 对方无 prekey 时回退', async ({ page }) => {
+  test('SDK 无 prekey 时直接报错', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
@@ -1492,43 +1492,26 @@ test.describe('P2P E2EE 扩展测试', () => {
       const receiver = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
       await receiver.auth.createAid({ aid: receiverAid });
 
-      // Sender 发加密消息（应回退到 long_term_key）
-      const sendResult = await sender.call('message.send', {
-        to: receiverAid,
-        payload: { text: 'long_term回退' },
-        encrypt: true,
-      });
-
-      // Receiver 后续连接
-      const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
-      await receiver.connect(rAuth);
-      await new Promise(r => setTimeout(r, 1000));
-
-      // Receiver pull 消息
-      const pullResult = await receiver.call('message.pull', { after_seq: 0, limit: 10 });
-      const msgs = pullResult.messages || [];
-      const fromSender = msgs.filter((m: any) => m.from === senderAid);
+      let errorMessage = '';
+      try {
+        await sender.call('message.send', {
+          to: receiverAid,
+          payload: { text: 'missing-prekey' },
+          encrypt: true,
+        });
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
 
       await sender.close();
       await receiver.close();
 
       return {
-        sent: !!sendResult?.message_id,
-        received: fromSender.length > 0,
-        text: fromSender.find((m: any) => m.payload?.text)?.payload?.text,
-        encryptionMode: fromSender[0]?.e2ee?.encryption_mode,
+        errorMessage,
       };
     }, rid);
 
-    expect(result.sent).toBe(true);
-    expect(result.received).toBe(true);
-    if (result.text) {
-      expect(result.text).toBe('long_term回退');
-    }
-    // 如果解密成功，应标记为 long_term_key 模式
-    if (result.encryptionMode) {
-      expect(result.encryptionMode).toBe('long_term_key');
-    }
+    expect(result.errorMessage).toContain('peer prekey not found for');
   });
 
   test('SDK 双向消息 — 双方互发加密消息', async ({ page }) => {
@@ -1796,4 +1779,3 @@ test.describe('P2P E2EE 扩展测试', () => {
     }
   });
 });
-

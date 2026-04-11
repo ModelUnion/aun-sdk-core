@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -267,9 +268,45 @@ func TestCleanupOldEpochs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("清理失败: %v", err)
 	}
-	// 应清理了 old_epochs 中的条目
-	if removed < 0 {
-		t.Errorf("清理数量不应为负: %d", removed)
+	if removed != 4 {
+		t.Fatalf("保留 0 秒时应清理 4 个旧 epoch，实际: %d", removed)
+	}
+
+	all := LoadAllGroupSecrets(ks, aid, "g1")
+	if len(all) != 1 {
+		t.Fatalf("清理后应只剩当前 epoch，实际保留: %d", len(all))
+	}
+	if _, ok := all[5]; !ok {
+		t.Fatalf("清理后应保留当前 epoch 5")
+	}
+}
+
+func TestStoreGroupSecretUsesStructuredKeyStoreInterface(t *testing.T) {
+	dir := t.TempDir()
+	backup := keystore.NewSQLiteBackup(filepath.Join(dir, ".aun_backup", "aun_backup.db"))
+	t.Cleanup(func() { backup.Close() })
+	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed", backup)
+	if err != nil {
+		t.Fatalf("创建 KeyStore 失败: %v", err)
+	}
+
+	aid := "alice.test"
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment([]string{"alice", "bob"}, 1, "g1", secret)
+	ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, []string{"alice", "bob"})
+	if err != nil || !ok {
+		t.Fatalf("StoreGroupSecret 失败: ok=%v err=%v", ok, err)
+	}
+
+	entry, err := ks.LoadGroupSecretState(aid, "g1")
+	if err != nil {
+		t.Fatalf("LoadGroupSecretState 失败: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("结构化 group secret 主存为空")
+	}
+	if int(toInt64(entry["epoch"])) != 1 {
+		t.Fatalf("epoch 不正确: %v", entry["epoch"])
 	}
 }
 

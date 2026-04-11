@@ -12,6 +12,7 @@ import WebSocket from 'ws';
 
 import { ConnectionError, SerializationError, TimeoutError, mapRemoteError } from './errors.js';
 import type { EventDispatcher } from './events.js';
+import { isJsonObject, type JsonObject, type JsonValue, type RpcMessage, type RpcParams, type RpcResult } from './types.js';
 
 /** 协议事件名映射 */
 const EVENT_NAME_MAP: Record<string, string> = {
@@ -31,11 +32,12 @@ export class RPCTransport {
   private _dispatcher: EventDispatcher;
   private _timeout: number;
   private _onDisconnect: DisconnectCallback | null;
+  private _verifySsl: boolean;
   private _ws: WebSocket | null = null;
   private _closed = true;
-  private _challenge: Record<string, unknown> | null = null;
+  private _challenge: RpcMessage | null = null;
   private _pending: Map<string, {
-    resolve: (value: Record<string, unknown>) => void;
+    resolve: (value: RpcMessage) => void;
     reject: (reason: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }> = new Map();
@@ -45,10 +47,12 @@ export class RPCTransport {
     eventDispatcher: EventDispatcher;
     timeout?: number;
     onDisconnect?: DisconnectCallback | null;
+    verifySsl?: boolean;
   }) {
     this._dispatcher = opts.eventDispatcher;
     this._timeout = opts.timeout ?? 10_000;
     this._onDisconnect = opts.onDisconnect ?? null;
+    this._verifySsl = opts.verifySsl ?? true;
   }
 
   /** 设置默认 RPC 超时（毫秒） */
@@ -57,7 +61,7 @@ export class RPCTransport {
   }
 
   /** 获取上次连接的 challenge 消息 */
-  get challenge(): Record<string, unknown> | null {
+  get challenge(): RpcMessage | null {
     return this._challenge;
   }
 
@@ -65,9 +69,9 @@ export class RPCTransport {
    * 连接到 Gateway WebSocket 端点。
    * 返回初始 challenge 消息（如果有）。
    */
-  async connect(url: string): Promise<Record<string, unknown> | null> {
-    return new Promise<Record<string, unknown> | null>((resolve, reject) => {
-      const ws = new WebSocket(url);
+  async connect(url: string): Promise<RpcMessage | null> {
+    return new Promise<RpcMessage | null>((resolve, reject) => {
+      const ws = new WebSocket(url, this._verifySsl ? undefined : { rejectUnauthorized: false });
       let initialResolved = false;
 
       ws.on('error', (err) => {
@@ -152,9 +156,9 @@ export class RPCTransport {
    */
   async call(
     method: string,
-    params?: Record<string, unknown>,
+    params?: RpcParams,
     timeout?: number,
-  ): Promise<unknown> {
+  ): Promise<RpcResult> {
     if (this._closed || !this._ws) {
       throw new ConnectionError('transport not connected');
     }
@@ -162,7 +166,7 @@ export class RPCTransport {
     const rpcId = `rpc-${String(++this._idCounter).padStart(5, '0')}`;
     const effectiveTimeout = timeout ?? this._timeout;
 
-    return new Promise<unknown>((resolve, reject) => {
+    return new Promise<RpcResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(rpcId);
         reject(new TimeoutError(`rpc timeout: ${method}`, { retryable: true }));
@@ -171,10 +175,12 @@ export class RPCTransport {
       this._pending.set(rpcId, {
         resolve: (response) => {
           clearTimeout(timer);
-          if ('error' in response) {
-            reject(mapRemoteError(response.error as Record<string, unknown>));
-          } else {
+          if (response.error !== undefined) {
+            reject(mapRemoteError(response.error));
+          } else if (response.result !== undefined) {
             resolve(response.result);
+          } else {
+            reject(new SerializationError(`rpc response missing result and error: ${method}`));
           }
         },
         reject: (err) => {
@@ -215,7 +221,9 @@ export class RPCTransport {
         this._routeMessage(message);
       } catch (err) {
         // 解析异常，发布错误事件
-        this._dispatcher.publish('connection.error', { error: err });
+        this._dispatcher.publish('connection.error', {
+          error: err instanceof Error ? err : String(err),
+        });
       }
     });
 
@@ -236,7 +244,7 @@ export class RPCTransport {
   }
 
   /** 路由消息：RPC 响应 / challenge / 事件 / 通知 */
-  private _routeMessage(message: Record<string, unknown>): void {
+  private _routeMessage(message: RpcMessage): void {
     // RPC 响应（有 id 字段）
     if ('id' in message) {
       const rpcId = String(message.id);
@@ -271,13 +279,15 @@ export class RPCTransport {
   }
 
   /** 解码 WebSocket 消息为 JSON 对象 */
-  private _decodeMessage(raw: unknown): Record<string, unknown> {
-    if (raw && typeof raw === 'object' && !Buffer.isBuffer(raw) && !(raw instanceof ArrayBuffer)) {
-      return raw as Record<string, unknown>;
+  private _decodeMessage(raw: string | Buffer | Buffer[] | ArrayBuffer | JsonObject): RpcMessage {
+    if (isJsonObject(raw)) {
+      return raw as RpcMessage;
     }
     let str: string;
     if (Buffer.isBuffer(raw)) {
       str = raw.toString('utf-8');
+    } else if (Array.isArray(raw)) {
+      str = Buffer.concat(raw).toString('utf-8');
     } else if (raw instanceof ArrayBuffer) {
       str = Buffer.from(raw).toString('utf-8');
     } else if (typeof raw === 'string') {
@@ -286,7 +296,11 @@ export class RPCTransport {
       throw new SerializationError(`unsupported websocket payload type: ${typeof raw}`);
     }
     try {
-      return JSON.parse(str);
+      const parsed = JSON.parse(str) as JsonValue;
+      if (!isJsonObject(parsed)) {
+        throw new SerializationError('invalid json payload');
+      }
+      return parsed as RpcMessage;
     } catch {
       throw new SerializationError('invalid json payload');
     }

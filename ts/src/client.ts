@@ -14,12 +14,13 @@
 import * as crypto from 'node:crypto';
 import * as http from 'node:http';
 import * as https from 'node:https';
+import { join } from 'node:path';
 import { URL } from 'node:url';
 
-import { configFromMap, type AUNConfig } from './config.js';
+import { configFromMap, getDeviceId, type AUNConfig } from './config.js';
 import { CryptoProvider } from './crypto.js';
 import { GatewayDiscovery } from './discovery.js';
-import { E2EEManager } from './e2ee.js';
+import { E2EEManager, type PrekeyMaterial } from './e2ee.js';
 import {
   GroupE2EEManager,
   computeMembershipCommitment,
@@ -33,22 +34,40 @@ import {
   AuthError,
   ConnectionError,
   E2EEError,
+  NotFoundError,
   PermissionError,
   StateError,
   TimeoutError,
   ValidationError,
 } from './errors.js';
-import { EventDispatcher, type Subscription, type EventHandler } from './events.js';
+import { EventDispatcher, type EventPayload, type Subscription, type EventHandler } from './events.js';
 import { FileKeyStore } from './keystore/file.js';
 import type { KeyStore } from './keystore/index.js';
+import { SQLiteBackup } from './keystore/sqlite-backup.js';
+import { updateKeyStoreMetadata } from './keystore/update.js';
 import { AuthNamespace } from './namespaces/auth.js';
 import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
+import { SeqTracker } from './seq-tracker.js';
+import {
+  isJsonObject,
+  type IdentityRecord,
+  type JsonObject,
+  type JsonValue,
+  type Message,
+  type MetadataRecord,
+  type RpcParams,
+  type RpcResult,
+} from './types.js';
 
 // ── 日志辅助 ──────────────────────────────────────────────────
 
 /** 简易日志：前缀 [aun_core.client] */
-function _clientLog(level: string, msg: string, ...args: unknown[]): void {
+function _clientLog(
+  level: string,
+  msg: string,
+  ...args: Array<string | number | boolean | null | undefined | Error | object>
+): void {
   const ts = new Date().toISOString();
   const formatted = args.reduce<string>((s, a) => s.replace('%s', String(a)), msg);
   // eslint-disable-next-line no-console
@@ -60,16 +79,16 @@ function _clientLog(level: string, msg: string, ...args: unknown[]): void {
  * 等价于 Python json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)
  * 非 ASCII 字符直接以 UTF-8 输出，与 AAD 序列化规则一致。
  */
-function stableStringify(obj: unknown): string {
+function stableStringify(obj: JsonValue | object | undefined): string {
   if (obj === null || obj === undefined) return 'null';
   if (typeof obj === 'boolean' || typeof obj === 'number') return JSON.stringify(obj);
   if (typeof obj === 'string') return JSON.stringify(obj);
   if (Array.isArray(obj)) {
     return '[' + obj.map(v => stableStringify(v)).join(',') + ']';
   }
-  if (typeof obj === 'object') {
-    const keys = Object.keys(obj as Record<string, unknown>).sort();
-    const entries = keys.map(k => stableStringify(k) + ':' + stableStringify((obj as Record<string, unknown>)[k]));
+  if (isJsonObject(obj)) {
+    const keys = Object.keys(obj).sort();
+    const entries = keys.map(k => stableStringify(k) + ':' + stableStringify(obj[k]));
     return '{' + entries.join(',') + '}';
   }
   return JSON.stringify(obj);
@@ -89,7 +108,65 @@ const INTERNAL_ONLY_METHODS = new Set([
 ]);
 
 /** 默认会话选项 */
-const DEFAULT_SESSION_OPTIONS: Record<string, unknown> = {
+interface SessionRetryOptions extends JsonObject {
+  initial_delay: number;
+  max_delay: number;
+}
+
+interface SessionTimeoutOptions extends JsonObject {
+  connect: number;
+  call: number;
+  http: number;
+}
+
+interface SessionOptions extends JsonObject {
+  auto_reconnect: boolean;
+  heartbeat_interval: number;
+  token_refresh_before: number;
+  retry: SessionRetryOptions;
+  timeouts: SessionTimeoutOptions;
+}
+
+interface ConnectParams extends RpcParams {
+  access_token?: string;
+  gateway?: string;
+  topology?: JsonObject;
+  auto_reconnect?: boolean;
+  heartbeat_interval?: number;
+  token_refresh_before?: number;
+  retry?: JsonObject;
+  timeouts?: JsonObject;
+}
+
+interface AuthContext extends JsonObject {
+  identity?: IdentityRecord;
+  token?: string;
+}
+
+interface MemberRecord extends JsonObject {
+  aid?: string;
+}
+
+interface GroupRecord extends JsonObject {
+  group_id?: string;
+}
+
+interface GroupBatchReviewResult extends JsonObject {
+  ok?: boolean;
+  status?: string;
+  aid?: string;
+}
+
+interface GroupDistribution extends JsonObject {
+  to: string;
+  payload: JsonObject;
+}
+
+interface UploadPrekeyResult extends JsonObject {
+  ok?: boolean;
+}
+
+const DEFAULT_SESSION_OPTIONS: SessionOptions = {
   auto_reconnect: false,
   heartbeat_interval: 30.0,
   token_refresh_before: 60.0,
@@ -108,6 +185,14 @@ const DEFAULT_SESSION_OPTIONS: Record<string, unknown> = {
 const SIGNED_METHODS = new Set([
   'group.send', 'group.kick', 'group.add_member',
   'group.leave', 'group.remove_member', 'group.update_rules',
+  'group.update', 'group.update_announcement',
+  'group.update_join_requirements', 'group.set_role',
+  'group.transfer_owner', 'group.review_join_request',
+  'group.batch_review_join_request',
+  'group.resources.put', 'group.resources.update',
+  'group.resources.delete', 'group.resources.request_add',
+  'group.resources.direct_add', 'group.resources.approve_request',
+  'group.resources.reject_request',
 ]);
 
 /** peer 证书缓存 TTL（10 分钟） */
@@ -119,6 +204,49 @@ interface CachedPeerCert {
   certPem: string;
   validatedAt: number;
   refreshAfter: number;
+}
+
+interface PeerPrekeyResponse {
+  found: boolean;
+  prekey?: PrekeyMaterial;
+}
+
+interface ConsumedPrekeyInfo {
+  encryption_mode?: string;
+  prekey_id?: string;
+}
+
+interface ConsumedPrekeyCarrier {
+  e2ee?: ConsumedPrekeyInfo;
+}
+
+function isGroupServiceAid(value: JsonValue | object | undefined): boolean {
+  const text = String(value ?? '').trim();
+  if (!text.includes('.')) return false;
+  const [name, ...issuerParts] = text.split('.');
+  return name === 'group' && issuerParts.join('.').length > 0;
+}
+
+function isPeerPrekeyMaterial(value: JsonValue | object | undefined): value is PrekeyMaterial {
+  if (!isJsonObject(value)) return false;
+  const candidate = value as Partial<PrekeyMaterial>;
+  return (
+    typeof candidate.prekey_id === 'string'
+    && typeof candidate.public_key === 'string'
+    && typeof candidate.signature === 'string'
+    && (candidate.created_at === undefined || typeof candidate.created_at === 'number')
+  );
+}
+
+function isPeerPrekeyResponse(value: JsonValue | object | undefined): value is PeerPrekeyResponse {
+  if (!isJsonObject(value)) return false;
+  const candidate = value as Partial<PeerPrekeyResponse>;
+  if (typeof candidate.found !== 'boolean') return false;
+  return candidate.prekey === undefined || isPeerPrekeyMaterial(candidate.prekey);
+}
+
+function formatCaughtError(error: any): Error | string {
+  return error instanceof Error ? error : String(error);
 }
 
 // ── HTTP 辅助 ─────────────────────────────────────────────────
@@ -156,7 +284,7 @@ function _httpGetText(url: string, verifySsl: boolean): Promise<string> {
  */
 export class AUNClient {
   /** 原始配置 */
-  readonly config: Record<string, unknown>;
+  readonly config: RpcParams;
 
   /** 解析后的配置模型 */
   private _configModel: AUNConfig;
@@ -165,7 +293,7 @@ export class AUNClient {
   private _aid: string | null = null;
 
   /** 当前身份信息（内存缓存） */
-  private _identity: Record<string, unknown> | null = null;
+  private _identity: IdentityRecord | null = null;
 
   /** 连接状态 */
   private _state: string = 'idle';
@@ -201,13 +329,18 @@ export class AUNClient {
   readonly auth: AuthNamespace;
 
   /** 会话参数（重连用） */
-  private _sessionParams: Record<string, unknown> | null = null;
+  private _sessionParams: ConnectParams | null = null;
 
   /** 会话选项 */
-  private _sessionOptions: Record<string, unknown> = { ...DEFAULT_SESSION_OPTIONS };
+  private _sessionOptions: SessionOptions = { ...DEFAULT_SESSION_OPTIONS };
 
   /** peer 证书缓存 */
   private _certCache: Map<string, CachedPeerCert> = new Map();
+  private _prekeyReplenishInflight: Set<string> = new Set();
+  private _prekeyReplenished: Set<string> = new Set();
+
+  /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
+  private _seqTracker: SeqTracker = new SeqTracker();
 
   // ── 后台任务定时器 ──────────────────────────────────────────
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -218,19 +351,23 @@ export class AUNClient {
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _reconnecting = false;
 
-  constructor(config?: Record<string, unknown>) {
-    const rawConfig = { ...(config ?? {}) };
+  constructor(config?: RpcParams) {
+    const rawConfig: RpcParams = { ...(config ?? {}) };
     this.config = rawConfig;
     this._configModel = configFromMap(rawConfig);
 
     this._dispatcher = new EventDispatcher();
     this._discovery = new GatewayDiscovery({ verifySsl: this._configModel.verifySsl });
 
+    const defaultSQLiteBackup = rawConfig.keystore
+      ? undefined
+      : new SQLiteBackup(join(this._configModel.aunPath, '.aun_backup', 'aun_backup.db'));
     const keystore = (rawConfig.keystore as KeyStore | undefined) ?? new FileKeyStore(
       this._configModel.aunPath,
       {
         secretStore: rawConfig.secret_store as undefined,
         encryptionSeed: this._configModel.encryptionSeed ?? undefined,
+        sqliteBackup: defaultSQLiteBackup,
       },
     );
     this._keystore = keystore;
@@ -247,6 +384,7 @@ export class AUNClient {
       eventDispatcher: this._dispatcher,
       timeout: 10_000,
       onDisconnect: (err) => this._handleTransportDisconnect(err),
+      verifySsl: this._configModel.verifySsl,
     });
 
     this._e2ee = new E2EEManager({
@@ -307,8 +445,8 @@ export class AUNClient {
    * @param options - 会话选项（auto_reconnect、heartbeat_interval 等）
    */
   async connect(
-    auth: Record<string, unknown>,
-    options?: Record<string, unknown>,
+    auth: RpcParams,
+    options?: RpcParams,
   ): Promise<void> {
     if (this._state !== 'idle' && this._state !== 'closed') {
       throw new StateError(`connect not allowed in state ${this._state}`);
@@ -318,7 +456,7 @@ export class AUNClient {
     const normalized = this._normalizeConnectParams(params);
     this._sessionParams = normalized;
     this._sessionOptions = this._buildSessionOptions(normalized);
-    const callTimeoutSec = (this._sessionOptions.timeouts as Record<string, number>)?.call;
+    const callTimeoutSec = this._sessionOptions.timeouts.call;
     this._transport.setTimeout(
       callTimeoutSec != null ? callTimeoutSec * 1000 : 10_000,
     );
@@ -329,13 +467,18 @@ export class AUNClient {
   /** 关闭连接 */
   async close(): Promise<void> {
     this._closing = true;
+    this._saveSeqTrackerState();
     this._stopBackgroundTasks();
     this._stopReconnect();
     if (this._state === 'idle' || this._state === 'closed') {
+      const closableKeyStore = this._keystore as KeyStore & { close?: () => void };
+      closableKeyStore.close?.();
       this._state = 'closed';
       return;
     }
     await this._transport.close();
+    const closableKeyStore = this._keystore as KeyStore & { close?: () => void };
+    closableKeyStore.close?.();
     this._state = 'closed';
     await this._dispatcher.publish('connection.state', { state: this._state });
   }
@@ -346,7 +489,7 @@ export class AUNClient {
    * 发送 JSON-RPC 调用。
    * 自动处理内部方法限制、E2EE 加解密、客户端签名等。
    */
-  async call(method: string, params?: Record<string, unknown>): Promise<unknown> {
+  async call(method: string, params?: RpcParams): Promise<RpcResult> {
     if (this._state !== 'connected') {
       throw new ConnectionError('client is not connected');
     }
@@ -355,6 +498,7 @@ export class AUNClient {
     }
 
     const p = { ...(params ?? {}) };
+    this._validateOutboundCall(method, p);
 
     // 自动加密：message.send 默认加密（encrypt 默认 True）
     if (method === 'message.send') {
@@ -379,33 +523,39 @@ export class AUNClient {
       this._signClientOperation(method, p);
     }
 
-    let result = await this._transport.call(method, p) as Record<string, unknown> | unknown;
+    let result = await this._transport.call(method, p);
 
     // 自动解密：message.pull 返回的消息
-    if (method === 'message.pull' && result && typeof result === 'object') {
-      const r = result as Record<string, unknown>;
+    if (method === 'message.pull' && isJsonObject(result)) {
+      const r = result;
       const messages = r.messages;
       if (Array.isArray(messages) && messages.length > 0) {
-        r.messages = await this._decryptMessages(messages as Record<string, unknown>[]);
+        r.messages = await this._decryptMessages(messages.filter(isJsonObject) as Message[]);
+        if (this._aid) {
+          this._seqTracker.onPullResult(`p2p:${this._aid}`, messages.filter(isJsonObject));
+        }
       }
     }
 
     // 自动解密：group.pull 返回的群消息
-    if (method === 'group.pull' && result && typeof result === 'object') {
-      const r = result as Record<string, unknown>;
+    if (method === 'group.pull' && isJsonObject(result)) {
+      const r = result;
       const messages = r.messages;
       if (Array.isArray(messages) && messages.length > 0) {
-        r.messages = await this._decryptGroupMessages(messages as Record<string, unknown>[]);
+        r.messages = await this._decryptGroupMessages(messages.filter(isJsonObject) as Message[]);
+        const gid = (p.group_id ?? '') as string;
+        if (gid) {
+          this._seqTracker.onPullResult(`group:${gid}`, messages.filter(isJsonObject));
+        }
       }
     }
 
     // ── Group E2EE 自动编排 ────────────────────────────
     if (this._configModel.groupE2ee) {
       // 建群后自动创建 epoch（幂等：已有 secret 时跳过）
-      if (method === 'group.create' && result && typeof result === 'object') {
-        const r = result as Record<string, unknown>;
-        const group = (r.group ?? {}) as Record<string, unknown>;
-        const gid = String(group.group_id ?? '');
+      if (method === 'group.create' && isJsonObject(result)) {
+        const group = isJsonObject(result.group) ? result.group as GroupRecord : null;
+        const gid = group ? String(group.group_id ?? '') : '';
         if (gid && this._aid && !this._groupE2ee.hasSecret(gid)) {
           try {
             this._groupE2ee.createEpoch(gid, [this._aid]);
@@ -447,9 +597,8 @@ export class AUNClient {
       }
 
       // 审批通过后自动分发密钥给新成员
-      if (method === 'group.review_join_request' && result && typeof result === 'object') {
-        const r = result as Record<string, unknown>;
-        if (r.approved || r.status === 'approved') {
+      if (method === 'group.review_join_request' && isJsonObject(result)) {
+        if (result.approved || result.status === 'approved') {
           const groupId = String(p.group_id ?? '');
           const newAid = String(p.aid ?? '');
           if (groupId && newAid) {
@@ -461,10 +610,9 @@ export class AUNClient {
       }
 
       // 批量审批通过后分发密钥
-      if (method === 'group.batch_review_join_request' && result && typeof result === 'object') {
-        const r = result as Record<string, unknown>;
+      if (method === 'group.batch_review_join_request' && isJsonObject(result)) {
         const groupId = String(p.group_id ?? '');
-        const approvedAids = ((r.results as Record<string, unknown>[] | undefined) ?? [])
+        const approvedAids = ((Array.isArray(result.results) ? result.results : []) as GroupBatchReviewResult[])
           .filter((item) => item.ok && item.status === 'approved' && item.aid)
           .map((item) => String(item.aid));
         if (groupId && approvedAids.length > 0) {
@@ -489,17 +637,17 @@ export class AUNClient {
   // ── 便利方法 ──────────────────────────────────────────────
 
   /** 心跳检测 */
-  async ping(params?: Record<string, unknown>): Promise<unknown> {
+  async ping(params?: RpcParams): Promise<RpcResult> {
     return await this.call('meta.ping', params ?? {});
   }
 
   /** 获取服务端状态 */
-  async status(params?: Record<string, unknown>): Promise<unknown> {
+  async status(params?: RpcParams): Promise<RpcResult> {
     return await this.call('meta.status', params ?? {});
   }
 
   /** 获取信任根证书列表 */
-  async trustRoots(params?: Record<string, unknown>): Promise<unknown> {
+  async trustRoots(params?: RpcParams): Promise<RpcResult> {
     return await this.call('meta.trust_roots', params ?? {});
   }
 
@@ -513,21 +661,33 @@ export class AUNClient {
   // ── E2EE 加密发送 ────────────────────────────────────────
 
   /** 自动加密并发送 P2P 消息 */
-  private async _sendEncrypted(params: Record<string, unknown>): Promise<unknown> {
+  private async _sendEncrypted(params: RpcParams): Promise<RpcResult> {
     const toAid = String(params.to ?? '');
-    const payload = params.payload;
+    this._validateMessageRecipient(toAid);
+    const payload = isJsonObject(params.payload) ? params.payload : null;
     const messageId = String(params.message_id ?? '') || crypto.randomUUID();
     const timestamp = (params.timestamp as number) ?? Date.now();
+    if (payload === null) {
+      throw new ValidationError('message.send payload must be an object when encrypt=true');
+    }
 
-    // 获取对方证书
-    const peerCertPem = await this._fetchPeerCert(toAid);
+    let prekey: PrekeyMaterial | null = null;
+    try {
+      prekey = await this._fetchPeerPrekey(toAid);
+    } catch (exc) {
+      if (!(exc instanceof NotFoundError)) {
+        throw exc;
+      }
+    }
 
-    // 获取对方 prekey（可能没有）
-    const prekey = await this._fetchPeerPrekey(toAid);
+    const peerCertPem = await this._fetchPeerCert(
+      toAid,
+      typeof prekey?.cert_fingerprint === 'string' ? prekey.cert_fingerprint : undefined,
+    );
 
     const [envelope, encryptResult] = this._e2ee.encryptOutbound(
       toAid,
-      payload as Record<string, unknown>,
+      payload,
       peerCertPem,
       prekey,
       messageId,
@@ -554,11 +714,11 @@ export class AUNClient {
           reason: encryptResult.degradation_reason,
         });
       } catch (exc) {
-        _clientLog('warn', '发布 e2ee.degraded 事件失败: %s', exc);
+        _clientLog('warn', '发布 e2ee.degraded 事件失败: %s', formatCaughtError(exc));
       }
     }
 
-    const sendParams: Record<string, unknown> = {
+    const sendParams: RpcParams = {
       to: toAid,
       payload: envelope,
       type: 'e2ee.encrypted',
@@ -571,16 +731,19 @@ export class AUNClient {
   }
 
   /** 自动加密并发送群组消息 */
-  private async _sendGroupEncrypted(params: Record<string, unknown>): Promise<unknown> {
+  private async _sendGroupEncrypted(params: RpcParams): Promise<RpcResult> {
     const groupId = String(params.group_id ?? '');
-    const payload = params.payload;
+    const payload = isJsonObject(params.payload) ? params.payload : null;
     if (!groupId) {
       throw new ValidationError('group.send requires group_id');
+    }
+    if (payload === null) {
+      throw new ValidationError('group.send payload must be an object when encrypt=true');
     }
 
     const envelope = this._groupE2ee.encrypt(groupId, payload);
 
-    const sendParams: Record<string, unknown> = {
+    const sendParams: RpcParams = {
       group_id: groupId,
       payload: envelope,
       type: 'e2ee.group_encrypted',
@@ -596,7 +759,7 @@ export class AUNClient {
    * 为关键操作附加客户端 ECDSA 签名（client_signature 字段）。
    * 签名覆盖所有非 _ 前缀且非 client_signature 的业务字段。
    */
-  private _signClientOperation(method: string, params: Record<string, unknown>): void {
+  private _signClientOperation(method: string, params: RpcParams): void {
     const identity = this._identity;
     if (!identity || !identity.private_key_pem) return;
 
@@ -605,7 +768,7 @@ export class AUNClient {
       const ts = String(Math.floor(Date.now() / 1000));
 
       // 计算 params hash — 必须递归排序所有键（与 Python json.dumps(sort_keys=True, separators=(",",":")) 一致）
-      const paramsForHash: Record<string, unknown> = {};
+      const paramsForHash: RpcParams = {};
       for (const [k, v] of Object.entries(params)) {
         if (k !== 'client_signature' && !k.startsWith('_')) {
           paramsForHash[k] = v;
@@ -618,38 +781,56 @@ export class AUNClient {
       const privateKey = crypto.createPrivateKey(String(identity.private_key_pem));
       const signature = crypto.sign('SHA256', signData, privateKey);
 
+      // 证书指纹
+      let certFingerprint = '';
+      const certPem = String(identity.cert ?? '');
+      if (certPem) {
+        const certObj = new crypto.X509Certificate(certPem);
+        certFingerprint = 'sha256:' + certObj.fingerprint256.replace(/:/g, '').toLowerCase();
+      }
+
       params.client_signature = {
         aid,
+        cert_fingerprint: certFingerprint,
         timestamp: ts,
         params_hash: paramsHash,
         signature: signature.toString('base64'),
       };
     } catch (exc) {
-      _clientLog('warn', '客户端签名失败，继续发送无签名请求: %s', exc);
+      _clientLog('warn', '客户端签名失败，继续发送无签名请求: %s', formatCaughtError(exc));
     }
   }
 
   // ── 事件自动解密管线 ──────────────────────────────────────
 
   /** 处理 transport 层推送的原始 P2P 消息 */
-  private async _onRawMessageReceived(data: unknown): Promise<void> {
+  private async _onRawMessageReceived(data: EventPayload): Promise<void> {
     // 异步处理，不阻塞事件调度
     this._processAndPublishMessage(data).catch((exc) => {
-      _clientLog('debug', '解密失败: %s', exc);
+      _clientLog('debug', '解密失败: %s', formatCaughtError(exc));
     });
   }
 
   /** 实际处理推送消息的异步任务 */
-  private async _processAndPublishMessage(data: unknown): Promise<void> {
-    if (!data || typeof data !== 'object') {
+  private async _processAndPublishMessage(data: EventPayload): Promise<void> {
+    if (!isJsonObject(data)) {
       await this._dispatcher.publish('message.received', data);
       return;
     }
-    const msg = { ...(data as Record<string, unknown>) };
+    const msg: Message = { ...data };
 
     // 拦截 P2P 传输的群组密钥分发/请求/响应消息
     if (await this._tryHandleGroupKeyMessage(msg)) {
       return;
+    }
+
+    // P2P 空洞检测
+    const seq = msg.seq as number | undefined;
+    if (seq !== undefined && seq !== null && this._aid) {
+      const needPull = this._seqTracker.onMessageSeq(`p2p:${this._aid}`, seq);
+      if (needPull) {
+        this._fillP2pGap().catch(() => {});
+      }
     }
 
     const decrypted = await this._decryptSingleMessage(msg);
@@ -657,35 +838,203 @@ export class AUNClient {
   }
 
   /** 处理群组消息推送：自动解密后 re-publish */
-  private async _onRawGroupMessageCreated(data: unknown): Promise<void> {
+  private async _onRawGroupMessageCreated(data: EventPayload): Promise<void> {
     this._processAndPublishGroupMessage(data).catch((exc) => {
-      _clientLog('debug', '群消息解密失败: %s', exc);
+      _clientLog('debug', '群消息解密失败: %s', formatCaughtError(exc));
     });
   }
 
-  /** 处理群组推送消息的异步任务 */
-  private async _processAndPublishGroupMessage(data: unknown): Promise<void> {
-    if (!data || typeof data !== 'object') {
+  /**
+   * 处理群组推送消息的异步任务。
+   *
+   * 带 payload 的事件（消息推送）：解密后 re-publish。
+   * 不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
+   */
+  private async _processAndPublishGroupMessage(data: EventPayload): Promise<void> {
+    if (!isJsonObject(data)) {
       await this._dispatcher.publish('group.message_created', data);
       return;
     }
-    const msg = { ...(data as Record<string, unknown>) };
+    const msg: Message = { ...data };
+    const groupId = (msg.group_id ?? '') as string;
+    const seq = msg.seq as number | undefined;
+    const payload = msg.payload;
+
+    // 空洞检测（无论带不带 payload 都检查）
+    if (groupId && seq !== undefined && seq !== null) {
+      const needPull = this._seqTracker.onMessageSeq(`group:${groupId}`, seq);
+      if (needPull) {
+        this._fillGroupGap(groupId).catch(() => {});
+      }
+    }
+
+    if (payload === undefined || payload === null
+      || (typeof payload === 'object' && Object.keys(payload as object).length === 0)) {
+      // 不带 payload 的通知：自动 pull 最新消息
+      await this._autoPullGroupMessages(msg);
+      return;
+    }
     const decrypted = await this._decryptGroupMessage(msg);
     await this._dispatcher.publish('group.message_created', decrypted);
+  }
+
+  /** 收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息 */
+  private async _autoPullGroupMessages(notification: Message): Promise<void> {
+    const groupId = (notification.group_id ?? '') as string;
+    if (!groupId) {
+      await this._dispatcher.publish('group.message_created', notification);
+      return;
+    }
+    const ns = `group:${groupId}`;
+    const afterSeq = this._seqTracker.getContiguousSeq(ns);
+    try {
+      const result = await this.call('group.pull', {
+        group_id: groupId,
+        after_message_seq: afterSeq,
+        device_id: getDeviceId(this._configModel.aunPath),
+        limit: 50,
+      });
+      if (isJsonObject(result)) {
+        const messages = result.messages;
+        if (Array.isArray(messages)) {
+          this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          for (const msg of messages) {
+            if (isJsonObject(msg)) {
+              await this._dispatcher.publish('group.message_created', msg);
+            }
+          }
+          return;
+        }
+      }
+    } catch (exc) {
+      _clientLog('debug', '自动 pull 群消息失败: %s', formatCaughtError(exc));
+    }
+    await this._dispatcher.publish('group.message_created', notification);
+  }
+
+  /** 后台补齐群消息空洞 */
+  private async _fillGroupGap(groupId: string): Promise<void> {
+    const ns = `group:${groupId}`;
+    const afterSeq = this._seqTracker.getContiguousSeq(ns);
+    try {
+      const result = await this.call('group.pull', {
+        group_id: groupId,
+        after_message_seq: afterSeq,
+        device_id: getDeviceId(this._configModel.aunPath),
+        limit: 50,
+      });
+      if (isJsonObject(result)) {
+        const messages = result.messages;
+        if (Array.isArray(messages)) {
+          this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          for (const msg of messages) {
+            if (isJsonObject(msg)) {
+              await this._dispatcher.publish('group.message_created', msg);
+            }
+          }
+        }
+      }
+    } catch {
+      // 静默失败，下次空洞检测时重试
+    }
+  }
+
+  /** 后台补齐 P2P 消息空洞 */
+  private async _fillP2pGap(): Promise<void> {
+    if (!this._aid) return;
+    const ns = `p2p:${this._aid}`;
+    const afterSeq = this._seqTracker.getContiguousSeq(ns);
+    try {
+      const result = await this.call('message.pull', {
+        after_seq: afterSeq,
+        limit: 50,
+      });
+      if (isJsonObject(result)) {
+        const messages = result.messages;
+        if (Array.isArray(messages)) {
+          this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          for (const msg of messages) {
+            if (isJsonObject(msg)) {
+              await this._dispatcher.publish('message.received', msg);
+            }
+          }
+        }
+      }
+    } catch {
+      // 静默失败
+    }
+  }
+
+  /** 后台补齐群事件空洞 */
+  private async _fillGroupEventGap(groupId: string): Promise<void> {
+    const ns = `group_event:${groupId}`;
+    const afterSeq = this._seqTracker.getContiguousSeq(ns);
+    try {
+      const result = await this.call('group.pull_events', {
+        group_id: groupId,
+        after_event_seq: afterSeq,
+        device_id: getDeviceId(this._configModel.aunPath),
+        limit: 50,
+      });
+      if (isJsonObject(result)) {
+        const events = result.events;
+        if (Array.isArray(events)) {
+          this._seqTracker.onPullResult(ns, events.filter(isJsonObject));
+          for (const evt of events) {
+            if (isJsonObject(evt)) {
+              await this._dispatcher.publish('group.changed', evt);
+            }
+          }
+        }
+      }
+    } catch {
+      // 静默失败
+    }
+  }
+
+  /** 上线/重连后一次性补齐所有已加入群的事件 */
+  private async _pullAllGroupEventsOnce(): Promise<void> {
+    try {
+      const result = await this.call('group.list', {});
+      if (!isJsonObject(result)) return;
+      const items = result.items;
+      if (!Array.isArray(items)) return;
+      for (const g of items) {
+        if (isJsonObject(g)) {
+          const gid = String(g.group_id ?? '');
+          if (gid) {
+            await this._fillGroupEventGap(gid);
+          }
+        }
+      }
+    } catch {
+      // 静默失败
+    }
   }
 
   /**
    * 处理群组变更事件：透传给用户，并在成员离开/被踢时自动触发 epoch 轮换。
    * 按协议，轮换由剩余在线 admin/owner 负责。
    */
-  private async _onRawGroupChanged(data: unknown): Promise<void> {
-    await this._dispatcher.publish('group.changed', data);
+  private async _onRawGroupChanged(data: EventPayload): Promise<void> {
+    if (isJsonObject(data)) {
+      const d = data;
+      // 验签：有 client_signature 就验，没有默认安全
+      const cs = d.client_signature;
+      if (cs && isJsonObject(cs)) {
+        d._verified = this._verifyEventSignatureSync(d, cs);
+      }
+      await this._dispatcher.publish('group.changed', d);
 
-    // 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
-    if (data && typeof data === 'object') {
-      const d = data as Record<string, unknown>;
+      const groupId = String(d.group_id ?? '');
+
+      // 收到事件推送后自动 pull 补齐
+      if (groupId) {
+        this._fillGroupEventGap(groupId).catch(() => {/* 静默 */});
+      }
+
+      // 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
       if (d.action === 'member_left' || d.action === 'member_removed') {
-        const groupId = String(d.group_id ?? '');
         if (groupId) {
           this._rotateGroupEpoch(groupId).catch((exc) =>
             this._logE2eeError('rotate_epoch', groupId, '', exc as Error),
@@ -695,16 +1044,57 @@ export class AUNClient {
     }
   }
 
-  /** 尝试处理 P2P 传输的群组密钥消息。返回 true 表示已处理（不再传播）。 */
-  private async _tryHandleGroupKeyMessage(message: Record<string, unknown>): Promise<boolean> {
-    const payload = message.payload;
-    if (!payload || typeof payload !== 'object') return false;
+  /** 同步验签群事件 client_signature。返回 true/false/"pending"。 */
+  private _verifyEventSignatureSync(event: JsonObject, cs: JsonObject): string | boolean {
+    try {
+      const sigAid = String(cs.aid ?? '');
+      const method = String(cs._method ?? '');
+      const expectedFP = String(cs.cert_fingerprint ?? '').trim().toLowerCase();
+      if (!sigAid || !method) return 'pending';
+      // 只用已缓存的证书
+      const cached = this._certCache.get(AUNClient._certCacheKey(sigAid, expectedFP || undefined));
+      if (!cached || !cached.certPem) {
+        // 异步触发证书获取
+        this._fetchPeerCert(sigAid, expectedFP || undefined).catch(() => {});
+        return 'pending';
+      }
+      const certPem = cached.certPem;
+      const certObj = new crypto.X509Certificate(certPem);
+      // cert_fingerprint 校验
+      if (expectedFP) {
+        const actualFP = 'sha256:' + certObj.fingerprint256.replace(/:/g, '').toLowerCase();
+        if (actualFP !== expectedFP) {
+          _clientLog('warn', '验签失败：证书指纹不匹配 aid=%s', sigAid);
+          return false;
+        }
+      }
+      // 验签
+      const paramsHash = String(cs.params_hash ?? '');
+      const timestamp = String(cs.timestamp ?? '');
+      const signData = Buffer.from(`${method}|${sigAid}|${timestamp}|${paramsHash}`, 'utf-8');
+      const sigB64 = String(cs.signature ?? '');
+      const pubKey = certObj.publicKey;
+      const ok = crypto.verify('SHA256', signData, pubKey, Buffer.from(sigB64, 'base64'));
+      if (!ok) {
+        _clientLog('warn', '群事件验签失败 aid=%s method=%s', sigAid, method);
+      }
+      return ok;
+    } catch (exc) {
+      _clientLog('warn', '群事件验签异常: %s', formatCaughtError(exc));
+      return false;
+    }
+  }
 
-    const payloadObj = payload as Record<string, unknown>;
+  /** 尝试处理 P2P 传输的群组密钥消息。返回 true 表示已处理（不再传播）。 */
+  private async _tryHandleGroupKeyMessage(message: Message): Promise<boolean> {
+    const payload = message.payload;
+    if (!isJsonObject(payload)) return false;
+
+    const payloadObj = payload;
 
     // 先解密 P2P E2EE（如果是加密的）
     // 注意：用 _decrypt_message 而非 decrypt_message，避免消耗 seen set
-    let actualPayload = payloadObj;
+    let actualPayload: JsonObject | null = payloadObj;
     if (payloadObj.type === 'e2ee.encrypted') {
       const fromAid = String(message.from ?? '');
       if (fromAid) {
@@ -712,8 +1102,9 @@ export class AUNClient {
       }
       const decrypted = this._e2ee._decryptMessage(message);
       if (decrypted === null) return false;
-      actualPayload = (decrypted.payload ?? {}) as Record<string, unknown>;
-      if (!actualPayload || typeof actualPayload !== 'object') return false;
+      this._schedulePrekeyReplenishIfConsumed(decrypted);
+      actualPayload = isJsonObject(decrypted.payload) ? decrypted.payload : null;
+      if (actualPayload === null) return false;
     }
 
     const result = this._groupE2ee.handleIncoming(actualPayload);
@@ -728,8 +1119,11 @@ export class AUNClient {
       // 请求者不在本地成员列表时，回源查询服务端最新成员列表
       if (requester && !members.includes(requester)) {
         try {
-          const membersResult = await this.call('group.get_members', { group_id: groupId }) as Record<string, unknown>;
-          members = ((membersResult.members ?? []) as Record<string, unknown>[]).map(
+          const membersResult = await this.call('group.get_members', { group_id: groupId });
+          const memberList = isJsonObject(membersResult) && Array.isArray(membersResult.members)
+            ? membersResult.members as MemberRecord[]
+            : [];
+          members = memberList.map(
             (m) => String(m.aid),
           );
           // 更新本地当前 epoch 的 member_aids/commitment
@@ -738,16 +1132,16 @@ export class AUNClient {
             if (secretData && this._aid) {
               const epoch = secretData.epoch as number;
               const commitment = computeMembershipCommitment(
-                members, epoch, groupId, secretData.secret as Buffer,
+                members, epoch, groupId, secretData.secret,
               );
               storeGroupSecret(
                 this._keystore, this._aid, groupId, epoch,
-                secretData.secret as Buffer, commitment, members,
+                secretData.secret, commitment, members,
               );
             }
           }
         } catch (exc) {
-          _clientLog('warn', '群组 %s 成员列表回源失败: %s', groupId, exc);
+          _clientLog('warn', '群组 %s 成员列表回源失败: %s', groupId, formatCaughtError(exc));
         }
       }
 
@@ -761,7 +1155,7 @@ export class AUNClient {
             persist: false,
           });
         } catch (exc) {
-          _clientLog('warn', '向 %s 回复群组密钥失败: %s', requester, exc);
+          _clientLog('warn', '向 %s 回复群组密钥失败: %s', requester, formatCaughtError(exc));
         }
       }
     }
@@ -775,8 +1169,9 @@ export class AUNClient {
    * 获取对方证书（带缓存 + 完整 PKI 验证）。
    * 跨域时自动路由到 peer 所在域的 Gateway。
    */
-  private async _fetchPeerCert(aid: string): Promise<string> {
-    const cached = this._certCache.get(aid);
+  private async _fetchPeerCert(aid: string, certFingerprint?: string): Promise<string> {
+    const cacheKey = AUNClient._certCacheKey(aid, certFingerprint);
+    const cached = this._certCache.get(cacheKey);
     const now = Date.now() / 1000;
     if (cached && now < cached.refreshAfter) {
       return cached.certPem;
@@ -789,7 +1184,7 @@ export class AUNClient {
 
     // 跨域时用 peer 所在域的 Gateway URL
     const peerGatewayUrl = AUNClient._resolvePeerGatewayUrl(gatewayUrl, aid);
-    const certUrl = AUNClient._buildCertUrl(peerGatewayUrl, aid);
+    const certUrl = AUNClient._buildCertUrl(peerGatewayUrl, aid, certFingerprint);
     const certPem = await _httpGetText(certUrl, this._configModel.verifySsl);
 
     // 完整 PKI 验证
@@ -802,47 +1197,58 @@ export class AUNClient {
     }
 
     const nowSec = Date.now() / 1000;
-    this._certCache.set(aid, {
+    this._certCache.set(cacheKey, {
       certPem,
       validatedAt: nowSec,
       refreshAfter: nowSec + PEER_CERT_CACHE_TTL,
     });
 
-    // 同步写入 keystore，保证 E2EE 解密时能读到
-    try {
-      this._keystore.saveCert(aid, certPem);
-    } catch (exc) {
-      _clientLog('error', '写入证书到 keystore 失败 (aid=%s): %s', aid, exc);
+    if (!certFingerprint) {
+      // 仅 active_signing 路径写回 keystore，避免旧证书覆盖当前证书
+      try {
+        this._keystore.saveCert(aid, certPem);
+      } catch (exc) {
+        _clientLog('error', '写入证书到 keystore 失败 (aid=%s): %s', aid, formatCaughtError(exc));
+      }
     }
 
     return certPem;
   }
 
   /** 获取对方的 prekey（通过 E2EEManager 缓存） */
-  private async _fetchPeerPrekey(peerAid: string): Promise<Record<string, unknown> | null> {
+  private async _fetchPeerPrekey(peerAid: string): Promise<PrekeyMaterial> {
     const cached = this._e2ee.getCachedPrekey(peerAid);
     if (cached !== null) return cached;
 
     try {
-      const result = await this._transport.call('message.e2ee.get_prekey', { aid: peerAid }) as Record<string, unknown>;
-      if (result && result.found) {
-        const prekey = result.prekey as Record<string, unknown> | undefined;
-        if (prekey) {
-          this._e2ee.cachePrekey(peerAid, prekey);
-        }
-        return prekey ?? null;
+      const result = await this._transport.call('message.e2ee.get_prekey', { aid: peerAid });
+      if (!isPeerPrekeyResponse(result)) {
+        throw new ValidationError(`invalid prekey response for ${peerAid}`);
       }
+      if (result.found === false) {
+        throw new NotFoundError(`peer prekey not found for ${peerAid}`);
+      }
+      const prekey = result.prekey;
+      if (!prekey) {
+        throw new ValidationError(`invalid prekey response for ${peerAid}`);
+      }
+      this._e2ee.cachePrekey(peerAid, prekey);
+      return prekey;
     } catch (exc) {
-      _clientLog('debug', 'prekey 获取失败: %s', exc);
+      if (exc instanceof ValidationError || exc instanceof NotFoundError) {
+        throw exc;
+      }
+      throw new ValidationError(
+        `failed to fetch peer prekey for ${peerAid}: ${exc instanceof Error ? exc.message : String(exc)}`,
+      );
     }
-    return null;
   }
 
   /** 生成 prekey 并上传到服务端 */
-  private async _uploadPrekey(): Promise<Record<string, unknown>> {
+  private async _uploadPrekey(): Promise<UploadPrekeyResult> {
     const prekeyMaterial = this._e2ee.generatePrekey();
     const result = await this._transport.call('message.e2ee.put_prekey', prekeyMaterial);
-    return (result && typeof result === 'object') ? result as Record<string, unknown> : { ok: true };
+    return isJsonObject(result) ? { ...result } : { ok: true };
   }
 
   /**
@@ -850,7 +1256,8 @@ export class AUNClient {
    * 返回 true 表示证书已就绪（PKI 验证通过），false 表示不可用。
    */
   private async _ensureSenderCertCached(aid: string): Promise<boolean> {
-    const cached = this._certCache.get(aid);
+    const cacheKey = AUNClient._certCacheKey(aid);
+    const cached = this._certCache.get(cacheKey);
     const now = Date.now() / 1000;
     if (cached && now < cached.refreshAfter) {
       return true;
@@ -862,10 +1269,10 @@ export class AUNClient {
     } catch (exc) {
       // 刷新失败时：若内存缓存有 PKI 验证过的证书（未过期 x2 倍 TTL）则继续用
       if (cached && now < cached.validatedAt + PEER_CERT_CACHE_TTL * 2) {
-        _clientLog('debug', '刷新发送方 %s 证书失败，继续使用已验证的内存缓存: %s', aid, exc);
+        _clientLog('debug', '刷新发送方 %s 证书失败，继续使用已验证的内存缓存: %s', aid, formatCaughtError(exc));
         return true;
       }
-      _clientLog('warn', '获取发送方 %s 证书失败且无已验证缓存，拒绝信任: %s', aid, exc);
+      _clientLog('warn', '获取发送方 %s 证书失败且无已验证缓存，拒绝信任: %s', aid, formatCaughtError(exc));
       return false;
     }
   }
@@ -874,8 +1281,8 @@ export class AUNClient {
    * 获取经过 PKI 验证的 peer 证书（仅信任内存缓存中已验证的证书）。
    * 零信任：不直接信任 keystore 中可能由恶意服务端注入的证书。
    */
-  private _getVerifiedPeerCert(aid: string): string | null {
-    const cached = this._certCache.get(aid);
+  private _getVerifiedPeerCert(aid: string, certFingerprint?: string): string | null {
+    const cached = this._certCache.get(AUNClient._certCacheKey(aid, certFingerprint));
     const now = Date.now() / 1000;
     if (cached && now < cached.validatedAt + PEER_CERT_CACHE_TTL * 2) {
       return cached.certPem;
@@ -884,10 +1291,10 @@ export class AUNClient {
   }
 
   /** 解密单条 P2P 消息 */
-  private async _decryptSingleMessage(message: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async _decryptSingleMessage(message: Message): Promise<Message> {
     const payload = message.payload;
-    if (!payload || typeof payload !== 'object') return message;
-    const payloadObj = payload as Record<string, unknown>;
+    if (!isJsonObject(payload)) return message;
+    const payloadObj = payload;
     if (payloadObj.type !== 'e2ee.encrypted') return message;
     if (message.encrypted === false) return message;
 
@@ -903,21 +1310,22 @@ export class AUNClient {
 
     // 密码学解密（E2EEManager.decryptMessage 内含本地防重放）
     const decrypted = this._e2ee.decryptMessage(message);
+    this._schedulePrekeyReplenishIfConsumed(decrypted);
     return decrypted !== null ? decrypted : message;
   }
 
   /** 批量解密 P2P 消息（用于 message.pull） */
-  private async _decryptMessages(messages: Record<string, unknown>[]): Promise<Record<string, unknown>[]> {
+  private async _decryptMessages(messages: Message[]): Promise<Message[]> {
     const seenInBatch = new Set<string>();
-    const result: Record<string, unknown>[] = [];
+    const result: Message[] = [];
     for (const msg of messages) {
       const mid = String(msg.message_id ?? '');
       if (mid && seenInBatch.has(mid)) continue;
       if (mid) seenInBatch.add(mid);
 
       const payload = msg.payload;
-      if (payload && typeof payload === 'object'
-        && (payload as Record<string, unknown>).type === 'e2ee.encrypted'
+      if (isJsonObject(payload)
+        && payload.type === 'e2ee.encrypted'
         && (msg.encrypted === true || !('encrypted' in msg))) {
         const fromAid = String(msg.from ?? '');
         if (fromAid) {
@@ -938,11 +1346,14 @@ export class AUNClient {
     return result;
   }
 
-  /** 解密单条群组消息 */
-  private async _decryptGroupMessage(message: Record<string, unknown>): Promise<Record<string, unknown>> {
+  /** 解密单条群组消息。opts.skipReplay 用于 group.pull 场景跳过防重放。 */
+  private async _decryptGroupMessage(
+    message: Message,
+    opts?: { skipReplay?: boolean },
+  ): Promise<Message> {
     const payload = message.payload;
-    if (!payload || typeof payload !== 'object') return message;
-    const payloadObj = payload as Record<string, unknown>;
+    if (!isJsonObject(payload)) return message;
+    const payloadObj = payload;
     if (payloadObj.type !== 'e2ee.group_encrypted') return message;
 
     // 确保发送方证书已缓存（签名验证需要）
@@ -956,7 +1367,7 @@ export class AUNClient {
     }
 
     // 先尝试直接解密
-    const result = this._groupE2ee.decrypt(message);
+    const result = this._groupE2ee.decrypt(message, opts);
     if (result !== null && result.e2ee) {
       return result;
     }
@@ -976,7 +1387,7 @@ export class AUNClient {
             persist: false,
           });
         } catch (exc) {
-          _clientLog('debug', '密钥恢复请求失败: %s', exc);
+          _clientLog('debug', '密钥恢复请求失败: %s', formatCaughtError(exc));
         }
       }
     }
@@ -984,11 +1395,11 @@ export class AUNClient {
     return message;
   }
 
-  /** 批量解密群组消息（用于 group.pull） */
-  private async _decryptGroupMessages(messages: Record<string, unknown>[]): Promise<Record<string, unknown>[]> {
-    const result: Record<string, unknown>[] = [];
+  /** 批量解密群组消息（用于 group.pull，跳过防重放） */
+  private async _decryptGroupMessages(messages: Message[]): Promise<Message[]> {
+    const result: Message[] = [];
     for (const msg of messages) {
-      const decrypted = await this._decryptGroupMessage(msg);
+      const decrypted = await this._decryptGroupMessage(msg, { skipReplay: true });
       result.push(decrypted);
     }
     return result;
@@ -999,14 +1410,14 @@ export class AUNClient {
   /** 建群后将本地 epoch 1 同步到服务端（服务端初始为 0） */
   private async _syncEpochToServer(groupId: string): Promise<void> {
     try {
-      const rotateParams: Record<string, unknown> = {
+      const rotateParams: RpcParams = {
         group_id: groupId,
         current_epoch: 0,
       };
       Object.assign(rotateParams, this._buildRotationSignature(groupId, 0, 1));
       await this.call('group.e2ee.rotate_epoch', rotateParams);
     } catch (exc) {
-      _clientLog('debug', '同步 epoch 到服务端失败 (group=%s，可能已同步): %s', groupId, exc);
+      _clientLog('debug', '同步 epoch 到服务端失败 (group=%s，可能已同步): %s', groupId, formatCaughtError(exc));
     }
   }
 
@@ -1017,29 +1428,34 @@ export class AUNClient {
   private async _rotateGroupEpoch(groupId: string): Promise<void> {
     try {
       // 1. 读取服务端当前 epoch
-      const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId }) as Record<string, unknown>;
-      const currentEpoch = (epochResult.epoch as number) ?? 0;
+      const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+      const currentEpoch = isJsonObject(epochResult) && typeof epochResult.epoch === 'number'
+        ? epochResult.epoch
+        : 0;
 
       // 2. CAS 尝试递增
-      const rotateParams: Record<string, unknown> = {
+      const rotateParams: RpcParams = {
         group_id: groupId,
         current_epoch: currentEpoch,
       };
       Object.assign(rotateParams, this._buildRotationSignature(groupId, currentEpoch, currentEpoch + 1));
-      const casResult = await this.call('group.e2ee.rotate_epoch', rotateParams) as Record<string, unknown>;
-      if (!casResult.success) return; // CAS 失败，放弃
+      const casResult = await this.call('group.e2ee.rotate_epoch', rotateParams);
+      if (!isJsonObject(casResult) || !casResult.success) return;
 
-      const newEpoch = casResult.epoch as number;
+      const newEpoch = typeof casResult.epoch === 'number' ? casResult.epoch : 0;
 
       // 3. 获取最新成员列表
-      const membersResult = await this.call('group.get_members', { group_id: groupId }) as Record<string, unknown>;
-      const memberAids = ((membersResult.members ?? []) as Record<string, unknown>[]).map(
+      const membersResult = await this.call('group.get_members', { group_id: groupId });
+      const memberList = isJsonObject(membersResult) && Array.isArray(membersResult.members)
+        ? membersResult.members as MemberRecord[]
+        : [];
+      const memberAids = memberList.map(
         (m) => String(m.aid),
       );
 
       // 4. 本地生成密钥 + 存储 + 分发
       const info = this._groupE2ee.rotateEpochTo(groupId, newEpoch, memberAids);
-      const distributions = (info.distributions ?? []) as { to: string; payload: Record<string, unknown> }[];
+      const distributions = (Array.isArray(info.distributions) ? info.distributions : []) as GroupDistribution[];
       for (const dist of distributions) {
         try {
           await this.call('message.send', {
@@ -1049,7 +1465,7 @@ export class AUNClient {
             persist: false,
           });
         } catch (exc) {
-          _clientLog('debug', '密钥分发失败: %s', exc);
+          _clientLog('debug', '密钥分发失败: %s', formatCaughtError(exc));
         }
       }
     } catch (exc) {
@@ -1064,20 +1480,23 @@ export class AUNClient {
       if (secretData === null) return;
 
       // 拉服务端最新成员列表
-      const membersResult = await this.call('group.get_members', { group_id: groupId }) as Record<string, unknown>;
-      const memberAids = ((membersResult.members ?? []) as Record<string, unknown>[]).map(
+      const membersResult = await this.call('group.get_members', { group_id: groupId });
+      const memberList = isJsonObject(membersResult) && Array.isArray(membersResult.members)
+        ? membersResult.members as MemberRecord[]
+        : [];
+      const memberAids = memberList.map(
         (m) => String(m.aid),
       );
 
       // 用最新成员列表更新本地当前 epoch 的 member_aids/commitment
       const epoch = secretData.epoch as number;
       const commitment = computeMembershipCommitment(
-        memberAids, epoch, groupId, secretData.secret as Buffer,
+        memberAids, epoch, groupId, secretData.secret,
       );
       if (this._aid) {
         storeGroupSecret(
           this._keystore, this._aid, groupId, epoch,
-          secretData.secret as Buffer, commitment, memberAids,
+          secretData.secret, commitment, memberAids,
         );
       }
 
@@ -1095,7 +1514,7 @@ export class AUNClient {
       }
 
       const distPayload = buildKeyDistribution(
-        groupId, epoch, secretData.secret as Buffer,
+        groupId, epoch, secretData.secret,
         memberAids, this._aid ?? '',
         manifest,
       );
@@ -1134,6 +1553,32 @@ export class AUNClient {
     }
   }
 
+  /** 从 keystore 恢复 SeqTracker 状态 */
+  private _restoreSeqTrackerState(): void {
+    if (!this._aid) return;
+    try {
+      const metadata = this._keystore.loadMetadata(this._aid);
+      if (metadata && typeof metadata === 'object') {
+        const state = (metadata as any).seq_tracker_state;
+        if (state && typeof state === 'object') {
+          this._seqTracker.restoreState(state as Record<string, number>);
+        }
+      }
+    } catch { /* 忽略 */ }
+  }
+
+  /** 将 SeqTracker 状态保存到 keystore */
+  private _saveSeqTrackerState(): void {
+    if (!this._aid) return;
+    const state = this._seqTracker.exportState();
+    if (Object.keys(state).length === 0) return;
+    try {
+      updateKeyStoreMetadata(this._keystore, this._aid, (m) => {
+        (m as any).seq_tracker_state = state;
+      });
+    } catch { /* 忽略 */ }
+  }
+
   /** 记录 E2EE 自动编排错误 */
   private _logE2eeError(stage: string, groupId: string, aid: string, exc: Error): void {
     try {
@@ -1160,16 +1605,26 @@ export class AUNClient {
   }
 
   /** 构建证书下载 URL */
-  private static _buildCertUrl(gatewayUrl: string, aid: string): string {
+  private static _certCacheKey(aid: string, certFingerprint?: string): string {
+    const normalized = String(certFingerprint ?? '').trim().toLowerCase();
+    return normalized ? `${aid}#${normalized}` : aid;
+  }
+
+  private static _buildCertUrl(gatewayUrl: string, aid: string, certFingerprint?: string): string {
     const parsed = new URL(gatewayUrl);
     const scheme = parsed.protocol === 'wss:' ? 'https:' : 'http:';
-    return `${scheme}//${parsed.host}/pki/cert/${encodeURIComponent(aid)}`;
+    const url = new URL(`${scheme}//${parsed.host}/pki/cert/${encodeURIComponent(aid)}`);
+    const normalized = String(certFingerprint ?? '').trim().toLowerCase();
+    if (normalized) {
+      url.searchParams.set('cert_fingerprint', normalized);
+    }
+    return url.toString();
   }
 
   // ── 内部：连接 ────────────────────────────────────────────
 
   /** 执行一次连接流程 */
-  private async _connectOnce(params: Record<string, unknown>, allowReauth: boolean): Promise<void> {
+  private async _connectOnce(params: ConnectParams, allowReauth: boolean): Promise<void> {
     const gatewayUrl = this._resolveGateway(params);
     this._gatewayUrl = gatewayUrl;
     this._state = 'connecting';
@@ -1185,13 +1640,14 @@ export class AUNClient {
           gatewayUrl,
           { accessToken: String(params.access_token ?? '') },
         );
-        if (authContext && typeof authContext === 'object') {
-          const identity = (authContext as Record<string, unknown>).identity as Record<string, unknown> | undefined;
-          if (identity && typeof identity === 'object') {
+        if (isJsonObject(authContext)) {
+          const auth = authContext as AuthContext;
+          const identity = auth.identity;
+          if (identity && isJsonObject(identity)) {
             this._identity = identity;
             this._aid = String(identity.aid ?? this._aid ?? '');
             if (this._sessionParams !== null) {
-              this._sessionParams.access_token = (authContext as Record<string, unknown>).token ?? params.access_token;
+              this._sessionParams.access_token = String(auth.token ?? params.access_token ?? '');
             }
           }
         }
@@ -1204,13 +1660,17 @@ export class AUNClient {
 
       this._state = 'connected';
       await this._dispatcher.publish('connection.state', { state: this._state, gateway: gatewayUrl });
+
+      // 从 keystore 恢复 SeqTracker 状态
+      this._restoreSeqTrackerState();
+
       this._startBackgroundTasks();
 
       // 上线后自动上传 prekey
       try {
         await this._uploadPrekey();
       } catch (exc) {
-        _clientLog('warn', 'prekey 上传失败: %s', exc);
+        _clientLog('warn', 'prekey 上传失败: %s', formatCaughtError(exc));
       }
     } catch (err) {
       this._state = 'idle';
@@ -1219,10 +1679,10 @@ export class AUNClient {
   }
 
   /** 从参数中解析 Gateway URL */
-  private _resolveGateway(params: Record<string, unknown>): string {
+  private _resolveGateway(params: ConnectParams): string {
     const topology = params.topology;
-    if (topology && typeof topology === 'object') {
-      const topo = topology as Record<string, unknown>;
+    if (isJsonObject(topology)) {
+      const topo = topology;
       const mode = String(topo.mode ?? 'gateway');
       if (mode === 'peer') {
         throw new ValidationError('peer topology is not implemented in the TypeScript SDK');
@@ -1254,43 +1714,43 @@ export class AUNClient {
   // ── 内部：参数处理 ────────────────────────────────────────
 
   /** 规范化连接参数 */
-  private _normalizeConnectParams(params: Record<string, unknown>): Record<string, unknown> {
-    const request = { ...params };
+  private _normalizeConnectParams(params: RpcParams): ConnectParams {
+    const request: ConnectParams = { ...params };
     const accessToken = String(request.access_token ?? '');
     if (!accessToken) throw new StateError('connect requires non-empty access_token');
     const gateway = String(request.gateway ?? this._gatewayUrl ?? '');
     if (!gateway) throw new StateError('connect requires non-empty gateway');
     request.access_token = accessToken;
     request.gateway = gateway;
-    if (request.topology != null && typeof request.topology !== 'object') {
+    if (request.topology != null && !isJsonObject(request.topology)) {
       throw new ValidationError('topology must be a dict');
     }
-    if ('retry' in request && typeof request.retry !== 'object') {
+    if ('retry' in request && request.retry != null && !isJsonObject(request.retry)) {
       throw new ValidationError('retry must be a dict');
     }
-    if ('timeouts' in request && typeof request.timeouts !== 'object') {
+    if ('timeouts' in request && request.timeouts != null && !isJsonObject(request.timeouts)) {
       throw new ValidationError('timeouts must be a dict');
     }
     return request;
   }
 
   /** 从参数构建会话选项 */
-  private _buildSessionOptions(params: Record<string, unknown>): Record<string, unknown> {
-    const options: Record<string, unknown> = {
-      auto_reconnect: (DEFAULT_SESSION_OPTIONS as Record<string, unknown>).auto_reconnect,
-      heartbeat_interval: (DEFAULT_SESSION_OPTIONS as Record<string, unknown>).heartbeat_interval,
-      token_refresh_before: (DEFAULT_SESSION_OPTIONS as Record<string, unknown>).token_refresh_before,
-      retry: { ...(DEFAULT_SESSION_OPTIONS as Record<string, Record<string, unknown>>).retry },
-      timeouts: { ...(DEFAULT_SESSION_OPTIONS as Record<string, Record<string, unknown>>).timeouts },
+  private _buildSessionOptions(params: ConnectParams): SessionOptions {
+    const options: SessionOptions = {
+      auto_reconnect: DEFAULT_SESSION_OPTIONS.auto_reconnect,
+      heartbeat_interval: DEFAULT_SESSION_OPTIONS.heartbeat_interval,
+      token_refresh_before: DEFAULT_SESSION_OPTIONS.token_refresh_before,
+      retry: { ...DEFAULT_SESSION_OPTIONS.retry },
+      timeouts: { ...DEFAULT_SESSION_OPTIONS.timeouts },
     };
     if ('auto_reconnect' in params) options.auto_reconnect = Boolean(params.auto_reconnect);
     if ('heartbeat_interval' in params) options.heartbeat_interval = Number(params.heartbeat_interval);
     if ('token_refresh_before' in params) options.token_refresh_before = Number(params.token_refresh_before);
-    if ('retry' in params && typeof params.retry === 'object') {
-      Object.assign(options.retry as Record<string, unknown>, params.retry);
+    if ('retry' in params && isJsonObject(params.retry)) {
+      Object.assign(options.retry, params.retry);
     }
-    if ('timeouts' in params && typeof params.timeouts === 'object') {
-      Object.assign(options.timeouts as Record<string, unknown>, params.timeouts);
+    if ('timeouts' in params && isJsonObject(params.timeouts)) {
+      Object.assign(options.timeouts, params.timeouts);
     }
     return options;
   }
@@ -1301,8 +1761,9 @@ export class AUNClient {
   private _startBackgroundTasks(): void {
     this._startHeartbeatTask();
     this._startTokenRefreshTask();
-    this._startPrekeyRefreshTask();
     this._startGroupEpochTasks();
+    // 上线/重连后一次性补齐群事件
+    this._pullAllGroupEventsOnce().catch(() => {/* 静默 */});
   }
 
   /** 停止所有后台任务 */
@@ -1337,7 +1798,7 @@ export class AUNClient {
     this._heartbeatTimer = setInterval(() => {
       if (this._closing || this._state !== 'connected') return;
       this._transport.call('meta.ping', {}).catch((exc) => {
-        this._dispatcher.publish('connection.error', { error: exc }).catch(() => {});
+        this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) }).catch(() => {});
       });
     }, interval);
     // 允许 Node.js 进程在只剩定时器时退出
@@ -1395,7 +1856,7 @@ export class AUNClient {
           if (exc instanceof AuthError) {
             _clientLog('debug', 'token 刷新失败，下次重试: %s', exc);
           } else {
-            await this._dispatcher.publish('connection.error', { error: exc });
+            await this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) });
           }
         }
         scheduleNext();
@@ -1408,15 +1869,45 @@ export class AUNClient {
 
   /** 启动 prekey 刷新任务 */
   private _startPrekeyRefreshTask(): void {
-    if (this._prekeyRefreshTimer !== null) return;
-    const interval = Number(this.config.prekey_refresh_interval ?? 3600) * 1000;
-    this._prekeyRefreshTimer = setInterval(() => {
-      if (this._closing || this._state !== 'connected') return;
-      this._uploadPrekey().catch((exc) => {
-        _clientLog('warn', 'prekey 轮换失败: %s', exc);
-      });
-    }, interval);
-    this._unrefTimer(this._prekeyRefreshTimer);
+    return;
+  }
+
+  private _extractConsumedPrekeyId(message: ConsumedPrekeyCarrier | null | undefined): string {
+    if (!message?.e2ee) return '';
+    if (message.e2ee.encryption_mode !== 'prekey_ecdh_v2') return '';
+    return String(message.e2ee.prekey_id ?? '').trim();
+  }
+
+  private _validateMessageRecipient(toAid: JsonValue | object | undefined): void {
+    if (isGroupServiceAid(toAid)) {
+      throw new ValidationError('message.send receiver cannot be group.{issuer}; use group.send instead');
+    }
+  }
+
+  private _validateOutboundCall(method: string, params: RpcParams): void {
+    if (method === 'message.send') {
+      this._validateMessageRecipient(params.to);
+    }
+  }
+
+  private _schedulePrekeyReplenishIfConsumed(message: ConsumedPrekeyCarrier | null | undefined): void {
+    const prekeyId = this._extractConsumedPrekeyId(message);
+    if (!prekeyId || this._state !== 'connected') return;
+    if (this._prekeyReplenished.has(prekeyId)) return;
+    // 同一时刻只允许一个 put_prekey inflight
+    if (this._prekeyReplenishInflight.size > 0) return;
+    this._prekeyReplenishInflight.add(prekeyId);
+
+    void (async () => {
+      try {
+        await this._uploadPrekey();
+        this._prekeyReplenished.add(prekeyId);
+      } catch (exc) {
+        _clientLog('warn', '消费 prekey %s 后补充 current prekey 失败: %s', prekeyId, formatCaughtError(exc));
+      } finally {
+        this._prekeyReplenishInflight.delete(prekeyId);
+      }
+    })();
   }
 
   /** 启动群组 epoch 相关后台任务 */
@@ -1428,14 +1919,14 @@ export class AUNClient {
       this._groupEpochCleanupTimer = setInterval(() => {
         if (this._closing || this._state !== 'connected' || !this._aid) return;
         try {
-          const metadata = this._keystore.loadMetadata(this._aid!) ?? {};
-          const groupSecrets = (metadata.group_secrets ?? {}) as Record<string, unknown>;
+          const metadata = (this._keystore.loadMetadata(this._aid!) ?? {}) as MetadataRecord;
+          const groupSecrets = metadata.group_secrets ?? {};
           const retention = this._configModel.oldEpochRetentionSeconds;
           for (const gid of Object.keys(groupSecrets)) {
             this._groupE2ee.cleanup(gid, retention);
           }
         } catch (exc) {
-          _clientLog('debug', 'epoch 清理失败: %s', exc);
+          _clientLog('debug', 'epoch 清理失败: %s', formatCaughtError(exc));
         }
       }, 3600_000);
       this._unrefTimer(this._groupEpochCleanupTimer);
@@ -1447,15 +1938,15 @@ export class AUNClient {
       this._groupEpochRotateTimer = setInterval(() => {
         if (this._closing || this._state !== 'connected' || !this._aid) return;
         try {
-          const metadata = this._keystore.loadMetadata(this._aid!) ?? {};
-          const groupSecrets = (metadata.group_secrets ?? {}) as Record<string, unknown>;
+          const metadata = (this._keystore.loadMetadata(this._aid!) ?? {}) as MetadataRecord;
+          const groupSecrets = metadata.group_secrets ?? {};
           for (const gid of Object.keys(groupSecrets)) {
             this._rotateGroupEpoch(gid).catch((exc) =>
-              _clientLog('debug', 'epoch 轮换失败: %s', exc),
+              _clientLog('debug', 'epoch 轮换失败: %s', formatCaughtError(exc)),
             );
           }
         } catch (exc) {
-          _clientLog('debug', 'epoch 轮换失败: %s', exc);
+          _clientLog('debug', 'epoch 轮换失败: %s', formatCaughtError(exc));
         }
       }, rotateInterval * 1000);
       this._unrefTimer(this._groupEpochRotateTimer);
@@ -1488,7 +1979,7 @@ export class AUNClient {
     if (this._reconnecting) return;
     this._reconnecting = true;
 
-    const retry = (this._sessionOptions.retry ?? {}) as Record<string, unknown>;
+    const retry = this._sessionOptions.retry;
     const initialDelay = Number(retry.initial_delay ?? 0.5) * 1000;
     const maxDelay = Number(retry.max_delay ?? 30.0) * 1000;
     let delay = initialDelay;
@@ -1518,7 +2009,7 @@ export class AUNClient {
           this._reconnectTimer = null;
         } catch (exc) {
           await this._dispatcher.publish('connection.error', {
-            error: exc,
+            error: formatCaughtError(exc),
             attempt,
           });
           if (!AUNClient._shouldRetryReconnect(exc as Error)) {
@@ -1526,7 +2017,7 @@ export class AUNClient {
             this._reconnecting = false;
             await this._dispatcher.publish('connection.state', {
               state: this._state,
-              error: exc,
+              error: formatCaughtError(exc),
               attempt,
             });
             return;

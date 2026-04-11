@@ -4,7 +4,14 @@
  * 与 Python SDK 的 EventDispatcher 完全对齐：订阅、取消订阅、发布。
  */
 
-export type EventHandler = (payload: unknown) => void | Promise<void>;
+import type { JsonValue } from './types.js';
+
+export type EventPayload =
+  | JsonValue
+  | Error
+  | { [key: string]: JsonValue | Error };
+
+export type EventHandler = (payload: EventPayload) => void | Promise<void>;
 
 /**
  * 订阅句柄，调用 unsubscribe() 取消订阅。
@@ -60,7 +67,7 @@ export class EventDispatcher {
   }
 
   /** 发布事件，按注册顺序调用所有处理器（支持异步） */
-  async publish(event: string, payload: unknown): Promise<void> {
+  async publish(event: string, payload: EventPayload): Promise<void> {
     const handlers = this._handlers.get(event);
     if (!handlers) return;
     // 复制列表，防止迭代期间修改

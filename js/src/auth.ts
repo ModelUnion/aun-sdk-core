@@ -3,9 +3,17 @@
 // 浏览器环境使用原生 WebSocket + fetch + SubtleCrypto。
 
 import type { KeyStore } from './keystore/index.js';
-import { CryptoProvider, base64ToUint8, uint8ToBase64, pemToArrayBuffer } from './crypto.js';
+import { CryptoProvider, base64ToUint8, uint8ToBase64, pemToArrayBuffer, toBufferSource } from './crypto.js';
 import { AuthError, StateError, ValidationError, mapRemoteError } from './errors.js';
 import { ROOT_CA_PEM } from './certs/root.js';
+import {
+  isJsonObject,
+  type IdentityRecord,
+  type JsonObject,
+  type RpcMessage,
+  type RpcParams,
+  type RpcResult,
+} from './types.js';
 
 // ── ASN.1 / PEM 工具 ────────────────────────────────────
 
@@ -91,6 +99,15 @@ interface ParsedCert {
   isCA: boolean;
   /** SPKI 公钥字节 */
   spkiBytes: Uint8Array;
+}
+
+interface AuthContext extends JsonObject {
+  token?: string;
+  identity?: IdentityRecord;
+}
+
+interface TransportLike {
+  call(method: string, params: RpcParams): Promise<RpcResult>;
 }
 
 /** 读取 ASN.1 TLV 的 tag 和长度，返回 [tag, 值起始偏移, 值长度] */
@@ -324,7 +341,7 @@ async function verifyCertSignature(
   try {
     pubKey = await crypto.subtle.importKey(
       'spki',
-      issuerSpkiDer,
+      toBufferSource(issuerSpkiDer),
       { name: 'ECDSA', namedCurve: params.curveName },
       false,
       ['verify'],
@@ -337,8 +354,8 @@ async function verifyCertSignature(
   const valid = await crypto.subtle.verify(
     { name: 'ECDSA', hash: params.hash },
     pubKey,
-    p1363Sig,
-    cert.tbsBytes,
+    toBufferSource(p1363Sig),
+    toBufferSource(cert.tbsBytes),
   );
   if (!valid) throw new AuthError('证书签名验证失败');
 }
@@ -354,15 +371,15 @@ async function verifyEcdsaSignature(
   let curveLen: number;
   let hash: string;
   try {
-    pubKey = await crypto.subtle.importKey(
-      'spki', spkiDer, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'],
-    );
+      pubKey = await crypto.subtle.importKey(
+        'spki', toBufferSource(spkiDer), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'],
+      );
     curveLen = 32;
     hash = 'SHA-256';
   } catch {
     try {
       pubKey = await crypto.subtle.importKey(
-        'spki', spkiDer, { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify'],
+        'spki', toBufferSource(spkiDer), { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify'],
       );
       curveLen = 48;
       hash = 'SHA-384';
@@ -372,7 +389,7 @@ async function verifyEcdsaSignature(
   }
 
   const p1363Sig = derToP1363(signatureDer, curveLen);
-  return crypto.subtle.verify({ name: 'ECDSA', hash }, pubKey, p1363Sig, data);
+  return crypto.subtle.verify({ name: 'ECDSA', hash }, pubKey, toBufferSource(p1363Sig), toBufferSource(data));
 }
 
 // ── Gateway URL 工具 ────────────────────────────────────
@@ -442,7 +459,7 @@ export class AuthFlow {
   // ── 公开 API ──────────────────────────────────────
 
   /** 加载本地身份信息 */
-  async loadIdentity(aid?: string): Promise<Record<string, unknown>> {
+  async loadIdentity(aid?: string): Promise<IdentityRecord> {
     const identity = await this._loadIdentityOrRaise(aid);
     const cert = await this._keystore.loadCert(identity.aid as string);
     if (cert) identity.cert = cert;
@@ -452,7 +469,7 @@ export class AuthFlow {
   }
 
   /** 加载身份，不存在时返回 null */
-  async loadIdentityOrNull(aid?: string): Promise<Record<string, unknown> | null> {
+  async loadIdentityOrNull(aid?: string): Promise<IdentityRecord | null> {
     try {
       return await this.loadIdentity(aid);
     } catch {
@@ -460,8 +477,13 @@ export class AuthFlow {
     }
   }
 
+  /** 与 Node/TS SDK 对齐的别名：加载身份，不存在时返回 null */
+  async loadIdentityOrNone(aid?: string): Promise<IdentityRecord | null> {
+    return await this.loadIdentityOrNull(aid);
+  }
+
   /** 获取 access_token 过期时间 */
-  getAccessTokenExpiry(identity: Record<string, unknown>): number | null {
+  getAccessTokenExpiry(identity: IdentityRecord): number | null {
     const expiresAt = identity.access_token_expires_at;
     if (typeof expiresAt === 'number') return expiresAt;
     return null;
@@ -475,7 +497,8 @@ export class AuthFlow {
    *   2. 短连接 RPC 调用 auth.create_aid
    *   3. 保存返回的证书
    */
-  async createAid(gatewayUrl: string, aid: string): Promise<Record<string, unknown>> {
+  async createAid(gatewayUrl: string, aid: string): Promise<JsonObject> {
+    AuthFlow._validateAidName(aid);
     const identity = await this._ensureLocalIdentity(aid);
     if (identity.cert) {
       return { aid: identity.aid, cert: identity.cert };
@@ -485,7 +508,7 @@ export class AuthFlow {
     try {
       const created = await this._createAid(gatewayUrl, identity);
       Object.assign(identity, created);
-    } catch (e: unknown) {
+    } catch (e) {
       if (e instanceof Error && e.message.includes('already exists')) {
         // AID 已在服务端注册，尝试下载证书恢复
         try {
@@ -511,7 +534,7 @@ export class AuthFlow {
   /**
    * 认证已有 AID — login1/login2 双阶段流程。
    */
-  async authenticate(gatewayUrl: string, aid?: string): Promise<Record<string, unknown>> {
+  async authenticate(gatewayUrl: string, aid?: string): Promise<JsonObject> {
     const identity = await this._loadIdentityOrRaise(aid);
     if (!identity.cert) {
       // 尝试下载恢复证书
@@ -544,7 +567,7 @@ export class AuthFlow {
   /**
    * 确保已认证（如无身份则先注册再登录）。
    */
-  async ensureAuthenticated(gatewayUrl: string): Promise<Record<string, unknown>> {
+  async ensureAuthenticated(gatewayUrl: string): Promise<AuthContext> {
     const identity = await this._ensureIdentity();
     if (!identity.cert) {
       const created = await this._createAid(gatewayUrl, identity);
@@ -566,13 +589,12 @@ export class AuthFlow {
    * 使用已有 token 初始化 WebSocket 会话。
    */
   async initializeWithToken(
-    transport: { call(method: string, params: Record<string, unknown>): Promise<unknown> },
-    challenge: Record<string, unknown> | null,
+    transport: TransportLike,
+    challenge: RpcMessage | null,
     accessToken: string,
   ): Promise<void> {
-    const nonce = (
-      (challenge?.params as Record<string, unknown>)?.nonce ?? ''
-    ) as string;
+    const params = isJsonObject(challenge?.params) ? challenge.params : {};
+    const nonce = String(params.nonce ?? '');
     if (!nonce) throw new AuthError('gateway challenge missing nonce');
     await this._initializeSession(transport, nonce, accessToken);
   }
@@ -581,17 +603,16 @@ export class AuthFlow {
    * 连接会话 — 多策略认证：显式 token → 缓存 token → refresh → 重新登录。
    */
   async connectSession(
-    transport: { call(method: string, params: Record<string, unknown>): Promise<unknown> },
-    challenge: Record<string, unknown> | null,
+    transport: TransportLike,
+    challenge: RpcMessage | null,
     gatewayUrl: string,
     accessToken?: string,
-  ): Promise<Record<string, unknown>> {
-    const nonce = (
-      (challenge?.params as Record<string, unknown>)?.nonce ?? ''
-    ) as string;
+  ): Promise<AuthContext> {
+    const params = isJsonObject(challenge?.params) ? challenge.params : {};
+    const nonce = String(params.nonce ?? '');
     if (!nonce) throw new AuthError('gateway challenge missing nonce');
 
-    let identity: Record<string, unknown> | null;
+    let identity: IdentityRecord | null;
     try {
       identity = await this.loadIdentity();
     } catch {
@@ -662,8 +683,8 @@ export class AuthFlow {
    */
   async refreshCachedTokens(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<IdentityRecord> {
     const refreshToken = String(identity.refresh_token ?? '');
     if (!refreshToken) throw new AuthError('missing refresh_token');
     const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken);
@@ -707,8 +728,8 @@ export class AuthFlow {
   private async _shortRpc(
     gatewayUrl: string,
     method: string,
-    params: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    params: RpcParams,
+  ): Promise<JsonObject> {
     return new Promise((resolve, reject) => {
       let ws: WebSocket;
       try {
@@ -760,7 +781,7 @@ export class AuthFlow {
             return;
           }
           const result = msg.result;
-          if (!result || typeof result !== 'object') {
+          if (!isJsonObject(result)) {
             reject(new ValidationError(`invalid pre-auth response for ${method}`));
             return;
           }
@@ -792,15 +813,15 @@ export class AuthFlow {
   }
 
   /** fetch GET 返回 JSON */
-  private async _fetchJson(url: string): Promise<Record<string, unknown>> {
+  private async _fetchJson(url: string): Promise<JsonObject> {
     try {
       const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const payload = await resp.json();
-      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      if (!isJsonObject(payload)) {
         throw new AuthError(`invalid JSON payload from ${url}`);
       }
-      return payload as Record<string, unknown>;
+      return payload;
     } catch (e) {
       if (e instanceof AuthError) throw e;
       throw new AuthError(`failed to fetch ${url}: ${e}`);
@@ -811,8 +832,8 @@ export class AuthFlow {
 
   private async _createAid(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<JsonObject> {
     const response = await this._shortRpc(gatewayUrl, 'auth.create_aid', {
       aid: identity.aid,
       public_key: identity.public_key_der_b64,
@@ -824,8 +845,8 @@ export class AuthFlow {
   /** 下载已注册证书恢复本地状态 */
   private async _recoverCertViaDownload(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<IdentityRecord> {
     const certUrl = gatewayHttpUrl(gatewayUrl, `/pki/cert/${identity.aid}`);
     const certPem = await this._fetchText(certUrl);
     if (!certPem || !certPem.includes('BEGIN CERTIFICATE')) {
@@ -849,8 +870,8 @@ export class AuthFlow {
 
   private async _login(
     gatewayUrl: string,
-    identity: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+    identity: IdentityRecord,
+  ): Promise<JsonObject> {
     const clientNonce = this._crypto.newClientNonce();
 
     // Phase 1: 发送 AID + 证书 + client_nonce
@@ -884,7 +905,7 @@ export class AuthFlow {
   private async _refreshAccessToken(
     gatewayUrl: string,
     refreshToken: string,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<JsonObject> {
     const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', {
       refresh_token: refreshToken,
     });
@@ -896,7 +917,7 @@ export class AuthFlow {
 
   /** 初始化 WebSocket 会话（auth.connect RPC） */
   private async _initializeSession(
-    transport: { call(method: string, params: Record<string, unknown>): Promise<unknown> },
+    transport: TransportLike,
     nonce: string,
     token: string,
   ): Promise<void> {
@@ -905,9 +926,9 @@ export class AuthFlow {
       auth: { method: 'kite_token', token },
       protocol: { min: '1.0', max: '1.0' },
       capabilities: { e2ee: true, group_e2ee: true },
-    }) as Record<string, unknown> | undefined;
+    });
 
-    const status = result?.status;
+    const status = isJsonObject(result) ? result.status : undefined;
     if (status !== 'ok') {
       throw new AuthError(`initialize failed: ${JSON.stringify(result)}`);
     }
@@ -917,7 +938,7 @@ export class AuthFlow {
 
   private async _verifyPhase1Response(
     gatewayUrl: string,
-    result: Record<string, unknown>,
+    result: JsonObject,
     clientNonce: string,
   ): Promise<void> {
     const authCertPem = String(result.auth_cert ?? '');
@@ -1240,25 +1261,25 @@ export class AuthFlow {
 
   // ── 内部方法：Token 管理 ──────────────────────────
 
-  private _rememberTokens(identity: Record<string, unknown>, authResult: Record<string, unknown>): void {
+  private _rememberTokens(identity: IdentityRecord, authResult: JsonObject): void {
     const accessToken = authResult.access_token ?? authResult.token ?? authResult.kite_token;
     const refreshToken = authResult.refresh_token;
     const expiresIn = authResult.expires_in;
 
-    if (accessToken) identity.access_token = accessToken;
-    if (refreshToken) identity.refresh_token = refreshToken;
-    if (authResult.token) identity.kite_token = authResult.token;
+    if (typeof accessToken === 'string' && accessToken) identity.access_token = accessToken;
+    if (typeof refreshToken === 'string' && refreshToken) identity.refresh_token = refreshToken;
+    if (typeof authResult.token === 'string' && authResult.token) identity.kite_token = authResult.token;
     if (typeof expiresIn === 'number') {
       identity.access_token_expires_at = Math.floor(Date.now() / 1000 + expiresIn);
     }
     // login2 响应含 new_cert 时（证书过半自动续期），暂存待验证
     const newCert = authResult.new_cert;
-    if (newCert) identity._pending_new_cert = newCert;
+    if (typeof newCert === 'string' && newCert) identity._pending_new_cert = newCert;
   }
 
   /** 验证服务端返回的 new_cert，通过后正式接受 */
   private async _validateNewCert(
-    identity: Record<string, unknown>,
+    identity: IdentityRecord,
     gatewayUrl: string = '',
   ): Promise<void> {
     const newCertPem = identity._pending_new_cert;
@@ -1306,7 +1327,7 @@ export class AuthFlow {
   }
 
   /** 获取缓存的有效 access_token */
-  private _getCachedAccessToken(identity: Record<string, unknown>): string {
+  private _getCachedAccessToken(identity: IdentityRecord): string {
     const accessToken = String(identity.access_token ?? '');
     if (!accessToken) return '';
     const expiresAt = identity.access_token_expires_at;
@@ -1318,22 +1339,37 @@ export class AuthFlow {
 
   // ── 内部方法：身份管理 ────────────────────────────
 
+  // AID name 验证：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
+  private static readonly _AID_NAME_RE = /^[a-z0-9_][a-z0-9_-]{3,63}$/;
+
+  private static _validateAidName(aid: string): void {
+    const name = aid.includes('.') ? aid.split('.')[0] : aid;
+    if (!AuthFlow._AID_NAME_RE.test(name)) {
+      throw new ValidationError(
+        `Invalid AID name '${name}': must be 4-64 characters, only [a-z0-9_-], cannot start with '-'`,
+      );
+    }
+    if (name.startsWith('guest')) {
+      throw new ValidationError("AID name must not start with 'guest'");
+    }
+  }
+
   /** 确保本地有密钥对（没有则生成） */
-  private async _ensureLocalIdentity(aid: string): Promise<Record<string, unknown>> {
+  private async _ensureLocalIdentity(aid: string): Promise<IdentityRecord> {
     const existing = await this._keystore.loadIdentity(aid);
     if (existing) {
       this._aid = aid;
       return existing;
     }
-    const identity = await this._crypto.generateIdentity();
-    (identity as Record<string, unknown>).aid = aid;
-    await this._keystore.saveIdentity(aid, identity as Record<string, unknown>);
+    const identity = await this._crypto.generateIdentity() as IdentityRecord;
+    identity.aid = aid;
+    await this._keystore.saveIdentity(aid, identity);
     this._aid = aid;
-    return identity as Record<string, unknown>;
+    return identity;
   }
 
   /** 加载身份，不存在时抛出异常 */
-  private async _loadIdentityOrRaise(aid?: string): Promise<Record<string, unknown>> {
+  private async _loadIdentityOrRaise(aid?: string): Promise<IdentityRecord> {
     const requestedAid = aid ?? this._aid;
     if (requestedAid) {
       const existing = await this._keystore.loadIdentity(requestedAid);
@@ -1347,17 +1383,17 @@ export class AuthFlow {
   }
 
   /** 确保有身份（无则尝试生成） */
-  private async _ensureIdentity(): Promise<Record<string, unknown>> {
+  private async _ensureIdentity(): Promise<IdentityRecord> {
     try {
       return await this._loadIdentityOrRaise();
     } catch {
       if (!this._aid) {
         throw new StateError('no local identity found, call auth.createAid() first');
       }
-      const identity = await this._crypto.generateIdentity();
-      (identity as Record<string, unknown>).aid = this._aid;
-      await this._keystore.saveIdentity(this._aid, identity as Record<string, unknown>);
-      return identity as Record<string, unknown>;
+      const identity = await this._crypto.generateIdentity() as IdentityRecord;
+      identity.aid = this._aid;
+      await this._keystore.saveIdentity(this._aid, identity);
+      return identity;
     }
   }
 }

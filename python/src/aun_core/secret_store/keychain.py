@@ -41,9 +41,6 @@ class KeychainSecretStore:
         service = self._service(scope)
         password = base64.b64encode(plaintext).decode("ascii")
 
-        # 先尝试删除已有条目（忽略不存在的情况）
-        self._delete(service, name)
-
         subprocess.run(
             [
                 "security", "add-generic-password",
@@ -90,26 +87,7 @@ class KeychainSecretStore:
             return None
         return base64.b64decode(password)
 
-    def clear(self, scope: str, name: str) -> None:
-        self._delete(self._service(scope), name)
-
     # ── 内部方法 ──────────────────────────────────────────
 
     def _service(self, scope: str) -> str:
         return f"{self._SERVICE_PREFIX}:{scope}"
-
-    @staticmethod
-    def _delete(service: str, account: str) -> None:
-        """删除 Keychain 条目，不存在时静默忽略。"""
-        try:
-            subprocess.run(
-                [
-                    "security", "delete-generic-password",
-                    "-s", service,
-                    "-a", account,
-                ],
-                capture_output=True,
-                timeout=10,
-            )
-        except (subprocess.CalledProcessError, OSError):
-            pass  # 平台兼容 fallback

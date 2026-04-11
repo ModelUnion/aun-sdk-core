@@ -73,7 +73,7 @@ def _get_signing_identity(aid: str):
 
 def _make_client(tmp_path, aid=_AID_ALICE):
     """创建一个 mock 好的 AUNClient 用于测试。"""
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = AUNClient({"aun_path": str(tmp_path / "aun"), "sqlite_backup": False})
     client._aid = aid
     client._identity = {"aid": aid, "private_key_pem": "", "cert": ""}
     client._state = "connected"
@@ -279,7 +279,7 @@ class TestKeyRequestAutoResponded:
 class TestConfigGroupE2EEDisabled:
     def test_config_defaults(self, tmp_path):
         """默认 group_e2ee=True（必选能力）"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = AUNClient({"aun_path": str(tmp_path / "aun"), "sqlite_backup": False})
         assert client._config_model.group_e2ee is True
         assert client._config_model.rotate_on_join is False
         assert client._config_model.epoch_auto_rotate_interval == 0
@@ -291,6 +291,7 @@ class TestConfigGroupE2EEDisabled:
             "aun_path": str(tmp_path / "aun"),
             "rotate_on_join": True,
             "epoch_auto_rotate_interval": 86400,
+            "sqlite_backup": False,
         })
         assert client._config_model.group_e2ee is True
         assert client._config_model.rotate_on_join is True
@@ -699,6 +700,7 @@ class TestAutoOrchestrationAddMember:
         client = AUNClient({
             "aun_path": str(tmp_path / "aun"),
             "rotate_on_join": True,
+            "sqlite_backup": False,
         })
         client._aid = _AID_ALICE
         client._identity = {"aid": _AID_ALICE}
@@ -1009,3 +1011,175 @@ class TestKeyRequestFallbackToServer:
 
         # 验证：没有发送响应（Dave 不是成员）
         assert len(sent_messages) == 0
+
+
+# ── 群消息推送管道 ─────────────────────────────────────
+
+class TestGroupMessagePushPipeline:
+    """测试 group.message_created 事件推送管道。"""
+
+    def _make_encrypted_group_msg(self, gs, from_aid=_AID_ALICE, seq=1):
+        pk_pem, _ = _get_signing_identity(from_aid)
+        msg_id = f"gm-{uuid.uuid4()}"
+        ts = 1710504000000
+        envelope = encrypt_group_message(
+            group_id=_GRP, epoch=1, group_secret=gs,
+            payload={"text": "推送消息"}, from_aid=from_aid,
+            message_id=msg_id, timestamp=ts,
+            sender_private_key_pem=pk_pem,
+        )
+        return {
+            "group_id": _GRP,
+            "seq": seq,
+            "from": from_aid,
+            "sender_aid": from_aid,
+            "message_id": msg_id,
+            "timestamp": ts,
+            "payload": envelope,
+            "encrypted": True,
+        }
+
+    def test_push_with_payload_decrypts_and_updates_seq(self, tmp_path):
+        """带 payload 的推送事件：自动解密 + 更新本地游标。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        gs = _store_secret_for_client(client, epoch=1)
+
+        published = []
+        client._dispatcher.subscribe("group.message_created", lambda data: published.append(data))
+
+        msg = self._make_encrypted_group_msg(gs, seq=1)
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._process_and_publish_group_message(msg)
+
+        asyncio.run(run())
+
+        assert len(published) == 1
+        assert published[0]["payload"] == {"text": "推送消息"}
+        assert published[0]["e2ee"]["encryption_mode"] == "epoch_group_key"
+        # 游标更新
+        ns = f"group:{_GRP}"
+        assert client._seq_tracker.get_contiguous_seq(ns) == 1
+        assert client._seq_tracker.get_max_seen_seq(ns) == 1
+
+    def test_push_without_payload_triggers_auto_pull(self, tmp_path):
+        """不带 payload 的通知：触发 auto pull。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        gs = _store_secret_for_client(client, epoch=1)
+
+        published = []
+        client._dispatcher.subscribe("group.message_created", lambda data: published.append(data))
+
+        # mock group.pull 返回
+        pull_msg = self._make_encrypted_group_msg(gs, seq=3)
+        pull_called = {}
+
+        async def fake_call(method, params):
+            if method == "group.pull":
+                pull_called["params"] = params
+                return {"messages": [pull_msg]}
+            return {}
+
+        import types
+        client.call = types.MethodType(lambda self, m, p: fake_call(m, p), client)
+
+        notification = {
+            "module_id": "group",
+            "group_id": _GRP,
+            "seq": 3,
+            "message_id": "gm-notify",
+            "sender_aid": _AID_ALICE,
+            "type": "text",
+        }
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._process_and_publish_group_message(notification)
+
+        asyncio.run(run())
+
+        # 验证 pull 被调用
+        assert "params" in pull_called
+        assert pull_called["params"]["group_id"] == _GRP
+        # 验证 pull 的消息被发布
+        assert len(published) >= 1
+
+    def test_auto_pull_uses_local_cursor(self, tmp_path):
+        """auto pull 使用本地游标 after_message_seq。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        _store_secret_for_client(client, epoch=1)
+        # 模拟已知 seq = 10（通过 seq_tracker 录入 1..10）
+        for s in range(1, 11):
+            client._seq_tracker.on_message_seq(f"group:{_GRP}", s)
+
+        pull_called = {}
+
+        async def fake_call(method, params):
+            if method == "group.pull":
+                pull_called["params"] = params
+                return {"messages": []}
+            return {}
+
+        import types
+        client.call = types.MethodType(lambda self, m, p: fake_call(m, p), client)
+
+        notification = {
+            "group_id": _GRP,
+            "seq": 12,
+            "sender_aid": _AID_ALICE,
+        }
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._auto_pull_group_messages(notification)
+
+        asyncio.run(run())
+
+        assert pull_called["params"]["after_message_seq"] == 10
+
+    def test_seq_tracking_across_push_messages(self, tmp_path):
+        """多条推送消息后 SeqTracker 正确跟踪序列号。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        gs = _store_secret_for_client(client, epoch=1)
+
+        for seq in [1, 3, 5, 2]:  # 无序到达
+            msg = self._make_encrypted_group_msg(gs, seq=seq)
+            asyncio.run(client._process_and_publish_group_message(msg))
+
+        ns = "group:" + _GRP
+        # seq=1 正常推进, seq=3 记入 received, seq=5 记入 received,
+        # seq=2 推进到 2 → received 有 3 → 推到 3（4 缺失停止）
+        assert client._seq_tracker.get_contiguous_seq(ns) == 3
+        assert client._seq_tracker.get_max_seen_seq(ns) == 5
+
+    def test_notification_with_empty_payload_triggers_pull(self, tmp_path):
+        """payload 为空 dict 也视为通知，触发 auto pull。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        _store_secret_for_client(client, epoch=1)
+
+        pull_called = {}
+
+        async def fake_call(method, params):
+            if method == "group.pull":
+                pull_called["called"] = True
+                return {"messages": []}
+            return {}
+
+        import types
+        client.call = types.MethodType(lambda self, m, p: fake_call(m, p), client)
+
+        notification = {
+            "group_id": _GRP,
+            "seq": 1,
+            "sender_aid": _AID_ALICE,
+            "payload": {},  # 空 payload
+        }
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._process_and_publish_group_message(notification)
+
+        asyncio.run(run())
+
+        assert pull_called.get("called") is True

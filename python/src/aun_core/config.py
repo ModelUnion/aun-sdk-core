@@ -8,33 +8,62 @@ from pathlib import Path
 from typing import Any
 
 
-def get_device_id(aun_root: Path | str | None = None) -> str:
+def get_device_id(aun_root: Path | str | None = None, sqlite_backup: Any = None) -> str:
     """获取本设备的稳定 ID。
 
     存储在 ~/.aun/.device_id（或 aun_root/.device_id）。
     首次调用时自动生成并持久化，后续调用返回同一值。
     同一台机器上所有 SDK 实例共享同一个 device_id。
+    支持 SQLite 备份：文件丢失时从 SQLite 恢复。
     """
     root = Path(aun_root) if aun_root else Path.home() / ".aun"
     root.mkdir(parents=True, exist_ok=True)
     device_id_path = root / ".device_id"
+    device_id: str | None = None
+    source = ""
 
+    # 1. 先读文件
     if device_id_path.exists():
         try:
             stored = device_id_path.read_text(encoding="utf-8").strip()
             if stored:
-                return stored
+                device_id = stored
+                source = "file"
         except OSError:
-            pass  # 平台兼容 fallback
+            pass
 
-    new_id = str(uuid.uuid4())
-    try:
-        device_id_path.write_text(new_id, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(device_id_path, 0o600)
-    except OSError:
-        pass  # 平台兼容 fallback
-    return new_id
+    # 2. 文件没有 → 读 SQLite
+    if device_id is None and sqlite_backup:
+        restored = sqlite_backup.restore_device_id()
+        if restored:
+            device_id = restored
+            source = "sqlite"
+            try:
+                device_id_path.write_text(device_id, encoding="utf-8")
+                if sys.platform != "win32":
+                    os.chmod(device_id_path, 0o600)
+            except OSError:
+                pass
+
+    # 3. 都没有 → 生成新 ID
+    if device_id is None:
+        device_id = str(uuid.uuid4())
+        source = "new"
+        try:
+            device_id_path.write_text(device_id, encoding="utf-8")
+            if sys.platform != "win32":
+                os.chmod(device_id_path, 0o600)
+        except OSError:
+            pass
+
+    # 双写：确保 SQLite 中也有
+    if sqlite_backup and source != "sqlite":
+        try:
+            sqlite_backup.backup_device_id(device_id)
+        except Exception:
+            pass
+
+    return device_id
 
 
 @dataclass(slots=True)

@@ -21,6 +21,13 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
+type structuredGroupKeyStore interface {
+	LoadGroupSecretState(aid, groupID string) (map[string]any, error)
+	LoadAllGroupSecretStates(aid string) (map[string]map[string]any, error)
+	SaveGroupSecretState(aid, groupID string, entry map[string]any) error
+	CleanupGroupOldEpochsState(aid, groupID string, cutoffMs int64) (int, error)
+}
+
 // ── 群组 AAD 字段 ──────────────────────────────────────────
 
 var (
@@ -33,6 +40,104 @@ var (
 		"epoch", "encryption_mode", "suite",
 	}
 )
+
+func loadKeyStoreGroupState(ks keystore.KeyStore, aid, groupID string) map[string]any {
+	if structured, ok := ks.(structuredGroupKeyStore); ok {
+		entry, err := structured.LoadGroupSecretState(aid, groupID)
+		if err == nil {
+			return entry
+		}
+	}
+	metadata, err := ks.LoadMetadata(aid)
+	if err != nil || metadata == nil {
+		return nil
+	}
+	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
+	entry, _ := groupSecrets[groupID].(map[string]any)
+	return entry
+}
+
+func loadAllKeyStoreGroupStates(ks keystore.KeyStore, aid string) map[string]map[string]any {
+	if structured, ok := ks.(structuredGroupKeyStore); ok {
+		entries, err := structured.LoadAllGroupSecretStates(aid)
+		if err == nil {
+			return entries
+		}
+	}
+	metadata, err := ks.LoadMetadata(aid)
+	if err != nil || metadata == nil {
+		return nil
+	}
+	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
+	result := make(map[string]map[string]any, len(groupSecrets))
+	for groupID, raw := range groupSecrets {
+		if entry, ok := raw.(map[string]any); ok {
+			result[groupID] = entry
+		}
+	}
+	return result
+}
+
+func saveKeyStoreGroupState(ks keystore.KeyStore, aid, groupID string, entry map[string]any) error {
+	if structured, ok := ks.(structuredGroupKeyStore); ok {
+		return structured.SaveGroupSecretState(aid, groupID, entry)
+	}
+	_, err := updateKeyStoreMetadata(ks, aid, func(metadata map[string]any) (map[string]any, error) {
+		groupSecrets, _ := metadata["group_secrets"].(map[string]any)
+		if groupSecrets == nil {
+			groupSecrets = make(map[string]any)
+		}
+		groupSecrets[groupID] = copyMapShallow(entry)
+		metadata["group_secrets"] = groupSecrets
+		return metadata, nil
+	})
+	return err
+}
+
+func cleanupKeyStoreGroupOldEpochs(ks keystore.KeyStore, aid, groupID string, cutoffMs int64) int {
+	if structured, ok := ks.(structuredGroupKeyStore); ok {
+		removed, err := structured.CleanupGroupOldEpochsState(aid, groupID, cutoffMs)
+		if err == nil {
+			return removed
+		}
+		return 0
+	}
+
+	removed := 0
+	_, err := updateKeyStoreMetadata(ks, aid, func(metadata map[string]any) (map[string]any, error) {
+		groupSecrets, _ := metadata["group_secrets"].(map[string]any)
+		entry, _ := groupSecrets[groupID].(map[string]any)
+		if entry == nil {
+			return metadata, nil
+		}
+
+		oldEpochs, _ := entry["old_epochs"].([]any)
+		if len(oldEpochs) == 0 {
+			return metadata, nil
+		}
+
+		remaining := make([]any, 0, len(oldEpochs))
+		for _, raw := range oldEpochs {
+			old, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			updatedAt := toInt64(old["updated_at"])
+			if updatedAt >= cutoffMs {
+				remaining = append(remaining, old)
+			}
+		}
+		removed = len(oldEpochs) - len(remaining)
+		if removed > 0 {
+			entry["old_epochs"] = remaining
+		}
+		return metadata, nil
+	})
+	if err != nil {
+		return 0
+	}
+	return removed
+}
 
 // ── 群组消息加密（纯函数）──────────────────────────────────
 
@@ -467,17 +572,7 @@ func GenerateGroupSecret() []byte {
 // 拒绝低于本地最新 epoch 的写入（防降级攻击）
 // 返回 (true, nil) 已存储; (false, nil) epoch 降级被拒; (false, err) 存储出错
 func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string) (bool, error) {
-	metadata, _ := ks.LoadMetadata(aid)
-	if metadata == nil {
-		metadata = make(map[string]any)
-	}
-	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-	if groupSecrets == nil {
-		groupSecrets = make(map[string]any)
-	}
-	existing, _ := groupSecrets[groupID].(map[string]any)
-
-	// epoch 降级防护
+	existing := loadKeyStoreGroupState(ks, aid, groupID)
 	if existing != nil {
 		localEpoch := int(toInt64(existing["epoch"]))
 		if epoch < localEpoch {
@@ -485,15 +580,17 @@ func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, grou
 		}
 	}
 
-	// 旧 epoch 移入 old_epochs
-	if existing != nil && int(toInt64(existing["epoch"])) != epoch {
+	if existing == nil {
+		existing = make(map[string]any)
+	}
+	if int(toInt64(existing["epoch"])) != 0 && int(toInt64(existing["epoch"])) != epoch {
 		oldEpochs, _ := existing["old_epochs"].([]any)
 		oldEntry := map[string]any{
-			"epoch":      existing["epoch"],
-			"secret":     existing["secret"],
-			"commitment": existing["commitment"],
+			"epoch":       existing["epoch"],
+			"secret":      existing["secret"],
+			"commitment":  existing["commitment"],
 			"member_aids": existing["member_aids"],
-			"updated_at": existing["updated_at"],
+			"updated_at":  existing["updated_at"],
 		}
 		if sp, ok := existing["secret_protection"]; ok {
 			oldEntry["secret_protection"] = sp
@@ -507,12 +604,8 @@ func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, grou
 	copy(sorted, memberAIDs)
 	sort.Strings(sorted)
 
-	var prevOldEpochs []any
-	if existing != nil {
-		prevOldEpochs, _ = existing["old_epochs"].([]any)
-	}
-
-	groupSecrets[groupID] = map[string]any{
+	prevOldEpochs, _ := existing["old_epochs"].([]any)
+	entry := map[string]any{
 		"epoch":       epoch,
 		"secret":      base64.StdEncoding.EncodeToString(groupSecret),
 		"commitment":  commitment,
@@ -520,9 +613,7 @@ func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, grou
 		"updated_at":  nowMs,
 		"old_epochs":  prevOldEpochs,
 	}
-	metadata["group_secrets"] = groupSecrets
-
-	if err := ks.SaveMetadata(aid, metadata); err != nil {
+	if err := saveKeyStoreGroupState(ks, aid, groupID, entry); err != nil {
 		return false, fmt.Errorf("保存 group_secret 失败: %w", err)
 	}
 	return true, nil
@@ -531,12 +622,7 @@ func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, grou
 // LoadGroupSecret 加载 group_secret
 // epoch=nil 时返回最新 epoch；指定 epoch 时先查当前再查 old_epochs
 func LoadGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch *int) (map[string]any, error) {
-	metadata, err := ks.LoadMetadata(aid)
-	if err != nil || metadata == nil {
-		return nil, err
-	}
-	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-	entry, _ := groupSecrets[groupID].(map[string]any)
+	entry := loadKeyStoreGroupState(ks, aid, groupID)
 	if entry == nil {
 		return nil, nil
 	}
@@ -591,12 +677,8 @@ func LoadGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch *int) (map
 // LoadAllGroupSecrets 加载某群组所有 epoch 的 group_secret
 // 返回 {epoch: secretBytes} 映射
 func LoadAllGroupSecrets(ks keystore.KeyStore, aid, groupID string) map[int][]byte {
-	metadata, _ := ks.LoadMetadata(aid)
-	if metadata == nil {
-		return nil
-	}
-	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-	entry, _ := groupSecrets[groupID].(map[string]any)
+	groupSecrets := loadAllKeyStoreGroupStates(ks, aid)
+	entry := groupSecrets[groupID]
 	if entry == nil {
 		return nil
 	}
@@ -631,42 +713,8 @@ func LoadAllGroupSecrets(ks keystore.KeyStore, aid, groupID string) map[int][]by
 
 // CleanupOldEpochs 清理过期的旧 epoch 记录，返回 (清理数量, error)
 func CleanupOldEpochs(ks keystore.KeyStore, aid, groupID string, retentionSeconds int) (int, error) {
-	metadata, err := ks.LoadMetadata(aid)
-	if err != nil || metadata == nil {
-		return 0, err
-	}
-	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-	entry, _ := groupSecrets[groupID].(map[string]any)
-	if entry == nil {
-		return 0, nil
-	}
-
-	oldEpochs, _ := entry["old_epochs"].([]any)
-	if len(oldEpochs) == 0 {
-		return 0, nil
-	}
-
 	cutoffMs := time.Now().UnixMilli() - int64(retentionSeconds)*1000
-	var remaining []any
-	for _, oldRaw := range oldEpochs {
-		old, ok := oldRaw.(map[string]any)
-		if !ok {
-			continue
-		}
-		updatedAt := toInt64(old["updated_at"])
-		if updatedAt >= cutoffMs {
-			remaining = append(remaining, old)
-		}
-	}
-
-	removed := len(oldEpochs) - len(remaining)
-	if removed > 0 {
-		entry["old_epochs"] = remaining
-		if err := ks.SaveMetadata(aid, metadata); err != nil {
-			return 0, err
-		}
-	}
-	return removed, nil
+	return cleanupKeyStoreGroupOldEpochs(ks, aid, groupID, cutoffMs), nil
 }
 
 // ── GroupReplayGuard 群组消息防重放守卫 ──────────────────────

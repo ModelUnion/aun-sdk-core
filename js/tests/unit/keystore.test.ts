@@ -4,15 +4,104 @@ import 'fake-indexeddb/auto';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { IndexedDBKeyStore } from '../../src/keystore/indexeddb.js';
 import { IndexedDBSecretStore } from '../../src/secret-store/indexeddb-store.js';
+import type { JsonObject, MetadataRecord, PrekeyMap } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
+const KEYSTORE_DB_NAME = 'aun-keystore';
+const KEYSTORE_DB_VERSION = 2;
+
+async function withStore<T>(
+  storeName: string,
+  mode: IDBTransactionMode,
+  action: (store: IDBObjectStore, resolve: (value: T) => void, reject: (error: Error) => void) => void,
+): Promise<T> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(KEYSTORE_DB_NAME, KEYSTORE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const upgradedDb = request.result;
+      for (const name of ['key_pairs', 'certs', 'metadata', 'prekeys', 'group_current', 'group_old_epochs']) {
+        if (!upgradedDb.objectStoreNames.contains(name)) {
+          upgradedDb.createObjectStore(name);
+        }
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('打开测试数据库失败'));
+  });
+
+  return new Promise<T>((resolve, reject) => {
+    const tx = db.transaction(storeName, mode);
+    const store = tx.objectStore(storeName);
+    action(store, resolve, reject);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error ?? new Error(`访问 ${storeName} 失败`));
+    };
+    tx.onabort = () => {
+      db.close();
+      reject(tx.error ?? new Error(`访问 ${storeName} 被中止`));
+    };
+  });
+}
+
+async function readStoreRecord(storeName: string, key: string): Promise<JsonObject | null> {
+  return withStore(storeName, 'readonly', (store, resolve, reject) => {
+    const request = store.get(key);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => reject(request.error ?? new Error(`读取 ${storeName}/${key} 失败`));
+  });
+}
+
+async function readStoreItems(storeName: string): Promise<Array<{ key: string; value: JsonObject | null }>> {
+  return withStore(storeName, 'readonly', (store, resolve, reject) => {
+    const valuesReq = store.getAll();
+    const keysReq = store.getAllKeys();
+    valuesReq.onerror = () => reject(valuesReq.error ?? new Error(`读取 ${storeName} values 失败`));
+    keysReq.onerror = () => reject(keysReq.error ?? new Error(`读取 ${storeName} keys 失败`));
+    Promise.all([
+      new Promise<void>((done) => { valuesReq.onsuccess = () => done(); }),
+      new Promise<void>((done) => { keysReq.onsuccess = () => done(); }),
+    ]).then(() => {
+      const values = valuesReq.result ?? [];
+      const keys = keysReq.result ?? [];
+      resolve(keys.map((rawKey, index) => ({
+        key: typeof rawKey === 'string' ? rawKey : String(rawKey),
+        value: values[index],
+      })));
+    }).catch(reject);
+  });
+}
+
+async function writeStoreRecord(storeName: string, key: string, value: JsonObject): Promise<void> {
+  await withStore<void>(storeName, 'readwrite', (store, resolve, reject) => {
+    const request = store.put(value, key);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error(`写入 ${storeName}/${key} 失败`));
+  });
+}
+
+async function clearStore(storeName: string): Promise<void> {
+  await withStore<void>(storeName, 'readwrite', (store, resolve, reject) => {
+    const request = store.clear();
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error(`清空 ${storeName} 失败`));
+  });
+}
+
+async function resetKeystoreDb(): Promise<void> {
+  for (const storeName of ['key_pairs', 'certs', 'metadata', 'prekeys', 'group_current', 'group_old_epochs']) {
+    await clearStore(storeName);
+  }
+}
 
 // ── IndexedDBKeyStore 测试 ──────────────────────────────
 
 describe('IndexedDBKeyStore', () => {
   let ks: IndexedDBKeyStore;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await resetKeystoreDb();
     ks = new IndexedDBKeyStore();
   });
 
@@ -36,14 +125,6 @@ describe('IndexedDBKeyStore', () => {
   it('加载不存在的密钥对应返回 null', async () => {
     const loaded = await ks.loadKeyPair('nonexistent');
     expect(loaded).toBeNull();
-  });
-
-  it('删除密钥对', async () => {
-    await ks.saveKeyPair('alice', { key: 'val' });
-    expect(await ks.loadKeyPair('alice')).not.toBeNull();
-
-    await ks.deleteKeyPair('alice');
-    expect(await ks.loadKeyPair('alice')).toBeNull();
   });
 
   // ── 证书 CRUD ──────────────────────────────────────
@@ -86,6 +167,175 @@ describe('IndexedDBKeyStore', () => {
     expect(loaded!.session_id).toBe('new');
     // e2ee_prekeys 应被自动合并保留
     expect(loaded!.e2ee_prekeys).toEqual({ pk1: { key: 'data' } });
+  });
+
+  it('saveMetadata 只在结构化 store 保存 prekeys 和 group_secrets', async () => {
+    await ks.saveMetadata('alice', {
+      session_id: 'sess-1',
+      e2ee_prekeys: {
+        pk1: { private_key_pem: 'PK1', created_at: 1700000000000 },
+      },
+      group_secrets: {
+        'group-1': {
+          epoch: 2,
+          secret: 'secret-v2',
+          updated_at: 1700000000000,
+          old_epochs: [
+            { epoch: 1, secret: 'secret-v1', updated_at: 1699999999000 },
+          ],
+        },
+      },
+    });
+
+    const rawMetadata = await readStoreRecord('metadata', 'alice');
+    expect(rawMetadata).toEqual({ session_id: 'sess-1' });
+
+    const prekeyItems = await readStoreItems('prekeys');
+    expect(prekeyItems).toHaveLength(1);
+    expect(prekeyItems[0].value).toMatchObject({
+      prekey_id: 'pk1',
+      private_key_pem: 'PK1',
+    });
+
+    const currentGroupItems = await readStoreItems('group_current');
+    expect(currentGroupItems).toHaveLength(1);
+    expect(currentGroupItems[0].value).toMatchObject({
+      group_id: 'group-1',
+      epoch: 2,
+      secret: 'secret-v2',
+    });
+
+    const oldGroupItems = await readStoreItems('group_old_epochs');
+    expect(oldGroupItems).toHaveLength(1);
+    expect(oldGroupItems[0].value).toMatchObject({
+      group_id: 'group-1',
+      epoch: 1,
+      secret: 'secret-v1',
+    });
+  });
+
+  it('updateMetadata 在并发调用下应保留两个 prekey', async () => {
+    await Promise.all([
+      ks.updateMetadata('alice', metadata => {
+        const prekeys = (metadata.e2ee_prekeys ?? {});
+        metadata.e2ee_prekeys = { ...prekeys, pk1: { private_key_pem: 'PK1' } };
+        return metadata;
+      }),
+      ks.updateMetadata('alice', metadata => {
+        const prekeys = (metadata.e2ee_prekeys ?? {});
+        metadata.e2ee_prekeys = { ...prekeys, pk2: { private_key_pem: 'PK2' } };
+        return metadata;
+      }),
+    ]);
+
+    const loaded = await ks.loadMetadata('alice');
+    expect((loaded!.e2ee_prekeys as PrekeyMap).pk1?.private_key_pem).toBe('PK1');
+    expect((loaded!.e2ee_prekeys as PrekeyMap).pk2?.private_key_pem).toBe('PK2');
+  });
+
+  it('saveIdentity 更新 token 时不应覆盖已有 prekey', async () => {
+    await ks.saveMetadata('identity.aid', {
+      e2ee_prekeys: {
+        pk1: { private_key_pem: 'KEEP_ME' },
+      },
+    });
+
+    await ks.saveIdentity('identity.aid', {
+      aid: 'identity.aid',
+      access_token: 'tok-new',
+      refresh_token: 'rt-new',
+    });
+
+    const loaded = await ks.loadMetadata('identity.aid');
+    const prekeys = loaded!.e2ee_prekeys as PrekeyMap;
+    expect(loaded!.access_token).toBe('tok-new');
+    expect(loaded!.refresh_token).toBe('rt-new');
+    expect(prekeys.pk1.private_key_pem).toBe('KEEP_ME');
+  });
+
+  it('loadMetadata 应迁移旧 metadata 中的结构化字段且仅回收未过期数据', async () => {
+    const now = Date.now();
+    await writeStoreRecord('metadata', 'legacy-aid', {
+      session_id: 'legacy-session',
+      e2ee_prekeys: {
+        keep: { private_key_pem: 'KEEP', created_at: now - 1000 },
+        expired: { private_key_pem: 'DROP', created_at: now - (8 * 24 * 3600 * 1000) },
+      },
+      group_secrets: {
+        'group-1': {
+          epoch: 2,
+          secret: 'group-secret-v2',
+          updated_at: now - 1000,
+          old_epochs: [
+            { epoch: 1, secret: 'group-secret-v1', updated_at: now - 2000 },
+          ],
+        },
+        'group-expired': {
+          epoch: 1,
+          secret: 'expired-group-secret',
+          updated_at: now - (8 * 24 * 3600 * 1000),
+        },
+      },
+    });
+
+    const loaded = await ks.loadMetadata('legacy-aid');
+    expect(loaded).not.toBeNull();
+    expect(loaded!.session_id).toBe('legacy-session');
+    expect(loaded!.e2ee_prekeys).toEqual({
+      keep: { private_key_pem: 'KEEP', created_at: now - 1000 },
+    });
+    expect(loaded!.group_secrets).toEqual({
+      'group-1': {
+        epoch: 2,
+        secret: 'group-secret-v2',
+        updated_at: now - 1000,
+        old_epochs: [
+          { epoch: 1, secret: 'group-secret-v1', updated_at: now - 2000 },
+        ],
+      },
+    });
+
+    const rawMetadata = await readStoreRecord('metadata', 'legacy-aid');
+    expect(rawMetadata).toEqual({ session_id: 'legacy-session' });
+
+    expect(await ks.loadE2EEPrekeys('legacy-aid')).toEqual({
+      keep: { private_key_pem: 'KEEP', created_at: now - 1000 },
+    });
+    expect(await ks.loadAllGroupSecretStates('legacy-aid')).toEqual({
+      'group-1': {
+        epoch: 2,
+        secret: 'group-secret-v2',
+        updated_at: now - 1000,
+        old_epochs: [
+          { epoch: 1, secret: 'group-secret-v1', updated_at: now - 2000 },
+        ],
+      },
+    });
+  });
+
+  it('cleanupE2EEPrekeys 应仅清理超过 7 天且不在最新 7 个里的 prekey', async () => {
+    const now = Date.now();
+    const cutoffMs = now - (7 * 24 * 3600 * 1000);
+
+    for (let i = 0; i < 8; i += 1) {
+      await ks.saveE2EEPrekey('cleanup-aid', `old-${i}`, {
+        private_key_pem: `OLD-${i}`,
+        created_at: cutoffMs - 1000 - (8 - i),
+      });
+    }
+    await ks.saveE2EEPrekey('cleanup-aid', 'current', {
+      private_key_pem: 'CURRENT',
+      created_at: now,
+    });
+
+    const removed = await ks.cleanupE2EEPrekeys('cleanup-aid', cutoffMs, 7);
+    expect(removed.sort()).toEqual(['old-0', 'old-1']);
+
+    const prekeys = await ks.loadE2EEPrekeys('cleanup-aid');
+    expect(Object.keys(prekeys)).toHaveLength(7);
+    expect(prekeys['old-0']).toBeUndefined();
+    expect(prekeys['old-1']).toBeUndefined();
+    expect(prekeys.current.private_key_pem).toBe('CURRENT');
   });
 
   it('加载不存在的 metadata 应返回 null', async () => {
@@ -136,20 +386,6 @@ describe('IndexedDBKeyStore', () => {
 
   it('加载不存在的身份应返回 null', async () => {
     expect(await ks.loadIdentity('nonexistent')).toBeNull();
-  });
-
-  it('deleteIdentity 应清除所有仓库', async () => {
-    await ks.saveIdentity('alice', {
-      private_key_pem: 'pk',
-      cert: 'cert',
-      session_id: 'sess',
-    });
-    expect(await ks.loadIdentity('alice')).not.toBeNull();
-
-    await ks.deleteIdentity('alice');
-    expect(await ks.loadKeyPair('alice')).toBeNull();
-    expect(await ks.loadCert('alice')).toBeNull();
-    expect(await ks.loadMetadata('alice')).toBeNull();
   });
 
   // ── AID 安全化 ──────────────────────────────────────
@@ -208,22 +444,4 @@ describe('IndexedDBSecretStore', () => {
     },
   );
 
-  it.skipIf(!hasSubtleCrypto)(
-    'clear 应使数据不可恢复',
-    async () => {
-      const store = new IndexedDBSecretStore('test-seed');
-      const plaintext = new TextEncoder().encode('data');
-      const record = await store.protect('s', 'k', plaintext);
-      expect(await store.reveal('s', 'k', record)).not.toBeNull();
-
-      await store.clear('s', 'k');
-      // record 仍持有密文，但 clear 只是删除了 IndexedDB 记录
-      // reveal 仍可以从 record 本身解密（因为 record 包含完整密文）
-      // 这是预期行为：clear 清除的是持久化存储，不影响内存中的 record
-      const afterClear = await store.reveal('s', 'k', record);
-      // 如果 record 包含完整密文信息，仍然可以解密
-      // 验证 scheme 仍然能正常工作
-      expect(afterClear).not.toBeNull();
-    },
-  );
 });

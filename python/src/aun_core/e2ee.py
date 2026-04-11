@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hmac as _hmac
 import json
 import logging
@@ -51,6 +52,30 @@ AAD_MATCH_FIELDS_OFFLINE = (
 
 # prekey 私钥本地保留时间（秒）
 PREKEY_RETENTION_SECONDS = 7 * 24 * 3600  # 7 天
+PREKEY_MIN_KEEP_COUNT = 7
+
+
+def _prekey_created_marker(prekey_data: dict[str, Any]) -> int:
+    for key in ("created_at", "updated_at", "expires_at"):
+        marker = prekey_data.get(key)
+        if isinstance(marker, (int, float)):
+            return int(marker)
+    return 0
+
+
+def _latest_prekey_ids(
+    prekeys: dict[str, dict[str, Any]],
+    keep_latest: int,
+) -> set[str]:
+    if keep_latest <= 0:
+        return set()
+    ordered: list[tuple[str, int]] = []
+    for prekey_id, prekey_data in prekeys.items():
+        if not isinstance(prekey_data, dict):
+            continue
+        ordered.append((prekey_id, _prekey_created_marker(prekey_data)))
+    ordered.sort(key=lambda item: (item[1], item[0]), reverse=True)
+    return {prekey_id for prekey_id, _marker in ordered[:keep_latest]}
 
 # ── 群组 E2EE 常量 ──────────────────────────────────────────
 MODE_EPOCH_GROUP_KEY = "epoch_group_key"
@@ -63,6 +88,190 @@ AAD_MATCH_FIELDS_GROUP = (
     "group_id", "from", "message_id",
     "epoch", "encryption_mode", "suite",
 )
+
+
+def _update_keystore_metadata(
+    keystore: Any,
+    aid: str,
+    updater: Any,
+) -> dict[str, Any]:
+    update_fn = getattr(keystore, "update_metadata", None)
+    if callable(update_fn):
+        return update_fn(aid, updater)
+
+    metadata = keystore.load_metadata(aid) or {}
+    working = copy.deepcopy(metadata)
+    updated = updater(working)
+    if updated is None:
+        updated = working
+    keystore.save_metadata(aid, updated)
+    return updated
+
+
+def _load_keystore_prekeys(
+    keystore: Any,
+    aid: str,
+) -> dict[str, dict[str, Any]]:
+    load_fn = getattr(keystore, "load_e2ee_prekeys", None)
+    if callable(load_fn):
+        result = load_fn(aid)
+        return result if isinstance(result, dict) else {}
+    metadata = keystore.load_metadata(aid) or {}
+    prekeys = metadata.get("e2ee_prekeys", {})
+    return prekeys if isinstance(prekeys, dict) else {}
+
+
+def _save_keystore_prekey(
+    keystore: Any,
+    aid: str,
+    prekey_id: str,
+    prekey_data: dict[str, Any],
+) -> None:
+    save_fn = getattr(keystore, "save_e2ee_prekey", None)
+    if callable(save_fn):
+        save_fn(aid, prekey_id, prekey_data)
+        return
+
+    def _store(metadata: dict[str, Any]) -> dict[str, Any]:
+        local_prekeys = metadata.get("e2ee_prekeys", {})
+        local_prekeys[prekey_id] = copy.deepcopy(prekey_data)
+        metadata["e2ee_prekeys"] = local_prekeys
+        return metadata
+
+    _update_keystore_metadata(keystore, aid, _store)
+
+
+def _cleanup_keystore_prekeys(
+    keystore: Any,
+    aid: str,
+    cutoff_ms: int,
+    keep_latest: int = PREKEY_MIN_KEEP_COUNT,
+) -> list[str]:
+    cleanup_fn = getattr(keystore, "cleanup_e2ee_prekeys", None)
+    if callable(cleanup_fn):
+        try:
+            result = cleanup_fn(aid, cutoff_ms, keep_latest)
+        except TypeError:
+            result = cleanup_fn(aid, cutoff_ms)
+        return result if isinstance(result, list) else []
+
+    expired: list[str] = []
+
+    def _cleanup(metadata: dict[str, Any]) -> dict[str, Any]:
+        local_prekeys = metadata.get("e2ee_prekeys", {})
+        if not local_prekeys:
+            return metadata
+        latest_ids = _latest_prekey_ids(local_prekeys, keep_latest)
+        expired.extend(
+            pid for pid, data in local_prekeys.items()
+            if (
+                isinstance(data, dict)
+                and _prekey_created_marker(data) < cutoff_ms
+                and pid not in latest_ids
+            )
+        )
+        for pid in expired:
+            local_prekeys.pop(pid, None)
+        metadata["e2ee_prekeys"] = local_prekeys
+        return metadata
+
+    _update_keystore_metadata(keystore, aid, _cleanup)
+    return expired
+
+
+def _load_keystore_group_state(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+) -> dict[str, Any] | None:
+    load_fn = getattr(keystore, "load_group_secret_state", None)
+    if callable(load_fn):
+        result = load_fn(aid, group_id)
+        return result if isinstance(result, dict) else None
+    metadata = keystore.load_metadata(aid) or {}
+    group_secrets = metadata.get("group_secrets", {})
+    if not isinstance(group_secrets, dict):
+        return None
+    entry = group_secrets.get(group_id)
+    return entry if isinstance(entry, dict) else None
+
+
+def _save_keystore_group_state(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+    entry: dict[str, Any],
+) -> None:
+    save_fn = getattr(keystore, "save_group_secret_state", None)
+    if callable(save_fn):
+        save_fn(aid, group_id, entry)
+        return
+
+    def _store(metadata: dict[str, Any]) -> dict[str, Any]:
+        group_secrets = metadata.setdefault("group_secrets", {})
+        group_secrets[group_id] = copy.deepcopy(entry)
+        metadata["group_secrets"] = group_secrets
+        return metadata
+
+    _update_keystore_metadata(keystore, aid, _store)
+
+
+def _load_all_keystore_group_states(
+    keystore: Any,
+    aid: str,
+) -> dict[str, dict[str, Any]]:
+    load_fn = getattr(keystore, "load_all_group_secret_states", None)
+    if callable(load_fn):
+        result = load_fn(aid)
+        return result if isinstance(result, dict) else {}
+    metadata = keystore.load_metadata(aid) or {}
+    group_secrets = metadata.get("group_secrets", {})
+    return group_secrets if isinstance(group_secrets, dict) else {}
+
+
+def _cleanup_keystore_group_old_epochs(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+    cutoff_ms: int,
+) -> int:
+    cleanup_fn = getattr(keystore, "cleanup_group_old_epochs_state", None)
+    if callable(cleanup_fn):
+        result = cleanup_fn(aid, group_id, cutoff_ms)
+        return int(result or 0)
+
+    removed = 0
+
+    def _cleanup_marker(entry: Any) -> int:
+        if not isinstance(entry, dict):
+            return 0
+        updated_at = entry.get("updated_at")
+        if isinstance(updated_at, (int, float)):
+            return int(updated_at)
+        expires_at = entry.get("expires_at")
+        if isinstance(expires_at, (int, float)):
+            return int(expires_at)
+        return 0
+
+    def _cleanup(metadata: dict[str, Any]) -> dict[str, Any]:
+        nonlocal removed
+        group_secrets = metadata.get("group_secrets", {})
+        entry = group_secrets.get(group_id)
+        if entry is None:
+            return metadata
+
+        old_epochs = entry.get("old_epochs", [])
+        if not old_epochs:
+            return metadata
+
+        remaining = [e for e in old_epochs if _cleanup_marker(e) >= cutoff_ms]
+        removed = len(old_epochs) - len(remaining)
+        if removed > 0:
+            entry["old_epochs"] = remaining
+        return metadata
+
+    _update_keystore_metadata(keystore, aid, _cleanup)
+    return removed
 
 
 class E2EEManager:
@@ -279,16 +488,17 @@ class E2EEManager:
         cert = x509.load_pem_x509_certificate(
             peer_cert_pem if isinstance(peer_cert_pem, bytes) else peer_cert_pem.encode("utf-8")
         )
+        expected_cert_fingerprint = str(prekey.get("cert_fingerprint", "") or "").strip().lower()
+        if expected_cert_fingerprint:
+            actual_cert_fingerprint = self._certificate_sha256_fingerprint(cert)
+            if actual_cert_fingerprint != expected_cert_fingerprint:
+                raise E2EEError("prekey cert fingerprint mismatch")
         peer_identity_public = cert.public_key()
 
         # 验证 prekey 签名（支持含/不含 created_at 的格式）
         created_at = prekey.get("created_at")
         if created_at is not None:
             sign_data = f"{prekey['prekey_id']}|{prekey['public_key']}|{created_at}".encode("utf-8")
-            # 检查 prekey 年龄（默认 30 天）
-            age_ms = int(_time_mod.time() * 1000) - int(created_at)
-            if age_ms > 30 * 24 * 3600 * 1000:
-                raise E2EEError(f"prekey too old: {age_ms // 1000}s")
         else:
             sign_data = f"{prekey['prekey_id']}|{prekey['public_key']}".encode("utf-8")
         signature_bytes = base64.b64decode(prekey["signature"])
@@ -707,7 +917,8 @@ class E2EEManager:
     def generate_prekey(self) -> dict[str, Any]:
         """生成 prekey 材料并保存私钥到本地 keystore。
 
-        返回 dict 包含 prekey_id、public_key、signature，可直接用于 RPC 上传。
+        返回 dict 包含 prekey_id、public_key、signature、created_at。
+        如果本地 identity 已携带证书，也会附带 cert_fingerprint。
         调用方负责调 transport.call("message.e2ee.put_prekey", result) 上传。
         """
         keystore = self._keystore()
@@ -737,46 +948,41 @@ class E2EEManager:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         ).decode("utf-8")
-
-        metadata = keystore.load_metadata(aid) or {}
-        local_prekeys = metadata.get("e2ee_prekeys", {})
-        local_prekeys[prekey_id] = {
-            "private_key_pem": private_key_pem,
-            "created_at": now_ms,
-        }
-        metadata["e2ee_prekeys"] = local_prekeys
-        keystore.save_metadata(aid, metadata)
+        _save_keystore_prekey(
+            keystore,
+            aid,
+            prekey_id,
+            {
+                "private_key_pem": private_key_pem,
+                "created_at": now_ms,
+                "updated_at": now_ms,
+            },
+        )
 
         # 内存缓存私钥（即使磁盘 metadata 被覆盖也不丢）
         self._local_prekey_cache[prekey_id] = private_key
 
-        # 清理过期的旧 prekey 私钥
+        # 清理超过保留窗口且不在最新 7 个内的旧 prekey 私钥
         self._cleanup_expired_prekeys(keystore, aid)
 
-        return {
+        result = {
             "prekey_id": prekey_id,
             "public_key": public_key_b64,
             "signature": signature,
             "created_at": now_ms,
         }
+        cert_fingerprint = self._local_cert_sha256_fingerprint()
+        if cert_fingerprint:
+            result["cert_fingerprint"] = cert_fingerprint
+        return result
 
     def _cleanup_expired_prekeys(self, keystore: Any, aid: str) -> None:
-        """清理本地过期的 prekey 私钥"""
-        metadata = keystore.load_metadata(aid) or {}
-        local_prekeys = metadata.get("e2ee_prekeys", {})
-        if not local_prekeys:
-            return
-
+        """清理本地超过保留窗口且不在最新 7 个内的 prekey 私钥"""
         now_ms = int(_time_mod.time() * 1000)
         cutoff_ms = now_ms - PREKEY_RETENTION_SECONDS * 1000
-        expired = [pid for pid, data in local_prekeys.items()
-                   if data.get("created_at", 0) < cutoff_ms]
-        if expired:
-            for pid in expired:
-                del local_prekeys[pid]
-                self._local_prekey_cache.pop(pid, None)  # 同步清理内存缓存
-            metadata["e2ee_prekeys"] = local_prekeys
-            keystore.save_metadata(aid, metadata)
+        expired = _cleanup_keystore_prekeys(keystore, aid, cutoff_ms, PREKEY_MIN_KEEP_COUNT)
+        for pid in expired:
+            self._local_prekey_cache.pop(pid, None)  # 同步清理内存缓存
 
     def _load_prekey_private_key(self, keystore: Any, prekey_id: str) -> ec.EllipticCurvePrivateKey | None:
         """从内存缓存或 keystore 加载 prekey 私钥"""
@@ -788,8 +994,7 @@ class E2EEManager:
         aid = self._current_aid()
         if not aid:
             return None
-        metadata = keystore.load_metadata(aid) or {}
-        prekeys = metadata.get("e2ee_prekeys", {})
+        prekeys = _load_keystore_prekeys(keystore, aid)
         prekey_data = prekeys.get(prekey_id)
         if not prekey_data:
             return None
@@ -834,6 +1039,14 @@ class E2EEManager:
 
     def _local_cert_fingerprint(self) -> str:
         return self._local_identity_fingerprint()
+
+    def _local_cert_sha256_fingerprint(self) -> str:
+        identity = self._identity_fn()
+        cert_pem = identity.get("cert")
+        if isinstance(cert_pem, str) and cert_pem:
+            cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+            return self._certificate_sha256_fingerprint(cert)
+        return ""
 
     def _sign_bytes(self, data: bytes) -> str:
         identity = self._identity_fn()
@@ -883,6 +1096,10 @@ class E2EEManager:
         digest = hashes.Hash(hashes.SHA256())
         digest.update(der)
         return f"sha256:{digest.finalize().hex()}"
+
+    @staticmethod
+    def _certificate_sha256_fingerprint(cert: x509.Certificate) -> str:
+        return f"sha256:{cert.fingerprint(hashes.SHA256()).hex()}"
 
     # ── 内部工具 ─────────────────────────────────────────────
 
@@ -1260,49 +1477,42 @@ def store_group_secret(
     commitment: str,
     member_aids: list[str],
 ) -> bool:
-    """存储 group_secret 到 keystore metadata。
+    """存储 group_secret 到 keystore。
 
-    如果已有旧 epoch，将旧的移入 old_epochs 列表。
-    拒绝低于本地最新 epoch 的写入（防止降级攻击）。
-    返回 True 表示已存储，False 表示被拒绝（epoch 降级）。
+    sqlite 主存时按 group_id 独立存取；自定义 keystore 未实现结构化接口时回退到 metadata。
     """
-    metadata = keystore.load_metadata(aid) or {}
-    group_secrets = metadata.setdefault("group_secrets", {})
-    existing = group_secrets.get(group_id)
-
-    # epoch 降级防护：拒绝低于本地最新 epoch 的写入
+    existing = _load_keystore_group_state(keystore, aid, group_id)
     if existing and existing.get("epoch") is not None:
         local_epoch = existing["epoch"]
         if epoch < local_epoch:
             return False
 
-    # 旧 epoch 移入 old_epochs
+    old_epochs = copy.deepcopy(existing.get("old_epochs", [])) if isinstance(existing, dict) else []
+    now_ms = int(_time_mod.time() * 1000)
     if existing and existing.get("epoch") != epoch:
-        old_epochs = existing.get("old_epochs", [])
         old_entry = {
             "epoch": existing.get("epoch"),
             "secret": existing.get("secret"),
             "commitment": existing.get("commitment"),
             "member_aids": existing.get("member_aids"),
             "updated_at": existing.get("updated_at"),
+            "expires_at": int(existing.get("updated_at", now_ms)) + OLD_EPOCH_RETENTION_SECONDS * 1000,
         }
-        # 保留 secret_protection（如果存在，来自 restore）
-        if "secret_protection" in existing:
-            old_entry["secret_protection"] = existing["secret_protection"]
         old_epochs.append(old_entry)
-        existing["old_epochs"] = old_epochs
 
-    now_ms = int(_time_mod.time() * 1000)
-    group_secrets[group_id] = {
-        "epoch": epoch,
-        "secret": base64.b64encode(group_secret).decode("ascii"),
-        "commitment": commitment,
-        "member_aids": sorted(member_aids),
-        "updated_at": now_ms,
-        "old_epochs": (existing or {}).get("old_epochs", []),
-    }
-    metadata["group_secrets"] = group_secrets
-    keystore.save_metadata(aid, metadata)
+    _save_keystore_group_state(
+        keystore,
+        aid,
+        group_id,
+        {
+            "epoch": epoch,
+            "secret": base64.b64encode(group_secret).decode("ascii"),
+            "commitment": commitment,
+            "member_aids": sorted(member_aids),
+            "updated_at": now_ms,
+            "old_epochs": old_epochs,
+        },
+    )
     return True
 
 def load_group_secret(
@@ -1317,9 +1527,7 @@ def load_group_secret(
     指定 epoch 时先查当前，再查 old_epochs。
     返回的 dict 包含 epoch, secret(bytes), commitment, member_aids。
     """
-    metadata = keystore.load_metadata(aid) or {}
-    group_secrets = metadata.get("group_secrets", {})
-    entry = group_secrets.get(group_id)
+    entry = _load_keystore_group_state(keystore, aid, group_id)
     if entry is None:
         return None
 
@@ -1359,9 +1567,7 @@ def load_all_group_secrets(
 
     返回 {epoch: secret_bytes} 映射，可直接传入 decrypt_group_message。
     """
-    metadata = keystore.load_metadata(aid) or {}
-    group_secrets = metadata.get("group_secrets", {})
-    entry = group_secrets.get(group_id)
+    entry = _load_keystore_group_state(keystore, aid, group_id)
     if entry is None:
         return {}
 
@@ -1385,25 +1591,8 @@ def cleanup_old_epochs(
     retention_seconds: int = OLD_EPOCH_RETENTION_SECONDS,
 ) -> int:
     """清理过期的旧 epoch 记录。返回清理数量。"""
-    metadata = keystore.load_metadata(aid) or {}
-    group_secrets = metadata.get("group_secrets", {})
-    entry = group_secrets.get(group_id)
-    if entry is None:
-        return 0
-
-    old_epochs = entry.get("old_epochs", [])
-    if not old_epochs:
-        return 0
-
     cutoff_ms = int(_time_mod.time() * 1000) - retention_seconds * 1000
-    remaining = [e for e in old_epochs if e.get("updated_at", 0) >= cutoff_ms]
-    removed = len(old_epochs) - len(remaining)
-
-    if removed > 0:
-        entry["old_epochs"] = remaining
-        keystore.save_metadata(aid, metadata)
-
-    return removed
+    return _cleanup_keystore_group_old_epochs(keystore, aid, group_id, cutoff_ms)
 
 
 class GroupReplayGuard:
@@ -1804,7 +1993,7 @@ class GroupE2EEManager:
             sender_private_key_pem=sender_pk_pem,
         )
 
-    def decrypt(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def decrypt(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any] | None:
         """解密单条群消息。内置防重放 + 发送方验签 + 外层字段校验。非加密消息原样返回。"""
         payload = message.get("payload")
         if not isinstance(payload, dict) or payload.get("type") != "e2ee.group_encrypted":
@@ -1816,7 +2005,7 @@ class GroupE2EEManager:
         aad = payload.get("aad")
         aad_msg_id = aad.get("message_id", "") if isinstance(aad, dict) else ""
         msg_id = aad_msg_id or message.get("message_id", "")
-        if group_id and sender and msg_id:
+        if not skip_replay and group_id and sender and msg_id:
             if self._replay_guard.is_seen(group_id, sender, msg_id):
                 return message
 
@@ -1839,15 +2028,15 @@ class GroupE2EEManager:
         result = decrypt_group_message(message, all_secrets, sender_cert_pem=sender_cert_pem)
 
         # 解密成功后，使用 AAD 内 message_id 记录防重放
-        if result is not None:
+        if result is not None and not skip_replay:
             # 从解密结果确认 AAD message_id
             final_msg_id = aad_msg_id or message.get("message_id", "")
             if group_id and sender and final_msg_id:
                 self._replay_guard.record(group_id, sender, final_msg_id)
         return result
 
-    def decrypt_batch(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [self.decrypt(m) or m for m in messages]
+    def decrypt_batch(self, messages: list[dict[str, Any]], *, skip_replay: bool = False) -> list[dict[str, Any]]:
+        return [self.decrypt(m, skip_replay=skip_replay) or m for m in messages]
 
     # ── 密钥协议消息处理 ──────────────────────────────────
 

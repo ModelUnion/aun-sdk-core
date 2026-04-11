@@ -1,7 +1,14 @@
 // ── 事件调度器 ──────────────────────────────────────────
 
+import type { JsonValue } from './types.js';
+
 /** 事件处理函数类型 */
-export type EventHandler = (payload: unknown) => void | Promise<void>;
+export type EventPayload =
+  | JsonValue
+  | Error
+  | { [key: string]: JsonValue | Error };
+
+export type EventHandler = (payload: EventPayload) => void | Promise<void>;
 
 /** 订阅句柄，调用 unsubscribe() 取消监听 */
 export class Subscription {
@@ -49,7 +56,7 @@ export class EventDispatcher {
   }
 
   /** 发布事件（依次调用所有处理函数，支持异步） */
-  async publish(event: string, payload: unknown): Promise<void> {
+  async publish(event: string, payload: EventPayload): Promise<void> {
     const handlers = [...(this._handlers.get(event) ?? [])];
     for (const handler of handlers) {
       try {
