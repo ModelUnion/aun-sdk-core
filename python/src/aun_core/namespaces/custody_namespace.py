@@ -55,18 +55,27 @@ class CustodyNamespace:
             "no access_token available: call auth.authenticate() first"
         )
 
-    async def send_code(self, *, phone: str) -> dict[str, Any]:
-        """发送手机验证码（绑定场景）。需要先 AID 登录。
+    async def send_code(self, *, phone: str, aid: str | None = None) -> dict[str, Any]:
+        """发送手机验证码。
+
+        绑定场景：不传 aid，需要先 AID 登录。
+        恢复场景：传 aid，不需要登录，但手机号必须已绑定该 AID。
 
         Args:
             phone: E.164 格式手机号（如 "+8613800138000"）
+            aid: 恢复场景传入要恢复的 AID，绑定场景不传
 
         Returns:
             包含 request_id, phone, expires_in_seconds, debug_code 的字典
         """
         url = f"{self._get_custody_url()}/custody/accounts/send-code"
-        token = self._get_access_token()
-        return await self._post(url, {"phone": phone}, token=token)
+        body: dict[str, Any] = {"phone": phone}
+        token: str | None = None
+        if aid:
+            body["aid"] = aid
+        else:
+            token = self._get_access_token()
+        return await self._post(url, body, token=token)
 
     async def bind_phone(
         self,

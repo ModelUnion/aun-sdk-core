@@ -22,19 +22,31 @@ AID Custody 是 AUN AP 提供的**可选增值服务**，不属于 AUN 协议本
 
 ## send-code
 
-发送手机号验证码（用于绑定场景）。
+发送手机号验证码，支持两种场景：
+
+- **绑定场景**：携带 `aun_token`，不传 `aid`。手机号必须未绑定过此 AID。
+- **恢复场景**：不携带 token，传 `aid`。手机号必须已绑定此 AID。
 
 ### 请求
 
 ```
 POST /custody/accounts/send-code
-Authorization: Bearer <aun_token>
+Authorization: Bearer <aun_token>   （绑定场景必填，恢复场景不传）
 Content-Type: application/json
 ```
 
+绑定场景：
 ```json
 {
     "phone": "+8613800138000"
+}
+```
+
+恢复场景：
+```json
+{
+    "phone": "+8613800138000",
+    "aid": "alice.aid.com"
 }
 ```
 
@@ -43,6 +55,7 @@ Content-Type: application/json
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `phone` | string | 是 | E.164 格式手机号（如 `+8613800138000`） |
+| `aid` | string | 否 | 恢复场景传入要恢复的 AID。传了 aid 则不需要 token |
 
 ### 响应
 
@@ -69,6 +82,7 @@ Content-Type: application/json
 | HTTP 状态 | 错误码 | 说明 |
 |-----------|--------|------|
 | 400 | `invalid_phone` | 手机号格式无效 |
+| 403 | `phone_not_bound` | 恢复场景：手机号未绑定此 AID |
 | 429 | `code_rate_limited` | 发送冷却时间未到 |
 | 429 | `rate_limited` | 请求频率超限 |
 
@@ -215,7 +229,11 @@ AID 通过 auth 模块登录后获得的 ES256 JWT，通过 `Authorization: Bear
 
 - **签发方：** auth 模块（`iss=kite-identity`）
 - **验证方：** custody 服务用 auth 公钥本地 ES256 验签
-- **用途：** `send-code` 和 `bind-phone` 端点需要 aun_token 证明 AID 身份
+- **用途：** `send-code`（绑定场景）和 `bind-phone` 端点需要 aun_token 证明 AID 身份
+
+### send-code 恢复场景无需认证
+
+`send-code` 传入 `aid` 参数时进入恢复模式，不需要 token，但服务端会校验手机号已绑定该 AID。
 
 ### restore-phone 无需认证
 
@@ -228,7 +246,7 @@ AID 通过 auth 模块登录后获得的 ES256 JWT，通过 `Authorization: Bear
 Python SDK 通过 `AUNClient.custody` namespace 提供便捷方法：
 
 ```python
-# 发送绑定验证码（需先 AID 登录）
+# 绑定场景：发送验证码（需先 AID 登录）
 result = await client.custody.send_code(phone="+8613800138000")
 
 # 绑定手机号 + 备份（需 AID 登录 + 验证码）
@@ -239,6 +257,9 @@ result = await client.custody.bind_phone(
     key=encrypted_key,
     metadata={"encryption": "aes-256-gcm"}
 )
+
+# 恢复场景：发送验证码（无需登录，传 aid）
+result = await client.custody.send_code(phone="+8613800138000", aid="alice.aid.com")
 
 # 手机号恢复（无需登录）
 result = await client.custody.restore_phone(
