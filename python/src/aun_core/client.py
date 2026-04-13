@@ -15,7 +15,7 @@ import aiohttp
 import websockets
 
 from .auth import AuthFlow
-from .config import AUNConfig
+from .config import AUNConfig, normalize_instance_id
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
 from .e2ee import E2EEManager, GroupE2EEManager
@@ -31,6 +31,7 @@ from .errors import (
 from .events import EventDispatcher, Subscription
 from .keystore.file import FileKeyStore
 from .namespaces.auth_namespace import AuthNamespace
+from .namespaces.custody_namespace import CustodyNamespace
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
 
@@ -116,13 +117,51 @@ def _is_group_service_aid(value: Any) -> bool:
     return name == "group" and bool(issuer)
 
 
+def _normalize_delivery_mode_config(
+    raw: Any,
+    *,
+    default_mode: str = "fanout",
+    default_routing: str = "round_robin",
+    default_affinity_ttl_ms: int = 0,
+) -> dict[str, Any]:
+    if isinstance(raw, str):
+        raw = {"mode": raw}
+    elif not isinstance(raw, dict):
+        raw = {}
+    mode = str(raw.get("mode") or default_mode).strip().lower() or "fanout"
+    if mode not in {"fanout", "queue"}:
+        raise ValidationError("delivery_mode must be 'fanout' or 'queue'")
+    default_routing_value = default_routing if mode == "queue" else ""
+    routing = str(raw.get("routing") or default_routing_value).strip().lower()
+    if mode != "queue":
+        routing = ""
+    elif routing not in {"", "round_robin", "sender_affinity"}:
+        raise ValidationError("queue_routing must be 'round_robin' or 'sender_affinity'")
+    if mode == "queue" and not routing:
+        routing = "round_robin"
+    ttl_raw = raw.get("affinity_ttl_ms", default_affinity_ttl_ms if mode == "queue" else 0)
+    try:
+        affinity_ttl_ms = max(0, int(ttl_raw or 0))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("affinity_ttl_ms must be an integer") from exc
+    return {
+        "mode": mode,
+        "routing": routing,
+        "affinity_ttl_ms": affinity_ttl_ms,
+    }
+
+
 class AUNClient:
     """AUN Core SDK — 连接、认证、密钥管理、E2EE。"""
 
     def __init__(self, config: dict | None = None) -> None:
         raw_config = dict(config or {})
         self._config_model = AUNConfig.from_dict(raw_config)
-        self.config = raw_config
+        self.config = {
+            "aun_path": str(self._config_model.aun_path),
+            "root_ca_path": self._config_model.root_ca_path,
+            "seed_password": self._config_model.seed_password,
+        }
         self._aid: str | None = None
         self._identity: dict[str, Any] | None = None
         self._state = "idle"
@@ -139,36 +178,34 @@ class AUNClient:
 
         # E2EE 编排状态（内存缓存，进程退出即清空）
         self._cert_cache: dict[str, _CachedPeerCert] = {}
+        self._peer_prekeys_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._prekey_replenish_inflight: set[str] = set()
         self._prekey_replenished: set[str] = set()
 
-        connection_factory = raw_config.get("connection_factory") or _make_connection_factory(
-            self._config_model.verify_ssl
-        )
-        # SQLite 备份层（仅在未提供自定义 keystore 时创建，可通过 sqlite_backup=False 禁用）
-        sqlite_backup = raw_config.get("sqlite_backup")
-        if sqlite_backup is False:
-            sqlite_backup = None
-        elif raw_config.get("keystore") is None and sqlite_backup is None:
-            from .keystore.sqlite_backup import SQLiteBackup
-            backup_dir = self._config_model.aun_path / ".aun_backup"
-            sqlite_backup = SQLiteBackup(backup_dir / "aun_backup.db")
-        keystore = raw_config.get("keystore") or FileKeyStore(
+        connection_factory = _make_connection_factory(self._config_model.verify_ssl)
+        from .keystore.sqlite_backup import SQLiteBackup
+        backup_dir = self._config_model.aun_path / ".aun_backup"
+        sqlite_backup = SQLiteBackup(backup_dir / "aun_backup.db")
+        keystore = FileKeyStore(
             self._config_model.aun_path,
-            secret_store=raw_config.get("secret_store"),
-            encryption_seed=self._config_model.encryption_seed,
+            encryption_seed=self._config_model.seed_password,
             sqlite_backup=sqlite_backup,
         )
         self._keystore = keystore
         # 获取并缓存 device_id
         from .config import get_device_id
         self._device_id = get_device_id(self._config_model.aun_path, sqlite_backup)
+        self._slot_id = ""
+        self._connect_delivery_mode = _normalize_delivery_mode_config({"mode": "fanout"})
+        self._default_connect_delivery_mode = dict(self._connect_delivery_mode)
         self._auth = AuthFlow(
             keystore=keystore,
-            crypto=raw_config.get("crypto") or CryptoProvider(),
+            crypto=CryptoProvider(),
             aid=None,
+            device_id=self._device_id,
+            slot_id=self._slot_id,
             connection_factory=connection_factory,
-            root_ca_path=raw_config.get("root_ca_path"),
+            root_ca_path=self._config_model.root_ca_path,
             verify_ssl=self._config_model.verify_ssl,
         )
         self._transport = RPCTransport(
@@ -179,6 +216,7 @@ class AUNClient:
         )
         self._e2ee = E2EEManager(
             identity_fn=lambda: self._identity or {},
+            device_id_fn=lambda: self._device_id,
             keystore=keystore,
             replay_window_seconds=self._config_model.replay_window_seconds,
         )
@@ -194,6 +232,7 @@ class AUNClient:
         self._seq_tracker = SeqTracker()
 
         self.auth = AuthNamespace(self)
+        self.custody = CustodyNamespace(self)
 
         # 内部订阅：推送消息自动解密后 re-publish 给用户
         self._dispatcher.subscribe("_raw.message.received", self._on_raw_message_received)
@@ -325,6 +364,7 @@ class AUNClient:
 
         params = dict(params) if params else {}
         self._validate_outbound_call(method, params)
+        self._inject_message_cursor_context(method, params)
 
         # 自动加密：message.send 默认加密（encrypt 默认 True）
         if method == "message.send":
@@ -447,43 +487,72 @@ class AUNClient:
         message_id = params.get("message_id") or str(_uuid.uuid4())
         timestamp = params.get("timestamp") or int(_time.time() * 1000)
 
-        # 获取对方 prekey（可能没有）
-        prekey = await self._fetch_peer_prekey(to_aid)
+        recipient_prekeys = await self._fetch_peer_prekeys(to_aid)
+        self_sync_copies = await self._build_self_sync_copies(
+            logical_to_aid=to_aid,
+            payload=payload,
+            message_id=message_id,
+            timestamp=timestamp,
+        )
 
-        # 有 cert_fingerprint 时按 aid + cert_fingerprint 精确获取；否则回退 active_signing
+        # 仅在确实需要多设备语义时切到 e2ee.multi_device，单设备路径继续兼容旧语义。
+        if not recipient_prekeys or (len(recipient_prekeys) <= 1 and not self_sync_copies):
+            return await self._send_encrypted_single(
+                to_aid=to_aid,
+                payload=payload,
+                message_id=message_id,
+                timestamp=timestamp,
+                prekey=recipient_prekeys[0] if recipient_prekeys else None,
+            )
+
+        recipient_copies = await self._build_recipient_device_copies(
+            to_aid=to_aid,
+            payload=payload,
+            message_id=message_id,
+            timestamp=timestamp,
+            prekeys=recipient_prekeys,
+        )
+        send_params: dict[str, Any] = {
+            "to": to_aid,
+            "payload": {
+                "type": "e2ee.multi_device",
+                "logical_message_id": message_id,
+                "recipient_copies": recipient_copies,
+                "self_copies": self_sync_copies,
+            },
+            "type": "e2ee.multi_device",
+            "encrypted": True,
+            "message_id": message_id,
+            "timestamp": timestamp,
+        }
+        return await self._transport.call("message.send", send_params)
+
+    async def _send_encrypted_single(
+        self,
+        *,
+        to_aid: str,
+        payload: dict[str, Any],
+        message_id: str,
+        timestamp: int,
+        prekey: dict[str, Any] | None = None,
+    ) -> Any:
+        if prekey is None:
+            prekey = await self._fetch_peer_prekey(to_aid)
+
         peer_cert_fingerprint = ""
         if isinstance(prekey, dict):
             peer_cert_fingerprint = str(prekey.get("cert_fingerprint", "") or "").strip().lower()
         peer_cert_pem = await self._fetch_peer_cert(to_aid, peer_cert_fingerprint or None)
 
-        envelope, encrypt_result = self._e2ee.encrypt_outbound(
-            peer_aid=to_aid,
+        envelope, encrypt_result = self._encrypt_copy_payload(
+            logical_to_aid=to_aid,
             payload=payload,
             peer_cert_pem=peer_cert_pem,
             prekey=prekey,
             message_id=message_id,
             timestamp=timestamp,
         )
-        if not encrypt_result.get("encrypted"):
-            raise E2EEError(f"failed to encrypt message to {to_aid}")
-
-        # 严格模式：拒绝无前向保密的降级
-        if self._config_model.require_forward_secrecy and not encrypt_result.get("forward_secrecy"):
-            raise E2EEError(
-                f"forward secrecy required but unavailable for {to_aid} "
-                f"(mode={encrypt_result.get('mode')})"
-            )
-
-        # 降级时发布安全事件
-        if encrypt_result.get("degraded"):
-            try:
-                await self._dispatcher.publish("e2ee.degraded", {
-                    "peer_aid": to_aid,
-                    "mode": encrypt_result.get("mode"),
-                    "reason": encrypt_result.get("degradation_reason"),
-                })
-            except Exception as exc:
-                _client_log.warning("发布 e2ee.degraded 事件失败: %s", exc)
+        self._ensure_encrypt_result(to_aid, encrypt_result)
 
         send_params: dict[str, Any] = {
             "to": to_aid,
@@ -492,9 +561,190 @@ class AUNClient:
             "encrypted": True,
             "message_id": message_id,
             "timestamp": timestamp,
-            "persist": params.get("persist", True),
         }
         return await self._transport.call("message.send", send_params)
+
+    async def _build_recipient_device_copies(
+        self,
+        *,
+        to_aid: str,
+        payload: dict[str, Any],
+        message_id: str,
+        timestamp: int,
+        prekeys: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        recipient_copies: list[dict[str, Any]] = []
+        cert_cache: dict[str, bytes] = {}
+        for prekey in prekeys:
+            device_id = str(prekey.get("device_id") or "").strip()
+            peer_cert_fingerprint = str(prekey.get("cert_fingerprint", "") or "").strip().lower()
+            cache_key = peer_cert_fingerprint or "__default__"
+            peer_cert_pem = cert_cache.get(cache_key)
+            if peer_cert_pem is None:
+                peer_cert_pem = await self._fetch_peer_cert(to_aid, peer_cert_fingerprint or None)
+                cert_cache[cache_key] = peer_cert_pem
+            envelope, encrypt_result = self._encrypt_copy_payload(
+                logical_to_aid=to_aid,
+                payload=payload,
+                peer_cert_pem=peer_cert_pem,
+                prekey=prekey,
+                message_id=message_id,
+                timestamp=timestamp,
+            )
+            self._ensure_encrypt_result(to_aid, encrypt_result)
+            recipient_copies.append({
+                "device_id": device_id,
+                "envelope": envelope,
+            })
+        if not recipient_copies:
+            raise E2EEError(f"no recipient device copies generated for {to_aid}")
+        return recipient_copies
+
+    @staticmethod
+    def _cert_sha256_fingerprint(cert_pem: bytes | str | None) -> str:
+        if not cert_pem:
+            return ""
+        try:
+            from cryptography import x509 as _x509
+            from cryptography.hazmat.primitives import hashes as _hashes
+
+            cert_bytes = cert_pem if isinstance(cert_pem, bytes) else cert_pem.encode("utf-8")
+            cert_obj = _x509.load_pem_x509_certificate(cert_bytes)
+            return "sha256:" + cert_obj.fingerprint(_hashes.SHA256()).hex()
+        except Exception:
+            return ""
+
+    async def _resolve_self_copy_peer_cert(self, cert_fingerprint: str | None = None) -> bytes:
+        """为 self_copies 选择目标设备对应的证书版本。"""
+        my_aid = self._aid
+        if not my_aid:
+            raise E2EEError("self sync copy requires current aid")
+
+        normalized_fp = str(cert_fingerprint or "").strip().lower()
+        identity_cert = (self._identity or {}).get("cert")
+        if isinstance(identity_cert, str) and identity_cert:
+            identity_cert_fp = self._cert_sha256_fingerprint(identity_cert)
+            if not normalized_fp or identity_cert_fp == normalized_fp:
+                return identity_cert.encode("utf-8")
+
+        local_cert = None
+        try:
+            local_cert = self._keystore.load_cert(my_aid, normalized_fp or None)
+        except TypeError:
+            local_cert = self._keystore.load_cert(my_aid)
+        except Exception:
+            local_cert = None
+        if local_cert:
+            return local_cert.encode("utf-8") if isinstance(local_cert, str) else local_cert
+
+        return await self._fetch_peer_cert(my_aid, normalized_fp or None)
+
+    async def _build_self_sync_copies(
+        self,
+        *,
+        logical_to_aid: str,
+        payload: dict[str, Any],
+        message_id: str,
+        timestamp: int,
+    ) -> list[dict[str, Any]]:
+        my_aid = self._aid
+        if not my_aid:
+            return []
+        prekeys = await self._fetch_peer_prekeys(my_aid)
+        if not prekeys:
+            return []
+        copies: list[dict[str, Any]] = []
+        for prekey in prekeys:
+            device_id = str(prekey.get("device_id") or "").strip()
+            if device_id == self._device_id:
+                continue
+            peer_cert_pem = await self._resolve_self_copy_peer_cert(
+                str(prekey.get("cert_fingerprint", "") or "").strip().lower() or None,
+            )
+            envelope, encrypt_result = self._encrypt_copy_payload(
+                logical_to_aid=logical_to_aid,
+                payload=payload,
+                peer_cert_pem=peer_cert_pem,
+                prekey=prekey,
+                message_id=message_id,
+                timestamp=timestamp,
+            )
+            self._ensure_encrypt_result(my_aid, encrypt_result)
+            copies.append({
+                "device_id": device_id,
+                "envelope": envelope,
+            })
+        return copies
+
+    def _encrypt_copy_payload(
+        self,
+        *,
+        logical_to_aid: str,
+        payload: dict[str, Any],
+        peer_cert_pem: bytes,
+        prekey: dict[str, Any] | None,
+        message_id: str,
+        timestamp: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if prekey is not None:
+            try:
+                envelope, _ = self._e2ee._encrypt_with_prekey(
+                    logical_to_aid,
+                    payload,
+                    prekey,
+                    peer_cert_pem,
+                    message_id=message_id,
+                    timestamp=timestamp,
+                )
+                return envelope, {
+                    "encrypted": True,
+                    "forward_secrecy": True,
+                    "mode": "prekey_ecdh_v2",
+                    "degraded": False,
+                }
+            except Exception as exc:
+                _client_log.warning("prekey 加密失败，降级到 long_term_key: %s", exc)
+
+        envelope, _ = self._e2ee._encrypt_with_long_term_key(
+            logical_to_aid,
+            payload,
+            peer_cert_pem,
+            message_id=message_id,
+            timestamp=timestamp,
+        )
+        degraded = prekey is not None
+        return envelope, {
+            "encrypted": True,
+            "forward_secrecy": False,
+            "mode": "long_term_key",
+            "degraded": degraded,
+            "degradation_reason": "prekey_encrypt_failed" if degraded else "no_prekey_available",
+        }
+
+    def _ensure_encrypt_result(self, peer_aid: str, encrypt_result: dict[str, Any]) -> None:
+        if not encrypt_result.get("encrypted"):
+            raise E2EEError(f"failed to encrypt message to {peer_aid}")
+
+        if self._config_model.require_forward_secrecy and not encrypt_result.get("forward_secrecy"):
+            raise E2EEError(
+                f"forward secrecy required but unavailable for {peer_aid} "
+                f"(mode={encrypt_result.get('mode')})"
+            )
+
+        if encrypt_result.get("degraded"):
+            loop = getattr(self, "_loop", None)
+            payload = {
+                "peer_aid": peer_aid,
+                "mode": encrypt_result.get("mode"),
+                "reason": encrypt_result.get("degradation_reason"),
+            }
+            try:
+                if loop and loop.is_running():
+                    loop.create_task(self._dispatcher.publish("e2ee.degraded", payload))
+                else:
+                    _client_log.warning("e2ee.degraded 事件未发布：事件循环未运行")
+            except Exception as exc:
+                _client_log.warning("发布 e2ee.degraded 事件失败: %s", exc)
 
     async def _send_group_encrypted(self, params: dict[str, Any]) -> Any:
         """自动加密并发送群组消息。"""
@@ -805,7 +1055,6 @@ class AUNClient:
                         "to": recovery["to"],
                         "payload": recovery["payload"],
                         "encrypt": True,
-                        "persist": False,
                     })
                 except Exception as _exc:
                     import logging as _logging
@@ -881,7 +1130,6 @@ class AUNClient:
                             "to": requester,
                             "payload": response,
                             "encrypt": True,
-                            "persist": False,
                         })
                     except Exception as exc:
                         _client_log.warning("向 %s 回复群组密钥失败: %s", requester, exc)
@@ -934,19 +1182,35 @@ class AUNClient:
             validated_at=now,
             refresh_after=now + _PEER_CERT_CACHE_TTL,
         )
-        if not cert_fingerprint:
-            # 仅 active_signing 路径写回 keystore，避免旧证书覆盖当前证书
-            try:
-                self._keystore.save_cert(aid, cert_pem)
-            except Exception as exc:
-                _client_log.error("写入证书到 keystore 失败 (aid=%s): %s", aid, exc)
+        try:
+            self._keystore.save_cert(
+                aid,
+                cert_pem,
+                cert_fingerprint=cert_fingerprint,
+                make_active=not bool(cert_fingerprint),
+            )
+        except TypeError:
+            # 兼容旧 keystore 实现：仅 active_signing 路径覆盖主证书
+            if not cert_fingerprint:
+                try:
+                    self._keystore.save_cert(aid, cert_pem)
+                except Exception as exc:
+                    _client_log.error("写入证书到 keystore 失败 (aid=%s): %s", aid, exc)
+        except Exception as exc:
+            _client_log.error("写入证书到 keystore 失败 (aid=%s, fp=%s): %s", aid, cert_fingerprint or "", exc)
         return cert_bytes
 
-    async def _fetch_peer_prekey(self, peer_aid: str) -> dict[str, Any] | None:
-        """获取对方的 prekey（通过 E2EEManager 缓存）"""
+    async def _fetch_peer_prekeys(self, peer_aid: str) -> list[dict[str, Any]]:
+        """获取对方所有设备的 prekey 列表。"""
+        cached_list = self._peer_prekeys_cache.get(peer_aid)
+        if cached_list is not None:
+            items, expire_at = cached_list
+            if time.time() < expire_at:
+                return [dict(item) for item in items]
+            self._peer_prekeys_cache.pop(peer_aid, None)
         cached = self._e2ee.get_cached_prekey(peer_aid)
         if cached is not None:
-            return cached
+            return [cached]
         try:
             result = await self._transport.call("message.e2ee.get_prekey", {"aid": peer_aid})
         except Exception as exc:
@@ -954,14 +1218,50 @@ class AUNClient:
         if not isinstance(result, dict):
             raise ValidationError(f"invalid prekey response for {peer_aid}")
         if result.get("found") is False:
-            return None
-        if result.get("found"):
-            prekey = result.get("prekey")
-            if not isinstance(prekey, dict):
-                raise ValidationError(f"invalid prekey response for {peer_aid}")
+            return []
+
+        device_prekeys = result.get("device_prekeys")
+        if isinstance(device_prekeys, list):
+            normalized: list[dict[str, Any]] = []
+            for item in device_prekeys:
+                if not isinstance(item, dict):
+                    continue
+                prekey_id = str(item.get("prekey_id") or "").strip()
+                public_key = str(item.get("public_key") or "").strip()
+                signature = str(item.get("signature") or "").strip()
+                if not prekey_id or not public_key or not signature:
+                    continue
+                normalized.append(dict(item))
+            if normalized:
+                self._peer_prekeys_cache[peer_aid] = (
+                    [dict(item) for item in normalized],
+                    time.time() + 3600.0,
+                )
+                self._e2ee.cache_prekey(peer_aid, normalized[0])
+                return normalized
+
+        prekey = result.get("prekey")
+        if isinstance(prekey, dict):
+            self._peer_prekeys_cache[peer_aid] = ([dict(prekey)], time.time() + 3600.0)
             self._e2ee.cache_prekey(peer_aid, prekey)
-            return prekey
-        raise ValidationError(f"invalid prekey response for {peer_aid}")
+            return [prekey]
+        if result.get("found"):
+            raise ValidationError(f"invalid prekey response for {peer_aid}")
+        return []
+
+    async def _fetch_peer_prekey(self, peer_aid: str) -> dict[str, Any] | None:
+        """获取对方的单个 prekey（兼容接口，优先返回第一条 device prekey）。"""
+        cached_list = self._peer_prekeys_cache.get(peer_aid)
+        if cached_list is not None:
+            items, expire_at = cached_list
+            if time.time() < expire_at and items:
+                return dict(items[0])
+            self._peer_prekeys_cache.pop(peer_aid, None)
+        cached = self._e2ee.get_cached_prekey(peer_aid)
+        if cached is not None:
+            return cached
+        prekeys = await self._fetch_peer_prekeys(peer_aid)
+        return dict(prekeys[0]) if prekeys else None
 
     async def _upload_prekey(self) -> dict[str, Any]:
         """生成 prekey 并上传到服务端"""
@@ -977,8 +1277,7 @@ class AUNClient:
         本地防重放由 E2EEManager._seen_messages 处理，无需此方法。
         此方法提供跨进程/跨重启的持久化防重放增强。
         """
-        if not self.config.get("server_replay_guard", False):
-            return True
+        return True
         if not message_id:
             return True
 
@@ -1031,8 +1330,15 @@ class AUNClient:
                     continue
                 # 确保发送方证书已缓存（签名验证需要）
                 from_aid = msg.get("from", "")
+                sender_cert_fingerprint = str(
+                    payload.get("sender_cert_fingerprint")
+                    or (payload.get("aad") or {}).get("sender_cert_fingerprint")
+                    or ""
+                ).strip().lower()
                 if from_aid:
-                    cert_ready = await self._ensure_sender_cert_cached(from_aid)
+                    cert_ready = await self._ensure_sender_cert_cached(
+                        from_aid, sender_cert_fingerprint or None,
+                    )
                     if not cert_ready:
                         _client_log.warning("无法获取发送方 %s 的证书，跳过解密", from_aid)
                         result.append(msg)
@@ -1058,12 +1364,19 @@ class AUNClient:
         message_id = message.get("message_id", "")
         from_aid = message.get("from", "")
         encryption_mode = payload.get("encryption_mode", "")
+        sender_cert_fingerprint = str(
+            payload.get("sender_cert_fingerprint")
+            or (payload.get("aad") or {}).get("sender_cert_fingerprint")
+            or ""
+        ).strip().lower()
         if not await self._check_replay_guard(message_id, from_aid, encryption_mode, message):
             return message
 
         # 确保发送方证书已缓存到 keystore（三路 ECDH + 签名验证需要）
         if from_aid:
-            cert_ready = await self._ensure_sender_cert_cached(from_aid)
+            cert_ready = await self._ensure_sender_cert_cached(
+                from_aid, sender_cert_fingerprint or None,
+            )
             if not cert_ready:
                 _client_log.warning("无法获取发送方 %s 的证书，跳过解密", from_aid)
                 return message
@@ -1073,7 +1386,7 @@ class AUNClient:
         self._schedule_prekey_replenish_if_consumed(decrypted)
         return decrypted if decrypted is not None else message
 
-    async def _ensure_sender_cert_cached(self, aid: str) -> bool:
+    async def _ensure_sender_cert_cached(self, aid: str, cert_fingerprint: str | None = None) -> bool:
         """确保发送方证书在本地 keystore 中可用且未过期。
 
         安全要点：不能永久信任旧证书，必须按 TTL 刷新并重新做 PKI 验证
@@ -1082,15 +1395,35 @@ class AUNClient:
         返回 True 表示证书已就绪（PKI 验证通过），False 表示不可用。
         """
         # 内存缓存未过期 → 跳过（_fetch_peer_cert 已做完整 PKI 验证）
-        cache_key = self._cert_cache_key(aid)
+        cache_key = self._cert_cache_key(aid, cert_fingerprint)
         cached = self._cert_cache.get(cache_key)
         if cached and time.time() < cached.refresh_after:
             return True
         try:
+            local_cert = self._keystore.load_cert(aid, cert_fingerprint)
+        except TypeError:
+            local_cert = self._keystore.load_cert(aid)
+        except Exception:
+            local_cert = None
+        if local_cert:
+            now = time.time()
+            cert_bytes = local_cert.encode("utf-8") if isinstance(local_cert, str) else local_cert
+            self._cert_cache[cache_key] = _CachedPeerCert(
+                cert_bytes=cert_bytes,
+                validated_at=now,
+                refresh_after=now + _PEER_CERT_CACHE_TTL,
+            )
+            return True
+        try:
             # _fetch_peer_cert 内部：下载 → 完整 PKI 验证 → 更新内存缓存
-            cert_bytes = await self._fetch_peer_cert(aid)
+            cert_bytes = await self._fetch_peer_cert(aid, cert_fingerprint)
             cert_pem = cert_bytes.decode("utf-8") if isinstance(cert_bytes, bytes) else cert_bytes
-            self._keystore.save_cert(aid, cert_pem)
+            self._keystore.save_cert(
+                aid,
+                cert_pem,
+                cert_fingerprint=cert_fingerprint,
+                make_active=not bool(cert_fingerprint),
+            )
             return True
         except Exception as exc:
             # 刷新失败时：若内存缓存有 PKI 验证过的证书（未过期 × 2 倍 TTL）则继续用
@@ -1099,7 +1432,10 @@ class AUNClient:
                 return True
             # 超出宽限期或从未验证过 → 不可信
             _client_log.warning(
-                "获取发送方 %s 证书失败且无已验证缓存，拒绝信任: %s", aid, exc,
+                "获取发送方 %s 证书失败且无已验证缓存，拒绝信任 (fp=%s): %s",
+                aid,
+                cert_fingerprint or "",
+                exc,
             )
             return False
 
@@ -1150,6 +1486,9 @@ class AUNClient:
         gateway_url = self._resolve_gateway(params)
         self._gateway_url = gateway_url
         self._loop = asyncio.get_running_loop()
+        self._slot_id = str(params.get("slot_id") or "")
+        self._connect_delivery_mode = dict(params.get("delivery_mode") or self._connect_delivery_mode)
+        self._auth.set_instance_context(device_id=self._device_id, slot_id=self._slot_id)
         self._state = "connecting"
         challenge = await self._transport.connect(gateway_url)
         self._state = "authenticating"
@@ -1159,6 +1498,9 @@ class AUNClient:
                 challenge,
                 gateway_url,
                 access_token=params.get("access_token"),
+                device_id=self._device_id,
+                slot_id=self._slot_id,
+                delivery_mode=self._connect_delivery_mode,
             )
             identity = auth_context.get("identity") if isinstance(auth_context, dict) else None
             if isinstance(identity, dict):
@@ -1167,7 +1509,14 @@ class AUNClient:
                 if self._session_params is not None:
                     self._session_params["access_token"] = auth_context.get("token", params.get("access_token"))
         else:
-            await self._auth.initialize_with_token(self._transport, challenge, str(params["access_token"]))
+            await self._auth.initialize_with_token(
+                self._transport,
+                challenge,
+                str(params["access_token"]),
+                device_id=self._device_id,
+                slot_id=self._slot_id,
+                delivery_mode=self._connect_delivery_mode,
+            )
             self._sync_identity_after_connect(str(params["access_token"]))
         self._state = "connected"
         await self._dispatcher.publish("connection.state", {"state": self._state, "gateway": gateway_url})
@@ -1318,6 +1667,29 @@ class AUNClient:
     def _validate_outbound_call(self, method: str, params: dict[str, Any]) -> None:
         if method == "message.send":
             self._validate_message_recipient(params.get("to"))
+            if "persist" in params:
+                raise ValidationError("message.send no longer accepts 'persist'; configure delivery_mode during connect")
+            if "delivery_mode" in params or "queue_routing" in params or "affinity_ttl_ms" in params:
+                raise ValidationError("message.send does not accept delivery_mode; configure delivery_mode during connect")
+        if method == "group.send":
+            if "persist" in params:
+                raise ValidationError("group.send does not accept 'persist'; group messages are always fanout")
+            if "delivery_mode" in params or "queue_routing" in params or "affinity_ttl_ms" in params:
+                raise ValidationError("group.send does not accept delivery_mode; group messages are always fanout")
+
+    def _current_message_delivery_mode(self) -> dict[str, Any]:
+        return dict(self._connect_delivery_mode)
+
+    def _inject_message_cursor_context(self, method: str, params: dict[str, Any]) -> None:
+        if method not in {"message.pull", "message.ack"}:
+            return
+        if "device_id" in params and str(params.get("device_id") or "").strip() != self._device_id:
+            raise ValidationError("message.pull/message.ack device_id must match the current client instance")
+        slot_id = normalize_instance_id(params.get("slot_id", self._slot_id), "slot_id", allow_empty=True)
+        if slot_id != self._slot_id:
+            raise ValidationError("message.pull/message.ack slot_id must match the current client instance")
+        params["device_id"] = self._device_id
+        params["slot_id"] = self._slot_id
 
     def _schedule_prekey_replenish_if_consumed(self, message: dict[str, Any] | None) -> None:
         prekey_id = self._extract_consumed_prekey_id(message)
@@ -1354,11 +1726,18 @@ class AUNClient:
         if not self._aid:
             return
         try:
-            metadata = self._keystore.load_metadata(self._aid)
-            if isinstance(metadata, dict):
-                state = metadata.get("seq_tracker_state")
-                if isinstance(state, dict):
-                    self._seq_tracker.restore_state(state)
+            state = None
+            loader = getattr(self._keystore, "load_instance_state", None)
+            if callable(loader):
+                instance_state = loader(self._aid, self._device_id, self._slot_id)
+                if isinstance(instance_state, dict):
+                    state = instance_state.get("seq_tracker_state")
+            if not isinstance(state, dict):
+                metadata = self._keystore.load_metadata(self._aid)
+                if isinstance(metadata, dict):
+                    state = metadata.get("seq_tracker_state")
+            if isinstance(state, dict):
+                self._seq_tracker.restore_state(state)
         except Exception as exc:
             _client_log.debug("恢复 SeqTracker 状态失败: %s", exc)
 
@@ -1370,8 +1749,18 @@ class AUNClient:
         if not state:
             return
         try:
-            def _merge(m: dict) -> None:
+            updater = getattr(self._keystore, "update_instance_state", None)
+            if callable(updater):
+                def _merge_instance(m: dict[str, Any]) -> dict[str, Any]:
+                    m["seq_tracker_state"] = state
+                    return m
+
+                updater(self._aid, self._device_id, self._slot_id, _merge_instance)
+                return
+
+            def _merge(m: dict) -> dict[str, Any]:
                 m["seq_tracker_state"] = state
+                return m
             self._keystore.update_metadata(self._aid, _merge)
         except Exception as exc:
             _client_log.debug("保存 SeqTracker 状态失败: %s", exc)
@@ -1445,7 +1834,6 @@ class AUNClient:
                         "to": dist["to"],
                         "payload": dist["payload"],
                         "encrypt": True,
-                        "persist": False,
                     })
                 except Exception as _exc:
                     import logging as _logging
@@ -1502,7 +1890,6 @@ class AUNClient:
                 "to": new_member_aid,
                 "payload": dist_payload,
                 "encrypt": True,
-                "persist": False,
             })
         except Exception as exc:
             self._log_e2ee_error("distribute_key", group_id, new_member_aid, exc)
@@ -1638,6 +2025,22 @@ class AUNClient:
             raise ValidationError("retry must be a dict")
         if "timeouts" in request and not isinstance(request["timeouts"], dict):
             raise ValidationError("timeouts must be a dict")
+        request["device_id"] = self._device_id
+        request["slot_id"] = normalize_instance_id(
+            request.get("slot_id", self._slot_id),
+            "slot_id",
+            allow_empty=True,
+        )
+        delivery_mode_raw = request.get("delivery_mode")
+        if delivery_mode_raw is None:
+            delivery_mode_raw = dict(self._default_connect_delivery_mode)
+        elif not isinstance(delivery_mode_raw, dict):
+            delivery_mode_raw = {"mode": delivery_mode_raw}
+        if "queue_routing" in request:
+            delivery_mode_raw["routing"] = request["queue_routing"]
+        if "affinity_ttl_ms" in request:
+            delivery_mode_raw["affinity_ttl_ms"] = request["affinity_ttl_ms"]
+        request["delivery_mode"] = _normalize_delivery_mode_config(delivery_mode_raw)
         return request
 
     def _build_session_options(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1668,7 +2071,11 @@ class AUNClient:
         identity["access_token"] = access_token
         self._identity = identity
         self._aid = identity.get("aid", self._aid)
-        self._auth._keystore.save_identity(identity["aid"], identity)
+        persist_identity = getattr(self._auth, "_persist_identity", None)
+        if callable(persist_identity):
+            persist_identity(identity)
+        else:
+            self._auth._keystore.save_identity(identity["aid"], identity)
 
     async def _invoke_reconnect_connect_once(self) -> None:
         if self._session_params is None:
