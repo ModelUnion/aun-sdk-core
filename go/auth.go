@@ -1335,6 +1335,9 @@ func (a *AuthFlow) loadIdentityOrRaise(aid string) (map[string]any, error) {
 			return nil, NewStateError(fmt.Sprintf("identity not found for aid: %s", requestedAID))
 		}
 		a.aid = requestedAID
+		if _, ok := existing["aid"].(string); !ok || existing["aid"] == "" {
+			existing["aid"] = requestedAID
+		}
 		return existing, nil
 	}
 

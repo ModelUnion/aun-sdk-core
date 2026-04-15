@@ -1258,26 +1258,23 @@ export class E2EEManager {
     return importPrivateKeyEcdsa(pem);
   }
 
-  /** 获取本地 identity 公钥指纹 */
+  /** 获取本地 identity 指纹（优先证书 DER SHA-256，缺失时回退到公钥指纹） */
   private async _localIdentityFingerprint(): Promise<string> {
     const identity = this._identityFn();
-    const pubDerB64 = identity.public_key_der_b64 as string | undefined;
-    if (pubDerB64) return fingerprintDerB64(pubDerB64);
+    // 优先用证书指纹（与 PKI 一致）
     const certPem = identity.cert as string | undefined;
     if (certPem) return fingerprintCertPem(certPem);
+    // 无证书时回退到公钥 SPKI 指纹
+    const pubDerB64 = identity.public_key_der_b64 as string | undefined;
+    if (pubDerB64) return fingerprintDerB64(pubDerB64);
     // 从私钥导出公钥的 SPKI 指纹
     const pem = identity.private_key_pem as string | undefined;
     if (pem) {
-      // 导入私钥 → 导出公钥（需要通过 ECDSA 导入因为可以同时导出公钥）
       const pk = await crypto.subtle.importKey(
         'pkcs8', pemToArrayBuffer(pem),
         { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign'],
       );
-      // SubtleCrypto 不支持直接从私钥导出公钥，需要通过生成密钥对或其他方式
-      // 改用 ECDH 方式 — 实际上 PKCS8 包含公钥信息
-      // 通过 JWK 提取公钥
       const jwk = await crypto.subtle.exportKey('jwk', pk);
-      // 移除私钥字段，只保留公钥
       const pubJwk = { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y };
       const pubKey = await crypto.subtle.importKey(
         'jwk', pubJwk,

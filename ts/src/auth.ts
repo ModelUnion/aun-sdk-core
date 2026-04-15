@@ -1347,10 +1347,11 @@ export class AuthFlow {
     }
     const responseStatus = ocspDer[statusTag.contentOffset];
     if (responseStatus !== 0) {
-      // 非 successful
+      // 非 successful（如 unauthorized=6 表示 responder 无法回答，常见于 unknown 证书）
+      // 抛普通 Error 而非 AuthError，让外层 catch 降级到 JSON status 字段
       const statusNames = ['successful', 'malformedRequest', 'internalError', 'tryLater', '', 'sigRequired', 'unauthorized'];
       const statusName = statusNames[responseStatus] || `unknown(${responseStatus})`;
-      throw new AuthError(`gateway OCSP response status is ${statusName}`);
+      throw new Error(`OCSP responseStatus is ${statusName} (non-successful), fallback to JSON status`);
     }
     offset += statusTag.totalLength;
 
@@ -1675,6 +1676,7 @@ export class AuthFlow {
         throw new StateError(`identity not found for aid: ${requestedAid}`);
       }
       this._aid = requestedAid;
+      if (!existing.aid) existing.aid = requestedAid;
       return existing;
     }
     // 尝试加载任意身份

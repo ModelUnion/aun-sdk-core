@@ -238,6 +238,7 @@ class AUNClient:
         self._cache_cleanup_task: asyncio.Task | None = None
         # 消息序列号跟踪器（群消息 + P2P 共用，按命名空间隔离）
         self._seq_tracker = SeqTracker()
+        self._seq_tracker_context: tuple[str, str, str] | None = None
         self._gap_fill_done: set[str] = set()  # 补洞去重：已完成/进行中的 (type:id:after_seq) 集合
         self._gap_fill_active: bool = False  # 当前是否在补洞中（用于标记 pull 来源）
 
@@ -301,10 +302,12 @@ class AUNClient:
             self._reconnect_task = None
         if self._state in {"idle", "closed"}:
             self._state = "closed"
+            self._reset_seq_tracking_state()
             return
         await self._transport.close()
         self._state = "closed"
         await self._dispatcher.publish("connection.state", {"state": self._state})
+        self._reset_seq_tracking_state()
 
     # ── RPC ───────────────────────────────────────────────
 
@@ -1695,6 +1698,7 @@ class AUNClient:
         self._state = "connected"
         await self._dispatcher.publish("connection.state", {"state": self._state, "gateway": gateway_url})
 
+        self._refresh_seq_tracking_context()
         # 从 keystore 恢复 SeqTracker 状态
         self._restore_seq_tracker_state()
 
@@ -1926,6 +1930,27 @@ class AUNClient:
                             _client_log.info("SeqTracker 从旧版 instance_state 恢复: %d 个命名空间", len(state))
         except Exception as exc:
             _client_log.warning("恢复 SeqTracker 状态失败: %s", exc)
+
+    def _current_seq_tracker_context(self) -> tuple[str, str, str] | None:
+        aid = str(self._aid or "").strip()
+        if not aid:
+            return None
+        return (aid, self._device_id, self._slot_id)
+
+    def _reset_seq_tracking_state(self) -> None:
+        self._seq_tracker = SeqTracker()
+        self._seq_tracker_context = None
+        self._gap_fill_done.clear()
+        self._gap_fill_active = False
+
+    def _refresh_seq_tracking_context(self) -> None:
+        next_context = self._current_seq_tracker_context()
+        if next_context == self._seq_tracker_context:
+            return
+        self._seq_tracker = SeqTracker()
+        self._gap_fill_done.clear()
+        self._gap_fill_active = False
+        self._seq_tracker_context = next_context
 
     def _persist_seq(self, ns: str, *, force_seq: int | None = None) -> None:
         """即时持久化单个 namespace 的 seq（行级写入）。

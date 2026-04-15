@@ -1455,6 +1455,7 @@ export class AuthFlow {
         throw new StateError(`identity not found for aid: ${requestedAid}`);
       }
       this._aid = requestedAid;
+      if (!existing.aid) existing.aid = requestedAid;
       return existing;
     }
     throw new StateError('no local identity found, call auth.createAid() first');

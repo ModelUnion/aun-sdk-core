@@ -1041,14 +1041,17 @@ class E2EEManager:
         return pk
 
     def _local_identity_fingerprint(self) -> str:
+        """本地 identity 指纹（优先证书 DER SHA-256，缺失时回退到公钥指纹）"""
         identity = self._identity_fn()
-        public_key_der_b64 = identity.get("public_key_der_b64")
-        if isinstance(public_key_der_b64, str) and public_key_der_b64:
-            return self._fingerprint_der_public_key(base64.b64decode(public_key_der_b64))
+        # 优先用证书指纹（与 PKI 一致）
         cert_pem = identity.get("cert")
         if isinstance(cert_pem, str) and cert_pem:
             cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
-            return self._fingerprint_public_key(cert.public_key())
+            return self._certificate_sha256_fingerprint(cert)
+        # 无证书时回退到公钥 SPKI 指纹
+        public_key_der_b64 = identity.get("public_key_der_b64")
+        if isinstance(public_key_der_b64, str) and public_key_der_b64:
+            return self._fingerprint_der_public_key(base64.b64decode(public_key_der_b64))
         private_key_pem = identity.get("private_key_pem")
         if isinstance(private_key_pem, str) and private_key_pem:
             private_key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
