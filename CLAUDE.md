@@ -308,31 +308,78 @@ extensions/services/evol/static/js/tests/
 
 ### 运行测试
 
-Windows 下 Python 默认使用 GBK 编码，中文输出会乱码。运行测试时必须加 `-X utf8` 选项：
+Windows 下 Python 默认使用 GBK 编码，中文输出会乱码。运行测试时必须加 `-X utf8` 选项。
+
+以下命令均在 `./python/` 目录下执行。
+
+#### 单元测试（无需 Docker）
 
 ```bash
-# 单元测试
 python -X utf8 -m pytest tests/unit/ -v --tb=short
-
-# 集成测试（需要 Docker 单域环境运行中）
-python -X utf8 tests/integration_test_e2ee.py
-
-# E2E 测试（需要 Docker 单域环境运行中）
-python -X utf8 tests/e2e_test_group_e2ee.py
 ```
 
-以上命令均在 `./python/` 目录下执行。
+#### 单域集成测试 & E2E 测试
+
+需要 Docker 单域环境运行中（`kite-app` + `kite-mysql`）。
+必须通过 `AUN_DATA_ROOT` 指定 Docker 挂载的持久化数据目录，否则测试会使用本地 `.aun_test`，与服务端注册数据不一致。
+
+```bash
+# 集成测试
+AUN_DATA_ROOT="D:/modelunion/kite/docker-deploy/data/sdk-tester-aun" \
+  python -X utf8 tests/integration_test_e2ee.py
+
+# E2E 群组测试
+AUN_DATA_ROOT="D:/modelunion/kite/docker-deploy/data/sdk-tester-aun" \
+  python -X utf8 tests/e2e_test_group_e2ee.py
+```
+
+#### 双域测试（跨域通信）
+
+需要 federation Docker 环境运行中（`federation-kite-a/b` + `client-a/b`）。
+测试脚本在容器内执行，宿主机通过 `docker exec` 触发：
+
+```bash
+# Windows Git Bash 下必须加 MSYS_NO_PATHCONV=1 防止路径转换
+MSYS_NO_PATHCONV=1 docker exec client-a python /test/e2e_encrypted.py
+MSYS_NO_PATHCONV=1 docker exec client-a python /test/e2e_plaintext.py
+MSYS_NO_PATHCONV=1 docker exec client-a python /test/e2e_offline.py
+MSYS_NO_PATHCONV=1 docker exec client-a python /test/e2e_group.py
+MSYS_NO_PATHCONV=1 docker exec client-a python /test/e2e_signature_audit.py
+MSYS_NO_PATHCONV=1 docker exec client-a python /test/e2e_storage.py
+```
+
+#### 重新构建 Docker 镜像
+
+当 aun 服务模块（`../extensions/services`）代码有修改时，必须重新 build 并重启 docker 容器：
+
+```bash
+# 在 docker-deploy 目录下 build 镜像
+cd ../docker-deploy
+docker compose -f docker-compose.build.yml build kite
+
+# 重启单域
+docker compose up -d kite
+
+# 重启双域
+cd federation-test
+docker compose up -d kite-a kite-b
+```
+
+SDK 代码（`python/src`）挂载到容器内（`/sdk/src`），修改后无需 rebuild，但服务端代码打包在镜像中，必须 rebuild。
 
 ### 相关项目及文档位置
 
 1. aun服务模块: ../extensions/services
 2. docker发布环境 ../docker-deploy, 跑集成测试和E2E测试时如果aun服务模块的代码有修改，需要重新build和重启docker镜像
 3. 测试脚本目录 ./python/tests
-4. aun协议文档目录 ../docs/aun文档/aun协议
-5. aun skill目录 ../../aun-skill/.claude/skills/aun-sdk
-6. aun sdk文档目录 ./docs/sdk
-7. ./python/src/aun-core/docs/skill 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
-8. ./docs/protocol 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
+4. 单域测试数据目录 D:\modelunion\kite\docker-deploy\data\sdk-tester-aun\single-domain\persistent\AIDs
+5. 双域测试脚本目录 D:\modelunion\kite\docker-deploy\federation-test\tests
+6. 双域测试数据目录 D:\modelunion\kite\docker-deploy\federation-test\client-data
+7. aun协议文档目录 ../docs/aun文档/aun协议
+8. aun skill目录 ../../aun-skill/.claude/skills/aun-sdk
+9. aun sdk文档目录 ./docs/sdk
+10. ./python/src/aun-core/docs/skill 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
+11. ./docs/protocol 这下面的文档不用直接编辑，发布前可通过./python/sync_docs.py同步过去
 
 D:\modelunion\kite\aun-sdk-core\python\tests 下是aun sdk的单域环境的测试用例，包括单元测试及集成测试/e2e测试的。
 D:\modelunion\kite\docker-deploy\federation-test是aun sdk的双域测试环境用例，主要用于测试跨域通信
