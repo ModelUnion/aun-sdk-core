@@ -27,7 +27,7 @@ from aun_core.errors import AuthError, ConnectionError, PermissionError
 
 def _make_client(auto_reconnect: bool = True) -> AUNClient:
     """创建已配置好的测试客户端（不实际连接）"""
-    client = AUNClient({"aun_path": "/tmp/test_reconnect", "sqlite_backup": False})
+    client = AUNClient({"aun_path": "/tmp/test_reconnect"})
     # 注入会话选项（模拟已连接状态）
     client._session_options = {
         "auto_reconnect": auto_reconnect,
@@ -261,6 +261,24 @@ class TestNonRetryableErrors:
         # AuthError 不可重试，只调用一次就 terminal_failed
         assert call_count == 1
         assert client._state == "terminal_failed"
+
+    @pytest.mark.asyncio
+    async def test_login_phase_auth_error_is_retryable(self):
+        client = _make_client(auto_reconnect=True)
+        call_count = 0
+
+        async def mock_reconnect():
+            nonlocal call_count
+            call_count += 1
+            raise AuthError("aid_login2_failed")
+
+        client._invoke_reconnect_connect_once = mock_reconnect
+
+        await client._handle_transport_disconnect(None)
+        await asyncio.sleep(0.3)
+
+        assert call_count > 1
+        assert client._state == "reconnecting"
 
     @pytest.mark.asyncio
     async def test_permission_error_no_retry(self):

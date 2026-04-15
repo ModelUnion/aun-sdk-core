@@ -4,11 +4,12 @@ import 'fake-indexeddb/auto';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { IndexedDBKeyStore } from '../../src/keystore/indexeddb.js';
 import { IndexedDBSecretStore } from '../../src/secret-store/indexeddb-store.js';
-import type { JsonObject, MetadataRecord, PrekeyMap } from '../../src/types.js';
+import type { JsonObject, PrekeyMap } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 const KEYSTORE_DB_NAME = 'aun-keystore';
-const KEYSTORE_DB_VERSION = 2;
+const KEYSTORE_DB_VERSION = 4;
+const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'prekeys', 'group_current', 'group_old_epochs', 'e2ee_sessions'];
 
 async function withStore<T>(
   storeName: string,
@@ -19,7 +20,7 @@ async function withStore<T>(
     const request = indexedDB.open(KEYSTORE_DB_NAME, KEYSTORE_DB_VERSION);
     request.onupgradeneeded = () => {
       const upgradedDb = request.result;
-      for (const name of ['key_pairs', 'certs', 'metadata', 'prekeys', 'group_current', 'group_old_epochs']) {
+      for (const name of KEYSTORE_STORES) {
         if (!upgradedDb.objectStoreNames.contains(name)) {
           upgradedDb.createObjectStore(name);
         }
@@ -90,7 +91,7 @@ async function clearStore(storeName: string): Promise<void> {
 }
 
 async function resetKeystoreDb(): Promise<void> {
-  for (const storeName of ['key_pairs', 'certs', 'metadata', 'prekeys', 'group_current', 'group_old_epochs']) {
+  for (const storeName of KEYSTORE_STORES) {
     await clearStore(storeName);
   }
 }
@@ -137,107 +138,33 @@ describe('IndexedDBKeyStore', () => {
     expect(loaded).toBe(certPem);
   });
 
+  it('支持按证书指纹保存和加载证书版本', async () => {
+    const certPem = '-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----';
+    await ks.saveCert(
+      'versioned-cert.test',
+      certPem,
+      'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      { makeActive: false },
+    );
+
+    const loaded = await ks.loadCert(
+      'versioned-cert.test',
+      'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    );
+    expect(loaded).toBe(certPem);
+    expect(await ks.loadCert('versioned-cert.test')).toBeNull();
+  });
+
   it('加载不存在的证书应返回 null', async () => {
     expect(await ks.loadCert('nonexistent')).toBeNull();
   });
 
-  // ── Metadata CRUD ──────────────────────────────────
-
-  it('保存和加载 metadata', async () => {
-    const md = { session_id: 'sess-1', e2ee_prekeys: { pk1: { created_at: 1000 } } };
-    await ks.saveMetadata('alice', md);
-
-    const loaded = await ks.loadMetadata('alice');
-    expect(loaded).not.toBeNull();
-    expect(loaded!.session_id).toBe('sess-1');
-    expect(loaded!.e2ee_prekeys).toEqual({ pk1: { created_at: 1000 } });
-  });
-
-  it('saveMetadata 应保护关键字段不被覆盖', async () => {
-    // 先保存含 e2ee_prekeys 的 metadata
-    await ks.saveMetadata('alice', {
-      e2ee_prekeys: { pk1: { key: 'data' } },
-      session_id: 'old',
-    });
-
-    // 再保存不含 e2ee_prekeys 的新数据
-    await ks.saveMetadata('alice', { session_id: 'new' });
-
-    const loaded = await ks.loadMetadata('alice');
-    expect(loaded!.session_id).toBe('new');
-    // e2ee_prekeys 应被自动合并保留
-    expect(loaded!.e2ee_prekeys).toEqual({ pk1: { key: 'data' } });
-  });
-
-  it('saveMetadata 只在结构化 store 保存 prekeys 和 group_secrets', async () => {
-    await ks.saveMetadata('alice', {
-      session_id: 'sess-1',
-      e2ee_prekeys: {
-        pk1: { private_key_pem: 'PK1', created_at: 1700000000000 },
-      },
-      group_secrets: {
-        'group-1': {
-          epoch: 2,
-          secret: 'secret-v2',
-          updated_at: 1700000000000,
-          old_epochs: [
-            { epoch: 1, secret: 'secret-v1', updated_at: 1699999999000 },
-          ],
-        },
-      },
-    });
-
-    const rawMetadata = await readStoreRecord('metadata', 'alice');
-    expect(rawMetadata).toEqual({ session_id: 'sess-1' });
-
-    const prekeyItems = await readStoreItems('prekeys');
-    expect(prekeyItems).toHaveLength(1);
-    expect(prekeyItems[0].value).toMatchObject({
-      prekey_id: 'pk1',
-      private_key_pem: 'PK1',
-    });
-
-    const currentGroupItems = await readStoreItems('group_current');
-    expect(currentGroupItems).toHaveLength(1);
-    expect(currentGroupItems[0].value).toMatchObject({
-      group_id: 'group-1',
-      epoch: 2,
-      secret: 'secret-v2',
-    });
-
-    const oldGroupItems = await readStoreItems('group_old_epochs');
-    expect(oldGroupItems).toHaveLength(1);
-    expect(oldGroupItems[0].value).toMatchObject({
-      group_id: 'group-1',
-      epoch: 1,
-      secret: 'secret-v1',
-    });
-  });
-
-  it('updateMetadata 在并发调用下应保留两个 prekey', async () => {
-    await Promise.all([
-      ks.updateMetadata('alice', metadata => {
-        const prekeys = (metadata.e2ee_prekeys ?? {});
-        metadata.e2ee_prekeys = { ...prekeys, pk1: { private_key_pem: 'PK1' } };
-        return metadata;
-      }),
-      ks.updateMetadata('alice', metadata => {
-        const prekeys = (metadata.e2ee_prekeys ?? {});
-        metadata.e2ee_prekeys = { ...prekeys, pk2: { private_key_pem: 'PK2' } };
-        return metadata;
-      }),
-    ]);
-
-    const loaded = await ks.loadMetadata('alice');
-    expect((loaded!.e2ee_prekeys as PrekeyMap).pk1?.private_key_pem).toBe('PK1');
-    expect((loaded!.e2ee_prekeys as PrekeyMap).pk2?.private_key_pem).toBe('PK2');
-  });
+  // ── Prekey / Identity 交互 ──────────────────────────────────
 
   it('saveIdentity 更新 token 时不应覆盖已有 prekey', async () => {
-    await ks.saveMetadata('identity.aid', {
-      e2ee_prekeys: {
-        pk1: { private_key_pem: 'KEEP_ME' },
-      },
+    await ks.saveE2EEPrekey!('identity.aid', 'pk1', {
+      private_key_pem: 'KEEP_ME',
+      created_at: Date.now(),
     });
 
     await ks.saveIdentity('identity.aid', {
@@ -246,71 +173,27 @@ describe('IndexedDBKeyStore', () => {
       refresh_token: 'rt-new',
     });
 
-    const loaded = await ks.loadMetadata('identity.aid');
-    const prekeys = loaded!.e2ee_prekeys as PrekeyMap;
-    expect(loaded!.access_token).toBe('tok-new');
-    expect(loaded!.refresh_token).toBe('rt-new');
+    const prekeys = await ks.loadE2EEPrekeys!('identity.aid');
     expect(prekeys.pk1.private_key_pem).toBe('KEEP_ME');
+
+    const identity = await ks.loadIdentity('identity.aid');
+    expect(identity!.access_token).toBe('tok-new');
+    expect(identity!.refresh_token).toBe('rt-new');
   });
 
-  it('loadMetadata 应迁移旧 metadata 中的结构化字段且仅回收未过期数据', async () => {
-    const now = Date.now();
-    await writeStoreRecord('metadata', 'legacy-aid', {
-      session_id: 'legacy-session',
-      e2ee_prekeys: {
-        keep: { private_key_pem: 'KEEP', created_at: now - 1000 },
-        expired: { private_key_pem: 'DROP', created_at: now - (8 * 24 * 3600 * 1000) },
-      },
-      group_secrets: {
-        'group-1': {
-          epoch: 2,
-          secret: 'group-secret-v2',
-          updated_at: now - 1000,
-          old_epochs: [
-            { epoch: 1, secret: 'group-secret-v1', updated_at: now - 2000 },
-          ],
-        },
-        'group-expired': {
-          epoch: 1,
-          secret: 'expired-group-secret',
-          updated_at: now - (8 * 24 * 3600 * 1000),
-        },
-      },
+  it('实例态应按 device_id/slot_id 隔离保存', async () => {
+    await ks.saveInstanceState!('instance.aid', 'device-a', '', {
+      access_token: 'tok-a',
+    });
+    await ks.saveInstanceState!('instance.aid', 'device-a', 'slot-2', {
+      access_token: 'tok-b',
     });
 
-    const loaded = await ks.loadMetadata('legacy-aid');
-    expect(loaded).not.toBeNull();
-    expect(loaded!.session_id).toBe('legacy-session');
-    expect(loaded!.e2ee_prekeys).toEqual({
-      keep: { private_key_pem: 'KEEP', created_at: now - 1000 },
-    });
-    expect(loaded!.group_secrets).toEqual({
-      'group-1': {
-        epoch: 2,
-        secret: 'group-secret-v2',
-        updated_at: now - 1000,
-        old_epochs: [
-          { epoch: 1, secret: 'group-secret-v1', updated_at: now - 2000 },
-        ],
-      },
-    });
+    const singleton = await ks.loadInstanceState!('instance.aid', 'device-a', '');
+    const slot2 = await ks.loadInstanceState!('instance.aid', 'device-a', 'slot-2');
 
-    const rawMetadata = await readStoreRecord('metadata', 'legacy-aid');
-    expect(rawMetadata).toEqual({ session_id: 'legacy-session' });
-
-    expect(await ks.loadE2EEPrekeys('legacy-aid')).toEqual({
-      keep: { private_key_pem: 'KEEP', created_at: now - 1000 },
-    });
-    expect(await ks.loadAllGroupSecretStates('legacy-aid')).toEqual({
-      'group-1': {
-        epoch: 2,
-        secret: 'group-secret-v2',
-        updated_at: now - 1000,
-        old_epochs: [
-          { epoch: 1, secret: 'group-secret-v1', updated_at: now - 2000 },
-        ],
-      },
-    });
+    expect(singleton!.access_token).toBe('tok-a');
+    expect(slot2!.access_token).toBe('tok-b');
   });
 
   it('cleanupE2EEPrekeys 应仅清理超过 7 天且不在最新 7 个里的 prekey', async () => {
@@ -338,8 +221,35 @@ describe('IndexedDBKeyStore', () => {
     expect(prekeys.current.private_key_pem).toBe('CURRENT');
   });
 
-  it('加载不存在的 metadata 应返回 null', async () => {
-    expect(await ks.loadMetadata('nonexistent')).toBeNull();
+  it('device-scoped prekey 应允许同一 prekey_id 并存且 cleanup 只影响目标 device', async () => {
+    const now = Date.now();
+    const cutoffMs = now - (7 * 24 * 3600 * 1000);
+
+    await ks.saveE2EEPrekeyForDevice!('device-aid', 'phone', 'pk-same', {
+      private_key_pem: 'PHONE',
+      created_at: cutoffMs - 1000,
+    });
+    await ks.saveE2EEPrekeyForDevice!('device-aid', 'laptop', 'pk-same', {
+      private_key_pem: 'LAPTOP',
+      created_at: cutoffMs - 1000,
+    });
+
+    expect(await ks.loadE2EEPrekeysForDevice!('device-aid', 'phone')).toEqual({
+      'pk-same': { private_key_pem: 'PHONE', created_at: cutoffMs - 1000 },
+    });
+    expect(await ks.loadE2EEPrekeysForDevice!('device-aid', 'laptop')).toEqual({
+      'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
+    });
+    expect(await ks.loadE2EEPrekeys!('device-aid')).toEqual({});
+    expect(await readStoreItems('prekeys')).toHaveLength(2);
+
+    const removed = await ks.cleanupE2EEPrekeysForDevice!('device-aid', 'phone', cutoffMs, 0);
+    expect(removed).toEqual(['pk-same']);
+    expect(await ks.loadE2EEPrekeysForDevice!('device-aid', 'phone')).toEqual({});
+    expect(await ks.loadE2EEPrekeysForDevice!('device-aid', 'laptop')).toEqual({
+      'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
+    });
+    expect(await readStoreItems('prekeys')).toHaveLength(1);
   });
 
   // ── 身份组合操作 ──────────────────────────────────
@@ -363,19 +273,16 @@ describe('IndexedDBKeyStore', () => {
     const cert = await ks.loadCert('alice');
     expect(cert).toContain('cert');
 
-    // metadata 应包含非密钥/非证书字段
-    const md = await ks.loadMetadata('alice');
-    expect(md!.session_id).toBe('sess-abc');
-    expect(md!.access_token).toBe('token-123');
-    // metadata 不应包含密钥字段
-    expect(md!.private_key_pem).toBeUndefined();
-    expect(md!.cert).toBeUndefined();
+    // loadIdentity 应包含非密钥/非证书字段
+    const loaded = await ks.loadIdentity('alice');
+    expect(loaded!.session_id).toBe('sess-abc');
+    expect(loaded!.access_token).toBe('token-123');
   });
 
   it('loadIdentity 应合并所有仓库数据', async () => {
     await ks.saveKeyPair('alice', { private_key_pem: 'pk', public_key_der_b64: 'pub', curve: 'P-256' });
     await ks.saveCert('alice', 'cert-pem');
-    await ks.saveMetadata('alice', { session_id: 'sess' });
+    await ks.saveIdentity('alice', { session_id: 'sess' });
 
     const identity = await ks.loadIdentity('alice');
     expect(identity).not.toBeNull();

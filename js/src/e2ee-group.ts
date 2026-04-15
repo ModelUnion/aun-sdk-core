@@ -9,6 +9,7 @@ import { uint8ToBase64, base64ToUint8, pemToArrayBuffer, toBufferSource } from '
 import {
   SUITE,
   _concatBytes as concatBytes,
+  _certificateSha256Fingerprint as certificateSha256Fingerprint,
   _ecdsaSignDer as ecdsaSignDer,
   _ecdsaVerifyDer as ecdsaVerifyDer,
   _hkdfDerive as hkdfDerive,
@@ -21,7 +22,6 @@ import {
   _importPrivateKeyEcdsa as importPrivateKeyEcdsa,
 } from './e2ee.js';
 import type { KeyStore } from './keystore/index.js';
-import { updateKeyStoreMetadata } from './keystore/update.js';
 import {
   isJsonObject,
   type GroupOldEpochRecord,
@@ -61,9 +61,7 @@ async function loadKeyStoreGroupState(
   if (typeof keystore.loadGroupSecretState === 'function') {
     return await keystore.loadGroupSecretState(aid, groupId);
   }
-  const metadata = (await keystore.loadMetadata(aid)) ?? {};
-  const groupSecrets = (metadata.group_secrets ?? {}) as GroupSecretMap;
-  return groupSecrets[groupId] ?? null;
+  throw new Error('keystore 缺少 loadGroupSecretState 方法');
 }
 
 async function loadAllKeyStoreGroupStates(
@@ -73,8 +71,7 @@ async function loadAllKeyStoreGroupStates(
   if (typeof keystore.loadAllGroupSecretStates === 'function') {
     return (await keystore.loadAllGroupSecretStates(aid)) ?? {};
   }
-  const metadata = (await keystore.loadMetadata(aid)) ?? {};
-  return (metadata.group_secrets ?? {}) as GroupSecretMap;
+  throw new Error('keystore 缺少 loadAllGroupSecretStates 方法');
 }
 
 async function saveKeyStoreGroupState(
@@ -87,12 +84,7 @@ async function saveKeyStoreGroupState(
     await keystore.saveGroupSecretState(aid, groupId, entry);
     return;
   }
-  await updateKeyStoreMetadata(keystore, aid, metadata => {
-    const groupSecrets = (metadata.group_secrets ?? {}) as GroupSecretMap;
-    groupSecrets[groupId] = { ...entry };
-    metadata.group_secrets = groupSecrets;
-    return metadata;
-  });
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing saveGroupSecretState method`);
 }
 
 async function cleanupKeyStoreGroupOldEpochs(
@@ -104,19 +96,7 @@ async function cleanupKeyStoreGroupOldEpochs(
   if (typeof keystore.cleanupGroupOldEpochsState === 'function') {
     return await keystore.cleanupGroupOldEpochsState(aid, groupId, cutoffMs);
   }
-  let removed = 0;
-  await updateKeyStoreMetadata(keystore, aid, metadata => {
-    const groupSecrets = (metadata.group_secrets ?? {}) as GroupSecretMap;
-    const entry = groupSecrets[groupId];
-    if (!entry) return metadata;
-    const oldEpochs = (entry.old_epochs ?? []) as GroupOldEpochRecord[];
-    if (!oldEpochs.length) return metadata;
-    const remaining = oldEpochs.filter((old) => Number(old.updated_at ?? 0) >= cutoffMs);
-    removed = oldEpochs.length - remaining.length;
-    if (removed > 0) entry.old_epochs = remaining;
-    return metadata;
-  });
-  return removed;
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing cleanupGroupOldEpochsState method`);
 }
 
 // ── 群组 AAD 工具 ────────────────────────────────────────────
@@ -170,6 +150,7 @@ export async function encryptGroupMessage(
     messageId: string;
     timestamp: number;
     senderPrivateKeyPem?: string | null;
+    senderCertPem?: string | null;
   },
 ): Promise<JsonObject> {
   const msgKey = await deriveGroupMsgKey(groupSecret, groupId, opts.messageId);
@@ -208,15 +189,9 @@ export async function encryptGroupMessage(
       const sig = await ecdsaSignDer(signKey, signPayload);
       envelope.sender_signature = uint8ToBase64(sig);
 
-      // 公钥指纹便于接收方查找证书
-      const jwk = await crypto.subtle.exportKey('jwk', signKey);
-      const pubJwk = { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y };
-      const pubKey = await crypto.subtle.importKey(
-        'jwk', pubJwk,
-        { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify'],
-      );
-      const spki = await crypto.subtle.exportKey('spki', pubKey);
-      envelope.sender_cert_fingerprint = await fingerprintSpki(spki);
+      if (opts.senderCertPem) {
+        envelope.sender_cert_fingerprint = await certificateSha256Fingerprint(opts.senderCertPem);
+      }
     } catch (exc) {
       console.warn('群消息发送方签名失败:', exc);
     }
@@ -989,12 +964,14 @@ export class GroupE2EEManager {
     }
     const identity = this._identityFn();
     const senderPkPem = (identity?.private_key_pem as string | undefined) ?? null;
+    const senderCertPem = (identity?.cert as string | undefined) ?? null;
     return encryptGroupMessage(
       groupId, secretData.epoch, secretData.secret, payload, {
         fromAid: aid,
         messageId: opts?.messageId ?? `gm-${uuidV4()}`,
         timestamp: opts?.timestamp ?? Date.now(),
         senderPrivateKeyPem: senderPkPem,
+        senderCertPem,
       },
     );
   }

@@ -16,6 +16,9 @@ export interface JsonArray extends Array<JsonValue> {}
 /** JSON 值 */
 export type JsonValue = JsonPrimitive | JsonObject | JsonArray;
 
+/** P2P 投递模式 */
+export type DeliveryMode = 'fanout' | 'queue';
+
 /** 判断值是否为普通 JSON 对象 */
 export function isJsonObject(value: JsonValue | object | null | undefined): value is JsonObject {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -127,6 +130,17 @@ export interface IdentityRecord extends MetadataRecord, KeyPairRecord {
   expires_at?: number;
 }
 
+/** E2EE session 记录 */
+export interface SessionRecord extends JsonObject {
+  session_id?: string;
+  key?: string;
+  key_protection?: JsonObject;
+  peer_aid?: string;
+  created_at?: number;
+  updated_at?: number;
+  expires_at?: number;
+}
+
 /** SecretStore 加密记录 */
 export interface SecretRecord extends JsonObject {
   scheme?: string;
@@ -147,22 +161,24 @@ export interface Message extends JsonObject {
   type?: string;
   payload?: JsonValue;
   encrypted?: boolean;
-  persist?: boolean;
+  delivery_mode?: DeliveryMode;
   timestamp?: number;
   e2ee?: JsonObject;
 }
 
 /** 发送结果 */
 export interface SendResult extends JsonObject {
+  ok?: boolean;
   message_id?: string;
   seq?: number;
   timestamp?: number;
   status?: 'sent' | 'delivered' | 'duplicate';
-  persist?: boolean;
+  delivery_mode?: DeliveryMode;
 }
 
 /** 确认结果 */
 export interface AckResult extends JsonObject {
+  success?: boolean;
   ack_seq?: number;
 }
 

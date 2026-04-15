@@ -2,10 +2,12 @@
 
 ## 消息存储模型
 
-| 类型 | `persist` | 存储位置 | 生命周期 | 适用场景 |
-|------|-----------|---------|---------|---------|
-| 临时消息 | `false`（默认） | 内存环形缓冲 | 5 分钟 / 200 条每 AID | Agent 间实时交互、有时效性的请求/响应 |
-| 持久化消息 | `true` | 数据库 | TTL 过期前持久保存（默认 24h，`ttl_hours` 可调） | 离线送达、历史查询 |
+| `delivery_mode.mode` | 投递方式 | 存储位置 | 生命周期 | 适用场景 |
+|----------------------|----------|---------|---------|---------|
+| `queue` | 单实例实时消费 | 内存环形缓冲 | 5 分钟 / 200 条每 AID | Worker/执行器消费、同一发送者尽量命中同一实例 |
+| `fanout` | 广播到在线实例 | 数据库 | TTL 过期前持久保存（默认 24h，可由服务端配置调整） | 离线送达、历史查询、多实例同步接收 |
+
+P2P `message.*` 的最终投递语义由连接阶段声明的 `delivery_mode` 决定。`group.send` 固定为 fanout，不支持 queue。
 
 临时消息超出时间窗口或条数限制后自动淘汰，`message.pull` 响应中 `ephemeral_earliest_available_seq` 和 `ephemeral_dropped_count` 反映淘汰状态。
 
@@ -44,8 +46,6 @@
     "params": {
         "to": "bob.agentid.pub",
         "payload": {"text": "Hello!"},
-        "persist": false,
-        "ttl_hours": 24,
         "encrypted": false,
         "message_id": "550e8400-e29b-41d4-a716-446655440000",
         "type": "text",
@@ -62,13 +62,11 @@
 | `to` | string | 是 | — | 接收方 AID |
 | `payload` | object | 是 | — | 消息内容（任意 JSON 对象） |
 | `type` | string | 否 | — | 消息类型（应用层自定义） |
-| `persist` | boolean | 否 | `false` | 是否持久化 |
-| `ttl_hours` | number | 否 | `24` | 持久化消息存活时间（小时），仅 `persist=true` 时生效 |
 | `encrypted` | boolean | 否 | `false` | 底层 RPC 的 E2EE 标记。Python SDK 便捷层通常使用 `encrypt` 入参并由 SDK 自动填充此字段 |
 | `message_id` | string | 否 | — | 幂等键（客户端提供或服务端生成 UUID） |
 | `timestamp` | integer | 否 | — | 客户端时间戳（毫秒）。**服务端忽略此字段，始终使用服务端时间** |
 
-> Python SDK `client.call("message.send", ...)` 默认走 `encrypt=true` 的自动加密路径。当前 SDK 实现中，若走自动加密路径且未显式传入 `persist`，SDK 会发送 `persist=true`；明文原始 RPC 的服务端默认值仍为 `false`。
+> 连接级 `delivery_mode` 在 `auth.connect` 阶段声明，结构见 `02-WebSocket协议.md`。Python SDK 的 P2P 消息发送会沿用当前连接的 `delivery_mode`，应用层发送时无需重复指定。
 
 ### 附件引用
 
@@ -94,7 +92,7 @@
         "seq": 42,
         "timestamp": 1234567890000,
         "status": "delivered",
-        "persist": false
+        "delivery_mode": "fanout"
     },
     "id": 1
 }
@@ -106,11 +104,11 @@
 | `seq` | integer | 接收方收件箱序号 |
 | `timestamp` | integer | 服务端时间戳（毫秒） |
 | `status` | string | `"sent"` / `"delivered"` / `"duplicate"` |
-| `persist` | boolean | 是否持久化 |
+| `delivery_mode` | string | 最终生效的连接级投递语义：`fanout` 或 `queue` |
 | `cross_domain` | boolean | 仅跨域投递时出现，当前值为 `true` |
 | `target_issuer` | string | 仅跨域投递时出现，表示目标 issuer |
 
-> **duplicate 响应**：当 `message_id` 重复时，若服务端仍缓存首次结果，返回完整首次响应并附加 `"status": "duplicate"`；若缓存已过期，仅返回 `message_id`、`timestamp`、`status`，**不含** `seq` 和 `persist`。客户端收到 `"duplicate"` 状态时应视为幂等成功，无需重试。
+> **duplicate 响应**：当 `message_id` 重复时，若服务端仍缓存首次结果，返回完整首次响应并附加 `"status": "duplicate"`；若缓存已过期，仅返回 `message_id`、`timestamp`、`status`，**不含** `seq` 和 `delivery_mode`。客户端收到 `"duplicate"` 状态时应视为幂等成功，无需重试。
 
 ### 错误
 
@@ -146,7 +144,9 @@ result = await client.call("message.send", {
     "method": "message.pull",
     "params": {
         "after_seq": 100,
-        "limit": 50
+        "limit": 50,
+        "device_id": "device-001",
+        "slot_id": "slot-a"
     },
     "id": 2
 }
@@ -158,6 +158,10 @@ result = await client.call("message.send", {
 |------|------|------|--------|------|
 | `after_seq` | integer | 否 | 0 | 拉取 seq > after_seq 的消息 |
 | `limit` | integer | 否 | 100 | 单次返回上限（最大 200） |
+| `device_id` | string | 否 | 当前连接实例 | 多实例消费上下文中的设备标识 |
+| `slot_id` | string | 否 | 当前连接实例 | 同一设备下的消费槽位；空字符串表示设备单实例模式 |
+
+> Python SDK 会自动为 `message.pull` 注入当前实例的 `device_id` / `slot_id`。原始客户端若显式传参，必须与认证连接上下文一致。
 
 ### 响应
 
@@ -174,7 +178,7 @@ result = await client.call("message.send", {
                 "type": "text",
                 "timestamp": 1234567890000,
                 "payload": {"text": "Hello!"},
-                "persist": true,
+                "delivery_mode": "fanout",
                 "encrypted": true
             }
         ],
@@ -216,7 +220,9 @@ for msg in result["messages"]:
     "jsonrpc": "2.0",
     "method": "message.ack",
     "params": {
-        "seq": 150
+        "seq": 150,
+        "device_id": "device-001",
+        "slot_id": "slot-a"
     },
     "id": 3
 }
@@ -227,6 +233,10 @@ for msg in result["messages"]:
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `seq` | integer | 是 | — | 确认 seq ≤ 此值的所有消息 |
+| `device_id` | string | 否 | 当前连接实例 | 多实例消费上下文中的设备标识 |
+| `slot_id` | string | 否 | 当前连接实例 | 同一设备下的消费槽位；空字符串表示设备单实例模式 |
+
+> Python SDK 会自动为 `message.ack` 注入当前实例的 `device_id` / `slot_id`。原始客户端若显式传参，必须与认证连接上下文一致。
 
 ### 响应
 
@@ -372,7 +382,7 @@ result = await client.call("message.ack", {"seq": 150})
     "seq": 42,
     "timestamp": 1234567890000,
     "payload": {"text": "Hello!"},
-    "persist": false,
+    "delivery_mode": "queue",
     "encrypted": false
 }
 ```
@@ -395,6 +405,8 @@ client.on("message.received", lambda msg: print(msg["payload"]))
 {
     "to": "bob.agentid.pub",
     "ack_seq": 150,
+    "device_id": "device-001",
+    "slot_id": "slot-a",
     "timestamp": 1234567890000
 }
 ```
@@ -403,12 +415,14 @@ client.on("message.received", lambda msg: print(msg["payload"]))
 |------|------|------|
 | `to` | string | **确认方（接收方）AID** — 即执行 ack 操作的一方 |
 | `ack_seq` | integer | 已确认的最大 seq |
+| `device_id` | string | 触发 ack 的设备标识；legacy 客户端为空字符串 |
+| `slot_id` | string | 触发 ack 的消费槽位；空字符串表示设备单实例或 legacy 路径 |
 | `timestamp` | integer | 服务端时间戳（毫秒） |
 
 ### 订阅
 
 ```python
-client.on("message.ack", lambda ev: print(f"{ev['to']} 已确认到 seq {ev['ack_seq']}"))
+client.on("message.ack", lambda ev: print(f"{ev['to']}[{ev['device_id']}/{ev['slot_id']}] 已确认到 seq {ev['ack_seq']}"))
 ```
 
 ---

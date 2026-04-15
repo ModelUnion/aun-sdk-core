@@ -180,6 +180,24 @@ class SeqTracker:
         """导出各命名空间的 contiguous_seq，用于持久化。"""
         return {ns: t.contiguous_seq for ns, t in self._trackers.items() if t.contiguous_seq > 0}
 
+    def force_contiguous_seq(self, ns: str, seq: int) -> None:
+        """强制跳过不连续区间，将 contiguous_seq 拨到指定位置。
+
+        当服务端返回 server_ack_seq 且本地 contiguous_seq 落后时调用，
+        跳过 [contiguous_seq, server_ack_seq) 这段不连续区间。
+        """
+        t = self._get(ns)
+        if seq > t.contiguous_seq:
+            # 清除被跳过区间内的 pending_gaps
+            for gap_key in list(t.pending_gaps):
+                if gap_key[1] <= seq:
+                    del t.pending_gaps[gap_key]
+            # 清除被跳过区间内的 received_seqs
+            t.received_seqs = {s for s in t.received_seqs if s > seq}
+            t.contiguous_seq = seq
+            t.max_seen_seq = max(t.max_seen_seq, seq)
+            self._try_advance(t)
+
     def restore_state(self, state: dict[str, int]) -> None:
         """从持久化数据恢复各命名空间的 contiguous_seq。"""
         for ns, seq in state.items():

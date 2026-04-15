@@ -4,7 +4,7 @@
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi } from 'vitest';
 import { AUNClient } from '../../src/client.js';
-import { ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
+import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
 
 describe('AUNClient 构造', () => {
   it('无参数构造应使用默认配置', () => {
@@ -18,12 +18,12 @@ describe('AUNClient 构造', () => {
   it('自定义配置应正确传递', () => {
     const client = new AUNClient({
       aunPath: 'custom',
-      groupE2ee: false,
-      replayWindowSeconds: 600,
+      seedPassword: 'seed-001',
     });
     expect(client.configModel.aunPath).toBe('custom');
-    expect(client.configModel.groupE2ee).toBe(false);
-    expect(client.configModel.replayWindowSeconds).toBe(600);
+    expect(client.configModel.seedPassword).toBe('seed-001');
+    expect(client.configModel.groupE2ee).toBe(true);
+    expect(client.configModel.replayWindowSeconds).toBe(300);
   });
 
   it('不允许以 verify_ssl=false 构造浏览器 SDK', () => {
@@ -143,6 +143,8 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
     const client = new AUNClient();
     const ks = (client as any)._keystore;
     const aid = 'sync.agentid.pub';
+    const deviceId = (client as any)._deviceId;
+    const slotId = (client as any)._slotId;
 
     await ks.saveIdentity(aid, {
       aid,
@@ -150,19 +152,18 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
       public_key_der_b64: 'pub',
       curve: 'P-256',
     });
-    await ks.saveMetadata(aid, {
-      aid,
-      e2ee_prekeys: {
-        pk1: { private_key_pem: 'KEEP_ME', created_at: 1 },
-      },
+    await ks.saveE2EEPrekey(aid, 'pk1', {
+      private_key_pem: 'KEEP_ME',
+      created_at: 1,
     });
 
     (client as any)._aid = aid;
     await (client as any)._syncIdentityAfterConnect('tok-connect');
 
-    const loaded = await ks.loadMetadata(aid);
-    expect(loaded.access_token).toBe('tok-connect');
-    expect(loaded.e2ee_prekeys.pk1.private_key_pem).toBe('KEEP_ME');
+    const prekeys = await ks.loadE2EEPrekeys(aid);
+    const instanceState = await ks.loadInstanceState(aid, deviceId, slotId);
+    expect(instanceState.access_token).toBe('tok-connect');
+    expect(prekeys.pk1.private_key_pem).toBe('KEEP_ME');
   });
 });
 
@@ -177,16 +178,72 @@ describe('AUNClient message.send 接收者校验', () => {
       encrypt: false,
     })).rejects.toThrow(ValidationError);
   });
+
+  it('message.send 拒绝 persist 参数', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+
+    await expect(client.call('message.send', {
+      to: 'bob.example.com',
+      payload: { text: 'hello' },
+      encrypt: false,
+      persist: true,
+    })).rejects.toThrow("message.send no longer accepts 'persist'");
+  });
+
+  it('message.send 拒绝发送级 delivery_mode 参数', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+
+    await expect(client.call('message.send', {
+      to: 'bob.example.com',
+      payload: { text: 'hello' },
+      encrypt: false,
+      delivery_mode: { mode: 'queue' },
+    })).rejects.toThrow('message.send does not accept delivery_mode');
+  });
+
+  it('message.send 不会转发连接级 delivery_mode', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._connectDeliveryMode = {
+      mode: 'queue',
+      routing: 'sender_affinity',
+      affinity_ttl_ms: 900,
+    };
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+
+    await client.call('message.send', {
+      to: 'bob.example.com',
+      payload: { text: 'hello' },
+      encrypt: false,
+    });
+
+    const [, sentParams] = (client as any)._transport.call.mock.calls[0];
+    expect(sentParams.delivery_mode).toBeUndefined();
+  });
+
+  it('message.pull 自动注入当前实例 device_id/slot_id', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ messages: [] });
+
+    await client.call('message.pull', { after_seq: 0, limit: 10 });
+
+    expect((client as any)._transport.call).toHaveBeenCalledWith('message.pull', expect.objectContaining({
+      device_id: (client as any)._deviceId,
+      slot_id: 'slot-a',
+    }));
+  });
 });
 
 describe('AUNClient._fetchPeerPrekey', () => {
-  it('found=false 时抛出 prekey 缺失错误', async () => {
+  it('found=false 时返回 null，允许降级到 long_term_key', async () => {
     const client = new AUNClient();
     (client as any)._transport.call = vi.fn().mockResolvedValue({ found: false });
 
-    await expect((client as any)._fetchPeerPrekey('bob.example.com')).rejects.toThrow(
-      'peer prekey not found for bob.example.com',
-    );
+    await expect((client as any)._fetchPeerPrekey('bob.example.com')).resolves.toBeNull();
   });
 
   it('查询失败时抛出 ValidationError', async () => {
@@ -209,14 +266,43 @@ describe('AUNClient._fetchPeerPrekey', () => {
 });
 
 describe('AUNClient prekey 证书指纹编排', () => {
+  it('queue 模式下多设备仍应生成多设备密文', async () => {
+    const client = new AUNClient();
+    (client as any)._connectDeliveryMode = { mode: 'queue', routing: 'round_robin', affinity_ttl_ms: 0 };
+    (client as any)._sendEncryptedSingle = vi.fn().mockResolvedValue({ ok: true });
+    (client as any)._fetchPeerPrekeys = vi.fn().mockResolvedValue([
+      { device_id: 'phone', prekey_id: 'pk-phone', public_key: 'pub-1', signature: 'sig-1', cert_fingerprint: 'sha256:abc' },
+      { device_id: 'laptop', prekey_id: 'pk-laptop', public_key: 'pub-2', signature: 'sig-2', cert_fingerprint: 'sha256:abc' },
+    ]);
+    (client as any)._buildSelfSyncCopies = vi.fn().mockResolvedValue([]);
+    (client as any)._buildRecipientDeviceCopies = vi.fn().mockResolvedValue([
+      { device_id: 'phone', envelope: { ciphertext: 'c1' } },
+      { device_id: 'laptop', envelope: { ciphertext: 'c2' } },
+    ]);
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+
+    const result = await (client as any)._sendEncrypted({
+      to: 'bob.example.com',
+      payload: { text: 'hello' },
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect((client as any)._sendEncryptedSingle).not.toHaveBeenCalled();
+    expect((client as any)._transport.call).toHaveBeenCalledWith('message.send', expect.objectContaining({
+      type: 'e2ee.multi_device',
+    }));
+    const [, sentParams] = (client as any)._transport.call.mock.calls[0];
+    expect(sentParams.delivery_mode).toBeUndefined();
+  });
+
   it('发送加密消息时应按 prekey.cert_fingerprint 获取证书', async () => {
     const client = new AUNClient();
-    (client as any)._fetchPeerPrekey = vi.fn().mockResolvedValue({
+    (client as any)._fetchPeerPrekeys = vi.fn().mockResolvedValue([{
       prekey_id: 'pk-1',
       public_key: 'pub',
       signature: 'sig',
       cert_fingerprint: 'sha256:abc',
-    });
+    }]);
     (client as any)._fetchPeerCert = vi.fn().mockResolvedValue('CERT');
     (client as any)._e2ee.encryptOutbound = vi.fn().mockResolvedValue([
       { ciphertext: 'ok' },
@@ -231,6 +317,34 @@ describe('AUNClient prekey 证书指纹编排', () => {
 
     expect(result).toEqual({ ok: true });
     expect((client as any)._fetchPeerCert).toHaveBeenCalledWith('bob.example.com', 'sha256:abc');
+  });
+
+  it('无 prekey 时应继续走 long_term_key 路径', async () => {
+    const client = new AUNClient();
+    ((client as any).configModel).requireForwardSecrecy = false;
+    (client as any)._fetchPeerPrekeys = vi.fn().mockResolvedValue([]);
+    (client as any)._fetchPeerPrekey = vi.fn().mockResolvedValue(null);
+    (client as any)._fetchPeerCert = vi.fn().mockResolvedValue('CERT');
+    (client as any)._e2ee.encryptOutbound = vi.fn().mockResolvedValue([
+      { ciphertext: 'ok', sender_cert_fingerprint: 'sha256:sender' },
+      { encrypted: true, forward_secrecy: false, mode: 'long_term_key', degraded: true, degradation_reason: 'no_prekey_available' },
+    ]);
+    (client as any)._dispatcher.publish = vi.fn().mockResolvedValue(undefined);
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+
+    const result = await (client as any)._sendEncrypted({
+      to: 'bob.example.com',
+      payload: { text: 'hello' },
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect((client as any)._fetchPeerPrekey).toHaveBeenCalledWith('bob.example.com');
+    expect((client as any)._fetchPeerCert).toHaveBeenCalledWith('bob.example.com', undefined);
+    expect((client as any)._e2ee.encryptOutbound).toHaveBeenCalledWith(
+      'bob.example.com',
+      { text: 'hello' },
+      expect.objectContaining({ prekey: null }),
+    );
   });
 });
 
@@ -276,5 +390,49 @@ describe('AUNClient prekey 补充', () => {
 
     await new Promise(resolve => setTimeout(resolve, 0));
     expect((client as any)._uploadPrekey).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AUNClient 重连错误分类', () => {
+  it('aid_login2_failed 应视为可重试', () => {
+    const client = new AUNClient();
+    expect((client as any)._shouldRetryReconnect(new AuthError('aid_login2_failed'))).toBe(true);
+  });
+
+  it('普通 AuthError 仍应直接终止', () => {
+    const client = new AUNClient();
+    expect((client as any)._shouldRetryReconnect(new AuthError('token invalid'))).toBe(false);
+  });
+});
+
+describe('AUNClient 群补拉实例上下文', () => {
+  it('_fillGroupGap 应复用当前实例 device_id', async () => {
+    const client = new AUNClient();
+    (client as any)._seqTracker.getContiguousSeq = vi.fn().mockReturnValue(12);
+    (client as any).call = vi.fn().mockResolvedValue({ messages: [] });
+
+    await (client as any)._fillGroupGap('group-1');
+
+    expect((client as any).call).toHaveBeenCalledWith('group.pull', expect.objectContaining({
+      group_id: 'group-1',
+      after_message_seq: 12,
+      device_id: (client as any)._deviceId,
+      limit: 50,
+    }));
+  });
+
+  it('_fillGroupEventGap 应复用当前实例 device_id', async () => {
+    const client = new AUNClient();
+    (client as any)._seqTracker.getContiguousSeq = vi.fn().mockReturnValue(5);
+    (client as any).call = vi.fn().mockResolvedValue({ events: [] });
+
+    await (client as any)._fillGroupEventGap('group-2');
+
+    expect((client as any).call).toHaveBeenCalledWith('group.pull_events', expect.objectContaining({
+      group_id: 'group-2',
+      after_event_seq: 5,
+      device_id: (client as any)._deviceId,
+      limit: 50,
+    }));
   });
 });

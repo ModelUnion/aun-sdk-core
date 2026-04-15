@@ -228,6 +228,34 @@ func seqGapKey(start, end int) string {
 	return intToStr(start) + ":" + intToStr(end)
 }
 
+// ForceContiguousSeq 强制跳过不连续区间，将 contiguousSeq 拨到指定位置。
+// 当服务端返回 server_ack_seq 且本地 contiguousSeq 落后时调用，
+// 跳过 [contiguousSeq, server_ack_seq) 这段不连续区间。
+func (st *SeqTracker) ForceContiguousSeq(ns string, seq int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	t := st.getState(ns)
+	if seq > t.contiguousSeq {
+		// 清除被跳过区间内的 pendingGaps
+		for key, probe := range t.pendingGaps {
+			if probe.gapEnd <= seq {
+				delete(t.pendingGaps, key)
+			}
+		}
+		// 清除被跳过区间内的 receivedSeqs
+		for s := range t.receivedSeqs {
+			if s <= seq {
+				delete(t.receivedSeqs, s)
+			}
+		}
+		t.contiguousSeq = seq
+		if seq > t.maxSeenSeq {
+			t.maxSeenSeq = seq
+		}
+		st.tryAdvance(t)
+	}
+}
+
 // ExportState 导出各命名空间的 contiguousSeq，用于持久化
 func (st *SeqTracker) ExportState() map[string]int {
 	st.mu.Lock()

@@ -50,8 +50,8 @@ func NewAuthNamespace(client ClientInterface) *AuthNamespace {
 //
 // 发现流程：
 //  1. 若 gatewayURL 已预置，直接返回
-//  2. https://{aid}/.well-known/aun-gateway（泛域名 nameservice）
-//  3. https://gateway.{issuer}/.well-known/aun-gateway（Gateway 直连）
+//  2. 开发环境：先 gateway.{issuer}，再 fallback {aid}（泛域名在开发环境可能不可用）
+//  3. 生产环境：先 {aid}（泛域名 nameservice），再 fallback gateway.{issuer}
 func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string, error) {
 	if gw := a.client.GetGatewayURL(); gw != "" {
 		return gw, nil
@@ -76,16 +76,22 @@ func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string,
 		portSuffix = fmt.Sprintf(":%d", port)
 	}
 
-	// 首选：通过 AID 域名发现
-	primaryURL := fmt.Sprintf("https://%s%s/.well-known/aun-gateway", resolvedAID, portSuffix)
+	aidURL := fmt.Sprintf("https://%s%s/.well-known/aun-gateway", resolvedAID, portSuffix)
+	gatewayURL := fmt.Sprintf("https://gateway.%s%s/.well-known/aun-gateway", issuerDomain, portSuffix)
+
+	// 开发环境：先 gateway.{issuer}（固定域名），再 fallback {aid}（泛域名）
+	// 生产环境：先 {aid}（泛域名），再 fallback gateway.{issuer}
+	primaryURL, fallbackURL := aidURL, gatewayURL
+	if !a.client.GetConfigVerifySSL() {
+		primaryURL, fallbackURL = gatewayURL, aidURL
+	}
+
 	gwURL, err := a.client.DiscoverGateway(ctx, primaryURL, 5*time.Second)
 	if err == nil {
 		return gwURL, nil
 	}
 	log.Printf("gateway 发现失败 (%s): %v", primaryURL, err)
 
-	// 备选：通过 gateway.{issuer} 发现
-	fallbackURL := fmt.Sprintf("https://gateway.%s%s/.well-known/aun-gateway", issuerDomain, portSuffix)
 	return a.client.DiscoverGateway(ctx, fallbackURL, 5*time.Second)
 }
 

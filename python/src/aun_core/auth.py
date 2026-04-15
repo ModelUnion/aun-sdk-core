@@ -41,12 +41,21 @@ def _verify_signature(public_key: Any, sig_bytes: bytes, data_bytes: bytes) -> N
 
 
 class AuthFlow:
+    _INSTANCE_STATE_FIELDS = (
+        "access_token",
+        "refresh_token",
+        "kite_token",
+        "access_token_expires_at",
+    )
+
     def __init__(
         self,
         *,
         keystore: FileKeyStore,
         crypto: CryptoProvider,
         aid: str | None = None,
+        device_id: str = "",
+        slot_id: str = "",
         connection_factory=None,
         root_ca_path: str | None = None,
         chain_cache_ttl: int = 86400,
@@ -55,6 +64,8 @@ class AuthFlow:
         self._keystore = keystore
         self._crypto = crypto
         self._aid = aid
+        self._device_id = str(device_id or "").strip()
+        self._slot_id = str(slot_id or "").strip()
         self._connection_factory = connection_factory or self._default_connection_factory
         self._root_ca_path = root_ca_path
         self._verify_ssl = verify_ssl
@@ -73,8 +84,9 @@ class AuthFlow:
         cert = self._keystore.load_cert(identity["aid"])
         if cert:
             identity["cert"] = cert
-        metadata = self._keystore.load_metadata(identity["aid"]) or {}
-        identity.update(metadata)
+        instance_state = self._load_instance_state(identity["aid"])
+        if isinstance(instance_state, dict):
+            identity.update(instance_state)
         return identity
 
     def load_identity_or_none(self, aid: str | None = None) -> dict[str, Any] | None:
@@ -89,12 +101,16 @@ class AuthFlow:
             return float(expires_at)
         return None
 
+    def set_instance_context(self, *, device_id: str, slot_id: str = "") -> None:
+        self._device_id = str(device_id or "").strip()
+        self._slot_id = str(slot_id or "").strip()
+
     async def create_aid(self, gateway_url: str, aid: str) -> dict[str, Any]:
         self._validate_aid_name(aid)
         identity = self._ensure_local_identity(aid)
         if identity.get("cert"):
             identity = await self._sync_existing_identity_cert(gateway_url, identity)
-            self._keystore.save_identity(identity["aid"], identity)
+            self._persist_identity(identity)
             self._aid = identity["aid"]
             return {"aid": identity["aid"], "cert": identity["cert"]}
 
@@ -117,7 +133,7 @@ class AuthFlow:
                     f"(1) use a different AID name, or "
                     f"(2) restart Kite server to clear registration."
                 ) from e
-        self._keystore.save_identity(identity["aid"], identity)
+        self._persist_identity(identity)
         self._aid = identity["aid"]
         return {"aid": identity["aid"], "cert": identity["cert"]}
 
@@ -190,7 +206,7 @@ class AuthFlow:
             # 本地有密钥但无证书 — 尝试从 PKI 下载恢复
             try:
                 identity = await self._recover_cert_via_download(gateway_url, identity)
-                self._keystore.save_identity(identity["aid"], identity)
+                self._persist_identity(identity)
             except Exception as e:
                 raise StateError(
                     f"local certificate missing and recovery failed: {e}. "
@@ -199,7 +215,7 @@ class AuthFlow:
         login = await self._login(gateway_url, identity)
         self._remember_tokens(identity, login)
         await self._validate_new_cert(identity, gateway_url)
-        self._keystore.save_identity(identity["aid"], identity)
+        self._persist_identity(identity)
         self._aid = identity["aid"]
         return {
             "aid": identity["aid"],
@@ -214,12 +230,12 @@ class AuthFlow:
         if not identity.get("cert"):
             created = await self._create_aid(gateway_url, identity)
             identity.update(created)
-            self._keystore.save_identity(identity["aid"], identity)
+            self._persist_identity(identity)
 
         login = await self._login(gateway_url, identity)
         self._remember_tokens(identity, login)
         await self._validate_new_cert(identity, gateway_url)
-        self._keystore.save_identity(identity["aid"], identity)
+        self._persist_identity(identity)
 
         token = identity.get("access_token") or identity.get("token") or identity.get("kite_token")
         if not token:
@@ -233,7 +249,7 @@ class AuthFlow:
         refreshed = await self._refresh_access_token(gateway_url, refresh_token)
         self._remember_tokens(identity, refreshed)
         await self._validate_new_cert(identity, gateway_url)
-        self._keystore.save_identity(identity["aid"], identity)
+        self._persist_identity(identity)
         return identity
 
     async def initialize_with_token(
@@ -241,11 +257,23 @@ class AuthFlow:
         transport,
         challenge: dict[str, Any] | None,
         access_token: str,
+        *,
+        device_id: str = "",
+        slot_id: str = "",
+        delivery_mode: dict[str, Any] | None = None,
     ) -> None:
         nonce = challenge.get("params", {}).get("nonce", "")
         if not nonce:
             raise AuthError("gateway challenge missing nonce")
-        await self._initialize_session(transport, nonce, access_token)
+        self.set_instance_context(device_id=device_id, slot_id=slot_id)
+        await self._initialize_session(
+            transport,
+            nonce,
+            access_token,
+            device_id=device_id,
+            slot_id=slot_id,
+            delivery_mode=delivery_mode,
+        )
 
     async def connect_session(
         self,
@@ -254,10 +282,14 @@ class AuthFlow:
         gateway_url: str,
         *,
         access_token: str | None = None,
+        device_id: str = "",
+        slot_id: str = "",
+        delivery_mode: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         nonce = challenge.get("params", {}).get("nonce", "")
         if not nonce:
             raise AuthError("gateway challenge missing nonce")
+        self.set_instance_context(device_id=device_id, slot_id=slot_id)
 
         try:
             identity = self.load_identity()
@@ -267,9 +299,16 @@ class AuthFlow:
         explicit_token = str(access_token or "")
         if explicit_token and identity is not None:
             try:
-                await self._initialize_session(transport, nonce, explicit_token)
+                await self._initialize_session(
+                    transport,
+                    nonce,
+                    explicit_token,
+                    device_id=device_id,
+                    slot_id=slot_id,
+                    delivery_mode=delivery_mode,
+                )
                 identity["access_token"] = explicit_token
-                self._keystore.save_identity(identity["aid"], identity)
+                self._persist_identity(identity)
                 return {"token": explicit_token, "identity": identity}
             except AuthError as exc:
                 _auth_log.debug("explicit_token 认证失败，尝试下一方式: %s", exc)
@@ -277,13 +316,27 @@ class AuthFlow:
         if identity is None:
             auth_context = await self.ensure_authenticated(gateway_url)
             token = auth_context["token"]
-            await self._initialize_session(transport, nonce, token)
+            await self._initialize_session(
+                transport,
+                nonce,
+                token,
+                device_id=device_id,
+                slot_id=slot_id,
+                delivery_mode=delivery_mode,
+            )
             return auth_context
 
         cached_token = self._get_cached_access_token(identity)
         if cached_token:
             try:
-                await self._initialize_session(transport, nonce, cached_token)
+                await self._initialize_session(
+                    transport,
+                    nonce,
+                    cached_token,
+                    device_id=device_id,
+                    slot_id=slot_id,
+                    delivery_mode=delivery_mode,
+                )
                 return {"token": cached_token, "identity": identity}
             except AuthError as exc:
                 _auth_log.debug("cached_token 认证失败，尝试刷新: %s", exc)
@@ -294,7 +347,14 @@ class AuthFlow:
                 identity = await self.refresh_cached_tokens(gateway_url, identity)
                 cached_token = self._get_cached_access_token(identity)
                 if cached_token:
-                    await self._initialize_session(transport, nonce, cached_token)
+                    await self._initialize_session(
+                        transport,
+                        nonce,
+                        cached_token,
+                        device_id=device_id,
+                        slot_id=slot_id,
+                        delivery_mode=delivery_mode,
+                    )
                     return {"token": cached_token, "identity": identity}
             except AuthError as exc:
                 _auth_log.debug("refresh_token 认证失败，将重新登录: %s", exc)
@@ -303,22 +363,42 @@ class AuthFlow:
         token = str(login.get("access_token") or "")
         if not token:
             raise AuthError("authenticate did not return access_token")
-        await self._initialize_session(transport, nonce, token)
+        await self._initialize_session(
+            transport,
+            nonce,
+            token,
+            device_id=device_id,
+            slot_id=slot_id,
+            delivery_mode=delivery_mode,
+        )
         identity = self.load_identity(identity.get("aid"))
         return {"token": token, "identity": identity}
 
-    async def _initialize_session(self, transport, nonce: str, token: str) -> None:
+    async def _initialize_session(
+        self,
+        transport,
+        nonce: str,
+        token: str,
+        *,
+        device_id: str = "",
+        slot_id: str = "",
+        delivery_mode: dict[str, Any] | None = None,
+    ) -> None:
         # The SDK lifecycle concept is "initialize(token)"; the gateway currently
         # serves it through its internal auth.connect entrypoint.
-        result = await transport.call("auth.connect", {
+        request = {
             "nonce": nonce,
             "auth": {"method": "kite_token", "token": token},
             "protocol": {"min": "1.0", "max": "1.0"},
+            "device": {"id": str(device_id or ""), "type": "sdk"},
+            "client": {"slot_id": str(slot_id or "")},
+            "delivery_mode": delivery_mode or {"mode": "fanout"},
             "capabilities": {
                 "e2ee": True,
                 "group_e2ee": True,
             },
-        })
+        }
+        result = await transport.call("auth.connect", request)
         status = (result or {}).get("status")
         if status != "ok":
             raise AuthError(f"initialize failed: {result}")
@@ -834,8 +914,8 @@ class AuthFlow:
                 await self._verify_auth_cert_revocation(gateway_url, cert)
                 try:
                     await self._verify_auth_cert_ocsp(gateway_url, cert)
-                except AuthError:
-                    pass  # OCSP 不可用时降级（CRL 已检查）
+                except AuthError as exc:
+                    _auth_log.info("OCSP 校验不可用，降级继续 (CRL 已检查): %s", exc)
             # 验证通过，正式接受
             identity["cert"] = new_cert_pem if isinstance(new_cert_pem, str) else new_cert_pem.decode("utf-8")
         except AuthError as exc:
@@ -860,7 +940,7 @@ class AuthFlow:
             return existing
         identity = self._crypto.generate_identity()
         identity["aid"] = aid
-        self._keystore.save_identity(aid, identity)  # 立即持久化 keypair，避免服务端拒绝后丢失
+        self._persist_identity(identity)  # 立即持久化 keypair，避免服务端拒绝后丢失
         self._aid = aid
         return identity
 
@@ -908,8 +988,65 @@ class AuthFlow:
                 raise StateError("no local identity found, call auth.create_aid() first")
             identity = self._crypto.generate_identity()
             identity["aid"] = self._aid
-            self._keystore.save_identity(self._aid, identity)  # 立即持久化，避免后续网络失败丢失密钥
+            self._persist_identity(identity)  # 立即持久化，避免后续网络失败丢失密钥
             return identity
+
+    def _load_instance_state(self, aid: str) -> dict[str, Any] | None:
+        if not self._device_id:
+            return None
+        loader = getattr(self._keystore, "load_instance_state", None)
+        if not callable(loader):
+            return None
+        return loader(aid, self._device_id, self._slot_id)
+
+    def _persist_identity(self, identity: dict[str, Any]) -> None:
+        aid = str(identity.get("aid") or "")
+        if not aid:
+            raise StateError("identity missing aid")
+        persisted = dict(identity)
+        instance_state = {}
+        for key in self._INSTANCE_STATE_FIELDS:
+            if key in persisted:
+                instance_state[key] = persisted.pop(key)
+        self._keystore.save_identity(aid, persisted)
+        if self._device_id:
+            # 从共享 metadata 中移除实例级字段（它们已保存到 instance_state）
+            db = getattr(self._keystore, "_get_db", None)
+            if callable(db):
+                aid_db = db(aid)
+                for key in self._INSTANCE_STATE_FIELDS:
+                    aid_db.delete_metadata(key)
+                    aid_db.delete_metadata(f"{key}_protection")
+        if not self._device_id or not instance_state:
+            return
+        updater = getattr(self._keystore, "update_instance_state", None)
+        if not callable(updater):
+            return
+
+        def _merge(current: dict[str, Any]) -> dict[str, Any]:
+            current.update(instance_state)
+            return current
+
+        updater(aid, self._device_id, self._slot_id, _merge)
 
     async def _default_connection_factory(self, url: str):
         return await websockets.connect(url, open_timeout=5, close_timeout=5, ping_interval=None)
+
+    def clean_expired_caches(self) -> None:
+        """清理过期的 gateway 缓存条目（供外部定时调用）"""
+        now = time.time()
+        for k in list(self._gateway_crl_cache):
+            entry = self._gateway_crl_cache[k]
+            if float(entry.get("next_refresh_at") or 0.0) <= now:
+                del self._gateway_crl_cache[k]
+        for k in list(self._gateway_ocsp_cache):
+            inner = self._gateway_ocsp_cache[k]
+            for serial in list(inner):
+                if float(inner[serial].get("next_refresh_at") or 0.0) <= now:
+                    del inner[serial]
+            if not inner:
+                del self._gateway_ocsp_cache[k]
+        ttl = self._chain_cache_ttl
+        for k in list(self._chain_verified_cache):
+            if now - self._chain_verified_cache[k] >= ttl:
+                del self._chain_verified_cache[k]

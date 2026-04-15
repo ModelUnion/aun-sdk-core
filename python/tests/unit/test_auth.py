@@ -348,6 +348,69 @@ def test_verify_peer_cert_revoked():
         asyncio.run(flow.verify_peer_certificate("wss://gw.example/aun", peer_cert, "alice.example.com"))
 
 
+def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
+    keystore = FileKeyStore(tmp_path / "aun")
+    flow = AuthFlow(
+        keystore=keystore,
+        crypto=CryptoProvider(),
+        connection_factory=lambda url: None,
+        device_id="device-1",
+        slot_id="slot-a",
+    )
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params):
+            calls.append((method, params))
+            return {"status": "ok"}
+
+    asyncio.run(flow.initialize_with_token(
+        _Transport(),
+        {"params": {"nonce": "nonce-1"}},
+        "token-1",
+        device_id="device-1",
+        slot_id="slot-a",
+        delivery_mode={"mode": "queue", "routing": "sender_affinity", "affinity_ttl_ms": 800},
+    ))
+
+    assert calls[0][0] == "auth.connect"
+    params = calls[0][1]
+    assert params["device"] == {"id": "device-1", "type": "sdk"}
+    assert params["client"] == {"slot_id": "slot-a"}
+    assert params["delivery_mode"] == {"mode": "queue", "routing": "sender_affinity", "affinity_ttl_ms": 800}
+
+
+def test_load_identity_prefers_instance_state_tokens(tmp_path):
+    keystore = FileKeyStore(tmp_path / "aun")
+    aid = "alice.example.aid"
+    keystore.save_identity(aid, {
+        "aid": aid,
+        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+        "public_key_der_b64": "pub",
+        "curve": "P-256",
+        "access_token": "shared-token",
+        "refresh_token": "shared-refresh",
+    })
+    keystore.save_instance_state(aid, "device-1", "slot-a", {
+        "access_token": "slot-token",
+        "refresh_token": "slot-refresh",
+        "access_token_expires_at": 123456,
+    })
+    flow = AuthFlow(
+        keystore=keystore,
+        crypto=CryptoProvider(),
+        connection_factory=lambda url: None,
+        device_id="device-1",
+        slot_id="slot-a",
+    )
+
+    loaded = flow.load_identity(aid)
+
+    assert loaded["access_token"] == "slot-token"
+    assert loaded["refresh_token"] == "slot-refresh"
+    assert loaded["access_token_expires_at"] == 123456
+
+
 # ── P0-2: _validate_new_cert 测试 ───────────────────────────
 
 

@@ -393,7 +393,7 @@ test.describe('配置', () => {
       return AUN.createConfig({ aunPath: 'custom', groupE2ee: false, replayWindowSeconds: 600 });
     });
     expect(config.aunPath).toBe('custom');
-    expect(config.groupE2ee).toBe(false);
+    expect(config.groupE2ee).toBe(true);
     expect(config.replayWindowSeconds).toBe(600);
   });
 
@@ -807,19 +807,13 @@ test.describe('P2P E2EE 集成测试', () => {
       const bobAid = `br-b-${rid}.agentid.pub`;
 
       // 创建 Alice
-      const alice = new AUN.AUNClient({
-        verify_ssl: false,
-        require_forward_secrecy: false,
-      });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
       // 创建 Bob
-      const bob = new AUN.AUNClient({
-        verify_ssl: false,
-        require_forward_secrecy: false,
-      });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
@@ -877,19 +871,13 @@ test.describe('Group E2EE 集成测试', () => {
       const bobAid = `bg-b-${rid}.agentid.pub`;
 
       // Alice 连接
-      const alice = new AUN.AUNClient({
-        verify_ssl: false,
-        require_forward_secrecy: false,
-      });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
       // Bob 连接
-      const bob = new AUN.AUNClient({
-        verify_ssl: false,
-        require_forward_secrecy: false,
-      });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
@@ -940,10 +928,7 @@ test.describe('Group E2EE 集成测试', () => {
       const AUN = (window as any).AUN;
       const aid = `bg-pt-${rid}.agentid.pub`;
 
-      const client = new AUN.AUNClient({
-        verify_ssl: false,
-        require_forward_secrecy: false,
-      });
+      const client = new AUN.AUNClient();
       await client.auth.createAid({ aid });
       const auth = await client.auth.authenticate({ aid });
       await client.connect(auth);
@@ -973,17 +958,17 @@ test.describe('Group E2EE 集成测试', () => {
       const carolAid = `bg-mc-${rid}.agentid.pub`;
 
       // 创建 3 个客户端
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      const carol = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const carol = new AUN.AUNClient();
       await carol.auth.createAid({ aid: carolAid });
       const cAuth = await carol.auth.authenticate({ aid: carolAid });
       await carol.connect(cAuth);
@@ -1037,17 +1022,17 @@ test.describe('Group E2EE 集成测试', () => {
       const bobAid = `bg-kb-${rid}.agentid.pub`;
       const carolAid = `bg-kc-${rid}.agentid.pub`;
 
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      const carol = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const carol = new AUN.AUNClient();
       await carol.auth.createAid({ aid: carolAid });
       const cAuth = await carol.auth.authenticate({ aid: carolAid });
       await carol.connect(cAuth);
@@ -1100,17 +1085,17 @@ test.describe('Group E2EE 集成测试', () => {
       const bobAid = `bg-jb-${rid}.agentid.pub`;
       const carolAid = `bg-jc-${rid}.agentid.pub`;
 
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      const carol = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const carol = new AUN.AUNClient();
       await carol.auth.createAid({ aid: carolAid });
       const cAuth = await carol.auth.authenticate({ aid: carolAid });
       await carol.connect(cAuth);
@@ -1159,12 +1144,12 @@ test.describe('Group E2EE 集成测试', () => {
       const aliceAid = `bg-ba-${rid}.agentid.pub`;
       const bobAid = `bg-bb-${rid}.agentid.pub`;
 
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
@@ -1218,12 +1203,12 @@ test.describe('Group E2EE 集成测试', () => {
       const aliceAid = `bg-mx-${rid}.agentid.pub`;
       const bobAid = `bg-my-${rid}.agentid.pub`;
 
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
@@ -1286,17 +1271,17 @@ test.describe('Group E2EE 集成测试', () => {
       const bobAid = `bg-ob-${rid}.agentid.pub`;
       const carolAid = `bg-oc-${rid}.agentid.pub`;
 
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      const carol = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const carol = new AUN.AUNClient();
       await carol.auth.createAid({ aid: carolAid });
       const cAuth = await carol.auth.authenticate({ aid: carolAid });
       await carol.connect(cAuth);
@@ -1361,17 +1346,17 @@ test.describe('Group E2EE 集成测试', () => {
       const bobAid = `bg-lb-${rid}.agentid.pub`;
       const carolAid = `bg-lc-${rid}.agentid.pub`;
 
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      const carol = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const carol = new AUN.AUNClient();
       await carol.auth.createAid({ aid: carolAid });
       const cAuth = await carol.auth.authenticate({ aid: carolAid });
       await carol.connect(cAuth);
@@ -1432,12 +1417,12 @@ test.describe('P2P E2EE 扩展测试', () => {
       const bobAid = `br-pk-b-${rid}.agentid.pub`;
 
       // Alice 和 Bob 都连接（连接时 SDK 自动上传 prekey）
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
@@ -1475,43 +1460,268 @@ test.describe('P2P E2EE 扩展测试', () => {
     }
   });
 
-  test('SDK 无 prekey 时直接报错', async ({ page }) => {
+  test('SDK 无 prekey 时降级到 long_term_key', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
       const senderAid = `br-lt-s-${rid}.agentid.pub`;
       const receiverAid = `br-lt-r-${rid}.agentid.pub`;
+      const waitForPullText = async (
+        client: any,
+        fromAid: string,
+        afterSeq: number,
+        expectedText: string,
+        timeout = 15000,
+      ) => {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+          const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 20 });
+          const msgs = (pullResult.messages || []).filter((m: any) => m.from === fromAid);
+          for (const msg of msgs) {
+            if (msg?.payload?.text === expectedText) {
+              return msg;
+            }
+          }
+          await new Promise(r => setTimeout(r, 500));
+        }
+        throw new Error(`timeout waiting for ${expectedText}`);
+      };
 
       // Sender 连接
-      const sender = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const sender = new AUN.AUNClient();
+      sender.configModel.requireForwardSecrecy = false;
       await sender.auth.createAid({ aid: senderAid });
       const sAuth = await sender.auth.authenticate({ aid: senderAid });
       await sender.connect(sAuth);
 
       // Receiver 只创建 AID，不连接（所以不会上传 prekey）
-      const receiver = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const receiver = new AUN.AUNClient();
       await receiver.auth.createAid({ aid: receiverAid });
 
-      let errorMessage = '';
-      try {
-        await sender.call('message.send', {
-          to: receiverAid,
-          payload: { text: 'missing-prekey' },
-          encrypt: true,
-        });
-      } catch (error) {
-        errorMessage = error instanceof Error ? error.message : String(error);
-      }
+      await sender.call('message.send', {
+        to: receiverAid,
+        payload: { text: 'missing-prekey' },
+        encrypt: true,
+      });
+
+      const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
+      await receiver.connect(rAuth);
+      const msg = await waitForPullText(receiver, senderAid, 0, 'missing-prekey');
 
       await sender.close();
       await receiver.close();
 
       return {
-        errorMessage,
+        text: msg?.payload?.text ?? null,
+        mode: msg?.e2ee?.encryption_mode ?? null,
       };
     }, rid);
 
-    expect(result.errorMessage).toContain('peer prekey not found for');
+    expect(result.text).toBe('missing-prekey');
+    expect(result.mode).toBe('long_term_key');
+  });
+
+  test('同一 AID 多设备 fanout + 发件同步副本', async ({ page }) => {
+    const rid = Math.random().toString(36).slice(2, 8);
+    const result = await page.evaluate(async (rid) => {
+      const AUN = (window as any).AUN;
+      const aliceAid = `br-md-a-${rid}.agentid.pub`;
+      const bobAid = `br-md-b-${rid}.agentid.pub`;
+      const makeClient = (deviceId: string) => {
+        const client = new AUN.AUNClient();
+        client._deviceId = deviceId;
+        return client;
+      };
+      const currentMaxSeq = async (client: any) => {
+        let afterSeq = 0;
+        let maxSeq = 0;
+        for (;;) {
+          const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 50 });
+          const msgs = pullResult.messages || [];
+          if (!msgs.length) return maxSeq;
+          for (const msg of msgs) {
+            maxSeq = Math.max(maxSeq, Number(msg?.seq || 0));
+          }
+          if (msgs.length < 50) return maxSeq;
+          afterSeq = maxSeq;
+        }
+      };
+      const waitForPullText = async (
+        client: any,
+        fromAid: string,
+        afterSeq: number,
+        expectedText: string,
+        timeout = 20000,
+      ) => {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+          const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 50 });
+          const msgs = (pullResult.messages || []).filter((m: any) => m.from === fromAid);
+          for (const msg of msgs) {
+            if (msg?.payload?.text === expectedText) {
+              return msg;
+            }
+          }
+          await new Promise(r => setTimeout(r, 500));
+        }
+        throw new Error(`timeout waiting for ${expectedText}`);
+      };
+
+      const aliceMain = makeClient(`alice-main-${rid}`);
+      await aliceMain.auth.createAid({ aid: aliceAid });
+      const aAuth = await aliceMain.auth.authenticate({ aid: aliceAid });
+      await aliceMain.connect(aAuth);
+
+      const bobPhone = makeClient(`bob-phone-${rid}`);
+      await bobPhone.auth.createAid({ aid: bobAid });
+      const bAuth = await bobPhone.auth.authenticate({ aid: bobAid });
+      await bobPhone.connect(bAuth);
+
+      const aliceSync = makeClient(`alice-sync-${rid}`);
+      const aSyncAuth = await aliceSync.auth.authenticate({ aid: aliceAid });
+      await aliceSync.connect(aSyncAuth);
+
+      const bobLaptop = makeClient(`bob-laptop-${rid}`);
+      const bSyncAuth = await bobLaptop.auth.authenticate({ aid: bobAid });
+      await bobLaptop.connect(bSyncAuth);
+
+      await new Promise(r => setTimeout(r, 1000));
+
+      const baseBobPhone = await currentMaxSeq(bobPhone);
+      const baseBobLaptop = await currentMaxSeq(bobLaptop);
+      const baseAliceSync = await currentMaxSeq(aliceSync);
+      const text = `browser_multi_device_${Date.now()}`;
+
+      await aliceMain.call('message.send', {
+        to: bobAid,
+        payload: { text, kind: 'multi-device' },
+        encrypt: true,
+      });
+
+      const bobPhoneMsg = await waitForPullText(bobPhone, aliceAid, baseBobPhone, text);
+      const bobLaptopMsg = await waitForPullText(bobLaptop, aliceAid, baseBobLaptop, text);
+      const aliceSyncMsg = await waitForPullText(aliceSync, aliceAid, baseAliceSync, text);
+
+      await aliceMain.close();
+      await bobPhone.close();
+      await aliceSync.close();
+      await bobLaptop.close();
+
+      return {
+        bobPhoneText: bobPhoneMsg?.payload?.text ?? null,
+        bobLaptopText: bobLaptopMsg?.payload?.text ?? null,
+        aliceSyncText: aliceSyncMsg?.payload?.text ?? null,
+        bobPhoneDirection: bobPhoneMsg?.direction ?? null,
+        bobLaptopDirection: bobLaptopMsg?.direction ?? null,
+        aliceSyncDirection: aliceSyncMsg?.direction ?? null,
+      };
+    }, rid);
+
+    expect(result.bobPhoneText).toBeTruthy();
+    expect(result.bobLaptopText).toBe(result.bobPhoneText);
+    expect(result.aliceSyncText).toBe(result.bobPhoneText);
+    expect(result.bobPhoneDirection).toBe('inbound');
+    expect(result.bobLaptopDirection).toBe('inbound');
+    expect(result.aliceSyncDirection).toBe('outbound_sync');
+  });
+
+  test('多设备离线设备重连后补拉自己的设备副本', async ({ page }) => {
+    const rid = Math.random().toString(36).slice(2, 8);
+    const result = await page.evaluate(async (rid) => {
+      const AUN = (window as any).AUN;
+      const aliceAid = `br-off-a-${rid}.agentid.pub`;
+      const bobAid = `br-off-b-${rid}.agentid.pub`;
+      const makeClient = (deviceId: string) => {
+        const client = new AUN.AUNClient();
+        client._deviceId = deviceId;
+        return client;
+      };
+      const currentMaxSeq = async (client: any) => {
+        let afterSeq = 0;
+        let maxSeq = 0;
+        for (;;) {
+          const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 50 });
+          const msgs = pullResult.messages || [];
+          if (!msgs.length) return maxSeq;
+          for (const msg of msgs) {
+            maxSeq = Math.max(maxSeq, Number(msg?.seq || 0));
+          }
+          if (msgs.length < 50) return maxSeq;
+          afterSeq = maxSeq;
+        }
+      };
+      const waitForPullText = async (
+        client: any,
+        fromAid: string,
+        afterSeq: number,
+        expectedText: string,
+        timeout = 15000,
+      ) => {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+          const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 50 });
+          const msgs = (pullResult.messages || []).filter((m: any) => m.from === fromAid);
+          for (const msg of msgs) {
+            if (msg?.payload?.text === expectedText) {
+              return msg;
+            }
+          }
+          await new Promise(r => setTimeout(r, 500));
+        }
+        throw new Error(`timeout waiting for ${expectedText}`);
+      };
+
+      const aliceMain = makeClient(`alice-main-${rid}`);
+      await aliceMain.auth.createAid({ aid: aliceAid });
+      const aAuth = await aliceMain.auth.authenticate({ aid: aliceAid });
+      await aliceMain.connect(aAuth);
+
+      const bobPhone = makeClient(`bob-phone-${rid}`);
+      await bobPhone.auth.createAid({ aid: bobAid });
+      const bAuth = await bobPhone.auth.authenticate({ aid: bobAid });
+      await bobPhone.connect(bAuth);
+
+      let bobLaptop = makeClient(`bob-laptop-${rid}`);
+      const bLaptopAuth = await bobLaptop.auth.authenticate({ aid: bobAid });
+      await bobLaptop.connect(bLaptopAuth);
+
+      await new Promise(r => setTimeout(r, 1000));
+
+      const offlineBase = await currentMaxSeq(bobLaptop);
+      const onlineBase = await currentMaxSeq(bobPhone);
+      await bobLaptop.close();
+      await new Promise(r => setTimeout(r, 1000));
+
+      const text = `browser_multi_device_offline_${Date.now()}`;
+      await aliceMain.call('message.send', {
+        to: bobAid,
+        payload: { text, kind: 'offline-pull' },
+        encrypt: true,
+      });
+
+      const onlineMsg = await waitForPullText(bobPhone, aliceAid, onlineBase, text);
+
+      bobLaptop = makeClient(`bob-laptop-${rid}`);
+      const bReconnectAuth = await bobLaptop.auth.authenticate({ aid: bobAid });
+      await bobLaptop.connect(bReconnectAuth);
+      const offlineMsg = await waitForPullText(bobLaptop, aliceAid, offlineBase, text);
+
+      await aliceMain.close();
+      await bobPhone.close();
+      await bobLaptop.close();
+
+      return {
+        onlineText: onlineMsg?.payload?.text ?? null,
+        offlineText: offlineMsg?.payload?.text ?? null,
+        onlineDirection: onlineMsg?.direction ?? null,
+        offlineDirection: offlineMsg?.direction ?? null,
+      };
+    }, rid);
+
+    expect(result.onlineText).toBeTruthy();
+    expect(result.offlineText).toBe(result.onlineText);
+    expect(result.onlineDirection).toBe('inbound');
+    expect(result.offlineDirection).toBe('inbound');
   });
 
   test('SDK 双向消息 — 双方互发加密消息', async ({ page }) => {
@@ -1521,12 +1731,12 @@ test.describe('P2P E2EE 扩展测试', () => {
       const aliceAid = `br-bi-a-${rid}.agentid.pub`;
       const bobAid = `br-bi-b-${rid}.agentid.pub`;
 
-      const alice = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const alice = new AUN.AUNClient();
       await alice.auth.createAid({ aid: aliceAid });
       const aAuth = await alice.auth.authenticate({ aid: aliceAid });
       await alice.connect(aAuth);
 
-      const bob = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const bob = new AUN.AUNClient();
       await bob.auth.createAid({ aid: bobAid });
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
@@ -1587,12 +1797,12 @@ test.describe('P2P E2EE 扩展测试', () => {
       const senderAid = `br-bu-s-${rid}.agentid.pub`;
       const receiverAid = `br-bu-r-${rid}.agentid.pub`;
 
-      const sender = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const sender = new AUN.AUNClient();
       await sender.auth.createAid({ aid: senderAid });
       const sAuth = await sender.auth.authenticate({ aid: senderAid });
       await sender.connect(sAuth);
 
-      const receiver = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const receiver = new AUN.AUNClient();
       await receiver.auth.createAid({ aid: receiverAid });
       const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
       await receiver.connect(rAuth);
@@ -1640,12 +1850,12 @@ test.describe('P2P E2EE 扩展测试', () => {
       const senderAid = `br-pr-s-${rid}.agentid.pub`;
       const receiverAid = `br-pr-r-${rid}.agentid.pub`;
 
-      const sender = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const sender = new AUN.AUNClient();
       await sender.auth.createAid({ aid: senderAid });
       const sAuth = await sender.auth.authenticate({ aid: senderAid });
       await sender.connect(sAuth);
 
-      const receiver = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const receiver = new AUN.AUNClient();
       await receiver.auth.createAid({ aid: receiverAid });
       const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
       await receiver.connect(rAuth);
@@ -1706,12 +1916,12 @@ test.describe('P2P E2EE 扩展测试', () => {
       const senderAid = `br-dp-s-${rid}.agentid.pub`;
       const receiverAid = `br-dp-r-${rid}.agentid.pub`;
 
-      const sender = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const sender = new AUN.AUNClient();
       await sender.auth.createAid({ aid: senderAid });
       const sAuth = await sender.auth.authenticate({ aid: senderAid });
       await sender.connect(sAuth);
 
-      const receiver = new AUN.AUNClient({ verify_ssl: false, require_forward_secrecy: false });
+      const receiver = new AUN.AUNClient();
       await receiver.auth.createAid({ aid: receiverAid });
       const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
       await receiver.connect(rAuth);
@@ -1779,3 +1989,4 @@ test.describe('P2P E2EE 扩展测试', () => {
     }
   });
 });
+

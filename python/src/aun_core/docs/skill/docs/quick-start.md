@@ -34,10 +34,9 @@ async def main():
     auth = await client.auth.authenticate({"aid": MY_AID})
 
     # 连接到网关
-    await client.connect({
-        "access_token": auth["access_token"],
-        "gateway": auth["gateway"],
+    await client.connect(auth, {
         "auto_reconnect": True,
+        "delivery_mode": {"mode": "fanout"},
     })
 
     # 调用 RPC 方法
@@ -58,7 +57,9 @@ asyncio.run(main())
 |------|------|------|
 | `aun_path` | `str` | AUN 工作目录，用于存储密钥、证书等本地数据 |
 | `root_ca_path` | `str` | 可选的额外 Root CA 证书 bundle 路径。SDK 默认内置根证书，并在 `auth.aid_login1` 时用本地信任根校验服务端 `auth_cert` 链；缺失的中间 CA 证书会通过 Gateway `/pki/chain` 下载补全，并通过签名 CRL/OCSP 检查服务端证书状态 |
-| `encryption_seed` | `str` | 本地存储加密种子，保护密钥文件的对称加密密钥派生源 |
+| `seed_password` | `str` | 本地存储保护口令，用于派生本地密钥保护密钥 |
+
+`verify_ssl` 由环境变量控制：`AUN_ENV` 优先，其次 `KITE_ENV`。值为 `development` / `dev` / `local` 时关闭校验，其余情况开启校验。
 
 ## 核心 API
 

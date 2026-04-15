@@ -8,8 +8,7 @@
 result = await client.call("message.send", {
     "to": "demo-msg-receiver.agentid.pub",
     "payload": {"text": "你好"},
-    "type": "text",
-    "persist": False
+    "type": "text"
 })
 ```
 
@@ -20,10 +19,11 @@ result = await client.call("message.send", {
 | `to` | string | 是 | — | 目标 AID |
 | `payload` | object | 是 | — | 消息体，结构由 `type` 决定 |
 | `type` | string | 否 | `"text"` | 消息类型 |
-| `persist` | boolean | 否 | `SDK 自动加密路径: true；明文原始 RPC: false` | 是否持久化到数据库。当前 Python SDK 默认 `encrypt=true`，若走自动加密路径且未显式传入 `persist`，SDK 会发送 `persist=true` |
 | `encrypt` | boolean | 否 | `true` | 是否端到端加密（SDK 默认加密发送；明文时显式传 `false`）。底层传输信封中映射为 `encrypted=true` |
 | `message_id` | string | 否 | 服务端生成 | 客户端指定的幂等 ID，重复发送返回 `"duplicate"` |
 | `timestamp` | integer | 否 | 服务端时间 | 客户端时间戳（毫秒）。**服务端忽略此字段，始终使用服务端时间** |
+
+P2P 消息的投递语义由连接阶段声明的 `delivery_mode` 决定；`group.send` 固定为 `fanout`。
 
 ## 返回值
 
@@ -33,7 +33,7 @@ result = await client.call("message.send", {
     "seq": 42,
     "timestamp": 1711234567890,
     "status": "sent",
-    "persist": false
+    "delivery_mode": "fanout"
 }
 ```
 
@@ -43,11 +43,11 @@ result = await client.call("message.send", {
 | `seq` | integer | 收件方的 inbox 序列号 |
 | `timestamp` | integer | 服务端确认时间戳（毫秒） |
 | `status` | string | `"sent"` / `"delivered"` / `"duplicate"` |
-| `persist` | boolean | 实际是否持久化 |
+| `delivery_mode` | string | 实际生效的连接级投递语义：`fanout` 或 `queue` |
 | `cross_domain` | boolean | 仅跨域投递时出现，当前值为 `true` |
 | `target_issuer` | string | 仅跨域投递时出现，表示目标 issuer |
 
-> **duplicate 响应**：当 `message_id` 重复时，`status` 为 `"duplicate"`。若无法返回首次发送的完整结果，响应可能只包含 `message_id`、`timestamp`、`status`，此时 `seq` 和 `persist` 字段都可能缺失。
+> **duplicate 响应**：当 `message_id` 重复时，`status` 为 `"duplicate"`。若无法返回首次发送的完整结果，响应可能只包含 `message_id`、`timestamp`、`status`，此时 `seq` 和 `delivery_mode` 字段都可能缺失。
 
 ## 错误码
 

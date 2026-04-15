@@ -35,7 +35,7 @@ describe('createConfig', () => {
     const cfg = createConfig();
     expect(cfg.aunPath).toBe('aun');
     expect(cfg.rootCaPem).toBeNull();
-    expect(cfg.encryptionSeed).toBeNull();
+    expect(cfg.seedPassword).toBeNull();
     expect(cfg.discoveryPort).toBeNull();
     expect(cfg.groupE2ee).toBe(true);
     expect(cfg.rotateOnJoin).toBe(false);
@@ -52,18 +52,46 @@ describe('createConfig', () => {
     expect(cfg.groupE2ee).toBe(true);
   });
 
-  it('应允许覆盖特定字段', () => {
+  it('解析已支持字段和别名', () => {
     const cfg = createConfig({
       aunPath: 'custom-db',
-      groupE2ee: false,
+      root_ca_pem: 'ROOT-CA-PEM',
+      discoveryPort: 20001,
+      groupE2EE: false,
+      rotateOnJoin: true,
+      epochAutoRotateInterval: 3600,
+      oldEpochRetentionSeconds: 86400,
+      requireForwardSecrecy: false,
       replayWindowSeconds: 600,
-    });
+    } as any);
     expect(cfg.aunPath).toBe('custom-db');
-    expect(cfg.groupE2ee).toBe(false);
+    expect(cfg.rootCaPem).toBe('ROOT-CA-PEM');
+    expect(cfg.discoveryPort).toBe(20001);
+    expect(cfg.groupE2ee).toBe(true); // 必备能力，不可关闭
+    expect(cfg.rotateOnJoin).toBe(true);
+    expect(cfg.epochAutoRotateInterval).toBe(3600);
+    expect(cfg.oldEpochRetentionSeconds).toBe(86400);
+    expect(cfg.requireForwardSecrecy).toBe(false);
     expect(cfg.replayWindowSeconds).toBe(600);
-    // 未覆盖的字段保持默认
     expect(cfg.verifySsl).toBe(true);
-    expect(cfg.rootCaPem).toBeNull();
+  });
+
+  it('兼容读取 seedPassword 旧别名', () => {
+    const cfg = createConfig({
+      encryptionSeed: 'legacy-seed',
+    } as any);
+    expect(cfg.seedPassword).toBe('legacy-seed');
+  });
+
+  it('应忽略 delivery_mode 相关构造参数', () => {
+    const cfg = createConfig({
+      delivery_mode: 'queue',
+      queue_routing: 'sender_affinity',
+      affinity_ttl_ms: 900,
+    } as any);
+    expect((cfg as any).deliveryMode).toBeUndefined();
+    expect((cfg as any).queueRouting).toBeUndefined();
+    expect((cfg as any).affinityTtlMs).toBeUndefined();
   });
 
   it('不允许 verify_ssl=false', () => {
@@ -73,6 +101,11 @@ describe('createConfig', () => {
 
   it('不允许 verifySsl=false', () => {
     expect(() => createConfig({ verifySsl: false }))
+      .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
+  });
+
+  it('不允许 verifySSL=false', () => {
+    expect(() => createConfig({ verifySSL: false } as any))
       .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
   });
 });

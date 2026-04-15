@@ -233,6 +233,7 @@ func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[
 
 	identity := m.identityFn()
 	senderPkPEM, _ := identity["private_key_pem"].(string)
+	senderCertPEM, _ := identity["cert"].(string)
 
 	epoch := int(toInt64(secretData["epoch"]))
 	secret, _ := secretData["secret"].([]byte)
@@ -240,7 +241,7 @@ func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[
 	msgID := fmt.Sprintf("gm-%s", generateUUID4())
 	ts := time.Now().UnixMilli()
 
-	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM)
+	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM, []byte(senderCertPEM))
 }
 
 // Decrypt 解密单条群组消息

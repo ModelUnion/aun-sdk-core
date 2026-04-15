@@ -2,14 +2,186 @@ package aun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/anthropics/aun-sdk-core/go/keystore"
+	"nhooyr.io/websocket"
 )
+
+type testRPCCall struct {
+	Method string
+	Params map[string]any
+}
+
+func cloneRPCParamsForTest(t *testing.T, params map[string]any) map[string]any {
+	t.Helper()
+	if params == nil {
+		return nil
+	}
+	data, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("序列化测试 RPC 参数失败: %v", err)
+	}
+	var cloned map[string]any
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		t.Fatalf("反序列化测试 RPC 参数失败: %v", err)
+	}
+	return cloned
+}
+
+func TestShouldRetryReconnectOnLoginPhaseAuthError(t *testing.T) {
+	if !shouldRetryReconnect(NewAuthError("aid_login2_failed")) {
+		t.Fatal("aid_login2_failed 应视为可重试")
+	}
+	if shouldRetryReconnect(NewAuthError("token invalid")) {
+		t.Fatal("普通 AuthError 不应被视为可重试")
+	}
+}
+
+func startTestRPCServer(
+	t *testing.T,
+	handler func(method string, params map[string]any) any,
+) (string, func() []testRPCCall, func()) {
+	t.Helper()
+
+	var (
+		mu    sync.Mutex
+		calls []testRPCCall
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("接受 WebSocket 失败: %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		challenge, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "challenge",
+			"params":  map[string]any{"nonce": "test-nonce"},
+		})
+		if err != nil {
+			t.Errorf("序列化 challenge 失败: %v", err)
+			return
+		}
+		if err := conn.Write(r.Context(), websocket.MessageText, challenge); err != nil {
+			t.Errorf("发送 challenge 失败: %v", err)
+			return
+		}
+
+		for {
+			_, data, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var request map[string]any
+			if err := json.Unmarshal(data, &request); err != nil {
+				t.Errorf("解析测试请求失败: %v", err)
+				return
+			}
+			method, _ := request["method"].(string)
+			params, _ := request["params"].(map[string]any)
+			if params == nil {
+				params = make(map[string]any)
+			}
+
+			mu.Lock()
+			calls = append(calls, testRPCCall{
+				Method: method,
+				Params: cloneRPCParamsForTest(t, params),
+			})
+			mu.Unlock()
+
+			response, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request["id"],
+				"result":  handler(method, cloneRPCParamsForTest(t, params)),
+			})
+			if err != nil {
+				t.Errorf("序列化测试响应失败: %v", err)
+				return
+			}
+			if err := conn.Write(r.Context(), websocket.MessageText, response); err != nil {
+				t.Errorf("发送测试响应失败: %v", err)
+				return
+			}
+		}
+	}))
+
+	getCalls := func() []testRPCCall {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]testRPCCall, len(calls))
+		for i, call := range calls {
+			out[i] = testRPCCall{
+				Method: call.Method,
+				Params: cloneRPCParamsForTest(t, call.Params),
+			}
+		}
+		return out
+	}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	return wsURL, getCalls, server.Close
+}
+
+func testBuildIdentityWithFingerprint(t *testing.T, aid string) (map[string]any, string, string) {
+	t.Helper()
+	priv, privPEM, pubB64 := testGenerateECKeypair(t)
+	certPEM := testMakeSelfSignedCert(t, priv, aid)
+	fingerprint, err := certSHA256Fingerprint([]byte(certPEM))
+	if err != nil {
+		t.Fatalf("计算证书指纹失败: %v", err)
+	}
+	return testBuildIdentity(aid, privPEM, pubB64, certPEM), certPEM, fingerprint
+}
+
+func testGeneratePrekeyForIdentity(t *testing.T, root string, identity map[string]any) map[string]any {
+	t.Helper()
+	aid, _ := identity["aid"].(string)
+	safeAid := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(aid)
+	ks, err := keystore.NewFileKeyStore(filepath.Join(root, safeAid+"-"+generateUUID4()[:8]), nil, "test-seed")
+	if err != nil {
+		t.Fatalf("创建 prekey keystore 失败: %v", err)
+	}
+	t.Cleanup(func() { ks.Close() })
+	if err := ks.SaveIdentity(aid, identity); err != nil {
+		t.Fatalf("保存测试身份失败: %v", err)
+	}
+	manager := NewE2EEManager(E2EEManagerConfig{
+		IdentityFn: func() map[string]any { return identity },
+		Keystore:   ks,
+	})
+	prekey, err := manager.GeneratePrekey()
+	if err != nil {
+		t.Fatalf("生成测试 prekey 失败: %v", err)
+	}
+	return prekey
+}
+
+func extractCopyDeviceIDs(items any) []string {
+	rawItems, _ := items.([]any)
+	var result []string
+	for _, raw := range rawItems {
+		item, _ := raw.(map[string]any)
+		if item == nil {
+			continue
+		}
+		deviceID, _ := item["device_id"].(string)
+		result = append(result, deviceID)
+	}
+	return result
+}
 
 // ── 客户端构造测试 ───────────────────────────────────────
 
@@ -56,9 +228,10 @@ func TestConstructDefaultSQLiteBackupUsesAUNPath(t *testing.T) {
 	if fks == nil {
 		t.Fatal("默认 FileKeyStore 不应为 nil")
 	}
-	backupPath := filepath.Join(tmpDir, ".aun_backup", "aun_backup.db")
-	if _, err := os.Stat(backupPath); err != nil {
-		t.Fatalf("默认 SQLite 备份文件未创建: %v", err)
+	// 新架构：SQLite DB 按 AID 懒初始化，不再预创建 .aun_backup
+	aidsDir := filepath.Join(tmpDir, "AIDs")
+	if err := os.MkdirAll(aidsDir, 0o700); err != nil {
+		t.Fatalf("AIDs 目录创建失败: %v", err)
 	}
 }
 
@@ -175,13 +348,287 @@ func TestCallRejectsMessageSendToGroupService(t *testing.T) {
 	}
 }
 
+func TestCallRejectsMessageSendDeliveryModeOverride(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.state = StateConnected
+	c.mu.Unlock()
+
+	_, err := c.Call(context.Background(), "message.send", map[string]any{
+		"to":            "bob.example.com",
+		"payload":       map[string]any{"text": "hello"},
+		"encrypt":       false,
+		"delivery_mode": map[string]any{"mode": "queue"},
+	})
+	if err == nil {
+		t.Fatal("message.send 传入发送级 delivery_mode 应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "message.send does not accept delivery_mode") {
+		t.Fatalf("错误信息不正确: %v", err)
+	}
+}
+
+func TestNormalizeConnectParamsIncludesSlotAndDeliveryMode(t *testing.T) {
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+
+	normalized, err := c.normalizeConnectParams(map[string]any{
+		"access_token":    "tok",
+		"gateway":         "ws://gateway.example.test/aun",
+		"slot_id":         "slot-a",
+		"delivery_mode":   "queue",
+		"queue_routing":   "sender_affinity",
+		"affinity_ttl_ms": 900,
+	})
+	if err != nil {
+		t.Fatalf("normalizeConnectParams 失败: %v", err)
+	}
+	if normalized["device_id"] != c.deviceID {
+		t.Fatalf("device_id 未正确注入: %v", normalized["device_id"])
+	}
+	if normalized["slot_id"] != "slot-a" {
+		t.Fatalf("slot_id 不正确: %v", normalized["slot_id"])
+	}
+	deliveryMode, _ := normalized["delivery_mode"].(map[string]any)
+	if deliveryMode == nil {
+		t.Fatal("delivery_mode 不应为空")
+	}
+	if deliveryMode["mode"] != "queue" || deliveryMode["routing"] != "sender_affinity" || toInt64(deliveryMode["affinity_ttl_ms"]) != 900 {
+		t.Fatalf("delivery_mode 规范化结果不正确: %#v", deliveryMode)
+	}
+}
+
+func TestConnectIncludesDeviceSlotAndDeliveryMode(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token":    "tok",
+		"gateway":         wsURL,
+		"slot_id":         "slot-a",
+		"delivery_mode":   "queue",
+		"queue_routing":   "sender_affinity",
+		"affinity_ttl_ms": 900,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	var authConnect *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "auth.connect" {
+			callCopy := call
+			authConnect = &callCopy
+			break
+		}
+	}
+	if authConnect == nil {
+		t.Fatal("未捕获 auth.connect")
+	}
+
+	device, _ := authConnect.Params["device"].(map[string]any)
+	clientParams, _ := authConnect.Params["client"].(map[string]any)
+	deliveryMode, _ := authConnect.Params["delivery_mode"].(map[string]any)
+	if device == nil || clientParams == nil || deliveryMode == nil {
+		t.Fatalf("auth.connect 缺少实例上下文字段: %#v", authConnect.Params)
+	}
+	if device["id"] != c.deviceID {
+		t.Fatalf("auth.connect device.id 不正确: %v", device["id"])
+	}
+	if clientParams["slot_id"] != "slot-a" {
+		t.Fatalf("auth.connect client.slot_id 不正确: %v", clientParams["slot_id"])
+	}
+	if deliveryMode["mode"] != "queue" || deliveryMode["routing"] != "sender_affinity" || toInt64(deliveryMode["affinity_ttl_ms"]) != 900 {
+		t.Fatalf("auth.connect delivery_mode 不正确: %#v", deliveryMode)
+	}
+}
+
+func TestCallInjectsMessageSlotContext(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.pull":
+			return map[string]any{"messages": []any{}, "count": 0, "latest_seq": 0}
+		case "message.ack":
+			return map[string]any{"success": true, "ack_seq": 7}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	pullResult, err := c.Call(ctx, "message.pull", map[string]any{"after_seq": 0, "limit": 10})
+	if err != nil {
+		t.Fatalf("message.pull 失败: %v", err)
+	}
+	pullMap, _ := pullResult.(map[string]any)
+	if toInt64(pullMap["count"]) != 0 {
+		t.Fatalf("message.pull 返回值不正确: %#v", pullMap)
+	}
+
+	ackResult, err := c.Call(ctx, "message.ack", map[string]any{"seq": 7})
+	if err != nil {
+		t.Fatalf("message.ack 失败: %v", err)
+	}
+	ackMap, _ := ackResult.(map[string]any)
+	if !ackMap["success"].(bool) || toInt64(ackMap["ack_seq"]) != 7 {
+		t.Fatalf("message.ack 返回值不正确: %#v", ackMap)
+	}
+
+	var pullCall, ackCall *testRPCCall
+	for _, call := range getCalls() {
+		switch call.Method {
+		case "message.pull":
+			callCopy := call
+			pullCall = &callCopy
+		case "message.ack":
+			callCopy := call
+			ackCall = &callCopy
+		}
+	}
+	if pullCall == nil || ackCall == nil {
+		t.Fatalf("未捕获 message.pull/message.ack: %#v", getCalls())
+	}
+	if pullCall.Params["device_id"] != c.deviceID || pullCall.Params["slot_id"] != "slot-a" {
+		t.Fatalf("message.pull 未注入当前实例上下文: %#v", pullCall.Params)
+	}
+	if ackCall.Params["device_id"] != c.deviceID || ackCall.Params["slot_id"] != "slot-a" {
+		t.Fatalf("message.ack 未注入当前实例上下文: %#v", ackCall.Params)
+	}
+}
+
+func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "auth.connect" {
+			return map[string]any{"status": "ok"}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token":    "tok",
+		"gateway":         wsURL,
+		"delivery_mode":   "queue",
+		"queue_routing":   "sender_affinity",
+		"affinity_ttl_ms": 900,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "message.send", map[string]any{
+		"to":      "bob.example.com",
+		"payload": map[string]any{"text": "hello"},
+		"encrypt": false,
+	}); err != nil {
+		t.Fatalf("message.send 失败: %v", err)
+	}
+
+	var sendCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.send" {
+			callCopy := call
+			sendCall = &callCopy
+		}
+	}
+	if sendCall == nil {
+		t.Fatal("未捕获 message.send")
+	}
+	if _, exists := sendCall.Params["delivery_mode"]; exists {
+		t.Fatalf("message.send 不应转发连接级 delivery_mode: %#v", sendCall.Params)
+	}
+}
+
+func TestCallRejectsMessageSlotContextOverride(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "auth.connect" {
+			return map[string]any{"status": "ok"}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "message.pull", map[string]any{
+		"after_seq": 0,
+		"device_id": "other-device",
+	}); err == nil || !strings.Contains(err.Error(), "device_id must match") {
+		t.Fatalf("覆盖 device_id 应被拒绝: %v", err)
+	}
+	if _, err := c.Call(ctx, "message.ack", map[string]any{
+		"seq":     1,
+		"slot_id": "slot-b",
+	}); err == nil || !strings.Contains(err.Error(), "slot_id must match") {
+		t.Fatalf("覆盖 slot_id 应被拒绝: %v", err)
+	}
+
+	for _, call := range getCalls() {
+		if call.Method == "message.pull" || call.Method == "message.ack" {
+			t.Fatalf("参数校验失败前不应发出 message.pull/message.ack: %#v", call)
+		}
+	}
+}
+
 func TestParsePeerPrekeyResponseSemantics(t *testing.T) {
 	prekey, err := parsePeerPrekeyResponse("bob.example.com", map[string]any{"found": false}, nil)
 	if prekey != nil {
 		t.Fatalf("found=false 应返回 nil prekey: %#v", prekey)
 	}
-	if _, ok := err.(*NotFoundError); !ok {
-		t.Fatalf("found=false 应返回 NotFoundError: %T", err)
+	if err == nil {
+		t.Fatal("found=false 应返回 NotFoundError")
 	}
 
 	if _, err := parsePeerPrekeyResponse("bob.example.com", nil, errors.New("boom")); err == nil {
@@ -294,27 +741,27 @@ func TestOnEventSubscription(t *testing.T) {
 
 // ── Client 配置测试 ──────────────────────────────────────
 
-// TestClientGroupE2EEConfig 验证群组 E2EE 配置传递
-func TestClientGroupE2EEConfig(t *testing.T) {
+// TestClientGroupE2EEAlwaysEnabled 验证群组 E2EE 是必备能力，不可关闭
+func TestClientGroupE2EEAlwaysEnabled(t *testing.T) {
 	c := NewClient(map[string]any{
 		"aun_path":   t.TempDir(),
-		"group_e2ee": false,
+		"group_e2ee": false, // 尝试关闭应被忽略
 	})
 	defer func() { _ = c.Close() }()
-	if c.configModel.GroupE2EE {
-		t.Error("group_e2ee 应为 false")
+	if !c.configModel.GroupE2EE {
+		t.Error("group_e2ee 是必备能力，即使传入 false 也应保持 true")
 	}
 }
 
 // TestClientVerifySSLConfig 验证 SSL 验证配置传递
 func TestClientVerifySSLConfig(t *testing.T) {
+	t.Setenv("AUN_ENV", "development")
 	c := NewClient(map[string]any{
-		"aun_path":   t.TempDir(),
-		"verify_ssl": false,
+		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
 	if c.configModel.VerifySSL {
-		t.Error("verify_ssl 应为 false")
+		t.Error("development 环境下 verify_ssl 应为 false")
 	}
 }
 
@@ -380,6 +827,362 @@ func TestBuildCertURL(t *testing.T) {
 	url3 := buildCertURL("wss://gateway.example.com:20001", "alice.example.com", "sha256:abc")
 	if url3 != "https://gateway.example.com:20001/pki/cert/alice.example.com?cert_fingerprint=sha256%3Aabc" {
 		t.Errorf("带 cert_fingerprint 的 URL 不正确: %s", url3)
+	}
+}
+
+func TestResolveSelfCopyPeerCertUsesVersionedKeystore(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	aid := "alice.example.com"
+	activeIdentity, activeCertPEM, _ := testBuildIdentityWithFingerprint(t, aid)
+	_, rotatedCertPEM, rotatedFingerprint := testBuildIdentityWithFingerprint(t, aid)
+
+	if err := c.keyStore.SaveIdentity(aid, activeIdentity); err != nil {
+		t.Fatalf("保存 active identity 失败: %v", err)
+	}
+	versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore)
+	if !ok {
+		t.Fatalf("默认 keystore 应支持 VersionedCertKeyStore: %T", c.keyStore)
+	}
+	if err := versioned.SaveCertVersion(aid, rotatedCertPEM, rotatedFingerprint, false); err != nil {
+		t.Fatalf("保存 rotated cert 失败: %v", err)
+	}
+
+	c.mu.Lock()
+	c.aid = aid
+	c.identity = map[string]any{
+		"aid":  aid,
+		"cert": activeCertPEM,
+	}
+	c.mu.Unlock()
+
+	resolved, err := c.resolveSelfCopyPeerCert(context.Background(), rotatedFingerprint)
+	if err != nil {
+		t.Fatalf("resolveSelfCopyPeerCert 失败: %v", err)
+	}
+	if string(resolved) != rotatedCertPEM {
+		t.Fatalf("resolveSelfCopyPeerCert 未返回版本化证书")
+	}
+}
+
+func TestSendEncryptedUsesMultiDevicePayloadWhenNeeded(t *testing.T) {
+	senderAID := "alice.example.com"
+	receiverAID := "bob.example.com"
+	senderIdentity, _, _ := testBuildIdentityWithFingerprint(t, senderAID)
+	receiverIdentity, receiverCertPEM, receiverFingerprint := testBuildIdentityWithFingerprint(t, receiverAID)
+
+	prekeyRoot := t.TempDir()
+	receiverPhonePrekey := testGeneratePrekeyForIdentity(t, prekeyRoot, receiverIdentity)
+	receiverPhonePrekey["device_id"] = "phone"
+	receiverLaptopPrekey := testGeneratePrekeyForIdentity(t, prekeyRoot, receiverIdentity)
+	receiverLaptopPrekey["device_id"] = "laptop"
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.e2ee.put_prekey":
+			return map[string]any{"ok": true}
+		case "message.e2ee.get_prekey":
+			if params["aid"] == receiverAID {
+				return map[string]any{
+					"found": true,
+					"device_prekeys": []any{
+						receiverPhonePrekey,
+						receiverLaptopPrekey,
+					},
+				}
+			}
+			return map[string]any{"found": false}
+		case "message.send":
+			return map[string]any{"ok": true}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+	c.configModel.RequireForwardSecrecy = false
+
+	if err := c.keyStore.SaveIdentity(senderAID, senderIdentity); err != nil {
+		t.Fatalf("保存发送方 identity 失败: %v", err)
+	}
+	c.certCacheMu.Lock()
+	now := float64(time.Now().Unix())
+	c.certCache[certCacheKey(receiverAID, receiverFingerprint)] = &cachedPeerCert{
+		certBytes:    []byte(receiverCertPEM),
+		validatedAt:  now,
+		refreshAfter: now + peerCertCacheTTL,
+	}
+	c.certCacheMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	result, err := c.Call(ctx, "message.send", map[string]any{
+		"to":      receiverAID,
+		"payload": map[string]any{"text": "hello"},
+	})
+	if err != nil {
+		t.Fatalf("message.send 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if !resultMap["ok"].(bool) {
+		t.Fatalf("message.send 返回值不正确: %#v", resultMap)
+	}
+
+	var sendCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.send" {
+			callCopy := call
+			sendCall = &callCopy
+		}
+	}
+	if sendCall == nil {
+		t.Fatal("未捕获最终的 message.send")
+	}
+	if sendCall.Params["type"] != "e2ee.multi_device" {
+		t.Fatalf("多设备发送应使用 e2ee.multi_device: %#v", sendCall.Params)
+	}
+	payload, _ := sendCall.Params["payload"].(map[string]any)
+	if payload == nil {
+		t.Fatalf("message.send payload 类型不正确: %#v", sendCall.Params["payload"])
+	}
+	if got := extractCopyDeviceIDs(payload["recipient_copies"]); strings.Join(got, ",") != "phone,laptop" {
+		t.Fatalf("recipient_copies 设备列表不正确: %v", got)
+	}
+	if got := extractCopyDeviceIDs(payload["self_copies"]); len(got) != 0 {
+		t.Fatalf("未声明其他设备时不应生成 self_copies: %v", got)
+	}
+}
+
+func TestSendEncryptedGeneratesSelfSyncCopies(t *testing.T) {
+	senderAID := "alice.example.com"
+	receiverAID := "bob.example.com"
+	senderIdentity, senderCertPEM, senderFingerprint := testBuildIdentityWithFingerprint(t, senderAID)
+	receiverIdentity, receiverCertPEM, receiverFingerprint := testBuildIdentityWithFingerprint(t, receiverAID)
+
+	prekeyRoot := t.TempDir()
+	receiverPrekey := testGeneratePrekeyForIdentity(t, prekeyRoot, receiverIdentity)
+	receiverPrekey["device_id"] = "bob-phone"
+	selfCurrentPrekey := testGeneratePrekeyForIdentity(t, prekeyRoot, senderIdentity)
+	selfOtherPrekey := testGeneratePrekeyForIdentity(t, prekeyRoot, senderIdentity)
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.e2ee.put_prekey":
+			return map[string]any{"ok": true}
+		case "message.e2ee.get_prekey":
+			switch params["aid"] {
+			case receiverAID:
+				return map[string]any{
+					"found":          true,
+					"device_prekeys": []any{receiverPrekey},
+				}
+			case senderAID:
+				return map[string]any{
+					"found":          true,
+					"device_prekeys": []any{selfCurrentPrekey, selfOtherPrekey},
+				}
+			default:
+				return map[string]any{"found": false}
+			}
+		case "message.send":
+			return map[string]any{"ok": true}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+	c.configModel.RequireForwardSecrecy = false
+
+	if err := c.keyStore.SaveIdentity(senderAID, senderIdentity); err != nil {
+		t.Fatalf("保存发送方 identity 失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = senderAID
+	c.identity = map[string]any{
+		"aid":  senderAID,
+		"cert": senderCertPEM,
+	}
+	currentDeviceID := c.deviceID
+	c.mu.Unlock()
+
+	selfCurrentPrekey["device_id"] = currentDeviceID
+	selfCurrentPrekey["cert_fingerprint"] = senderFingerprint
+	selfOtherPrekey["device_id"] = "tablet"
+	selfOtherPrekey["cert_fingerprint"] = senderFingerprint
+
+	c.certCacheMu.Lock()
+	now := float64(time.Now().Unix())
+	c.certCache[certCacheKey(receiverAID, receiverFingerprint)] = &cachedPeerCert{
+		certBytes:    []byte(receiverCertPEM),
+		validatedAt:  now,
+		refreshAfter: now + peerCertCacheTTL,
+	}
+	c.certCacheMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "message.send", map[string]any{
+		"to":      receiverAID,
+		"payload": map[string]any{"text": "hello"},
+	}); err != nil {
+		t.Fatalf("message.send 失败: %v", err)
+	}
+
+	var sendCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.send" {
+			callCopy := call
+			sendCall = &callCopy
+		}
+	}
+	if sendCall == nil {
+		t.Fatal("未捕获最终的 message.send")
+	}
+	payload, _ := sendCall.Params["payload"].(map[string]any)
+	if payload == nil {
+		t.Fatalf("message.send payload 类型不正确: %#v", sendCall.Params["payload"])
+	}
+	if got := extractCopyDeviceIDs(payload["recipient_copies"]); strings.Join(got, ",") != "bob-phone" {
+		t.Fatalf("recipient_copies 不正确: %v", got)
+	}
+	if got := extractCopyDeviceIDs(payload["self_copies"]); strings.Join(got, ",") != "tablet" {
+		t.Fatalf("self_copies 应只包含其他设备: %v", got)
+	}
+}
+
+func TestSendEncryptedQueueModeUsesMultiDevicePayload(t *testing.T) {
+	senderAID := "alice.example.com"
+	receiverAID := "bob.example.com"
+	senderIdentity, _, _ := testBuildIdentityWithFingerprint(t, senderAID)
+	receiverIdentity, receiverCertPEM, receiverFingerprint := testBuildIdentityWithFingerprint(t, receiverAID)
+
+	prekeyRoot := t.TempDir()
+	receiverPhonePrekey := testGeneratePrekeyForIdentity(t, prekeyRoot, receiverIdentity)
+	receiverLaptopPrekey := testGeneratePrekeyForIdentity(t, prekeyRoot, receiverIdentity)
+	receiverPhonePrekey["device_id"] = "phone"
+	receiverLaptopPrekey["device_id"] = "laptop"
+	receiverPhonePrekey["cert_fingerprint"] = receiverFingerprint
+	receiverLaptopPrekey["cert_fingerprint"] = receiverFingerprint
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.e2ee.put_prekey":
+			return map[string]any{"ok": true}
+		case "message.e2ee.get_prekey":
+			if params["aid"] == receiverAID {
+				return map[string]any{
+					"found": true,
+					"device_prekeys": []any{
+						receiverPhonePrekey,
+						receiverLaptopPrekey,
+					},
+				}
+			}
+			return map[string]any{"found": false}
+		case "message.send":
+			return map[string]any{"ok": true}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+	c.configModel.RequireForwardSecrecy = false
+
+	if err := c.keyStore.SaveIdentity(senderAID, senderIdentity); err != nil {
+		t.Fatalf("保存发送方 identity 失败: %v", err)
+	}
+	c.certCacheMu.Lock()
+	now := float64(time.Now().Unix())
+	c.certCache[certCacheKey(receiverAID, receiverFingerprint)] = &cachedPeerCert{
+		certBytes:    []byte(receiverCertPEM),
+		validatedAt:  now,
+		refreshAfter: now + peerCertCacheTTL,
+	}
+	c.certCacheMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token":  "tok",
+		"gateway":       wsURL,
+		"delivery_mode": "queue",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	result, err := c.Call(ctx, "message.send", map[string]any{
+		"to":      receiverAID,
+		"payload": map[string]any{"text": "hello"},
+		"encrypt": true,
+	})
+	if err != nil {
+		t.Fatalf("queue 模式 message.send 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if !resultMap["ok"].(bool) {
+		t.Fatalf("message.send 返回值不正确: %#v", resultMap)
+	}
+
+	var sendCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.send" {
+			callCopy := call
+			sendCall = &callCopy
+		}
+	}
+	if sendCall == nil {
+		t.Fatal("未捕获最终的 message.send")
+	}
+	if sendCall.Params["type"] != "e2ee.multi_device" {
+		t.Fatalf("queue 模式多设备仍应走设备副本路径: %#v", sendCall.Params)
+	}
+	if _, exists := sendCall.Params["delivery_mode"]; exists {
+		t.Fatalf("queue 模式不应在 message.send 中携带 delivery_mode: %#v", sendCall.Params["delivery_mode"])
+	}
+	payload, _ := sendCall.Params["payload"].(map[string]any)
+	if payload == nil {
+		t.Fatalf("message.send payload 类型不正确: %#v", sendCall.Params["payload"])
+	}
+	if got := extractCopyDeviceIDs(payload["recipient_copies"]); strings.Join(got, ",") != "phone,laptop" {
+		t.Fatalf("queue 模式 recipient_copies 不正确: %v", got)
+	}
+	if got := extractCopyDeviceIDs(payload["self_copies"]); len(got) != 0 {
+		t.Fatalf("queue 模式未声明发送方其他设备时不应生成 self_copies: %v", got)
 	}
 }
 

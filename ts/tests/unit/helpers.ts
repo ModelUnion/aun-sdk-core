@@ -14,7 +14,6 @@ import type {
   IdentityRecord,
   JsonObject,
   KeyPairRecord,
-  MetadataRecord,
   PrekeyMap,
   PrekeyRecord,
 } from '../../src/types.js';
@@ -22,19 +21,12 @@ import type {
 // ── FakeKeystore ──────────────────────────────────────────────
 
 export class FakeKeystore implements KeyStore {
-  _metadata: Record<string, MetadataRecord> = {};
   _keyPairs: Record<string, KeyPairRecord> = {};
   _certs: Record<string, string> = {};
   _identities: Record<string, IdentityRecord> = {};
   _prekeys: Record<string, PrekeyMap> = {};
   _groups: Record<string, GroupSecretMap> = {};
 
-  loadMetadata(aid: string): MetadataRecord | null {
-    return this._metadata[aid] ?? null;
-  }
-  saveMetadata(aid: string, meta: MetadataRecord): void {
-    this._metadata[aid] = meta;
-  }
   loadKeyPair(aid: string): KeyPairRecord | null {
     return this._keyPairs[aid] ?? null;
   }

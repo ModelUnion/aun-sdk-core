@@ -88,11 +88,12 @@ AUN-E2EE 是 Layer 3 扩展协议，建立在以下核心能力之上：
 以下字段必须保持为服务端可见的明文，以便进行路由和离线存储：
 
 - `to`
-- `persist`
 - `encrypted`
 - `message_id`
 - `timestamp`
 - `type`
+
+消息的投递语义来自认证连接上下文中的 `delivery_mode`，不需要作为每条消息的显式字段传输。
 
 ### 4.2 密文载荷
 

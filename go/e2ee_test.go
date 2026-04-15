@@ -101,6 +101,7 @@ func testMakeE2EEPair(t *testing.T) (
 	if err != nil {
 		t.Fatalf("创建发送方 keystore 失败: %v", err)
 	}
+	t.Cleanup(func() { senderKS.Close() })
 	_ = senderKS.SaveIdentity(senderAID, senderIdentity)
 	_ = senderKS.SaveCert(receiverAID, receiverCertPEM) // 发送方存对方证书
 
@@ -108,6 +109,7 @@ func testMakeE2EEPair(t *testing.T) (
 	if err != nil {
 		t.Fatalf("创建接收方 keystore 失败: %v", err)
 	}
+	t.Cleanup(func() { receiverKS.Close() })
 	_ = receiverKS.SaveIdentity(receiverAID, receiverIdentity)
 	_ = receiverKS.SaveCert(senderAID, senderCertPEM) // 接收方存对方证书
 
@@ -560,18 +562,17 @@ func TestGeneratePrekeyIncludesCreatedAt(t *testing.T) {
 
 func TestGeneratePrekeyUsesStructuredKeyStoreInterface(t *testing.T) {
 	dir := t.TempDir()
-	backup := keystore.NewSQLiteBackup(filepath.Join(dir, ".aun_backup", "aun_backup.db"))
-	t.Cleanup(func() { backup.Close() })
 
 	receiverAID := "receiver.test"
 	receiverPriv, receiverPrivPEM, receiverPubB64 := testGenerateECKeypair(t)
 	receiverCertPEM := testMakeSelfSignedCert(t, receiverPriv, receiverAID)
 	receiverIdentity := testBuildIdentity(receiverAID, receiverPrivPEM, receiverPubB64, receiverCertPEM)
 
-	receiverKS, err := keystore.NewFileKeyStore(filepath.Join(dir, "receiver"), nil, "test-seed", backup)
+	receiverKS, err := keystore.NewFileKeyStore(filepath.Join(dir, "receiver"), nil, "test-seed")
 	if err != nil {
 		t.Fatalf("创建接收方 keystore 失败: %v", err)
 	}
+	t.Cleanup(func() { receiverKS.Close() })
 	if err := receiverKS.SaveIdentity(receiverAID, receiverIdentity); err != nil {
 		t.Fatalf("SaveIdentity 失败: %v", err)
 	}

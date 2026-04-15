@@ -80,8 +80,8 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 		return nil, NewConnectionError(fmt.Sprintf("连接 WebSocket 失败: %v", err))
 	}
 
-	t.ws = conn
 	t.closedMu.Lock()
+	t.ws = conn
 	t.closed = false
 	t.closedMu.Unlock()
 
@@ -89,6 +89,12 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 	challenge, err := t.recvInitialMessage(ctx)
 	if err != nil {
 		_ = conn.Close(websocket.StatusNormalClosure, "")
+		t.closedMu.Lock()
+		if t.ws == conn {
+			t.ws = nil
+		}
+		t.closed = true
+		t.closedMu.Unlock()
 		return nil, err
 	}
 	t.challenge = challenge
@@ -137,7 +143,8 @@ func (t *RPCTransport) Close() error {
 // Call 发起 JSON-RPC 调用
 func (t *RPCTransport) Call(ctx context.Context, method string, params map[string]any) (any, error) {
 	t.closedMu.RLock()
-	if t.closed || t.ws == nil {
+	ws := t.ws
+	if t.closed || ws == nil {
 		t.closedMu.RUnlock()
 		return nil, NewConnectionError("传输层未连接")
 	}
@@ -173,7 +180,7 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 	// 发送请求
 	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := t.ws.Write(writeCtx, websocket.MessageText, data); err != nil {
+	if err := ws.Write(writeCtx, websocket.MessageText, data); err != nil {
 		t.pendingMu.Lock()
 		delete(t.pending, rpcID)
 		t.pendingMu.Unlock()

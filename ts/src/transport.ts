@@ -232,7 +232,7 @@ export class RPCTransport {
       this._closed = true;
       if (!wasClosed && this._onDisconnect) {
         const cb = this._onDisconnect;
-        Promise.resolve(cb(null)).catch(() => {});
+        Promise.resolve(cb(null)).catch(exc => console.warn('[aun_core.transport] disconnect 回调异常:', exc));
       }
     });
 

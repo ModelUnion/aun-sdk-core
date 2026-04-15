@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -26,6 +25,7 @@ func testNewGroupKeyStore(t *testing.T) keystore.KeyStore {
 	if err != nil {
 		t.Fatalf("创建 KeyStore 失败: %v", err)
 	}
+	t.Cleanup(func() { ks.Close() })
 	return ks
 }
 
@@ -37,7 +37,7 @@ func TestEncryptGroupMessage_EnvelopeFields(t *testing.T) {
 	payload := map[string]any{"text": "hello group"}
 	envelope, err := EncryptGroupMessage(
 		secret, payload, "group-1", "alice.test", "gm-1",
-		time.Now().UnixMilli(), 1, "",
+		time.Now().UnixMilli(), 1, "", nil,
 	)
 	if err != nil {
 		t.Fatalf("加密失败: %v", err)
@@ -68,7 +68,7 @@ func TestEncryptDecryptGroupRoundtrip(t *testing.T) {
 	msgID := "gm-roundtrip"
 	ts := time.Now().UnixMilli()
 
-	envelope, err := EncryptGroupMessage(secret, originalPayload, "group-1", "alice.test", msgID, ts, 1, "")
+	envelope, err := EncryptGroupMessage(secret, originalPayload, "group-1", "alice.test", msgID, ts, 1, "", nil)
 	if err != nil {
 		t.Fatalf("加密失败: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestEncryptDecryptGroupRoundtrip_WithSignature(t *testing.T) {
 	msgID := "gm-sig-rt"
 	ts := time.Now().UnixMilli()
 
-	envelope, err := EncryptGroupMessage(secret, map[string]any{"t": "x"}, "g1", "alice.test", msgID, ts, 1, privPEM)
+	envelope, err := EncryptGroupMessage(secret, map[string]any{"t": "x"}, "g1", "alice.test", msgID, ts, 1, privPEM, []byte(certPEM))
 	if err != nil {
 		t.Fatalf("加密失败: %v", err)
 	}
@@ -283,12 +283,11 @@ func TestCleanupOldEpochs(t *testing.T) {
 
 func TestStoreGroupSecretUsesStructuredKeyStoreInterface(t *testing.T) {
 	dir := t.TempDir()
-	backup := keystore.NewSQLiteBackup(filepath.Join(dir, ".aun_backup", "aun_backup.db"))
-	t.Cleanup(func() { backup.Close() })
-	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed", backup)
+	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
 	if err != nil {
 		t.Fatalf("创建 KeyStore 失败: %v", err)
 	}
+	t.Cleanup(func() { ks.Close() })
 
 	aid := "alice.test"
 	secret := GenerateGroupSecret()
@@ -670,7 +669,7 @@ func TestSenderSignature_PresentAndVerifiable(t *testing.T) {
 	secret := GenerateGroupSecret()
 	envelope, err := EncryptGroupMessage(
 		secret, map[string]any{"t": "x"}, "g1", "alice.test",
-		"gm-sig", time.Now().UnixMilli(), 1, privPEM,
+		"gm-sig", time.Now().UnixMilli(), 1, privPEM, []byte(certPEM),
 	)
 	if err != nil {
 		t.Fatalf("加密失败: %v", err)
@@ -715,7 +714,7 @@ func TestSenderSignature_MissingSigRejected(t *testing.T) {
 	secret := GenerateGroupSecret()
 	envelope, _ := EncryptGroupMessage(
 		secret, map[string]any{"t": "x"}, "g1", "alice.test",
-		"gm-nosig", time.Now().UnixMilli(), 1, "", // 不提供私钥 -> 无签名
+		"gm-nosig", time.Now().UnixMilli(), 1, "", nil, // 不提供私钥 -> 无签名
 	)
 
 	message := map[string]any{

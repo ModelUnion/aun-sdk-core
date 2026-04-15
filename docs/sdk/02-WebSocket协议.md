@@ -13,7 +13,7 @@ sequenceDiagram
 
     C->>G: WebSocket 连接
     G->>C: challenge（nonce, protocol, auth_methods）
-    C->>G: auth.connect（nonce, token, protocol）
+    C->>G: auth.connect（nonce, token, protocol, device, client, delivery_mode）
     G->>C: hello-ok（identity, capabilities）
     Note over C,G: 握手完成，进入双向 RPC / 事件通信
 ```
@@ -52,10 +52,23 @@ sequenceDiagram
             "method": "kite_token",
             "token": "authenticate() 返回的 access_token"
         },
-        "protocol": { "min": "1.0", "max": "1.0" }
+        "protocol": { "min": "1.0", "max": "1.0" },
+        "device": { "id": "来自 ~/.aun/.device_id", "type": "desktop" },
+        "client": { "slot_id": "slot-a" },
+        "delivery_mode": {
+            "mode": "queue",
+            "routing": "sender_affinity",
+            "affinity_ttl_ms": 300000
+        }
     }
 }
 ```
+
+说明：
+
+- `device.id` 是设备级稳定标识，Python SDK 默认从 `~/.aun/.device_id` 读取。
+- `client.slot_id` 由应用层显式传入，用于区分同设备上的多个实例槽位。
+- `delivery_mode` 决定该 AID 当前连接的投递语义；同一 AID 的所有在线连接必须保持一致。
 
 ### (3) hello-ok — 握手完成
 

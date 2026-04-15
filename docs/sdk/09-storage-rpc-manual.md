@@ -475,3 +475,15 @@ for obj in result["items"]:
 | `object_key` | string | 对象路径 |
 
 > 当前实现只在 `storage.put_object` 成功后推送 `action="put"`，以及 `storage.delete_object` 返回 `deleted=true` 时推送 `action="delete"`。`complete_upload`、`copy_object`、`append_object`、`batch_delete` 当前不会自动发布该事件。
+
+---
+
+## 错误码
+
+| code | 说明 |
+|------|------|
+| -32002 | 服务暂不可用（数据库未连接） |
+| -32004 | 权限拒绝（requester 不是对象 owner，或非公开对象的读权限不足） |
+| -32008 | 对象不存在（`ErrNotFound`） |
+| -32009 | 版本冲突（`ErrVersionConflict`，`expected_version` 与实际版本不匹配） |
+| -32000 | 通用错误（参数校验失败、配额不足、base64 解码失败、文件大小超限等） |

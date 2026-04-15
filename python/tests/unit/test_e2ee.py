@@ -10,6 +10,7 @@ import time
 import uuid
 
 import pytest
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -59,36 +60,65 @@ def _make_self_signed_cert(private_key, cn="test"):
 
 class FakeKeystore:
     def __init__(self):
-        self._metadata = {}
         self._key_pairs = {}
         self._certs = {}
+        self._prekeys = {}  # {aid: {prekey_id: data}}
+        self._group_secrets = {}  # {aid: {group_id: entry}}
 
-    def load_metadata(self, aid):
-        return self._metadata.get(aid, {})
+    def save_e2ee_prekey(self, aid, prekey_id, prekey_data, device_id=""):
+        self._prekeys.setdefault(aid, {})[prekey_id] = prekey_data
 
-    def save_metadata(self, aid, meta):
-        self._metadata[aid] = meta
+    def load_e2ee_prekeys(self, aid):
+        return self._prekeys.get(aid, {})
+
+    def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7):
+        return []
+
+    def save_group_secret_state(self, aid, group_id, entry):
+        self._group_secrets.setdefault(aid, {})[group_id] = entry
+
+    def load_group_secret_state(self, aid, group_id):
+        return self._group_secrets.get(aid, {}).get(group_id)
+
+    def load_all_group_secret_states(self, aid):
+        return self._group_secrets.get(aid, {})
+
+    def cleanup_group_old_epochs_state(self, aid, group_id, cutoff_ms):
+        return 0
 
     def load_key_pair(self, aid):
         return self._key_pairs.get(aid)
 
-    def load_cert(self, aid):
+    def load_cert(self, aid, cert_fingerprint=None):
+        if cert_fingerprint:
+            cert = self._certs.get((aid, cert_fingerprint))
+            if cert is not None:
+                return cert
+            active = self._certs.get(aid)
+            if active:
+                try:
+                    cert_obj = x509.load_pem_x509_certificate(
+                        active.encode("utf-8") if isinstance(active, str) else active
+                    )
+                    actual_fp = "sha256:" + cert_obj.fingerprint(hashes.SHA256()).hex()
+                    if actual_fp == cert_fingerprint:
+                        return active
+                except Exception:
+                    return None
+            return None
         return self._certs.get(aid)
 
-    def save_cert(self, aid, cert_pem):
-        self._certs[aid] = cert_pem
+    def save_cert(self, aid, cert_pem, cert_fingerprint=None, *, make_active=True):
+        if cert_fingerprint:
+            self._certs[(aid, cert_fingerprint)] = cert_pem
+        if make_active or not cert_fingerprint:
+            self._certs[aid] = cert_pem
 
 
 class StructuredPrekeyKeystore(FakeKeystore):
     def __init__(self):
         super().__init__()
         self._prekeys = {}
-
-    def load_metadata(self, aid):
-        raise AssertionError("structured prekey path should not use load_metadata")
-
-    def save_metadata(self, aid, meta):
-        raise AssertionError("structured prekey path should not use save_metadata")
 
     def load_e2ee_prekeys(self, aid):
         prekeys = self._prekeys.get(aid, {})
@@ -283,11 +313,9 @@ class TestPrekeyEncrypt:
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         ).decode("utf-8")
-        receiver_ks._metadata["receiver.test"] = {
-            "e2ee_prekeys": {
-                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
-            },
-        }
+        receiver_ks.save_e2ee_prekey("receiver.test", prekey["prekey_id"], {
+            "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
+        })
 
         payload = {"text": "prekey roundtrip"}
         mid = str(uuid.uuid4())
@@ -436,11 +464,9 @@ class TestReplayGuard:
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         ).decode("utf-8")
-        receiver_ks._metadata["receiver.test"] = {
-            "e2ee_prekeys": {
-                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
-            },
-        }
+        receiver_ks.save_e2ee_prekey("receiver.test", prekey["prekey_id"], {
+            "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
+        })
 
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
@@ -463,10 +489,11 @@ class TestReplayGuard:
         assert result2 is None
 
     def test_seen_set_trim(self):
+        import time as _t
         _, receiver_mgr, _, _, _, _, _, _ = _make_e2ee_pair()
         receiver_mgr._seen_max_size = 100
         for i in range(120):
-            receiver_mgr._seen_messages[f"sender:msg_{i}"] = True
+            receiver_mgr._seen_messages[f"sender:msg_{i}"] = _t.time()
         receiver_mgr._trim_seen_set()
         assert len(receiver_mgr._seen_messages) == 80
         assert "sender:msg_119" in receiver_mgr._seen_messages
@@ -488,8 +515,7 @@ class TestPrekeyGenerate:
         assert "signature" in result
         assert result["cert_fingerprint"].startswith("sha256:")
 
-        meta = receiver_ks.load_metadata("receiver.test")
-        prekeys = meta.get("e2ee_prekeys", {})
+        prekeys = receiver_ks.load_e2ee_prekeys("receiver.test")
         assert len(prekeys) == 1
         pid = list(prekeys.keys())[0]
         assert "private_key_pem" in prekeys[pid]
@@ -674,25 +700,18 @@ class TestFileKeyStoreProtection:
         from aun_core.keystore.file import FileKeyStore
 
         ks = FileKeyStore(root=tmp_path)
-        metadata = {
-            "e2ee_prekeys": {
-                "prekey-123": {
-                    "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
-                    "public_key": "MFkw...",
-                }
-            }
-        }
-        ks.save_metadata("test.aid", metadata)
+        ks.save_e2ee_prekey("test.aid", "prekey-123", {
+            "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+            "public_key": "MFkw...",
+        })
 
-        meta_file = tmp_path / "AIDs" / "test.aid" / "tokens" / "meta.json"
-        assert meta_file.exists()
-        content = json.loads(meta_file.read_text(encoding="utf-8"))
-        prekey_data = content["e2ee_prekeys"]["prekey-123"]
-        assert "private_key_pem" not in prekey_data
-        assert "private_key_protection" in prekey_data
+        # prekey 私钥存储在 SQLCipher 加密的 aun.db 中，不应出现在 meta.json
+        safe_aid = "test.aid"
+        db_file = tmp_path / "AIDs" / safe_aid / "aun.db"
+        assert db_file.exists(), "aun.db 应该存在"
 
-        loaded = ks.load_metadata("test.aid")
-        assert loaded["e2ee_prekeys"]["prekey-123"]["private_key_pem"] == metadata["e2ee_prekeys"]["prekey-123"]["private_key_pem"]
+        prekeys = ks.load_e2ee_prekeys("test.aid")
+        assert prekeys["prekey-123"]["private_key_pem"] == "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"
 
 
 # ---------------------------------------------------------------------------
@@ -725,11 +744,9 @@ class TestPrekeyV2:
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         ).decode("utf-8")
-        receiver_ks._metadata["receiver.test"] = {
-            "e2ee_prekeys": {
-                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
-            },
-        }
+        receiver_ks.save_e2ee_prekey("receiver.test", prekey["prekey_id"], {
+            "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
+        })
 
         payload = {"text": "双 ECDH 往返"}
         mid = str(uuid.uuid4())
@@ -759,11 +776,9 @@ class TestPrekeyV2:
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         ).decode("utf-8")
-        receiver_ks._metadata["receiver.test"] = {
-            "e2ee_prekeys": {
-                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
-            },
-        }
+        receiver_ks.save_e2ee_prekey("receiver.test", prekey["prekey_id"], {
+            "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
+        })
 
         # 手动构造 v1 信封（单 ECDH）— 使用已移除的 encryption_mode
         from cryptography.hazmat.primitives.asymmetric import ec as _ec
@@ -792,11 +807,7 @@ class TestPrekeyV2:
         ephemeral_pk_b64 = base64.b64encode(ephemeral_public_bytes).decode("ascii")
         from cryptography import x509 as _x509
         _rcert = _x509.load_pem_x509_certificate(receiver_cert.encode("utf-8"))
-        _fp_der = _rcert.public_key().public_bytes(
-            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-        _fp_hash = hashes.Hash(hashes.SHA256())
-        _fp_hash.update(_fp_der)
-        recipient_fp = f"sha256:{_fp_hash.finalize().hex()}"
+        recipient_fp = f"sha256:{_rcert.fingerprint(hashes.SHA256()).hex()}"
         aad = {
             "from": "sender.test", "to": "receiver.test",
             "message_id": mid, "timestamp": ts,
@@ -838,11 +849,9 @@ class TestPrekeyV2:
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         ).decode("utf-8")
-        receiver_ks._metadata["receiver.test"] = {
-            "e2ee_prekeys": {
-                prekey["prekey_id"]: {"private_key_pem": priv_pem, "created_at": int(time.time() * 1000)},
-            },
-        }
+        receiver_ks.save_e2ee_prekey("receiver.test", prekey["prekey_id"], {
+            "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
+        })
         # 替换 identity 私钥为错误的密钥
         wrong_key = ec.generate_private_key(ec.SECP256R1())
         wrong_pem = wrong_key.private_bytes(

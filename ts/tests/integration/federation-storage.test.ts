@@ -11,18 +11,18 @@ import { AUNClient } from '../../src/client.js';
 import type { JsonObject } from '../../src/types.js';
 
 const TEST_TIMEOUT = 90_000;
+process.env.AUN_ENV ??= 'development';
 
 function runId(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
 function makeClient(tag: string): AUNClient {
-  return new AUNClient({
+  const client = new AUNClient({
     aun_path: fs.mkdtempSync(path.join(os.tmpdir(), `aun-fed-storage-${tag}-`)),
-    verify_ssl: false,
-    require_forward_secrecy: false,
-    group_e2ee: false,
   });
+  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  return client;
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {

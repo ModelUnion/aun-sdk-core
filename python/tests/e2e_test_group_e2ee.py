@@ -14,6 +14,7 @@
 import asyncio
 import base64
 import os
+import re
 import secrets
 import sys
 import time
@@ -41,6 +42,7 @@ from aun_core.e2ee import (
 # ---------------------------------------------------------------------------
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
+os.environ.setdefault("AUN_ENV", "development")
 
 
 def _default_test_aun_path() -> str:
@@ -94,13 +96,26 @@ def _assert_fixed_aid_layout() -> None:
 _assert_fixed_aid_layout()
 
 
+def _normalize_slot_part(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+    return text.strip("-._") or "slot"
+
+
+def _build_test_slot_id(tag: str, rid: str | None = None) -> str:
+    tag_part = _normalize_slot_part(tag)
+    rid_part = _normalize_slot_part(rid) if rid else uuid.uuid4().hex[:12]
+    slot_id = f"{tag_part}-{rid_part}"
+    return slot_id[:128]
+
+
 def _make_client(tag: str, rid: str | None = None) -> AUNClient:
     """创建测试客户端。所有客户端共享同一 aun_path，各 AID 数据在 AIDs/{aid}/ 下自然隔离。"""
-    return AUNClient({
+    client = AUNClient({
         "aun_path": _TEST_AUN_PATH,
-        "verify_ssl": False,
-        "require_forward_secrecy": False,
     })
+    client._config_model.require_forward_secrecy = False
+    client._test_slot_id = _build_test_slot_id(tag, rid)
+    return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
@@ -108,7 +123,12 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     if local is None:
         await client.auth.create_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth)
+    connect_params = dict(auth)
+    slot_id = str(getattr(client, "_test_slot_id", "") or "")
+    if slot_id:
+        connect_params["slot_id"] = slot_id
+    connect_params["auto_reconnect"] = False
+    await client.connect(connect_params)
     return aid
 
 
@@ -168,8 +188,8 @@ async def test_group_encrypted_messaging():
     """Test 1: 建群 → 分发密钥 → 加密发送 → 解密接收"""
     print("\n=== Test 1: Group encrypted messaging ===")
     rid = _run_id()
-    alice = _make_client("alice")
-    bob = _make_client("bob")
+    alice = _make_client("alice", rid)
+    bob = _make_client("bob", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -214,7 +234,7 @@ async def test_multiple_members():
     """Test 2: 3人群组，A 发加密消息，B/C 都能解密"""
     print("\n=== Test 2: Multiple members decrypt ===")
     rid = _run_id()
-    alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
+    alice, bob, carol = _make_client("a", rid), _make_client("b", rid), _make_client("c", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -256,7 +276,7 @@ async def test_epoch_rotation_on_kick():
     """Test 3: 踢人 → epoch 轮换 → 旧成员无法解密新消息"""
     print("\n=== Test 3: Epoch rotation on kick ===")
     rid = _run_id()
-    alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
+    alice, bob, carol = _make_client("a", rid), _make_client("b", rid), _make_client("c", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -316,7 +336,7 @@ async def test_new_member_no_rotation():
     """Test 4: 加人 → 无 epoch 轮换 → 新成员可解密当前 epoch 消息"""
     print("\n=== Test 4: New member join no rotation ===")
     rid = _run_id()
-    alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
+    alice, bob, carol = _make_client("a", rid), _make_client("b", rid), _make_client("c", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -361,7 +381,7 @@ async def test_burst_group_messages():
     """Test 5: 连续发 5 条加密群消息 → 全部解密成功"""
     print("\n=== Test 5: Burst group messages ===")
     rid = _run_id()
-    alice, bob = _make_client("a"), _make_client("b")
+    alice, bob = _make_client("a", rid), _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -404,7 +424,7 @@ async def test_mixed_encrypted_plaintext():
     """Test 6: 同一群中加密和明文消息交替 → 正确处理"""
     print("\n=== Test 6: Mixed encrypted + plaintext ===")
     rid = _run_id()
-    alice, bob = _make_client("a"), _make_client("b")
+    alice, bob = _make_client("a", rid), _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -466,7 +486,7 @@ async def test_membership_commitment_verification():
     """Test 7: 篡改 member_aids → commitment 校验失败"""
     print("\n=== Test 7: Membership commitment prevents ghost ===")
     rid = _run_id()
-    alice, bob = _make_client("a"), _make_client("b")
+    alice, bob = _make_client("a", rid), _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -499,7 +519,7 @@ async def test_old_epoch_still_decryptable():
     """Test 8: 旧 epoch 消息在保留期内仍可解密"""
     print("\n=== Test 8: Old epoch messages still decryptable ===")
     rid = _run_id()
-    alice, bob = _make_client("a"), _make_client("b")
+    alice, bob = _make_client("a", rid), _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -522,7 +542,7 @@ async def test_old_epoch_still_decryptable():
         for dist in info['distributions']:
             await alice.call('message.send', {
                 'to': dist['to'], 'payload': dist['payload'],
-                'encrypt': True, 'persist': False,
+                'encrypt': True,
             })
         await asyncio.sleep(2)
 
@@ -561,7 +581,7 @@ async def test_review_join_request_auto_distribute():
     """
     print("\n=== Test 9: Review join request auto distribute ===")
     rid = _run_id()
-    alice, bob = _make_client("a"), _make_client("b")
+    alice, bob = _make_client("a", rid), _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -632,7 +652,7 @@ async def test_invite_code_auto_recovery():
     """
     print("\n=== Test 10: Invite code auto recovery ===")
     rid = _run_id()
-    alice, bob = _make_client("a"), _make_client("b")
+    alice, bob = _make_client("a", rid), _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -708,14 +728,10 @@ async def test_capabilities_required_for_join():
     """Test 11: 不声明 group_e2ee 能力的客户端无法入群"""
     print("\n=== Test 11: Capabilities required for group join ===")
     rid = _run_id()
-    alice = _make_client("alice")
+    alice = _make_client("alice", rid)
 
     # 创建不声明 group_e2ee 的客户端（模拟旧版本）
-    old_bob = AUNClient({
-        "aun_path": _TEST_AUN_PATH,
-        "verify_ssl": False,
-        "require_forward_secrecy": False,
-    })
+    old_bob = _make_client("old-bob", rid)
 
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
@@ -744,8 +760,8 @@ async def test_plaintext_send_explicit():
     """Test 12: 发送者显式传 encrypt=False 可以发送明文群消息"""
     print("\n=== Test 12: Explicit plaintext group send ===")
     rid = _run_id()
-    alice = _make_client("alice")
-    bob = _make_client("bob")
+    alice = _make_client("alice", rid)
+    bob = _make_client("bob", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -795,7 +811,7 @@ async def test_epoch_rotation_on_leave():
     """Test 13: 成员主动退群 → 剩余 admin/owner 事件侧自动轮换 → 离开者无法解密新消息"""
     print("\n=== Test 13: Epoch rotation on leave (event-side) ===")
     rid = _run_id()
-    alice, bob, carol = _make_client("a"), _make_client("b"), _make_client("c")
+    alice, bob, carol = _make_client("a", rid), _make_client("b", rid), _make_client("c", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -876,8 +892,8 @@ async def test_push_event_decrypt():
     """
     print("\n=== Test 14: Push event decrypts (no pull) ===")
     rid = _run_id()
-    alice = _make_client("a")
-    bob = _make_client("b")
+    alice = _make_client("a", rid)
+    bob = _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)

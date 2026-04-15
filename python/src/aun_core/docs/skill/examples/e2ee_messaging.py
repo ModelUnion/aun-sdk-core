@@ -33,7 +33,6 @@ async def main():
     result = await sender.call("message.send", {
         "to": receiver_aid,
         "payload": {"text": "这是一条加密消息", "secret_data": "仅接收方可见"},
-        "persist": True,
     })
     print(f"[1] 发送完成: seq={result.get('seq')}")
 

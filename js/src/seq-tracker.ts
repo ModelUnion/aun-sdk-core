@@ -167,6 +167,28 @@ export class SeqTracker {
     return now - probe.lastProbeAt >= interval;
   }
 
+  /** 强制跳过不连续区间，将 contiguousSeq 拨到指定位置。
+   *  当服务端返回 server_ack_seq 且本地 contiguousSeq 落后时调用，
+   *  跳过 [contiguousSeq, server_ack_seq) 这段不连续区间。 */
+  forceContiguousSeq(ns: string, seq: number): void {
+    const t = this._get(ns);
+    if (seq > t.contiguousSeq) {
+      // 清除被跳过区间内的 pendingGaps
+      for (const [key, probe] of t.pendingGaps) {
+        if (probe.gapEnd <= seq) {
+          t.pendingGaps.delete(key);
+        }
+      }
+      // 清除被跳过区间内的 receivedSeqs
+      for (const s of t.receivedSeqs) {
+        if (s <= seq) t.receivedSeqs.delete(s);
+      }
+      t.contiguousSeq = seq;
+      t.maxSeenSeq = Math.max(t.maxSeenSeq, seq);
+      this._tryAdvance(t);
+    }
+  }
+
   /** 导出各命名空间的 contiguousSeq，用于持久化 */
   exportState(): Record<string, number> {
     const result: Record<string, number> = {};

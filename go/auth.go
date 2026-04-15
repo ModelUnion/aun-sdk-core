@@ -99,6 +99,9 @@ type AuthFlow struct {
 	keystore          keystore.KeyStore
 	crypto            *CryptoProvider
 	aid               string
+	deviceID          string
+	slotID            string
+	deliveryMode      map[string]any
 	connectionFactory ConnectionFactory
 	rootCAPath        string
 	chainCacheTTL     int
@@ -121,6 +124,13 @@ type AuthFlow struct {
 	mu sync.RWMutex // 保护所有缓存字段
 }
 
+var authInstanceStateFields = []string{
+	"access_token",
+	"refresh_token",
+	"kite_token",
+	"access_token_expires_at",
+}
+
 // NewAuthFlow 创建认证流程实例
 func NewAuthFlow(cfg AuthFlowConfig) *AuthFlow {
 	ttl := cfg.ChainCacheTTL
@@ -131,6 +141,9 @@ func NewAuthFlow(cfg AuthFlowConfig) *AuthFlow {
 		keystore:           cfg.Keystore,
 		crypto:             cfg.Crypto,
 		aid:                cfg.AID,
+		deviceID:           "",
+		slotID:             "",
+		deliveryMode:       map[string]any{"mode": "fanout"},
 		connectionFactory:  cfg.ConnectionFactory,
 		rootCAPath:         cfg.RootCAPath,
 		chainCacheTTL:      ttl,
@@ -164,10 +177,12 @@ func (a *AuthFlow) LoadIdentity(aid string) (map[string]any, error) {
 	if cert != "" {
 		identity["cert"] = cert
 	}
-	metadata, _ := a.keystore.LoadMetadata(resolvedAID)
-	if metadata != nil {
-		for k, v := range metadata {
-			identity[k] = v
+	if a.deviceID != "" {
+		if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+			instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID)
+			for k, v := range instanceState {
+				identity[k] = v
+			}
 		}
 	}
 	return identity, nil
@@ -197,6 +212,21 @@ func (a *AuthFlow) GetAccessTokenExpiry(identity map[string]any) float64 {
 		return float64(v)
 	}
 	return 0
+}
+
+// SetInstanceContext 设置当前实例上下文。
+func (a *AuthFlow) SetInstanceContext(deviceID, slotID string) {
+	a.deviceID = strings.TrimSpace(deviceID)
+	a.slotID = strings.TrimSpace(slotID)
+}
+
+// SetDeliveryMode 设置 connect/auth.connect 使用的 delivery_mode。
+func (a *AuthFlow) SetDeliveryMode(deliveryMode map[string]any) {
+	if deliveryMode == nil {
+		a.deliveryMode = map[string]any{"mode": "fanout"}
+		return
+	}
+	a.deliveryMode = copyMapShallow(deliveryMode)
 }
 
 // ── AID 创建 ────────────────────────────────────────────────
@@ -233,7 +263,7 @@ func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (map[s
 		identity["cert"] = created["cert"]
 	}
 
-	if err := a.keystore.SaveIdentity(authGetStr(identity, "aid"), identity); err != nil {
+	if err := a.persistIdentity(identity); err != nil {
 		return nil, err
 	}
 	a.aid = authGetStr(identity, "aid")
@@ -258,7 +288,7 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 					"Run auth.create_aid() to register a new identity.", recoverErr))
 		}
 		identity = recovered
-		if err := a.keystore.SaveIdentity(authGetStr(identity, "aid"), identity); err != nil {
+		if err := a.persistIdentity(identity); err != nil {
 			return nil, err
 		}
 	}
@@ -269,7 +299,7 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 	}
 	authRememberTokens(identity, login)
 	a.validateNewCert(ctx, identity, gatewayURL)
-	if err := a.keystore.SaveIdentity(authGetStr(identity, "aid"), identity); err != nil {
+	if err := a.persistIdentity(identity); err != nil {
 		return nil, err
 	}
 	a.aid = authGetStr(identity, "aid")
@@ -292,7 +322,7 @@ func (a *AuthFlow) EnsureAuthenticated(ctx context.Context, gatewayURL string) (
 			return nil, err
 		}
 		identity["cert"] = created["cert"]
-		if err := a.keystore.SaveIdentity(authGetStr(identity, "aid"), identity); err != nil {
+		if err := a.persistIdentity(identity); err != nil {
 			return nil, err
 		}
 	}
@@ -303,7 +333,7 @@ func (a *AuthFlow) EnsureAuthenticated(ctx context.Context, gatewayURL string) (
 	}
 	authRememberTokens(identity, login)
 	a.validateNewCert(ctx, identity, gatewayURL)
-	if err := a.keystore.SaveIdentity(authGetStr(identity, "aid"), identity); err != nil {
+	if err := a.persistIdentity(identity); err != nil {
 		return nil, err
 	}
 
@@ -334,7 +364,7 @@ func (a *AuthFlow) RefreshCachedTokens(ctx context.Context, gatewayURL string, i
 	}
 	authRememberTokens(identity, refreshed)
 	a.validateNewCert(ctx, identity, gatewayURL)
-	if err := a.keystore.SaveIdentity(authGetStr(identity, "aid"), identity); err != nil {
+	if err := a.persistIdentity(identity); err != nil {
 		return nil, err
 	}
 	return identity, nil
@@ -371,7 +401,7 @@ func (a *AuthFlow) ConnectSession(
 	if accessToken != "" && identity != nil {
 		if err := a.initializeSession(ctx, transport, nonce, accessToken); err == nil {
 			identity["access_token"] = accessToken
-			_ = a.keystore.SaveIdentity(authGetStr(identity, "aid"), identity)
+			_ = a.persistIdentity(identity)
 			return map[string]any{"token": accessToken, "identity": identity}, nil
 		}
 		log.Printf("explicit_token 认证失败，尝试下一方式")
@@ -1066,6 +1096,14 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 			"min": "1.0",
 			"max": "1.0",
 		},
+		"device": map[string]any{
+			"id":   a.deviceID,
+			"type": "sdk",
+		},
+		"client": map[string]any{
+			"slot_id": a.slotID,
+		},
+		"delivery_mode": copyMapShallow(a.deliveryMode),
 		"capabilities": map[string]any{
 			"e2ee":       true,
 			"group_e2ee": true,
@@ -1147,7 +1185,9 @@ func (a *AuthFlow) validateNewCert(ctx context.Context, identity map[string]any,
 			return
 		}
 		// OCSP 不可用时降级（CRL 已检查）
-		_ = a.verifyAuthCertOCSP(ctx, gatewayURL, cert, "")
+		if err := a.verifyAuthCertOCSP(ctx, gatewayURL, cert, ""); err != nil {
+			log.Printf("[aun_core.auth] OCSP 校验不可用，降级继续 (CRL 已检查): %v", err)
+		}
 	}
 
 	// 验证通过，正式接受
@@ -1275,7 +1315,7 @@ func (a *AuthFlow) ensureLocalIdentity(aid string) map[string]any {
 		return map[string]any{"aid": aid}
 	}
 	identity["aid"] = aid
-	_ = a.keystore.SaveIdentity(aid, identity)
+	_ = a.persistIdentity(identity)
 	a.aid = aid
 	return identity
 }
@@ -1329,8 +1369,48 @@ func (a *AuthFlow) ensureIdentity() map[string]any {
 		return map[string]any{"aid": a.aid}
 	}
 	newIdentity["aid"] = a.aid
-	_ = a.keystore.SaveIdentity(a.aid, newIdentity)
+	_ = a.persistIdentity(newIdentity)
 	return newIdentity
+}
+
+func (a *AuthFlow) persistIdentity(identity map[string]any) error {
+	aid := authGetStr(identity, "aid")
+	if aid == "" {
+		return NewStateError("identity missing aid")
+	}
+
+	persisted := copyMapShallow(identity)
+	instanceState := make(map[string]any)
+	for _, key := range authInstanceStateFields {
+		if value, ok := persisted[key]; ok {
+			instanceState[key] = value
+			delete(persisted, key)
+		}
+	}
+
+	if err := a.keystore.SaveIdentity(aid, persisted); err != nil {
+		return err
+	}
+	if a.deviceID == "" {
+		return nil
+	}
+	// 实例级字段已拆分到 instance_state，无需从共享 metadata 清理
+	if len(instanceState) == 0 {
+		return nil
+	}
+	if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+		_, err := store.UpdateInstanceState(aid, a.deviceID, a.slotID, func(current map[string]any) (map[string]any, error) {
+			if current == nil {
+				current = make(map[string]any)
+			}
+			for k, v := range instanceState {
+				current[k] = v
+			}
+			return current, nil
+		})
+		return err
+	}
+	return nil
 }
 
 // ── 内部：根证书加载 ────────────────────────────────────────
@@ -1571,6 +1651,34 @@ func authAppendCertPaths(paths *[]string, dir string) {
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".crt") {
 			*paths = append(*paths, filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
+// CleanExpiredCaches 清理过期的 gateway 缓存条目（供外部定时调用）
+func (a *AuthFlow) CleanExpiredCaches() {
+	now := float64(time.Now().Unix())
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for k, v := range a.gatewayCRLCache {
+		if v.NextRefreshAt <= now {
+			delete(a.gatewayCRLCache, k)
+		}
+	}
+	for k, inner := range a.gatewayOCSPCache {
+		for serial, entry := range inner {
+			if entry.NextRefreshAt <= now {
+				delete(inner, serial)
+			}
+		}
+		if len(inner) == 0 {
+			delete(a.gatewayOCSPCache, k)
+		}
+	}
+	ttl := float64(a.chainCacheTTL)
+	for k, v := range a.chainVerifiedCache {
+		if now-v >= ttl {
+			delete(a.chainVerifiedCache, k)
 		}
 	}
 }

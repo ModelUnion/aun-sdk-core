@@ -70,27 +70,18 @@
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `aun_path` | `str` | 否 | `~/.aun/{cwd}` | 应用级数据目录（AID 数据在 `{aun_path}/AIDs/{aid}/` 下） |
+| `aun_path` | `str` | 否 | `~/.aun` | 应用级数据目录（AID 数据在 `{aun_path}/AIDs/{aid}/` 下） |
 | `root_ca_path` | `str` | 否 | `None` | 额外 Root CA 路径 |
-| `encryption_seed` | `str` | 否 | `None` | 本地加密种子 |
-| `discovery_port` | `int` | 否 | `None` | 自定义 Gateway 发现端口 |
-| `group_e2ee` | `bool` | 否 | `true` | 群组 E2EE 为必选能力；当前 Python SDK 固定启用，用户传入值被忽略 |
-| `rotate_on_join` | `bool` | 否 | `false` | 新成员加入时是否轮换 epoch |
-| `epoch_auto_rotate_interval` | `int` | 否 | `0` | 定时 epoch 轮换间隔（秒），0=禁用 |
-| `old_epoch_retention_seconds` | `int` | 否 | `604800` | 旧 epoch 密钥保留时间（默认 7 天） |
-| `keystore` | `KeyStore` | 否 | `FileKeyStore` | 自定义密钥存储实现 |
-| `secret_store` | `SecretStore` | 否 | 平台默认 | 自定义敏感数据存储（DPAPI/Keychain/libsecret） |
-| `connection_factory` | `callable` | 否 | 内置 WSS | 自定义 WebSocket 连接工厂 |
-| `crypto` | `CryptoProvider` | 否 | 内置 | 自定义密码学实现 |
-| `server_replay_guard` | `bool` | 否 | `false` | 启用服务端防重放（跨进程持久化） |
-| `prekey_refresh_interval` | `float` | 否 | `3600` | Prekey 自动轮换间隔（秒） |
+| `seed_password` | `str` | 否 | `None` | 本地存储保护口令 |
 
 ```python
 client = AUNClient({
     "aun_path": "~/.aun/myapp",
-    "rotate_on_join": False,
+    "seed_password": "seed",
 })
 ```
+
+`verify_ssl` 不在构造阶段传入。Python / TS / Go SDK 根据 `AUN_ENV` 或 `KITE_ENV` 自动决定是否校验证书；Browser SDK 恒为 `true`。
 
 ### 属性
 
@@ -122,6 +113,10 @@ client = AUNClient({
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
+| `slot_id` | `str` | `""` | 同一设备上的实例槽位；空字符串表示该设备单实例模式 |
+| `delivery_mode.mode` | `str` | `"fanout"` | 连接级投递语义；同一 AID 的所有在线实例必须保持一致 |
+| `delivery_mode.routing` | `str` | `"sender_affinity"` | 仅 `queue` 模式有效 |
+| `delivery_mode.affinity_ttl_ms` | `int` | `300000` | 仅 `queue + sender_affinity` 有效 |
 | `auto_reconnect` | `bool` | `False` | 断线自动重连 |
 | `heartbeat_interval` | `float` | `30.0` | 心跳间隔（秒） |
 | `token_refresh_before` | `float` | `60.0` | 令牌过期前多久刷新（秒） |
@@ -135,6 +130,8 @@ client = AUNClient({
 ```python
 auth = await client.auth.authenticate({"aid": MY_AID})
 await client.connect(auth, {
+    "slot_id": "slot-a",
+    "delivery_mode": {"mode": "fanout"},
     "auto_reconnect": False,
     "heartbeat_interval": 30.0,
 })
@@ -158,16 +155,19 @@ await client.connect(auth, {
 - `message.send` 和 `group.send` **默认加密发送**（`encrypt` 默认 `True`），无需显式传参
 - 发送明文消息需显式传 `encrypt=False`
 - `message.pull` / `group.pull` 返回的消息已自动解密，加密消息带有 `encrypted=True` 标记
+- P2P 消息的投递语义由连接阶段声明的 `delivery_mode` 决定
+- `group.send` 固定为 `fanout`，不支持 `queue`
+- Python SDK 会为 `message.pull` / `message.ack` 自动附带当前实例的 `device_id` / `slot_id`，应用层不应手工覆盖
+- 同一 AID 的所有在线实例必须声明一致的连接级 `delivery_mode`
 
 ```python
 # 发送加密消息（默认行为，无需传 encrypt）
 await client.call("message.send", {
     "to": "bob.agentid.pub",
     "payload": {"text": "秘密消息"},
-    "persist": True,
 })
 
-# 接收并自动解密
+# 接收并自动解密（SDK 会自动带当前实例的 device_id / slot_id）
 result = await client.call("message.pull", {"after_seq": 0, "limit": 50})
 for msg in result["messages"]:
     print(msg["payload"])   # 加密消息已自动解密
@@ -187,7 +187,8 @@ await client.call("message.send", {
 | `encrypt` | `bool` | 否 | 是否加密消息（默认 `true`） |
 | `message_id` | `str` | 否 | 消息 ID（不传则自动生成） |
 | `timestamp` | `int` | 否 | 时间戳毫秒（不传则自动生成） |
-| `persist` | `bool` | 否 | 是否持久化（默认 `true`） |
+
+P2P 消息的 `delivery_mode` 由当前连接实例携带；应用层通过 `connect` 配置即可。
 
 ---
 

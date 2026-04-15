@@ -11,12 +11,12 @@ import (
 
 func makeFederationClient(t *testing.T) *AUNClient {
 	t.Helper()
-	return NewClient(map[string]any{
-		"aun_path":                t.TempDir(),
-		"verify_ssl":             false,
-		"require_forward_secrecy": false,
-		"group_e2ee":             false,
+	t.Setenv("AUN_ENV", "development")
+	client := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
 	})
+	client.configModel.RequireForwardSecrecy = false
+	return client
 }
 
 func ensureFederationConnected(t *testing.T, client *AUNClient, aid string) string {
@@ -83,7 +83,6 @@ func TestFederationSDKToSDKPrekey(t *testing.T) {
 		"to":      bobAID,
 		"payload": map[string]any{"text": text},
 		"encrypt": true,
-		"persist": true,
 	})
 	if err != nil {
 		t.Fatalf("跨域发送失败: %v", err)

@@ -56,6 +56,7 @@ from aun_core import AUNClient
 # ---------------------------------------------------------------------------
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
+os.environ.setdefault("AUN_ENV", "development")
 
 
 def _default_test_aun_path() -> str:
@@ -117,11 +118,11 @@ _assert_fixed_aid_layout()
 # ---------------------------------------------------------------------------
 
 def _make_client() -> AUNClient:
-    return AUNClient({
+    client = AUNClient({
         "aun_path": _TEST_AUN_PATH,
-        "verify_ssl": False,
-        "require_forward_secrecy": False,
     })
+    client._config_model.require_forward_secrecy = False
+    return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:

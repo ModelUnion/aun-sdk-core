@@ -6,26 +6,35 @@ from typing import Any, Literal, TypedDict
 JsonValue = Any
 
 
-class Message(TypedDict, total=False):
-    message_id: str
-    seq: int
-    to: str
-    type: str
-    payload: JsonValue
-    encrypted: bool
-    persist: bool
-    timestamp: int
+Message = TypedDict(
+    "Message",
+    {
+        "message_id": str,
+        "seq": int,
+        "from": str,
+        "to": str,
+        "type": str,
+        "payload": JsonValue,
+        "encrypted": bool,
+        "delivery_mode": Literal["fanout", "queue"],
+        "timestamp": int,
+        "e2ee": dict[str, Any],
+    },
+    total=False,
+)
 
 
 class SendResult(TypedDict, total=False):
+    ok: bool
     message_id: str
     seq: int
     timestamp: int
     status: Literal["sent", "delivered", "duplicate"]
-    persist: bool
+    delivery_mode: Literal["fanout", "queue"]
 
 
 class AckResult(TypedDict, total=False):
+    success: bool
     ack_seq: int
 
 

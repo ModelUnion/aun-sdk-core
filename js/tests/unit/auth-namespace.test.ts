@@ -87,7 +87,8 @@ describe('AuthNamespace agent.md', () => {
   });
 
   it('downloadAgentMd 应匿名下载', async () => {
-    const client = new AUNClient({ discoveryPort: 18443 });
+    const client = new AUNClient();
+    (client as any).configModel.discoveryPort = 18443;
     client.gatewayUrl = 'wss://gateway.agentid.pub/aun';
 
     const fetchMock = vi.fn().mockResolvedValue({

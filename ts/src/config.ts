@@ -8,9 +8,29 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { ValidationError } from './errors.js';
 import type { JsonObject } from './types.js';
 
 // ── 设备 ID ──────────────────────────────────────────────────
+
+const INSTANCE_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+const DEV_ENV_VALUES = new Set(['development', 'dev', 'local']);
+
+export function normalizeInstanceId(
+  value: unknown,
+  field: string,
+  opts: { allowEmpty?: boolean } = {},
+): string {
+  const text = String(value ?? '').trim();
+  if (!text) {
+    if (opts.allowEmpty) return '';
+    throw new ValidationError(`${field} must be a non-empty string`);
+  }
+  if (!INSTANCE_ID_PATTERN.test(text)) {
+    throw new ValidationError(`${field} contains unsupported characters`);
+  }
+  return text;
+}
 
 /**
  * 获取本设备的稳定 ID。
@@ -27,13 +47,13 @@ export function getDeviceId(aunRoot?: string): string {
   if (existsSync(deviceIdPath)) {
     try {
       const stored = readFileSync(deviceIdPath, 'utf-8').trim();
-      if (stored) return stored;
+      if (stored) return normalizeInstanceId(stored, 'device_id');
     } catch {
       // 平台兼容 fallback
     }
   }
 
-  const newId = randomUUID();
+  const newId = normalizeInstanceId(randomUUID(), 'device_id');
   try {
     writeFileSync(deviceIdPath, newId, 'utf-8');
     if (process.platform !== 'win32') {
@@ -56,8 +76,8 @@ export interface AUNConfig {
   aunPath: string;
   /** 根证书路径 */
   rootCaPath: string | null;
-  /** 加密种子（用于 FileSecretStore 密钥派生） */
-  encryptionSeed: string | null;
+  /** 私钥加密口令（用于本地密钥派生） */
+  seedPassword: string | null;
   /** Gateway 发现端口 */
   discoveryPort: number | null;
   /** 是否启用群组 E2EE */
@@ -76,6 +96,25 @@ export interface AUNConfig {
   replayWindowSeconds: number;
 }
 
+function readOptionalNumber(value: unknown, fallback: number | null): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function readBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function resolveVerifySslFromEnv(): boolean {
+  for (const key of ['AUN_ENV', 'KITE_ENV'] as const) {
+    const raw = process.env[key];
+    if (typeof raw !== 'string') continue;
+    const value = raw.trim().toLowerCase();
+    if (!value) continue;
+    return !DEV_ENV_VALUES.has(value);
+  }
+  return true;
+}
+
 // ── 默认配置 ─────────────────────────────────────────────────
 
 /** 返回默认配置 */
@@ -83,13 +122,13 @@ export function defaultConfig(): AUNConfig {
   return {
     aunPath: join(homedir(), '.aun'),
     rootCaPath: null,
-    encryptionSeed: null,
+    seedPassword: null,
     discoveryPort: null,
     groupE2ee: true,
     rotateOnJoin: false,
     epochAutoRotateInterval: 0,
     oldEpochRetentionSeconds: 604800,
-    verifySsl: true,
+    verifySsl: resolveVerifySslFromEnv(),
     requireForwardSecrecy: true,
     replayWindowSeconds: 300,
   };
@@ -101,27 +140,22 @@ export function defaultConfig(): AUNConfig {
 export function configFromMap(raw: JsonObject): AUNConfig {
   const def = defaultConfig();
   const aunPath = raw.aun_path ?? raw.aunPath;
-  const dp = raw.discovery_port ?? raw.discoveryPort;
 
   return {
     aunPath: aunPath ? String(aunPath) : def.aunPath,
     rootCaPath: raw.root_ca_path != null ? String(raw.root_ca_path) : (raw.rootCaPath != null ? String(raw.rootCaPath) : null),
-    encryptionSeed: raw.encryption_seed != null ? String(raw.encryption_seed) : (raw.encryptionSeed != null ? String(raw.encryptionSeed) : null),
-    discoveryPort: dp != null ? Number(dp) : null,
-    groupE2ee: raw.group_e2ee != null ? Boolean(raw.group_e2ee) : (raw.groupE2ee != null ? Boolean(raw.groupE2ee) : def.groupE2ee),
-    rotateOnJoin: raw.rotate_on_join != null ? Boolean(raw.rotate_on_join) : (raw.rotateOnJoin != null ? Boolean(raw.rotateOnJoin) : def.rotateOnJoin),
-    epochAutoRotateInterval: raw.epoch_auto_rotate_interval != null
-      ? Number(raw.epoch_auto_rotate_interval)
-      : (raw.epochAutoRotateInterval != null ? Number(raw.epochAutoRotateInterval) : def.epochAutoRotateInterval),
-    oldEpochRetentionSeconds: raw.old_epoch_retention_seconds != null
-      ? Number(raw.old_epoch_retention_seconds)
-      : (raw.oldEpochRetentionSeconds != null ? Number(raw.oldEpochRetentionSeconds) : def.oldEpochRetentionSeconds),
-    verifySsl: raw.verify_ssl != null ? Boolean(raw.verify_ssl) : (raw.verifySsl != null ? Boolean(raw.verifySsl) : def.verifySsl),
-    requireForwardSecrecy: raw.require_forward_secrecy != null
-      ? Boolean(raw.require_forward_secrecy)
-      : (raw.requireForwardSecrecy != null ? Boolean(raw.requireForwardSecrecy) : def.requireForwardSecrecy),
-    replayWindowSeconds: raw.replay_window_seconds != null
-      ? Number(raw.replay_window_seconds)
-      : (raw.replayWindowSeconds != null ? Number(raw.replayWindowSeconds) : def.replayWindowSeconds),
+    seedPassword:
+      raw.seed_password != null ? String(raw.seed_password)
+      : (raw.seedPassword != null ? String(raw.seedPassword)
+      : (raw.encryption_seed != null ? String(raw.encryption_seed)
+      : (raw.encryptionSeed != null ? String(raw.encryptionSeed) : null))),
+    discoveryPort: readOptionalNumber(raw.discovery_port ?? raw.discoveryPort, def.discoveryPort),
+    groupE2ee: true,  // 必备能力，不可配置
+    rotateOnJoin: readBoolean(raw.rotate_on_join ?? raw.rotateOnJoin, def.rotateOnJoin),
+    epochAutoRotateInterval: readOptionalNumber(raw.epoch_auto_rotate_interval ?? raw.epochAutoRotateInterval, def.epochAutoRotateInterval) ?? def.epochAutoRotateInterval,
+    oldEpochRetentionSeconds: readOptionalNumber(raw.old_epoch_retention_seconds ?? raw.oldEpochRetentionSeconds, def.oldEpochRetentionSeconds) ?? def.oldEpochRetentionSeconds,
+    verifySsl: readBoolean(raw.verify_ssl ?? raw.verifySSL ?? raw.verifySsl, def.verifySsl),
+    requireForwardSecrecy: readBoolean(raw.require_forward_secrecy ?? raw.requireForwardSecrecy, def.requireForwardSecrecy),
+    replayWindowSeconds: readOptionalNumber(raw.replay_window_seconds ?? raw.replayWindowSeconds, def.replayWindowSeconds) ?? def.replayWindowSeconds,
   };
 }

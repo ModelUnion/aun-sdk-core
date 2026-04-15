@@ -3,6 +3,8 @@
 import { ValidationError } from './errors.js';
 import type { JsonObject } from './types.js';
 
+const INSTANCE_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
 function readString(value: JsonObject[keyof JsonObject], fallback: string): string {
   return typeof value === 'string' ? value : fallback;
 }
@@ -19,8 +21,20 @@ function readBoolean(value: JsonObject[keyof JsonObject], fallback: boolean): bo
   return typeof value === 'boolean' ? value : fallback;
 }
 
-function readNumber(value: JsonObject[keyof JsonObject], fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+export function normalizeInstanceId(
+  value: unknown,
+  field: string,
+  opts: { allowEmpty?: boolean } = {},
+): string {
+  const text = String(value ?? '').trim();
+  if (!text) {
+    if (opts.allowEmpty) return '';
+    throw new ValidationError(`${field} must be a non-empty string`);
+  }
+  if (!INSTANCE_ID_PATTERN.test(text)) {
+    throw new ValidationError(`${field} contains unsupported characters`);
+  }
+  return text;
 }
 
 /**
@@ -31,12 +45,12 @@ export function getDeviceId(): string {
   const STORAGE_KEY = 'aun_device_id';
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) return stored;
+    if (stored) return normalizeInstanceId(stored, 'device_id');
   } catch {
     // localStorage 不可用（隐私模式等）
   }
 
-  const newId = crypto.randomUUID();
+  const newId = normalizeInstanceId(crypto.randomUUID(), 'device_id');
   try {
     localStorage.setItem(STORAGE_KEY, newId);
   } catch {
@@ -51,8 +65,8 @@ export interface AUNConfig {
   aunPath: string;
   /** 根证书 PEM 字符串 */
   rootCaPem: string | null;
-  /** 加密种子 */
-  encryptionSeed: string | null;
+  /** 私钥加密口令 */
+  seedPassword: string | null;
   /** Gateway 发现端口 */
   discoveryPort: number | null;
   /** 是否启用群组 E2EE（默认 true） */
@@ -75,7 +89,7 @@ export interface AUNConfig {
 const DEFAULTS: AUNConfig = {
   aunPath: 'aun',
   rootCaPem: null,
-  encryptionSeed: null,
+  seedPassword: null,
   discoveryPort: null,
   groupE2ee: true,
   rotateOnJoin: false,
@@ -91,21 +105,23 @@ type AUNConfigInput = Partial<AUNConfig> & JsonObject;
 /** 从字典创建 AUNConfig（兼容 snake_case 和 camelCase） */
 export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
   const data = (raw ?? {}) as AUNConfigInput;
-  const verifySsl = readBoolean(data.verifySsl ?? data.verify_ssl, DEFAULTS.verifySsl);
-  if (!verifySsl) {
+  if (data.verifySsl === false || data.verifySSL === false || data.verify_ssl === false) {
     throw new ValidationError('browser SDK does not allow verify_ssl=false');
   }
   return {
     aunPath: readString(data.aunPath ?? data.aun_path, DEFAULTS.aunPath),
     rootCaPem: readOptionalString(data.rootCaPem ?? data.root_ca_pem ?? data.root_ca_path, DEFAULTS.rootCaPem),
-    encryptionSeed: readOptionalString(data.encryptionSeed ?? data.encryption_seed, DEFAULTS.encryptionSeed),
+    seedPassword: readOptionalString(
+      data.seedPassword ?? data.seed_password ?? data.encryptionSeed ?? data.encryption_seed,
+      DEFAULTS.seedPassword,
+    ),
     discoveryPort: readOptionalNumber(data.discoveryPort ?? data.discovery_port, DEFAULTS.discoveryPort),
-    groupE2ee: readBoolean(data.groupE2ee ?? data.group_e2ee, DEFAULTS.groupE2ee),
+    groupE2ee: true,  // 必备能力，不可配置
     rotateOnJoin: readBoolean(data.rotateOnJoin ?? data.rotate_on_join, DEFAULTS.rotateOnJoin),
-    epochAutoRotateInterval: readNumber(data.epochAutoRotateInterval ?? data.epoch_auto_rotate_interval, DEFAULTS.epochAutoRotateInterval),
-    oldEpochRetentionSeconds: readNumber(data.oldEpochRetentionSeconds ?? data.old_epoch_retention_seconds, DEFAULTS.oldEpochRetentionSeconds),
-    verifySsl,
+    epochAutoRotateInterval: readOptionalNumber(data.epochAutoRotateInterval ?? data.epoch_auto_rotate_interval, DEFAULTS.epochAutoRotateInterval) ?? DEFAULTS.epochAutoRotateInterval,
+    oldEpochRetentionSeconds: readOptionalNumber(data.oldEpochRetentionSeconds ?? data.old_epoch_retention_seconds, DEFAULTS.oldEpochRetentionSeconds) ?? DEFAULTS.oldEpochRetentionSeconds,
+    verifySsl: DEFAULTS.verifySsl,
     requireForwardSecrecy: readBoolean(data.requireForwardSecrecy ?? data.require_forward_secrecy, DEFAULTS.requireForwardSecrecy),
-    replayWindowSeconds: readNumber(data.replayWindowSeconds ?? data.replay_window_seconds, DEFAULTS.replayWindowSeconds),
+    replayWindowSeconds: readOptionalNumber(data.replayWindowSeconds ?? data.replay_window_seconds, DEFAULTS.replayWindowSeconds) ?? DEFAULTS.replayWindowSeconds,
   };
 }

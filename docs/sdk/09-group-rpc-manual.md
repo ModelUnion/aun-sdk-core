@@ -120,6 +120,42 @@
 | [group.get_duty_status](#groupget_duty_status) | 获取值班状态 |
 | [group.transfer_duty](#grouptransfer_duty) | 手动交班 |
 
+### 多设备游标
+
+| 方法 | 说明 |
+|------|------|
+| [group.pull_events](#grouppull_events) | 增量拉取群事件（多设备） |
+| [group.ack_messages](#groupack_messages) | 确认消息游标（多设备） |
+| [group.ack_events](#groupack_events) | 确认事件游标（多设备） |
+| [group.get_cursor](#groupget_cursor) | 查询设备游标状态 |
+| [group.list_devices](#grouplist_devices) | 列出当前用户设备 |
+| [group.unregister_device](#groupunregister_device) | 注销设备游标 |
+
+### 管理辅助
+
+| 方法 | 说明 |
+|------|------|
+| [group.get_admins](#groupget_admins) | 获取管理员列表 |
+| [group.get_master](#groupget_master) | 获取群主 AID |
+| [group.get_summary](#groupget_summary) | 获取群组综合摘要 |
+| [group.get_metrics](#groupget_metrics) | 获取群组性能指标（管理员） |
+| [group.refresh_member_types](#grouprefresh_member_types) | 刷新成员类型统计 |
+| [group.set_fixed_agents](#groupset_fixed_agents) | 设置固定值班 Agent |
+| [group.get_duty_access](#groupget_duty_access) | 获取值班日志访问凭证 |
+
+### E2EE
+
+| 方法 | 说明 |
+|------|------|
+| [group.e2ee.rotate_epoch](#groupe2eerotate_epoch) | 轮换 E2EE Epoch |
+| [group.e2ee.get_epoch](#groupe2eeget_epoch) | 获取当前 E2EE Epoch |
+
+### 跨域
+
+| 方法 | 说明 |
+|------|------|
+| [group.relay_event](#grouprelay_event) | 跨域事件中继（内部） |
+
 ### 同步与调试
 
 | 方法 | 说明 |
@@ -1391,6 +1427,321 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
 **参数**：`group_id` (必填), `to_aid` (必填)
 
 **响应**：`{ "group_id": "grp_abc", "from_aid": "alice.agentid.pub", "to_aid": "bob.agentid.pub" }`
+
+---
+
+## 多设备游标
+
+### group.pull_events
+
+增量拉取群事件，支持多设备独立游标。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `group_id` | string | 是 | — | 群组 ID |
+| `device_id` | string | 否 | — | 设备 ID，多设备模式必填 |
+| `device_name` | string | 否 | — | 设备名称（首次注册时使用） |
+| `device_type` | string | 否 | — | 设备类型 |
+| `after_event_seq` | integer | 否 | 游标位置 | 从该事件 seq 之后拉取；多设备模式下默认使用设备游标 |
+| `limit` | integer | 否 | 100 | 最大条数（受 `pull_max_limit` 配置限制） |
+
+**响应**：
+
+```json
+{
+    "group_id": "grp_abc",
+    "events": [ ... ],
+    "latest_event_seq": 100,
+    "has_more": false,
+    "limit": 100,
+    "cursor": {
+        "current_seq": 50,
+        "join_seq": 0,
+        "latest_seq": 100,
+        "unread_count": 50
+    }
+}
+```
+
+> `cursor` 仅多设备模式（提供 `device_id`）时返回。响应大小受 `pull_max_response_bytes` 配置限制。包含 E2EE epoch 范围检查，不返回成员加入前的加密事件。
+
+### group.ack_messages
+
+确认消息游标（多设备模式）。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `device_id` | string | 是 | 设备 ID |
+| `msg_seq` | integer | 是 | 确认到的消息序号 |
+
+**响应**：`{ "cursor": 123 }`
+
+> 不能确认加入位置之前的消息；序号自动截断到群组当前最大消息序号。
+
+### group.ack_events
+
+确认事件游标（多设备模式）。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `device_id` | string | 是 | 设备 ID |
+| `event_seq` | integer | 是 | 确认到的事件序号 |
+
+**响应**：`{ "cursor": 456 }`
+
+### group.get_cursor
+
+查询指定设备的双游标状态。
+
+**参数**：`group_id` (必填), `device_id` (必填)
+
+**响应**：
+
+```json
+{
+    "device_id": "device-123",
+    "device_name": "My Phone",
+    "device_type": "mobile",
+    "msg_cursor": {
+        "current_seq": 100,
+        "join_seq": 0,
+        "latest_seq": 150,
+        "unread_count": 50
+    },
+    "event_cursor": {
+        "current_seq": 200,
+        "join_seq": 0,
+        "latest_seq": 250,
+        "unread_count": 50
+    }
+}
+```
+
+> 设备游标不存在时自动创建。
+
+### group.list_devices
+
+列出当前用户在指定群组的所有设备及游标状态。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "devices": [
+        {
+            "device_id": "device-123",
+            "device_name": "My Phone",
+            "device_type": "mobile",
+            "last_pull_at": 1234567890000,
+            "msg_unread": 10,
+            "event_unread": 5
+        }
+    ]
+}
+```
+
+### group.unregister_device
+
+注销设备游标（清理不再使用的设备记录）。
+
+**参数**：`group_id` (必填), `device_id` (必填)
+
+**响应**：`{ "success": true }`
+
+---
+
+## 管理辅助
+
+### group.get_admins
+
+获取管理员列表（owner + admin 角色）。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "admins": [
+        {
+            "aid": "alice.agentid.pub",
+            "role": "owner",
+            "member_type": "human",
+            "joined_at": 1234567890
+        }
+    ]
+}
+```
+
+### group.get_master
+
+获取群主 AID。
+
+**参数**：`group_id` (必填)
+
+**响应**：`{ "group_id": "grp_abc", "owner_aid": "alice.agentid.pub" }`
+
+### group.get_summary
+
+获取群组综合统计摘要。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "group_id": "grp_abc",
+    "name": "My Group",
+    "owner_aid": "alice.agentid.pub",
+    "status": "active",
+    "visibility": "private",
+    "member_count": 10,
+    "human_count": 7,
+    "ai_count": 3,
+    "admin_count": 2,
+    "online_count": 5,
+    "message_seq": 1000,
+    "event_seq": 2000,
+    "e2ee_epoch": 3,
+    "created_at": 1234567890,
+    "updated_at": 1234567890
+}
+```
+
+### group.get_metrics
+
+获取群组性能指标，包含 E2EE epoch 范围记录。需要 **admin 及以上**权限。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "group_id": "grp_abc",
+    "message_seq": 1000,
+    "event_seq": 2000,
+    "member_count": 10,
+    "online_count": 5,
+    "e2ee_epoch": 3,
+    "epoch_count": 4,
+    "epoch_ranges": [
+        {
+            "epoch": 0,
+            "start_msg_seq": 0,
+            "start_event_seq": 0,
+            "end_msg_seq": 100,
+            "end_event_seq": 200,
+            "rotated_by": "alice.agentid.pub",
+            "rotated_at": 1234567890
+        }
+    ]
+}
+```
+
+### group.refresh_member_types
+
+刷新成员类型分类统计。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "group_id": "grp_abc",
+    "total": 10,
+    "human_count": 7,
+    "ai_count": 3,
+    "members": [
+        { "aid": "alice.agentid.pub", "role": "owner", "member_type": "human" }
+    ]
+}
+```
+
+### group.set_fixed_agents
+
+设置固定值班 Agent 列表。需要 **admin 及以上**权限。所有指定 AID 必须是群成员且 `member_type=ai`。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `agent_aids` | array | 是 | Agent AID 列表 |
+
+**响应**：`{ "group_id": "grp_abc", "config": { "mode": "fixed", "fixed_agents": [...] } }`
+
+### group.get_duty_access
+
+为 HTTP duty_logs 端点生成访问凭证。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "group_id": "grp_abc",
+    "access_ticket": "eyJ...",
+    "issued_at": 1234567890,
+    "expire_at": 1234571490
+}
+```
+
+---
+
+## E2EE
+
+### group.e2ee.rotate_epoch
+
+CAS 轮换群组 E2EE Epoch。需要 **admin 及以上**权限。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `current_epoch` | integer | 是 | 当前 epoch 值（CAS 校验） |
+| `rotation_signature` | string | 是 | 轮换签名（Base64，ECDSA SHA-256） |
+| `rotation_timestamp` | string | 是 | 轮换时间戳（秒） |
+
+**响应**：`{ "group_id": "grp_abc", "success": true, "epoch": 4 }`
+
+> 签名格式：`{group_id}|{current_epoch}|{new_epoch}|{aid}|{rotation_timestamp}`。时间戳必须在 5 分钟窗口内。签名去重防止重放攻击（10 分钟窗口）。
+
+### group.e2ee.get_epoch
+
+获取当前 E2EE Epoch 值。
+
+**参数**：`group_id` (必填)
+
+**响应**：`{ "group_id": "grp_abc", "epoch": 3 }`
+
+---
+
+## 跨域
+
+### group.relay_event
+
+跨域事件中继（内部接口，仅供远端 group 模块调用）。
+
+**参数**：`event_name` (string), `event_data` (object)
+
+**响应**：`{ "status": "relayed" }`
+
+> 当前仅允许中继 `group.message_created` 事件。
 
 ---
 

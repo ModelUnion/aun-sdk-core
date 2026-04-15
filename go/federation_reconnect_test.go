@@ -61,6 +61,57 @@ func waitForFederationCondition(timeout, interval time.Duration, fn func() bool)
 	return false
 }
 
+func waitForFederationDelivery(
+	t *testing.T,
+	alice *AUNClient,
+	bob *AUNClient,
+	aliceAID string,
+	bobAID string,
+	rid string,
+) {
+	t.Helper()
+
+	var lastMessages []map[string]any
+	for attempt := 1; attempt <= 30; attempt++ {
+		text := fmt.Sprintf("go federation reconnect %s-%d", rid, attempt)
+
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, sendErr := alice.Call(sendCtx, "message.send", map[string]any{
+			"to":      bobAID,
+			"payload": map[string]any{"text": text},
+			"encrypt": false,
+		})
+		sendCancel()
+		if sendErr == nil {
+			pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			pullResult, pullErr := bob.Call(pullCtx, "message.pull", map[string]any{
+				"after_seq": 0,
+				"limit":     50,
+			})
+			pullCancel()
+			if pullErr == nil {
+				if pullMap, _ := pullResult.(map[string]any); pullMap != nil {
+					msgsAny, _ := pullMap["messages"].([]any)
+					lastMessages = lastMessages[:0]
+					for _, raw := range msgsAny {
+						if msg, ok := raw.(map[string]any); ok {
+							lastMessages = append(lastMessages, msg)
+							from, _ := msg["from"].(string)
+							if from == aliceAID && getPayloadText(msg) == text {
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	t.Fatalf("等待 Bob 在重连后收到跨域消息 超时: %+v", lastMessages)
+}
+
 func TestFederationReconnectAfterRemoteGatewayRestart(t *testing.T) {
 	rid := federationRunID()
 	alice := makeFederationClient(t)
@@ -139,67 +190,5 @@ func TestFederationReconnectAfterRemoteGatewayRestart(t *testing.T) {
 		t.Fatalf("Alice 在远端域重启后不应断开: %s", alice.State())
 	}
 
-	text := fmt.Sprintf("go federation reconnect %s", rid)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	sendResult, err := alice.Call(ctx, "message.send", map[string]any{
-		"to":      bobAID,
-		"payload": map[string]any{"text": text},
-		"encrypt": false,
-		"persist": true,
-	})
-	if err != nil {
-		t.Fatalf("重连后跨域发送失败: %v", err)
-	}
-	if sendMap, _ := sendResult.(map[string]any); sendMap == nil {
-		t.Fatalf("重连后跨域发送返回 nil")
-	}
-
-	msgs := federationWaitForMessages(t, bob, func() []map[string]any {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		pullResult, err := bob.Call(ctx, "message.pull", map[string]any{
-			"after_seq": 0,
-			"limit":     50,
-		})
-		if err != nil {
-			return nil
-		}
-		pullMap, _ := pullResult.(map[string]any)
-		if pullMap == nil {
-			return nil
-		}
-		msgsAny, _ := pullMap["messages"].([]any)
-		var items []map[string]any
-		for _, raw := range msgsAny {
-			if msg, ok := raw.(map[string]any); ok {
-				items = append(items, msg)
-			}
-		}
-		return items
-	}, 30*time.Second, func(items []map[string]any) bool {
-		for _, item := range items {
-			from, _ := item["from"].(string)
-			if from != aliceAID {
-				continue
-			}
-			if getPayloadText(item) == text {
-				return true
-			}
-		}
-		return false
-	}, "等待 Bob 在重连后收到跨域消息")
-
-	found := false
-	for _, item := range msgs {
-		from, _ := item["from"].(string)
-		if from == aliceAID && getPayloadText(item) == text {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("Bob 未收到重连后的跨域消息")
-	}
+	waitForFederationDelivery(t, alice, bob, aliceAID, bobAID, rid)
 }

@@ -11,7 +11,7 @@ import {
 } from '../../src/e2ee.js';
 import { CryptoProvider, uint8ToBase64 } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
-import type { IdentityRecord, KeyPairRecord, MetadataRecord, PrekeyMap, PrekeyRecord } from '../../src/types.js';
+import type { IdentityRecord, KeyPairRecord, PrekeyMap, PrekeyRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 
@@ -81,15 +81,12 @@ describe('E2EE 常量', () => {
 function createMockKeyStore(): KeyStore {
   const keyPairs = new Map<string, KeyPairRecord>();
   const certs = new Map<string, string>();
-  const metadata = new Map<string, MetadataRecord>();
   const prekeys = new Map<string, PrekeyMap>();
   return {
     async loadKeyPair(aid) { return keyPairs.get(aid) ?? null; },
     async saveKeyPair(aid, kp) { keyPairs.set(aid, kp); },
     async loadCert(aid) { return certs.get(aid) ?? null; },
     async saveCert(aid, cert) { certs.set(aid, cert); },
-    async loadMetadata(aid) { return metadata.get(aid) ?? null; },
-    async saveMetadata(aid, md) { metadata.set(aid, { ...md }); },
     async loadE2EEPrekeys(aid) { return JSON.parse(JSON.stringify(prekeys.get(aid) ?? {})); },
     async saveE2EEPrekey(aid, prekeyId, prekeyData) {
       const current = prekeys.get(aid) ?? {};
@@ -124,8 +121,7 @@ function createMockKeyStore(): KeyStore {
       const kp = keyPairs.get(aid);
       if (!kp) return null;
       const cert = certs.get(aid);
-      const md = metadata.get(aid);
-      return { ...kp, ...(md ?? {}), ...(cert ? { cert } : {}) };
+      return { ...kp, ...(cert ? { cert } : {}) };
     },
     async saveIdentity(aid, identity) {
       const kp: KeyPairRecord = {};

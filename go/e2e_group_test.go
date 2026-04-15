@@ -17,11 +17,12 @@ import (
 // makeGroupTestClient 创建群组测试用 AUN 客户端，使用临时目录隔离测试数据。
 func makeGroupTestClient(t *testing.T) *AUNClient {
 	t.Helper()
-	return NewClient(map[string]any{
-		"aun_path":                t.TempDir(),
-		"verify_ssl":             false,
-		"require_forward_secrecy": false,
+	t.Setenv("AUN_ENV", "development")
+	client := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
 	})
+	client.configModel.RequireForwardSecrecy = false
+	return client
 }
 
 // groupRunID 生成唯一运行标识（UUID 前 12 位，避免 AID 碰撞）
@@ -724,7 +725,6 @@ func TestGroupE2EOldEpochStillDecryptable(t *testing.T) {
 				"to":      to,
 				"payload": distPayload,
 				"encrypt": true,
-				"persist": false,
 			})
 			cancel()
 			if err != nil {

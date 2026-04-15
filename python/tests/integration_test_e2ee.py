@@ -13,7 +13,10 @@
 """
 import asyncio
 import os
+import re
+import shutil
 import sys
+import uuid
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -24,6 +27,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
+from aun_core.config import get_device_id
 from aun_core.e2ee import E2EEManager
 
 
@@ -32,6 +36,7 @@ from aun_core.e2ee import E2EEManager
 # ---------------------------------------------------------------------------
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
+os.environ.setdefault("AUN_ENV", "development")
 
 
 def _default_test_aun_path() -> str:
@@ -85,13 +90,95 @@ def _assert_fixed_aid_layout() -> None:
 _assert_fixed_aid_layout()
 
 
+def _single_domain_device_root(tag: str) -> Path:
+    base = Path(_TEST_AUN_PATH)
+    parent = base.parent if base.name else base
+    root = parent / "multi-device" / tag
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _read_device_id(root: Path) -> str:
+    path = root / ".device_id"
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _ensure_unique_test_device_id(tag: str) -> str:
+    """仅修正 multi-device 测试根目录里的重复 device_id，不触碰固定身份目录。"""
+    root = _single_domain_device_root(tag)
+    current = get_device_id(root)
+    siblings = root.parent
+    seen: set[str] = set()
+    for entry in siblings.iterdir():
+        if not entry.is_dir() or entry == root:
+            continue
+        other = _read_device_id(entry)
+        if other:
+            seen.add(other)
+    if current and current not in seen:
+        return current
+
+    device_id_path = root / ".device_id"
+    while True:
+        candidate = str(uuid.uuid4())
+        if candidate in seen:
+            continue
+        device_id_path.write_text(candidate, encoding="utf-8")
+        return candidate
+
+
+def _copy_identity_tree(source_root: Path, target_root: Path, aid: str) -> None:
+    source_identity = source_root / "AIDs" / aid
+    if not source_identity.exists():
+        raise RuntimeError(f"identity source missing: {source_identity}")
+    source_seed = source_root / ".seed"
+    target_root.mkdir(parents=True, exist_ok=True)
+    if source_seed.exists():
+        shutil.copy2(source_seed, target_root / ".seed")
+    (target_root / "AIDs").mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_identity, target_root / "AIDs" / aid, dirs_exist_ok=True)
+
+
+def _prepare_isolated_identity(tag: str, aid: str) -> Path:
+    target_root = _single_domain_device_root(tag)
+    _copy_identity_tree(Path(_TEST_AUN_PATH), target_root, aid)
+    _ensure_unique_test_device_id(tag)
+    return target_root
+
+
+def _normalize_slot_part(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+    return text.strip("-._") or "slot"
+
+
+def _build_test_slot_id(tag: str, rid: str | None = None) -> str:
+    tag_part = _normalize_slot_part(tag)
+    rid_part = _normalize_slot_part(rid) if rid else uuid.uuid4().hex[:12]
+    slot_id = f"{tag_part}-{rid_part}"
+    return slot_id[:128]
+
+
+def _make_isolated_client(tag: str, *, slot_id: str = "") -> AUNClient:
+    client = AUNClient({
+        "aun_path": str(_single_domain_device_root(tag)),
+    }, debug=True)
+    client._config_model.require_forward_secrecy = False
+    client._test_slot_id = slot_id or _build_test_slot_id(tag, "main")
+    return client
+
+
 def _make_client(tag: str) -> AUNClient:
     """创建测试客户端 — Gateway 通过 well-known 发现机制自动获取。"""
     client = AUNClient({
         "aun_path": _TEST_AUN_PATH,
-        "verify_ssl": False,
-        "require_forward_secrecy": False,
-    })
+    }, debug=True)
+    client._config_model.require_forward_secrecy = False
+    client._test_slot_id = _build_test_slot_id(tag)
     return client
 
 
@@ -100,7 +187,12 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     if local is None:
         await client.auth.create_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth)
+    connect_params = dict(auth)
+    slot_id = str(getattr(client, "_test_slot_id", "") or "")
+    if slot_id:
+        connect_params["slot_id"] = slot_id
+    connect_params["auto_reconnect"] = False
+    await client.connect(connect_params)
     return aid
 
 
@@ -110,6 +202,7 @@ def _make_raw_e2ee(client: AUNClient) -> E2EEManager:
     """
     return E2EEManager(
         identity_fn=lambda: client._identity or {},
+        device_id_fn=lambda: client._device_id,
         keystore=client._keystore,
     )
 
@@ -134,13 +227,13 @@ async def _raw_send(client: AUNClient, e2ee: E2EEManager, to_aid: str, payload: 
         "encrypted": True,
         "message_id": aad["message_id"],
         "timestamp": aad["timestamp"],
-        "persist": True,
     })
 
 
 async def _raw_recv_pull(client: AUNClient, e2ee: E2EEManager, from_aid: str,
                          after_seq: int = 0) -> list[dict]:
     """裸 WS pull + 手动解密。"""
+    await client._ensure_sender_cert_cached(from_aid)
     raw = await client._transport.call("message.pull", {"after_seq": after_seq, "limit": 50})
     raw_msgs = raw.get("messages", [])
     result = []
@@ -159,7 +252,6 @@ async def _sdk_send(client: AUNClient, to_aid: str, payload: dict) -> dict:
         "to": to_aid,
         "payload": payload,
         "encrypt": True,
-        "persist": True,
     })
 
 
@@ -212,6 +304,55 @@ async def _sdk_recv_pull(client: AUNClient, from_aid: str, after_seq: int = 0) -
     return [m for m in msgs if m.get("from") == from_aid]
 
 
+async def _wait_for_sdk_pull_message(
+    client: AUNClient,
+    from_aid: str,
+    *,
+    after_seq: int,
+    expected_text: str,
+    timeout: float = 20.0,
+) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_messages: list[dict] = []
+    while asyncio.get_running_loop().time() < deadline:
+        messages = await _sdk_recv_pull(client, from_aid, after_seq=after_seq)
+        last_messages = messages
+        for message in messages:
+            payload = message.get("payload")
+            if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
+                return message
+        await asyncio.sleep(0.5)
+    raise AssertionError(
+        f"timeout waiting for message text={expected_text!r} from={from_aid}; "
+        f"last_messages={last_messages}"
+    )
+
+
+async def _wait_for_raw_pull_message(
+    client: AUNClient,
+    e2ee: E2EEManager,
+    from_aid: str,
+    *,
+    after_seq: int,
+    expected_text: str,
+    timeout: float = 20.0,
+) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_messages: list[dict] = []
+    while asyncio.get_running_loop().time() < deadline:
+        messages = await _raw_recv_pull(client, e2ee, from_aid, after_seq=after_seq)
+        last_messages = messages
+        for message in messages:
+            payload = message.get("payload")
+            if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
+                return message
+        await asyncio.sleep(0.5)
+    raise AssertionError(
+        f"timeout waiting for raw message text={expected_text!r} from={from_aid}; "
+        f"last_messages={last_messages}"
+    )
+
+
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
     """遍历当前消息游标，供固定 AID 场景按 after_seq 隔离本轮消息。"""
     after_seq = 0
@@ -233,6 +374,14 @@ def _assert_decrypted(msg: dict, expected_payload: dict, label: str = ""):
     assert msg.get("encrypted") is True, f"{prefix}should be marked encrypted"
     for k, v in expected_payload.items():
         assert msg["payload"].get(k) == v, f"{prefix}payload.{k} mismatch: {msg['payload'].get(k)} != {v}"
+
+
+def _find_message_by_text(messages: list[dict], expected_text: str) -> dict:
+    for message in messages:
+        payload = message.get("payload")
+        if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
+            return message
+    raise AssertionError(f"message with text={expected_text!r} not found in {messages}")
 
 
 # ---------------------------------------------------------------------------
@@ -331,11 +480,17 @@ async def test_raw_to_sdk():
         r_aid = await _ensure_connected(r_sdk, _BOBB_AID)
         s_e2ee = _make_raw_e2ee(s_sdk)
         base_seq = await _current_max_seq(r_sdk)
+        unique_text = f"raw2sdk_{int(asyncio.get_running_loop().time() * 1000)}"
 
-        await _raw_send(s_sdk, s_e2ee, r_aid, {"text": "raw2sdk"})
+        await _raw_send(s_sdk, s_e2ee, r_aid, {"text": unique_text})
         msgs = await _sdk_recv_push_after(r_sdk, s_aid, after_seq=base_seq)
-        assert len(msgs) >= 1
-        _assert_decrypted(msgs[0], {"text": "raw2sdk"})
+        try:
+            msg = _find_message_by_text(msgs, unique_text)
+        except AssertionError:
+            msg = await _wait_for_sdk_pull_message(
+                r_sdk, s_aid, after_seq=base_seq, expected_text=unique_text,
+            )
+        _assert_decrypted(msg, {"text": unique_text})
 
         print("[PASS] Test 4")
         return True
@@ -360,12 +515,13 @@ async def test_sdk_to_raw():
         r_aid = await _ensure_connected(r_sdk, _BOBB_AID)
         r_e2ee = _make_raw_e2ee(r_sdk)
         base_seq = await _current_max_seq(r_sdk)
+        unique_text = f"sdk2raw_{int(asyncio.get_running_loop().time() * 1000)}"
 
-        await _sdk_send(s_sdk, r_aid, {"text": "sdk2raw"})
-        await asyncio.sleep(1)
-        msgs = await _raw_recv_pull(r_sdk, r_e2ee, s_aid, after_seq=base_seq)
-        assert len(msgs) >= 1, f"expected >= 1 msg, got {len(msgs)}"
-        _assert_decrypted(msgs[0], {"text": "sdk2raw"})
+        await _sdk_send(s_sdk, r_aid, {"text": unique_text})
+        msg = await _wait_for_raw_pull_message(
+            r_sdk, r_e2ee, s_aid, after_seq=base_seq, expected_text=unique_text,
+        )
+        _assert_decrypted(msg, {"text": unique_text})
 
         print("[PASS] Test 5")
         return True
@@ -386,22 +542,25 @@ async def test_raw_to_raw():
         b_aid = await _ensure_connected(b_sdk, _BOBB_AID)
         a_e2ee = _make_raw_e2ee(a_sdk)
         b_e2ee = _make_raw_e2ee(b_sdk)
+        run_id = int(asyncio.get_running_loop().time() * 1000)
 
         # A -> B
         base_seq_b = await _current_max_seq(b_sdk)
-        await _raw_send(a_sdk, a_e2ee, b_aid, {"text": "raw_a2b"})
-        await asyncio.sleep(1)
-        msgs_b = await _raw_recv_pull(b_sdk, b_e2ee, a_aid, after_seq=base_seq_b)
-        assert len(msgs_b) >= 1, "B should receive A's message"
-        _assert_decrypted(msgs_b[0], {"text": "raw_a2b"}, "A->B")
+        text_a2b = f"raw_a2b_{run_id}"
+        await _raw_send(a_sdk, a_e2ee, b_aid, {"text": text_a2b})
+        msg_b = await _wait_for_raw_pull_message(
+            b_sdk, b_e2ee, a_aid, after_seq=base_seq_b, expected_text=text_a2b,
+        )
+        _assert_decrypted(msg_b, {"text": text_a2b}, "A->B")
 
         # B -> A
         base_seq_a = await _current_max_seq(a_sdk)
-        await _raw_send(b_sdk, b_e2ee, a_aid, {"text": "raw_b2a"})
-        await asyncio.sleep(1)
-        msgs_a = await _raw_recv_pull(a_sdk, a_e2ee, b_aid, after_seq=base_seq_a)
-        assert len(msgs_a) >= 1, "A should receive B's message"
-        _assert_decrypted(msgs_a[0], {"text": "raw_b2a"}, "B->A")
+        text_b2a = f"raw_b2a_{run_id}"
+        await _raw_send(b_sdk, b_e2ee, a_aid, {"text": text_b2a})
+        msg_a = await _wait_for_raw_pull_message(
+            a_sdk, a_e2ee, b_aid, after_seq=base_seq_a, expected_text=text_b2a,
+        )
+        _assert_decrypted(msg_a, {"text": text_b2a}, "B->A")
 
         print("[PASS] Test 6")
         return True
@@ -421,21 +580,31 @@ async def test_bidirectional_mixed():
         sdk_aid = await _ensure_connected(sdk_client, _ALICE_AID)
         raw_aid = await _ensure_connected(raw_client, _BOBB_AID)
         raw_e2ee = _make_raw_e2ee(raw_client)
+        run_id = int(asyncio.get_running_loop().time() * 1000)
 
         # SDK -> Raw
         raw_base_seq = await _current_max_seq(raw_client)
-        await _sdk_send(sdk_client, raw_aid, {"text": "sdk2raw_bidir", "dir": "forward"})
-        await asyncio.sleep(1)
-        msgs_raw = await _raw_recv_pull(raw_client, raw_e2ee, sdk_aid, after_seq=raw_base_seq)
-        assert len(msgs_raw) >= 1, "Raw should receive SDK's message"
-        _assert_decrypted(msgs_raw[0], {"text": "sdk2raw_bidir"}, "SDK->Raw")
+        sdk_to_raw_text = f"sdk2raw_bidir_{run_id}"
+        await _sdk_send(sdk_client, raw_aid, {"text": sdk_to_raw_text, "dir": "forward"})
+        msg_raw = await _wait_for_raw_pull_message(
+            raw_client, raw_e2ee, sdk_aid, after_seq=raw_base_seq, expected_text=sdk_to_raw_text,
+        )
+        _assert_decrypted(msg_raw, {"text": sdk_to_raw_text}, "SDK->Raw")
 
         # Raw -> SDK
         sdk_base_seq = await _current_max_seq(sdk_client)
-        await _raw_send(raw_client, raw_e2ee, sdk_aid, {"text": "raw2sdk_bidir", "dir": "reverse"})
+        raw_to_sdk_text = f"raw2sdk_bidir_{run_id}"
+        await _raw_send(
+            raw_client, raw_e2ee, sdk_aid, {"text": raw_to_sdk_text, "dir": "reverse"},
+        )
         msgs_sdk = await _sdk_recv_push_after(sdk_client, raw_aid, after_seq=sdk_base_seq)
-        assert len(msgs_sdk) >= 1, "SDK should receive Raw's message"
-        _assert_decrypted(msgs_sdk[0], {"text": "raw2sdk_bidir"}, "Raw->SDK")
+        try:
+            msg_sdk = _find_message_by_text(msgs_sdk, raw_to_sdk_text)
+        except AssertionError:
+            msg_sdk = await _wait_for_sdk_pull_message(
+                sdk_client, raw_aid, after_seq=sdk_base_seq, expected_text=raw_to_sdk_text,
+            )
+        _assert_decrypted(msg_sdk, {"text": raw_to_sdk_text}, "Raw->SDK")
 
         print("[PASS] Test 7")
         return True
@@ -599,9 +768,96 @@ async def test_sdk_to_sdk_bidirectional():
         await alice.close(); await bob.close()
 
 
+async def test_same_aid_slots_ack_isolated():
+    """同一 AID 下不同 slot 的 pull/ack 互不污染。"""
+    print("\n=== Test 12: Same AID multi-slot ack isolation ===")
+    sender = AUNClient({
+        "aun_path": _TEST_AUN_PATH,
+    }, debug=True)
+    sender._config_model.require_forward_secrecy = False
+    sender._test_slot_id = _build_test_slot_id("sender")
+    receiver_slot_a = AUNClient({
+        "aun_path": _TEST_AUN_PATH,
+    }, debug=True)
+    receiver_slot_a._config_model.require_forward_secrecy = False
+    receiver_slot_a._test_slot_id = "slot-a"
+    receiver_slot_b = AUNClient({
+        "aun_path": _TEST_AUN_PATH,
+    }, debug=True)
+    receiver_slot_b._config_model.require_forward_secrecy = False
+    receiver_slot_b._test_slot_id = "slot-b"
+    try:
+        s_aid = await _ensure_connected(sender, _ALICE_AID)
+        r_aid = await _ensure_connected(receiver_slot_a, _BOBB_AID)
+        await _ensure_connected(receiver_slot_b, _BOBB_AID)
+
+        base_seq_a = await _current_max_seq(receiver_slot_a)
+        base_seq_b = await _current_max_seq(receiver_slot_b)
+        assert base_seq_a == base_seq_b, f"slot 基线不一致: {base_seq_a} != {base_seq_b}"
+
+        expected_slots = {"slot-a", "slot-b"}
+        ack_events = []
+        ack_event = asyncio.Event()
+
+        def _on_ack(data):
+            if not isinstance(data, dict):
+                return
+            if data.get("to") != r_aid:
+                return
+            slot_id = str(data.get("slot_id") or "")
+            if slot_id not in expected_slots:
+                return
+            ack_events.append(dict(data))
+            if {str(item.get("slot_id") or "") for item in ack_events} >= expected_slots:
+                ack_event.set()
+
+        sub = sender.on("message.ack", _on_ack)
+        try:
+            unique_text = f"slot_isolation_{int(asyncio.get_running_loop().time() * 1000)}"
+            await _sdk_send(sender, r_aid, {"text": unique_text})
+
+            msg_a = await _wait_for_sdk_pull_message(
+                receiver_slot_a, s_aid, after_seq=base_seq_a, expected_text=unique_text,
+            )
+            msg_b = await _wait_for_sdk_pull_message(
+                receiver_slot_b, s_aid, after_seq=base_seq_b, expected_text=unique_text,
+            )
+            _assert_decrypted(msg_a, {"text": unique_text}, "slot-a")
+            _assert_decrypted(msg_b, {"text": unique_text}, "slot-b")
+            assert int(msg_a.get("seq") or 0) == int(msg_b.get("seq") or 0), "同 AID 不同 slot 的 seq 应一致"
+
+            ack_a = await receiver_slot_a.call("message.ack", {"seq": msg_a["seq"]})
+            ack_b = await receiver_slot_b.call("message.ack", {"seq": msg_b["seq"]})
+            assert int(ack_a["ack_seq"]) >= int(msg_a["seq"])
+            assert int(ack_b["ack_seq"]) >= int(msg_b["seq"])
+
+            await asyncio.wait_for(ack_event.wait(), timeout=5.0)
+        finally:
+            sub.unsubscribe()
+
+        slots_seen = {str(item.get("slot_id") or "") for item in ack_events}
+        assert slots_seen == expected_slots, f"ack 事件 slot 集合不完整: {slots_seen}"
+        device_ids = {str(item.get("device_id") or "") for item in ack_events}
+        assert len(device_ids) == 1 and "" not in device_ids, f"device_id 异常: {device_ids}"
+        ack_by_slot = {str(item.get("slot_id") or ""): int(item.get("ack_seq") or 0) for item in ack_events}
+        assert ack_by_slot["slot-a"] >= int(msg_a["seq"])
+        assert ack_by_slot["slot-b"] >= int(msg_b["seq"])
+
+        print("[PASS] Test 12")
+        return True
+    except Exception as e:
+        print(f"[FAIL] Test 12: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        await sender.close()
+        await receiver_slot_a.close()
+        await receiver_slot_b.close()
+
+
 async def test_raw_multi_message():
     """Raw WS burst messages"""
-    print("\n=== Test 12: Raw WS burst ===")
+    print("\n=== Test 13: Raw WS burst ===")
     s_sdk, r_sdk = _make_client("s"), _make_client("r")
     try:
         s_aid = await _ensure_connected(s_sdk, _ALICE_AID)
@@ -609,27 +865,189 @@ async def test_raw_multi_message():
         s_e2ee = _make_raw_e2ee(s_sdk)
         r_e2ee = _make_raw_e2ee(r_sdk)
         base_seq = await _current_max_seq(r_sdk)
+        run_id = int(asyncio.get_running_loop().time() * 1000)
 
         N = 3
+        expected_texts = [f"raw_burst_{run_id}_{i}" for i in range(N)]
         for i in range(N):
-            await _raw_send(s_sdk, s_e2ee, r_aid, {"text": f"raw_burst_{i}", "i": i})
+            await _raw_send(s_sdk, s_e2ee, r_aid, {"text": expected_texts[i], "i": i, "run_id": run_id})
 
-        await asyncio.sleep(2)
-        msgs = await _raw_recv_pull(r_sdk, r_e2ee, s_aid, after_seq=base_seq)
-        assert len(msgs) >= N, f"expected {N}, got {len(msgs)}"
+        expected_set = set(expected_texts)
+        matched: dict[str, dict] = {}
+        deadline = asyncio.get_running_loop().time() + 20.0
+        while asyncio.get_running_loop().time() < deadline and len(matched) < N:
+            msgs = await _raw_recv_pull(r_sdk, r_e2ee, s_aid, after_seq=base_seq)
+            for msg in msgs:
+                payload = msg.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                text = str(payload.get("text") or "")
+                if text in expected_set:
+                    matched[text] = msg
+            if len(matched) < N:
+                await asyncio.sleep(0.5)
 
-        texts = sorted(m["payload"]["text"] for m in msgs)
-        expected = sorted(f"raw_burst_{i}" for i in range(N))
-        assert texts == expected, f"mismatch: {texts}"
+        assert set(matched) == expected_set, f"mismatch: matched={sorted(matched)} expected={sorted(expected_set)}"
+        for i, text in enumerate(expected_texts):
+            _assert_decrypted(matched[text], {"text": text, "i": i}, f"burst-{i}")
 
-        print(f"[PASS] Test 12 ({len(msgs)}/{N})")
+        print(f"[PASS] Test 13 ({len(matched)}/{N})")
         return True
     except Exception as e:
-        print(f"[FAIL] Test 12: {e}")
+        print(f"[FAIL] Test 13: {e}")
         import traceback; traceback.print_exc()
         return False
     finally:
         await s_sdk.close(); await r_sdk.close()
+
+
+async def test_multi_device_recipient_and_self_sync():
+    """同一 AID 多设备 fanout + 发件同步副本。"""
+    print("\n=== Test 14: Multi-device recipient + self sync ===")
+    seed_alice, seed_bob = _make_client("seed-a"), _make_client("seed-b")
+    alice_main = alice_sync = bob_phone = bob_laptop = None
+    try:
+        await _ensure_connected(seed_alice, _ALICE_AID)
+        await _ensure_connected(seed_bob, _BOBB_AID)
+        _prepare_isolated_identity("alice-main", _ALICE_AID)
+        _prepare_isolated_identity("alice-sync", _ALICE_AID)
+        _prepare_isolated_identity("bob-phone", _BOBB_AID)
+        _prepare_isolated_identity("bob-laptop", _BOBB_AID)
+        await seed_bob.close()
+        await seed_alice.close()
+        seed_bob = None
+        seed_alice = None
+
+        alice_main = _make_isolated_client("alice-main")
+        alice_sync = _make_isolated_client("alice-sync")
+        bob_phone = _make_isolated_client("bob-phone")
+        bob_laptop = _make_isolated_client("bob-laptop")
+
+        await _ensure_connected(alice_main, _ALICE_AID)
+        await _ensure_connected(alice_sync, _ALICE_AID)
+        await _ensure_connected(bob_phone, _BOBB_AID)
+        await _ensure_connected(bob_laptop, _BOBB_AID)
+        await asyncio.sleep(1.0)
+
+        alice_main_device = str(alice_main._device_id or "")
+        alice_sync_device = str(alice_sync._device_id or "")
+        bob_phone_device = str(bob_phone._device_id or "")
+        bob_laptop_device = str(bob_laptop._device_id or "")
+        assert alice_main_device and alice_sync_device and alice_main_device != alice_sync_device
+        assert bob_phone_device and bob_laptop_device and bob_phone_device != bob_laptop_device
+
+        base_phone = await _current_max_seq(bob_phone)
+        base_laptop = await _current_max_seq(bob_laptop)
+        base_sync = await _current_max_seq(alice_sync)
+        text = f"multi_device_sync_{int(asyncio.get_running_loop().time() * 1000)}"
+
+        result = await _sdk_send(alice_main, _BOBB_AID, {"text": text, "kind": "multi-device"})
+        assert result.get("status") in {"sent", "delivered"}
+
+        phone_msg = await _wait_for_sdk_pull_message(
+            bob_phone, _ALICE_AID, after_seq=base_phone, expected_text=text,
+        )
+        laptop_msg = await _wait_for_sdk_pull_message(
+            bob_laptop, _ALICE_AID, after_seq=base_laptop, expected_text=text,
+        )
+        sync_msg = await _wait_for_sdk_pull_message(
+            alice_sync, _ALICE_AID, after_seq=base_sync, expected_text=text,
+        )
+
+        _assert_decrypted(phone_msg, {"text": text, "kind": "multi-device"}, "bob-phone")
+        _assert_decrypted(laptop_msg, {"text": text, "kind": "multi-device"}, "bob-laptop")
+        _assert_decrypted(sync_msg, {"text": text, "kind": "multi-device"}, "alice-sync")
+        assert phone_msg.get("direction") == "inbound"
+        assert laptop_msg.get("direction") == "inbound"
+        assert sync_msg.get("direction") == "outbound_sync"
+
+        print("[PASS] Test 14")
+        return True
+    except Exception as e:
+        print(f"[FAIL] Test 14: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        if seed_bob:
+            await seed_bob.close()
+        if seed_alice:
+            await seed_alice.close()
+        if bob_laptop:
+            await bob_laptop.close()
+        if bob_phone:
+            await bob_phone.close()
+        if alice_sync:
+            await alice_sync.close()
+        if alice_main:
+            await alice_main.close()
+
+
+async def test_multi_device_offline_pull():
+    """多设备场景下离线设备重连后能补拉自己的设备副本。"""
+    print("\n=== Test 15: Multi-device offline pull ===")
+    seed_alice, seed_bob = _make_client("seed-a"), _make_client("seed-b")
+    alice_main = bob_phone = bob_laptop = None
+    try:
+        await _ensure_connected(seed_alice, _ALICE_AID)
+        await _ensure_connected(seed_bob, _BOBB_AID)
+        _prepare_isolated_identity("alice-main", _ALICE_AID)
+        _prepare_isolated_identity("bob-phone", _BOBB_AID)
+        _prepare_isolated_identity("bob-laptop", _BOBB_AID)
+        await seed_bob.close()
+        await seed_alice.close()
+        seed_bob = None
+        seed_alice = None
+
+        alice_main = _make_isolated_client("alice-main")
+        bob_phone = _make_isolated_client("bob-phone")
+        bob_laptop = _make_isolated_client("bob-laptop")
+
+        await _ensure_connected(alice_main, _ALICE_AID)
+        await _ensure_connected(bob_phone, _BOBB_AID)
+        await _ensure_connected(bob_laptop, _BOBB_AID)
+        await asyncio.sleep(1.0)
+
+        offline_base = await _current_max_seq(bob_laptop)
+        online_base = await _current_max_seq(bob_phone)
+        await bob_laptop.close()
+        bob_laptop = None
+        await asyncio.sleep(1.0)
+
+        text = f"multi_device_offline_{int(asyncio.get_running_loop().time() * 1000)}"
+        result = await _sdk_send(alice_main, _BOBB_AID, {"text": text, "kind": "offline-pull"})
+        assert result.get("status") in {"sent", "delivered"}
+
+        online_msg = await _wait_for_sdk_pull_message(
+            bob_phone, _ALICE_AID, after_seq=online_base, expected_text=text,
+        )
+        _assert_decrypted(online_msg, {"text": text, "kind": "offline-pull"}, "bob-phone-online")
+        assert online_msg.get("direction") == "inbound"
+
+        bob_laptop = _make_isolated_client("bob-laptop")
+        await _ensure_connected(bob_laptop, _BOBB_AID)
+        offline_msg = await _wait_for_sdk_pull_message(
+            bob_laptop, _ALICE_AID, after_seq=offline_base, expected_text=text, timeout=15.0,
+        )
+        _assert_decrypted(offline_msg, {"text": text, "kind": "offline-pull"}, "bob-laptop-offline")
+        assert offline_msg.get("direction") == "inbound"
+
+        print("[PASS] Test 15")
+        return True
+    except Exception as e:
+        print(f"[FAIL] Test 15: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        if seed_bob:
+            await seed_bob.close()
+        if seed_alice:
+            await seed_alice.close()
+        if bob_laptop:
+            await bob_laptop.close()
+        if bob_phone:
+            await bob_phone.close()
+        if alice_main:
+            await alice_main.close()
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +1071,10 @@ async def main():
         ("Prekey rotation",              test_prekey_rotation_in_flight),
         ("Push+pull no duplicate",       test_push_then_pull_no_duplicate),
         ("SDK<->SDK bidirectional",      test_sdk_to_sdk_bidirectional),
+        ("Same AID multi-slot ack",      test_same_aid_slots_ack_isolated),
         ("Raw WS burst",                 test_raw_multi_message),
+        ("Multi-device recipient+self",  test_multi_device_recipient_and_self_sync),
+        ("Multi-device offline pull",    test_multi_device_offline_pull),
     ]
 
     results = []

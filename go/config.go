@@ -5,9 +5,31 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 )
+
+var instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+var devEnvValues = map[string]bool{
+	"development": true,
+	"dev":         true,
+	"local":       true,
+}
+
+func NormalizeInstanceID(value any, field string, allowEmpty bool) (string, error) {
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" {
+		if allowEmpty {
+			return "", nil
+		}
+		return "", fmt.Errorf("%s must be a non-empty string", field)
+	}
+	if !instanceIDPattern.MatchString(text) {
+		return "", fmt.Errorf("%s contains unsupported characters", field)
+	}
+	return text, nil
+}
 
 // GetDeviceID 获取或生成本设备的稳定 ID。
 // 存储在 {aunRoot}/.device_id（默认 ~/.aun/.device_id）。
@@ -33,12 +55,14 @@ func GetDeviceID(aunRoot string) string {
 	if err == nil {
 		stored := strings.TrimSpace(string(data))
 		if stored != "" {
-			return stored
+			if normalized, normErr := NormalizeInstanceID(stored, "device_id", false); normErr == nil {
+				return normalized
+			}
 		}
 	}
 
 	// 生成新 UUID v4
-	newID := generateUUID4()
+	newID, _ := NormalizeInstanceID(generateUUID4(), "device_id", false)
 
 	// 写入文件
 	if err := os.WriteFile(deviceIDPath, []byte(newID), 0o600); err == nil {
@@ -51,11 +75,22 @@ func GetDeviceID(aunRoot string) string {
 	return newID
 }
 
+func resolveVerifySSLFromEnv() bool {
+	for _, key := range []string{"AUN_ENV", "KITE_ENV"} {
+		value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+		if value == "" {
+			continue
+		}
+		return !devEnvValues[value]
+	}
+	return true
+}
+
 // AUNConfig SDK 配置
 type AUNConfig struct {
 	AUNPath                  string // AUN 数据根目录，默认 ~/.aun
 	RootCAPath               string // 自定义根证书路径
-	EncryptionSeed           string // 加密种子（用于 FileSecretStore 密钥派生）
+	SeedPassword             string // 私钥加密口令（用于本地密钥派生）
 	DiscoveryPort            int    // Gateway 发现端口
 	GroupE2EE                bool   // 启用群组 E2EE，默认 true
 	RotateOnJoin             bool   // 新成员加入时自动轮换 epoch，默认 false
@@ -76,7 +111,7 @@ func DefaultConfig() *AUNConfig {
 		RotateOnJoin:             false,
 		EpochAutoRotateInterval:  0,
 		OldEpochRetentionSeconds: 604800, // 7 天
-		VerifySSL:                true,
+		VerifySSL:                resolveVerifySSLFromEnv(),
 		RequireForwardSecrecy:    true,
 		ReplayWindowSeconds:      300,
 	}
@@ -92,55 +127,48 @@ func ConfigFromMap(raw map[string]any) *AUNConfig {
 	if v, ok := raw["aun_path"].(string); ok && v != "" {
 		cfg.AUNPath = v
 	}
+	if v, ok := raw["aunPath"].(string); ok && v != "" {
+		cfg.AUNPath = v
+	}
 	if v, ok := raw["root_ca_path"].(string); ok {
 		cfg.RootCAPath = v
 	}
+	if v, ok := raw["rootCaPath"].(string); ok {
+		cfg.RootCAPath = v
+	}
+	if v, ok := raw["seed_password"].(string); ok {
+		cfg.SeedPassword = v
+	}
+	if v, ok := raw["seedPassword"].(string); ok {
+		cfg.SeedPassword = v
+	}
 	if v, ok := raw["encryption_seed"].(string); ok {
-		cfg.EncryptionSeed = v
+		cfg.SeedPassword = v
 	}
-	if v, ok := raw["discovery_port"]; ok {
-		switch dp := v.(type) {
-		case float64:
-			cfg.DiscoveryPort = int(dp)
-		case int:
-			cfg.DiscoveryPort = dp
-		}
+	if v, ok := raw["encryptionSeed"].(string); ok {
+		cfg.SeedPassword = v
 	}
-	if v, ok := raw["group_e2ee"].(bool); ok {
-		cfg.GroupE2EE = v
+	if v, ok := numberFromMap(raw, "discovery_port", "discoveryPort"); ok {
+		cfg.DiscoveryPort = int(v)
 	}
-	if v, ok := raw["rotate_on_join"].(bool); ok {
+	// GroupE2EE 是必备能力，不再从用户配置中读取
+	if v, ok := boolFromMap(raw, "rotate_on_join", "rotateOnJoin"); ok {
 		cfg.RotateOnJoin = v
 	}
-	if v, ok := raw["epoch_auto_rotate_interval"]; ok {
-		switch ei := v.(type) {
-		case float64:
-			cfg.EpochAutoRotateInterval = int(ei)
-		case int:
-			cfg.EpochAutoRotateInterval = ei
-		}
+	if v, ok := numberFromMap(raw, "epoch_auto_rotate_interval", "epochAutoRotateInterval"); ok {
+		cfg.EpochAutoRotateInterval = int(v)
 	}
-	if v, ok := raw["old_epoch_retention_seconds"]; ok {
-		switch rs := v.(type) {
-		case float64:
-			cfg.OldEpochRetentionSeconds = int(rs)
-		case int:
-			cfg.OldEpochRetentionSeconds = rs
-		}
+	if v, ok := numberFromMap(raw, "old_epoch_retention_seconds", "oldEpochRetentionSeconds"); ok {
+		cfg.OldEpochRetentionSeconds = int(v)
 	}
-	if v, ok := raw["verify_ssl"].(bool); ok {
+	if v, ok := boolFromMap(raw, "verify_ssl", "verifySSL", "verifySsl"); ok {
 		cfg.VerifySSL = v
 	}
-	if v, ok := raw["require_forward_secrecy"].(bool); ok {
+	if v, ok := boolFromMap(raw, "require_forward_secrecy", "requireForwardSecrecy"); ok {
 		cfg.RequireForwardSecrecy = v
 	}
-	if v, ok := raw["replay_window_seconds"]; ok {
-		switch rw := v.(type) {
-		case float64:
-			cfg.ReplayWindowSeconds = int(rw)
-		case int:
-			cfg.ReplayWindowSeconds = rw
-		}
+	if v, ok := numberFromMap(raw, "replay_window_seconds", "replayWindowSeconds"); ok {
+		cfg.ReplayWindowSeconds = int(v)
 	}
 	return cfg
 }
@@ -160,4 +188,31 @@ func generateUUID4() string {
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func boolFromMap(raw map[string]any, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		if value, ok := raw[key].(bool); ok {
+			return value, true
+		}
+	}
+	return false, false
+}
+
+func numberFromMap(raw map[string]any, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		switch value := raw[key].(type) {
+		case int:
+			return float64(value), true
+		case int32:
+			return float64(value), true
+		case int64:
+			return float64(value), true
+		case float32:
+			return float64(value), true
+		case float64:
+			return value, true
+		}
+	}
+	return 0, false
 }

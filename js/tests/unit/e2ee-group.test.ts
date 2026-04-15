@@ -31,7 +31,7 @@ import {
 } from '../../src/e2ee-group.js';
 import { CryptoProvider, uint8ToBase64, base64ToUint8 } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
-import type { GroupOldEpochRecord, GroupSecretMap, JsonObject, KeyPairRecord, MetadataRecord } from '../../src/types.js';
+import type { GroupOldEpochRecord, GroupSecretMap, JsonObject, KeyPairRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 
@@ -40,18 +40,12 @@ const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'funct
 function createMockKeyStore(): KeyStore {
   const keyPairs = new Map<string, KeyPairRecord>();
   const certs = new Map<string, string>();
-  const metadata = new Map<string, MetadataRecord>();
   const groups = new Map<string, GroupSecretMap>();
   return {
     async loadKeyPair(aid) { return keyPairs.get(aid) ?? null; },
     async saveKeyPair(aid, kp) { keyPairs.set(aid, kp); },
     async loadCert(aid) { return certs.get(aid) ?? null; },
     async saveCert(aid, cert) { certs.set(aid, cert); },
-    async loadMetadata(aid) {
-      const md = metadata.get(aid);
-      return md ? JSON.parse(JSON.stringify(md)) : null;
-    },
-    async saveMetadata(aid, md) { metadata.set(aid, JSON.parse(JSON.stringify(md))); },
     async loadGroupSecretState(aid, groupId) {
       return JSON.parse(JSON.stringify(groups.get(aid)?.[groupId] ?? null));
     },
@@ -76,8 +70,7 @@ function createMockKeyStore(): KeyStore {
       const kp = keyPairs.get(aid);
       if (!kp) return null;
       const cert = certs.get(aid);
-      const md = metadata.get(aid);
-      return { ...kp, ...(md ?? {}), ...(cert ? { cert } : {}) };
+      return { ...kp, ...(cert ? { cert } : {}) };
     },
     async saveIdentity(aid, identity) {
       const kp: KeyPairRecord = {};
@@ -817,11 +810,13 @@ describe('GroupE2EEManager', () => {
   it.skipIf(!hasSubtleCrypto)(
     'encrypt 应返回 e2ee.group_encrypted 信封',
     async () => {
+      const certPem = '-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----';
       const manager = new GroupE2EEManager({
         identityFn: () => ({
           aid: 'alice',
           private_key_pem: aliceIdentity.private_key_pem,
           public_key_der_b64: aliceIdentity.public_key_der_b64,
+          cert: certPem,
         }),
         keystore: ks,
       });
@@ -836,6 +831,7 @@ describe('GroupE2EEManager', () => {
       expect(envelope.tag).toBeDefined();
       expect(envelope.nonce).toBeDefined();
       expect(envelope.sender_signature).toBeDefined(); // 自动签名
+      expect(String(envelope.sender_cert_fingerprint ?? '')).toMatch(/^sha256:[0-9a-f]{64}$/);
     },
   );
 

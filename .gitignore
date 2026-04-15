@@ -6,6 +6,9 @@ __pycache__/
 
 # Go
 go/go.sum
+go/vendor/
+go/*.exe
+go/*.test.exe
 
 # Node.js / TypeScript / JavaScript
 node_modules/

@@ -64,9 +64,9 @@ WebSocket 连接建立
   ← challenge（服务端推送 nonce）
   → auth.aid_login1 (可选，已有 token 时跳过)
   → auth.aid_login2 (可选)
-  → auth.connect(nonce, auth, protocol)
+  → auth.connect(nonce, auth, protocol, device, client, delivery_mode)
   ← {status: "ok", protocol, identity, ...}
-  → READY，进入 relay 模式
+  → READY，进入 Gateway 业务态
 ```
 
 > `auth.aid_login1/2` 为可选：如果客户端已持有有效 token，可直接调用 `auth.connect`。
@@ -84,10 +84,23 @@ WebSocket 连接建立
 | auth.token | string | 是 | JWT token |
 | protocol.min | string | 是 | 客户端支持的最低协议版本 |
 | protocol.max | string | 是 | 客户端支持的最高协议版本 |
-| device.id | string | 推荐 | 设备唯一标识 |
+| device.id | string | 推荐 | 设备唯一标识。SDK 默认从 `~/.aun/.device_id` 稳定读取 |
 | device.type | string | 推荐 | 设备类型（desktop/mobile/browser） |
+| client.slot_id | string | 否 | 同一 `device.id` 下的实例槽位。仅在 `device.id` 存在时可用 |
+| delivery_mode.mode | string | 否 | 连接级投递模式：`fanout` 或 `queue` |
+| delivery_mode.routing | string | 否 | 仅 `queue` 时有效：`round_robin` 或 `sender_affinity` |
+| delivery_mode.affinity_ttl_ms | integer | 否 | 仅 `queue + sender_affinity` 时有效，表示发送者粘性保持时长 |
 | capabilities | object | 否 | 客户端能力声明 |
 | client | object | 否 | 客户端信息（名称、版本等） |
+
+**连接约束**：
+
+- 未传 `device.id` 的客户端按 legacy 语义处理，不支持多实例槽位。
+- `client.slot_id` 只能和 `device.id` 一起使用；否则返回 `slot_requires_device_id`。
+- `device.id` 非空但 `client.slot_id` 为空时，同一 `(aid, device.id)` 只允许一个在线实例；冲突时返回 `device_singleton_conflict`。
+- `device.id` 与 `client.slot_id` 同时存在时，同一 `(aid, device.id, client.slot_id)` 只允许一个在线实例；冲突时返回 `slot_conflict`。
+- 同一 `aid` 的所有在线连接必须声明一致的 `delivery_mode`；冲突时返回 `delivery_mode_conflict`。
+- `queue + sender_affinity` 为 best-effort 粘性路由：同一发送者会尽量命中同一实例，实例下线后自动切换。
 
 **capabilities 字段说明**：
 
@@ -107,7 +120,13 @@ WebSocket 连接建立
     "nonce": "challenge-nonce-from-server",
     "auth": {"method": "kite_token", "token": "eyJhbGciOi..."},
     "protocol": {"min": "1.0", "max": "1.0"},
-    "device": {"id": "dev-001", "type": "browser"}
+    "device": {"id": "dev-001", "type": "browser"},
+    "client": {"slot_id": "slot-a"},
+    "delivery_mode": {
+      "mode": "queue",
+      "routing": "sender_affinity",
+      "affinity_ttl_ms": 300000
+    }
   }
 }
 ```
@@ -160,6 +179,13 @@ WebSocket 连接建立
 | 4001 | 认证失败（token 无效或过期） |
 | 4010 | Nonce 无效或已过期 |
 | 4500 | 服务端内部错误（Auth 服务或 Kernel 不可达） |
+
+**典型错误消息**：
+
+- `slot_requires_device_id`
+- `device_singleton_conflict`
+- `slot_conflict`
+- `delivery_mode_conflict`
 
 ### 连接超时
 

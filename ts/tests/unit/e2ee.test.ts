@@ -334,10 +334,10 @@ describe('decryptMessage', () => {
 // ── 证书指纹测试 ─────────────────────────────────────────────
 
 describe('指纹工具方法', () => {
-  it('fingerprintCertPem 返回 sha256: 前缀的字符串', () => {
+  it('fingerprintCertPem 返回证书 SHA-256 指纹', () => {
     const { senderCert } = makeE2EEPair();
     const fp = E2EEManager.fingerprintCertPem(senderCert);
-    expect(fp).toMatch(/^sha256:[0-9a-f]+$/);
+    expect(fp).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 
   it('同一证书的指纹稳定一致', () => {

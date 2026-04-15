@@ -6,7 +6,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -48,13 +47,7 @@ func loadKeyStoreGroupState(ks keystore.KeyStore, aid, groupID string) map[strin
 			return entry
 		}
 	}
-	metadata, err := ks.LoadMetadata(aid)
-	if err != nil || metadata == nil {
-		return nil
-	}
-	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-	entry, _ := groupSecrets[groupID].(map[string]any)
-	return entry
+	return nil
 }
 
 func loadAllKeyStoreGroupStates(ks keystore.KeyStore, aid string) map[string]map[string]any {
@@ -64,34 +57,14 @@ func loadAllKeyStoreGroupStates(ks keystore.KeyStore, aid string) map[string]map
 			return entries
 		}
 	}
-	metadata, err := ks.LoadMetadata(aid)
-	if err != nil || metadata == nil {
-		return nil
-	}
-	groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-	result := make(map[string]map[string]any, len(groupSecrets))
-	for groupID, raw := range groupSecrets {
-		if entry, ok := raw.(map[string]any); ok {
-			result[groupID] = entry
-		}
-	}
-	return result
+	return nil
 }
 
 func saveKeyStoreGroupState(ks keystore.KeyStore, aid, groupID string, entry map[string]any) error {
 	if structured, ok := ks.(structuredGroupKeyStore); ok {
 		return structured.SaveGroupSecretState(aid, groupID, entry)
 	}
-	_, err := updateKeyStoreMetadata(ks, aid, func(metadata map[string]any) (map[string]any, error) {
-		groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-		if groupSecrets == nil {
-			groupSecrets = make(map[string]any)
-		}
-		groupSecrets[groupID] = copyMapShallow(entry)
-		metadata["group_secrets"] = groupSecrets
-		return metadata, nil
-	})
-	return err
+	return fmt.Errorf("keystore 不支持 SaveGroupSecretState")
 }
 
 func cleanupKeyStoreGroupOldEpochs(ks keystore.KeyStore, aid, groupID string, cutoffMs int64) int {
@@ -102,41 +75,8 @@ func cleanupKeyStoreGroupOldEpochs(ks keystore.KeyStore, aid, groupID string, cu
 		}
 		return 0
 	}
-
-	removed := 0
-	_, err := updateKeyStoreMetadata(ks, aid, func(metadata map[string]any) (map[string]any, error) {
-		groupSecrets, _ := metadata["group_secrets"].(map[string]any)
-		entry, _ := groupSecrets[groupID].(map[string]any)
-		if entry == nil {
-			return metadata, nil
-		}
-
-		oldEpochs, _ := entry["old_epochs"].([]any)
-		if len(oldEpochs) == 0 {
-			return metadata, nil
-		}
-
-		remaining := make([]any, 0, len(oldEpochs))
-		for _, raw := range oldEpochs {
-			old, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			updatedAt := toInt64(old["updated_at"])
-			if updatedAt >= cutoffMs {
-				remaining = append(remaining, old)
-			}
-		}
-		removed = len(oldEpochs) - len(remaining)
-		if removed > 0 {
-			entry["old_epochs"] = remaining
-		}
-		return metadata, nil
-	})
-	if err != nil {
-		return 0
-	}
-	return removed
+	log.Printf("[e2ee_group] keystore 不支持 CleanupGroupOldEpochsState，跳过旧 epoch 清理")
+	return 0
 }
 
 // ── 群组消息加密（纯函数）──────────────────────────────────
@@ -150,6 +90,7 @@ func EncryptGroupMessage(
 	timestamp int64,
 	epoch int,
 	senderPrivateKeyPEM string,
+	senderCertPEM []byte,
 ) (map[string]any, error) {
 	// 派生单条消息密钥
 	msgKey, err := deriveGroupMsgKey(groupSecret, groupID, messageID)
@@ -215,10 +156,11 @@ func EncryptGroupMessage(
 			sig, err := ecdsa.SignASN1(rand.Reader, pk, hash[:])
 			if err == nil {
 				envelope["sender_signature"] = base64.StdEncoding.EncodeToString(sig)
-				// 公钥指纹
-				pubDER, _ := x509.MarshalPKIXPublicKey(&pk.PublicKey)
-				fp := sha256.Sum256(pubDER)
-				envelope["sender_cert_fingerprint"] = fmt.Sprintf("sha256:%x", fp)
+				if len(senderCertPEM) > 0 {
+					if cert, certErr := parseCertPEM(senderCertPEM); certErr == nil {
+						envelope["sender_cert_fingerprint"] = certificateSHA256Fingerprint(cert)
+					}
+				}
 			} else {
 				log.Printf("[e2ee_group] 群消息发送方签名失败: %v", err)
 			}

@@ -7,7 +7,7 @@
 
 import * as crypto from 'node:crypto';
 import type { KeyStore } from './keystore/index.js';
-import { updateKeyStoreMetadata } from './keystore/update.js';
+
 import {
   E2EEError,
   E2EEGroupSecretMissingError,
@@ -57,9 +57,7 @@ function loadKeyStoreGroupState(
   if (typeof keystore.loadGroupSecretState === 'function') {
     return keystore.loadGroupSecretState(aid, groupId);
   }
-  const metadata = keystore.loadMetadata(aid) ?? {};
-  const groupSecrets = (metadata.group_secrets as GroupSecretMap) ?? {};
-  return groupSecrets[groupId] ?? null;
+  throw new Error('keystore 缺少 loadGroupSecretState 方法');
 }
 
 function loadAllKeyStoreGroupStates(
@@ -69,8 +67,7 @@ function loadAllKeyStoreGroupStates(
   if (typeof keystore.loadAllGroupSecretStates === 'function') {
     return keystore.loadAllGroupSecretStates(aid) ?? {};
   }
-  const metadata = keystore.loadMetadata(aid) ?? {};
-  return (metadata.group_secrets as GroupSecretMap) ?? {};
+  throw new Error('keystore 缺少 loadAllGroupSecretStates 方法');
 }
 
 function saveKeyStoreGroupState(
@@ -83,12 +80,7 @@ function saveKeyStoreGroupState(
     keystore.saveGroupSecretState(aid, groupId, entry);
     return;
   }
-  updateKeyStoreMetadata(keystore, aid, metadata => {
-    const groupSecrets = (metadata.group_secrets as GroupSecretMap) ?? {};
-    groupSecrets[groupId] = { ...entry };
-    metadata.group_secrets = groupSecrets;
-    return metadata;
-  });
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing saveGroupSecretState method`);
 }
 
 function cleanupKeyStoreGroupOldEpochs(
@@ -101,23 +93,7 @@ function cleanupKeyStoreGroupOldEpochs(
     return keystore.cleanupGroupOldEpochsState(aid, groupId, cutoffMs);
   }
 
-  let removed = 0;
-  updateKeyStoreMetadata(keystore, aid, metadata => {
-    const groupSecrets = (metadata.group_secrets as GroupSecretMap) ?? {};
-    const entry = groupSecrets[groupId];
-    if (!entry) return metadata;
-
-    const oldEpochs = (entry.old_epochs as GroupOldEpochRecord[]) ?? [];
-    if (oldEpochs.length === 0) return metadata;
-
-    const remaining = oldEpochs.filter(e => ((e.updated_at as number) || 0) >= cutoffMs);
-    removed = oldEpochs.length - remaining.length;
-    if (removed > 0) {
-      entry.old_epochs = remaining;
-    }
-    return metadata;
-  });
-  return removed;
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing cleanupGroupOldEpochsState method`);
 }
 
 // ── 内部工具函数 ───────────────────────────────────────────────

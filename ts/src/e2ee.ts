@@ -8,7 +8,7 @@
 
 import * as crypto from 'node:crypto';
 import type { KeyStore } from './keystore/index.js';
-import { updateKeyStoreMetadata } from './keystore/update.js';
+
 import { E2EEError, E2EEDecryptFailedError } from './errors.js';
 import type { IdentityRecord, JsonObject, Message, PrekeyRecord } from './types.js';
 
@@ -46,6 +46,7 @@ export interface PrekeyMaterial extends JsonObject {
   public_key: string;
   signature: string;
   created_at?: number;
+  device_id?: string;
   cert_fingerprint?: string;
 }
 
@@ -83,59 +84,53 @@ function latestPrekeyIds(
 function loadKeyStorePrekeys(
   keystore: KeyStore,
   aid: string,
+  deviceId = '',
 ): LocalPrekeyStore {
+  const normalizedDeviceId = String(deviceId ?? '').trim();
+  if (normalizedDeviceId && typeof keystore.loadE2EEPrekeysForDevice === 'function') {
+    return (keystore.loadE2EEPrekeysForDevice(aid, normalizedDeviceId) ?? {}) as LocalPrekeyStore;
+  }
   if (typeof keystore.loadE2EEPrekeys === 'function') {
     return (keystore.loadE2EEPrekeys(aid) ?? {}) as LocalPrekeyStore;
   }
-  const metadata = keystore.loadMetadata(aid) ?? {};
-  return (metadata.e2ee_prekeys as LocalPrekeyStore) ?? {};
+  throw new Error('keystore 缺少 loadE2EEPrekeys 方法');
 }
 
 function saveKeyStorePrekey(
   keystore: KeyStore,
   aid: string,
+  deviceId: string,
   prekeyId: string,
   prekeyData: LocalPrekeyRecord,
 ): void {
+  const normalizedDeviceId = String(deviceId ?? '').trim();
+  if (normalizedDeviceId && typeof keystore.saveE2EEPrekeyForDevice === 'function') {
+    keystore.saveE2EEPrekeyForDevice(aid, normalizedDeviceId, prekeyId, prekeyData);
+    return;
+  }
   if (typeof keystore.saveE2EEPrekey === 'function') {
     keystore.saveE2EEPrekey(aid, prekeyId, prekeyData);
     return;
   }
-  updateKeyStoreMetadata(keystore, aid, metadata => {
-    const localPrekeys = (metadata.e2ee_prekeys as LocalPrekeyStore) ?? {};
-    localPrekeys[prekeyId] = { ...prekeyData };
-    metadata.e2ee_prekeys = localPrekeys;
-    return metadata;
-  });
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing saveE2EEPrekey method`);
 }
 
 function cleanupKeyStorePrekeys(
   keystore: KeyStore,
   aid: string,
+  deviceId: string,
   cutoffMs: number,
   keepLatest = PREKEY_MIN_KEEP_COUNT,
 ): string[] {
+  const normalizedDeviceId = String(deviceId ?? '').trim();
+  if (normalizedDeviceId && typeof keystore.cleanupE2EEPrekeysForDevice === 'function') {
+    return keystore.cleanupE2EEPrekeysForDevice(aid, normalizedDeviceId, cutoffMs, keepLatest) ?? [];
+  }
   if (typeof keystore.cleanupE2EEPrekeys === 'function') {
     return keystore.cleanupE2EEPrekeys(aid, cutoffMs, keepLatest) ?? [];
   }
 
-  const expired: string[] = [];
-  updateKeyStoreMetadata(keystore, aid, metadata => {
-    const localPrekeys = metadata.e2ee_prekeys as LocalPrekeyStore | undefined;
-    if (!localPrekeys) return metadata;
-    const retainedIds = latestPrekeyIds(localPrekeys, keepLatest);
-    for (const [pid, data] of Object.entries(localPrekeys)) {
-      if (prekeyCreatedMarker(data) < cutoffMs && !retainedIds.has(pid)) {
-        expired.push(pid);
-      }
-    }
-    for (const pid of expired) {
-      delete localPrekeys[pid];
-    }
-    metadata.e2ee_prekeys = localPrekeys;
-    return metadata;
-  });
-  return expired;
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing cleanupE2EEPrekeys method`);
 }
 
 // ── 工具函数 ───────────────────────────────────────────────────
@@ -143,8 +138,12 @@ function cleanupKeyStorePrekeys(
 /** 将 PEM 证书/公钥转为 KeyObject */
 function pemToCertPublicKey(certPem: string | Buffer): crypto.KeyObject {
   const pem = typeof certPem === 'string' ? certPem : certPem.toString('utf-8');
-  const x509 = new crypto.X509Certificate(pem);
-  return x509.publicKey;
+  try {
+    const x509 = new crypto.X509Certificate(pem);
+    return x509.publicKey;
+  } catch {
+    return crypto.createPublicKey(pem);
+  }
 }
 
 /** ECDH 共享密钥计算 */
@@ -214,16 +213,37 @@ function fingerprintKeyObject(pubKey: crypto.KeyObject): string {
   return fingerprintPublicKeyDer(der as Buffer);
 }
 
-/** PEM 证书 → 公钥指纹 */
+/** PEM 证书 → 证书 SHA-256 指纹 */
 function fingerprintCertPem(certPem: string | Buffer): string {
-  const pubKey = pemToCertPublicKey(certPem);
-  return fingerprintKeyObject(pubKey);
+  return certificateSha256Fingerprint(certPem);
+}
+
+/** PEM/DER 证书 → DER 字节 */
+function certToDerBytes(certPem: string | Buffer): Buffer {
+  const raw = Buffer.isBuffer(certPem) ? Buffer.from(certPem) : Buffer.from(certPem, 'utf-8');
+  const text = raw.toString('utf-8');
+  if (text.includes('-----BEGIN CERTIFICATE-----')) {
+    const body = text
+      .replace(/-----BEGIN CERTIFICATE-----/g, '')
+      .replace(/-----END CERTIFICATE-----/g, '')
+      .replace(/\s+/g, '');
+    if (!body) {
+      throw new E2EEError('无效证书 PEM：缺少 base64 内容');
+    }
+    return Buffer.from(body, 'base64');
+  }
+  try {
+    return new crypto.X509Certificate(raw).raw;
+  } catch {
+    return raw;
+  }
 }
 
 /** PEM 证书 → 证书 SHA-256 指纹 */
 function certificateSha256Fingerprint(certPem: string | Buffer): string {
-  const cert = new crypto.X509Certificate(certPem);
-  return `sha256:${cert.fingerprint256.replace(/:/g, '').toLowerCase()}`;
+  const der = certToDerBytes(certPem);
+  const hash = crypto.createHash('sha256').update(der).digest('hex');
+  return `sha256:${hash}`;
 }
 
 /** 公钥 KeyObject → 未压缩点（0x04 || x || y，65 字节） */
@@ -277,6 +297,7 @@ function aadMatchesOffline(expected: JsonObject, actual: JsonObject): boolean {
 
 export class E2EEManager {
   private _identityFn: () => IdentityRecord;
+  private _deviceIdFn: () => string;
   private _keystore: KeyStore;
   /** 本地防重放 seen set */
   private _seenMessages = new Map<string, boolean>();
@@ -291,11 +312,13 @@ export class E2EEManager {
 
   constructor(opts: {
     identityFn: () => IdentityRecord;
+    deviceIdFn?: () => string;
     keystore: KeyStore;
     prekeyCacheTtl?: number;
     replayWindowSeconds?: number;
   }) {
     this._identityFn = opts.identityFn;
+    this._deviceIdFn = opts.deviceIdFn ?? (() => '');
     this._keystore = opts.keystore;
     this._prekeyCacheTtl = opts.prekeyCacheTtl ?? 3600;
     this._replayWindowSeconds = opts.replayWindowSeconds ?? 300;
@@ -431,7 +454,7 @@ export class E2EEManager {
 
     // AES-GCM 加密
     const plaintext = Buffer.from(JSON.stringify(payload), 'utf-8');
-    const senderFingerprint = this._localIdentityFingerprint();
+    const senderFingerprint = this._localCertSha256Fingerprint() || this._localIdentityFingerprint();
     const recipientFingerprint = fingerprintCertPem(peerCertPem);
     const ephemeralPkB64 = ephemeralPublicBytes.toString('base64');
 
@@ -494,7 +517,7 @@ export class E2EEManager {
     );
 
     const plaintext = Buffer.from(JSON.stringify(payload), 'utf-8');
-    const senderFingerprint = this._localIdentityFingerprint();
+    const senderFingerprint = this._localCertSha256Fingerprint() || this._localIdentityFingerprint();
     const recipientFingerprint = fingerprintCertPem(peerCertPem);
     const ephemeralPkB64 = ephemeralPublicBytes.toString('base64');
 
@@ -614,7 +637,10 @@ export class E2EEManager {
 
       // 获取发送方公钥
       const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
-      const senderPublicKey = this._loadSenderPublicKey(fromAid);
+      const senderCertFingerprint = String(
+        payload.sender_cert_fingerprint ?? (payload.aad as JsonObject | undefined)?.sender_cert_fingerprint ?? '',
+      ).trim().toLowerCase();
+      const senderPublicKey = this._loadSenderPublicKey(fromAid, senderCertFingerprint || undefined);
       if (!senderPublicKey) {
         throw new E2EEError(`sender public key not found for ${fromAid}`);
       }
@@ -679,7 +705,10 @@ export class E2EEManager {
 
       // 获取发送方公钥
       const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
-      const senderPublicKey = this._loadSenderPublicKey(fromAid);
+      const senderCertFingerprint = String(
+        payload.sender_cert_fingerprint ?? (payload.aad as JsonObject | undefined)?.sender_cert_fingerprint ?? '',
+      ).trim().toLowerCase();
+      const senderPublicKey = this._loadSenderPublicKey(fromAid, senderCertFingerprint || undefined);
       if (!senderPublicKey) {
         throw new E2EEError(`sender public key not found for ${fromAid}`);
       }
@@ -734,7 +763,10 @@ export class E2EEManager {
       throw new E2EEDecryptFailedError('from_aid missing in message');
     }
 
-    const senderCertPem = this._getSenderCert(fromAid);
+    const senderCertFingerprint = String(
+      payload.sender_cert_fingerprint ?? (payload.aad as JsonObject | undefined)?.sender_cert_fingerprint ?? '',
+    ).trim().toLowerCase();
+    const senderCertPem = this._getSenderCert(fromAid, senderCertFingerprint || undefined);
     if (!senderCertPem) {
       throw new E2EEDecryptFailedError(`sender cert not found for ${fromAid}`);
     }
@@ -789,6 +821,7 @@ export class E2EEManager {
   generatePrekey(): PrekeyMaterial {
     const aid = this._currentAid();
     if (!aid) throw new E2EEError('AID unavailable for prekey generation');
+    const deviceId = this._currentDeviceId();
 
     // 生成新 prekey
     const { privateKey, publicKey } = generateECKeyPair();
@@ -804,16 +837,17 @@ export class E2EEManager {
     // 保存私钥到本地 keystore
     const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
 
-    saveKeyStorePrekey(this._keystore, aid, prekeyId, {
+    saveKeyStorePrekey(this._keystore, aid, deviceId, prekeyId, {
       private_key_pem: privateKeyPem,
       created_at: nowMs,
+      updated_at: nowMs,
     });
 
     // 内存缓存私钥
     this._localPrekeyCache.set(prekeyId, privateKeyPem);
 
     // 清理过期的旧 prekey 私钥
-    this._cleanupExpiredPrekeys(aid);
+    this._cleanupExpiredPrekeys(aid, deviceId);
 
     const result: PrekeyMaterial = {
       prekey_id: prekeyId,
@@ -825,14 +859,17 @@ export class E2EEManager {
     if (certFingerprint) {
       result.cert_fingerprint = certFingerprint;
     }
+    if (deviceId) {
+      result.device_id = deviceId;
+    }
     return result;
   }
 
   /** 清理本地过期的 prekey 私钥 */
-  private _cleanupExpiredPrekeys(aid: string): void {
+  private _cleanupExpiredPrekeys(aid: string, deviceId: string): void {
     const nowMs = Date.now();
     const cutoffMs = nowMs - PREKEY_RETENTION_SECONDS * 1000;
-    const expired = cleanupKeyStorePrekeys(this._keystore, aid, cutoffMs, PREKEY_MIN_KEEP_COUNT);
+    const expired = cleanupKeyStorePrekeys(this._keystore, aid, deviceId, cutoffMs, PREKEY_MIN_KEEP_COUNT);
     if (expired.length > 0) {
       for (const pid of expired) {
         this._localPrekeyCache.delete(pid);
@@ -850,7 +887,7 @@ export class E2EEManager {
 
     const aid = this._currentAid();
     if (!aid) return null;
-    const prekeys = loadKeyStorePrekeys(this._keystore, aid);
+    const prekeys = loadKeyStorePrekeys(this._keystore, aid, this._currentDeviceId());
     const prekeyData = prekeys[prekeyId];
     if (!prekeyData) return null;
     const privateKeyPem = prekeyData.private_key_pem as string | undefined;
@@ -884,6 +921,9 @@ export class E2EEManager {
     message: Message,
     payload: JsonObject,
   ): boolean {
+    if (String(message.direction ?? '').trim().toLowerCase() === 'outbound_sync') {
+      return true;
+    }
     const currentAid = this._currentAid();
     if (!currentAid) return true;
     const targetAid =
@@ -914,15 +954,27 @@ export class E2EEManager {
     return aid ? String(aid) : null;
   }
 
+  private _currentDeviceId(): string {
+    try {
+      return String(this._deviceIdFn() ?? '').trim();
+    } catch {
+      return '';
+    }
+  }
+
   /** 获取发送方证书 */
-  private _getSenderCert(aid: string): string | null {
-    return this._keystore.loadCert(aid);
+  private _getSenderCert(aid: string, certFingerprint?: string): string | null {
+    const certPem = this._keystore.loadCert(aid, certFingerprint);
+    const normalized = String(certFingerprint ?? '').trim().toLowerCase();
+    if (!certPem) return null;
+    if (!normalized) return certPem;
+    return certificateSha256Fingerprint(certPem) === normalized ? certPem : null;
   }
 
   /** 获取发送方的 identity 公钥（从本地证书缓存） */
-  private _loadSenderPublicKey(aid: string | null): crypto.KeyObject | null {
+  private _loadSenderPublicKey(aid: string | null, certFingerprint?: string): crypto.KeyObject | null {
     if (!aid) return null;
-    const certPem = this._getSenderCert(aid);
+    const certPem = this._getSenderCert(aid, certFingerprint);
     if (!certPem) return null;
     try {
       return pemToCertPublicKey(certPem);
@@ -951,7 +1003,7 @@ export class E2EEManager {
     return crypto.createPrivateKey(privateKeyPem);
   }
 
-  /** 本地 identity 指纹 */
+  /** 本地 identity 指纹（优先公钥指纹，不绑定具体证书版本） */
   private _localIdentityFingerprint(): string {
     const identity = this._identityFn();
     const publicKeyDerB64 = identity.public_key_der_b64 as string | undefined;
@@ -960,7 +1012,7 @@ export class E2EEManager {
     }
     const cert = identity.cert as string | undefined;
     if (cert) {
-      return fingerprintCertPem(cert);
+      return fingerprintKeyObject(pemToCertPublicKey(cert));
     }
     const privateKeyPem = identity.private_key_pem as string | undefined;
     if (privateKeyPem) {
@@ -971,9 +1023,9 @@ export class E2EEManager {
     throw new E2EEError('identity fingerprint unavailable');
   }
 
-  /** 本地证书指纹（与 _localIdentityFingerprint 相同） */
+  /** 本地证书指纹（优先证书 SHA-256，缺失时回退到 identity 公钥指纹） */
   private _localCertFingerprint(): string {
-    return this._localIdentityFingerprint();
+    return this._localCertSha256Fingerprint() || this._localIdentityFingerprint();
   }
 
   /** 本地证书的 SHA-256 指纹（用于锁定证书版本） */
@@ -1002,5 +1054,13 @@ export class E2EEManager {
       sender_cert_fingerprint: (payload.sender_cert_fingerprint ?? aad?.sender_cert_fingerprint) as string | undefined,
       prekey_id: (payload.prekey_id ?? aad?.prekey_id) as string | undefined,
     };
+  }
+
+  /** 清理过期的 prekey 缓存条目（供外部定时调用） */
+  cleanExpiredCaches(): void {
+    const now = Date.now() / 1000;
+    for (const [k, v] of this._prekeyCache) {
+      if (now >= v.expireAt) this._prekeyCache.delete(k);
+    }
   }
 }

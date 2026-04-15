@@ -26,6 +26,8 @@ import {
 } from '../../src/e2ee-group.js';
 import type { JsonObject, KeyStore, Message } from '../../src/types.js';
 
+process.env.AUN_ENV ??= 'development';
+
 // ── 常量 ──────────────────────────────────────────────────────
 
 /** 单条测试超时（毫秒） */
@@ -40,11 +42,11 @@ function runId(): string {
 
 /** 创建测试客户端（Gateway 通过 well-known 自动发现） */
 function makeClient(): AUNClient {
-  return new AUNClient({
+  const client = new AUNClient({
     aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-e2e-')),
-    verify_ssl: false,
-    require_forward_secrecy: false,
   });
+  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  return client;
 }
 
 /** 注册 AID 并连接到 Gateway */
@@ -484,7 +486,6 @@ describe('Group E2EE E2E 测试', () => {
         to: dist.to,
         payload: dist.payload,
         encrypt: true,
-        persist: false,
       });
     }
     await sleep(2000);

@@ -81,6 +81,10 @@ export type PrekeyMap = Record<string, PrekeyRecord>;
 /** 群组旧 epoch 记录 */
 export interface GroupOldEpochRecord extends JsonObject {
   epoch?: number;
+  secret?: string;
+  commitment?: string;
+  member_aids?: string[];
+  secret_protection?: JsonObject;
   created_at?: number;
   updated_at?: number;
   expires_at?: number;
@@ -90,6 +94,11 @@ export interface GroupOldEpochRecord extends JsonObject {
 export interface GroupSecretRecord extends JsonObject {
   group_id?: string;
   epoch?: number;
+  secret?: string;
+  commitment?: string;
+  member_aids?: string[];
+  updated_at?: number;
+  secret_protection?: JsonObject;
   old_epochs?: GroupOldEpochRecord[];
 }
 
@@ -116,6 +125,17 @@ export interface IdentityRecord extends MetadataRecord, KeyPairRecord {
   expires_at?: number;
 }
 
+/** E2EE session 记录 */
+export interface SessionRecord extends JsonObject {
+  session_id?: string;
+  key?: string;
+  key_protection?: JsonObject;
+  peer_aid?: string;
+  created_at?: number;
+  updated_at?: number;
+  expires_at?: number;
+}
+
 /** SecretStore 加密记录 */
 export interface SecretRecord extends JsonObject {
   scheme?: string;
@@ -127,6 +147,9 @@ export interface SecretRecord extends JsonObject {
   iv?: string;
 }
 
+/** 投递模式 */
+export type DeliveryMode = 'fanout' | 'queue';
+
 /** 消息类型 */
 export interface Message extends JsonObject {
   message_id?: string;
@@ -136,22 +159,24 @@ export interface Message extends JsonObject {
   type?: string;
   payload?: JsonValue;
   encrypted?: boolean;
-  persist?: boolean;
+  delivery_mode?: DeliveryMode;
   timestamp?: number;
   e2ee?: JsonObject;
 }
 
 /** 发送结果 */
 export interface SendResult extends JsonObject {
+  ok?: boolean;
   message_id?: string;
   seq?: number;
   timestamp?: number;
   status?: 'sent' | 'delivered' | 'duplicate';
-  persist?: boolean;
+  delivery_mode?: DeliveryMode;
 }
 
 /** ACK 结果 */
 export interface AckResult extends JsonObject {
+  success?: boolean;
   ack_seq?: number;
 }
 

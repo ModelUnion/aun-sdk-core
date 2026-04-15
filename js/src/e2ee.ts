@@ -4,7 +4,6 @@
 import { E2EEDecryptFailedError, E2EEError } from './errors.js';
 import { uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer, toArrayBuffer, toBufferSource } from './crypto.js';
 import type { KeyStore } from './keystore/index.js';
-import { updateKeyStoreMetadata } from './keystore/update.js';
 import type { IdentityRecord, JsonObject, Message, PrekeyRecord } from './types.js';
 
 /** 加密套件标识 */
@@ -39,6 +38,7 @@ export interface PrekeyMaterial extends JsonObject {
   public_key: string;
   signature: string;
   created_at?: number;
+  device_id?: string;
   cert_fingerprint?: string;
 }
 
@@ -85,59 +85,53 @@ export interface EncryptResult {
 async function loadKeyStorePrekeys(
   keystore: KeyStore,
   aid: string,
+  deviceId = '',
 ): Promise<LocalPrekeyStore> {
+  const normalizedDeviceId = String(deviceId ?? '').trim();
+  if (normalizedDeviceId && typeof keystore.loadE2EEPrekeysForDevice === 'function') {
+    return ((await keystore.loadE2EEPrekeysForDevice(aid, normalizedDeviceId)) ?? {}) as LocalPrekeyStore;
+  }
   if (typeof keystore.loadE2EEPrekeys === 'function') {
     return ((await keystore.loadE2EEPrekeys(aid)) ?? {}) as LocalPrekeyStore;
   }
-  const metadata = (await keystore.loadMetadata(aid)) ?? {};
-  return (metadata.e2ee_prekeys ?? {}) as LocalPrekeyStore;
+  throw new Error('keystore 缺少 loadE2EEPrekeys 方法');
 }
 
 async function saveKeyStorePrekey(
   keystore: KeyStore,
   aid: string,
+  deviceId: string,
   prekeyId: string,
   prekeyData: LocalPrekeyRecord,
 ): Promise<void> {
+  const normalizedDeviceId = String(deviceId ?? '').trim();
+  if (normalizedDeviceId && typeof keystore.saveE2EEPrekeyForDevice === 'function') {
+    await keystore.saveE2EEPrekeyForDevice(aid, normalizedDeviceId, prekeyId, prekeyData);
+    return;
+  }
   if (typeof keystore.saveE2EEPrekey === 'function') {
     await keystore.saveE2EEPrekey(aid, prekeyId, prekeyData);
     return;
   }
-  await updateKeyStoreMetadata(keystore, aid, metadata => {
-    const localPrekeys = (metadata.e2ee_prekeys ?? {}) as LocalPrekeyStore;
-    localPrekeys[prekeyId] = { ...prekeyData };
-    metadata.e2ee_prekeys = localPrekeys;
-    return metadata;
-  });
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing saveE2EEPrekey method`);
 }
 
 async function cleanupKeyStorePrekeys(
   keystore: KeyStore,
   aid: string,
+  deviceId: string,
   cutoffMs: number,
   keepLatest = PREKEY_MIN_KEEP_COUNT,
 ): Promise<string[]> {
+  const normalizedDeviceId = String(deviceId ?? '').trim();
+  if (normalizedDeviceId && typeof keystore.cleanupE2EEPrekeysForDevice === 'function') {
+    return (await keystore.cleanupE2EEPrekeysForDevice(aid, normalizedDeviceId, cutoffMs, keepLatest)) ?? [];
+  }
   if (typeof keystore.cleanupE2EEPrekeys === 'function') {
     return (await keystore.cleanupE2EEPrekeys(aid, cutoffMs, keepLatest)) ?? [];
   }
 
-  const expired: string[] = [];
-  await updateKeyStoreMetadata(keystore, aid, metadata => {
-    const localPrekeys = (metadata.e2ee_prekeys ?? {}) as LocalPrekeyStore;
-    if (!Object.keys(localPrekeys).length) return metadata;
-    const retainedIds = latestPrekeyIds(localPrekeys, keepLatest);
-    for (const [pid, data] of Object.entries(localPrekeys)) {
-      if (prekeyCreatedMarker(data) < cutoffMs && !retainedIds.has(pid)) {
-        expired.push(pid);
-      }
-    }
-    for (const pid of expired) {
-      delete localPrekeys[pid];
-    }
-    metadata.e2ee_prekeys = localPrekeys;
-    return metadata;
-  });
-  return expired;
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing cleanupE2EEPrekeys method`);
 }
 
 // ── 工具函数 ────────────────────────────────────────────────
@@ -301,10 +295,9 @@ async function fingerprintSpki(spkiBytes: ArrayBuffer): Promise<string> {
   return `sha256:${hex}`;
 }
 
-/** 从 PEM 证书计算公钥指纹 */
+/** 从 PEM 证书计算证书 SHA-256 指纹 */
 async function fingerprintCertPem(certPem: string): Promise<string> {
-  const spki = extractSpkiFromCertPem(certPem);
-  return fingerprintSpki(spki);
+  return certificateSha256Fingerprint(certPem);
 }
 
 /** 从 PEM 证书计算证书 SHA-256 指纹 */
@@ -504,6 +497,7 @@ async function importUncompressedPointEcdh(pointBytes: Uint8Array): Promise<Cryp
  */
 export class E2EEManager {
   private _identityFn: () => IdentityRecord;
+  private _deviceIdFn: () => string;
   private _keystoreRef: KeyStore;
   /** 本地防重放 seen set */
   private _seenMessages: Map<string, boolean> = new Map();
@@ -518,11 +512,13 @@ export class E2EEManager {
 
   constructor(opts: {
     identityFn: () => IdentityRecord;
+    deviceIdFn?: () => string;
     keystore: KeyStore;
     prekeyCacheTtl?: number;
     replayWindowSeconds?: number;
   }) {
     this._identityFn = opts.identityFn;
+    this._deviceIdFn = opts.deviceIdFn ?? (() => '');
     this._keystoreRef = opts.keystore;
     this._prekeyCacheTtl = opts.prekeyCacheTtl ?? 3600;
     this._replayWindowSeconds = opts.replayWindowSeconds ?? 300;
@@ -713,7 +709,7 @@ export class E2EEManager {
     const plaintext = _encoder.encode(JSON.stringify(payload));
     const nonce = randomNonce();
 
-    const senderFingerprint = await this._localIdentityFingerprint();
+    const senderFingerprint = await this._localCertSha256Fingerprint() || await this._localIdentityFingerprint();
     const recipientFingerprint = await fingerprintCertPem(peerCertPem);
     const ephPkB64 = uint8ToBase64(ephPublicBytes);
 
@@ -788,7 +784,7 @@ export class E2EEManager {
     const plaintext = _encoder.encode(JSON.stringify(payload));
     const nonce = randomNonce();
 
-    const senderFingerprint = await this._localIdentityFingerprint();
+    const senderFingerprint = await this._localCertSha256Fingerprint() || await this._localIdentityFingerprint();
     const recipientFingerprint = await fingerprintCertPem(peerCertPem);
     const ephPkB64 = uint8ToBase64(ephPublicBytes);
 
@@ -881,6 +877,9 @@ export class E2EEManager {
     message: Message,
     payload: JsonObject,
   ): boolean {
+    if (String(message.direction ?? '').trim().toLowerCase() === 'outbound_sync') {
+      return true;
+    }
     const currentAid = this._currentAid();
     if (!currentAid) return true;
     const targetAid = (
@@ -931,7 +930,10 @@ export class E2EEManager {
     const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
     if (!fromAid) throw new E2EEDecryptFailedError('from_aid missing in message');
 
-    const senderCertPem = await this._getSenderCert(fromAid);
+    const senderCertFingerprint = String(
+      payload.sender_cert_fingerprint ?? (payload.aad as JsonObject | undefined)?.sender_cert_fingerprint ?? '',
+    ).trim().toLowerCase();
+    const senderCertPem = await this._getSenderCert(fromAid, senderCertFingerprint || undefined);
     if (!senderCertPem) throw new E2EEDecryptFailedError(`sender cert not found for ${fromAid}`);
 
     const senderPubKey = await importCertPublicKeyEcdsa(senderCertPem);
@@ -951,8 +953,13 @@ export class E2EEManager {
   }
 
   /** 从 keystore 获取发送方证书 PEM */
-  private async _getSenderCert(aid: string): Promise<string | null> {
-    return this._keystoreRef.loadCert(aid);
+  private async _getSenderCert(aid: string, certFingerprint?: string): Promise<string | null> {
+    const certPem = await this._keystoreRef.loadCert(aid, certFingerprint);
+    const normalized = String(certFingerprint ?? '').trim().toLowerCase();
+    if (!certPem) return null;
+    if (!normalized) return certPem;
+    const actualFingerprint = await certificateSha256Fingerprint(certPem);
+    return actualFingerprint === normalized ? certPem : null;
   }
 
   /** 解密 prekey_ecdh_v2 模式的消息（四路 ECDH） */
@@ -981,7 +988,10 @@ export class E2EEManager {
 
       // 获取发送方公钥（四路 ECDH 需要）
       const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
-      const senderCertPem = await this._getSenderCert(fromAid);
+      const senderCertFingerprint = String(
+        payload.sender_cert_fingerprint ?? (payload.aad as JsonObject | undefined)?.sender_cert_fingerprint ?? '',
+      ).trim().toLowerCase();
+      const senderCertPem = await this._getSenderCert(fromAid, senderCertFingerprint || undefined);
       if (!senderCertPem) throw new E2EEError(`sender public key not found for ${fromAid}`);
       const senderPubEcdh = await importCertPublicKeyEcdh(senderCertPem);
 
@@ -1051,7 +1061,10 @@ export class E2EEManager {
 
       // 获取发送方公钥（2DH 需要）
       const fromAid = (message.from ?? (payload.aad as JsonObject | undefined)?.from) as string;
-      const senderCertPem = await this._getSenderCert(fromAid);
+      const senderCertFingerprint = String(
+        payload.sender_cert_fingerprint ?? (payload.aad as JsonObject | undefined)?.sender_cert_fingerprint ?? '',
+      ).trim().toLowerCase();
+      const senderCertPem = await this._getSenderCert(fromAid, senderCertFingerprint || undefined);
       if (!senderCertPem) throw new E2EEError(`sender public key not found for ${fromAid}`);
       const senderPubEcdh = await importCertPublicKeyEcdh(senderCertPem);
 
@@ -1130,6 +1143,7 @@ export class E2EEManager {
   async generatePrekey(): Promise<PrekeyMaterial> {
     const aid = this._currentAid();
     if (!aid) throw new E2EEError('AID unavailable for prekey generation');
+    const deviceId = this._currentDeviceId();
 
     // 生成新 ECDH 密钥对（标记为 ECDH 用途）
     const keyPair = await crypto.subtle.generateKey(
@@ -1153,16 +1167,17 @@ export class E2EEManager {
     const sig = await ecdsaSignDer(senderSignKey, signData);
     const signatureB64 = uint8ToBase64(sig);
 
-    await saveKeyStorePrekey(this._keystoreRef, aid, prekeyId, {
+    await saveKeyStorePrekey(this._keystoreRef, aid, deviceId, prekeyId, {
       private_key_pem: privateKeyPem,
       created_at: nowMs,
+      updated_at: nowMs,
     });
 
     // 内存缓存私钥 PEM
     this._localPrekeyCache.set(prekeyId, privateKeyPem);
 
     // 清理过期的旧 prekey
-    await this._cleanupExpiredPrekeys(aid);
+    await this._cleanupExpiredPrekeys(aid, deviceId);
 
     const result: PrekeyMaterial = {
       prekey_id: prekeyId,
@@ -1174,14 +1189,17 @@ export class E2EEManager {
     if (certFingerprint) {
       result.cert_fingerprint = certFingerprint;
     }
+    if (deviceId) {
+      result.device_id = deviceId;
+    }
     return result;
   }
 
   /** 清理过期的本地 prekey 私钥 */
-  private async _cleanupExpiredPrekeys(aid: string): Promise<void> {
+  private async _cleanupExpiredPrekeys(aid: string, deviceId: string): Promise<void> {
     const nowMs = Date.now();
     const cutoffMs = nowMs - PREKEY_RETENTION_SECONDS * 1000;
-    const expired = await cleanupKeyStorePrekeys(this._keystoreRef, aid, cutoffMs, PREKEY_MIN_KEEP_COUNT);
+    const expired = await cleanupKeyStorePrekeys(this._keystoreRef, aid, deviceId, cutoffMs, PREKEY_MIN_KEEP_COUNT);
     if (expired.length > 0) {
       for (const pid of expired) {
         this._localPrekeyCache.delete(pid);
@@ -1197,7 +1215,7 @@ export class E2EEManager {
 
     const aid = this._currentAid();
     if (!aid) return null;
-    const prekeys = await loadKeyStorePrekeys(this._keystoreRef, aid);
+    const prekeys = await loadKeyStorePrekeys(this._keystoreRef, aid, this._currentDeviceId());
     const prekeyData = prekeys[prekeyId];
     if (!prekeyData) return null;
     const pem = prekeyData.private_key_pem as string | undefined;
@@ -1214,6 +1232,14 @@ export class E2EEManager {
     const identity = this._identityFn();
     const aid = identity.aid;
     return typeof aid === 'string' ? aid : null;
+  }
+
+  private _currentDeviceId(): string {
+    try {
+      return String(this._deviceIdFn() ?? '').trim();
+    } catch {
+      return '';
+    }
   }
 
   /** 加载发送方 identity 私钥（ECDH 用途） */
@@ -1281,6 +1307,14 @@ export class E2EEManager {
       }
     }
   }
+
+  /** 清理过期的 prekey 缓存条目（供外部定时调用） */
+  cleanExpiredCaches(): void {
+    const now = Date.now() / 1000;
+    for (const [k, v] of this._prekeyCache) {
+      if (now >= v.expireAt) this._prekeyCache.delete(k);
+    }
+  }
 }
 
 // ── 内部工具函数（PEM 生成） ────────────────────────────────
@@ -1308,6 +1342,7 @@ export {
   randomNonce as _randomNonce,
   uuidV4 as _uuidV4,
   fingerprintCertPem as _fingerprintCertPem,
+  certificateSha256Fingerprint as _certificateSha256Fingerprint,
   fingerprintSpki as _fingerprintSpki,
   importCertPublicKeyEcdsa as _importCertPublicKeyEcdsa,
   importPrivateKeyEcdsa as _importPrivateKeyEcdsa,

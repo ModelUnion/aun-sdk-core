@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aun-core"
-version = "0.2.3"
+version = "0.2.4"
 description = "AUN Protocol Core SDK — identity, authentication, key management, E2EE"
 requires-python = ">=3.11"
 license = "Apache-2.0"

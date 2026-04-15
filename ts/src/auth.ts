@@ -28,6 +28,7 @@ import {
   isJsonObject,
   type IdentityRecord,
   type JsonObject,
+  type JsonValue,
   type RpcMessage,
   type RpcParams,
   type RpcResult,
@@ -278,9 +279,18 @@ function _defaultConnectionFactory(url: string): Promise<WebSocket> {
 // ── AuthFlow ──────────────────────────────────────────────────
 
 export class AuthFlow {
+  private static readonly _INSTANCE_STATE_FIELDS = [
+    'access_token',
+    'refresh_token',
+    'kite_token',
+    'access_token_expires_at',
+  ] as const;
+
   private _keystore: KeyStore;
   private _crypto: CryptoProvider;
   private _aid: string | null;
+  private _deviceId: string;
+  private _slotId: string;
   private _verifySsl: boolean;
   private _connectionFactory: ConnectionFactory;
   private _rootCaPath: string | null;
@@ -304,6 +314,8 @@ export class AuthFlow {
     keystore: KeyStore;
     crypto: CryptoProvider;
     aid?: string | null;
+    deviceId?: string;
+    slotId?: string;
     connectionFactory?: ConnectionFactory;
     rootCaPath?: string | null;
     chainCacheTtl?: number;
@@ -312,6 +324,8 @@ export class AuthFlow {
     this._keystore = opts.keystore;
     this._crypto = opts.crypto;
     this._aid = opts.aid ?? null;
+    this._deviceId = String(opts.deviceId ?? '').trim();
+    this._slotId = String(opts.slotId ?? '').trim();
     this._connectionFactory = opts.connectionFactory ?? _defaultConnectionFactory;
     this._rootCaPath = opts.rootCaPath ?? null;
     this._verifySsl = opts.verifySsl ?? false;
@@ -326,8 +340,10 @@ export class AuthFlow {
     const identity = this._loadIdentityOrRaise(aid);
     const cert = this._keystore.loadCert(String(identity.aid));
     if (cert) identity.cert = cert;
-    const metadata = this._keystore.loadMetadata(String(identity.aid)) ?? {};
-    Object.assign(identity, metadata);
+    const instanceState = this._loadInstanceState(String(identity.aid));
+    if (instanceState && typeof instanceState === 'object') {
+      Object.assign(identity, instanceState);
+    }
     return identity;
   }
 
@@ -351,6 +367,11 @@ export class AuthFlow {
     const expiresAt = identity.access_token_expires_at;
     if (typeof expiresAt === 'number') return expiresAt;
     return null;
+  }
+
+  setInstanceContext(opts: { deviceId: string; slotId?: string }): void {
+    this._deviceId = String(opts.deviceId ?? '').trim();
+    this._slotId = String(opts.slotId ?? '').trim();
   }
 
   /**
@@ -384,7 +405,7 @@ export class AuthFlow {
         );
       }
     }
-    this._keystore.saveIdentity(String(identity.aid), identity);
+    this._persistIdentity(identity);
     this._aid = String(identity.aid);
     return { aid: identity.aid, cert: identity.cert };
   }
@@ -402,7 +423,7 @@ export class AuthFlow {
       // 本地有密钥但无证书——尝试从 PKI 下载恢复
       try {
         identity = await this._recoverCertViaDownload(gatewayUrl, identity);
-        this._keystore.saveIdentity(String(identity.aid), identity);
+        this._persistIdentity(identity);
       } catch (e) {
         throw new StateError(
           `local certificate missing and recovery failed: ${e instanceof Error ? e.message : String(e)}. ` +
@@ -413,7 +434,7 @@ export class AuthFlow {
     const login = await this._login(gatewayUrl, identity);
     AuthFlow._rememberTokens(identity, login);
     await this._validateNewCert(identity, gatewayUrl);
-    this._keystore.saveIdentity(String(identity.aid), identity);
+    this._persistIdentity(identity);
     this._aid = String(identity.aid);
     return {
       aid: identity.aid,
@@ -433,12 +454,12 @@ export class AuthFlow {
     if (!identity.cert) {
       const created = await this._createAid(gatewayUrl, identity);
       Object.assign(identity, created);
-      this._keystore.saveIdentity(String(identity.aid), identity);
+      this._persistIdentity(identity);
     }
     const login = await this._login(gatewayUrl, identity);
     AuthFlow._rememberTokens(identity, login);
     await this._validateNewCert(identity, gatewayUrl);
-    this._keystore.saveIdentity(String(identity.aid), identity);
+    this._persistIdentity(identity);
 
     const token = identity.access_token || identity.token || identity.kite_token;
     if (!token) {
@@ -462,7 +483,7 @@ export class AuthFlow {
     const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken);
     AuthFlow._rememberTokens(identity, refreshed);
     await this._validateNewCert(identity, gatewayUrl);
-    this._keystore.saveIdentity(String(identity.aid), identity);
+    this._persistIdentity(identity);
     return identity;
   }
 
@@ -474,9 +495,22 @@ export class AuthFlow {
     transport: RPCTransport,
     challenge: RpcMessage | null,
     accessToken: string,
+    opts?: {
+      deviceId?: string;
+      slotId?: string;
+      deliveryMode?: JsonObject | null;
+    },
   ): Promise<void> {
     const nonce = this._extractChallengeNonce(challenge);
-    await this._initializeSession(transport, nonce, accessToken);
+    this.setInstanceContext({
+      deviceId: String(opts?.deviceId ?? ''),
+      slotId: String(opts?.slotId ?? ''),
+    });
+    await this._initializeSession(transport, nonce, accessToken, {
+      deviceId: String(opts?.deviceId ?? ''),
+      slotId: String(opts?.slotId ?? ''),
+      deliveryMode: opts?.deliveryMode ?? null,
+    });
   }
 
   /**
@@ -487,9 +521,18 @@ export class AuthFlow {
     transport: RPCTransport,
     challenge: RpcMessage | null,
     gatewayUrl: string,
-    opts?: { accessToken?: string },
+    opts?: {
+      accessToken?: string;
+      deviceId?: string;
+      slotId?: string;
+      deliveryMode?: JsonObject | null;
+    },
   ): Promise<AuthContext> {
     const nonce = this._extractChallengeNonce(challenge);
+    const deviceId = String(opts?.deviceId ?? '');
+    const slotId = String(opts?.slotId ?? '');
+    const deliveryMode = opts?.deliveryMode ?? null;
+    this.setInstanceContext({ deviceId, slotId });
 
     let identity: IdentityRecord | null;
     try {
@@ -502,9 +545,13 @@ export class AuthFlow {
     const explicitToken = String(opts?.accessToken || '');
     if (explicitToken && identity !== null) {
       try {
-        await this._initializeSession(transport, nonce, explicitToken);
+        await this._initializeSession(transport, nonce, explicitToken, {
+          deviceId,
+          slotId,
+          deliveryMode,
+        });
         identity.access_token = explicitToken;
-        this._keystore.saveIdentity(String(identity.aid), identity);
+        this._persistIdentity(identity);
         return { token: explicitToken, identity };
       } catch (exc) {
         if (!(exc instanceof AuthError)) throw exc;
@@ -516,7 +563,11 @@ export class AuthFlow {
     if (identity === null) {
       const authContext = await this.ensureAuthenticated(gatewayUrl);
       const token = String(authContext.token);
-      await this._initializeSession(transport, nonce, token);
+      await this._initializeSession(transport, nonce, token, {
+        deviceId,
+        slotId,
+        deliveryMode,
+      });
       return authContext;
     }
 
@@ -524,7 +575,11 @@ export class AuthFlow {
     const cachedToken = AuthFlow._getCachedAccessToken(identity);
     if (cachedToken) {
       try {
-        await this._initializeSession(transport, nonce, cachedToken);
+        await this._initializeSession(transport, nonce, cachedToken, {
+          deviceId,
+          slotId,
+          deliveryMode,
+        });
         return { token: cachedToken, identity };
       } catch (exc) {
         if (!(exc instanceof AuthError)) throw exc;
@@ -539,7 +594,11 @@ export class AuthFlow {
         identity = await this.refreshCachedTokens(gatewayUrl, identity);
         const newCachedToken = AuthFlow._getCachedAccessToken(identity);
         if (newCachedToken) {
-          await this._initializeSession(transport, nonce, newCachedToken);
+          await this._initializeSession(transport, nonce, newCachedToken, {
+            deviceId,
+            slotId,
+            deliveryMode,
+          });
           return { token: newCachedToken, identity };
         }
       } catch (exc) {
@@ -554,7 +613,11 @@ export class AuthFlow {
     if (!token) {
       throw new AuthError('authenticate did not return access_token');
     }
-    await this._initializeSession(transport, nonce, token);
+    await this._initializeSession(transport, nonce, token, {
+      deviceId,
+      slotId,
+      deliveryMode,
+    });
     identity = this.loadIdentity(identity.aid as string | undefined);
     return { token, identity };
   }
@@ -583,8 +646,8 @@ export class AuthFlow {
 
     try {
       await this._verifyAuthCertOcsp(gatewayUrl, cert, expectedAid);
-    } catch {
-      // OCSP 不可用时降级（CRL 已检查）
+    } catch (exc) {
+      console.log('[aun_core.auth] OCSP 校验不可用，降级继续:', exc);
     }
 
     // 检查 CN 匹配
@@ -740,11 +803,19 @@ export class AuthFlow {
     transport: RPCTransport,
     nonce: string,
     token: string,
+    opts?: {
+      deviceId?: string;
+      slotId?: string;
+      deliveryMode?: JsonObject | null;
+    },
   ): Promise<void> {
     const result = await transport.call('auth.connect', {
       nonce,
       auth: { method: 'kite_token', token },
       protocol: { min: '1.0', max: '1.0' },
+      device: { id: String(opts?.deviceId ?? ''), type: 'sdk' },
+      client: { slot_id: String(opts?.slotId ?? '') },
+      delivery_mode: opts?.deliveryMode ?? { mode: 'fanout' },
       capabilities: {
         e2ee: true,
         group_e2ee: true,
@@ -1506,8 +1577,8 @@ export class AuthFlow {
         await this._verifyAuthCertRevocation(gatewayUrl, cert);
         try {
           await this._verifyAuthCertOcsp(gatewayUrl, cert);
-        } catch {
-          // OCSP 不可用时降级（CRL 已检查）
+        } catch (exc) {
+          console.log('[aun_core.auth] OCSP 校验不可用，降级继续:', exc);
         }
       }
 
@@ -1590,7 +1661,7 @@ export class AuthFlow {
     }
     const identity = this._crypto.generateIdentity() as IdentityRecord;
     identity.aid = aid;
-    this._keystore.saveIdentity(aid, identity); // 立即持久化密钥对
+    this._persistIdentity(identity); // 立即持久化密钥对
     this._aid = aid;
     return identity;
   }
@@ -1632,9 +1703,70 @@ export class AuthFlow {
       }
       const identity = this._crypto.generateIdentity() as IdentityRecord;
       identity.aid = this._aid;
-      this._keystore.saveIdentity(this._aid, identity); // 立即持久化
+      this._persistIdentity(identity); // 立即持久化
       return identity;
     }
+  }
+
+  private _loadInstanceState(aid: string): IdentityRecord | null {
+    if (!this._deviceId) {
+      return null;
+    }
+    const loader = (this._keystore as KeyStore & {
+      loadInstanceState?: (aid: string, deviceId: string, slotId?: string) => IdentityRecord | null;
+    }).loadInstanceState;
+    if (typeof loader !== 'function') {
+      return null;
+    }
+    return loader.call(this._keystore, aid, this._deviceId, this._slotId);
+  }
+
+  private _persistIdentity(identity: IdentityRecord): void {
+    const aid = String(identity.aid ?? '');
+    if (!aid) {
+      throw new StateError('identity missing aid');
+    }
+
+    const persisted: IdentityRecord = { ...identity };
+    const instanceState: JsonObject = {};
+    for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
+      if (key in persisted) {
+        instanceState[key] = persisted[key] as JsonValue;
+        delete persisted[key];
+      }
+    }
+
+    this._keystore.saveIdentity(aid, persisted);
+
+    if (this._deviceId) {
+      // 从共享 metadata_kv 中移除实例级字段（它们已保存到 instance_state）
+      const db = (this._keystore as any)._getDB?.(aid);
+      if (db && typeof db.deleteMetadata === 'function') {
+        for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
+          db.deleteMetadata(key);
+          db.deleteMetadata(`${key}_protection`);
+        }
+      }
+    }
+
+    if (!this._deviceId || Object.keys(instanceState).length === 0) {
+      return;
+    }
+    const updater = (this._keystore as KeyStore & {
+      updateInstanceState?: (
+        aid: string,
+        deviceId: string,
+        slotId: string,
+        updater: (state: IdentityRecord) => IdentityRecord | void,
+      ) => IdentityRecord;
+    }).updateInstanceState;
+    if (typeof updater !== 'function') {
+      return;
+    }
+    updater.call(this._keystore, aid, this._deviceId, this._slotId, (current) => {
+      Object.assign(current, instanceState);
+      return current;
+    });
   }
 
   /** 从 challenge 消息中提取 nonce */
@@ -1723,6 +1855,23 @@ export class AuthFlow {
     }
 
     return certs;
+  }
+
+  /** 清理过期的 gateway 缓存条目（供外部定时调用） */
+  cleanExpiredCaches(): void {
+    const now = Date.now();
+    for (const [k, v] of this._gatewayCrlCache) {
+      if (v.nextRefreshAt <= now) this._gatewayCrlCache.delete(k);
+    }
+    for (const [k, v] of this._gatewayOcspCache) {
+      for (const [serial, entry] of v) {
+        if (entry.nextRefreshAt <= now) v.delete(serial);
+      }
+      if (v.size === 0) this._gatewayOcspCache.delete(k);
+    }
+    for (const [k, v] of this._chainVerifiedCache) {
+      if (now - v >= 300_000) this._chainVerifiedCache.delete(k);
+    }
   }
 }
 interface ExportedJwk extends JsonObject {

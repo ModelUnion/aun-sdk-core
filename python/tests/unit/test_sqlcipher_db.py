@@ -10,7 +10,6 @@ import pytest
 
 from aun_core.keystore.sqlcipher_db import (
     AIDDatabase,
-    SQLCIPHER_AVAILABLE,
     derive_sqlcipher_key,
     load_or_create_seed,
 )
@@ -90,8 +89,6 @@ def test_db_file_created(tmp_path):
 
 def test_db_not_readable_without_key(tmp_path):
     """aun.db 不能用普通 sqlite3 打开（SQLCipher 加密验证）。"""
-    if not SQLCIPHER_AVAILABLE:
-        pytest.skip("SQLCipher 未安装，跳过加密验证")
     db = _make_db(tmp_path)
     db.get_schema_version()
     db.close()
@@ -316,6 +313,86 @@ def test_concurrent_writes_no_corruption(tmp_path):
     assert errors == []
     assert len(db.load_prekeys()) == 20
     db.close()
+
+
+def test_get_conn_recovers_from_disk_io_error_and_removes_journal(tmp_path, monkeypatch):
+    db = _make_db(tmp_path)
+    db_path = tmp_path / "aun.db"
+    journal_path = tmp_path / "aun.db-journal"
+    db_path.write_bytes(b"")
+    journal_path.write_bytes(b"stale-journal")
+
+    class _Conn:
+        def close(self):
+            return None
+
+    attempts = {"count": 0}
+
+    def _open_and_init():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("disk I/O error")
+        return _Conn()
+
+    monkeypatch.setattr(db, "_open_and_init", _open_and_init)
+
+    conn = db._get_conn()
+
+    assert isinstance(conn, _Conn)
+    assert attempts["count"] == 2
+    assert not db_path.exists()
+    assert not journal_path.exists()
+    db.close()
+
+
+def test_open_and_init_falls_back_to_exclusive_locking(tmp_path, monkeypatch):
+    db = _make_db(tmp_path)
+    calls = []
+
+    class _Cursor:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self, fail_init: bool):
+            self.fail_init = fail_init
+            self.closed = False
+
+        def execute(self, stmt, params=None):
+            calls.append(stmt)
+            if self.fail_init and stmt.startswith("CREATE TABLE IF NOT EXISTS _schema_version"):
+                raise RuntimeError("disk I/O error")
+            if stmt.startswith("SELECT version FROM _schema_version"):
+                return _Cursor(None)
+            return _Cursor()
+
+        def commit(self):
+            calls.append("COMMIT")
+
+        def close(self):
+            self.closed = True
+            calls.append("CLOSE")
+
+    created = {"count": 0}
+
+    def _fake_connect(*args, **kwargs):
+        created["count"] += 1
+        return _Conn(fail_init=created["count"] == 1)
+
+    import aun_core.keystore.sqlcipher_db as module
+    monkeypatch.setattr(module._sqlite_mod, "connect", _fake_connect)
+
+    conn = db._open_and_init()
+
+    assert created["count"] == 2
+    assert db._use_exclusive_locking is True
+    assert isinstance(conn, _Conn)
+    assert "PRAGMA journal_mode = WAL" in calls
+    assert "PRAGMA locking_mode = EXCLUSIVE" in calls
+    assert "PRAGMA journal_mode = DELETE" in calls
 
 
 # ── 持久化验证 ───────────────────────────────────────────────

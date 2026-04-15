@@ -112,6 +112,7 @@ class _GatewayState:
     rejected_tokens: set[str]
     refresh_to_aid: dict[str, str]
     connect_tokens: list[str]
+    connect_requests: list[dict]
     refresh_calls: list[str]
     downloaded_certs: list[str]
     next_token_id: int = 0
@@ -156,6 +157,7 @@ async def local_gateway(tmp_path) -> LocalGateway:
         rejected_tokens=set(),
         refresh_to_aid={},
         connect_tokens=[],
+        connect_requests=[],
         refresh_calls=[],
         downloaded_certs=[],
     )
@@ -221,6 +223,7 @@ async def local_gateway(tmp_path) -> LocalGateway:
                 elif method == "auth.connect":
                     token = str(params.get("auth", {}).get("token") or "")
                     state.connect_tokens.append(token)
+                    state.connect_requests.append(dict(params))
                     status = "ok" if token in state.accepted_tokens and token not in state.rejected_tokens else "denied"
                     result = {"status": status}
                 elif method == "meta.ping":
@@ -303,8 +306,6 @@ def _make_client(tmp_path, gateway: LocalGateway) -> AUNClient:
     client = AUNClient({
         "aun_path": str(tmp_path / "aun"),
         "root_ca_path": gateway.root_ca_path,
-        "verify_ssl": False,
-        "sqlite_backup": False,
     })
     client._gateway_url = gateway.ws_url
     return client
@@ -326,12 +327,26 @@ async def test_local_gateway_full_auth_and_connect(tmp_path, local_gateway: Loca
         assert auth["access_token"].startswith("access-")
         assert auth["refresh_token"].startswith("refresh-")
 
-        await client.connect(auth, {"auto_reconnect": False, "heartbeat_interval": 0})
+        await client.connect({
+            **auth,
+            "slot_id": "slot-a",
+            "delivery_mode": "queue",
+            "queue_routing": "sender_affinity",
+            "affinity_ttl_ms": 600,
+        }, {"auto_reconnect": False, "heartbeat_interval": 0})
         assert client.state == "connected"
 
         pong = await client.call("meta.ping", {})
         assert pong["pong"] is True
         assert any(token == auth["access_token"] for token in local_gateway.state.connect_tokens)
+        connect_request = local_gateway.state.connect_requests[-1]
+        assert connect_request["device"] == {"id": client._device_id, "type": "sdk"}
+        assert connect_request["client"] == {"slot_id": "slot-a"}
+        assert connect_request["delivery_mode"] == {
+            "mode": "queue",
+            "routing": "sender_affinity",
+            "affinity_ttl_ms": 600,
+        }
     finally:
         await client.close()
 
@@ -350,12 +365,12 @@ async def test_create_aid_recovers_missing_cert_via_download(tmp_path, local_gat
             "public_key_der_b64": identity["public_key_der_b64"],
             "curve": identity["curve"],
         })
-        metadata = {
+        remaining = {
             key: value
             for key, value in identity.items()
             if key not in {"private_key_pem", "public_key_der_b64", "curve", "cert"}
         }
-        client2._keystore.save_metadata(aid, metadata)
+        client2._keystore.save_identity(aid, remaining)
 
         recovered = await client2.auth.create_aid({"aid": aid})
         restored = client2._keystore.load_identity(aid)

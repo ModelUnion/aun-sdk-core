@@ -175,7 +175,7 @@
 <!-- ━━ SDK 加载与逻辑 ━━ -->
 <script type="module">
 // ── SDK 加载 ────────────────────────────────────────
-import * as AUN from '../../dist/aun-core-browser.js';
+import * as AUN from '../../dist/index.js';
 window.AUN = AUN;
 
 // ── 状态 ────────────────────────────────────────────
@@ -257,11 +257,7 @@ async function runStep(btnId, name, fn) {
 // ── 客户端工厂 ──────────────────────────────────────
 function makeClient(tag) {
   const gw = document.getElementById('gatewayInput').value.trim();
-  const opts = {
-    verify_ssl: false,
-    require_forward_secrecy: false,
-  };
-  if (gw) opts.gateway = gw;
+  const opts = {};
   log('dim', '创建客户端 [' + tag + ']', { gateway: gw || '(自动发现)' });
   return new AUN.AUNClient(opts);
 }
@@ -320,11 +316,19 @@ window.stepConnect = async function() {
   if (!aliceAuth || !bobAuth) { log('error', '请先完成认证'); return; }
 
   await runStep('btn-connect', 'Alice 连接 Gateway', async () => {
-    await alice.connect(aliceAuth);
+    const params = { ...aliceAuth };
+    if (document.getElementById('gatewayInput').value.trim()) {
+      params.gateway = document.getElementById('gatewayInput').value.trim();
+    }
+    await alice.connect(params);
     return { state: alice.state, gateway: alice.gatewayUrl };
   });
   await runStep('btn-connect', 'Bob 连接 Gateway', async () => {
-    await bob.connect(bobAuth);
+    const params = { ...bobAuth };
+    if (document.getElementById('gatewayInput').value.trim()) {
+      params.gateway = document.getElementById('gatewayInput').value.trim();
+    }
+    await bob.connect(params);
     return { state: bob.state, gateway: bob.gatewayUrl };
   });
   setStatus('已连接 | Alice: ' + alice.aid + ' | Bob: ' + bob.aid);

@@ -123,8 +123,7 @@ ws.send(JSON.stringify({
           content_type: 'application/pdf'
         }
       ]
-    },
-    persist: true
+    }
   }
 }));
 ```

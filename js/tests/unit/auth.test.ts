@@ -6,7 +6,7 @@ import { AuthFlow } from '../../src/auth.js';
 import { CryptoProvider } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
 import { StateError } from '../../src/errors.js';
-import type { IdentityRecord, JsonObject, KeyPairRecord, MetadataRecord } from '../../src/types.js';
+import type { IdentityRecord, JsonObject, KeyPairRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 
@@ -15,20 +15,18 @@ const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'funct
 function createMockKeyStore(): KeyStore {
   const keyPairs = new Map<string, KeyPairRecord>();
   const certs = new Map<string, string>();
-  const metadata = new Map<string, MetadataRecord>();
+  const identities = new Map<string, IdentityRecord>();
   return {
     async loadKeyPair(aid) { return keyPairs.get(aid) ?? null; },
     async saveKeyPair(aid, kp) { keyPairs.set(aid, kp); },
     async loadCert(aid) { return certs.get(aid) ?? null; },
     async saveCert(aid, cert) { certs.set(aid, cert); },
-    async loadMetadata(aid) { return metadata.get(aid) ?? null; },
-    async saveMetadata(aid, md) { metadata.set(aid, { ...md }); },
     async loadIdentity(aid) {
       const kp = keyPairs.get(aid);
-      if (!kp) return null;
+      const id = identities.get(aid);
+      if (!kp && !id) return null;
       const cert = certs.get(aid);
-      const md = metadata.get(aid);
-      return { ...kp, ...(md ?? {}), ...(cert ? { cert } : {}) };
+      return { ...(kp ?? {}), ...(id ?? {}), ...(cert ? { cert } : {}) };
     },
     async saveIdentity(aid, identity) {
       const kp: KeyPairRecord = {};
@@ -37,13 +35,7 @@ function createMockKeyStore(): KeyStore {
       }
       if (Object.keys(kp).length) keyPairs.set(aid, kp);
       if (identity.cert) certs.set(aid, identity.cert as string);
-      const md: MetadataRecord = {};
-      for (const [k, v] of Object.entries(identity)) {
-        if (!['private_key_pem', 'public_key_der_b64', 'curve', 'cert'].includes(k)) {
-          md[k] = v;
-        }
-      }
-      if (Object.keys(md).length) metadata.set(aid, md);
+      identities.set(aid, { ...(identities.get(aid) ?? {}), ...identity });
     },
   };
 }

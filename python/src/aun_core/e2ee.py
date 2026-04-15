@@ -90,93 +90,68 @@ AAD_MATCH_FIELDS_GROUP = (
 )
 
 
-def _update_keystore_metadata(
-    keystore: Any,
-    aid: str,
-    updater: Any,
-) -> dict[str, Any]:
-    update_fn = getattr(keystore, "update_metadata", None)
-    if callable(update_fn):
-        return update_fn(aid, updater)
-
-    metadata = keystore.load_metadata(aid) or {}
-    working = copy.deepcopy(metadata)
-    updated = updater(working)
-    if updated is None:
-        updated = working
-    keystore.save_metadata(aid, updated)
-    return updated
-
 
 def _load_keystore_prekeys(
     keystore: Any,
     aid: str,
+    device_id: str = "",
 ) -> dict[str, dict[str, Any]]:
     load_fn = getattr(keystore, "load_e2ee_prekeys", None)
     if callable(load_fn):
-        result = load_fn(aid)
+        try:
+            result = load_fn(aid, device_id=device_id)
+        except TypeError:
+            try:
+                result = load_fn(aid, device_id)
+            except TypeError:
+                result = load_fn(aid)
         return result if isinstance(result, dict) else {}
-    metadata = keystore.load_metadata(aid) or {}
-    prekeys = metadata.get("e2ee_prekeys", {})
-    return prekeys if isinstance(prekeys, dict) else {}
+    raise AttributeError("keystore 缺少 load_e2ee_prekeys 方法")
 
 
 def _save_keystore_prekey(
     keystore: Any,
     aid: str,
+    device_id: str,
     prekey_id: str,
     prekey_data: dict[str, Any],
 ) -> None:
     save_fn = getattr(keystore, "save_e2ee_prekey", None)
     if callable(save_fn):
-        save_fn(aid, prekey_id, prekey_data)
+        try:
+            save_fn(aid, prekey_id, prekey_data, device_id=device_id)
+        except TypeError:
+            try:
+                save_fn(aid, prekey_id, prekey_data, device_id)
+            except TypeError:
+                save_fn(aid, prekey_id, prekey_data)
         return
 
-    def _store(metadata: dict[str, Any]) -> dict[str, Any]:
-        local_prekeys = metadata.get("e2ee_prekeys", {})
-        local_prekeys[prekey_id] = copy.deepcopy(prekey_data)
-        metadata["e2ee_prekeys"] = local_prekeys
-        return metadata
-
-    _update_keystore_metadata(keystore, aid, _store)
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 save_e2ee_prekey 方法")
 
 
 def _cleanup_keystore_prekeys(
     keystore: Any,
     aid: str,
+    device_id: str,
     cutoff_ms: int,
     keep_latest: int = PREKEY_MIN_KEEP_COUNT,
 ) -> list[str]:
     cleanup_fn = getattr(keystore, "cleanup_e2ee_prekeys", None)
     if callable(cleanup_fn):
         try:
-            result = cleanup_fn(aid, cutoff_ms, keep_latest)
+            result = cleanup_fn(aid, cutoff_ms, keep_latest, device_id=device_id)
         except TypeError:
-            result = cleanup_fn(aid, cutoff_ms)
+            try:
+                result = cleanup_fn(aid, cutoff_ms, keep_latest, device_id)
+            except TypeError:
+                try:
+                    result = cleanup_fn(aid, cutoff_ms, keep_latest)
+                except TypeError:
+                    result = cleanup_fn(aid, cutoff_ms)
         return result if isinstance(result, list) else []
 
-    expired: list[str] = []
-
-    def _cleanup(metadata: dict[str, Any]) -> dict[str, Any]:
-        local_prekeys = metadata.get("e2ee_prekeys", {})
-        if not local_prekeys:
-            return metadata
-        latest_ids = _latest_prekey_ids(local_prekeys, keep_latest)
-        expired.extend(
-            pid for pid, data in local_prekeys.items()
-            if (
-                isinstance(data, dict)
-                and _prekey_created_marker(data) < cutoff_ms
-                and pid not in latest_ids
-            )
-        )
-        for pid in expired:
-            local_prekeys.pop(pid, None)
-        metadata["e2ee_prekeys"] = local_prekeys
-        return metadata
-
-    _update_keystore_metadata(keystore, aid, _cleanup)
-    return expired
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 cleanup_e2ee_prekeys 方法")
 
 
 def _load_keystore_group_state(
@@ -188,12 +163,8 @@ def _load_keystore_group_state(
     if callable(load_fn):
         result = load_fn(aid, group_id)
         return result if isinstance(result, dict) else None
-    metadata = keystore.load_metadata(aid) or {}
-    group_secrets = metadata.get("group_secrets", {})
-    if not isinstance(group_secrets, dict):
-        return None
-    entry = group_secrets.get(group_id)
-    return entry if isinstance(entry, dict) else None
+
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 load_group_secret_state 方法")
 
 
 def _save_keystore_group_state(
@@ -207,13 +178,7 @@ def _save_keystore_group_state(
         save_fn(aid, group_id, entry)
         return
 
-    def _store(metadata: dict[str, Any]) -> dict[str, Any]:
-        group_secrets = metadata.setdefault("group_secrets", {})
-        group_secrets[group_id] = copy.deepcopy(entry)
-        metadata["group_secrets"] = group_secrets
-        return metadata
-
-    _update_keystore_metadata(keystore, aid, _store)
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 save_group_secret_state 方法")
 
 
 def _load_all_keystore_group_states(
@@ -224,9 +189,8 @@ def _load_all_keystore_group_states(
     if callable(load_fn):
         result = load_fn(aid)
         return result if isinstance(result, dict) else {}
-    metadata = keystore.load_metadata(aid) or {}
-    group_secrets = metadata.get("group_secrets", {})
-    return group_secrets if isinstance(group_secrets, dict) else {}
+
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 load_all_group_secret_states 方法")
 
 
 def _cleanup_keystore_group_old_epochs(
@@ -240,38 +204,7 @@ def _cleanup_keystore_group_old_epochs(
         result = cleanup_fn(aid, group_id, cutoff_ms)
         return int(result or 0)
 
-    removed = 0
-
-    def _cleanup_marker(entry: Any) -> int:
-        if not isinstance(entry, dict):
-            return 0
-        updated_at = entry.get("updated_at")
-        if isinstance(updated_at, (int, float)):
-            return int(updated_at)
-        expires_at = entry.get("expires_at")
-        if isinstance(expires_at, (int, float)):
-            return int(expires_at)
-        return 0
-
-    def _cleanup(metadata: dict[str, Any]) -> dict[str, Any]:
-        nonlocal removed
-        group_secrets = metadata.get("group_secrets", {})
-        entry = group_secrets.get(group_id)
-        if entry is None:
-            return metadata
-
-        old_epochs = entry.get("old_epochs", [])
-        if not old_epochs:
-            return metadata
-
-        remaining = [e for e in old_epochs if _cleanup_marker(e) >= cutoff_ms]
-        removed = len(old_epochs) - len(remaining)
-        if removed > 0:
-            entry["old_epochs"] = remaining
-        return metadata
-
-    _update_keystore_metadata(keystore, aid, _cleanup)
-    return removed
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 cleanup_group_old_epochs_state 方法")
 
 
 class E2EEManager:
@@ -286,20 +219,25 @@ class E2EEManager:
         self,
         *,
         identity_fn: Any,
+        device_id_fn: Any | None = None,
         keystore: Any,
         prekey_cache_ttl: float = 3600.0,
         replay_window_seconds: int = 300,
     ) -> None:
         self._identity_fn = identity_fn
+        self._device_id_fn = device_id_fn or (lambda: "")
         self._keystore_ref = keystore
-        # 本地防重放 seen set
-        self._seen_messages: dict[str, bool] = {}
+        # 本地防重放 seen set（值为 timestamp，支持 TTL 清理）
+        self._seen_messages: dict[str, float] = {}
         self._seen_max_size = 50000
+        self._seen_ttl = 300.0  # 5 分钟 TTL
         # 对方 prekey 内存缓存（TTL 默认 1 小时）
         self._prekey_cache: dict[str, tuple[dict[str, Any], float]] = {}
         self._prekey_cache_ttl = prekey_cache_ttl
         # 本地 prekey 私钥内存缓存 {prekey_id: EllipticCurvePrivateKey}
         self._local_prekey_cache: dict[str, ec.EllipticCurvePrivateKey] = {}
+        # 已知不可恢复的 prekey_id（避免重复 warning）
+        self._missing_prekey_ids: set[str] = set()
         # 防重放时间窗口（秒）
         self._replay_window_seconds = replay_window_seconds
 
@@ -332,7 +270,7 @@ class E2EEManager:
             timestamp=timestamp,
         )
 
-    def decrypt_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def decrypt_message(self, message: dict[str, Any], *, source: str = "") -> dict[str, Any] | None:
         """解密单条消息（便利方法，内置本地防重放 + timestamp 窗口）。"""
         payload = message.get("payload")
         if not isinstance(payload, dict):
@@ -365,13 +303,15 @@ class E2EEManager:
             seen_key = f"{from_aid}:{message_id}"
             if seen_key in self._seen_messages:
                 return None  # 重放消息
-            self._seen_messages[seen_key] = True
+            self._seen_messages[seen_key] = _time_mod.time()
             self._trim_seen_set()
 
-        return self._decrypt_message(message)
+        return self._decrypt_message(message, source=source)
 
     def _should_decrypt_for_current_aid(self, message: dict[str, Any], payload: dict[str, Any]) -> bool:
         """仅解密发给当前 AID 的消息，避免发送端回显消息误走接收端解密流程。"""
+        if str(message.get("direction") or "").strip().lower() == "outbound_sync":
+            return True
         current_aid = self._current_aid()
         if not current_aid:
             return True
@@ -385,6 +325,12 @@ class E2EEManager:
         return str(target_aid) == str(current_aid)
 
     def _trim_seen_set(self) -> None:
+        # 先按 TTL 清理过期条目
+        now = _time_mod.time()
+        expired = [k for k, t in self._seen_messages.items() if now - t > self._seen_ttl]
+        for k in expired:
+            del self._seen_messages[k]
+        # 再按数量上限裁剪
         if len(self._seen_messages) > self._seen_max_size:
             trim_count = len(self._seen_messages) - int(self._seen_max_size * 0.8)
             keys = list(self._seen_messages.keys())[:trim_count]
@@ -539,7 +485,7 @@ class E2EEManager:
         nonce = secrets.token_bytes(12)
         aesgcm = AESGCM(message_key)
 
-        sender_fingerprint = self._local_identity_fingerprint()
+        sender_fingerprint = self._local_cert_sha256_fingerprint() or self._local_identity_fingerprint()
         recipient_fingerprint = self._fingerprint_cert_pem(peer_cert_pem)
         ephemeral_pk_b64 = base64.b64encode(ephemeral_public_bytes).decode("ascii")
         aad = {
@@ -622,7 +568,7 @@ class E2EEManager:
         nonce = secrets.token_bytes(12)
         aesgcm = AESGCM(message_key)
 
-        sender_fingerprint = self._local_identity_fingerprint()
+        sender_fingerprint = self._local_cert_sha256_fingerprint() or self._local_identity_fingerprint()
         recipient_fingerprint = self._fingerprint_cert_pem(peer_cert_pem)
         ephemeral_pk_b64 = base64.b64encode(ephemeral_public_bytes).decode("ascii")
         aad = {
@@ -670,7 +616,12 @@ class E2EEManager:
         if not from_aid:
             raise E2EEDecryptFailedError("from_aid missing in message")
 
-        sender_cert_pem = self._get_sender_cert(from_aid)
+        sender_cert_fingerprint = str(
+            payload.get("sender_cert_fingerprint")
+            or (payload.get("aad") or {}).get("sender_cert_fingerprint")
+            or ""
+        ).strip().lower()
+        sender_cert_pem = self._get_sender_cert(from_aid, sender_cert_fingerprint or None)
         if sender_cert_pem is None:
             raise E2EEDecryptFailedError(f"sender cert not found for {from_aid}")
 
@@ -692,12 +643,15 @@ class E2EEManager:
         except Exception as exc:
             raise E2EEDecryptFailedError(f"sender signature verification failed: {exc}")
 
-    def _get_sender_cert(self, aid: str) -> bytes | None:
+    def _get_sender_cert(self, aid: str, cert_fingerprint: str | None = None) -> bytes | None:
         """从 keystore 或缓存获取发送方证书"""
         keystore = self._keystore()
         if keystore is None:
             return None
-        cert_pem = keystore.load_cert(aid)
+        try:
+            cert_pem = keystore.load_cert(aid, cert_fingerprint)
+        except TypeError:
+            cert_pem = keystore.load_cert(aid)
         if cert_pem:
             return cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem
         return None
@@ -718,7 +672,7 @@ class E2EEManager:
             _e2ee_log.warning("加载发送方 %s 证书公钥失败: %s", aid, exc)
         return None
 
-    def _decrypt_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def _decrypt_message(self, message: dict[str, Any], *, source: str = "") -> dict[str, Any] | None:
         payload = message["payload"]
         if isinstance(payload, dict) and not self._should_decrypt_for_current_aid(message, payload):
             return message
@@ -732,14 +686,14 @@ class E2EEManager:
             return None
 
         if encryption_mode == MODE_PREKEY_ECDH_V2:
-            return self._decrypt_message_prekey_v2(message)
+            return self._decrypt_message_prekey_v2(message, source=source)
         elif encryption_mode == MODE_LONG_TERM_KEY:
             return self._decrypt_message_long_term(message)
         else:
             _e2ee_log.warning("不支持的加密模式: %s", encryption_mode)
             return None
 
-    def _decrypt_message_prekey_v2(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def _decrypt_message_prekey_v2(self, message: dict[str, Any], *, source: str = "") -> dict[str, Any] | None:
         """解密 prekey_ecdh_v2 模式的消息（四路 ECDH：prekey + identity + sender_identity）"""
         payload = message["payload"]
         try:
@@ -754,6 +708,13 @@ class E2EEManager:
                 raise E2EEError("Keystore unavailable")
             prekey_private_key = self._load_prekey_private_key(keystore, prekey_id)
             if prekey_private_key is None:
+                src_tag = f" [{source}]" if source else ""
+                if prekey_id not in self._missing_prekey_ids:
+                    self._missing_prekey_ids.add(prekey_id)
+                    _e2ee_log.warning("prekey 私钥不存在（不可恢复）%s: prekey_id=%s mid=%s seq=%s from=%s",
+                                      src_tag, prekey_id,
+                                      message.get("message_id", "?"), message.get("seq", "?"),
+                                      message.get("from", "?"))
                 raise E2EEError(f"prekey not found: {prekey_id}")
 
             # 加载接收方自己的 identity 私钥
@@ -811,10 +772,11 @@ class E2EEManager:
             }
             return transformed
         except E2EEError as exc:
-            _e2ee_log.warning("prekey_ecdh_v2 解密失败 (E2EE): %s", exc)
+            src_tag = f"[{source}] " if source else ""
+            _e2ee_log.debug("%sprekey_ecdh_v2 解密失败: %s", src_tag, exc)
             return None
         except Exception as exc:
-            _e2ee_log.warning("prekey_ecdh_v2 解密失败: %s", exc)
+            _e2ee_log.warning("prekey_ecdh_v2 解密异常: %s", exc)
             return None
 
     def _decrypt_message_long_term(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -927,6 +889,7 @@ class E2EEManager:
         aid = self._current_aid()
         if not aid:
             raise E2EEError("AID unavailable for prekey generation")
+        device_id = self._current_device_id()
 
         # 生成新 prekey
         private_key = ec.generate_private_key(ec.SECP256R1())
@@ -951,6 +914,7 @@ class E2EEManager:
         _save_keystore_prekey(
             keystore,
             aid,
+            device_id,
             prekey_id,
             {
                 "private_key_pem": private_key_pem,
@@ -958,12 +922,13 @@ class E2EEManager:
                 "updated_at": now_ms,
             },
         )
+        _e2ee_log.info("prekey 生成并保存: prekey_id=%s aid=%s device_id=%s", prekey_id, aid, device_id)
 
         # 内存缓存私钥（即使磁盘 metadata 被覆盖也不丢）
         self._local_prekey_cache[prekey_id] = private_key
 
         # 清理超过保留窗口且不在最新 7 个内的旧 prekey 私钥
-        self._cleanup_expired_prekeys(keystore, aid)
+        self._cleanup_expired_prekeys(keystore, aid, device_id)
 
         result = {
             "prekey_id": prekey_id,
@@ -974,13 +939,15 @@ class E2EEManager:
         cert_fingerprint = self._local_cert_sha256_fingerprint()
         if cert_fingerprint:
             result["cert_fingerprint"] = cert_fingerprint
+        if device_id:
+            result["device_id"] = device_id
         return result
 
-    def _cleanup_expired_prekeys(self, keystore: Any, aid: str) -> None:
+    def _cleanup_expired_prekeys(self, keystore: Any, aid: str, device_id: str = "") -> None:
         """清理本地超过保留窗口且不在最新 7 个内的 prekey 私钥"""
         now_ms = int(_time_mod.time() * 1000)
         cutoff_ms = now_ms - PREKEY_RETENTION_SECONDS * 1000
-        expired = _cleanup_keystore_prekeys(keystore, aid, cutoff_ms, PREKEY_MIN_KEEP_COUNT)
+        expired = _cleanup_keystore_prekeys(keystore, aid, device_id, cutoff_ms, PREKEY_MIN_KEEP_COUNT)
         for pid in expired:
             self._local_prekey_cache.pop(pid, None)  # 同步清理内存缓存
 
@@ -989,56 +956,61 @@ class E2EEManager:
         # 优先从内存缓存获取（不受磁盘 metadata 覆盖影响）
         cached = self._local_prekey_cache.get(prekey_id)
         if cached is not None:
+            _e2ee_log.debug("prekey %s 从内存缓存命中", prekey_id)
             return cached
 
         aid = self._current_aid()
         if not aid:
+            _e2ee_log.warning("prekey %s 查找失败: AID 不可用", prekey_id)
             return None
-        prekeys = _load_keystore_prekeys(keystore, aid)
+        device_id = self._current_device_id()
+        prekeys = _load_keystore_prekeys(keystore, aid, device_id)
+        _e2ee_log.debug("prekey %s keystore 查找: aid=%s device_id=%s 本地prekey总数=%d 命中=%s",
+                        prekey_id, aid, device_id, len(prekeys), prekey_id in prekeys)
         prekey_data = prekeys.get(prekey_id)
+        if not prekey_data and device_id:
+            # 回退：按 prekey_id 精确查找，不限 device_id（兼容旧数据）
+            loader = getattr(keystore, "load_prekey_by_id", None)
+            if callable(loader):
+                prekey_data = loader(prekey_id)
+                if prekey_data:
+                    _e2ee_log.info("prekey %s 通过 load_prekey_by_id 回退命中", prekey_id)
+            if not prekey_data:
+                # 再回退：加载全部 prekey（无 device_id 参数的旧 keystore）
+                try:
+                    prekeys_all = _load_keystore_prekeys(keystore, aid, "")
+                    prekey_data = prekeys_all.get(prekey_id)
+                    if prekey_data:
+                        _e2ee_log.info("prekey %s 在 device_id='' 回退查找中命中", prekey_id)
+                except Exception:
+                    pass
         if not prekey_data:
             return None
         private_key_pem = prekey_data.get("private_key_pem")
         if not private_key_pem:
             return None
 
-        # 尝试加密存储（向后兼容）
-        key_pair = keystore.load_key_pair(aid)
-        if key_pair and "private_key_pem" in key_pair:
-            identity_key_hash = hashes.Hash(hashes.SHA256())
-            identity_key_hash.update(key_pair["private_key_pem"].encode("utf-8"))
-            encryption_password = identity_key_hash.finalize()[:32]
-            try:
-                pk = serialization.load_pem_private_key(
-                    private_key_pem.encode("utf-8"), password=encryption_password
-                )
-                if isinstance(pk, ec.EllipticCurvePrivateKey):
-                    self._local_prekey_cache[prekey_id] = pk  # 回填内存缓存
-                    return pk
-            except Exception as exc:
-                _e2ee_log.debug("prekey %s 加密格式加载失败: %s", prekey_id, exc)
-
         try:
             pk = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
             if isinstance(pk, ec.EllipticCurvePrivateKey):
-                self._local_prekey_cache[prekey_id] = pk  # 回填内存缓存
+                self._local_prekey_cache[prekey_id] = pk
                 return pk
         except Exception as exc:
-            _e2ee_log.debug("prekey %s 明文格式加载失败: %s", prekey_id, exc)
-        _e2ee_log.warning("prekey %s 私钥加载失败，所有格式均不可用", prekey_id)
+            _e2ee_log.warning("prekey %s 私钥 PEM 加载失败: %s", prekey_id, exc)
+        return None
         return None
 
     # ── 证书指纹工具 ────────────────────────────────────────
 
     @classmethod
     def _fingerprint_cert_pem(cls, cert_pem: bytes) -> str:
-        """从 PEM 证书计算公钥指纹"""
+        """从 PEM 证书计算证书 SHA-256 指纹"""
         cert_bytes = cert_pem if isinstance(cert_pem, bytes) else cert_pem.encode("utf-8")
         cert = x509.load_pem_x509_certificate(cert_bytes)
-        return cls._fingerprint_public_key(cert.public_key())
+        return cls._certificate_sha256_fingerprint(cert)
 
     def _local_cert_fingerprint(self) -> str:
-        return self._local_identity_fingerprint()
+        return self._local_cert_sha256_fingerprint() or self._local_identity_fingerprint()
 
     def _local_cert_sha256_fingerprint(self) -> str:
         identity = self._identity_fn()
@@ -1108,6 +1080,13 @@ class E2EEManager:
         aid = identity.get("aid")
         return str(aid) if aid else None
 
+    def _current_device_id(self) -> str:
+        try:
+            device_id = self._device_id_fn()
+        except Exception:
+            return ""
+        return str(device_id or "").strip()
+
     def _keystore(self) -> Any | None:
         return self._keystore_ref
 
@@ -1151,6 +1130,7 @@ def encrypt_group_message(
     message_id: str,
     timestamp: int,
     sender_private_key_pem: str | None = None,
+    sender_cert_pem: bytes | str | None = None,
 ) -> dict[str, Any]:
     """加密群组消息，返回 e2ee.group_encrypted 信封。
 
@@ -1197,13 +1177,11 @@ def encrypt_group_message(
             sign_payload = ciphertext + tag + _aad_bytes_group(aad)
             sig = pk.sign(sign_payload, ec.ECDSA(hashes.SHA256()))
             envelope["sender_signature"] = base64.b64encode(sig).decode("ascii")
-            # 公钥指纹便于接收方查找证书
-            pub_der = pk.public_key().public_bytes(
-                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-            fp = hashes.Hash(hashes.SHA256())
-            fp.update(pub_der)
-            envelope["sender_cert_fingerprint"] = f"sha256:{fp.finalize().hex()}"
+            if sender_cert_pem:
+                sender_cert = x509.load_pem_x509_certificate(
+                    sender_cert_pem.encode("utf-8") if isinstance(sender_cert_pem, str) else sender_cert_pem
+                )
+                envelope["sender_cert_fingerprint"] = E2EEManager._certificate_sha256_fingerprint(sender_cert)
         except Exception as exc:
             _e2ee_log.warning("群消息发送方签名失败: %s", exc)
 
@@ -1985,12 +1963,14 @@ class GroupE2EEManager:
         # 获取发送方私钥用于签名
         identity = self._identity_fn()
         sender_pk_pem = identity.get("private_key_pem") if identity else None
+        sender_cert_pem = identity.get("cert") if identity else None
         return encrypt_group_message(
             group_id=group_id, epoch=secret_data["epoch"], group_secret=secret_data["secret"],
             payload=payload, from_aid=aid,
             message_id=message_id or f"gm-{uuid.uuid4()}",
             timestamp=timestamp or int(_time_mod.time() * 1000),
             sender_private_key_pem=sender_pk_pem,
+            sender_cert_pem=sender_cert_pem,
         )
 
     def decrypt(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any] | None:
@@ -2127,3 +2107,11 @@ class GroupE2EEManager:
 
     def _keystore(self) -> Any:
         return self._keystore_ref
+
+    def clean_expired_caches(self) -> None:
+        """清理过期的 prekey 缓存条目（供外部定时调用）"""
+        now = _time_mod.time()
+        for k in list(self._prekey_cache):
+            _, expire_at = self._prekey_cache[k]
+            if now >= expire_at:
+                del self._prekey_cache[k]

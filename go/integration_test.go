@@ -5,6 +5,9 @@ package aun
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,12 +21,12 @@ import (
 // makeClient 创建一个测试用 AUN 客户端，使用临时目录隔离测试数据。
 func makeClient(t *testing.T) *AUNClient {
 	t.Helper()
-	tmpDir := t.TempDir()
-	return NewClient(map[string]any{
-		"aun_path":                tmpDir,
-		"verify_ssl":             false,
-		"require_forward_secrecy": false,
-	})
+	t.Setenv("AUN_ENV", "development")
+	client := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	}, true)
+	client.configModel.RequireForwardSecrecy = false
+	return client
 }
 
 // ensureConnected 注册 AID、认证并连接到 Gateway。
@@ -67,7 +70,6 @@ func sdkSend(t *testing.T, client *AUNClient, toAID string, payload map[string]a
 		"to":      toAID,
 		"payload": payload,
 		"encrypt": true,
-		"persist": true,
 	})
 	if err != nil {
 		t.Fatalf("发送消息失败: %v", err)
@@ -174,6 +176,146 @@ func sdkRecvPull(t *testing.T, client *AUNClient, fromAID string, afterSeq int) 
 		}
 	}
 	return result
+}
+
+func currentMaxSeq(t *testing.T, client *AUNClient, limit int) int {
+	t.Helper()
+	if limit <= 0 {
+		limit = 200
+	}
+	afterSeq := 0
+	maxSeq := 0
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pullResult, err := client.Call(ctx, "message.pull", map[string]any{
+			"after_seq": afterSeq,
+			"limit":     limit,
+		})
+		cancel()
+		if err != nil {
+			t.Fatalf("获取当前最大 seq 失败: %v", err)
+		}
+		pullMap, _ := pullResult.(map[string]any)
+		if pullMap == nil {
+			return maxSeq
+		}
+		msgs, _ := pullMap["messages"].([]any)
+		if len(msgs) == 0 {
+			return maxSeq
+		}
+		for _, m := range msgs {
+			msg, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			seq := int(toInt64(msg["seq"]))
+			if seq > maxSeq {
+				maxSeq = seq
+			}
+		}
+		if len(msgs) < limit {
+			return maxSeq
+		}
+		afterSeq = maxSeq
+	}
+}
+
+func waitForSDKPullMessage(
+	t *testing.T,
+	client *AUNClient,
+	fromAID string,
+	afterSeq int,
+	expectedText string,
+	timeout time.Duration,
+) map[string]any {
+	t.Helper()
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var lastMessages []map[string]any
+	for time.Now().Before(deadline) {
+		messages := sdkRecvPull(t, client, fromAID, afterSeq)
+		lastMessages = messages
+		for _, msg := range messages {
+			payload, _ := msg["payload"].(map[string]any)
+			if payload == nil {
+				continue
+			}
+			if text, _ := payload["text"].(string); text == expectedText {
+				return msg
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("等待消息超时: text=%q from=%s last_messages=%#v", expectedText, fromAID, lastMessages)
+	return nil
+}
+
+func makeIsolatedClient(t *testing.T, root string, slotID string) *AUNClient {
+	t.Helper()
+	t.Setenv("AUN_ENV", "development")
+	client := NewClient(map[string]any{
+		"aun_path": root,
+	})
+	client.configModel.RequireForwardSecrecy = false
+	if slotID != "" {
+		client.slotID = slotID
+	}
+	return client
+}
+
+func copyIdentityTree(t *testing.T, sourceRoot, targetRoot, aid string) {
+	t.Helper()
+	sourceIdentity := filepath.Join(sourceRoot, "AIDs", aid)
+	if _, err := os.Stat(sourceIdentity); err != nil {
+		t.Fatalf("identity source missing: %s (%v)", sourceIdentity, err)
+	}
+	if err := os.MkdirAll(filepath.Join(targetRoot, "AIDs"), 0o755); err != nil {
+		t.Fatalf("创建目标 AIDs 目录失败: %v", err)
+	}
+	sourceSeed := filepath.Join(sourceRoot, ".seed")
+	if data, err := os.ReadFile(sourceSeed); err == nil {
+		if err := os.WriteFile(filepath.Join(targetRoot, ".seed"), data, 0o600); err != nil {
+			t.Fatalf("复制 .seed 失败: %v", err)
+		}
+	}
+	copyDirRecursive(t, sourceIdentity, filepath.Join(targetRoot, "AIDs", aid))
+}
+
+func copyDirRecursive(t *testing.T, source, target string) {
+	t.Helper()
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		t.Fatalf("读取目录失败: %s (%v)", source, err)
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("创建目录失败: %s (%v)", target, err)
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(source, entry.Name())
+		dstPath := filepath.Join(target, entry.Name())
+		if entry.IsDir() {
+			copyDirRecursive(t, srcPath, dstPath)
+			continue
+		}
+		srcFile, err := os.Open(srcPath)
+		if err != nil {
+			t.Fatalf("打开源文件失败: %s (%v)", srcPath, err)
+		}
+		dstFile, err := os.Create(dstPath)
+		if err != nil {
+			srcFile.Close()
+			t.Fatalf("创建目标文件失败: %s (%v)", dstPath, err)
+		}
+		if _, err := io.Copy(dstFile, srcFile); err != nil {
+			dstFile.Close()
+			srcFile.Close()
+			t.Fatalf("复制文件失败: %s -> %s (%v)", srcPath, dstPath, err)
+		}
+		dstFile.Close()
+		srcFile.Close()
+	}
 }
 
 // assertDecrypted 断言消息已加密且 payload 匹配
@@ -546,4 +688,229 @@ func TestIntegrationPushThenPullNoDuplicate(t *testing.T) {
 		}
 	}
 	t.Logf("push=%d, pull_encrypted=%d", pushCount, pullEncrypted)
+}
+
+// TestIntegrationSameAIDMultiSlotAckIsolation 同一 AID 不同 slot 的 pull/ack 互不污染。
+func TestIntegrationSameAIDMultiSlotAckIsolation(t *testing.T) {
+	rid := runID()
+	sender := makeClient(t)
+	sharedRoot := t.TempDir()
+	receiverSlotA := makeIsolatedClient(t, sharedRoot, "slot-a")
+	receiverSlotB := makeIsolatedClient(t, sharedRoot, "slot-b")
+	defer sender.Close()
+	defer receiverSlotA.Close()
+	defer receiverSlotB.Close()
+
+	sAID := ensureConnected(t, sender, fmt.Sprintf("e2ee-slot-s-%s.agentid.pub", rid))
+	rAID := ensureConnected(t, receiverSlotA, fmt.Sprintf("e2ee-slot-r-%s.agentid.pub", rid))
+	ensureConnected(t, receiverSlotB, rAID)
+
+	baseSeqA := currentMaxSeq(t, receiverSlotA, 200)
+	baseSeqB := currentMaxSeq(t, receiverSlotB, 200)
+	if baseSeqA != baseSeqB {
+		t.Fatalf("slot 基线不一致: %d != %d", baseSeqA, baseSeqB)
+	}
+
+	expectedSlots := map[string]bool{"slot-a": true, "slot-b": true}
+	var ackMu sync.Mutex
+	ackEvents := make([]map[string]any, 0, 2)
+	ackDone := make(chan struct{}, 1)
+
+	sub := sender.On("message.ack", func(payload any) {
+		data, ok := payload.(map[string]any)
+		if !ok {
+			return
+		}
+		if getStr(data, "to", "") != rAID {
+			return
+		}
+		slotID := strings.TrimSpace(getStr(data, "slot_id", ""))
+		if !expectedSlots[slotID] {
+			return
+		}
+		ackMu.Lock()
+		ackEvents = append(ackEvents, data)
+		seen := map[string]bool{}
+		for _, item := range ackEvents {
+			seen[strings.TrimSpace(getStr(item, "slot_id", ""))] = true
+		}
+		complete := len(seen) == len(expectedSlots)
+		ackMu.Unlock()
+		if complete {
+			select {
+			case ackDone <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer sub.Unsubscribe()
+
+	uniqueText := fmt.Sprintf("slot_isolation_%d", time.Now().UnixMilli())
+	sdkSend(t, sender, rAID, map[string]any{"text": uniqueText})
+
+	msgA := waitForSDKPullMessage(t, receiverSlotA, sAID, baseSeqA, uniqueText, 15*time.Second)
+	msgB := waitForSDKPullMessage(t, receiverSlotB, sAID, baseSeqB, uniqueText, 15*time.Second)
+	assertDecrypted(t, msgA, map[string]any{"text": uniqueText}, "slot-a")
+	assertDecrypted(t, msgB, map[string]any{"text": uniqueText}, "slot-b")
+
+	seqA := int(toInt64(msgA["seq"]))
+	seqB := int(toInt64(msgB["seq"]))
+	if seqA != seqB {
+		t.Fatalf("同 AID 不同 slot 的 seq 应一致: %d != %d", seqA, seqB)
+	}
+
+	ctxAckA, cancelAckA := context.WithTimeout(context.Background(), 10*time.Second)
+	ackAResult, err := receiverSlotA.Call(ctxAckA, "message.ack", map[string]any{"seq": seqA})
+	cancelAckA()
+	if err != nil {
+		t.Fatalf("slot-a ack 失败: %v", err)
+	}
+	ctxAckB, cancelAckB := context.WithTimeout(context.Background(), 10*time.Second)
+	ackBResult, err := receiverSlotB.Call(ctxAckB, "message.ack", map[string]any{"seq": seqB})
+	cancelAckB()
+	if err != nil {
+		t.Fatalf("slot-b ack 失败: %v", err)
+	}
+	ackAMap, _ := ackAResult.(map[string]any)
+	ackBMap, _ := ackBResult.(map[string]any)
+	if int(toInt64(ackAMap["ack_seq"])) != seqA {
+		t.Fatalf("slot-a ack_seq 不正确: %#v", ackAMap)
+	}
+	if int(toInt64(ackBMap["ack_seq"])) != seqB {
+		t.Fatalf("slot-b ack_seq 不正确: %#v", ackBMap)
+	}
+
+	timer := time.NewTimer(5 * time.Second)
+	select {
+	case <-ackDone:
+	case <-timer.C:
+		t.Fatalf("等待双 slot ack 事件超时: %#v", ackEvents)
+	}
+	timer.Stop()
+
+	ackMu.Lock()
+	defer ackMu.Unlock()
+	slotsSeen := map[string]bool{}
+	deviceIDs := map[string]bool{}
+	for _, item := range ackEvents {
+		slotsSeen[strings.TrimSpace(getStr(item, "slot_id", ""))] = true
+		deviceIDs[strings.TrimSpace(getStr(item, "device_id", ""))] = true
+	}
+	if len(slotsSeen) != len(expectedSlots) {
+		t.Fatalf("ack 事件 slot 集合不完整: %#v", slotsSeen)
+	}
+	if len(deviceIDs) != 1 || deviceIDs[""] {
+		t.Fatalf("ack 事件 device_id 异常: %#v", deviceIDs)
+	}
+}
+
+// TestIntegrationMultiDeviceRecipientAndSelfSync 同一 AID 多设备 fanout + 发件同步副本。
+func TestIntegrationMultiDeviceRecipientAndSelfSync(t *testing.T) {
+	t.Setenv("AUN_ENV", "development")
+	root := t.TempDir()
+	aliceSeedRoot := filepath.Join(root, "alice-seed")
+	aliceSyncRoot := filepath.Join(root, "alice-sync")
+	bobSeedRoot := filepath.Join(root, "bob-seed")
+	bobSyncRoot := filepath.Join(root, "bob-sync")
+
+	aliceSeed := makeIsolatedClient(t, aliceSeedRoot, "")
+	bobSeed := makeIsolatedClient(t, bobSeedRoot, "")
+	defer aliceSeed.Close()
+	defer bobSeed.Close()
+
+	rid := runID()
+	aliceAID := ensureConnected(t, aliceSeed, fmt.Sprintf("e2ee-md-a-%s.agentid.pub", rid))
+	bobAID := ensureConnected(t, bobSeed, fmt.Sprintf("e2ee-md-b-%s.agentid.pub", rid))
+	copyIdentityTree(t, aliceSeedRoot, aliceSyncRoot, aliceAID)
+	copyIdentityTree(t, bobSeedRoot, bobSyncRoot, bobAID)
+
+	aliceSync := makeIsolatedClient(t, aliceSyncRoot, "")
+	bobSync := makeIsolatedClient(t, bobSyncRoot, "")
+	defer aliceSync.Close()
+	defer bobSync.Close()
+
+	ensureConnected(t, aliceSync, aliceAID)
+	ensureConnected(t, bobSync, bobAID)
+	time.Sleep(1 * time.Second)
+
+	baseMain := currentMaxSeq(t, bobSeed, 200)
+	baseSync := currentMaxSeq(t, bobSync, 200)
+	baseAliceSync := currentMaxSeq(t, aliceSync, 200)
+	text := fmt.Sprintf("multi_device_sync_%d", time.Now().UnixMilli())
+	sdkSend(t, aliceSeed, bobAID, map[string]any{"text": text, "kind": "multi-device"})
+
+	mainMsg := waitForSDKPullMessage(t, bobSeed, aliceAID, baseMain, text, 20*time.Second)
+	syncMsg := waitForSDKPullMessage(t, bobSync, aliceAID, baseSync, text, 20*time.Second)
+	aliceSyncMsg := waitForSDKPullMessage(t, aliceSync, aliceAID, baseAliceSync, text, 20*time.Second)
+	assertDecrypted(t, mainMsg, map[string]any{"text": text, "kind": "multi-device"}, "bob-main")
+	assertDecrypted(t, syncMsg, map[string]any{"text": text, "kind": "multi-device"}, "bob-sync")
+	assertDecrypted(t, aliceSyncMsg, map[string]any{"text": text, "kind": "multi-device"}, "alice-sync")
+	if getStr(mainMsg, "direction", "") != "inbound" {
+		t.Fatalf("主设备消息 direction 不正确: %#v", mainMsg["direction"])
+	}
+	if getStr(syncMsg, "direction", "") != "inbound" {
+		t.Fatalf("同步设备消息 direction 不正确: %#v", syncMsg["direction"])
+	}
+	if getStr(aliceSyncMsg, "direction", "") != "outbound_sync" {
+		t.Fatalf("发送同步副本 direction 不正确: %#v", aliceSyncMsg["direction"])
+	}
+}
+
+// TestIntegrationMultiDeviceOfflinePull 多设备场景下离线设备重连后能补拉自己的设备副本。
+func TestIntegrationMultiDeviceOfflinePull(t *testing.T) {
+	t.Setenv("AUN_ENV", "development")
+	root := t.TempDir()
+	aliceSeedRoot := filepath.Join(root, "alice-seed")
+	bobSeedRoot := filepath.Join(root, "bob-seed")
+	aliceMainRoot := filepath.Join(root, "alice-main")
+	bobPhoneRoot := filepath.Join(root, "bob-phone")
+	bobLaptopRoot := filepath.Join(root, "bob-laptop")
+
+	seedAlice := makeIsolatedClient(t, aliceSeedRoot, "")
+	seedBob := makeIsolatedClient(t, bobSeedRoot, "")
+	defer seedAlice.Close()
+	defer seedBob.Close()
+
+	rid := runID()
+	aliceAID := ensureConnected(t, seedAlice, fmt.Sprintf("e2ee-off-a-%s.agentid.pub", rid))
+	bobAID := ensureConnected(t, seedBob, fmt.Sprintf("e2ee-off-b-%s.agentid.pub", rid))
+	copyIdentityTree(t, aliceSeedRoot, aliceMainRoot, aliceAID)
+	copyIdentityTree(t, bobSeedRoot, bobPhoneRoot, bobAID)
+	copyIdentityTree(t, bobSeedRoot, bobLaptopRoot, bobAID)
+	seedAlice.Close()
+	seedBob.Close()
+
+	aliceMain := makeIsolatedClient(t, aliceMainRoot, "")
+	bobPhone := makeIsolatedClient(t, bobPhoneRoot, "")
+	bobLaptop := makeIsolatedClient(t, bobLaptopRoot, "")
+	defer aliceMain.Close()
+	defer bobPhone.Close()
+
+	ensureConnected(t, aliceMain, aliceAID)
+	ensureConnected(t, bobPhone, bobAID)
+	ensureConnected(t, bobLaptop, bobAID)
+	time.Sleep(1 * time.Second)
+
+	offlineBase := currentMaxSeq(t, bobLaptop, 200)
+	onlineBase := currentMaxSeq(t, bobPhone, 200)
+	bobLaptop.Close()
+	time.Sleep(1 * time.Second)
+
+	text := fmt.Sprintf("multi_device_offline_%d", time.Now().UnixMilli())
+	sdkSend(t, aliceMain, bobAID, map[string]any{"text": text, "kind": "offline-pull"})
+
+	onlineMsg := waitForSDKPullMessage(t, bobPhone, aliceAID, onlineBase, text, 15*time.Second)
+	assertDecrypted(t, onlineMsg, map[string]any{"text": text, "kind": "offline-pull"}, "bob-phone-online")
+	if getStr(onlineMsg, "direction", "") != "inbound" {
+		t.Fatalf("在线设备消息 direction 不正确: %#v", onlineMsg["direction"])
+	}
+
+	bobLaptop = makeIsolatedClient(t, bobLaptopRoot, "")
+	defer bobLaptop.Close()
+	ensureConnected(t, bobLaptop, bobAID)
+	offlineMsg := waitForSDKPullMessage(t, bobLaptop, aliceAID, offlineBase, text, 15*time.Second)
+	assertDecrypted(t, offlineMsg, map[string]any{"text": text, "kind": "offline-pull"}, "bob-laptop-offline")
+	if getStr(offlineMsg, "direction", "") != "inbound" {
+		t.Fatalf("离线补拉消息 direction 不正确: %#v", offlineMsg["direction"])
+	}
 }

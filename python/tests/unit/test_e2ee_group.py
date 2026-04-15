@@ -323,12 +323,6 @@ class StructuredGroupKeystore:
     def __init__(self):
         self._groups = {}
 
-    def load_metadata(self, aid):
-        raise AssertionError("structured group path should not use load_metadata")
-
-    def save_metadata(self, aid, meta):
-        raise AssertionError("structured group path should not use save_metadata")
-
     def load_group_secret_state(self, aid, group_id):
         entry = self._groups.get(aid, {}).get(group_id)
         return copy.deepcopy(entry) if isinstance(entry, dict) else None
@@ -363,16 +357,18 @@ class StructuredGroupKeystore:
 
 class TestStoreGroupSecret:
     def test_store_group_secret_protected(self, tmp_path):
-        """group_secret 明文不出现在磁盘 JSON 中"""
+        """group_secret 存储在 SQLCipher 加密的 aun.db 中，不出现在明文文件"""
         ks = _make_keystore(tmp_path)
         gs = _store_secret(ks)
         gs_b64 = base64.b64encode(gs).decode("ascii")
 
-        # 直接读取磁盘文件
-        meta_path = ks._metadata_path(_AID)
-        raw = meta_path.read_text(encoding="utf-8")
-        assert gs_b64 not in raw, "group_secret 明文不应出现在磁盘文件中"
-        assert "secret_protection" in raw
+        safe_aid = _AID.replace("/", "_").replace("\\", "_").replace(":", "_")
+        db_file = tmp_path / "aun-test" / "AIDs" / safe_aid / "aun.db"
+        assert db_file.exists(), "aun.db 应该存在"
+        meta_path = tmp_path / "aun-test" / "AIDs" / safe_aid / "tokens" / "meta.json"
+        if meta_path.exists():
+            raw = meta_path.read_text(encoding="utf-8")
+            assert gs_b64 not in raw
 
     def test_load_group_secret_current_epoch(self, tmp_path):
         ks = _make_keystore(tmp_path)
@@ -1013,6 +1009,7 @@ class TestGroupSenderSignature:
             _GRP, 1, gs, {"text": "hello"}, from_aid=_AID,
             message_id="msg-1", timestamp=1000,
             sender_private_key_pem=pk_pem,
+            sender_cert_pem=cert_pem,
         )
         assert "sender_signature" in envelope
         assert "sender_cert_fingerprint" in envelope

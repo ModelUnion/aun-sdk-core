@@ -73,7 +73,7 @@ def _get_signing_identity(aid: str):
 
 def _make_client(tmp_path, aid=_AID_ALICE):
     """创建一个 mock 好的 AUNClient 用于测试。"""
-    client = AUNClient({"aun_path": str(tmp_path / "aun"), "sqlite_backup": False})
+    client = AUNClient({"aun_path": str(tmp_path / "aun")})
     client._aid = aid
     client._identity = {"aid": aid, "private_key_pem": "", "cert": ""}
     client._state = "connected"
@@ -279,7 +279,7 @@ class TestKeyRequestAutoResponded:
 class TestConfigGroupE2EEDisabled:
     def test_config_defaults(self, tmp_path):
         """默认 group_e2ee=True（必选能力）"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun"), "sqlite_backup": False})
+        client = AUNClient({"aun_path": str(tmp_path / "aun")})
         assert client._config_model.group_e2ee is True
         assert client._config_model.rotate_on_join is False
         assert client._config_model.epoch_auto_rotate_interval == 0
@@ -291,7 +291,6 @@ class TestConfigGroupE2EEDisabled:
             "aun_path": str(tmp_path / "aun"),
             "rotate_on_join": True,
             "epoch_auto_rotate_interval": 86400,
-            "sqlite_backup": False,
         })
         assert client._config_model.group_e2ee is True
         assert client._config_model.rotate_on_join is True
@@ -700,7 +699,6 @@ class TestAutoOrchestrationAddMember:
         client = AUNClient({
             "aun_path": str(tmp_path / "aun"),
             "rotate_on_join": True,
-            "sqlite_backup": False,
         })
         client._aid = _AID_ALICE
         client._identity = {"aid": _AID_ALICE}

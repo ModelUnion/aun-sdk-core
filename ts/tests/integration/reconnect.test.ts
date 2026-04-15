@@ -14,13 +14,14 @@ import { AUNClient } from '../../src/index.js';
 import type { JsonObject, Message } from '../../src/types.js';
 
 const DOCKER_COMPOSE_DIR = path.resolve(__dirname, '../../../../docker-deploy');
+process.env.AUN_ENV ??= 'development';
 
 function makeClient(): AUNClient {
-  return new AUNClient({
+  const client = new AUNClient({
     aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-')),
-    verify_ssl: false,
-    require_forward_secrecy: false,
   });
+  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  return client;
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
@@ -149,8 +150,8 @@ describe('断线重连集成测试', () => {
     const r = rid();
     const client = new AUNClient({
       aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-ex-')),
-      verify_ssl: false,
     });
+    ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
     clients.push(client);
     const states: string[] = [];
     client.on('connection.state', (d: any) => states.push(d.state));

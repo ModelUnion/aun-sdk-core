@@ -1,7 +1,6 @@
 package aun
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,31 +20,12 @@ func testNewFileKeyStoreWithSQLite(t *testing.T) *keystore.FileKeyStore {
 
 func testNewFileKeyStoreWithSQLiteAndDir(t *testing.T, dir string) (*keystore.FileKeyStore, string) {
 	t.Helper()
-	backup := keystore.NewSQLiteBackup(filepath.Join(dir, ".aun_backup", "aun_backup.db"))
-	t.Cleanup(func() {
-		backup.Close()
-	})
-	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed", backup)
+	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("创建带 SQLite 的 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 FileKeyStore 失败: %v", err)
 	}
+	t.Cleanup(func() { ks.Close() })
 	return ks, dir
-}
-
-func testSeedMetaOnly(t *testing.T, root, aid string, metadata map[string]any) {
-	t.Helper()
-	safeAid := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(aid)
-	metaDir := filepath.Join(root, "AIDs", safeAid, "tokens")
-	if err := os.MkdirAll(metaDir, 0o700); err != nil {
-		t.Fatalf("创建 meta 目录失败: %v", err)
-	}
-	data, err := json.Marshal(metadata)
-	if err != nil {
-		t.Fatalf("序列化 meta-only 数据失败: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metaDir, "meta.json"), data, 0o600); err != nil {
-		t.Fatalf("写入 meta-only 文件失败: %v", err)
-	}
 }
 
 // ── FileSecretStore 测试 ─────────────────────────────────
@@ -147,6 +127,7 @@ func testNewFileKeyStore(t *testing.T) keystore.KeyStore {
 	if err != nil {
 		t.Fatalf("创建 FileKeyStore 失败: %v", err)
 	}
+	t.Cleanup(func() { ks.Close() })
 	return ks
 }
 
@@ -189,9 +170,11 @@ func TestFileKeyStore_KeyPairSurvivesRestart(t *testing.T) {
 		"curve":              "P-256",
 	}
 	_ = ks1.SaveKeyPair(aid, kp)
+	ks1.Close()
 
 	// 模拟重启
 	ks2, _ := keystore.NewFileKeyStore(dir, nil, "seed")
+	t.Cleanup(func() { ks2.Close() })
 	loaded, err := ks2.LoadKeyPair(aid)
 	if err != nil {
 		t.Fatalf("重启后 LoadKeyPair 失败: %v", err)
@@ -219,6 +202,66 @@ func TestFileKeyStore_SaveLoadCert(t *testing.T) {
 	}
 	if loaded != certPEM {
 		t.Errorf("证书不匹配: %s", loaded)
+	}
+}
+
+func TestFileKeyStore_SaveLoadCertVersion(t *testing.T) {
+	dir := t.TempDir()
+	ks, err := keystore.NewFileKeyStore(dir, nil, "seed")
+	if err != nil {
+		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+	}
+	t.Cleanup(func() { ks.Close() })
+	aid := "versioned-cert.example"
+
+	priv1, _, _ := testGenerateECKeypair(t)
+	cert1 := testMakeSelfSignedCert(t, priv1, aid)
+	fp1, err := certSHA256Fingerprint([]byte(cert1))
+	if err != nil {
+		t.Fatalf("计算 cert1 指纹失败: %v", err)
+	}
+	if err := ks.SaveCertVersion(aid, cert1, fp1, false); err != nil {
+		t.Fatalf("SaveCertVersion(cert1) 失败: %v", err)
+	}
+
+	versioned1, err := ks.LoadCertVersion(aid, fp1)
+	if err != nil {
+		t.Fatalf("LoadCertVersion(cert1) 失败: %v", err)
+	}
+	if versioned1 != cert1 {
+		t.Fatalf("版本化证书内容不匹配")
+	}
+	active, err := ks.LoadCert(aid)
+	if err != nil {
+		t.Fatalf("LoadCert 失败: %v", err)
+	}
+	if active != "" {
+		t.Fatalf("makeActive=false 时 active cert 应为空: %q", active)
+	}
+
+	priv2, _, _ := testGenerateECKeypair(t)
+	cert2 := testMakeSelfSignedCert(t, priv2, aid)
+	fp2, err := certSHA256Fingerprint([]byte(cert2))
+	if err != nil {
+		t.Fatalf("计算 cert2 指纹失败: %v", err)
+	}
+	if err := ks.SaveCertVersion(aid, cert2, fp2, true); err != nil {
+		t.Fatalf("SaveCertVersion(cert2) 失败: %v", err)
+	}
+
+	versioned2, err := ks.LoadCertVersion(aid, fp2)
+	if err != nil {
+		t.Fatalf("LoadCertVersion(cert2) 失败: %v", err)
+	}
+	if versioned2 != cert2 {
+		t.Fatalf("active 版本化证书内容不匹配")
+	}
+	active, err = ks.LoadCert(aid)
+	if err != nil {
+		t.Fatalf("LoadCert(active) 失败: %v", err)
+	}
+	if active != cert2 {
+		t.Fatalf("makeActive=true 时应同步更新 active cert")
 	}
 }
 
@@ -254,13 +297,14 @@ func TestFileKeyStore_SaveLoadIdentity(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters 验证原子 metadata 更新不会互相覆盖
-func TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters(t *testing.T) {
+// TestFileKeyStore_UpdateInstanceStateSerializesConcurrentWriters 验证原子 instance state 更新不会互相覆盖
+func TestFileKeyStore_UpdateInstanceStateSerializesConcurrentWriters(t *testing.T) {
 	dir := t.TempDir()
 	ks, err := keystore.NewFileKeyStore(dir, nil, "atomic-seed")
 	if err != nil {
 		t.Fatalf("创建 FileKeyStore 失败: %v", err)
 	}
+	t.Cleanup(func() { ks.Close() })
 	aid := "atomic.agent.example"
 
 	firstEntered := make(chan struct{})
@@ -269,16 +313,11 @@ func TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters(t *testing.T) {
 	errCh := make(chan error, 2)
 
 	go func() {
-		_, err := ks.UpdateMetadata(aid, func(metadata map[string]any) (map[string]any, error) {
-			prekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
-			if prekeys == nil {
-				prekeys = make(map[string]any)
-			}
-			prekeys["pk1"] = map[string]any{"private_key_pem": "PK1"}
-			metadata["e2ee_prekeys"] = prekeys
+		_, err := ks.UpdateInstanceState(aid, "device-a", "", func(state map[string]any) (map[string]any, error) {
+			state["field1"] = "value1"
 			close(firstEntered)
 			<-releaseFirst
-			return metadata, nil
+			return state, nil
 		})
 		errCh <- err
 	}()
@@ -286,14 +325,9 @@ func TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters(t *testing.T) {
 	<-firstEntered
 
 	go func() {
-		_, err := ks.UpdateMetadata(aid, func(metadata map[string]any) (map[string]any, error) {
-			prekeys, _ := metadata["e2ee_prekeys"].(map[string]any)
-			if prekeys == nil {
-				prekeys = make(map[string]any)
-			}
-			prekeys["pk2"] = map[string]any{"private_key_pem": "PK2"}
-			metadata["e2ee_prekeys"] = prekeys
-			return metadata, nil
+		_, err := ks.UpdateInstanceState(aid, "device-a", "", func(state map[string]any) (map[string]any, error) {
+			state["field2"] = "value2"
+			return state, nil
 		})
 		if err == nil {
 			close(secondDone)
@@ -303,7 +337,7 @@ func TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters(t *testing.T) {
 
 	select {
 	case <-secondDone:
-		t.Fatal("第二个 updateMetadata 不应在第一个释放前完成")
+		t.Fatal("第二个 UpdateInstanceState 不应在第一个释放前完成")
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -311,36 +345,36 @@ func TestFileKeyStore_UpdateMetadataSerializesConcurrentWriters(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if err := <-errCh; err != nil {
-			t.Fatalf("UpdateMetadata 失败: %v", err)
+			t.Fatalf("UpdateInstanceState 失败: %v", err)
 		}
 	}
 
-	loaded, err := ks.LoadMetadata(aid)
+	loaded, err := ks.LoadInstanceState(aid, "device-a", "")
 	if err != nil {
-		t.Fatalf("LoadMetadata 失败: %v", err)
+		t.Fatalf("LoadInstanceState 失败: %v", err)
 	}
-	prekeys, _ := loaded["e2ee_prekeys"].(map[string]any)
-	if _, ok := prekeys["pk1"]; !ok {
-		t.Fatal("缺少 pk1")
+	if loaded["field1"] != "value1" {
+		t.Fatal("缺少 field1")
 	}
-	if _, ok := prekeys["pk2"]; !ok {
-		t.Fatal("缺少 pk2")
+	if loaded["field2"] != "value2" {
+		t.Fatal("缺少 field2")
 	}
 }
 
 // TestFileKeyStore_SaveIdentityPreservesExistingPrekeys 验证 SaveIdentity 不覆盖已有 prekey
 func TestFileKeyStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
-	ks := testNewFileKeyStore(t)
+	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "identity-preserve.example"
 
-	if err := ks.SaveMetadata(aid, map[string]any{
-		"e2ee_prekeys": map[string]any{
-			"pk1": map[string]any{"private_key_pem": "KEEP_ME"},
-		},
+	// 通过 StructuredKeyStore 接口写入 prekey
+	if err := ks.SaveE2EEPrekey(aid, "pk1", map[string]any{
+		"private_key_pem": "KEEP_ME",
+		"created_at":      time.Now().UnixMilli(),
 	}); err != nil {
-		t.Fatalf("SaveMetadata 失败: %v", err)
+		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
 	}
 
+	// SaveIdentity 写入 token
 	if err := ks.SaveIdentity(aid, map[string]any{
 		"aid":           aid,
 		"access_token":  "tok-new",
@@ -349,15 +383,21 @@ func TestFileKeyStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
 		t.Fatalf("SaveIdentity 失败: %v", err)
 	}
 
-	loaded, err := ks.LoadMetadata(aid)
+	// 验证 token 通过 LoadIdentity 可读
+	loaded, err := ks.LoadIdentity(aid)
 	if err != nil {
-		t.Fatalf("LoadMetadata 失败: %v", err)
+		t.Fatalf("LoadIdentity 失败: %v", err)
 	}
-	prekeys, _ := loaded["e2ee_prekeys"].(map[string]any)
 	if loaded["access_token"] != "tok-new" {
 		t.Fatalf("access_token 未更新: %v", loaded["access_token"])
 	}
-	pk1, _ := prekeys["pk1"].(map[string]any)
+
+	// 验证 prekey 未被覆盖
+	prekeys, err := ks.LoadE2EEPrekeys(aid)
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
+	}
+	pk1 := prekeys["pk1"]
 	if pk1["private_key_pem"] != "KEEP_ME" {
 		t.Fatalf("prekey 被覆盖: %v", pk1["private_key_pem"])
 	}
@@ -386,6 +426,7 @@ func TestFileKeyStore_MultipleAids(t *testing.T) {
 func TestFileKeyStore_PrivateKeyNotPlaintext(t *testing.T) {
 	dir := t.TempDir()
 	ks, _ := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	t.Cleanup(func() { ks.Close() })
 	aid := "test-agent.example"
 	_, privPEM, pubB64 := testGenerateECKeypair(t)
 
@@ -413,23 +454,25 @@ func TestFileKeyStore_PrivateKeyNotPlaintext(t *testing.T) {
 
 // ── Token 持久化测试 ─────────────────────────────────────
 
-// TestTokenPersistence 验证 token 通过 metadata 持久化
+// TestTokenPersistence 验证 token 通过 SaveIdentity 持久化
 func TestTokenPersistence(t *testing.T) {
 	dir := t.TempDir()
 	ks, _ := keystore.NewFileKeyStore(dir, nil, "seed")
+	t.Cleanup(func() { ks.Close() })
 	aid := "test-agent.example"
 
-	metadata := map[string]any{
+	identity := map[string]any{
+		"aid":           aid,
 		"access_token":  "at-12345",
 		"refresh_token": "rt-67890",
 	}
-	if err := ks.SaveMetadata(aid, metadata); err != nil {
-		t.Fatalf("SaveMetadata 失败: %v", err)
+	if err := ks.SaveIdentity(aid, identity); err != nil {
+		t.Fatalf("SaveIdentity 失败: %v", err)
 	}
 
-	loaded, err := ks.LoadMetadata(aid)
+	loaded, err := ks.LoadIdentity(aid)
 	if err != nil {
-		t.Fatalf("LoadMetadata 失败: %v", err)
+		t.Fatalf("LoadIdentity 失败: %v", err)
 	}
 	if loaded["access_token"] != "at-12345" {
 		t.Errorf("access_token 不匹配: %v", loaded["access_token"])
@@ -438,40 +481,35 @@ func TestTokenPersistence(t *testing.T) {
 		t.Errorf("refresh_token 不匹配: %v", loaded["refresh_token"])
 	}
 
-	// 验证 token 不以明文存储
+	// 验证 token 不会回落写入 meta.json
 	metaFile := filepath.Join(dir, "AIDs", "test-agent.example", "tokens", "meta.json")
 	data, _ := os.ReadFile(metaFile)
 	if strings.Contains(string(data), "at-12345") {
-		t.Error("access_token 不应以明文存储")
+		t.Error("access_token 不应出现在 meta.json 中")
 	}
 }
 
 // ── Prekey 持久化测试 ────────────────────────────────────
 
-// TestPrekeyPersistence 验证 prekey 私钥持久化（通过 metadata）
+// TestPrekeyPersistence 验证 prekey 私钥持久化（通过 StructuredKeyStore 接口）
 func TestPrekeyPersistence(t *testing.T) {
-	dir := t.TempDir()
-	ks, _ := keystore.NewFileKeyStore(dir, nil, "seed")
+	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "test-agent.example"
 
-	metadata := map[string]any{
-		"e2ee_prekeys": map[string]any{
-			"pk-001": map[string]any{
-				"private_key_pem": "-----BEGIN PRIVATE KEY-----\nprekey-data\n-----END PRIVATE KEY-----",
-				"created_at":      int64(1700000000000),
-			},
-		},
+	if err := ks.SaveE2EEPrekey(aid, "pk-001", map[string]any{
+		"private_key_pem": "-----BEGIN PRIVATE KEY-----\nprekey-data\n-----END PRIVATE KEY-----",
+		"created_at":      int64(1700000000000),
+	}); err != nil {
+		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
 	}
-	_ = ks.SaveMetadata(aid, metadata)
 
-	loaded, _ := ks.LoadMetadata(aid)
-	prekeys, ok := loaded["e2ee_prekeys"].(map[string]any)
-	if !ok {
-		t.Fatal("加载的 e2ee_prekeys 类型不正确")
+	prekeys, err := ks.LoadE2EEPrekeys(aid)
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
-	pkData, ok := prekeys["pk-001"].(map[string]any)
+	pkData, ok := prekeys["pk-001"]
 	if !ok {
-		t.Fatal("prekey pk-001 不存在或类型不正确")
+		t.Fatal("prekey pk-001 不存在")
 	}
 	if pkData["private_key_pem"] != "-----BEGIN PRIVATE KEY-----\nprekey-data\n-----END PRIVATE KEY-----" {
 		t.Errorf("prekey 私钥不匹配: %v", pkData["private_key_pem"])
@@ -482,30 +520,24 @@ func TestPrekeyPersistence(t *testing.T) {
 
 // TestGroupSecretPersistence 验证 group secret 持久化
 func TestGroupSecretPersistence(t *testing.T) {
-	dir := t.TempDir()
-	ks, _ := keystore.NewFileKeyStore(dir, nil, "seed")
+	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "test-agent.example"
 
-	metadata := map[string]any{
-		"group_secrets": map[string]any{
-			"group-1": map[string]any{
-				"epoch":       1,
-				"secret":      "dGVzdC1zZWNyZXQ=", // base64("test-secret")
-				"commitment":  "abc123",
-				"member_aids": []any{"alice", "bob"},
-			},
-		},
+	if err := ks.SaveGroupSecretState(aid, "group-1", map[string]any{
+		"epoch":       int64(1),
+		"secret":      "dGVzdC1zZWNyZXQ=", // base64("test-secret")
+		"commitment":  "abc123",
+		"member_aids": []any{"alice", "bob"},
+	}); err != nil {
+		t.Fatalf("SaveGroupSecretState 失败: %v", err)
 	}
-	_ = ks.SaveMetadata(aid, metadata)
 
-	loaded, _ := ks.LoadMetadata(aid)
-	gs, ok := loaded["group_secrets"].(map[string]any)
-	if !ok {
-		t.Fatal("group_secrets 类型不正确")
+	g1, err := ks.LoadGroupSecretState(aid, "group-1")
+	if err != nil {
+		t.Fatalf("LoadGroupSecretState 失败: %v", err)
 	}
-	g1, ok := gs["group-1"].(map[string]any)
-	if !ok {
-		t.Fatal("group-1 不存在或类型不正确")
+	if g1 == nil {
+		t.Fatal("group-1 不存在")
 	}
 	if g1["secret"] != "dGVzdC1zZWNyZXQ=" {
 		t.Errorf("group secret 不匹配: %v", g1["secret"])
@@ -513,48 +545,30 @@ func TestGroupSecretPersistence(t *testing.T) {
 }
 
 func TestStructuredPrekeysPrimaryAndRecoverUnexpiredMeta(t *testing.T) {
-	dir := t.TempDir()
-	ks, root := testNewFileKeyStoreWithSQLiteAndDir(t, dir)
+	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "structured-prekeys.example"
-
 	nowMs := time.Now().UnixMilli()
-	testSeedMetaOnly(t, root, aid, map[string]any{
-		"e2ee_prekeys": map[string]any{
-			"pk-recover": map[string]any{
-				"private_key_pem": "META_RECOVER",
-				"created_at":      nowMs,
-				"updated_at":      nowMs,
-				"expires_at":      nowMs + int64(time.Minute/time.Millisecond),
-			},
-			"pk-expired": map[string]any{
-				"private_key_pem": "META_EXPIRED",
-				"created_at":      nowMs - int64(8*24*time.Hour/time.Millisecond),
-				"updated_at":      nowMs - int64(8*24*time.Hour/time.Millisecond),
-				"expires_at":      nowMs - 1,
-			},
-		},
-	})
 
-	if err := ks.SaveE2EEPrekey(aid, "pk-sql", map[string]any{
+	// 直接写入两个 prekey
+	_ = ks.SaveE2EEPrekey(aid, "pk-recover", map[string]any{
+		"private_key_pem": "META_RECOVER",
+		"created_at":      nowMs,
+		"expires_at":      nowMs + int64(time.Minute/time.Millisecond),
+	})
+	_ = ks.SaveE2EEPrekey(aid, "pk-sql", map[string]any{
 		"private_key_pem": "SQLITE_SQL",
 		"created_at":      nowMs,
-	}); err != nil {
-		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
-	}
+	})
 
-	loaded, err := ks.LoadMetadata(aid)
+	prekeys, err := ks.LoadE2EEPrekeys(aid)
 	if err != nil {
-		t.Fatalf("LoadMetadata 失败: %v", err)
+		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
-	prekeys, _ := loaded["e2ee_prekeys"].(map[string]any)
 	if _, ok := prekeys["pk-sql"]; !ok {
-		t.Fatal("缺少 sqlite 主存 prekey")
+		t.Fatal("缺少 pk-sql prekey")
 	}
 	if _, ok := prekeys["pk-recover"]; !ok {
-		t.Fatal("缺少从 meta 回捞的未过期 prekey")
-	}
-	if _, ok := prekeys["pk-expired"]; ok {
-		t.Fatal("过期 prekey 不应被回捞")
+		t.Fatal("缺少 pk-recover prekey")
 	}
 }
 
@@ -563,22 +577,20 @@ func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
 	aid := "structured-prekeys-preserve.example"
 	nowMs := time.Now().UnixMilli()
 
-	if err := ks.SaveMetadata(aid, map[string]any{
-		"e2ee_prekeys": map[string]any{
-			"pk-meta": map[string]any{
-				"private_key_pem": "META_ONLY",
-				"created_at":      nowMs,
-			},
-		},
+	// 先写入一个 prekey
+	if err := ks.SaveE2EEPrekey(aid, "pk-meta", map[string]any{
+		"private_key_pem": "META_ONLY",
+		"created_at":      nowMs,
 	}); err != nil {
-		t.Fatalf("SaveMetadata 失败: %v", err)
+		t.Fatalf("SaveE2EEPrekey(pk-meta) 失败: %v", err)
 	}
 
+	// 再写入另一个 prekey，不应覆盖第一个
 	if err := ks.SaveE2EEPrekey(aid, "pk-new", map[string]any{
 		"private_key_pem": "NEW_ONE",
 		"created_at":      nowMs,
 	}); err != nil {
-		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
+		t.Fatalf("SaveE2EEPrekey(pk-new) 失败: %v", err)
 	}
 
 	prekeys, err := ks.LoadE2EEPrekeys(aid)
@@ -594,41 +606,29 @@ func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
 }
 
 func TestStructuredGroupSecretsPrimaryAndRecoverMetaEpochs(t *testing.T) {
-	dir := t.TempDir()
-	ks, root := testNewFileKeyStoreWithSQLiteAndDir(t, dir)
+	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "structured-group.example"
 	nowMs := time.Now().UnixMilli()
 
-	testSeedMetaOnly(t, root, aid, map[string]any{
-		"group_secrets": map[string]any{
-			"grp-1": map[string]any{
-				"epoch":       2,
-				"secret":      "META_CURRENT",
-				"updated_at":  nowMs,
-				"expires_at":  nowMs + int64(time.Minute/time.Millisecond),
-				"member_aids": []any{"alice"},
-				"old_epochs": []any{
-					map[string]any{
-						"epoch":      1,
-						"secret":     "META_OLD",
-						"updated_at": nowMs,
-						"expires_at": nowMs + int64(time.Minute/time.Millisecond),
-					},
-				},
+	// 写入 group secret（含 old_epochs）
+	_ = ks.SaveGroupSecretState(aid, "grp-1", map[string]any{
+		"epoch":       int64(3),
+		"secret":      "SQLITE_CURRENT",
+		"updated_at":  nowMs,
+		"member_aids": []any{"alice", "bob"},
+		"old_epochs": []any{
+			map[string]any{
+				"epoch":      int64(1),
+				"secret":     "OLD_1",
+				"updated_at": nowMs,
+				"expires_at": nowMs + int64(time.Minute/time.Millisecond),
 			},
-		},
-	})
-
-	backup := keystore.NewSQLiteBackup(filepath.Join(root, ".aun_backup", "aun_backup.db"))
-	t.Cleanup(func() {
-		backup.Close()
-	})
-	backup.ReplaceGroupEntries(aid, map[string]map[string]any{
-		"grp-1": {
-			"epoch":       3,
-			"secret":      "SQLITE_CURRENT",
-			"updated_at":  nowMs + 1000,
-			"member_aids": []any{"alice", "bob"},
+			map[string]any{
+				"epoch":      int64(2),
+				"secret":     "OLD_2",
+				"updated_at": nowMs,
+				"expires_at": nowMs + int64(time.Minute/time.Millisecond),
+			},
 		},
 	})
 
@@ -645,36 +645,61 @@ func TestStructuredGroupSecretsPrimaryAndRecoverMetaEpochs(t *testing.T) {
 	}
 }
 
-// ── Metadata 合并保护测试 ────────────────────────────────
+func TestDeviceScopedPrekeysAllowSamePrekeyAcrossDevices(t *testing.T) {
+	ks := testNewFileKeyStoreWithSQLite(t)
+	aid := "device-prekeys.example"
+	cutoffMs := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
 
-// TestMetadataCriticalFieldsMerge 验证关键 metadata 字段不被覆盖
-func TestMetadataCriticalFieldsMerge(t *testing.T) {
-	dir := t.TempDir()
-	ks, _ := keystore.NewFileKeyStore(dir, nil, "seed")
-	aid := "test.example"
-
-	// 第一次保存包含 e2ee_prekeys
-	meta1 := map[string]any{
-		"e2ee_prekeys": map[string]any{
-			"pk-1": map[string]any{"private_key_pem": "key1"},
-		},
-		"other_field": "value1",
+	if err := ks.SaveE2EEPrekeyForDevice(aid, "phone", "pk-same", map[string]any{
+		"private_key_pem": "PHONE",
+		"created_at":      cutoffMs - 1000,
+	}); err != nil {
+		t.Fatalf("SaveE2EEPrekeyForDevice(phone) 失败: %v", err)
 	}
-	_ = ks.SaveMetadata(aid, meta1)
-
-	// 第二次保存不包含 e2ee_prekeys（应自动合并已有数据）
-	meta2 := map[string]any{
-		"other_field": "value2",
+	if err := ks.SaveE2EEPrekeyForDevice(aid, "laptop", "pk-same", map[string]any{
+		"private_key_pem": "LAPTOP",
+		"created_at":      cutoffMs - 1000,
+	}); err != nil {
+		t.Fatalf("SaveE2EEPrekeyForDevice(laptop) 失败: %v", err)
 	}
-	_ = ks.SaveMetadata(aid, meta2)
 
-	loaded, _ := ks.LoadMetadata(aid)
-	prekeys, ok := loaded["e2ee_prekeys"].(map[string]any)
-	if !ok || prekeys == nil {
-		t.Error("e2ee_prekeys 不应被覆盖丢失")
+	phone, err := ks.LoadE2EEPrekeysForDevice(aid, "phone")
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeysForDevice(phone) 失败: %v", err)
 	}
-	if loaded["other_field"] != "value2" {
-		t.Errorf("other_field 应更新为 value2: %v", loaded["other_field"])
+	laptop, err := ks.LoadE2EEPrekeysForDevice(aid, "laptop")
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeysForDevice(laptop) 失败: %v", err)
+	}
+	legacy, err := ks.LoadE2EEPrekeys(aid)
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
+	}
+	if phone["pk-same"]["private_key_pem"] != "PHONE" {
+		t.Fatalf("phone prekey 不正确: %v", phone["pk-same"]["private_key_pem"])
+	}
+	if laptop["pk-same"]["private_key_pem"] != "LAPTOP" {
+		t.Fatalf("laptop prekey 不正确: %v", laptop["pk-same"]["private_key_pem"])
+	}
+	if len(legacy) != 0 {
+		t.Fatalf("默认 device prekeys 应为空: %v", legacy)
+	}
+
+	removed, err := ks.CleanupE2EEPrekeysForDevice(aid, "phone", cutoffMs, 0)
+	if err != nil {
+		t.Fatalf("CleanupE2EEPrekeysForDevice(phone) 失败: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "pk-same" {
+		t.Fatalf("cleanup 结果不正确: %v", removed)
+	}
+
+	phone, _ = ks.LoadE2EEPrekeysForDevice(aid, "phone")
+	laptop, _ = ks.LoadE2EEPrekeysForDevice(aid, "laptop")
+	if len(phone) != 0 {
+		t.Fatalf("phone prekeys 应被清空: %v", phone)
+	}
+	if laptop["pk-same"]["private_key_pem"] != "LAPTOP" {
+		t.Fatalf("cleanup 不应影响 laptop: %v", laptop["pk-same"]["private_key_pem"])
 	}
 }
 
@@ -697,12 +722,12 @@ func TestFileKeyStore_LoadNonExistent(t *testing.T) {
 		t.Error("加载不存在的证书应返回空字符串")
 	}
 
-	meta, err := ks.LoadMetadata("nonexistent.example")
+	identity, err := ks.LoadIdentity("nonexistent.example")
 	if err != nil {
-		t.Fatalf("加载不存在的元数据不应返回错误: %v", err)
+		t.Fatalf("加载不存在的身份不应返回错误: %v", err)
 	}
-	if meta != nil {
-		t.Error("加载不存在的元数据应返回 nil")
+	if identity != nil {
+		t.Error("加载不存在的身份应返回 nil")
 	}
 }
 
@@ -730,6 +755,7 @@ func TestFileSecretStore_AutoSeed(t *testing.T) {
 func TestFileKeyStore_SaveIdentity_Roundtrip_WithRealKeys(t *testing.T) {
 	dir := t.TempDir()
 	ks, _ := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	t.Cleanup(func() { ks.Close() })
 	aid := "real-agent.example"
 	priv, privPEM, pubB64 := testGenerateECKeypair(t)
 	certPEM := testMakeSelfSignedCert(t, priv, aid)
@@ -757,15 +783,67 @@ func TestFileKeyStore_SaveIdentity_Roundtrip_WithRealKeys(t *testing.T) {
 		t.Errorf("access_token 不匹配: %v", loaded["access_token"])
 	}
 
-	// 验证磁盘上的 meta.json 不包含明文 token
-	metaFile := filepath.Join(dir, "AIDs", "real-agent.example", "tokens", "meta.json")
-	fileData, _ := os.ReadFile(metaFile)
-	var rawMeta map[string]any
-	json.Unmarshal(fileData, &rawMeta)
-	if _, hasPlain := rawMeta["access_token"]; hasPlain {
-		t.Error("磁盘 meta.json 不应包含明文 access_token")
+	// token 存储在 SQLite DB 中，key.json 不含明文私钥
+	keyFile := filepath.Join(dir, "AIDs", "real-agent.example", "private", "key.json")
+	keyData, _ := os.ReadFile(keyFile)
+	if strings.Contains(string(keyData), privPEM) {
+		t.Error("key.json 不应包含明文私钥")
 	}
-	if _, hasProtected := rawMeta["access_token_protection"]; !hasProtected {
-		t.Error("磁盘 meta.json 应包含 access_token_protection")
+	ks.Close()
+}
+
+func TestFileKeyStore_InstanceStateIsolationAndProtection(t *testing.T) {
+	dir := t.TempDir()
+	ks, err := keystore.NewFileKeyStore(dir, nil, "seed")
+	if err != nil {
+		t.Fatalf("创建 FileKeyStore 失败: %v", err)
 	}
+	t.Cleanup(func() { ks.Close() })
+	aid := "instance-state.example"
+
+	if err := ks.SaveInstanceState(aid, "device-a", "", map[string]any{
+		"access_token": "tok-singleton",
+		"kite_token":   "kite-singleton",
+		"updated_at":   int64(1),
+	}); err != nil {
+		t.Fatalf("保存单实例状态失败: %v", err)
+	}
+	if err := ks.SaveInstanceState(aid, "device-a", "slot-2", map[string]any{
+		"access_token": "tok-slot-2",
+		"updated_at":   int64(2),
+	}); err != nil {
+		t.Fatalf("保存多槽位状态失败: %v", err)
+	}
+	if _, err := ks.UpdateInstanceState(aid, "device-a", "slot-2", func(current map[string]any) (map[string]any, error) {
+		current["refresh_token"] = "refresh-slot-2"
+		return current, nil
+	}); err != nil {
+		t.Fatalf("更新多槽位状态失败: %v", err)
+	}
+
+	singleton, err := ks.LoadInstanceState(aid, "device-a", "")
+	if err != nil {
+		t.Fatalf("LoadInstanceState(singleton) 失败: %v", err)
+	}
+	slot2, err := ks.LoadInstanceState(aid, "device-a", "slot-2")
+	if err != nil {
+		t.Fatalf("LoadInstanceState(slot-2) 失败: %v", err)
+	}
+	if singleton["access_token"] != "tok-singleton" {
+		t.Fatalf("singleton access_token 不正确: %v", singleton["access_token"])
+	}
+	if singleton["kite_token"] != "kite-singleton" {
+		t.Fatalf("singleton kite_token 不正确: %v", singleton["kite_token"])
+	}
+	if slot2["access_token"] != "tok-slot-2" {
+		t.Fatalf("slot-2 access_token 不正确: %v", slot2["access_token"])
+	}
+	if slot2["refresh_token"] != "refresh-slot-2" {
+		t.Fatalf("slot-2 refresh_token 不正确: %v", slot2["refresh_token"])
+	}
+	// 验证两个槽位互相隔离
+	if singleton["refresh_token"] != nil {
+		t.Fatal("singleton 不应有 refresh_token")
+	}
+	ks.Close()
 }

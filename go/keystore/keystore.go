@@ -16,15 +16,6 @@ type KeyStore interface {
 	// SaveCert 保存证书（PEM 字符串）
 	SaveCert(aid string, certPEM string) error
 
-	// LoadMetadata 加载元数据（tokens、prekeys 等）
-	LoadMetadata(aid string) (map[string]any, error)
-
-	// SaveMetadata 保存元数据
-	SaveMetadata(aid string, metadata map[string]any) error
-
-	// UpdateMetadata 在同一把锁内完成 load -> mutate -> save（原子更新）
-	UpdateMetadata(aid string, updater func(map[string]any) (map[string]any, error)) (map[string]any, error)
-
 	// LoadIdentity 加载完整身份信息（密钥对 + 证书 + 元数据合并）
 	LoadIdentity(aid string) (map[string]any, error)
 
@@ -61,4 +52,57 @@ type StructuredKeyStore interface {
 
 	// CleanupGroupOldEpochsState 清理单个群组过期的旧 epoch 状态
 	CleanupGroupOldEpochsState(aid, groupID string, cutoffMs int64) (int, error)
+}
+
+// VersionedCertKeyStore 提供按证书指纹加载/保存版本化证书的能力。
+type VersionedCertKeyStore interface {
+	KeyStore
+
+	// LoadCertVersion 按 cert_fingerprint 加载证书版本
+	LoadCertVersion(aid, certFingerprint string) (string, error)
+
+	// SaveCertVersion 保存版本化证书；makeActive=true 时同时更新 active_signing 证书
+	SaveCertVersion(aid, certPEM, certFingerprint string, makeActive bool) error
+}
+
+// InstanceStateStore 提供 device_id / slot_id 维度的实例态持久化能力。
+type InstanceStateStore interface {
+	KeyStore
+
+	// LoadInstanceState 加载实例级状态
+	LoadInstanceState(aid, deviceID, slotID string) (map[string]any, error)
+
+	// SaveInstanceState 保存实例级状态
+	SaveInstanceState(aid, deviceID, slotID string, state map[string]any) error
+
+	// UpdateInstanceState 原子更新实例级状态
+	UpdateInstanceState(
+		aid, deviceID, slotID string,
+		updater func(map[string]any) (map[string]any, error),
+	) (map[string]any, error)
+}
+
+// SessionKeyStore 提供 E2EE session 独立存储能力（对标 Python AIDDatabase.e2ee_sessions 表）。
+type SessionKeyStore interface {
+	KeyStore
+
+	// LoadE2EESessions 加载某个 AID 的全部 E2EE session
+	LoadE2EESessions(aid string) ([]map[string]any, error)
+
+	// SaveE2EESession 保存单个 E2EE session
+	SaveE2EESession(aid, sessionID string, data map[string]any) error
+}
+
+// SeqTrackerStore 提供 seq tracker 结构化存储能力（对标 Python AIDDatabase.seq_tracker 表）。
+type SeqTrackerStore interface {
+	KeyStore
+
+	// SaveSeq 保存单个 namespace 的 contiguous_seq
+	SaveSeq(aid, deviceID, slotID, namespace string, contiguousSeq int) error
+
+	// LoadSeq 加载单个 namespace 的 contiguous_seq
+	LoadSeq(aid, deviceID, slotID, namespace string) (int, error)
+
+	// LoadAllSeqs 加载某 device+slot 下所有 namespace 的 contiguous_seq
+	LoadAllSeqs(aid, deviceID, slotID string) (map[string]int, error)
 }

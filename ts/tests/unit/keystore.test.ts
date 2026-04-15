@@ -11,9 +11,6 @@ import { FileSecretStore } from '../../src/secret-store/file-store.js';
 import { FileKeyStore } from '../../src/keystore/file.js';
 import type {
   GroupOldEpochRecord,
-  GroupSecretMap,
-  JsonObject,
-  PrekeyMap,
 } from '../../src/types.js';
 
 // ── FileSecretStore 测试 ────────────────────────────────────
@@ -135,6 +132,24 @@ describe('FileKeyStore', () => {
     expect(loaded).toBe(certPem);
   });
 
+  it('支持按证书指纹保存和加载证书版本', () => {
+    const ks = new FileKeyStore(tmpDir);
+    const certPem = '-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n';
+    ks.saveCert(
+      'test.aid',
+      certPem,
+      'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      { makeActive: false },
+    );
+
+    const loaded = ks.loadCert(
+      'test.aid',
+      'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    );
+    expect(loaded).toBe(certPem);
+    expect(ks.loadCert('test.aid')).toBeNull();
+  });
+
   it('保存和加载身份信息', () => {
     const ks = new FileKeyStore(tmpDir);
     const identity = {
@@ -204,73 +219,47 @@ describe('FileKeyStore', () => {
     expect(loaded!.private_key_pem).toBe(privPem);
   });
 
-  it('token 不以明文保存在磁盘上', () => {
+  it('token 存取往返正确（存 SQLite）', () => {
     const ks = new FileKeyStore(tmpDir);
-    ks.saveMetadata('token.aid', {
-      access_token: 'secret-token-123',
-      refresh_token: 'refresh-token-456',
-    });
+    const db = (ks as any)._getDB('token.aid');
+    db.setToken('access_token', 'secret-token-123');
+    db.setToken('refresh_token', 'refresh-token-456');
 
-    const metaFilePath = join(tmpDir, 'AIDs', 'token.aid', 'tokens', 'meta.json');
-    expect(existsSync(metaFilePath)).toBe(true);
-    const content = JSON.parse(readFileSync(metaFilePath, 'utf-8'));
-    expect(content.access_token).toBeUndefined();
-    expect(content.refresh_token).toBeUndefined();
-    expect(content.access_token_protection).toBeDefined();
-    expect(content.refresh_token_protection).toBeDefined();
-
-    const loaded = ks.loadMetadata('token.aid');
+    const loaded = ks.loadIdentity('token.aid');
     expect(loaded!.access_token).toBe('secret-token-123');
     expect(loaded!.refresh_token).toBe('refresh-token-456');
+    ks.close();
   });
 
-  it('prekey 私钥不以明文保存在磁盘上', () => {
+  it('prekey 私钥存取往返正确（存 SQLite）', () => {
     const ks = new FileKeyStore(tmpDir);
     const privPem = '-----BEGIN PRIVATE KEY-----\nprekey-secret\n-----END PRIVATE KEY-----';
-    ks.saveMetadata('prekey.aid', {
-      e2ee_prekeys: {
-        'prekey-123': {
-          private_key_pem: privPem,
-          public_key: 'MFkw...',
-          created_at: Date.now(),
-        },
-      },
+    ks.saveE2EEPrekey('prekey.aid', 'prekey-123', {
+      private_key_pem: privPem,
+      public_key: 'MFkw...',
+      created_at: Date.now(),
     });
 
-    const metaFilePath = join(tmpDir, 'AIDs', 'prekey.aid', 'tokens', 'meta.json');
-    const content = JSON.parse(readFileSync(metaFilePath, 'utf-8'));
-    const prekeyData = content.e2ee_prekeys['prekey-123'];
-    expect(prekeyData.private_key_pem).toBeUndefined();
-    expect(prekeyData.private_key_protection).toBeDefined();
-
-    const loaded = ks.loadMetadata('prekey.aid');
-    expect((loaded!.e2ee_prekeys as PrekeyMap)['prekey-123']?.private_key_pem).toBe(privPem);
+    const prekeys = ks.loadE2EEPrekeys('prekey.aid');
+    expect(prekeys['prekey-123']?.private_key_pem).toBe(privPem);
+    ks.close();
   });
 
-  it('group_secret 不以明文保存在磁盘上', () => {
+  it('group_secret 存取往返正确（存 SQLite）', () => {
     const ks = new FileKeyStore(tmpDir);
-    ks.saveMetadata('group.aid', {
-      group_secrets: {
-        'group-1': {
-          epoch: 1,
-          secret: Buffer.from('group-secret-bytes').toString('base64'),
-          commitment: 'abc',
-          member_aids: ['a', 'b'],
-          updated_at: Date.now(),
-          old_epochs: [],
-        },
-      },
+    const secretB64 = Buffer.from('group-secret-bytes').toString('base64');
+    ks.saveGroupSecretState('group.aid', 'group-1', {
+      epoch: 1,
+      secret: secretB64,
+      commitment: 'abc',
+      member_aids: ['a', 'b'],
+      updated_at: Date.now(),
+      old_epochs: [],
     });
 
-    const metaFilePath = join(tmpDir, 'AIDs', 'group.aid', 'tokens', 'meta.json');
-    const content = JSON.parse(readFileSync(metaFilePath, 'utf-8'));
-    const groupData = content.group_secrets['group-1'];
-    expect(groupData.secret).toBeUndefined();
-    expect(groupData.secret_protection).toBeDefined();
-
-    const loaded = ks.loadMetadata('group.aid');
-    const gs = (loaded!.group_secrets as GroupSecretMap)['group-1'];
-    expect(gs.secret).toBe(Buffer.from('group-secret-bytes').toString('base64'));
+    const gs = ks.loadGroupSecretState('group.aid', 'group-1');
+    expect(gs!.secret).toBe(secretB64);
+    ks.close();
   });
 
   it('loadKeyPair 不存在的 AID 返回 null', () => {
@@ -283,9 +272,9 @@ describe('FileKeyStore', () => {
     expect(ks.loadCert('nonexistent')).toBeNull();
   });
 
-  it('loadMetadata 不存在的 AID 返回 null', () => {
+  it('loadIdentity 不存在的 AID 返回 null（原 loadMetadata）', () => {
     const ks = new FileKeyStore(tmpDir);
-    expect(ks.loadMetadata('nonexistent')).toBeNull();
+    expect(ks.loadIdentity('nonexistent')).toBeNull();
   });
 
   it('loadIdentity 不存在的 AID 返回 null', () => {
@@ -294,62 +283,27 @@ describe('FileKeyStore', () => {
   });
 
   it('safeAid 替换特殊字符', () => {
-    expect(FileKeyStore._safeAid('user/domain')).toBe('user_domain');
-    expect(FileKeyStore._safeAid('user\\domain')).toBe('user_domain');
-    expect(FileKeyStore._safeAid('user:domain')).toBe('user_domain');
-    expect(FileKeyStore._safeAid('normal.aid')).toBe('normal.aid');
-  });
-
-  it('metadata 防御性合并：不丢失关键数据', () => {
+    // user/domain, user\domain, user:domain 都映射到同一个 safe AID: user_domain
     const ks = new FileKeyStore(tmpDir);
+    const db1 = (ks as any)._getDB('normal.aid');
+    db1.setMetadata('custom', 'normal');
+    const db2 = (ks as any)._getDB('user/domain');
+    db2.setMetadata('custom', 'slash');
 
-    // 先保存带有 e2ee_prekeys 的 metadata
-    ks.saveMetadata('merge.aid', {
-      e2ee_prekeys: { 'pk-1': { public_key: 'pub1' } },
-      some_field: 'value',
-    });
-
-    // 再保存不包含 e2ee_prekeys 的 metadata
-    ks.saveMetadata('merge.aid', {
-      some_field: 'updated',
-    });
-
-    // e2ee_prekeys 应被自动合并保留
-    const loaded = ks.loadMetadata('merge.aid');
-    expect(loaded!.some_field).toBe('updated');
-    expect(loaded!.e2ee_prekeys).toBeDefined();
-  });
-
-  it('updateMetadata 应基于最新快照追加嵌套 prekey', () => {
-    const ks = new FileKeyStore(tmpDir);
-
-    ks.updateMetadata('atomic.aid', metadata => {
-      metadata.e2ee_prekeys = {
-        ...((metadata.e2ee_prekeys as PrekeyMap | undefined) ?? {}),
-        'pk-1': { private_key_pem: 'PK1' },
-      };
-      return metadata;
-    });
-    ks.updateMetadata('atomic.aid', metadata => {
-      metadata.e2ee_prekeys = {
-        ...((metadata.e2ee_prekeys as PrekeyMap | undefined) ?? {}),
-        'pk-2': { private_key_pem: 'PK2' },
-      };
-      return metadata;
-    });
-
-    const loaded = ks.loadMetadata('atomic.aid');
-    const prekeys = loaded!.e2ee_prekeys as PrekeyMap;
-    expect(prekeys['pk-1'].private_key_pem).toBe('PK1');
-    expect(prekeys['pk-2'].private_key_pem).toBe('PK2');
+    const meta1 = (ks as any)._getDB('normal.aid').getAllMetadata();
+    expect(meta1.custom).toBe('normal');
+    // 同一个 safe AID 下后写覆盖前写
+    const meta2 = (ks as any)._getDB('user/domain').getAllMetadata();
+    expect(meta2.custom).toBe('slash');
+    const meta3 = (ks as any)._getDB('user:domain').getAllMetadata();
+    expect(meta3.custom).toBe('slash');
+    ks.close();
   });
 
   it('saveIdentity 更新 token 时不应覆盖已有 prekey', () => {
     const ks = new FileKeyStore(tmpDir);
-    ks.saveMetadata('identity.aid', {
-      e2ee_prekeys: {
-        'pk-1': { private_key_pem: 'KEEP_ME' },
-      },
+    ks.saveE2EEPrekey('identity.aid', 'pk-1', {
+      private_key_pem: 'KEEP_ME',
     });
 
     ks.saveIdentity('identity.aid', {
@@ -358,11 +312,27 @@ describe('FileKeyStore', () => {
       refresh_token: 'rt-new',
     });
 
-    const loaded = ks.loadMetadata('identity.aid');
-    const prekeys = loaded!.e2ee_prekeys as PrekeyMap;
+    const loaded = ks.loadIdentity('identity.aid');
+    const prekeys = ks.loadE2EEPrekeys('identity.aid');
     expect(loaded!.access_token).toBe('tok-new');
     expect(loaded!.refresh_token).toBe('rt-new');
     expect(prekeys['pk-1'].private_key_pem).toBe('KEEP_ME');
+  });
+
+  it('实例态应按 device_id/slot_id 隔离保存', () => {
+    const ks = new FileKeyStore(tmpDir);
+    ks.saveInstanceState!('instance.aid', 'device-a', '', {
+      access_token: 'tok-a',
+    });
+    ks.saveInstanceState!('instance.aid', 'device-a', 'slot-2', {
+      access_token: 'tok-b',
+    });
+
+    const singleton = ks.loadInstanceState!('instance.aid', 'device-a', '');
+    const slot2 = ks.loadInstanceState!('instance.aid', 'device-a', 'slot-2');
+
+    expect(singleton!.access_token).toBe('tok-a');
+    expect(slot2!.access_token).toBe('tok-b');
   });
 
   it('cleanupE2EEPrekeys 应仅清理超过 7 天且不在最新 7 个里的 prekey', () => {
@@ -391,57 +361,74 @@ describe('FileKeyStore', () => {
     expect(prekeys.current.private_key_pem).toBe('CURRENT');
   });
 
-  it('e2ee_sessions 的 key 被保护', () => {
+  it('device-scoped prekey 应允许同一 prekey_id 并存且 cleanup 只影响目标 device', () => {
     const ks = new FileKeyStore(tmpDir);
-    ks.saveMetadata('session.aid', {
-      e2ee_sessions: [
-        { session_id: 'sess-1', key: 'session-secret-key', peer_aid: 'peer.aid' },
+    const now = Date.now();
+    const cutoffMs = now - (7 * 24 * 3600 * 1000);
+
+    ks.saveE2EEPrekeyForDevice!('device.aid', 'phone', 'pk-same', {
+      private_key_pem: 'PHONE',
+      created_at: cutoffMs - 1000,
+    });
+    ks.saveE2EEPrekeyForDevice!('device.aid', 'laptop', 'pk-same', {
+      private_key_pem: 'LAPTOP',
+      created_at: cutoffMs - 1000,
+    });
+
+    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'phone')).toMatchObject({
+      'pk-same': { private_key_pem: 'PHONE', created_at: cutoffMs - 1000 },
+    });
+    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'laptop')).toMatchObject({
+      'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
+    });
+    expect(ks.loadE2EEPrekeys('device.aid')).toEqual({});
+
+    const removed = ks.cleanupE2EEPrekeysForDevice!('device.aid', 'phone', cutoffMs, 0);
+    expect(removed).toEqual(['pk-same']);
+    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'phone')).toEqual({});
+    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'laptop')).toMatchObject({
+      'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
+    });
+  });
+
+  it('e2ee_sessions 存取往返正确（存 SQLite）', () => {
+    const ks = new FileKeyStore(tmpDir);
+    ks.saveE2EESession!('session.aid', 'sess-1', {
+      key: 'session-secret-key',
+      peer_aid: 'peer.aid',
+    });
+
+    const sessions = ks.loadE2EESessions!('session.aid');
+    expect(sessions[0].key).toBe('session-secret-key');
+    expect(sessions[0].session_id).toBe('sess-1');
+    ks.close();
+  });
+
+  it('old_epochs 存取往返正确（存 SQLite）', () => {
+    const ks = new FileKeyStore(tmpDir);
+    const oldSecretB64 = Buffer.from('old-secret').toString('base64');
+    const newSecretB64 = Buffer.from('new-secret').toString('base64');
+    ks.saveGroupSecretState('epoch.aid', 'group-1', {
+      epoch: 2,
+      secret: newSecretB64,
+      commitment: 'xyz',
+      member_aids: ['a', 'b'],
+      updated_at: Date.now(),
+      old_epochs: [
+        {
+          epoch: 1,
+          secret: oldSecretB64,
+          commitment: 'old-xyz',
+          member_aids: ['a'],
+          updated_at: Date.now() - 10000,
+        },
       ],
     });
 
-    const metaFilePath = join(tmpDir, 'AIDs', 'session.aid', 'tokens', 'meta.json');
-    const content = JSON.parse(readFileSync(metaFilePath, 'utf-8'));
-    const sess = content.e2ee_sessions[0];
-    expect(sess.key).toBeUndefined();
-    expect(sess.key_protection).toBeDefined();
-
-    const loaded = ks.loadMetadata('session.aid');
-    const sessions = loaded!.e2ee_sessions as JsonObject[];
-    expect(sessions[0].key).toBe('session-secret-key');
-  });
-
-  it('old_epochs 中的 secret 也被保护', () => {
-    const ks = new FileKeyStore(tmpDir);
-    ks.saveMetadata('epoch.aid', {
-      group_secrets: {
-        'group-1': {
-          epoch: 2,
-          secret: Buffer.from('new-secret').toString('base64'),
-          commitment: 'xyz',
-          member_aids: ['a', 'b'],
-          updated_at: Date.now(),
-          old_epochs: [
-            {
-              epoch: 1,
-              secret: Buffer.from('old-secret').toString('base64'),
-              commitment: 'old-xyz',
-              member_aids: ['a'],
-              updated_at: Date.now() - 10000,
-            },
-          ],
-        },
-      },
-    });
-
-    const metaFilePath = join(tmpDir, 'AIDs', 'epoch.aid', 'tokens', 'meta.json');
-    const content = JSON.parse(readFileSync(metaFilePath, 'utf-8'));
-    const oldEpoch = content.group_secrets['group-1'].old_epochs[0];
-    expect(oldEpoch.secret).toBeUndefined();
-    expect(oldEpoch.secret_protection).toBeDefined();
-
-    const loaded = ks.loadMetadata('epoch.aid');
-    const gs = (loaded!.group_secrets as GroupSecretMap)['group-1'];
-    const oldEpochs = gs.old_epochs as GroupOldEpochRecord[];
-    expect(oldEpochs[0].secret).toBe(Buffer.from('old-secret').toString('base64'));
+    const gs = ks.loadGroupSecretState('epoch.aid', 'group-1');
+    expect(gs!.secret).toBe(newSecretB64);
+    const oldEpochs = gs!.old_epochs as GroupOldEpochRecord[];
+    expect(oldEpochs[0].secret).toBe(oldSecretB64);
+    ks.close();
   });
 });

@@ -29,7 +29,6 @@ async def main():
         "to": receiver_aid,
         "type": "text",
         "payload": {"text": "你好！"},
-        "persist": True,
     })
     print(f"发送结果: status={result['status']}, seq={result['seq']}")
 
@@ -42,7 +41,6 @@ async def main():
             "text": "这是一条结构化消息",
             "priority": "high",
         },
-        "persist": True,
     })
     print(f"JSON 消息: status={result['status']}, seq={result['seq']}")
 

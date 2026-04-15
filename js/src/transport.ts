@@ -217,7 +217,7 @@ export class RPCTransport {
       const error = new ConnectionError(`websocket closed: code=${event.code} reason=${event.reason}`);
       this._dispatcher.publish('connection.error', { error });
       if (this._onDisconnect) {
-        this._onDisconnect(error).catch(() => {});
+        this._onDisconnect(error).catch(exc => console.warn('[aun_core.transport] disconnect 回调异常:', exc));
       }
     }
   }

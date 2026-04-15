@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 import time
@@ -21,6 +22,8 @@ from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -29,21 +32,62 @@ from aun_core import AUNClient
 
 # ── 配置 ──────────────────────────────────────────────────
 
-_TEST_AUN_PATH = "./.aun_test_reconnect"
+_AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
+
+
+def _default_test_aun_path() -> str:
+    if _AUN_DATA_ROOT:
+        return f"{_AUN_DATA_ROOT}/single-domain/reconnect"
+    return "./.aun_test_reconnect"
+
+
+_TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).strip()
 _DOCKER_COMPOSE_DIR = str(Path(__file__).parent.parent.parent.parent / "docker-deploy")
 _NETWORK_NAME = "docker-deploy_kite-net"
 _CONTAINER_NAME = "kite-app"
+os.environ.setdefault("AUN_ENV", "development")
 
 
 # ── 辅助函数 ──────────────────────────────────────────────
 
+
+def _disable_proxy_env_for_tests() -> None:
+    """测试脚本默认直连 Gateway，避免系统代理劫持本地域名解析。"""
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        os.environ.pop(key, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+
+
+def _run_docker(args: list[str], timeout: int) -> bool:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=_DOCKER_COMPOSE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as e:
+        print(f"  [warn] {' '.join(args)} 失败: {e}")
+        return False
+    if result.returncode == 0:
+        return True
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        print(f"  [warn] {' '.join(args)} 失败: {detail}")
+    return False
+
 def _make_client(tag: str) -> AUNClient:
     """创建测试客户端（通过 well-known 发现 gateway）"""
-    return AUNClient({
+    client = AUNClient({
         "aun_path": _TEST_AUN_PATH,
-        "verify_ssl": False,
-        "require_forward_secrecy": False,
     })
+    client._config_model.require_forward_secrecy = False
+    return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
@@ -63,42 +107,17 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
 
 def _docker_restart_gateway(timeout: int = 30) -> bool:
     """重启 Docker 容器（模拟服务端重启）"""
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "restart", "kite"],
-            cwd=_DOCKER_COMPOSE_DIR,
-            capture_output=True, text=True, timeout=timeout,
-        )
-        return result.returncode == 0
-    except Exception as e:
-        print(f"  [warn] docker restart 失败: {e}")
-        return False
+    return _run_docker(["docker", "compose", "restart", "kite"], timeout=timeout)
 
 
 def _docker_network_disconnect() -> bool:
     """断开容器网络（模拟网络中断）"""
-    try:
-        result = subprocess.run(
-            ["docker", "network", "disconnect", _NETWORK_NAME, _CONTAINER_NAME],
-            capture_output=True, text=True, timeout=10,
-        )
-        return result.returncode == 0
-    except Exception as e:
-        print(f"  [warn] network disconnect 失败: {e}")
-        return False
+    return _run_docker(["docker", "network", "disconnect", _NETWORK_NAME, _CONTAINER_NAME], timeout=10)
 
 
 def _docker_network_connect() -> bool:
     """恢复容器网络"""
-    try:
-        result = subprocess.run(
-            ["docker", "network", "connect", _NETWORK_NAME, _CONTAINER_NAME],
-            capture_output=True, text=True, timeout=10,
-        )
-        return result.returncode == 0
-    except Exception as e:
-        print(f"  [warn] network connect 失败: {e}")
-        return False
+    return _run_docker(["docker", "network", "connect", _NETWORK_NAME, _CONTAINER_NAME], timeout=10)
 
 
 async def _wait_for_state(client: AUNClient, target_state: str, timeout: float = 30.0) -> bool:
@@ -329,11 +348,7 @@ async def test_reconnect_exhausted():
     rid = str(uuid.uuid4())[:8]
     aid = f"rc-t5-{rid}.agentid.pub"
 
-    client = AUNClient({
-        "aun_path": _TEST_AUN_PATH,
-        "verify_ssl": False,
-        "require_forward_secrecy": False,
-    })
+    client = _make_client("reconnect-exhausted")
     state_events: list[dict] = []
     client.on("connection.state", lambda d: state_events.append(d))
 
@@ -393,6 +408,7 @@ async def test_reconnect_exhausted():
 # ── 主程序 ────────────────────────────────────────────────
 
 async def main():
+    _disable_proxy_env_for_tests()
     print("=" * 60)
     print("AUN SDK 断线重连集成测试")
     print("=" * 60)

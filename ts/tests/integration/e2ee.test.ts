@@ -21,6 +21,8 @@ import { AUNClient } from '../../src/client.js';
 import { E2EEManager } from '../../src/e2ee.js';
 import type { JsonObject, Message, PrekeyRecord } from '../../src/types.js';
 
+process.env.AUN_ENV ??= 'development';
+
 // ── 常量 ──────────────────────────────────────────────────────
 
 /** 单条测试超时（毫秒） */
@@ -39,11 +41,36 @@ function runId(): string {
 /** 创建测试客户端（仅设必要配置，Gateway 通过 well-known 自动发现） */
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-e2ee-'));
-  return new AUNClient({
-    aun_path: tmpDir,
-    verify_ssl: false,
-    require_forward_secrecy: false,
-  });
+  const client = new AUNClient({ aun_path: tmpDir }, true);
+  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  return client;
+}
+
+function makeClientAtPath(aunPath: string, slotId = ''): AUNClient {
+  const client = new AUNClient({ aun_path: aunPath }, true);
+  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  if (slotId) {
+    ((client as unknown) as { _slotId: string })._slotId = slotId;
+  }
+  return client;
+}
+
+function makeIsolatedClient(tag: string, slotId = ''): AUNClient {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `aun-${tag}-`));
+  return makeClientAtPath(tmpDir, slotId);
+}
+
+function copyIdentityTree(sourceRoot: string, targetRoot: string, aid: string): void {
+  const sourceIdentity = path.join(sourceRoot, 'AIDs', aid);
+  if (!fs.existsSync(sourceIdentity)) {
+    throw new Error(`identity source missing: ${sourceIdentity}`);
+  }
+  fs.mkdirSync(path.join(targetRoot, 'AIDs'), { recursive: true });
+  const sourceSeed = path.join(sourceRoot, '.seed');
+  if (fs.existsSync(sourceSeed)) {
+    fs.copyFileSync(sourceSeed, path.join(targetRoot, '.seed'));
+  }
+  fs.cpSync(sourceIdentity, path.join(targetRoot, 'AIDs', aid), { recursive: true });
 }
 
 /** 注册 AID 并连接到 Gateway */
@@ -103,6 +130,46 @@ async function sdkRecvPull(
   return msgs.filter((m) => m.from === fromAid);
 }
 
+async function currentMaxSeq(client: AUNClient, limit = 200): Promise<number> {
+  let afterSeq = 0;
+  let maxSeq = 0;
+  for (;;) {
+    const result = await client.call('message.pull', { after_seq: afterSeq, limit }) as JsonObject;
+    const msgs = (result.messages ?? []) as Message[];
+    if (msgs.length === 0) return maxSeq;
+    for (const msg of msgs) {
+      maxSeq = Math.max(maxSeq, Number(msg.seq ?? 0));
+    }
+    if (msgs.length < limit) return maxSeq;
+    afterSeq = maxSeq;
+  }
+}
+
+async function waitForSdkPullMessage(
+  client: AUNClient,
+  fromAid: string,
+  afterSeq: number,
+  expectedText: string,
+  timeout = 20_000,
+): Promise<Message> {
+  const deadline = Date.now() + timeout;
+  let lastMessages: Message[] = [];
+  while (Date.now() < deadline) {
+    const messages = await sdkRecvPull(client, fromAid, afterSeq);
+    lastMessages = messages;
+    for (const message of messages) {
+      const payload = message.payload as JsonObject;
+      if (String(payload?.text ?? '') === expectedText) {
+        return message;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(
+    `timeout waiting for message text=${expectedText} from=${fromAid}; last_messages=${JSON.stringify(lastMessages)}`,
+  );
+}
+
 /** SDK 加密发送消息 */
 async function sdkSend(
   client: AUNClient,
@@ -113,7 +180,6 @@ async function sdkSend(
     to: toAid,
     payload,
     encrypt: true,
-    persist: true,
   });
 }
 
@@ -127,9 +193,11 @@ type InternalTransport = {
 type ClientInternals = AUNClient & {
   _identity: JsonObject | null;
   _keystore: import('../../src/keystore/index.js').KeyStore;
+  _deviceId: string;
   _transport: InternalTransport;
-  _fetchPeerCert: (aid: string) => Promise<string>;
-  _fetchPeerPrekey: (aid: string) => Promise<PrekeyRecord>;
+  _fetchPeerCert: (aid: string, certFingerprint?: string) => Promise<string>;
+  _fetchPeerPrekey: (aid: string) => Promise<PrekeyRecord | null>;
+  _ensureSenderCertCached: (aid: string, certFingerprint?: string) => Promise<boolean>;
   _uploadPrekey: () => Promise<JsonObject | null>;
 };
 
@@ -138,6 +206,7 @@ function makeRawE2ee(client: AUNClient): E2EEManager {
   const internal = client as ClientInternals;
   return new E2EEManager({
     identityFn: () => internal._identity ?? {},
+    deviceIdFn: () => internal._deviceId,
     keystore: internal._keystore,
   });
 }
@@ -162,8 +231,9 @@ async function rawSend(
   const fetchCert = internal._fetchPeerCert.bind(client);
   const fetchPrekey = internal._fetchPeerPrekey.bind(client);
 
-  const peerCertPem = await fetchCert(toAid);
   const prekey = await fetchPrekey(toAid);
+  const peerCertFingerprint = typeof prekey?.cert_fingerprint === 'string' ? prekey.cert_fingerprint : undefined;
+  const peerCertPem = await fetchCert(toAid, peerCertFingerprint);
 
   const [envelope, result] = e2ee.encryptOutbound(
     toAid,
@@ -183,7 +253,6 @@ async function rawSend(
     encrypted: true,
     message_id: aad.message_id as string,
     timestamp: aad.timestamp as number,
-    persist: true,
   });
 }
 
@@ -197,6 +266,8 @@ async function rawRecvPull(
   fromAid: string,
   afterSeq: number = 0,
 ): Promise<Message[]> {
+  const internal = client as ClientInternals;
+  await internal._ensureSenderCertCached(fromAid);
   const raw = await getTransport(client).call('message.pull', {
     after_seq: afterSeq,
     limit: 50,
@@ -209,6 +280,32 @@ async function rawRecvPull(
     if (decrypted !== null) result.push(decrypted);
   }
   return result;
+}
+
+async function waitForRawPullMessage(
+  client: AUNClient,
+  e2ee: E2EEManager,
+  fromAid: string,
+  afterSeq: number,
+  expectedText: string,
+  timeout: number = 20_000,
+): Promise<Message> {
+  const deadline = Date.now() + timeout;
+  let lastMessages: Message[] = [];
+  while (Date.now() < deadline) {
+    const messages = await rawRecvPull(client, e2ee, fromAid, afterSeq);
+    lastMessages = messages;
+    for (const message of messages) {
+      const payload = message.payload as JsonObject;
+      if (String(payload?.text ?? '') === expectedText) {
+        return message;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(
+    `timeout waiting for raw message text=${expectedText} from=${fromAid}; last_messages=${JSON.stringify(lastMessages)}`,
+  );
 }
 
 /** 断言消息已正确解密 */
@@ -493,11 +590,11 @@ describe('E2EE 集成测试', () => {
     await ensureConnected(rawClient, rAid);
 
     const rawE2ee = makeRawE2ee(rawClient);
-    await sdkSend(sender, rAid, { text: 'sdk2raw' });
-    await new Promise((r) => setTimeout(r, 1000));
-    const msgs = await rawRecvPull(rawClient, rawE2ee, sAid);
-    expect(msgs.length, 'Raw WS 应收到消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgs[0], { text: 'sdk2raw' });
+    const baseSeq = await currentMaxSeq(rawClient);
+    const text = `sdk2raw_${Date.now()}`;
+    await sdkSend(sender, rAid, { text });
+    const msg = await waitForRawPullMessage(rawClient, rawE2ee, sAid, baseSeq, text);
+    assertDecrypted(msg, { text });
   }, TEST_TIMEOUT);
 
   // ── 10. Raw WS ↔ Raw WS ──────────────────────────────────
@@ -516,18 +613,18 @@ describe('E2EE 集成测试', () => {
     const e2eeB = makeRawE2ee(clientB);
 
     // A → B
-    await rawSend(clientA, e2eeA, bAid, { text: 'raw_a2b' });
-    await new Promise((r) => setTimeout(r, 1000));
-    const msgsB = await rawRecvPull(clientB, e2eeB, aAid);
-    expect(msgsB.length, 'B 应收到 A 的消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgsB[0], { text: 'raw_a2b' }, 'A→B');
+    const baseSeqB = await currentMaxSeq(clientB);
+    const textA2B = `raw_a2b_${Date.now()}`;
+    await rawSend(clientA, e2eeA, bAid, { text: textA2B });
+    const msgB = await waitForRawPullMessage(clientB, e2eeB, aAid, baseSeqB, textA2B);
+    assertDecrypted(msgB, { text: textA2B }, 'A→B');
 
     // B → A
-    await rawSend(clientB, e2eeB, aAid, { text: 'raw_b2a' });
-    await new Promise((r) => setTimeout(r, 1000));
-    const msgsA = await rawRecvPull(clientA, e2eeA, bAid);
-    expect(msgsA.length, 'A 应收到 B 的消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgsA[0], { text: 'raw_b2a' }, 'B→A');
+    const baseSeqA = await currentMaxSeq(clientA);
+    const textB2A = `raw_b2a_${Date.now()}`;
+    await rawSend(clientB, e2eeB, aAid, { text: textB2A });
+    const msgA = await waitForRawPullMessage(clientA, e2eeA, bAid, baseSeqA, textB2A);
+    assertDecrypted(msgA, { text: textB2A }, 'B→A');
   }, TEST_TIMEOUT);
 
   // ── 11. SDK ↔ Raw 混合双向 ────────────────────────────────
@@ -545,17 +642,20 @@ describe('E2EE 集成测试', () => {
     const rawE2ee = makeRawE2ee(rawClient);
 
     // SDK → Raw
-    await sdkSend(sdkClient, rawAid, { text: 'sdk2raw_bidir', dir: 'forward' });
-    await new Promise((r) => setTimeout(r, 1000));
-    const msgsRaw = await rawRecvPull(rawClient, rawE2ee, sdkAid);
-    expect(msgsRaw.length, 'Raw 应收到 SDK 的消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgsRaw[0], { text: 'sdk2raw_bidir' }, 'SDK→Raw');
+    const rawBaseSeq = await currentMaxSeq(rawClient);
+    const sdkToRawText = `sdk2raw_bidir_${Date.now()}`;
+    await sdkSend(sdkClient, rawAid, { text: sdkToRawText, dir: 'forward' });
+    const msgRaw = await waitForRawPullMessage(rawClient, rawE2ee, sdkAid, rawBaseSeq, sdkToRawText);
+    assertDecrypted(msgRaw, { text: sdkToRawText }, 'SDK→Raw');
 
     // Raw → SDK
-    await rawSend(rawClient, rawE2ee, sdkAid, { text: 'raw2sdk_bidir', dir: 'reverse' });
+    const sdkBaseSeq = await currentMaxSeq(sdkClient);
+    const rawToSdkText = `raw2sdk_bidir_${Date.now()}`;
+    await rawSend(rawClient, rawE2ee, sdkAid, { text: rawToSdkText, dir: 'reverse' });
     const msgsSdk = await sdkRecvPush(sdkClient, rawAid);
-    expect(msgsSdk.length, 'SDK 应收到 Raw 的消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgsSdk[0], { text: 'raw2sdk_bidir' }, 'Raw→SDK');
+    const msgSdk = msgsSdk.find((msg) => String(((msg.payload as JsonObject).text) ?? '') === rawToSdkText)
+      ?? await waitForSdkPullMessage(sdkClient, rawAid, sdkBaseSeq, rawToSdkText);
+    assertDecrypted(msgSdk, { text: rawToSdkText }, 'Raw→SDK');
   }, TEST_TIMEOUT);
 
   // ── 12. Raw WS 连续发送（burst） ──────────────────────────
@@ -572,6 +672,7 @@ describe('E2EE 集成测试', () => {
 
     const sE2ee = makeRawE2ee(sClient);
     const rE2ee = makeRawE2ee(rClient);
+    const baseSeq = await currentMaxSeq(rClient);
 
     const N = 3;
     for (let i = 0; i < N; i++) {
@@ -579,11 +680,161 @@ describe('E2EE 集成测试', () => {
     }
 
     await new Promise((r) => setTimeout(r, 2000));
-    const msgs = await rawRecvPull(rClient, rE2ee, sAid);
+    const msgs = await rawRecvPull(rClient, rE2ee, sAid, baseSeq);
     expect(msgs.length, `应收到 ${N} 条消息`).toBeGreaterThanOrEqual(N);
 
     const texts = msgs.map((m) => String((m.payload as JsonObject).text ?? '')).sort();
     const expected = Array.from({ length: N }, (_, i) => `raw_burst_${i}`).sort();
     expect(texts, '消息内容应完全匹配').toEqual(expected);
+  }, TEST_TIMEOUT);
+
+  it('同一 AID 多 slot ack 隔离', async () => {
+    const rid = runId();
+    const sender = tracked();
+    const sharedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-slot-shared-'));
+    const receiverSlotA = makeClientAtPath(sharedRoot, 'slot-a');
+    const receiverSlotB = makeClientAtPath(sharedRoot, 'slot-b');
+    clients.push(receiverSlotA, receiverSlotB);
+
+    const sAid = `e2ee-slot-s-${rid}.agentid.pub`;
+    const rAid = `e2ee-slot-r-${rid}.agentid.pub`;
+    await ensureConnected(sender, sAid);
+    await ensureConnected(receiverSlotA, rAid);
+    await ensureConnected(receiverSlotB, rAid);
+
+    const baseSeqA = await currentMaxSeq(receiverSlotA);
+    const baseSeqB = await currentMaxSeq(receiverSlotB);
+    expect(baseSeqA).toBe(baseSeqB);
+
+    const ackEvents: Message[] = [];
+    let resolveWait: () => void;
+    const waitPromise = new Promise<void>((r) => { resolveWait = r; });
+    const sub = sender.on('message.ack', (data) => {
+      const msg = data as Message;
+      if (msg?.to !== rAid) return;
+      const slotId = String((msg as JsonObject).slot_id ?? '');
+      if (slotId !== 'slot-a' && slotId !== 'slot-b') return;
+      ackEvents.push(msg);
+      const seen = new Set(ackEvents.map((item) => String((item as JsonObject).slot_id ?? '')));
+      if (seen.has('slot-a') && seen.has('slot-b')) {
+        resolveWait();
+      }
+    });
+
+    const text = `slot_isolation_${Date.now()}`;
+    await sdkSend(sender, rAid, { text });
+    const msgA = await waitForSdkPullMessage(receiverSlotA, sAid, baseSeqA, text, 15_000);
+    const msgB = await waitForSdkPullMessage(receiverSlotB, sAid, baseSeqB, text, 15_000);
+    assertDecrypted(msgA, { text }, 'slot-a');
+    assertDecrypted(msgB, { text }, 'slot-b');
+    expect(Number(msgA.seq ?? 0)).toBe(Number(msgB.seq ?? 0));
+
+    const ackA = await receiverSlotA.call('message.ack', { seq: msgA.seq }) as JsonObject;
+    const ackB = await receiverSlotB.call('message.ack', { seq: msgB.seq }) as JsonObject;
+    expect(Number(ackA.ack_seq ?? 0)).toBe(Number(msgA.seq ?? 0));
+    expect(Number(ackB.ack_seq ?? 0)).toBe(Number(msgB.seq ?? 0));
+
+    const timer = setTimeout(() => resolveWait(), 5_000);
+    await waitPromise;
+    clearTimeout(timer);
+    sub.unsubscribe();
+
+    const slotsSeen = new Set(ackEvents.map((item) => String((item as JsonObject).slot_id ?? '')));
+    expect(slotsSeen).toEqual(new Set(['slot-a', 'slot-b']));
+    const deviceIds = new Set(ackEvents.map((item) => String((item as JsonObject).device_id ?? '')));
+    expect(deviceIds.size).toBe(1);
+    expect(deviceIds.has('')).toBe(false);
+  }, TEST_TIMEOUT);
+
+  it('同一 AID 多设备 fanout + 发件同步副本', async () => {
+    const rid = runId();
+    const aliceSeedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-alice-seed-'));
+    const aliceSyncRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-alice-sync-'));
+    const bobSeedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-bob-seed-'));
+    const bobSyncRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-bob-sync-'));
+    const aliceSeed = makeClientAtPath(aliceSeedRoot);
+    const bobSeed = makeClientAtPath(bobSeedRoot);
+    clients.push(aliceSeed, bobSeed);
+
+    const aliceAid = `e2ee-md-a-${rid}.agentid.pub`;
+    const bobAid = `e2ee-md-b-${rid}.agentid.pub`;
+    await ensureConnected(aliceSeed, aliceAid);
+    await ensureConnected(bobSeed, bobAid);
+    copyIdentityTree(aliceSeedRoot, aliceSyncRoot, aliceAid);
+    copyIdentityTree(bobSeedRoot, bobSyncRoot, bobAid);
+    const aliceSync = makeClientAtPath(aliceSyncRoot);
+    const bobSync = makeClientAtPath(bobSyncRoot);
+    clients.push(aliceSync, bobSync);
+    await ensureConnected(aliceSync, aliceAid);
+    await ensureConnected(bobSync, bobAid);
+    await new Promise((r) => setTimeout(r, 1000));
+
+    const baseMain = await currentMaxSeq(bobSeed);
+    const baseSync = await currentMaxSeq(bobSync);
+    const baseAliceSync = await currentMaxSeq(aliceSync);
+    const text = `multi_device_sync_${Date.now()}`;
+
+    await sdkSend(aliceSeed, bobAid, { text, kind: 'multi-device' });
+    const mainMsg = await waitForSdkPullMessage(bobSeed, aliceAid, baseMain, text, 20_000);
+    const syncMsg = await waitForSdkPullMessage(bobSync, aliceAid, baseSync, text, 20_000);
+    const aliceSyncMsg = await waitForSdkPullMessage(aliceSync, aliceAid, baseAliceSync, text, 20_000);
+    assertDecrypted(mainMsg, { text, kind: 'multi-device' }, 'bob-main');
+    assertDecrypted(syncMsg, { text, kind: 'multi-device' }, 'bob-sync');
+    assertDecrypted(aliceSyncMsg, { text, kind: 'multi-device' }, 'alice-sync');
+    expect(String(mainMsg.direction ?? '')).toBe('inbound');
+    expect(String(syncMsg.direction ?? '')).toBe('inbound');
+    expect(String(aliceSyncMsg.direction ?? '')).toBe('outbound_sync');
+  }, TEST_TIMEOUT);
+
+  it('多设备离线设备重连后补拉自己的设备副本', async () => {
+    const rid = runId();
+    const aliceSeedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-offline-alice-seed-'));
+    const bobSeedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-offline-bob-seed-'));
+    const aliceMainRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-offline-alice-main-'));
+    const bobPhoneRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-offline-bob-phone-'));
+    const bobLaptopRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-offline-bob-laptop-'));
+
+    const seedAlice = makeClientAtPath(aliceSeedRoot);
+    const seedBob = makeClientAtPath(bobSeedRoot);
+    clients.push(seedAlice, seedBob);
+
+    const aliceAid = `e2ee-off-a-${rid}.agentid.pub`;
+    const bobAid = `e2ee-off-b-${rid}.agentid.pub`;
+    await ensureConnected(seedAlice, aliceAid);
+    await ensureConnected(seedBob, bobAid);
+    copyIdentityTree(aliceSeedRoot, aliceMainRoot, aliceAid);
+    copyIdentityTree(bobSeedRoot, bobPhoneRoot, bobAid);
+    copyIdentityTree(bobSeedRoot, bobLaptopRoot, bobAid);
+    await seedAlice.close();
+    await seedBob.close();
+
+    const aliceMain = makeClientAtPath(aliceMainRoot);
+    const bobPhone = makeClientAtPath(bobPhoneRoot);
+    let bobLaptop = makeClientAtPath(bobLaptopRoot);
+    clients.push(aliceMain, bobPhone, bobLaptop);
+
+    await ensureConnected(aliceMain, aliceAid);
+    await ensureConnected(bobPhone, bobAid);
+    await ensureConnected(bobLaptop, bobAid);
+    await new Promise((r) => setTimeout(r, 1000));
+
+    const offlineBase = await currentMaxSeq(bobLaptop);
+    const onlineBase = await currentMaxSeq(bobPhone);
+    await bobLaptop.close();
+    await new Promise((r) => setTimeout(r, 1000));
+
+    const text = `multi_device_offline_${Date.now()}`;
+    await sdkSend(aliceMain, bobAid, { text, kind: 'offline-pull' });
+
+    const onlineMsg = await waitForSdkPullMessage(bobPhone, aliceAid, onlineBase, text, 15_000);
+    assertDecrypted(onlineMsg, { text, kind: 'offline-pull' }, 'bob-phone-online');
+    expect(String(onlineMsg.direction ?? '')).toBe('inbound');
+
+    bobLaptop = makeClientAtPath(bobLaptopRoot);
+    clients.push(bobLaptop);
+    await ensureConnected(bobLaptop, bobAid);
+    const offlineMsg = await waitForSdkPullMessage(bobLaptop, aliceAid, offlineBase, text, 15_000);
+    assertDecrypted(offlineMsg, { text, kind: 'offline-pull' }, 'bob-laptop-offline');
+    expect(String(offlineMsg.direction ?? '')).toBe('inbound');
   }, TEST_TIMEOUT);
 });

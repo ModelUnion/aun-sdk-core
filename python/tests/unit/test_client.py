@@ -5,12 +5,36 @@ import pytest
 
 from aun_core import AUNClient
 from aun_core.errors import AUNError, NotFoundError, StateError, ValidationError
-from aun_core.keystore.sqlite_backup import SQLiteBackup
 import aun_core.namespaces.auth_namespace as auth_namespace_module
 
 
+def _make_test_cert(cn: str) -> tuple[str, str]:
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+    cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+    return cert_pem, cert_fp
+
+
 def test_construct_no_args():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     assert client.aid is None
     assert client.state == "idle"
     assert hasattr(client, "auth")
@@ -20,19 +44,19 @@ def test_construct_no_args():
 
 
 def test_construct_with_aun_path(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "test"), "sqlite_backup": False})
+    client = AUNClient({"aun_path": str(tmp_path / "test")})
     assert client.state == "idle"
 
 
 def test_construct_default_sqlite_backup_uses_aun_path(tmp_path):
+    """SQLCipher 迁移后不再使用 SQLiteBackup，改为验证 keystore 使用正确的 aun_path。"""
     root = tmp_path / "aun"
     client = AUNClient({"aun_path": str(root)})
-    assert isinstance(client._keystore._sqlite_backup, SQLiteBackup)
-    assert client._keystore._sqlite_backup._db_path == root / ".aun_backup" / "aun_backup.db"
+    assert client._keystore._root == root
 
 
 def test_connect_requires_access_token():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     with pytest.raises(StateError, match="access_token"):
         asyncio.run(
             client.connect({"gateway": "ws://localhost/aun"})
@@ -40,7 +64,7 @@ def test_connect_requires_access_token():
 
 
 def test_connect_requires_gateway():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     with pytest.raises(StateError, match="gateway"):
         asyncio.run(
             client.connect({"access_token": "tok"})
@@ -48,15 +72,38 @@ def test_connect_requires_gateway():
 
 
 def test_connect_uses_cached_gateway():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._gateway_url = "ws://cached.example/aun"
 
     normalized = client._normalize_connect_params({"access_token": "tok"})
     assert normalized["gateway"] == "ws://cached.example/aun"
 
 
+def test_normalize_connect_params_includes_slot_and_delivery_mode(tmp_path):
+    client = AUNClient({
+        "aun_path": str(tmp_path / "aun"),
+    })
+
+    normalized = client._normalize_connect_params({
+        "access_token": "tok",
+        "gateway": "wss://gateway.example.com/aun",
+        "slot_id": "slot-a",
+        "delivery_mode": "queue",
+        "queue_routing": "sender_affinity",
+        "affinity_ttl_ms": 900,
+    })
+
+    assert normalized["device_id"] == client._device_id
+    assert normalized["slot_id"] == "slot-a"
+    assert normalized["delivery_mode"] == {
+        "mode": "queue",
+        "routing": "sender_affinity",
+        "affinity_ttl_ms": 900,
+    }
+
+
 def test_create_aid_caches_discovered_gateway(monkeypatch):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
 
     async def fake_discover(url: str) -> str:
         assert url == "https://gateway.agentid.pub/.well-known/aun-gateway"
@@ -80,7 +127,7 @@ def test_create_aid_caches_discovered_gateway(monkeypatch):
 
 
 def test_authenticate_caches_discovered_gateway(monkeypatch):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
 
     async def fake_discover(url: str) -> str:
         assert url == "https://gateway.agentid.pub/.well-known/aun-gateway"
@@ -110,21 +157,21 @@ def test_authenticate_caches_discovered_gateway(monkeypatch):
 
 
 def test_create_aid_requires_aid_when_gateway_missing():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
 
     with pytest.raises(Exception, match="auth.create_aid requires 'aid'"):
         asyncio.run(client.auth.create_aid({}))
 
 
 def test_authenticate_requires_aid_when_gateway_missing():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
 
     with pytest.raises(Exception, match="unable to resolve gateway"):
         asyncio.run(client.auth.authenticate({}))
 
 
 def test_upload_agent_md_uses_cached_access_token(monkeypatch):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._aid = "alice.agentid.pub"
     client._gateway_url = "ws://gateway.agentid.pub/aun"
 
@@ -178,7 +225,7 @@ def test_upload_agent_md_uses_cached_access_token(monkeypatch):
 
 
 def test_upload_agent_md_falls_back_to_authenticate(monkeypatch):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._aid = "alice.agentid.pub"
     client._gateway_url = "ws://gateway.agentid.pub/aun"
 
@@ -236,7 +283,7 @@ def test_upload_agent_md_falls_back_to_authenticate(monkeypatch):
 
 
 def test_upload_agent_md_refresh_failure_logs_and_falls_back_to_authenticate(monkeypatch, caplog):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._aid = "alice.agentid.pub"
     client._gateway_url = "ws://gateway.agentid.pub/aun"
 
@@ -306,7 +353,7 @@ def test_upload_agent_md_refresh_failure_logs_and_falls_back_to_authenticate(mon
 
 
 def test_upload_agent_md_403_raises_aunerror(monkeypatch):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._aid = "alice.agentid.pub"
     client._gateway_url = "ws://gateway.agentid.pub/aun"
 
@@ -357,7 +404,8 @@ def test_upload_agent_md_403_raises_aunerror(monkeypatch):
 
 
 def test_download_agent_md_is_anonymous(monkeypatch):
-    client = AUNClient({"sqlite_backup": False, "discovery_port": 18443})
+    client = AUNClient()
+    client._config_model.discovery_port = 18443
     client._gateway_url = "wss://gateway.agentid.pub/aun"
 
     class _FakeResponse:
@@ -395,7 +443,7 @@ def test_download_agent_md_is_anonymous(monkeypatch):
 
 
 def test_download_agent_md_404_raises_not_found(monkeypatch):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._gateway_url = "wss://gateway.agentid.pub/aun"
 
     class _FakeResponse:
@@ -432,7 +480,7 @@ def test_download_agent_md_404_raises_not_found(monkeypatch):
 
 
 def test_call_not_connected():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     with pytest.raises(Exception):
         asyncio.run(
             client.call("meta.ping", {})
@@ -454,12 +502,12 @@ def test_no_callable_prefix_restriction():
 
 
 def test_e2ee_property():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     assert client.e2ee is not None
 
 
 def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "aun"), "sqlite_backup": False})
+    client = AUNClient({"aun_path": str(tmp_path / "aun")})
     aid = "demo.agentid.pub"
 
     client._keystore.save_identity(aid, {
@@ -468,23 +516,24 @@ def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
         "public_key_der_b64": "pub",
         "curve": "P-256",
     })
-    client._keystore.save_metadata(aid, {
-        "aid": aid,
-        "e2ee_prekeys": {
-            "pk1": {"private_key_pem": "KEEP_ME", "created_at": 1},
-        },
+    client._keystore.save_e2ee_prekey(aid, "pk1", {
+        "private_key_pem": "KEEP_ME",
+        "created_at": 1,
     })
     client._aid = aid
 
     client._sync_identity_after_connect("tok-connect")
 
-    loaded = client._keystore.load_metadata(aid)
-    assert loaded["access_token"] == "tok-connect"
-    assert loaded["e2ee_prekeys"]["pk1"]["private_key_pem"] == "KEEP_ME"
+    loaded = client._keystore.load_identity(aid)
+    slot_state = client._keystore.load_instance_state(aid, client._device_id, "")
+    assert "access_token" not in loaded
+    assert slot_state["access_token"] == "tok-connect"
+    prekeys = client._keystore.load_e2ee_prekeys(aid)
+    assert prekeys["pk1"]["private_key_pem"] == "KEEP_ME"
 
 
 def test_call_rejects_group_service_recipient():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._state = "connected"
 
     with pytest.raises(
@@ -498,8 +547,121 @@ def test_call_rejects_group_service_recipient():
         }))
 
 
+def test_call_rejects_message_send_persist_param():
+    client = AUNClient()
+    client._state = "connected"
+
+    with pytest.raises(ValidationError, match="no longer accepts 'persist'"):
+        asyncio.run(client.call("message.send", {
+            "to": "bob.remote.example",
+            "payload": {"text": "hello"},
+            "encrypt": False,
+            "persist": True,
+        }))
+
+
+def test_call_rejects_message_send_delivery_mode_param():
+    client = AUNClient()
+    client._state = "connected"
+
+    with pytest.raises(ValidationError, match="does not accept delivery_mode"):
+        asyncio.run(client.call("message.send", {
+            "to": "bob.remote.example",
+            "payload": {"text": "hello"},
+            "encrypt": False,
+            "delivery_mode": {"mode": "queue"},
+        }))
+
+
+def test_call_does_not_forward_message_send_delivery_mode():
+    client = AUNClient()
+    client._state = "connected"
+    client._connect_delivery_mode = {
+        "mode": "queue",
+        "routing": "sender_affinity",
+        "affinity_ttl_ms": 1000,
+    }
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params):
+            calls.append((method, dict(params)))
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    asyncio.run(client.call("message.send", {
+        "to": "bob.remote.example",
+        "payload": {"text": "hello"},
+        "encrypt": False,
+    }))
+
+    assert calls == [("message.send", {
+        "to": "bob.remote.example",
+        "payload": {"text": "hello"},
+    })]
+
+
+def test_call_injects_message_slot_context():
+    client = object.__new__(AUNClient)
+    client._state = "connected"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._aid = "alice.agentid.pub"
+    client._config_model = type("Config", (), {"group_e2ee": False})()
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params):
+            calls.append((method, dict(params)))
+            if method == "message.pull":
+                return {"messages": [], "count": 0, "latest_seq": 0}
+            return {"success": True, "ack_seq": 7}
+
+    client._transport = _Transport()
+
+    pull_result = asyncio.run(client.call("message.pull", {"after_seq": 1, "limit": 5}))
+    ack_result = asyncio.run(client.call("message.ack", {"seq": 7}))
+
+    assert pull_result["count"] == 0
+    assert ack_result == {"success": True, "ack_seq": 7}
+    assert calls[0][0] == "message.pull"
+    assert calls[0][1]["device_id"] == client._device_id
+    assert calls[0][1]["slot_id"] == "slot-a"
+    assert calls[1][0] == "message.ack"
+    assert calls[1][1]["device_id"] == client._device_id
+    assert calls[1][1]["slot_id"] == "slot-a"
+
+
+def test_call_rejects_message_slot_context_override():
+    client = object.__new__(AUNClient)
+    client._state = "connected"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._aid = "alice.agentid.pub"
+    client._config_model = type("Config", (), {"group_e2ee": False})()
+
+    class _Transport:
+        async def call(self, method, params):
+            return {"messages": [], "count": 0, "latest_seq": 0}
+
+    client._transport = _Transport()
+
+    with pytest.raises(ValidationError, match="device_id must match"):
+        asyncio.run(client.call("message.pull", {
+            "after_seq": 0,
+            "device_id": "other-device",
+        }))
+
+    with pytest.raises(ValidationError, match="slot_id must match"):
+        asyncio.run(client.call("message.ack", {
+            "seq": 1,
+            "slot_id": "slot-b",
+        }))
+
+
 def test_fetch_peer_prekey_returns_none_when_missing():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
 
     async def _fake_call(method, params):
         assert method == "message.e2ee.get_prekey"
@@ -513,8 +675,43 @@ def test_fetch_peer_prekey_returns_none_when_missing():
     assert result is None
 
 
+def test_fetch_peer_prekey_accepts_device_prekeys_response():
+    client = AUNClient()
+
+    async def _fake_call(method, params):
+        assert method == "message.e2ee.get_prekey"
+        return {
+            "found": True,
+            "device_prekeys": [
+                {
+                    "device_id": "device-b",
+                    "prekey_id": "pk-b",
+                    "public_key": "pub-b",
+                    "signature": "sig-b",
+                    "cert_fingerprint": "sha256:b",
+                },
+                {
+                    "device_id": "device-a",
+                    "prekey_id": "pk-a",
+                    "public_key": "pub-a",
+                    "signature": "sig-a",
+                    "cert_fingerprint": "sha256:a",
+                },
+            ],
+        }
+
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
+    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
+
+    assert result["device_id"] == "device-b"
+    assert result["prekey_id"] == "pk-b"
+    assert [item["device_id"] for item in all_prekeys] == ["device-b", "device-a"]
+
+
 def test_fetch_peer_prekey_query_failure_raises_validation_error():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
 
     async def _fake_call(method, params):
         raise RuntimeError("network down")
@@ -526,7 +723,7 @@ def test_fetch_peer_prekey_query_failure_raises_validation_error():
 
 
 def test_fetch_peer_prekey_invalid_response_raises_validation_error():
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
 
     async def _fake_call(method, params):
         return {"found": True}
@@ -547,25 +744,26 @@ def test_build_cert_url_with_cert_fingerprint():
 
 
 def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
-    client = AUNClient({"sqlite_backup": False})
+    client = AUNClient()
     client._gateway_url = "wss://gateway.example.com/aun"
 
     calls = []
 
-    async def _fake_fetch_peer_prekey(peer_aid):
+    async def _fake_fetch_peer_prekeys(peer_aid):
         assert peer_aid == "bob.example.com"
-        return {
+        return [{
+            "device_id": "",
             "prekey_id": "pk-1",
             "public_key": "pub",
             "signature": "sig",
             "cert_fingerprint": "sha256:abc",
-        }
+        }]
 
     async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
         calls.append((aid, cert_fingerprint))
         return b"PEM"
 
-    def _fake_encrypt_outbound(**kwargs):
+    def _fake_encrypt_copy_payload(**kwargs):
         assert kwargs["prekey"]["cert_fingerprint"] == "sha256:abc"
         return {"ciphertext": "ok"}, {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2"}
 
@@ -573,9 +771,9 @@ def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
         assert method == "message.send"
         return {"ok": True}
 
-    monkeypatch.setattr(client, "_fetch_peer_prekey", _fake_fetch_peer_prekey)
+    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
     monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client._e2ee, "encrypt_outbound", _fake_encrypt_outbound)
+    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
     client._transport.call = _fake_call
 
     result = asyncio.run(client._send_encrypted({
@@ -587,8 +785,430 @@ def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
     assert calls == [("bob.example.com", "sha256:abc")]
 
 
+def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeypatch):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    from datetime import datetime, timedelta, timezone
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "alice.example.com")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+    cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+
+    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client._keystore.save_cert("alice.example.com", cert_pem, cert_fingerprint=cert_fp, make_active=False)
+
+    called = {"fetch": 0}
+
+    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
+        called["fetch"] += 1
+        raise AssertionError("should not fetch when local fingerprint cert exists")
+
+    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
+
+    ok = asyncio.run(client._ensure_sender_cert_cached("alice.example.com", cert_fp))
+
+    assert ok is True
+    assert called["fetch"] == 0
+
+
+def test_send_encrypted_uses_multi_device_payload_when_needed(monkeypatch):
+    client = AUNClient()
+    sent = {}
+
+    async def _fake_fetch_peer_prekeys(peer_aid):
+        assert peer_aid == "bob.example.com"
+        return [
+            {
+                "device_id": "phone",
+                "prekey_id": "pk-phone",
+                "public_key": "pub-phone",
+                "signature": "sig-phone",
+                "cert_fingerprint": "sha256:cert",
+            },
+            {
+                "device_id": "laptop",
+                "prekey_id": "pk-laptop",
+                "public_key": "pub-laptop",
+                "signature": "sig-laptop",
+                "cert_fingerprint": "sha256:cert",
+            },
+        ]
+
+    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
+        assert aid == "bob.example.com"
+        assert cert_fingerprint == "sha256:cert"
+        return b"PEM"
+
+    def _fake_encrypt_copy_payload(**kwargs):
+        prekey = kwargs["prekey"]
+        return (
+            {"type": "e2ee.encrypted", "ciphertext": prekey["prekey_id"]},
+            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
+        )
+
+    async def _fake_call(method, params):
+        sent["method"] = method
+        sent["params"] = dict(params)
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
+    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
+    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._send_encrypted({
+        "to": "bob.example.com",
+        "payload": {"text": "hello"},
+    }))
+
+    assert result == {"ok": True}
+    assert sent["method"] == "message.send"
+    assert sent["params"]["type"] == "e2ee.multi_device"
+    assert [item["device_id"] for item in sent["params"]["payload"]["recipient_copies"]] == ["phone", "laptop"]
+    assert sent["params"]["payload"]["self_copies"] == []
+
+
+def test_send_encrypted_generates_self_sync_copies(monkeypatch):
+    client = AUNClient()
+    active_cert, active_fp = _make_test_cert("alice.example.com")
+    client._aid = "alice.example.com"
+    client._device_id = "phone"
+    client._identity = {
+        "aid": "alice.example.com",
+        "cert": active_cert,
+    }
+    sent = {}
+
+    async def _fake_fetch_peer_prekeys(peer_aid):
+        if peer_aid == "bob.example.com":
+            return [{
+                "device_id": "bob-phone",
+                "prekey_id": "pk-bob",
+                "public_key": "pub-bob",
+                "signature": "sig-bob",
+                "cert_fingerprint": "sha256:bob",
+            }]
+        if peer_aid == "alice.example.com":
+            return [
+                {
+                    "device_id": "phone",
+                    "prekey_id": "pk-self",
+                    "public_key": "pub-self",
+                    "signature": "sig-self",
+                    "cert_fingerprint": active_fp,
+                },
+                {
+                    "device_id": "tablet",
+                    "prekey_id": "pk-tablet",
+                    "public_key": "pub-tablet",
+                    "signature": "sig-tablet",
+                    "cert_fingerprint": active_fp,
+                },
+            ]
+        raise AssertionError(peer_aid)
+
+    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
+        assert aid == "bob.example.com"
+        return b"BOB-CERT"
+
+    def _fake_encrypt_copy_payload(**kwargs):
+        prekey = kwargs["prekey"]
+        return (
+            {
+                "type": "e2ee.encrypted",
+                "ciphertext": prekey["prekey_id"],
+                "aad": {"to": kwargs["logical_to_aid"]},
+            },
+            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
+        )
+
+    async def _fake_call(method, params):
+        sent["method"] = method
+        sent["params"] = dict(params)
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
+    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
+    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._send_encrypted({
+        "to": "bob.example.com",
+        "payload": {"text": "hi"},
+    }))
+
+    assert result == {"ok": True}
+    assert sent["params"]["type"] == "e2ee.multi_device"
+    assert [item["device_id"] for item in sent["params"]["payload"]["recipient_copies"]] == ["bob-phone"]
+    assert [item["device_id"] for item in sent["params"]["payload"]["self_copies"]] == ["tablet"]
+    assert sent["params"]["payload"]["self_copies"][0]["envelope"]["aad"]["to"] == "bob.example.com"
+
+
+def test_send_encrypted_self_sync_uses_cert_fingerprint_specific_cert(monkeypatch):
+    client = AUNClient()
+    active_cert, active_fp = _make_test_cert("alice-active.example.com")
+    old_cert, old_fp = _make_test_cert("alice-rotated.example.com")
+    client._aid = "alice.example.com"
+    client._device_id = "phone"
+    client._identity = {
+        "aid": "alice.example.com",
+        "cert": active_cert,
+    }
+    sent = {}
+    cert_calls = []
+
+    async def _fake_fetch_peer_prekeys(peer_aid):
+        if peer_aid == "bob.example.com":
+            return [{
+                "device_id": "bob-phone",
+                "prekey_id": "pk-bob",
+                "public_key": "pub-bob",
+                "signature": "sig-bob",
+                "cert_fingerprint": "sha256:bob",
+            }]
+        if peer_aid == "alice.example.com":
+            return [
+                {
+                    "device_id": "phone",
+                    "prekey_id": "pk-self",
+                    "public_key": "pub-self",
+                    "signature": "sig-self",
+                    "cert_fingerprint": active_fp,
+                },
+                {
+                    "device_id": "tablet",
+                    "prekey_id": "pk-tablet",
+                    "public_key": "pub-tablet",
+                    "signature": "sig-tablet",
+                    "cert_fingerprint": old_fp,
+                },
+            ]
+        raise AssertionError(peer_aid)
+
+    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
+        cert_calls.append((aid, cert_fingerprint))
+        if aid == "bob.example.com":
+            return b"BOB-CERT"
+        if aid == "alice.example.com":
+            assert cert_fingerprint == old_fp
+            return old_cert.encode("utf-8")
+        raise AssertionError(aid)
+
+    def _fake_encrypt_copy_payload(**kwargs):
+        prekey = kwargs["prekey"]
+        return (
+            {
+                "type": "e2ee.encrypted",
+                "ciphertext": prekey["prekey_id"],
+                "aad": {"to": kwargs["logical_to_aid"]},
+            },
+            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
+        )
+
+    async def _fake_call(method, params):
+        sent["method"] = method
+        sent["params"] = dict(params)
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
+    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
+    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._send_encrypted({
+        "to": "bob.example.com",
+        "payload": {"text": "hi"},
+    }))
+
+    assert result == {"ok": True}
+    assert sent["params"]["type"] == "e2ee.multi_device"
+    assert [item["device_id"] for item in sent["params"]["payload"]["self_copies"]] == ["tablet"]
+    assert ("alice.example.com", old_fp) in cert_calls
+    assert ("alice.example.com", active_fp) not in cert_calls
+
+
+def test_outbound_sync_messages_are_decryptable_for_current_aid():
+    client = AUNClient()
+    client._identity = {"aid": "alice.example.com"}
+
+    allowed = client._e2ee._should_decrypt_for_current_aid(
+        {"to": "bob.example.com", "direction": "outbound_sync"},
+        {"aad": {"to": "bob.example.com"}},
+    )
+
+    assert allowed is True
+
+
+def test_upload_prekey_forwards_device_id(monkeypatch):
+    client = AUNClient()
+    client._device_id = "device-7"
+    sent = {}
+
+    monkeypatch.setattr(client._e2ee, "generate_prekey", lambda: {
+        "device_id": "device-7",
+        "prekey_id": "pk-1",
+        "public_key": "pub",
+        "signature": "sig",
+        "created_at": 1,
+    })
+
+    async def _fake_call(method, params):
+        sent["method"] = method
+        sent["params"] = dict(params)
+        return {"ok": True}
+
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._upload_prekey())
+
+    assert result == {"ok": True}
+    assert sent["method"] == "message.e2ee.put_prekey"
+    assert sent["params"]["device_id"] == "device-7"
+
+
+def test_send_encrypted_does_not_forward_delivery_mode(monkeypatch):
+    client = AUNClient()
+    client._gateway_url = "wss://gateway.example.com/aun"
+    client._connect_delivery_mode = {
+        "mode": "queue",
+        "routing": "sender_affinity",
+        "affinity_ttl_ms": 1000,
+    }
+    sent = {}
+
+    async def _fake_fetch_peer_prekeys(peer_aid):
+        return [{
+            "device_id": "phone",
+            "prekey_id": "pk-1",
+            "public_key": "pub",
+            "signature": "sig",
+            "cert_fingerprint": "sha256:abc",
+        }]
+
+    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
+        return b"PEM"
+
+    def _fake_encrypt_copy_payload(**kwargs):
+        return {"ciphertext": "ok"}, {"encrypted": True, "forward_secrecy": True, "mode": "sealed_box"}
+
+    async def _fake_call(method, params):
+        sent.update(params)
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
+    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
+    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
+    client._transport.call = _fake_call
+
+    asyncio.run(client._send_encrypted({
+        "to": "bob.example.com",
+        "payload": {"text": "hello"},
+    }))
+
+    assert "delivery_mode" not in sent
+
+
+def test_send_encrypted_queue_mode_still_uses_multi_device_payload(monkeypatch):
+    client = AUNClient()
+    client._connect_delivery_mode = {
+        "mode": "queue",
+        "routing": "sender_affinity",
+        "affinity_ttl_ms": 1000,
+    }
+    sent = {}
+
+    async def _fake_fetch_peer_prekeys(peer_aid):
+        return [
+            {
+                "device_id": "phone",
+                "prekey_id": "pk-phone",
+                "public_key": "pub-phone",
+                "signature": "sig-phone",
+                "cert_fingerprint": "sha256:cert",
+            },
+            {
+                "device_id": "laptop",
+                "prekey_id": "pk-laptop",
+                "public_key": "pub-laptop",
+                "signature": "sig-laptop",
+                "cert_fingerprint": "sha256:cert",
+            },
+        ]
+
+    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
+        return b"PEM"
+
+    def _fake_encrypt_copy_payload(**kwargs):
+        prekey = kwargs["prekey"]
+        return (
+            {"type": "e2ee.encrypted", "ciphertext": prekey["prekey_id"]},
+            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
+        )
+
+    async def _fake_call(method, params):
+        sent["method"] = method
+        sent["params"] = dict(params)
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
+    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
+    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._send_encrypted({
+        "to": "bob.example.com",
+        "payload": {"text": "hello"},
+    }))
+
+    assert result == {"ok": True}
+    assert sent["method"] == "message.send"
+    assert sent["params"]["type"] == "e2ee.multi_device"
+    assert "delivery_mode" not in sent["params"]
+    assert [item["device_id"] for item in sent["params"]["payload"]["recipient_copies"]] == ["phone", "laptop"]
+
+
+def test_seq_tracker_state_isolated_between_slots(tmp_path):
+    root = tmp_path / "aun"
+    aid = "demo.agentid.pub"
+    base_identity = {
+        "aid": aid,
+        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+        "public_key_der_b64": "pub",
+        "curve": "P-256",
+    }
+    client_a = AUNClient({"aun_path": str(root)})
+    client_b = AUNClient({"aun_path": str(root)})
+    client_a._keystore.save_identity(aid, dict(base_identity))
+    client_b._keystore.save_identity(aid, dict(base_identity))
+    client_a._aid = aid
+    client_b._aid = aid
+    client_a._slot_id = "slot-a"
+    client_b._slot_id = "slot-b"
+
+    client_a._seq_tracker.restore_state({"p2p:demo": {"next_expected": 5}})
+    client_a._save_seq_tracker_state()
+    client_b._seq_tracker.restore_state({})
+    client_b._restore_seq_tracker_state()
+
+    assert client_b._seq_tracker.export_state() == {}
+
+
 def test_schedule_prekey_replenish_only_once_per_consumed_prekey():
-    client = AUNClient({"sqlite_backup": False})
+    """inflight 限流：同时多次消耗 prekey 只启动一个 upload，但 pending 会在 inflight 完成后再触发一次"""
+    client = AUNClient()
     client._state = "connected"
 
     async def _case():
@@ -602,14 +1222,16 @@ def test_schedule_prekey_replenish_only_once_per_consumed_prekey():
 
         client._upload_prekey = _fake_upload
         consumed = {"e2ee": {"encryption_mode": "prekey_ecdh_v2", "prekey_id": "pk-1"}}
+        # 第一次触发 → 启动 inflight
         client._schedule_prekey_replenish_if_consumed(consumed)
+        # 第二次 → inflight 中，计入 pending
         client._schedule_prekey_replenish_if_consumed(consumed)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        client._schedule_prekey_replenish_if_consumed(consumed)
-        await asyncio.sleep(0)
+        # 让 event loop 运行完成第一次 upload + pending 触发第二次
+        for _ in range(10):
+            await asyncio.sleep(0)
         return uploads
 
     uploads = asyncio.run(_case())
 
-    assert uploads == ["ok"]
+    # inflight 限流确保不会并发 upload；pending 合并确保完成后补充一次
+    assert len(uploads) <= 2

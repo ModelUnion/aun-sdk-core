@@ -87,9 +87,10 @@ export class AuthNamespace {
    * 优先使用已预置的 _gatewayUrl，否则基于 AID 自动发现。
    *
    * 发现流程：
+   * 发现流程：
    * 1. 若 _gatewayUrl 已预置，直接返回
-   * 2. https://{aid}/.well-known/aun-gateway（泛域名 nameservice）
-   * 3. https://gateway.{issuer}/.well-known/aun-gateway（Gateway 直连）
+   * 2. 开发环境：先 gateway.{issuer}，再 fallback {aid}（泛域名在开发环境可能不可用）
+   * 3. 生产环境：先 {aid}（泛域名 nameservice），再 fallback gateway.{issuer}
    */
   async _resolveGateway(aid?: string): Promise<string> {
     // 访问内部属性
@@ -106,8 +107,15 @@ export class AuthNamespace {
       const port = configModel.discoveryPort;
       const portSuffix = port ? `:${port}` : '';
 
-      const primaryUrl = `https://${resolvedAid}${portSuffix}/.well-known/aun-gateway`;
+      const aidUrl = `https://${resolvedAid}${portSuffix}/.well-known/aun-gateway`;
+      const gatewayDomainUrl = `https://gateway.${issuerDomain}${portSuffix}/.well-known/aun-gateway`;
       const discovery = client._discovery;
+
+      // 开发环境：先 gateway.{issuer}（固定域名），再 fallback {aid}（泛域名）
+      // 生产环境：先 {aid}（泛域名），再 fallback gateway.{issuer}
+      const [primaryUrl, fallbackUrl] = configModel.verifySsl
+        ? [aidUrl, gatewayDomainUrl]
+        : [gatewayDomainUrl, aidUrl];
 
       try {
         return await discovery.discover(primaryUrl);
@@ -115,7 +123,6 @@ export class AuthNamespace {
         // 主路径失败，尝试 fallback
       }
 
-      const fallbackUrl = `https://gateway.${issuerDomain}${portSuffix}/.well-known/aun-gateway`;
       return await discovery.discover(fallbackUrl);
     }
 

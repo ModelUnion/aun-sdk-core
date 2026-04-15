@@ -11,9 +11,9 @@ describe('AUNClient 群组 E2EE 配置', () => {
     expect(client.configModel.groupE2ee).toBe(true);
   });
 
-  it('可通过配置禁用群组 E2EE', () => {
-    const client = new AUNClient({ groupE2ee: false });
-    expect(client.configModel.groupE2ee).toBe(false);
+  it('构造期 groupE2ee 配置应被忽略并保持启用', () => {
+    const client = new AUNClient({ groupE2ee: false } as any);
+    expect(client.configModel.groupE2ee).toBe(true);
   });
 
   it('rotateOnJoin 默认为 false', () => {

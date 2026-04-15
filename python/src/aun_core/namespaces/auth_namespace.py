@@ -34,8 +34,8 @@ class AuthNamespace:
 
         发现流程：
         1. 若 _gateway_url 已预置，直接返回
-        2. https://{aid}/.well-known/aun-gateway（泛域名 nameservice）
-        3. https://gateway.{issuer}/.well-known/aun-gateway（Gateway 直连）
+        2. 开发环境：先 gateway.{issuer}，再 fallback {aid}（泛域名在开发环境可能不可用）
+        3. 生产环境：先 {aid}（泛域名 nameservice），再 fallback gateway.{issuer}
         """
         if self._client._gateway_url:
             return str(self._client._gateway_url)
@@ -47,14 +47,22 @@ class AuthNamespace:
             port = self._client._config_model.discovery_port
             port_suffix = f":{port}" if port else ""
 
-            primary_url = f"https://{resolved_aid}{port_suffix}/.well-known/aun-gateway"
+            aid_url = f"https://{resolved_aid}{port_suffix}/.well-known/aun-gateway"
+            gateway_url = f"https://gateway.{issuer_domain}{port_suffix}/.well-known/aun-gateway"
+
+            # 开发环境：先 gateway.{issuer}（固定域名），再 fallback {aid}（泛域名）
+            # 生产环境：先 {aid}（泛域名），再 fallback gateway.{issuer}
+            if self._client._config_model.verify_ssl:
+                primary_url, fallback_url = aid_url, gateway_url
+            else:
+                primary_url, fallback_url = gateway_url, aid_url
+
             try:
                 return await self._client._discovery.discover(primary_url)
             except Exception as _exc:
                 import logging as _logging
                 _logging.getLogger("aun_core").debug("gateway 发现失败: %s", _exc)
 
-            fallback_url = f"https://gateway.{issuer_domain}{port_suffix}/.well-known/aun-gateway"
             return await self._client._discovery.discover(fallback_url)
         raise ValidationError(
             "unable to resolve gateway: set client._gateway_url or provide 'aid' for auto-discovery"
