@@ -353,9 +353,9 @@ MSYS_NO_PATHCONV=1 docker exec client-a python /test/e2e_storage.py
 当 aun 服务模块（`../extensions/services`）代码有修改时，必须重新 build 并重启 docker 容器：
 
 ```bash
-# 在 docker-deploy 目录下 build 镜像
+# 在 docker-deploy 目录下 build 镜像（含测试容器镜像）
 cd ../docker-deploy
-docker compose -f docker-compose.build.yml build kite
+docker compose -f docker-compose.build.yml build kite sdk-tester
 
 # 重启单域
 docker compose up -d kite
@@ -366,6 +366,17 @@ docker compose up -d kite-a kite-b
 ```
 
 SDK 代码（`python/src`）挂载到容器内（`/sdk/src`），修改后无需 rebuild，但服务端代码打包在镜像中，必须 rebuild。
+
+#### 测试环境数据保护（最高优先级）
+
+**严格禁止未经用户明确同意的以下操作：**
+
+- **禁止删除或清空 AID 身份材料**：包括私钥（`*.key`）、证书（`*.crt`）、种子文件（`.seed`）、`key.json`、SQLCipher 数据库（`*.db`）等
+- **禁止删除或清空持久化身份目录**：包括 `client-data/`、`data/sdk-tester-aun/`、容器内 `/data/aun/` 下的任何 AID 子目录
+- **禁止擅自执行数据库清理命令**：如 `DELETE FROM agentid_cert`、`DROP TABLE` 等
+- **禁止擅自执行 `setup_aids.py` 重建身份**：除非用户明确要求
+
+**原则：测试环境的固定身份是长期复用资产，不是一次性消耗品。任何涉及身份材料增删改的操作都必须先征得用户同意。**
 
 ### 相关项目及文档位置
 

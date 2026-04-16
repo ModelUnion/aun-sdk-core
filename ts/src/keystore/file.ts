@@ -198,7 +198,24 @@ export class FileKeyStore implements KeyStore {
     }
     Object.assign(identity, tokens);
     if (kp) Object.assign(identity, kp);
-    if (cert) identity.cert = cert;
+    if (cert) {
+      // key/cert 公钥一致性校验：防止 cert.pem 被意外覆盖
+      const localPubB64 = kp?.public_key_der_b64;
+      if (typeof localPubB64 === 'string' && localPubB64) {
+        try {
+          const x = new crypto.X509Certificate(cert);
+          const certPubDer = x.publicKey.export({ type: 'spki', format: 'der' });
+          const localPubDer = Buffer.from(localPubB64, 'base64');
+          if (!certPubDer.equals(localPubDer)) {
+            console.error(`[keystore] 身份 ${aid} 的 key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert`);
+          } else {
+            identity.cert = cert;
+          }
+        } catch { identity.cert = cert; }
+      } else {
+        identity.cert = cert;
+      }
+    }
     return identity;
   }
 

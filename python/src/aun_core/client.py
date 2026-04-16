@@ -47,7 +47,7 @@ _INTERNAL_ONLY_METHODS = {
 }
 
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
-    "auto_reconnect": False,
+    "auto_reconnect": True,
     "heartbeat_interval": 30.0,
     "token_refresh_before": 60.0,
     "retry": {
@@ -1333,22 +1333,19 @@ class AUNClient:
             validated_at=now,
             refresh_after=now + _PEER_CERT_CACHE_TTL,
         )
+        # peer 证书只存到版本目录，不覆盖 cert.pem（防止破坏自身身份证书）
         try:
             self._keystore.save_cert(
                 aid,
                 cert_pem,
                 cert_fingerprint=cert_fingerprint,
-                make_active=not bool(cert_fingerprint),
+                make_active=False,
             )
         except TypeError:
-            # 兼容旧 keystore 实现：仅 active_signing 路径覆盖主证书
-            if not cert_fingerprint:
-                try:
-                    self._keystore.save_cert(aid, cert_pem)
-                except Exception as exc:
-                    _client_log.error("写入证书到 keystore 失败 (aid=%s): %s", aid, exc)
+            # 兼容旧 keystore 实现
+            pass
         except Exception as exc:
-            _client_log.error("写入证书到 keystore 失败 (aid=%s, fp=%s): %s", aid, cert_fingerprint or "", exc)
+            _client_log.error("写入 peer 证书到 keystore 失败 (aid=%s, fp=%s): %s", aid, cert_fingerprint or "", exc)
         return cert_bytes
 
     async def _fetch_peer_prekeys(self, peer_aid: str) -> list[dict[str, Any]]:
@@ -1592,13 +1589,7 @@ class AUNClient:
         try:
             # _fetch_peer_cert 内部：下载 → 完整 PKI 验证 → 更新内存缓存
             cert_bytes = await self._fetch_peer_cert(aid, cert_fingerprint)
-            cert_pem = cert_bytes.decode("utf-8") if isinstance(cert_bytes, bytes) else cert_bytes
-            self._keystore.save_cert(
-                aid,
-                cert_pem,
-                cert_fingerprint=cert_fingerprint,
-                make_active=not bool(cert_fingerprint),
-            )
+            # _fetch_peer_cert 内部已保存到版本目录，此处无需重复保存
             return True
         except Exception as exc:
             # 刷新失败时：若内存缓存有 PKI 验证过的证书（未过期 × 2 倍 TTL）则继续用

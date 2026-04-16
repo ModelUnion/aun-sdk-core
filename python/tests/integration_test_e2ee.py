@@ -141,7 +141,12 @@ def _copy_identity_tree(source_root: Path, target_root: Path, aid: str) -> None:
     if source_seed.exists():
         shutil.copy2(source_seed, target_root / ".seed")
     (target_root / "AIDs").mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source_identity, target_root / "AIDs" / aid, dirs_exist_ok=True)
+    # 跳过 SQLite WAL 临时文件（-shm/-wal），它们会在新连接时自动重建
+    _skip_suffixes = {".db-shm", ".db-wal"}
+    shutil.copytree(
+        source_identity, target_root / "AIDs" / aid, dirs_exist_ok=True,
+        ignore=lambda d, files: [f for f in files if any(f.endswith(s) for s in _skip_suffixes)],
+    )
 
 
 def _prepare_isolated_identity(tag: str, aid: str) -> Path:

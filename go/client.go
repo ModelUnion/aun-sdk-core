@@ -1733,7 +1733,8 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	c.certCacheMu.Unlock()
 
 	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok {
-		if err := versioned.SaveCertVersion(aid, string(certBytes), certFingerprint, strings.TrimSpace(certFingerprint) == ""); err != nil {
+		// peer 证书只存版本目录，不覆盖 cert.pem
+		if err := versioned.SaveCertVersion(aid, string(certBytes), certFingerprint, false); err != nil {
 			log.Printf("写入版本化证书失败 (aid=%s): %v", aid, err)
 		}
 	} else if strings.TrimSpace(certFingerprint) == "" {
@@ -1887,7 +1888,8 @@ func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string, cert
 	}
 	certPEM := string(certBytes)
 	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok {
-		if err := versioned.SaveCertVersion(aid, certPEM, requestedFingerprint, strings.TrimSpace(requestedFingerprint) == ""); err != nil {
+		// peer 证书只存版本目录，不覆盖 cert.pem
+		if err := versioned.SaveCertVersion(aid, certPEM, requestedFingerprint, false); err != nil {
 			log.Printf("保存版本化证书失败 (aid=%s): %v", aid, err)
 		}
 	} else if err := c.keyStore.SaveCert(aid, certPEM); err != nil {
@@ -3103,7 +3105,7 @@ func (c *AUNClient) normalizeConnectParams(params map[string]any) (map[string]an
 // buildSessionOptions 构建会话选项
 func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 	options := map[string]any{
-		"auto_reconnect":       false,
+		"auto_reconnect":       true,
 		"heartbeat_interval":   30.0,
 		"token_refresh_before": 60.0,
 		"retry": map[string]any{

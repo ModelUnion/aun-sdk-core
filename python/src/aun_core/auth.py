@@ -212,7 +212,17 @@ class AuthFlow:
                     f"local certificate missing and recovery failed: {e}. "
                     f"Run auth.create_aid() to register a new identity."
                 ) from e
-        login = await self._login(gateway_url, identity)
+        try:
+            login = await self._login(gateway_url, identity)
+        except AuthError as e:
+            if "not registered" in str(e):
+                _auth_log.warning("证书未在服务端注册，自动重新注册: aid=%s", identity["aid"])
+                created = await self._create_aid(gateway_url, identity)
+                identity["cert"] = created["cert"]
+                self._persist_identity(identity)
+                login = await self._login(gateway_url, identity)
+            else:
+                raise
         self._remember_tokens(identity, login)
         await self._validate_new_cert(identity, gateway_url)
         self._persist_identity(identity)
@@ -894,6 +904,10 @@ class AuthFlow:
         new_cert = auth_result.get("new_cert")
         if new_cert:
             identity["_pending_new_cert"] = new_cert
+        # 服务端返回 active_cert 用于同步本地 cert.pem
+        active_cert = auth_result.get("active_cert")
+        if active_cert:
+            identity["_pending_active_cert"] = active_cert
 
     async def _validate_new_cert(self, identity: dict[str, Any], gateway_url: str = "") -> None:
         """验证服务端返回的 new_cert，通过后才正式接受。
@@ -941,6 +955,30 @@ class AuthFlow:
             _auth_log.warning("拒绝服务端返回的 new_cert (%s): %s", identity.get("aid"), exc)
         except Exception as exc:
             _auth_log.warning("new_cert 验证异常 (%s): %s", identity.get("aid"), exc)
+
+        # 同步服务端 active_signing 证书到本地
+        active_cert_pem = identity.pop("_pending_active_cert", None)
+        if active_cert_pem:
+            try:
+                act = x509.load_pem_x509_certificate(
+                    active_cert_pem.encode("utf-8") if isinstance(active_cert_pem, str) else active_cert_pem
+                )
+                act_pub_der = act.public_key().public_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                local_pub_b64 = identity.get("public_key_der_b64", "")
+                if local_pub_b64:
+                    local_pub_der = base64.b64decode(local_pub_b64)
+                    if act_pub_der != local_pub_der:
+                        _auth_log.error(
+                            "服务端 active_cert 公钥与本地私钥不匹配 (%s)，拒绝同步",
+                            identity.get("aid"),
+                        )
+                    else:
+                        identity["cert"] = active_cert_pem if isinstance(active_cert_pem, str) else active_cert_pem.decode("utf-8")
+            except Exception as exc:
+                _auth_log.warning("active_cert 同步异常 (%s): %s", identity.get("aid"), exc)
 
     @staticmethod
     def _get_cached_access_token(identity: dict[str, Any]) -> str:

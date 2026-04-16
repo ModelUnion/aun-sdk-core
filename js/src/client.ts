@@ -161,7 +161,7 @@ interface UploadPrekeyResult extends JsonObject {
 }
 
 const DEFAULT_SESSION_OPTIONS: SessionOptions = {
-  auto_reconnect: false,
+  auto_reconnect: true,
   heartbeat_interval: 30.0,
   token_refresh_before: 60.0,
   retry: {
@@ -1598,7 +1598,8 @@ export class AUNClient {
     });
 
     try {
-      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: !Boolean(certFingerprint) });
+      // peer 证书只存版本目录，不覆盖 cert.pem
+      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
     } catch (exc) {
       console.error(`写入证书到 keystore 失败 (aid=${aid}):`, exc);
     }
@@ -1706,7 +1707,8 @@ export class AUNClient {
     }
     try {
       const certPem = await this._fetchPeerCert(aid, certFingerprint);
-      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: !Boolean(certFingerprint) });
+      // peer 证书只存版本目录，不覆盖 cert.pem
+      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
       return true;
     } catch (exc) {
       // 刷新失败时：若缓存有 PKI 验证过的证书（2 倍 TTL 内）则继续用
