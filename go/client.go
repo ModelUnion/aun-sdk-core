@@ -14,8 +14,8 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -163,15 +163,15 @@ type cachedPeerPrekeys struct {
 
 // AUNClient AUN 协议客户端主类
 type AUNClient struct {
-	mu          sync.RWMutex
-	config      map[string]any
-	configModel *AUNConfig
-	state       ClientState
-	aid         string
-	identity    map[string]any
-	gatewayURL  string
-	deviceID    string
-	slotID      string
+	mu           sync.RWMutex
+	config       map[string]any
+	configModel  *AUNConfig
+	state        ClientState
+	aid          string
+	identity     map[string]any
+	gatewayURL   string
+	deviceID     string
+	slotID       string
 	closing      atomic.Bool
 	reconnecting atomic.Bool
 
@@ -200,7 +200,8 @@ type AUNClient struct {
 	prekeyReplenished          map[string]bool
 
 	// 消息序列号跟踪器（群消息 + P2P 空洞检测）
-	seqTracker *SeqTracker
+	seqTracker        *SeqTracker
+	seqTrackerContext string
 
 	// 补洞去重：已完成/进行中的 key 集合，防止重复 pull 同一区间
 	gapFillDone   map[string]bool
@@ -538,6 +539,7 @@ func (c *AUNClient) Close() error {
 		}
 		c.mu.Lock()
 		c.state = StateClosed
+		c.resetSeqTrackingStateLocked()
 		c.mu.Unlock()
 		return nil
 	}
@@ -552,6 +554,7 @@ func (c *AUNClient) Close() error {
 
 	c.mu.Lock()
 	c.state = StateClosed
+	c.resetSeqTrackingStateLocked()
 	c.mu.Unlock()
 
 	c.events.Publish("connection.state", map[string]any{"state": string(StateClosed)})
@@ -1730,7 +1733,8 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	c.certCacheMu.Unlock()
 
 	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok {
-		if err := versioned.SaveCertVersion(aid, string(certBytes), certFingerprint, strings.TrimSpace(certFingerprint) == ""); err != nil {
+		// peer 证书只存版本目录，不覆盖 cert.pem
+		if err := versioned.SaveCertVersion(aid, string(certBytes), certFingerprint, false); err != nil {
 			log.Printf("写入版本化证书失败 (aid=%s): %v", aid, err)
 		}
 	} else if strings.TrimSpace(certFingerprint) == "" {
@@ -1884,7 +1888,8 @@ func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string, cert
 	}
 	certPEM := string(certBytes)
 	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok {
-		if err := versioned.SaveCertVersion(aid, certPEM, requestedFingerprint, strings.TrimSpace(requestedFingerprint) == ""); err != nil {
+		// peer 证书只存版本目录，不覆盖 cert.pem
+		if err := versioned.SaveCertVersion(aid, certPEM, requestedFingerprint, false); err != nil {
 			log.Printf("保存版本化证书失败 (aid=%s): %v", aid, err)
 		}
 	} else if err := c.keyStore.SaveCert(aid, certPEM); err != nil {
@@ -2161,6 +2166,7 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 
 	c.mu.Lock()
 	c.state = StateConnected
+	c.refreshSeqTrackerContextLocked()
 	c.mu.Unlock()
 
 	c.events.Publish("connection.state", map[string]any{"state": "connected", "gateway": gatewayURL})
@@ -2175,6 +2181,34 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 	}
 
 	return nil
+}
+
+func buildSeqTrackerContext(aid, deviceID, slotID string) string {
+	aid = strings.TrimSpace(aid)
+	if aid == "" {
+		return ""
+	}
+	return aid + "\x00" + strings.TrimSpace(deviceID) + "\x00" + strings.TrimSpace(slotID)
+}
+
+func (c *AUNClient) resetSeqTrackingStateLocked() {
+	c.seqTracker = NewSeqTracker()
+	c.seqTrackerContext = ""
+	c.gapFillDoneMu.Lock()
+	c.gapFillDone = make(map[string]bool)
+	c.gapFillDoneMu.Unlock()
+}
+
+func (c *AUNClient) refreshSeqTrackerContextLocked() {
+	nextContext := buildSeqTrackerContext(c.aid, c.deviceID, c.slotID)
+	if nextContext == c.seqTrackerContext {
+		return
+	}
+	c.seqTracker = NewSeqTracker()
+	c.seqTrackerContext = nextContext
+	c.gapFillDoneMu.Lock()
+	c.gapFillDone = make(map[string]bool)
+	c.gapFillDoneMu.Unlock()
 }
 
 // resolveGateway 解析 Gateway URL
@@ -3071,7 +3105,7 @@ func (c *AUNClient) normalizeConnectParams(params map[string]any) (map[string]an
 // buildSessionOptions 构建会话选项
 func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 	options := map[string]any{
-		"auto_reconnect":       false,
+		"auto_reconnect":       true,
 		"heartbeat_interval":   30.0,
 		"token_refresh_before": 60.0,
 		"retry": map[string]any{

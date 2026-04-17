@@ -1235,3 +1235,44 @@ def test_schedule_prekey_replenish_only_once_per_consumed_prekey():
 
     # inflight 限流确保不会并发 upload；pending 合并确保完成后补充一次
     assert len(uploads) <= 2
+
+
+def test_seq_tracker_same_context_refresh_keeps_in_memory_state(tmp_path):
+    aid = "alice.agentid.pub"
+    client = AUNClient({"aun_path": str(tmp_path)})
+    client._aid = aid
+    client._slot_id = "slot-a"
+    client._refresh_seq_tracking_context()
+    client._seq_tracker.restore_state({"p2p:demo": 5})
+    client._gap_fill_done.add("p2p:5")
+    client._refresh_seq_tracking_context()
+
+    assert client._seq_tracker.export_state() == {"p2p:demo": 5}
+    assert client._gap_fill_done == {"p2p:5"}
+
+
+def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path):
+    aid = "alice.agentid.pub"
+    root = tmp_path / "aun"
+    client = AUNClient({"aun_path": str(root)})
+    identity = {
+        "aid": aid,
+        "access_token": "token",
+        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+        "public_key_der_b64": "pub",
+        "curve": "P-256",
+    }
+    client._keystore.save_identity(aid, identity)
+    client._aid = aid
+    client._slot_id = "slot-a"
+    client._seq_tracker.restore_state({"p2p:demo": 5})
+    client._gap_fill_done.add("p2p:5")
+    client._refresh_seq_tracking_context()
+    client._save_seq_tracker_state()
+
+    client._slot_id = "slot-b"
+    client._refresh_seq_tracking_context()
+    client._restore_seq_tracker_state()
+
+    assert client._seq_tracker.export_state() == {}
+    assert client._gap_fill_done == set()

@@ -1,8 +1,12 @@
 package keystore
 
 import (
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -312,9 +316,40 @@ func (f *FileKeyStore) LoadIdentity(aid string) (map[string]any, error) {
 		identity[k] = v
 	}
 	if cert != "" {
+		// key/cert 公钥一致性校验：防止 cert.pem 被意外覆盖
+		localPubB64, _ := kp["public_key_der_b64"].(string)
+		if localPubB64 != "" {
+			if matched := verifyCertKeyMatch(cert, localPubB64); !matched {
+				log.Printf("[keystore] 身份 %s 的 key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert", aid)
+				cert = ""
+			}
+		}
+	}
+	if cert != "" {
 		identity["cert"] = cert
 	}
 	return identity, nil
+}
+
+// verifyCertKeyMatch 比对 cert PEM 中的公钥与 base64 编码的 DER 公钥是否一致
+func verifyCertKeyMatch(certPEM, localPubB64 string) bool {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return true // 解析失败不阻断
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return true
+	}
+	certPubDer, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return true
+	}
+	localPubDer, err := base64.StdEncoding.DecodeString(localPubB64)
+	if err != nil {
+		return true
+	}
+	return string(certPubDer) == string(localPubDer)
 }
 
 func (f *FileKeyStore) SaveIdentity(aid string, identity map[string]any) error {

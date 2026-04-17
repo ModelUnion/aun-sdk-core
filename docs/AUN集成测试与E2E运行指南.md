@@ -12,12 +12,29 @@
 - 双域固定身份统一落在 `D:\modelunion\kite\docker-deploy\federation-test\client-data`，容器内路径固定为 `/data/aun`。
 - 如果改了 `extensions/services` 下的服务端代码，必须重新 build Docker 镜像并重启对应容器。
 - 如果只改了 `aun-sdk-core/python/src` 或测试脚本，单域 `sdk-tester`、双域 `client-a/client-b` 都是目录挂载，通常不需要 rebuild 镜像，直接重跑即可。
-- `kite-sdk-tester`、`client-a`、`client-b` 当前都是裸 `python:3.13-slim` 容器，不自带 SDK 运行依赖或测试依赖；只要容器被 `--force-recreate`，之前手工装进容器的依赖就会丢失，必须重新执行依赖安装步骤。
+- `kite-sdk-tester`、`client-a`、`client-b` 使用预构建的 `aun-sdk-tester` 镜像（`Dockerfile.sdk-tester`），已内置所有 Python 测试依赖（含 `sqlcipher3`），`--force-recreate` 后无需手动安装。
 - 单域环境当前只有 Python 常驻测试容器；TS/Go 单域集成与 E2E 测试统一通过临时 `docker run` 接入 `docker-deploy_kite-net` 执行。
 - TS 在 Linux 容器里运行时不能直接复用宿主机 Windows 上的 `node_modules`；必须先把源码复制到容器内临时目录，再在容器内重新 `npm install`，否则容易触发 `better-sqlite3 ... invalid ELF header`。
 - Go 在 Linux 容器里运行时，推荐把宿主机 `C:\go\pkg\mod` 只读挂进容器作为 `GOMODCACHE=/go/pkg/mod`，避免测试容器临时联网拉依赖。
 - 双域 `ts-tester`、`go-tester` 只负责提供容器网络与基础 runtime；TS 依赖仍需在容器内临时副本中安装，Go 仍建议挂载宿主机模块缓存。
 - TS/Go 双域 reconnect 测试不是单纯 `docker exec` 一条命令，需要宿主机在测试进程写出 marker 后协调执行 `docker restart federation-kite-b`。
+
+### 测试环境数据保护（最高优先级）
+
+**严格禁止未经用户明确同意的以下操作：**
+
+- **禁止删除或清空 AID 身份材料**：包括私钥（`*.key`）、证书（`*.crt`）、种子文件（`.seed`）、`key.json`、SQLCipher 数据库（`*.db`）等。这些文件一旦丢失，对应 AID 将永久无法恢复。
+- **禁止删除或清空持久化身份目录**：包括 `client-data/`、`data/sdk-tester-aun/`、容器内 `/data/aun/` 下的任何 AID 子目录。
+- **禁止擅自执行数据库清理命令**：如 `DELETE FROM agentid_cert`、`DROP TABLE` 等。
+- **禁止擅自执行 `setup_aids.py` 重建身份**：除非用户明确要求。
+
+**可以安全执行的操作：**
+
+- 读取、查看身份文件和数据库记录（只读）
+- 运行测试脚本（测试脚本本身不应修改持久化身份）
+- 查看容器日志和状态
+
+**原则：测试环境的固定身份是长期复用资产，不是一次性消耗品。任何涉及身份材料增删改的操作都必须先征得用户同意。**
 
 ## 目录约定
 
@@ -30,22 +47,24 @@
 
 ## 一次性准备
 
-先构建服务镜像：
+先构建服务镜像和测试容器镜像：
 
 ```powershell
 cd D:\modelunion\kite\docker-deploy
-docker compose -f docker-compose.build.yml build kite
+docker compose -f docker-compose.build.yml build kite sdk-tester
 ```
 
-单域测试容器和双域客户端容器默认只挂载源码与测试目录，不自带测试依赖。首次启动后需要安装一次；后续只要这些容器被重建，也需要重新安装：
+`aun-sdk-tester` 镜像（`Dockerfile.sdk-tester`）已内置所有 Python 测试依赖（含 `sqlcipher3`）。正常情况下，单域 `kite-sdk-tester`、双域 `client-a/client-b` 启动后即可直接运行测试，无需手动安装。
+
+如果因网络或镜像原因 `aun-sdk-tester` 构建失败，回退到裸 `python:3.13-slim` 容器时，需要在首次启动后手动安装依赖（后续只要容器被 `--force-recreate` 重建，也需要重新安装）：
 
 ```powershell
-docker exec kite-sdk-tester python -m pip install -U pip pytest aiohttp websockets cryptography requests
-docker exec client-a python -m pip install -U pip pytest aiohttp websockets cryptography requests
-docker exec client-b python -m pip install -U pip pytest aiohttp websockets cryptography requests
+docker exec kite-sdk-tester python -m pip install -U pip pytest aiohttp websockets cryptography requests sqlcipher3
+docker exec client-a python -m pip install -U pip pytest aiohttp websockets cryptography requests sqlcipher3
+docker exec client-b python -m pip install -U pip pytest aiohttp websockets cryptography requests sqlcipher3
 ```
 
-如果只是重启服务容器 `kite` / `kite-a` / `kite-b`，而没有重建 `sdk-tester`、`client-a`、`client-b`，通常不需要重复安装；如果执行过 `docker compose up -d --force-recreate`，就按上面的命令重新补依赖。
+如果只是重启服务容器 `kite` / `kite-a` / `kite-b`，而没有重建 `sdk-tester`、`client-a`、`client-b`，不需要重新安装依赖。使用预构建的 `aun-sdk-tester` 镜像时，即使 `--force-recreate` 也无需手动补依赖，因为依赖已烘焙在镜像中。
 
 双域固定身份的持久化目录：
 
@@ -289,6 +308,17 @@ docker exec client-a python /test/e2e_group.py
 docker exec client-a python /test/e2e_storage.py
 ```
 
+以下测试脚本内部会调用 `docker exec` 操作另一个容器（"套娃"模式），**必须在宿主机 PowerShell 中运行**，不能在容器内运行：
+
+```powershell
+# 宿主机 PowerShell 执行（Windows Git Bash 下加 MSYS_NO_PATHCONV=1）
+docker exec client-a python /test/e2e_real.py
+docker exec client-a python /test/e2e_comprehensive.py
+docker exec client-a python /test/e2e_coverage_gaps.py
+```
+
+这三个脚本都需要容器内能访问 `docker` CLI，当前 `aun-sdk-tester` 镜像未内置 Docker CLI，因此暂时无法在容器内直接运行。如需运行，可在宿主机安装 Docker SDK 后从宿主机直接执行。
+
 `client-b` 与 `client-a` 共享同一个 `/data/aun` 宿主持久化目录，因此如需从另一侧复核，也可以在 `client-b` 中对称执行。
 
 ### TypeScript 集成 / E2E
@@ -371,8 +401,6 @@ cd D:\modelunion\kite\docker-deploy
 docker compose up -d --force-recreate kite sdk-tester
 ```
 
-注意：这条命令会重建 `sdk-tester`，因此需要重新执行上面的 Python 依赖安装步骤。
-
 双域重启：
 
 ```powershell
@@ -380,7 +408,7 @@ cd D:\modelunion\kite\docker-deploy\federation-test
 docker compose up -d --force-recreate kite-a kite-b client-a client-b
 ```
 
-注意：这条命令会重建 `client-a`、`client-b`，因此也需要重新执行上面的 Python 依赖安装步骤。
+使用预构建的 `aun-sdk-tester` 镜像时，`--force-recreate` 不会丢失依赖，无需手动重装。
 
 ### 只改了 SDK 或测试脚本
 
@@ -395,16 +423,24 @@ docker compose up -d --force-recreate kite-a kite-b client-a client-b
 - 再看测试容器内是否能解析 `gateway.{issuer}`、`stream.{issuer}`、`storage.{issuer}`、`group.{issuer}`。
 - 如果测试脚本拿到的是 `127.0.0.1` 或 `localhost`，优先视为服务端 URL 生成逻辑有 bug，而不是测试环境问题。
 - 如果固定 `alice.aid.com` / `bobb.aid.net` 登录失败，先区分两种情况：
-- 如果是“本地身份存在，但数据库里没有对应证书记录”，不要清库。这不是脏数据冲突，而是服务端登记缺失。应以本地持久化身份为准，执行一次补登记或导入，把现有证书恢复到数据库。
-- 如果是“本地身份与数据库中的证书不匹配”，这才属于脏数据冲突。此时再清理上面的固定 AID 记录，然后重新执行 `/test/setup_aids.py`。
+- 如果是”本地身份存在，但数据库里没有对应证书记录”，不要清库。这不是脏数据冲突，而是服务端登记缺失。应以本地持久化身份为准，执行一次补登记或导入，把现有证书恢复到数据库。
+- 如果是”本地身份与数据库中的证书不匹配”，这才属于脏数据冲突。此时再清理上面的固定 AID 记录，然后重新执行 `/test/setup_aids.py`。
 - 如果改了服务端代码但测试结果没变化，通常是镜像没 rebuild 或容器没重启。
 - 双域问题优先分别检查 `client-a -> aid.com`、`client-a -> aid.net`、`client-b -> aid.net`、`client-b -> aid.com` 四条路径。
 - TS 如果在 Linux 容器里直接使用宿主机 `node_modules`，优先怀疑原生模块 ABI 不匹配，而不是业务代码本身。
 - Go 如果在容器里跑测试时开始重新联网下载模块，优先检查 `C:\go\pkg\mod -> /go/pkg/mod` 的只读挂载和 `GOMODCACHE=/go/pkg/mod` 是否生效。
+
+### 常见踩坑
+
+- **`ModuleNotFoundError: No module named 'sqlcipher3'`**：SDK 依赖 `sqlcipher3`，`Dockerfile.sdk-tester` 中通过 `sqlcipher3-binary` 安装（自带预编译库，无需系统级 `libsqlcipher-dev`）。如果手动 pip 安装，使用 `pip install sqlcipher3-binary` 而不是 `pip install sqlcipher3`（后者需要编译环境）。
+- **`message.send does not accept delivery_mode`**：SDK 新版本要求 `delivery_mode` 在 `connect()` 时配置，不能在 `message.send` 参数中传入。测试脚本中的 `”delivery_mode”: {“mode”: “fanout”}` 应从 `message.send` 调用中移除，改到 `make_client()` 或 `connect()` 参数中。
+- **套娃型测试报 `FileNotFoundError: 'docker'`**：`e2e_real.py`、`e2e_comprehensive.py`、`e2e_coverage_gaps.py` 内部调用 `docker exec` 操控其他容器。这些脚本必须在宿主机运行（`python tests/e2e_xxx.py`），不能通过 `docker exec client-a python /test/...` 在容器内执行。
+- **`sqlcipher_page_cipher: hmac check failed`**：SQLCipher 数据库文件的加密密钥与当前 `.seed` 不匹配。通常是多个测试进程使用不同 seed 访问了同一个 `.db` 文件。临时 AID（非固定身份）的数据库可安全删除重建；固定 AID 的数据库需谨慎处理。
 
 ## 当前边界
 
 - `integration_test_reconnect.py` 仍是宿主机脚本，不适合放进测试容器。
 - `ts/tests/integration/reconnect.test.ts` 也是宿主机协调型测试，用于控制单域 `docker compose restart kite`，不适合直接塞进单域临时测试容器。
 - Go 当前没有单域 Docker reconnect 用例；双域 reconnect 已通过 `federation_reconnect_test.go` 覆盖。
+- 双域 `e2e_real.py`、`e2e_comprehensive.py`、`e2e_coverage_gaps.py` 内部会调用 `docker exec` 操控其他容器，需要从宿主机运行，不能在 `client-a/client-b` 容器内执行。
 - 其余单域集成测试、双域 federation/E2E 脚本应优先在 Docker 测试容器内运行，以保证与服务端网络环境一致。

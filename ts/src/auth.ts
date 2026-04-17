@@ -431,7 +431,21 @@ export class AuthFlow {
         );
       }
     }
-    const login = await this._login(gatewayUrl, identity);
+    let login: JsonObject;
+    try {
+      login = await this._login(gatewayUrl, identity);
+    } catch (e) {
+      // 证书未在服务端注册或公钥不匹配 — 自动重新注册
+      if (e instanceof AuthError && (String(e.message).includes('not registered') || String(e.message).includes('public key mismatch'))) {
+        _authLog('warn', '证书未在服务端注册，自动重新注册: aid=%s', identity.aid);
+        const created = await this._createAid(gatewayUrl, identity);
+        identity.cert = created.cert as string;
+        this._persistIdentity(identity);
+        login = await this._login(gatewayUrl, identity);
+      } else {
+        throw e;
+      }
+    }
     AuthFlow._rememberTokens(identity, login);
     await this._validateNewCert(identity, gatewayUrl);
     this._persistIdentity(identity);
@@ -1347,10 +1361,11 @@ export class AuthFlow {
     }
     const responseStatus = ocspDer[statusTag.contentOffset];
     if (responseStatus !== 0) {
-      // 非 successful
+      // 非 successful（如 unauthorized=6 表示 responder 无法回答，常见于 unknown 证书）
+      // 抛普通 Error 而非 AuthError，让外层 catch 降级到 JSON status 字段
       const statusNames = ['successful', 'malformedRequest', 'internalError', 'tryLater', '', 'sigRequired', 'unauthorized'];
       const statusName = statusNames[responseStatus] || `unknown(${responseStatus})`;
-      throw new AuthError(`gateway OCSP response status is ${statusName}`);
+      throw new Error(`OCSP responseStatus is ${statusName} (non-successful), fallback to JSON status`);
     }
     offset += statusTag.totalLength;
 
@@ -1591,6 +1606,27 @@ export class AuthFlow {
         _authLog('warn', 'new_cert 验证异常 (%s): %s', identity.aid, e instanceof Error ? e.message : String(e));
       }
     }
+
+    // active_cert 同步：验证公钥匹配后更新本地 cert
+    const activeCertPem = identity._pending_active_cert;
+    delete identity._pending_active_cert;
+    if (typeof activeCertPem === 'string' && activeCertPem) {
+      try {
+        const actCert = _loadX509(activeCertPem);
+        const actPubDer = _extractPublicKey(actCert).export({ type: 'spki', format: 'der' });
+        const localPubB64 = String(identity.public_key_der_b64 || '');
+        if (localPubB64) {
+          const localPubDer = Buffer.from(localPubB64, 'base64');
+          if (actPubDer.equals(localPubDer)) {
+            identity.cert = activeCertPem;
+          } else {
+            _authLog('warn', '服务端 active_cert 公钥与本地私钥不匹配，拒绝同步 (aid=%s)', identity.aid);
+          }
+        }
+      } catch (e) {
+        _authLog('warn', 'active_cert 同步异常 (%s): %s', identity.aid, e instanceof Error ? e.message : String(e));
+      }
+    }
   }
 
   // ── 内部方法：Token 管理 ───────────────────────────────────
@@ -1618,6 +1654,11 @@ export class AuthFlow {
     const newCert = authResult.new_cert;
     if (typeof newCert === 'string' && newCert) {
       identity._pending_new_cert = newCert;
+    }
+    // 服务端返回 active_cert 用于同步本地 cert.pem
+    const activeCert = authResult.active_cert;
+    if (typeof activeCert === 'string' && activeCert) {
+      identity._pending_active_cert = activeCert;
     }
   }
 
@@ -1675,6 +1716,7 @@ export class AuthFlow {
         throw new StateError(`identity not found for aid: ${requestedAid}`);
       }
       this._aid = requestedAid;
+      if (!existing.aid) existing.aid = requestedAid;
       return existing;
     }
     // 尝试加载任意身份

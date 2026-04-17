@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .base import KeyStore
@@ -514,6 +514,32 @@ class FileKeyStore(KeyStore):
             identity.update(key_pair)
         if cert:
             identity["cert"] = cert
+        # key/cert 公钥一致性校验：防止 cert.pem 被意外覆盖导致签名验证失败
+        if isinstance(key_pair, dict) and cert:
+            try:
+                local_pub_b64 = key_pair.get("public_key_der_b64", "")
+                if local_pub_b64:
+                    import base64 as _b64
+                    cert_obj = x509.load_pem_x509_certificate(cert.encode("utf-8"))
+                    cert_pub_der = cert_obj.public_key().public_bytes(
+                        serialization.Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    local_pub_der = _b64.b64decode(local_pub_b64)
+                    if cert_pub_der != local_pub_der:
+                        import base64
+                        cert_pub_b64 = base64.b64encode(cert_pub_der).decode()[:20]
+                        local_pub_b64_short = local_pub_b64[:20]
+                        _log.error(
+                            "身份 %s 的 key.json 公钥与 cert.pem 公钥不匹配！"
+                            "key.json=%s... cert.pem=%s... "
+                            "cert.pem 可能被 peer 证书覆盖，将忽略损坏的 cert.pem",
+                            aid, local_pub_b64_short, cert_pub_b64,
+                        )
+                        # 丢弃损坏的 cert，以 key_pair 为准（后续登录会重新获取正确证书）
+                        del identity["cert"]
+            except Exception as exc:
+                _log.warning("身份 %s key/cert 一致性校验异常: %s", aid, exc)
         return identity
 
     # ── 静态辅助 ─────────────────────────────────────────────

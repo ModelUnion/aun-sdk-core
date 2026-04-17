@@ -1003,16 +1003,18 @@ export class E2EEManager {
     return crypto.createPrivateKey(privateKeyPem);
   }
 
-  /** 本地 identity 指纹（优先公钥指纹，不绑定具体证书版本） */
+  /** 本地 identity 指纹（优先证书 DER SHA-256，缺失时回退到公钥指纹） */
   private _localIdentityFingerprint(): string {
+    // 优先用证书指纹（与 PKI 一致）
     const identity = this._identityFn();
+    const cert = identity.cert as string | undefined;
+    if (cert) {
+      return certificateSha256Fingerprint(cert);
+    }
+    // 无证书时回退到公钥 SPKI 指纹
     const publicKeyDerB64 = identity.public_key_der_b64 as string | undefined;
     if (publicKeyDerB64) {
       return fingerprintPublicKeyDer(Buffer.from(publicKeyDerB64, 'base64'));
-    }
-    const cert = identity.cert as string | undefined;
-    if (cert) {
-      return fingerprintKeyObject(pemToCertPublicKey(cert));
     }
     const privateKeyPem = identity.private_key_pem as string | undefined;
     if (privateKeyPem) {

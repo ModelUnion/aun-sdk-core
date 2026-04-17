@@ -569,7 +569,21 @@ export class AuthFlow {
       }
     }
 
-    const login = await this._login(gatewayUrl, identity);
+    let login: JsonObject;
+    try {
+      login = await this._login(gatewayUrl, identity);
+    } catch (e) {
+      // 证书未在服务端注册或公钥不匹配 — 自动重新注册
+      if (e instanceof AuthError && (String((e as Error).message).includes('not registered') || String((e as Error).message).includes('public key mismatch'))) {
+        console.warn(`[auth] 证书未在服务端注册，自动重新注册: aid=${identity.aid}`);
+        const created = await this._createAid(gatewayUrl, identity);
+        identity.cert = created.cert as string;
+        await this._persistIdentity(identity);
+        login = await this._login(gatewayUrl, identity);
+      } else {
+        throw e;
+      }
+    }
     this._rememberTokens(identity, login);
     await this._validateNewCert(identity, gatewayUrl);
     await this._persistIdentity(identity);
@@ -1353,6 +1367,9 @@ export class AuthFlow {
     // login2 响应含 new_cert 时（证书过半自动续期），暂存待验证
     const newCert = authResult.new_cert;
     if (typeof newCert === 'string' && newCert) identity._pending_new_cert = newCert;
+    // 服务端返回 active_cert 用于同步本地 cert.pem
+    const activeCert = authResult.active_cert;
+    if (typeof activeCert === 'string' && activeCert) identity._pending_active_cert = activeCert;
   }
 
   /** 验证服务端返回的 new_cert，通过后正式接受 */
@@ -1401,6 +1418,26 @@ export class AuthFlow {
     } catch (e) {
       // 验证失败，静默拒绝（不影响主流程）
       console.warn(`拒绝服务端返回的 new_cert (${identity.aid}):`, e);
+    }
+
+    // active_cert 同步：验证公钥匹配后更新本地 cert
+    const activeCertPem = identity._pending_active_cert;
+    delete identity._pending_active_cert;
+    if (typeof activeCertPem === 'string' && activeCertPem) {
+      try {
+        const actCert = parseCertDer(activeCertPem);
+        const localPubB64 = String(identity.public_key_der_b64 ?? '');
+        if (localPubB64) {
+          const actSpkiB64 = uint8ToBase64(actCert.spkiBytes);
+          if (actSpkiB64 === localPubB64) {
+            identity.cert = activeCertPem;
+          } else {
+            console.warn(`[auth] 服务端 active_cert 公钥与本地私钥不匹配，拒绝同步 (aid=${identity.aid})`);
+          }
+        }
+      } catch (e) {
+        console.warn(`[auth] active_cert 同步异常 (${identity.aid}):`, e);
+      }
     }
   }
 
@@ -1455,6 +1492,7 @@ export class AuthFlow {
         throw new StateError(`identity not found for aid: ${requestedAid}`);
       }
       this._aid = requestedAid;
+      if (!existing.aid) existing.aid = requestedAid;
       return existing;
     }
     throw new StateError('no local identity found, call auth.createAid() first');

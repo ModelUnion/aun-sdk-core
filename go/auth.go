@@ -295,10 +295,28 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 
 	login, err := a.login(ctx, gatewayURL, identity)
 	if err != nil {
-		return nil, err
+		// 证书未在服务端注册或公钥不匹配 — 自动重新注册
+		if strings.Contains(err.Error(), "not registered") || strings.Contains(err.Error(), "public key mismatch") {
+			log.Printf("[auth] 证书未在服务端注册，自动重新注册: aid=%s", authGetStr(identity, "aid"))
+			created, createErr := a.createAIDRemote(ctx, gatewayURL, identity)
+			if createErr != nil {
+				return nil, err
+			}
+			identity["cert"] = created["cert"]
+			if persistErr := a.persistIdentity(identity); persistErr != nil {
+				return nil, persistErr
+			}
+			login, err = a.login(ctx, gatewayURL, identity)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 	authRememberTokens(identity, login)
 	a.validateNewCert(ctx, identity, gatewayURL)
+	syncActiveCert(identity)
 	if err := a.persistIdentity(identity); err != nil {
 		return nil, err
 	}
@@ -333,6 +351,7 @@ func (a *AuthFlow) EnsureAuthenticated(ctx context.Context, gatewayURL string) (
 	}
 	authRememberTokens(identity, login)
 	a.validateNewCert(ctx, identity, gatewayURL)
+	syncActiveCert(identity)
 	if err := a.persistIdentity(identity); err != nil {
 		return nil, err
 	}
@@ -364,6 +383,7 @@ func (a *AuthFlow) RefreshCachedTokens(ctx context.Context, gatewayURL string, i
 	}
 	authRememberTokens(identity, refreshed)
 	a.validateNewCert(ctx, identity, gatewayURL)
+	syncActiveCert(identity)
 	if err := a.persistIdentity(identity); err != nil {
 		return nil, err
 	}
@@ -1194,6 +1214,42 @@ func (a *AuthFlow) validateNewCert(ctx context.Context, identity map[string]any,
 	identity["cert"] = pemStr
 }
 
+// syncActiveCert 同步服务端返回的 active_cert：验证公钥匹配后更新本地 cert
+func syncActiveCert(identity map[string]any) {
+	activeCertPEM, ok := identity["_pending_active_cert"]
+	delete(identity, "_pending_active_cert")
+	if !ok || activeCertPEM == nil {
+		return
+	}
+	pemStr, _ := activeCertPEM.(string)
+	if pemStr == "" {
+		return
+	}
+	aid := authGetStr(identity, "aid")
+	cert, err := authParsePEMCertificate(pemStr)
+	if err != nil {
+		log.Printf("[auth] active_cert 同步异常 (%s): %v", aid, err)
+		return
+	}
+	certPubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return
+	}
+	localPubB64 := authGetStr(identity, "public_key_der_b64")
+	if localPubB64 == "" {
+		return
+	}
+	localPubDER, err := base64.StdEncoding.DecodeString(localPubB64)
+	if err != nil {
+		return
+	}
+	if authBytesEqual(certPubDER, localPubDER) {
+		identity["cert"] = pemStr
+	} else {
+		log.Printf("[auth] 服务端 active_cert 公钥与本地私钥不匹配，拒绝同步 (aid=%s)", aid)
+	}
+}
+
 // ── 内部：证书下载恢复 ──────────────────────────────────────
 
 // recoverCertViaDownload 本地有密钥但无证书、服务端已注册 — 通过 PKI HTTP 端点下载证书恢复。
@@ -1335,6 +1391,9 @@ func (a *AuthFlow) loadIdentityOrRaise(aid string) (map[string]any, error) {
 			return nil, NewStateError(fmt.Sprintf("identity not found for aid: %s", requestedAID))
 		}
 		a.aid = requestedAID
+		if _, ok := existing["aid"].(string); !ok || existing["aid"] == "" {
+			existing["aid"] = requestedAID
+		}
 		return existing, nil
 	}
 
@@ -1614,6 +1673,10 @@ func authRememberTokens(identity map[string]any, authResult map[string]any) {
 	// 暂存 new_cert，由 validateNewCert 验证后正式接受
 	if newCert, ok := authResult["new_cert"]; ok && newCert != nil {
 		identity["_pending_new_cert"] = newCert
+	}
+	// 服务端返回 active_cert 用于同步本地 cert.pem
+	if activeCert, ok := authResult["active_cert"]; ok && activeCert != nil {
+		identity["_pending_active_cert"] = activeCert
 	}
 }
 

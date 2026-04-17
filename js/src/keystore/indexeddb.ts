@@ -22,6 +22,38 @@ function safeAid(aid: string): string {
   return aid.replace(/[/\\:]/g, '_');
 }
 
+/** 从 cert PEM 中提取 SPKI 公钥的 base64（纯 ASN.1 DER 解析，浏览器兼容） */
+function extractSpkiB64FromCertPem(certPem: string): string {
+  try {
+    const der = new Uint8Array(pemToArrayBuffer(certPem));
+    // 最小 ASN.1 TLV 读取
+    const tlv = (d: Uint8Array, o: number): [number, number] => {
+      let lo = o + 1, len: number;
+      if (d[lo] & 0x80) { const n = d[lo] & 0x7f; len = 0; for (let i = 0; i < n; i++) len = (len << 8) | d[lo + 1 + i]; lo += 1 + n; } else { len = d[lo]; lo += 1; }
+      return [lo, len]; // [valueStart, valueLen]
+    };
+    const skip = (d: Uint8Array, o: number): number => { const [vs, vl] = tlv(d, o); return vs + vl; };
+    // Certificate → SEQUENCE
+    let [vs] = tlv(der, 0);
+    // TBSCertificate → SEQUENCE
+    let pos = vs;
+    const [tbsVs] = tlv(der, pos);
+    pos = tbsVs;
+    // version [0] EXPLICIT (optional)
+    if (der[pos] === 0xa0) pos = skip(der, pos);
+    // serialNumber, signatureAlgorithm, issuer, validity, subject — 跳过 5 个字段
+    for (let i = 0; i < 5; i++) pos = skip(der, pos);
+    // SubjectPublicKeyInfo — 就是当前位置
+    const spkiEnd = skip(der, pos);
+    const spkiBytes = der.slice(pos, spkiEnd);
+    // base64 编码
+    let b = ''; for (let i = 0; i < spkiBytes.length; i++) b += String.fromCharCode(spkiBytes[i]);
+    return btoa(b);
+  } catch {
+    return '';
+  }
+}
+
 function encodePart(value: string): string {
   return encodeURIComponent(value);
 }
@@ -445,7 +477,20 @@ export class IndexedDBKeyStore implements KeyStore {
       const identity: IdentityRecord = {};
       if (hasMeta) Object.assign(identity, metadataOnly);
       if (keyPair) Object.assign(identity, keyPair);
-      if (cert) identity.cert = cert;
+      if (cert) {
+        // key/cert 公钥一致性校验：防止 cert 被意外覆盖
+        const localPubB64 = keyPair?.public_key_der_b64;
+        if (typeof localPubB64 === 'string' && localPubB64) {
+          const certSpkiB64 = extractSpkiB64FromCertPem(cert);
+          if (certSpkiB64 && certSpkiB64 !== localPubB64) {
+            console.error(`[keystore] 身份 ${aid} 的 key 公钥与 cert 公钥不匹配，丢弃 cert`);
+          } else {
+            identity.cert = cert;
+          }
+        } else {
+          identity.cert = cert;
+        }
+      }
       return identity;
     });
   }

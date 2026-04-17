@@ -1158,27 +1158,21 @@ func (m *E2EEManager) currentDeviceID() string {
 	return strings.TrimSpace(m.deviceIDFn())
 }
 
-// localIdentityFingerprint 计算当前身份的公钥指纹
+// localIdentityFingerprint 计算当前身份指纹（优先证书 DER SHA-256，缺失时回退到公钥指纹）
 func (m *E2EEManager) localIdentityFingerprint() string {
 	identity := m.identityFn()
-	// 优先使用 public_key_der_b64
+	// 优先用证书指纹（与 PKI 一致）
+	if certPEM, ok := identity["cert"].(string); ok && certPEM != "" {
+		cert, err := parseCertPEM([]byte(certPEM))
+		if err == nil {
+			return certificateSHA256Fingerprint(cert)
+		}
+	}
+	// 无证书时回退到公钥 SPKI 指纹
 	if pubDERB64, ok := identity["public_key_der_b64"].(string); ok && pubDERB64 != "" {
 		der, err := base64.StdEncoding.DecodeString(pubDERB64)
 		if err == nil {
 			return internal.PEMFingerprint(der)
-		}
-	}
-	// 尝试从证书获取公钥指纹（不绑定具体证书版本）
-	if certPEM, ok := identity["cert"].(string); ok && certPEM != "" {
-		cert, err := parseCertPEM([]byte(certPEM))
-		if err == nil {
-			pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
-			if ok {
-				der, err := x509.MarshalPKIXPublicKey(pub)
-				if err == nil {
-					return internal.PEMFingerprint(der)
-				}
-			}
 		}
 	}
 	// 从私钥派生公钥

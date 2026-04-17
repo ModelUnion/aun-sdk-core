@@ -161,7 +161,7 @@ interface UploadPrekeyResult extends JsonObject {
 }
 
 const DEFAULT_SESSION_OPTIONS: SessionOptions = {
-  auto_reconnect: false,
+  auto_reconnect: true,
   heartbeat_interval: 30.0,
   token_refresh_before: 60.0,
   retry: {
@@ -381,6 +381,7 @@ export class AUNClient {
   private _cacheCleanupTimer: ReturnType<typeof setInterval> | null = null;
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
+  private _seqTrackerContext: string | null = null;
   /** 补洞去重：已完成/进行中的 key 集合，防止重复 pull 同一区间 */
   private _gapFillDone: Set<string> = new Set();
   // 重连相关
@@ -524,12 +525,14 @@ export class AUNClient {
 
     if (this._state === 'idle' || this._state === 'closed') {
       this._state = 'closed';
+      this._resetSeqTrackingState();
       return;
     }
 
     await this._transport.close();
     this._state = 'closed';
     await this._dispatcher.publish('connection.state', { state: this._state });
+    this._resetSeqTrackingState();
   }
 
   // ── RPC ───────────────────────────────────────────
@@ -1595,7 +1598,8 @@ export class AUNClient {
     });
 
     try {
-      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: !Boolean(certFingerprint) });
+      // peer 证书只存版本目录，不覆盖 cert.pem
+      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
     } catch (exc) {
       console.error(`写入证书到 keystore 失败 (aid=${aid}):`, exc);
     }
@@ -1703,7 +1707,8 @@ export class AUNClient {
     }
     try {
       const certPem = await this._fetchPeerCert(aid, certFingerprint);
-      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: !Boolean(certFingerprint) });
+      // peer 证书只存版本目录，不覆盖 cert.pem
+      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
       return true;
     } catch (exc) {
       // 刷新失败时：若缓存有 PKI 验证过的证书（2 倍 TTL 内）则继续用
@@ -2014,6 +2019,7 @@ export class AUNClient {
       gateway: gatewayUrl,
     });
 
+    this._refreshSeqTrackerContext();
     // 从 keystore 恢复 SeqTracker 状态
     this._restoreSeqTrackerState();
 
@@ -2474,12 +2480,18 @@ export class AUNClient {
   /** 从 keystore 恢复 SeqTracker 状态 */
   private _restoreSeqTrackerState(): void {
     if (!this._aid) return;
+    const context = this._seqTrackerContext;
+    if (!context) return;
+    const aid = this._aid;
+    const deviceId = this._deviceId;
+    const slotId = this._slotId;
     try {
       // 优先从 seq_tracker 表按行读取
       const loadAll = this._keystore.loadAllSeqs?.bind(this._keystore);
       if (typeof loadAll === 'function') {
-        const pending = loadAll(this._aid, this._deviceId, this._slotId);
+        const pending = loadAll(aid, deviceId, slotId);
         pending.then((state) => {
+          if (this._seqTrackerContext !== context) return;
           if (state && typeof state === 'object' && Object.keys(state).length > 0) {
             this._seqTracker.restoreState(state);
           }
@@ -2489,8 +2501,9 @@ export class AUNClient {
       // fallback: 从旧 instance_state JSON blob 恢复
       const loader = this._keystore.loadInstanceState?.bind(this._keystore);
       if (typeof loader !== 'function') return;
-      const pending = loader(this._aid, this._deviceId, this._slotId);
+      const pending = loader(aid, deviceId, slotId);
       pending.then((stateHolder) => {
+        if (this._seqTrackerContext !== context) return;
         if (stateHolder && typeof stateHolder === 'object') {
           const state = (stateHolder as Record<string, JsonValue>).seq_tracker_state;
           if (isJsonObject(state)) {
@@ -2499,6 +2512,25 @@ export class AUNClient {
         }
       }).catch(() => {});
     } catch { /* 忽略 */ }
+  }
+
+  private _currentSeqTrackerContext(): string | null {
+    if (!this._aid) return null;
+    return JSON.stringify([this._aid, this._deviceId, this._slotId]);
+  }
+
+  private _resetSeqTrackingState(): void {
+    this._seqTracker = new SeqTracker();
+    this._seqTrackerContext = null;
+    this._gapFillDone.clear();
+  }
+
+  private _refreshSeqTrackerContext(): void {
+    const nextContext = this._currentSeqTrackerContext();
+    if (nextContext === this._seqTrackerContext) return;
+    this._seqTracker = new SeqTracker();
+    this._gapFillDone.clear();
+    this._seqTrackerContext = nextContext;
   }
 
   /** 将 SeqTracker 状态保存到 keystore */

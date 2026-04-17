@@ -212,7 +212,17 @@ class AuthFlow:
                     f"local certificate missing and recovery failed: {e}. "
                     f"Run auth.create_aid() to register a new identity."
                 ) from e
-        login = await self._login(gateway_url, identity)
+        try:
+            login = await self._login(gateway_url, identity)
+        except AuthError as e:
+            if "not registered" in str(e):
+                _auth_log.warning("证书未在服务端注册，自动重新注册: aid=%s", identity["aid"])
+                created = await self._create_aid(gateway_url, identity)
+                identity["cert"] = created["cert"]
+                self._persist_identity(identity)
+                login = await self._login(gateway_url, identity)
+            else:
+                raise
         self._remember_tokens(identity, login)
         await self._validate_new_cert(identity, gateway_url)
         self._persist_identity(identity)
@@ -721,52 +731,71 @@ class AuthFlow:
         ocsp_b64 = str(payload.get("ocsp_response") or "")
         if not ocsp_b64:
             raise AuthError("gateway OCSP endpoint returned no ocsp_response")
+        effective_status: str | None = None
         try:
             response = ocsp.load_der_ocsp_response(base64.b64decode(ocsp_b64))
-        except Exception as exc:
-            raise AuthError("gateway OCSP endpoint returned invalid OCSP response") from exc
 
-        if response.response_status is not ocsp.OCSPResponseStatus.SUCCESSFUL:
-            raise AuthError(f"gateway OCSP response status is {response.response_status.name.lower()}")
-        if response.serial_number != auth_cert.serial_number:
-            raise AuthError("gateway OCSP response serial mismatch")
-        expected_issuer_name_hash = hashlib.sha256(issuer_cert.subject.public_bytes()).digest()
-        expected_issuer_key_hash = hashlib.sha256(
-            issuer_cert.public_key().public_bytes(
-                serialization.Encoding.DER,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-        ).digest()
-        if response.issuer_name_hash != expected_issuer_name_hash:
-            raise AuthError("gateway OCSP issuer name hash mismatch")
-        if response.issuer_key_hash != expected_issuer_key_hash:
-            raise AuthError("gateway OCSP issuer key hash mismatch")
+            if response.response_status is not ocsp.OCSPResponseStatus.SUCCESSFUL:
+                # 非 successful（如 UNAUTHORIZED）表示 responder 无法回答，常见于 unknown 证书
+                # 降级到 JSON status 字段
+                _auth_log.debug(
+                    "OCSP responseStatus=%s (non-successful)，降级使用 JSON status",
+                    response.response_status.name,
+                )
+            else:
+                if response.serial_number != auth_cert.serial_number:
+                    raise AuthError("gateway OCSP response serial mismatch")
+                expected_issuer_name_hash = hashlib.sha256(issuer_cert.subject.public_bytes()).digest()
+                expected_issuer_key_hash = hashlib.sha256(
+                    issuer_cert.public_key().public_bytes(
+                        serialization.Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                ).digest()
+                if response.issuer_name_hash != expected_issuer_name_hash:
+                    raise AuthError("gateway OCSP issuer name hash mismatch")
+                if response.issuer_key_hash != expected_issuer_key_hash:
+                    raise AuthError("gateway OCSP issuer key hash mismatch")
+                try:
+                    _verify_signature(
+                        issuer_cert.public_key(),
+                        response.signature,
+                        response.tbs_response_bytes,
+                    )
+                except Exception as exc:
+                    raise AuthError("gateway OCSP signature verification failed") from exc
+
+                now = time.time()
+                if response.this_update_utc and now < response.this_update_utc.timestamp() - 300:
+                    raise AuthError("gateway OCSP response is not yet valid")
+                if response.next_update_utc and now > response.next_update_utc.timestamp():
+                    raise AuthError("gateway OCSP response has expired")
+
+                cert_status = response.certificate_status
+                if cert_status == ocsp.OCSPCertStatus.GOOD:
+                    effective_status = "good"
+                elif cert_status == ocsp.OCSPCertStatus.REVOKED:
+                    effective_status = "revoked"
+                else:
+                    effective_status = "unknown"
+                if status and status != effective_status:
+                    raise AuthError("gateway OCSP status mismatch")
+        except AuthError:
+            raise
+        except Exception as exc:
+            _auth_log.debug("OCSP DER 解析失败，降级使用 JSON status: %s", exc)
+
+        # DER 解析未得出结果时，降级使用 JSON status
+        if effective_status is None:
+            if not status:
+                raise AuthError("gateway OCSP endpoint returned invalid response and no status field")
+            effective_status = status
+
+        # 计算缓存 TTL
         try:
-            _verify_signature(
-                issuer_cert.public_key(),
-                response.signature,
-                response.tbs_response_bytes,
-            )
-        except Exception as exc:
-            raise AuthError("gateway OCSP signature verification failed") from exc
-
-        now = time.time()
-        if response.this_update_utc and now < response.this_update_utc.timestamp() - 300:
-            raise AuthError("gateway OCSP response is not yet valid")
-        if response.next_update_utc and now > response.next_update_utc.timestamp():
-            raise AuthError("gateway OCSP response has expired")
-
-        cert_status = response.certificate_status
-        if cert_status == ocsp.OCSPCertStatus.GOOD:
-            effective_status = "good"
-        elif cert_status == ocsp.OCSPCertStatus.REVOKED:
-            effective_status = "revoked"
-        else:
-            effective_status = "unknown"
-        if status and status != effective_status:
-            raise AuthError("gateway OCSP status mismatch")
-
-        next_refresh_at = response.next_update_utc.timestamp() if response.next_update_utc else time.time() + 300
+            next_refresh_at = response.next_update_utc.timestamp() if response.response_status == ocsp.OCSPResponseStatus.SUCCESSFUL and response.next_update_utc else time.time() + 300
+        except Exception:
+            next_refresh_at = time.time() + 300
         # 客户端最大缓存 TTL：不信任服务端设置超过 24 小时的 next_update
         max_refresh_at = time.time() + 86400
         next_refresh_at = min(next_refresh_at, max_refresh_at)
@@ -875,6 +904,10 @@ class AuthFlow:
         new_cert = auth_result.get("new_cert")
         if new_cert:
             identity["_pending_new_cert"] = new_cert
+        # 服务端返回 active_cert 用于同步本地 cert.pem
+        active_cert = auth_result.get("active_cert")
+        if active_cert:
+            identity["_pending_active_cert"] = active_cert
 
     async def _validate_new_cert(self, identity: dict[str, Any], gateway_url: str = "") -> None:
         """验证服务端返回的 new_cert，通过后才正式接受。
@@ -923,6 +956,30 @@ class AuthFlow:
         except Exception as exc:
             _auth_log.warning("new_cert 验证异常 (%s): %s", identity.get("aid"), exc)
 
+        # 同步服务端 active_signing 证书到本地
+        active_cert_pem = identity.pop("_pending_active_cert", None)
+        if active_cert_pem:
+            try:
+                act = x509.load_pem_x509_certificate(
+                    active_cert_pem.encode("utf-8") if isinstance(active_cert_pem, str) else active_cert_pem
+                )
+                act_pub_der = act.public_key().public_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                local_pub_b64 = identity.get("public_key_der_b64", "")
+                if local_pub_b64:
+                    local_pub_der = base64.b64decode(local_pub_b64)
+                    if act_pub_der != local_pub_der:
+                        _auth_log.error(
+                            "服务端 active_cert 公钥与本地私钥不匹配 (%s)，拒绝同步",
+                            identity.get("aid"),
+                        )
+                    else:
+                        identity["cert"] = active_cert_pem if isinstance(active_cert_pem, str) else active_cert_pem.decode("utf-8")
+            except Exception as exc:
+                _auth_log.warning("active_cert 同步异常 (%s): %s", identity.get("aid"), exc)
+
     @staticmethod
     def _get_cached_access_token(identity: dict[str, Any]) -> str:
         access_token = str(identity.get("access_token") or "")
@@ -967,6 +1024,8 @@ class AuthFlow:
             if existing is None:
                 raise StateError(f"identity not found for aid: {requested_aid}")
             self._aid = requested_aid
+            if not existing.get("aid"):
+                existing["aid"] = requested_aid
             return existing
 
         load_any_identity = getattr(self._keystore, "load_any_identity", None)
