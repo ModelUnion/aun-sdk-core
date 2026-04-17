@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Literal, TypedDict
+
+
+class ConnectionState(str, Enum):
+    """连接状态枚举（对齐 C++ ConnectionState）"""
+    IDLE = "idle"
+    CONNECTING = "connecting"
+    AUTHENTICATING = "authenticating"
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    RECONNECTING = "reconnecting"
+    TERMINAL_FAILED = "terminal_failed"
+    CLOSED = "closed"
 
 
 JsonValue = Any
