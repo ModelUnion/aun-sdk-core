@@ -1823,6 +1823,12 @@ class AUNClient:
         self._connect_delivery_mode = dict(params.get("delivery_mode") or self._connect_delivery_mode)
         self._auth.set_instance_context(device_id=self._device_id, slot_id=self._slot_id)
         self._state = "connecting"
+
+        # ── 前置 restore：在 transport.connect 启动 reader 之前完成
+        # 避免 reader 把积压 push 交给空 tracker 的 handler，触发 S2 历史 gap 误补拉
+        self._refresh_seq_tracking_context()
+        self._restore_seq_tracker_state()
+
         challenge = await self._transport.connect(gateway_url)
         self._state = "authenticating"
         if allow_reauth:
@@ -1856,9 +1862,11 @@ class AUNClient:
         self._state = "connected"
         await self._dispatcher.publish("connection.state", {"state": self._state, "gateway": gateway_url})
 
-        self._refresh_seq_tracking_context()
-        # 从 keystore 恢复 SeqTracker 状态
-        self._restore_seq_tracker_state()
+        # auth 阶段 aid 可能被 identity 覆盖（上方 self._aid = identity.get(...)）；
+        # 若 context 发生变化，重新 refresh + restore，保持 tracker 与真实身份一致
+        if self._seq_tracker_context != self._current_seq_tracker_context():
+            self._refresh_seq_tracking_context()
+            self._restore_seq_tracker_state()
 
         self._start_background_tasks()
 

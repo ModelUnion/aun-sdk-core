@@ -1346,3 +1346,129 @@ async def test_group_changed_triggers_fill_when_gap():
     await client._on_raw_group_changed(data)
     await asyncio.sleep(0)
     assert fill_calls == ["G1"]
+
+
+@pytest.mark.asyncio
+async def test_restore_before_transport_connect():
+    """SeqTracker restore 必须在 transport.connect 之前被调用（避免启动期竞态）。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    client._seq_tracker = SeqTracker()
+    client._seq_tracker_context = None
+    client._gap_fill_done = set()
+    client._gap_fill_active = False
+    client._pushed_seqs = {}
+    client._aid = "alice.aid.com"
+    client._device_id = "dev1"
+    client._slot_id = "s1"
+    client._identity = {"aid": "alice.aid.com"}
+    client._logger = None
+    client._session_params = None
+    client._connect_delivery_mode = {}
+    client._state = "idle"
+    client._gateway_url = None
+    client._loop = asyncio.get_running_loop()
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._keystore = MagicMock()
+    client._keystore.load_all_seqs = MagicMock(return_value={})
+    client._auth = MagicMock()
+    client._auth.set_instance_context = MagicMock()
+    client._auth.connect_session = AsyncMock(
+        return_value={"identity": {"aid": "alice.aid.com"}, "token": "t"}
+    )
+    client._transport = MagicMock()
+    client._transport.connect = AsyncMock(return_value={"challenge": "x"})
+    client._start_background_tasks = MagicMock()
+    client._upload_prekey = AsyncMock()
+    client._resolve_gateway = lambda p: "wss://gw"
+    client._sync_identity_after_connect = MagicMock()
+
+    # 记录调用次序
+    call_order: list[str] = []
+    original_restore = AUNClient._restore_seq_tracker_state.__get__(client, AUNClient)
+
+    def traced_restore():
+        call_order.append("restore")
+        original_restore()
+
+    original_connect = client._transport.connect
+
+    async def traced_connect(url):
+        call_order.append("transport.connect")
+        return await original_connect(url)
+
+    client._restore_seq_tracker_state = traced_restore
+    client._transport.connect = traced_connect
+
+    await client._connect_once(
+        {"gateway": "wss://gw", "access_token": "t"}, allow_reauth=True
+    )
+
+    restore_idx = call_order.index("restore")
+    connect_idx = call_order.index("transport.connect")
+    assert restore_idx < connect_idx, f"call order: {call_order}"
+
+
+@pytest.mark.asyncio
+async def test_restore_after_aid_change_during_auth():
+    """auth 阶段 aid 发生变化时，二次 restore 被触发。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    client._seq_tracker = SeqTracker()
+    client._seq_tracker_context = None
+    client._gap_fill_done = set()
+    client._gap_fill_active = False
+    client._pushed_seqs = {}
+    client._aid = "alice.aid.com"
+    client._device_id = "dev1"
+    client._slot_id = "s1"
+    client._identity = {"aid": "alice.aid.com"}
+    client._logger = None
+    client._session_params = {"access_token": "t"}
+    client._connect_delivery_mode = {}
+    client._state = "idle"
+    client._gateway_url = None
+    client._loop = asyncio.get_running_loop()
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._keystore = MagicMock()
+    client._keystore.load_all_seqs = MagicMock(return_value={})
+    client._auth = MagicMock()
+    client._auth.set_instance_context = MagicMock()
+
+    # auth 返回不同 aid，模拟身份覆盖（复现 client.py:1841 路径）
+    async def fake_connect_session(transport, challenge, url, **kwargs):
+        client._aid = "bob.aid.com"
+        return {"identity": {"aid": "bob.aid.com"}, "token": "t"}
+
+    client._auth.connect_session = fake_connect_session
+    client._transport = MagicMock()
+    client._transport.connect = AsyncMock(return_value={"challenge": "x"})
+    client._start_background_tasks = MagicMock()
+    client._upload_prekey = AsyncMock()
+    client._resolve_gateway = lambda p: "wss://gw"
+    client._sync_identity_after_connect = MagicMock()
+
+    restore_count = {"n": 0}
+    original_restore = AUNClient._restore_seq_tracker_state.__get__(client, AUNClient)
+
+    def traced_restore():
+        restore_count["n"] += 1
+        original_restore()
+
+    client._restore_seq_tracker_state = traced_restore
+
+    await client._connect_once(
+        {"gateway": "wss://gw", "access_token": "t"}, allow_reauth=True
+    )
+
+    assert restore_count["n"] == 2, f"expected 2 restores, got {restore_count['n']}"
