@@ -786,6 +786,9 @@ def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
 
 
 def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeypatch):
+    """零信任语义：keystore 中即便有匹配指纹的证书，仍必须经过 _fetch_peer_cert
+    完成 PKI 验证后方可信任；mock 让 _fetch_peer_cert 成功返回，验证流程通过即可。
+    """
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -810,18 +813,21 @@ def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeyp
     client = AUNClient({"aun_path": str(tmp_path / "aun")})
     client._keystore.save_cert("alice.example.com", cert_pem, cert_fingerprint=cert_fp, make_active=False)
 
-    called = {"fetch": 0}
+    called = {"fetch": 0, "last_fp": None}
 
     async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
         called["fetch"] += 1
-        raise AssertionError("should not fetch when local fingerprint cert exists")
+        called["last_fp"] = cert_fingerprint
+        return cert_pem.encode("utf-8")
 
     monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
 
     ok = asyncio.run(client._ensure_sender_cert_cached("alice.example.com", cert_fp))
 
     assert ok is True
-    assert called["fetch"] == 0
+    # 零信任：必须调用 _fetch_peer_cert 做 PKI 验证，不能仅凭 keystore 信任
+    assert called["fetch"] == 1
+    assert called["last_fp"] == cert_fp
 
 
 def test_send_encrypted_uses_multi_device_payload_when_needed(monkeypatch):
@@ -1276,3 +1282,67 @@ def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path)
 
     assert client._seq_tracker.export_state() == {}
     assert client._gap_fill_done == set()
+
+
+# ── 重启全量拉取问题优化相关测试 ─────────────────────────────
+# 见 docs/superpowers/specs/2026-04-17-restart-full-pull-mitigation-design.md
+
+
+@pytest.mark.asyncio
+async def test_group_changed_skips_fill_when_no_gap():
+    """gap 检测：连续 event_seq 无需触发 _fill_group_event_gap。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._seq_tracker = SeqTracker()
+    # 预置 contiguous = 5
+    client._seq_tracker.restore_state({"group_event:G1": 5})
+    client._loop = asyncio.get_running_loop()
+    client._verify_event_signature = AsyncMock(return_value=True)
+    fill_calls: list[str] = []
+
+    async def fake_fill(gid):
+        fill_calls.append(gid)
+
+    client._fill_group_event_gap = fake_fill
+    client._rotate_group_epoch = AsyncMock()
+
+    data = {"group_id": "G1", "event_seq": 6, "action": "foo"}
+    await client._on_raw_group_changed(data)
+    # 给 create_task 机会运行
+    await asyncio.sleep(0)
+    assert fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_group_changed_triggers_fill_when_gap():
+    """gap 检测：event_seq 跳跃触发 _fill_group_event_gap。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._seq_tracker = SeqTracker()
+    client._seq_tracker.restore_state({"group_event:G1": 5})
+    client._loop = asyncio.get_running_loop()
+    client._verify_event_signature = AsyncMock(return_value=True)
+    fill_calls: list[str] = []
+
+    async def fake_fill(gid):
+        fill_calls.append(gid)
+
+    client._fill_group_event_gap = fake_fill
+    client._rotate_group_epoch = AsyncMock()
+
+    data = {"group_id": "G1", "event_seq": 10, "action": "foo"}
+    await client._on_raw_group_changed(data)
+    await asyncio.sleep(0)
+    assert fill_calls == ["G1"]
