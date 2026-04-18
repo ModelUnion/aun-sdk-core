@@ -1233,35 +1233,91 @@ class TestGroupMessagePushPipeline:
 
         assert pull_called.get("called") is True
 
-    def test_push_with_payload_gap_does_not_immediately_pull_current_seq(self, tmp_path):
-        """带完整 payload 的 push 即使触发补洞，也不应立刻为当前 seq 冗余 group.pull。"""
+    def test_push_with_payload_gap_triggers_fill_group_gap(self, tmp_path):
+        """带完整 payload 的 push 发现 gap 时，仍应触发 _fill_group_gap 补洞。"""
         client = _make_client(tmp_path, aid=_AID_BOB)
         gs = _store_secret_for_client(client, epoch=1)
 
         published = []
         client._dispatcher.subscribe("group.message_created", lambda data: published.append(data))
+        # 已知 seq=1，下一条 seq=3 → gap [2]
         client._seq_tracker.on_message_seq(f"group:{_GRP}", 1)
 
-        pull_calls = []
+        fill_gap_called = []
+        fill_gap_done = asyncio.Event()
 
-        async def fake_call(method, params):
-            if method == "group.pull":
-                pull_calls.append(dict(params))
-                return {"messages": []}
-            raise AssertionError(f"unexpected method: {method}")
+        async def fake_fill_group_gap(group_id):
+            fill_gap_called.append(group_id)
+            fill_gap_done.set()
 
-        import types
-        client.call = types.MethodType(lambda self, m, p: fake_call(m, p), client)
+        client._fill_group_gap = fake_fill_group_gap
 
         msg = self._make_encrypted_group_msg(gs, seq=3)
 
         async def run():
             client._loop = asyncio.get_running_loop()
             await client._process_and_publish_group_message(msg)
-            await asyncio.sleep(0)
+            await asyncio.wait_for(fill_gap_done.wait(), timeout=1)
 
         asyncio.run(run())
 
+        # 消息仍应被解密并发布
         assert len(published) == 1
         assert published[0]["seq"] == 3
-        assert pull_calls == []
+        # 补洞必须被触发
+        assert fill_gap_called == [_GRP]
+
+
+# ══════════════════════════════════════════════════════════════
+# replay guard 语义测试
+# ══════════════════════════════════════════════════════════════
+
+class TestReplayGuardSemantics:
+    """_check_replay_guard 的 fail-closed 语义验证。"""
+
+    def _make_client_with_transport_mock(self, tmp_path, transport_call_fn):
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        import types
+        client._transport.call = types.MethodType(
+            lambda self, m, p=None: transport_call_fn(m, p), client._transport
+        )
+        return client
+
+    def test_duplicate_returns_false(self, tmp_path):
+        """服务端返回 duplicate=True 时，_check_replay_guard 返回 False（拒绝消息）。"""
+        async def transport_call(method, params=None):
+            if method == "message.e2ee.record_replay_guard":
+                return {"duplicate": True}
+            return {}
+
+        client = self._make_client_with_transport_mock(tmp_path, transport_call)
+        result = asyncio.run(client._check_replay_guard(
+            "msg-dup-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
+        ))
+        assert result is False
+
+    def test_non_duplicate_returns_true(self, tmp_path):
+        """服务端返回 duplicate=False 时，_check_replay_guard 返回 True（允许消息）。"""
+        async def transport_call(method, params=None):
+            if method == "message.e2ee.record_replay_guard":
+                return {"duplicate": False}
+            return {}
+
+        client = self._make_client_with_transport_mock(tmp_path, transport_call)
+        result = asyncio.run(client._check_replay_guard(
+            "msg-new-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
+        ))
+        assert result is True
+
+    def test_rpc_exception_fail_closed_returns_false(self, tmp_path):
+        """RPC 异常时，_check_replay_guard 应 fail-closed 返回 False（拒绝消息）。"""
+        async def transport_call(method, params=None):
+            if method == "message.e2ee.record_replay_guard":
+                raise RuntimeError("network error")
+            return {}
+
+        client = self._make_client_with_transport_mock(tmp_path, transport_call)
+        result = asyncio.run(client._check_replay_guard(
+            "msg-err-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
+        ))
+        assert result is False

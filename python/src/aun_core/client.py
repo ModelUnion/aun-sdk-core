@@ -1045,7 +1045,7 @@ class AUNClient:
                 ns = f"group:{group_id}"
                 need_pull = self._seq_tracker.on_message_seq(ns, int(seq))
                 self._persist_seq(ns)
-                if need_pull and not payload_present:
+                if need_pull:
                     loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
                     loop.create_task(self._fill_group_gap(group_id))
 
@@ -1639,10 +1639,11 @@ class AUNClient:
             })
             if isinstance(result, dict) and result.get("duplicate"):
                 return False
+            return True
         except Exception as _exc:
             import logging as _logging
             _logging.getLogger("aun_core").debug("操作失败: %s", _exc)
-        return True
+            return False
 
     async def _decrypt_messages(self, messages: list[dict[str, Any]], *, source: str = "pull") -> list[dict[str, Any]]:
         """批量解密消息（用于 message.pull）。
