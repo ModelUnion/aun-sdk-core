@@ -2117,10 +2117,8 @@ func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string
 	if err != nil || decrypted == nil {
 		if err != nil {
 			log.Printf("[WARN] P2P 解密失败: %v", err)
-			message["_decrypt_error"] = err.Error()
 		} else {
 			log.Printf("[WARN] P2P 解密失败: DecryptMessage 返回 nil")
-			message["_decrypt_error"] = "DecryptMessage returned nil"
 		}
 		return nil
 	}
@@ -2152,6 +2150,7 @@ func (c *AUNClient) decryptMessages(ctx context.Context, messages []any) []any {
 			fromAID, _ := msg["from"].(string)
 			if fromAID != "" {
 				if !c.ensureSenderCertCached(ctx, fromAID) {
+					// 证书不可用，丢弃密文，不投递给应用层
 					continue
 				}
 			}
@@ -2160,6 +2159,7 @@ func (c *AUNClient) decryptMessages(ctx context.Context, messages []any) []any {
 			if err == nil && decrypted != nil {
 				result = append(result, decrypted)
 			}
+			// 解密失败：丢弃密文，不投递给应用层
 		} else {
 			result = append(result, raw)
 		}
@@ -2229,10 +2229,8 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 	// 密钥恢复后仍无法解密时返回 nil，由调用方发布 undecryptable 事件
 	if decryptErr != nil {
 		log.Printf("[WARN] 群消息解密失败: group=%s %v", groupID, decryptErr)
-		message["_decrypt_error"] = decryptErr.Error()
 	} else {
 		log.Printf("[WARN] 群消息解密失败: group=%s 解密结果无 e2ee 字段", groupID)
-		message["_decrypt_error"] = "decrypt result missing e2ee field"
 	}
 
 	return nil
@@ -2272,6 +2270,7 @@ func (c *AUNClient) decryptGroupMessages(ctx context.Context, messages []any) []
 		}
 		if senderAID != "" {
 			if !c.ensureSenderCertCached(ctx, senderAID, senderCertFingerprint) {
+				// 证书不可用，丢弃密文，不投递给应用层
 				continue
 			}
 		}
@@ -2279,6 +2278,7 @@ func (c *AUNClient) decryptGroupMessages(ctx context.Context, messages []any) []
 		if err == nil && decrypted != nil {
 			result = append(result, decrypted)
 		}
+		// 解密失败：丢弃密文，不投递给应用层
 	}
 	return result
 }
