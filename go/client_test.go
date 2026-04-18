@@ -1267,3 +1267,305 @@ func TestShouldRetryReconnect(t *testing.T) {
 		t.Error("TimeoutError 应重试")
 	}
 }
+
+func TestDecryptP2PFailurePublishesUndecryptable(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.mu.Unlock()
+
+	var undecryptablePayload any
+	receivedCount := 0
+	c.On("message.undecryptable", func(payload any) {
+		undecryptablePayload = payload
+	})
+	c.On("message.received", func(payload any) {
+		receivedCount++
+	})
+
+	c.processAndPublishMessage(map[string]any{
+		"message_id": "msg-p2p-fail",
+		"from":       "unknown.example.com",
+		"to":         "alice.example.com",
+		"seq":        0,
+		"timestamp":  "2026-04-18T12:00:00Z",
+		"encrypted":  true,
+		"payload": map[string]any{
+			"type": "e2ee.encrypted",
+		},
+	})
+
+	if undecryptablePayload == nil {
+		t.Fatal("解密失败时应发布 message.undecryptable")
+	}
+	payloadMap, _ := undecryptablePayload.(map[string]any)
+	if payloadMap["message_id"] != "msg-p2p-fail" || toInt64(payloadMap["seq"]) != 0 {
+		t.Fatalf("message.undecryptable 载荷不正确: %#v", payloadMap)
+	}
+	if receivedCount != 0 {
+		t.Fatalf("解密失败时不应发布 message.received: %d", receivedCount)
+	}
+}
+
+func TestDecryptGroupFailurePublishesUndecryptable(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	var undecryptablePayload any
+	createdCount := 0
+	c.On("group.message_undecryptable", func(payload any) {
+		undecryptablePayload = payload
+	})
+	c.On("group.message_created", func(payload any) {
+		createdCount++
+	})
+
+	c.processAndPublishGroupMessage(map[string]any{
+		"message_id": "msg-group-fail",
+		"group_id":   "g-1.example.com",
+		"from":       "unknown.example.com",
+		"seq":        0,
+		"timestamp":  "2026-04-18T12:00:00Z",
+		"payload": map[string]any{
+			"type":  "e2ee.group_encrypted",
+			"epoch": 3,
+		},
+	})
+
+	if undecryptablePayload == nil {
+		t.Fatal("群消息解密失败时应发布 group.message_undecryptable")
+	}
+	payloadMap, _ := undecryptablePayload.(map[string]any)
+	if payloadMap["message_id"] != "msg-group-fail" || toInt64(payloadMap["seq"]) != 0 {
+		t.Fatalf("group.message_undecryptable 载荷不正确: %#v", payloadMap)
+	}
+	if createdCount != 0 {
+		t.Fatalf("群消息解密失败时不应发布 group.message_created: %d", createdCount)
+	}
+}
+
+func TestDecryptMessagesDropsFailedCiphertext(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	messages := []any{
+		map[string]any{
+			"message_id": "plain-1",
+			"from":       "bob.example.com",
+			"payload":    map[string]any{"text": "hello"},
+		},
+		map[string]any{
+			"message_id": "cipher-1",
+			"from":       "unknown.example.com",
+			"encrypted":  true,
+			"payload": map[string]any{
+				"type": "e2ee.encrypted",
+			},
+		},
+	}
+
+	result := c.decryptMessages(context.Background(), messages)
+	if len(result) != 1 {
+		t.Fatalf("解密失败的密文不应混入补洞结果: %#v", result)
+	}
+	msg, _ := result[0].(map[string]any)
+	if msg["message_id"] != "plain-1" {
+		t.Fatalf("补洞结果应仅保留明文消息: %#v", result)
+	}
+}
+
+func TestDecryptGroupMessagesDropsFailedCiphertext(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	messages := []any{
+		map[string]any{
+			"message_id": "group-plain-1",
+			"group_id":   "g-1.example.com",
+			"from":       "bob.example.com",
+			"payload":    map[string]any{"text": "hello"},
+		},
+		map[string]any{
+			"message_id": "group-cipher-1",
+			"group_id":   "g-1.example.com",
+			"from":       "unknown.example.com",
+			"payload": map[string]any{
+				"type":  "e2ee.group_encrypted",
+				"epoch": 2,
+			},
+		},
+	}
+
+	result := c.decryptGroupMessages(context.Background(), messages)
+	if len(result) != 1 {
+		t.Fatalf("群消息解密失败的密文不应混入补洞结果: %#v", result)
+	}
+	msg, _ := result[0].(map[string]any)
+	if msg["message_id"] != "group-plain-1" {
+		t.Fatalf("群补洞结果应仅保留可投递消息: %#v", result)
+	}
+}
+
+// TestPushedSeqsNoDuplicateOnGapFill 验证：推送路径已分发的 seq，
+// 补洞路径不得重复投递（功能正确性测试）。
+func TestPushedSeqsNoDuplicateOnGapFill(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ns := "p2p:alice.example.com"
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.mu.Unlock()
+
+	// 模拟推送路径已标记 seq=5
+	c.pushedSeqsMu.Lock()
+	if c.pushedSeqs[ns] == nil {
+		c.pushedSeqs[ns] = make(map[int]bool)
+	}
+	c.pushedSeqs[ns][5] = true
+	c.pushedSeqsMu.Unlock()
+
+	// 模拟补洞路径返回包含 seq=5 和 seq=6 的消息列表
+	messages := []any{
+		map[string]any{"message_id": "m5", "seq": float64(5), "payload": map[string]any{"text": "dup"}},
+		map[string]any{"message_id": "m6", "seq": float64(6), "payload": map[string]any{"text": "new"}},
+	}
+
+	var received []string
+	c.On("message.received", func(payload any) {
+		if m, ok := payload.(map[string]any); ok {
+			received = append(received, m["message_id"].(string))
+		}
+	})
+
+	// 调用 publishGapFillMessages 验证去重逻辑
+	c.publishGapFillMessages(ns, messages)
+
+	if len(received) != 1 {
+		t.Fatalf("补洞路径应跳过已推送的 seq=5，只投递 seq=6，实际投递: %v", received)
+	}
+	if received[0] != "m6" {
+		t.Fatalf("补洞路径应投递 m6，实际: %v", received)
+	}
+}
+
+// TestPushedSeqsGroupNoDuplicateOnGapFill 验证：群消息推送路径已分发的 seq，
+// 补洞路径不得重复投递（群消息功能正确性测试）。
+func TestPushedSeqsGroupNoDuplicateOnGapFill(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	groupID := "g-test.example.com"
+	ns := "group:" + groupID
+
+	// 模拟推送路径已标记 seq=10
+	c.pushedSeqsMu.Lock()
+	if c.pushedSeqs[ns] == nil {
+		c.pushedSeqs[ns] = make(map[int]bool)
+	}
+	c.pushedSeqs[ns][10] = true
+	c.pushedSeqsMu.Unlock()
+
+	messages := []any{
+		map[string]any{"message_id": "gm10", "group_id": groupID, "seq": float64(10), "payload": map[string]any{"text": "dup"}},
+		map[string]any{"message_id": "gm11", "group_id": groupID, "seq": float64(11), "payload": map[string]any{"text": "new"}},
+	}
+
+	var created []string
+	c.On("group.message_created", func(payload any) {
+		if m, ok := payload.(map[string]any); ok {
+			created = append(created, m["message_id"].(string))
+		}
+	})
+
+	c.publishGapFillGroupMessages(ns, messages)
+
+	if len(created) != 1 {
+		t.Fatalf("群补洞路径应跳过已推送的 seq=10，只投递 seq=11，实际投递: %v", created)
+	}
+	if created[0] != "gm11" {
+		t.Fatalf("群补洞路径应投递 gm11，实际: %v", created)
+	}
+}
+
+// TestPushedSeqsPreMarkBeforeGapFill 验证：推送路径必须在启动补洞 goroutine 之前
+// 完成 pushedSeqs 预标记，否则补洞路径可能在预标记前读取到空 map 而重复投递。
+// 此测试通过 markPushedSeq 方法验证预标记的原子性。
+func TestPushedSeqsPreMarkBeforeGapFill(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ns := "p2p:premark.example.com"
+	c.mu.Lock()
+	c.aid = "premark.example.com"
+	c.mu.Unlock()
+
+	// 模拟：推送路径先预标记 seq=7（在启动补洞 goroutine 之前）
+	c.markPushedSeq(ns, 7)
+
+	// 然后补洞路径立即读取（模拟 goroutine 调度到补洞路径先执行）
+	messages := []any{
+		map[string]any{"message_id": "pm7", "seq": float64(7), "payload": map[string]any{"text": "dup"}},
+		map[string]any{"message_id": "pm8", "seq": float64(8), "payload": map[string]any{"text": "new"}},
+	}
+
+	var received []string
+	c.On("message.received", func(payload any) {
+		if m, ok := payload.(map[string]any); ok {
+			received = append(received, m["message_id"].(string))
+		}
+	})
+
+	c.publishGapFillMessages(ns, messages)
+
+	if len(received) != 1 || received[0] != "pm8" {
+		t.Fatalf("预标记后补洞路径应跳过 seq=7，只投递 seq=8，实际: %v", received)
+	}
+}
+
+// TestPushedSeqsConcurrentMarkAndRead 验证：并发标记和读取 pushedSeqs 不产生 data race。
+// 修复后通过锁内逐条查询避免锁外持有 map 引用；在支持 -race 的环境下应干净通过。
+// 注：Windows 环境无 gcc，-race 不可用；此测试作为逻辑正确性验证。
+func TestPushedSeqsConcurrentMarkAndRead(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ns := "p2p:concurrent.example.com"
+	c.mu.Lock()
+	c.aid = "concurrent.example.com"
+	c.mu.Unlock()
+
+	const n = 100
+	var wg sync.WaitGroup
+
+	// 并发写：模拟推送路径标记 seq
+	for i := 1; i <= n; i++ {
+		wg.Add(1)
+		s := i
+		go func() {
+			defer wg.Done()
+			c.markPushedSeq(ns, s)
+		}()
+	}
+
+	// 并发读：模拟补洞路径读取快照
+	results := make([]bool, n+1)
+	for i := 1; i <= n; i++ {
+		wg.Add(1)
+		s := i
+		go func() {
+			defer wg.Done()
+			// 使用 isPushedSeq 方法（修复后的安全读取）
+			results[s] = c.isPushedSeq(ns, s)
+		}()
+	}
+
+	wg.Wait()
+	// 验证最终所有 seq 都被标记
+	for i := 1; i <= n; i++ {
+		if !c.isPushedSeq(ns, i) {
+			t.Errorf("seq=%d 应已被标记", i)
+		}
+	}
+}

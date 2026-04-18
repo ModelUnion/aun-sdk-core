@@ -1224,6 +1224,9 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 	c.mu.RUnlock()
 	if seq > 0 && myAID != "" {
 		ns := "p2p:" + myAID
+		// 预标记：在启动补洞 goroutine 之前完成，确保补洞路径能看到此 seq 已被推送路径处理。
+		// 若解密失败，补洞路径的 decryptMessages 也会过滤掉同一条消息，不会重复投递。
+		c.markPushedSeq(ns, seq)
 		needPull := c.seqTracker.OnMessageSeq(ns, seq)
 		if needPull {
 			go c.fillP2pGap()
@@ -1263,16 +1266,6 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 		c.events.Publish("message.undecryptable", safeEvent)
 		return
 	}
-	// 记录已推送的 seq，补洞路径据此去重
-	if seq > 0 && myAID != "" {
-		ns := "p2p:" + myAID
-		c.pushedSeqsMu.Lock()
-		if c.pushedSeqs[ns] == nil {
-			c.pushedSeqs[ns] = make(map[int]bool)
-		}
-		c.pushedSeqs[ns][seq] = true
-		c.pushedSeqsMu.Unlock()
-	}
 	c.events.Publish("message.received", decrypted)
 }
 
@@ -1305,6 +1298,8 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 	// 空洞检测（无论带不带 payload 都检查）
 	if groupID != "" && seq > 0 {
 		ns := "group:" + groupID
+		// 预标记：在启动补洞 goroutine 之前完成，确保补洞路径能看到此 seq 已被推送路径处理。
+		c.markPushedSeq(ns, seq)
 		needPull := c.seqTracker.OnMessageSeq(ns, seq)
 		if needPull {
 			go c.fillGroupGap(groupID)
@@ -1361,16 +1356,6 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 		c.events.Publish("group.message_undecryptable", safeEvent)
 		return
 	}
-	// 记录已推送的 seq，补洞路径据此去重
-	if groupID != "" && seq > 0 {
-		nsKey := "group:" + groupID
-		c.pushedSeqsMu.Lock()
-		if c.pushedSeqs[nsKey] == nil {
-			c.pushedSeqs[nsKey] = make(map[int]bool)
-		}
-		c.pushedSeqs[nsKey][seq] = true
-		c.pushedSeqsMu.Unlock()
-	}
 	c.events.Publish("group.message_created", decrypted)
 }
 
@@ -1415,21 +1400,8 @@ func (c *AUNClient) autoPullGroupMessages(notification map[string]any) {
 		}
 	}
 	c.seqTracker.OnPullResult(ns, pullMsgs)
-	// pushedSeqs 去重：跳过已通过推送路径分发的消息
-	c.pushedSeqsMu.Lock()
-	pushed := c.pushedSeqs[ns]
-	c.pushedSeqsMu.Unlock()
-	for _, raw := range messages {
-		msg, ok := raw.(map[string]any)
-		if ok {
-			s := int(toInt64(msg["seq"]))
-			if pushed != nil && s > 0 && pushed[s] {
-				continue // 已通过推送路径分发，跳过
-			}
-			c.events.Publish("group.message_created", msg)
-		}
-	}
-	c.prunePushedSeqs(ns)
+	// pushedSeqs 去重：使用 publishGapFillGroupMessages 安全发布，避免锁外读取竞态
+	c.publishGapFillGroupMessages(ns, messages)
 }
 
 // fillGroupGap 后台补齐群消息空洞
@@ -1477,19 +1449,7 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 	}
 	// seq_tracker 更新和 auto-ack 已在 Call() 拦截器中完成
 	nsKey := "group:" + groupID
-	c.pushedSeqsMu.Lock()
-	pushed := c.pushedSeqs[nsKey]
-	c.pushedSeqsMu.Unlock()
-	for _, raw := range messages {
-		if msg, ok := raw.(map[string]any); ok {
-			s := int(toInt64(msg["seq"]))
-			if pushed != nil && s > 0 && pushed[s] {
-				continue // 已通过推送路径分发，跳过
-			}
-			c.events.Publish("group.message_created", msg)
-		}
-	}
-	c.prunePushedSeqs(nsKey)
+	c.publishGapFillGroupMessages(nsKey, messages)
 }
 
 // fillGroupEventGap 后台补齐群事件空洞
@@ -1618,19 +1578,7 @@ func (c *AUNClient) fillP2pGap() {
 	}
 	// seq_tracker 更新和 auto-ack 已在 Call() 拦截器中完成
 	nsKey := "p2p:" + myAID
-	c.pushedSeqsMu.Lock()
-	pushed := c.pushedSeqs[nsKey]
-	c.pushedSeqsMu.Unlock()
-	for _, raw := range messages {
-		if msg, ok := raw.(map[string]any); ok {
-			s := int(toInt64(msg["seq"]))
-			if pushed != nil && s > 0 && pushed[s] {
-				continue // 已通过推送路径分发，跳过
-			}
-			c.events.Publish("message.received", msg)
-		}
-	}
-	c.prunePushedSeqs(nsKey)
+	c.publishGapFillMessages(nsKey, messages)
 }
 
 // prunePushedSeqs 清理 pushedSeqs 中 <= contiguousSeq 的条目，防止无限增长
@@ -1650,6 +1598,64 @@ func (c *AUNClient) prunePushedSeqs(ns string) {
 	if len(pushed) == 0 {
 		delete(c.pushedSeqs, ns)
 	}
+}
+
+// markPushedSeq 在锁内安全标记指定 ns 的 seq 已通过推送路径分发。
+// 必须在启动补洞 goroutine 之前调用，确保补洞路径能看到预标记。
+func (c *AUNClient) markPushedSeq(ns string, seq int) {
+	if seq <= 0 || ns == "" {
+		return
+	}
+	c.pushedSeqsMu.Lock()
+	if c.pushedSeqs[ns] == nil {
+		c.pushedSeqs[ns] = make(map[int]bool)
+	}
+	c.pushedSeqs[ns][seq] = true
+	c.pushedSeqsMu.Unlock()
+}
+
+// isPushedSeq 在锁内安全查询指定 ns 的 seq 是否已通过推送路径分发。
+// 不取出内层 map 引用，避免锁外读写竞态。
+func (c *AUNClient) isPushedSeq(ns string, seq int) bool {
+	if seq <= 0 || ns == "" {
+		return false
+	}
+	c.pushedSeqsMu.Lock()
+	defer c.pushedSeqsMu.Unlock()
+	pushed := c.pushedSeqs[ns]
+	if pushed == nil {
+		return false
+	}
+	return pushed[seq]
+}
+
+// publishGapFillMessages 补洞路径发布 P2P 消息，跳过已通过推送路径分发的 seq。
+// 使用 isPushedSeq 逐条检查，避免取出内层 map 引用后在锁外读取的竞态。
+func (c *AUNClient) publishGapFillMessages(ns string, messages []any) {
+	for _, raw := range messages {
+		if msg, ok := raw.(map[string]any); ok {
+			s := int(toInt64(msg["seq"]))
+			if c.isPushedSeq(ns, s) {
+				continue // 已通过推送路径分发，跳过
+			}
+			c.events.Publish("message.received", msg)
+		}
+	}
+	c.prunePushedSeqs(ns)
+}
+
+// publishGapFillGroupMessages 补洞路径发布群消息，跳过已通过推送路径分发的 seq。
+func (c *AUNClient) publishGapFillGroupMessages(ns string, messages []any) {
+	for _, raw := range messages {
+		if msg, ok := raw.(map[string]any); ok {
+			s := int(toInt64(msg["seq"]))
+			if c.isPushedSeq(ns, s) {
+				continue // 已通过推送路径分发，跳过
+			}
+			c.events.Publish("group.message_created", msg)
+		}
+	}
+	c.prunePushedSeqs(ns)
 }
 
 // onRawGroupChanged 处理群组变更事件
@@ -2102,7 +2108,7 @@ func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string
 			errMsg := fmt.Sprintf("无法获取发送方 %s 的证书，跳过解密", fromAID)
 			log.Printf("[WARN] P2P 解密失败: %s", errMsg)
 			message["_decrypt_error"] = errMsg
-			return message
+			return nil
 		}
 	}
 
@@ -2116,7 +2122,7 @@ func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string
 			log.Printf("[WARN] P2P 解密失败: DecryptMessage 返回 nil")
 			message["_decrypt_error"] = "DecryptMessage returned nil"
 		}
-		return message
+		return nil
 	}
 	c.schedulePrekeyReplenishIfConsumed(decrypted)
 	return decrypted
@@ -2146,7 +2152,6 @@ func (c *AUNClient) decryptMessages(ctx context.Context, messages []any) []any {
 			fromAID, _ := msg["from"].(string)
 			if fromAID != "" {
 				if !c.ensureSenderCertCached(ctx, fromAID) {
-					result = append(result, raw)
 					continue
 				}
 			}
@@ -2154,8 +2159,6 @@ func (c *AUNClient) decryptMessages(ctx context.Context, messages []any) []any {
 			decrypted, err := c.e2ee.decryptMessage(msg)
 			if err == nil && decrypted != nil {
 				result = append(result, decrypted)
-			} else {
-				result = append(result, raw)
 			}
 		} else {
 			result = append(result, raw)
@@ -2185,7 +2188,7 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 			errMsg := fmt.Sprintf("群消息解密跳过：发送方 %s 证书不可用", senderAID)
 			log.Printf("[WARN] %s", errMsg)
 			message["_decrypt_error"] = errMsg
-			return message
+			return nil
 		}
 	}
 
@@ -2223,7 +2226,7 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 		}
 	}
 
-	// 密钥恢复后仍返回原始消息，附带错误标记
+	// 密钥恢复后仍无法解密时返回 nil，由调用方发布 undecryptable 事件
 	if decryptErr != nil {
 		log.Printf("[WARN] 群消息解密失败: group=%s %v", groupID, decryptErr)
 		message["_decrypt_error"] = decryptErr.Error()
@@ -2232,7 +2235,7 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 		message["_decrypt_error"] = "decrypt result missing e2ee field"
 	}
 
-	return message
+	return nil
 }
 
 // decryptGroupMessages 批量解密群组消息（用于 group.pull，跳过防重放）
@@ -2269,15 +2272,12 @@ func (c *AUNClient) decryptGroupMessages(ctx context.Context, messages []any) []
 		}
 		if senderAID != "" {
 			if !c.ensureSenderCertCached(ctx, senderAID, senderCertFingerprint) {
-				result = append(result, raw)
 				continue
 			}
 		}
 		decrypted, err := c.groupE2EE.Decrypt(msg, true)
 		if err == nil && decrypted != nil {
 			result = append(result, decrypted)
-		} else {
-			result = append(result, raw)
 		}
 	}
 	return result
