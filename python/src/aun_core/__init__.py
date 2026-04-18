@@ -1,5 +1,6 @@
 from .client import AUNClient
 from .config import get_device_id
+from .types import ConnectionState
 from .errors import (
     AUNError,
     AuthError,
@@ -19,6 +20,7 @@ __version__ = "0.2.4"
 __all__ = [
     "__version__",
     "AUNClient",
+    "ConnectionState",
     "get_device_id",
     "AUNError",
     "AuthError",

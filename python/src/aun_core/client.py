@@ -35,6 +35,7 @@ from .namespaces.auth_namespace import AuthNamespace
 from .namespaces.custody_namespace import CustodyNamespace
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
+from .types import ConnectionState
 
 _INTERNAL_ONLY_METHODS = {
     "auth.login1",
@@ -264,8 +265,8 @@ class AUNClient:
         return self._aid
 
     @property
-    def state(self) -> str:
-        return self._state
+    def state(self) -> ConnectionState:
+        return ConnectionState(self._state)
 
     @property
     def e2ee(self) -> E2EEManager:
@@ -289,6 +290,28 @@ class AUNClient:
         self._transport.set_timeout(self._session_options["timeouts"]["call"])
         self._closing = False
         await self._connect_once(normalized, allow_reauth=False)
+
+    async def disconnect(self) -> None:
+        """断开连接但不关闭客户端（可重新 connect，对齐 C++ Disconnect）"""
+        if self._state not in {"connected", "reconnecting"}:
+            return
+        self._save_seq_tracker_state()
+        await self._stop_background_tasks()
+        await self._transport.close()
+        self._state = "disconnected"
+        await self._dispatcher.publish("connection.state", {"state": self._state})
+
+    def list_identities(self) -> list[dict[str, Any]]:
+        """列出本地所有已存储的身份摘要（对齐 C++ ListIdentities）"""
+        aids = self._keystore.list_identities()
+        summaries: list[dict[str, Any]] = []
+        for aid in sorted(aids):
+            summary: dict[str, Any] = {"aid": aid}
+            md = self._keystore.load_metadata(aid)
+            if md:
+                summary["metadata"] = md
+            summaries.append(summary)
+        return summaries
 
     async def close(self) -> None:
         self._closing = True
