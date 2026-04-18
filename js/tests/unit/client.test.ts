@@ -4,6 +4,7 @@
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi } from 'vitest';
 import { AUNClient } from '../../src/client.js';
+import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
 
 describe('AUNClient 构造', () => {
@@ -402,6 +403,81 @@ describe('AUNClient 重连错误分类', () => {
   it('普通 AuthError 仍应直接终止', () => {
     const client = new AUNClient();
     expect((client as any)._shouldRetryReconnect(new AuthError('token invalid'))).toBe(false);
+  });
+});
+
+describe('AUNClient M25 重连行为', () => {
+  it('默认 max_attempts=0 应保留无限重试语义', () => {
+    const client = new AUNClient();
+    const options = (client as any)._buildSessionOptions({
+      access_token: 'tok-1',
+      gateway: 'ws://gateway.example.com/aun',
+      auto_reconnect: true,
+    });
+
+    expect(options.retry.max_attempts).toBe(0);
+  });
+
+  it('显式 max_attempts 用尽后进入 terminal_failed', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+      (client as any)._sessionParams = { access_token: 'tok-1', gateway: 'ws://gateway.example.com/aun' };
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.01, max_delay: 0.01, max_attempts: 2 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+      (client as any)._connectOnce = vi.fn().mockRejectedValue(new ConnectionError('gateway down'));
+      (client as any)._reconnectAbort = new AbortController();
+      (client as any)._reconnectActive = true;
+
+      const reconnectLoop = (client as any)._reconnectLoop();
+      await vi.advanceTimersByTimeAsync(50);
+      await reconnectLoop;
+
+      expect((client as any)._connectOnce).toHaveBeenCalledTimes(2);
+      expect(client.state).toBe('terminal_failed');
+      expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
+        state: 'terminal_failed',
+        reason: 'max_attempts_exhausted',
+        attempt: 2,
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('心跳连续 2 次失败才触发断线处理', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      (client as any)._state = 'connected';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 0.01,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.5, max_delay: 30, max_attempts: 0 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.call = vi.fn().mockRejectedValue(new ConnectionError('ping failed'));
+      const disconnectSpy = vi.spyOn(client as any, '_handleTransportDisconnect').mockResolvedValue(undefined);
+
+      (client as any)._startHeartbeat();
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+      expect(disconnectSpy).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

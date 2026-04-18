@@ -150,9 +150,9 @@ func groupPull(t *testing.T, client *AUNClient, groupID string, afterSeq int) []
 	defer cancel()
 
 	result, err := client.Call(ctx, "group.pull", map[string]any{
-		"group_id":  groupID,
-		"after_seq": afterSeq,
-		"limit":     50,
+		"group_id":          groupID,
+		"after_message_seq": afterSeq,
+		"limit":             50,
 	})
 	if err != nil {
 		t.Fatalf("group.pull 失败: %v", err)
@@ -169,6 +169,113 @@ func groupPull(t *testing.T, client *AUNClient, groupID string, afterSeq int) []
 		}
 	}
 	return out
+}
+
+func currentGroupMaxSeq(t *testing.T, client *AUNClient, groupID string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	result, err := client.Call(ctx, "group.get_cursor", map[string]any{"group_id": groupID})
+	if err != nil {
+		t.Fatalf("group.get_cursor 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if resultMap == nil {
+		return 0
+	}
+	cursor, _ := resultMap["msg_cursor"].(map[string]any)
+	if cursor == nil {
+		return 0
+	}
+	return int(toInt64(cursor["latest_seq"]))
+}
+
+func mergeMessages(target []map[string]any, incoming []map[string]any) []map[string]any {
+	seen := make(map[int]bool, len(target))
+	for _, msg := range target {
+		seq := int(toInt64(msg["seq"]))
+		if seq > 0 {
+			seen[seq] = true
+		}
+	}
+	for _, msg := range incoming {
+		seq := int(toInt64(msg["seq"]))
+		if seq > 0 {
+			if seen[seq] {
+				continue
+			}
+			seen[seq] = true
+		}
+		target = append(target, msg)
+	}
+	return target
+}
+
+type groupMessageWatcher struct {
+	client   *AUNClient
+	groupID  string
+	afterSeq int
+	mu       sync.Mutex
+	inbox    []map[string]any
+	sub      *Subscription
+}
+
+func watchGroupMessages(t *testing.T, client *AUNClient, groupID string) *groupMessageWatcher {
+	t.Helper()
+	watcher := &groupMessageWatcher{
+		client:   client,
+		groupID:  groupID,
+		afterSeq: currentGroupMaxSeq(t, client, groupID),
+	}
+	watcher.sub = client.On("group.message_created", func(payload any) {
+		msg, ok := payload.(map[string]any)
+		if !ok {
+			return
+		}
+		gid, _ := msg["group_id"].(string)
+		if gid != groupID {
+			return
+		}
+		watcher.mu.Lock()
+		watcher.inbox = mergeMessages(watcher.inbox, []map[string]any{msg})
+		watcher.mu.Unlock()
+	})
+	return watcher
+}
+
+func (w *groupMessageWatcher) Stop() {
+	if w == nil || w.sub == nil {
+		return
+	}
+	w.sub.Unsubscribe()
+}
+
+func (w *groupMessageWatcher) WaitFor(t *testing.T, timeout time.Duration, predicate func([]map[string]any) bool) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		current := append([]map[string]any(nil), w.inbox...)
+		w.mu.Unlock()
+		if predicate(current) {
+			return current
+		}
+
+		pulled := groupPull(t, w.client, w.groupID, w.afterSeq)
+		w.mu.Lock()
+		w.inbox = mergeMessages(w.inbox, pulled)
+		current = append([]map[string]any(nil), w.inbox...)
+		w.mu.Unlock()
+		if predicate(current) {
+			return current
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]map[string]any(nil), w.inbox...)
 }
 
 // getMembers 获取群成员列表
@@ -288,12 +395,20 @@ func TestGroupE2EEncryptedMessaging(t *testing.T) {
 		t.Fatal("Bob 未在超时内收到 group_secret")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+
 	// Alice 发送加密群消息
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "加密群消息"})
-	time.Sleep(1 * time.Second)
 
-	// Bob 拉取（自动解密）
-	msgs := groupPull(t, bob, groupID, 0)
+	msgs := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecrypted(messages) {
+			if getPayloadText(msg) == "加密群消息" {
+				return true
+			}
+		}
+		return false
+	})
 	if len(msgs) < 1 {
 		t.Fatalf("期望至少 1 条消息，实际 %d", len(msgs))
 	}
@@ -302,8 +417,15 @@ func TestGroupE2EEncryptedMessaging(t *testing.T) {
 	if len(decrypted) < 1 {
 		t.Fatal("未找到自动解密的群消息")
 	}
-	if text := getPayloadText(decrypted[0]); text != "加密群消息" {
-		t.Fatalf("payload.text 不匹配: 期望 '加密群消息', 实际 '%s'", text)
+	found := false
+	for _, msg := range decrypted {
+		if getPayloadText(msg) == "加密群消息" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("未找到 payload.text=加密群消息 的自动解密群消息")
 	}
 }
 
@@ -335,25 +457,40 @@ func TestGroupE2EMultipleMembers(t *testing.T) {
 		t.Fatal("Carol 未在超时内收到 group_secret")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+	carolWatch := watchGroupMessages(t, carol, groupID)
+	defer carolWatch.Stop()
+
 	// Alice 发送加密群消息
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "三人群消息"})
-	time.Sleep(1 * time.Second)
 
 	// Bob 和 Carol 都能解密
 	for _, tc := range []struct {
-		name   string
-		client *AUNClient
+		name    string
+		watcher *groupMessageWatcher
 	}{
-		{"Bob", bob},
-		{"Carol", carol},
+		{"Bob", bobWatch},
+		{"Carol", carolWatch},
 	} {
-		msgs := groupPull(t, tc.client, groupID, 0)
+		msgs := tc.watcher.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+			for _, msg := range filterDecrypted(messages) {
+				if getPayloadText(msg) == "三人群消息" {
+					return true
+				}
+			}
+			return false
+		})
 		decrypted := filterDecrypted(msgs)
-		if len(decrypted) < 1 {
-			t.Fatalf("%s: 未找到自动解密的群消息", tc.name)
+		found := false
+		for _, msg := range decrypted {
+			if getPayloadText(msg) == "三人群消息" {
+				found = true
+				break
+			}
 		}
-		if text := getPayloadText(decrypted[0]); text != "三人群消息" {
-			t.Fatalf("%s: payload.text 不匹配: 期望 '三人群消息', 实际 '%s'", tc.name, text)
+		if !found {
+			t.Fatalf("%s: 未找到自动解密的群消息", tc.name)
 		}
 	}
 }
@@ -393,18 +530,31 @@ func TestGroupE2EEpochRotationOnKick(t *testing.T) {
 		t.Fatal("Bob 未在 15s 内收到 epoch 2 密钥")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+
 	// Alice 用 epoch 2 发加密消息
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "踢人后的消息"})
-	time.Sleep(1 * time.Second)
 
 	// Bob 能解密（有 epoch 2 密钥）
-	msgsBob := groupPull(t, bob, groupID, 0)
+	msgsBob := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecryptedByEpoch(messages, 2) {
+			if getPayloadText(msg) == "踢人后的消息" {
+				return true
+			}
+		}
+		return false
+	})
 	decryptedBob := filterDecryptedByEpoch(msgsBob, 2)
-	if len(decryptedBob) < 1 {
-		t.Fatal("Bob: 未找到 epoch 2 的自动解密消息")
+	foundBob := false
+	for _, msg := range decryptedBob {
+		if getPayloadText(msg) == "踢人后的消息" {
+			foundBob = true
+			break
+		}
 	}
-	if text := getPayloadText(decryptedBob[0]); text != "踢人后的消息" {
-		t.Fatalf("Bob: payload.text 不匹配: 期望 '踢人后的消息', 实际 '%s'", text)
+	if !foundBob {
+		t.Fatal("Bob: 未找到 epoch 2 的自动解密消息")
 	}
 
 	// Carol 没有 epoch 2 密钥（被踢后不会收到新密钥）
@@ -435,6 +585,9 @@ func TestGroupE2EBurstMessages(t *testing.T) {
 		t.Fatal("Bob 未在超时内收到 group_secret")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+
 	const N = 5
 	for i := 0; i < N; i++ {
 		groupSendEncrypted(t, alice, groupID, map[string]any{
@@ -443,13 +596,21 @@ func TestGroupE2EBurstMessages(t *testing.T) {
 		})
 	}
 
-	time.Sleep(2 * time.Second)
-
-	msgs := groupPull(t, bob, groupID, 0)
+	msgs := bobWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		texts := make(map[string]bool)
+		for _, m := range filterDecrypted(messages) {
+			if text := getPayloadText(m); text != "" {
+				texts[text] = true
+			}
+		}
+		for i := 0; i < N; i++ {
+			if !texts[fmt.Sprintf("burst_%d", i)] {
+				return false
+			}
+		}
+		return true
+	})
 	decrypted := filterDecrypted(msgs)
-	if len(decrypted) < N {
-		t.Fatalf("期望 %d 条已解密消息，实际 %d", N, len(decrypted))
-	}
 
 	// 验证所有消息内容
 	receivedTexts := make(map[string]bool)
@@ -518,13 +679,24 @@ func TestGroupE2EPlaintextExplicit(t *testing.T) {
 		t.Fatal("Bob 未在超时内收到 group_secret")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+
 	// Alice 显式发送明文消息
 	groupSendPlaintext(t, alice, groupID, map[string]any{"text": "这是一条明文消息"})
 
-	time.Sleep(1 * time.Second)
-
-	// Bob 拉取
-	msgs := groupPull(t, bob, groupID, 0)
+	msgs := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+		for _, m := range messages {
+			if getPayloadText(m) == "这是一条明文消息" {
+				_, hasE2EE := m["e2ee"]
+				enc, _ := m["encrypted"].(bool)
+				if !hasE2EE && !enc {
+					return true
+				}
+			}
+		}
+		return false
+	})
 	// 查找明文消息（不含 e2ee 字段 或 encrypted=false）
 	var plaintext []map[string]any
 	for _, m := range msgs {
@@ -549,23 +721,24 @@ func TestGroupE2EPlaintextExplicit(t *testing.T) {
 	// Alice 默认加密发送
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "这是一条加密消息"})
 
-	time.Sleep(1 * time.Second)
-
-	// 获取最后一条明文消息的 seq 用于 after_seq
-	lastSeq := 0
-	if len(msgs) > 0 {
-		if seqVal := msgs[len(msgs)-1]["seq"]; seqVal != nil {
-			lastSeq = int(toInt64(seqVal))
+	msgs2 := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecrypted(messages) {
+			if getPayloadText(msg) == "这是一条加密消息" {
+				return true
+			}
+		}
+		return false
+	})
+	encrypted := filterDecrypted(msgs2)
+	foundEncrypted := false
+	for _, msg := range encrypted {
+		if getPayloadText(msg) == "这是一条加密消息" {
+			foundEncrypted = true
+			break
 		}
 	}
-
-	msgs2 := groupPull(t, bob, groupID, lastSeq)
-	encrypted := filterDecrypted(msgs2)
-	if len(encrypted) < 1 {
+	if !foundEncrypted {
 		t.Fatal("未找到加密群消息")
-	}
-	if text := getPayloadText(encrypted[0]); text != "这是一条加密消息" {
-		t.Fatalf("加密 payload.text 不匹配: 期望 '这是一条加密消息', 实际 '%s'", text)
 	}
 }
 
@@ -604,18 +777,31 @@ func TestGroupE2ENewMemberNoRotation(t *testing.T) {
 		t.Fatal("Carol 未在超时内收到 group_secret")
 	}
 
+	carolWatch := watchGroupMessages(t, carol, groupID)
+	defer carolWatch.Stop()
+
 	// Alice 用 epoch 1 发消息
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "新成员能看到"})
-	time.Sleep(1 * time.Second)
 
 	// Carol 能解密
-	msgs := groupPull(t, carol, groupID, 0)
+	msgs := carolWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecrypted(messages) {
+			if getPayloadText(msg) == "新成员能看到" {
+				return true
+			}
+		}
+		return false
+	})
 	decrypted := filterDecrypted(msgs)
-	if len(decrypted) < 1 {
-		t.Fatal("Carol: 未找到自动解密的群消息")
+	found := false
+	for _, msg := range decrypted {
+		if getPayloadText(msg) == "新成员能看到" {
+			found = true
+			break
+		}
 	}
-	if text := getPayloadText(decrypted[0]); text != "新成员能看到" {
-		t.Fatalf("Carol: payload.text 不匹配: 期望 '新成员能看到', 实际 '%s'", text)
+	if !found {
+		t.Fatal("Carol: 未找到自动解密的群消息")
 	}
 }
 
@@ -639,6 +825,9 @@ func TestGroupE2EMixedEncryptedPlaintext(t *testing.T) {
 		t.Fatal("Bob 未在超时内收到 group_secret")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+
 	// 明文消息
 	groupSendPlaintext(t, alice, groupID, map[string]any{"text": "明文"})
 	// 加密消息
@@ -646,20 +835,47 @@ func TestGroupE2EMixedEncryptedPlaintext(t *testing.T) {
 	// 又一条明文
 	groupSendPlaintext(t, alice, groupID, map[string]any{"text": "又是明文"})
 
-	time.Sleep(1 * time.Second)
-
-	msgs := groupPull(t, bob, groupID, 0)
-	if len(msgs) < 3 {
-		t.Fatalf("期望至少 3 条消息，实际 %d", len(msgs))
-	}
+	msgs := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+		hasPlain1 := false
+		hasPlain2 := false
+		hasEncrypted := false
+		for _, msg := range messages {
+			text := getPayloadText(msg)
+			switch text {
+			case "明文":
+				_, hasE2EE := msg["e2ee"]
+				enc, _ := msg["encrypted"].(bool)
+				if !hasE2EE && !enc {
+					hasPlain1 = true
+				}
+			case "又是明文":
+				_, hasE2EE := msg["e2ee"]
+				enc, _ := msg["encrypted"].(bool)
+				if !hasE2EE && !enc {
+					hasPlain2 = true
+				}
+			case "密文":
+				for _, d := range filterDecrypted([]map[string]any{msg}) {
+					if getPayloadText(d) == "密文" {
+						hasEncrypted = true
+					}
+				}
+			}
+		}
+		return hasPlain1 && hasPlain2 && hasEncrypted
+	})
 
 	// 加密消息已自动解密
 	decrypted := filterDecrypted(msgs)
-	if len(decrypted) < 1 {
-		t.Fatal("未找到自动解密的群消息")
+	foundEncrypted := false
+	for _, msg := range decrypted {
+		if getPayloadText(msg) == "密文" {
+			foundEncrypted = true
+			break
+		}
 	}
-	if text := getPayloadText(decrypted[0]); text != "密文" {
-		t.Fatalf("加密消息 payload.text 不匹配: 期望 '密文', 实际 '%s'", text)
+	if !foundEncrypted {
+		t.Fatal("未找到自动解密的群消息")
 	}
 
 	// 明文消息直接可读
@@ -704,6 +920,9 @@ func TestGroupE2EOldEpochStillDecryptable(t *testing.T) {
 		t.Fatal("Bob 未在超时内收到 epoch 1 密钥")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+
 	// epoch 1 发消息
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "epoch1消息"})
 
@@ -740,14 +959,18 @@ func TestGroupE2EOldEpochStillDecryptable(t *testing.T) {
 
 	// epoch 2 发消息
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "epoch2消息"})
-	time.Sleep(1 * time.Second)
 
 	// Bob 应能解密两个 epoch 的消息
-	msgs := groupPull(t, bob, groupID, 0)
+	msgs := bobWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		texts := make(map[string]bool)
+		for _, m := range filterDecrypted(messages) {
+			if text := getPayloadText(m); text != "" {
+				texts[text] = true
+			}
+		}
+		return texts["epoch1消息"] && texts["epoch2消息"]
+	})
 	decrypted := filterDecrypted(msgs)
-	if len(decrypted) < 2 {
-		t.Fatalf("期望至少 2 条已解密消息，实际 %d", len(decrypted))
-	}
 
 	texts := make(map[string]bool)
 	for _, m := range decrypted {
@@ -837,18 +1060,31 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 		t.Fatal("Alice 应持有 epoch 2 密钥")
 	}
 
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+
 	// Alice 用 epoch 2 发加密消息
 	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "退群后的消息"})
-	time.Sleep(1 * time.Second)
 
 	// Bob 能解密
-	msgsBob := groupPull(t, bob, groupID, 0)
+	msgsBob := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecryptedByEpoch(messages, 2) {
+			if getPayloadText(msg) == "退群后的消息" {
+				return true
+			}
+		}
+		return false
+	})
 	decryptedBob := filterDecryptedByEpoch(msgsBob, 2)
-	if len(decryptedBob) < 1 {
-		t.Fatal("Bob: 未找到 epoch 2 的自动解密消息")
+	foundBob := false
+	for _, msg := range decryptedBob {
+		if getPayloadText(msg) == "退群后的消息" {
+			foundBob = true
+			break
+		}
 	}
-	if text := getPayloadText(decryptedBob[0]); text != "退群后的消息" {
-		t.Fatalf("Bob: payload.text 不匹配: 期望 '退群后的消息', 实际 '%s'", text)
+	if !foundBob {
+		t.Fatal("Bob: 未找到 epoch 2 的自动解密消息")
 	}
 
 	// Carol 不应有 epoch 2 密钥

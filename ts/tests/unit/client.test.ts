@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AUNClient } from '../../src/client.js';
+import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, PermissionError, StateError, ValidationError } from '../../src/errors.js';
 
 describe('AUNClient 构造', () => {
@@ -350,5 +351,159 @@ describe('AUNClient 重连错误分类', () => {
 
   it('普通 AuthError 仍应直接终止', () => {
     expect((AUNClient as any)._shouldRetryReconnect(new AuthError('token invalid'))).toBe(false);
+  });
+});
+
+describe('AUNClient M25 重连行为', () => {
+  it('默认 max_attempts=0 应保留无限重试语义', () => {
+    const client = new AUNClient();
+    const options = (client as any)._buildSessionOptions({
+      access_token: 'tok-1',
+      gateway: 'ws://gateway.example.com/aun',
+      auto_reconnect: true,
+    });
+
+    expect(options.retry.max_attempts).toBe(0);
+  });
+
+  it('显式 max_attempts 用尽后进入 terminal_failed', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+      (client as any)._sessionParams = { access_token: 'tok-1', gateway: 'ws://gateway.example.com/aun' };
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.01, max_delay: 0.01, max_attempts: 2 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+      (client as any)._connectOnce = vi.fn().mockRejectedValue(new ConnectionError('gateway down'));
+
+      (client as any)._startReconnect();
+      await vi.advanceTimersByTimeAsync(50);
+      await Promise.resolve();
+
+      expect((client as any)._connectOnce).toHaveBeenCalledTimes(2);
+      expect(client.state).toBe('terminal_failed');
+      expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
+        state: 'terminal_failed',
+        reason: 'max_attempts_exhausted',
+        attempt: 2,
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('心跳连续 2 次失败才触发断线处理', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      (client as any)._state = 'connected';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 0.01,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.5, max_delay: 30, max_attempts: 0 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.call = vi.fn().mockRejectedValue(new ConnectionError('ping failed'));
+      const disconnectSpy = vi.spyOn(client as any, '_handleTransportDisconnect').mockResolvedValue(undefined);
+
+      (client as any)._startHeartbeatTask();
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+      expect(disconnectSpy).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('RPCTransport.close M25 清理', () => {
+  it('close 时应先移除 message/error 监听并在超时后 terminate', async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new RPCTransport({
+        eventDispatcher: { publish: vi.fn().mockResolvedValue(undefined) } as any,
+      });
+      let closeHandler: (() => void) | null = null;
+      const removeAllListeners = vi.fn();
+      const ws = {
+        removeAllListeners: vi.fn((event?: string) => {
+          if (event === undefined) {
+            removeAllListeners();
+          }
+        }),
+        on: vi.fn((event: string, handler: () => void) => {
+          if (event === 'close') closeHandler = handler;
+        }),
+        close: vi.fn(),
+        terminate: vi.fn(),
+      };
+      (transport as any)._ws = ws;
+      (transport as any)._closed = false;
+
+      const closing = transport.close();
+      expect(ws.removeAllListeners).toHaveBeenNthCalledWith(1, 'message');
+      expect(ws.removeAllListeners).toHaveBeenNthCalledWith(2, 'error');
+
+      await vi.advanceTimersByTimeAsync(3000);
+      await closing;
+
+      expect(ws.terminate).toHaveBeenCalledTimes(1);
+      expect(removeAllListeners).toHaveBeenCalledTimes(1);
+      expect(closeHandler).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('AUNClient 群组 epoch 自动轮换', () => {
+  it('普通 member 收到 member_removed 事件时不应触发 rotate_epoch', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+
+      (client as any)._aid = 'member.aid.com';
+      (client as any)._identity = { aid: 'member.aid.com' };
+      (client as any)._state = 'connected';
+
+      const rotateEpochSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
+      const callSpy = vi.spyOn(client, 'call').mockImplementation(async (method, params) => {
+        if (method === 'group.get_members') {
+          expect(params).toEqual({ group_id: 'test-group-123' });
+          return {
+            members: [
+              { aid: 'owner.aid.com', role: 'owner' },
+              { aid: 'member.aid.com', role: 'member' },
+            ],
+          };
+        }
+        throw new Error(`unexpected method: ${method}`);
+      });
+      vi.spyOn(Math, 'random').mockReturnValue(0);
+
+      await (client as any)._onRawGroupChanged({
+        group_id: 'test-group-123',
+        action: 'member_removed',
+        member_aid: 'removed.aid.com',
+      });
+      await vi.runAllTimersAsync();
+
+      expect(callSpy).toHaveBeenCalledWith('group.get_members', { group_id: 'test-group-123' });
+      expect(rotateEpochSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
   });
 });

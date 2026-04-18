@@ -110,13 +110,33 @@ class TestSeqTrackerGapDetection:
         assert t.get_max_seen_seq("g1") == 100
 
     def test_first_message_baseline(self):
-        """第一条消息作为基线，不创建空洞。"""
+        """S2: 首条消息 seq>1 时应构造 [1, seq-1] 历史空洞，
+        避免离线期积压的历史消息被丢弃。
+        """
         t = SeqTracker()
-        assert t.on_message_seq("g1", 5) is False  # 首次 → 基线初始化
-        assert t.get_contiguous_seq("g1") == 5
+        # 首次 seq=5 → 构造 [1,4] 历史 gap，需要 pull
+        assert t.on_message_seq("g1", 5) is True
+        assert t.get_contiguous_seq("g1") == 0  # 历史 gap 未补齐前不推进
         assert t.get_max_seen_seq("g1") == 5
-        # 之后 seq=7 → 空洞 (6,6)
+        state = t._trackers["g1"]
+        assert (1, 4) in state.pending_gaps
+        # 之后 seq=7 → 又一个空洞 (6,6)
         assert t.on_message_seq("g1", 7) is True
+        assert t.get_contiguous_seq("g1") == 0
+
+    def test_first_message_seq1_baseline(self):
+        """S2: 首条消息 seq==1 时直接设为 baseline（无历史）。"""
+        t = SeqTracker()
+        assert t.on_message_seq("g1", 1) is False
+        assert t.get_contiguous_seq("g1") == 1
+
+    def test_set_baseline_skips_history(self):
+        """S2: 通过 set_baseline 预置后，首条消息不会构造历史 gap。"""
+        t = SeqTracker()
+        t.set_baseline("g1", 4)
+        assert t.get_contiguous_seq("g1") == 4
+        # 首条 seq=5 正常递进，不产生历史 gap
+        assert t.on_message_seq("g1", 5) is False
         assert t.get_contiguous_seq("g1") == 5
 
 
@@ -192,8 +212,11 @@ class TestSeqTrackerBackoff:
 
         assert t.on_message_seq("g1", 3) is True  # 退避结束 → 可以 pull
 
-    def test_max_probe_count_resolves(self):
-        """探测达到上限后标记为 resolved，不再触发 pull。"""
+    def test_max_probe_count_no_auto_resolve(self):
+        """S2: 达到 _MAX_PROBE_COUNT 不再自动 resolved，
+        仅作为退避索引上限（超出后使用最长间隔 60s 持续重试）。
+        resolved 只由完整补齐或服务端 tombstone 驱动。
+        """
         t = SeqTracker()
         t.on_message_seq("g1", 1)
         t.on_message_seq("g1", 3)
@@ -202,11 +225,23 @@ class TestSeqTrackerBackoff:
         gap_key = (2, 2)
         probe = state.pending_gaps[gap_key]
         probe.probe_count = _MAX_PROBE_COUNT  # 达到上限
+        probe.last_probe_at = time.monotonic() - 120  # 超过 60s 退避
 
-        # 下一次检查时应标记为 resolved
+        # 未 resolved → 仍应触发 pull
         result = t.on_message_seq("g1", 3)
-        assert result is False
-        assert probe.resolved is True
+        assert result is True
+        assert probe.resolved is False
+
+    def test_tombstone_resolves_gap(self):
+        """S2: 服务端通过 tombstone 明确标记区间无消息 → resolved 并推进。"""
+        t = SeqTracker()
+        t.on_message_seq("g1", 1)
+        t.on_message_seq("g1", 5)  # 空洞 [2,4]
+
+        # 服务端 tombstone 告知 [2,4] 无消息
+        t.mark_gap_resolved_by_tombstone("g1", 2, 4)
+        # gap resolved → contiguous 推到 4 → received 有 5 → 推到 5
+        assert t.get_contiguous_seq("g1") == 5
 
     def test_resolved_gap_advances_contiguous(self):
         """resolved 的空洞在下一条消息到达时允许 contiguous 推进。"""
@@ -224,13 +259,14 @@ class TestSeqTrackerBackoff:
         t.on_message_seq("g1", 3)
         assert t.get_contiguous_seq("g1") == 3
 
-    def test_three_empty_pulls_resolve_gap(self):
-        """连续 3 次 pull 没命中空洞内的 seq → resolved。"""
+    def test_three_empty_pulls_do_not_resolve_gap(self):
+        """S2: 连续 pull 没命中空洞内的 seq → 不再自动 resolved，
+        避免消息因探测无回应被静默放弃。仅由完整补齐或 tombstone 驱动。
+        """
         t = SeqTracker()
         t.on_message_seq("g1", 1)
         t.on_message_seq("g1", 5)  # 空洞 [2,3,4]
 
-        # 空洞 gap_key = (2, 4)
         state = t._trackers["g1"]
         gap_key = (2, 4)
         assert gap_key in state.pending_gaps
@@ -238,9 +274,9 @@ class TestSeqTrackerBackoff:
         for _ in range(3):
             t.on_pull_result("g1", [{"seq": 10}])  # 没命中空洞
 
-        # 3 次 pull 无命中 → resolved
-        # gap(2,4) resolved → contiguous 推进到 4 → received 有 5 → 推到 5
-        assert t.get_contiguous_seq("g1") == 5
+        # 不再自动 resolved，gap 仍 pending
+        assert state.pending_gaps[gap_key].resolved is False
+        assert t.get_contiguous_seq("g1") == 1
 
     def test_backoff_intervals(self):
         """退避间隔序列正确：1, 3, 10, 30, 60 秒。"""

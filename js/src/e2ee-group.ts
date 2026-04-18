@@ -758,7 +758,7 @@ export class GroupReplayGuard {
     const key = `${groupId}:${senderAid}:${messageId}`;
     if (this._seen.has(key)) return false;
     this._seen.set(key, true);
-    this._trim();
+    this.trim();
     return true;
   }
 
@@ -770,10 +770,11 @@ export class GroupReplayGuard {
   /** 仅记录 */
   record(groupId: string, senderAid: string, messageId: string): void {
     this._seen.set(`${groupId}:${senderAid}:${messageId}`, true);
-    this._trim();
+    this.trim();
   }
 
-  private _trim(): void {
+  /** LRU 裁剪（供外部调用） */
+  trim(): void {
     if (this._seen.size > this._maxSize) {
       const trimCount = this._seen.size - Math.floor(this._maxSize * 0.8);
       const keys = [...this._seen.keys()].slice(0, trimCount);
@@ -998,7 +999,7 @@ export class GroupE2EEManager {
     const aadMsgId = aad ? (aad.message_id ?? '') as string : '';
     const msgId = aadMsgId || (message.message_id ?? '') as string;
     if (!skipReplay && groupId && sender && msgId) {
-      if (this._replayGuard.isSeen(groupId, sender, msgId)) return message;
+      if (this._replayGuard.isSeen(groupId, sender, msgId)) return null;
     }
 
     // 解析发送方证书（零信任：无证书则拒绝）
@@ -1126,6 +1127,11 @@ export class GroupE2EEManager {
   async getMemberAids(groupId: string): Promise<string[]> {
     const s = await loadGroupSecret(this._keystoreRef, this._currentAid(), groupId);
     return s ? s.member_aids : [];
+  }
+
+  /** 清理过期缓存（replay guard 等），供外部定时调用 */
+  cleanExpiredCaches(): void {
+    this._replayGuard.trim();
   }
 
   // ── 内部工具 ──────────────────────────────────────

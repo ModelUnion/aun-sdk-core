@@ -213,8 +213,19 @@ function openDB(): Promise<IDBDatabase> {
       }
     };
 
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      // H22: 其它 tab 持有旧版本连接时，触发 versionchange 通知它们关闭，避免 onupgradeneeded 挂起
+      db.onversionchange = () => {
+        try { db.close(); } catch { /* ignore */ }
+      };
+      resolve(db);
+    };
     request.onerror = () => reject(request.error ?? new Error('打开 IndexedDB 失败'));
+    // H22: onblocked = 其它 tab 持有旧版本阻塞升级；必须显式 reject 让上层感知而非永久挂起
+    request.onblocked = () => {
+      reject(new Error('IndexedDB 升级被其它 tab 阻塞，请关闭其它页面后重试'));
+    };
   });
 }
 

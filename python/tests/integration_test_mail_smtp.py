@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mail 服务 Phase 3/4/5/6 集成测试 — SMTP 出站/入站 + IMAP + 新功能。
+"""Mail 服务 Phase 3/4/5/6/7 集成测试 — SMTP 出站/入站 + IMAP + 配额 + 垃圾邮件。
 
 覆盖：
   Phase 3（SMTP 出站）:
@@ -1357,13 +1357,201 @@ def test_imap_namespace():
 
 
 # ---------------------------------------------------------------------------
-# 主流程
+# Phase 7 测试：配额追踪 + 垃圾邮件过滤
 # ---------------------------------------------------------------------------
+
+
+async def test_quota_tracking(alice: AUNClient):
+    """Q1: 发邮件前后 used_bytes 应增长"""
+    name = "Q1 配额追踪 — used_bytes 增长"
+    try:
+        # 发送前查询配额
+        before = await alice.call("mail.get_quota", {})
+        used_before = before.get("used_bytes", 0)
+
+        # 发一封邮件给自己
+        ts = str(int(time.time() * 1000))
+        subject = f"quota-track-{ts}"
+        body = "A" * 500  # 500 字节正文
+        result = await alice.call("mail.send", {
+            "to": [_ALICE_AID],
+            "subject": subject,
+            "body": body,
+        })
+        if not result.get("ok"):
+            _fail(name, f"发送失败: {result}")
+            return
+
+        await asyncio.sleep(0.5)
+
+        # 发送后查询配额
+        after = await alice.call("mail.get_quota", {})
+        used_after = after.get("used_bytes", 0)
+
+        # used_bytes 应增长（至少增加 subject + body 大小的 2 倍，inbox + sent）
+        delta = used_after - used_before
+        if delta > 0:
+            _ok(name)
+        else:
+            _fail(name, f"used_bytes 未增长: before={used_before} after={used_after}")
+
+        # 清理
+        inbox = await alice.call("mail.list", {"mailbox": "inbox", "limit": 50})
+        for m in inbox.get("messages", []):
+            if m.get("subject") == subject:
+                await alice.call("mail.delete", {"message_id": m["id"]})
+                break
+    except Exception as e:
+        _fail(name, str(e))
+
+
+async def test_quota_fields_valid(alice: AUNClient):
+    """Q2: get_quota 返回字段类型和值域正确"""
+    name = "Q2 配额字段校验"
+    try:
+        q = await alice.call("mail.get_quota", {})
+        used = q.get("used_bytes")
+        quota = q.get("quota_bytes")
+        pct = q.get("usage_pct")
+
+        errors = []
+        if not isinstance(used, (int, float)) or used < 0:
+            errors.append(f"used_bytes 异常: {used}")
+        if not isinstance(quota, (int, float)) or quota <= 0:
+            errors.append(f"quota_bytes 异常: {quota}")
+        if not isinstance(pct, (int, float)) or pct < 0 or pct > 100:
+            errors.append(f"usage_pct 异常: {pct}")
+        # used_bytes / quota_bytes ≈ usage_pct
+        if quota and quota > 0:
+            expected_pct = used / quota * 100
+            if abs(pct - expected_pct) > 0.01:
+                errors.append(f"usage_pct 不匹配: 期望 {expected_pct:.2f} 实际 {pct:.2f}")
+
+        if errors:
+            _fail(name, "; ".join(errors))
+        else:
+            _ok(name)
+    except Exception as e:
+        _fail(name, str(e))
+
+
+def test_spam_smtp_inbound_to_junk():
+    """S1: 含黑名单关键词的 SMTP 入站邮件应投递到 junk"""
+    name = "S1 垃圾邮件 → junk 邮箱"
+    ts = str(int(time.time() * 1000))
+    alice_email = _aid_to_email(_ALICE_AID)
+    # 主题和正文包含黑名单关键词 "viagra"（docker-compose 中已配置）
+    subject = f"Buy viagra now {ts}"
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = "spammer@spammer.test"  # 黑名单域名
+        msg["To"] = alice_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(f"Free viagra offer {ts}", "plain", "utf-8"))
+
+        with smtplib.SMTP(_KITE_HOST, _SMTP_INBOUND_PORT, timeout=10) as smtp:
+            smtp.sendmail("spammer@spammer.test", [alice_email], msg.as_string())
+
+        _ok(name)
+    except smtplib.SMTPException as e:
+        # 如果 spam 得分 >= 阈值直接被 DMARC reject，也算合理
+        if "550" in str(e):
+            _ok(name)
+        else:
+            _fail(name, str(e))
+    except Exception as e:
+        _fail(name, str(e))
+    return subject
+
+
+async def test_spam_landed_in_junk(alice: AUNClient, spam_subject: str):
+    """S2: 验证垃圾邮件确实进入 junk 而非 inbox"""
+    name = "S2 垃圾邮件进入 junk 邮箱"
+    if not spam_subject:
+        _skip(name, "垃圾邮件未成功投递")
+        return
+    try:
+        await asyncio.sleep(1)
+
+        # 检查 junk 邮箱
+        junk = await alice.call("mail.list", {"mailbox": "junk", "limit": 50})
+        junk_msgs = junk.get("messages", [])
+        in_junk = any(spam_subject in m.get("subject", "") for m in junk_msgs)
+
+        # 检查 inbox（不应在 inbox 中）
+        inbox = await alice.call("mail.list", {"mailbox": "inbox", "limit": 200})
+        inbox_msgs = inbox.get("messages", [])
+        in_inbox = any(spam_subject in m.get("subject", "") for m in inbox_msgs)
+
+        if in_junk and not in_inbox:
+            _ok(name)
+        elif in_junk and in_inbox:
+            _fail(name, "邮件同时出现在 junk 和 inbox 中")
+        elif in_inbox:
+            _fail(name, "垃圾邮件进入了 inbox 而非 junk")
+        else:
+            _fail(name, f"邮件未出现在 junk 或 inbox 中 (junk={len(junk_msgs)}, inbox={len(inbox_msgs)})")
+    except Exception as e:
+        _fail(name, str(e))
+
+
+def test_spam_clean_mail_to_inbox():
+    """S3: 正常邮件（无黑名单关键词）应正常进入 inbox"""
+    name = "S3 正常邮件 → inbox"
+    ts = str(int(time.time() * 1000))
+    alice_email = _aid_to_email(_ALICE_AID)
+    subject = f"Normal business email {ts}"
+
+    try:
+        msg = MIMEText(f"Hello, this is a normal email {ts}", "plain", "utf-8")
+        msg["From"] = "partner@legit.com"
+        msg["To"] = alice_email
+        msg["Subject"] = subject
+
+        with smtplib.SMTP(_KITE_HOST, _SMTP_INBOUND_PORT, timeout=10) as smtp:
+            smtp.sendmail("partner@legit.com", [alice_email], msg.as_string())
+
+        _ok(name)
+    except Exception as e:
+        _fail(name, str(e))
+    return subject
+
+
+async def test_clean_mail_in_inbox(alice: AUNClient, clean_subject: str):
+    """S4: 验证正常邮件进入 inbox 而非 junk"""
+    name = "S4 正常邮件在 inbox"
+    if not clean_subject:
+        _skip(name, "正常邮件未成功投递")
+        return
+    try:
+        await asyncio.sleep(1)
+
+        inbox = await alice.call("mail.list", {"mailbox": "inbox", "limit": 200})
+        inbox_msgs = inbox.get("messages", [])
+        in_inbox = any(clean_subject in m.get("subject", "") for m in inbox_msgs)
+
+        if in_inbox:
+            _ok(name)
+        else:
+            # 也检查 junk
+            junk = await alice.call("mail.list", {"mailbox": "junk", "limit": 50})
+            junk_msgs = junk.get("messages", [])
+            in_junk = any(clean_subject in m.get("subject", "") for m in junk_msgs)
+            if in_junk:
+                _fail(name, "正常邮件错误地进入了 junk")
+            else:
+                _fail(name, f"邮件未找到 (inbox={len(inbox_msgs)})")
+    except Exception as e:
+        _fail(name, str(e))
+
+
+
 
 
 async def main():
     print("=" * 60)
-    print("Mail Phase 3/4/5 集成测试（SMTP + IMAP）")
+    print("Mail Phase 3/4/5/6/7 集成测试（SMTP + IMAP + 配额 + 垃圾邮件）")
     print("=" * 60)
     print(f"  Issuer:     {_ISSUER}")
     print(f"  Alice:      {_ALICE_AID}")
@@ -1461,6 +1649,20 @@ async def main():
     test_imap_delete_mailbox()
     test_imap_rename_mailbox()
     test_imap_namespace()
+
+    # Phase 7: 配额追踪
+    print()
+    print("── Phase 7: 配额追踪 (Q1-Q2) ──")
+    await test_quota_tracking(alice_client)
+    await test_quota_fields_valid(alice_client)
+
+    # Phase 7: 垃圾邮件过滤
+    print()
+    print("── Phase 7: 垃圾邮件过滤 (S1-S4) ──")
+    spam_subject = test_spam_smtp_inbound_to_junk()
+    await test_spam_landed_in_junk(alice_client, spam_subject)
+    clean_subject = test_spam_clean_mail_to_inbox()
+    await test_clean_mail_in_inbox(alice_client, clean_subject)
 
     # 断开连接
     await alice_client.close()

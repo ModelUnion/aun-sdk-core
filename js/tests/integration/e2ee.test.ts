@@ -1,15 +1,19 @@
 // ── E2EE 集成测试（浏览器 SDK）──────────────────────────────
 //
 // 浏览器 SDK 使用原生 WebSocket 和 fetch()，jsdom 环境无法建立真实的
-// WebSocket/HTTPS 连接，因此所有集成测试标记为 skip。
+// WebSocket/HTTPS 连接，因此当前仓库里的这组 Vitest 用例全部标记为 skip。
+//
+// 它们的作用是保留与 Python 集成测试对齐的用例结构，不属于
+// docs/AUN集成测试与E2E运行指南.md 里的常规 Docker 单域/双域回归矩阵。
 //
 // 要在真实环境中运行这些测试，需使用 Playwright 或 Cypress 等
-// 浏览器自动化框架，配合运行中的 Docker 测试环境。
+// 浏览器自动化框架，配合运行中的 Docker 测试环境，并通过容器网络
+// alias / 对等域名解析方案访问 gateway.{issuer}。
 //
 // 前置条件（真实浏览器环境）：
 //   - Docker 环境运行中（docker compose up -d）
-//   - hosts 文件映射 gateway.agentid.pub -> 127.0.0.1
 //   - Gateway 地址由 SDK 通过 AID 的 issuer domain 自动发现（well-known discovery）
+//   - 浏览器运行环境本身能够解析 gateway.{issuer} 等服务域名
 //
 // 测试用例与 Python 集成测试 (tests/integration_test_e2ee.py) 对齐，
 // 覆盖 E2EE 核心流程：prekey 上传/获取、加密消息收发、密钥轮换、防重复等。

@@ -28,7 +28,7 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.10",
     "cryptography>=43.0",
-    "websockets>=15.0",
+    "websockets>=13.0,<15",
     "sqlcipher3>=0.6.0",
 ]
 

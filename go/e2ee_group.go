@@ -3,7 +3,6 @@ package aun
 import (
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/anthropics/aun-sdk-core/go/keystore"
@@ -25,15 +24,14 @@ const (
 // 所有网络操作（P2P 发送、RPC 调用）由调用方负责。
 // 内置防重放、epoch 降级防护、密钥请求频率限制。
 type GroupE2EEManager struct {
-	mu                    sync.RWMutex
 	identityFn            func() map[string]any // 获取当前身份的回调
 	keystore              keystore.KeyStore     // 密钥存储后端
 	config                *AUNConfig            // SDK 配置
 	replayGuard           *GroupReplayGuard     // 防重放守卫
 	requestThrottle       *GroupKeyRequestThrottle // 密钥请求频率限制
 	responseThrottle      *GroupKeyRequestThrottle // 密钥响应频率限制
-	senderCertResolver    func(string) string   // 发送方证书解析器
-	initiatorCertResolver func(string) string   // 发起者证书解析器
+	senderCertResolver    func(string, string) string   // 发送方证书解析器（AID, fingerprint）
+	initiatorCertResolver func(string, string) string   // 发起者证书解析器（AID, fingerprint）
 }
 
 // GroupE2EEManagerConfig 群组 E2EE 配置
@@ -43,8 +41,8 @@ type GroupE2EEManagerConfig struct {
 	Config                *AUNConfig            // SDK 配置
 	RequestCooldown       float64               // 密钥请求冷却时间（秒），默认 30
 	ResponseCooldown      float64               // 密钥响应冷却时间（秒），默认 30
-	SenderCertResolver    func(string) string   // 通过 AID 获取发送方证书 PEM
-	InitiatorCertResolver func(string) string   // 通过 AID 获取发起者证书 PEM
+	SenderCertResolver    func(string, string) string   // 通过 AID + fingerprint 获取发送方证书 PEM
+	InitiatorCertResolver func(string, string) string   // 通过 AID + fingerprint 获取发起者证书 PEM
 }
 
 // NewGroupE2EEManager 创建群组 E2EE 管理器
@@ -220,6 +218,11 @@ func (m *GroupE2EEManager) Cleanup(groupID string, retentionSeconds int) (int, e
 	return CleanupOldEpochs(m.keystore, m.currentAID(), groupID, retentionSeconds)
 }
 
+// CleanExpiredCaches 清理过期缓存（replay guard 等），供外部定时调用
+func (m *GroupE2EEManager) CleanExpiredCaches() {
+	m.replayGuard.Trim()
+}
+
 // ── 加解密 ────────────────────────────────────────────────
 
 // Encrypt 加密群组消息（含发送方签名）
@@ -275,14 +278,21 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map
 	}
 	if !skipReplay && groupID != "" && sender != "" && msgID != "" {
 		if m.replayGuard.IsSeen(groupID, sender, msgID) {
-			return message, nil // 已处理过，原样返回
+			return nil, nil // 重复消息，丢弃
 		}
 	}
 
 	// 解析发送方证书（零信任：无证书则拒绝）
+	// 从 payload 或 aad 提取 sender_cert_fingerprint 以精确匹配证书版本
+	senderFP := ""
+	if fp, ok := payload["sender_cert_fingerprint"].(string); ok && fp != "" {
+		senderFP = fp
+	} else if aad != nil {
+		senderFP, _ = aad["sender_cert_fingerprint"].(string)
+	}
 	var senderCertPEM []byte
 	if m.senderCertResolver != nil && sender != "" {
-		raw := m.senderCertResolver(sender)
+		raw := m.senderCertResolver(sender, senderFP)
 		if raw != "" {
 			senderCertPEM = []byte(raw)
 		}
@@ -343,8 +353,10 @@ func (m *GroupE2EEManager) HandleIncoming(payload map[string]any) string {
 		// 解析发起者证书用于 manifest 验证
 		var initiatorCert []byte
 		distributedBy, _ := payload["distributed_by"].(string)
+		// 从 payload 提取 fingerprint 以精确匹配证书版本
+		initiatorFP, _ := payload["distributor_cert_fingerprint"].(string)
 		if m.initiatorCertResolver != nil && distributedBy != "" {
-			raw := m.initiatorCertResolver(distributedBy)
+			raw := m.initiatorCertResolver(distributedBy, initiatorFP)
 			if raw != "" {
 				initiatorCert = []byte(raw)
 			}

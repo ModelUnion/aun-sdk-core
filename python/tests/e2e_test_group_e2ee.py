@@ -115,6 +115,18 @@ def _make_client(tag: str, rid: str | None = None) -> AUNClient:
     })
     client._config_model.require_forward_secrecy = False
     client._test_slot_id = _build_test_slot_id(tag, rid)
+    # 服务端 cursor 兜底生效后，after_message_seq=0 会被抬升到 last_ack_msg_seq，
+    # 而 auto-ack 已把 cursor 推到最新，pull 会返回空。测试用 push 收件箱兜底。
+    client._test_group_inbox = {}
+
+    def _collect_group_msg(data):
+        if not isinstance(data, dict):
+            return
+        gid = data.get("group_id", "")
+        if gid:
+            client._test_group_inbox.setdefault(gid, []).append(data)
+
+    client._dispatcher.subscribe("group.message_created", _collect_group_msg)
     return client
 
 
@@ -169,14 +181,36 @@ def _distribute_group_secret(
 
 
 async def _group_pull(client: AUNClient, group_id: str, after_seq: int = 0) -> list[dict]:
-    """拉取群消息（经 client.call 自动解密）"""
-    result = await client.call("group.pull", {"group_id": group_id, "after_seq": after_seq})
+    """获取群消息：从 push 推送收件箱读取（防抖 N>1 时触发 auto-pull 也会填入）。
+
+    服务端多设备 cursor 兜底后，auto-ack 推进后服务端 pull 返回空。
+    push inbox 是客户端侧真实收到并解密的消息集合，是测试的真实可信源。
+    """
+    pushed = list(getattr(client, "_test_group_inbox", {}).get(group_id, []))
+    # 按 seq 排序去重（同一 seq 可能既被 push 也被 auto-pull 投递过）
+    seen_seq = set()
+    ordered = []
+    for m in sorted(pushed, key=lambda x: x.get("seq") or 0):
+        s = m.get("seq")
+        if s in seen_seq:
+            continue
+        if s is not None:
+            seen_seq.add(s)
+        ordered.append(m)
+    if after_seq and after_seq > 0:
+        ordered = [m for m in ordered if (m.get("seq") or 0) > after_seq]
+    if ordered:
+        return ordered
+    # 兜底：未收到任何 push 时走服务端 pull（覆盖 push 完全丢失的边缘情况）
+    result = await client.call(
+        "group.pull", {"group_id": group_id, "after_message_seq": after_seq or 0}
+    )
     return result.get("messages", [])
 
 
 async def _group_pull_raw(client: AUNClient, group_id: str, after_seq: int = 0) -> list[dict]:
     """拉取群消息（不经自动解密，用于验证无密钥方看到密文）"""
-    result = await client._transport.call("group.pull", {"group_id": group_id, "after_seq": after_seq})
+    result = await client._transport.call("group.pull", {"group_id": group_id, "after_message_seq": after_seq})
     return result.get("messages", [])
 
 

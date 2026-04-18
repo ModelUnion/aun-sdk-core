@@ -138,15 +138,30 @@ export class RPCTransport {
     if (this._ws) {
       const ws = this._ws;
       this._ws = null;
+      // M25: close() 返回前先移除路由相关的监听器，避免
+      // 超时强制 resolve 后，stale ws 仍把消息注入 _routeMessage 或
+      // 向 EventDispatcher 广播 connection.error。
+      try { ws.removeAllListeners('message'); } catch { /* noop */ }
+      try { ws.removeAllListeners('error'); } catch { /* noop */ }
       return new Promise<void>((resolve) => {
-        ws.on('close', () => resolve());
+        let settled = false;
+        const finish = (): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { ws.removeAllListeners(); } catch { /* noop */ }
+          try { ws.terminate?.(); } catch { /* noop */ }
+          resolve();
+        };
+        ws.on('close', finish);
         try {
           ws.close();
         } catch {
-          resolve();
+          finish();
+          return;
         }
-        // 超时强制解析
-        setTimeout(() => resolve(), 3_000);
+        // 超时强制解析，并在定时器触发时通过 terminate() 彻底清理残留 socket
+        const timer = setTimeout(finish, 3_000);
       });
     }
   }

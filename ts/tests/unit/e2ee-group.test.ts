@@ -72,12 +72,14 @@ describe('encryptGroupMessage', () => {
     const gs = makeGroupSecret();
     const { privateKey } = generateECKeypair();
     const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+    const certPem = makeSelfSignedCert(privateKey, 'alice.test');
 
     const envelope = encryptGroupMessage('grp-1', 1, gs, { text: 'signed' }, {
       fromAid: 'alice.test',
       messageId: 'msg-1',
       timestamp: Date.now(),
       senderPrivateKeyPem: privPem,
+      senderCertPem: certPem,
     });
 
     expect(envelope.sender_signature).toBeTruthy();

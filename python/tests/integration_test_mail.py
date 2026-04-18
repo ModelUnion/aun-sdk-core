@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mail 服务 Phase 2 集成测试 — 需要运行中的 AUN Gateway + Mail 服务。
+"""Mail 服务集成测试 — 需要运行中的 AUN Gateway + Mail 服务。
 
 覆盖（单域）：
   T2.1  本域投递 — 收件方 inbox 出现邮件
@@ -16,6 +16,8 @@
   T2.23 列出应用专用密码
   T2.24 撤销应用专用密码
   T2.25 超过密码上限（跳过，上限 20 太大）
+  T7.1  mail.get_quota 配额查询
+  T7.2  mail.status 包含新特性
 
 使用方法：
   docker exec kite-sdk-tester python /tests/integration_test_mail.py
@@ -608,12 +610,57 @@ async def test_e2ee_plaintext_still_works(alice: AUNClient, bob: AUNClient):
         _fail(name, str(e))
 
 
+async def test_get_quota(alice: AUNClient):
+    """T7.1: mail.get_quota 配额查询"""
+    name = "T7.1 mail.get_quota"
+    try:
+        result = await alice.call("mail.get_quota", {})
+        used = result.get("used_bytes")
+        quota = result.get("quota_bytes")
+        pct = result.get("usage_pct")
+
+        if used is None or quota is None or pct is None:
+            _fail(name, f"返回字段不完整: {result}")
+            return
+
+        if quota <= 0:
+            _fail(name, f"配额应 > 0，实际: {quota}")
+            return
+
+        if not isinstance(pct, (int, float)):
+            _fail(name, f"usage_pct 类型不正确: {type(pct)}")
+            return
+
+        _ok(name)
+    except Exception as e:
+        _fail(name, str(e))
+
+
+async def test_status_new_features(alice: AUNClient):
+    """T7.2: mail.status 包含新增特性"""
+    name = "T7.2 mail.status 新特性"
+    try:
+        s = await alice.call("mail.status", {})
+        features = s.get("features", [])
+        expected = ["tls", "spf", "dkim_verify", "dmarc", "quota", "spam_filter"]
+        missing = [f for f in expected if f not in features]
+        if missing:
+            _fail(name, f"缺少特性: {missing}")
+            return
+        if "mail.get_quota" not in features:
+            _fail(name, "缺少 mail.get_quota 特性")
+            return
+        _ok(name)
+    except Exception as e:
+        _fail(name, str(e))
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
 async def main():
-    print(f"=== Mail Phase 2 集成测试 ===")
+    print(f"=== Mail 集成测试 ===")
     print(f"AUN_PATH: {_TEST_AUN_PATH}")
     print(f"ISSUER:   {_ISSUER}")
     print(f"ALICE:    {_ALICE_AID}")
@@ -665,6 +712,11 @@ async def main():
     await test_e2ee_send_and_get(alice, bob)
     await test_e2ee_recipient_gets_envelope(alice, bob)
     await test_e2ee_plaintext_still_works(alice, bob)
+
+    print()
+    print("--- 配额与新特性 ---")
+    await test_get_quota(alice)
+    await test_status_new_features(alice)
 
     # 清理
     try:

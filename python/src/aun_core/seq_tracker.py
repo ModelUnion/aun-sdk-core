@@ -29,6 +29,9 @@ from dataclasses import dataclass, field
 
 
 _BACKOFF_INTERVALS = [1.0, 3.0, 10.0, 30.0, 60.0]
+# S2: 删除"probe_count >= 5 强制 resolved"的硬限制。resolved 只应由"完整补齐"或
+# 服务端明确 tombstone 驱动，否则漏消息窗口里所有 gap 都会在探测 5 次后被静默放弃。
+# 保留 _MAX_PROBE_COUNT 变量仅用作退避索引上限。
 _MAX_PROBE_COUNT = 5
 
 
@@ -70,6 +73,18 @@ class SeqTracker:
     def get_max_seen_seq(self, ns: str) -> int:
         return self._get(ns).max_seen_seq
 
+    def set_baseline(self, ns: str, baseline_seq: int) -> None:
+        """S2: 从持久化（keystore 最近 ack seq）恢复 baseline，
+        以便首条 push 消息能构造 [baseline+1, seq-1] 的历史 gap。
+        必须在收到首条消息前调用（否则 (0,0) 自动 baseline 会跳过历史）。
+        """
+        if baseline_seq <= 0:
+            return
+        t = self._get(ns)
+        if t.contiguous_seq == 0 and t.max_seen_seq == 0:
+            t.contiguous_seq = baseline_seq
+            t.max_seen_seq = baseline_seq
+
     def on_message_seq(self, ns: str, seq: int) -> bool:
         """记录收到的 seq，返回 True 表示需要 pull 补齐空洞。"""
         if seq <= 0:
@@ -79,11 +94,19 @@ class SeqTracker:
         if seq <= t.contiguous_seq:
             return False  # 重复或旧消息
 
-        # 首次收到消息：以当前 seq 为基线，不创建历史空洞
+        # S2: 首次收到消息（且未通过 set_baseline 初始化）时，必须构造 [1, seq-1] gap，
+        # 触发补洞拉取离线期积压的历史消息，而不是直接把 seq 作为 baseline 丢弃历史。
         if t.contiguous_seq == 0 and t.max_seen_seq == 0:
-            t.contiguous_seq = seq
+            if seq == 1:
+                t.contiguous_seq = seq
+                t.max_seen_seq = seq
+                return False
+            # seq > 1 → 视作存在 [1, seq-1] 的历史空洞
             t.max_seen_seq = seq
-            return False
+            t.received_seqs.add(seq)
+            gap_key = (1, seq - 1)
+            t.pending_gaps[gap_key] = GapProbe(gap_start=1, gap_end=seq - 1)
+            return True
 
         # 记录到 received_seqs
         t.received_seqs.add(seq)
@@ -138,11 +161,10 @@ class SeqTracker:
 
             gap_range = set(range(probe.gap_start, probe.gap_end + 1))
             if gap_range <= pulled_seqs:
-                # 完全补齐
+                # 完全补齐 → 明确 resolved
                 probe.resolved = True
-            elif not (gap_range & pulled_seqs) and probe.probe_count >= 3:
-                # 连续 3 次没拉到任何空洞内的消息 → 认定不存在
-                probe.resolved = True
+            # S2: 不再因 probe_count >= 3 自动 resolved；
+            # "探测 N 次无回应"不代表消息真的不存在，只能由服务端 tombstone/完整补齐驱动。
 
         t.max_seen_seq = max(t.max_seen_seq, max(pulled_seqs) if pulled_seqs else 0)
         self._try_advance(t)
@@ -167,14 +189,26 @@ class SeqTracker:
 
     @staticmethod
     def _should_probe(probe: GapProbe) -> bool:
-        """判断是否应该再次探测（指数退避）。"""
-        if probe.probe_count >= _MAX_PROBE_COUNT:
-            probe.resolved = True
-            return False
+        """判断是否应该再次探测（指数退避）。
+
+        S2: 不再以 probe_count >= _MAX_PROBE_COUNT 为由将 probe 标记为 resolved，
+        避免 5 次拉取失败后历史消息被永久丢弃。这里仅决定"是否到下一次探测时间"，
+        超出 backoff 表长度后按最长间隔（60s）持续重试。
+        """
         now = time.monotonic()
         idx = min(probe.probe_count, len(_BACKOFF_INTERVALS) - 1)
         interval = _BACKOFF_INTERVALS[idx]
         return now - probe.last_probe_at >= interval
+
+    def mark_gap_resolved_by_tombstone(self, ns: str, gap_start: int, gap_end: int) -> None:
+        """S2: 服务端明确告知某区间无消息（tombstone），才将 gap 标记为 resolved。"""
+        t = self._get(ns)
+        for gap_key in list(t.pending_gaps):
+            probe = t.pending_gaps[gap_key]
+            # 完全覆盖的 gap 才算由服务端 tombstone 解决
+            if probe.gap_start >= gap_start and probe.gap_end <= gap_end:
+                probe.resolved = True
+        self._try_advance(t)
 
     def export_state(self) -> dict[str, int]:
         """导出各命名空间的 contiguous_seq，用于持久化。"""

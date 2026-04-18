@@ -172,23 +172,30 @@ export class RPCTransport {
       throw new ConnectionError(`failed to send rpc ${method}: ${exc}`);
     }
 
-    // 超时控制
+    // 超时控制（H23 修复：成功路径必须 clearTimeout，避免定时器泄漏 + 慢响应被静默丢弃）
+    let timeoutHandle: ReturnType<typeof globalThis.setTimeout> | null = null;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      globalThis.setTimeout(() => {
+      timeoutHandle = globalThis.setTimeout(() => {
         this._pending.delete(rpcId);
         reject(new TimeoutError(`rpc timeout: ${method}`, { retryable: true }));
       }, effectiveTimeout);
     });
 
-    const response = await Promise.race([promise, timeoutPromise]);
+    try {
+      const response = await Promise.race([promise, timeoutPromise]);
 
-    if (response.error !== undefined) {
-      throw mapRemoteError(response.error);
+      if (response.error !== undefined) {
+        throw mapRemoteError(response.error);
+      }
+      if (response.result === undefined) {
+        throw new SerializationError(`rpc response missing result and error: ${method}`);
+      }
+      return response.result;
+    } finally {
+      if (timeoutHandle !== null) {
+        globalThis.clearTimeout(timeoutHandle);
+      }
     }
-    if (response.result === undefined) {
-      throw new SerializationError(`rpc response missing result and error: ${method}`);
-    }
-    return response.result;
   }
 
   // ── 内部消息处理 ──────────────────────────────────
@@ -230,6 +237,9 @@ export class RPCTransport {
       if (pending) {
         this._pending.delete(rpcId);
         pending.resolve(message);
+      } else {
+        // H23: 未知 id 多数是超时后到达的慢响应；打 warn 便于排查，避免被完全吞掉
+        console.warn('[aun_core.transport] 收到未知 rpc 响应（可能超时后到达）: id=' + rpcId);
       }
       return;
     }

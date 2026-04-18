@@ -6,12 +6,15 @@ package aun
 // 用法：群消息 key = "group:" + groupID，P2P 消息 key = "p2p:" + myAID
 
 import (
+	"strconv"
 	"sync"
 	"time"
 )
 
 var backoffIntervals = []float64{1, 3, 10, 30, 60} // 秒
 
+// S2: 删除"probeCount >= 5 强制 resolved"的硬限制；该常量仅作 backoff 索引上限。
+// resolved 只应由"完整补齐"或服务端明确 tombstone 驱动。
 const maxProbeCount = 5
 
 type gapProbe struct {
@@ -30,7 +33,10 @@ type trackerState struct {
 }
 
 func gapKey(start, end int) string {
-	return string(rune(start)) + ":" + string(rune(end))
+	// 使用 strconv.Itoa 而非 string(rune(...))：
+	// rune 转字符串会把整数当成码点，超出有效 Unicode 范围（>0x10FFFF 或 surrogate 段）时
+	// 会产出 U+FFFD 替换字符，导致不同输入的 gap 映射到同一 key，出现键碰撞。
+	return strconv.Itoa(start) + ":" + strconv.Itoa(end)
 }
 
 // SeqTracker 消息序列号跟踪器
@@ -79,6 +85,22 @@ func (st *SeqTracker) OnMessageSeq(ns string, seq int) bool {
 	return st.onMessageSeqLocked(ns, seq)
 }
 
+// SetBaseline S2: 从持久化（keystore 最近 ack seq）恢复 baseline，
+// 以便首条 push 消息能构造 [baseline+1, seq-1] 的历史 gap。
+// 必须在收到首条消息前调用。
+func (st *SeqTracker) SetBaseline(ns string, baselineSeq int) {
+	if baselineSeq <= 0 {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	t := st.getState(ns)
+	if t.contiguousSeq == 0 && t.maxSeenSeq == 0 {
+		t.contiguousSeq = baselineSeq
+		t.maxSeenSeq = baselineSeq
+	}
+}
+
 func (st *SeqTracker) onMessageSeqLocked(ns string, seq int) bool {
 	if seq <= 0 {
 		return false
@@ -89,11 +111,19 @@ func (st *SeqTracker) onMessageSeqLocked(ns string, seq int) bool {
 		return false
 	}
 
-	// 首次收到消息：以当前 seq 为基线，不创建历史空洞
+	// S2: 首次收到消息（且未 SetBaseline 初始化）必须构造 [1, seq-1] 历史 gap，
+	// 触发补洞拉取离线期消息，而不是直接把 seq 当 baseline 丢弃历史。
 	if t.contiguousSeq == 0 && t.maxSeenSeq == 0 {
-		t.contiguousSeq = seq
+		if seq == 1 {
+			t.contiguousSeq = seq
+			t.maxSeenSeq = seq
+			return false
+		}
 		t.maxSeenSeq = seq
-		return false
+		t.receivedSeqs[seq] = true
+		histKey := seqGapKey(1, seq-1)
+		t.pendingGaps[histKey] = &gapProbe{gapStart: 1, gapEnd: seq - 1}
+		return true
 	}
 
 	t.receivedSeqs[seq] = true
@@ -175,9 +205,9 @@ func (st *SeqTracker) OnPullResult(ns string, messages []map[string]any) {
 		}
 		if allCovered {
 			probe.resolved = true
-		} else if !anyHit && probe.probeCount >= 3 {
-			probe.resolved = true
 		}
+		// S2: 不再因 probeCount >= 3 自动 resolved。
+		_ = anyHit
 		_ = key // suppress unused
 	}
 
@@ -210,10 +240,8 @@ func (st *SeqTracker) tryAdvance(t *trackerState) {
 }
 
 func (st *SeqTracker) shouldProbe(probe *gapProbe) bool {
-	if probe.probeCount >= maxProbeCount {
-		probe.resolved = true
-		return false
-	}
+	// S2: 不再以 probeCount >= maxProbeCount 为由将 probe 置为 resolved。
+	// 超出 backoff 表长度后按最长间隔持续重试。
 	now := float64(time.Now().UnixNano()) / 1e9
 	idx := probe.probeCount
 	if idx >= len(backoffIntervals) {
@@ -221,6 +249,19 @@ func (st *SeqTracker) shouldProbe(probe *gapProbe) bool {
 	}
 	interval := backoffIntervals[idx]
 	return now-probe.lastProbeAt >= interval
+}
+
+// MarkGapResolvedByTombstone S2: 服务端明确告知某区间无消息（tombstone）→ 标 resolved
+func (st *SeqTracker) MarkGapResolvedByTombstone(ns string, gapStart, gapEnd int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	t := st.getState(ns)
+	for _, probe := range t.pendingGaps {
+		if probe.gapStart >= gapStart && probe.gapEnd <= gapEnd {
+			probe.resolved = true
+		}
+	}
+	st.tryAdvance(t)
 }
 
 func seqGapKey(start, end int) string {

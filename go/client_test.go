@@ -866,6 +866,57 @@ func TestResolveSelfCopyPeerCertUsesVersionedKeystore(t *testing.T) {
 	}
 }
 
+func TestOnRawGroupChanged_MemberDoesNotRotateEpoch(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.get_members":
+			return map[string]any{
+				"members": []any{
+					map[string]any{"aid": "owner.example.com", "role": "owner"},
+					map[string]any{"aid": "bob.example.com", "role": "member"},
+				},
+			}
+		case "group.e2ee.rotate_epoch":
+			return map[string]any{"success": true, "epoch": 2}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = "bob.example.com"
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	c.onRawGroupChanged(map[string]any{
+		"group_id": "g-1.example.com",
+		"action":   "member_removed",
+	})
+
+	time.Sleep(500 * time.Millisecond)
+
+	for _, call := range getCalls() {
+		if call.Method == "group.e2ee.rotate_epoch" {
+			t.Fatalf("member 不应触发 group.e2ee.rotate_epoch: %#v", call.Params)
+		}
+	}
+}
+
 func TestSendEncryptedUsesMultiDevicePayloadWhenNeeded(t *testing.T) {
 	senderAID := "alice.example.com"
 	receiverAID := "bob.example.com"

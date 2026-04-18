@@ -6,6 +6,8 @@
 import type { JsonObject } from './types.js';
 
 const BACKOFF_INTERVALS = [1, 3, 10, 30, 60]; // 秒
+// S2: 删除"probeCount >= 5 强制 resolved"的硬限制；仅用作 backoff 索引上限。
+// resolved 只应由"完整补齐"或服务端明确 tombstone 驱动。
 const MAX_PROBE_COUNT = 5;
 
 interface GapProbe {
@@ -51,6 +53,18 @@ export class SeqTracker {
     return this._get(ns).maxSeenSeq;
   }
 
+  /** S2: 从持久化（keystore 最近 ack seq）恢复 baseline，
+   *  以便首条 push 消息能构造 [baseline+1, seq-1] 的历史 gap。
+   *  必须在收到首条消息前调用。 */
+  setBaseline(ns: string, baselineSeq: number): void {
+    if (baselineSeq <= 0) return;
+    const t = this._get(ns);
+    if (t.contiguousSeq === 0 && t.maxSeenSeq === 0) {
+      t.contiguousSeq = baselineSeq;
+      t.maxSeenSeq = baselineSeq;
+    }
+  }
+
   /** 记录收到的 seq，返回 true 表示需要 pull 补齐空洞 */
   onMessageSeq(ns: string, seq: number): boolean {
     if (seq <= 0) return false;
@@ -58,11 +72,22 @@ export class SeqTracker {
 
     if (seq <= t.contiguousSeq) return false;
 
-    // 首次收到消息：以当前 seq 为基线，不创建历史空洞
+    // S2: 首次收到消息时，必须构造 [1, seq-1] 的历史 gap 来触发补洞，
+    // 而不是把当前 seq 当成 baseline 丢弃历史。
     if (t.contiguousSeq === 0 && t.maxSeenSeq === 0) {
-      t.contiguousSeq = seq;
+      if (seq === 1) {
+        t.contiguousSeq = seq;
+        t.maxSeenSeq = seq;
+        return false;
+      }
       t.maxSeenSeq = seq;
-      return false;
+      t.receivedSeqs.add(seq);
+      const histKey = gapKey(1, seq - 1);
+      t.pendingGaps.set(histKey, {
+        gapStart: 1, gapEnd: seq - 1,
+        lastProbeAt: 0, probeCount: 0, resolved: false,
+      });
+      return true;
     }
 
     t.receivedSeqs.add(seq);
@@ -121,9 +146,8 @@ export class SeqTracker {
       }
       if (allCovered) {
         probe.resolved = true;
-      } else if (!anyHit && probe.probeCount >= 3) {
-        probe.resolved = true;
       }
+      // S2: 不再因 probeCount >= 3 自动 resolved；仅由完整补齐 / 服务端 tombstone 驱动。
     }
 
     for (const s of pulledSeqs) {
@@ -157,14 +181,23 @@ export class SeqTracker {
   }
 
   private _shouldProbe(probe: GapProbe): boolean {
-    if (probe.probeCount >= MAX_PROBE_COUNT) {
-      probe.resolved = true;
-      return false;
-    }
+    // S2: 不再以 probeCount >= MAX_PROBE_COUNT 为由将 probe 置为 resolved。
+    // 超出 backoff 表长度后按最长间隔持续重试。
     const now = nowMs();
     const idx = Math.min(probe.probeCount, BACKOFF_INTERVALS.length - 1);
     const interval = BACKOFF_INTERVALS[idx] * 1000; // 秒转毫秒
     return now - probe.lastProbeAt >= interval;
+  }
+
+  /** S2: 服务端明确告知某区间无消息（tombstone）→ 将 gap 标记为 resolved */
+  markGapResolvedByTombstone(ns: string, gapStart: number, gapEnd: number): void {
+    const t = this._get(ns);
+    for (const [, probe] of t.pendingGaps) {
+      if (probe.gapStart >= gapStart && probe.gapEnd <= gapEnd) {
+        probe.resolved = true;
+      }
+    }
+    this._tryAdvance(t);
   }
 
   /** 强制跳过不连续区间，将 contiguousSeq 拨到指定位置。

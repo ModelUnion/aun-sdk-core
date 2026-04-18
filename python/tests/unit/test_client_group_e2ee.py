@@ -553,38 +553,45 @@ class TestRotateGroupEpochCAS:
         # 本地 epoch 未变
         assert client._group_e2ee.current_epoch(_GRP) == 1
 
-    def test_kick_triggers_cas_rotation(self, tmp_path, monkeypatch):
-        """group.kick 后自动触发 CAS 轮换"""
+    def test_kick_waits_for_member_removed_event_to_rotate(self, tmp_path, monkeypatch):
+        """group.kick 返回后不应直接轮换；仅收到 member_removed 事件后触发一次 CAS 轮换"""
         client = _make_client(tmp_path, aid=_AID_ALICE)
         _store_secret_for_client(client, epoch=1)
-        rpc_log = []
         rotate_called = []
-
-        original_rotate = client._rotate_group_epoch
 
         async def track_rotate(group_id):
             rotate_called.append(group_id)
 
-        # mock _rotate_group_epoch 来追踪调用
         monkeypatch.setattr(client, "_rotate_group_epoch", track_rotate)
 
         async def fake_transport_call(method, params=None):
-            rpc_log.append(method)
-            return {"group": {"group_id": _GRP}}
+            if method == "group.kick":
+                return {"group": {"group_id": _GRP}}
+            if method == "group.get_members":
+                return {
+                    "members": [
+                        {"aid": _AID_ALICE, "role": "admin"},
+                        {"aid": _AID_BOB, "role": "member"},
+                    ]
+                }
+            return {}
 
         monkeypatch.setattr(client._transport, "call", fake_transport_call)
 
-        asyncio.run(client.call("group.kick", {"group_id": _GRP, "aid": _AID_BOB}))
+        async def run():
+            await client.call("group.kick", {"group_id": _GRP, "aid": _AID_BOB})
+            await asyncio.sleep(0)
+            assert rotate_called == [], "group.kick 返回后不应直接触发轮换"
 
-        # 让异步任务有机会执行
-        import asyncio as _aio
-        loop = _aio.new_event_loop()
-        loop.run_until_complete(_aio.sleep(0.1))
-        loop.close()
+            await client._on_raw_group_changed({
+                "module_id": "group",
+                "action": "member_removed",
+                "group_id": _GRP,
+            })
+            await asyncio.sleep(0.2)
+            assert rotate_called == [_GRP], "收到 member_removed 事件后应触发一次轮换"
 
-        # kick 后应触发 _rotate_group_epoch（但由于 create_task 是异步的，
-        # 这里验证 call() 确实拦截了 group.kick）
-        assert "group.kick" in rpc_log
+        asyncio.run(run())
 
     def test_leave_triggers_cas_rotation(self, tmp_path, monkeypatch):
         """group.leave 后离开者不轮换；收到 group.changed(member_left) 事件时自动触发 CAS 轮换"""
@@ -600,6 +607,14 @@ class TestRotateGroupEpochCAS:
         async def fake_transport_call(method, params=None):
             if method == "group.leave":
                 return {"group": {"group_id": _GRP}, "left_aid": _AID_ALICE}
+            if method == "group.get_members":
+                # 模拟 alice 是 admin，会触发轮换
+                return {
+                    "members": [
+                        {"aid": _AID_ALICE, "role": "admin"},
+                        {"aid": _AID_BOB, "role": "member"},
+                    ]
+                }
             return {}
 
         monkeypatch.setattr(client._transport, "call", fake_transport_call)
@@ -618,6 +633,42 @@ class TestRotateGroupEpochCAS:
             })
             await asyncio.sleep(0.2)
             assert _GRP in rotate_called, "收到 member_left 事件后应触发轮换"
+
+        asyncio.run(run())
+
+    def test_member_left_only_admin_rotates(self, tmp_path, monkeypatch):
+        """收到 member_left/member_removed 事件时，仅 admin/owner 触发轮换，普通 member 不触发"""
+        client = _make_client(tmp_path, aid=_AID_ALICE)
+        _store_secret_for_client(client, epoch=1)
+        rotate_called = []
+
+        async def track_rotate(group_id):
+            rotate_called.append(group_id)
+
+        monkeypatch.setattr(client, "_rotate_group_epoch", track_rotate)
+
+        async def fake_transport_call(method, params=None):
+            if method == "group.get_members":
+                # 模拟返回成员列表：bob 是 owner，alice 是普通 member
+                return {
+                    "members": [
+                        {"aid": _AID_BOB, "role": "owner"},
+                        {"aid": _AID_ALICE, "role": "member"},
+                    ]
+                }
+            return {}
+
+        monkeypatch.setattr(client._transport, "call", fake_transport_call)
+
+        async def run():
+            # 普通 member 收到 member_removed 事件 → 不应触发轮换
+            await client._on_raw_group_changed({
+                "module_id": "group",
+                "action": "member_removed",
+                "group_id": _GRP,
+            })
+            await asyncio.sleep(0.2)
+            assert _GRP not in rotate_called, "普通 member 不应触发轮换"
 
         asyncio.run(run())
 
@@ -1181,3 +1232,36 @@ class TestGroupMessagePushPipeline:
         asyncio.run(run())
 
         assert pull_called.get("called") is True
+
+    def test_push_with_payload_gap_does_not_immediately_pull_current_seq(self, tmp_path):
+        """带完整 payload 的 push 即使触发补洞，也不应立刻为当前 seq 冗余 group.pull。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        gs = _store_secret_for_client(client, epoch=1)
+
+        published = []
+        client._dispatcher.subscribe("group.message_created", lambda data: published.append(data))
+        client._seq_tracker.on_message_seq(f"group:{_GRP}", 1)
+
+        pull_calls = []
+
+        async def fake_call(method, params):
+            if method == "group.pull":
+                pull_calls.append(dict(params))
+                return {"messages": []}
+            raise AssertionError(f"unexpected method: {method}")
+
+        import types
+        client.call = types.MethodType(lambda self, m, p: fake_call(m, p), client)
+
+        msg = self._make_encrypted_group_msg(gs, seq=3)
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._process_and_publish_group_message(msg)
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        assert len(published) == 1
+        assert published[0]["seq"] == 3
+        assert pull_calls == []

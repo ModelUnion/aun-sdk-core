@@ -494,7 +494,7 @@ describe('E2EE 集成测试', () => {
     await receiverInternal._uploadPrekey();
 
     // 清除 sender 的 prekey 缓存，使其获取新 prekey
-    sender.e2ee.invalidatePrekeyCahce(rAid);
+    sender.e2ee.invalidatePrekeyCache(rAid);
 
     // 第二条消息（使用新 prekey）
     await sdkSend(sender, rAid, { text: 'after_rotate', phase: 2 });

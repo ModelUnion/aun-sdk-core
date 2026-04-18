@@ -78,4 +78,11 @@ export interface KeyStore {
   loadSeq?(aid: string, deviceId: string, slotId: string, namespace: string): number;
   /** 加载某 device+slot 下所有 namespace 的 contiguous_seq */
   loadAllSeqs?(aid: string, deviceId: string, slotId: string): Record<string, number>;
+
+  // S2: 最近 ack seq（用作 SeqTracker 首条消息 baseline）。
+  // 默认实现可直接复用 loadSeq/saveSeq（语义等价），实现方如已有独立字段可覆盖。
+  /** 读取最近 ack seq，供 SeqTracker 作 baseline 使用 */
+  getLastAckSeq?(aid: string, deviceId: string, slotId: string, namespace: string): number;
+  /** 写入最近 ack seq */
+  setLastAckSeq?(aid: string, deviceId: string, slotId: string, namespace: string, seq: number): void;
 }

@@ -498,14 +498,8 @@ class AUNClient:
                 else:
                     loop.create_task(self._distribute_key_to_new_member(group_id, new_aid))
 
-        # 踢人后自动轮换 epoch
-        if method == "group.kick":
-            group_id = params.get("group_id", "")
-            if group_id:
-                loop.create_task(self._rotate_group_epoch(group_id))
-
-        # group.leave：按协议，离开者自身不执行轮换。
-        # 剩余在线 admin/owner 收到 group.changed(action=member_left) 后自动补位轮换。
+        # group.kick / group.leave：由 group.changed(member_removed/member_left)
+        # 事件侧统一驱动剩余 admin/owner 补位轮换，避免 RPC 返回路径与事件路径双重触发。
 
         # 审批通过后自动分发密钥给新成员
         if method == "group.review_join_request" and isinstance(result, dict):
@@ -956,7 +950,7 @@ class AUNClient:
             # 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
             if data.get("action") in ("member_left", "member_removed") and group_id:
                 loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                loop.create_task(self._rotate_group_epoch(group_id))
+                loop.create_task(self._maybe_lead_rotate_group_epoch(group_id))
         else:
             await self._dispatcher.publish("group.changed", data)
 
@@ -2216,6 +2210,64 @@ class AUNClient:
             await self.call("group.e2ee.rotate_epoch", rotate_params)
         except Exception as exc:
             _client_log.debug("同步 epoch 到服务端失败 (group=%s，可能已同步): %s", group_id, exc)
+
+    async def _maybe_lead_rotate_group_epoch(self, group_id: str) -> None:
+        """基于"排序最小 admin = leader"选举，其他 admin 走 jitter 兜底重试。
+
+        避免所有剩余 admin 同时触发 _rotate_group_epoch 造成 CAS 风暴。
+        普通 member 直接返回，不参与轮换。
+        """
+        my_aid = self._aid
+        if not my_aid:
+            return
+        try:
+            # 1. 获取成员列表
+            members_resp = await self.call("group.get_members", {"group_id": group_id})
+            if not isinstance(members_resp, dict):
+                return
+            raw_list = members_resp.get("members") or members_resp.get("items")
+            if not isinstance(raw_list, list):
+                return
+
+            # 2. 提取所有 admin/owner
+            admins = []
+            for m in raw_list:
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role", ""))
+                aid = str(m.get("aid", ""))
+                if aid and role in ("admin", "owner"):
+                    admins.append(aid)
+
+            if len(admins) == 0:
+                return
+
+            # 3. 排序选出 leader
+            admins.sort()
+            leader = admins[0]
+
+            if leader == my_aid:
+                # 我是 leader，直接发起
+                await self._rotate_group_epoch(group_id)
+                return
+
+            # 4. 非 leader：随机 jitter（2~6s）后检查 epoch 是否已被 leader 推进
+            import random
+            jitter_ms = 2000 + random.randint(0, 4000)
+            before_epoch = self._group_e2ee.current_epoch(group_id) or 0
+            await asyncio.sleep(jitter_ms / 1000.0)
+            after_epoch = self._group_e2ee.current_epoch(group_id) or 0
+
+            if after_epoch > before_epoch:
+                return  # leader 已完成
+
+            _client_log.info(
+                "[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s",
+                group_id, my_aid
+            )
+            await self._rotate_group_epoch(group_id)
+        except Exception as exc:
+            _client_log.warning("_maybe_lead_rotate_group_epoch 失败: %s", exc)
 
     async def _rotate_group_epoch(self, group_id: str) -> None:
         """为指定群组轮换 epoch 并分发新密钥。

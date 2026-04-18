@@ -330,14 +330,26 @@ class E2EEManager:
         expired = [k for k, t in self._seen_messages.items() if now - t > self._seen_ttl]
         for k in expired:
             del self._seen_messages[k]
-        # 再按数量上限裁剪
+        # 再按数量上限裁剪：按时间戳从旧到新删除（而非插入顺序），
+        # 避免误删仍在防重放窗口内的条目。
         if len(self._seen_messages) > self._seen_max_size:
             trim_count = len(self._seen_messages) - int(self._seen_max_size * 0.8)
-            keys = list(self._seen_messages.keys())[:trim_count]
-            for k in keys:
+            oldest_keys = sorted(
+                self._seen_messages.items(), key=lambda kv: kv[1]
+            )[:trim_count]
+            for k, _ts in oldest_keys:
                 del self._seen_messages[k]
 
     # ── Prekey 缓存 ────────────────────────────────────────────
+
+    def clean_expired_caches(self) -> None:
+        """清理过期的 prekey 缓存和 seen set 条目（供外部定时调用）"""
+        now = _time_mod.time()
+        for k in list(self._prekey_cache):
+            _, expire_at = self._prekey_cache[k]
+            if now >= expire_at:
+                del self._prekey_cache[k]
+        self._trim_seen_set()
 
     def cache_prekey(self, peer_aid: str, prekey: dict[str, Any]) -> None:
         """缓存对方的 prekey（调用方获取后存入，后续 encrypt 自动复用）"""
@@ -656,11 +668,11 @@ class E2EEManager:
             return cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem
         return None
 
-    def _load_sender_public_key(self, aid: str | None) -> ec.EllipticCurvePublicKey | None:
+    def _load_sender_public_key(self, aid: str | None, cert_fingerprint: str | None = None) -> ec.EllipticCurvePublicKey | None:
         """获取发送方的 identity 公钥（从本地证书缓存）"""
         if not aid:
             return None
-        cert_pem = self._get_sender_cert(aid)
+        cert_pem = self._get_sender_cert(aid, cert_fingerprint)
         if cert_pem is None:
             return None
         try:
@@ -730,7 +742,12 @@ class E2EEManager:
 
             # 获取发送方公钥（四路 ECDH 需要）
             from_aid = message.get("from") or (payload.get("aad") or {}).get("from")
-            sender_public_key = self._load_sender_public_key(from_aid)
+            sender_fp = str(
+                payload.get("sender_cert_fingerprint")
+                or (payload.get("aad") or {}).get("sender_cert_fingerprint")
+                or ""
+            ).strip().lower() or None
+            sender_public_key = self._load_sender_public_key(from_aid, sender_fp)
             if sender_public_key is None:
                 raise E2EEError(f"sender public key not found for {from_aid}")
 
@@ -803,7 +820,12 @@ class E2EEManager:
 
             # 获取发送方公钥（2DH 需要）
             from_aid = message.get("from") or (payload.get("aad") or {}).get("from")
-            sender_public_key = self._load_sender_public_key(from_aid)
+            sender_fp = str(
+                payload.get("sender_cert_fingerprint")
+                or (payload.get("aad") or {}).get("sender_cert_fingerprint")
+                or ""
+            ).strip().lower() or None
+            sender_public_key = self._load_sender_public_key(from_aid, sender_fp)
             if sender_public_key is None:
                 raise E2EEError(f"sender public key not found for {from_aid}")
 
@@ -997,7 +1019,6 @@ class E2EEManager:
                 return pk
         except Exception as exc:
             _e2ee_log.warning("prekey %s 私钥 PEM 加载失败: %s", prekey_id, exc)
-        return None
         return None
 
     # ── 证书指纹工具 ────────────────────────────────────────
@@ -1990,6 +2011,8 @@ class GroupE2EEManager:
         msg_id = aad_msg_id or message.get("message_id", "")
         if not skip_replay and group_id and sender and msg_id:
             if self._replay_guard.is_seen(group_id, sender, msg_id):
+                # 重放：返回原消息（不携带 e2ee 字段），与 decrypt_batch "or m" 语义一致。
+                # 调用方可以通过缺失 e2ee 字段识别未解密。
                 return message
 
         # 解析发送方证书（用于签名验证）— 零信任：无证书则拒绝
@@ -2112,9 +2135,5 @@ class GroupE2EEManager:
         return self._keystore_ref
 
     def clean_expired_caches(self) -> None:
-        """清理过期的 prekey 缓存条目（供外部定时调用）"""
-        now = _time_mod.time()
-        for k in list(self._prekey_cache):
-            _, expire_at = self._prekey_cache[k]
-            if now >= expire_at:
-                del self._prekey_cache[k]
+        """清理过期缓存（replay guard 等），供外部定时调用"""
+        self._replay_guard._trim()

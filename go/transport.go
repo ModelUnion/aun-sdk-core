@@ -112,6 +112,8 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 func (t *RPCTransport) Close() error {
 	t.closedMu.Lock()
 	t.closed = true
+	ws := t.ws
+	t.ws = nil
 	t.closedMu.Unlock()
 
 	// 取消读取循环
@@ -123,10 +125,9 @@ func (t *RPCTransport) Close() error {
 		}
 	}
 
-	// 关闭 WebSocket
-	if t.ws != nil {
-		_ = t.ws.Close(websocket.StatusNormalClosure, "")
-		t.ws = nil
+	// H25: 在锁外关闭 ws，避免持锁做网络 I/O；先把 t.ws 置 nil 保证其他 goroutine 看到一致状态
+	if ws != nil {
+		_ = ws.Close(websocket.StatusNormalClosure, "")
 	}
 
 	// 通知所有等待中的 RPC 调用
@@ -177,8 +178,13 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 		return nil, NewSerializationError(fmt.Sprintf("序列化 RPC 请求失败: %v", err))
 	}
 
-	// 发送请求
-	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// 发送请求：write 超时跟随整体 t.timeout（不超过 30s 作为兜底上限），
+	// 避免慢网络下 5s 硬编码导致 RPC 还没等响应就先 fail。
+	writeTimeout := t.timeout
+	if writeTimeout <= 0 || writeTimeout > 30*time.Second {
+		writeTimeout = 30 * time.Second
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 	if err := ws.Write(writeCtx, websocket.MessageText, data); err != nil {
 		t.pendingMu.Lock()
@@ -223,7 +229,14 @@ func (t *RPCTransport) recvInitialMessage(ctx context.Context) (map[string]any, 
 	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, data, err := t.ws.Read(readCtx)
+	// H25: 通过锁读取 t.ws，避免与 Close/Connect 的写入竞争
+	t.closedMu.RLock()
+	ws := t.ws
+	t.closedMu.RUnlock()
+	if ws == nil {
+		return nil, NewConnectionError("接收初始消息失败: 连接已关闭")
+	}
+	_, data, err := ws.Read(readCtx)
 	if err != nil {
 		return nil, NewConnectionError(fmt.Sprintf("接收初始消息失败: %v", err))
 	}
@@ -273,7 +286,14 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 		default:
 		}
 
-		_, data, err := t.ws.Read(ctx)
+		// H25: 通过锁读 t.ws，避免与 Connect/Close 竞争；重连窗口中 ws 被置 nil 时安全退出
+		t.closedMu.RLock()
+		ws := t.ws
+		t.closedMu.RUnlock()
+		if ws == nil {
+			return
+		}
+		_, data, err := ws.Read(ctx)
 		if err != nil {
 			t.closedMu.RLock()
 			wasClosed := t.closed

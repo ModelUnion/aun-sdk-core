@@ -69,7 +69,8 @@ type E2EEManager struct {
 	keystore         keystore.KeyStore            // 密钥存储后端
 	prekeyCacheTTL   float64                      // prekey 缓存 TTL（秒）
 	replayWindow     int                          // 防重放时间窗口（秒）
-	seenMessages     map[string]bool              // 防重放 seen set
+	seenMessages     map[string]int64             // 防重放 seen set（值为插入序号，用于 LRU 淘汰）
+	seenCounter      int64                        // 防重放集合的单调递增计数器
 	prekeyCache      map[string]*cachedPrekey     // 对端 prekey 缓存
 	localPrekeyCache map[string]*ecdsa.PrivateKey // 本地 prekey 私钥内存缓存
 }
@@ -201,7 +202,7 @@ func NewE2EEManager(cfg E2EEManagerConfig) *E2EEManager {
 		keystore:         cfg.Keystore,
 		prekeyCacheTTL:   ttl,
 		replayWindow:     rw,
-		seenMessages:     make(map[string]bool),
+		seenMessages:     make(map[string]int64),
 		prekeyCache:      make(map[string]*cachedPrekey),
 		localPrekeyCache: make(map[string]*ecdsa.PrivateKey),
 	}
@@ -607,11 +608,12 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 	if messageID != "" && fromAID != "" {
 		seenKey := fromAID + ":" + messageID
 		m.mu.Lock()
-		if m.seenMessages[seenKey] {
+		if _, seen := m.seenMessages[seenKey]; seen {
 			m.mu.Unlock()
 			return nil, NewE2EEDecryptFailedError("重放消息")
 		}
-		m.seenMessages[seenKey] = true
+		m.seenCounter++
+		m.seenMessages[seenKey] = m.seenCounter
 		m.trimSeenSet()
 		m.mu.Unlock()
 	}
@@ -643,16 +645,23 @@ func (m *E2EEManager) shouldDecryptForCurrentAID(message, payload map[string]any
 }
 
 // trimSeenSet LRU 裁剪防重放集合（需在持锁状态调用）
+// 基于插入序号淘汰最旧的记录，保证不会误删最新记录
 func (m *E2EEManager) trimSeenSet() {
 	if len(m.seenMessages) > seenMaxSize {
-		trimCount := len(m.seenMessages) - int(float64(seenMaxSize)*0.8)
-		i := 0
-		for k := range m.seenMessages {
-			if i >= trimCount {
-				break
+		targetSize := int(float64(seenMaxSize) * 0.8)
+		trimCount := len(m.seenMessages) - targetSize
+		// 找到第 trimCount 小的序号作为阈值
+		seqs := make([]int64, 0, len(m.seenMessages))
+		for _, seq := range m.seenMessages {
+			seqs = append(seqs, seq)
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		threshold := seqs[trimCount-1]
+		// 删除序号 <= 阈值的记录（最旧的）
+		for k, seq := range m.seenMessages {
+			if seq <= threshold {
+				delete(m.seenMessages, k)
 			}
-			delete(m.seenMessages, k)
-			i++
 		}
 	}
 }
@@ -1057,13 +1066,56 @@ func (m *E2EEManager) loadPrekeyPrivateKey(prekeyID string) *ecdsa.PrivateKey {
 
 // ── AAD 工具 ─────────────────────────────────────────────
 
+// canonicalJSONMarshal 序列化 map，将 float64 整数值转为 int64，
+// 确保输出与 JS/Python 的 JSON.stringify 一致（不出现科学计数法）。
+//
+// 若 json.Marshal 出错（例如 AAD 含无法序列化的值），直接 panic：
+// AAD 静默产生空字节会导致 AEAD 完整性校验结果无法预期，是严重的安全失败。
+// 对调用方而言这属于"违反合约"的程序错误，必须立即暴露。
+func canonicalJSONMarshal(m map[string]any) []byte {
+	normalized := make(map[string]any, len(m))
+	for k, v := range m {
+		normalized[k] = normalizeJSONValue(v)
+	}
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		panic(fmt.Sprintf("canonicalJSONMarshal: AAD marshal failed: %v", err))
+	}
+	return data
+}
+
+// normalizeJSONValue 递归将 float64 整数值转为 int64
+func normalizeJSONValue(v any) any {
+	switch val := v.(type) {
+	case float64:
+		if val == float64(int64(val)) {
+			return int64(val)
+		}
+		return val
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, vv := range val {
+			out[k] = normalizeJSONValue(vv)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, vv := range val {
+			out[i] = normalizeJSONValue(vv)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 // aadBytesOffline 序列化 P2P AAD（排序键 + 紧凑格式）
 func aadBytesOffline(aad map[string]any) []byte {
 	filtered := make(map[string]any, len(aadFieldsOffline))
 	for _, field := range aadFieldsOffline {
 		filtered[field] = aad[field]
 	}
-	data, _ := json.Marshal(filtered)
+	data := canonicalJSONMarshal(filtered)
 	return data
 }
 
@@ -1445,14 +1497,17 @@ func abs64(n int64) int64 {
 	return n
 }
 
-// CleanExpiredCaches 清理过期的 prekey 缓存条目（供外部定时调用）
+// CleanExpiredCaches 清理过期的 prekey 缓存和 seen set 条目（供外部定时调用）
 func (m *E2EEManager) CleanExpiredCaches() {
 	now := float64(time.Now().Unix())
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// 清理过期的 prekey 缓存
 	for k, v := range m.prekeyCache {
 		if now-v.CachedAt >= m.prekeyCacheTTL {
 			delete(m.prekeyCache, k)
 		}
 	}
+	// 清理 seen set（LRU 裁剪）
+	m.trimSeenSet()
 }

@@ -100,6 +100,8 @@ const SIGNED_METHODS = new Set([
 interface SessionRetryOptions extends JsonObject {
   initial_delay: number;
   max_delay: number;
+  /** M25: 最大重试次数，0 表示无限（与 Go/Python 对齐） */
+  max_attempts: number;
 }
 
 interface SessionTimeoutOptions extends JsonObject {
@@ -167,6 +169,8 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
   retry: {
     initial_delay: 0.5,
     max_delay: 30.0,
+    // M25: 0 表示无限重试，与 Go/Python 对齐
+    max_attempts: 0,
   },
   timeouts: {
     connect: 5.0,
@@ -384,6 +388,8 @@ export class AUNClient {
   private _seqTrackerContext: string | null = null;
   /** 补洞去重：已完成/进行中的 key 集合，防止重复 pull 同一区间 */
   private _gapFillDone: Set<string> = new Set();
+  /** 推送路径已分发的 seq 集合（按命名空间），补洞路径 publish 前检查以避免重复分发 */
+  private _pushedSeqs: Map<string, Set<number>> = new Map();
   // 重连相关
   private _reconnectActive = false;
   private _reconnectAbort: AbortController | null = null;
@@ -558,6 +564,11 @@ export class AUNClient {
     this._validateOutboundCall(method, p);
     this._injectMessageCursorContext(method, p);
 
+    // group.* 方法注入 device_id（服务端用于多设备消息路由）
+    if (method.startsWith('group.') && this._deviceId && p.device_id === undefined) {
+      p.device_id = this._deviceId;
+    }
+
     // 自动加密：message.send 默认加密（encrypt 默认 true）
     if (method === 'message.send') {
       const encrypt = p.encrypt !== undefined ? p.encrypt : true;
@@ -594,11 +605,15 @@ export class AUNClient {
         const ns = `p2p:${this._aid}`;
         // 用原始 messages 喂 SeqTracker（解密去重前），与 Go/TS/Python 一致
         this._seqTracker.onPullResult(ns, (Array.isArray(messages) ? messages : []).filter(isJsonObject));
-        // 处理 server_ack_seq：跳过 [contiguous, server_ack) 区间
+        // ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
+        // 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若 contiguous 落后必须 force 跳过
+        // retention window 外的空洞。与 S2 [1,seq-1] 历史 gap 配合；若去掉 force，首条消息建的 gap 会
+        // 永远悬挂触发无限 pull。临时消息淘汰走 ephemeral_earliest_available_seq（仅提示），与此互斥。
         const serverAck = Number(r.server_ack_seq ?? 0);
         if (serverAck > 0) {
           const contig = this._seqTracker.getContiguousSeq(ns);
           if (contig < serverAck) {
+            console.info('[aun_core] message.pull retention-floor 推进: ns=' + ns + ' contiguous=' + contig + ' -> server_ack_seq=' + serverAck);
             this._seqTracker.forceContiguousSeq(ns, serverAck);
           }
         }
@@ -609,7 +624,7 @@ export class AUNClient {
           this._transport.call('message.ack', {
             seq: contig,
             device_id: this._deviceId,
-          }).catch(() => {/* 静默 */});
+          }).catch((e) => { console.warn('message.pull auto-ack 失败:', e); });
         }
       }
     }
@@ -625,13 +640,16 @@ export class AUNClient {
       if (gid) {
         const ns = `group:${gid}`;
         this._seqTracker.onPullResult(ns, (Array.isArray(r.messages) ? r.messages : []).filter(isJsonObject));
-        // 处理 server_ack_seq：从 cursor.current_seq 读取
+        // ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
+        // 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
+        // 与 S2 [1,seq-1] 历史 gap 配合使用，force_contiguous_seq 是跳过空洞的唯一手段。
         const cursor = isJsonObject(r.cursor) ? r.cursor : null;
         if (cursor) {
           const serverAck = Number(cursor.current_seq ?? 0);
           if (serverAck > 0) {
             const contig = this._seqTracker.getContiguousSeq(ns);
             if (contig < serverAck) {
+              console.info('[aun_core] group.pull retention-floor 推进: ns=' + ns + ' contiguous=' + contig + ' -> cursor.current_seq=' + serverAck);
               this._seqTracker.forceContiguousSeq(ns, serverAck);
             }
           }
@@ -644,7 +662,7 @@ export class AUNClient {
             group_id: gid,
             msg_seq: contig,
             device_id: this._deviceId,
-          }).catch(() => {/* 静默 */});
+          }).catch((e) => { console.warn('group.pull auto-ack 失败: group=' + gid, e); });
         }
       }
     }
@@ -776,16 +794,36 @@ export class AUNClient {
           this._transport.call('message.ack', {
             seq: contig,
             device_id: this._deviceId,
-          }).catch(() => {/* 静默 */});
+          }).catch((e) => { console.warn('P2P auto-ack 失败:', e); });
         }
         // 即时持久化 cursor，异常断连后不回退
         this._saveSeqTrackerState();
       }
 
       const decrypted = await this._decryptSingleMessage(msg);
+      // 记录已推送的 seq，补洞路径据此去重
+      if (seq !== undefined && seq !== null && this._aid) {
+        const ns = `p2p:${this._aid}`;
+        if (!this._pushedSeqs.has(ns)) this._pushedSeqs.set(ns, new Set());
+        this._pushedSeqs.get(ns)!.add(seq);
+      }
       await this._dispatcher.publish('message.received', decrypted);
     } catch (exc) {
-      console.debug('消息解密失败:', exc);
+      console.warn('消息解密失败:', exc);
+      // H26: 解密失败不再投递原始密文 payload（避免元数据泄漏 + 语义混淆），
+      // 改为发布 message.undecryptable 事件，仅携带安全的 header 信息。
+      if (isJsonObject(data)) {
+        const src = data as Record<string, unknown>;
+        const safeEvent: { [key: string]: JsonValue } = {
+          message_id: (src.message_id ?? null) as JsonValue,
+          from: (src.from ?? null) as JsonValue,
+          to: (src.to ?? null) as JsonValue,
+          seq: (src.seq ?? null) as JsonValue,
+          timestamp: (src.timestamp ?? null) as JsonValue,
+          _decrypt_error: String(exc),
+        };
+        await this._dispatcher.publish('message.undecryptable', safeEvent);
+      }
     }
   }
 
@@ -825,7 +863,7 @@ export class AUNClient {
             group_id: groupId,
             msg_seq: contig,
             device_id: this._deviceId,
-          }).catch(() => {/* 静默 */});
+          }).catch((e) => { console.warn('群消息 auto-ack 失败: group=' + groupId, e); });
         }
         // 即时持久化 cursor，异常断连后不回退
         this._saveSeqTrackerState();
@@ -838,9 +876,28 @@ export class AUNClient {
         return;
       }
       const decrypted = await this._decryptGroupMessage(msg);
+      // 记录已推送的 seq，补洞路径据此去重
+      if (groupId && seq !== undefined && seq !== null) {
+        const nsKey = `group:${groupId}`;
+        if (!this._pushedSeqs.has(nsKey)) this._pushedSeqs.set(nsKey, new Set());
+        this._pushedSeqs.get(nsKey)!.add(seq);
+      }
       await this._dispatcher.publish('group.message_created', decrypted);
     } catch (exc) {
-      console.debug('群消息解密失败:', exc);
+      console.warn('群消息解密失败:', exc);
+      // H26: 解密失败改发 group.message_undecryptable 事件，不投递原始密文 payload。
+      if (isJsonObject(data)) {
+        const src = data as Record<string, unknown>;
+        const safeEvent: { [key: string]: JsonValue } = {
+          message_id: (src.message_id ?? null) as JsonValue,
+          group_id: (src.group_id ?? null) as JsonValue,
+          from: (src.from ?? null) as JsonValue,
+          seq: (src.seq ?? null) as JsonValue,
+          timestamp: (src.timestamp ?? null) as JsonValue,
+          _decrypt_error: String(exc),
+        };
+        await this._dispatcher.publish('group.message_undecryptable', safeEvent);
+      }
     }
   }
 
@@ -864,16 +921,23 @@ export class AUNClient {
         const messages = result.messages;
         if (Array.isArray(messages)) {
           this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          // pushedSeqs 去重：跳过已通过推送路径分发的消息
+          const pushed = this._pushedSeqs.get(ns);
           for (const msg of messages) {
             if (isJsonObject(msg)) {
+              const s = (msg as Record<string, unknown>).seq as number | undefined;
+              if (pushed && s !== undefined && s !== null && pushed.has(s)) {
+                continue; // 已通过推送路径分发，跳过
+              }
               await this._dispatcher.publish('group.message_created', msg);
             }
           }
+          this._prunePushedSeqs(ns);
           return;
         }
       }
     } catch (exc) {
-      console.debug('自动 pull 群消息失败:', exc);
+      console.warn('自动 pull 群消息失败:', exc);
     }
     // pull 失败时仍透传原始通知
     await this._dispatcher.publish('group.message_created', notification);
@@ -887,7 +951,9 @@ export class AUNClient {
     if (afterSeq === 0 && !(await this._groupE2ee.hasSecret(groupId))) {
       return;
     }
-    // 去重：同一 (group:id:after_seq) 只补一次
+    // 去重：同一 (group:id:after_seq) 在飞行中只补一次
+    // S1: 使用 try/finally 保证无论成功失败都清理 dedupKey，避免旧实现只在异常路径清理
+    // 导致成功后相同 afterSeq 再次出现空洞时被永久抑制。
     const dedupKey = `group_msg:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
     this._gapFillDone.add(dedupKey);
@@ -902,15 +968,22 @@ export class AUNClient {
         const messages = result.messages;
         if (Array.isArray(messages)) {
           this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          const pushed = this._pushedSeqs.get(ns);
           for (const msg of messages) {
             if (isJsonObject(msg)) {
+              const s = (msg as Record<string, unknown>).seq as number | undefined;
+              if (pushed && s !== undefined && s !== null && pushed.has(s)) continue;
               await this._dispatcher.publish('group.message_created', msg);
             }
           }
+          this._prunePushedSeqs(ns);
         }
       }
     } catch (exc) {
       console.warn('[aun_core] 群消息补洞失败:', exc);
+    } finally {
+      // S1: 成功 / 失败路径都必须清理飞行标记
+      this._gapFillDone.delete(dedupKey);
     }
   }
 
@@ -918,7 +991,8 @@ export class AUNClient {
   private async _fillGroupEventGap(groupId: string): Promise<void> {
     const ns = `group_event:${groupId}`;
     const afterSeq = this._seqTracker.getContiguousSeq(ns);
-    // 去重：同一 (group_evt:id:after_seq) 只补一次
+    // 去重：同一 (group_evt:id:after_seq) 在飞行中只补一次
+    // S1: 使用 try/finally 保证无论成功失败都清理 dedupKey
     const dedupKey = `group_evt:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
     this._gapFillDone.add(dedupKey);
@@ -941,11 +1015,15 @@ export class AUNClient {
               group_id: groupId,
               event_seq: contig,
               device_id: this._deviceId,
-            }).catch(() => {/* 静默 */});
+            }).catch((e) => { console.warn('群事件 auto-ack 失败: group=' + groupId, e); });
           }
           for (const evt of events) {
             if (isJsonObject(evt)) {
               evt._from_gap_fill = true;
+              const et = String(evt.event_type ?? '');
+              // 消息事件由 _fillGroupGap 负责，事件补洞不重复投递
+              if (et === 'group.message_created') continue;
+              // group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
               await this._dispatcher.publish('group.changed', evt);
             }
           }
@@ -953,6 +1031,9 @@ export class AUNClient {
       }
     } catch (exc) {
       console.warn('[aun_core] 群事件补洞失败:', exc);
+    } finally {
+      // S1: 成功 / 失败路径都必须清理飞行标记
+      this._gapFillDone.delete(dedupKey);
     }
   }
 
@@ -965,7 +1046,8 @@ export class AUNClient {
     if (afterSeq === 0) {
       return;
     }
-    // 去重：同一 (type:after_seq) 只补一次
+    // 去重：同一 (type:after_seq) 在飞行中只补一次
+    // S1: 使用 try/finally 保证无论成功失败都清理 dedupKey
     const dedupKey = `p2p:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
     this._gapFillDone.add(dedupKey);
@@ -978,16 +1060,34 @@ export class AUNClient {
         const messages = result.messages;
         if (Array.isArray(messages)) {
           this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          const pushed = this._pushedSeqs.get(ns);
           for (const msg of messages) {
             if (isJsonObject(msg)) {
+              const s = (msg as Record<string, unknown>).seq as number | undefined;
+              if (pushed && s !== undefined && s !== null && pushed.has(s)) continue;
               await this._dispatcher.publish('message.received', msg);
             }
           }
+          this._prunePushedSeqs(ns);
         }
       }
     } catch (exc) {
       console.warn('[aun_core] P2P 消息补洞失败:', exc);
+    } finally {
+      // S1: 成功 / 失败路径都必须清理飞行标记
+      this._gapFillDone.delete(dedupKey);
     }
+  }
+
+  /** 清理 pushedSeqs 中 <= contiguousSeq 的条目，防止无限增长 */
+  private _prunePushedSeqs(ns: string): void {
+    const pushed = this._pushedSeqs.get(ns);
+    if (!pushed) return;
+    const contig = this._seqTracker.getContiguousSeq(ns);
+    for (const s of pushed) {
+      if (s <= contig) pushed.delete(s);
+    }
+    if (pushed.size === 0) this._pushedSeqs.delete(ns);
   }
 
   /**
@@ -1035,14 +1135,25 @@ export class AUNClient {
 
       const groupId = (d.group_id ?? '') as string;
 
-      // 收到事件推送后自动 pull 补齐（补洞回来的事件不再触发新补洞）
-      if (groupId && !d._from_gap_fill) {
+      // event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq。
+      // 用 onMessageSeq 返回值决定是否补拉，与 P2P / group.message 路径对齐。
+      let needPull = false;
+      const rawEventSeq = d.event_seq;
+      if (rawEventSeq != null && groupId) {
+        const es = Number(rawEventSeq);
+        if (Number.isFinite(es) && es > 0) {
+          needPull = this._seqTracker.onMessageSeq(`group_event:${groupId}`, es);
+        }
+      }
+
+      // 仅在真实 event gap 时才触发补拉（补洞回来的事件不再触发新补洞）
+      if (needPull && groupId && !d._from_gap_fill) {
         this._safeAsync(this._fillGroupEventGap(groupId));
       }
 
       if (d.action === 'member_left' || d.action === 'member_removed') {
         if (groupId) {
-          this._safeAsync(this._rotateGroupEpoch(groupId));
+          this._safeAsync(this._maybeLeadRotateGroupEpoch(groupId));
         }
       }
     }
@@ -1324,6 +1435,72 @@ export class AUNClient {
     return 'sha256:' + Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
+  /**
+   * 从 X.509 DER 证书中提取 SubjectPublicKeyInfo 并计算其 SHA-256 指纹。
+   * 返回 "sha256:<hex>"，提取失败返回空串。
+   * 用于 H7 指纹校验（DER 证书指纹 OR SPKI 指纹任一匹配）。
+   */
+  private async _spkiFingerprint(certPem: string): Promise<string> {
+    try {
+      const der = new Uint8Array(pemToArrayBuffer(certPem));
+      // X.509: Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+      // tbsCertificate ::= SEQUENCE { version?, serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo, ... }
+      // 逐级解析 SEQUENCE 并定位 SPKI (第 7 个或第 6 个子元素，取决于 version 是否 [0] explicit)。
+      const readLen = (buf: Uint8Array, pos: number): { len: number; next: number } => {
+        const first = buf[pos];
+        if (first < 0x80) return { len: first, next: pos + 1 };
+        const n = first & 0x7f;
+        let len = 0;
+        for (let i = 0; i < n; i++) len = (len << 8) | buf[pos + 1 + i];
+        return { len, next: pos + 1 + n };
+      };
+      // 外层 SEQUENCE
+      if (der[0] !== 0x30) return '';
+      const outer = readLen(der, 1);
+      // tbsCertificate SEQUENCE 起点
+      const tbsStart = outer.next;
+      if (der[tbsStart] !== 0x30) return '';
+      const tbsLen = readLen(der, tbsStart + 1);
+      let p = tbsLen.next;
+      const tbsEnd = tbsLen.next + tbsLen.len;
+      // 跳过 [0] EXPLICIT Version（可选）
+      if (der[p] === 0xa0) {
+        const lv = readLen(der, p + 1);
+        p = lv.next + lv.len;
+      }
+      // 跳过 serialNumber (INTEGER)
+      if (der[p] !== 0x02) return '';
+      let lv = readLen(der, p + 1);
+      p = lv.next + lv.len;
+      // 跳过 signature (SEQUENCE)
+      if (der[p] !== 0x30) return '';
+      lv = readLen(der, p + 1);
+      p = lv.next + lv.len;
+      // 跳过 issuer (SEQUENCE)
+      if (der[p] !== 0x30) return '';
+      lv = readLen(der, p + 1);
+      p = lv.next + lv.len;
+      // 跳过 validity (SEQUENCE)
+      if (der[p] !== 0x30) return '';
+      lv = readLen(der, p + 1);
+      p = lv.next + lv.len;
+      // 跳过 subject (SEQUENCE)
+      if (der[p] !== 0x30) return '';
+      lv = readLen(der, p + 1);
+      p = lv.next + lv.len;
+      // subjectPublicKeyInfo (SEQUENCE) — 连同 tag+length+value 全部即 SPKI DER
+      if (der[p] !== 0x30 || p >= tbsEnd) return '';
+      const spkiStart = p;
+      const spkiLV = readLen(der, p + 1);
+      const spkiEnd = spkiLV.next + spkiLV.len;
+      const spkiDer = der.subarray(spkiStart, spkiEnd);
+      const digest = await crypto.subtle.digest('SHA-256', spkiDer);
+      return 'sha256:' + Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      return '';
+    }
+  }
+
   /** 自动加密并发送群组消息 */
   private async _sendGroupEncrypted(params: RpcParams): Promise<RpcResult> {
     const groupId = String(params.group_id ?? '');
@@ -1452,7 +1629,7 @@ export class AUNClient {
             encrypt: true,
           });
         } catch (exc) {
-          console.debug('密钥恢复请求发送失败:', exc);
+          console.warn('密钥恢复请求发送失败:', exc);
         }
       }
     }
@@ -1469,7 +1646,18 @@ export class AUNClient {
     return result;
   }
 
-  /** 尝试处理 P2P 传输的群组密钥消息。返回 true 表示已处理。 */
+  /**
+   * 尝试处理 P2P 传输的群组密钥消息。
+   *
+   * 返回值：
+   *   - true  = 已处理 / 已被抑制（外层不应再 publish 到业务事件）
+   *   - false = 非密钥消息，外层应继续走普通 P2P 消息链路
+   *
+   * S14: 按 envelope_type 识别。外层 payload.type === 'e2ee.encrypted' 属于受保护的
+   *      加密外壳，无法在解密前判定它是业务消息还是群组密钥控制面消息。为避免把
+   *      控制面密文（或失败的控制面消息）以 `_decrypt_error` 形式下发给业务监听器，
+   *      此处对"外层 e2ee.encrypted 解密失败"的场景直接返回 true 进行抑制。
+   */
   private async _tryHandleGroupKeyMessage(message: Message): Promise<boolean> {
     let actualPayload = isJsonObject(message.payload) ? message.payload : null;
     if (actualPayload === null) return false;
@@ -1483,15 +1671,46 @@ export class AUNClient {
       if (fromAid) {
         await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
       }
-      const decrypted = await this._e2ee.decryptMessage(message);
-      if (!decrypted) return false;
+      let decrypted: Message | null = null;
+      try {
+        decrypted = await this._e2ee.decryptMessage(message);
+      } catch (exc) {
+        // S14: 解密抛异常也按解密失败处理，抑制业务事件下发
+        console.warn('[aun_core] e2ee.encrypted 外壳解密抛异常，抑制业务分发:', exc);
+        return true;
+      }
+      if (!decrypted) {
+        // S14: 外层 e2ee.encrypted 解密失败。无法判定其是控制面还是业务消息，
+        // 为安全起见不再回落到业务事件（旧实现此处 return false 会导致外层
+        // 走 catch 分支把原始密文带 _decrypt_error 发给业务监听器，造成控制面
+        // 密钥分发消息泄漏为业务事件）。
+        return true;
+      }
       this._schedulePrekeyReplenishIfConsumed(decrypted);
       actualPayload = isJsonObject(decrypted.payload) ? decrypted.payload : null;
       if (actualPayload === null) return false;
     }
 
-    const result = await this._groupE2ee.handleIncoming(actualPayload);
-    if (result === null) return false;
+    // S14: 按 envelope_type 识别控制面消息。内层 type 以 'e2ee.group_key_' 开头的
+    //      一律视为群组密钥控制面，无论 handleIncoming 成功还是被拒绝，都不应
+    //      向业务层投递。
+    const innerType = String(actualPayload.type ?? '');
+    const isGroupKeyCtrl = innerType.startsWith('e2ee.group_key_');
+
+    let result: string | null = null;
+    try {
+      result = await this._groupE2ee.handleIncoming(actualPayload);
+    } catch (exc) {
+      console.warn('[aun_core] 群组密钥消息处理异常:', exc);
+      // S14: 控制面消息处理异常也要抑制业务分发
+      if (isGroupKeyCtrl) return true;
+      return false;
+    }
+    if (result === null) {
+      // 非密钥消息。但若 envelope_type 显示为控制面（防御性：handleIncoming
+      // 未识别但类型前缀匹配），仍抑制业务分发。
+      return isGroupKeyCtrl;
+    }
 
     if (result === 'request') {
       // 处理密钥请求并回复
@@ -1576,12 +1795,26 @@ export class AUNClient {
       if (!fallbackResp.ok) {
         throw exc;
       }
-      const fallbackCert = await fallbackResp.text();
-      const actualFingerprint = await this._certFingerprint(fallbackCert);
-      if (actualFingerprint !== String(certFingerprint).trim().toLowerCase()) {
-        throw exc;
+      certPem = await fallbackResp.text();
+    }
+
+    // H7: 严格校验指纹（DER SHA-256 或 SPKI SHA-256 任一匹配即可）
+    if (certFingerprint) {
+      const expectedFP = String(certFingerprint).trim().toLowerCase();
+      if (!expectedFP.startsWith('sha256:')) {
+        throw new ValidationError(
+          `unsupported cert_fingerprint format for ${aid}: ${expectedFP.slice(0, 24)}`,
+        );
       }
-      certPem = fallbackCert;
+      const derFP = await this._certFingerprint(certPem);
+      if (derFP !== expectedFP) {
+        const spkiFP = await this._spkiFingerprint(certPem);
+        if (!spkiFP || spkiFP !== expectedFP) {
+          throw new ValidationError(
+            `peer cert fingerprint mismatch for ${aid}: expected=${expectedFP.slice(0, 24)}...`,
+          );
+        }
+      }
     }
 
     // 完整 PKI 验证：链 + CRL + OCSP + AID 绑定
@@ -1713,7 +1946,7 @@ export class AUNClient {
     } catch (exc) {
       // 刷新失败时：若缓存有 PKI 验证过的证书（2 倍 TTL 内）则继续用
       if (cached && now < cached.validatedAt + PEER_CERT_CACHE_TTL * 2) {
-        console.debug(`刷新发送方 ${aid} 证书失败，继续使用已验证的内存缓存:`, exc);
+        console.warn(`刷新发送方 ${aid} 证书失败，继续使用已验证的内存缓存:`, exc);
         return true;
       }
       console.warn(`获取发送方 ${aid} 证书失败且无已验证缓存，拒绝信任:`, exc);
@@ -1817,7 +2050,48 @@ export class AUNClient {
       Object.assign(rotateParams, sigParams);
       await this.call('group.e2ee.rotate_epoch', rotateParams);
     } catch (exc) {
-      console.debug(`同步 epoch 到服务端失败 (group=${groupId}，可能已同步):`, exc);
+      console.warn(`同步 epoch 到服务端失败 (group=${groupId}，可能已同步):`, exc);
+    }
+  }
+
+  /**
+   * H21: 基于"排序最小 admin = leader"选举，其他 admin 走 jitter 兜底重试。
+   * 避免所有剩余 admin 同时触发 `_rotateGroupEpoch` 造成 CAS 风暴。
+   */
+  private async _maybeLeadRotateGroupEpoch(groupId: string): Promise<void> {
+    const myAid = this._aid;
+    if (!myAid) return;
+    try {
+      const membersResp = await this.call('group.get_members', { group_id: groupId });
+      if (!isJsonObject(membersResp)) return;
+      const rawList = membersResp.members ?? membersResp.items;
+      if (!Array.isArray(rawList)) return;
+      const admins: string[] = [];
+      for (const m of rawList) {
+        if (!isJsonObject(m)) continue;
+        const role = String(m.role ?? '');
+        const aid = String(m.aid ?? '');
+        if (aid && (role === 'admin' || role === 'owner')) admins.push(aid);
+      }
+      if (admins.length === 0) return;
+      admins.sort();
+      const leader = admins[0];
+      if (leader === myAid) {
+        // 我是 leader，直接发起
+        await this._rotateGroupEpoch(groupId);
+        return;
+      }
+      if (!admins.includes(myAid)) return;
+      // 非 leader：随机 jitter（2~6s）后检查 epoch 是否已被 leader 推进，没推进就兜底
+      const jitterMs = 2000 + Math.floor(Math.random() * 4000);
+      const beforeEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0;
+      await new Promise((r) => setTimeout(r, jitterMs));
+      const afterEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0;
+      if (afterEpoch > beforeEpoch) return; // leader 已完成
+      console.info('[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s', groupId, myAid);
+      await this._rotateGroupEpoch(groupId);
+    } catch (exc) {
+      console.warn('_maybeLeadRotateGroupEpoch 失败: %s', exc);
     }
   }
 
@@ -1856,14 +2130,22 @@ export class AUNClient {
       const info = await this._groupE2ee.rotateEpochTo(groupId, newEpoch, memberAids);
       const distributions = (Array.isArray(info.distributions) ? info.distributions : []) as GroupDistribution[];
       for (const dist of distributions) {
-        try {
-          await this.call('message.send', {
-            to: dist.to,
-            payload: dist.payload,
-            encrypt: true,
-          });
-        } catch (exc) {
-          console.debug('密钥分发失败:', exc);
+        // 重试 3 次，间隔递增（1s, 2s）
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            await this.call('message.send', {
+              to: dist.to,
+              payload: dist.payload,
+              encrypt: true,
+            });
+            break; // 成功则跳出重试循环
+          } catch (exc) {
+            if (attempt < 2) {
+              await this._sleep((attempt + 1) * 1000);
+            } else {
+              console.warn('epoch 密钥分发失败 (to=%s):', dist.to, exc);
+            }
+          }
         }
       }
     } catch (exc) {
@@ -1899,7 +2181,7 @@ export class AUNClient {
 
       // 构建并签名 manifest
       let manifest = buildMembershipManifest(
-        groupId, epoch, epoch, memberAids, {
+        groupId, epoch, null, memberAids, {
           added: [newMemberAid],
           removed: [],
           initiatorAid: this._aid,
@@ -1914,53 +2196,63 @@ export class AUNClient {
         groupId, epoch, secretData.secret,
         memberAids, this._aid, manifest,
       );
-      await this.call('message.send', {
-        to: newMemberAid,
-        payload: distPayload,
-        encrypt: true,
-      });
+      // 重试 3 次，间隔递增（1s, 2s）
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await this.call('message.send', {
+            to: newMemberAid,
+            payload: distPayload,
+            encrypt: true,
+          });
+          break; // 成功则跳出重试循环
+        } catch (sendExc) {
+          if (attempt < 2) {
+            await this._sleep((attempt + 1) * 1000);
+          } else {
+            throw sendExc;
+          }
+        }
+      }
     } catch (exc) {
       this._logE2eeError('distribute_key', groupId, newMemberAid, exc as Error);
     }
   }
 
-  /** 构建 epoch 轮换签名参数（异步，使用 SubtleCrypto） */
+  /** 构建 epoch 轮换签名参数（异步，使用 SubtleCrypto）。失败时抛错，调用方在 try/catch 中跳过轮换。 */
   private async _buildRotationSignature(
     groupId: string,
     currentEpoch: number,
     newEpoch: number,
   ): Promise<Record<string, string>> {
     const identity = this._identity;
-    if (!identity || !identity.private_key_pem) return {};
-
-    try {
-      const aid = (identity.aid ?? '') as string;
-      const ts = String(Math.floor(Date.now() / 1000));
-      const signData = new TextEncoder().encode(
-        `${groupId}|${currentEpoch}|${newEpoch}|${aid}|${ts}`,
-      );
-
-      const pkcs8 = pemToArrayBuffer(identity.private_key_pem as string);
-      const cryptoKey = await crypto.subtle.importKey(
-        'pkcs8', pkcs8,
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        false, ['sign'],
-      );
-      const sigP1363 = await crypto.subtle.sign(
-        { name: 'ECDSA', hash: 'SHA-256' },
-        cryptoKey, signData,
-      );
-
-      const { p1363ToDer } = await import('./crypto.js');
-      const sigDer = p1363ToDer(new Uint8Array(sigP1363));
-
-      return {
-        rotation_signature: uint8ToBase64(sigDer),
-        rotation_timestamp: ts,
-      };
-    } catch {
-      return {};
+    if (!identity || !identity.private_key_pem) {
+      throw new StateError('rotation signature requires local identity private key');
     }
+
+    const aid = (identity.aid ?? '') as string;
+    const ts = String(Math.floor(Date.now() / 1000));
+    const signData = new TextEncoder().encode(
+      `${groupId}|${currentEpoch}|${newEpoch}|${aid}|${ts}`,
+    );
+
+    const pkcs8 = pemToArrayBuffer(identity.private_key_pem as string);
+    const cryptoKey = await crypto.subtle.importKey(
+      'pkcs8', pkcs8,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false, ['sign'],
+    );
+    const sigP1363 = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      cryptoKey, signData,
+    );
+
+    const { p1363ToDer } = await import('./crypto.js');
+    const sigDer = p1363ToDer(new Uint8Array(sigP1363));
+
+    return {
+      rotation_signature: uint8ToBase64(sigDer),
+      rotation_timestamp: ts,
+    };
   }
 
   // ── 内部：连接 ────────────────────────────────────
@@ -1973,6 +2265,12 @@ export class AUNClient {
     this._auth.setInstanceContext({ deviceId: this._deviceId, slotId: this._slotId });
 
     this._state = 'connecting';
+
+    // 前置 restore：在 _transport.connect 启动 reader 之前完成，
+    // 避免 reader 把积压 push 交给空 tracker 的 handler，触发 S2 历史 gap 误补拉。
+    this._refreshSeqTrackerContext();
+    this._restoreSeqTrackerState();
+
     const challenge = await this._transport.connect(gatewayUrl);
 
     this._state = 'authenticating';
@@ -2019,9 +2317,11 @@ export class AUNClient {
       gateway: gatewayUrl,
     });
 
-    this._refreshSeqTrackerContext();
-    // 从 keystore 恢复 SeqTracker 状态
-    this._restoreSeqTrackerState();
+    // auth 阶段 aid 可能被 identity 覆盖；若 context 发生变化，重新 refresh + restore。
+    if (this._seqTrackerContext !== this._currentSeqTrackerContext()) {
+      this._refreshSeqTrackerContext();
+      this._restoreSeqTrackerState();
+    }
 
     this._startBackgroundTasks();
 
@@ -2182,12 +2482,26 @@ export class AUNClient {
     const interval = this._sessionOptions.heartbeat_interval * 1000;
     if (interval <= 0) return;
 
+    // M25: 把连续失败阈值从 3 次收窄到 2 次。既能容忍一次网络抖动/GC 暂停，
+    // 又把半开连接的检测延迟从 3 个心跳周期降到 2 个，避免 RPC 长时间挂起。
+    // 真正的 socket 死亡由 ws.on('close') 立即触发 _handleTransportDisconnect，
+    // 不依赖此心跳路径。
+    let consecutiveFailures = 0;
+    const maxFailures = 2;
+
     this._heartbeatTimer = setInterval(async () => {
       if (this._state !== 'connected' || this._closing) return;
       try {
         await this._transport.call('meta.ping', {});
+        consecutiveFailures = 0;
       } catch (exc) {
+        consecutiveFailures++;
+        console.warn(`心跳失败 (${consecutiveFailures}/${maxFailures}):`, exc);
         this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) });
+        if (consecutiveFailures >= maxFailures) {
+          console.warn(`连续 ${maxFailures} 次心跳失败，触发断线重连`);
+          this._handleTransportDisconnect(exc instanceof Error ? exc : new Error(String(exc)));
+        }
       }
     }, interval);
   }
@@ -2236,7 +2550,7 @@ export class AUNClient {
           });
         } catch (exc) {
           if (exc instanceof AuthError) {
-            console.debug('token 刷新失败，下次重试:', exc);
+            console.warn('token 刷新失败，下次重试:', exc);
           } else {
             this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) });
           }
@@ -2343,7 +2657,7 @@ export class AUNClient {
             await this._groupE2ee.cleanup(gid, retention);
           }
         } catch (exc) {
-          console.debug('epoch 清理失败:', exc);
+          console.warn('epoch 清理失败:', exc);
         }
       }, 3600 * 1000);
     }
@@ -2361,7 +2675,7 @@ export class AUNClient {
             await this._rotateGroupEpoch(gid);
           }
         } catch (exc) {
-          console.debug('epoch 定时轮换失败:', exc);
+          console.warn('epoch 定时轮换失败:', exc);
         }
       }, rotateInterval * 1000);
     }
@@ -2381,6 +2695,7 @@ export class AUNClient {
           this._gapFillDone = new Set(arr.slice(arr.length - 5000));
         }
         this._e2ee.cleanExpiredCaches();
+        this._groupE2ee.cleanExpiredCaches();
         this._auth.cleanExpiredCaches();
       }, 3600_000);
     }
@@ -2404,11 +2719,14 @@ export class AUNClient {
     this._safeAsync(this._reconnectLoop());
   }
 
-  /** 指数退避重连循环（无限重试，仅在不可重试错误或 close() 时终止） */
+  /** 指数退避重连循环（默认无限重试，仅在不可重试错误或 close() 或 max_attempts 耗尽时终止） */
   private async _reconnectLoop(): Promise<void> {
     const retry = { ...this._sessionOptions.retry };
     const initialDelay = retry.initial_delay;
     const maxDelay = retry.max_delay;
+    // M25: max_attempts=0 表示无限重试（与 Go/Python 对齐）
+    const maxAttemptsRaw = Number(retry.max_attempts ?? 0);
+    const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? Math.floor(maxAttemptsRaw) : 0;
     let delay = initialDelay;
 
     for (let attempt = 1; !this._reconnectAbort?.signal.aborted; attempt++) {
@@ -2445,6 +2763,19 @@ export class AUNClient {
             state: this._state,
             error: formatCaughtError(exc),
             attempt,
+          });
+          return;
+        }
+        // M25: 仅在显式配置 max_attempts > 0 且已达到上限时，进入 terminal_failed
+        if (maxAttempts > 0 && attempt >= maxAttempts) {
+          this._state = 'terminal_failed';
+          this._reconnectActive = false;
+          this._reconnectAbort = null;
+          await this._dispatcher.publish('connection.state', {
+            state: this._state,
+            error: formatCaughtError(exc),
+            attempt,
+            reason: 'max_attempts_exhausted',
           });
           return;
         }
@@ -2523,6 +2854,7 @@ export class AUNClient {
     this._seqTracker = new SeqTracker();
     this._seqTrackerContext = null;
     this._gapFillDone.clear();
+    this._pushedSeqs.clear();
   }
 
   private _refreshSeqTrackerContext(): void {
@@ -2530,6 +2862,7 @@ export class AUNClient {
     if (nextContext === this._seqTrackerContext) return;
     this._seqTracker = new SeqTracker();
     this._gapFillDone.clear();
+    this._pushedSeqs.clear();
     this._seqTrackerContext = nextContext;
   }
 
@@ -2569,10 +2902,10 @@ export class AUNClient {
     } catch { /* 日志本身不应阻断主流程 */ }
   }
 
-  /** 安全执行异步操作（不阻塞调用方，错误只打日志） */
+  /** 安全执行异步操作（不阻塞调用方，错误打 warning 便于排障） */
   private _safeAsync(promise: Promise<RpcResult | void>): void {
     promise.catch((exc) => {
-      console.debug('后台任务异常:', exc);
+      console.warn('后台任务异常:', exc);
     });
   }
 

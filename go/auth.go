@@ -107,6 +107,9 @@ type AuthFlow struct {
 	chainCacheTTL     int
 	verifySSL         bool
 
+	// H24: 记录最近一次关键持久化失败，调用方可通过 GetLastPersistError 主动轮询
+	lastPersistErr error
+
 	// 根证书
 	rootCerts []*x509.Certificate
 
@@ -421,7 +424,11 @@ func (a *AuthFlow) ConnectSession(
 	if accessToken != "" && identity != nil {
 		if err := a.initializeSession(ctx, transport, nonce, accessToken); err == nil {
 			identity["access_token"] = accessToken
-			_ = a.persistIdentity(identity)
+			// H24: 持久化失败不能静默吞；打 ERROR 日志，调用方可以主动检查 GetLastPersistError
+			if perr := a.persistIdentity(identity); perr != nil {
+				log.Printf("[aun_core.auth] ERROR persistIdentity(explicit_token) 失败: %v", perr)
+				a.lastPersistErr = perr
+			}
 			return map[string]any{"token": accessToken, "identity": identity}, nil
 		}
 		log.Printf("explicit_token 认证失败，尝试下一方式")
@@ -1371,7 +1378,11 @@ func (a *AuthFlow) ensureLocalIdentity(aid string) map[string]any {
 		return map[string]any{"aid": aid}
 	}
 	identity["aid"] = aid
-	_ = a.persistIdentity(identity)
+	// H24: 持久化失败不能静默吞
+	if perr := a.persistIdentity(identity); perr != nil {
+		log.Printf("[aun_core.auth] ERROR persistIdentity 失败 aid=%s: %v", aid, perr)
+		a.lastPersistErr = perr
+	}
 	a.aid = aid
 	return identity
 }
@@ -1428,8 +1439,23 @@ func (a *AuthFlow) ensureIdentity() map[string]any {
 		return map[string]any{"aid": a.aid}
 	}
 	newIdentity["aid"] = a.aid
-	_ = a.persistIdentity(newIdentity)
+	// H24: 持久化失败不能静默吞
+	if perr := a.persistIdentity(newIdentity); perr != nil {
+		log.Printf("[aun_core.auth] ERROR persistIdentity(rekey) 失败 aid=%s: %v", a.aid, perr)
+		a.lastPersistErr = perr
+	}
 	return newIdentity
+}
+
+// GetLastPersistError H24: 暴露最近一次关键持久化（identity/token）失败错误，
+// 调用方可在关键操作后轮询检查。调用后不重置，需要主动 ClearLastPersistError。
+func (a *AuthFlow) GetLastPersistError() error {
+	return a.lastPersistErr
+}
+
+// ClearLastPersistError H24: 清除 lastPersistErr，便于下一次检测
+func (a *AuthFlow) ClearLastPersistError() {
+	a.lastPersistErr = nil
 }
 
 func (a *AuthFlow) persistIdentity(identity map[string]any) error {

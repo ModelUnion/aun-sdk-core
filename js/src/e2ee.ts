@@ -1305,12 +1305,15 @@ export class E2EEManager {
     }
   }
 
-  /** 清理过期的 prekey 缓存条目（供外部定时调用） */
+  /** 清理过期的 prekey 缓存和 seen set 条目（供外部定时调用） */
   cleanExpiredCaches(): void {
     const now = Date.now() / 1000;
+    // 清理过期的 prekey 缓存
     for (const [k, v] of this._prekeyCache) {
       if (now >= v.expireAt) this._prekeyCache.delete(k);
     }
+    // 清理 seen set（LRU 裁剪）
+    this._trimSeenSet();
   }
 }
 

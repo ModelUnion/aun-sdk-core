@@ -732,6 +732,13 @@ func (g *GroupReplayGuard) trim() {
 	}
 }
 
+// Trim LRU 裁剪（供外部调用，自动加锁）
+func (g *GroupReplayGuard) Trim() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.trim()
+}
+
 // ── GroupKeyRequestThrottle 密钥请求频率限制 ────────────────
 
 // GroupKeyRequestThrottle 群组密钥请求/响应频率限制
@@ -984,7 +991,7 @@ func aadBytesGroup(aad map[string]any) []byte {
 	for _, field := range aadFieldsGroup {
 		filtered[field] = aad[field]
 	}
-	data, _ := json.Marshal(filtered)
+	data := canonicalJSONMarshal(filtered)
 	return data
 }
 

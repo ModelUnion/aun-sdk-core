@@ -8,15 +8,17 @@
 - 不硬编码 `gateway_url`，Gateway 统一通过 `https://{issuer}/.well-known/aun-gateway` 或 `http://{issuer}/.well-known/aun-gateway` 发现。
 - 服务端对外返回的 URL 必须是 `{svc}.{issuer-domain}` 风格，不能出现 `127.0.0.1`、`localhost`、`0.0.0.0`、`::1`。
 - 双域测试脚本统一在 Docker 测试容器里直接运行，不再依赖宿主机 `docker exec` 套娃。
+- Windows Git Bash 运行 `docker exec` / `docker run` 且命令里包含容器内绝对路径（如 `/tests/...`、`/test/...`、`/workspace/...`）时，统一在命令前加 `MSYS_NO_PATHCONV=1`，避免 Git Bash 把容器路径错误改写成宿主机路径。
 - 单域 Docker 测试容器默认使用 `AUN_TEST_AUN_PATH=/data/aun/single-domain/persistent`，固定身份长期复用统一落在这条路径下。
 - 双域固定身份统一落在 `D:\modelunion\kite\docker-deploy\federation-test\client-data`，容器内路径固定为 `/data/aun`。
 - 如果改了 `extensions/services` 下的服务端代码，必须重新 build Docker 镜像并重启对应容器。
 - 如果只改了 `aun-sdk-core/python/src` 或测试脚本，单域 `sdk-tester`、双域 `client-a/client-b` 都是目录挂载，通常不需要 rebuild 镜像，直接重跑即可。
 - `kite-sdk-tester`、`client-a`、`client-b` 使用预构建的 `aun-sdk-tester` 镜像（`Dockerfile.sdk-tester`），已内置所有 Python 测试依赖（含 `sqlcipher3`），`--force-recreate` 后无需手动安装。
-- 单域环境当前只有 Python 常驻测试容器；TS/Go 单域集成与 E2E 测试统一通过临时 `docker run` 接入 `docker-deploy_kite-net` 执行。
-- TS 在 Linux 容器里运行时不能直接复用宿主机 Windows 上的 `node_modules`；必须先把源码复制到容器内临时目录，再在容器内重新 `npm install`，否则容易触发 `better-sqlite3 ... invalid ELF header`。
+- 单域环境当前提供 `kite-sdk-tester`（Python）与 `kite-ts-tester`（TypeScript）常驻测试容器；双域环境提供 `client-a`、`client-b`、`ts-tester`、`go-tester`。
+- TS 测试容器（单域 `kite-ts-tester`、双域 `ts-tester`）使用独立 Docker volume 挂载 `/workspace/ts/node_modules`，避免宿主机 Windows `node_modules` 污染 Linux 容器。
+- TS 测试容器启动时会检查 `node_modules/better-sqlite3/build/Release/better_sqlite3.node` 是否为 Linux ELF；若缺失或仍是 Windows 二进制，会自动执行 `npm install --legacy-peer-deps` 修复依赖。
+- 如果改了 `aun-sdk-core/ts/package.json` 或 `package-lock.json`，需要重建对应 TS 测试容器，或在容器内手动重新执行 `npm install --legacy-peer-deps`。
 - Go 在 Linux 容器里运行时，推荐把宿主机 `C:\go\pkg\mod` 只读挂进容器作为 `GOMODCACHE=/go/pkg/mod`，避免测试容器临时联网拉依赖。
-- 双域 `ts-tester`、`go-tester` 只负责提供容器网络与基础 runtime；TS 依赖仍需在容器内临时副本中安装，Go 仍建议挂载宿主机模块缓存。
 - TS/Go 双域 reconnect 测试不是单纯 `docker exec` 一条命令，需要宿主机在测试进程写出 marker 后协调执行 `docker restart federation-kite-b`。
 
 ### 测试环境数据保护（最高优先级）
@@ -95,7 +97,7 @@ docker compose up -d
 - `storage.agentid.pub`
 - `group.agentid.pub`
 
-并额外提供测试容器 `kite-sdk-tester`，用于在同一 Docker 网络内直接跑 SDK 集成测试。
+并额外提供测试容器 `kite-sdk-tester`（Python）和 `kite-ts-tester`（TypeScript），用于在同一 Docker 网络内直接跑 SDK 集成测试。
 
 当前单域 `kite-sdk-tester` 默认环境变量：
 
@@ -115,6 +117,7 @@ docker compose up -d
 
 ```powershell
 docker exec -it kite-sdk-tester sh
+docker exec -it kite-ts-tester bash
 ```
 
 容器内约定：
@@ -123,14 +126,20 @@ docker exec -it kite-sdk-tester sh
 - 测试目录：`/tests`
 - `PYTHONPATH=/sdk/src`
 - 固定身份目录唯一使用 `/data/aun/single-domain/persistent`
+- `kite-ts-tester` 挂载 `D:\modelunion\kite\aun-sdk-core\ts -> /workspace/ts`
+- `kite-ts-tester` 的 `/workspace/ts/node_modules` 使用容器内独立 volume，与宿主机 Windows `node_modules` 隔离
 
 ### 典型测试命令
 
 直接运行脚本：
 
 ```powershell
-docker exec kite-sdk-tester python /tests/integration_test_stream.py
-docker exec kite-sdk-tester python /tests/test_integration_auth_flow.py
+# Windows Git Bash 下运行时统一加 MSYS_NO_PATHCONV=1
+MSYS_NO_PATHCONV=1 docker exec kite-sdk-tester python /tests/integration_test_stream.py
+MSYS_NO_PATHCONV=1 docker exec kite-sdk-tester python /tests/test_integration_auth_flow.py
+MSYS_NO_PATHCONV=1 docker exec kite-sdk-tester python /tests/integration_test_e2ee.py
+MSYS_NO_PATHCONV=1 docker exec kite-sdk-tester python /tests/integration_test_multi_device_e2ee.py
+MSYS_NO_PATHCONV=1 docker exec kite-sdk-tester python /tests/e2e_test_group_e2ee.py
 ```
 
 其中固定 AID 单域测试脚本默认会优先使用 `AUN_DATA_ROOT/single-domain/persistent`。如果检测到旧目录残留或固定身份只有半套文件，会直接报错并停止，而不是继续运行把环境写得更脏。
@@ -161,24 +170,18 @@ python tests/integration_test_reconnect.py
 
 ### TypeScript 集成 / E2E
 
-单域当前没有常驻 `ts-tester` 服务，推荐直接起临时 Node 容器接入 `docker-deploy_kite-net`。
+单域当前提供常驻 `kite-ts-tester` 服务。容器启动时会自动校验并修复 Linux 版 `better-sqlite3` 依赖，因此直接在容器内运行即可。
 
 集成测试：
 
 ```powershell
-docker run --rm --network docker-deploy_kite-net `
-  -v D:\modelunion\kite\aun-sdk-core\ts:/workspace/ts `
-  -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e NO_PROXY=* `
-  node:20-bookworm bash -lc "rm -rf /tmp/ts-single && cp -R /workspace/ts /tmp/ts-single && rm -rf /tmp/ts-single/node_modules /tmp/ts-single/dist && cd /tmp/ts-single && npm install --legacy-peer-deps && npx vitest run tests/integration/e2ee.test.ts"
+MSYS_NO_PATHCONV=1 docker exec kite-ts-tester bash -lc "cd /workspace/ts && npx vitest run tests/integration/e2ee.test.ts"
 ```
 
 E2E 测试：
 
 ```powershell
-docker run --rm --network docker-deploy_kite-net `
-  -v D:\modelunion\kite\aun-sdk-core\ts:/workspace/ts `
-  -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e NO_PROXY=* `
-  node:20-bookworm bash -lc "rm -rf /tmp/ts-single && cp -R /workspace/ts /tmp/ts-single && rm -rf /tmp/ts-single/node_modules /tmp/ts-single/dist && cd /tmp/ts-single && npm install --legacy-peer-deps && npx vitest run tests/e2e/group-e2ee.test.ts"
+MSYS_NO_PATHCONV=1 docker exec kite-ts-tester bash -lc "cd /workspace/ts && npx vitest run tests/e2e/group-e2ee.test.ts"
 ```
 
 单域 reconnect 集成测试当前由宿主机 Node 进程直接协调 `docker compose restart kite`，不适合放进临时 Docker 测试容器：
@@ -193,12 +196,12 @@ npx vitest run tests/integration/reconnect.test.ts
 
 ### Go 集成 / E2E
 
-单域 Go 测试同样通过临时容器接入 `docker-deploy_kite-net`。下面命令默认复用宿主机 `C:\go\pkg\mod` 作为只读模块缓存。
+单域 Go 测试同样通过临时容器接入 `docker-deploy_kite-net`。下面命令默认复用宿主机 `C:\go\pkg\mod` 作为只读模块缓存。Windows Git Bash 下运行时统一在命令前加 `MSYS_NO_PATHCONV=1`。
 
 集成测试：
 
 ```powershell
-docker run --rm --network docker-deploy_kite-net `
+MSYS_NO_PATHCONV=1 docker run --rm --network docker-deploy_kite-net `
   -v D:\modelunion\kite\aun-sdk-core\go:/workspace/go `
   -v C:\go\pkg\mod:/go/pkg/mod:ro `
   -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e NO_PROXY=* `
@@ -211,7 +214,7 @@ docker run --rm --network docker-deploy_kite-net `
 E2E 测试：
 
 ```powershell
-docker run --rm --network docker-deploy_kite-net `
+MSYS_NO_PATHCONV=1 docker run --rm --network docker-deploy_kite-net `
   -v D:\modelunion\kite\aun-sdk-core\go:/workspace/go `
   -v C:\go\pkg\mod:/go/pkg/mod:ro `
   -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e NO_PROXY=* `
@@ -264,6 +267,7 @@ docker exec -it go-tester sh
 - `AUN_DATA_ROOT=/data/aun`
 - `PYTHONPATH=/sdk/src`
 - `ts-tester` 挂载 `D:\modelunion\kite\aun-sdk-core\ts -> /workspace/ts`
+- `ts-tester` 的 `/workspace/ts/node_modules` 使用容器内独立 volume，与宿主机 Windows `node_modules` 隔离
 - `go-tester` 挂载 `D:\modelunion\kite\aun-sdk-core\go -> /workspace/go`
 
 ### 建议执行顺序
@@ -323,10 +327,10 @@ docker exec client-a python /test/e2e_coverage_gaps.py
 
 ### TypeScript 集成 / E2E
 
-普通双域集成与 E2E 推荐直接在 `ts-tester` 容器里运行，但仍然要先把源码复制到容器内临时目录并重新安装 Linux 依赖：
+普通双域集成与 E2E 直接在 `ts-tester` 容器里运行即可。容器启动时会自动校验并修复 Linux 版 `better-sqlite3` 依赖。
 
 ```powershell
-docker exec ts-tester bash -lc "rm -rf /tmp/ts-fed && cp -R /workspace/ts /tmp/ts-fed && rm -rf /tmp/ts-fed/node_modules /tmp/ts-fed/dist && cd /tmp/ts-fed && npm install --legacy-peer-deps && npx vitest run tests/integration/federation.test.ts tests/integration/federation-storage.test.ts"
+MSYS_NO_PATHCONV=1 docker exec ts-tester bash -lc "cd /workspace/ts && npx vitest run tests/integration/federation.test.ts tests/integration/federation-storage.test.ts"
 ```
 
 双域 reconnect 需要宿主机配合重启远端域 `kite-b`。推荐在宿主机 PowerShell 执行：
@@ -335,7 +339,7 @@ docker exec ts-tester bash -lc "rm -rf /tmp/ts-fed && cp -R /workspace/ts /tmp/t
 $marker = 'D:\modelunion\kite\aun-sdk-core\ts\.codex_fed_reconnect_marker_ts'
 Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
 $job = Start-Job -ScriptBlock {
-  docker exec ts-tester bash -lc "rm -rf /tmp/ts-fed && cp -R /workspace/ts /tmp/ts-fed && rm -rf /tmp/ts-fed/node_modules /tmp/ts-fed/dist && cd /tmp/ts-fed && npm install --legacy-peer-deps && AUN_RECONNECT_MARKER=/workspace/ts/.codex_fed_reconnect_marker_ts npx vitest run tests/integration/federation-reconnect.test.ts"
+  docker exec ts-tester bash -lc "cd /workspace/ts && AUN_RECONNECT_MARKER=/workspace/ts/.codex_fed_reconnect_marker_ts npx vitest run tests/integration/federation-reconnect.test.ts"
 }
 while (-not (Test-Path -LiteralPath $marker)) { Start-Sleep -Seconds 1 }
 docker restart federation-kite-b
@@ -346,10 +350,10 @@ Remove-Job $job
 
 ### Go 集成 / E2E
 
-普通双域 Go 用例可以直接跑完整 `Federation` 子集；如果没有设置 `AUN_RECONNECT_MARKER`，reconnect 子用例会自动跳过，只执行 message/group/storage 这几类普通双域场景：
+普通双域 Go 用例可以直接跑完整 `Federation` 子集；如果没有设置 `AUN_RECONNECT_MARKER`，reconnect 子用例会自动跳过，只执行 message/group/storage 这几类普通双域场景。Windows Git Bash 下运行时统一在命令前加 `MSYS_NO_PATHCONV=1`。
 
 ```powershell
-docker run --rm --network federation-test_federation-net `
+MSYS_NO_PATHCONV=1 docker run --rm --network federation-test_federation-net `
   -v D:\modelunion\kite\aun-sdk-core\go:/workspace/go `
   -v C:\go\pkg\mod:/go/pkg/mod:ro `
   -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e NO_PROXY=* `
@@ -442,5 +446,6 @@ docker compose up -d --force-recreate kite-a kite-b client-a client-b
 - `integration_test_reconnect.py` 仍是宿主机脚本，不适合放进测试容器。
 - `ts/tests/integration/reconnect.test.ts` 也是宿主机协调型测试，用于控制单域 `docker compose restart kite`，不适合直接塞进单域临时测试容器。
 - Go 当前没有单域 Docker reconnect 用例；双域 reconnect 已通过 `federation_reconnect_test.go` 覆盖。
+- 浏览器版 JS SDK 当前只有 skip 的占位集成测试与真实浏览器 E2E 骨架，不属于本文这套常规 Docker 单域/双域回归矩阵；如需执行，应改用 Playwright/Cypress 等真实浏览器方案，并复用同一套 Docker 服务环境。
 - 双域 `e2e_real.py`、`e2e_comprehensive.py`、`e2e_coverage_gaps.py` 内部会调用 `docker exec` 操控其他容器，需要从宿主机运行，不能在 `client-a/client-b` 容器内执行。
 - 其余单域集成测试、双域 federation/E2E 脚本应优先在 Docker 测试容器内运行，以保证与服务端网络环境一致。

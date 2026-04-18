@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -207,6 +208,10 @@ type AUNClient struct {
 	gapFillDone   map[string]bool
 	gapFillDoneMu sync.Mutex
 
+	// 推送路径已分发的 seq 集合（按命名空间），补洞路径 publish 前检查以避免重复分发
+	pushedSeqs   map[string]map[int]bool
+	pushedSeqsMu sync.Mutex
+
 	// 后台任务上下文
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -274,8 +279,9 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		defaultConnectDeliveryMode: copyMapShallow(connectDeliveryMode),
 		seqTracker:                 NewSeqTracker(),
 		gapFillDone:                make(map[string]bool),
+		pushedSeqs:                 make(map[string]map[int]bool),
 		sessionOptions: map[string]any{
-			"auto_reconnect":       false,
+			"auto_reconnect":       true,
 			"heartbeat_interval":   30.0,
 			"token_refresh_before": 60.0,
 			"retry": map[string]any{
@@ -329,8 +335,8 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		},
 		Keystore:              ks,
 		Config:                cfg,
-		SenderCertResolver:    func(aid string) string { return c.getVerifiedPeerCert(aid, "") },
-		InitiatorCertResolver: func(aid string) string { return c.getVerifiedPeerCert(aid, "") },
+		SenderCertResolver:    func(aid, fingerprint string) string { return c.getVerifiedPeerCert(aid, fingerprint) },
+		InitiatorCertResolver: func(aid, fingerprint string) string { return c.getVerifiedPeerCert(aid, fingerprint) },
 	})
 
 	// Auth 命名空间
@@ -593,6 +599,13 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		return nil, err
 	}
 
+	// group.* 方法注入 device_id（服务端用于多设备消息路由）
+	if strings.HasPrefix(method, "group.") && c.deviceID != "" {
+		if _, exists := params["device_id"]; !exists {
+			params["device_id"] = c.deviceID
+		}
+	}
+
 	// 自动加密：message.send 默认加密
 	if method == "message.send" {
 		encrypt := true
@@ -649,11 +662,15 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 						}
 					}
 					c.seqTracker.OnPullResult(ns, pullMsgs)
-					// 处理 server_ack_seq：跳过 [contiguous, server_ack) 区间
+					// ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
+					// 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若 contiguous 落后必须 force 跳过
+					// retention window 外的空洞。与 S2 [1,seq-1] 历史 gap 配合；若去掉 force，首条消息建的 gap 会
+					// 永远悬挂触发无限 pull。临时消息淘汰走 ephemeral_earliest_available_seq（仅提示），与此互斥。
 					serverAck := int(toInt64(resultMap["server_ack_seq"]))
 					if serverAck > 0 {
 						contig := c.seqTracker.GetContiguousSeq(ns)
 						if contig < serverAck {
+							log.Printf("[aun_core] message.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d", ns, contig, serverAck)
 							c.seqTracker.ForceContiguousSeq(ns, serverAck)
 						}
 					}
@@ -664,10 +681,12 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 						go func() {
 							ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 							defer ackCancel()
-							c.transport.Call(ackCtx, "message.ack", map[string]any{
+							if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
 								"seq":       contig,
 								"device_id": c.deviceID,
-							})
+							}); ackErr != nil {
+								log.Printf("message.pull auto-ack 失败: %v", ackErr)
+							}
 						}()
 					}
 				}
@@ -691,12 +710,15 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 						}
 					}
 					c.seqTracker.OnPullResult(ns, pullMsgs)
-					// 处理 server_ack_seq：从 cursor.current_seq 读取
+					// ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
+					// 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
+					// 与 S2 [1,seq-1] 历史 gap 配合使用，ForceContiguousSeq 是跳过空洞的唯一手段。
 					if cursor, ok := resultMap["cursor"].(map[string]any); ok {
 						serverAck := int(toInt64(cursor["current_seq"]))
 						if serverAck > 0 {
 							contig := c.seqTracker.GetContiguousSeq(ns)
 							if contig < serverAck {
+								log.Printf("[aun_core] group.pull retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, contig, serverAck)
 								c.seqTracker.ForceContiguousSeq(ns, serverAck)
 							}
 						}
@@ -708,11 +730,13 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 						go func() {
 							ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 							defer ackCancel()
-							c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
+							if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
 								"group_id":  gid,
 								"msg_seq":   contig,
 								"device_id": c.deviceID,
-							})
+							}); ackErr != nil {
+								log.Printf("group.pull auto-ack 失败: group=%s %v", gid, ackErr)
+							}
 						}()
 					}
 				}
@@ -1210,10 +1234,12 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 			go func() {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
-				c.transport.Call(ackCtx, "message.ack", map[string]any{
+				if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
 					"seq":       contig,
 					"device_id": c.deviceID,
-				})
+				}); ackErr != nil {
+					log.Printf("P2P auto-ack 失败: %v", ackErr)
+				}
 			}()
 		}
 		// 即时持久化 cursor，异常断连后不回退
@@ -1222,6 +1248,31 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 
 	ctx := context.Background()
 	decrypted := c.decryptSingleMessage(ctx, msg)
+	if decrypted == nil {
+		// H26: 解密失败不再投递原始密文 payload（避免元数据泄漏 + 语义混淆），
+		// 改为发布 message.undecryptable 事件，仅携带安全的 header 信息。
+		log.Printf("[aun_core] [WARN] P2P 消息解密失败，发布 message.undecryptable: seq=%d", seq)
+		safeEvent := map[string]any{
+			"message_id":     msg["message_id"],
+			"from":           msg["from"],
+			"to":             msg["to"],
+			"seq":            msg["seq"],
+			"timestamp":      msg["timestamp"],
+			"_decrypt_error": "decryption failed",
+		}
+		c.events.Publish("message.undecryptable", safeEvent)
+		return
+	}
+	// 记录已推送的 seq，补洞路径据此去重
+	if seq > 0 && myAID != "" {
+		ns := "p2p:" + myAID
+		c.pushedSeqsMu.Lock()
+		if c.pushedSeqs[ns] == nil {
+			c.pushedSeqs[ns] = make(map[int]bool)
+		}
+		c.pushedSeqs[ns][seq] = true
+		c.pushedSeqsMu.Unlock()
+	}
 	c.events.Publish("message.received", decrypted)
 }
 
@@ -1264,11 +1315,13 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 			go func() {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
-				c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
+				if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
 					"group_id":  groupID,
 					"msg_seq":   contig,
 					"device_id": c.deviceID,
-				})
+				}); ackErr != nil {
+					log.Printf("群消息 auto-ack 失败: group=%s %v", groupID, ackErr)
+				}
 			}()
 		}
 		// 即时持久化 cursor，异常断连后不回退
@@ -1294,6 +1347,30 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 
 	ctx := context.Background()
 	decrypted := c.decryptGroupMessage(ctx, msg)
+	if decrypted == nil {
+		// H26: 解密失败改发 group.message_undecryptable 事件，不投递原始密文 payload。
+		log.Printf("[aun_core] [WARN] 群消息解密失败，发布 group.message_undecryptable: group=%s seq=%d", groupID, seq)
+		safeEvent := map[string]any{
+			"message_id":     msg["message_id"],
+			"group_id":       msg["group_id"],
+			"from":           msg["from"],
+			"seq":            msg["seq"],
+			"timestamp":      msg["timestamp"],
+			"_decrypt_error": "decryption failed",
+		}
+		c.events.Publish("group.message_undecryptable", safeEvent)
+		return
+	}
+	// 记录已推送的 seq，补洞路径据此去重
+	if groupID != "" && seq > 0 {
+		nsKey := "group:" + groupID
+		c.pushedSeqsMu.Lock()
+		if c.pushedSeqs[nsKey] == nil {
+			c.pushedSeqs[nsKey] = make(map[int]bool)
+		}
+		c.pushedSeqs[nsKey][seq] = true
+		c.pushedSeqsMu.Unlock()
+	}
 	c.events.Publish("group.message_created", decrypted)
 }
 
@@ -1338,12 +1415,21 @@ func (c *AUNClient) autoPullGroupMessages(notification map[string]any) {
 		}
 	}
 	c.seqTracker.OnPullResult(ns, pullMsgs)
+	// pushedSeqs 去重：跳过已通过推送路径分发的消息
+	c.pushedSeqsMu.Lock()
+	pushed := c.pushedSeqs[ns]
+	c.pushedSeqsMu.Unlock()
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]any)
 		if ok {
+			s := int(toInt64(msg["seq"]))
+			if pushed != nil && s > 0 && pushed[s] {
+				continue // 已通过推送路径分发，跳过
+			}
 			c.events.Publish("group.message_created", msg)
 		}
 	}
+	c.prunePushedSeqs(ns)
 }
 
 // fillGroupGap 后台补齐群消息空洞
@@ -1363,6 +1449,12 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 	}
 	c.gapFillDone[dedupKey] = true
 	c.gapFillDoneMu.Unlock()
+	// S1: 使用 defer 在所有出口（成功/异常/空返）清理 dedup 键，避免"成功但返回 0 条"永久污染。
+	defer func() {
+		c.gapFillDoneMu.Lock()
+		delete(c.gapFillDone, dedupKey)
+		c.gapFillDoneMu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := c.Call(ctx, "group.pull", map[string]any{
@@ -1384,11 +1476,20 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 		return
 	}
 	// seq_tracker 更新和 auto-ack 已在 Call() 拦截器中完成
+	nsKey := "group:" + groupID
+	c.pushedSeqsMu.Lock()
+	pushed := c.pushedSeqs[nsKey]
+	c.pushedSeqsMu.Unlock()
 	for _, raw := range messages {
 		if msg, ok := raw.(map[string]any); ok {
+			s := int(toInt64(msg["seq"]))
+			if pushed != nil && s > 0 && pushed[s] {
+				continue // 已通过推送路径分发，跳过
+			}
 			c.events.Publish("group.message_created", msg)
 		}
 	}
+	c.prunePushedSeqs(nsKey)
 }
 
 // fillGroupEventGap 后台补齐群事件空洞
@@ -1404,6 +1505,12 @@ func (c *AUNClient) fillGroupEventGap(groupID string) {
 	}
 	c.gapFillDone[dedupKey] = true
 	c.gapFillDoneMu.Unlock()
+	// S1: defer 清理 dedup 键
+	defer func() {
+		c.gapFillDoneMu.Lock()
+		delete(c.gapFillDone, dedupKey)
+		c.gapFillDoneMu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := c.Call(ctx, "group.pull_events", map[string]any{
@@ -1438,16 +1545,24 @@ func (c *AUNClient) fillGroupEventGap(groupID string) {
 		go func() {
 			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ackCancel()
-			c.transport.Call(ackCtx, "group.ack_events", map[string]any{
+			if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
 				"group_id":  groupID,
 				"event_seq": contig,
 				"device_id": c.deviceID,
-			})
+			}); ackErr != nil {
+				log.Printf("群事件 auto-ack 失败: group=%s %v", groupID, ackErr)
+			}
 		}()
 	}
 	for _, raw := range events {
 		if evt, ok := raw.(map[string]any); ok {
 			evt["_from_gap_fill"] = true
+			et, _ := evt["event_type"].(string)
+			// 消息事件由 fillGroupGap 负责，事件补洞不重复投递
+			if et == "group.message_created" {
+				continue
+			}
+			// group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
 			c.events.Publish("group.changed", evt)
 		}
 	}
@@ -1476,10 +1591,17 @@ func (c *AUNClient) fillP2pGap() {
 	}
 	c.gapFillDone[dedupKey] = true
 	c.gapFillDoneMu.Unlock()
+	// S1: defer 清理 dedup 键
+	defer func() {
+		c.gapFillDoneMu.Lock()
+		delete(c.gapFillDone, dedupKey)
+		c.gapFillDoneMu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := c.Call(ctx, "message.pull", map[string]any{
 		"after_seq": afterSeq,
+		"device_id": c.deviceID,
 		"limit":     50,
 	})
 	if err != nil {
@@ -1495,10 +1617,38 @@ func (c *AUNClient) fillP2pGap() {
 		return
 	}
 	// seq_tracker 更新和 auto-ack 已在 Call() 拦截器中完成
+	nsKey := "p2p:" + myAID
+	c.pushedSeqsMu.Lock()
+	pushed := c.pushedSeqs[nsKey]
+	c.pushedSeqsMu.Unlock()
 	for _, raw := range messages {
 		if msg, ok := raw.(map[string]any); ok {
+			s := int(toInt64(msg["seq"]))
+			if pushed != nil && s > 0 && pushed[s] {
+				continue // 已通过推送路径分发，跳过
+			}
 			c.events.Publish("message.received", msg)
 		}
+	}
+	c.prunePushedSeqs(nsKey)
+}
+
+// prunePushedSeqs 清理 pushedSeqs 中 <= contiguousSeq 的条目，防止无限增长
+func (c *AUNClient) prunePushedSeqs(ns string) {
+	contig := c.seqTracker.GetContiguousSeq(ns)
+	c.pushedSeqsMu.Lock()
+	defer c.pushedSeqsMu.Unlock()
+	pushed := c.pushedSeqs[ns]
+	if pushed == nil {
+		return
+	}
+	for s := range pushed {
+		if s <= contig {
+			delete(pushed, s)
+		}
+	}
+	if len(pushed) == 0 {
+		delete(c.pushedSeqs, ns)
 	}
 }
 
@@ -1517,8 +1667,15 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 
 	c.events.Publish("group.changed", dataMap)
 
-	// 收到事件推送后自动 pull 补齐（补洞回来的事件不再触发新补洞）
+	// event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq
 	groupID, _ := dataMap["group_id"].(string)
+	if rawES, ok := dataMap["event_seq"]; ok && groupID != "" {
+		if es := toInt64(rawES); es > 0 {
+			c.seqTracker.OnMessageSeq("group_event:"+groupID, int(es))
+		}
+	}
+
+	// 收到事件推送后自动 pull 补齐（补洞回来的事件不再触发新补洞）
 	if groupID != "" && dataMap["_from_gap_fill"] == nil {
 		go c.fillGroupEventGap(groupID)
 	}
@@ -1527,7 +1684,7 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 	action, _ := dataMap["action"].(string)
 	if action == "member_left" || action == "member_removed" {
 		if groupID != "" {
-			go c.rotateGroupEpoch(context.Background(), groupID)
+			go c.maybeLeadRotateGroupEpoch(context.Background(), groupID)
 		}
 	}
 }
@@ -1711,11 +1868,14 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 		if fallbackErr != nil {
 			return nil, err
 		}
-		actualFingerprint, fpErr := certSHA256Fingerprint(fallbackCert)
-		if fpErr != nil || actualFingerprint != strings.TrimSpace(strings.ToLower(certFingerprint)) {
-			return nil, err
-		}
 		certBytes = fallbackCert
+	}
+
+	// H7: 严格校验指纹（DER SHA-256 或 SPKI SHA-256 任一匹配即可）
+	if strings.TrimSpace(certFingerprint) != "" {
+		if !matchCertFingerprint(certBytes, certFingerprint) {
+			return nil, NewValidationError(fmt.Sprintf("对端证书指纹不匹配 (%s)", aid))
+		}
 	}
 
 	// 完整 PKI 验证：链 + CRL + OCSP + AID 绑定
@@ -1939,7 +2099,9 @@ func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string
 	}
 	if fromAID != "" {
 		if !c.ensureSenderCertCached(ctx, fromAID, senderCertFingerprint) {
-			log.Printf("无法获取发送方 %s 的证书，跳过解密", fromAID)
+			errMsg := fmt.Sprintf("无法获取发送方 %s 的证书，跳过解密", fromAID)
+			log.Printf("[WARN] P2P 解密失败: %s", errMsg)
+			message["_decrypt_error"] = errMsg
 			return message
 		}
 	}
@@ -1947,6 +2109,13 @@ func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string
 	// 密码学解密（E2EEManager.DecryptMessage 内含本地防重放）
 	decrypted, err := c.e2ee.DecryptMessage(message)
 	if err != nil || decrypted == nil {
+		if err != nil {
+			log.Printf("[WARN] P2P 解密失败: %v", err)
+			message["_decrypt_error"] = err.Error()
+		} else {
+			log.Printf("[WARN] P2P 解密失败: DecryptMessage 返回 nil")
+			message["_decrypt_error"] = "DecryptMessage returned nil"
+		}
 		return message
 	}
 	c.schedulePrekeyReplenishIfConsumed(decrypted)
@@ -2013,14 +2182,16 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 	}
 	if senderAID != "" {
 		if !c.ensureSenderCertCached(ctx, senderAID) {
-			log.Printf("群消息解密跳过：发送方 %s 证书不可用", senderAID)
+			errMsg := fmt.Sprintf("群消息解密跳过：发送方 %s 证书不可用", senderAID)
+			log.Printf("[WARN] %s", errMsg)
+			message["_decrypt_error"] = errMsg
 			return message
 		}
 	}
 
 	// 尝试直接解密
-	result, err := c.groupE2EE.Decrypt(message, false)
-	if err == nil && result != nil {
+	result, decryptErr := c.groupE2EE.Decrypt(message, false)
+	if decryptErr == nil && result != nil {
 		if _, ok := result["e2ee"]; ok {
 			return result
 		}
@@ -2050,6 +2221,15 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 				}
 			}
 		}
+	}
+
+	// 密钥恢复后仍返回原始消息，附带错误标记
+	if decryptErr != nil {
+		log.Printf("[WARN] 群消息解密失败: group=%s %v", groupID, decryptErr)
+		message["_decrypt_error"] = decryptErr.Error()
+	} else {
+		log.Printf("[WARN] 群消息解密失败: group=%s 解密结果无 e2ee 字段", groupID)
+		message["_decrypt_error"] = "decrypt result missing e2ee field"
 	}
 
 	return message
@@ -2118,7 +2298,11 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 	c.auth.SetInstanceContext(c.deviceID, c.slotID)
 	c.auth.SetDeliveryMode(c.connectDeliveryMode)
 	c.state = StateConnecting
+	// 前置 restore：在 transport.Connect 启动 reader 之前完成，
+	// 避免 reader 把积压 push 交给空 tracker 的 handler，触发 S2 历史 gap 误补拉。
+	c.refreshSeqTrackerContextLocked()
 	c.mu.Unlock()
+	c.restoreSeqTrackerState()
 
 	// 连接 WebSocket
 	challenge, err := c.transport.Connect(ctx, gatewayURL)
@@ -2164,15 +2348,20 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 		c.syncIdentityAfterConnect(accessToken)
 	}
 
+	// auth 阶段 aid 可能被 identity 覆盖；若 context 发生变化，重做 refresh + restore 兜底
 	c.mu.Lock()
 	c.state = StateConnected
+	prevContext := c.seqTrackerContext
 	c.refreshSeqTrackerContextLocked()
+	contextChanged := c.seqTrackerContext != prevContext
 	c.mu.Unlock()
 
 	c.events.Publish("connection.state", map[string]any{"state": "connected", "gateway": gatewayURL})
 
 	// 启动后台任务
-	c.restoreSeqTrackerState()
+	if contextChanged {
+		c.restoreSeqTrackerState()
+	}
 	c.startBackgroundTasks(ctx)
 
 	// 上线后自动上传 prekey
@@ -2197,6 +2386,9 @@ func (c *AUNClient) resetSeqTrackingStateLocked() {
 	c.gapFillDoneMu.Lock()
 	c.gapFillDone = make(map[string]bool)
 	c.gapFillDoneMu.Unlock()
+	c.pushedSeqsMu.Lock()
+	c.pushedSeqs = make(map[string]map[int]bool)
+	c.pushedSeqsMu.Unlock()
 }
 
 func (c *AUNClient) refreshSeqTrackerContextLocked() {
@@ -2209,6 +2401,9 @@ func (c *AUNClient) refreshSeqTrackerContextLocked() {
 	c.gapFillDoneMu.Lock()
 	c.gapFillDone = make(map[string]bool)
 	c.gapFillDoneMu.Unlock()
+	c.pushedSeqsMu.Lock()
+	c.pushedSeqs = make(map[string]map[int]bool)
+	c.pushedSeqsMu.Unlock()
 }
 
 // resolveGateway 解析 Gateway URL
@@ -2348,11 +2543,20 @@ func (c *AUNClient) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
 	defer ticker.Stop()
 
+	consecutiveFailures := 0
+	maxFailures := 3 // 连续失败 3 次触发重连
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 先检查 ctx 是否已取消，避免用已取消的 context 发心跳导致误判
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			c.mu.RLock()
 			isClosing := c.closing.Load()
 			state := c.state
@@ -2361,11 +2565,25 @@ func (c *AUNClient) heartbeatLoop(ctx context.Context) {
 				return
 			}
 			if state != StateConnected {
+				consecutiveFailures = 0
 				continue
 			}
 			_, err := c.transport.Call(ctx, "meta.ping", map[string]any{})
 			if err != nil {
+				// ctx 取消导致的失败不算心跳失败
+				if ctx.Err() != nil {
+					return
+				}
+				consecutiveFailures++
+				log.Printf("心跳失败 (%d/%d): %v", consecutiveFailures, maxFailures, err)
 				c.events.Publish("connection.error", map[string]any{"error": err})
+				if consecutiveFailures >= maxFailures {
+					log.Printf("连续 %d 次心跳失败，触发断线重连", maxFailures)
+					c.handleTransportDisconnect(err)
+					return
+				}
+			} else {
+				consecutiveFailures = 0
 			}
 		}
 	}
@@ -2604,6 +2822,8 @@ func (c *AUNClient) cacheCleanupLoop(ctx context.Context, interval float64) {
 
 			// e2ee prekey 缓存
 			c.e2ee.CleanExpiredCaches()
+			// group e2ee replay guard 缓存
+			c.groupE2EE.CleanExpiredCaches()
 			// auth gateway 缓存
 			c.auth.CleanExpiredCaches()
 		}
@@ -2659,6 +2879,81 @@ func (c *AUNClient) syncEpochToServer(ctx context.Context, groupID string) {
 	if err != nil {
 		log.Printf("同步 epoch 到服务端失败 (group=%s，可能已同步): %v", groupID, err)
 	}
+}
+
+func randomLeaderRotateJitter() time.Duration {
+	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(4000))
+	if err != nil {
+		return 3 * time.Second
+	}
+	return time.Duration(2000+n.Int64()) * time.Millisecond
+}
+
+// maybeLeadRotateGroupEpoch 基于"排序最小 admin = leader"选举自动触发 epoch 轮换。
+// 非 owner/admin 不会发起 rotate；非 leader admin 在 jitter 后做一次兜底。
+func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID string) {
+	c.mu.RLock()
+	myAID := c.aid
+	c.mu.RUnlock()
+	if groupID == "" || myAID == "" {
+		return
+	}
+
+	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
+	if err != nil {
+		log.Printf("_maybeLeadRotateGroupEpoch 获取成员失败: group=%s %v", groupID, err)
+		return
+	}
+	membersMap, ok := membersResult.(map[string]any)
+	if !ok {
+		return
+	}
+	membersList, _ := membersMap["members"].([]any)
+	admins := make([]string, 0, len(membersList))
+	for _, item := range membersList {
+		member, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		aid, _ := member["aid"].(string)
+		role, _ := member["role"].(string)
+		if aid != "" && (role == "owner" || role == "admin") {
+			admins = append(admins, aid)
+		}
+	}
+	if len(admins) == 0 {
+		return
+	}
+	sort.Strings(admins)
+	leader := admins[0]
+	if leader == myAID {
+		c.rotateGroupEpoch(ctx, groupID)
+		return
+	}
+	if !stringSliceContains(admins, myAID) {
+		return
+	}
+
+	beforeEpoch := 0
+	if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
+		beforeEpoch = *epoch
+	}
+	timer := time.NewTimer(randomLeaderRotateJitter())
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	afterEpoch := 0
+	if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
+		afterEpoch = *epoch
+	}
+	if afterEpoch > beforeEpoch {
+		return
+	}
+	log.Printf("[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s", groupID, myAID)
+	c.rotateGroupEpoch(ctx, groupID)
 }
 
 // rotateGroupEpoch 为指定群组轮换 epoch 并分发新密钥（使用服务端 CAS 保证只有一方成功）
@@ -2729,13 +3024,21 @@ func (c *AUNClient) rotateGroupEpoch(ctx context.Context, groupID string) {
 		to, _ := dist["to"].(string)
 		distPayload, _ := dist["payload"].(map[string]any)
 		if to != "" && distPayload != nil {
-			_, err := c.Call(ctx, "message.send", map[string]any{
-				"to":      to,
-				"payload": distPayload,
-				"encrypt": true,
-			})
-			if err != nil {
-				log.Printf("分发 epoch 密钥失败 (%s → %s): %v", groupID, to, err)
+			// 重试 3 次，间隔递增（1s, 2s）
+			for attempt := 0; attempt < 3; attempt++ {
+				_, sendErr := c.Call(ctx, "message.send", map[string]any{
+					"to":      to,
+					"payload": distPayload,
+					"encrypt": true,
+				})
+				if sendErr == nil {
+					break
+				}
+				if attempt < 2 {
+					time.Sleep(time.Duration(attempt+1) * time.Second)
+				} else {
+					log.Printf("epoch 密钥分发失败 (to=%s): %v", to, sendErr)
+				}
 			}
 		}
 	}
@@ -2797,13 +3100,21 @@ func (c *AUNClient) distributeKeyToNewMember(ctx context.Context, groupID, newMe
 	}
 
 	distPayload := BuildKeyDistribution(groupID, epoch, secret, memberAIDs, myAID, manifest)
-	_, err = c.Call(ctx, "message.send", map[string]any{
-		"to":      newMemberAID,
-		"payload": distPayload,
-		"encrypt": true,
-	})
-	if err != nil {
-		c.logE2EEError("distribute_key", groupID, newMemberAID, err)
+	// 重试 3 次，间隔递增（1s, 2s）
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err = c.Call(ctx, "message.send", map[string]any{
+			"to":      newMemberAID,
+			"payload": distPayload,
+			"encrypt": true,
+		})
+		if err == nil {
+			break
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+		} else {
+			c.logE2EEError("distribute_key", groupID, newMemberAID, err)
+		}
 	}
 }
 
@@ -2885,16 +3196,14 @@ func (c *AUNClient) logE2EEError(stage, groupID, aid string, err error) {
 
 // handleTransportDisconnect 传输层断线回调
 func (c *AUNClient) handleTransportDisconnect(err error) {
-	c.mu.RLock()
+	// 原子检查+设置状态，避免锁间隙中 close() 被调用后仍启动重连
+	c.mu.Lock()
 	isClosing := c.closing.Load()
 	state := c.state
-	c.mu.RUnlock()
-
 	if isClosing || state == StateClosed {
+		c.mu.Unlock()
 		return
 	}
-
-	c.mu.Lock()
 	c.state = StateDisconnected
 	c.mu.Unlock()
 
@@ -2921,7 +3230,7 @@ func (c *AUNClient) handleTransportDisconnect(err error) {
 	}
 }
 
-// reconnectLoop 重连循环（无限重试 + 指数退避，仅在不可重试错误或 close() 时终止）
+// reconnectLoop 重连循环（指数退避，在不可重试错误、close()、或超过最大重试次数时终止）
 func (c *AUNClient) reconnectLoop() {
 	c.mu.RLock()
 	opts := c.sessionOptions
@@ -2930,6 +3239,7 @@ func (c *AUNClient) reconnectLoop() {
 	retryConfig, _ := opts["retry"].(map[string]any)
 	initialDelay := 0.5
 	maxDelay := 30.0
+	maxAttempts := 0 // 0 表示无限重试
 	if retryConfig != nil {
 		if v, ok := retryConfig["initial_delay"].(float64); ok {
 			initialDelay = v
@@ -2937,10 +3247,28 @@ func (c *AUNClient) reconnectLoop() {
 		if v, ok := retryConfig["max_delay"].(float64); ok {
 			maxDelay = v
 		}
+		if v, ok := retryConfig["max_attempts"].(float64); ok && v > 0 {
+			maxAttempts = int(v)
+		}
 	}
 
 	delay := initialDelay
 	for attempt := 1; !c.closing.Load(); attempt++ {
+		// 超过最大重试次数时停止
+		if maxAttempts > 0 && attempt > maxAttempts {
+			log.Printf("[aun_core] 重连超过最大次数 %d，停止重试", maxAttempts)
+			c.mu.Lock()
+			c.state = StateTerminalFailed
+			c.mu.Unlock()
+			c.events.Publish("connection.state", map[string]any{
+				"state":   "terminal_failed",
+				"error":   fmt.Errorf("超过最大重连次数 %d", maxAttempts),
+				"attempt": attempt - 1,
+			})
+			c.reconnecting.Store(false)
+			return
+		}
+
 		c.mu.Lock()
 		c.state = StateReconnecting
 		c.mu.Unlock()
@@ -3429,6 +3757,42 @@ func certSHA256Fingerprint(certPEM []byte) (string, error) {
 	}
 	fp := sha256.Sum256(block.Bytes)
 	return "sha256:" + fmt.Sprintf("%x", fp[:]), nil
+}
+
+// spkiSHA256Fingerprint 计算证书的 SubjectPublicKeyInfo SHA-256 指纹
+// （H7：CA 同时接受 DER 证书指纹与 SPKI 指纹两种格式）
+func spkiSHA256Fingerprint(certPEM []byte) (string, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return "", fmt.Errorf("invalid PEM certificate")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", err
+	}
+	if len(cert.RawSubjectPublicKeyInfo) == 0 {
+		return "", fmt.Errorf("missing RawSubjectPublicKeyInfo")
+	}
+	fp := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	return "sha256:" + fmt.Sprintf("%x", fp[:]), nil
+}
+
+// matchCertFingerprint 检查证书指纹是否匹配（DER 或 SPKI 任一即可）
+func matchCertFingerprint(certPEM []byte, expectedFP string) bool {
+	expected := strings.TrimSpace(strings.ToLower(expectedFP))
+	if expected == "" {
+		return true
+	}
+	if !strings.HasPrefix(expected, "sha256:") {
+		return false
+	}
+	if derFP, err := certSHA256Fingerprint(certPEM); err == nil && derFP == expected {
+		return true
+	}
+	if spkiFP, err := spkiSHA256Fingerprint(certPEM); err == nil && spkiFP == expected {
+		return true
+	}
+	return false
 }
 
 // sleepWithCancel 可取消的 sleep

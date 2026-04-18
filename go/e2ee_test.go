@@ -495,7 +495,7 @@ func TestSeenSetTrim(t *testing.T) {
 	// 手动填充 seen set 到超过限制
 	mgr.mu.Lock()
 	for i := 0; i < seenMaxSize+100; i++ {
-		mgr.seenMessages[strings.Repeat("x", 10)+string(rune(i))] = true
+		mgr.seenMessages[strings.Repeat("x", 10)+string(rune(i))] = int64(i)
 	}
 	mgr.trimSeenSet()
 	size := len(mgr.seenMessages)

@@ -162,6 +162,9 @@ class AIDDatabase:
 
     @staticmethod
     def _is_recoverable_db_error(err_msg: str) -> bool:
+        # S3: 不能把 "hmac check failed" 视为可恢复 — 这是密码错误的明确信号，
+        # 误把它当成"文件损坏"会导致主上下文吞掉错误并把合法数据库重建/清空。
+        # 该类错误必须向上抛出，由调用方提示用户重试密码。
         lowered = str(err_msg or "").lower()
         return any(
             token in lowered
@@ -169,7 +172,6 @@ class AIDDatabase:
                 "malformed",
                 "corrupt",
                 "not a database",
-                "hmac check failed",
                 "disk i/o error",
             )
         )

@@ -29,6 +29,16 @@ export interface LoadedGroupSecret {
   member_aids: string[];
 }
 
+// ── 辅助：证书 SHA-256 指纹 ──────────────────────────────────────
+
+/** PEM 证书 → sha256:{hex} 指纹（与 Python/Go/JS SDK 一致） */
+function certSha256Fingerprint(certPem: string | Buffer): string {
+  const pem = typeof certPem === 'string' ? certPem : certPem.toString('utf-8');
+  const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  const der = Buffer.from(b64, 'base64');
+  return `sha256:${crypto.createHash('sha256').update(der).digest('hex')}`;
+}
+
 // ── 常量 ───────────────────────────────────────────────────────
 
 const SUITE = 'P256_HKDF_SHA256_AES_256_GCM';
@@ -201,6 +211,7 @@ export function encryptGroupMessage(
     messageId: string;
     timestamp: number;
     senderPrivateKeyPem?: string | null;
+    senderCertPem?: string | null;
   },
 ): JsonObject {
   const msgKey = deriveGroupMsgKey(groupSecret, groupId, opts.messageId);
@@ -236,12 +247,10 @@ export function encryptGroupMessage(
       const signPayload = Buffer.concat([ciphertext, tag, aadBytes]);
       const sig = ecdsaSign(opts.senderPrivateKeyPem, signPayload);
       envelope.sender_signature = sig.toString('base64');
-      // 公钥指纹
-      const pk = crypto.createPrivateKey(opts.senderPrivateKeyPem);
-      const pubKey = crypto.createPublicKey(pk);
-      const pubDer = pubKey.export({ type: 'spki', format: 'der' }) as Buffer;
-      const fp = crypto.createHash('sha256').update(pubDer).digest();
-      envelope.sender_cert_fingerprint = `sha256:${fp.toString('hex')}`;
+      // 证书指纹（与 Python/Go/JS SDK 一致）
+      if (opts.senderCertPem) {
+        envelope.sender_cert_fingerprint = certSha256Fingerprint(opts.senderCertPem);
+      }
     } catch {
       // 签名失败不阻止发送
     }
@@ -492,6 +501,7 @@ export function storeGroupSecret(
       commitment: existing.commitment,
       member_aids: existing.member_aids,
       updated_at: existing.updated_at,
+      expires_at: ((existing.updated_at as number) || Date.now()) + OLD_EPOCH_RETENTION_SECONDS * 1000,
     };
     if ('secret_protection' in existing) {
       oldEntry.secret_protection = existing.secret_protection;
@@ -600,7 +610,7 @@ export class GroupReplayGuard {
     const key = `${groupId}:${senderAid}:${messageId}`;
     if (this._seen.has(key)) return false;
     this._seen.set(key, true);
-    this._trim();
+    this.trim();
     return true;
   }
 
@@ -612,10 +622,11 @@ export class GroupReplayGuard {
   /** 仅记录，不检查 */
   record(groupId: string, senderAid: string, messageId: string): void {
     this._seen.set(`${groupId}:${senderAid}:${messageId}`, true);
-    this._trim();
+    this.trim();
   }
 
-  private _trim(): void {
+  /** LRU 裁剪（供外部调用） */
+  trim(): void {
     if (this._seen.size > this._maxSize) {
       const trimCount = this._seen.size - Math.floor(this._maxSize * 0.8);
       const iter = this._seen.keys();
@@ -931,6 +942,7 @@ export class GroupE2EEManager {
     }
     const identity = this._identityFn();
     const senderPkPem = identity ? (identity.private_key_pem as string | undefined) ?? null : null;
+    const senderCertPem = identity ? (identity.cert as string | undefined) ?? null : null;
     return encryptGroupMessage(
       groupId,
       secretData.epoch as number,
@@ -941,6 +953,7 @@ export class GroupE2EEManager {
         messageId: `gm-${crypto.randomUUID()}`,
         timestamp: Date.now(),
         senderPrivateKeyPem: senderPkPem,
+        senderCertPem,
       },
     );
   }
@@ -960,7 +973,7 @@ export class GroupE2EEManager {
     const msgId = aadMsgId || (message.message_id as string) || '';
     if (!opts?.skipReplay && groupId && sender && msgId) {
       if (this._replayGuard.isSeen(groupId, sender, msgId)) {
-        return message;
+        return null;
       }
     }
 
@@ -1086,6 +1099,11 @@ export class GroupE2EEManager {
   /** 清理过期的旧 epoch */
   cleanup(groupId: string, retentionSeconds: number = OLD_EPOCH_RETENTION_SECONDS): void {
     cleanupOldEpochs(this._keystore, this._currentAid(), groupId, retentionSeconds);
+  }
+
+  /** 清理过期缓存（replay guard 等），供外部定时调用 */
+  cleanExpiredCaches(): void {
+    this._replayGuard.trim();
   }
 
   private _currentAid(): string {

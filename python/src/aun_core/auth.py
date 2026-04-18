@@ -710,8 +710,9 @@ class AuthFlow:
             for revoked in crl
         }
         next_refresh_at = crl.next_update_utc.timestamp() if crl.next_update_utc else time.time() + 300
-        # 客户端最大缓存 TTL：不信任服务端设置超过 24 小时的 next_update
-        max_refresh_at = time.time() + 86400
+        # 客户端最大缓存 TTL：不信任服务端设置超过 1 小时的 next_update，
+        # 以确保紧急吊销（compromise/key theft）能在合理时间窗内生效。
+        max_refresh_at = time.time() + 3600
         next_refresh_at = min(next_refresh_at, max_refresh_at)
         return {
             "revoked_serials": revoked_serials,

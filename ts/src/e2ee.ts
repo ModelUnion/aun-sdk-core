@@ -248,10 +248,20 @@ function certificateSha256Fingerprint(certPem: string | Buffer): string {
 
 /** 公钥 KeyObject → 未压缩点（0x04 || x || y，65 字节） */
 function publicKeyToUncompressedPoint(pubKey: crypto.KeyObject): Buffer {
-  // 用 JWK 提取 x, y
-  const jwk = pubKey.export({ format: 'jwk' }) as { x: string; y: string };
+  // 用 JWK 提取 x, y，并显式校验曲线必须是 P-256。
+  // 这样 P-384/P-521 错误会在导出阶段立即抛出，而不是延后到解密时才失败。
+  const jwk = pubKey.export({ format: 'jwk' }) as { kty?: string; crv?: string; x: string; y: string };
+  if (jwk.kty !== 'EC') {
+    throw new E2EEError(`unsupported public key type: ${jwk.kty ?? 'unknown'}`);
+  }
+  if (jwk.crv !== 'P-256') {
+    throw new E2EEError(`unsupported EC curve: ${jwk.crv ?? 'unknown'} (only P-256 is supported)`);
+  }
   const x = Buffer.from(jwk.x, 'base64url');
   const y = Buffer.from(jwk.y, 'base64url');
+  if (x.length !== 32 || y.length !== 32) {
+    throw new E2EEError(`invalid P-256 coordinate length: x=${x.length}, y=${y.length}`);
+  }
   return Buffer.concat([Buffer.from([0x04]), x, y]);
 }
 
@@ -561,7 +571,6 @@ export class E2EEManager {
     const payload = message.payload as JsonObject | undefined;
     if (!payload || typeof payload !== 'object') return message;
     if (payload.type !== 'e2ee.encrypted') return message;
-    if (message.encrypted === false) return message;
     if (!this._shouldDecryptForCurrentAid(message, payload)) return message;
 
     // timestamp 窗口检查
@@ -574,17 +583,22 @@ export class E2EEManager {
       }
     }
 
-    // 本地防重放
+    // H27: 本地防重放——必须在 _decryptMessage 成功后再 set seenKey，
+    // 否则解密/验签失败时合法重传会被当作重复丢弃。
     const messageId = message.message_id as string || '';
     const fromAid = message.from as string || '';
+    let seenKey = '';
     if (messageId && fromAid) {
-      const seenKey = `${fromAid}:${messageId}`;
+      seenKey = `${fromAid}:${messageId}`;
       if (this._seenMessages.has(seenKey)) return null;
+    }
+
+    const result = this._decryptMessage(message);
+    if (result !== null && seenKey) {
       this._seenMessages.set(seenKey, true);
       this._trimSeenSet();
     }
-
-    return this._decryptMessage(message);
+    return result;
   }
 
   /** 解密入站消息（不消耗 seen set，用于 pull 场景） */
@@ -808,7 +822,7 @@ export class E2EEManager {
   }
 
   /** 使指定 peer 的 prekey 缓存失效 */
-  invalidatePrekeyCahce(peerAid: string): void {
+  invalidatePrekeyCache(peerAid: string): void {
     this._prekeyCache.delete(peerAid);
   }
 
@@ -1058,11 +1072,14 @@ export class E2EEManager {
     };
   }
 
-  /** 清理过期的 prekey 缓存条目（供外部定时调用） */
+  /** 清理过期的 prekey 缓存和 seen set 条目（供外部定时调用） */
   cleanExpiredCaches(): void {
     const now = Date.now() / 1000;
+    // 清理过期的 prekey 缓存
     for (const [k, v] of this._prekeyCache) {
       if (now >= v.expireAt) this._prekeyCache.delete(k);
     }
+    // 清理 seen set（LRU 裁剪）
+    this._trimSeenSet();
   }
 }
