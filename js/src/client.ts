@@ -1062,7 +1062,8 @@ export class AUNClient {
       if (isJsonObject(result)) {
         const messages = result.messages;
         if (Array.isArray(messages)) {
-          this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          // ⚠️ 不再重复调用 onPullResult：call('message.pull') 拦截器已在内部调用过一次
+          // 与 _fillGroupGap 路径对齐，避免双重 tracker 推进。
           const pushed = this._pushedSeqs.get(ns);
           for (const msg of messages) {
             if (isJsonObject(msg)) {
