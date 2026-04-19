@@ -226,6 +226,12 @@ extensions/services/evol/static/js/tests/
 - **未经用户确认，不得新增、删除或修改任何模块的对外接口**（HTTP endpoint、WS 消息类型、stdin 协议等）
 - 接口是架构契约，变更必须先提出方案、说明理由，获得确认后再动手
 
+### 异常处理纪律
+
+- **禁止新增 `except Exception: pass`、`except: pass` 或其他静默吞异常写法**
+- 如确需做降级或兜底，必须至少记录日志，或将异常转换为带上下文的信息后继续抛出
+- 不允许用“先吞掉再说”的方式掩盖真实错误；优先保留原始异常语义，便于调试和审查
+
 ### 调试日志
 
 每个模块都有独立的日志目录，路径统一为 `{KITE_INSTANCE_DIR}/{module_name}/log/`。
