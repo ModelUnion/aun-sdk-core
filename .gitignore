@@ -33,6 +33,7 @@ Thumbs.db
 .aun_test/
 .claude/
 .tmp/
+superpowers/*
 go/gocache_run_*/
 go/.codex_fed_reconnect_*
 ts/.codex_fed_reconnect_*
