@@ -467,6 +467,141 @@ describe('RPCTransport.close M25 清理', () => {
   });
 });
 
+// ── Task 2 新增测试 ────────────────────────────────────────────
+
+describe('RPCTransport.connect 握手阶段回滚', () => {
+  it('握手消息解析失败后应回滚 _ws 和 _closed', async () => {
+    const transport = new RPCTransport({
+      eventDispatcher: { publish: vi.fn().mockResolvedValue(undefined) } as any,
+    });
+
+    // 构造一个假 WebSocket：open 后立即发送非法 JSON
+    let openHandler: (() => void) | null = null;
+    let messageHandler: ((data: Buffer) => void) | null = null;
+    let errorHandler: ((err: Error) => void) | null = null;
+    const ws = {
+      on: vi.fn((event: string, handler: (...args: any[]) => void) => {
+        if (event === 'open') openHandler = handler;
+        if (event === 'message') messageHandler = handler;
+        if (event === 'error') errorHandler = handler;
+      }),
+      close: vi.fn(),
+      terminate: vi.fn(),
+      removeAllListeners: vi.fn(),
+      send: vi.fn(),
+    };
+
+    // 替换 WebSocket 构造函数
+    const { RPCTransport: RPCTransportClass } = await import('../../src/transport.js');
+    const origWs = (globalThis as any).WebSocket;
+    // 通过 mock 注入假 ws
+    const connectPromise = (transport as any)._connectWithWs(ws);
+
+    // 触发 open，此时 _ws 应被设置
+    openHandler!();
+    // 发送非法 JSON
+    messageHandler!(Buffer.from('not-valid-json'));
+
+    await expect(connectPromise).rejects.toThrow();
+    // 回滚后 _ws 应为 null，_closed 应为 true
+    expect((transport as any)._ws).toBeNull();
+    expect((transport as any)._closed).toBe(true);
+  });
+
+  it('open 后收到 error 事件应回滚 _ws 和 _closed', async () => {
+    const transport = new RPCTransport({
+      eventDispatcher: { publish: vi.fn().mockResolvedValue(undefined) } as any,
+    });
+
+    let openHandler: (() => void) | null = null;
+    let errorHandler: ((err: Error) => void) | null = null;
+    const ws = {
+      on: vi.fn((event: string, handler: (...args: any[]) => void) => {
+        if (event === 'open') openHandler = handler;
+        if (event === 'error') errorHandler = handler;
+      }),
+      close: vi.fn(),
+      terminate: vi.fn(),
+      removeAllListeners: vi.fn(),
+      send: vi.fn(),
+    };
+
+    const connectPromise = (transport as any)._connectWithWs(ws);
+
+    // 触发 open，此时 _ws 应被设置
+    openHandler!();
+    // 触发 error（握手阶段）
+    errorHandler!(new Error('network error after open'));
+
+    await expect(connectPromise).rejects.toThrow('network error after open');
+    // 回滚后 _ws 应为 null，_closed 应为 true
+    expect((transport as any)._ws).toBeNull();
+    expect((transport as any)._closed).toBe(true);
+  });
+});
+
+describe('AUNClient SeqTracker 持久化错误事件', () => {
+  it('_saveSeqTrackerState 失败时应发布 seq_tracker.persist_error', () => {
+    const client = new AUNClient();
+    const publishSpy = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+
+    // 设置必要状态
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-1';
+
+    // 让 seqTracker 有状态可保存（contiguousSeq > 0，seq=1 直接推进 contiguousSeq）
+    (client as any)._seqTracker.onMessageSeq('p2p:test.aid.com', 1);
+    (client as any)._seqTracker.onMessageSeq('p2p:test.aid.com', 2);
+
+    // 让 keystore.saveSeq 抛出异常
+    const ks = (client as any)._keystore;
+    if (typeof ks.saveSeq === 'function') {
+      vi.spyOn(ks, 'saveSeq').mockImplementation(() => { throw new Error('disk full'); });
+    } else {
+      // fallback 路径：让 updateInstanceState 抛出
+      vi.spyOn(ks, 'updateInstanceState').mockImplementation(() => { throw new Error('disk full'); });
+    }
+
+    (client as any)._saveSeqTrackerState();
+
+    expect(publishSpy).toHaveBeenCalledWith('seq_tracker.persist_error', expect.objectContaining({
+      phase: 'save',
+      aid: 'test.aid.com',
+      device_id: 'dev-1',
+      slot_id: 'slot-1',
+      error: expect.any(String),
+    }));
+  });
+
+  it('_restoreSeqTrackerState 失败时应发布 seq_tracker.persist_error', () => {
+    const client = new AUNClient();
+    const publishSpy = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-1';
+
+    // 让 keystore 的读取方法抛出异常
+    const ks = (client as any)._keystore;
+    if (typeof ks.loadAllSeqs === 'function') {
+      vi.spyOn(ks, 'loadAllSeqs').mockImplementation(() => { throw new Error('db corrupted'); });
+    } else {
+      vi.spyOn(ks, 'loadInstanceState').mockImplementation(() => { throw new Error('db corrupted'); });
+    }
+
+    (client as any)._restoreSeqTrackerState();
+
+    expect(publishSpy).toHaveBeenCalledWith('seq_tracker.persist_error', expect.objectContaining({
+      phase: 'restore',
+      aid: 'test.aid.com',
+      device_id: 'dev-1',
+      slot_id: 'slot-1',
+      error: expect.any(String),
+    }));
+  });
+});
+
 describe('AUNClient 群组 epoch 自动轮换', () => {
   it('普通 member 收到 member_removed 事件时不应触发 rotate_epoch', async () => {
     vi.useFakeTimers();

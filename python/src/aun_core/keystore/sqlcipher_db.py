@@ -207,6 +207,7 @@ class AIDDatabase:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         last_exc: Exception | None = None
         for attempt in range(1, self._MAX_CONNECT_RETRIES + 1):
+            conn: Any | None = None
             try:
                 conn = self._open_and_init()
                 self._conn = conn
@@ -216,10 +217,11 @@ class AIDDatabase:
                 err_msg = str(exc).lower()
                 is_malformed = self._is_recoverable_db_error(err_msg)
                 # 尝试关闭已损坏的连接
-                try:
-                    conn.close()  # type: ignore[possibly-undefined]
-                except Exception:
-                    pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception as close_exc:
+                        _log.debug("关闭失败连接时出错: %s", close_exc)
                 if is_malformed and attempt < self._MAX_CONNECT_RETRIES:
                     _log.warning(
                         "数据库文件损坏 (attempt %d/%d)，删除并重建: %s — %s",
@@ -277,8 +279,8 @@ class AIDDatabase:
         except Exception:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as close_exc:
+                _log.debug("关闭失败连接时出错: %s", close_exc)
             del conn
             gc.collect()
             raise
@@ -318,8 +320,8 @@ class AIDDatabase:
                     if self._conn is not None:
                         try:
                             self._conn.close()
-                        except Exception:
-                            pass
+                        except Exception as close_exc:
+                            _log.debug("关闭失败连接时出错: %s", close_exc)
                     self._conn = None  # 清除连接，下次 _get_conn 重建
                     try:
                         self._cleanup_broken_files()

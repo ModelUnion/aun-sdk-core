@@ -1321,3 +1321,95 @@ class TestReplayGuardSemantics:
             "msg-err-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
         ))
         assert result is False
+
+
+class TestGroupPushDecryptFailureAutoAck:
+    """group push 解密失败时，若 SeqTracker 已推进 contiguous，仍应发送 group.ack_messages。
+
+    Bug 场景：解密失败进入 except 块，auto-ack 代码在 try 块内（解密成功后），
+    导致 contiguous 已推进但 ack 未发送。
+    """
+
+    def _make_client_with_ack_tracking(self, tmp_path):
+        """创建带 ack 追踪的客户端。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        ack_calls: list[dict] = []
+
+        async def fake_transport_call(method, params=None):
+            if method == "group.ack_messages":
+                ack_calls.append({"method": method, "params": params})
+            return {}
+
+        client._transport.call = fake_transport_call
+        client._ack_calls = ack_calls
+        return client
+
+    def test_group_push_decrypt_failure_still_auto_acks(self, tmp_path):
+        """group push 解密抛出异常时，contiguous 已推进，仍应发送 group.ack_messages。"""
+        client = self._make_client_with_ack_tracking(tmp_path)
+
+        # mock _decrypt_group_message 让它抛出异常（模拟解密失败）
+        async def fake_decrypt_group_message(msg):
+            raise Exception("群消息解密失败：密钥不匹配")
+
+        client._decrypt_group_message = fake_decrypt_group_message
+
+        # 构造一个带 payload 的群消息（seq=1），payload type 为 e2ee.group_encrypted
+        msg = {
+            "module_id": "group",
+            "group_id": _GRP,
+            "message_id": "gm-1",
+            "from": _AID_ALICE,
+            "sender_aid": _AID_ALICE,
+            "seq": 1,
+            "payload": {"type": "e2ee.group_encrypted", "epoch": 1, "data": "INVALID"},
+            "timestamp": 1000,
+        }
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._process_and_publish_group_message(msg)
+
+        asyncio.run(run())
+
+        # contiguous 应已推进到 1
+        ns = f"group:{_GRP}"
+        assert client._seq_tracker.get_contiguous_seq(ns) == 1
+
+        # 即使解密失败，也应发送 group.ack_messages
+        assert len(client._ack_calls) == 1, (
+            f"期望 1 次 group.ack_messages，实际 {len(client._ack_calls)} 次: {client._ack_calls}"
+        )
+        assert client._ack_calls[0]["params"]["group_id"] == _GRP
+        assert client._ack_calls[0]["params"]["msg_seq"] == 1
+
+    def test_group_push_decrypt_failure_no_ack_when_contiguous_zero(self, tmp_path):
+        """group push 解密失败且 contiguous=0 时，不应发送 ack（避免无效 ack）。"""
+        client = self._make_client_with_ack_tracking(tmp_path)
+
+        # mock _decrypt_group_message 让它抛出异常
+        async def fake_decrypt_group_message(msg):
+            raise Exception("群消息解密失败")
+
+        client._decrypt_group_message = fake_decrypt_group_message
+
+        # seq=None 的消息不会推进 contiguous
+        msg = {
+            "module_id": "group",
+            "group_id": _GRP,
+            "message_id": "gm-no-seq",
+            "from": _AID_ALICE,
+            "sender_aid": _AID_ALICE,
+            # 无 seq 字段
+            "payload": {"type": "e2ee.group_encrypted", "epoch": 1, "data": "INVALID"},
+            "timestamp": 1000,
+        }
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._process_and_publish_group_message(msg)
+
+        asyncio.run(run())
+
+        # 没有 seq，contiguous 仍为 0，不应发送 ack
+        assert len(client._ack_calls) == 0

@@ -70,13 +70,30 @@ export class RPCTransport {
    * 返回初始 challenge 消息（如果有）。
    */
   async connect(url: string): Promise<RpcMessage | null> {
+    const ws = new WebSocket(url, this._verifySsl ? undefined : { rejectUnauthorized: false });
+    return this._connectWithWs(ws);
+  }
+
+  /**
+   * 内部：使用已创建的 WebSocket 实例完成握手。
+   * 握手阶段（open 后到首条消息处理完毕）如果发生 error 或解析失败，
+   * 会回滚 _ws / _closed，确保不留下半连接状态。
+   */
+  private _connectWithWs(ws: WebSocket): Promise<RpcMessage | null> {
     return new Promise<RpcMessage | null>((resolve, reject) => {
-      const ws = new WebSocket(url, this._verifySsl ? undefined : { rejectUnauthorized: false });
       let initialResolved = false;
+
+      /** 握手失败时回滚内部状态，避免半连接 */
+      const rollback = (): void => {
+        this._ws = null;
+        this._closed = true;
+        try { ws.close(); } catch { /* noop */ }
+      };
 
       ws.on('error', (err) => {
         if (!initialResolved) {
           initialResolved = true;
+          rollback();
           reject(new ConnectionError(`websocket connect failed: ${err.message}`));
         }
       });
@@ -105,6 +122,8 @@ export class RPCTransport {
               resolve(null);
             }
           } catch (err) {
+            // 握手消息解析失败：回滚状态，不留半连接
+            rollback();
             reject(err instanceof Error ? err : new SerializationError(String(err)));
           }
           return;
@@ -116,7 +135,7 @@ export class RPCTransport {
       const connectTimeout = setTimeout(() => {
         if (!initialResolved) {
           initialResolved = true;
-          ws.close();
+          rollback();
           reject(new ConnectionError('websocket connect timeout'));
         }
       }, 10_000);

@@ -2248,6 +2248,14 @@ export class AUNClient {
       }
     } catch (exc) {
       _clientLog('warn', '恢复 SeqTracker 状态失败: %s', formatCaughtError(exc));
+      // 通过内部 dispatcher 发布可观测事件，便于上层监控
+      this._dispatcher.publish('seq_tracker.persist_error', {
+        phase: 'restore',
+        aid: this._aid,
+        device_id: this._deviceId,
+        slot_id: this._slotId,
+        error: String(formatCaughtError(exc)),
+      }).catch(() => {});
     }
   }
 
@@ -2303,6 +2311,14 @@ export class AUNClient {
       }
     } catch (exc) {
       _clientLog('warn', '保存 SeqTracker 状态失败: %s', formatCaughtError(exc));
+      // 通过内部 dispatcher 发布可观测事件，便于上层监控
+      this._dispatcher.publish('seq_tracker.persist_error', {
+        phase: 'save',
+        aid: this._aid,
+        device_id: this._deviceId,
+        slot_id: this._slotId,
+        error: String(formatCaughtError(exc)),
+      }).catch(() => {});
     }
   }
 

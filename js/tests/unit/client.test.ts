@@ -512,3 +512,185 @@ describe('AUNClient 群补拉实例上下文', () => {
     }));
   });
 });
+
+// ── Task 1 针对性测试 ──────────────────────────────────────────
+
+describe('group.pull 拦截器：onPullResult 应消费原始消息', () => {
+  it('onPullResult 应在解密前被调用（传入原始密文消息）', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+
+    // 原始服务端消息（含 e2ee 密文）
+    const rawMsg = { seq: 5, group_id: 'g1', payload: { type: 'e2ee.group_v1', ciphertext: 'CIPHER' } };
+    // 解密后消息（payload 已替换）
+    const decryptedMsg = { seq: 5, group_id: 'g1', payload: { text: 'hello' } };
+
+    // mock transport.call 返回原始消息
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      messages: [rawMsg],
+      cursor: { current_seq: 5 },
+    });
+    // mock 解密：返回解密后消息
+    (client as any)._decryptGroupMessages = vi.fn().mockResolvedValue([decryptedMsg]);
+
+    // 捕获 onPullResult 的调用参数
+    const onPullResultSpy = vi.spyOn((client as any)._seqTracker, 'onPullResult');
+
+    await client.call('group.pull', { group_id: 'g1', after_message_seq: 0 });
+
+    // onPullResult 必须收到原始消息（rawMsg），而不是解密后的 decryptedMsg
+    expect(onPullResultSpy).toHaveBeenCalledWith(
+      'group:g1',
+      expect.arrayContaining([expect.objectContaining({ payload: rawMsg.payload })]),
+    );
+    // 确认解密后的消息不被传给 onPullResult
+    const callArgs = onPullResultSpy.mock.calls[0];
+    const passedMessages = callArgs[1] as any[];
+    expect(passedMessages[0].payload).toEqual(rawMsg.payload);
+    expect(passedMessages[0].payload).not.toEqual(decryptedMsg.payload);
+  });
+});
+
+describe('_fillGroupGap 不应重复调用 onPullResult', () => {
+  it('_fillGroupGap 调用 call(group.pull) 后不应再次调用 onPullResult', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._groupE2ee.hasSecret = vi.fn().mockResolvedValue(true);
+
+    const rawMsg = { seq: 3, group_id: 'g2', payload: { type: 'e2ee.group_v1', ciphertext: 'C' } };
+    const decryptedMsg = { seq: 3, group_id: 'g2', payload: { text: 'hi' } };
+
+    // mock transport.call（被 call() 拦截器调用）
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      messages: [rawMsg],
+      cursor: { current_seq: 3 },
+    });
+    (client as any)._decryptGroupMessages = vi.fn().mockResolvedValue([decryptedMsg]);
+
+    const onPullResultSpy = vi.spyOn((client as any)._seqTracker, 'onPullResult');
+    (client as any)._seqTracker.getContiguousSeq = vi.fn().mockReturnValue(2);
+
+    await (client as any)._fillGroupGap('g2');
+
+    // onPullResult 只能被调用一次（来自 call() 拦截器），不能被 _fillGroupGap 再调用一次
+    expect(onPullResultSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('_handleTransportDisconnect 应先停后台任务再启动重连', () => {
+  it('断线时应先调用 _stopBackgroundTasks 再启动重连循环', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._sessionOptions = {
+      auto_reconnect: true,
+      heartbeat_interval: 30,
+      token_refresh_before: 60,
+      retry: { initial_delay: 0.5, max_delay: 30, max_attempts: 0 },
+      timeouts: { connect: 5, call: 10, http: 30 },
+    };
+
+    const callOrder: string[] = [];
+    vi.spyOn(client as any, '_stopBackgroundTasks').mockImplementation(() => {
+      callOrder.push('stop');
+    });
+    vi.spyOn(client as any, '_safeAsync').mockImplementation(() => {
+      callOrder.push('reconnect');
+    });
+    vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+
+    await (client as any)._handleTransportDisconnect(new Error('network error'));
+
+    // stop 必须在 reconnect 之前
+    const stopIdx = callOrder.indexOf('stop');
+    const reconnectIdx = callOrder.indexOf('reconnect');
+    expect(stopIdx).toBeGreaterThanOrEqual(0);
+    expect(reconnectIdx).toBeGreaterThanOrEqual(0);
+    expect(stopIdx).toBeLessThan(reconnectIdx);
+  });
+});
+
+describe('_connectOnce 应等待 _restoreSeqTrackerState 完成后再调用 transport.connect', () => {
+  it('_restoreSeqTrackerState 应在 transport.connect 之前完成', async () => {
+    const client = new AUNClient();
+
+    const callOrder: string[] = [];
+    // mock _restoreSeqTrackerState 为异步（返回 Promise）
+    vi.spyOn(client as any, '_restoreSeqTrackerState').mockImplementation(async () => {
+      // 模拟异步 IO
+      await new Promise(resolve => setTimeout(resolve, 0));
+      callOrder.push('restore');
+    });
+    vi.spyOn((client as any)._transport, 'connect').mockImplementation(async () => {
+      callOrder.push('connect');
+      return { nonce: 'challenge' };
+    });
+    (client as any)._auth.initializeWithToken = vi.fn().mockResolvedValue(undefined);
+    (client as any)._syncIdentityAfterConnect = vi.fn().mockResolvedValue(undefined);
+    (client as any)._startBackgroundTasks = vi.fn();
+    (client as any)._uploadPrekey = vi.fn().mockResolvedValue({ ok: true });
+
+    await client.connect({
+      access_token: 'tok-1',
+      gateway: 'ws://gateway.example.com/aun',
+    });
+
+    // restore 必须在 connect 之前完成
+    const restoreIdx = callOrder.indexOf('restore');
+    const connectIdx = callOrder.indexOf('connect');
+    expect(restoreIdx).toBeGreaterThanOrEqual(0);
+    expect(connectIdx).toBeGreaterThanOrEqual(0);
+    expect(restoreIdx).toBeLessThan(connectIdx);
+  });
+});
+
+describe('AUNClient SeqTracker 持久化错误事件', () => {
+  it('_saveSeqTrackerState 异步失败时应发布 seq_tracker.persist_error', async () => {
+    const client = new AUNClient();
+    const publishSpy = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-1';
+    (client as any)._seqTracker.onMessageSeq('p2p:test.aid.com', 1);
+    (client as any)._seqTracker.onMessageSeq('p2p:test.aid.com', 2);
+
+    const ks = (client as any)._keystore;
+    vi.spyOn(ks, 'saveSeq').mockRejectedValue(new Error('disk full'));
+
+    (client as any)._saveSeqTrackerState();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(publishSpy).toHaveBeenCalledWith('seq_tracker.persist_error', expect.objectContaining({
+      phase: 'save',
+      aid: 'test.aid.com',
+      device_id: 'dev-1',
+      slot_id: 'slot-1',
+      error: expect.any(String),
+    }));
+  });
+
+  it('_restoreSeqTrackerState 失败时应发布 seq_tracker.persist_error', async () => {
+    const client = new AUNClient();
+    const publishSpy = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-1';
+    (client as any)._seqTrackerContext = JSON.stringify(['test.aid.com', 'dev-1', 'slot-1']);
+
+    const ks = (client as any)._keystore;
+    vi.spyOn(ks, 'loadAllSeqs').mockRejectedValue(new Error('db corrupted'));
+
+    await (client as any)._restoreSeqTrackerState();
+
+    expect(publishSpy).toHaveBeenCalledWith('seq_tracker.persist_error', expect.objectContaining({
+      phase: 'restore',
+      aid: 'test.aid.com',
+      device_id: 'dev-1',
+      slot_id: 'slot-1',
+      error: expect.any(String),
+    }));
+  });
+});

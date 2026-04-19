@@ -404,3 +404,73 @@ class TestReconnectAttemptInfo:
         # attempt 递增
         attempts = [e.get("attempt") for e in reconnect_events[:3]]
         assert attempts == [1, 2, 3]
+
+
+class TestReconnectStopsBackgroundTasksFirst:
+    """reconnect 前必须先停止后台任务，再关闭 transport / 进入重连。"""
+
+    @pytest.mark.asyncio
+    async def test_background_tasks_stopped_before_reconnect(self):
+        """断线时，后台任务（心跳/token刷新等）必须在重连前被取消。"""
+        client = _make_client(auto_reconnect=True)
+
+        # 创建一个模拟的后台任务（永不结束）
+        stop_order: list[str] = []
+
+        async def _long_running():
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                stop_order.append("background_task_cancelled")
+                raise
+
+        # 注入一个"正在运行"的后台任务，并让它先启动到第一个 await 点
+        client._heartbeat_task = asyncio.create_task(_long_running())
+        await asyncio.sleep(0)  # 让任务运行到 await asyncio.sleep(100)
+
+        async def mock_reconnect():
+            stop_order.append("reconnect_called")
+            client._state = "connected"
+
+        client._invoke_reconnect_connect_once = mock_reconnect
+
+        await client._handle_transport_disconnect(None)
+        await asyncio.sleep(0.2)
+
+        # 后台任务必须在 reconnect 之前被取消
+        assert "background_task_cancelled" in stop_order
+        assert "reconnect_called" in stop_order
+        cancelled_idx = stop_order.index("background_task_cancelled")
+        reconnect_idx = stop_order.index("reconnect_called")
+        assert cancelled_idx < reconnect_idx, (
+            f"后台任务取消（{cancelled_idx}）必须在 reconnect（{reconnect_idx}）之前发生"
+        )
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_task_not_running_after_reconnect_starts(self):
+        """重连开始后，心跳任务不应继续运行。"""
+        client = _make_client(auto_reconnect=True)
+
+        heartbeat_ran_after_disconnect = []
+
+        async def _fake_heartbeat():
+            try:
+                await asyncio.sleep(100)
+                heartbeat_ran_after_disconnect.append("ran")
+            except asyncio.CancelledError:
+                raise
+
+        client._heartbeat_task = asyncio.create_task(_fake_heartbeat())
+
+        async def mock_reconnect():
+            client._state = "connected"
+
+        client._invoke_reconnect_connect_once = mock_reconnect
+
+        await client._handle_transport_disconnect(None)
+        await asyncio.sleep(0.2)
+
+        # 心跳任务应已被取消，不应继续运行
+        assert heartbeat_ran_after_disconnect == []
+        # 心跳任务引用应已清空
+        assert client._heartbeat_task is None

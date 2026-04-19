@@ -902,6 +902,17 @@ class AUNClient:
 
             decrypted = await self._decrypt_single_message(msg, source="push")
             if decrypted is None:
+                # 解密返回 None（replay guard 判定重复或解密失败），不投递消息，
+                # 但 SeqTracker 已推进 contiguous，仍需 auto-ack 避免服务端重推。
+                if seq is not None and self._aid:
+                    contig = self._seq_tracker.get_contiguous_seq(ns)
+                    if contig > 0:
+                        try:
+                            await self._transport.call("message.ack", {
+                                "seq": contig, "device_id": self._device_id,
+                            })
+                        except Exception as _ack_exc:
+                            _client_log.debug("P2P auto-ack（解密None）失败: %s", _ack_exc)
                 return
             # 记录已推送的 seq，补洞路径据此去重
             if seq is not None and self._aid:
@@ -920,6 +931,16 @@ class AUNClient:
                         _client_log.debug("P2P auto-ack 失败: %s", _ack_exc)
         except Exception as _exc:
             _client_log.warning("P2P push 处理失败: %s", _exc)
+            if isinstance(data, dict) and data.get("seq") is not None and self._aid:
+                _exc_ns = f"p2p:{self._aid}"
+                _exc_contig = self._seq_tracker.get_contiguous_seq(_exc_ns)
+                if _exc_contig > 0:
+                    try:
+                        await self._transport.call("message.ack", {
+                            "seq": _exc_contig, "device_id": self._device_id,
+                        })
+                    except Exception as _ack_exc:
+                        _client_log.debug("P2P auto-ack（异常路径）失败: %s", _ack_exc)
             # H26: 解密失败不再投递原始密文 payload（避免元数据泄漏 + 语义混淆），
             # 改为发布 message.undecryptable 事件，仅携带安全的 header 信息。
             if isinstance(data, dict):
@@ -1084,6 +1105,21 @@ class AUNClient:
                     "_decrypt_error": str(_exc),
                 }
                 await self._dispatcher.publish("group.message_undecryptable", safe_event)
+                # 解密失败时，SeqTracker 已推进 contiguous，仍需 auto-ack 避免服务端重推
+                _exc_group_id = data.get("group_id", "")
+                _exc_seq = data.get("seq")
+                if _exc_group_id and _exc_seq is not None:
+                    _exc_ns = f"group:{_exc_group_id}"
+                    _exc_contig = self._seq_tracker.get_contiguous_seq(_exc_ns)
+                    if _exc_contig > 0:
+                        try:
+                            await self._transport.call("group.ack_messages", {
+                                "group_id": _exc_group_id, "msg_seq": _exc_contig,
+                                "device_id": self._device_id,
+                            })
+                        except Exception as _ack_exc:
+                            _client_log.debug("群消息 auto-ack（解密失败）失败: group=%s %s",
+                                              _exc_group_id, _ack_exc)
 
     async def _auto_pull_group_messages(self, notification: dict[str, Any]) -> None:
         """收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息。"""
@@ -1933,6 +1969,7 @@ class AUNClient:
         loop.create_task(self._sync_all_groups_once())
 
     async def _stop_background_tasks(self) -> None:
+        current_task = asyncio.current_task()
         for attr in ("_heartbeat_task", "_token_refresh_task", "_prekey_refresh_task",
                       "_group_epoch_rotate_task", "_group_epoch_cleanup_task",
                       "_cache_cleanup_task"):
@@ -1940,6 +1977,9 @@ class AUNClient:
             if task is None:
                 continue
             task.cancel()
+            if task is current_task:
+                setattr(self, attr, None)
+                continue
             try:
                 await task
             except asyncio.CancelledError:
@@ -2498,6 +2538,7 @@ class AUNClient:
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
+        await self._stop_background_tasks()
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:

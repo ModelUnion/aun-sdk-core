@@ -633,13 +633,16 @@ export class AUNClient {
     if (method === 'group.pull' && isJsonObject(result)) {
       const r = result;
       const messages = r.messages;
+      // 先保存原始消息（解密前），用于喂 SeqTracker（与 P2P message.pull 路径对齐）
+      const rawMessages = Array.isArray(messages) ? [...messages] : [];
       if (Array.isArray(messages) && messages.length) {
         r.messages = await this._decryptGroupMessages(messages.filter(isJsonObject) as Message[]);
       }
       const gid = (p.group_id ?? '') as string;
       if (gid) {
         const ns = `group:${gid}`;
-        this._seqTracker.onPullResult(ns, (Array.isArray(r.messages) ? r.messages : []).filter(isJsonObject));
+        // ⚠️ 使用原始消息（rawMessages）喂 SeqTracker，与 P2P message.pull 路径一致
+        this._seqTracker.onPullResult(ns, rawMessages.filter(isJsonObject));
         // ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
         // 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
         // 与 S2 [1,seq-1] 历史 gap 配合使用，force_contiguous_seq 是跳过空洞的唯一手段。
@@ -920,7 +923,7 @@ export class AUNClient {
       if (isJsonObject(result)) {
         const messages = result.messages;
         if (Array.isArray(messages)) {
-          this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          // ⚠️ 不再重复调用 onPullResult：call('group.pull') 拦截器已在内部调用过一次
           // pushedSeqs 去重：跳过已通过推送路径分发的消息
           const pushed = this._pushedSeqs.get(ns);
           for (const msg of messages) {
@@ -967,7 +970,7 @@ export class AUNClient {
       if (isJsonObject(result)) {
         const messages = result.messages;
         if (Array.isArray(messages)) {
-          this._seqTracker.onPullResult(ns, messages.filter(isJsonObject));
+          // ⚠️ 不再重复调用 onPullResult：call('group.pull') 拦截器已在内部调用过一次
           const pushed = this._pushedSeqs.get(ns);
           for (const msg of messages) {
             if (isJsonObject(msg)) {
@@ -2269,7 +2272,7 @@ export class AUNClient {
     // 前置 restore：在 _transport.connect 启动 reader 之前完成，
     // 避免 reader 把积压 push 交给空 tracker 的 handler，触发 S2 历史 gap 误补拉。
     this._refreshSeqTrackerContext();
-    this._restoreSeqTrackerState();
+    await this._restoreSeqTrackerState();
 
     const challenge = await this._transport.connect(gatewayUrl);
 
@@ -2320,7 +2323,7 @@ export class AUNClient {
     // auth 阶段 aid 可能被 identity 覆盖；若 context 发生变化，重新 refresh + restore。
     if (this._seqTrackerContext !== this._currentSeqTrackerContext()) {
       this._refreshSeqTrackerContext();
-      this._restoreSeqTrackerState();
+      await this._restoreSeqTrackerState();
     }
 
     this._startBackgroundTasks();
@@ -2706,6 +2709,8 @@ export class AUNClient {
   private async _handleTransportDisconnect(error: Error | null): Promise<void> {
     if (this._closing || this._state === 'closed') return;
     this._state = 'disconnected';
+    // 先停止后台任务，避免心跳/token刷新在重连期间继续触发
+    this._stopBackgroundTasks();
     await this._dispatcher.publish('connection.state', {
       state: this._state,
       error,
@@ -2808,8 +2813,8 @@ export class AUNClient {
 
   // ── 内部：工具方法 ────────────────────────────────
 
-  /** 从 keystore 恢复 SeqTracker 状态 */
-  private _restoreSeqTrackerState(): void {
+  /** 从 keystore 恢复 SeqTracker 状态（真正可 await，确保在 transport.connect 前完成） */
+  private async _restoreSeqTrackerState(): Promise<void> {
     if (!this._aid) return;
     const context = this._seqTrackerContext;
     if (!context) return;
@@ -2820,29 +2825,33 @@ export class AUNClient {
       // 优先从 seq_tracker 表按行读取
       const loadAll = this._keystore.loadAllSeqs?.bind(this._keystore);
       if (typeof loadAll === 'function') {
-        const pending = loadAll(aid, deviceId, slotId);
-        pending.then((state) => {
-          if (this._seqTrackerContext !== context) return;
-          if (state && typeof state === 'object' && Object.keys(state).length > 0) {
-            this._seqTracker.restoreState(state);
-          }
-        }).catch(() => {});
+        const state = await loadAll(aid, deviceId, slotId);
+        if (this._seqTrackerContext !== context) return;
+        if (state && typeof state === 'object' && Object.keys(state).length > 0) {
+          this._seqTracker.restoreState(state);
+        }
         return;
       }
       // fallback: 从旧 instance_state JSON blob 恢复
       const loader = this._keystore.loadInstanceState?.bind(this._keystore);
       if (typeof loader !== 'function') return;
-      const pending = loader(aid, deviceId, slotId);
-      pending.then((stateHolder) => {
-        if (this._seqTrackerContext !== context) return;
-        if (stateHolder && typeof stateHolder === 'object') {
-          const state = (stateHolder as Record<string, JsonValue>).seq_tracker_state;
-          if (isJsonObject(state)) {
-            this._seqTracker.restoreState(state as Record<string, number>);
-          }
+      const stateHolder = await loader(aid, deviceId, slotId);
+      if (this._seqTrackerContext !== context) return;
+      if (stateHolder && typeof stateHolder === 'object') {
+        const state = (stateHolder as Record<string, JsonValue>).seq_tracker_state;
+        if (isJsonObject(state)) {
+          this._seqTracker.restoreState(state as Record<string, number>);
         }
+      }
+    } catch (exc) {
+      this._dispatcher.publish('seq_tracker.persist_error', {
+        phase: 'restore',
+        aid,
+        device_id: deviceId,
+        slot_id: slotId,
+        error: String(exc),
       }).catch(() => {});
-    } catch { /* 忽略 */ }
+    }
   }
 
   private _currentSeqTrackerContext(): string | null {
@@ -2876,7 +2885,15 @@ export class AUNClient {
       const saveFn = this._keystore.saveSeq?.bind(this._keystore);
       if (typeof saveFn === 'function') {
         for (const [ns, seq] of Object.entries(state)) {
-          saveFn(this._aid, this._deviceId, this._slotId, ns, seq).catch(() => {});
+          saveFn(this._aid, this._deviceId, this._slotId, ns, seq).catch((exc) => {
+            this._dispatcher.publish('seq_tracker.persist_error', {
+              phase: 'save',
+              aid: this._aid,
+              device_id: this._deviceId,
+              slot_id: this._slotId,
+              error: String(exc),
+            }).catch(() => {});
+          });
         }
         return;
       }
@@ -2885,9 +2902,25 @@ export class AUNClient {
         this._keystore.updateInstanceState(this._aid, this._deviceId, this._slotId, (current) => {
           (current as Record<string, JsonValue>).seq_tracker_state = state as unknown as JsonValue;
           return current;
-        }).catch(() => {});
+        }).catch((exc) => {
+          this._dispatcher.publish('seq_tracker.persist_error', {
+            phase: 'save',
+            aid: this._aid,
+            device_id: this._deviceId,
+            slot_id: this._slotId,
+            error: String(exc),
+          }).catch(() => {});
+        });
       }
-    } catch { /* 忽略 */ }
+    } catch (exc) {
+      this._dispatcher.publish('seq_tracker.persist_error', {
+        phase: 'save',
+        aid: this._aid,
+        device_id: this._deviceId,
+        slot_id: this._slotId,
+        error: String(exc),
+      }).catch(() => {});
+    }
   }
 
   /** 发布 E2EE 编排错误事件 */

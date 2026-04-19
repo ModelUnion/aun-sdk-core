@@ -409,3 +409,86 @@ def test_data_survives_close_reopen(tmp_path):
     assert db2.get_token("access_token") == "persistent-token"
     assert "pk-1" in db2.load_prekeys()
     db2.close()
+
+
+# ── _get_conn 早期抛错不触发 UnboundLocalError ────────────────
+
+
+def test_get_conn_open_and_init_raises_immediately_no_unbound_error(tmp_path, monkeypatch):
+    """_open_and_init() 直接抛出异常时，_get_conn() 不应触发 UnboundLocalError。
+
+    Bug 场景：_open_and_init() 在赋值 conn = ... 之前就抛出，
+    except 块中 conn.close() 引用未定义的 conn，导致 UnboundLocalError 掩盖原始异常。
+    修复后应直接抛出原始异常（RuntimeError），而不是 UnboundLocalError。
+    """
+    db = _make_db(tmp_path)
+
+    original_error = RuntimeError("模拟 _open_and_init 早期失败")
+
+    def _open_and_init_raises():
+        raise original_error
+
+    monkeypatch.setattr(db, "_open_and_init", _open_and_init_raises)
+
+    # 应抛出原始异常，而不是 UnboundLocalError
+    with pytest.raises(RuntimeError, match="模拟 _open_and_init 早期失败"):
+        db._get_conn()
+
+
+def test_get_conn_unbound_error_not_raised_on_non_recoverable(tmp_path, monkeypatch):
+    """非可恢复错误时，_get_conn() 应直接 raise 原始异常，不触发 UnboundLocalError。"""
+    db = _make_db(tmp_path)
+
+    class _SpecificError(Exception):
+        pass
+
+    def _open_and_init_raises():
+        raise _SpecificError("hmac check failed")
+
+    monkeypatch.setattr(db, "_open_and_init", _open_and_init_raises)
+
+    # 应抛出 _SpecificError，而不是 UnboundLocalError
+    with pytest.raises(_SpecificError):
+        db._get_conn()
+
+
+def test_open_and_init_logs_close_failure(tmp_path, monkeypatch, caplog):
+    db = _make_db(tmp_path)
+
+    class _FakeConn:
+        def execute(self, _sql):
+            raise RuntimeError("boom during init")
+
+        def close(self):
+            raise RuntimeError("close failed")
+
+    from aun_core.keystore import sqlcipher_db as module
+
+    monkeypatch.setattr(module._sqlite_mod, "connect", lambda *args, **kwargs: _FakeConn())
+
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(RuntimeError, match="boom during init"):
+            db._open_and_init_once(exclusive_locking=False)
+
+    assert "关闭失败连接时出错: close failed" in caplog.text
+
+
+def test_retry_on_locked_logs_close_failure(tmp_path, caplog):
+    db = _make_db(tmp_path)
+
+    class _FakeConn:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    db._conn = _FakeConn()
+    db._cleanup_broken_files = lambda: None
+
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(RuntimeError, match="database disk image is malformed"):
+            db._retry_on_locked(
+                lambda: (_ for _ in ()).throw(RuntimeError("database disk image is malformed")),
+                max_retries=2,
+                delay=0,
+            )
+
+    assert "关闭失败连接时出错: close failed" in caplog.text

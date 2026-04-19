@@ -1472,3 +1472,64 @@ async def test_restore_after_aid_change_during_auth():
     )
 
     assert restore_count["n"] == 2, f"expected 2 restores, got {restore_count['n']}"
+
+
+# ── P2P push 解密失败仍应 auto-ack ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_p2p_push_decrypt_failure_still_auto_acks():
+    """P2P push 解密返回 None 时，若 SeqTracker 已推进 contiguous，仍应发送 message.ack。
+
+    Bug 场景：_decrypt_single_message 返回 None（replay guard 判定重复或解密失败），
+    代码直接 return，auto-ack 代码在 return 之后，导致 contiguous 已推进但 ack 未发送。
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    client = AUNClient({"aun_path": "/tmp/test_ack_on_decrypt_fail"})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+
+    # 记录 transport.call 的调用
+    ack_calls: list[dict] = []
+
+    async def fake_transport_call(method, params):
+        if method == "message.ack":
+            ack_calls.append({"method": method, "params": params})
+        return {}
+
+    client._transport.call = fake_transport_call
+
+    # 模拟解密返回 None（replay guard 判定重复）
+    async def fake_decrypt_single(msg, source=None):
+        return None  # 返回 None 表示解密失败/重复消息
+
+    client._decrypt_single_message = fake_decrypt_single
+
+    # 模拟群组密钥消息拦截（返回 False，不拦截）
+    async def fake_try_handle_group_key(msg):
+        return False
+
+    client._try_handle_group_key_message = fake_try_handle_group_key
+
+    # 发送 seq=1 的消息（contiguous 会从 0 推进到 1）
+    msg = {
+        "message_id": "msg-1",
+        "from": "bob.aid.com",
+        "to": "alice.aid.com",
+        "seq": 1,
+        "payload": {"type": "e2ee.encrypted", "data": "ENCRYPTED"},
+        "timestamp": 1000,
+    }
+
+    await client._process_and_publish_message(msg)
+
+    # contiguous 应已推进到 1
+    ns = "p2p:alice.aid.com"
+    assert client._seq_tracker.get_contiguous_seq(ns) == 1
+
+    # 即使解密返回 None，也应发送 message.ack
+    assert len(ack_calls) == 1, f"期望 1 次 ack，实际 {len(ack_calls)} 次: {ack_calls}"
+    assert ack_calls[0]["params"]["seq"] == 1
