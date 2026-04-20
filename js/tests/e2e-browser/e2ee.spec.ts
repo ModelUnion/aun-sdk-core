@@ -85,7 +85,7 @@ test.describe('Browser SDK 基础功能', () => {
 
   test('SDK 加载成功，版本号正确', async ({ page }) => {
     const version = await page.evaluate(() => (window as any).AUN.__version__);
-    expect(version).toBe('0.2.0');
+    expect(version).toBe('0.2.5');
   });
 
   test('所有核心导出存在', async ({ page }) => {

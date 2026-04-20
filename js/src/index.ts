@@ -1,6 +1,6 @@
 // ── @aun/core-browser 包入口 ──────────────────────────────
 
-export const __version__ = '0.2.0';
+export const __version__ = '0.2.5';
 
 // 客户端
 export { AUNClient } from './client.js';
