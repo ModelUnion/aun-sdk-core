@@ -753,6 +753,172 @@ async def test_rpc_close_stops_stream():
         await client.close()
 
 
+async def test_header_query_token_compat_matrix():
+    """Token 通过 HTTP header 和 query 参数两种方式均可鉴权"""
+    client = _make_client()
+    try:
+        aid = await _ensure_connected(client, _ALICE_AID)
+        result = await client.call("stream.create", {
+            "content_type": "text/plain",
+            "buffer_size": 10,
+        })
+        stream_id = result["stream_id"]
+        push_url = result["push_url"]
+        pull_url = result["pull_url"]
+        push_token = result.get("push_token", "")
+        pull_token = result.get("pull_token", "")
+
+        # --- 场景 1: push_token via query, pull_token via header ---
+        # push via query（在 URL 上附加 token）
+        push_base = _localize_url(push_url, ws=True)
+        sep = "&" if "?" in push_base else "?"
+        push_url_with_query = f"{push_base}{sep}token={push_token}"
+        ssl_ctx = _nossl_ctx() if push_url_with_query.startswith("wss") else None
+        async with websockets.connect(push_url_with_query, ssl=ssl_ctx, max_size=64*1024*1024) as ws:
+            await ws.send(json.dumps({"cmd": "data", "data": "query_push", "seq": 1}))
+            await ws.send(json.dumps({"cmd": "close"}))
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=2)
+            except Exception:
+                pass
+
+        # pull via header
+        pull_base = _localize_url(pull_url)
+        headers = {"Authorization": f"Bearer {pull_token}"}
+        frames1 = []
+        async with aiohttp.ClientSession() as session:
+            ssl_ctx_h = _nossl_ctx() if pull_base.startswith("https") else None
+            async with session.get(pull_base, headers=headers, ssl=ssl_ctx_h, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                assert resp.status == 200, f"pull header auth 失败: {resp.status}"
+                async for line in resp.content:
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if text.startswith("data:"):
+                        try:
+                            frames1.append(json.loads(text[5:].strip()))
+                        except Exception:
+                            pass
+
+        data_frames1 = [f for f in frames1 if f.get("data") == "query_push"]
+        assert len(data_frames1) >= 1, "场景1: pull via header 未收到数据"
+        print(f"  [OK] 场景1: push_token query + pull_token header")
+
+        # --- 场景 2: push_token via extra_headers, pull_token via query ---
+        result2 = await client.call("stream.create", {
+            "content_type": "text/plain",
+            "buffer_size": 10,
+        })
+        push_url2 = result2["push_url"]
+        pull_url2 = result2["pull_url"]
+        push_token2 = result2.get("push_token", "")
+        pull_token2 = result2.get("pull_token", "")
+
+        # push via extra_headers
+        push_base2 = _localize_url(push_url2, ws=True)
+        ssl_ctx2 = _nossl_ctx() if push_base2.startswith("wss") else None
+        extra_headers = {"Authorization": f"Bearer {push_token2}"}
+        async with websockets.connect(push_base2, ssl=ssl_ctx2, extra_headers=extra_headers, max_size=64*1024*1024) as ws:
+            await ws.send(json.dumps({"cmd": "data", "data": "header_push", "seq": 1}))
+            await ws.send(json.dumps({"cmd": "close"}))
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=2)
+            except Exception:
+                pass
+
+        # pull via query
+        pull_base2 = _localize_url(pull_url2)
+        sep2 = "&" if "?" in pull_base2 else "?"
+        pull_url_with_query = f"{pull_base2}{sep2}token={pull_token2}"
+        frames2 = []
+        async with aiohttp.ClientSession() as session:
+            ssl_ctx_q = _nossl_ctx() if pull_url_with_query.startswith("https") else None
+            async with session.get(pull_url_with_query, ssl=ssl_ctx_q, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                assert resp.status == 200, f"pull query auth 失败: {resp.status}"
+                async for line in resp.content:
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if text.startswith("data:"):
+                        try:
+                            frames2.append(json.loads(text[5:].strip()))
+                        except Exception:
+                            pass
+
+        data_frames2 = [f for f in frames2 if f.get("data") == "header_push"]
+        assert len(data_frames2) >= 1, "场景2: pull via query 未收到数据"
+        print(f"  [OK] 场景2: push_token header + pull_token query")
+
+        print(f"  [OK] Token header/query 兼容矩阵全部通过")
+    finally:
+        await client.close()
+
+
+async def test_high_concurrency_pullers():
+    """20+ 并发 puller 同时拉取 100 chunks，验证完整性和顺序"""
+    client = _make_client()
+    NUM_PULLERS = 20
+    NUM_CHUNKS = 100
+    try:
+        aid = await _ensure_connected(client, _ALICE_AID)
+        result = await client.call("stream.create", {
+            "content_type": "text/plain",
+            "buffer_size": NUM_CHUNKS + 50,
+        })
+        push_url = result["push_url"]
+        pull_url = result["pull_url"]
+
+        # 启动 20 个 puller
+        pull_tasks = []
+        for i in range(NUM_PULLERS):
+            task = asyncio.create_task(
+                _pull_sse(pull_url, timeout=30, stop_after_frames=NUM_CHUNKS + 1)
+            )
+            pull_tasks.append(task)
+
+        await asyncio.sleep(0.5)  # 等待 puller 连接建立
+
+        # 推送 100 chunks
+        url = _localize_url(push_url, ws=True)
+        ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
+        async with websockets.connect(url, ssl=ssl_ctx, max_size=64*1024*1024) as ws:
+            for seq in range(1, NUM_CHUNKS + 1):
+                frame = json.dumps({"cmd": "data", "data": f"chunk_{seq}", "seq": seq})
+                await ws.send(frame)
+            await ws.send(json.dumps({"cmd": "close"}))
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=2)
+            except Exception:
+                pass
+
+        # 收集所有 puller 结果
+        results = await asyncio.gather(*pull_tasks, return_exceptions=True)
+
+        success_count = 0
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                print(f"  [WARN] puller#{i} 异常: {r}")
+                continue
+            data_frames = [f for f in r if f.get("event") == "message" or "data" in f]
+            # 过滤出有效数据帧（排除 done 帧）
+            valid = [f for f in r if f.get("data", "").startswith("chunk_")]
+            if len(valid) >= NUM_CHUNKS:
+                # 验证顺序
+                seqs = [int(f["data"].split("_")[1]) for f in valid[:NUM_CHUNKS]]
+                expected = list(range(1, NUM_CHUNKS + 1))
+                if seqs == expected:
+                    success_count += 1
+                else:
+                    print(f"  [WARN] puller#{i} 顺序错乱: 前5={seqs[:5]}")
+            else:
+                print(f"  [WARN] puller#{i} 只收到 {len(valid)}/{NUM_CHUNKS} chunks")
+
+        # 至少 80% 的 puller 成功收到完整有序数据
+        min_success = int(NUM_PULLERS * 0.8)
+        assert success_count >= min_success, \
+            f"高并发 puller 成功率不足: {success_count}/{NUM_PULLERS} (需 >= {min_success})"
+
+        print(f"  [OK] 高并发 puller: {success_count}/{NUM_PULLERS} 成功收到 {NUM_CHUNKS} chunks")
+    finally:
+        await client.close()
+
+
 # ---------------------------------------------------------------------------
 # 测试运行器
 # ---------------------------------------------------------------------------
@@ -774,6 +940,8 @@ async def run_all():
         ("list_active 列表", test_stream_list_active),
         ("并发多流", test_concurrent_streams),
         ("RPC close 关闭", test_rpc_close_stops_stream),
+        ("Token header/query 兼容矩阵", test_header_query_token_compat_matrix),
+        ("高并发 puller", test_high_concurrency_pullers),
     ]
 
     print(f"\n{'='*60}")

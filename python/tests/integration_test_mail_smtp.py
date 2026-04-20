@@ -436,12 +436,26 @@ _app_password = None  # 在测试开始前创建
 async def _create_app_password(alice: AUNClient):
     """创建应用专用密码供 IMAP/SMTP AUTH 测试使用"""
     global _app_password
-    result = await alice.call("mail.create_app_password", {"name": "test-imap"})
-    if result.get("ok"):
-        _app_password = result.get("password")
-        print(f"  [INFO] 创建应用专用密码: {_app_password[:8]}...")
-    else:
-        print(f"  [WARN] 创建应用专用密码失败: {result}")
+    try:
+        result = await alice.call("mail.create_app_password", {"name": "test-imap"})
+        if result.get("ok"):
+            _app_password = result.get("password")
+            print(f"  [INFO] 创建应用专用密码: {_app_password[:8]}...")
+        else:
+            print(f"  [WARN] 创建应用专用密码失败: {result}")
+    except Exception as e:
+        err_msg = str(e)
+        if "已达到应用专用密码上限" in err_msg:
+            print(f"  [INFO] 应用专用密码已达上限，尝试列出现有密码...")
+            try:
+                list_result = await alice.call("mail.list_app_passwords", {})
+                passwords = list_result.get("passwords", [])
+                print(f"  [WARN] 已有 {len(passwords)} 个应用专用密码，但无法获取明文。IMAP/SMTP 测试将被跳过。")
+                print(f"  [HINT] 请手动撤销部分密码后重试，或使用已知的应用专用密码。")
+            except Exception:
+                print(f"  [WARN] 无法列出现有密码: {e}")
+        else:
+            print(f"  [WARN] 创建应用专用密码失败: {e}")
 
 
 def test_imap_login_success():

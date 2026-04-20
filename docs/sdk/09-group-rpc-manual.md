@@ -58,8 +58,49 @@
 | 方法 | 说明 |
 |------|------|
 | [group.send](#groupsend) | 发送群消息 |
-| [group.pull](#grouppull) | 增量拉取 |
-| [group.ack](#groupack) | 确认已读 |
+| [group.pull](#grouppull) | 增量拉取消息 |
+| [group.pull_events](#grouppull_events) | 增量拉取事件 |
+| [group.ack](#groupack) | 确认已读（旧接口，等同 ack_messages） |
+| [group.ack_messages](#groupack_messages) | 确认消息游标 |
+| [group.ack_events](#groupack_events) | 确认事件游标 |
+| [group.get_cursor](#groupget_cursor) | 获取双游标状态 |
+
+### 多设备管理
+
+| 方法 | 说明 |
+|------|------|
+| [group.list_devices](#grouplist_devices) | 列出设备列表 |
+| [group.unregister_device](#groupunregister_device) | 注销设备 |
+
+### 管理员与成员类型
+
+| 方法 | 说明 |
+|------|------|
+| [group.get_admins](#groupget_admins) | 获取管理员列表 |
+| [group.get_master](#groupget_master) | 获取群主信息 |
+| [group.set_fixed_agents](#groupset_fixed_agents) | 设置固定值班 Agent |
+| [group.refresh_member_types](#grouprefresh_member_types) | 刷新成员类型统计 |
+
+### 统计与指标
+
+| 方法 | 说明 |
+|------|------|
+| [group.get_summary](#groupget_summary) | 获取群组摘要 |
+| [group.get_metrics](#groupget_metrics) | 获取性能指标 |
+
+### E2EE
+
+| 方法 | 说明 |
+|------|------|
+| [group.e2ee.rotate_epoch](#groupe2eerotate_epoch) | 轮换 E2EE 纪元 |
+| [group.e2ee.get_epoch](#groupe2eeget_epoch) | 获取当前 E2EE 纪元 |
+
+### 跨域
+
+| 方法 | 说明 |
+|------|------|
+| [group.relay_event](#grouprelay_event) | 跨域事件中继 |
+| [group.get_duty_access](#groupget_duty_access) | 获取值班日志访问凭证 |
 
 ### 公告与规则
 
@@ -119,42 +160,6 @@
 | [group.update_duty_config](#groupupdate_duty_config) | 更新值班配置 |
 | [group.get_duty_status](#groupget_duty_status) | 获取值班状态 |
 | [group.transfer_duty](#grouptransfer_duty) | 手动交班 |
-
-### 多设备游标
-
-| 方法 | 说明 |
-|------|------|
-| [group.pull_events](#grouppull_events) | 增量拉取群事件（多设备） |
-| [group.ack_messages](#groupack_messages) | 确认消息游标（多设备） |
-| [group.ack_events](#groupack_events) | 确认事件游标（多设备） |
-| [group.get_cursor](#groupget_cursor) | 查询设备游标状态 |
-| [group.list_devices](#grouplist_devices) | 列出当前用户设备 |
-| [group.unregister_device](#groupunregister_device) | 注销设备游标 |
-
-### 管理辅助
-
-| 方法 | 说明 |
-|------|------|
-| [group.get_admins](#groupget_admins) | 获取管理员列表 |
-| [group.get_master](#groupget_master) | 获取群主 AID |
-| [group.get_summary](#groupget_summary) | 获取群组综合摘要 |
-| [group.get_metrics](#groupget_metrics) | 获取群组性能指标（管理员） |
-| [group.refresh_member_types](#grouprefresh_member_types) | 刷新成员类型统计 |
-| [group.set_fixed_agents](#groupset_fixed_agents) | 设置固定值班 Agent |
-| [group.get_duty_access](#groupget_duty_access) | 获取值班日志访问凭证 |
-
-### E2EE
-
-| 方法 | 说明 |
-|------|------|
-| [group.e2ee.rotate_epoch](#groupe2eerotate_epoch) | 轮换 E2EE Epoch |
-| [group.e2ee.get_epoch](#groupe2eeget_epoch) | 获取当前 E2EE Epoch |
-
-### 跨域
-
-| 方法 | 说明 |
-|------|------|
-| [group.relay_event](#grouprelay_event) | 跨域事件中继（内部） |
 
 ### 同步与调试
 
@@ -248,6 +253,7 @@
 | `visibility` | string | 否 | 新可见性 |
 | `description` | string | 否 | 新描述 |
 | `metadata` | object | 否 | 新元数据 |
+| `avatar_ref` | string | 否 | 新头像存储引用 |
 
 ### group.list_my
 
@@ -257,7 +263,7 @@
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `size` | integer | 否 | 200 | 返回数量上限（受 max_limit 配置限制） |
+| `size` | integer | 否 | 50 | 返回数量上限（最大 200，受 max_limit 配置限制） |
 
 > 也接受 `limit` 作为 `size` 的别名。
 
@@ -597,7 +603,7 @@
 
 ### group.get_banlist
 
-获取封禁列表。
+获取封禁列表。需要 **admin 及以上**权限。
 
 **参数**：`group_id` (string, 必填)
 
@@ -892,7 +898,7 @@
 
 ### group.pull
 
-增量拉取群消息和群事件。
+增量拉取群消息。事件请用 `group.pull_events` 单独拉取。
 
 **参数**：
 
@@ -900,8 +906,8 @@
 |------|------|------|--------|------|
 | `group_id` | string | 是 | — | 群组 ID |
 | `after_message_seq` | integer | 否 | 0 | 从该消息 seq 之后拉取 |
-| `after_event_seq` | integer | 否 | 0 | 从该事件 seq 之后拉取 |
 | `limit` | integer | 否 | 100 | 最大条数 |
+| `device_id` | string | 否 | — | 设备 ID（多设备模式） |
 
 **响应**：
 
@@ -909,33 +915,30 @@
 {
     "group_id": "grp_abc",
     "messages": [ ... ],
-    "events": [ ... ],
     "latest_message_seq": 42,
-    "latest_event_seq": 10,
+    "has_more": false,
     "limit": 100
 }
 ```
 
+多设备模式时额外返回 `cursor` 对象（含 `current_seq`、`join_seq`、`latest_seq`、`unread_count`）。
+
 ### group.ack
 
-提交群消息已读游标。
+提交群消息已读游标。等同于 `group.ack_messages`，需要 `device_id`。
 
 **参数**：
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `group_id` | string | 是 | 群组 ID |
-| `seq` | integer | 是 | 确认到的消息序号 |
+| `device_id` | string | 是 | 设备 ID |
+| `msg_seq` | integer | 是 | 确认到的消息序号 |
 
 **响应**：
 
 ```json
-{
-    "group_id": "grp_abc",
-    "aid": "alice.agentid.pub",
-    "ack_seq": 42,
-    "latest_message_seq": 100
-}
+{"cursor": 42}
 ```
 
 ---

@@ -1,10 +1,8 @@
-// +build integration
+//go:build integration
 
 package aun
 
 import (
-	"context"
-	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -338,12 +336,3 @@ func TestGroupUndecryptableEventOnly(t *testing.T) {
 	}
 }
 
-// testBuildIdentity 构造测试用身份
-func testBuildIdentity(aid, privPEM, pubB64, certPEM string) map[string]any {
-	return map[string]any{
-		"aid":             aid,
-		"private_key_pem": privPEM,
-		"public_key_b64":  pubB64,
-		"cert":            certPEM,
-	}
-}

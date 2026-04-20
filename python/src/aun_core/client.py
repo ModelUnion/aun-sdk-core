@@ -344,6 +344,7 @@ class AUNClient:
         "group.update_join_requirements", "group.set_role",
         "group.transfer_owner", "group.review_join_request",
         "group.batch_review_join_request",
+        "group.request_join", "group.use_invite_code",
         "group.resources.put", "group.resources.update",
         "group.resources.delete", "group.resources.request_add",
         "group.resources.direct_add", "group.resources.approve_request",
@@ -2656,6 +2657,12 @@ class AUNClient:
     async def _invoke_reconnect_connect_once(self) -> None:
         if self._session_params is None:
             raise StateError("missing connect params for reconnect")
+        # 从持久化 identity 刷新 token，避免用过期/失败的旧 token 反复重试
+        fresh_identity = self._auth.load_identity_or_none(self._aid)
+        if fresh_identity:
+            fresh_token = self._auth._get_cached_access_token(fresh_identity)
+            if fresh_token:
+                self._session_params["access_token"] = fresh_token
         await self._connect_once(self._session_params, allow_reauth=True)
 
     @staticmethod

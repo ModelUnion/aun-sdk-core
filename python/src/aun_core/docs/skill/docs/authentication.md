@@ -7,7 +7,7 @@ AUN 认证基于**两阶段挑战-响应机制**（ECDSA + SHA-256）：
 1. 客户端向 Issuer 发起认证请求，服务端返回随机挑战（challenge）和 `auth_cert`
 2. 客户端使用本地信任根校验服务端 `auth_cert` 链（含 CRL/OCSP 验证），然后用 AID 对应的私钥对挑战进行 ECDSA 签名，服务端验证通过后颁发 `access_token`
 
-整个过程不传输私钥，仅通过签名证明身份所有权。详细流程见 [03-认证与身份](../sdk-core/03-认证与身份.md)。
+整个过程不传输私钥，仅通过签名证明身份所有权。详细流程见 [04-连接与认证](../sdk-core/04-连接与认证.md)。
 
 ## 创建 AID
 
@@ -51,19 +51,21 @@ await client.connect({
 
 ## 网关发现
 
-`authenticate()` 内部通过 **Well-Known 端点**自动发现网关地址：
+`create_aid()` / `authenticate()` 内部通过 **Well-Known 端点**自动发现网关地址：
 
 ```
-GET https://{user-aid}.{issuer-domain}/.well-known/aun-gateway
+GET https://{aid}/.well-known/aun-gateway
+GET https://gateway.{issuer-domain}/.well-known/aun-gateway
 ```
 
 例如，AID 为 `my-agent.agentid.pub` 时，请求地址为：
 
 ```
 GET https://my-agent.agentid.pub/.well-known/aun-gateway
+GET https://gateway.agentid.pub/.well-known/aun-gateway
 ```
 
-SDK 自动选择优先级最高的网关完成认证，将地址缓存到客户端内部，并在 `authenticate()` 返回值中一并返回；如需覆盖，也可显式传入 `gateway`。
+生产配置（`verify_ssl=true`）下优先尝试 AID 域名，失败后回退到 `gateway.{issuer}`；开发配置（`verify_ssl=false`）下顺序相反，以兼容未启用泛域名的环境。发现结果会缓存到客户端内部，并在 `authenticate()` 返回值中一并返回。
 
 ## 令牌刷新
 

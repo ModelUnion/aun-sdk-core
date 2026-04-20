@@ -78,11 +78,22 @@ class TestSignedMethodsCoverage:
         "group.update_join_requirements", "group.set_role",
         "group.transfer_owner", "group.review_join_request",
         "group.batch_review_join_request",
+        "group.request_join", "group.use_invite_code",
         # 群资源
         "group.resources.put", "group.resources.update",
         "group.resources.delete", "group.resources.request_add",
         "group.resources.direct_add", "group.resources.approve_request",
         "group.resources.reject_request",
+    ]
+
+    # 服务端通过 _require_actor_aid_verified 强制要求签名的方法
+    # 如果服务端新增了签名要求，必须同步加入 SDK _SIGNED_METHODS
+    SERVER_VERIFIED_METHODS = [
+        "group.add_member",
+        "group.leave",
+        "group.kick",
+        "group.update_rules",
+        "group.send",
     ]
 
     @pytest.mark.parametrize("method", EXPECTED_METHODS)
@@ -96,6 +107,15 @@ class TestSignedMethodsCoverage:
             assert m in self.EXPECTED_METHODS, (
                 f"_SIGNED_METHODS 中包含未预期的方法: {m}"
             )
+
+    @pytest.mark.parametrize("method", SERVER_VERIFIED_METHODS)
+    def test_server_verified_method_in_sdk_signed(self, method):
+        """服务端 _require_actor_aid_verified 的方法必须在 SDK _SIGNED_METHODS 中，
+        否则 SDK 调用时不会签名，服务端会拒绝请求。"""
+        assert method in AUNClient._SIGNED_METHODS, (
+            f"服务端要求签名的 {method} 未在 SDK _SIGNED_METHODS 中，"
+            f"调用将失败 (client signature verification failed)"
+        )
 
 
 # ── 签名输出测试 ──────────────────────────────────────────

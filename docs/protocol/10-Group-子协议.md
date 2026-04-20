@@ -334,7 +334,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 
 ### `group.pull`
 
-增量拉取群消息和群事件。
+增量拉取群消息。事件请用 `group.pull_events` 单独拉取。
 
 **参数**：
 
@@ -342,8 +342,8 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 |------|------|:----:|--------|------|
 | `group_id` | string | ✅ | — | 群组 ID |
 | `after_message_seq` | integer | ❌ | 0 | 拉取该 seq 之后的消息 |
-| `after_event_seq` | integer | ❌ | 0 | 拉取该 seq 之后的事件 |
 | `limit` | integer | ❌ | 100 | 最大条数 |
+| `device_id` | string | ❌ | — | 设备 ID（多设备模式） |
 
 **响应**：
 
@@ -351,12 +351,13 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 {
     "group_id": "grp_abc",
     "messages": [ ... ],
-    "events": [ ... ],
     "latest_message_seq": 42,
-    "latest_event_seq": 10,
+    "has_more": false,
     "limit": 100
 }
 ```
+
+多设备模式时额外返回 `cursor` 对象（含 `current_seq`、`join_seq`、`latest_seq`、`unread_count`）。
 
 ### `group.ack`
 
@@ -905,7 +906,7 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 
 - **Group Service 是独立 AID 持有者**：所有 `group.*` 方法都通过 Group Service 的 AID 暴露，不内嵌于 Gateway。
 - **消息 seq 单调递增**：per-group 粒度，确保顺序一致性，`ack_seq` 仅增不减。
-- **事件 seq 独立计数**：`event_seq` 与 `message_seq` 独立，通过 `group.pull` 同时返回。
+- **事件 seq 独立计数**：`event_seq` 与 `message_seq` 独立；消息增量拉取使用 `group.pull`，事件增量拉取使用 `group.pull_events`。
 - **duty 模式**：群规则 `dispatch_mode=duty` 时，消息仅推送给当班成员，`group.pull` 仍可拉取全量消息。
 - **资源审批**：`group.resources.request_add` 提交申请后需 admin 通过 `group.resources.review_add` 审批；直接添加（owner/admin）使用 `group.resources.direct_add`。
 - **在线状态**：通过 `group.go_online` / `group.go_offline` 管理，`group.heartbeat` 刷新有效期，`group.get_online_members` 查询当前在线成员列表。

@@ -32,6 +32,8 @@
 
 ---
 
+> `object_key` 当前仅支持 ASCII 安全字符集合 `[A-Za-z0-9._/-]`，且不允许空路径段、`..`、反斜杠转义后的非法段。
+
 ## storage.put_object
 
 上传小对象（内容 base64 编码通过 RPC 传输）。
@@ -185,6 +187,7 @@ content = base64.b64decode(result["content"])
 | `owner_aid` | string | 否 | 所有者 AID，默认当前用户 |
 | `page` | integer | 否 | 页码，默认 1 |
 | `size` | integer | 否 | 每页条数，默认 50（最大 200） |
+| `marker` | string | 否 | 深度分页游标；传入时优先按游标分页 |
 
 ### 响应
 
@@ -194,6 +197,8 @@ content = base64.b64decode(result["content"])
 | `total` | integer | 总条数 |
 | `page` | integer | 当前页码 |
 | `size` | integer | 每页条数 |
+| `marker` | string | 当前游标标记 |
+| `next_marker` | string | 下一页游标标记（为空表示无更多数据） |
 
 每个 item 包含：
 
@@ -231,6 +236,7 @@ for obj in result["items"]:
 | `prefix` | string | 否 | 路径前缀过滤 |
 | `bucket` | string | 否 | 存储桶，默认 `"default"` |
 | `owner_aid` | string | 否 | 所有者 AID，默认当前用户 |
+| `size` | integer | 否 | 每页条数上限 |
 
 ### 响应
 
@@ -238,6 +244,7 @@ for obj in result["items"]:
 |------|------|------|
 | `prefixes` | string[] | 直接子目录列表 |
 | `count` | integer | 子目录数量 |
+| `size` | integer | 实际生效的每页上限 |
 
 ---
 
@@ -271,7 +278,7 @@ for obj in result["items"]:
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `object_key` | string | 是 | 对象路径 |
-| `size_bytes` | integer | 是 | 文件大小（字节） |
+| `size_bytes` | integer | 否 | 声明的文件大小（字节）。当前实现允许省略，但建议传入用于客户端追踪与最终校验 |
 | `content_type` | string | 否 | MIME 类型，默认 `"application/octet-stream"` |
 | `bucket` | string | 否 | 存储桶，默认 `"default"` |
 | `owner_aid` | string | 否 | 所有者 AID，默认当前用户 |
@@ -294,6 +301,8 @@ for obj in result["items"]:
 客户端获得 `upload_url` 后，通过 HTTP PUT 上传文件数据。
 
 > 当前实现会对 BlobStore 返回的 loopback URL 做对外地址规范化：优先使用 `KITE_STORAGE_EXTERNAL_URL`，否则按 `storage.{issuer}` 形式改写。对外地址不可使用 `127.0.0.1` 或 `localhost`。
+
+> 当前实现不会在 `create_upload_session` 阶段强校验配额或最终文件大小；这些检查会在 `storage.complete_upload` 阶段执行。
 
 ---
 

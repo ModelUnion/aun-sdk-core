@@ -18,7 +18,7 @@ Gateway 是 AUN 三种平级连接模式之一（Gateway / [Peer](04-Peer-子协
 ## 3.2 前置条件
 
 - 已创建 AID（通过 `auth.create_aid`）
-- 已获取 JWT token（通过 `auth.aid_login1` + `auth.aid_login2`）
+- 已获取可用于 `auth.connect` 的访问凭证（常见为 `auth.aid_login1` + `auth.aid_login2` 返回的 JWT access_token）
 - 或已有未过期的 token（重连场景）
 
 ## 3.3 Gateway 发现
@@ -73,15 +73,21 @@ WebSocket 连接建立
 
 ## 3.5 auth.connect
 
-客户端通过 `auth.connect` 完成会话初始化，Gateway 验证 token 后建立到 Kernel 的代理连接，返回 `status: "ok"` 即进入 READY 状态。
+客户端通过 `auth.connect` 完成会话初始化，Gateway 验证认证凭证后建立到 Kernel 的代理连接，返回 `status: "ok"` 即进入 READY 状态。
 
 ### 请求参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | nonce | string | 是 | 服务端 challenge 中下发的 nonce |
-| auth.method | string | 是 | 认证方式（`"kite_token"` / `"aid"` / `"pairing"`） |
-| auth.token | string | 是 | JWT token |
+| auth.method | string | 是 | 认证方式（`"kite_token"` / `"aid"` / `"pairing_code"`） |
+| auth.token | string | 条件必填 | 当 `auth.method="kite_token"` 时必填。当前实现兼容 JWT access_token 与 kite_token |
+| auth.code | string | 条件必填 | 当 `auth.method="pairing_code"` 时必填 |
+| auth.aid | string | 条件必填 | 当 `auth.method="aid"` 时必填，必须是完整 AID |
+| auth.request_id | string | 条件必填 | 当 `auth.method="aid"` 时必填，对应 `auth.aid_login1` 返回的 `request_id` |
+| auth.nonce | string | 条件必填 | 当 `auth.method="aid"` 时必填，对应 `auth.aid_login1` 返回的一次性 nonce |
+| auth.client_time | integer | 条件必填 | 当 `auth.method="aid"` 时必填，客户端毫秒时间戳 |
+| auth.signature | string | 条件必填 | 当 `auth.method="aid"` 时必填，对 `auth.nonce` 的签名 |
 | protocol.min | string | 是 | 客户端支持的最低协议版本 |
 | protocol.max | string | 是 | 客户端支持的最高协议版本 |
 | device.id | string | 推荐 | 设备唯一标识。SDK 默认从 `~/.aun/.device_id` 稳定读取 |
@@ -92,6 +98,11 @@ WebSocket 连接建立
 | delivery_mode.affinity_ttl_ms | integer | 否 | 仅 `queue + sender_affinity` 时有效，表示发送者粘性保持时长 |
 | capabilities | object | 否 | 客户端能力声明 |
 | client | object | 否 | 客户端信息（名称、版本等） |
+
+**当前实现补充**：
+
+- 顶层 `nonce` 与 `auth.nonce` 语义不同：前者是 Gateway challenge nonce，后者仅 `aid` 模式使用，来自 `auth.aid_login1`
+- `aid` 模式的 `auth.signature` 由客户端对 `auth.nonce` 进行签名；裸 WebSocket 客户端若先获取了 JWT access_token，也可直接改用 `kite_token` 模式连接
 
 **连接约束**：
 

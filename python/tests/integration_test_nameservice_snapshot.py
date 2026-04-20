@@ -54,9 +54,9 @@ _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
 os.environ.setdefault("AUN_ENV", "development")
 
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
-_NS_HOST = os.environ.get("AUN_TEST_NS_HOST", f"nameservice.{_ISSUER}").strip()
-_NS_PORT = int(os.environ.get("AUN_TEST_NS_PORT", "18080"))
-_NS_SSL = os.environ.get("AUN_TEST_NS_SSL", "false").strip().lower() in {"1", "true", "yes"}
+_NS_HOST = os.environ.get("AUN_TEST_NS_HOST", f"{_ISSUER}").strip()
+_NS_PORT = int(os.environ.get("AUN_TEST_NS_PORT", "443"))
+_NS_SSL = os.environ.get("AUN_TEST_NS_SSL", "true").strip().lower() in {"1", "true", "yes"}
 
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 

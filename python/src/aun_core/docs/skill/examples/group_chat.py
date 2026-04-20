@@ -54,7 +54,6 @@ async def main():
     pulled = await owner.call("group.pull", {
         "group_id": gid,
         "after_message_seq": 0,
-        "after_event_seq": 0,
     })
     print(f"\n拉取到 {len(pulled['messages'])} 条消息:")
     for msg in pulled["messages"]:

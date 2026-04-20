@@ -117,22 +117,23 @@ client = AUNClient({
 | `delivery_mode.mode` | `str` | `"fanout"` | 连接级投递语义；同一 AID 的所有在线实例必须保持一致 |
 | `delivery_mode.routing` | `str` | `"sender_affinity"` | 仅 `queue` 模式有效 |
 | `delivery_mode.affinity_ttl_ms` | `int` | `300000` | 仅 `queue + sender_affinity` 有效 |
-| `auto_reconnect` | `bool` | `False` | 断线自动重连 |
+| `auto_reconnect` | `bool` | `True` | 断线自动重连 |
 | `heartbeat_interval` | `float` | `30.0` | 心跳间隔（秒） |
 | `token_refresh_before` | `float` | `60.0` | 令牌过期前多久刷新（秒） |
-| `retry.max_attempts` | `int` | `3` | 重连最大次数 |
 | `retry.initial_delay` | `float` | `0.5` | 首次重连延迟（秒） |
-| `retry.max_delay` | `float` | `5.0` | 最大重连延迟（秒） |
+| `retry.max_delay` | `float` | `30.0` | 最大重连延迟（秒） |
 | `timeouts.connect` | `float` | `5.0` | 连接超时（秒） |
 | `timeouts.call` | `float` | `10.0` | RPC 调用超时（秒） |
 | `timeouts.http` | `float` | `30.0` | HTTP 请求超时（秒） |
+
+> 当前实现只读取 `retry.initial_delay` / `retry.max_delay`；未提供 `retry.max_attempts` 选项。
 
 ```python
 auth = await client.auth.authenticate({"aid": MY_AID})
 await client.connect(auth, {
     "slot_id": "slot-a",
     "delivery_mode": {"mode": "fanout"},
-    "auto_reconnect": False,
+    "auto_reconnect": True,
     "heartbeat_interval": 30.0,
 })
 ```
@@ -158,7 +159,6 @@ await client.connect(auth, {
 - P2P 消息的投递语义由连接阶段声明的 `delivery_mode` 决定
 - `group.send` 固定为 `fanout`，不支持 `queue`
 - Python SDK 会为 `message.pull` / `message.ack` 自动附带当前实例的 `device_id` / `slot_id`，应用层不应手工覆盖
-- 同一 AID 的所有在线实例必须声明一致的连接级 `delivery_mode`
 
 ```python
 # 发送加密消息（默认行为，无需传 encrypt）
@@ -202,6 +202,10 @@ P2P 消息的 `delivery_mode` 由当前连接实例携带；应用层通过 `con
 | `handler` | `Callable` | 是 | 事件处理函数 |
 
 **返回值**: `Subscription` 对象（可调用 `.unsubscribe()` 取消订阅）
+
+> 当前 Python SDK 不提供 `client.off(event, handler)` 便利方法。取消订阅请保留 `Subscription` 句柄并调用 `.unsubscribe()`。
+
+> 事件处理器内部抛出的异常会被 SDK 记录并吞掉，不会中断其他处理器，也不会自动重新抛回到调用方。
 
 ```python
 sub = client.on("message.received", lambda e: print(e))
@@ -729,7 +733,7 @@ GroupE2EEManager(
 |--------|----------|--------------|
 | `message.received` | 收到新消息推送 | `Message` 对象 |
 | `message.recalled` | 消息被撤回 | 撤回信息 |
-| `message.ack` | 消息已读确认 | `{"ack_seq": N}` |
+| `message.ack` | 消息已读确认 | `{"ack_seq": N, "device_id": "...", "slot_id": "..."}` |
 | `group.changed` | 群组状态变更 | 变更详情 |
 | `connection.state` | 连接状态变化 | `{"state": "..."}` |
 | `connection.challenge` | 收到认证挑战 | 挑战参数 |
@@ -767,20 +771,29 @@ Stream 服务用于实时流式数据传输（LLM 输出、数据推送等）。
 result = await client.call("stream.create", {
     "content_type": "text/plain",   # 可选，默认 text/plain
     "metadata": {"model": "gpt-4"}, # 可选，自定义元数据
-    "target_aid": "bob.aid.net",    # 可选，绑定拉流方 AID
+    "target_aid": "bob.aid.net",    # 可选，仅在拉流方显式提供 aid 时做匹配校验
 })
 stream_id = result["stream_id"]
 push_url  = result["push_url"]   # WebSocket 推流地址
 pull_url  = result["pull_url"]   # HTTP SSE 拉流地址
-pull_token = result["pull_token"] # 拉流凭证（可单独传递）
+push_token = result["push_token"]   # 推流凭证
+pull_token = result["pull_token"]   # 拉流凭证
+push_headers = result["push_headers"] # 推荐使用 Authorization header
+pull_headers = result["pull_headers"] # 推荐使用 Authorization header
 ```
+
+> 当前实现仍保留 URL query token 以兼容旧客户端；新客户端优先使用 `push_headers` / `pull_headers`。
 
 ### 推流（WebSocket）
 
 ```python
 import websockets, json
 
-async with websockets.connect(push_url, ssl=ssl_ctx) as ws:
+async with websockets.connect(
+    push_url,
+    ssl=ssl_ctx,
+    additional_headers=push_headers,
+) as ws:
     await ws.send(json.dumps({"cmd": "data", "data": "Hello ", "seq": 1}))
     await ws.send(json.dumps({"cmd": "data", "data": "World", "seq": 2}))
     await ws.send(json.dumps({"cmd": "close"}))
@@ -792,10 +805,12 @@ async with websockets.connect(push_url, ssl=ssl_ctx) as ws:
 import aiohttp
 
 async with aiohttp.ClientSession() as session:
-    async with session.get(pull_url) as resp:
+    async with session.get(pull_url, headers=pull_headers) as resp:
         async for line in resp.content:
             # SSE 格式：id: {seq}\ndata: {内容}\n\n
             pass
+
+> 推流连接若失败，当前实现常见返回为 HTTP `403` / `404` / `410`，应优先检查升级前的 HTTP 状态码。
 ```
 
 ### 关闭流

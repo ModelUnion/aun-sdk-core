@@ -42,7 +42,7 @@ print(f"seq={msg['seq']}, id={msg['message_id']}")
         "created_at": 1711234567890
     },
     "event": { ... },
-    "dispatch": "broadcast"
+    "dispatch": {"mode": "broadcast", "reason": "default"}
 }
 ```
 
@@ -55,7 +55,7 @@ print(f"seq={msg['seq']}, id={msg['message_id']}")
 | `message.sender_aid` | string | 发送者 AID |
 | `message.created_at` | integer | 创建时间戳（毫秒） |
 | `event` | object | 关联的群事件 |
-| `dispatch` | string | 消息分发模式 |
+| `dispatch` | object | 消息分发模式，含 `mode`（`"broadcast"` / `"duty"`）和 `reason` |
 
 > 注意：`seq` 在 `result["message"]["seq"]` 下，不在顶层。
 

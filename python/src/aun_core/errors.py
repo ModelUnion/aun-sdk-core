@@ -154,7 +154,7 @@ def map_remote_error(error: dict[str, Any]) -> AUNError:
     if isinstance(data, dict):
         trace_id = data.get("trace_id") or data.get("traceId")
 
-    if code in {4001, 4010, -32003}:
+    if code in {4001, 4010, -32001, -32003}:
         cls = AuthError
     elif code in {4030, 403}:
         cls = PermissionError

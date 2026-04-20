@@ -47,6 +47,10 @@ _NETWORK_NAME = "docker-deploy_kite-net"
 _CONTAINER_NAME = "kite-app"
 os.environ.setdefault("AUN_ENV", "development")
 
+_ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip()
+_ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
+_BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bob.{_ISSUER}").strip()
+
 
 # ── 辅助函数 ──────────────────────────────────────────────
 
@@ -407,6 +411,95 @@ async def test_reconnect_exhausted():
 
 # ── 主程序 ────────────────────────────────────────────────
 
+async def test_message_chain_recovery_after_reconnect():
+    """重连后消息链恢复验证（非仅 ping）"""
+    aid = _ALICE_AID
+    bob_aid = _BOB_AID
+
+    client = _make_client("message-chain-recovery")
+    bob_client = _make_client("bob-receiver")
+
+    try:
+        await client.auth.create_aid({"aid": aid})
+        auth = await client.auth.authenticate({"aid": aid})
+        await client.connect(auth, {"auto_reconnect": True, "heartbeat_interval": 5})
+
+        await bob_client.auth.create_aid({"aid": bob_aid})
+        bob_auth = await bob_client.auth.authenticate({"aid": bob_aid})
+        await bob_client.connect(bob_auth)
+
+        # 发送第一条消息
+        await client.call("message.send", {"to": bob_aid, "payload": "msg_before_disconnect", "encrypt": False})
+        await asyncio.sleep(1)
+
+        # 断网
+        print("  断开网络...")
+        _docker_network_disconnect()
+        await asyncio.sleep(2)
+
+        # 恢复网络
+        print("  恢复网络...")
+        _docker_network_connect()
+        reconnected = await _wait_for_state(client, "connected", timeout=30.0)
+        assert reconnected, "重连失败"
+        print("  [OK] 重连成功")
+
+        # 发送第二条消息（验证消息链恢复）
+        await client.call("message.send", {"to": bob_aid, "payload": "msg_after_reconnect", "encrypt": False})
+        await asyncio.sleep(1)
+
+        # Bob 拉取消息，验证两条都收到
+        result = await bob_client.call("message.pull", {"after_seq": 0, "limit": 50})
+        messages = result.get("messages", [])
+        payloads = [m.get("payload") for m in messages if m.get("from") == aid]
+        assert "msg_before_disconnect" in payloads, "断网前消息未收到"
+        assert "msg_after_reconnect" in payloads, "重连后消息未收到"
+
+        print(f"  [PASS] 消息链恢复验证通过（收到 {len(payloads)} 条消息）")
+        return True
+    finally:
+        await client.close()
+        await bob_client.close()
+
+
+async def test_no_duplicate_background_tasks():
+    """重连后不重复创建后台任务"""
+    aid = _ALICE_AID
+
+    client = _make_client("no-duplicate-tasks")
+    try:
+        await client.auth.create_aid({"aid": aid})
+        auth = await client.auth.authenticate({"aid": aid})
+        await client.connect(auth, {"auto_reconnect": True, "heartbeat_interval": 5})
+
+        # 记录初始后台任务数（通过心跳计数）
+        initial_heartbeat_count = getattr(client, "_heartbeat_count", 0)
+
+        # 断网 → 重连
+        print("  断开网络...")
+        _docker_network_disconnect()
+        await asyncio.sleep(2)
+
+        print("  恢复网络...")
+        _docker_network_connect()
+        reconnected = await _wait_for_state(client, "connected", timeout=30.0)
+        assert reconnected, "重连失败"
+        print("  [OK] 重连成功")
+
+        # 等待一段时间，验证心跳任务未重复创建
+        await asyncio.sleep(10)
+        final_heartbeat_count = getattr(client, "_heartbeat_count", 0)
+
+        # 验证心跳计数增长正常（约 2 次，允许误差）
+        heartbeat_delta = final_heartbeat_count - initial_heartbeat_count
+        assert 1 <= heartbeat_delta <= 3, f"心跳计数异常：{heartbeat_delta}（可能重复创建任务）"
+
+        print(f"  [PASS] 后台任务未重复创建（心跳增量 {heartbeat_delta}）")
+        return True
+    finally:
+        await client.close()
+
+
 async def main():
     _disable_proxy_env_for_tests()
     print("=" * 60)
@@ -419,6 +512,8 @@ async def main():
         ("状态事件序列验证", test_state_events_sequence),
         ("重连后消息收发", test_message_after_reconnect),
         ("重连耗尽 → 无限重试验证", test_reconnect_exhausted),
+        ("消息链恢复验证", test_message_chain_recovery_after_reconnect),
+        ("后台任务不重复创建", test_no_duplicate_background_tasks),
     ]
 
     results = []

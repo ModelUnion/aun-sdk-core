@@ -45,7 +45,7 @@ def _default_test_aun_path() -> str:
 _TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).strip()
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
-_BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bob.{_ISSUER}").strip()
+_BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 
 # ---------------------------------------------------------------------------
 # 计数
@@ -128,6 +128,22 @@ async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: i
     return sorted(inbox, key=_seq_of)
 
 
+async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
+    """获取当前最大 seq，用于建立 baseline"""
+    after_seq = 0
+    max_seq = 0
+    while True:
+        result = await client.call("message.pull", {"after_seq": after_seq, "limit": limit})
+        msgs = result.get("messages", [])
+        if not msgs:
+            return max_seq
+        for msg in msgs:
+            max_seq = max(max_seq, _seq_of(msg))
+        if len(msgs) < limit:
+            return max_seq
+        after_seq = max_seq
+
+
 # ---------------------------------------------------------------------------
 # 测试
 # ---------------------------------------------------------------------------
@@ -141,12 +157,15 @@ async def test_message_ack_basic():
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bob, _BOB_AID)
 
+        # 0. 获取 baseline seq，避免拉取历史消息
+        baseline = await _current_max_seq(bob)
+
         # 1. Alice 发送消息给 Bob
         await _sdk_send(alice, _BOB_AID, "test_ack_message")
         await asyncio.sleep(1.0)
 
         # 2. Bob 拉取消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=0, timeout=2.0)
+        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
         if not msgs:
             _fail("message_ack_basic", "Bob 未收到消息")
             return
@@ -157,13 +176,13 @@ async def test_message_ack_basic():
         # 3. Bob ack 消息
         ack_result = await bob.call("message.ack", {"seq": msg_seq})
 
-        # 4. 验证 ack 结果
+        # 4. 验证 ack 结果（ack_seq 是累积值，可能 >= msg_seq）
         if not ack_result.get("success"):
             _fail("message_ack_basic", f"ack 失败: {ack_result}")
             return
 
-        if ack_result.get("ack_seq") != msg_seq:
-            _fail("message_ack_basic", f"ack_seq 不匹配: 期望 {msg_seq}, 实际 {ack_result.get('ack_seq')}")
+        if not (ack_result.get("ack_seq") >= msg_seq):
+            _fail("message_ack_basic", f"ack_seq 不匹配: 期望 >= {msg_seq}, 实际 {ack_result.get('ack_seq')}")
             return
 
         _ok("message_ack_basic")
@@ -182,6 +201,9 @@ async def test_message_ack_event():
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bob, _BOB_AID)
 
+        # 0. 获取 baseline seq
+        baseline = await _current_max_seq(bob)
+
         # 1. Alice 订阅 ack 事件
         ack_events = []
         ack_event = asyncio.Event()
@@ -198,7 +220,7 @@ async def test_message_ack_event():
         await asyncio.sleep(1.0)
 
         # 3. Bob 拉取消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=0, timeout=2.0)
+        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
         if not msgs:
             _fail("message_ack_event", "Bob 未收到消息")
             return
@@ -223,12 +245,13 @@ async def test_message_ack_event():
             return
 
         event_data = ack_events[0]
-        if event_data.get("from") != _BOB_AID:
-            _fail("message_ack_event", f"ack 事件 from 不匹配: 期望 {_BOB_AID}, 实际 {event_data.get('from')}")
+        # ack 事件的 "to" 字段是 ack 发起方（Bob）
+        if event_data.get("to") != _BOB_AID:
+            _fail("message_ack_event", f"ack 事件 to 不匹配: 期望 {_BOB_AID}, 实际 {event_data.get('to')}")
             return
 
-        if event_data.get("ack_seq") != msg_seq:
-            _fail("message_ack_event", f"ack 事件 ack_seq 不匹配: 期望 {msg_seq}, 实际 {event_data.get('ack_seq')}")
+        if not (event_data.get("ack_seq") >= msg_seq):
+            _fail("message_ack_event", f"ack 事件 ack_seq 不匹配: 期望 >= {msg_seq}, 实际 {event_data.get('ack_seq')}")
             return
 
         _ok("message_ack_event")
@@ -247,12 +270,15 @@ async def test_message_ack_partial_success():
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bob, _BOB_AID)
 
+        # 0. 获取 baseline seq
+        baseline = await _current_max_seq(bob)
+
         # 1. Alice 发送消息给 Bob
         await _sdk_send(alice, _BOB_AID, "test_partial_success")
         await asyncio.sleep(1.0)
 
         # 2. Bob 拉取消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=0, timeout=2.0)
+        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
         if not msgs:
             _fail("message_ack_partial_success", "Bob 未收到消息")
             return
@@ -281,14 +307,14 @@ async def test_message_ack_partial_success():
             if not ack_result.get("event_published"):
                 print(f"  [INFO] 事件发布失败，但 ack_seq 已推进: {ack_result.get('ack_seq')}")
 
-        # 6. 再次 ack 同一 seq，验证幂等性
+        # 6. 再次 ack 同一 seq，验证幂等性（ack_seq 是累积值，可能 >= msg_seq）
         ack_result2 = await bob.call("message.ack", {"seq": msg_seq})
         if not ack_result2.get("success"):
             _fail("message_ack_partial_success", f"重复 ack 失败: {ack_result2}")
             return
 
-        if ack_result2.get("ack_seq") != msg_seq:
-            _fail("message_ack_partial_success", f"重复 ack 的 ack_seq 不匹配: 期望 {msg_seq}, 实际 {ack_result2.get('ack_seq')}")
+        if not (ack_result2.get("ack_seq") >= msg_seq):
+            _fail("message_ack_partial_success", f"重复 ack 的 ack_seq 不匹配: 期望 >= {msg_seq}, 实际 {ack_result2.get('ack_seq')}")
             return
 
         _ok("message_ack_partial_success")
@@ -307,6 +333,9 @@ async def test_message_ack_sequence():
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bob, _BOB_AID)
 
+        # 0. 获取 baseline seq
+        baseline = await _current_max_seq(bob)
+
         # 1. Alice 发送 3 条消息给 Bob
         await _sdk_send(alice, _BOB_AID, "msg1")
         await asyncio.sleep(0.2)
@@ -316,7 +345,7 @@ async def test_message_ack_sequence():
         await asyncio.sleep(1.0)
 
         # 2. Bob 拉取所有消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=0, timeout=2.0)
+        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
         if len(msgs) < 3:
             _fail("message_ack_sequence", f"Bob 未收到足够消息: 期望 3 条, 实际 {len(msgs)} 条")
             return
@@ -324,20 +353,20 @@ async def test_message_ack_sequence():
         seqs = [_seq_of(m) for m in msgs[:3]]
         print(f"  [INFO] Bob 收到消息 seqs={seqs}")
 
-        # 3. Bob 按顺序 ack
+        # 3. Bob 按顺序 ack（ack_seq 是累积值，可能 >= 当前 seq）
         for seq in seqs:
             ack_result = await bob.call("message.ack", {"seq": seq})
             if not ack_result.get("success"):
                 _fail("message_ack_sequence", f"ack seq={seq} 失败: {ack_result}")
                 return
-            if ack_result.get("ack_seq") != seq:
-                _fail("message_ack_sequence", f"ack_seq 不匹配: 期望 {seq}, 实际 {ack_result.get('ack_seq')}")
+            if not (ack_result.get("ack_seq") >= seq):
+                _fail("message_ack_sequence", f"ack_seq 不匹配: 期望 >= {seq}, 实际 {ack_result.get('ack_seq')}")
                 return
 
-        # 4. 验证最终 ack_seq
+        # 4. 验证最终 ack_seq >= 最后一条消息的 seq
         final_ack = await bob.call("message.ack", {"seq": seqs[-1]})
-        if final_ack.get("ack_seq") != seqs[-1]:
-            _fail("message_ack_sequence", f"最终 ack_seq 不匹配: 期望 {seqs[-1]}, 实际 {final_ack.get('ack_seq')}")
+        if not (final_ack.get("ack_seq") >= seqs[-1]):
+            _fail("message_ack_sequence", f"最终 ack_seq 不匹配: 期望 >= {seqs[-1]}, 实际 {final_ack.get('ack_seq')}")
             return
 
         _ok("message_ack_sequence")

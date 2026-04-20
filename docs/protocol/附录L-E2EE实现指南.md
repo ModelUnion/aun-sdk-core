@@ -165,6 +165,7 @@ await rpc_call("message.send", {
     "encrypted": True,
     "message_id": aad["message_id"],
     "timestamp": aad["timestamp"],
+    "delivery_mode": {"mode": "fanout"},
 })
 
 # 5. 解密（内置本地防重放）

@@ -4,7 +4,7 @@
 
 当前仅支持 **Gateway 模式**：客户端通过网关中转与其他 AID 通信。
 
-> Peer 模式（点对点直连）和 Relay 模式（中继转发）正在规划中。
+> `connect()` 虽然接受 `topology` 字段，但当前 Python SDK 对 `peer` / `relay` 会明确返回未实现。
 
 ## connect() 参数
 
@@ -12,11 +12,15 @@
 await client.connect({
     "access_token": "...",         # 必填，认证返回的访问令牌
     "gateway": "wss://...",        # 可选，显式覆盖 Gateway 地址
-    "auto_reconnect": False,       # 可选，是否启用自动重连，默认 False
+    "slot_id": "",                 # 可选，同一 device 下的实例槽位
+    "delivery_mode": {"mode": "fanout"},  # 可选，连接级投递语义
+    "queue_routing": "round_robin",# 可选，queue 模式下的路由策略
+    "affinity_ttl_ms": 0,          # 可选，sender_affinity 粘滞时间
+    "auto_reconnect": True,        # 可选，是否启用自动重连，默认 True
     "token_refresh_before": 60.0,  # 可选，令牌到期前多少秒开始刷新，默认 60.0
     "retry": {                     # 可选，重连策略配置
         "initial_delay": 0.5,      #   初始重连延迟（秒），默认 0.5
-        "max_delay": 5.0,          #   最大重连延迟（秒），默认 5.0
+        "max_delay": 30.0,         #   最大重连延迟（秒），默认 30.0
     },
     "heartbeat_interval": 30.0,    # 可选，心跳间隔（秒），默认 30.0
     "timeouts": {                  # 可选，超时配置
@@ -77,7 +81,7 @@ await client.connect({
 启用 `auto_reconnect: True` 后，连接断开时 SDK 自动尝试重连：
 
 - 采用**指数退避**策略，避免频繁重连
-- 初始延迟 **0.5 秒**，逐次翻倍，最大 **5.0 秒**
+- 初始延迟 **0.5 秒**，逐次翻倍，最大 **30.0 秒**
 - 重连成功后自动恢复 `connected` 状态
 - 主动调用 `close()` 不会触发自动重连
 

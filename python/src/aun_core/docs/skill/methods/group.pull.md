@@ -1,6 +1,6 @@
 # group.pull
 
-增量拉取群消息和群事件。基于 `after_message_seq` / `after_event_seq` 游标获取增量数据。
+增量拉取群消息。事件请用 `group.pull_events` 单独拉取。
 
 ## 调用示例
 
@@ -8,8 +8,7 @@
 result = await client.call("group.pull", {
     "group_id": "grp-uuid-xxx",
     "after_message_seq": 10,
-    "after_event_seq": 5,
-    "limit": 50
+    "limit": 100
 })
 ```
 
@@ -19,8 +18,8 @@ result = await client.call("group.pull", {
 |------|------|------|--------|------|
 | `group_id` | string | 是 | — | 群组 ID |
 | `after_message_seq` | integer | 否 | `0` | 消息起始序列号，返回 seq > after_message_seq 的消息 |
-| `after_event_seq` | integer | 否 | `0` | 事件起始序列号，返回 seq > after_event_seq 的事件 |
-| `limit` | integer | 否 | `50` | 返回消息数量上限（最大 100） |
+| `limit` | integer | 否 | `100` | 返回消息数量上限（最大 100） |
+| `device_id` | string | 否 | — | 设备 ID（多设备模式） |
 
 ## 返回值
 
@@ -39,10 +38,9 @@ result = await client.call("group.pull", {
             "created_at": 1711234567890
         }
     ],
-    "events": [],
     "latest_message_seq": 11,
-    "latest_event_seq": 5,
-    "limit": 50
+    "has_more": false,
+    "limit": 100
 }
 ```
 
@@ -50,10 +48,11 @@ result = await client.call("group.pull", {
 |------|------|------|
 | `group_id` | string | 群组 ID |
 | `messages` | array | 消息列表，按 seq 升序 |
-| `events` | array | 事件列表（成员变动等） |
 | `latest_message_seq` | integer | 本次返回的最大消息 seq |
-| `latest_event_seq` | integer | 本次返回的最大事件 seq |
+| `has_more` | boolean | 是否还有更多消息 |
 | `limit` | integer | 实际使用的上限 |
+
+> 多设备模式时额外返回 `cursor` 对象（含 `current_seq`、`join_seq`、`latest_seq`、`unread_count`）。
 
 ## 相关方法
 

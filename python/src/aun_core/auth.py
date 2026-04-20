@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from .crypto import CryptoProvider
-from .errors import AuthError, StateError, ValidationError, map_remote_error, AUNError
+from .errors import AuthError, ConnectionError, StateError, ValidationError, map_remote_error, AUNError
 from .keystore.file import FileKeyStore
 
 
@@ -320,8 +320,14 @@ class AuthFlow:
                 identity["access_token"] = explicit_token
                 self._persist_identity(identity)
                 return {"token": explicit_token, "identity": identity}
-            except AuthError as exc:
+            except (AuthError, ConnectionError, AUNError) as exc:
                 _auth_log.debug("explicit_token 认证失败，尝试下一方式: %s", exc)
+                # transport 被 Gateway 关闭（4001）时，后续 fallback 无法使用同一连接，
+                # 直接向上抛出让 _reconnect_loop 重新建立连接后再走完整 fallback 链
+                if getattr(transport, "_closed", False):
+                    raise ConnectionError(
+                        f"transport closed during auth fallback: {exc}"
+                    ) from exc
 
         if identity is None:
             auth_context = await self.ensure_authenticated(gateway_url)
@@ -348,8 +354,12 @@ class AuthFlow:
                     delivery_mode=delivery_mode,
                 )
                 return {"token": cached_token, "identity": identity}
-            except AuthError as exc:
+            except (AuthError, ConnectionError, AUNError) as exc:
                 _auth_log.debug("cached_token 认证失败，尝试刷新: %s", exc)
+                if getattr(transport, "_closed", False):
+                    raise ConnectionError(
+                        f"transport closed during auth fallback: {exc}"
+                    ) from exc
 
         refresh_token = str(identity.get("refresh_token") or "")
         if refresh_token:
@@ -366,8 +376,12 @@ class AuthFlow:
                         delivery_mode=delivery_mode,
                     )
                     return {"token": cached_token, "identity": identity}
-            except AuthError as exc:
+            except (AuthError, ConnectionError, AUNError) as exc:
                 _auth_log.debug("refresh_token 认证失败，将重新登录: %s", exc)
+                if getattr(transport, "_closed", False):
+                    raise ConnectionError(
+                        f"transport closed during auth fallback: {exc}"
+                    ) from exc
 
         login = await self.authenticate(gateway_url, aid=identity.get("aid"))
         token = str(login.get("access_token") or "")
