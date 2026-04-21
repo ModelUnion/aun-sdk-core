@@ -69,13 +69,16 @@ result = await client.call("stream.create", {
 
 | code | message | 原因 |
 |------|---------|------|
-| -32000 | 达到最大流数限制 (`达到最大流数限制 (N)`) | 活跃流数超过服务配置上限 |
+| -33402 | `达到最大流数限制 (N)` | 活跃流数超过服务配置上限 |
+| -33405 | `无效的 content_type` / `metadata 必须是 JSON 对象` / `target_aid 格式无效` | 参数校验失败 |
 
 ---
 
 ## stream.close
 
 关闭流。仅流的创建者可调用。关闭后所有拉流端收到 SSE `event: done`。
+
+**幂等语义**：对不存在的流（已关闭或已清理）调用 `stream.close` 仍返回 `{ "success": true }`，不会报错。客户端可安全重试而无需担心重复关闭。
 
 ### 参数
 
@@ -99,8 +102,10 @@ await client.call("stream.close", {"stream_id": "4d5067f203cf42ba"})
 
 | code | message | 原因 |
 |------|---------|------|
-| -32000 | `流不存在: {stream_id}` | stream_id 无效或已被清理 |
-| -32000 | `只有流创建者可以关闭流` | 非创建者调用 |
+| -33405 | `缺少 stream_id` | 未提供 stream_id 参数 |
+| -33403 | `只有流创建者可以关闭流` | 非创建者调用 |
+
+> 注意：流不存在时不返回错误（幂等语义），直接返回 `{ "success": true }`。
 
 ---
 
