@@ -18,6 +18,8 @@ import type {
  * 的异步特性，所有方法返回 Promise。
  */
 export interface KeyStore {
+  /** 列出本地已有身份 */
+  listIdentities?(): Promise<string[]>;
   /** 加载密钥对 */
   loadKeyPair(aid: string): Promise<KeyPairRecord | null>;
   /** 保存密钥对 */

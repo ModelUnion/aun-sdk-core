@@ -395,6 +395,29 @@ export class IndexedDBKeyStore implements KeyStore {
     }
   }
 
+  async listIdentities(): Promise<string[]> {
+    const records = await idbGetAll<JsonObject | string>(STORE_METADATA);
+    const aids = new Set<string>();
+    for (const item of records) {
+      if (item.key.startsWith('_seq_|')) continue;
+      const value = item.value;
+      const aid = typeof value === 'object' && value !== null && isRecord(value) && typeof value.aid === 'string' && value.aid
+        ? value.aid
+        : item.key;
+      aids.add(String(aid));
+    }
+
+    for (const item of await idbGetAll<JsonObject>(STORE_KEY_PAIRS)) {
+      if (!item.key.startsWith('_seq_|')) aids.add(item.key);
+    }
+    for (const item of await idbGetAll<string>(STORE_CERTS)) {
+      if (item.key.startsWith('_seq_|')) continue;
+      const [safe] = item.key.split('|', 1);
+      if (safe) aids.add(safe);
+    }
+    return [...aids].sort();
+  }
+
   // ── 密钥对 ──────────────────────────────────────────
 
   async loadKeyPair(aid: string): Promise<KeyPairRecord | null> {
@@ -1162,4 +1185,3 @@ export class IndexedDBKeyStore implements KeyStore {
     return result;
   }
 }
-
