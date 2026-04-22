@@ -12,7 +12,6 @@ import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
 import { AuthNamespace } from './namespaces/auth.js';
-import { CustodyNamespace } from './namespaces/custody.js';
 import { CryptoProvider, uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer } from './crypto.js';
 import {
   E2EEManager,
@@ -374,8 +373,6 @@ export class AUNClient {
 
   /** 认证命名空间 */
   readonly auth: AuthNamespace;
-  /** AID 托管命名空间 */
-  readonly custody: CustodyNamespace;
 
   // E2EE 编排状态（内存缓存）
   private _certCache: Map<string, CachedPeerCert> = new Map();
@@ -412,7 +409,6 @@ export class AUNClient {
     this.config = {
       aun_path: this.configModel.aunPath,
       root_ca_path: this.configModel.rootCaPem,
-      custody_url: this.configModel.custodyUrl,
       seed_password: this.configModel.seedPassword,
     };
 
@@ -452,7 +448,6 @@ export class AUNClient {
     });
 
     this.auth = new AuthNamespace(this);
-    this.custody = new CustodyNamespace(this);
 
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => {
@@ -564,6 +559,37 @@ export class AUNClient {
     await this._dispatcher.publish('connection.state', { state: this._state });
   }
 
+  /** 列出本地所有已存储的身份摘要（仅返回有有效私钥的 AID） */
+  async listIdentities(): Promise<Array<{ aid: string; metadata?: MetadataRecord }>> {
+    const listFn = (this._keystore as any).listIdentities;
+    if (typeof listFn !== 'function') return [];
+    const aids: string[] = await listFn.call(this._keystore);
+    const summaries: Array<{ aid: string; metadata?: MetadataRecord }> = [];
+    for (const aid of [...aids].sort()) {
+      const identity = await this._keystore.loadIdentity(aid);
+      if (!identity || !identity.private_key_pem) continue;
+      const summary: { aid: string; metadata?: MetadataRecord } = { aid };
+      // 优先从 loadMetadata 获取
+      const loadMeta = (this._keystore as any).loadMetadata;
+      if (typeof loadMeta === 'function') {
+        const md = await loadMeta.call(this._keystore, aid);
+        if (md && Object.keys(md).length > 0) { summary.metadata = md; }
+      }
+      // 回退：从 identity 中提取非核心字段
+      if (!summary.metadata) {
+        const metadata: MetadataRecord = {};
+        for (const [key, value] of Object.entries(identity)) {
+          if (!['aid', 'private_key_pem', 'public_key_der_b64', 'curve', 'cert'].includes(key)) {
+            metadata[key] = value;
+          }
+        }
+        if (Object.keys(metadata).length > 0) { summary.metadata = metadata; }
+      }
+      summaries.push(summary);
+    }
+    return summaries;
+  }
+
   /** 关闭连接 */
   async close(): Promise<void> {
     this._closing = true;
@@ -596,41 +622,6 @@ export class AUNClient {
     this._resetSeqTrackingState();
   }
 
-  /** 断开连接但不关闭客户端（可重新 connect，对齐 Go Disconnect / Python disconnect） */
-  async disconnect(): Promise<void> {
-    if (this._state !== 'connected' && this._state !== 'reconnecting') return;
-    this._saveSeqTrackerState();
-    this._stopBackgroundTasks();
-    await this._transport.close();
-    this._state = 'disconnected';
-    await this._dispatcher.publish('connection.state', { state: this._state });
-  }
-
-  /** 列出本地已存储身份摘要 */
-  async listIdentities(): Promise<Array<{ aid: string; metadata?: MetadataRecord }>> {
-    const listFn = this._keystore.listIdentities?.bind(this._keystore);
-    if (typeof listFn !== 'function') return [];
-    const aids = await listFn();
-    const summaries: Array<{ aid: string; metadata?: MetadataRecord }> = [];
-
-    for (const aid of aids) {
-      const identity = await this._keystore.loadIdentity(aid);
-      const summary: { aid: string; metadata?: MetadataRecord } = { aid };
-      if (identity) {
-        const metadata: MetadataRecord = {};
-        for (const [key, value] of Object.entries(identity)) {
-          if (!['aid', 'private_key_pem', 'public_key_der_b64', 'curve', 'cert'].includes(key)) {
-            metadata[key] = value;
-          }
-        }
-        if (Object.keys(metadata).length > 0) {
-          summary.metadata = metadata;
-        }
-      }
-      summaries.push(summary);
-    }
-    return summaries;
-  }
 
   // ── RPC ───────────────────────────────────────────
 
@@ -839,27 +830,6 @@ export class AUNClient {
 
   async trustRoots(params?: RpcParams): Promise<RpcResult> {
     return this.call('meta.trust_roots', params ?? {});
-  }
-
-  /**
-   * 列出本地所有已存储的身份摘要（对齐 Python list_identities）。
-   * 返回 [{aid, metadata?}, ...] 数组。
-   */
-  async listIdentities(): Promise<JsonObject[]> {
-    const listFn = (this._keystore as any).listIdentities;
-    if (typeof listFn !== 'function') return [];
-    const aids: string[] = await listFn.call(this._keystore);
-    const summaries: JsonObject[] = [];
-    for (const aid of [...aids].sort()) {
-      const summary: JsonObject = { aid };
-      const loadMeta = (this._keystore as any).loadMetadata;
-      if (typeof loadMeta === 'function') {
-        const md = await loadMeta.call(this._keystore, aid);
-        if (md) summary.metadata = md;
-      }
-      summaries.push(summary);
-    }
-    return summaries;
   }
 
   // ── 事件 ──────────────────────────────────────────

@@ -83,13 +83,6 @@ describe('createConfig', () => {
     expect(cfg.seedPassword).toBe('legacy-seed');
   });
 
-  it('支持 custodyUrl 配置', () => {
-    const cfg = createConfig({
-      custody_url: 'https://custody.example.com',
-    } as any);
-    expect(cfg.custodyUrl).toBe('https://custody.example.com');
-  });
-
   it('应忽略 delivery_mode 相关构造参数', () => {
     const cfg = createConfig({
       delivery_mode: 'queue',

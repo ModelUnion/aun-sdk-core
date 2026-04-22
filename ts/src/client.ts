@@ -608,7 +608,7 @@ export class AUNClient {
   }
 
   /**
-   * 列出本地所有已存储的身份摘要（对齐 Python list_identities）。
+   * 列出本地所有已存储的身份摘要（仅返回有有效私钥的 AID）。
    */
   listIdentities(): Array<{ aid: string; metadata?: Record<string, unknown> }> {
     const listFn = (this._keystore as KeyStore & {
@@ -618,6 +618,8 @@ export class AUNClient {
     const aids = listFn.call(this._keystore);
     const summaries: Array<{ aid: string; metadata?: Record<string, unknown> }> = [];
     for (const aid of [...aids].sort()) {
+      const identity = this._keystore.loadIdentity(aid);
+      if (!identity || !identity.private_key_pem) continue;
       const summary: { aid: string; metadata?: Record<string, unknown> } = { aid };
       const loadMetadata = (this._keystore as KeyStore & {
         loadMetadata?: (aid: string) => Record<string, unknown> | null;

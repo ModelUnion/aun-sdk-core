@@ -142,10 +142,6 @@ describe('AUNClient 子模块可访问', () => {
     expect(client.discovery).toBeDefined();
   });
 
-  it('custody 命名空间应可用', () => {
-    const client = new AUNClient();
-    expect((client as any).custody).toBeDefined();
-  });
 });
 
 describe('AUNClient._syncIdentityAfterConnect', () => {

@@ -80,7 +80,6 @@ const client = new AUNClient(config?);
 | --- | --- | --- | --- |
 | `aunPath` | `string` | `aun` | 本地存储命名标识 |
 | `rootCaPem` | `string \| null` | `null` | 自定义根证书 PEM |
-| `custodyUrl` | `string \| null` | `null` | AID 托管服务地址 |
 | `seedPassword` | `string \| null` | `null` | SecretStore 派生种子 |
 | `discoveryPort` | `number \| null` | `null` | Gateway 发现端口 |
 | `rotateOnJoin` | `boolean` | `false` | 新成员加入后是否直接轮换群组 epoch |
@@ -129,10 +128,6 @@ string | null
 #### `client.auth`
 
 认证命名空间，见下文 `AuthNamespace`。
-
-#### `client.custody`
-
-托管命名空间，见下文 `CustodyNamespace`。
 
 #### `client.discovery`
 
@@ -403,97 +398,7 @@ await client.auth.rekey();
 await client.auth.trustRoots();
 ```
 
-## 6. `CustodyNamespace`
-
-### 6.1 `client.custody.setUrl(url)`
-
-设置托管服务地址。
-
-```ts
-client.custody.setUrl('https://custody.example.com');
-```
-
-如果构造客户端时已经传入 `custodyUrl`，则可以不调用本方法。
-
-### 6.2 `client.custody.sendCode(params)`
-
-发送手机验证码。
-
-```ts
-await client.custody.sendCode({
-  phone: '+8613800138000',
-});
-```
-
-恢复场景：
-
-```ts
-await client.custody.sendCode({
-  phone: '+8613800138000',
-  aid: 'alice.agentid.pub',
-});
-```
-
-参数：
-
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `phone` | `string` | 是 | E.164 手机号 |
-| `aid` | `string` | 否 | 恢复场景传入目标 AID；绑定场景不传 |
-
-说明：
-
-- 不传 `aid` 时，默认走绑定场景，需要当前客户端已有 `access_token`。
-- 传 `aid` 时，走恢复场景，不要求当前客户端已登录。
-
-### 6.3 `client.custody.bindPhone(params)`
-
-绑定手机号并备份证书/密钥。
-
-```ts
-await client.custody.bindPhone({
-  phone: '+8613800138000',
-  code: '123456',
-  cert: certPem,
-  key: encryptedPrivateKey,
-  metadata: {
-    alg: 'AES-GCM',
-    version: 1,
-  },
-});
-```
-
-参数：
-
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `phone` | `string` | 是 | E.164 手机号 |
-| `code` | `string` | 是 | 验证码 |
-| `cert` | `string` | 是 | 证书 PEM |
-| `key` | `string` | 是 | 客户端加密后的私钥数据 |
-| `metadata` | `object` | 否 | 额外备份元数据 |
-
-### 6.4 `client.custody.restorePhone(params)`
-
-通过手机号恢复备份。
-
-```ts
-const result = await client.custody.restorePhone({
-  phone: '+8613800138000',
-  code: '123456',
-  aid: 'alice.agentid.pub',
-});
-```
-
-参数：
-
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `phone` | `string` | 是 | E.164 手机号 |
-| `code` | `string` | 是 | 验证码 |
-| `aid` | `string` | 是 | 要恢复的 AID |
-
-## 7. P2P 消息接口
+## 6. P2P 消息接口
 
 ### 7.1 发送消息 `message.send`
 
@@ -546,7 +451,7 @@ SDK 自动行为：
 - 自动更新 contiguous seq
 - 自动发送 `message.ack`
 
-## 8. 群组消息接口
+## 7. 群组消息接口
 
 ### 8.1 发送群消息 `group.send`
 
@@ -591,7 +496,7 @@ SDK 内部已自动处理以下群组 E2EE 场景：
 - 审批通过后自动分发密钥
 - 群消息解密失败时自动尝试密钥恢复
 
-## 9. 事件
+## 8. 事件
 
 常用事件：
 
@@ -628,7 +533,7 @@ client.on('group.message_created', (evt) => {
 });
 ```
 
-## 10. 错误类型
+## 9. 错误类型
 
 常用错误类型：
 
@@ -667,7 +572,7 @@ try {
 }
 ```
 
-## 11. 最小接入模板
+## 10. 最小接入模板
 
 ```ts
 import { AUNClient } from '@aun/core-browser';
@@ -677,7 +582,6 @@ export async function bootstrapAun() {
     aunPath: 'aun-web',
     discoveryPort: 18443,
     seedPassword: 'demo-seed',
-    custodyUrl: 'https://custody.example.com',
   });
 
   client.on('connection.state', (evt) => {

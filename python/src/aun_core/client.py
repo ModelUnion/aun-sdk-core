@@ -337,10 +337,13 @@ class AUNClient:
         await self._dispatcher.publish("connection.state", {"state": self._state})
 
     def list_identities(self) -> list[dict[str, Any]]:
-        """列出本地所有已存储的身份摘要（对齐 C++ ListIdentities）"""
+        """列出本地所有已存储的身份摘要（仅返回有有效私钥的 AID）"""
         aids = self._keystore.list_identities()
         summaries: list[dict[str, Any]] = []
         for aid in sorted(aids):
+            identity = self._keystore.load_identity(aid)
+            if not identity or not identity.get("private_key_pem"):
+                continue
             summary: dict[str, Any] = {"aid": aid}
             md = self._keystore.load_metadata(aid)
             if md:

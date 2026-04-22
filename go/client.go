@@ -582,6 +582,27 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 	return c.connectOnce(ctx, normalized, false)
 }
 
+// ListIdentities 列出本地所有具有有效私钥的身份摘要（对齐 Python list_identities）。
+func (c *AUNClient) ListIdentities() ([]map[string]any, error) {
+	type lister interface {
+		ListIdentities() ([]string, error)
+	}
+	ks, ok := c.keyStore.(lister)
+	if !ok {
+		return nil, nil
+	}
+	aids, err := ks.ListIdentities()
+	if err != nil {
+		return nil, err
+	}
+	var summaries []map[string]any
+	for _, aid := range aids {
+		summary := map[string]any{"aid": aid}
+		summaries = append(summaries, summary)
+	}
+	return summaries, nil
+}
+
 // Disconnect 主动断开连接但保留身份，可重新 Connect（ISSUE-GO-005）
 func (c *AUNClient) Disconnect() error {
 	c.mu.Lock()

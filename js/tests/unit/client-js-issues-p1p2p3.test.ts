@@ -110,6 +110,7 @@ describe('ISSUE-SDK-JS-003: listIdentities()', () => {
     const client = new AUNClient();
     // mock keystore.listIdentities
     (client as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.aid.com', 'bob.aid.com']);
+    (client as any)._keystore.loadIdentity = vi.fn().mockResolvedValue({ private_key_pem: 'PEM' });
     (client as any)._keystore.loadMetadata = vi.fn().mockResolvedValue(null);
 
     const result = await (client as any).listIdentities();

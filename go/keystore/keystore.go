@@ -21,6 +21,9 @@ type KeyStore interface {
 
 	// SaveIdentity 保存完整身份信息（自动拆分到密钥对、证书、元数据）
 	SaveIdentity(aid string, identity map[string]any) error
+
+	// ListIdentities 列出所有具有有效私钥的 AID
+	ListIdentities() ([]string, error)
 }
 
 // StructuredKeyStore 提供结构化主存能力。

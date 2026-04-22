@@ -88,7 +88,6 @@ export { IndexedDBSecretStore } from './secret-store/indexeddb-store.js';
 // 认证
 export { AuthFlow } from './auth.js';
 export { AuthNamespace } from './namespaces/auth.js';
-export { CustodyNamespace } from './namespaces/custody.js';
 
 // E2EE — P2P
 export { E2EEManager, SUITE, MODE_PREKEY_ECDH_V2, MODE_LONG_TERM_KEY } from './e2ee.js';

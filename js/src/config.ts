@@ -65,8 +65,6 @@ export interface AUNConfig {
   aunPath: string;
   /** 根证书 PEM 字符串 */
   rootCaPem: string | null;
-  /** AID Custody 服务地址 */
-  custodyUrl: string | null;
   /** 私钥加密口令 */
   seedPassword: string | null;
   /** Gateway 发现端口 */
@@ -85,15 +83,12 @@ export interface AUNConfig {
   requireForwardSecrecy: boolean;
   /** 防重放时间窗口（秒） */
   replayWindowSeconds: number;
-  /** AID 托管服务地址 */
-  custodyUrl: string | null;
 }
 
 /** AUN 配置默认值 */
 const DEFAULTS: AUNConfig = {
   aunPath: 'aun',
   rootCaPem: null,
-  custodyUrl: null,
   seedPassword: null,
   discoveryPort: null,
   groupE2ee: true,
@@ -103,7 +98,6 @@ const DEFAULTS: AUNConfig = {
   verifySsl: true,
   requireForwardSecrecy: true,
   replayWindowSeconds: 300,
-  custodyUrl: null,
 };
 
 type AUNConfigInput = Partial<AUNConfig> & JsonObject;
@@ -121,7 +115,6 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
   return {
     aunPath: readString(data.aunPath ?? data.aun_path, DEFAULTS.aunPath),
     rootCaPem: readOptionalString(data.rootCaPem ?? data.root_ca_pem ?? data.root_ca_path, DEFAULTS.rootCaPem),
-    custodyUrl: readOptionalString(data.custodyUrl ?? data.custody_url, DEFAULTS.custodyUrl),
     seedPassword: readOptionalString(
       data.seedPassword ?? data.seed_password ?? data.encryptionSeed ?? data.encryption_seed,
       DEFAULTS.seedPassword,
@@ -134,6 +127,5 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
     verifySsl: DEFAULTS.verifySsl,
     requireForwardSecrecy: readBoolean(data.requireForwardSecrecy ?? data.require_forward_secrecy, DEFAULTS.requireForwardSecrecy),
     replayWindowSeconds: readOptionalNumber(data.replayWindowSeconds ?? data.replay_window_seconds, DEFAULTS.replayWindowSeconds) ?? DEFAULTS.replayWindowSeconds,
-    custodyUrl: readOptionalString(data.custodyUrl ?? data.custody_url, DEFAULTS.custodyUrl),
   };
 }

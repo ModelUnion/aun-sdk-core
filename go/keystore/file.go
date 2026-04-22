@@ -722,6 +722,33 @@ func (f *FileKeyStore) UpdateInstanceState(aid, deviceID, slotID string, updater
 
 // ── LoadAnyIdentity ──────────────────────────────────────────
 
+// ListIdentities 列出所有具有有效私钥的 AID（排序返回）。
+func (f *FileKeyStore) ListIdentities() ([]string, error) {
+	entries, err := os.ReadDir(f.aidsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var aids []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		aid := entry.Name()
+		identity, err := f.LoadIdentity(aid)
+		if err != nil || identity == nil {
+			continue
+		}
+		if pk, _ := identity["private_key_pem"].(string); pk == "" {
+			continue
+		}
+		aids = append(aids, aid)
+	}
+	return aids, nil
+}
+
 func (f *FileKeyStore) LoadAnyIdentity() (map[string]any, error) {
 	entries, err := os.ReadDir(f.aidsRoot)
 	if err != nil {
