@@ -70,7 +70,12 @@ function copyIdentityTree(sourceRoot: string, targetRoot: string, aid: string): 
   if (fs.existsSync(sourceSeed)) {
     fs.copyFileSync(sourceSeed, path.join(targetRoot, '.seed'));
   }
-  fs.cpSync(sourceIdentity, path.join(targetRoot, 'AIDs', aid), { recursive: true });
+  // 只复制身份材料（key.json/cert.pem），跳过 SQLite 数据库文件
+  // 每个实例使用 aun_{device_id}.db，源实例的 db 不应被复制
+  fs.cpSync(sourceIdentity, path.join(targetRoot, 'AIDs', aid), {
+    recursive: true,
+    filter: (src: string) => !/\.(db|db-wal|db-shm|db-journal)/.test(path.basename(src)),
+  });
 }
 
 /** 注册 AID 并连接到 Gateway */

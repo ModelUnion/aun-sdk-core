@@ -130,7 +130,7 @@ export class SQLiteBackup {
 
   replacePrekeys(aid: string, prekeys: Record<string, JsonMap>): void {
     if (!this._db) return;
-    this._runTransaction(this._db.transaction(() => {
+    this._runTransaction(() => {
       const stmt = this._db!.prepare(`
         INSERT OR REPLACE INTO prekeys
           (aid, prekey_id, data, created_at, updated_at, expires_at, deleted_at)
@@ -147,7 +147,7 @@ export class SQLiteBackup {
           toNumber(data.deleted_at),
         );
       }
-    }), 'replace_prekeys');
+    }, 'replace_prekeys');
   }
 
   cleanupPrekeysBefore(aid: string, cutoffMs: number, keepLatest = 7): string[] {
@@ -177,10 +177,10 @@ export class SQLiteBackup {
       .map(row => row.prekey_id);
     if (prekeyIds.length === 0 || !this._db) return prekeyIds;
 
-    this._runTransaction(this._db.transaction(() => {
+    this._runTransaction(() => {
       const stmt = this._db!.prepare('DELETE FROM prekeys WHERE aid = ? AND prekey_id = ?');
       for (const prekeyId of prekeyIds) stmt.run(aid, prekeyId);
-    }), 'cleanup_prekeys');
+    }, 'cleanup_prekeys');
     return prekeyIds;
   }
 
@@ -224,7 +224,7 @@ export class SQLiteBackup {
 
   replaceGroupEntries(aid: string, entries: Record<string, JsonMap>): void {
     if (!this._db) return;
-    this._runTransaction(this._db.transaction(() => {
+    this._runTransaction(() => {
       const currentStmt = this._db!.prepare(`
         INSERT OR REPLACE INTO group_current
           (aid, group_id, epoch, data, updated_at)
@@ -261,7 +261,7 @@ export class SQLiteBackup {
           );
         }
       }
-    }), 'replace_group_entries');
+    }, 'replace_group_entries');
   }
 
   cleanupGroupOldEpochs(aid: string, groupId: string, cutoffMs: number): number[] {
@@ -278,10 +278,10 @@ export class SQLiteBackup {
     const epochs = rows.map(row => row.epoch);
     if (epochs.length === 0 || !this._db) return epochs;
 
-    this._runTransaction(this._db.transaction(() => {
+    this._runTransaction(() => {
       const stmt = this._db!.prepare('DELETE FROM group_old_epochs WHERE aid = ? AND group_id = ? AND epoch = ?');
       for (const epoch of epochs) stmt.run(aid, groupId, epoch);
-    }), 'cleanup_group_old_epochs');
+    }, 'cleanup_group_old_epochs');
     return epochs;
   }
 
@@ -360,9 +360,11 @@ export class SQLiteBackup {
     }
   }
 
-  private _runTransaction(tx: () => void, label: string): void {
+  private _runTransaction(fn: () => void, label: string): void {
+    if (!this._db) return;
     try {
-      tx();
+      const txn = this._db.transaction(fn);
+      txn();
     } catch (err) {
       console.warn(`SQLite ${label} 失败: ${err}`);
     }

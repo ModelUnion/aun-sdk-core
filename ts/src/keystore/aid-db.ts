@@ -1,15 +1,18 @@
 /**
  * Per-AID SQLite 数据库（对标 Python sqlcipher_db.py / Go aid_db.go）
  *
- * 每个 AID 一个独立的 aun.db，表结构与 Python 完全一致。
+ * 每个 AID 一个独立的 aun_{deviceId}.db，表结构与 Python 完全一致。
  * DB 中敏感字段存明文（无 SQLCipher，与 Python 降级行为一致）。
  */
 
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 
 const SCHEMA_VERSION = 1;
+
+// 全局 per-path 单例缓存：同一个 db 文件路径在整个进程中只创建一个 Database 实例
+const _dbPool = new Map<string, { db: Database.Database; refCount: number }>();
 
 const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS _schema_version (
@@ -78,17 +81,36 @@ const DDL_STATEMENTS = [
 
 export class AIDDatabase {
   private _db: Database.Database;
+  private _dbPath: string;
 
   constructor(dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
-    this._db = new Database(dbPath);
-    this._db.pragma('journal_mode = WAL');
-    this._db.pragma('busy_timeout = 5000');
+    const absPath = resolve(dbPath);
+    this._dbPath = absPath;
+    const cached = _dbPool.get(absPath);
+    if (cached) {
+      cached.refCount++;
+      this._db = cached.db;
+    } else {
+      this._db = new Database(dbPath);
+      this._db.pragma('journal_mode = WAL');
+      this._db.pragma('busy_timeout = 5000');
+      _dbPool.set(absPath, { db: this._db, refCount: 1 });
+    }
     this._initSchema();
   }
 
   close(): void {
-    this._db.close();
+    const cached = _dbPool.get(this._dbPath);
+    if (cached) {
+      cached.refCount--;
+      if (cached.refCount <= 0) {
+        _dbPool.delete(this._dbPath);
+        this._db.close();
+      }
+    } else {
+      this._db.close();
+    }
   }
 
   private _initSchema(): void {
@@ -129,7 +151,7 @@ export class AIDDatabase {
 
   savePrekey(prekeyId: string, privateKeyPem: string, deviceId = '', createdAt?: number, expiresAt?: number, extraData?: Record<string, unknown>): void {
     const now = Date.now();
-    
+
     const dataJson = JSON.stringify(extraData ?? {});
     this._db.prepare(
       `INSERT INTO prekeys (prekey_id, device_id, private_key_enc, data, created_at, updated_at, expires_at)
@@ -175,7 +197,10 @@ export class AIDDatabase {
       .map((r) => r.prekey_id);
     if (toDelete.length > 0) {
       const del = this._db.prepare('DELETE FROM prekeys WHERE device_id = ? AND prekey_id = ?');
-      this._db.transaction(() => { for (const id of toDelete) del.run(deviceId, id); })();
+      const txn = this._db.transaction(() => {
+        for (const id of toDelete) del.run(deviceId, id);
+      });
+      txn();
     }
     return toDelete;
   }
@@ -183,7 +208,6 @@ export class AIDDatabase {
   // ── Group Current ────────────────────────────────────────
 
   saveGroupCurrent(groupId: string, epoch: number, secret: string, data: Record<string, unknown>): void {
-    
     this._db.prepare(
       `INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
        VALUES (?, ?, ?, ?, ?)
@@ -227,7 +251,6 @@ export class AIDDatabase {
   // ── Group Old Epochs ─────────────────────────────────────
 
   saveGroupOldEpoch(groupId: string, epoch: number, secret: string, data: Record<string, unknown>, updatedAt?: number, expiresAt?: number): void {
-    
     this._db.prepare(
       `INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
        VALUES (?, ?, ?, ?, ?, ?)
@@ -271,7 +294,6 @@ export class AIDDatabase {
 
   saveSession(sessionId: string, data: Record<string, unknown>): void {
     const dataJson = JSON.stringify(data);
-    
     this._db.prepare(
       'INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at',
     ).run(sessionId, dataJson, Date.now());

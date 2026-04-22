@@ -24,7 +24,7 @@ import { homedir } from 'node:os';
 import type { KeyStore } from './index.js';
 import type { SecretStore } from '../secret-store/index.js';
 import { AIDDatabase } from './aid-db.js';
-import { normalizeInstanceId } from '../config.js';
+import { getDeviceId, normalizeInstanceId } from '../config.js';
 import { certificateSha256Fingerprint } from '../crypto.js';
 import { createDefaultSecretStore } from '../secret-store/index.js';
 import {
@@ -73,6 +73,7 @@ export class FileKeyStore implements KeyStore {
   private _aidsRoot: string;
   private _secretStore: SecretStore;
   private _aidDBs = new Map<string, AIDDatabase>();
+  private _deviceId: string;
 
   constructor(
     root?: string,
@@ -88,6 +89,7 @@ export class FileKeyStore implements KeyStore {
     this._secretStore = opts?.secretStore ?? createDefaultSecretStore(this._root, opts?.encryptionSeed);
     this._aidsRoot = join(this._root, 'AIDs');
     mkdirSync(this._aidsRoot, { recursive: true });
+    this._deviceId = getDeviceId(this._root);
   }
 
   close(): void {
@@ -99,7 +101,7 @@ export class FileKeyStore implements KeyStore {
     const safe = safeAid(aid);
     let db = this._aidDBs.get(safe);
     if (!db) {
-      const dbPath = join(this._aidsRoot, safe, 'aun.db');
+      const dbPath = join(this._aidsRoot, safe, `aun_${this._deviceId}.db`);
       try {
         db = new AIDDatabase(dbPath);
       } catch (exc) {

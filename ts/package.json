@@ -1,5 +1,5 @@
 {
-  "name": "@aun/core-node",
+  "name": "@agentunion/core.node",
   "version": "0.2.6",
   "description": "AUN Protocol Core SDK for Node.js",
   "type": "module",
@@ -26,11 +26,11 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "better-sqlite3": "^12.8.0",
+    "better-sqlite3": "^11.0.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
+    "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
     "@vitest/coverage-v8": "^4.1.3",
