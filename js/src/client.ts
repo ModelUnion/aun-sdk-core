@@ -12,6 +12,7 @@ import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
 import { AuthNamespace } from './namespaces/auth.js';
+import { CustodyNamespace } from './namespaces/custody.js';
 import { CryptoProvider, uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer } from './crypto.js';
 import {
   E2EEManager,
@@ -47,6 +48,7 @@ import {
   type JsonObject,
   type JsonValue,
   type Message,
+  type ConnectionState,
   type MetadataRecord,
   type RpcParams,
   type RpcResult,
@@ -372,6 +374,9 @@ export class AUNClient {
 
   /** 认证命名空间 */
   readonly auth: AuthNamespace;
+  /** AID 托管命名空间 */
+  readonly custody: CustodyNamespace;
+
   // E2EE 编排状态（内存缓存）
   private _certCache: Map<string, CachedPeerCert> = new Map();
   private _prekeyReplenishInflight: Set<string> = new Set();
@@ -401,12 +406,13 @@ export class AUNClient {
   private _reconnectAbort: AbortController | null = null;
   private _serverKicked = false;
 
-  constructor(config?: Partial<AUNConfig> & RpcParams) {
+  constructor(config?: Partial<AUNConfig> & RpcParams, _debug = false) {
     const rawConfig: RpcParams = config ?? {};
     this.configModel = createConfig(rawConfig as Partial<AUNConfig>);
     this.config = {
       aun_path: this.configModel.aunPath,
       root_ca_path: this.configModel.rootCaPem,
+      custody_url: this.configModel.custodyUrl,
       seed_password: this.configModel.seedPassword,
     };
 
@@ -446,6 +452,8 @@ export class AUNClient {
     });
 
     this.auth = new AuthNamespace(this);
+    this.custody = new CustodyNamespace(this);
+
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => {
       this._onRawMessageReceived(data);
@@ -476,7 +484,7 @@ export class AUNClient {
     return this._aid;
   }
 
-  get state(): string {
+  get state(): ConnectionState {
     return this._state;
   }
 
@@ -522,7 +530,7 @@ export class AUNClient {
     auth: RpcParams,
     options?: RpcParams,
   ): Promise<void> {
-    if (this._state !== 'idle' && this._state !== 'closed') {
+    if (this._state !== 'idle' && this._state !== 'closed' && this._state !== 'disconnected') {
       throw new StateError(`connect not allowed in state ${this._state}`);
     }
 
@@ -534,6 +542,26 @@ export class AUNClient {
     this._closing = false;
 
     await this._connectOnce(normalized, false);
+  }
+
+  /** 断开连接但保留本地状态，可再次 connect */
+  async disconnect(): Promise<void> {
+    if (this._state !== 'connected' && this._state !== 'reconnecting') {
+      return;
+    }
+
+    this._saveSeqTrackerState();
+    this._stopBackgroundTasks();
+
+    if (this._reconnectAbort) {
+      this._reconnectAbort.abort();
+      this._reconnectAbort = null;
+      this._reconnectActive = false;
+    }
+
+    await this._transport.close();
+    this._state = 'disconnected';
+    await this._dispatcher.publish('connection.state', { state: this._state });
   }
 
   /** 关闭连接 */
@@ -576,6 +604,32 @@ export class AUNClient {
     await this._transport.close();
     this._state = 'disconnected';
     await this._dispatcher.publish('connection.state', { state: this._state });
+  }
+
+  /** 列出本地已存储身份摘要 */
+  async listIdentities(): Promise<Array<{ aid: string; metadata?: MetadataRecord }>> {
+    const listFn = this._keystore.listIdentities?.bind(this._keystore);
+    if (typeof listFn !== 'function') return [];
+    const aids = await listFn();
+    const summaries: Array<{ aid: string; metadata?: MetadataRecord }> = [];
+
+    for (const aid of aids) {
+      const identity = await this._keystore.loadIdentity(aid);
+      const summary: { aid: string; metadata?: MetadataRecord } = { aid };
+      if (identity) {
+        const metadata: MetadataRecord = {};
+        for (const [key, value] of Object.entries(identity)) {
+          if (!['aid', 'private_key_pem', 'public_key_der_b64', 'curve', 'cert'].includes(key)) {
+            metadata[key] = value;
+          }
+        }
+        if (Object.keys(metadata).length > 0) {
+          summary.metadata = metadata;
+        }
+      }
+      summaries.push(summary);
+    }
+    return summaries;
   }
 
   // ── RPC ───────────────────────────────────────────

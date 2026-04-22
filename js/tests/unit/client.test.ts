@@ -141,6 +141,11 @@ describe('AUNClient 子模块可访问', () => {
     const client = new AUNClient();
     expect(client.discovery).toBeDefined();
   });
+
+  it('custody 命名空间应可用', () => {
+    const client = new AUNClient();
+    expect((client as any).custody).toBeDefined();
+  });
 });
 
 describe('AUNClient._syncIdentityAfterConnect', () => {
@@ -169,6 +174,57 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
     const instanceState = await ks.loadInstanceState(aid, deviceId, slotId);
     expect(instanceState.access_token).toBe('tok-connect');
     expect(prekeys.pk1.private_key_pem).toBe('KEEP_ME');
+  });
+});
+
+describe('AUNClient.disconnect', () => {
+  it('connected 状态断开后应进入 disconnected', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+
+    await client.disconnect();
+
+    expect((client as any)._transport.close).toHaveBeenCalledTimes(1);
+    expect(client.state).toBe('disconnected');
+  });
+
+  it('disconnected 后应允许再次 connect', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'disconnected';
+    (client as any)._connectOnce = vi.fn().mockResolvedValue(undefined);
+    (client as any)._transport.setTimeout = vi.fn();
+
+    await client.connect({
+      access_token: 'tok-1',
+      gateway: 'ws://gateway.example.com/aun',
+    });
+
+    expect((client as any)._connectOnce).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AUNClient.listIdentities', () => {
+  it('应返回本地身份摘要', async () => {
+    const client = new AUNClient();
+    const ks = (client as any)._keystore;
+
+    await ks.saveIdentity('alice.agentid.pub', {
+      aid: 'alice.agentid.pub',
+      private_key_pem: 'PRIVATE_KEY',
+      access_token: 'tok-1',
+      refresh_token: 'ref-1',
+    });
+
+    await expect(client.listIdentities()).resolves.toEqual([
+      {
+        aid: 'alice.agentid.pub',
+        metadata: {
+          access_token: 'tok-1',
+          refresh_token: 'ref-1',
+        },
+      },
+    ]);
   });
 });
 
