@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -429,6 +429,60 @@ describe('FileKeyStore', () => {
     expect(gs!.secret).toBe(newSecretB64);
     const oldEpochs = gs!.old_epochs as GroupOldEpochRecord[];
     expect(oldEpochs[0].secret).toBe(oldSecretB64);
+    ks.close();
+  });
+
+  // ── ISSUE-SDK-TS-010: loadKeyPair 对损坏的 key.json 的健壮性 ──
+
+  it('loadKeyPair 在 key.json 内容损坏时应返回 null', () => {
+    const ks = new FileKeyStore(tmpDir);
+    // 先创建目录结构
+    const keyDir = join(tmpDir, 'AIDs', 'corrupt.aid', 'private');
+    mkdirSync(keyDir, { recursive: true });
+    // 写入损坏的 JSON
+    writeFileSync(join(keyDir, 'key.json'), '{invalid json!!!');
+
+    const result = ks.loadKeyPair('corrupt.aid');
+    expect(result).toBeNull();
+    ks.close();
+  });
+
+  it('loadKeyPair 在 key.json 为空文件时应返回 null', () => {
+    const ks = new FileKeyStore(tmpDir);
+    const keyDir = join(tmpDir, 'AIDs', 'empty.aid', 'private');
+    mkdirSync(keyDir, { recursive: true });
+    writeFileSync(join(keyDir, 'key.json'), '');
+
+    const result = ks.loadKeyPair('empty.aid');
+    expect(result).toBeNull();
+    ks.close();
+  });
+
+  // ── ISSUE-SDK-TS-020: loadCert readFileSync 异常处理 ──
+
+  it('loadCert 在 cert.pem 内容不可读时应返回 null（文件目录冲突模拟）', () => {
+    const ks = new FileKeyStore(tmpDir);
+    // 用目录替代文件来模拟 readFileSync 抛异常的场景
+    const certDir = join(tmpDir, 'AIDs', 'badcert.aid', 'public');
+    mkdirSync(certDir, { recursive: true });
+    // 创建一个同名目录来让 readFileSync 抛 EISDIR
+    mkdirSync(join(certDir, 'cert.pem'), { recursive: true });
+
+    const result = ks.loadCert('badcert.aid');
+    expect(result).toBeNull();
+    ks.close();
+  });
+
+  it('loadCert 按指纹加载时 readFileSync 失败应返回 null', () => {
+    const ks = new FileKeyStore(tmpDir);
+    const fp = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    // 用目录替代文件来模拟 readFileSync 失败
+    const certVerDir = join(tmpDir, 'AIDs', 'badcert2.aid', 'public', 'certs');
+    mkdirSync(certVerDir, { recursive: true });
+    mkdirSync(join(certVerDir, `${fp.replace(/:/g, '_')}.pem`), { recursive: true });
+
+    const result = ks.loadCert('badcert2.aid', fp);
+    expect(result).toBeNull();
     ks.close();
   });
 });

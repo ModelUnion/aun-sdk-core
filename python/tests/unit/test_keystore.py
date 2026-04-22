@@ -868,3 +868,141 @@ class TestDataIndependence:
         assert prekeys["pk1"]["private_key_pem"] == "PK1"
         grp = ks4.load_group_secret_state(self.AID, "g1")
         assert grp["secret"] == "GS"
+
+
+class TestListIdentitiesAndLoadMetadata:
+    """PY-001: FileKeyStore 必须实现 list_identities() 和 load_metadata()。"""
+
+    AID_1 = "alice.agentid.pub"
+    AID_2 = "bob.agentid.pub"
+
+    def _make_ks(self, tmp_path, seed="seed"):
+        return FileKeyStore(tmp_path, encryption_seed=seed)
+
+    def test_list_identities_empty(self, tmp_path):
+        """无身份时返回空列表。"""
+        ks = self._make_ks(tmp_path)
+        assert ks.list_identities() == []
+
+    def test_list_identities_single(self, tmp_path):
+        """保存一个身份后能列出。"""
+        ks = self._make_ks(tmp_path)
+        ks.save_key_pair(self.AID_1, {
+            "private_key_pem": "KEY_1",
+            "public_key_der_b64": "PUB_1",
+            "curve": "P-256",
+        })
+        result = ks.list_identities()
+        assert self.AID_1 in result
+
+    def test_list_identities_multiple(self, tmp_path):
+        """多个身份全部列出。"""
+        ks = self._make_ks(tmp_path)
+        ks.save_key_pair(self.AID_1, {
+            "private_key_pem": "KEY_1",
+            "public_key_der_b64": "PUB_1",
+            "curve": "P-256",
+        })
+        ks.save_key_pair(self.AID_2, {
+            "private_key_pem": "KEY_2",
+            "public_key_der_b64": "PUB_2",
+            "curve": "P-256",
+        })
+        result = ks.list_identities()
+        assert self.AID_1 in result
+        assert self.AID_2 in result
+        assert len(result) >= 2
+
+    def test_list_identities_survives_restart(self, tmp_path):
+        """重启后 list_identities 结果不变。"""
+        ks1 = self._make_ks(tmp_path)
+        ks1.save_key_pair(self.AID_1, {
+            "private_key_pem": "KEY_1",
+            "public_key_der_b64": "PUB_1",
+            "curve": "P-256",
+        })
+        ks2 = self._make_ks(tmp_path)
+        assert self.AID_1 in ks2.list_identities()
+
+    def test_load_metadata_basic(self, tmp_path):
+        """load_metadata 返回 AID 的基本元数据。"""
+        ks = self._make_ks(tmp_path)
+        ks.save_identity(self.AID_1, {
+            "aid": self.AID_1,
+            "private_key_pem": "KEY",
+            "public_key_der_b64": "PUB",
+            "curve": "P-256",
+            "custom_field": "test_value",
+        })
+        md = ks.load_metadata(self.AID_1)
+        assert md is not None
+        assert isinstance(md, dict)
+
+    def test_load_metadata_nonexistent(self, tmp_path):
+        """不存在的 AID 返回 None 或空字典。"""
+        ks = self._make_ks(tmp_path)
+        md = ks.load_metadata("nonexistent.agentid.pub")
+        assert md is None or md == {}
+
+    def test_load_metadata_has_cert_fingerprint(self, tmp_path):
+        """有证书时 metadata 包含 cert_fingerprint。"""
+        cert_pem = _make_real_cert(self.AID_1)
+        fp = _fingerprint_of_cert(cert_pem)
+        ks = self._make_ks(tmp_path)
+        ks.save_key_pair(self.AID_1, {
+            "private_key_pem": "KEY",
+            "public_key_der_b64": "PUB",
+            "curve": "P-256",
+        })
+        ks.save_cert(self.AID_1, cert_pem)
+        md = ks.load_metadata(self.AID_1)
+        assert md is not None
+        assert md.get("cert_fingerprint") == fp
+
+
+class TestMetadataLocksBounded:
+    """PY-016: _metadata_locks 应为实例变量，不同实例互不干扰。"""
+
+    def test_metadata_locks_bounded(self, tmp_path):
+        """大量不同 AID 访问后，_metadata_locks 应有上限。"""
+        from aun_core.keystore.file import _METADATA_LOCKS_LIMIT
+
+        ks = FileKeyStore(root=str(tmp_path))
+        # 触发大量不同 AID 的锁创建
+        for i in range(_METADATA_LOCKS_LIMIT + 100):
+            ks._get_metadata_lock(f"aid-{i}.test")
+
+        assert len(ks._metadata_locks) <= _METADATA_LOCKS_LIMIT
+
+    def test_metadata_locks_are_instance_level(self, tmp_path):
+        """不同 aun_path 的实例拥有独立的 _metadata_locks，互不竞争。"""
+        dir_a = tmp_path / "store_a"
+        dir_b = tmp_path / "store_b"
+        ks_a = FileKeyStore(root=str(dir_a), encryption_seed="seed_a")
+        ks_b = FileKeyStore(root=str(dir_b), encryption_seed="seed_b")
+
+        # 在实例 A 中获取锁
+        lock_a = ks_a._get_metadata_lock("shared.aid")
+        # 在实例 B 中获取同名 AID 的锁
+        lock_b = ks_b._get_metadata_lock("shared.aid")
+
+        # 两个实例的锁应该是不同对象（实例隔离）
+        assert lock_a is not lock_b, "_metadata_locks 应为实例变量，不同实例不共享锁"
+
+        # 各实例的锁字典独立
+        assert "shared.aid" in ks_a._metadata_locks
+        assert "shared.aid" in ks_b._metadata_locks
+        assert ks_a._metadata_locks is not ks_b._metadata_locks
+
+    def test_metadata_locks_no_class_level_dict(self, tmp_path):
+        """确保 _metadata_locks 不再是类变量（不通过类访问）。"""
+        ks = FileKeyStore(root=str(tmp_path))
+        # 实例应有自己的 _metadata_locks
+        assert hasattr(ks, '_metadata_locks')
+        assert isinstance(ks._metadata_locks, dict)
+        # _get_metadata_lock 应该是实例方法，不是类方法
+        import inspect
+        assert not isinstance(
+            inspect.getattr_static(FileKeyStore, '_get_metadata_lock'),
+            classmethod
+        ), "_get_metadata_lock 不应再是 classmethod"

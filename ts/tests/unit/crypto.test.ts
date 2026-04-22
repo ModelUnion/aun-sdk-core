@@ -65,6 +65,17 @@ describe('CryptoProvider', () => {
       );
       expect(timestamp).toBe('1234567890.0');
     });
+
+    it('自动生成的时间戳应为整数秒（TS-001）', () => {
+      const identity = provider.generateIdentity();
+      const [, timestamp] = provider.signLoginNonce(identity.private_key_pem, 'nonce');
+      // 时间戳不应包含小数点（应为整数秒）
+      expect(timestamp).not.toContain('.');
+      // 应为合理的 Unix 时间戳（大于 2020-01-01）
+      const ts = parseInt(timestamp, 10);
+      expect(ts).toBeGreaterThan(1577836800);
+      expect(Number.isInteger(ts)).toBe(true);
+    });
   });
 
   describe('newClientNonce', () => {

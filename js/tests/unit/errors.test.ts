@@ -147,22 +147,22 @@ describe('错误类层级', () => {
 
 describe('mapRemoteError', () => {
   it('认证错误码 → AuthError', () => {
-    for (const code of [4001, 4010, -32003]) {
+    for (const code of [4001, 4010, -32001, -32003]) {
       const err = mapRemoteError({ code, message: 'auth fail' });
       expect(err).toBeInstanceOf(AuthError);
       expect(err.code).toBe(code);
     }
   });
 
-  it('权限错误码 → PermissionError', () => {
-    for (const code of [4030, 403]) {
+  it('权限错误码 → PermissionError（含 -32004 PERMISSION_DENIED）', () => {
+    for (const code of [4030, 403, -32004]) {
       const err = mapRemoteError({ code, message: 'forbidden' });
       expect(err).toBeInstanceOf(PermissionError);
     }
   });
 
   it('资源不存在错误码 → NotFoundError', () => {
-    for (const code of [4040, 404, -32004]) {
+    for (const code of [4040, 404]) {
       const err = mapRemoteError({ code, message: 'not found' });
       expect(err).toBeInstanceOf(NotFoundError);
     }

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -17,18 +18,20 @@ import (
 
 // eventNameMap 协议事件名到 SDK 事件名的映射
 var eventNameMap = map[string]string{
-	"message.received": "message.received",
-	"message.recalled": "message.recalled",
-	"message.ack":      "message.ack",
-	"group.changed":    "group.changed",
+	"message.received":      "message.received",
+	"message.recalled":      "message.recalled",
+	"message.ack":           "message.ack",
+	"group.changed":         "group.changed",
+	"group.message_created": "group.message_created", // ISSUE-SDK-GO-001: 补充群消息事件映射
+	"storage.object_changed": "storage.object_changed",
 }
 
 // RPCTransport WebSocket JSON-RPC 2.0 传输层
 // 与 Python SDK transport.py 对应。
 type RPCTransport struct {
 	dispatcher    *EventDispatcher
-	timeout       time.Duration
-	onDisconnect  func(error)
+	timeout       atomic.Int64 // 纳秒，使用 atomic 保证跨 goroutine 安全
+	onDisconnect  func(error, int)
 	verifySSL     bool
 	ws            *websocket.Conn
 	pending       map[string]chan map[string]any
@@ -36,33 +39,49 @@ type RPCTransport struct {
 	closed        bool
 	closedMu      sync.RWMutex
 	challenge     map[string]any
+	challengeMu   sync.RWMutex
 	cancelReader  context.CancelFunc
 	readerDone    chan struct{}
 }
 
 // NewRPCTransport 创建 RPC 传输层
-func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisconnect func(error), verifySSL bool) *RPCTransport {
+func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisconnect func(error, int), verifySSL bool) *RPCTransport {
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
-	return &RPCTransport{
+	t := &RPCTransport{
 		dispatcher:   dispatcher,
-		timeout:      timeout,
 		onDisconnect: onDisconnect,
 		verifySSL:    verifySSL,
 		pending:      make(map[string]chan map[string]any),
 		closed:       true,
 	}
+	t.timeout.Store(int64(timeout))
+	return t
 }
 
-// SetTimeout 设置 RPC 调用超时时间
+// SetTimeout 设置 RPC 调用超时时间（线程安全）
 func (t *RPCTransport) SetTimeout(timeout time.Duration) {
-	t.timeout = timeout
+	t.timeout.Store(int64(timeout))
 }
 
-// Challenge 返回连接时收到的 challenge 消息
+// getTimeout 获取当前超时设置（线程安全）
+func (t *RPCTransport) getTimeout() time.Duration {
+	return time.Duration(t.timeout.Load())
+}
+
+// Challenge 返回连接时收到的 challenge 消息（线程安全）
 func (t *RPCTransport) Challenge() map[string]any {
+	t.challengeMu.RLock()
+	defer t.challengeMu.RUnlock()
 	return t.challenge
+}
+
+// setChallenge 线程安全地设置 challenge
+func (t *RPCTransport) setChallenge(c map[string]any) {
+	t.challengeMu.Lock()
+	t.challenge = c
+	t.challengeMu.Unlock()
 }
 
 // Connect 连接到 WebSocket 服务端，返回 challenge 消息
@@ -97,7 +116,7 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 		t.closedMu.Unlock()
 		return nil, err
 	}
-	t.challenge = challenge
+	t.setChallenge(challenge)
 
 	// 启动读取循环
 	readerCtx, cancel := context.WithCancel(context.Background())
@@ -178,9 +197,10 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 		return nil, NewSerializationError(fmt.Sprintf("序列化 RPC 请求失败: %v", err))
 	}
 
-	// 发送请求：write 超时跟随整体 t.timeout（不超过 30s 作为兜底上限），
+	// 发送请求：write 超时跟随整体 timeout（不超过 30s 作为兜底上限），
 	// 避免慢网络下 5s 硬编码导致 RPC 还没等响应就先 fail。
-	writeTimeout := t.timeout
+	currentTimeout := t.getTimeout()
+	writeTimeout := currentTimeout
 	if writeTimeout <= 0 || writeTimeout > 30*time.Second {
 		writeTimeout = 30 * time.Second
 	}
@@ -194,7 +214,7 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 	}
 
 	// 等待响应（带超时）
-	timer := time.NewTimer(t.timeout)
+	timer := time.NewTimer(currentTimeout)
 	defer timer.Stop()
 
 	select {
@@ -225,6 +245,7 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 }
 
 // recvInitialMessage 接收初始消息（通常为 challenge）
+// GO-015: 循环等待 challenge 消息，非 challenge 消息路由后继续等待，直到超时
 func (t *RPCTransport) recvInitialMessage(ctx context.Context) (map[string]any, error) {
 	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -236,23 +257,25 @@ func (t *RPCTransport) recvInitialMessage(ctx context.Context) (map[string]any, 
 	if ws == nil {
 		return nil, NewConnectionError("接收初始消息失败: 连接已关闭")
 	}
-	_, data, err := ws.Read(readCtx)
-	if err != nil {
-		return nil, NewConnectionError(fmt.Sprintf("接收初始消息失败: %v", err))
-	}
 
-	message, err := decodeMessage(data)
-	if err != nil {
-		return nil, err
-	}
+	for {
+		_, data, err := ws.Read(readCtx)
+		if err != nil {
+			return nil, NewConnectionError(fmt.Sprintf("等待 challenge 超时或连接失败: %v", err))
+		}
 
-	if method, ok := message["method"].(string); ok && method == "challenge" {
-		return message, nil
-	}
+		message, err := decodeMessage(data)
+		if err != nil {
+			return nil, err
+		}
 
-	// 非 challenge 消息，路由到事件处理
-	t.routeMessage(message)
-	return nil, nil
+		if method, ok := message["method"].(string); ok && method == "challenge" {
+			return message, nil
+		}
+
+		// 非 challenge 消息，路由到事件处理后继续等待
+		t.routeMessage(message)
+	}
 }
 
 // readerLoop 后台读取循环
@@ -268,7 +291,9 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 		t.closedMu.Unlock()
 
 		if unexpectedDisconnect && !wasClosed && t.onDisconnect != nil {
-			t.onDisconnect(disconnectErr)
+			// 从 nhooyr.io/websocket 错误中提取 close code（-1 表示无 close frame）
+			closeCode := int(websocket.CloseStatus(disconnectErr))
+			t.onDisconnect(disconnectErr, closeCode)
 		}
 	}()
 
@@ -336,13 +361,13 @@ func (t *RPCTransport) routeMessage(message map[string]any) {
 	// challenge 消息
 	method, _ := message["method"].(string)
 	if method == "challenge" {
-		t.challenge = message
+		t.setChallenge(message)
 		params, _ := message["params"].(map[string]any)
 		t.dispatcher.Publish("connection.challenge", params)
 		return
 	}
 
-	// 事件消息
+	// 事件消息 — 异步发布，避免慢 handler 阻塞 readerLoop
 	if len(method) > 6 && method[:6] == "event/" {
 		protocolEvent := method[6:]
 		sdkEvent := protocolEvent
@@ -350,12 +375,12 @@ func (t *RPCTransport) routeMessage(message map[string]any) {
 			sdkEvent = mapped
 		}
 		params, _ := message["params"].(map[string]any)
-		t.dispatcher.Publish("_raw."+sdkEvent, params)
+		go t.dispatcher.Publish("_raw."+sdkEvent, params)
 		return
 	}
 
 	// 其他通知
-	t.dispatcher.Publish("notification", message)
+	go t.dispatcher.Publish("notification", message)
 }
 
 // decodeMessage 解码 WebSocket 消息为 map

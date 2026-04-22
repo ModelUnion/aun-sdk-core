@@ -27,7 +27,7 @@ import ssl
 import sys
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -49,6 +49,15 @@ except ImportError:
     sys.exit(1)
 
 from aun_core import AUNClient
+
+
+# websockets v14+ 将 extra_headers 更名为 additional_headers
+_WS_HDR_KEY = "additional_headers" if int(getattr(websockets, "__version__", "0").split(".")[0]) >= 14 else "extra_headers"
+
+
+def _ws_headers_kwarg(headers: dict) -> dict:
+    """返回包含正确 websockets header 参数名的 kwargs 字典"""
+    return {_WS_HDR_KEY: headers} if headers else {}
 
 
 # ---------------------------------------------------------------------------
@@ -142,12 +151,15 @@ def _nossl_ctx():
     return ctx
 
 
-async def _push_ws(push_url: str, chunks: list[str], close_after: bool = True):
-    """通过 WebSocket 推送 chunks"""
+async def _push_ws(push_url: str, chunks: list[str], close_after: bool = True,
+                   push_token: str = ""):
+    """通过 WebSocket 推送 chunks，token 通过 Authorization header 传递"""
     # 替换域名为本地地址（测试环境）
     url = _localize_url(push_url, ws=True)
     ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
+    ws_headers = {"Authorization": f"Bearer {push_token}"} if push_token else {}
     async with websockets.connect(url, ssl=ssl_ctx,
+                                  **_ws_headers_kwarg(ws_headers),
                                   max_size=64 * 1024 * 1024) as ws:
         for i, chunk in enumerate(chunks, 1):
             frame = json.dumps({"cmd": "data", "data": chunk, "seq": i}, ensure_ascii=False)
@@ -164,12 +176,17 @@ async def _push_ws(push_url: str, chunks: list[str], close_after: bool = True):
 async def _pull_sse(pull_url: str, timeout: float = 10.0,
                     last_event_id: str | None = None,
                     aid: str | None = None,
+                    pull_token: str = "",
                     stop_after_frames: int | None = None) -> list[dict]:
-    """通过 HTTP SSE 拉流，返回收到的帧列表 [{"seq": N, "data": "...", "event": "..."}]"""
+    """通过 HTTP SSE 拉流，返回收到的帧列表 [{"seq": N, "data": "...", "event": "..."}]
+    token 通过 Authorization header 传递，aid 通过 X-Stream-AID header 传递。
+    """
     url = _localize_url(pull_url, ws=False)
-    if aid:
-        url = _append_query_param(url, "aid", aid)
     headers = {"Accept": "text/event-stream"}
+    if pull_token:
+        headers["Authorization"] = f"Bearer {pull_token}"
+    if aid:
+        headers["X-Stream-AID"] = aid
     if last_event_id:
         headers["Last-Event-ID"] = last_event_id
 
@@ -258,12 +275,6 @@ def _localize_url(url: str, ws: bool = False) -> str:
     return url
 
 
-def _append_query_param(url: str, key: str, value: str) -> str:
-    parsed = urlparse(url)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query[key] = value
-    return urlunparse(parsed._replace(query=urlencode(query)))
-
 
 # ---------------------------------------------------------------------------
 # 测试用例
@@ -279,6 +290,8 @@ async def test_basic_push_pull_flow():
         stream_id = result["stream_id"]
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
         assert stream_id, "stream_id 不能为空"
         assert push_url, "push_url 不能为空"
         assert pull_url, "pull_url 不能为空"
@@ -286,9 +299,9 @@ async def test_basic_push_pull_flow():
         chunks = ["Hello", " ", "World"]
 
         # 并行推拉
-        push_task = asyncio.create_task(_push_ws(push_url, chunks))
+        push_task = asyncio.create_task(_push_ws(push_url, chunks, push_token=push_token))
         await asyncio.sleep(0.2)  # 让推流先开始
-        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5))
+        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5, pull_token=pull_token))
 
         await push_task
         frames = await pull_task
@@ -316,11 +329,13 @@ async def test_sse_seq_in_id_field():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
         chunks = ["chunk_a", "chunk_b", "chunk_c"]
-        push_task = asyncio.create_task(_push_ws(push_url, chunks))
+        push_task = asyncio.create_task(_push_ws(push_url, chunks, push_token=push_token))
         await asyncio.sleep(0.2)
-        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5))
+        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5, pull_token=pull_token))
 
         await push_task
         frames = await pull_task
@@ -347,16 +362,20 @@ async def test_late_puller_gets_buffer():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
         # 先推 3 个 chunk
         url = _localize_url(push_url, ws=True)
-        async with websockets.connect(url, ssl=_nossl_ctx() if url.startswith("wss") else None, max_size=64*1024*1024) as ws:
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=_nossl_ctx() if url.startswith("wss") else None,
+                                       **_ws_headers_kwarg(push_headers), max_size=64*1024*1024) as ws:
             for i in range(1, 4):
                 await ws.send(json.dumps({"cmd": "data", "data": f"buffered_{i}", "seq": i}))
             await asyncio.sleep(0.3)
 
             # 现在连接拉流端
-            pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5))
+            pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5, pull_token=pull_token))
             await asyncio.sleep(0.2)
 
             # 再推 2 个实时 chunk
@@ -389,11 +408,14 @@ async def test_resume_from_last_event_id():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
         url = _localize_url(push_url, ws=True)
         ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
-        async with websockets.connect(url, ssl=ssl_ctx, max_size=64 * 1024 * 1024) as ws:
-            first_pull = asyncio.create_task(_pull_sse(pull_url, timeout=2, stop_after_frames=2))
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64 * 1024 * 1024) as ws:
+            first_pull = asyncio.create_task(_pull_sse(pull_url, timeout=2, stop_after_frames=2, pull_token=pull_token))
             await asyncio.sleep(0.2)
             await ws.send(json.dumps({"cmd": "data", "data": "resume_1", "seq": 1}))
             await ws.send(json.dumps({"cmd": "data", "data": "resume_2", "seq": 2}))
@@ -402,7 +424,7 @@ async def test_resume_from_last_event_id():
             data1 = [f for f in first_frames if f["event"] != "done"]
             assert [f["seq"] for f in data1] == [1, 2]
 
-            second_pull = asyncio.create_task(_pull_sse(pull_url, timeout=5, last_event_id="2"))
+            second_pull = asyncio.create_task(_pull_sse(pull_url, timeout=5, last_event_id="2", pull_token=pull_token))
             await asyncio.sleep(0.2)
             await ws.send(json.dumps({"cmd": "data", "data": "resume_3", "seq": 3}))
             await ws.send(json.dumps({"cmd": "data", "data": "resume_4", "seq": 4}))
@@ -429,15 +451,17 @@ async def test_multiple_pullers():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
         chunks = ["A", "B", "C", "D", "E"]
 
         # 3 个 puller 并行
-        pull_tasks = [asyncio.create_task(_pull_sse(pull_url, timeout=5)) for _ in range(3)]
+        pull_tasks = [asyncio.create_task(_pull_sse(pull_url, timeout=5, pull_token=pull_token)) for _ in range(3)]
         await asyncio.sleep(0.3)
 
         # 推送
-        await _push_ws(push_url, chunks)
+        await _push_ws(push_url, chunks, push_token=push_token)
 
         # 等待所有 puller 完成
         all_frames = await asyncio.gather(*pull_tasks)
@@ -464,15 +488,18 @@ async def test_target_aid_restriction():
             "target_aid": target_aid,
         })
         pull_url = _localize_url(result["pull_url"], ws=False)
+        pull_token = result["pull_token"]
 
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
-            ok_url = _append_query_param(pull_url, "aid", target_aid)
-            async with session.get(ok_url, headers={"Accept": "text/event-stream"}) as resp:
+            ok_headers = {"Authorization": f"Bearer {pull_token}", "X-Stream-AID": target_aid,
+                          "Accept": "text/event-stream"}
+            async with session.get(pull_url, headers=ok_headers) as resp:
                 assert resp.status == 200, f"正确 aid 应允许拉流，收到 {resp.status}"
 
-            bad_url = _append_query_param(pull_url, "aid", "outsider.agentid.pub")
-            async with session.get(bad_url, headers={"Accept": "text/event-stream"}) as resp:
+            bad_headers = {"Authorization": f"Bearer {pull_token}", "X-Stream-AID": "outsider.agentid.pub",
+                           "Accept": "text/event-stream"}
+            async with session.get(pull_url, headers=bad_headers) as resp:
                 assert resp.status == 403, f"错误 aid 应被拒绝，收到 {resp.status}"
 
         print("  [OK] target_aid 绑定限制通过")
@@ -488,13 +515,14 @@ async def test_push_token_validation():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         stream_id = result["stream_id"]
 
-        # 构造错误的 push_url
+        # 构造错误的 push_url（通过 header 传递错误 token）
         scheme = "wss" if _STREAM_SSL else "ws"
-        bad_url = f"{scheme}://{_STREAM_HOST}:{_STREAM_PORT}/push/{stream_id}?token=bad_token_xxx"
+        bad_url = f"{scheme}://{_STREAM_HOST}:{_STREAM_PORT}/push/{stream_id}"
+        bad_headers = {"Authorization": "Bearer bad_token_xxx"}
         rejected = False
         try:
             ssl_ctx = _nossl_ctx() if _STREAM_SSL else None
-            async with websockets.connect(bad_url, ssl=ssl_ctx, max_size=64*1024*1024) as ws:
+            async with websockets.connect(bad_url, ssl=ssl_ctx, **_ws_headers_kwarg(bad_headers), max_size=64*1024*1024) as ws:
                 await ws.send(json.dumps({"cmd": "data", "data": "test", "seq": 1}))
                 # 如果连接成功但服务端返回错误，也算拒绝
                 resp = await asyncio.wait_for(ws.recv(), timeout=2)
@@ -516,13 +544,16 @@ async def test_invalid_json_frame_then_recover():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
-        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5))
+        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5, pull_token=pull_token))
         await asyncio.sleep(0.2)
 
         url = _localize_url(push_url, ws=True)
         ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
-        async with websockets.connect(url, ssl=ssl_ctx, max_size=64 * 1024 * 1024) as ws:
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64 * 1024 * 1024) as ws:
             await ws.send("{bad json")
             error_resp = await asyncio.wait_for(ws.recv(), timeout=2)
             error_payload = json.loads(error_resp)
@@ -555,10 +586,11 @@ async def test_pull_token_validation():
         stream_id = result["stream_id"]
 
         scheme = "https" if _STREAM_SSL else "http"
-        bad_url = f"{scheme}://{_STREAM_HOST}:{_STREAM_PORT}/pull/{stream_id}?token=bad_token_xxx"
+        bad_url = f"{scheme}://{_STREAM_HOST}:{_STREAM_PORT}/pull/{stream_id}"
+        bad_headers = {"Authorization": "Bearer bad_token_xxx"}
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(bad_url) as resp:
+            async with session.get(bad_url, headers=bad_headers) as resp:
                 assert resp.status == 403, f"期望 403，收到 {resp.status}"
 
         print(f"  [OK] pull_token 验证通过")
@@ -574,14 +606,18 @@ async def test_stream_close_notifies_pullers():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
         # 先连接 puller
-        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5))
+        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5, pull_token=pull_token))
         await asyncio.sleep(0.3)
 
         # 推送一个 chunk 然后关闭
         url = _localize_url(push_url, ws=True)
-        async with websockets.connect(url, ssl=_nossl_ctx() if url.startswith("wss") else None, max_size=64*1024*1024) as ws:
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=_nossl_ctx() if url.startswith("wss") else None,
+                                       **_ws_headers_kwarg(push_headers), max_size=64*1024*1024) as ws:
             await ws.send(json.dumps({"cmd": "data", "data": "final", "seq": 1}))
             await asyncio.sleep(0.1)
             await ws.send(json.dumps({"cmd": "close"}))
@@ -603,6 +639,7 @@ async def test_stream_info_status_and_reject_push_after_close():
         result = await client.call("stream.create", {"content_type": "text/plain"})
         stream_id = result["stream_id"]
         push_url = result["push_url"]
+        push_token = result["push_token"]
 
         waiting = await client.call("stream.get_info", {"stream_id": stream_id})
         assert waiting["status"] == "waiting"
@@ -610,7 +647,8 @@ async def test_stream_info_status_and_reject_push_after_close():
 
         url = _localize_url(push_url, ws=True)
         ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
-        async with websockets.connect(url, ssl=ssl_ctx, max_size=64 * 1024 * 1024) as ws:
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64 * 1024 * 1024) as ws:
             await ws.send(json.dumps({"cmd": "data", "data": "info_chunk", "seq": 1}))
             await asyncio.sleep(0.2)
 
@@ -632,7 +670,7 @@ async def test_stream_info_status_and_reject_push_after_close():
 
         rejected = False
         try:
-            async with websockets.connect(url, ssl=ssl_ctx, max_size=64 * 1024 * 1024):
+            async with websockets.connect(url, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64 * 1024 * 1024):
                 pass
         except Exception:
             rejected = True
@@ -704,9 +742,11 @@ async def test_concurrent_streams():
         # 并行推拉
         async def _push_pull_one(idx, stream_info):
             chunks = [f"stream{idx}_chunk{j}" for j in range(3)]
-            push_task = asyncio.create_task(_push_ws(stream_info["push_url"], chunks))
+            pt = stream_info["push_token"]
+            plt = stream_info["pull_token"]
+            push_task = asyncio.create_task(_push_ws(stream_info["push_url"], chunks, push_token=pt))
             await asyncio.sleep(0.1)
-            frames = await _pull_sse(stream_info["pull_url"], timeout=5)
+            frames = await _pull_sse(stream_info["pull_url"], timeout=5, pull_token=plt)
             await push_task
             data_frames = [f for f in frames if f["event"] != "done"]
             assert len(data_frames) == 3, f"流 {idx}: 期望 3 帧，收到 {len(data_frames)}"
@@ -729,14 +769,18 @@ async def test_rpc_close_stops_stream():
         stream_id = result["stream_id"]
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
         # 连接 puller
-        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5))
+        pull_task = asyncio.create_task(_pull_sse(pull_url, timeout=5, pull_token=pull_token))
         await asyncio.sleep(0.3)
 
         # 推送一些数据
         url = _localize_url(push_url, ws=True)
-        async with websockets.connect(url, ssl=_nossl_ctx() if url.startswith("wss") else None, max_size=64*1024*1024) as ws:
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=_nossl_ctx() if url.startswith("wss") else None,
+                                       **_ws_headers_kwarg(push_headers), max_size=64*1024*1024) as ws:
             await ws.send(json.dumps({"cmd": "data", "data": "before_close", "seq": 1}))
             await asyncio.sleep(0.2)
 
@@ -753,8 +797,8 @@ async def test_rpc_close_stops_stream():
         await client.close()
 
 
-async def test_header_query_token_compat_matrix():
-    """Token 通过 HTTP header 和 query 参数两种方式均可鉴权"""
+async def test_header_token_auth():
+    """Token 通过 HTTP header 鉴权（push via WS header, pull via Authorization header）"""
     client = _make_client()
     try:
         aid = await _ensure_connected(client, _ALICE_AID)
@@ -765,58 +809,14 @@ async def test_header_query_token_compat_matrix():
         stream_id = result["stream_id"]
         push_url = result["push_url"]
         pull_url = result["pull_url"]
-        push_token = result.get("push_token", "")
-        pull_token = result.get("pull_token", "")
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
-        # --- 场景 1: push_token via query, pull_token via header ---
-        # push via query（在 URL 上附加 token）
+        # push via header
         push_base = _localize_url(push_url, ws=True)
-        sep = "&" if "?" in push_base else "?"
-        push_url_with_query = f"{push_base}{sep}token={push_token}"
-        ssl_ctx = _nossl_ctx() if push_url_with_query.startswith("wss") else None
-        async with websockets.connect(push_url_with_query, ssl=ssl_ctx, max_size=64*1024*1024) as ws:
-            await ws.send(json.dumps({"cmd": "data", "data": "query_push", "seq": 1}))
-            await ws.send(json.dumps({"cmd": "close"}))
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=2)
-            except Exception:
-                pass
-
-        # pull via header
-        pull_base = _localize_url(pull_url)
-        headers = {"Authorization": f"Bearer {pull_token}"}
-        frames1 = []
-        async with aiohttp.ClientSession() as session:
-            ssl_ctx_h = _nossl_ctx() if pull_base.startswith("https") else None
-            async with session.get(pull_base, headers=headers, ssl=ssl_ctx_h, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                assert resp.status == 200, f"pull header auth 失败: {resp.status}"
-                async for line in resp.content:
-                    text = line.decode("utf-8", errors="replace").strip()
-                    if text.startswith("data:"):
-                        try:
-                            frames1.append(json.loads(text[5:].strip()))
-                        except Exception:
-                            pass
-
-        data_frames1 = [f for f in frames1 if f.get("data") == "query_push"]
-        assert len(data_frames1) >= 1, "场景1: pull via header 未收到数据"
-        print(f"  [OK] 场景1: push_token query + pull_token header")
-
-        # --- 场景 2: push_token via extra_headers, pull_token via query ---
-        result2 = await client.call("stream.create", {
-            "content_type": "text/plain",
-            "buffer_size": 10,
-        })
-        push_url2 = result2["push_url"]
-        pull_url2 = result2["pull_url"]
-        push_token2 = result2.get("push_token", "")
-        pull_token2 = result2.get("pull_token", "")
-
-        # push via extra_headers
-        push_base2 = _localize_url(push_url2, ws=True)
-        ssl_ctx2 = _nossl_ctx() if push_base2.startswith("wss") else None
-        extra_headers = {"Authorization": f"Bearer {push_token2}"}
-        async with websockets.connect(push_base2, ssl=ssl_ctx2, extra_headers=extra_headers, max_size=64*1024*1024) as ws:
+        ssl_ctx = _nossl_ctx() if push_base.startswith("wss") else None
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(push_base, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64*1024*1024) as ws:
             await ws.send(json.dumps({"cmd": "data", "data": "header_push", "seq": 1}))
             await ws.send(json.dumps({"cmd": "close"}))
             try:
@@ -824,28 +824,27 @@ async def test_header_query_token_compat_matrix():
             except Exception:
                 pass
 
-        # pull via query
-        pull_base2 = _localize_url(pull_url2)
-        sep2 = "&" if "?" in pull_base2 else "?"
-        pull_url_with_query = f"{pull_base2}{sep2}token={pull_token2}"
-        frames2 = []
-        async with aiohttp.ClientSession() as session:
-            ssl_ctx_q = _nossl_ctx() if pull_url_with_query.startswith("https") else None
-            async with session.get(pull_url_with_query, ssl=ssl_ctx_q, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                assert resp.status == 200, f"pull query auth 失败: {resp.status}"
+        # pull via Authorization header
+        pull_base = _localize_url(pull_url)
+        pull_headers = {"Authorization": f"Bearer {pull_token}", "Accept": "text/event-stream"}
+        frames = []
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(pull_base, headers=pull_headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                assert resp.status == 200, f"pull header auth 失败: {resp.status}"
                 async for line in resp.content:
                     text = line.decode("utf-8", errors="replace").strip()
                     if text.startswith("data:"):
+                        raw = text[5:].strip()
                         try:
-                            frames2.append(json.loads(text[5:].strip()))
+                            frames.append(json.loads(raw))
                         except Exception:
-                            pass
+                            # SSE data 可能是纯文本（非 JSON）
+                            frames.append({"data": raw})
 
-        data_frames2 = [f for f in frames2 if f.get("data") == "header_push"]
-        assert len(data_frames2) >= 1, "场景2: pull via query 未收到数据"
-        print(f"  [OK] 场景2: push_token header + pull_token query")
-
-        print(f"  [OK] Token header/query 兼容矩阵全部通过")
+        data_frames = [f for f in frames if f.get("data") == "header_push"]
+        assert len(data_frames) >= 1, "pull via header 未收到数据"
+        print(f"  [OK] Token header 鉴权通过")
     finally:
         await client.close()
 
@@ -863,12 +862,14 @@ async def test_high_concurrency_pullers():
         })
         push_url = result["push_url"]
         pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
 
         # 启动 20 个 puller
         pull_tasks = []
         for i in range(NUM_PULLERS):
             task = asyncio.create_task(
-                _pull_sse(pull_url, timeout=30, stop_after_frames=NUM_CHUNKS + 1)
+                _pull_sse(pull_url, timeout=30, stop_after_frames=NUM_CHUNKS + 1, pull_token=pull_token)
             )
             pull_tasks.append(task)
 
@@ -877,7 +878,8 @@ async def test_high_concurrency_pullers():
         # 推送 100 chunks
         url = _localize_url(push_url, ws=True)
         ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
-        async with websockets.connect(url, ssl=ssl_ctx, max_size=64*1024*1024) as ws:
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64*1024*1024) as ws:
             for seq in range(1, NUM_CHUNKS + 1):
                 frame = json.dumps({"cmd": "data", "data": f"chunk_{seq}", "seq": seq})
                 await ws.send(frame)
@@ -940,7 +942,7 @@ async def run_all():
         ("list_active 列表", test_stream_list_active),
         ("并发多流", test_concurrent_streams),
         ("RPC close 关闭", test_rpc_close_stops_stream),
-        ("Token header/query 兼容矩阵", test_header_query_token_compat_matrix),
+        ("Token header 鉴权", test_header_token_auth),
         ("高并发 puller", test_high_concurrency_pullers),
     ]
 

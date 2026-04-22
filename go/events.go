@@ -65,22 +65,23 @@ func (d *EventDispatcher) Subscribe(event string, handler EventHandler) *Subscri
 	}
 }
 
-// Unsubscribe 取消订阅指定事件的处理函数
-// 注意：Go 中函数不可直接比较，此处按注册顺序移除最后一个匹配项
+// Unsubscribe 取消订阅指定事件的处理函数。
+// 已废弃：Go 中函数不可直接比较，此方法无法准确匹配 handler。
+// 请使用 Subscribe 返回的 Subscription.Unsubscribe() 按 ID 移除。
+//
+// Deprecated: Use Subscription.Unsubscribe() instead.
 func (d *EventDispatcher) Unsubscribe(event string, handler EventHandler) {
+	log.Printf("警告: EventDispatcher.Unsubscribe(event, handler) 已废弃且无法精确匹配 handler，" +
+		"请使用 Subscription.Unsubscribe()。事件: %s", event)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	entries := d.handlers[event]
 	if len(entries) == 0 {
 		return
 	}
-	// 使用函数指针比较来查找匹配项（注意：Go 不支持直接比较函数值，
-	// 但同一变量引用的函数是同一地址，可以通过 reflect 进行比较。
-	// 简化方案：移除最后注册的同名事件处理函数）
-	// 实际实现中建议使用 Subscription.Unsubscribe() 按 ID 移除
-	if len(entries) > 0 {
-		d.handlers[event] = entries[:len(entries)-1]
-	}
+	// Go 中函数值不可比较，无法精确匹配。
+	// 移除最后一个 entry 作为尽力而为的兼容行为。
+	d.handlers[event] = entries[:len(entries)-1]
 	if len(d.handlers[event]) == 0 {
 		delete(d.handlers, event)
 	}
@@ -104,8 +105,9 @@ func (d *EventDispatcher) unsubscribeByID(event string, id uint64) {
 	}
 }
 
-// Publish 发布事件，按注册顺序同步执行所有处理函数。
-// 处理函数中的 panic 会被 recover，不会导致调用方崩溃。
+// Publish 发布事件，每个 handler 在独立 goroutine 中异步执行。
+// ISSUE-SDK-GO-006: handler 异步化，避免用户注册的外部 handler 阻塞事件循环。
+// 处理函数中的 panic 会被 recover，不会导致其他 handler 或调用方崩溃。
 func (d *EventDispatcher) Publish(event string, payload any) {
 	d.mu.RLock()
 	// 复制一份 handler 列表，避免在执行过程中持锁
@@ -114,13 +116,13 @@ func (d *EventDispatcher) Publish(event string, payload any) {
 	d.mu.RUnlock()
 
 	for _, entry := range entries {
-		func() {
+		go func(e handlerEntry) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("事件 %s 处理器执行异常 (panic): %v", event, r)
 				}
 			}()
-			entry.handler(payload)
-		}()
+			e.handler(payload)
+		}(entry)
 	}
 }

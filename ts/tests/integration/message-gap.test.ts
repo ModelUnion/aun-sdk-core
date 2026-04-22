@@ -5,25 +5,25 @@
  * 最终业务层收到完整有序消息序列。
  */
 
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
 
 process.env.AUN_ENV ??= 'development';
 
-const AUN_DATA_ROOT = process.env.AUN_DATA_ROOT ?? '';
-const TEST_AUN_PATH = process.env.AUN_TEST_AUN_PATH
-  ?? (AUN_DATA_ROOT ? `${AUN_DATA_ROOT}/single-domain/persistent` : '');
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const ALICE_AID = process.env.AUN_TEST_ALICE_AID ?? `alice.${ISSUER}`;
-const BOB_AID = process.env.AUN_TEST_BOB_AID ?? `bob.${ISSUER}`;
+
+function runId(): string {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+}
 
 function makeClient(): AUNClient {
-  const aunPath = TEST_AUN_PATH || fs.mkdtempSync(path.join(os.tmpdir(), 'aun-gap-'));
-  const client = new AUNClient({ aun_path: aunPath });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-gap-'));
+  const client = new AUNClient({ aun_path: tmpDir });
   ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
   return client;
 }
@@ -44,14 +44,18 @@ describe('P2P Message Gap Fill', { timeout: 30000 }, () => {
   });
 
   it('应自动补洞并按序投递完整消息', async () => {
+    const rid = runId();
+    const aliceAid = `gap-a-${rid}.${ISSUER}`;
+    const bobAid = `gap-b-${rid}.${ISSUER}`;
+
     alice = makeClient();
     bob = makeClient();
-    await ensureConnected(alice, ALICE_AID);
-    await ensureConnected(bob, BOB_AID);
+    await ensureConnected(alice, aliceAid);
+    await ensureConnected(bob, bobAid);
 
     // Alice 发送 5 条消息
     for (let i = 1; i <= 5; i++) {
-      await alice.call('message.send', { to: BOB_AID, payload: `msg${i}`, encrypt: true });
+      await alice.call('message.send', { to: bobAid, payload: { text: `msg${i}` }, encrypt: false });
       await new Promise(r => setTimeout(r, 200));
     }
 
@@ -60,9 +64,9 @@ describe('P2P Message Gap Fill', { timeout: 30000 }, () => {
 
     // Bob 拉取所有消息
     const result = await bob.call('message.pull', { after_seq: 0, limit: 50 }) as {
-      messages?: Array<{ seq: number; payload: string; from: string }>;
+      messages?: Array<{ seq: number; payload: any; from: string }>;
     };
-    const msgs = (result.messages ?? []).filter(m => m.from === ALICE_AID);
+    const msgs = (result.messages ?? []).filter(m => m.from === aliceAid);
 
     expect(msgs.length).toBe(5);
 
@@ -73,27 +77,34 @@ describe('P2P Message Gap Fill', { timeout: 30000 }, () => {
     }
 
     // 验证 payload 顺序
-    const payloads = msgs.map(m => m.payload);
+    const payloads = msgs.map(m => {
+      const p = m.payload;
+      return typeof p === 'object' && p !== null ? p.text : p;
+    });
     expect(payloads).toEqual(['msg1', 'msg2', 'msg3', 'msg4', 'msg5']);
   });
 
   it('push 路径检测到 gap 后应触发补洞', async () => {
+    const rid = runId();
+    const aliceAid = `gap2-a-${rid}.${ISSUER}`;
+    const bobAid = `gap2-b-${rid}.${ISSUER}`;
+
     alice = makeClient();
     bob = makeClient();
-    await ensureConnected(alice, ALICE_AID);
-    await ensureConnected(bob, BOB_AID);
+    await ensureConnected(alice, aliceAid);
+    await ensureConnected(bob, bobAid);
 
     // 收集 Bob 通过推送收到的消息
-    const received: Array<{ seq: number; payload: string }> = [];
+    const received: Array<{ seq: number; payload: any }> = [];
     bob.on('message.received', (data: any) => {
-      if (data.from === ALICE_AID) {
+      if (data.from === aliceAid) {
         received.push({ seq: data.seq, payload: data.payload });
       }
     });
 
     // Alice 快速发送 5 条消息（可能触发 gap）
     for (let i = 1; i <= 5; i++) {
-      await alice.call('message.send', { to: BOB_AID, payload: `gap_msg${i}`, encrypt: true });
+      await alice.call('message.send', { to: bobAid, payload: { text: `gap_msg${i}` }, encrypt: false });
     }
 
     // 等待推送 + 补洞完成
@@ -102,11 +113,10 @@ describe('P2P Message Gap Fill', { timeout: 30000 }, () => {
     // 如果推送路径没有全部收到，主动拉取验证
     if (received.length < 5) {
       const result = await bob.call('message.pull', { after_seq: 0, limit: 50 }) as {
-        messages?: Array<{ seq: number; payload: string; from: string }>;
+        messages?: Array<{ seq: number; payload: any; from: string }>;
       };
-      const pulled = (result.messages ?? []).filter(m => m.from === ALICE_AID);
+      const pulled = (result.messages ?? []).filter(m => m.from === aliceAid);
       expect(pulled.length).toBeGreaterThanOrEqual(5);
     }
   });
 });
-

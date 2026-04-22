@@ -94,6 +94,8 @@ export interface AUNConfig {
   requireForwardSecrecy: boolean;
   /** 防重放窗口（秒） */
   replayWindowSeconds: number;
+  /** Custody 托管服务 URL */
+  custodyUrl: string;
 }
 
 function readOptionalNumber(value: unknown, fallback: number | null): number | null {
@@ -131,6 +133,7 @@ export function defaultConfig(): AUNConfig {
     verifySsl: resolveVerifySslFromEnv(),
     requireForwardSecrecy: true,
     replayWindowSeconds: 300,
+    custodyUrl: '',
   };
 }
 
@@ -157,5 +160,6 @@ export function configFromMap(raw: JsonObject): AUNConfig {
     verifySsl: readBoolean(raw.verify_ssl ?? raw.verifySSL ?? raw.verifySsl, def.verifySsl),
     requireForwardSecrecy: readBoolean(raw.require_forward_secrecy ?? raw.requireForwardSecrecy, def.requireForwardSecrecy),
     replayWindowSeconds: readOptionalNumber(raw.replay_window_seconds ?? raw.replayWindowSeconds, def.replayWindowSeconds) ?? def.replayWindowSeconds,
+    custodyUrl: raw.custody_url != null ? String(raw.custody_url) : (raw.custodyUrl != null ? String(raw.custodyUrl) : def.custodyUrl),
   };
 }

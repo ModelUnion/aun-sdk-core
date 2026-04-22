@@ -33,6 +33,8 @@ _BACKOFF_INTERVALS = [1.0, 3.0, 10.0, 30.0, 60.0]
 # 服务端明确 tombstone 驱动，否则漏消息窗口里所有 gap 都会在探测 5 次后被静默放弃。
 # 保留 _MAX_PROBE_COUNT 变量仅用作退避索引上限。
 _MAX_PROBE_COUNT = 5
+# received_seqs 内存上限：超过此值时强制跳过空洞推进 contiguous_seq
+_RECEIVED_SEQS_LIMIT = 5000
 
 
 @dataclass
@@ -112,6 +114,10 @@ class SeqTracker:
         t.received_seqs.add(seq)
         t.max_seen_seq = max(t.max_seen_seq, seq)
 
+        # 内存保护：received_seqs 超过上限时，强制跳过空洞推进 contiguous_seq
+        if len(t.received_seqs) > _RECEIVED_SEQS_LIMIT:
+            self._force_compact(t)
+
         if seq == t.contiguous_seq + 1:
             # 正常递进
             t.contiguous_seq = seq
@@ -187,6 +193,19 @@ class SeqTracker:
             t.contiguous_seq += 1
             t.received_seqs.discard(t.contiguous_seq)
 
+    def _force_compact(self, t: _TrackerState) -> None:
+        """内存保护：received_seqs 超限时强制跳过空洞推进 contiguous_seq。"""
+        min_seq = min(t.received_seqs)
+        t.contiguous_seq = min_seq - 1
+        # 正常推进
+        while (t.contiguous_seq + 1) in t.received_seqs:
+            t.contiguous_seq += 1
+            t.received_seqs.discard(t.contiguous_seq)
+        # 清理被跳过区间内的 pending_gaps（gap_end <= 最终 contiguous_seq）
+        for gap_key in list(t.pending_gaps):
+            if gap_key[1] <= t.contiguous_seq:
+                del t.pending_gaps[gap_key]
+
     @staticmethod
     def _should_probe(probe: GapProbe) -> bool:
         """判断是否应该再次探测（指数退避）。
@@ -231,6 +250,10 @@ class SeqTracker:
             t.contiguous_seq = seq
             t.max_seen_seq = max(t.max_seen_seq, seq)
             self._try_advance(t)
+
+    def remove_namespace(self, ns: str) -> None:
+        """移除指定命名空间的所有跟踪状态（dissolve/leave 时调用）。"""
+        self._trackers.pop(ns, None)
 
     def restore_state(self, state: dict[str, int]) -> None:
         """从持久化数据恢复各命名空间的 contiguous_seq。"""

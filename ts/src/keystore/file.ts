@@ -15,6 +15,8 @@ import {
   writeFileSync,
   readdirSync,
   chmodSync,
+  renameSync,
+  unlinkSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -23,6 +25,7 @@ import type { KeyStore } from './index.js';
 import type { SecretStore } from '../secret-store/index.js';
 import { AIDDatabase } from './aid-db.js';
 import { normalizeInstanceId } from '../config.js';
+import { certificateSha256Fingerprint } from '../crypto.js';
 import { createDefaultSecretStore } from '../secret-store/index.js';
 import {
   isJsonObject,
@@ -50,12 +53,8 @@ function deepClone<T>(value: T): T {
 }
 
 function fingerprintFromCertPem(certPem: string): string {
-  try {
-    const cert = new crypto.X509Certificate(certPem);
-    return `sha256:${cert.fingerprint256.replace(/:/g, '').toLowerCase()}`;
-  } catch {
-    return '';
-  }
+  // 委托给 crypto.ts 的统一实现（ISSUE-SDK-TS-008: 消除两套指纹计算）
+  return certificateSha256Fingerprint(certPem);
 }
 
 function normalizeCertFingerprint(fp?: string): string {
@@ -101,7 +100,20 @@ export class FileKeyStore implements KeyStore {
     let db = this._aidDBs.get(safe);
     if (!db) {
       const dbPath = join(this._aidsRoot, safe, 'aun.db');
-      db = new AIDDatabase(dbPath);
+      try {
+        db = new AIDDatabase(dbPath);
+      } catch (exc) {
+        // DB 损坏：备份后重建
+        console.warn('[aun_core.keystore] 数据库损坏，备份后重建');
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const bakPath = dbPath + `.corrupt_${ts}.bak`;
+        try { renameSync(dbPath, bakPath); } catch { /* 备份失败也继续重建 */ }
+        // 清理 WAL/SHM
+        for (const suffix of ['-wal', '-shm', '-journal']) {
+          try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+        }
+        db = new AIDDatabase(dbPath);
+      }
       this._aidDBs.set(safe, db);
     }
     return db;
@@ -112,6 +124,8 @@ export class FileKeyStore implements KeyStore {
       mkdirSync(preferred, { recursive: true });
       return preferred;
     } catch {
+      // ISSUE-TS-003: 回退时警告用户数据存储位置变更
+      console.warn(`[aun_core.keystore] 首选路径 ${preferred} 不可用，回退到 ${fallback}`);
       mkdirSync(fallback, { recursive: true });
       return fallback;
     }
@@ -122,8 +136,13 @@ export class FileKeyStore implements KeyStore {
   loadKeyPair(aid: string): KeyPairRecord | null {
     const path = this._keyPairPath(aid);
     if (!existsSync(path)) return null;
-    const raw = JSON.parse(readFileSync(path, 'utf-8'));
-    return this._restoreKeyPair(aid, raw);
+    try {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      return this._restoreKeyPair(aid, raw);
+    } catch (exc) {
+      console.warn('[aun_core.keystore] key.json 读取或解析失败，视为不存在');
+      return null;
+    }
   }
 
   saveKeyPair(aid: string, keyPair: KeyPairRecord): void {
@@ -153,19 +172,25 @@ export class FileKeyStore implements KeyStore {
   // ── Cert ─────────────────────────────────────────────────
 
   loadCert(aid: string, certFingerprint?: string): string | null {
-    const norm = normalizeCertFingerprint(certFingerprint);
-    if (norm) {
-      const vp = this._certVersionPath(aid, norm);
-      if (existsSync(vp)) return readFileSync(vp, 'utf-8');
-      const active = this._certPath(aid);
-      if (existsSync(active)) {
-        const certPem = readFileSync(active, 'utf-8');
-        if (fingerprintFromCertPem(certPem) === norm) return certPem;
+    try {
+      const norm = normalizeCertFingerprint(certFingerprint);
+      if (norm) {
+        const vp = this._certVersionPath(aid, norm);
+        if (existsSync(vp)) return readFileSync(vp, 'utf-8');
+        const active = this._certPath(aid);
+        if (existsSync(active)) {
+          const certPem = readFileSync(active, 'utf-8');
+          if (fingerprintFromCertPem(certPem) === norm) return certPem;
+        }
+        return null;
       }
+      const path = this._certPath(aid);
+      return existsSync(path) ? readFileSync(path, 'utf-8') : null;
+    } catch (exc) {
+      // 文件被锁定、无权限、目录冲突等异常时降级返回 null
+      console.warn('[aun_core.keystore] cert.pem 读取失败，视为不存在');
       return null;
     }
-    const path = this._certPath(aid);
-    return existsSync(path) ? readFileSync(path, 'utf-8') : null;
   }
 
   saveCert(aid: string, certPem: string, certFingerprint?: string, opts?: { makeActive?: boolean }): void {
@@ -207,7 +232,7 @@ export class FileKeyStore implements KeyStore {
           const certPubDer = x.publicKey.export({ type: 'spki', format: 'der' });
           const localPubDer = Buffer.from(localPubB64, 'base64');
           if (!certPubDer.equals(localPubDer)) {
-            console.error(`[keystore] 身份 ${aid} 的 key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert`);
+            console.error('[keystore] key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert');
           } else {
             identity.cert = cert;
           }
@@ -338,6 +363,12 @@ export class FileKeyStore implements KeyStore {
     return this._getDB(aid).cleanupGroupOldEpochs(groupId, cutoffMs);
   }
 
+  deleteGroupSecretState(aid: string, groupId: string): void {
+    const db = this._getDB(aid);
+    db.deleteGroupCurrent(groupId);
+    db.deleteAllGroupOldEpochs(groupId);
+  }
+
   // ── Instance State ───────────────────────────────────────
 
   loadInstanceState(aid: string, deviceId: string, slotId = ''): MetadataRecord | null {
@@ -379,6 +410,35 @@ export class FileKeyStore implements KeyStore {
 
   loadAllSeqs(aid: string, deviceId: string, slotId: string): Record<string, number> {
     return this._getDB(aid).loadAllSeqs(deviceId, slotId);
+  }
+
+  // ── 身份列表 ───────────────────────────────────────────
+
+  /** 列出所有已存储的 AID（对齐 Python list_identities） */
+  listIdentities(): string[] {
+    if (!existsSync(this._aidsRoot)) return [];
+    const aids: string[] = [];
+    for (const entry of readdirSync(this._aidsRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      aids.push(entry.name);
+    }
+    return aids;
+  }
+
+  /** 加载指定 AID 的元数据（对齐 Python load_metadata） */
+  loadMetadata(aid: string): Record<string, unknown> | null {
+    try {
+      const db = this._getDB(aid);
+      const kv = db.getAllMetadata();
+      if (Object.keys(kv).length === 0) return null;
+      const result: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(kv)) {
+        try { result[k] = JSON.parse(v); } catch { result[k] = v; }
+      }
+      return result;
+    } catch {
+      return null;
+    }
   }
 
   // ── 路径辅助 ─────────────────────────────────────────────

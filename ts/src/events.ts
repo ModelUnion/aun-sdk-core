@@ -39,6 +39,10 @@ export class Subscription {
 
 /**
  * 事件调度器：管理事件处理器的注册与派发。
+ *
+ * 线程安全说明：本实现依赖 Node.js 单线程事件循环模型，
+ * _handlers 的读写在同一微任务中完成，无需额外的并发保护。
+ * 若未来需要在 Worker 线程中共享同一实例，须引入锁或消息传递机制。
  */
 export class EventDispatcher {
   private _handlers: Map<string, EventHandler[]> = new Map();

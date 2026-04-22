@@ -322,3 +322,42 @@ class TestSeqTrackerNamespace:
         t.on_pull_result("g1", [{"seq": 2}])
         assert t.get_contiguous_seq("g1") == 3  # received_seqs 有 3 → 推到 3
         assert t.get_contiguous_seq("g2") == 1  # 未受影响
+
+
+class TestSeqTrackerMemoryBound:
+    """PY-006: received_seqs 不应无限增长。"""
+
+    def test_received_seqs_bounded_with_permanent_gap(self):
+        """当存在永久空洞时，received_seqs 不应无限增长。
+        模拟：seq 2 永远不到达，但 3..10002 全部到达。
+        内存保护应触发，强制跳过空洞推进 contiguous_seq。"""
+        t = SeqTracker()
+        t.on_message_seq("g1", 1)
+        # 跳过 seq 2，直接发送 3..10002
+        for seq in range(3, 10003):
+            t.on_message_seq("g1", seq)
+
+        state = t._get("g1")
+        # 内存保护触发后，contiguous_seq 应被推进（跳过空洞 2）
+        assert state.contiguous_seq == 10002
+        # received_seqs 应被清空或保持在合理范围
+        assert len(state.received_seqs) <= 5000
+        # pending_gaps 也不应无限增长
+        assert len(state.pending_gaps) <= 5000
+
+    def test_received_seqs_cleanup_after_advance(self):
+        """推进后 received_seqs 中 <= contiguous_seq 的元素应被清理。"""
+        t = SeqTracker()
+        t.on_message_seq("g1", 1)
+        t.on_message_seq("g1", 3)
+        t.on_message_seq("g1", 4)
+        t.on_message_seq("g1", 5)
+        # 此时 contiguous=1, received_seqs 应含 {3,4,5}
+        state = t._get("g1")
+        assert 3 in state.received_seqs
+
+        # 补齐 seq 2 → 推进到 5
+        t.on_message_seq("g1", 2)
+        assert state.contiguous_seq == 5
+        # 推进后 received_seqs 应为空
+        assert len(state.received_seqs) == 0

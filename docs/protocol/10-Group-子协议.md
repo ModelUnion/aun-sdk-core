@@ -32,7 +32,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | `name` | string | 群组名称 |
 | `owner_aid` | string | 群主 AID |
 | `creator_aid` | string | 创建者 AID |
-| `visibility` | string | `"public"` / `"invite_only"` / `"private"` |
+| `visibility` | string | `"public"` / `"private"` |
 | `status` | string | `"active"` / `"suspended"` / `"closed"` |
 | `description` | string | 群组描述 |
 | `metadata` | object | 自定义元数据 |
@@ -96,7 +96,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 |------|------|:----:|------|
 | `name` | string | ✅ | 群组名称 |
 | `group_id` | string | ❌ | 自定义群 ID，不提供则自动生成 |
-| `visibility` | string | ❌ | `"public"` / `"invite_only"` / `"private"`，默认由服务配置决定 |
+| `visibility` | string | ❌ | `"public"` / `"private"`，默认由服务配置决定 |
 | `description` | string | ❌ | 群组描述 |
 | `metadata` | object | ❌ | 自定义元数据 |
 | `avatar_ref` | string | ❌ | 头像存储引用 |
@@ -599,62 +599,6 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
 
 ---
 
-## 10.10 广播锁与权限
-
-### `group.acquire_broadcast_lock`
-
-获取群广播锁。用于独占广播权限。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "lock": { "holder_aid": "alice.agentid.pub", "expires_at": 1234567890 } }`
-
-### `group.release_broadcast_lock`
-
-释放群广播锁。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "released": true }`
-
-### `group.check_broadcast_permission`
-
-检查当前 AID 是否有广播权限。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "allowed": true }`
-
----
-
-## 10.11 成员归属索引
-
-### `group.register_membership`
-
-注册成员归属索引（用于快速查询 AID 所属群组）。
-
-**参数**：`group_id` (必填), `aid` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "aid": "alice.agentid.pub", "registered": true }`
-
-### `group.unregister_membership`
-
-更新成员归属索引为离开/移除状态。
-
-**参数**：`group_id` (必填), `aid` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "aid": "alice.agentid.pub", "unregistered": true }`
-
-### `group.list_membership`
-
-列出 AID 的群归属索引。
-
-**参数**：`aid` (必填)
-
-**响应**：`{ "aid": "alice.agentid.pub", "items": [ ... ] }`
-
----
-
 ## 10.12 在线状态
 
 群组在线状态是 per-AID 的全局状态（非 per-group），注册一次对所有群可见。
@@ -689,99 +633,7 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
 
 ---
 
-## 10.13 值班模式（Duty）
-
-值班模式允许群组消息按轮值策略分发给特定成员处理。
-
-### `group.update_duty_config`
-
-更新值班配置。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), `duty_mode` / `duty_fixed_agents` / `duty_rotation_strategy` 等配置项（可选）
-
-**响应**：`{ "group_id": "grp_abc", "config": { ... } }`
-
-### `group.get_duty_status`
-
-获取当前值班状态。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "current_duty_aid": "alice.agentid.pub", "shift_started_at": 1234567890, ... }`
-
-### `group.transfer_duty`
-
-手动交班给指定成员。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), `to_aid` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "from_aid": "alice.agentid.pub", "to_aid": "bob.agentid.pub" }`
-
----
-
-## 10.14 同步与调试
-
-以下方法用于多实例同步、故障排查和数据一致性校验。
-
-### `group.get_sync_status`
-
-获取群同步状态。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "sync_status": { ... } }`
-
-### `group.get_sync_log`
-
-获取群同步日志。
-
-**参数**：`group_id` (必填), `limit` (可选)
-
-**响应**：`{ "group_id": "grp_abc", "logs": [ ... ] }`
-
-### `group.get_dispatch_log`
-
-获取值班分发日志。
-
-**参数**：`group_id` (必填), `limit` (可选)
-
-**响应**：`{ "group_id": "grp_abc", "logs": [ ... ] }`
-
-### `group.get_duty_topic_log`
-
-获取值班主题日志。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "logs": [ ... ] }`
-
-### `group.get_checksum`
-
-获取逻辑对象校验和（用于数据一致性校验）。
-
-**参数**：`group_id` (必填), `object_type` (必填，如 `"group"` / `"members"` / `"messages"`)
-
-**响应**：`{ "group_id": "grp_abc", "checksum": "sha256:..." }`
-
-### `group.get_message_checksum`
-
-获取消息导出校验和。
-
-**参数**：`group_id` (必填), `from_seq` / `to_seq` (可选)
-
-**响应**：`{ "group_id": "grp_abc", "checksum": "sha256:...", "message_count": 100 }`
-
-### `group.get_file`
-
-导出逻辑对象为 JSON 文件。
-
-**参数**：`group_id` (必填), `object_type` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "file_url": "...", "expires_at": 1234567890 }`
-
----
-
-## 10.15 事件
+## 10.13 事件
 
 Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 
@@ -891,14 +743,14 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 | -32004 | Permission denied（权限不足） | 提示用户，不重试 |
 | -32001 | Authentication failed | 重新认证 |
 | -33001 | Group not found | 检查 group_id |
-| -33002 | Group suspended | 等待恢复或联系管理员 |
-| -33003 | Group closed | 不重试 |
-| -33004 | Already a member | 无需处理 |
-| -33005 | Not a member | 先加入群组 |
-| -33006 | Invite code invalid or expired | 获取新邀请码 |
-| -33007 | Join request pending | 等待审批 |
-| -33008 | Resource not found | 检查 resource_path |
-| -33009 | Resource request not found | 检查 request_id |
+| -33002 | Group state invalid（群状态不允许该操作） | 检查群状态 |
+| -33003 | Group suspended | 等待恢复或联系管理员 |
+| -33004 | Group member limit reached | 不重试 |
+| -33005 | Already a member | 无需处理 |
+| -33006 | Not a member | 先加入群组 |
+| -33007 | Role insufficient（权限不足） | 检查角色 |
+| -33008 | Invite code invalid or expired | 获取新邀请码 |
+| -33009 | Join rejected | 不重试 |
 
 ---
 
@@ -907,6 +759,6 @@ Group 服务通过 `event/group.*` 事件推送变更通知给相关 AID。
 - **Group Service 是独立 AID 持有者**：所有 `group.*` 方法都通过 Group Service 的 AID 暴露，不内嵌于 Gateway。
 - **消息 seq 单调递增**：per-group 粒度，确保顺序一致性，`ack_seq` 仅增不减。
 - **事件 seq 独立计数**：`event_seq` 与 `message_seq` 独立；消息增量拉取使用 `group.pull`，事件增量拉取使用 `group.pull_events`。
-- **duty 模式**：群规则 `dispatch_mode=duty` 时，消息仅推送给当班成员，`group.pull` 仍可拉取全量消息。
+- **duty 模式**：`duty_mode` 非 `"none"` 且 `duty_human_message_policy = "dispatch"` 时，消息先推送给当班成员处理，回复后再广播；`group.pull` 始终可拉取全量消息。
 - **资源审批**：`group.resources.request_add` 提交申请后需 admin 通过 `group.resources.review_add` 审批；直接添加（owner/admin）使用 `group.resources.direct_add`。
-- **在线状态**：通过 `group.go_online` / `group.go_offline` 管理，`group.heartbeat` 刷新有效期，`group.get_online_members` 查询当前在线成员列表。
+- **在线状态**：通过 `group.get_online_members` 查询当前在线成员列表。

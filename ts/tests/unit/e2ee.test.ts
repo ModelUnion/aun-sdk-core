@@ -331,7 +331,123 @@ describe('decryptMessage', () => {
   });
 });
 
-// ── 证书指纹测试 ─────────────────────────────────────────────
+// ── prekey 加密失败降级日志测试（TS-014）────────────────────────
+
+describe('prekey 加密失败降级日志（TS-014）', () => {
+  it('prekey 加密失败时应输出包含异常信息的警告日志', () => {
+    const { senderMgr, receiverKey, receiverCert } = makeE2EEPair();
+    const { prekey } = makePrekey(receiverKey);
+    // 伪造 cert_fingerprint 触发 prekey 加密失败
+    prekey.cert_fingerprint = `sha256:${'0'.repeat(64)}`;
+
+    const warnArgs: unknown[][] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnArgs.push(args); };
+
+    try {
+      const [_envelope, info] = senderMgr.encryptOutbound(
+        'receiver.test', { text: 'test' }, receiverCert,
+        prekey, crypto.randomUUID(), Date.now(),
+      );
+      // 应降级到 long_term_key
+      expect(info.mode).toBe(MODE_LONG_TERM_KEY);
+      expect(info.degraded).toBe(true);
+      // 验证 warn 被调用且包含异常对象
+      const prekeyWarn = warnArgs.find(args =>
+        typeof args[0] === 'string' && args[0].includes('prekey 加密失败'));
+      expect(prekeyWarn).toBeDefined();
+      // 最后一个参数应为异常对象（非空）
+      expect(prekeyWarn!.length).toBeGreaterThanOrEqual(2);
+      expect(prekeyWarn![prekeyWarn!.length - 1]).toBeTruthy();
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+});
+
+// ── 解密失败行为测试（TS-015）────────────────────────────────
+
+describe('decryptMessage 解密失败行为（TS-015）', () => {
+  it('篡改密文时 decryptMessage 应返回 null（不投递密文给应用层）', () => {
+    const { senderMgr, receiverMgr, receiverKey, receiverCert, receiverKs } = makeE2EEPair();
+    const { prekey, prekeyPrivateKey } = makePrekey(receiverKey);
+    const privPem = prekeyPrivateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+    receiverKs._prekeys['receiver.test'] = {
+      [prekey.prekey_id as string]: { private_key_pem: privPem, created_at: Date.now() },
+    };
+    const mid = crypto.randomUUID();
+    const ts = Date.now();
+    const [envelope] = senderMgr.encryptOutbound('receiver.test', { text: 'hi' }, receiverCert, prekey, mid, ts);
+    // 篡改密文
+    const tampered = { ...envelope, ciphertext: 'AAAAAAAAAAAAAAAA' };
+    const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };
+    const result = receiverMgr.decryptMessage(msg);
+    // 解密失败应返回 null，调用方（client.ts）据此触发 undecryptable 事件
+    expect(result).toBeNull();
+  });
+
+  it('prekey_ecdh_v2 解密失败时应输出包含上下文信息的警告日志', () => {
+    const { senderMgr, receiverMgr, receiverKey, receiverCert, receiverKs } = makeE2EEPair();
+    const { prekey, prekeyPrivateKey } = makePrekey(receiverKey);
+    const privPem = prekeyPrivateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+    receiverKs._prekeys['receiver.test'] = {
+      [prekey.prekey_id as string]: { private_key_pem: privPem, created_at: Date.now() },
+    };
+    const mid = crypto.randomUUID();
+    const ts = Date.now();
+    const [envelope] = senderMgr.encryptOutbound('receiver.test', { text: 'hi' }, receiverCert, prekey, mid, ts);
+    // 篡改 nonce（不影响签名验证，但解密会失败）
+    const tampered = { ...envelope, nonce: Buffer.from(crypto.randomBytes(12)).toString('base64') };
+    const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };
+
+    const warnArgs: unknown[][] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnArgs.push(args); };
+
+    try {
+      receiverMgr.decryptMessage(msg);
+      // 应有包含 mode/from/message_id 的解密失败日志
+      const decryptWarn = warnArgs.find(args =>
+        typeof args[0] === 'string' && args[0].includes('解密失败'));
+      expect(decryptWarn).toBeDefined();
+      // 日志中应包含 mode、from、message_id 等上下文
+      const logStr = String(decryptWarn![0]);
+      expect(logStr).toContain('prekey_ecdh_v2');
+      expect(logStr).toContain('sender.test');
+      expect(logStr).toContain(mid);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  it('long_term_key 解密失败时应输出包含上下文信息的警告日志', () => {
+    const { senderMgr, receiverMgr, receiverCert } = makeE2EEPair();
+    const mid = crypto.randomUUID();
+    const ts = Date.now();
+    const [envelope] = senderMgr.encryptOutbound('receiver.test', { text: 'hi' }, receiverCert, null, mid, ts);
+    // 篡改 nonce（不影响签名验证，但解密会失败）
+    const tampered = { ...envelope, nonce: Buffer.from(crypto.randomBytes(12)).toString('base64') };
+    const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };
+
+    const warnArgs: unknown[][] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnArgs.push(args); };
+
+    try {
+      receiverMgr.decryptMessage(msg);
+      // 应有包含 mode/from/message_id 的解密失败日志
+      const decryptWarn = warnArgs.find(args =>
+        typeof args[0] === 'string' && args[0].includes('解密失败'));
+      expect(decryptWarn).toBeDefined();
+      const logStr = String(decryptWarn![0]);
+      expect(logStr).toContain('long_term_key');
+      expect(logStr).toContain('sender.test');
+      expect(logStr).toContain(mid);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+});
 
 describe('指纹工具方法', () => {
   it('fingerprintCertPem 返回证书 SHA-256 指纹', () => {

@@ -95,6 +95,12 @@ func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string,
 	return a.client.DiscoverGateway(ctx, fallbackURL, 5*time.Second)
 }
 
+// CreateAIDWithName 类型安全的便捷方法，通过 AID 名称创建身份。
+// 内部构造 map 并调用 CreateAID。
+func (a *AuthNamespace) CreateAIDWithName(ctx context.Context, aid string) (map[string]any, error) {
+	return a.CreateAID(ctx, map[string]any{"aid": aid})
+}
+
 // CreateAID 创建新的 AID 身份
 func (a *AuthNamespace) CreateAID(ctx context.Context, params map[string]any) (map[string]any, error) {
 	aid, _ := params["aid"].(string)

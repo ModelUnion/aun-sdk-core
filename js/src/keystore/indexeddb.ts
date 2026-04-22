@@ -70,6 +70,62 @@ function sameJson(a: JsonObject | string | number | boolean | null | undefined, 
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// ── 私钥字段级加密 (AES-256-GCM + PBKDF2) ──────────────
+const _ENC_ALGO = 'AES-GCM';
+const _PBKDF2_ITERATIONS = 100_000;
+
+/** 加密信封结构 */
+interface EncryptedEnvelope {
+  ct: string;   // 密文（base64）
+  iv: string;   // 初始向量（base64）
+  salt: string; // PBKDF2 盐值（base64）
+}
+
+/** 将 Uint8Array 编码为 base64 字符串 */
+function _uint8ToBase64(bytes: Uint8Array): string {
+  let b = '';
+  for (let i = 0; i < bytes.length; i++) b += String.fromCharCode(bytes[i]);
+  return btoa(b);
+}
+
+/** 将 base64 字符串解码为 Uint8Array */
+function _base64ToUint8(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+/** 从 seed 派生 AES-256 加密密钥 */
+async function _deriveEncKey(seed: string, salt: Uint8Array): Promise<CryptoKey> {
+  const raw = new TextEncoder().encode(seed);
+  const base = await crypto.subtle.importKey('raw', raw, 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt as BufferSource, iterations: _PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    base, { name: _ENC_ALGO, length: 256 }, false, ['encrypt', 'decrypt'],
+  );
+}
+
+/** 加密 PEM 字符串，返回加密信封 */
+async function _encryptPEM(pem: string, seed: string): Promise<EncryptedEnvelope> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await _deriveEncKey(seed, salt);
+  const ct = await crypto.subtle.encrypt({ name: _ENC_ALGO, iv: iv as BufferSource }, key, new TextEncoder().encode(pem));
+  return {
+    ct: _uint8ToBase64(new Uint8Array(ct)),
+    iv: _uint8ToBase64(iv),
+    salt: _uint8ToBase64(salt),
+  };
+}
+
+/** 解密加密信封，还原 PEM 字符串 */
+async function _decryptPEM(enc: EncryptedEnvelope, seed: string): Promise<string> {
+  const salt = _base64ToUint8(enc.salt);
+  const iv = _base64ToUint8(enc.iv);
+  const ct = _base64ToUint8(enc.ct);
+  const key = await _deriveEncKey(seed, salt);
+  const pt = await crypto.subtle.decrypt({ name: _ENC_ALGO, iv: iv as BufferSource }, key, ct);
+  return new TextDecoder().decode(pt);
+}
+
 // ── IndexedDB 工具 ──────────────────────────────────────
 
 const DB_NAME = 'aun-keystore';
@@ -180,9 +236,17 @@ function stripStructuredFields(metadata: MetadataRecord): MetadataRecord {
   return plain;
 }
 
-/** 打开或升级数据库 */
+/** 缓存的数据库连接 */
+let _cachedDB: IDBDatabase | null = null;
+/** 并发竞态保护：缓存正在进行的 openDB Promise，避免多个并发调用同时创建连接 */
+let _openDBPromise: Promise<IDBDatabase> | null = null;
+
+/** 打开或升级数据库（复用已有连接） */
 function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (_cachedDB) return Promise.resolve(_cachedDB);
+  // 如果已有正在进行的打开请求，直接复用同一个 Promise
+  if (_openDBPromise) return _openDBPromise;
+  _openDBPromise = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
     request.onupgradeneeded = () => {
@@ -217,16 +281,29 @@ function openDB(): Promise<IDBDatabase> {
       const db = request.result;
       // H22: 其它 tab 持有旧版本连接时，触发 versionchange 通知它们关闭，避免 onupgradeneeded 挂起
       db.onversionchange = () => {
+        _cachedDB = null;
+        _openDBPromise = null;
         try { db.close(); } catch { /* ignore */ }
       };
+      db.onclose = () => { _cachedDB = null; };
+      _cachedDB = db;
+      _openDBPromise = null;  // 成功后清除 Promise 缓存
       resolve(db);
     };
-    request.onerror = () => reject(request.error ?? new Error('打开 IndexedDB 失败'));
+    request.onerror = () => {
+      _openDBPromise = null;  // 失败后清除，允许后续重试
+      reject(new Error(
+        'IndexedDB 不可用（可能处于隐私模式或 IndexedDB 被禁用）。' +
+        '请使用 FileKeyStore (Node.js) 或在浏览器中允许 IndexedDB。'
+      ));
+    };
     // H22: onblocked = 其它 tab 持有旧版本阻塞升级；必须显式 reject 让上层感知而非永久挂起
     request.onblocked = () => {
+      _openDBPromise = null;  // 阻塞时清除，允许后续重试
       reject(new Error('IndexedDB 升级被其它 tab 阻塞，请关闭其它页面后重试'));
     };
   });
+  return _openDBPromise;
 }
 
 /** 从指定仓库读取一条记录 */
@@ -238,15 +315,12 @@ async function idbGet<T>(storeName: string, key: string): Promise<T | undefined>
     const req = store.get(key);
 
     tx.oncomplete = () => {
-      db.close();
       resolve(req.result ?? null);
     };
     tx.onerror = () => {
-      db.close();
       reject(tx.error ?? new Error(`读取 ${storeName} 失败`));
     };
     tx.onabort = () => {
-      db.close();
       reject(tx.error ?? new Error(`读取 ${storeName} 被中止`));
     };
   });
@@ -262,7 +336,6 @@ async function idbGetAll<T>(storeName: string): Promise<Array<{ key: string; val
     const keysReq = store.getAllKeys();
 
     tx.oncomplete = () => {
-      db.close();
       const values = valuesReq.result ?? [];
       const keys = keysReq.result ?? [];
       resolve(keys.map((key, index) => ({
@@ -271,11 +344,9 @@ async function idbGetAll<T>(storeName: string): Promise<Array<{ key: string; val
       })));
     };
     tx.onerror = () => {
-      db.close();
       reject(tx.error ?? new Error(`读取 ${storeName} 全量数据失败`));
     };
     tx.onabort = () => {
-      db.close();
       reject(tx.error ?? new Error(`读取 ${storeName} 全量数据被中止`));
     };
   });
@@ -301,15 +372,12 @@ async function idbGetAllByPrefix<T>(storeName: string, prefix: string): Promise<
     };
 
     tx.oncomplete = () => {
-      db.close();
       resolve(result);
     };
     tx.onerror = () => {
-      db.close();
       reject(tx.error ?? new Error(`按前缀读取 ${storeName} 失败`));
     };
     tx.onabort = () => {
-      db.close();
       reject(tx.error ?? new Error(`按前缀读取 ${storeName} 被中止`));
     };
   });
@@ -322,15 +390,12 @@ async function idbPut<T>(storeName: string, key: string, value: T): Promise<void
     const tx = db.transaction(storeName, 'readwrite');
     tx.objectStore(storeName).put(value, key);
     tx.oncomplete = () => {
-      db.close();
       resolve();
     };
     tx.onerror = () => {
-      db.close();
       reject(tx.error ?? new Error(`写入 ${storeName} 失败`));
     };
     tx.onabort = () => {
-      db.close();
       reject(tx.error ?? new Error(`写入 ${storeName} 被中止`));
     };
   });
@@ -343,15 +408,12 @@ async function idbDelete(storeName: string, key: string): Promise<void> {
     const tx = db.transaction(storeName, 'readwrite');
     tx.objectStore(storeName).delete(key);
     tx.oncomplete = () => {
-      db.close();
       resolve();
     };
     tx.onerror = () => {
-      db.close();
       reject(tx.error ?? new Error(`删除 ${storeName} 失败`));
     };
     tx.onabort = () => {
-      db.close();
       reject(tx.error ?? new Error(`删除 ${storeName} 被中止`));
     };
   });
@@ -370,6 +432,13 @@ async function idbDelete(storeName: string, key: string): Promise<void> {
  */
 export class IndexedDBKeyStore implements KeyStore {
   private static _aidTails = new Map<string, Promise<void>>();
+
+  /** 私钥加密种子；为空时降级为明文存储（向后兼容） */
+  private _encryptionSeed: string | undefined;
+
+  constructor(opts?: { encryptionSeed?: string }) {
+    this._encryptionSeed = opts?.encryptionSeed;
+  }
 
   private async _withAidLock<T>(aid: string, fn: () => Promise<T>): Promise<T> {
     const key = safeAid(aid);
@@ -399,11 +468,39 @@ export class IndexedDBKeyStore implements KeyStore {
 
   async loadKeyPair(aid: string): Promise<KeyPairRecord | null> {
     const data = await idbGet<JsonObject>(STORE_KEY_PAIRS, metadataStoreKey(aid));
-    return isRecord(data) ? deepClone(data) : null;
+    if (!isRecord(data)) return null;
+    const result = deepClone(data);
+    // 如果存在加密私钥信封，尝试解密还原
+    const epk = result._encrypted_pk;
+    if (epk && typeof epk === 'object' && !Array.isArray(epk) && this._encryptionSeed) {
+      try {
+        const envelope = epk as unknown as EncryptedEnvelope;
+        result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
+        delete result._encrypted_pk;
+      } catch {
+        console.error(`[keystore] 解密 ${aid} 私钥失败，可能 encryptionSeed 不匹配`);
+      }
+    } else if (
+      // 透明迁移：旧版明文数据自动加密回写
+      !epk && typeof result.private_key_pem === 'string' && this._encryptionSeed
+    ) {
+      try {
+        await this.saveKeyPair(aid, result);
+      } catch {
+        // 迁移失败不影响读取
+      }
+    }
+    return result;
   }
 
   async saveKeyPair(aid: string, keyPair: KeyPairRecord): Promise<void> {
-    await idbPut(STORE_KEY_PAIRS, metadataStoreKey(aid), deepClone(keyPair));
+    const record = deepClone(keyPair);
+    // 如果配置了加密种子且包含明文私钥，加密后再存储
+    if (this._encryptionSeed && typeof record.private_key_pem === 'string') {
+      (record as JsonObject)._encrypted_pk = await _encryptPEM(record.private_key_pem, this._encryptionSeed) as unknown as JsonObject;
+      delete record.private_key_pem;
+    }
+    await idbPut(STORE_KEY_PAIRS, metadataStoreKey(aid), record);
   }
 
   // ── 证书 ──────────────────────────────────────────
@@ -706,6 +803,17 @@ export class IndexedDBKeyStore implements KeyStore {
     });
   }
 
+  async deleteGroupSecretState(aid: string, groupId: string): Promise<void> {
+    await this._withAidLock(aid, async () => {
+      // 删除 current epoch
+      await idbDelete(STORE_GROUP_CURRENT, groupCurrentStoreKey(aid, groupId));
+      // 删除所有 old epochs
+      for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_OLD_EPOCHS, groupOldPrefix(aid, groupId))) {
+        await idbDelete(STORE_GROUP_OLD_EPOCHS, item.key);
+      }
+    });
+  }
+
   // ── E2EE Sessions ─────────────────────────────────────
 
   async loadE2EESessions(aid: string): Promise<SessionRecord[]> {
@@ -728,11 +836,38 @@ export class IndexedDBKeyStore implements KeyStore {
 
   private async _loadKeyPairUnlocked(aid: string): Promise<KeyPairRecord | null> {
     const data = await idbGet<JsonObject>(STORE_KEY_PAIRS, metadataStoreKey(aid));
-    return isRecord(data) ? deepClone(data) : null;
+    if (!isRecord(data)) return null;
+    const result = deepClone(data);
+    // 如果存在加密私钥信封，尝试解密还原
+    if (isRecord(result._encrypted_pk) && this._encryptionSeed) {
+      try {
+        const envelope = result._encrypted_pk as unknown as EncryptedEnvelope;
+        result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
+        delete result._encrypted_pk;
+      } catch {
+        console.error(`[keystore] 解密 ${aid} 私钥失败，可能 encryptionSeed 不匹配`);
+      }
+    } else if (
+      // 透明迁移：旧版明文数据自动加密回写
+      !isRecord(result._encrypted_pk) && typeof result.private_key_pem === 'string' && this._encryptionSeed
+    ) {
+      try {
+        await this._saveKeyPairUnlocked(aid, result);
+      } catch {
+        // 迁移失败不影响读取
+      }
+    }
+    return result;
   }
 
   private async _saveKeyPairUnlocked(aid: string, keyPair: KeyPairRecord): Promise<void> {
-    await idbPut(STORE_KEY_PAIRS, metadataStoreKey(aid), deepClone(keyPair));
+    const record = deepClone(keyPair);
+    // 如果配置了加密种子且包含明文私钥，加密后再存储
+    if (this._encryptionSeed && typeof record.private_key_pem === 'string') {
+      (record as JsonObject)._encrypted_pk = await _encryptPEM(record.private_key_pem, this._encryptionSeed) as unknown as JsonObject;
+      delete record.private_key_pem;
+    }
+    await idbPut(STORE_KEY_PAIRS, metadataStoreKey(aid), record);
   }
 
   private async _loadCertUnlocked(aid: string): Promise<string | null> {
@@ -1082,6 +1217,9 @@ export class IndexedDBKeyStore implements KeyStore {
   }
 
   private _isGroupEpochRecoverable(record: GroupOldEpochRecord | GroupSecretRecord): boolean {
+    // 空字符串 secret 不视为可恢复的有效记录
+    const secret = record.secret;
+    if (!secret || (typeof secret === 'string' && secret.length === 0)) return false;
     return this._isUnexpiredRecord(record, 'updated_at');
   }
 

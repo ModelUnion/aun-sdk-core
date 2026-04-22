@@ -392,7 +392,8 @@ export class E2EEManager {
           degraded: false,
         }];
       } catch (exc) {
-        // prekey 加密失败，降级到 long_term_key
+        // prekey 加密失败，降级到 long_term_key — 记录异常以便排查安全降级原因
+        console.warn('[aun_core.e2ee] prekey 加密失败，降级到 long_term_key:', exc);
       }
     }
 
@@ -612,7 +613,8 @@ export class E2EEManager {
     // 验证发送方签名（适用于所有模式）
     try {
       this._verifySenderSignature(payload, message);
-    } catch {
+    } catch (exc) {
+      console.warn('[aun_core.e2ee] 发送方签名验证失败');
       return null;
     }
 
@@ -695,7 +697,10 @@ export class E2EEManager {
           prekey_id: prekeyId,
         },
       };
-    } catch {
+    } catch (exc) {
+      const fromAid = (message.from ?? '') as string;
+      const msgId = (message.message_id ?? '') as string;
+      console.warn(`[aun_core.e2ee] 解密失败: mode=prekey_ecdh_v2, from=${fromAid}, mid=${msgId}`, exc);
       return null;
     }
   }
@@ -759,7 +764,10 @@ export class E2EEManager {
           suite: payload.suite as string,
         },
       };
-    } catch {
+    } catch (exc) {
+      const fromAid = (message.from ?? '') as string;
+      const msgId = (message.message_id ?? '') as string;
+      console.warn(`[aun_core.e2ee] 解密失败: mode=long_term_key, from=${fromAid}, mid=${msgId}`, exc);
       return null;
     }
   }

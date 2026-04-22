@@ -64,6 +64,10 @@ class GroupError(AUNError):
     pass
 
 
+class VersionConflictError(AUNError):
+    pass
+
+
 class GroupNotFoundError(GroupError):
     pass
 
@@ -156,9 +160,13 @@ def map_remote_error(error: dict[str, Any]) -> AUNError:
 
     if code in {4001, 4010, -32001, -32003}:
         cls = AuthError
-    elif code in {4030, 403}:
+    elif code in {4030, 403, -32004}:
         cls = PermissionError
-    elif code in {4040, 404, -32004}:
+    elif code == -32008:
+        cls = NotFoundError
+    elif code == -32009:
+        cls = VersionConflictError
+    elif code in {4040, 404}:
         cls = NotFoundError
     elif code in {4290, 429, -32029}:
         cls = RateLimitError

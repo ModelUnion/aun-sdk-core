@@ -1,6 +1,7 @@
 package aun
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	cryptorand "crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -29,6 +31,36 @@ import (
 )
 
 // stableStringify 递归排序键的 JSON 序列化（Canonical JSON for AUN）
+// jsonMarshalNoHTMLEscape 等价于 json.Marshal 但不转义 HTML 特殊字符 (<, >, &)
+// 使签名行为与 Python ensure_ascii=False / JS JSON.stringify 一致
+func jsonMarshalNoHTMLEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	// Encode 追加换行符，去掉
+	b := buf.Bytes()
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	return b, nil
+}
+
+// secureRandFloat64 使用 crypto/rand 生成 [0.0, 1.0) 范围的浮点数。
+// ISSUE-SDK-GO-007: 替代 math/rand.Float64()，在并发场景下无需额外加锁。
+func secureRandFloat64() float64 {
+	var buf [8]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		// crypto/rand 读取失败极其罕见（系统熵源不可用），使用时间戳作为降级
+		return float64(time.Now().UnixNano()%1000) / 1000.0
+	}
+	// 取 uint64 后转为 [0, 1) 的浮点数
+	n := binary.LittleEndian.Uint64(buf[:])
+	return float64(n) / float64(1<<64)
+}
+
 // 等价于 Python json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)
 // 和 TS/JS 的 stableStringify — 无空格分隔
 func stableStringify(v any) string {
@@ -50,7 +82,7 @@ func stableStringify(v any) string {
 	case int64:
 		return fmt.Sprintf("%d", val)
 	case string:
-		b, _ := json.Marshal(val)
+		b, _ := jsonMarshalNoHTMLEscape(val)
 		return string(b)
 	case []any:
 		parts := make([]string, len(val))
@@ -66,12 +98,12 @@ func stableStringify(v any) string {
 		sort.Strings(keys)
 		parts := make([]string, len(keys))
 		for i, k := range keys {
-			keyJSON, _ := json.Marshal(k)
+			keyJSON, _ := jsonMarshalNoHTMLEscape(k)
 			parts[i] = string(keyJSON) + ":" + stableStringify(val[k])
 		}
 		return "{" + strings.Join(parts, ",") + "}"
 	default:
-		b, _ := json.Marshal(val)
+		b, _ := jsonMarshalNoHTMLEscape(val)
 		return string(b)
 	}
 }
@@ -92,12 +124,11 @@ const (
 
 // ConnectOptions 连接选项
 type ConnectOptions struct {
-	AutoReconnect         bool           // 是否自动重连
-	HeartbeatInterval     int            // 心跳间隔（秒），默认 30
-	TokenRefreshBefore    int            // token 到期前多少秒刷新，默认 60
-	PrekeyRefreshInterval int            // prekey 刷新间隔（秒），默认 3600
-	Retry                 *RetryConfig   // 重试配置
-	Timeouts              *TimeoutConfig // 超时配置
+	AutoReconnect      bool           // 是否自动重连
+	HeartbeatInterval  int            // 心跳间隔（秒），默认 30
+	TokenRefreshBefore int            // token 到期前多少秒刷新，默认 60
+	Retry              *RetryConfig   // 重试配置
+	Timeouts           *TimeoutConfig // 超时配置
 }
 
 // RetryConfig 重试配置
@@ -138,6 +169,8 @@ var signedMethods = map[string]bool{
 	"group.transfer_owner":            true,
 	"group.review_join_request":       true,
 	"group.batch_review_join_request": true,
+	"group.request_join":              true,
+	"group.use_invite_code":           true,
 	"group.resources.put":             true,
 	"group.resources.update":          true,
 	"group.resources.delete":          true,
@@ -175,6 +208,7 @@ type AUNClient struct {
 	slotID       string
 	closing      atomic.Bool
 	reconnecting atomic.Bool
+	serverKicked atomic.Bool
 
 	// 组件
 	crypto    *CryptoProvider
@@ -285,8 +319,8 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 			"heartbeat_interval":   30.0,
 			"token_refresh_before": 60.0,
 			"retry": map[string]any{
-				"initial_delay": 0.5,
-				"max_delay":     30.0,
+				"initial_delay": 1.0,
+				"max_delay":     64.0,
 			},
 			"timeouts": map[string]any{
 				"connect": 5.0,
@@ -300,8 +334,8 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	}
 
 	// 创建 RPCTransport（使用断线回调）
-	c.transport = NewRPCTransport(events, 10*time.Second, func(err error) {
-		c.handleTransportDisconnect(err)
+	c.transport = NewRPCTransport(events, 10*time.Second, func(err error, closeCode int) {
+		c.handleTransportDisconnect(err, closeCode)
 	}, cfg.VerifySSL)
 
 	// 创建 E2EE 管理器
@@ -360,6 +394,10 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	})
 	events.Subscribe("_raw.message.ack", func(payload any) {
 		events.Publish("message.ack", payload)
+	})
+	// 服务端主动断开通知：记录日志并标记不重连
+	events.Subscribe("_raw.gateway.disconnect", func(payload any) {
+		c.onGatewayDisconnect(payload)
 	})
 
 	return c
@@ -452,6 +490,16 @@ func (c *AUNClient) DiscoverGateway(ctx context.Context, wellKnownURL string, ti
 	return c.discovery.Discover(ctx, wellKnownURL, timeout)
 }
 
+// CheckGatewayHealth 向 gatewayURL 的 /health 端点发送 HEAD 请求，检查网关可用性。
+func (c *AUNClient) CheckGatewayHealth(ctx context.Context, gatewayURL string, timeout time.Duration) bool {
+	return c.discovery.CheckHealth(ctx, gatewayURL, timeout)
+}
+
+// GatewayHealth 返回最近一次 health check 结果，nil 表示尚未检查。
+func (c *AUNClient) GatewayHealth() *bool {
+	return c.discovery.LastHealthy()
+}
+
 // SetIdentity 设置当前身份信息
 func (c *AUNClient) SetIdentity(identity map[string]any) {
 	c.mu.Lock()
@@ -459,17 +507,27 @@ func (c *AUNClient) SetIdentity(identity map[string]any) {
 	c.identity = identity
 }
 
+// GetIdentity 返回当前身份信息
+func (c *AUNClient) GetIdentity() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.identity
+}
+
 // ── 生命周期 ──────────────────────────────────────────────
 
 // Connect 连接到 AUN Gateway
 func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *ConnectOptions) error {
-	c.mu.RLock()
-	state := c.state
-	c.mu.RUnlock()
-
-	if state != StateIdle && state != StateClosed {
-		return NewStateError(fmt.Sprintf("connect 不允许在状态 %s 下调用", state))
+	// 原子检查+状态转换，避免 TOCTOU 竞态
+	// ISSUE-SDK-GO-009: 允许从 disconnected 状态重新连接
+	c.mu.Lock()
+	if c.state != StateIdle && c.state != StateClosed && c.state != StateDisconnected {
+		st := c.state
+		c.mu.Unlock()
+		return NewStateError(fmt.Sprintf("connect 不允许在状态 %s 下调用", st))
 	}
+	c.state = StateConnecting
+	c.mu.Unlock()
 
 	// 合并参数
 	params := make(map[string]any)
@@ -522,6 +580,59 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 	c.mu.RUnlock()
 
 	return c.connectOnce(ctx, normalized, false)
+}
+
+// Disconnect 主动断开连接但保留身份，可重新 Connect（ISSUE-GO-005）
+func (c *AUNClient) Disconnect() error {
+	c.mu.Lock()
+	state := c.state
+	if state != StateConnected && state != StateReconnecting {
+		c.mu.Unlock()
+		return nil // idle/closed/disconnected 等状态无需操作
+	}
+	cancelFn := c.cancel
+	c.mu.Unlock()
+
+	c.saveSeqTrackerState()
+
+	// 取消后台任务
+	if cancelFn != nil {
+		cancelFn()
+	}
+
+	// 关闭传输层
+	if err := c.transport.Close(); err != nil {
+		log.Printf("Disconnect 关闭传输层失败: %v", err)
+	}
+
+	c.mu.Lock()
+	c.state = StateDisconnected
+	c.mu.Unlock()
+
+	c.events.Publish("connection.state", map[string]any{"state": string(StateDisconnected)})
+	return nil
+}
+
+// Logout 完全登出：断开连接、清除 token、关闭客户端（ISSUE-GO-005）
+func (c *AUNClient) Logout() error {
+	// 先断开连接
+	_ = c.Disconnect()
+
+	// 清除 token
+	c.mu.RLock()
+	aid := c.aid
+	c.mu.RUnlock()
+
+	if aid != "" {
+		// 用空 token 覆盖保存，清除持久化的 token
+		_ = c.keyStore.SaveIdentity(aid, map[string]any{
+			"access_token":  "",
+			"refresh_token": "",
+			"kite_token":    "",
+		})
+	}
+
+	return c.Close()
 }
 
 // Close 关闭客户端，取消所有后台任务
@@ -788,13 +899,8 @@ func (c *AUNClient) orchestrateGroupE2EE(ctx context.Context, method string, par
 		}
 	}
 
-	// 踢人后自动轮换 epoch
-	if method == "group.kick" {
-		groupID, _ := params["group_id"].(string)
-		if groupID != "" {
-			go c.rotateGroupEpoch(context.Background(), groupID)
-		}
-	}
+	// group.kick / group.leave：由 group.changed（member_removed/member_left）
+	// 事件侧统一驱动剩余 admin/owner 补位轮换，避免 RPC 返回路径与事件路径双重触发。
 
 	// 审批通过后自动分发密钥给新成员
 	if method == "group.review_join_request" && resultMap != nil {
@@ -949,7 +1055,11 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 		"message_id": messageID,
 		"timestamp":  timestamp,
 	}
-	return c.transport.Call(ctx, "message.send", sendParams)
+	result, err := c.transport.Call(ctx, "message.send", sendParams)
+	if err != nil {
+		log.Printf("[aun_core] 警告: E2EE 多设备消息发送失败，prekey 已消耗不可回滚 (to=%s, copies=%d): %v", toAID, len(recipientCopies), err)
+	}
+	return result, err
 }
 
 func (c *AUNClient) sendEncryptedSingle(
@@ -987,7 +1097,12 @@ func (c *AUNClient) sendEncryptedSingle(
 		"message_id": messageID,
 		"timestamp":  timestamp,
 	}
-	return c.transport.Call(ctx, "message.send", sendParams)
+	result, err := c.transport.Call(ctx, "message.send", sendParams)
+	if err != nil {
+		prekeyID, _ := prekey["prekey_id"].(string)
+		log.Printf("[aun_core] 警告: E2EE 消息发送失败，prekey 已消耗不可回滚 (to=%s, prekey_id=%s): %v", toAID, prekeyID, err)
+	}
+	return result, err
 }
 
 func (c *AUNClient) buildRecipientDeviceCopies(
@@ -1145,12 +1260,16 @@ func (c *AUNClient) ensureEncryptResult(toAID string, encryptResult map[string]a
 }
 
 // sendGroupEncrypted 自动加密并发送群组消息
+// GO-001: 发送前预检本地 epoch 是否与服务端一致
 func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]any) (any, error) {
 	groupID, _ := params["group_id"].(string)
 	payload, _ := params["payload"].(map[string]any)
 	if groupID == "" {
 		return nil, NewValidationError("group.send 需要 group_id")
 	}
+
+	// GO-001: epoch 预检 — 对比本地和服务端 epoch，落后则触发密钥恢复
+	c.epochPrecheck(ctx, groupID)
 
 	envelope, err := c.groupE2EE.Encrypt(groupID, payload)
 	if err != nil {
@@ -1163,8 +1282,76 @@ func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]an
 		"type":      "e2ee.group_encrypted",
 		"encrypted": true,
 	}
+	// 注入 device_id（与 Call() 路径对齐）
+	if c.deviceID != "" {
+		sendParams["device_id"] = c.deviceID
+	}
 	c.signClientOperation("group.send", sendParams)
 	return c.transport.Call(ctx, "group.send", sendParams)
+}
+
+// epochPrecheck 检查本地 epoch 是否落后于服务端，落后则触发密钥恢复
+// GO-001: 参考 Python SDK _send_group_encrypted 的 epoch 预检逻辑
+func (c *AUNClient) epochPrecheck(ctx context.Context, groupID string) {
+	localEpoch := c.groupE2EE.CurrentEpoch(groupID)
+	if localEpoch == nil {
+		return // 无本地密钥时跳过预检（Encrypt 会返回 SecretMissingError）
+	}
+
+	epochResult, err := c.transport.Call(ctx, "group.e2ee.get_epoch", map[string]any{
+		"group_id": groupID,
+	})
+	if err != nil {
+		log.Printf("[aun_core] 群 %s epoch 预检查询失败: %v", groupID, err)
+		return // 查询失败不阻塞发送
+	}
+
+	resultMap, ok := epochResult.(map[string]any)
+	if !ok {
+		return
+	}
+	serverEpoch := int(toInt64(resultMap["epoch"]))
+	if serverEpoch <= *localEpoch {
+		return // 本地 epoch 不落后
+	}
+
+	log.Printf("[aun_core] 群 %s 本地 epoch=%d < 服务端 epoch=%d，触发密钥恢复",
+		groupID, *localEpoch, serverEpoch)
+
+	// 向 owner 请求最新密钥
+	ownerAID, _ := resultMap["owner_aid"].(string)
+	if ownerAID == "" {
+		// 尝试通过 group.get_info 获取 owner
+		info, infoErr := c.transport.Call(ctx, "group.get_info", map[string]any{
+			"group_id": groupID,
+		})
+		if infoErr == nil {
+			if infoMap, ok := info.(map[string]any); ok {
+				ownerAID, _ = infoMap["owner_aid"].(string)
+			}
+		}
+	}
+
+	c.mu.RLock()
+	myAID := c.aid
+	c.mu.RUnlock()
+	if ownerAID != "" && ownerAID != myAID {
+		recovery := c.groupE2EE.BuildRecoveryRequest(groupID, serverEpoch, ownerAID)
+		if recovery != nil {
+			to, _ := recovery["to"].(string)
+			recPayload, _ := recovery["payload"].(map[string]any)
+			if to != "" && recPayload != nil {
+				if _, sendErr := c.Call(ctx, "message.send", map[string]any{
+					"to":      to,
+					"payload": recPayload,
+					"encrypt": true,
+				}); sendErr != nil {
+					log.Printf("[aun_core] epoch 预检密钥恢复请求失败: %v", sendErr)
+				}
+			}
+		}
+	}
+	// 不阻塞发送：使用当前本地 epoch 发送，服务端若拒绝由上层处理
 }
 
 // ── 便利方法 ──────────────────────────────────────────────
@@ -1675,14 +1862,15 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 
 	// event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq
 	groupID, _ := dataMap["group_id"].(string)
+	needPull := false
 	if rawES, ok := dataMap["event_seq"]; ok && groupID != "" {
 		if es := toInt64(rawES); es > 0 {
-			c.seqTracker.OnMessageSeq("group_event:"+groupID, int(es))
+			needPull = c.seqTracker.OnMessageSeq("group_event:"+groupID, int(es))
 		}
 	}
 
-	// 收到事件推送后自动 pull 补齐（补洞回来的事件不再触发新补洞）
-	if groupID != "" && dataMap["_from_gap_fill"] == nil {
+	// 仅在检测到 event gap 时才触发补洞（补洞回来的事件不再触发新补洞）
+	if needPull && groupID != "" && dataMap["_from_gap_fill"] == nil {
 		go c.fillGroupEventGap(groupID)
 	}
 
@@ -1692,6 +1880,14 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 		if groupID != "" {
 			go c.maybeLeadRotateGroupEpoch(context.Background(), groupID)
 		}
+	}
+
+	// GO-006: 群组解散 → 清理本地 epoch key 和 seq_tracker
+	if action == "dissolved" && groupID != "" {
+		c.groupE2EE.PurgeGroupData(groupID)
+		c.seqTracker.RemoveNamespace("group:" + groupID)
+		c.seqTracker.RemoveNamespace("group_event:" + groupID)
+		log.Printf("[aun_core] 群 %s 已解散，已清理本地 epoch 密钥和 seq tracker", groupID)
 	}
 }
 
@@ -1803,7 +1999,7 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 						members = extractAIDsFromMembers(membersList)
 						// 更新本地当前 epoch 的 member_aids/commitment
 						if stringSliceContains(members, requester) {
-							secretData := c.groupE2EE.LoadSecret(groupID)
+							secretData, _ := c.groupE2EE.LoadSecret(groupID)
 							if secretData != nil {
 								c.mu.RLock()
 								myAID := c.aid
@@ -2157,6 +2353,8 @@ func (c *AUNClient) decryptMessages(ctx context.Context, messages []any) []any {
 			// 使用内部解密，避免消耗 seen set
 			decrypted, err := c.e2ee.decryptMessage(msg)
 			if err == nil && decrypted != nil {
+				// ISSUE-SDK-GO-002: pull 批量解密路径也需要补充 prekey
+				c.schedulePrekeyReplenishIfConsumed(decrypted)
 				result = append(result, decrypted)
 			}
 			// 解密失败：丢弃密文，不投递给应用层
@@ -2452,13 +2650,16 @@ func (c *AUNClient) syncIdentityAfterConnect(accessToken string) {
 // ── 后台任务 ──────────────────────────────────────────────
 
 // startBackgroundTasks 启动所有后台 goroutine
-func (c *AUNClient) startBackgroundTasks(parentCtx context.Context) {
+// ISSUE-SDK-GO-010: 后台任务使用独立的 context.Background() 作为父 context，
+// 避免用户传入的短生命周期 context（如 WithTimeout）导致心跳、token 刷新等后台任务被意外取消。
+// 后台任务的生命周期由 Close()/Disconnect() 通过 cancel 函数统一管理。
+func (c *AUNClient) startBackgroundTasks(_ context.Context) {
 	c.mu.Lock()
 	// 取消旧的后台任务
 	if c.cancel != nil {
 		c.cancel()
 	}
-	ctx, cancel := context.WithCancel(parentCtx)
+	ctx, cancel := context.WithCancel(context.Background())
 	c.ctx = ctx
 	c.cancel = cancel
 	c.mu.Unlock()
@@ -2476,6 +2677,7 @@ func (c *AUNClient) startBackgroundTasks(parentCtx context.Context) {
 // syncAllGroupsOnce 上线/重连后一次性同步所有已加入群：
 // 1. 有 epoch key 的群 → 补消息 + 补事件
 // 2. 无 epoch key 的群 → 仅补事件（事件不加密，等收到推送时触发密钥恢复）
+// ISSUE-SDK-GO-011: 使用 goroutine 并发处理，加信号量限制并发数
 func (c *AUNClient) syncAllGroupsOnce() {
 	if c.closing.Load() {
 		return
@@ -2490,7 +2692,7 @@ func (c *AUNClient) syncAllGroupsOnce() {
 	}
 	ctx, cancel := context.WithTimeout(baseCtx, 30*time.Second)
 	defer cancel()
-	result, err := c.Call(ctx, "group.list", map[string]any{})
+	result, err := c.Call(ctx, "group.list_my", map[string]any{})
 	if err != nil {
 		return
 	}
@@ -2502,6 +2704,12 @@ func (c *AUNClient) syncAllGroupsOnce() {
 	if !ok {
 		return
 	}
+
+	// 并发限制：最多 5 个 goroutine 同时处理群同步
+	const maxConcurrency = 5
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+
 	for _, raw := range items {
 		g, ok := raw.(map[string]any)
 		if !ok {
@@ -2511,13 +2719,22 @@ func (c *AUNClient) syncAllGroupsOnce() {
 		if gid == "" {
 			continue
 		}
-		// 有 epoch key → 补消息
-		if c.groupE2EE.HasSecret(gid) {
-			c.fillGroupGap(gid)
-		}
-		// 所有群都补事件（事件不加密）
-		c.fillGroupEventGap(gid)
+
+		wg.Add(1)
+		sem <- struct{}{} // 获取信号量
+		go func(groupID string) {
+			defer wg.Done()
+			defer func() { <-sem }() // 释放信号量
+
+			// 有 epoch key → 补消息
+			if c.groupE2EE.HasSecret(groupID) {
+				c.fillGroupGap(groupID)
+			}
+			// 所有群都补事件（事件不加密）
+			c.fillGroupEventGap(groupID)
+		}(gid)
 	}
+	wg.Wait()
 }
 
 // pullAllGroupEventsOnce 兼容旧调用，委托给 syncAllGroupsOnce。
@@ -2579,7 +2796,7 @@ func (c *AUNClient) heartbeatLoop(ctx context.Context) {
 				c.events.Publish("connection.error", map[string]any{"error": err})
 				if consecutiveFailures >= maxFailures {
 					log.Printf("连续 %d 次心跳失败，触发断线重连", maxFailures)
-					c.handleTransportDisconnect(err)
+					c.handleTransportDisconnect(err, -1)
 					return
 				}
 			} else {
@@ -2865,19 +3082,29 @@ func (c *AUNClient) buildRotationSignature(groupID string, currentEpoch, newEpoc
 	}
 }
 
-// syncEpochToServer 建群后将本地 epoch 1 同步到服务端
+// syncEpochToServer 建群后将本地 epoch 1 同步到服务端，最多重试 3 次
 func (c *AUNClient) syncEpochToServer(ctx context.Context, groupID string) {
-	rotateParams := map[string]any{
-		"group_id":      groupID,
-		"current_epoch": 0,
-	}
-	sigParams := c.buildRotationSignature(groupID, 0, 1)
-	for k, v := range sigParams {
-		rotateParams[k] = v
-	}
-	_, err := c.Call(ctx, "group.e2ee.rotate_epoch", rotateParams)
-	if err != nil {
-		log.Printf("同步 epoch 到服务端失败 (group=%s，可能已同步): %v", groupID, err)
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		rotateParams := map[string]any{
+			"group_id":      groupID,
+			"current_epoch": 0,
+		}
+		sigParams := c.buildRotationSignature(groupID, 0, 1)
+		for k, v := range sigParams {
+			rotateParams[k] = v
+		}
+		_, err := c.Call(ctx, "group.e2ee.rotate_epoch", rotateParams)
+		if err == nil {
+			return
+		}
+		if attempt < maxRetries {
+			delay := time.Duration(500*(1<<(attempt-1))) * time.Millisecond
+			log.Printf("同步 epoch 到服务端失败 (group=%s, 第%d/%d次): %v, %v后重试", groupID, attempt, maxRetries, err, delay)
+			time.Sleep(delay)
+		} else {
+			log.Printf("同步 epoch 到服务端最终失败 (group=%s, 已重试%d次): %v", groupID, maxRetries, err)
+		}
 	}
 }
 
@@ -2934,8 +3161,15 @@ func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID strin
 		return
 	}
 
+	// 查询服务端 epoch（本地可能因未收到密钥分发而滞后）
 	beforeEpoch := 0
-	if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
+	if resp, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
+		if m, ok := resp.(map[string]any); ok {
+			if v, ok := m["epoch"].(float64); ok {
+				beforeEpoch = int(v)
+			}
+		}
+	} else if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
 		beforeEpoch = *epoch
 	}
 	timer := time.NewTimer(randomLeaderRotateJitter())
@@ -2946,7 +3180,13 @@ func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID strin
 	case <-timer.C:
 	}
 	afterEpoch := 0
-	if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
+	if resp, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
+		if m, ok := resp.(map[string]any); ok {
+			if v, ok := m["epoch"].(float64); ok {
+				afterEpoch = int(v)
+			}
+		}
+	} else if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
 		afterEpoch = *epoch
 	}
 	if afterEpoch > beforeEpoch {
@@ -3019,7 +3259,19 @@ func (c *AUNClient) rotateGroupEpoch(ctx context.Context, groupID string) {
 		c.logE2EEError("rotate_epoch", groupID, "", err)
 		return
 	}
-	distributions, _ := info["distributions"].([]map[string]any)
+	// distributions 可能是 []any 或 []map[string]any，逐个断言
+	rawDist, _ := info["distributions"]
+	var distributions []map[string]any
+	switch v := rawDist.(type) {
+	case []map[string]any:
+		distributions = v
+	case []any:
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				distributions = append(distributions, m)
+			}
+		}
+	}
 	for _, dist := range distributions {
 		to, _ := dist["to"].(string)
 		distPayload, _ := dist["payload"].(map[string]any)
@@ -3052,7 +3304,7 @@ func (c *AUNClient) distributeKeyToNewMember(ctx context.Context, groupID, newMe
 		}
 	}()
 
-	secretData := c.groupE2EE.LoadSecret(groupID)
+	secretData, _ := c.groupE2EE.LoadSecret(groupID)
 	if secretData == nil {
 		return
 	}
@@ -3194,8 +3446,27 @@ func (c *AUNClient) logE2EEError(stage, groupID, aid string, err error) {
 
 // ── 断线重连 ──────────────────────────────────────────────
 
+// 不重连 close code 集合：认证失败/权限错误/被踢等，重连无意义
+var noReconnectCodes = map[int]bool{
+	4001: true, // Auth failed
+	4003: true, // Invalid AID
+	4008: true, // Auth timeout
+	4009: true, // Server kick
+	4010: true, // Invalid nonce
+	4011: true, // Federation ACL denied
+}
+
+// onGatewayDisconnect 处理服务端主动断开通知 event/gateway.disconnect
+func (c *AUNClient) onGatewayDisconnect(payload any) {
+	data, _ := payload.(map[string]any)
+	code := data["code"]
+	reason := data["reason"]
+	log.Printf("[aun_core] 服务端主动断开: code=%v, reason=%v", code, reason)
+	c.serverKicked.Store(true)
+}
+
 // handleTransportDisconnect 传输层断线回调
-func (c *AUNClient) handleTransportDisconnect(err error) {
+func (c *AUNClient) handleTransportDisconnect(err error, closeCode int) {
 	// 原子检查+设置状态，避免锁间隙中 close() 被调用后仍启动重连
 	c.mu.Lock()
 	isClosing := c.closing.Load()
@@ -3225,20 +3496,40 @@ func (c *AUNClient) handleTransportDisconnect(err error) {
 		return
 	}
 
+	// 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
+	if c.serverKicked.Load() || noReconnectCodes[closeCode] {
+		c.mu.Lock()
+		c.state = StateTerminalFailed
+		c.mu.Unlock()
+		reason := "server kicked"
+		if !c.serverKicked.Load() {
+			reason = fmt.Sprintf("close code %d", closeCode)
+		}
+		log.Printf("[aun_core] 抑制自动重连: %s", reason)
+		c.events.Publish("connection.state", map[string]any{
+			"state":  "terminal_failed",
+			"error":  err,
+			"reason": reason,
+		})
+		return
+	}
+
 	if c.reconnecting.CompareAndSwap(false, true) {
-		go c.reconnectLoop()
+		// closeCode == -1 表示网络异常断开（无 close frame），其他 code = 服务端主动关闭
+		serverInitiated := closeCode != -1
+		go c.reconnectLoop(serverInitiated)
 	}
 }
 
-// reconnectLoop 重连循环（指数退避，在不可重试错误、close()、或超过最大重试次数时终止）
-func (c *AUNClient) reconnectLoop() {
+// reconnectLoop 重连循环（指数退避 + Full Jitter，在不可重试错误、close()、或超过最大重试次数时终止）
+func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 	c.mu.RLock()
 	opts := c.sessionOptions
 	c.mu.RUnlock()
 
 	retryConfig, _ := opts["retry"].(map[string]any)
-	initialDelay := 0.5
-	maxDelay := 30.0
+	initialDelay := 1.0
+	maxDelay := 64.0
 	maxAttempts := 0 // 0 表示无限重试
 	if retryConfig != nil {
 		if v, ok := retryConfig["initial_delay"].(float64); ok {
@@ -3252,7 +3543,11 @@ func (c *AUNClient) reconnectLoop() {
 		}
 	}
 
+	// 服务端主动关闭时从 16s 起跳，避免重连风暴；网络断开从 initial_delay 起跳
 	delay := initialDelay
+	if serverInitiated {
+		delay = 16.0
+	}
 	for attempt := 1; !c.closing.Load(); attempt++ {
 		// 超过最大重试次数时停止
 		if maxAttempts > 0 && attempt > maxAttempts {
@@ -3278,12 +3573,30 @@ func (c *AUNClient) reconnectLoop() {
 			"attempt": attempt,
 		})
 
-		time.Sleep(time.Duration(delay * float64(time.Second)))
+		// Full Jitter: random(0, delay) 打散重连时机
+		// ISSUE-SDK-GO-007: 使用 crypto/rand 代替 math/rand，确保并发安全
+		jitteredDelay := secureRandFloat64() * delay
+		time.Sleep(time.Duration(jitteredDelay * float64(time.Second)))
 
 		// close() 可能在 sleep 期间被调用
 		if c.closing.Load() {
 			c.reconnecting.Store(false)
 			return
+		}
+
+		// 重连前先 HEAD /health 探测，不健康则跳过本轮
+		c.mu.RLock()
+		gw := c.gatewayURL
+		c.mu.RUnlock()
+		if gw != "" {
+			healthy := c.discovery.CheckHealth(context.Background(), gw, 5*time.Second)
+			if !healthy {
+				delay = delay * 2
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
 		}
 
 		// 关闭旧连接
@@ -3437,7 +3750,7 @@ func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 		"heartbeat_interval":   30.0,
 		"token_refresh_before": 60.0,
 		"retry": map[string]any{
-			"initial_delay": 0.5,
+			"initial_delay": 1.0,
 			"max_delay":     30.0,
 		},
 		"timeouts": map[string]any{

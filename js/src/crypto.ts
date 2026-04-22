@@ -101,7 +101,7 @@ export class CryptoProvider {
     nonce: string,
     clientTime?: string,
   ): Promise<[string, string]> {
-    const usedTime = clientTime ?? String(Date.now() / 1000);
+    const usedTime = clientTime ?? String(Math.floor(Date.now() / 1000));
     const signData = new TextEncoder().encode(`${nonce}:${usedTime}`);
 
     // 导入 PEM 私钥

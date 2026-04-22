@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from .e2ee import E2EEManager, GroupE2EEManager
 from .errors import (
     AUNError,
     AuthError,
+    ClientSignatureError,
     ConnectionError,
     E2EEError,
     PermissionError as AUNPermissionError,
@@ -32,7 +34,6 @@ from .errors import (
 from .events import EventDispatcher, Subscription
 from .keystore.file import FileKeyStore
 from .namespaces.auth_namespace import AuthNamespace
-from .namespaces.custody_namespace import CustodyNamespace
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
 from .types import ConnectionState
@@ -47,13 +48,22 @@ _INTERNAL_ONLY_METHODS = {
     "initialize",
 }
 
+# token 刷新连续失败次数上限，超过后发布 exhausted 事件
+_TOKEN_REFRESH_MAX_FAILURES = 3
+
+# PY-001: 解密失败的群消息待重试队列上限
+_PENDING_DECRYPT_LIMIT = 100
+
+# PY-006: pushed_seqs 单 namespace 硬上限
+_PUSHED_SEQS_LIMIT = 50000
+
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
     "auto_reconnect": True,
     "heartbeat_interval": 30.0,
     "token_refresh_before": 60.0,
     "retry": {
-        "initial_delay": 0.5,
-        "max_delay": 30.0,
+        "initial_delay": 1.0,
+        "max_delay": 64.0,
     },
     "timeouts": {
         "connect": 5.0,
@@ -69,9 +79,18 @@ import logging as _logging
 _client_log = _logging.getLogger("aun_core.client")
 _ssl_warning_emitted = False
 
-_NO_VERIFY_SSL = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
-_NO_VERIFY_SSL.check_hostname = False
-_NO_VERIFY_SSL.verify_mode = _ssl.CERT_NONE
+# SSL 上下文延迟创建，避免模块加载时即创建不安全的 SSL 上下文
+_no_verify_ssl_ctx: _ssl.SSLContext | None = None
+
+
+def _get_no_verify_ssl() -> _ssl.SSLContext:
+    """延迟创建跳过证书验证的 SSL 上下文（仅在实际需要时创建）。"""
+    global _no_verify_ssl_ctx
+    if _no_verify_ssl_ctx is None:
+        _no_verify_ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+        _no_verify_ssl_ctx.check_hostname = False
+        _no_verify_ssl_ctx.verify_mode = _ssl.CERT_NONE
+    return _no_verify_ssl_ctx
 
 
 def _make_connection_factory(verify_ssl: bool = True):
@@ -83,7 +102,7 @@ def _make_connection_factory(verify_ssl: bool = True):
             if verify_ssl:
                 pass  # 使用默认 SSL 上下文（验证证书）
             else:
-                kw["ssl"] = _NO_VERIFY_SSL
+                kw["ssl"] = _get_no_verify_ssl()
                 if not _ssl_warning_emitted:
                     _client_log.warning(
                         "TLS 证书验证已禁用（verify_ssl=False）。"
@@ -97,7 +116,7 @@ def _make_connection_factory(verify_ssl: bool = True):
 async def _default_connection_factory(url: str) -> Any:
     kw: dict[str, Any] = {"open_timeout": 5, "close_timeout": 5, "ping_interval": None}
     if url.startswith("wss://"):
-        kw["ssl"] = _NO_VERIFY_SSL
+        kw["ssl"] = _get_no_verify_ssl()
     return await websockets.connect(url, **kw)
 
 
@@ -234,20 +253,21 @@ class AUNClient:
             sender_cert_resolver=lambda aid: self._get_verified_peer_cert(aid),
             initiator_cert_resolver=lambda aid: self._get_verified_peer_cert(aid),
         )
+        self._token_refresh_failures = 0  # token 刷新连续失败计数
         self._group_epoch_rotate_task: asyncio.Task | None = None
         self._group_epoch_cleanup_task: asyncio.Task | None = None
         self._cache_cleanup_task: asyncio.Task | None = None
         # 消息序列号跟踪器（群消息 + P2P 共用，按命名空间隔离）
         self._seq_tracker = SeqTracker()
         self._seq_tracker_context: tuple[str, str, str] | None = None
-        self._gap_fill_done: set[str] = set()  # 补洞去重：已完成/进行中的 (type:id:after_seq) 集合
+        self._gap_fill_done: dict[str, float] = {}  # 补洞去重：进行中的 key -> 开始时间戳
         self._gap_fill_active: bool = False  # 当前是否在补洞中（用于标记 pull 来源）
         # 推送路径已分发的 seq 集合（按命名空间），补洞路径 publish 前检查以避免重复分发
         self._pushed_seqs: dict[str, set[int]] = {}
+        # PY-001: 解密失败的群消息待重试队列（按 namespace 分组）
+        self._pending_decrypt_msgs: dict[str, list[dict[str, Any]]] = {}
 
         self.auth = AuthNamespace(self)
-        self.custody = CustodyNamespace(self)
-
         # 内部订阅：推送消息自动解密后 re-publish 给用户
         self._dispatcher.subscribe("_raw.message.received", self._on_raw_message_received)
         # 群组消息推送：自动解密后 re-publish
@@ -257,6 +277,9 @@ class AUNClient:
         # 其他事件直接透传
         for evt in ("message.recalled", "message.ack"):
             self._dispatcher.subscribe(f"_raw.{evt}", lambda data, e=evt: self._dispatcher.publish(e, data))
+        # 服务端主动断开通知：记录日志并标记不重连
+        self._server_kicked = False
+        self._dispatcher.subscribe("_raw.gateway.disconnect", self._on_gateway_disconnect)
 
     # ── 属性 ──────────────────────────────────────────────
 
@@ -278,6 +301,15 @@ class AUNClient:
 
     # ── 生命周期 ──────────────────────────────────────────
 
+    @property
+    def gateway_health(self) -> bool | None:
+        """最近一次 health check 结果，None 表示尚未检查。"""
+        return self._discovery.last_healthy
+
+    async def check_gateway_health(self, gateway_url: str, *, timeout: float = 5.0) -> bool:
+        """向 gateway_url 的 /health 端点发送 HEAD 请求，检查网关可用性。"""
+        return await self._discovery.check_health(gateway_url, timeout=timeout)
+
     async def connect(self, auth: dict[str, Any], options: dict[str, Any] | None = None) -> None:
         if self._state not in {"idle", "closed"}:
             raise StateError(f"connect not allowed in state {self._state}")
@@ -293,6 +325,9 @@ class AUNClient:
 
     async def disconnect(self) -> None:
         """断开连接但不关闭客户端（可重新 connect，对齐 C++ Disconnect）"""
+        # 若 close() 已在执行中，跳过 disconnect 避免竞态
+        if self._closing:
+            return
         if self._state not in {"connected", "reconnecting"}:
             return
         self._save_seq_tracker_state()
@@ -387,7 +422,7 @@ class AUNClient:
                 "signature": base64.b64encode(sig).decode("ascii"),
             }
         except Exception as exc:
-            _client_log.warning("客户端签名失败，继续发送无签名请求: %s", exc)
+            raise ClientSignatureError(f"客户端签名失败，拒绝发送无签名请求: {exc}") from exc
 
     async def call(self, method: str, params: dict | None = None) -> Any:
         if self._state != "connected":
@@ -507,27 +542,29 @@ class AUNClient:
             if gid and self._aid and not self._group_e2ee.has_secret(gid):
                 try:
                     self._group_e2ee.create_epoch(gid, [self._aid])
-                    # 同步到服务端：将服务端 epoch 从 0 推到 1
-                    loop.create_task(self._sync_epoch_to_server(gid))
+                    # 同步到服务端：将服务端 epoch 从 0 推到 1（await 确保完成后再返回）
+                    await self._sync_epoch_to_server(gid)
                 except Exception as exc:
                     self._log_e2ee_error("create_epoch", gid, "", exc)
 
         # 加人后自动分发密钥给新成员（如 rotate_on_join 则先轮换）
-        if method == "group.add_member":
-            group_id = params.get("group_id", "")
-            new_aid = params.get("aid", "")
-            if group_id and new_aid:
-                if self._config_model.rotate_on_join:
-                    loop.create_task(self._rotate_group_epoch(group_id))
-                else:
-                    loop.create_task(self._distribute_key_to_new_member(group_id, new_aid))
+        # 必须检查返回结果是否成功，失败时禁止分发密钥（安全：防止泄漏 epoch key）
+        if method == "group.add_member" and isinstance(result, dict):
+            if not result.get("error"):
+                group_id = params.get("group_id", "")
+                new_aid = params.get("aid", "")
+                if group_id and new_aid:
+                    if self._config_model.rotate_on_join:
+                        loop.create_task(self._rotate_group_epoch(group_id))
+                    else:
+                        loop.create_task(self._distribute_key_to_new_member(group_id, new_aid))
 
         # group.kick / group.leave：由 group.changed(member_removed/member_left)
         # 事件侧统一驱动剩余 admin/owner 补位轮换，避免 RPC 返回路径与事件路径双重触发。
 
         # 审批通过后自动分发密钥给新成员
         if method == "group.review_join_request" and isinstance(result, dict):
-            if result.get("approved") or result.get("status") == "approved":
+            if result.get("approved") is True or result.get("status") == "approved":
                 group_id = params.get("group_id", "")
                 new_aid = params.get("aid", "")
                 if group_id and new_aid:
@@ -562,7 +599,7 @@ class AUNClient:
                     {"stage": stage, "group_id": group_id, "aid": aid, "error": str(exc)},
                 ))
         except Exception as _pub_exc:
-            _client_log.debug("发布 e2ee 编排事件失败: %s", _pub_exc)
+            _client_log.warning("发布 e2ee 编排事件失败: %s", _pub_exc)
 
     async def _send_encrypted(self, params: dict[str, Any]) -> Any:
         """自动加密并发送消息。"""
@@ -837,11 +874,36 @@ class AUNClient:
                 _client_log.warning("发布 e2ee.degraded 事件失败: %s", exc)
 
     async def _send_group_encrypted(self, params: dict[str, Any]) -> Any:
-        """自动加密并发送群组消息。"""
+        """自动加密并发送群组消息。发送前预检本地 epoch 是否与服务端一致。"""
         group_id = params.get("group_id")
         payload = params.get("payload")
         if not group_id:
             raise ValidationError("group.send requires group_id")
+
+        # 预检：本地 epoch 是否与服务端一致，不一致则等待密钥恢复
+        local_epoch = self._group_e2ee.current_epoch(group_id)
+        if local_epoch is not None:
+            try:
+                epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+                server_epoch = epoch_result.get("epoch", 0)
+                if server_epoch > local_epoch:
+                    _client_log.warning(
+                        "群 %s 本地 epoch=%d < 服务端 epoch=%d，触发密钥恢复",
+                        group_id, local_epoch, server_epoch,
+                    )
+                    # 向 owner 请求最新密钥
+                    owner_aid = epoch_result.get("owner_aid", "")
+                    if not owner_aid:
+                        try:
+                            info = await self.call("group.get_info", {"group_id": group_id})
+                            owner_aid = info.get("owner_aid", "")
+                        except Exception:
+                            pass
+                    if owner_aid and owner_aid != self._aid:
+                        await self._request_group_key_from(group_id, owner_aid)
+                    # 不阻塞发送：使用当前本地 epoch 发送，服务端若拒绝由上层处理
+            except Exception as _exc:
+                _client_log.warning("群 %s epoch 预检失败: %s", group_id, _exc)
 
         envelope = self._group_e2ee.encrypt(group_id, payload)
 
@@ -869,6 +931,10 @@ class AUNClient:
 
     def on(self, event: str, handler: Callable[[Any], Any]) -> Subscription:
         return self._dispatcher.subscribe(event, handler)
+
+    def off(self, event: str, handler: Callable[[Any], Any]) -> None:
+        """注销事件处理器（对齐 C++ RemoveEventHandler / JS off）。"""
+        self._dispatcher.unsubscribe(event, handler)
 
     async def _on_raw_message_received(self, data: Any) -> None:
         """处理 transport 层推送的原始消息：解密后 re-publish 给用户。"""
@@ -996,6 +1062,10 @@ class AUNClient:
             if data.get("action") in ("member_left", "member_removed") and group_id:
                 loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
                 loop.create_task(self._maybe_lead_rotate_group_epoch(group_id))
+
+            # PY-003: 群组解散 → 清理本地 epoch key、seq_tracker 等状态
+            if data.get("action") == "dissolved" and group_id:
+                self._cleanup_group_state(group_id)
         else:
             await self._dispatcher.publish("group.changed", data)
 
@@ -1050,6 +1120,8 @@ class AUNClient:
 
         带 payload 的事件（消息推送）：解密后 re-publish。
         不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
+
+        PY-001: 解密失败的消息不 auto-ack，加入待重试队列等待密钥恢复。
         """
         try:
             if not isinstance(data, dict):
@@ -1076,23 +1148,43 @@ class AUNClient:
                 await self._auto_pull_group_messages(msg)
                 return
             decrypted = await self._decrypt_group_message(msg)
-            # 记录已推送的 seq，补洞路径据此去重
-            if group_id and seq is not None:
-                ns_key = f"group:{group_id}"
-                self._pushed_seqs.setdefault(ns_key, set()).add(int(seq))
-            await self._dispatcher.publish("group.message_created", decrypted)
 
-            # auto-ack：ack contiguous_seq（避免空洞时跳跃推进）
-            if group_id and seq is not None:
-                contig = self._seq_tracker.get_contiguous_seq(ns)
-                if contig > 0:
-                    try:
-                        await self._transport.call("group.ack_messages", {
-                            "group_id": group_id, "msg_seq": contig,
-                            "device_id": self._device_id,
-                        })
-                    except Exception as _ack_exc:
-                        _client_log.debug("群消息 auto-ack 失败: group=%s %s", group_id, _ack_exc)
+            # PY-001: 检查解密是否成功（成功时有 e2ee 字段）
+            is_encrypted_payload = isinstance(payload, dict) and payload.get("type") == "e2ee.group_encrypted"
+            decrypt_success = not is_encrypted_payload or (isinstance(decrypted, dict) and decrypted.get("e2ee"))
+
+            if decrypt_success:
+                # 解密成功：记录 pushed_seq + 发布 + auto-ack
+                if group_id and seq is not None:
+                    ns_key = f"group:{group_id}"
+                    self._pushed_seqs.setdefault(ns_key, set()).add(int(seq))
+                    self._enforce_pushed_seqs_limit(ns_key)
+                await self._dispatcher.publish("group.message_created", decrypted)
+
+                # auto-ack：ack contiguous_seq（避免空洞时跳跃推进）
+                if group_id and seq is not None:
+                    contig = self._seq_tracker.get_contiguous_seq(ns)
+                    if contig > 0:
+                        try:
+                            await self._transport.call("group.ack_messages", {
+                                "group_id": group_id, "msg_seq": contig,
+                                "device_id": self._device_id,
+                            })
+                        except Exception as _ack_exc:
+                            _client_log.debug("群消息 auto-ack 失败: group=%s %s", group_id, _ack_exc)
+            else:
+                # PY-001: 解密失败 → 不 auto-ack，加入待重试队列
+                self._enqueue_pending_decrypt(group_id, msg)
+                # 发布 undecryptable 事件（安全：不含密文 payload）
+                safe_event = {
+                    "message_id": msg.get("message_id"),
+                    "group_id": group_id,
+                    "from": msg.get("from"),
+                    "seq": seq,
+                    "timestamp": msg.get("timestamp"),
+                    "_decrypt_error": "group secret unavailable",
+                }
+                await self._dispatcher.publish("group.message_undecryptable", safe_event)
         except Exception as _exc:
             _client_log.warning("群消息 push 处理失败: %s", _exc)
             # H26: 解密失败改发 group.message_undecryptable 事件，不投递原始密文 payload
@@ -1106,21 +1198,10 @@ class AUNClient:
                     "_decrypt_error": str(_exc),
                 }
                 await self._dispatcher.publish("group.message_undecryptable", safe_event)
-                # 解密失败时，SeqTracker 已推进 contiguous，仍需 auto-ack 避免服务端重推
+                # PY-001: 异常路径也不 auto-ack，加入待重试队列
                 _exc_group_id = data.get("group_id", "")
-                _exc_seq = data.get("seq")
-                if _exc_group_id and _exc_seq is not None:
-                    _exc_ns = f"group:{_exc_group_id}"
-                    _exc_contig = self._seq_tracker.get_contiguous_seq(_exc_ns)
-                    if _exc_contig > 0:
-                        try:
-                            await self._transport.call("group.ack_messages", {
-                                "group_id": _exc_group_id, "msg_seq": _exc_contig,
-                                "device_id": self._device_id,
-                            })
-                        except Exception as _ack_exc:
-                            _client_log.debug("群消息 auto-ack（解密失败）失败: group=%s %s",
-                                              _exc_group_id, _ack_exc)
+                if _exc_group_id:
+                    self._enqueue_pending_decrypt(_exc_group_id, dict(data))
 
     async def _auto_pull_group_messages(self, notification: dict[str, Any]) -> None:
         """收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息。"""
@@ -1166,7 +1247,7 @@ class AUNClient:
         dedup_key = f"group_msg:{group_id}:{after_seq}"
         if dedup_key in self._gap_fill_done:
             return
-        self._gap_fill_done.add(dedup_key)
+        self._gap_fill_done[dedup_key] = time.time()
         # S1: dedup 键必须在所有出口（成功/异常/空返）清理，避免"成功但返回 0 条"永久占位。
         # 真实空洞下次 push 还会触发；同窗口内并发由 add 前的 in 检查保证幂等。
         try:
@@ -1195,7 +1276,7 @@ class AUNClient:
         except Exception as exc:
             _client_log.warning("群消息补洞失败: group=%s after_seq=%d error=%s", group_id, after_seq, exc)
         finally:
-            self._gap_fill_done.discard(dedup_key)
+            self._gap_fill_done.pop(dedup_key, None)
 
     async def _fill_group_event_gap(self, group_id: str) -> None:
         """后台补齐群事件空洞。"""
@@ -1206,7 +1287,7 @@ class AUNClient:
         dedup_key = f"group_evt:{group_id}:{after_seq}"
         if dedup_key in self._gap_fill_done:
             return
-        self._gap_fill_done.add(dedup_key)
+        self._gap_fill_done[dedup_key] = time.time()
         # S1: try/finally 保证 dedup 键在所有出口清理
         try:
             _client_log.info("群事件补洞开始: group=%s after_seq=%d", group_id, after_seq)
@@ -1239,16 +1320,20 @@ class AUNClient:
                             # 消息事件由 _fill_group_gap 负责，事件补洞不重复投递
                             if et == "group.message_created":
                                 continue
+                            # 验签：有 client_signature 就验（与实时事件路径对齐）
+                            cs = evt.get("client_signature")
+                            if cs and isinstance(cs, dict):
+                                evt["_verified"] = await self._verify_event_signature(evt, cs)
                             # group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
                             await self._dispatcher.publish("group.changed", evt)
         except Exception as exc:
             _client_log.warning("群事件补洞失败: group=%s after_seq=%d error=%s", group_id, after_seq, exc)
         finally:
-            self._gap_fill_done.discard(dedup_key)
+            self._gap_fill_done.pop(dedup_key, None)
 
     async def _sync_all_groups_once(self) -> None:
         """上线/重连后一次性同步所有已加入群：
-        1. 无 epoch key 的群 → 发密钥请求（不等待）
+        1. 无 epoch key 的群 → 向 owner 发密钥恢复请求
         2. 有 epoch key 的群 → 补消息 + 补事件
         3. 所有群 → 补事件（事件不加密）
         """
@@ -1257,7 +1342,7 @@ class AUNClient:
         if not self._aid:
             return
         try:
-            result = await self.call("group.list", {})
+            result = await self.call("group.list_my", {})
             groups = result.get("items", []) if isinstance(result, dict) else []
             _client_log.info("群全量同步: 共 %d 个群", len(groups))
             for g in groups:
@@ -1266,8 +1351,12 @@ class AUNClient:
                     continue
                 has_secret = self._group_e2ee.has_secret(gid)
                 if not has_secret:
-                    # 没有 epoch key → 跳过消息补洞，等收到推送时触发密钥恢复
-                    _client_log.debug("群 %s 无 epoch key，跳过消息补洞", gid)
+                    # 没有 epoch key → 主动向 owner 请求密钥恢复
+                    owner_aid = g.get("owner_aid", "") if isinstance(g, dict) else ""
+                    if owner_aid and owner_aid != self._aid:
+                        await self._request_group_key_from(gid, owner_aid)
+                    else:
+                        _client_log.debug("群 %s 无 epoch key 且无法确定 owner，等待推送触发恢复", gid)
                 else:
                     # 有 epoch key → 补消息
                     await self._fill_group_gap(gid)
@@ -1279,6 +1368,20 @@ class AUNClient:
     async def _pull_all_group_events_once(self) -> None:
         """兼容旧调用，委托给 _sync_all_groups_once。"""
         await self._sync_all_groups_once()
+
+    async def _request_group_key_from(self, group_id: str, target_aid: str) -> None:
+        """主动向指定成员请求群组密钥（用于重连时无 epoch key 的群）。"""
+        try:
+            from .e2ee import build_key_request
+            req_payload = build_key_request(group_id, 0, self._aid or "")
+            await self.call("message.send", {
+                "to": target_aid,
+                "payload": req_payload,
+                "encrypt": True,
+            })
+            _client_log.info("已向 %s 请求群 %s 的密钥", target_aid, group_id)
+        except Exception as exc:
+            _client_log.warning("向 %s 请求群 %s 密钥失败: %s", target_aid, group_id, exc)
 
     async def _fill_p2p_gap(self) -> None:
         """后台补齐 P2P 消息空洞。"""
@@ -1294,7 +1397,7 @@ class AUNClient:
         dedup_key = f"p2p:{after_seq}"
         if dedup_key in self._gap_fill_done:
             return
-        self._gap_fill_done.add(dedup_key)
+        self._gap_fill_done[dedup_key] = time.time()
         # S1: try/finally 保证 dedup 键在所有出口清理
         try:
             _client_log.info("P2P 消息补洞开始: after_seq=%d device_id=%s", after_seq, self._device_id)
@@ -1330,7 +1433,7 @@ class AUNClient:
         except Exception as exc:
             _client_log.warning("P2P 消息补洞失败: after_seq=%d error=%s", after_seq, exc)
         finally:
-            self._gap_fill_done.discard(dedup_key)
+            self._gap_fill_done.pop(dedup_key, None)
 
     def _prune_pushed_seqs(self, ns: str) -> None:
         """清理 pushed_seqs 中 <= contiguous_seq 的条目，防止无限增长。"""
@@ -1341,6 +1444,109 @@ class AUNClient:
         pushed.difference_update(s for s in list(pushed) if s <= contig)
         if not pushed:
             del self._pushed_seqs[ns]
+
+    def _enforce_pushed_seqs_limit(self, ns: str) -> None:
+        """PY-006: pushed_seqs 超过硬上限时清理最旧条目。"""
+        pushed = self._pushed_seqs.get(ns)
+        if not pushed or len(pushed) <= _PUSHED_SEQS_LIMIT:
+            return
+        # 保留最大（最新）的 _PUSHED_SEQS_LIMIT 个条目
+        sorted_seqs = sorted(pushed)
+        keep = set(sorted_seqs[-_PUSHED_SEQS_LIMIT:])
+        self._pushed_seqs[ns] = keep
+
+    def _enqueue_pending_decrypt(self, group_id: str, msg: dict[str, Any]) -> None:
+        """PY-001: 将解密失败的消息加入待重试队列（有大小上限）。"""
+        ns = f"group:{group_id}"
+        queue = self._pending_decrypt_msgs.setdefault(ns, [])
+        queue.append(msg)
+        # 超过上限时丢弃最旧的
+        if len(queue) > _PENDING_DECRYPT_LIMIT:
+            self._pending_decrypt_msgs[ns] = queue[-_PENDING_DECRYPT_LIMIT:]
+
+    async def _retry_pending_decrypt_msgs(self, group_id: str) -> None:
+        """PY-002: 密钥恢复后重试待解密队列中的消息。
+
+        成功解密的消息发布到 group.message_created 并 auto-ack。
+        仍然失败的消息保留在队列中。
+        """
+        ns = f"group:{group_id}"
+        queue = self._pending_decrypt_msgs.get(ns)
+        if not queue:
+            return
+        # 取出队列，逐条重试
+        pending = list(queue)
+        self._pending_decrypt_msgs[ns] = []
+        still_pending: list[dict[str, Any]] = []
+
+        for msg in pending:
+            try:
+                decrypted = await self._decrypt_group_message(msg, skip_replay=True)
+                is_encrypted = isinstance(msg.get("payload"), dict) and msg["payload"].get("type") == "e2ee.group_encrypted"
+                if is_encrypted and (not isinstance(decrypted, dict) or not decrypted.get("e2ee")):
+                    # 仍然解密失败
+                    still_pending.append(msg)
+                    continue
+                # 解密成功
+                seq = msg.get("seq")
+                if group_id and seq is not None:
+                    ns_key = f"group:{group_id}"
+                    self._pushed_seqs.setdefault(ns_key, set()).add(int(seq))
+                    self._enforce_pushed_seqs_limit(ns_key)
+                await self._dispatcher.publish("group.message_created", decrypted)
+                # auto-ack
+                if group_id and seq is not None:
+                    contig = self._seq_tracker.get_contiguous_seq(ns)
+                    if contig > 0:
+                        try:
+                            await self._transport.call("group.ack_messages", {
+                                "group_id": group_id, "msg_seq": contig,
+                                "device_id": self._device_id,
+                            })
+                        except Exception as _ack_exc:
+                            _client_log.debug("重试 auto-ack 失败: group=%s %s", group_id, _ack_exc)
+            except Exception as _exc:
+                _client_log.debug("重试解密失败: group=%s seq=%s: %s", group_id, msg.get("seq"), _exc)
+                still_pending.append(msg)
+
+        if still_pending:
+            self._pending_decrypt_msgs[ns] = still_pending
+        else:
+            self._pending_decrypt_msgs.pop(ns, None)
+
+    def _cleanup_group_state(self, group_id: str) -> None:
+        """PY-003: 群组 dissolve/leave 后清理该群组的全部本地状态。
+
+        包括 epoch key、seq_tracker、pushed_seqs、待重试解密队列。
+        """
+        ns_msg = f"group:{group_id}"
+        ns_evt = f"group_event:{group_id}"
+
+        # 清理 keystore 中的 epoch key
+        if self._aid:
+            try:
+                db = self._keystore._get_db(self._aid)
+                db.delete_group_current(group_id)
+                db.delete_all_group_old_epochs(group_id)
+            except Exception as _exc:
+                _client_log.debug("清理群 %s epoch key 失败: %s", group_id, _exc)
+
+        # 清理 seq_tracker
+        self._seq_tracker.remove_namespace(ns_msg)
+        self._seq_tracker.remove_namespace(ns_evt)
+
+        # 清理 pushed_seqs
+        self._pushed_seqs.pop(ns_msg, None)
+
+        # 清理待重试解密队列
+        self._pending_decrypt_msgs.pop(ns_msg, None)
+
+        # 清理补洞去重状态
+        for k in list(self._gap_fill_done):
+            if group_id in k:
+                self._gap_fill_done.pop(k, None)
+
+        _client_log.info("已清理群组 %s 本地状态（epoch key + seq + pushed_seqs）", group_id)
 
     async def _decrypt_group_message(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any]:
         """解密单条群组消息。"""
@@ -1370,15 +1576,17 @@ class AUNClient:
                 group_id, epoch, sender_aid=sender,
             )
             if recovery:
-                try:
-                    await self.call("message.send", {
-                        "to": recovery["to"],
-                        "payload": recovery["payload"],
-                        "encrypt": True,
-                    })
-                except Exception as _exc:
-                    import logging as _logging
-                    _logging.getLogger("aun_core").debug("操作失败: %s", _exc)
+                # 向主候选人 + 最多 2 个备选候选人发送密钥请求
+                targets = [recovery["to"]] + recovery.get("fallback_targets", [])[:2]
+                for target in targets:
+                    try:
+                        await self.call("message.send", {
+                            "to": target,
+                            "payload": recovery["payload"],
+                            "encrypt": True,
+                        })
+                    except Exception as _exc:
+                        _client_log.warning("向 %s 请求密钥恢复失败: %s", target, _exc)
 
         return message
 
@@ -1483,6 +1691,15 @@ class AUNClient:
                     except Exception as exc:
                         _client_log.warning("向 %s 回复群组密钥失败: %s", requester, exc)
 
+        # PY-002: 密钥分发/响应成功后，触发待解密消息重试
+        if result in ("distribution", "response"):
+            group_id_for_retry = actual_payload.get("group_id", "")
+            if group_id_for_retry:
+                ns_check = f"group:{group_id_for_retry}"
+                if self._pending_decrypt_msgs.get(ns_check):
+                    loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+                    loop.create_task(self._retry_pending_decrypt_msgs(group_id_for_retry))
+
         # S14: 控制面消息无论 handle_incoming 是否返回 rejected/None 都吞掉，
         # 避免发布到业务消息流。
         return True
@@ -1512,7 +1729,9 @@ class AUNClient:
         peer_gateway_url = self._resolve_peer_gateway_url(gateway_url, aid)
         cert_url = self._build_cert_url(peer_gateway_url, aid, cert_fingerprint)
         ssl_param = None if self._config_model.verify_ssl else False
-        async with aiohttp.ClientSession() as session:
+        # PY-017: 显式设置 HTTP 超时，避免 aiohttp 默认 300s 阻塞
+        http_timeout = aiohttp.ClientTimeout(total=10.0)
+        async with aiohttp.ClientSession(timeout=http_timeout) as session:
             async with session.get(cert_url, ssl=ssl_param) as response:
                 response.raise_for_status()
                 cert_pem = await response.text()
@@ -1679,8 +1898,10 @@ class AUNClient:
             return True
         except Exception as _exc:
             import logging as _logging
-            _logging.getLogger("aun_core").debug("操作失败: %s", _exc)
-            return False
+            _logging.getLogger("aun_core").warning(
+                "replay guard RPC 调用失败，允许消息通过: %s", _exc,
+            )
+            return True
 
     async def _decrypt_messages(self, messages: list[dict[str, Any]], *, source: str = "pull") -> list[dict[str, Any]]:
         """批量解密消息（用于 message.pull）。
@@ -2001,7 +2222,12 @@ class AUNClient:
         self._token_refresh_task = asyncio.create_task(self._token_refresh_loop())
 
     def _start_prekey_refresh_task(self) -> None:
-        return
+        if self._prekey_refresh_task is not None and not self._prekey_refresh_task.done():
+            return
+        interval = 3600.0  # 每小时检查一次 prekey 是否需要补充
+        self._prekey_refresh_task = asyncio.get_event_loop().create_task(
+            self._prekey_refresh_loop(interval)
+        )
 
     async def _heartbeat_loop(self, interval: float) -> None:
         consecutive_failures = 0
@@ -2056,8 +2282,27 @@ class AUNClient:
                         "aid": identity.get("aid"),
                         "expires_at": identity.get("access_token_expires_at"),
                     })
+                    self._token_refresh_failures = 0  # 刷新成功，重置连续失败计数
                 except AuthError as exc:
-                    _client_log.debug("token 刷新失败，下次重试: %s", exc)
+                    self._token_refresh_failures += 1
+                    if self._token_refresh_failures >= _TOKEN_REFRESH_MAX_FAILURES:
+                        _client_log.warning(
+                            "token 刷新连续失败 %d 次，发布 exhausted 事件",
+                            self._token_refresh_failures,
+                        )
+                        await self._dispatcher.publish("token.refresh_exhausted", {
+                            "aid": self._identity.get("aid") if self._identity else None,
+                            "consecutive_failures": self._token_refresh_failures,
+                            "last_error": str(exc),
+                        })
+                        self._token_refresh_failures = 0
+                    else:
+                        _client_log.debug(
+                            "token 刷新失败 (%d/%d)，下次重试: %s",
+                            self._token_refresh_failures,
+                            _TOKEN_REFRESH_MAX_FAILURES,
+                            exc,
+                        )
                     continue
                 except Exception as exc:
                     await self._dispatcher.publish("connection.error", {"error": exc})
@@ -2065,7 +2310,18 @@ class AUNClient:
             raise
 
     async def _prekey_refresh_loop(self, interval: float) -> None:
-        return
+        """定期检查并补充 prekey，防止长时间无通信后 prekey 耗尽。"""
+        try:
+            while not self._closing:
+                await asyncio.sleep(interval)
+                if self._state != "connected":
+                    continue
+                try:
+                    await self._upload_prekey()
+                except Exception as exc:
+                    _client_log.warning("prekey 定期刷新失败: %s", exc)
+        except asyncio.CancelledError:
+            raise
 
     @staticmethod
     def _extract_consumed_prekey_id(message: dict[str, Any] | None) -> str:
@@ -2261,20 +2517,34 @@ class AUNClient:
                 "rotation_timestamp": ts,
             }
         except Exception as _sig_exc:
-            _client_log.debug("构建轮换签名失败: %s", _sig_exc)
+            _client_log.warning("构建轮换签名失败: %s", _sig_exc)
             return {}
 
     async def _sync_epoch_to_server(self, group_id: str) -> None:
-        """建群后将本地 epoch 1 同步到服务端（服务端初始为 0）。"""
-        try:
-            rotate_params = {
-                "group_id": group_id,
-                "current_epoch": 0,
-            }
-            rotate_params.update(self._build_rotation_signature(group_id, 0, 1))
-            await self.call("group.e2ee.rotate_epoch", rotate_params)
-        except Exception as exc:
-            _client_log.debug("同步 epoch 到服务端失败 (group=%s，可能已同步): %s", group_id, exc)
+        """建群后将本地 epoch 1 同步到服务端（服务端初始为 0），最多重试 3 次。"""
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                rotate_params = {
+                    "group_id": group_id,
+                    "current_epoch": 0,
+                }
+                rotate_params.update(self._build_rotation_signature(group_id, 0, 1))
+                await self.call("group.e2ee.rotate_epoch", rotate_params)
+                return
+            except Exception as exc:
+                if attempt < max_retries:
+                    delay = 0.5 * (2 ** (attempt - 1))
+                    _client_log.warning(
+                        "同步 epoch 到服务端失败 (group=%s, 第%d/%d次): %s, %.1fs后重试",
+                        group_id, attempt, max_retries, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    _client_log.error(
+                        "同步 epoch 到服务端最终失败 (group=%s, 已重试%d次): %s",
+                        group_id, max_retries, exc,
+                    )
 
     async def _maybe_lead_rotate_group_epoch(self, group_id: str) -> None:
         """基于"排序最小 admin = leader"选举，其他 admin 走 jitter 兜底重试。
@@ -2316,12 +2586,22 @@ class AUNClient:
                 await self._rotate_group_epoch(group_id)
                 return
 
-            # 4. 非 leader：随机 jitter（2~6s）后检查 epoch 是否已被 leader 推进
+            # 4. 非 leader：随机 jitter（2~6s）后查询服务端 epoch 是否已被 leader 推进
             import random
             jitter_ms = 2000 + random.randint(0, 4000)
-            before_epoch = self._group_e2ee.current_epoch(group_id) or 0
+            # 记录 jitter 前的服务端 epoch
+            try:
+                before_resp = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+                before_epoch = before_resp.get("epoch", 0) if isinstance(before_resp, dict) else 0
+            except Exception:
+                before_epoch = self._group_e2ee.current_epoch(group_id) or 0
             await asyncio.sleep(jitter_ms / 1000.0)
-            after_epoch = self._group_e2ee.current_epoch(group_id) or 0
+            # jitter 后查询服务端 epoch
+            try:
+                after_resp = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+                after_epoch = after_resp.get("epoch", 0) if isinstance(after_resp, dict) else 0
+            except Exception:
+                after_epoch = self._group_e2ee.current_epoch(group_id) or 0
 
             if after_epoch > before_epoch:
                 return  # leader 已完成
@@ -2461,8 +2741,43 @@ class AUNClient:
                 self._cache_cleanup_loop(3600.0)
             )
 
+    async def _is_rotation_leader(self, group_id: str) -> bool:
+        """PY-005: 判断自己是否为该群组定时轮换的 leader。
+
+        规则：所有 admin/owner 按 AID 字典序排序，最小的为 leader。
+        普通 member 始终返回 False。
+        """
+        my_aid = self._aid
+        if not my_aid:
+            return False
+        try:
+            members_resp = await self._transport.call("group.get_members", {"group_id": group_id})
+            if not isinstance(members_resp, dict):
+                return False
+            raw_list = members_resp.get("members") or members_resp.get("items")
+            if not isinstance(raw_list, list):
+                return False
+            admins = []
+            for m in raw_list:
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role", ""))
+                aid = str(m.get("aid", ""))
+                if aid and role in ("admin", "owner"):
+                    admins.append(aid)
+            if not admins or my_aid not in admins:
+                return False
+            admins.sort()
+            return admins[0] == my_aid
+        except Exception as _exc:
+            _client_log.debug("leader 选举查询失败: group=%s: %s", group_id, _exc)
+            return False
+
     async def _group_epoch_rotate_loop(self, interval: float) -> None:
-        """定时轮换所有已知群组的 epoch"""
+        """定时轮换所有已知群组的 epoch。
+
+        PY-005: 只有 leader admin 执行定时轮换，避免多 admin 同时竞争。
+        """
         try:
             while not self._closing:
                 await asyncio.sleep(interval)
@@ -2474,9 +2789,13 @@ class AUNClient:
                 try:
                     all_groups = self._keystore.load_all_group_secret_states(my_aid)
                     for gid in list(all_groups.keys()):
-                        await self._rotate_group_epoch(gid)
+                        # PY-005: 只有 leader 执行定时轮换
+                        if await self._is_rotation_leader(gid):
+                            await self._rotate_group_epoch(gid)
+                        else:
+                            _client_log.debug("非 leader，跳过定时轮换: group=%s", gid)
                 except Exception as _exc:
-                    _client_log.debug("epoch 轮换失败: %s", _exc)
+                    _client_log.warning("epoch 轮换失败: %s", _exc)
         except asyncio.CancelledError:
             raise
 
@@ -2496,7 +2815,7 @@ class AUNClient:
                     for gid in list(all_groups.keys()):
                         self._group_e2ee.cleanup(gid, retention)
                 except Exception as _exc:
-                    _client_log.debug("epoch 轮换失败: %s", _exc)
+                    _client_log.warning("epoch 轮换失败: %s", _exc)
         except asyncio.CancelledError:
             raise
 
@@ -2515,11 +2834,11 @@ class AUNClient:
                     _, expire_at = self._peer_prekeys_cache[k]
                     if now >= expire_at:
                         del self._peer_prekeys_cache[k]
-                # 补洞去重集合（仅保留最近 5000 条）
-                if len(self._gap_fill_done) > 10000:
-                    excess = len(self._gap_fill_done) - 5000
-                    to_remove = list(self._gap_fill_done)[:excess]
-                    self._gap_fill_done -= set(to_remove)
+                # 补洞去重：清理超过 5 分钟的旧条目（可能是卡住的补洞）
+                gap_cutoff = now - 300
+                stale_keys = [k for k, ts in self._gap_fill_done.items() if ts < gap_cutoff]
+                for k in stale_keys:
+                    self._gap_fill_done.pop(k, None)
                 # e2ee prekey 缓存
                 self._e2ee.clean_expired_caches()
                 self._group_e2ee.clean_expired_caches()
@@ -2530,23 +2849,51 @@ class AUNClient:
 
     # ── 内部：断线重连 ────────────────────────────────────
 
-    async def _handle_transport_disconnect(self, error: Exception | None) -> None:
+    # 不重连 close code 集合：客户端/认证/权限错误，重连无意义
+    _NO_RECONNECT_CODES = frozenset({4001, 4003, 4008, 4009, 4010, 4011})
+
+    async def _on_gateway_disconnect(self, data: Any) -> None:
+        """处理服务端主动断开通知 event/gateway.disconnect。"""
+        code = data.get("code") if isinstance(data, dict) else None
+        reason = data.get("reason", "") if isinstance(data, dict) else ""
+        _client_log.warning("服务端主动断开: code=%s, reason=%s", code, reason)
+        self._server_kicked = True
+
+    async def _handle_transport_disconnect(self, error: Exception | None, close_code: int | None = None) -> None:
         if self._closing or self._state == "closed":
             return
         self._state = "disconnected"
+        # 断线时保存 SeqTracker 状态，防止进程崩溃后 seq 回退
+        try:
+            self._save_seq_tracker_state()
+        except Exception as exc:
+            _client_log.debug("断线时保存 SeqTracker 失败: %s", exc)
         await self._dispatcher.publish("connection.state", {"state": self._state, "error": error})
         if not bool(self._session_options["auto_reconnect"]):
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
+        # 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
+        if self._server_kicked or (close_code is not None and close_code in self._NO_RECONNECT_CODES):
+            self._state = "terminal_failed"
+            reason = "server kicked" if self._server_kicked else f"close code {close_code}"
+            _client_log.warning("抑制自动重连: %s", reason)
+            await self._dispatcher.publish("connection.state", {
+                "state": self._state, "error": error, "reason": reason,
+            })
+            return
         await self._stop_background_tasks()
-        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        # 1006 = 网络异常断开（无 close frame），1000 = 正常关闭（客户端主动）
+        # 其他 code = 服务端主动关闭
+        server_initiated = close_code is not None and close_code not in (1000, 1006)
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop(server_initiated))
 
-    async def _reconnect_loop(self) -> None:
+    async def _reconnect_loop(self, server_initiated: bool = False) -> None:
         retry = dict(self._session_options["retry"])
-        initial_delay = float(retry.get("initial_delay", 0.5))
-        max_delay = float(retry.get("max_delay", 30.0))
-        delay = initial_delay
+        max_delay = float(retry.get("max_delay", 64.0))
+        # 服务端主动关闭时从 16s 起跳，避免重连风暴；网络断开从 initial_delay 起跳
+        base_delay = 16.0 if server_initiated else float(retry.get("initial_delay", 1.0))
+        delay = base_delay
         attempt = 0
 
         while not self._closing:
@@ -2557,7 +2904,14 @@ class AUNClient:
                 "attempt": attempt,
             })
             try:
-                await asyncio.sleep(delay)
+                # Full Jitter: random(0, delay) 打散重连时机
+                await asyncio.sleep(random.random() * delay)
+                # 重连前先 HEAD /health 探测，不健康则跳过本轮
+                if self._gateway_url:
+                    healthy = await self._discovery.check_health(self._gateway_url)
+                    if not healthy:
+                        delay = min(delay * 2, max_delay)
+                        continue
                 await self._transport.close()
                 await self._invoke_reconnect_connect_once()
                 self._reconnect_task = None

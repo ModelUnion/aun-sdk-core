@@ -200,6 +200,11 @@ export class SeqTracker {
     this._tryAdvance(t);
   }
 
+  /** 删除指定命名空间的所有跟踪状态（群组解散时使用） */
+  removeNamespace(ns: string): void {
+    this._trackers.delete(ns);
+  }
+
   /** 强制跳过不连续区间，将 contiguousSeq 拨到指定位置。
    *  当服务端返回 server_ack_seq 且本地 contiguousSeq 落后时调用，
    *  跳过 [contiguousSeq, server_ack_seq) 这段不连续区间。 */

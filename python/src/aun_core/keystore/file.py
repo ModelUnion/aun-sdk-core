@@ -57,6 +57,9 @@ def _latest_prekey_ids(prekeys: dict[str, dict[str, Any]], keep_latest: int) -> 
 
 def _derive_field_key(master_key: bytes, scope: str, name: str) -> bytes:
     """派生字段级加密密钥，与旧 SecretStore 格式完全一致。"""
+    # 防御性校验：scope/name 不能包含分隔符 ':'，避免域混淆
+    if ':' in scope or ':' in name:
+        raise ValueError(f"scope/name 不能包含 ':'（scope={scope!r}, name={name!r}）")
     msg = f"aun:{scope}:{name}\x01".encode("utf-8")
     return hmac.new(master_key, msg, hashlib.sha256).digest()
 
@@ -109,9 +112,9 @@ def _reveal_field(seed_bytes: bytes, scope: str, name: str, record: dict) -> byt
         return None
 
 
+_METADATA_LOCKS_LIMIT = 256
+
 class FileKeyStore(KeyStore):
-    _metadata_locks: dict[str, threading.RLock] = {}
-    _locks_lock = threading.Lock()
 
     def __init__(
         self,
@@ -139,6 +142,10 @@ class FileKeyStore(KeyStore):
         # 每 AID 一个 AIDDatabase，lazy 初始化
         self._aid_dbs: dict[str, AIDDatabase] = {}
         self._aid_dbs_lock = threading.Lock()
+
+        # 实例级别的元数据锁（不同 aun_path 的实例互不竞争）
+        self._metadata_locks: dict[str, threading.RLock] = {}
+        self._locks_lock = threading.Lock()
 
         self._sync_bundled_root_ca()
 
@@ -299,6 +306,37 @@ class FileKeyStore(KeyStore):
             if identity is not None:
                 return identity
         return None
+
+    def list_identities(self) -> list[str]:
+        """遍历 AIDs 目录，返回所有已存储的 AID 名称列表。"""
+        result: list[str] = []
+        if self._aids_root.exists():
+            for path in sorted(self._aids_root.iterdir()):
+                if path.is_dir():
+                    result.append(path.name)
+        return result
+
+    def load_metadata(self, aid: str) -> dict[str, Any] | None:
+        """返回指定 AID 的元数据摘要（证书指纹、创建时间等），不含私钥。"""
+        identity_dir = self._identity_dir(aid)
+        if not identity_dir.exists():
+            return None
+        metadata: dict[str, Any] = {"aid": aid}
+        # 证书指纹
+        cert_pem = self.load_cert(aid)
+        if cert_pem:
+            fp = self._fingerprint_from_cert_pem(cert_pem)
+            if fp:
+                metadata["cert_fingerprint"] = fp
+        # 从 DB 读取 KV 元数据（不含 token 等敏感信息）
+        try:
+            db = self._get_db(aid)
+            kv = db.get_all_metadata()
+            if kv:
+                metadata["fields"] = dict(kv)
+        except Exception as exc:
+            _log.warning("加载 %s 元数据失败: %s", aid, exc)
+        return metadata
 
     # ── Prekeys ──────────────────────────────────────────────
 
@@ -576,12 +614,19 @@ class FileKeyStore(KeyStore):
 
     # ── 并发锁 ───────────────────────────────────────────────
 
-    @classmethod
-    def _get_metadata_lock(cls, aid: str) -> threading.RLock:
-        with cls._locks_lock:
-            if aid not in cls._metadata_locks:
-                cls._metadata_locks[aid] = threading.RLock()
-            return cls._metadata_locks[aid]
+    def _get_metadata_lock(self, aid: str) -> threading.RLock:
+        with self._locks_lock:
+            if aid not in self._metadata_locks:
+                # 超过上限时，清理未被持有的锁
+                if len(self._metadata_locks) >= _METADATA_LOCKS_LIMIT:
+                    to_remove = [
+                        k for k, v in self._metadata_locks.items()
+                        if not v._is_owned()
+                    ]
+                    for k in to_remove[:len(self._metadata_locks) - _METADATA_LOCKS_LIMIT + 1]:
+                        del self._metadata_locks[k]
+                self._metadata_locks[aid] = threading.RLock()
+            return self._metadata_locks[aid]
 
     # ── 根证书同步 ───────────────────────────────────────────
 

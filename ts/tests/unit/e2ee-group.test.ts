@@ -85,6 +85,31 @@ describe('encryptGroupMessage', () => {
     expect(envelope.sender_signature).toBeTruthy();
     expect(envelope.sender_cert_fingerprint).toBeTruthy();
   });
+
+  it('签名失败时应抛出错误而非静默降级（TS-017）', () => {
+    const gs = makeGroupSecret();
+    // 提供无效的私钥 PEM，应该抛出错误
+    expect(() => {
+      encryptGroupMessage('grp-1', 1, gs, { text: 'fail' }, {
+        fromAid: 'alice.test',
+        messageId: 'msg-1',
+        timestamp: Date.now(),
+        senderPrivateKeyPem: 'INVALID_PEM_DATA',
+      });
+    }).toThrow();
+  });
+
+  it('senderPrivateKeyPem 为 null 时信封不含签名（纯函数行为）', () => {
+    const gs = makeGroupSecret();
+    const envelope = encryptGroupMessage('grp-1', 1, gs, { text: 'no sig' }, {
+      fromAid: 'alice.test',
+      messageId: 'msg-1',
+      timestamp: Date.now(),
+      senderPrivateKeyPem: null,
+    });
+    // 纯函数级别：无私钥则不签名
+    expect(envelope.sender_signature).toBeUndefined();
+  });
 });
 
 describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
@@ -567,7 +592,111 @@ describe('generateGroupSecret', () => {
   });
 });
 
+// ── GroupE2EEManager.encrypt 签名强制测试（TS-017）──────────────
+
+describe('GroupE2EEManager.encrypt 签名强制（TS-017）', () => {
+  it('identity 无私钥时 encrypt 应抛出异常而非发送无签名消息', () => {
+    const aid = 'nosig-test.aid';
+    const ks = makeGroupKs(aid);
+    // 构建一个没有 private_key_pem 的 identity
+    const identityWithoutKey = { aid, cert: null, private_key_pem: null };
+
+    const mgr = new GroupE2EEManager({
+      identityFn: () => identityWithoutKey,
+      keystore: ks,
+    });
+
+    const groupId = 'grp-nosig';
+    const gs = generateGroupSecret();
+    const members = [aid, 'other.aid'];
+    const commitment = computeMembershipCommitment(members, 1, groupId, gs);
+    storeGroupSecret(ks, aid, groupId, 1, gs, commitment, members);
+
+    // 应抛出异常：签名失败不允许静默跳过
+    expect(() => {
+      mgr.encrypt(groupId, { text: 'should fail' });
+    }).toThrow();
+  });
+});
+
 // ── commitment 绑定测试 ─────────────────────────────────────
+
+describe('GroupE2EEManager.rotateEpoch', () => {
+  it('无先前 epoch 时应返回 epoch=1 且 prevEpoch 为 null（TS-018）', () => {
+    const aid = 'rotate-test.aid';
+    const ks = makeGroupKs(aid);
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity(aid, privateKey);
+    ks._identities[aid] = identity;
+
+    const mgr = new GroupE2EEManager({
+      identityFn: () => identity,
+      keystore: ks,
+    });
+
+    const groupId = 'grp-rotate-1';
+    const members = [aid, 'other.aid'];
+
+    // 没有先前 epoch，rotateEpoch 应正常工作
+    const result = mgr.rotateEpoch(groupId, members);
+    expect(result.epoch).toBe(1);
+    // 应存储了新的 group secret
+    const stored = loadGroupSecret(ks, aid, groupId);
+    expect(stored).not.toBeNull();
+    expect(stored!.epoch).toBe(1);
+  });
+
+  it('有先前 epoch 时应返回 prevEpoch+1（TS-018）', () => {
+    const aid = 'rotate-test2.aid';
+    const ks = makeGroupKs(aid);
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity(aid, privateKey);
+    ks._identities[aid] = identity;
+
+    const mgr = new GroupE2EEManager({
+      identityFn: () => identity,
+      keystore: ks,
+    });
+
+    const groupId = 'grp-rotate-2';
+    const members = [aid, 'other.aid'];
+
+    // 先创建 epoch 1
+    mgr.createEpoch(groupId, members);
+    const stored1 = loadGroupSecret(ks, aid, groupId);
+    expect(stored1!.epoch).toBe(1);
+
+    // rotateEpoch 应返回 epoch=2
+    const result = mgr.rotateEpoch(groupId, members);
+    expect(result.epoch).toBe(2);
+  });
+
+  it('epoch 为 0 时不应被 || 运算符误判为 falsy（TS-018）', () => {
+    const aid = 'rotate-test3.aid';
+    const ks = makeGroupKs(aid);
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity(aid, privateKey);
+    ks._identities[aid] = identity;
+
+    const mgr = new GroupE2EEManager({
+      identityFn: () => identity,
+      keystore: ks,
+    });
+
+    const groupId = 'grp-rotate-3';
+    const members = [aid, 'other.aid'];
+
+    // 手动存储一个 epoch=0 的 group secret
+    const gs = generateGroupSecret();
+    const commitment = computeMembershipCommitment(members, 0, groupId, gs);
+    storeGroupSecret(ks, aid, groupId, 0, gs, commitment, members);
+
+    // rotateEpoch 应返回 epoch=1（0+1），而非 epoch=1（因为 0||0 = 0 → 0+1=1）
+    // 关键：如果用 ?? 替代 ||，epoch 0 不会被误判
+    const result = mgr.rotateEpoch(groupId, members);
+    expect(result.epoch).toBe(1);
+  });
+});
 
 describe('Commitment 绑定', () => {
   it('commitment 绑定 group_secret', () => {

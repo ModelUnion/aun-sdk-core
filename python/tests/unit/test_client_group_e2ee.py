@@ -1309,8 +1309,9 @@ class TestReplayGuardSemantics:
         ))
         assert result is True
 
-    def test_rpc_exception_fail_closed_returns_false(self, tmp_path):
-        """RPC 异常时，_check_replay_guard 应 fail-closed 返回 False（拒绝消息）。"""
+    def test_rpc_exception_fail_open_returns_true(self, tmp_path):
+        """RPC 异常时，_check_replay_guard 应 fail-open 返回 True（允许消息通过）。
+        RPC 异常（如网络问题）不代表消息是重复的，不应丢弃消息。"""
         async def transport_call(method, params=None):
             if method == "message.e2ee.record_replay_guard":
                 raise RuntimeError("network error")
@@ -1320,7 +1321,7 @@ class TestReplayGuardSemantics:
         result = asyncio.run(client._check_replay_guard(
             "msg-err-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
         ))
-        assert result is False
+        assert result is True
 
 
 class TestGroupPushDecryptFailureAutoAck:
@@ -1345,11 +1346,15 @@ class TestGroupPushDecryptFailureAutoAck:
         return client
 
     def test_group_push_decrypt_failure_still_auto_acks(self, tmp_path):
-        """group push 解密抛出异常时，contiguous 已推进，仍应发送 group.ack_messages。"""
+        """PY-001: group push 解密抛出异常时，不应 auto-ack（消息加入待重试队列）。
+
+        旧行为（已修复）：解密失败仍然 auto-ack，导致消息不可恢复。
+        新行为：解密失败不 auto-ack，消息进入 _pending_decrypt_msgs 等待密钥恢复后重试。
+        """
         client = self._make_client_with_ack_tracking(tmp_path)
 
         # mock _decrypt_group_message 让它抛出异常（模拟解密失败）
-        async def fake_decrypt_group_message(msg):
+        async def fake_decrypt_group_message(msg, **kw):
             raise Exception("群消息解密失败：密钥不匹配")
 
         client._decrypt_group_message = fake_decrypt_group_message
@@ -1376,12 +1381,13 @@ class TestGroupPushDecryptFailureAutoAck:
         ns = f"group:{_GRP}"
         assert client._seq_tracker.get_contiguous_seq(ns) == 1
 
-        # 即使解密失败，也应发送 group.ack_messages
-        assert len(client._ack_calls) == 1, (
-            f"期望 1 次 group.ack_messages，实际 {len(client._ack_calls)} 次: {client._ack_calls}"
+        # PY-001: 解密失败不应 auto-ack（消息加入待重试队列）
+        assert len(client._ack_calls) == 0, (
+            f"PY-001: 解密失败时不应 auto-ack，实际 {len(client._ack_calls)} 次: {client._ack_calls}"
         )
-        assert client._ack_calls[0]["params"]["group_id"] == _GRP
-        assert client._ack_calls[0]["params"]["msg_seq"] == 1
+        # 消息应进入待重试队列
+        pending = client._pending_decrypt_msgs.get(ns, [])
+        assert len(pending) == 1, f"解密失败的消息应进入待重试队列，实际 {len(pending)}"
 
     def test_group_push_decrypt_failure_no_ack_when_contiguous_zero(self, tmp_path):
         """group push 解密失败且 contiguous=0 时，不应发送 ack（避免无效 ack）。"""

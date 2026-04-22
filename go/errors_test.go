@@ -17,9 +17,9 @@ func TestMapRemoteError_AuthCodes(t *testing.T) {
 	}
 }
 
-// TestMapRemoteError_PermissionCodes 验证权限错误码映射
+// TestMapRemoteError_PermissionCodes 验证权限错误码映射（含 -32004 PERMISSION_DENIED）
 func TestMapRemoteError_PermissionCodes(t *testing.T) {
-	for _, code := range []int{4030, 403} {
+	for _, code := range []int{4030, 403, -32004} {
 		err := MapRemoteError(map[string]any{"code": code, "message": "perm err"})
 		if _, ok := err.(*PermissionError); !ok {
 			t.Errorf("code=%d 应映射为 PermissionError, 实际: %T", code, err)
@@ -29,7 +29,7 @@ func TestMapRemoteError_PermissionCodes(t *testing.T) {
 
 // TestMapRemoteError_NotFoundCodes 验证资源不存在错误码映射
 func TestMapRemoteError_NotFoundCodes(t *testing.T) {
-	for _, code := range []int{4040, 404, -32004} {
+	for _, code := range []int{4040, 404} {
 		err := MapRemoteError(map[string]any{"code": code, "message": "not found"})
 		if _, ok := err.(*NotFoundError); !ok {
 			t.Errorf("code=%d 应映射为 NotFoundError, 实际: %T", code, err)

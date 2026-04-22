@@ -94,6 +94,11 @@ export class FakeKeystore implements KeyStore {
     entry.old_epochs = remaining;
     return removed;
   }
+  deleteGroupSecretState(aid: string, groupId: string): void {
+    if (this._groups[aid]) {
+      delete this._groups[aid][groupId];
+    }
+  }
 }
 
 // ── 密钥和证书生成 ────────────────────────────────────────────

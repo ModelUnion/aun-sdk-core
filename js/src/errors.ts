@@ -107,6 +107,14 @@ export class SessionError extends AUNError {
   }
 }
 
+/** 版本冲突错误 */
+export class VersionConflictError extends AUNError {
+  constructor(message: string, opts?: ConstructorParameters<typeof AUNError>[1]) {
+    super(message, opts);
+    this.name = 'VersionConflictError';
+  }
+}
+
 /** 群组错误 */
 export class GroupError extends AUNError {
   constructor(message: string, opts?: ConstructorParameters<typeof AUNError>[1]) {
@@ -249,14 +257,16 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
 
   let Cls: typeof AUNError;
 
-  if ([4001, 4010, -32003].includes(code)) {
+  if ([4001, 4010, -32001, -32003].includes(code)) {
     Cls = AuthError;
-  } else if ([4030, 403].includes(code)) {
+  } else if ([4030, 403, -32004].includes(code)) { // -32004 = PERMISSION_DENIED
     Cls = PermissionError;
-  } else if ([4040, 404, -32004].includes(code)) {
+  } else if ([4040, 404, -32008].includes(code)) {
     Cls = NotFoundError;
   } else if ([4290, 429, -32029].includes(code)) {
     Cls = RateLimitError;
+  } else if (code === -32009) {
+    Cls = VersionConflictError;
   } else if ([-32010, -32011, -32013].includes(code)) {
     Cls = SessionError;
   } else if ([-32600, -32601, -32602, 4000].includes(code)) {

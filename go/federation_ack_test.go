@@ -159,6 +159,10 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 	bobAID := ensureFederationConnected(t, bobSlotA, fmt.Sprintf("go-mack-b-%s.aid.net", rid))
 	ensureFederationConnected(t, bobSlotB, bobAID)
 
+	// 两个 slot 各自记录基线 seq（必须在 Alice 发送之前）
+	baseA := currentMaxSeq(t, bobSlotA, 200)
+	baseB := currentMaxSeq(t, bobSlotB, 200)
+
 	// 监听 ack 事件
 	expectedSlots := map[string]bool{"fed-slot-a": true, "fed-slot-b": true}
 	var ackMu sync.Mutex
@@ -209,8 +213,6 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 	}
 
 	// 两个 slot 各自拉取
-	baseA := currentMaxSeq(t, bobSlotA, 200)
-	baseB := currentMaxSeq(t, bobSlotB, 200)
 	msgA := waitForSDKPullMessage(t, bobSlotA, aliceAID, baseA, text, 20*time.Second)
 	msgB := waitForSDKPullMessage(t, bobSlotB, aliceAID, baseB, text, 20*time.Second)
 
@@ -254,8 +256,9 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 	if len(slotsSeen) != 2 {
 		t.Fatalf("应收到 2 个不同 slot 的 ack 事件: %+v", ackEvents)
 	}
-	if len(deviceIDs) != 2 {
-		t.Fatalf("应收到 2 个不同 device_id 的 ack 事件: %+v", ackEvents)
+	// 同设备多 slot：device_id 应相同（只有 1 个唯一值）
+	if len(deviceIDs) != 1 {
+		t.Fatalf("同设备多 slot 的 device_id 应相同: %+v", ackEvents)
 	}
 }
 

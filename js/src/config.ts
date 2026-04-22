@@ -83,6 +83,8 @@ export interface AUNConfig {
   requireForwardSecrecy: boolean;
   /** 防重放时间窗口（秒） */
   replayWindowSeconds: number;
+  /** AID 托管服务地址 */
+  custodyUrl: string | null;
 }
 
 /** AUN 配置默认值 */
@@ -98,6 +100,7 @@ const DEFAULTS: AUNConfig = {
   verifySsl: true,
   requireForwardSecrecy: true,
   replayWindowSeconds: 300,
+  custodyUrl: null,
 };
 
 type AUNConfigInput = Partial<AUNConfig> & JsonObject;
@@ -106,7 +109,11 @@ type AUNConfigInput = Partial<AUNConfig> & JsonObject;
 export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
   const data = (raw ?? {}) as AUNConfigInput;
   if (data.verifySsl === false || data.verifySSL === false || data.verify_ssl === false) {
-    throw new ValidationError('browser SDK does not allow verify_ssl=false');
+    // 浏览器环境不支持跳过 SSL 验证，发出警告但不抛错（与 Python 对齐）
+    console.warn(
+      '[aun_core] verify_ssl=false 在浏览器环境中不受支持，' +
+      'SSL 证书验证将保持启用。浏览器 fetch API 不提供跳过证书验证的选项。',
+    );
   }
   return {
     aunPath: readString(data.aunPath ?? data.aun_path, DEFAULTS.aunPath),
@@ -123,5 +130,6 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
     verifySsl: DEFAULTS.verifySsl,
     requireForwardSecrecy: readBoolean(data.requireForwardSecrecy ?? data.require_forward_secrecy, DEFAULTS.requireForwardSecrecy),
     replayWindowSeconds: readOptionalNumber(data.replayWindowSeconds ?? data.replay_window_seconds, DEFAULTS.replayWindowSeconds) ?? DEFAULTS.replayWindowSeconds,
+    custodyUrl: readOptionalString(data.custodyUrl ?? data.custody_url, DEFAULTS.custodyUrl),
   };
 }

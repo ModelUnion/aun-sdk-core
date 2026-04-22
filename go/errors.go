@@ -12,6 +12,7 @@ type AUNError struct {
 	Data      any    // 附加数据
 	Retryable bool   // 是否可重试
 	TraceID   string // 链路追踪 ID
+	Cause     error  // 原始错误（用于 errors.Unwrap 链）
 }
 
 func (e *AUNError) Error() string {
@@ -21,9 +22,23 @@ func (e *AUNError) Error() string {
 	return e.Message
 }
 
+// Unwrap 返回原始错误，支持 Go 1.13+ errors.Is/As 错误链
+func (e *AUNError) Unwrap() error {
+	return e.Cause
+}
+
 // NewAUNError 创建基础 AUN 错误
 func NewAUNError(message string, opts ...ErrorOption) *AUNError {
 	e := &AUNError{Message: message, Code: -1}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
+}
+
+// WrapError 包装已有错误为 AUNError，保留原始错误链
+func WrapError(cause error, message string, opts ...ErrorOption) *AUNError {
+	e := &AUNError{Message: message, Code: -1, Cause: cause}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -84,6 +99,9 @@ type SerializationError struct{ AUNError }
 
 // SessionError 会话错误
 type SessionError struct{ AUNError }
+
+// VersionConflictError 版本冲突错误
+type VersionConflictError struct{ AUNError }
 
 // GroupError 群组错误
 type GroupError struct{ AUNError }
@@ -216,6 +234,15 @@ func NewSerializationError(msg string, opts ...ErrorOption) *SerializationError 
 // NewSessionError 创建会话错误
 func NewSessionError(msg string, opts ...ErrorOption) *SessionError {
 	e := &SessionError{AUNError{Message: msg, Code: -1}}
+	for _, opt := range opts {
+		opt(&e.AUNError)
+	}
+	return e
+}
+
+// NewVersionConflictError 创建版本冲突错误
+func NewVersionConflictError(msg string, opts ...ErrorOption) *VersionConflictError {
+	e := &VersionConflictError{AUNError{Message: msg, Code: -1}}
 	for _, opt := range opts {
 		opt(&e.AUNError)
 	}
@@ -402,11 +429,17 @@ func MapRemoteError(errMap map[string]any) error {
 	case code == 4001 || code == 4010 || code == -32003:
 		return &AuthError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
 
-	case code == 4030 || code == 403:
+	case code == 4030 || code == 403 || code == -32004: // -32004 = PERMISSION_DENIED
 		return &PermissionError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
 
-	case code == 4040 || code == 404 || code == -32004:
+	case code == 4040 || code == 404:
 		return &NotFoundError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
+
+	case code == -32008:
+		return &NotFoundError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
+
+	case code == -32009:
+		return &VersionConflictError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
 
 	case code == 4290 || code == 429 || code == -32029:
 		return &RateLimitError{AUNError{Message: message, Code: code, Data: data, Retryable: true, TraceID: traceID}}

@@ -3,11 +3,11 @@
 
 通过 mock transport 和 auth，直接触发断线事件，验证：
 - 状态机转换（disconnected → reconnecting → connected）
-- 指数退避延迟
-- 重连耗尽进入 terminal_failed
+- 指数退避延迟（含 Full Jitter）
 - 不可重试错误直接 terminal_failed
 - auto_reconnect=False 时不重连
 - close() 中断重连
+- 重连前 health probe
 """
 from __future__ import annotations
 
@@ -45,6 +45,11 @@ def _make_client(auto_reconnect: bool = True) -> AUNClient:
     }
     client._state = "connected"
     client._gateway_url = "wss://gateway.test/aun"
+    # mock transport.close 和 discovery.check_health，避免真实 I/O
+    client._transport = MagicMock()
+    client._transport.close = AsyncMock()
+    client._discovery = MagicMock()
+    client._discovery.check_health = AsyncMock(return_value=True)
     return client
 
 
@@ -101,10 +106,11 @@ class TestBasicReconnect:
     """基础重连：断线后自动重连并恢复 connected"""
 
     @pytest.mark.asyncio
-    async def test_reconnect_success(self):
+    @patch("aun_core.client.random")
+    async def test_reconnect_success(self, mock_random):
+        mock_random.random.return_value = 0.0  # 消除 jitter 延迟
         client = _make_client(auto_reconnect=True)
 
-        # mock _invoke_reconnect_connect_once 成功
         connect_calls = []
 
         async def mock_reconnect():
@@ -114,15 +120,16 @@ class TestBasicReconnect:
         client._invoke_reconnect_connect_once = mock_reconnect
 
         await client._handle_transport_disconnect(None)
-        # 等待重连任务完成
         await asyncio.sleep(0.1)
 
         assert client._state == "connected"
         assert len(connect_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_state_sequence_on_reconnect(self):
+    @patch("aun_core.client.random")
+    async def test_state_sequence_on_reconnect(self, mock_random):
         """状态序列：disconnected → reconnecting → connected"""
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         states: list[str] = []
 
@@ -141,12 +148,13 @@ class TestBasicReconnect:
 
         assert "disconnected" in states
         assert "reconnecting" in states
-        # disconnected 必须在 reconnecting 之前
         assert states.index("disconnected") < states.index("reconnecting")
 
     @pytest.mark.asyncio
-    async def test_reconnect_task_cleared_on_success(self):
+    @patch("aun_core.client.random")
+    async def test_reconnect_task_cleared_on_success(self, mock_random):
         """重连成功后 _reconnect_task 应清空"""
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
 
         async def mock_reconnect():
@@ -161,12 +169,14 @@ class TestBasicReconnect:
 
 
 class TestExponentialBackoff:
-    """指数退避：延迟序列 0.01 → 0.02 → 0.04 → 0.05（max_delay）"""
+    """指数退避（含 Full Jitter）：延迟递增，被 random.random() 打散"""
 
     @pytest.mark.asyncio
-    async def test_backoff_delays(self):
+    @patch("aun_core.client.random")
+    async def test_backoff_delays(self, mock_random):
+        # random.random() 返回 1.0 时 jitter = delay * 1.0 = delay 本身
+        mock_random.random.return_value = 1.0
         client = _make_client(auto_reconnect=True)
-        # 设置可观测的延迟
         client._session_options["retry"] = {
             "initial_delay": 0.05,
             "max_delay": 0.15,
@@ -186,7 +196,7 @@ class TestExponentialBackoff:
         client._invoke_reconnect_connect_once = mock_reconnect
 
         await client._handle_transport_disconnect(None)
-        await asyncio.sleep(1.0)  # 等待所有重试完成
+        await asyncio.sleep(2.0)  # 足够完成 4 次尝试
 
         assert call_count == 4
         # 验证延迟递增（允许 50% 误差）
@@ -200,8 +210,10 @@ class TestReconnectInfiniteRetry:
     """无限重试：只有不可重试错误才终止"""
 
     @pytest.mark.asyncio
-    async def test_keeps_retrying_on_connection_error(self):
+    @patch("aun_core.client.random")
+    async def test_keeps_retrying_on_connection_error(self, mock_random):
         """ConnectionError 会持续重试，直到成功"""
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         call_count = 0
 
@@ -221,8 +233,10 @@ class TestReconnectInfiniteRetry:
         assert client._state == "connected"
 
     @pytest.mark.asyncio
-    async def test_auth_error_still_terminates(self):
+    @patch("aun_core.client.random")
+    async def test_auth_error_still_terminates(self, mock_random):
         """AuthError 不可重试，仍然直接 terminal_failed"""
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         call_count = 0
 
@@ -244,7 +258,9 @@ class TestNonRetryableErrors:
     """不可重试错误：AuthError/PermissionError 直接 terminal_failed"""
 
     @pytest.mark.asyncio
-    async def test_auth_error_no_retry(self):
+    @patch("aun_core.client.random")
+    async def test_auth_error_no_retry(self, mock_random):
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         call_count = 0
 
@@ -258,12 +274,13 @@ class TestNonRetryableErrors:
         await client._handle_transport_disconnect(None)
         await asyncio.sleep(0.3)
 
-        # AuthError 不可重试，只调用一次就 terminal_failed
         assert call_count == 1
         assert client._state == "terminal_failed"
 
     @pytest.mark.asyncio
-    async def test_login_phase_auth_error_is_retryable(self):
+    @patch("aun_core.client.random")
+    async def test_login_phase_auth_error_is_retryable(self, mock_random):
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         call_count = 0
 
@@ -281,7 +298,9 @@ class TestNonRetryableErrors:
         assert client._state == "reconnecting"
 
     @pytest.mark.asyncio
-    async def test_permission_error_no_retry(self):
+    @patch("aun_core.client.random")
+    async def test_permission_error_no_retry(self, mock_random):
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         call_count = 0
 
@@ -299,8 +318,10 @@ class TestNonRetryableErrors:
         assert client._state == "terminal_failed"
 
     @pytest.mark.asyncio
-    async def test_connection_error_is_retryable(self):
+    @patch("aun_core.client.random")
+    async def test_connection_error_is_retryable(self, mock_random):
         """ConnectionError 应该重试"""
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         call_count = 0
 
@@ -324,9 +345,10 @@ class TestCloseInterruptsReconnect:
     """close() 中断重连：重连过程中调用 close()，任务被取消"""
 
     @pytest.mark.asyncio
-    async def test_close_cancels_reconnect(self):
+    @patch("aun_core.client.random")
+    async def test_close_cancels_reconnect(self, mock_random):
+        mock_random.random.return_value = 1.0  # 使 jitter 延迟 = delay 本身
         client = _make_client(auto_reconnect=True)
-        # 使用短延迟，让重连任务启动后再 close
         client._session_options["retry"]["initial_delay"] = 0.05
 
         call_count = 0
@@ -375,7 +397,9 @@ class TestReconnectAttemptInfo:
     """重连事件包含正确的 attempt 信息"""
 
     @pytest.mark.asyncio
-    async def test_attempt_numbers_in_events(self):
+    @patch("aun_core.client.random")
+    async def test_attempt_numbers_in_events(self, mock_random):
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         reconnect_events: list[dict] = []
 
@@ -410,8 +434,10 @@ class TestReconnectStopsBackgroundTasksFirst:
     """reconnect 前必须先停止后台任务，再关闭 transport / 进入重连。"""
 
     @pytest.mark.asyncio
-    async def test_background_tasks_stopped_before_reconnect(self):
+    @patch("aun_core.client.random")
+    async def test_background_tasks_stopped_before_reconnect(self, mock_random):
         """断线时，后台任务（心跳/token刷新等）必须在重连前被取消。"""
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
 
         # 创建一个模拟的后台任务（永不结束）
@@ -447,8 +473,10 @@ class TestReconnectStopsBackgroundTasksFirst:
         )
 
     @pytest.mark.asyncio
-    async def test_heartbeat_task_not_running_after_reconnect_starts(self):
+    @patch("aun_core.client.random")
+    async def test_heartbeat_task_not_running_after_reconnect_starts(self, mock_random):
         """重连开始后，心跳任务不应继续运行。"""
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
 
         heartbeat_ran_after_disconnect = []
@@ -474,3 +502,85 @@ class TestReconnectStopsBackgroundTasksFirst:
         assert heartbeat_ran_after_disconnect == []
         # 心跳任务引用应已清空
         assert client._heartbeat_task is None
+
+
+# ── 抑制重连测试 ──────────────────────────────────────────
+
+
+class TestNoReconnectCodes:
+    """测试 NO_RECONNECT_CODES close code 和 gateway.disconnect 通知的抑制重连行为"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [4001, 4003, 4008, 4009, 4010, 4011])
+    async def test_no_reconnect_on_fatal_close_code(self, code):
+        """不重连 close code 应直接进入 terminal_failed，不启动重连"""
+        client = _make_client(auto_reconnect=True)
+        reconnect_started = []
+
+        async def fake_reconnect_loop(server_initiated=False):
+            reconnect_started.append(True)
+
+        client._reconnect_loop = fake_reconnect_loop
+        client._reconnect_task = None
+
+        await client._handle_transport_disconnect(Exception("test"), close_code=code)
+
+        assert client._state == "terminal_failed"
+        assert reconnect_started == [], f"close code {code} 不应触发重连"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [4000, 4029, 4500, 4503])
+    async def test_reconnect_on_retryable_close_code(self, code):
+        """可重连 close code 应正常启动重连"""
+        client = _make_client(auto_reconnect=True)
+
+        async def mock_reconnect():
+            client._state = "connected"
+
+        client._invoke_reconnect_connect_once = mock_reconnect
+
+        await client._handle_transport_disconnect(Exception("test"), close_code=code)
+        # 应进入重连流程（reconnecting 或 connected），不应是 terminal_failed
+        assert client._state != "terminal_failed"
+
+    @pytest.mark.asyncio
+    async def test_gateway_disconnect_notification_suppresses_reconnect(self):
+        """收到 gateway.disconnect 通知后断线应抑制重连"""
+        client = _make_client(auto_reconnect=True)
+        reconnect_started = []
+
+        async def fake_reconnect_loop(server_initiated=False):
+            reconnect_started.append(True)
+
+        client._reconnect_loop = fake_reconnect_loop
+        client._reconnect_task = None
+
+        # 模拟收到 gateway.disconnect 通知
+        await client._on_gateway_disconnect({"code": 4009, "reason": "Connection replaced"})
+        assert client._server_kicked is True
+
+        # 触发断线
+        await client._handle_transport_disconnect(Exception("test"), close_code=4009)
+
+        assert client._state == "terminal_failed"
+        assert reconnect_started == []
+
+    @pytest.mark.asyncio
+    async def test_server_kicked_flag_suppresses_any_code(self):
+        """_server_kicked 标志即使 close code 是可重连的也应抑制重连"""
+        client = _make_client(auto_reconnect=True)
+        reconnect_started = []
+
+        async def fake_reconnect_loop(server_initiated=False):
+            reconnect_started.append(True)
+
+        client._reconnect_loop = fake_reconnect_loop
+        client._reconnect_task = None
+        client._server_kicked = True
+
+        # 使用一个"可重连"的 close code
+        await client._handle_transport_disconnect(Exception("test"), close_code=1006)
+
+        assert client._state == "terminal_failed"
+        assert reconnect_started == []
+

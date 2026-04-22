@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,7 +17,8 @@ import (
 // 通过 well-known URL 获取可用的 Gateway 列表并按优先级排序。
 // 与 Python SDK discovery.py 对应。
 type GatewayDiscovery struct {
-	verifySSL bool
+	verifySSL   bool
+	lastHealthy atomic.Pointer[bool] // nil = 尚未检查
 }
 
 // NewGatewayDiscovery 创建 Gateway 发现器
@@ -29,6 +32,43 @@ type gatewayEntry struct {
 	Priority int    `json:"priority"`
 }
 
+func (d *GatewayDiscovery) httpClient() *http.Client {
+	transport := &http.Transport{}
+	if !d.verifySSL {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	return &http.Client{Transport: transport}
+}
+
+// LastHealthy 返回最近一次 health check 结果，nil 表示尚未检查。
+func (d *GatewayDiscovery) LastHealthy() *bool {
+	return d.lastHealthy.Load()
+}
+
+// CheckHealth 向 gatewayURL 对应的 /health 端点发送 HEAD 请求，检查网关可用性。
+func (d *GatewayDiscovery) CheckHealth(ctx context.Context, gatewayURL string, timeout time.Duration) bool {
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+	healthURL := strings.NewReplacer("wss://", "https://", "ws://", "http://").Replace(gatewayURL)
+	healthURL = strings.TrimRight(healthURL, "/") + "/health"
+
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, healthURL, nil)
+	ok := false
+	if err == nil {
+		resp, err := d.httpClient().Do(req)
+		if err == nil {
+			resp.Body.Close()
+			ok = resp.StatusCode == http.StatusOK
+		}
+	}
+	d.lastHealthy.Store(&ok)
+	return ok
+}
+
 // Discover 从 well-known URL 发现 Gateway
 // 返回优先级最高的 Gateway WebSocket URL
 func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, timeout time.Duration) (string, error) {
@@ -39,13 +79,6 @@ func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, ti
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// 创建 HTTP 客户端（根据 verifySSL 配置 TLS）
-	transport := &http.Transport{}
-	if !d.verifySSL {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	}
-	client := &http.Client{Transport: transport}
-
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, wellKnownURL, nil)
 	if err != nil {
 		return "", NewConnectionError(
@@ -54,7 +87,7 @@ func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, ti
 		)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := d.httpClient().Do(req)
 	if err != nil {
 		return "", NewConnectionError(
 			fmt.Sprintf("gateway 发现失败 (%s): %v", wellKnownURL, err),
@@ -106,6 +139,9 @@ func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, ti
 	if url == "" {
 		return "", NewValidationError("well-known 缺少 gateway url")
 	}
+
+	// 发现后异步触发 health check（不阻塞）
+	go d.CheckHealth(context.Background(), url, timeout)
 
 	return url, nil
 }

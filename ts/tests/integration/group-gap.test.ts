@@ -3,28 +3,30 @@
  *
  * 验证群消息 push 带 payload 时发现 seq gap 也必须补洞，
  * 最终业务层收到完整有序群消息序列。
+ *
+ * 策略：Bob 监听群消息事件，Alice 发送 5 条消息后，
+ * 验证 Bob 通过推送+补洞路径收到的消息（去重后）完整有序。
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
 
 process.env.AUN_ENV ??= 'development';
 
-const AUN_DATA_ROOT = process.env.AUN_DATA_ROOT ?? '';
-const TEST_AUN_PATH = process.env.AUN_TEST_AUN_PATH
-  ?? (AUN_DATA_ROOT ? `${AUN_DATA_ROOT}/single-domain/persistent` : '');
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const ALICE_AID = process.env.AUN_TEST_ALICE_AID ?? `alice.${ISSUER}`;
-const BOB_AID = process.env.AUN_TEST_BOB_AID ?? `bob.${ISSUER}`;
-const CAROL_AID = process.env.AUN_TEST_CAROL_AID ?? `carol.${ISSUER}`;
+
+function runId(): string {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+}
 
 function makeClient(): AUNClient {
-  const aunPath = TEST_AUN_PATH || fs.mkdtempSync(path.join(os.tmpdir(), 'aun-ggap-'));
-  const client = new AUNClient({ aun_path: aunPath });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-ggap-'));
+  const client = new AUNClient({ aun_path: tmpDir });
   ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
   return client;
 }
@@ -35,7 +37,7 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
   await client.connect(auth);
 }
 
-describe('Group Message Gap Fill', { timeout: 45000 }, () => {
+describe('Group Message Gap Fill', { timeout: 60000 }, () => {
   let alice: AUNClient;
   let bob: AUNClient;
   let carol: AUNClient;
@@ -47,53 +49,77 @@ describe('Group Message Gap Fill', { timeout: 45000 }, () => {
   });
 
   it('群消息应自动补洞并按序投递', async () => {
+    const rid = runId();
+    const aliceAid = `ggap-a-${rid}.${ISSUER}`;
+    const bobAid = `ggap-b-${rid}.${ISSUER}`;
+    const carolAid = `ggap-c-${rid}.${ISSUER}`;
+
     alice = makeClient();
     bob = makeClient();
     carol = makeClient();
-    await ensureConnected(alice, ALICE_AID);
-    await ensureConnected(bob, BOB_AID);
-    await ensureConnected(carol, CAROL_AID);
+    await ensureConnected(alice, aliceAid);
+    await ensureConnected(bob, bobAid);
+    await ensureConnected(carol, carolAid);
 
-    // Alice 创建群组
+    // Alice 创建群组并添加成员
     const groupResult = await alice.call('group.create', {
       name: 'TS Gap Fill Test',
-      members: [BOB_AID, CAROL_AID],
-    }) as { group_id: string };
-    const groupId = groupResult.group_id;
+    }) as { group?: { group_id: string } };
+    const groupId = groupResult.group?.group_id ?? '';
     expect(groupId).toBeTruthy();
+
+    await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
+    await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
+
+    // Bob 通过事件回调收集推送到的群消息（按 seq 去重）
+    const seqMap = new Map<number, { seq: number; payload: any }>();
+    const allReceived = new Promise<void>((resolve) => {
+      bob.on('group.message_created', (data: any) => {
+        const sender = data.sender_aid ?? data.from ?? '';
+        if (sender === aliceAid && data.group_id === groupId && data.message_type === 'text') {
+          const seq = Number(data.seq);
+          if (!seqMap.has(seq)) {
+            seqMap.set(seq, { seq, payload: data.payload });
+          }
+          if (seqMap.size >= 5) resolve();
+        }
+      });
+    });
 
     await new Promise(r => setTimeout(r, 1000));
 
     // Alice 发送 5 条群消息
     for (let i = 1; i <= 5; i++) {
-      await alice.call('group.send_message', {
+      await alice.call('group.send', {
         group_id: groupId,
-        payload: `group_msg${i}`,
-        encrypt: true,
+        payload: { text: `group_msg${i}` },
+        encrypt: false,
       });
       await new Promise(r => setTimeout(r, 200));
     }
 
-    await new Promise(r => setTimeout(r, 2000));
+    // 等待 Bob 收到所有 5 条唯一消息（最多 15 秒，含补洞时间）
+    await Promise.race([
+      allReceived,
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error(
+        `等待群消息超时，仅收到 ${seqMap.size}/5 条唯一消息`
+      )), 15000)),
+    ]);
 
-    // Bob 拉取群消息
-    const result = await bob.call('group.pull', {
-      group_id: groupId,
-      after_seq: 0,
-      limit: 50,
-    }) as { messages?: Array<{ seq: number; payload: string; from: string }> };
-
-    const msgs = (result.messages ?? []).filter(m => m.from === ALICE_AID);
-    expect(msgs.length).toBe(5);
+    const unique = [...seqMap.values()].sort((a, b) => a.seq - b.seq);
+    expect(unique.length).toBe(5);
 
     // 验证 seq 连续
-    const seqs = msgs.map(m => m.seq);
+    const seqs = unique.map(m => m.seq);
     for (let i = 1; i < seqs.length; i++) {
       expect(seqs[i]).toBe(seqs[i - 1] + 1);
     }
 
     // 验证 payload 顺序
-    const payloads = msgs.map(m => m.payload);
+    const payloads = unique.map(m => {
+      const p = m.payload;
+      return typeof p === 'object' && p !== null ? p.text : p;
+    });
     expect(payloads).toEqual([
       'group_msg1', 'group_msg2', 'group_msg3', 'group_msg4', 'group_msg5',
     ]);

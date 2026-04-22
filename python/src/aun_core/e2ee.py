@@ -54,6 +54,9 @@ AAD_MATCH_FIELDS_OFFLINE = (
 PREKEY_RETENTION_SECONDS = 7 * 24 * 3600  # 7 天
 PREKEY_MIN_KEEP_COUNT = 7
 
+# AES-256-GCM 认证标签长度（字节），标准值 16 字节 = 128-bit
+_AES_GCM_TAG_LEN = 16
+
 
 def _prekey_created_marker(prekey_data: dict[str, Any]) -> int:
     for key in ("created_at", "updated_at", "expires_at"):
@@ -513,8 +516,8 @@ class E2EEManager:
             "prekey_id": prekey["prekey_id"],
         }
         ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
-        ciphertext = ciphertext_with_tag[:-16]
-        tag = ciphertext_with_tag[-16:]
+        ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
+        tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
 
         envelope = {
             "type": "e2ee.encrypted",
@@ -595,8 +598,8 @@ class E2EEManager:
             "sender_cert_fingerprint": sender_fingerprint,
         }
         ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
-        ciphertext = ciphertext_with_tag[:-16]
-        tag = ciphertext_with_tag[-16:]
+        ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
+        tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
 
         envelope = {
             "type": "e2ee.encrypted",
@@ -775,7 +778,8 @@ class E2EEManager:
                     raise E2EEDecryptFailedError("aad mismatch")
                 aad_bytes = self._aad_bytes_offline(aad)
             else:
-                aad_bytes = b""
+                # SC-MSG-015: AAD 缺失或非 dict 时显式拒绝，不尝试用空 AAD 解密
+                raise E2EEDecryptFailedError("missing or invalid aad field")
             plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
 
             decoded = json.loads(plaintext.decode("utf-8"))
@@ -850,7 +854,8 @@ class E2EEManager:
                     raise E2EEDecryptFailedError("aad mismatch")
                 aad_bytes = self._aad_bytes_offline(aad)
             else:
-                aad_bytes = b""
+                # SC-MSG-015: AAD 缺失或非 dict 时显式拒绝，不尝试用空 AAD 解密
+                raise E2EEDecryptFailedError("missing or invalid aad field")
             plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
 
             decoded = json.loads(plaintext.decode("utf-8"))
@@ -1175,8 +1180,8 @@ def encrypt_group_message(
         "suite": SUITE,
     }
     ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, _aad_bytes_group(aad))
-    ciphertext = ciphertext_with_tag[:-16]
-    tag = ciphertext_with_tag[-16:]
+    ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
+    tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
 
     envelope = {
         "type": "e2ee.group_encrypted",
@@ -1488,6 +1493,17 @@ def store_group_secret(
         local_epoch = existing["epoch"]
         if epoch < local_epoch:
             return False
+        # epoch 相等时：密钥不变，但允许更新 member_aids/commitment（成员变更场景）
+        if epoch == local_epoch and existing.get("secret"):
+            old_members = sorted(existing.get("member_aids", []))
+            new_members = sorted(member_aids)
+            if old_members != new_members and new_members:
+                # 成员列表有变化 → 更新 member_aids + commitment，保留原 secret
+                existing["member_aids"] = new_members
+                existing["commitment"] = commitment
+                existing["updated_at"] = int(_time_mod.time() * 1000)
+                _save_keystore_group_state(keystore, aid, group_id, existing)
+            return True
 
     old_epochs = copy.deepcopy(existing.get("old_epochs", [])) if isinstance(existing, dict) else []
     now_ms = int(_time_mod.time() * 1000)
@@ -1834,7 +1850,7 @@ def handle_key_response(
 ) -> bool:
     """处理收到的密钥响应。
 
-    验证 commitment → 存储。返回 True 表示成功。
+    验证 commitment → manifest 一致性校验 → 存储。返回 True 表示成功。
     """
     payload = response if "group_id" in response else response.get("payload", response)
 
@@ -1851,6 +1867,17 @@ def handle_key_response(
 
     if not verify_membership_commitment(commitment, member_aids, epoch, group_id, aid, group_secret):
         return False
+
+    # manifest 一致性校验（如果响应包含 manifest，验证其与 payload 匹配）
+    manifest = payload.get("manifest")
+    if manifest and isinstance(manifest, dict):
+        if manifest.get("group_id") != group_id:
+            return False
+        if manifest.get("epoch") != epoch:
+            return False
+        manifest_members = manifest.get("member_aids", [])
+        if manifest_members and sorted(manifest_members) != sorted(member_aids):
+            return False
 
     return store_group_secret(keystore, aid, group_id, epoch, group_secret, commitment, member_aids)
 
@@ -2077,19 +2104,33 @@ class GroupE2EEManager:
     def build_recovery_request(
         self, group_id: str, epoch: int, *, sender_aid: str | None = None,
     ) -> dict[str, Any] | None:
-        """构建恢复请求。返回 {to, payload} 或 None（限流/无目标）。"""
+        """构建恢复请求。返回 {to, payload, fallback_targets} 或 None。
+
+        优先向消息发送方请求（最可能拥有该 epoch），
+        其次从本地成员列表中选取候选人。
+        fallback_targets 提供额外候选人供调用方逐个尝试。
+        """
         aid = self._current_aid()
         if not self._request_throttle.allow(f"request:{group_id}:{epoch}"):
             return None
         candidates: list[str] = []
+        # 优先使用消息发送方（最可能有该 epoch 密钥）
+        if sender_aid and sender_aid != aid:
+            candidates.append(sender_aid)
+        # 补充本地成员列表中的其他候选人
         secret_data = load_group_secret(self._keystore(), aid, group_id)
         if secret_data and secret_data.get("member_aids"):
-            candidates = [m for m in secret_data["member_aids"] if m != aid]
-        if not candidates and sender_aid and sender_aid != aid:
-            candidates = [sender_aid]
+            for m in secret_data["member_aids"]:
+                if m != aid and m not in candidates:
+                    candidates.append(m)
         if not candidates:
             return None
-        return {"to": candidates[0], "payload": build_key_request(group_id, epoch, aid)}
+        payload = build_key_request(group_id, epoch, aid)
+        return {
+            "to": candidates[0],
+            "payload": payload,
+            "fallback_targets": candidates[1:],
+        }
 
     def handle_key_request_msg(
         self, request_payload: dict[str, Any], current_members: list[str],

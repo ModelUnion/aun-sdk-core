@@ -70,23 +70,27 @@ func NewGroupE2EEManager(cfg GroupE2EEManagerConfig) *GroupE2EEManager {
 // ── 密钥管理 ──────────────────────────────────────────────
 
 // signManifest 用当前身份私钥签名 manifest
-func (m *GroupE2EEManager) signManifest(manifest map[string]any) map[string]any {
+// 签名失败时返回 error，不再静默回退未签名 manifest
+func (m *GroupE2EEManager) signManifest(manifest map[string]any) (map[string]any, error) {
 	identity := m.identityFn()
 	pkPEM, _ := identity["private_key_pem"].(string)
 	if pkPEM == "" {
-		return manifest
+		return nil, fmt.Errorf("无可用私钥，无法签名 manifest")
 	}
 	signed, err := SignMembershipManifest(manifest, pkPEM)
 	if err != nil {
-		return manifest
+		return nil, fmt.Errorf("manifest 签名失败: %w", err)
 	}
-	return signed
+	return signed, nil
 }
 
 // CreateEpoch 创建首个 epoch
 // 返回 {epoch, commitment, distributions: [{to, payload}]}
 func (m *GroupE2EEManager) CreateEpoch(groupID string, memberAIDs []string) (map[string]any, error) {
 	aid := m.currentAID()
+	if aid == "" {
+		return nil, fmt.Errorf("identity not set: cannot create epoch without AID")
+	}
 	gs := GenerateGroupSecret()
 	epoch := 1
 	commitment := ComputeMembershipCommitment(memberAIDs, epoch, groupID, gs)
@@ -95,7 +99,10 @@ func (m *GroupE2EEManager) CreateEpoch(groupID string, memberAIDs []string) (map
 		return nil, err
 	}
 
-	manifest := m.signManifest(BuildMembershipManifest(groupID, epoch, nil, memberAIDs, nil, nil, aid))
+	manifest, err := m.signManifest(BuildMembershipManifest(groupID, epoch, nil, memberAIDs, nil, nil, aid))
+	if err != nil {
+		return nil, fmt.Errorf("CreateEpoch 签名失败: %w", err)
+	}
 	distPayload := BuildKeyDistribution(groupID, epoch, gs, memberAIDs, aid, manifest)
 
 	distributions := make([]map[string]any, 0)
@@ -118,8 +125,14 @@ func (m *GroupE2EEManager) CreateEpoch(groupID string, memberAIDs []string) (map
 // RotateEpoch 轮换 epoch（踢人/退出后调用）
 func (m *GroupE2EEManager) RotateEpoch(groupID string, memberAIDs []string) (map[string]any, error) {
 	aid := m.currentAID()
+	if aid == "" {
+		return nil, fmt.Errorf("identity not set: cannot rotate epoch without AID")
+	}
 	ks := m.keystore
-	current, _ := LoadGroupSecret(ks, aid, groupID, nil)
+	current, err := LoadGroupSecret(ks, aid, groupID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("加载当前 epoch 失败: %w", err)
+	}
 	var prevEpoch *int
 	newEpoch := 1
 	if current != nil {
@@ -132,12 +145,15 @@ func (m *GroupE2EEManager) RotateEpoch(groupID string, memberAIDs []string) (map
 
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, newEpoch, groupID, gs)
-	_, err := StoreGroupSecret(ks, aid, groupID, newEpoch, gs, commitment, memberAIDs)
+	_, err = StoreGroupSecret(ks, aid, groupID, newEpoch, gs, commitment, memberAIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	manifest := m.signManifest(BuildMembershipManifest(groupID, newEpoch, prevEpoch, memberAIDs, nil, nil, aid))
+	manifest, err := m.signManifest(BuildMembershipManifest(groupID, newEpoch, prevEpoch, memberAIDs, nil, nil, aid))
+	if err != nil {
+		return nil, fmt.Errorf("RotateEpoch 签名失败: %w", err)
+	}
 	distPayload := BuildKeyDistribution(groupID, newEpoch, gs, memberAIDs, aid, manifest)
 
 	distributions := make([]map[string]any, 0)
@@ -160,6 +176,9 @@ func (m *GroupE2EEManager) RotateEpoch(groupID string, memberAIDs []string) (map
 // RotateEpochTo 指定目标 epoch 号轮换（配合服务端 CAS 使用）
 func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, memberAIDs []string) (map[string]any, error) {
 	aid := m.currentAID()
+	if aid == "" {
+		return nil, fmt.Errorf("identity not set: cannot rotate epoch without AID")
+	}
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, targetEpoch, groupID, gs)
 	_, err := StoreGroupSecret(m.keystore, aid, groupID, targetEpoch, gs, commitment, memberAIDs)
@@ -168,7 +187,10 @@ func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, member
 	}
 
 	prevEpoch := targetEpoch - 1
-	manifest := m.signManifest(BuildMembershipManifest(groupID, targetEpoch, &prevEpoch, memberAIDs, nil, nil, aid))
+	manifest, err := m.signManifest(BuildMembershipManifest(groupID, targetEpoch, &prevEpoch, memberAIDs, nil, nil, aid))
+	if err != nil {
+		return nil, fmt.Errorf("RotateEpochTo 签名失败: %w", err)
+	}
 	distPayload := BuildKeyDistribution(groupID, targetEpoch, gs, memberAIDs, aid, manifest)
 
 	distributions := make([]map[string]any, 0)
@@ -194,15 +216,13 @@ func (m *GroupE2EEManager) StoreSecret(groupID string, epoch int, groupSecret []
 }
 
 // LoadSecret 加载群组密钥
-func (m *GroupE2EEManager) LoadSecret(groupID string) map[string]any {
-	data, _ := LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
-	return data
+func (m *GroupE2EEManager) LoadSecret(groupID string) (map[string]any, error) {
+	return LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
 }
 
 // LoadSecretForEpoch 加载指定 epoch 的群组密钥
-func (m *GroupE2EEManager) LoadSecretForEpoch(groupID string, epoch int) map[string]any {
-	data, _ := LoadGroupSecret(m.keystore, m.currentAID(), groupID, &epoch)
-	return data
+func (m *GroupE2EEManager) LoadSecretForEpoch(groupID string, epoch int) (map[string]any, error) {
+	return LoadGroupSecret(m.keystore, m.currentAID(), groupID, &epoch)
 }
 
 // LoadAllSecrets 加载所有 epoch 的群组密钥
@@ -229,7 +249,10 @@ func (m *GroupE2EEManager) CleanExpiredCaches() {
 // 无密钥时返回 E2EEGroupSecretMissingError
 func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[string]any, error) {
 	aid := m.currentAID()
-	secretData, _ := LoadGroupSecret(m.keystore, aid, groupID, nil)
+	secretData, err := LoadGroupSecret(m.keystore, aid, groupID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("加载群 %s 密钥失败: %w", groupID, err)
+	}
 	if secretData == nil {
 		return nil, NewE2EEGroupSecretMissingError(fmt.Sprintf("群 %s 无密钥", groupID))
 	}
@@ -278,7 +301,7 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map
 	}
 	if !skipReplay && groupID != "" && sender != "" && msgID != "" {
 		if m.replayGuard.IsSeen(groupID, sender, msgID) {
-			return nil, nil // 重复消息，丢弃
+			return nil, fmt.Errorf("replay detected: group=%s sender=%s msg=%s", groupID, sender, msgID)
 		}
 	}
 
@@ -299,16 +322,20 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map
 	}
 	if senderCertPEM == nil {
 		log.Printf("[e2ee_group] 拒绝群消息：无法获取发送方 %s 的证书: group=%s", sender, groupID)
-		return nil, nil
+		return nil, fmt.Errorf("sender cert not found: aid=%s group=%s", sender, groupID)
 	}
 
 	allSecrets := LoadAllGroupSecrets(m.keystore, m.currentAID(), groupID)
 	if len(allSecrets) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("no group secret available: group=%s", groupID)
 	}
 
 	result := DecryptGroupMessage(allSecrets, message, senderCertPEM, true)
-	if result != nil && !skipReplay {
+	if result == nil {
+		// GO-003: 解密失败时返回 error，不再返回 (nil, nil)
+		return nil, fmt.Errorf("群消息解密失败: group=%s sender=%s", groupID, sender)
+	}
+	if !skipReplay {
 		// 解密成功后记录防重放
 		finalMsgID := aadMsgID
 		if finalMsgID == "" {
@@ -321,15 +348,42 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map
 	return result, nil
 }
 
-// DecryptBatch 批量解密群组消息
+// DecryptResult 单条解密结果，包含明文和可能的错误
+type DecryptResult struct {
+	Message map[string]any // 解密后的消息（成功时），或原始消息（非加密消息时）
+	Error   error          // 解密错误（nil 表示成功或非加密消息）
+}
+
+// DecryptBatch 批量解密群组消息（兼容旧接口，静默忽略错误）
+// 已废弃：请使用 DecryptBatchWithErrors 获取每条的错误详情。
 func (m *GroupE2EEManager) DecryptBatch(messages []map[string]any, skipReplay bool) []map[string]any {
 	results := make([]map[string]any, len(messages))
 	for i, msg := range messages {
-		decrypted, _ := m.Decrypt(msg, skipReplay)
-		if decrypted != nil {
+		decrypted, err := m.Decrypt(msg, skipReplay)
+		if err != nil {
+			log.Printf("[e2ee_group] DecryptBatch 第 %d 条解密失败: %v", i, err)
+			results[i] = msg
+		} else if decrypted != nil {
 			results[i] = decrypted
 		} else {
 			results[i] = msg
+		}
+	}
+	return results
+}
+
+// DecryptBatchWithErrors 批量解密群组消息，返回每条的解密结果（含 error）
+// GO-003: 调用方可通过 DecryptResult.Error 了解每条消息的解密状态
+func (m *GroupE2EEManager) DecryptBatchWithErrors(messages []map[string]any, skipReplay bool) []DecryptResult {
+	results := make([]DecryptResult, len(messages))
+	for i, msg := range messages {
+		decrypted, err := m.Decrypt(msg, skipReplay)
+		if err != nil {
+			results[i] = DecryptResult{Message: msg, Error: err}
+		} else if decrypted != nil {
+			results[i] = DecryptResult{Message: decrypted, Error: nil}
+		} else {
+			results[i] = DecryptResult{Message: msg, Error: nil}
 		}
 	}
 	return results
@@ -390,7 +444,10 @@ func (m *GroupE2EEManager) BuildRecoveryRequest(groupID string, epoch int, sende
 	}
 
 	var candidates []string
-	secretData, _ := LoadGroupSecret(m.keystore, aid, groupID, nil)
+	secretData, err := LoadGroupSecret(m.keystore, aid, groupID, nil)
+	if err != nil {
+		log.Printf("[e2ee_group] BuildRecoveryRequest 加载密钥失败: group=%s %v", groupID, err)
+	}
 	if secretData != nil {
 		if members, ok := secretData["member_aids"].([]string); ok {
 			for _, member := range members {
@@ -447,13 +504,21 @@ func (m *GroupE2EEManager) HandleKeyRequestMsg(requestPayload map[string]any, cu
 
 // HasSecret 判断是否持有群组密钥
 func (m *GroupE2EEManager) HasSecret(groupID string) bool {
-	data, _ := LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
+	data, err := LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
+	if err != nil {
+		log.Printf("[e2ee_group] HasSecret 加载密钥失败: group=%s %v", groupID, err)
+		return false
+	}
 	return data != nil
 }
 
 // CurrentEpoch 获取群组当前 epoch，未知则返回 nil
 func (m *GroupE2EEManager) CurrentEpoch(groupID string) *int {
-	data, _ := LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
+	data, err := LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
+	if err != nil {
+		log.Printf("[e2ee_group] CurrentEpoch 加载密钥失败: group=%s %v", groupID, err)
+		return nil
+	}
 	if data == nil {
 		return nil
 	}
@@ -463,7 +528,11 @@ func (m *GroupE2EEManager) CurrentEpoch(groupID string) *int {
 
 // GetMemberAIDs 获取群组成员列表
 func (m *GroupE2EEManager) GetMemberAIDs(groupID string) []string {
-	data, _ := LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
+	data, err := LoadGroupSecret(m.keystore, m.currentAID(), groupID, nil)
+	if err != nil {
+		log.Printf("[e2ee_group] GetMemberAIDs 加载密钥失败: group=%s %v", groupID, err)
+		return nil
+	}
 	if data == nil {
 		return nil
 	}
@@ -480,4 +549,18 @@ func (m *GroupE2EEManager) currentAID() string {
 		return aid
 	}
 	return ""
+}
+
+// PurgeGroupData 清理指定群组的所有本地密钥数据（dissolve/退出时调用）
+// GO-006: 删除 current epoch + 所有 old epoch 密钥
+func (m *GroupE2EEManager) PurgeGroupData(groupID string) {
+	aid := m.currentAID()
+	if aid == "" {
+		return
+	}
+	// 写入空状态以清除 group_current 和 group_old_epochs
+	emptyEntry := map[string]any{}
+	if err := saveKeyStoreGroupState(m.keystore, aid, groupID, emptyEntry); err != nil {
+		log.Printf("[e2ee_group] PurgeGroupData 清理群 %s 密钥失败: %v", groupID, err)
+	}
 }

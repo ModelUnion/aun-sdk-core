@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropics/aun-sdk-core/go/secretstore"
 	_ "modernc.org/sqlite"
 )
 
@@ -89,13 +90,16 @@ var aidDBDDL = []string{
 
 // AIDDatabase 单个 AID 的 SQLite 数据库。
 type AIDDatabase struct {
-	mu     sync.Mutex
-	db     *sql.DB
-	dbPath string
+	mu          sync.Mutex
+	db          *sql.DB
+	dbPath      string
+	secretStore secretstore.SecretStore // 字段级加密，nil 时降级为明文
+	aid         string                 // 当前 AID 标识，用于 SecretStore scope
 }
 
 // newAIDDatabase 创建或打开 AID 数据库。
-func newAIDDatabase(dbPath string) (*AIDDatabase, error) {
+// ss 和 aid 用于 prekey 私钥字段级加密；ss 为 nil 时降级为明文存储。
+func newAIDDatabase(dbPath string, ss secretstore.SecretStore, aid string) (*AIDDatabase, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, fmt.Errorf("创建 AID DB 目录失败: %w", err)
 	}
@@ -106,7 +110,7 @@ func newAIDDatabase(dbPath string) (*AIDDatabase, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	adb := &AIDDatabase{db: db, dbPath: dbPath}
+	adb := &AIDDatabase{db: db, dbPath: dbPath, secretStore: ss, aid: aid}
 	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
 		log.Printf("[WARN] AIDDatabase WAL 设置失败: %v", err)
 	}
@@ -127,16 +131,49 @@ func (a *AIDDatabase) close() {
 }
 
 func (a *AIDDatabase) initSchema() error {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
 	for _, ddl := range aidDBDDL {
-		if _, err := a.db.Exec(ddl); err != nil {
+		if _, err := tx.Exec(ddl); err != nil {
 			return fmt.Errorf("DDL 执行失败 (%s...): %w", ddl[:min(40, len(ddl))], err)
 		}
 	}
 	var ver int
-	row := a.db.QueryRow("SELECT version FROM _schema_version WHERE id = 1")
+	row := tx.QueryRow("SELECT version FROM _schema_version WHERE id = 1")
 	if err := row.Scan(&ver); err != nil {
-		_, err2 := a.db.Exec("INSERT INTO _schema_version (id, version) VALUES (1, ?)", aidDBSchemaVersion)
-		return err2
+		// 首次创建，写入当前版本
+		if _, err2 := tx.Exec("INSERT INTO _schema_version (id, version) VALUES (1, ?)", aidDBSchemaVersion); err2 != nil {
+			return err2
+		}
+	} else if ver < aidDBSchemaVersion {
+		// 检测到旧版本 → 执行迁移
+		if err := migrateSchema(tx, ver, aidDBSchemaVersion); err != nil {
+			return fmt.Errorf("schema 迁移失败 (from v%d to v%d): %w", ver, aidDBSchemaVersion, err)
+		}
+		// 更新版本号
+		if _, err := tx.Exec("UPDATE _schema_version SET version = ? WHERE id = 1", aidDBSchemaVersion); err != nil {
+			return fmt.Errorf("更新 schema 版本号失败: %w", err)
+		}
+		log.Printf("[aid_db] schema 已从 v%d 迁移到 v%d", ver, aidDBSchemaVersion)
+	}
+	return tx.Commit()
+}
+
+// migrateSchema 按版本顺序执行增量迁移。
+// 当前版本为 1，无需实际迁移操作；预留此函数作为未来版本升级的扩展点。
+func migrateSchema(tx *sql.Tx, fromVer, toVer int) error {
+	for v := fromVer; v < toVer; v++ {
+		switch v {
+		// case 1:
+		//     // v1 → v2 迁移逻辑（未来添加）
+		//     if _, err := tx.Exec("ALTER TABLE ..."); err != nil { return err }
+		default:
+			// 当前无需迁移操作，仅升级版本号
+		}
 	}
 	return nil
 }
@@ -206,7 +243,25 @@ func (a *AIDDatabase) SavePrekey(prekeyID, privateKeyPEM, deviceID string, creat
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := nowMs()
-	// 明文存储（无 SQLCipher，与 Python 降级行为一致）
+
+	// 字段级加密：如果 secretStore 可用且私钥非空，加密后存储
+	storedKey := privateKeyPEM
+	if a.secretStore != nil && privateKeyPEM != "" {
+		scope := safeAID(a.aid)
+		rec, err := a.secretStore.Protect(scope, "prekey/"+prekeyID, []byte(privateKeyPEM))
+		if err != nil {
+			// 加密失败降级为明文，记录日志
+			log.Printf("[aid_db] SavePrekey 加密失败 (id=%s)，降级明文存储: %v", prekeyID, err)
+		} else {
+			encJSON, err2 := json.Marshal(rec)
+			if err2 != nil {
+				log.Printf("[aid_db] SavePrekey 序列化加密记录失败 (id=%s)，降级明文存储: %v", prekeyID, err2)
+			} else {
+				storedKey = string(encJSON)
+			}
+		}
+	}
+
 	dataJSON, err := json.Marshal(extraData)
 	if err != nil {
 		log.Printf("[aid_db] SavePrekey json.Marshal 失败: %v", err)
@@ -218,7 +273,7 @@ func (a *AIDDatabase) SavePrekey(prekeyID, privateKeyPEM, deviceID string, creat
 		 ON CONFLICT(prekey_id, device_id) DO UPDATE SET
 		   private_key_enc=excluded.private_key_enc, data=excluded.data,
 		   updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
-		prekeyID, deviceID, privateKeyPEM, string(dataJSON),
+		prekeyID, deviceID, storedKey, string(dataJSON),
 		nullInt64Ptr(createdAt, now), now, nullInt64PtrSQL(expiresAt),
 	); err != nil {
 		log.Printf("[aid_db] SavePrekey 失败 (id=%s): %v", prekeyID, err)
@@ -244,8 +299,27 @@ func (a *AIDDatabase) LoadPrekeys(deviceID string) map[string]map[string]any {
 		if err := rows.Scan(&id, &enc, &dataStr, &createdAt, &updatedAt, &expiresAt); err != nil {
 			continue
 		}
+
+		// 字段级解密：尝试将 enc 解析为加密记录并解密
+		privateKeyPEM := enc
+		if a.secretStore != nil && enc != "" {
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(enc), &rec); err == nil {
+				// 成功解析为 JSON → 尝试解密
+				scope := safeAID(a.aid)
+				if plain, err2 := a.secretStore.Reveal(scope, "prekey/"+id, rec); err2 != nil {
+					log.Printf("[aid_db] LoadPrekeys 解密失败 (id=%s): %v", id, err2)
+					// 解密失败保留原始值（可能是旧的明文 PEM）
+				} else if plain != nil {
+					privateKeyPEM = string(plain)
+				}
+				// plain == nil 表示 scheme/name 不匹配，保留原始值（明文兼容）
+			}
+			// JSON 解析失败 → 原始值就是明文 PEM，直接使用
+		}
+
 		entry := map[string]any{
-			"private_key_pem": enc,
+			"private_key_pem": privateKeyPEM,
 		}
 		if createdAt.Valid {
 			entry["created_at"] = createdAt.Int64
@@ -527,10 +601,28 @@ func (a *AIDDatabase) SaveSession(sessionID string, data map[string]any) {
 		log.Printf("[aid_db] SaveSession json.Marshal 失败: %v", err)
 		dataJSON = []byte("{}")
 	}
+
+	// 字段级加密：如果 secretStore 可用，加密整个 session 数据
+	stored := string(dataJSON)
+	if a.secretStore != nil {
+		scope := safeAID(a.aid)
+		rec, err := a.secretStore.Protect(scope, "session/"+sessionID, dataJSON)
+		if err != nil {
+			log.Printf("[aid_db] SaveSession 加密失败 (id=%s)，降级明文存储: %v", sessionID, err)
+		} else {
+			encJSON, err2 := json.Marshal(rec)
+			if err2 != nil {
+				log.Printf("[aid_db] SaveSession 序列化加密记录失败 (id=%s)，降级明文存储: %v", sessionID, err2)
+			} else {
+				stored = string(encJSON)
+			}
+		}
+	}
+
 	if _, err := a.db.Exec(
 		`INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?)
 		 ON CONFLICT(session_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at`,
-		sessionID, string(dataJSON), nowMs(),
+		sessionID, stored, nowMs(),
 	); err != nil {
 		log.Printf("[aid_db] SaveSession 失败 (id=%s): %v", sessionID, err)
 	}
@@ -545,7 +637,7 @@ func (a *AIDDatabase) LoadSession(sessionID string) map[string]any {
 	if err := row.Scan(&enc, &updatedAt); err != nil {
 		return nil
 	}
-	plain := enc
+	plain := a.decryptSessionData(sessionID, enc)
 	var result map[string]any
 	if err := json.Unmarshal([]byte(plain), &result); err != nil {
 		return nil
@@ -570,7 +662,7 @@ func (a *AIDDatabase) LoadAllSessions() []map[string]any {
 		if err := rows.Scan(&sid, &enc, &updatedAt); err != nil {
 			continue
 		}
-		plain := enc
+		plain := a.decryptSessionData(sid, enc)
 		var entry map[string]any
 		if err := json.Unmarshal([]byte(plain), &entry); err != nil {
 			continue
@@ -588,6 +680,24 @@ func (a *AIDDatabase) DeleteSession(sessionID string) {
 	if _, err := a.db.Exec("DELETE FROM e2ee_sessions WHERE session_id = ?", sessionID); err != nil {
 		log.Printf("[aid_db] DeleteSession 失败 (id=%s): %v", sessionID, err)
 	}
+}
+
+// decryptSessionData 尝试解密 session 数据，兼容旧明文格式
+func (a *AIDDatabase) decryptSessionData(sessionID, enc string) string {
+	if a.secretStore == nil || enc == "" {
+		return enc
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(enc), &rec); err == nil {
+		scope := safeAID(a.aid)
+		if plain, err2 := a.secretStore.Reveal(scope, "session/"+sessionID, rec); err2 != nil {
+			log.Printf("[aid_db] LoadSession 解密失败 (id=%s): %v", sessionID, err2)
+		} else if plain != nil {
+			return string(plain)
+		}
+	}
+	// JSON 解析失败或 scheme 不匹配 → 原始值是明文 JSON，直接返回
+	return enc
 }
 
 // ── Instance State ───────────────────────────────────────────

@@ -887,19 +887,27 @@ export class AuthFlow {
 
   /** fetch GET 返回文本 */
   private async _fetchText(url: string): Promise<string> {
+    // 兼容旧浏览器，不使用 AbortSignal.timeout（Chrome 103+ 才支持）
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
     try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      const resp = await fetch(url, { signal: controller.signal });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       return await resp.text();
     } catch (e) {
       throw new AuthError(`failed to fetch ${url}: ${e}`);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
   /** fetch GET 返回 JSON */
   private async _fetchJson(url: string): Promise<JsonObject> {
+    // 兼容旧浏览器，不使用 AbortSignal.timeout（Chrome 103+ 才支持）
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
     try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      const resp = await fetch(url, { signal: controller.signal });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const payload = await resp.json();
       if (!isJsonObject(payload)) {
@@ -909,6 +917,8 @@ export class AuthFlow {
     } catch (e) {
       if (e instanceof AuthError) throw e;
       throw new AuthError(`failed to fetch ${url}: ${e}`);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 

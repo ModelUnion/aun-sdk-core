@@ -119,7 +119,7 @@ func (f *FileSecretStore) Protect(scope, name string, plaintext []byte) (map[str
 
 // Reveal 还原被保护的数据（AES-256-GCM 解密）
 func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) ([]byte, error) {
-	// 验证 scheme 和 name
+	// 验证 scheme 和 name — 不匹配返回 nil,nil（表示"不是我的 record"）
 	if scheme, ok := record["scheme"].(string); !ok || scheme != "file_aes" {
 		return nil, nil
 	}
@@ -132,7 +132,7 @@ func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) ([]b
 	ctB64, _ := record["ciphertext"].(string)
 	tagB64, _ := record["tag"].(string)
 	if nonceB64 == "" || ctB64 == "" || tagB64 == "" {
-		return nil, nil
+		return nil, fmt.Errorf("secretstore.Reveal: record 缺少必要字段 (nonce/ciphertext/tag)")
 	}
 
 	key := f.deriveKey(scope, name)
@@ -140,32 +140,32 @@ func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) ([]b
 	// 解码
 	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("secretstore.Reveal: nonce base64 解码失败: %w", err)
 	}
 	ciphertext, err := base64.StdEncoding.DecodeString(ctB64)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("secretstore.Reveal: ciphertext base64 解码失败: %w", err)
 	}
 	tag, err := base64.StdEncoding.DecodeString(tagB64)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("secretstore.Reveal: tag base64 解码失败: %w", err)
 	}
 
 	// AES-256-GCM 解密
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("secretstore.Reveal: AES cipher 创建失败: %w", err)
 	}
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("secretstore.Reveal: GCM 创建失败: %w", err)
 	}
 
 	// 拼接 ciphertext + tag（GCM Open 期望的格式）
 	sealed := append(ciphertext, tag...)
 	plaintext, err := aead.Open(nil, nonce, sealed, nil)
 	if err != nil {
-		return nil, nil // 解密失败返回 nil（与 Python 行为一致）
+		return nil, fmt.Errorf("secretstore.Reveal: GCM 解密失败（数据可能损坏）: %w", err)
 	}
 
 	return plaintext, nil

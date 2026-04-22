@@ -66,6 +66,8 @@ export interface KeyStore {
   saveGroupSecretState?(aid: string, groupId: string, entry: GroupSecretRecord): void;
   /** 清理单个群组过期 old epochs */
   cleanupGroupOldEpochsState?(aid: string, groupId: string, cutoffMs: number): number;
+  /** 删除单个群组的所有密钥状态（群组解散时使用） */
+  deleteGroupSecretState?(aid: string, groupId: string): void;
 
   /** 加载全部 E2EE sessions */
   loadE2EESessions?(aid: string): Array<Record<string, unknown>>;
@@ -85,4 +87,9 @@ export interface KeyStore {
   getLastAckSeq?(aid: string, deviceId: string, slotId: string, namespace: string): number;
   /** 写入最近 ack seq */
   setLastAckSeq?(aid: string, deviceId: string, slotId: string, namespace: string, seq: number): void;
+
+  /** 列出所有已存储的 AID（对齐 Python list_identities） */
+  listIdentities?(): string[];
+  /** 加载指定 AID 的元数据（对齐 Python load_metadata） */
+  loadMetadata?(aid: string): Record<string, unknown> | null;
 }

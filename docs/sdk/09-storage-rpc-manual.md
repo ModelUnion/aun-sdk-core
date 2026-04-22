@@ -14,14 +14,6 @@
 | [storage.list_prefixes](#storagelist_prefixes) | 列举子目录 |
 | [storage.get_quota](#storageget_quota) | 查询配额 |
 
-### 批量 / 扩展方法
-
-| 方法 | 说明 |
-|------|------|
-| [storage.copy_object](#storagecopy_object) | 复制对象 |
-| [storage.append_object](#storageappend_object) | 追加写入 |
-| [storage.batch_delete](#storagebatch_delete) | 批量删除 |
-
 ### 数据面协调方法
 
 | 方法 | 说明 |
@@ -373,92 +365,6 @@ for obj in result["items"]:
 
 ---
 
-## storage.copy_object
-
-复制对象到新位置。
-
-### 参数
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `src_object_key` | string | 是 | 源对象路径 |
-| `dst_object_key` | string | 是 | 目标对象路径 |
-| `src_bucket` | string | 否 | 源存储桶，默认 `"default"` |
-| `dst_bucket` | string | 否 | 目标存储桶，默认同 `src_bucket` |
-| `src_owner_aid` | string | 否 | 源 owner，默认同目标 owner |
-| `owner_aid` | string | 否 | 目标 owner，默认当前用户 |
-
-### 响应
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `owner_aid` | string | 目标 owner AID |
-| `bucket` | string | 目标存储桶 |
-| `object_key` | string | 目标对象路径 |
-| `size_bytes` | integer | 对象大小（字节） |
-| `content_type` | string | MIME 类型 |
-| `sha256` | string | SHA-256 哈希 |
-| `version` | integer | 版本号 |
-| `etag` | string | 实体标签 |
-| `updated_at` | integer | 更新时间戳 |
-
----
-
-## storage.append_object
-
-向已有对象追加内容。
-
-### 参数
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `object_key` | string | 是 | 对象路径 |
-| `content` | string | 是 | base64 编码的追加内容 |
-| `bucket` | string | 否 | 存储桶，默认 `"default"` |
-| `content_type` | string | 否 | MIME 类型，默认 `"application/octet-stream"` |
-| `owner_aid` | string | 否 | 所有者，默认当前用户 |
-
-### 响应
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `owner_aid` | string | 所有者 AID |
-| `bucket` | string | 存储桶 |
-| `object_key` | string | 对象路径 |
-| `size_bytes` | integer | 追加后总大小（字节） |
-| `content_type` | string | MIME 类型 |
-| `sha256` | string | SHA-256 哈希 |
-| `version` | integer | 版本号 |
-| `etag` | string | 实体标签 |
-| `updated_at` | integer | 更新时间戳 |
-
----
-
-## storage.batch_delete
-
-批量删除对象。
-
-### 参数
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `object_keys` | array | 是 | 要删除的对象路径列表（最多 100 个） |
-| `bucket` | string | 否 | 存储桶，默认 `"default"` |
-| `owner_aid` | string | 否 | 所有者，默认当前用户 |
-
-### 响应
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `deleted` | array | 成功删除的对象路径列表 |
-| `deleted_count` | integer | 删除数量 |
-| `not_found` | array | 不存在的对象路径列表 |
-| `not_found_count` | integer | 不存在数量 |
-| `failed` | array | 失败项 `[{"object_key": "...", "error": "..."}]` |
-| `failed_count` | integer | 失败数量 |
-
----
-
 ## 事件
 
 ### event/storage.object_changed
@@ -483,7 +389,7 @@ for obj in result["items"]:
 | `owner_aid` | string | 对象所有者 AID |
 | `object_key` | string | 对象路径 |
 
-> 当前实现只在 `storage.put_object` 成功后推送 `action="put"`，以及 `storage.delete_object` 返回 `deleted=true` 时推送 `action="delete"`。`complete_upload`、`copy_object`、`append_object`、`batch_delete` 当前不会自动发布该事件。
+> 当前实现在 `storage.put_object` 成功后推送 `action="put"`，`storage.delete_object` 返回 `deleted=true` 时推送 `action="delete"`，`storage.complete_upload` 成功后也会推送 `action="put"` 事件。
 
 ---
 

@@ -83,7 +83,7 @@ function _clientLog(
  * 等价于 Python json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)
  * 非 ASCII 字符直接以 UTF-8 输出，与 AAD 序列化规则一致。
  */
-function stableStringify(obj: JsonValue | object | undefined): string {
+export function stableStringify(obj: JsonValue | object | undefined): string {
   if (obj === null || obj === undefined) return 'null';
   if (typeof obj === 'boolean' || typeof obj === 'number') return JSON.stringify(obj);
   if (typeof obj === 'string') return JSON.stringify(obj);
@@ -92,7 +92,10 @@ function stableStringify(obj: JsonValue | object | undefined): string {
   }
   if (isJsonObject(obj)) {
     const keys = Object.keys(obj).sort();
-    const entries = keys.map(k => stableStringify(k) + ':' + stableStringify(obj[k]));
+    // 跳过值为 undefined 的 key，与 JSON.stringify 行为一致（ISSUE-TS-001）
+    const entries = keys
+      .filter(k => obj[k] !== undefined)
+      .map(k => stableStringify(k) + ':' + stableStringify(obj[k]));
     return '{' + entries.join(',') + '}';
   }
   return JSON.stringify(obj);
@@ -182,8 +185,8 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
   heartbeat_interval: 30.0,
   token_refresh_before: 60.0,
   retry: {
-    initial_delay: 0.5,
-    max_delay: 30.0,
+    initial_delay: 1.0,
+    max_delay: 64.0,
     // M25: 0 表示无限重试，与 Go/Python 对齐
     max_attempts: 0,
   },
@@ -202,6 +205,7 @@ const SIGNED_METHODS = new Set([
   'group.update_join_requirements', 'group.set_role',
   'group.transfer_owner', 'group.review_join_request',
   'group.batch_review_join_request',
+  'group.request_join', 'group.use_invite_code',
   'group.resources.put', 'group.resources.update',
   'group.resources.delete', 'group.resources.request_add',
   'group.resources.direct_add', 'group.resources.approve_request',
@@ -411,8 +415,8 @@ export class AUNClient {
   private _seqTracker: SeqTracker = new SeqTracker();
   private _seqTrackerContext: string | null = null;
 
-  /** 补洞去重：已完成/进行中的 key 集合，防止重复 pull 同一区间 */
-  private _gapFillDone: Set<string> = new Set();
+  /** 补洞去重：已完成/进行中的 key -> 开始时间戳，防止重复 pull 同一区间 */
+  private _gapFillDone: Map<string, number> = new Map();
   /** 推送路径已分发的 seq 集合（按命名空间），补洞路径 publish 前检查以避免重复分发 */
   private _pushedSeqs: Map<string, Set<number>> = new Map();
 
@@ -425,6 +429,7 @@ export class AUNClient {
   private _cacheCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _reconnecting = false;
+  private _serverKicked = false;
 
   constructor(config?: RpcParams, debug = false) {
     const rawConfig: RpcParams = { ...(config ?? {}) };
@@ -472,7 +477,7 @@ export class AUNClient {
     this._transport = new RPCTransport({
       eventDispatcher: this._dispatcher,
       timeout: 10_000,
-      onDisconnect: (err) => this._handleTransportDisconnect(err),
+      onDisconnect: (err, closeCode) => this._handleTransportDisconnect(err, closeCode),
       verifySsl: this._configModel.verifySsl,
     });
 
@@ -491,7 +496,6 @@ export class AUNClient {
     });
 
     this.auth = new AuthNamespace(this);
-
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => this._onRawMessageReceived(data));
     // 群组消息推送：自动解密后 re-publish
@@ -502,6 +506,8 @@ export class AUNClient {
     for (const evt of ['message.recalled', 'message.ack']) {
       this._dispatcher.subscribe(`_raw.${evt}`, (data) => this._dispatcher.publish(evt, data));
     }
+    // 服务端主动断开通知：记录日志并标记不重连
+    this._dispatcher.subscribe('_raw.gateway.disconnect', (data) => this._onGatewayDisconnect(data));
   }
 
   // ── 属性 ──────────────────────────────────────────────────
@@ -526,6 +532,16 @@ export class AUNClient {
     return this._groupE2ee;
   }
 
+  /** 最近一次 gateway health check 结果，null 表示尚未检查 */
+  get gatewayHealth(): boolean | null {
+    return this._discovery.lastHealthy;
+  }
+
+  /** 向 gatewayUrl 的 /health 端点发送 HEAD 请求，检查网关可用性 */
+  async checkGatewayHealth(gatewayUrl: string, timeout = 5_000): Promise<boolean> {
+    return this._discovery.checkHealth(gatewayUrl, timeout);
+  }
+
   // ── 生命周期 ──────────────────────────────────────────────
 
   /**
@@ -538,7 +554,7 @@ export class AUNClient {
     auth: RpcParams,
     options?: RpcParams,
   ): Promise<void> {
-    if (this._state !== 'idle' && this._state !== 'closed') {
+    if (this._state !== 'idle' && this._state !== 'closed' && this._state !== 'disconnected') {
       throw new StateError(`connect not allowed in state ${this._state}`);
     }
     const params = { ...auth };
@@ -573,6 +589,46 @@ export class AUNClient {
     this._state = 'closed';
     await this._dispatcher.publish('connection.state', { state: this._state });
     this._resetSeqTrackingState();
+  }
+
+  /**
+   * 断开连接但不关闭客户端（可重新 connect，对齐 Python disconnect）。
+   * disconnect 是可恢复的：停止心跳、关闭 WebSocket，但不清理 keystore 等状态。
+   */
+  async disconnect(): Promise<void> {
+    // 若 close() 已在执行中，跳过 disconnect 避免竞态
+    if (this._closing) return;
+    if (this._state !== 'connected' && this._state !== 'reconnecting') return;
+    this._saveSeqTrackerState();
+    this._stopBackgroundTasks();
+    this._stopReconnect();
+    await this._transport.close();
+    this._state = 'disconnected';
+    await this._dispatcher.publish('connection.state', { state: this._state });
+  }
+
+  /**
+   * 列出本地所有已存储的身份摘要（对齐 Python list_identities）。
+   */
+  listIdentities(): Array<{ aid: string; metadata?: Record<string, unknown> }> {
+    const listFn = (this._keystore as KeyStore & {
+      listIdentities?: () => string[];
+    }).listIdentities;
+    if (typeof listFn !== 'function') return [];
+    const aids = listFn.call(this._keystore);
+    const summaries: Array<{ aid: string; metadata?: Record<string, unknown> }> = [];
+    for (const aid of [...aids].sort()) {
+      const summary: { aid: string; metadata?: Record<string, unknown> } = { aid };
+      const loadMetadata = (this._keystore as KeyStore & {
+        loadMetadata?: (aid: string) => Record<string, unknown> | null;
+      }).loadMetadata;
+      if (typeof loadMetadata === 'function') {
+        const md = loadMetadata.call(this._keystore, aid);
+        if (md) summary.metadata = md;
+      }
+      summaries.push(summary);
+    }
+    return summaries;
   }
 
   // ── RPC ───────────────────────────────────────────────────
@@ -714,8 +770,8 @@ export class AUNClient {
         }
       }
 
-      // 加人后自动分发密钥给新成员
-      if (method === 'group.add_member') {
+      // 加人后自动分发密钥给新成员（仅 RPC 成功时）
+      if (method === 'group.add_member' && isJsonObject(result) && !result.error) {
         const groupId = String(p.group_id ?? '');
         const newAid = String(p.aid ?? '');
         if (groupId && newAid) {
@@ -1044,6 +1100,10 @@ export class AUNClient {
       type: 'e2ee.group_encrypted',
       encrypted: true,
     };
+    // 注入 device_id（与 call() 路径对齐）
+    if (this._deviceId && sendParams.device_id === undefined) {
+      sendParams.device_id = this._deviceId;
+    }
     this._signClientOperation('group.send', sendParams);
     return await this._transport.call('group.send', sendParams);
   }
@@ -1092,7 +1152,7 @@ export class AUNClient {
         signature: signature.toString('base64'),
       };
     } catch (exc) {
-      _clientLog('warn', '客户端签名失败，继续发送无签名请求: %s', formatCaughtError(exc));
+      throw new Error(`客户端签名失败，拒绝发送无签名请求: ${formatCaughtError(exc)}`);
     }
   }
 
@@ -1284,7 +1344,7 @@ export class AUNClient {
     // 去重：同一 (group:id:after_seq) 只补一次
     const dedupKey = `group_msg:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
-    this._gapFillDone.add(dedupKey);
+    this._gapFillDone.set(dedupKey, Date.now());
     // S1: 成功/失败双路径都需要根据"是否真正前进"决定是否保留 dedup 标记，
     // 避免 pull 返空、contiguous 未推进时标记被永久污染。
     let success = false;
@@ -1335,7 +1395,7 @@ export class AUNClient {
     // 去重：同一 (type:after_seq) 只补一次
     const dedupKey = `p2p:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
-    this._gapFillDone.add(dedupKey);
+    this._gapFillDone.set(dedupKey, Date.now());
     // S1: 成功路径也要判断是否真正前进；pull 返空时必须清除标记，
     // 否则下一次相同 afterSeq 触发的补洞会被永久跳过。
     let success = false;
@@ -1389,7 +1449,7 @@ export class AUNClient {
     // 去重：同一 (group_evt:id:after_seq) 只补一次
     const dedupKey = `group_evt:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
-    this._gapFillDone.add(dedupKey);
+    this._gapFillDone.set(dedupKey, Date.now());
     // S1: 成功/失败均按"是否真正前进"决定是否保留标记
     let success = false;
     try {
@@ -1443,7 +1503,7 @@ export class AUNClient {
    */
   private async _syncAllGroupsOnce(): Promise<void> {
     try {
-      const result = await this.call('group.list', {});
+      const result = await this.call('group.list_my', {});
       if (!isJsonObject(result)) return;
       const items = result.items;
       if (!Array.isArray(items)) return;
@@ -1490,6 +1550,16 @@ export class AUNClient {
         if (Number.isFinite(es) && es > 0) {
           needPull = this._seqTracker.onMessageSeq(`group_event:${groupId}`, es);
         }
+        // ISSUE-TS-002: 群事件推送路径 ack + 持久化，与 P2P/群消息路径对齐
+        this._saveSeqTrackerState();
+        const contig = this._seqTracker.getContiguousSeq(`group_event:${groupId}`);
+        if (contig > 0) {
+          this._transport.call('group.ack_events', {
+            group_id: groupId,
+            event_seq: contig,
+            device_id: this._deviceId,
+          }).catch((e) => { _clientLog('debug', '群事件推送 auto-ack 失败: group=%s %s', groupId, formatCaughtError(e)); });
+        }
       }
 
       // 仅在真实 event gap 时才触发补拉（补洞回来的事件不再触发新补洞）
@@ -1508,11 +1578,20 @@ export class AUNClient {
           );
         }
       }
+
+      // 群组解散 → 清理本地 epoch key、seq_tracker、补洞去重缓存
+      if (d.action === 'dissolved') {
+        if (groupId) {
+          this._cleanupDissolvedGroup(groupId);
+        }
+      }
+    } else {
+      // data 非对象也透传给用户（兼容旧版）
+      await this._dispatcher.publish('group.changed', data);
     }
   }
-
   /**
-   * H21: 基于"排序最小 admin = leader"选举，其他 admin 走 jitter 兜底重试。
+   * 成员退出/被踢后，判断本地是否为 leader admin 并发起 epoch 轮换。
    * 避免所有剩余 admin 同时触发 `_rotateGroupEpoch` 造成 CAS 风暴。
    */
   private async _maybeLeadRotateGroupEpoch(groupId: string): Promise<void> {
@@ -1539,17 +1618,58 @@ export class AUNClient {
         return;
       }
       if (!admins.includes(myAid)) return;
-      // 非 leader：随机 jitter（2~6s）后检查 epoch 是否已被 leader 推进，没推进就兜底
+      // 非 leader：随机 jitter（2~6s）后查询服务端 epoch 是否已被 leader 推进
       const jitterMs = 2000 + Math.floor(Math.random() * 4000);
-      const beforeEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0;
+      let beforeEpoch = 0;
+      try {
+        const resp = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+        if (isJsonObject(resp)) beforeEpoch = Number(resp.epoch ?? 0);
+      } catch { beforeEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0; }
       await new Promise((r) => setTimeout(r, jitterMs));
-      const afterEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0;
+      let afterEpoch = 0;
+      try {
+        const resp = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+        if (isJsonObject(resp)) afterEpoch = Number(resp.epoch ?? 0);
+      } catch { afterEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0; }
       if (afterEpoch > beforeEpoch) return; // leader 已完成
       _clientLog('info', '[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s', groupId, myAid);
       await this._rotateGroupEpoch(groupId);
     } catch (exc) {
       _clientLog('warn', '_maybeLeadRotateGroupEpoch 失败: %s', formatCaughtError(exc));
     }
+  }
+
+  /**
+   * 群组解散后清理本地状态：
+   * - keystore 中的 epoch key 数据
+   * - seq_tracker 中的群消息和群事件 seq 记录
+   * - 补洞去重缓存中的相关条目
+   */
+  private _cleanupDissolvedGroup(groupId: string): void {
+    // 1. 清理 GroupE2EEManager / keystore 中的 epoch 密钥
+    try {
+      this._groupE2ee.removeGroup(groupId);
+    } catch (exc) {
+      _clientLog('warn', '清理解散群组 %s epoch 密钥失败: %s', groupId, formatCaughtError(exc));
+    }
+
+    // 2. 清理 seq_tracker 中的群消息和群事件命名空间
+    this._seqTracker.removeNamespace(`group:${groupId}`);
+    this._seqTracker.removeNamespace(`group_event:${groupId}`);
+    this._saveSeqTrackerState();
+
+    // 3. 清理补洞去重缓存中的相关条目
+    for (const key of this._gapFillDone.keys()) {
+      if (key.includes(groupId)) {
+        this._gapFillDone.delete(key);
+      }
+    }
+
+    // 4. 清理推送 seq 去重缓存
+    this._pushedSeqs.delete(`group:${groupId}`);
+    this._pushedSeqs.delete(`group_event:${groupId}`);
+
+    _clientLog('info', '已清理解散群组 %s 的本地状态', groupId);
   }
 
   /** 同步验签群事件 client_signature。返回 true/false/"pending"。 */
@@ -1963,7 +2083,12 @@ export class AUNClient {
     // 密码学解密（E2EEManager.decryptMessage 内含本地防重放）
     const decrypted = this._e2ee.decryptMessage(message);
     this._schedulePrekeyReplenishIfConsumed(decrypted);
-    return decrypted !== null ? decrypted : message;
+    // TS-015: 解密返回 null 表示失败（密文损坏/签名无效/重放等），
+    // 不得回退到原始密文投递给应用层，应抛出错误触发 undecryptable 事件
+    if (decrypted === null) {
+      throw new Error(`E2EE 解密失败: from=${message.from}, mid=${message.message_id}`);
+    }
+    return decrypted;
   }
 
   /** 批量解密 P2P 消息（用于 message.pull） */
@@ -1993,7 +2118,12 @@ export class AUNClient {
         }
         // 用 _decryptMessage 而非 decryptMessage，避免消耗 seen set
         const decrypted = this._e2ee._decryptMessage(msg);
-        result.push(decrypted !== null ? decrypted : msg);
+        if (decrypted !== null) {
+          result.push(decrypted);
+        } else {
+          // TS-015: 解密失败不回退到密文，跳过该消息并记录
+          _clientLog('warn', 'pull 消息解密失败，跳过: from=%s mid=%s', msg.from, msg.message_id);
+        }
       } else {
         result.push(msg);
       }
@@ -2062,16 +2192,29 @@ export class AUNClient {
   // ── Group E2EE 编排 ───────────────────────────────────────
 
   /** 建群后将本地 epoch 1 同步到服务端（服务端初始为 0） */
+  /** 建群后将本地 epoch 1 同步到服务端（服务端初始为 0），最多重试 3 次 */
   private async _syncEpochToServer(groupId: string): Promise<void> {
-    try {
-      const rotateParams: RpcParams = {
-        group_id: groupId,
-        current_epoch: 0,
-      };
-      Object.assign(rotateParams, this._buildRotationSignature(groupId, 0, 1));
-      await this.call('group.e2ee.rotate_epoch', rotateParams);
-    } catch (exc) {
-      _clientLog('debug', '同步 epoch 到服务端失败 (group=%s，可能已同步): %s', groupId, formatCaughtError(exc));
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const rotateParams: RpcParams = {
+          group_id: groupId,
+          current_epoch: 0,
+        };
+        Object.assign(rotateParams, this._buildRotationSignature(groupId, 0, 1));
+        await this.call('group.e2ee.rotate_epoch', rotateParams);
+        return;
+      } catch (exc) {
+        if (attempt < maxRetries) {
+          const delay = 500 * Math.pow(2, attempt - 1);
+          _clientLog('warn', '同步 epoch 到服务端失败 (group=%s, 第%d/%d次): %s, %dms后重试',
+            groupId, attempt, maxRetries, formatCaughtError(exc), delay);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          _clientLog('error', '同步 epoch 到服务端最终失败 (group=%s, 已重试%d次): %s',
+            groupId, maxRetries, formatCaughtError(exc));
+        }
+      }
     }
   }
 
@@ -2163,7 +2306,7 @@ export class AUNClient {
 
       // 构建并签名 manifest
       let manifest = buildMembershipManifest(
-        groupId, epoch, null, memberAids, {
+        groupId, epoch, epoch, memberAids, {
           added: [newMemberAid],
           removed: [],
           initiatorAid: this._aid ?? '',
@@ -2811,10 +2954,10 @@ export class AUNClient {
         for (const [k, v] of this._peerPrekeysCache) {
           if (nowSec >= v.expireAt) this._peerPrekeysCache.delete(k);
         }
-        // 补洞去重集合（仅保留最近 10000 条）
-        if (this._gapFillDone.size > 10000) {
-          const arr = [...this._gapFillDone];
-          this._gapFillDone = new Set(arr.slice(arr.length - 5000));
+        // 补洞去重：清理超过 5 分钟的旧条目（与 Python 对齐，按时间过期）
+        const gapCutoffMs = Date.now() - 300_000;
+        for (const [k, ts] of this._gapFillDone) {
+          if (ts < gapCutoffMs) this._gapFillDone.delete(k);
         }
         // e2ee prekey 缓存
         this._e2ee.cleanExpiredCaches();
@@ -2836,8 +2979,19 @@ export class AUNClient {
 
   // ── 内部：断线重连 ────────────────────────────────────────
 
+  /** 不重连 close code 集合：认证失败/权限错误/被踢等，重连无意义 */
+  private static readonly _NO_RECONNECT_CODES = new Set([4001, 4003, 4008, 4009, 4010, 4011]);
+
+  /** 处理服务端主动断开通知 event/gateway.disconnect */
+  private _onGatewayDisconnect(data: any): void {
+    const code = data?.code;
+    const reason = data?.reason ?? '';
+    _clientLog('warn', '服务端主动断开: code=%s, reason=%s', code, reason);
+    this._serverKicked = true;
+  }
+
   /** 传输层断线回调 */
-  private async _handleTransportDisconnect(error: Error | null): Promise<void> {
+  private async _handleTransportDisconnect(error: Error | null, closeCode?: number): Promise<void> {
     if (this._closing || this._state === 'closed') return;
     // 已在重连中则跳过，避免心跳超时和 transport 断线回调重复触发
     if (this._reconnecting) return;
@@ -2847,21 +3001,34 @@ export class AUNClient {
 
     if (!this._sessionOptions.auto_reconnect) return;
     if (this._reconnecting) return;
-    this._startReconnect();
+    // 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
+    if (this._serverKicked || (closeCode !== undefined && AUNClient._NO_RECONNECT_CODES.has(closeCode))) {
+      this._state = 'terminal_failed';
+      const reason = this._serverKicked ? 'server kicked' : `close code ${closeCode}`;
+      _clientLog('warn', '抑制自动重连: %s', reason);
+      await this._dispatcher.publish('connection.state', {
+        state: this._state, error, reason,
+      });
+      return;
+    }
+    // 1000 = 正常关闭, 1006 = 网络异常断开（无 close frame），其他 code = 服务端主动关闭
+    const serverInitiated = closeCode !== undefined && closeCode !== 1000 && closeCode !== 1006;
+    this._startReconnect(serverInitiated);
   }
 
-  /** 启动重连循环（默认无限重试 + 指数退避，仅在不可重试错误、close() 或 max_attempts 耗尽时终止） */
-  private _startReconnect(): void {
+  /** 启动重连循环（默认无限重试 + 指数退避 + Full Jitter，仅在不可重试错误、close() 或 max_attempts 耗尽时终止） */
+  private _startReconnect(serverInitiated = false): void {
     if (this._reconnecting) return;
     this._reconnecting = true;
 
     const retry = this._sessionOptions.retry;
-    const initialDelay = Number(retry.initial_delay ?? 0.5) * 1000;
-    const maxDelay = Number(retry.max_delay ?? 30.0) * 1000;
+    const maxDelay = Number(retry.max_delay ?? 64.0) * 1000;
     // M25: max_attempts=0 表示无限重试（与 Go/Python 对齐）
     const maxAttemptsRaw = Number(retry.max_attempts ?? 0);
     const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? Math.floor(maxAttemptsRaw) : 0;
-    let delay = initialDelay;
+    // 服务端主动关闭（close frame）时从 16s 起跳，避免重连风暴；网络断开从 1s 起跳
+    const baseDelay = serverInitiated ? 16_000 : Number(retry.initial_delay ?? 1.0) * 1000;
+    let delay = baseDelay;
     let attempt = 0;
 
     const tryReconnect = async (): Promise<void> => {
@@ -2877,6 +3044,7 @@ export class AUNClient {
         attempt,
       });
 
+      // Full Jitter: random(0, delay) 打散重连时机
       this._reconnectTimer = setTimeout(async () => {
         // 防止 close() 后仍执行重连（递归调用无 await 可能越过 _stopReconnect）
         if (this._closing || !this._reconnecting) {
@@ -2884,6 +3052,19 @@ export class AUNClient {
           return;
         }
         try {
+          // 重连前先 HEAD /health 探测，不健康则跳过本轮
+          if (this._gatewayUrl) {
+            const healthy = await this._discovery.checkHealth(this._gatewayUrl, 5_000);
+            if (!healthy) {
+              delay = Math.random() * Math.min(delay * 2, maxDelay);
+              if (!this._closing && this._reconnecting) {
+                tryReconnect().catch(() => {});
+              } else {
+                this._reconnecting = false;
+              }
+              return;
+            }
+          }
           await this._transport.close();
           if (this._sessionParams === null) {
             throw new StateError('missing connect params for reconnect');
@@ -2918,14 +3099,14 @@ export class AUNClient {
             });
             return;
           }
-          delay = Math.min(delay * 2, maxDelay);
+          delay = Math.random() * Math.min(delay * 2, maxDelay);
           if (!this._closing && this._reconnecting) {
             tryReconnect().catch(() => {}); // 捕获未处理的 rejection
           } else {
             this._reconnecting = false;
           }
         }
-      }, delay);
+      }, Math.random() * delay);
       this._unrefTimer(this._reconnectTimer);
     };
 

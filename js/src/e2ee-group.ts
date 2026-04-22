@@ -183,17 +183,13 @@ export async function encryptGroupMessage(
 
   // 发送方签名：对 ciphertext + tag + aad_bytes 签名（不可否认性）
   if (opts.senderPrivateKeyPem) {
-    try {
-      const signKey = await importPrivateKeyEcdsa(opts.senderPrivateKeyPem);
-      const signPayload = concatBytes(ciphertext, tag, aadBytes);
-      const sig = await ecdsaSignDer(signKey, signPayload);
-      envelope.sender_signature = uint8ToBase64(sig);
+    const signKey = await importPrivateKeyEcdsa(opts.senderPrivateKeyPem);
+    const signPayload = concatBytes(ciphertext, tag, aadBytes);
+    const sig = await ecdsaSignDer(signKey, signPayload);
+    envelope.sender_signature = uint8ToBase64(sig);
 
-      if (opts.senderCertPem) {
-        envelope.sender_cert_fingerprint = await certificateSha256Fingerprint(opts.senderCertPem);
-      }
-    } catch (exc) {
-      console.warn('群消息发送方签名失败:', exc);
+    if (opts.senderCertPem) {
+      envelope.sender_cert_fingerprint = await certificateSha256Fingerprint(opts.senderCertPem);
     }
   }
 
@@ -223,14 +219,14 @@ export async function decryptGroupMessage(
 
   const groupSecret = groupSecrets.get(epoch);
   if (!groupSecret) {
-    console.error(`[DEBUG:decryptGroupMessage] no secret for epoch=${epoch}, available=[${[...groupSecrets.keys()].join(',')}]`);
+    console.warn('[aun_core.e2ee-group] 群消息解密失败：找不到对应 epoch 的密钥');
     return null;
   }
 
   try {
     // 优先从 AAD 读取 group_id 和 message_id（SDK 加密时的原始值）
     const aad = isJsonObject(payload.aad) ? payload.aad : undefined;
-    const outerGroupId = (message.group_id ?? '') as string;
+    const outerGroupId = String(message.group_id ?? '');
     let groupId: string;
     let messageId: string;
     let aadFrom = '';
@@ -242,18 +238,18 @@ export async function decryptGroupMessage(
 
       // 外层路由字段与 AAD 绑定校验
       if (outerGroupId && groupId !== outerGroupId) {
-        console.error(`[DEBUG:decryptGroupMessage] AAD group_id mismatch: outer=${outerGroupId} aad=${groupId}`);
+        console.warn('[aun_core.e2ee-group] AAD group_id 与外层路由不匹配');
         return null;
       }
       if (aadFrom) {
         const outerFrom = (message.from ?? '') as string;
-        const outerSender = (message.sender_aid ?? '') as string;
+        const outerSender = String(message.sender_aid ?? '');
         if (outerFrom && outerFrom !== aadFrom) {
-          console.error(`[DEBUG:decryptGroupMessage] AAD from mismatch: outer.from=${outerFrom} aad.from=${aadFrom}`);
+          console.warn('[aun_core.e2ee-group] AAD from 与外层 from 不匹配');
           return null;
         }
         if (outerSender && outerSender !== aadFrom) {
-          console.error(`[DEBUG:decryptGroupMessage] AAD sender_aid mismatch: outer.sender_aid=${outerSender} aad.from=${aadFrom}`);
+          console.warn('[aun_core.e2ee-group] AAD sender_aid 与外层 sender_aid 不匹配');
           return null;
         }
       }
@@ -263,7 +259,7 @@ export async function decryptGroupMessage(
     }
 
     if (!groupId || !messageId) {
-      console.error(`[DEBUG:decryptGroupMessage] missing groupId=${groupId} or messageId=${messageId}`);
+      console.warn('[aun_core.e2ee-group] 群消息解密失败：缺少 groupId 或 messageId');
       return null;
     }
 
@@ -326,7 +322,7 @@ export async function decryptGroupMessage(
 
     return result;
   } catch (exc) {
-    console.error(`[DEBUG:decryptGroupMessage] decrypt exception:`, exc);
+    console.warn('[aun_core.e2ee-group] 群消息解密异常:', exc instanceof Error ? (exc.stack || exc.message) : String(exc));
     return null;
   }
 }
@@ -574,6 +570,24 @@ export async function cleanupOldEpochs(
   return await cleanupKeyStoreGroupOldEpochs(keystore, aid, groupId, cutoffMs);
 }
 
+/** 删除群组的所有密钥数据（群组解散时使用，异步） */
+export async function deleteGroupSecret(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+): Promise<void> {
+  if (typeof keystore.deleteGroupSecretState === 'function') {
+    await keystore.deleteGroupSecretState(aid, groupId);
+    return;
+  }
+  // 降级：通过 saveGroupSecretState 写入空记录来"删除"
+  if (typeof keystore.saveGroupSecretState === 'function') {
+    await keystore.saveGroupSecretState(aid, groupId, {} as any);
+    return;
+  }
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing deleteGroupSecretState method`);
+}
+
 // ── Group Key 分发与恢复协议 ────────────────────────────────
 
 /** 生成 32 字节随机 group_secret */
@@ -749,7 +763,7 @@ export class GroupReplayGuard {
   private _seen: Map<string, boolean> = new Map();
   private _maxSize: number;
 
-  constructor(maxSize = 50000) {
+  constructor(maxSize = 10000) {
     this._maxSize = maxSize;
   }
 
@@ -990,8 +1004,8 @@ export class GroupE2EEManager {
     if (payload === null || payload.type !== 'e2ee.group_encrypted') {
       return message;
     }
-    const groupId = (message.group_id ?? '') as string;
-    const sender = (message.from ?? message.sender_aid ?? '') as string;
+    const groupId = String(message.group_id ?? '');
+    const sender = String(message.from ?? message.sender_aid ?? '');
     const skipReplay = opts?.skipReplay ?? false;
 
     // 防重放预检：优先使用 AAD 内 message_id
@@ -1007,7 +1021,6 @@ export class GroupE2EEManager {
     if (this._senderCertResolver && sender) {
       senderCertPem = this._senderCertResolver(sender);
     }
-    console.error(`[DEBUG:GroupE2EE.decrypt] groupId=${groupId}, sender=${sender}, msgId=${msgId}, hasCert=${!!senderCertPem}, hasResolver=${!!this._senderCertResolver}`);
     if (!senderCertPem) {
       console.warn(
         `拒绝群消息：无法获取发送方 ${sender} 的证书（零信任模式禁止跳过验签）: group=${groupId}`,
@@ -1016,10 +1029,8 @@ export class GroupE2EEManager {
     }
 
     const allSecrets = await loadAllGroupSecrets(this._keystoreRef, this._currentAid(), groupId);
-    console.error(`[DEBUG:GroupE2EE.decrypt] allSecrets.size=${allSecrets.size}, epochs=[${[...allSecrets.keys()].join(',')}]`);
     if (!allSecrets.size) return null;
     const result = await decryptGroupMessage(message, allSecrets, senderCertPem);
-    console.error(`[DEBUG:GroupE2EE.decrypt] decryptGroupMessage result=${result !== null ? 'OK' : 'null'}`);
 
     // 解密成功后记录防重放
     if (result !== null) {
@@ -1132,6 +1143,15 @@ export class GroupE2EEManager {
   /** 清理过期缓存（replay guard 等），供外部定时调用 */
   cleanExpiredCaches(): void {
     this._replayGuard.trim();
+  }
+
+  /** 删除群组的所有本地状态（群组解散时使用，异步） */
+  async removeGroup(groupId: string): Promise<void> {
+    try {
+      await deleteGroupSecret(this._keystoreRef, this._currentAid(), groupId);
+    } catch {
+      // keystore 不支持 delete 时忽略（降级方案已在 deleteGroupSecret 中处理）
+    }
   }
 
   // ── 内部工具 ──────────────────────────────────────

@@ -27,9 +27,13 @@ describe('AUNClient 构造', () => {
     expect(client.configModel.replayWindowSeconds).toBe(300);
   });
 
-  it('不允许以 verify_ssl=false 构造浏览器 SDK', () => {
-    expect(() => new AUNClient({ verify_ssl: false }))
-      .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
+  it('verify_ssl=false 应记录警告但不抛错（浏览器环境）', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const client = new AUNClient({ verify_ssl: false });
+    // 浏览器环境不支持跳过 SSL，verifySsl 始终为 true
+    expect(client.configModel.verifySsl).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('verify_ssl'));
+    warnSpy.mockRestore();
   });
 });
 
@@ -484,6 +488,8 @@ describe('AUNClient M25 重连行为', () => {
 describe('AUNClient 群补拉实例上下文', () => {
   it('_fillGroupGap 应复用当前实例 device_id', async () => {
     const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._closing = false;
     (client as any)._seqTracker.getContiguousSeq = vi.fn().mockReturnValue(12);
     (client as any).call = vi.fn().mockResolvedValue({ messages: [] });
 
@@ -499,6 +505,8 @@ describe('AUNClient 群补拉实例上下文', () => {
 
   it('_fillGroupEventGap 应复用当前实例 device_id', async () => {
     const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._closing = false;
     (client as any)._seqTracker.getContiguousSeq = vi.fn().mockReturnValue(5);
     (client as any).call = vi.fn().mockResolvedValue({ events: [] });
 
@@ -692,5 +700,65 @@ describe('AUNClient SeqTracker 持久化错误事件', () => {
       slot_id: 'slot-1',
       error: expect.any(String),
     }));
+  });
+});
+
+// ── 抑制重连测试 ──────────────────────────────────────────
+
+describe('NO_RECONNECT_CODES 抑制重连', () => {
+  function makeDisconnectClient() {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._sessionOptions = {
+      auto_reconnect: true,
+      retry: { initial_delay: 0.01, max_delay: 0.05, max_attempts: 0 },
+      timeouts: { connect: 5, call: 10, http: 30 },
+      heartbeat_interval: 0,
+      token_refresh_before: 60,
+    };
+    (client as any)._closing = false;
+    (client as any)._reconnectActive = false;
+    (client as any)._stopBackgroundTasks = vi.fn();
+    const safeAsyncSpy = vi.spyOn(client as any, '_safeAsync').mockImplementation(() => {});
+    return { client, safeAsyncSpy };
+  }
+
+  it.each([4001, 4003, 4008, 4009, 4010, 4011])(
+    '不重连 close code %d 应进入 terminal_failed',
+    async (code) => {
+      const { client, safeAsyncSpy } = makeDisconnectClient();
+      await (client as any)._handleTransportDisconnect(new Error('test'), code);
+      expect(client.state).toBe('terminal_failed');
+      expect(safeAsyncSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([4000, 4029, 4500, 4503])(
+    '可重连 close code %d 应启动重连',
+    async (code) => {
+      const { client, safeAsyncSpy } = makeDisconnectClient();
+      await (client as any)._handleTransportDisconnect(new Error('test'), code);
+      expect(safeAsyncSpy).toHaveBeenCalled();
+      expect(client.state).not.toBe('terminal_failed');
+    },
+  );
+
+  it('收到 gateway.disconnect 通知后断线应抑制重连', async () => {
+    const { client, safeAsyncSpy } = makeDisconnectClient();
+    (client as any)._onGatewayDisconnect({ code: 4009, reason: 'Connection replaced' });
+    expect((client as any)._serverKicked).toBe(true);
+
+    await (client as any)._handleTransportDisconnect(new Error('test'), 4009);
+    expect(client.state).toBe('terminal_failed');
+    expect(safeAsyncSpy).not.toHaveBeenCalled();
+  });
+
+  it('_serverKicked 标志即使可重连 close code 也应抑制重连', async () => {
+    const { client, safeAsyncSpy } = makeDisconnectClient();
+    (client as any)._serverKicked = true;
+
+    await (client as any)._handleTransportDisconnect(new Error('test'), 1006);
+    expect(client.state).toBe('terminal_failed');
+    expect(safeAsyncSpy).not.toHaveBeenCalled();
   });
 });

@@ -661,7 +661,7 @@ export class AuthFlow {
     try {
       await this._verifyAuthCertOcsp(gatewayUrl, cert, expectedAid);
     } catch (exc) {
-      console.log('[aun_core.auth] OCSP 校验不可用，降级继续:', exc);
+      _authLog('debug', 'OCSP 校验不可用，降级继续: %s', exc instanceof Error ? exc.message : String(exc));
     }
 
     // 检查 CN 匹配
@@ -1593,7 +1593,7 @@ export class AuthFlow {
         try {
           await this._verifyAuthCertOcsp(gatewayUrl, cert);
         } catch (exc) {
-          console.log('[aun_core.auth] OCSP 校验不可用，降级继续:', exc);
+          _authLog('debug', 'OCSP 校验不可用，降级继续: %s', exc instanceof Error ? exc.message : String(exc));
         }
       }
 

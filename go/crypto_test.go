@@ -109,6 +109,33 @@ func TestNewClientNonce(t *testing.T) {
 	}
 }
 
+// TestSignLoginNonceTimestampIsFloatSeconds 验证自动生成的时间戳为浮点数秒格式
+// ISSUE-SDK-GO-012: 与 Python SDK str(time.time()) 对齐，使用浮点数格式（含微秒）
+func TestSignLoginNonceTimestampIsFloatSeconds(t *testing.T) {
+	cp := &CryptoProvider{}
+	identity, err := cp.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity 失败: %v", err)
+	}
+	privPEM := identity["private_key_pem"].(string)
+
+	_, usedTime, err := cp.SignLoginNonce(privPEM, "test-nonce", "")
+	if err != nil {
+		t.Fatalf("SignLoginNonce 失败: %v", err)
+	}
+
+	// ISSUE-SDK-GO-012: 时间戳应包含小数点（浮点数秒格式，如 "1745318400.123456"）
+	if !strings.Contains(usedTime, ".") {
+		t.Fatalf("ISSUE-SDK-GO-012: 时间戳应为浮点数秒格式（含小数点），实际: %s", usedTime)
+	}
+
+	// 小数点前应为 10 位 Unix 时间戳
+	parts := strings.SplitN(usedTime, ".", 2)
+	if len(parts[0]) < 10 {
+		t.Fatalf("ISSUE-SDK-GO-012: 时间戳整数部分长度不合理: %s", usedTime)
+	}
+}
+
 // TestGenerateIdentity_Unique 验证每次生成的密钥对不同
 func TestGenerateIdentity_Unique(t *testing.T) {
 	cp := &CryptoProvider{}

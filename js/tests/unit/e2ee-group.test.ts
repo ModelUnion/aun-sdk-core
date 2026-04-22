@@ -873,3 +873,22 @@ describe('GroupE2EEManager', () => {
     },
   );
 });
+
+// ── ISSUE-SDK-JS-011/019: 签名失败应抛出而非静默降级 ──────────
+
+describe('encryptGroupMessage 签名失败应抛出错误（ISSUE-SDK-JS-011/019）', () => {
+  it.skipIf(!hasSubtleCrypto)(
+    '传入无效私钥时应抛出错误而非静默发送无签名消息',
+    async () => {
+      const secret = generateGroupSecret();
+      await expect(
+        encryptGroupMessage('grp-1', 1, secret, { text: 'test' }, {
+          fromAid: 'alice.test',
+          messageId: 'msg-1',
+          timestamp: Date.now(),
+          senderPrivateKeyPem: 'INVALID_PEM_DATA',
+        }),
+      ).rejects.toThrow();
+    },
+  );
+});

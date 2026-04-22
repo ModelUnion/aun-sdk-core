@@ -257,8 +257,8 @@ async def test_unsigned_event_no_verified():
         await _ensure_connected(alice, _ALICE_AID)
         rid = _run_id()
         # group.create 事件（upsert）会有签名（因为 group.create 不在 SIGNED_METHODS）
-        # 用 group.list 验证不触发签名
-        result = await alice.call("group.list", {})
+        # 用 group.list_my 验证不触发签名
+        result = await alice.call("group.list_my", {})
         _result("无签名操作正常执行", result is not None)
     finally:
         await alice.close()

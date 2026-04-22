@@ -108,6 +108,14 @@ export class SessionError extends AUNError {
   }
 }
 
+/** 版本冲突错误 */
+export class VersionConflictError extends AUNError {
+  constructor(message: string, opts: ConstructorParameters<typeof AUNError>[1] = {}) {
+    super(message, opts);
+    this.name = 'VersionConflictError';
+  }
+}
+
 // ── 群组错误 ──────────────────────────────────────────────────
 
 export class GroupError extends AUNError {
@@ -248,9 +256,9 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
   }
 
   // 认证错误
-  const AUTH_CODES = new Set([4001, 4010, -32003]);
-  const PERMISSION_CODES = new Set([4030, 403]);
-  const NOT_FOUND_CODES = new Set([4040, 404, -32004]);
+  const AUTH_CODES = new Set([4001, 4010, -32001, -32003]);
+  const PERMISSION_CODES = new Set([4030, 403, -32004]); // -32004 = PERMISSION_DENIED
+  const NOT_FOUND_CODES = new Set([4040, 404, -32008]);
   const RATE_LIMIT_CODES = new Set([4290, 429, -32029]);
   const SESSION_CODES = new Set([-32010, -32011, -32013]);
   const VALIDATION_CODES = new Set([-32600, -32601, -32602, 4000]);
@@ -267,6 +275,8 @@ export function mapRemoteError(error: RpcErrorObject): AUNError {
     err = new NotFoundError(message, opts);
   } else if (RATE_LIMIT_CODES.has(code)) {
     err = new RateLimitError(message, { ...opts, retryable: true });
+  } else if (code === -32009) {
+    err = new VersionConflictError(message, opts);
   } else if (SESSION_CODES.has(code)) {
     err = new SessionError(message, opts);
   } else if (VALIDATION_CODES.has(code)) {

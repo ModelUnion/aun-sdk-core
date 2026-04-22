@@ -11,6 +11,7 @@
 - [call()](#await-callmethod-str-params-dict--none---any) - 调用 RPC 方法
 - [on()](#onevent-str-handler-callable---subscription) - 订阅事件
 - [close()](#await-close---none) - 关闭连接
+- [check_gateway_health()](#await-check_gateway_healthgateway_url-str-timeout-float--50---bool) - 检查网关可用性
 
 ### [AUNClient.Auth](#authnamespace-clientauth)
 - [create_aid()](#await-create_aidparams-dict---dict) - 注册新 AID
@@ -92,6 +93,7 @@ client = AUNClient({
 | `auth` | `AuthNamespace` | 认证命名空间 |
 | `e2ee` | `E2EEManager` | P2P E2EE 工具类 |
 | `group_e2ee` | `GroupE2EEManager` | 群组 E2EE 工具类（当前 Python SDK 固定可用） |
+| `gateway_health` | `bool \| None` | 最近一次 health check 结果，`None` 表示尚未检查 |
 
 ---
 
@@ -115,13 +117,13 @@ client = AUNClient({
 |------|------|--------|------|
 | `slot_id` | `str` | `""` | 同一设备上的实例槽位；空字符串表示该设备单实例模式 |
 | `delivery_mode.mode` | `str` | `"fanout"` | 连接级投递语义；同一 AID 的所有在线实例必须保持一致 |
-| `delivery_mode.routing` | `str` | `"sender_affinity"` | 仅 `queue` 模式有效 |
+| `delivery_mode.routing` | `str` | `"round_robin"` | 仅 `queue` 模式有效 |
 | `delivery_mode.affinity_ttl_ms` | `int` | `300000` | 仅 `queue + sender_affinity` 有效 |
 | `auto_reconnect` | `bool` | `True` | 断线自动重连 |
 | `heartbeat_interval` | `float` | `30.0` | 心跳间隔（秒） |
 | `token_refresh_before` | `float` | `60.0` | 令牌过期前多久刷新（秒） |
-| `retry.initial_delay` | `float` | `0.5` | 首次重连延迟（秒） |
-| `retry.max_delay` | `float` | `30.0` | 最大重连延迟（秒） |
+| `retry.initial_delay` | `float` | `1.0` | 首次重连延迟（秒） |
+| `retry.max_delay` | `float` | `64.0` | 最大重连延迟（秒） |
 | `timeouts.connect` | `float` | `5.0` | 连接超时（秒） |
 | `timeouts.call` | `float` | `10.0` | RPC 调用超时（秒） |
 | `timeouts.http` | `float` | `30.0` | HTTP 请求超时（秒） |
@@ -217,6 +219,30 @@ sub.unsubscribe()
 ### `await close() -> None`
 
 关闭连接，停止心跳、令牌刷新、重连等所有后台任务。
+
+---
+
+### `await check_gateway_health(gateway_url: str, timeout: float = 5.0) -> bool`
+
+向 gateway 的 `HEAD /health` 端点发送请求，检查网关可用性。结果同步更新 `gateway_health` 属性。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `gateway_url` | `str` | — | 网关 WebSocket URL（`wss://` 或 `ws://`） |
+| `timeout` | `float` | `5.0` | 超时秒数 |
+
+返回 `True` 表示网关可用（HTTP 200），`False` 表示不可用或超时。
+
+> **说明**：`discover()` 成功后会自动异步触发一次 health check，无需手动调用。
+
+**各语言对应 API**
+
+| 语言 | 属性 | 方法 |
+|------|------|------|
+| Python | `client.gateway_health` | `await client.check_gateway_health(url)` |
+| TypeScript | `client.gatewayHealth` | `await client.checkGatewayHealth(url)` |
+| Go | `client.GatewayHealth()` | `client.CheckGatewayHealth(ctx, url, timeout)` |
+| JS (browser) | `client.gatewayHealth` | `await client.checkGatewayHealth(url)` |
 
 ---
 
@@ -738,6 +764,7 @@ GroupE2EEManager(
 | `group.changed` | 群组状态变更 | 变更详情 |
 | `group.message_created` | 收到群消息推送 | 群消息对象 |
 | `group.message_undecryptable` | 群消息解密失败 | 原始加密群消息 |
+| `storage.object_changed` | 存储对象变更（put/delete） | `{"action": "put"/"delete", "owner_aid": "...", "object_key": "..."}` |
 | `e2ee.degraded` | E2EE 降级为 long_term_key | `{"peer_aid": "...", "reason": "..."}` |
 | `e2ee.orchestration_error` | 群 E2EE 编排失败 | 错误详情 |
 | `connection.state` | 连接状态变化 | `{"state": "..."}` |

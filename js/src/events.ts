@@ -35,7 +35,13 @@ export class Subscription {
 export class EventDispatcher {
   private _handlers: Map<string, EventHandler[]> = new Map();
 
-  /** 订阅事件，返回订阅句柄 */
+  /**
+   * 订阅事件，返回订阅句柄。
+   *
+   * 注意：unsubscribe() 使用引用相等（===）匹配 handler。若传入匿名函数，
+   * 将无法通过 off(event, handler) 取消订阅——应使用返回的 Subscription
+   * 对象调用 unsubscribe() 来取消。
+   */
   subscribe(event: string, handler: EventHandler): Subscription {
     const list = this._handlers.get(event) ?? [];
     list.push(handler);
@@ -57,6 +63,8 @@ export class EventDispatcher {
 
   /** 发布事件（依次调用所有处理函数，支持异步） */
   async publish(event: string, payload: EventPayload): Promise<void> {
+    // 浅拷贝 handler 列表：防止迭代过程中 subscribe/unsubscribe 修改原数组导致跳过或重复执行。
+    // 浏览器单线程事件循环模型下，浅拷贝即可保证并发安全（无需锁机制）。
     const handlers = [...(this._handlers.get(event) ?? [])];
     for (const handler of handlers) {
       try {

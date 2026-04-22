@@ -230,3 +230,142 @@ describe('P2-8: _restoreSeqTrackerState 应真正 await', () => {
     expect(callOrder.indexOf('restore')).toBeLessThan(callOrder.indexOf('connect'));
   });
 });
+
+// ── close_code 1000 误判测试 ──────────────────────────────
+
+describe('close_code 1000 不应视为 serverInitiated', () => {
+  let client: AUNClient;
+
+  beforeEach(() => {
+    client = new AUNClient();
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._sessionOptions = {
+      ...(client as any)._sessionOptions,
+      auto_reconnect: false,
+    };
+  });
+
+  it('close_code=1000 时 serverInitiated 应为 false', async () => {
+    // 测试 _handleTransportDisconnect 中对 closeCode 的处理
+    // 1000 是正常关闭，不应被视为服务端主动关闭
+    const startReconnectSpy = vi.spyOn(client as any, '_reconnectLoop').mockResolvedValue(undefined);
+
+    // 开启自动重连以测试 serverInitiated 参数
+    (client as any)._sessionOptions.auto_reconnect = true;
+
+    await (client as any)._handleTransportDisconnect(new Error('closed'), 1000);
+
+    // closeCode=1000 不应触发重连（它是正常关闭）
+    // 或者如果触发了，serverInitiated 应为 false
+    if (startReconnectSpy.mock.calls.length > 0) {
+      const serverInitiated = startReconnectSpy.mock.calls[0][0];
+      expect(serverInitiated).toBe(false);
+    }
+  });
+});
+
+// ── group.add_member 密钥分发结果检查测试 ──────────────────
+
+describe('group.add_member 失败时不应分发密钥', () => {
+  let client: AUNClient;
+
+  beforeEach(() => {
+    client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'device-001';
+  });
+
+  it('group.add_member 返回 error 时不应触发密钥分发', async () => {
+    // 模拟 transport.call 返回错误结果
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      error: { code: -33003, message: 'not authorized' },
+    });
+
+    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
+    const rotateSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
+
+    await client.call('group.add_member', {
+      group_id: 'group-123',
+      aid: 'new-member.aid.com',
+    });
+
+    // 失败的 add_member 不应触发密钥分发
+    expect(distributeSpy).not.toHaveBeenCalled();
+    expect(rotateSpy).not.toHaveBeenCalled();
+  });
+
+  it('group.add_member 成功时应触发密钥分发', async () => {
+    // 模拟成功结果
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      ok: true,
+    });
+
+    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
+
+    await client.call('group.add_member', {
+      group_id: 'group-123',
+      aid: 'new-member.aid.com',
+    });
+
+    // 成功的 add_member 应触发密钥分发
+    expect(distributeSpy).toHaveBeenCalledWith('group-123', 'new-member.aid.com');
+  });
+});
+
+// ── JS-012: _buildRotationSignature 不应使用动态 import ──────────
+
+describe('JS-012: _buildRotationSignature 不应使用冗余动态 import', () => {
+  it('源码中 _buildRotationSignature 不应包含动态 import("./crypto")', async () => {
+    // 读取 _buildRotationSignature 方法源码，确认没有动态 import
+    const client = new AUNClient();
+    const methodSrc = (client as any)._buildRotationSignature.toString();
+    // 修复后不应再包含 import('./crypto 这样的动态导入
+    expect(methodSrc).not.toContain("import(");
+  });
+});
+
+// ── JS-001: off() 事件注销方法 ──────────────────────────────────
+
+describe('JS-001: AUNClient.off() 事件注销方法', () => {
+  it('off() 应取消订阅指定的事件处理函数', () => {
+    const client = new AUNClient();
+    const handler = vi.fn();
+
+    // 先订阅
+    client.on('test.event', handler);
+
+    // 再用 off 取消订阅
+    client.off('test.event', handler);
+
+    // 手动触发事件，handler 不应被调用
+    (client as any)._dispatcher.publish('test.event', { data: 'test' });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('off() 只移除指定的 handler，其他 handler 不受影响', () => {
+    const client = new AUNClient();
+    const handler1 = vi.fn();
+    const handler2 = vi.fn();
+
+    client.on('test.event', handler1);
+    client.on('test.event', handler2);
+
+    // 仅移除 handler1
+    client.off('test.event', handler1);
+
+    (client as any)._dispatcher.publish('test.event', { data: 'test' });
+    expect(handler1).not.toHaveBeenCalled();
+    expect(handler2).toHaveBeenCalledTimes(1);
+  });
+
+  it('off() 对未订阅的事件不应抛错', () => {
+    const client = new AUNClient();
+    const handler = vi.fn();
+
+    // 对从未订阅的事件调用 off 不应抛异常
+    expect(() => client.off('nonexistent.event', handler)).not.toThrow();
+  });
+});

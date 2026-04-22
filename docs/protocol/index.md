@@ -107,7 +107,7 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 `group.*` 命名空间完整协议规范。群组生命周期（create/suspend/close）、成员管理（add/kick/set_role/transfer_owner）、群消息（send/pull/ack）、入群申请与邀请码、群规则与公告、资源共享（put/get/request_add/review_add）、在线状态（go_online/heartbeat）、事件推送（group.created/changed/message_created）、错误码（-33001~-33009）。Group Service 作为独立 AID 持有者运行。
 
 ### 11-Storage-子协议
-`storage.*` 命名空间完整协议规范。控制面与数据面分离（小对象内联 RPC，大对象预签名 URL HTTP 传输）、per-AID 隔离、对象键路径化、版本化 CAS 并发控制。方法：put_object / get_object / delete_object / list_objects / batch_delete / create_upload_session / create_download_ticket。
+`storage.*` 命名空间完整协议规范。控制面与数据面分离（小对象内联 RPC，大对象预签名 URL HTTP 传输）、per-AID 隔离、对象键路径化、版本化 CAS 并发控制。方法：put_object / get_object / delete_object / list_objects / create_upload_session / create_download_ticket。
 
 ### 12-Stream-子协议
 `stream.*` 命名空间完整协议规范。控制面通过 JSON-RPC（stream.create / close / get_info / list_active）管理流生命周期，数据面通过独立端口的 WebSocket（推流）和 HTTP SSE（拉流）传输。当前实现以 push/pull URL 中的 token 作为能力凭证，拉流可跨域使用，并支持 Late Joiner 回放、Last-Event-ID 断线续拉、空闲/离线超时自动关闭。

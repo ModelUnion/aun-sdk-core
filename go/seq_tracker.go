@@ -17,6 +17,9 @@ var backoffIntervals = []float64{1, 3, 10, 30, 60} // 秒
 // resolved 只应由"完整补齐"或服务端明确 tombstone 驱动。
 const maxProbeCount = 5
 
+// receivedSeqs 内存上限：超过此值时强制跳过空洞推进 contiguousSeq
+const receivedSeqsLimit = 5000
+
 type gapProbe struct {
 	gapStart    int
 	gapEnd      int
@@ -131,6 +134,16 @@ func (st *SeqTracker) onMessageSeqLocked(ns string, seq int) bool {
 		t.maxSeenSeq = seq
 	}
 
+	// 内存保护：receivedSeqs 超过上限时，强制跳过空洞推进 contiguousSeq
+	if len(t.receivedSeqs) > receivedSeqsLimit {
+		st.forceCompact(t)
+	}
+
+	// forceCompact 可能已将 contiguousSeq 推进到 >= seq，无需再处理
+	if seq <= t.contiguousSeq {
+		return false
+	}
+
 	if seq == t.contiguousSeq+1 {
 		t.contiguousSeq = seq
 		delete(t.receivedSeqs, seq) // 已纳入连续前缀
@@ -194,6 +207,9 @@ func (st *SeqTracker) OnPullResult(ns string, messages []map[string]any) {
 		probe.lastProbeAt = now
 		probe.probeCount++
 
+		// 逐 seq 遍历检查 gap 是否完全补齐。
+		// 时间复杂度 O(gapEnd - gapStart)，但 pull 操作是低频的（仅在空洞检测后触发），
+		// 且典型 gap 范围较小，因此性能影响可忽略。
 		allCovered := true
 		anyHit := false
 		for s := probe.gapStart; s <= probe.gapEnd; s++ {
@@ -236,6 +252,37 @@ func (st *SeqTracker) tryAdvance(t *trackerState) {
 	for t.receivedSeqs[t.contiguousSeq+1] {
 		t.contiguousSeq++
 		delete(t.receivedSeqs, t.contiguousSeq)
+	}
+}
+
+// forceCompact 内存保护：receivedSeqs 超限时强制跳过空洞推进 contiguousSeq。
+// 找到 receivedSeqs 中的最小 seq，将 contiguousSeq 推进到该值前一位，
+// 然后正常推进连续前缀，最后清理被跳过区间内的 pendingGaps。
+func (st *SeqTracker) forceCompact(t *trackerState) {
+	if len(t.receivedSeqs) == 0 {
+		return
+	}
+	// 找到 receivedSeqs 中最小的 seq
+	minSeq := 0
+	first := true
+	for s := range t.receivedSeqs {
+		if first || s < minSeq {
+			minSeq = s
+			first = false
+		}
+	}
+	// 将 contiguousSeq 推进到 minSeq-1
+	t.contiguousSeq = minSeq - 1
+	// 正常推进连续前缀
+	for t.receivedSeqs[t.contiguousSeq+1] {
+		t.contiguousSeq++
+		delete(t.receivedSeqs, t.contiguousSeq)
+	}
+	// 清理被跳过区间内的 pendingGaps（gapEnd <= 最终 contiguousSeq）
+	for key, probe := range t.pendingGaps {
+		if probe.gapEnd <= t.contiguousSeq {
+			delete(t.pendingGaps, key)
+		}
 	}
 }
 
@@ -325,6 +372,14 @@ func (st *SeqTracker) RestoreState(state map[string]int) {
 			}
 		}
 	}
+}
+
+// RemoveNamespace 删除指定命名空间的全部跟踪状态
+// GO-006: 群组解散时调用，清理 group: 和 group_event: 命名空间
+func (st *SeqTracker) RemoveNamespace(ns string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delete(st.trackers, ns)
 }
 
 func intToStr(n int) string {

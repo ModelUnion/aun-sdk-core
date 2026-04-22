@@ -160,6 +160,24 @@ class AIDDatabase:
     _MAX_CONNECT_RETRIES = 3
     _RETRY_DELAY_S = 0.1
 
+    # 纯 SQLite3 文件头的前 16 字节
+    _SQLITE3_HEADER = b"SQLite format 3\x00"
+
+    def _detect_plain_sqlite(self) -> bool:
+        """检测数据库文件是否为未加密的纯 SQLite3 格式。
+
+        纯 SQLite3 文件以 'SQLite format 3\\0' 开头（16字节），
+        SQLCipher 加密文件的头部是随机字节。
+        """
+        if not self._db_path.exists():
+            return False
+        try:
+            with open(self._db_path, "rb") as f:
+                header = f.read(16)
+            return header == self._SQLITE3_HEADER
+        except OSError:
+            return False
+
     @staticmethod
     def _is_recoverable_db_error(err_msg: str) -> bool:
         # S3: 不能把 "hmac check failed" 视为可恢复 — 这是密码错误的明确信号，
@@ -175,6 +193,25 @@ class AIDDatabase:
                 "disk i/o error",
             )
         )
+
+    def _backup_broken_files(self, *, tag: str = "corrupt") -> bool:
+        """将损坏的数据库文件重命名为 .{tag}_{timestamp}.bak，保留数据以便后续恢复。
+        返回 True 表示所有文件备份成功（或无文件需要备份），False 表示有备份失败。"""
+        import shutil
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        all_ok = True
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            p = Path(str(self._db_path) + suffix)
+            if not p.exists():
+                continue
+            bak = p.with_suffix(f"{p.suffix}.{tag}_{ts}.bak")
+            try:
+                shutil.copy2(str(p), str(bak))
+                _log.warning("已备份数据库文件: %s → %s", p, bak)
+            except OSError as exc:
+                _log.warning("备份数据库文件失败: %s — %s", p, exc)
+                all_ok = False
+        return all_ok
 
     def _cleanup_broken_files(self) -> None:
         last_err: OSError | None = None
@@ -205,6 +242,17 @@ class AIDDatabase:
         if self._conn is not None:
             return self._conn
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # ── 预检：检测纯 SQLite3 文件（加密不匹配）──
+        if self._detect_plain_sqlite():
+            _log.warning(
+                "检测到数据库文件为未加密的纯 SQLite3 格式（文件头匹配 'SQLite format 3'），"
+                "但当前配置要求 SQLCipher 加密。备份未加密文件后将重建加密数据库: %s",
+                self._db_path,
+            )
+            self._backup_broken_files(tag="unencrypted")
+            self._cleanup_broken_files()
+
         last_exc: Exception | None = None
         for attempt in range(1, self._MAX_CONNECT_RETRIES + 1):
             conn: Any | None = None
@@ -224,11 +272,15 @@ class AIDDatabase:
                         _log.debug("关闭失败连接时出错: %s", close_exc)
                 if is_malformed and attempt < self._MAX_CONNECT_RETRIES:
                     _log.warning(
-                        "数据库文件损坏 (attempt %d/%d)，删除并重建: %s — %s",
+                        "数据库文件损坏 (attempt %d/%d)，备份后重建: %s — %s",
                         attempt, self._MAX_CONNECT_RETRIES, self._db_path, exc,
                     )
                     try:
-                        self._cleanup_broken_files()
+                        backup_ok = self._backup_broken_files()
+                        if backup_ok:
+                            self._cleanup_broken_files()
+                        else:
+                            _log.warning("备份不完整，跳过删除以防数据丢失: %s", self._db_path)
                     except OSError as rm_err:
                         _log.warning("删除损坏数据库文件失败: %s", rm_err)
                     continue
@@ -324,9 +376,13 @@ class AIDDatabase:
                             _log.debug("关闭失败连接时出错: %s", close_exc)
                     self._conn = None  # 清除连接，下次 _get_conn 重建
                     try:
-                        self._cleanup_broken_files()
+                        backup_ok = self._backup_broken_files()
+                        if backup_ok:
+                            self._cleanup_broken_files()
+                        else:
+                            _log.warning("备份不完整，跳过删除以防数据丢失: %s", self._db_path)
                     except OSError as rm_err:
-                        _log.warning("删除损坏数据库文件失败: %s", rm_err)
+                        _log.warning("备份/删除损坏数据库文件失败: %s", rm_err)
                     continue
                 raise
 

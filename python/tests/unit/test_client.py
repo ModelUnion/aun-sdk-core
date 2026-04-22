@@ -4,7 +4,7 @@ import time
 import pytest
 
 from aun_core import AUNClient
-from aun_core.errors import AUNError, NotFoundError, StateError, ValidationError
+from aun_core.errors import AUNError, ClientSignatureError, NotFoundError, StateError, ValidationError
 import aun_core.namespaces.auth_namespace as auth_namespace_module
 
 
@@ -1250,11 +1250,11 @@ def test_seq_tracker_same_context_refresh_keeps_in_memory_state(tmp_path):
     client._slot_id = "slot-a"
     client._refresh_seq_tracking_context()
     client._seq_tracker.restore_state({"p2p:demo": 5})
-    client._gap_fill_done.add("p2p:5")
+    client._gap_fill_done["p2p:5"] = 0
     client._refresh_seq_tracking_context()
 
     assert client._seq_tracker.export_state() == {"p2p:demo": 5}
-    assert client._gap_fill_done == {"p2p:5"}
+    assert "p2p:5" in client._gap_fill_done
 
 
 def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path):
@@ -1272,7 +1272,7 @@ def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path)
     client._aid = aid
     client._slot_id = "slot-a"
     client._seq_tracker.restore_state({"p2p:demo": 5})
-    client._gap_fill_done.add("p2p:5")
+    client._gap_fill_done["p2p:5"] = 0
     client._refresh_seq_tracking_context()
     client._save_seq_tracker_state()
 
@@ -1281,7 +1281,7 @@ def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path)
     client._restore_seq_tracker_state()
 
     assert client._seq_tracker.export_state() == {}
-    assert client._gap_fill_done == set()
+    assert client._gap_fill_done == {}
 
 
 # ── 重启全量拉取问题优化相关测试 ─────────────────────────────
@@ -1533,3 +1533,367 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
     # 即使解密返回 None，也应发送 message.ack
     assert len(ack_calls) == 1, f"期望 1 次 ack，实际 {len(ack_calls)} 次: {ack_calls}"
     assert ack_calls[0]["params"]["seq"] == 1
+
+
+# ─── ISSUE-SDK-PY-014: replay guard RPC 异常不应丢弃消息 ───
+
+
+@pytest.mark.asyncio
+async def test_check_replay_guard_rpc_exception_returns_true():
+    """当 message.e2ee.record_replay_guard RPC 调用抛异常时，
+    应返回 True（允许消息通过），而非 False（丢弃消息）。
+    RPC 异常（如网络问题）不代表消息是重复的。"""
+    client = object.__new__(AUNClient)
+    client._state = "connected"
+
+    class _TransportRaisesOnReplayGuard:
+        async def call(self, method, params):
+            if method == "message.e2ee.record_replay_guard":
+                raise ConnectionError("网络不可达")
+            return {}
+
+    client._transport = _TransportRaisesOnReplayGuard()
+
+    message = {
+        "timestamp": 1000,
+        "payload": {"ephemeral_public_key": "test-key-abc"},
+    }
+
+    result = await client._check_replay_guard(
+        message_id="msg-001",
+        sender_aid="bob.aid.com",
+        encryption_mode="e2ee",
+        message=message,
+    )
+
+    # RPC 异常时应允许消息通过（返回 True），而不是拒绝
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_check_replay_guard_rpc_success_not_duplicate():
+    """RPC 成功且非重复时，应返回 True。"""
+    client = object.__new__(AUNClient)
+    client._state = "connected"
+
+    class _TransportOk:
+        async def call(self, method, params):
+            return {"duplicate": False}
+
+    client._transport = _TransportOk()
+
+    result = await client._check_replay_guard(
+        message_id="msg-002",
+        sender_aid="bob.aid.com",
+        encryption_mode="e2ee",
+        message={"timestamp": 2000, "payload": {}},
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_check_replay_guard_rpc_success_duplicate():
+    """RPC 成功且检测到重复时，应返回 False。"""
+    client = object.__new__(AUNClient)
+    client._state = "connected"
+
+    class _TransportDuplicate:
+        async def call(self, method, params):
+            return {"duplicate": True}
+
+    client._transport = _TransportDuplicate()
+
+    result = await client._check_replay_guard(
+        message_id="msg-003",
+        sender_aid="bob.aid.com",
+        encryption_mode="e2ee",
+        message={"timestamp": 3000, "payload": {}},
+    )
+    assert result is False
+
+
+# ─── ISSUE-SDK-PY-021: close_code 1000 不应视为 server_initiated ───
+
+
+def _make_disconnect_client():
+    """构造用于 _handle_transport_disconnect 测试的 client 和参数捕获列表。"""
+    client = object.__new__(AUNClient)
+    client._closing = False
+    client._state = "connected"
+    client._reconnect_task = None
+    client._server_kicked = False
+    client._session_options = {
+        "auto_reconnect": True,
+        "retry": {"initial_delay": 1.0, "max_delay": 64.0},
+    }
+
+    captured_server_initiated = []
+
+    class _FakeDispatcher:
+        async def publish(self, event, data):
+            pass
+
+    client._dispatcher = _FakeDispatcher()
+
+    async def fake_stop_background_tasks():
+        pass
+
+    client._stop_background_tasks = fake_stop_background_tasks
+
+    async def fake_reconnect_loop(server_initiated=False):
+        captured_server_initiated.append(server_initiated)
+
+    client._reconnect_loop = fake_reconnect_loop
+
+    return client, captured_server_initiated
+
+
+@pytest.mark.asyncio
+async def test_close_code_1000_not_server_initiated():
+    """close_code=1000 是正常关闭（客户端主动），不应被标记为 server_initiated。
+    server_initiated=True 会导致重连延迟从 16s 起跳。"""
+    client, captured = _make_disconnect_client()
+
+    await client._handle_transport_disconnect(error=None, close_code=1000)
+    # 让 create_task 调度的协程得以执行
+    await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    assert captured[0] is False, \
+        "close_code=1000（正常关闭）不应被标记为 server_initiated"
+
+
+@pytest.mark.asyncio
+async def test_close_code_1001_is_server_initiated():
+    """close_code=1001（going away）应被视为 server_initiated。"""
+    client, captured = _make_disconnect_client()
+
+    await client._handle_transport_disconnect(error=None, close_code=1001)
+    await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    assert captured[0] is True, \
+        "close_code=1001（going away）应被标记为 server_initiated"
+
+
+@pytest.mark.asyncio
+async def test_close_code_1006_not_server_initiated():
+    """close_code=1006（异常断开）不应被视为 server_initiated。"""
+    client, captured = _make_disconnect_client()
+
+    await client._handle_transport_disconnect(error=None, close_code=1006)
+    await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    assert captured[0] is False, \
+        "close_code=1006（异常断开）不应被标记为 server_initiated"
+
+
+@pytest.mark.asyncio
+async def test_close_code_none_not_server_initiated():
+    """close_code=None（无 close frame）不应被视为 server_initiated。"""
+    client, captured = _make_disconnect_client()
+
+    await client._handle_transport_disconnect(error=None, close_code=None)
+    await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    assert captured[0] is False, \
+        "close_code=None 不应被标记为 server_initiated"
+
+
+def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch):
+    """PY-017: _fetch_peer_cert 应设置合理的 HTTP 超时，而非依赖 aiohttp 默认 300s。"""
+    import aiohttp
+
+    captured_timeouts = []
+    original_init = aiohttp.ClientSession.__init__
+
+    def patched_init(self, *args, **kwargs):
+        captured_timeouts.append(kwargs.get("timeout"))
+        original_init(self, *args, **kwargs)
+
+    client = AUNClient()
+    client._gateway_url = "https://gateway.example.com"
+
+    # 拦截 aiohttp.ClientSession.__init__ 以捕获 timeout 参数
+    monkeypatch.setattr(aiohttp.ClientSession, "__init__", patched_init)
+
+    # 模拟 HTTP 响应，避免真实网络请求
+    cert_pem, cert_fp = _make_test_cert("test.aid.com")
+
+    class FakeResponse:
+        status = 200
+        async def text(self):
+            return cert_pem
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        def raise_for_status(self):
+            pass
+
+    class FakeContextManager:
+        """模拟 aiohttp session.get() 返回的异步上下文管理器。"""
+        async def __aenter__(self):
+            return FakeResponse()
+        async def __aexit__(self, *a):
+            pass
+
+    def fake_get(self, url, **kwargs):
+        return FakeContextManager()
+
+    monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get)
+
+    # 跳过 PKI 验证
+    async def fake_verify(gateway_url, cert_obj, aid):
+        pass
+    monkeypatch.setattr(client._auth, "verify_peer_certificate", fake_verify)
+
+    asyncio.run(client._fetch_peer_cert("test.aid.com"))
+
+    assert len(captured_timeouts) >= 1, "应至少创建一个 ClientSession"
+    timeout_obj = captured_timeouts[0]
+    assert timeout_obj is not None, (
+        "PY-017: _fetch_peer_cert 必须显式设置 HTTP 超时，"
+        "不能依赖 aiohttp 默认 300s"
+    )
+    # 超时不应超过 30s（合理范围）
+    assert timeout_obj.total is not None and timeout_obj.total <= 30, (
+        f"PY-017: HTTP 超时应不超过 30s，实际为 {timeout_obj.total}s"
+    )
+
+
+# ── PY-003: off() 事件注销方法 ────────────────────────────
+
+
+class TestOffMethod:
+    """PY-003: AUNClient 必须提供 off() 方法注销事件处理器。"""
+
+    def test_off_removes_handler(self):
+        """off() 后 handler 不再被调用。"""
+        client = AUNClient()
+        called = []
+
+        def handler(data):
+            called.append(data)
+
+        client.on("test.event", handler)
+        client.off("test.event", handler)
+        asyncio.run(client._dispatcher.publish("test.event", {"x": 1}))
+        assert called == [], "off() 后 handler 不应被调用"
+
+    def test_off_only_removes_specific_handler(self):
+        """off() 只移除指定的 handler，不影响其他 handler。"""
+        client = AUNClient()
+        called_a = []
+        called_b = []
+
+        def handler_a(data):
+            called_a.append(data)
+
+        def handler_b(data):
+            called_b.append(data)
+
+        client.on("test.event", handler_a)
+        client.on("test.event", handler_b)
+        client.off("test.event", handler_a)
+        asyncio.run(client._dispatcher.publish("test.event", {"x": 1}))
+        assert called_a == [], "handler_a 应被移除"
+        assert len(called_b) == 1, "handler_b 不应受影响"
+
+    def test_off_nonexistent_handler_no_error(self):
+        """移除未注册的 handler 不应报错。"""
+        client = AUNClient()
+
+        def handler(data):
+            pass
+
+        # 不应抛出异常
+        client.off("test.event", handler)
+
+    def test_off_returns_none(self):
+        """off() 返回 None（无返回值）。"""
+        client = AUNClient()
+
+        def handler(data):
+            pass
+
+        client.on("test.event", handler)
+        result = client.off("test.event", handler)
+        assert result is None
+
+
+# ── PY-012: 签名失败抛出 ClientSignatureError ──────────────
+
+
+class TestSignatureFailureRaises:
+    """PY-012: _sign_client_operation 签名失败时必须抛出
+    ClientSignatureError 而非静默降级或抛出其他异常类型。"""
+
+    def test_sign_failure_raises_client_signature_error(self, tmp_path):
+        """私钥损坏时签名应抛出 ClientSignatureError。"""
+        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client._identity = {
+            "aid": "test.example.com",
+            "private_key_pem": "INVALID_KEY_DATA",
+            "cert": "INVALID_CERT_DATA",
+        }
+        params = {"group_id": "g1", "content": "hello"}
+        with pytest.raises(ClientSignatureError):
+            client._sign_client_operation("group.send", params)
+
+    def test_sign_failure_does_not_silently_continue(self, tmp_path):
+        """签名失败后 params 中不应有 client_signature 字段。"""
+        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client._identity = {
+            "aid": "test.example.com",
+            "private_key_pem": "BROKEN_PEM",
+        }
+        params = {"group_id": "g1"}
+        try:
+            client._sign_client_operation("group.send", params)
+        except Exception:
+            pass
+        assert "client_signature" not in params, (
+            "PY-012: 签名失败时 params 不应包含 client_signature"
+        )
+
+    def test_sign_failure_preserves_original_cause(self, tmp_path):
+        """ClientSignatureError 应保留原始异常信息（__cause__）。"""
+        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client._identity = {
+            "aid": "test.example.com",
+            "private_key_pem": "BAD_KEY",
+        }
+        params = {}
+        with pytest.raises(ClientSignatureError) as exc_info:
+            client._sign_client_operation("group.send", params)
+        assert exc_info.value.__cause__ is not None, (
+            "PY-012: ClientSignatureError 应通过 'from exc' 保留原始异常链"
+        )
+
+
+# ── PY-001: list_identities() 集成测试 ────────────────────
+
+
+class TestClientListIdentities:
+    """PY-001: AUNClient.list_identities() 必须能正常工作。"""
+
+    def test_list_identities_returns_list(self, tmp_path):
+        """list_identities() 返回列表类型。"""
+        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        result = client.list_identities()
+        assert isinstance(result, list)
+
+    def test_list_identities_with_saved_identity(self, tmp_path):
+        """保存身份后 list_identities() 能返回它。"""
+        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client._keystore.save_key_pair("test.agentid.pub", {
+            "private_key_pem": "KEY",
+            "public_key_der_b64": "PUB",
+            "curve": "P-256",
+        })
+        result = client.list_identities()
+        aids = [item["aid"] for item in result]
+        assert "test.agentid.pub" in aids

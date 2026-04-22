@@ -77,6 +77,8 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.resources.direct_add",
 		"group.resources.approve_request",
 		"group.resources.reject_request",
+		"group.request_join",
+		"group.use_invite_code",
 	}
 
 	if len(signedMethods) != len(expected) {

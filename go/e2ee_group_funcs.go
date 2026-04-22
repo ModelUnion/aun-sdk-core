@@ -242,9 +242,16 @@ func DecryptGroupMessage(
 		return nil
 	}
 
-	nonce, _ := base64.StdEncoding.DecodeString(payload["nonce"].(string))
-	ciphertext, _ := base64.StdEncoding.DecodeString(payload["ciphertext"].(string))
-	tag, _ := base64.StdEncoding.DecodeString(payload["tag"].(string))
+	// GO-003: 安全类型断言，避免无效 payload 字段导致 panic
+	nonceStr, _ := payload["nonce"].(string)
+	ciphertextStr, _ := payload["ciphertext"].(string)
+	tagStr, _ := payload["tag"].(string)
+	if nonceStr == "" || ciphertextStr == "" || tagStr == "" {
+		return nil
+	}
+	nonce, _ := base64.StdEncoding.DecodeString(nonceStr)
+	ciphertext, _ := base64.StdEncoding.DecodeString(ciphertextStr)
+	tag, _ := base64.StdEncoding.DecodeString(tagStr)
 
 	var aadBytes []byte
 	if aad != nil {

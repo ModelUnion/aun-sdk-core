@@ -63,7 +63,6 @@
 | [group.ack](#groupack) | 确认已读（旧接口，等同 ack_messages） |
 | [group.ack_messages](#groupack_messages) | 确认消息游标 |
 | [group.ack_events](#groupack_events) | 确认事件游标 |
-| [group.get_cursor](#groupget_cursor) | 获取双游标状态 |
 
 ### 多设备管理
 
@@ -78,7 +77,6 @@
 |------|------|
 | [group.get_admins](#groupget_admins) | 获取管理员列表 |
 | [group.get_master](#groupget_master) | 获取群主信息 |
-| [group.set_fixed_agents](#groupset_fixed_agents) | 设置固定值班 Agent |
 | [group.refresh_member_types](#grouprefresh_member_types) | 刷新成员类型统计 |
 
 ### 统计与指标
@@ -94,13 +92,6 @@
 |------|------|
 | [group.e2ee.rotate_epoch](#groupe2eerotate_epoch) | 轮换 E2EE 纪元 |
 | [group.e2ee.get_epoch](#groupe2eeget_epoch) | 获取当前 E2EE 纪元 |
-
-### 跨域
-
-| 方法 | 说明 |
-|------|------|
-| [group.relay_event](#grouprelay_event) | 跨域事件中继 |
-| [group.get_duty_access](#groupget_duty_access) | 获取值班日志访问凭证 |
 
 ### 公告与规则
 
@@ -120,7 +111,9 @@
 | [group.resources.put](#groupresourcesput) | 分享资源 |
 | [group.resources.get](#groupresourcesget) | 查看资源 |
 | [group.resources.list](#groupresourceslist) | 列出资源 |
+| [group.resources.update](#groupresourcesupdate) | 更新资源元数据 |
 | [group.resources.get_access](#groupresourcesget_access) | 获取下载票据 |
+| [group.resources.resolve_access_ticket](#groupresourcesresolve_access_ticket) | 解析访问票据 |
 | [group.resources.delete](#groupresourcesdelete) | 删除资源 |
 | [group.resources.request_add](#groupresourcesrequest_add) | 申请分享 |
 | [group.resources.direct_add](#groupresourcesdirect_add) | 直接添加 |
@@ -132,46 +125,7 @@
 
 | 方法 | 说明 |
 |------|------|
-| [group.register_online](#groupregister_online) | 注册上线 |
-| [group.unregister_online](#groupunregister_online) | 注销下线 |
-| [group.heartbeat](#groupheartbeat) | 刷新心跳 |
 | [group.get_online_members](#groupget_online_members) | 在线成员 |
-
-### 广播锁与权限
-
-| 方法 | 说明 |
-|------|------|
-| [group.acquire_broadcast_lock](#groupacquire_broadcast_lock) | 获取广播锁 |
-| [group.release_broadcast_lock](#grouprelease_broadcast_lock) | 释放广播锁 |
-| [group.check_broadcast_permission](#groupcheck_broadcast_permission) | 检查广播权限 |
-
-### 成员归属索引
-
-| 方法 | 说明 |
-|------|------|
-| [group.register_membership](#groupregister_membership) | 注册归属索引 |
-| [group.unregister_membership](#groupunregister_membership) | 注销归属索引 |
-| [group.list_membership](#grouplist_membership) | 列出归属索引 |
-
-### 值班模式
-
-| 方法 | 说明 |
-|------|------|
-| [group.update_duty_config](#groupupdate_duty_config) | 更新值班配置 |
-| [group.get_duty_status](#groupget_duty_status) | 获取值班状态 |
-| [group.transfer_duty](#grouptransfer_duty) | 手动交班 |
-
-### 同步与调试
-
-| 方法 | 说明 |
-|------|------|
-| [group.get_sync_status](#groupget_sync_status) | 获取同步状态 |
-| [group.get_sync_log](#groupget_sync_log) | 获取同步日志 |
-| [group.get_dispatch_log](#groupget_dispatch_log) | 获取分发日志 |
-| [group.get_duty_topic_log](#groupget_duty_topic_log) | 获取值班主题日志 |
-| [group.get_checksum](#groupget_checksum) | 获取校验和 |
-| [group.get_message_checksum](#groupget_message_checksum) | 获取消息校验和 |
-| [group.get_file](#groupget_file) | 导出对象文件 |
 
 ---
 
@@ -187,7 +141,7 @@
 |------|------|------|------|
 | `name` | string | 是 | 群组名称 |
 | `group_id` | string | 否 | 自定义群 ID（不提供则自动生成） |
-| `visibility` | string | 否 | `"public"` / `"invite_only"` / `"private"`，默认由配置决定 |
+| `visibility` | string | 否 | `"public"` / `"private"`，默认由配置决定 |
 | `description` | string | 否 | 群组描述 |
 | `metadata` | object | 否 | 自定义元数据 |
 | `avatar_ref` | string | 否 | 头像存储引用 |
@@ -257,7 +211,7 @@
 
 ### group.list_my
 
-列出当前用户加入的群组。
+列出当前用户加入的群组。`group.list` 是此方法的别名，两者等价。
 
 **参数**：
 
@@ -891,7 +845,7 @@
 | `group_id` | string | 群组 ID |
 | `message` | object | 消息对象（含 seq、message_id、sender_aid 等） |
 | `event` | object | 关联的群事件对象 |
-| `dispatch` | object | 分发策略（`{"mode": "broadcast"/"duty", "reason": ...}`） |
+| `dispatch` | object | 分发策略：`mode` 为 `"broadcast"`（广播全员）或 `"duty"`（值班分发）；`reason` 说明原因（如 `"duty_disabled"` / `"active_duty"` / `"no_duty_candidate"` 等） |
 | `duty_state` | object | 可选，值班模式下的当前状态 |
 | `message_dispatch` | object | 运行时分发结果（广播目标等结构化信息） |
 ```
@@ -1000,7 +954,7 @@
 
 更新群规则。需要 **admin 及以上**权限。
 
-**参数**：`group_id` (string) + 规则字段（broadcast_mode, max_members, allow_member_invite 等，均可选）
+**参数**：`group_id` (string) + 规则字段（max_members, allow_member_invite 等，均可选）
 
 ### group.get_join_requirements
 
@@ -1246,67 +1200,6 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
 
 ## 在线状态
 
-### group.register_online
-
-注册在线状态。**不需要 `group_id` 参数**，基于当前认证 AID 注册。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `session_id` | string | 否 | 会话 ID（从 params 或 _auth 中取） |
-
-**响应**：
-
-```json
-{
-    "aid": "alice.agentid.pub",
-    "online": true,
-    "member": {
-        "aid": "alice.agentid.pub",
-        "session_id": "sess_123",
-        "last_active_at": 1234567890,
-        "expire_at": 1234571490
-    }
-}
-```
-
-### group.unregister_online
-
-注销在线状态。**不需要 `group_id` 参数**。
-
-**参数**：无
-
-**响应**：
-
-```json
-{
-    "aid": "alice.agentid.pub",
-    "online": false,
-    "removed": true
-}
-```
-
-### group.heartbeat
-
-刷新在线心跳。**不需要 `group_id` 参数**。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `session_id` | string | 否 | 会话 ID |
-
-**响应**：
-
-```json
-{
-    "aid": "alice.agentid.pub",
-    "online": true,
-    "member": { ... }
-}
-```
-
 ### group.get_online_members
 
 获取当前在线成员列表。
@@ -1335,101 +1228,6 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
     ]
 }
 ```
-
----
-
-## 广播锁与权限
-
-### group.acquire_broadcast_lock
-
-获取群广播锁。用于独占广播权限。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "grp_abc",
-    "lock": {
-        "holder_aid": "alice.agentid.pub",
-        "acquired_at": 1234567890,
-        "expires_at": 1234567920
-    }
-}
-```
-
-### group.release_broadcast_lock
-
-释放群广播锁。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：`{ "group_id": "grp_abc", "released": true }`
-
-### group.check_broadcast_permission
-
-检查当前 AID 是否有广播权限。
-
-**参数**：`group_id` (string, 必填)
-
-**响应**：`{ "group_id": "grp_abc", "allowed": true }`
-
----
-
-## 成员归属索引
-
-### group.register_membership
-
-注册成员归属索引（用于快速查询 AID 所属群组）。
-
-**参数**：`group_id` (必填), `aid` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "aid": "alice.agentid.pub", "registered": true }`
-
-### group.unregister_membership
-
-更新成员归属索引为离开/移除状态。
-
-**参数**：`group_id` (必填), `aid` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "aid": "alice.agentid.pub", "unregistered": true }`
-
-### group.list_membership
-
-列出 AID 的群归属索引。
-
-**参数**：`aid` (必填)
-
-**响应**：`{ "aid": "alice.agentid.pub", "items": [ ... ] }`
-
----
-
-## 值班模式
-
-### group.update_duty_config
-
-更新值班配置。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), 其他配置项（可选）
-
-**响应**：`{ "group_id": "grp_abc", "config": { ... } }`
-
-### group.get_duty_status
-
-获取当前值班状态。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "current_duty_aid": "alice.agentid.pub", ... }`
-
-### group.transfer_duty
-
-手动交班。需要 admin 及以上权限。
-
-**参数**：`group_id` (必填), `to_aid` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "from_aid": "alice.agentid.pub", "to_aid": "bob.agentid.pub" }`
 
 ---
 
@@ -1499,36 +1297,6 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
 | `event_seq` | integer | 是 | 确认到的事件序号 |
 
 **响应**：`{ "cursor": 456 }`
-
-### group.get_cursor
-
-查询指定设备的双游标状态。
-
-**参数**：`group_id` (必填), `device_id` (必填)
-
-**响应**：
-
-```json
-{
-    "device_id": "device-123",
-    "device_name": "My Phone",
-    "device_type": "mobile",
-    "msg_cursor": {
-        "current_seq": 100,
-        "join_seq": 0,
-        "latest_seq": 150,
-        "unread_count": 50
-    },
-    "event_cursor": {
-        "current_seq": 200,
-        "join_seq": 0,
-        "latest_seq": 250,
-        "unread_count": 50
-    }
-}
-```
-
-> 设备游标不存在时自动创建。
 
 ### group.list_devices
 
@@ -1673,36 +1441,6 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
 }
 ```
 
-### group.set_fixed_agents
-
-设置固定值班 Agent 列表。需要 **admin 及以上**权限。所有指定 AID 必须是群成员且 `member_type=ai`。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `agent_aids` | array | 是 | Agent AID 列表 |
-
-**响应**：`{ "group_id": "grp_abc", "config": { "mode": "fixed", "fixed_agents": [...] } }`
-
-### group.get_duty_access
-
-为 HTTP duty_logs 端点生成访问凭证。
-
-**参数**：`group_id` (必填)
-
-**响应**：
-
-```json
-{
-    "group_id": "grp_abc",
-    "access_ticket": "eyJ...",
-    "issued_at": 1234567890,
-    "expire_at": 1234571490
-}
-```
-
 ---
 
 ## E2EE
@@ -1733,78 +1471,6 @@ CAS 轮换群组 E2EE Epoch。需要 **admin 及以上**权限。
 **响应**：`{ "group_id": "grp_abc", "epoch": 3 }`
 
 ---
-
-## 跨域
-
-### group.relay_event
-
-跨域事件中继（内部接口，仅供远端 group 模块调用）。
-
-**参数**：`event_name` (string), `event_data` (object)
-
-**响应**：`{ "status": "relayed" }`
-
-> 当前仅允许中继 `group.message_created` 事件。
-
----
-
-## 同步与调试
-
-### group.get_sync_status
-
-获取群同步状态。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "sync_status": { ... } }`
-
-### group.get_sync_log
-
-获取群同步日志。
-
-**参数**：`group_id` (必填), `limit` (可选)
-
-**响应**：`{ "group_id": "grp_abc", "logs": [ ... ] }`
-
-### group.get_dispatch_log
-
-获取值班分发日志。
-
-**参数**：`group_id` (必填), `limit` (可选)
-
-**响应**：`{ "group_id": "grp_abc", "logs": [ ... ] }`
-
-### group.get_duty_topic_log
-
-获取值班主题日志。
-
-**参数**：`group_id` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "logs": [ ... ] }`
-
-### group.get_checksum
-
-获取逻辑对象校验和。
-
-**参数**：`group_id` (必填), `object_type` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "checksum": "sha256:..." }`
-
-### group.get_message_checksum
-
-获取消息导出校验和。
-
-**参数**：`group_id` (必填), `from_seq` / `to_seq` (可选)
-
-**响应**：`{ "group_id": "grp_abc", "checksum": "sha256:...", "message_count": 100 }`
-
-### group.get_file
-
-导出逻辑对象为 JSON 文件。
-
-**参数**：`group_id` (必填), `object_type` (必填)
-
-**响应**：`{ "group_id": "grp_abc", "file_url": "...", "expires_at": 1234567890 }`
 
 ---
 

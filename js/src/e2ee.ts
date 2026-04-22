@@ -355,13 +355,23 @@ async function importSpkiDerB64Ecdsa(derB64: string): Promise<CryptoKey> {
 }
 
 /** 导入 PEM 私钥为 ECDSA CryptoKey */
+/**
+ * ECDSA 私钥导入缓存：避免每次签名都重复调用 crypto.subtle.importKey。
+ * 缓存键为 PEM 字符串本身，identity 变更时新 PEM 自然不命中旧缓存。
+ */
+const _ecdsaKeyCache = new Map<string, CryptoKey>();
+
 async function importPrivateKeyEcdsa(pem: string): Promise<CryptoKey> {
+  const cached = _ecdsaKeyCache.get(pem);
+  if (cached) return cached;
   const pkcs8 = pemToArrayBuffer(pem);
-  return crypto.subtle.importKey(
+  const key = await crypto.subtle.importKey(
     'pkcs8', pkcs8,
     { name: 'ECDSA', namedCurve: 'P-256' },
     true, ['sign'],
   );
+  _ecdsaKeyCache.set(pem, key);
+  return key;
 }
 
 /** 导入 PEM 私钥为 ECDH CryptoKey */

@@ -69,7 +69,7 @@ result = await client.call("stream.create", {
 
 | code | message | 原因 |
 |------|---------|------|
-| -32000 | 达到最大流数限制 (`达到最大流数限制 (N)`) | 活跃流数超过服务配置上限 |
+| -33402 | Stream limit exceeded | 活跃流数超过服务配置上限 |
 
 ---
 
@@ -99,14 +99,16 @@ await client.call("stream.close", {"stream_id": "4d5067f203cf42ba"})
 
 | code | message | 原因 |
 |------|---------|------|
-| -32000 | `流不存在: {stream_id}` | stream_id 无效或已被清理 |
-| -32000 | `只有流创建者可以关闭流` | 非创建者调用 |
+| -33405 | Stream invalid params | 缺少 stream_id |
+| -33403 | Stream permission denied | 非创建者调用 |
+
+> 流不存在时幂等返回 `{"success": true}`，不抛错误。
 
 ---
 
 ## stream.get_info
 
-获取流的状态和统计信息。
+获取流的状态和统计信息。仅流的创建者或 `target_aid` 可调用。
 
 ### 参数
 
@@ -143,7 +145,7 @@ info = await client.call("stream.get_info", {"stream_id": "4d5067f203cf42ba"})
 
 ## stream.list_active
 
-列出当前 AID 创建的所有活跃流。
+列出当前 AID 创建的所有活跃流。需要有效认证身份。
 
 ### 参数
 
@@ -257,3 +259,17 @@ async with aiohttp.ClientSession() as session:
 | 404 | 流不存在 |
 | 410 | 流已关闭 |
 | 429 | 拉流端数量已达上限 |
+
+---
+
+## 控制面错误码汇总
+
+| code | message | 说明 |
+|------|---------|------|
+| -33401 | Stream not found | stream_id 无效或流已被清理 |
+| -33402 | Stream limit exceeded | 活跃流数超过上限 |
+| -33403 | Stream permission denied | 非创建者执行受限操作 |
+| -33404 | Stream already closed | 流已关闭 |
+| -33405 | Stream invalid params | 参数无效（如缺少 stream_id） |
+| -33406 | Stream rate limited | 速率限制 |
+| -33407 | Stream internal error | 服务内部错误 |

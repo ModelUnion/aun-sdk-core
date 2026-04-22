@@ -156,6 +156,10 @@ export interface Message extends JsonObject {
   seq?: number;
   to?: string;
   from?: string;
+  /** 群组消息的群组 ID */
+  group_id?: string;
+  /** 群组消息的发送方 AID（服务端注入） */
+  sender_aid?: string;
   type?: string;
   payload?: JsonValue;
   encrypted?: boolean;

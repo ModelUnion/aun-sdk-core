@@ -39,12 +39,13 @@ export class AUNLogger {
     const now = new Date();
     const tsMs = now.getTime();
     const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
-    const line = `${tsMs}${this._aid} ${message}\n`;
+    // 时间戳与后续内容之间用 " | " 分隔，便于日志解析
+    const line = `${tsMs} | ${this._aid ? '[' + this._aid + '] ' : ''}${message}\n`;
     try {
       appendFileSync(logPath(dateStr), line, 'utf-8');
     } catch (exc) {
       // eslint-disable-next-line no-console
-      console.error('[AUNLogger] 写日志文件失败:', exc);
+      console.error('[AUNLogger] 写日志文件失败');
     }
   }
 }

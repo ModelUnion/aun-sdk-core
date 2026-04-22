@@ -128,6 +128,7 @@ docker exec -it kite-ts-tester bash
 - 固定身份目录唯一使用 `/data/aun/single-domain/persistent`
 - `kite-ts-tester` 挂载 `D:\modelunion\kite\aun-sdk-core\ts -> /workspace/ts`
 - `kite-ts-tester` 的 `/workspace/ts/node_modules` 使用容器内独立 volume，与宿主机 Windows `node_modules` 隔离
+- `kite-ts-tester` 使用独立的数据目录（`/data/aun`），不与 Python `kite-sdk-tester` 共享身份数据。Python SDK 使用 SQLCipher 加密数据库，TS SDK 使用 better-sqlite3（无加密），两者的本地存储格式不兼容，共用会导致"数据库损坏"错误。
 
 ### 典型测试命令
 
@@ -183,6 +184,14 @@ E2E 测试：
 ```powershell
 MSYS_NO_PATHCONV=1 docker exec kite-ts-tester bash -lc "cd /workspace/ts && npx vitest run tests/e2e/group-e2ee.test.ts"
 ```
+
+Gap 补洞测试（P2P + 群消息）：
+
+```powershell
+MSYS_NO_PATHCONV=1 docker exec -w /workspace/ts kite-ts-tester node_modules/.bin/vitest run tests/integration/message-gap.test.ts tests/integration/group-gap.test.ts
+```
+
+gap 测试每次运行使用随机动态 AID + 临时目录，不依赖固定身份，也不需要 `AUN_TEST_AUN_PATH`。
 
 单域 reconnect 集成测试当前由宿主机 Node 进程直接协调 `docker compose restart kite`，不适合放进临时 Docker 测试容器：
 
@@ -446,6 +455,6 @@ docker compose up -d --force-recreate kite-a kite-b client-a client-b
 - `integration_test_reconnect.py` 仍是宿主机脚本，不适合放进测试容器。
 - `ts/tests/integration/reconnect.test.ts` 也是宿主机协调型测试，用于控制单域 `docker compose restart kite`，不适合直接塞进单域临时测试容器。
 - Go 当前没有单域 Docker reconnect 用例；双域 reconnect 已通过 `federation_reconnect_test.go` 覆盖。
-- 浏览器版 JS SDK 当前只有 skip 的占位集成测试与真实浏览器 E2E 骨架，不属于本文这套常规 Docker 单域/双域回归矩阵；如需执行，应改用 Playwright/Cypress 等真实浏览器方案，并复用同一套 Docker 服务环境。
+- 浏览器版 JS SDK 当前只有 skip 的占位集成测试与真实浏览器 E2E 骨架，不属于本文这套常规 Docker 单域/双域回归矩阵；如需执行，应改用 Playwright/Cypress 等真实浏览器方案，并复用同一套 Docker 服务环境。JS SDK 的单元测试可直接在宿主机运行：`cd aun-sdk-core/js && npx vitest run`。
 - 双域 `e2e_real.py`、`e2e_comprehensive.py`、`e2e_coverage_gaps.py` 内部会调用 `docker exec` 操控其他容器，需要从宿主机运行，不能在 `client-a/client-b` 容器内执行。
 - 其余单域集成测试、双域 federation/E2E 脚本应优先在 Docker 测试容器内运行，以保证与服务端网络环境一致。

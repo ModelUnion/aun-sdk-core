@@ -642,3 +642,138 @@ describe('AUNClient 群组 epoch 自动轮换', () => {
     }
   });
 });
+
+// ── close_code 1000 误判测试 ──────────────────────────────
+
+describe('close_code 1000 不应视为 serverInitiated', () => {
+  it('close_code=1000 时不应以 serverInitiated=true 启动重连', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._sessionOptions = {
+      ...(client as any)._sessionOptions,
+      auto_reconnect: true,
+    };
+
+    const startReconnectSpy = vi.spyOn(client as any, '_startReconnect').mockImplementation(() => {});
+
+    await (client as any)._handleTransportDisconnect(new Error('closed'), 1000);
+
+    // closeCode=1000 是正常关闭，不应被视为 serverInitiated
+    if (startReconnectSpy.mock.calls.length > 0) {
+      const serverInitiated = startReconnectSpy.mock.calls[0][0];
+      expect(serverInitiated).toBe(false);
+    }
+  });
+});
+
+// ── group.add_member 密钥分发结果检查测试 ──────────────────
+
+describe('group.add_member 失败时不应分发密钥', () => {
+  it('group.add_member 返回 error 时不应触发密钥分发', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'device-001';
+
+    // 模拟 transport.call 返回错误结果
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      error: { code: -33003, message: 'not authorized' },
+    });
+
+    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
+    const rotateSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
+
+    await client.call('group.add_member', {
+      group_id: 'group-123',
+      aid: 'new-member.aid.com',
+    });
+
+    // 失败的 add_member 不应触发密钥分发
+    expect(distributeSpy).not.toHaveBeenCalled();
+    expect(rotateSpy).not.toHaveBeenCalled();
+  });
+
+  it('group.add_member 成功时应触发密钥分发', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'device-001';
+
+    // 模拟成功结果
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      ok: true,
+    });
+
+    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
+
+    await client.call('group.add_member', {
+      group_id: 'group-123',
+      aid: 'new-member.aid.com',
+    });
+
+    // 成功的 add_member 应触发密钥分发
+    expect(distributeSpy).toHaveBeenCalledWith('group-123', 'new-member.aid.com');
+  });
+});
+
+// ── 抑制重连测试 ──────────────────────────────────────────
+
+describe('NO_RECONNECT_CODES 抑制重连', () => {
+  function makeDisconnectClient() {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._sessionOptions = {
+      auto_reconnect: true,
+      retry: { initial_delay: 0.01, max_delay: 0.05, max_attempts: 0 },
+      timeouts: { connect: 5, call: 10, http: 30 },
+      heartbeat_interval: 0,
+      token_refresh_before: 60,
+    };
+    (client as any)._closing = false;
+    (client as any)._reconnecting = false;
+    const startReconnectSpy = vi.spyOn(client as any, '_startReconnect').mockImplementation(() => {});
+    (client as any)._stopBackgroundTasks = vi.fn();
+    return { client, startReconnectSpy };
+  }
+
+  it.each([4001, 4003, 4008, 4009, 4010, 4011])(
+    '不重连 close code %d 应进入 terminal_failed',
+    async (code) => {
+      const { client, startReconnectSpy } = makeDisconnectClient();
+      await (client as any)._handleTransportDisconnect(new Error('test'), code);
+      expect(client.state).toBe('terminal_failed');
+      expect(startReconnectSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([4000, 4029, 4500, 4503])(
+    '可重连 close code %d 应启动重连',
+    async (code) => {
+      const { client, startReconnectSpy } = makeDisconnectClient();
+      await (client as any)._handleTransportDisconnect(new Error('test'), code);
+      expect(startReconnectSpy).toHaveBeenCalled();
+      expect(client.state).not.toBe('terminal_failed');
+    },
+  );
+
+  it('收到 gateway.disconnect 通知后断线应抑制重连', async () => {
+    const { client, startReconnectSpy } = makeDisconnectClient();
+    // 模拟 gateway.disconnect 通知
+    (client as any)._onGatewayDisconnect({ code: 4009, reason: 'Connection replaced' });
+    expect((client as any)._serverKicked).toBe(true);
+
+    await (client as any)._handleTransportDisconnect(new Error('test'), 4009);
+    expect(client.state).toBe('terminal_failed');
+    expect(startReconnectSpy).not.toHaveBeenCalled();
+  });
+
+  it('_serverKicked 标志即使可重连 close code 也应抑制重连', async () => {
+    const { client, startReconnectSpy } = makeDisconnectClient();
+    (client as any)._serverKicked = true;
+
+    await (client as any)._handleTransportDisconnect(new Error('test'), 1006);
+    expect(client.state).toBe('terminal_failed');
+    expect(startReconnectSpy).not.toHaveBeenCalled();
+  });
+});

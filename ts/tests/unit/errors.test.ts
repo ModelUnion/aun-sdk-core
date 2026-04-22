@@ -19,7 +19,7 @@ import {
 
 describe('mapRemoteError', () => {
   // ── 认证错误 ────────────────────────────────────────────
-  it.each([4001, 4010, -32003])('code %d 映射为 AuthError', (code) => {
+  it.each([4001, 4010, -32001, -32003])('code %d 映射为 AuthError', (code) => {
     const err = mapRemoteError({ code, message: 'auth failed' });
     expect(err).toBeInstanceOf(AuthError);
     expect(err.code).toBe(code);
@@ -28,14 +28,14 @@ describe('mapRemoteError', () => {
   });
 
   // ── 权限错误 ────────────────────────────────────────────
-  it.each([4030, 403])('code %d 映射为 PermissionError', (code) => {
+  it.each([4030, 403, -32004])('code %d 映射为 PermissionError', (code) => {
     const err = mapRemoteError({ code, message: 'forbidden' });
     expect(err).toBeInstanceOf(PermissionError);
     expect(err.retryable).toBe(false);
   });
 
   // ── 未找到错误 ──────────────────────────────────────────
-  it.each([4040, 404, -32004])('code %d 映射为 NotFoundError', (code) => {
+  it.each([4040, 404])('code %d 映射为 NotFoundError', (code) => {
     const err = mapRemoteError({ code, message: 'not found' });
     expect(err).toBeInstanceOf(NotFoundError);
     expect(err.retryable).toBe(false);

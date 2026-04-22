@@ -6,18 +6,22 @@ import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import websockets
+
 from .errors import ConnectionError, SerializationError, TimeoutError, map_remote_error
 from .events import EventDispatcher
 
 
 ConnectionFactory = Callable[[str], Awaitable[Any]]
-DisconnectCallback = Callable[[Exception | None], Awaitable[None]]
+DisconnectCallback = Callable[[Exception | None, int | None], Awaitable[None]]
 
 EVENT_NAME_MAP = {
     "message.received": "message.received",
     "message.recalled": "message.recalled",
     "message.ack": "message.ack",
     "group.changed": "group.changed",
+    "group.message_created": "group.message_created",
+    "storage.object_changed": "storage.object_changed",
 }
 
 
@@ -131,7 +135,11 @@ class RPCTransport:
             self._closed = True
             if unexpected_disconnect:
                 if self._on_disconnect is not None:
-                    await self._on_disconnect(disconnect_error)
+                    # 从 websockets.ConnectionClosed 中提取 close code
+                    close_code: int | None = None
+                    if isinstance(disconnect_error, websockets.ConnectionClosed):
+                        close_code = disconnect_error.code
+                    await self._on_disconnect(disconnect_error, close_code)
 
     async def _route_message(self, message: dict[str, Any]) -> None:
         if "id" in message:

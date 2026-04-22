@@ -69,9 +69,12 @@ func (c *CryptoProvider) SignLoginNonce(privateKeyPEM string, nonce string, clie
 	}
 
 	// 确定使用的时间戳
+	// ISSUE-SDK-GO-012: 与 Python SDK str(time.time()) 对齐，使用浮点数格式（含微秒）
+	// 服务端原样使用 client_time，各 SDK 只需保证 sign_data 与传给服务端的 client_time 一致即可。
 	usedTime := clientTime
 	if usedTime == "" {
-		usedTime = fmt.Sprintf("%f", float64(time.Now().UnixMilli())/1000.0)
+		now := time.Now()
+		usedTime = fmt.Sprintf("%d.%06d", now.Unix(), now.Nanosecond()/1000)
 	}
 
 	// 构造签名数据
@@ -96,7 +99,9 @@ func (c *CryptoProvider) SignLoginNonce(privateKeyPEM string, nonce string, clie
 // NewClientNonce 生成 12 字节随机 nonce（base64 编码）
 func (c *CryptoProvider) NewClientNonce() string {
 	nonce := make([]byte, 12)
-	_, _ = rand.Read(nonce)
+	if _, err := rand.Read(nonce); err != nil {
+		panic(fmt.Sprintf("crypto/rand.Read 失败（系统熵源不可用）: %v", err))
+	}
 	return base64.StdEncoding.EncodeToString(nonce)
 }
 

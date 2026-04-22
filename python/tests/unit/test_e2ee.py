@@ -415,7 +415,7 @@ class TestLongTermKey:
 
 class TestEncryptOutboundDegradation:
     def test_prekey_available_uses_prekey(self):
-        """有 prekey → 使用 prekey_ecdh_v2（双 ECDH）"""
+        """有 prekey -> 使用 prekey_ecdh_v2（双 ECDH）"""
         sender_mgr, _, _, receiver_key, _, receiver_cert, _, _ = _make_e2ee_pair()
         prekey, _ = _make_prekey(receiver_key)
 
@@ -431,7 +431,7 @@ class TestEncryptOutboundDegradation:
         assert envelope["encryption_mode"] == MODE_PREKEY_ECDH_V2
 
     def test_no_prekey_falls_to_long_term(self):
-        """无 prekey → 降级到 long_term_key"""
+        """无 prekey -> 降级到 long_term_key"""
         sender_mgr, _, _, _, _, receiver_cert, _, _ = _make_e2ee_pair()
 
         mid = str(uuid.uuid4())
@@ -840,7 +840,7 @@ class TestPrekeyV2:
         assert result is None
 
     def test_wrong_identity_key_fails(self):
-        """只有 prekey 私钥没有正确 identity 私钥 → v2 解密失败"""
+        """只有 prekey 私钥没有正确 identity 私钥 -> v2 解密失败"""
         sender_mgr, receiver_mgr, _, receiver_key, _, receiver_cert, _, receiver_ks = _make_e2ee_pair()
         prekey, prekey_private = _make_prekey(receiver_key)
 
@@ -875,4 +875,122 @@ class TestPrekeyV2:
         }
         # v2 解密应失败（identity key 不匹配）
         result = receiver_mgr._decrypt_message_prekey_v2(message)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# SC-MSG-015: AAD 缺失/无效时显式拒绝解密
+# ---------------------------------------------------------------------------
+
+class TestAADMissingRejectsDecrypt:
+    """SC-MSG-015: AAD 缺失或非 dict 时应显式抛 E2EEDecryptFailedError，
+    不应回退到空 AAD 尝试解密。"""
+
+    def _encrypt_prekey_message(self):
+        """构造合法的 prekey_ecdh_v2 加密消息，返回 (message, receiver_mgr)。"""
+        sender_mgr, receiver_mgr, _, receiver_key, _, receiver_cert, _, receiver_ks = _make_e2ee_pair()
+        prekey, prekey_private = _make_prekey(receiver_key)
+
+        priv_pem = prekey_private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8")
+        receiver_ks.save_e2ee_prekey("receiver.test", prekey["prekey_id"], {
+            "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
+        })
+
+        payload = {"text": "aad test"}
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        envelope, ok = sender_mgr._encrypt_with_prekey(
+            "receiver.test", payload, prekey, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+        assert ok
+        message = {
+            "message_id": mid, "from": "sender.test", "to": "receiver.test",
+            "timestamp": ts, "seq": 1, "payload": envelope, "encrypted": True,
+        }
+        return message, receiver_mgr
+
+    def _encrypt_long_term_message(self):
+        """构造合法的 long_term_key 加密消息，返回 (message, receiver_mgr)。"""
+        sender_mgr, receiver_mgr, _, _, _, receiver_cert, _, _ = _make_e2ee_pair()
+
+        payload = {"text": "aad test lt"}
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        envelope, ok = sender_mgr._encrypt_with_long_term_key(
+            "receiver.test", payload, receiver_cert,
+            message_id=mid, timestamp=ts,
+        )
+        assert ok
+        message = {
+            "message_id": mid, "from": "sender.test", "to": "receiver.test",
+            "timestamp": ts, "seq": 1, "payload": envelope, "encrypted": True,
+        }
+        return message, receiver_mgr
+
+    def test_decrypt_prekey_v2_missing_aad_raises(self):
+        """SC-MSG-015: AAD 缺失时应显式拒绝解密，不应尝试用空 AAD 解密"""
+        message, receiver_mgr = self._encrypt_prekey_message()
+
+        # 删除 aad 字段
+        del message["payload"]["aad"]
+
+        # 外层 catch E2EEError 返回 None
+        result = receiver_mgr._decrypt_message_prekey_v2(message)
+        assert result is None
+
+    def test_decrypt_prekey_v2_aad_none_raises(self):
+        """SC-MSG-015: AAD 为 None 时应显式拒绝"""
+        message, receiver_mgr = self._encrypt_prekey_message()
+
+        message["payload"]["aad"] = None
+
+        result = receiver_mgr._decrypt_message_prekey_v2(message)
+        assert result is None
+
+    def test_decrypt_prekey_v2_aad_string_raises(self):
+        """SC-MSG-015: AAD 为 string 时应显式拒绝"""
+        message, receiver_mgr = self._encrypt_prekey_message()
+
+        message["payload"]["aad"] = "not-a-dict"
+
+        result = receiver_mgr._decrypt_message_prekey_v2(message)
+        assert result is None
+
+    def test_decrypt_prekey_v2_aad_invalid_raises_not_aesgcm(self):
+        """SC-MSG-015: 确保在 AAD 检查阶段就抛 E2EEDecryptFailedError，
+        而不是到 aesgcm.decrypt() 才隐式失败"""
+        from unittest.mock import patch
+        message, receiver_mgr = self._encrypt_prekey_message()
+
+        message["payload"]["aad"] = "bad"
+
+        # 如果 aesgcm.decrypt 被调用，说明没有在 AAD 检查阶段拒绝
+        with patch("aun_core.e2ee.AESGCM") as mock_aesgcm_cls:
+            result = receiver_mgr._decrypt_message_prekey_v2(message)
+            assert result is None
+            # AESGCM 实例的 decrypt 方法不应被调用
+            if mock_aesgcm_cls.return_value.decrypt.called:
+                pytest.fail("aesgcm.decrypt() 不应被调用，AAD 检查阶段就应拒绝")
+
+    def test_decrypt_long_term_missing_aad_raises(self):
+        """SC-MSG-015: long_term_key 模式 AAD 缺失时也应显式拒绝"""
+        message, receiver_mgr = self._encrypt_long_term_message()
+
+        del message["payload"]["aad"]
+
+        result = receiver_mgr._decrypt_message_long_term(message)
+        assert result is None
+
+    def test_decrypt_long_term_aad_string_raises(self):
+        """SC-MSG-015: long_term_key 模式 AAD 为 string 时也应显式拒绝"""
+        message, receiver_mgr = self._encrypt_long_term_message()
+
+        message["payload"]["aad"] = "not-a-dict"
+
+        result = receiver_mgr._decrypt_message_long_term(message)
         assert result is None

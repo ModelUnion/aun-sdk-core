@@ -106,6 +106,23 @@ function cleanupKeyStoreGroupOldEpochs(
   throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing cleanupGroupOldEpochsState method`);
 }
 
+function deleteKeyStoreGroupState(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+): void {
+  if (typeof keystore.deleteGroupSecretState === 'function') {
+    keystore.deleteGroupSecretState(aid, groupId);
+    return;
+  }
+  // 降级：通过 saveGroupSecretState 写入空记录来"删除"
+  if (typeof keystore.saveGroupSecretState === 'function') {
+    keystore.saveGroupSecretState(aid, groupId, {} as any);
+    return;
+  }
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing deleteGroupSecretState method`);
+}
+
 // ── 内部工具函数 ───────────────────────────────────────────────
 
 /** HKDF-SHA256 派生密钥 */
@@ -243,16 +260,12 @@ export function encryptGroupMessage(
 
   // 发送方签名
   if (opts.senderPrivateKeyPem) {
-    try {
-      const signPayload = Buffer.concat([ciphertext, tag, aadBytes]);
-      const sig = ecdsaSign(opts.senderPrivateKeyPem, signPayload);
-      envelope.sender_signature = sig.toString('base64');
-      // 证书指纹（与 Python/Go/JS SDK 一致）
-      if (opts.senderCertPem) {
-        envelope.sender_cert_fingerprint = certSha256Fingerprint(opts.senderCertPem);
-      }
-    } catch {
-      // 签名失败不阻止发送
+    const signPayload = Buffer.concat([ciphertext, tag, aadBytes]);
+    const sig = ecdsaSign(opts.senderPrivateKeyPem, signPayload);
+    envelope.sender_signature = sig.toString('base64');
+    // 证书指纹（与 Python/Go/JS SDK 一致）
+    if (opts.senderCertPem) {
+      envelope.sender_cert_fingerprint = certSha256Fingerprint(opts.senderCertPem);
     }
   }
 
@@ -594,6 +607,15 @@ export function cleanupOldEpochs(
   return cleanupKeyStoreGroupOldEpochs(keystore, aid, groupId, cutoffMs);
 }
 
+/** 删除群组的所有密钥数据（群组解散时使用） */
+export function deleteGroupSecret(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+): void {
+  deleteKeyStoreGroupState(keystore, aid, groupId);
+}
+
 // ── GroupReplayGuard ──────────────────────────────────────────
 
 /** 群组消息防重放守卫 */
@@ -892,8 +914,8 @@ export class GroupE2EEManager {
   rotateEpoch(groupId: string, memberAids: string[]): JsonObject {
     const aid = this._currentAid();
     const current = loadGroupSecret(this._keystore, aid, groupId);
-    const prevEpoch = current ? current.epoch as number : null;
-    const newEpoch = ((prevEpoch as number) || 0) + 1;
+    const prevEpoch = current ? Number(current.epoch) : null;
+    const newEpoch = (prevEpoch ?? 0) + 1;
     const gs = generateGroupSecret();
     const commitment = computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
     storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids);
@@ -942,6 +964,10 @@ export class GroupE2EEManager {
     }
     const identity = this._identityFn();
     const senderPkPem = identity ? (identity.private_key_pem as string | undefined) ?? null : null;
+    // TS-017: 签名失败必须阻止发送，不允许发出无签名的群消息
+    if (!senderPkPem) {
+      throw new E2EEError('sender identity private key unavailable for group message signing');
+    }
     const senderCertPem = identity ? (identity.cert as string | undefined) ?? null : null;
     return encryptGroupMessage(
       groupId,
@@ -999,8 +1025,8 @@ export class GroupE2EEManager {
   }
 
   /** 批量解密 */
-  decryptBatch(messages: Message[]): Message[] {
-    return messages.map(m => this.decrypt(m) ?? m);
+  decryptBatch(messages: Message[], opts?: { skipReplay?: boolean }): Message[] {
+    return messages.map(m => this.decrypt(m, opts) ?? m);
   }
 
   // ── 密钥协议消息处理 ──────────────────────────────────
@@ -1104,6 +1130,15 @@ export class GroupE2EEManager {
   /** 清理过期缓存（replay guard 等），供外部定时调用 */
   cleanExpiredCaches(): void {
     this._replayGuard.trim();
+  }
+
+  /** 删除群组的所有本地状态（群组解散时使用） */
+  removeGroup(groupId: string): void {
+    try {
+      deleteGroupSecret(this._keystore, this._currentAid(), groupId);
+    } catch {
+      // keystore 不支持 delete 时忽略（降级方案已在 deleteKeyStoreGroupState 中处理）
+    }
   }
 
   private _currentAid(): string {

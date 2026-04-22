@@ -9,12 +9,17 @@ import {
 } from './errors.js';
 import { isJsonObject, type JsonObject, type JsonValue, type RpcMessage, type RpcParams, type RpcResult } from './types.js';
 
+/** RPC 请求递增计数器，避免 Date.now() 高并发碰撞 */
+let _rpcIdCounter = 0;
+
 /** 协议事件名映射 */
 const EVENT_NAME_MAP: Record<string, string> = {
   'message.received': 'message.received',
   'message.recalled': 'message.recalled',
   'message.ack': 'message.ack',
   'group.changed': 'group.changed',
+  'group.message_created': 'group.message_created',
+  'storage.object_changed': 'storage.object_changed',
 };
 
 /**
@@ -28,7 +33,7 @@ const EVENT_NAME_MAP: Record<string, string> = {
 export class RPCTransport {
   private _dispatcher: EventDispatcher;
   private _timeout: number;
-  private _onDisconnect: ((error: Error | null) => Promise<void>) | null;
+  private _onDisconnect: ((error: Error | null, closeCode?: number) => Promise<void>) | null;
   private _ws: WebSocket | null = null;
   private _closed = true;
   private _challenge: RpcMessage | null = null;
@@ -40,7 +45,7 @@ export class RPCTransport {
   constructor(opts: {
     eventDispatcher: EventDispatcher;
     timeout?: number;
-    onDisconnect?: ((error: Error | null) => Promise<void>) | null;
+    onDisconnect?: ((error: Error | null, closeCode?: number) => Promise<void>) | null;
   }) {
     this._dispatcher = opts.eventDispatcher;
     this._timeout = opts.timeout ?? 10;
@@ -125,8 +130,8 @@ export class RPCTransport {
         this._ws.onerror = null;
         this._ws.onmessage = null;
         this._ws.close();
-      } catch {
-        // 忽略关闭异常
+      } catch (exc) {
+        console.warn('[aun_core.transport] WebSocket 关闭异常:', String(exc));
       }
       this._ws = null;
     }
@@ -151,8 +156,8 @@ export class RPCTransport {
       throw new ConnectionError('transport not connected');
     }
 
-    // 生成唯一 RPC ID
-    const rpcId = `rpc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    // 生成唯一 RPC ID（递增计数器，避免高并发碰撞）
+    const rpcId = `rpc-${String(++_rpcIdCounter).padStart(6, '0')}`;
     const effectiveTimeout = (timeout ?? this._timeout) * 1000;
 
     const promise = new Promise<RpcMessage>((resolve, reject) => {
@@ -224,7 +229,7 @@ export class RPCTransport {
       const error = new ConnectionError(`websocket closed: code=${event.code} reason=${event.reason}`);
       this._dispatcher.publish('connection.error', { error });
       if (this._onDisconnect) {
-        this._onDisconnect(error).catch(exc => console.warn('[aun_core.transport] disconnect 回调异常:', exc));
+        this._onDisconnect(error, event.code).catch(exc => console.warn('[aun_core.transport] disconnect 回调异常:', exc));
       }
     }
   }

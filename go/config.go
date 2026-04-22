@@ -1,13 +1,14 @@
 package aun
 
 import (
-	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 var instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
@@ -178,16 +179,9 @@ func (c *AUNConfig) DeviceID() string {
 	return GetDeviceID(c.AUNPath)
 }
 
-// generateUUID4 生成 UUID v4（不依赖外部库）
+// generateUUID4 生成 UUID v4，使用 google/uuid 库（项目已引入）
 func generateUUID4() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	// 设置版本 4
-	b[6] = (b[6] & 0x0f) | 0x40
-	// 设置变体 RFC 4122
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	return uuid.New().String()
 }
 
 func boolFromMap(raw map[string]any, keys ...string) (bool, bool) {

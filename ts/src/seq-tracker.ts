@@ -13,7 +13,7 @@ const MAX_PROBE_COUNT = 5;
 interface GapProbe {
   gapStart: number;
   gapEnd: number;
-  lastProbeAt: number; // performance.now() ms
+  lastProbeAt: number; // Date.now() ms
   probeCount: number;
   resolved: boolean;
 }
@@ -29,8 +29,10 @@ function gapKey(start: number, end: number): string {
   return `${start}:${end}`;
 }
 
+/** 统一使用 Date.now() 返回绝对时间戳（毫秒），
+ *  避免 performance.now()（相对时间）与 Date.now()（绝对时间）混用导致语义不一致。 */
 function nowMs(): number {
-  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+  return Date.now();
 }
 
 export class SeqTracker {
@@ -220,6 +222,11 @@ export class SeqTracker {
       t.maxSeenSeq = Math.max(t.maxSeenSeq, seq);
       this._tryAdvance(t);
     }
+  }
+
+  /** 删除指定命名空间的所有跟踪状态（群组解散时使用） */
+  removeNamespace(ns: string): void {
+    this._trackers.delete(ns);
   }
 
   /** 导出各命名空间的 contiguousSeq，用于持久化 */

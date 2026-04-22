@@ -25,6 +25,21 @@ func secureFilePermissions(path string) {
 	}
 }
 
+// safeRename 原子重命名，Windows 上 os.Rename 目标已存在时可能失败，
+// 失败后 fallback 为先删除再重命名（ISSUE-GO-003）。
+func safeRename(src, dst string) error {
+	if err := os.Rename(src, dst); err != nil {
+		// Windows fallback: 先删除目标再重命名
+		if removeErr := os.Remove(dst); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("删除目标文件失败: %w (原始 rename 错误: %v)", removeErr, err)
+		}
+		return os.Rename(src, dst)
+	}
+	return nil
+}
+
+const metaLocksLimit = 256
+
 // FileKeyStore 基于文件（key.json/cert.pem）+ AIDDatabase（SQLite）的密钥存储。
 type FileKeyStore struct {
 	root          string
@@ -111,7 +126,7 @@ func (f *FileKeyStore) getDB(aid string) (*AIDDatabase, error) {
 		return db, nil
 	}
 	dbPath := filepath.Join(f.identityDir(aid), "aun.db")
-	db, err := newAIDDatabase(dbPath)
+	db, err := newAIDDatabase(dbPath, f.secretStore, aid)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +139,18 @@ func (f *FileKeyStore) getLock(aid string) *sync.Mutex {
 	defer f.metaLocksLock.Unlock()
 	if l, ok := f.metaLocks[aid]; ok {
 		return l
+	}
+	// 超过上限时，清理未被持有的锁（TryLock 成功说明没人持有）
+	if len(f.metaLocks) >= metaLocksLimit {
+		for k, v := range f.metaLocks {
+			if v.TryLock() {
+				v.Unlock()
+				delete(f.metaLocks, k)
+				if len(f.metaLocks) < metaLocksLimit {
+					break
+				}
+			}
+		}
 	}
 	l := &sync.Mutex{}
 	f.metaLocks[aid] = l
@@ -182,7 +209,13 @@ func (f *FileKeyStore) saveKeyPairLocked(aid string, keyPair map[string]any) err
 		protected["private_key_protection"] = rec
 	}
 	data, _ := json.MarshalIndent(protected, "", "  ")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	// 原子写入：先写临时文件，再 rename 覆盖目标文件
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return err
+	}
+	if err := safeRename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
 		return err
 	}
 	secureFilePermissions(path)
@@ -227,7 +260,16 @@ func (f *FileKeyStore) saveCertLocked(aid, certPEM string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(certPEM), 0o644)
+	// 原子写入：先写临时文件，再 rename 覆盖目标文件
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(certPEM), 0o644); err != nil {
+		return err
+	}
+	if err := safeRename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func (f *FileKeyStore) LoadCertVersion(aid, fp string) (string, error) {

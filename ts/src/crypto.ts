@@ -4,7 +4,7 @@
  * 使用 Node.js 内置 crypto 模块，与 Python SDK 的 CryptoProvider 对齐。
  */
 
-import { generateKeyPairSync, createSign, randomBytes } from 'node:crypto';
+import { generateKeyPairSync, createSign, createHash, randomBytes, X509Certificate } from 'node:crypto';
 
 export interface IdentityKeyPair {
   /** PEM 格式私钥 */
@@ -53,7 +53,7 @@ export class CryptoProvider {
     nonce: string,
     clientTime?: string,
   ): [string, string] {
-    const usedTime = clientTime ?? String(Date.now() / 1000);
+    const usedTime = clientTime ?? String(Math.floor(Date.now() / 1000));
     const signData = `${nonce}:${usedTime}`;
 
     // Python 的 cryptography 库默认输出 DER 编码签名，
@@ -72,4 +72,33 @@ export class CryptoProvider {
   newClientNonce(): string {
     return randomBytes(12).toString('base64');
   }
+}
+
+/**
+ * 统一的证书 SHA-256 指纹计算（对齐 Python certificate_sha256_fingerprint）。
+ * 返回 "sha256:{hex}" 格式的指纹。
+ * e2ee.ts 与 keystore/file.ts 共用此函数，避免两套实现不一致。
+ */
+export function certificateSha256Fingerprint(certPem: string | Buffer): string {
+  const raw = Buffer.isBuffer(certPem) ? certPem : Buffer.from(certPem, 'utf-8');
+  const text = raw.toString('utf-8');
+  let der: Buffer;
+  if (text.includes('-----BEGIN CERTIFICATE-----')) {
+    // PEM → DER 解码
+    const body = text
+      .replace(/-----BEGIN CERTIFICATE-----/g, '')
+      .replace(/-----END CERTIFICATE-----/g, '')
+      .replace(/\s+/g, '');
+    if (!body) return '';
+    der = Buffer.from(body, 'base64');
+  } else {
+    // 尝试通过 X509Certificate 获取 DER
+    try {
+      der = new X509Certificate(raw).raw;
+    } catch {
+      der = raw;
+    }
+  }
+  const hash = createHash('sha256').update(der).digest('hex');
+  return `sha256:${hash}`;
 }

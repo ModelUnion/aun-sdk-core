@@ -317,12 +317,12 @@ sequenceDiagram
 | code | message | 说明 |
 |------|---------|------|
 | -33401 | Stream not found | stream_id 无效或流已被清理 |
-| -33402 | Stream already closed | 流已关闭 |
-| -33403 | Stream limit reached | 活跃流数超过上限 |
-| -33404 | Stream push token invalid | 推流端 token 不匹配 |
-| -33405 | Stream pull token invalid | 拉流端 token 不匹配 |
-| -33406 | Stream puller limit reached | 拉流端数量已达上限 |
-| -33407 | Stream permission denied | 非创建者执行受限操作 |
+| -33402 | Stream limit exceeded | 活跃流数超过上限 |
+| -33403 | Stream permission denied | 非创建者执行受限操作 |
+| -33404 | Stream already closed | 流已关闭 |
+| -33405 | Stream invalid params | 参数无效（如缺少 stream_id） |
+| -33406 | Stream rate limited | 速率限制 |
+| -33407 | Stream internal error | 服务内部错误 |
 | HTTP 403 | — | push/pull token 无效，或请求方显式提供的 `aid` 与 `target_aid` 不匹配 |
 | HTTP 404 | — | 数据平面找不到流 |
 | HTTP 410 | — | 流已关闭 |

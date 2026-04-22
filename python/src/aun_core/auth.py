@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -462,16 +463,29 @@ class AuthFlow:
         return result
 
     async def _short_rpc(self, gateway_url: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        _SHORT_RPC_TIMEOUT = 15.0  # 单次 recv 超时（秒）
         ws = await self._connection_factory(gateway_url)
         try:
-            await ws.recv()
+            # 握手帧接收
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=_SHORT_RPC_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise ConnectionError(
+                    f"gateway {gateway_url} handshake recv timeout ({_SHORT_RPC_TIMEOUT}s)"
+                )
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
                 "id": f"pre-{method}",
                 "method": method,
                 "params": params,
             }))
-            raw = await ws.recv()
+            # RPC 响应接收
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=_SHORT_RPC_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise ConnectionError(
+                    f"gateway {gateway_url} RPC recv timeout for {method} ({_SHORT_RPC_TIMEOUT}s)"
+                )
             message = raw if isinstance(raw, dict) else json.loads(raw)
         finally:
             await ws.close()

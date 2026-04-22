@@ -68,6 +68,8 @@ export interface KeyStore {
   saveGroupSecretState?(aid: string, groupId: string, entry: GroupSecretRecord): Promise<void>;
   /** 清理单个群组过期 old epochs */
   cleanupGroupOldEpochsState?(aid: string, groupId: string, cutoffMs: number): Promise<number>;
+  /** 删除单个群组的所有密钥状态（群组解散时使用） */
+  deleteGroupSecretState?(aid: string, groupId: string): Promise<void>;
 
   /** 加载全部 E2EE sessions */
   loadE2EESessions?(aid: string): Promise<SessionRecord[]>;
@@ -80,4 +82,8 @@ export interface KeyStore {
   loadSeq?(aid: string, deviceId: string, slotId: string, namespace: string): Promise<number>;
   /** 加载某 device+slot 下所有 namespace 的 contiguous_seq */
   loadAllSeqs?(aid: string, deviceId: string, slotId: string): Promise<Record<string, number>>;
+  /** 列出已存储的所有身份 AID（可选） */
+  listIdentities?(): Promise<string[]>;
+  /** 加载身份元数据（可选） */
+  loadMetadata?(aid: string): Promise<Record<string, unknown> | null>;
 }

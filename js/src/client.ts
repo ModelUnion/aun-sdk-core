@@ -25,6 +25,7 @@ import {
   computeMembershipCommitment,
   storeGroupSecret,
   buildKeyDistribution,
+  buildKeyRequest,
   buildMembershipManifest,
   signMembershipManifest,
 } from './e2ee-group.js';
@@ -90,6 +91,7 @@ const SIGNED_METHODS = new Set([
   'group.update_join_requirements', 'group.set_role',
   'group.transfer_owner', 'group.review_join_request',
   'group.batch_review_join_request',
+  'group.request_join', 'group.use_invite_code',
   'group.resources.put', 'group.resources.update',
   'group.resources.delete', 'group.resources.request_add',
   'group.resources.direct_add', 'group.resources.approve_request',
@@ -167,8 +169,8 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
   heartbeat_interval: 30.0,
   token_refresh_before: 60.0,
   retry: {
-    initial_delay: 0.5,
-    max_delay: 30.0,
+    initial_delay: 1.0,
+    max_delay: 64.0,
     // M25: 0 表示无限重试，与 Go/Python 对齐
     max_attempts: 0,
   },
@@ -340,6 +342,7 @@ function normalizeDeliveryModeConfig(
  *   - E2EE 自动编排（加密/解密/密钥管理/group 生命周期）
  *   - 事件分发与管道
  *   - 后台任务（心跳、token 刷新、prekey 轮换、epoch 清理/轮换）
+ *
  */
 export class AUNClient {
   /** SDK 配置模型 */
@@ -369,7 +372,6 @@ export class AUNClient {
 
   /** 认证命名空间 */
   readonly auth: AuthNamespace;
-
   // E2EE 编排状态（内存缓存）
   private _certCache: Map<string, CachedPeerCert> = new Map();
   private _prekeyReplenishInflight: Set<string> = new Set();
@@ -379,7 +381,9 @@ export class AUNClient {
   // 后台任务 handle（浏览器 setInterval/setTimeout）
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  private _prekeyRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  /** 非连接状态下 token 刷新的退避计数器 */
+  private _tokenDisconnectedRetries = 0;
+  private _prekeyRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _groupEpochCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private _groupEpochRotateTimer: ReturnType<typeof setInterval> | null = null;
   private _cacheCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -390,9 +394,12 @@ export class AUNClient {
   private _gapFillDone: Set<string> = new Set();
   /** 推送路径已分发的 seq 集合（按命名空间），补洞路径 publish 前检查以避免重复分发 */
   private _pushedSeqs: Map<string, Set<number>> = new Map();
+  /** gap fill 来源标记：true 表示当前正在补洞（pull 触发），false 表示非补洞 */
+  private _gapFillActive = false;
   // 重连相关
   private _reconnectActive = false;
   private _reconnectAbort: AbortController | null = null;
+  private _serverKicked = false;
 
   constructor(config?: Partial<AUNConfig> & RpcParams) {
     const rawConfig: RpcParams = config ?? {};
@@ -422,7 +429,7 @@ export class AUNClient {
     this._transport = new RPCTransport({
       eventDispatcher: this._dispatcher,
       timeout: DEFAULT_SESSION_OPTIONS.timeouts.call,
-      onDisconnect: (error) => this._handleTransportDisconnect(error),
+      onDisconnect: (error, closeCode) => this._handleTransportDisconnect(error, closeCode),
     });
     this._e2ee = new E2EEManager({
       identityFn: () => this._identity ?? {},
@@ -439,7 +446,6 @@ export class AUNClient {
     });
 
     this.auth = new AuthNamespace(this);
-
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => {
       this._onRawMessageReceived(data);
@@ -458,6 +464,10 @@ export class AUNClient {
         this._dispatcher.publish(evt, data);
       });
     }
+    // 服务端主动断开通知：记录日志并标记不重连
+    this._dispatcher.subscribe('_raw.gateway.disconnect', (data) => {
+      this._onGatewayDisconnect(data);
+    });
   }
 
   // ── 属性 ──────────────────────────────────────────
@@ -480,6 +490,16 @@ export class AUNClient {
 
   get discovery(): GatewayDiscovery {
     return this._discovery;
+  }
+
+  /** 最近一次 health check 结果，null 表示尚未检查 */
+  get gatewayHealth(): boolean | null {
+    return this._discovery.lastHealthy;
+  }
+
+  /** 主动检查 gateway 可用性（HEAD /health） */
+  async checkGatewayHealth(gatewayUrl: string, timeout = 5000): Promise<boolean> {
+    return this._discovery.checkHealth(gatewayUrl, timeout);
   }
 
   get e2ee(): E2EEManager {
@@ -535,10 +555,27 @@ export class AUNClient {
       return;
     }
 
+    // 关闭前通知服务端主动退出（best-effort，失败不阻塞）
+    try {
+      await this._transport.call('auth.logout', {});
+    } catch {
+      // auth.logout 失败不影响关闭流程
+    }
+
     await this._transport.close();
     this._state = 'closed';
     await this._dispatcher.publish('connection.state', { state: this._state });
     this._resetSeqTrackingState();
+  }
+
+  /** 断开连接但不关闭客户端（可重新 connect，对齐 Go Disconnect / Python disconnect） */
+  async disconnect(): Promise<void> {
+    if (this._state !== 'connected' && this._state !== 'reconnecting') return;
+    this._saveSeqTrackerState();
+    this._stopBackgroundTasks();
+    await this._transport.close();
+    this._state = 'disconnected';
+    await this._dispatcher.publish('connection.state', { state: this._state });
   }
 
   // ── RPC ───────────────────────────────────────────
@@ -688,8 +725,8 @@ export class AUNClient {
         }
       }
 
-      // 加人后自动分发密钥给新成员
-      if (method === 'group.add_member') {
+      // 加人后自动分发密钥给新成员（仅 RPC 明确成功时，与 Python 对齐）
+      if (method === 'group.add_member' && isJsonObject(result) && !result.error && (result.ok || result.member)) {
         const groupId = (p.group_id ?? '') as string;
         const newAid = (p.aid ?? '') as string;
         if (groupId && newAid) {
@@ -701,13 +738,8 @@ export class AUNClient {
         }
       }
 
-      // 踢人后自动轮换 epoch
-      if (method === 'group.kick') {
-        const groupId = (p.group_id ?? '') as string;
-        if (groupId) {
-          this._safeAsync(this._rotateGroupEpoch(groupId));
-        }
-      }
+      // group.kick / group.leave：由 group.changed（member_removed/member_left）
+      // 事件侧统一驱动剩余 admin/owner 补位轮换，避免 RPC 返回路径与事件路径双重触发。
 
       // 审批通过后自动分发密钥给新成员
       if (method === 'group.review_join_request' && isJsonObject(result)) {
@@ -755,11 +787,42 @@ export class AUNClient {
     return this.call('meta.trust_roots', params ?? {});
   }
 
+  /**
+   * 列出本地所有已存储的身份摘要（对齐 Python list_identities）。
+   * 返回 [{aid, metadata?}, ...] 数组。
+   */
+  async listIdentities(): Promise<JsonObject[]> {
+    const listFn = (this._keystore as any).listIdentities;
+    if (typeof listFn !== 'function') return [];
+    const aids: string[] = await listFn.call(this._keystore);
+    const summaries: JsonObject[] = [];
+    for (const aid of [...aids].sort()) {
+      const summary: JsonObject = { aid };
+      const loadMeta = (this._keystore as any).loadMetadata;
+      if (typeof loadMeta === 'function') {
+        const md = await loadMeta.call(this._keystore, aid);
+        if (md) summary.metadata = md;
+      }
+      summaries.push(summary);
+    }
+    return summaries;
+  }
+
   // ── 事件 ──────────────────────────────────────────
 
-  /** 订阅事件 */
+  /**
+   * 订阅事件。
+   *
+   * 注意：off() 使用引用相等（===）匹配 handler，匿名函数将无法通过
+   * off() 取消订阅。建议使用返回的 Subscription 对象调用 unsubscribe()。
+   */
   on(event: string, handler: EventHandler): Subscription {
     return this._dispatcher.subscribe(event, handler);
+  }
+
+  /** 取消订阅事件 */
+  off(event: string, handler: EventHandler): void {
+    this._dispatcher.unsubscribe(event, handler);
   }
 
   // ── 事件管道：消息解密 ────────────────────────────
@@ -948,6 +1011,8 @@ export class AUNClient {
 
   /** 后台补齐群消息空洞 */
   private async _fillGroupGap(groupId: string): Promise<void> {
+    // 状态保护：非 connected 或正在关闭时跳过（与 Python 对齐）
+    if (this._state !== 'connected' || this._closing) return;
     const ns = `group:${groupId}`;
     const afterSeq = this._seqTracker.getContiguousSeq(ns);
     // 新设备（seq=0）没有历史 epoch key，拉旧消息也解不了
@@ -960,6 +1025,7 @@ export class AUNClient {
     const dedupKey = `group_msg:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
     this._gapFillDone.add(dedupKey);
+    this._gapFillActive = true;
     try {
       const result = await this.call('group.pull', {
         group_id: groupId,
@@ -987,11 +1053,14 @@ export class AUNClient {
     } finally {
       // S1: 成功 / 失败路径都必须清理飞行标记
       this._gapFillDone.delete(dedupKey);
+      this._gapFillActive = false;
     }
   }
 
   /** 后台补齐群事件空洞 */
   private async _fillGroupEventGap(groupId: string): Promise<void> {
+    // 状态保护：非 connected 或正在关闭时跳过（与 Python 对齐）
+    if (this._state !== 'connected' || this._closing) return;
     const ns = `group_event:${groupId}`;
     const afterSeq = this._seqTracker.getContiguousSeq(ns);
     // 去重：同一 (group_evt:id:after_seq) 在飞行中只补一次
@@ -999,6 +1068,7 @@ export class AUNClient {
     const dedupKey = `group_evt:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
     this._gapFillDone.add(dedupKey);
+    this._gapFillActive = true;
     try {
       const result = await this.call('group.pull_events', {
         group_id: groupId,
@@ -1037,11 +1107,14 @@ export class AUNClient {
     } finally {
       // S1: 成功 / 失败路径都必须清理飞行标记
       this._gapFillDone.delete(dedupKey);
+      this._gapFillActive = false;
     }
   }
 
   /** 后台补齐 P2P 消息空洞 */
   private async _fillP2pGap(): Promise<void> {
+    // 状态保护：非 connected 或正在关闭时跳过（与 Python 对齐）
+    if (this._state !== 'connected' || this._closing) return;
     if (!this._aid) return;
     const ns = `p2p:${this._aid}`;
     const afterSeq = this._seqTracker.getContiguousSeq(ns);
@@ -1054,6 +1127,7 @@ export class AUNClient {
     const dedupKey = `p2p:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
     this._gapFillDone.add(dedupKey);
+    this._gapFillActive = true;
     try {
       const result = await this.call('message.pull', {
         after_seq: afterSeq,
@@ -1080,6 +1154,7 @@ export class AUNClient {
     } finally {
       // S1: 成功 / 失败路径都必须清理飞行标记
       this._gapFillDone.delete(dedupKey);
+      this._gapFillActive = false;
     }
   }
 
@@ -1097,11 +1172,11 @@ export class AUNClient {
   /**
    * 上线/重连后一次性同步所有已加入群：
    * 1. 有 epoch key 的群 → 补消息 + 补事件
-   * 2. 无 epoch key 的群 → 仅补事件（事件不加密，等推送触发密钥恢复）
+   * 2. 无 epoch key 的群 → 主动向 owner 请求密钥恢复 + 补事件
    */
   private async _syncAllGroupsOnce(): Promise<void> {
     try {
-      const result = await this.call('group.list', {});
+      const result = await this.call('group.list_my', {});
       if (!isJsonObject(result)) return;
       const items = result.items;
       if (!Array.isArray(items)) return;
@@ -1109,8 +1184,17 @@ export class AUNClient {
         if (isJsonObject(g)) {
           const gid = (g.group_id ?? '') as string;
           if (gid) {
-            // 有 epoch key → 补消息
-            if (await this._groupE2ee.hasSecret(gid)) {
+            const hasSecret = await this._groupE2ee.hasSecret(gid);
+            if (!hasSecret) {
+              // 没有 epoch key → 主动向 owner 请求密钥恢复（与 Python 对齐）
+              const ownerAid = (g.owner_aid ?? '') as string;
+              if (ownerAid && ownerAid !== this._aid) {
+                await this._requestGroupKeyFrom(gid, ownerAid);
+              } else {
+                console.debug(`[aun_core] 群 ${gid} 无 epoch key 且无法确定 owner，等待推送触发恢复`);
+              }
+            } else {
+              // 有 epoch key → 补消息
               await this._fillGroupGap(gid);
             }
             // 所有群都补事件（事件不加密）
@@ -1118,8 +1202,26 @@ export class AUNClient {
           }
         }
       }
-    } catch {
-      // 静默失败
+    } catch (exc) {
+      console.warn('[aun_core] 上线群组同步失败，群消息可能不完整:', exc);
+      this._dispatcher.publish('group.sync_failed', {
+        error: exc instanceof Error ? exc.message : String(exc),
+      }).catch(() => {});
+    }
+  }
+
+  /** 主动向指定成员请求群组密钥（用于重连时无 epoch key 的群）（与 Python 对齐） */
+  private async _requestGroupKeyFrom(groupId: string, targetAid: string): Promise<void> {
+    try {
+      const reqPayload = buildKeyRequest(groupId, 0, this._aid || '');
+      await this.call('message.send', {
+        to: targetAid,
+        payload: reqPayload,
+        encrypt: true,
+      });
+      console.info(`[aun_core] 已向 ${targetAid} 请求群 ${groupId} 的密钥`);
+    } catch (exc) {
+      console.warn(`[aun_core] 向 ${targetAid} 请求群 ${groupId} 密钥失败:`, exc);
     }
   }
 
@@ -1160,10 +1262,53 @@ export class AUNClient {
           this._safeAsync(this._maybeLeadRotateGroupEpoch(groupId));
         }
       }
+
+      // 群组解散 → 清理本地 epoch key、seq_tracker、补洞去重缓存
+      if (d.action === 'dissolved') {
+        if (groupId) {
+          this._cleanupDissolvedGroup(groupId);
+        }
+      }
+    } else {
+      // data 非对象也透传给用户（兼容旧版）
+      await this._dispatcher.publish('group.changed', data);
     }
   }
 
-  /** 验证群事件 client_signature。返回 true/false/"pending"。 */
+  /**
+   * 群组解散后清理本地状态：
+   * - keystore 中的 epoch key 数据
+   * - seq_tracker 中的群消息和群事件 seq 记录
+   * - 补洞去重缓存中的相关条目
+   * - 推送 seq 去重缓存
+   */
+  private _cleanupDissolvedGroup(groupId: string): void {
+    // 1. 清理 GroupE2EEManager / keystore 中的 epoch 密钥
+    this._safeAsync(
+      this._groupE2ee.removeGroup(groupId).catch((exc: unknown) => {
+        console.warn(`[aun_core] 清理解散群组 ${groupId} epoch 密钥失败:`, exc);
+      }),
+    );
+
+    // 2. 清理 seq_tracker 中的群消息和群事件命名空间
+    this._seqTracker.removeNamespace(`group:${groupId}`);
+    this._seqTracker.removeNamespace(`group_event:${groupId}`);
+    this._saveSeqTrackerState();
+
+    // 3. 清理补洞去重缓存中的相关条目
+    for (const key of this._gapFillDone.keys()) {
+      if (key.includes(groupId)) {
+        this._gapFillDone.delete(key);
+      }
+    }
+
+    // 4. 清理推送 seq 去重缓存
+    this._pushedSeqs.delete(`group:${groupId}`);
+    this._pushedSeqs.delete(`group_event:${groupId}`);
+
+    console.info(`[aun_core] 已清理解散群组 ${groupId} 的本地状态`);
+  }
+
   private async _verifyEventSignature(_event: JsonObject, cs: JsonObject): Promise<string | boolean> {
     const sigAid = String(cs.aid ?? '');
     const method = String(cs._method ?? '');
@@ -1516,6 +1661,36 @@ export class AUNClient {
       throw new ValidationError('group.send payload must be an object when encrypt=true');
     }
 
+    // 预检：本地 epoch 是否与服务端一致，不一致则触发密钥恢复（与 Python 对齐）
+    const localEpoch = await this._groupE2ee.currentEpoch(groupId);
+    if (localEpoch !== null) {
+      try {
+        const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+        const serverEpoch = isJsonObject(epochResult) ? Number(epochResult.epoch ?? 0) : 0;
+        if (serverEpoch > localEpoch) {
+          console.warn(
+            `[aun_core] 群 ${groupId} 本地 epoch=${localEpoch} < 服务端 epoch=${serverEpoch}，触发密钥恢复`,
+          );
+          // 向 owner 请求最新密钥
+          let ownerAid = isJsonObject(epochResult) ? String(epochResult.owner_aid ?? '') : '';
+          if (!ownerAid) {
+            try {
+              const info = await this.call('group.get_info', { group_id: groupId });
+              ownerAid = isJsonObject(info) ? String(info.owner_aid ?? '') : '';
+            } catch {
+              // 获取群信息失败，不阻塞发送
+            }
+          }
+          if (ownerAid && ownerAid !== this._aid) {
+            await this._requestGroupKeyFrom(groupId, ownerAid);
+          }
+          // 不阻塞发送：使用当前本地 epoch 发送，服务端若拒绝由上层处理
+        }
+      } catch (_exc) {
+        console.warn(`[aun_core] 群 ${groupId} epoch 预检失败:`, _exc);
+      }
+    }
+
     const envelope = await this._groupE2ee.encrypt(groupId, payload);
 
     const sendParams: RpcParams = {
@@ -1524,6 +1699,10 @@ export class AUNClient {
       type: 'e2ee.group_encrypted',
       encrypted: true,
     };
+    // 注入 device_id（与 call() 路径对齐）
+    if (this._deviceId && sendParams.device_id === undefined) {
+      sendParams.device_id = this._deviceId;
+    }
     await this._signClientOperation('group.send', sendParams);
     return this._transport.call('group.send', sendParams);
   }
@@ -1602,7 +1781,7 @@ export class AUNClient {
     }
 
     // 确保发送方证书已缓存（签名验证需要）
-    const senderAid = (message.from ?? message.sender_aid ?? '') as string;
+    const senderAid = String(message.from ?? message.sender_aid ?? '');
     if (senderAid) {
       const certOk = await this._ensureSenderCertCached(senderAid);
       if (!certOk) {
@@ -1618,8 +1797,8 @@ export class AUNClient {
     }
 
     // 解密失败，尝试密钥恢复后重试
-    const groupId = (message.group_id ?? '') as string;
-    const sender = (message.from ?? message.sender_aid ?? '') as string;
+    const groupId = String(message.group_id ?? '');
+    const sender = String(message.from ?? message.sender_aid ?? '');
     const epoch = payload.epoch as number | undefined;
     if (epoch !== undefined && groupId) {
       const recovery = await this._groupE2ee.buildRecoveryRequest(
@@ -1788,18 +1967,32 @@ export class AUNClient {
     let certPem: string;
     try {
       const certUrl = buildCertUrl(peerGatewayUrl, aid, certFingerprint);
-      const resp = await fetch(certUrl, { signal: AbortSignal.timeout(5000) });
-      if (!resp.ok) throw new ValidationError(`failed to fetch peer cert for ${aid}: HTTP ${resp.status}`);
-      certPem = await resp.text();
+      // 兼容旧浏览器，不使用 AbortSignal.timeout（Chrome 103+ 才支持）
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      try {
+        const resp = await fetch(certUrl, { signal: controller.signal });
+        if (!resp.ok) throw new ValidationError(`failed to fetch peer cert for ${aid}: HTTP ${resp.status}`);
+        certPem = await resp.text();
+      } finally {
+        clearTimeout(timeoutId);
+      }
     } catch (exc) {
       if (!certFingerprint) {
         throw exc;
       }
-      const fallbackResp = await fetch(buildCertUrl(peerGatewayUrl, aid), { signal: AbortSignal.timeout(5000) });
-      if (!fallbackResp.ok) {
-        throw exc;
+      // 兼容旧浏览器，不使用 AbortSignal.timeout（Chrome 103+ 才支持）
+      const fallbackController = new AbortController();
+      const fallbackTimeoutId = setTimeout(() => fallbackController.abort(), 5000);
+      try {
+        const fallbackResp = await fetch(buildCertUrl(peerGatewayUrl, aid), { signal: fallbackController.signal });
+        if (!fallbackResp.ok) {
+          throw exc;
+        }
+        certPem = await fallbackResp.text();
+      } finally {
+        clearTimeout(fallbackTimeoutId);
       }
-      certPem = await fallbackResp.text();
     }
 
     // H7: 严格校验指纹（DER SHA-256 或 SPKI SHA-256 任一匹配即可）
@@ -2037,24 +2230,35 @@ export class AUNClient {
         signature: uint8ToBase64(sigDer),
       };
     } catch (exc) {
-      console.warn('客户端签名失败，继续发送无签名请求:', exc);
+      throw new E2EEError(`客户端签名失败: ${exc instanceof Error ? exc.message : String(exc)}`);
     }
   }
 
   // ── E2EE 编排：Group 生命周期 ─────────────────────
 
   /** 建群后将本地 epoch 1 同步到服务端 */
+  /** 建群后将本地 epoch 1 同步到服务端，最多重试 3 次 */
   private async _syncEpochToServer(groupId: string): Promise<void> {
-    try {
-      const rotateParams: RpcParams = {
-        group_id: groupId,
-        current_epoch: 0,
-      };
-      const sigParams = await this._buildRotationSignature(groupId, 0, 1);
-      Object.assign(rotateParams, sigParams);
-      await this.call('group.e2ee.rotate_epoch', rotateParams);
-    } catch (exc) {
-      console.warn(`同步 epoch 到服务端失败 (group=${groupId}，可能已同步):`, exc);
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const rotateParams: RpcParams = {
+          group_id: groupId,
+          current_epoch: 0,
+        };
+        const sigParams = await this._buildRotationSignature(groupId, 0, 1);
+        Object.assign(rotateParams, sigParams);
+        await this.call('group.e2ee.rotate_epoch', rotateParams);
+        return;
+      } catch (exc) {
+        if (attempt < maxRetries) {
+          const delay = 500 * Math.pow(2, attempt - 1);
+          console.warn(`同步 epoch 到服务端失败 (group=${groupId}, 第${attempt}/${maxRetries}次), ${delay}ms后重试:`, exc);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          console.error(`同步 epoch 到服务端最终失败 (group=${groupId}, 已重试${maxRetries}次):`, exc);
+        }
+      }
     }
   }
 
@@ -2086,11 +2290,19 @@ export class AUNClient {
         return;
       }
       if (!admins.includes(myAid)) return;
-      // 非 leader：随机 jitter（2~6s）后检查 epoch 是否已被 leader 推进，没推进就兜底
+      // 非 leader：随机 jitter（2~6s）后查询服务端 epoch 是否已被 leader 推进
       const jitterMs = 2000 + Math.floor(Math.random() * 4000);
-      const beforeEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0;
+      let beforeEpoch = 0;
+      try {
+        const resp = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+        if (isJsonObject(resp)) beforeEpoch = Number(resp.epoch ?? 0);
+      } catch { beforeEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0; }
       await new Promise((r) => setTimeout(r, jitterMs));
-      const afterEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0;
+      let afterEpoch = 0;
+      try {
+        const resp = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+        if (isJsonObject(resp)) afterEpoch = Number(resp.epoch ?? 0);
+      } catch { afterEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0; }
       if (afterEpoch > beforeEpoch) return; // leader 已完成
       console.info('[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s', groupId, myAid);
       await this._rotateGroupEpoch(groupId);
@@ -2185,7 +2397,7 @@ export class AUNClient {
 
       // 构建并签名 manifest
       let manifest = buildMembershipManifest(
-        groupId, epoch, null, memberAids, {
+        groupId, epoch, epoch, memberAids, {
           added: [newMemberAid],
           removed: [],
           initiatorAid: this._aid,
@@ -2250,7 +2462,7 @@ export class AUNClient {
       cryptoKey, signData,
     );
 
-    const { p1363ToDer } = await import('./crypto.js');
+    // P1363 → DER 格式（使用顶部静态导入的 p1363ToDer）
     const sigDer = p1363ToDer(new Uint8Array(sigP1363));
 
     return {
@@ -2448,6 +2660,7 @@ export class AUNClient {
   private _startBackgroundTasks(): void {
     this._startHeartbeat();
     this._startTokenRefresh();
+    this._startPrekeyRefresh();
     this._startGroupEpochTasks();
     // 上线/重连后一次性补齐群消息和群事件
     this._safeAsync(this._syncAllGroupsOnce());
@@ -2463,7 +2676,7 @@ export class AUNClient {
       this._tokenRefreshTimer = null;
     }
     if (this._prekeyRefreshTimer !== null) {
-      clearInterval(this._prekeyRefreshTimer);
+      clearTimeout(this._prekeyRefreshTimer);
       this._prekeyRefreshTimer = null;
     }
     if (this._groupEpochCleanupTimer !== null) {
@@ -2520,9 +2733,14 @@ export class AUNClient {
       const minimumDelay = 1000;
 
       if (this._state !== 'connected' || !this._gatewayUrl) {
-        this._tokenRefreshTimer = globalThis.setTimeout(scheduleRefresh, minimumDelay);
+        // 非连接状态下使用指数退避，避免 1s 轮询浪费 CPU
+        this._tokenDisconnectedRetries++;
+        const backoff = Math.min(minimumDelay * Math.pow(2, this._tokenDisconnectedRetries), 60_000);
+        this._tokenRefreshTimer = globalThis.setTimeout(scheduleRefresh, backoff);
         return;
       }
+      // 连接恢复后重置退避计数器
+      this._tokenDisconnectedRetries = 0;
 
       let identity = this._identity;
       if (!identity) {
@@ -2566,9 +2784,54 @@ export class AUNClient {
     scheduleRefresh();
   }
 
-  /** Prekey 轮换定时器 */
+  /** Prekey 轮换定时器：定期检查本地 prekey 数量，不足时自动补充上传 */
   private _startPrekeyRefresh(): void {
-    return;
+    if (this._prekeyRefreshTimer !== null) return;
+    const PREKEY_CHECK_INTERVAL = 3600_000; // 1 小时
+    const PREKEY_LOW_THRESHOLD = 5;         // 低于此数量则补充
+    const PREKEY_UPLOAD_COUNT = 10;         // 每次补充上传的数量
+
+    const check = async () => {
+      try {
+        if (this._state !== 'connected' || !this._e2ee) return;
+        const aid = this._identity?.aid;
+        if (!aid) return;
+
+        // 从 keystore 加载本地 prekey 并计数
+        let remaining = 0;
+        try {
+          const deviceId = String(this._deviceId ?? '').trim();
+          let prekeys: Record<string, unknown> = {};
+          if (deviceId && typeof this._keystore.loadE2EEPrekeysForDevice === 'function') {
+            prekeys = (await this._keystore.loadE2EEPrekeysForDevice(aid, deviceId)) ?? {};
+          } else if (typeof this._keystore.loadE2EEPrekeys === 'function') {
+            prekeys = (await this._keystore.loadE2EEPrekeys(aid)) ?? {};
+          }
+          remaining = Object.keys(prekeys).length;
+        } catch {
+          // keystore 读取失败时保守地触发补充
+          remaining = 0;
+        }
+
+        // prekey 不足时批量生成并上传
+        if (remaining < PREKEY_LOW_THRESHOLD) {
+          const uploadCount = PREKEY_UPLOAD_COUNT - remaining;
+          for (let i = 0; i < uploadCount; i++) {
+            await this._uploadPrekey();
+          }
+        }
+      } catch (exc) {
+        console.warn('[aun_core] prekey 定时刷新失败:', exc);
+      }
+
+      // 仍处于连接状态时安排下一次检查
+      if (this._state === 'connected') {
+        this._prekeyRefreshTimer = globalThis.setTimeout(check, PREKEY_CHECK_INTERVAL);
+      }
+    };
+
+    // 首次检查延迟 1 小时后启动
+    this._prekeyRefreshTimer = globalThis.setTimeout(check, PREKEY_CHECK_INTERVAL);
   }
 
   private _extractConsumedPrekeyId(message: ConsumedPrekeyCarrier | null | undefined): string {
@@ -2707,7 +2970,18 @@ export class AUNClient {
 
   // ── 内部：断线重连 ────────────────────────────────
 
-  private async _handleTransportDisconnect(error: Error | null): Promise<void> {
+  /** 不重连 close code 集合：认证失败/权限错误/被踢等，重连无意义 */
+  private static readonly _NO_RECONNECT_CODES = new Set([4001, 4003, 4008, 4009, 4010, 4011]);
+
+  /** 处理服务端主动断开通知 event/gateway.disconnect */
+  private _onGatewayDisconnect(data: any): void {
+    const code = data?.code;
+    const reason = data?.reason ?? '';
+    console.warn(`[aun_core] 服务端主动断开: code=${code}, reason=${reason}`);
+    this._serverKicked = true;
+  }
+
+  private async _handleTransportDisconnect(error: Error | null, closeCode?: number): Promise<void> {
     if (this._closing || this._state === 'closed') return;
     this._state = 'disconnected';
     // 先停止后台任务，避免心跳/token刷新在重连期间继续触发
@@ -2720,20 +2994,34 @@ export class AUNClient {
     if (!this._sessionOptions.auto_reconnect) return;
     if (this._reconnectActive) return;
 
+    // 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
+    if (this._serverKicked || (closeCode !== undefined && AUNClient._NO_RECONNECT_CODES.has(closeCode))) {
+      this._state = 'terminal_failed';
+      const reason = this._serverKicked ? 'server kicked' : `close code ${closeCode}`;
+      console.warn(`[aun_core] 抑制自动重连: ${reason}`);
+      await this._dispatcher.publish('connection.state', {
+        state: this._state, error, reason,
+      });
+      return;
+    }
+
+    // 1000 = 正常关闭, 1006 = 网络异常断开（无 close frame），其他 code = 服务端主动关闭
+    const serverInitiated = closeCode !== undefined && closeCode !== 1000 && closeCode !== 1006;
+
     this._reconnectActive = true;
     this._reconnectAbort = new AbortController();
-    this._safeAsync(this._reconnectLoop());
+    this._safeAsync(this._reconnectLoop(serverInitiated));
   }
 
-  /** 指数退避重连循环（默认无限重试，仅在不可重试错误或 close() 或 max_attempts 耗尽时终止） */
-  private async _reconnectLoop(): Promise<void> {
+  /** 指数退避 + Full Jitter 重连循环（默认无限重试，仅在不可重试错误或 close() 或 max_attempts 耗尽时终止） */
+  private async _reconnectLoop(serverInitiated = false): Promise<void> {
     const retry = { ...this._sessionOptions.retry };
-    const initialDelay = retry.initial_delay;
     const maxDelay = retry.max_delay;
     // M25: max_attempts=0 表示无限重试（与 Go/Python 对齐）
     const maxAttemptsRaw = Number(retry.max_attempts ?? 0);
     const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? Math.floor(maxAttemptsRaw) : 0;
-    let delay = initialDelay;
+    // 服务端主动关闭时从 16s 起跳，避免重连风暴；网络断开从 initial_delay 起跳
+    let delay = serverInitiated ? 16.0 : retry.initial_delay;
 
     for (let attempt = 1; !this._reconnectAbort?.signal.aborted; attempt++) {
       this._state = 'reconnecting';
@@ -2743,10 +3031,18 @@ export class AUNClient {
       });
 
       try {
-        await this._sleep(delay * 1000);
+        await this._sleep(Math.random() * delay * 1000);
         if (this._reconnectAbort?.signal.aborted) {
           this._reconnectActive = false;
           return;
+        }
+        // 重连前先 HEAD /health 探测，不健康则跳过本轮
+        if (this._gatewayUrl) {
+          const healthy = await this._discovery.checkHealth(this._gatewayUrl, 5000);
+          if (!healthy) {
+            delay = Math.min(delay * 2, maxDelay);
+            continue;
+          }
         }
         await this._transport.close();
         if (!this._sessionParams) {

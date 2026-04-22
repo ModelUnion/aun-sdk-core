@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -720,22 +722,102 @@ func TestCloseIdempotent(t *testing.T) {
 	}
 }
 
+// ── ISSUE-GO-005: Disconnect / Logout 测试 ──────────────────
+
+func TestDisconnectFromIdleIsNoop(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	// idle 状态下 Disconnect 应无错误返回
+	if err := c.Disconnect(); err != nil {
+		t.Fatalf("idle 状态 Disconnect 不应报错: %v", err)
+	}
+	// 状态应保持 idle（未连接过，无需变为 disconnected）
+	if c.State() != StateIdle {
+		t.Fatalf("idle 状态 Disconnect 后应保持 idle，实际: %s", c.State())
+	}
+}
+
+func TestDisconnectSetsStateDisconnected(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	// 模拟已连接状态
+	c.mu.Lock()
+	c.state = StateConnected
+	c.mu.Unlock()
+
+	if err := c.Disconnect(); err != nil {
+		t.Fatalf("Disconnect 不应报错: %v", err)
+	}
+	if c.State() != StateDisconnected {
+		t.Fatalf("Disconnect 后状态应为 disconnected，实际: %s", c.State())
+	}
+}
+
+func TestLogoutClearsTokens(t *testing.T) {
+	dir := t.TempDir()
+	c := NewClient(map[string]any{"aun_path": dir})
+	defer func() { _ = c.Close() }()
+
+	// 设置身份和 token
+	aid := "logout-test.aid.com"
+	c.SetAID(aid)
+	c.SetIdentity(map[string]any{
+		"aid":           aid,
+		"access_token":  "tok-123",
+		"refresh_token": "ref-456",
+	})
+	// 保存到 keystore
+	_ = c.keyStore.SaveIdentity(aid, map[string]any{
+		"aid":           aid,
+		"access_token":  "tok-123",
+		"refresh_token": "ref-456",
+	})
+
+	if err := c.Logout(); err != nil {
+		t.Fatalf("Logout 不应报错: %v", err)
+	}
+
+	// 状态应为 closed
+	if c.State() != StateClosed {
+		t.Fatalf("Logout 后状态应为 closed，实际: %s", c.State())
+	}
+
+	// 重新加载身份，token 应已清除
+	loaded, err := c.keyStore.LoadIdentity(aid)
+	if err != nil {
+		t.Fatalf("LoadIdentity 失败: %v", err)
+	}
+	if loaded != nil {
+		if tok, ok := loaded["access_token"].(string); ok && tok != "" {
+			t.Fatal("Logout 后 access_token 应已清除")
+		}
+		if tok, ok := loaded["refresh_token"].(string); ok && tok != "" {
+			t.Fatal("Logout 后 refresh_token 应已清除")
+		}
+	}
+}
+
 // ── On 事件订阅测试 ──────────────────────────────────────
 
 // TestOnEventSubscription 验证通过客户端订阅事件
+// ISSUE-SDK-GO-006: Publish 异步化后需等待 handler 完成
 func TestOnEventSubscription(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
-	var received any
+	var received atomic.Value
 	sub := c.On("test.event", func(payload any) {
-		received = payload
+		received.Store(payload)
 	})
 	if sub == nil {
 		t.Fatal("On 应返回 Subscription")
 	}
 	c.events.Publish("test.event", "hello")
-	if received != "hello" {
-		t.Errorf("收到的 payload 不正确: %v", received)
+	// 等待异步 handler 完成
+	time.Sleep(50 * time.Millisecond)
+	if received.Load() != "hello" {
+		t.Errorf("收到的 payload 不正确: %v", received.Load())
 	}
 }
 
@@ -1275,13 +1357,13 @@ func TestDecryptP2PFailurePublishesUndecryptable(t *testing.T) {
 	c.aid = "alice.example.com"
 	c.mu.Unlock()
 
-	var undecryptablePayload any
-	receivedCount := 0
+	var undecryptablePayload atomic.Value
+	var receivedCount atomic.Int64
 	c.On("message.undecryptable", func(payload any) {
-		undecryptablePayload = payload
+		undecryptablePayload.Store(payload)
 	})
 	c.On("message.received", func(payload any) {
-		receivedCount++
+		receivedCount.Add(1)
 	})
 
 	c.processAndPublishMessage(map[string]any{
@@ -1296,15 +1378,18 @@ func TestDecryptP2PFailurePublishesUndecryptable(t *testing.T) {
 		},
 	})
 
-	if undecryptablePayload == nil {
+	// ISSUE-SDK-GO-006: Publish 异步化，等待 handler 完成
+	time.Sleep(100 * time.Millisecond)
+
+	if undecryptablePayload.Load() == nil {
 		t.Fatal("解密失败时应发布 message.undecryptable")
 	}
-	payloadMap, _ := undecryptablePayload.(map[string]any)
+	payloadMap, _ := undecryptablePayload.Load().(map[string]any)
 	if payloadMap["message_id"] != "msg-p2p-fail" || toInt64(payloadMap["seq"]) != 0 {
 		t.Fatalf("message.undecryptable 载荷不正确: %#v", payloadMap)
 	}
-	if receivedCount != 0 {
-		t.Fatalf("解密失败时不应发布 message.received: %d", receivedCount)
+	if receivedCount.Load() != 0 {
+		t.Fatalf("解密失败时不应发布 message.received: %d", receivedCount.Load())
 	}
 }
 
@@ -1312,13 +1397,13 @@ func TestDecryptGroupFailurePublishesUndecryptable(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	var undecryptablePayload any
-	createdCount := 0
+	var undecryptablePayload atomic.Value
+	var createdCount atomic.Int64
 	c.On("group.message_undecryptable", func(payload any) {
-		undecryptablePayload = payload
+		undecryptablePayload.Store(payload)
 	})
 	c.On("group.message_created", func(payload any) {
-		createdCount++
+		createdCount.Add(1)
 	})
 
 	c.processAndPublishGroupMessage(map[string]any{
@@ -1333,15 +1418,18 @@ func TestDecryptGroupFailurePublishesUndecryptable(t *testing.T) {
 		},
 	})
 
-	if undecryptablePayload == nil {
+	// ISSUE-SDK-GO-006: Publish 异步化，等待 handler 完成
+	time.Sleep(100 * time.Millisecond)
+
+	if undecryptablePayload.Load() == nil {
 		t.Fatal("群消息解密失败时应发布 group.message_undecryptable")
 	}
-	payloadMap, _ := undecryptablePayload.(map[string]any)
+	payloadMap, _ := undecryptablePayload.Load().(map[string]any)
 	if payloadMap["message_id"] != "msg-group-fail" || toInt64(payloadMap["seq"]) != 0 {
 		t.Fatalf("group.message_undecryptable 载荷不正确: %#v", payloadMap)
 	}
-	if createdCount != 0 {
-		t.Fatalf("群消息解密失败时不应发布 group.message_created: %d", createdCount)
+	if createdCount.Load() != 0 {
+		t.Fatalf("群消息解密失败时不应发布 group.message_created: %d", createdCount.Load())
 	}
 }
 
@@ -1432,16 +1520,24 @@ func TestPushedSeqsNoDuplicateOnGapFill(t *testing.T) {
 		map[string]any{"message_id": "m6", "seq": float64(6), "payload": map[string]any{"text": "new"}},
 	}
 
+	var mu sync.Mutex
 	var received []string
 	c.On("message.received", func(payload any) {
 		if m, ok := payload.(map[string]any); ok {
+			mu.Lock()
 			received = append(received, m["message_id"].(string))
+			mu.Unlock()
 		}
 	})
 
 	// 调用 publishGapFillMessages 验证去重逻辑
 	c.publishGapFillMessages(ns, messages)
 
+	// ISSUE-SDK-GO-006: Publish 异步化，等待 handler 完成
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
 	if len(received) != 1 {
 		t.Fatalf("补洞路径应跳过已推送的 seq=5，只投递 seq=6，实际投递: %v", received)
 	}
@@ -1472,15 +1568,23 @@ func TestPushedSeqsGroupNoDuplicateOnGapFill(t *testing.T) {
 		map[string]any{"message_id": "gm11", "group_id": groupID, "seq": float64(11), "payload": map[string]any{"text": "new"}},
 	}
 
+	var mu sync.Mutex
 	var created []string
 	c.On("group.message_created", func(payload any) {
 		if m, ok := payload.(map[string]any); ok {
+			mu.Lock()
 			created = append(created, m["message_id"].(string))
+			mu.Unlock()
 		}
 	})
 
 	c.publishGapFillGroupMessages(ns, messages)
 
+	// ISSUE-SDK-GO-006: Publish 异步化，等待 handler 完成
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
 	if len(created) != 1 {
 		t.Fatalf("群补洞路径应跳过已推送的 seq=10，只投递 seq=11，实际投递: %v", created)
 	}
@@ -1510,15 +1614,23 @@ func TestPushedSeqsPreMarkBeforeGapFill(t *testing.T) {
 		map[string]any{"message_id": "pm8", "seq": float64(8), "payload": map[string]any{"text": "new"}},
 	}
 
+	var mu sync.Mutex
 	var received []string
 	c.On("message.received", func(payload any) {
 		if m, ok := payload.(map[string]any); ok {
+			mu.Lock()
 			received = append(received, m["message_id"].(string))
+			mu.Unlock()
 		}
 	})
 
 	c.publishGapFillMessages(ns, messages)
 
+	// ISSUE-SDK-GO-006: Publish 异步化，等待 handler 完成
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
 	if len(received) != 1 || received[0] != "pm8" {
 		t.Fatalf("预标记后补洞路径应跳过 seq=7，只投递 seq=8，实际: %v", received)
 	}
@@ -1567,5 +1679,109 @@ func TestPushedSeqsConcurrentMarkAndRead(t *testing.T) {
 		if !c.isPushedSeq(ns, i) {
 			t.Errorf("seq=%d 应已被标记", i)
 		}
+	}
+}
+
+// ── 抑制重连测试 ──────────────────────────────────────────
+
+func makeDisconnectClient(t *testing.T) *AUNClient {
+	t.Helper()
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c.mu.Lock()
+	c.state = StateConnected
+	c.sessionOptions = map[string]any{
+		"auto_reconnect": true,
+		"retry": map[string]any{
+			"initial_delay": 0.01,
+			"max_delay":     0.05,
+			"max_attempts":  float64(0),
+		},
+	}
+	c.mu.Unlock()
+	return c
+}
+
+func TestNoReconnectOnFatalCloseCode(t *testing.T) {
+	fatalCodes := []int{4001, 4003, 4008, 4009, 4010, 4011}
+	for _, code := range fatalCodes {
+		t.Run(fmt.Sprintf("code_%d", code), func(t *testing.T) {
+			c := makeDisconnectClient(t)
+			defer func() { _ = c.Close() }()
+
+			c.handleTransportDisconnect(errors.New("test"), code)
+			// 等一小段时间让异步逻辑执行
+			time.Sleep(50 * time.Millisecond)
+
+			c.mu.RLock()
+			state := c.state
+			c.mu.RUnlock()
+			if state != StateTerminalFailed {
+				t.Errorf("close code %d 应进入 terminal_failed，实际: %s", code, state)
+			}
+			if c.reconnecting.Load() {
+				t.Errorf("close code %d 不应触发重连", code)
+			}
+		})
+	}
+}
+
+func TestReconnectOnRetryableCloseCode(t *testing.T) {
+	retryableCodes := []int{4000, 4029, 4500, 4503}
+	for _, code := range retryableCodes {
+		t.Run(fmt.Sprintf("code_%d", code), func(t *testing.T) {
+			c := makeDisconnectClient(t)
+			defer func() {
+				c.closing.Store(true) // 停止重连循环
+				_ = c.Close()
+			}()
+
+			c.handleTransportDisconnect(errors.New("test"), code)
+			time.Sleep(50 * time.Millisecond)
+
+			c.mu.RLock()
+			state := c.state
+			c.mu.RUnlock()
+			if state == StateTerminalFailed {
+				t.Errorf("close code %d 不应进入 terminal_failed", code)
+			}
+		})
+	}
+}
+
+func TestGatewayDisconnectSuppressesReconnect(t *testing.T) {
+	c := makeDisconnectClient(t)
+	defer func() { _ = c.Close() }()
+
+	// 模拟 gateway.disconnect 通知
+	c.onGatewayDisconnect(map[string]any{"code": 4009, "reason": "Connection replaced"})
+	if !c.serverKicked.Load() {
+		t.Fatal("onGatewayDisconnect 应设置 serverKicked 标志")
+	}
+
+	c.handleTransportDisconnect(errors.New("test"), 4009)
+	time.Sleep(50 * time.Millisecond)
+
+	c.mu.RLock()
+	state := c.state
+	c.mu.RUnlock()
+	if state != StateTerminalFailed {
+		t.Errorf("gateway.disconnect 后断线应进入 terminal_failed，实际: %s", state)
+	}
+}
+
+func TestServerKickedSuppressesAnyCode(t *testing.T) {
+	c := makeDisconnectClient(t)
+	defer func() { _ = c.Close() }()
+	c.serverKicked.Store(true)
+
+	// 使用一个"可重连"的 close code
+	c.handleTransportDisconnect(errors.New("test"), -1) // -1 = 网络异常
+	time.Sleep(50 * time.Millisecond)
+
+	c.mu.RLock()
+	state := c.state
+	c.mu.RUnlock()
+	if state != StateTerminalFailed {
+		t.Errorf("serverKicked=true 应抑制重连，实际: %s", state)
 	}
 }

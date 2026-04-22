@@ -9,6 +9,7 @@
  */
 
 import WebSocket from 'ws';
+import * as crypto from 'node:crypto';
 
 import { ConnectionError, SerializationError, TimeoutError, mapRemoteError } from './errors.js';
 import type { EventDispatcher } from './events.js';
@@ -20,10 +21,12 @@ const EVENT_NAME_MAP: Record<string, string> = {
   'message.recalled': 'message.recalled',
   'message.ack': 'message.ack',
   'group.changed': 'group.changed',
+  'group.message_created': 'group.message_created',
+  'storage.object_changed': 'storage.object_changed',
 };
 
-/** 断线回调 */
-export type DisconnectCallback = (error: Error | null) => void | Promise<void>;
+/** 断线回调，closeCode 为 WebSocket close code（1006 = 网络异常断开，其他 = 服务端主动关闭） */
+export type DisconnectCallback = (error: Error | null, closeCode?: number) => void | Promise<void>;
 
 /**
  * WebSocket JSON-RPC 2.0 传输层
@@ -70,7 +73,13 @@ export class RPCTransport {
    * 返回初始 challenge 消息（如果有）。
    */
   async connect(url: string): Promise<RpcMessage | null> {
-    const ws = new WebSocket(url, this._verifySsl ? undefined : { rejectUnauthorized: false });
+    // ws 8.x+ 中 rejectUnauthorized 需通过 https.Agent 传递
+    let wsOpts: any = undefined;
+    if (!this._verifySsl) {
+      const https = await import('https');
+      wsOpts = { agent: new https.Agent({ rejectUnauthorized: false }) };
+    }
+    const ws = new WebSocket(url, wsOpts);
     return this._connectWithWs(ws);
   }
 
@@ -90,26 +99,35 @@ export class RPCTransport {
         try { ws.close(); } catch { /* noop */ }
       };
 
-      ws.on('error', (err) => {
+      /** 清理握手阶段的临时监听器 */
+      const cleanupHandshakeListeners = (): void => {
+        try { ws.removeListener('message', onFirstMessage); } catch { /* noop */ }
+        try { ws.removeListener('error', onHandshakeError); } catch { /* noop */ }
+        try { ws.removeListener('open', onOpen); } catch { /* noop */ }
+      };
+
+      const onHandshakeError = (err: Error): void => {
         if (!initialResolved) {
           initialResolved = true;
+          cleanupHandshakeListeners();
           rollback();
           reject(new ConnectionError(`websocket connect failed: ${err.message}`));
         }
-      });
+      };
 
-      ws.on('open', () => {
+      const onOpen = (): void => {
         this._ws = ws;
         this._closed = false;
         // 等待第一条消息作为 challenge
-      });
+      };
 
-      ws.on('message', (data) => {
+      const onFirstMessage = (data: unknown): void => {
         if (!initialResolved) {
           // 第一条消息：尝试解析为 challenge
           initialResolved = true;
+          cleanupHandshakeListeners();
           try {
-            const message = this._decodeMessage(data);
+            const message = this._decodeMessage(data as string | Buffer | Buffer[] | ArrayBuffer | JsonObject);
             if (message.method === 'challenge') {
               this._challenge = message;
               this._setupListeners(ws);
@@ -129,18 +147,22 @@ export class RPCTransport {
           return;
         }
         // 后续消息由 _setupListeners 处理
-      });
+      };
 
-      // 连接超时处理
+      ws.on('error', onHandshakeError);
+      ws.on('open', onOpen);
+      ws.on('message', onFirstMessage);
+
+      // 连接超时覆盖整个握手流程（open + 等待 challenge）。
+      // 不在 open 时清除，防止服务端沉默导致 Promise 永远不 resolve。
       const connectTimeout = setTimeout(() => {
         if (!initialResolved) {
           initialResolved = true;
+          cleanupHandshakeListeners();
           rollback();
           reject(new ConnectionError('websocket connect timeout'));
         }
-      }, 10_000);
-
-      ws.on('open', () => clearTimeout(connectTimeout));
+      }, this._timeout);
     });
   }
 
@@ -197,7 +219,7 @@ export class RPCTransport {
       throw new ConnectionError('transport not connected');
     }
 
-    const rpcId = `rpc-${String(++this._idCounter).padStart(5, '0')}`;
+    const rpcId = `rpc-${crypto.randomBytes(8).toString('hex')}`;
     const effectiveTimeout = timeout ?? this._timeout;
 
     return new Promise<RpcResult>((resolve, reject) => {
@@ -261,12 +283,12 @@ export class RPCTransport {
       }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code: number) => {
       const wasClosed = this._closed;
       this._closed = true;
       if (!wasClosed && this._onDisconnect) {
         const cb = this._onDisconnect;
-        Promise.resolve(cb(null)).catch(exc => console.warn('[aun_core.transport] disconnect 回调异常:', exc));
+        Promise.resolve(cb(null, code)).catch(() => console.warn('[aun_core.transport] disconnect 回调异常'));
       }
     });
 

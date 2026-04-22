@@ -1,5 +1,5 @@
 // ── config 模块单元测试 ──────────────────────────────────────
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ValidationError } from '../../src/errors.js';
 import { getDeviceId, createConfig } from '../../src/config.js';
 
@@ -94,18 +94,28 @@ describe('createConfig', () => {
     expect((cfg as any).affinityTtlMs).toBeUndefined();
   });
 
-  it('不允许 verify_ssl=false', () => {
-    expect(() => createConfig({ verify_ssl: false }))
-      .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
+  it('verify_ssl=false 应记录警告但不抛错（浏览器环境）', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cfg = createConfig({ verify_ssl: false });
+    // 浏览器环境不支持跳过 SSL，verifySsl 始终为 true
+    expect(cfg.verifySsl).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('verify_ssl'));
+    warnSpy.mockRestore();
   });
 
-  it('不允许 verifySsl=false', () => {
-    expect(() => createConfig({ verifySsl: false }))
-      .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
+  it('verifySsl=false 应记录警告但不抛错（浏览器环境）', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cfg = createConfig({ verifySsl: false });
+    expect(cfg.verifySsl).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('verify_ssl'));
+    warnSpy.mockRestore();
   });
 
-  it('不允许 verifySSL=false', () => {
-    expect(() => createConfig({ verifySSL: false } as any))
-      .toThrowError(new ValidationError('browser SDK does not allow verify_ssl=false'));
+  it('verifySSL=false 应记录警告但不抛错（浏览器环境）', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cfg = createConfig({ verifySSL: false } as any);
+    expect(cfg.verifySsl).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('verify_ssl'));
+    warnSpy.mockRestore();
   });
 });

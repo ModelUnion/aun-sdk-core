@@ -1,12 +1,3 @@
-/**
- * Gateway 发现
- *
- * 通过 HTTPS GET 请求 well-known URL 获取 Gateway 列表，
- * 按优先级排序后返回最优 Gateway 的 WebSocket URL。
- *
- * 与 Python SDK 的 GatewayDiscovery 完全对齐。
- */
-
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { ConnectionError, ValidationError } from './errors.js';
@@ -47,11 +38,44 @@ function _httpGetJson(url: string, verifySsl: boolean, timeout: number): Promise
   });
 }
 
+function _httpHead(url: string, verifySsl: boolean, timeout: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const options: https.RequestOptions = { method: 'HEAD', timeout };
+    if (!verifySsl) options.rejectUnauthorized = false;
+    const req = mod.request(url, options, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
 export class GatewayDiscovery {
   private _verifySsl: boolean;
+  private _lastHealthy: boolean | null = null;
 
   constructor(opts?: { verifySsl?: boolean }) {
     this._verifySsl = opts?.verifySsl ?? true;
+  }
+
+  /** 最近一次 health check 结果，null 表示尚未检查 */
+  get lastHealthy(): boolean | null { return this._lastHealthy; }
+
+  /**
+   * 向 gatewayUrl 对应的 /health 端点发送 HEAD 请求，检查网关可用性。
+   * 结果缓存到 lastHealthy，同时返回检查结果。
+   */
+  async checkHealth(gatewayUrl: string, timeout = 5_000): Promise<boolean> {
+    const parsed = new URL(gatewayUrl);
+    parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
+    parsed.pathname = '/health';
+    const healthUrl = parsed.toString();
+    this._lastHealthy = await _httpHead(healthUrl, this._verifySsl, timeout);
+    return this._lastHealthy;
   }
 
   /**
@@ -90,6 +114,10 @@ export class GatewayDiscovery {
     if (!url || typeof url !== 'string') {
       throw new ValidationError('well-known missing gateway url');
     }
+
+    // 发现后自动检查网关可用性（不阻塞，失败不影响返回）
+    this.checkHealth(url, timeout).catch(() => {});
+
     return url;
   }
 }

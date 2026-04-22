@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -248,8 +249,17 @@ func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (map[s
 	// 本地有密钥但无证书 — 尝试服务端注册
 	created, err := a.createAIDRemote(ctx, gatewayURL, identity)
 	if err != nil {
-		// AID 已存在，尝试下载证书恢复
-		if strings.Contains(err.Error(), "already exists") {
+		// 优先检查结构化错误码：4090/409 = Conflict（AID 已存在）
+		var aunErr *AUNError
+		isConflict := false
+		if errors.As(err, &aunErr) {
+			isConflict = aunErr.Code == 4090 || aunErr.Code == 409
+		}
+		// 降级：兼容旧版服务端的字符串匹配
+		if !isConflict {
+			isConflict = strings.Contains(err.Error(), "already exists")
+		}
+		if isConflict {
 			recovered, recoverErr := a.recoverCertViaDownload(ctx, gatewayURL, identity)
 			if recoverErr != nil {
 				return nil, NewStateError(fmt.Sprintf(
