@@ -1,49 +1,56 @@
-"""Per-AID SQLCipher 加密数据库 — prekeys/tokens/groups/sessions/instance_state 的单一存储源。
+"""Per-AID SQLite3 数据库 — prekeys/tokens/groups/sessions/instance_state 的单一存储源。
 
-密钥派生：
-  seed_bytes → PBKDF2-HMAC-SHA256(salt=b"aun_sqlcipher_v1", iterations=100_000) → 32 字节 raw key
-  连接时通过 PRAGMA key = "x'<hex>'" 传入，跳过 SQLCipher 内部 KDF。
-
-零共享代码依赖：仅依赖 sqlcipher3 和标准库。
+零共享代码依赖：仅依赖 Python 标准库 sqlite3。
 """
 
 from __future__ import annotations
 
 import gc
+import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
+import sqlite3 as _sqlite_mod
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-_log = logging.getLogger("aun_core.keystore")
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-import sqlcipher3 as _sqlite_mod  # 硬性依赖，不降级到 sqlite3
+_log = logging.getLogger("aun_core.keystore")
 
 _SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5000
 
 
-# ── Key 派生 ─────────────────────────────────────────────────
+# ── Seed 管理 ─────────────────────────────────────────────────
 
 
-def derive_sqlcipher_key(seed_bytes: bytes) -> str:
-    """从 seed 派生 SQLCipher raw hex key。
+def derive_sqlite_key(seed_bytes: bytes) -> bytes:
+    """保留旧调用点的 seed 传递语义；SQLite3 不再使用数据库加密密钥。"""
+    return seed_bytes
 
-    使用与 key.json 不同的 salt，确保两个密钥独立。
-    返回格式：x'<64 hex chars>'（SQLCipher raw key 格式）。
-    """
-    derived = hashlib.pbkdf2_hmac(
-        "sha256",
-        seed_bytes,
-        b"aun_sqlcipher_v1",
-        iterations=100_000,
-    )
-    return f"x'{derived.hex()}'"
+
+def _derive_master_key(seed_bytes: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", seed_bytes, b"aun_file_secret_store_v1", 100_000)
+
+
+def _derive_field_key(master_key: bytes, scope: str, name: str) -> bytes:
+    if ":" in scope or ":" in name:
+        raise ValueError(f"scope/name 不能包含 ':'（scope={scope!r}, name={name!r}）")
+    msg = f"aun:{scope}:{name}\x01".encode("utf-8")
+    return hmac.new(master_key, msg, hashlib.sha256).digest()
+
+
+def _decode_secret_part(value: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception:
+        return bytes.fromhex(value)
 
 
 def load_or_create_seed(root: Path, *, encryption_seed: str | None = None) -> bytes:
@@ -86,7 +93,7 @@ _DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS prekeys (
         prekey_id TEXT NOT NULL,
         device_id TEXT NOT NULL DEFAULT '',
-        private_key_pem TEXT NOT NULL,
+        private_key_enc TEXT NOT NULL DEFAULT '',
         data TEXT NOT NULL DEFAULT '{}',
         created_at INTEGER,
         updated_at INTEGER NOT NULL,
@@ -97,14 +104,14 @@ _DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS group_current (
         group_id TEXT PRIMARY KEY,
         epoch INTEGER NOT NULL,
-        secret TEXT NOT NULL,
+        secret_enc TEXT NOT NULL DEFAULT '',
         data TEXT NOT NULL,
         updated_at INTEGER NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS group_old_epochs (
         group_id TEXT NOT NULL,
         epoch INTEGER NOT NULL,
-        secret TEXT NOT NULL,
+        secret_enc TEXT NOT NULL DEFAULT '',
         data TEXT NOT NULL,
         updated_at INTEGER NOT NULL,
         expires_at INTEGER,
@@ -113,7 +120,7 @@ _DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_group_old_expires ON group_old_epochs (group_id, expires_at)",
     """CREATE TABLE IF NOT EXISTS e2ee_sessions (
         session_id TEXT PRIMARY KEY,
-        data TEXT NOT NULL,
+        data_enc TEXT NOT NULL DEFAULT '{}',
         updated_at INTEGER NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS instance_state (
@@ -143,46 +150,31 @@ _DDL_STATEMENTS = [
 
 
 class AIDDatabase:
-    """单个 AID 的 SQLCipher 数据库。
+    """单个 AID 的 SQLite3 数据库。
 
     持有一个持久连接，优先使用 WAL；若当前文件系统对默认锁模式返回
     disk I/O error，则自动回退到 EXCLUSIVE + DELETE 模式。
     线程安全由外部 RLock 保证。
     """
 
-    def __init__(self, db_path: Path, sqlcipher_key: str) -> None:
+    def __init__(self, db_path: Path, sqlite_key: bytes | str | None = None) -> None:
         self._db_path = db_path
-        self._key = sqlcipher_key
+        if isinstance(sqlite_key, str):
+            self._seed_bytes = sqlite_key.encode("utf-8")
+        else:
+            self._seed_bytes = sqlite_key or b""
+        self._scope = db_path.parent.name
         self._conn: Any | None = None
         self._lock = threading.RLock()
         self._use_exclusive_locking = False
+        # 缓存 PBKDF2 派生的 master_key，避免每次加解密都重复 100K 次迭代
+        self._master_key: bytes | None = None
 
     _MAX_CONNECT_RETRIES = 3
     _RETRY_DELAY_S = 0.1
 
-    # 纯 SQLite3 文件头的前 16 字节
-    _SQLITE3_HEADER = b"SQLite format 3\x00"
-
-    def _detect_plain_sqlite(self) -> bool:
-        """检测数据库文件是否为未加密的纯 SQLite3 格式。
-
-        纯 SQLite3 文件以 'SQLite format 3\\0' 开头（16字节），
-        SQLCipher 加密文件的头部是随机字节。
-        """
-        if not self._db_path.exists():
-            return False
-        try:
-            with open(self._db_path, "rb") as f:
-                header = f.read(16)
-            return header == self._SQLITE3_HEADER
-        except OSError:
-            return False
-
     @staticmethod
     def _is_recoverable_db_error(err_msg: str) -> bool:
-        # S3: 不能把 "hmac check failed" 视为可恢复 — 这是密码错误的明确信号，
-        # 误把它当成"文件损坏"会导致主上下文吞掉错误并把合法数据库重建/清空。
-        # 该类错误必须向上抛出，由调用方提示用户重试密码。
         lowered = str(err_msg or "").lower()
         return any(
             token in lowered
@@ -242,16 +234,6 @@ class AIDDatabase:
         if self._conn is not None:
             return self._conn
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # ── 预检：检测纯 SQLite3 文件（加密不匹配）──
-        if self._detect_plain_sqlite():
-            _log.warning(
-                "检测到数据库文件为未加密的纯 SQLite3 格式（文件头匹配 'SQLite format 3'），"
-                "但当前配置要求 SQLCipher 加密。备份未加密文件后将重建加密数据库: %s",
-                self._db_path,
-            )
-            self._backup_broken_files(tag="unencrypted")
-            self._cleanup_broken_files()
 
         last_exc: Exception | None = None
         for attempt in range(1, self._MAX_CONNECT_RETRIES + 1):
@@ -318,7 +300,6 @@ class AIDDatabase:
             check_same_thread=False,
         )
         try:
-            conn.execute(f"PRAGMA key = \"{self._key}\"")
             if exclusive_locking:
                 conn.execute("PRAGMA locking_mode = EXCLUSIVE")
                 conn.execute("PRAGMA journal_mode = DELETE")
@@ -340,6 +321,7 @@ class AIDDatabase:
     def _init_schema(self, conn: Any) -> None:
         for ddl in _DDL_STATEMENTS:
             conn.execute(ddl)
+        self._migrate_legacy_columns(conn)
         # 初始化 schema version
         cur = conn.execute("SELECT version FROM _schema_version WHERE id = 1")
         row = cur.fetchone()
@@ -349,6 +331,68 @@ class AIDDatabase:
                 (_SCHEMA_VERSION,),
             )
         conn.commit()
+
+    def _migrate_legacy_columns(self, conn: Any) -> None:
+        self._rename_column_if_exists(conn, "prekeys", "private_key_pem", "private_key_enc")
+        self._rename_column_if_exists(conn, "group_current", "secret", "secret_enc")
+        self._rename_column_if_exists(conn, "group_old_epochs", "secret", "secret_enc")
+        self._rename_column_if_exists(conn, "e2ee_sessions", "data", "data_enc")
+
+    @staticmethod
+    def _rename_column_if_exists(conn: Any, table: str, old_name: str, new_name: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if old_name in columns and new_name not in columns:
+            conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}")
+
+    def _get_master_key(self) -> bytes:
+        """获取缓存的 master_key，避免每次都重复 100K 次 PBKDF2 迭代。"""
+        if self._master_key is None:
+            self._master_key = _derive_master_key(self._seed_bytes)
+        return self._master_key
+
+    def _protect_text(self, name: str, plaintext: str) -> str:
+        if not self._seed_bytes or not plaintext:
+            return plaintext
+        try:
+            master_key = self._get_master_key()
+            field_key = _derive_field_key(master_key, self._scope, name)
+            nonce = os.urandom(12)
+            sealed = AESGCM(field_key).encrypt(nonce, plaintext.encode("utf-8"), None)
+            record = {
+                "scheme": "file_aes",
+                "name": name,
+                "persisted": True,
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "ciphertext": base64.b64encode(sealed[:-16]).decode("ascii"),
+                "tag": base64.b64encode(sealed[-16:]).decode("ascii"),
+            }
+            return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        except Exception as exc:
+            _log.warning("字段加密失败 (scope=%s, name=%s)，降级明文存储: %s", self._scope, name, exc)
+            return plaintext
+
+    def _reveal_text(self, name: str, stored: str) -> str:
+        if not stored or not self._seed_bytes:
+            return stored
+        try:
+            record = json.loads(stored)
+        except (json.JSONDecodeError, TypeError):
+            return stored
+        if not isinstance(record, dict) or record.get("scheme") != "file_aes":
+            return stored
+        if str(record.get("name") or "") != name:
+            return stored
+        try:
+            master_key = self._get_master_key()
+            field_key = _derive_field_key(master_key, self._scope, name)
+            nonce = _decode_secret_part(str(record.get("nonce") or ""))
+            ciphertext = _decode_secret_part(str(record.get("ciphertext") or ""))
+            tag = _decode_secret_part(str(record.get("tag") or ""))
+            return AESGCM(field_key).decrypt(nonce, ciphertext + tag, None).decode("utf-8")
+        except Exception as exc:
+            _log.warning("字段解密失败 (scope=%s, name=%s): %s", self._scope, name, exc)
+            return stored
 
     def close(self) -> None:
         with self._lock:
@@ -440,13 +484,14 @@ class AIDDatabase:
             conn = self._get_conn()
             now = _now_ms()
             data_json = json.dumps(extra_data or {}, ensure_ascii=False, separators=(",", ":"))
+            stored_key = self._protect_text(f"prekey/{prekey_id}", private_key_pem)
             conn.execute(
-                "INSERT INTO prekeys (prekey_id, device_id, private_key_pem, data, created_at, updated_at, expires_at) "
+                "INSERT INTO prekeys (prekey_id, device_id, private_key_enc, data, created_at, updated_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(prekey_id, device_id) DO UPDATE SET "
-                "private_key_pem = excluded.private_key_pem, data = excluded.data, "
+                "private_key_enc = excluded.private_key_enc, data = excluded.data, "
                 "updated_at = excluded.updated_at, expires_at = excluded.expires_at",
-                (prekey_id, device_id, private_key_pem, data_json, created_at or now, now, expires_at),
+                (prekey_id, device_id, stored_key, data_json, created_at or now, now, expires_at),
             )
             conn.commit()
         self._retry_on_locked(_do)
@@ -454,14 +499,15 @@ class AIDDatabase:
     def load_prekeys(self, device_id: str = "") -> dict[str, dict[str, Any]]:
         conn = self._get_conn()
         cur = conn.execute(
-            "SELECT prekey_id, private_key_pem, data, created_at, updated_at, expires_at "
+            "SELECT prekey_id, private_key_enc, data, created_at, updated_at, expires_at "
             "FROM prekeys WHERE device_id = ?",
             (device_id,),
         )
         result: dict[str, dict[str, Any]] = {}
         for row in cur.fetchall():
+            prekey_id = str(row[0])
             entry: dict[str, Any] = {
-                "private_key_pem": row[1],
+                "private_key_pem": self._reveal_text(f"prekey/{prekey_id}", str(row[1] or "")),
                 "created_at": row[3],
                 "updated_at": row[4],
                 "expires_at": row[5],
@@ -473,14 +519,14 @@ class AIDDatabase:
                 extra = {}
             if isinstance(extra, dict):
                 entry.update(extra)
-            result[row[0]] = entry
+            result[prekey_id] = entry
         return result
 
     def load_prekey_by_id(self, prekey_id: str) -> dict[str, Any] | None:
         """按 prekey_id 精确查找，不限 device_id（用于解密回退）。"""
         conn = self._get_conn()
         cur = conn.execute(
-            "SELECT prekey_id, private_key_pem, data, created_at, updated_at, expires_at "
+            "SELECT prekey_id, private_key_enc, data, created_at, updated_at, expires_at "
             "FROM prekeys WHERE prekey_id = ? LIMIT 1",
             (prekey_id,),
         )
@@ -488,7 +534,7 @@ class AIDDatabase:
         if not row:
             return None
         entry: dict[str, Any] = {
-            "private_key_pem": row[1],
+            "private_key_pem": self._reveal_text(f"prekey/{prekey_id}", str(row[1] or "")),
             "created_at": row[3],
             "updated_at": row[4],
             "expires_at": row[5],
@@ -551,13 +597,14 @@ class AIDDatabase:
             conn = self._get_conn()
             now = _now_ms()
             data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            stored_secret = self._protect_text(f"group/{group_id}/current", secret)
             conn.execute(
-                "INSERT INTO group_current (group_id, epoch, secret, data, updated_at) "
+                "INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at) "
                 "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(group_id) DO UPDATE SET "
-                "epoch = excluded.epoch, secret = excluded.secret, "
+                "epoch = excluded.epoch, secret_enc = excluded.secret_enc, "
                 "data = excluded.data, updated_at = excluded.updated_at",
-                (group_id, epoch, secret, data_json, now),
+                (group_id, epoch, stored_secret, data_json, now),
             )
             conn.commit()
         self._retry_on_locked(_do)
@@ -565,7 +612,7 @@ class AIDDatabase:
     def load_group_current(self, group_id: str) -> dict[str, Any] | None:
         conn = self._get_conn()
         cur = conn.execute(
-            "SELECT epoch, secret, data, updated_at FROM group_current WHERE group_id = ?",
+            "SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?",
             (group_id,),
         )
         row = cur.fetchone()
@@ -574,20 +621,21 @@ class AIDDatabase:
         return {
             "group_id": group_id,
             "epoch": row[0],
-            "secret": row[1],
+            "secret": self._reveal_text(f"group/{group_id}/current", str(row[1] or "")),
             **json.loads(row[2]),
             "updated_at": row[3],
         }
 
     def load_all_group_current(self) -> dict[str, dict[str, Any]]:
         conn = self._get_conn()
-        cur = conn.execute("SELECT group_id, epoch, secret, data, updated_at FROM group_current")
+        cur = conn.execute("SELECT group_id, epoch, secret_enc, data, updated_at FROM group_current")
         result: dict[str, dict[str, Any]] = {}
         for row in cur.fetchall():
+            group_id = str(row[0])
             result[row[0]] = {
-                "group_id": row[0],
+                "group_id": group_id,
                 "epoch": row[1],
-                "secret": row[2],
+                "secret": self._reveal_text(f"group/{group_id}/current", str(row[2] or "")),
                 **json.loads(row[3]),
                 "updated_at": row[4],
             }
@@ -614,13 +662,14 @@ class AIDDatabase:
             conn = self._get_conn()
             now = updated_at if updated_at is not None else _now_ms()
             data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            stored_secret = self._protect_text(f"group/{group_id}/epoch/{epoch}", secret)
             conn.execute(
-                "INSERT INTO group_old_epochs (group_id, epoch, secret, data, updated_at, expires_at) "
+                "INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(group_id, epoch) DO UPDATE SET "
-                "secret = excluded.secret, data = excluded.data, "
+                "secret_enc = excluded.secret_enc, data = excluded.data, "
                 "updated_at = excluded.updated_at, expires_at = excluded.expires_at",
-                (group_id, epoch, secret, data_json, now, expires_at),
+                (group_id, epoch, stored_secret, data_json, now, expires_at),
             )
             conn.commit()
         self._retry_on_locked(_do)
@@ -628,7 +677,7 @@ class AIDDatabase:
     def load_group_old_epochs(self, group_id: str) -> list[dict[str, Any]]:
         conn = self._get_conn()
         cur = conn.execute(
-            "SELECT epoch, secret, data, updated_at, expires_at "
+            "SELECT epoch, secret_enc, data, updated_at, expires_at "
             "FROM group_old_epochs WHERE group_id = ? ORDER BY epoch ASC",
             (group_id,),
         )
@@ -636,7 +685,7 @@ class AIDDatabase:
         for row in cur.fetchall():
             result.append({
                 "epoch": row[0],
-                "secret": row[1],
+                "secret": self._reveal_text(f"group/{group_id}/epoch/{row[0]}", str(row[1] or "")),
                 **json.loads(row[2]),
                 "updated_at": row[3],
                 "expires_at": row[4],
@@ -675,10 +724,11 @@ class AIDDatabase:
             conn = self._get_conn()
             now = _now_ms()
             data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            stored_data = self._protect_text(f"session/{session_id}", data_json)
             conn.execute(
-                "INSERT INTO e2ee_sessions (session_id, data, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-                (session_id, data_json, now),
+                "INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET data_enc = excluded.data_enc, updated_at = excluded.updated_at",
+                (session_id, stored_data, now),
             )
             conn.commit()
         self._retry_on_locked(_do)
@@ -686,21 +736,24 @@ class AIDDatabase:
     def load_session(self, session_id: str) -> dict[str, Any] | None:
         conn = self._get_conn()
         cur = conn.execute(
-            "SELECT data, updated_at FROM e2ee_sessions WHERE session_id = ?",
+            "SELECT data_enc, updated_at FROM e2ee_sessions WHERE session_id = ?",
             (session_id,),
         )
         row = cur.fetchone()
         if row is None:
             return None
-        return {**json.loads(row[0]), "session_id": session_id, "updated_at": row[1]}
+        data_json = self._reveal_text(f"session/{session_id}", str(row[0] or "{}"))
+        return {**json.loads(data_json), "session_id": session_id, "updated_at": row[1]}
 
     def load_all_sessions(self) -> list[dict[str, Any]]:
         conn = self._get_conn()
-        cur = conn.execute("SELECT session_id, data, updated_at FROM e2ee_sessions")
-        return [
-            {**json.loads(row[1]), "session_id": row[0], "updated_at": row[2]}
-            for row in cur.fetchall()
-        ]
+        cur = conn.execute("SELECT session_id, data_enc, updated_at FROM e2ee_sessions")
+        result: list[dict[str, Any]] = []
+        for row in cur.fetchall():
+            session_id = str(row[0])
+            data_json = self._reveal_text(f"session/{session_id}", str(row[1] or "{}"))
+            result.append({**json.loads(data_json), "session_id": session_id, "updated_at": row[2]})
+        return result
 
     def delete_session(self, session_id: str) -> None:
         def _do():

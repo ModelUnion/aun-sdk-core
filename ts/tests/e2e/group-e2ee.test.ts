@@ -326,18 +326,21 @@ describe('Group E2EE E2E 测试', () => {
     await addMember(alice, groupId, bAid);
     await addMember(alice, groupId, cAid);
 
-    // 等待 SDK 自动分发密钥给 Bob 和 Carol
+    // 等待初始成员变更轮换/分发完成，记录 kick 前 Bob 已知最高 epoch。
     await sleep(2000);
+    const oldEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
 
     // 踢 Carol
     await kickMember(alice, groupId, cAid);
 
-    // kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到 epoch 2 密钥
-    const bobGotEpoch2 = await waitFor(() => {
+    // kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到更高 epoch 密钥。
+    const bobGotNewEpoch = await waitFor(() => {
       const allBob = loadAllGroupSecrets(getKeystore(bob), bAid, groupId);
-      return allBob.has(2);
+      return Array.from(allBob.keys()).some((epoch) => epoch > oldEpoch);
     }, 15_000);
-    expect(bobGotEpoch2, 'Bob 应在 15s 内收到 epoch 2 密钥').toBe(true);
+    expect(bobGotNewEpoch, `Bob 应在 15s 内收到 epoch > ${oldEpoch} 密钥`).toBe(true);
+    const newEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
+
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 
@@ -349,11 +352,11 @@ describe('Group E2EE E2E 测试', () => {
     });
 
     try {
-      const msgsBob = await bobWatch.waitFor((messages) => filterByEpoch(messages, 2).some((msg) =>
+      const msgsBob = await bobWatch.waitFor((messages) => filterByEpoch(messages, newEpoch).some((msg) =>
         String(((msg.payload as JsonObject | undefined)?.text) ?? '') === '踢人后的消息'));
-      const decryptedBob = filterByEpoch(msgsBob, 2).find((msg) =>
+      const decryptedBob = filterByEpoch(msgsBob, newEpoch).find((msg) =>
         String(((msg.payload as JsonObject | undefined)?.text) ?? '') === '踢人后的消息');
-      expect(decryptedBob, 'Bob: 应有 epoch 2 的解密消息').toBeTruthy();
+      expect(decryptedBob, `Bob: 应有 epoch ${newEpoch} 的解密消息`).toBeTruthy();
       expect(((decryptedBob?.payload as JsonObject | undefined)?.text)).toBe('踢人后的消息');
     } finally {
       bobWatch.stop();
@@ -361,7 +364,7 @@ describe('Group E2EE E2E 测试', () => {
 
     // Carol 没有 epoch 2 密钥（被踢后不会收到新密钥）
     const allCarol = loadAllGroupSecrets(getKeystore(carol), cAid, groupId);
-    expect(allCarol.has(2), 'Carol 不应有 epoch 2 密钥').toBe(false);
+    expect(allCarol.has(newEpoch), `Carol 不应有 epoch ${newEpoch} 密钥`).toBe(false);
   }, TEST_TIMEOUT);
 
   // ── Test 4: 加人 → 无 epoch 轮换 → 新成员可解密当前 epoch 消息 ──
@@ -385,9 +388,15 @@ describe('Group E2EE E2E 测试', () => {
     // 等待 SDK 自动分发密钥给 Bob
     await sleep(2000);
 
-    // 加 Carol（SDK 自动分发当前密钥）
+    // 加 Carol 后会触发成员变更 epoch 轮换，并向新成员分发新 epoch key。
+    const beforeCarolJoinEpoch = Math.max(...loadAllGroupSecrets(getKeystore(alice), aAid, groupId).keys());
     await addMember(alice, groupId, cAid);
-    await sleep(2000);
+    const carolGotSecret = await waitFor(() => {
+      const aliceEpochs = loadAllGroupSecrets(getKeystore(alice), aAid, groupId);
+      const carolEpochs = loadAllGroupSecrets(getKeystore(carol), cAid, groupId);
+      return Array.from(aliceEpochs.keys()).some((epoch) => epoch > beforeCarolJoinEpoch && carolEpochs.has(epoch));
+    }, 15_000);
+    expect(carolGotSecret, 'Carol 应在 15s 内收到新 epoch group_secret').toBe(true);
 
     const carolWatch = await watchGroupMessages(carol, groupId);
 
@@ -676,30 +685,29 @@ describe('Group E2EE E2E 测试', () => {
     // 等待 SDK 自动分发密钥
     await sleep(2000);
 
-    // 确认三方都有 epoch 1
+    // 确认三方都有初始 group secret。
     expect(alice.groupE2ee.hasSecret(groupId), 'Alice 应有密钥').toBe(true);
-    const allGotEpoch1 = await waitFor(() => {
+    const allGotInitialSecret = await waitFor(() => {
       return bob.groupE2ee.hasSecret(groupId) && carol.groupE2ee.hasSecret(groupId);
     }, 10_000);
-    expect(allGotEpoch1, 'Bob/Carol 应在 10s 内收到 epoch 1').toBe(true);
+    expect(allGotInitialSecret, 'Bob/Carol 应在 10s 内收到初始 group_secret').toBe(true);
 
-    const oldEpoch = alice.groupE2ee.currentEpoch(groupId);
-    expect(oldEpoch, '初始应为 epoch 1').toBe(1);
+    const oldEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
 
     // Carol 主动退群
     await carol.call('group.leave', { group_id: groupId });
 
-    // Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换
-    // 轮询等待 Bob 拿到 epoch 2 密钥
-    const bobGotEpoch2 = await waitFor(() => {
+    // Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换。
+    const bobGotNewEpoch = await waitFor(() => {
       const allBob = loadAllGroupSecrets(getKeystore(bob), bAid, groupId);
-      return allBob.has(2);
+      return Array.from(allBob.keys()).some((epoch) => epoch > oldEpoch);
     }, 15_000);
-    expect(bobGotEpoch2, 'Bob 应在 15s 内收到 epoch 2 密钥').toBe(true);
+    expect(bobGotNewEpoch, `Bob 应在 15s 内收到 epoch > ${oldEpoch} 密钥`).toBe(true);
+    const newEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
 
-    // Alice 也应有 epoch 2
+    // Alice 也应有新 epoch
     const allAlice = loadAllGroupSecrets(getKeystore(alice), aAid, groupId);
-    expect(allAlice.has(2), 'Alice 应有 epoch 2').toBe(true);
+    expect(allAlice.has(newEpoch), `Alice 应有 epoch ${newEpoch}`).toBe(true);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 
@@ -710,11 +718,11 @@ describe('Group E2EE E2E 测试', () => {
     });
 
     try {
-      const msgsBob = await bobWatch.waitFor((messages) => filterByEpoch(messages, 2).some((msg) =>
+      const msgsBob = await bobWatch.waitFor((messages) => filterByEpoch(messages, newEpoch).some((msg) =>
         String(((msg.payload as JsonObject | undefined)?.text) ?? '') === '退群后的消息'));
-      const decryptedBob = filterByEpoch(msgsBob, 2).find((msg) =>
+      const decryptedBob = filterByEpoch(msgsBob, newEpoch).find((msg) =>
         String(((msg.payload as JsonObject | undefined)?.text) ?? '') === '退群后的消息');
-      expect(decryptedBob, 'Bob: 应有 epoch 2 的解密消息').toBeTruthy();
+      expect(decryptedBob, `Bob: 应有 epoch ${newEpoch} 的解密消息`).toBeTruthy();
       expect(((decryptedBob?.payload as JsonObject | undefined)?.text)).toBe('退群后的消息');
     } finally {
       bobWatch.stop();
@@ -722,6 +730,6 @@ describe('Group E2EE E2E 测试', () => {
 
     // Carol 不应有 epoch 2 密钥
     const allCarol = loadAllGroupSecrets(getKeystore(carol), cAid, groupId);
-    expect(allCarol.has(2), 'Carol 不应有 epoch 2 密钥').toBe(false);
+    expect(allCarol.has(newEpoch), `Carol 不应有 epoch ${newEpoch} 密钥`).toBe(false);
   }, TEST_TIMEOUT);
 });

@@ -13,9 +13,17 @@ from .errors import (
     StateError,
     SerializationError,
     E2EEError,
+    GroupError,
+    GroupNotFoundError,
+    GroupStateError,
+    E2EEGroupSecretMissingError,
+    E2EEGroupEpochMismatchError,
+    E2EEGroupCommitmentInvalidError,
+    E2EEGroupNotMemberError,
+    E2EEGroupDecryptFailedError,
 )
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 __all__ = [
     "__version__",
@@ -33,4 +41,12 @@ __all__ = [
     "StateError",
     "SerializationError",
     "E2EEError",
+    "GroupError",
+    "GroupNotFoundError",
+    "GroupStateError",
+    "E2EEGroupSecretMissingError",
+    "E2EEGroupEpochMismatchError",
+    "E2EEGroupCommitmentInvalidError",
+    "E2EEGroupNotMemberError",
+    "E2EEGroupDecryptFailedError",
 ]

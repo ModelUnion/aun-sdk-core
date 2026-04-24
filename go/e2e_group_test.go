@@ -363,6 +363,27 @@ func waitForGroupEpoch(client *AUNClient, aid, groupID string, epoch int, timeou
 	return false
 }
 
+func maxGroupSecretEpoch(client *AUNClient, aid, groupID string) int {
+	maxEpoch := 0
+	for epoch := range LoadAllGroupSecrets(client.keyStore, aid, groupID) {
+		if epoch > maxEpoch {
+			maxEpoch = epoch
+		}
+	}
+	return maxEpoch
+}
+
+func waitForGroupEpochGreaterThan(client *AUNClient, aid, groupID string, oldEpoch int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if maxGroupSecretEpoch(client, aid, groupID) > oldEpoch {
+			return true
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // 测试用例
 // ---------------------------------------------------------------------------
@@ -522,13 +543,16 @@ func TestGroupE2EEpochRotationOnKick(t *testing.T) {
 		t.Fatal("Carol 未在超时内收到 epoch 1 密钥")
 	}
 
+	oldEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
+
 	// 踢 Carol
 	kickMember(t, alice, groupID, cAID)
 
-	// kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到 epoch 2 密钥
-	if !waitForGroupEpoch(bob, bAID, groupID, 2, 15*time.Second) {
-		t.Fatal("Bob 未在 15s 内收到 epoch 2 密钥")
+	// kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到更高 epoch 密钥
+	if !waitForGroupEpochGreaterThan(bob, bAID, groupID, oldEpoch, 15*time.Second) {
+		t.Fatalf("Bob 未在 15s 内收到 epoch > %d 密钥", oldEpoch)
 	}
+	newEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
 
 	bobWatch := watchGroupMessages(t, bob, groupID)
 	defer bobWatch.Stop()
@@ -538,14 +562,14 @@ func TestGroupE2EEpochRotationOnKick(t *testing.T) {
 
 	// Bob 能解密（有 epoch 2 密钥）
 	msgsBob := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
-		for _, msg := range filterDecryptedByEpoch(messages, 2) {
+		for _, msg := range filterDecryptedByEpoch(messages, newEpoch) {
 			if getPayloadText(msg) == "踢人后的消息" {
 				return true
 			}
 		}
 		return false
 	})
-	decryptedBob := filterDecryptedByEpoch(msgsBob, 2)
+	decryptedBob := filterDecryptedByEpoch(msgsBob, newEpoch)
 	foundBob := false
 	for _, msg := range decryptedBob {
 		if getPayloadText(msg) == "踢人后的消息" {
@@ -554,13 +578,13 @@ func TestGroupE2EEpochRotationOnKick(t *testing.T) {
 		}
 	}
 	if !foundBob {
-		t.Fatal("Bob: 未找到 epoch 2 的自动解密消息")
+		t.Fatal(fmt.Sprintf("Bob: 未找到 epoch %d 的自动解密消息", newEpoch))
 	}
 
-	// Carol 没有 epoch 2 密钥（被踢后不会收到新密钥）
+	// Carol 没有新 epoch 密钥（被踢后不会收到新密钥）
 	allCarol := LoadAllGroupSecrets(carol.keyStore, cAID, groupID)
-	if _, hasEpoch2 := allCarol[2]; hasEpoch2 {
-		t.Fatal("Carol 被踢后不应持有 epoch 2 密钥")
+	if _, hasNewEpoch := allCarol[newEpoch]; hasNewEpoch {
+		t.Fatalf("Carol 被踢后不应持有 epoch %d 密钥", newEpoch)
 	}
 }
 
@@ -769,12 +793,24 @@ func TestGroupE2ENewMemberNoRotation(t *testing.T) {
 		t.Fatal("Bob 未在超时内收到 group_secret")
 	}
 
-	// 加 Carol（SDK 自动分发当前密钥，不轮换 epoch）
+	// 加 Carol 后会触发成员变更 epoch 轮换，并向新成员分发新 epoch key。
+	beforeCarolJoinEpoch := maxGroupSecretEpoch(alice, aAID, groupID)
 	addMember(t, alice, groupID, cAID)
 
-	// 等待 Carol 收到密钥
-	if !waitForGroupSecret(carol, groupID, 10*time.Second) {
-		t.Fatal("Carol 未在超时内收到 group_secret")
+	// 等待 Carol 收到新 epoch 密钥
+	deadline := time.Now().Add(15 * time.Second)
+	carolGotSecret := false
+	for time.Now().Before(deadline) {
+		aliceEpoch := maxGroupSecretEpoch(alice, aAID, groupID)
+		carolEpoch := maxGroupSecretEpoch(carol, cAID, groupID)
+		if aliceEpoch > beforeCarolJoinEpoch && carolEpoch == aliceEpoch {
+			carolGotSecret = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if !carolGotSecret {
+		t.Fatal("Carol 未在 15s 内收到新 epoch group_secret")
 	}
 
 	carolWatch := watchGroupMessages(t, carol, groupID)
@@ -1030,15 +1066,7 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 		t.Fatal("Carol 未在超时内收到 group_secret")
 	}
 
-	// 确认 epoch 1
-	epoch := alice.GroupE2EE().CurrentEpoch(groupID)
-	if epoch == nil || *epoch != 1 {
-		epVal := 0
-		if epoch != nil {
-			epVal = *epoch
-		}
-		t.Fatalf("期望 epoch 1，实际 %d", epVal)
-	}
+	oldEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
 
 	// Carol 主动退群
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -1049,15 +1077,15 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 	}
 
 	// Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换
-	// 轮询等待 Bob 拿到 epoch 2 密钥
-	if !waitForGroupEpoch(bob, bAID, groupID, 2, 15*time.Second) {
-		t.Fatal("Bob 未在 15s 内收到 epoch 2 密钥（leave 后自动轮换）")
+	if !waitForGroupEpochGreaterThan(bob, bAID, groupID, oldEpoch, 15*time.Second) {
+		t.Fatalf("Bob 未在 15s 内收到 epoch > %d 密钥（leave 后自动轮换）", oldEpoch)
 	}
+	newEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
 
-	// Alice 也应有 epoch 2
+	// Alice 也应有新 epoch
 	allAlice := LoadAllGroupSecrets(alice.keyStore, aAID, groupID)
-	if _, hasEpoch2 := allAlice[2]; !hasEpoch2 {
-		t.Fatal("Alice 应持有 epoch 2 密钥")
+	if _, hasNewEpoch := allAlice[newEpoch]; !hasNewEpoch {
+		t.Fatalf("Alice 应持有 epoch %d 密钥", newEpoch)
 	}
 
 	bobWatch := watchGroupMessages(t, bob, groupID)
@@ -1068,14 +1096,14 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 
 	// Bob 能解密
 	msgsBob := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
-		for _, msg := range filterDecryptedByEpoch(messages, 2) {
+		for _, msg := range filterDecryptedByEpoch(messages, newEpoch) {
 			if getPayloadText(msg) == "退群后的消息" {
 				return true
 			}
 		}
 		return false
 	})
-	decryptedBob := filterDecryptedByEpoch(msgsBob, 2)
+	decryptedBob := filterDecryptedByEpoch(msgsBob, newEpoch)
 	foundBob := false
 	for _, msg := range decryptedBob {
 		if getPayloadText(msg) == "退群后的消息" {
@@ -1084,13 +1112,13 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 		}
 	}
 	if !foundBob {
-		t.Fatal("Bob: 未找到 epoch 2 的自动解密消息")
+		t.Fatal(fmt.Sprintf("Bob: 未找到 epoch %d 的自动解密消息", newEpoch))
 	}
 
-	// Carol 不应有 epoch 2 密钥
+	// Carol 不应有新 epoch 密钥
 	allCarol := LoadAllGroupSecrets(carol.keyStore, cAID, groupID)
-	if _, hasEpoch2 := allCarol[2]; hasEpoch2 {
-		t.Fatal("Carol 退群后不应持有 epoch 2 密钥")
+	if _, hasNewEpoch := allCarol[newEpoch]; hasNewEpoch {
+		t.Fatalf("Carol 退群后不应持有 epoch %d 密钥", newEpoch)
 	}
 }
 

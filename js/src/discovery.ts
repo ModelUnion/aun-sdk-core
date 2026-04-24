@@ -14,14 +14,18 @@ export class GatewayDiscovery {
   /** 最近一次 health check 结果，null 表示尚未检查 */
   get lastHealthy(): boolean | null { return this._lastHealthy; }
 
-  /** 向 gatewayUrl 对应的 /health 端点发送 HEAD 请求，检查网关可用性。 */
+  /** 向 gatewayUrl 对应的 /health 端点发送 GET 请求，检查网关可用性。 */
   async checkHealth(gatewayUrl: string, timeout = 5000): Promise<boolean> {
-    const healthUrl = gatewayUrl.replace(/^wss?:\/\//, (m) => m === 'wss://' ? 'https://' : 'http://')
-      .replace(/\/?$/, '/health');
+    const parsed = new URL(gatewayUrl);
+    parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
+    parsed.pathname = '/health';
+    parsed.search = '';
+    parsed.hash = '';
+    const healthUrl = parsed.toString();
     try {
       const controller = new AbortController();
       const timer = globalThis.setTimeout(() => controller.abort(), timeout);
-      const resp = await fetch(healthUrl, { method: 'HEAD', signal: controller.signal });
+      const resp = await fetch(healthUrl, { method: 'GET', signal: controller.signal });
       clearTimeout(timer);
       this._lastHealthy = resp.status === 200;
     } catch {

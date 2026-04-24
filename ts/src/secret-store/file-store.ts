@@ -27,6 +27,13 @@ import { join } from 'node:path';
 import type { SecretStore } from './index.js';
 import type { SecretRecord } from '../types.js';
 
+function decodeSecretPart(value: string): Buffer {
+  if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
+    return Buffer.from(value, 'hex');
+  }
+  return Buffer.from(value, 'base64');
+}
+
 export class FileSecretStore implements SecretStore {
   private _root: string;
   private _masterKey: Buffer;
@@ -82,10 +89,10 @@ export class FileSecretStore implements SecretStore {
     const key = this._deriveKey(scope, name);
 
     try {
-      const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(nonceB64, 'base64'));
-      decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+      const decipher = createDecipheriv('aes-256-gcm', key, decodeSecretPart(nonceB64));
+      decipher.setAuthTag(decodeSecretPart(tagB64));
       const decrypted = Buffer.concat([
-        decipher.update(Buffer.from(ctB64, 'base64')),
+        decipher.update(decodeSecretPart(ctB64)),
         decipher.final(),
       ]);
       return decrypted;

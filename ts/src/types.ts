@@ -164,6 +164,9 @@ export interface Message extends JsonObject {
   delivery_mode?: DeliveryMode;
   timestamp?: number;
   e2ee?: JsonObject;
+  group_id?: string;
+  sender_aid?: string;
+  direction?: string;
 }
 
 /** 发送结果 */

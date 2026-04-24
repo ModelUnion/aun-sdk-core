@@ -38,11 +38,11 @@ function _httpGetJson(url: string, verifySsl: boolean, timeout: number): Promise
   });
 }
 
-function _httpHead(url: string, verifySsl: boolean, timeout: number): Promise<boolean> {
+function _httpGetOk(url: string, verifySsl: boolean, timeout: number): Promise<boolean> {
   return new Promise((resolve) => {
     const parsed = new URL(url);
     const mod = parsed.protocol === 'https:' ? https : http;
-    const options: https.RequestOptions = { method: 'HEAD', timeout };
+    const options: https.RequestOptions = { method: 'GET', timeout };
     if (!verifySsl) options.rejectUnauthorized = false;
     const req = mod.request(url, options, (res) => {
       res.resume();
@@ -66,15 +66,17 @@ export class GatewayDiscovery {
   get lastHealthy(): boolean | null { return this._lastHealthy; }
 
   /**
-   * 向 gatewayUrl 对应的 /health 端点发送 HEAD 请求，检查网关可用性。
+   * 向 gatewayUrl 对应的 /health 端点发送 GET 请求，检查网关可用性。
    * 结果缓存到 lastHealthy，同时返回检查结果。
    */
   async checkHealth(gatewayUrl: string, timeout = 5_000): Promise<boolean> {
     const parsed = new URL(gatewayUrl);
     parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
     parsed.pathname = '/health';
+    parsed.search = '';
+    parsed.hash = '';
     const healthUrl = parsed.toString();
-    this._lastHealthy = await _httpHead(healthUrl, this._verifySsl, timeout);
+    this._lastHealthy = await _httpGetOk(healthUrl, this._verifySsl, timeout);
     return this._lastHealthy;
   }
 

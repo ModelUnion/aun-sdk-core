@@ -1463,6 +1463,35 @@ func TestDecryptMessagesDropsFailedCiphertext(t *testing.T) {
 	}
 }
 
+func TestDecryptMessagesSuppressesGroupKeyControlPlane(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	messages := []any{
+		map[string]any{
+			"message_id": "plain-1",
+			"from":       "bob.example.com",
+			"payload":    map[string]any{"text": "hello"},
+		},
+		map[string]any{
+			"message_id": "ctrl-1",
+			"from":       "alice.example.com",
+			"payload": map[string]any{
+				"type": "e2ee.group_key_distribution",
+			},
+		},
+	}
+
+	result := c.decryptMessages(context.Background(), messages)
+	if len(result) != 1 {
+		t.Fatalf("群密钥控制面消息不应混入补洞结果: %#v", result)
+	}
+	msg, _ := result[0].(map[string]any)
+	if msg["message_id"] != "plain-1" {
+		t.Fatalf("补洞结果应仅保留业务消息: %#v", result)
+	}
+}
+
 func TestDecryptGroupMessagesDropsFailedCiphertext(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()

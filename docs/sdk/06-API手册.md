@@ -1,4 +1,4 @@
-# AUN SDK Python - API 手册
+﻿# AUN SDK Python - API 手册
 
 ---
 
@@ -224,11 +224,11 @@ sub.unsubscribe()
 
 ### `await check_gateway_health(gateway_url: str, timeout: float = 5.0) -> bool`
 
-向 gateway 的 `HEAD /health` 端点发送请求，检查网关可用性。结果同步更新 `gateway_health` 属性。
+基于传入的 Gateway WebSocket URL 动态构造健康检查地址：将末尾路径替换为 `/health`，并将 `wss://` / `ws://` 分别转换为 `https://` / `http://`。随后向该地址发送 `GET /health` 请求，检查网关可用性。结果同步更新 `gateway_health` 属性。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `gateway_url` | `str` | — | 网关 WebSocket URL（`wss://` 或 `ws://`） |
+| `gateway_url` | `str` | — | 服务器发现返回的网关 WebSocket URL（`wss://.../aun` 或 `ws://.../aun`） |
 | `timeout` | `float` | `5.0` | 超时秒数 |
 
 返回 `True` 表示网关可用（HTTP 200），`False` 表示不可用或超时。
@@ -856,3 +856,4 @@ await client.call("stream.close", {"stream_id": stream_id})
 ```python
 info = await client.call("stream.get_info", {"stream_id": stream_id})
 streams = await client.call("stream.list_active", {})
+

@@ -1493,8 +1493,16 @@ def store_group_secret(
         local_epoch = existing["epoch"]
         if epoch < local_epoch:
             return False
-        # epoch 相等时：密钥不变，但允许更新 member_aids/commitment（成员变更场景）
+        # epoch 相等时：校验密钥一致性，允许更新 member_aids/commitment（成员变更场景）
         if epoch == local_epoch and existing.get("secret"):
+            # 校验 group_secret 是否一致
+            incoming_secret_enc = base64.b64encode(group_secret).decode("ascii")
+            if existing.get("secret") != incoming_secret_enc:
+                _e2ee_log.warning(
+                    "群 %s epoch=%d 密钥不一致：本地已有不同 secret，拒绝覆盖",
+                    group_id, epoch,
+                )
+                return False
             old_members = sorted(existing.get("member_aids", []))
             new_members = sorted(member_aids)
             if old_members != new_members and new_members:
@@ -1954,7 +1962,9 @@ class GroupE2EEManager:
         new_epoch = (prev_epoch or 0) + 1
         gs = generate_group_secret()
         commitment = compute_membership_commitment(member_aids, new_epoch, group_id, gs)
-        store_group_secret(ks, aid, group_id, new_epoch, gs, commitment, member_aids)
+        stored = store_group_secret(ks, aid, group_id, new_epoch, gs, commitment, member_aids)
+        if not stored:
+            raise RuntimeError(f"group {group_id} epoch {new_epoch} secret already exists or is newer; abort distribution")
         manifest = self._sign_manifest(build_membership_manifest(
             group_id, new_epoch, prev_epoch, member_aids, initiator_aid=aid,
         ))
@@ -1971,7 +1981,9 @@ class GroupE2EEManager:
         aid = self._current_aid()
         gs = generate_group_secret()
         commitment = compute_membership_commitment(member_aids, target_epoch, group_id, gs)
-        store_group_secret(self._keystore(), aid, group_id, target_epoch, gs, commitment, member_aids)
+        stored = store_group_secret(self._keystore(), aid, group_id, target_epoch, gs, commitment, member_aids)
+        if not stored:
+            raise RuntimeError(f"group {group_id} epoch {target_epoch} secret already exists or is newer; abort distribution")
         manifest = self._sign_manifest(build_membership_manifest(
             group_id, target_epoch, target_epoch - 1, member_aids, initiator_aid=aid,
         ))

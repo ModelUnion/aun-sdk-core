@@ -293,6 +293,65 @@ describe('AUNClient message.send 接收者校验', () => {
       slot_id: 'slot-a',
     }));
   });
+
+  it('message.pull 不应返回群密钥控制面消息', async () => {
+    const client = new AUNClient();
+    const rawMessage = {
+      message_id: 'ctrl-1',
+      from: 'alice.example.com',
+      encrypted: true,
+      payload: { type: 'e2ee.encrypted' },
+    };
+    const decryptedControl = {
+      ...rawMessage,
+      payload: { type: 'e2ee.group_key_distribution', group_id: 'g1' },
+    };
+
+    (client as any)._ensureSenderCertCached = vi.fn().mockResolvedValue(true);
+    (client as any)._schedulePrekeyReplenishIfConsumed = vi.fn();
+    (client as any)._e2ee = {
+      decryptMessage: vi.fn().mockResolvedValue(decryptedControl),
+    };
+    (client as any)._groupE2ee = {
+      handleIncoming: vi.fn().mockResolvedValue('distribution'),
+    };
+
+    const result = await (client as any)._decryptMessages([rawMessage]);
+
+    expect(result).toEqual([]);
+    expect((client as any)._e2ee.decryptMessage).toHaveBeenCalledWith(rawMessage, { skipReplay: true });
+  });
+
+  it('message.pull 识别控制面时不应消耗业务消息 seen set', async () => {
+    const client = new AUNClient();
+    const rawMessage = {
+      message_id: 'biz-1',
+      from: 'alice.example.com',
+      encrypted: true,
+      payload: { type: 'e2ee.encrypted' },
+    };
+    const decryptedBusiness = {
+      ...rawMessage,
+      payload: { text: 'hello' },
+    };
+
+    (client as any)._ensureSenderCertCached = vi.fn().mockResolvedValue(true);
+    (client as any)._schedulePrekeyReplenishIfConsumed = vi.fn();
+    (client as any)._e2ee = {
+      decryptMessage: vi.fn().mockResolvedValue(decryptedBusiness),
+    };
+    (client as any)._groupE2ee = {
+      handleIncoming: vi.fn().mockResolvedValue(null),
+    };
+
+    const result = await (client as any)._decryptMessages([rawMessage]);
+
+    expect(result).toEqual([decryptedBusiness]);
+    const decryptMock = (client as any)._e2ee.decryptMessage;
+    expect(decryptMock).toHaveBeenCalledTimes(2);
+    expect(decryptMock).toHaveBeenNthCalledWith(1, rawMessage, { skipReplay: true });
+    expect(decryptMock).toHaveBeenNthCalledWith(2, rawMessage, { skipReplay: true });
+  });
 });
 
 describe('AUNClient._fetchPeerPrekey', () => {

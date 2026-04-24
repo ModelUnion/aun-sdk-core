@@ -188,22 +188,39 @@ async def _group_pull(client: AUNClient, group_id: str, after_seq: int = 0) -> l
     """
     pushed = list(getattr(client, "_test_group_inbox", {}).get(group_id, []))
     # 按 seq 排序去重（同一 seq 可能既被 push 也被 auto-pull 投递过）
-    seen_seq = set()
-    ordered = []
+    by_seq = {}
+    no_seq = []
     for m in sorted(pushed, key=lambda x: x.get("seq") or 0):
         s = m.get("seq")
-        if s in seen_seq:
+        if s is None:
+            no_seq.append(m)
             continue
-        if s is not None:
-            seen_seq.add(s)
-        ordered.append(m)
+        old_msg = by_seq.get(s)
+        if old_msg is None:
+            by_seq[s] = m
+            continue
+        old_decrypted = bool(old_msg.get("e2ee")) if isinstance(old_msg, dict) else False
+        new_decrypted = bool(m.get("e2ee")) if isinstance(m, dict) else False
+        if new_decrypted and not old_decrypted:
+            by_seq[s] = m
+    ordered = no_seq + [by_seq[s] for s in sorted(by_seq)]
     if after_seq and after_seq > 0:
         ordered = [m for m in ordered if (m.get("seq") or 0) > after_seq]
-    if ordered:
-        return ordered
-    # 兜底：未收到任何 push 时走服务端 pull（覆盖 push 完全丢失的边缘情况）
+    usable = []
+    for m in ordered:
+        payload = m.get("payload") if isinstance(m, dict) else None
+        if payload is not None and (not isinstance(payload, dict) or bool(payload)):
+            usable.append(m)
+    if usable:
+        return usable
+    # 兜底：未收到任何有效 push 时走服务端 pull（覆盖 push 完全丢失或仅收到空通知的边缘情况）
     result = await client.call(
-        "group.pull", {"group_id": group_id, "after_message_seq": after_seq or 0}
+        "group.pull", {
+            "group_id": group_id,
+            "after_message_seq": after_seq or 0,
+            "device_id": client._device_id,
+            "slot_id": getattr(client, "_slot_id", ""),
+        },
     )
     return result.get("messages", [])
 
@@ -212,6 +229,19 @@ async def _group_pull_raw(client: AUNClient, group_id: str, after_seq: int = 0) 
     """拉取群消息（不经自动解密，用于验证无密钥方看到密文）"""
     result = await client._transport.call("group.pull", {"group_id": group_id, "after_message_seq": after_seq})
     return result.get("messages", [])
+
+
+async def _wait_for_group_secret_epoch(client: AUNClient, aid: str, group_id: str, *, min_epoch: int = 1, timeout: float = 15.0) -> int:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_epochs: list[int] = []
+    while asyncio.get_running_loop().time() < deadline:
+        all_secrets = load_all_group_secrets(client._keystore, aid, group_id)
+        last_epochs = sorted(all_secrets)
+        eligible = [epoch for epoch in last_epochs if epoch >= min_epoch]
+        if eligible:
+            return max(eligible)
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"{aid} did not receive group {group_id} epoch >= {min_epoch} within {timeout}s; epochs={last_epochs}")
 
 
 # ---------------------------------------------------------------------------
@@ -320,22 +350,24 @@ async def test_epoch_rotation_on_kick():
         await _add_member(alice, group_id, b_aid)
         await _add_member(alice, group_id, c_aid)
 
-        # 等待 SDK 自动分发密钥给 Bob 和 Carol
-        await asyncio.sleep(2)
+        # 等待 SDK 自动分发/轮换密钥给 Bob 和 Carol
+        old_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         # 踢 Carol
         await _kick_member(alice, group_id, c_aid)
 
-        # kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到 epoch 2 密钥
+        # kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到新 epoch 密钥
         for _wait in range(15):
             await asyncio.sleep(1)
             all_bob = load_all_group_secrets(bob._keystore, b_aid, group_id)
-            if 2 in all_bob:
+            if any(epoch > old_epoch for epoch in all_bob):
                 break
         else:
-            assert False, "Bob did not receive epoch 2 secret within 15s"
+            assert False, f"Bob did not receive epoch > {old_epoch} secret within 15s"
 
-        # Alice 用 epoch 2 发加密消息
+        new_epoch = max(load_all_group_secrets(bob._keystore, b_aid, group_id))
+
+        # Alice 用新 epoch 发加密消息
         await alice.call("group.send", {
             "group_id": group_id,
             "payload": {"text": "踢人后的消息"},
@@ -344,16 +376,16 @@ async def test_epoch_rotation_on_kick():
 
         await asyncio.sleep(1)
 
-        # Bob 能解密（有 epoch 2 密钥，auto-decrypt）
+        # Bob 能解密（有新 epoch 密钥，auto-decrypt）
         msgs_bob = await _group_pull(bob, group_id)
         decrypted_bob = [m for m in msgs_bob
-                         if m.get("e2ee", {}).get("epoch") == 2]
-        assert len(decrypted_bob) >= 1, "Bob: no auto-decrypted epoch 2 msgs"
+                         if m.get("e2ee", {}).get("epoch") == new_epoch]
+        assert len(decrypted_bob) >= 1, f"Bob: no auto-decrypted epoch {new_epoch} msgs"
         assert decrypted_bob[0]["payload"]["text"] == "踢人后的消息"
 
-        # Carol 没有 epoch 2 密钥（被踢后不会收到新密钥）
+        # Carol 没有新 epoch 密钥（被踢后不会收到新密钥）
         all_carol = load_all_group_secrets(carol._keystore, c_aid, group_id)
-        assert 2 not in all_carol, "Carol should not have epoch 2 secret"
+        assert new_epoch not in all_carol, f"Carol should not have epoch {new_epoch} secret"
         # Carol 已被踢出群，无法 pull 消息——这本身就是安全保证
 
         print("[PASS] Test 3")
@@ -529,7 +561,7 @@ async def test_membership_commitment_verification():
         members = [a_aid, b_aid]
 
         # 正常分发
-        dist = build_key_distribution("grp_test", 1, gs, members, a_aid)
+        dist = build_key_distribution(f"grp_test_{rid}", 1, gs, members, a_aid)
         ok = handle_key_distribution(dist, bob._keystore, b_aid)
         assert ok, "正常分发应成功"
 
@@ -721,10 +753,12 @@ async def test_invite_code_auto_recovery():
             "encrypt": True,
         })
 
-        # 5. 等待恢复链路完成：Bob pull → 缺密钥 → key_request → Alice 响应 → Bob 解密
-        #    先 pull 一次触发恢复流程，再轮询等待 Bob 本地拿到密钥
+        # 5. 等待恢复链路完成：Bob pull → 缺密钥 → key_request → Alice 响应 → Bob 解密。
+        #    新的接收侧本地 replay guard 会按实例去重；如果首次 pull 已同步恢复并解密，
+        #    后续重复 pull 同一 message_id 会被本地去重，所以必须保留首次 pull 的结果。
+        first_pull_msgs = []
         try:
-            await _group_pull(bob, group_id)
+            first_pull_msgs = await _group_pull(bob, group_id)
         except Exception:
             pass  # 首次 pull 可能无法解密
 
@@ -735,12 +769,23 @@ async def test_invite_code_auto_recovery():
         else:
             assert False, "Bob did not recover group secret within 15s"
 
-        # Bob 再次拉取（此时已有密钥，可自动解密）
-        msgs = await _group_pull(bob, group_id)
-        assert len(msgs) >= 1, f"expected >= 1 msg, got {len(msgs)}"
-
-        # 6. 验证自动解密成功
-        decrypted = [m for m in msgs if m.get("e2ee", {}).get("encryption_mode") == "epoch_group_key"]
+        decrypted = [
+            m for m in first_pull_msgs
+            if m.get("e2ee", {}).get("encryption_mode") == "epoch_group_key"
+            and m.get("payload", {}).get("text") == "邀请码入群后的消息"
+        ]
+        for _wait in range(15):
+            if decrypted:
+                break
+            msgs = await _group_pull(bob, group_id)
+            decrypted = [
+                m for m in msgs
+                if m.get("e2ee", {}).get("encryption_mode") == "epoch_group_key"
+                and m.get("payload", {}).get("text") == "邀请码入群后的消息"
+            ]
+            if decrypted:
+                break
+            await asyncio.sleep(1)
         assert len(decrypted) >= 1, f"no auto-decrypted msgs found"
         assert decrypted[0]["payload"]["text"] == "邀请码入群后的消息"
 
@@ -752,6 +797,70 @@ async def test_invite_code_auto_recovery():
         return True
     except Exception as e:
         print(f"[FAIL] Test 10: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        await alice.close(); await bob.close()
+
+
+async def test_open_group_join_rotates_epoch_and_updates_memberlist():
+    """Test 11: open 群 request_join 后应轮换 epoch，并用签名 manifest 更新成员列表。"""
+    print("\n=== Test 11: Open group join rotates epoch ===")
+    rid = _run_id()
+    alice, bob = _make_client("a-open", rid), _make_client("b-open", rid)
+    try:
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
+
+        created = await alice.call("group.create", {
+            "name": f"e2ee-open-{rid}",
+            "visibility": "public",
+            "join_mode": "open",
+        })
+        group_id = created["group"]["group_id"]
+        assert alice.group_e2ee.has_secret(group_id), "owner should have secret after create"
+        owner_secret_before = alice.group_e2ee.load_secret(group_id)
+        assert owner_secret_before is not None
+        before_epoch = owner_secret_before["epoch"]
+
+        join_result = await bob.call("group.request_join", {
+            "group_id": group_id,
+            "message": "open join",
+        })
+        assert join_result.get("status") == "joined", f"expected joined, got {join_result}"
+
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            bob_secret = bob.group_e2ee.load_secret(group_id)
+            alice_secret = alice.group_e2ee.load_secret(group_id)
+            if bob_secret and alice_secret and int(alice_secret["epoch"]) > int(before_epoch):
+                break
+        else:
+            assert False, "open join did not rotate and distribute group secret within 10s"
+
+        alice_secret = alice.group_e2ee.load_secret(group_id)
+        bob_secret = bob.group_e2ee.load_secret(group_id)
+        assert alice_secret is not None and bob_secret is not None
+        assert int(alice_secret["epoch"]) > int(before_epoch), "owner epoch should rotate after open join"
+        assert int(bob_secret["epoch"]) == int(alice_secret["epoch"]), "new member should receive rotated epoch"
+        assert b_aid in alice_secret.get("member_aids", []), "signed member list should include new member"
+        assert b_aid in bob_secret.get("member_aids", []), "new member local member list should include itself"
+
+        text = f"open-join-encrypted-{rid}"
+        await alice.call("group.send", {
+            "group_id": group_id,
+            "payload": {"text": text},
+            "encrypt": True,
+        })
+        await asyncio.sleep(1)
+        msgs = await _group_pull(bob, group_id)
+        decrypted = [m for m in msgs if m.get("e2ee", {}).get("encryption_mode") == "epoch_group_key"]
+        assert any(m.get("payload", {}).get("text") == text for m in decrypted), f"Bob did not decrypt open join msg: {msgs}"
+
+        print("[PASS] Test 11")
+        return True
+    except Exception as e:
+        print(f"[FAIL] Test 11: {e}")
         import traceback; traceback.print_exc()
         return False
     finally:
@@ -868,7 +977,7 @@ async def test_epoch_rotation_on_leave():
             assert False, "Bob/Carol did not receive epoch 1 within 10s"
 
         old_epoch = alice._group_e2ee.current_epoch(group_id)
-        assert old_epoch == 1, f"expected epoch 1, got {old_epoch}"
+        assert old_epoch and old_epoch >= 1, f"expected existing epoch, got {old_epoch}"
 
         # Carol 主动退群（离开者自身不触发轮换）
         await carol.call("group.leave", {"group_id": group_id})
@@ -878,16 +987,16 @@ async def test_epoch_rotation_on_leave():
         for _wait in range(15):
             await asyncio.sleep(1)
             all_bob = load_all_group_secrets(bob._keystore, b_aid, group_id)
-            if 2 in all_bob:
+            if any(epoch > old_epoch for epoch in all_bob):
                 break
         else:
-            assert False, "Bob did not receive epoch 2 secret within 15s after leave"
+            assert False, f"Bob did not receive epoch > {old_epoch} secret within 15s after leave"
 
-        # Alice 也应有 epoch 2
+        new_epoch = max(load_all_group_secrets(bob._keystore, b_aid, group_id))
         all_alice = load_all_group_secrets(alice._keystore, a_aid, group_id)
-        assert 2 in all_alice, "Alice should have epoch 2"
+        assert new_epoch in all_alice, f"Alice should have epoch {new_epoch}"
 
-        # Alice 用 epoch 2 发加密消息
+        # Alice 用新 epoch 发加密消息
         await alice.call("group.send", {
             "group_id": group_id,
             "payload": {"text": "退群后的消息"},
@@ -898,13 +1007,13 @@ async def test_epoch_rotation_on_leave():
         # Bob 能解密
         msgs_bob = await _group_pull(bob, group_id)
         decrypted_bob = [m for m in msgs_bob
-                         if m.get("e2ee", {}).get("epoch") == 2]
-        assert len(decrypted_bob) >= 1, "Bob: no auto-decrypted epoch 2 msgs"
+                         if m.get("e2ee", {}).get("epoch") == new_epoch]
+        assert len(decrypted_bob) >= 1, f"Bob: no auto-decrypted epoch {new_epoch} msgs"
         assert decrypted_bob[0]["payload"]["text"] == "退群后的消息"
 
-        # Carol 不应有 epoch 2 密钥
+        # Carol 不应有新 epoch 密钥
         all_carol = load_all_group_secrets(carol._keystore, c_aid, group_id)
-        assert 2 not in all_carol, "Carol should not have epoch 2 secret"
+        assert new_epoch not in all_carol, f"Carol should not have epoch {new_epoch} secret"
 
         print("[PASS] Test 13")
         return True
@@ -994,10 +1103,11 @@ async def main():
         ("8. Old epoch still decryptable",        test_old_epoch_still_decryptable),
         ("9. Review join request auto distribute", test_review_join_request_auto_distribute),
         ("10. Invite code auto recovery",         test_invite_code_auto_recovery),
-        ("11. Capabilities required for join",    test_capabilities_required_for_join),
-        ("12. Explicit plaintext send",           test_plaintext_send_explicit),
-        ("13. Epoch rotation on leave",           test_epoch_rotation_on_leave),
-        ("14. Push event decrypts (no pull)",     test_push_event_decrypt),
+        ("11. Open group join rotates epoch",    test_open_group_join_rotates_epoch_and_updates_memberlist),
+        ("12. Capabilities required for join",    test_capabilities_required_for_join),
+        ("13. Explicit plaintext send",           test_plaintext_send_explicit),
+        ("14. Epoch rotation on leave",           test_epoch_rotation_on_leave),
+        ("15. Push event decrypts (no pull)",     test_push_event_decrypt),
     ]
 
     results = []
@@ -1028,3 +1138,4 @@ async def main():
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
+

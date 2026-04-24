@@ -817,7 +817,84 @@
 | `group_id` | string | 是 | 群组 ID |
 | `payload` | object | 否 | 消息内容 |
 | `type` | string | 否 | 消息类型，默认 `"text"`，受 allowed_message_types 配置限制 |
-| `attachments` | array | 否 | 附件数组，每项为存储引用对象 |
+| `attachments` | array | 否 | 兼容旧接口的顶层附件元数据；推荐把业务附件放入 `payload.attachments` |
+
+### Payload 参考约定
+
+`payload` 是群消息的应用层内容，Group 服务只做 JSON 可序列化、大小和 E2EE epoch 相关检查，其他字段由客户端约定。为了让不同客户端能一致展示和处理，建议采用以下松散约定：
+
+- `type` 是服务端可配置的粗粒度分类；默认通常只允许 `"text"` / `"json"` / `"notice"` / `"e2ee.group_encrypted"`。
+- 自定义业务类型优先使用 `type: "json"` + `payload.kind`，除非群服务配置已允许新的外层 `type`。
+- 业务附件引用推荐放在 `payload.attachments`，这样明文、E2EE、历史回放和跨端展示都围绕同一个透传载荷处理。
+- 大文件、图片、音视频不直接放进 `payload`，应先上传到 `storage.*`，再在 `payload.attachments` 中携带 URL 或对象引用。
+
+| 业务类型 | 推荐外层 `type` | 推荐 payload 字段 | 说明 |
+|------|------|------|------|
+| 普通文本 | `text` | `text`, `format`, `lang` | 文本或 Markdown |
+| 文件 | `json` 或已配置的 `file` | `kind`, `text`, `attachments` | 文件引用放 `payload.attachments` |
+| 图片 | `json` 或已配置的 `image` | `kind`, `text`, `attachments`, `alt`, `width`, `height` | 图片引用放 `payload.attachments` |
+| 音频 | `json` 或已配置的 `audio` | `kind`, `duration_ms`, `transcript` | 可附转写文本 |
+| 视频 | `json` 或已配置的 `video` | `kind`, `text`, `thumbnail`, `duration_ms` | `thumbnail` 可引用附件或缩略图对象 |
+| 链接 | `json` | `kind`, `url`, `title`, `description`, `thumbnail` | 链接卡片或预览 |
+| 通知 | `notice` | `text`, `level`, `code` | 群公告、状态提醒、机器人通知 |
+| 反应 | `json` | `kind`, `target`, `action`, `key` | 对已有消息添加或移除反应 |
+| 投票/表单 | `json` | `kind`, `title`, `options`, `expires_at` | 应用层自行处理提交与统计 |
+| 自定义消息 | `json` 或已配置的 `custom` | `kind`, `data` | 接收方不认识时应降级展示 |
+
+公共辅助字段可按需放入 `payload`：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `chat_id` | string | 应用层会话或场景标识；群组本身仍由外层 `group_id` 标识 |
+| `thread_id` | string | 群内话题、子线程或任务线程 |
+| `reply_to` | object | 回复目标，推荐含 `message_id`、`seq`、`sender_aid` |
+| `quote` | object | 展示用引用摘要，避免复制完整敏感原文 |
+| `mentions` | array | 提及对象，推荐项为 `{aid, display, offset, length}`；全体提及可用 `{scope: "all"}` |
+| `entities` | array | 文本实体，如链接、代码片段、时间范围 |
+| `client_context` | object | 客户端自定义上下文，如窗口、任务、草稿来源 |
+
+> 字段名建议使用 snake_case，如 `chat_id`、`thread_id`；已有应用若使用 `chatId` 等命名，可在自己的应用层约定中保持一致。
+
+### 附件引用
+
+推荐把附件引用放入 `payload.attachments`。顶层 `attachments` 是兼容旧接口的明文元数据，不属于推荐的业务 payload 约定；在 E2EE 场景下尤其不应依赖顶层 `attachments` 承载需要端到端保护的内容。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `owner_aid` | string | 否 | 对象所有者 AID，可作为对象标识补充 |
+| `bucket` | string | 否 | 存储桶，默认 `"default"` |
+| `object_key` | string | 否 | Storage 对象路径 |
+| `url` | string | 否 | 对象 URL；AUN Storage 场景下为上传完成后返回的长期对象引用 |
+| `filename` | string | 否 | 原始文件名；缺省时可由 `object_key` 推导 |
+| `content_type` | string | 否 | MIME 类型 |
+| `size_bytes` | integer | 否 | 文件大小（字节） |
+| `sha256` | string | 否 | 内容哈希，用于完整性校验 |
+
+AUN Storage 的 `url` 是长期对象引用，不是最终文件下载地址。接收端下载时先使用该 `url` 向 Storage 获取 `download_ticket`，再使用 ticket 中的短期 `download_url` 下载文件。`owner_aid`、`bucket`、`object_key` 可作为可选对象标识补充，便于没有 `url` 解析能力的客户端或服务端工具定位对象。
+
+**示例**：
+
+```json
+{
+    "group_id": "grp_abc",
+    "type": "json",
+    "payload": {
+        "kind": "image",
+        "text": "这张图是新版流程",
+        "thread_id": "release-2026-04",
+        "reply_to": {"message_id": "gm-prev", "seq": 12},
+        "mentions": [{"aid": "bob.agentid.pub", "display": "Bob", "offset": 0, "length": 3}],
+        "attachments": [{
+            "owner_aid": "alice.agentid.pub",
+            "bucket": "default",
+            "object_key": "images/flow.png",
+            "url": "https://storage.agentid.pub/objects/default/images/flow.png",
+            "filename": "flow.png",
+            "content_type": "image/png"
+        }]
+    }
+}
+```
 
 **响应**：
 
@@ -848,7 +925,6 @@
 | `dispatch` | object | 分发策略：`mode` 为 `"broadcast"`（广播全员）或 `"duty"`（值班分发）；`reason` 说明原因（如 `"duty_disabled"` / `"active_duty"` / `"no_duty_candidate"` 等） |
 | `duty_state` | object | 可选，值班模式下的当前状态 |
 | `message_dispatch` | object | 运行时分发结果（广播目标等结构化信息） |
-```
 
 ### group.pull
 

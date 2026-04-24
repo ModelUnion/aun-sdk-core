@@ -62,8 +62,12 @@ function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function isRecord(value: JsonObject | object | null | undefined): value is JsonObject {
-  return isJsonObject(value);
+function isRecord(value: unknown): value is JsonObject {
+  return isJsonObject(value as JsonObject | object | null | undefined);
+}
+
+function toBufferSource(bytes: Uint8Array): BufferSource {
+  return bytes.slice().buffer;
 }
 
 function sameJson(a: JsonObject | string | number | boolean | null | undefined, b: JsonObject | string | number | boolean | null | undefined): boolean {
@@ -122,7 +126,7 @@ async function _decryptPEM(enc: EncryptedEnvelope, seed: string): Promise<string
   const iv = _base64ToUint8(enc.iv);
   const ct = _base64ToUint8(enc.ct);
   const key = await _deriveEncKey(seed, salt);
-  const pt = await crypto.subtle.decrypt({ name: _ENC_ALGO, iv: iv as BufferSource }, key, ct);
+  const pt = await crypto.subtle.decrypt({ name: _ENC_ALGO, iv: toBufferSource(iv) }, key, toBufferSource(ct));
   return new TextDecoder().decode(pt);
 }
 

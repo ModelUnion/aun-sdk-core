@@ -24,25 +24,25 @@ const (
 // 所有网络操作（P2P 发送、RPC 调用）由调用方负责。
 // 内置防重放、epoch 降级防护、密钥请求频率限制。
 type GroupE2EEManager struct {
-	identityFn            func() map[string]any // 获取当前身份的回调
-	keystore              keystore.KeyStore     // 密钥存储后端
-	config                *AUNConfig            // SDK 配置
-	replayGuard           *GroupReplayGuard     // 防重放守卫
-	requestThrottle       *GroupKeyRequestThrottle // 密钥请求频率限制
-	responseThrottle      *GroupKeyRequestThrottle // 密钥响应频率限制
-	senderCertResolver    func(string, string) string   // 发送方证书解析器（AID, fingerprint）
-	initiatorCertResolver func(string, string) string   // 发起者证书解析器（AID, fingerprint）
+	identityFn            func() map[string]any       // 获取当前身份的回调
+	keystore              keystore.KeyStore           // 密钥存储后端
+	config                *AUNConfig                  // SDK 配置
+	replayGuard           *GroupReplayGuard           // 防重放守卫
+	requestThrottle       *GroupKeyRequestThrottle    // 密钥请求频率限制
+	responseThrottle      *GroupKeyRequestThrottle    // 密钥响应频率限制
+	senderCertResolver    func(string, string) string // 发送方证书解析器（AID, fingerprint）
+	initiatorCertResolver func(string, string) string // 发起者证书解析器（AID, fingerprint）
 }
 
 // GroupE2EEManagerConfig 群组 E2EE 配置
 type GroupE2EEManagerConfig struct {
-	IdentityFn            func() map[string]any // 获取当前身份的回调
-	Keystore              keystore.KeyStore     // 密钥存储后端
-	Config                *AUNConfig            // SDK 配置
-	RequestCooldown       float64               // 密钥请求冷却时间（秒），默认 30
-	ResponseCooldown      float64               // 密钥响应冷却时间（秒），默认 30
-	SenderCertResolver    func(string, string) string   // 通过 AID + fingerprint 获取发送方证书 PEM
-	InitiatorCertResolver func(string, string) string   // 通过 AID + fingerprint 获取发起者证书 PEM
+	IdentityFn            func() map[string]any       // 获取当前身份的回调
+	Keystore              keystore.KeyStore           // 密钥存储后端
+	Config                *AUNConfig                  // SDK 配置
+	RequestCooldown       float64                     // 密钥请求冷却时间（秒），默认 30
+	ResponseCooldown      float64                     // 密钥响应冷却时间（秒），默认 30
+	SenderCertResolver    func(string, string) string // 通过 AID + fingerprint 获取发送方证书 PEM
+	InitiatorCertResolver func(string, string) string // 通过 AID + fingerprint 获取发起者证书 PEM
 }
 
 // NewGroupE2EEManager 创建群组 E2EE 管理器
@@ -145,9 +145,12 @@ func (m *GroupE2EEManager) RotateEpoch(groupID string, memberAIDs []string) (map
 
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, newEpoch, groupID, gs)
-	_, err = StoreGroupSecret(ks, aid, groupID, newEpoch, gs, commitment, memberAIDs)
+	stored, err := StoreGroupSecret(ks, aid, groupID, newEpoch, gs, commitment, memberAIDs)
 	if err != nil {
 		return nil, err
+	}
+	if !stored {
+		return nil, fmt.Errorf("group %s epoch %d secret already exists or is newer; abort distribution", groupID, newEpoch)
 	}
 
 	manifest, err := m.signManifest(BuildMembershipManifest(groupID, newEpoch, prevEpoch, memberAIDs, nil, nil, aid))
@@ -181,9 +184,12 @@ func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, member
 	}
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, targetEpoch, groupID, gs)
-	_, err := StoreGroupSecret(m.keystore, aid, groupID, targetEpoch, gs, commitment, memberAIDs)
+	stored, err := StoreGroupSecret(m.keystore, aid, groupID, targetEpoch, gs, commitment, memberAIDs)
 	if err != nil {
 		return nil, err
+	}
+	if !stored {
+		return nil, fmt.Errorf("group %s epoch %d secret already exists or is newer; abort distribution", groupID, targetEpoch)
 	}
 
 	prevEpoch := targetEpoch - 1

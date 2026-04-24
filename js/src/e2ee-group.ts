@@ -467,8 +467,28 @@ export async function storeGroupSecret(
   memberAids: string[],
 ): Promise<boolean> {
   const existing = await loadKeyStoreGroupState(keystore, aid, groupId);
-  if (existing && existing.epoch !== undefined && existing.epoch !== null && epoch < (existing.epoch as number)) {
-    return false;
+  if (existing && existing.epoch !== undefined && existing.epoch !== null) {
+    const localEpoch = existing.epoch as number;
+    if (epoch < localEpoch) {
+      return false;
+    }
+    if (epoch === localEpoch && typeof existing.secret === 'string') {
+      const incomingSecret = uint8ToBase64(groupSecret);
+      if (existing.secret !== incomingSecret) {
+        return false;
+      }
+      const oldMembers = [...((existing.member_aids as string[] | undefined) ?? [])].sort();
+      const newMembers = [...memberAids].sort();
+      if (JSON.stringify(oldMembers) !== JSON.stringify(newMembers) && newMembers.length > 0) {
+        await saveKeyStoreGroupState(keystore, aid, groupId, {
+          ...existing,
+          member_aids: newMembers,
+          commitment,
+          updated_at: Date.now(),
+        });
+      }
+      return true;
+    }
   }
 
   const current = existing ? { ...existing } : {};
@@ -903,7 +923,10 @@ export class GroupE2EEManager {
     const newEpoch = (prevEpoch ?? 0) + 1;
     const gs = generateGroupSecret();
     const commitment = await computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
-    await storeGroupSecret(this._keystoreRef, aid, groupId, newEpoch, gs, commitment, memberAids);
+    const stored = await storeGroupSecret(this._keystoreRef, aid, groupId, newEpoch, gs, commitment, memberAids);
+    if (!stored) {
+      throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
+    }
     const manifest = await this._signManifest(buildMembershipManifest(
       groupId, newEpoch, prevEpoch, memberAids, { initiatorAid: aid },
     ));
@@ -924,7 +947,10 @@ export class GroupE2EEManager {
     const aid = this._currentAid();
     const gs = generateGroupSecret();
     const commitment = await computeMembershipCommitment(memberAids, targetEpoch, groupId, gs);
-    await storeGroupSecret(this._keystoreRef, aid, groupId, targetEpoch, gs, commitment, memberAids);
+    const stored = await storeGroupSecret(this._keystoreRef, aid, groupId, targetEpoch, gs, commitment, memberAids);
+    if (!stored) {
+      throw new Error(`group ${groupId} epoch ${targetEpoch} secret already exists or is newer; abort distribution`);
+    }
     const manifest = await this._signManifest(buildMembershipManifest(
       groupId, targetEpoch, targetEpoch - 1, memberAids, { initiatorAid: aid },
     ));

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
@@ -23,14 +24,14 @@ class GatewayDiscovery:
         return self._last_healthy
 
     async def check_health(self, gateway_url: str, *, timeout: float = 5.0) -> bool:
-        """向 gateway_url 对应的 /health 端点发送 HEAD 请求，检查网关可用性。"""
-        import re
-        health_url = re.sub(r'^wss?://', lambda m: 'https://' if m.group() == 'wss://' else 'http://', gateway_url)
-        health_url = health_url.rstrip('/') + '/health'
+        """向 gateway_url 对应的 /health 端点发送 GET 请求，检查网关可用性。"""
+        parsed = urlparse(gateway_url)
+        scheme = "https" if parsed.scheme == "wss" else "http"
+        health_url = urlunparse((scheme, parsed.netloc, "/health", "", "", ""))
         try:
             ssl_param = None if self._verify_ssl else False
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-                async with session.head(health_url, ssl=ssl_param) as resp:
+                async with session.get(health_url, ssl=ssl_param) as resp:
                     self._last_healthy = resp.status == 200
         except Exception as exc:
             _discovery_log.warning("check_health 异常 (%s): %s", health_url, exc)

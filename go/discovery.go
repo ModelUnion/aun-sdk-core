@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -45,18 +45,28 @@ func (d *GatewayDiscovery) LastHealthy() *bool {
 	return d.lastHealthy.Load()
 }
 
-// CheckHealth 向 gatewayURL 对应的 /health 端点发送 HEAD 请求，检查网关可用性。
+// CheckHealth 向 gatewayURL 对应的 /health 端点发送 GET 请求，检查网关可用性。
 func (d *GatewayDiscovery) CheckHealth(ctx context.Context, gatewayURL string, timeout time.Duration) bool {
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
-	healthURL := strings.NewReplacer("wss://", "https://", "ws://", "http://").Replace(gatewayURL)
-	healthURL = strings.TrimRight(healthURL, "/") + "/health"
+	healthURL := gatewayURL
+	if parsed, parseErr := url.Parse(gatewayURL); parseErr == nil {
+		if parsed.Scheme == "wss" {
+			parsed.Scheme = "https"
+		} else {
+			parsed.Scheme = "http"
+		}
+		parsed.Path = "/health"
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		healthURL = parsed.String()
+	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, healthURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, healthURL, nil)
 	ok := false
 	if err == nil {
 		resp, err := d.httpClient().Do(req)

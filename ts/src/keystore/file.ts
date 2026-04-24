@@ -101,9 +101,9 @@ export class FileKeyStore implements KeyStore {
     const safe = safeAid(aid);
     let db = this._aidDBs.get(safe);
     if (!db) {
-      const dbPath = join(this._aidsRoot, safe, `aun_${this._deviceId}.db`);
+      const dbPath = join(this._aidsRoot, safe, 'aun.db');
       try {
-        db = new AIDDatabase(dbPath);
+        db = new AIDDatabase(dbPath, this._secretStore, safe);
       } catch (exc) {
         // DB 损坏：备份后重建
         console.warn('[aun_core.keystore] 数据库损坏，备份后重建');
@@ -114,7 +114,7 @@ export class FileKeyStore implements KeyStore {
         for (const suffix of ['-wal', '-shm', '-journal']) {
           try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
         }
-        db = new AIDDatabase(dbPath);
+        db = new AIDDatabase(dbPath, this._secretStore, safe);
       }
       this._aidDBs.set(safe, db);
     }

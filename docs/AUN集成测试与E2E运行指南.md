@@ -11,6 +11,7 @@
 - Windows Git Bash 运行 `docker exec` / `docker run` 且命令里包含容器内绝对路径（如 `/tests/...`、`/test/...`、`/workspace/...`）时，统一在命令前加 `MSYS_NO_PATHCONV=1`，避免 Git Bash 把容器路径错误改写成宿主机路径。
 - 单域 Docker 测试容器默认使用 `AUN_TEST_AUN_PATH=/data/aun/single-domain/persistent`，固定身份长期复用统一落在这条路径下。
 - 双域固定身份统一落在 `D:\modelunion\kite\docker-deploy\federation-test\client-data`，容器内路径固定为 `/data/aun`。
+- **所有语言 SDK 的集成/E2E 测试必须串行运行**，不可并行执行多个测试进程。各语言 SDK 共享同一套 AID 身份材料（私钥、证书、SQLite/SQLCipher 数据库），并行运行会导致数据库锁冲突、密钥材料竞争写入、以及不可预测的认证失败。推荐按 Python → TypeScript → Go → JS 的顺序依次运行。
 - 如果改了 `extensions/services` 下的服务端代码，必须重新 build Docker 镜像并重启对应容器。
 - 如果只改了 `aun-sdk-core/python/src` 或测试脚本，单域 `sdk-tester`、双域 `client-a/client-b` 都是目录挂载，通常不需要 rebuild 镜像，直接重跑即可。
 - `kite-sdk-tester`、`client-a`、`client-b` 使用预构建的 `aun-sdk-tester` 镜像（`Dockerfile.sdk-tester`），已内置所有 Python 测试依赖（含 `sqlcipher3`），`--force-recreate` 后无需手动安装。

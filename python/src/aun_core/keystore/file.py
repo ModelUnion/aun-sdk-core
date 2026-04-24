@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 import hashlib
@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .base import KeyStore
-from .sqlcipher_db import AIDDatabase, derive_sqlcipher_key, load_or_create_seed
+from .sqlite_db import AIDDatabase, derive_sqlite_key, load_or_create_seed
 from ..config import normalize_instance_id
 
 import logging
@@ -137,7 +137,7 @@ class FileKeyStore(KeyStore):
         self._aids_root.mkdir(parents=True, exist_ok=True)
 
         self._seed_bytes = load_or_create_seed(self._root, encryption_seed=encryption_seed)
-        self._sqlcipher_key = derive_sqlcipher_key(self._seed_bytes)
+        self._sqlite_key = derive_sqlite_key(self._seed_bytes)
 
         # 每 AID 一个 AIDDatabase，lazy 初始化
         self._aid_dbs: dict[str, AIDDatabase] = {}
@@ -156,7 +156,7 @@ class FileKeyStore(KeyStore):
         with self._aid_dbs_lock:
             if safe not in self._aid_dbs:
                 db_path = self._identity_dir(aid) / "aun.db"
-                self._aid_dbs[safe] = AIDDatabase(db_path, self._sqlcipher_key)
+                self._aid_dbs[safe] = AIDDatabase(db_path, self._sqlite_key)
             return self._aid_dbs[safe]
 
     # ── 公共 API ─────────────────────────────────────────────
@@ -180,7 +180,7 @@ class FileKeyStore(KeyStore):
             if legacy_subdir.is_dir():
                 lks = FileKeyStore(legacy_subdir, encryption_seed=None)
                 lks._seed_bytes = self._seed_bytes
-                lks._sqlcipher_key = self._sqlcipher_key
+                lks._sqlite_key = self._sqlite_key
                 identity = lks._load_identity_from_split_files(aid)
                 if isinstance(identity, dict):
                     identity.setdefault("aid", aid)

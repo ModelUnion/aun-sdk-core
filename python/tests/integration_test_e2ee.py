@@ -239,7 +239,7 @@ async def _raw_recv_pull(client: AUNClient, e2ee: E2EEManager, from_aid: str,
                          after_seq: int = 0) -> list[dict]:
     """裸 WS pull + 手动解密。"""
     await client._ensure_sender_cert_cached(from_aid)
-    raw = await client._transport.call("message.pull", {"after_seq": after_seq, "limit": 50})
+    raw = await client._transport.call("message.pull", _message_pull_params(client, after_seq, 50))
     raw_msgs = raw.get("messages", [])
     result = []
     for msg in raw_msgs:
@@ -359,11 +359,11 @@ async def _wait_for_raw_pull_message(
 
 
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
-    """遍历当前消息游标，供固定 AID 场景按 after_seq 隔离本轮消息。"""
+    """遍历当前原始消息游标，供固定 AID 场景按 after_seq 隔离本轮消息。"""
     after_seq = 0
     max_seq = 0
     while True:
-        result = await client.call("message.pull", {"after_seq": after_seq, "limit": limit})
+        result = await client._transport.call("message.pull", _message_pull_params(client, after_seq, limit))
         msgs = result.get("messages", [])
         if not msgs:
             return max_seq
@@ -374,11 +374,23 @@ async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
         after_seq = max_seq
 
 
+def _message_pull_params(client: AUNClient, after_seq: int, limit: int) -> dict:
+    """构造与 SDK message.pull 一致的设备/slot 游标参数。"""
+    return {
+        "after_seq": after_seq,
+        "limit": limit,
+        "device_id": getattr(client, "_device_id", ""),
+        "slot_id": getattr(client, "_slot_id", ""),
+    }
+
+
 def _assert_decrypted(msg: dict, expected_payload: dict, label: str = ""):
     prefix = f"[{label}] " if label else ""
-    assert msg.get("encrypted") is True, f"{prefix}should be marked encrypted"
+    print(f"  DEBUG _assert_decrypted: encrypted={msg.get('encrypted')}, payload.type={msg.get('payload',{}).get('type')}, payload.keys={list(msg.get('payload',{}).keys())[:15]}, msg.keys={list(msg.keys())[:15]}")
+    assert msg.get("encrypted") is True, f"{prefix}should be marked encrypted; msg.keys={list(msg.keys())}"
     for k, v in expected_payload.items():
-        assert msg["payload"].get(k) == v, f"{prefix}payload.{k} mismatch: {msg['payload'].get(k)} != {v}"
+        actual = msg["payload"].get(k)
+        assert actual == v, f"{prefix}payload.{k} mismatch: {actual!r} != {v!r}; payload.keys={list(msg['payload'].keys())[:15]}"
 
 
 def _find_message_by_text(messages: list[dict], expected_text: str) -> dict:
@@ -799,6 +811,7 @@ async def test_same_aid_slots_ack_isolated():
         base_seq_a = await _current_max_seq(receiver_slot_a)
         base_seq_b = await _current_max_seq(receiver_slot_b)
         assert base_seq_a == base_seq_b, f"slot 基线不一致: {base_seq_a} != {base_seq_b}"
+        min_ack_seq = max(base_seq_a, base_seq_b)
 
         expected_slots = {"slot-a", "slot-b"}
         ack_events = []
@@ -811,6 +824,12 @@ async def test_same_aid_slots_ack_isolated():
                 return
             slot_id = str(data.get("slot_id") or "")
             if slot_id not in expected_slots:
+                return
+            try:
+                ack_seq = int(data.get("ack_seq") or 0)
+            except (TypeError, ValueError):
+                ack_seq = 0
+            if ack_seq <= min_ack_seq:
                 return
             ack_events.append(dict(data))
             if {str(item.get("slot_id") or "") for item in ack_events} >= expected_slots:
@@ -946,15 +965,36 @@ async def test_multi_device_recipient_and_self_sync():
         base_sync = await _current_max_seq(alice_sync)
         text = f"multi_device_sync_{int(asyncio.get_running_loop().time() * 1000)}"
 
-        result = await _sdk_send(alice_main, _BOBB_AID, {"text": text, "kind": "multi-device"})
-        assert result.get("status") in {"sent", "delivered"}
+        phone_push: list[dict] = []
+        laptop_push: list[dict] = []
+        phone_event = asyncio.Event()
+        laptop_event = asyncio.Event()
 
-        phone_msg = await _wait_for_sdk_pull_message(
-            bob_phone, _ALICE_AID, after_seq=base_phone, expected_text=text,
-        )
-        laptop_msg = await _wait_for_sdk_pull_message(
-            bob_laptop, _ALICE_AID, after_seq=base_laptop, expected_text=text,
-        )
+        def _capture_push(target: list[dict], event: asyncio.Event):
+            def _handler(data):
+                if not isinstance(data, dict):
+                    return
+                payload = data.get("payload")
+                if not isinstance(payload, dict) or payload.get("text") != text:
+                    return
+                target.append(dict(data))
+                event.set()
+            return _handler
+
+        sub_phone = bob_phone.on("message.received", _capture_push(phone_push, phone_event))
+        sub_laptop = bob_laptop.on("message.received", _capture_push(laptop_push, laptop_event))
+        try:
+            result = await _sdk_send(alice_main, _BOBB_AID, {"text": text, "kind": "multi-device"})
+            assert result.get("status") in {"sent", "delivered"}
+            await asyncio.wait_for(phone_event.wait(), timeout=10.0)
+            await asyncio.wait_for(laptop_event.wait(), timeout=10.0)
+            assert phone_push and laptop_push, "fanout push should reach both online slots"
+        finally:
+            sub_phone.unsubscribe()
+            sub_laptop.unsubscribe()
+
+        phone_msg = phone_push[0]
+        laptop_msg = laptop_push[0]
         sync_msg = await _wait_for_sdk_pull_message(
             alice_sync, _ALICE_AID, after_seq=base_sync, expected_text=text,
         )

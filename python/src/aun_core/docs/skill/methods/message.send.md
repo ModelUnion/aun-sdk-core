@@ -25,6 +25,15 @@ result = await client.call("message.send", {
 
 P2P 消息的投递语义由连接阶段声明的 `delivery_mode` 决定；`group.send` 固定为 `fanout`。
 
+## Payload 约定要点
+
+- `payload` 由应用层定义，服务端只做大小限制和透传；建议用 `payload.text` 放正文，用 `payload.kind` 放业务私有子类型。
+- 引用、会话和提及等不适合放在信封里的字段，可放入 `payload.chat_id`、`payload.reply_to`、`payload.quote`、`payload.mentions`。
+- 文件、图片、音视频等附件引用放入 `payload.attachments`；不要把二进制内容直接嵌入 `payload`。
+- AUN Storage 的 `url` 是上传完成后返回的长期对象引用；下载时用该 `url` 换取 `download_ticket`，再使用短期 `download_url`。
+
+详细字段建议见 [message/04-RPC-Manual.md](../rpc-manual/message/04-RPC-Manual.md#payload-参考约定)。
+
 ## 返回值
 
 ```json

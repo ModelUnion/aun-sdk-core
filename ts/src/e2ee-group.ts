@@ -503,6 +503,23 @@ export function storeGroupSecret(
     if (epoch < localEpoch) {
       return false;
     }
+    if (epoch === localEpoch && typeof existing.secret === 'string') {
+      const incomingSecret = groupSecret.toString('base64');
+      if (existing.secret !== incomingSecret) {
+        return false;
+      }
+      const oldMembers = [...((existing.member_aids as string[] | undefined) ?? [])].sort();
+      const newMembers = [...memberAids].sort();
+      if (JSON.stringify(oldMembers) !== JSON.stringify(newMembers) && newMembers.length > 0) {
+        saveKeyStoreGroupState(keystore, aid, groupId, {
+          ...existing,
+          member_aids: newMembers,
+          commitment,
+          updated_at: Date.now(),
+        });
+      }
+      return true;
+    }
   }
 
   const current = existing ? { ...existing } : {};
@@ -918,7 +935,10 @@ export class GroupE2EEManager {
     const newEpoch = (prevEpoch ?? 0) + 1;
     const gs = generateGroupSecret();
     const commitment = computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
-    storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids);
+    const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids);
+    if (!stored) {
+      throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
+    }
     const manifest = this._signManifest(buildMembershipManifest(
       groupId, newEpoch, prevEpoch, memberAids, { initiatorAid: aid },
     ));
@@ -941,7 +961,10 @@ export class GroupE2EEManager {
     const aid = this._currentAid();
     const gs = generateGroupSecret();
     const commitment = computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
-    storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids);
+    const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids);
+    if (!stored) {
+      throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
+    }
     const manifest = this._signManifest(buildMembershipManifest(
       groupId, newEpoch, newEpoch - 1, memberAids, { initiatorAid: aid },
     ));
@@ -1118,8 +1141,8 @@ export class GroupE2EEManager {
   }
 
   /** 加载群组密钥数据 */
-  loadSecret(groupId: string): LoadedGroupSecret | null {
-    return loadGroupSecret(this._keystore, this._currentAid(), groupId);
+  loadSecret(groupId: string, epoch?: number | null): LoadedGroupSecret | null {
+    return loadGroupSecret(this._keystore, this._currentAid(), groupId, epoch);
   }
 
   /** 清理过期的旧 epoch */

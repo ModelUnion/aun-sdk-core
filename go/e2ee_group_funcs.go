@@ -147,25 +147,23 @@ func EncryptGroupMessage(
 	// 发送方签名
 	if senderPrivateKeyPEM != "" {
 		pk, err := parseECPrivateKeyPEM(senderPrivateKeyPEM)
-		if err == nil {
-			signPayload := make([]byte, 0, len(ciphertext)+len(tag)+len(aadBytes))
-			signPayload = append(signPayload, ciphertext...)
-			signPayload = append(signPayload, tag...)
-			signPayload = append(signPayload, aadBytes...)
-			hash := sha256.Sum256(signPayload)
-			sig, err := ecdsa.SignASN1(rand.Reader, pk, hash[:])
-			if err == nil {
-				envelope["sender_signature"] = base64.StdEncoding.EncodeToString(sig)
-				if len(senderCertPEM) > 0 {
-					if cert, certErr := parseCertPEM(senderCertPEM); certErr == nil {
-						envelope["sender_cert_fingerprint"] = certificateSHA256Fingerprint(cert)
-					}
-				}
-			} else {
-				log.Printf("[e2ee_group] 群消息发送方签名失败: %v", err)
+		if err != nil {
+			return nil, fmt.Errorf("解析发送方私钥失败: %w", err)
+		}
+		signPayload := make([]byte, 0, len(ciphertext)+len(tag)+len(aadBytes))
+		signPayload = append(signPayload, ciphertext...)
+		signPayload = append(signPayload, tag...)
+		signPayload = append(signPayload, aadBytes...)
+		hash := sha256.Sum256(signPayload)
+		sig, err := ecdsa.SignASN1(rand.Reader, pk, hash[:])
+		if err != nil {
+			return nil, fmt.Errorf("群消息发送方签名失败: %w", err)
+		}
+		envelope["sender_signature"] = base64.StdEncoding.EncodeToString(sig)
+		if len(senderCertPEM) > 0 {
+			if cert, certErr := parseCertPEM(senderCertPEM); certErr == nil {
+				envelope["sender_cert_fingerprint"] = certificateSHA256Fingerprint(cert)
 			}
-		} else {
-			log.Printf("[e2ee_group] 解析发送方私钥失败: %v", err)
 		}
 	}
 
@@ -527,6 +525,12 @@ func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, grou
 		if epoch < localEpoch {
 			return false, nil
 		}
+		if epoch == localEpoch {
+			incomingSecret := base64.StdEncoding.EncodeToString(groupSecret)
+			if existingSecret, _ := existing["secret"].(string); existingSecret != "" && existingSecret != incomingSecret {
+				return false, nil
+			}
+		}
 	}
 
 	if existing == nil {
@@ -879,7 +883,10 @@ func HandleKeyDistribution(
 		return false
 	}
 
-	ok, _ := StoreGroupSecret(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs)
+	ok, storeErr := StoreGroupSecret(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs)
+	if storeErr != nil {
+		log.Printf("[e2ee_group] HandleKeyDistribution 存储 group secret 失败: group=%s epoch=%d err=%v", groupID, epoch, storeErr)
+	}
 	return ok
 }
 
@@ -986,7 +993,10 @@ func HandleKeyResponse(
 		return false
 	}
 
-	ok, _ := StoreGroupSecret(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs)
+	ok, storeErr := StoreGroupSecret(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs)
+	if storeErr != nil {
+		log.Printf("[e2ee_group] HandleKeyResponse 存储 group secret 失败: group=%s epoch=%d err=%v", groupID, epoch, storeErr)
+	}
 	return ok
 }
 

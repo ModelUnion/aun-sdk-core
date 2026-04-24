@@ -94,7 +94,7 @@ type AIDDatabase struct {
 	db          *sql.DB
 	dbPath      string
 	secretStore secretstore.SecretStore // 字段级加密，nil 时降级为明文
-	aid         string                 // 当前 AID 标识，用于 SecretStore scope
+	aid         string                  // 当前 AID 标识，用于 SecretStore scope
 }
 
 // newAIDDatabase 创建或打开 AID 数据库。
@@ -113,6 +113,12 @@ func newAIDDatabase(dbPath string, ss secretstore.SecretStore, aid string) (*AID
 	adb := &AIDDatabase{db: db, dbPath: dbPath, secretStore: ss, aid: aid}
 	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
 		log.Printf("[WARN] AIDDatabase WAL 设置失败: %v", err)
+		if _, lockErr := db.Exec("PRAGMA locking_mode = EXCLUSIVE"); lockErr != nil {
+			log.Printf("[WARN] AIDDatabase EXCLUSIVE locking 设置失败: %v", lockErr)
+		}
+		if _, delErr := db.Exec("PRAGMA journal_mode = DELETE"); delErr != nil {
+			log.Printf("[WARN] AIDDatabase DELETE journal 设置失败: %v", delErr)
+		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", aidDBBusyTimeout)); err != nil {
 		log.Printf("[WARN] AIDDatabase busy_timeout 设置失败: %v", err)
@@ -405,13 +411,14 @@ func (a *AIDDatabase) SaveGroupCurrent(groupID string, epoch int64, secret strin
 		log.Printf("[aid_db] SaveGroupCurrent json.Marshal 失败: %v", err)
 		dataJSON = []byte("{}")
 	}
+	storedSecret := a.encryptText("group/"+groupID+"/current", secret, "SaveGroupCurrent")
 	if _, err := a.db.Exec(
 		`INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
 		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(group_id) DO UPDATE SET
 		   epoch=excluded.epoch, secret_enc=excluded.secret_enc,
 		   data=excluded.data, updated_at=excluded.updated_at`,
-		groupID, epoch, secret, string(dataJSON), nowMs(),
+		groupID, epoch, storedSecret, string(dataJSON), nowMs(),
 	); err != nil {
 		log.Printf("[aid_db] SaveGroupCurrent 失败 (group=%s): %v", groupID, err)
 	}
@@ -432,7 +439,7 @@ func (a *AIDDatabase) LoadGroupCurrent(groupID string) map[string]any {
 	result := map[string]any{
 		"group_id":   groupID,
 		"epoch":      epoch,
-		"secret":     enc,
+		"secret":     a.decryptText("group/"+groupID+"/current", enc, "LoadGroupCurrent"),
 		"updated_at": updatedAt,
 	}
 	var extra map[string]any
@@ -463,7 +470,7 @@ func (a *AIDDatabase) LoadAllGroupCurrent() map[string]map[string]any {
 		entry := map[string]any{
 			"group_id":   gid,
 			"epoch":      epoch,
-			"secret":     enc,
+			"secret":     a.decryptText("group/"+gid+"/current", enc, "LoadAllGroupCurrent"),
 			"updated_at": updatedAt,
 		}
 		var extra map[string]any
@@ -499,13 +506,14 @@ func (a *AIDDatabase) SaveGroupOldEpoch(groupID string, epoch int64, secret stri
 		log.Printf("[aid_db] SaveGroupOldEpoch json.Marshal 失败: %v", err)
 		dataJSON = []byte("{}")
 	}
+	storedSecret := a.encryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), secret, "SaveGroupOldEpoch")
 	if _, err := a.db.Exec(
 		`INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(group_id, epoch) DO UPDATE SET
 		   secret_enc=excluded.secret_enc, data=excluded.data,
 		   updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
-		groupID, epoch, secret, string(dataJSON), now, nullInt64PtrSQL(expiresAt),
+		groupID, epoch, storedSecret, string(dataJSON), now, nullInt64PtrSQL(expiresAt),
 	); err != nil {
 		log.Printf("[aid_db] SaveGroupOldEpoch 失败 (group=%s, epoch=%d): %v", groupID, epoch, err)
 	}
@@ -532,7 +540,7 @@ func (a *AIDDatabase) LoadGroupOldEpochs(groupID string) []map[string]any {
 		}
 		entry := map[string]any{
 			"epoch":      epoch,
-			"secret":     enc,
+			"secret":     a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), enc, "LoadGroupOldEpochs"),
 			"updated_at": updatedAt,
 		}
 		if expiresAt.Valid {
@@ -684,19 +692,38 @@ func (a *AIDDatabase) DeleteSession(sessionID string) {
 
 // decryptSessionData 尝试解密 session 数据，兼容旧明文格式
 func (a *AIDDatabase) decryptSessionData(sessionID, enc string) string {
+	return a.decryptText("session/"+sessionID, enc, "LoadSession")
+}
+
+func (a *AIDDatabase) encryptText(name, plaintext, label string) string {
+	if a.secretStore == nil || plaintext == "" {
+		return plaintext
+	}
+	rec, err := a.secretStore.Protect(safeAID(a.aid), name, []byte(plaintext))
+	if err != nil {
+		log.Printf("[aid_db] %s 加密失败 (name=%s)，降级明文存储: %v", label, name, err)
+		return plaintext
+	}
+	encJSON, err := json.Marshal(rec)
+	if err != nil {
+		log.Printf("[aid_db] %s 序列化加密记录失败 (name=%s)，降级明文存储: %v", label, name, err)
+		return plaintext
+	}
+	return string(encJSON)
+}
+
+func (a *AIDDatabase) decryptText(name, enc, label string) string {
 	if a.secretStore == nil || enc == "" {
 		return enc
 	}
 	var rec map[string]any
 	if err := json.Unmarshal([]byte(enc), &rec); err == nil {
-		scope := safeAID(a.aid)
-		if plain, err2 := a.secretStore.Reveal(scope, "session/"+sessionID, rec); err2 != nil {
-			log.Printf("[aid_db] LoadSession 解密失败 (id=%s): %v", sessionID, err2)
+		if plain, err2 := a.secretStore.Reveal(safeAID(a.aid), name, rec); err2 != nil {
+			log.Printf("[aid_db] %s 解密失败 (name=%s): %v", label, name, err2)
 		} else if plain != nil {
 			return string(plain)
 		}
 	}
-	// JSON 解析失败或 scheme 不匹配 → 原始值是明文 JSON，直接返回
 	return enc
 }
 

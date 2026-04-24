@@ -7,15 +7,26 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 
 	"golang.org/x/crypto/pbkdf2"
 )
+
+var hexSecretPartPattern = regexp.MustCompile(`^[0-9a-fA-F]+$`)
+
+func decodeSecretPart(value string) ([]byte, error) {
+	if len(value)%2 == 0 && hexSecretPartPattern.MatchString(value) {
+		return hex.DecodeString(value)
+	}
+	return base64.StdEncoding.DecodeString(value)
+}
 
 // SeedBackup seed 备份接口，避免循环依赖 keystore 包
 type SeedBackup interface {
@@ -138,15 +149,15 @@ func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) ([]b
 	key := f.deriveKey(scope, name)
 
 	// 解码
-	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
+	nonce, err := decodeSecretPart(nonceB64)
 	if err != nil {
 		return nil, fmt.Errorf("secretstore.Reveal: nonce base64 解码失败: %w", err)
 	}
-	ciphertext, err := base64.StdEncoding.DecodeString(ctB64)
+	ciphertext, err := decodeSecretPart(ctB64)
 	if err != nil {
 		return nil, fmt.Errorf("secretstore.Reveal: ciphertext base64 解码失败: %w", err)
 	}
-	tag, err := base64.StdEncoding.DecodeString(tagB64)
+	tag, err := decodeSecretPart(tagB64)
 	if err != nil {
 		return nil, fmt.Errorf("secretstore.Reveal: tag base64 解码失败: %w", err)
 	}
