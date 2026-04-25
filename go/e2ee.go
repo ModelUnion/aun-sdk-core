@@ -90,28 +90,10 @@ type E2EEManagerConfig struct {
 	ReplayWindowSecs int                   // 防重放时间窗口（秒），默认 300
 }
 
-type structuredKeyStore interface {
-	LoadE2EEPrekeys(aid string) (map[string]map[string]any, error)
-	SaveE2EEPrekey(aid, prekeyID string, prekeyData map[string]any) error
-	CleanupE2EEPrekeys(aid string, cutoffMs int64, keepLatest int) ([]string, error)
-}
-
-type structuredDeviceKeyStore interface {
-	LoadE2EEPrekeysForDevice(aid, deviceID string) (map[string]map[string]any, error)
-	SaveE2EEPrekeyForDevice(aid, deviceID, prekeyID string, prekeyData map[string]any) error
-	CleanupE2EEPrekeysForDevice(aid, deviceID string, cutoffMs int64, keepLatest int) ([]string, error)
-}
-
 func loadKeyStorePrekeys(ks keystore.KeyStore, aid, deviceID string) map[string]map[string]any {
 	normalizedDeviceID := strings.TrimSpace(deviceID)
-	if deviceAware, ok := ks.(structuredDeviceKeyStore); ok {
-		result, err := deviceAware.LoadE2EEPrekeysForDevice(aid, normalizedDeviceID)
-		if err == nil && result != nil {
-			return result
-		}
-	}
-	if structured, ok := ks.(structuredKeyStore); ok {
-		result, err := structured.LoadE2EEPrekeys(aid)
+	if structured, ok := ks.(keystore.StructuredKeyStore); ok {
+		result, err := structured.LoadE2EEPrekeys(aid, normalizedDeviceID)
 		if err == nil && result != nil {
 			return result
 		}
@@ -122,11 +104,8 @@ func loadKeyStorePrekeys(ks keystore.KeyStore, aid, deviceID string) map[string]
 
 func saveKeyStorePrekey(ks keystore.KeyStore, aid, deviceID, prekeyID string, prekeyData map[string]any) error {
 	normalizedDeviceID := strings.TrimSpace(deviceID)
-	if deviceAware, ok := ks.(structuredDeviceKeyStore); ok {
-		return deviceAware.SaveE2EEPrekeyForDevice(aid, normalizedDeviceID, prekeyID, prekeyData)
-	}
-	if structured, ok := ks.(structuredKeyStore); ok {
-		return structured.SaveE2EEPrekey(aid, prekeyID, prekeyData)
+	if structured, ok := ks.(keystore.StructuredKeyStore); ok {
+		return structured.SaveE2EEPrekey(aid, prekeyID, normalizedDeviceID, prekeyData)
 	}
 	return fmt.Errorf("keystore 不支持 SaveE2EEPrekey")
 }
@@ -168,15 +147,8 @@ func latestPrekeyIDs(prekeys map[string]map[string]any, keepLatest int) map[stri
 
 func cleanupKeyStorePrekeys(ks keystore.KeyStore, aid, deviceID string, cutoffMs int64, keepLatest int) []string {
 	normalizedDeviceID := strings.TrimSpace(deviceID)
-	if deviceAware, ok := ks.(structuredDeviceKeyStore); ok {
-		result, err := deviceAware.CleanupE2EEPrekeysForDevice(aid, normalizedDeviceID, cutoffMs, keepLatest)
-		if err == nil {
-			return result
-		}
-		return nil
-	}
-	if structured, ok := ks.(structuredKeyStore); ok {
-		result, err := structured.CleanupE2EEPrekeys(aid, cutoffMs, keepLatest)
+	if structured, ok := ks.(keystore.StructuredKeyStore); ok {
+		result, err := structured.CleanupE2EEPrekeys(aid, normalizedDeviceID, cutoffMs, keepLatest)
 		if err == nil {
 			return result
 		}

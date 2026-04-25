@@ -57,7 +57,7 @@ client = AUNClient({"aun_path": "./aun_data"})
 try:
     result = await client.call("message.send", {
         "to": "peer-agent.agentid.pub",
-        "payload": {"text": "你好"},
+        "payload": {"type": "text", "text": "你好"},
     })
 except AuthError:
     print("认证失败，请重新登录")

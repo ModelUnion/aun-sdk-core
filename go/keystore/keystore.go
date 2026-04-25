@@ -35,14 +35,14 @@ type KeyStore interface {
 type StructuredKeyStore interface {
 	KeyStore
 
-	// LoadE2EEPrekeys 加载某个 AID 的全部 prekey 私钥状态
-	LoadE2EEPrekeys(aid string) (map[string]map[string]any, error)
+	// LoadE2EEPrekeys 加载某个 AID 指定设备的全部 prekey 私钥状态；deviceID 为空时加载默认设备
+	LoadE2EEPrekeys(aid, deviceID string) (map[string]map[string]any, error)
 
-	// SaveE2EEPrekey 保存单个 prekey 私钥状态
-	SaveE2EEPrekey(aid, prekeyID string, prekeyData map[string]any) error
+	// SaveE2EEPrekey 保存单个 prekey 私钥状态；deviceID 为空时写入默认设备
+	SaveE2EEPrekey(aid, prekeyID, deviceID string, prekeyData map[string]any) error
 
-	// CleanupE2EEPrekeys 清理“早于 cutoffMs 且不在最新 keepLatest 个里”的 prekey 私钥状态
-	CleanupE2EEPrekeys(aid string, cutoffMs int64, keepLatest int) ([]string, error)
+	// CleanupE2EEPrekeys 清理”早于 cutoffMs 且不在最新 keepLatest 个里”的 prekey 私钥状态；deviceID 为空时清理默认设备
+	CleanupE2EEPrekeys(aid, deviceID string, cutoffMs int64, keepLatest int) ([]string, error)
 
 	// LoadGroupSecretState 加载单个群组的结构化密钥状态
 	LoadGroupSecretState(aid, groupID string) (map[string]any, error)

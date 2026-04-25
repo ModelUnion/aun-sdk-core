@@ -424,13 +424,13 @@ func TestIntegrationSDKToSDKPrekey(t *testing.T) {
 	sAID := ensureConnected(t, sender, fmt.Sprintf("e2ee-s-%s.agentid.pub", rid))
 	rAID := ensureConnected(t, receiver, fmt.Sprintf("e2ee-r-%s.agentid.pub", rid))
 
-	sdkSend(t, sender, rAID, map[string]any{"text": "sdk2sdk prekey", "n": 1})
+	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "sdk2sdk prekey", "n": 1})
 
 	msgs := sdkRecvPush(t, receiver, sAID, 5*time.Second)
 	if len(msgs) < 1 {
 		t.Fatalf("期望至少收到 1 条消息，实际 %d", len(msgs))
 	}
-	assertDecrypted(t, msgs[0], map[string]any{"text": "sdk2sdk prekey"}, "")
+	assertDecrypted(t, msgs[0], map[string]any{"type": "text", "text": "sdk2sdk prekey"}, "")
 }
 
 // TestIntegrationSDKLongTermFallback 未上传 prekey 时，验证 long_term_key 降级模式。
@@ -454,7 +454,7 @@ func TestIntegrationSDKLongTermFallback(t *testing.T) {
 	}
 
 	// sender 发送消息（对方无 prekey，应降级到 long_term_key）
-	sdkSend(t, sender, rAID, map[string]any{"text": "fallback"})
+	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "fallback"})
 
 	// receiver 此时认证并连接
 	authResult, err := receiver.Auth.Authenticate(ctx, map[string]any{"aid": rAID})
@@ -471,7 +471,7 @@ func TestIntegrationSDKLongTermFallback(t *testing.T) {
 	if len(msgs) < 1 {
 		t.Fatalf("期望至少收到 1 条消息，实际 %d", len(msgs))
 	}
-	assertDecrypted(t, msgs[0], map[string]any{"text": "fallback"}, "")
+	assertDecrypted(t, msgs[0], map[string]any{"type": "text", "text": "fallback"}, "")
 
 	// 验证加密模式为 long_term_key
 	e2eeMeta, _ := msgs[0]["e2ee"].(map[string]any)
@@ -495,20 +495,20 @@ func TestIntegrationSDKToSDKBidirectional(t *testing.T) {
 	bAID := ensureConnected(t, bob, fmt.Sprintf("e2ee-b-%s.agentid.pub", rid))
 
 	// alice -> bob
-	sdkSend(t, alice, bAID, map[string]any{"text": "hello_bob", "from": "alice"})
+	sdkSend(t, alice, bAID, map[string]any{"type": "text", "text": "hello_bob", "from": "alice"})
 	msgsBob := sdkRecvPush(t, bob, aAID, 5*time.Second)
 	if len(msgsBob) < 1 {
 		t.Fatalf("bob 期望至少收到 1 条消息，实际 %d", len(msgsBob))
 	}
-	assertDecrypted(t, msgsBob[0], map[string]any{"text": "hello_bob"}, "A->B")
+	assertDecrypted(t, msgsBob[0], map[string]any{"type": "text", "text": "hello_bob"}, "A->B")
 
 	// bob -> alice
-	sdkSend(t, bob, aAID, map[string]any{"text": "hello_alice", "from": "bob"})
+	sdkSend(t, bob, aAID, map[string]any{"type": "text", "text": "hello_alice", "from": "bob"})
 	msgsAlice := sdkRecvPush(t, alice, bAID, 5*time.Second)
 	if len(msgsAlice) < 1 {
 		t.Fatalf("alice 期望至少收到 1 条消息，实际 %d", len(msgsAlice))
 	}
-	assertDecrypted(t, msgsAlice[0], map[string]any{"text": "hello_alice"}, "B->A")
+	assertDecrypted(t, msgsAlice[0], map[string]any{"type": "text", "text": "hello_alice"}, "B->A")
 }
 
 // TestIntegrationBurstMessages 连续发送 10 条消息，验证全部接收。
@@ -525,7 +525,7 @@ func TestIntegrationBurstMessages(t *testing.T) {
 	const N = 10
 	for i := 0; i < N; i++ {
 		sdkSend(t, sender, rAID, map[string]any{
-			"text": fmt.Sprintf("burst_%d", i),
+			"type": "text", "text": fmt.Sprintf("burst_%d", i),
 			"seq":  i,
 		})
 	}
@@ -566,7 +566,7 @@ func TestIntegrationPrekeyRotation(t *testing.T) {
 	rAID := ensureConnected(t, receiver, fmt.Sprintf("e2ee-r-%s.agentid.pub", rid))
 
 	// 轮换前发送
-	sdkSend(t, sender, rAID, map[string]any{"text": "before_rotate", "phase": 1})
+	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "before_rotate", "phase": 1})
 
 	// receiver 轮换 prekey
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -576,7 +576,7 @@ func TestIntegrationPrekeyRotation(t *testing.T) {
 	}
 
 	// 轮换后发送（sender 的缓存可能仍是旧 prekey，但接收方应能解密两者）
-	sdkSend(t, sender, rAID, map[string]any{"text": "after_rotate", "phase": 2})
+	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "after_rotate", "phase": 2})
 
 	time.Sleep(2 * time.Second)
 	msgs := sdkRecvPull(t, receiver, sAID, 0)
@@ -634,7 +634,7 @@ func TestIntegrationPushThenPullNoDuplicate(t *testing.T) {
 		}
 	})
 
-	sdkSend(t, sender, rAID, map[string]any{"text": "dup_test"})
+	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "dup_test"})
 
 	// 等待推送
 	timer := time.NewTimer(5 * time.Second)
@@ -658,7 +658,7 @@ func TestIntegrationPushThenPullNoDuplicate(t *testing.T) {
 		t.Errorf("推送应只收到 1 条，实际 %d", pushCount)
 	}
 	pushMu.Lock()
-	assertDecrypted(t, pushMsgs[0], map[string]any{"text": "dup_test"}, "push")
+	assertDecrypted(t, pushMsgs[0], map[string]any{"type": "text", "text": "dup_test"}, "push")
 	pushMu.Unlock()
 
 	// pull 获取消息
@@ -746,12 +746,12 @@ func TestIntegrationSameAIDMultiSlotAckIsolation(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	uniqueText := fmt.Sprintf("slot_isolation_%d", time.Now().UnixMilli())
-	sdkSend(t, sender, rAID, map[string]any{"text": uniqueText})
+	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": uniqueText})
 
 	msgA := waitForSDKPullMessage(t, receiverSlotA, sAID, baseSeqA, uniqueText, 15*time.Second)
 	msgB := waitForSDKPullMessage(t, receiverSlotB, sAID, baseSeqB, uniqueText, 15*time.Second)
-	assertDecrypted(t, msgA, map[string]any{"text": uniqueText}, "slot-a")
-	assertDecrypted(t, msgB, map[string]any{"text": uniqueText}, "slot-b")
+	assertDecrypted(t, msgA, map[string]any{"type": "text", "text": uniqueText}, "slot-a")
+	assertDecrypted(t, msgB, map[string]any{"type": "text", "text": uniqueText}, "slot-b")
 
 	seqA := int(toInt64(msgA["seq"]))
 	seqB := int(toInt64(msgB["seq"]))
@@ -837,14 +837,14 @@ func TestIntegrationMultiDeviceRecipientAndSelfSync(t *testing.T) {
 	baseSync := currentMaxSeq(t, bobSync, 200)
 	baseAliceSync := currentMaxSeq(t, aliceSync, 200)
 	text := fmt.Sprintf("multi_device_sync_%d", time.Now().UnixMilli())
-	sdkSend(t, aliceSeed, bobAID, map[string]any{"text": text, "kind": "multi-device"})
+	sdkSend(t, aliceSeed, bobAID, map[string]any{"type": "text", "text": text, "kind": "multi-device"})
 
 	mainMsg := waitForSDKPullMessage(t, bobSeed, aliceAID, baseMain, text, 20*time.Second)
 	syncMsg := waitForSDKPullMessage(t, bobSync, aliceAID, baseSync, text, 20*time.Second)
 	aliceSyncMsg := waitForSDKPullMessage(t, aliceSync, aliceAID, baseAliceSync, text, 20*time.Second)
-	assertDecrypted(t, mainMsg, map[string]any{"text": text, "kind": "multi-device"}, "bob-main")
-	assertDecrypted(t, syncMsg, map[string]any{"text": text, "kind": "multi-device"}, "bob-sync")
-	assertDecrypted(t, aliceSyncMsg, map[string]any{"text": text, "kind": "multi-device"}, "alice-sync")
+	assertDecrypted(t, mainMsg, map[string]any{"type": "text", "text": text, "kind": "multi-device"}, "bob-main")
+	assertDecrypted(t, syncMsg, map[string]any{"type": "text", "text": text, "kind": "multi-device"}, "bob-sync")
+	assertDecrypted(t, aliceSyncMsg, map[string]any{"type": "text", "text": text, "kind": "multi-device"}, "alice-sync")
 	if getStr(mainMsg, "direction", "") != "inbound" {
 		t.Fatalf("主设备消息 direction 不正确: %#v", mainMsg["direction"])
 	}
@@ -897,10 +897,10 @@ func TestIntegrationMultiDeviceOfflinePull(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	text := fmt.Sprintf("multi_device_offline_%d", time.Now().UnixMilli())
-	sdkSend(t, aliceMain, bobAID, map[string]any{"text": text, "kind": "offline-pull"})
+	sdkSend(t, aliceMain, bobAID, map[string]any{"type": "text", "text": text, "kind": "offline-pull"})
 
 	onlineMsg := waitForSDKPullMessage(t, bobPhone, aliceAID, onlineBase, text, 15*time.Second)
-	assertDecrypted(t, onlineMsg, map[string]any{"text": text, "kind": "offline-pull"}, "bob-phone-online")
+	assertDecrypted(t, onlineMsg, map[string]any{"type": "text", "text": text, "kind": "offline-pull"}, "bob-phone-online")
 	if getStr(onlineMsg, "direction", "") != "inbound" {
 		t.Fatalf("在线设备消息 direction 不正确: %#v", onlineMsg["direction"])
 	}
@@ -909,7 +909,7 @@ func TestIntegrationMultiDeviceOfflinePull(t *testing.T) {
 	defer bobLaptop.Close()
 	ensureConnected(t, bobLaptop, bobAID)
 	offlineMsg := waitForSDKPullMessage(t, bobLaptop, aliceAID, offlineBase, text, 15*time.Second)
-	assertDecrypted(t, offlineMsg, map[string]any{"text": text, "kind": "offline-pull"}, "bob-laptop-offline")
+	assertDecrypted(t, offlineMsg, map[string]any{"type": "text", "text": text, "kind": "offline-pull"}, "bob-laptop-offline")
 	if getStr(offlineMsg, "direction", "") != "inbound" {
 		t.Fatalf("离线补拉消息 direction 不正确: %#v", offlineMsg["direction"])
 	}

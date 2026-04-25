@@ -227,7 +227,7 @@ func TestPrekeyEncryptEnvelopeFields(t *testing.T) {
 
 	envelope, info, err := sender.EncryptOutbound(
 		receiverAID,
-		map[string]any{"text": "hello"},
+		map[string]any{"type": "text", "text": "hello"},
 		[]byte(receiverCertPEM),
 		prekey,
 		"test-msg-1",
@@ -274,7 +274,7 @@ func TestPrekeyEncryptDecryptRoundtrip(t *testing.T) {
 		t.Fatalf("生成 prekey 失败: %v", err)
 	}
 
-	originalPayload := map[string]any{"text": "hello world", "count": float64(42)}
+	originalPayload := map[string]any{"type": "text", "text": "hello world", "count": float64(42)}
 	messageID := "test-msg-roundtrip"
 	ts := time.Now().UnixMilli()
 
@@ -334,7 +334,7 @@ func TestPrekeyEncryptRejectsCertFingerprintMismatch(t *testing.T) {
 	prekey["cert_fingerprint"] = "sha256:" + strings.Repeat("0", 64)
 
 	_, err = sender.encryptWithPrekey(
-		receiverAID, map[string]any{"text": "hello"}, prekey,
+		receiverAID, map[string]any{"type": "text", "text": "hello"}, prekey,
 		[]byte(receiverCertPEM), "msg-fp-mismatch", time.Now().UnixMilli(),
 	)
 	if err == nil || !strings.Contains(err.Error(), "prekey cert fingerprint mismatch") {
@@ -350,7 +350,7 @@ func TestLongTermKeyEnvelopeAadFields(t *testing.T) {
 
 	envelope, info, err := sender.EncryptOutbound(
 		receiverAID,
-		map[string]any{"text": "hello"},
+		map[string]any{"type": "text", "text": "hello"},
 		[]byte(receiverCertPEM),
 		nil, // 无 prekey，降级到 long_term_key
 		"test-msg-lt",
@@ -384,7 +384,7 @@ func TestLongTermKeyEnvelopeAadFields(t *testing.T) {
 func TestLongTermKeyRoundtrip(t *testing.T) {
 	sender, receiver, senderAID, receiverAID, _, _, _, receiverCertPEM := testMakeE2EEPair(t)
 
-	originalPayload := map[string]any{"text": "long term test"}
+	originalPayload := map[string]any{"type": "text", "text": "long term test"}
 	messageID := "test-msg-lt-rt"
 	ts := time.Now().UnixMilli()
 
@@ -587,7 +587,7 @@ func TestGeneratePrekeyUsesStructuredKeyStoreInterface(t *testing.T) {
 		t.Fatalf("GeneratePrekey 失败: %v", err)
 	}
 
-	prekeys, err := receiverKS.LoadE2EEPrekeys(receiverAID)
+	prekeys, err := receiverKS.LoadE2EEPrekeys(receiverAID, "")
 	if err != nil {
 		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
@@ -609,7 +609,7 @@ func TestEncryptOutboundAcceptsOldPrekey(t *testing.T) {
 
 	envelope, info, err := sender.EncryptOutbound(
 		receiverAID,
-		map[string]any{"text": "old prekey still works"},
+		map[string]any{"type": "text", "text": "old prekey still works"},
 		[]byte(receiverCertPEM),
 		oldPrekey,
 		"old-prekey-msg",
@@ -629,14 +629,14 @@ func TestEncryptOutboundAcceptsOldPrekey(t *testing.T) {
 func TestGeneratePrekeyCleanupKeepsLatestSeven(t *testing.T) {
 	_, receiver, _, receiverAID, _, _, _, _ := testMakeE2EEPair(t)
 
-	structured, ok := receiver.keystore.(structuredKeyStore)
+	structured, ok := receiver.keystore.(keystore.StructuredKeyStore)
 	if !ok {
-		t.Fatal("receiver keystore 应支持 structuredKeyStore")
+		t.Fatal("receiver keystore 应支持 StructuredKeyStore")
 	}
 
 	oldBase := time.Now().Add(-8 * 24 * time.Hour).UnixMilli()
 	for i := 0; i < 8; i++ {
-		err := structured.SaveE2EEPrekey(receiverAID, fmt.Sprintf("old-%d", i), map[string]any{
+		err := structured.SaveE2EEPrekey(receiverAID, fmt.Sprintf("old-%d", i), "", map[string]any{
 			"private_key_pem": fmt.Sprintf("OLD-%d", i),
 			"created_at":      oldBase + int64(i),
 		})
@@ -650,7 +650,7 @@ func TestGeneratePrekeyCleanupKeepsLatestSeven(t *testing.T) {
 		t.Fatalf("生成新 prekey 失败: %v", err)
 	}
 
-	prekeys, err := structured.LoadE2EEPrekeys(receiverAID)
+	prekeys, err := structured.LoadE2EEPrekeys(receiverAID, "")
 	if err != nil {
 		t.Fatalf("读取 prekeys 失败: %v", err)
 	}
@@ -681,7 +681,7 @@ func TestPlaintextPassthrough(t *testing.T) {
 	message := map[string]any{
 		"from": "alice", "to": "bob",
 		"message_id": "plain-1",
-		"payload":    map[string]any{"text": "hello"},
+		"payload":    map[string]any{"type": "text", "text": "hello"},
 	}
 	result, err := receiver.DecryptMessage(message)
 	if err != nil {

@@ -27,7 +27,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, AuthError, RateLimitError
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -84,9 +84,47 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
         await client.auth.create_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth)
-    return aid
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            auth = await client.auth.authenticate({"aid": aid})
+            await client.connect(auth)
+            return aid
+        except (AuthError, RateLimitError) as exc:
+            last_error = exc
+            if attempt >= 3:
+                break
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_error or RuntimeError(f"{aid} connect failed")
+
+
+async def _wait_for_message(client: AUNClient, from_aid: str, *, timeout: float = 5.0) -> dict | None:
+    inbox: list[dict] = []
+    event = asyncio.Event()
+
+    def handler(data):
+        if not isinstance(data, dict):
+            return
+        if data.get("from") != from_aid:
+            return
+        inbox.append(data)
+        event.set()
+
+    sub = client.on("message.received", handler)
+    try:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        if inbox:
+            return inbox[0]
+        result = await client.call("message.pull", {"after_seq": 0, "limit": 10})
+        for msg in result.get("messages", []):
+            if isinstance(msg, dict) and msg.get("from") == from_aid:
+                return msg
+        return None
+    finally:
+        sub.unsubscribe()
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +141,7 @@ async def test_replay_guard_fail_close():
         await _ensure_connected(bob, _BOB_AID)
 
         # 1. Alice 发送消息给 Bob
+        wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
         send_result = await alice.call("message.send", {
             "to": _BOB_AID,
             "payload": "test replay guard",
@@ -111,17 +150,12 @@ async def test_replay_guard_fail_close():
         message_id = send_result.get("message_id")
         print(f"  [INFO] Alice 发送消息: {message_id}")
 
-        await asyncio.sleep(1.0)
-
-        # 2. Bob 正常拉取消息（第一次，replay guard 应该通过）
-        result = await bob.call("message.pull", {"after_seq": 0, "limit": 10})
-        messages = result.get("messages", [])
-
-        if not messages:
+        # 2. Bob 正常接收消息（push 或 pull 兜底，replay guard 应该通过）
+        first_msg = await wait_task
+        if not first_msg:
             _fail("replay_guard_fail_close", "Bob 未收到消息")
             return
 
-        first_msg = messages[0]
         print(f"  [INFO] Bob 第一次拉取成功: seq={first_msg.get('seq')}")
 
         # 3. 模拟 replay guard RPC 失败
@@ -169,24 +203,22 @@ async def test_replay_guard_rpc_timeout():
         await _ensure_connected(bob, _BOB_AID)
 
         # 1. Alice 发送消息
+        wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
         await alice.call("message.send", {
             "to": _BOB_AID,
             "payload": "test timeout",
             "encrypt": True
         })
-        await asyncio.sleep(1.0)
 
-        # 2. Bob 拉取消息
-        result = await bob.call("message.pull", {"after_seq": 0, "limit": 10})
-        messages = result.get("messages", [])
-
-        if not messages:
+        # 2. Bob 接收消息
+        msg = await wait_task
+        if not msg:
             _fail("replay_guard_rpc_timeout", "Bob 未收到消息")
             return
 
         # 3. 验证消息正常接收
         # 注意：实际的超时测试需要能够控制 RPC 响应时间
-        print(f"  [INFO] 收到消息 {len(messages)} 条")
+        print("  [INFO] 收到消息 1 条")
 
         _ok("replay_guard_rpc_timeout_basic")
 
@@ -210,22 +242,19 @@ async def test_replay_guard_error_handling():
         await _ensure_connected(bob, _BOB_AID)
 
         # 1. Alice 发送消息
+        wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
         await alice.call("message.send", {
             "to": _BOB_AID,
             "payload": "test error handling",
             "encrypt": True
         })
-        await asyncio.sleep(1.0)
 
-        # 2. Bob 拉取消息
-        result = await bob.call("message.pull", {"after_seq": 0, "limit": 10})
-        messages = result.get("messages", [])
-
-        if not messages:
+        # 2. Bob 接收消息
+        msg = await wait_task
+        if not msg:
             _fail("replay_guard_error_handling", "Bob 未收到消息")
             return
 
-        msg = messages[0]
         print(f"  [INFO] 收到消息: seq={msg.get('seq')}, message_id={msg.get('message_id')}")
 
         # 3. 验证消息包含必要的 replay guard 字段

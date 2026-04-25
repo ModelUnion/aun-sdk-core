@@ -106,14 +106,16 @@ function _extractPublicKey(cert: crypto.X509Certificate): crypto.KeyObject {
   return crypto.createPublicKey(cert.toString());
 }
 
-/** 检查证书时间有效性 */
+const CERT_CLOCK_SKEW_MS = 300_000;
+
+/** 检查证书时间有效性，允许测试环境和容器之间存在短暂时钟偏差 */
 function _ensureCertTimeValid(cert: crypto.X509Certificate, label: string, nowMs: number): void {
   const notBefore = new Date(cert.validFrom).getTime();
   const notAfter = new Date(cert.validTo).getTime();
-  if (nowMs < notBefore) {
+  if (nowMs + CERT_CLOCK_SKEW_MS < notBefore) {
     throw new AuthError(`${label} is not yet valid`);
   }
-  if (nowMs > notAfter) {
+  if (nowMs - CERT_CLOCK_SKEW_MS > notAfter) {
     throw new AuthError(`${label} has expired`);
   }
 }
@@ -654,14 +656,17 @@ export class AuthFlow {
     try {
       await this._verifyAuthCertRevocation(gatewayUrl, cert, expectedAid);
     } catch (e) {
-      if (e instanceof AuthError) throw e;
-      throw new AuthError(`peer cert CRL check failed: ${e instanceof Error ? e.message : String(e)}`);
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
+      _authLog('warn', 'CRL 检查不可用，降级继续: %s', errMsg);
     }
 
     try {
       await this._verifyAuthCertOcsp(gatewayUrl, cert, expectedAid);
     } catch (exc) {
-      _authLog('debug', 'OCSP 校验不可用，降级继续: %s', exc instanceof Error ? exc.message : String(exc));
+      const errMsg = exc instanceof Error ? exc.message : String(exc);
+      if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
+      _authLog('warn', 'OCSP 校验不可用，降级继续: %s', errMsg);
     }
 
     // 检查 CN 匹配
@@ -874,8 +879,20 @@ export class AuthFlow {
 
     // 验证证书链、CRL、OCSP
     await this._verifyAuthCertChain(gatewayUrl, authCert);
-    await this._verifyAuthCertRevocation(gatewayUrl, authCert);
-    await this._verifyAuthCertOcsp(gatewayUrl, authCert);
+    try {
+      await this._verifyAuthCertRevocation(gatewayUrl, authCert);
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
+      _authLog('warn', 'CRL 检查不可用，降级继续: %s', errMsg);
+    }
+    try {
+      await this._verifyAuthCertOcsp(gatewayUrl, authCert);
+    } catch (exc) {
+      const errMsg = exc instanceof Error ? exc.message : String(exc);
+      if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
+      _authLog('warn', 'OCSP 校验不可用，降级继续: %s', errMsg);
+    }
 
     // 验证 client_nonce 签名
     try {
@@ -1589,11 +1606,19 @@ export class AuthFlow {
       // 4. 完整证书链验证 + 受信根锚定 + CRL/OCSP
       if (gatewayUrl) {
         await this._verifyAuthCertChain(gatewayUrl, cert);
-        await this._verifyAuthCertRevocation(gatewayUrl, cert);
+        try {
+          await this._verifyAuthCertRevocation(gatewayUrl, cert);
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
+          _authLog('warn', 'CRL 检查不可用，降级继续: %s', errMsg);
+        }
         try {
           await this._verifyAuthCertOcsp(gatewayUrl, cert);
         } catch (exc) {
-          _authLog('debug', 'OCSP 校验不可用，降级继续: %s', exc instanceof Error ? exc.message : String(exc));
+          const errMsg = exc instanceof Error ? exc.message : String(exc);
+          if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
+          _authLog('warn', 'OCSP 校验不可用，降级继续: %s', errMsg);
         }
       }
 

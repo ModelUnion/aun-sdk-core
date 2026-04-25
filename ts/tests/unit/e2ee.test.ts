@@ -47,7 +47,7 @@ describe('prekey_ecdh_v2 加密', () => {
     const ts = Date.now();
 
     const [envelope, info] = senderMgr.encryptOutbound(
-      'receiver.test', { text: 'hello' }, receiverCert,
+      'receiver.test', { type: 'text', text: 'hello' }, receiverCert,
       prekey, mid, ts,
     );
     expect(info.encrypted).toBe(true);
@@ -69,7 +69,7 @@ describe('prekey_ecdh_v2 加密', () => {
       [prekey.prekey_id as string]: { private_key_pem: privPem, created_at: Date.now() },
     };
 
-    const payload = { text: 'prekey roundtrip' };
+    const payload = { type: 'text', text: 'prekey roundtrip' };
     const mid = crypto.randomUUID();
     const ts = Date.now();
 
@@ -99,7 +99,7 @@ describe('long_term_key 加密', () => {
     const ts = Date.now();
 
     const [envelope, info] = senderMgr.encryptOutbound(
-      'receiver.test', { text: 'hello' }, receiverCert, null, mid, ts,
+      'receiver.test', { type: 'text', text: 'hello' }, receiverCert, null, mid, ts,
     );
     expect(info.mode).toBe(MODE_LONG_TERM_KEY);
     expect(envelope.encryption_mode).toBe(MODE_LONG_TERM_KEY);
@@ -114,7 +114,7 @@ describe('long_term_key 加密', () => {
   it('long_term_key 加解密往返成功', () => {
     const { senderMgr, receiverMgr, receiverCert } = makeE2EEPair();
 
-    const payload = { text: 'long term roundtrip' };
+    const payload = { type: 'text', text: 'long term roundtrip' };
     const mid = crypto.randomUUID();
     const ts = Date.now();
 
@@ -145,7 +145,7 @@ describe('encryptOutbound 降级策略', () => {
     const ts = Date.now();
 
     const [envelope, info] = senderMgr.encryptOutbound(
-      'receiver.test', { text: 'test' }, receiverCert, prekey, mid, ts,
+      'receiver.test', { type: 'text', text: 'test' }, receiverCert, prekey, mid, ts,
     );
     expect(info.mode).toBe(MODE_PREKEY_ECDH_V2);
     expect(info.forward_secrecy).toBe(true);
@@ -159,7 +159,7 @@ describe('encryptOutbound 降级策略', () => {
     const ts = Date.now();
 
     const [envelope, info] = senderMgr.encryptOutbound(
-      'receiver.test', { text: 'test' }, receiverCert, null, mid, ts,
+      'receiver.test', { type: 'text', text: 'test' }, receiverCert, null, mid, ts,
     );
     expect(info.mode).toBe(MODE_LONG_TERM_KEY);
     expect(info.forward_secrecy).toBe(false);
@@ -173,7 +173,7 @@ describe('本地防重放', () => {
   it('重复消息被拦截', () => {
     const { senderMgr, receiverMgr, receiverCert } = makeE2EEPair();
 
-    const payload = { text: 'test replay' };
+    const payload = { type: 'text', text: 'test replay' };
     const mid = crypto.randomUUID();
     const ts = Date.now();
 
@@ -268,7 +268,7 @@ describe('generatePrekey', () => {
 
     const [_envelope, info] = senderMgr.encryptOutbound(
       'receiver.test',
-      { text: 'hello' },
+      { type: 'text', text: 'hello' },
       receiverCert,
       prekey,
       crypto.randomUUID(),
@@ -285,16 +285,16 @@ describe('generatePrekey', () => {
 describe('decryptMessage', () => {
   it('明文消息直接透传', () => {
     const { receiverMgr } = makeE2EEPair();
-    const message = { seq: 1, payload: { text: 'hello' } };
+    const message = { seq: 1, payload: { type: 'text', text: 'hello' } };
     const result = receiverMgr.decryptMessage(message);
     expect(result).not.toBeNull();
-    expect((result as Message).payload).toEqual({ text: 'hello' });
+    expect((result as Message).payload).toEqual({ type: 'text', text: 'hello' });
   });
 
   it('加密消息被自动解密', () => {
     const { senderMgr, receiverMgr, receiverCert } = makeE2EEPair();
 
-    const payload = { text: 'secret' };
+    const payload = { type: 'text', text: 'secret' };
     const mid = crypto.randomUUID();
     const ts = Date.now();
     const [envelope] = senderMgr.encryptOutbound(
@@ -317,7 +317,7 @@ describe('decryptMessage', () => {
     const ts = Date.now();
 
     const [envelope] = senderMgr.encryptOutbound(
-      'receiver.test', { text: 'self echo' }, receiverCert,
+      'receiver.test', { type: 'text', text: 'self echo' }, receiverCert,
       prekey, mid, ts,
     );
     const outboundCopy = {
@@ -346,7 +346,7 @@ describe('prekey 加密失败降级日志（TS-014）', () => {
 
     try {
       const [_envelope, info] = senderMgr.encryptOutbound(
-        'receiver.test', { text: 'test' }, receiverCert,
+        'receiver.test', { type: 'text', text: 'test' }, receiverCert,
         prekey, crypto.randomUUID(), Date.now(),
       );
       // 应降级到 long_term_key
@@ -377,7 +377,7 @@ describe('decryptMessage 解密失败行为（TS-015）', () => {
     };
     const mid = crypto.randomUUID();
     const ts = Date.now();
-    const [envelope] = senderMgr.encryptOutbound('receiver.test', { text: 'hi' }, receiverCert, prekey, mid, ts);
+    const [envelope] = senderMgr.encryptOutbound('receiver.test', { type: 'text', text: 'hi' }, receiverCert, prekey, mid, ts);
     // 篡改密文
     const tampered = { ...envelope, ciphertext: 'AAAAAAAAAAAAAAAA' };
     const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };
@@ -395,7 +395,7 @@ describe('decryptMessage 解密失败行为（TS-015）', () => {
     };
     const mid = crypto.randomUUID();
     const ts = Date.now();
-    const [envelope] = senderMgr.encryptOutbound('receiver.test', { text: 'hi' }, receiverCert, prekey, mid, ts);
+    const [envelope] = senderMgr.encryptOutbound('receiver.test', { type: 'text', text: 'hi' }, receiverCert, prekey, mid, ts);
     // 篡改 nonce（不影响签名验证，但解密会失败）
     const tampered = { ...envelope, nonce: Buffer.from(crypto.randomBytes(12)).toString('base64') };
     const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };
@@ -424,7 +424,7 @@ describe('decryptMessage 解密失败行为（TS-015）', () => {
     const { senderMgr, receiverMgr, receiverCert } = makeE2EEPair();
     const mid = crypto.randomUUID();
     const ts = Date.now();
-    const [envelope] = senderMgr.encryptOutbound('receiver.test', { text: 'hi' }, receiverCert, null, mid, ts);
+    const [envelope] = senderMgr.encryptOutbound('receiver.test', { type: 'text', text: 'hi' }, receiverCert, null, mid, ts);
     // 篡改 nonce（不影响签名验证，但解密会失败）
     const tampered = { ...envelope, nonce: Buffer.from(crypto.randomBytes(12)).toString('base64') };
     const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };

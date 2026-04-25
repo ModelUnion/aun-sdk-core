@@ -161,12 +161,12 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
     await ks.saveE2EEPrekey(aid, 'pk1', {
       private_key_pem: 'KEEP_ME',
       created_at: 1,
-    });
+    }, deviceId);
 
     (client as any)._aid = aid;
     await (client as any)._syncIdentityAfterConnect('tok-connect');
 
-    const prekeys = await ks.loadE2EEPrekeys(aid);
+    const prekeys = await ks.loadE2EEPrekeys(aid, deviceId);
     const instanceState = await ks.loadInstanceState(aid, deviceId, slotId);
     expect(instanceState.access_token).toBe('tok-connect');
     expect(prekeys.pk1.private_key_pem).toBe('KEEP_ME');
@@ -231,7 +231,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await expect(client.call('message.send', {
       to: 'group.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
     })).rejects.toThrow(ValidationError);
   });
@@ -242,7 +242,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await expect(client.call('message.send', {
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
       persist: true,
     })).rejects.toThrow("message.send no longer accepts 'persist'");
@@ -254,7 +254,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await expect(client.call('message.send', {
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
       delivery_mode: { mode: 'queue' },
     })).rejects.toThrow('message.send does not accept delivery_mode');
@@ -272,7 +272,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await client.call('message.send', {
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
     });
 
@@ -332,7 +332,7 @@ describe('AUNClient message.send 接收者校验', () => {
     };
     const decryptedBusiness = {
       ...rawMessage,
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     };
 
     (client as any)._ensureSenderCertCached = vi.fn().mockResolvedValue(true);
@@ -399,7 +399,7 @@ describe('AUNClient prekey 证书指纹编排', () => {
 
     const result = await (client as any)._sendEncrypted({
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     expect(result).toEqual({ ok: true });
@@ -428,7 +428,7 @@ describe('AUNClient prekey 证书指纹编排', () => {
 
     const result = await (client as any)._sendEncrypted({
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     expect(result).toEqual({ ok: true });
@@ -450,7 +450,7 @@ describe('AUNClient prekey 证书指纹编排', () => {
 
     const result = await (client as any)._sendEncrypted({
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     expect(result).toEqual({ ok: true });
@@ -458,7 +458,7 @@ describe('AUNClient prekey 证书指纹编排', () => {
     expect((client as any)._fetchPeerCert).toHaveBeenCalledWith('bob.example.com', undefined);
     expect((client as any)._e2ee.encryptOutbound).toHaveBeenCalledWith(
       'bob.example.com',
-      { text: 'hello' },
+      { type: 'text', text: 'hello' },
       expect.objectContaining({ prekey: null }),
     );
   });
@@ -567,6 +567,44 @@ describe('AUNClient M25 重连行为', () => {
     }
   });
 
+  // ── R1: health-fail 路径也应受 max_attempts 约束 ──────────
+  it('health 持续失败时应在 max_attempts 次后进入 terminal_failed', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+      (client as any)._sessionParams = { access_token: 'tok-1', gateway: 'ws://gateway.example.com/aun' };
+      (client as any)._gatewayUrl = 'ws://gateway.example.com/aun';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.01, max_delay: 0.01, max_attempts: 3 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      // health check 始终失败
+      (client as any)._discovery = { checkHealth: vi.fn().mockResolvedValue(false) };
+      (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+      (client as any)._connectOnce = vi.fn().mockRejectedValue(new Error('should not reach'));
+      (client as any)._reconnectAbort = new AbortController();
+      (client as any)._reconnectActive = true;
+
+      const reconnectLoop = (client as any)._reconnectLoop();
+      await vi.advanceTimersByTimeAsync(500);
+      await reconnectLoop;
+
+      expect(client.state).toBe('terminal_failed');
+      expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
+        state: 'terminal_failed',
+        reason: 'max_attempts_exhausted',
+      }));
+      // _connectOnce 不应被调用（health 一直失败）
+      expect((client as any)._connectOnce).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('心跳连续 2 次失败才触发断线处理', async () => {
     vi.useFakeTimers();
     try {
@@ -643,7 +681,7 @@ describe('group.pull 拦截器：onPullResult 应消费原始消息', () => {
     // 原始服务端消息（含 e2ee 密文）
     const rawMsg = { seq: 5, group_id: 'g1', payload: { type: 'e2ee.group_v1', ciphertext: 'CIPHER' } };
     // 解密后消息（payload 已替换）
-    const decryptedMsg = { seq: 5, group_id: 'g1', payload: { text: 'hello' } };
+    const decryptedMsg = { seq: 5, group_id: 'g1', payload: { type: 'text', text: 'hello' } };
 
     // mock transport.call 返回原始消息
     (client as any)._transport.call = vi.fn().mockResolvedValue({
@@ -679,7 +717,7 @@ describe('_fillGroupGap 不应重复调用 onPullResult', () => {
     (client as any)._groupE2ee.hasSecret = vi.fn().mockResolvedValue(true);
 
     const rawMsg = { seq: 3, group_id: 'g2', payload: { type: 'e2ee.group_v1', ciphertext: 'C' } };
-    const decryptedMsg = { seq: 3, group_id: 'g2', payload: { text: 'hi' } };
+    const decryptedMsg = { seq: 3, group_id: 'g2', payload: { type: 'text', text: 'hi' } };
 
     // mock transport.call（被 call() 拦截器调用）
     (client as any)._transport.call = vi.fn().mockResolvedValue({
@@ -871,5 +909,94 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     await (client as any)._handleTransportDisconnect(new Error('test'), 1006);
     expect(client.state).toBe('terminal_failed');
     expect(safeAsyncSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ── R3: 解密失败不应 publish 密文给应用层 ──────────────────
+
+describe('R3: 解密失败不应将密文 publish 给应用层', () => {
+  function makeDecryptFailClient() {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'device-001';
+    (client as any)._identity = { aid: 'test.aid.com' };
+
+    // _decryptGroupMessage 返回原始消息（无 e2ee 字段）= 解密失败
+    vi.spyOn(client as any, '_decryptGroupMessage').mockImplementation(async (msg: any) => msg);
+    vi.spyOn(client as any, '_ensureSenderCertCached').mockResolvedValue(true);
+    (client as any)._seqTracker = {
+      onMessageSeq: () => false,
+      getContiguousSeq: () => 0,
+      exportState: () => ({}),
+    };
+
+    return client;
+  }
+
+  it('推送路径：解密失败时不应 publish group.message_created', async () => {
+    const client = makeDecryptFailClient();
+    const events: string[] = [];
+    (client as any)._dispatcher.subscribe('group.message_created', () => { events.push('created'); });
+    (client as any)._dispatcher.subscribe('group.message_undecryptable', () => { events.push('undecryptable'); });
+
+    const msg = {
+      group_id: 'g1',
+      from: 'sender.aid.com',
+      seq: 1,
+      payload: { type: 'e2ee.group_encrypted', epoch: 1, ciphertext: 'AAAA' },
+    };
+    await (client as any)._processAndPublishGroupMessage(msg);
+
+    expect(events).not.toContain('created');
+    expect(events).toContain('undecryptable');
+  });
+
+  it('批量路径：解密失败的消息不应出现在返回结果中', async () => {
+    const client = makeDecryptFailClient();
+
+    const msgs = [
+      { group_id: 'g1', from: 'a', seq: 1, payload: { type: 'e2ee.group_encrypted', epoch: 1, ciphertext: 'X' } },
+      { group_id: 'g1', from: 'b', seq: 2, payload: { type: 'text', text: 'hello' } },
+    ];
+    const result = await (client as any)._decryptGroupMessages(msgs);
+
+    expect(result.length).toBe(1);
+    expect(result[0].payload.type).toBe('text');
+  });
+});
+
+// ── R4: _retryPendingDecryptMsgs 应被激活 ──────────────────
+
+describe('R4: 收到密钥后应触发 pending 消息重试', () => {
+  it('handleIncoming 返回 distribution 后应调用 _retryPendingDecryptMsgs', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._identity = { aid: 'test.aid.com' };
+
+    (client as any)._pendingDecryptMsgs.set('group:g1', [{ fake: true }]);
+
+    (client as any)._groupE2ee = {
+      handleIncoming: vi.fn().mockReturnValue('distribution'),
+      decrypt: vi.fn(),
+      loadSecret: vi.fn(),
+      getMemberAids: vi.fn().mockReturnValue([]),
+    };
+
+    const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
+
+    const msg = {
+      from: 'peer.aid.com',
+      payload: {
+        type: 'e2ee.group_key_distribution',
+        group_id: 'g1',
+        epoch: 2,
+      },
+    };
+
+    await (client as any)._tryHandleGroupKeyMessage(msg);
+
+    expect(retrySpy).toHaveBeenCalledWith('g1');
   });
 });

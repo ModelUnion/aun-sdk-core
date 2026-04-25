@@ -367,7 +367,7 @@ func TestFileKeyStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
 	aid := "identity-preserve.example"
 
 	// 通过 StructuredKeyStore 接口写入 prekey
-	if err := ks.SaveE2EEPrekey(aid, "pk1", map[string]any{
+	if err := ks.SaveE2EEPrekey(aid, "pk1", "", map[string]any{
 		"private_key_pem": "KEEP_ME",
 		"created_at":      time.Now().UnixMilli(),
 	}); err != nil {
@@ -393,7 +393,7 @@ func TestFileKeyStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
 	}
 
 	// 验证 prekey 未被覆盖
-	prekeys, err := ks.LoadE2EEPrekeys(aid)
+	prekeys, err := ks.LoadE2EEPrekeys(aid, "")
 	if err != nil {
 		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
@@ -496,14 +496,14 @@ func TestPrekeyPersistence(t *testing.T) {
 	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "test-agent.example"
 
-	if err := ks.SaveE2EEPrekey(aid, "pk-001", map[string]any{
+	if err := ks.SaveE2EEPrekey(aid, "pk-001", "", map[string]any{
 		"private_key_pem": "-----BEGIN PRIVATE KEY-----\nprekey-data\n-----END PRIVATE KEY-----",
 		"created_at":      int64(1700000000000),
 	}); err != nil {
 		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
 	}
 
-	prekeys, err := ks.LoadE2EEPrekeys(aid)
+	prekeys, err := ks.LoadE2EEPrekeys(aid, "")
 	if err != nil {
 		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
@@ -550,17 +550,17 @@ func TestStructuredPrekeysPrimaryAndRecoverUnexpiredMeta(t *testing.T) {
 	nowMs := time.Now().UnixMilli()
 
 	// 直接写入两个 prekey
-	_ = ks.SaveE2EEPrekey(aid, "pk-recover", map[string]any{
+	_ = ks.SaveE2EEPrekey(aid, "pk-recover", "", map[string]any{
 		"private_key_pem": "META_RECOVER",
 		"created_at":      nowMs,
 		"expires_at":      nowMs + int64(time.Minute/time.Millisecond),
 	})
-	_ = ks.SaveE2EEPrekey(aid, "pk-sql", map[string]any{
+	_ = ks.SaveE2EEPrekey(aid, "pk-sql", "", map[string]any{
 		"private_key_pem": "SQLITE_SQL",
 		"created_at":      nowMs,
 	})
 
-	prekeys, err := ks.LoadE2EEPrekeys(aid)
+	prekeys, err := ks.LoadE2EEPrekeys(aid, "")
 	if err != nil {
 		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
@@ -578,7 +578,7 @@ func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
 	nowMs := time.Now().UnixMilli()
 
 	// 先写入一个 prekey
-	if err := ks.SaveE2EEPrekey(aid, "pk-meta", map[string]any{
+	if err := ks.SaveE2EEPrekey(aid, "pk-meta", "", map[string]any{
 		"private_key_pem": "META_ONLY",
 		"created_at":      nowMs,
 	}); err != nil {
@@ -586,14 +586,14 @@ func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
 	}
 
 	// 再写入另一个 prekey，不应覆盖第一个
-	if err := ks.SaveE2EEPrekey(aid, "pk-new", map[string]any{
+	if err := ks.SaveE2EEPrekey(aid, "pk-new", "", map[string]any{
 		"private_key_pem": "NEW_ONE",
 		"created_at":      nowMs,
 	}); err != nil {
 		t.Fatalf("SaveE2EEPrekey(pk-new) 失败: %v", err)
 	}
 
-	prekeys, err := ks.LoadE2EEPrekeys(aid)
+	prekeys, err := ks.LoadE2EEPrekeys(aid, "")
 	if err != nil {
 		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
@@ -650,28 +650,28 @@ func TestDeviceScopedPrekeysAllowSamePrekeyAcrossDevices(t *testing.T) {
 	aid := "device-prekeys.example"
 	cutoffMs := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
 
-	if err := ks.SaveE2EEPrekeyForDevice(aid, "phone", "pk-same", map[string]any{
+	if err := ks.SaveE2EEPrekey(aid, "pk-same", "phone", map[string]any{
 		"private_key_pem": "PHONE",
 		"created_at":      cutoffMs - 1000,
 	}); err != nil {
-		t.Fatalf("SaveE2EEPrekeyForDevice(phone) 失败: %v", err)
+		t.Fatalf("SaveE2EEPrekey(phone) 失败: %v", err)
 	}
-	if err := ks.SaveE2EEPrekeyForDevice(aid, "laptop", "pk-same", map[string]any{
+	if err := ks.SaveE2EEPrekey(aid, "pk-same", "laptop", map[string]any{
 		"private_key_pem": "LAPTOP",
 		"created_at":      cutoffMs - 1000,
 	}); err != nil {
-		t.Fatalf("SaveE2EEPrekeyForDevice(laptop) 失败: %v", err)
+		t.Fatalf("SaveE2EEPrekey(laptop) 失败: %v", err)
 	}
 
-	phone, err := ks.LoadE2EEPrekeysForDevice(aid, "phone")
+	phone, err := ks.LoadE2EEPrekeys(aid, "phone")
 	if err != nil {
-		t.Fatalf("LoadE2EEPrekeysForDevice(phone) 失败: %v", err)
+		t.Fatalf("LoadE2EEPrekeys(phone) 失败: %v", err)
 	}
-	laptop, err := ks.LoadE2EEPrekeysForDevice(aid, "laptop")
+	laptop, err := ks.LoadE2EEPrekeys(aid, "laptop")
 	if err != nil {
-		t.Fatalf("LoadE2EEPrekeysForDevice(laptop) 失败: %v", err)
+		t.Fatalf("LoadE2EEPrekeys(laptop) 失败: %v", err)
 	}
-	legacy, err := ks.LoadE2EEPrekeys(aid)
+	legacy, err := ks.LoadE2EEPrekeys(aid, "")
 	if err != nil {
 		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
@@ -685,16 +685,16 @@ func TestDeviceScopedPrekeysAllowSamePrekeyAcrossDevices(t *testing.T) {
 		t.Fatalf("默认 device prekeys 应为空: %v", legacy)
 	}
 
-	removed, err := ks.CleanupE2EEPrekeysForDevice(aid, "phone", cutoffMs, 0)
+	removed, err := ks.CleanupE2EEPrekeys(aid, "phone", cutoffMs, 0)
 	if err != nil {
-		t.Fatalf("CleanupE2EEPrekeysForDevice(phone) 失败: %v", err)
+		t.Fatalf("CleanupE2EEPrekeys(phone) 失败: %v", err)
 	}
 	if len(removed) != 1 || removed[0] != "pk-same" {
 		t.Fatalf("cleanup 结果不正确: %v", removed)
 	}
 
-	phone, _ = ks.LoadE2EEPrekeysForDevice(aid, "phone")
-	laptop, _ = ks.LoadE2EEPrekeysForDevice(aid, "laptop")
+	phone, _ = ks.LoadE2EEPrekeys(aid, "phone")
+	laptop, _ = ks.LoadE2EEPrekeys(aid, "laptop")
 	if len(phone) != 0 {
 		t.Fatalf("phone prekeys 应被清空: %v", phone)
 	}

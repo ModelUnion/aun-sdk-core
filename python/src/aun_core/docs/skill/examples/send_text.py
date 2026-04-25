@@ -27,16 +27,15 @@ async def main():
     # ── 发送文本消息 ──
     result = await sender.call("message.send", {
         "to": receiver_aid,
-        "type": "text",
-        "payload": {"text": "你好！"},
+        "payload": {"type": "text", "text": "你好！"},
     })
     print(f"发送结果: status={result['status']}, seq={result['seq']}")
 
     # ── 发送 JSON 消息 ──
     result = await sender.call("message.send", {
         "to": receiver_aid,
-        "type": "json",
         "payload": {
+            "type": "json",
             "kind": "greeting",
             "text": "这是一条结构化消息",
             "priority": "high",

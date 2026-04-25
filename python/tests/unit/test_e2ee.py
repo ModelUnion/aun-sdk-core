@@ -293,7 +293,7 @@ class TestPrekeyEncrypt:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
-            "receiver.test", {"text": "hello"}, prekey, receiver_cert,
+            "receiver.test", {"type": "text", "text": "hello"}, prekey, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         assert ok
@@ -317,7 +317,7 @@ class TestPrekeyEncrypt:
             "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
         })
 
-        payload = {"text": "prekey roundtrip"}
+        payload = {"type": "text", "text": "prekey roundtrip"}
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
 
@@ -344,7 +344,7 @@ class TestPrekeyEncrypt:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
-            "receiver.test", {"text": "self echo"}, prekey, receiver_cert,
+            "receiver.test", {"type": "text", "text": "self echo"}, prekey, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         assert ok
@@ -373,7 +373,7 @@ class TestLongTermKey:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_long_term_key(
-            "receiver.test", {"text": "hello"}, receiver_cert,
+            "receiver.test", {"type": "text", "text": "hello"}, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         assert ok
@@ -388,7 +388,7 @@ class TestLongTermKey:
     def test_long_term_key_roundtrip(self):
         sender_mgr, receiver_mgr, _, _, _, receiver_cert, _, _ = _make_e2ee_pair()
 
-        payload = {"text": "mode3 roundtrip"}
+        payload = {"type": "text", "text": "mode3 roundtrip"}
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
 
@@ -422,7 +422,7 @@ class TestEncryptOutboundDegradation:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr.encrypt_outbound(
-            "receiver.test", {"text": "test"},
+            "receiver.test", {"type": "text", "text": "test"},
             peer_cert_pem=receiver_cert,
             prekey=prekey,
             message_id=mid, timestamp=ts,
@@ -437,7 +437,7 @@ class TestEncryptOutboundDegradation:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr.encrypt_outbound(
-            "receiver.test", {"text": "test"},
+            "receiver.test", {"type": "text", "text": "test"},
             peer_cert_pem=receiver_cert,
             prekey=None,
             message_id=mid, timestamp=ts,
@@ -471,7 +471,7 @@ class TestReplayGuard:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, _ = sender_mgr._encrypt_with_prekey(
-            "receiver.test", {"text": "test"}, prekey, receiver_cert,
+            "receiver.test", {"type": "text", "text": "test"}, prekey, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         message = {
@@ -538,7 +538,7 @@ class TestPrekeyGenerate:
         with pytest.raises(E2EEError, match="prekey cert fingerprint mismatch"):
             sender_mgr._encrypt_with_prekey(
                 peer_aid="receiver.test",
-                payload={"text": "hello"},
+                payload={"type": "text", "text": "hello"},
                 prekey=prekey,
                 peer_cert_pem=receiver_cert,
                 message_id=str(uuid.uuid4()),
@@ -585,7 +585,7 @@ class TestPrekeyGenerate:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
-            "receiver.test", {"text": "test"}, prekey, receiver_cert,
+            "receiver.test", {"type": "text", "text": "test"}, prekey, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         assert ok  # 无 created_at 时兼容旧格式
@@ -604,7 +604,7 @@ class TestPrekeyGenerate:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
-            "receiver.test", {"text": "test"}, prekey, receiver_cert,
+            "receiver.test", {"type": "text", "text": "test"}, prekey, receiver_cert,
             message_id=mid, timestamp=ts,
         )
 
@@ -642,7 +642,7 @@ class TestDecryptMessage:
     def test_plaintext_passthrough(self):
         """明文消息直接透传"""
         _, receiver_mgr, _, _, _, _, _, _ = _make_e2ee_pair()
-        message = {"seq": 1, "payload": {"text": "hello"}}
+        message = {"seq": 1, "payload": {"type": "text", "text": "hello"}}
         result = receiver_mgr.decrypt_message(message)
         assert result is not None
         assert result["payload"]["text"] == "hello"
@@ -651,7 +651,7 @@ class TestDecryptMessage:
         """加密消息被自动解密"""
         sender_mgr, receiver_mgr, _, _, _, receiver_cert, _, _ = _make_e2ee_pair()
 
-        payload = {"text": "secret"}
+        payload = {"type": "text", "text": "secret"}
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, _ = sender_mgr._encrypt_with_long_term_key(
@@ -727,7 +727,7 @@ class TestPrekeyV2:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
-            "receiver.test", {"text": "v2 test"}, prekey, receiver_cert,
+            "receiver.test", {"type": "text", "text": "v2 test"}, prekey, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         assert ok
@@ -748,7 +748,7 @@ class TestPrekeyV2:
             "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
         })
 
-        payload = {"text": "双 ECDH 往返"}
+        payload = {"type": "text", "text": "双 ECDH 往返"}
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
@@ -797,7 +797,7 @@ class TestPrekeyV2:
                       info=f"aun-prekey:{prekey['prekey_id']}".encode("utf-8"))
         message_key = hkdf.derive(shared_secret)
 
-        payload = {"text": "v1 legacy"}
+        payload = {"type": "text", "text": "v1 legacy"}
         plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         nonce = _secrets.token_bytes(12)
         aesgcm = _AESGCM(message_key)
@@ -864,7 +864,7 @@ class TestPrekeyV2:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
-            "receiver.test", {"text": "should fail"}, prekey, receiver_cert,
+            "receiver.test", {"type": "text", "text": "should fail"}, prekey, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         assert ok
@@ -900,7 +900,7 @@ class TestAADMissingRejectsDecrypt:
             "private_key_pem": priv_pem, "created_at": int(time.time() * 1000),
         })
 
-        payload = {"text": "aad test"}
+        payload = {"type": "text", "text": "aad test"}
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_prekey(
@@ -918,7 +918,7 @@ class TestAADMissingRejectsDecrypt:
         """构造合法的 long_term_key 加密消息，返回 (message, receiver_mgr)。"""
         sender_mgr, receiver_mgr, _, _, _, receiver_cert, _, _ = _make_e2ee_pair()
 
-        payload = {"text": "aad test lt"}
+        payload = {"type": "text", "text": "aad test lt"}
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, ok = sender_mgr._encrypt_with_long_term_key(

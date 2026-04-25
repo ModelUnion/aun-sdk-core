@@ -354,7 +354,7 @@ window.stepSendP2P = async function() {
   await runStep('btn-sendP2P', '发送加密消息给 ' + bobAidVal, async () => {
     const result = await alice.call('message.send', {
       to: bobAidVal,
-      payload: { text: text },
+      payload: { type: 'text', text: text },
       encrypt: true,
     });
     return result;
@@ -369,7 +369,7 @@ window.stepSendP2PPlaintext = async function() {
   await runStep('btn-sendP2PPt', '发送明文消息给 ' + bobAidVal, async () => {
     const result = await alice.call('message.send', {
       to: bobAidVal,
-      payload: { text: text },
+      payload: { type: 'text', text: text },
       encrypt: false,
     });
     return result;
@@ -430,7 +430,7 @@ window.stepSendGroup = async function() {
   await runStep('btn-sendGroup', '发送群加密消息', async () => {
     return await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '群加密消息 ' + ts },
+      payload: { type: 'text', text: '群加密消息 ' + ts },
       encrypt: true,
     });
   });
@@ -442,7 +442,7 @@ window.stepSendGroupPlaintext = async function() {
   await runStep('btn-sendGroupPt', '发送群明文消息', async () => {
     return await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '明文群消息' },
+      payload: { type: 'text', text: '明文群消息' },
       encrypt: false,
     });
   });
@@ -551,7 +551,7 @@ window.runP2PTest = async function() {
     const t4 = Date.now();
     const sendResult = await a.call('message.send', {
       to: bAid,
-      payload: { text: 'P2P自动测试' },
+      payload: { type: 'text', text: 'P2P自动测试' },
       encrypt: true,
     });
     log('dim', '  发送耗时: ' + (Date.now() - t4) + 'ms, message_id=' + (sendResult.message_id || ''));
@@ -652,7 +652,7 @@ window.runGroupTest = async function() {
     const t4 = Date.now();
     await a.call('group.send', {
       group_id: gid,
-      payload: { text: 'Group自动测试' },
+      payload: { type: 'text', text: 'Group自动测试' },
       encrypt: true,
     });
     log('dim', '  发送耗时: ' + (Date.now() - t4) + 'ms');
@@ -684,7 +684,7 @@ window.runGroupTest = async function() {
     const t6 = Date.now();
     const ptResult = await a.call('group.send', {
       group_id: gid,
-      payload: { text: '明文' },
+      payload: { type: 'text', text: '明文' },
       encrypt: false,
     });
     log('dim', '  明文发送耗时: ' + (Date.now() - t6) + 'ms');

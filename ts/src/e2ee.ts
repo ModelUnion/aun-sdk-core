@@ -87,11 +87,8 @@ function loadKeyStorePrekeys(
   deviceId = '',
 ): LocalPrekeyStore {
   const normalizedDeviceId = String(deviceId ?? '').trim();
-  if (normalizedDeviceId && typeof keystore.loadE2EEPrekeysForDevice === 'function') {
-    return (keystore.loadE2EEPrekeysForDevice(aid, normalizedDeviceId) ?? {}) as LocalPrekeyStore;
-  }
   if (typeof keystore.loadE2EEPrekeys === 'function') {
-    return (keystore.loadE2EEPrekeys(aid) ?? {}) as LocalPrekeyStore;
+    return (keystore.loadE2EEPrekeys(aid, normalizedDeviceId) ?? {}) as LocalPrekeyStore;
   }
   throw new Error('keystore 缺少 loadE2EEPrekeys 方法');
 }
@@ -104,12 +101,8 @@ function saveKeyStorePrekey(
   prekeyData: LocalPrekeyRecord,
 ): void {
   const normalizedDeviceId = String(deviceId ?? '').trim();
-  if (normalizedDeviceId && typeof keystore.saveE2EEPrekeyForDevice === 'function') {
-    keystore.saveE2EEPrekeyForDevice(aid, normalizedDeviceId, prekeyId, prekeyData);
-    return;
-  }
   if (typeof keystore.saveE2EEPrekey === 'function') {
-    keystore.saveE2EEPrekey(aid, prekeyId, prekeyData);
+    keystore.saveE2EEPrekey(aid, prekeyId, prekeyData, normalizedDeviceId);
     return;
   }
   throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing saveE2EEPrekey method`);
@@ -123,13 +116,9 @@ function cleanupKeyStorePrekeys(
   keepLatest = PREKEY_MIN_KEEP_COUNT,
 ): string[] {
   const normalizedDeviceId = String(deviceId ?? '').trim();
-  if (normalizedDeviceId && typeof keystore.cleanupE2EEPrekeysForDevice === 'function') {
-    return keystore.cleanupE2EEPrekeysForDevice(aid, normalizedDeviceId, cutoffMs, keepLatest) ?? [];
-  }
   if (typeof keystore.cleanupE2EEPrekeys === 'function') {
-    return keystore.cleanupE2EEPrekeys(aid, cutoffMs, keepLatest) ?? [];
+    return keystore.cleanupE2EEPrekeys(aid, cutoffMs, keepLatest, normalizedDeviceId) ?? [];
   }
-
   throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing cleanupE2EEPrekeys method`);
 }
 

@@ -117,7 +117,7 @@ class TestGroupSendEncrypt:
 
         asyncio.run(client.call("group.send", {
             "group_id": _GRP,
-            "payload": {"text": "加密消息"},
+            "payload": {"type": "text", "text": "加密消息"},
             "encrypt": True,
         }))
 
@@ -139,7 +139,7 @@ class TestGroupSendEncrypt:
         with pytest.raises(E2EEGroupSecretMissingError):
             asyncio.run(client.call("group.send", {
                 "group_id": _GRP,
-                "payload": {"text": "test"},
+                "payload": {"type": "text", "text": "test"},
                 "encrypt": True,
             }))
 
@@ -153,7 +153,7 @@ class TestGroupMessageAutoDecrypt:
         ts = 1710504000000
         envelope = encrypt_group_message(
             group_id=_GRP, epoch=1, group_secret=gs,
-            payload={"text": "秘密"}, from_aid=from_aid,
+            payload={"type": "text", "text": "秘密"}, from_aid=from_aid,
             message_id=msg_id, timestamp=ts,
             sender_private_key_pem=pk_pem,
         )
@@ -174,7 +174,7 @@ class TestGroupMessageAutoDecrypt:
 
         msg = self._make_encrypted_group_msg(gs)
         result = asyncio.run(client._decrypt_group_message(msg))
-        assert result["payload"] == {"text": "秘密"}
+        assert result["payload"] == {"type": "text", "text": "秘密"}
         assert result["e2ee"]["encryption_mode"] == "epoch_group_key"
 
     def test_auto_decrypted_on_pull(self, tmp_path):
@@ -195,7 +195,7 @@ class TestGroupMessageAutoDecrypt:
             "from": _AID_ALICE,
             "message_id": "gm-123",
             "timestamp": 1710504000000,
-            "payload": {"text": "明文消息"},
+            "payload": {"type": "text", "text": "明文消息"},
         }
         result = asyncio.run(client._decrypt_group_message(msg))
         assert result["payload"]["text"] == "明文消息"
@@ -375,7 +375,7 @@ def _make_encrypted_group_msg(gs, group_id=_GRP, from_aid=_AID_ALICE):
     ts = 1710504000000
     envelope = encrypt_group_message(
         group_id=group_id, epoch=1, group_secret=gs,
-        payload={"text": "test"}, from_aid=from_aid,
+        payload={"type": "text", "text": "test"}, from_aid=from_aid,
         message_id=msg_id, timestamp=ts,
         sender_private_key_pem=pk_pem,
     )
@@ -1073,7 +1073,7 @@ class TestGroupMessagePushPipeline:
         ts = 1710504000000
         envelope = encrypt_group_message(
             group_id=_GRP, epoch=1, group_secret=gs,
-            payload={"text": "推送消息"}, from_aid=from_aid,
+            payload={"type": "text", "text": "推送消息"}, from_aid=from_aid,
             message_id=msg_id, timestamp=ts,
             sender_private_key_pem=pk_pem,
         )
@@ -1105,7 +1105,7 @@ class TestGroupMessagePushPipeline:
         asyncio.run(run())
 
         assert len(published) == 1
-        assert published[0]["payload"] == {"text": "推送消息"}
+        assert published[0]["payload"] == {"type": "text", "text": "推送消息"}
         assert published[0]["e2ee"]["encryption_mode"] == "epoch_group_key"
         # 游标更新
         ns = f"group:{_GRP}"

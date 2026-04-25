@@ -46,7 +46,7 @@ describe('ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检', () => {
     // 调用 _sendGroupEncrypted
     await (client as any)._sendGroupEncrypted({
       group_id: 'g1',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     // 应该先调用 group.e2ee.get_epoch 进行预检
@@ -67,7 +67,7 @@ describe('ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检', () => {
     await expect(
       (client as any)._sendGroupEncrypted({
         group_id: 'g1',
-        payload: { text: 'hello' },
+        payload: { type: 'text', text: 'hello' },
       })
     ).resolves.toBeDefined();
   });
@@ -91,7 +91,7 @@ describe('ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检', () => {
 
     const result = await (client as any)._sendGroupEncrypted({
       group_id: 'g1',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     expect(result).toBeDefined();

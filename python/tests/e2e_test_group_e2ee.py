@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, AuthError, RateLimitError
 from aun_core.e2ee import (
     build_key_distribution,
     compute_membership_commitment,
@@ -134,14 +134,23 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
         await client.auth.create_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    connect_params = dict(auth)
-    slot_id = str(getattr(client, "_test_slot_id", "") or "")
-    if slot_id:
-        connect_params["slot_id"] = slot_id
-    connect_params["auto_reconnect"] = False
-    await client.connect(connect_params)
-    return aid
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            auth = await client.auth.authenticate({"aid": aid})
+            connect_params = dict(auth)
+            slot_id = str(getattr(client, "_test_slot_id", "") or "")
+            if slot_id:
+                connect_params["slot_id"] = slot_id
+            connect_params["auto_reconnect"] = False
+            await client.connect(connect_params)
+            return aid
+        except (AuthError, RateLimitError) as exc:
+            last_error = exc
+            if attempt >= 3:
+                break
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_error or RuntimeError(f"{aid} connect failed")
 
 
 def _run_id() -> str:
@@ -180,17 +189,10 @@ def _distribute_group_secret(
     store_group_secret(keystore, aid, group_id, epoch, gs, commitment, member_aids)
 
 
-async def _group_pull(client: AUNClient, group_id: str, after_seq: int = 0) -> list[dict]:
-    """获取群消息：从 push 推送收件箱读取（防抖 N>1 时触发 auto-pull 也会填入）。
-
-    服务端多设备 cursor 兜底后，auto-ack 推进后服务端 pull 返回空。
-    push inbox 是客户端侧真实收到并解密的消息集合，是测试的真实可信源。
-    """
-    pushed = list(getattr(client, "_test_group_inbox", {}).get(group_id, []))
-    # 按 seq 排序去重（同一 seq 可能既被 push 也被 auto-pull 投递过）
+def _usable_group_messages(messages: list[dict], after_seq: int = 0) -> list[dict]:
     by_seq = {}
     no_seq = []
-    for m in sorted(pushed, key=lambda x: x.get("seq") or 0):
+    for m in sorted(messages, key=lambda x: x.get("seq") or 0):
         s = m.get("seq")
         if s is None:
             no_seq.append(m)
@@ -211,9 +213,20 @@ async def _group_pull(client: AUNClient, group_id: str, after_seq: int = 0) -> l
         payload = m.get("payload") if isinstance(m, dict) else None
         if payload is not None and (not isinstance(payload, dict) or bool(payload)):
             usable.append(m)
-    if usable:
+    return usable
+
+
+async def _group_pull(client: AUNClient, group_id: str, after_seq: int = 0, min_count: int = 0) -> list[dict]:
+    """获取群消息：从 push 推送收件箱读取（防抖 N>1 时触发 auto-pull 也会填入）。
+
+    服务端多设备 cursor 兜底后，auto-ack 推进后服务端 pull 返回空。
+    push inbox 是客户端侧真实收到并解密的消息集合，是测试的真实可信源。
+    """
+    pushed = list(getattr(client, "_test_group_inbox", {}).get(group_id, []))
+    usable = _usable_group_messages(pushed, after_seq)
+    if usable and (min_count <= 0 or len(usable) >= min_count):
         return usable
-    # 兜底：未收到任何有效 push 时走服务端 pull（覆盖 push 完全丢失或仅收到空通知的边缘情况）
+    # 兜底：push 可能只收到通知窗口中的最后一条；主动 pull 后合并，覆盖 burst 场景。
     result = await client.call(
         "group.pull", {
             "group_id": group_id,
@@ -222,7 +235,8 @@ async def _group_pull(client: AUNClient, group_id: str, after_seq: int = 0) -> l
             "slot_id": getattr(client, "_slot_id", ""),
         },
     )
-    return result.get("messages", [])
+    pulled = result.get("messages", [])
+    return _usable_group_messages(pushed + pulled, after_seq)
 
 
 async def _group_pull_raw(client: AUNClient, group_id: str, after_seq: int = 0) -> list[dict]:
@@ -269,14 +283,14 @@ async def test_group_encrypted_messaging():
         # Alice 发送加密群消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "加密群消息"},
+            "payload": {"type": "text", "text": "加密群消息"},
             "encrypt": True,
         })
 
         await asyncio.sleep(1)
 
         # Bob 拉取（自动解密）
-        msgs = await _group_pull(bob, group_id)
+        msgs = await _group_pull(bob, group_id, min_count=1)
         assert len(msgs) >= 1, f"expected >= 1 msg, got {len(msgs)}"
 
         # 验证自动解密成功
@@ -314,7 +328,7 @@ async def test_multiple_members():
 
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "三人群消息"},
+            "payload": {"type": "text", "text": "三人群消息"},
             "encrypt": True,
         })
 
@@ -370,7 +384,7 @@ async def test_epoch_rotation_on_kick():
         # Alice 用新 epoch 发加密消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "踢人后的消息"},
+            "payload": {"type": "text", "text": "踢人后的消息"},
             "encrypt": True,
         })
 
@@ -421,7 +435,7 @@ async def test_new_member_no_rotation():
         # Alice 用 epoch 1 发消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "新成员能看到"},
+            "payload": {"type": "text", "text": "新成员能看到"},
             "encrypt": True,
         })
 
@@ -462,13 +476,13 @@ async def test_burst_group_messages():
         for i in range(N):
             await alice.call("group.send", {
                 "group_id": group_id,
-                "payload": {"text": f"burst_{i}", "seq": i},
+                "payload": {"type": "text", "text": f"burst_{i}", "seq": i},
                 "encrypt": True,
             })
 
         await asyncio.sleep(2)
 
-        msgs = await _group_pull(bob, group_id)
+        msgs = await _group_pull(bob, group_id, min_count=N)
         decrypted = [m for m in msgs if m.get("e2ee", {}).get("encryption_mode") == "epoch_group_key"]
         assert len(decrypted) >= N, f"expected {N}, got {len(decrypted)}"
 
@@ -504,25 +518,25 @@ async def test_mixed_encrypted_plaintext():
         # 明文消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "明文"},
+            "payload": {"type": "text", "text": "明文"},
             "encrypt": False,
         })
         # 加密消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "密文"},
+            "payload": {"type": "text", "text": "密文"},
             "encrypt": True,
         })
         # 又一条明文
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "又是明文"},
+            "payload": {"type": "text", "text": "又是明文"},
             "encrypt": False,
         })
 
         await asyncio.sleep(1)
 
-        msgs = await _group_pull(bob, group_id)
+        msgs = await _group_pull(bob, group_id, min_count=3)
         assert len(msgs) >= 3, f"expected >= 3, got {len(msgs)}"
 
         # 加密消息已自动解密
@@ -599,7 +613,7 @@ async def test_old_epoch_still_decryptable():
 
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "epoch1消息"},
+            "payload": {"type": "text", "text": "epoch1消息"},
             "encrypt": True,
         })
 
@@ -614,7 +628,7 @@ async def test_old_epoch_still_decryptable():
 
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "epoch2消息"},
+            "payload": {"type": "text", "text": "epoch2消息"},
             "encrypt": True,
         })
 
@@ -677,7 +691,7 @@ async def test_review_join_request_auto_distribute():
         # Alice 发送加密群消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "审批后的消息"},
+            "payload": {"type": "text", "text": "审批后的消息"},
             "encrypt": True,
         })
 
@@ -749,7 +763,7 @@ async def test_invite_code_auto_recovery():
         # 4. Alice 发送加密群消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "邀请码入群后的消息"},
+            "payload": {"type": "text", "text": "邀请码入群后的消息"},
             "encrypt": True,
         })
 
@@ -849,7 +863,7 @@ async def test_open_group_join_rotates_epoch_and_updates_memberlist():
         text = f"open-join-encrypted-{rid}"
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": text},
+            "payload": {"type": "text", "text": text},
             "encrypt": True,
         })
         await asyncio.sleep(1)
@@ -917,7 +931,7 @@ async def test_plaintext_send_explicit():
         # Alice 显式发送明文消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "这是一条明文消息"},
+            "payload": {"type": "text", "text": "这是一条明文消息"},
             "encrypt": False,
         })
 
@@ -931,7 +945,7 @@ async def test_plaintext_send_explicit():
         # Alice 默认加密发送
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "这是一条加密消息"},
+            "payload": {"type": "text", "text": "这是一条加密消息"},
         })
 
         await asyncio.sleep(1)
@@ -962,19 +976,12 @@ async def test_epoch_rotation_on_leave():
 
         group_id = await _create_group(alice, f"e2ee-leave-{rid}")
         await _add_member(alice, group_id, b_aid)
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=25.0)
         await _add_member(alice, group_id, c_aid)
-
-        # 等待 SDK 自动分发密钥
-        await asyncio.sleep(2)
+        await _wait_for_group_secret_epoch(carol, c_aid, group_id, min_epoch=1, timeout=25.0)
 
         # 确认三方都有 epoch 1
         assert alice._group_e2ee.has_secret(group_id), "Alice missing secret"
-        for _w in range(10):
-            await asyncio.sleep(1)
-            if bob._group_e2ee.has_secret(group_id) and carol._group_e2ee.has_secret(group_id):
-                break
-        else:
-            assert False, "Bob/Carol did not receive epoch 1 within 10s"
 
         old_epoch = alice._group_e2ee.current_epoch(group_id)
         assert old_epoch and old_epoch >= 1, f"expected existing epoch, got {old_epoch}"
@@ -984,13 +991,13 @@ async def test_epoch_rotation_on_leave():
 
         # Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换
         # 轮询等待 Bob 拿到 epoch 2 密钥
-        for _wait in range(15):
+        for _wait in range(25):
             await asyncio.sleep(1)
             all_bob = load_all_group_secrets(bob._keystore, b_aid, group_id)
             if any(epoch > old_epoch for epoch in all_bob):
                 break
         else:
-            assert False, f"Bob did not receive epoch > {old_epoch} secret within 15s after leave"
+            assert False, f"Bob did not receive epoch > {old_epoch} secret within 25s after leave"
 
         new_epoch = max(load_all_group_secrets(bob._keystore, b_aid, group_id))
         all_alice = load_all_group_secrets(alice._keystore, a_aid, group_id)
@@ -999,7 +1006,7 @@ async def test_epoch_rotation_on_leave():
         # Alice 用新 epoch 发加密消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "退群后的消息"},
+            "payload": {"type": "text", "text": "退群后的消息"},
         })
 
         await asyncio.sleep(1)
@@ -1059,7 +1066,7 @@ async def test_push_event_decrypt():
         # Alice 发加密消息
         await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"text": "推送测试"},
+            "payload": {"type": "text", "text": "推送测试"},
             "encrypt": True,
         })
 

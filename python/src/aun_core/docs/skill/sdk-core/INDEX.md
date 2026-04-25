@@ -21,8 +21,8 @@
 
 | 文档 | 说明 |
 |------|------|
-| [group-rpc-manual](group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/消息收发 |
-| [message-rpc-manual](message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认 |
+| [group-rpc-manual](group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/消息收发 · `payload.type` 负载类型 |
+| [message-rpc-manual](message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认 · `payload.type` 负载类型 |
 | [meta-rpc-manual](meta-rpc-manual.md) | Meta 服务 RPC 接口 · ping/status 等元信息 |
 | [storage-rpc-manual](storage-rpc-manual.md) | Storage 服务 RPC 接口 · 文件上传/下载/对象管理 |
 | [stream-rpc-manual](stream-rpc-manual.md) | Stream 服务 RPC 接口 · 流式数据传输 |
@@ -58,8 +58,8 @@
 - **裸 WebSocket RPC 调用** → [02-WebSocket协议](02-WebSocket协议.md)
 - **内置事件列表** → [06-API手册](06-API手册.md)
 - **RPC 手册索引** → [06-API手册](06-API手册.md)
-- **Group RPC** → [group-rpc-manual](group-rpc-manual.md)
-- **Message RPC** → [message-rpc-manual](message-rpc-manual.md)
+- **Group RPC 与群消息 payload 类型** → [group-rpc-manual](group-rpc-manual.md)
+- **Message RPC 与 P2P payload 类型** → [message-rpc-manual](message-rpc-manual.md)
 - **Meta RPC** → [meta-rpc-manual](meta-rpc-manual.md)
 - **Storage RPC** → [storage-rpc-manual](storage-rpc-manual.md)
 - **Stream RPC** → [stream-rpc-manual](stream-rpc-manual.md)

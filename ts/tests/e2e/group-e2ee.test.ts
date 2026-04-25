@@ -240,7 +240,7 @@ describe('Group E2EE E2E 测试', () => {
     // Alice 发送加密群消息
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '加密群消息' },
+      payload: { type: 'text', text: '加密群消息' },
       encrypt: true,
     });
 
@@ -285,7 +285,7 @@ describe('Group E2EE E2E 测试', () => {
 
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '三人群消息' },
+      payload: { type: 'text', text: '三人群消息' },
       encrypt: true,
     });
 
@@ -347,7 +347,7 @@ describe('Group E2EE E2E 测试', () => {
     // Alice 用 epoch 2 发加密消息
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '踢人后的消息' },
+      payload: { type: 'text', text: '踢人后的消息' },
       encrypt: true,
     });
 
@@ -403,7 +403,7 @@ describe('Group E2EE E2E 测试', () => {
     // Alice 用 epoch 1 发消息
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '新成员能看到' },
+      payload: { type: 'text', text: '新成员能看到' },
       encrypt: true,
     });
 
@@ -443,7 +443,7 @@ describe('Group E2EE E2E 测试', () => {
     for (let i = 0; i < N; i++) {
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: `burst_${i}`, seq: i },
+        payload: { type: 'text', text: `burst_${i}`, seq: i },
         encrypt: true,
       });
     }
@@ -487,19 +487,19 @@ describe('Group E2EE E2E 测试', () => {
     // 明文消息
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '明文' },
+      payload: { type: 'text', text: '明文' },
       encrypt: false,
     });
     // 加密消息
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '密文' },
+      payload: { type: 'text', text: '密文' },
       encrypt: true,
     });
     // 又一条明文
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '又是明文' },
+      payload: { type: 'text', text: '又是明文' },
       encrypt: false,
     });
 
@@ -576,7 +576,7 @@ describe('Group E2EE E2E 测试', () => {
 
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: 'epoch1消息' },
+      payload: { type: 'text', text: 'epoch1消息' },
       encrypt: true,
     });
 
@@ -594,7 +594,7 @@ describe('Group E2EE E2E 测试', () => {
 
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: 'epoch2消息' },
+      payload: { type: 'text', text: 'epoch2消息' },
       encrypt: true,
     });
 
@@ -636,7 +636,7 @@ describe('Group E2EE E2E 测试', () => {
     // Alice 显式发送明文消息
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '这是一条明文消息' },
+      payload: { type: 'text', text: '这是一条明文消息' },
       encrypt: false,
     });
 
@@ -649,7 +649,7 @@ describe('Group E2EE E2E 测试', () => {
 
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '这是一条加密消息' },
+        payload: { type: 'text', text: '这是一条加密消息' },
       });
 
       const msgs2 = await bobWatch.waitFor((messages) => filterDecrypted(messages).some((msg) =>
@@ -714,7 +714,7 @@ describe('Group E2EE E2E 测试', () => {
     // Alice 用 epoch 2 发加密消息
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: '退群后的消息' },
+      payload: { type: 'text', text: '退群后的消息' },
     });
 
     try {

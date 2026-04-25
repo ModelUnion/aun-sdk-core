@@ -115,7 +115,7 @@ describe('双域 Federation 集成测试', () => {
     const sendText = `ts federation hello ${rid}`;
     const sendResult = await alice.call('message.send', {
       to: bobAid,
-      payload: { text: sendText },
+      payload: { type: 'text', text: sendText },
       encrypt: true,
     }) as JsonObject;
 
@@ -160,7 +160,7 @@ describe('双域 Federation 集成测试', () => {
     const text1 = `group-msg-1-${rid}`;
     const sent1 = await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: text1 },
+      payload: { type: 'text', text: text1 },
       encrypt: false,
     }) as JsonObject;
     const seq1 = Number((((sent1.message ?? {}) as JsonObject).seq ?? sent1.seq ?? 0));
@@ -189,7 +189,7 @@ describe('双域 Federation 集成测试', () => {
     const text2 = `group-msg-2-${rid}`;
     await alice.call('group.send', {
       group_id: groupId,
-      payload: { text: text2 },
+      payload: { type: 'text', text: text2 },
       encrypt: false,
     });
 

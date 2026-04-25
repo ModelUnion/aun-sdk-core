@@ -64,6 +64,7 @@ _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
     "retry": {
         "initial_delay": 1.0,
         "max_delay": 64.0,
+        "max_attempts": 0,
     },
     "timeouts": {
         "connect": 5.0,
@@ -264,9 +265,15 @@ class AUNClient:
         self._gap_fill_active: bool = False  # 当前是否在补洞中（用于标记 pull 来源）
         # 推送路径已分发的 seq 集合（按命名空间），补洞路径 publish 前检查以避免重复分发
         self._pushed_seqs: dict[str, set[int]] = {}
+        # 群惰性同步标志：只有收到推送或主动 pull 后才标记为已同步
+        # 发送消息前如果未同步，先做一次 pull
+        self._group_synced: set[str] = set()
+        # P2P 惰性同步标志：只有收到推送或主动发消息后才激活
+        self._p2p_synced: bool = False
         # PY-001: 解密失败的群消息待重试队列（按 namespace 分组）
         self._pending_decrypt_msgs: dict[str, list[dict[str, Any]]] = {}
         self._group_epoch_rotation_inflight: set[str] = set()
+        self._group_epoch_recovery_inflight: dict[str, asyncio.Future[bool]] = {}
         self._group_membership_rotation_done: set[str] = set()
 
         self.auth = AuthNamespace(self)
@@ -313,7 +320,7 @@ class AUNClient:
         return await self._discovery.check_health(gateway_url, timeout=timeout)
 
     async def connect(self, auth: dict[str, Any], options: dict[str, Any] | None = None) -> None:
-        if self._state not in {"idle", "closed"}:
+        if self._state not in {"idle", "closed", "disconnected"}:
             raise StateError(f"connect not allowed in state {self._state}")
         params = dict(auth)
         if options:
@@ -672,6 +679,10 @@ class AUNClient:
         message_id = params.get("message_id") or str(_uuid.uuid4())
         timestamp = params.get("timestamp") or int(_time.time() * 1000)
 
+        # 惰性同步：首次发送 P2P 消息时先 pull 一次
+        if not self._p2p_synced:
+            await self._lazy_sync_p2p()
+
         recipient_prekeys = await self._fetch_peer_prekeys(to_aid)
         self_sync_copies = await self._build_self_sync_copies(
             logical_to_aid=to_aid,
@@ -940,6 +951,10 @@ class AUNClient:
         if not group_id:
             raise ValidationError("group.send requires group_id")
 
+        # 惰性同步：首次对该群发消息时先 pull 一次，确保 epoch key 和 seq 状态就绪
+        if group_id not in self._group_synced:
+            await self._lazy_sync_group(group_id)
+
         # 预检：本地 epoch 是否与服务端一致，不一致则等待密钥恢复
         await self._ensure_group_epoch_ready(group_id, strict=False)
 
@@ -963,7 +978,50 @@ class AUNClient:
 
         raise StateError(f"group {group_id} send failed after epoch recovery retry")
 
-    @staticmethod
+    async def _lazy_sync_group(self, group_id: str) -> None:
+        """惰性同步：首次激活群时 pull 最近消息，建立 seq 基线。"""
+        self._group_synced.add(group_id)
+        try:
+            ns = f"group:{group_id}"
+            after_seq = self._seq_tracker.get_contiguous_seq(ns)
+            result = await self._transport.call("group.pull", {
+                "group_id": group_id,
+                "after_message_seq": after_seq,
+                "limit": 200,
+            })
+            messages = result.get("messages", []) if isinstance(result, dict) else []
+            for msg in messages:
+                seq = msg.get("seq")
+                if seq is not None:
+                    self._seq_tracker.on_message_seq(ns, int(seq))
+            if messages:
+                self._persist_seq(ns)
+                _client_log.info("惰性同步群 %s: pull %d 条消息, after_seq=%d", group_id, len(messages), after_seq)
+        except Exception as exc:
+            _client_log.warning("惰性同步群 %s 失败: %s", group_id, exc)
+
+    async def _lazy_sync_p2p(self) -> None:
+        """惰性同步：首次激活 P2P 通道时 pull 最近消息，建立 seq 基线。"""
+        self._p2p_synced = True
+        if not self._aid:
+            return
+        try:
+            ns = f"p2p:{self._aid}"
+            after_seq = self._seq_tracker.get_contiguous_seq(ns)
+            result = await self._transport.call("message.pull", {
+                "after_seq": after_seq,
+                "limit": 200,
+            })
+            messages = result.get("messages", []) if isinstance(result, dict) else []
+            for msg in messages:
+                seq = msg.get("seq")
+                if seq is not None:
+                    self._seq_tracker.on_message_seq(ns, int(seq))
+            if messages:
+                self._persist_seq(ns)
+                _client_log.info("惰性同步 P2P: pull %d 条消息, after_seq=%d", len(messages), after_seq)
+        except Exception as exc:
+            _client_log.warning("惰性同步 P2P 失败: %s", exc)
     def _is_group_epoch_too_old_error(exc: Exception) -> bool:
         return "e2ee epoch too old" in str(exc).lower()
 
@@ -1011,9 +1069,48 @@ class AUNClient:
         sender_aid: str = "",
         timeout_s: float = 5.0,
     ) -> bool:
-        if self._group_e2ee.load_secret(group_id, epoch) is not None:
+        existing = self._group_e2ee.load_secret(group_id, epoch)
+        if existing is not None:
+            _client_log.debug(
+                "DIAG: _recover skip — group=%s epoch=%s 密钥已在本地", group_id, epoch,
+            )
             return True
 
+        # inflight 去重：同 group_id:epoch 的并发恢复共享同一个 Future
+        key = f"{group_id}:{epoch}"
+        inflight = self._group_epoch_recovery_inflight.get(key)
+        if inflight is not None:
+            _client_log.info(
+                "DIAG: _recover inflight 去重 — group=%s epoch=%s 共享已有 Future", group_id, epoch,
+            )
+            return await asyncio.shield(inflight)
+
+        _client_log.info(
+            "DIAG: _recover 发起新请求 — group=%s epoch=%s sender=%s", group_id, epoch, sender_aid,
+        )
+
+        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        self._group_epoch_recovery_inflight[key] = future
+        try:
+            result = await self._do_recover_group_epoch_key(
+                group_id, epoch, sender_aid=sender_aid, timeout_s=timeout_s,
+            )
+            future.set_result(result)
+            return result
+        except Exception as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            self._group_epoch_recovery_inflight.pop(key, None)
+
+    async def _do_recover_group_epoch_key(
+        self,
+        group_id: str,
+        epoch: int,
+        *,
+        sender_aid: str = "",
+        timeout_s: float = 5.0,
+    ) -> bool:
         epoch_result: dict[str, Any] = {"epoch": epoch}
         try:
             raw = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
@@ -1122,6 +1219,7 @@ class AUNClient:
             # P2P 空洞检测
             seq = msg.get("seq")
             if seq is not None and self._aid:
+                self._p2p_synced = True  # 收到推送即视为激活
                 ns = f"p2p:{self._aid}"
                 old_contig = self._seq_tracker.get_contiguous_seq(ns)
                 need_pull = self._seq_tracker.on_message_seq(ns, int(seq))
@@ -1329,6 +1427,7 @@ class AUNClient:
 
             # 空洞检测（无论带不带 payload 都检查）
             if group_id and seq is not None:
+                self._group_synced.add(group_id)
                 ns = f"group:{group_id}"
                 need_pull = self._seq_tracker.on_message_seq(ns, int(seq))
                 self._persist_seq(ns)
@@ -1442,8 +1541,8 @@ class AUNClient:
         if self._state != "connected" or self._closing:
             return
         after_seq = self._seq_tracker.get_contiguous_seq(f"group:{group_id}")
-        # 新设备（seq=0）没有历史 epoch key，拉旧消息也解不了
-        if after_seq == 0 and not self._group_e2ee.has_secret(group_id):
+        # 冷启动（seq=0）：服务端推送会带全量消息，SDK 不主动补洞避免重复拉取
+        if after_seq == 0:
             return
         dedup_key = f"group_msg:{group_id}:{after_seq}"
         if dedup_key in self._gap_fill_done:
@@ -1485,6 +1584,9 @@ class AUNClient:
             return
         ns = f"group_event:{group_id}"
         after_seq = self._seq_tracker.get_contiguous_seq(ns)
+        # 冷启动（seq=0）：服务端推送会带全量事件，SDK 不主动补洞避免重复拉取
+        if after_seq == 0:
+            return
         dedup_key = f"group_evt:{group_id}:{after_seq}"
         if dedup_key in self._gap_fill_done:
             return
@@ -1755,12 +1857,19 @@ class AUNClient:
         if not isinstance(payload, dict) or payload.get("type") != "e2ee.group_encrypted":
             return message
 
+        group_id = message.get("group_id", "")
+        msg_epoch = payload.get("epoch")
+        msg_seq = message.get("seq")
+
         # 确保发送方证书已缓存（签名验证需要）— 失败时拒绝解密
         sender_aid = message.get("from", message.get("sender_aid", ""))
         if sender_aid:
             cert_ok = await self._ensure_sender_cert_cached(sender_aid)
             if not cert_ok:
-                _client_log.warning("群消息解密跳过：发送方 %s 证书不可用", sender_aid)
+                _client_log.warning(
+                    "DIAG: 群消息解密跳过：发送方 %s 证书不可用 (group=%s epoch=%s seq=%s)",
+                    sender_aid, group_id, msg_epoch, msg_seq,
+                )
                 return message
 
         # 先尝试直接解密
@@ -1768,11 +1877,34 @@ class AUNClient:
         if result is not None and result.get("e2ee"):
             return result
 
+        # replay guard 命中：decrypt 返回了原消息（非 None）但无 e2ee 字段
+        # 这不是解密失败，不应触发 recover
+        if result is not None:
+            _client_log.debug(
+                "群消息 replay guard 命中，跳过 recover: group=%s seq=%s sender=%s",
+                group_id, msg_seq, sender_aid,
+            )
+            return result
+
+        # 真正的解密失败（result is None），记录原因
+        _has_cert = self._get_verified_peer_cert(sender_aid) is not None if sender_aid else False
+        _local_secrets = self._group_e2ee.load_all_secrets(group_id)
+        _client_log.info(
+            "DIAG: decrypt 返回 None — group=%s epoch=%s seq=%s sender=%s "
+            "has_cert=%s local_epochs=%s skip_replay=%s",
+            group_id, msg_epoch, msg_seq, sender_aid,
+            _has_cert, sorted(_local_secrets.keys()) if _local_secrets else [],
+            skip_replay,
+        )
+
         # 解密失败时，先同步请求目标 epoch key；5 秒内拿到则立即重解。
-        group_id = message.get("group_id", "")
         sender = message.get("from", message.get("sender_aid", ""))
-        epoch = payload.get("epoch")
+        epoch = msg_epoch
         if epoch is not None and group_id:
+            _client_log.info(
+                "DIAG: 触发 _recover_group_epoch_key — group=%s epoch=%s sender=%s",
+                group_id, epoch, sender,
+            )
             try:
                 if await self._recover_group_epoch_key(
                     group_id,
@@ -1798,6 +1930,7 @@ class AUNClient:
             is_encrypted = isinstance(payload, dict) and payload.get("type") == "e2ee.group_encrypted"
             if is_encrypted and isinstance(msg, dict) and group_id and not decrypted.get("e2ee"):
                 self._enqueue_pending_decrypt(group_id, msg)
+                continue  # R3: 解密失败不入 result，不 publish 密文给应用层
             result.append(decrypted)
         return result
 
@@ -2615,15 +2748,29 @@ class AUNClient:
         self._gap_fill_done.clear()
         self._gap_fill_active = False
         self._pushed_seqs.clear()
+        if hasattr(self, "_group_synced"):
+            self._group_synced.clear()
+        if hasattr(self, "_p2p_synced"):
+            self._p2p_synced = False
 
     def _refresh_seq_tracking_context(self) -> None:
         next_context = self._current_seq_tracker_context()
         if next_context == self._seq_tracker_context:
             return
+        prev = self._seq_tracker_context
+        old_state = self._seq_tracker.export_state() if prev else {}
+        _client_log.info(
+            "DIAG: SeqTracker 上下文切换 %s → %s, 旧 state=%s",
+            prev, next_context, old_state,
+        )
         self._seq_tracker = SeqTracker()
         self._gap_fill_done.clear()
         self._gap_fill_active = False
         self._pushed_seqs.clear()
+        if hasattr(self, "_group_synced"):
+            self._group_synced.clear()
+        if hasattr(self, "_p2p_synced"):
+            self._p2p_synced = False
         self._seq_tracker_context = next_context
 
     def _persist_seq(self, ns: str, *, force_seq: int | None = None) -> None:
@@ -3104,6 +3251,9 @@ class AUNClient:
     async def _reconnect_loop(self, server_initiated: bool = False) -> None:
         retry = dict(self._session_options["retry"])
         max_delay = float(retry.get("max_delay", 64.0))
+        # max_attempts=0 表示无限重试（与 Go/TS/JS 对齐）
+        max_attempts_raw = int(retry.get("max_attempts", 0))
+        max_attempts = max_attempts_raw if max_attempts_raw > 0 else 0
         # 服务端主动关闭时从 16s 起跳，避免重连风暴；网络断开从 initial_delay 起跳
         base_delay = 16.0 if server_initiated else float(retry.get("initial_delay", 1.0))
         delay = base_delay
@@ -3111,6 +3261,17 @@ class AUNClient:
 
         while not self._closing:
             attempt += 1
+            # R1 fix: max_attempts 检查在循环顶部，覆盖所有路径（含 health-fail）
+            if max_attempts > 0 and attempt > max_attempts:
+                self._state = "terminal_failed"
+                self._reconnect_task = None
+                await self._dispatcher.publish("connection.state", {
+                    "state": self._state,
+                    "attempt": attempt - 1,
+                    "reason": "max_attempts_exhausted",
+                })
+                return
+
             self._state = "reconnecting"
             await self._dispatcher.publish("connection.state", {
                 "state": self._state,
@@ -3118,7 +3279,7 @@ class AUNClient:
             })
             try:
                 # Full Jitter: random(0, delay) 打散重连时机
-                await asyncio.sleep(random.random() * delay)
+                await asyncio.sleep(delay + random.random() * delay)
                 # 重连前先 GET /health 探测，不健康则跳过本轮
                 if self._gateway_url:
                     healthy = await self._discovery.check_health(self._gateway_url)

@@ -88,11 +88,8 @@ async function loadKeyStorePrekeys(
   deviceId = '',
 ): Promise<LocalPrekeyStore> {
   const normalizedDeviceId = String(deviceId ?? '').trim();
-  if (normalizedDeviceId && typeof keystore.loadE2EEPrekeysForDevice === 'function') {
-    return ((await keystore.loadE2EEPrekeysForDevice(aid, normalizedDeviceId)) ?? {}) as LocalPrekeyStore;
-  }
   if (typeof keystore.loadE2EEPrekeys === 'function') {
-    return ((await keystore.loadE2EEPrekeys(aid)) ?? {}) as LocalPrekeyStore;
+    return ((await keystore.loadE2EEPrekeys(aid, normalizedDeviceId)) ?? {}) as LocalPrekeyStore;
   }
   throw new Error('keystore 缺少 loadE2EEPrekeys 方法');
 }
@@ -105,15 +102,11 @@ async function saveKeyStorePrekey(
   prekeyData: LocalPrekeyRecord,
 ): Promise<void> {
   const normalizedDeviceId = String(deviceId ?? '').trim();
-  if (normalizedDeviceId && typeof keystore.saveE2EEPrekeyForDevice === 'function') {
-    await keystore.saveE2EEPrekeyForDevice(aid, normalizedDeviceId, prekeyId, prekeyData);
-    return;
-  }
   if (typeof keystore.saveE2EEPrekey === 'function') {
-    await keystore.saveE2EEPrekey(aid, prekeyId, prekeyData);
+    await keystore.saveE2EEPrekey(aid, prekeyId, prekeyData, normalizedDeviceId);
     return;
   }
-  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing saveE2EEPrekey method`);
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} 缺少 saveE2EEPrekey 方法`);
 }
 
 async function cleanupKeyStorePrekeys(
@@ -124,14 +117,10 @@ async function cleanupKeyStorePrekeys(
   keepLatest = PREKEY_MIN_KEEP_COUNT,
 ): Promise<string[]> {
   const normalizedDeviceId = String(deviceId ?? '').trim();
-  if (normalizedDeviceId && typeof keystore.cleanupE2EEPrekeysForDevice === 'function') {
-    return (await keystore.cleanupE2EEPrekeysForDevice(aid, normalizedDeviceId, cutoffMs, keepLatest)) ?? [];
-  }
   if (typeof keystore.cleanupE2EEPrekeys === 'function') {
-    return (await keystore.cleanupE2EEPrekeys(aid, cutoffMs, keepLatest)) ?? [];
+    return (await keystore.cleanupE2EEPrekeys(aid, cutoffMs, keepLatest, normalizedDeviceId)) ?? [];
   }
-
-  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing cleanupE2EEPrekeys method`);
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} 缺少 cleanupE2EEPrekeys 方法`);
 }
 
 // ── 工具函数 ────────────────────────────────────────────────

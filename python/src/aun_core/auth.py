@@ -513,8 +513,18 @@ class AuthFlow:
             raise AuthError("aid_login1 returned invalid auth_cert") from exc
 
         await self._verify_auth_cert_chain(gateway_url, auth_cert)
-        await self._verify_auth_cert_revocation(gateway_url, auth_cert)
-        await self._verify_auth_cert_ocsp(gateway_url, auth_cert)
+        try:
+            await self._verify_auth_cert_revocation(gateway_url, auth_cert)
+        except AuthError as _crl_exc:
+            if "revoked" in str(_crl_exc).lower():
+                raise
+            _auth_log.warning("CRL 检查不可用，降级继续: %s", _crl_exc)
+        try:
+            await self._verify_auth_cert_ocsp(gateway_url, auth_cert)
+        except AuthError as _ocsp_exc:
+            if "revoked" in str(_ocsp_exc).lower():
+                raise
+            _auth_log.warning("OCSP 检查不可用，降级继续: %s", _ocsp_exc)
 
         try:
             signature = base64.b64decode(signature_b64)
@@ -653,16 +663,20 @@ class AuthFlow:
         await self._verify_auth_cert_chain(gateway_url, cert, chain_aid=expected_aid)
         try:
             await self._verify_auth_cert_revocation(gateway_url, cert, chain_aid=expected_aid)
-        except AuthError:
-            raise
+        except AuthError as _crl_exc:
+            if "revoked" in str(_crl_exc).lower():
+                raise
+            _auth_log.warning("peer cert CRL 检查不可用，降级继续: %s", _crl_exc)
         except Exception as exc:
-            raise AuthError(f"peer cert CRL check failed: {exc}") from exc
+            _auth_log.warning("peer cert CRL 检查不可用，降级继续: %s", exc)
         try:
             await self._verify_auth_cert_ocsp(gateway_url, cert, chain_aid=expected_aid)
-        except AuthError:
-            raise
+        except AuthError as _ocsp_exc:
+            if "revoked" in str(_ocsp_exc).lower():
+                raise
+            _auth_log.warning("peer cert OCSP 检查不可用，降级继续: %s", _ocsp_exc)
         except Exception as exc:
-            raise AuthError(f"peer cert OCSP check failed: {exc}") from exc
+            _auth_log.warning("peer cert OCSP 检查不可用，降级继续: %s", exc)
         cn_attrs = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
         if not cn_attrs or cn_attrs[0].value != expected_aid:
             cert_cn = cn_attrs[0].value if cn_attrs else "none"
@@ -973,11 +987,18 @@ class AuthFlow:
             # 4. 完整证书链验证 + 受信根锚定 + CRL/OCSP
             if gateway_url:
                 await self._verify_auth_cert_chain(gateway_url, cert)
-                await self._verify_auth_cert_revocation(gateway_url, cert)
+                try:
+                    await self._verify_auth_cert_revocation(gateway_url, cert)
+                except AuthError as exc:
+                    if "revoked" in str(exc).lower():
+                        raise
+                    _auth_log.warning("CRL 检查不可用，降级继续: %s", exc)
                 try:
                     await self._verify_auth_cert_ocsp(gateway_url, cert)
                 except AuthError as exc:
-                    _auth_log.info("OCSP 校验不可用，降级继续 (CRL 已检查): %s", exc)
+                    if "revoked" in str(exc).lower():
+                        raise
+                    _auth_log.info("OCSP 校验不可用，降级继续: %s", exc)
             # 验证通过，正式接受
             identity["cert"] = new_cert_pem if isinstance(new_cert_pem, str) else new_cert_pem.decode("utf-8")
         except AuthError as exc:

@@ -137,7 +137,7 @@ class TestPY002SenderSignatureVerification:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, _ = sender_mgr._encrypt_with_long_term_key(
-            "receiver.test", {"text": "hello"}, receiver_cert,
+            "receiver.test", {"type": "text", "text": "hello"}, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         # 移除 sender_signature
@@ -155,7 +155,7 @@ class TestPY002SenderSignatureVerification:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, _ = sender_mgr._encrypt_with_long_term_key(
-            "receiver.test", {"text": "hello"}, receiver_cert,
+            "receiver.test", {"type": "text", "text": "hello"}, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         # 篡改签名
@@ -174,7 +174,7 @@ class TestPY002SenderSignatureVerification:
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)
         envelope, _ = sender_mgr._encrypt_with_long_term_key(
-            "receiver.test", {"text": "hello"}, receiver_cert,
+            "receiver.test", {"type": "text", "text": "hello"}, receiver_cert,
             message_id=mid, timestamp=ts,
         )
         message = {

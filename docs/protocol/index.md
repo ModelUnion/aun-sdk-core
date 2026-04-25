@@ -89,7 +89,7 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 `relay.*` 3 个方法：register、forward、event/relay.message。Relay 职责边界（零信任笨管道）、透明封装规则、与 peer.* 配合完成端到端认证。
 
 ### 06-服务协议（业务层）
-认证后可用的业务方法：auth.*（身份管理）、ca.*（证书管理）、message.*（P2P 消息、E2EE prekey）、meta.*（心跳、状态、受信根）、storage.*（文件存储）、group.*（群组）、mail.*（邮件）、stream.*（流式传输）、search.*（Agent 发现）、relay.*（中继）、peer.*（点对点）、task.*（协作任务）。
+认证后可用的业务方法：auth.*（身份管理）、ca.*（证书管理）、message.*（P2P 消息、E2EE prekey、`payload.type` 负载类型）、meta.*（心跳、状态、受信根）、storage.*（文件存储）、group.*（群组）、mail.*（邮件）、stream.*（流式传输）、search.*（Agent 发现）、relay.*（中继）、peer.*（点对点）、task.*（协作任务）。
 
 ### 07-错误码与状态机
 错误码分层汇总（JSON-RPC 通用 + AUN 协议级 + Peer/Relay/Search/Task/升级扩展码）。三种连接模式状态机。任务状态机。可重试/不可重试分类。
@@ -104,7 +104,7 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 威胁模型、传输层安全、认证安全、JWT 信任模型分析、连接升级安全（降级攻击/假地址注入/信令重放）、公开 AP 同步安全、证书轮换验签时序。
 
 ### 10-Group-子协议
-`group.*` 命名空间完整协议规范。群组生命周期（create/suspend/close）、成员管理（add/kick/set_role/transfer_owner）、群消息（send/pull/ack）、入群申请与邀请码、群规则与公告、资源共享（put/get/request_add/review_add）、在线状态（go_online/heartbeat）、事件推送（group.created/changed/message_created）、错误码（-33001~-33009）。Group Service 作为独立 AID 持有者运行。
+`group.*` 命名空间完整协议规范。群组生命周期（create/suspend/close）、成员管理（add/kick/set_role/transfer_owner）、群消息（send/pull/ack、`payload.type` 负载类型）、入群申请与邀请码、群规则与公告、资源共享（put/get/request_add/review_add）、在线状态（go_online/heartbeat）、事件推送（group.created/changed/message_created）、错误码（-33001~-33009）。Group Service 作为独立 AID 持有者运行。
 
 ### 11-Storage-子协议
 `storage.*` 命名空间完整协议规范。控制面与数据面分离（小对象内联 RPC，大对象预签名 URL HTTP 传输）、per-AID 隔离、对象键路径化、版本化 CAS 并发控制。方法：put_object / get_object / delete_object / list_objects / create_upload_session / create_download_ticket。

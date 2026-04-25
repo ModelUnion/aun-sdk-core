@@ -23,7 +23,7 @@ func TestSQLiteInteropDriver(t *testing.T) {
 	defer ks.Close()
 	switch action {
 	case "write-go":
-		if err := ks.SaveE2EEPrekey(aid, "go-prekey", map[string]any{"private_key_pem": "GO-PREKEY-SECRET", "created_at": int64(1)}); err != nil {
+		if err := ks.SaveE2EEPrekey(aid, "go-prekey", "", map[string]any{"private_key_pem": "GO-PREKEY-SECRET", "created_at": int64(1)}); err != nil {
 			t.Fatalf("SaveE2EEPrekey: %v", err)
 		}
 		if err := ks.SaveGroupSecretState(aid, "go-group", map[string]any{"epoch": int64(1), "secret": "GO-GROUP-SECRET"}); err != nil {
@@ -33,7 +33,7 @@ func TestSQLiteInteropDriver(t *testing.T) {
 			t.Fatalf("SaveE2EESession: %v", err)
 		}
 	case "read-all":
-		prekeys, err := ks.LoadE2EEPrekeys(aid)
+		prekeys, err := ks.LoadE2EEPrekeys(aid, "")
 		if err != nil {
 			t.Fatalf("LoadE2EEPrekeys: %v", err)
 		}

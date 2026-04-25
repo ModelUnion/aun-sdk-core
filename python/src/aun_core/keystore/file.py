@@ -340,13 +340,13 @@ class FileKeyStore(KeyStore):
 
     # ── Prekeys ──────────────────────────────────────────────
 
-    def load_e2ee_prekeys(self, aid: str, device_id: str = "") -> dict[str, dict[str, Any]]:
+    def load_e2ee_prekeys(self, aid: str, device_id: str) -> dict[str, dict[str, Any]]:
         lock = self._get_metadata_lock(aid)
         with lock:
             device_id = str(device_id or "").strip()
             return self._get_db(aid).load_prekeys(device_id)
 
-    def save_e2ee_prekey(self, aid: str, prekey_id: str, prekey_data: dict[str, Any], device_id: str = "") -> None:
+    def save_e2ee_prekey(self, aid: str, prekey_id: str, prekey_data: dict[str, Any], device_id: str) -> None:
         lock = self._get_metadata_lock(aid)
         with lock:
             device_id = str(device_id or "").strip()

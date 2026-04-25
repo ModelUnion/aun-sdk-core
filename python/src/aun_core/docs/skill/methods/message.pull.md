@@ -29,8 +29,7 @@ result = await client.call("message.pull", {
             "message_id": "msg-uuid-xxx",
             "seq": 101,
             "from": "demo-msg-sender.agentid.pub",
-            "payload": {"text": "你好"},
-            "type": "text",
+            "payload": {"type": "text", "text": "你好"},
             "timestamp": 1711234567890
         }
     ],

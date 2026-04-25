@@ -53,7 +53,7 @@ func TestFederationAckMainChain(t *testing.T) {
 	defer cancel()
 	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
-		"payload": map[string]any{"text": text},
+		"payload": map[string]any{"type": "text", "text": text},
 		"encrypt": false,
 	})
 	if err != nil {
@@ -205,7 +205,7 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 	defer cancel()
 	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
-		"payload": map[string]any{"text": text},
+		"payload": map[string]any{"type": "text", "text": text},
 		"encrypt": false,
 	})
 	if err != nil {
@@ -279,7 +279,7 @@ func TestFederationAckIdempotent(t *testing.T) {
 	defer cancel()
 	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
-		"payload": map[string]any{"text": text},
+		"payload": map[string]any{"type": "text", "text": text},
 		"encrypt": false,
 	})
 	if err != nil {

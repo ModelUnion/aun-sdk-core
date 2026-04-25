@@ -6,7 +6,7 @@
 
 ```python
 result = await client.call("group.resources.get_access", {
-    "group_id": "g-xxx",
+    "group_id": "g-abc123.agentid.pub",
     "resource_path": "shared/design-doc.md"
 })
 
@@ -30,7 +30,7 @@ async with aiohttp.ClientSession() as http:
 
 ```json
 {
-    "group_id": "g-xxx",
+    "group_id": "g-abc123.agentid.pub",
     "resource_path": "shared/design-doc.md",
     "resource_link": "storage://...",
     "resource": { ... },

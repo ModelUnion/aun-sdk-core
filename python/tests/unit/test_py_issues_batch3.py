@@ -1,15 +1,14 @@
-"""PY-002(pushed_seqs) / PY-003(seed TOCTOU) / PY-004(read retry) / PY-005(epoch wait) 修复验证测试。
+"""PY-002(pushed_seqs) / PY-005(epoch wait) 修复验证测试。
 
 每个 ISSUE 一个测试类，覆盖修复逻辑的关键路径。
+PY-003 (seed TOCTOU) 和 PY-004 (SQLCipher 读操作重试) 测试已随 sqlcipher_db 模块移除。
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import secrets
-import sqlite3
 import tempfile
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -26,7 +25,6 @@ from aun_core.e2ee import (
     generate_group_secret,
     store_group_secret,
 )
-from aun_core.keystore.sqlcipher_db import AIDDatabase, load_or_create_seed
 
 
 # ── 辅助函数 ──────────────────────────────────────────────
@@ -109,7 +107,7 @@ def _make_encrypted_group_msg(gs, group_id=_GRP, from_aid=_AID_ALICE, seq=1, epo
     ts = 1710504000000 + seq
     envelope = encrypt_group_message(
         group_id=group_id, epoch=epoch, group_secret=gs,
-        payload={"text": f"消息-{seq}"}, from_aid=from_aid,
+        payload={"type": "text", "text": f"消息-{seq}"}, from_aid=from_aid,
         message_id=msg_id, timestamp=ts,
         sender_private_key_pem=pk_pem,
     )
@@ -154,7 +152,7 @@ class TestPY002PushedSeqsLimit:
             "to": client._aid,
             "message_id": "test-msg-1",
             "seq": 1,
-            "payload": {"text": "hello"},
+            "payload": {"type": "text", "text": "hello"},
         }
         ns = f"p2p:{client._aid}"
 
@@ -183,274 +181,6 @@ class TestPY002PushedSeqsLimit:
         assert excess - 1 in remaining, "应保留最新的 seq"
         # 最小的 seq 应被清理
         assert 0 not in remaining, "应清理最旧的 seq"
-
-
-# ── PY-003: load_or_create_seed TOCTOU 竞态 ────────────────────
-
-
-class TestPY003SeedTOCTOU:
-    """PY-003: load_or_create_seed 使用原子写入避免多进程竞态。"""
-
-    def test_existing_seed_is_loaded(self, tmp_path):
-        """已有 seed 文件时应直接加载，不重新创建。"""
-        existing_seed = os.urandom(32)
-        seed_path = tmp_path / ".seed"
-        seed_path.write_bytes(existing_seed)
-
-        loaded = load_or_create_seed(tmp_path)
-        assert loaded == existing_seed, "应加载已有的 seed"
-
-    def test_encryption_seed_takes_priority(self, tmp_path):
-        """encryption_seed 参数应优先于文件中的 seed。"""
-        existing_seed = os.urandom(32)
-        seed_path = tmp_path / ".seed"
-        seed_path.write_bytes(existing_seed)
-
-        loaded = load_or_create_seed(tmp_path, encryption_seed="custom_seed")
-        assert loaded == b"custom_seed", "encryption_seed 应优先"
-
-    def test_new_seed_is_created_atomically(self, tmp_path):
-        """新 seed 应通过原子写入创建。"""
-        seed_dir = tmp_path / "fresh"
-        seed = load_or_create_seed(seed_dir)
-
-        assert len(seed) == 32, "seed 应为 32 字节"
-        assert (seed_dir / ".seed").exists(), ".seed 文件应已创建"
-        assert (seed_dir / ".seed").read_bytes() == seed, "文件内容应匹配"
-
-    def test_no_temp_files_left_on_success(self, tmp_path):
-        """成功创建后不应有临时文件残留。"""
-        seed_dir = tmp_path / "clean"
-        load_or_create_seed(seed_dir)
-
-        # 检查没有 .seed_tmp_ 开头的文件残留
-        leftover = list(seed_dir.glob(".seed_tmp_*"))
-        assert len(leftover) == 0, f"不应有临时文件残留，但找到: {leftover}"
-
-    def test_concurrent_creation_returns_same_seed(self, tmp_path):
-        """多线程同时创建时，所有线程最终应使用同一个 seed。"""
-        seed_dir = tmp_path / "concurrent"
-        results = []
-        errors = []
-
-        def worker():
-            try:
-                s = load_or_create_seed(seed_dir)
-                results.append(s)
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=worker) for _ in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-
-        assert len(errors) == 0, f"不应有线程报错: {errors}"
-        assert len(results) == 5, "所有线程都应成功获取 seed"
-        # 所有线程返回的 seed 应相同
-        assert all(r == results[0] for r in results), \
-            "所有线程应获得同一个 seed，避免竞态产生不同 seed"
-
-
-# ── PY-004: SQLCipher 读操作重试 ────────────────────────────────
-
-
-class TestPY004ReadRetry:
-    """PY-004: 所有 SQLCipher 读操作应通过 _retry_on_locked 重试 database locked 异常。"""
-
-    def _make_db(self, tmp_path) -> AIDDatabase:
-        db_path = tmp_path / "test.db"
-        seed = os.urandom(32)
-        db = AIDDatabase(db_path, seed)
-        return db
-
-    def test_get_token_retries_on_locked(self, tmp_path):
-        """get_token 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        # 先写入一个 token
-        db.set_token("key1", "value1")
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.get_token("key1")
-        assert result == "value1", "重试后应成功获取 token"
-        assert call_count >= 2, "应至少重试一次"
-
-    def test_get_all_tokens_retries_on_locked(self, tmp_path):
-        """get_all_tokens 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.set_token("a", "1")
-        db.set_token("b", "2")
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.get_all_tokens()
-        assert result == {"a": "1", "b": "2"}, "重试后应成功获取所有 token"
-
-    def test_load_prekeys_retries_on_locked(self, tmp_path):
-        """load_prekeys 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.save_prekey("pk1", "enc_data")
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.load_prekeys()
-        assert "pk1" in result, "重试后应成功加载 prekeys"
-
-    def test_load_group_current_retries_on_locked(self, tmp_path):
-        """load_group_current 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.save_group_current("g1", 1, "secret", {"k": "v"})
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.load_group_current("g1")
-        assert result is not None, "重试后应成功加载 group_current"
-        assert result["epoch"] == 1
-
-    def test_load_session_retries_on_locked(self, tmp_path):
-        """load_session 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.save_session("s1", "enc_data")
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.load_session("s1")
-        assert result is not None, "重试后应成功加载 session"
-
-    def test_load_instance_state_retries_on_locked(self, tmp_path):
-        """load_instance_state 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.save_instance_state("dev1", "_singleton", {"status": "ok"})
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.load_instance_state("dev1")
-        assert result == {"status": "ok"}, "重试后应成功加载 instance_state"
-
-    def test_load_seq_retries_on_locked(self, tmp_path):
-        """load_seq 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.save_seq("dev1", "_singleton", "p2p:test", 42)
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.load_seq("dev1", "_singleton", "p2p:test")
-        assert result == 42, "重试后应成功加载 seq"
-
-    def test_get_metadata_retries_on_locked(self, tmp_path):
-        """get_metadata 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.set_metadata("foo", "bar")
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.get_metadata("foo")
-        assert result == "bar", "重试后应成功获取 metadata"
-
-    def test_get_all_metadata_retries_on_locked(self, tmp_path):
-        """get_all_metadata 应在 database locked 时重试。"""
-        db = self._make_db(tmp_path)
-        db.set_metadata("a", "1")
-        db.set_metadata("b", "2")
-
-        call_count = 0
-        original_get_conn = db._get_conn
-
-        def flaky_get_conn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise sqlite3.OperationalError("database is locked")
-            return original_get_conn()
-
-        db._get_conn = flaky_get_conn
-        result = db.get_all_metadata()
-        assert result == {"a": "1", "b": "2"}, "重试后应成功获取所有 metadata"
-
-    def test_read_still_raises_non_locked_errors(self, tmp_path):
-        """非 database locked 错误不应重试，应直接抛出。"""
-        db = self._make_db(tmp_path)
-
-        def bad_get_conn():
-            raise sqlite3.OperationalError("some other error")
-
-        db._get_conn = bad_get_conn
-        with pytest.raises(sqlite3.OperationalError, match="some other error"):
-            db.get_token("key1")
 
 
 # ── PY-005: 群消息 epoch 落后时等待密钥恢复 ────────────────────────
@@ -497,7 +227,7 @@ class TestPY005EpochWait:
              patch("aun_core.client._KEY_WAIT_POLL_INTERVAL_S", 0.05):
             await client._send_group_encrypted({
                 "group_id": _GRP,
-                "payload": {"text": "test"},
+                "payload": {"type": "text", "text": "test"},
             })
 
         # 应调用过密钥请求
@@ -536,7 +266,7 @@ class TestPY005EpochWait:
              patch("aun_core.client._KEY_WAIT_POLL_INTERVAL_S", 0.05):
             await client._send_group_encrypted({
                 "group_id": _GRP,
-                "payload": {"text": "test"},
+                "payload": {"type": "text", "text": "test"},
             })
 
         # 即使超时，也应最终发送消息
@@ -567,7 +297,7 @@ class TestPY005EpochWait:
         start = time.time()
         await client._send_group_encrypted({
             "group_id": _GRP,
-            "payload": {"text": "test"},
+            "payload": {"type": "text", "text": "test"},
         })
         elapsed = time.time() - start
 

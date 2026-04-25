@@ -252,7 +252,7 @@ describe('断线重连集成测试', () => {
 
     const sendResult = await alice.call('message.send', {
       to: bobAid,
-      payload: { text: '重连后消息' },
+      payload: { type: 'text', text: '重连后消息' },
       encrypt: false,
     }) as JsonObject;
     expect(sendResult.message_id).toBeTruthy();

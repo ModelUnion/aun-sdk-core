@@ -48,7 +48,7 @@ async def main():
     # ── 3. Alice 发送加密群消息（group.send 默认加密） ──
     await alice.call("group.send", {
         "group_id": group_id,
-        "payload": {"text": "这是一条群组加密消息", "secret": True},
+        "payload": {"type": "text", "text": "这是一条群组加密消息", "secret": True},
     })
     print(f"[3] Alice 发送加密消息完成")
 

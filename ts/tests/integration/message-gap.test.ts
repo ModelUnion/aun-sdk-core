@@ -55,7 +55,7 @@ describe('P2P Message Gap Fill', { timeout: 30000 }, () => {
 
     // Alice 发送 5 条消息
     for (let i = 1; i <= 5; i++) {
-      await alice.call('message.send', { to: bobAid, payload: { text: `msg${i}` }, encrypt: false });
+      await alice.call('message.send', { to: bobAid, payload: { type: 'text', text: `msg${i}` }, encrypt: false });
       await new Promise(r => setTimeout(r, 200));
     }
 
@@ -104,7 +104,7 @@ describe('P2P Message Gap Fill', { timeout: 30000 }, () => {
 
     // Alice 快速发送 5 条消息（可能触发 gap）
     for (let i = 1; i <= 5; i++) {
-      await alice.call('message.send', { to: bobAid, payload: { text: `gap_msg${i}` }, encrypt: false });
+      await alice.call('message.send', { to: bobAid, payload: { type: 'text', text: `gap_msg${i}` }, encrypt: false });
     }
 
     // 等待推送 + 补洞完成

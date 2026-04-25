@@ -114,8 +114,7 @@ sequenceDiagram
     "method": "message.send",
     "params": {
         "to": "bob.agentid.pub",
-        "type": "text",
-        "payload": {"text": "Hello"}
+        "payload": {"type": "text", "text": "Hello"}
     }
 }
 ```
@@ -158,8 +157,7 @@ sequenceDiagram
     "params": {
         "from": "alice.agentid.pub",
         "to": "bob.agentid.pub",
-        "type": "text",
-        "payload": {"text": "Hello"}
+        "payload": {"type": "text", "text": "Hello"}
     }
 }
 ```
@@ -291,8 +289,7 @@ async def main():
         try:
             result = await ws_call(alice_ws, "message.send", {
                 "to": BOB,
-                "type": "text",
-                "payload": {"text": "Hello from Alice (raw WebSocket)!"},
+                "payload": {"type": "text", "text": "Hello from Alice (raw WebSocket)!"},
             })
             print(f"[{ts()}] [Alice 发送] status={result.get('status')}, seq={result.get('seq')}")
         except TimeoutError as e:

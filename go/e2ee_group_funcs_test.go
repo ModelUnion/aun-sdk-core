@@ -34,7 +34,7 @@ func testNewGroupKeyStore(t *testing.T) keystore.KeyStore {
 // TestEncryptGroupMessage_EnvelopeFields 验证群组加密信封包含正确字段
 func TestEncryptGroupMessage_EnvelopeFields(t *testing.T) {
 	secret := GenerateGroupSecret()
-	payload := map[string]any{"text": "hello group"}
+	payload := map[string]any{"type": "text", "text": "hello group"}
 	envelope, err := EncryptGroupMessage(
 		secret, payload, "group-1", "alice.test", "gm-1",
 		time.Now().UnixMilli(), 1, "", nil,
@@ -64,7 +64,7 @@ func TestEncryptGroupMessage_EnvelopeFields(t *testing.T) {
 // TestEncryptDecryptGroupRoundtrip 验证群组消息加密解密往返
 func TestEncryptDecryptGroupRoundtrip(t *testing.T) {
 	secret := GenerateGroupSecret()
-	originalPayload := map[string]any{"text": "group message", "num": float64(7)}
+	originalPayload := map[string]any{"type": "text", "text": "group message", "num": float64(7)}
 	msgID := "gm-roundtrip"
 	ts := time.Now().UnixMilli()
 

@@ -33,7 +33,7 @@ result = await client.call("group.pull", {
             "message_id": "msg-uuid-xxx",
             "sender_aid": "demo-gm-member.agentid.pub",
             "message_type": "text",
-            "payload": {"text": "收到"},
+            "payload": {"type": "text", "text": "收到"},
             "attachments": [],
             "created_at": 1711234567890
         }

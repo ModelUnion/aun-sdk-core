@@ -88,7 +88,7 @@ ws.onmessage = async (event) => {
       params: {
         to: 'bob.aid.pub',
         type: 'text',
-        payload: {text: 'Hello Bob!'}
+        payload: {type: 'text', text: 'Hello Bob!'}
       }
     }));
   }
@@ -109,8 +109,8 @@ ws.send(JSON.stringify({
   method: 'message.send',
   params: {
     to: 'bob.aid.pub',
-    type: 'file',
     payload: {
+      type: 'file',
       text: '请查收附件',
       attachments: [
         {
@@ -201,8 +201,7 @@ ws.onMessage = { message in
         ws.send(jsonrpc: "2.0", id: msgId, method: "message.send",
                params: [
                    "to": "bob.aid.pub",
-                   "type": "text",
-                   "payload": ["text": "Hello Bob!"]
+                   "payload": ["type": "text", "text": "Hello Bob!"]
                ])
         msgId += 1
     }
@@ -276,7 +275,7 @@ ws.onmessage = async (event) => {
       params: {
         to: 'bob.company.com',
         type: 'text',
-        payload: {text: 'Hello from peer mode'}
+        payload: {type: 'text', text: 'Hello from peer mode'}
       }
     }));
   }
@@ -373,7 +372,7 @@ ws.onmessage = async (event) => {
           params: {
             to: 'bob.company.com',
             type: 'text',
-            payload: {text: 'Hello from relay mode'}
+            payload: {type: 'text', text: 'Hello from relay mode'}
           }
         }
       }

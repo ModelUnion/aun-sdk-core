@@ -101,13 +101,7 @@ def _load_keystore_prekeys(
 ) -> dict[str, dict[str, Any]]:
     load_fn = getattr(keystore, "load_e2ee_prekeys", None)
     if callable(load_fn):
-        try:
-            result = load_fn(aid, device_id=device_id)
-        except TypeError:
-            try:
-                result = load_fn(aid, device_id)
-            except TypeError:
-                result = load_fn(aid)
+        result = load_fn(aid, device_id)
         return result if isinstance(result, dict) else {}
     raise AttributeError("keystore 缺少 load_e2ee_prekeys 方法")
 
@@ -121,13 +115,7 @@ def _save_keystore_prekey(
 ) -> None:
     save_fn = getattr(keystore, "save_e2ee_prekey", None)
     if callable(save_fn):
-        try:
-            save_fn(aid, prekey_id, prekey_data, device_id=device_id)
-        except TypeError:
-            try:
-                save_fn(aid, prekey_id, prekey_data, device_id)
-            except TypeError:
-                save_fn(aid, prekey_id, prekey_data)
+        save_fn(aid, prekey_id, prekey_data, device_id)
         return
 
     raise AttributeError(f"keystore {type(keystore).__name__} 缺少 save_e2ee_prekey 方法")
@@ -142,16 +130,7 @@ def _cleanup_keystore_prekeys(
 ) -> list[str]:
     cleanup_fn = getattr(keystore, "cleanup_e2ee_prekeys", None)
     if callable(cleanup_fn):
-        try:
-            result = cleanup_fn(aid, cutoff_ms, keep_latest, device_id=device_id)
-        except TypeError:
-            try:
-                result = cleanup_fn(aid, cutoff_ms, keep_latest, device_id)
-            except TypeError:
-                try:
-                    result = cleanup_fn(aid, cutoff_ms, keep_latest)
-                except TypeError:
-                    result = cleanup_fn(aid, cutoff_ms)
+        result = cleanup_fn(aid, cutoff_ms, keep_latest, device_id)
         return result if isinstance(result, list) else []
 
     raise AttributeError(f"keystore {type(keystore).__name__} 缺少 cleanup_e2ee_prekeys 方法")

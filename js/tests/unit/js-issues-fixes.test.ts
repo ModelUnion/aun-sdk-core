@@ -134,7 +134,7 @@ describe('JS-003: _sendGroupEncrypted epoch 预检', () => {
 
     await (client as any)._sendGroupEncrypted({
       group_id: 'g1',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     expect(methods).toContain('group.e2ee.get_epoch');

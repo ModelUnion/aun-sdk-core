@@ -323,7 +323,7 @@ async def test_message_after_reconnect():
         # 重连后发消息
         send_result = await alice.call("message.send", {
             "to": bob_aid,
-            "payload": {"text": "重连后的消息"},
+            "payload": {"type": "text", "text": "重连后的消息"},
             "encrypt": False,
         })
         assert send_result.get("message_id"), "消息发送失败"

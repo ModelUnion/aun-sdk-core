@@ -1039,7 +1039,8 @@ export class GroupE2EEManager {
     const aadMsgId = aad ? (aad.message_id ?? '') as string : '';
     const msgId = aadMsgId || (message.message_id ?? '') as string;
     if (!skipReplay && groupId && sender && msgId) {
-      if (this._replayGuard.isSeen(groupId, sender, msgId)) return null;
+      // 返回原消息（不含 e2ee 字段），调用方可通过缺失 e2ee 识别 replay
+      if (this._replayGuard.isSeen(groupId, sender, msgId)) return message;
     }
 
     // 解析发送方证书（零信任：无证书则拒绝）

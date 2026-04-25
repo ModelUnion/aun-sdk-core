@@ -24,10 +24,10 @@ result = await client.call("group.resources.list", {
 
 ```json
 {
-    "group_id": "g-xxx",
+    "group_id": "g-abc123.agentid.pub",
     "items": [
         {
-            "group_id": "g-xxx",
+            "group_id": "g-abc123.agentid.pub",
             "resource_path": "shared/design-doc.md",
             "resource_type": "file",
             "title": "设计稿v2.png",

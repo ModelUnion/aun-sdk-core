@@ -361,7 +361,7 @@ describe('E2EEManager 本地防重放', () => {
     });
 
     // 非加密消息应原样返回
-    const plainMsg = { from: 'bob', message_id: 'msg-1', payload: { text: 'hello' } };
+    const plainMsg = { from: 'bob', message_id: 'msg-1', payload: { type: 'text', text: 'hello' } };
     const r1 = await manager.decryptMessage(plainMsg);
     expect(r1).toEqual(plainMsg);
 

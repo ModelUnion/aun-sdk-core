@@ -396,10 +396,10 @@ describe('E2EE 集成测试', () => {
     await ensureConnected(sender, sAid);
     await ensureConnected(receiver, rAid);
 
-    await sdkSend(sender, rAid, { text: 'sdk2sdk prekey', n: 1 });
+    await sdkSend(sender, rAid, { type: 'text', text: 'sdk2sdk prekey', n: 1 });
     const msgs = await sdkRecvPush(receiver, sAid);
     expect(msgs.length, '应收到至少 1 条消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgs[0], { text: 'sdk2sdk prekey' });
+    assertDecrypted(msgs[0], { type: 'text', text: 'sdk2sdk prekey' });
   }, TEST_TIMEOUT);
 
   // ── 3. SDK 无 prekey 时降级到 long_term_key ─────────────────
@@ -416,14 +416,14 @@ describe('E2EE 集成测试', () => {
     // Receiver 仅创建 AID，不连接（不上传 prekey）
     await receiver.auth.createAid({ aid: rAid });
 
-    await sdkSend(sender, rAid, { text: 'missing-prekey' });
+    await sdkSend(sender, rAid, { type: 'text', text: 'missing-prekey' });
 
     const auth = await receiver.auth.authenticate({ aid: rAid });
     await receiver.connect(auth);
 
     const msgs = await sdkRecvPull(receiver, sAid);
     expect(msgs.length, '应收到至少 1 条降级消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgs[0], { text: 'missing-prekey' });
+    assertDecrypted(msgs[0], { type: 'text', text: 'missing-prekey' });
     expect(((msgs[0].e2ee ?? {}) as JsonObject).encryption_mode).toBe('long_term_key');
   }, TEST_TIMEOUT);
 
@@ -440,16 +440,16 @@ describe('E2EE 集成测试', () => {
     await ensureConnected(bob, bAid);
 
     // Alice → Bob
-    await sdkSend(alice, bAid, { text: 'hello_bob', from: 'alice' });
+    await sdkSend(alice, bAid, { type: 'text', text: 'hello_bob', from: 'alice' });
     const msgsBob = await sdkRecvPush(bob, aAid);
     expect(msgsBob.length, 'Bob 应收到消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgsBob[0], { text: 'hello_bob' }, 'A→B');
+    assertDecrypted(msgsBob[0], { type: 'text', text: 'hello_bob' }, 'A→B');
 
     // Bob → Alice
-    await sdkSend(bob, aAid, { text: 'hello_alice', from: 'bob' });
+    await sdkSend(bob, aAid, { type: 'text', text: 'hello_alice', from: 'bob' });
     const msgsAlice = await sdkRecvPush(alice, bAid);
     expect(msgsAlice.length, 'Alice 应收到消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgsAlice[0], { text: 'hello_alice' }, 'B→A');
+    assertDecrypted(msgsAlice[0], { type: 'text', text: 'hello_alice' }, 'B→A');
   }, TEST_TIMEOUT);
 
   // ── 5. 连续发送多条消息（burst） ───────────────────────────
@@ -466,7 +466,7 @@ describe('E2EE 集成测试', () => {
 
     const N = 5;
     for (let i = 0; i < N; i++) {
-      await sdkSend(sender, rAid, { text: `burst_${i}`, seq: i });
+      await sdkSend(sender, rAid, { type: 'text', text: `burst_${i}`, seq: i });
     }
 
     // 等待服务端处理后 pull
@@ -492,7 +492,7 @@ describe('E2EE 集成测试', () => {
     await ensureConnected(receiver, rAid);
 
     // 第一条消息（使用旧 prekey）
-    await sdkSend(sender, rAid, { text: 'before_rotate', phase: 1 });
+    await sdkSend(sender, rAid, { type: 'text', text: 'before_rotate', phase: 1 });
 
     // Receiver 轮换 prekey
     const receiverInternal = receiver as ClientInternals;
@@ -502,7 +502,7 @@ describe('E2EE 集成测试', () => {
     sender.e2ee.invalidatePrekeyCache(rAid);
 
     // 第二条消息（使用新 prekey）
-    await sdkSend(sender, rAid, { text: 'after_rotate', phase: 2 });
+    await sdkSend(sender, rAid, { type: 'text', text: 'after_rotate', phase: 2 });
 
     // 等待处理后 pull
     await new Promise((r) => setTimeout(r, 2000));
@@ -538,7 +538,7 @@ describe('E2EE 集成测试', () => {
       }
     });
 
-    await sdkSend(sender, rAid, { text: 'dup_test' });
+    await sdkSend(sender, rAid, { type: 'text', text: 'dup_test' });
 
     // 等待推送
     const timer = setTimeout(() => resolveWait(), PUSH_TIMEOUT);
@@ -552,7 +552,7 @@ describe('E2EE 集成测试', () => {
     }
 
     expect(pushMsgs.length, '推送应恰好 1 条').toBe(1);
-    assertDecrypted(pushMsgs[0], { text: 'dup_test' }, 'push');
+    assertDecrypted(pushMsgs[0], { type: 'text', text: 'dup_test' }, 'push');
 
     // pull 不应重复解密已推送的消息（SDK 内置 seen set 防重放）
     const pullResult = await receiver.call('message.pull', { after_seq: 0, limit: 50 }) as JsonObject;
@@ -576,10 +576,10 @@ describe('E2EE 集成测试', () => {
     await ensureConnected(sdkClient, sdkAid);
 
     const rawE2ee = makeRawE2ee(rawClient);
-    await rawSend(rawClient, rawE2ee, sdkAid, { text: 'raw2sdk' });
+    await rawSend(rawClient, rawE2ee, sdkAid, { type: 'text', text: 'raw2sdk' });
     const msgs = await sdkRecvPush(sdkClient, rawAid);
     expect(msgs.length, 'SDK 应收到消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgs[0], { text: 'raw2sdk' });
+    assertDecrypted(msgs[0], { type: 'text', text: 'raw2sdk' });
   }, TEST_TIMEOUT);
 
   // ── 9. SDK → Raw WS ───────────────────────────────────────
@@ -597,9 +597,9 @@ describe('E2EE 集成测试', () => {
     const rawE2ee = makeRawE2ee(rawClient);
     const baseSeq = await currentMaxSeq(rawClient);
     const text = `sdk2raw_${Date.now()}`;
-    await sdkSend(sender, rAid, { text });
+    await sdkSend(sender, rAid, { type: 'text', text });
     const msg = await waitForRawPullMessage(rawClient, rawE2ee, sAid, baseSeq, text);
-    assertDecrypted(msg, { text });
+    assertDecrypted(msg, { type: 'text', text });
   }, TEST_TIMEOUT);
 
   // ── 10. Raw WS ↔ Raw WS ──────────────────────────────────
@@ -620,16 +620,16 @@ describe('E2EE 集成测试', () => {
     // A → B
     const baseSeqB = await currentMaxSeq(clientB);
     const textA2B = `raw_a2b_${Date.now()}`;
-    await rawSend(clientA, e2eeA, bAid, { text: textA2B });
+    await rawSend(clientA, e2eeA, bAid, { type: 'text', text: textA2B });
     const msgB = await waitForRawPullMessage(clientB, e2eeB, aAid, baseSeqB, textA2B);
-    assertDecrypted(msgB, { text: textA2B }, 'A→B');
+    assertDecrypted(msgB, { type: 'text', text: textA2B }, 'A→B');
 
     // B → A
     const baseSeqA = await currentMaxSeq(clientA);
     const textB2A = `raw_b2a_${Date.now()}`;
-    await rawSend(clientB, e2eeB, aAid, { text: textB2A });
+    await rawSend(clientB, e2eeB, aAid, { type: 'text', text: textB2A });
     const msgA = await waitForRawPullMessage(clientA, e2eeA, bAid, baseSeqA, textB2A);
-    assertDecrypted(msgA, { text: textB2A }, 'B→A');
+    assertDecrypted(msgA, { type: 'text', text: textB2A }, 'B→A');
   }, TEST_TIMEOUT);
 
   // ── 11. SDK ↔ Raw 混合双向 ────────────────────────────────
@@ -649,18 +649,18 @@ describe('E2EE 集成测试', () => {
     // SDK → Raw
     const rawBaseSeq = await currentMaxSeq(rawClient);
     const sdkToRawText = `sdk2raw_bidir_${Date.now()}`;
-    await sdkSend(sdkClient, rawAid, { text: sdkToRawText, dir: 'forward' });
+    await sdkSend(sdkClient, rawAid, { type: 'text', text: sdkToRawText, dir: 'forward' });
     const msgRaw = await waitForRawPullMessage(rawClient, rawE2ee, sdkAid, rawBaseSeq, sdkToRawText);
-    assertDecrypted(msgRaw, { text: sdkToRawText }, 'SDK→Raw');
+    assertDecrypted(msgRaw, { type: 'text', text: sdkToRawText }, 'SDK→Raw');
 
     // Raw → SDK
     const sdkBaseSeq = await currentMaxSeq(sdkClient);
     const rawToSdkText = `raw2sdk_bidir_${Date.now()}`;
-    await rawSend(rawClient, rawE2ee, sdkAid, { text: rawToSdkText, dir: 'reverse' });
+    await rawSend(rawClient, rawE2ee, sdkAid, { type: 'text', text: rawToSdkText, dir: 'reverse' });
     const msgsSdk = await sdkRecvPush(sdkClient, rawAid);
     const msgSdk = msgsSdk.find((msg) => String(((msg.payload as JsonObject).text) ?? '') === rawToSdkText)
       ?? await waitForSdkPullMessage(sdkClient, rawAid, sdkBaseSeq, rawToSdkText);
-    assertDecrypted(msgSdk, { text: rawToSdkText }, 'Raw→SDK');
+    assertDecrypted(msgSdk, { type: 'text', text: rawToSdkText }, 'Raw→SDK');
   }, TEST_TIMEOUT);
 
   // ── 12. Raw WS 连续发送（burst） ──────────────────────────
@@ -681,7 +681,7 @@ describe('E2EE 集成测试', () => {
 
     const N = 3;
     for (let i = 0; i < N; i++) {
-      await rawSend(sClient, sE2ee, rAid, { text: `raw_burst_${i}`, i });
+      await rawSend(sClient, sE2ee, rAid, { type: 'text', text: `raw_burst_${i}`, i });
     }
 
     await new Promise((r) => setTimeout(r, 2000));
@@ -727,11 +727,11 @@ describe('E2EE 集成测试', () => {
     });
 
     const text = `slot_isolation_${Date.now()}`;
-    await sdkSend(sender, rAid, { text });
+    await sdkSend(sender, rAid, { type: 'text', text });
     const msgA = await waitForSdkPullMessage(receiverSlotA, sAid, baseSeqA, text, 15_000);
     const msgB = await waitForSdkPullMessage(receiverSlotB, sAid, baseSeqB, text, 15_000);
-    assertDecrypted(msgA, { text }, 'slot-a');
-    assertDecrypted(msgB, { text }, 'slot-b');
+    assertDecrypted(msgA, { type: 'text', text }, 'slot-a');
+    assertDecrypted(msgB, { type: 'text', text }, 'slot-b');
     expect(Number(msgA.seq ?? 0)).toBe(Number(msgB.seq ?? 0));
 
     const ackA = await receiverSlotA.call('message.ack', { seq: msgA.seq }) as JsonObject;
@@ -779,13 +779,13 @@ describe('E2EE 集成测试', () => {
     const baseAliceSync = await currentMaxSeq(aliceSync);
     const text = `multi_device_sync_${Date.now()}`;
 
-    await sdkSend(aliceSeed, bobAid, { text, kind: 'multi-device' });
+    await sdkSend(aliceSeed, bobAid, { type: 'text', text, kind: 'multi-device' });
     const mainMsg = await waitForSdkPullMessage(bobSeed, aliceAid, baseMain, text, 20_000);
     const syncMsg = await waitForSdkPullMessage(bobSync, aliceAid, baseSync, text, 20_000);
     const aliceSyncMsg = await waitForSdkPullMessage(aliceSync, aliceAid, baseAliceSync, text, 20_000);
-    assertDecrypted(mainMsg, { text, kind: 'multi-device' }, 'bob-main');
-    assertDecrypted(syncMsg, { text, kind: 'multi-device' }, 'bob-sync');
-    assertDecrypted(aliceSyncMsg, { text, kind: 'multi-device' }, 'alice-sync');
+    assertDecrypted(mainMsg, { type: 'text', text, kind: 'multi-device' }, 'bob-main');
+    assertDecrypted(syncMsg, { type: 'text', text, kind: 'multi-device' }, 'bob-sync');
+    assertDecrypted(aliceSyncMsg, { type: 'text', text, kind: 'multi-device' }, 'alice-sync');
     expect(String(mainMsg.direction ?? '')).toBe('inbound');
     expect(String(syncMsg.direction ?? '')).toBe('inbound');
     expect(String(aliceSyncMsg.direction ?? '')).toBe('outbound_sync');
@@ -829,17 +829,17 @@ describe('E2EE 集成测试', () => {
     await new Promise((r) => setTimeout(r, 1000));
 
     const text = `multi_device_offline_${Date.now()}`;
-    await sdkSend(aliceMain, bobAid, { text, kind: 'offline-pull' });
+    await sdkSend(aliceMain, bobAid, { type: 'text', text, kind: 'offline-pull' });
 
     const onlineMsg = await waitForSdkPullMessage(bobPhone, aliceAid, onlineBase, text, 15_000);
-    assertDecrypted(onlineMsg, { text, kind: 'offline-pull' }, 'bob-phone-online');
+    assertDecrypted(onlineMsg, { type: 'text', text, kind: 'offline-pull' }, 'bob-phone-online');
     expect(String(onlineMsg.direction ?? '')).toBe('inbound');
 
     bobLaptop = makeClientAtPath(bobLaptopRoot);
     clients.push(bobLaptop);
     await ensureConnected(bobLaptop, bobAid);
     const offlineMsg = await waitForSdkPullMessage(bobLaptop, aliceAid, offlineBase, text, 15_000);
-    assertDecrypted(offlineMsg, { text, kind: 'offline-pull' }, 'bob-laptop-offline');
+    assertDecrypted(offlineMsg, { type: 'text', text, kind: 'offline-pull' }, 'bob-laptop-offline');
     expect(String(offlineMsg.direction ?? '')).toBe('inbound');
   }, TEST_TIMEOUT);
 });

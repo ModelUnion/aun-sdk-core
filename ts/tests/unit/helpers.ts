@@ -45,14 +45,14 @@ export class FakeKeystore implements KeyStore {
   saveIdentity(aid: string, identity: IdentityRecord): void {
     this._identities[aid] = identity;
   }
-  loadE2EEPrekeys(aid: string): PrekeyMap {
+  loadE2EEPrekeys(aid: string, deviceId?: string): PrekeyMap {
     return JSON.parse(JSON.stringify(this._prekeys[aid] ?? {}));
   }
-  saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord): void {
+  saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): void {
     this._prekeys[aid] ??= {};
     this._prekeys[aid][prekeyId] = JSON.parse(JSON.stringify(prekeyData));
   }
-  cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest: number = 7): string[] {
+  cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest: number = 7, deviceId?: string): string[] {
     const current = this._prekeys[aid] ?? {};
     const retainedIds = new Set(
       Object.entries(current)

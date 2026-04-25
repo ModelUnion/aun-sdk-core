@@ -26,7 +26,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, AuthError, RateLimitError
 from aun_core.config import get_device_id
 from aun_core.e2ee import E2EEManager
 
@@ -191,14 +191,23 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
         await client.auth.create_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    connect_params = dict(auth)
-    slot_id = str(getattr(client, "_test_slot_id", "") or "")
-    if slot_id:
-        connect_params["slot_id"] = slot_id
-    connect_params["auto_reconnect"] = False
-    await client.connect(connect_params)
-    return aid
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            auth = await client.auth.authenticate({"aid": aid})
+            connect_params = dict(auth)
+            slot_id = str(getattr(client, "_test_slot_id", "") or "")
+            if slot_id:
+                connect_params["slot_id"] = slot_id
+            connect_params["auto_reconnect"] = False
+            await client.connect(connect_params)
+            return aid
+        except (AuthError, RateLimitError) as exc:
+            last_error = exc
+            if attempt >= 3:
+                break
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_error or RuntimeError(f"{aid} connect failed")
 
 
 def _make_raw_e2ee(client: AUNClient) -> E2EEManager:
@@ -344,18 +353,71 @@ async def _wait_for_raw_pull_message(
 ) -> dict:
     deadline = asyncio.get_running_loop().time() + timeout
     last_messages: list[dict] = []
-    while asyncio.get_running_loop().time() < deadline:
-        messages = await _raw_recv_pull(client, e2ee, from_aid, after_seq=after_seq)
-        last_messages = messages
-        for message in messages:
-            payload = message.get("payload")
-            if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
-                return message
-        await asyncio.sleep(0.5)
+    inbox: list[dict] = []
+    event = asyncio.Event()
+
+    def _seq_of(message: dict) -> int:
+        try:
+            return int(message.get("seq") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _handle_raw(data):
+        if not isinstance(data, dict):
+            return
+        if data.get("from") != from_aid:
+            return
+        if _seq_of(data) <= after_seq:
+            return
+        decrypted = e2ee.decrypt_message(dict(data), source="push")
+        if decrypted is None:
+            return
+        inbox.append(decrypted)
+        event.set()
+
+    sub = client.on("_raw.message.received", _handle_raw)
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            if inbox:
+                last_messages = sorted(inbox, key=_seq_of)
+                for message in last_messages:
+                    payload = message.get("payload")
+                    if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
+                        return message
+            messages = await _raw_recv_pull(client, e2ee, from_aid, after_seq=after_seq)
+            last_messages = messages
+            for message in messages:
+                payload = message.get("payload")
+                if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
+                    return message
+            try:
+                await asyncio.wait_for(event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            event.clear()
+    finally:
+        sub.unsubscribe()
     raise AssertionError(
         f"timeout waiting for raw message text={expected_text!r} from={from_aid}; "
         f"last_messages={last_messages}"
     )
+
+
+async def _await_started(task: asyncio.Task) -> None:
+    await asyncio.sleep(0)
+
+
+async def _send_then_wait_raw(
+    wait_task: asyncio.Task,
+    send_coro,
+) -> dict:
+    await _await_started(wait_task)
+    try:
+        await send_coro
+        return await wait_task
+    except Exception:
+        wait_task.cancel()
+        raise
 
 
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
@@ -444,10 +506,10 @@ async def test_sdk_to_sdk_prekey():
         r_aid = await _ensure_connected(receiver, _BOBB_AID)
         base_seq = await _current_max_seq(receiver)
 
-        await _sdk_send(sender, r_aid, {"text": "sdk2sdk prekey", "n": 1})
+        await _sdk_send(sender, r_aid, {"type": "text", "text": "sdk2sdk prekey", "n": 1})
         msgs = await _sdk_recv_push_after(receiver, s_aid, after_seq=base_seq)
         assert len(msgs) >= 1
-        _assert_decrypted(msgs[0], {"text": "sdk2sdk prekey"})
+        _assert_decrypted(msgs[0], {"type": "text", "text": "sdk2sdk prekey"})
 
         print("[PASS] Test 2")
         return True
@@ -470,13 +532,13 @@ async def test_sdk_long_term_fallback():
             await receiver.auth.create_aid({"aid": r_aid})
         base_seq = await _current_max_seq(receiver)
 
-        await _sdk_send(sender, r_aid, {"text": "fallback"})
+        await _sdk_send(sender, r_aid, {"type": "text", "text": "fallback"})
 
         auth = await receiver.auth.authenticate({"aid": r_aid})
         await receiver.connect(auth)
         msgs = await _sdk_recv_pull(receiver, s_aid, after_seq=base_seq)
         assert len(msgs) >= 1
-        _assert_decrypted(msgs[0], {"text": "fallback"})
+        _assert_decrypted(msgs[0], {"type": "text", "text": "fallback"})
         assert msgs[0].get("e2ee", {}).get("encryption_mode") == "long_term_key"
 
         print("[PASS] Test 3")
@@ -499,7 +561,7 @@ async def test_raw_to_sdk():
         base_seq = await _current_max_seq(r_sdk)
         unique_text = f"raw2sdk_{int(asyncio.get_running_loop().time() * 1000)}"
 
-        await _raw_send(s_sdk, s_e2ee, r_aid, {"text": unique_text})
+        await _raw_send(s_sdk, s_e2ee, r_aid, {"type": "text", "text": unique_text})
         msgs = await _sdk_recv_push_after(r_sdk, s_aid, after_seq=base_seq)
         try:
             msg = _find_message_by_text(msgs, unique_text)
@@ -507,7 +569,7 @@ async def test_raw_to_sdk():
             msg = await _wait_for_sdk_pull_message(
                 r_sdk, s_aid, after_seq=base_seq, expected_text=unique_text,
             )
-        _assert_decrypted(msg, {"text": unique_text})
+        _assert_decrypted(msg, {"type": "text", "text": unique_text})
 
         print("[PASS] Test 4")
         return True
@@ -534,11 +596,14 @@ async def test_sdk_to_raw():
         base_seq = await _current_max_seq(r_sdk)
         unique_text = f"sdk2raw_{int(asyncio.get_running_loop().time() * 1000)}"
 
-        await _sdk_send(s_sdk, r_aid, {"text": unique_text})
-        msg = await _wait_for_raw_pull_message(
+        wait_task = asyncio.create_task(_wait_for_raw_pull_message(
             r_sdk, r_e2ee, s_aid, after_seq=base_seq, expected_text=unique_text,
+        ))
+        msg = await _send_then_wait_raw(
+            wait_task,
+            _sdk_send(s_sdk, r_aid, {"type": "text", "text": unique_text}),
         )
-        _assert_decrypted(msg, {"text": unique_text})
+        _assert_decrypted(msg, {"type": "text", "text": unique_text})
 
         print("[PASS] Test 5")
         return True
@@ -564,20 +629,26 @@ async def test_raw_to_raw():
         # A -> B
         base_seq_b = await _current_max_seq(b_sdk)
         text_a2b = f"raw_a2b_{run_id}"
-        await _raw_send(a_sdk, a_e2ee, b_aid, {"text": text_a2b})
-        msg_b = await _wait_for_raw_pull_message(
+        wait_b = asyncio.create_task(_wait_for_raw_pull_message(
             b_sdk, b_e2ee, a_aid, after_seq=base_seq_b, expected_text=text_a2b,
+        ))
+        msg_b = await _send_then_wait_raw(
+            wait_b,
+            _raw_send(a_sdk, a_e2ee, b_aid, {"type": "text", "text": text_a2b}),
         )
-        _assert_decrypted(msg_b, {"text": text_a2b}, "A->B")
+        _assert_decrypted(msg_b, {"type": "text", "text": text_a2b}, "A->B")
 
         # B -> A
         base_seq_a = await _current_max_seq(a_sdk)
         text_b2a = f"raw_b2a_{run_id}"
-        await _raw_send(b_sdk, b_e2ee, a_aid, {"text": text_b2a})
-        msg_a = await _wait_for_raw_pull_message(
+        wait_a = asyncio.create_task(_wait_for_raw_pull_message(
             a_sdk, a_e2ee, b_aid, after_seq=base_seq_a, expected_text=text_b2a,
+        ))
+        msg_a = await _send_then_wait_raw(
+            wait_a,
+            _raw_send(b_sdk, b_e2ee, a_aid, {"type": "text", "text": text_b2a}),
         )
-        _assert_decrypted(msg_a, {"text": text_b2a}, "B->A")
+        _assert_decrypted(msg_a, {"type": "text", "text": text_b2a}, "B->A")
 
         print("[PASS] Test 6")
         return True
@@ -602,17 +673,20 @@ async def test_bidirectional_mixed():
         # SDK -> Raw
         raw_base_seq = await _current_max_seq(raw_client)
         sdk_to_raw_text = f"sdk2raw_bidir_{run_id}"
-        await _sdk_send(sdk_client, raw_aid, {"text": sdk_to_raw_text, "dir": "forward"})
-        msg_raw = await _wait_for_raw_pull_message(
+        wait_raw = asyncio.create_task(_wait_for_raw_pull_message(
             raw_client, raw_e2ee, sdk_aid, after_seq=raw_base_seq, expected_text=sdk_to_raw_text,
+        ))
+        msg_raw = await _send_then_wait_raw(
+            wait_raw,
+            _sdk_send(sdk_client, raw_aid, {"type": "text", "text": sdk_to_raw_text, "dir": "forward"}),
         )
-        _assert_decrypted(msg_raw, {"text": sdk_to_raw_text}, "SDK->Raw")
+        _assert_decrypted(msg_raw, {"type": "text", "text": sdk_to_raw_text}, "SDK->Raw")
 
         # Raw -> SDK
         sdk_base_seq = await _current_max_seq(sdk_client)
         raw_to_sdk_text = f"raw2sdk_bidir_{run_id}"
         await _raw_send(
-            raw_client, raw_e2ee, sdk_aid, {"text": raw_to_sdk_text, "dir": "reverse"},
+            raw_client, raw_e2ee, sdk_aid, {"type": "text", "text": raw_to_sdk_text, "dir": "reverse"},
         )
         msgs_sdk = await _sdk_recv_push_after(sdk_client, raw_aid, after_seq=sdk_base_seq)
         try:
@@ -621,7 +695,7 @@ async def test_bidirectional_mixed():
             msg_sdk = await _wait_for_sdk_pull_message(
                 sdk_client, raw_aid, after_seq=sdk_base_seq, expected_text=raw_to_sdk_text,
             )
-        _assert_decrypted(msg_sdk, {"text": raw_to_sdk_text}, "Raw->SDK")
+        _assert_decrypted(msg_sdk, {"type": "text", "text": raw_to_sdk_text}, "Raw->SDK")
 
         print("[PASS] Test 7")
         return True
@@ -644,7 +718,7 @@ async def test_multi_message_burst():
 
         N = 5
         for i in range(N):
-            await _sdk_send(sender, r_aid, {"text": f"burst_{i}", "seq": i})
+            await _sdk_send(sender, r_aid, {"type": "text", "text": f"burst_{i}", "seq": i})
 
         await asyncio.sleep(2)
         msgs = await _sdk_recv_pull(receiver, s_aid, after_seq=base_seq)
@@ -673,12 +747,12 @@ async def test_prekey_rotation_in_flight():
         r_aid = await _ensure_connected(receiver, _BOBB_AID)
         base_seq = await _current_max_seq(receiver)
 
-        await _sdk_send(sender, r_aid, {"text": "before_rotate", "phase": 1})
+        await _sdk_send(sender, r_aid, {"type": "text", "text": "before_rotate", "phase": 1})
 
         # Receiver rotates prekey
         await receiver._upload_prekey()
 
-        await _sdk_send(sender, r_aid, {"text": "after_rotate", "phase": 2})
+        await _sdk_send(sender, r_aid, {"type": "text", "text": "after_rotate", "phase": 2})
 
         await asyncio.sleep(2)
         msgs = await _sdk_recv_pull(receiver, s_aid, after_seq=base_seq)
@@ -726,7 +800,7 @@ async def test_push_then_pull_no_duplicate():
 
         sub = receiver.on("message.received", handler)
 
-        await _sdk_send(sender, r_aid, {"text": "dup_test"})
+        await _sdk_send(sender, r_aid, {"type": "text", "text": "dup_test"})
         try:
             await asyncio.wait_for(push_event.wait(), timeout=5.0)
         except asyncio.TimeoutError:
@@ -738,7 +812,7 @@ async def test_push_then_pull_no_duplicate():
             return True
 
         assert len(push_msgs) == 1
-        _assert_decrypted(push_msgs[0], {"text": "dup_test"}, "push")
+        _assert_decrypted(push_msgs[0], {"type": "text", "text": "dup_test"}, "push")
 
         pull_result = await receiver.call("message.pull", {"after_seq": base_seq, "limit": 50})
         pull_msgs = [m for m in pull_result.get("messages", [])
@@ -764,16 +838,16 @@ async def test_sdk_to_sdk_bidirectional():
         b_aid = await _ensure_connected(bob, _BOBB_AID)
 
         bob_base_seq = await _current_max_seq(bob)
-        await _sdk_send(alice, b_aid, {"text": "hello_bob", "from": "alice"})
+        await _sdk_send(alice, b_aid, {"type": "text", "text": "hello_bob", "from": "alice"})
         msgs_bob = await _sdk_recv_push_after(bob, a_aid, after_seq=bob_base_seq)
         assert len(msgs_bob) >= 1
-        _assert_decrypted(msgs_bob[0], {"text": "hello_bob"}, "A->B")
+        _assert_decrypted(msgs_bob[0], {"type": "text", "text": "hello_bob"}, "A->B")
 
         alice_base_seq = await _current_max_seq(alice)
-        await _sdk_send(bob, a_aid, {"text": "hello_alice", "from": "bob"})
+        await _sdk_send(bob, a_aid, {"type": "text", "text": "hello_alice", "from": "bob"})
         msgs_alice = await _sdk_recv_push_after(alice, b_aid, after_seq=alice_base_seq)
         assert len(msgs_alice) >= 1
-        _assert_decrypted(msgs_alice[0], {"text": "hello_alice"}, "B->A")
+        _assert_decrypted(msgs_alice[0], {"type": "text", "text": "hello_alice"}, "B->A")
 
         print("[PASS] Test 11")
         return True
@@ -838,7 +912,7 @@ async def test_same_aid_slots_ack_isolated():
         sub = sender.on("message.ack", _on_ack)
         try:
             unique_text = f"slot_isolation_{int(asyncio.get_running_loop().time() * 1000)}"
-            await _sdk_send(sender, r_aid, {"text": unique_text})
+            await _sdk_send(sender, r_aid, {"type": "text", "text": unique_text})
 
             msg_a = await _wait_for_sdk_pull_message(
                 receiver_slot_a, s_aid, after_seq=base_seq_a, expected_text=unique_text,
@@ -846,8 +920,8 @@ async def test_same_aid_slots_ack_isolated():
             msg_b = await _wait_for_sdk_pull_message(
                 receiver_slot_b, s_aid, after_seq=base_seq_b, expected_text=unique_text,
             )
-            _assert_decrypted(msg_a, {"text": unique_text}, "slot-a")
-            _assert_decrypted(msg_b, {"text": unique_text}, "slot-b")
+            _assert_decrypted(msg_a, {"type": "text", "text": unique_text}, "slot-a")
+            _assert_decrypted(msg_b, {"type": "text", "text": unique_text}, "slot-b")
             assert int(msg_a.get("seq") or 0) == int(msg_b.get("seq") or 0), "同 AID 不同 slot 的 seq 应一致"
 
             ack_a = await receiver_slot_a.call("message.ack", {"seq": msg_a["seq"]})
@@ -894,7 +968,7 @@ async def test_raw_multi_message():
         N = 3
         expected_texts = [f"raw_burst_{run_id}_{i}" for i in range(N)]
         for i in range(N):
-            await _raw_send(s_sdk, s_e2ee, r_aid, {"text": expected_texts[i], "i": i, "run_id": run_id})
+            await _raw_send(s_sdk, s_e2ee, r_aid, {"type": "text", "text": expected_texts[i], "i": i, "run_id": run_id})
 
         expected_set = set(expected_texts)
         matched: dict[str, dict] = {}
@@ -913,7 +987,7 @@ async def test_raw_multi_message():
 
         assert set(matched) == expected_set, f"mismatch: matched={sorted(matched)} expected={sorted(expected_set)}"
         for i, text in enumerate(expected_texts):
-            _assert_decrypted(matched[text], {"text": text, "i": i}, f"burst-{i}")
+            _assert_decrypted(matched[text], {"type": "text", "text": text, "i": i}, f"burst-{i}")
 
         print(f"[PASS] Test 13 ({len(matched)}/{N})")
         return True
@@ -984,7 +1058,7 @@ async def test_multi_device_recipient_and_self_sync():
         sub_phone = bob_phone.on("message.received", _capture_push(phone_push, phone_event))
         sub_laptop = bob_laptop.on("message.received", _capture_push(laptop_push, laptop_event))
         try:
-            result = await _sdk_send(alice_main, _BOBB_AID, {"text": text, "kind": "multi-device"})
+            result = await _sdk_send(alice_main, _BOBB_AID, {"type": "text", "text": text, "kind": "multi-device"})
             assert result.get("status") in {"sent", "delivered"}
             await asyncio.wait_for(phone_event.wait(), timeout=10.0)
             await asyncio.wait_for(laptop_event.wait(), timeout=10.0)
@@ -999,9 +1073,9 @@ async def test_multi_device_recipient_and_self_sync():
             alice_sync, _ALICE_AID, after_seq=base_sync, expected_text=text,
         )
 
-        _assert_decrypted(phone_msg, {"text": text, "kind": "multi-device"}, "bob-phone")
-        _assert_decrypted(laptop_msg, {"text": text, "kind": "multi-device"}, "bob-laptop")
-        _assert_decrypted(sync_msg, {"text": text, "kind": "multi-device"}, "alice-sync")
+        _assert_decrypted(phone_msg, {"type": "text", "text": text, "kind": "multi-device"}, "bob-phone")
+        _assert_decrypted(laptop_msg, {"type": "text", "text": text, "kind": "multi-device"}, "bob-laptop")
+        _assert_decrypted(sync_msg, {"type": "text", "text": text, "kind": "multi-device"}, "alice-sync")
         assert phone_msg.get("direction") == "inbound"
         assert laptop_msg.get("direction") == "inbound"
         assert sync_msg.get("direction") == "outbound_sync"
@@ -1059,13 +1133,13 @@ async def test_multi_device_offline_pull():
         await asyncio.sleep(1.0)
 
         text = f"multi_device_offline_{int(asyncio.get_running_loop().time() * 1000)}"
-        result = await _sdk_send(alice_main, _BOBB_AID, {"text": text, "kind": "offline-pull"})
+        result = await _sdk_send(alice_main, _BOBB_AID, {"type": "text", "text": text, "kind": "offline-pull"})
         assert result.get("status") in {"sent", "delivered"}
 
         online_msg = await _wait_for_sdk_pull_message(
             bob_phone, _ALICE_AID, after_seq=online_base, expected_text=text,
         )
-        _assert_decrypted(online_msg, {"text": text, "kind": "offline-pull"}, "bob-phone-online")
+        _assert_decrypted(online_msg, {"type": "text", "text": text, "kind": "offline-pull"}, "bob-phone-online")
         assert online_msg.get("direction") == "inbound"
 
         bob_laptop = _make_isolated_client("bob-laptop")
@@ -1073,7 +1147,7 @@ async def test_multi_device_offline_pull():
         offline_msg = await _wait_for_sdk_pull_message(
             bob_laptop, _ALICE_AID, after_seq=offline_base, expected_text=text, timeout=15.0,
         )
-        _assert_decrypted(offline_msg, {"text": text, "kind": "offline-pull"}, "bob-laptop-offline")
+        _assert_decrypted(offline_msg, {"type": "text", "text": text, "kind": "offline-pull"}, "bob-laptop-offline")
         assert offline_msg.get("direction") == "inbound"
 
         print("[PASS] Test 15")

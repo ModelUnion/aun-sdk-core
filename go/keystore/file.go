@@ -468,18 +468,7 @@ func (f *FileKeyStore) loadCertUnlocked(aid string) (string, error) {
 
 // ── Prekeys ──────────────────────────────────────────────────
 
-func (f *FileKeyStore) LoadE2EEPrekeys(aid string) (map[string]map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.LoadPrekeys(""), nil
-}
-
-func (f *FileKeyStore) LoadE2EEPrekeysForDevice(aid, deviceID string) (map[string]map[string]any, error) {
+func (f *FileKeyStore) LoadE2EEPrekeys(aid, deviceID string) (map[string]map[string]any, error) {
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -490,33 +479,7 @@ func (f *FileKeyStore) LoadE2EEPrekeysForDevice(aid, deviceID string) (map[strin
 	return db.LoadPrekeys(strings.TrimSpace(deviceID)), nil
 }
 
-func (f *FileKeyStore) SaveE2EEPrekey(aid, prekeyID string, prekeyData map[string]any) error {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return err
-	}
-	pem, _ := prekeyData["private_key_pem"].(string)
-	extra := make(map[string]any)
-	for k, v := range prekeyData {
-		if k != "private_key_pem" && k != "created_at" && k != "updated_at" && k != "expires_at" {
-			extra[k] = v
-		}
-	}
-	var ca, ea *int64
-	if v, ok := int64OrNil(prekeyData["created_at"]); ok {
-		ca = &v
-	}
-	if v, ok := int64OrNil(prekeyData["expires_at"]); ok {
-		ea = &v
-	}
-	db.SavePrekey(prekeyID, pem, "", ca, ea, extra)
-	return nil
-}
-
-func (f *FileKeyStore) SaveE2EEPrekeyForDevice(aid, deviceID, prekeyID string, prekeyData map[string]any) error {
+func (f *FileKeyStore) SaveE2EEPrekey(aid, prekeyID, deviceID string, prekeyData map[string]any) error {
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -542,18 +505,7 @@ func (f *FileKeyStore) SaveE2EEPrekeyForDevice(aid, deviceID, prekeyID string, p
 	return nil
 }
 
-func (f *FileKeyStore) CleanupE2EEPrekeys(aid string, cutoffMs int64, keepLatest int) ([]string, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	return db.CleanupPrekeys("", cutoffMs, keepLatest), nil
-}
-
-func (f *FileKeyStore) CleanupE2EEPrekeysForDevice(aid, deviceID string, cutoffMs int64, keepLatest int) ([]string, error) {
+func (f *FileKeyStore) CleanupE2EEPrekeys(aid, deviceID string, cutoffMs int64, keepLatest int) ([]string, error) {
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()

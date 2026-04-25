@@ -32,7 +32,7 @@ async def main():
     # ── 1. Sender 发送加密消息（默认自动加密，SDK 自动处理） ──
     result = await sender.call("message.send", {
         "to": receiver_aid,
-        "payload": {"text": "这是一条加密消息", "secret_data": "仅接收方可见"},
+        "payload": {"type": "text", "text": "这是一条加密消息", "secret_data": "仅接收方可见"},
     })
     print(f"[1] 发送完成: seq={result.get('seq')}")
 

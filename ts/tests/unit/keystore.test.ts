@@ -366,27 +366,27 @@ describe('FileKeyStore', () => {
     const now = Date.now();
     const cutoffMs = now - (7 * 24 * 3600 * 1000);
 
-    ks.saveE2EEPrekeyForDevice!('device.aid', 'phone', 'pk-same', {
+    ks.saveE2EEPrekey('device.aid', 'pk-same', {
       private_key_pem: 'PHONE',
       created_at: cutoffMs - 1000,
-    });
-    ks.saveE2EEPrekeyForDevice!('device.aid', 'laptop', 'pk-same', {
+    }, 'phone');
+    ks.saveE2EEPrekey('device.aid', 'pk-same', {
       private_key_pem: 'LAPTOP',
       created_at: cutoffMs - 1000,
-    });
+    }, 'laptop');
 
-    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'phone')).toMatchObject({
+    expect(ks.loadE2EEPrekeys('device.aid', 'phone')).toMatchObject({
       'pk-same': { private_key_pem: 'PHONE', created_at: cutoffMs - 1000 },
     });
-    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'laptop')).toMatchObject({
+    expect(ks.loadE2EEPrekeys('device.aid', 'laptop')).toMatchObject({
       'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
     });
     expect(ks.loadE2EEPrekeys('device.aid')).toEqual({});
 
-    const removed = ks.cleanupE2EEPrekeysForDevice!('device.aid', 'phone', cutoffMs, 0);
+    const removed = ks.cleanupE2EEPrekeys('device.aid', cutoffMs, 0, 'phone');
     expect(removed).toEqual(['pk-same']);
-    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'phone')).toEqual({});
-    expect(ks.loadE2EEPrekeysForDevice!('device.aid', 'laptop')).toMatchObject({
+    expect(ks.loadE2EEPrekeys('device.aid', 'phone')).toEqual({});
+    expect(ks.loadE2EEPrekeys('device.aid', 'laptop')).toMatchObject({
       'pk-same': { private_key_pem: 'LAPTOP', created_at: cutoffMs - 1000 },
     });
   });

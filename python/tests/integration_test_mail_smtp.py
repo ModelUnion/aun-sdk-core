@@ -102,6 +102,7 @@ _KITE_HOST = os.environ.get("AUN_TEST_KITE_HOST", f"gateway.{_ISSUER}").strip()
 _SMTP_INBOUND_PORT = int(os.environ.get("MAIL_SMTP_INBOUND_PORT", "2525"))
 _SMTP_SUBMISSION_PORT = int(os.environ.get("MAIL_SUBMISSION_PORT", "587"))
 _IMAP_PORT = int(os.environ.get("MAIL_IMAP_PORT", "1143"))
+_IMAP_TIMEOUT = int(os.environ.get("MAIL_IMAP_TIMEOUT", "10"))
 
 # Mailpit REST API（Docker 容器内连接 kite-mailpit）
 _MAILPIT_HOST = os.environ.get("MAILPIT_HOST", "kite-mailpit").strip()
@@ -204,6 +205,29 @@ def _aid_to_email(aid: str) -> str:
         domain = ".".join(parts[-2:])
         return f"{local}@{domain}"
     return aid
+
+
+async def _wait_mail_subject(
+    client: AUNClient,
+    mailbox: str,
+    subject: str,
+    *,
+    timeout: float = 8.0,
+    limit: int = 200,
+) -> dict | None:
+    deadline = time.time() + timeout
+    while True:
+        box = await client.call("mail.list", {"mailbox": mailbox, "limit": limit})
+        found = next((m for m in box.get("messages", []) if m.get("subject") == subject), None)
+        if found:
+            return found
+        if time.time() >= deadline:
+            return None
+        await asyncio.sleep(0.3)
+
+
+def _open_imap() -> imaplib.IMAP4:
+    return imaplib.IMAP4(_KITE_HOST, _IMAP_PORT, timeout=_IMAP_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -431,15 +455,35 @@ async def test_smtp_inbound_mime_parse(alice: AUNClient, subject: str):
 # ---------------------------------------------------------------------------
 
 _app_password = None  # 在测试开始前创建
+_app_password_id = None
+
+
+def _is_test_app_password(item: dict) -> bool:
+    name = str(item.get("name") or "")
+    return name in {"TestClient", "test-imap"} or name.startswith("AUN_TEST_")
+
+
+async def _cleanup_test_app_passwords(client: AUNClient):
+    try:
+        list_result = await client.call("mail.list_app_passwords", {})
+        for item in list_result.get("passwords", []):
+            if _is_test_app_password(item) and item.get("id"):
+                await client.call("mail.revoke_app_password", {"id": item["id"]})
+    except Exception as e:
+        print(f"  [WARN] 清理测试应用专用密码失败: {e}")
 
 
 async def _create_app_password(alice: AUNClient):
     """创建应用专用密码供 IMAP/SMTP AUTH 测试使用"""
-    global _app_password
+    global _app_password, _app_password_id
     try:
-        result = await alice.call("mail.create_app_password", {"name": "test-imap"})
+        await _cleanup_test_app_passwords(alice)
+        result = await alice.call("mail.create_app_password", {
+            "name": f"AUN_TEST_IMAP_{int(time.time() * 1000)}",
+        })
         if result.get("ok"):
             _app_password = result.get("password")
+            _app_password_id = result.get("id")
             print(f"  [INFO] 创建应用专用密码: {_app_password[:8]}...")
         else:
             print(f"  [WARN] 创建应用专用密码失败: {result}")
@@ -458,6 +502,18 @@ async def _create_app_password(alice: AUNClient):
             print(f"  [WARN] 创建应用专用密码失败: {e}")
 
 
+async def _revoke_created_app_password(alice: AUNClient):
+    global _app_password_id
+    if not _app_password_id:
+        return
+    try:
+        await alice.call("mail.revoke_app_password", {"id": _app_password_id})
+    except Exception as e:
+        print(f"  [WARN] 撤销测试应用专用密码失败: {e}")
+    finally:
+        _app_password_id = None
+
+
 def test_imap_login_success():
     """T5.1: imaplib LOGIN 用 app_password 成功"""
     name = "T5.1 IMAP LOGIN 成功"
@@ -466,7 +522,7 @@ def test_imap_login_success():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         alice_email = _aid_to_email(_ALICE_AID)
         status, data = imap.login(alice_email, _app_password)
         if status == "OK":
@@ -482,7 +538,7 @@ def test_imap_login_fail():
     """T5.2: imaplib LOGIN 用错误密码失败"""
     name = "T5.2 IMAP LOGIN 失败"
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         alice_email = _aid_to_email(_ALICE_AID)
         try:
             status, data = imap.login(alice_email, "WRONG-PASS-XXXX")
@@ -505,7 +561,7 @@ def test_imap_list():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
 
         status, data = imap.list()
@@ -544,7 +600,7 @@ def test_imap_select():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
 
         status, data = imap.select("INBOX")
@@ -568,7 +624,7 @@ def test_imap_fetch():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
         imap.select("INBOX")
 
@@ -601,7 +657,7 @@ def test_imap_store():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
         imap.select("INBOX")
 
@@ -633,7 +689,7 @@ def test_imap_search():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
         imap.select("INBOX")
 
@@ -659,7 +715,7 @@ def test_imap_copy():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
         imap.select("INBOX")
 
@@ -691,7 +747,7 @@ def test_imap_expunge():
         return
 
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
         imap.select("INBOX")
 
@@ -736,6 +792,9 @@ def test_smtp_submission_auth():
         msg["Subject"] = f"Submission {ts}"
 
         with smtplib.SMTP(_KITE_HOST, _SMTP_SUBMISSION_PORT, timeout=10) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
             smtp.login(alice_email, _app_password)
             smtp.sendmail(alice_email, [bobb_email], msg.as_string())
 
@@ -963,7 +1022,7 @@ async def test_attachment_imap_fetch(alice: AUNClient):
         _skip(name, "无应用专用密码")
         return
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
         imap.select("INBOX")
         status, data = imap.search(None, "ALL")
@@ -1003,9 +1062,7 @@ async def test_bcc_recipient_receives(alice: AUNClient, bob: AUNClient):
             _fail(name, f"发送失败: {result}")
             return
 
-        await asyncio.sleep(0.5)
-        inbox = await bob.call("mail.list", {"mailbox": "inbox", "limit": 50})
-        found = next((m for m in inbox.get("messages", []) if m.get("subject") == subject), None)
+        found = await _wait_mail_subject(bob, "inbox", subject)
         if found:
             _ok(name)
         else:
@@ -1026,10 +1083,7 @@ async def test_bcc_not_exposed_to_recipient(alice: AUNClient, bob: AUNClient):
             "subject": subject,
             "body": "bcc hidden test",
         })
-        await asyncio.sleep(0.5)
-
-        inbox = await bob.call("mail.list", {"mailbox": "inbox", "limit": 50})
-        found = next((m for m in inbox.get("messages", []) if m.get("subject") == subject), None)
+        found = await _wait_mail_subject(bob, "inbox", subject)
         if not found:
             _fail(name, "inbox 未找到邮件")
             return
@@ -1056,10 +1110,7 @@ async def test_bcc_in_sent(alice: AUNClient):
             "subject": subject,
             "body": "bcc sent test",
         })
-        await asyncio.sleep(0.5)
-
-        sent = await alice.call("mail.list", {"mailbox": "sent", "limit": 50})
-        found = next((m for m in sent.get("messages", []) if m.get("subject") == subject), None)
+        found = await _wait_mail_subject(alice, "sent", subject)
         if not found:
             _fail(name, "sent 未找到邮件")
             return
@@ -1282,7 +1333,7 @@ def test_imap_append():
             f"Appended message body {ts}"
         ).encode("utf-8")
 
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
 
         status, data = imap.append("Sent", None, None, mime_msg)
@@ -1308,7 +1359,7 @@ def test_imap_delete_mailbox():
         _skip(name, "无应用专用密码")
         return
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
 
         # 先 CREATE 一个临时邮箱
@@ -1330,7 +1381,7 @@ def test_imap_rename_mailbox():
         _skip(name, "无应用专用密码")
         return
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
 
         imap.create("TestRenameOld")
@@ -1353,7 +1404,7 @@ def test_imap_namespace():
         _skip(name, "无应用专用密码")
         return
     try:
-        imap = imaplib.IMAP4(_KITE_HOST, _IMAP_PORT)
+        imap = _open_imap()
         imap.login(_aid_to_email(_ALICE_AID), _app_password)
 
         status, data = imap.namespace()
@@ -1677,6 +1728,8 @@ async def main():
     await test_spam_landed_in_junk(alice_client, spam_subject)
     clean_subject = test_spam_clean_mail_to_inbox()
     await test_clean_mail_in_inbox(alice_client, clean_subject)
+
+    await _revoke_created_app_password(alice_client)
 
     # 断开连接
     await alice_client.close()

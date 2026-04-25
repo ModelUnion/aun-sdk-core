@@ -81,7 +81,7 @@ func TestFederationSDKToSDKPrekey(t *testing.T) {
 
 	result, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
-		"payload": map[string]any{"text": text},
+		"payload": map[string]any{"type": "text", "text": text},
 		"encrypt": true,
 	})
 	if err != nil {
@@ -176,7 +176,7 @@ func TestFederationGroupBasicFlow(t *testing.T) {
 
 	send1, err := alice.Call(ctx, "group.send", map[string]any{
 		"group_id": groupID,
-		"payload":  map[string]any{"text": fmt.Sprintf("go-group-msg-1-%s", rid)},
+		"payload":  map[string]any{"type": "text", "text": fmt.Sprintf("go-group-msg-1-%s", rid)},
 		"encrypt":  false,
 	})
 	if err != nil {
@@ -251,7 +251,7 @@ func TestFederationGroupBasicFlow(t *testing.T) {
 	want2 := fmt.Sprintf("go-group-msg-2-%s", rid)
 	if _, err := alice.Call(ctx, "group.send", map[string]any{
 		"group_id": groupID,
-		"payload":  map[string]any{"text": want2},
+		"payload":  map[string]any{"type": "text", "text": want2},
 		"encrypt":  false,
 	}); err != nil {
 		t.Fatalf("第二条群消息发送失败: %v", err)

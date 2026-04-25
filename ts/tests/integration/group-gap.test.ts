@@ -92,7 +92,7 @@ describe('Group Message Gap Fill', { timeout: 60000 }, () => {
     for (let i = 1; i <= 5; i++) {
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: `group_msg${i}` },
+        payload: { type: 'text', text: `group_msg${i}` },
         encrypt: false,
       });
       await new Promise(r => setTimeout(r, 200));

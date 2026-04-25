@@ -164,7 +164,7 @@ await client.connect(auth, {
 # 发送加密消息（默认行为，无需传 encrypt）
 await client.call("message.send", {
     "to": "bob.agentid.pub",
-    "payload": {"text": "秘密消息"},
+    "payload": {"type": "text", "text": "秘密消息"},
 })
 
 # 接收并自动解密（SDK 会自动带当前实例的 device_id / slot_id）
@@ -175,7 +175,7 @@ for msg in result["messages"]:
 # 发送明文消息（需显式关闭加密）
 await client.call("message.send", {
     "to": "bob.agentid.pub",
-    "payload": {"text": "Hello"},
+    "payload": {"type": "text", "text": "Hello"},
     "encrypt": False,
 })
 ```

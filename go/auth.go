@@ -513,10 +513,16 @@ func (a *AuthFlow) VerifyPeerCertificate(ctx context.Context, gatewayURL string,
 		return err
 	}
 	if err := a.verifyAuthCertRevocation(ctx, gatewayURL, cert, expectedAID); err != nil {
-		return NewAuthError(fmt.Sprintf("peer cert CRL check failed: %v", err))
+		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
+			return NewAuthError(fmt.Sprintf("peer cert CRL check failed: %v", err))
+		}
+		log.Printf("[auth] CRL 检查不可用，降级继续: %v", err)
 	}
 	if err := a.verifyAuthCertOCSP(ctx, gatewayURL, cert, expectedAID); err != nil {
-		return NewAuthError(fmt.Sprintf("peer cert OCSP check failed: %v", err))
+		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
+			return NewAuthError(fmt.Sprintf("peer cert OCSP check failed: %v", err))
+		}
+		log.Printf("[auth] OCSP 检查不可用，降级继续: %v", err)
 	}
 	// CN 必须匹配 expectedAID
 	if cert.Subject.CommonName != expectedAID {
@@ -718,11 +724,17 @@ func (a *AuthFlow) verifyPhase1Response(ctx context.Context, gatewayURL string, 
 	}
 	// CRL 验证
 	if err := a.verifyAuthCertRevocation(ctx, gatewayURL, authCert, ""); err != nil {
-		return err
+		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
+			return err
+		}
+		log.Printf("[auth] CRL 检查不可用，降级继续: %v", err)
 	}
 	// OCSP 验证
 	if err := a.verifyAuthCertOCSP(ctx, gatewayURL, authCert, ""); err != nil {
-		return err
+		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
+			return err
+		}
+		log.Printf("[auth] OCSP 检查不可用，降级继续: %v", err)
 	}
 
 	// 验证 client_nonce 签名
@@ -1218,12 +1230,19 @@ func (a *AuthFlow) validateNewCert(ctx context.Context, identity map[string]any,
 			return
 		}
 		if err := a.verifyAuthCertRevocation(ctx, gatewayURL, cert, ""); err != nil {
-			log.Printf("拒绝服务端返回的 new_cert (%s): CRL 验证失败 %v", aid, err)
-			return
+			if strings.Contains(strings.ToLower(err.Error()), "revoked") {
+				log.Printf("拒绝服务端返回的 new_cert (%s): CRL 验证失败 %v", aid, err)
+				return
+			}
+			log.Printf("[auth] CRL 检查不可用，降级继续: %v", err)
 		}
-		// OCSP 不可用时降级（CRL 已检查）
+		// OCSP 不可用时降级
 		if err := a.verifyAuthCertOCSP(ctx, gatewayURL, cert, ""); err != nil {
-			log.Printf("[aun_core.auth] OCSP 校验不可用，降级继续 (CRL 已检查): %v", err)
+			if strings.Contains(strings.ToLower(err.Error()), "revoked") {
+				log.Printf("拒绝服务端返回的 new_cert (%s): OCSP 验证失败 %v", aid, err)
+				return
+			}
+			log.Printf("[auth] OCSP 检查不可用，降级继续: %v", err)
 		}
 	}
 

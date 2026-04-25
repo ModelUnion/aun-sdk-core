@@ -462,7 +462,7 @@ describe('群组消息加密/解密往返', () => {
       const timestamp = Date.now();
 
       // 加密
-      const payload = { text: 'Hello, group!', num: 42 };
+      const payload = { type: 'text', text: 'Hello, group!', num: 42 };
       const envelope = await encryptGroupMessage(groupId, epoch, secret, payload, {
         fromAid: 'alice',
         messageId,
@@ -503,7 +503,7 @@ describe('群组消息加密/解密往返', () => {
       const secret = generateGroupSecret();
       const wrongSecret = generateGroupSecret();
 
-      const envelope = await encryptGroupMessage('g1', 1, secret, { text: 'hi' }, {
+      const envelope = await encryptGroupMessage('g1', 1, secret, { type: 'text', text: 'hi' }, {
         fromAid: 'alice',
         messageId: 'msg-1',
         timestamp: Date.now(),
@@ -522,7 +522,7 @@ describe('群组消息加密/解密往返', () => {
     '错误的 epoch 应解密失败',
     async () => {
       const secret = generateGroupSecret();
-      const envelope = await encryptGroupMessage('g1', 1, secret, { text: 'hi' }, {
+      const envelope = await encryptGroupMessage('g1', 1, secret, { type: 'text', text: 'hi' }, {
         fromAid: 'alice',
         messageId: 'msg-1',
         timestamp: Date.now(),
@@ -802,7 +802,7 @@ describe('GroupE2EEManager', () => {
         keystore: ks,
       });
 
-      await expect(manager.encrypt('nonexistent-group', { text: 'hi' }))
+      await expect(manager.encrypt('nonexistent-group', { type: 'text', text: 'hi' }))
         .rejects.toThrow(E2EEGroupSecretMissingError);
     },
   );
@@ -822,7 +822,7 @@ describe('GroupE2EEManager', () => {
       });
 
       await manager.createEpoch('g1', ['alice', 'bob']);
-      const envelope = await manager.encrypt('g1', { text: 'hello group' });
+      const envelope = await manager.encrypt('g1', { type: 'text', text: 'hello group' });
 
       expect(envelope.type).toBe('e2ee.group_encrypted');
       expect(envelope.encryption_mode).toBe(MODE_EPOCH_GROUP_KEY);
@@ -882,7 +882,7 @@ describe('encryptGroupMessage 签名失败应抛出错误（ISSUE-SDK-JS-011/019
     async () => {
       const secret = generateGroupSecret();
       await expect(
-        encryptGroupMessage('grp-1', 1, secret, { text: 'test' }, {
+        encryptGroupMessage('grp-1', 1, secret, { type: 'text', text: 'test' }, {
           fromAid: 'alice.test',
           messageId: 'msg-1',
           timestamp: Date.now(),

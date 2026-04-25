@@ -339,7 +339,7 @@ func TestCallRejectsMessageSendToGroupService(t *testing.T) {
 
 	_, err := c.Call(context.Background(), "message.send", map[string]any{
 		"to":      "group.example.com",
-		"payload": map[string]any{"text": "hello"},
+		"payload": map[string]any{"type": "text", "text": "hello"},
 		"encrypt": false,
 	})
 	if err == nil {
@@ -359,7 +359,7 @@ func TestCallRejectsMessageSendDeliveryModeOverride(t *testing.T) {
 
 	_, err := c.Call(context.Background(), "message.send", map[string]any{
 		"to":            "bob.example.com",
-		"payload":       map[string]any{"text": "hello"},
+		"payload":       map[string]any{"type": "text", "text": "hello"},
 		"encrypt":       false,
 		"delivery_mode": map[string]any{"mode": "queue"},
 	})
@@ -559,7 +559,7 @@ func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
 
 	if _, err := c.Call(ctx, "message.send", map[string]any{
 		"to":      "bob.example.com",
-		"payload": map[string]any{"text": "hello"},
+		"payload": map[string]any{"type": "text", "text": "hello"},
 		"encrypt": false,
 	}); err != nil {
 		t.Fatalf("message.send 失败: %v", err)
@@ -858,7 +858,7 @@ func TestClientGroupE2EE_EncryptNoSecret(t *testing.T) {
 	c.identity = map[string]any{"aid": "alice.test"}
 	c.mu.Unlock()
 
-	_, err := c.GroupE2EE().Encrypt("non-existent-group", map[string]any{"text": "hello"})
+	_, err := c.GroupE2EE().Encrypt("non-existent-group", map[string]any{"type": "text", "text": "hello"})
 	if err == nil {
 		t.Error("无密钥时加密应返回错误")
 	}
@@ -1065,7 +1065,7 @@ func TestSendEncryptedUsesMultiDevicePayloadWhenNeeded(t *testing.T) {
 
 	result, err := c.Call(ctx, "message.send", map[string]any{
 		"to":      receiverAID,
-		"payload": map[string]any{"text": "hello"},
+		"payload": map[string]any{"type": "text", "text": "hello"},
 	})
 	if err != nil {
 		t.Fatalf("message.send 失败: %v", err)
@@ -1184,7 +1184,7 @@ func TestSendEncryptedGeneratesSelfSyncCopies(t *testing.T) {
 
 	if _, err := c.Call(ctx, "message.send", map[string]any{
 		"to":      receiverAID,
-		"payload": map[string]any{"text": "hello"},
+		"payload": map[string]any{"type": "text", "text": "hello"},
 	}); err != nil {
 		t.Fatalf("message.send 失败: %v", err)
 	}
@@ -1280,7 +1280,7 @@ func TestSendEncryptedQueueModeUsesMultiDevicePayload(t *testing.T) {
 
 	result, err := c.Call(ctx, "message.send", map[string]any{
 		"to":      receiverAID,
-		"payload": map[string]any{"text": "hello"},
+		"payload": map[string]any{"type": "text", "text": "hello"},
 		"encrypt": true,
 	})
 	if err != nil {
@@ -1441,7 +1441,7 @@ func TestDecryptMessagesDropsFailedCiphertext(t *testing.T) {
 		map[string]any{
 			"message_id": "plain-1",
 			"from":       "bob.example.com",
-			"payload":    map[string]any{"text": "hello"},
+			"payload":    map[string]any{"type": "text", "text": "hello"},
 		},
 		map[string]any{
 			"message_id": "cipher-1",
@@ -1471,7 +1471,7 @@ func TestDecryptMessagesSuppressesGroupKeyControlPlane(t *testing.T) {
 		map[string]any{
 			"message_id": "plain-1",
 			"from":       "bob.example.com",
-			"payload":    map[string]any{"text": "hello"},
+			"payload":    map[string]any{"type": "text", "text": "hello"},
 		},
 		map[string]any{
 			"message_id": "ctrl-1",
@@ -1501,7 +1501,7 @@ func TestDecryptGroupMessagesDropsFailedCiphertext(t *testing.T) {
 			"message_id": "group-plain-1",
 			"group_id":   "g-1.example.com",
 			"from":       "bob.example.com",
-			"payload":    map[string]any{"text": "hello"},
+			"payload":    map[string]any{"type": "text", "text": "hello"},
 		},
 		map[string]any{
 			"message_id": "group-cipher-1",
@@ -1545,8 +1545,8 @@ func TestPushedSeqsNoDuplicateOnGapFill(t *testing.T) {
 
 	// 模拟补洞路径返回包含 seq=5 和 seq=6 的消息列表
 	messages := []any{
-		map[string]any{"message_id": "m5", "seq": float64(5), "payload": map[string]any{"text": "dup"}},
-		map[string]any{"message_id": "m6", "seq": float64(6), "payload": map[string]any{"text": "new"}},
+		map[string]any{"message_id": "m5", "seq": float64(5), "payload": map[string]any{"type": "text", "text": "dup"}},
+		map[string]any{"message_id": "m6", "seq": float64(6), "payload": map[string]any{"type": "text", "text": "new"}},
 	}
 
 	var mu sync.Mutex
@@ -1593,8 +1593,8 @@ func TestPushedSeqsGroupNoDuplicateOnGapFill(t *testing.T) {
 	c.pushedSeqsMu.Unlock()
 
 	messages := []any{
-		map[string]any{"message_id": "gm10", "group_id": groupID, "seq": float64(10), "payload": map[string]any{"text": "dup"}},
-		map[string]any{"message_id": "gm11", "group_id": groupID, "seq": float64(11), "payload": map[string]any{"text": "new"}},
+		map[string]any{"message_id": "gm10", "group_id": groupID, "seq": float64(10), "payload": map[string]any{"type": "text", "text": "dup"}},
+		map[string]any{"message_id": "gm11", "group_id": groupID, "seq": float64(11), "payload": map[string]any{"type": "text", "text": "new"}},
 	}
 
 	var mu sync.Mutex
@@ -1639,8 +1639,8 @@ func TestPushedSeqsPreMarkBeforeGapFill(t *testing.T) {
 
 	// 然后补洞路径立即读取（模拟 goroutine 调度到补洞路径先执行）
 	messages := []any{
-		map[string]any{"message_id": "pm7", "seq": float64(7), "payload": map[string]any{"text": "dup"}},
-		map[string]any{"message_id": "pm8", "seq": float64(8), "payload": map[string]any{"text": "new"}},
+		map[string]any{"message_id": "pm7", "seq": float64(7), "payload": map[string]any{"type": "text", "text": "dup"}},
+		map[string]any{"message_id": "pm8", "seq": float64(8), "payload": map[string]any{"type": "text", "text": "new"}},
 	}
 
 	var mu sync.Mutex

@@ -78,7 +78,7 @@ func waitForFederationDelivery(
 		sendCtx, sendCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		_, sendErr := alice.Call(sendCtx, "message.send", map[string]any{
 			"to":      bobAID,
-			"payload": map[string]any{"text": text},
+			"payload": map[string]any{"type": "text", "text": text},
 			"encrypt": false,
 		})
 		sendCancel()

@@ -519,7 +519,7 @@ def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
     client._keystore.save_e2ee_prekey(aid, "pk1", {
         "private_key_pem": "KEEP_ME",
         "created_at": 1,
-    })
+    }, device_id=client._device_id)
     client._aid = aid
 
     client._sync_identity_after_connect("tok-connect")
@@ -528,7 +528,7 @@ def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
     slot_state = client._keystore.load_instance_state(aid, client._device_id, "")
     assert "access_token" not in loaded
     assert slot_state["access_token"] == "tok-connect"
-    prekeys = client._keystore.load_e2ee_prekeys(aid)
+    prekeys = client._keystore.load_e2ee_prekeys(aid, device_id=client._device_id)
     assert prekeys["pk1"]["private_key_pem"] == "KEEP_ME"
 
 
@@ -542,7 +542,7 @@ def test_call_rejects_group_service_recipient():
     ):
         asyncio.run(client.call("message.send", {
             "to": "group.remote.example",
-            "payload": {"text": "hello"},
+            "payload": {"type": "text", "text": "hello"},
             "encrypt": False,
         }))
 
@@ -554,7 +554,7 @@ def test_call_rejects_message_send_persist_param():
     with pytest.raises(ValidationError, match="no longer accepts 'persist'"):
         asyncio.run(client.call("message.send", {
             "to": "bob.remote.example",
-            "payload": {"text": "hello"},
+            "payload": {"type": "text", "text": "hello"},
             "encrypt": False,
             "persist": True,
         }))
@@ -567,7 +567,7 @@ def test_call_rejects_message_send_delivery_mode_param():
     with pytest.raises(ValidationError, match="does not accept delivery_mode"):
         asyncio.run(client.call("message.send", {
             "to": "bob.remote.example",
-            "payload": {"text": "hello"},
+            "payload": {"type": "text", "text": "hello"},
             "encrypt": False,
             "delivery_mode": {"mode": "queue"},
         }))
@@ -592,13 +592,13 @@ def test_call_does_not_forward_message_send_delivery_mode():
 
     asyncio.run(client.call("message.send", {
         "to": "bob.remote.example",
-        "payload": {"text": "hello"},
+        "payload": {"type": "text", "text": "hello"},
         "encrypt": False,
     }))
 
     assert calls == [("message.send", {
         "to": "bob.remote.example",
-        "payload": {"text": "hello"},
+        "payload": {"type": "text", "text": "hello"},
     })]
 
 
@@ -778,7 +778,7 @@ def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
 
     result = asyncio.run(client._send_encrypted({
         "to": "bob.example.com",
-        "payload": {"text": "hello"},
+        "payload": {"type": "text", "text": "hello"},
     }))
 
     assert result == {"ok": True}
@@ -877,7 +877,7 @@ def test_send_encrypted_uses_multi_device_payload_when_needed(monkeypatch):
 
     result = asyncio.run(client._send_encrypted({
         "to": "bob.example.com",
-        "payload": {"text": "hello"},
+        "payload": {"type": "text", "text": "hello"},
     }))
 
     assert result == {"ok": True}
@@ -953,7 +953,7 @@ def test_send_encrypted_generates_self_sync_copies(monkeypatch):
 
     result = asyncio.run(client._send_encrypted({
         "to": "bob.example.com",
-        "payload": {"text": "hi"},
+        "payload": {"type": "text", "text": "hi"},
     }))
 
     assert result == {"ok": True}
@@ -1036,7 +1036,7 @@ def test_send_encrypted_self_sync_uses_cert_fingerprint_specific_cert(monkeypatc
 
     result = asyncio.run(client._send_encrypted({
         "to": "bob.example.com",
-        "payload": {"text": "hi"},
+        "payload": {"type": "text", "text": "hi"},
     }))
 
     assert result == {"ok": True}
@@ -1121,7 +1121,7 @@ def test_send_encrypted_does_not_forward_delivery_mode(monkeypatch):
 
     asyncio.run(client._send_encrypted({
         "to": "bob.example.com",
-        "payload": {"text": "hello"},
+        "payload": {"type": "text", "text": "hello"},
     }))
 
     assert "delivery_mode" not in sent
@@ -1176,7 +1176,7 @@ def test_send_encrypted_queue_mode_still_uses_multi_device_payload(monkeypatch):
 
     result = asyncio.run(client._send_encrypted({
         "to": "bob.example.com",
-        "payload": {"text": "hello"},
+        "payload": {"type": "text", "text": "hello"},
     }))
 
     assert result == {"ok": True}
@@ -1535,81 +1535,10 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
     assert ack_calls[0]["params"]["seq"] == 1
 
 
-# ─── ISSUE-SDK-PY-014: replay guard RPC 异常不应丢弃消息 ───
-
-
-@pytest.mark.asyncio
-async def test_check_replay_guard_rpc_exception_returns_true():
-    """当 message.e2ee.record_replay_guard RPC 调用抛异常时，
-    应返回 True（允许消息通过），而非 False（丢弃消息）。
-    RPC 异常（如网络问题）不代表消息是重复的。"""
-    client = object.__new__(AUNClient)
-    client._state = "connected"
-
-    class _TransportRaisesOnReplayGuard:
-        async def call(self, method, params):
-            if method == "message.e2ee.record_replay_guard":
-                raise ConnectionError("网络不可达")
-            return {}
-
-    client._transport = _TransportRaisesOnReplayGuard()
-
-    message = {
-        "timestamp": 1000,
-        "payload": {"ephemeral_public_key": "test-key-abc"},
-    }
-
-    result = await client._check_replay_guard(
-        message_id="msg-001",
-        sender_aid="bob.aid.com",
-        encryption_mode="e2ee",
-        message=message,
-    )
-
-    # RPC 异常时应允许消息通过（返回 True），而不是拒绝
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_check_replay_guard_rpc_success_not_duplicate():
-    """RPC 成功且非重复时，应返回 True。"""
-    client = object.__new__(AUNClient)
-    client._state = "connected"
-
-    class _TransportOk:
-        async def call(self, method, params):
-            return {"duplicate": False}
-
-    client._transport = _TransportOk()
-
-    result = await client._check_replay_guard(
-        message_id="msg-002",
-        sender_aid="bob.aid.com",
-        encryption_mode="e2ee",
-        message={"timestamp": 2000, "payload": {}},
-    )
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_check_replay_guard_rpc_success_duplicate():
-    """RPC 成功且检测到重复时，应返回 False。"""
-    client = object.__new__(AUNClient)
-    client._state = "connected"
-
-    class _TransportDuplicate:
-        async def call(self, method, params):
-            return {"duplicate": True}
-
-    client._transport = _TransportDuplicate()
-
-    result = await client._check_replay_guard(
-        message_id="msg-003",
-        sender_aid="bob.aid.com",
-        encryption_mode="e2ee",
-        message={"timestamp": 3000, "payload": {}},
-    )
-    assert result is False
+# ─── ISSUE-SDK-PY-014: replay guard 已改为本地处理 ───
+# _check_replay_guard 方法已移除，防重放改由 _group_e2ee.decrypt(skip_replay=)
+# 在本地完成；服务端入口已做 AID 级防重放（见 client.py:2210 注释）。
+# 原 3 个 RPC replay guard 测试不再适用，已删除。
 
 
 # ─── ISSUE-SDK-PY-021: close_code 1000 不应视为 server_initiated ───
@@ -1897,3 +1826,149 @@ class TestClientListIdentities:
         result = client.list_identities()
         aids = [item["aid"] for item in result]
         assert "test.agentid.pub" in aids
+
+
+# ── R1: max_attempts 支持 + health-fail 路径约束 ────────────
+
+
+def _make_reconnect_client():
+    """构造用于 _reconnect_loop 测试的 client。"""
+    client = object.__new__(AUNClient)
+    client._closing = False
+    client._state = "connected"
+    client._reconnect_task = None
+    client._server_kicked = False
+    client._gateway_url = "ws://gateway.example.com/aun"
+    client._logger = None
+
+    published = []
+
+    class _FakeDispatcher:
+        async def publish(self, event, data):
+            published.append((event, data))
+
+    class _FakeDiscovery:
+        async def check_health(self, url, timeout=5):
+            return False  # 始终不健康
+
+    class _FakeTransport:
+        async def close(self):
+            pass
+
+    client._dispatcher = _FakeDispatcher()
+    client._discovery = _FakeDiscovery()
+    client._transport = _FakeTransport()
+
+    return client, published
+
+
+@pytest.mark.asyncio
+async def test_max_attempts_stops_reconnect_on_health_fail():
+    """R1: max_attempts > 0 时，health 持续失败也应在达到上限后终止。"""
+    client, published = _make_reconnect_client()
+    client._session_options = {
+        "auto_reconnect": True,
+        "retry": {"initial_delay": 0.01, "max_delay": 0.01, "max_attempts": 3},
+        "timeouts": {"connect": 5, "call": 10, "http": 30},
+    }
+
+    await client._reconnect_loop()
+
+    assert client._state == "terminal_failed"
+    # 应该发布 terminal_failed 事件
+    terminal_events = [
+        (e, d) for e, d in published
+        if e == "connection.state" and d.get("state") == "terminal_failed"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0][1].get("reason") == "max_attempts_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_max_attempts_zero_means_infinite():
+    """max_attempts=0 表示无限重试（默认值），循环不应因 max_attempts 终止。"""
+    client, published = _make_reconnect_client()
+    client._session_options = {
+        "auto_reconnect": True,
+        "retry": {"initial_delay": 0.001, "max_delay": 0.001, "max_attempts": 0},
+        "timeouts": {"connect": 5, "call": 10, "http": 30},
+    }
+
+    # 5 次 health-fail 后手动停止
+    attempt_count = [0]
+    orig_check = client._discovery.check_health
+
+    async def counting_check(url, timeout=5):
+        attempt_count[0] += 1
+        if attempt_count[0] >= 5:
+            client._closing = True
+        return False
+
+    client._discovery.check_health = counting_check
+
+    await client._reconnect_loop()
+
+    # 应该循环了 5 次，不是因为 max_attempts 终止
+    assert attempt_count[0] >= 5
+    assert client._state != "terminal_failed"
+
+
+@pytest.mark.asyncio
+async def test_max_attempts_stops_reconnect_on_connect_fail():
+    """max_attempts > 0 时，连接失败也应在达到上限后终止。"""
+    client, published = _make_reconnect_client()
+    client._session_options = {
+        "auto_reconnect": True,
+        "retry": {"initial_delay": 0.01, "max_delay": 0.01, "max_attempts": 2},
+        "timeouts": {"connect": 5, "call": 10, "http": 30},
+    }
+
+    # health 总是健康，但连接总是失败
+    async def healthy_check(url, timeout=5):
+        return True
+
+    client._discovery.check_health = healthy_check
+
+    async def failing_connect():
+        raise ConnectionError("gateway down")
+
+    client._invoke_reconnect_connect_once = failing_connect
+
+    await client._reconnect_loop()
+
+    assert client._state == "terminal_failed"
+    terminal_events = [
+        (e, d) for e, d in published
+        if e == "connection.state" and d.get("state") == "terminal_failed"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0][1].get("reason") == "max_attempts_exhausted"
+
+
+# ── R3: 批量路径解密失败不应出现在返回结果中 ──────────────────
+
+@pytest.mark.asyncio
+async def test_decrypt_group_messages_excludes_undecryptable():
+    """R3: _decrypt_group_messages 解密失败的消息不应出现在返回结果中。"""
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "test.aid.com"
+    client._device_id = "device-001"
+
+    # _decrypt_group_message 返回原始消息（无 e2ee 字段）= 解密失败
+    async def fake_decrypt(msg, skip_replay=False):
+        return msg
+
+    client._decrypt_group_message = fake_decrypt
+
+    msgs = [
+        {"group_id": "g1", "from": "a", "seq": 1,
+         "payload": {"type": "e2ee.group_encrypted", "epoch": 1, "ciphertext": "X"}},
+        {"group_id": "g1", "from": "b", "seq": 2,
+         "payload": {"type": "text", "text": "hello"}},
+    ]
+    result = await client._decrypt_group_messages(msgs)
+
+    # 只有非加密消息应在结果中
+    assert len(result) == 1
+    assert result[0]["payload"]["type"] == "text"

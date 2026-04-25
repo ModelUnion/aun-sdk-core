@@ -1,12 +1,16 @@
 package aun
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/anthropics/aun-sdk-core/go/keystore"
 )
+
+// ErrReplayDetected 表示消息被防重放守卫拦截（非解密失败）。
+var ErrReplayDetected = errors.New("replay detected")
 
 // ── 群组 E2EE 常量 ──────────────────────────────────────────
 
@@ -307,7 +311,7 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map
 	}
 	if !skipReplay && groupID != "" && sender != "" && msgID != "" {
 		if m.replayGuard.IsSeen(groupID, sender, msgID) {
-			return nil, fmt.Errorf("replay detected: group=%s sender=%s msg=%s", groupID, sender, msgID)
+			return nil, fmt.Errorf("%w: group=%s sender=%s msg=%s", ErrReplayDetected, groupID, sender, msgID)
 		}
 	}
 

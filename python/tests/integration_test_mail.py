@@ -39,7 +39,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, AuthError, RateLimitError
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -96,9 +96,37 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
         await client.auth.create_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth)
-    return aid
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            auth = await client.auth.authenticate({"aid": aid})
+            await client.connect(auth)
+            return aid
+        except (AuthError, RateLimitError) as exc:
+            last_error = exc
+            if attempt >= 3:
+                break
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_error or RuntimeError(f"{aid} connect failed")
+
+
+async def _wait_mail_subject(
+    client: AUNClient,
+    mailbox: str,
+    subject: str,
+    *,
+    timeout: float = 8.0,
+    limit: int = 200,
+) -> dict | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        result = await client.call("mail.list", {"mailbox": mailbox, "limit": limit})
+        for msg in result.get("messages", []):
+            if msg.get("subject") == subject:
+                return msg
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -122,19 +150,12 @@ async def test_send_and_list(alice: AUNClient, bob: AUNClient):
             return
 
         # 收件方 inbox
-        await asyncio.sleep(0.5)
-        inbox = await bob.call("mail.list", {"mailbox": "inbox", "limit": 50})
-        msgs = inbox.get("messages", [])
-        found = any(m.get("subject") == subject for m in msgs)
-        if not found:
+        if not await _wait_mail_subject(bob, "inbox", subject):
             _fail(name, f"收件方 inbox 未找到邮件 (subject={subject})")
             return
 
         # 发件方 sent
-        sent = await alice.call("mail.list", {"mailbox": "sent", "limit": 50})
-        sent_msgs = sent.get("messages", [])
-        found_sent = any(m.get("subject") == subject for m in sent_msgs)
-        if not found_sent:
+        if not await _wait_mail_subject(alice, "sent", subject):
             _fail(name, "发件方 sent 未找到记录")
             return
 
@@ -202,15 +223,11 @@ async def test_send_to_self(alice: AUNClient):
             _fail(name, f"发送失败: {result}")
             return
 
-        await asyncio.sleep(0.5)
-
         # inbox 应有
-        inbox = await alice.call("mail.list", {"mailbox": "inbox", "limit": 50})
-        found_inbox = any(m.get("subject") == subject for m in inbox.get("messages", []))
+        found_inbox = bool(await _wait_mail_subject(alice, "inbox", subject))
 
         # sent 应有
-        sent = await alice.call("mail.list", {"mailbox": "sent", "limit": 50})
-        found_sent = any(m.get("subject") == subject for m in sent.get("messages", []))
+        found_sent = bool(await _wait_mail_subject(alice, "sent", subject))
 
         if found_inbox and found_sent:
             _ok(name)
@@ -374,6 +391,21 @@ async def test_search_miss(alice: AUNClient):
         _fail(name, str(e))
 
 
+def _is_test_app_password(item: dict) -> bool:
+    name = str(item.get("name") or "")
+    return name in {"TestClient", "test-imap"} or name.startswith("AUN_TEST_")
+
+
+async def _cleanup_test_app_passwords(client: AUNClient):
+    try:
+        list_result = await client.call("mail.list_app_passwords", {})
+        for item in list_result.get("passwords", []):
+            if _is_test_app_password(item) and item.get("id"):
+                await client.call("mail.revoke_app_password", {"id": item["id"]})
+    except Exception:
+        pass
+
+
 async def test_app_password_lifecycle(alice: AUNClient):
     """T2.22+T2.23+T2.24: 创建/列出/撤销应用专用密码"""
     name_create = "T2.22 创建应用专用密码"
@@ -381,8 +413,12 @@ async def test_app_password_lifecycle(alice: AUNClient):
     name_revoke = "T2.24 撤销应用专用密码"
 
     try:
+        await _cleanup_test_app_passwords(alice)
+
         # 创建
-        result = await alice.call("mail.create_app_password", {"name": "TestClient"})
+        result = await alice.call("mail.create_app_password", {
+            "name": f"AUN_TEST_TestClient_{int(time.time() * 1000)}",
+        })
         if not result.get("ok"):
             _fail(name_create, f"创建失败: {result}")
             return
@@ -507,12 +543,7 @@ async def test_e2ee_send_and_get(alice: AUNClient, bob: AUNClient):
         msg_id = result.get("message_id", "")
 
         # 检查发件方 sent 中 encrypted 字段
-        sent = await alice.call("mail.list", {"mailbox": "sent", "limit": 10})
-        sent_msg = None
-        for m in sent.get("messages", []):
-            if m.get("subject") == subject:
-                sent_msg = m
-                break
+        sent_msg = await _wait_mail_subject(alice, "sent", subject)
         if not sent_msg:
             _fail(name, "sent 中未找到加密邮件")
             return
@@ -544,15 +575,8 @@ async def test_e2ee_recipient_gets_envelope(alice: AUNClient, bob: AUNClient):
             "encrypted": 1,
             "e2ee_envelope": fake_envelope,
         })
-        await asyncio.sleep(0.5)
-
         # bob 列出 inbox
-        inbox = await bob.call("mail.list", {"mailbox": "inbox", "limit": 50})
-        target = None
-        for m in inbox.get("messages", []):
-            if m.get("subject") == subject:
-                target = m
-                break
+        target = await _wait_mail_subject(bob, "inbox", subject)
 
         if not target:
             _fail(name, "收件人 inbox 未找到 E2EE 邮件")
@@ -592,13 +616,7 @@ async def test_e2ee_plaintext_still_works(alice: AUNClient, bob: AUNClient):
             _fail(name, f"发送失败: {result}")
             return
 
-        await asyncio.sleep(0.5)
-        inbox = await bob.call("mail.list", {"mailbox": "inbox", "limit": 50})
-        target = None
-        for m in inbox.get("messages", []):
-            if m.get("subject") == subject:
-                target = m
-                break
+        target = await _wait_mail_subject(bob, "inbox", subject)
         if not target:
             _fail(name, "未找到明文邮件")
             return

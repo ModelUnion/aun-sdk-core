@@ -821,7 +821,7 @@ test.describe('P2P E2EE 集成测试', () => {
       // Alice 发送加密消息给 Bob
       const sendResult = await alice.call('message.send', {
         to: bobAid,
-        payload: { text: 'hello from browser' },
+        payload: { type: 'text', text: 'hello from browser' },
         encrypt: true,
       });
 
@@ -893,7 +893,7 @@ test.describe('Group E2EE 集成测试', () => {
       // Alice 发送加密群消息
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '浏览器群消息' },
+        payload: { type: 'text', text: '浏览器群消息' },
         encrypt: true,
       });
       await new Promise(r => setTimeout(r, 1000));
@@ -938,7 +938,7 @@ test.describe('Group E2EE 集成测试', () => {
 
       const sendResult = await client.call('group.send', {
         group_id: groupId,
-        payload: { text: 'plaintext' },
+        payload: { type: 'text', text: 'plaintext' },
         encrypt: false,
       });
 
@@ -983,7 +983,7 @@ test.describe('Group E2EE 集成测试', () => {
       // Alice 发送加密群消息
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '三人群消息' },
+        payload: { type: 'text', text: '三人群消息' },
         encrypt: true,
       });
       await new Promise(r => setTimeout(r, 1000));
@@ -1052,7 +1052,7 @@ test.describe('Group E2EE 集成测试', () => {
       // Alice 用新 epoch 发消息
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '踢人后的消息' },
+        payload: { type: 'text', text: '踢人后的消息' },
         encrypt: true,
       });
       await new Promise(r => setTimeout(r, 1000));
@@ -1113,7 +1113,7 @@ test.describe('Group E2EE 集成测试', () => {
       // Alice 用当前 epoch 发消息
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '新成员能看到' },
+        payload: { type: 'text', text: '新成员能看到' },
         encrypt: true,
       });
       await new Promise(r => setTimeout(r, 1000));
@@ -1164,7 +1164,7 @@ test.describe('Group E2EE 集成测试', () => {
       for (let i = 0; i < N; i++) {
         await alice.call('group.send', {
           group_id: groupId,
-          payload: { text: `burst_${i}`, seq: i },
+          payload: { type: 'text', text: `burst_${i}`, seq: i },
           encrypt: true,
         });
       }
@@ -1221,17 +1221,17 @@ test.describe('Group E2EE 集成测试', () => {
       // 明文 → 加密 → 明文
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '明文消息' },
+        payload: { type: 'text', text: '明文消息' },
         encrypt: false,
       });
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '加密消息' },
+        payload: { type: 'text', text: '加密消息' },
         encrypt: true,
       });
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '又是明文' },
+        payload: { type: 'text', text: '又是明文' },
         encrypt: false,
       });
       await new Promise(r => setTimeout(r, 1000));
@@ -1296,7 +1296,7 @@ test.describe('Group E2EE 集成测试', () => {
       // epoch 1 消息
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: 'epoch1消息' },
+        payload: { type: 'text', text: 'epoch1消息' },
         encrypt: true,
       });
 
@@ -1307,7 +1307,7 @@ test.describe('Group E2EE 集成测试', () => {
       // epoch 2 消息
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: 'epoch2消息' },
+        payload: { type: 'text', text: 'epoch2消息' },
         encrypt: true,
       });
       await new Promise(r => setTimeout(r, 1000));
@@ -1376,7 +1376,7 @@ test.describe('Group E2EE 集成测试', () => {
       // Alice 用新 epoch 发消息
       await alice.call('group.send', {
         group_id: groupId,
-        payload: { text: '退群后的消息' },
+        payload: { type: 'text', text: '退群后的消息' },
         encrypt: true,
       });
       await new Promise(r => setTimeout(r, 1000));
@@ -1430,7 +1430,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       // Alice 发加密消息给 Bob
       const sendResult = await alice.call('message.send', {
         to: bobAid,
-        payload: { text: 'prekey消息测试' },
+        payload: { type: 'text', text: 'prekey消息测试' },
         encrypt: true,
       });
 
@@ -1500,7 +1500,7 @@ test.describe('P2P E2EE 扩展测试', () => {
 
       await sender.call('message.send', {
         to: receiverAid,
-        payload: { text: 'missing-prekey' },
+        payload: { type: 'text', text: 'missing-prekey' },
         encrypt: true,
       });
 
@@ -1594,7 +1594,7 @@ test.describe('P2P E2EE 扩展测试', () => {
 
       await aliceMain.call('message.send', {
         to: bobAid,
-        payload: { text, kind: 'multi-device' },
+        payload: { type: 'text', text, kind: 'multi-device' },
         encrypt: true,
       });
 
@@ -1695,7 +1695,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       const text = `browser_multi_device_offline_${Date.now()}`;
       await aliceMain.call('message.send', {
         to: bobAid,
-        payload: { text, kind: 'offline-pull' },
+        payload: { type: 'text', text, kind: 'offline-pull' },
         encrypt: true,
       });
 
@@ -1744,7 +1744,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       // Alice -> Bob
       const send1 = await alice.call('message.send', {
         to: bobAid,
-        payload: { text: 'hello_bob' },
+        payload: { type: 'text', text: 'hello_bob' },
         encrypt: true,
       });
 
@@ -1753,7 +1753,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       // Bob -> Alice
       const send2 = await bob.call('message.send', {
         to: aliceAid,
-        payload: { text: 'hello_alice' },
+        payload: { type: 'text', text: 'hello_alice' },
         encrypt: true,
       });
 
@@ -1812,7 +1812,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       for (let i = 0; i < N; i++) {
         await sender.call('message.send', {
           to: receiverAid,
-          payload: { text: `burst_${i}`, seq: i },
+          payload: { type: 'text', text: `burst_${i}`, seq: i },
           encrypt: true,
         });
       }
@@ -1863,7 +1863,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       // 轮换前发消息
       await sender.call('message.send', {
         to: receiverAid,
-        payload: { text: 'before_rotate' },
+        payload: { type: 'text', text: 'before_rotate' },
         encrypt: true,
       });
 
@@ -1878,7 +1878,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       // 轮换后发消息
       await sender.call('message.send', {
         to: receiverAid,
-        payload: { text: 'after_rotate' },
+        payload: { type: 'text', text: 'after_rotate' },
         encrypt: true,
       });
 
@@ -1944,7 +1944,7 @@ test.describe('P2P E2EE 扩展测试', () => {
       // 发送一条消息
       await sender.call('message.send', {
         to: receiverAid,
-        payload: { text: 'dup_test' },
+        payload: { type: 'text', text: 'dup_test' },
         encrypt: true,
       });
 

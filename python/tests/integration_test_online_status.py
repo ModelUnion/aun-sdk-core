@@ -31,7 +31,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, AuthError, RateLimitError
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +82,23 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
         await client.auth.create_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    connect_params = dict(auth)
-    slot_id = str(getattr(client, "_test_slot_id", "") or "")
-    if slot_id:
-        connect_params["slot_id"] = slot_id
-    connect_params["auto_reconnect"] = False
-    await client.connect(connect_params)
-    return aid
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            auth = await client.auth.authenticate({"aid": aid})
+            connect_params = dict(auth)
+            slot_id = str(getattr(client, "_test_slot_id", "") or "")
+            if slot_id:
+                connect_params["slot_id"] = slot_id
+            connect_params["auto_reconnect"] = False
+            await client.connect(connect_params)
+            return aid
+        except (AuthError, RateLimitError) as exc:
+            last_error = exc
+            if attempt >= 3:
+                break
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_error or RuntimeError(f"{aid} connect failed")
 
 
 async def _query_online(client: AUNClient, aids: list[str]) -> dict[str, bool]:
@@ -98,10 +107,44 @@ async def _query_online(client: AUNClient, aids: list[str]) -> dict[str, bool]:
     return result.get("online", {})
 
 
+async def _wait_online(client: AUNClient, aid: str, expected: bool, *, timeout: float = 6.0) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        result = await _query_online(client, [aid])
+        if result.get(aid) is expected:
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.3)
+
+
 async def _get_online_members(client: AUNClient, group_id: str) -> list[dict]:
     """调用 group.get_online_members，返回成员列表"""
     result = await client.call("group.get_online_members", {"group_id": group_id})
     return result.get("members", [])
+
+
+async def _wait_group_members_online(
+    client: AUNClient,
+    group_id: str,
+    expected_online: set[str],
+    *,
+    expected_offline: set[str] | None = None,
+    timeout: float = 10.0,
+) -> tuple[set[str], set[str]]:
+    expected_offline = expected_offline or set()
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_online: set[str] = set()
+    last_offline: set[str] = set()
+    while True:
+        members = await _get_online_members(client, group_id)
+        last_online = {m["aid"] for m in members if m.get("online")}
+        last_offline = {m["aid"] for m in members if not m.get("online")}
+        if expected_online.issubset(last_online) and expected_offline.issubset(last_offline):
+            return last_online, last_offline
+        if asyncio.get_running_loop().time() >= deadline:
+            return last_online, last_offline
+        await asyncio.sleep(0.3)
 
 
 async def _create_group(client: AUNClient, name: str) -> str:
@@ -136,16 +179,11 @@ async def test_online_after_connect():
         alice_aid = await _ensure_connected(alice, _ALICE_AID)
         bob_aid = await _ensure_connected(bob, _BOBB_AID)
 
-        # Gateway 写 Redis 是异步的，稍等确保写入完成
-        await asyncio.sleep(1.0)
-
         # alice 查询 bob 的在线状态
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is True, f"bob 应在线，实际: {result}"
+        assert await _wait_online(alice, bob_aid, True, timeout=10.0), "bob 应在线"
 
         # bob 查询 alice 的在线状态
-        result = await _query_online(bob, [alice_aid])
-        assert result.get(alice_aid) is True, f"alice 应在线，实际: {result}"
+        assert await _wait_online(bob, alice_aid, True, timeout=10.0), "alice 应在线"
 
         print("[PASS] Test 1")
         return True
@@ -165,20 +203,15 @@ async def test_offline_after_disconnect():
     try:
         alice_aid = await _ensure_connected(alice, _ALICE_AID)
         bob_aid = await _ensure_connected(bob, _BOBB_AID)
-        await asyncio.sleep(1.0)
 
         # 确认 bob 在线
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is True, f"bob 应在线，实际: {result}"
+        assert await _wait_online(alice, bob_aid, True, timeout=10.0), "bob 应在线"
 
         # bob 断开
         await bob.close()
-        # Gateway 清理 Redis 是异步的，等待清理完成
-        await asyncio.sleep(2.0)
 
         # 再次查询，bob 应离线
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is False, f"bob 已断开应离线，实际: {result}"
+        assert await _wait_online(alice, bob_aid, False, timeout=10.0), "bob 已断开应离线"
 
         print("[PASS] Test 2")
         return True
@@ -200,7 +233,8 @@ async def test_batch_query_online():
         alice_aid = await _ensure_connected(alice, _ALICE_AID)
         bob_aid = await _ensure_connected(bob, _BOBB_AID)
         charlie_aid = await _ensure_connected(charlie, _CHARLIE_AID)
-        await asyncio.sleep(1.0)
+        assert await _wait_online(alice, bob_aid, True, timeout=10.0), "bob 应在线"
+        assert await _wait_online(alice, charlie_aid, True, timeout=10.0), "charlie 应在线"
 
         # alice 批量查询 bob、charlie、dave（dave 未连接）
         result = await _query_online(alice, [bob_aid, charlie_aid, _DAVE_AID])
@@ -210,7 +244,8 @@ async def test_batch_query_online():
 
         # charlie 断开
         await charlie.close()
-        await asyncio.sleep(2.0)
+        assert await _wait_online(alice, charlie_aid, False, timeout=10.0), "charlie 已断开应离线"
+        assert await _wait_online(alice, bob_aid, True, timeout=10.0), "bob 应仍在线"
 
         # 再次批量查询
         result = await _query_online(alice, [bob_aid, charlie_aid])
@@ -272,11 +307,14 @@ async def test_group_online_members():
         group_id = await _create_group(alice, f"online-test-{run_id}")
         await _add_member(alice, group_id, bob_aid)
         await _add_member(alice, group_id, charlie_aid)
-        await asyncio.sleep(1.0)
+        assert await _wait_online(alice, alice_aid, True), "alice 在线状态未收敛"
+        assert await _wait_online(alice, bob_aid, True), "bob 在线状态未收敛"
+        assert await _wait_online(alice, charlie_aid, True), "charlie 在线状态未收敛"
 
         # 查询群在线成员 — alice、bob、charlie 都应在线
-        members = await _get_online_members(alice, group_id)
-        online_aids = {m["aid"] for m in members if m.get("online")}
+        online_aids, _ = await _wait_group_members_online(
+            alice, group_id, {alice_aid, bob_aid, charlie_aid},
+        )
         assert alice_aid in online_aids, f"alice 应在线，实际在线: {online_aids}"
         assert bob_aid in online_aids, f"bob 应在线，实际在线: {online_aids}"
         assert charlie_aid in online_aids, f"charlie 应在线，实际在线: {online_aids}"
@@ -311,16 +349,18 @@ async def test_group_online_members_after_disconnect():
         group_id = await _create_group(alice, f"online-dc-{run_id}")
         await _add_member(alice, group_id, bob_aid)
         await _add_member(alice, group_id, charlie_aid)
-        await asyncio.sleep(1.0)
+        assert await _wait_online(alice, alice_aid, True), "alice 在线状态未收敛"
+        assert await _wait_online(alice, bob_aid, True), "bob 在线状态未收敛"
+        assert await _wait_online(alice, charlie_aid, True), "charlie 在线状态未收敛"
 
         # charlie 断开
         await charlie.close()
-        await asyncio.sleep(2.0)
+        assert await _wait_online(alice, charlie_aid, False, timeout=10.0), "charlie 离线状态未收敛"
 
         # 查询群在线成员 — alice 和 bob 在线，charlie 离线
-        members = await _get_online_members(alice, group_id)
-        online_aids = {m["aid"] for m in members if m.get("online")}
-        offline_aids = {m["aid"] for m in members if not m.get("online")}
+        online_aids, offline_aids = await _wait_group_members_online(
+            alice, group_id, {alice_aid, bob_aid}, expected_offline={charlie_aid},
+        )
         assert alice_aid in online_aids, f"alice 应在线，实际在线: {online_aids}"
         assert bob_aid in online_aids, f"bob 应在线，实际在线: {online_aids}"
         assert charlie_aid in offline_aids, f"charlie 应离线，实际在线: {online_aids}"
@@ -349,24 +389,21 @@ async def test_reconnect_online_status():
         await asyncio.sleep(1.0)
 
         # 确认 bob 在线
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is True, f"bob 应在线"
+        assert await _wait_online(alice, bob_aid, True), "bob 应在线"
 
         # bob 断开
         await bob.close()
         await asyncio.sleep(2.0)
 
         # 确认 bob 离线
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is False, f"bob 断开后应离线"
+        assert await _wait_online(alice, bob_aid, False), "bob 断开后应离线"
 
         # bob 用新客户端重连
         await _ensure_connected(bob2, _BOBB_AID)
         await asyncio.sleep(1.0)
 
         # 确认 bob 重新上线
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is True, f"bob 重连后应在线"
+        assert await _wait_online(alice, bob_aid, True), "bob 重连后应在线"
 
         print("[PASS] Test 7")
         return True
@@ -388,27 +425,24 @@ async def test_multi_device_online():
         alice_aid = await _ensure_connected(alice, _ALICE_AID)
         bob_aid = await _ensure_connected(bob_dev1, _BOBB_AID)
         await _ensure_connected(bob_dev2, _BOBB_AID)
-        await asyncio.sleep(1.0)
 
         # bob 两个设备都在线
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is True, f"bob 两设备在线，应返回 true"
+        assert await _wait_online(alice, bob_aid, True, timeout=10.0), \
+            "bob 两设备在线，应返回 true"
 
         # 断开第一个设备
         await bob_dev1.close()
-        await asyncio.sleep(2.0)
 
         # bob 仍然在线（还有 dev2）
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is True, f"bob 还有一个设备在线，应返回 true"
+        assert await _wait_online(alice, bob_aid, True, timeout=10.0), \
+            "bob 还有一个设备在线，应返回 true"
 
         # 断开第二个设备
         await bob_dev2.close()
-        await asyncio.sleep(2.0)
 
         # bob 完全离线
-        result = await _query_online(alice, [bob_aid])
-        assert result.get(bob_aid) is False, f"bob 全部断开应离线"
+        assert await _wait_online(alice, bob_aid, False, timeout=10.0), \
+            "bob 全部断开应离线"
 
         print("[PASS] Test 8")
         return True

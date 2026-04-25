@@ -667,30 +667,14 @@ export class IndexedDBKeyStore implements KeyStore {
 
   // ── 结构化 prekeys ───────────────────────────────────
 
-  async loadE2EEPrekeys(aid: string): Promise<PrekeyMap> {
-    return this._withAidLock(aid, async () => {
-      await this._migrateLegacyStructuredStateUnlocked(aid);
-      return this._loadPrekeysUnlocked(aid, '');
-    });
-  }
-
-  async loadE2EEPrekeysForDevice(aid: string, deviceId: string): Promise<PrekeyMap> {
+  async loadE2EEPrekeys(aid: string, deviceId?: string): Promise<PrekeyMap> {
     return this._withAidLock(aid, async () => {
       await this._migrateLegacyStructuredStateUnlocked(aid);
       return this._loadPrekeysUnlocked(aid, String(deviceId ?? '').trim());
     });
   }
 
-  async saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord): Promise<void> {
-    await this._withAidLock(aid, async () => {
-      await this._migrateLegacyStructuredStateUnlocked(aid);
-      const record = deepClone(prekeyData);
-      record.prekey_id = prekeyId;
-      await idbPut(STORE_PREKEYS, prekeyStoreKey(aid, prekeyId, ''), record);
-    });
-  }
-
-  async saveE2EEPrekeyForDevice(aid: string, deviceId: string, prekeyId: string, prekeyData: PrekeyRecord): Promise<void> {
+  async saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): Promise<void> {
     await this._withAidLock(aid, async () => {
       await this._migrateLegacyStructuredStateUnlocked(aid);
       const record = deepClone(prekeyData);
@@ -716,41 +700,7 @@ export class IndexedDBKeyStore implements KeyStore {
     });
   }
 
-  async cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest = 7): Promise<string[]> {
-    return this._withAidLock(aid, async () => {
-      await this._migrateLegacyStructuredStateUnlocked(aid);
-      const prekeys = await this._loadPrekeysUnlocked(aid, '');
-      const retainedIds = new Set(
-        Object.entries(prekeys)
-          .sort((left, right) => {
-            const leftMarker = Number(left[1].created_at ?? left[1].updated_at ?? left[1].expires_at ?? 0);
-            const rightMarker = Number(right[1].created_at ?? right[1].updated_at ?? right[1].expires_at ?? 0);
-            if (rightMarker !== leftMarker) return rightMarker - leftMarker;
-            return right[0].localeCompare(left[0]);
-          })
-          .slice(0, keepLatest)
-          .map(([prekeyId]) => prekeyId),
-      );
-      const removed = Object.entries(prekeys)
-        .filter(
-          ([prekeyId, data]) =>
-            Number(data.created_at ?? data.updated_at ?? data.expires_at ?? 0) < cutoffMs
-            && !retainedIds.has(prekeyId),
-        )
-        .map(([prekeyId]) => prekeyId);
-      const removedIds = new Set(removed);
-      for (const item of await idbGetAllByPrefix<JsonObject>(STORE_PREKEYS, prekeyPrefix(aid))) {
-        if (!isRecord(item.value)) continue;
-        const recordDeviceId = String(item.value.device_id ?? '').trim();
-        if (recordDeviceId !== '') continue;
-        const prekeyId = typeof item.value.prekey_id === 'string' ? item.value.prekey_id : '';
-        if (removedIds.has(prekeyId)) await idbDelete(STORE_PREKEYS, item.key);
-      }
-      return removed;
-    });
-  }
-
-  async cleanupE2EEPrekeysForDevice(aid: string, deviceId: string, cutoffMs: number, keepLatest = 7): Promise<string[]> {
+  async cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest = 7, deviceId?: string): Promise<string[]> {
     return this._withAidLock(aid, async () => {
       await this._migrateLegacyStructuredStateUnlocked(aid);
       const normalizedDeviceId = String(deviceId ?? '').trim();

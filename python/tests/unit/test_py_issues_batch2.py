@@ -109,7 +109,7 @@ def _make_encrypted_group_msg(gs, group_id=_GRP, from_aid=_AID_ALICE, seq=1, epo
     ts = 1710504000000 + seq
     envelope = encrypt_group_message(
         group_id=group_id, epoch=epoch, group_secret=gs,
-        payload={"text": f"消息-{seq}"}, from_aid=from_aid,
+        payload={"type": "text", "text": f"消息-{seq}"}, from_aid=from_aid,
         message_id=msg_id, timestamp=ts,
         sender_private_key_pem=pk_pem,
     )

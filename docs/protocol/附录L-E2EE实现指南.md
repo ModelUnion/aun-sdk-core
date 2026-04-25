@@ -112,7 +112,7 @@ sequenceDiagram
 # SDK 自动获取证书和 prekey，自动选择加密模式
 await client.call("message.send", {
     "to": "bob.agentid.pub",
-    "payload": {"text": "秘密消息"},
+    "payload": {"type": "text", "text": "秘密消息"},
     "encrypt": True,
 })
 ```
@@ -151,7 +151,7 @@ prekey_data = prekey.get("prekey") if prekey.get("found") else None
 # 3. 加密（prekey 传入后自动缓存，后续可传 None 复用缓存）
 envelope, ok = e2ee.encrypt_message(
     to_aid="bob.agentid.pub",
-    payload={"text": "秘密消息"},
+    payload={"type": "text", "text": "秘密消息"},
     peer_cert_pem=peer_cert_pem,
     prekey=prekey_data,
 )

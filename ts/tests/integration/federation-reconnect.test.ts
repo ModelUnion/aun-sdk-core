@@ -102,7 +102,7 @@ async function waitForFederationDelivery(
       try {
         const sendResult = await alice.call('message.send', {
           to: bobAid,
-          payload: { text },
+          payload: { type: 'text', text },
           encrypt: false,
         }) as JsonObject;
         if (!(sendResult.message_id || sendResult.status)) {

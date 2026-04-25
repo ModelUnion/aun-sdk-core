@@ -254,8 +254,8 @@ async def main():
     await bob.connect(bob_auth, {})
 
     await alice.call("message.send", {
-        "to": BOB, "type": "text",
-        "payload": {"text": "Hello from Alice!"},
+        "to": BOB,
+        "payload": {"type": "text", "text": "Hello from Alice!"},
     })
 
     try:

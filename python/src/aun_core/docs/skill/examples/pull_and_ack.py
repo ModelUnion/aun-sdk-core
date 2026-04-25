@@ -27,8 +27,7 @@ async def main():
     for i in range(3):
         await sender.call("message.send", {
             "to": receiver_aid,
-            "type": "text",
-            "payload": {"text": f"消息 #{i + 1}"},
+            "payload": {"type": "text", "text": f"消息 #{i + 1}"},
         })
     print("Sender 发送了 3 条消息\n")
 

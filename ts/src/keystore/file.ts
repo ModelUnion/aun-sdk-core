@@ -280,24 +280,11 @@ export class FileKeyStore implements KeyStore {
 
   // ── Prekeys ──────────────────────────────────────────────
 
-  loadE2EEPrekeys(aid: string): PrekeyMap {
-    return this._getDB(aid).loadPrekeys('') as PrekeyMap;
-  }
-
-  loadE2EEPrekeysForDevice(aid: string, deviceId: string): PrekeyMap {
+  loadE2EEPrekeys(aid: string, deviceId?: string): PrekeyMap {
     return this._getDB(aid).loadPrekeys(String(deviceId ?? '').trim()) as PrekeyMap;
   }
 
-  saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord): void {
-    const pem = typeof prekeyData.private_key_pem === 'string' ? prekeyData.private_key_pem : '';
-    const extra: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(prekeyData)) {
-      if (!['private_key_pem', 'created_at', 'updated_at', 'expires_at'].includes(k)) extra[k] = v;
-    }
-    this._getDB(aid).savePrekey(prekeyId, pem, '', prekeyData.created_at, prekeyData.expires_at, extra);
-  }
-
-  saveE2EEPrekeyForDevice(aid: string, deviceId: string, prekeyId: string, prekeyData: PrekeyRecord): void {
+  saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): void {
     const pem = typeof prekeyData.private_key_pem === 'string' ? prekeyData.private_key_pem : '';
     const extra: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(prekeyData)) {
@@ -306,11 +293,7 @@ export class FileKeyStore implements KeyStore {
     this._getDB(aid).savePrekey(prekeyId, pem, String(deviceId ?? '').trim(), prekeyData.created_at, prekeyData.expires_at, extra);
   }
 
-  cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest = 7): string[] {
-    return this._getDB(aid).cleanupPrekeys('', cutoffMs, keepLatest);
-  }
-
-  cleanupE2EEPrekeysForDevice(aid: string, deviceId: string, cutoffMs: number, keepLatest = 7): string[] {
+  cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest = 7, deviceId?: string): string[] {
     return this._getDB(aid).cleanupPrekeys(String(deviceId ?? '').trim(), cutoffMs, keepLatest);
   }
 

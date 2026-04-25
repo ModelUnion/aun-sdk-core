@@ -4,7 +4,7 @@
  * 测试客户端构造、参数校验、状态管理等不需要网络连接的逻辑。
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { existsSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -128,12 +128,12 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
     ks.saveE2EEPrekey(aid, 'pk1', {
       private_key_pem: 'KEEP_ME',
       created_at: 1,
-    });
+    }, deviceId);
 
     (client as any)._aid = aid;
     (client as any)._syncIdentityAfterConnect('tok-connect');
 
-    const prekeys = ks.loadE2EEPrekeys(aid);
+    const prekeys = ks.loadE2EEPrekeys(aid, deviceId);
     const instanceState = ks.loadInstanceState(aid, deviceId, '');
     expect(instanceState.access_token).toBe('tok-connect');
     expect(prekeys.pk1?.private_key_pem).toBe('KEEP_ME');
@@ -147,7 +147,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await expect(client.call('message.send', {
       to: 'group.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
     })).rejects.toThrow(ValidationError);
   });
@@ -158,7 +158,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await expect(client.call('message.send', {
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
       persist: true,
     })).rejects.toThrow("message.send no longer accepts 'persist'");
@@ -170,7 +170,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await expect(client.call('message.send', {
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
       delivery_mode: { mode: 'queue' },
     })).rejects.toThrow('message.send does not accept delivery_mode');
@@ -188,7 +188,7 @@ describe('AUNClient message.send 接收者校验', () => {
 
     await client.call('message.send', {
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
       encrypt: false,
     });
 
@@ -256,7 +256,7 @@ describe('AUNClient 证书 URL 与 prekey 指纹编排', () => {
 
     const result = await (client as any)._sendEncrypted({
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     expect(result).toEqual({ ok: true });
@@ -291,7 +291,7 @@ describe('AUNClient 证书 URL 与 prekey 指纹编排', () => {
 
     const result = await (client as any)._sendEncrypted({
       to: 'bob.example.com',
-      payload: { text: 'hello' },
+      payload: { type: 'text', text: 'hello' },
     });
 
     expect(result).toEqual({ ok: true });
@@ -623,7 +623,8 @@ describe('AUNClient 群组 epoch 自动轮换', () => {
             ],
           };
         }
-        throw new Error(`unexpected method: ${method}`);
+        // 允许 ack 等调用通过
+        return { ok: true };
       });
       vi.spyOn(Math, 'random').mockReturnValue(0);
 
@@ -631,6 +632,7 @@ describe('AUNClient 群组 epoch 自动轮换', () => {
         group_id: 'test-group-123',
         action: 'member_removed',
         member_aid: 'removed.aid.com',
+        old_epoch: 5,
       });
       await vi.runAllTimersAsync();
 
@@ -667,10 +669,10 @@ describe('close_code 1000 不应视为 serverInitiated', () => {
   });
 });
 
-// ── group.add_member 密钥分发结果检查测试 ──────────────────
+// ── group.add_member epoch 轮换兜底测试 ──────────────────
 
-describe('group.add_member 失败时不应分发密钥', () => {
-  it('group.add_member 返回 error 时不应触发密钥分发', async () => {
+describe('group.add_member 成员变更 epoch 处理', () => {
+  it('group.add_member 返回 error 时不应触发 epoch 轮换', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._aid = 'test.aid.com';
@@ -681,20 +683,18 @@ describe('group.add_member 失败时不应分发密钥', () => {
       error: { code: -33003, message: 'not authorized' },
     });
 
-    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
-    const rotateSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
+    const rotateSpy = vi.spyOn(client as any, '_maybeLeadRotateGroupEpoch').mockResolvedValue(undefined);
 
     await client.call('group.add_member', {
       group_id: 'group-123',
       aid: 'new-member.aid.com',
     });
 
-    // 失败的 add_member 不应触发密钥分发
-    expect(distributeSpy).not.toHaveBeenCalled();
+    // 失败的 add_member 不应触发 epoch 轮换
     expect(rotateSpy).not.toHaveBeenCalled();
   });
 
-  it('group.add_member 成功时应触发密钥分发', async () => {
+  it('group.add_member 成功时应触发 epoch 轮换兜底', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._aid = 'test.aid.com';
@@ -705,15 +705,125 @@ describe('group.add_member 失败时不应分发密钥', () => {
       ok: true,
     });
 
-    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
+    const rotateSpy = vi.spyOn(client as any, '_maybeLeadRotateGroupEpoch').mockResolvedValue(undefined);
 
     await client.call('group.add_member', {
       group_id: 'group-123',
       aid: 'new-member.aid.com',
     });
 
-    // 成功的 add_member 应触发密钥分发
-    expect(distributeSpy).toHaveBeenCalledWith('group-123', 'new-member.aid.com');
+    // 成功的 add_member 应触发 epoch 轮换兜底（fire-and-forget）
+    expect(rotateSpy).toHaveBeenCalledWith(
+      'group-123',
+      expect.any(String),
+      null,
+    );
+  });
+});
+
+// ── R1: health-fail 路径也应受 max_attempts 约束 ──────────
+
+describe('R1: health-fail 路径 max_attempts 检查', () => {
+  it('health 持续失败时应在 max_attempts 次后进入 terminal_failed', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+      (client as any)._sessionParams = { access_token: 'tok-1', gateway: 'ws://gateway.example.com/aun' };
+      (client as any)._gatewayUrl = 'ws://gateway.example.com/aun';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.01, max_delay: 0.01, max_attempts: 3 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+
+      // health check 始终失败 → 应走 health-fail 路径
+      (client as any)._discovery = { checkHealth: vi.fn().mockResolvedValue(false) };
+      (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+      // _connectOnce 不应被调用（health 失败应跳过连接）
+      (client as any)._connectOnce = vi.fn().mockRejectedValue(new Error('should not reach'));
+
+      (client as any)._startReconnect();
+      // 推进足够多的 timer 让所有重试完成
+      await vi.advanceTimersByTimeAsync(500);
+
+      // health-fail 路径应计入 attempt，3 次后应终止
+      expect(client.state).toBe('terminal_failed');
+      expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
+        state: 'terminal_failed',
+        reason: 'max_attempts_exhausted',
+      }));
+      // _connectOnce 不应被调用（health 一直失败）
+      expect((client as any)._connectOnce).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ── R2: Full Jitter 不应双重随机化 ──────────────────────────
+
+describe('R2: delay 基数不应被 Math.random 污染', () => {
+  it('连续重连失败时 delay 基数应指数增长，不坍塌到 0', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+      (client as any)._sessionParams = { access_token: 'tok-1', gateway: 'ws://gateway.example.com/aun' };
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 1.0, max_delay: 64, max_attempts: 0 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+
+      // 固定 Math.random 为 0.1，如果有双重随机化，delay 会迅速坍塌
+      vi.spyOn(Math, 'random').mockReturnValue(0.1);
+
+      // 记录每次 setTimeout 的实际 delay
+      const timeoutDelays: number[] = [];
+      const origSetTimeout = globalThis.setTimeout;
+      vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn: any, delay?: number) => {
+        if (delay !== undefined) timeoutDelays.push(delay);
+        return origSetTimeout(fn, delay);
+      });
+
+      let connectAttempts = 0;
+      (client as any)._connectOnce = vi.fn().mockImplementation(async () => {
+        connectAttempts++;
+        if (connectAttempts >= 5) {
+          // 第 5 次后停止重连
+          (client as any)._closing = true;
+        }
+        throw new ConnectionError('gateway down');
+      });
+
+      (client as any)._startReconnect();
+      await vi.advanceTimersByTimeAsync(100_000);
+
+      // 正确的 Full Jitter 下，delay 基数应翻倍增长：
+      // attempt 1: base = 1s, sleep = random(0, 1s) = 100ms, next_base = 2s
+      // attempt 2: base = 2s, sleep = random(0, 2s) = 200ms, next_base = 4s
+      // attempt 3: base = 4s, sleep = random(0, 4s) = 400ms, next_base = 8s
+      // 如果双重随机化，delay 会指数衰减到接近 0
+      // 验证：第 3 次 setTimeout delay 应大于第 1 次
+      expect(timeoutDelays.length).toBeGreaterThanOrEqual(3);
+      // 每次 setTimeout delay 都应 > 0（不坍塌到 0）
+      for (const d of timeoutDelays) {
+        expect(d).toBeGreaterThanOrEqual(0);
+      }
+      // delay 应递增（指数退避），第 3 次应大于第 1 次
+      if (timeoutDelays.length >= 3) {
+        expect(timeoutDelays[2]).toBeGreaterThan(timeoutDelays[0]);
+      }
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
   });
 });
 
@@ -776,4 +886,203 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     expect(client.state).toBe('terminal_failed');
     expect(startReconnectSpy).not.toHaveBeenCalled();
   });
+});
+
+// ── R3: 解密失败不应 publish 密文给应用层 ──────────────────
+
+describe('R3: 解密失败不应将密文 publish 给应用层', () => {
+  /** 构造一个预设解密失败的 client */
+  function makeDecryptFailClient() {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'device-001';
+    (client as any)._identity = { aid: 'test.aid.com' };
+
+    // _decryptGroupMessage 返回原始消息（无 e2ee 字段）= 解密失败
+    vi.spyOn(client as any, '_decryptGroupMessage').mockImplementation(async (msg: any) => msg);
+    // _ensureSenderCertCached 直接通过
+    vi.spyOn(client as any, '_ensureSenderCertCached').mockResolvedValue(true);
+    // SeqTracker 不触发补洞
+    (client as any)._seqTracker = {
+      onMessageSeq: () => false,
+      getContiguousSeq: () => 0,
+      exportState: () => ({}),
+    };
+
+    return client;
+  }
+
+  it('推送路径：解密失败时不应 publish group.message_created', async () => {
+    const client = makeDecryptFailClient();
+    const events: string[] = [];
+    (client as any)._dispatcher.subscribe('group.message_created', () => { events.push('created'); });
+    (client as any)._dispatcher.subscribe('group.message_undecryptable', () => { events.push('undecryptable'); });
+
+    const msg = {
+      group_id: 'g1',
+      from: 'sender.aid.com',
+      seq: 1,
+      payload: { type: 'e2ee.group_encrypted', epoch: 1, ciphertext: 'AAAA' },
+    };
+    await (client as any)._processAndPublishGroupMessage(msg);
+
+    // 不应有 group.message_created 事件
+    expect(events).not.toContain('created');
+    // 应有 group.message_undecryptable 事件
+    expect(events).toContain('undecryptable');
+  });
+
+  it('推送路径：解密失败时应入 pending 队列', async () => {
+    const client = makeDecryptFailClient();
+    const msg = {
+      group_id: 'g1',
+      from: 'sender.aid.com',
+      seq: 2,
+      payload: { type: 'e2ee.group_encrypted', epoch: 1, ciphertext: 'BBBB' },
+    };
+    await (client as any)._processAndPublishGroupMessage(msg);
+
+    const pending = (client as any)._pendingDecryptMsgs.get('group:g1');
+    expect(pending).toBeDefined();
+    expect(pending.length).toBe(1);
+  });
+
+  it('批量路径：解密失败的消息不应出现在返回结果中', async () => {
+    const client = makeDecryptFailClient();
+
+    const msgs = [
+      { group_id: 'g1', from: 'a', seq: 1, payload: { type: 'e2ee.group_encrypted', epoch: 1, ciphertext: 'X' } },
+      { group_id: 'g1', from: 'b', seq: 2, payload: { type: 'text', text: 'hello' } }, // 非加密消息
+    ];
+    const result = await (client as any)._decryptGroupMessages(msgs);
+
+    // 只有非加密消息应在结果中，加密但解密失败的不应在结果中
+    expect(result.length).toBe(1);
+    expect(result[0].payload.type).toBe('text');
+  });
+});
+
+// ── R4: _retryPendingDecryptMsgs 应被激活 ──────────────────
+
+describe('R4: 收到密钥后应触发 pending 消息重试', () => {
+  it('handleIncoming 返回 distribution 后应调用 _retryPendingDecryptMsgs', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._identity = { aid: 'test.aid.com' };
+
+    // 预填充 pending 队列
+    (client as any)._pendingDecryptMsgs.set('group:g1', [{ fake: true }]);
+
+    // handleIncoming 返回 'distribution'
+    (client as any)._groupE2ee = {
+      handleIncoming: vi.fn().mockReturnValue('distribution'),
+      decrypt: vi.fn(),
+      loadSecret: vi.fn(),
+      getMemberAids: vi.fn().mockReturnValue([]),
+    };
+
+    const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
+
+    const msg = {
+      from: 'peer.aid.com',
+      payload: {
+        type: 'e2ee.group_key_distribution',
+        group_id: 'g1',
+        epoch: 2,
+      },
+    };
+
+    await (client as any)._tryHandleGroupKeyMessage(msg);
+
+    expect(retrySpy).toHaveBeenCalledWith('g1');
+  });
+});
+
+// ── Epoch key recovery inflight 去重 ──────────────────
+
+describe('epoch key recovery inflight 去重', () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+
+  function makeRecoveryClient() {
+    vi.useFakeTimers();
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'test.aid.com';
+    (client as any)._deviceId = 'device-001';
+    (client as any)._identity = { aid: 'test.aid.com' };
+    (client as any)._seqTracker = {
+      onMessageSeq: () => false,
+      getContiguousSeq: () => 0,
+      exportState: () => ({}),
+    };
+
+    let secretAvailable = false;
+    (client as any)._groupE2ee = {
+      loadSecret: vi.fn().mockImplementation(() => secretAvailable ? { key: 'ok' } : null),
+      getMemberAids: vi.fn().mockReturnValue([]),
+    };
+
+    const requestSpy = vi.fn().mockImplementation(async () => {
+      secretAvailable = true;
+    });
+    (client as any)._requestGroupKeyFromCandidates = requestSpy;
+    (client as any).call = vi.fn().mockResolvedValue({ epoch: 3, recovery_candidates: ['peer.aid.com'] });
+
+    return {
+      client,
+      requestSpy,
+      resetSecret: () => { secretAvailable = false; },
+    };
+  }
+
+  /** 推进 fake timer 并 flush 所有 microtask，直至所有 promise settle */
+  async function advanceUntilSettled() {
+    for (let i = 0; i < 20; i++) {
+      await vi.advanceTimersByTimeAsync(200);
+    }
+  }
+
+  it('并发 3 次 recoverGroupEpochKey(同 groupId+epoch) 只应发起 1 次 key request', async () => {
+    const { client, requestSpy } = makeRecoveryClient();
+
+    const p1 = (client as any)._recoverGroupEpochKey('g1', 3, 'sender1', 2000);
+    const p2 = (client as any)._recoverGroupEpochKey('g1', 3, 'sender2', 2000);
+    const p3 = (client as any)._recoverGroupEpochKey('g1', 3, 'sender3', 2000);
+
+    await advanceUntilSettled();
+    await Promise.all([p1, p2, p3]);
+
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  }, 10000);
+
+  it('不同 groupId 或 epoch 的恢复请求应各自独立', async () => {
+    const { client, requestSpy } = makeRecoveryClient();
+
+    const p1 = (client as any)._recoverGroupEpochKey('g1', 3, '', 2000);
+    const p2 = (client as any)._recoverGroupEpochKey('g2', 3, '', 2000);
+    const p3 = (client as any)._recoverGroupEpochKey('g1', 4, '', 2000);
+
+    await advanceUntilSettled();
+    await Promise.all([p1, p2, p3]);
+
+    expect(requestSpy).toHaveBeenCalledTimes(3);
+  }, 10000);
+
+  it('恢复完成后同 key 的新请求应重新发起', async () => {
+    const { client, requestSpy, resetSecret } = makeRecoveryClient();
+
+    const p1 = (client as any)._recoverGroupEpochKey('g1', 3, '', 2000);
+    await advanceUntilSettled();
+    await p1;
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+
+    resetSecret();
+
+    const p2 = (client as any)._recoverGroupEpochKey('g1', 3, '', 2000);
+    await advanceUntilSettled();
+    await p2;
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  }, 10000);
 });

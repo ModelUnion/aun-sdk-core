@@ -45,18 +45,12 @@ export interface KeyStore {
     updater: (state: MetadataRecord) => MetadataRecord | void,
   ): MetadataRecord;
 
-  /** 加载结构化 prekeys 主存 */
-  loadE2EEPrekeys?(aid: string): PrekeyMap;
-  /** 按 device_id 加载结构化 prekeys 主存 */
-  loadE2EEPrekeysForDevice?(aid: string, deviceId: string): PrekeyMap;
-  /** 保存单个结构化 prekey 主存记录 */
-  saveE2EEPrekey?(aid: string, prekeyId: string, prekeyData: PrekeyRecord): void;
-  /** 按 device_id 保存单个结构化 prekey 主存记录 */
-  saveE2EEPrekeyForDevice?(aid: string, deviceId: string, prekeyId: string, prekeyData: PrekeyRecord): void;
-  /** 清理过期结构化 prekeys */
-  cleanupE2EEPrekeys?(aid: string, cutoffMs: number, keepLatest?: number): string[];
-  /** 按 device_id 清理过期结构化 prekeys */
-  cleanupE2EEPrekeysForDevice?(aid: string, deviceId: string, cutoffMs: number, keepLatest?: number): string[];
+  /** 加载结构化 prekeys，deviceId 为空时等价于全局 */
+  loadE2EEPrekeys?(aid: string, deviceId?: string): PrekeyMap;
+  /** 保存单个 prekey，deviceId 为空时等价于全局 */
+  saveE2EEPrekey?(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): void;
+  /** 清理过期 prekeys，deviceId 为空时等价于全局 */
+  cleanupE2EEPrekeys?(aid: string, cutoffMs: number, keepLatest?: number, deviceId?: string): string[];
 
   /** 加载单个群组结构化密钥状态 */
   loadGroupSecretState?(aid: string, groupId: string): GroupSecretRecord | null;

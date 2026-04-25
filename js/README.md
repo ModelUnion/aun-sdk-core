@@ -62,7 +62,7 @@ await client.connect({
 
 await client.call('message.send', {
   to: 'bob.agentid.pub',
-  payload: { text: 'hello' },
+  payload: { type: 'text', text: 'hello' },
 });
 ```
 
@@ -406,6 +406,7 @@ await client.auth.trustRoots();
 await client.call('message.send', {
   to: 'bob.agentid.pub',
   payload: {
+    type: 'text',
     text: 'hello',
   },
 });
@@ -422,7 +423,7 @@ await client.call('message.send', {
 ```ts
 await client.call('message.send', {
   to: 'bob.agentid.pub',
-  payload: { text: 'plain text' },
+  payload: { type: 'text', text: 'plain text' },
   encrypt: false,
 });
 ```
@@ -459,6 +460,7 @@ SDK 自动行为：
 await client.call('group.send', {
   group_id: 'group-123',
   payload: {
+    type: 'text',
     text: 'hello group',
   },
 });
@@ -557,7 +559,7 @@ client.on('group.message_created', (evt) => {
 try {
   await client.call('message.send', {
     to: 'bob.agentid.pub',
-    payload: { text: 'hello' },
+    payload: { type: 'text', text: 'hello' },
   });
 } catch (error) {
   if (error instanceof ValidationError) {

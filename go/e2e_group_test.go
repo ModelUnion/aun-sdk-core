@@ -420,7 +420,7 @@ func TestGroupE2EEncryptedMessaging(t *testing.T) {
 	defer bobWatch.Stop()
 
 	// Alice 发送加密群消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "加密群消息"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "加密群消息"})
 
 	msgs := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
 		for _, msg := range filterDecrypted(messages) {
@@ -484,7 +484,7 @@ func TestGroupE2EMultipleMembers(t *testing.T) {
 	defer carolWatch.Stop()
 
 	// Alice 发送加密群消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "三人群消息"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "三人群消息"})
 
 	// Bob 和 Carol 都能解密
 	for _, tc := range []struct {
@@ -558,7 +558,7 @@ func TestGroupE2EEpochRotationOnKick(t *testing.T) {
 	defer bobWatch.Stop()
 
 	// Alice 用 epoch 2 发加密消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "踢人后的消息"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "踢人后的消息"})
 
 	// Bob 能解密（有 epoch 2 密钥）
 	msgsBob := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
@@ -615,7 +615,7 @@ func TestGroupE2EBurstMessages(t *testing.T) {
 	const N = 5
 	for i := 0; i < N; i++ {
 		groupSendEncrypted(t, alice, groupID, map[string]any{
-			"text": fmt.Sprintf("burst_%d", i),
+			"type": "text", "text": fmt.Sprintf("burst_%d", i),
 			"seq":  i,
 		})
 	}
@@ -707,7 +707,7 @@ func TestGroupE2EPlaintextExplicit(t *testing.T) {
 	defer bobWatch.Stop()
 
 	// Alice 显式发送明文消息
-	groupSendPlaintext(t, alice, groupID, map[string]any{"text": "这是一条明文消息"})
+	groupSendPlaintext(t, alice, groupID, map[string]any{"type": "text", "text": "这是一条明文消息"})
 
 	msgs := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
 		for _, m := range messages {
@@ -743,7 +743,7 @@ func TestGroupE2EPlaintextExplicit(t *testing.T) {
 	}
 
 	// Alice 默认加密发送
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "这是一条加密消息"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "这是一条加密消息"})
 
 	msgs2 := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
 		for _, msg := range filterDecrypted(messages) {
@@ -817,7 +817,7 @@ func TestGroupE2ENewMemberNoRotation(t *testing.T) {
 	defer carolWatch.Stop()
 
 	// Alice 用 epoch 1 发消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "新成员能看到"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "新成员能看到"})
 
 	// Carol 能解密
 	msgs := carolWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
@@ -865,11 +865,11 @@ func TestGroupE2EMixedEncryptedPlaintext(t *testing.T) {
 	defer bobWatch.Stop()
 
 	// 明文消息
-	groupSendPlaintext(t, alice, groupID, map[string]any{"text": "明文"})
+	groupSendPlaintext(t, alice, groupID, map[string]any{"type": "text", "text": "明文"})
 	// 加密消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "密文"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "密文"})
 	// 又一条明文
-	groupSendPlaintext(t, alice, groupID, map[string]any{"text": "又是明文"})
+	groupSendPlaintext(t, alice, groupID, map[string]any{"type": "text", "text": "又是明文"})
 
 	msgs := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
 		hasPlain1 := false
@@ -960,7 +960,7 @@ func TestGroupE2EOldEpochStillDecryptable(t *testing.T) {
 	defer bobWatch.Stop()
 
 	// epoch 1 发消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "epoch1消息"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "epoch1消息"})
 
 	// 手动轮换 epoch 2（模拟踢人后轮换）
 	members := []string{aAID, bAID}
@@ -994,7 +994,7 @@ func TestGroupE2EOldEpochStillDecryptable(t *testing.T) {
 	}
 
 	// epoch 2 发消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "epoch2消息"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "epoch2消息"})
 
 	// Bob 应能解密两个 epoch 的消息
 	msgs := bobWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
@@ -1092,7 +1092,7 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 	defer bobWatch.Stop()
 
 	// Alice 用 epoch 2 发加密消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "退群后的消息"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "退群后的消息"})
 
 	// Bob 能解密
 	msgsBob := bobWatch.WaitFor(t, 15*time.Second, func(messages []map[string]any) bool {
@@ -1165,7 +1165,7 @@ func TestGroupE2EPushEventDecrypt(t *testing.T) {
 	})
 
 	// Alice 发送加密群消息
-	groupSendEncrypted(t, alice, groupID, map[string]any{"text": "推送测试"})
+	groupSendEncrypted(t, alice, groupID, map[string]any{"type": "text", "text": "推送测试"})
 
 	// 等待推送事件
 	timer := time.NewTimer(8 * time.Second)

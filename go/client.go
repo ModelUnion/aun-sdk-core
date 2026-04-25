@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -196,6 +197,12 @@ type cachedPeerPrekeys struct {
 }
 
 // AUNClient AUN 协议客户端主类
+// epochRecoveryResult 用于 epoch key recovery 的 singleflight 去重
+type epochRecoveryResult struct {
+	done chan struct{}
+	ok   bool
+}
+
 type AUNClient struct {
 	mu           sync.RWMutex
 	config       map[string]any
@@ -246,6 +253,14 @@ type AUNClient struct {
 	pushedSeqs   map[string]map[int]bool
 	pushedSeqsMu sync.Mutex
 
+	// 群惰性同步标志：首次对群发消息/收到推送后标记，避免重复 pull
+	groupSynced   map[string]bool
+	groupSyncedMu sync.Mutex
+
+	// P2P 惰性同步标志：首次发送/收到 P2P 消息后标记
+	p2pSynced   bool
+	p2pSyncedMu sync.Mutex
+
 	// 群消息缺少 epoch key 时的待解队列
 	pendingDecryptMsgs   map[string][]map[string]any
 	pendingDecryptMsgsMu sync.Mutex
@@ -253,6 +268,10 @@ type AUNClient struct {
 	groupEpochRotationInflight  map[string]bool
 	groupEpochRotationMu        sync.Mutex
 	groupMembershipRotationDone map[string]bool
+
+	// epoch key recovery inflight 去重（singleflight 模式）
+	groupEpochRecoveryInflight   map[string]*epochRecoveryResult
+	groupEpochRecoveryInflightMu sync.Mutex
 
 	// 后台任务上下文
 	ctx              context.Context
@@ -322,6 +341,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		seqTracker:                 NewSeqTracker(),
 		gapFillDone:                make(map[string]bool),
 		pushedSeqs:                 make(map[string]map[int]bool),
+		groupSynced:                make(map[string]bool),
 		sessionOptions: map[string]any{
 			"auto_reconnect":       true,
 			"heartbeat_interval":   30.0,
@@ -337,8 +357,9 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 			},
 		},
 		pendingDecryptMsgs:          make(map[string][]map[string]any),
-		groupEpochRotationInflight:  make(map[string]bool),
+		groupEpochRotationInflight:   make(map[string]bool),
 		groupMembershipRotationDone: make(map[string]bool),
+		groupEpochRecoveryInflight:  make(map[string]*epochRecoveryResult),
 		prekeyReplenishInflight:     make(map[string]bool),
 		prekeyReplenished:           make(map[string]bool),
 		logger:                      aunLogger,
@@ -1018,6 +1039,14 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 		timestamp = time.Now().UnixMilli()
 	}
 
+	// 惰性同步：首次发送 P2P 消息时先 pull 一次，确保 seq 状态就绪
+	c.p2pSyncedMu.Lock()
+	synced := c.p2pSynced
+	c.p2pSyncedMu.Unlock()
+	if !synced {
+		c.lazySyncP2p()
+	}
+
 	recipientPrekeys, err := c.fetchPeerPrekeys(ctx, toAID)
 	if err != nil {
 		return nil, err
@@ -1261,6 +1290,14 @@ func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]an
 	payload, _ := params["payload"].(map[string]any)
 	if groupID == "" {
 		return nil, NewValidationError("group.send 需要 group_id")
+	}
+
+	// 惰性同步：首次对该群发消息时先 pull 一次，确保 epoch key 和 seq 状态就绪
+	c.groupSyncedMu.Lock()
+	synced := c.groupSynced[groupID]
+	c.groupSyncedMu.Unlock()
+	if !synced {
+		c.lazySyncGroup(groupID)
 	}
 
 	if err := c.ensureGroupEpochReady(ctx, groupID, false); err != nil {
@@ -1555,6 +1592,11 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 	myAID := c.aid
 	c.mu.RUnlock()
 	if seq > 0 && myAID != "" {
+		// 收到推送即标记 P2P 已同步
+		c.p2pSyncedMu.Lock()
+		c.p2pSynced = true
+		c.p2pSyncedMu.Unlock()
+
 		ns := "p2p:" + myAID
 		// 预标记：在启动补洞 goroutine 之前完成，确保补洞路径能看到此 seq 已被推送路径处理。
 		// 若解密失败，补洞路径的 decryptMessages 也会过滤掉同一条消息，不会重复投递。
@@ -1629,6 +1671,11 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 
 	// 空洞检测（无论带不带 payload 都检查）
 	if groupID != "" && seq > 0 {
+		// 收到推送即标记该群已同步
+		c.groupSyncedMu.Lock()
+		c.groupSynced[groupID] = true
+		c.groupSyncedMu.Unlock()
+
 		ns := "group:" + groupID
 		// 预标记：在启动补洞 goroutine 之前完成，确保补洞路径能看到此 seq 已被推送路径处理。
 		c.markPushedSeq(ns, seq)
@@ -1741,8 +1788,8 @@ func (c *AUNClient) autoPullGroupMessages(notification map[string]any) {
 func (c *AUNClient) fillGroupGap(groupID string) {
 	ns := "group:" + groupID
 	afterSeq := c.seqTracker.GetContiguousSeq(ns)
-	// 新设备（seq=0）没有历史 epoch key，拉旧消息也解不了
-	if afterSeq == 0 && !c.groupE2EE.HasSecret(groupID) {
+	// 冷启动（seq=0）：服务端推送会带全量消息，SDK 不主动补洞避免重复拉取
+	if afterSeq == 0 {
 		return
 	}
 	// 去重：同一 (group:id:after_seq) 只补一次
@@ -1785,10 +1832,55 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 	c.publishGapFillGroupMessages(nsKey, messages)
 }
 
+// lazySyncGroup 惰性同步：首次激活群时 pull 最近消息，建立 seq 基线。
+func (c *AUNClient) lazySyncGroup(groupID string) {
+	c.groupSyncedMu.Lock()
+	c.groupSynced[groupID] = true
+	c.groupSyncedMu.Unlock()
+
+	ns := "group:" + groupID
+	afterSeq := c.seqTracker.GetContiguousSeq(ns)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := c.transport.Call(ctx, "group.pull", map[string]any{
+		"group_id":          groupID,
+		"after_message_seq": afterSeq,
+		"limit":             200,
+	})
+	if err != nil {
+		log.Printf("[aun_core] [WARN] 惰性同步群 %s 失败: %v", groupID, err)
+		return
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return
+	}
+	messages, ok := resultMap["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range messages {
+		if msg, ok := raw.(map[string]any); ok {
+			s := int(toInt64(msg["seq"]))
+			if s > 0 {
+				c.seqTracker.OnMessageSeq(ns, s)
+			}
+		}
+	}
+	if len(messages) > 0 {
+		c.saveSeqTrackerState()
+		log.Printf("[aun_core] 惰性同步群 %s: pull %d 条消息, after_seq=%d", groupID, len(messages), afterSeq)
+	}
+}
+
 // fillGroupEventGap 后台补齐群事件空洞
 func (c *AUNClient) fillGroupEventGap(groupID string) {
 	ns := "group_event:" + groupID
 	afterSeq := c.seqTracker.GetContiguousSeq(ns)
+	// 冷启动（seq=0）：服务端推送会带全量事件，SDK 不主动补洞避免重复拉取
+	if afterSeq == 0 {
+		return
+	}
 	// 去重：同一 (group_evt:id:after_seq) 只补一次
 	dedupKey := fmt.Sprintf("group_evt:%s:%d", groupID, afterSeq)
 	c.gapFillDoneMu.Lock()
@@ -1912,6 +2004,53 @@ func (c *AUNClient) fillP2pGap() {
 	// seq_tracker 更新和 auto-ack 已在 Call() 拦截器中完成
 	nsKey := "p2p:" + myAID
 	c.publishGapFillMessages(nsKey, messages)
+}
+
+// lazySyncP2p 惰性同步：首次激活 P2P 通道时 pull 最近消息，建立 seq 基线。
+func (c *AUNClient) lazySyncP2p() {
+	c.p2pSyncedMu.Lock()
+	c.p2pSynced = true
+	c.p2pSyncedMu.Unlock()
+
+	c.mu.RLock()
+	myAID := c.aid
+	c.mu.RUnlock()
+	if myAID == "" {
+		return
+	}
+
+	ns := "p2p:" + myAID
+	afterSeq := c.seqTracker.GetContiguousSeq(ns)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := c.transport.Call(ctx, "message.pull", map[string]any{
+		"after_seq": afterSeq,
+		"limit":     200,
+	})
+	if err != nil {
+		log.Printf("[aun_core] [WARN] 惰性同步 P2P 失败: %v", err)
+		return
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return
+	}
+	messages, ok := resultMap["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range messages {
+		if msg, ok := raw.(map[string]any); ok {
+			s := int(toInt64(msg["seq"]))
+			if s > 0 {
+				c.seqTracker.OnMessageSeq(ns, s)
+			}
+		}
+	}
+	if len(messages) > 0 {
+		c.saveSeqTrackerState()
+		log.Printf("[aun_core] 惰性同步 P2P: pull %d 条消息, after_seq=%d", len(messages), afterSeq)
+	}
 }
 
 // prunePushedSeqs 清理 pushedSeqs 中 <= contiguousSeq 的条目，防止无限增长
@@ -2533,6 +2672,12 @@ func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string
 	}
 	payloadType, _ := payload["type"].(string)
 	if payloadType != "e2ee.encrypted" {
+		if enc, ok := message["encrypted"].(bool); ok && enc {
+			errMsg := fmt.Sprintf("不支持的 P2P 加密消息类型: %s", payloadType)
+			log.Printf("[WARN] P2P 解密失败: %s", errMsg)
+			message["_decrypt_error"] = errMsg
+			return nil
+		}
 		return message
 	}
 	// 检查 encrypted 标记
@@ -2629,6 +2774,12 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 	}
 	payloadType, _ := payload["type"].(string)
 	if payloadType != "e2ee.group_encrypted" {
+		if enc, ok := message["encrypted"].(bool); ok && enc {
+			errMsg := fmt.Sprintf("不支持的群加密消息类型: %s", payloadType)
+			log.Printf("[WARN] 群消息解密失败: %s", errMsg)
+			message["_decrypt_error"] = errMsg
+			return nil
+		}
 		return message
 	}
 
@@ -2654,7 +2805,12 @@ func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]
 		}
 	}
 
-	// 解密失败时，先同步请求目标 epoch key；5 秒内拿到则立即重解。
+	// replay guard 命中：不是解密失败，不应触发 recover
+	if errors.Is(decryptErr, ErrReplayDetected) {
+		return nil
+	}
+
+	// 真正的解密失败，先同步请求目标 epoch key；5 秒内拿到则立即重解。
 	groupID, _ := message["group_id"].(string)
 	sender, _ := message["from"].(string)
 	if sender == "" {
@@ -2728,9 +2884,43 @@ func (c *AUNClient) retryPendingDecryptMsgs(groupID string) {
 }
 
 func (c *AUNClient) recoverGroupEpochKey(ctx context.Context, groupID string, epoch int, senderAID string, timeout time.Duration) bool {
+	// 快速路径：本地已有该 epoch 密钥
 	if secret, err := c.groupE2EE.LoadSecretForEpoch(groupID, epoch); err == nil && secret != nil {
 		return true
 	}
+
+	key := fmt.Sprintf("%s:%d", groupID, epoch)
+
+	c.groupEpochRecoveryInflightMu.Lock()
+	if entry, ok := c.groupEpochRecoveryInflight[key]; ok {
+		// 已有恢复进行中，等待其完成
+		c.groupEpochRecoveryInflightMu.Unlock()
+		select {
+		case <-entry.done:
+			return entry.ok
+		case <-ctx.Done():
+			return false
+		}
+	}
+	// 首个请求，注册 inflight 条目
+	entry := &epochRecoveryResult{done: make(chan struct{})}
+	c.groupEpochRecoveryInflight[key] = entry
+	c.groupEpochRecoveryInflightMu.Unlock()
+
+	// 执行实际恢复逻辑
+	entry.ok = c.doRecoverGroupEpochKey(ctx, groupID, epoch, senderAID, timeout)
+	close(entry.done)
+
+	// 清理 inflight 条目
+	c.groupEpochRecoveryInflightMu.Lock()
+	delete(c.groupEpochRecoveryInflight, key)
+	c.groupEpochRecoveryInflightMu.Unlock()
+
+	return entry.ok
+}
+
+// doRecoverGroupEpochKey 执行实际的 epoch key 恢复逻辑
+func (c *AUNClient) doRecoverGroupEpochKey(ctx context.Context, groupID string, epoch int, senderAID string, timeout time.Duration) bool {
 	epochResult := map[string]any{"epoch": epoch}
 	if raw, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
 		if m, ok := raw.(map[string]any); ok {
@@ -2914,6 +3104,12 @@ func (c *AUNClient) resetSeqTrackingStateLocked() {
 	c.pushedSeqsMu.Lock()
 	c.pushedSeqs = make(map[string]map[int]bool)
 	c.pushedSeqsMu.Unlock()
+	c.groupSyncedMu.Lock()
+	c.groupSynced = make(map[string]bool)
+	c.groupSyncedMu.Unlock()
+	c.p2pSyncedMu.Lock()
+	c.p2pSynced = false
+	c.p2pSyncedMu.Unlock()
 }
 
 func (c *AUNClient) refreshSeqTrackerContextLocked() {
@@ -2929,6 +3125,12 @@ func (c *AUNClient) refreshSeqTrackerContextLocked() {
 	c.pushedSeqsMu.Lock()
 	c.pushedSeqs = make(map[string]map[int]bool)
 	c.pushedSeqsMu.Unlock()
+	c.groupSyncedMu.Lock()
+	c.groupSynced = make(map[string]bool)
+	c.groupSyncedMu.Unlock()
+	c.p2pSyncedMu.Lock()
+	c.p2pSynced = false
+	c.p2pSyncedMu.Unlock()
 }
 
 // resolveGateway 解析 Gateway URL
@@ -3951,9 +4153,9 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 			"attempt": attempt,
 		})
 
-		// Full Jitter: random(0, delay) 打散重连时机
+		// Additive Jitter: sleep in [delay, 2*delay] 保证最小退避间隔
 		// ISSUE-SDK-GO-007: 使用 crypto/rand 代替 math/rand，确保并发安全
-		jitteredDelay := secureRandFloat64() * delay
+		jitteredDelay := delay + secureRandFloat64()*delay
 		time.Sleep(time.Duration(jitteredDelay * float64(time.Second)))
 
 		// close() 可能在 sleep 期间被调用

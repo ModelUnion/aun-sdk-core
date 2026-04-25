@@ -35,13 +35,12 @@ async def main():
     # ── 发送群消息 ──
     await owner.call("group.send", {
         "group_id": gid,
-        "type": "text",
-        "payload": {"text": "大家好！"},
+        "payload": {"type": "text", "text": "大家好！"},
     })
     await member.call("group.send", {
         "group_id": gid,
-        "type": "json",
         "payload": {
+            "type": "json",
             "kind": "status_update",
             "text": "我已上线",
             "status": "online",

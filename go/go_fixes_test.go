@@ -93,7 +93,7 @@ func TestDecryptBatchReturnsPerMessageError(t *testing.T) {
 	}
 
 	// 加密一条消息
-	encrypted, err := mgr.Encrypt(groupID, map[string]any{"text": "hello"})
+	encrypted, err := mgr.Encrypt(groupID, map[string]any{"type": "text", "text": "hello"})
 	if err != nil {
 		t.Fatalf("Encrypt 失败: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestEncryptPropagatesLoadSecretError(t *testing.T) {
 	})
 
 	// 无密钥时 Encrypt 应返回 E2EEGroupSecretMissingError
-	_, err := mgr.Encrypt("nonexistent-group", map[string]any{"text": "hello"})
+	_, err := mgr.Encrypt("nonexistent-group", map[string]any{"type": "text", "text": "hello"})
 	if err == nil {
 		t.Fatal("GO-004: 无群组密钥时 Encrypt 应返回 error")
 	}
@@ -384,7 +384,7 @@ func TestSendGroupEncryptedEpochPrecheck(t *testing.T) {
 	// 无 epoch 密钥时应返回 E2EEGroupSecretMissingError
 	_, err := c.sendGroupEncrypted(nil, map[string]any{
 		"group_id": groupID,
-		"payload":  map[string]any{"text": "hello"},
+		"payload":  map[string]any{"type": "text", "text": "hello"},
 	})
 	if err == nil {
 		t.Fatal("无密钥时 sendGroupEncrypted 应返回 error")
@@ -392,7 +392,7 @@ func TestSendGroupEncryptedEpochPrecheck(t *testing.T) {
 
 	// 验证 group_id 缺失时返回 ValidationError
 	_, err = c.sendGroupEncrypted(nil, map[string]any{
-		"payload": map[string]any{"text": "hello"},
+		"payload": map[string]any{"type": "text", "text": "hello"},
 	})
 	if err == nil {
 		t.Fatal("缺少 group_id 时应返回 error")

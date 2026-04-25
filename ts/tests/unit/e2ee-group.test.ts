@@ -52,7 +52,7 @@ function makeGroupKs(aid: string): FakeKeystore {
 describe('encryptGroupMessage', () => {
   it('信封包含正确字段', () => {
     const gs = makeGroupSecret();
-    const envelope = encryptGroupMessage('grp-1', 1, gs, { text: 'hello' }, {
+    const envelope = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'hello' }, {
       fromAid: 'alice.test',
       messageId: 'msg-1',
       timestamp: Date.now(),
@@ -74,7 +74,7 @@ describe('encryptGroupMessage', () => {
     const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
     const certPem = makeSelfSignedCert(privateKey, 'alice.test');
 
-    const envelope = encryptGroupMessage('grp-1', 1, gs, { text: 'signed' }, {
+    const envelope = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'signed' }, {
       fromAid: 'alice.test',
       messageId: 'msg-1',
       timestamp: Date.now(),
@@ -90,7 +90,7 @@ describe('encryptGroupMessage', () => {
     const gs = makeGroupSecret();
     // 提供无效的私钥 PEM，应该抛出错误
     expect(() => {
-      encryptGroupMessage('grp-1', 1, gs, { text: 'fail' }, {
+      encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'fail' }, {
         fromAid: 'alice.test',
         messageId: 'msg-1',
         timestamp: Date.now(),
@@ -101,7 +101,7 @@ describe('encryptGroupMessage', () => {
 
   it('senderPrivateKeyPem 为 null 时信封不含签名（纯函数行为）', () => {
     const gs = makeGroupSecret();
-    const envelope = encryptGroupMessage('grp-1', 1, gs, { text: 'no sig' }, {
+    const envelope = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'no sig' }, {
       fromAid: 'alice.test',
       messageId: 'msg-1',
       timestamp: Date.now(),
@@ -121,7 +121,7 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
     const mid = `msg-${crypto.randomUUID()}`;
     const ts = Date.now();
 
-    const envelope = encryptGroupMessage('grp-1', 1, gs, { text: 'roundtrip' }, {
+    const envelope = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'roundtrip' }, {
       fromAid: 'alice.test',
       messageId: mid,
       timestamp: ts,
@@ -140,7 +140,7 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
 
     const result = decryptGroupMessage(message, secrets, certPem);
     expect(result).not.toBeNull();
-    expect((result as Message).payload).toEqual({ text: 'roundtrip' });
+    expect((result as Message).payload).toEqual({ type: 'text', text: 'roundtrip' });
     const e2ee = (result as Message).e2ee as JsonObject;
     expect(e2ee.encryption_mode).toBe('epoch_group_key');
     expect(e2ee.epoch).toBe(1);
@@ -152,7 +152,7 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
     const wrongGs = makeGroupSecret();
     const mid = `msg-${crypto.randomUUID()}`;
 
-    const envelope = encryptGroupMessage('grp-1', 1, gs, { text: 'test' }, {
+    const envelope = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'test' }, {
       fromAid: 'alice.test',
       messageId: mid,
       timestamp: Date.now(),
@@ -176,10 +176,10 @@ describe('群组 AAD', () => {
     const mid = 'deterministic-msg';
     const ts = 1700000000000;
 
-    const e1 = encryptGroupMessage('grp-1', 1, gs, { text: 'a' }, {
+    const e1 = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'a' }, {
       fromAid: 'alice.test', messageId: mid, timestamp: ts,
     });
-    const e2 = encryptGroupMessage('grp-1', 1, gs, { text: 'a' }, {
+    const e2 = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'a' }, {
       fromAid: 'alice.test', messageId: mid, timestamp: ts,
     });
 
@@ -614,7 +614,7 @@ describe('GroupE2EEManager.encrypt 签名强制（TS-017）', () => {
 
     // 应抛出异常：签名失败不允许静默跳过
     expect(() => {
-      mgr.encrypt(groupId, { text: 'should fail' });
+      mgr.encrypt(groupId, { type: 'text', text: 'should fail' });
     }).toThrow();
   });
 });

@@ -187,6 +187,6 @@ describe('GroupE2EEManager.removeGroup', () => {
 
   it('removeGroup 后加密操作应抛出 E2EEGroupSecretMissingError', () => {
     mgr.removeGroup(groupId);
-    expect(() => mgr.encrypt(groupId, { text: 'hello' })).toThrow();
+    expect(() => mgr.encrypt(groupId, { type: 'text', text: 'hello' })).toThrow();
   });
 });

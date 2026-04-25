@@ -91,7 +91,7 @@ def _make_group_msg(
     gs = group_secret or _random_secret()
     msg_id = f"gm-{uuid.uuid4()}"
     ts = 1710504000000
-    pl = payload or {"text": "hello group"}
+    pl = payload or {"type": "text", "text": "hello group"}
 
     pk_pem = sender_private_key_pem
     if pk_pem == "AUTO":
@@ -146,7 +146,7 @@ class TestEncryptGroupMessage:
             group_id="grp_test",
             epoch=3,
             group_secret=gs,
-            payload={"text": "test"},
+            payload={"type": "text", "text": "test"},
             from_aid="alice.agentid.pub",
             message_id="gm-123",
             timestamp=1710504000000,
@@ -171,7 +171,7 @@ class TestEncryptGroupMessage:
 
 class TestEncryptDecryptRoundtrip:
     def test_roundtrip(self):
-        original = {"text": "秘密消息", "data": [1, 2, 3]}
+        original = {"type": "text", "text": "秘密消息", "data": [1, 2, 3]}
         message, gs, _ = _make_group_msg(payload=original)
         result = decrypt_group_message(message, {1: gs}, sender_cert_pem=_default_cert())
         assert result is not None
@@ -499,7 +499,7 @@ class TestStoreEncryptDecryptRoundtrip:
         pk_pem, cert_pem = _ensure_default_signing_identity()
 
         # 加密
-        payload = {"text": "通过 keystore 存取的密钥加解密"}
+        payload = {"type": "text", "text": "通过 keystore 存取的密钥加解密"}
         msg_id = f"gm-{uuid.uuid4()}"
         envelope = encrypt_group_message(
             group_id=_GRP, epoch=2, group_secret=gs,
@@ -671,7 +671,7 @@ class TestKeyDistributionP2PRoundtrip:
         msg_id = f"gm-{uuid.uuid4()}"
         envelope = encrypt_group_message(
             group_id=_GRP, epoch=1, group_secret=gs,
-            payload={"text": "P2P 分发后的加密消息"},
+            payload={"type": "text", "text": "P2P 分发后的加密消息"},
             from_aid=_AID, message_id=msg_id, timestamp=1710504000000,
             sender_private_key_pem=pk_pem,
         )
@@ -697,7 +697,7 @@ class TestEncryptFailureNoFallback:
             encrypt_group_message(
                 group_id=_GRP, epoch=1,
                 group_secret=None,  # type: ignore
-                payload={"text": "test"},
+                payload={"type": "text", "text": "test"},
                 from_aid=_AID, message_id="gm-1", timestamp=100,
             )
 
@@ -723,11 +723,11 @@ class TestNonceUniqueness:
         gs = _random_secret()
         e1 = encrypt_group_message(
             group_id=_GRP, epoch=1, group_secret=gs,
-            payload={"text": "a"}, from_aid=_AID, message_id="gm-1", timestamp=100,
+            payload={"type": "text", "text": "a"}, from_aid=_AID, message_id="gm-1", timestamp=100,
         )
         e2 = encrypt_group_message(
             group_id=_GRP, epoch=1, group_secret=gs,
-            payload={"text": "a"}, from_aid=_AID, message_id="gm-2", timestamp=100,
+            payload={"type": "text", "text": "a"}, from_aid=_AID, message_id="gm-2", timestamp=100,
         )
         assert e1["nonce"] != e2["nonce"]
 
@@ -807,7 +807,7 @@ class TestGroupE2EEManagerEncryptDecrypt:
         bob_mgr.handle_incoming(info["distributions"][0]["payload"])
 
         # Alice 加密
-        envelope = alice_mgr.encrypt(_GRP, {"text": "via manager"})
+        envelope = alice_mgr.encrypt(_GRP, {"type": "text", "text": "via manager"})
         assert envelope["type"] == "e2ee.group_encrypted"
 
         # Bob 解密
@@ -824,12 +824,12 @@ class TestGroupE2EEManagerEncryptDecrypt:
         mgr, _ = _make_manager(tmp_path)
         from aun_core.errors import E2EEGroupSecretMissingError
         with pytest.raises(E2EEGroupSecretMissingError):
-            mgr.encrypt("grp_none", {"text": "fail"})
+            mgr.encrypt("grp_none", {"type": "text", "text": "fail"})
 
     def test_decrypt_with_replay_guard(self, tmp_path):
         mgr, _ = _make_manager(tmp_path)
         mgr.create_epoch(_GRP, _MEMBERS)
-        envelope = mgr.encrypt(_GRP, {"text": "replay"})
+        envelope = mgr.encrypt(_GRP, {"type": "text", "text": "replay"})
         message = {
             "group_id": _GRP, "from": _AID, "sender_aid": _AID,
             "message_id": "gm-replay-1", "timestamp": 100,
@@ -846,7 +846,7 @@ class TestGroupE2EEManagerEncryptDecrypt:
         mgr.create_epoch(_GRP, _MEMBERS)
         msgs = []
         for i in range(3):
-            env = mgr.encrypt(_GRP, {"text": f"batch_{i}"})
+            env = mgr.encrypt(_GRP, {"type": "text", "text": f"batch_{i}"})
             msgs.append({
                 "group_id": _GRP, "from": _AID, "sender_aid": _AID,
                 "message_id": f"gm-batch-{i}", "timestamp": 100,
@@ -1006,7 +1006,7 @@ class TestGroupSenderSignature:
         pk_pem, cert_pem = _make_signing_identity()
         gs = _random_secret()
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "hello"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "hello"}, from_aid=_AID,
             message_id="msg-1", timestamp=1000,
             sender_private_key_pem=pk_pem,
             sender_cert_pem=cert_pem,
@@ -1020,7 +1020,7 @@ class TestGroupSenderSignature:
         pk_pem, cert_pem = _make_signing_identity()
         gs = _random_secret()
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "secret"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "secret"}, from_aid=_AID,
             message_id="msg-2", timestamp=2000,
             sender_private_key_pem=pk_pem,
         )
@@ -1033,7 +1033,7 @@ class TestGroupSenderSignature:
         """零信任模式（默认）：无签名无证书 → 拒绝"""
         gs = _random_secret()
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "plain"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "plain"}, from_aid=_AID,
             message_id="msg-3", timestamp=3000,
         )
         message = {"group_id": _GRP, "from": _AID, "message_id": "msg-3", "payload": envelope}
@@ -1045,7 +1045,7 @@ class TestGroupSenderSignature:
         """非零信任模式（require_signature=False）：无签名无证书 → 兼容放行"""
         gs = _random_secret()
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "plain"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "plain"}, from_aid=_AID,
             message_id="msg-3b", timestamp=3000,
         )
         message = {"group_id": _GRP, "from": _AID, "message_id": "msg-3b", "payload": envelope}
@@ -1058,7 +1058,7 @@ class TestGroupSenderSignature:
         pk_pem, cert_pem = _make_signing_identity()
         gs = _random_secret()
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "signed"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "signed"}, from_aid=_AID,
             message_id="msg-nocert", timestamp=3500,
             sender_private_key_pem=pk_pem,
         )
@@ -1073,7 +1073,7 @@ class TestGroupSenderSignature:
         gs = _random_secret()
         # 不传 sender_private_key_pem → 无签名
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "no sig"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "no sig"}, from_aid=_AID,
             message_id="msg-nosig", timestamp=4000,
         )
         message = {"group_id": _GRP, "from": _AID, "message_id": "msg-nosig", "payload": envelope}
@@ -1100,7 +1100,7 @@ class TestGroupSenderSignature:
 
         gs = _random_secret()
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "test"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "test"}, from_aid=_AID,
             message_id="msg-wrong", timestamp=5000,
             sender_private_key_pem=pk_pem,
         )
@@ -1121,7 +1121,7 @@ class TestGroupSenderSignature:
         gs = _random_secret()
         # Bob 用自己的私钥签名，但 from 写成 Alice
         envelope = encrypt_group_message(
-            _GRP, 1, gs, {"text": "fake"}, from_aid=_AID,
+            _GRP, 1, gs, {"type": "text", "text": "fake"}, from_aid=_AID,
             message_id="msg-impersonate", timestamp=6000,
             sender_private_key_pem=bob_pk,
         )
@@ -1196,7 +1196,7 @@ class TestReplayGuardUsesAADMessageId:
         # 获取 identity 私钥用于签名
         secret_data = mgr.load_secret(_GRP)
         envelope = encrypt_group_message(
-            _GRP, 1, secret_data["secret"], {"text": "hello"},
+            _GRP, 1, secret_data["secret"], {"type": "text", "text": "hello"},
             from_aid=_AID, message_id="aad-msg-1", timestamp=1000,
             sender_private_key_pem=pk_pem,
         )
@@ -1226,7 +1226,7 @@ class TestReplayGuardUsesAADMessageId:
         secret_data = mgr.load_secret(_GRP)
         for i in range(3):
             envelope = encrypt_group_message(
-                _GRP, 1, secret_data["secret"], {"text": f"msg-{i}"},
+                _GRP, 1, secret_data["secret"], {"type": "text", "text": f"msg-{i}"},
                 from_aid=_AID, message_id=f"aad-msg-{i}", timestamp=1000 + i,
                 sender_private_key_pem=pk_pem,
             )

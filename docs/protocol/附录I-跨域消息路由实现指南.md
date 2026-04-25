@@ -340,8 +340,8 @@ async def route_cross_domain(to_aid: str, payload: dict) -> dict:
   "method": "message.send",
   "params": {
     "to": "bob.example.com",
-    "type": "text",
     "payload": {
+      "type": "text",
       "text": "Hello from alice.aid.pub"
     }
   }
