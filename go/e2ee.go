@@ -559,7 +559,7 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 		}
 	}
 	if !m.shouldDecryptForCurrentAID(message, payload) {
-		return message, nil
+		return nil, NewE2EEDecryptFailedError("encrypted message is not addressed to current aid")
 	}
 
 	// timestamp 窗口检查
@@ -574,23 +574,29 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 		}
 	}
 
-	// 本地防重放
+	// 本地防重放：先检查，解密成功后再记录。
 	messageID, _ := message["message_id"].(string)
 	fromAID, _ := message["from"].(string)
+	seenKey := ""
 	if messageID != "" && fromAID != "" {
-		seenKey := fromAID + ":" + messageID
+		seenKey = fromAID + ":" + messageID
 		m.mu.Lock()
 		if _, seen := m.seenMessages[seenKey]; seen {
 			m.mu.Unlock()
 			return nil, NewE2EEDecryptFailedError("重放消息")
 		}
+		m.mu.Unlock()
+	}
+
+	result, err := m.decryptMessage(message)
+	if err == nil && result != nil && seenKey != "" {
+		m.mu.Lock()
 		m.seenCounter++
 		m.seenMessages[seenKey] = m.seenCounter
 		m.trimSeenSet()
 		m.mu.Unlock()
 	}
-
-	return m.decryptMessage(message)
+	return result, err
 }
 
 // shouldDecryptForCurrentAID 仅解密发给当前 AID 的消息
@@ -643,7 +649,7 @@ func (m *E2EEManager) decryptMessage(message map[string]any) (map[string]any, er
 	payload := message["payload"].(map[string]any)
 
 	if !m.shouldDecryptForCurrentAID(message, payload) {
-		return message, nil
+		return nil, NewE2EEDecryptFailedError("encrypted message is not addressed to current aid")
 	}
 
 	// 验证发送方签名
@@ -700,9 +706,11 @@ func (m *E2EEManager) verifySenderSignature(payload, message map[string]any) err
 		return NewE2EEDecryptFailedError("发送方证书非 EC 公钥")
 	}
 
-	// 重建签名载荷
-	ct, _ := base64.StdEncoding.DecodeString(payload["ciphertext"].(string))
-	tagBytes, _ := base64.StdEncoding.DecodeString(payload["tag"].(string))
+	// 重建签名载荷 — 安全断言防止恶意消息触发 panic
+	ctB64, _ := payload["ciphertext"].(string)
+	tagB64, _ := payload["tag"].(string)
+	ct, _ := base64.StdEncoding.DecodeString(ctB64)
+	tagBytes, _ := base64.StdEncoding.DecodeString(tagB64)
 	var aadBytes []byte
 	if aad, ok := payload["aad"].(map[string]any); ok {
 		aadBytes = aadBytesOffline(aad)
@@ -724,16 +732,23 @@ func (m *E2EEManager) verifySenderSignature(payload, message map[string]any) err
 
 // decryptMessagePrekeyV2 解密 prekey_ecdh_v2 模式的消息
 func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string]any, error) {
-	payload := message["payload"].(map[string]any)
+	payload, ok := message["payload"].(map[string]any)
+	if !ok {
+		return nil, NewE2EEDecryptFailedError("消息缺少 payload 或类型错误")
+	}
 
-	ephPubBytes, err := base64.StdEncoding.DecodeString(payload["ephemeral_public_key"].(string))
+	ephPubB64, _ := payload["ephemeral_public_key"].(string)
+	ephPubBytes, err := base64.StdEncoding.DecodeString(ephPubB64)
 	if err != nil {
 		return nil, NewE2EEDecryptFailedError("解码 ephemeral key 失败")
 	}
 	prekeyID, _ := payload["prekey_id"].(string)
-	nonce, _ := base64.StdEncoding.DecodeString(payload["nonce"].(string))
-	ct, _ := base64.StdEncoding.DecodeString(payload["ciphertext"].(string))
-	tag, _ := base64.StdEncoding.DecodeString(payload["tag"].(string))
+	nonceB64, _ := payload["nonce"].(string)
+	nonce, _ := base64.StdEncoding.DecodeString(nonceB64)
+	ctB64, _ := payload["ciphertext"].(string)
+	ct, _ := base64.StdEncoding.DecodeString(ctB64)
+	tagB64, _ := payload["tag"].(string)
+	tag, _ := base64.StdEncoding.DecodeString(tagB64)
 
 	// 加载 prekey 私钥
 	prekeyPriv := m.loadPrekeyPrivateKey(prekeyID)
@@ -823,15 +838,22 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 
 // decryptMessageLongTerm 解密 long_term_key 模式的消息
 func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string]any, error) {
-	payload := message["payload"].(map[string]any)
+	payload, ok := message["payload"].(map[string]any)
+	if !ok {
+		return nil, NewE2EEDecryptFailedError("消息缺少 payload 或类型错误")
+	}
 
-	ephPubBytes, err := base64.StdEncoding.DecodeString(payload["ephemeral_public_key"].(string))
+	ephPubB64, _ := payload["ephemeral_public_key"].(string)
+	ephPubBytes, err := base64.StdEncoding.DecodeString(ephPubB64)
 	if err != nil {
 		return nil, NewE2EEDecryptFailedError("解码 ephemeral key 失败")
 	}
-	nonce, _ := base64.StdEncoding.DecodeString(payload["nonce"].(string))
-	ct, _ := base64.StdEncoding.DecodeString(payload["ciphertext"].(string))
-	tag, _ := base64.StdEncoding.DecodeString(payload["tag"].(string))
+	nonceB64, _ := payload["nonce"].(string)
+	nonce, _ := base64.StdEncoding.DecodeString(nonceB64)
+	ctB64, _ := payload["ciphertext"].(string)
+	ct, _ := base64.StdEncoding.DecodeString(ctB64)
+	tagB64, _ := payload["tag"].(string)
+	tag, _ := base64.StdEncoding.DecodeString(tagB64)
 
 	// 加载接收方 identity 私钥
 	myPriv, err := m.loadMyIdentityPrivate()

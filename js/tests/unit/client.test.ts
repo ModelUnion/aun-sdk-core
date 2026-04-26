@@ -535,6 +535,7 @@ describe('AUNClient M25 重连行为', () => {
 
   it('显式 max_attempts 用尽后进入 terminal_failed', async () => {
     vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       const client = new AUNClient();
       const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
@@ -552,7 +553,7 @@ describe('AUNClient M25 重连行为', () => {
       (client as any)._reconnectActive = true;
 
       const reconnectLoop = (client as any)._reconnectLoop();
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(3_000);
       await reconnectLoop;
 
       expect((client as any)._connectOnce).toHaveBeenCalledTimes(2);
@@ -563,6 +564,7 @@ describe('AUNClient M25 重连行为', () => {
         attempt: 2,
       }));
     } finally {
+      randomSpy.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -570,6 +572,7 @@ describe('AUNClient M25 重连行为', () => {
   // ── R1: health-fail 路径也应受 max_attempts 约束 ──────────
   it('health 持续失败时应在 max_attempts 次后进入 terminal_failed', async () => {
     vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       const client = new AUNClient();
       const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
@@ -590,7 +593,7 @@ describe('AUNClient M25 重连行为', () => {
       (client as any)._reconnectActive = true;
 
       const reconnectLoop = (client as any)._reconnectLoop();
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(4_000);
       await reconnectLoop;
 
       expect(client.state).toBe('terminal_failed');
@@ -601,6 +604,7 @@ describe('AUNClient M25 重连行为', () => {
       // _connectOnce 不应被调用（health 一直失败）
       expect((client as any)._connectOnce).not.toHaveBeenCalled();
     } finally {
+      randomSpy.mockRestore();
       vi.useRealTimers();
     }
   });

@@ -169,6 +169,41 @@ function ecdsaVerify(publicKey: crypto.KeyObject, signature: Buffer, data: Buffe
   return verifier.verify(publicKey, signature);
 }
 
+function groupKeyResponseSignData(payload: JsonObject): Buffer {
+  const fields = [
+    String(payload.response_version ?? 1),
+    String(payload.group_id ?? ''),
+    String(payload.epoch ?? 0),
+    String(payload.requester_aid ?? ''),
+    String(payload.request_id ?? ''),
+    String(payload.responder_aid ?? ''),
+    String(payload.commitment ?? ''),
+    [...((payload.member_aids as string[] | undefined) ?? [])].sort().join('|'),
+    String(payload.issued_at ?? 0),
+  ];
+  return Buffer.from(fields.join('\n'), 'utf-8');
+}
+
+export function signGroupKeyResponse(payload: JsonObject, privateKeyPem: string): JsonObject {
+  const signed: JsonObject = {
+    ...payload,
+    response_version: payload.response_version ?? 1,
+    issued_at: payload.issued_at ?? Date.now(),
+  };
+  signed.response_signature = ecdsaSign(privateKeyPem, groupKeyResponseSignData(signed)).toString('base64');
+  return signed;
+}
+
+export function verifyGroupKeyResponseSignature(payload: JsonObject, responderCertPem: string): boolean {
+  const sigB64 = payload.response_signature as string | undefined;
+  if (!sigB64) return false;
+  try {
+    return ecdsaVerify(pemToCertPublicKey(responderCertPem), Buffer.from(sigB64, 'base64'), groupKeyResponseSignData(payload));
+  } catch {
+    return false;
+  }
+}
+
 /** PEM 证书 → 公钥 KeyObject */
 function pemToCertPublicKey(certPem: string | Buffer): crypto.KeyObject {
   const pem = typeof certPem === 'string' ? certPem : certPem.toString('utf-8');
@@ -790,12 +825,15 @@ export function buildKeyRequest(
   groupId: string,
   epoch: number,
   requesterAid: string,
+  requestId?: string,
 ): JsonObject {
   return {
     type: 'e2ee.group_key_request',
     group_id: groupId,
     epoch,
     requester_aid: requesterAid,
+    request_id: requestId ?? crypto.randomUUID(),
+    requested_at: Date.now(),
   };
 }
 
@@ -805,6 +843,7 @@ export function handleKeyRequest(
   keystore: KeyStore,
   aid: string,
   currentMembers: string[],
+  privateKeyPem?: string | null,
 ): JsonObject | null {
   const payload = 'group_id' in request
     ? request
@@ -832,14 +871,19 @@ export function handleKeyRequest(
     );
   }
 
-  return {
+  const response: JsonObject = {
     type: 'e2ee.group_key_response',
     group_id: groupId,
     epoch,
     group_secret: secretData.secret.toString('base64'),
     commitment: commitmentStr,
     member_aids: memberAids.length > 0 ? memberAids : [...currentMembers].sort(),
+    requester_aid: requesterAid,
+    request_id: String(payload.request_id ?? ''),
+    responder_aid: aid,
+    issued_at: Date.now(),
   };
+  return privateKeyPem ? signGroupKeyResponse(response, privateKeyPem) : response;
 }
 
 /** 处理收到的密钥响应 */
@@ -847,6 +891,12 @@ export function handleKeyResponse(
   response: Message | JsonObject,
   keystore: KeyStore,
   aid: string,
+  opts?: {
+    expectedRequest?: JsonObject | null;
+    responderCertPem?: string | null;
+    currentMembers?: string[];
+    strict?: boolean;
+  },
 ): boolean {
   const payload = 'group_id' in response
     ? response
@@ -859,6 +909,25 @@ export function handleKeyResponse(
   const memberAids = (payload.member_aids as string[]) ?? [];
 
   if (!groupId || epoch == null || !groupSecretB64 || !commitment) return false;
+
+  const expected = opts?.expectedRequest ?? null;
+  if (expected) {
+    if (payload.requester_aid !== aid) return false;
+    const expectedResponder = String(expected._expected_responder_aid ?? '');
+    if (expectedResponder && payload.responder_aid !== expectedResponder) return false;
+    if (payload.request_id !== expected.request_id) return false;
+    if (payload.group_id !== expected.group_id) return false;
+    if (Number(payload.epoch ?? 0) !== Number(expected.epoch ?? 0)) return false;
+  }
+
+  const responderAid = String(payload.responder_aid ?? '');
+  if (opts?.strict) {
+    if (!responderAid || !opts.responderCertPem) return false;
+    if ((opts.currentMembers?.length ?? 0) > 0 && !opts.currentMembers!.includes(responderAid)) return false;
+    if (!verifyGroupKeyResponseSignature(payload, opts.responderCertPem)) return false;
+  } else if (opts?.responderCertPem && payload.response_signature) {
+    if (!verifyGroupKeyResponseSignature(payload, opts.responderCertPem)) return false;
+  }
 
   const groupSecret = Buffer.from(groupSecretB64, 'base64');
 
@@ -879,6 +948,7 @@ export class GroupE2EEManager {
   private _responseThrottle: GroupKeyRequestThrottle;
   private _senderCertResolver: ((aid: string) => string | null) | null;
   private _initiatorCertResolver: ((aid: string) => string | null) | null;
+  private _pendingKeyRequests: Map<string, JsonObject> = new Map();
 
   constructor(opts: {
     identityFn: () => IdentityRecord;
@@ -1075,7 +1145,20 @@ export class GroupE2EEManager {
       return ok ? 'distribution' : 'distribution_rejected';
     }
     if (msgType === 'e2ee.group_key_response') {
-      const ok = handleKeyResponse(payload, this._keystore, aid);
+      const pendingKey = `${String(payload.group_id ?? '')}:${String(payload.epoch ?? '')}:${String(payload.request_id ?? '')}`;
+      const expected = this._pendingKeyRequests.get(pendingKey) ?? null;
+      if (expected === null) return 'response_rejected';
+      const responderAid = String(payload.responder_aid ?? '');
+      const responderCertPem = responderAid && this._initiatorCertResolver
+        ? this._initiatorCertResolver(responderAid)
+        : null;
+      const ok = handleKeyResponse(payload, this._keystore, aid, {
+        expectedRequest: expected,
+        responderCertPem,
+        currentMembers: this.getMemberAids(String(payload.group_id ?? '')),
+        strict: true,
+      });
+      if (ok && expected) this._pendingKeyRequests.delete(pendingKey);
       return ok ? 'response' : 'response_rejected';
     }
     if (msgType === 'e2ee.group_key_request') {
@@ -1103,7 +1186,19 @@ export class GroupE2EEManager {
       candidates = [senderAid];
     }
     if (candidates.length === 0) return null;
-    return { to: candidates[0], payload: buildKeyRequest(groupId, epoch, aid) };
+    const payload = buildKeyRequest(groupId, epoch, aid);
+    this.rememberKeyRequest(payload, candidates[0]);
+    return { to: candidates[0], payload };
+  }
+
+  rememberKeyRequest(payload: JsonObject, expectedResponderAid?: string | null): void {
+    if (payload.type !== 'e2ee.group_key_request') return;
+    const requestId = String(payload.request_id ?? '');
+    if (!requestId) return;
+    this._pendingKeyRequests.set(
+      `${String(payload.group_id ?? '')}:${String(payload.epoch ?? '')}:${requestId}`,
+      expectedResponderAid ? { ...payload, _expected_responder_aid: expectedResponderAid } : { ...payload },
+    );
   }
 
   /** 处理密钥请求。返回响应 payload（受频率限制 + 成员资格验证）。 */
@@ -1119,7 +1214,10 @@ export class GroupE2EEManager {
     if (!this._responseThrottle.allow(`response:${groupId}:${requester}`)) {
       return null;
     }
-    return handleKeyRequest(requestPayload, this._keystore, this._currentAid(), members);
+    const identity = this._identityFn();
+    const privateKeyPem = identity.private_key_pem as string | undefined;
+    if (!privateKeyPem) return null;
+    return handleKeyRequest(requestPayload, this._keystore, this._currentAid(), members, privateKeyPem);
   }
 
   // ── 状态查询 ──────────────────────────────────────────

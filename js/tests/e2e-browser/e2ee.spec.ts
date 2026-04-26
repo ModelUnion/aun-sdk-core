@@ -381,7 +381,6 @@ test.describe('配置', () => {
     expect(config.aunPath).toBe('aun');
     expect(config.rootCaPem).toBeNull();
     expect(config.groupE2ee).toBe(true);
-    expect(config.rotateOnJoin).toBe(false);
     expect(config.verifySsl).toBe(true);
     expect(config.requireForwardSecrecy).toBe(true);
     expect(config.replayWindowSeconds).toBe(300);
@@ -861,12 +860,96 @@ test.describe('Group E2EE 集成测试', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto(`${baseUrl}/tests/e2e-browser/test-page.html`);
     await page.waitForFunction(() => (window as any).testReady === true, undefined, { timeout: 10_000 });
+    await page.evaluate(() => {
+      const w = window as any;
+      if (w.__aunGroupTest) return;
+
+      const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+      const mergeMessages = (target: any[], incoming: any[]) => {
+        const seenSeqs = new Set(target.map(msg => Number(msg?.seq ?? 0)).filter(seq => seq > 0));
+        for (const msg of incoming) {
+          const seq = Number(msg?.seq ?? 0);
+          if (seq > 0) {
+            if (seenSeqs.has(seq)) continue;
+            seenSeqs.add(seq);
+          }
+          target.push(msg);
+        }
+        target.sort((a, b) => Number(a?.seq ?? 0) - Number(b?.seq ?? 0));
+      };
+      const currentGroupMaxSeq = async (client: any, groupId: string): Promise<number> => {
+        try {
+          const result = await client.call('group.get_cursor', { group_id: groupId });
+          const cursor = result?.msg_cursor ?? result?.cursor ?? {};
+          return Number(cursor.latest_seq ?? cursor.current_seq ?? 0) || 0;
+        } catch {
+          return 0;
+        }
+      };
+      const groupPull = async (
+        client: any,
+        groupId: string,
+        afterSeq: number,
+        limit: number = 50,
+      ): Promise<any[]> => {
+        const result = await client.call('group.pull', {
+          group_id: groupId,
+          after_message_seq: afterSeq,
+          limit,
+        });
+        return result?.messages ?? [];
+      };
+      const watchGroupMessages = async (client: any, groupId: string) => {
+        const afterSeq = await currentGroupMaxSeq(client, groupId);
+        const inbox: any[] = [];
+        const sub = client.on('group.message_created', (evt: any) => {
+          if (String(evt?.group_id ?? '') !== groupId) return;
+          mergeMessages(inbox, [evt]);
+        });
+        return {
+          inbox,
+          stop() {
+            sub.unsubscribe();
+          },
+          async waitFor(predicate: (messages: any[]) => boolean, timeoutMs: number = 20_000) {
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+              if (predicate(inbox)) return [...inbox];
+              mergeMessages(inbox, await groupPull(client, groupId, afterSeq));
+              if (predicate(inbox)) return [...inbox];
+              await sleep(200);
+            }
+            throw new Error(`timeout waiting for group messages group=${groupId}; inbox=${JSON.stringify(inbox)}`);
+          },
+        };
+      };
+      const byText = (messages: any[], text: string) =>
+        messages.find(msg => msg?.payload?.text === text);
+      const decryptedTexts = (messages: any[]) =>
+        messages
+          .filter(msg => msg?.e2ee?.encryption_mode === 'epoch_group_key')
+          .map(msg => msg?.payload?.text)
+          .filter(Boolean);
+      const plaintextTexts = (messages: any[]) =>
+        messages
+          .filter(msg => !msg?.e2ee && msg?.payload?.text)
+          .map(msg => msg.payload.text);
+
+      w.__aunGroupTest = {
+        sleep,
+        watchGroupMessages,
+        byText,
+        decryptedTexts,
+        plaintextTexts,
+      };
+    });
   });
 
   test('建群 + 加人 + 加密发送 + 解密接收', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-a-${rid}.agentid.pub`;
       const bobAid = `bg-b-${rid}.agentid.pub`;
 
@@ -888,7 +971,9 @@ test.describe('Group E2EE 集成测试', () => {
 
       // Alice 加 Bob
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await new Promise(r => setTimeout(r, 3000)); // 等待密钥分发
+      await H.sleep(2000); // 等待密钥分发或后续密钥恢复就绪
+
+      const bobWatch = await H.watchGroupMessages(bob, groupId);
 
       // Alice 发送加密群消息
       await alice.call('group.send', {
@@ -896,29 +981,27 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: '浏览器群消息' },
         encrypt: true,
       });
-      await new Promise(r => setTimeout(r, 1000));
 
-      // Bob 拉取群消息
-      const pullResult = await bob.call('group.pull', {
-        group_id: groupId,
-        after_seq: 0,
-        limit: 10,
+      const msgs = await bobWatch.waitFor((messages: any[]) => {
+        const msg = H.byText(messages, '浏览器群消息');
+        return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
       });
-      const msgs = pullResult.messages || [];
+      const msg = H.byText(msgs, '浏览器群消息');
 
-      await alice.close();
-      await bob.close();
+      bobWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close()]);
 
       return {
         groupCreated: !!groupId,
         messagesReceived: msgs.length,
-        decrypted: msgs.some((m: any) => m.e2ee?.encryption_mode === 'epoch_group_key'),
-        text: msgs.find((m: any) => m.payload?.text)?.payload?.text,
+        decrypted: msg?.e2ee?.encryption_mode === 'epoch_group_key',
+        text: msg?.payload?.text,
       };
     }, rid);
 
     expect(result.groupCreated).toBe(true);
     expect(result.messagesReceived).toBeGreaterThan(0);
+    expect(result.decrypted).toBe(true);
     expect(result.text).toBe('浏览器群消息');
   });
 
@@ -953,6 +1036,7 @@ test.describe('Group E2EE 集成测试', () => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-ma-${rid}.agentid.pub`;
       const bobAid = `bg-mb-${rid}.agentid.pub`;
       const carolAid = `bg-mc-${rid}.agentid.pub`;
@@ -978,7 +1062,10 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await new Promise(r => setTimeout(r, 3000)); // 等待密钥分发
+      await H.sleep(2000);
+
+      const bobWatch = await H.watchGroupMessages(bob, groupId);
+      const carolWatch = await H.watchGroupMessages(carol, groupId);
 
       // Alice 发送加密群消息
       await alice.call('group.send', {
@@ -986,30 +1073,36 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: '三人群消息' },
         encrypt: true,
       });
-      await new Promise(r => setTimeout(r, 1000));
 
-      // Bob 和 Carol 分别拉取
-      const pullBob = await bob.call('group.pull', { group_id: groupId, after_seq: 0, limit: 10 });
-      const pullCarol = await carol.call('group.pull', { group_id: groupId, after_seq: 0, limit: 10 });
-      const msgsBob = pullBob.messages || [];
-      const msgsCarol = pullCarol.messages || [];
+      const msgsBob = await bobWatch.waitFor((messages: any[]) => {
+        const msg = H.byText(messages, '三人群消息');
+        return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
+      });
+      const msgsCarol = await carolWatch.waitFor((messages: any[]) => {
+        const msg = H.byText(messages, '三人群消息');
+        return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
+      });
+      const bobMsg = H.byText(msgsBob, '三人群消息');
+      const carolMsg = H.byText(msgsCarol, '三人群消息');
 
-      await alice.close();
-      await bob.close();
-      await carol.close();
+      bobWatch.stop();
+      carolWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
 
       return {
         bobReceived: msgsBob.length,
         carolReceived: msgsCarol.length,
-        bobText: msgsBob.find((m: any) => m.payload?.text)?.payload?.text,
-        carolText: msgsCarol.find((m: any) => m.payload?.text)?.payload?.text,
-        bobDecrypted: msgsBob.some((m: any) => m.e2ee?.encryption_mode === 'epoch_group_key'),
-        carolDecrypted: msgsCarol.some((m: any) => m.e2ee?.encryption_mode === 'epoch_group_key'),
+        bobText: bobMsg?.payload?.text,
+        carolText: carolMsg?.payload?.text,
+        bobDecrypted: bobMsg?.e2ee?.encryption_mode === 'epoch_group_key',
+        carolDecrypted: carolMsg?.e2ee?.encryption_mode === 'epoch_group_key',
       };
     }, rid);
 
     expect(result.bobReceived).toBeGreaterThan(0);
     expect(result.carolReceived).toBeGreaterThan(0);
+    expect(result.bobDecrypted).toBe(true);
+    expect(result.carolDecrypted).toBe(true);
     expect(result.bobText).toBe('三人群消息');
     expect(result.carolText).toBe('三人群消息');
   });
@@ -1018,6 +1111,7 @@ test.describe('Group E2EE 集成测试', () => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-ka-${rid}.agentid.pub`;
       const bobAid = `bg-kb-${rid}.agentid.pub`;
       const carolAid = `bg-kc-${rid}.agentid.pub`;
@@ -1042,12 +1136,14 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await new Promise(r => setTimeout(r, 3000)); // 等待密钥分发
+      await H.sleep(2000);
 
       // 踢 Carol
       await alice.call('group.kick', { group_id: groupId, aid: carolAid });
       // 等待 SDK 自动 CAS 轮换 + 分发新 epoch 密钥给 Bob
-      await new Promise(r => setTimeout(r, 5000));
+      await H.sleep(5000);
+
+      const bobWatch = await H.watchGroupMessages(bob, groupId);
 
       // Alice 用新 epoch 发消息
       await alice.call('group.send', {
@@ -1055,32 +1151,34 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: '踢人后的消息' },
         encrypt: true,
       });
-      await new Promise(r => setTimeout(r, 1000));
 
-      // Bob 拉取 — 应能解密
-      const pullBob = await bob.call('group.pull', { group_id: groupId, after_seq: 0, limit: 10 });
-      const msgsBob = pullBob.messages || [];
+      const msgsBob = await bobWatch.waitFor((messages: any[]) => {
+        const msg = H.byText(messages, '踢人后的消息');
+        return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
+      });
+      const msg = H.byText(msgsBob, '踢人后的消息');
 
-      await alice.close();
-      await bob.close();
-      await carol.close();
+      bobWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
 
       return {
         bobReceived: msgsBob.length,
-        bobText: msgsBob.find((m: any) => m.payload?.text === '踢人后的消息')?.payload?.text,
+        bobText: msg?.payload?.text,
         // 验证是否有 epoch > 1 的消息（epoch 轮换）
-        hasNewEpoch: msgsBob.some((m: any) => m.e2ee?.epoch && m.e2ee.epoch > 1),
+        hasNewEpoch: Number(msg?.e2ee?.epoch ?? 0) > 1,
       };
     }, rid);
 
     expect(result.bobReceived).toBeGreaterThan(0);
     expect(result.bobText).toBe('踢人后的消息');
+    expect(result.hasNewEpoch).toBe(true);
   });
 
   test('新成员加入无 epoch 轮换', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-ja-${rid}.agentid.pub`;
       const bobAid = `bg-jb-${rid}.agentid.pub`;
       const carolAid = `bg-jc-${rid}.agentid.pub`;
@@ -1104,11 +1202,13 @@ test.describe('Group E2EE 集成测试', () => {
       const createResult = await alice.call('group.create', { name: `join-${rid}` });
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await new Promise(r => setTimeout(r, 3000));
+      await H.sleep(2000);
 
       // 再加 Carol（不应触发 epoch 轮换）
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await new Promise(r => setTimeout(r, 3000));
+      await H.sleep(2000);
+
+      const carolWatch = await H.watchGroupMessages(carol, groupId);
 
       // Alice 用当前 epoch 发消息
       await alice.call('group.send', {
@@ -1116,24 +1216,25 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: '新成员能看到' },
         encrypt: true,
       });
-      await new Promise(r => setTimeout(r, 1000));
 
-      // Carol 拉取 — 应能解密
-      const pullCarol = await carol.call('group.pull', { group_id: groupId, after_seq: 0, limit: 10 });
-      const msgsCarol = pullCarol.messages || [];
+      const msgsCarol = await carolWatch.waitFor((messages: any[]) => {
+        const msg = H.byText(messages, '新成员能看到');
+        return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
+      });
+      const msg = H.byText(msgsCarol, '新成员能看到');
 
-      await alice.close();
-      await bob.close();
-      await carol.close();
+      carolWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
 
       return {
         carolReceived: msgsCarol.length,
-        carolText: msgsCarol.find((m: any) => m.payload?.text)?.payload?.text,
-        carolDecrypted: msgsCarol.some((m: any) => m.e2ee?.encryption_mode === 'epoch_group_key'),
+        carolText: msg?.payload?.text,
+        carolDecrypted: msg?.e2ee?.encryption_mode === 'epoch_group_key',
       };
     }, rid);
 
     expect(result.carolReceived).toBeGreaterThan(0);
+    expect(result.carolDecrypted).toBe(true);
     expect(result.carolText).toBe('新成员能看到');
   });
 
@@ -1141,6 +1242,7 @@ test.describe('Group E2EE 集成测试', () => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-ba-${rid}.agentid.pub`;
       const bobAid = `bg-bb-${rid}.agentid.pub`;
 
@@ -1157,10 +1259,13 @@ test.describe('Group E2EE 集成测试', () => {
       const createResult = await alice.call('group.create', { name: `burst-${rid}` });
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await new Promise(r => setTimeout(r, 3000));
+      await H.sleep(2000);
+
+      const bobWatch = await H.watchGroupMessages(bob, groupId);
 
       // 连续发 5 条加密消息
       const N = 5;
+      const expected = Array.from({ length: N }, (_, i) => `burst_${i}`).sort();
       for (let i = 0; i < N; i++) {
         await alice.call('group.send', {
           group_id: groupId,
@@ -1168,26 +1273,21 @@ test.describe('Group E2EE 集成测试', () => {
           encrypt: true,
         });
       }
-      await new Promise(r => setTimeout(r, 2000));
 
-      // Bob 拉取
-      const pullResult = await bob.call('group.pull', { group_id: groupId, after_seq: 0, limit: 20 });
-      const msgs = pullResult.messages || [];
+      const msgs = await bobWatch.waitFor((messages: any[]) => {
+        const texts = H.decryptedTexts(messages).sort();
+        return expected.every((text: string) => texts.includes(text));
+      }, 25_000);
 
-      await alice.close();
-      await bob.close();
-
-      // 收集解密成功的消息文本
-      const decryptedTexts = msgs
-        .filter((m: any) => m.e2ee?.encryption_mode === 'epoch_group_key')
-        .map((m: any) => m.payload?.text)
-        .filter(Boolean);
+      bobWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close()]);
+      const decryptedTexts = H.decryptedTexts(msgs).sort();
 
       return {
         totalReceived: msgs.length,
         decryptedCount: decryptedTexts.length,
-        decryptedTexts: decryptedTexts.sort(),
-        expected: Array.from({ length: N }, (_, i) => `burst_${i}`).sort(),
+        decryptedTexts,
+        expected,
       };
     }, rid);
 
@@ -1200,6 +1300,7 @@ test.describe('Group E2EE 集成测试', () => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-mx-${rid}.agentid.pub`;
       const bobAid = `bg-my-${rid}.agentid.pub`;
 
@@ -1216,7 +1317,9 @@ test.describe('Group E2EE 集成测试', () => {
       const createResult = await alice.call('group.create', { name: `mixed-${rid}` });
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await new Promise(r => setTimeout(r, 3000));
+      await H.sleep(2000);
+
+      const bobWatch = await H.watchGroupMessages(bob, groupId);
 
       // 明文 → 加密 → 明文
       await alice.call('group.send', {
@@ -1234,26 +1337,22 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: '又是明文' },
         encrypt: false,
       });
-      await new Promise(r => setTimeout(r, 1000));
 
-      const pullResult = await bob.call('group.pull', { group_id: groupId, after_seq: 0, limit: 10 });
-      const msgs = pullResult.messages || [];
+      const msgs = await bobWatch.waitFor((messages: any[]) => {
+        const encrypted = H.decryptedTexts(messages);
+        const plaintext = H.plaintextTexts(messages);
+        return encrypted.includes('加密消息')
+          && plaintext.includes('明文消息')
+          && plaintext.includes('又是明文');
+      });
 
-      await alice.close();
-      await bob.close();
-
-      // 分类收集
-      const encryptedTexts = msgs
-        .filter((m: any) => m.e2ee?.encryption_mode === 'epoch_group_key')
-        .map((m: any) => m.payload?.text);
-      const plaintextTexts = msgs
-        .filter((m: any) => !m.e2ee && m.payload?.text)
-        .map((m: any) => m.payload.text);
+      bobWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close()]);
 
       return {
         totalReceived: msgs.length,
-        encryptedTexts,
-        plaintextTexts,
+        encryptedTexts: H.decryptedTexts(msgs),
+        plaintextTexts: H.plaintextTexts(msgs),
       };
     }, rid);
 
@@ -1267,6 +1366,7 @@ test.describe('Group E2EE 集成测试', () => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-oa-${rid}.agentid.pub`;
       const bobAid = `bg-ob-${rid}.agentid.pub`;
       const carolAid = `bg-oc-${rid}.agentid.pub`;
@@ -1291,7 +1391,9 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await new Promise(r => setTimeout(r, 3000));
+      await H.sleep(2000);
+
+      const bobWatch = await H.watchGroupMessages(bob, groupId);
 
       // epoch 1 消息
       await alice.call('group.send', {
@@ -1299,10 +1401,14 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: 'epoch1消息' },
         encrypt: true,
       });
+      await bobWatch.waitFor((messages: any[]) => {
+        const msg = H.byText(messages, 'epoch1消息');
+        return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
+      });
 
       // 踢 Carol 触发 epoch 轮换到 epoch 2
       await alice.call('group.kick', { group_id: groupId, aid: carolAid });
-      await new Promise(r => setTimeout(r, 5000));
+      await H.sleep(5000);
 
       // epoch 2 消息
       await alice.call('group.send', {
@@ -1310,20 +1416,15 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: 'epoch2消息' },
         encrypt: true,
       });
-      await new Promise(r => setTimeout(r, 1000));
 
-      // Bob 拉取所有消息 — 两个 epoch 的消息都应可解密
-      const pullResult = await bob.call('group.pull', { group_id: groupId, after_seq: 0, limit: 20 });
-      const msgs = pullResult.messages || [];
+      const msgs = await bobWatch.waitFor((messages: any[]) => {
+        const texts = H.decryptedTexts(messages);
+        return texts.includes('epoch1消息') && texts.includes('epoch2消息');
+      });
 
-      await alice.close();
-      await bob.close();
-      await carol.close();
-
-      const decryptedTexts = msgs
-        .filter((m: any) => m.e2ee?.encryption_mode === 'epoch_group_key')
-        .map((m: any) => m.payload?.text)
-        .filter(Boolean);
+      bobWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
+      const decryptedTexts = H.decryptedTexts(msgs);
 
       return {
         totalReceived: msgs.length,
@@ -1342,6 +1443,7 @@ test.describe('Group E2EE 集成测试', () => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
+      const H = (window as any).__aunGroupTest;
       const aliceAid = `bg-la-${rid}.agentid.pub`;
       const bobAid = `bg-lb-${rid}.agentid.pub`;
       const carolAid = `bg-lc-${rid}.agentid.pub`;
@@ -1366,12 +1468,14 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await new Promise(r => setTimeout(r, 3000));
+      await H.sleep(2000);
 
       // Carol 主动退群
       await carol.call('group.leave', { group_id: groupId });
       // 等待 Alice（owner）收到 group.changed 事件后自动 CAS 轮换
-      await new Promise(r => setTimeout(r, 5000));
+      await H.sleep(5000);
+
+      const bobWatch = await H.watchGroupMessages(bob, groupId);
 
       // Alice 用新 epoch 发消息
       await alice.call('group.send', {
@@ -1379,25 +1483,26 @@ test.describe('Group E2EE 集成测试', () => {
         payload: { type: 'text', text: '退群后的消息' },
         encrypt: true,
       });
-      await new Promise(r => setTimeout(r, 1000));
 
-      // Bob 拉取 — 应能解密
-      const pullBob = await bob.call('group.pull', { group_id: groupId, after_seq: 0, limit: 10 });
-      const msgsBob = pullBob.messages || [];
+      const msgsBob = await bobWatch.waitFor((messages: any[]) => {
+        const msg = H.byText(messages, '退群后的消息');
+        return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
+      });
+      const msg = H.byText(msgsBob, '退群后的消息');
 
-      await alice.close();
-      await bob.close();
-      await carol.close();
+      bobWatch.stop();
+      await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
 
       return {
         bobReceived: msgsBob.length,
-        bobText: msgsBob.find((m: any) => m.payload?.text === '退群后的消息')?.payload?.text,
-        hasNewEpoch: msgsBob.some((m: any) => m.e2ee?.epoch && m.e2ee.epoch > 1),
+        bobText: msg?.payload?.text,
+        hasNewEpoch: Number(msg?.e2ee?.epoch ?? 0) > 1,
       };
     }, rid);
 
     expect(result.bobReceived).toBeGreaterThan(0);
     expect(result.bobText).toBe('退群后的消息');
+    expect(result.hasNewEpoch).toBe(true);
   });
 });
 

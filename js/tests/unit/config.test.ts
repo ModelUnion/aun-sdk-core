@@ -38,7 +38,6 @@ describe('createConfig', () => {
     expect(cfg.seedPassword).toBeNull();
     expect(cfg.discoveryPort).toBeNull();
     expect(cfg.groupE2ee).toBe(true);
-    expect(cfg.rotateOnJoin).toBe(false);
     expect(cfg.epochAutoRotateInterval).toBe(0);
     expect(cfg.oldEpochRetentionSeconds).toBe(604800);
     expect(cfg.verifySsl).toBe(true);
@@ -58,7 +57,6 @@ describe('createConfig', () => {
       root_ca_pem: 'ROOT-CA-PEM',
       discoveryPort: 20001,
       groupE2EE: false,
-      rotateOnJoin: true,
       epochAutoRotateInterval: 3600,
       oldEpochRetentionSeconds: 86400,
       requireForwardSecrecy: false,
@@ -68,7 +66,6 @@ describe('createConfig', () => {
     expect(cfg.rootCaPem).toBe('ROOT-CA-PEM');
     expect(cfg.discoveryPort).toBe(20001);
     expect(cfg.groupE2ee).toBe(true); // 必备能力，不可关闭
-    expect(cfg.rotateOnJoin).toBe(true);
     expect(cfg.epochAutoRotateInterval).toBe(3600);
     expect(cfg.oldEpochRetentionSeconds).toBe(86400);
     expect(cfg.requireForwardSecrecy).toBe(false);

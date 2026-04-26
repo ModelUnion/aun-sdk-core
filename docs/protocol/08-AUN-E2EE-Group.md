@@ -151,7 +151,7 @@ ciphertext = AES-256-GCM(msg_key, nonce, plaintext, aad_bytes)
 |----------|:-----------:|------|
 | 成员被踢出（`group.kick`） | **MUST** | 离开者仍持有旧 group_secret |
 | 成员主动退出（`group.leave`） | **MUST** | 离开者仍持有旧 group_secret；剩余在线 admin/owner 负责轮换，离开者自身不执行轮换 |
-| 成员加入（`group.add_member`） | **MUST NOT**（默认） | 新成员无旧 group_secret，直接发当前密钥即可；**MAY** 通过 `rotate_on_join` 配置启用加入时轮换 |
+| 成员加入（`group.add_member`） | **MUST** | 新成员加入会改变成员集；服务端记录 `min_read_epoch = join_epoch + 1`，客户端 MUST 轮换后再向新成员分发新 epoch 密钥 |
 | 定时轮换 | **MAY** | 缩小密钥泄露窗口，建议每 24 小时 |
 | 管理员手动轮换 | **MAY** | 怀疑密钥泄露时主动触发 |
 | 群组解散（`group.dissolve`） | 不适用 | 群组不再存在 |
@@ -204,13 +204,15 @@ ciphertext = AES-256-GCM(msg_key, nonce, plaintext, aad_bytes)
 
 ### 5.3 新成员加入
 
-新成员加入时 **MUST NOT** 触发 epoch 轮换。执行加入操作的 admin **MUST** 通过 P2P E2EE 向新成员发送当前 group_secret：
+新成员加入时 **MUST** 触发 epoch 轮换。服务端在成员写入时 **MUST** 记录加入时的 `join_epoch`，并将该成员的 `min_read_epoch` 设置为 `join_epoch + 1`（若群组尚未启用 E2EE epoch，则为 0）。因此，新成员 **MUST NOT** 获得加入前 epoch 的 group_secret。
+
+执行加入操作的 admin/owner，或成员变更事件选举出的在线 owner/admin leader，**MUST** 通过 `group.e2ee.rotate_epoch` 完成 CAS 轮换，然后通过 P2P E2EE 向当前成员（包含新成员）分发新 epoch 的 group_secret：
 
 ```
 p2p_encrypt_send(new_member, {
     type: "e2ee.group_key_distribution",
     group_id,
-    epoch,                     // 当前 epoch
+    epoch,                     // 新 epoch
     group_secret,
     commitment,
     member_aids,               // 含新成员的列表
@@ -220,7 +222,7 @@ p2p_encrypt_send(new_member, {
 })
 ```
 
-新成员收到后即可解密当前 epoch 的群消息。是否允许新成员解密加入前的历史消息，由应用层策略决定（§5.5）。
+新成员收到后只能解密新 epoch 及之后的群消息。若轮换尚未完成，服务端 **SHOULD** 拒绝新成员发送低于 `min_read_epoch` 的群组 E2EE 消息，并返回“epoch rotation pending”类错误。
 
 ### 5.4 分发职责
 
@@ -230,7 +232,7 @@ group_secret 的分发 **MUST NOT** 依赖单一节点：
 |------|--------|
 | 踢人 | 执行 `group.kick` 的 admin/owner |
 | 成员退出 | 剩余在线 admin/owner（离开者不执行轮换） |
-| 加人 | 执行 `group.add_member` 的 admin |
+| 加人/审批通过/邀请码入群 | 执行操作的 admin/owner 或成员变更事件选举出的在线 owner/admin leader |
 | 定时轮换 | 任意在线 admin/owner |
 | 密钥补发 | 任意持有当前 group_secret 的成员（§8） |
 
@@ -238,10 +240,9 @@ group_secret 的分发 **MUST NOT** 依赖单一节点：
 
 | 策略 | 行为 | 适用场景 |
 |------|------|---------|
-| **允许看历史**（默认） | 新成员收到当前 group_secret 后可解密本 epoch 内所有历史消息 | 一般群聊 |
-| **禁止看历史** | 加入时触发 epoch 轮换，新成员只拿到新 group_secret | 机密频道 |
+| **加入前历史隔离**（默认且唯一） | 加入时触发 epoch 轮换，新成员只拿到新 group_secret；服务端通过 `min_read_epoch` 阻止其使用旧 epoch | 所有群组 |
 
-SDK **SHOULD** 提供配置项 `rotate_on_join: bool`（默认 `false`）。
+如业务需要向新成员开放入群前历史，**MUST** 在应用层通过单独的历史授权、导出或重加密流程实现，不得复用加入前的 group_secret。
 
 ---
 
@@ -847,7 +848,6 @@ SDK 收到 `event/group.message_created` 且 `payload.type == "e2ee.group_encryp
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `group_e2ee` | bool | `true` | 群组 E2EE 能力声明（必选能力，始终为 true，非用户开关） |
-| `rotate_on_join` | bool | `false` | 新成员加入时是否轮换 epoch |
 | `epoch_auto_rotate_interval` | int | `0` | 自动轮换间隔（秒），0 表示禁用 |
 | `old_epoch_retention_seconds` | int | `604800` | 旧 epoch 密钥保留时间（默认 7 天） |
 
@@ -891,9 +891,10 @@ msg_key[i] = HKDF(sender_chain_key[i], info="msg")
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 1.0-draft-r5 | 2026-04 | 成员加入改为 MUST 轮换 epoch；服务端以 `min_read_epoch` 约束新成员加入前历史访问；删除加入轮换配置开关 |
 | 1.0-draft-r4 | 2026-04 | 新增 Epoch CAS 轮换 RPC 的 rotation_signature 要求（§5.2.1）；新增客户端操作签名要求（§11.3）；补充密钥恢复异步语义（§8.5）；补充外层与 AAD 绑定校验说明；升级防服务端注入安全属性 |
 | 1.0-draft-r3 | 2026-04 | Membership Commitment 绑定 group_secret 哈希（§6.2）；新增 Membership Manifest 签名机制（§6A）；群密文消息新增发送方签名（§7.1）；更新本地状态模型含 old_epochs（§9.2）；服务端角色明确 epoch CAS 协调（§1.2）；分发消息增加 manifest 字段（§5.2, §5.3） |
-| 1.0-draft-r2 | 2026-04 | group_e2ee 默认值改为 true；成员加入轮换策略增加 rotate_on_join 配置说明；group.leave 明确离开者不执行轮换 |
+| 1.0-draft-r2 | 2026-04 | group_e2ee 默认值改为 true；补充成员加入轮换策略；group.leave 明确离开者不执行轮换 |
 | 1.0-draft-r1 | 2026-04 | 修正：Membership Commitment 去掉 "Signed" 命名，明确为哈希一致性检测而非签名防伪；修正 message_id 来源为客户端生成；新增外层路由字段与 AAD 绑定校验要求 |
 | 1.0-draft | 2026-04 | 初始版本：Epoch Group Key 机制；Membership Commitment；密钥恢复协议 |
 

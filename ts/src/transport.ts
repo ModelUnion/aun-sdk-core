@@ -106,9 +106,12 @@ export class RPCTransport {
         try { ws.removeListener('open', onOpen); } catch { /* noop */ }
       };
 
+      let connectTimeout: ReturnType<typeof setTimeout> | null = null;
+
       const onHandshakeError = (err: Error): void => {
         if (!initialResolved) {
           initialResolved = true;
+          if (connectTimeout) clearTimeout(connectTimeout);
           cleanupHandshakeListeners();
           rollback();
           reject(new ConnectionError(`websocket connect failed: ${err.message}`));
@@ -116,6 +119,8 @@ export class RPCTransport {
       };
 
       const onOpen = (): void => {
+        // 防止超时/错误已 rollback 后，迟到的 open 事件重新赋值 _ws 导致 zombie 连接
+        if (initialResolved) return;
         this._ws = ws;
         this._closed = false;
         // 等待第一条消息作为 challenge
@@ -125,6 +130,7 @@ export class RPCTransport {
         if (!initialResolved) {
           // 第一条消息：尝试解析为 challenge
           initialResolved = true;
+          if (connectTimeout) clearTimeout(connectTimeout);
           cleanupHandshakeListeners();
           try {
             const message = this._decodeMessage(data as string | Buffer | Buffer[] | ArrayBuffer | JsonObject);
@@ -155,7 +161,7 @@ export class RPCTransport {
 
       // 连接超时覆盖整个握手流程（open + 等待 challenge）。
       // 不在 open 时清除，防止服务端沉默导致 Promise 永远不 resolve。
-      const connectTimeout = setTimeout(() => {
+      connectTimeout = setTimeout(() => {
         if (!initialResolved) {
           initialResolved = true;
           cleanupHandshakeListeners();

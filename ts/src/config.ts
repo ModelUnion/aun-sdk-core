@@ -82,8 +82,6 @@ export interface AUNConfig {
   discoveryPort: number | null;
   /** 是否启用群组 E2EE */
   groupE2ee: boolean;
-  /** 加入群组时是否轮换 epoch */
-  rotateOnJoin: boolean;
   /** epoch 自动轮换间隔（秒，0 表示不自动轮换） */
   epochAutoRotateInterval: number;
   /** 旧 epoch 保留时长（秒，默认 7 天） */
@@ -94,8 +92,6 @@ export interface AUNConfig {
   requireForwardSecrecy: boolean;
   /** 防重放窗口（秒） */
   replayWindowSeconds: number;
-  /** Custody 托管服务 URL */
-  custodyUrl: string;
 }
 
 function readOptionalNumber(value: unknown, fallback: number | null): number | null {
@@ -127,13 +123,11 @@ export function defaultConfig(): AUNConfig {
     seedPassword: null,
     discoveryPort: null,
     groupE2ee: true,
-    rotateOnJoin: false,
     epochAutoRotateInterval: 0,
     oldEpochRetentionSeconds: 604800,
     verifySsl: resolveVerifySslFromEnv(),
     requireForwardSecrecy: true,
     replayWindowSeconds: 300,
-    custodyUrl: '',
   };
 }
 
@@ -154,12 +148,10 @@ export function configFromMap(raw: JsonObject): AUNConfig {
       : (raw.encryptionSeed != null ? String(raw.encryptionSeed) : null))),
     discoveryPort: readOptionalNumber(raw.discovery_port ?? raw.discoveryPort, def.discoveryPort),
     groupE2ee: true,  // 必备能力，不可配置
-    rotateOnJoin: readBoolean(raw.rotate_on_join ?? raw.rotateOnJoin, def.rotateOnJoin),
     epochAutoRotateInterval: readOptionalNumber(raw.epoch_auto_rotate_interval ?? raw.epochAutoRotateInterval, def.epochAutoRotateInterval) ?? def.epochAutoRotateInterval,
     oldEpochRetentionSeconds: readOptionalNumber(raw.old_epoch_retention_seconds ?? raw.oldEpochRetentionSeconds, def.oldEpochRetentionSeconds) ?? def.oldEpochRetentionSeconds,
     verifySsl: readBoolean(raw.verify_ssl ?? raw.verifySSL ?? raw.verifySsl, def.verifySsl),
     requireForwardSecrecy: readBoolean(raw.require_forward_secrecy ?? raw.requireForwardSecrecy, def.requireForwardSecrecy),
     replayWindowSeconds: readOptionalNumber(raw.replay_window_seconds ?? raw.replayWindowSeconds, def.replayWindowSeconds) ?? def.replayWindowSeconds,
-    custodyUrl: raw.custody_url != null ? String(raw.custody_url) : (raw.custodyUrl != null ? String(raw.custodyUrl) : def.custodyUrl),
   };
 }

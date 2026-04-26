@@ -18,9 +18,6 @@ func TestDefaultConfig(t *testing.T) {
 	if !cfg.GroupE2EE {
 		t.Error("默认 GroupE2EE 应为 true")
 	}
-	if cfg.RotateOnJoin {
-		t.Error("默认 RotateOnJoin 应为 false")
-	}
 	if cfg.EpochAutoRotateInterval != 0 {
 		t.Error("默认 EpochAutoRotateInterval 应为 0")
 	}
@@ -47,7 +44,6 @@ func TestConfigFromMap(t *testing.T) {
 		"encryption_seed":             "test-seed",
 		"discovery_port":              20001,
 		"group_e2ee":                  false,
-		"rotate_on_join":              true,
 		"epoch_auto_rotate_interval":  3600,
 		"old_epoch_retention_seconds": 86400,
 		"verify_ssl":                  false,
@@ -70,9 +66,6 @@ func TestConfigFromMap(t *testing.T) {
 	}
 	if !cfg.GroupE2EE {
 		t.Error("GroupE2EE 是必备能力，应始终为 true")
-	}
-	if !cfg.RotateOnJoin {
-		t.Error("RotateOnJoin 应为 true")
 	}
 	if cfg.EpochAutoRotateInterval != 3600 {
 		t.Errorf("EpochAutoRotateInterval 不正确: %d", cfg.EpochAutoRotateInterval)
@@ -98,7 +91,6 @@ func TestConfigFromMapSupportsCamelCaseAliases(t *testing.T) {
 		"encryptionSeed":           "camel-seed",
 		"discoveryPort":            21001,
 		"groupE2EE":                false,
-		"rotateOnJoin":             true,
 		"epochAutoRotateInterval":  120,
 		"oldEpochRetentionSeconds": 30,
 		"verifySSL":                false,
@@ -121,9 +113,6 @@ func TestConfigFromMapSupportsCamelCaseAliases(t *testing.T) {
 	}
 	if !cfg.GroupE2EE {
 		t.Fatal("GroupE2EE 应始终为 true（必备能力）")
-	}
-	if !cfg.RotateOnJoin {
-		t.Fatal("RotateOnJoin 应为 true")
 	}
 	if cfg.EpochAutoRotateInterval != 120 {
 		t.Fatalf("EpochAutoRotateInterval 不正确: %d", cfg.EpochAutoRotateInterval)

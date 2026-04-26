@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/anthropics/aun-sdk-core/go/keystore"
@@ -36,6 +37,8 @@ type GroupE2EEManager struct {
 	responseThrottle      *GroupKeyRequestThrottle    // 密钥响应频率限制
 	senderCertResolver    func(string, string) string // 发送方证书解析器（AID, fingerprint）
 	initiatorCertResolver func(string, string) string // 发起者证书解析器（AID, fingerprint）
+	pendingKeyRequests    map[string]map[string]any
+	pendingKeyRequestsMu  sync.Mutex
 }
 
 // GroupE2EEManagerConfig 群组 E2EE 配置
@@ -68,6 +71,7 @@ func NewGroupE2EEManager(cfg GroupE2EEManagerConfig) *GroupE2EEManager {
 		responseThrottle:      NewGroupKeyRequestThrottle(resCooldown),
 		senderCertResolver:    cfg.SenderCertResolver,
 		initiatorCertResolver: cfg.InitiatorCertResolver,
+		pendingKeyRequests:    make(map[string]map[string]any),
 	}
 }
 
@@ -310,7 +314,7 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map
 		msgID, _ = message["message_id"].(string)
 	}
 	if !skipReplay && groupID != "" && sender != "" && msgID != "" {
-		if m.replayGuard.IsSeen(groupID, sender, msgID) {
+		if !m.replayGuard.CheckAndRecord(groupID, sender, msgID) {
 			return nil, fmt.Errorf("%w: group=%s sender=%s msg=%s", ErrReplayDetected, groupID, sender, msgID)
 		}
 	}
@@ -332,29 +336,30 @@ func (m *GroupE2EEManager) Decrypt(message map[string]any, skipReplay bool) (map
 	}
 	if senderCertPEM == nil {
 		log.Printf("[e2ee_group] 拒绝群消息：无法获取发送方 %s 的证书: group=%s", sender, groupID)
+		if !skipReplay && groupID != "" && sender != "" && msgID != "" {
+			m.replayGuard.Unrecord(groupID, sender, msgID)
+		}
 		return nil, fmt.Errorf("sender cert not found: aid=%s group=%s", sender, groupID)
 	}
 
 	allSecrets := LoadAllGroupSecrets(m.keystore, m.currentAID(), groupID)
 	if len(allSecrets) == 0 {
+		// 解密失败，回退 replay guard 记录以允许后续重试
+		if !skipReplay && groupID != "" && sender != "" && msgID != "" {
+			m.replayGuard.Unrecord(groupID, sender, msgID)
+		}
 		return nil, fmt.Errorf("no group secret available: group=%s", groupID)
 	}
 
 	result := DecryptGroupMessage(allSecrets, message, senderCertPEM, true)
 	if result == nil {
-		// GO-003: 解密失败时返回 error，不再返回 (nil, nil)
+		// GO-003: 解密失败时回退 replay guard 记录并返回 error
+		if !skipReplay && groupID != "" && sender != "" && msgID != "" {
+			m.replayGuard.Unrecord(groupID, sender, msgID)
+		}
 		return nil, fmt.Errorf("群消息解密失败: group=%s sender=%s", groupID, sender)
 	}
-	if !skipReplay {
-		// 解密成功后记录防重放
-		finalMsgID := aadMsgID
-		if finalMsgID == "" {
-			finalMsgID, _ = message["message_id"].(string)
-		}
-		if groupID != "" && sender != "" && finalMsgID != "" {
-			m.replayGuard.Record(groupID, sender, finalMsgID)
-		}
-	}
+	// CheckAndRecord 已在预检阶段原子记录，解密成功无需再次 Record
 	return result, nil
 }
 
@@ -432,7 +437,31 @@ func (m *GroupE2EEManager) HandleIncoming(payload map[string]any) string {
 		return "distribution_rejected"
 
 	case "e2ee.group_key_response":
-		ok := HandleKeyResponse(payload, m.keystore, aid)
+		pendingKey := fmt.Sprintf("%s:%v:%s", getStr(payload, "group_id", ""), payload["epoch"], getStr(payload, "request_id", ""))
+		m.pendingKeyRequestsMu.Lock()
+		expected := m.pendingKeyRequests[pendingKey]
+		m.pendingKeyRequestsMu.Unlock()
+		if expected == nil {
+			return "response_rejected"
+		}
+		responderAID, _ := payload["responder_aid"].(string)
+		var responderCert []byte
+		if m.initiatorCertResolver != nil && responderAID != "" {
+			if raw := m.initiatorCertResolver(responderAID, ""); raw != "" {
+				responderCert = []byte(raw)
+			}
+		}
+		ok := HandleKeyResponse(payload, m.keystore, aid, KeyResponseVerifyOptions{
+			ExpectedRequest:  expected,
+			ResponderCertPEM: responderCert,
+			CurrentMembers:   m.GetMemberAIDs(getStr(payload, "group_id", "")),
+			Strict:           true,
+		})
+		if ok && expected != nil {
+			m.pendingKeyRequestsMu.Lock()
+			delete(m.pendingKeyRequests, pendingKey)
+			m.pendingKeyRequestsMu.Unlock()
+		}
 		if ok {
 			return "response"
 		}
@@ -474,10 +503,30 @@ func (m *GroupE2EEManager) BuildRecoveryRequest(groupID string, epoch int, sende
 		return nil
 	}
 
+	payload := BuildKeyRequest(groupID, epoch, aid)
+	m.RememberKeyRequest(payload, candidates[0])
 	return map[string]any{
 		"to":      candidates[0],
-		"payload": BuildKeyRequest(groupID, epoch, aid),
+		"payload": payload,
 	}
+}
+
+func (m *GroupE2EEManager) RememberKeyRequest(payload map[string]any, expectedResponder ...string) {
+	if payload == nil || getStr(payload, "type", "") != "e2ee.group_key_request" {
+		return
+	}
+	requestID := getStr(payload, "request_id", "")
+	if requestID == "" {
+		return
+	}
+	key := fmt.Sprintf("%s:%v:%s", getStr(payload, "group_id", ""), payload["epoch"], requestID)
+	pending := copyMapShallow(payload)
+	if len(expectedResponder) > 0 && expectedResponder[0] != "" {
+		pending["_expected_responder_aid"] = expectedResponder[0]
+	}
+	m.pendingKeyRequestsMu.Lock()
+	m.pendingKeyRequests[key] = pending
+	m.pendingKeyRequestsMu.Unlock()
 }
 
 // HandleKeyRequestMsg 处理密钥请求
@@ -507,7 +556,22 @@ func (m *GroupE2EEManager) HandleKeyRequestMsg(requestPayload map[string]any, cu
 		return nil
 	}
 
-	return HandleKeyRequest(requestPayload, m.keystore, m.currentAID(), currentMembers)
+	response := HandleKeyRequest(requestPayload, m.keystore, m.currentAID(), currentMembers)
+	if response == nil {
+		return nil
+	}
+	identity := m.identityFn()
+	pk, _ := identity["private_key_pem"].(string)
+	if pk == "" {
+		log.Printf("[e2ee_group] 拒绝密钥恢复响应：本地身份私钥不可用 group=%s requester=%s", groupID, requester)
+		return nil
+	}
+	signed, err := SignGroupKeyResponse(response, pk)
+	if err != nil {
+		log.Printf("[e2ee_group] group key response 签名失败: group=%s err=%v", groupID, err)
+		return nil
+	}
+	return signed
 }
 
 // ── 状态查询 ──────────────────────────────────────────────

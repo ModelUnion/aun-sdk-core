@@ -118,10 +118,13 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 	}
 	t.setChallenge(challenge)
 
-	// 启动读取循环
+	// 启动读取循环 — cancelReader/readerDone 在 closedMu 保护下写入，与 Close() 的读取保持一致
 	readerCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.closedMu.Lock()
 	t.cancelReader = cancel
-	t.readerDone = make(chan struct{})
+	t.readerDone = done
+	t.closedMu.Unlock()
 	go t.readerLoop(readerCtx)
 
 	return challenge, nil
@@ -133,14 +136,16 @@ func (t *RPCTransport) Close() error {
 	t.closed = true
 	ws := t.ws
 	t.ws = nil
+	cancelFn := t.cancelReader
+	doneCh := t.readerDone
 	t.closedMu.Unlock()
 
-	// 取消读取循环
-	if t.cancelReader != nil {
-		t.cancelReader()
+	// 取消读取循环 — cancelFn/doneCh 在锁内快照，避免与 Connect() 写入竞争
+	if cancelFn != nil {
+		cancelFn()
 		// 等待读取循环退出
-		if t.readerDone != nil {
-			<-t.readerDone
+		if doneCh != nil {
+			<-doneCh
 		}
 	}
 

@@ -1859,6 +1859,11 @@ def _make_reconnect_client():
     client._discovery = _FakeDiscovery()
     client._transport = _FakeTransport()
 
+    async def _fast_reconnect_sleep(delay: float):
+        await asyncio.sleep(0)
+
+    client._reconnect_sleep = _fast_reconnect_sleep
+
     return client, published
 
 

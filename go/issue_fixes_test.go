@@ -2,6 +2,7 @@ package aun
 
 import (
 	"context"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,21 @@ func TestReconnectJitterNoPanic(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestReconnectDelayBaseClamp(t *testing.T) {
+	if got := clampReconnectDelaySeconds(0.01, 1, reconnectMaxBaseDelaySeconds); got != 1.0 {
+		t.Fatalf("base 下限应夹到 1s，实际: %f", got)
+	}
+	if got := clampReconnectDelaySeconds(128, 1, reconnectMaxBaseDelaySeconds); got != reconnectMaxBaseDelaySeconds {
+		t.Fatalf("base 上限应夹到 64s，实际: %f", got)
+	}
+	if got := clampReconnectDelaySeconds(math.NaN(), 1, reconnectMaxBaseDelaySeconds); got != 1.0 {
+		t.Fatalf("NaN base 应回退到 fallback 后夹取，实际: %f", got)
+	}
+	if got := reconnectSleepDelaySeconds(4, 64); got < 4 || got >= 68 {
+		t.Fatalf("delay 应在 [base, base+max_base) 范围内，实际: %f", got)
+	}
 }
 
 // ── P1: ISSUE-SDK-GO-008 transport.SetTimeout 并发保护 ────────────

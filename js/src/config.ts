@@ -71,8 +71,6 @@ export interface AUNConfig {
   discoveryPort: number | null;
   /** 是否启用群组 E2EE（默认 true） */
   groupE2ee: boolean;
-  /** 加入群组时是否轮换 epoch（默认 false） */
-  rotateOnJoin: boolean;
   /** epoch 自动轮换间隔（秒，0 表示禁用） */
   epochAutoRotateInterval: number;
   /** 旧 epoch 保留时间（秒，默认 7 天） */
@@ -92,7 +90,6 @@ const DEFAULTS: AUNConfig = {
   seedPassword: null,
   discoveryPort: null,
   groupE2ee: true,
-  rotateOnJoin: false,
   epochAutoRotateInterval: 0,
   oldEpochRetentionSeconds: 604800,
   verifySsl: true,
@@ -121,7 +118,6 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
     ),
     discoveryPort: readOptionalNumber(data.discoveryPort ?? data.discovery_port, DEFAULTS.discoveryPort),
     groupE2ee: true,  // 必备能力，不可配置
-    rotateOnJoin: readBoolean(data.rotateOnJoin ?? data.rotate_on_join, DEFAULTS.rotateOnJoin),
     epochAutoRotateInterval: readOptionalNumber(data.epochAutoRotateInterval ?? data.epoch_auto_rotate_interval, DEFAULTS.epochAutoRotateInterval) ?? DEFAULTS.epochAutoRotateInterval,
     oldEpochRetentionSeconds: readOptionalNumber(data.oldEpochRetentionSeconds ?? data.old_epoch_retention_seconds, DEFAULTS.oldEpochRetentionSeconds) ?? DEFAULTS.oldEpochRetentionSeconds,
     verifySsl: DEFAULTS.verifySsl,

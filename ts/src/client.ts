@@ -47,6 +47,7 @@ import { AUNLogger } from './logger.js';
 import { SQLiteBackup } from './keystore/sqlite-backup.js';
 
 import { AuthNamespace } from './namespaces/auth.js';
+import { CustodyNamespace } from './namespaces/custody.js';
 import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
@@ -197,6 +198,23 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
     http: 30.0,
   },
 };
+
+const RECONNECT_MIN_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_BASE_DELAY_MS = 64_000;
+
+function clampReconnectDelayMs(
+  value: unknown,
+  fallback: number,
+  upper = RECONNECT_MAX_BASE_DELAY_MS,
+): number {
+  const parsed = Number(value);
+  const ms = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(Math.max(ms, RECONNECT_MIN_BASE_DELAY_MS), upper);
+}
+
+function reconnectSleepDelayMs(baseDelay: number, maxBaseDelay: number): number {
+  return baseDelay + Math.random() * maxBaseDelay;
+}
 
 /** 需要客户端签名的关键方法 */
 const SIGNED_METHODS = new Set([
@@ -393,6 +411,8 @@ export class AUNClient {
 
   /** Auth 命名空间 */
   readonly auth: AuthNamespace;
+  /** AID 托管命名空间 */
+  readonly custody: CustodyNamespace;
 
   /** 会话参数（重连用） */
   private _sessionParams: ConnectParams | null = null;
@@ -506,6 +526,7 @@ export class AUNClient {
     });
 
     this.auth = new AuthNamespace(this);
+    this.custody = new CustodyNamespace(this);
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => this._onRawMessageReceived(data));
     // 群组消息推送：自动解密后 re-publish
@@ -1204,6 +1225,7 @@ export class AUNClient {
   private async _requestGroupKeyFrom(groupId: string, targetAid: string, epoch = 0): Promise<void> {
     try {
       const reqPayload = buildKeyRequest(groupId, epoch, this._aid || '');
+      this._groupE2ee.rememberKeyRequest(reqPayload, targetAid);
       await this.call('message.send', {
         to: targetAid,
         payload: reqPayload,
@@ -1991,8 +2013,7 @@ export class AUNClient {
 
     const payloadObj = payload;
 
-    // S14: 控制面消息类型识别。一旦命中（明文 type 或 P2P 解密后内层 type），无论后续
-    // 处理是否成功都返回 true，避免控制面消息被发布到业务消息流。
+    // 控制面消息类型识别：只有明文 type 或 P2P 解密后内层 type 命中时才拦截。
     const GROUP_KEY_TYPES = new Set([
       'e2ee.group_key_distribution',
       'e2ee.group_key_request',
@@ -2013,7 +2034,6 @@ export class AUNClient {
         await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
       }
       const decrypted = this._e2ee._decryptMessage(message);
-      // S14: P2P 解密失败仍未识别为控制面 — 保持原行为返回 false
       if (decrypted === null) return false;
       this._schedulePrekeyReplenishIfConsumed(decrypted);
       actualPayload = isJsonObject(decrypted.payload) ? decrypted.payload : null;
@@ -2346,7 +2366,7 @@ export class AUNClient {
       const certReady = await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
       if (!certReady) {
         _clientLog('warn', '无法获取发送方 %s 的证书，跳过解密', fromAid);
-        return message;
+        throw new Error(`发送方证书不可用: from=${fromAid}, mid=${message.message_id}`);
       }
     }
 
@@ -2385,7 +2405,6 @@ export class AUNClient {
           const certReady = await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
           if (!certReady) {
             _clientLog('warn', '无法获取发送方 %s 的证书，跳过解密', fromAid);
-            result.push(msg);
             continue;
           }
         }
@@ -3386,7 +3405,7 @@ export class AUNClient {
     this._startReconnect(serverInitiated);
   }
 
-  /** 启动重连循环（默认无限重试 + 指数退避 + Full Jitter，仅在不可重试错误、close() 或 max_attempts 耗尽时终止） */
+  /** 启动重连循环（默认无限重试 + 指数退避 + 固定上限抖动，仅在不可重试错误、close() 或 max_attempts 耗尽时终止） */
   private _startReconnect(serverInitiated = false): void {
     if (this._reconnectActive) return;
     this._reconnectActive = true;
@@ -3399,11 +3418,17 @@ export class AUNClient {
   /** 重连循环（for 循环 + AbortController，与 JS/Python 对齐） */
   private async _reconnectLoop(serverInitiated: boolean): Promise<void> {
     const retry = this._sessionOptions.retry;
-    const maxDelay = Number(retry.max_delay ?? 64.0) * 1000;
+    const maxBaseDelay = clampReconnectDelayMs(
+      Number(retry.max_delay ?? 64.0) * 1000,
+      RECONNECT_MAX_BASE_DELAY_MS,
+    );
     const maxAttemptsRaw = Number(retry.max_attempts ?? 0);
     const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? Math.floor(maxAttemptsRaw) : 0;
-    const baseDelay = serverInitiated ? 16_000 : Number(retry.initial_delay ?? 1.0) * 1000;
-    let delay = baseDelay;
+    let delay = clampReconnectDelayMs(
+      serverInitiated ? 16_000 : Number(retry.initial_delay ?? 1.0) * 1000,
+      serverInitiated ? 16_000 : RECONNECT_MIN_BASE_DELAY_MS,
+      maxBaseDelay,
+    );
 
     for (let attempt = 1; !this._reconnectAbort?.signal.aborted; attempt++) {
       if (this._closing) break;
@@ -3425,15 +3450,15 @@ export class AUNClient {
       });
 
       try {
-        // Full Jitter: sleep(delay + random * delay)
-        await this._sleep(delay + Math.random() * delay);
+        // 固定上限抖动：base=[1s, max_base]，delay=base+rand(0..max_base)。
+        await this._sleep(reconnectSleepDelayMs(delay, maxBaseDelay));
         if (this._reconnectAbort?.signal.aborted || this._closing) break;
 
         // 重连前先 GET /health 探测，不健康则跳过本轮
         if (this._gatewayUrl) {
           const healthy = await this._discovery.checkHealth(this._gatewayUrl, 5_000);
           if (!healthy) {
-            delay = Math.min(delay * 2, maxDelay);
+            delay = Math.min(delay * 2, maxBaseDelay);
             continue;
           }
         }
@@ -3460,7 +3485,7 @@ export class AUNClient {
           });
           break;
         }
-        delay = Math.min(delay * 2, maxDelay);
+        delay = Math.min(delay * 2, maxBaseDelay);
       }
     }
 

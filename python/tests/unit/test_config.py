@@ -22,7 +22,6 @@ def test_from_dict_custom(tmp_path):
         "encryption_seed": "s3cret",
         "discovery_port": 20001,
         "group_e2ee": False,
-        "rotate_on_join": True,
         "epoch_auto_rotate_interval": 3600,
         "old_epoch_retention_seconds": 86400,
         "verify_ssl": False,
@@ -35,7 +34,6 @@ def test_from_dict_custom(tmp_path):
     assert cfg.seed_password == "s3cret"
     assert cfg.discovery_port == 20001
     assert cfg.group_e2ee is True  # 必备能力，不可关闭
-    assert cfg.rotate_on_join is True
     assert cfg.epoch_auto_rotate_interval == 3600
     assert cfg.old_epoch_retention_seconds == 86400
     assert cfg.verify_ssl is False
@@ -50,7 +48,6 @@ def test_from_dict_supports_camel_case_aliases(tmp_path):
         "encryptionSeed": "camel-seed",
         "discoveryPort": 21001,
         "groupE2EE": False,
-        "rotateOnJoin": True,
         "epochAutoRotateInterval": 120,
         "oldEpochRetentionSeconds": 30,
         "verifySSL": False,
@@ -63,7 +60,6 @@ def test_from_dict_supports_camel_case_aliases(tmp_path):
     assert cfg.seed_password == "camel-seed"
     assert cfg.discovery_port == 21001
     assert cfg.group_e2ee is True  # 必备能力，不可关闭
-    assert cfg.rotate_on_join is True
     assert cfg.epoch_auto_rotate_interval == 120
     assert cfg.old_epoch_retention_seconds == 30
     assert cfg.verify_ssl is False

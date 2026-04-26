@@ -82,7 +82,6 @@ const client = new AUNClient(config?);
 | `rootCaPem` | `string \| null` | `null` | 自定义根证书 PEM |
 | `seedPassword` | `string \| null` | `null` | SecretStore 派生种子 |
 | `discoveryPort` | `number \| null` | `null` | Gateway 发现端口 |
-| `rotateOnJoin` | `boolean` | `false` | 新成员加入后是否直接轮换群组 epoch |
 | `epochAutoRotateInterval` | `number` | `0` | 群组 epoch 自动轮换间隔，秒 |
 | `oldEpochRetentionSeconds` | `number` | `604800` | 旧 epoch 保留时长 |
 | `requireForwardSecrecy` | `boolean` | `true` | P2P 加密是否强制要求前向保密 |
@@ -91,6 +90,7 @@ const client = new AUNClient(config?);
 说明：
 
 - `groupE2ee` 在浏览器 SDK 中始终强制开启。
+- 新成员加入、审批通过或邀请码入群后，浏览器 SDK 固定触发群组 epoch 轮换。
 - `verify_ssl=false` 在浏览器 SDK 中不允许使用。
 
 ### 4.2 属性
@@ -493,9 +493,9 @@ SDK 自动行为：
 SDK 内部已自动处理以下群组 E2EE 场景：
 
 - `group.create` 后自动创建首个 epoch
-- `group.add_member` 后自动分发密钥或轮换 epoch
+- `group.add_member` 后自动轮换 epoch 并分发新密钥
 - `group.kick` 后自动轮换 epoch
-- 审批通过后自动分发密钥
+- 审批通过后自动轮换 epoch 并分发新密钥
 - 群消息解密失败时自动尝试密钥恢复
 
 ## 8. 事件

@@ -22,7 +22,6 @@ describe('defaultConfig', () => {
     expect(cfg.seedPassword).toBeNull();
     expect(cfg.discoveryPort).toBeNull();
     expect(cfg.groupE2ee).toBe(true);
-    expect(cfg.rotateOnJoin).toBe(false);
     expect(cfg.epochAutoRotateInterval).toBe(0);
     expect(cfg.oldEpochRetentionSeconds).toBe(604800);
     expect(cfg.verifySsl).toBe(true);
@@ -40,7 +39,6 @@ describe('configFromMap', () => {
       encryption_seed: 's3cret',
       discovery_port: 20001,
       group_e2ee: false,
-      rotate_on_join: true,
       epoch_auto_rotate_interval: 3600,
       old_epoch_retention_seconds: 86400,
       verify_ssl: false,
@@ -52,7 +50,6 @@ describe('configFromMap', () => {
     expect(cfg.seedPassword).toBe('s3cret');
     expect(cfg.discoveryPort).toBe(20001);
     expect(cfg.groupE2ee).toBe(true); // 必备能力，不可关闭
-    expect(cfg.rotateOnJoin).toBe(true);
     expect(cfg.epochAutoRotateInterval).toBe(3600);
     expect(cfg.oldEpochRetentionSeconds).toBe(86400);
     expect(cfg.verifySsl).toBe(false);
@@ -68,7 +65,6 @@ describe('configFromMap', () => {
       encryptionSeed: 'camelSeed',
       discoveryPort: 21001,
       groupE2EE: false,
-      rotateOnJoin: true,
       epochAutoRotateInterval: 120,
       oldEpochRetentionSeconds: 30,
       verifySSL: false,
@@ -80,7 +76,6 @@ describe('configFromMap', () => {
     expect(cfg.seedPassword).toBe('camelSeed');
     expect(cfg.discoveryPort).toBe(21001);
     expect(cfg.groupE2ee).toBe(true); // 必备能力，不可关闭
-    expect(cfg.rotateOnJoin).toBe(true);
     expect(cfg.epochAutoRotateInterval).toBe(120);
     expect(cfg.oldEpochRetentionSeconds).toBe(30);
     expect(cfg.verifySsl).toBe(false);

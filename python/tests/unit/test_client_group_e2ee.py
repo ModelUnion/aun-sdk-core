@@ -20,6 +20,7 @@ from aun_core.e2ee import (
     compute_membership_commitment,
     encrypt_group_message,
     generate_group_secret,
+    GroupReplayGuard,
     load_all_group_secrets,
     load_group_secret,
     store_group_secret,
@@ -74,8 +75,10 @@ def _get_signing_identity(aid: str):
 def _make_client(tmp_path, aid=_AID_ALICE):
     """创建一个 mock 好的 AUNClient 用于测试。"""
     client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    pk_pem, cert_pem = _get_signing_identity(aid)
+    cert_str = cert_pem.decode("utf-8") if isinstance(cert_pem, bytes) else cert_pem
     client._aid = aid
-    client._identity = {"aid": aid, "private_key_pem": "", "cert": ""}
+    client._identity = {"aid": aid, "private_key_pem": pk_pem, "cert": cert_str}
     client._state = "connected"
     # 为所有已知成员预填充 PKI 验证过的证书缓存
     now = time.time()
@@ -281,7 +284,6 @@ class TestConfigGroupE2EEDisabled:
         """默认 group_e2ee=True（必选能力）"""
         client = AUNClient({"aun_path": str(tmp_path / "aun")})
         assert client._config_model.group_e2ee is True
-        assert client._config_model.rotate_on_join is False
         assert client._config_model.epoch_auto_rotate_interval == 0
         assert client._config_model.old_epoch_retention_seconds == 604800
 
@@ -289,11 +291,9 @@ class TestConfigGroupE2EEDisabled:
         """group_e2ee 是必选能力，即使用户传 False 也始终为 True"""
         client = AUNClient({
             "aun_path": str(tmp_path / "aun"),
-            "rotate_on_join": True,
             "epoch_auto_rotate_interval": 86400,
         })
         assert client._config_model.group_e2ee is True
-        assert client._config_model.rotate_on_join is True
         assert client._config_model.epoch_auto_rotate_interval == 86400
 
 
@@ -554,12 +554,12 @@ class TestRotateGroupEpochCAS:
         assert client._group_e2ee.current_epoch(_GRP) == 1
 
     def test_kick_waits_for_member_removed_event_to_rotate(self, tmp_path, monkeypatch):
-        """group.kick 返回后不应直接轮换；仅收到 member_removed 事件后触发一次 CAS 轮换"""
+        """group.kick 成功返回后通过 RPC 兜底触发一次 CAS 轮换。"""
         client = _make_client(tmp_path, aid=_AID_ALICE)
         _store_secret_for_client(client, epoch=1)
         rotate_called = []
 
-        async def track_rotate(group_id):
+        async def track_rotate(group_id, *args, **kwargs):
             rotate_called.append(group_id)
 
         monkeypatch.setattr(client, "_rotate_group_epoch", track_rotate)
@@ -580,16 +580,8 @@ class TestRotateGroupEpochCAS:
 
         async def run():
             await client.call("group.kick", {"group_id": _GRP, "aid": _AID_BOB})
-            await asyncio.sleep(0)
-            assert rotate_called == [], "group.kick 返回后不应直接触发轮换"
-
-            await client._on_raw_group_changed({
-                "module_id": "group",
-                "action": "member_removed",
-                "group_id": _GRP,
-            })
             await asyncio.sleep(0.2)
-            assert rotate_called == [_GRP], "收到 member_removed 事件后应触发一次轮换"
+            assert rotate_called == [_GRP], "group.kick 成功后应触发一次轮换兜底"
 
         asyncio.run(run())
 
@@ -599,7 +591,7 @@ class TestRotateGroupEpochCAS:
         _store_secret_for_client(client, epoch=1)
         rotate_called = []
 
-        async def track_rotate(group_id):
+        async def track_rotate(group_id, *args, **kwargs):
             rotate_called.append(group_id)
 
         monkeypatch.setattr(client, "_rotate_group_epoch", track_rotate)
@@ -608,11 +600,10 @@ class TestRotateGroupEpochCAS:
             if method == "group.leave":
                 return {"group": {"group_id": _GRP}, "left_aid": _AID_ALICE}
             if method == "group.get_members":
-                # 模拟 alice 是 admin，会触发轮换
+                # Alice 已离开，不再参与轮换
                 return {
                     "members": [
-                        {"aid": _AID_ALICE, "role": "admin"},
-                        {"aid": _AID_BOB, "role": "member"},
+                        {"aid": _AID_BOB, "role": "admin"},
                     ]
                 }
             return {}
@@ -625,16 +616,35 @@ class TestRotateGroupEpochCAS:
             await asyncio.sleep(0.2)
             assert _GRP not in rotate_called, "离开者自身不应触发轮换"
 
-            # 2. 模拟剩余成员收到 group.changed 事件 → 应触发轮换
-            await client._on_raw_group_changed({
+        asyncio.run(run())
+
+        remaining = _make_client(tmp_path, aid=_AID_BOB)
+        _store_secret_for_client(remaining, epoch=1)
+        remaining_rotated = []
+
+        async def track_remaining_rotate(group_id, *args, **kwargs):
+            remaining_rotated.append(group_id)
+
+        monkeypatch.setattr(remaining, "_rotate_group_epoch", track_remaining_rotate)
+
+        async def fake_remaining_transport_call(method, params=None):
+            if method == "group.get_members":
+                return {"members": [{"aid": _AID_BOB, "role": "admin"}]}
+            return {}
+
+        monkeypatch.setattr(remaining._transport, "call", fake_remaining_transport_call)
+
+        async def remaining_run():
+            await remaining._on_raw_group_changed({
                 "module_id": "group",
                 "action": "member_left",
                 "group_id": _GRP,
+                "old_epoch": 1,
             })
             await asyncio.sleep(0.2)
-            assert _GRP in rotate_called, "收到 member_left 事件后应触发轮换"
 
-        asyncio.run(run())
+        asyncio.run(remaining_run())
+        assert remaining_rotated == [_GRP], "剩余 admin 收到 member_left 事件后应触发轮换"
 
     def test_member_left_only_admin_rotates(self, tmp_path, monkeypatch):
         """收到 member_left/member_removed 事件时，仅 admin/owner 触发轮换，普通 member 不触发"""
@@ -642,7 +652,7 @@ class TestRotateGroupEpochCAS:
         _store_secret_for_client(client, epoch=1)
         rotate_called = []
 
-        async def track_rotate(group_id):
+        async def track_rotate(group_id, *args, **kwargs):
             rotate_called.append(group_id)
 
         monkeypatch.setattr(client, "_rotate_group_epoch", track_rotate)
@@ -745,12 +755,9 @@ class TestAutoOrchestrationAddMember:
         assert _AID_ALICE in local
         assert _AID_BOB in local
 
-    def test_add_member_rotate_on_join(self, tmp_path, monkeypatch):
-        """rotate_on_join=True 时走 CAS 轮换而非补发"""
-        client = AUNClient({
-            "aun_path": str(tmp_path / "aun"),
-            "rotate_on_join": True,
-        })
+    def test_add_member_triggers_epoch_rotation(self, tmp_path, monkeypatch):
+        """成员加入默认走 CAS 轮换而非补发当前 epoch"""
+        client = AUNClient({"aun_path": str(tmp_path / "aun")})
         client._aid = _AID_ALICE
         client._identity = {"aid": _AID_ALICE}
         client._state = "connected"
@@ -758,12 +765,17 @@ class TestAutoOrchestrationAddMember:
 
         rotate_called = []
 
-        async def mock_rotate(gid):
+        async def mock_rotate(gid, *args, **kwargs):
             rotate_called.append(gid)
 
         monkeypatch.setattr(client, "_rotate_group_epoch", mock_rotate)
 
         async def fake_transport(method, params):
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                ]}
             return {"ok": True}
         monkeypatch.setattr(client._transport, "call", fake_transport)
 
@@ -827,16 +839,21 @@ class TestAutoOrchestrationReview:
 
 class TestAutoOrchestrationBatchReview:
     def test_batch_review_distributes_to_approved_only(self, tmp_path, monkeypatch):
-        """batch_review 仅对 approved 的成员分发"""
+        """batch_review 只要有 approved 成员就触发 epoch 轮换，不补发旧 epoch 密钥"""
         client = _make_client(tmp_path, aid=_AID_ALICE)
         _store_secret_for_client(client, epoch=1)
         _CAROL = "carol.agentid.pub"
 
-        distributed_to = []
+        rotated = []
+        distributed = []
+
+        async def track_rotate(group_id, *args, **kwargs):
+            rotated.append(group_id)
 
         async def track_distribute(group_id, new_aid):
-            distributed_to.append(new_aid)
+            distributed.append(new_aid)
 
+        monkeypatch.setattr(client, "_rotate_group_epoch", track_rotate)
         monkeypatch.setattr(client, "_distribute_key_to_new_member", track_distribute)
 
         async def fake_transport(method, params):
@@ -844,6 +861,11 @@ class TestAutoOrchestrationBatchReview:
                 return {"results": [
                     {"aid": _AID_BOB, "ok": True, "status": "approved"},
                     {"aid": _CAROL, "ok": True, "status": "rejected"},
+                ]}
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
                 ]}
             return {}
 
@@ -861,19 +883,18 @@ class TestAutoOrchestrationBatchReview:
 
         asyncio.run(run())
 
-        assert _AID_BOB in distributed_to
-        assert _CAROL not in distributed_to
+        assert rotated == [_GRP]
+        assert distributed == []
 
-    def test_batch_review_rotate_on_join(self, tmp_path, monkeypatch):
-        """batch_review 在 rotate_on_join=True 时触发轮换而非补发"""
+    def test_batch_review_triggers_epoch_rotation(self, tmp_path, monkeypatch):
+        """batch_review 批准成员加入时默认触发轮换而非补发当前 epoch"""
         client = _make_client(tmp_path, aid=_AID_ALICE)
-        client._config_model.rotate_on_join = True
         _store_secret_for_client(client, epoch=1)
 
         rotated = []
         distributed = []
 
-        async def track_rotate(group_id):
+        async def track_rotate(group_id, *args, **kwargs):
             rotated.append(group_id)
 
         async def track_distribute(group_id, new_aid):
@@ -887,6 +908,12 @@ class TestAutoOrchestrationBatchReview:
                 return {"results": [
                     {"aid": _AID_BOB, "ok": True, "status": "approved"},
                     {"aid": "carol.agentid.pub", "ok": True, "status": "approved"},
+                ]}
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                    {"aid": "carol.agentid.pub", "role": "member"},
                 ]}
             return {}
 
@@ -1273,55 +1300,30 @@ class TestGroupMessagePushPipeline:
 # ══════════════════════════════════════════════════════════════
 
 class TestReplayGuardSemantics:
-    """_check_replay_guard 的 fail-closed 语义验证。"""
-
-    def _make_client_with_transport_mock(self, tmp_path, transport_call_fn):
-        client = _make_client(tmp_path, aid=_AID_BOB)
-        import types
-        client._transport.call = types.MethodType(
-            lambda self, m, p=None: transport_call_fn(m, p), client._transport
-        )
-        return client
+    """接收侧 replay guard 使用 SDK 实例内本地 seen set。"""
 
     def test_duplicate_returns_false(self, tmp_path):
-        """服务端返回 duplicate=True 时，_check_replay_guard 返回 False（拒绝消息）。"""
-        async def transport_call(method, params=None):
-            if method == "message.e2ee.record_replay_guard":
-                return {"duplicate": True}
-            return {}
-
-        client = self._make_client_with_transport_mock(tmp_path, transport_call)
-        result = asyncio.run(client._check_replay_guard(
-            "msg-dup-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
-        ))
-        assert result is False
+        """同一 group/sender/message_id 第二次记录应被判定为重放。"""
+        guard = GroupReplayGuard()
+        assert guard.check_and_record(_GRP, _AID_ALICE, "msg-dup-1") is True
+        assert guard.check_and_record(_GRP, _AID_ALICE, "msg-dup-1") is False
 
     def test_non_duplicate_returns_true(self, tmp_path):
-        """服务端返回 duplicate=False 时，_check_replay_guard 返回 True（允许消息）。"""
-        async def transport_call(method, params=None):
-            if method == "message.e2ee.record_replay_guard":
-                return {"duplicate": False}
-            return {}
-
-        client = self._make_client_with_transport_mock(tmp_path, transport_call)
-        result = asyncio.run(client._check_replay_guard(
-            "msg-new-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
-        ))
-        assert result is True
+        """不同 message_id 应正常通过本地 replay guard。"""
+        guard = GroupReplayGuard()
+        assert guard.check_and_record(_GRP, _AID_ALICE, "msg-new-1") is True
+        assert guard.check_and_record(_GRP, _AID_ALICE, "msg-new-2") is True
 
     def test_rpc_exception_fail_open_returns_true(self, tmp_path):
-        """RPC 异常时，_check_replay_guard 应 fail-open 返回 True（允许消息通过）。
-        RPC 异常（如网络问题）不代表消息是重复的，不应丢弃消息。"""
+        """接收侧不再调用服务端 replay guard，传输层异常不影响本地判定。"""
         async def transport_call(method, params=None):
-            if method == "message.e2ee.record_replay_guard":
-                raise RuntimeError("network error")
-            return {}
+            raise RuntimeError("should not be called")
 
-        client = self._make_client_with_transport_mock(tmp_path, transport_call)
-        result = asyncio.run(client._check_replay_guard(
-            "msg-err-1", _AID_ALICE, "epoch_group_key", {"timestamp": 1710504000000},
-        ))
-        assert result is True
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        client._transport.call = transport_call
+        assert client._group_e2ee._replay_guard.check_and_record(
+            _GRP, _AID_ALICE, "msg-local-1",
+        ) is True
 
 
 class TestGroupPushDecryptFailureAutoAck:

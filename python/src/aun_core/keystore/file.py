@@ -617,12 +617,14 @@ class FileKeyStore(KeyStore):
     def _get_metadata_lock(self, aid: str) -> threading.RLock:
         with self._locks_lock:
             if aid not in self._metadata_locks:
-                # 超过上限时，清理未被持有的锁
+                # 超过上限时，清理真正空闲的锁（非当前线程持有 ≠ 无人持有，
+                # 须用 acquire(blocking=False) 确认无任何线程持有后再淘汰）
                 if len(self._metadata_locks) >= _METADATA_LOCKS_LIMIT:
-                    to_remove = [
-                        k for k, v in self._metadata_locks.items()
-                        if not v._is_owned()
-                    ]
+                    to_remove = []
+                    for k, v in self._metadata_locks.items():
+                        if v.acquire(blocking=False):
+                            v.release()
+                            to_remove.append(k)
                     for k in to_remove[:len(self._metadata_locks) - _METADATA_LOCKS_LIMIT + 1]:
                         del self._metadata_locks[k]
                 self._metadata_locks[aid] = threading.RLock()

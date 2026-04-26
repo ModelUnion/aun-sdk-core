@@ -839,7 +839,7 @@ export class E2EEManager {
     if (!payload || typeof payload !== 'object') return message;
     if (payload.type !== 'e2ee.encrypted') return message;
     if (message.encrypted === false) return message;
-    if (!this._shouldDecryptForCurrentAid(message, payload)) return message;
+    if (!this._shouldDecryptForCurrentAid(message, payload)) return null;
 
     const skipReplay = opts?.skipReplay ?? false;
 
@@ -857,15 +857,20 @@ export class E2EEManager {
         }
       }
 
-      // 本地防重放
+      // 本地防重放：先检查，解密成功后再记录。
       const messageIdVal = message.message_id as string | undefined;
       const fromAid = message.from as string | undefined;
+      let seenKey = '';
       if (messageIdVal && fromAid) {
-        const seenKey = `${fromAid}:${messageIdVal}`;
+        seenKey = `${fromAid}:${messageIdVal}`;
         if (this._seenMessages.has(seenKey)) return null;
+      }
+      const result = await this._decryptMessageInternal(message);
+      if (result !== null && seenKey) {
         this._seenMessages.set(seenKey, true);
         this._trimSeenSet();
       }
+      return result;
     }
 
     return this._decryptMessageInternal(message);

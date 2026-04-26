@@ -6,6 +6,7 @@ import hmac as _hmac
 import json
 import logging
 import secrets
+import threading
 import time as _time_mod
 import uuid
 from typing import Any
@@ -28,6 +29,8 @@ from .errors import (
 
 
 _e2ee_log = logging.getLogger("aun_core.e2ee")
+_group_secret_locks_guard = threading.Lock()
+_group_secret_locks: dict[str, threading.RLock] = {}
 
 
 SUITE = "P256_HKDF_SHA256_AES_256_GCM"
@@ -278,17 +281,20 @@ class E2EEManager:
                 )
                 return None
 
-        # 本地防重放
+        # 本地防重放：先检查，解密成功后再记录。
         message_id = message.get("message_id", "")
         from_aid = message.get("from", "")
+        seen_key = ""
         if message_id and from_aid:
             seen_key = f"{from_aid}:{message_id}"
             if seen_key in self._seen_messages:
                 return None  # 重放消息
+
+        result = self._decrypt_message(message, source=source)
+        if result is not None and seen_key:
             self._seen_messages[seen_key] = _time_mod.time()
             self._trim_seen_set()
-
-        return self._decrypt_message(message, source=source)
+        return result
 
     def _should_decrypt_for_current_aid(self, message: dict[str, Any], payload: dict[str, Any]) -> bool:
         """仅解密发给当前 AID 的消息，避免发送端回显消息误走接收端解密流程。"""
@@ -669,7 +675,7 @@ class E2EEManager:
     def _decrypt_message(self, message: dict[str, Any], *, source: str = "") -> dict[str, Any] | None:
         payload = message["payload"]
         if isinstance(payload, dict) and not self._should_decrypt_for_current_aid(message, payload):
-            return message
+            return None
         encryption_mode = payload.get("encryption_mode", "")
 
         # 验证发送方签名（适用于所有模式）
@@ -1373,6 +1379,50 @@ def _manifest_sign_data(manifest: dict[str, Any]) -> bytes:
     return "\n".join(fields).encode("utf-8")
 
 
+def _group_key_response_sign_data(payload: dict[str, Any]) -> bytes:
+    fields = [
+        str(payload.get("response_version", 1)),
+        str(payload.get("group_id", "")),
+        str(payload.get("epoch", 0)),
+        str(payload.get("requester_aid", "")),
+        str(payload.get("request_id", "")),
+        str(payload.get("responder_aid", "")),
+        str(payload.get("commitment", "")),
+        "|".join(sorted(str(item) for item in (payload.get("member_aids", []) or []))),
+        str(payload.get("issued_at", 0)),
+    ]
+    return "\n".join(fields).encode("utf-8")
+
+
+def sign_group_key_response(payload: dict[str, Any], private_key_pem: str) -> dict[str, Any]:
+    pk = serialization.load_pem_private_key(
+        private_key_pem.encode("utf-8") if isinstance(private_key_pem, str) else private_key_pem,
+        password=None,
+    )
+    signed = dict(payload)
+    signed.setdefault("response_version", 1)
+    signed.setdefault("issued_at", int(_time_mod.time() * 1000))
+    sig = pk.sign(_group_key_response_sign_data(signed), ec.ECDSA(hashes.SHA256()))
+    signed["response_signature"] = base64.b64encode(sig).decode("ascii")
+    return signed
+
+
+def verify_group_key_response_signature(payload: dict[str, Any], responder_cert_pem: bytes | str) -> bool:
+    sig_b64 = payload.get("response_signature")
+    if not sig_b64:
+        return False
+    try:
+        cert = x509.load_pem_x509_certificate(
+            responder_cert_pem if isinstance(responder_cert_pem, bytes)
+            else responder_cert_pem.encode("utf-8")
+        )
+        sig = base64.b64decode(sig_b64)
+        cert.public_key().verify(sig, _group_key_response_sign_data(payload), ec.ECDSA(hashes.SHA256()))
+        return True
+    except Exception:
+        return False
+
+
 def sign_membership_manifest(
     manifest: dict[str, Any],
     private_key_pem: str,
@@ -1467,6 +1517,24 @@ def store_group_secret(
 
     sqlite 主存时按 group_id 独立存取；自定义 keystore 未实现结构化接口时回退到 metadata。
     """
+    lock_key = f"{aid}:{group_id}"
+    with _group_secret_locks_guard:
+        lock = _group_secret_locks.setdefault(lock_key, threading.RLock())
+    with lock:
+        return _store_group_secret_locked(
+            keystore, aid, group_id, epoch, group_secret, commitment, member_aids,
+        )
+
+
+def _store_group_secret_locked(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+    epoch: int,
+    group_secret: bytes,
+    commitment: str,
+    member_aids: list[str],
+) -> bool:
     existing = _load_keystore_group_state(keystore, aid, group_id)
     if existing and existing.get("epoch") is not None:
         local_epoch = existing["epoch"]
@@ -1776,6 +1844,7 @@ def build_key_request(
     group_id: str,
     epoch: int,
     requester_aid: str,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """构建密钥请求 payload。通过 P2P E2EE 通道发送。"""
     return {
@@ -1783,6 +1852,8 @@ def build_key_request(
         "group_id": group_id,
         "epoch": epoch,
         "requester_aid": requester_aid,
+        "request_id": request_id or str(uuid.uuid4()),
+        "requested_at": int(_time_mod.time() * 1000),
     }
 
 
@@ -1791,6 +1862,7 @@ def handle_key_request(
     keystore: Any,
     aid: str,
     current_members: list[str],
+    private_key_pem: str | None = None,
 ) -> dict[str, Any] | None:
     """处理收到的密钥请求。
 
@@ -1820,20 +1892,32 @@ def handle_key_request(
     if not commitment:
         commitment = compute_membership_commitment(member_aids or current_members, epoch, group_id, secret_data["secret"])
 
-    return {
+    response = {
         "type": "e2ee.group_key_response",
         "group_id": group_id,
         "epoch": epoch,
         "group_secret": base64.b64encode(secret_data["secret"]).decode("ascii"),
         "commitment": commitment,
         "member_aids": member_aids or sorted(current_members),
+        "requester_aid": requester_aid,
+        "request_id": payload.get("request_id", ""),
+        "responder_aid": aid,
+        "issued_at": int(_time_mod.time() * 1000),
     }
+    if private_key_pem:
+        response = sign_group_key_response(response, private_key_pem)
+    return response
 
 
 def handle_key_response(
     response: dict[str, Any],
     keystore: Any,
     aid: str,
+    *,
+    expected_request: dict[str, Any] | None = None,
+    responder_cert_pem: bytes | str | None = None,
+    current_members: list[str] | None = None,
+    strict: bool = False,
 ) -> bool:
     """处理收到的密钥响应。
 
@@ -1849,6 +1933,31 @@ def handle_key_response(
 
     if not all([group_id, epoch is not None, group_secret_b64, commitment]):
         return False
+
+    if expected_request is not None:
+        if payload.get("requester_aid") != aid:
+            return False
+        expected_responder = str(expected_request.get("_expected_responder_aid") or "")
+        if expected_responder and payload.get("responder_aid") != expected_responder:
+            return False
+        if payload.get("request_id") != expected_request.get("request_id"):
+            return False
+        if payload.get("group_id") != expected_request.get("group_id"):
+            return False
+        if int(payload.get("epoch") or 0) != int(expected_request.get("epoch") or 0):
+            return False
+
+    responder_aid = str(payload.get("responder_aid") or "")
+    if strict:
+        if not responder_aid or not responder_cert_pem:
+            return False
+        if current_members and responder_aid not in current_members:
+            return False
+        if not verify_group_key_response_signature(payload, responder_cert_pem):
+            return False
+    elif responder_cert_pem is not None and payload.get("response_signature"):
+        if not verify_group_key_response_signature(payload, responder_cert_pem):
+            return False
 
     group_secret = base64.b64decode(group_secret_b64)
 
@@ -1905,6 +2014,7 @@ class GroupE2EEManager:
         self._response_throttle = GroupKeyRequestThrottle(cooldown=response_cooldown)
         self._sender_cert_resolver = sender_cert_resolver
         self._initiator_cert_resolver = initiator_cert_resolver
+        self._pending_key_requests: dict[str, dict[str, Any]] = {}
 
     # ── 密钥管理 ──────────────────────────────────────────
 
@@ -2086,7 +2196,25 @@ class GroupE2EEManager:
             ok = handle_key_distribution(payload, self._keystore(), aid, initiator_cert_pem=initiator_cert)
             return "distribution" if ok else "distribution_rejected"
         if msg_type == "e2ee.group_key_response":
-            ok = handle_key_response(payload, self._keystore(), aid)
+            pending_key = f"{payload.get('group_id', '')}:{payload.get('epoch', '')}:{payload.get('request_id', '')}"
+            expected = self._pending_key_requests.get(pending_key)
+            if expected is None:
+                return "response_rejected"
+            responder = str(payload.get("responder_aid") or "")
+            responder_cert = None
+            if self._initiator_cert_resolver and responder:
+                raw = self._initiator_cert_resolver(responder)
+                if raw:
+                    responder_cert = raw.encode("utf-8") if isinstance(raw, str) else raw
+            ok = handle_key_response(
+                payload, self._keystore(), aid,
+                expected_request=expected,
+                responder_cert_pem=responder_cert,
+                current_members=self.get_member_aids(str(payload.get("group_id") or "")),
+                strict=True,
+            )
+            if ok and expected is not None:
+                self._pending_key_requests.pop(pending_key, None)
             return "response" if ok else "response_rejected"
         if msg_type == "e2ee.group_key_request":
             return "request"
@@ -2117,11 +2245,24 @@ class GroupE2EEManager:
         if not candidates:
             return None
         payload = build_key_request(group_id, epoch, aid)
+        self.remember_key_request(payload, expected_responder_aid=candidates[0])
         return {
             "to": candidates[0],
             "payload": payload,
             "fallback_targets": candidates[1:],
         }
+
+    def remember_key_request(self, payload: dict[str, Any], expected_responder_aid: str | None = None) -> None:
+        if payload.get("type") != "e2ee.group_key_request":
+            return
+        request_id = str(payload.get("request_id") or "")
+        if not request_id:
+            return
+        key = f"{payload.get('group_id', '')}:{payload.get('epoch', '')}:{request_id}"
+        pending = dict(payload)
+        if expected_responder_aid:
+            pending["_expected_responder_aid"] = expected_responder_aid
+        self._pending_key_requests[key] = pending
 
     def handle_key_request_msg(
         self, request_payload: dict[str, Any], current_members: list[str],
@@ -2139,8 +2280,14 @@ class GroupE2EEManager:
             return None
         if not self._response_throttle.allow(f"response:{group_id}:{requester}"):
             return None
+        identity = self._identity_fn() or {}
+        private_key_pem = identity.get("private_key_pem")
+        if not private_key_pem:
+            _e2ee_log.warning("拒绝密钥恢复响应：本地身份私钥不可用 group=%s requester=%s", group_id, requester)
+            return None
         return handle_key_request(
             request_payload, self._keystore(), self._current_aid(), current_members,
+            private_key_pem=private_key_pem,
         )
 
     # ── 状态查询 ──────────────────────────────────────────

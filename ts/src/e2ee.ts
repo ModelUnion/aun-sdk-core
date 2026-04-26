@@ -561,7 +561,7 @@ export class E2EEManager {
     const payload = message.payload as JsonObject | undefined;
     if (!payload || typeof payload !== 'object') return message;
     if (payload.type !== 'e2ee.encrypted') return message;
-    if (!this._shouldDecryptForCurrentAid(message, payload)) return message;
+    if (!this._shouldDecryptForCurrentAid(message, payload)) return null;
 
     // timestamp 窗口检查
     const ts = (message.timestamp ?? (payload.aad as JsonObject | undefined)?.timestamp) as number | undefined;
@@ -595,7 +595,7 @@ export class E2EEManager {
   _decryptMessage(message: Message): Message | null {
     const payload = message.payload as JsonObject;
     if (typeof payload === 'object' && !this._shouldDecryptForCurrentAid(message, payload)) {
-      return message;
+      return null;
     }
     const encryptionMode = (payload.encryption_mode as string) || '';
 

@@ -16,6 +16,7 @@
 | [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · E2EEManager · 内置事件 · RPC手册索引 |
 | [07-错误处理](07-错误处理.md) | 错误类层级 · 错误码速查 · 重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等初始化 · 多AID隔离 · 环境变量 · 资源清理 |
+| [10-custody-api-manual](10-custody-api-manual.md) | AID 托管 · 手机号验证码 · 备份恢复 · 跨设备复制 |
 
 ### RPC 手册
 
@@ -36,6 +37,7 @@
 - **创建 AID** → [04-连接与认证](04-连接与认证.md) · [06-API手册](06-API手册.md)
 - **认证流程（挑战-应答）** → [03-核心概念](03-核心概念.md)
 - **认证失败处理** → [07-错误处理](07-错误处理.md)
+- **AID 证书与加密私钥托管恢复/跨设备复制** → [10-custody-api-manual](10-custody-api-manual.md)
 
 ### 连接与协议
 - **WebSocket 握手协议** → [02-WebSocket协议](02-WebSocket协议.md)
@@ -104,3 +106,6 @@ E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；
 
 ### 08-最佳实践
 幂等连接初始化；安全关闭；E2EE 幂等运行；多 AID 隔离；环境变量驱动配置；资源清理。
+
+### 10-custody-api-manual
+AID 托管 HTTP API。通过手机号验证码上传和下载 AID 证书、客户端加密后的私钥密文；定义 `send-code`、`bind-phone`、`restore-phone` 主流程；补充旧设备 AID token 授权的跨设备复制流程、CT 记录要求及安全边界。

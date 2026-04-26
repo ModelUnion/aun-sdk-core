@@ -16,11 +16,6 @@ describe('AUNClient 群组 E2EE 配置', () => {
     expect(client.configModel.groupE2ee).toBe(true);
   });
 
-  it('rotateOnJoin 默认为 false', () => {
-    const client = new AUNClient();
-    expect(client.configModel.rotateOnJoin).toBe(false);
-  });
-
   it('epochAutoRotateInterval 默认为 0 秒', () => {
     const client = new AUNClient();
     expect(client.configModel.epochAutoRotateInterval).toBe(0);

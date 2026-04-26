@@ -368,6 +368,7 @@ describe('AUNClient M25 重连行为', () => {
 
   it('显式 max_attempts 用尽后进入 terminal_failed', async () => {
     vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       const client = new AUNClient();
       const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
@@ -383,7 +384,7 @@ describe('AUNClient M25 重连行为', () => {
       (client as any)._connectOnce = vi.fn().mockRejectedValue(new ConnectionError('gateway down'));
 
       (client as any)._startReconnect();
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(3_000);
       await Promise.resolve();
 
       expect((client as any)._connectOnce).toHaveBeenCalledTimes(2);
@@ -394,6 +395,7 @@ describe('AUNClient M25 重连行为', () => {
         attempt: 2,
       }));
     } finally {
+      randomSpy.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -726,6 +728,7 @@ describe('group.add_member 成员变更 epoch 处理', () => {
 describe('R1: health-fail 路径 max_attempts 检查', () => {
   it('health 持续失败时应在 max_attempts 次后进入 terminal_failed', async () => {
     vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       const client = new AUNClient();
       const publish = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
@@ -747,7 +750,7 @@ describe('R1: health-fail 路径 max_attempts 检查', () => {
 
       (client as any)._startReconnect();
       // 推进足够多的 timer 让所有重试完成
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(4_000);
 
       // health-fail 路径应计入 attempt，3 次后应终止
       expect(client.state).toBe('terminal_failed');
@@ -758,12 +761,13 @@ describe('R1: health-fail 路径 max_attempts 检查', () => {
       // _connectOnce 不应被调用（health 一直失败）
       expect((client as any)._connectOnce).not.toHaveBeenCalled();
     } finally {
+      randomSpy.mockRestore();
       vi.useRealTimers();
     }
   });
 });
 
-// ── R2: Full Jitter 不应双重随机化 ──────────────────────────
+// ── R2: 固定上限抖动不应污染指数退避 base ────────────────────
 
 describe('R2: delay 基数不应被 Math.random 污染', () => {
   it('连续重连失败时 delay 基数应指数增长，不坍塌到 0', async () => {
@@ -781,7 +785,7 @@ describe('R2: delay 基数不应被 Math.random 污染', () => {
       };
       (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
 
-      // 固定 Math.random 为 0.1，如果有双重随机化，delay 会迅速坍塌
+      // 固定 Math.random 为 0.1，验证随机抖动不会反向污染下一轮 base
       vi.spyOn(Math, 'random').mockReturnValue(0.1);
 
       // 记录每次 setTimeout 的实际 delay
@@ -805,11 +809,8 @@ describe('R2: delay 基数不应被 Math.random 污染', () => {
       (client as any)._startReconnect();
       await vi.advanceTimersByTimeAsync(100_000);
 
-      // 正确的 Full Jitter 下，delay 基数应翻倍增长：
-      // attempt 1: base = 1s, sleep = random(0, 1s) = 100ms, next_base = 2s
-      // attempt 2: base = 2s, sleep = random(0, 2s) = 200ms, next_base = 4s
-      // attempt 3: base = 4s, sleep = random(0, 4s) = 400ms, next_base = 8s
-      // 如果双重随机化，delay 会指数衰减到接近 0
+      // 正确语义：base 指数增长并夹在 [1s, 64s]，sleep = base + rand(0, max_base)
+      // 如果随机值污染下一轮 base，base 会衰减到接近 0
       // 验证：第 3 次 setTimeout delay 应大于第 1 次
       expect(timeoutDelays.length).toBeGreaterThanOrEqual(3);
       // 每次 setTimeout delay 都应 > 0（不坍塌到 0）

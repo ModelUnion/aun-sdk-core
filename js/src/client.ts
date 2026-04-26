@@ -12,6 +12,7 @@ import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
 import { AuthNamespace } from './namespaces/auth.js';
+import { CustodyNamespace } from './namespaces/custody.js';
 import { CryptoProvider, uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer } from './crypto.js';
 import {
   E2EEManager,
@@ -181,6 +182,23 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
     http: 30.0,
   },
 };
+
+const RECONNECT_MIN_BASE_DELAY_SECONDS = 1.0;
+const RECONNECT_MAX_BASE_DELAY_SECONDS = 64.0;
+
+function clampReconnectDelaySeconds(
+  value: unknown,
+  fallback: number,
+  upper = RECONNECT_MAX_BASE_DELAY_SECONDS,
+): number {
+  const parsed = Number(value);
+  const seconds = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(Math.max(seconds, RECONNECT_MIN_BASE_DELAY_SECONDS), upper);
+}
+
+function reconnectSleepDelaySeconds(baseDelay: number, maxBaseDelay: number): number {
+  return baseDelay + Math.random() * maxBaseDelay;
+}
 
 /** 对端证书缓存 TTL（秒） */
 const PEER_CERT_CACHE_TTL = 600;
@@ -373,6 +391,8 @@ export class AUNClient {
 
   /** 认证命名空间 */
   readonly auth: AuthNamespace;
+  /** AID 托管命名空间 */
+  readonly custody: CustodyNamespace;
 
   // E2EE 编排状态（内存缓存）
   private _certCache: Map<string, CachedPeerCert> = new Map();
@@ -456,6 +476,7 @@ export class AUNClient {
     });
 
     this.auth = new AuthNamespace(this);
+    this.custody = new CustodyNamespace(this);
 
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => {
@@ -1263,6 +1284,7 @@ export class AUNClient {
   private async _requestGroupKeyFrom(groupId: string, targetAid: string, epoch = 0): Promise<void> {
     try {
       const reqPayload = buildKeyRequest(groupId, epoch, this._aid || '');
+      this._groupE2ee.rememberKeyRequest(reqPayload, targetAid);
       await this.call('message.send', {
         to: targetAid,
         payload: reqPayload,
@@ -1964,14 +1986,17 @@ export class AUNClient {
       const certReady = await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
       if (!certReady) {
         console.warn(`无法获取发送方 ${fromAid} 的证书，跳过解密`);
-        return message;
+        throw new Error(`发送方证书不可用: from=${fromAid}, mid=${message.message_id}`);
       }
     }
 
     // 密码学解密（E2EEManager.decryptMessage 内含本地防重放）
     const decrypted = await this._e2ee.decryptMessage(message);
     this._schedulePrekeyReplenishIfConsumed(decrypted);
-    return decrypted ?? message;
+    if (decrypted === null) {
+      throw new Error(`E2EE 解密失败: from=${message.from}, mid=${message.message_id}`);
+    }
+    return decrypted;
   }
 
   /** 批量解密 P2P 消息（用于 message.pull） */
@@ -1998,7 +2023,6 @@ export class AUNClient {
           const certReady = await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
           if (!certReady) {
             console.warn(`无法获取发送方 ${fromAid} 的证书，跳过解密`);
-            result.push(msg);
             continue;
           }
         }
@@ -2154,10 +2178,8 @@ export class AUNClient {
    *   - true  = 已处理 / 已被抑制（外层不应再 publish 到业务事件）
    *   - false = 非密钥消息，外层应继续走普通 P2P 消息链路
    *
-   * S14: 按 envelope_type 识别。外层 payload.type === 'e2ee.encrypted' 属于受保护的
-   *      加密外壳，无法在解密前判定它是业务消息还是群组密钥控制面消息。为避免把
-   *      控制面密文（或失败的控制面消息）以 `_decrypt_error` 形式下发给业务监听器，
-   *      此处对"外层 e2ee.encrypted 解密失败"的场景直接返回 true 进行抑制。
+   * 外层 payload.type === 'e2ee.encrypted' 需要先解密才能判定是否为控制面。
+   * 解密失败交给普通链路处理；普通链路只发布安全的 undecryptable 事件。
    */
   private async _tryHandleGroupKeyMessage(message: Message): Promise<boolean> {
     let actualPayload = isJsonObject(message.payload) ? message.payload : null;
@@ -2176,16 +2198,11 @@ export class AUNClient {
       try {
         decrypted = await this._e2ee.decryptMessage(message, { skipReplay: true });
       } catch (exc) {
-        // S14: 解密抛异常也按解密失败处理，抑制业务事件下发
-        console.warn('[aun_core] e2ee.encrypted 外壳解密抛异常，抑制业务分发:', exc);
-        return true;
+        console.warn('[aun_core] e2ee.encrypted 外壳解密抛异常，交给普通链路处理:', exc);
+        return false;
       }
       if (!decrypted) {
-        // S14: 外层 e2ee.encrypted 解密失败。无法判定其是控制面还是业务消息，
-        // 为安全起见不再回落到业务事件（旧实现此处 return false 会导致外层
-        // 走 catch 分支把原始密文带 _decrypt_error 发给业务监听器，造成控制面
-        // 密钥分发消息泄漏为业务事件）。
-        return true;
+        return false;
       }
       this._schedulePrekeyReplenishIfConsumed(decrypted);
       actualPayload = isJsonObject(decrypted.payload) ? decrypted.payload : null;
@@ -3367,15 +3384,22 @@ export class AUNClient {
     this._safeAsync(this._reconnectLoop(serverInitiated));
   }
 
-  /** 指数退避 + Full Jitter 重连循环（默认无限重试，仅在不可重试错误或 close() 或 max_attempts 耗尽时终止） */
+  /** 指数退避 + 固定上限抖动重连循环（默认无限重试，仅在不可重试错误或 close() 或 max_attempts 耗尽时终止） */
   private async _reconnectLoop(serverInitiated = false): Promise<void> {
     const retry = { ...this._sessionOptions.retry };
-    const maxDelay = retry.max_delay;
+    const maxBaseDelay = clampReconnectDelaySeconds(
+      retry.max_delay,
+      RECONNECT_MAX_BASE_DELAY_SECONDS,
+    );
     // M25: max_attempts=0 表示无限重试（与 Go/Python 对齐）
     const maxAttemptsRaw = Number(retry.max_attempts ?? 0);
     const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? Math.floor(maxAttemptsRaw) : 0;
     // 服务端主动关闭时从 16s 起跳，避免重连风暴；网络断开从 initial_delay 起跳
-    let delay = serverInitiated ? 16.0 : retry.initial_delay;
+    let delay = clampReconnectDelaySeconds(
+      serverInitiated ? 16.0 : retry.initial_delay,
+      serverInitiated ? 16.0 : 1.0,
+      maxBaseDelay,
+    );
 
     for (let attempt = 1; !this._reconnectAbort?.signal.aborted; attempt++) {
       // R1 fix: max_attempts 检查在循环顶部，覆盖所有路径（含 health-fail）
@@ -3398,7 +3422,7 @@ export class AUNClient {
       });
 
       try {
-        await this._sleep((delay + Math.random() * delay) * 1000);
+        await this._sleep(reconnectSleepDelaySeconds(delay, maxBaseDelay) * 1000);
         if (this._reconnectAbort?.signal.aborted) {
           this._reconnectActive = false;
           return;
@@ -3407,7 +3431,7 @@ export class AUNClient {
         if (this._gatewayUrl) {
           const healthy = await this._discovery.checkHealth(this._gatewayUrl, 5000);
           if (!healthy) {
-            delay = Math.min(delay * 2, maxDelay);
+            delay = Math.min(delay * 2, maxBaseDelay);
             continue;
           }
         }
@@ -3435,7 +3459,7 @@ export class AUNClient {
           });
           return;
         }
-        delay = Math.min(delay * 2, maxDelay);
+        delay = Math.min(delay * 2, maxBaseDelay);
       }
     }
 

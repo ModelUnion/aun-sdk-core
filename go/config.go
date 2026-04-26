@@ -94,7 +94,6 @@ type AUNConfig struct {
 	SeedPassword             string // 私钥加密口令（用于本地密钥派生）
 	DiscoveryPort            int    // Gateway 发现端口
 	GroupE2EE                bool   // 启用群组 E2EE，默认 true
-	RotateOnJoin             bool   // 新成员加入时自动轮换 epoch，默认 false
 	EpochAutoRotateInterval  int    // epoch 自动轮换间隔（秒），0 表示不自动轮换
 	OldEpochRetentionSeconds int    // 旧 epoch 保留时间（秒），默认 604800（7 天）
 	VerifySSL                bool   // 是否验证 TLS 证书，默认 true
@@ -109,7 +108,6 @@ func DefaultConfig() *AUNConfig {
 	return &AUNConfig{
 		AUNPath:                  aunPath,
 		GroupE2EE:                true,
-		RotateOnJoin:             false,
 		EpochAutoRotateInterval:  0,
 		OldEpochRetentionSeconds: 604800, // 7 天
 		VerifySSL:                resolveVerifySSLFromEnv(),
@@ -153,9 +151,6 @@ func ConfigFromMap(raw map[string]any) *AUNConfig {
 		cfg.DiscoveryPort = int(v)
 	}
 	// GroupE2EE 是必备能力，不再从用户配置中读取
-	if v, ok := boolFromMap(raw, "rotate_on_join", "rotateOnJoin"); ok {
-		cfg.RotateOnJoin = v
-	}
 	if v, ok := numberFromMap(raw, "epoch_auto_rotate_interval", "epochAutoRotateInterval"); ok {
 		cfg.EpochAutoRotateInterval = int(v)
 	}

@@ -20,6 +20,70 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
+func groupKeyResponseSignData(payload map[string]any) []byte {
+	fields := []string{
+		fmt.Sprint(valueOrDefault(payload["response_version"], 1)),
+		fmt.Sprint(payload["group_id"]),
+		fmt.Sprint(valueOrDefault(payload["epoch"], 0)),
+		fmt.Sprint(payload["requester_aid"]),
+		fmt.Sprint(payload["request_id"]),
+		fmt.Sprint(payload["responder_aid"]),
+		fmt.Sprint(payload["commitment"]),
+		strings.Join(sorted(toStringSlice(payload["member_aids"])), "|"),
+		fmt.Sprint(valueOrDefault(payload["issued_at"], 0)),
+	}
+	return []byte(strings.Join(fields, "\n"))
+}
+
+func valueOrDefault(v any, fallback any) any {
+	if v == nil || fmt.Sprint(v) == "" {
+		return fallback
+	}
+	return v
+}
+
+func SignGroupKeyResponse(payload map[string]any, privateKeyPEM string) (map[string]any, error) {
+	signed := copyMapShallow(payload)
+	if signed["response_version"] == nil {
+		signed["response_version"] = 1
+	}
+	if signed["issued_at"] == nil {
+		signed["issued_at"] = time.Now().UnixMilli()
+	}
+	priv, err := parseECPrivateKeyPEM(privateKeyPEM)
+	if err != nil {
+		return nil, err
+	}
+	hash := sha256.Sum256(groupKeyResponseSignData(signed))
+	sig, err := ecdsa.SignASN1(rand.Reader, priv, hash[:])
+	if err != nil {
+		return nil, err
+	}
+	signed["response_signature"] = base64.StdEncoding.EncodeToString(sig)
+	return signed, nil
+}
+
+func VerifyGroupKeyResponseSignature(payload map[string]any, responderCertPEM []byte) bool {
+	sigB64, _ := payload["response_signature"].(string)
+	if sigB64 == "" {
+		return false
+	}
+	cert, err := parseCertPEM(responderCertPEM)
+	if err != nil {
+		return false
+	}
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return false
+	}
+	hash := sha256.Sum256(groupKeyResponseSignData(payload))
+	return ecdsa.VerifyASN1(pub, hash[:], sig)
+}
+
 type structuredGroupKeyStore interface {
 	LoadGroupSecretState(aid, groupID string) (map[string]any, error)
 	LoadAllGroupSecretStates(aid string) (map[string]map[string]any, error)
@@ -508,17 +572,46 @@ func VerifyMembershipManifest(manifest map[string]any, initiatorCertPEM []byte) 
 
 // ── Group Secret 生命周期管理 ──────────────────────────────
 
+// groupSecretMu 保护 StoreGroupSecret 的 load-check-save 原子性（per aid:groupID 粒度）
+var groupSecretMu struct {
+	sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func init() {
+	groupSecretMu.locks = make(map[string]*sync.Mutex)
+}
+
+func getGroupSecretLock(aid, groupID string) *sync.Mutex {
+	key := aid + ":" + groupID
+	groupSecretMu.Lock()
+	defer groupSecretMu.Unlock()
+	mu, ok := groupSecretMu.locks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		groupSecretMu.locks[key] = mu
+	}
+	return mu
+}
+
 // GenerateGroupSecret 生成 32 字节随机 group_secret
 func GenerateGroupSecret() []byte {
 	secret := make([]byte, 32)
-	_, _ = io.ReadFull(rand.Reader, secret)
+	if _, err := io.ReadFull(rand.Reader, secret); err != nil {
+		panic(fmt.Sprintf("crypto/rand 不可用，无法生成安全随机数: %v", err))
+	}
 	return secret
 }
 
 // StoreGroupSecret 存储 group_secret 到 keystore metadata
 // 拒绝低于本地最新 epoch 的写入（防降级攻击）
 // 返回 (true, nil) 已存储; (false, nil) epoch 降级被拒; (false, err) 存储出错
+// 整个 load-check-save 操作在 per-group mutex 保护下原子执行
 func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string) (bool, error) {
+	mu := getGroupSecretLock(aid, groupID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	existing := loadKeyStoreGroupState(ks, aid, groupID)
 	if existing != nil {
 		localEpoch := int(toInt64(existing["epoch"]))
@@ -721,6 +814,14 @@ func (g *GroupReplayGuard) Record(groupID, senderAID, messageID string) {
 	g.trim()
 }
 
+// Unrecord 移除已记录的条目（解密失败回退时使用）
+func (g *GroupReplayGuard) Unrecord(groupID, senderAID, messageID string) {
+	key := groupID + ":" + senderAID + ":" + messageID
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.seen, key)
+}
+
 // Size 返回已记录的数量
 func (g *GroupReplayGuard) Size() int {
 	g.mu.Lock()
@@ -891,12 +992,21 @@ func HandleKeyDistribution(
 }
 
 // BuildKeyRequest 构建密钥请求 payload
-func BuildKeyRequest(groupID string, epoch int, requesterAID string) map[string]any {
+func BuildKeyRequest(groupID string, epoch int, requesterAID string, requestID ...string) map[string]any {
+	rid := ""
+	if len(requestID) > 0 {
+		rid = requestID[0]
+	}
+	if strings.TrimSpace(rid) == "" {
+		rid = generateUUID4()
+	}
 	return map[string]any{
 		"type":          "e2ee.group_key_request",
 		"group_id":      groupID,
 		"epoch":         epoch,
 		"requester_aid": requesterAID,
+		"request_id":    rid,
+		"requested_at":  time.Now().UnixMilli(),
 	}
 }
 
@@ -955,22 +1065,35 @@ func HandleKeyRequest(
 	}
 	sort.Strings(sorted)
 
-	return map[string]any{
-		"type":         "e2ee.group_key_response",
-		"group_id":     groupID,
-		"epoch":        epoch,
-		"group_secret": base64.StdEncoding.EncodeToString(secret),
-		"commitment":   commitmentStr,
-		"member_aids":  sorted,
+	response := map[string]any{
+		"type":          "e2ee.group_key_response",
+		"group_id":      groupID,
+		"epoch":         epoch,
+		"group_secret":  base64.StdEncoding.EncodeToString(secret),
+		"commitment":    commitmentStr,
+		"member_aids":   sorted,
+		"requester_aid": requesterAID,
+		"request_id":    fmt.Sprint(payload["request_id"]),
+		"responder_aid": aid,
+		"issued_at":     time.Now().UnixMilli(),
 	}
+	return response
 }
 
 // HandleKeyResponse 处理收到的密钥响应
 // 验证 commitment -> 存储
+type KeyResponseVerifyOptions struct {
+	ExpectedRequest  map[string]any
+	ResponderCertPEM []byte
+	CurrentMembers   []string
+	Strict           bool
+}
+
 func HandleKeyResponse(
 	response map[string]any,
 	ks keystore.KeyStore,
 	aid string,
+	opts ...KeyResponseVerifyOptions,
 ) bool {
 	payload := extractPayload(response)
 
@@ -982,6 +1105,47 @@ func HandleKeyResponse(
 
 	if groupID == "" || secretB64 == "" || commitment == "" {
 		return false
+	}
+
+	var opt KeyResponseVerifyOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	responderAID, _ := payload["responder_aid"].(string)
+	if opt.ExpectedRequest != nil {
+		requester, _ := payload["requester_aid"].(string)
+		requestID, _ := payload["request_id"].(string)
+		if requester != aid {
+			return false
+		}
+		expectedResponder := getStr(opt.ExpectedRequest, "_expected_responder_aid", "")
+		if expectedResponder != "" && responderAID != expectedResponder {
+			return false
+		}
+		if requestID != fmt.Sprint(opt.ExpectedRequest["request_id"]) {
+			return false
+		}
+		if groupID != fmt.Sprint(opt.ExpectedRequest["group_id"]) {
+			return false
+		}
+		if epoch != int(toInt64(opt.ExpectedRequest["epoch"])) {
+			return false
+		}
+	}
+	if opt.Strict {
+		if responderAID == "" || opt.ResponderCertPEM == nil {
+			return false
+		}
+		if len(opt.CurrentMembers) > 0 && !stringSliceContains(opt.CurrentMembers, responderAID) {
+			return false
+		}
+		if !VerifyGroupKeyResponseSignature(payload, opt.ResponderCertPEM) {
+			return false
+		}
+	} else if opt.ResponderCertPEM != nil {
+		if sig, _ := payload["response_signature"].(string); sig != "" && !VerifyGroupKeyResponseSignature(payload, opt.ResponderCertPEM) {
+			return false
+		}
 	}
 
 	groupSecret, err := base64.StdEncoding.DecodeString(secretB64)

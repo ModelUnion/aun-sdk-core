@@ -96,7 +96,6 @@ class AUNConfig:
     seed_password: str | None = None
     discovery_port: int | None = None
     group_e2ee: bool = True
-    rotate_on_join: bool = False
     epoch_auto_rotate_interval: int = 0
     old_epoch_retention_seconds: int = 604800
     verify_ssl: bool = field(default_factory=resolve_verify_ssl_from_env)
@@ -126,7 +125,6 @@ class AUNConfig:
             seed_password=seed_password,
             discovery_port=_read_optional_int(_coalesce(data, "discovery_port", "discoveryPort"), None),
             group_e2ee=True,  # 必备能力，不可配置
-            rotate_on_join=_read_bool(_coalesce(data, "rotate_on_join", "rotateOnJoin"), False),
             epoch_auto_rotate_interval=_read_optional_int(
                 _coalesce(data, "epoch_auto_rotate_interval", "epochAutoRotateInterval"),
                 0,

@@ -33,6 +33,7 @@ Thumbs.db
 .aun_test/
 .claude/
 .tmp/
+python/tests/local_real_sms_e2e.py
 audit/*
 superpowers/*
 go/gocache_run_*/

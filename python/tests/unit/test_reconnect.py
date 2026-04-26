@@ -3,7 +3,7 @@
 
 通过 mock transport 和 auth，直接触发断线事件，验证：
 - 状态机转换（disconnected → reconnecting → connected）
-- 指数退避延迟（含 Full Jitter）
+- 指数退避延迟（固定上限抖动）
 - 不可重试错误直接 terminal_failed
 - auto_reconnect=False 时不重连
 - close() 中断重连
@@ -19,6 +19,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aun_core import AUNClient
+from aun_core.client import (
+    _RECONNECT_MAX_BASE_DELAY,
+    _clamp_reconnect_delay,
+    _reconnect_sleep_delay,
+)
 from aun_core.errors import AuthError, ConnectionError, PermissionError
 
 
@@ -50,6 +55,11 @@ def _make_client(auto_reconnect: bool = True) -> AUNClient:
     client._transport.close = AsyncMock()
     client._discovery = MagicMock()
     client._discovery.check_health = AsyncMock(return_value=True)
+
+    async def _fast_reconnect_sleep(delay: float) -> None:
+        await asyncio.sleep(0)
+
+    client._reconnect_sleep = _fast_reconnect_sleep
     return client
 
 
@@ -169,12 +179,19 @@ class TestBasicReconnect:
 
 
 class TestExponentialBackoff:
-    """指数退避（含 Full Jitter）：延迟递增，被 random.random() 打散"""
+    """指数退避（固定上限抖动）：base 递增，jitter 上限固定为 max_base"""
+
+    @patch("aun_core.client.random")
+    def test_delay_formula_clamps_base_and_uses_fixed_jitter(self, mock_random):
+        mock_random.random.return_value = 0.5
+        assert _clamp_reconnect_delay(0.01, 1.0) == 1.0
+        assert _clamp_reconnect_delay(128.0, 1.0) == _RECONNECT_MAX_BASE_DELAY
+        assert _reconnect_sleep_delay(4.0, _RECONNECT_MAX_BASE_DELAY) == 36.0
 
     @pytest.mark.asyncio
     @patch("aun_core.client.random")
     async def test_backoff_delays(self, mock_random):
-        # random.random() 返回 1.0 时 jitter = delay * 1.0 = delay 本身
+        # random.random() 返回 1.0 时 jitter = max_base
         mock_random.random.return_value = 1.0
         client = _make_client(auto_reconnect=True)
         client._session_options["retry"] = {
@@ -287,6 +304,8 @@ class TestNonRetryableErrors:
         async def mock_reconnect():
             nonlocal call_count
             call_count += 1
+            if call_count >= 3:
+                client._closing = True
             raise AuthError("aid_login2_failed")
 
         client._invoke_reconnect_connect_once = mock_reconnect
@@ -347,9 +366,14 @@ class TestCloseInterruptsReconnect:
     @pytest.mark.asyncio
     @patch("aun_core.client.random")
     async def test_close_cancels_reconnect(self, mock_random):
-        mock_random.random.return_value = 1.0  # 使 jitter 延迟 = delay 本身
+        mock_random.random.return_value = 1.0  # 使 jitter 使用 max_base 上限
         client = _make_client(auto_reconnect=True)
         client._session_options["retry"]["initial_delay"] = 0.05
+
+        async def _short_reconnect_sleep(delay: float) -> None:
+            await asyncio.sleep(0.01)
+
+        client._reconnect_sleep = _short_reconnect_sleep
 
         call_count = 0
 

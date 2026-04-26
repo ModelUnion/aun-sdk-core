@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -60,6 +61,29 @@ func secureRandFloat64() float64 {
 	// 取 uint64 后转为 [0, 1) 的浮点数
 	n := binary.LittleEndian.Uint64(buf[:])
 	return float64(n) / float64(1<<64)
+}
+
+const (
+	reconnectMinBaseDelaySeconds = 1.0
+	reconnectMaxBaseDelaySeconds = 64.0
+)
+
+func clampReconnectDelaySeconds(value float64, fallback float64, upper float64) float64 {
+	seconds := value
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		seconds = fallback
+	}
+	if seconds < reconnectMinBaseDelaySeconds {
+		return reconnectMinBaseDelaySeconds
+	}
+	if seconds > upper {
+		return upper
+	}
+	return seconds
+}
+
+func reconnectSleepDelaySeconds(baseDelay float64, maxBaseDelay float64) float64 {
+	return baseDelay + secureRandFloat64()*maxBaseDelay
 }
 
 // 等价于 Python json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)
@@ -280,6 +304,8 @@ type AUNClient struct {
 
 	// Auth 命名空间
 	Auth *namespace.AuthNamespace
+	// AID 托管命名空间
+	Custody *namespace.CustodyNamespace
 
 	// 调试日志
 	logger *AUNLogger
@@ -357,7 +383,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 			},
 		},
 		pendingDecryptMsgs:          make(map[string][]map[string]any),
-		groupEpochRotationInflight:   make(map[string]bool),
+		groupEpochRotationInflight:  make(map[string]bool),
 		groupMembershipRotationDone: make(map[string]bool),
 		groupEpochRecoveryInflight:  make(map[string]*epochRecoveryResult),
 		prekeyReplenishInflight:     make(map[string]bool),
@@ -407,6 +433,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 
 	// Auth 命名空间
 	c.Auth = namespace.NewAuthNamespace(c)
+	c.Custody = namespace.NewCustodyNamespace(c)
 
 	// 订阅内部事件：推送消息自动解密后 re-publish
 	events.Subscribe("_raw.message.received", func(payload any) {
@@ -1392,6 +1419,7 @@ func (c *AUNClient) requestGroupKeyFromCandidates(ctx context.Context, groupID s
 	c.mu.RUnlock()
 	for _, target := range c.groupKeyRecoveryCandidates(groupID, epochResult) {
 		reqPayload := BuildKeyRequest(groupID, serverEpoch, myAID)
+		c.groupE2EE.RememberKeyRequest(reqPayload, target)
 		if _, err := c.Call(ctx, "message.send", map[string]any{
 			"to":      target,
 			"payload": reqPayload,
@@ -4101,7 +4129,7 @@ func (c *AUNClient) handleTransportDisconnect(err error, closeCode int) {
 	}
 }
 
-// reconnectLoop 重连循环（指数退避 + Full Jitter，在不可重试错误、close()、或超过最大重试次数时终止）
+// reconnectLoop 重连循环（指数退避 + 固定上限抖动，在不可重试错误、close()、或超过最大重试次数时终止）
 func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 	c.mu.RLock()
 	opts := c.sessionOptions
@@ -4109,25 +4137,29 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 
 	retryConfig, _ := opts["retry"].(map[string]any)
 	initialDelay := 1.0
-	maxDelay := 64.0
+	maxBaseDelay := 64.0
 	maxAttempts := 0 // 0 表示无限重试
 	if retryConfig != nil {
 		if v, ok := retryConfig["initial_delay"].(float64); ok {
 			initialDelay = v
 		}
 		if v, ok := retryConfig["max_delay"].(float64); ok {
-			maxDelay = v
+			maxBaseDelay = v
 		}
 		if v, ok := retryConfig["max_attempts"].(float64); ok && v > 0 {
 			maxAttempts = int(v)
 		}
 	}
+	maxBaseDelay = clampReconnectDelaySeconds(maxBaseDelay, reconnectMaxBaseDelaySeconds, reconnectMaxBaseDelaySeconds)
 
 	// 服务端主动关闭时从 16s 起跳，避免重连风暴；网络断开从 initial_delay 起跳
 	delay := initialDelay
+	delayFallback := 1.0
 	if serverInitiated {
 		delay = 16.0
+		delayFallback = 16.0
 	}
+	delay = clampReconnectDelaySeconds(delay, delayFallback, maxBaseDelay)
 	for attempt := 1; !c.closing.Load(); attempt++ {
 		// 超过最大重试次数时停止
 		if maxAttempts > 0 && attempt > maxAttempts {
@@ -4153,9 +4185,9 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 			"attempt": attempt,
 		})
 
-		// Additive Jitter: sleep in [delay, 2*delay] 保证最小退避间隔
-		// ISSUE-SDK-GO-007: 使用 crypto/rand 代替 math/rand，确保并发安全
-		jitteredDelay := delay + secureRandFloat64()*delay
+		// 固定上限抖动：base=[1s, max_base]，delay=base+rand(0..max_base)。
+		// ISSUE-SDK-GO-007: 使用 crypto/rand 代替 math/rand，确保并发安全。
+		jitteredDelay := reconnectSleepDelaySeconds(delay, maxBaseDelay)
 		time.Sleep(time.Duration(jitteredDelay * float64(time.Second)))
 
 		// close() 可能在 sleep 期间被调用
@@ -4172,8 +4204,8 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 			healthy := c.discovery.CheckHealth(context.Background(), gw, 5*time.Second)
 			if !healthy {
 				delay = delay * 2
-				if delay > maxDelay {
-					delay = maxDelay
+				if delay > maxBaseDelay {
+					delay = maxBaseDelay
 				}
 				continue
 			}
@@ -4220,8 +4252,8 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 		}
 
 		delay = delay * 2
-		if delay > maxDelay {
-			delay = maxDelay
+		if delay > maxBaseDelay {
+			delay = maxBaseDelay
 		}
 	}
 	c.reconnecting.Store(false)

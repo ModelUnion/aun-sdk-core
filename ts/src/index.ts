@@ -90,6 +90,7 @@ export { GatewayDiscovery } from './discovery.js';
 
 // ── 认证流程 ─────────────────────────────────────────────────
 export { AuthFlow } from './auth.js';
+export { CustodyNamespace } from './namespaces/custody.js';
 
 // ── E2EE ─────────────────────────────────────────────────────
 export {

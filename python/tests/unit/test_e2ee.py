@@ -68,10 +68,10 @@ class FakeKeystore:
     def save_e2ee_prekey(self, aid, prekey_id, prekey_data, device_id=""):
         self._prekeys.setdefault(aid, {})[prekey_id] = prekey_data
 
-    def load_e2ee_prekeys(self, aid):
+    def load_e2ee_prekeys(self, aid, device_id=""):
         return self._prekeys.get(aid, {})
 
-    def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7):
+    def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7, device_id=""):
         return []
 
     def save_group_secret_state(self, aid, group_id, entry):
@@ -120,14 +120,14 @@ class StructuredPrekeyKeystore(FakeKeystore):
         super().__init__()
         self._prekeys = {}
 
-    def load_e2ee_prekeys(self, aid):
+    def load_e2ee_prekeys(self, aid, device_id=""):
         prekeys = self._prekeys.get(aid, {})
         return {key: dict(value) for key, value in prekeys.items()}
 
-    def save_e2ee_prekey(self, aid, prekey_id, prekey_data):
+    def save_e2ee_prekey(self, aid, prekey_id, prekey_data, device_id=""):
         self._prekeys.setdefault(aid, {})[prekey_id] = dict(prekey_data)
 
-    def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7):
+    def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7, device_id=""):
         prekeys = self._prekeys.get(aid, {})
         retained_ids = {
             prekey_id
@@ -703,14 +703,14 @@ class TestFileKeyStoreProtection:
         ks.save_e2ee_prekey("test.aid", "prekey-123", {
             "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
             "public_key": "MFkw...",
-        })
+        }, device_id="")
 
         # prekey 私钥存储在 SQLCipher 加密的 aun.db 中，不应出现在 meta.json
         safe_aid = "test.aid"
         db_file = tmp_path / "AIDs" / safe_aid / "aun.db"
         assert db_file.exists(), "aun.db 应该存在"
 
-        prekeys = ks.load_e2ee_prekeys("test.aid")
+        prekeys = ks.load_e2ee_prekeys("test.aid", device_id="")
         assert prekeys["prekey-123"]["private_key_pem"] == "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"
 
 

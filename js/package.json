@@ -1,6 +1,6 @@
 {
-  "name": "@aun/core-browser",
-  "version": "0.2.8",
+  "name": "@agentunion/core-browser",
+  "version": "0.2.9",
   "description": "AUN Protocol Core SDK for Browser",
   "type": "module",
   "main": "dist/index.js",
