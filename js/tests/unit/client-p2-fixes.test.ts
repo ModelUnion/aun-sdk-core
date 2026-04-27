@@ -297,21 +297,20 @@ describe('group.add_member 失败时不应分发密钥', () => {
     expect(rotateSpy).not.toHaveBeenCalled();
   });
 
-  it('group.add_member 成功时应触发密钥分发', async () => {
+  it('group.add_member 成功时应触发 epoch 轮换兜底', async () => {
     // 模拟成功结果
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       ok: true,
     });
 
-    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
+    const rotateSpy = vi.spyOn(client as any, '_maybeLeadRotateGroupEpoch').mockResolvedValue(undefined);
 
     await client.call('group.add_member', {
       group_id: 'group-123',
       aid: 'new-member.aid.com',
     });
 
-    // 成功的 add_member 应触发密钥分发
-    expect(distributeSpy).toHaveBeenCalledWith('group-123', 'new-member.aid.com');
+    expect(rotateSpy).toHaveBeenCalledWith('group-123', expect.any(String), null);
   });
 });
 

@@ -6,7 +6,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -84,11 +87,36 @@ func VerifyGroupKeyResponseSignature(payload map[string]any, responderCertPEM []
 	return ecdsa.VerifyASN1(pub, hash[:], sig)
 }
 
-type structuredGroupKeyStore interface {
-	LoadGroupSecretState(aid, groupID string) (map[string]any, error)
-	LoadAllGroupSecretStates(aid string) (map[string]map[string]any, error)
-	SaveGroupSecretState(aid, groupID string, entry map[string]any) error
+type groupSecretEpochLoader interface {
+	LoadGroupSecretEpoch(aid, groupID string, epoch *int) (map[string]any, error)
+}
+
+type groupSecretEpochListLoader interface {
+	LoadGroupSecretEpochs(aid, groupID string) ([]map[string]any, error)
+}
+
+type groupSecretTransitionStore interface {
+	StoreGroupSecretTransition(aid, groupID string, opts keystore.GroupSecretTransitionOptions) (bool, error)
+}
+
+type groupSecretEpochStore interface {
+	StoreGroupSecretEpoch(aid, groupID string, opts keystore.GroupSecretTransitionOptions) (bool, error)
+}
+
+type groupSecretPendingDiscardStore interface {
+	DiscardPendingGroupSecretState(aid, groupID string, epoch int, rotationID string) (bool, error)
+}
+
+type groupOldEpochCleanupStore interface {
 	CleanupGroupOldEpochsState(aid, groupID string, cutoffMs int64) (int, error)
+}
+
+type groupSecretIDLister interface {
+	ListGroupSecretIDs(aid string) ([]string, error)
+}
+
+type groupSecretDeleteStore interface {
+	DeleteGroupSecretState(aid, groupID string) error
 }
 
 // ── 群组 AAD 字段 ──────────────────────────────────────────
@@ -104,9 +132,9 @@ var (
 	}
 )
 
-func loadKeyStoreGroupState(ks keystore.KeyStore, aid, groupID string) map[string]any {
-	if structured, ok := ks.(structuredGroupKeyStore); ok {
-		entry, err := structured.LoadGroupSecretState(aid, groupID)
+func loadKeyStoreGroupEpoch(ks keystore.KeyStore, aid, groupID string, epoch *int) map[string]any {
+	if rowStore, ok := ks.(groupSecretEpochLoader); ok {
+		entry, err := rowStore.LoadGroupSecretEpoch(aid, groupID, epoch)
 		if err == nil {
 			return entry
 		}
@@ -114,9 +142,9 @@ func loadKeyStoreGroupState(ks keystore.KeyStore, aid, groupID string) map[strin
 	return nil
 }
 
-func loadAllKeyStoreGroupStates(ks keystore.KeyStore, aid string) map[string]map[string]any {
-	if structured, ok := ks.(structuredGroupKeyStore); ok {
-		entries, err := structured.LoadAllGroupSecretStates(aid)
+func loadKeyStoreGroupEpochs(ks keystore.KeyStore, aid, groupID string) []map[string]any {
+	if rowStore, ok := ks.(groupSecretEpochListLoader); ok {
+		entries, err := rowStore.LoadGroupSecretEpochs(aid, groupID)
 		if err == nil {
 			return entries
 		}
@@ -124,15 +152,48 @@ func loadAllKeyStoreGroupStates(ks keystore.KeyStore, aid string) map[string]map
 	return nil
 }
 
-func saveKeyStoreGroupState(ks keystore.KeyStore, aid, groupID string, entry map[string]any) error {
-	if structured, ok := ks.(structuredGroupKeyStore); ok {
-		return structured.SaveGroupSecretState(aid, groupID, entry)
+func storeKeyStoreGroupTransition(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string, opts GroupSecretStoreOptions) (bool, bool, error) {
+	rowStore, ok := ks.(groupSecretTransitionStore)
+	if !ok {
+		return false, false, nil
 	}
-	return fmt.Errorf("keystore 不支持 SaveGroupSecretState")
+	stored, err := rowStore.StoreGroupSecretTransition(aid, groupID, keystore.GroupSecretTransitionOptions{
+		Epoch:                      epoch,
+		Secret:                     base64.StdEncoding.EncodeToString(groupSecret),
+		Commitment:                 commitment,
+		MemberAIDs:                 memberAIDs,
+		EpochChain:                 strings.TrimSpace(opts.EpochChain),
+		PendingRotationID:          strings.TrimSpace(opts.PendingRotationID),
+		EpochChainUnverified:       opts.EpochChainUnverified,
+		EpochChainUnverifiedSet:    opts.EpochChainUnverifiedSet,
+		EpochChainUnverifiedReason: strings.TrimSpace(opts.EpochChainUnverifiedReason),
+		OldEpochRetentionMillis:    int64(OldEpochRetentionSeconds) * 1000,
+	})
+	return stored, true, err
+}
+
+func storeKeyStoreGroupEpoch(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string, opts GroupSecretStoreOptions) (bool, bool, error) {
+	rowStore, ok := ks.(groupSecretEpochStore)
+	if !ok {
+		return false, false, nil
+	}
+	stored, err := rowStore.StoreGroupSecretEpoch(aid, groupID, keystore.GroupSecretTransitionOptions{
+		Epoch:                      epoch,
+		Secret:                     base64.StdEncoding.EncodeToString(groupSecret),
+		Commitment:                 commitment,
+		MemberAIDs:                 memberAIDs,
+		EpochChain:                 strings.TrimSpace(opts.EpochChain),
+		PendingRotationID:          strings.TrimSpace(opts.PendingRotationID),
+		EpochChainUnverified:       opts.EpochChainUnverified,
+		EpochChainUnverifiedSet:    opts.EpochChainUnverifiedSet,
+		EpochChainUnverifiedReason: strings.TrimSpace(opts.EpochChainUnverifiedReason),
+		OldEpochRetentionMillis:    int64(OldEpochRetentionSeconds) * 1000,
+	})
+	return stored, true, err
 }
 
 func cleanupKeyStoreGroupOldEpochs(ks keystore.KeyStore, aid, groupID string, cutoffMs int64) int {
-	if structured, ok := ks.(structuredGroupKeyStore); ok {
+	if structured, ok := ks.(groupOldEpochCleanupStore); ok {
 		removed, err := structured.CleanupGroupOldEpochsState(aid, groupID, cutoffMs)
 		if err == nil {
 			return removed
@@ -141,6 +202,17 @@ func cleanupKeyStoreGroupOldEpochs(ks keystore.KeyStore, aid, groupID string, cu
 	}
 	log.Printf("[e2ee_group] keystore 不支持 CleanupGroupOldEpochsState，跳过旧 epoch 清理")
 	return 0
+}
+
+func listKeyStoreGroupIDs(ks keystore.KeyStore, aid string) []string {
+	if lister, ok := ks.(groupSecretIDLister); ok {
+		groupIDs, err := lister.ListGroupSecretIDs(aid)
+		if err == nil {
+			return groupIDs
+		}
+		log.Printf("[e2ee_group] ListGroupSecretIDs 失败: %v", err)
+	}
+	return nil
 }
 
 // ── 群组消息加密（纯函数）──────────────────────────────────
@@ -396,6 +468,40 @@ func verifyGroupSenderSignature(certPEM []byte, sigB64 string, ciphertext, tag, 
 	return ecdsa.VerifyASN1(pub, hash[:], sigBytes)
 }
 
+// ── Epoch Transcript Chain ─────────────────────────────────
+
+var epochChainGenesisPrefix = []byte("aun-epoch-chain:genesis")
+
+// ComputeEpochChain 计算 epoch transcript chain
+// prevChain 为空字符串时表示 genesis（首个 epoch）
+func ComputeEpochChain(prevChain string, epoch int, commitment string, rotatorAID string) string {
+	var prefix []byte
+	if prevChain == "" {
+		prefix = epochChainGenesisPrefix
+	} else {
+		decoded, err := hex.DecodeString(prevChain)
+		if err != nil {
+			// 非法 hex 输入，使用原始字节降级
+			prefix = []byte(prevChain)
+		} else {
+			prefix = decoded
+		}
+	}
+	epochBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(epochBytes, uint32(epoch))
+	data := append(prefix, epochBytes...)
+	data = append(data, []byte(commitment)...)
+	data = append(data, []byte(rotatorAID)...)
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
+
+// VerifyEpochChain 验证 epoch transcript chain（常量时间比较）
+func VerifyEpochChain(epochChain string, prevChain string, epoch int, commitment string, rotatorAID string) bool {
+	expected := ComputeEpochChain(prevChain, epoch, commitment, rotatorAID)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(epochChain)) == 1
+}
+
 // ── Membership Commitment ──────────────────────────────────
 
 // ComputeMembershipCommitment 计算成员承诺哈希
@@ -573,25 +679,42 @@ func VerifyMembershipManifest(manifest map[string]any, initiatorCertPEM []byte) 
 // ── Group Secret 生命周期管理 ──────────────────────────────
 
 // groupSecretMu 保护 StoreGroupSecret 的 load-check-save 原子性（per aid:groupID 粒度）
+type countedGroupSecretLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 var groupSecretMu struct {
 	sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[string]*countedGroupSecretLock
 }
 
 func init() {
-	groupSecretMu.locks = make(map[string]*sync.Mutex)
+	groupSecretMu.locks = make(map[string]*countedGroupSecretLock)
 }
 
-func getGroupSecretLock(aid, groupID string) *sync.Mutex {
+func acquireGroupSecretLock(aid, groupID string) (string, *countedGroupSecretLock) {
 	key := aid + ":" + groupID
 	groupSecretMu.Lock()
-	defer groupSecretMu.Unlock()
 	mu, ok := groupSecretMu.locks[key]
 	if !ok {
-		mu = &sync.Mutex{}
+		mu = &countedGroupSecretLock{}
 		groupSecretMu.locks[key] = mu
 	}
-	return mu
+	mu.refs++
+	groupSecretMu.Unlock()
+	mu.mu.Lock()
+	return key, mu
+}
+
+func releaseGroupSecretLock(key string, lock *countedGroupSecretLock) {
+	lock.mu.Unlock()
+	groupSecretMu.Lock()
+	lock.refs--
+	if lock.refs <= 0 && groupSecretMu.locks[key] == lock {
+		delete(groupSecretMu.locks, key)
+	}
+	groupSecretMu.Unlock()
 }
 
 // GenerateGroupSecret 生成 32 字节随机 group_secret
@@ -603,153 +726,199 @@ func GenerateGroupSecret() []byte {
 	return secret
 }
 
+type GroupSecretStoreOptions struct {
+	EpochChain                 string
+	PendingRotationID          string
+	EpochChainUnverified       bool
+	EpochChainUnverifiedSet    bool
+	EpochChainUnverifiedReason string
+}
+
 // StoreGroupSecret 存储 group_secret 到 keystore metadata
 // 拒绝低于本地最新 epoch 的写入（防降级攻击）
 // 返回 (true, nil) 已存储; (false, nil) epoch 降级被拒; (false, err) 存储出错
 // 整个 load-check-save 操作在 per-group mutex 保护下原子执行
-func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string) (bool, error) {
-	mu := getGroupSecretLock(aid, groupID)
-	mu.Lock()
-	defer mu.Unlock()
+func StoreGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string, epochChain string, pendingRotationIDs ...string) (bool, error) {
+	pendingRotationID := ""
+	if len(pendingRotationIDs) > 0 {
+		pendingRotationID = strings.TrimSpace(pendingRotationIDs[0])
+	}
+	return StoreGroupSecretWithOptions(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs, GroupSecretStoreOptions{
+		EpochChain:        epochChain,
+		PendingRotationID: pendingRotationID,
+	})
+}
 
-	existing := loadKeyStoreGroupState(ks, aid, groupID)
-	if existing != nil {
-		localEpoch := int(toInt64(existing["epoch"]))
-		if epoch < localEpoch {
-			return false, nil
-		}
-		if epoch == localEpoch {
-			incomingSecret := base64.StdEncoding.EncodeToString(groupSecret)
-			if existingSecret, _ := existing["secret"].(string); existingSecret != "" && existingSecret != incomingSecret {
-				return false, nil
-			}
-		}
+// DiscardPendingGroupSecret 仅回滚指定 rotation 写入的本地 target epoch key。
+func DiscardPendingGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch int, rotationID string) (bool, error) {
+	rotationID = strings.TrimSpace(rotationID)
+	if rotationID == "" {
+		return false, nil
 	}
+	lockKey, mu := acquireGroupSecretLock(aid, groupID)
+	defer releaseGroupSecretLock(lockKey, mu)
 
-	if existing == nil {
-		existing = make(map[string]any)
+	if rowStore, ok := ks.(groupSecretPendingDiscardStore); ok {
+		return rowStore.DiscardPendingGroupSecretState(aid, groupID, epoch, rotationID)
 	}
-	if int(toInt64(existing["epoch"])) != 0 && int(toInt64(existing["epoch"])) != epoch {
-		oldEpochs, _ := existing["old_epochs"].([]any)
-		oldEntry := map[string]any{
-			"epoch":       existing["epoch"],
-			"secret":      existing["secret"],
-			"commitment":  existing["commitment"],
-			"member_aids": existing["member_aids"],
-			"updated_at":  existing["updated_at"],
-		}
-		if sp, ok := existing["secret_protection"]; ok {
-			oldEntry["secret_protection"] = sp
-		}
-		oldEpochs = append(oldEpochs, oldEntry)
-		existing["old_epochs"] = oldEpochs
-	}
+	return false, fmt.Errorf("keystore 不支持 DiscardPendingGroupSecretState")
+}
 
-	nowMs := time.Now().UnixMilli()
-	sorted := make([]string, len(memberAIDs))
-	copy(sorted, memberAIDs)
-	sort.Strings(sorted)
+func StoreGroupSecretWithOptions(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string, opts GroupSecretStoreOptions) (bool, error) {
+	lockKey, mu := acquireGroupSecretLock(aid, groupID)
+	defer releaseGroupSecretLock(lockKey, mu)
 
-	prevOldEpochs, _ := existing["old_epochs"].([]any)
-	entry := map[string]any{
-		"epoch":       epoch,
-		"secret":      base64.StdEncoding.EncodeToString(groupSecret),
-		"commitment":  commitment,
-		"member_aids": sorted,
-		"updated_at":  nowMs,
-		"old_epochs":  prevOldEpochs,
+	if stored, handled, err := storeKeyStoreGroupTransition(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs, opts); handled {
+		if err != nil {
+			return false, fmt.Errorf("保存 group_secret 失败: %w", err)
+		}
+		return stored, nil
 	}
-	if err := saveKeyStoreGroupState(ks, aid, groupID, entry); err != nil {
-		return false, fmt.Errorf("保存 group_secret 失败: %w", err)
+	return false, fmt.Errorf("keystore 不支持 StoreGroupSecretTransition")
+}
+
+// StoreGroupSecretEpochWithOptions 保存指定 epoch key。低于 current 时写入 old epoch row，不覆盖 current。
+func StoreGroupSecretEpochWithOptions(ks keystore.KeyStore, aid, groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string, opts GroupSecretStoreOptions) (bool, error) {
+	lockKey, mu := acquireGroupSecretLock(aid, groupID)
+	defer releaseGroupSecretLock(lockKey, mu)
+
+	if stored, handled, err := storeKeyStoreGroupEpoch(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs, opts); handled {
+		if err != nil {
+			return false, fmt.Errorf("保存 group_secret epoch 失败: %w", err)
+		}
+		return stored, nil
 	}
-	return true, nil
+	return false, fmt.Errorf("keystore 不支持 StoreGroupSecretEpoch")
 }
 
 // LoadGroupSecret 加载 group_secret
-// epoch=nil 时返回最新 epoch；指定 epoch 时先查当前再查 old_epochs
+// epoch=nil 时返回最新 epoch；指定 epoch 时按 epoch row 查询。
 func LoadGroupSecret(ks keystore.KeyStore, aid, groupID string, epoch *int) (map[string]any, error) {
-	entry := loadKeyStoreGroupState(ks, aid, groupID)
+	entry := loadKeyStoreGroupEpoch(ks, aid, groupID, epoch)
 	if entry == nil {
 		return nil, nil
 	}
 
 	entryEpoch := int(toInt64(entry["epoch"]))
-	if epoch == nil || entryEpoch == *epoch {
-		secretStr, _ := entry["secret"].(string)
-		if secretStr == "" {
-			return nil, nil
-		}
-		secretBytes, err := base64.StdEncoding.DecodeString(secretStr)
-		if err != nil {
-			return nil, nil
-		}
-		return map[string]any{
-			"epoch":       entryEpoch,
-			"secret":      secretBytes,
-			"commitment":  entry["commitment"],
-			"member_aids": toStringSlice(entry["member_aids"]),
-		}, nil
+	secretStr, _ := entry["secret"].(string)
+	if secretStr == "" {
+		return nil, nil
+	}
+	secretBytes, err := base64.StdEncoding.DecodeString(secretStr)
+	if err != nil {
+		return nil, nil
+	}
+	result := map[string]any{
+		"epoch":       entryEpoch,
+		"secret":      secretBytes,
+		"commitment":  entry["commitment"],
+		"member_aids": toStringSlice(entry["member_aids"]),
+	}
+	if ec, ok := entry["epoch_chain"]; ok && ec != nil && ec != "" {
+		result["epoch_chain"] = ec
+	}
+	if pending, ok := entry["pending_rotation_id"]; ok && pending != nil && pending != "" {
+		result["pending_rotation_id"] = pending
+	}
+	if uv, ok := entry["epoch_chain_unverified"]; ok && uv != nil {
+		result["epoch_chain_unverified"] = uv
+	}
+	if reason, ok := entry["epoch_chain_unverified_reason"]; ok && reason != nil && reason != "" {
+		result["epoch_chain_unverified_reason"] = reason
+	}
+	return result, nil
+}
+
+type epochChainAssessment struct {
+	ok         bool
+	set        bool
+	unverified bool
+	reason     string
+}
+
+func assessIncomingEpochChain(
+	ks keystore.KeyStore,
+	aid string,
+	groupID string,
+	epoch int,
+	commitment string,
+	incomingChain string,
+	rotationID string,
+	rotatorAID string,
+	source string,
+) epochChainAssessment {
+	chain := strings.TrimSpace(incomingChain)
+	rid := strings.TrimSpace(rotationID)
+	rotator := strings.TrimSpace(rotatorAID)
+
+	if rid != "" && chain == "" {
+		log.Printf("[e2ee_group] 拒绝缺少 epoch_chain 的新 rotation key: source=%s group=%s epoch=%d rotation=%s", source, groupID, epoch, rid)
+		return epochChainAssessment{ok: false}
 	}
 
-	// 查 old_epochs
-	oldEpochs, _ := entry["old_epochs"].([]any)
-	for _, oldRaw := range oldEpochs {
-		old, ok := oldRaw.(map[string]any)
-		if !ok {
-			continue
+	currentData, _ := LoadGroupSecret(ks, aid, groupID, nil)
+	if currentData != nil && int(toInt64(currentData["epoch"])) == epoch {
+		currentChain, _ := currentData["epoch_chain"].(string)
+		currentPendingRotationID, _ := currentData["pending_rotation_id"].(string)
+		if chain != "" && currentChain == chain {
+			return epochChainAssessment{ok: true}
 		}
-		oldEp := int(toInt64(old["epoch"]))
-		if oldEp == *epoch {
-			secretStr, _ := old["secret"].(string)
-			if secretStr == "" {
-				return nil, nil
+		if rid != "" && chain != "" && currentChain != "" && currentChain != chain {
+			if !(strings.TrimSpace(currentPendingRotationID) != "" && strings.TrimSpace(currentPendingRotationID) != rid) {
+				log.Printf("[e2ee_group] 拒绝同 epoch 分叉 chain: source=%s group=%s epoch=%d rotation=%s", source, groupID, epoch, rid)
+				return epochChainAssessment{ok: false}
 			}
-			secretBytes, err := base64.StdEncoding.DecodeString(secretStr)
-			if err != nil {
-				return nil, nil
-			}
-			return map[string]any{
-				"epoch":       oldEp,
-				"secret":      secretBytes,
-				"commitment":  old["commitment"],
-				"member_aids": toStringSlice(old["member_aids"]),
-			}, nil
 		}
 	}
 
-	return nil, nil
+	prevEpoch := epoch - 1
+	prevData, _ := LoadGroupSecret(ks, aid, groupID, &prevEpoch)
+	prevChain := ""
+	if prevData != nil {
+		prevChain, _ = prevData["epoch_chain"].(string)
+	}
+	if chain == "" {
+		return epochChainAssessment{ok: true, set: true, unverified: true, reason: "missing_epoch_chain"}
+	}
+	if prevChain == "" {
+		return epochChainAssessment{ok: true, set: true, unverified: true, reason: "missing_prev_chain"}
+	}
+	if rotator == "" {
+		if rid != "" {
+			log.Printf("[e2ee_group] 拒绝缺少 rotator_aid 的新 rotation key: source=%s group=%s epoch=%d rotation=%s", source, groupID, epoch, rid)
+			return epochChainAssessment{ok: false}
+		}
+		return epochChainAssessment{ok: true, set: true, unverified: true, reason: "missing_rotator_aid"}
+	}
+	if !VerifyEpochChain(chain, prevChain, epoch, commitment, rotator) {
+		if rid != "" {
+			log.Printf("[e2ee_group] 拒绝 epoch_chain 验证失败的新 rotation key: source=%s group=%s epoch=%d rotation=%s", source, groupID, epoch, rid)
+			return epochChainAssessment{ok: false}
+		}
+		log.Printf("[e2ee_group] epoch_chain 验证失败，按兼容档接收并标记未验证: source=%s group=%s epoch=%d", source, groupID, epoch)
+		return epochChainAssessment{ok: true, set: true, unverified: true, reason: "chain_mismatch_legacy"}
+	}
+	if rid == "" {
+		return epochChainAssessment{ok: true, set: true, unverified: true, reason: "missing_rotation_id"}
+	}
+	return epochChainAssessment{ok: true, set: true, unverified: false}
 }
 
 // LoadAllGroupSecrets 加载某群组所有 epoch 的 group_secret
 // 返回 {epoch: secretBytes} 映射
 func LoadAllGroupSecrets(ks keystore.KeyStore, aid, groupID string) map[int][]byte {
-	groupSecrets := loadAllKeyStoreGroupStates(ks, aid)
-	entry := groupSecrets[groupID]
-	if entry == nil {
+	entries := loadKeyStoreGroupEpochs(ks, aid, groupID)
+	if len(entries) == 0 {
 		return nil
 	}
 
 	result := make(map[int][]byte)
-
-	secretStr, _ := entry["secret"].(string)
-	entryEpoch := int(toInt64(entry["epoch"]))
-	if secretStr != "" {
-		if decoded, err := base64.StdEncoding.DecodeString(secretStr); err == nil {
-			result[entryEpoch] = decoded
-		}
-	}
-
-	oldEpochs, _ := entry["old_epochs"].([]any)
-	for _, oldRaw := range oldEpochs {
-		old, ok := oldRaw.(map[string]any)
-		if !ok {
-			continue
-		}
-		oldSecret, _ := old["secret"].(string)
-		oldEp := int(toInt64(old["epoch"]))
-		if oldSecret != "" {
-			if decoded, err := base64.StdEncoding.DecodeString(oldSecret); err == nil {
-				result[oldEp] = decoded
+	for _, entry := range entries {
+		secretStr, _ := entry["secret"].(string)
+		entryEpoch := int(toInt64(entry["epoch"]))
+		if secretStr != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(secretStr); err == nil {
+				result[entryEpoch] = decoded
 			}
 		}
 	}
@@ -898,6 +1067,7 @@ func BuildKeyDistribution(
 	groupID string, epoch int, groupSecret []byte,
 	memberAIDs []string, distributedBy string,
 	manifest map[string]any,
+	epochChain string,
 ) map[string]any {
 	commitment := ComputeMembershipCommitment(memberAIDs, epoch, groupID, groupSecret)
 	sorted := make([]string, len(memberAIDs))
@@ -917,6 +1087,9 @@ func BuildKeyDistribution(
 	if manifest != nil {
 		result["manifest"] = manifest
 	}
+	if epochChain != "" {
+		result["epoch_chain"] = epochChain
+	}
 	return result
 }
 
@@ -935,6 +1108,7 @@ func HandleKeyDistribution(
 	secretB64, _ := payload["group_secret"].(string)
 	commitment, _ := payload["commitment"].(string)
 	memberAIDs := toStringSlice(payload["member_aids"])
+	epochChain, _ := payload["epoch_chain"].(string)
 
 	if groupID == "" || secretB64 == "" || commitment == "" {
 		return false
@@ -984,7 +1158,23 @@ func HandleKeyDistribution(
 		return false
 	}
 
-	ok, storeErr := StoreGroupSecret(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs)
+	rotationID, _ := payload["rotation_id"].(string)
+	chainAssessment := assessIncomingEpochChain(
+		ks, aid, groupID, epoch, commitment, epochChain, rotationID,
+		getStr(payload, "distributed_by", getStr(payload, "rotator_aid", "")),
+		"key_distribution",
+	)
+	if !chainAssessment.ok {
+		return false
+	}
+
+	ok, storeErr := StoreGroupSecretWithOptions(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs, GroupSecretStoreOptions{
+		EpochChain:                 epochChain,
+		PendingRotationID:          rotationID,
+		EpochChainUnverifiedSet:    chainAssessment.set,
+		EpochChainUnverified:       chainAssessment.unverified,
+		EpochChainUnverifiedReason: chainAssessment.reason,
+	})
 	if storeErr != nil {
 		log.Printf("[e2ee_group] HandleKeyDistribution 存储 group secret 失败: group=%s epoch=%d err=%v", groupID, epoch, storeErr)
 	}
@@ -1077,6 +1267,9 @@ func HandleKeyRequest(
 		"responder_aid": aid,
 		"issued_at":     time.Now().UnixMilli(),
 	}
+	if ec, ok := secretData["epoch_chain"].(string); ok && ec != "" {
+		response["epoch_chain"] = ec
+	}
 	return response
 }
 
@@ -1157,7 +1350,24 @@ func HandleKeyResponse(
 		return false
 	}
 
-	ok, storeErr := StoreGroupSecret(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs)
+	epochChain, _ := payload["epoch_chain"].(string)
+	rotationID, _ := payload["rotation_id"].(string)
+	chainAssessment := assessIncomingEpochChain(
+		ks, aid, groupID, epoch, commitment, epochChain, rotationID,
+		getStr(payload, "distributed_by", getStr(payload, "rotator_aid", responderAID)),
+		"key_response",
+	)
+	if !chainAssessment.ok {
+		return false
+	}
+
+	ok, storeErr := StoreGroupSecretEpochWithOptions(ks, aid, groupID, epoch, groupSecret, commitment, memberAIDs, GroupSecretStoreOptions{
+		EpochChain:                 epochChain,
+		PendingRotationID:          rotationID,
+		EpochChainUnverifiedSet:    chainAssessment.set,
+		EpochChainUnverified:       chainAssessment.unverified,
+		EpochChainUnverifiedReason: chainAssessment.reason,
+	})
 	if storeErr != nil {
 		log.Printf("[e2ee_group] HandleKeyResponse 存储 group secret 失败: group=%s epoch=%d err=%v", groupID, epoch, storeErr)
 	}

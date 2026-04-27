@@ -73,6 +73,7 @@ type E2EEManager struct {
 	seenCounter      int64                        // 防重放集合的单调递增计数器
 	prekeyCache      map[string]*cachedPrekey     // 对端 prekey 缓存
 	localPrekeyCache map[string]*ecdsa.PrivateKey // 本地 prekey 私钥内存缓存
+	prekeyLoadMu     sync.Mutex                   // 串行化本地 prekey 私钥的缓存 miss 加载
 }
 
 // cachedPrekey 缓存的 prekey 条目
@@ -574,10 +575,11 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 		}
 	}
 
-	// 本地防重放：先检查，解密成功后再记录。
+	// 本地防重放：检查通过后先预占，解密失败再释放，避免并发重复解密同一消息。
 	messageID, _ := message["message_id"].(string)
 	fromAID, _ := message["from"].(string)
 	seenKey := ""
+	reservedSeen := false
 	if messageID != "" && fromAID != "" {
 		seenKey = fromAID + ":" + messageID
 		m.mu.Lock()
@@ -585,15 +587,17 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 			m.mu.Unlock()
 			return nil, NewE2EEDecryptFailedError("重放消息")
 		}
+		m.seenCounter++
+		m.seenMessages[seenKey] = m.seenCounter
+		m.trimSeenSet()
+		reservedSeen = true
 		m.mu.Unlock()
 	}
 
 	result, err := m.decryptMessage(message)
-	if err == nil && result != nil && seenKey != "" {
+	if (err != nil || result == nil) && reservedSeen {
 		m.mu.Lock()
-		m.seenCounter++
-		m.seenMessages[seenKey] = m.seenCounter
-		m.trimSeenSet()
+		delete(m.seenMessages, seenKey)
 		m.mu.Unlock()
 	}
 	return result, err
@@ -1023,9 +1027,18 @@ func (m *E2EEManager) cleanupExpiredPrekeys(ks keystore.KeyStore, aid, deviceID 
 
 // loadPrekeyPrivateKey 从内存缓存或 keystore 加载 prekey 私钥
 func (m *E2EEManager) loadPrekeyPrivateKey(prekeyID string) *ecdsa.PrivateKey {
-	// 优先内存缓存
 	m.mu.RLock()
 	cached := m.localPrekeyCache[prekeyID]
+	m.mu.RUnlock()
+	if cached != nil {
+		return cached
+	}
+
+	m.prekeyLoadMu.Lock()
+	defer m.prekeyLoadMu.Unlock()
+
+	m.mu.RLock()
+	cached = m.localPrekeyCache[prekeyID]
 	m.mu.RUnlock()
 	if cached != nil {
 		return cached

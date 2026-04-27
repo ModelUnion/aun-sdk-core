@@ -73,6 +73,7 @@ describe('群组成员变更事件的 epoch 轮换逻辑', () => {
         group_id: 'test-group-123',
         action: 'member_removed',
         member_aid: 'removed.aid.com',
+        old_epoch: 5,
       });
       await vi.runAllTimersAsync();
 
@@ -115,11 +116,41 @@ describe('群组成员变更事件的 epoch 轮换逻辑', () => {
         group_id: 'test-group-epoch',
         action: 'member_removed',
         member_aid: 'removed.aid.com',
+        old_epoch: 5,
       });
       await vi.runAllTimersAsync();
 
       expect(callSpy).toHaveBeenCalledWith('group.get_members', { group_id: 'test-group-epoch' });
       expect(currentEpochSpy).toHaveBeenCalledTimes(2);
+      expect(rotateEpochSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('member_removed 事件缺 old_epoch 时应跳过轮换', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+
+      (client as any)._aid = 'owner.aid.com';
+      (client as any)._identity = { aid: 'owner.aid.com' };
+      (client as any)._state = 'connected';
+
+      const rotateEpochSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
+      const callSpy = vi.spyOn(client, 'call').mockResolvedValue({
+        members: [{ aid: 'owner.aid.com', role: 'owner' }],
+      });
+
+      await (client as any)._onRawGroupChanged({
+        group_id: 'test-group-no-old-epoch',
+        action: 'member_removed',
+        member_aid: 'removed.aid.com',
+      });
+      await vi.runAllTimersAsync();
+
+      expect(callSpy).not.toHaveBeenCalledWith('group.get_members', expect.anything());
       expect(rotateEpochSpy).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();

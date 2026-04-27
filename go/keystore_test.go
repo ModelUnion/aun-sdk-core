@@ -523,18 +523,20 @@ func TestGroupSecretPersistence(t *testing.T) {
 	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "test-agent.example"
 
-	if err := ks.SaveGroupSecretState(aid, "group-1", map[string]any{
-		"epoch":       int64(1),
-		"secret":      "dGVzdC1zZWNyZXQ=", // base64("test-secret")
-		"commitment":  "abc123",
-		"member_aids": []any{"alice", "bob"},
-	}); err != nil {
-		t.Fatalf("SaveGroupSecretState 失败: %v", err)
+	ok, err := ks.StoreGroupSecretTransition(aid, "group-1", keystore.GroupSecretTransitionOptions{
+		Epoch:                   1,
+		Secret:                  "dGVzdC1zZWNyZXQ=", // base64("test-secret")
+		Commitment:              "abc123",
+		MemberAIDs:              []string{"alice", "bob"},
+		OldEpochRetentionMillis: int64(7 * 24 * time.Hour / time.Millisecond),
+	})
+	if err != nil || !ok {
+		t.Fatalf("StoreGroupSecretTransition 失败: ok=%v err=%v", ok, err)
 	}
 
-	g1, err := ks.LoadGroupSecretState(aid, "group-1")
+	g1, err := ks.LoadGroupSecretEpoch(aid, "group-1", nil)
 	if err != nil {
-		t.Fatalf("LoadGroupSecretState 失败: %v", err)
+		t.Fatalf("LoadGroupSecretEpoch 失败: %v", err)
 	}
 	if g1 == nil {
 		t.Fatal("group-1 不存在")
@@ -608,40 +610,43 @@ func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
 func TestStructuredGroupSecretsPrimaryAndRecoverMetaEpochs(t *testing.T) {
 	ks := testNewFileKeyStoreWithSQLite(t)
 	aid := "structured-group.example"
-	nowMs := time.Now().UnixMilli()
 
-	// 写入 group secret（含 old_epochs）
-	_ = ks.SaveGroupSecretState(aid, "grp-1", map[string]any{
-		"epoch":       int64(3),
-		"secret":      "SQLITE_CURRENT",
-		"updated_at":  nowMs,
-		"member_aids": []any{"alice", "bob"},
-		"old_epochs": []any{
-			map[string]any{
-				"epoch":      int64(1),
-				"secret":     "OLD_1",
-				"updated_at": nowMs,
-				"expires_at": nowMs + int64(time.Minute/time.Millisecond),
-			},
-			map[string]any{
-				"epoch":      int64(2),
-				"secret":     "OLD_2",
-				"updated_at": nowMs,
-				"expires_at": nowMs + int64(time.Minute/time.Millisecond),
-			},
-		},
+	// 写入 current 和 old epoch rows
+	_, _ = ks.StoreGroupSecretTransition(aid, "grp-1", keystore.GroupSecretTransitionOptions{
+		Epoch:                   3,
+		Secret:                  "SQLITE_CURRENT",
+		Commitment:              "current",
+		MemberAIDs:              []string{"alice", "bob"},
+		OldEpochRetentionMillis: int64(time.Minute / time.Millisecond),
+	})
+	_, _ = ks.StoreGroupSecretEpoch(aid, "grp-1", keystore.GroupSecretTransitionOptions{
+		Epoch:                   1,
+		Secret:                  "OLD_1",
+		Commitment:              "old1",
+		MemberAIDs:              []string{"alice", "bob"},
+		OldEpochRetentionMillis: int64(time.Minute / time.Millisecond),
+	})
+	_, _ = ks.StoreGroupSecretEpoch(aid, "grp-1", keystore.GroupSecretTransitionOptions{
+		Epoch:                   2,
+		Secret:                  "OLD_2",
+		Commitment:              "old2",
+		MemberAIDs:              []string{"alice", "bob"},
+		OldEpochRetentionMillis: int64(time.Minute / time.Millisecond),
 	})
 
-	loaded, err := ks.LoadGroupSecretState(aid, "grp-1")
+	loaded, err := ks.LoadGroupSecretEpoch(aid, "grp-1", nil)
 	if err != nil {
-		t.Fatalf("LoadGroupSecretState 失败: %v", err)
+		t.Fatalf("LoadGroupSecretEpoch 失败: %v", err)
 	}
 	if int(toInt64(loaded["epoch"])) != 3 {
 		t.Fatalf("当前 epoch 应为 3，实际: %v", loaded["epoch"])
 	}
-	oldEpochs, _ := loaded["old_epochs"].([]any)
-	if len(oldEpochs) != 2 {
-		t.Fatalf("应保留两个 old epoch，实际: %d", len(oldEpochs))
+	oldEpochs, err := ks.LoadGroupSecretEpochs(aid, "grp-1")
+	if err != nil {
+		t.Fatalf("LoadGroupSecretEpochs 失败: %v", err)
+	}
+	if len(oldEpochs) != 3 {
+		t.Fatalf("应保留两个 old epoch，实际: %d", len(oldEpochs)-1)
 	}
 }
 

@@ -29,8 +29,6 @@ import { certificateSha256Fingerprint } from '../crypto.js';
 import { createDefaultSecretStore } from '../secret-store/index.js';
 import {
   isJsonObject,
-  type GroupOldEpochRecord,
-  type GroupSecretMap,
   type GroupSecretRecord,
   type IdentityRecord,
   type JsonObject,
@@ -299,53 +297,63 @@ export class FileKeyStore implements KeyStore {
 
   // ── Group Secrets ────────────────────────────────────────
 
-  loadGroupSecretState(aid: string, groupId: string): GroupSecretRecord | null {
+  listGroupSecretIds(aid: string): string[] {
     const db = this._getDB(aid);
-    const current = db.loadGroupCurrent(groupId);
-    if (!current) return null;
-    const old = db.loadGroupOldEpochs(groupId);
-    if (old.length > 0) (current as any).old_epochs = old;
-    return current as GroupSecretRecord;
-  }
-
-  loadAllGroupSecretStates(aid: string): GroupSecretMap {
-    const db = this._getDB(aid);
-    const result = db.loadAllGroupCurrent();
-    for (const [gid, entry] of Object.entries(result)) {
-      const old = db.loadGroupOldEpochs(gid);
-      if (old.length > 0) (entry as any).old_epochs = old;
-    }
-    return result as GroupSecretMap;
-  }
-
-  saveGroupSecretState(aid: string, groupId: string, entry: GroupSecretRecord): void {
-    const db = this._getDB(aid);
-    db.deleteAllGroupOldEpochs(groupId);
-    if (typeof entry.epoch === 'number') {
-      const secret = typeof entry.secret === 'string' ? entry.secret : '';
-      const data: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(entry)) {
-        if (!['group_id', 'epoch', 'secret', 'old_epochs', 'updated_at'].includes(k)) data[k] = v;
-      }
-      db.saveGroupCurrent(groupId, entry.epoch, secret, data);
-    } else {
-      db.deleteGroupCurrent(groupId);
-    }
-    if (Array.isArray(entry.old_epochs)) {
-      for (const old of entry.old_epochs as GroupOldEpochRecord[]) {
-        if (typeof old.epoch !== 'number') continue;
-        const oldSecret = typeof old.secret === 'string' ? old.secret : '';
-        const oldData: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(old)) {
-          if (!['epoch', 'secret', 'updated_at', 'expires_at'].includes(k)) oldData[k] = v;
-        }
-        db.saveGroupOldEpoch(groupId, old.epoch, oldSecret, oldData, old.updated_at, old.expires_at);
-      }
-    }
+    const ids = new Set<string>(Object.keys(db.loadAllGroupCurrent()));
+    for (const groupId of db.loadAllGroupIdsWithOldEpochs()) ids.add(groupId);
+    return [...ids].sort();
   }
 
   cleanupGroupOldEpochsState(aid: string, groupId: string, cutoffMs: number): number {
     return this._getDB(aid).cleanupGroupOldEpochs(groupId, cutoffMs);
+  }
+
+  loadGroupSecretEpoch(aid: string, groupId: string, epoch?: number | null): GroupSecretRecord | null {
+    return this._getDB(aid).loadGroupSecretEpoch(groupId, epoch) as GroupSecretRecord | null;
+  }
+
+  loadGroupSecretEpochs(aid: string, groupId: string): GroupSecretRecord[] {
+    return this._getDB(aid).loadGroupSecretEpochs(groupId) as GroupSecretRecord[];
+  }
+
+  storeGroupSecretTransition(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): boolean {
+    return this._getDB(aid).storeGroupSecretTransition(groupId, opts);
+  }
+
+  storeGroupSecretEpoch(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): boolean {
+    return this._getDB(aid).storeGroupSecretEpoch(groupId, opts);
+  }
+
+  discardPendingGroupSecretState(aid: string, groupId: string, epoch: number, rotationId: string): boolean {
+    return this._getDB(aid).discardPendingGroupSecretState(groupId, epoch, rotationId);
   }
 
   deleteGroupSecretState(aid: string, groupId: string): void {

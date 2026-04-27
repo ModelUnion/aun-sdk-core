@@ -2,6 +2,8 @@
 // 群组端到端加密测试。密码学操作全部异步。
 import 'fake-indexeddb/auto';
 import { describe, it, expect, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   GroupE2EEManager,
   GroupReplayGuard,
@@ -15,12 +17,14 @@ import {
   buildMembershipManifest,
   signMembershipManifest,
   verifyMembershipManifest,
+  computeEpochChain,
   computeMembershipCommitment,
   verifyMembershipCommitment,
   storeGroupSecret,
   loadGroupSecret,
   loadAllGroupSecrets,
   cleanupOldEpochs,
+  discardPendingGroupSecret,
   generateGroupSecret,
   buildKeyDistribution,
   handleKeyDistribution,
@@ -31,7 +35,7 @@ import {
 } from '../../src/e2ee-group.js';
 import { CryptoProvider, uint8ToBase64, base64ToUint8 } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
-import type { GroupOldEpochRecord, GroupSecretMap, JsonObject, KeyPairRecord } from '../../src/types.js';
+import type { GroupOldEpochRecord, GroupSecretRecord, JsonObject, KeyPairRecord } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 
@@ -40,22 +44,166 @@ const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'funct
 function createMockKeyStore(): KeyStore {
   const keyPairs = new Map<string, KeyPairRecord>();
   const certs = new Map<string, string>();
-  const groups = new Map<string, GroupSecretMap>();
+  const groups = new Map<string, Record<string, GroupSecretRecord>>();
+  const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+  const getGroup = (aid: string, groupId: string): GroupSecretRecord | null => groups.get(aid)?.[groupId] ?? null;
+  const setGroup = (aid: string, groupId: string, entry: GroupSecretRecord): void => {
+    const current = groups.get(aid) ?? {};
+    current[groupId] = clone(entry);
+    groups.set(aid, current);
+  };
+  const buildGroupEntry = (
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+    },
+    members: string[],
+    updatedAt: number,
+    oldEpochs: GroupOldEpochRecord[] = [],
+  ): GroupSecretRecord => {
+    const entry: GroupSecretRecord = {
+      epoch: Number(opts.epoch),
+      secret: opts.secret,
+      commitment: opts.commitment,
+      member_aids: members,
+      updated_at: updatedAt,
+      old_epochs: oldEpochs,
+    };
+    if (opts.epochChain !== undefined) entry.epoch_chain = opts.epochChain;
+    if (opts.pendingRotationId) {
+      entry.pending_rotation_id = opts.pendingRotationId;
+      entry.pending_created_at = updatedAt;
+    }
+    if (opts.epochChainUnverified === true) {
+      entry.epoch_chain_unverified = true;
+      if (opts.epochChainUnverifiedReason) entry.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+    }
+    return entry;
+  };
+  const mergeGroupMetadata = (
+    current: GroupSecretRecord,
+    opts: {
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+    },
+    members: string[],
+    updatedAt: number,
+  ): GroupSecretRecord => {
+    const updated: GroupSecretRecord = { ...current, updated_at: updatedAt };
+    const oldMembers = Array.isArray(updated.member_aids) ? updated.member_aids.map(String).sort() : [];
+    if (members.length && JSON.stringify(oldMembers) !== JSON.stringify(members)) {
+      updated.member_aids = members;
+      updated.commitment = opts.commitment;
+    }
+    if (opts.epochChain !== undefined) updated.epoch_chain = opts.epochChain;
+    if (opts.pendingRotationId) {
+      updated.pending_rotation_id = opts.pendingRotationId;
+      updated.pending_created_at = updatedAt;
+    } else {
+      delete updated.pending_rotation_id;
+      delete updated.pending_created_at;
+    }
+    if (opts.epochChainUnverified === true) {
+      updated.epoch_chain_unverified = true;
+      if (opts.epochChainUnverifiedReason) updated.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+    } else if (opts.epochChainUnverified === false) {
+      delete updated.epoch_chain_unverified;
+      delete updated.epoch_chain_unverified_reason;
+    }
+    return updated;
+  };
   return {
     async loadKeyPair(aid) { return keyPairs.get(aid) ?? null; },
     async saveKeyPair(aid, kp) { keyPairs.set(aid, kp); },
     async loadCert(aid) { return certs.get(aid) ?? null; },
     async saveCert(aid, cert) { certs.set(aid, cert); },
-    async loadGroupSecretState(aid, groupId) {
-      return JSON.parse(JSON.stringify(groups.get(aid)?.[groupId] ?? null));
+    async listGroupSecretIds(aid) {
+      return Object.keys(groups.get(aid) ?? {}).sort();
     },
-    async loadAllGroupSecretStates(aid) {
-      return JSON.parse(JSON.stringify(groups.get(aid) ?? {}));
+    async loadGroupSecretEpoch(aid, groupId, epoch) {
+      const current = getGroup(aid, groupId);
+      if (!current) return null;
+      if (epoch === undefined || epoch === null || Number(current.epoch ?? 0) === Number(epoch)) {
+        return clone(current);
+      }
+      const old = ((current.old_epochs ?? []) as GroupOldEpochRecord[])
+        .find((item) => Number(item.epoch ?? 0) === Number(epoch));
+      return old ? clone(old as GroupSecretRecord) : null;
     },
-    async saveGroupSecretState(aid, groupId, entry) {
-      const current = groups.get(aid) ?? {};
-      current[groupId] = JSON.parse(JSON.stringify(entry));
-      groups.set(aid, current);
+    async loadGroupSecretEpochs(aid, groupId) {
+      const current = getGroup(aid, groupId);
+      if (!current) return [];
+      return clone([
+        current,
+        ...((current.old_epochs ?? []) as GroupOldEpochRecord[]),
+      ] as GroupSecretRecord[]);
+    },
+    async storeGroupSecretTransition(aid, groupId, opts) {
+      const now = Date.now();
+      const epoch = Number(opts.epoch);
+      const members = [...(opts.memberAids ?? [])].map(String).sort();
+      const current = getGroup(aid, groupId);
+      if (current) {
+        const localEpoch = Number(current.epoch ?? 0);
+        if (epoch < localEpoch) return false;
+        if (epoch === localEpoch && typeof current.secret === 'string') {
+          if (current.secret !== opts.secret) {
+            if (!String(current.pending_rotation_id ?? '').trim()) return false;
+            setGroup(aid, groupId, buildGroupEntry(opts, members, now, (current.old_epochs ?? []) as GroupOldEpochRecord[]));
+            return true;
+          }
+          setGroup(aid, groupId, mergeGroupMetadata(current, opts, members, now));
+          return true;
+        }
+        const oldEntry = { ...current, expires_at: Number(current.updated_at ?? now) + opts.oldEpochRetentionMs } as GroupOldEpochRecord;
+        const oldEpochs = [...((current.old_epochs ?? []) as GroupOldEpochRecord[]), oldEntry];
+        setGroup(aid, groupId, buildGroupEntry(opts, members, now, oldEpochs));
+        return true;
+      }
+      setGroup(aid, groupId, buildGroupEntry(opts, members, now, []));
+      return true;
+    },
+    async storeGroupSecretEpoch(aid, groupId, opts) {
+      const now = Date.now();
+      const epoch = Number(opts.epoch);
+      const members = [...(opts.memberAids ?? [])].map(String).sort();
+      const current = getGroup(aid, groupId);
+      if (!current) {
+        setGroup(aid, groupId, buildGroupEntry(opts, members, now, []));
+        return true;
+      }
+      const localEpoch = Number(current.epoch ?? 0);
+      if (epoch > localEpoch) return false;
+      if (epoch === localEpoch) {
+        if (current.secret && current.secret !== opts.secret && !String(current.pending_rotation_id ?? '').trim()) {
+          return false;
+        }
+        setGroup(aid, groupId, buildGroupEntry(opts, members, now, (current.old_epochs ?? []) as GroupOldEpochRecord[]));
+        return true;
+      }
+      const oldEpochs = [...((current.old_epochs ?? []) as GroupOldEpochRecord[])];
+      const index = oldEpochs.findIndex((item) => Number(item.epoch ?? 0) === epoch);
+      const oldEntry = buildGroupEntry(opts, members, now, []) as GroupOldEpochRecord;
+      oldEntry.expires_at = now + opts.oldEpochRetentionMs;
+      delete oldEntry.old_epochs;
+      if (index >= 0) {
+        if (oldEpochs[index].secret && oldEpochs[index].secret !== opts.secret) return false;
+        oldEpochs[index] = oldEntry;
+      } else {
+        oldEpochs.push(oldEntry);
+      }
+      setGroup(aid, groupId, { ...current, old_epochs: oldEpochs });
+      return true;
     },
     async cleanupGroupOldEpochsState(aid, groupId, cutoffMs) {
       const entry = groups.get(aid)?.[groupId];
@@ -65,6 +213,30 @@ function createMockKeyStore(): KeyStore {
       const removed = oldEpochs.length - remaining.length;
       entry.old_epochs = remaining;
       return removed;
+    },
+    async discardPendingGroupSecretState(aid, groupId, epoch, rotationId) {
+      const current = getGroup(aid, groupId);
+      if (!current) return false;
+      if (Number(current.epoch ?? 0) !== Number(epoch)) return false;
+      if (String(current.pending_rotation_id ?? '').trim() !== rotationId.trim()) return false;
+      const oldEpochs = [...((current.old_epochs ?? []) as GroupOldEpochRecord[])];
+      let restoreIndex = -1;
+      let restoreEpoch = -1;
+      oldEpochs.forEach((old, index) => {
+        const oldEpoch = Number(old.epoch ?? 0);
+        if (oldEpoch < epoch && oldEpoch > restoreEpoch && old.secret) {
+          restoreIndex = index;
+          restoreEpoch = oldEpoch;
+        }
+      });
+      if (restoreIndex >= 0) {
+        const restored = { ...oldEpochs[restoreIndex] } as GroupSecretRecord;
+        restored.old_epochs = oldEpochs.filter((_, index) => index !== restoreIndex);
+        setGroup(aid, groupId, restored);
+      } else {
+        delete (groups.get(aid) ?? {})[groupId];
+      }
+      return true;
     },
     async loadIdentity(aid) {
       const kp = keyPairs.get(aid);
@@ -155,6 +327,14 @@ describe('GroupReplayGuard', () => {
     }
     // 裁剪到 80% = 8 条
     expect(guard.size).toBeLessThanOrEqual(10);
+  });
+});
+
+describe('GroupE2EEManager replay guard', () => {
+  it('skipReplay 解密成功后不应写入 replay guard', () => {
+    const source = readFileSync(join(process.cwd(), 'src', 'e2ee-group.ts'), 'utf8');
+    const decryptBody = source.split('async decrypt', 2)[1].split('/** 批量解密 */', 1)[0];
+    expect(decryptBody).toContain('if (!skipReplay && groupId && sender && finalMsgId)');
   });
 });
 
@@ -315,6 +495,23 @@ describe('storeGroupSecret / loadGroupSecret', () => {
     expect(old).not.toBeNull();
     expect(old!.epoch).toBe(1);
     expect(uint8ToBase64(old!.secret)).toBe(uint8ToBase64(s1));
+  });
+
+  it('discardPendingGroupSecret 只回滚匹配 rotation 的 pending key', async () => {
+    const ks = createMockKeyStore();
+    const s1 = generateGroupSecret();
+    const s2 = generateGroupSecret();
+    await storeGroupSecret(ks, 'alice', 'g1', 1, s1, 'c1', ['alice']);
+    await storeGroupSecret(ks, 'alice', 'g1', 2, s2, 'c2', ['alice'], 'chain2', 'rot-2');
+
+    expect(await discardPendingGroupSecret(ks, 'alice', 'g1', 2, 'other')).toBe(false);
+    expect((await loadGroupSecret(ks, 'alice', 'g1'))!.epoch).toBe(2);
+    expect(await discardPendingGroupSecret(ks, 'alice', 'g1', 2, 'rot-2')).toBe(true);
+
+    const restored = await loadGroupSecret(ks, 'alice', 'g1');
+    expect(restored!.epoch).toBe(1);
+    expect(uint8ToBase64(restored!.secret)).toBe(uint8ToBase64(s1));
+    expect(restored!.pending_rotation_id).toBeUndefined();
   });
 
   it('指定 epoch 加载当前 epoch 应成功', async () => {
@@ -602,6 +799,102 @@ describe('handleKeyDistribution', () => {
       expect(ok).toBe(false);
     },
   );
+
+  it.skipIf(!hasSubtleCrypto)(
+    'key distribution 低于 current epoch 应拒绝防降级',
+    async () => {
+      const ks = createMockKeyStore();
+      const groupId = 'g1';
+      const members = ['alice', 'bob'];
+      const currentSecret = generateGroupSecret();
+      const currentCommitment = await computeMembershipCommitment(members, 5, groupId, currentSecret);
+      expect(await storeGroupSecret(ks, 'bob', groupId, 5, currentSecret, currentCommitment, members)).toBe(true);
+
+      const staleSecret = generateGroupSecret();
+      const payload = await buildKeyDistribution(groupId, 3, staleSecret, members, 'alice');
+      expect(await handleKeyDistribution(payload, ks, 'bob')).toBe(false);
+      expect((await loadGroupSecret(ks, 'bob', groupId))!.epoch).toBe(5);
+      expect(await loadGroupSecret(ks, 'bob', groupId, 3)).toBeNull();
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    '带 rotation_id 且本地前链可信时拒绝 chain 分叉',
+    async () => {
+      const ks = createMockKeyStore();
+      const groupId = 'g1';
+      const members = ['alice', 'bob'];
+      const secret1 = generateGroupSecret();
+      const commitment1 = await computeMembershipCommitment(members, 1, groupId, secret1);
+      const chain1 = await computeEpochChain(null, 1, commitment1, 'alice');
+      await storeGroupSecret(ks, 'bob', groupId, 1, secret1, commitment1, members, chain1);
+
+      const secret2 = generateGroupSecret();
+      const payload = await buildKeyDistribution(groupId, 2, secret2, members, 'alice', null, '00'.repeat(32));
+      payload.rotation_id = 'rot-test';
+
+      const ok = await handleKeyDistribution(payload, ks, 'bob');
+      expect(ok).toBe(false);
+      expect((await loadGroupSecret(ks, 'bob', groupId))!.epoch).toBe(1);
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    '新 rotation 可覆盖同 epoch 的旧 pending secret',
+    async () => {
+      const ks = createMockKeyStore();
+      const groupId = 'g1';
+      const members = ['alice', 'bob'];
+      const secret1 = generateGroupSecret();
+      const commitment1 = await computeMembershipCommitment(members, 1, groupId, secret1);
+      const chain1 = await computeEpochChain(null, 1, commitment1, 'alice');
+      await storeGroupSecret(ks, 'bob', groupId, 1, secret1, commitment1, members, chain1);
+
+      const oldSecret = generateGroupSecret();
+      const oldCommitment = await computeMembershipCommitment(members, 2, groupId, oldSecret);
+      const oldChain = await computeEpochChain(chain1, 2, oldCommitment, 'alice');
+      await storeGroupSecret(ks, 'bob', groupId, 2, oldSecret, oldCommitment, members, oldChain, 'rot-old');
+
+      const newSecret = generateGroupSecret();
+      const newCommitment = await computeMembershipCommitment(members, 2, groupId, newSecret);
+      const newChain = await computeEpochChain(chain1, 2, newCommitment, 'alice');
+      const payload = await buildKeyDistribution(groupId, 2, newSecret, members, 'alice', null, newChain);
+      payload.rotation_id = 'rot-new';
+
+      const ok = await handleKeyDistribution(payload, ks, 'bob');
+      expect(ok).toBe(true);
+      const loaded = await loadGroupSecret(ks, 'bob', groupId);
+      expect(Buffer.compare(Buffer.from(loaded!.secret), Buffer.from(newSecret))).toBe(0);
+      expect(loaded!.epoch_chain).toBe(newChain);
+      expect(loaded!.pending_rotation_id).toBe('rot-new');
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    '缺少本地前链时按兼容档接收并标记未验证',
+    async () => {
+      const ks = createMockKeyStore();
+      const payload = await buildKeyDistribution('g1', 2, generateGroupSecret(), ['alice', 'bob'], 'alice', null, '00'.repeat(32));
+
+      const ok = await handleKeyDistribution(payload, ks, 'bob');
+      expect(ok).toBe(true);
+      const loaded = await loadGroupSecret(ks, 'bob', 'g1');
+      expect(loaded!.epoch_chain_unverified).toBe(true);
+      expect(loaded!.epoch_chain_unverified_reason).toBe('missing_prev_chain');
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    '新 rotation 缺少 epoch_chain 时拒绝',
+    async () => {
+      const ks = createMockKeyStore();
+      const payload = await buildKeyDistribution('g1', 1, generateGroupSecret(), ['alice', 'bob'], 'alice');
+      payload.rotation_id = 'rot-test';
+
+      const ok = await handleKeyDistribution(payload, ks, 'bob');
+      expect(ok).toBe(false);
+    },
+  );
 });
 
 describe('handleKeyRequest', () => {
@@ -673,6 +966,66 @@ describe('handleKeyResponse', () => {
       const loaded = await loadGroupSecret(ks, 'bob', 'g1');
       expect(loaded).not.toBeNull();
       expect(loaded!.epoch).toBe(1);
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    'key response 补旧 epoch 只写 old epoch，不覆盖 current',
+    async () => {
+      const ks = createMockKeyStore();
+      const groupId = 'g1';
+      const members = ['alice', 'bob'];
+      const currentSecret = generateGroupSecret();
+      const currentCommitment = await computeMembershipCommitment(members, 5, groupId, currentSecret);
+      expect(await storeGroupSecret(ks, 'bob', groupId, 5, currentSecret, currentCommitment, members)).toBe(true);
+
+      const oldSecret = generateGroupSecret();
+      const oldCommitment = await computeMembershipCommitment(members, 3, groupId, oldSecret);
+      const ok = await handleKeyResponse({
+        type: 'e2ee.group_key_response',
+        group_id: groupId,
+        epoch: 3,
+        group_secret: uint8ToBase64(oldSecret),
+        commitment: oldCommitment,
+        member_aids: members,
+        requester_aid: 'bob',
+        responder_aid: 'alice',
+        request_id: 'req-old',
+      }, ks, 'bob');
+
+      expect(ok).toBe(true);
+      expect((await loadGroupSecret(ks, 'bob', groupId))!.epoch).toBe(5);
+      expect(Buffer.compare(Buffer.from((await loadGroupSecret(ks, 'bob', groupId, 3))!.secret), Buffer.from(oldSecret))).toBe(0);
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    'key response 不能绕过轮换推进到 future epoch',
+    async () => {
+      const ks = createMockKeyStore();
+      const groupId = 'g1';
+      const members = ['alice', 'bob'];
+      const currentSecret = generateGroupSecret();
+      const currentCommitment = await computeMembershipCommitment(members, 5, groupId, currentSecret);
+      expect(await storeGroupSecret(ks, 'bob', groupId, 5, currentSecret, currentCommitment, members)).toBe(true);
+
+      const futureSecret = generateGroupSecret();
+      const futureCommitment = await computeMembershipCommitment(members, 6, groupId, futureSecret);
+      const ok = await handleKeyResponse({
+        type: 'e2ee.group_key_response',
+        group_id: groupId,
+        epoch: 6,
+        group_secret: uint8ToBase64(futureSecret),
+        commitment: futureCommitment,
+        member_aids: members,
+        requester_aid: 'bob',
+        responder_aid: 'alice',
+        request_id: 'req-future',
+      }, ks, 'bob');
+
+      expect(ok).toBe(false);
+      expect((await loadGroupSecret(ks, 'bob', groupId))!.epoch).toBe(5);
+      expect(await loadGroupSecret(ks, 'bob', groupId, 6)).toBeNull();
     },
   );
 });
@@ -851,6 +1204,37 @@ describe('GroupE2EEManager', () => {
       expect(result.epoch).toBe(5);
 
       expect(await manager.currentEpoch('g1')).toBe(5);
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    'rotateEpochTo 替换同 epoch pending 时应使用上一 epoch chain',
+    async () => {
+      const manager = new GroupE2EEManager({
+        identityFn: () => ({
+          aid: 'alice',
+          private_key_pem: aliceIdentity.private_key_pem,
+          public_key_der_b64: aliceIdentity.public_key_der_b64,
+        }),
+        keystore: ks,
+      });
+      const members = ['alice', 'bob'];
+      const secret1 = generateGroupSecret();
+      const commitment1 = await computeMembershipCommitment(members, 1, 'g1', secret1);
+      const chain1 = await computeEpochChain(null, 1, commitment1, 'alice');
+      await storeGroupSecret(ks, 'alice', 'g1', 1, secret1, commitment1, members, chain1);
+
+      const oldSecret = generateGroupSecret();
+      const oldCommitment = await computeMembershipCommitment(members, 2, 'g1', oldSecret);
+      const oldChain = await computeEpochChain(chain1, 2, oldCommitment, 'alice');
+      await storeGroupSecret(ks, 'alice', 'g1', 2, oldSecret, oldCommitment, members, oldChain, 'rot-old');
+
+      await manager.rotateEpochTo('g1', 2, members, { rotationId: 'rot-new' });
+
+      const loaded = await loadGroupSecret(ks, 'alice', 'g1');
+      const expectedChain = await computeEpochChain(chain1, 2, loaded!.commitment, 'alice');
+      expect(loaded!.epoch_chain).toBe(expectedChain);
+      expect(loaded!.pending_rotation_id).toBe('rot-new');
     },
   );
 

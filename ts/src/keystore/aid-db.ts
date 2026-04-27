@@ -279,6 +279,45 @@ export class AIDDatabase {
     };
   }
 
+  loadGroupSecretEpoch(groupId: string, epoch?: number | null): Record<string, unknown> | null {
+    const current = this.loadGroupCurrent(groupId);
+    if (epoch === undefined || epoch === null) return current;
+    if (current && Number(current.epoch ?? 0) === Number(epoch)) return current;
+    const row = this._db.prepare(
+      'SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? AND epoch = ?',
+    ).get(groupId, epoch) as
+      { epoch: number; secret_enc: string; data: string; updated_at: number; expires_at: number | null } | undefined;
+    if (!row) return null;
+    const entry: Record<string, unknown> = {
+      epoch: row.epoch,
+      secret: this._revealText(`group/${groupId}/epoch/${row.epoch}`, row.secret_enc),
+      ...jsonParseObject(row.data),
+      updated_at: row.updated_at,
+    };
+    if (row.expires_at != null) entry.expires_at = row.expires_at;
+    return entry;
+  }
+
+  loadGroupSecretEpochs(groupId: string): Array<Record<string, unknown>> {
+    const result: Array<Record<string, unknown>> = [];
+    const current = this.loadGroupCurrent(groupId);
+    if (current) result.push(current);
+    const rows = this._db.prepare(
+      'SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? ORDER BY epoch ASC',
+    ).all(groupId) as Array<{ epoch: number; secret_enc: string; data: string; updated_at: number; expires_at: number | null }>;
+    for (const row of rows) {
+      const entry: Record<string, unknown> = {
+        epoch: row.epoch,
+        secret: this._revealText(`group/${groupId}/epoch/${row.epoch}`, row.secret_enc),
+        ...jsonParseObject(row.data),
+        updated_at: row.updated_at,
+      };
+      if (row.expires_at != null) entry.expires_at = row.expires_at;
+      result.push(entry);
+    }
+    return result;
+  }
+
   loadAllGroupCurrent(): Record<string, Record<string, unknown>> {
     const rows = this._db.prepare('SELECT group_id, epoch, secret_enc, data, updated_at FROM group_current').all() as
       Array<{ group_id: string; epoch: number; secret_enc: string; data: string; updated_at: number }>;
@@ -334,9 +373,263 @@ export class AIDDatabase {
 
   cleanupGroupOldEpochs(groupId: string, cutoffMs: number): number {
     const result = this._db.prepare(
-      'DELETE FROM group_old_epochs WHERE group_id = ? AND (CASE WHEN expires_at IS NOT NULL THEN expires_at ELSE updated_at END) < ?',
+      'DELETE FROM group_old_epochs WHERE group_id = ? AND updated_at <= ?',
     ).run(groupId, cutoffMs);
     return result.changes;
+  }
+
+  storeGroupSecretTransition(groupId: string, opts: {
+    epoch: number;
+    secret: string;
+    commitment: string;
+    memberAids: string[];
+    epochChain?: string;
+    pendingRotationId?: string;
+    epochChainUnverified?: boolean | null;
+    epochChainUnverifiedReason?: string | null;
+    oldEpochRetentionMs: number;
+  }): boolean {
+    const txn = this._db.transaction(() => {
+      const now = Date.now();
+      const epoch = Number(opts.epoch);
+      const members = [...(opts.memberAids ?? [])].map((item) => String(item)).sort();
+      const pendingRotationId = String(opts.pendingRotationId ?? '').trim();
+      const current = this._db.prepare(
+        'SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?',
+      ).get(groupId) as { epoch: number; secret_enc: string; data: string; updated_at: number } | undefined;
+
+      if (current) {
+        const localEpoch = Number(current.epoch);
+        const currentSecret = this._revealText(`group/${groupId}/current`, current.secret_enc);
+        const currentData = jsonParseObject(current.data);
+        if (epoch < localEpoch) return false;
+        if (epoch === localEpoch && currentSecret) {
+          if (currentSecret !== opts.secret) {
+            if (String(currentData.pending_rotation_id ?? '').trim()) {
+              this._upsertGroupCurrent(groupId, epoch, opts.secret, this._buildGroupCurrentData(opts, members, now), now);
+              return true;
+            }
+            return false;
+          }
+          const updated = { ...currentData };
+          let changed = false;
+          const oldMembers = Array.isArray(updated.member_aids) ? updated.member_aids.map(String).sort() : [];
+          if (members.length > 0 && JSON.stringify(oldMembers) !== JSON.stringify(members)) {
+            updated.member_aids = members;
+            updated.commitment = opts.commitment;
+            changed = true;
+          }
+          if (opts.epochChain !== undefined && updated.epoch_chain !== opts.epochChain) {
+            updated.epoch_chain = opts.epochChain;
+            changed = true;
+          }
+          if (opts.epochChainUnverified === true) {
+            if (updated.epoch_chain_unverified !== true) {
+              updated.epoch_chain_unverified = true;
+              changed = true;
+            }
+            if (opts.epochChainUnverifiedReason && updated.epoch_chain_unverified_reason !== opts.epochChainUnverifiedReason) {
+              updated.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+              changed = true;
+            }
+          } else if (opts.epochChainUnverified === false) {
+            if ('epoch_chain_unverified' in updated || 'epoch_chain_unverified_reason' in updated) {
+              delete updated.epoch_chain_unverified;
+              delete updated.epoch_chain_unverified_reason;
+              changed = true;
+            }
+          }
+          if (pendingRotationId && updated.pending_rotation_id !== pendingRotationId) {
+            updated.pending_rotation_id = pendingRotationId;
+            updated.pending_created_at = now;
+            changed = true;
+          }
+          if (!pendingRotationId && updated.pending_rotation_id) {
+            delete updated.pending_rotation_id;
+            delete updated.pending_created_at;
+            changed = true;
+          }
+          if (changed) this._upsertGroupCurrent(groupId, epoch, currentSecret, updated, now);
+          return true;
+        }
+        if (localEpoch !== epoch) {
+          const expiresAt = Number(current.updated_at || now) + opts.oldEpochRetentionMs;
+          this._upsertGroupOldEpoch(groupId, localEpoch, currentSecret, currentData, Number(current.updated_at || now), expiresAt);
+        }
+      }
+
+      this._upsertGroupCurrent(groupId, epoch, opts.secret, this._buildGroupCurrentData(opts, members, now), now);
+      return true;
+    });
+    return Boolean(txn());
+  }
+
+  storeGroupSecretEpoch(groupId: string, opts: {
+    epoch: number;
+    secret: string;
+    commitment: string;
+    memberAids: string[];
+    epochChain?: string;
+    pendingRotationId?: string;
+    epochChainUnverified?: boolean | null;
+    epochChainUnverifiedReason?: string | null;
+    oldEpochRetentionMs: number;
+  }): boolean {
+    const txn = this._db.transaction(() => {
+      const now = Date.now();
+      const epoch = Number(opts.epoch);
+      const members = [...(opts.memberAids ?? [])].map((item) => String(item)).sort();
+      const pendingRotationId = String(opts.pendingRotationId ?? '').trim();
+      const data = this._buildGroupCurrentData(opts, members, now);
+      const current = this._db.prepare(
+        'SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?',
+      ).get(groupId) as { epoch: number; secret_enc: string; data: string; updated_at: number } | undefined;
+
+      if (!current) {
+        this._upsertGroupCurrent(groupId, epoch, opts.secret, data, now);
+        return true;
+      }
+
+      const localEpoch = Number(current.epoch);
+      if (epoch > localEpoch) return false;
+
+      if (epoch === localEpoch) {
+        const currentSecret = this._revealText(`group/${groupId}/current`, current.secret_enc);
+        const currentData = jsonParseObject(current.data);
+        if (currentSecret && currentSecret !== opts.secret) {
+          if (!String(currentData.pending_rotation_id ?? '').trim()) return false;
+          this._upsertGroupCurrent(groupId, epoch, opts.secret, data, now);
+          return true;
+        }
+        const updated = { ...currentData };
+        let changed = false;
+        const oldMembers = Array.isArray(updated.member_aids) ? updated.member_aids.map(String).sort() : [];
+        if (members.length > 0 && JSON.stringify(oldMembers) !== JSON.stringify(members)) {
+          updated.member_aids = members;
+          updated.commitment = opts.commitment;
+          changed = true;
+        }
+        if (opts.epochChain !== undefined && updated.epoch_chain !== opts.epochChain) {
+          updated.epoch_chain = opts.epochChain;
+          changed = true;
+        }
+        if (opts.epochChainUnverified === true) {
+          if (updated.epoch_chain_unverified !== true) {
+            updated.epoch_chain_unverified = true;
+            changed = true;
+          }
+          if (opts.epochChainUnverifiedReason && updated.epoch_chain_unverified_reason !== opts.epochChainUnverifiedReason) {
+            updated.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+            changed = true;
+          }
+        } else if (opts.epochChainUnverified === false) {
+          if ('epoch_chain_unverified' in updated || 'epoch_chain_unverified_reason' in updated) {
+            delete updated.epoch_chain_unverified;
+            delete updated.epoch_chain_unverified_reason;
+            changed = true;
+          }
+        }
+        if (pendingRotationId && updated.pending_rotation_id !== pendingRotationId) {
+          updated.pending_rotation_id = pendingRotationId;
+          updated.pending_created_at = now;
+          changed = true;
+        }
+        if (!pendingRotationId && updated.pending_rotation_id) {
+          delete updated.pending_rotation_id;
+          delete updated.pending_created_at;
+          changed = true;
+        }
+        if (changed) this._upsertGroupCurrent(groupId, epoch, currentSecret, updated, now);
+        return true;
+      }
+
+      const old = this._db.prepare(
+        'SELECT secret_enc FROM group_old_epochs WHERE group_id = ? AND epoch = ?',
+      ).get(groupId, epoch) as { secret_enc: string } | undefined;
+      if (old) {
+        const oldSecret = this._revealText(`group/${groupId}/epoch/${epoch}`, old.secret_enc);
+        if (oldSecret && oldSecret !== opts.secret) return false;
+      }
+      this._upsertGroupOldEpoch(groupId, epoch, opts.secret, data, now, now + opts.oldEpochRetentionMs);
+      return true;
+    });
+    return Boolean(txn());
+  }
+
+  discardPendingGroupSecretState(groupId: string, epoch: number, rotationId: string): boolean {
+    const txn = this._db.transaction(() => {
+      const rid = String(rotationId ?? '').trim();
+      if (!rid) return false;
+      const current = this._db.prepare(
+        'SELECT epoch, data FROM group_current WHERE group_id = ?',
+      ).get(groupId) as { epoch: number; data: string } | undefined;
+      if (!current || Number(current.epoch) !== Number(epoch)) return false;
+      const data = jsonParseObject(current.data);
+      if (String(data.pending_rotation_id ?? '').trim() !== rid) return false;
+
+      const old = this._db.prepare(
+        'SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? AND epoch < ? ORDER BY epoch DESC LIMIT 1',
+      ).get(groupId, epoch) as
+        { epoch: number; secret_enc: string; data: string; updated_at: number; expires_at: number | null } | undefined;
+      if (!old) {
+        this._db.prepare('DELETE FROM group_current WHERE group_id = ?').run(groupId);
+        this._db.prepare('DELETE FROM group_old_epochs WHERE group_id = ?').run(groupId);
+        return true;
+      }
+      const secret = this._revealText(`group/${groupId}/epoch/${old.epoch}`, old.secret_enc);
+      this._upsertGroupCurrent(groupId, Number(old.epoch), secret, jsonParseObject(old.data), Date.now());
+      this._db.prepare('DELETE FROM group_old_epochs WHERE group_id = ? AND epoch = ?').run(groupId, old.epoch);
+      return true;
+    });
+    return Boolean(txn());
+  }
+
+  private _buildGroupCurrentData(opts: {
+    commitment: string;
+    memberAids?: string[];
+    epochChain?: string;
+    pendingRotationId?: string;
+    epochChainUnverified?: boolean | null;
+    epochChainUnverifiedReason?: string | null;
+  }, memberAids: string[], now: number): Record<string, unknown> {
+    const data: Record<string, unknown> = {
+      commitment: opts.commitment,
+      member_aids: memberAids,
+    };
+    if (opts.epochChain !== undefined) data.epoch_chain = opts.epochChain;
+    const pendingRotationId = String(opts.pendingRotationId ?? '').trim();
+    if (pendingRotationId) {
+      data.pending_rotation_id = pendingRotationId;
+      data.pending_created_at = now;
+    }
+    if (opts.epochChainUnverified === true) {
+      data.epoch_chain_unverified = true;
+      if (opts.epochChainUnverifiedReason) data.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+    }
+    return data;
+  }
+
+  private _upsertGroupCurrent(groupId: string, epoch: number, secret: string, data: Record<string, unknown>, updatedAt: number): void {
+    this._db.prepare(
+      `INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(group_id) DO UPDATE SET epoch=excluded.epoch, secret_enc=excluded.secret_enc, data=excluded.data, updated_at=excluded.updated_at`,
+    ).run(groupId, epoch, this._protectText(`group/${groupId}/current`, secret), JSON.stringify(data), updatedAt);
+  }
+
+  private _upsertGroupOldEpoch(
+    groupId: string,
+    epoch: number,
+    secret: string,
+    data: Record<string, unknown>,
+    updatedAt: number,
+    expiresAt?: number | null,
+  ): void {
+    this._db.prepare(
+      `INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(group_id, epoch) DO UPDATE SET secret_enc=excluded.secret_enc, data=excluded.data, updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
+    ).run(groupId, epoch, this._protectText(`group/${groupId}/epoch/${epoch}`, secret), JSON.stringify(data), updatedAt, expiresAt ?? null);
   }
 
   saveSession(sessionId: string, data: Record<string, unknown>): void {

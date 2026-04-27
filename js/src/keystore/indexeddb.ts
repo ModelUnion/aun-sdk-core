@@ -6,7 +6,6 @@ import type { KeyStore } from './index.js';
 import {
   isJsonObject,
   type GroupOldEpochRecord,
-  type GroupSecretMap,
   type GroupSecretRecord,
   type IdentityRecord,
   type JsonObject,
@@ -16,6 +15,8 @@ import {
   type PrekeyRecord,
   type SessionRecord,
 } from '../types.js';
+
+type LegacyGroupSecretMap = Record<string, GroupSecretRecord>;
 
 /** AID 安全化（替换路径分隔符） */
 function safeAid(aid: string): string {
@@ -737,46 +738,126 @@ export class IndexedDBKeyStore implements KeyStore {
 
   // ── 结构化群组密钥 ─────────────────────────────────
 
-  async loadGroupSecretState(aid: string, groupId: string): Promise<GroupSecretRecord | null> {
+  async listGroupSecretIds(aid: string): Promise<string[]> {
     return this._withAidLock(aid, async () => {
       await this._migrateLegacyStructuredStateUnlocked(aid);
-      const groups = await this._loadGroupEntriesUnlocked(aid);
-      return deepClone(groups[groupId] ?? null);
-    });
-  }
-
-  async loadAllGroupSecretStates(aid: string): Promise<GroupSecretMap> {
-    return this._withAidLock(aid, async () => {
-      await this._migrateLegacyStructuredStateUnlocked(aid);
-      return this._loadGroupEntriesUnlocked(aid);
-    });
-  }
-
-  async saveGroupSecretState(aid: string, groupId: string, entry: GroupSecretRecord): Promise<void> {
-    await this._withAidLock(aid, async () => {
-      await this._migrateLegacyStructuredStateUnlocked(aid);
-      await this._saveSingleGroupEntryUnlocked(aid, groupId, entry);
+      const ids = new Set<string>();
+      for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_CURRENT, groupCurrentPrefix(aid))) {
+        const [, encodedGroupId] = item.key.split('|');
+        if (encodedGroupId) ids.add(decodeURIComponent(encodedGroupId));
+      }
+      for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_OLD_EPOCHS, groupOldPrefix(aid))) {
+        const [, encodedGroupId] = item.key.split('|');
+        if (encodedGroupId) ids.add(decodeURIComponent(encodedGroupId));
+      }
+      return [...ids].sort();
     });
   }
 
   async cleanupGroupOldEpochsState(aid: string, groupId: string, cutoffMs: number): Promise<number> {
     return this._withAidLock(aid, async () => {
       await this._migrateLegacyStructuredStateUnlocked(aid);
-      const groups = await this._loadGroupEntriesUnlocked(aid);
-      const entry = groups[groupId];
-      if (!entry) return 0;
-
-      const oldEpochs = Array.isArray(entry.old_epochs)
-        ? entry.old_epochs as GroupOldEpochRecord[]
-        : [];
-      const remaining = oldEpochs.filter((old) => Number(old.updated_at ?? old.expires_at ?? 0) >= cutoffMs);
-      const removed = oldEpochs.length - remaining.length;
-
-      if (removed > 0) {
-        entry.old_epochs = remaining;
-        await this._saveSingleGroupEntryUnlocked(aid, groupId, entry);
+      let removed = 0;
+      for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_OLD_EPOCHS, groupOldPrefix(aid, groupId))) {
+        if (!isRecord(item.value)) continue;
+        if (Number(item.value.updated_at ?? 0) <= cutoffMs) {
+          await idbDelete(STORE_GROUP_OLD_EPOCHS, item.key);
+          removed += 1;
+        }
       }
       return removed;
+    });
+  }
+
+  async loadGroupSecretEpoch(aid: string, groupId: string, epoch?: number | null): Promise<GroupSecretRecord | null> {
+    return this._withAidLock(aid, async () => {
+      await this._migrateLegacyStructuredStateUnlocked(aid);
+      const current = await idbGet<JsonObject>(STORE_GROUP_CURRENT, groupCurrentStoreKey(aid, groupId));
+      if (isRecord(current)) {
+        const record = deepClone(current) as GroupSecretRecord;
+        delete record.group_id;
+        if (epoch === undefined || epoch === null || Number(record.epoch ?? 0) === Number(epoch)) {
+          return record;
+        }
+      } else if (epoch === undefined || epoch === null) {
+        return null;
+      }
+      const old = await idbGet<JsonObject>(STORE_GROUP_OLD_EPOCHS, groupOldStoreKey(aid, groupId, Number(epoch)));
+      if (!isRecord(old)) return null;
+      const record = deepClone(old) as GroupSecretRecord;
+      delete record.group_id;
+      return record;
+    });
+  }
+
+  async loadGroupSecretEpochs(aid: string, groupId: string): Promise<GroupSecretRecord[]> {
+    return this._withAidLock(aid, async () => {
+      await this._migrateLegacyStructuredStateUnlocked(aid);
+      const result: GroupSecretRecord[] = [];
+      const current = await idbGet<JsonObject>(STORE_GROUP_CURRENT, groupCurrentStoreKey(aid, groupId));
+      if (isRecord(current)) {
+        const record = deepClone(current) as GroupSecretRecord;
+        delete record.group_id;
+        result.push(record);
+      }
+      for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_OLD_EPOCHS, groupOldPrefix(aid, groupId))) {
+        if (!isRecord(item.value)) continue;
+        const record = deepClone(item.value) as GroupSecretRecord;
+        delete record.group_id;
+        result.push(record);
+      }
+      return result;
+    });
+  }
+
+  async storeGroupSecretTransition(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): Promise<boolean> {
+    return this._withAidLock(aid, async () => {
+      await this._migrateLegacyStructuredStateUnlocked(aid);
+      return this._storeGroupSecretTransitionUnlocked(aid, groupId, opts);
+    });
+  }
+
+  async storeGroupSecretEpoch(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): Promise<boolean> {
+    return this._withAidLock(aid, async () => {
+      await this._migrateLegacyStructuredStateUnlocked(aid);
+      return this._storeGroupSecretEpochUnlocked(aid, groupId, opts);
+    });
+  }
+
+  async discardPendingGroupSecretState(aid: string, groupId: string, epoch: number, rotationId: string): Promise<boolean> {
+    return this._withAidLock(aid, async () => {
+      const rid = String(rotationId ?? '').trim();
+      if (!rid) return false;
+      await this._migrateLegacyStructuredStateUnlocked(aid);
+      return this._discardPendingGroupSecretUnlocked(aid, groupId, epoch, rid);
     });
   }
 
@@ -868,7 +949,7 @@ export class IndexedDBKeyStore implements KeyStore {
     }
 
     if ('group_secrets' in metadata && isRecord(metadata.group_secrets)) {
-      await this._replaceGroupEntriesUnlocked(aid, metadata.group_secrets as GroupSecretMap);
+      await this._replaceGroupEntriesUnlocked(aid, metadata.group_secrets as LegacyGroupSecretMap);
     }
 
     if ('e2ee_sessions' in metadata && Array.isArray(metadata.e2ee_sessions)) {
@@ -1007,8 +1088,8 @@ export class IndexedDBKeyStore implements KeyStore {
     }
   }
 
-  private async _loadGroupEntriesUnlocked(aid: string): Promise<GroupSecretMap> {
-    const result: GroupSecretMap = {};
+  private async _loadGroupEntriesUnlocked(aid: string): Promise<LegacyGroupSecretMap> {
+    const result: LegacyGroupSecretMap = {};
 
     for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_CURRENT, groupCurrentPrefix(aid))) {
       if (!isRecord(item.value)) continue;
@@ -1043,7 +1124,7 @@ export class IndexedDBKeyStore implements KeyStore {
 
   private async _replaceGroupEntriesUnlocked(
     aid: string,
-    groups: GroupSecretMap,
+    groups: LegacyGroupSecretMap,
   ): Promise<void> {
     const desiredGroups = new Set(Object.keys(groups));
     for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_CURRENT, groupCurrentPrefix(aid))) {
@@ -1101,6 +1182,277 @@ export class IndexedDBKeyStore implements KeyStore {
         group_id: groupId,
       });
     }
+  }
+
+  private async _storeGroupSecretTransitionUnlocked(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): Promise<boolean> {
+    const currentKey = groupCurrentStoreKey(aid, groupId);
+    const currentRaw = await idbGet<JsonObject>(STORE_GROUP_CURRENT, currentKey);
+    const now = Date.now();
+    const epoch = Number(opts.epoch);
+    const members = [...(opts.memberAids ?? [])].map((item) => String(item)).sort();
+    const pendingRotationId = String(opts.pendingRotationId ?? '').trim();
+
+    if (isRecord(currentRaw)) {
+      const current = deepClone(currentRaw) as GroupSecretRecord;
+      delete current.group_id;
+      const localEpoch = Number(current.epoch ?? 0);
+      if (epoch < localEpoch) return false;
+      if (epoch === localEpoch && typeof current.secret === 'string') {
+        if (current.secret !== opts.secret) {
+          if (String(current.pending_rotation_id ?? '').trim()) {
+            await idbPut(STORE_GROUP_CURRENT, currentKey, {
+              ...this._buildGroupCurrentRecord(groupId, opts, members, now),
+            });
+            return true;
+          }
+          return false;
+        }
+
+        const updated: GroupSecretRecord = { ...current };
+        let changed = false;
+        const oldMembers = Array.isArray(updated.member_aids) ? updated.member_aids.map(String).sort() : [];
+        if (members.length > 0 && JSON.stringify(oldMembers) !== JSON.stringify(members)) {
+          updated.member_aids = members;
+          updated.commitment = opts.commitment;
+          updated.updated_at = now;
+          changed = true;
+        }
+        if (opts.epochChain !== undefined && updated.epoch_chain !== opts.epochChain) {
+          updated.epoch_chain = opts.epochChain;
+          updated.updated_at = now;
+          changed = true;
+        }
+        if (opts.epochChainUnverified === true) {
+          if (updated.epoch_chain_unverified !== true) {
+            updated.epoch_chain_unverified = true;
+            changed = true;
+          }
+          if (opts.epochChainUnverifiedReason && updated.epoch_chain_unverified_reason !== opts.epochChainUnverifiedReason) {
+            updated.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+            changed = true;
+          }
+        } else if (opts.epochChainUnverified === false) {
+          if ('epoch_chain_unverified' in updated || 'epoch_chain_unverified_reason' in updated) {
+            delete updated.epoch_chain_unverified;
+            delete updated.epoch_chain_unverified_reason;
+            changed = true;
+          }
+        }
+        if (pendingRotationId && updated.pending_rotation_id !== pendingRotationId) {
+          updated.pending_rotation_id = pendingRotationId;
+          updated.pending_created_at = now;
+          changed = true;
+        }
+        if (!pendingRotationId && updated.pending_rotation_id) {
+          delete updated.pending_rotation_id;
+          delete updated.pending_created_at;
+          changed = true;
+        }
+        if (changed) {
+          await idbPut(STORE_GROUP_CURRENT, currentKey, { ...updated, group_id: groupId });
+        }
+        return true;
+      }
+
+      if (localEpoch !== epoch) {
+        const oldEntry = { ...current };
+        oldEntry.expires_at = Number(current.updated_at ?? now) + opts.oldEpochRetentionMs;
+        await idbPut(STORE_GROUP_OLD_EPOCHS, groupOldStoreKey(aid, groupId, localEpoch), {
+          ...oldEntry,
+          group_id: groupId,
+        });
+      }
+    }
+
+    await idbPut(STORE_GROUP_CURRENT, currentKey, {
+      ...this._buildGroupCurrentRecord(groupId, opts, members, now),
+    });
+    return true;
+  }
+
+  private async _storeGroupSecretEpochUnlocked(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): Promise<boolean> {
+    const now = Date.now();
+    const epoch = Number(opts.epoch);
+    const members = [...(opts.memberAids ?? [])].map((item) => String(item)).sort();
+    const pendingRotationId = String(opts.pendingRotationId ?? '').trim();
+    const currentKey = groupCurrentStoreKey(aid, groupId);
+    const currentRaw = await idbGet<JsonObject>(STORE_GROUP_CURRENT, currentKey);
+    const newRecord = this._buildGroupCurrentRecord(groupId, opts, members, now);
+
+    if (!isRecord(currentRaw)) {
+      await idbPut(STORE_GROUP_CURRENT, currentKey, newRecord);
+      return true;
+    }
+
+    const current = deepClone(currentRaw) as GroupSecretRecord;
+    delete current.group_id;
+    const localEpoch = Number(current.epoch ?? 0);
+    if (epoch > localEpoch) return false;
+
+    if (epoch === localEpoch) {
+      if (typeof current.secret === 'string' && current.secret !== opts.secret) {
+        if (!String(current.pending_rotation_id ?? '').trim()) return false;
+        await idbPut(STORE_GROUP_CURRENT, currentKey, newRecord);
+        return true;
+      }
+      const updated: GroupSecretRecord = { ...current };
+      let changed = false;
+      const oldMembers = Array.isArray(updated.member_aids) ? updated.member_aids.map(String).sort() : [];
+      if (members.length > 0 && JSON.stringify(oldMembers) !== JSON.stringify(members)) {
+        updated.member_aids = members;
+        updated.commitment = opts.commitment;
+        updated.updated_at = now;
+        changed = true;
+      }
+      if (opts.epochChain !== undefined && updated.epoch_chain !== opts.epochChain) {
+        updated.epoch_chain = opts.epochChain;
+        updated.updated_at = now;
+        changed = true;
+      }
+      if (opts.epochChainUnverified === true) {
+        if (updated.epoch_chain_unverified !== true) {
+          updated.epoch_chain_unverified = true;
+          changed = true;
+        }
+        if (opts.epochChainUnverifiedReason && updated.epoch_chain_unverified_reason !== opts.epochChainUnverifiedReason) {
+          updated.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+          changed = true;
+        }
+      } else if (opts.epochChainUnverified === false) {
+        if ('epoch_chain_unverified' in updated || 'epoch_chain_unverified_reason' in updated) {
+          delete updated.epoch_chain_unverified;
+          delete updated.epoch_chain_unverified_reason;
+          changed = true;
+        }
+      }
+      if (pendingRotationId && updated.pending_rotation_id !== pendingRotationId) {
+        updated.pending_rotation_id = pendingRotationId;
+        updated.pending_created_at = now;
+        changed = true;
+      }
+      if (!pendingRotationId && updated.pending_rotation_id) {
+        delete updated.pending_rotation_id;
+        delete updated.pending_created_at;
+        changed = true;
+      }
+      if (changed) await idbPut(STORE_GROUP_CURRENT, currentKey, { ...updated, group_id: groupId });
+      return true;
+    }
+
+    const oldKey = groupOldStoreKey(aid, groupId, epoch);
+    const oldRaw = await idbGet<JsonObject>(STORE_GROUP_OLD_EPOCHS, oldKey);
+    if (isRecord(oldRaw)) {
+      const old = deepClone(oldRaw) as GroupSecretRecord;
+      if (typeof old.secret === 'string' && old.secret !== opts.secret) return false;
+    }
+    await idbPut(STORE_GROUP_OLD_EPOCHS, oldKey, {
+      ...newRecord,
+      epoch,
+      expires_at: now + opts.oldEpochRetentionMs,
+    });
+    return true;
+  }
+
+  private async _discardPendingGroupSecretUnlocked(
+    aid: string,
+    groupId: string,
+    epoch: number,
+    rotationId: string,
+  ): Promise<boolean> {
+    const currentKey = groupCurrentStoreKey(aid, groupId);
+    const currentRaw = await idbGet<JsonObject>(STORE_GROUP_CURRENT, currentKey);
+    if (!isRecord(currentRaw)) return false;
+    const current = deepClone(currentRaw) as GroupSecretRecord;
+    if (Number(current.epoch ?? 0) !== Number(epoch)) return false;
+    if (String(current.pending_rotation_id ?? '').trim() !== rotationId) return false;
+
+    let restored: GroupSecretRecord | null = null;
+    let restoredKey = '';
+    for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_OLD_EPOCHS, groupOldPrefix(aid, groupId))) {
+      if (!isRecord(item.value)) continue;
+      const old = deepClone(item.value) as GroupSecretRecord;
+      const oldEpoch = Number(old.epoch ?? 0);
+      if (oldEpoch >= Number(epoch) || !old.secret) continue;
+      if (!restored || oldEpoch > Number(restored.epoch ?? 0)) {
+        restored = old;
+        restoredKey = item.key;
+      }
+    }
+    if (!restored) {
+      await idbDelete(STORE_GROUP_CURRENT, currentKey);
+      for (const item of await idbGetAllByPrefix<JsonObject>(STORE_GROUP_OLD_EPOCHS, groupOldPrefix(aid, groupId))) {
+        await idbDelete(STORE_GROUP_OLD_EPOCHS, item.key);
+      }
+      return true;
+    }
+    delete restored.group_id;
+    delete restored.expires_at;
+    await idbPut(STORE_GROUP_CURRENT, currentKey, { ...restored, group_id: groupId, updated_at: Date.now() });
+    if (restoredKey) await idbDelete(STORE_GROUP_OLD_EPOCHS, restoredKey);
+    return true;
+  }
+
+  private _buildGroupCurrentRecord(
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      pendingRotationId?: string;
+      epochChain?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+    },
+    memberAids: string[],
+    now: number,
+  ): GroupSecretRecord {
+    const record: GroupSecretRecord = {
+      group_id: groupId,
+      epoch: opts.epoch,
+      secret: opts.secret,
+      commitment: opts.commitment,
+      member_aids: memberAids,
+      updated_at: now,
+    };
+    if (opts.epochChain !== undefined) record.epoch_chain = opts.epochChain;
+    const pendingRotationId = String(opts.pendingRotationId ?? '').trim();
+    if (pendingRotationId) {
+      record.pending_rotation_id = pendingRotationId;
+      record.pending_created_at = now;
+    }
+    if (opts.epochChainUnverified === true) {
+      record.epoch_chain_unverified = true;
+      if (opts.epochChainUnverifiedReason) record.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+    }
+    return record;
   }
 
   private _mergeGroupEntryFromLegacy(

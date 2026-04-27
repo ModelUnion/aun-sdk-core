@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/core.node",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "AUN Protocol Core SDK for Node.js",
   "type": "module",
   "main": "dist/index.js",
@@ -23,6 +23,10 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration/e2ee.test.ts",
+    "test:e2e": "vitest run tests/e2e/group-e2ee.test.ts",
+    "test:federation": "vitest run tests/integration/federation.test.ts tests/integration/federation-storage.test.ts",
     "test:watch": "vitest"
   },
   "dependencies": {

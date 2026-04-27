@@ -21,7 +21,7 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 | 文档 | 内容 |
 |------|------|
 | [00-总览与分层.md](00-总览与分层.md) | 协议目标、核心原则、四层架构、三种连接模式总览、文档导航 |
-| [02-证书与信任体系.md](02-证书与信任体系.md) | AID 身份、四级证书链、信任模型、吊销机制（CRL/OCSP） |
+| [02-证书与信任体系.md](02-证书与信任体系.md) | AID 身份、四级证书链、信任模型、吊销机制（CRL/OCSP）、CT 概述 |
 | [09-安全考虑.md](09-安全考虑.md) | 威胁模型、防护措施、责任边界、连接升级安全、验签时序 |
 
 ### 子协议
@@ -37,7 +37,7 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 
 | 文档 | 内容 |
 |------|------|
-| [06-服务协议.md](06-服务协议.md) | 业务层方法：message.* / meta.* / search.* / task.* / 跨域消息路由 / E2EE 摘要 |
+| [06-服务协议.md](06-服务协议.md) | 业务层方法：message.* / meta.* / search.* / task.* / 跨域消息路由 / E2EE 摘要 / `pki.{issuer}` 与 `ct.{issuer}` 公开端点 |
 | [07-错误码与状态机.md](07-错误码与状态机.md) | 错误码分层汇总、各模式状态机、可重试/不可重试分类 |
 | [08-AUN-E2EE.md](08-AUN-E2EE.md) | 端到端加密安全层：密文格式、签名、防重放、prekey 管理（横跨三种模式） |
 | [08-AUN-E2EE-Group.md](08-AUN-E2EE-Group.md) | 群组 E2EE：Epoch Group Key、Membership Commitment、密钥分发与恢复 |
@@ -49,9 +49,9 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 | A | [附录A-术语表.md](附录A-术语表.md) | 核心术语、命名规范 |
 | B | [附录B-扩展性指南.md](附录B-扩展性指南.md) | 可选命名空间、自定义协议 |
 | C | [附录C-私钥管理与身份恢复.md](附录C-私钥管理与身份恢复.md) | 私钥管理、社交恢复 |
-| D | [附录D-Root_CA_治理机制.md](附录D-Root_CA_治理机制.md) | 根证书管理局治理 |
+| D | [附录D-Root_CA_治理机制.md](附录D-Root_CA_治理机制.md) | 根证书管理局治理、CT 通用模型 |
 | E | [附录E-Root_CA_准入流程.md](附录E-Root_CA_准入流程.md) | Root CA 准入流程 |
-| F | [附录F-Issuer_CA_申请流程.md](附录F-Issuer_CA_申请流程.md) | Issuer CA 证书申请 |
+| F | [附录F-Issuer_CA_申请流程.md](附录F-Issuer_CA_申请流程.md) | Issuer CA 证书申请、Issuer CT 服务要求 |
 | G | [附录G-AID_孤儿预防与救援机制.md](附录G-AID_孤儿预防与救援机制.md) | 孤儿 AID 预防与救援 |
 | H | [附录H-Identity服务实现指南.md](附录H-Identity服务实现指南.md) | Auth 服务实现 |
 | I | [附录I-跨域消息路由实现指南.md](附录I-跨域消息路由实现指南.md) | 跨域消息路由实现 |

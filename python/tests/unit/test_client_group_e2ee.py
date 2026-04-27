@@ -25,11 +25,12 @@ from aun_core.e2ee import (
     load_group_secret,
     store_group_secret,
 )
-from aun_core.errors import E2EEGroupSecretMissingError
+from aun_core.errors import E2EEGroupSecretMissingError, StateError
 
 
 _AID_ALICE = "alice.agentid.pub"
 _AID_BOB = "bob.agentid.pub"
+_AID_CAROL = "carol.agentid.pub"
 _GRP = "grp_test1"
 _MEMBERS = [_AID_ALICE, _AID_BOB]
 
@@ -130,6 +131,213 @@ class TestGroupSendEncrypt:
         assert p["payload"]["type"] == "e2ee.group_encrypted"
         assert p["payload"]["encryption_mode"] == "epoch_group_key"
 
+    def test_plaintext_group_send_waits_for_membership_floor(self, tmp_path, monkeypatch):
+        """明文群消息也必须等待成员 epoch floor，避免服务端拒绝旧 epoch。"""
+        client = _make_client(tmp_path)
+        call_order = []
+
+        async def fake_wait(group_id, *, timeout_s, strict=False):
+            call_order.append(("wait", group_id, strict))
+
+        async def fake_transport(method, params):
+            call_order.append(("send", method, params.get("group_id")))
+            return {"ok": True}
+
+        monkeypatch.setattr(client, "_wait_for_group_membership_epoch_floor", fake_wait)
+        monkeypatch.setattr(client._transport, "call", fake_transport)
+
+        asyncio.run(client.call("group.send", {
+            "group_id": _GRP,
+            "payload": {"type": "text", "text": "明文"},
+            "encrypt": False,
+        }))
+
+        assert call_order[0] == ("wait", _GRP, True)
+        assert call_order[1] == ("send", "group.send", _GRP)
+
+    def test_membership_floor_strict_timeout_raises(self, tmp_path, monkeypatch):
+        """strict 模式下 committed epoch 未追上成员 floor 时拒绝发送。"""
+        client = _make_client(tmp_path)
+
+        async def fake_call(method, params=None):
+            if method == "group.e2ee.get_epoch":
+                return {"epoch": 1, "committed_epoch": 1}
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner", "min_read_epoch": 1},
+                    {"aid": _AID_BOB, "role": "member", "min_read_epoch": 2},
+                ]}
+            raise AssertionError(f"unmocked: {method}")
+
+        monkeypatch.setattr(client, "call", fake_call)
+
+        with pytest.raises(StateError, match="membership floor 2"):
+            asyncio.run(client._wait_for_group_membership_epoch_floor(
+                _GRP,
+                timeout_s=0.0,
+                strict=True,
+            ))
+
+    def test_group_send_refuses_uncommitted_pending_secret(self, tmp_path, monkeypatch):
+        """本地 pending epoch key 与服务端 committed rotation 不匹配时不得用于发送。"""
+        client = _make_client(tmp_path)
+        old_secret = _store_secret_for_client(client, epoch=1)
+        pending_secret = secrets.token_bytes(32)
+        pending_commitment = compute_membership_commitment(_MEMBERS, 2, _GRP, pending_secret)
+        store_group_secret(
+            client._keystore,
+            client._aid,
+            _GRP,
+            2,
+            pending_secret,
+            pending_commitment,
+            _MEMBERS,
+            pending_rotation_id="rot-local-pending",
+            allow_pending_overwrite=True,
+        )
+        assert old_secret
+        client._group_synced.add(_GRP)
+
+        async def no_wait(*args, **kwargs):
+            return None
+
+        async def no_recover(*args, **kwargs):
+            return False
+
+        async def fake_transport(method, params):
+            if method == "group.e2ee.get_epoch":
+                return {
+                    "epoch": 2,
+                    "committed_epoch": 2,
+                    "committed_rotation": {
+                        "rotation_id": "rot-other",
+                        "key_commitment": "other-commitment",
+                    },
+                }
+            if method == "group.send":
+                raise AssertionError("不应使用未提交或不匹配的 pending key 发送群消息")
+            return {}
+
+        monkeypatch.setattr(client, "_wait_for_group_membership_epoch_floor", no_wait)
+        monkeypatch.setattr(client, "_recover_group_epoch_key", no_recover)
+        monkeypatch.setattr(client._transport, "call", fake_transport)
+
+        with pytest.raises(StateError, match="refuse to send with uncommitted group key"):
+            asyncio.run(client.call("group.send", {
+                "group_id": _GRP,
+                "payload": {"type": "text", "text": "should not send"},
+                "encrypt": True,
+            }))
+
+    def test_group_send_refuses_commitment_mismatch_without_pending_marker(self, tmp_path, monkeypatch):
+        """本地 target epoch 没有 pending 标记时仍必须匹配 committed key_commitment。"""
+        client = _make_client(tmp_path)
+        wrong_secret = secrets.token_bytes(32)
+        wrong_commitment = compute_membership_commitment(_MEMBERS, 2, _GRP, wrong_secret)
+        store_group_secret(
+            client._keystore,
+            client._aid,
+            _GRP,
+            2,
+            wrong_secret,
+            wrong_commitment,
+            _MEMBERS,
+        )
+        client._group_synced.add(_GRP)
+
+        async def no_wait(*args, **kwargs):
+            return None
+
+        async def no_recover(*args, **kwargs):
+            return False
+
+        async def fake_transport(method, params):
+            if method == "group.e2ee.get_epoch":
+                return {
+                    "epoch": 2,
+                    "committed_epoch": 2,
+                    "committed_rotation": {
+                        "rotation_id": "rot-committed",
+                        "key_commitment": "different-commitment",
+                    },
+                }
+            if method == "group.send":
+                raise AssertionError("commitment 不匹配时不得发送")
+            return {}
+
+        monkeypatch.setattr(client, "_wait_for_group_membership_epoch_floor", no_wait)
+        monkeypatch.setattr(client, "_recover_group_epoch_key", no_recover)
+        monkeypatch.setattr(client._transport, "call", fake_transport)
+
+        with pytest.raises(StateError, match="refuse to send with uncommitted group key"):
+            asyncio.run(client.call("group.send", {
+                "group_id": _GRP,
+                "payload": {"type": "text", "text": "blocked"},
+                "encrypt": True,
+            }))
+
+    def test_group_send_rechecks_committed_epoch_after_recovery_wait(self, tmp_path, monkeypatch):
+        """恢复等待期间服务端 epoch 再推进时，应改用最新 committed epoch 发送。"""
+        client = _make_client(tmp_path)
+        client._group_synced.add(_GRP)
+        c2 = "commitment-2"
+        get_epoch_calls = 0
+        sent_params = {}
+        recovered_epochs = []
+
+        async def no_wait(*args, **kwargs):
+            return None
+
+        async def fake_recover(group_id, epoch, **kwargs):
+            recovered_epochs.append(epoch)
+            return True
+
+        def fake_load_secret(group_id, epoch=None):
+            if epoch == 1:
+                return {"epoch": 1, "pending_rotation_id": "rot-local-1", "commitment": "c1"}
+            if epoch == 2:
+                return {"epoch": 2, "pending_rotation_id": "rot-2", "commitment": c2}
+            return None
+
+        def fake_encrypt_with_epoch(group_id, epoch, payload):
+            return {"type": "e2ee.group_encrypted", "epoch": epoch, "payload": payload}
+
+        async def fake_transport(method, params):
+            nonlocal get_epoch_calls
+            if method == "group.e2ee.get_epoch":
+                get_epoch_calls += 1
+                if get_epoch_calls == 1:
+                    return {
+                        "epoch": 1,
+                        "committed_epoch": 1,
+                        "committed_rotation": {"rotation_id": "rot-other", "key_commitment": "other"},
+                    }
+                return {
+                    "epoch": 2,
+                    "committed_epoch": 2,
+                    "committed_rotation": {"rotation_id": "rot-2", "key_commitment": c2},
+                }
+            if method == "group.send":
+                sent_params.update(params)
+                return {"ok": True}
+            return {}
+
+        monkeypatch.setattr(client, "_ensure_group_epoch_ready", no_wait)
+        monkeypatch.setattr(client, "_wait_for_group_membership_epoch_floor", no_wait)
+        monkeypatch.setattr(client, "_recover_group_epoch_key", fake_recover)
+        monkeypatch.setattr(client._group_e2ee, "load_secret", fake_load_secret)
+        monkeypatch.setattr(client._group_e2ee, "encrypt_with_epoch", fake_encrypt_with_epoch)
+        monkeypatch.setattr(client._transport, "call", fake_transport)
+
+        asyncio.run(client.call("group.send", {
+            "group_id": _GRP,
+            "payload": {"type": "text", "text": "use latest epoch"},
+            "encrypt": True,
+        }))
+
+        assert sent_params["payload"]["epoch"] == 2
+        assert recovered_epochs == [1, 2]
+
     def test_without_secret_raises_error(self, tmp_path, monkeypatch):
         """无 group_secret 时抛 E2EEGroupSecretMissingError"""
         client = _make_client(tmp_path)
@@ -207,7 +415,7 @@ class TestGroupMessageAutoDecrypt:
 # ── 密钥分发自动处理 ─────────────────────────────────────
 
 class TestKeyDistributionAutoHandled:
-    def test_distribution_handled(self, tmp_path):
+    def test_distribution_handled(self, tmp_path, monkeypatch):
         """收到 e2ee.group_key_distribution P2P 消息 → 自动存储"""
         client = _make_client(tmp_path, aid=_AID_BOB)
         gs = generate_group_secret()
@@ -225,6 +433,12 @@ class TestKeyDistributionAutoHandled:
             "message_id": "msg-dist-1",
             "payload": dist,
         }
+
+        async def fake_call(method, params):
+            assert method == "group.e2ee.get_epoch"
+            return {"epoch": 1, "committed_epoch": 1}
+
+        monkeypatch.setattr(client, "call", fake_call)
 
         handled = asyncio.run(client._try_handle_group_key_message(message))
         assert handled is True
@@ -474,25 +688,44 @@ class TestZeroStateKeyRecovery:
 
 
 # ══════════════════════════════════════════════════════════════
-# CAS 轮换链路测试
+# 两阶段轮换链路测试
 # ══════════════════════════════════════════════════════════════
 
 class TestRotateGroupEpochCAS:
-    """_rotate_group_epoch 必须走服务端 CAS，不能绕过。"""
+    """_rotate_group_epoch 必须走服务端两阶段轮换，不能绕过。"""
 
     def _setup(self, tmp_path, monkeypatch):
         client = _make_client(tmp_path, aid=_AID_ALICE)
         _store_secret_for_client(client, epoch=1)
         rpc_log = []
+        active_rotation = {}
 
         async def fake_call(method, params=None):
+            params = params or {}
             rpc_log.append({"method": method, "params": params})
             if method == "group.e2ee.get_epoch":
-                return {"epoch": 1, "group_id": _GRP}
-            if method == "group.e2ee.rotate_epoch":
-                current = params.get("current_epoch", 0)
-                # 模拟 CAS 成功
-                return {"success": True, "epoch": current + 1, "group_id": _GRP}
+                return {"epoch": 1, "committed_epoch": 1, "group_id": _GRP}
+            if method == "group.e2ee.begin_rotation":
+                active_rotation.clear()
+                active_rotation.update({
+                    "rotation_id": params.get("rotation_id", "rot-test"),
+                    "group_id": _GRP,
+                    "base_epoch": params.get("base_epoch", 1),
+                    "target_epoch": params.get("target_epoch", 2),
+                    "status": "distributing",
+                    "key_commitment": params.get("key_commitment", ""),
+                })
+                return {"success": True, "rotation": dict(active_rotation)}
+            if method == "group.e2ee.heartbeat_rotation":
+                return {"success": True, "rotation": dict(active_rotation)}
+            if method == "group.e2ee.ack_rotation_key":
+                return {"success": True}
+            if method == "group.e2ee.commit_rotation":
+                return {
+                    "success": True,
+                    "epoch": active_rotation.get("target_epoch", 2),
+                    "rotation": {**active_rotation, "status": "committed"},
+                }
             if method == "group.get_members":
                 return {"members": [
                     {"aid": _AID_ALICE, "role": "owner"},
@@ -506,20 +739,23 @@ class TestRotateGroupEpochCAS:
         return client, rpc_log
 
     def test_calls_cas_rpcs(self, tmp_path, monkeypatch):
-        """_rotate_group_epoch 必须依次调 get_epoch → rotate_epoch"""
+        """_rotate_group_epoch 必须依次调 get_epoch → begin → ack → commit"""
         client, rpc_log = self._setup(tmp_path, monkeypatch)
         asyncio.run(client._rotate_group_epoch(_GRP))
 
         methods = [r["method"] for r in rpc_log]
         assert "group.e2ee.get_epoch" in methods
-        assert "group.e2ee.rotate_epoch" in methods
-        # rotate_epoch 在 get_epoch 之后
+        assert "group.e2ee.begin_rotation" in methods
+        assert "group.e2ee.ack_rotation_key" in methods
+        assert "group.e2ee.commit_rotation" in methods
         idx_get = methods.index("group.e2ee.get_epoch")
-        idx_rotate = methods.index("group.e2ee.rotate_epoch")
-        assert idx_rotate > idx_get
+        idx_begin = methods.index("group.e2ee.begin_rotation")
+        idx_ack = methods.index("group.e2ee.ack_rotation_key")
+        idx_commit = methods.index("group.e2ee.commit_rotation")
+        assert idx_get < idx_begin < idx_ack < idx_commit
 
     def test_cas_success_distributes(self, tmp_path, monkeypatch):
-        """CAS 成功 → 本地存储新 epoch + 分发"""
+        """begin 成功 → 分发 → self-ack → commit → 本地 key 转为 committed"""
         client, rpc_log = self._setup(tmp_path, monkeypatch)
         asyncio.run(client._rotate_group_epoch(_GRP))
 
@@ -531,17 +767,23 @@ class TestRotateGroupEpochCAS:
         assert client._group_e2ee.current_epoch(_GRP) == 2
 
     def test_cas_failure_no_distribute(self, tmp_path, monkeypatch):
-        """CAS 失败 → 不生成、不分发、不存储"""
+        """begin 失败 → 不分发、不 ack、不 commit"""
         client = _make_client(tmp_path, aid=_AID_ALICE)
         _store_secret_for_client(client, epoch=1)
         rpc_log = []
 
         async def fake_call(method, params=None):
+            params = params or {}
             rpc_log.append({"method": method, "params": params})
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                ]}
             if method == "group.e2ee.get_epoch":
-                return {"epoch": 1, "group_id": _GRP}
-            if method == "group.e2ee.rotate_epoch":
-                return {"success": False, "epoch": 1, "group_id": _GRP}  # CAS 失败
+                return {"epoch": 1, "committed_epoch": 1, "group_id": _GRP}
+            if method == "group.e2ee.begin_rotation":
+                return {"success": False, "rotation": None}
             raise Exception(f"unmocked: {method}")
 
         monkeypatch.setattr(client, "call", fake_call)
@@ -550,8 +792,302 @@ class TestRotateGroupEpochCAS:
         # 不应有 message.send（不分发）
         sends = [r for r in rpc_log if r["method"] == "message.send"]
         assert len(sends) == 0
-        # 本地 epoch 未变
-        assert client._group_e2ee.current_epoch(_GRP) == 1
+        assert "group.e2ee.ack_rotation_key" not in [r["method"] for r in rpc_log]
+        assert "group.e2ee.commit_rotation" not in [r["method"] for r in rpc_log]
+
+    def test_membership_change_aborts_stale_pending_and_restarts(self, tmp_path, monkeypatch):
+        """pending 期间成员又变化：旧 expected_members 过期，应 abort 后用最新成员重新 begin。"""
+        client = _make_client(tmp_path, aid=_AID_ALICE)
+        _store_secret_for_client(client, epoch=1)
+        rpc_log = []
+        now_ms = int(time.time() * 1000)
+        old_pending = {
+            "rotation_id": "rot-old",
+            "group_id": _GRP,
+            "base_epoch": 1,
+            "target_epoch": 2,
+            "status": "distributing",
+            "expected_members": [_AID_ALICE, _AID_BOB],
+            "key_commitment": "old-commitment",
+            "lease_expires_at": now_ms + 60000,
+        }
+        active_rotation = {}
+
+        async def fake_call(method, params=None):
+            params = params or {}
+            rpc_log.append({"method": method, "params": params})
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                    {"aid": _AID_CAROL, "role": "member"},
+                ]}
+            if method == "group.e2ee.get_epoch":
+                return {
+                    "epoch": 1,
+                    "committed_epoch": 1,
+                    "pending_rotation": dict(old_pending),
+                }
+            if method == "group.e2ee.abort_rotation":
+                return {"success": True, "rotation": {**old_pending, "status": "aborted"}}
+            if method == "group.e2ee.begin_rotation":
+                active_rotation.clear()
+                active_rotation.update({
+                    "rotation_id": params["rotation_id"],
+                    "group_id": _GRP,
+                    "base_epoch": params["base_epoch"],
+                    "target_epoch": params["target_epoch"],
+                    "status": "distributing",
+                    "key_commitment": params["key_commitment"],
+                })
+                return {"success": True, "rotation": dict(active_rotation)}
+            if method == "message.send":
+                return {"ok": True}
+            if method == "group.e2ee.heartbeat_rotation":
+                return {"success": True, "rotation": dict(active_rotation)}
+            if method == "group.e2ee.ack_rotation_key":
+                return {"success": True}
+            if method == "group.e2ee.commit_rotation":
+                return {
+                    "success": True,
+                    "epoch": 2,
+                    "committed_epoch": 2,
+                    "rotation": {**active_rotation, "status": "committed"},
+                }
+            raise AssertionError(f"unmocked: {method}")
+
+        monkeypatch.setattr(client, "call", fake_call)
+        asyncio.run(client._rotate_group_epoch(
+            _GRP,
+            reason="membership_changed",
+            trigger_id="join-carol",
+            expected_epoch=1,
+        ))
+
+        methods = [r["method"] for r in rpc_log]
+        assert methods.index("group.e2ee.abort_rotation") < methods.index("group.e2ee.begin_rotation")
+        assert "group.e2ee.commit_rotation" in methods
+        abort_params = next(r["params"] for r in rpc_log if r["method"] == "group.e2ee.abort_rotation")
+        assert abort_params["rotation_id"] == "rot-old"
+        assert abort_params["reason"] == "membership_changed_during_rotation"
+
+        begin_params = next(r["params"] for r in rpc_log if r["method"] == "group.e2ee.begin_rotation")
+        assert begin_params["base_epoch"] == 1
+        assert begin_params["target_epoch"] == 2
+        assert begin_params["expected_members"] == sorted([_AID_ALICE, _AID_BOB, _AID_CAROL])
+        assert "join-carol" in client._group_membership_rotation_done
+
+    def test_membership_change_keeps_non_stale_pending_and_retries(self, tmp_path, monkeypatch):
+        """pending 的 expected_members 仍匹配当前成员时，不应抢跑新轮换，只排队重试。"""
+        client = _make_client(tmp_path, aid=_AID_ALICE)
+        _store_secret_for_client(client, epoch=1)
+        rpc_log = []
+        retry_calls = []
+        pending = {
+            "rotation_id": "rot-active",
+            "group_id": _GRP,
+            "base_epoch": 1,
+            "target_epoch": 2,
+            "status": "distributing",
+            "expected_members": [_AID_ALICE, _AID_BOB],
+            "lease_expires_at": int(time.time() * 1000) + 60000,
+        }
+
+        async def fake_call(method, params=None):
+            params = params or {}
+            rpc_log.append({"method": method, "params": params})
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                ]}
+            if method == "group.e2ee.get_epoch":
+                return {"epoch": 1, "committed_epoch": 1, "pending_rotation": dict(pending)}
+            raise AssertionError(f"unmocked: {method}")
+
+        def fake_schedule(group_id, **kwargs):
+            retry_calls.append({"group_id": group_id, **kwargs})
+
+        monkeypatch.setattr(client, "call", fake_call)
+        monkeypatch.setattr(client, "_schedule_group_rotation_retry", fake_schedule)
+        asyncio.run(client._rotate_group_epoch(
+            _GRP,
+            reason="membership_changed",
+            trigger_id="member-update",
+            expected_epoch=1,
+        ))
+
+        methods = [r["method"] for r in rpc_log]
+        assert "group.e2ee.abort_rotation" not in methods
+        assert "group.e2ee.begin_rotation" not in methods
+        assert "message.send" not in methods
+        assert len(retry_calls) == 1
+        assert retry_calls[0]["pending"]["rotation_id"] == "rot-active"
+
+    def test_begin_race_with_stale_pending_aborts_and_schedules_retry(self, tmp_path, monkeypatch):
+        """get_epoch 未见 pending，但 begin 时撞上 stale pending：应 abort 并排队重试，不能分发新 key。"""
+        client = _make_client(tmp_path, aid=_AID_ALICE)
+        _store_secret_for_client(client, epoch=1)
+        rpc_log = []
+        retry_calls = []
+        stale_rotation = {
+            "rotation_id": "rot-race-stale",
+            "group_id": _GRP,
+            "base_epoch": 1,
+            "target_epoch": 2,
+            "status": "distributing",
+            "expected_members": [_AID_ALICE, _AID_BOB],
+            "lease_expires_at": int(time.time() * 1000) + 60000,
+        }
+
+        async def fake_call(method, params=None):
+            params = params or {}
+            rpc_log.append({"method": method, "params": params})
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                    {"aid": _AID_CAROL, "role": "member"},
+                ]}
+            if method == "group.e2ee.get_epoch":
+                return {"epoch": 1, "committed_epoch": 1, "pending_rotation": None}
+            if method == "group.e2ee.begin_rotation":
+                return {"success": False, "rotation": dict(stale_rotation)}
+            if method == "group.e2ee.abort_rotation":
+                return {"success": True, "rotation": {**stale_rotation, "status": "aborted"}}
+            raise AssertionError(f"unmocked: {method}")
+
+        def fake_schedule(group_id, **kwargs):
+            retry_calls.append({"group_id": group_id, **kwargs})
+
+        monkeypatch.setattr(client, "call", fake_call)
+        monkeypatch.setattr(client, "_schedule_group_rotation_retry", fake_schedule)
+        asyncio.run(client._rotate_group_epoch(
+            _GRP,
+            reason="membership_changed",
+            trigger_id="join-carol-race",
+            expected_epoch=1,
+        ))
+
+        methods = [r["method"] for r in rpc_log]
+        assert methods.index("group.e2ee.begin_rotation") < methods.index("group.e2ee.abort_rotation")
+        assert "message.send" not in methods
+        assert "group.e2ee.ack_rotation_key" not in methods
+        assert "group.e2ee.commit_rotation" not in methods
+        assert len(retry_calls) == 1
+        assert retry_calls[0]["pending"] is None
+
+        local_pending = client._group_e2ee.load_secret(_GRP, 2)
+        assert local_pending is None
+        assert client._group_e2ee.load_secret(_GRP, 1) is not None
+
+    def test_distribution_failure_aborts_before_ack_or_commit(self, tmp_path, monkeypatch):
+        """begin 成功但 key 分发失败：必须 abort，不能 self-ack 或 commit。"""
+        client = _make_client(tmp_path, aid=_AID_ALICE)
+        _store_secret_for_client(client, epoch=1)
+        rpc_log = []
+        retry_calls = []
+        active_rotation = {}
+
+        async def fake_call(method, params=None):
+            params = params or {}
+            rpc_log.append({"method": method, "params": params})
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                ]}
+            if method == "group.e2ee.get_epoch":
+                return {"epoch": 1, "committed_epoch": 1}
+            if method == "group.e2ee.begin_rotation":
+                active_rotation.update({
+                    "rotation_id": params["rotation_id"],
+                    "group_id": _GRP,
+                    "base_epoch": 1,
+                    "target_epoch": 2,
+                    "status": "distributing",
+                    "key_commitment": params["key_commitment"],
+                })
+                return {"success": True, "rotation": dict(active_rotation)}
+            if method == "group.e2ee.abort_rotation":
+                return {"success": True, "rotation": {**active_rotation, "status": "aborted"}}
+            raise AssertionError(f"unmocked: {method}")
+
+        async def fake_distribute(info, *, rotation_id=""):
+            return {"sent": [], "failed": [_AID_BOB]}
+
+        def fake_schedule(group_id, **kwargs):
+            retry_calls.append({"group_id": group_id, **kwargs})
+
+        monkeypatch.setattr(client, "call", fake_call)
+        monkeypatch.setattr(client, "_distribute_group_epoch_key", fake_distribute)
+        monkeypatch.setattr(client, "_schedule_group_rotation_retry", fake_schedule)
+        asyncio.run(client._rotate_group_epoch(_GRP))
+
+        methods = [r["method"] for r in rpc_log]
+        assert "group.e2ee.abort_rotation" in methods
+        assert "group.e2ee.ack_rotation_key" not in methods
+        assert "group.e2ee.commit_rotation" not in methods
+        assert len(retry_calls) == 1
+        assert retry_calls[0]["pending"] is None
+
+    def test_commit_failure_keeps_pending_key_and_schedules_retry(self, tmp_path, monkeypatch):
+        """commit 失败后本地 target epoch 仍是 pending key，只能等待后续重试/恢复。"""
+        client = _make_client(tmp_path, aid=_AID_ALICE)
+        _store_secret_for_client(client, epoch=1)
+        rpc_log = []
+        retry_calls = []
+        active_rotation = {}
+
+        async def fake_call(method, params=None):
+            params = params or {}
+            rpc_log.append({"method": method, "params": params})
+            if method == "group.get_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner"},
+                    {"aid": _AID_BOB, "role": "member"},
+                ]}
+            if method == "group.e2ee.get_epoch":
+                return {"epoch": 1, "committed_epoch": 1}
+            if method == "group.e2ee.begin_rotation":
+                active_rotation.update({
+                    "rotation_id": params["rotation_id"],
+                    "group_id": _GRP,
+                    "base_epoch": 1,
+                    "target_epoch": 2,
+                    "status": "distributing",
+                    "key_commitment": params["key_commitment"],
+                })
+                return {"success": True, "rotation": dict(active_rotation)}
+            if method == "message.send":
+                return {"ok": True}
+            if method == "group.e2ee.heartbeat_rotation":
+                return {"success": True, "rotation": dict(active_rotation)}
+            if method == "group.e2ee.ack_rotation_key":
+                return {"success": True}
+            if method == "group.e2ee.commit_rotation":
+                return {
+                    "success": False,
+                    "reason": "missing_required_acks",
+                    "rotation": {**active_rotation, "status": "aborted"},
+                }
+            raise AssertionError(f"unmocked: {method}")
+
+        def fake_schedule(group_id, **kwargs):
+            retry_calls.append({"group_id": group_id, **kwargs})
+
+        monkeypatch.setattr(client, "call", fake_call)
+        monkeypatch.setattr(client, "_schedule_group_rotation_retry", fake_schedule)
+        asyncio.run(client._rotate_group_epoch(_GRP))
+
+        methods = [r["method"] for r in rpc_log]
+        assert "group.e2ee.commit_rotation" in methods
+        assert len(retry_calls) == 1
+        assert retry_calls[0]["pending"]["rotation_id"] == active_rotation["rotation_id"]
+
+        local_pending = client._group_e2ee.load_secret(_GRP, 2)
+        assert local_pending is None
+        assert client._group_e2ee.load_secret(_GRP, 1) is not None
 
     def test_kick_waits_for_member_removed_event_to_rotate(self, tmp_path, monkeypatch):
         """group.kick 成功返回后通过 RPC 兜底触发一次 CAS 轮换。"""
@@ -749,6 +1285,7 @@ class TestAutoOrchestrationAddMember:
         assert "message.send" in methods
         sends = [r for r in rpc_log if r["method"] == "message.send"]
         assert any(s["params"]["to"] == _AID_BOB for s in sends)
+        assert all(s["params"].get("persist_required") is True for s in sends)
 
         # 验证本地 member_aids 已更新
         local = client._group_e2ee.get_member_aids(_GRP)
@@ -809,6 +1346,7 @@ class TestAutoOrchestrationReview:
 
         sends = [r for r in rpc_log if r["method"] == "message.send"]
         assert len(sends) >= 1
+        assert all(s["params"].get("persist_required") is True for s in sends)
 
     def test_review_rejected_no_distribute(self, tmp_path, monkeypatch):
         """review_join_request rejected → 不分发"""
@@ -1421,3 +1959,215 @@ class TestGroupPushDecryptFailureAutoAck:
 
         # 没有 seq，contiguous 仍为 0，不应发送 ack
         assert len(client._ack_calls) == 0
+
+
+class TestGroupEpochRaceHardening:
+    def test_membership_trigger_id_prefers_aid_and_epoch_over_event_seq(self, tmp_path):
+        payload = {
+            "action": "member_added",
+            "event_seq": 101,
+            "member": {"aid": _AID_CAROL},
+            "old_epoch": 2,
+        }
+        assert AUNClient._membership_rotation_trigger_id(_GRP, payload) == (
+            f"{_GRP}:member_added:aid:{_AID_CAROL}:epoch:2"
+        )
+
+    def test_membership_trigger_id_batch_review_uses_approved_aid_set(self, tmp_path):
+        first = {
+            "action": "join_request_reviewed",
+            "status": "approved",
+            "old_epoch": 3,
+            "results": [
+                {"status": "approved", "request": {"aid": _AID_BOB}},
+                {"status": "rejected", "request": {"aid": "ignored.agentid.pub"}},
+            ],
+        }
+        second = {
+            **first,
+            "results": [{"status": "approved", "request": {"aid": _AID_CAROL}}],
+        }
+
+        assert AUNClient._membership_rotation_trigger_id(_GRP, first) == (
+            f"{_GRP}:join_request_reviewed:aid:{_AID_BOB}:epoch:3"
+        )
+        assert AUNClient._membership_rotation_trigger_id(_GRP, second) == (
+            f"{_GRP}:join_request_reviewed:aid:{_AID_CAROL}:epoch:3"
+        )
+
+    def test_retry_pending_decrypt_keeps_messages_enqueued_during_retry(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+        ns = f"group:{_GRP}"
+        first = {
+            "group_id": _GRP,
+            "seq": 1,
+            "payload": {"type": "e2ee.group_encrypted", "epoch": 1},
+        }
+        second = {
+            "group_id": _GRP,
+            "seq": 2,
+            "payload": {"type": "e2ee.group_encrypted", "epoch": 1},
+        }
+        client._pending_decrypt_msgs[ns] = [first]
+
+        async def fake_decrypt(msg, **kwargs):
+            client._enqueue_pending_decrypt(_GRP, second)
+            return {"group_id": _GRP, "seq": msg.get("seq"), "payload": {"type": "text"}, "e2ee": {"ok": True}}
+
+        monkeypatch.setattr(client, "_decrypt_group_message", fake_decrypt)
+
+        asyncio.run(client._retry_pending_decrypt_msgs(_GRP))
+
+        assert client._pending_decrypt_msgs[ns] == [second]
+
+    def test_distribution_without_rotation_id_rejects_future_epoch(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+
+        async def fake_call(method, params):
+            assert method == "group.e2ee.get_epoch"
+            return {"epoch": 1, "committed_epoch": 1, "pending_rotation": None}
+
+        monkeypatch.setattr(client, "call", fake_call)
+
+        accepted = asyncio.run(client._verify_active_group_rotation_distribution({
+            "type": "e2ee.group_key_distribution",
+            "group_id": _GRP,
+            "epoch": 2,
+            "commitment": "c2",
+        }))
+
+        assert accepted is False
+
+    def test_initial_epoch_zero_with_local_epoch_one_triggers_create_sync(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+        client._group_e2ee.create_epoch(_GRP, [_AID_ALICE])
+        sync_calls = []
+        get_epoch_calls = 0
+
+        async def fake_sync(group_id):
+            sync_calls.append(group_id)
+
+        async def fake_call(method, params):
+            nonlocal get_epoch_calls
+            assert method == "group.e2ee.get_epoch"
+            get_epoch_calls += 1
+            if get_epoch_calls == 1:
+                return {"epoch": 0, "committed_epoch": 0}
+            return {"epoch": 1, "committed_epoch": 1}
+
+        monkeypatch.setattr(client, "_sync_epoch_to_server", fake_sync)
+        monkeypatch.setattr(client, "call", fake_call)
+
+        asyncio.run(client._ensure_group_epoch_ready(_GRP, strict=False))
+
+        assert sync_calls == [_GRP]
+        assert get_epoch_calls == 2
+
+    def test_initial_epoch_zero_with_local_epoch_one_refuses_when_sync_not_completed(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+        client._group_e2ee.create_epoch(_GRP, [_AID_ALICE])
+
+        async def fake_sync(group_id):
+            return None
+
+        async def fake_call(method, params):
+            assert method == "group.e2ee.get_epoch"
+            return {"epoch": 0, "committed_epoch": 0}
+
+        monkeypatch.setattr(client, "_sync_epoch_to_server", fake_sync)
+        monkeypatch.setattr(client, "call", fake_call)
+
+        with pytest.raises(StateError, match="initial epoch sync has not completed"):
+            asyncio.run(client._ensure_group_epoch_ready(_GRP, strict=False))
+
+    def test_recover_group_epoch_key_ignores_stale_pending_secret(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+        get_epoch_calls = []
+        recovery_requests = []
+
+        monkeypatch.setattr(
+            client._group_e2ee,
+            "load_secret",
+            lambda group_id, epoch=None: {
+                "epoch": epoch,
+                "pending_rotation_id": "rot-stale",
+                "commitment": "c2",
+            },
+        )
+
+        async def fake_call(method, params):
+            assert method == "group.e2ee.get_epoch"
+            get_epoch_calls.append(params)
+            return {
+                "epoch": 2,
+                "committed_epoch": 2,
+                "committed_rotation": {
+                    "rotation_id": "rot-committed",
+                    "key_commitment": "c2",
+                },
+            }
+
+        async def fake_request(group_id, epoch, epoch_result):
+            recovery_requests.append((group_id, epoch, epoch_result))
+
+        monkeypatch.setattr(client, "call", fake_call)
+        monkeypatch.setattr(client, "_request_group_key_from_candidates", fake_request)
+
+        ok = asyncio.run(client._recover_group_epoch_key(_GRP, 2, timeout_s=0))
+
+        assert ok is False
+        assert get_epoch_calls
+        assert len(recovery_requests) == 1
+
+    def test_recover_group_epoch_key_schedules_pending_retry_after_poll_success(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+        ns = f"group:{_GRP}"
+        client._pending_decrypt_msgs[ns] = [{
+            "group_id": _GRP,
+            "seq": 7,
+            "payload": {"type": "e2ee.group_encrypted", "epoch": 2},
+        }]
+        load_calls = 0
+        scheduled = []
+
+        def fake_load_secret(group_id, epoch=None):
+            nonlocal load_calls
+            load_calls += 1
+            if load_calls == 1:
+                return None
+            return {"epoch": epoch, "commitment": "c2"}
+
+        async def fake_call(method, params):
+            assert method == "group.e2ee.get_epoch"
+            return {"epoch": 2, "committed_epoch": 2}
+
+        async def fake_request(group_id, epoch, epoch_result):
+            return None
+
+        monkeypatch.setattr(client._group_e2ee, "load_secret", fake_load_secret)
+        monkeypatch.setattr(client, "call", fake_call)
+        monkeypatch.setattr(client, "_request_group_key_from_candidates", fake_request)
+        monkeypatch.setattr(client, "_schedule_retry_pending_decrypt_msgs", lambda group_id: scheduled.append(group_id))
+
+        ok = asyncio.run(client._recover_group_epoch_key(_GRP, 2, timeout_s=0))
+
+        assert ok is True
+        assert scheduled == [_GRP]
+
+    def test_key_response_rejects_uncommitted_epoch(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+
+        async def fake_call(method, params):
+            assert method == "group.e2ee.get_epoch"
+            return {"epoch": 1, "committed_epoch": 1}
+
+        monkeypatch.setattr(client, "call", fake_call)
+
+        accepted = asyncio.run(client._verify_group_key_response_epoch({
+            "type": "e2ee.group_key_response",
+            "group_id": _GRP,
+            "epoch": 2,
+            "commitment": "c2",
+        }))
+
+        assert accepted is False

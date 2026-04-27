@@ -1,4 +1,4 @@
-﻿package keystore
+package keystore
 
 import (
 	"encoding/json"
@@ -26,8 +26,14 @@ func TestSQLiteInteropDriver(t *testing.T) {
 		if err := ks.SaveE2EEPrekey(aid, "go-prekey", "", map[string]any{"private_key_pem": "GO-PREKEY-SECRET", "created_at": int64(1)}); err != nil {
 			t.Fatalf("SaveE2EEPrekey: %v", err)
 		}
-		if err := ks.SaveGroupSecretState(aid, "go-group", map[string]any{"epoch": int64(1), "secret": "GO-GROUP-SECRET"}); err != nil {
-			t.Fatalf("SaveGroupSecretState: %v", err)
+		if ok, err := ks.StoreGroupSecretTransition(aid, "go-group", GroupSecretTransitionOptions{
+			Epoch:                   1,
+			Secret:                  "GO-GROUP-SECRET",
+			Commitment:              "go-commit",
+			MemberAIDs:              []string{aid},
+			OldEpochRetentionMillis: int64(7 * 24 * 3600 * 1000),
+		}); err != nil || !ok {
+			t.Fatalf("StoreGroupSecretTransition: ok=%v err=%v", ok, err)
 		}
 		if err := ks.SaveE2EESession(aid, "go-session", map[string]any{"secret": "GO-SESSION-SECRET"}); err != nil {
 			t.Fatalf("SaveE2EESession: %v", err)
@@ -37,9 +43,17 @@ func TestSQLiteInteropDriver(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LoadE2EEPrekeys: %v", err)
 		}
-		groups, err := ks.LoadAllGroupSecretStates(aid)
+		groupIDs, err := ks.ListGroupSecretIDs(aid)
 		if err != nil {
-			t.Fatalf("LoadAllGroupSecretStates: %v", err)
+			t.Fatalf("ListGroupSecretIDs: %v", err)
+		}
+		groups := map[string]map[string]any{}
+		for _, groupID := range groupIDs {
+			entry, err := ks.LoadGroupSecretEpoch(aid, groupID, nil)
+			if err != nil {
+				t.Fatalf("LoadGroupSecretEpoch(%s): %v", groupID, err)
+			}
+			groups[groupID] = entry
 		}
 		sessions, err := ks.LoadE2EESessions(aid)
 		if err != nil {

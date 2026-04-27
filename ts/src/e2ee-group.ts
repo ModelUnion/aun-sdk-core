@@ -14,8 +14,6 @@ import {
 } from './errors.js';
 import {
   isJsonObject,
-  type GroupOldEpochRecord,
-  type GroupSecretMap,
   type GroupSecretRecord,
   type IdentityRecord,
   type JsonObject,
@@ -27,6 +25,10 @@ export interface LoadedGroupSecret {
   secret: Buffer;
   commitment: string;
   member_aids: string[];
+  epoch_chain?: string;
+  pending_rotation_id?: string;
+  epoch_chain_unverified?: boolean;
+  epoch_chain_unverified_reason?: string;
 }
 
 // ── 辅助：证书 SHA-256 指纹 ──────────────────────────────────────
@@ -59,38 +61,116 @@ const AAD_MATCH_FIELDS_GROUP: readonly string[] = [
 /** 旧 epoch 默认保留 7 天 */
 const OLD_EPOCH_RETENTION_SECONDS = 7 * 24 * 3600;
 
-function loadKeyStoreGroupState(
+// ── Epoch Transcript Chain ────────────────────────────────────
+
+const EPOCH_CHAIN_GENESIS_PREFIX = Buffer.from('aun-epoch-chain:genesis', 'utf-8');
+
+/**
+ * 计算 Epoch Transcript Chain。
+ * genesis（prev_chain=null）使用固定前缀；后续 epoch 使用上一个 chain 的字节。
+ */
+export function computeEpochChain(
+  prevChain: string | null,
+  epoch: number,
+  commitment: string,
+  rotatorAid: string,
+): string {
+  const prefix = prevChain === null
+    ? EPOCH_CHAIN_GENESIS_PREFIX
+    : Buffer.from(prevChain, 'hex');
+  const epochBuf = Buffer.alloc(4);
+  epochBuf.writeUInt32BE(epoch, 0);
+  const data = Buffer.concat([
+    prefix,
+    epochBuf,
+    Buffer.from(commitment, 'utf-8'),
+    Buffer.from(rotatorAid, 'utf-8'),
+  ]);
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * 验证 Epoch Transcript Chain（常量时间比较）。
+ */
+export function verifyEpochChain(
+  epochChain: string,
+  prevChain: string | null,
+  epoch: number,
+  commitment: string,
+  rotatorAid: string,
+): boolean {
+  const expected = computeEpochChain(prevChain, epoch, commitment, rotatorAid);
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(epochChain, 'hex');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function loadKeyStoreGroupEpoch(
   keystore: KeyStore,
   aid: string,
   groupId: string,
+  epoch?: number | null,
 ): GroupSecretRecord | null {
-  if (typeof keystore.loadGroupSecretState === 'function') {
-    return keystore.loadGroupSecretState(aid, groupId);
+  if (typeof keystore.loadGroupSecretEpoch === 'function') {
+    return keystore.loadGroupSecretEpoch(aid, groupId, epoch);
   }
-  throw new Error('keystore 缺少 loadGroupSecretState 方法');
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing loadGroupSecretEpoch method`);
 }
 
-function loadAllKeyStoreGroupStates(
-  keystore: KeyStore,
-  aid: string,
-): GroupSecretMap {
-  if (typeof keystore.loadAllGroupSecretStates === 'function') {
-    return keystore.loadAllGroupSecretStates(aid) ?? {};
-  }
-  throw new Error('keystore 缺少 loadAllGroupSecretStates 方法');
-}
-
-function saveKeyStoreGroupState(
+function loadKeyStoreGroupEpochs(
   keystore: KeyStore,
   aid: string,
   groupId: string,
-  entry: GroupSecretRecord,
-): void {
-  if (typeof keystore.saveGroupSecretState === 'function') {
-    keystore.saveGroupSecretState(aid, groupId, entry);
-    return;
+): GroupSecretRecord[] {
+  if (typeof keystore.loadGroupSecretEpochs === 'function') {
+    return keystore.loadGroupSecretEpochs(aid, groupId);
   }
-  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing saveGroupSecretState method`);
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing loadGroupSecretEpochs method`);
+}
+
+function storeKeyStoreGroupTransition(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+  opts: {
+    epoch: number;
+    secret: string;
+    commitment: string;
+    memberAids: string[];
+    epochChain?: string;
+    pendingRotationId?: string;
+    epochChainUnverified?: boolean | null;
+    epochChainUnverifiedReason?: string | null;
+  },
+): boolean | null {
+  if (typeof keystore.storeGroupSecretTransition !== 'function') return null;
+  return keystore.storeGroupSecretTransition(aid, groupId, {
+    ...opts,
+    oldEpochRetentionMs: OLD_EPOCH_RETENTION_SECONDS * 1000,
+  });
+}
+
+function storeKeyStoreGroupEpoch(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+  opts: {
+    epoch: number;
+    secret: string;
+    commitment: string;
+    memberAids: string[];
+    epochChain?: string;
+    pendingRotationId?: string;
+    epochChainUnverified?: boolean | null;
+    epochChainUnverifiedReason?: string | null;
+  },
+): boolean | null {
+  if (typeof keystore.storeGroupSecretEpoch !== 'function') return null;
+  return keystore.storeGroupSecretEpoch(aid, groupId, {
+    ...opts,
+    oldEpochRetentionMs: OLD_EPOCH_RETENTION_SECONDS * 1000,
+  });
 }
 
 function cleanupKeyStoreGroupOldEpochs(
@@ -113,11 +193,6 @@ function deleteKeyStoreGroupState(
 ): void {
   if (typeof keystore.deleteGroupSecretState === 'function') {
     keystore.deleteGroupSecretState(aid, groupId);
-    return;
-  }
-  // 降级：通过 saveGroupSecretState 写入空记录来"删除"
-  if (typeof keystore.saveGroupSecretState === 'function') {
-    keystore.saveGroupSecretState(aid, groupId, {} as any);
     return;
   }
   throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing deleteGroupSecretState method`);
@@ -531,58 +606,53 @@ export function storeGroupSecret(
   groupSecret: Buffer,
   commitment: string,
   memberAids: string[],
+  epochChain?: string,
+  pendingRotationId = '',
+  epochChainUnverified?: boolean | null,
+  epochChainUnverifiedReason?: string | null,
 ): boolean {
-  const existing = loadKeyStoreGroupState(keystore, aid, groupId);
-  if (existing && existing.epoch != null) {
-    const localEpoch = existing.epoch as number;
-    if (epoch < localEpoch) {
-      return false;
-    }
-    if (epoch === localEpoch && typeof existing.secret === 'string') {
-      const incomingSecret = groupSecret.toString('base64');
-      if (existing.secret !== incomingSecret) {
-        return false;
-      }
-      const oldMembers = [...((existing.member_aids as string[] | undefined) ?? [])].sort();
-      const newMembers = [...memberAids].sort();
-      if (JSON.stringify(oldMembers) !== JSON.stringify(newMembers) && newMembers.length > 0) {
-        saveKeyStoreGroupState(keystore, aid, groupId, {
-          ...existing,
-          member_aids: newMembers,
-          commitment,
-          updated_at: Date.now(),
-        });
-      }
-      return true;
-    }
-  }
-
-  const current = existing ? { ...existing } : {};
-  if (existing && existing.epoch !== epoch) {
-    const oldEpochs = (existing.old_epochs as GroupOldEpochRecord[]) ?? [];
-    const oldEntry: GroupOldEpochRecord = {
-      epoch: existing.epoch,
-      secret: existing.secret,
-      commitment: existing.commitment,
-      member_aids: existing.member_aids,
-      updated_at: existing.updated_at,
-      expires_at: ((existing.updated_at as number) || Date.now()) + OLD_EPOCH_RETENTION_SECONDS * 1000,
-    };
-    if ('secret_protection' in existing) {
-      oldEntry.secret_protection = existing.secret_protection;
-    }
-    current.old_epochs = [...oldEpochs, oldEntry];
-  }
-
-  saveKeyStoreGroupState(keystore, aid, groupId, {
+  const transitionResult = storeKeyStoreGroupTransition(keystore, aid, groupId, {
     epoch,
     secret: groupSecret.toString('base64'),
     commitment,
-    member_aids: [...memberAids].sort(),
-    updated_at: Date.now(),
-    old_epochs: (current.old_epochs as GroupOldEpochRecord[] | undefined) ?? [],
+    memberAids: [...memberAids].sort(),
+    epochChain,
+    pendingRotationId,
+    epochChainUnverified,
+    epochChainUnverifiedReason,
   });
-  return true;
+  if (transitionResult !== null) return transitionResult;
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing storeGroupSecretTransition method`);
+}
+
+/** 保存指定 epoch key；低于 current 时写入 old epoch，不覆盖 current。 */
+export function storeGroupSecretEpoch(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+  epoch: number,
+  groupSecret: Buffer,
+  commitment: string,
+  memberAids: string[],
+  epochChain?: string,
+  pendingRotationId = '',
+  epochChainUnverified?: boolean | null,
+  epochChainUnverifiedReason?: string | null,
+): boolean {
+  const secret = groupSecret.toString('base64');
+  const members = [...memberAids].sort();
+  const rowResult = storeKeyStoreGroupEpoch(keystore, aid, groupId, {
+    epoch,
+    secret,
+    commitment,
+    memberAids: members,
+    epochChain,
+    pendingRotationId,
+    epochChainUnverified,
+    epochChainUnverifiedReason,
+  });
+  if (rowResult !== null) return rowResult;
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing storeGroupSecretEpoch method`);
 }
 
 /** 读取 group_secret */
@@ -592,35 +662,80 @@ export function loadGroupSecret(
   groupId: string,
   epoch?: number | null,
 ): LoadedGroupSecret | null {
-  const entry = loadKeyStoreGroupState(keystore, aid, groupId) ?? undefined;
+  const entry = loadKeyStoreGroupEpoch(keystore, aid, groupId, epoch) ?? undefined;
   if (!entry) return null;
 
-  if (epoch == null || entry.epoch === epoch) {
-    const secretStr = entry.secret as string | undefined;
-    if (!secretStr) return null;
-    return {
-      epoch: entry.epoch as number,
-      secret: Buffer.from(secretStr, 'base64'),
-      commitment: String(entry.commitment ?? ''),
-      member_aids: Array.isArray(entry.member_aids) ? entry.member_aids.map((item) => String(item)) : [],
-    };
+  const secretStr = entry.secret as string | undefined;
+  if (!secretStr) return null;
+  const loaded: LoadedGroupSecret = {
+    epoch: entry.epoch as number,
+    secret: Buffer.from(secretStr, 'base64'),
+    commitment: String(entry.commitment ?? ''),
+    member_aids: Array.isArray(entry.member_aids) ? entry.member_aids.map((item) => String(item)) : [],
+  };
+  if (typeof entry.epoch_chain === 'string') loaded.epoch_chain = entry.epoch_chain;
+  if (typeof entry.pending_rotation_id === 'string') loaded.pending_rotation_id = entry.pending_rotation_id;
+  if (typeof entry.epoch_chain_unverified === 'boolean') loaded.epoch_chain_unverified = entry.epoch_chain_unverified;
+  if (typeof entry.epoch_chain_unverified_reason === 'string') {
+    loaded.epoch_chain_unverified_reason = entry.epoch_chain_unverified_reason;
+  }
+  return loaded;
+}
+
+function assessIncomingEpochChain(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+  epoch: number,
+  commitment: string,
+  incomingChain: string | undefined,
+  rotationId: string,
+  rotatorAid: string,
+  source: string,
+): { ok: boolean; unverified?: boolean | null; reason?: string | null } {
+  const chain = (incomingChain ?? '').trim();
+  const rid = rotationId.trim();
+  const rotator = rotatorAid.trim();
+
+  if (rid && !chain) {
+    console.warn(`[e2ee-group] 拒绝缺少 epoch_chain 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+    return { ok: false };
   }
 
-  // 查 old_epochs
-  const oldEpochs = (entry.old_epochs as GroupOldEpochRecord[]) ?? [];
-  for (const old of oldEpochs) {
-    if (old.epoch === epoch) {
-      const secretStr = old.secret as string | undefined;
-      if (!secretStr) return null;
-      return {
-        epoch: old.epoch as number,
-        secret: Buffer.from(secretStr, 'base64'),
-        commitment: String(old.commitment ?? ''),
-        member_aids: Array.isArray(old.member_aids) ? old.member_aids.map((item) => String(item)) : [],
-      };
+  const current = loadGroupSecret(keystore, aid, groupId);
+  if (current?.epoch === epoch) {
+    const currentChain = current.epoch_chain ?? '';
+    const currentPendingRotationId = current.pending_rotation_id ?? '';
+    if (chain && currentChain === chain) return { ok: true };
+    if (rid && chain && currentChain && currentChain !== chain) {
+      if (!(currentPendingRotationId && currentPendingRotationId !== rid)) {
+        console.warn(`[e2ee-group] 拒绝同 epoch 分叉 chain source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+        return { ok: false };
+      }
     }
   }
-  return null;
+
+  const prev = loadGroupSecret(keystore, aid, groupId, epoch - 1);
+  const prevChain = prev?.epoch_chain ?? '';
+  if (!chain) return { ok: true, unverified: true, reason: 'missing_epoch_chain' };
+  if (!prevChain) return { ok: true, unverified: true, reason: 'missing_prev_chain' };
+  if (!rotator) {
+    if (rid) {
+      console.warn(`[e2ee-group] 拒绝缺少 rotator_aid 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      return { ok: false };
+    }
+    return { ok: true, unverified: true, reason: 'missing_rotator_aid' };
+  }
+  if (!verifyEpochChain(chain, prevChain, epoch, commitment, rotator)) {
+    if (rid) {
+      console.warn(`[e2ee-group] 拒绝 epoch_chain 验证失败的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      return { ok: false };
+    }
+    console.warn(`[e2ee-group] epoch_chain 验证失败，按兼容档接收并标记未验证 source=${source} group=${groupId} epoch=${epoch}`);
+    return { ok: true, unverified: true, reason: 'chain_mismatch_legacy' };
+  }
+  if (!rid) return { ok: true, unverified: true, reason: 'missing_rotation_id' };
+  return { ok: true, unverified: false };
 }
 
 /** 加载某群组所有 epoch 的 group_secret */
@@ -629,20 +744,11 @@ export function loadAllGroupSecrets(
   aid: string,
   groupId: string,
 ): Map<number, Buffer> {
-  const groupSecrets = loadAllKeyStoreGroupStates(keystore, aid);
-  const entry = groupSecrets[groupId];
-  if (!entry) return new Map();
-
   const result = new Map<number, Buffer>();
-  const secretStr = entry.secret as string | undefined;
-  if (secretStr && entry.epoch != null) {
-    result.set(entry.epoch as number, Buffer.from(secretStr, 'base64'));
-  }
-  const oldEpochs = (entry.old_epochs as GroupOldEpochRecord[]) ?? [];
-  for (const old of oldEpochs) {
-    const oldSecret = old.secret as string | undefined;
-    if (oldSecret && old.epoch != null) {
-      result.set(old.epoch as number, Buffer.from(oldSecret, 'base64'));
+  for (const entry of loadKeyStoreGroupEpochs(keystore, aid, groupId)) {
+    const secretStr = entry.secret as string | undefined;
+    if (secretStr && entry.epoch != null) {
+      result.set(entry.epoch as number, Buffer.from(secretStr, 'base64'));
     }
   }
   return result;
@@ -657,6 +763,22 @@ export function cleanupOldEpochs(
 ): number {
   const cutoffMs = Date.now() - retentionSeconds * 1000;
   return cleanupKeyStoreGroupOldEpochs(keystore, aid, groupId, cutoffMs);
+}
+
+/** 仅回滚指定 rotation 写入的本地 pending epoch key。 */
+export function discardPendingGroupSecret(
+  keystore: KeyStore,
+  aid: string,
+  groupId: string,
+  epoch: number,
+  rotationId: string,
+): boolean {
+  const rid = rotationId.trim();
+  if (!rid) return false;
+  if (typeof keystore.discardPendingGroupSecretState === 'function') {
+    return keystore.discardPendingGroupSecretState(aid, groupId, epoch, rid);
+  }
+  throw new Error(`keystore ${keystore.constructor?.name ?? 'unknown'} missing discardPendingGroupSecretState method`);
 }
 
 /** 删除群组的所有密钥数据（群组解散时使用） */
@@ -757,6 +879,7 @@ export function buildKeyDistribution(
   memberAids: string[],
   distributedBy: string,
   manifest?: JsonObject | null,
+  epochChain?: string,
 ): JsonObject {
   const commitment = computeMembershipCommitment(memberAids, epoch, groupId, groupSecret);
   const result: JsonObject = {
@@ -771,6 +894,9 @@ export function buildKeyDistribution(
   };
   if (manifest) {
     result.manifest = manifest;
+  }
+  if (epochChain !== undefined) {
+    result.epoch_chain = epochChain;
   }
   return result;
 }
@@ -817,7 +943,28 @@ export function handleKeyDistribution(
     return false;
   }
 
-  return storeGroupSecret(keystore, aid, groupId, epoch, groupSecret, commitment, memberAids);
+  const incomingChain = typeof payload.epoch_chain === 'string' ? payload.epoch_chain : undefined;
+  const rotationId = typeof payload.rotation_id === 'string' ? payload.rotation_id : '';
+  const chainAssessment = assessIncomingEpochChain(
+    keystore,
+    aid,
+    groupId,
+    epoch,
+    commitment,
+    incomingChain,
+    rotationId,
+    String(payload.distributed_by ?? payload.rotator_aid ?? ''),
+    'key_distribution',
+  );
+  if (!chainAssessment.ok) return false;
+
+  return storeGroupSecret(
+    keystore, aid, groupId, epoch, groupSecret, commitment, memberAids,
+    incomingChain,
+    rotationId,
+    chainAssessment.unverified,
+    chainAssessment.reason,
+  );
 }
 
 /** 构建密钥请求 payload */
@@ -883,6 +1030,9 @@ export function handleKeyRequest(
     responder_aid: aid,
     issued_at: Date.now(),
   };
+  if (secretData.epoch_chain !== undefined) {
+    response.epoch_chain = secretData.epoch_chain;
+  }
   return privateKeyPem ? signGroupKeyResponse(response, privateKeyPem) : response;
 }
 
@@ -935,7 +1085,28 @@ export function handleKeyResponse(
     return false;
   }
 
-  return storeGroupSecret(keystore, aid, groupId, epoch, groupSecret, commitment, memberAids);
+  const incomingChain = typeof payload.epoch_chain === 'string' ? payload.epoch_chain : undefined;
+  const rotationId = typeof payload.rotation_id === 'string' ? payload.rotation_id : '';
+  const chainAssessment = assessIncomingEpochChain(
+    keystore,
+    aid,
+    groupId,
+    epoch,
+    commitment,
+    incomingChain,
+    rotationId,
+    String(payload.distributed_by ?? payload.rotator_aid ?? payload.responder_aid ?? ''),
+    'key_response',
+  );
+  if (!chainAssessment.ok) return false;
+
+  return storeGroupSecretEpoch(
+    keystore, aid, groupId, epoch, groupSecret, commitment, memberAids,
+    incomingChain,
+    rotationId,
+    chainAssessment.unverified,
+    chainAssessment.reason,
+  );
 }
 
 // ── GroupE2EEManager 类 ───────────────────────────────────────
@@ -983,11 +1154,12 @@ export class GroupE2EEManager {
     const gs = generateGroupSecret();
     const epoch = 1;
     const commitment = computeMembershipCommitment(memberAids, epoch, groupId, gs);
-    storeGroupSecret(this._keystore, aid, groupId, epoch, gs, commitment, memberAids);
+    const epochChain = computeEpochChain(null, epoch, commitment, aid);
+    storeGroupSecret(this._keystore, aid, groupId, epoch, gs, commitment, memberAids, epochChain);
     const manifest = this._signManifest(buildMembershipManifest(
       groupId, epoch, null, memberAids, { initiatorAid: aid },
     ));
-    const distPayload = buildKeyDistribution(groupId, epoch, gs, memberAids, aid, manifest);
+    const distPayload = buildKeyDistribution(groupId, epoch, gs, memberAids, aid, manifest, epochChain);
     return {
       epoch,
       commitment,
@@ -1005,14 +1177,16 @@ export class GroupE2EEManager {
     const newEpoch = (prevEpoch ?? 0) + 1;
     const gs = generateGroupSecret();
     const commitment = computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
-    const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids);
+    const prevChain = current?.epoch_chain ?? null;
+    const epochChain = computeEpochChain(prevChain, newEpoch, commitment, aid);
+    const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids, epochChain);
     if (!stored) {
       throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
     }
     const manifest = this._signManifest(buildMembershipManifest(
       groupId, newEpoch, prevEpoch, memberAids, { initiatorAid: aid },
     ));
-    const distPayload = buildKeyDistribution(groupId, newEpoch, gs, memberAids, aid, manifest);
+    const distPayload = buildKeyDistribution(groupId, newEpoch, gs, memberAids, aid, manifest, epochChain);
     return {
       epoch: newEpoch,
       commitment,
@@ -1027,18 +1201,27 @@ export class GroupE2EEManager {
     groupId: string,
     newEpoch: number,
     memberAids: string[],
+    opts?: { rotationId?: string },
   ): JsonObject {
     const aid = this._currentAid();
+    const current = loadGroupSecret(this._keystore, aid, groupId, newEpoch - 1)
+      ?? loadGroupSecret(this._keystore, aid, groupId);
     const gs = generateGroupSecret();
     const commitment = computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
-    const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids);
+    const prevChain = current?.epoch_chain ?? null;
+    const epochChain = computeEpochChain(prevChain, newEpoch, commitment, aid);
+    const rotationId = opts?.rotationId ?? '';
+    const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids, epochChain, rotationId);
     if (!stored) {
       throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
     }
     const manifest = this._signManifest(buildMembershipManifest(
       groupId, newEpoch, newEpoch - 1, memberAids, { initiatorAid: aid },
     ));
-    const distPayload = buildKeyDistribution(groupId, newEpoch, gs, memberAids, aid, manifest);
+    const distPayload = buildKeyDistribution(groupId, newEpoch, gs, memberAids, aid, manifest, epochChain);
+    if (rotationId) {
+      distPayload.rotation_id = rotationId;
+    }
     return {
       epoch: newEpoch,
       commitment,
@@ -1046,6 +1229,10 @@ export class GroupE2EEManager {
         .filter(m => m !== aid)
         .map(m => ({ to: m, payload: distPayload })),
     };
+  }
+
+  discardPendingSecret(groupId: string, epoch: number, rotationId: string): boolean {
+    return discardPendingGroupSecret(this._keystore, this._currentAid(), groupId, epoch, rotationId);
   }
 
   /** 加密群消息（含发送方签名）。无密钥时抛 E2EEGroupSecretMissingError。 */
@@ -1065,6 +1252,34 @@ export class GroupE2EEManager {
     return encryptGroupMessage(
       groupId,
       secretData.epoch as number,
+      secretData.secret,
+      payload,
+      {
+        fromAid: aid,
+        messageId: `gm-${crypto.randomUUID()}`,
+        timestamp: Date.now(),
+        senderPrivateKeyPem: senderPkPem,
+        senderCertPem,
+      },
+    );
+  }
+
+  /** 使用指定 epoch 加密群消息。 */
+  encryptWithEpoch(groupId: string, epoch: number, payload: JsonObject): JsonObject {
+    const aid = this._currentAid();
+    const secretData = loadGroupSecret(this._keystore, aid, groupId, epoch);
+    if (!secretData) {
+      throw new E2EEGroupSecretMissingError(`no group secret for ${groupId} epoch ${epoch}`);
+    }
+    const identity = this._identityFn();
+    const senderPkPem = identity ? (identity.private_key_pem as string | undefined) ?? null : null;
+    if (!senderPkPem) {
+      throw new E2EEError('sender identity private key unavailable for group message signing');
+    }
+    const senderCertPem = identity ? (identity.cert as string | undefined) ?? null : null;
+    return encryptGroupMessage(
+      groupId,
+      secretData.epoch,
       secretData.secret,
       payload,
       {

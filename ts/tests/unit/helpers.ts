@@ -9,7 +9,6 @@ import type { KeyStore } from '../../src/keystore/index.js';
 import { E2EEManager } from '../../src/e2ee.js';
 import type {
   GroupOldEpochRecord,
-  GroupSecretMap,
   GroupSecretRecord,
   IdentityRecord,
   JsonObject,
@@ -25,7 +24,7 @@ export class FakeKeystore implements KeyStore {
   _certs: Record<string, string> = {};
   _identities: Record<string, IdentityRecord> = {};
   _prekeys: Record<string, PrekeyMap> = {};
-  _groups: Record<string, GroupSecretMap> = {};
+  _groups: Record<string, Record<string, GroupSecretRecord>> = {};
 
   loadKeyPair(aid: string): KeyPairRecord | null {
     return this._keyPairs[aid] ?? null;
@@ -75,15 +74,122 @@ export class FakeKeystore implements KeyStore {
     }
     return removed;
   }
-  loadGroupSecretState(aid: string, groupId: string): GroupSecretRecord | null {
-    return JSON.parse(JSON.stringify(this._groups[aid]?.[groupId] ?? null));
+  listGroupSecretIds(aid: string): string[] {
+    return Object.keys(this._groups[aid] ?? {}).sort();
   }
-  loadAllGroupSecretStates(aid: string): GroupSecretMap {
-    return JSON.parse(JSON.stringify(this._groups[aid] ?? {}));
+  loadGroupSecretEpoch(aid: string, groupId: string, epoch?: number | null): GroupSecretRecord | null {
+    const current = this._groups[aid]?.[groupId];
+    if (!current) return null;
+    if (epoch == null || Number(current.epoch ?? 0) === Number(epoch)) {
+      return JSON.parse(JSON.stringify(current));
+    }
+    const old = ((current.old_epochs ?? []) as GroupOldEpochRecord[])
+      .find((item) => Number(item.epoch ?? 0) === Number(epoch));
+    return old ? JSON.parse(JSON.stringify(old)) : null;
   }
-  saveGroupSecretState(aid: string, groupId: string, entry: GroupSecretRecord): void {
+  loadGroupSecretEpochs(aid: string, groupId: string): GroupSecretRecord[] {
+    const current = this._groups[aid]?.[groupId];
+    if (!current) return [];
+    return JSON.parse(JSON.stringify([
+      current,
+      ...((current.old_epochs ?? []) as GroupOldEpochRecord[]),
+    ]));
+  }
+  storeGroupSecretTransition(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): boolean {
     this._groups[aid] ??= {};
-    this._groups[aid][groupId] = JSON.parse(JSON.stringify(entry));
+    const now = Date.now();
+    const epoch = Number(opts.epoch);
+    const members = [...(opts.memberAids ?? [])].map(String).sort();
+    const current = this._groups[aid][groupId];
+
+    if (current) {
+      const localEpoch = Number(current.epoch ?? 0);
+      if (epoch < localEpoch) return false;
+      if (epoch === localEpoch && typeof current.secret === 'string') {
+        if (current.secret !== opts.secret) {
+          if (!String(current.pending_rotation_id ?? '').trim()) return false;
+          this._groups[aid][groupId] = this._buildGroupEntry(opts, members, now, current.old_epochs as GroupOldEpochRecord[] | undefined);
+          return true;
+        }
+        const updated = this._mergeGroupMetadata(current, opts, members, now);
+        this._groups[aid][groupId] = updated;
+        return true;
+      }
+      const oldEntry: GroupOldEpochRecord = {
+        ...current,
+        expires_at: Number(current.updated_at ?? now) + opts.oldEpochRetentionMs,
+      } as GroupOldEpochRecord;
+      const oldEpochs = [...((current.old_epochs ?? []) as GroupOldEpochRecord[]), oldEntry];
+      this._groups[aid][groupId] = this._buildGroupEntry(opts, members, now, oldEpochs);
+      return true;
+    }
+
+    this._groups[aid][groupId] = this._buildGroupEntry(opts, members, now, []);
+    return true;
+  }
+  storeGroupSecretEpoch(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): boolean {
+    this._groups[aid] ??= {};
+    const now = Date.now();
+    const epoch = Number(opts.epoch);
+    const members = [...(opts.memberAids ?? [])].map(String).sort();
+    const current = this._groups[aid][groupId];
+
+    if (!current) {
+      this._groups[aid][groupId] = this._buildGroupEntry(opts, members, now, []);
+      return true;
+    }
+
+    const localEpoch = Number(current.epoch ?? 0);
+    if (epoch > localEpoch) return false;
+    if (epoch === localEpoch) {
+      if (current.secret && current.secret !== opts.secret && !String(current.pending_rotation_id ?? '').trim()) {
+        return false;
+      }
+      this._groups[aid][groupId] = this._buildGroupEntry(opts, members, now, current.old_epochs as GroupOldEpochRecord[] | undefined);
+      return true;
+    }
+
+    const oldEpochs = [...((current.old_epochs ?? []) as GroupOldEpochRecord[])];
+    const index = oldEpochs.findIndex((item) => Number(item.epoch ?? 0) === epoch);
+    const oldEntry = this._buildGroupEntry(opts, members, now, []) as GroupOldEpochRecord;
+    oldEntry.expires_at = now + opts.oldEpochRetentionMs;
+    delete oldEntry.old_epochs;
+    if (index >= 0) {
+      if (oldEpochs[index].secret && oldEpochs[index].secret !== opts.secret) return false;
+      oldEpochs[index] = oldEntry;
+    } else {
+      oldEpochs.push(oldEntry);
+    }
+    this._groups[aid][groupId] = { ...current, old_epochs: oldEpochs };
+    return true;
   }
   cleanupGroupOldEpochsState(aid: string, groupId: string, cutoffMs: number): number {
     const entry = this._groups[aid]?.[groupId];
@@ -98,6 +204,102 @@ export class FakeKeystore implements KeyStore {
     if (this._groups[aid]) {
       delete this._groups[aid][groupId];
     }
+  }
+  discardPendingGroupSecretState(aid: string, groupId: string, epoch: number, rotationId: string): boolean {
+    const current = this._groups[aid]?.[groupId];
+    if (!current) return false;
+    if (Number(current.epoch ?? 0) !== Number(epoch)) return false;
+    if (String(current.pending_rotation_id ?? '').trim() !== rotationId.trim()) return false;
+    const oldEpochs = [...((current.old_epochs ?? []) as GroupOldEpochRecord[])];
+    let restoreIndex = -1;
+    let restoreEpoch = -1;
+    oldEpochs.forEach((old, index) => {
+      const oldEpoch = Number(old.epoch ?? 0);
+      if (oldEpoch < epoch && oldEpoch > restoreEpoch && old.secret) {
+        restoreIndex = index;
+        restoreEpoch = oldEpoch;
+      }
+    });
+    if (restoreIndex >= 0) {
+      const restored = { ...oldEpochs[restoreIndex] } as GroupSecretRecord;
+      restored.old_epochs = oldEpochs.filter((_, index) => index !== restoreIndex);
+      this._groups[aid][groupId] = restored;
+    } else {
+      delete this._groups[aid][groupId];
+    }
+    return true;
+  }
+
+  private _buildGroupEntry(
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+    },
+    members: string[],
+    updatedAt: number,
+    oldEpochs?: GroupOldEpochRecord[],
+  ): GroupSecretRecord {
+    const entry: GroupSecretRecord = {
+      epoch: Number(opts.epoch),
+      secret: opts.secret,
+      commitment: opts.commitment,
+      member_aids: members,
+      updated_at: updatedAt,
+      old_epochs: oldEpochs ?? [],
+    };
+    if (opts.epochChain !== undefined) entry.epoch_chain = opts.epochChain;
+    if (opts.pendingRotationId) {
+      entry.pending_rotation_id = opts.pendingRotationId;
+      entry.pending_created_at = updatedAt;
+    }
+    if (opts.epochChainUnverified === true) {
+      entry.epoch_chain_unverified = true;
+      if (opts.epochChainUnverifiedReason) entry.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+    }
+    return entry;
+  }
+
+  private _mergeGroupMetadata(
+    current: GroupSecretRecord,
+    opts: {
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+    },
+    members: string[],
+    updatedAt: number,
+  ): GroupSecretRecord {
+    const updated: GroupSecretRecord = { ...current, updated_at: updatedAt };
+    const oldMembers = Array.isArray(updated.member_aids) ? updated.member_aids.map(String).sort() : [];
+    if (members.length && JSON.stringify(oldMembers) !== JSON.stringify(members)) {
+      updated.member_aids = members;
+      updated.commitment = opts.commitment;
+    }
+    if (opts.epochChain !== undefined) updated.epoch_chain = opts.epochChain;
+    if (opts.pendingRotationId) {
+      updated.pending_rotation_id = opts.pendingRotationId;
+      updated.pending_created_at = updatedAt;
+    } else {
+      delete updated.pending_rotation_id;
+      delete updated.pending_created_at;
+    }
+    if (opts.epochChainUnverified === true) {
+      updated.epoch_chain_unverified = true;
+      if (opts.epochChainUnverifiedReason) updated.epoch_chain_unverified_reason = opts.epochChainUnverifiedReason;
+    } else if (opts.epochChainUnverified === false) {
+      delete updated.epoch_chain_unverified;
+      delete updated.epoch_chain_unverified_reason;
+    }
+    return updated;
   }
 }
 

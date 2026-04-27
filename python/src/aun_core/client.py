@@ -7,6 +7,7 @@ import json
 import math
 import random
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ from .events import EventDispatcher, Subscription
 from .keystore.file import FileKeyStore
 from .namespaces.auth_namespace import AuthNamespace
 from .namespaces.custody_namespace import CustodyNamespace
+from .namespaces.meta_namespace import MetaNamespace
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
 from .types import ConnectionState
@@ -60,6 +62,8 @@ _PENDING_DECRYPT_LIMIT = 100
 _PUSHED_SEQS_LIMIT = 50000
 _RECONNECT_MIN_BASE_DELAY = 1.0
 _RECONNECT_MAX_BASE_DELAY = 64.0
+_GROUP_ROTATION_LEASE_MS = 120000
+_GROUP_ROTATION_RETRY_MAX_DELAY = 300.0
 
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
     "auto_reconnect": True,
@@ -291,11 +295,13 @@ class AUNClient:
         # PY-001: 解密失败的群消息待重试队列（按 namespace 分组）
         self._pending_decrypt_msgs: dict[str, list[dict[str, Any]]] = {}
         self._group_epoch_rotation_inflight: set[str] = set()
+        self._group_epoch_rotation_retry_tasks: dict[str, asyncio.Task] = {}
         self._group_epoch_recovery_inflight: dict[str, asyncio.Future[bool]] = {}
         self._group_membership_rotation_done: set[str] = set()
 
         self.auth = AuthNamespace(self)
         self.custody = CustodyNamespace(self)
+        self.meta = MetaNamespace(self)
         # 内部订阅：推送消息自动解密后 re-publish 给用户
         self._dispatcher.subscribe("_raw.message.received", self._on_raw_message_received)
         # 群组消息推送：自动解密后 re-publish
@@ -490,6 +496,9 @@ class AUNClient:
             encrypt = params.pop("encrypt", True)
             if encrypt:
                 return await self._send_group_encrypted(params)
+            group_id = str(params.get("group_id") or "").strip()
+            if group_id:
+                await self._wait_for_group_membership_epoch_floor(group_id, timeout_s=5.0, strict=True)
 
         # 关键操作自动附加客户端签名
         if method in self._SIGNED_METHODS:
@@ -500,80 +509,74 @@ class AUNClient:
         # 自动解密：message.pull 返回的消息
         if method == "message.pull" and isinstance(result, dict):
             messages = result.get("messages")
+            ns = f"p2p:{self._aid}" if self._aid else ""
             if isinstance(messages, list) and messages:
                 pull_source = "gap_fill" if getattr(self, "_gap_fill_active", False) else "pull"
                 result["messages"] = await self._decrypt_messages(messages, source=pull_source)
-                if self._aid:
-                    ns = f"p2p:{self._aid}"
+                if self._aid and getattr(self, "_seq_tracker", None) is not None:
                     self._seq_tracker.on_pull_result(ns, messages)
-                    # ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
-                    # 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若本地 contiguous_seq 落后，
-                    # 必须调用 force_contiguous_seq 跳过服务端已清理掉的不连续区间（retention window 外的消息）。
-                    # 这是跳过"服务端允许起始位置之前"空洞的唯一手段，与 S2 引入的 [1,seq-1] 历史 gap 配合使用。
-                    # 若这里不 force，首条消息建的 [1,N-1] gap 会永远悬挂，触发无限 pull 重试。
-                    # 注意：临时消息淘汰走另一字段 ephemeral_earliest_available_seq（当前不 force，仅提示），与此互斥。
-                    # 修改前请复核 docs/bug-audit-2026-04-17-review.md 的 S2 条款。
-                    server_ack = int(result.get("server_ack_seq") or 0)
-                    if server_ack > 0:
-                        contig = self._seq_tracker.get_contiguous_seq(ns)
-                        if contig < server_ack:
-                            _client_log.info(
-                                "message.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d",
-                                ns, contig, server_ack,
-                            )
-                            self._seq_tracker.force_contiguous_seq(ns, server_ack)
-                    self._persist_seq(ns)
-                # auto-ack：ack contiguous_seq
-                if self._aid:
+            if self._aid and getattr(self, "_seq_tracker", None) is not None:
+                # P2P retention floor 即使本次没有消息也必须生效，否则空拉时的历史 gap 会一直悬挂。
+                server_ack = int(result.get("server_ack_seq") or 0)
+                if server_ack > 0:
                     contig = self._seq_tracker.get_contiguous_seq(ns)
-                    if contig > 0:
-                        try:
-                            await self._transport.call("message.ack", {
-                                "seq": contig, "device_id": self._device_id,
-                            })
-                        except Exception as _ack_exc:
-                            _client_log.debug("message.pull auto-ack 失败: %s", _ack_exc)
+                    if contig < server_ack:
+                        _client_log.info(
+                            "message.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d",
+                            ns, contig, server_ack,
+                        )
+                        self._seq_tracker.force_contiguous_seq(ns, server_ack)
+                self._persist_seq(ns)
+                # auto-ack：ack contiguous_seq
+                contig = self._seq_tracker.get_contiguous_seq(ns)
+                should_ack = bool(isinstance(messages, list) and messages) or server_ack > 0
+                if contig > 0 and should_ack:
+                    try:
+                        await self._transport.call("message.ack", {
+                            "seq": contig, "device_id": self._device_id,
+                        })
+                    except Exception as _ack_exc:
+                        _client_log.debug("message.pull auto-ack 失败: %s", _ack_exc)
 
         # 自动解密：group.pull 返回的群消息
         if method == "group.pull" and isinstance(result, dict):
             messages = result.get("messages")
+            gid = (params or {}).get("group_id", "")
+            ns = f"group:{gid}" if gid else ""
             if isinstance(messages, list) and messages:
                 result["messages"] = await self._decrypt_group_messages(messages)
-                gid = (params or {}).get("group_id", "")
-                if gid:
-                    ns = f"group:{gid}"
+                if gid and getattr(self, "_seq_tracker", None) is not None:
                     self._seq_tracker.on_pull_result(ns, messages)
-                    # ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
-                    # 群路径目前"服务端允许起始位置"仅由 cursor.current_seq 表达（= server_ack_seq 语义），
-                    # 没有独立的 earliest_available_seq 字段。若未来在 group/entry.py 引入 retention 淘汰，
-                    # 需要新增独立字段并同步更新这里；否则群消息 retention 窗外的空洞会永远悬挂。
-                    # 与 S2 [1,seq-1] 历史 gap 配合使用，force_contiguous_seq 是跳过空洞的唯一手段。
-                    cursor = result.get("cursor")
-                    if isinstance(cursor, dict):
-                        server_ack = int(cursor.get("current_seq") or 0)
-                        if server_ack > 0:
-                            contig = self._seq_tracker.get_contiguous_seq(ns)
-                            if contig < server_ack:
-                                _client_log.info(
-                                    "group.pull retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d",
-                                    ns, contig, server_ack,
-                                )
-                                self._seq_tracker.force_contiguous_seq(ns, server_ack)
-                    self._persist_seq(ns)
-                    # auto-ack：ack contiguous_seq
-                    contig = self._seq_tracker.get_contiguous_seq(ns)
-                    if contig > 0:
-                        try:
-                            await self._transport.call("group.ack_messages", {
-                                "group_id": gid, "msg_seq": contig,
-                                "device_id": self._device_id,
-                            })
-                        except Exception as _ack_exc:
-                            _client_log.debug("group.pull auto-ack 失败: group=%s %s", gid, _ack_exc)
+            if gid and getattr(self, "_seq_tracker", None) is not None:
+                # group retention floor 由 cursor.current_seq 表达，也需要在空拉时推进。
+                cursor = result.get("cursor")
+                if isinstance(cursor, dict):
+                    server_ack = int(cursor.get("current_seq") or 0)
+                    if server_ack > 0:
+                        contig = self._seq_tracker.get_contiguous_seq(ns)
+                        if contig < server_ack:
+                            _client_log.info(
+                                "group.pull retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d",
+                                ns, contig, server_ack,
+                            )
+                            self._seq_tracker.force_contiguous_seq(ns, server_ack)
+                self._persist_seq(ns)
+                # auto-ack：ack contiguous_seq
+                contig = self._seq_tracker.get_contiguous_seq(ns)
+                should_ack = bool(isinstance(messages, list) and messages) or (
+                    isinstance(cursor, dict) and int(cursor.get("current_seq") or 0) > 0
+                )
+                if contig > 0 and should_ack:
+                    try:
+                        await self._transport.call("group.ack_messages", {
+                            "group_id": gid, "msg_seq": contig,
+                            "device_id": self._device_id,
+                        })
+                    except Exception as _ack_exc:
+                        _client_log.debug("group.pull auto-ack 失败: group=%s %s", gid, _ack_exc)
 
         # ── Group E2EE 自动编排 ────────────────────────────
         # 群组 E2EE 是必备能力，始终启用自动编排
-        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
 
         # 建群后自动创建 epoch（幂等：已有 secret 时跳过）
         # 同步到服务端确保 epoch 一致
@@ -596,13 +599,14 @@ class AUNClient:
             "group.use_invite_code", "group.request_join",
         } and isinstance(result, dict):
             gid = self._extract_group_id_from_result(result) or str(params.get("group_id") or "")
-            if gid:
-                loop.create_task(self._maybe_lead_rotate_group_epoch(
+            expected_epoch = self._membership_rotation_expected_epoch(result)
+            if gid and self._membership_rotation_changed(method, result):
+                await self._maybe_lead_rotate_group_epoch(
                     gid,
                     reason="membership_changed",
                     trigger_id=self._membership_rotation_trigger_id(gid, result),
-                    expected_epoch=self._membership_rotation_expected_epoch(result),
-                ))
+                    expected_epoch=expected_epoch,
+                )
 
         return result
 
@@ -610,21 +614,88 @@ class AUNClient:
 
     @staticmethod
     def _membership_rotation_trigger_id(group_id: str, payload: dict[str, Any]) -> str:
-        action = str(payload.get("action") or payload.get("status") or payload.get("reason") or "membership_changed")
+        action = str(payload.get("action") or "").strip()
+        if not action:
+            if payload.get("removed_aid"):
+                action = "member_removed"
+            elif payload.get("left_aid"):
+                action = "member_left"
+            elif isinstance(payload.get("member"), dict):
+                action = "member_added"
+            else:
+                action = str(payload.get("status") or payload.get("reason") or "membership_changed")
         event_seq = payload.get("event_seq") or payload.get("seq") or ""
         group = payload.get("group")
         if isinstance(group, dict):
             event_seq = event_seq or group.get("event_seq") or ""
+        changed_aids: set[str] = set()
         changed_aid = (
             payload.get("aid") or payload.get("removed_aid") or payload.get("left_aid")
             or payload.get("member_aid") or payload.get("target_aid") or ""
         )
+        if changed_aid:
+            changed_aids.add(str(changed_aid))
         member = payload.get("member")
         if isinstance(member, dict):
             changed_aid = changed_aid or member.get("aid") or ""
+            if member.get("aid"):
+                changed_aids.add(str(member.get("aid")))
+        request = payload.get("request")
+        if isinstance(request, dict):
+            changed_aid = changed_aid or request.get("aid") or ""
+            if request.get("aid"):
+                changed_aids.add(str(request.get("aid")))
+        invite_code = payload.get("invite_code")
+        if isinstance(invite_code, dict):
+            changed_aid = changed_aid or invite_code.get("used_by") or invite_code.get("aid") or ""
+            for key in ("used_by", "aid"):
+                if invite_code.get(key):
+                    changed_aids.add(str(invite_code.get(key)))
+        results = payload.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                item_status = str(item.get("status") or "").strip().lower()
+                if item_status != "approved" and not bool(item.get("approved")):
+                    continue
+                for key in ("aid", "member_aid", "target_aid"):
+                    if item.get(key):
+                        changed_aids.add(str(item.get(key)))
+                for key in ("member", "request"):
+                    nested = item.get(key)
+                    if isinstance(nested, dict) and nested.get("aid"):
+                        changed_aids.add(str(nested.get("aid")))
+        changed_aid_key = ",".join(sorted(aid for aid in changed_aids if aid))
+        expected_epoch = AUNClient._membership_rotation_expected_epoch(payload)
+        if changed_aid_key and expected_epoch is not None:
+            return f"{group_id}:{action}:aid:{changed_aid_key}:epoch:{expected_epoch}"
         if event_seq:
             return f"{group_id}:{action}:event:{event_seq}"
-        return f"{group_id}:{action}:aid:{changed_aid or '-'}"
+        return f"{group_id}:{action}:aid:{changed_aid_key or changed_aid or '-'}"
+
+    @staticmethod
+    def _membership_rotation_changed(method: str, payload: dict[str, Any]) -> bool:
+        """判断 RPC 成功返回是否真的意味着成员集合变更。"""
+        if method in {"group.add_member", "group.kick", "group.remove_member", "group.leave"}:
+            return True
+        status = str(payload.get("status") or "").strip().lower()
+        if method in {"group.use_invite_code", "group.request_join"}:
+            return status in {"joined", "approved"} or isinstance(payload.get("member"), dict)
+        if method == "group.review_join_request":
+            return status == "approved" or bool(payload.get("approved")) or isinstance(payload.get("member"), dict)
+        if method == "group.batch_review_join_request":
+            results = payload.get("results")
+            if not isinstance(results, list):
+                return False
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                item_status = str(item.get("status") or "").strip().lower()
+                if item_status == "approved" or bool(item.get("approved")):
+                    return True
+            return False
+        return False
 
     @staticmethod
     def _membership_rotation_expected_epoch(payload: dict[str, Any]) -> int | None:
@@ -710,6 +781,7 @@ class AUNClient:
         if not self._p2p_synced:
             await self._lazy_sync_p2p()
 
+        persist_required = bool(params.get("persist_required") or params.get("durable"))
         recipient_prekeys = await self._fetch_peer_prekeys(to_aid)
         self_sync_copies = await self._build_self_sync_copies(
             logical_to_aid=to_aid,
@@ -726,6 +798,7 @@ class AUNClient:
                 message_id=message_id,
                 timestamp=timestamp,
                 prekey=recipient_prekeys[0] if recipient_prekeys else None,
+                persist_required=persist_required,
             )
 
         recipient_copies = await self._build_recipient_device_copies(
@@ -748,6 +821,8 @@ class AUNClient:
             "message_id": message_id,
             "timestamp": timestamp,
         }
+        if persist_required:
+            send_params["persist_required"] = True
         return await self._transport.call("message.send", send_params)
 
     async def _send_encrypted_single(
@@ -758,6 +833,7 @@ class AUNClient:
         message_id: str,
         timestamp: int,
         prekey: dict[str, Any] | None = None,
+        persist_required: bool = False,
     ) -> Any:
         if prekey is None:
             prekey = await self._fetch_peer_prekey(to_aid)
@@ -785,6 +861,8 @@ class AUNClient:
             "message_id": message_id,
             "timestamp": timestamp,
         }
+        if persist_required:
+            send_params["persist_required"] = True
         return await self._transport.call("message.send", send_params)
 
     async def _build_recipient_device_copies(
@@ -984,9 +1062,16 @@ class AUNClient:
 
         # 预检：本地 epoch 是否与服务端一致，不一致则等待密钥恢复
         await self._ensure_group_epoch_ready(group_id, strict=False)
+        await self._wait_for_group_membership_epoch_floor(group_id, timeout_s=5.0, strict=True)
 
         for attempt in range(2):
-            envelope = self._group_e2ee.encrypt(group_id, payload)
+            epoch_result = await self._committed_group_epoch_state(group_id)
+            committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
+            if committed_epoch > 0:
+                ready_epoch = await self._ensure_committed_group_secret_for_send(group_id, committed_epoch, epoch_result)
+                envelope = self._group_e2ee.encrypt_with_epoch(group_id, ready_epoch, payload)
+            else:
+                envelope = self._group_e2ee.encrypt(group_id, payload)
             send_params: dict[str, Any] = {
                 "group_id": group_id,
                 "payload": envelope,
@@ -1054,11 +1139,21 @@ class AUNClient:
 
     @staticmethod
     def _is_group_epoch_rotation_pending_error(exc: Exception) -> bool:
-        return "e2ee epoch rotation pending" in str(exc).lower()
+        text = str(exc).lower()
+        return "e2ee epoch rotation pending" in text or "e2ee epoch not committed" in text
 
     @classmethod
     def _is_recoverable_group_epoch_error(cls, exc: Exception) -> bool:
         return cls._is_group_epoch_too_old_error(exc) or cls._is_group_epoch_rotation_pending_error(exc)
+
+    @staticmethod
+    def _is_expected_group_rotation_skip_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "is not a member" in text
+            or "client is not connected" in text
+            or "not connected" in text
+        )
 
     def _group_key_recovery_candidates(self, group_id: str, epoch_result: dict[str, Any]) -> list[str]:
         candidates: list[str] = []
@@ -1088,6 +1183,32 @@ class AUNClient:
         for target_aid in self._group_key_recovery_candidates(group_id, epoch_result):
             await self._request_group_key_from(group_id, target_aid, epoch=server_epoch)
 
+    async def _recover_initial_group_epoch_if_needed(
+        self,
+        group_id: str,
+        local_epoch: int,
+        epoch_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """恢复建群后本地 epoch 1 已创建、服务端 epoch 仍为 0 的崩溃窗口。"""
+        server_epoch = int(epoch_result.get("epoch", 0) if isinstance(epoch_result, dict) else 0)
+        if server_epoch != 0 or local_epoch != 1:
+            return epoch_result
+        secret_data = self._group_e2ee.load_secret(group_id, 1)
+        if not isinstance(secret_data, dict) or secret_data.get("pending_rotation_id"):
+            return epoch_result
+        _client_log.warning(
+            "群 %s 检测到本地 epoch 1 已存在但服务端 epoch 仍为 0，尝试补同步初始 epoch",
+            group_id,
+        )
+        await self._sync_epoch_to_server(group_id)
+        try:
+            refreshed = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+            if isinstance(refreshed, dict):
+                return refreshed
+        except Exception as exc:
+            _client_log.warning("群 %s 初始 epoch 补同步后刷新服务端 epoch 失败: %s", group_id, exc)
+        return epoch_result
+
     async def _recover_group_epoch_key(
         self,
         group_id: str,
@@ -1097,10 +1218,11 @@ class AUNClient:
         timeout_s: float = 5.0,
     ) -> bool:
         existing = self._group_e2ee.load_secret(group_id, epoch)
-        if existing is not None:
+        if await self._group_epoch_secret_ready_for_recovery(group_id, epoch, existing):
             _client_log.debug(
                 "群组 epoch 密钥恢复跳过：group=%s epoch=%s 密钥已在本地", group_id, epoch,
             )
+            self._schedule_retry_pending_decrypt_msgs(group_id)
             return True
 
         # inflight 去重：同 group_id:epoch 的并发恢复共享同一个 Future
@@ -1154,9 +1276,57 @@ class AUNClient:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             await asyncio.sleep(0.15)
-            if self._group_e2ee.load_secret(group_id, epoch) is not None:
+            secret = self._group_e2ee.load_secret(group_id, epoch)
+            if await self._group_epoch_secret_ready_for_recovery(group_id, epoch, secret):
+                self._schedule_retry_pending_decrypt_msgs(group_id)
                 return True
-        return self._group_e2ee.load_secret(group_id, epoch) is not None
+        secret = self._group_e2ee.load_secret(group_id, epoch)
+        ready = await self._group_epoch_secret_ready_for_recovery(group_id, epoch, secret)
+        if ready:
+            self._schedule_retry_pending_decrypt_msgs(group_id)
+        return ready
+
+    async def _group_epoch_secret_ready_for_recovery(
+        self,
+        group_id: str,
+        epoch: int,
+        secret_data: Any,
+    ) -> bool:
+        if not isinstance(secret_data, dict):
+            return False
+        pending_rotation_id = str(secret_data.get("pending_rotation_id") or "").strip()
+        if not pending_rotation_id:
+            return True
+        return await self._pending_group_secret_still_current(group_id, epoch, pending_rotation_id)
+
+    async def _pending_group_secret_still_current(
+        self,
+        group_id: str,
+        epoch: int,
+        pending_rotation_id: str,
+    ) -> bool:
+        try:
+            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+        except Exception:
+            return False
+        if not isinstance(epoch_result, dict):
+            return False
+        pending = epoch_result.get("pending_rotation")
+        if (
+            isinstance(pending, dict)
+            and not pending.get("expired")
+            and str(pending.get("rotation_id") or "").strip() == pending_rotation_id
+        ):
+            return True
+        committed_rotation = epoch_result.get("committed_rotation")
+        if isinstance(committed_rotation, dict):
+            try:
+                committed_epoch = int(committed_rotation.get("target_epoch") or 0)
+            except (TypeError, ValueError):
+                committed_epoch = 0
+            if committed_epoch == epoch and str(committed_rotation.get("rotation_id") or "").strip() == pending_rotation_id:
+                return True
+        return False
 
     async def _ensure_group_epoch_ready(self, group_id: str, *, strict: bool) -> None:
         local_epoch = self._group_e2ee.current_epoch(group_id)
@@ -1171,6 +1341,27 @@ class AUNClient:
             return
 
         server_epoch = int(epoch_result.get("epoch", 0) if isinstance(epoch_result, dict) else 0)
+        pending = epoch_result.get("pending_rotation") if isinstance(epoch_result, dict) else None
+        if isinstance(pending, dict):
+            try:
+                pending_base_epoch = int(pending.get("base_epoch") or server_epoch)
+            except (TypeError, ValueError):
+                pending_base_epoch = server_epoch
+            self._schedule_group_rotation_retry(
+                group_id,
+                reason="pending_recovery",
+                trigger_id=str(pending.get("rotation_id") or ""),
+                expected_epoch=pending_base_epoch,
+                pending=pending,
+            )
+        if server_epoch == 0 and local_epoch == 1:
+            epoch_result = await self._recover_initial_group_epoch_if_needed(group_id, local_epoch, epoch_result)
+            server_epoch = int(epoch_result.get("epoch", 0) if isinstance(epoch_result, dict) else 0)
+            if server_epoch == 0:
+                raise StateError(
+                    f"group {group_id} initial epoch sync has not completed; "
+                    "refuse to send with local epoch 1 while server epoch is 0"
+                )
         if server_epoch <= local_epoch:
             if not strict or server_epoch <= 0:
                 return
@@ -1206,16 +1397,152 @@ class AUNClient:
             "key recovery has not completed"
         )
 
+    async def _wait_for_group_membership_epoch_floor(
+        self,
+        group_id: str,
+        *,
+        timeout_s: float,
+        strict: bool = False,
+    ) -> None:
+        """成员加入后短暂等待 committed epoch 追上成员的最小可读 epoch。
+
+        strict=True 时若超时仍未追上则拒绝发送，避免服务端按成员 floor 拒绝旧 epoch 消息。
+        """
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            try:
+                epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+                committed_epoch = int(
+                    epoch_result.get("committed_epoch", epoch_result.get("epoch", 0))
+                    if isinstance(epoch_result, dict) else 0
+                )
+                members_result = await self.call("group.get_members", {"group_id": group_id})
+            except Exception as exc:
+                if strict:
+                    raise StateError(f"group {group_id} failed to verify membership epoch floor: {exc}") from exc
+                _client_log.debug("群 %s 成员 epoch floor 预检跳过: %s", group_id, exc)
+                return
+
+            members = members_result.get("members") if isinstance(members_result, dict) else None
+            max_min_read_epoch = 0
+            if isinstance(members, list):
+                for member in members:
+                    if not isinstance(member, dict):
+                        continue
+                    try:
+                        max_min_read_epoch = max(max_min_read_epoch, int(member.get("min_read_epoch") or 0))
+                    except (TypeError, ValueError):
+                        continue
+
+            if max_min_read_epoch <= committed_epoch:
+                return
+
+            if time.monotonic() >= deadline:
+                message = (
+                    f"group {group_id} committed epoch {committed_epoch} is below "
+                    f"membership floor {max_min_read_epoch}"
+                )
+                if strict:
+                    raise StateError(message)
+                _client_log.info(
+                    "群 %s committed epoch 尚未追上成员可读下限，按当前 committed epoch 继续发送: committed=%s floor=%s",
+                    group_id, committed_epoch, max_min_read_epoch,
+                )
+                return
+            await asyncio.sleep(0.15)
+
+    async def _committed_group_epoch(self, group_id: str) -> int:
+        try:
+            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+        except Exception as exc:
+            _client_log.warning("群 %s 查询 committed epoch 失败，回退本地 epoch: %s", group_id, exc)
+            return self._group_e2ee.current_epoch(group_id) or 0
+        if not isinstance(epoch_result, dict):
+            return self._group_e2ee.current_epoch(group_id) or 0
+        return int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
+
+    @staticmethod
+    def _group_secret_matches_committed_rotation(
+        secret_data: dict[str, Any] | None,
+        committed_rotation: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(secret_data, dict):
+            return False
+        committed_commitment = ""
+        if isinstance(committed_rotation, dict):
+            committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
+        local_commitment = str(secret_data.get("commitment") or "").strip()
+        if committed_commitment and committed_commitment != local_commitment:
+            return False
+        pending_rotation_id = str(secret_data.get("pending_rotation_id") or "").strip()
+        if not pending_rotation_id:
+            return True
+        if not isinstance(committed_rotation, dict):
+            return False
+        if str(committed_rotation.get("rotation_id") or "").strip() != pending_rotation_id:
+            return False
+        return True
+
+    async def _committed_group_epoch_state(self, group_id: str) -> dict[str, Any]:
+        try:
+            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+            if isinstance(epoch_result, dict):
+                return epoch_result
+        except Exception as exc:
+            _client_log.warning("群 %s 查询 committed epoch 状态失败，回退本地 epoch: %s", group_id, exc)
+        return {
+            "epoch": self._group_e2ee.current_epoch(group_id) or 0,
+            "committed_epoch": self._group_e2ee.current_epoch(group_id) or 0,
+        }
+
+    async def _ensure_committed_group_secret_for_send(
+        self,
+        group_id: str,
+        committed_epoch: int,
+        epoch_result: dict[str, Any],
+    ) -> int:
+        if committed_epoch <= 0:
+            return committed_epoch
+        secret_data = self._group_e2ee.load_secret(group_id, committed_epoch)
+        committed_rotation = epoch_result.get("committed_rotation") if isinstance(epoch_result, dict) else None
+        if self._group_secret_matches_committed_rotation(secret_data, committed_rotation):
+            return committed_epoch
+        pending_rotation_id = str(secret_data.get("pending_rotation_id") or "") if isinstance(secret_data, dict) else ""
+        _client_log.warning(
+            "群 %s epoch %s 本地 pending key 未匹配服务端 committed rotation，先恢复密钥: local_rotation=%s",
+            group_id, committed_epoch, pending_rotation_id or "-",
+        )
+        await self._recover_group_epoch_key(group_id, committed_epoch, timeout_s=5.0)
+        refreshed = await self._committed_group_epoch_state(group_id)
+        refreshed_committed_epoch = int(
+            (
+                refreshed.get("committed_epoch", refreshed.get("epoch", committed_epoch))
+                if isinstance(refreshed, dict) else committed_epoch
+            ) or committed_epoch
+        )
+        if refreshed_committed_epoch > committed_epoch:
+            committed_epoch = refreshed_committed_epoch
+            await self._recover_group_epoch_key(group_id, committed_epoch, timeout_s=5.0)
+            refreshed = await self._committed_group_epoch_state(group_id)
+        refreshed_rotation = refreshed.get("committed_rotation") if isinstance(refreshed, dict) else None
+        refreshed_secret = self._group_e2ee.load_secret(group_id, committed_epoch)
+        if not self._group_secret_matches_committed_rotation(refreshed_secret, refreshed_rotation):
+            raise StateError(
+                f"group {group_id} epoch {committed_epoch} local key is pending or mismatched; "
+                "refuse to send with uncommitted group key"
+            )
+        return committed_epoch
+
     # ── 便利方法 ──────────────────────────────────────────
 
     async def ping(self, params: dict | None = None) -> Any:
-        return await self.call("meta.ping", params or {})
+        return await self.meta.ping(params or {})
 
     async def status(self, params: dict | None = None) -> Any:
-        return await self.call("meta.status", params or {})
+        return await self.meta.status(params or {})
 
     async def trust_roots(self, params: dict | None = None) -> Any:
-        return await self.call("meta.trust_roots", params or {})
+        return await self.meta.trust_roots(params or {})
 
     # ── 事件 ──────────────────────────────────────────────
 
@@ -1712,10 +2039,152 @@ class AUNClient:
                 "to": target_aid,
                 "payload": req_payload,
                 "encrypt": True,
+                "persist_required": True,
             })
             _client_log.info("已向 %s 请求群 %s 的密钥", target_aid, group_id)
         except Exception as exc:
             _client_log.warning("向 %s 请求群 %s 密钥失败: %s", target_aid, group_id, exc)
+
+    async def _ack_group_rotation_key(
+        self,
+        *,
+        rotation_id: str,
+        key_commitment: str,
+        device_id: str | None = None,
+    ) -> bool:
+        if not rotation_id:
+            return False
+        try:
+            result = await self.call("group.e2ee.ack_rotation_key", {
+                "rotation_id": rotation_id,
+                "key_commitment": key_commitment,
+                "device_id": device_id if device_id is not None else self._device_id,
+            })
+            return bool(isinstance(result, dict) and result.get("success"))
+        except Exception as exc:
+            _client_log.warning("提交 epoch key ack 失败: rotation=%s err=%s", rotation_id, exc)
+            return False
+
+    async def _verify_active_group_rotation_distribution(self, payload: dict[str, Any]) -> bool:
+        """只接受服务端 pending 或已 committed 的 rotation 分发。"""
+        rotation_id = str(payload.get("rotation_id") or "").strip()
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id:
+            return False
+        try:
+            epoch = int(payload.get("epoch") or 0)
+        except (TypeError, ValueError):
+            return False
+        commitment = str(payload.get("commitment") or "").strip()
+        try:
+            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+        except Exception as exc:
+            _client_log.warning(
+                "拒绝无法校验 active rotation 的 epoch key 分发: group=%s rotation=%s err=%s",
+                group_id, rotation_id, exc,
+            )
+            return False
+        committed_epoch = int(
+            epoch_result.get("committed_epoch", epoch_result.get("epoch", 0))
+            if isinstance(epoch_result, dict) else 0
+        )
+        committed_rotation = epoch_result.get("committed_rotation") if isinstance(epoch_result, dict) else None
+        if not rotation_id:
+            if epoch > 0 and epoch <= committed_epoch:
+                if isinstance(committed_rotation, dict) and int(committed_rotation.get("target_epoch") or committed_epoch) == epoch:
+                    committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
+                    if committed_commitment and commitment and committed_commitment != commitment:
+                        return False
+                return True
+            _client_log.info(
+                "拒绝缺少 rotation_id 的未来 epoch key 分发: group=%s epoch=%s committed=%s",
+                group_id, epoch, committed_epoch,
+            )
+            return False
+        pending = epoch_result.get("pending_rotation") if isinstance(epoch_result, dict) else None
+        if isinstance(pending, dict) and not pending.get("expired"):
+            pending_commitment = str(pending.get("key_commitment") or "").strip()
+            if (
+                str(pending.get("rotation_id") or "") == rotation_id
+                and int(pending.get("target_epoch") or 0) == epoch
+                and (not pending_commitment or commitment == pending_commitment)
+            ):
+                return True
+
+        if isinstance(committed_rotation, dict) and committed_epoch >= epoch:
+            committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
+            if (
+                str(committed_rotation.get("rotation_id") or "") == rotation_id
+                and (not committed_commitment or commitment == committed_commitment)
+            ):
+                return True
+
+        _client_log.info(
+            "拒绝非 pending/committed 状态的 epoch key 分发: group=%s rotation=%s epoch=%s",
+            group_id, rotation_id, epoch,
+        )
+        return False
+
+    async def _discard_group_distribution_if_stale(self, payload: dict[str, Any]) -> None:
+        """处理后再校验一次，关闭 verify/store 之间的状态变化窗口。"""
+        rotation_id = str(payload.get("rotation_id") or "").strip()
+        if not rotation_id:
+            return
+        group_id = str(payload.get("group_id") or "").strip()
+        try:
+            epoch = int(payload.get("epoch") or 0)
+        except (TypeError, ValueError):
+            return
+        if not group_id or epoch <= 0:
+            return
+        if await self._verify_active_group_rotation_distribution(payload):
+            return
+        try:
+            if self._group_e2ee.discard_pending_secret(group_id, epoch, rotation_id):
+                _client_log.info(
+                    "丢弃 verify 后变为 stale 的 group epoch key: group=%s epoch=%s rotation=%s",
+                    group_id, epoch, rotation_id,
+                )
+        except Exception as exc:
+            _client_log.debug(
+                "清理 stale group epoch key 失败: group=%s epoch=%s rotation=%s err=%s",
+                group_id, epoch, rotation_id, exc,
+            )
+
+    async def _verify_group_key_response_epoch(self, payload: dict[str, Any]) -> bool:
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id:
+            return False
+        try:
+            epoch = int(payload.get("epoch") or 0)
+        except (TypeError, ValueError):
+            return False
+        if epoch <= 0:
+            return False
+        commitment = str(payload.get("commitment") or "").strip()
+        try:
+            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
+        except Exception as exc:
+            _client_log.warning(
+                "拒绝无法校验 committed epoch 的 group key response: group=%s epoch=%s err=%s",
+                group_id, epoch, exc,
+            )
+            return False
+        if not isinstance(epoch_result, dict):
+            return False
+        committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
+        if epoch > committed_epoch:
+            _client_log.info(
+                "拒绝未提交 epoch 的 group key response: group=%s epoch=%s committed=%s",
+                group_id, epoch, committed_epoch,
+            )
+            return False
+        committed_rotation = epoch_result.get("committed_rotation")
+        if isinstance(committed_rotation, dict) and int(committed_rotation.get("target_epoch") or committed_epoch) == epoch:
+            committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
+            if committed_commitment and commitment and committed_commitment != commitment:
+                return False
+        return True
 
     async def _fill_p2p_gap(self) -> None:
         """后台补齐 P2P 消息空洞。"""
@@ -1798,6 +2267,13 @@ class AUNClient:
         if len(queue) > _PENDING_DECRYPT_LIMIT:
             self._pending_decrypt_msgs[ns] = queue[-_PENDING_DECRYPT_LIMIT:]
 
+    def _schedule_retry_pending_decrypt_msgs(self, group_id: str) -> None:
+        ns = f"group:{group_id}"
+        if not group_id or not self._pending_decrypt_msgs.get(ns):
+            return
+        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+        loop.create_task(self._retry_pending_decrypt_msgs(group_id))
+
     async def _retry_pending_decrypt_msgs(self, group_id: str) -> None:
         """PY-002: 密钥恢复后重试待解密队列中的消息。
 
@@ -1843,8 +2319,10 @@ class AUNClient:
                 _client_log.debug("重试解密失败: group=%s seq=%s: %s", group_id, msg.get("seq"), _exc)
                 still_pending.append(msg)
 
-        if still_pending:
-            self._pending_decrypt_msgs[ns] = still_pending
+        queued_during_retry = list(self._pending_decrypt_msgs.get(ns) or [])
+        merged_pending = still_pending + queued_during_retry
+        if merged_pending:
+            self._pending_decrypt_msgs[ns] = merged_pending[-_PENDING_DECRYPT_LIMIT:]
         else:
             self._pending_decrypt_msgs.pop(ns, None)
 
@@ -2016,7 +2494,15 @@ class AUNClient:
             if result is None:
                 return False
         else:
+            if actual_payload.get("type") == "e2ee.group_key_distribution":
+                if not await self._verify_active_group_rotation_distribution(actual_payload):
+                    return True
+            elif actual_payload.get("type") == "e2ee.group_key_response":
+                if not await self._verify_group_key_response_epoch(actual_payload):
+                    return True
             result = self._group_e2ee.handle_incoming(actual_payload)
+            if result == "distribution":
+                await self._discard_group_distribution_if_stale(actual_payload)
 
         if result == "request":
             # 处理密钥请求并回复
@@ -2052,6 +2538,7 @@ class AUNClient:
                             "to": requester,
                             "payload": response,
                             "encrypt": True,
+                            "persist_required": True,
                         })
                     except Exception as exc:
                         _client_log.warning("向 %s 回复群组密钥失败: %s", requester, exc)
@@ -2059,11 +2546,15 @@ class AUNClient:
         # PY-002: 密钥分发/响应成功后，触发待解密消息重试
         if result in ("distribution", "response"):
             group_id_for_retry = actual_payload.get("group_id", "")
-            if group_id_for_retry:
-                ns_check = f"group:{group_id_for_retry}"
-                if self._pending_decrypt_msgs.get(ns_check):
-                    loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                    loop.create_task(self._retry_pending_decrypt_msgs(group_id_for_retry))
+            rotation_id = str(actual_payload.get("rotation_id") or "")
+            key_commitment = str(actual_payload.get("commitment") or "")
+            if rotation_id and key_commitment:
+                loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+                loop.create_task(self._ack_group_rotation_key(
+                    rotation_id=rotation_id,
+                    key_commitment=key_commitment,
+                ))
+            self._schedule_retry_pending_decrypt_msgs(group_id_for_retry)
 
         # S14: 控制面消息无论 handle_incoming 是否返回 rejected/None 都吞掉，
         # 避免发布到业务消息流。
@@ -2544,6 +3035,15 @@ class AUNClient:
             except asyncio.CancelledError:
                 pass  # 任务取消，正常清理
             setattr(self, attr, None)
+        for key, task in list(self._group_epoch_rotation_retry_tasks.items()):
+            task.cancel()
+            if task is current_task:
+                continue
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._group_epoch_rotation_retry_tasks.pop(key, None)
 
     def _start_heartbeat_task(self) -> None:
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
@@ -2848,7 +3348,13 @@ class AUNClient:
         except Exception as exc:
             _client_log.warning("保存 SeqTracker 状态失败: %s", exc)
 
-    def _build_rotation_signature(self, group_id: str, current_epoch: int, new_epoch: int = 0) -> dict[str, str]:
+    def _build_rotation_signature(
+        self,
+        group_id: str,
+        current_epoch: int,
+        new_epoch: int = 0,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
         """构建 epoch 轮换签名参数。"""
         identity = self._identity
         if not identity or not identity.get("private_key_pem"):
@@ -2858,12 +3364,34 @@ class AUNClient:
             from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
             aid = identity.get("aid", "")
             ts = str(int(time.time()))
-            sign_data = f"{group_id}|{current_epoch}|{new_epoch}|{aid}|{ts}".encode("utf-8")
+            target_epoch = int(new_epoch or current_epoch + 1)
+            source = params or {}
+            sign_payload = {
+                "version": "v2",
+                "group_id": group_id,
+                "base_epoch": int(current_epoch),
+                "target_epoch": target_epoch,
+                "aid": aid,
+                "rotation_timestamp": ts,
+                "rotation_id": str(source.get("rotation_id") or source.get("new_rotation_id") or ""),
+                "reason": str(source.get("reason") or ""),
+                "key_commitment": str(source.get("key_commitment") or ""),
+                "manifest_hash": str(source.get("manifest_hash") or ""),
+                "epoch_chain": str(source.get("epoch_chain") or ""),
+                "expected_members": sorted(str(item) for item in source.get("expected_members", []) if str(item or "").strip())
+                if isinstance(source.get("expected_members"), list) else [],
+                "required_acks": sorted(str(item) for item in source.get("required_acks", []) if str(item or "").strip())
+                if isinstance(source.get("required_acks"), list) else [],
+            }
+            sign_data = json.dumps(
+                sign_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
             pk = _ser.load_pem_private_key(
                 identity["private_key_pem"].encode("utf-8"), password=None,
             )
             sig = pk.sign(sign_data, _ec.ECDSA(_hashes.SHA256()))
             return {
+                "rotation_sig_version": "v2",
                 "rotation_signature": base64.b64encode(sig).decode("ascii"),
                 "rotation_timestamp": ts,
             }
@@ -2871,37 +3399,218 @@ class AUNClient:
             _client_log.warning("构建轮换签名失败: %s", _sig_exc)
             return {}
 
+    @staticmethod
+    def _attach_rotation_id(info: dict[str, Any], rotation_id: str) -> None:
+        if not rotation_id:
+            return
+        for dist in info.get("distributions", []):
+            if not isinstance(dist, dict):
+                continue
+            payload = dist.get("payload")
+            if isinstance(payload, dict):
+                payload["rotation_id"] = rotation_id
+
+    async def _distribute_group_epoch_key(
+        self,
+        info: dict[str, Any],
+        *,
+        rotation_id: str = "",
+    ) -> dict[str, list[str]]:
+        sent: list[str] = []
+        failed: list[str] = []
+        last_heartbeat = time.monotonic()
+        for dist in info.get("distributions", []):
+            if not isinstance(dist, dict):
+                continue
+            target = dist.get("to")
+            payload = dist.get("payload")
+            if not target or not isinstance(payload, dict):
+                continue
+            if rotation_id and time.monotonic() - last_heartbeat >= 20.0:
+                if await self._heartbeat_group_rotation(rotation_id):
+                    last_heartbeat = time.monotonic()
+            for attempt in range(3):
+                try:
+                    await self.call("message.send", {
+                        "to": target,
+                        "payload": payload,
+                        "encrypt": True,
+                        "persist_required": True,
+                    })
+                    sent.append(str(target))
+                    break
+                except Exception as exc:
+                    if attempt < 2:
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                    else:
+                        failed.append(str(target))
+                        _client_log.warning("epoch 密钥分发失败 (to=%s): %s", target, exc)
+        return {"sent": sent, "failed": failed}
+
+    async def _heartbeat_group_rotation(self, rotation_id: str) -> bool:
+        if not rotation_id:
+            return False
+        try:
+            result = await self.call("group.e2ee.heartbeat_rotation", {
+                "rotation_id": rotation_id,
+                "lease_ms": _GROUP_ROTATION_LEASE_MS,
+            })
+            return bool(isinstance(result, dict) and result.get("success"))
+        except Exception as exc:
+            _client_log.warning("刷新 epoch rotation lease 失败: rotation=%s err=%s", rotation_id, exc)
+            return False
+
+    async def _abort_group_rotation(self, rotation_id: str, *, reason: str = "") -> bool:
+        if not rotation_id:
+            return False
+        try:
+            result = await self.call("group.e2ee.abort_rotation", {
+                "rotation_id": rotation_id,
+                "reason": reason or "client_abort",
+            })
+            return bool(isinstance(result, dict) and result.get("success"))
+        except Exception as exc:
+            _client_log.warning("中止 epoch rotation 失败: rotation=%s err=%s", rotation_id, exc)
+            return False
+
+    @staticmethod
+    def _rotation_expected_members_stale(rotation: dict[str, Any], member_aids: list[str]) -> bool:
+        expected = rotation.get("expected_members")
+        if not isinstance(expected, list) or not expected:
+            return False
+        expected_members = sorted({str(item) for item in expected if str(item or "").strip()})
+        current_members = sorted({str(item) for item in member_aids if str(item or "").strip()})
+        return bool(expected_members and current_members and expected_members != current_members)
+
+    @staticmethod
+    def _rotation_retry_delay_s(pending: dict[str, Any] | None) -> float:
+        now_ms = int(time.time() * 1000)
+        lease_expires_at = 0
+        if isinstance(pending, dict):
+            if pending.get("expired") or str(pending.get("status") or "") not in ("", "distributing"):
+                lease_expires_at = 0
+            else:
+                try:
+                    lease_expires_at = int(pending.get("lease_expires_at") or 0)
+                except (TypeError, ValueError):
+                    lease_expires_at = 0
+        base = max(1.0, (lease_expires_at - now_ms) / 1000.0 + 1.0) if lease_expires_at else 5.0
+        return min(base + random.random() * 2.0, _GROUP_ROTATION_RETRY_MAX_DELAY)
+
+    def _schedule_group_rotation_retry(
+        self,
+        group_id: str,
+        *,
+        reason: str,
+        trigger_id: str,
+        expected_epoch: int | None,
+        pending: dict[str, Any] | None,
+    ) -> None:
+        if self._closing or self._state != "connected":
+            return
+        retry_key = f"{group_id}:{trigger_id or reason}:{expected_epoch if expected_epoch is not None else '-'}"
+        existing = self._group_epoch_rotation_retry_tasks.get(retry_key)
+        if existing is not None and not existing.done():
+            return
+        delay = self._rotation_retry_delay_s(pending)
+
+        async def _retry_later() -> None:
+            try:
+                await asyncio.sleep(delay)
+                if self._closing or self._state != "connected":
+                    return
+                await self._maybe_lead_rotate_group_epoch(
+                    group_id,
+                    reason=reason,
+                    trigger_id=trigger_id,
+                    expected_epoch=expected_epoch,
+                )
+            except asyncio.CancelledError:
+                raise
+            finally:
+                self._group_epoch_rotation_retry_tasks.pop(retry_key, None)
+
+        self._group_epoch_rotation_retry_tasks[retry_key] = asyncio.create_task(_retry_later())
+
     async def _sync_epoch_to_server(self, group_id: str) -> None:
         """建群后将本地 epoch 1 同步到服务端（服务端初始为 0），最多重试 3 次。"""
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            try:
-                rotate_params = {
-                    "group_id": group_id,
-                    "current_epoch": 0,
-                }
-                rotate_params.update(self._build_rotation_signature(group_id, 0, 1))
-                cas_result = await self.call("group.e2ee.rotate_epoch", rotate_params)
-                if cas_result.get("success"):
-                    return
-                _client_log.warning(
-                    "group epoch CAS failed; stop key distribution (group=%s, current_epoch=%s, returned_epoch=%s)",
-                    group_id, 0, cas_result.get("epoch"),
-                )
+        wait_started = time.monotonic()
+        while group_id in self._group_epoch_rotation_inflight:
+            if self._closing or self._state != "connected":
                 return
-            except Exception as exc:
-                if attempt < max_retries:
-                    delay = 0.5 * (2 ** (attempt - 1))
+            if time.monotonic() - wait_started > 20.0:
+                _client_log.warning("group epoch create sync still in-flight; skip duplicate sync (group=%s)", group_id)
+                return
+            await asyncio.sleep(0.2)
+        self._group_epoch_rotation_inflight.add(group_id)
+        try:
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                try:
+                    secret_data = self._group_e2ee.load_secret(group_id, 1)
+                    if not secret_data:
+                        raise StateError(f"group {group_id} epoch 1 secret missing")
+                    rotation_id = f"rot-{uuid.uuid4().hex}"
+                    rotate_params = {
+                        "group_id": group_id,
+                        "base_epoch": 0,
+                        "target_epoch": 1,
+                        "rotation_id": rotation_id,
+                        "reason": "create_group",
+                        "key_commitment": secret_data.get("commitment", ""),
+                        "expected_members": secret_data.get("member_aids", [self._aid] if self._aid else []),
+                        "required_acks": [self._aid] if self._aid else [],
+                        "lease_ms": _GROUP_ROTATION_LEASE_MS,
+                    }
+                    rotate_params.update(self._build_rotation_signature(group_id, 0, 1, rotate_params))
+                    begin_result = await self.call("group.e2ee.begin_rotation", rotate_params)
+                    rotation = begin_result.get("rotation") if isinstance(begin_result, dict) else None
+                    if not begin_result.get("success") or not isinstance(rotation, dict):
+                        _client_log.warning(
+                            "group epoch begin failed; stop key distribution (group=%s, returned=%s)",
+                            group_id, begin_result,
+                        )
+                        return
+                    if not await self._ack_group_rotation_key(
+                        rotation_id=rotation.get("rotation_id", rotation_id),
+                        key_commitment=secret_data.get("commitment", ""),
+                    ):
+                        _client_log.warning("group epoch self ack failed (group=%s, rotation=%s)", group_id, rotation_id)
+                        await self._abort_group_rotation(rotation.get("rotation_id", rotation_id), reason="self_ack_failed")
+                        return
+                    commit_result = await self.call("group.e2ee.commit_rotation", {
+                        "rotation_id": rotation.get("rotation_id", rotation_id),
+                    })
+                    if commit_result.get("success"):
+                        self._group_e2ee.store_secret(
+                            group_id,
+                            1,
+                            secret_data["secret"],
+                            secret_data.get("commitment", ""),
+                            secret_data.get("member_aids", [self._aid] if self._aid else []),
+                            epoch_chain=secret_data.get("epoch_chain"),
+                        )
+                        return
                     _client_log.warning(
-                        "同步 epoch 到服务端失败 (group=%s, 第%d/%d次): %s, %.1fs后重试",
-                        group_id, attempt, max_retries, exc, delay,
+                        "group epoch commit failed (group=%s, returned=%s)",
+                        group_id, commit_result,
                     )
-                    await asyncio.sleep(delay)
-                else:
-                    _client_log.error(
-                        "同步 epoch 到服务端最终失败 (group=%s, 已重试%d次): %s",
-                        group_id, max_retries, exc,
-                    )
+                    return
+                except Exception as exc:
+                    if attempt < max_retries:
+                        delay = 0.5 * (2 ** (attempt - 1))
+                        _client_log.warning(
+                            "同步 epoch 到服务端失败 (group=%s, 第%d/%d次): %s, %.1fs后重试",
+                            group_id, attempt, max_retries, exc, delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        _client_log.error(
+                            "同步 epoch 到服务端最终失败 (group=%s, 已重试%d次): %s",
+                            group_id, max_retries, exc,
+                        )
+        finally:
+            self._group_epoch_rotation_inflight.discard(group_id)
 
     async def _maybe_lead_rotate_group_epoch(self, group_id: str, *, reason: str = "membership_changed", trigger_id: str = "", expected_epoch: int | None = None) -> None:
         """基于"排序最小 admin = leader"选举，其他 admin 走 jitter 兜底重试。
@@ -2910,11 +3619,13 @@ class AUNClient:
         普通 member 直接返回，不参与轮换。
         """
         my_aid = self._aid
-        if not my_aid:
+        if not my_aid or self._closing or self._state != "connected":
             return
         wait_started = time.monotonic()
         while group_id in self._group_epoch_rotation_inflight:
             if reason == "membership_changed" and trigger_id and trigger_id in self._group_membership_rotation_done:
+                return
+            if self._closing or self._state != "connected":
                 return
             if time.monotonic() - wait_started > 20.0:
                 _client_log.warning(
@@ -2925,6 +3636,8 @@ class AUNClient:
             await asyncio.sleep(0.2)
         self._group_epoch_rotation_inflight.add(group_id)
         try:
+            if self._closing or self._state != "connected":
+                return
             # 1. 获取成员列表
             members_resp = await self.call("group.get_members", {"group_id": group_id})
             if not isinstance(members_resp, dict):
@@ -2948,6 +3661,8 @@ class AUNClient:
 
             # 3. 排序选出 leader
             admins.sort()
+            if my_aid not in admins:
+                return
             leader = admins[0]
 
             if leader == my_aid:
@@ -2970,10 +3685,23 @@ class AUNClient:
                 after_resp = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
                 after_epoch = after_resp.get("epoch", 0) if isinstance(after_resp, dict) else 0
             except Exception:
+                after_resp = {}
                 after_epoch = self._group_e2ee.current_epoch(group_id) or 0
 
+            if self._closing or self._state != "connected":
+                return
             if after_epoch > before_epoch:
                 return  # leader 已完成
+            pending = after_resp.get("pending_rotation") if isinstance(after_resp, dict) else None
+            if isinstance(pending, dict) and not pending.get("expired"):
+                self._schedule_group_rotation_retry(
+                    group_id,
+                    reason=reason,
+                    trigger_id=trigger_id,
+                    expected_epoch=expected_epoch,
+                    pending=pending,
+                )
+                return
 
             _client_log.info(
                 "[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s",
@@ -2981,6 +3709,12 @@ class AUNClient:
             )
             await self._rotate_group_epoch(group_id, reason=reason, trigger_id=trigger_id, expected_epoch=expected_epoch)
         except Exception as exc:
+            if self._is_expected_group_rotation_skip_error(exc):
+                _client_log.debug(
+                    "跳过 group epoch 轮换兜底: group=%s aid=%s reason=%s err=%s",
+                    group_id, my_aid, reason, exc,
+                )
+                return
             _client_log.warning("_maybe_lead_rotate_group_epoch 失败: %s", exc)
         finally:
             self._group_epoch_rotation_inflight.discard(group_id)
@@ -3003,6 +3737,31 @@ class AUNClient:
             #    只允许 old_epoch -> old_epoch + 1；若 epoch 已推进，说明同一变更已被其它路径处理。
             epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
             server_epoch = int(epoch_result.get("epoch", 0))
+            pending_rotation = epoch_result.get("pending_rotation") if isinstance(epoch_result, dict) else None
+            if isinstance(pending_rotation, dict) and not pending_rotation.get("expired"):
+                stale_pending = (
+                    reason == "membership_changed"
+                    and expected_epoch is not None
+                    and server_epoch == expected_epoch
+                    and self._rotation_expected_members_stale(pending_rotation, member_aids)
+                )
+                if stale_pending and await self._abort_group_rotation(
+                    str(pending_rotation.get("rotation_id") or ""),
+                    reason="membership_changed_during_rotation",
+                ):
+                    _client_log.info(
+                        "aborted stale pending group epoch rotation: group=%s rotation=%s",
+                        group_id, pending_rotation.get("rotation_id") or "-",
+                    )
+                else:
+                    self._schedule_group_rotation_retry(
+                        group_id,
+                        reason=reason,
+                        trigger_id=trigger_id,
+                        expected_epoch=expected_epoch,
+                        pending=pending_rotation,
+                    )
+                    return
             if reason == "membership_changed" and expected_epoch is not None and server_epoch != expected_epoch:
                 if trigger_id:
                     self._group_membership_rotation_done.add(trigger_id)
@@ -3013,42 +3772,169 @@ class AUNClient:
                 return
             current_epoch = expected_epoch if expected_epoch is not None else server_epoch
 
-            # 3. CAS 尝试递增（服务端校验角色 + 原子递增）
+            target_epoch = current_epoch + 1
+            # 3. 本地生成目标 epoch 密钥；服务端 begin 只创建 pending，不推进 committed epoch。
+            rotation_id = f"rot-{uuid.uuid4().hex}"
+            info = self._group_e2ee.rotate_epoch_to(
+                group_id, target_epoch, member_aids, rotation_id=rotation_id,
+            )
+            self._attach_rotation_id(info, rotation_id)
+            def discard_generated_pending() -> None:
+                try:
+                    self._group_e2ee.discard_pending_secret(group_id, target_epoch, rotation_id)
+                except Exception as cleanup_exc:
+                    _client_log.debug(
+                        "清理本地 pending group key 失败: group=%s epoch=%s rotation=%s err=%s",
+                        group_id, target_epoch, rotation_id, cleanup_exc,
+                    )
+
             rotate_params = {
                 "group_id": group_id,
-                "current_epoch": current_epoch,
+                "base_epoch": current_epoch,
+                "target_epoch": target_epoch,
+                "rotation_id": rotation_id,
+                "reason": reason,
+                "key_commitment": info.get("commitment", ""),
+                "expected_members": member_aids,
+                "required_acks": [self._aid] if self._aid else [],
+                "lease_ms": _GROUP_ROTATION_LEASE_MS,
             }
-            rotate_params.update(self._build_rotation_signature(group_id, current_epoch, current_epoch + 1))
-            cas_result = await self.call("group.e2ee.rotate_epoch", rotate_params)
-            if not cas_result.get("success"):
+            rotate_params.update(self._build_rotation_signature(group_id, current_epoch, target_epoch, rotate_params))
+            try:
+                begin_result = await self.call("group.e2ee.begin_rotation", rotate_params)
+            except Exception:
+                discard_generated_pending()
+                raise
+            rotation = begin_result.get("rotation") if isinstance(begin_result, dict) else None
+            if not isinstance(begin_result, dict) or not begin_result.get("success") or not isinstance(rotation, dict):
+                if isinstance(rotation, dict) and not rotation.get("expired"):
+                    if (
+                        reason == "membership_changed"
+                        and self._rotation_expected_members_stale(rotation, member_aids)
+                        and await self._abort_group_rotation(
+                            str(rotation.get("rotation_id") or ""),
+                            reason="membership_changed_during_rotation",
+                        )
+                    ):
+                        self._schedule_group_rotation_retry(
+                            group_id,
+                            reason=reason,
+                            trigger_id=trigger_id,
+                            expected_epoch=expected_epoch,
+                            pending=None,
+                        )
+                    else:
+                        self._schedule_group_rotation_retry(
+                            group_id,
+                            reason=reason,
+                            trigger_id=trigger_id,
+                            expected_epoch=expected_epoch,
+                            pending=rotation,
+                        )
+                elif isinstance(begin_result, dict) and begin_result.get("reason") == "expected_members_mismatch":
+                    self._schedule_group_rotation_retry(
+                        group_id,
+                        reason=reason,
+                        trigger_id=trigger_id,
+                        expected_epoch=expected_epoch,
+                        pending=None,
+                    )
                 _client_log.warning(
-                    "group epoch CAS failed; stop key distribution (group=%s, current_epoch=%s, returned_epoch=%s)",
-                    group_id, current_epoch, cas_result.get("epoch"),
+                    "group epoch begin failed; stop key distribution (group=%s, current_epoch=%s, returned=%s)",
+                    group_id, current_epoch, begin_result,
                 )
-                return  # CAS 失败后必须停止，不生成也不分发新 epoch key
-
-            new_epoch = cas_result["epoch"]
-
-            # 4. 本地生成密钥 + 存储 + 分发
-            info = self._group_e2ee.rotate_epoch_to(group_id, new_epoch, member_aids)
+                discard_generated_pending()
+                return
+            active_rotation_id = str(rotation.get("rotation_id") or rotation_id)
+            distribute_result = await self._distribute_group_epoch_key(info, rotation_id=active_rotation_id)
+            failed = distribute_result.get("failed", [])
+            if failed:
+                _client_log.warning(
+                    "group epoch key distribution incomplete; abort rotation before retry "
+                    "(group=%s rotation=%s failed=%s)",
+                    group_id, active_rotation_id, failed,
+                )
+                await self._abort_group_rotation(active_rotation_id, reason="distribution_failed")
+                self._schedule_group_rotation_retry(
+                    group_id,
+                    reason=reason,
+                    trigger_id=trigger_id,
+                    expected_epoch=expected_epoch,
+                    pending=None,
+                )
+                discard_generated_pending()
+                return
+            await self._heartbeat_group_rotation(rotation.get("rotation_id", rotation_id))
+            if not await self._ack_group_rotation_key(
+                rotation_id=active_rotation_id,
+                key_commitment=info.get("commitment", ""),
+            ):
+                _client_log.warning(
+                    "group epoch self ack failed; abort rotation before retry "
+                    "(group=%s rotation=%s)",
+                    group_id, active_rotation_id,
+                )
+                await self._abort_group_rotation(active_rotation_id, reason="self_ack_failed")
+                self._schedule_group_rotation_retry(
+                    group_id,
+                    reason=reason,
+                    trigger_id=trigger_id,
+                    expected_epoch=expected_epoch,
+                    pending=None,
+                )
+                discard_generated_pending()
+                return
+            commit_result = await self.call("group.e2ee.commit_rotation", {
+                "rotation_id": active_rotation_id,
+            })
+            if not commit_result.get("success"):
+                _client_log.warning(
+                    "group epoch commit failed (group=%s, rotation=%s, returned=%s)",
+                    group_id, active_rotation_id, commit_result,
+                )
+                self._schedule_group_rotation_retry(
+                    group_id,
+                    reason=reason,
+                    trigger_id=trigger_id,
+                    expected_epoch=expected_epoch,
+                    pending=commit_result.get("rotation") if isinstance(commit_result, dict) else rotation,
+                )
+                returned_rotation = commit_result.get("rotation") if isinstance(commit_result, dict) else None
+                if not (
+                    isinstance(returned_rotation, dict)
+                    and str(returned_rotation.get("rotation_id") or "") == active_rotation_id
+                    and str(returned_rotation.get("status") or "") == "distributing"
+                ):
+                    discard_generated_pending()
+                return
+            committed_secret = self._group_e2ee.load_secret(group_id, target_epoch)
+            committed_rotation = (
+                commit_result.get("rotation")
+                if isinstance(commit_result, dict) and isinstance(commit_result.get("rotation"), dict)
+                else {
+                    "rotation_id": active_rotation_id,
+                    "key_commitment": info.get("commitment", ""),
+                }
+            )
+            if committed_secret and self._group_secret_matches_committed_rotation(committed_secret, committed_rotation):
+                self._group_e2ee.store_secret(
+                    group_id,
+                    target_epoch,
+                    committed_secret["secret"],
+                    committed_secret.get("commitment", ""),
+                    committed_secret.get("member_aids", member_aids),
+                    epoch_chain=committed_secret.get("epoch_chain"),
+                )
+            else:
+                _client_log.warning(
+                    "group epoch commit succeeded but local target key does not match committed rotation; keep pending blocked "
+                    "(group=%s rotation=%s epoch=%s)",
+                    group_id, active_rotation_id, target_epoch,
+                )
             if reason == "membership_changed" and trigger_id:
                 self._group_membership_rotation_done.add(trigger_id)
                 if len(self._group_membership_rotation_done) > 2000:
                     self._group_membership_rotation_done = set(list(self._group_membership_rotation_done)[-1000:])
-            for dist in info["distributions"]:
-                for _attempt in range(3):
-                    try:
-                        await self.call("message.send", {
-                            "to": dist["to"],
-                            "payload": dist["payload"],
-                            "encrypt": True,
-                        })
-                        break  # 成功则跳出重试循环
-                    except Exception as _exc:
-                        if _attempt < 2:
-                            await asyncio.sleep(1.0 * (_attempt + 1))
-                        else:
-                            _client_log.warning("epoch 密钥分发失败 (to=%s): %s", dist["to"], _exc)
         except Exception as exc:
             self._log_e2ee_error("rotate_epoch", group_id, "", exc)
 
@@ -3103,6 +3989,7 @@ class AUNClient:
                         "to": new_member_aid,
                         "payload": dist_payload,
                         "encrypt": True,
+                        "persist_required": True,
                     })
                     break
                 except Exception as _send_exc:
@@ -3179,13 +4066,9 @@ class AUNClient:
                 if not my_aid:
                     continue
                 try:
-                    all_groups = self._keystore.load_all_group_secret_states(my_aid)
-                    for gid in list(all_groups.keys()):
-                        # PY-005: 只有 leader 执行定时轮换
-                        if await self._is_rotation_leader(gid):
-                            await self._rotate_group_epoch(gid, reason="scheduled")
-                        else:
-                            _client_log.debug("非 leader，跳过定时轮换: group=%s", gid)
+                    group_ids = self._keystore.list_group_secret_ids(my_aid)
+                    for gid in list(group_ids):
+                        await self._maybe_lead_rotate_group_epoch(gid, reason="scheduled")
                 except Exception as _exc:
                     _client_log.warning("epoch 轮换失败: %s", _exc)
         except asyncio.CancelledError:
@@ -3202,9 +4085,9 @@ class AUNClient:
                 if not my_aid:
                     continue
                 try:
-                    all_groups = self._keystore.load_all_group_secret_states(my_aid)
+                    group_ids = self._keystore.list_group_secret_ids(my_aid)
                     retention = self._config_model.old_epoch_retention_seconds
-                    for gid in list(all_groups.keys()):
+                    for gid in list(group_ids):
                         self._group_e2ee.cleanup(gid, retention)
                 except Exception as _exc:
                     _client_log.warning("epoch 轮换失败: %s", _exc)

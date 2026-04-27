@@ -44,5 +44,5 @@ AGENTS.md
 CLAUDE.md
 
 # 内部测试指南（不发布到 GitHub）
-docs/AUN集成测试与E2E运行指南.md
+docs/AUN测试运行指南.md
 docs/superpowers/

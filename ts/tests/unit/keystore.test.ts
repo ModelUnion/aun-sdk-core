@@ -248,16 +248,15 @@ describe('FileKeyStore', () => {
   it('group_secret 存取往返正确（存 SQLite）', () => {
     const ks = new FileKeyStore(tmpDir);
     const secretB64 = Buffer.from('group-secret-bytes').toString('base64');
-    ks.saveGroupSecretState('group.aid', 'group-1', {
+    ks.storeGroupSecretTransition!('group.aid', 'group-1', {
       epoch: 1,
       secret: secretB64,
       commitment: 'abc',
-      member_aids: ['a', 'b'],
-      updated_at: Date.now(),
-      old_epochs: [],
+      memberAids: ['a', 'b'],
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
     });
 
-    const gs = ks.loadGroupSecretState('group.aid', 'group-1');
+    const gs = ks.loadGroupSecretEpoch!('group.aid', 'group-1');
     expect(gs!.secret).toBe(secretB64);
     ks.close();
   });
@@ -408,27 +407,25 @@ describe('FileKeyStore', () => {
     const ks = new FileKeyStore(tmpDir);
     const oldSecretB64 = Buffer.from('old-secret').toString('base64');
     const newSecretB64 = Buffer.from('new-secret').toString('base64');
-    ks.saveGroupSecretState('epoch.aid', 'group-1', {
+    ks.storeGroupSecretTransition!('epoch.aid', 'group-1', {
+      epoch: 1,
+      secret: oldSecretB64,
+      commitment: 'old-xyz',
+      memberAids: ['a'],
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+    });
+    ks.storeGroupSecretTransition!('epoch.aid', 'group-1', {
       epoch: 2,
       secret: newSecretB64,
       commitment: 'xyz',
-      member_aids: ['a', 'b'],
-      updated_at: Date.now(),
-      old_epochs: [
-        {
-          epoch: 1,
-          secret: oldSecretB64,
-          commitment: 'old-xyz',
-          member_aids: ['a'],
-          updated_at: Date.now() - 10000,
-        },
-      ],
+      memberAids: ['a', 'b'],
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
     });
 
-    const gs = ks.loadGroupSecretState('epoch.aid', 'group-1');
+    const gs = ks.loadGroupSecretEpoch!('epoch.aid', 'group-1');
     expect(gs!.secret).toBe(newSecretB64);
-    const oldEpochs = gs!.old_epochs as GroupOldEpochRecord[];
-    expect(oldEpochs[0].secret).toBe(oldSecretB64);
+    const old = ks.loadGroupSecretEpoch!('epoch.aid', 'group-1', 1) as GroupOldEpochRecord;
+    expect(old.secret).toBe(oldSecretB64);
     ks.close();
   });
 

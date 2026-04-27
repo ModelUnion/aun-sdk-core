@@ -8,12 +8,14 @@ import * as crypto from 'node:crypto';
 import {
   encryptGroupMessage,
   decryptGroupMessage,
+  computeEpochChain,
   computeMembershipCommitment,
   verifyMembershipCommitment,
   storeGroupSecret,
   loadGroupSecret,
   loadAllGroupSecrets,
   cleanupOldEpochs,
+  discardPendingGroupSecret,
   GroupReplayGuard,
   GroupKeyRequestThrottle,
   buildKeyDistribution,
@@ -285,6 +287,24 @@ describe('storeGroupSecret', () => {
     expect(old).not.toBeNull();
     expect(old!.epoch).toBe(1);
   });
+
+  it('discardPendingGroupSecret 只回滚匹配 rotation 的 pending key', () => {
+    const ks = new FakeKeystore();
+    const gs1 = makeGroupSecret();
+    const gs2 = makeGroupSecret();
+
+    storeGroupSecret(ks, 'a', 'grp-1', 1, gs1, 'c1', ['a']);
+    storeGroupSecret(ks, 'a', 'grp-1', 2, gs2, 'c2', ['a'], 'chain2', 'rot-2');
+
+    expect(discardPendingGroupSecret(ks, 'a', 'grp-1', 2, 'other')).toBe(false);
+    expect(loadGroupSecret(ks, 'a', 'grp-1')!.epoch).toBe(2);
+    expect(discardPendingGroupSecret(ks, 'a', 'grp-1', 2, 'rot-2')).toBe(true);
+
+    const restored = loadGroupSecret(ks, 'a', 'grp-1');
+    expect(restored!.epoch).toBe(1);
+    expect(restored!.secret.equals(gs1)).toBe(true);
+    expect(restored!.pending_rotation_id).toBeUndefined();
+  });
 });
 
 describe('loadAllGroupSecrets', () => {
@@ -420,6 +440,86 @@ describe('buildKeyDistribution / handleKeyDistribution', () => {
     const ok = handleKeyDistribution(dist, ks, 'eve.test'); // eve 不在成员列表中
     expect(ok).toBe(false);
   });
+
+  it('key distribution 低于 current epoch 应拒绝防降级', () => {
+    const ks = new FakeKeystore();
+    const members = ['alice.test', 'bob.test'];
+    const currentSecret = makeGroupSecret();
+    const currentCommitment = computeMembershipCommitment(members, 5, 'grp-1', currentSecret);
+    expect(storeGroupSecret(ks, 'bob.test', 'grp-1', 5, currentSecret, currentCommitment, members)).toBe(true);
+
+    const staleSecret = makeGroupSecret();
+    const dist = buildKeyDistribution('grp-1', 3, staleSecret, members, 'alice.test');
+    expect(handleKeyDistribution(dist, ks, 'bob.test')).toBe(false);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1')!.epoch).toBe(5);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1', 3)).toBeNull();
+  });
+
+  it('带 rotation_id 且本地前链可信时拒绝 chain 分叉', () => {
+    const ks = new FakeKeystore();
+    const members = ['alice.test', 'bob.test'];
+    const gs1 = makeGroupSecret();
+    const commitment1 = computeMembershipCommitment(members, 1, 'grp-1', gs1);
+    const chain1 = computeEpochChain(null, 1, commitment1, 'alice.test');
+    expect(storeGroupSecret(ks, 'bob.test', 'grp-1', 1, gs1, commitment1, members, chain1)).toBe(true);
+
+    const gs2 = makeGroupSecret();
+    const dist = buildKeyDistribution('grp-1', 2, gs2, members, 'alice.test', null, '00'.repeat(32));
+    dist.rotation_id = 'rot-test';
+
+    expect(handleKeyDistribution(dist, ks, 'bob.test')).toBe(false);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1')!.epoch).toBe(1);
+  });
+
+  it('新 rotation 可覆盖同 epoch 的旧 pending secret', () => {
+    const ks = new FakeKeystore();
+    const members = ['alice.test', 'bob.test'];
+    const gs1 = makeGroupSecret();
+    const commitment1 = computeMembershipCommitment(members, 1, 'grp-1', gs1);
+    const chain1 = computeEpochChain(null, 1, commitment1, 'alice.test');
+    expect(storeGroupSecret(ks, 'bob.test', 'grp-1', 1, gs1, commitment1, members, chain1)).toBe(true);
+
+    const oldSecret = makeGroupSecret();
+    const oldCommitment = computeMembershipCommitment(members, 2, 'grp-1', oldSecret);
+    const oldChain = computeEpochChain(chain1, 2, oldCommitment, 'alice.test');
+    expect(storeGroupSecret(
+      ks, 'bob.test', 'grp-1', 2, oldSecret, oldCommitment, members, oldChain, 'rot-old',
+    )).toBe(true);
+
+    const newSecret = makeGroupSecret();
+    const newCommitment = computeMembershipCommitment(members, 2, 'grp-1', newSecret);
+    const newChain = computeEpochChain(chain1, 2, newCommitment, 'alice.test');
+    const dist = buildKeyDistribution('grp-1', 2, newSecret, members, 'alice.test', null, newChain);
+    dist.rotation_id = 'rot-new';
+
+    expect(handleKeyDistribution(dist, ks, 'bob.test')).toBe(true);
+    const loaded = loadGroupSecret(ks, 'bob.test', 'grp-1')!;
+    expect(Buffer.compare(loaded.secret, newSecret)).toBe(0);
+    expect(loaded.epoch_chain).toBe(newChain);
+    expect(loaded.pending_rotation_id).toBe('rot-new');
+  });
+
+  it('缺少本地前链时按兼容档接收并标记未验证', () => {
+    const ks = new FakeKeystore();
+    const members = ['alice.test', 'bob.test'];
+    const gs = makeGroupSecret();
+    const dist = buildKeyDistribution('grp-1', 2, gs, members, 'alice.test', null, '00'.repeat(32));
+
+    expect(handleKeyDistribution(dist, ks, 'bob.test')).toBe(true);
+    const loaded = loadGroupSecret(ks, 'bob.test', 'grp-1')!;
+    expect(loaded.epoch_chain_unverified).toBe(true);
+    expect(loaded.epoch_chain_unverified_reason).toBe('missing_prev_chain');
+  });
+
+  it('新 rotation 缺少 epoch_chain 时拒绝', () => {
+    const ks = new FakeKeystore();
+    const gs = makeGroupSecret();
+    const members = ['alice.test', 'bob.test'];
+    const dist = buildKeyDistribution('grp-1', 1, gs, members, 'alice.test');
+    dist.rotation_id = 'rot-test';
+
+    expect(handleKeyDistribution(dist, ks, 'bob.test')).toBe(false);
+  });
 });
 
 describe('buildKeyRequest / handleKeyRequest / handleKeyResponse', () => {
@@ -463,6 +563,58 @@ describe('buildKeyRequest / handleKeyRequest / handleKeyResponse', () => {
     const request = buildKeyRequest('grp-1', 1, 'eve.test'); // eve 不是成员
     const response = handleKeyRequest(request, aliceKs, 'alice.test', members);
     expect(response).toBeNull();
+  });
+
+  it('key response 补旧 epoch 只写 old epoch，不覆盖 current', () => {
+    const ks = new FakeKeystore();
+    const members = ['alice.test', 'bob.test'];
+    const currentSecret = makeGroupSecret();
+    const currentCommitment = computeMembershipCommitment(members, 5, 'grp-1', currentSecret);
+    expect(storeGroupSecret(ks, 'bob.test', 'grp-1', 5, currentSecret, currentCommitment, members)).toBe(true);
+
+    const oldSecret = makeGroupSecret();
+    const oldCommitment = computeMembershipCommitment(members, 3, 'grp-1', oldSecret);
+    const ok = handleKeyResponse({
+      type: 'e2ee.group_key_response',
+      group_id: 'grp-1',
+      epoch: 3,
+      group_secret: oldSecret.toString('base64'),
+      commitment: oldCommitment,
+      member_aids: members,
+      requester_aid: 'bob.test',
+      responder_aid: 'alice.test',
+      request_id: 'req-old',
+    }, ks, 'bob.test');
+
+    expect(ok).toBe(true);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1')!.epoch).toBe(5);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1', 3)!.secret.equals(oldSecret)).toBe(true);
+  });
+
+  it('key response 不能绕过轮换推进到 future epoch', () => {
+    const ks = new FakeKeystore();
+    const members = ['alice.test', 'bob.test'];
+    const currentSecret = makeGroupSecret();
+    const currentCommitment = computeMembershipCommitment(members, 5, 'grp-1', currentSecret);
+    expect(storeGroupSecret(ks, 'bob.test', 'grp-1', 5, currentSecret, currentCommitment, members)).toBe(true);
+
+    const futureSecret = makeGroupSecret();
+    const futureCommitment = computeMembershipCommitment(members, 6, 'grp-1', futureSecret);
+    const ok = handleKeyResponse({
+      type: 'e2ee.group_key_response',
+      group_id: 'grp-1',
+      epoch: 6,
+      group_secret: futureSecret.toString('base64'),
+      commitment: futureCommitment,
+      member_aids: members,
+      requester_aid: 'bob.test',
+      responder_aid: 'alice.test',
+      request_id: 'req-future',
+    }, ks, 'bob.test');
+
+    expect(ok).toBe(false);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1')!.epoch).toBe(5);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1', 6)).toBeNull();
   });
 });
 
@@ -695,6 +847,37 @@ describe('GroupE2EEManager.rotateEpoch', () => {
     // 关键：如果用 ?? 替代 ||，epoch 0 不会被误判
     const result = mgr.rotateEpoch(groupId, members);
     expect(result.epoch).toBe(1);
+  });
+
+  it('rotateEpochTo 替换同 epoch pending 时应使用上一 epoch chain', () => {
+    const aid = 'rotate-pending.aid';
+    const ks = makeGroupKs(aid);
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity(aid, privateKey);
+    ks._identities[aid] = identity;
+
+    const mgr = new GroupE2EEManager({
+      identityFn: () => identity,
+      keystore: ks,
+    });
+    const groupId = 'grp-rotate-pending';
+    const members = [aid, 'other.aid'];
+    const secret1 = generateGroupSecret();
+    const commitment1 = computeMembershipCommitment(members, 1, groupId, secret1);
+    const chain1 = computeEpochChain(null, 1, commitment1, aid);
+    storeGroupSecret(ks, aid, groupId, 1, secret1, commitment1, members, chain1);
+
+    const oldSecret = generateGroupSecret();
+    const oldCommitment = computeMembershipCommitment(members, 2, groupId, oldSecret);
+    const oldChain = computeEpochChain(chain1, 2, oldCommitment, aid);
+    storeGroupSecret(ks, aid, groupId, 2, oldSecret, oldCommitment, members, oldChain, 'rot-old');
+
+    mgr.rotateEpochTo(groupId, 2, members, { rotationId: 'rot-new' });
+
+    const loaded = loadGroupSecret(ks, aid, groupId);
+    const expectedChain = computeEpochChain(chain1, 2, loaded!.commitment, aid);
+    expect(loaded!.epoch_chain).toBe(expectedChain);
+    expect(loaded!.pending_rotation_id).toBe('rot-new');
   });
 });
 

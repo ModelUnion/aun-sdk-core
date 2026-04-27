@@ -85,9 +85,8 @@ class TestPY002SenderSignatureVerification:
                 return self._prekeys.get(aid, {})
             def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7, device_id=""):
                 return []
-            def save_group_secret_state(self, *a, **kw): pass
-            def load_group_secret_state(self, *a, **kw): return None
-            def load_all_group_secret_states(self, *a, **kw): return {}
+            def list_group_secret_ids(self, *a, **kw): return []
+            def load_group_secret_epoch(self, *a, **kw): return None
             def cleanup_group_old_epochs_state(self, *a, **kw): return 0
 
         sender_priv_pem = sender_key.private_bytes(

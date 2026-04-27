@@ -44,17 +44,42 @@ type StructuredKeyStore interface {
 	// CleanupE2EEPrekeys 清理”早于 cutoffMs 且不在最新 keepLatest 个里”的 prekey 私钥状态；deviceID 为空时清理默认设备
 	CleanupE2EEPrekeys(aid, deviceID string, cutoffMs int64, keepLatest int) ([]string, error)
 
-	// LoadGroupSecretState 加载单个群组的结构化密钥状态
-	LoadGroupSecretState(aid, groupID string) (map[string]any, error)
-
-	// LoadAllGroupSecretStates 加载某个 AID 的全部群组结构化密钥状态
-	LoadAllGroupSecretStates(aid string) (map[string]map[string]any, error)
-
-	// SaveGroupSecretState 保存单个群组结构化密钥状态
-	SaveGroupSecretState(aid, groupID string, entry map[string]any) error
+	// ListGroupSecretIDs 列出本地已存储群组密钥的 group_id
+	ListGroupSecretIDs(aid string) ([]string, error)
 
 	// CleanupGroupOldEpochsState 清理单个群组过期的旧 epoch 状态
 	CleanupGroupOldEpochsState(aid, groupID string, cutoffMs int64) (int, error)
+
+	// LoadGroupSecretEpoch 按 row 加载当前或指定 epoch 的群组密钥
+	LoadGroupSecretEpoch(aid, groupID string, epoch *int) (map[string]any, error)
+
+	// LoadGroupSecretEpochs 按 row 加载某个群组的当前和历史 epoch 密钥
+	LoadGroupSecretEpochs(aid, groupID string) ([]map[string]any, error)
+
+	// StoreGroupSecretTransition 事务化保存群组密钥状态转移
+	StoreGroupSecretTransition(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error)
+
+	// StoreGroupSecretEpoch 事务化保存指定 epoch 密钥；低于 current 时写入 old epoch row
+	StoreGroupSecretEpoch(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error)
+
+	// DiscardPendingGroupSecretState 事务化丢弃指定 pending rotation
+	DiscardPendingGroupSecretState(aid, groupID string, epoch int, rotationID string) (bool, error)
+
+	// DeleteGroupSecretState 删除单个群组的所有密钥状态
+	DeleteGroupSecretState(aid, groupID string) error
+}
+
+type GroupSecretTransitionOptions struct {
+	Epoch                      int
+	Secret                     string
+	Commitment                 string
+	MemberAIDs                 []string
+	EpochChain                 string
+	PendingRotationID          string
+	EpochChainUnverified       bool
+	EpochChainUnverifiedSet    bool
+	EpochChainUnverifiedReason string
+	OldEpochRetentionMillis    int64
 }
 
 // VersionedCertKeyStore 提供按证书指纹加载/保存版本化证书的能力。

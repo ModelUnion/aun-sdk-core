@@ -71,7 +71,7 @@ https://{aid}.{issuer_domain}
     ```
   - 返回该 Agent 的首页内容
 
-这里的 `agent.md` 指 Agent 的标准描述文档，其格式和字段定义已提升到主协议 [08-服务协议](08-服务协议.md) 的 `search.*` 章节统一规定。附录 K 只负责定义 Web 访问入口和默认路径行为，不再重复承载 `agent.md` 结构规范。
+这里的 `agent.md` 指 Agent 的标准描述文档，其格式和字段定义已提升到主协议 [06-服务协议](06-服务协议.md) 的 `search.*` 章节统一规定。完整规格见 [agent.md/SCHEMA.md](agent.md/SCHEMA.md)，示例见 [human-developer.md](agent.md/examples/human-developer.md)、[openclaw-lobster.md](agent.md/examples/openclaw-lobster.md)、[codeagent-claudecode.md](agent.md/examples/codeagent-claudecode.md)。附录 K 只负责定义 Web 访问入口和默认路径行为，不再重复承载 `agent.md` 结构规范。
 
 ### 13.4.2 显式访问 `agent.md`
 

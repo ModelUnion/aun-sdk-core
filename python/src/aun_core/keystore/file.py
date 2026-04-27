@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -369,52 +370,13 @@ class FileKeyStore(KeyStore):
 
     # ── Group Secrets ────────────────────────────────────────
 
-    def load_group_secret_state(self, aid: str, group_id: str) -> dict[str, Any] | None:
+    def list_group_secret_ids(self, aid: str) -> list[str]:
         lock = self._get_metadata_lock(aid)
         with lock:
             db = self._get_db(aid)
-            current = db.load_group_current(group_id)
-            if current is None:
-                return None
-            old_epochs = db.load_group_old_epochs(group_id)
-            if old_epochs:
-                current["old_epochs"] = old_epochs
-            return current
-
-    def load_all_group_secret_states(self, aid: str) -> dict[str, dict[str, Any]]:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            db = self._get_db(aid)
-            result = db.load_all_group_current()
-            for group_id, entry in result.items():
-                old_epochs = db.load_group_old_epochs(group_id)
-                if old_epochs:
-                    entry["old_epochs"] = old_epochs
-            return result
-
-    def save_group_secret_state(self, aid: str, group_id: str, entry: dict[str, Any]) -> None:
-        lock = self._get_metadata_lock(aid)
-        with lock:
-            db = self._get_db(aid)
-            db.delete_all_group_old_epochs(group_id)
-            epoch = entry.get("epoch")
-            secret = entry.get("secret", "")
-            data = {k: v for k, v in entry.items() if k not in ("group_id", "epoch", "secret", "old_epochs", "updated_at")}
-            if isinstance(epoch, (int, float)):
-                db.save_group_current(group_id, int(epoch), secret, data)
-            else:
-                db.delete_group_current(group_id)
-            old_epochs = entry.get("old_epochs")
-            if isinstance(old_epochs, list):
-                for old in old_epochs:
-                    if not isinstance(old, dict):
-                        continue
-                    old_epoch = old.get("epoch")
-                    if not isinstance(old_epoch, (int, float)):
-                        continue
-                    old_secret = old.get("secret", "")
-                    old_data = {k: v for k, v in old.items() if k not in ("epoch", "secret", "updated_at", "expires_at")}
-                    db.save_group_old_epoch(group_id, int(old_epoch), old_secret, old_data, updated_at=old.get("updated_at"), expires_at=old.get("expires_at"))
+            ids = set(db.load_all_group_current().keys())
+            ids.update(db.load_all_group_ids_with_old_epochs())
+            return sorted(ids)
 
     def cleanup_group_old_epochs_state(self, aid: str, group_id: str, cutoff_ms: int) -> int:
         lock = self._get_metadata_lock(aid)
@@ -423,11 +385,10 @@ class FileKeyStore(KeyStore):
             old_epochs = db.load_group_old_epochs(group_id)
             if not old_epochs:
                 return 0
-            # 与 e2ee.py _cleanup_marker 一致：优先 updated_at，没有则 expires_at
             to_delete: list[int] = []
             for old in old_epochs:
-                marker = old.get("updated_at") or old.get("expires_at") or 0
-                if isinstance(marker, (int, float)) and int(marker) < cutoff_ms:
+                marker = old.get("updated_at") or 0
+                if isinstance(marker, (int, float)) and int(marker) <= cutoff_ms:
                     epoch = old.get("epoch")
                     if isinstance(epoch, (int, float)):
                         to_delete.append(int(epoch))
@@ -440,6 +401,81 @@ class FileKeyStore(KeyStore):
                 )
                 conn.commit()
             return len(to_delete)
+
+    def load_group_secret_epoch(self, aid: str, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).load_group_secret_epoch(group_id, epoch)
+
+    def load_group_secret_epochs(self, aid: str, group_id: str) -> list[dict[str, Any]]:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).load_group_secret_epochs(group_id)
+
+    def store_group_secret_transition(
+        self,
+        aid: str,
+        group_id: str,
+        *,
+        epoch: int,
+        secret: str,
+        commitment: str,
+        member_aids: list[str],
+        epoch_chain: str | None = None,
+        pending_rotation_id: str = "",
+        epoch_chain_unverified: bool | None = None,
+        epoch_chain_unverified_reason: str | None = None,
+        old_epoch_retention_ms: int,
+    ) -> bool:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).store_group_secret_transition(
+                group_id,
+                epoch=epoch,
+                secret=secret,
+                commitment=commitment,
+                member_aids=member_aids,
+                epoch_chain=epoch_chain,
+                pending_rotation_id=pending_rotation_id,
+                epoch_chain_unverified=epoch_chain_unverified,
+                epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+                old_epoch_retention_ms=old_epoch_retention_ms,
+            )
+
+    def store_group_secret_epoch(
+        self,
+        aid: str,
+        group_id: str,
+        *,
+        epoch: int,
+        secret: str,
+        commitment: str,
+        member_aids: list[str],
+        epoch_chain: str | None = None,
+        pending_rotation_id: str = "",
+        epoch_chain_unverified: bool | None = None,
+        epoch_chain_unverified_reason: str | None = None,
+        old_epoch_retention_ms: int,
+    ) -> bool:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).store_group_secret_epoch(
+                group_id,
+                epoch=epoch,
+                secret=secret,
+                commitment=commitment,
+                member_aids=member_aids,
+                epoch_chain=epoch_chain,
+                pending_rotation_id=pending_rotation_id,
+                epoch_chain_unverified=epoch_chain_unverified,
+                epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+                old_epoch_retention_ms=old_epoch_retention_ms,
+            )
+
+    def discard_pending_group_secret_state(self, aid: str, group_id: str, epoch: int, rotation_id: str) -> bool:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).discard_pending_group_secret_state(group_id, epoch, rotation_id)
 
     # ── Instance State ───────────────────────────────────────
 
@@ -646,6 +682,81 @@ class FileKeyStore(KeyStore):
                 dest.write_bytes(src.read_bytes())
             except OSError as exc:
                 _log.warning("同步根证书失败 (src=%s, dest=%s): %s", src, dest, exc)
+
+    def trust_root_dir(self) -> Path:
+        """返回本地信任根证书目录。"""
+        path = self._root / "CA" / "root"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def trust_root_bundle_path(self) -> Path:
+        """返回动态导入的信任根证书 bundle 路径。"""
+        return self.trust_root_dir() / "trust-roots.pem"
+
+    def save_trust_roots(self, trust_list: dict[str, Any], root_certs: list[dict[str, str]]) -> Path:
+        """保存已通过管理局签名校验的信任根列表和 PEM bundle。"""
+        dest_dir = self.trust_root_dir()
+        bundle_parts: list[str] = []
+        for index, item in enumerate(root_certs):
+            cert_pem = str(item.get("cert_pem") or "").strip()
+            if not cert_pem:
+                continue
+            cert_id = str(item.get("id") or item.get("fingerprint_sha256") or f"root-{index + 1}").strip()
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", cert_id)[:120] or f"root-{index + 1}"
+            (dest_dir / f"{safe_name}.crt").write_text(cert_pem + "\n", encoding="utf-8")
+            bundle_parts.append(cert_pem + "\n")
+        bundle_path = self.trust_root_bundle_path()
+        bundle_path.write_text("".join(bundle_parts), encoding="utf-8")
+        (dest_dir / "trust-roots.json").write_text(
+            json.dumps(trust_list, ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        return bundle_path
+
+    def save_issuer_root_cert(self, issuer: str, cert_pem: str, fingerprint_sha256: str = "") -> tuple[Path, Path]:
+        """保存指定 issuer 发布的 Root CA 证书，并合并进动态 trust-roots bundle。"""
+        dest_dir = self.trust_root_dir()
+        issuer_dir = dest_dir / "issuers"
+        issuer_dir.mkdir(parents=True, exist_ok=True)
+        safe_issuer = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(issuer or "").strip())[:120] or "issuer"
+        cert_path = issuer_dir / f"{safe_issuer}.root.crt"
+        normalized_pem = cert_pem.strip() + "\n"
+        cert_path.write_text(normalized_pem, encoding="utf-8")
+
+        bundle_path = self.trust_root_bundle_path()
+        bundle_parts: list[str] = []
+        if bundle_path.exists():
+            try:
+                bundle_parts.extend(self._split_pem_bundle(bundle_path.read_text(encoding="utf-8")))
+            except OSError:
+                pass
+        bundle_parts.append(normalized_pem)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for pem in bundle_parts:
+            key = self._fingerprint_from_cert_pem(pem) or hashlib.sha256(pem.encode("utf-8")).hexdigest()
+            if fingerprint_sha256:
+                normalized_fp = fingerprint_sha256.lower().removeprefix("sha256:")
+                if key.endswith(normalized_fp):
+                    key = f"sha256:{normalized_fp}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(pem.strip() + "\n")
+        bundle_path.write_text("".join(deduped), encoding="utf-8")
+        return cert_path, bundle_path
+
+    @staticmethod
+    def _split_pem_bundle(bundle_text: str) -> list[str]:
+        marker = "-----END CERTIFICATE-----"
+        certs: list[str] = []
+        for part in bundle_text.split(marker):
+            part = part.strip()
+            if not part:
+                continue
+            certs.append(f"{part}\n{marker}\n")
+        return certs
 
     @staticmethod
     def _prepare_root(preferred: Path, fallback: Path) -> Path:

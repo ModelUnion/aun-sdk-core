@@ -95,6 +95,11 @@ export interface GroupOldEpochRecord extends JsonObject {
   secret?: string;
   commitment?: string;
   member_aids?: string[];
+  epoch_chain?: string;
+  epoch_chain_unverified?: boolean;
+  epoch_chain_unverified_reason?: string;
+  pending_rotation_id?: string;
+  pending_created_at?: number;
   secret_protection?: JsonObject;
   created_at?: number;
   updated_at?: number;
@@ -108,13 +113,15 @@ export interface GroupSecretRecord extends JsonObject {
   secret?: string;
   commitment?: string;
   member_aids?: string[];
+  epoch_chain?: string;
+  epoch_chain_unverified?: boolean;
+  epoch_chain_unverified_reason?: string;
+  pending_rotation_id?: string;
+  pending_created_at?: number;
   updated_at?: number;
   secret_protection?: JsonObject;
   old_epochs?: GroupOldEpochRecord[];
 }
-
-/** 群组密钥状态映射 */
-export type GroupSecretMap = Record<string, GroupSecretRecord>;
 
 /** metadata 记录 */
 export interface MetadataRecord extends JsonObject {
@@ -123,7 +130,6 @@ export interface MetadataRecord extends JsonObject {
   kite_token?: string;
   e2ee_prekeys?: PrekeyMap;
   e2ee_sessions?: JsonObject[];
-  group_secrets?: GroupSecretMap;
 }
 
 /** 身份记录 */

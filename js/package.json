@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/core-browser",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "AUN Protocol Core SDK for Browser",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,11 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "vitest run --environment jsdom"
+    "test": "vitest run --environment jsdom",
+    "test:unit": "vitest run --environment jsdom tests/unit",
+    "test:integration": "vitest run --environment jsdom tests/integration",
+    "test:e2e": "npm run build && playwright test --config=playwright.agentid-local.config.ts tests/e2e-browser/e2ee.spec.ts --reporter=line",
+    "test:e2e:smoke": "npm run build && playwright test --config=playwright.agentid-local.config.ts tests/e2e-browser/e2ee.spec.ts --grep \"SDK 创建 AID\" --reporter=line"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",

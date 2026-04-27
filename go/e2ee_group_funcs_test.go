@@ -1,6 +1,7 @@
 package aun
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -208,7 +209,7 @@ func TestStoreGroupSecret(t *testing.T) {
 	secret := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment([]string{"alice", "bob"}, 1, "g1", secret)
 
-	ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, []string{"alice", "bob"})
+	ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, []string{"alice", "bob"}, "")
 	if err != nil || !ok {
 		t.Fatalf("StoreGroupSecret 失败: ok=%v err=%v", ok, err)
 	}
@@ -232,11 +233,11 @@ func TestStoreGroupSecret_EpochDowngradeRejected(t *testing.T) {
 	aid := "alice.test"
 	secret1 := GenerateGroupSecret()
 	commitment1 := ComputeMembershipCommitment([]string{"alice"}, 5, "g1", secret1)
-	StoreGroupSecret(ks, aid, "g1", 5, secret1, commitment1, []string{"alice"})
+	StoreGroupSecret(ks, aid, "g1", 5, secret1, commitment1, []string{"alice"}, "")
 
 	secret2 := GenerateGroupSecret()
 	commitment2 := ComputeMembershipCommitment([]string{"alice"}, 3, "g1", secret2)
-	ok, err := StoreGroupSecret(ks, aid, "g1", 3, secret2, commitment2, []string{"alice"})
+	ok, err := StoreGroupSecret(ks, aid, "g1", 3, secret2, commitment2, []string{"alice"}, "")
 	if err != nil {
 		t.Fatalf("不应报错: %v", err)
 	}
@@ -260,7 +261,7 @@ func TestCleanupOldEpochs(t *testing.T) {
 	for epoch := 1; epoch <= 5; epoch++ {
 		secret := GenerateGroupSecret()
 		commitment := ComputeMembershipCommitment([]string{"alice"}, epoch, "g1", secret)
-		StoreGroupSecret(ks, aid, "g1", epoch, secret, commitment, []string{"alice"})
+		StoreGroupSecret(ks, aid, "g1", epoch, secret, commitment, []string{"alice"}, "")
 	}
 
 	// 清理所有旧 epoch（保留 0 秒 = 全部过期）
@@ -292,14 +293,14 @@ func TestStoreGroupSecretUsesStructuredKeyStoreInterface(t *testing.T) {
 	aid := "alice.test"
 	secret := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment([]string{"alice", "bob"}, 1, "g1", secret)
-	ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, []string{"alice", "bob"})
+	ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, []string{"alice", "bob"}, "")
 	if err != nil || !ok {
 		t.Fatalf("StoreGroupSecret 失败: ok=%v err=%v", ok, err)
 	}
 
-	entry, err := ks.LoadGroupSecretState(aid, "g1")
+	entry, err := ks.LoadGroupSecretEpoch(aid, "g1", nil)
 	if err != nil {
-		t.Fatalf("LoadGroupSecretState 失败: %v", err)
+		t.Fatalf("LoadGroupSecretEpoch 失败: %v", err)
 	}
 	if entry == nil {
 		t.Fatal("结构化 group secret 主存为空")
@@ -366,12 +367,12 @@ func TestEpochDowngrade(t *testing.T) {
 	// epoch 1
 	s1 := GenerateGroupSecret()
 	c1 := ComputeMembershipCommitment([]string{"alice"}, 1, "g1", s1)
-	StoreGroupSecret(ks, aid, "g1", 1, s1, c1, []string{"alice"})
+	StoreGroupSecret(ks, aid, "g1", 1, s1, c1, []string{"alice"}, "")
 
 	// epoch 3 (跳过 2)
 	s3 := GenerateGroupSecret()
 	c3 := ComputeMembershipCommitment([]string{"alice"}, 3, "g1", s3)
-	ok, _ := StoreGroupSecret(ks, aid, "g1", 3, s3, c3, []string{"alice"})
+	ok, _ := StoreGroupSecret(ks, aid, "g1", 3, s3, c3, []string{"alice"}, "")
 	if !ok {
 		t.Error("epoch 3 应被接受")
 	}
@@ -379,7 +380,7 @@ func TestEpochDowngrade(t *testing.T) {
 	// epoch 2 应被拒绝
 	s2 := GenerateGroupSecret()
 	c2 := ComputeMembershipCommitment([]string{"alice"}, 2, "g1", s2)
-	ok, _ = StoreGroupSecret(ks, aid, "g1", 2, s2, c2, []string{"alice"})
+	ok, _ = StoreGroupSecret(ks, aid, "g1", 2, s2, c2, []string{"alice"}, "")
 	if ok {
 		t.Error("epoch 2 降级应被拒绝")
 	}
@@ -404,7 +405,7 @@ func TestEpochDowngrade(t *testing.T) {
 func TestBuildKeyDistribution(t *testing.T) {
 	secret := GenerateGroupSecret()
 	members := []string{"alice", "bob", "charlie"}
-	dist := BuildKeyDistribution("g1", 1, secret, members, "alice", nil)
+	dist := BuildKeyDistribution("g1", 1, secret, members, "alice", nil, "")
 
 	if dist["type"] != "e2ee.group_key_distribution" {
 		t.Errorf("type 不正确: %v", dist["type"])
@@ -444,7 +445,7 @@ func TestHandleKeyDistribution(t *testing.T) {
 	secret := GenerateGroupSecret()
 	members := []string{"alice.test", "bob.test"}
 
-	dist := BuildKeyDistribution("g1", 1, secret, members, "alice.test", nil)
+	dist := BuildKeyDistribution("g1", 1, secret, members, "alice.test", nil, "")
 	ok := HandleKeyDistribution(dist, ks, aid, nil)
 	if !ok {
 		t.Error("HandleKeyDistribution 应成功")
@@ -459,6 +460,135 @@ func TestHandleKeyDistribution(t *testing.T) {
 	}
 }
 
+func TestHandleKeyDistribution_StrictRejectsChainFork(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	secret1 := GenerateGroupSecret()
+	commitment1 := ComputeMembershipCommitment(members, 1, "g1", secret1)
+	chain1 := ComputeEpochChain("", 1, commitment1, "alice.test")
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret1, commitment1, members, chain1); err != nil || !ok {
+		t.Fatalf("预置 epoch1 失败: ok=%v err=%v", ok, err)
+	}
+
+	dist := BuildKeyDistribution("g1", 2, GenerateGroupSecret(), members, "alice.test", nil, strings.Repeat("00", 32))
+	dist["rotation_id"] = "rot-test"
+	if HandleKeyDistribution(dist, ks, aid, nil) {
+		t.Fatal("带 rotation_id 且本地前链可信时应拒绝 chain 分叉")
+	}
+	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
+	if int(toInt64(loaded["epoch"])) != 1 {
+		t.Fatalf("拒绝后不应覆盖当前 epoch: %v", loaded["epoch"])
+	}
+}
+
+func TestHandleKeyDistribution_ReplacesStalePendingSameEpoch(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	secret1 := GenerateGroupSecret()
+	commitment1 := ComputeMembershipCommitment(members, 1, "g1", secret1)
+	chain1 := ComputeEpochChain("", 1, commitment1, "alice.test")
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret1, commitment1, members, chain1); err != nil || !ok {
+		t.Fatalf("预置 epoch1 失败: ok=%v err=%v", ok, err)
+	}
+
+	oldSecret := GenerateGroupSecret()
+	oldCommitment := ComputeMembershipCommitment(members, 2, "g1", oldSecret)
+	oldChain := ComputeEpochChain(chain1, 2, oldCommitment, "alice.test")
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 2, oldSecret, oldCommitment, members, oldChain, "rot-old"); err != nil || !ok {
+		t.Fatalf("预置旧 pending 失败: ok=%v err=%v", ok, err)
+	}
+
+	newSecret := GenerateGroupSecret()
+	newCommitment := ComputeMembershipCommitment(members, 2, "g1", newSecret)
+	newChain := ComputeEpochChain(chain1, 2, newCommitment, "alice.test")
+	dist := BuildKeyDistribution("g1", 2, newSecret, members, "alice.test", nil, newChain)
+	dist["rotation_id"] = "rot-new"
+
+	if !HandleKeyDistribution(dist, ks, aid, nil) {
+		t.Fatal("新 active rotation 应可覆盖旧 pending secret")
+	}
+	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
+	if !bytes.Equal(loaded["secret"].([]byte), newSecret) {
+		t.Fatal("应覆盖为新 rotation 的 group secret")
+	}
+	if loaded["epoch_chain"] != newChain {
+		t.Fatalf("epoch_chain 未更新: %v", loaded["epoch_chain"])
+	}
+	if loaded["pending_rotation_id"] != "rot-new" {
+		t.Fatalf("pending_rotation_id 未更新: %v", loaded["pending_rotation_id"])
+	}
+}
+
+func TestHandleKeyDistribution_MissingPrevChainMarkedUnverified(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	dist := BuildKeyDistribution("g1", 2, GenerateGroupSecret(), members, "alice.test", nil, strings.Repeat("00", 32))
+
+	if !HandleKeyDistribution(dist, ks, aid, nil) {
+		t.Fatal("缺少本地前链时应按兼容档接收")
+	}
+	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
+	if loaded["epoch_chain_unverified"] != true {
+		t.Fatalf("应标记 epoch_chain_unverified: %#v", loaded)
+	}
+	if loaded["epoch_chain_unverified_reason"] != "missing_prev_chain" {
+		t.Fatalf("未验证原因不正确: %#v", loaded["epoch_chain_unverified_reason"])
+	}
+}
+
+func TestHandleKeyDistribution_RotationRequiresEpochChain(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	dist := BuildKeyDistribution("g1", 1, GenerateGroupSecret(), members, "alice.test", nil, "")
+	dist["rotation_id"] = "rot-test"
+
+	if HandleKeyDistribution(dist, ks, aid, nil) {
+		t.Fatal("新 rotation 缺少 epoch_chain 时应拒绝")
+	}
+}
+
+func TestGroupE2EEManagerRotateEpochToUsesPreviousEpochChainForStalePending(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "alice.test"
+	members := []string{aid, "bob.test"}
+	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
+	manager := NewGroupE2EEManager(GroupE2EEManagerConfig{
+		IdentityFn: func() map[string]any { return identity },
+		Keystore:   ks,
+	})
+
+	secret1 := GenerateGroupSecret()
+	commitment1 := ComputeMembershipCommitment(members, 1, "g1", secret1)
+	chain1 := ComputeEpochChain("", 1, commitment1, aid)
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 1, secret1, commitment1, members, chain1); err != nil || !ok {
+		t.Fatalf("预置 epoch1 失败: ok=%v err=%v", ok, err)
+	}
+
+	oldSecret := GenerateGroupSecret()
+	oldCommitment := ComputeMembershipCommitment(members, 2, "g1", oldSecret)
+	oldChain := ComputeEpochChain(chain1, 2, oldCommitment, aid)
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 2, oldSecret, oldCommitment, members, oldChain, "rot-old"); err != nil || !ok {
+		t.Fatalf("预置旧 pending 失败: ok=%v err=%v", ok, err)
+	}
+
+	if _, err := manager.RotateEpochTo("g1", 2, members, "rot-new"); err != nil {
+		t.Fatalf("RotateEpochTo 失败: %v", err)
+	}
+
+	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
+	expectedChain := ComputeEpochChain(chain1, 2, stringFromAny(loaded["commitment"]), aid)
+	if loaded["epoch_chain"] != expectedChain {
+		t.Fatalf("epoch_chain 应基于上一 epoch chain: got=%v want=%v oldPending=%v", loaded["epoch_chain"], expectedChain, oldChain)
+	}
+	if loaded["pending_rotation_id"] != "rot-new" {
+		t.Fatalf("pending_rotation_id 未更新: %v", loaded["pending_rotation_id"])
+	}
+}
+
 // TestHandleKeyDistribution_RejectNonMember 验证非成员的分发被拒绝
 func TestHandleKeyDistribution_RejectNonMember(t *testing.T) {
 	ks := testNewGroupKeyStore(t)
@@ -466,10 +596,36 @@ func TestHandleKeyDistribution_RejectNonMember(t *testing.T) {
 	secret := GenerateGroupSecret()
 	members := []string{"alice.test", "bob.test"}
 
-	dist := BuildKeyDistribution("g1", 1, secret, members, "alice.test", nil)
+	dist := BuildKeyDistribution("g1", 1, secret, members, "alice.test", nil, "")
 	ok := HandleKeyDistribution(dist, ks, aid, nil)
 	if ok {
 		t.Error("非成员不应接受密钥分发")
+	}
+}
+
+func TestHandleKeyDistribution_RejectsEpochBelowCurrent(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	currentSecret := GenerateGroupSecret()
+	currentCommitment := ComputeMembershipCommitment(members, 5, "g1", currentSecret)
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 5, currentSecret, currentCommitment, members, ""); err != nil || !ok {
+		t.Fatalf("预置 current epoch 失败: ok=%v err=%v", ok, err)
+	}
+
+	staleSecret := GenerateGroupSecret()
+	dist := BuildKeyDistribution("g1", 3, staleSecret, members, "alice.test", nil, "")
+	if HandleKeyDistribution(dist, ks, aid, nil) {
+		t.Fatal("低于 current epoch 的 key distribution 应拒绝")
+	}
+	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
+	if int(toInt64(loaded["epoch"])) != 5 {
+		t.Fatalf("current epoch 不应被覆盖: %v", loaded["epoch"])
+	}
+	three := 3
+	old, _ := LoadGroupSecret(ks, aid, "g1", &three)
+	if old != nil {
+		t.Fatalf("key distribution 不应补写 stale old epoch: %#v", old)
 	}
 }
 
@@ -499,7 +655,7 @@ func TestHandleKeyRequest(t *testing.T) {
 	members := []string{"alice.test", "bob.test"}
 	secret := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(members, 1, "g1", secret)
-	StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, members)
+	StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, members, "")
 
 	req := BuildKeyRequest("g1", 1, "bob.test")
 	resp := HandleKeyRequest(req, ks, aid, members)
@@ -521,7 +677,7 @@ func TestHandleKeyRequest_RejectNonMember(t *testing.T) {
 	members := []string{"alice.test", "bob.test"}
 	secret := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(members, 1, "g1", secret)
-	StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, members)
+	StoreGroupSecret(ks, aid, "g1", 1, secret, commitment, members, "")
 
 	req := BuildKeyRequest("g1", 1, "eve.test")
 	resp := HandleKeyRequest(req, ks, aid, members)
@@ -557,6 +713,82 @@ func TestHandleKeyResponse(t *testing.T) {
 	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
 	if loaded == nil {
 		t.Fatal("响应后应能加载密钥")
+	}
+}
+
+func TestHandleKeyResponse_BackfillsOldEpochWithoutOverwritingCurrent(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	currentSecret := GenerateGroupSecret()
+	currentCommitment := ComputeMembershipCommitment(members, 5, "g1", currentSecret)
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 5, currentSecret, currentCommitment, members, ""); err != nil || !ok {
+		t.Fatalf("预置 current epoch 失败: ok=%v err=%v", ok, err)
+	}
+
+	oldSecret := GenerateGroupSecret()
+	oldCommitment := ComputeMembershipCommitment(members, 3, "g1", oldSecret)
+	response := map[string]any{
+		"type":          "e2ee.group_key_response",
+		"group_id":      "g1",
+		"epoch":         3,
+		"group_secret":  base64.StdEncoding.EncodeToString(oldSecret),
+		"commitment":    oldCommitment,
+		"member_aids":   members,
+		"requester_aid": aid,
+		"responder_aid": "alice.test",
+		"request_id":    "req-old",
+	}
+
+	if !HandleKeyResponse(response, ks, aid) {
+		t.Fatal("旧 epoch key response 应可补写 old epoch")
+	}
+	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
+	if int(toInt64(loaded["epoch"])) != 5 {
+		t.Fatalf("current epoch 不应被覆盖: %v", loaded["epoch"])
+	}
+	three := 3
+	old, _ := LoadGroupSecret(ks, aid, "g1", &three)
+	if old == nil || !bytes.Equal(old["secret"].([]byte), oldSecret) {
+		t.Fatalf("旧 epoch secret 未正确补写: %#v", old)
+	}
+}
+
+func TestHandleKeyResponse_RejectsFutureEpoch(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	currentSecret := GenerateGroupSecret()
+	currentCommitment := ComputeMembershipCommitment(members, 5, "g1", currentSecret)
+	if ok, err := StoreGroupSecret(ks, aid, "g1", 5, currentSecret, currentCommitment, members, ""); err != nil || !ok {
+		t.Fatalf("预置 current epoch 失败: ok=%v err=%v", ok, err)
+	}
+
+	futureSecret := GenerateGroupSecret()
+	futureCommitment := ComputeMembershipCommitment(members, 6, "g1", futureSecret)
+	response := map[string]any{
+		"type":          "e2ee.group_key_response",
+		"group_id":      "g1",
+		"epoch":         6,
+		"group_secret":  base64.StdEncoding.EncodeToString(futureSecret),
+		"commitment":    futureCommitment,
+		"member_aids":   members,
+		"requester_aid": aid,
+		"responder_aid": "alice.test",
+		"request_id":    "req-future",
+	}
+
+	if HandleKeyResponse(response, ks, aid) {
+		t.Fatal("future epoch key response 不应绕过轮换推进 current")
+	}
+	loaded, _ := LoadGroupSecret(ks, aid, "g1", nil)
+	if int(toInt64(loaded["epoch"])) != 5 {
+		t.Fatalf("current epoch 不应被覆盖: %v", loaded["epoch"])
+	}
+	six := 6
+	future, _ := LoadGroupSecret(ks, aid, "g1", &six)
+	if future != nil {
+		t.Fatalf("future epoch 不应被写入: %#v", future)
 	}
 }
 
@@ -739,7 +971,7 @@ func TestLoadAllGroupSecrets(t *testing.T) {
 	for epoch := 1; epoch <= 3; epoch++ {
 		secret := GenerateGroupSecret()
 		commitment := ComputeMembershipCommitment([]string{"alice"}, epoch, "g1", secret)
-		StoreGroupSecret(ks, aid, "g1", epoch, secret, commitment, []string{"alice"})
+		StoreGroupSecret(ks, aid, "g1", epoch, secret, commitment, []string{"alice"}, "")
 	}
 
 	all := LoadAllGroupSecrets(ks, aid, "g1")
@@ -767,7 +999,7 @@ func TestHandleKeyDistribution_WithManifest(t *testing.T) {
 	manifest := BuildMembershipManifest("g1", 1, nil, members, nil, nil, "alice.test")
 	signed, _ := SignMembershipManifest(manifest, privPEM)
 
-	dist := BuildKeyDistribution("g1", 1, secret, members, "alice.test", signed)
+	dist := BuildKeyDistribution("g1", 1, secret, members, "alice.test", signed, "")
 	ok := HandleKeyDistribution(dist, ks, aid, []byte(certPEM))
 	if !ok {
 		t.Error("带合法 manifest 的分发应成功")

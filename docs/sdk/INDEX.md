@@ -13,7 +13,8 @@
 | [03-核心概念](03-核心概念.md) | AID · 连接状态机 · 认证流程 · E2EE |
 | [04-连接与认证](04-连接与认证.md) | 创建AID · 连接网关 · 网关发现 · 调用RPC · 事件订阅 |
 | [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · 会话管理 · 自定义密钥存储 |
-| [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · E2EEManager · 内置事件 · RPC手册索引 |
+| [GROUP-E2EE轮换竞态清单](GROUP-E2EE轮换竞态清单.md) | GROUP epoch key 轮换状态 · 竞态条件 · 补测清单 |
+| [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · MetaNamespace（信任根列表 / issuer root 更新） · E2EEManager · 内置事件 · RPC手册索引 |
 | [07-错误处理](07-错误处理.md) | 错误类层级 · 错误码速查 · 重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等初始化 · 多AID隔离 · 环境变量 · 资源清理 |
 | [10-custody-api-manual](10-custody-api-manual.md) | AID 托管 · 手机号验证码 · 备份恢复 · 跨设备复制 |
@@ -22,11 +23,12 @@
 
 | 文档 | 说明 |
 |------|------|
-| [group-rpc-manual](group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/消息收发 · `payload.type` 负载类型 |
-| [message-rpc-manual](message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认 · `payload.type` 负载类型 |
-| [meta-rpc-manual](meta-rpc-manual.md) | Meta 服务 RPC 接口 · ping/status 等元信息 |
-| [storage-rpc-manual](storage-rpc-manual.md) | Storage 服务 RPC 接口 · 文件上传/下载/对象管理 |
-| [stream-rpc-manual](stream-rpc-manual.md) | Stream 服务 RPC 接口 · 流式数据传输 |
+| [09-payload-reference](09-payload-reference.md) | `message.send` / `group.send` 共用业务负载格式 · `payload.type` 类型总览 · 交互卡片/action_card_reply · 任务事件 · 附件引用 |
+| [09-group-rpc-manual](09-group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/消息收发 · `payload.type` 负载类型 |
+| [09-message-rpc-manual](09-message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认 · `payload.type` 负载类型 |
+| [09-meta-rpc-manual](09-meta-rpc-manual.md) | Meta 服务 RPC 接口 · ping/status/信任根列表与 PKI 下载端点 |
+| [09-storage-rpc-manual](09-storage-rpc-manual.md) | Storage 服务 RPC 接口 · 文件上传/下载/对象管理 |
+| [09-stream-rpc-manual](09-stream-rpc-manual.md) | Stream 服务 RPC 接口 · 流式数据传输 |
 
 ---
 
@@ -50,6 +52,7 @@
 - **E2EE 机制概述** → [03-核心概念](03-核心概念.md)
 - **加密消息收发** → [05-E2EE加密通信](05-E2EE加密通信.md)
 - **会话管理** → [05-E2EE加密通信](05-E2EE加密通信.md)
+- **GROUP epoch key 轮换竞态/补测清单** → [GROUP-E2EE轮换竞态清单](GROUP-E2EE轮换竞态清单.md)
 - **E2EEManager API** → [06-API手册](06-API手册.md)
 - **E2EE 错误类** → [07-错误处理](07-错误处理.md)
 - **E2EE 幂等运行** → [08-最佳实践](08-最佳实践.md)
@@ -60,11 +63,12 @@
 - **裸 WebSocket RPC 调用** → [02-WebSocket协议](02-WebSocket协议.md)
 - **内置事件列表** → [06-API手册](06-API手册.md)
 - **RPC 手册索引** → [06-API手册](06-API手册.md)
-- **Group RPC 与群消息 payload 类型** → [group-rpc-manual](group-rpc-manual.md)
-- **Message RPC 与 P2P payload 类型** → [message-rpc-manual](message-rpc-manual.md)
-- **Meta RPC** → [meta-rpc-manual](meta-rpc-manual.md)
-- **Storage RPC** → [storage-rpc-manual](storage-rpc-manual.md)
-- **Stream RPC** → [stream-rpc-manual](stream-rpc-manual.md)
+- **消息 payload 类型总览与格式约定** → [09-payload-reference](09-payload-reference.md)
+- **Group RPC 与群消息收发** → [09-group-rpc-manual](09-group-rpc-manual.md)
+- **Message RPC 与 P2P 消息收发** → [09-message-rpc-manual](09-message-rpc-manual.md)
+- **Meta RPC** → [09-meta-rpc-manual](09-meta-rpc-manual.md)
+- **Storage RPC** → [09-storage-rpc-manual](09-storage-rpc-manual.md)
+- **Stream RPC** → [09-stream-rpc-manual](09-stream-rpc-manual.md)
 
 ### 配置与存储
 - **构造参数** → [01-快速开始](01-快速开始.md)
@@ -98,6 +102,9 @@ SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数
 ### 05-E2EE加密通信
 E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
 
+### GROUP-E2EE轮换竞态清单
+GROUP epoch key 两阶段轮换的状态边界和竞态检查项。覆盖 pending 期间成员变更、leader 竞争、分发/ack/commit 失败、stale pending、key recovery、旧 epoch 保留等场景，用于补充测试和实现审查。
+
 ### 06-API手册
 完整 API 文档。AUNClient 构造函数/属性/方法；AuthNamespace 方法；E2EEManager 方法；内置事件列表；RPC 手册索引。
 
@@ -109,3 +116,6 @@ E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；
 
 ### 10-custody-api-manual
 AID 托管 HTTP API。通过手机号验证码上传和下载 AID 证书、客户端加密后的私钥密文；定义 `send-code`、`bind-phone`、`restore-phone` 主流程；补充旧设备 AID token 授权的跨设备复制流程、CT 记录要求及安全边界。
+
+### 09-payload-reference
+`message.send` 和 `group.send` 共用的业务 payload 约定。包含 `payload.type` 类型总览、信封字段边界、公共辅助字段、提及语义、各类型字段格式、交互卡片及 `action_card_reply`、`status` / `event` 任务生命周期约定、附件引用规范和降级处理建议。

@@ -45,13 +45,16 @@ describe('JS-001: Message 类型字段声明', () => {
 // ── JS-002: IndexedDB 群组密钥事务隔离 ─────────────────────────
 // 注：IndexedDB 事务隔离属于内部实现细节，通过功能测试验证正确性
 describe('JS-002: IndexedDB 群组密钥操作原子性', () => {
-  it('IndexedDBKeyStore 应有 saveGroupSecretState 方法', async () => {
+  it('IndexedDBKeyStore 应有 row 化群组密钥方法', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
     const ks = new IndexedDBKeyStore({ dbName: 'test-js002' });
-    expect(typeof ks.saveGroupSecretState).toBe('function');
+    expect(typeof ks.storeGroupSecretTransition).toBe('function');
+    expect(typeof ks.storeGroupSecretEpoch).toBe('function');
+    expect(typeof ks.loadGroupSecretEpoch).toBe('function');
+    expect(typeof ks.listGroupSecretIds).toBe('function');
   });
 
-  it('saveGroupSecretState 后 loadGroupSecretState 应返回一致的数据', async () => {
+  it('storeGroupSecretTransition 后 loadGroupSecretEpoch 应返回一致的数据', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
     const ks = new IndexedDBKeyStore({ dbName: 'test-js002-rw' });
 
@@ -67,13 +70,34 @@ describe('JS-002: IndexedDB 群组密钥操作原子性', () => {
       ],
     };
 
-    await ks.saveGroupSecretState('alice.test', 'grp-1', entry);
-    const loaded = await ks.loadGroupSecretState('alice.test', 'grp-1');
+    await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+      epoch: 1,
+      secret: 'b2xk',
+      commitment: 'old1',
+      memberAids: ['alice.test'],
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+    });
+    await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+      epoch: 2,
+      secret: 'b2xkMg==',
+      commitment: 'old2',
+      memberAids: ['alice.test'],
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+    });
+    await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+      epoch: entry.epoch,
+      secret: entry.secret,
+      commitment: entry.commitment,
+      memberAids: entry.member_aids,
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+    });
+    const loaded = await ks.loadGroupSecretEpoch('alice.test', 'grp-1');
 
     expect(loaded).not.toBeNull();
     expect(loaded!.epoch).toBe(3);
     expect(loaded!.secret).toBe('dGVzdC1zZWNyZXQ=');
     expect(loaded!.member_aids).toEqual(['alice.test', 'bob.test']);
+    expect(await ks.listGroupSecretIds('alice.test')).toEqual(['grp-1']);
   });
 
   it('并发写同一群组密钥不应丢失数据', async () => {
@@ -97,11 +121,23 @@ describe('JS-002: IndexedDB 群组密钥操作原子性', () => {
 
     // 并发写入
     await Promise.all([
-      ks.saveGroupSecretState('alice.test', 'grp-1', entry1),
-      ks.saveGroupSecretState('alice.test', 'grp-1', entry2),
+      ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+        epoch: entry1.epoch,
+        secret: entry1.secret,
+        commitment: entry1.commitment,
+        memberAids: entry1.member_aids,
+        oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+      }),
+      ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+        epoch: entry2.epoch,
+        secret: entry2.secret,
+        commitment: entry2.commitment,
+        memberAids: entry2.member_aids,
+        oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+      }),
     ]);
 
-    const loaded = await ks.loadGroupSecretState('alice.test', 'grp-1');
+    const loaded = await ks.loadGroupSecretEpoch('alice.test', 'grp-1');
     expect(loaded).not.toBeNull();
     // 最终应保持后写入的 epoch 2（_withAidLock 保证串行化）
     expect(loaded!.epoch).toBe(2);
@@ -119,8 +155,19 @@ describe('JS-003: _sendGroupEncrypted epoch 预检', () => {
     (client as any)._identity = { aid: 'alice.aid.com', private_key_pem: null, cert: null };
 
     const groupE2ee = (client as any)._groupE2ee;
-    vi.spyOn(groupE2ee, 'currentEpoch').mockResolvedValue(1);
+    let recovered = false;
+    vi.spyOn(groupE2ee, 'currentEpoch').mockImplementation(async () => (recovered ? 3 : 1));
     vi.spyOn(groupE2ee, 'encrypt').mockResolvedValue({ type: 'e2ee.group_encrypted', epoch: 1 });
+    vi.spyOn(groupE2ee, 'loadSecret').mockResolvedValue({
+      epoch: 3,
+      secret: new Uint8Array(32),
+      commitment: 'c3',
+      member_aids: ['alice.aid.com'],
+    });
+    vi.spyOn(groupE2ee, 'encryptWithEpoch').mockResolvedValue({ type: 'e2ee.group_encrypted', epoch: 3 });
+    (client as any)._requestGroupKeyFromCandidates = vi.fn().mockImplementation(async () => {
+      recovered = true;
+    });
 
     const methods: string[] = [];
     (client as any)._transport.call = vi.fn().mockImplementation(async (method: string) => {
@@ -205,8 +252,14 @@ describe('JS-005: _isGroupEpochRecoverable 空字符串 secret 判断', () => {
       updated_at: Date.now(),
     };
 
-    await ks.saveGroupSecretState('alice.test', 'grp-1', entry);
-    const loaded = await ks.loadGroupSecretState('alice.test', 'grp-1');
+    await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+      epoch: entry.epoch,
+      secret: entry.secret,
+      commitment: entry.commitment,
+      memberAids: entry.member_aids,
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+    });
+    const loaded = await ks.loadGroupSecretEpoch('alice.test', 'grp-1');
 
     // 加载后 secret 应存在但为空
     // _isGroupEpochRecoverable 应在 secret 为空时返回 false
@@ -228,8 +281,14 @@ describe('JS-005: _isGroupEpochRecoverable 空字符串 secret 判断', () => {
       updated_at: Date.now(),
     };
 
-    await ks.saveGroupSecretState('alice.test', 'grp-1', entry);
-    const loaded = await ks.loadGroupSecretState('alice.test', 'grp-1');
+    await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+      epoch: entry.epoch,
+      secret: entry.secret,
+      commitment: entry.commitment,
+      memberAids: entry.member_aids,
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+    });
+    const loaded = await ks.loadGroupSecretEpoch('alice.test', 'grp-1');
 
     expect(loaded).not.toBeNull();
     expect(loaded!.secret).toBe('dGVzdC1zZWNyZXQ=');
@@ -343,26 +402,26 @@ describe('JS-007: dissolve 后清理本地状态', () => {
     expect(typeof ks.deleteGroupSecretState).toBe('function');
   });
 
-  it('deleteGroupSecretState 删除后 loadGroupSecretState 返回 null', async () => {
+  it('deleteGroupSecretState 删除后 loadGroupSecretEpoch 返回 null', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
     const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete-2' });
 
     // 先保存
-    await ks.saveGroupSecretState('alice.test', 'grp-1', {
+    await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
       epoch: 1,
       secret: 'dGVzdA==',
       commitment: 'test',
-      member_aids: ['alice.test'],
-      updated_at: Date.now(),
+      memberAids: ['alice.test'],
+      oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
     });
 
-    const before = await ks.loadGroupSecretState('alice.test', 'grp-1');
+    const before = await ks.loadGroupSecretEpoch('alice.test', 'grp-1');
     expect(before).not.toBeNull();
 
     // 删除
     await ks.deleteGroupSecretState!('alice.test', 'grp-1');
 
-    const after = await ks.loadGroupSecretState('alice.test', 'grp-1');
+    const after = await ks.loadGroupSecretEpoch('alice.test', 'grp-1');
     expect(after).toBeNull();
   });
 
@@ -370,17 +429,17 @@ describe('JS-007: dissolve 后清理本地状态', () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
     const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete-3' });
 
-    await ks.saveGroupSecretState('alice.test', 'grp-1', {
-      epoch: 1, secret: 'dGVzdA==', commitment: 'c1', member_aids: ['alice.test'], updated_at: Date.now(),
+    await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
+      epoch: 1, secret: 'dGVzdA==', commitment: 'c1', memberAids: ['alice.test'], oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
     });
-    await ks.saveGroupSecretState('alice.test', 'grp-2', {
-      epoch: 1, secret: 'dGVzdDI=', commitment: 'c2', member_aids: ['alice.test'], updated_at: Date.now(),
+    await ks.storeGroupSecretTransition('alice.test', 'grp-2', {
+      epoch: 1, secret: 'dGVzdDI=', commitment: 'c2', memberAids: ['alice.test'], oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
     });
 
     await ks.deleteGroupSecretState!('alice.test', 'grp-1');
 
-    expect(await ks.loadGroupSecretState('alice.test', 'grp-1')).toBeNull();
-    expect(await ks.loadGroupSecretState('alice.test', 'grp-2')).not.toBeNull();
+    expect(await ks.loadGroupSecretEpoch('alice.test', 'grp-1')).toBeNull();
+    expect(await ks.loadGroupSecretEpoch('alice.test', 'grp-2')).not.toBeNull();
   });
 
   // ── GroupE2EEManager.removeGroup ──

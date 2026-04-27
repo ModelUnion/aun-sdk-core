@@ -13,7 +13,7 @@ import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
 import { AuthNamespace } from './namespaces/auth.js';
 import { CustodyNamespace } from './namespaces/custody.js';
-import { CryptoProvider, uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer } from './crypto.js';
+import { CryptoProvider, uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer, toBufferSource } from './crypto.js';
 import {
   E2EEManager,
   type PrekeyMaterial,
@@ -185,6 +185,8 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
 
 const RECONNECT_MIN_BASE_DELAY_SECONDS = 1.0;
 const RECONNECT_MAX_BASE_DELAY_SECONDS = 64.0;
+const GROUP_ROTATION_LEASE_MS = 120_000;
+const GROUP_ROTATION_RETRY_MAX_DELAY_MS = 300_000;
 
 function clampReconnectDelaySeconds(
   value: unknown,
@@ -420,6 +422,7 @@ export class AUNClient {
   private _groupEpochRotationInflight: Set<string> = new Set();
   private _groupEpochRecoveryInflight: Map<string, Promise<boolean>> = new Map();
   private _groupMembershipRotationDone: Set<string> = new Set();
+  private _groupEpochRotationRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Lazy group sync：首次发送群消息前自动拉取历史 */
   private _groupSynced: Set<string> = new Set();
   /** Lazy P2P sync：首次发送 P2P 消息前自动拉取历史 */
@@ -712,13 +715,16 @@ export class AUNClient {
     if (method === 'message.pull' && isJsonObject(result)) {
       const r = result;
       const messages = r.messages;
-      if (Array.isArray(messages) && messages.length) {
-        r.messages = await this._decryptMessages(messages.filter(isJsonObject) as Message[]);
+      const rawMessages = (Array.isArray(messages) ? messages : []).filter(isJsonObject) as Message[];
+      if (rawMessages.length) {
+        r.messages = await this._decryptMessages(rawMessages);
       }
       if (this._aid) {
         const ns = `p2p:${this._aid}`;
         // 用原始 messages 喂 SeqTracker（解密去重前），与 Go/TS/Python 一致
-        this._seqTracker.onPullResult(ns, (Array.isArray(messages) ? messages : []).filter(isJsonObject));
+        if (rawMessages.length) {
+          this._seqTracker.onPullResult(ns, rawMessages);
+        }
         // ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
         // 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若 contiguous 落后必须 force 跳过
         // retention window 外的空洞。与 S2 [1,seq-1] 历史 gap 配合；若去掉 force，首条消息建的 gap 会
@@ -734,7 +740,7 @@ export class AUNClient {
         this._saveSeqTrackerState();
         // auto-ack contiguous_seq
         const contig = this._seqTracker.getContiguousSeq(ns);
-        if (contig > 0) {
+        if (contig > 0 && (rawMessages.length > 0 || serverAck > 0)) {
           this._transport.call('message.ack', {
             seq: contig,
             device_id: this._deviceId,
@@ -748,15 +754,17 @@ export class AUNClient {
       const r = result;
       const messages = r.messages;
       // 先保存原始消息（解密前），用于喂 SeqTracker（与 P2P message.pull 路径对齐）
-      const rawMessages = Array.isArray(messages) ? [...messages] : [];
-      if (Array.isArray(messages) && messages.length) {
-        r.messages = await this._decryptGroupMessages(messages.filter(isJsonObject) as Message[]);
+      const rawMessages = (Array.isArray(messages) ? messages : []).filter(isJsonObject) as Message[];
+      if (rawMessages.length) {
+        r.messages = await this._decryptGroupMessages(rawMessages);
       }
       const gid = (p.group_id ?? '') as string;
       if (gid) {
         const ns = `group:${gid}`;
         // ⚠️ 使用原始消息（rawMessages）喂 SeqTracker，与 P2P message.pull 路径一致
-        this._seqTracker.onPullResult(ns, rawMessages.filter(isJsonObject));
+        if (rawMessages.length) {
+          this._seqTracker.onPullResult(ns, rawMessages);
+        }
         // ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
         // 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
         // 与 S2 [1,seq-1] 历史 gap 配合使用，force_contiguous_seq 是跳过空洞的唯一手段。
@@ -774,7 +782,8 @@ export class AUNClient {
         this._saveSeqTrackerState();
         // auto-ack contiguous_seq
         const contig = this._seqTracker.getContiguousSeq(ns);
-        if (contig > 0) {
+        const shouldAck = rawMessages.length > 0 || (cursor !== null && Number(cursor.current_seq ?? 0) > 0);
+        if (contig > 0 && shouldAck) {
           this._transport.call('group.ack_messages', {
             group_id: gid,
             msg_seq: contig,
@@ -794,8 +803,9 @@ export class AUNClient {
         if (gid && this._aid && !(await this._groupE2ee.hasSecret(gid))) {
           try {
             await this._groupE2ee.createEpoch(gid, [this._aid]);
-            // 同步到服务端：将服务端 epoch 从 0 推到 1
-            this._safeAsync(this._syncEpochToServer(gid));
+            // 同步到服务端：将服务端 epoch 从 0 推到 1；必须在 group.create 返回前完成，
+            // 否则调用方紧接着加成员时会让初始 rotation 因成员集变化而提交失败。
+            await this._syncEpochToServer(gid);
           } catch (exc) {
             this._logE2eeError('create_epoch', gid, '', exc as Error);
           }
@@ -806,16 +816,6 @@ export class AUNClient {
 
     }
 
-    if (method === 'group.add_member' && isJsonObject(result) && !('error' in result)) {
-      const groupId = this._extractGroupIdFromResult(result) || String(p.group_id ?? '');
-      const member = isJsonObject(result.member) ? result.member as JsonObject : null;
-      const newMemberAid = String(member?.aid ?? p.aid ?? '').trim();
-      if (groupId && newMemberAid) {
-        this._safeAsync(this._distributeKeyToNewMember(groupId, newMemberAid));
-      }
-    }
-
-
     // 成员集变更主要由 group.changed 事件驱动；RPC 成功返回路径做幂等兜底，避免事件丢失或延迟时不轮换。
     const membershipMethods = new Set([
       'group.add_member', 'group.kick', 'group.remove_member', 'group.leave',
@@ -824,7 +824,7 @@ export class AUNClient {
     ]);
     if (membershipMethods.has(method) && isJsonObject(result) && !('error' in result)) {
       const groupId = this._extractGroupIdFromResult(result) || String(p.group_id ?? '');
-      if (groupId) {
+      if (groupId && this._membershipRotationChanged(method, result)) {
         const expectedEpoch = this._membershipRotationExpectedEpoch(result);
         this._safeAsync(this._maybeLeadRotateGroupEpoch(
           groupId,
@@ -1289,6 +1289,7 @@ export class AUNClient {
         to: targetAid,
         payload: reqPayload,
         encrypt: true,
+        persist_required: true,
       });
       console.info(`[aun_core] 已向 ${targetAid} 请求群 ${groupId} 的密钥`);
     } catch (exc) {
@@ -1322,23 +1323,81 @@ export class AUNClient {
   }
 
   private _membershipRotationTriggerId(groupId: string, payload: JsonObject): string {
-    const action = String(payload.action ?? payload.status ?? payload.reason ?? 'membership_changed');
+    let action = String(payload.action ?? '').trim();
+    if (!action) {
+      if (payload.removed_aid) action = 'member_removed';
+      else if (payload.left_aid) action = 'member_left';
+      else if (isJsonObject(payload.member)) action = 'member_added';
+      else action = String(payload.status ?? payload.reason ?? 'membership_changed');
+    }
     const group = isJsonObject(payload.group) ? payload.group : null;
     const eventSeq = payload.event_seq ?? payload.seq ?? group?.event_seq ?? '';
+    const changedAids = new Set<string>();
     let changedAid = String(payload.aid ?? payload.removed_aid ?? payload.left_aid ?? payload.member_aid ?? payload.target_aid ?? '');
+    if (changedAid) changedAids.add(changedAid);
     const member = isJsonObject(payload.member) ? payload.member : null;
+    if (member?.aid) changedAids.add(String(member.aid));
     if (!changedAid && member) changedAid = String(member.aid ?? '');
-    if (eventSeq !== undefined && eventSeq !== null && String(eventSeq) !== '') {
-      return `${groupId}:${action}:event:${String(eventSeq)}`;
+    const request = isJsonObject(payload.request) ? payload.request : null;
+    if (request?.aid) changedAids.add(String(request.aid));
+    if (!changedAid && request) changedAid = String(request.aid ?? '');
+    const inviteCode = isJsonObject(payload.invite_code) ? payload.invite_code : null;
+    if (inviteCode?.used_by) changedAids.add(String(inviteCode.used_by));
+    if (inviteCode?.aid) changedAids.add(String(inviteCode.aid));
+    if (!changedAid && inviteCode) changedAid = String(inviteCode.used_by ?? inviteCode.aid ?? '');
+    if (Array.isArray(payload.results)) {
+      for (const item of payload.results) {
+        if (!isJsonObject(item)) continue;
+        const status = String(item.status ?? '').trim().toLowerCase();
+        if (status !== 'approved' && item.approved !== true) continue;
+        for (const key of ['aid', 'member_aid', 'target_aid']) {
+          const value = item[key];
+          if (value !== undefined && value !== null && String(value)) changedAids.add(String(value));
+        }
+        for (const key of ['member', 'request']) {
+          const nested = isJsonObject(item[key]) ? item[key] : null;
+          if (nested?.aid) changedAids.add(String(nested.aid));
+        }
+      }
     }
-    return `${groupId}:${action}:aid:${changedAid || '-'}`;
+    const changedAidKey = Array.from(changedAids).filter(Boolean).sort().join(',');
+    const expectedEpoch = this._membershipRotationExpectedEpoch(payload);
+    if (changedAidKey && expectedEpoch !== null) return `${groupId}:${action}:aid:${changedAidKey}:epoch:${expectedEpoch}`;
+    if (eventSeq !== undefined && eventSeq !== null && String(eventSeq) !== '') return `${groupId}:${action}:event:${String(eventSeq)}`;
+    return `${groupId}:${action}:aid:${changedAidKey || changedAid || '-'}`;
+  }
+
+  private _membershipRotationChanged(method: string, payload: JsonObject): boolean {
+    if (['group.add_member', 'group.kick', 'group.remove_member', 'group.leave'].includes(method)) {
+      return true;
+    }
+    const status = String(payload.status ?? '').trim().toLowerCase();
+    if (['group.use_invite_code', 'group.request_join'].includes(method)) {
+      return ['joined', 'approved'].includes(status) || isJsonObject(payload.member);
+    }
+    if (method === 'group.review_join_request') {
+      return status === 'approved' || payload.approved === true || isJsonObject(payload.member);
+    }
+    if (method === 'group.batch_review_join_request') {
+      const results = payload.results;
+      if (!Array.isArray(results)) return false;
+      return results.some((item) => {
+        if (!isJsonObject(item)) return false;
+        const itemStatus = String(item.status ?? '').trim().toLowerCase();
+        return itemStatus === 'approved' || item.approved === true;
+      });
+    }
+    return false;
   }
 
   private _extractGroupIdFromResult(result: JsonObject): string {
     const group = isJsonObject(result.group) ? result.group : null;
     const gid = group ? String(group.group_id ?? '') : '';
     if (gid) return gid;
-    return String(result.group_id ?? '');
+    const directGid = String(result.group_id ?? '');
+    if (directGid) return directGid;
+    const member = isJsonObject(result.member) ? result.member : null;
+    return member ? String(member.group_id ?? '') : '';
   }
 
   private async _onRawGroupChanged(data: EventPayload): Promise<void> {
@@ -1372,7 +1431,11 @@ export class AUNClient {
       if (d.action === 'member_left' || d.action === 'member_removed') {
         if (groupId) {
           const expectedEpoch = this._membershipRotationExpectedEpoch(d);
-          this._safeAsync(this._maybeLeadRotateGroupEpoch(groupId, this._membershipRotationTriggerId(groupId, d), expectedEpoch));
+          if (expectedEpoch === null) {
+            console.debug('membership event without old_epoch skipped for epoch rotation: aid=%s group=%s action=%s event_seq=%s', this._aid ?? '', groupId, String(d.action ?? ''), String(d.event_seq ?? ''));
+          } else {
+            this._safeAsync(this._maybeLeadRotateGroupEpoch(groupId, this._membershipRotationTriggerId(groupId, d), expectedEpoch));
+          }
         }
       }
 
@@ -1486,6 +1549,7 @@ export class AUNClient {
     if (payload === null) {
       throw new ValidationError('message.send payload must be an object when encrypt=true');
     }
+    const persistRequired = Boolean(params.persist_required || params.durable);
 
     // Lazy P2P sync：首次发送前自动拉取历史，避免重连后 seq 空洞
     if (!this._p2pSynced) {
@@ -1507,6 +1571,7 @@ export class AUNClient {
         messageId,
         timestamp,
         prekey: recipientPrekeys[0],
+        persistRequired,
       });
     }
 
@@ -1530,6 +1595,9 @@ export class AUNClient {
       message_id: messageId,
       timestamp,
     };
+    if (persistRequired) {
+      sendParams.persist_required = true;
+    }
     return this._transport.call('message.send', sendParams);
   }
 
@@ -1565,6 +1633,7 @@ export class AUNClient {
     messageId: string;
     timestamp: number;
     prekey?: PrekeyMaterial | null;
+    persistRequired?: boolean;
   }): Promise<RpcResult> {
     let prekey = opts.prekey;
     if (prekey === undefined) {
@@ -1589,6 +1658,9 @@ export class AUNClient {
       message_id: opts.messageId,
       timestamp: opts.timestamp,
     };
+    if (opts.persistRequired) {
+      sendParams.persist_required = true;
+    }
     return this._transport.call('message.send', sendParams);
   }
 
@@ -1822,9 +1894,18 @@ export class AUNClient {
     }
 
     await this._ensureGroupEpochReady(groupId, false);
+    await this._waitForGroupMembershipEpochFloor(groupId, 2000);
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const envelope = await this._groupE2ee.encrypt(groupId, payload);
+      const epochResult = await this._committedGroupEpochState(groupId);
+      const committedEpoch = Number(epochResult.committed_epoch ?? epochResult.epoch ?? 0);
+      const envelope = committedEpoch > 0
+        ? await this._groupE2ee.encryptWithEpoch(
+          groupId,
+          await this._ensureCommittedGroupSecretForSend(groupId, committedEpoch, epochResult),
+          payload,
+        )
+        : await this._groupE2ee.encrypt(groupId, payload);
       const sendParams: RpcParams = {
         group_id: groupId,
         payload: envelope,
@@ -1881,7 +1962,8 @@ export class AUNClient {
   }
 
   private _isGroupEpochRotationPendingError(exc: unknown): boolean {
-    return String(exc).toLowerCase().includes('e2ee epoch rotation pending');
+    const text = String(exc).toLowerCase();
+    return text.includes('e2ee epoch rotation pending') || text.includes('e2ee epoch not committed');
   }
 
   private _isRecoverableGroupEpochError(exc: unknown): boolean {
@@ -1917,6 +1999,26 @@ export class AUNClient {
     }
   }
 
+  private async _recoverInitialGroupEpochIfNeeded(
+    groupId: string,
+    localEpoch: number,
+    epochResult: JsonObject,
+  ): Promise<JsonObject> {
+    const serverEpoch = Number(epochResult.epoch ?? 0);
+    if (serverEpoch !== 0 || localEpoch !== 1) return epochResult;
+    const secretData = await this._groupE2ee.loadSecret(groupId, 1) as JsonObject | null;
+    if (!secretData || secretData.pending_rotation_id) return epochResult;
+    console.warn(`[aun_core] 群 ${groupId} 检测到本地 epoch 1 已存在但服务端 epoch 仍为 0，尝试补同步初始 epoch`);
+    await this._syncEpochToServer(groupId);
+    try {
+      const refreshed = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+      if (isJsonObject(refreshed)) return refreshed;
+    } catch (exc) {
+      console.warn(`[aun_core] 群 ${groupId} 初始 epoch 补同步后刷新服务端 epoch 失败: ${formatCaughtError(exc)}`);
+    }
+    return epochResult;
+  }
+
   private async _ensureGroupEpochReady(groupId: string, strict: boolean): Promise<void> {
     const localEpoch = await this._groupE2ee.currentEpoch(groupId);
     const initialLocalEpoch = localEpoch ?? 0;
@@ -1932,7 +2034,24 @@ export class AUNClient {
     }
     let serverEpoch = Number(epochResult.epoch ?? 0);
     if (!Number.isFinite(serverEpoch)) return;
+    const pending = isJsonObject(epochResult.pending_rotation) ? epochResult.pending_rotation : null;
+    if (pending && !pending.expired) {
+      const pendingBaseEpoch = Number(pending.base_epoch ?? serverEpoch);
+      this._scheduleGroupRotationRetry(groupId, {
+        reason: 'pending_recovery',
+        triggerId: String(pending.rotation_id ?? ''),
+        expectedEpoch: Number.isFinite(pendingBaseEpoch) ? pendingBaseEpoch : serverEpoch,
+        pending,
+      });
+    }
     let effectiveLocalEpoch = initialLocalEpoch;
+    if (serverEpoch === 0 && effectiveLocalEpoch === 1) {
+      epochResult = await this._recoverInitialGroupEpochIfNeeded(groupId, effectiveLocalEpoch, epochResult);
+      serverEpoch = Number(epochResult.epoch ?? 0);
+      if (serverEpoch === 0) {
+        throw new StateError(`group ${groupId} initial epoch sync has not completed; refuse to send with local epoch 1 while server epoch is 0`);
+      }
+    }
     if (serverEpoch <= effectiveLocalEpoch) {
       if (!strict || serverEpoch <= 0) return;
       const waitDeadline = Date.now() + 5000;
@@ -1956,7 +2075,6 @@ export class AUNClient {
 
     console.warn(`[aun_core] group ${groupId} local epoch=${effectiveLocalEpoch} < server epoch=${serverEpoch}; requesting key recovery`);
     await this._requestGroupKeyFromCandidates(groupId, serverEpoch, epochResult);
-    if (!strict) return;
 
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
@@ -1966,6 +2084,90 @@ export class AUNClient {
     }
     const refreshedEpoch = await this._groupE2ee.currentEpoch(groupId);
     throw new StateError(`group ${groupId} local epoch ${refreshedEpoch} is behind server epoch ${serverEpoch}; key recovery has not completed`);
+  }
+
+  private async _waitForGroupMembershipEpochFloor(groupId: string, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (true) {
+      let committedEpoch = 0;
+      let members: unknown = null;
+      try {
+        const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+        committedEpoch = isJsonObject(epochResult) ? Number(epochResult.committed_epoch ?? epochResult.epoch ?? 0) : 0;
+        const membersResult = await this.call('group.get_members', { group_id: groupId });
+        members = isJsonObject(membersResult) ? membersResult.members : null;
+      } catch (exc) {
+        console.warn(`[aun_core] 群 ${groupId} 成员 epoch floor 预检跳过: ${formatCaughtError(exc)}`);
+        return;
+      }
+
+      let maxMinReadEpoch = 0;
+      if (Array.isArray(members)) {
+        for (const member of members) {
+          if (!isJsonObject(member)) continue;
+          const value = Number(member.min_read_epoch ?? 0);
+          if (Number.isFinite(value)) maxMinReadEpoch = Math.max(maxMinReadEpoch, value);
+        }
+      }
+      if (maxMinReadEpoch <= committedEpoch) return;
+      if (Date.now() >= deadline) {
+        console.info(`[aun_core] 群 ${groupId} committed epoch 尚未追上成员可读下限，按当前 committed epoch 继续发送: committed=${committedEpoch} floor=${maxMinReadEpoch}`);
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+  }
+
+  private async _committedGroupEpochState(groupId: string): Promise<JsonObject> {
+    try {
+      const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+      if (isJsonObject(epochResult)) return epochResult;
+    } catch (exc) {
+      console.warn(`[aun_core] 群 ${groupId} 查询 committed epoch 状态失败，回退本地 epoch: ${formatCaughtError(exc)}`);
+    }
+    const localEpoch = await this._groupE2ee.currentEpoch(groupId);
+    return { epoch: localEpoch ?? 0, committed_epoch: localEpoch ?? 0 };
+  }
+
+  private _groupSecretMatchesCommittedRotation(secretData: JsonObject | null, committedRotation: JsonObject | null): boolean {
+    if (!secretData) return false;
+    const committedCommitment = committedRotation ? String(committedRotation.key_commitment ?? '').trim() : '';
+    const localCommitment = String(secretData.commitment ?? '').trim();
+    if (committedCommitment && committedCommitment !== localCommitment) return false;
+    const pendingRotationId = String(secretData.pending_rotation_id ?? '').trim();
+    if (!pendingRotationId) return true;
+    if (!committedRotation) return false;
+    if (String(committedRotation.rotation_id ?? '').trim() !== pendingRotationId) return false;
+    return true;
+  }
+
+  private async _ensureCommittedGroupSecretForSend(
+    groupId: string,
+    committedEpoch: number,
+    epochResult: JsonObject,
+  ): Promise<number> {
+    if (committedEpoch <= 0) return committedEpoch;
+    const secretData = await this._groupE2ee.loadSecret(groupId, committedEpoch) as JsonObject | null;
+    const committedRotation = isJsonObject(epochResult.committed_rotation) ? epochResult.committed_rotation : null;
+    if (this._groupSecretMatchesCommittedRotation(secretData, committedRotation)) {
+      return committedEpoch;
+    }
+    const pendingRotationId = secretData ? String(secretData.pending_rotation_id ?? '') : '';
+    console.warn(`[aun_core] 群 ${groupId} epoch ${committedEpoch} 本地 pending key 未匹配服务端 committed rotation，先恢复密钥: local_rotation=${pendingRotationId || '-'}`);
+    await this._recoverGroupEpochKey(groupId, committedEpoch, '', 5000);
+    let refreshed = await this._committedGroupEpochState(groupId);
+    const refreshedCommittedEpoch = Number(refreshed.committed_epoch ?? refreshed.epoch ?? committedEpoch);
+    if (Number.isFinite(refreshedCommittedEpoch) && refreshedCommittedEpoch > committedEpoch) {
+      committedEpoch = refreshedCommittedEpoch;
+      await this._recoverGroupEpochKey(groupId, committedEpoch, '', 5000);
+      refreshed = await this._committedGroupEpochState(groupId);
+    }
+    const refreshedRotation = isJsonObject(refreshed.committed_rotation) ? refreshed.committed_rotation : null;
+    const refreshedSecret = await this._groupE2ee.loadSecret(groupId, committedEpoch) as JsonObject | null;
+    if (!this._groupSecretMatchesCommittedRotation(refreshedSecret, refreshedRotation)) {
+      throw new StateError(`group ${groupId} epoch ${committedEpoch} local key is pending or mismatched; refuse to send with uncommitted group key`);
+    }
+    return committedEpoch;
   }
 
   // ── E2EE 自动解密 ────────────────────────────────
@@ -2065,13 +2267,23 @@ export class AUNClient {
         stillPending.push(msg);
       }
     }
-    if (stillPending.length) this._pendingDecryptMsgs.set(ns, stillPending);
+    const queuedDuringRetry = this._pendingDecryptMsgs.get(ns) ?? [];
+    const mergedPending = [...stillPending, ...queuedDuringRetry].slice(-200);
+    if (mergedPending.length) this._pendingDecryptMsgs.set(ns, mergedPending);
     else this._pendingDecryptMsgs.delete(ns);
+  }
+
+  private _scheduleRetryPendingDecryptMsgs(groupId: string): void {
+    if (!groupId || !this._pendingDecryptMsgs.has(`group:${groupId}`)) return;
+    this._safeAsync(this._retryPendingDecryptMsgs(groupId));
   }
 
   private async _recoverGroupEpochKey(groupId: string, epoch: number, senderAid = '', timeoutMs = 5000): Promise<boolean> {
     const existing = await this._groupE2ee.loadSecret(groupId, epoch);
-    if (existing) return true;
+    if (await this._groupEpochSecretReadyForRecovery(groupId, epoch, existing)) {
+      this._scheduleRetryPendingDecryptMsgs(groupId);
+      return true;
+    }
 
     // inflight 去重：同 groupId:epoch 的并发恢复共享同一个 Promise
     const key = `${groupId}:${epoch}`;
@@ -2101,9 +2313,47 @@ export class AUNClient {
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 150));
       const secret = await this._groupE2ee.loadSecret(groupId, epoch);
-      if (secret) return true;
+      if (await this._groupEpochSecretReadyForRecovery(groupId, epoch, secret)) {
+        this._scheduleRetryPendingDecryptMsgs(groupId);
+        return true;
+      }
     }
-    return (await this._groupE2ee.loadSecret(groupId, epoch)) !== null;
+    const secret = await this._groupE2ee.loadSecret(groupId, epoch);
+    const ready = await this._groupEpochSecretReadyForRecovery(groupId, epoch, secret);
+    if (ready) this._scheduleRetryPendingDecryptMsgs(groupId);
+    return ready;
+  }
+
+  private async _groupEpochSecretReadyForRecovery(groupId: string, epoch: number, secret: any): Promise<boolean> {
+    if (!isJsonObject(secret)) return false;
+    const pendingRotationId = String(secret.pending_rotation_id ?? '').trim();
+    if (!pendingRotationId) return true;
+    return this._pendingGroupSecretStillCurrent(groupId, epoch, pendingRotationId);
+  }
+
+  private async _pendingGroupSecretStillCurrent(groupId: string, epoch: number, pendingRotationId: string): Promise<boolean> {
+    try {
+      const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+      if (!isJsonObject(epochResult)) return false;
+      const pending = isJsonObject(epochResult.pending_rotation) ? epochResult.pending_rotation : null;
+      if (
+        pending
+        && !pending.expired
+        && String(pending.rotation_id ?? '').trim() === pendingRotationId
+      ) {
+        return true;
+      }
+      const committedRotation = isJsonObject(epochResult.committed_rotation) ? epochResult.committed_rotation : null;
+      const committedTargetEpoch = Number(committedRotation?.target_epoch ?? 0);
+      return Boolean(
+        committedRotation
+        && Number.isFinite(committedTargetEpoch)
+        && committedTargetEpoch === epoch
+        && String(committedRotation.rotation_id ?? '').trim() === pendingRotationId,
+      );
+    } catch {
+      return false;
+    }
   }
 
   private async _decryptGroupMessage(
@@ -2217,7 +2467,19 @@ export class AUNClient {
 
     let result: string | null = null;
     try {
+      if (actualPayload.type === 'e2ee.group_key_distribution') {
+        if (!await this._verifyActiveGroupRotationDistribution(actualPayload)) {
+          return true;
+        }
+      } else if (actualPayload.type === 'e2ee.group_key_response') {
+        if (!await this._verifyGroupKeyResponseEpoch(actualPayload)) {
+          return true;
+        }
+      }
       result = await this._groupE2ee.handleIncoming(actualPayload);
+      if (result === 'distribution') {
+        await this._discardGroupDistributionIfStale(actualPayload);
+      }
     } catch (exc) {
       console.warn('[aun_core] 群组密钥消息处理异常:', exc);
       // S14: 控制面消息处理异常也要抑制业务分发
@@ -2268,6 +2530,7 @@ export class AUNClient {
             to: requester,
             payload: response,
             encrypt: true,
+            persist_required: true,
           });
         } catch (exc) {
           console.warn(`向 ${requester} 回复群组密钥失败:`, exc);
@@ -2278,9 +2541,12 @@ export class AUNClient {
     // R4: 收到 distribution/response 后触发 pending 消息重试
     if (result === 'distribution' || result === 'response') {
       const groupId = String(actualPayload.group_id ?? '');
-      if (groupId && this._pendingDecryptMsgs.has(`group:${groupId}`)) {
-        this._safeAsync(this._retryPendingDecryptMsgs(groupId));
+      const rotationId = String(actualPayload.rotation_id ?? '');
+      const keyCommitment = String(actualPayload.commitment ?? '');
+      if (rotationId && keyCommitment) {
+        this._safeAsync(this._ackGroupRotationKey(rotationId, keyCommitment).then(() => undefined));
       }
+      this._scheduleRetryPendingDecryptMsgs(groupId);
     }
 
     return true;
@@ -2579,32 +2845,309 @@ export class AUNClient {
 
   // ── E2EE 编排：Group 生命周期 ─────────────────────
 
-  /** 建群后将本地 epoch 1 同步到服务端 */
-  /** 建群后将本地 epoch 1 同步到服务端，最多重试 3 次 */
-  private async _syncEpochToServer(groupId: string): Promise<void> {
-    const maxRetries = 3;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const rotateParams: RpcParams = {
-          group_id: groupId,
-          current_epoch: 0,
-        };
-        const sigParams = await this._buildRotationSignature(groupId, 0, 1);
-        Object.assign(rotateParams, sigParams);
-        const casResult = await this.call('group.e2ee.rotate_epoch', rotateParams);
-        if (isJsonObject(casResult) && casResult.success) return;
-        console.warn('group epoch CAS failed; stop key distribution (group=%s, current_epoch=%d, returned_epoch=%s)',
-          groupId, 0, isJsonObject(casResult) ? String(casResult.epoch ?? '') : 'invalid_result');
-        return;
-      } catch (exc) {
-        if (attempt < maxRetries) {
-          const delay = 500 * Math.pow(2, attempt - 1);
-          console.warn(`同步 epoch 到服务端失败 (group=${groupId}, 第${attempt}/${maxRetries}次), ${delay}ms后重试:`, exc);
-          await new Promise(r => setTimeout(r, delay));
-        } else {
-          console.error(`同步 epoch 到服务端最终失败 (group=${groupId}, 已重试${maxRetries}次):`, exc);
+  private _attachRotationId(info: JsonObject, rotationId: string): void {
+    if (!rotationId || !Array.isArray(info.distributions)) return;
+    for (const dist of info.distributions) {
+      if (isJsonObject(dist) && isJsonObject(dist.payload)) {
+        dist.payload.rotation_id = rotationId;
+      }
+    }
+  }
+
+  private async _getGroupMemberAids(groupId: string): Promise<string[]> {
+    const membersResult = await this.call('group.get_members', { group_id: groupId });
+    const rawList = isJsonObject(membersResult)
+      ? (Array.isArray(membersResult.members) ? membersResult.members : membersResult.items)
+      : [];
+    if (!Array.isArray(rawList)) return [];
+    const aids: string[] = [];
+    for (const item of rawList) {
+      if (!isJsonObject(item)) continue;
+      const aid = String(item.aid ?? '').trim();
+      if (aid) aids.push(aid);
+    }
+    return aids;
+  }
+
+  private async _distributeGroupEpochKey(info: JsonObject, rotationId = ''): Promise<{ sent: string[]; failed: string[] }> {
+    const sent: string[] = [];
+    const failed: string[] = [];
+    let lastHeartbeat = Date.now();
+    const distributions = (Array.isArray(info.distributions) ? info.distributions : []) as GroupDistribution[];
+    for (const dist of distributions) {
+      if (!isJsonObject(dist) || !dist.to || !isJsonObject(dist.payload)) continue;
+      if (rotationId && Date.now() - lastHeartbeat >= 20_000) {
+        if (await this._heartbeatGroupRotation(rotationId)) lastHeartbeat = Date.now();
+      }
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await this.call('message.send', {
+            to: dist.to,
+            payload: dist.payload,
+            encrypt: true,
+            persist_required: true,
+          });
+          sent.push(String(dist.to));
+          break;
+        } catch (exc) {
+          if (attempt < 2) {
+            await this._sleep((attempt + 1) * 1000);
+          } else {
+            failed.push(String(dist.to));
+            console.warn('epoch 密钥分发失败 (to=%s):', dist.to, exc);
+          }
         }
       }
+    }
+    return { sent, failed };
+  }
+
+  private async _heartbeatGroupRotation(rotationId: string): Promise<boolean> {
+    if (!rotationId) return false;
+    try {
+      const result = await this.call('group.e2ee.heartbeat_rotation', {
+        rotation_id: rotationId,
+        lease_ms: GROUP_ROTATION_LEASE_MS,
+      });
+      return isJsonObject(result) && result.success === true;
+    } catch (exc) {
+      console.warn(`[aun_core] 刷新 epoch rotation lease 失败: rotation=${rotationId} err=${formatCaughtError(exc)}`);
+      return false;
+    }
+  }
+
+  private async _ackGroupRotationKey(rotationId: string, keyCommitment: string, deviceId?: string): Promise<boolean> {
+    if (!rotationId) return false;
+    try {
+      const result = await this.call('group.e2ee.ack_rotation_key', {
+        rotation_id: rotationId,
+        key_commitment: keyCommitment,
+        device_id: deviceId ?? this._deviceId,
+      });
+      return isJsonObject(result) && result.success === true;
+    } catch (exc) {
+      console.warn(`[aun_core] 提交 epoch key ack 失败: rotation=${rotationId} err=${formatCaughtError(exc)}`);
+      return false;
+    }
+  }
+
+  private async _verifyActiveGroupRotationDistribution(payload: JsonObject): Promise<boolean> {
+    const rotationId = String(payload.rotation_id ?? '').trim();
+    const groupId = String(payload.group_id ?? '').trim();
+    if (!groupId) return false;
+    const epoch = Number(payload.epoch ?? 0);
+    if (!Number.isFinite(epoch) || epoch <= 0) return false;
+    const commitment = String(payload.commitment ?? '').trim();
+    try {
+      const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+      if (!isJsonObject(epochResult)) return false;
+      const committedRotation = isJsonObject(epochResult.committed_rotation) ? epochResult.committed_rotation : null;
+      const committedEpoch = Number(epochResult.committed_epoch ?? epochResult.epoch ?? 0);
+      if (!rotationId) {
+        if (Number.isFinite(epoch) && epoch > 0 && epoch <= committedEpoch) {
+          if (committedRotation && Number(committedRotation.target_epoch ?? committedEpoch) === epoch) {
+            const committedCommitment = String(committedRotation.key_commitment ?? '').trim();
+            if (committedCommitment && commitment && committedCommitment !== commitment) return false;
+          }
+          return true;
+        }
+        console.info(`[aun_core] 拒绝缺少 rotation_id 的未来 epoch key 分发: group=${groupId} epoch=${epoch} committed=${committedEpoch}`);
+        return false;
+      }
+      const pending = isJsonObject(epochResult.pending_rotation) ? epochResult.pending_rotation : null;
+      if (pending && !pending.expired) {
+        const pendingCommitment = String(pending.key_commitment ?? '').trim();
+        if (
+          String(pending.rotation_id ?? '') === rotationId
+          && Number(pending.target_epoch ?? 0) === epoch
+          && (!pendingCommitment || pendingCommitment === commitment)
+        ) {
+          return true;
+        }
+      }
+      if (committedRotation && committedEpoch >= epoch) {
+        const committedCommitment = String(committedRotation.key_commitment ?? '').trim();
+        if (
+          String(committedRotation.rotation_id ?? '') === rotationId
+          && (!committedCommitment || committedCommitment === commitment)
+        ) {
+          return true;
+        }
+      }
+    } catch (exc) {
+      console.warn(`[aun_core] 拒绝无法校验 active rotation 的 epoch key 分发: group=${groupId} rotation=${rotationId} err=${formatCaughtError(exc)}`);
+      return false;
+    }
+    console.info(`[aun_core] 拒绝非 pending/committed 状态的 epoch key 分发: group=${groupId} rotation=${rotationId} epoch=${epoch}`);
+    return false;
+  }
+
+  private async _discardGroupDistributionIfStale(payload: JsonObject): Promise<void> {
+    const rotationId = String(payload.rotation_id ?? '').trim();
+    if (!rotationId) return;
+    const groupId = String(payload.group_id ?? '').trim();
+    const epoch = Number(payload.epoch ?? 0);
+    if (!groupId || !Number.isFinite(epoch) || epoch <= 0) return;
+    if (await this._verifyActiveGroupRotationDistribution(payload)) return;
+    try {
+      await this._groupE2ee.discardPendingSecret(groupId, epoch, rotationId);
+      console.info('丢弃 verify 后变为 stale 的 group epoch key: group=%s epoch=%s rotation=%s',
+        groupId, epoch, rotationId);
+    } catch (exc) {
+      console.debug('清理 stale group epoch key 失败: group=%s epoch=%s rotation=%s err=%s',
+        groupId, epoch, rotationId, formatCaughtError(exc));
+    }
+  }
+
+  private async _verifyGroupKeyResponseEpoch(payload: JsonObject): Promise<boolean> {
+    const groupId = String(payload.group_id ?? '').trim();
+    if (!groupId) return false;
+    const epoch = Number(payload.epoch ?? 0);
+    if (!Number.isFinite(epoch) || epoch <= 0) return false;
+    const commitment = String(payload.commitment ?? '').trim();
+    try {
+      const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+      if (!isJsonObject(epochResult)) return false;
+      const committedEpoch = Number(epochResult.committed_epoch ?? epochResult.epoch ?? 0);
+      if (epoch > committedEpoch) {
+        console.info(`[aun_core] 拒绝未提交 epoch 的 group key response: group=${groupId} epoch=${epoch} committed=${committedEpoch}`);
+        return false;
+      }
+      const committedRotation = isJsonObject(epochResult.committed_rotation) ? epochResult.committed_rotation : null;
+      if (committedRotation && Number(committedRotation.target_epoch ?? committedEpoch) === epoch) {
+        const committedCommitment = String(committedRotation.key_commitment ?? '').trim();
+        if (committedCommitment && commitment && committedCommitment !== commitment) return false;
+      }
+      return true;
+    } catch (exc) {
+      console.warn(`[aun_core] 拒绝无法校验 committed epoch 的 group key response: group=${groupId} epoch=${epoch} err=${formatCaughtError(exc)}`);
+      return false;
+    }
+  }
+
+  private async _abortGroupRotation(rotationId: string, reason = ''): Promise<boolean> {
+    if (!rotationId) return false;
+    try {
+      const result = await this.call('group.e2ee.abort_rotation', {
+        rotation_id: rotationId,
+        reason: reason || 'client_abort',
+      });
+      return isJsonObject(result) && result.success === true;
+    } catch (exc) {
+      console.warn(`[aun_core] 中止 epoch rotation 失败: rotation=${rotationId} err=${formatCaughtError(exc)}`);
+      return false;
+    }
+  }
+
+  private _rotationExpectedMembersStale(rotation: JsonObject, memberAids: string[]): boolean {
+    const expected = Array.isArray(rotation.expected_members)
+      ? rotation.expected_members.map((item) => String(item ?? '').trim()).filter(Boolean).sort()
+      : [];
+    const current = memberAids.map((item) => String(item ?? '').trim()).filter(Boolean).sort();
+    return expected.length > 0 && current.length > 0 && expected.join('\n') !== current.join('\n');
+  }
+
+  private _rotationRetryDelayMs(pending: JsonObject | null): number {
+    let leaseExpiresAt = 0;
+    if (pending && !pending.expired && ['', 'distributing'].includes(String(pending.status ?? ''))) {
+      const parsed = Number(pending.lease_expires_at ?? 0);
+      if (Number.isFinite(parsed)) leaseExpiresAt = parsed;
+    }
+    const base = leaseExpiresAt
+      ? Math.max(1000, leaseExpiresAt - Date.now() + 1000)
+      : 5000;
+    return Math.min(base + Math.floor(Math.random() * 2000), GROUP_ROTATION_RETRY_MAX_DELAY_MS);
+  }
+
+  private _scheduleGroupRotationRetry(
+    groupId: string,
+    opts: { reason: string; triggerId: string; expectedEpoch: number | null; pending: JsonObject | null },
+  ): void {
+    if (this._closing || this._state !== 'connected') return;
+    const retryKey = `${groupId}:${opts.triggerId || opts.reason}:${opts.expectedEpoch ?? '-'}`;
+    if (this._groupEpochRotationRetryTimers.has(retryKey)) return;
+    const timer = setTimeout(() => {
+      this._groupEpochRotationRetryTimers.delete(retryKey);
+      if (this._closing || this._state !== 'connected') return;
+      this._safeAsync(this._maybeLeadRotateGroupEpoch(groupId, opts.triggerId, opts.expectedEpoch));
+    }, this._rotationRetryDelayMs(opts.pending));
+    this._groupEpochRotationRetryTimers.set(retryKey, timer);
+  }
+
+  /** 建群后将本地 epoch 1 同步到服务端，最多重试 3 次 */
+  private async _syncEpochToServer(groupId: string): Promise<void> {
+    const started = Date.now();
+    while (this._groupEpochRotationInflight.has(groupId)) {
+      if (this._closing || this._state !== 'connected') return;
+      if (Date.now() - started > 20000) {
+        console.warn('group epoch create sync still in-flight; skip duplicate sync (group=%s)', groupId);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (this._closing || this._state !== 'connected') return;
+    this._groupEpochRotationInflight.add(groupId);
+    try {
+      const maxRetries = 3;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          if (!this._aid) return;
+          const secretData = await this._groupE2ee.loadSecret(groupId, 1);
+          if (!secretData) throw new StateError(`group ${groupId} epoch 1 secret missing`);
+          const rotationId = `rot-${_uuidV4().replace(/-/g, '')}`;
+          const rotateParams: RpcParams = {
+            group_id: groupId,
+            base_epoch: 0,
+            target_epoch: 1,
+            rotation_id: rotationId,
+            reason: 'create_group',
+            key_commitment: secretData.commitment,
+            expected_members: secretData.member_aids.length > 0 ? secretData.member_aids : [this._aid],
+            required_acks: [this._aid],
+            lease_ms: GROUP_ROTATION_LEASE_MS,
+          };
+          const sigParams = await this._buildRotationSignature(groupId, 0, 1, rotateParams);
+          Object.assign(rotateParams, sigParams);
+          const beginResult = await this.call('group.e2ee.begin_rotation', rotateParams);
+          const rotation = isJsonObject(beginResult) && isJsonObject(beginResult.rotation) ? beginResult.rotation : null;
+          if (!isJsonObject(beginResult) || beginResult.success !== true || !rotation) {
+            console.warn('group epoch begin failed; stop key distribution (group=%s, returned=%s)', groupId, JSON.stringify(beginResult));
+            return;
+          }
+          const activeRotationId = String(rotation.rotation_id ?? rotationId);
+          if (!await this._ackGroupRotationKey(activeRotationId, secretData.commitment)) {
+            console.warn('group epoch self ack failed (group=%s, rotation=%s)', groupId, activeRotationId);
+            await this._abortGroupRotation(activeRotationId, 'self_ack_failed');
+            return;
+          }
+          const commitResult = await this.call('group.e2ee.commit_rotation', { rotation_id: activeRotationId });
+          if (isJsonObject(commitResult) && commitResult.success === true) {
+            await storeGroupSecret(
+              this._keystore,
+              this._aid,
+              groupId,
+              1,
+              secretData.secret,
+              secretData.commitment,
+              secretData.member_aids,
+              secretData.epoch_chain,
+            );
+            return;
+          }
+          console.warn('group epoch commit failed (group=%s, returned=%s)', groupId, JSON.stringify(commitResult));
+          return;
+        } catch (exc) {
+          if (attempt < maxRetries) {
+            const delay = 500 * Math.pow(2, attempt - 1);
+            console.warn(`同步 epoch 到服务端失败 (group=${groupId}, 第${attempt}/${maxRetries}次), ${delay}ms后重试:`, exc);
+            await new Promise(r => setTimeout(r, delay));
+          } else {
+            console.error(`同步 epoch 到服务端最终失败 (group=${groupId}, 已重试${maxRetries}次):`, exc);
+          }
+        }
+      }
+    } finally {
+      this._groupEpochRotationInflight.delete(groupId);
     }
   }
 
@@ -2614,18 +3157,21 @@ export class AUNClient {
    */
   private async _maybeLeadRotateGroupEpoch(groupId: string, triggerId = '', expectedEpoch: number | null = null): Promise<void> {
     const myAid = this._aid;
-    if (!myAid) return;
+    if (!myAid || this._closing || this._state !== 'connected') return;
     const started = Date.now();
     while (this._groupEpochRotationInflight.has(groupId)) {
       if (triggerId && this._groupMembershipRotationDone.has(triggerId)) return;
+      if (this._closing || this._state !== 'connected') return;
       if (Date.now() - started > 20000) {
         console.warn('group epoch rotation still in-flight; skip pending trigger (group=%s trigger=%s)', groupId, triggerId || '-');
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
+    if (this._closing || this._state !== 'connected') return;
     this._groupEpochRotationInflight.add(groupId);
     try {
+      if (this._closing || this._state !== 'connected') return;
       const membersResp = await this.call('group.get_members', { group_id: groupId });
       if (!isJsonObject(membersResp)) return;
       const rawList = membersResp.members ?? membersResp.items;
@@ -2654,12 +3200,26 @@ export class AUNClient {
         if (isJsonObject(resp)) beforeEpoch = Number(resp.epoch ?? 0);
       } catch { beforeEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0; }
       await new Promise((r) => setTimeout(r, jitterMs));
+      if (this._closing || this._state !== 'connected') return;
       let afterEpoch = 0;
+      let afterResp: RpcResult = {};
       try {
-        const resp = await this.call('group.e2ee.get_epoch', { group_id: groupId });
-        if (isJsonObject(resp)) afterEpoch = Number(resp.epoch ?? 0);
-      } catch { afterEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0; }
+        afterResp = await this.call('group.e2ee.get_epoch', { group_id: groupId });
+        if (isJsonObject(afterResp)) afterEpoch = Number(afterResp.epoch ?? 0);
+      } catch {
+        afterEpoch = (await this._groupE2ee.currentEpoch(groupId)) ?? 0;
+      }
       if (afterEpoch > beforeEpoch) return; // leader 已完成
+      const pending = isJsonObject(afterResp) && isJsonObject(afterResp.pending_rotation) ? afterResp.pending_rotation : null;
+      if (pending && !pending.expired) {
+        this._scheduleGroupRotationRetry(groupId, {
+          reason: 'membership_changed',
+          triggerId,
+          expectedEpoch,
+          pending,
+        });
+        return;
+      }
       console.info('[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s', groupId, myAid);
       await this._rotateGroupEpoch(groupId, triggerId, expectedEpoch);
     } catch (exc) {
@@ -2675,9 +3235,35 @@ export class AUNClient {
    */
   private async _rotateGroupEpoch(groupId: string, triggerId = '', expectedEpoch: number | null = null): Promise<void> {
     try {
-      // 1. 读取服务端当前 epoch
+      if (!this._aid) return;
+      const memberAids = await this._getGroupMemberAids(groupId);
+      if (triggerId && this._groupMembershipRotationDone.has(triggerId)) return;
+
       const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
       const serverEpoch = isJsonObject(epochResult) ? Number(epochResult.epoch ?? 0) : 0;
+      const pendingRotation = isJsonObject(epochResult) && isJsonObject(epochResult.pending_rotation)
+        ? epochResult.pending_rotation
+        : null;
+      if (pendingRotation && !pendingRotation.expired) {
+        const pendingRotationId = String(pendingRotation.rotation_id ?? '');
+        const stalePending = (
+          expectedEpoch !== null
+          && serverEpoch === expectedEpoch
+          && this._rotationExpectedMembersStale(pendingRotation, memberAids)
+        );
+        if (stalePending && await this._abortGroupRotation(pendingRotationId, 'membership_changed_during_rotation')) {
+          console.info('aborted stale pending group epoch rotation: group=%s rotation=%s',
+            groupId, pendingRotationId || '-');
+        } else {
+          this._scheduleGroupRotationRetry(groupId, {
+            reason: 'membership_changed',
+            triggerId,
+            expectedEpoch,
+            pending: pendingRotation,
+          });
+          return;
+        }
+      }
       if (expectedEpoch !== null && serverEpoch !== expectedEpoch) {
         if (triggerId) this._groupMembershipRotationDone.add(triggerId);
         console.info('skip membership epoch rotation: group=%s expected_epoch=%d server_epoch=%d trigger=%s',
@@ -2685,56 +3271,147 @@ export class AUNClient {
         return;
       }
       const currentEpoch = expectedEpoch ?? serverEpoch;
+      const targetEpoch = currentEpoch + 1;
+      const rotationId = `rot-${_uuidV4().replace(/-/g, '')}`;
+      const info = await this._groupE2ee.rotateEpochTo(groupId, targetEpoch, memberAids, { rotationId });
+      this._attachRotationId(info, rotationId);
+      const discardGeneratedPending = async (): Promise<void> => {
+        try {
+          await this._groupE2ee.discardPendingSecret(groupId, targetEpoch, rotationId);
+        } catch (cleanupExc) {
+          console.debug('清理本地 pending group key 失败: group=%s epoch=%d rotation=%s err=%s',
+            groupId, targetEpoch, rotationId, formatCaughtError(cleanupExc));
+        }
+      };
 
-      // 2. CAS 尝试递增（服务端校验角色 + 原子递增）
       const rotateParams: RpcParams = {
         group_id: groupId,
-        current_epoch: currentEpoch,
+        base_epoch: currentEpoch,
+        target_epoch: targetEpoch,
+        rotation_id: rotationId,
+        reason: triggerId || expectedEpoch !== null ? 'membership_changed' : 'manual',
+        key_commitment: String(info.commitment ?? ''),
+        expected_members: memberAids,
+        required_acks: [this._aid],
+        lease_ms: GROUP_ROTATION_LEASE_MS,
       };
-      const sigParams = await this._buildRotationSignature(groupId, currentEpoch, currentEpoch + 1);
+      const sigParams = await this._buildRotationSignature(groupId, currentEpoch, targetEpoch, rotateParams);
       Object.assign(rotateParams, sigParams);
-      const casResult = await this.call('group.e2ee.rotate_epoch', rotateParams);
-      if (!isJsonObject(casResult) || !casResult.success) {
-        console.warn('group epoch CAS failed; stop key distribution (group=%s, current_epoch=%d, returned_epoch=%s)',
-          groupId, currentEpoch, isJsonObject(casResult) ? String(casResult.epoch ?? '') : 'invalid_result');
+      let rawBeginResult: any;
+      try {
+        rawBeginResult = await this.call('group.e2ee.begin_rotation', rotateParams);
+      } catch (exc) {
+        await discardGeneratedPending();
+        throw exc;
+      }
+      const beginResult = isJsonObject(rawBeginResult) ? rawBeginResult : null;
+      const beginRotationRaw = beginResult ? beginResult.rotation : null;
+      const rotation = isJsonObject(beginRotationRaw) ? beginRotationRaw : null;
+      if (!beginResult || beginResult.success !== true || !rotation) {
+        if (rotation && !rotation.expired) {
+          if (
+            this._rotationExpectedMembersStale(rotation, memberAids)
+            && await this._abortGroupRotation(String(rotation.rotation_id ?? ''), 'membership_changed_during_rotation')
+          ) {
+            this._scheduleGroupRotationRetry(groupId, {
+              reason: 'membership_changed',
+              triggerId,
+              expectedEpoch,
+              pending: null,
+            });
+          } else {
+            this._scheduleGroupRotationRetry(groupId, {
+              reason: 'membership_changed',
+              triggerId,
+              expectedEpoch,
+              pending: rotation,
+            });
+          }
+        } else if (beginResult && beginResult.reason === 'expected_members_mismatch') {
+          this._scheduleGroupRotationRetry(groupId, {
+            reason: 'membership_changed',
+            triggerId,
+            expectedEpoch,
+            pending: null,
+          });
+        }
+        console.warn('group epoch begin failed; stop key distribution (group=%s, current_epoch=%d, returned=%s)',
+          groupId, currentEpoch, JSON.stringify(beginResult));
+        await discardGeneratedPending();
         return;
       }
 
-      const newEpoch = typeof casResult.epoch === 'number' ? casResult.epoch : 0;
+      const activeRotationId = String(rotation.rotation_id ?? rotationId);
+      const distributeResult = await this._distributeGroupEpochKey(info, activeRotationId);
+      if (distributeResult.failed.length > 0) {
+        console.warn('group epoch key distribution incomplete; abort rotation before retry (group=%s rotation=%s failed=%s)',
+          groupId, activeRotationId, distributeResult.failed.join(','));
+        await this._abortGroupRotation(activeRotationId, 'distribution_failed');
+        this._scheduleGroupRotationRetry(groupId, {
+          reason: 'membership_changed',
+          triggerId,
+          expectedEpoch,
+          pending: null,
+        });
+        await discardGeneratedPending();
+        return;
+      }
+      await this._heartbeatGroupRotation(activeRotationId);
+      if (!await this._ackGroupRotationKey(activeRotationId, String(info.commitment ?? ''))) {
+        console.warn('group epoch self ack failed; abort rotation before retry (group=%s rotation=%s)', groupId, activeRotationId);
+        await this._abortGroupRotation(activeRotationId, 'self_ack_failed');
+        this._scheduleGroupRotationRetry(groupId, {
+          reason: 'membership_changed',
+          triggerId,
+          expectedEpoch,
+          pending: null,
+        });
+        await discardGeneratedPending();
+        return;
+      }
+      const commitResult = await this.call('group.e2ee.commit_rotation', { rotation_id: activeRotationId });
+      if (!isJsonObject(commitResult) || commitResult.success !== true) {
+        console.warn('group epoch commit failed (group=%s, rotation=%s, returned=%s)',
+          groupId, activeRotationId, JSON.stringify(commitResult));
+        this._scheduleGroupRotationRetry(groupId, {
+          reason: 'membership_changed',
+          triggerId,
+          expectedEpoch,
+          pending: isJsonObject(commitResult) && isJsonObject(commitResult.rotation) ? commitResult.rotation : rotation,
+        });
+        const returnedRotation = isJsonObject(commitResult) && isJsonObject(commitResult.rotation) ? commitResult.rotation : null;
+        if (!(returnedRotation
+          && String(returnedRotation.rotation_id ?? '') === activeRotationId
+          && String(returnedRotation.status ?? '') === 'distributing')) {
+          await discardGeneratedPending();
+        }
+        return;
+      }
+      const committedSecret = await this._groupE2ee.loadSecret(groupId, targetEpoch);
+      if (committedSecret && this._aid) {
+        const committedRotation = isJsonObject(commitResult.rotation)
+          ? commitResult.rotation
+          : { rotation_id: activeRotationId, key_commitment: String(info.commitment ?? '') };
+        if (this._groupSecretMatchesCommittedRotation(committedSecret as unknown as JsonObject, committedRotation)) {
+          await storeGroupSecret(
+            this._keystore,
+            this._aid,
+            groupId,
+            targetEpoch,
+            committedSecret.secret,
+            committedSecret.commitment,
+            committedSecret.member_aids.length > 0 ? committedSecret.member_aids : memberAids,
+            committedSecret.epoch_chain,
+          );
+        } else {
+          console.warn('group epoch commit succeeded but local target key does not match committed rotation; keep pending blocked (group=%s rotation=%s epoch=%d)',
+            groupId, activeRotationId, targetEpoch);
+        }
+      }
       if (triggerId) {
         this._groupMembershipRotationDone.add(triggerId);
         if (this._groupMembershipRotationDone.size > 2000) {
           this._groupMembershipRotationDone = new Set(Array.from(this._groupMembershipRotationDone).slice(-1000));
-        }
-      }
-
-      // 3. 获取最新成员列表
-      const membersResult = await this.call('group.get_members', { group_id: groupId });
-      const memberList = isJsonObject(membersResult) && Array.isArray(membersResult.members)
-        ? membersResult.members as MemberRecord[]
-        : [];
-      const memberAids = memberList.map(m => String(m.aid ?? ''));
-
-      // 4. 本地生成密钥 + 存储 + 分发
-      const info = await this._groupE2ee.rotateEpochTo(groupId, newEpoch, memberAids);
-      const distributions = (Array.isArray(info.distributions) ? info.distributions : []) as GroupDistribution[];
-      for (const dist of distributions) {
-        // 重试 3 次，间隔递增（1s, 2s）
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try {
-            await this.call('message.send', {
-              to: dist.to,
-              payload: dist.payload,
-              encrypt: true,
-            });
-            break; // 成功则跳出重试循环
-          } catch (exc) {
-            if (attempt < 2) {
-              await this._sleep((attempt + 1) * 1000);
-            } else {
-              console.warn('epoch 密钥分发失败 (to=%s):', dist.to, exc);
-            }
-          }
         }
       }
     } catch (exc) {
@@ -2792,6 +3469,7 @@ export class AUNClient {
             to: newMemberAid,
             payload: distPayload,
             encrypt: true,
+            persist_required: true,
           });
           break; // 成功则跳出重试循环
         } catch (sendExc) {
@@ -2812,6 +3490,7 @@ export class AUNClient {
     groupId: string,
     currentEpoch: number,
     newEpoch: number,
+    source?: JsonObject,
   ): Promise<Record<string, string>> {
     const identity = this._identity;
     if (!identity || !identity.private_key_pem) {
@@ -2820,9 +3499,34 @@ export class AUNClient {
 
     const aid = (identity.aid ?? '') as string;
     const ts = String(Math.floor(Date.now() / 1000));
-    const signData = new TextEncoder().encode(
-      `${groupId}|${currentEpoch}|${newEpoch}|${aid}|${ts}`,
-    );
+    let signData: Uint8Array;
+    if (source) {
+      const listField = (key: string): string[] => {
+        const raw = source[key];
+        return Array.isArray(raw)
+          ? raw.map(item => String(item ?? '').trim()).filter(Boolean).sort()
+          : [];
+      };
+      signData = new TextEncoder().encode(stableStringify({
+        version: 'v2',
+        group_id: groupId,
+        base_epoch: Math.trunc(currentEpoch),
+        target_epoch: Math.trunc(newEpoch),
+        aid,
+        rotation_timestamp: ts,
+        rotation_id: String(source.rotation_id ?? source.new_rotation_id ?? ''),
+        reason: String(source.reason ?? ''),
+        key_commitment: String(source.key_commitment ?? ''),
+        manifest_hash: String(source.manifest_hash ?? ''),
+        epoch_chain: String(source.epoch_chain ?? ''),
+        expected_members: listField('expected_members'),
+        required_acks: listField('required_acks'),
+      }));
+    } else {
+      signData = new TextEncoder().encode(
+        `${groupId}|${currentEpoch}|${newEpoch}|${aid}|${ts}`,
+      );
+    }
 
     const pkcs8 = pemToArrayBuffer(identity.private_key_pem as string);
     const cryptoKey = await crypto.subtle.importKey(
@@ -2832,16 +3536,18 @@ export class AUNClient {
     );
     const sigP1363 = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
-      cryptoKey, signData,
+      cryptoKey, toBufferSource(signData),
     );
 
     // P1363 → DER 格式（使用顶部静态导入的 p1363ToDer）
     const sigDer = p1363ToDer(new Uint8Array(sigP1363));
 
-    return {
+    const result: Record<string, string> = {
       rotation_signature: uint8ToBase64(sigDer),
       rotation_timestamp: ts,
     };
+    if (source) result.rotation_sig_version = 'v2';
+    return result;
   }
 
   // ── 内部：连接 ────────────────────────────────────
@@ -3064,6 +3770,10 @@ export class AUNClient {
       clearInterval(this._cacheCleanupTimer);
       this._cacheCleanupTimer = null;
     }
+    for (const timer of this._groupEpochRotationRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this._groupEpochRotationRetryTimers.clear();
   }
 
   /** 心跳定时器 */
@@ -3287,11 +3997,11 @@ export class AUNClient {
       this._groupEpochCleanupTimer = setInterval(async () => {
         if (this._state !== 'connected' || this._closing || !this._aid) return;
         try {
-          const allGroups = typeof this._keystore.loadAllGroupSecretStates === 'function'
-            ? await this._keystore.loadAllGroupSecretStates(this._aid!) ?? {}
-            : {};
+          const groupIds = typeof this._keystore.listGroupSecretIds === 'function'
+            ? await this._keystore.listGroupSecretIds(this._aid!)
+            : [];
           const retention = this.configModel.oldEpochRetentionSeconds;
-          for (const gid of Object.keys(allGroups)) {
+          for (const gid of groupIds) {
             await this._groupE2ee.cleanup(gid, retention);
           }
         } catch (exc) {
@@ -3306,11 +4016,11 @@ export class AUNClient {
       this._groupEpochRotateTimer = setInterval(async () => {
         if (this._state !== 'connected' || this._closing || !this._aid) return;
         try {
-          const allGroups = typeof this._keystore.loadAllGroupSecretStates === 'function'
-            ? await this._keystore.loadAllGroupSecretStates(this._aid!) ?? {}
-            : {};
-          for (const gid of Object.keys(allGroups)) {
-            await this._rotateGroupEpoch(gid);
+          const groupIds = typeof this._keystore.listGroupSecretIds === 'function'
+            ? await this._keystore.listGroupSecretIds(this._aid!)
+            : [];
+          for (const gid of groupIds) {
+            await this._maybeLeadRotateGroupEpoch(gid);
           }
         } catch (exc) {
           console.warn('epoch 定时轮换失败:', exc);

@@ -277,6 +277,7 @@ dig test-{random3}.aid.pub
 - 提交日志条目到 CT 日志服务（包含 Issuer CA 证书、签发 Registry CA、验证结果摘要）
 - 获取签名日志证明（SCT）
 - SCT 作为独立证明随证书一同返回给申请者
+- Issuer 获得 Issuer CA 证书后，必须通过 `https://ct.{issuer}` 提供公开 CT 查询入口
 
 #### 步骤 13：返回证书
 
@@ -312,8 +313,9 @@ dig test-{random3}.aid.pub
 2. 将 Issuer CA 私钥安全存储（推荐 HSM）
 3. 部署 Auth 服务，配置 Issuer CA 证书和私钥
 4. 配置 `https://{issuer}/ca/cert` 返回完整证书链
-5. 可选：删除 `.well-known/aun-issuer-verification.json` 验证文件
-6. 测试证书签发功能
+5. 确保 `https://ct.{issuer}` 的 CT 公开只读查询端点可访问
+6. 可选：删除 `.well-known/aun-issuer-verification.json` 验证文件
+7. 测试证书签发和 CT 查询功能
 
 ## F.4 Registry CA API 规范
 
@@ -501,7 +503,41 @@ Registry CA 签发流程：
 | 审计日志 | 所有签发操作完整记录 |
 | 监控 | 异常签发行为实时告警 |
 
-## F.9 与现有 PKI 标准的对比
+## F.9 Issuer CT 服务要求
+
+### F.9.1 服务边界
+
+Issuer 获得 Issuer CA 证书后，必须提供 Issuer 维度的 CT 查询服务。CA 服务只负责写入 CT 和提供内部只读查询能力，不得直接暴露公网 HTTP。`ct.{issuer}` 是稳定公开访问面，只能提供公开只读查询路径，公开 URL 和响应格式必须保持兼容。
+
+### F.9.2 Issuer 本地 CA 写入范围
+
+Issuer CA 的下列写操作成功后，必须追加 CT 条目：
+
+| 操作 | CT operation | 记录内容 |
+|------|--------------|----------|
+| 终端证书签发 | `agent_cert_issue` | AID、证书序列号、证书 SHA-256、公钥 SHA-256、曲线、签发时间 |
+| 内置服务证书签发 | `agent_cert_issue` | 服务 AID、证书序列号、证书 SHA-256、公钥 SHA-256、曲线、签发时间 |
+| 证书续期 | `agent_cert_renew` | AID、新旧证书序列号、新证书 SHA-256、曲线 |
+| 证书换钥 | `agent_cert_rekey` | AID、新旧证书序列号、新公钥 SHA-256、新证书 SHA-256、曲线 |
+| 证书吊销 | `agent_cert_revoke` | AID、证书序列号、吊销原因、吊销时间 |
+
+CT 条目只包含公开字段，不得写入私钥、私钥摘要、手机号、客户端 IP 或内部操作者标识。内部审计日志可以另行记录，但不能通过 `ct.{issuer}` 暴露。
+
+### F.9.3 公开查询端点
+
+Issuer CT 服务必须提供以下公开 HTTP 端点，不要求鉴权：
+
+| 方法 | URL | 说明 |
+|------|-----|------|
+| GET | `https://ct.{issuer}/sth` | 最新签名树头 |
+| GET | `https://ct.{issuer}/entries?start=0&limit=100` | 分页查询公开 CT 条目 |
+| GET | `https://ct.{issuer}/entries/{log_id}` | 查询单条 CT 条目 |
+| GET | `https://ct.{issuer}/certs/{serial}` | 按证书序列号查询 CT 条目 |
+| GET | `https://ct.{issuer}/proof/{tree_size}/{log_id}` | 查询 Merkle inclusion proof |
+
+这些端点是公开 HTTP 能力，不属于 SDK RPC。SDK 不提供专用 CT namespace 或 `AUNClient.ct` 功能。
+
+## F.10 与现有 PKI 标准的对比
 
 | 标准 | AUN 对应 | 相似点 | 差异点 |
 |------|---------|--------|--------|

@@ -411,6 +411,30 @@ describe('AUNClient prekey 证书指纹编排', () => {
     expect(sentParams.delivery_mode).toBeUndefined();
   });
 
+  it('加密 P2P 多设备发送应透传 durable 为 persist_required', async () => {
+    const client = new AUNClient();
+    (client as any)._fetchPeerPrekeys = vi.fn().mockResolvedValue([
+      { device_id: 'phone', prekey_id: 'pk-phone', public_key: 'pub-1', signature: 'sig-1' },
+      { device_id: 'laptop', prekey_id: 'pk-laptop', public_key: 'pub-2', signature: 'sig-2' },
+    ]);
+    (client as any)._buildSelfSyncCopies = vi.fn().mockResolvedValue([]);
+    (client as any)._buildRecipientDeviceCopies = vi.fn().mockResolvedValue([
+      { device_id: 'phone', envelope: { ciphertext: 'c1' } },
+      { device_id: 'laptop', envelope: { ciphertext: 'c2' } },
+    ]);
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+
+    await (client as any)._sendEncrypted({
+      to: 'bob.example.com',
+      payload: { type: 'text', text: 'hello' },
+      durable: true,
+    });
+
+    expect((client as any)._transport.call).toHaveBeenCalledWith('message.send', expect.objectContaining({
+      persist_required: true,
+    }));
+  });
+
   it('发送加密消息时应按 prekey.cert_fingerprint 获取证书', async () => {
     const client = new AUNClient();
     (client as any)._fetchPeerPrekeys = vi.fn().mockResolvedValue([{
@@ -989,6 +1013,11 @@ describe('R4: 收到密钥后应触发 pending 消息重试', () => {
     };
 
     const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
+    (client as any).call = vi.fn().mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: { rotation_id: 'rot-r4' },
+    });
 
     const msg = {
       from: 'peer.aid.com',
@@ -996,11 +1025,162 @@ describe('R4: 收到密钥后应触发 pending 消息重试', () => {
         type: 'e2ee.group_key_distribution',
         group_id: 'g1',
         epoch: 2,
+        rotation_id: 'rot-r4',
       },
     };
 
     await (client as any)._tryHandleGroupKeyMessage(msg);
 
     expect(retrySpy).toHaveBeenCalledWith('g1');
+  });
+});
+
+describe('GROUP epoch 轮换竞态防护', () => {
+  it('pending decrypt retry 不应覆盖 retry 期间新入队消息', async () => {
+    const client = new AUNClient();
+    const ns = 'group:g1';
+    const first = { group_id: 'g1', seq: 1, payload: { type: 'e2ee.group_encrypted' } };
+    const second = { group_id: 'g1', seq: 2, payload: { type: 'e2ee.group_encrypted' } };
+    (client as any)._pendingDecryptMsgs.set(ns, [first]);
+    vi.spyOn(client as any, '_decryptGroupMessage').mockImplementation(async (msg: any) => {
+      (client as any)._enqueuePendingDecrypt('g1', second);
+      return { ...msg, e2ee: { ok: true } };
+    });
+    vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
+
+    await (client as any)._retryPendingDecryptMsgs('g1');
+
+    expect((client as any)._pendingDecryptMsgs.get(ns)).toEqual([second]);
+  });
+
+  it('无 rotation_id 的未来 epoch 分发应被拒绝', async () => {
+    const client = new AUNClient();
+    (client as any).call = vi.fn().mockResolvedValue({ epoch: 1, committed_epoch: 1 });
+
+    await expect((client as any)._verifyActiveGroupRotationDistribution({
+      type: 'e2ee.group_key_distribution',
+      group_id: 'g1',
+      epoch: 2,
+      commitment: 'c2',
+    })).resolves.toBe(false);
+  });
+
+  it('未提交 epoch 的 key response 应被拒绝', async () => {
+    const client = new AUNClient();
+    (client as any).call = vi.fn().mockResolvedValue({ epoch: 1, committed_epoch: 1 });
+
+    await expect((client as any)._verifyGroupKeyResponseEpoch({
+      type: 'e2ee.group_key_response',
+      group_id: 'g1',
+      epoch: 2,
+      commitment: 'c2',
+    })).resolves.toBe(false);
+  });
+
+  it('发送前恢复等待期间 committed epoch 推进时应返回最新 epoch', async () => {
+    const client = new AUNClient();
+    (client as any)._groupE2ee = {
+      loadSecret: vi.fn().mockImplementation(async (_groupId: string, epoch: number) => (
+        epoch === 1
+          ? { pending_rotation_id: 'rot-local-1', commitment: 'c1' }
+          : { pending_rotation_id: 'rot-2', commitment: 'c2' }
+      )),
+    };
+    const recoverSpy = vi.spyOn(client as any, '_recoverGroupEpochKey').mockResolvedValue(true);
+    vi.spyOn(client as any, '_committedGroupEpochState').mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: { rotation_id: 'rot-2', key_commitment: 'c2' },
+    });
+
+    const readyEpoch = await (client as any)._ensureCommittedGroupSecretForSend('g1', 1, {
+      epoch: 1,
+      committed_epoch: 1,
+      committed_rotation: { rotation_id: 'rot-other', key_commitment: 'other' },
+    });
+
+    expect(readyEpoch).toBe(2);
+    expect(recoverSpy).toHaveBeenCalledWith('g1', 1, '', 5000);
+    expect(recoverSpy).toHaveBeenCalledWith('g1', 2, '', 5000);
+  });
+
+  it('本地 epoch 1 但服务端 epoch 0 时应先补同步初始 epoch', async () => {
+    const client = new AUNClient();
+    let getEpochCalls = 0;
+    (client as any)._groupE2ee = {
+      currentEpoch: vi.fn().mockResolvedValue(1),
+      loadSecret: vi.fn().mockResolvedValue({ epoch: 1, commitment: 'c1', member_aids: ['alice.aid'] }),
+    };
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      expect(method).toBe('group.e2ee.get_epoch');
+      getEpochCalls += 1;
+      return getEpochCalls === 1 ? { epoch: 0, committed_epoch: 0 } : { epoch: 1, committed_epoch: 1 };
+    });
+    const syncSpy = vi.spyOn(client as any, '_syncEpochToServer').mockResolvedValue(undefined);
+
+    await (client as any)._ensureGroupEpochReady('g1', false);
+
+    expect(syncSpy).toHaveBeenCalledWith('g1');
+    expect(getEpochCalls).toBe(2);
+  });
+
+  it('初始 epoch 补同步后服务端仍为 0 时应拒绝继续发送', async () => {
+    const client = new AUNClient();
+    (client as any)._groupE2ee = {
+      currentEpoch: vi.fn().mockResolvedValue(1),
+      loadSecret: vi.fn().mockResolvedValue({ epoch: 1, commitment: 'c1', member_aids: ['alice.aid'] }),
+    };
+    (client as any).call = vi.fn().mockResolvedValue({ epoch: 0, committed_epoch: 0 });
+    vi.spyOn(client as any, '_syncEpochToServer').mockResolvedValue(undefined);
+
+    await expect((client as any)._ensureGroupEpochReady('g1', false))
+      .rejects.toThrow('initial epoch sync has not completed');
+  });
+
+  it('stale pending secret 不应让 epoch key recovery 返回成功', async () => {
+    const client = new AUNClient();
+    (client as any)._groupE2ee = {
+      loadSecret: vi.fn().mockResolvedValue({ pending_rotation_id: 'rot-stale', commitment: 'c2' }),
+    };
+    (client as any).call = vi.fn().mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: { rotation_id: 'rot-committed', key_commitment: 'c2' },
+    });
+    const requestSpy = vi.spyOn(client as any, '_requestGroupKeyFromCandidates').mockResolvedValue(undefined);
+
+    await expect((client as any)._recoverGroupEpochKey('g1', 2, '', 0)).resolves.toBe(false);
+
+    expect((client as any).call).toHaveBeenCalledWith('group.e2ee.get_epoch', { group_id: 'g1' });
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('poll 恢复拿到 epoch key 后应触发 pending decrypt retry', async () => {
+    const client = new AUNClient();
+    (client as any)._pendingDecryptMsgs.set('group:g1', [
+      { group_id: 'g1', seq: 7, payload: { type: 'e2ee.group_encrypted', epoch: 2 } },
+    ]);
+    (client as any)._groupE2ee = {
+      loadSecret: vi.fn()
+        .mockResolvedValue({ epoch: 2, commitment: 'c2' }),
+    };
+    (client as any).call = vi.fn().mockResolvedValue({ epoch: 2, committed_epoch: 2 });
+    vi.spyOn(client as any, '_requestGroupKeyFromCandidates').mockResolvedValue(undefined);
+    const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
+
+    await expect((client as any)._doRecoverGroupEpochKey('g1', 2, '', 0)).resolves.toBe(true);
+
+    expect(retrySpy).toHaveBeenCalledWith('g1');
+  });
+
+  it('成员变更 trigger_id 优先使用 aid + epoch', () => {
+    const client = new AUNClient();
+    const triggerId = (client as any)._membershipRotationTriggerId('g1', {
+      action: 'member_added',
+      event_seq: 99,
+      member: { aid: 'carol.aid' },
+      old_epoch: 2,
+    });
+    expect(triggerId).toBe('g1:member_added:aid:carol.aid:epoch:2');
   });
 });

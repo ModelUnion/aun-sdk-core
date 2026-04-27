@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -451,6 +453,122 @@ func (a *AIDDatabase) LoadGroupCurrent(groupID string) map[string]any {
 	return result
 }
 
+func (a *AIDDatabase) LoadGroupSecretEpoch(groupID string, epoch *int) (map[string]any, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	current, err := a.loadGroupCurrentLocked(groupID)
+	if err != nil {
+		return nil, err
+	}
+	if epoch == nil {
+		return current, nil
+	}
+	if current != nil && int(toInt64Local(current["epoch"])) == *epoch {
+		return current, nil
+	}
+	var oldEpoch, updatedAt int64
+	var enc, dataStr string
+	var expiresAt sql.NullInt64
+	row := a.db.QueryRow(
+		"SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? AND epoch = ?",
+		groupID, *epoch,
+	)
+	if err := row.Scan(&oldEpoch, &enc, &dataStr, &updatedAt, &expiresAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	entry := map[string]any{
+		"epoch":      oldEpoch,
+		"secret":     a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, oldEpoch), enc, "LoadGroupSecretEpoch"),
+		"updated_at": updatedAt,
+	}
+	var extra map[string]any
+	if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
+		for k, v := range extra {
+			entry[k] = v
+		}
+	}
+	if expiresAt.Valid {
+		entry["expires_at"] = expiresAt.Int64
+	}
+	return entry, nil
+}
+
+func (a *AIDDatabase) LoadGroupSecretEpochs(groupID string) ([]map[string]any, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	current, err := a.loadGroupCurrentLocked(groupID)
+	if err != nil {
+		return nil, err
+	}
+	var result []map[string]any
+	if current != nil {
+		result = append(result, current)
+	}
+	rows, err := a.db.Query(
+		"SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? ORDER BY epoch ASC",
+		groupID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var oldEpoch, updatedAt int64
+		var enc, dataStr string
+		var expiresAt sql.NullInt64
+		if err := rows.Scan(&oldEpoch, &enc, &dataStr, &updatedAt, &expiresAt); err != nil {
+			return nil, err
+		}
+		entry := map[string]any{
+			"epoch":      oldEpoch,
+			"secret":     a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, oldEpoch), enc, "LoadGroupSecretEpochs"),
+			"updated_at": updatedAt,
+		}
+		var extra map[string]any
+		if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
+			for k, v := range extra {
+				entry[k] = v
+			}
+		}
+		if expiresAt.Valid {
+			entry["expires_at"] = expiresAt.Int64
+		}
+		result = append(result, entry)
+	}
+	return result, rows.Err()
+}
+
+func (a *AIDDatabase) loadGroupCurrentLocked(groupID string) (map[string]any, error) {
+	var epoch int64
+	var enc, dataStr string
+	var updatedAt int64
+	row := a.db.QueryRow(
+		"SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?", groupID,
+	)
+	if err := row.Scan(&epoch, &enc, &dataStr, &updatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	result := map[string]any{
+		"group_id":   groupID,
+		"epoch":      epoch,
+		"secret":     a.decryptText("group/"+groupID+"/current", enc, "LoadGroupCurrent"),
+		"updated_at": updatedAt,
+	}
+	var extra map[string]any
+	if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
+		for k, v := range extra {
+			result[k] = v
+		}
+	}
+	return result, nil
+}
+
 func (a *AIDDatabase) LoadAllGroupCurrent() map[string]map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -587,8 +705,7 @@ func (a *AIDDatabase) CleanupGroupOldEpochs(groupID string, cutoffMs int64) int 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	res, err := a.db.Exec(
-		`DELETE FROM group_old_epochs WHERE group_id = ?
-		 AND (CASE WHEN expires_at IS NOT NULL THEN expires_at ELSE updated_at END) < ?`,
+		`DELETE FROM group_old_epochs WHERE group_id = ? AND updated_at <= ?`,
 		groupID, cutoffMs,
 	)
 	if err != nil {
@@ -597,6 +714,401 @@ func (a *AIDDatabase) CleanupGroupOldEpochs(groupID string, cutoffMs int64) int 
 	}
 	n, _ := res.RowsAffected()
 	return int(n)
+}
+
+func (a *AIDDatabase) StoreGroupSecretTransition(groupID string, opts GroupSecretTransitionOptions) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	now := nowMs()
+	epoch := int64(opts.Epoch)
+	members := normalizeStringSlice(opts.MemberAIDs)
+	pendingID := strings.TrimSpace(opts.PendingRotationID)
+
+	var currentEpoch, currentUpdatedAt int64
+	var currentEnc, currentDataStr string
+	row := tx.QueryRow(
+		"SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?",
+		groupID,
+	)
+	hasCurrent := true
+	if err := row.Scan(&currentEpoch, &currentEnc, &currentDataStr, &currentUpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			hasCurrent = false
+		} else {
+			return false, err
+		}
+	}
+
+	if hasCurrent {
+		currentSecret := a.decryptText("group/"+groupID+"/current", currentEnc, "StoreGroupSecretTransition")
+		currentData := jsonObjectLocal(currentDataStr)
+		if epoch < currentEpoch {
+			if err := tx.Commit(); err != nil {
+				return false, err
+			}
+			committed = true
+			return false, nil
+		}
+		if epoch == currentEpoch && currentSecret != "" {
+			if currentSecret != opts.Secret {
+				if strings.TrimSpace(fmt.Sprint(currentData["pending_rotation_id"])) != "" {
+					if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
+						return false, err
+					}
+					if err := tx.Commit(); err != nil {
+						return false, err
+					}
+					committed = true
+					return true, nil
+				}
+				if err := tx.Commit(); err != nil {
+					return false, err
+				}
+				committed = true
+				return false, nil
+			}
+
+			updated := copyMapLocal(currentData)
+			changed := false
+			oldMembers := normalizeStringSliceFromAny(updated["member_aids"])
+			if len(members) > 0 && !stringSliceEqualLocal(oldMembers, members) {
+				updated["member_aids"] = members
+				updated["commitment"] = opts.Commitment
+				changed = true
+			}
+			if opts.EpochChain != "" && updated["epoch_chain"] != opts.EpochChain {
+				updated["epoch_chain"] = opts.EpochChain
+				changed = true
+			}
+			if opts.EpochChainUnverifiedSet && opts.EpochChainUnverified {
+				if updated["epoch_chain_unverified"] != true {
+					updated["epoch_chain_unverified"] = true
+					changed = true
+				}
+				if opts.EpochChainUnverifiedReason != "" && updated["epoch_chain_unverified_reason"] != opts.EpochChainUnverifiedReason {
+					updated["epoch_chain_unverified_reason"] = opts.EpochChainUnverifiedReason
+					changed = true
+				}
+			} else if opts.EpochChainUnverifiedSet && (updated["epoch_chain_unverified"] != nil || updated["epoch_chain_unverified_reason"] != nil) {
+				delete(updated, "epoch_chain_unverified")
+				delete(updated, "epoch_chain_unverified_reason")
+				changed = true
+			}
+			if pendingID != "" && updated["pending_rotation_id"] != pendingID {
+				updated["pending_rotation_id"] = pendingID
+				updated["pending_created_at"] = now
+				changed = true
+			}
+			if pendingID == "" && updated["pending_rotation_id"] != nil {
+				delete(updated, "pending_rotation_id")
+				delete(updated, "pending_created_at")
+				changed = true
+			}
+			if changed {
+				if err := a.upsertGroupCurrentTx(tx, groupID, epoch, currentSecret, updated, now); err != nil {
+					return false, err
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return false, err
+			}
+			committed = true
+			return true, nil
+		}
+		if currentEpoch != epoch {
+			expiresAt := currentUpdatedAt + opts.OldEpochRetentionMillis
+			if err := a.upsertGroupOldEpochTx(tx, groupID, currentEpoch, currentSecret, currentData, currentUpdatedAt, &expiresAt); err != nil {
+				return false, err
+			}
+		}
+	}
+
+	if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	committed = true
+	return true, nil
+}
+
+func (a *AIDDatabase) StoreGroupSecretEpoch(groupID string, opts GroupSecretTransitionOptions) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	now := nowMs()
+	epoch := int64(opts.Epoch)
+	members := normalizeStringSlice(opts.MemberAIDs)
+	pendingID := strings.TrimSpace(opts.PendingRotationID)
+
+	var currentEpoch int64
+	var currentEnc, currentDataStr string
+	var currentUpdatedAt int64
+	row := tx.QueryRow(
+		"SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?",
+		groupID,
+	)
+	hasCurrent := true
+	if err := row.Scan(&currentEpoch, &currentEnc, &currentDataStr, &currentUpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			hasCurrent = false
+		} else {
+			return false, err
+		}
+	}
+
+	if !hasCurrent {
+		if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		committed = true
+		return true, nil
+	}
+
+	if epoch > currentEpoch {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		committed = true
+		return false, nil
+	}
+
+	if epoch == currentEpoch {
+		currentSecret := a.decryptText("group/"+groupID+"/current", currentEnc, "StoreGroupSecretEpoch")
+		currentData := jsonObjectLocal(currentDataStr)
+		if currentSecret != "" && currentSecret != opts.Secret {
+			if strings.TrimSpace(fmt.Sprint(currentData["pending_rotation_id"])) == "" {
+				if err := tx.Commit(); err != nil {
+					return false, err
+				}
+				committed = true
+				return false, nil
+			}
+			if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
+				return false, err
+			}
+			if err := tx.Commit(); err != nil {
+				return false, err
+			}
+			committed = true
+			return true, nil
+		}
+
+		updated := copyMapLocal(currentData)
+		changed := false
+		oldMembers := normalizeStringSliceFromAny(updated["member_aids"])
+		if len(members) > 0 && !stringSliceEqualLocal(oldMembers, members) {
+			updated["member_aids"] = members
+			updated["commitment"] = opts.Commitment
+			changed = true
+		}
+		if opts.EpochChain != "" && updated["epoch_chain"] != opts.EpochChain {
+			updated["epoch_chain"] = opts.EpochChain
+			changed = true
+		}
+		if opts.EpochChainUnverifiedSet && opts.EpochChainUnverified {
+			if updated["epoch_chain_unverified"] != true {
+				updated["epoch_chain_unverified"] = true
+				changed = true
+			}
+			if opts.EpochChainUnverifiedReason != "" && updated["epoch_chain_unverified_reason"] != opts.EpochChainUnverifiedReason {
+				updated["epoch_chain_unverified_reason"] = opts.EpochChainUnverifiedReason
+				changed = true
+			}
+		} else if opts.EpochChainUnverifiedSet && (updated["epoch_chain_unverified"] != nil || updated["epoch_chain_unverified_reason"] != nil) {
+			delete(updated, "epoch_chain_unverified")
+			delete(updated, "epoch_chain_unverified_reason")
+			changed = true
+		}
+		if pendingID != "" && updated["pending_rotation_id"] != pendingID {
+			updated["pending_rotation_id"] = pendingID
+			updated["pending_created_at"] = now
+			changed = true
+		}
+		if pendingID == "" && updated["pending_rotation_id"] != nil {
+			delete(updated, "pending_rotation_id")
+			delete(updated, "pending_created_at")
+			changed = true
+		}
+		if changed {
+			if err := a.upsertGroupCurrentTx(tx, groupID, epoch, currentSecret, updated, now); err != nil {
+				return false, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		committed = true
+		return true, nil
+	}
+
+	var oldEnc string
+	oldRow := tx.QueryRow(
+		"SELECT secret_enc FROM group_old_epochs WHERE group_id = ? AND epoch = ?",
+		groupID, epoch,
+	)
+	if err := oldRow.Scan(&oldEnc); err != nil && err != sql.ErrNoRows {
+		return false, err
+	} else if err == nil {
+		oldSecret := a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), oldEnc, "StoreGroupSecretEpoch")
+		if oldSecret != "" && oldSecret != opts.Secret {
+			if err := tx.Commit(); err != nil {
+				return false, err
+			}
+			committed = true
+			return false, nil
+		}
+	}
+
+	expiresAt := now + opts.OldEpochRetentionMillis
+	if err := a.upsertGroupOldEpochTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now, &expiresAt); err != nil {
+		return false, err
+	}
+	_ = currentUpdatedAt
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	committed = true
+	return true, nil
+}
+
+func (a *AIDDatabase) DiscardPendingGroupSecretState(groupID string, epoch int, rotationID string) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rid := strings.TrimSpace(rotationID)
+	if rid == "" {
+		return false, nil
+	}
+	tx, err := a.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var currentEpoch int64
+	var dataStr string
+	row := tx.QueryRow("SELECT epoch, data FROM group_current WHERE group_id = ?", groupID)
+	if err := row.Scan(&currentEpoch, &dataStr); err != nil {
+		if err == sql.ErrNoRows {
+			_ = tx.Commit()
+			committed = true
+			return false, nil
+		}
+		return false, err
+	}
+	if int(currentEpoch) != epoch {
+		_ = tx.Commit()
+		committed = true
+		return false, nil
+	}
+	data := jsonObjectLocal(dataStr)
+	if strings.TrimSpace(fmt.Sprint(data["pending_rotation_id"])) != rid {
+		_ = tx.Commit()
+		committed = true
+		return false, nil
+	}
+
+	var oldEpoch, oldUpdatedAt int64
+	var oldEnc, oldData string
+	var oldExpires sql.NullInt64
+	oldRow := tx.QueryRow(
+		"SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? AND epoch < ? ORDER BY epoch DESC LIMIT 1",
+		groupID, epoch,
+	)
+	if err := oldRow.Scan(&oldEpoch, &oldEnc, &oldData, &oldUpdatedAt, &oldExpires); err != nil {
+		if err != sql.ErrNoRows {
+			return false, err
+		}
+		if _, err := tx.Exec("DELETE FROM group_current WHERE group_id = ?", groupID); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec("DELETE FROM group_old_epochs WHERE group_id = ?", groupID); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		committed = true
+		return true, nil
+	}
+	secret := a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, oldEpoch), oldEnc, "DiscardPendingGroupSecretState")
+	if err := a.upsertGroupCurrentTx(tx, groupID, oldEpoch, secret, jsonObjectLocal(oldData), nowMs()); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec("DELETE FROM group_old_epochs WHERE group_id = ? AND epoch = ?", groupID, oldEpoch); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	committed = true
+	return true, nil
+}
+
+func (a *AIDDatabase) upsertGroupCurrentTx(tx *sql.Tx, groupID string, epoch int64, secret string, data map[string]any, updatedAt int64) error {
+	dataJSON, err := json.Marshal(data)
+	if err != nil {
+		dataJSON = []byte("{}")
+	}
+	storedSecret := a.encryptText("group/"+groupID+"/current", secret, "StoreGroupSecretTransition")
+	_, err = tx.Exec(
+		`INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(group_id) DO UPDATE SET
+		   epoch=excluded.epoch, secret_enc=excluded.secret_enc,
+		   data=excluded.data, updated_at=excluded.updated_at`,
+		groupID, epoch, storedSecret, string(dataJSON), updatedAt,
+	)
+	return err
+}
+
+func (a *AIDDatabase) upsertGroupOldEpochTx(tx *sql.Tx, groupID string, epoch int64, secret string, data map[string]any, updatedAt int64, expiresAt *int64) error {
+	dataJSON, err := json.Marshal(data)
+	if err != nil {
+		dataJSON = []byte("{}")
+	}
+	storedSecret := a.encryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), secret, "StoreGroupSecretTransition")
+	_, err = tx.Exec(
+		`INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(group_id, epoch) DO UPDATE SET
+		   secret_enc=excluded.secret_enc, data=excluded.data,
+		   updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
+		groupID, epoch, storedSecret, string(dataJSON), updatedAt, nullInt64PtrSQL(expiresAt),
+	)
+	return err
 }
 
 // ── E2EE Sessions ────────────────────────────────────────────
@@ -892,4 +1404,104 @@ func nullInt64PtrSQL(p *int64) sql.NullInt64 {
 		return sql.NullInt64{Int64: *p, Valid: true}
 	}
 	return sql.NullInt64{}
+}
+
+func buildGroupCurrentData(opts GroupSecretTransitionOptions, members []string, now int64) map[string]any {
+	data := map[string]any{
+		"commitment":  opts.Commitment,
+		"member_aids": members,
+	}
+	if opts.EpochChain != "" {
+		data["epoch_chain"] = opts.EpochChain
+	}
+	if strings.TrimSpace(opts.PendingRotationID) != "" {
+		data["pending_rotation_id"] = strings.TrimSpace(opts.PendingRotationID)
+		data["pending_created_at"] = now
+	}
+	if opts.EpochChainUnverifiedSet && opts.EpochChainUnverified {
+		data["epoch_chain_unverified"] = true
+		if opts.EpochChainUnverifiedReason != "" {
+			data["epoch_chain_unverified_reason"] = opts.EpochChainUnverifiedReason
+		}
+	}
+	return data
+}
+
+func jsonObjectLocal(data string) map[string]any {
+	var result map[string]any
+	if err := json.Unmarshal([]byte(data), &result); err != nil || result == nil {
+		return map[string]any{}
+	}
+	return result
+}
+
+func copyMapLocal(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func normalizeStringSlice(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		s := strings.TrimSpace(v)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizeStringSliceFromAny(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		return normalizeStringSlice(v)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s := strings.TrimSpace(fmt.Sprint(item))
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		sort.Strings(out)
+		return out
+	default:
+		return nil
+	}
+}
+
+func stringSliceEqualLocal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func toInt64Local(v any) int64 {
+	switch x := v.(type) {
+	case int:
+		return int64(x)
+	case int64:
+		return x
+	case int32:
+		return int64(x)
+	case float64:
+		return int64(x)
+	case float32:
+		return int64(x)
+	case json.Number:
+		n, _ := x.Int64()
+		return n
+	default:
+		return 0
+	}
 }

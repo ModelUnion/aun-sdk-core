@@ -839,7 +839,7 @@ export class E2EEManager {
     if (!payload || typeof payload !== 'object') return message;
     if (payload.type !== 'e2ee.encrypted') return message;
     if (message.encrypted === false) return message;
-    if (!this._shouldDecryptForCurrentAid(message, payload)) return null;
+    if (!this._shouldDecryptForCurrentAid(message, payload)) return message;
 
     const skipReplay = opts?.skipReplay ?? false;
 

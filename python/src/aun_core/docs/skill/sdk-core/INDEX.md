@@ -13,7 +13,7 @@
 | [03-核心概念](03-核心概念.md) | AID · 连接状态机 · 认证流程 · E2EE |
 | [04-连接与认证](04-连接与认证.md) | 创建AID · 连接网关 · 网关发现 · 调用RPC · 事件订阅 |
 | [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · 会话管理 · 自定义密钥存储 |
-| [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · E2EEManager · 内置事件 · RPC手册索引 |
+| [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · MetaNamespace（信任根列表 / issuer root 更新） · E2EEManager · 内置事件 · RPC手册索引 |
 | [07-错误处理](07-错误处理.md) | 错误类层级 · 错误码速查 · 重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等初始化 · 多AID隔离 · 环境变量 · 资源清理 |
 
@@ -21,9 +21,10 @@
 
 | 文档 | 说明 |
 |------|------|
+| [消息Payload参考约定](消息Payload参考约定.md) | `message.send` / `group.send` 共用业务负载格式 · `payload.type` 类型总览 · 附件引用 |
 | [group-rpc-manual](group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/消息收发 · `payload.type` 负载类型 |
 | [message-rpc-manual](message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认 · `payload.type` 负载类型 |
-| [meta-rpc-manual](meta-rpc-manual.md) | Meta 服务 RPC 接口 · ping/status 等元信息 |
+| [meta-rpc-manual](meta-rpc-manual.md) | Meta 服务 RPC 接口 · ping/status/信任根列表与 PKI 下载端点 |
 | [storage-rpc-manual](storage-rpc-manual.md) | Storage 服务 RPC 接口 · 文件上传/下载/对象管理 |
 | [stream-rpc-manual](stream-rpc-manual.md) | Stream 服务 RPC 接口 · 流式数据传输 |
 
@@ -58,8 +59,9 @@
 - **裸 WebSocket RPC 调用** → [02-WebSocket协议](02-WebSocket协议.md)
 - **内置事件列表** → [06-API手册](06-API手册.md)
 - **RPC 手册索引** → [06-API手册](06-API手册.md)
-- **Group RPC 与群消息 payload 类型** → [group-rpc-manual](group-rpc-manual.md)
-- **Message RPC 与 P2P payload 类型** → [message-rpc-manual](message-rpc-manual.md)
+- **消息 payload 类型总览与格式约定** → [消息Payload参考约定](消息Payload参考约定.md)
+- **Group RPC 与群消息收发** → [group-rpc-manual](group-rpc-manual.md)
+- **Message RPC 与 P2P 消息收发** → [message-rpc-manual](message-rpc-manual.md)
 - **Meta RPC** → [meta-rpc-manual](meta-rpc-manual.md)
 - **Storage RPC** → [storage-rpc-manual](storage-rpc-manual.md)
 - **Stream RPC** → [stream-rpc-manual](stream-rpc-manual.md)
@@ -104,3 +106,6 @@ E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；
 
 ### 08-最佳实践
 幂等连接初始化；安全关闭；E2EE 幂等运行；多 AID 隔离；环境变量驱动配置；资源清理。
+
+### 消息Payload参考约定
+`message.send` 和 `group.send` 共用的业务 payload 约定。包含 `payload.type` 类型总览、信封字段边界、公共辅助字段、提及语义、各类型字段格式、附件引用规范和降级处理建议。

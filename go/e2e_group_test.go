@@ -667,7 +667,7 @@ func TestGroupE2EMembershipCommitment(t *testing.T) {
 	members := []string{aAID, bAID}
 
 	// 正常分发（不通过 P2P，直接调用底层函数验证 commitment 机制）
-	dist := BuildKeyDistribution("grp_test", 1, gs, members, aAID, nil)
+	dist := BuildKeyDistribution("grp_test", 1, gs, members, aAID, nil, "")
 	ok := HandleKeyDistribution(dist, bob.keyStore, bAID, nil)
 	if !ok {
 		t.Fatal("正常分发应成功")

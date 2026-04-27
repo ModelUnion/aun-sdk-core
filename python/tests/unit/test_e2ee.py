@@ -6,6 +6,7 @@
 import asyncio
 import base64
 import json
+import threading
 import time
 import uuid
 
@@ -74,14 +75,17 @@ class FakeKeystore:
     def cleanup_e2ee_prekeys(self, aid, cutoff_ms, keep_latest=7, device_id=""):
         return []
 
-    def save_group_secret_state(self, aid, group_id, entry):
-        self._group_secrets.setdefault(aid, {})[group_id] = entry
+    def list_group_secret_ids(self, aid):
+        return sorted(self._group_secrets.get(aid, {}).keys())
 
-    def load_group_secret_state(self, aid, group_id):
-        return self._group_secrets.get(aid, {}).get(group_id)
-
-    def load_all_group_secret_states(self, aid):
-        return self._group_secrets.get(aid, {})
+    def load_group_secret_epoch(self, aid, group_id, epoch=None):
+        entry = self._group_secrets.get(aid, {}).get(group_id)
+        if entry is None or epoch is None or int(entry.get("epoch") or 0) == int(epoch):
+            return entry
+        for old in entry.get("old_epochs", []):
+            if int(old.get("epoch") or 0) == int(epoch):
+                return old
+        return None
 
     def cleanup_group_old_epochs_state(self, aid, group_id, cutoff_ms):
         return 0
@@ -487,6 +491,49 @@ class TestReplayGuard:
         # 第二次重放被拦截
         result2 = receiver_mgr.decrypt_message(message)
         assert result2 is None
+
+    def test_local_seen_set_blocks_concurrent_duplicate(self):
+        _, receiver_mgr, _, _, _, _, _, _ = _make_e2ee_pair()
+        calls = 0
+        calls_lock = threading.Lock()
+        start = threading.Barrier(16)
+
+        def slow_decrypt(message, *, source=""):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.03)
+            result = dict(message)
+            result["payload"] = {"type": "text", "text": "ok"}
+            return result
+
+        receiver_mgr._decrypt_message = slow_decrypt
+        message = {
+            "message_id": "dup-msg-concurrent",
+            "from": "sender.test",
+            "to": "receiver.test",
+            "timestamp": int(time.time() * 1000),
+            "seq": 1,
+            "payload": {"type": "e2ee.encrypted"},
+            "encrypted": True,
+        }
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            start.wait()
+            result = receiver_mgr.decrypt_message(message)
+            with results_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=worker) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert sum(result is not None for result in results) == 1
+        assert calls == 1
 
     def test_seen_set_trim(self):
         import time as _t

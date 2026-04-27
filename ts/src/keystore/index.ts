@@ -5,7 +5,6 @@
  */
 
 import type {
-  GroupSecretMap,
   GroupSecretRecord,
   IdentityRecord,
   KeyPairRecord,
@@ -52,14 +51,48 @@ export interface KeyStore {
   /** 清理过期 prekeys，deviceId 为空时等价于全局 */
   cleanupE2EEPrekeys?(aid: string, cutoffMs: number, keepLatest?: number, deviceId?: string): string[];
 
-  /** 加载单个群组结构化密钥状态 */
-  loadGroupSecretState?(aid: string, groupId: string): GroupSecretRecord | null;
-  /** 加载全部群组结构化密钥状态 */
-  loadAllGroupSecretStates?(aid: string): GroupSecretMap;
-  /** 保存单个群组结构化密钥状态 */
-  saveGroupSecretState?(aid: string, groupId: string, entry: GroupSecretRecord): void;
+  /** 列出本地已存储群组密钥的 group_id */
+  listGroupSecretIds?(aid: string): string[];
   /** 清理单个群组过期 old epochs */
   cleanupGroupOldEpochsState?(aid: string, groupId: string, cutoffMs: number): number;
+  /** 按 row 加载当前或指定 epoch 的群组密钥 */
+  loadGroupSecretEpoch?(aid: string, groupId: string, epoch?: number | null): GroupSecretRecord | null;
+  /** 按 row 加载某个群组的当前和历史 epoch 密钥 */
+  loadGroupSecretEpochs?(aid: string, groupId: string): GroupSecretRecord[];
+  /** 事务化保存群组密钥状态转移 */
+  storeGroupSecretTransition?(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): boolean;
+  /** 事务化保存指定 epoch 密钥；低于 current 时写入 old epoch row */
+  storeGroupSecretEpoch?(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids: string[];
+      epochChain?: string;
+      pendingRotationId?: string;
+      epochChainUnverified?: boolean | null;
+      epochChainUnverifiedReason?: string | null;
+      oldEpochRetentionMs: number;
+    },
+  ): boolean;
+  /** 事务化丢弃指定 pending rotation */
+  discardPendingGroupSecretState?(aid: string, groupId: string, epoch: number, rotationId: string): boolean;
   /** 删除单个群组的所有密钥状态（群组解散时使用） */
   deleteGroupSecretState?(aid: string, groupId: string): void;
 

@@ -34,7 +34,8 @@
 | AID 身份体系 | 00 §0.5, 02 §2.1-2.2 |
 | 证书链（Root CA → Issuer CA → Agent） | 02 §2.3-2.4 |
 | 证书吊销（CRL/OCSP） | 02 §2.5 |
-| 受信根证书列表 | 02 §2.2, 06 meta.trust_roots |
+| 受信根证书列表 | 02 §2.2, 06 meta.trust_roots, 附录D §D.7 |
+| CT 公开查询服务（ct.{issuer}） | 06 CT 公开 HTTP 端点, 附录D §D.8, 附录F §F.9 |
 | AID 创建（auth.create_aid） | 01 §1.3 |
 | 两阶段登录（auth.aid_login1/2） | 01 §1.4 |
 | JWT Token 机制 | 01 §1.7 |
@@ -77,7 +78,7 @@
 定义 `auth.*` 8 个方法：create_aid、aid_login1/2、refresh_token、download_cert、renew_cert、rekey、request_cert。包含 JWT Token 签发/验证机制和安全约束。
 
 ### 02-证书与信任体系
-AID 格式与命名规则、AUN 网络与根证书管理局、四级证书链（Root CA → Registry CA → Issuer CA → Agent）、终端证书生命周期状态、信任模型与共识场景、CRL/OCSP 吊销机制。
+AID 格式与命名规则、AUN 网络与根证书管理局、四级证书链（Root CA → Registry CA → Issuer CA → Agent）、终端证书生命周期状态、信任模型与共识场景、CRL/OCSP 吊销机制、CT 公开查询入口概述。
 
 ### 03-Gateway-连接模式
 Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* → initialize → AUTHENTICATED）、initialize 请求/响应格式、心跳与重连策略。
@@ -89,7 +90,7 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 `relay.*` 3 个方法：register、forward、event/relay.message。Relay 职责边界（零信任笨管道）、透明封装规则、与 peer.* 配合完成端到端认证。
 
 ### 06-服务协议（业务层）
-认证后可用的业务方法：auth.*（身份管理）、ca.*（证书管理）、message.*（P2P 消息、E2EE prekey、`payload.type` 负载类型）、meta.*（心跳、状态、受信根）、storage.*（文件存储）、group.*（群组）、mail.*（邮件）、stream.*（流式传输）、search.*（Agent 发现）、relay.*（中继）、peer.*（点对点）、task.*（协作任务）。
+认证后可用的业务方法：auth.*（身份管理）、ca.*（证书管理）、message.*（P2P 消息、E2EE prekey、`payload.type` 负载类型）、meta.*（心跳、状态、受信根）、storage.*（文件存储）、group.*（群组）、mail.*（邮件）、stream.*（流式传输）、search.*（Agent 发现）、relay.*（中继）、peer.*（点对点）、task.*（协作任务）。同时列出 `pki.{issuer}` 与 `ct.{issuer}` 等公开 HTTP 端点入口。
 
 ### 07-错误码与状态机
 错误码分层汇总（JSON-RPC 通用 + AUN 协议级 + Peer/Relay/Search/Task/升级扩展码）。三种连接模式状态机。任务状态机。可重试/不可重试分类。

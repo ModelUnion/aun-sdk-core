@@ -19,6 +19,50 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 
+def _store_group_current(
+    ks: FileKeyStore,
+    aid: str,
+    group_id: str,
+    *,
+    epoch: int,
+    secret: str,
+    commitment: str = "commitment",
+    member_aids: list[str] | None = None,
+) -> None:
+    ok = ks.store_group_secret_transition(
+        aid,
+        group_id,
+        epoch=epoch,
+        secret=secret,
+        commitment=commitment,
+        member_aids=member_aids or [],
+        old_epoch_retention_ms=7 * 24 * 3600 * 1000,
+    )
+    assert ok
+
+
+def _store_group_epoch(
+    ks: FileKeyStore,
+    aid: str,
+    group_id: str,
+    *,
+    epoch: int,
+    secret: str,
+    commitment: str = "commitment",
+    member_aids: list[str] | None = None,
+) -> None:
+    ok = ks.store_group_secret_epoch(
+        aid,
+        group_id,
+        epoch=epoch,
+        secret=secret,
+        commitment=commitment,
+        member_aids=member_aids or [],
+        old_epoch_retention_ms=7 * 24 * 3600 * 1000,
+    )
+    assert ok
+
+
 # ── (已删除) FileSecretStore / VolatileSecretStore 测试 ───
 # secret_store 模块已在 Phase 3 中删除，相关测试随之移除。
 
@@ -293,14 +337,14 @@ class TestPrekeyPersistence:
             "public_key_der_b64": "MFkw...",
             "created_at": 1700000000,
             "expires_at": 1700604800,
-        })
+        }, device_id="")
         ks.save_e2ee_prekey(self.AID, "pk_002", {
             "private_key_pem": "-----BEGIN EC PRIVATE KEY-----\nPK002...\n-----END EC PRIVATE KEY-----",
             "public_key_der_b64": "MFky...",
             "created_at": 1700000001,
-        })
+        }, device_id="")
 
-        prekeys = ks.load_e2ee_prekeys(self.AID)
+        prekeys = ks.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk_001"]["private_key_pem"].endswith("PK001...\n-----END EC PRIVATE KEY-----")
         assert prekeys["pk_002"]["private_key_pem"].endswith("PK002...\n-----END EC PRIVATE KEY-----")
         assert prekeys["pk_001"]["created_at"] == 1700000000
@@ -310,10 +354,10 @@ class TestPrekeyPersistence:
         ks1.save_e2ee_prekey(self.AID, "pk_r1", {
             "private_key_pem": "RESTART_KEY",
             "public_key_der_b64": "pub",
-        })
+        }, device_id="")
 
         ks2 = self._make_ks(tmp_path)
-        prekeys = ks2.load_e2ee_prekeys(self.AID)
+        prekeys = ks2.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk_r1"]["private_key_pem"] == "RESTART_KEY"
 
     def test_prekey_private_key_not_plaintext_on_disk(self, tmp_path):
@@ -322,7 +366,7 @@ class TestPrekeyPersistence:
         ks.save_e2ee_prekey(self.AID, "pk_x", {
             "private_key_pem": "SECRET_PK",
             "public_key_der_b64": "pub",
-        })
+        }, device_id="")
 
         safe_aid = self.AID.replace("/", "_").replace("\\", "_")
         db_file = tmp_path / "AIDs" / safe_aid / "aun.db"
@@ -336,11 +380,11 @@ class TestPrekeyPersistence:
     def test_multiple_prekeys_independent(self, tmp_path):
         """多个 prekey 各自独立加密，互不干扰。"""
         ks = self._make_ks(tmp_path)
-        ks.save_e2ee_prekey(self.AID, "a", {"private_key_pem": "KEY_A", "public_key_der_b64": "pub_a"})
-        ks.save_e2ee_prekey(self.AID, "b", {"private_key_pem": "KEY_B", "public_key_der_b64": "pub_b"})
-        ks.save_e2ee_prekey(self.AID, "c", {"private_key_pem": "KEY_C", "public_key_der_b64": "pub_c"})
+        ks.save_e2ee_prekey(self.AID, "a", {"private_key_pem": "KEY_A", "public_key_der_b64": "pub_a"}, device_id="")
+        ks.save_e2ee_prekey(self.AID, "b", {"private_key_pem": "KEY_B", "public_key_der_b64": "pub_b"}, device_id="")
+        ks.save_e2ee_prekey(self.AID, "c", {"private_key_pem": "KEY_C", "public_key_der_b64": "pub_c"}, device_id="")
 
-        prekeys = ks.load_e2ee_prekeys(self.AID)
+        prekeys = ks.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["a"]["private_key_pem"] == "KEY_A"
         assert prekeys["b"]["private_key_pem"] == "KEY_B"
         assert prekeys["c"]["private_key_pem"] == "KEY_C"
@@ -360,7 +404,7 @@ class TestPrekeyPersistence:
 
         dev1 = ks.load_e2ee_prekeys(self.AID, device_id="device-1")
         dev2 = ks.load_e2ee_prekeys(self.AID, device_id="device-2")
-        legacy = ks.load_e2ee_prekeys(self.AID)
+        legacy = ks.load_e2ee_prekeys(self.AID, device_id="")
 
         assert dev1["pk-dev-1"]["private_key_pem"] == "DEVICE_1_KEY"
         assert "pk-dev-2" not in dev1
@@ -374,7 +418,7 @@ class TestPrekeyPersistence:
 
 class TestGroupSecretPersistence:
     """测试群组 E2EE 密钥（当前 epoch + 旧 epoch）的加密持久化。
-    通过 save_group_secret_state / load_group_secret_state 验证。"""
+    通过 row 化 group secret API 验证。"""
 
     AID = "group-test.agentid.pub"
     GRP = "grp_test1"
@@ -384,14 +428,17 @@ class TestGroupSecretPersistence:
 
     def test_group_secret_saved_and_restored(self, tmp_path):
         ks = self._make_ks(tmp_path)
-        ks.save_group_secret_state(self.AID, self.GRP, {
-            "epoch": 3,
-            "secret": "current_epoch_secret_b64",
-            "commitment": "hash_abc",
-            "member_aids": ["alice", "bob"],
-        })
+        _store_group_current(
+            ks,
+            self.AID,
+            self.GRP,
+            epoch=3,
+            secret="current_epoch_secret_b64",
+            commitment="hash_abc",
+            member_aids=["alice", "bob"],
+        )
 
-        loaded = ks.load_group_secret_state(self.AID, self.GRP)
+        loaded = ks.load_group_secret_epoch(self.AID, self.GRP)
         assert loaded is not None
         assert loaded["secret"] == "current_epoch_secret_b64"
         assert loaded["epoch"] == 3
@@ -400,23 +447,17 @@ class TestGroupSecretPersistence:
 
     def test_group_secret_survives_restart(self, tmp_path):
         ks1 = self._make_ks(tmp_path)
-        ks1.save_group_secret_state(self.AID, self.GRP, {
-            "epoch": 1,
-            "secret": "RESTART_SECRET",
-        })
+        _store_group_current(ks1, self.AID, self.GRP, epoch=1, secret="RESTART_SECRET")
 
         ks2 = self._make_ks(tmp_path)
-        loaded = ks2.load_group_secret_state(self.AID, self.GRP)
+        loaded = ks2.load_group_secret_epoch(self.AID, self.GRP)
         assert loaded is not None
         assert loaded["secret"] == "RESTART_SECRET"
 
     def test_group_secret_not_plaintext_on_disk(self, tmp_path):
         """group secret 存储在 SQLCipher 加密的 aun.db 中。"""
         ks = self._make_ks(tmp_path)
-        ks.save_group_secret_state(self.AID, self.GRP, {
-            "epoch": 1,
-            "secret": "TOP_SECRET_GROUP",
-        })
+        _store_group_current(ks, self.AID, self.GRP, epoch=1, secret="TOP_SECRET_GROUP")
 
         safe_aid = self.AID.replace("/", "_").replace("\\", "_")
         db_file = tmp_path / "AIDs" / safe_aid / "aun.db"
@@ -429,19 +470,14 @@ class TestGroupSecretPersistence:
     def test_old_epoch_secrets_saved_and_restored(self, tmp_path):
         """旧 epoch 密钥也应加密持久化。"""
         ks = self._make_ks(tmp_path)
-        ks.save_group_secret_state(self.AID, self.GRP, {
-            "epoch": 3,
-            "secret": "epoch3_secret",
-            "old_epochs": [
-                {"epoch": 1, "secret": "epoch1_secret", "expired_at": 1700000000},
-                {"epoch": 2, "secret": "epoch2_secret", "expired_at": 1700100000},
-            ],
-        })
+        _store_group_current(ks, self.AID, self.GRP, epoch=3, secret="epoch3_secret")
+        _store_group_epoch(ks, self.AID, self.GRP, epoch=1, secret="epoch1_secret")
+        _store_group_epoch(ks, self.AID, self.GRP, epoch=2, secret="epoch2_secret")
 
-        loaded = ks.load_group_secret_state(self.AID, self.GRP)
+        loaded = ks.load_group_secret_epoch(self.AID, self.GRP)
         assert loaded is not None
         assert loaded["secret"] == "epoch3_secret"
-        old = loaded["old_epochs"]
+        old = ks.load_group_secret_epochs(self.AID, self.GRP)[1:]
         assert len(old) == 2
         assert old[0]["secret"] == "epoch1_secret"
         assert old[0]["epoch"] == 1
@@ -450,13 +486,8 @@ class TestGroupSecretPersistence:
     def test_old_epoch_not_plaintext_on_disk(self, tmp_path):
         """旧 epoch 密钥存储在 SQLCipher 加密的 aun.db 中。"""
         ks = self._make_ks(tmp_path)
-        ks.save_group_secret_state(self.AID, self.GRP, {
-            "epoch": 2,
-            "secret": "current",
-            "old_epochs": [
-                {"epoch": 1, "secret": "old_secret"},
-            ],
-        })
+        _store_group_current(ks, self.AID, self.GRP, epoch=2, secret="current")
+        _store_group_epoch(ks, self.AID, self.GRP, epoch=1, secret="old_secret")
 
         safe_aid = self.AID.replace("/", "_").replace("\\", "_")
         db_file = tmp_path / "AIDs" / safe_aid / "aun.db"
@@ -468,29 +499,25 @@ class TestGroupSecretPersistence:
 
     def test_old_epoch_survives_restart(self, tmp_path):
         ks1 = self._make_ks(tmp_path)
-        ks1.save_group_secret_state(self.AID, self.GRP, {
-            "epoch": 2,
-            "secret": "cur",
-            "old_epochs": [
-                {"epoch": 1, "secret": "old_persist"},
-            ],
-        })
+        _store_group_current(ks1, self.AID, self.GRP, epoch=2, secret="cur")
+        _store_group_epoch(ks1, self.AID, self.GRP, epoch=1, secret="old_persist")
 
         ks2 = self._make_ks(tmp_path)
-        loaded = ks2.load_group_secret_state(self.AID, self.GRP)
+        loaded = ks2.load_group_secret_epoch(self.AID, self.GRP, 1)
         assert loaded is not None
-        assert loaded["old_epochs"][0]["secret"] == "old_persist"
+        assert loaded["secret"] == "old_persist"
 
     def test_multiple_groups(self, tmp_path):
         """多个群组密钥互不干扰。"""
         ks = self._make_ks(tmp_path)
-        ks.save_group_secret_state(self.AID, "g1", {"epoch": 1, "secret": "S1"})
-        ks.save_group_secret_state(self.AID, "g2", {"epoch": 2, "secret": "S2"})
-        ks.save_group_secret_state(self.AID, "g3", {"epoch": 1, "secret": "S3"})
+        _store_group_current(ks, self.AID, "g1", epoch=1, secret="S1")
+        _store_group_current(ks, self.AID, "g2", epoch=2, secret="S2")
+        _store_group_current(ks, self.AID, "g3", epoch=1, secret="S3")
 
-        assert ks.load_group_secret_state(self.AID, "g1")["secret"] == "S1"
-        assert ks.load_group_secret_state(self.AID, "g2")["secret"] == "S2"
-        assert ks.load_group_secret_state(self.AID, "g3")["secret"] == "S3"
+        assert ks.load_group_secret_epoch(self.AID, "g1")["secret"] == "S1"
+        assert ks.load_group_secret_epoch(self.AID, "g2")["secret"] == "S2"
+        assert ks.load_group_secret_epoch(self.AID, "g3")["secret"] == "S3"
+        assert ks.list_group_secret_ids(self.AID) == ["g1", "g2", "g3"]
 
 
 # ── Peer 证书持久化测试 ──────────────────────────────────
@@ -623,21 +650,30 @@ class TestFullIdentityLifecycle:
             "private_key_pem": "PREKEY_1",
             "public_key_der_b64": "pub1",
             "created_at": 1700000000,
-        })
+        }, device_id="")
         ks1.save_e2ee_prekey(self.AID, "pk_lc2", {
             "private_key_pem": "PREKEY_2",
             "public_key_der_b64": "pub2",
             "created_at": 1700000001,
-        })
-        ks1.save_group_secret_state(self.AID, "grp_lc", {
-            "epoch": 2,
-            "secret": "GRP_SECRET_CURRENT",
-            "commitment": "commit_hash",
-            "member_aids": [self.AID, self.PEER],
-            "old_epochs": [
-                {"epoch": 1, "secret": "GRP_SECRET_OLD", "expired_at": 1700050000},
-            ],
-        })
+        }, device_id="")
+        _store_group_current(
+            ks1,
+            self.AID,
+            "grp_lc",
+            epoch=2,
+            secret="GRP_SECRET_CURRENT",
+            commitment="commit_hash",
+            member_aids=[self.AID, self.PEER],
+        )
+        _store_group_epoch(
+            ks1,
+            self.AID,
+            "grp_lc",
+            epoch=1,
+            secret="GRP_SECRET_OLD",
+            commitment="commit_hash_old",
+            member_aids=[self.AID, self.PEER],
+        )
 
         # 保存对方证书
         ks1.save_cert(self.PEER, "PEER_CERT_PEM")
@@ -662,13 +698,13 @@ class TestFullIdentityLifecycle:
         assert identity["refresh_token"] == "rt_lifecycle"
 
         # 验证 prekey（通过 load_e2ee_prekeys）
-        prekeys = ks2.load_e2ee_prekeys(self.AID)
+        prekeys = ks2.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk_lc1"]["private_key_pem"] == "PREKEY_1"
         assert prekeys["pk_lc2"]["private_key_pem"] == "PREKEY_2"
         assert prekeys["pk_lc1"]["created_at"] == 1700000000
 
-        # 验证 group secret（通过 load_group_secret_state）
-        grp = ks2.load_group_secret_state(self.AID, "grp_lc")
+        # 验证 group secret（通过 row API）
+        grp = ks2.load_group_secret_epoch(self.AID, "grp_lc")
         assert grp is not None
         assert grp["secret"] == "GRP_SECRET_CURRENT"
         assert grp["epoch"] == 2
@@ -676,8 +712,9 @@ class TestFullIdentityLifecycle:
         assert grp["member_aids"] == [self.AID, self.PEER]
 
         # 验证 group secret（旧 epoch）
-        assert grp["old_epochs"][0]["secret"] == "GRP_SECRET_OLD"
-        assert grp["old_epochs"][0]["epoch"] == 1
+        old_grp = ks2.load_group_secret_epoch(self.AID, "grp_lc", 1)
+        assert old_grp["secret"] == "GRP_SECRET_OLD"
+        assert old_grp["epoch"] == 1
 
     def test_split_files_do_not_contain_plaintext_secrets(self, tmp_path):
         """验证非 DB 拆分文件不暴露明文敏感数据。"""
@@ -692,12 +729,9 @@ class TestFullIdentityLifecycle:
         ks.save_e2ee_prekey(self.AID, "pk", {
             "private_key_pem": "PREKEY_SECRET",
             "public_key_der_b64": "pub",
-        })
-        ks.save_group_secret_state(self.AID, "g1", {
-            "epoch": 1,
-            "secret": "GROUP_SECRET",
-            "old_epochs": [{"epoch": 0, "secret": "OLD_SECRET"}],
-        })
+        }, device_id="")
+        _store_group_current(ks, self.AID, "g1", epoch=1, secret="GROUP_SECRET")
+        _store_group_epoch(ks, self.AID, "g1", epoch=0, secret="OLD_SECRET")
 
         # 扫描所有磁盘文件
         secrets = ["IDENTITY_SECRET_KEY", "TOKEN_SECRET", "PREKEY_SECRET", "GROUP_SECRET", "OLD_SECRET"]
@@ -737,13 +771,13 @@ class TestDataIndependence:
         ks.save_e2ee_prekey(self.AID, "pk1", {
             "private_key_pem": "PK1",
             "public_key_der_b64": "pub",
-        })
+        }, device_id="")
 
         # 验证 token 没丢
         loaded = ks.load_identity(self.AID)
         assert loaded["access_token"] == "at_keep"
         assert loaded["refresh_token"] == "rt_keep"
-        prekeys = ks.load_e2ee_prekeys(self.AID)
+        prekeys = ks.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk1"]["private_key_pem"] == "PK1"
 
     def test_save_group_does_not_lose_prekeys(self, tmp_path):
@@ -754,18 +788,15 @@ class TestDataIndependence:
         ks.save_e2ee_prekey(self.AID, "pk_x", {
             "private_key_pem": "KEEP_ME",
             "public_key_der_b64": "pub",
-        })
+        }, device_id="")
 
         # 步骤 2: 保存 group secret
-        ks.save_group_secret_state(self.AID, "grp1", {
-            "epoch": 1,
-            "secret": "GS1",
-        })
+        _store_group_current(ks, self.AID, "grp1", epoch=1, secret="GS1")
 
         # 验证 prekey 没丢
-        prekeys = ks.load_e2ee_prekeys(self.AID)
+        prekeys = ks.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk_x"]["private_key_pem"] == "KEEP_ME"
-        grp = ks.load_group_secret_state(self.AID, "grp1")
+        grp = ks.load_group_secret_epoch(self.AID, "grp1")
         assert grp["secret"] == "GS1"
 
     def test_save_identity_preserves_existing_prekeys(self, tmp_path):
@@ -774,7 +805,7 @@ class TestDataIndependence:
         ks.save_e2ee_prekey(self.AID, "pk1", {
             "private_key_pem": "KEEP_ME",
             "public_key_der_b64": "pub1",
-        })
+        }, device_id="")
 
         ks.save_identity(self.AID, {
             "aid": self.AID,
@@ -785,7 +816,7 @@ class TestDataIndependence:
         loaded = ks.load_identity(self.AID)
         assert loaded["access_token"] == "tok_new"
         assert loaded["refresh_token"] == "rt_new"
-        prekeys = ks.load_e2ee_prekeys(self.AID)
+        prekeys = ks.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk1"]["private_key_pem"] == "KEEP_ME"
 
     def test_full_load_modify_save_cycle(self, tmp_path):
@@ -799,13 +830,10 @@ class TestDataIndependence:
             "refresh_token": "rt_v1",
             "custom_field": "keep_me",
         })
-        ks.save_e2ee_prekey(self.AID, "pk1", {"private_key_pem": "PK1", "public_key_der_b64": "pub1"})
-        ks.save_e2ee_prekey(self.AID, "pk2", {"private_key_pem": "PK2", "public_key_der_b64": "pub2"})
-        ks.save_group_secret_state(self.AID, "g1", {
-            "epoch": 2,
-            "secret": "GS1",
-            "old_epochs": [{"epoch": 1, "secret": "GS1_OLD"}],
-        })
+        ks.save_e2ee_prekey(self.AID, "pk1", {"private_key_pem": "PK1", "public_key_der_b64": "pub1"}, device_id="")
+        ks.save_e2ee_prekey(self.AID, "pk2", {"private_key_pem": "PK2", "public_key_der_b64": "pub2"}, device_id="")
+        _store_group_current(ks, self.AID, "g1", epoch=2, secret="GS1")
+        _store_group_epoch(ks, self.AID, "g1", epoch=1, secret="GS1_OLD")
 
         # 模拟 5 次 token 更新
         for i in range(5):
@@ -816,7 +844,7 @@ class TestDataIndependence:
             ks.save_e2ee_prekey(self.AID, f"pk_new_{i}", {
                 "private_key_pem": f"NEW_PK_{i}",
                 "public_key_der_b64": f"pub_new_{i}",
-            })
+            }, device_id="")
 
         # 最终验证：所有数据完整
         final = ks.load_identity(self.AID)
@@ -824,15 +852,15 @@ class TestDataIndependence:
         assert final["refresh_token"] == "rt_v1"
         assert final["custom_field"] == "keep_me"
 
-        prekeys = ks.load_e2ee_prekeys(self.AID)
+        prekeys = ks.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk1"]["private_key_pem"] == "PK1"
         assert prekeys["pk2"]["private_key_pem"] == "PK2"
         for i in range(5):
             assert prekeys[f"pk_new_{i}"]["private_key_pem"] == f"NEW_PK_{i}"
 
-        grp = ks.load_group_secret_state(self.AID, "g1")
+        grp = ks.load_group_secret_epoch(self.AID, "g1")
         assert grp["secret"] == "GS1"
-        assert grp["old_epochs"][0]["secret"] == "GS1_OLD"
+        assert ks.load_group_secret_epoch(self.AID, "g1", 1)["secret"] == "GS1_OLD"
 
     def test_survives_restart_between_writes(self, tmp_path):
         """在不同阶段写入不同类型数据，每次重启后数据完整。"""
@@ -850,23 +878,23 @@ class TestDataIndependence:
         ks2.save_e2ee_prekey(self.AID, "pk1", {
             "private_key_pem": "PK1",
             "public_key_der_b64": "pub",
-        })
+        }, device_id="")
 
         # 阶段 3: 再次重启，添加 group
         ks3 = self._make_ks(tmp_path)
         loaded = ks3.load_identity(self.AID)
         assert loaded["access_token"] == "at1"
-        prekeys = ks3.load_e2ee_prekeys(self.AID)
+        prekeys = ks3.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk1"]["private_key_pem"] == "PK1"
-        ks3.save_group_secret_state(self.AID, "g1", {"epoch": 1, "secret": "GS"})
+        _store_group_current(ks3, self.AID, "g1", epoch=1, secret="GS")
 
         # 阶段 4: 最终重启验证
         ks4 = self._make_ks(tmp_path)
         final = ks4.load_identity(self.AID)
         assert final["access_token"] == "at1"
-        prekeys = ks4.load_e2ee_prekeys(self.AID)
+        prekeys = ks4.load_e2ee_prekeys(self.AID, device_id="")
         assert prekeys["pk1"]["private_key_pem"] == "PK1"
-        grp = ks4.load_group_secret_state(self.AID, "g1")
+        grp = ks4.load_group_secret_epoch(self.AID, "g1")
         assert grp["secret"] == "GS"
 
 

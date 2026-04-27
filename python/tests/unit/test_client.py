@@ -633,6 +633,31 @@ def test_call_injects_message_slot_context():
     assert calls[1][1]["slot_id"] == "slot-a"
 
 
+def test_message_pull_empty_result_applies_server_ack_floor():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._persist_seq = lambda ns: None
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params):
+            calls.append((method, dict(params)))
+            if method == "message.pull":
+                return {"messages": [], "count": 0, "latest_seq": 7, "server_ack_seq": 7}
+            return {"success": True, "ack_seq": params.get("seq")}
+
+    client._transport = _Transport()
+
+    result = asyncio.run(client.call("message.pull", {"after_seq": 0, "limit": 5}))
+
+    assert result["server_ack_seq"] == 7
+    assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 7
+    assert calls[-1] == ("message.ack", {"seq": 7, "device_id": "device-1"})
+
+
 def test_call_rejects_message_slot_context_override():
     client = object.__new__(AUNClient)
     client._state = "connected"

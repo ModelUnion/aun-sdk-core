@@ -70,7 +70,7 @@ class AuthFlow:
         self._connection_factory = connection_factory or self._default_connection_factory
         self._root_ca_path = root_ca_path
         self._verify_ssl = verify_ssl
-        self._root_certs = self._load_root_certs(root_ca_path)
+        self._root_certs = self._load_root_certs(root_ca_path, keystore=keystore)
         self._gateway_chain_cache: dict[str, list[str]] = {}
         self._gateway_crl_cache: dict[str, dict[str, Any]] = {}
         self._gateway_ocsp_cache: dict[str, dict[str, dict[str, Any]]] = {}
@@ -904,11 +904,25 @@ class AuthFlow:
         if current_ts > cert.not_valid_after_utc.timestamp():
             raise AuthError(f"{label} has expired")
 
+    def reload_trusted_roots(self) -> int:
+        """重新加载本地信任根证书，供 meta.import_trust_roots 后刷新当前客户端使用。"""
+        self._root_certs = self._load_root_certs(self._root_ca_path, keystore=self._keystore)
+        self._gateway_ca_verified.clear()
+        self._chain_verified_cache.clear()
+        return len(self._root_certs)
+
     @staticmethod
-    def _load_root_certs(root_ca_path: str | None) -> list[x509.Certificate]:
+    def _load_root_certs(root_ca_path: str | None, *, keystore: FileKeyStore | None = None) -> list[x509.Certificate]:
         candidate_paths: list[Path] = []
         if root_ca_path:
             candidate_paths.append(Path(root_ca_path))
+        if keystore is not None:
+            try:
+                dynamic_bundle = keystore.trust_root_bundle_path()
+                if dynamic_bundle.exists():
+                    candidate_paths.append(dynamic_bundle)
+            except Exception:
+                pass
         bundled_dir = Path(__file__).resolve().parent / "certs"
         if bundled_dir.exists():
             candidate_paths.extend(sorted(bundled_dir.glob("*.crt")))

@@ -248,14 +248,23 @@ async def _group_pull_raw(client: AUNClient, group_id: str, after_seq: int = 0) 
 async def _wait_for_group_secret_epoch(client: AUNClient, aid: str, group_id: str, *, min_epoch: int = 1, timeout: float = 15.0) -> int:
     deadline = asyncio.get_running_loop().time() + timeout
     last_epochs: list[int] = []
+    last_committed = 0
     while asyncio.get_running_loop().time() < deadline:
         all_secrets = load_all_group_secrets(client._keystore, aid, group_id)
         last_epochs = sorted(all_secrets)
-        eligible = [epoch for epoch in last_epochs if epoch >= min_epoch]
+        try:
+            epoch_result = await client.call("group.e2ee.get_epoch", {"group_id": group_id})
+            last_committed = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)))
+        except Exception:
+            last_committed = 0
+        eligible = [epoch for epoch in last_epochs if epoch >= min_epoch and epoch <= last_committed]
         if eligible:
             return max(eligible)
         await asyncio.sleep(0.5)
-    raise AssertionError(f"{aid} did not receive group {group_id} epoch >= {min_epoch} within {timeout}s; epochs={last_epochs}")
+    raise AssertionError(
+        f"{aid} did not receive committed group {group_id} epoch >= {min_epoch} "
+        f"within {timeout}s; epochs={last_epochs}, committed={last_committed}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -370,16 +379,18 @@ async def test_epoch_rotation_on_kick():
         # 踢 Carol
         await _kick_member(alice, group_id, c_aid)
 
-        # kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到新 epoch 密钥
+        # kick 后 SDK 自动两阶段轮换 + 分发给 Bob，轮询等待 Bob 拿到已提交的新 epoch 密钥
         for _wait in range(15):
             await asyncio.sleep(1)
             all_bob = load_all_group_secrets(bob._keystore, b_aid, group_id)
-            if any(epoch > old_epoch for epoch in all_bob):
+            epoch_result = await bob.call("group.e2ee.get_epoch", {"group_id": group_id})
+            committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)))
+            if committed_epoch > old_epoch and committed_epoch in all_bob:
                 break
         else:
             assert False, f"Bob did not receive epoch > {old_epoch} secret within 15s"
 
-        new_epoch = max(load_all_group_secrets(bob._keystore, b_aid, group_id))
+        new_epoch = committed_epoch
 
         # Alice 用新 epoch 发加密消息
         await alice.call("group.send", {

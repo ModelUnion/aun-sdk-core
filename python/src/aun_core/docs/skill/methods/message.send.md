@@ -31,7 +31,7 @@ P2P 消息的投递语义由连接阶段声明的 `delivery_mode` 决定；`grou
 - 文件、图片、音视频等附件引用放入 `payload.attachments`；不要把二进制内容直接嵌入 `payload`。
 - AUN Storage 的 `url` 是上传完成后返回的长期对象引用；下载时用该 `url` 换取 `download_ticket`，再使用短期 `download_url`。
 
-详细字段建议见 [message/04-RPC-Manual.md](../rpc-manual/message/04-RPC-Manual.md#payload-参考约定)。
+详细字段建议见 [消息Payload参考约定](../sdk-core/消息Payload参考约定.md)；RPC 调用细节见 [message/04-RPC-Manual.md](../rpc-manual/message/04-RPC-Manual.md#payload-参考约定)。
 
 ## 返回值
 

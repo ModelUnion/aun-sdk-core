@@ -626,6 +626,56 @@ class AIDDatabase:
             "updated_at": row[3],
         }
 
+    def load_group_secret_epoch(self, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
+        """按 row 读取当前或指定 epoch，避免为单条解密加载整个 old_epochs 列表。"""
+        conn = self._get_conn()
+        current = self.load_group_current(group_id)
+        if epoch is None:
+            return current
+        if current is not None and int(current.get("epoch") or 0) == int(epoch):
+            return current
+        cur = conn.execute(
+            "SELECT epoch, secret_enc, data, updated_at, expires_at "
+            "FROM group_old_epochs WHERE group_id = ? AND epoch = ?",
+            (group_id, int(epoch)),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        result = {
+            "epoch": row[0],
+            "secret": self._reveal_text(f"group/{group_id}/epoch/{row[0]}", str(row[1] or "")),
+            **json.loads(row[2]),
+            "updated_at": row[3],
+        }
+        if row[4] is not None:
+            result["expires_at"] = row[4]
+        return result
+
+    def load_group_secret_epochs(self, group_id: str) -> list[dict[str, Any]]:
+        """按 row 读取某群组当前和历史 epoch。"""
+        conn = self._get_conn()
+        result: list[dict[str, Any]] = []
+        current = self.load_group_current(group_id)
+        if current is not None:
+            result.append(current)
+        cur = conn.execute(
+            "SELECT epoch, secret_enc, data, updated_at, expires_at "
+            "FROM group_old_epochs WHERE group_id = ? ORDER BY epoch ASC",
+            (group_id,),
+        )
+        for row in cur.fetchall():
+            entry = {
+                "epoch": row[0],
+                "secret": self._reveal_text(f"group/{group_id}/epoch/{row[0]}", str(row[1] or "")),
+                **json.loads(row[2]),
+                "updated_at": row[3],
+            }
+            if row[4] is not None:
+                entry["expires_at"] = row[4]
+            result.append(entry)
+        return result
+
     def load_all_group_current(self) -> dict[str, dict[str, Any]]:
         conn = self._get_conn()
         cur = conn.execute("SELECT group_id, epoch, secret_enc, data, updated_at FROM group_current")
@@ -699,18 +749,401 @@ class AIDDatabase:
             conn.commit()
         self._retry_on_locked(_do)
 
+    def store_group_secret_transition(
+        self,
+        group_id: str,
+        *,
+        epoch: int,
+        secret: str,
+        commitment: str,
+        member_aids: list[str],
+        epoch_chain: str | None = None,
+        pending_rotation_id: str = "",
+        epoch_chain_unverified: bool | None = None,
+        epoch_chain_unverified_reason: str | None = None,
+        old_epoch_retention_ms: int,
+    ) -> bool:
+        """事务化保存 group_secret 状态转移。
+
+        该方法只触碰 current row 和必要的单条 old epoch row，不再将整个
+        old_epochs 列表 load 到业务层再整体 save 回去。
+        """
+        def _do() -> bool:
+            conn = self._get_conn()
+            now = _now_ms()
+            epoch_i = int(epoch)
+            members = sorted(str(item) for item in (member_aids or []))
+            incoming_secret = str(secret or "")
+            pending_id = str(pending_rotation_id or "").strip()
+            chain_value = str(epoch_chain) if epoch_chain is not None else None
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?",
+                    (group_id,),
+                ).fetchone()
+
+                current_data: dict[str, Any] = {}
+                current_secret = ""
+                current_epoch: int | None = None
+                current_updated_at = now
+                if row is not None:
+                    current_epoch = int(row[0])
+                    current_secret = self._reveal_text(f"group/{group_id}/current", str(row[1] or ""))
+                    current_data = json.loads(row[2] or "{}")
+                    current_updated_at = int(row[3] or now)
+                    if epoch_i < current_epoch:
+                        conn.commit()
+                        return False
+
+                    if epoch_i == current_epoch and current_secret:
+                        if current_secret != incoming_secret:
+                            if str(current_data.get("pending_rotation_id") or "").strip():
+                                replacement_data = self._build_group_current_data(
+                                    commitment=commitment,
+                                    member_aids=members,
+                                    epoch_chain=chain_value,
+                                    pending_rotation_id=pending_id,
+                                    pending_created_at=now if pending_id else None,
+                                    epoch_chain_unverified=epoch_chain_unverified,
+                                    epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+                                )
+                                self._upsert_group_current(conn, group_id, epoch_i, incoming_secret, replacement_data, now)
+                                conn.commit()
+                                return True
+                            conn.commit()
+                            return False
+
+                        updated_data = dict(current_data)
+                        changed = False
+                        if members and sorted(updated_data.get("member_aids") or []) != members:
+                            updated_data["member_aids"] = members
+                            updated_data["commitment"] = commitment
+                            changed = True
+                        if chain_value is not None and updated_data.get("epoch_chain") != chain_value:
+                            updated_data["epoch_chain"] = chain_value
+                            changed = True
+                        if epoch_chain_unverified is True:
+                            if updated_data.get("epoch_chain_unverified") is not True:
+                                updated_data["epoch_chain_unverified"] = True
+                                changed = True
+                            if (
+                                epoch_chain_unverified_reason
+                                and updated_data.get("epoch_chain_unverified_reason") != epoch_chain_unverified_reason
+                            ):
+                                updated_data["epoch_chain_unverified_reason"] = epoch_chain_unverified_reason
+                                changed = True
+                        elif epoch_chain_unverified is False:
+                            if "epoch_chain_unverified" in updated_data or "epoch_chain_unverified_reason" in updated_data:
+                                updated_data.pop("epoch_chain_unverified", None)
+                                updated_data.pop("epoch_chain_unverified_reason", None)
+                                changed = True
+                        if pending_id and updated_data.get("pending_rotation_id") != pending_id:
+                            updated_data["pending_rotation_id"] = pending_id
+                            updated_data["pending_created_at"] = now
+                            changed = True
+                        if not pending_id and updated_data.get("pending_rotation_id"):
+                            updated_data.pop("pending_rotation_id", None)
+                            updated_data.pop("pending_created_at", None)
+                            changed = True
+                        if changed:
+                            self._upsert_group_current(conn, group_id, epoch_i, current_secret, updated_data, now)
+                        conn.commit()
+                        return True
+
+                    if current_epoch is not None and current_epoch != epoch_i:
+                        old_data = dict(current_data)
+                        expires_at = int(current_updated_at or now) + int(old_epoch_retention_ms)
+                        self._upsert_group_old_epoch(
+                            conn,
+                            group_id,
+                            current_epoch,
+                            current_secret,
+                            old_data,
+                            current_updated_at,
+                            expires_at,
+                        )
+
+                new_data = self._build_group_current_data(
+                    commitment=commitment,
+                    member_aids=members,
+                    epoch_chain=chain_value,
+                    pending_rotation_id=pending_id,
+                    pending_created_at=now if pending_id else None,
+                    epoch_chain_unverified=epoch_chain_unverified,
+                    epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+                )
+                self._upsert_group_current(conn, group_id, epoch_i, incoming_secret, new_data, now)
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
+        return bool(self._retry_on_locked(_do))
+
+    def store_group_secret_epoch(
+        self,
+        group_id: str,
+        *,
+        epoch: int,
+        secret: str,
+        commitment: str,
+        member_aids: list[str],
+        epoch_chain: str | None = None,
+        pending_rotation_id: str = "",
+        epoch_chain_unverified: bool | None = None,
+        epoch_chain_unverified_reason: str | None = None,
+        old_epoch_retention_ms: int,
+    ) -> bool:
+        """事务化保存指定 epoch key；低于 current 时写入 old epoch row。"""
+        def _do() -> bool:
+            conn = self._get_conn()
+            now = _now_ms()
+            epoch_i = int(epoch)
+            incoming_secret = str(secret or "")
+            members = sorted(str(item) for item in (member_aids or []))
+            pending_id = str(pending_rotation_id or "").strip()
+            chain_value = str(epoch_chain) if epoch_chain is not None else None
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?",
+                    (group_id,),
+                ).fetchone()
+
+                new_data = self._build_group_current_data(
+                    commitment=commitment,
+                    member_aids=members,
+                    epoch_chain=chain_value,
+                    pending_rotation_id=pending_id,
+                    pending_created_at=now if pending_id else None,
+                    epoch_chain_unverified=epoch_chain_unverified,
+                    epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+                )
+
+                if row is None:
+                    self._upsert_group_current(conn, group_id, epoch_i, incoming_secret, new_data, now)
+                    conn.commit()
+                    return True
+
+                current_epoch = int(row[0])
+                current_secret = self._reveal_text(f"group/{group_id}/current", str(row[1] or ""))
+                current_data = json.loads(row[2] or "{}")
+
+                if epoch_i > current_epoch:
+                    conn.commit()
+                    return False
+
+                if epoch_i == current_epoch:
+                    if current_secret and current_secret != incoming_secret:
+                        if not str(current_data.get("pending_rotation_id") or "").strip():
+                            conn.commit()
+                            return False
+                        self._upsert_group_current(conn, group_id, epoch_i, incoming_secret, new_data, now)
+                        conn.commit()
+                        return True
+
+                    updated_data = dict(current_data)
+                    changed = False
+                    if members and sorted(updated_data.get("member_aids") or []) != members:
+                        updated_data["member_aids"] = members
+                        updated_data["commitment"] = commitment
+                        changed = True
+                    if chain_value is not None and updated_data.get("epoch_chain") != chain_value:
+                        updated_data["epoch_chain"] = chain_value
+                        changed = True
+                    if epoch_chain_unverified is True:
+                        if updated_data.get("epoch_chain_unverified") is not True:
+                            updated_data["epoch_chain_unverified"] = True
+                            changed = True
+                        if (
+                            epoch_chain_unverified_reason
+                            and updated_data.get("epoch_chain_unverified_reason") != epoch_chain_unverified_reason
+                        ):
+                            updated_data["epoch_chain_unverified_reason"] = epoch_chain_unverified_reason
+                            changed = True
+                    elif epoch_chain_unverified is False:
+                        if "epoch_chain_unverified" in updated_data or "epoch_chain_unverified_reason" in updated_data:
+                            updated_data.pop("epoch_chain_unverified", None)
+                            updated_data.pop("epoch_chain_unverified_reason", None)
+                            changed = True
+                    if pending_id and updated_data.get("pending_rotation_id") != pending_id:
+                        updated_data["pending_rotation_id"] = pending_id
+                        updated_data["pending_created_at"] = now
+                        changed = True
+                    if not pending_id and updated_data.get("pending_rotation_id"):
+                        updated_data.pop("pending_rotation_id", None)
+                        updated_data.pop("pending_created_at", None)
+                        changed = True
+                    if changed:
+                        self._upsert_group_current(conn, group_id, epoch_i, current_secret, updated_data, now)
+                    conn.commit()
+                    return True
+
+                old = conn.execute(
+                    "SELECT secret_enc FROM group_old_epochs WHERE group_id = ? AND epoch = ?",
+                    (group_id, epoch_i),
+                ).fetchone()
+                if old is not None:
+                    old_secret = self._reveal_text(f"group/{group_id}/epoch/{epoch_i}", str(old[0] or ""))
+                    if old_secret and old_secret != incoming_secret:
+                        conn.commit()
+                        return False
+
+                self._upsert_group_old_epoch(
+                    conn,
+                    group_id,
+                    epoch_i,
+                    incoming_secret,
+                    new_data,
+                    now,
+                    now + int(old_epoch_retention_ms),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
+        return bool(self._retry_on_locked(_do))
+
+    def discard_pending_group_secret_state(self, group_id: str, epoch: int, rotation_id: str) -> bool:
+        """事务化丢弃 pending epoch；存在旧 epoch 时只恢复那一行。"""
+        def _do() -> bool:
+            conn = self._get_conn()
+            rid = str(rotation_id or "").strip()
+            if not rid:
+                return False
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT epoch, data FROM group_current WHERE group_id = ?",
+                    (group_id,),
+                ).fetchone()
+                if row is None or int(row[0]) != int(epoch):
+                    conn.commit()
+                    return False
+                data = json.loads(row[1] or "{}")
+                if str(data.get("pending_rotation_id") or "").strip() != rid:
+                    conn.commit()
+                    return False
+
+                old = conn.execute(
+                    "SELECT epoch, secret_enc, data, updated_at, expires_at "
+                    "FROM group_old_epochs WHERE group_id = ? AND epoch < ? "
+                    "ORDER BY epoch DESC LIMIT 1",
+                    (group_id, int(epoch)),
+                ).fetchone()
+                if old is None:
+                    conn.execute("DELETE FROM group_current WHERE group_id = ?", (group_id,))
+                    conn.execute("DELETE FROM group_old_epochs WHERE group_id = ?", (group_id,))
+                    conn.commit()
+                    return True
+
+                old_epoch = int(old[0])
+                secret = self._reveal_text(f"group/{group_id}/epoch/{old_epoch}", str(old[1] or ""))
+                restored_data = json.loads(old[2] or "{}")
+                self._upsert_group_current(conn, group_id, old_epoch, secret, restored_data, _now_ms())
+                conn.execute(
+                    "DELETE FROM group_old_epochs WHERE group_id = ? AND epoch = ?",
+                    (group_id, old_epoch),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
+        return bool(self._retry_on_locked(_do))
+
+    @staticmethod
+    def _build_group_current_data(
+        *,
+        commitment: str,
+        member_aids: list[str],
+        epoch_chain: str | None,
+        pending_rotation_id: str,
+        pending_created_at: int | None,
+        epoch_chain_unverified: bool | None,
+        epoch_chain_unverified_reason: str | None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "commitment": commitment,
+            "member_aids": member_aids,
+        }
+        if epoch_chain is not None:
+            data["epoch_chain"] = epoch_chain
+        if pending_rotation_id:
+            data["pending_rotation_id"] = pending_rotation_id
+            data["pending_created_at"] = pending_created_at
+        if epoch_chain_unverified is True:
+            data["epoch_chain_unverified"] = True
+            if epoch_chain_unverified_reason:
+                data["epoch_chain_unverified_reason"] = epoch_chain_unverified_reason
+        return data
+
+    def _upsert_group_current(
+        self,
+        conn: Any,
+        group_id: str,
+        epoch: int,
+        secret: str,
+        data: dict[str, Any],
+        updated_at: int,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(group_id) DO UPDATE SET "
+            "epoch = excluded.epoch, secret_enc = excluded.secret_enc, "
+            "data = excluded.data, updated_at = excluded.updated_at",
+            (
+                group_id,
+                int(epoch),
+                self._protect_text(f"group/{group_id}/current", secret),
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                int(updated_at),
+            ),
+        )
+
+    def _upsert_group_old_epoch(
+        self,
+        conn: Any,
+        group_id: str,
+        epoch: int,
+        secret: str,
+        data: dict[str, Any],
+        updated_at: int,
+        expires_at: int | None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(group_id, epoch) DO UPDATE SET "
+            "secret_enc = excluded.secret_enc, data = excluded.data, "
+            "updated_at = excluded.updated_at, expires_at = excluded.expires_at",
+            (
+                group_id,
+                int(epoch),
+                self._protect_text(f"group/{group_id}/epoch/{int(epoch)}", secret),
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                int(updated_at),
+                expires_at,
+            ),
+        )
+
     def load_all_group_ids_with_old_epochs(self) -> list[str]:
         conn = self._get_conn()
         cur = conn.execute("SELECT DISTINCT group_id FROM group_old_epochs")
         return [str(row[0]) for row in cur.fetchall()]
 
     def cleanup_group_old_epochs(self, group_id: str, cutoff_ms: int) -> int:
-        """删除过期旧 epochs。判断逻辑：有 expires_at 就用 expires_at，否则用 updated_at。"""
+        """按调用方传入的 retention cutoff 删除旧 epochs。"""
         def _do():
             conn = self._get_conn()
             cur = conn.execute(
-                "DELETE FROM group_old_epochs WHERE group_id = ? "
-                "AND (CASE WHEN expires_at IS NOT NULL THEN expires_at ELSE updated_at END) < ?",
+                "DELETE FROM group_old_epochs WHERE group_id = ? AND updated_at <= ?",
                 (group_id, cutoff_ms),
             )
             conn.commit()

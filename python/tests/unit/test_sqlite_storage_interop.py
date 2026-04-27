@@ -65,8 +65,16 @@ def _run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str
 
 def _write_python(root: Path) -> None:
     ks = FileKeyStore(root, encryption_seed=SEED)
-    ks.save_e2ee_prekey(AID, "python-prekey", {"private_key_pem": EXPECTED["python-prekey"], "created_at": 1})
-    ks.save_group_secret_state(AID, "python-group", {"epoch": 1, "secret": EXPECTED_GROUPS["python-group"]})
+    ks.save_e2ee_prekey(AID, "python-prekey", {"private_key_pem": EXPECTED["python-prekey"], "created_at": 1}, device_id="")
+    ks.store_group_secret_transition(
+        AID,
+        "python-group",
+        epoch=1,
+        secret=EXPECTED_GROUPS["python-group"],
+        commitment="python-commit",
+        member_aids=[AID],
+        old_epoch_retention_ms=7 * 24 * 3600 * 1000,
+    )
     db = ks._get_db(AID)
     db.save_session("python-session", {"secret": EXPECTED_SESSIONS["python-session"]})
     for aid_db in list(ks._aid_dbs.values()):
@@ -76,9 +84,13 @@ def _write_python(root: Path) -> None:
 def _read_python(root: Path) -> dict:
     ks = FileKeyStore(root, encryption_seed=SEED)
     db = ks._get_db(AID)
+    groups = {
+        group_id: ks.load_group_secret_epoch(AID, group_id)
+        for group_id in ks.list_group_secret_ids(AID)
+    }
     payload = {
-        "prekeys": ks.load_e2ee_prekeys(AID),
-        "groups": ks.load_all_group_secret_states(AID),
+        "prekeys": ks.load_e2ee_prekeys(AID, device_id=""),
+        "groups": groups,
         "sessions": db.load_all_sessions(),
     }
     for aid_db in list(ks._aid_dbs.values()):
@@ -97,13 +109,22 @@ const aid = {json.dumps(AID)};
 const ks = new FileKeyStore(root, {{ encryptionSeed: {json.dumps(SEED)} }});
 if ({json.dumps(action)} === 'write') {{
   await ks.saveE2EEPrekey(aid, 'ts-prekey', {{ private_key_pem: 'TS-PREKEY-SECRET', created_at: 1 }});
-  await ks.saveGroupSecretState(aid, 'ts-group', {{ epoch: 1, secret: 'TS-GROUP-SECRET' }});
+  await ks.storeGroupSecretTransition(aid, 'ts-group', {{
+    epoch: 1,
+    secret: 'TS-GROUP-SECRET',
+    commitment: 'ts-commit',
+    memberAids: [aid],
+    oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
+  }});
   await ks.saveE2EESession(aid, 'ts-session', {{ secret: 'TS-SESSION-SECRET' }});
   ks.close?.();
 }} else {{
+  const groupIds = await ks.listGroupSecretIds(aid);
+  const groups = {{}};
+  for (const groupId of groupIds) groups[groupId] = await ks.loadGroupSecretEpoch(aid, groupId);
   const payload = {{
     prekeys: await ks.loadE2EEPrekeys(aid),
-    groups: await ks.loadAllGroupSecretStates(aid),
+    groups,
     sessions: await ks.loadE2EESessions(aid),
   }};
   ks.close?.();

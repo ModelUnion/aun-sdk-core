@@ -21,6 +21,7 @@ from aun_core.e2ee import (
     _derive_group_msg_key,
     check_epoch_downgrade,
     cleanup_old_epochs,
+    compute_epoch_chain,
     compute_membership_commitment,
     decrypt_group_message,
     encrypt_group_message,
@@ -323,16 +324,153 @@ class StructuredGroupKeystore:
     def __init__(self):
         self._groups = {}
 
-    def load_group_secret_state(self, aid, group_id):
+    def list_group_secret_ids(self, aid):
+        return sorted(self._groups.get(aid, {}).keys())
+
+    def load_group_secret_epoch(self, aid, group_id, epoch=None):
         entry = self._groups.get(aid, {}).get(group_id)
-        return copy.deepcopy(entry) if isinstance(entry, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        if epoch is None or int(entry.get("epoch") or 0) == int(epoch):
+            return copy.deepcopy(entry)
+        for old in entry.get("old_epochs", []):
+            if isinstance(old, dict) and int(old.get("epoch") or 0) == int(epoch):
+                return copy.deepcopy(old)
+        return None
 
-    def load_all_group_secret_states(self, aid):
-        groups = self._groups.get(aid, {})
-        return copy.deepcopy(groups)
+    def load_group_secret_epochs(self, aid, group_id):
+        entry = self._groups.get(aid, {}).get(group_id)
+        if not isinstance(entry, dict):
+            return []
+        return copy.deepcopy([entry, *[old for old in entry.get("old_epochs", []) if isinstance(old, dict)]])
 
-    def save_group_secret_state(self, aid, group_id, entry):
-        self._groups.setdefault(aid, {})[group_id] = copy.deepcopy(entry)
+    def store_group_secret_transition(
+        self, aid, group_id, *, epoch, secret, commitment, member_aids,
+        epoch_chain=None, pending_rotation_id="", epoch_chain_unverified=None,
+        epoch_chain_unverified_reason=None, old_epoch_retention_ms=7 * 24 * 3600 * 1000,
+    ):
+        now_ms = int(time.time() * 1000)
+        epoch_i = int(epoch)
+        members = sorted(member_aids or [])
+        groups = self._groups.setdefault(aid, {})
+        existing = groups.get(group_id)
+
+        if isinstance(existing, dict):
+            local_epoch = int(existing.get("epoch") or 0)
+            if epoch_i < local_epoch:
+                return False
+            if epoch_i == local_epoch and existing.get("secret"):
+                if existing.get("secret") != secret:
+                    if not str(existing.get("pending_rotation_id") or "").strip():
+                        return False
+                    groups[group_id] = self._build_group_entry(
+                        epoch_i, secret, commitment, members, now_ms,
+                        copy.deepcopy(existing.get("old_epochs", [])),
+                        epoch_chain, pending_rotation_id,
+                        epoch_chain_unverified, epoch_chain_unverified_reason,
+                    )
+                    return True
+                groups[group_id] = self._merge_group_metadata(
+                    existing, commitment, members, now_ms, epoch_chain,
+                    pending_rotation_id, epoch_chain_unverified,
+                    epoch_chain_unverified_reason,
+                )
+                return True
+            old_entry = copy.deepcopy(existing)
+            old_entry["expires_at"] = int(existing.get("updated_at") or now_ms) + int(old_epoch_retention_ms)
+            old_epochs = copy.deepcopy(existing.get("old_epochs", []))
+            old_epochs.append(old_entry)
+            groups[group_id] = self._build_group_entry(
+                epoch_i, secret, commitment, members, now_ms, old_epochs,
+                epoch_chain, pending_rotation_id,
+                epoch_chain_unverified, epoch_chain_unverified_reason,
+            )
+            return True
+
+        groups[group_id] = self._build_group_entry(
+            epoch_i, secret, commitment, members, now_ms, [],
+            epoch_chain, pending_rotation_id,
+            epoch_chain_unverified, epoch_chain_unverified_reason,
+        )
+        return True
+
+    def store_group_secret_epoch(
+        self, aid, group_id, *, epoch, secret, commitment, member_aids,
+        epoch_chain=None, pending_rotation_id="", epoch_chain_unverified=None,
+        epoch_chain_unverified_reason=None, old_epoch_retention_ms=7 * 24 * 3600 * 1000,
+    ):
+        now_ms = int(time.time() * 1000)
+        epoch_i = int(epoch)
+        members = sorted(member_aids or [])
+        groups = self._groups.setdefault(aid, {})
+        existing = groups.get(group_id)
+
+        if not isinstance(existing, dict):
+            groups[group_id] = self._build_group_entry(
+                epoch_i, secret, commitment, members, now_ms, [],
+                epoch_chain, pending_rotation_id,
+                epoch_chain_unverified, epoch_chain_unverified_reason,
+            )
+            return True
+
+        local_epoch = int(existing.get("epoch") or 0)
+        if epoch_i > local_epoch:
+            return False
+        if epoch_i == local_epoch:
+            existing_secret = str(existing.get("secret") or "")
+            if existing_secret and existing_secret != secret and not str(existing.get("pending_rotation_id") or "").strip():
+                return False
+            groups[group_id] = self._build_group_entry(
+                epoch_i, secret, commitment, members, now_ms,
+                copy.deepcopy(existing.get("old_epochs", [])),
+                epoch_chain, pending_rotation_id,
+                epoch_chain_unverified, epoch_chain_unverified_reason,
+            )
+            return True
+
+        old_epochs = [copy.deepcopy(old) for old in existing.get("old_epochs", []) if isinstance(old, dict)]
+        replacement = self._build_group_entry(
+            epoch_i, secret, commitment, members, now_ms, [],
+            epoch_chain, pending_rotation_id,
+            epoch_chain_unverified, epoch_chain_unverified_reason,
+        )
+        replacement.pop("old_epochs", None)
+        replacement["expires_at"] = now_ms + int(old_epoch_retention_ms)
+        for index, old in enumerate(old_epochs):
+            if int(old.get("epoch") or 0) != epoch_i:
+                continue
+            if old.get("secret") and old.get("secret") != secret:
+                return False
+            old_epochs[index] = replacement
+            break
+        else:
+            old_epochs.append(replacement)
+        groups[group_id] = {**copy.deepcopy(existing), "old_epochs": old_epochs}
+        return True
+
+    def discard_pending_group_secret_state(self, aid, group_id, epoch, rotation_id):
+        entry = self._groups.get(aid, {}).get(group_id)
+        if not isinstance(entry, dict):
+            return False
+        if int(entry.get("epoch") or 0) != int(epoch):
+            return False
+        if str(entry.get("pending_rotation_id") or "").strip() != str(rotation_id or "").strip():
+            return False
+        old_epochs = [copy.deepcopy(old) for old in entry.get("old_epochs", []) if isinstance(old, dict)]
+        restore_index = -1
+        restore_epoch = -1
+        for index, old in enumerate(old_epochs):
+            old_epoch = int(old.get("epoch") or 0)
+            if old_epoch < int(epoch) and old_epoch > restore_epoch and old.get("secret"):
+                restore_index = index
+                restore_epoch = old_epoch
+        if restore_index >= 0:
+            restored = copy.deepcopy(old_epochs[restore_index])
+            restored["old_epochs"] = [old for index, old in enumerate(old_epochs) if index != restore_index]
+            self._groups[aid][group_id] = restored
+        else:
+            self._groups.get(aid, {}).pop(group_id, None)
+        return True
 
     def cleanup_group_old_epochs_state(self, aid, group_id, cutoff_ms):
         entry = self._groups.get(aid, {}).get(group_id)
@@ -353,6 +491,57 @@ class StructuredGroupKeystore:
             remaining.append(copy.deepcopy(old))
         entry["old_epochs"] = remaining
         return removed
+
+    def _build_group_entry(
+        self, epoch, secret, commitment, members, updated_at, old_epochs,
+        epoch_chain, pending_rotation_id, epoch_chain_unverified,
+        epoch_chain_unverified_reason,
+    ):
+        entry = {
+            "epoch": int(epoch),
+            "secret": secret,
+            "commitment": commitment,
+            "member_aids": sorted(members),
+            "updated_at": updated_at,
+            "old_epochs": copy.deepcopy(old_epochs),
+        }
+        if epoch_chain is not None:
+            entry["epoch_chain"] = epoch_chain
+        if pending_rotation_id:
+            entry["pending_rotation_id"] = pending_rotation_id
+            entry["pending_created_at"] = updated_at
+        if epoch_chain_unverified is True:
+            entry["epoch_chain_unverified"] = True
+            if epoch_chain_unverified_reason:
+                entry["epoch_chain_unverified_reason"] = epoch_chain_unverified_reason
+        return entry
+
+    def _merge_group_metadata(
+        self, existing, commitment, members, updated_at, epoch_chain,
+        pending_rotation_id, epoch_chain_unverified,
+        epoch_chain_unverified_reason,
+    ):
+        updated = copy.deepcopy(existing)
+        updated["updated_at"] = updated_at
+        if members and sorted(updated.get("member_aids") or []) != sorted(members):
+            updated["member_aids"] = sorted(members)
+            updated["commitment"] = commitment
+        if epoch_chain is not None:
+            updated["epoch_chain"] = epoch_chain
+        if pending_rotation_id:
+            updated["pending_rotation_id"] = pending_rotation_id
+            updated["pending_created_at"] = updated_at
+        else:
+            updated.pop("pending_rotation_id", None)
+            updated.pop("pending_created_at", None)
+        if epoch_chain_unverified is True:
+            updated["epoch_chain_unverified"] = True
+            if epoch_chain_unverified_reason:
+                updated["epoch_chain_unverified_reason"] = epoch_chain_unverified_reason
+        elif epoch_chain_unverified is False:
+            updated.pop("epoch_chain_unverified", None)
+            updated.pop("epoch_chain_unverified_reason", None)
+        return updated
 
 
 class TestStoreGroupSecret:
@@ -573,6 +762,19 @@ class TestHandleKeyDistribution:
         result = handle_key_distribution(dist, ks, _CAROL)
         assert result is False
 
+    def test_rejects_distribution_below_current_epoch(self, tmp_path):
+        """key distribution 低于 current epoch 应拒绝防降级"""
+        ks = _make_keystore(tmp_path)
+        current_secret = generate_group_secret()
+        current_commitment = compute_membership_commitment(_MEMBERS, 5, _GRP, current_secret)
+        assert store_group_secret(ks, _BOB, _GRP, 5, current_secret, current_commitment, _MEMBERS)
+
+        stale_secret = generate_group_secret()
+        dist = build_key_distribution(_GRP, 3, stale_secret, _MEMBERS, _AID)
+        assert handle_key_distribution(dist, ks, _BOB) is False
+        assert load_group_secret(ks, _BOB, _GRP)["epoch"] == 5
+        assert load_group_secret(ks, _BOB, _GRP, epoch=3) is None
+
     def test_epoch_update(self, tmp_path):
         """新 epoch 覆盖旧 epoch，旧的进入 old_epochs"""
         ks = _make_keystore(tmp_path)
@@ -589,6 +791,66 @@ class TestHandleKeyDistribution:
         old = load_group_secret(ks, _BOB, _GRP, epoch=1)
         assert old is not None
         assert old["secret"] == gs1
+
+    def test_rotation_id_rejects_chain_mismatch_with_trusted_prev(self, tmp_path):
+        ks = _make_keystore(tmp_path)
+        gs1 = generate_group_secret()
+        commitment1 = compute_membership_commitment(_MEMBERS, 1, _GRP, gs1)
+        chain1 = compute_epoch_chain(None, 1, commitment1, _AID)
+        assert store_group_secret(ks, _BOB, _GRP, 1, gs1, commitment1, _MEMBERS, epoch_chain=chain1)
+
+        gs2 = generate_group_secret()
+        dist = build_key_distribution(_GRP, 2, gs2, _MEMBERS, _AID, epoch_chain="00" * 32)
+        dist["rotation_id"] = "rot-test"
+
+        assert handle_key_distribution(dist, ks, _BOB) is False
+        assert load_group_secret(ks, _BOB, _GRP)["epoch"] == 1
+
+    def test_new_rotation_replaces_stale_pending_same_epoch(self, tmp_path):
+        ks = _make_keystore(tmp_path)
+        gs1 = generate_group_secret()
+        commitment1 = compute_membership_commitment(_MEMBERS, 1, _GRP, gs1)
+        chain1 = compute_epoch_chain(None, 1, commitment1, _AID)
+        assert store_group_secret(ks, _BOB, _GRP, 1, gs1, commitment1, _MEMBERS, epoch_chain=chain1)
+
+        old_secret = generate_group_secret()
+        old_commitment = compute_membership_commitment(_MEMBERS, 2, _GRP, old_secret)
+        old_chain = compute_epoch_chain(chain1, 2, old_commitment, _AID)
+        assert store_group_secret(
+            ks, _BOB, _GRP, 2, old_secret, old_commitment, _MEMBERS,
+            epoch_chain=old_chain, pending_rotation_id="rot-old",
+        )
+
+        new_secret = generate_group_secret()
+        new_commitment = compute_membership_commitment(_MEMBERS, 2, _GRP, new_secret)
+        new_chain = compute_epoch_chain(chain1, 2, new_commitment, _AID)
+        dist = build_key_distribution(_GRP, 2, new_secret, _MEMBERS, _AID, epoch_chain=new_chain)
+        dist["rotation_id"] = "rot-new"
+
+        assert handle_key_distribution(dist, ks, _BOB) is True
+        loaded = load_group_secret(ks, _BOB, _GRP)
+        assert loaded["secret"] == new_secret
+        assert loaded["epoch_chain"] == new_chain
+        assert loaded["pending_rotation_id"] == "rot-new"
+
+    def test_missing_prev_chain_is_marked_unverified(self, tmp_path):
+        ks = _make_keystore(tmp_path)
+        gs = generate_group_secret()
+        dist = build_key_distribution(_GRP, 2, gs, _MEMBERS, _AID, epoch_chain="00" * 32)
+
+        assert handle_key_distribution(dist, ks, _BOB) is True
+        loaded = load_group_secret(ks, _BOB, _GRP)
+        assert loaded["epoch"] == 2
+        assert loaded["epoch_chain_unverified"] is True
+        assert loaded["epoch_chain_unverified_reason"] == "missing_prev_chain"
+
+    def test_rotation_id_requires_epoch_chain(self, tmp_path):
+        ks = _make_keystore(tmp_path)
+        gs = generate_group_secret()
+        dist = build_key_distribution(_GRP, 1, gs, _MEMBERS, _AID)
+        dist["rotation_id"] = "rot-test"
+
+        assert handle_key_distribution(dist, ks, _BOB) is False
 
 
 class TestBuildKeyRequest:
@@ -645,6 +907,56 @@ class TestHandleKeyResponse:
         assert loaded is not None
         assert loaded["epoch"] == 3
         assert loaded["secret"] == gs
+
+    def test_key_response_backfills_old_epoch_without_overwriting_current(self, tmp_path):
+        """key response 补旧 epoch 只写 old epoch，不覆盖 current。"""
+        ks = _make_keystore(tmp_path)
+        current_secret = generate_group_secret()
+        current_commitment = compute_membership_commitment(_MEMBERS, 5, _GRP, current_secret)
+        assert store_group_secret(ks, _BOB, _GRP, 5, current_secret, current_commitment, _MEMBERS)
+
+        old_secret = generate_group_secret()
+        old_commitment = compute_membership_commitment(_MEMBERS, 3, _GRP, old_secret)
+        response = {
+            "type": "e2ee.group_key_response",
+            "group_id": _GRP,
+            "epoch": 3,
+            "group_secret": base64.b64encode(old_secret).decode("ascii"),
+            "commitment": old_commitment,
+            "member_aids": _MEMBERS,
+            "requester_aid": _BOB,
+            "responder_aid": _AID,
+            "request_id": "req-old",
+        }
+
+        assert handle_key_response(response, ks, _BOB) is True
+        assert load_group_secret(ks, _BOB, _GRP)["epoch"] == 5
+        assert load_group_secret(ks, _BOB, _GRP, epoch=3)["secret"] == old_secret
+
+    def test_key_response_rejects_future_epoch(self, tmp_path):
+        """key response 不能绕过轮换推进到 future epoch。"""
+        ks = _make_keystore(tmp_path)
+        current_secret = generate_group_secret()
+        current_commitment = compute_membership_commitment(_MEMBERS, 5, _GRP, current_secret)
+        assert store_group_secret(ks, _BOB, _GRP, 5, current_secret, current_commitment, _MEMBERS)
+
+        future_secret = generate_group_secret()
+        future_commitment = compute_membership_commitment(_MEMBERS, 6, _GRP, future_secret)
+        response = {
+            "type": "e2ee.group_key_response",
+            "group_id": _GRP,
+            "epoch": 6,
+            "group_secret": base64.b64encode(future_secret).decode("ascii"),
+            "commitment": future_commitment,
+            "member_aids": _MEMBERS,
+            "requester_aid": _BOB,
+            "responder_aid": _AID,
+            "request_id": "req-future",
+        }
+
+        assert handle_key_response(response, ks, _BOB) is False
+        assert load_group_secret(ks, _BOB, _GRP)["epoch"] == 5
+        assert load_group_secret(ks, _BOB, _GRP, epoch=6) is None
 
 
 class TestKeyDistributionP2PRoundtrip:
@@ -899,10 +1211,12 @@ class TestGroupE2EEManagerHandleIncoming:
         bob_mgr, _ = _make_manager(tmp_path / "b", aid=_BOB)
         alice_mgr.create_epoch(_GRP, _MEMBERS)
         # Alice 手动构建 response
-        req = {"type": "e2ee.group_key_request", "group_id": _GRP, "epoch": 1, "requester_aid": _BOB}
+        req = {"type": "e2ee.group_key_request", "group_id": _GRP, "epoch": 1, "requester_aid": _BOB, "request_id": "test-req-1"}
         resp = alice_mgr.handle_key_request_msg(req, _MEMBERS)
         assert resp is not None
 
+        # Bob 必须先注册 pending 请求，handle_incoming 才会接受响应
+        bob_mgr.remember_key_request(req)
         result = bob_mgr.handle_incoming(resp)
         assert result == "response"
         assert bob_mgr.has_secret(_GRP)

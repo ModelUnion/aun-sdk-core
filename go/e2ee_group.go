@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,7 +103,8 @@ func (m *GroupE2EEManager) CreateEpoch(groupID string, memberAIDs []string) (map
 	gs := GenerateGroupSecret()
 	epoch := 1
 	commitment := ComputeMembershipCommitment(memberAIDs, epoch, groupID, gs)
-	_, err := StoreGroupSecret(m.keystore, aid, groupID, epoch, gs, commitment, memberAIDs)
+	epochChain := ComputeEpochChain("", epoch, commitment, aid)
+	_, err := StoreGroupSecret(m.keystore, aid, groupID, epoch, gs, commitment, memberAIDs, epochChain)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +113,7 @@ func (m *GroupE2EEManager) CreateEpoch(groupID string, memberAIDs []string) (map
 	if err != nil {
 		return nil, fmt.Errorf("CreateEpoch 签名失败: %w", err)
 	}
-	distPayload := BuildKeyDistribution(groupID, epoch, gs, memberAIDs, aid, manifest)
+	distPayload := BuildKeyDistribution(groupID, epoch, gs, memberAIDs, aid, manifest, epochChain)
 
 	distributions := make([]map[string]any, 0)
 	for _, member := range memberAIDs {
@@ -143,17 +145,22 @@ func (m *GroupE2EEManager) RotateEpoch(groupID string, memberAIDs []string) (map
 	}
 	var prevEpoch *int
 	newEpoch := 1
+	prevChain := ""
 	if current != nil {
 		if ep, ok := current["epoch"]; ok {
 			e := int(toInt64(ep))
 			prevEpoch = &e
 			newEpoch = e + 1
 		}
+		if ec, ok := current["epoch_chain"].(string); ok {
+			prevChain = ec
+		}
 	}
 
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, newEpoch, groupID, gs)
-	stored, err := StoreGroupSecret(ks, aid, groupID, newEpoch, gs, commitment, memberAIDs)
+	epochChain := ComputeEpochChain(prevChain, newEpoch, commitment, aid)
+	stored, err := StoreGroupSecret(ks, aid, groupID, newEpoch, gs, commitment, memberAIDs, epochChain)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +172,7 @@ func (m *GroupE2EEManager) RotateEpoch(groupID string, memberAIDs []string) (map
 	if err != nil {
 		return nil, fmt.Errorf("RotateEpoch 签名失败: %w", err)
 	}
-	distPayload := BuildKeyDistribution(groupID, newEpoch, gs, memberAIDs, aid, manifest)
+	distPayload := BuildKeyDistribution(groupID, newEpoch, gs, memberAIDs, aid, manifest, epochChain)
 
 	distributions := make([]map[string]any, 0)
 	for _, member := range memberAIDs {
@@ -184,15 +191,34 @@ func (m *GroupE2EEManager) RotateEpoch(groupID string, memberAIDs []string) (map
 	}, nil
 }
 
-// RotateEpochTo 指定目标 epoch 号轮换（配合服务端 CAS 使用）
-func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, memberAIDs []string) (map[string]any, error) {
+// RotateEpochTo 指定目标 epoch 号轮换（配合服务端两阶段 rotation 使用）
+func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, memberAIDs []string, rotationIDs ...string) (map[string]any, error) {
 	aid := m.currentAID()
 	if aid == "" {
 		return nil, fmt.Errorf("identity not set: cannot rotate epoch without AID")
 	}
+	// 优先使用 targetEpoch-1 的已提交前链；若本地当前是同 epoch 的旧 pending，
+	// 不能把旧 pending chain 当作新 rotation 的前链。
+	prevEpoch := targetEpoch - 1
+	current, _ := LoadGroupSecret(m.keystore, aid, groupID, &prevEpoch)
+	if current == nil {
+		current, _ = LoadGroupSecret(m.keystore, aid, groupID, nil)
+	}
+	prevChain := ""
+	if current != nil {
+		if ec, ok := current["epoch_chain"].(string); ok {
+			prevChain = ec
+		}
+	}
+
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, targetEpoch, groupID, gs)
-	stored, err := StoreGroupSecret(m.keystore, aid, groupID, targetEpoch, gs, commitment, memberAIDs)
+	epochChain := ComputeEpochChain(prevChain, targetEpoch, commitment, aid)
+	rotationID := ""
+	if len(rotationIDs) > 0 {
+		rotationID = strings.TrimSpace(rotationIDs[0])
+	}
+	stored, err := StoreGroupSecret(m.keystore, aid, groupID, targetEpoch, gs, commitment, memberAIDs, epochChain, rotationID)
 	if err != nil {
 		return nil, err
 	}
@@ -200,12 +226,14 @@ func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, member
 		return nil, fmt.Errorf("group %s epoch %d secret already exists or is newer; abort distribution", groupID, targetEpoch)
 	}
 
-	prevEpoch := targetEpoch - 1
 	manifest, err := m.signManifest(BuildMembershipManifest(groupID, targetEpoch, &prevEpoch, memberAIDs, nil, nil, aid))
 	if err != nil {
 		return nil, fmt.Errorf("RotateEpochTo 签名失败: %w", err)
 	}
-	distPayload := BuildKeyDistribution(groupID, targetEpoch, gs, memberAIDs, aid, manifest)
+	distPayload := BuildKeyDistribution(groupID, targetEpoch, gs, memberAIDs, aid, manifest, epochChain)
+	if rotationID != "" {
+		distPayload["rotation_id"] = rotationID
+	}
 
 	distributions := make([]map[string]any, 0)
 	for _, member := range memberAIDs {
@@ -225,8 +253,13 @@ func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, member
 }
 
 // StoreSecret 手动存储 group_secret。返回 false 表示 epoch 降级被拒。
-func (m *GroupE2EEManager) StoreSecret(groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string) (bool, error) {
-	return StoreGroupSecret(m.keystore, m.currentAID(), groupID, epoch, groupSecret, commitment, memberAIDs)
+func (m *GroupE2EEManager) StoreSecret(groupID string, epoch int, groupSecret []byte, commitment string, memberAIDs []string, epochChain string) (bool, error) {
+	return StoreGroupSecret(m.keystore, m.currentAID(), groupID, epoch, groupSecret, commitment, memberAIDs, epochChain)
+}
+
+// DiscardPendingSecret 仅回滚指定 pending rotation 的本地 target epoch key。
+func (m *GroupE2EEManager) DiscardPendingSecret(groupID string, epoch int, rotationID string) (bool, error) {
+	return DiscardPendingGroupSecret(m.keystore, m.currentAID(), groupID, epoch, rotationID)
 }
 
 // LoadSecret 加载群组密钥
@@ -263,7 +296,9 @@ func (m *GroupE2EEManager) CleanExpiredCaches() {
 // 无密钥时返回 E2EEGroupSecretMissingError
 func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[string]any, error) {
 	aid := m.currentAID()
+	lockKey, mu := acquireGroupSecretLock(aid, groupID)
 	secretData, err := LoadGroupSecret(m.keystore, aid, groupID, nil)
+	releaseGroupSecretLock(lockKey, mu)
 	if err != nil {
 		return nil, fmt.Errorf("加载群 %s 密钥失败: %w", groupID, err)
 	}
@@ -281,6 +316,31 @@ func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[
 	msgID := fmt.Sprintf("gm-%s", generateUUID4())
 	ts := time.Now().UnixMilli()
 
+	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM, []byte(senderCertPEM))
+}
+
+// EncryptWithEpoch 使用指定 committed epoch 加密群组消息。
+func (m *GroupE2EEManager) EncryptWithEpoch(groupID string, epoch int, payload map[string]any) (map[string]any, error) {
+	aid := m.currentAID()
+	lockKey, mu := acquireGroupSecretLock(aid, groupID)
+	secretData, err := LoadGroupSecret(m.keystore, aid, groupID, &epoch)
+	releaseGroupSecretLock(lockKey, mu)
+	if err != nil {
+		return nil, fmt.Errorf("加载群 %s epoch %d 密钥失败: %w", groupID, epoch, err)
+	}
+	if secretData == nil {
+		return nil, NewE2EEGroupSecretMissingError(fmt.Sprintf("群 %s epoch %d 无密钥", groupID, epoch))
+	}
+
+	identity := m.identityFn()
+	senderPkPEM, _ := identity["private_key_pem"].(string)
+	if senderPkPEM == "" {
+		return nil, NewE2EEError("sender identity private key unavailable for group message signing", "E2EE_SIGN_FAILED")
+	}
+	senderCertPEM, _ := identity["cert"].(string)
+	secret, _ := secretData["secret"].([]byte)
+	msgID := fmt.Sprintf("gm-%s", generateUUID4())
+	ts := time.Now().UnixMilli()
 	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM, []byte(senderCertPEM))
 }
 
@@ -440,6 +500,9 @@ func (m *GroupE2EEManager) HandleIncoming(payload map[string]any) string {
 		pendingKey := fmt.Sprintf("%s:%v:%s", getStr(payload, "group_id", ""), payload["epoch"], getStr(payload, "request_id", ""))
 		m.pendingKeyRequestsMu.Lock()
 		expected := m.pendingKeyRequests[pendingKey]
+		if expected != nil {
+			delete(m.pendingKeyRequests, pendingKey)
+		}
 		m.pendingKeyRequestsMu.Unlock()
 		if expected == nil {
 			return "response_rejected"
@@ -457,9 +520,11 @@ func (m *GroupE2EEManager) HandleIncoming(payload map[string]any) string {
 			CurrentMembers:   m.GetMemberAIDs(getStr(payload, "group_id", "")),
 			Strict:           true,
 		})
-		if ok && expected != nil {
+		if !ok {
 			m.pendingKeyRequestsMu.Lock()
-			delete(m.pendingKeyRequests, pendingKey)
+			if _, exists := m.pendingKeyRequests[pendingKey]; !exists {
+				m.pendingKeyRequests[pendingKey] = expected
+			}
 			m.pendingKeyRequestsMu.Unlock()
 		}
 		if ok {
@@ -632,9 +697,12 @@ func (m *GroupE2EEManager) PurgeGroupData(groupID string) {
 	if aid == "" {
 		return
 	}
-	// 写入空状态以清除 group_current 和 group_old_epochs
-	emptyEntry := map[string]any{}
-	if err := saveKeyStoreGroupState(m.keystore, aid, groupID, emptyEntry); err != nil {
+	deleter, ok := m.keystore.(groupSecretDeleteStore)
+	if !ok {
+		log.Printf("[e2ee_group] PurgeGroupData 清理群 %s 密钥失败: keystore 不支持 DeleteGroupSecretState", groupID)
+		return
+	}
+	if err := deleter.DeleteGroupSecretState(aid, groupID); err != nil {
 		log.Printf("[e2ee_group] PurgeGroupData 清理群 %s 密钥失败: %v", groupID, err)
 	}
 }

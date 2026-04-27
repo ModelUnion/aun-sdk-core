@@ -21,7 +21,15 @@
 - [rekey()](#await-rekeyparams-dict--none---dict) - 密钥轮换
 - [request_cert()](#await-request_certparams-dict---dict) - 通用证书请求
 - [download_cert()](#await-download_certparams-dict--none---any) - 下载证书
-- [trust_roots()](#await-trust_rootsparams-dict--none---any) - 查询信任根
+
+### [AUNClient.Meta](#metanamespace-clientmeta)
+- [trust_roots()](#await-clientmetatrust_rootsparams-dict--none--none---any) - 查询信任根
+- [download_trust_roots()](#await-clientmetadownload_trust_rootsurl-str--none--none--gateway_url-str--none--none-timeout-float--100---dict) - 下载信任根列表
+- [download_issuer_root_cert()](#await-clientmetadownload_issuer_root_certissuer-str-url-str--none--none-timeout-float--100---str) - 下载 issuer Root CA 证书
+- [verify_trust_roots()](#clientmetaverify_trust_rootstrust_list-dict--authority_cert_pem-str--none--none-authority_public_key_pem-str--none--none-allow_unsigned-bool--false---dict) - 验证信任根列表
+- [import_trust_roots()](#clientmetaimport_trust_rootstrust_list-dict--authority_cert_pem-str--none--none-authority_public_key_pem-str--none--none-allow_unsigned-bool--false---dict) - 验签并导入信任根
+- [refresh_trust_roots()](#await-clientmetarefresh_trust_roots---dict) - 下载、验签并导入
+- [update_issuer_root_cert()](#await-clientmetaupdate_issuer_root_certissuer-str---dict) - 更新指定 issuer Root CA 证书
 
 ### [E2EEManager](#e2eemanager-cliente2ee)（高级 API，裸 WebSocket 开发者使用）
 - [构造函数](#构造函数裸-websocket-开发者使用) - 独立实例化
@@ -90,6 +98,7 @@ client = AUNClient({
 | `aid` | `str \| None` | 当前连接的 AID |
 | `state` | `str` | 连接状态 (`idle` / `connecting` / `connected` / `disconnected` / `closed`) |
 | `auth` | `AuthNamespace` | 认证命名空间 |
+| `meta` | `MetaNamespace` | 元信息与信任根管理命名空间 |
 | `e2ee` | `E2EEManager` | P2P E2EE 工具类 |
 | `group_e2ee` | `GroupE2EEManager` | 群组 E2EE 工具类（当前 Python SDK 固定可用） |
 
@@ -415,13 +424,41 @@ agent_md = await client.auth.download_agent_md("bob.agentid.pub")
 
 ---
 
-### `await trust_roots(params: dict | None) -> Any`
+## MetaNamespace (`client.meta`)
+
+### `await client.meta.trust_roots(params: dict | None = None) -> Any`
 
 查询网关信任的 Root CA 列表（需已连接）。
 
 **参数**: 无
 
-**返回值**: Root CA 证书列表
+**返回值**: 管理局签名的受信根证书列表。早期服务可能返回 `roots/count` 兼容结构。
+
+### `await client.meta.download_trust_roots(url: str | None = None, *, issuer: str | None = None, gateway_url: str | None = None, timeout: float = 10.0) -> dict`
+
+从管理局权威端点、`pki.{issuer}` 泛域名端点或 Gateway 镜像端点下载受信根列表。优先级为显式 `url`、`https://pki.{issuer}/trust-root.json`、已连接 Gateway 的 `https://gateway.{issuer}/pki/trust-roots.json`、管理局权威端点。
+
+### `await client.meta.download_issuer_root_cert(issuer: str, url: str | None = None, *, timeout: float = 10.0) -> str`
+
+从 `https://pki.{issuer}/root.crt` 下载该 issuer 证书链锚定的 Root CA PEM。该方法只下载和解析证书，不会导入本地信任根。
+
+### `client.meta.verify_trust_roots(trust_list: dict, *, authority_cert_pem: str | None = None, authority_public_key_pem: str | None = None, allow_unsigned: bool = False) -> dict`
+
+验证 `authority_signature`、`version`、`issued_at`、`next_update`、Root CA 证书有效期、CA 约束和 `fingerprint_sha256`，只返回可导入摘要，不写入本地信任根。默认拒绝未签名列表；`allow_unsigned=True` 仅用于私有测试环境。
+
+### `client.meta.import_trust_roots(trust_list: dict, *, authority_cert_pem: str | None = None, authority_public_key_pem: str | None = None, allow_unsigned: bool = False) -> dict`
+
+在 `verify_trust_roots()` 通过后，进一步检查 `version` 不低于本地已导入版本，再写入 `{aun_path}/CA/root/trust-roots.json` 和 `{aun_path}/CA/root/trust-roots.pem`，并刷新当前客户端的信任根缓存。
+
+### `await client.meta.refresh_trust_roots(...) -> dict`
+
+组合执行下载、验签、导入和刷新。应用层通常优先使用该方法。
+
+### `await client.meta.update_issuer_root_cert(issuer: str, *, cert_pem: str | None = None, url: str | None = None, trust_list: dict | None = None, authority_cert_pem: str | None = None, authority_public_key_pem: str | None = None, allow_unsigned: bool = False, timeout: float = 10.0) -> dict`
+
+下载或接收 `issuer` 的 `root.crt`，校验证书为自签 Root CA，并确认其 SHA-256 指纹存在于已验签的受信根列表中，通过后写入 `{aun_path}/CA/root/issuers/{issuer}.root.crt`，合并进 `{aun_path}/CA/root/trust-roots.pem`，并刷新当前客户端信任根缓存。
+
+顶层兼容方法 `await client.trust_roots()` 仍保留，等价于 `await client.meta.trust_roots()`。
 
 ---
 

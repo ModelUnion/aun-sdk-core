@@ -33,7 +33,7 @@ print(f"seq={msg['seq']}, id={msg['message_id']}")
 - `payload.mentions` 中单人成员提及使用 `{ "aid": "...", "display": "...", "offset": 0, "length": 3 }`；`@所有人` 使用 `{ "scope": "all" }`，可额外带 `display`、`offset`、`length`。`all` 不是 AID，不要写成 `{ "aid": "all" }`。
 - AUN Storage 的 `url` 是上传完成后返回的长期对象引用；下载时用该 `url` 换取 `download_ticket`，再使用短期 `download_url`。
 
-详细字段建议见 [group/04-RPC-Manual.md](../rpc-manual/group/04-RPC-Manual.md#payload-参考约定)。
+详细字段建议见 [消息Payload参考约定](../sdk-core/消息Payload参考约定.md)；RPC 调用细节见 [group/04-RPC-Manual.md](../rpc-manual/group/04-RPC-Manual.md#payload-参考约定)。
 
 ## 返回值
 

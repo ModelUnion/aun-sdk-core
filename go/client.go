@@ -66,6 +66,8 @@ func secureRandFloat64() float64 {
 const (
 	reconnectMinBaseDelaySeconds = 1.0
 	reconnectMaxBaseDelaySeconds = 64.0
+	groupRotationLeaseMS         = 120000
+	groupRotationRetryMaxDelay   = 300 * time.Second
 )
 
 func clampReconnectDelaySeconds(value float64, fallback float64, upper float64) float64 {
@@ -292,6 +294,7 @@ type AUNClient struct {
 	groupEpochRotationInflight  map[string]bool
 	groupEpochRotationMu        sync.Mutex
 	groupMembershipRotationDone map[string]bool
+	groupEpochRotationRetrying  map[string]bool
 
 	// epoch key recovery inflight 去重（singleflight 模式）
 	groupEpochRecoveryInflight   map[string]*epochRecoveryResult
@@ -385,6 +388,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		pendingDecryptMsgs:          make(map[string][]map[string]any),
 		groupEpochRotationInflight:  make(map[string]bool),
 		groupMembershipRotationDone: make(map[string]bool),
+		groupEpochRotationRetrying:  make(map[string]bool),
 		groupEpochRecoveryInflight:  make(map[string]*epochRecoveryResult),
 		prekeyReplenishInflight:     make(map[string]bool),
 		prekeyReplenished:           make(map[string]bool),
@@ -843,48 +847,52 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 	// 自动解密：message.pull 返回的消息
 	if method == "message.pull" {
 		if resultMap, ok := result.(map[string]any); ok {
-			if messages, ok := resultMap["messages"].([]any); ok && len(messages) > 0 {
+			messages, _ := resultMap["messages"].([]any)
+			if len(messages) > 0 {
 				resultMap["messages"] = c.decryptMessages(ctx, messages)
-				// 更新 SeqTracker
-				c.mu.RLock()
-				myAID := c.aid
-				c.mu.RUnlock()
-				if myAID != "" {
-					ns := "p2p:" + myAID
-					var pullMsgs []map[string]any
-					for _, raw := range messages {
-						if m, ok := raw.(map[string]any); ok {
-							pullMsgs = append(pullMsgs, m)
-						}
+			}
+			// 更新 SeqTracker；server_ack_seq 即使空 pull 也必须生效。
+			c.mu.RLock()
+			myAID := c.aid
+			c.mu.RUnlock()
+			if myAID != "" {
+				ns := "p2p:" + myAID
+				var pullMsgs []map[string]any
+				for _, raw := range messages {
+					if m, ok := raw.(map[string]any); ok {
+						pullMsgs = append(pullMsgs, m)
 					}
+				}
+				if len(pullMsgs) > 0 {
 					c.seqTracker.OnPullResult(ns, pullMsgs)
-					// ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
-					// 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若 contiguous 落后必须 force 跳过
-					// retention window 外的空洞。与 S2 [1,seq-1] 历史 gap 配合；若去掉 force，首条消息建的 gap 会
-					// 永远悬挂触发无限 pull。临时消息淘汰走 ephemeral_earliest_available_seq（仅提示），与此互斥。
-					serverAck := int(toInt64(resultMap["server_ack_seq"]))
-					if serverAck > 0 {
-						contig := c.seqTracker.GetContiguousSeq(ns)
-						if contig < serverAck {
-							log.Printf("[aun_core] message.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d", ns, contig, serverAck)
-							c.seqTracker.ForceContiguousSeq(ns, serverAck)
-						}
-					}
-					c.saveSeqTrackerState()
-					// auto-ack contiguous_seq
+				}
+				// ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
+				// 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若 contiguous 落后必须 force 跳过
+				// retention window 外的空洞。与 S2 [1,seq-1] 历史 gap 配合；若去掉 force，首条消息建的 gap 会
+				// 永远悬挂触发无限 pull。临时消息淘汰走 ephemeral_earliest_available_seq（仅提示），与此互斥。
+				serverAck := int(toInt64(resultMap["server_ack_seq"]))
+				if serverAck > 0 {
 					contig := c.seqTracker.GetContiguousSeq(ns)
-					if contig > 0 {
-						go func() {
-							ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-							defer ackCancel()
-							if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-								"seq":       contig,
-								"device_id": c.deviceID,
-							}); ackErr != nil {
-								log.Printf("message.pull auto-ack 失败: %v", ackErr)
-							}
-						}()
+					if contig < serverAck {
+						log.Printf("[aun_core] message.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d", ns, contig, serverAck)
+						c.seqTracker.ForceContiguousSeq(ns, serverAck)
 					}
+				}
+				c.saveSeqTrackerState()
+				// auto-ack contiguous_seq
+				contig := c.seqTracker.GetContiguousSeq(ns)
+				shouldAck := len(messages) > 0 || serverAck > 0
+				if contig > 0 && shouldAck {
+					go func() {
+						ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer ackCancel()
+						if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
+							"seq":       contig,
+							"device_id": c.deviceID,
+						}); ackErr != nil {
+							log.Printf("message.pull auto-ack 失败: %v", ackErr)
+						}
+					}()
 				}
 			}
 		}
@@ -893,48 +901,53 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 	// 自动解密：group.pull 返回的群消息
 	if method == "group.pull" {
 		if resultMap, ok := result.(map[string]any); ok {
-			if messages, ok := resultMap["messages"].([]any); ok && len(messages) > 0 {
+			messages, _ := resultMap["messages"].([]any)
+			if len(messages) > 0 {
 				resultMap["messages"] = c.decryptGroupMessages(ctx, messages)
-				// 更新 SeqTracker
-				gid, _ := params["group_id"].(string)
-				if gid != "" {
-					ns := "group:" + gid
-					var pullMsgs []map[string]any
-					for _, raw := range messages {
-						if m, ok := raw.(map[string]any); ok {
-							pullMsgs = append(pullMsgs, m)
-						}
+			}
+			// 更新 SeqTracker；cursor.current_seq 即使空 pull 也必须生效。
+			gid, _ := params["group_id"].(string)
+			if gid != "" {
+				ns := "group:" + gid
+				var pullMsgs []map[string]any
+				for _, raw := range messages {
+					if m, ok := raw.(map[string]any); ok {
+						pullMsgs = append(pullMsgs, m)
 					}
+				}
+				if len(pullMsgs) > 0 {
 					c.seqTracker.OnPullResult(ns, pullMsgs)
-					// ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
-					// 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
-					// 与 S2 [1,seq-1] 历史 gap 配合使用，ForceContiguousSeq 是跳过空洞的唯一手段。
-					if cursor, ok := resultMap["cursor"].(map[string]any); ok {
-						serverAck := int(toInt64(cursor["current_seq"]))
-						if serverAck > 0 {
-							contig := c.seqTracker.GetContiguousSeq(ns)
-							if contig < serverAck {
-								log.Printf("[aun_core] group.pull retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, contig, serverAck)
-								c.seqTracker.ForceContiguousSeq(ns, serverAck)
-							}
+				}
+				// ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
+				// 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
+				// 与 S2 [1,seq-1] 历史 gap 配合使用，ForceContiguousSeq 是跳过空洞的唯一手段。
+				serverAck := 0
+				if cursor, ok := resultMap["cursor"].(map[string]any); ok {
+					serverAck = int(toInt64(cursor["current_seq"]))
+					if serverAck > 0 {
+						contig := c.seqTracker.GetContiguousSeq(ns)
+						if contig < serverAck {
+							log.Printf("[aun_core] group.pull retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, contig, serverAck)
+							c.seqTracker.ForceContiguousSeq(ns, serverAck)
 						}
 					}
-					c.saveSeqTrackerState()
-					// auto-ack contiguous_seq
-					contig := c.seqTracker.GetContiguousSeq(ns)
-					if contig > 0 {
-						go func() {
-							ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-							defer ackCancel()
-							if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-								"group_id":  gid,
-								"msg_seq":   contig,
-								"device_id": c.deviceID,
-							}); ackErr != nil {
-								log.Printf("group.pull auto-ack 失败: group=%s %v", gid, ackErr)
-							}
-						}()
-					}
+				}
+				c.saveSeqTrackerState()
+				// auto-ack contiguous_seq
+				contig := c.seqTracker.GetContiguousSeq(ns)
+				shouldAck := len(messages) > 0 || serverAck > 0
+				if contig > 0 && shouldAck {
+					go func() {
+						ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer ackCancel()
+						if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
+							"group_id":  gid,
+							"msg_seq":   contig,
+							"device_id": c.deviceID,
+						}); ackErr != nil {
+							log.Printf("group.pull auto-ack 失败: group=%s %v", gid, ackErr)
+						}
+					}()
 				}
 			}
 		}
@@ -965,8 +978,9 @@ func (c *AUNClient) orchestrateGroupE2EE(ctx context.Context, method string, par
 			if err != nil {
 				c.logE2EEError("create_epoch", gid, "", err)
 			} else {
-				// 后台同步到服务端
-				go c.syncEpochToServer(context.Background(), gid)
+				// 建群初始化必须在 group.create 返回前完成；否则调用方紧接着加成员时，
+				// 初始 rotation 会因成员集变化被服务端拒绝提交。
+				c.syncEpochToServer(ctx, gid)
 			}
 		}
 	}
@@ -977,7 +991,7 @@ func (c *AUNClient) orchestrateGroupE2EE(ctx context.Context, method string, par
 		if gid == "" {
 			gid = stringFromAny(params["group_id"])
 		}
-		if gid != "" {
+		if gid != "" && membershipRotationChanged(method, resultMap) {
 			expectedEpoch := membershipRotationExpectedEpoch(resultMap)
 			triggerID := membershipRotationTriggerID(gid, resultMap)
 			go c.maybeLeadRotateGroupEpoch(context.Background(), gid, triggerID, expectedEpoch)
@@ -1065,6 +1079,7 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 	if timestamp == 0 {
 		timestamp = time.Now().UnixMilli()
 	}
+	persistRequired := truthyBool(params["persist_required"]) || truthyBool(params["durable"])
 
 	// 惰性同步：首次发送 P2P 消息时先 pull 一次，确保 seq 状态就绪
 	c.p2pSyncedMu.Lock()
@@ -1087,7 +1102,7 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 		if len(recipientPrekeys) == 1 {
 			prekey = recipientPrekeys[0]
 		}
-		return c.sendEncryptedSingle(ctx, toAID, payload, messageID, timestamp, prekey)
+		return c.sendEncryptedSingle(ctx, toAID, payload, messageID, timestamp, prekey, persistRequired)
 	}
 	recipientCopies, err := c.buildRecipientDeviceCopies(ctx, toAID, payload, messageID, timestamp, recipientPrekeys)
 	if err != nil {
@@ -1106,6 +1121,9 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 		"message_id": messageID,
 		"timestamp":  timestamp,
 	}
+	if persistRequired {
+		sendParams["persist_required"] = true
+	}
 	result, err := c.transport.Call(ctx, "message.send", sendParams)
 	if err != nil {
 		log.Printf("[aun_core] 警告: E2EE 多设备消息发送失败，prekey 已消耗不可回滚 (to=%s, copies=%d): %v", toAID, len(recipientCopies), err)
@@ -1120,6 +1138,7 @@ func (c *AUNClient) sendEncryptedSingle(
 	messageID string,
 	timestamp int64,
 	prekey map[string]any,
+	persistRequired bool,
 ) (any, error) {
 	var err error
 	if prekey == nil {
@@ -1147,6 +1166,9 @@ func (c *AUNClient) sendEncryptedSingle(
 		"encrypted":  true,
 		"message_id": messageID,
 		"timestamp":  timestamp,
+	}
+	if persistRequired {
+		sendParams["persist_required"] = true
 	}
 	result, err := c.transport.Call(ctx, "message.send", sendParams)
 	if err != nil {
@@ -1318,6 +1340,9 @@ func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]an
 	if groupID == "" {
 		return nil, NewValidationError("group.send 需要 group_id")
 	}
+	if payload == nil {
+		return nil, NewValidationError("group.send encrypt=true 时 payload 必须是对象")
+	}
 
 	// 惰性同步：首次对该群发消息时先 pull 一次，确保 epoch key 和 seq 状态就绪
 	c.groupSyncedMu.Lock()
@@ -1330,9 +1355,22 @@ func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]an
 	if err := c.ensureGroupEpochReady(ctx, groupID, false); err != nil {
 		return nil, err
 	}
+	c.waitForGroupMembershipEpochFloor(ctx, groupID, 2*time.Second)
 
 	for attempt := 0; attempt < 2; attempt++ {
-		envelope, err := c.groupE2EE.Encrypt(groupID, payload)
+		epochResult := c.committedGroupEpochState(ctx, groupID)
+		committedEpoch := int(toInt64(firstNonNil(epochResult["committed_epoch"], epochResult["epoch"])))
+		var envelope map[string]any
+		var err error
+		if committedEpoch > 0 {
+			readyEpoch, readyErr := c.ensureCommittedGroupSecretForSend(ctx, groupID, committedEpoch, epochResult)
+			if readyErr != nil {
+				return nil, readyErr
+			}
+			envelope, err = c.groupE2EE.EncryptWithEpoch(groupID, readyEpoch, payload)
+		} else {
+			envelope, err = c.groupE2EE.Encrypt(groupID, payload)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1368,7 +1406,11 @@ func isGroupEpochTooOldError(err error) bool {
 }
 
 func isGroupEpochRotationPendingError(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "e2ee epoch rotation pending")
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "e2ee epoch rotation pending") || strings.Contains(text, "e2ee epoch not committed")
 }
 
 func isRecoverableGroupEpochError(err error) bool {
@@ -1421,13 +1463,36 @@ func (c *AUNClient) requestGroupKeyFromCandidates(ctx context.Context, groupID s
 		reqPayload := BuildKeyRequest(groupID, serverEpoch, myAID)
 		c.groupE2EE.RememberKeyRequest(reqPayload, target)
 		if _, err := c.Call(ctx, "message.send", map[string]any{
-			"to":      target,
-			"payload": reqPayload,
-			"encrypt": true,
+			"to":               target,
+			"payload":          reqPayload,
+			"encrypt":          true,
+			"persist_required": true,
 		}); err != nil {
 			log.Printf("[aun_core] 向 %s 请求群 %s epoch %d 密钥失败: %v", target, groupID, serverEpoch, err)
 		}
 	}
+}
+
+func (c *AUNClient) recoverInitialGroupEpochIfNeeded(ctx context.Context, groupID string, localEpoch int, epochResult map[string]any) map[string]any {
+	serverEpoch := int(toInt64(epochResult["epoch"]))
+	if serverEpoch != 0 || localEpoch != 1 {
+		return epochResult
+	}
+	secretData, err := c.groupE2EE.LoadSecretForEpoch(groupID, 1)
+	if err != nil || secretData == nil || strings.TrimSpace(stringFromAny(secretData["pending_rotation_id"])) != "" {
+		return epochResult
+	}
+	log.Printf("[aun_core] 群 %s 检测到本地 epoch 1 已存在但服务端 epoch 仍为 0，尝试补同步初始 epoch", groupID)
+	c.syncEpochToServer(ctx, groupID)
+	refreshedRaw, refreshErr := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
+	if refreshErr != nil {
+		log.Printf("[aun_core] 群 %s 初始 epoch 补同步后刷新服务端 epoch 失败: %v", groupID, refreshErr)
+		return epochResult
+	}
+	if refreshedMap, ok := refreshedRaw.(map[string]any); ok {
+		return refreshedMap
+	}
+	return epochResult
 }
 
 func (c *AUNClient) ensureGroupEpochReady(ctx context.Context, groupID string, strict bool) error {
@@ -1449,6 +1514,17 @@ func (c *AUNClient) ensureGroupEpochReady(ctx context.Context, groupID string, s
 		return nil
 	}
 	serverEpoch := int(toInt64(resultMap["epoch"]))
+	if pending, ok := resultMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
+		pendingBaseEpoch := int(toInt64(firstNonNil(pending["base_epoch"], serverEpoch)))
+		c.scheduleGroupRotationRetry(groupID, "pending_recovery", stringFromAny(pending["rotation_id"]), pendingBaseEpoch, pending)
+	}
+	if serverEpoch == 0 && effectiveLocalEpoch == 1 {
+		resultMap = c.recoverInitialGroupEpochIfNeeded(ctx, groupID, effectiveLocalEpoch, resultMap)
+		serverEpoch = int(toInt64(resultMap["epoch"]))
+		if serverEpoch == 0 {
+			return NewStateError(fmt.Sprintf("group %s initial epoch sync has not completed; refuse to send with local epoch 1 while server epoch is 0", groupID))
+		}
+	}
 	if serverEpoch <= effectiveLocalEpoch {
 		if !strict || serverEpoch <= 0 {
 			return nil
@@ -1498,6 +1574,127 @@ func (c *AUNClient) ensureGroupEpochReady(ctx context.Context, groupID string, s
 		refreshedText = fmt.Sprint(*refreshed)
 	}
 	return NewStateError(fmt.Sprintf("group %s local epoch %s is behind server epoch %d; key recovery has not completed", groupID, refreshedText, serverEpoch))
+}
+
+func (c *AUNClient) waitForGroupMembershipEpochFloor(ctx context.Context, groupID string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		epochRaw, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
+		if err != nil {
+			log.Printf("[aun_core] 群 %s 成员 epoch floor 预检跳过: %v", groupID, err)
+			return
+		}
+		epochMap, _ := epochRaw.(map[string]any)
+		committedEpoch := int(toInt64(firstNonNil(epochMap["committed_epoch"], epochMap["epoch"])))
+
+		membersRaw, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
+		if err != nil {
+			log.Printf("[aun_core] 群 %s 成员 epoch floor 成员查询跳过: %v", groupID, err)
+			return
+		}
+		membersMap, _ := membersRaw.(map[string]any)
+		members, _ := membersMap["members"].([]any)
+		maxMinReadEpoch := 0
+		for _, raw := range members {
+			member, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			value := int(toInt64(member["min_read_epoch"]))
+			if value > maxMinReadEpoch {
+				maxMinReadEpoch = value
+			}
+		}
+		if maxMinReadEpoch <= committedEpoch {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("[aun_core] 群 %s committed epoch 尚未追上成员可读下限，按当前 committed epoch 继续发送: committed=%d floor=%d",
+				groupID, committedEpoch, maxMinReadEpoch)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
+func (c *AUNClient) committedGroupEpochState(ctx context.Context, groupID string) map[string]any {
+	raw, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
+	if err == nil {
+		if result, ok := raw.(map[string]any); ok {
+			return result
+		}
+	}
+	if err != nil {
+		log.Printf("[aun_core] 群 %s 查询 committed epoch 状态失败，回退本地 epoch: %v", groupID, err)
+	}
+	localEpoch := 0
+	if ep := c.groupE2EE.CurrentEpoch(groupID); ep != nil {
+		localEpoch = *ep
+	}
+	return map[string]any{"epoch": localEpoch, "committed_epoch": localEpoch}
+}
+
+func (c *AUNClient) groupSecretMatchesCommittedRotation(secretData map[string]any, committedRotation map[string]any) bool {
+	if secretData == nil {
+		return false
+	}
+	committedCommitment := ""
+	if committedRotation != nil {
+		committedCommitment = strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
+	}
+	localCommitment := strings.TrimSpace(stringFromAny(secretData["commitment"]))
+	if committedCommitment != "" && committedCommitment != localCommitment {
+		return false
+	}
+	pendingRotationID := strings.TrimSpace(stringFromAny(secretData["pending_rotation_id"]))
+	if pendingRotationID == "" {
+		return true
+	}
+	if committedRotation == nil {
+		return false
+	}
+	if strings.TrimSpace(stringFromAny(committedRotation["rotation_id"])) != pendingRotationID {
+		return false
+	}
+	return true
+}
+
+func (c *AUNClient) ensureCommittedGroupSecretForSend(ctx context.Context, groupID string, committedEpoch int, epochResult map[string]any) (int, error) {
+	if committedEpoch <= 0 {
+		return committedEpoch, nil
+	}
+	secretData, err := c.groupE2EE.LoadSecretForEpoch(groupID, committedEpoch)
+	if err != nil {
+		return 0, err
+	}
+	committedRotation, _ := epochResult["committed_rotation"].(map[string]any)
+	if c.groupSecretMatchesCommittedRotation(secretData, committedRotation) {
+		return committedEpoch, nil
+	}
+	pendingRotationID := ""
+	if secretData != nil {
+		pendingRotationID = stringFromAny(secretData["pending_rotation_id"])
+	}
+	log.Printf("[aun_core] 群 %s epoch %d 本地 pending key 未匹配服务端 committed rotation，先恢复密钥: local_rotation=%s",
+		groupID, committedEpoch, firstNonEmpty(pendingRotationID, "-"))
+	c.recoverGroupEpochKey(ctx, groupID, committedEpoch, "", 5*time.Second)
+	refreshed := c.committedGroupEpochState(ctx, groupID)
+	refreshedCommittedEpoch := int(toInt64(firstNonNil(refreshed["committed_epoch"], refreshed["epoch"], committedEpoch)))
+	if refreshedCommittedEpoch > committedEpoch {
+		committedEpoch = refreshedCommittedEpoch
+		c.recoverGroupEpochKey(ctx, groupID, committedEpoch, "", 5*time.Second)
+		refreshed = c.committedGroupEpochState(ctx, groupID)
+	}
+	refreshedRotation, _ := refreshed["committed_rotation"].(map[string]any)
+	refreshedSecret, _ := c.groupE2EE.LoadSecretForEpoch(groupID, committedEpoch)
+	if !c.groupSecretMatchesCommittedRotation(refreshedSecret, refreshedRotation) {
+		return 0, NewStateError(fmt.Sprintf("group %s epoch %d local key is pending or mismatched; refuse to send with uncommitted group key", groupID, committedEpoch))
+	}
+	return committedEpoch, nil
 }
 
 // epochPrecheck 检查本地 epoch 是否落后于服务端，落后则触发密钥恢复
@@ -2177,15 +2374,23 @@ func membershipRotationExpectedEpoch(payload map[string]any) *int {
 }
 
 func membershipRotationTriggerID(groupID string, payload map[string]any) string {
-	action := stringFromAny(payload["action"])
+	action := strings.TrimSpace(stringFromAny(payload["action"]))
 	if action == "" {
-		action = stringFromAny(payload["status"])
-	}
-	if action == "" {
-		action = stringFromAny(payload["reason"])
-	}
-	if action == "" {
-		action = "membership_changed"
+		if stringFromAny(payload["removed_aid"]) != "" {
+			action = "member_removed"
+		} else if stringFromAny(payload["left_aid"]) != "" {
+			action = "member_left"
+		} else if _, ok := payload["member"].(map[string]any); ok {
+			action = "member_added"
+		} else {
+			action = strings.TrimSpace(stringFromAny(payload["status"]))
+			if action == "" {
+				action = strings.TrimSpace(stringFromAny(payload["reason"]))
+			}
+			if action == "" {
+				action = "membership_changed"
+			}
+		}
 	}
 	eventSeq := stringFromAny(payload["event_seq"])
 	if eventSeq == "" {
@@ -2197,22 +2402,93 @@ func membershipRotationTriggerID(groupID string, payload map[string]any) string 
 		}
 	}
 	changedAID := ""
+	changedAIDs := make(map[string]bool)
 	for _, key := range []string{"aid", "removed_aid", "left_aid", "member_aid", "target_aid"} {
 		changedAID = stringFromAny(payload[key])
 		if changedAID != "" {
+			changedAIDs[changedAID] = true
 			break
 		}
 	}
 	if changedAID == "" {
 		if member, ok := payload["member"].(map[string]any); ok {
 			changedAID = stringFromAny(member["aid"])
+			if changedAID != "" {
+				changedAIDs[changedAID] = true
+			}
 		}
+	} else if member, ok := payload["member"].(map[string]any); ok {
+		if aid := stringFromAny(member["aid"]); aid != "" {
+			changedAIDs[aid] = true
+		}
+	}
+	if changedAID == "" {
+		if request, ok := payload["request"].(map[string]any); ok {
+			changedAID = stringFromAny(request["aid"])
+			if changedAID != "" {
+				changedAIDs[changedAID] = true
+			}
+		}
+	} else if request, ok := payload["request"].(map[string]any); ok {
+		if aid := stringFromAny(request["aid"]); aid != "" {
+			changedAIDs[aid] = true
+		}
+	}
+	if changedAID == "" {
+		if inviteCode, ok := payload["invite_code"].(map[string]any); ok {
+			changedAID = firstNonEmpty(stringFromAny(inviteCode["used_by"]), stringFromAny(inviteCode["aid"]))
+			if changedAID != "" {
+				changedAIDs[changedAID] = true
+			}
+		}
+	} else if inviteCode, ok := payload["invite_code"].(map[string]any); ok {
+		for _, aid := range []string{stringFromAny(inviteCode["used_by"]), stringFromAny(inviteCode["aid"])} {
+			if aid != "" {
+				changedAIDs[aid] = true
+			}
+		}
+	}
+	if results, ok := payload["results"].([]any); ok {
+		for _, raw := range results {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			status := strings.ToLower(strings.TrimSpace(stringFromAny(item["status"])))
+			if status != "approved" && !truthyBool(item["approved"]) {
+				continue
+			}
+			for _, key := range []string{"aid", "member_aid", "target_aid"} {
+				if aid := stringFromAny(item[key]); aid != "" {
+					changedAIDs[aid] = true
+				}
+			}
+			for _, key := range []string{"member", "request"} {
+				if nested, ok := item[key].(map[string]any); ok {
+					if aid := stringFromAny(nested["aid"]); aid != "" {
+						changedAIDs[aid] = true
+					}
+				}
+			}
+		}
+	}
+	changedAidList := make([]string, 0, len(changedAIDs))
+	for aid := range changedAIDs {
+		changedAidList = append(changedAidList, aid)
+	}
+	sort.Strings(changedAidList)
+	changedAidKey := strings.Join(changedAidList, ",")
+	if changedAID == "" {
+		changedAID = "-"
+	}
+	if expectedEpoch := membershipRotationExpectedEpoch(payload); changedAidKey != "" && expectedEpoch != nil {
+		return fmt.Sprintf("%s:%s:aid:%s:epoch:%d", groupID, action, changedAidKey, *expectedEpoch)
 	}
 	if eventSeq != "" {
 		return fmt.Sprintf("%s:%s:event:%s", groupID, action, eventSeq)
 	}
-	if changedAID == "" {
-		changedAID = "-"
+	if changedAidKey != "" {
+		return fmt.Sprintf("%s:%s:aid:%s", groupID, action, changedAidKey)
 	}
 	return fmt.Sprintf("%s:%s:aid:%s", groupID, action, changedAID)
 }
@@ -2228,13 +2504,44 @@ func stringFromAny(value any) string {
 	}
 }
 
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func truthyBool(value any) bool {
+	v, ok := value.(bool)
+	return ok && v
+}
+
 func extractGroupIDFromResult(result map[string]any) string {
 	if group, ok := result["group"].(map[string]any); ok {
 		if gid := stringFromAny(group["group_id"]); gid != "" {
 			return gid
 		}
 	}
-	return stringFromAny(result["group_id"])
+	if gid := stringFromAny(result["group_id"]); gid != "" {
+		return gid
+	}
+	if member, ok := result["member"].(map[string]any); ok {
+		if gid := stringFromAny(member["group_id"]); gid != "" {
+			return gid
+		}
+	}
+	return ""
 }
 
 func isMembershipChangeMethod(method string) bool {
@@ -2246,6 +2553,46 @@ func isMembershipChangeMethod(method string) bool {
 	default:
 		return false
 	}
+}
+
+func membershipRotationChanged(method string, payload map[string]any) bool {
+	switch method {
+	case "group.add_member", "group.kick", "group.remove_member", "group.leave":
+		return true
+	case "group.use_invite_code", "group.request_join":
+		status := strings.ToLower(strings.TrimSpace(stringFromAny(payload["status"])))
+		if status == "joined" || status == "approved" {
+			return true
+		}
+		_, hasMember := payload["member"].(map[string]any)
+		return hasMember
+	case "group.review_join_request":
+		status := strings.ToLower(strings.TrimSpace(stringFromAny(payload["status"])))
+		if status == "approved" {
+			return true
+		}
+		if approved, ok := payload["approved"].(bool); ok && approved {
+			return true
+		}
+		_, hasMember := payload["member"].(map[string]any)
+		return hasMember
+	case "group.batch_review_join_request":
+		results, _ := payload["results"].([]any)
+		for _, raw := range results {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			status := strings.ToLower(strings.TrimSpace(stringFromAny(item["status"])))
+			if status == "approved" {
+				return true
+			}
+			if approved, ok := item["approved"].(bool); ok && approved {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // onRawGroupChanged 处理群组变更事件
@@ -2379,6 +2726,7 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 	// 先解密 P2P E2EE（如果是加密的）
 	actualPayload := payload
 	payloadType, _ := payload["type"].(string)
+	isGroupKeyCtrl := strings.HasPrefix(payloadType, "e2ee.group_key_")
 	if payloadType == "e2ee.encrypted" {
 		fromAID, _ := message["from"].(string)
 		if fromAID != "" {
@@ -2396,10 +2744,26 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 		}
 		actualPayload = ap
 	}
+	innerType, _ := actualPayload["type"].(string)
+	if strings.HasPrefix(innerType, "e2ee.group_key_") {
+		isGroupKeyCtrl = true
+	}
 
+	if innerType == "e2ee.group_key_distribution" {
+		if !c.verifyActiveGroupRotationDistribution(context.Background(), actualPayload) {
+			return true
+		}
+	} else if innerType == "e2ee.group_key_response" {
+		if !c.verifyGroupKeyResponseEpoch(context.Background(), actualPayload) {
+			return true
+		}
+	}
 	result := c.groupE2EE.HandleIncoming(actualPayload)
+	if result == "distribution" {
+		c.discardGroupDistributionIfStale(context.Background(), actualPayload)
+	}
 	if result == "" {
-		return false
+		return isGroupKeyCtrl
 	}
 
 	if result == "request" {
@@ -2426,7 +2790,7 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 								epoch := int(toInt64(secretData["epoch"]))
 								secret, _ := secretData["secret"].([]byte)
 								commitment := ComputeMembershipCommitment(members, epoch, groupID, secret)
-								StoreGroupSecret(c.keyStore, myAID, groupID, epoch, secret, commitment, members)
+								StoreGroupSecret(c.keyStore, myAID, groupID, epoch, secret, commitment, members, "")
 							}
 						}
 					}
@@ -2438,13 +2802,26 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 		if response != nil && requester != "" {
 			ctx := context.Background()
 			_, err := c.Call(ctx, "message.send", map[string]any{
-				"to":      requester,
-				"payload": response,
-				"encrypt": true,
+				"to":               requester,
+				"payload":          response,
+				"encrypt":          true,
+				"persist_required": true,
 			})
 			if err != nil {
 				log.Printf("向 %s 回复群组密钥失败: %v", requester, err)
 			}
+		}
+	}
+
+	if result == "distribution" || result == "response" {
+		groupID, _ := actualPayload["group_id"].(string)
+		rotationID := strings.TrimSpace(stringFromAny(actualPayload["rotation_id"]))
+		keyCommitment := strings.TrimSpace(stringFromAny(actualPayload["commitment"]))
+		if rotationID != "" && keyCommitment != "" {
+			go c.ackGroupRotationKey(context.Background(), rotationID, keyCommitment)
+		}
+		if groupID != "" {
+			go c.retryPendingDecryptMsgs(groupID)
 		}
 	}
 
@@ -2903,8 +3280,13 @@ func (c *AUNClient) retryPendingDecryptMsgs(groupID string) {
 		c.events.Publish("group.message_created", decrypted)
 	}
 	c.pendingDecryptMsgsMu.Lock()
-	if len(stillPending) > 0 {
-		c.pendingDecryptMsgs[ns] = stillPending
+	queuedDuringRetry := append([]map[string]any(nil), c.pendingDecryptMsgs[ns]...)
+	mergedPending := append(stillPending, queuedDuringRetry...)
+	if len(mergedPending) > 200 {
+		mergedPending = mergedPending[len(mergedPending)-200:]
+	}
+	if len(mergedPending) > 0 {
+		c.pendingDecryptMsgs[ns] = mergedPending
 	} else {
 		delete(c.pendingDecryptMsgs, ns)
 	}
@@ -2912,9 +3294,12 @@ func (c *AUNClient) retryPendingDecryptMsgs(groupID string) {
 }
 
 func (c *AUNClient) recoverGroupEpochKey(ctx context.Context, groupID string, epoch int, senderAID string, timeout time.Duration) bool {
-	// 快速路径：本地已有该 epoch 密钥
+	// 快速路径：本地已有 committed epoch 密钥。pending key 必须先确认仍对应服务端状态，
+	// 否则要继续发起 recovery，避免 stale pending key 阻断恢复。
 	if secret, err := c.groupE2EE.LoadSecretForEpoch(groupID, epoch); err == nil && secret != nil {
-		return true
+		if c.groupEpochSecretReadyForRecovery(ctx, groupID, epoch, secret) {
+			return true
+		}
 	}
 
 	key := fmt.Sprintf("%s:%d", groupID, epoch)
@@ -2947,6 +3332,40 @@ func (c *AUNClient) recoverGroupEpochKey(ctx context.Context, groupID string, ep
 	return entry.ok
 }
 
+func (c *AUNClient) groupEpochSecretReadyForRecovery(ctx context.Context, groupID string, epoch int, secret map[string]any) bool {
+	if secret == nil {
+		return false
+	}
+	pendingRotationID := strings.TrimSpace(stringFromAny(secret["pending_rotation_id"]))
+	if pendingRotationID == "" {
+		return true
+	}
+	return c.pendingGroupSecretStillCurrent(ctx, groupID, epoch, pendingRotationID)
+}
+
+func (c *AUNClient) pendingGroupSecretStillCurrent(ctx context.Context, groupID string, epoch int, pendingRotationID string) bool {
+	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
+	if err != nil {
+		return false
+	}
+	epochMap, ok := epochResult.(map[string]any)
+	if !ok {
+		return false
+	}
+	if pending, ok := epochMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
+		if strings.TrimSpace(stringFromAny(pending["rotation_id"])) == pendingRotationID {
+			return true
+		}
+	}
+	if committedRotation, ok := epochMap["committed_rotation"].(map[string]any); ok {
+		if int(toInt64(committedRotation["target_epoch"])) == epoch &&
+			strings.TrimSpace(stringFromAny(committedRotation["rotation_id"])) == pendingRotationID {
+			return true
+		}
+	}
+	return false
+}
+
 // doRecoverGroupEpochKey 执行实际的 epoch key 恢复逻辑
 func (c *AUNClient) doRecoverGroupEpochKey(ctx context.Context, groupID string, epoch int, senderAID string, timeout time.Duration) bool {
 	epochResult := map[string]any{"epoch": epoch}
@@ -2966,13 +3385,17 @@ func (c *AUNClient) doRecoverGroupEpochKey(ctx context.Context, groupID string, 
 	for time.Now().Before(deadline) {
 		time.Sleep(150 * time.Millisecond)
 		if secret, err := c.groupE2EE.LoadSecretForEpoch(groupID, epoch); err == nil && secret != nil {
-			go c.retryPendingDecryptMsgs(groupID)
-			return true
+			if c.groupEpochSecretReadyForRecovery(ctx, groupID, epoch, secret) {
+				go c.retryPendingDecryptMsgs(groupID)
+				return true
+			}
 		}
 	}
 	if secret, err := c.groupE2EE.LoadSecretForEpoch(groupID, epoch); err == nil && secret != nil {
-		go c.retryPendingDecryptMsgs(groupID)
-		return true
+		if c.groupEpochSecretReadyForRecovery(ctx, groupID, epoch, secret) {
+			go c.retryPendingDecryptMsgs(groupID)
+			return true
+		}
 	}
 	return false
 }
@@ -3506,9 +3929,8 @@ func (c *AUNClient) groupEpochRotateLoop(ctx context.Context, interval float64) 
 				continue
 			}
 
-			groupStates := loadAllKeyStoreGroupStates(c.keyStore, myAID)
-			for gid := range groupStates {
-				c.rotateGroupEpoch(ctx, gid, "", nil)
+			for _, gid := range listKeyStoreGroupIDs(c.keyStore, myAID) {
+				c.maybeLeadRotateGroupEpoch(ctx, gid, "", nil)
 			}
 		}
 	}
@@ -3536,9 +3958,8 @@ func (c *AUNClient) groupEpochCleanupLoop(ctx context.Context, interval float64)
 				continue
 			}
 
-			groupStates := loadAllKeyStoreGroupStates(c.keyStore, myAID)
 			retention := c.configModel.OldEpochRetentionSeconds
-			for gid := range groupStates {
+			for _, gid := range listKeyStoreGroupIDs(c.keyStore, myAID) {
 				c.groupE2EE.Cleanup(gid, retention)
 			}
 		}
@@ -3606,8 +4027,9 @@ func (c *AUNClient) cacheCleanupLoop(ctx context.Context, interval float64) {
 
 // ── Group E2EE 编排 ─────────────────────────────────────────
 
-// buildRotationSignature 构建 epoch 轮换签名参数
-func (c *AUNClient) buildRotationSignature(groupID string, currentEpoch, newEpoch int) map[string]any {
+// buildRotationSignature 构建 epoch 轮换签名参数。
+// 传入 source 时使用 v2 canonical JSON 签名，覆盖 rotation_id/key_commitment/成员 ack 集。
+func (c *AUNClient) buildRotationSignature(groupID string, currentEpoch, newEpoch int, source ...map[string]any) map[string]any {
 	c.mu.RLock()
 	identity := c.identity
 	c.mu.RUnlock()
@@ -3621,7 +4043,28 @@ func (c *AUNClient) buildRotationSignature(groupID string, currentEpoch, newEpoc
 
 	aidStr, _ := identity["aid"].(string)
 	ts := fmt.Sprintf("%d", time.Now().Unix())
-	signData := []byte(fmt.Sprintf("%s|%d|%d|%s|%s", groupID, currentEpoch, newEpoch, aidStr, ts))
+	var signData []byte
+	useV2 := len(source) > 0 && source[0] != nil
+	if useV2 {
+		src := source[0]
+		signData = []byte(stableStringify(map[string]any{
+			"version":            "v2",
+			"group_id":           groupID,
+			"base_epoch":         currentEpoch,
+			"target_epoch":       newEpoch,
+			"aid":                aidStr,
+			"rotation_timestamp": ts,
+			"rotation_id":        stringFromAny(firstNonNil(src["rotation_id"], src["new_rotation_id"])),
+			"reason":             stringFromAny(src["reason"]),
+			"key_commitment":     stringFromAny(src["key_commitment"]),
+			"manifest_hash":      stringFromAny(src["manifest_hash"]),
+			"epoch_chain":        stringFromAny(src["epoch_chain"]),
+			"expected_members":   sortedStringListFromAny(src["expected_members"]),
+			"required_acks":      sortedStringListFromAny(src["required_acks"]),
+		}))
+	} else {
+		signData = []byte(fmt.Sprintf("%s|%d|%d|%s|%s", groupID, currentEpoch, newEpoch, aidStr, ts))
+	}
 
 	pk, err := parseECPrivateKeyPEM(privPEM)
 	if err != nil {
@@ -3633,35 +4076,398 @@ func (c *AUNClient) buildRotationSignature(groupID string, currentEpoch, newEpoc
 		return nil
 	}
 
-	return map[string]any{
+	result := map[string]any{
 		"rotation_signature": base64.StdEncoding.EncodeToString(sig),
 		"rotation_timestamp": ts,
 	}
+	if useV2 {
+		result["rotation_sig_version"] = "v2"
+	}
+	return result
+}
+
+func (c *AUNClient) getGroupMemberAIDs(ctx context.Context, groupID string) ([]string, error) {
+	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
+	if err != nil {
+		return nil, err
+	}
+	membersMap, ok := membersResult.(map[string]any)
+	if !ok {
+		return nil, NewStateError(fmt.Sprintf("group %s members response invalid", groupID))
+	}
+	membersList, _ := membersMap["members"].([]any)
+	return extractAIDsFromMembers(membersList), nil
+}
+
+func (c *AUNClient) distributeGroupEpochKey(ctx context.Context, info map[string]any, rotationID string) (sent []string, failed []string) {
+	rawDist := info["distributions"]
+	distributions := make([]map[string]any, 0)
+	switch v := rawDist.(type) {
+	case []map[string]any:
+		distributions = v
+	case []any:
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				distributions = append(distributions, m)
+			}
+		}
+	}
+
+	lastHeartbeat := time.Now()
+	for _, dist := range distributions {
+		to, _ := dist["to"].(string)
+		distPayload, _ := dist["payload"].(map[string]any)
+		if to == "" || distPayload == nil {
+			continue
+		}
+		if rotationID != "" && time.Since(lastHeartbeat) >= 20*time.Second {
+			if c.heartbeatGroupRotation(ctx, rotationID) {
+				lastHeartbeat = time.Now()
+			}
+		}
+		ok := false
+		for attempt := 0; attempt < 3; attempt++ {
+			_, sendErr := c.Call(ctx, "message.send", map[string]any{
+				"to":               to,
+				"payload":          distPayload,
+				"encrypt":          true,
+				"persist_required": true,
+			})
+			if sendErr == nil {
+				sent = append(sent, to)
+				ok = true
+				break
+			}
+			if attempt < 2 {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+			} else {
+				log.Printf("epoch 密钥分发失败 (to=%s): %v", to, sendErr)
+			}
+		}
+		if !ok {
+			failed = append(failed, to)
+		}
+	}
+	return sent, failed
+}
+
+func (c *AUNClient) heartbeatGroupRotation(ctx context.Context, rotationID string) bool {
+	if strings.TrimSpace(rotationID) == "" {
+		return false
+	}
+	result, err := c.Call(ctx, "group.e2ee.heartbeat_rotation", map[string]any{
+		"rotation_id": rotationID,
+		"lease_ms":    groupRotationLeaseMS,
+	})
+	if err != nil {
+		log.Printf("刷新 epoch rotation lease 失败: rotation=%s err=%v", rotationID, err)
+		return false
+	}
+	resultMap, _ := result.(map[string]any)
+	return truthyBool(resultMap["success"])
+}
+
+func (c *AUNClient) ackGroupRotationKey(ctx context.Context, rotationID string, keyCommitment string) bool {
+	if strings.TrimSpace(rotationID) == "" {
+		return false
+	}
+	result, err := c.Call(ctx, "group.e2ee.ack_rotation_key", map[string]any{
+		"rotation_id":    rotationID,
+		"key_commitment": keyCommitment,
+		"device_id":      c.deviceID,
+	})
+	if err != nil {
+		log.Printf("提交 epoch key ack 失败: rotation=%s err=%v", rotationID, err)
+		return false
+	}
+	resultMap, _ := result.(map[string]any)
+	return truthyBool(resultMap["success"])
+}
+
+func (c *AUNClient) verifyActiveGroupRotationDistribution(ctx context.Context, payload map[string]any) bool {
+	rotationID := strings.TrimSpace(stringFromAny(payload["rotation_id"]))
+	groupID := strings.TrimSpace(stringFromAny(payload["group_id"]))
+	if groupID == "" {
+		return false
+	}
+	epoch := int(toInt64(payload["epoch"]))
+	if epoch <= 0 {
+		return false
+	}
+	commitment := strings.TrimSpace(stringFromAny(payload["commitment"]))
+	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
+	if err != nil {
+		log.Printf("拒绝无法校验 active rotation 的 epoch key 分发: group=%s rotation=%s err=%v", groupID, rotationID, err)
+		return false
+	}
+	epochMap, ok := epochResult.(map[string]any)
+	if !ok {
+		return false
+	}
+	committedEpoch := int(toInt64(firstNonNil(epochMap["committed_epoch"], epochMap["epoch"])))
+	committedRotation, _ := epochMap["committed_rotation"].(map[string]any)
+	if rotationID == "" {
+		if epoch > 0 && epoch <= committedEpoch {
+			if committedRotation != nil && int(toInt64(firstNonNil(committedRotation["target_epoch"], committedEpoch))) == epoch {
+				committedCommitment := strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
+				if committedCommitment != "" && commitment != "" && committedCommitment != commitment {
+					return false
+				}
+			}
+			return true
+		}
+		log.Printf("拒绝缺少 rotation_id 的未来 epoch key 分发: group=%s epoch=%d committed=%d", groupID, epoch, committedEpoch)
+		return false
+	}
+	if pending, ok := epochMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
+		pendingCommitment := strings.TrimSpace(stringFromAny(pending["key_commitment"]))
+		if strings.TrimSpace(stringFromAny(pending["rotation_id"])) == rotationID &&
+			int(toInt64(pending["target_epoch"])) == epoch &&
+			(pendingCommitment == "" || pendingCommitment == commitment) {
+			return true
+		}
+	}
+	if committedRotation != nil && committedEpoch >= epoch {
+		committedCommitment := strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
+		if strings.TrimSpace(stringFromAny(committedRotation["rotation_id"])) == rotationID &&
+			(committedCommitment == "" || committedCommitment == commitment) {
+			return true
+		}
+	}
+	log.Printf("拒绝非 pending/committed 状态的 epoch key 分发: group=%s rotation=%s epoch=%d", groupID, rotationID, epoch)
+	return false
+}
+
+func (c *AUNClient) discardGroupDistributionIfStale(ctx context.Context, payload map[string]any) {
+	rotationID := strings.TrimSpace(stringFromAny(payload["rotation_id"]))
+	if rotationID == "" {
+		return
+	}
+	groupID := strings.TrimSpace(stringFromAny(payload["group_id"]))
+	epoch := int(toInt64(payload["epoch"]))
+	if groupID == "" || epoch <= 0 {
+		return
+	}
+	if c.verifyActiveGroupRotationDistribution(ctx, payload) {
+		return
+	}
+	if ok, err := c.groupE2EE.DiscardPendingSecret(groupID, epoch, rotationID); err != nil {
+		log.Printf("[aun_core] 清理 stale group epoch key 失败: group=%s epoch=%d rotation=%s err=%v", groupID, epoch, rotationID, err)
+	} else if ok {
+		log.Printf("[aun_core] 丢弃 verify 后变为 stale 的 group epoch key: group=%s epoch=%d rotation=%s", groupID, epoch, rotationID)
+	}
+}
+
+func (c *AUNClient) verifyGroupKeyResponseEpoch(ctx context.Context, payload map[string]any) bool {
+	groupID := strings.TrimSpace(stringFromAny(payload["group_id"]))
+	if groupID == "" {
+		return false
+	}
+	epoch := int(toInt64(payload["epoch"]))
+	if epoch <= 0 {
+		return false
+	}
+	commitment := strings.TrimSpace(stringFromAny(payload["commitment"]))
+	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
+	if err != nil {
+		log.Printf("拒绝无法校验 committed epoch 的 group key response: group=%s epoch=%d err=%v", groupID, epoch, err)
+		return false
+	}
+	epochMap, ok := epochResult.(map[string]any)
+	if !ok {
+		return false
+	}
+	committedEpoch := int(toInt64(firstNonNil(epochMap["committed_epoch"], epochMap["epoch"])))
+	if epoch > committedEpoch {
+		log.Printf("拒绝未提交 epoch 的 group key response: group=%s epoch=%d committed=%d", groupID, epoch, committedEpoch)
+		return false
+	}
+	committedRotation, _ := epochMap["committed_rotation"].(map[string]any)
+	if committedRotation != nil && int(toInt64(firstNonNil(committedRotation["target_epoch"], committedEpoch))) == epoch {
+		committedCommitment := strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
+		if committedCommitment != "" && commitment != "" && committedCommitment != commitment {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *AUNClient) abortGroupRotation(ctx context.Context, rotationID string, reason string) bool {
+	if strings.TrimSpace(rotationID) == "" {
+		return false
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "client_abort"
+	}
+	result, err := c.Call(ctx, "group.e2ee.abort_rotation", map[string]any{
+		"rotation_id": rotationID,
+		"reason":      reason,
+	})
+	if err != nil {
+		log.Printf("中止 epoch rotation 失败: rotation=%s err=%v", rotationID, err)
+		return false
+	}
+	resultMap, _ := result.(map[string]any)
+	return truthyBool(resultMap["success"])
+}
+
+func rotationExpectedMembersStale(rotation map[string]any, memberAIDs []string) bool {
+	expected := sortedStringListFromAny(rotation["expected_members"])
+	current := append([]string(nil), memberAIDs...)
+	sort.Strings(current)
+	return len(expected) > 0 && len(current) > 0 && strings.Join(expected, "\n") != strings.Join(current, "\n")
+}
+
+func (c *AUNClient) rotationRetryDelay(pending map[string]any) time.Duration {
+	var leaseExpiresAt int64
+	if pending != nil && !truthyBool(pending["expired"]) {
+		status := strings.TrimSpace(stringFromAny(pending["status"]))
+		if status == "" || status == "distributing" {
+			leaseExpiresAt = toInt64(pending["lease_expires_at"])
+		}
+	}
+	base := 5 * time.Second
+	if leaseExpiresAt > 0 {
+		remaining := time.Until(time.UnixMilli(leaseExpiresAt)) + time.Second
+		if remaining > base {
+			base = remaining
+		}
+	}
+	jitterMs, _ := cryptorand.Int(cryptorand.Reader, big.NewInt(2000))
+	delay := base + time.Duration(jitterMs.Int64())*time.Millisecond
+	if delay > groupRotationRetryMaxDelay {
+		return groupRotationRetryMaxDelay
+	}
+	return delay
+}
+
+func (c *AUNClient) scheduleGroupRotationRetry(groupID, reason, triggerID string, expectedEpoch int, pending map[string]any) {
+	retryKey := fmt.Sprintf("%s:%s:%s:%d", groupID, firstNonEmpty(triggerID, reason), reason, expectedEpoch)
+	c.groupEpochRotationMu.Lock()
+	if c.groupEpochRotationRetrying[retryKey] {
+		c.groupEpochRotationMu.Unlock()
+		return
+	}
+	c.groupEpochRotationRetrying[retryKey] = true
+	c.groupEpochRotationMu.Unlock()
+
+	delay := c.rotationRetryDelay(pending)
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		c.mu.RLock()
+		baseCtx := c.ctx
+		c.mu.RUnlock()
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		select {
+		case <-baseCtx.Done():
+		case <-timer.C:
+		}
+		c.groupEpochRotationMu.Lock()
+		delete(c.groupEpochRotationRetrying, retryKey)
+		c.groupEpochRotationMu.Unlock()
+		if baseCtx.Err() != nil || c.closing.Load() {
+			return
+		}
+		c.mu.RLock()
+		state := c.state
+		c.mu.RUnlock()
+		if state != StateConnected {
+			return
+		}
+		expected := expectedEpoch
+		c.maybeLeadRotateGroupEpoch(context.Background(), groupID, triggerID, &expected)
+	}()
 }
 
 // syncEpochToServer 建群后将本地 epoch 1 同步到服务端，最多重试 3 次
 func (c *AUNClient) syncEpochToServer(ctx context.Context, groupID string) {
 	const maxRetries = 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		rotateParams := map[string]any{
-			"group_id":      groupID,
-			"current_epoch": 0,
+	started := time.Now()
+	for {
+		c.groupEpochRotationMu.Lock()
+		if !c.groupEpochRotationInflight[groupID] {
+			c.groupEpochRotationInflight[groupID] = true
+			c.groupEpochRotationMu.Unlock()
+			break
 		}
-		sigParams := c.buildRotationSignature(groupID, 0, 1)
+		c.groupEpochRotationMu.Unlock()
+		if time.Since(started) > 20*time.Second {
+			log.Printf("group epoch create sync still in-flight; skip duplicate sync (group=%s)", groupID)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	defer func() {
+		c.groupEpochRotationMu.Lock()
+		delete(c.groupEpochRotationInflight, groupID)
+		c.groupEpochRotationMu.Unlock()
+	}()
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		c.mu.RLock()
+		myAID := c.aid
+		c.mu.RUnlock()
+		if myAID == "" {
+			return
+		}
+		secretData, secretErr := c.groupE2EE.LoadSecretForEpoch(groupID, 1)
+		if secretErr != nil || secretData == nil {
+			log.Printf("同步 epoch 到服务端失败: group=%s epoch1 secret missing err=%v", groupID, secretErr)
+			return
+		}
+		rotationID := "rot-" + strings.ReplaceAll(generateUUID4(), "-", "")
+		members := toStringSlice(secretData["member_aids"])
+		if len(members) == 0 {
+			members = []string{myAID}
+		}
+		rotateParams := map[string]any{
+			"group_id":         groupID,
+			"base_epoch":       0,
+			"target_epoch":     1,
+			"rotation_id":      rotationID,
+			"reason":           "create_group",
+			"key_commitment":   stringFromAny(secretData["commitment"]),
+			"epoch_chain":      stringFromAny(secretData["epoch_chain"]),
+			"expected_members": members,
+			"required_acks":    []string{myAID},
+			"lease_ms":         groupRotationLeaseMS,
+		}
+		sigParams := c.buildRotationSignature(groupID, 0, 1, rotateParams)
 		for k, v := range sigParams {
 			rotateParams[k] = v
 		}
-		casResult, err := c.Call(ctx, "group.e2ee.rotate_epoch", rotateParams)
+		beginResult, err := c.Call(ctx, "group.e2ee.begin_rotation", rotateParams)
 		if err == nil {
-			casMap, ok := casResult.(map[string]any)
-			if ok {
-				if success, _ := casMap["success"].(bool); success {
+			beginMap, ok := beginResult.(map[string]any)
+			rotation, _ := beginMap["rotation"].(map[string]any)
+			if ok && truthyBool(beginMap["success"]) && rotation != nil {
+				activeRotationID := firstNonEmpty(stringFromAny(rotation["rotation_id"]), rotationID)
+				if !c.ackGroupRotationKey(ctx, activeRotationID, stringFromAny(secretData["commitment"])) {
+					log.Printf("group epoch self ack failed (group=%s, rotation=%s)", groupID, activeRotationID)
+					c.abortGroupRotation(ctx, activeRotationID, "self_ack_failed")
 					return
 				}
-				log.Printf("group epoch CAS failed; stop key distribution (group=%s, current_epoch=%d, returned_epoch=%v)", groupID, 0, casMap["epoch"])
+				commitResult, commitErr := c.Call(ctx, "group.e2ee.commit_rotation", map[string]any{"rotation_id": activeRotationID})
+				if commitErr == nil {
+					commitMap, _ := commitResult.(map[string]any)
+					if truthyBool(commitMap["success"]) {
+						secret, _ := secretData["secret"].([]byte)
+						StoreGroupSecret(c.keyStore, myAID, groupID, 1, secret, stringFromAny(secretData["commitment"]), members, stringFromAny(secretData["epoch_chain"]))
+						return
+					}
+					log.Printf("group epoch commit failed (group=%s, returned=%v)", groupID, commitResult)
+					return
+				}
+				log.Printf("group epoch commit failed (group=%s): %v", groupID, commitErr)
 				return
 			}
-			log.Printf("group epoch CAS failed; stop key distribution (group=%s, current_epoch=%d, returned_epoch=%v)", groupID, 0, "invalid_result")
+			log.Printf("group epoch begin failed; stop key distribution (group=%s, returned=%v)", groupID, beginResult)
 			return
 		}
 		if attempt < maxRetries {
@@ -3687,8 +4493,9 @@ func randomLeaderRotateJitter() time.Duration {
 func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID string, triggerID string, expectedEpoch *int) {
 	c.mu.RLock()
 	myAID := c.aid
+	state := c.state
 	c.mu.RUnlock()
-	if groupID == "" || myAID == "" {
+	if groupID == "" || myAID == "" || c.closing.Load() || state != StateConnected {
 		return
 	}
 
@@ -3703,6 +4510,12 @@ func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID strin
 		done := triggerID != "" && c.groupMembershipRotationDone[triggerID]
 		c.groupEpochRotationMu.Unlock()
 		if done {
+			return
+		}
+		c.mu.RLock()
+		state = c.state
+		c.mu.RUnlock()
+		if c.closing.Load() || state != StateConnected {
 			return
 		}
 		if time.Since(started) > 20*time.Second {
@@ -3720,6 +4533,12 @@ func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID strin
 		delete(c.groupEpochRotationInflight, groupID)
 		c.groupEpochRotationMu.Unlock()
 	}()
+	c.mu.RLock()
+	state = c.state
+	c.mu.RUnlock()
+	if c.closing.Load() || state != StateConnected {
+		return
+	}
 
 	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
 	if err != nil {
@@ -3760,9 +4579,7 @@ func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID strin
 	beforeEpoch := 0
 	if resp, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
 		if m, ok := resp.(map[string]any); ok {
-			if v, ok := m["epoch"].(float64); ok {
-				beforeEpoch = int(v)
-			}
+			beforeEpoch = int(toInt64(m["epoch"]))
 		}
 	} else if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
 		beforeEpoch = *epoch
@@ -3774,12 +4591,18 @@ func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID strin
 		return
 	case <-timer.C:
 	}
+	c.mu.RLock()
+	state = c.state
+	c.mu.RUnlock()
+	if c.closing.Load() || state != StateConnected {
+		return
+	}
 	afterEpoch := 0
+	var afterMap map[string]any
 	if resp, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
 		if m, ok := resp.(map[string]any); ok {
-			if v, ok := m["epoch"].(float64); ok {
-				afterEpoch = int(v)
-			}
+			afterMap = m
+			afterEpoch = int(toInt64(m["epoch"]))
 		}
 	} else if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
 		afterEpoch = *epoch
@@ -3787,19 +4610,46 @@ func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID strin
 	if afterEpoch > beforeEpoch {
 		return
 	}
+	if pending, ok := afterMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
+		exp := afterEpoch
+		if expectedEpoch != nil {
+			exp = *expectedEpoch
+		}
+		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, pending)
+		return
+	}
 	log.Printf("[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s", groupID, myAID)
 	c.rotateGroupEpoch(ctx, groupID, triggerID, expectedEpoch)
 }
 
-// rotateGroupEpoch 为指定群组轮换 epoch 并分发新密钥（使用服务端 CAS 保证只有一方成功）
+// rotateGroupEpoch 为指定群组轮换 epoch 并分发新密钥（使用服务端两阶段 rotation）
 func (c *AUNClient) rotateGroupEpoch(ctx context.Context, groupID string, triggerID string, expectedEpoch *int) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("rotateGroupEpoch panic: %v", r)
 		}
 	}()
+	c.mu.RLock()
+	myAID := c.aid
+	c.mu.RUnlock()
+	if myAID == "" {
+		return
+	}
 
-	// 1. 读取服务端当前 epoch
+	memberAIDs, err := c.getGroupMemberAIDs(ctx, groupID)
+	if err != nil {
+		c.logE2EEError("rotate_epoch", groupID, "", err)
+		return
+	}
+	if triggerID != "" {
+		c.groupEpochRotationMu.Lock()
+		done := c.groupMembershipRotationDone[triggerID]
+		c.groupEpochRotationMu.Unlock()
+		if done {
+			return
+		}
+	}
+
 	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
 	if err != nil {
 		c.logE2EEError("rotate_epoch", groupID, "", err)
@@ -3810,6 +4660,20 @@ func (c *AUNClient) rotateGroupEpoch(ctx context.Context, groupID string, trigge
 		return
 	}
 	serverEpoch := int(toInt64(epochMap["epoch"]))
+	if pendingRotation, ok := epochMap["pending_rotation"].(map[string]any); ok && !truthyBool(pendingRotation["expired"]) {
+		pendingRotationID := stringFromAny(pendingRotation["rotation_id"])
+		if expectedEpoch != nil && serverEpoch == *expectedEpoch && rotationExpectedMembersStale(pendingRotation, memberAIDs) &&
+			c.abortGroupRotation(ctx, pendingRotationID, "membership_changed_during_rotation") {
+			log.Printf("aborted stale pending group epoch rotation: group=%s rotation=%s", groupID, firstNonEmpty(pendingRotationID, "-"))
+		} else {
+			exp := serverEpoch
+			if expectedEpoch != nil {
+				exp = *expectedEpoch
+			}
+			c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, pendingRotation)
+			return
+		}
+	}
 	if expectedEpoch != nil && serverEpoch != *expectedEpoch {
 		if triggerID != "" {
 			c.groupEpochRotationMu.Lock()
@@ -3823,84 +4687,154 @@ func (c *AUNClient) rotateGroupEpoch(ctx context.Context, groupID string, trigge
 	if expectedEpoch != nil {
 		currentEpoch = *expectedEpoch
 	}
+	targetEpoch := currentEpoch + 1
+	rotationID := "rot-" + strings.ReplaceAll(generateUUID4(), "-", "")
 
-	// 2. CAS 尝试递增（服务端校验角色 + 原子递增）
-	rotateParams := map[string]any{
-		"group_id":      groupID,
-		"current_epoch": currentEpoch,
+	info, err := c.groupE2EE.RotateEpochTo(groupID, targetEpoch, memberAIDs, rotationID)
+	if err != nil {
+		c.logE2EEError("rotate_epoch", groupID, "", err)
+		return
 	}
-	sigParams := c.buildRotationSignature(groupID, currentEpoch, currentEpoch+1)
+	discardGeneratedPending := func() {
+		if _, err := c.groupE2EE.DiscardPendingSecret(groupID, targetEpoch, rotationID); err != nil {
+			log.Printf("[aun_core] 清理本地 pending group key 失败: group=%s epoch=%d rotation=%s err=%v",
+				groupID, targetEpoch, rotationID, err)
+		}
+	}
+	commitment := stringFromAny(info["commitment"])
+	rotationReason := "manual"
+	if triggerID != "" || expectedEpoch != nil {
+		rotationReason = "membership_changed"
+	}
+	rotateParams := map[string]any{
+		"group_id":         groupID,
+		"base_epoch":       currentEpoch,
+		"target_epoch":     targetEpoch,
+		"rotation_id":      rotationID,
+		"reason":           rotationReason,
+		"key_commitment":   commitment,
+		"expected_members": memberAIDs,
+		"required_acks":    []string{myAID},
+		"lease_ms":         groupRotationLeaseMS,
+	}
+	sigParams := c.buildRotationSignature(groupID, currentEpoch, targetEpoch, rotateParams)
 	for k, v := range sigParams {
 		rotateParams[k] = v
 	}
-	casResult, err := c.Call(ctx, "group.e2ee.rotate_epoch", rotateParams)
+	beginResult, err := c.Call(ctx, "group.e2ee.begin_rotation", rotateParams)
 	if err != nil {
+		discardGeneratedPending()
 		c.logE2EEError("rotate_epoch", groupID, "", err)
 		return
 	}
-	casMap, ok := casResult.(map[string]any)
+	beginMap, ok := beginResult.(map[string]any)
 	if !ok {
+		discardGeneratedPending()
 		return
 	}
-	success, _ := casMap["success"].(bool)
-	if !success {
-		return // CAS 失败（别人先轮换了或角色不符），放弃
+	rotation, _ := beginMap["rotation"].(map[string]any)
+	if !truthyBool(beginMap["success"]) || rotation == nil {
+		if rotation != nil && !truthyBool(rotation["expired"]) {
+			exp := currentEpoch
+			if expectedEpoch != nil {
+				exp = *expectedEpoch
+			}
+			if rotationExpectedMembersStale(rotation, memberAIDs) &&
+				c.abortGroupRotation(ctx, stringFromAny(rotation["rotation_id"]), "membership_changed_during_rotation") {
+				c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
+			} else {
+				c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, rotation)
+			}
+		} else if stringFromAny(beginMap["reason"]) == "expected_members_mismatch" {
+			exp := currentEpoch
+			if expectedEpoch != nil {
+				exp = *expectedEpoch
+			}
+			c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
+		}
+		log.Printf("group epoch begin failed; stop key distribution (group=%s current_epoch=%d returned=%v)", groupID, currentEpoch, beginResult)
+		discardGeneratedPending()
+		return
 	}
-	newEpoch := int(toInt64(casMap["epoch"]))
-
-	// 3. 获取最新成员列表
-	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
+	activeRotationID := firstNonEmpty(stringFromAny(rotation["rotation_id"]), rotationID)
+	_, failed := c.distributeGroupEpochKey(ctx, info, activeRotationID)
+	if len(failed) > 0 {
+		log.Printf("group epoch key distribution incomplete; abort rotation before retry (group=%s rotation=%s failed=%s)",
+			groupID, activeRotationID, strings.Join(failed, ","))
+		c.abortGroupRotation(ctx, activeRotationID, "distribution_failed")
+		exp := currentEpoch
+		if expectedEpoch != nil {
+			exp = *expectedEpoch
+		}
+		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
+		discardGeneratedPending()
+		return
+	}
+	c.heartbeatGroupRotation(ctx, activeRotationID)
+	if !c.ackGroupRotationKey(ctx, activeRotationID, commitment) {
+		log.Printf("group epoch self ack failed; abort rotation before retry (group=%s rotation=%s)", groupID, activeRotationID)
+		c.abortGroupRotation(ctx, activeRotationID, "self_ack_failed")
+		exp := currentEpoch
+		if expectedEpoch != nil {
+			exp = *expectedEpoch
+		}
+		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
+		discardGeneratedPending()
+		return
+	}
+	commitResult, err := c.Call(ctx, "group.e2ee.commit_rotation", map[string]any{"rotation_id": activeRotationID})
 	if err != nil {
 		c.logE2EEError("rotate_epoch", groupID, "", err)
+		exp := currentEpoch
+		if expectedEpoch != nil {
+			exp = *expectedEpoch
+		}
+		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, rotation)
 		return
 	}
-	membersMap, ok := membersResult.(map[string]any)
-	if !ok {
+	commitMap, _ := commitResult.(map[string]any)
+	if !truthyBool(commitMap["success"]) {
+		pending, _ := commitMap["rotation"].(map[string]any)
+		exp := currentEpoch
+		if expectedEpoch != nil {
+			exp = *expectedEpoch
+		}
+		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, pending)
+		log.Printf("group epoch commit failed (group=%s rotation=%s returned=%v)", groupID, activeRotationID, commitResult)
+		if !(pending != nil &&
+			stringFromAny(pending["rotation_id"]) == activeRotationID &&
+			stringFromAny(pending["status"]) == "distributing") {
+			discardGeneratedPending()
+		}
 		return
 	}
-	membersList, _ := membersMap["members"].([]any)
-	memberAIDs := extractAIDsFromMembers(membersList)
-
-	// 4. 本地生成密钥 + 存储 + 分发
-	info, err := c.groupE2EE.RotateEpochTo(groupID, newEpoch, memberAIDs)
-	if err != nil {
-		c.logE2EEError("rotate_epoch", groupID, "", err)
-		return
-	}
-	// distributions 可能是 []any 或 []map[string]any，逐个断言
-	rawDist, _ := info["distributions"]
-	var distributions []map[string]any
-	switch v := rawDist.(type) {
-	case []map[string]any:
-		distributions = v
-	case []any:
-		for _, item := range v {
-			if m, ok := item.(map[string]any); ok {
-				distributions = append(distributions, m)
+	if committedSecret, _ := c.groupE2EE.LoadSecretForEpoch(groupID, targetEpoch); committedSecret != nil {
+		committedRotation, _ := commitMap["rotation"].(map[string]any)
+		if committedRotation == nil {
+			committedRotation = map[string]any{
+				"rotation_id":    activeRotationID,
+				"key_commitment": commitment,
 			}
 		}
-	}
-	for _, dist := range distributions {
-		to, _ := dist["to"].(string)
-		distPayload, _ := dist["payload"].(map[string]any)
-		if to != "" && distPayload != nil {
-			// 重试 3 次，间隔递增（1s, 2s）
-			for attempt := 0; attempt < 3; attempt++ {
-				_, sendErr := c.Call(ctx, "message.send", map[string]any{
-					"to":      to,
-					"payload": distPayload,
-					"encrypt": true,
-				})
-				if sendErr == nil {
-					break
-				}
-				if attempt < 2 {
-					time.Sleep(time.Duration(attempt+1) * time.Second)
-				} else {
-					log.Printf("epoch 密钥分发失败 (to=%s): %v", to, sendErr)
-				}
+		if c.groupSecretMatchesCommittedRotation(committedSecret, committedRotation) {
+			secret, _ := committedSecret["secret"].([]byte)
+			members := toStringSlice(committedSecret["member_aids"])
+			if len(members) == 0 {
+				members = memberAIDs
 			}
+			StoreGroupSecret(c.keyStore, myAID, groupID, targetEpoch, secret, stringFromAny(committedSecret["commitment"]), members, stringFromAny(committedSecret["epoch_chain"]))
+		} else {
+			log.Printf("[aun_core] group epoch commit succeeded but local target key does not match committed rotation; keep pending blocked (group=%s rotation=%s epoch=%d)",
+				groupID, activeRotationID, targetEpoch)
 		}
+	}
+	if triggerID != "" {
+		c.groupEpochRotationMu.Lock()
+		c.groupMembershipRotationDone[triggerID] = true
+		if len(c.groupMembershipRotationDone) > 2000 {
+			c.groupMembershipRotationDone = make(map[string]bool)
+		}
+		c.groupEpochRotationMu.Unlock()
 	}
 }
 
@@ -3938,7 +4872,7 @@ func (c *AUNClient) distributeKeyToNewMember(ctx context.Context, groupID, newMe
 	epoch := int(toInt64(secretData["epoch"]))
 	secret, _ := secretData["secret"].([]byte)
 	commitment := ComputeMembershipCommitment(memberAIDs, epoch, groupID, secret)
-	StoreGroupSecret(c.keyStore, myAID, groupID, epoch, secret, commitment, memberAIDs)
+	StoreGroupSecret(c.keyStore, myAID, groupID, epoch, secret, commitment, memberAIDs, "")
 
 	// 构建并签名 manifest
 	prevEpoch := epoch
@@ -3959,13 +4893,14 @@ func (c *AUNClient) distributeKeyToNewMember(ctx context.Context, groupID, newMe
 		}
 	}
 
-	distPayload := BuildKeyDistribution(groupID, epoch, secret, memberAIDs, myAID, manifest)
+	distPayload := BuildKeyDistribution(groupID, epoch, secret, memberAIDs, myAID, manifest, stringFromAny(secretData["epoch_chain"]))
 	// 重试 3 次，间隔递增（1s, 2s）
 	for attempt := 0; attempt < 3; attempt++ {
 		_, err = c.Call(ctx, "message.send", map[string]any{
-			"to":      newMemberAID,
-			"payload": distPayload,
-			"encrypt": true,
+			"to":               newMemberAID,
+			"payload":          distPayload,
+			"encrypt":          true,
+			"persist_required": true,
 		})
 		if err == nil {
 			break
@@ -4751,4 +5686,24 @@ func extractAIDsFromMembers(membersList []any) []string {
 		}
 	}
 	return aids
+}
+
+func sortedStringListFromAny(value any) []string {
+	result := make([]string, 0)
+	switch v := value.(type) {
+	case []string:
+		for _, item := range v {
+			if s := strings.TrimSpace(item); s != "" {
+				result = append(result, s)
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if s := strings.TrimSpace(stringFromAny(item)); s != "" {
+				result = append(result, s)
+			}
+		}
+	}
+	sort.Strings(result)
+	return result
 }

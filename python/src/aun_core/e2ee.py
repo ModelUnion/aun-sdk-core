@@ -139,43 +139,93 @@ def _cleanup_keystore_prekeys(
     raise AttributeError(f"keystore {type(keystore).__name__} 缺少 cleanup_e2ee_prekeys 方法")
 
 
-def _load_keystore_group_state(
+def _load_keystore_group_epoch(
     keystore: Any,
     aid: str,
     group_id: str,
+    epoch: int | None = None,
 ) -> dict[str, Any] | None:
-    load_fn = getattr(keystore, "load_group_secret_state", None)
+    load_fn = getattr(keystore, "load_group_secret_epoch", None)
+    if callable(load_fn):
+        result = load_fn(aid, group_id, epoch)
+        return result if isinstance(result, dict) else None
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 load_group_secret_epoch 方法")
+
+
+def _load_keystore_group_epochs(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+) -> list[dict[str, Any]]:
+    load_fn = getattr(keystore, "load_group_secret_epochs", None)
     if callable(load_fn):
         result = load_fn(aid, group_id)
-        return result if isinstance(result, dict) else None
+        return [entry for entry in result if isinstance(entry, dict)] if isinstance(result, list) else []
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 load_group_secret_epochs 方法")
 
-    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 load_group_secret_state 方法")
 
-
-def _save_keystore_group_state(
+def _store_keystore_group_transition(
     keystore: Any,
     aid: str,
     group_id: str,
-    entry: dict[str, Any],
-) -> None:
-    save_fn = getattr(keystore, "save_group_secret_state", None)
-    if callable(save_fn):
-        save_fn(aid, group_id, entry)
-        return
+    *,
+    epoch: int,
+    secret: str,
+    commitment: str,
+    member_aids: list[str],
+    epoch_chain: str | None,
+    pending_rotation_id: str,
+    epoch_chain_unverified: bool | None,
+    epoch_chain_unverified_reason: str | None,
+) -> bool | None:
+    store_fn = getattr(keystore, "store_group_secret_transition", None)
+    if not callable(store_fn):
+        return None
+    return bool(store_fn(
+        aid,
+        group_id,
+        epoch=epoch,
+        secret=secret,
+        commitment=commitment,
+        member_aids=member_aids,
+        epoch_chain=epoch_chain,
+        pending_rotation_id=pending_rotation_id,
+        epoch_chain_unverified=epoch_chain_unverified,
+        epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+        old_epoch_retention_ms=OLD_EPOCH_RETENTION_SECONDS * 1000,
+    ))
 
-    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 save_group_secret_state 方法")
 
-
-def _load_all_keystore_group_states(
+def _store_keystore_group_epoch(
     keystore: Any,
     aid: str,
-) -> dict[str, dict[str, Any]]:
-    load_fn = getattr(keystore, "load_all_group_secret_states", None)
-    if callable(load_fn):
-        result = load_fn(aid)
-        return result if isinstance(result, dict) else {}
-
-    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 load_all_group_secret_states 方法")
+    group_id: str,
+    *,
+    epoch: int,
+    secret: str,
+    commitment: str,
+    member_aids: list[str],
+    epoch_chain: str | None,
+    pending_rotation_id: str,
+    epoch_chain_unverified: bool | None,
+    epoch_chain_unverified_reason: str | None,
+) -> bool | None:
+    store_fn = getattr(keystore, "store_group_secret_epoch", None)
+    if not callable(store_fn):
+        return None
+    return bool(store_fn(
+        aid,
+        group_id,
+        epoch=epoch,
+        secret=secret,
+        commitment=commitment,
+        member_aids=member_aids,
+        epoch_chain=epoch_chain,
+        pending_rotation_id=pending_rotation_id,
+        epoch_chain_unverified=epoch_chain_unverified,
+        epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+        old_epoch_retention_ms=OLD_EPOCH_RETENTION_SECONDS * 1000,
+    ))
 
 
 def _cleanup_keystore_group_old_epochs(
@@ -212,6 +262,8 @@ class E2EEManager:
         self._identity_fn = identity_fn
         self._device_id_fn = device_id_fn or (lambda: "")
         self._keystore_ref = keystore
+        self._cache_lock = threading.RLock()
+        self._prekey_load_lock = threading.Lock()
         # 本地防重放 seen set（值为 timestamp，支持 TTL 清理）
         self._seen_messages: dict[str, float] = {}
         self._seen_max_size = 50000
@@ -281,19 +333,30 @@ class E2EEManager:
                 )
                 return None
 
-        # 本地防重放：先检查，解密成功后再记录。
+        # 本地防重放：检查通过后先预占，解密失败再释放，避免并发重复解密同一消息。
         message_id = message.get("message_id", "")
         from_aid = message.get("from", "")
         seen_key = ""
+        reserved_seen = False
         if message_id and from_aid:
             seen_key = f"{from_aid}:{message_id}"
-            if seen_key in self._seen_messages:
-                return None  # 重放消息
+            with self._cache_lock:
+                if seen_key in self._seen_messages:
+                    return None  # 重放消息
+                self._seen_messages[seen_key] = _time_mod.time()
+                self._trim_seen_set_locked()
+                reserved_seen = True
 
-        result = self._decrypt_message(message, source=source)
-        if result is not None and seen_key:
-            self._seen_messages[seen_key] = _time_mod.time()
-            self._trim_seen_set()
+        try:
+            result = self._decrypt_message(message, source=source)
+        except Exception:
+            if reserved_seen:
+                with self._cache_lock:
+                    self._seen_messages.pop(seen_key, None)
+            raise
+        if result is None and reserved_seen:
+            with self._cache_lock:
+                self._seen_messages.pop(seen_key, None)
         return result
 
     def _should_decrypt_for_current_aid(self, message: dict[str, Any], payload: dict[str, Any]) -> bool:
@@ -313,6 +376,10 @@ class E2EEManager:
         return str(target_aid) == str(current_aid)
 
     def _trim_seen_set(self) -> None:
+        with self._cache_lock:
+            self._trim_seen_set_locked()
+
+    def _trim_seen_set_locked(self) -> None:
         # 先按 TTL 清理过期条目
         now = _time_mod.time()
         expired = [k for k, t in self._seen_messages.items() if now - t > self._seen_ttl]
@@ -332,31 +399,35 @@ class E2EEManager:
 
     def clean_expired_caches(self) -> None:
         """清理过期的 prekey 缓存和 seen set 条目（供外部定时调用）"""
-        now = _time_mod.time()
-        for k in list(self._prekey_cache):
-            _, expire_at = self._prekey_cache[k]
-            if now >= expire_at:
-                del self._prekey_cache[k]
-        self._trim_seen_set()
+        with self._cache_lock:
+            now = _time_mod.time()
+            for k in list(self._prekey_cache):
+                _, expire_at = self._prekey_cache[k]
+                if now >= expire_at:
+                    del self._prekey_cache[k]
+            self._trim_seen_set_locked()
 
     def cache_prekey(self, peer_aid: str, prekey: dict[str, Any]) -> None:
         """缓存对方的 prekey（调用方获取后存入，后续 encrypt 自动复用）"""
-        self._prekey_cache[peer_aid] = (prekey, _time_mod.time() + self._prekey_cache_ttl)
+        with self._cache_lock:
+            self._prekey_cache[peer_aid] = (prekey, _time_mod.time() + self._prekey_cache_ttl)
 
     def get_cached_prekey(self, peer_aid: str) -> dict[str, Any] | None:
         """获取缓存的 prekey（过期返回 None）"""
-        cached = self._prekey_cache.get(peer_aid)
-        if cached is None:
-            return None
-        prekey, expire_at = cached
-        if _time_mod.time() >= expire_at:
-            del self._prekey_cache[peer_aid]
-            return None
-        return prekey
+        with self._cache_lock:
+            cached = self._prekey_cache.get(peer_aid)
+            if cached is None:
+                return None
+            prekey, expire_at = cached
+            if _time_mod.time() >= expire_at:
+                del self._prekey_cache[peer_aid]
+                return None
+            return prekey
 
     def invalidate_prekey_cache(self, peer_aid: str) -> None:
         """使指定 peer 的 prekey 缓存失效"""
-        self._prekey_cache.pop(peer_aid, None)
+        with self._cache_lock:
+            self._prekey_cache.pop(peer_aid, None)
 
     # ── 加密 ─────────────────────────────────────────────────
 
@@ -675,7 +746,7 @@ class E2EEManager:
     def _decrypt_message(self, message: dict[str, Any], *, source: str = "") -> dict[str, Any] | None:
         payload = message["payload"]
         if isinstance(payload, dict) and not self._should_decrypt_for_current_aid(message, payload):
-            return None
+            return message
         encryption_mode = payload.get("encryption_mode", "")
 
         # 验证发送方签名（适用于所有模式）
@@ -709,8 +780,12 @@ class E2EEManager:
             prekey_private_key = self._load_prekey_private_key(keystore, prekey_id)
             if prekey_private_key is None:
                 src_tag = f" [{source}]" if source else ""
-                if prekey_id not in self._missing_prekey_ids:
-                    self._missing_prekey_ids.add(prekey_id)
+                should_log_missing = False
+                with self._cache_lock:
+                    if prekey_id not in self._missing_prekey_ids:
+                        self._missing_prekey_ids.add(prekey_id)
+                        should_log_missing = True
+                if should_log_missing:
                     _e2ee_log.warning("prekey 私钥不存在（不可恢复）%s: prekey_id=%s mid=%s seq=%s from=%s",
                                       src_tag, prekey_id,
                                       message.get("message_id", "?"), message.get("seq", "?"),
@@ -937,7 +1012,8 @@ class E2EEManager:
         _e2ee_log.info("prekey 生成并保存: prekey_id=%s aid=%s device_id=%s", prekey_id, aid, device_id)
 
         # 内存缓存私钥（即使磁盘 metadata 被覆盖也不丢）
-        self._local_prekey_cache[prekey_id] = private_key
+        with self._cache_lock:
+            self._local_prekey_cache[prekey_id] = private_key
 
         # 清理超过保留窗口且不在最新 7 个内的旧 prekey 私钥
         self._cleanup_expired_prekeys(keystore, aid, device_id)
@@ -960,22 +1036,41 @@ class E2EEManager:
         now_ms = int(_time_mod.time() * 1000)
         cutoff_ms = now_ms - PREKEY_RETENTION_SECONDS * 1000
         expired = _cleanup_keystore_prekeys(keystore, aid, device_id, cutoff_ms, PREKEY_MIN_KEEP_COUNT)
-        for pid in expired:
-            self._local_prekey_cache.pop(pid, None)  # 同步清理内存缓存
+        if expired:
+            with self._cache_lock:
+                for pid in expired:
+                    self._local_prekey_cache.pop(pid, None)  # 同步清理内存缓存
 
     def _load_prekey_private_key(self, keystore: Any, prekey_id: str) -> ec.EllipticCurvePrivateKey | None:
         """从内存缓存或 keystore 加载 prekey 私钥"""
-        # 优先从内存缓存获取（不受磁盘 metadata 覆盖影响）
-        cached = self._local_prekey_cache.get(prekey_id)
-        if cached is not None:
-            _e2ee_log.debug("prekey %s 从内存缓存命中", prekey_id)
-            return cached
-
         aid = self._current_aid()
         if not aid:
             _e2ee_log.warning("prekey %s 查找失败: AID 不可用", prekey_id)
             return None
         device_id = self._current_device_id()
+
+        with self._cache_lock:
+            cached = self._local_prekey_cache.get(prekey_id)
+            if cached is not None:
+                _e2ee_log.debug("prekey %s 从内存缓存命中", prekey_id)
+                return cached
+
+        with self._prekey_load_lock:
+            with self._cache_lock:
+                cached = self._local_prekey_cache.get(prekey_id)
+                if cached is not None:
+                    _e2ee_log.debug("prekey %s 从内存缓存命中", prekey_id)
+                    return cached
+
+            return self._load_prekey_private_key_uncached(keystore, aid, device_id, prekey_id)
+
+    def _load_prekey_private_key_uncached(
+        self,
+        keystore: Any,
+        aid: str,
+        device_id: str,
+        prekey_id: str,
+    ) -> ec.EllipticCurvePrivateKey | None:
         prekeys = _load_keystore_prekeys(keystore, aid, device_id)
         _e2ee_log.debug("prekey %s keystore 查找: aid=%s device_id=%s 本地prekey总数=%d 命中=%s",
                         prekey_id, aid, device_id, len(prekeys), prekey_id in prekeys)
@@ -1005,7 +1100,8 @@ class E2EEManager:
         try:
             pk = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
             if isinstance(pk, ec.EllipticCurvePrivateKey):
-                self._local_prekey_cache[prekey_id] = pk
+                with self._cache_lock:
+                    self._local_prekey_cache[prekey_id] = pk
                 return pk
         except Exception as exc:
             _e2ee_log.warning("prekey %s 私钥 PEM 加载失败: %s", prekey_id, exc)
@@ -1479,6 +1575,44 @@ def compute_membership_commitment(
     return digest.finalize().hex()
 
 
+# ── Epoch Transcript Chain ──────────────────────────────────
+
+_EPOCH_CHAIN_GENESIS_PREFIX = b"aun-epoch-chain:genesis"
+
+
+def compute_epoch_chain(
+    prev_chain: str | None,
+    epoch: int,
+    commitment: str,
+    rotator_aid: str,
+) -> str:
+    """计算当前 epoch 的 transcript chain hash。
+
+    epoch_chain[1] = SHA-256(GENESIS_PREFIX | epoch_bytes(4BE) | commitment_utf8 | rotator_aid_utf8)
+    epoch_chain[n] = SHA-256(prev_chain_bytes(32) | epoch_bytes(4BE) | commitment_utf8 | rotator_aid_utf8)
+
+    链式绑定每个 epoch 的 commitment（含 group_secret 哈希）与操作者身份，
+    可检测 epoch 回滚、分叉、phantom rotation 等攻击。
+    """
+    prefix = _EPOCH_CHAIN_GENESIS_PREFIX if prev_chain is None else bytes.fromhex(prev_chain)
+    data = prefix + epoch.to_bytes(4, "big") + commitment.encode("utf-8") + rotator_aid.encode("utf-8")
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
+    return digest.finalize().hex()
+
+
+def verify_epoch_chain(
+    epoch_chain: str,
+    prev_chain: str | None,
+    epoch: int,
+    commitment: str,
+    rotator_aid: str,
+) -> bool:
+    """验证 epoch_chain 是否与预期一致。"""
+    expected = compute_epoch_chain(prev_chain, epoch, commitment, rotator_aid)
+    return _hmac.compare_digest(expected.encode("utf-8"), epoch_chain.encode("utf-8"))
+
+
 def verify_membership_commitment(
     commitment: str,
     member_aids: list[str],
@@ -1512,10 +1646,16 @@ def store_group_secret(
     group_secret: bytes,
     commitment: str,
     member_aids: list[str],
+    epoch_chain: str | None = None,
+    pending_rotation_id: str = "",
+    allow_pending_overwrite: bool = False,
+    epoch_chain_unverified: bool | None = None,
+    epoch_chain_unverified_reason: str | None = None,
 ) -> bool:
     """存储 group_secret 到 keystore。
 
     sqlite 主存时按 group_id 独立存取；自定义 keystore 未实现结构化接口时回退到 metadata。
+    epoch_chain: 可选的 Epoch Transcript Chain hash，用于检测 epoch 回滚/分叉。
     """
     lock_key = f"{aid}:{group_id}"
     with _group_secret_locks_guard:
@@ -1523,7 +1663,73 @@ def store_group_secret(
     with lock:
         return _store_group_secret_locked(
             keystore, aid, group_id, epoch, group_secret, commitment, member_aids,
+            epoch_chain=epoch_chain,
+            pending_rotation_id=pending_rotation_id,
+            allow_pending_overwrite=allow_pending_overwrite,
+            epoch_chain_unverified=epoch_chain_unverified,
+            epoch_chain_unverified_reason=epoch_chain_unverified_reason,
         )
+
+
+def store_group_secret_epoch(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+    epoch: int,
+    group_secret: bytes,
+    commitment: str,
+    member_aids: list[str],
+    epoch_chain: str | None = None,
+    pending_rotation_id: str = "",
+    epoch_chain_unverified: bool | None = None,
+    epoch_chain_unverified_reason: str | None = None,
+) -> bool:
+    """保存指定 epoch key。低于 current 时写入 old epoch，不覆盖 current。"""
+    lock_key = f"{aid}:{group_id}"
+    with _group_secret_locks_guard:
+        lock = _group_secret_locks.setdefault(lock_key, threading.RLock())
+    with lock:
+        secret_b64 = base64.b64encode(group_secret).decode("ascii")
+        epoch_i = int(epoch)
+        members = sorted(member_aids)
+        pending_id = str(pending_rotation_id or "").strip()
+        row_result = _store_keystore_group_epoch(
+            keystore,
+            aid,
+            group_id,
+            epoch=epoch_i,
+            secret=secret_b64,
+            commitment=commitment,
+            member_aids=members,
+            epoch_chain=epoch_chain,
+            pending_rotation_id=pending_id,
+            epoch_chain_unverified=epoch_chain_unverified,
+            epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+        )
+        if row_result is not None:
+            return row_result
+        raise AttributeError(f"keystore {type(keystore).__name__} 缺少 store_group_secret_epoch 方法")
+
+
+def discard_pending_group_secret(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+    epoch: int,
+    rotation_id: str,
+) -> bool:
+    """丢弃指定 rotation 写入的本地 pending epoch key。"""
+    rotation_id = str(rotation_id or "").strip()
+    if not rotation_id:
+        return False
+    lock_key = f"{aid}:{group_id}"
+    with _group_secret_locks_guard:
+        lock = _group_secret_locks.setdefault(lock_key, threading.RLock())
+    with lock:
+        discard_fn = getattr(keystore, "discard_pending_group_secret_state", None)
+        if callable(discard_fn):
+            return bool(discard_fn(aid, group_id, epoch, rotation_id))
+        raise AttributeError(f"keystore {type(keystore).__name__} 缺少 discard_pending_group_secret_state 方法")
 
 
 def _store_group_secret_locked(
@@ -1534,59 +1740,29 @@ def _store_group_secret_locked(
     group_secret: bytes,
     commitment: str,
     member_aids: list[str],
+    *,
+    epoch_chain: str | None = None,
+    pending_rotation_id: str = "",
+    allow_pending_overwrite: bool = False,
+    epoch_chain_unverified: bool | None = None,
+    epoch_chain_unverified_reason: str | None = None,
 ) -> bool:
-    existing = _load_keystore_group_state(keystore, aid, group_id)
-    if existing and existing.get("epoch") is not None:
-        local_epoch = existing["epoch"]
-        if epoch < local_epoch:
-            return False
-        # epoch 相等时：校验密钥一致性，允许更新 member_aids/commitment（成员变更场景）
-        if epoch == local_epoch and existing.get("secret"):
-            # 校验 group_secret 是否一致
-            incoming_secret_enc = base64.b64encode(group_secret).decode("ascii")
-            if existing.get("secret") != incoming_secret_enc:
-                _e2ee_log.warning(
-                    "群 %s epoch=%d 密钥不一致：本地已有不同 secret，拒绝覆盖",
-                    group_id, epoch,
-                )
-                return False
-            old_members = sorted(existing.get("member_aids", []))
-            new_members = sorted(member_aids)
-            if old_members != new_members and new_members:
-                # 成员列表有变化 → 更新 member_aids + commitment，保留原 secret
-                existing["member_aids"] = new_members
-                existing["commitment"] = commitment
-                existing["updated_at"] = int(_time_mod.time() * 1000)
-                _save_keystore_group_state(keystore, aid, group_id, existing)
-            return True
-
-    old_epochs = copy.deepcopy(existing.get("old_epochs", [])) if isinstance(existing, dict) else []
-    now_ms = int(_time_mod.time() * 1000)
-    if existing and existing.get("epoch") != epoch:
-        old_entry = {
-            "epoch": existing.get("epoch"),
-            "secret": existing.get("secret"),
-            "commitment": existing.get("commitment"),
-            "member_aids": existing.get("member_aids"),
-            "updated_at": existing.get("updated_at"),
-            "expires_at": int(existing.get("updated_at", now_ms)) + OLD_EPOCH_RETENTION_SECONDS * 1000,
-        }
-        old_epochs.append(old_entry)
-
-    _save_keystore_group_state(
+    transition_result = _store_keystore_group_transition(
         keystore,
         aid,
         group_id,
-        {
-            "epoch": epoch,
-            "secret": base64.b64encode(group_secret).decode("ascii"),
-            "commitment": commitment,
-            "member_aids": sorted(member_aids),
-            "updated_at": now_ms,
-            "old_epochs": old_epochs,
-        },
+        epoch=epoch,
+        secret=base64.b64encode(group_secret).decode("ascii"),
+        commitment=commitment,
+        member_aids=sorted(member_aids),
+        epoch_chain=epoch_chain,
+        pending_rotation_id=pending_rotation_id,
+        epoch_chain_unverified=epoch_chain_unverified,
+        epoch_chain_unverified_reason=epoch_chain_unverified_reason,
     )
-    return True
+    if transition_result is not None:
+        return transition_result
+    raise AttributeError(f"keystore {type(keystore).__name__} 缺少 store_group_secret_transition 方法")
 
 def load_group_secret(
     keystore: Any,
@@ -1600,35 +1776,103 @@ def load_group_secret(
     指定 epoch 时先查当前，再查 old_epochs。
     返回的 dict 包含 epoch, secret(bytes), commitment, member_aids。
     """
-    entry = _load_keystore_group_state(keystore, aid, group_id)
+    entry = _load_keystore_group_epoch(keystore, aid, group_id, epoch)
     if entry is None:
         return None
 
-    if epoch is None or entry.get("epoch") == epoch:
-        secret_str = entry.get("secret")
-        if not secret_str:
-            return None
-        return {
-            "epoch": entry["epoch"],
-            "secret": base64.b64decode(secret_str),
-            "commitment": entry.get("commitment"),
-            "member_aids": entry.get("member_aids", []),
-        }
+    secret_str = entry.get("secret")
+    if not secret_str:
+        return None
+    return {
+        "epoch": entry["epoch"],
+        "secret": base64.b64decode(secret_str),
+        "commitment": entry.get("commitment"),
+        "member_aids": entry.get("member_aids", []),
+        "epoch_chain": entry.get("epoch_chain"),
+        "pending_rotation_id": entry.get("pending_rotation_id"),
+        "epoch_chain_unverified": entry.get("epoch_chain_unverified"),
+        "epoch_chain_unverified_reason": entry.get("epoch_chain_unverified_reason"),
+    }
 
-    # 查 old_epochs
-    for old in entry.get("old_epochs", []):
-        if old.get("epoch") == epoch:
-            secret_str = old.get("secret")
-            if not secret_str:
-                return None
-            return {
-                "epoch": old["epoch"],
-                "secret": base64.b64decode(secret_str),
-                "commitment": old.get("commitment"),
-                "member_aids": old.get("member_aids", []),
-            }
 
-    return None
+def _assess_incoming_epoch_chain(
+    keystore: Any,
+    aid: str,
+    group_id: str,
+    epoch: int,
+    commitment: str,
+    incoming_chain: str | None,
+    rotation_id: str,
+    rotator_aid: str,
+    source: str,
+) -> tuple[bool, bool | None, str | None]:
+    incoming_chain = str(incoming_chain or "").strip()
+    rotation_id = str(rotation_id or "").strip()
+    rotator_aid = str(rotator_aid or "").strip()
+
+    if rotation_id and not incoming_chain:
+        _e2ee_log.warning(
+            "拒绝缺少 epoch_chain 的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
+            source, group_id, epoch, rotation_id,
+        )
+        return False, None, None
+
+    current_data = load_group_secret(keystore, aid, group_id)
+    if current_data and int(current_data.get("epoch") or 0) == int(epoch):
+        current_chain = str(current_data.get("epoch_chain") or "")
+        current_pending_rotation_id = str(current_data.get("pending_rotation_id") or "")
+        if incoming_chain and current_chain == incoming_chain:
+            return True, None, None
+        if rotation_id and incoming_chain and current_chain and current_chain != incoming_chain:
+            if current_pending_rotation_id and current_pending_rotation_id != rotation_id:
+                # 本地同 epoch 仍是未提交 pending secret。服务端可能因成员集变化废弃旧
+                # rotation 并重新 begin 同一 target_epoch；继续用上一 epoch 校验 incoming。
+                pass
+            else:
+                _e2ee_log.warning(
+                    "拒绝同 epoch 分叉 chain: source=%s group=%s epoch=%s rotation=%s",
+                    source, group_id, epoch, rotation_id,
+                )
+                return False, None, None
+        elif rotation_id and incoming_chain and current_pending_rotation_id == rotation_id and current_chain and current_chain != incoming_chain:
+            _e2ee_log.warning(
+                "拒绝同 epoch 分叉 chain: source=%s group=%s epoch=%s rotation=%s",
+                source, group_id, epoch, rotation_id,
+            )
+            return False, None, None
+
+    prev_data = load_group_secret(keystore, aid, group_id, int(epoch) - 1)
+    prev_chain = str(prev_data.get("epoch_chain") or "") if prev_data else ""
+
+    if not incoming_chain:
+        return True, True, "missing_epoch_chain"
+    if not prev_chain:
+        return True, True, "missing_prev_chain"
+    if not rotator_aid:
+        if rotation_id:
+            _e2ee_log.warning(
+                "拒绝缺少 rotator_aid 的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
+                source, group_id, epoch, rotation_id,
+            )
+            return False, None, None
+        return True, True, "missing_rotator_aid"
+
+    if not verify_epoch_chain(incoming_chain, prev_chain, epoch, commitment, rotator_aid):
+        if rotation_id:
+            _e2ee_log.warning(
+                "拒绝 epoch chain 验证失败的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
+                source, group_id, epoch, rotation_id,
+            )
+            return False, None, None
+        _e2ee_log.warning(
+            "epoch chain 验证失败，按兼容档接收并标记未验证: source=%s group=%s epoch=%s",
+            source, group_id, epoch,
+        )
+        return True, True, "chain_mismatch_legacy"
+
+    if not rotation_id:
+        return True, True, "missing_rotation_id"
+    return True, False, None
 
 
 def load_all_group_secrets(
@@ -1640,19 +1884,11 @@ def load_all_group_secrets(
 
     返回 {epoch: secret_bytes} 映射，可直接传入 decrypt_group_message。
     """
-    entry = _load_keystore_group_state(keystore, aid, group_id)
-    if entry is None:
-        return {}
-
     result: dict[int, bytes] = {}
-    secret_str = entry.get("secret")
-    if secret_str and entry.get("epoch") is not None:
-        result[entry["epoch"]] = base64.b64decode(secret_str)
-
-    for old in entry.get("old_epochs", []):
-        old_secret = old.get("secret")
-        if old_secret and old.get("epoch") is not None:
-            result[old["epoch"]] = base64.b64decode(old_secret)
+    for entry in _load_keystore_group_epochs(keystore, aid, group_id):
+        secret_str = entry.get("secret")
+        if secret_str and entry.get("epoch") is not None:
+            result[int(entry["epoch"])] = base64.b64decode(secret_str)
 
     return result
 
@@ -1764,11 +2000,13 @@ def build_key_distribution(
     member_aids: list[str],
     distributed_by: str,
     manifest: dict[str, Any] | None = None,
+    epoch_chain: str | None = None,
 ) -> dict[str, Any]:
     """构建 group key 分发消息 payload。
 
     此 payload 应通过 P2P E2EE 通道逐个发送给每个群成员。
     manifest: 可选的已签名 Membership Manifest，附加后接收方可验证成员变更授权。
+    epoch_chain: 可选的 Epoch Transcript Chain hash，附加后接收方可验证 epoch 连续性。
     """
     commitment = compute_membership_commitment(member_aids, epoch, group_id, group_secret)
     result = {
@@ -1783,6 +2021,8 @@ def build_key_distribution(
     }
     if manifest:
         result["manifest"] = manifest
+    if epoch_chain:
+        result["epoch_chain"] = epoch_chain
     return result
 
 
@@ -1837,7 +2077,26 @@ def handle_key_distribution(
     if not verify_membership_commitment(commitment, member_aids, epoch, group_id, aid, group_secret):
         return False
 
-    return store_group_secret(keystore, aid, group_id, epoch, group_secret, commitment, member_aids)
+    incoming_chain = payload.get("epoch_chain")
+    rotation_id = str(payload.get("rotation_id") or "")
+    chain_ok, chain_unverified, chain_reason = _assess_incoming_epoch_chain(
+        keystore, aid, group_id, int(epoch), commitment,
+        str(incoming_chain or "") or None,
+        rotation_id,
+        str(payload.get("distributed_by") or payload.get("rotator_aid") or ""),
+        "key_distribution",
+    )
+    if not chain_ok:
+        return False
+
+    return store_group_secret(
+        keystore, aid, group_id, epoch, group_secret, commitment, member_aids,
+        epoch_chain=str(incoming_chain or "") or None,
+        pending_rotation_id=rotation_id,
+        allow_pending_overwrite=bool(rotation_id),
+        epoch_chain_unverified=chain_unverified,
+        epoch_chain_unverified_reason=chain_reason,
+    )
 
 
 def build_key_request(
@@ -1904,6 +2163,9 @@ def handle_key_request(
         "responder_aid": aid,
         "issued_at": int(_time_mod.time() * 1000),
     }
+    epoch_chain = secret_data.get("epoch_chain")
+    if epoch_chain:
+        response["epoch_chain"] = epoch_chain
     if private_key_pem:
         response = sign_group_key_response(response, private_key_pem)
     return response
@@ -1975,7 +2237,25 @@ def handle_key_response(
         if manifest_members and sorted(manifest_members) != sorted(member_aids):
             return False
 
-    return store_group_secret(keystore, aid, group_id, epoch, group_secret, commitment, member_aids)
+    incoming_chain = payload.get("epoch_chain")
+    rotation_id = str(payload.get("rotation_id") or "")
+    chain_ok, chain_unverified, chain_reason = _assess_incoming_epoch_chain(
+        keystore, aid, group_id, int(epoch), commitment,
+        str(incoming_chain or "") or None,
+        rotation_id,
+        str(payload.get("distributed_by") or payload.get("rotator_aid") or payload.get("responder_aid") or ""),
+        "key_response",
+    )
+    if not chain_ok:
+        return False
+
+    return store_group_secret_epoch(
+        keystore, aid, group_id, epoch, group_secret, commitment, member_aids,
+        epoch_chain=str(incoming_chain or "") or None,
+        pending_rotation_id=rotation_id,
+        epoch_chain_unverified=chain_unverified,
+        epoch_chain_unverified_reason=chain_reason,
+    )
 
 
 # ── GroupE2EEManager ─────────────────────────────────────────
@@ -2032,11 +2312,14 @@ class GroupE2EEManager:
         gs = generate_group_secret()
         epoch = 1
         commitment = compute_membership_commitment(member_aids, epoch, group_id, gs)
-        store_group_secret(self._keystore(), aid, group_id, epoch, gs, commitment, member_aids)
+        epoch_chain = compute_epoch_chain(None, epoch, commitment, aid)
+        store_group_secret(self._keystore(), aid, group_id, epoch, gs, commitment, member_aids,
+                           epoch_chain=epoch_chain)
         manifest = self._sign_manifest(build_membership_manifest(
             group_id, epoch, None, member_aids, initiator_aid=aid,
         ))
-        dist_payload = build_key_distribution(group_id, epoch, gs, member_aids, aid, manifest=manifest)
+        dist_payload = build_key_distribution(group_id, epoch, gs, member_aids, aid,
+                                              manifest=manifest, epoch_chain=epoch_chain)
         return {
             "epoch": epoch, "commitment": commitment,
             "distributions": [{"to": m, "payload": dist_payload} for m in member_aids if m != aid],
@@ -2048,35 +2331,49 @@ class GroupE2EEManager:
         ks = self._keystore()
         current = load_group_secret(ks, aid, group_id)
         prev_epoch = current["epoch"] if current else None
+        prev_chain = current.get("epoch_chain") if current else None
         new_epoch = (prev_epoch or 0) + 1
         gs = generate_group_secret()
         commitment = compute_membership_commitment(member_aids, new_epoch, group_id, gs)
-        stored = store_group_secret(ks, aid, group_id, new_epoch, gs, commitment, member_aids)
+        epoch_chain = compute_epoch_chain(prev_chain, new_epoch, commitment, aid)
+        stored = store_group_secret(ks, aid, group_id, new_epoch, gs, commitment, member_aids,
+                                    epoch_chain=epoch_chain)
         if not stored:
             raise RuntimeError(f"group {group_id} epoch {new_epoch} secret already exists or is newer; abort distribution")
         manifest = self._sign_manifest(build_membership_manifest(
             group_id, new_epoch, prev_epoch, member_aids, initiator_aid=aid,
         ))
-        dist_payload = build_key_distribution(group_id, new_epoch, gs, member_aids, aid, manifest=manifest)
+        dist_payload = build_key_distribution(group_id, new_epoch, gs, member_aids, aid,
+                                              manifest=manifest, epoch_chain=epoch_chain)
         return {
             "epoch": new_epoch, "commitment": commitment,
             "distributions": [{"to": m, "payload": dist_payload} for m in member_aids if m != aid],
         }
 
     def rotate_epoch_to(
-        self, group_id: str, target_epoch: int, member_aids: list[str],
+        self, group_id: str, target_epoch: int, member_aids: list[str], *, rotation_id: str = "",
     ) -> dict[str, Any]:
         """指定目标 epoch 号轮换（配合服务端 CAS 使用）。"""
         aid = self._current_aid()
+        ks = self._keystore()
+        current = load_group_secret(ks, aid, group_id, target_epoch - 1) or load_group_secret(ks, aid, group_id)
+        prev_chain = current.get("epoch_chain") if current else None
         gs = generate_group_secret()
         commitment = compute_membership_commitment(member_aids, target_epoch, group_id, gs)
-        stored = store_group_secret(self._keystore(), aid, group_id, target_epoch, gs, commitment, member_aids)
+        epoch_chain = compute_epoch_chain(prev_chain, target_epoch, commitment, aid)
+        stored = store_group_secret(ks, aid, group_id, target_epoch, gs, commitment, member_aids,
+                                    epoch_chain=epoch_chain,
+                                    pending_rotation_id=rotation_id,
+                                    allow_pending_overwrite=bool(rotation_id))
         if not stored:
             raise RuntimeError(f"group {group_id} epoch {target_epoch} secret already exists or is newer; abort distribution")
         manifest = self._sign_manifest(build_membership_manifest(
             group_id, target_epoch, target_epoch - 1, member_aids, initiator_aid=aid,
         ))
-        dist_payload = build_key_distribution(group_id, target_epoch, gs, member_aids, aid, manifest=manifest)
+        dist_payload = build_key_distribution(group_id, target_epoch, gs, member_aids, aid,
+                                              manifest=manifest, epoch_chain=epoch_chain)
+        if rotation_id:
+            dist_payload["rotation_id"] = rotation_id
         return {
             "epoch": target_epoch, "commitment": commitment,
             "distributions": [{"to": m, "payload": dist_payload} for m in member_aids if m != aid],
@@ -2085,11 +2382,19 @@ class GroupE2EEManager:
     def store_secret(
         self, group_id: str, epoch: int, group_secret_bytes: bytes,
         commitment: str, member_aids: list[str],
+        epoch_chain: str | None = None,
     ) -> bool:
         """手动存储 group_secret。返回 False 表示 epoch 降级被拒。"""
         return store_group_secret(
             self._keystore(), self._current_aid(), group_id, epoch,
             group_secret_bytes, commitment, member_aids,
+            epoch_chain=epoch_chain,
+        )
+
+    def discard_pending_secret(self, group_id: str, epoch: int, rotation_id: str) -> bool:
+        """仅回滚指定 pending rotation 的本地 target epoch key。"""
+        return discard_pending_group_secret(
+            self._keystore(), self._current_aid(), group_id, epoch, rotation_id,
         )
 
     def load_secret(self, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
@@ -2112,6 +2417,30 @@ class GroupE2EEManager:
         secret_data = load_group_secret(self._keystore(), aid, group_id)
         if secret_data is None:
             raise E2EEGroupSecretMissingError(f"no group secret for {group_id}")
+        return self._encrypt_with_secret_data(
+            group_id, payload, secret_data,
+            message_id=message_id, timestamp=timestamp,
+        )
+
+    def encrypt_with_epoch(
+        self, group_id: str, epoch: int, payload: dict[str, Any], *,
+        message_id: str | None = None, timestamp: int | None = None,
+    ) -> dict[str, Any]:
+        """使用指定 epoch 加密群消息。"""
+        aid = self._current_aid()
+        secret_data = load_group_secret(self._keystore(), aid, group_id, epoch)
+        if secret_data is None:
+            raise E2EEGroupSecretMissingError(f"no group secret for {group_id} epoch {epoch}")
+        return self._encrypt_with_secret_data(
+            group_id, payload, secret_data,
+            message_id=message_id, timestamp=timestamp,
+        )
+
+    def _encrypt_with_secret_data(
+        self, group_id: str, payload: dict[str, Any], secret_data: dict[str, Any], *,
+        message_id: str | None = None, timestamp: int | None = None,
+    ) -> dict[str, Any]:
+        aid = self._current_aid()
         # 获取发送方私钥用于签名
         identity = self._identity_fn()
         sender_pk_pem = identity.get("private_key_pem") if identity else None

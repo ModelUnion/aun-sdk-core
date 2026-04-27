@@ -1,18 +1,18 @@
 # AUN SDK Python 文档查阅指南
 
-AUN SDK 文档在 `python/docs/` 下，索引文件 `python/docs/INDEX.md` 分三层，**严格按需逐层加载，禁止一次性读取整个索引**。
+AUN SDK 文档在 `sdk-core/` 下，索引文件 `sdk-core/INDEX.md` 分三层，**严格按需逐层加载，禁止一次性读取整个索引**。
 
 行区间格式：`L43-49` 表示用 Read 工具读取时读取第 43 行到 49 行。
 
 ## SDK 文档定位
 
-SDK 文档聚焦两大核心封装：**认证（`client.auth`）** 和 **E2EE（`client.e2ee`）**。
+SDK 文档聚焦核心封装：**认证（`client.auth`）**、**元信息与信任根（`client.meta`）** 和 **E2EE（`client.e2ee`）**。
 
-其他业务操作（消息、群组、存储等）通过 `client.call(method, params)` 调用 RPC 方法，参数和响应格式见 RPC 手册：`src/aun_core/docs/skill/rpc-manual/`。
+其他业务操作（消息、群组、存储等）通过 `client.call(method, params)` 调用 RPC 方法，参数和响应格式见 `rpc-manual/`；`message.send` / `group.send` 的业务 payload 共用格式见 `sdk-core/消息Payload参考约定.md`。
 
 ## 渐进式查阅流程
 
-### Step 1：只读 Layer 1（L10-24）
+### Step 1：只读 Layer 1（L7-29）
 
 列出所有文档名和章节行区间。能直接定位目标 → 跳 Step 4。
 
@@ -20,13 +20,13 @@ SDK 文档聚焦两大核心封装：**认证（`client.auth`）** 和 **E2EE（
 
 仅当 Step 1 不够时，按关键词读：
 
-身份与认证 L29-35 · 连接与状态 L37-42 · E2EE L44-51 · RPC与事件 L53-58 · 配置与存储 L60-68 · 错误处理 L70-74
+身份与认证 L35-39 · 连接与状态 L41-46 · E2EE L48-54 · RPC与事件 L56-67 · 配置与存储 L69-75 · 错误处理 L77-80
 
 ### Step 3：按需读 Layer 3 单篇摘要
 
 仅当需要某篇详情但不确定读哪个章节时：
 
-快速开始 L80-82 · 核心概念 L84-86 · 连接与认证 L88-90 · E2EE加密通信 L92-94 · API参考 L96-98 · 错误处理 L100-102 · 最佳实践 L104-106
+快速开始 L86-87 · WebSocket协议 L89-90 · 核心概念 L92-93 · 连接与认证 L95-96 · E2EE加密通信 L98-99 · API参考 L101-102 · 错误处理 L104-105 · 最佳实践 L107-108 · 消息Payload L110-111
 
 大多数问题在摘要层就能解答。
 
@@ -43,9 +43,10 @@ SDK 文档聚焦两大核心封装：**认证（`client.auth`）** 和 **E2EE（
 | 03 | [核心概念](03-核心概念.md) | AID、状态机、认证、E2EE |
 | 04 | [连接与认证](04-连接与认证.md) | 认证封装、call()、on()、连接 |
 | 05 | [E2EE加密通信](05-E2EE加密通信.md) | E2EE封装、自定义存储 |
-| 06 | [API手册](06-API手册.md) | AUNClient / AuthNamespace / E2EEManager |
+| 06 | [API手册](06-API手册.md) | AUNClient / AuthNamespace / MetaNamespace（信任根列表与 issuer root 更新） / E2EEManager |
 | 07 | [错误处理](07-错误处理.md) | 错误类层级、错误码、重试 |
 | 08 | [最佳实践](08-最佳实践.md) | 幂等、隔离、资源清理 |
+| - | [消息Payload参考约定](消息Payload参考约定.md) | `message.send` / `group.send` 共用业务负载格式、类型总览、附件引用 |
 
 ## 常见查阅场景
 
@@ -56,7 +57,8 @@ SDK 文档聚焦两大核心封装：**认证（`client.auth`）** 和 **E2EE（
 | 理解 AID / E2EE 原理 | 03-核心概念 对应章节 |
 | 认证 + 连接 + call/on 用法 | 04-连接与认证 |
 | 需要加密通信 | 05-E2EE加密通信 |
+| 查消息 payload 类型和格式 | [消息Payload参考约定](消息Payload参考约定.md) |
 | 查某个方法的签名 | 06-API手册 |
 | 遇到报错需排查 | 07-错误处理 |
 | 部署前检查 | 08-最佳实践 |
-| 查 RPC 方法参数 | `src/aun_core/docs/skill/rpc-manual/` |
+| 查 RPC 方法参数 | `rpc-manual/` |

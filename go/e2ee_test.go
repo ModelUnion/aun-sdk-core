@@ -14,6 +14,8 @@ import (
 	"math/big"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -198,7 +200,7 @@ func TestAADMatchesOffline(t *testing.T) {
 	aad1 := map[string]any{
 		"from": "alice", "to": "bob", "message_id": "mid1",
 		"encryption_mode": "prekey_ecdh_v2", "suite": SuiteP256,
-		"ephemeral_public_key": "epk1",
+		"ephemeral_public_key":       "epk1",
 		"recipient_cert_fingerprint": "sha256:abc", "sender_cert_fingerprint": "sha256:def",
 		"prekey_id": "pk1",
 	}
@@ -484,6 +486,58 @@ func TestLocalSeenSetBlocksDuplicate(t *testing.T) {
 	_, err = receiver.DecryptMessage(message)
 	if err == nil {
 		t.Error("重放消息应返回错误")
+	}
+}
+
+func TestLocalSeenSetBlocksConcurrentDuplicate(t *testing.T) {
+	sender, receiver, senderAID, receiverAID, _, _, _, receiverCertPEM := testMakeE2EEPair(t)
+
+	envelope, _, err := sender.EncryptOutbound(
+		receiverAID,
+		map[string]any{"type": "text", "text": "concurrent"},
+		[]byte(receiverCertPEM),
+		nil,
+		"dup-msg-concurrent",
+		time.Now().UnixMilli(),
+	)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	message := map[string]any{
+		"from":       senderAID,
+		"to":         receiverAID,
+		"message_id": "dup-msg-concurrent",
+		"timestamp":  time.Now().UnixMilli(),
+		"payload":    envelope,
+		"encrypted":  true,
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var success int32
+	var rejected int32
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := receiver.DecryptMessage(message)
+			if err == nil && result != nil {
+				atomic.AddInt32(&success, 1)
+				return
+			}
+			atomic.AddInt32(&rejected, 1)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if success != 1 {
+		t.Fatalf("并发重复消息应只有 1 次成功解密，实际成功 %d 次，拒绝 %d 次", success, rejected)
+	}
+	if rejected != workers-1 {
+		t.Fatalf("并发重复消息应拒绝 %d 次，实际拒绝 %d 次", workers-1, rejected)
 	}
 }
 

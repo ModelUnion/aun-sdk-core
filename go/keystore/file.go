@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -518,101 +519,6 @@ func (f *FileKeyStore) CleanupE2EEPrekeys(aid, deviceID string, cutoffMs int64, 
 
 // ── Group Secrets ────────────────────────────────────────────
 
-func (f *FileKeyStore) LoadGroupSecretState(aid, groupID string) (map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	current := db.LoadGroupCurrent(groupID)
-	if current == nil {
-		return nil, nil
-	}
-	if old := db.LoadGroupOldEpochs(groupID); len(old) > 0 {
-		oldAny := make([]any, len(old))
-		for i, o := range old {
-			oldAny[i] = o
-		}
-		current["old_epochs"] = oldAny
-	}
-	return current, nil
-}
-
-func (f *FileKeyStore) LoadAllGroupSecretStates(aid string) (map[string]map[string]any, error) {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
-	}
-	result := db.LoadAllGroupCurrent()
-	for gid, entry := range result {
-		if old := db.LoadGroupOldEpochs(gid); len(old) > 0 {
-			oldAny := make([]any, len(old))
-			for i, o := range old {
-				oldAny[i] = o
-			}
-			entry["old_epochs"] = oldAny
-		}
-	}
-	return result, nil
-}
-
-func (f *FileKeyStore) SaveGroupSecretState(aid, groupID string, entry map[string]any) error {
-	l := f.getLock(aid)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(aid)
-	if err != nil {
-		return err
-	}
-	db.DeleteAllGroupOldEpochs(groupID)
-	epoch, hasEpoch := int64OrNil(entry["epoch"])
-	secret, _ := entry["secret"].(string)
-	data := make(map[string]any)
-	for k, v := range entry {
-		if k != "group_id" && k != "epoch" && k != "secret" && k != "old_epochs" && k != "updated_at" {
-			data[k] = v
-		}
-	}
-	if hasEpoch {
-		db.SaveGroupCurrent(groupID, epoch, secret, data)
-	} else {
-		db.DeleteGroupCurrent(groupID)
-	}
-	if oldEpochs, ok := entry["old_epochs"].([]any); ok {
-		for _, rawOld := range oldEpochs {
-			old, ok := rawOld.(map[string]any)
-			if !ok {
-				continue
-			}
-			oldEpoch, ok := int64OrNil(old["epoch"])
-			if !ok {
-				continue
-			}
-			oldSecret, _ := old["secret"].(string)
-			oldData := make(map[string]any)
-			for k, v := range old {
-				if k != "epoch" && k != "secret" && k != "updated_at" && k != "expires_at" {
-					oldData[k] = v
-				}
-			}
-			var ua, ea *int64
-			if v, ok := int64OrNil(old["updated_at"]); ok {
-				ua = &v
-			}
-			if v, ok := int64OrNil(old["expires_at"]); ok {
-				ea = &v
-			}
-			db.SaveGroupOldEpoch(groupID, oldEpoch, oldSecret, oldData, ua, ea)
-		}
-	}
-	return nil
-}
-
 func (f *FileKeyStore) CleanupGroupOldEpochsState(aid, groupID string, cutoffMs int64) (int, error) {
 	l := f.getLock(aid)
 	l.Lock()
@@ -622,6 +528,97 @@ func (f *FileKeyStore) CleanupGroupOldEpochsState(aid, groupID string, cutoffMs 
 		return 0, err
 	}
 	return db.CleanupGroupOldEpochs(groupID, cutoffMs), nil
+}
+
+func (f *FileKeyStore) LoadGroupSecretEpoch(aid, groupID string, epoch *int) (map[string]any, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return nil, err
+	}
+	return db.LoadGroupSecretEpoch(groupID, epoch)
+}
+
+func (f *FileKeyStore) LoadGroupSecretEpochs(aid, groupID string) ([]map[string]any, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return nil, err
+	}
+	return db.LoadGroupSecretEpochs(groupID)
+}
+
+func (f *FileKeyStore) ListGroupSecretIDs(aid string) ([]string, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for gid := range db.LoadAllGroupCurrent() {
+		seen[gid] = true
+	}
+	for _, gid := range db.LoadAllGroupIDsWithOldEpochs() {
+		seen[gid] = true
+	}
+	result := make([]string, 0, len(seen))
+	for gid := range seen {
+		result = append(result, gid)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func (f *FileKeyStore) StoreGroupSecretTransition(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return false, err
+	}
+	return db.StoreGroupSecretTransition(groupID, opts)
+}
+
+func (f *FileKeyStore) StoreGroupSecretEpoch(aid, groupID string, opts GroupSecretTransitionOptions) (bool, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return false, err
+	}
+	return db.StoreGroupSecretEpoch(groupID, opts)
+}
+
+func (f *FileKeyStore) DiscardPendingGroupSecretState(aid, groupID string, epoch int, rotationID string) (bool, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return false, err
+	}
+	return db.DiscardPendingGroupSecretState(groupID, epoch, rotationID)
+}
+
+func (f *FileKeyStore) DeleteGroupSecretState(aid, groupID string) error {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return err
+	}
+	db.DeleteGroupCurrent(groupID)
+	db.DeleteAllGroupOldEpochs(groupID)
+	return nil
 }
 
 // ── Instance State ───────────────────────────────────────────
