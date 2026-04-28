@@ -42,6 +42,22 @@ describe('AUNClient 群组 E2EE 管理器', () => {
     expect(typeof ge.getMemberAids).toBe('function');
     expect(typeof ge.handleIncoming).toBe('function');
   });
+
+  it('sender membership floor 错误应作为可恢复 epoch 错误重试', () => {
+    const client = new AUNClient();
+    const err = new Error('e2ee epoch below sender membership floor: epoch=1 floor=2');
+
+    expect((client as any)._isGroupEpochTooOldError(err)).toBe(true);
+    expect((client as any)._isRecoverableGroupEpochError(err)).toBe(true);
+  });
+
+  it('epoch changed during send 错误应作为可恢复 epoch 错误重试', () => {
+    const client = new AUNClient();
+    const err = new Error('e2ee epoch changed during send: expected 1, current 2');
+
+    expect((client as any)._isGroupEpochChangedDuringSendError(err)).toBe(true);
+    expect((client as any)._isRecoverableGroupEpochError(err)).toBe(true);
+  });
 });
 
 describe('群组成员变更事件的 epoch 轮换逻辑', () => {

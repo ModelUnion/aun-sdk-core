@@ -5,7 +5,7 @@
 SDK Core 尚未发布到 PyPI，当前使用本地开发安装：
 
 ```bash
-pip install aun-core
+pip install aunp
 ```
 
 依赖项：

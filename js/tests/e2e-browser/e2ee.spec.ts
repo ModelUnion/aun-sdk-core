@@ -934,9 +934,87 @@ test.describe('Group E2EE 集成测试', () => {
         messages
           .filter(msg => !msg?.e2ee && msg?.payload?.text)
           .map(msg => msg.payload.text);
+      const truthyBool = (value: any): boolean => {
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') return value !== 0;
+        if (typeof value === 'string') {
+          return ['1', 'true', 'yes', 'y', 'on'].includes(value.trim().toLowerCase());
+        }
+        return !!value;
+      };
+      const isPlainObject = (value: any): value is Record<string, any> =>
+        value !== null && typeof value === 'object' && !Array.isArray(value);
+      const groupSecretMatchesCommittedRotation = (
+        secretData: any,
+        committedRotation: Record<string, any> | null,
+      ): boolean => {
+        if (!isPlainObject(secretData)) return false;
+        const committedCommitment = String(committedRotation?.key_commitment ?? '').trim();
+        const localCommitment = String(secretData.commitment ?? '').trim();
+        if (committedCommitment && committedCommitment !== localCommitment) return false;
+        const pendingRotationId = String(secretData.pending_rotation_id ?? '').trim();
+        if (!pendingRotationId) return true;
+        return String(committedRotation?.rotation_id ?? '').trim() === pendingRotationId;
+      };
+      const waitFor = async (
+        predicate: () => boolean | Promise<boolean>,
+        timeoutMs: number = 20_000,
+        intervalMs: number = 500,
+      ): Promise<boolean> => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (await predicate()) return true;
+          await sleep(intervalMs);
+        }
+        return false;
+      };
+      const committedGroupEpochSnapshot = async (client: any, groupId: string) => {
+        const result = await client.call('group.e2ee.get_epoch', { group_id: groupId });
+        const epoch = Number(result?.committed_epoch ?? result?.epoch ?? 0);
+        const pending = result?.pending_rotation;
+        return {
+          epoch: Number.isFinite(epoch) ? epoch : 0,
+          committedRotation: isPlainObject(result?.committed_rotation) ? result.committed_rotation : null,
+          pendingActive: isPlainObject(pending) && !truthyBool(pending.expired),
+        };
+      };
+      const waitForCommittedGroupEpochReady = async (
+        client: any,
+        groupId: string,
+        minEpoch: number,
+        timeoutMs: number = 20_000,
+      ): Promise<number> => {
+        let readyEpoch = 0;
+        let lastEpoch = 0;
+        let lastPending = false;
+        const matched = await waitFor(async () => {
+          const snapshot = await committedGroupEpochSnapshot(client, groupId);
+          lastEpoch = snapshot.epoch;
+          lastPending = snapshot.pendingActive;
+          if (snapshot.epoch < minEpoch || snapshot.pendingActive) return false;
+          const secret = await client.groupE2ee.loadSecret(groupId, snapshot.epoch);
+          if (!groupSecretMatchesCommittedRotation(secret, snapshot.committedRotation)) return false;
+          readyEpoch = snapshot.epoch;
+          return true;
+        }, timeoutMs);
+        if (!matched) {
+          throw new Error(
+            `timeout waiting committed group epoch >= ${minEpoch}; last_epoch=${lastEpoch}; pending=${lastPending}`,
+          );
+        }
+        return readyEpoch;
+      };
+      const waitForCommittedGroupEpochGreaterThan = (
+        client: any,
+        groupId: string,
+        oldEpoch: number,
+        timeoutMs: number = 20_000,
+      ): Promise<number> => waitForCommittedGroupEpochReady(client, groupId, oldEpoch + 1, timeoutMs);
 
       w.__aunGroupTest = {
         sleep,
+        waitForCommittedGroupEpochReady,
+        waitForCommittedGroupEpochGreaterThan,
         watchGroupMessages,
         byText,
         decryptedTexts,
@@ -971,7 +1049,7 @@ test.describe('Group E2EE 集成测试', () => {
 
       // Alice 加 Bob
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await H.sleep(2000); // 等待密钥分发或后续密钥恢复就绪
+      await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
       const bobWatch = await H.watchGroupMessages(bob, groupId);
 
@@ -1062,7 +1140,8 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await H.sleep(2000);
+      const oldEpoch = await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
+      await H.waitForCommittedGroupEpochReady(carol, groupId, oldEpoch, 20_000);
 
       const bobWatch = await H.watchGroupMessages(bob, groupId);
       const carolWatch = await H.watchGroupMessages(carol, groupId);
@@ -1136,12 +1215,14 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await H.sleep(2000);
+      const oldEpoch = await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
+      await H.waitForCommittedGroupEpochReady(carol, groupId, oldEpoch, 20_000);
 
       // 踢 Carol
       await alice.call('group.kick', { group_id: groupId, aid: carolAid });
-      // 等待 SDK 自动 CAS 轮换 + 分发新 epoch 密钥给 Bob
-      await H.sleep(5000);
+      // 等待 SDK 自动 CAS 轮换提交，并确认 Bob/Alice 本地密钥匹配。
+      const newEpoch = await H.waitForCommittedGroupEpochGreaterThan(bob, groupId, oldEpoch, 20_000);
+      await H.waitForCommittedGroupEpochReady(alice, groupId, newEpoch, 20_000);
 
       const bobWatch = await H.watchGroupMessages(bob, groupId);
 
@@ -1157,6 +1238,7 @@ test.describe('Group E2EE 集成测试', () => {
         return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
       });
       const msg = H.byText(msgsBob, '踢人后的消息');
+      const carolHasNewEpoch = !!await carol.groupE2ee.loadSecret(groupId, newEpoch);
 
       bobWatch.stop();
       await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
@@ -1164,17 +1246,20 @@ test.describe('Group E2EE 集成测试', () => {
       return {
         bobReceived: msgsBob.length,
         bobText: msg?.payload?.text,
-        // 验证是否有 epoch > 1 的消息（epoch 轮换）
-        hasNewEpoch: Number(msg?.e2ee?.epoch ?? 0) > 1,
+        messageEpoch: Number(msg?.e2ee?.epoch ?? 0),
+        newEpoch,
+        hasNewEpoch: Number(msg?.e2ee?.epoch ?? 0) === newEpoch,
+        carolHasNewEpoch,
       };
     }, rid);
 
     expect(result.bobReceived).toBeGreaterThan(0);
     expect(result.bobText).toBe('踢人后的消息');
     expect(result.hasNewEpoch).toBe(true);
+    expect(result.carolHasNewEpoch).toBe(false);
   });
 
-  test('新成员加入无 epoch 轮换', async ({ page }) => {
+  test('新成员加入后 epoch 轮换', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
@@ -1202,11 +1287,17 @@ test.describe('Group E2EE 集成测试', () => {
       const createResult = await alice.call('group.create', { name: `join-${rid}` });
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await H.sleep(2000);
+      const beforeCarolJoinEpoch = await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
-      // 再加 Carol（不应触发 epoch 轮换）
+      // 再加 Carol，等待成员变更轮换提交并确认 Carol 持有已提交密钥。
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await H.sleep(2000);
+      const carolEpoch = await H.waitForCommittedGroupEpochGreaterThan(
+        carol,
+        groupId,
+        beforeCarolJoinEpoch,
+        20_000,
+      );
+      await H.waitForCommittedGroupEpochReady(alice, groupId, carolEpoch, 20_000);
 
       const carolWatch = await H.watchGroupMessages(carol, groupId);
 
@@ -1259,7 +1350,7 @@ test.describe('Group E2EE 集成测试', () => {
       const createResult = await alice.call('group.create', { name: `burst-${rid}` });
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await H.sleep(2000);
+      await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
       const bobWatch = await H.watchGroupMessages(bob, groupId);
 
@@ -1317,7 +1408,7 @@ test.describe('Group E2EE 集成测试', () => {
       const createResult = await alice.call('group.create', { name: `mixed-${rid}` });
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
-      await H.sleep(2000);
+      await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
       const bobWatch = await H.watchGroupMessages(bob, groupId);
 
@@ -1391,7 +1482,8 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await H.sleep(2000);
+      const oldEpoch = await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
+      await H.waitForCommittedGroupEpochReady(carol, groupId, oldEpoch, 20_000);
 
       const bobWatch = await H.watchGroupMessages(bob, groupId);
 
@@ -1408,7 +1500,8 @@ test.describe('Group E2EE 集成测试', () => {
 
       // 踢 Carol 触发 epoch 轮换到 epoch 2
       await alice.call('group.kick', { group_id: groupId, aid: carolAid });
-      await H.sleep(5000);
+      const newEpoch = await H.waitForCommittedGroupEpochGreaterThan(bob, groupId, oldEpoch, 20_000);
+      await H.waitForCommittedGroupEpochReady(alice, groupId, newEpoch, 20_000);
 
       // epoch 2 消息
       await alice.call('group.send', {
@@ -1425,18 +1518,22 @@ test.describe('Group E2EE 集成测试', () => {
       bobWatch.stop();
       await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
       const decryptedTexts = H.decryptedTexts(msgs);
+      const epoch2Msg = H.byText(msgs, 'epoch2消息');
 
       return {
         totalReceived: msgs.length,
         decryptedTexts,
         hasEpoch1: decryptedTexts.includes('epoch1消息'),
         hasEpoch2: decryptedTexts.includes('epoch2消息'),
+        epoch2MessageEpoch: Number(epoch2Msg?.e2ee?.epoch ?? 0),
+        newEpoch,
       };
     }, rid);
 
     expect(result.totalReceived).toBeGreaterThanOrEqual(2);
     expect(result.hasEpoch1).toBe(true);
     expect(result.hasEpoch2).toBe(true);
+    expect(result.epoch2MessageEpoch).toBe(result.newEpoch);
   });
 
   test('退群后 epoch 轮换', async ({ page }) => {
@@ -1468,12 +1565,14 @@ test.describe('Group E2EE 集成测试', () => {
       const groupId = createResult.group.group_id;
       await alice.call('group.add_member', { group_id: groupId, aid: bobAid });
       await alice.call('group.add_member', { group_id: groupId, aid: carolAid });
-      await H.sleep(2000);
+      const oldEpoch = await H.waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
+      await H.waitForCommittedGroupEpochReady(carol, groupId, oldEpoch, 20_000);
 
       // Carol 主动退群
       await carol.call('group.leave', { group_id: groupId });
-      // 等待 Alice（owner）收到 group.changed 事件后自动 CAS 轮换
-      await H.sleep(5000);
+      // 等待 Alice（owner）收到 group.changed 事件后自动 CAS 轮换并提交。
+      const newEpoch = await H.waitForCommittedGroupEpochGreaterThan(bob, groupId, oldEpoch, 20_000);
+      await H.waitForCommittedGroupEpochReady(alice, groupId, newEpoch, 20_000);
 
       const bobWatch = await H.watchGroupMessages(bob, groupId);
 
@@ -1489,6 +1588,7 @@ test.describe('Group E2EE 集成测试', () => {
         return !!msg && msg.e2ee?.encryption_mode === 'epoch_group_key';
       });
       const msg = H.byText(msgsBob, '退群后的消息');
+      const carolHasNewEpoch = !!await carol.groupE2ee.loadSecret(groupId, newEpoch);
 
       bobWatch.stop();
       await Promise.allSettled([alice.close(), bob.close(), carol.close()]);
@@ -1496,13 +1596,17 @@ test.describe('Group E2EE 集成测试', () => {
       return {
         bobReceived: msgsBob.length,
         bobText: msg?.payload?.text,
-        hasNewEpoch: Number(msg?.e2ee?.epoch ?? 0) > 1,
+        messageEpoch: Number(msg?.e2ee?.epoch ?? 0),
+        newEpoch,
+        hasNewEpoch: Number(msg?.e2ee?.epoch ?? 0) === newEpoch,
+        carolHasNewEpoch,
       };
     }, rid);
 
     expect(result.bobReceived).toBeGreaterThan(0);
     expect(result.bobText).toBe('退群后的消息');
     expect(result.hasNewEpoch).toBe(true);
+    expect(result.carolHasNewEpoch).toBe(false);
   });
 });
 

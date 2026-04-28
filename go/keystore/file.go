@@ -15,7 +15,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/anthropics/aun-sdk-core/go/secretstore"
+	"github.com/modelunion/aun-sdk-core/go/secretstore"
 )
 
 var instanceComponentPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)

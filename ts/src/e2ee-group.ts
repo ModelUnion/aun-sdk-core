@@ -1010,10 +1010,20 @@ export function handleKeyRequest(
   if (!secretData) return null;
 
   let commitmentStr = secretData.commitment as string ?? '';
-  const memberAids = (secretData.member_aids as string[]) ?? [];
-  if (!commitmentStr) {
+  const memberAids = ((secretData.member_aids as string[]) ?? []).map(String).filter(Boolean).sort();
+  const currentMemberAids = currentMembers.map(String).filter(Boolean).sort();
+  let responseMemberAids = memberAids.length > 0 ? memberAids : currentMemberAids;
+  let includeEpochChain = true;
+  if (currentMemberAids.includes(requesterAid) && !responseMemberAids.includes(requesterAid)) {
+    responseMemberAids = currentMemberAids;
     commitmentStr = computeMembershipCommitment(
-      memberAids.length > 0 ? memberAids : currentMembers,
+      responseMemberAids,
+      epoch, groupId, secretData.secret,
+    );
+    includeEpochChain = false;
+  } else if (!commitmentStr) {
+    commitmentStr = computeMembershipCommitment(
+      responseMemberAids,
       epoch, groupId, secretData.secret,
     );
   }
@@ -1024,13 +1034,13 @@ export function handleKeyRequest(
     epoch,
     group_secret: secretData.secret.toString('base64'),
     commitment: commitmentStr,
-    member_aids: memberAids.length > 0 ? memberAids : [...currentMembers].sort(),
+    member_aids: responseMemberAids,
     requester_aid: requesterAid,
     request_id: String(payload.request_id ?? ''),
     responder_aid: aid,
     issued_at: Date.now(),
   };
-  if (secretData.epoch_chain !== undefined) {
+  if (includeEpochChain && secretData.epoch_chain !== undefined) {
     response.epoch_chain = secretData.epoch_chain;
   }
   return privateKeyPem ? signGroupKeyResponse(response, privateKeyPem) : response;

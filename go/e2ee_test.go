@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/keystore"
-	"github.com/anthropics/aun-sdk-core/go/secretstore"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/secretstore"
 )
 
 // ── 测试辅助函数 ─────────────────────────────────────────

@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/secretstore"
+	"github.com/modelunion/aun-sdk-core/go/secretstore"
 	_ "modernc.org/sqlite"
 )
 

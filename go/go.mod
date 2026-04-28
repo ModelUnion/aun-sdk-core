@@ -1,4 +1,4 @@
-module github.com/anthropics/aun-sdk-core/go
+module github.com/modelunion/aun-sdk-core/go
 
 go 1.22
 

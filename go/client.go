@@ -28,8 +28,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/keystore"
-	"github.com/anthropics/aun-sdk-core/go/namespace"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/namespace"
 )
 
 // stableStringify 递归排序键的 JSON 序列化（Canonical JSON for AUN）
@@ -944,6 +944,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 							"group_id":  gid,
 							"msg_seq":   contig,
 							"device_id": c.deviceID,
+							"slot_id":   c.slotID,
 						}); ackErr != nil {
 							log.Printf("group.pull auto-ack 失败: group=%s %v", gid, ackErr)
 						}
@@ -1402,7 +1403,12 @@ func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]an
 }
 
 func isGroupEpochTooOldError(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "e2ee epoch too old")
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "e2ee epoch too old") ||
+		strings.Contains(text, "epoch below sender membership floor")
 }
 
 func isGroupEpochRotationPendingError(err error) bool {
@@ -1413,8 +1419,14 @@ func isGroupEpochRotationPendingError(err error) bool {
 	return strings.Contains(text, "e2ee epoch rotation pending") || strings.Contains(text, "e2ee epoch not committed")
 }
 
+func isGroupEpochChangedDuringSendError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "e2ee epoch changed during send")
+}
+
 func isRecoverableGroupEpochError(err error) bool {
-	return isGroupEpochTooOldError(err) || isGroupEpochRotationPendingError(err)
+	return isGroupEpochTooOldError(err) ||
+		isGroupEpochRotationPendingError(err) ||
+		isGroupEpochChangedDuringSendError(err)
 }
 
 func (c *AUNClient) groupKeyRecoveryCandidates(groupID string, epochResult map[string]any) []string {
@@ -1577,7 +1589,7 @@ func (c *AUNClient) ensureGroupEpochReady(ctx context.Context, groupID string, s
 }
 
 func (c *AUNClient) waitForGroupMembershipEpochFloor(ctx context.Context, groupID string, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
+	_ = timeout
 	for {
 		epochRaw, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
 		if err != nil {
@@ -1608,16 +1620,9 @@ func (c *AUNClient) waitForGroupMembershipEpochFloor(ctx context.Context, groupI
 		if maxMinReadEpoch <= committedEpoch {
 			return
 		}
-		if time.Now().After(deadline) {
-			log.Printf("[aun_core] 群 %s committed epoch 尚未追上成员可读下限，按当前 committed epoch 继续发送: committed=%d floor=%d",
-				groupID, committedEpoch, maxMinReadEpoch)
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(150 * time.Millisecond):
-		}
+		log.Printf("[aun_core] 群 %s 成员 min_read_epoch 高于 committed epoch，按 committed epoch 继续发送: committed=%d floor=%d",
+			groupID, committedEpoch, maxMinReadEpoch)
+		return
 	}
 }
 
@@ -1728,13 +1733,18 @@ func (c *AUNClient) epochPrecheck(ctx context.Context, groupID string) {
 	// 向 owner 请求最新密钥
 	ownerAID, _ := resultMap["owner_aid"].(string)
 	if ownerAID == "" {
-		// 尝试通过 group.get_info 获取 owner
-		info, infoErr := c.transport.Call(ctx, "group.get_info", map[string]any{
+		// 尝试通过 group.get 获取 owner；Group 服务没有 group.get_info 方法。
+		info, infoErr := c.transport.Call(ctx, "group.get", map[string]any{
 			"group_id": groupID,
 		})
 		if infoErr == nil {
 			if infoMap, ok := info.(map[string]any); ok {
 				ownerAID, _ = infoMap["owner_aid"].(string)
+				if ownerAID == "" {
+					if groupMap, ok := infoMap["group"].(map[string]any); ok {
+						ownerAID, _ = groupMap["owner_aid"].(string)
+					}
+				}
 			}
 		}
 	}
@@ -1894,37 +1904,10 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 	groupID, _ := msg["group_id"].(string)
 	seq := int(toInt64(msg["seq"]))
 
-	// 空洞检测（无论带不带 payload 都检查）
-	if groupID != "" && seq > 0 {
-		// 收到推送即标记该群已同步
+	if groupID != "" {
 		c.groupSyncedMu.Lock()
 		c.groupSynced[groupID] = true
 		c.groupSyncedMu.Unlock()
-
-		ns := "group:" + groupID
-		// 预标记：在启动补洞 goroutine 之前完成，确保补洞路径能看到此 seq 已被推送路径处理。
-		c.markPushedSeq(ns, seq)
-		needPull := c.seqTracker.OnMessageSeq(ns, seq)
-		if needPull {
-			go c.fillGroupGap(groupID)
-		}
-		// auto-ack contiguous_seq
-		contig := c.seqTracker.GetContiguousSeq(ns)
-		if contig > 0 {
-			go func() {
-				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer ackCancel()
-				if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-					"group_id":  groupID,
-					"msg_seq":   contig,
-					"device_id": c.deviceID,
-				}); ackErr != nil {
-					log.Printf("群消息 auto-ack 失败: group=%s %v", groupID, ackErr)
-				}
-			}()
-		}
-		// 即时持久化 cursor，异常断连后不回退
-		c.saveSeqTrackerState()
 	}
 
 	// 检查是否带 payload
@@ -1939,13 +1922,41 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 	}
 
 	if !hasPayload {
-		// 不带 payload 的通知：自动 pull 最新消息
+		// 不带 payload 的通知不能先推进 seq，否则 auto-pull 会用推进后的 cursor 跳过该消息。
 		c.autoPullGroupMessages(msg)
 		return
 	}
 
 	ctx := context.Background()
 	decrypted := c.decryptGroupMessage(ctx, msg)
+
+	// 只有带 payload 的真实消息，在同步解密/恢复尝试结束后才推进游标。
+	if groupID != "" && seq > 0 {
+		ns := "group:" + groupID
+		// 预标记：在启动补洞 goroutine 之前完成，确保补洞路径能看到此 seq 已被推送路径处理。
+		c.markPushedSeq(ns, seq)
+		needPull := c.seqTracker.OnMessageSeq(ns, seq)
+		if needPull {
+			go c.fillGroupGap(groupID)
+		}
+		contig := c.seqTracker.GetContiguousSeq(ns)
+		if contig > 0 {
+			go func() {
+				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer ackCancel()
+				if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
+					"group_id":  groupID,
+					"msg_seq":   contig,
+					"device_id": c.deviceID,
+					"slot_id":   c.slotID,
+				}); ackErr != nil {
+					log.Printf("群消息 auto-ack 失败: group=%s %v", groupID, ackErr)
+				}
+			}()
+		}
+		c.saveSeqTrackerState()
+	}
+
 	if decrypted == nil {
 		c.enqueuePendingDecrypt(groupID, msg)
 		// H26: 解密失败改发 group.message_undecryptable 事件，不投递原始密文 payload。

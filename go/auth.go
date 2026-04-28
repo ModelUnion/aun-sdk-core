@@ -28,7 +28,7 @@ import (
 	"golang.org/x/crypto/ocsp"
 	"nhooyr.io/websocket"
 
-	"github.com/anthropics/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
 )
 
 // ── 辅助：多算法签名验证（ECDSA P-256/P-384、Ed25519）──────

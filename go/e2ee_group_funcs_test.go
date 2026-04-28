@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
 )
 
 // ── 测试辅助函数（群组 E2EE）────────────────────────────────
@@ -667,6 +667,39 @@ func TestHandleKeyRequest(t *testing.T) {
 	}
 	if resp["group_id"] != "g1" {
 		t.Errorf("group_id 不正确: %v", resp["group_id"])
+	}
+}
+
+func TestHandleKeyRequest_ExpandsStaleEpochMembershipForCurrentMember(t *testing.T) {
+	aliceKS := testNewGroupKeyStore(t)
+	bobKS := testNewGroupKeyStore(t)
+	aid := "alice.test"
+	oldMembers := []string{"alice.test"}
+	currentMembers := []string{"alice.test", "bob.test"}
+	secret := GenerateGroupSecret()
+	oldCommitment := ComputeMembershipCommitment(oldMembers, 1, "g1", secret)
+	StoreGroupSecret(aliceKS, aid, "g1", 1, secret, oldCommitment, oldMembers, "")
+
+	req := BuildKeyRequest("g1", 1, "bob.test")
+	resp := HandleKeyRequest(req, aliceKS, aid, currentMembers)
+	if resp == nil {
+		t.Fatal("应返回响应")
+	}
+	responseMembers := toStringSlice(resp["member_aids"])
+	if !stringSliceEqual(responseMembers, currentMembers) {
+		t.Fatalf("响应 member_aids 应扩展到当前成员: %v", responseMembers)
+	}
+	expectedCommitment := ComputeMembershipCommitment(currentMembers, 1, "g1", secret)
+	if resp["commitment"] != expectedCommitment {
+		t.Fatalf("响应 commitment 未按当前成员重算: %v", resp["commitment"])
+	}
+	if !HandleKeyResponse(resp, bobKS, "bob.test") {
+		t.Fatal("Bob 应接受扩展成员后的旧 epoch key response")
+	}
+	epochPtr := 1
+	loaded, _ := LoadGroupSecret(bobKS, "bob.test", "g1", &epochPtr)
+	if loaded == nil || !stringSliceEqual(toStringSlice(loaded["member_aids"]), currentMembers) {
+		t.Fatalf("Bob 存储的 member_aids 不正确: %#v", loaded)
 	}
 }
 

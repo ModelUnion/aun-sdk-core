@@ -245,25 +245,68 @@ async def _group_pull_raw(client: AUNClient, group_id: str, after_seq: int = 0) 
     return result.get("messages", [])
 
 
+def _truthy_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _group_secret_matches_committed_rotation(secret_data: dict | None, committed_rotation: dict | None) -> bool:
+    if not isinstance(secret_data, dict):
+        return False
+    committed_commitment = ""
+    if isinstance(committed_rotation, dict):
+        committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
+    local_commitment = str(secret_data.get("commitment") or "").strip()
+    if committed_commitment and committed_commitment != local_commitment:
+        return False
+    pending_rotation_id = str(secret_data.get("pending_rotation_id") or "").strip()
+    if not pending_rotation_id:
+        return True
+    if not isinstance(committed_rotation, dict):
+        return False
+    return str(committed_rotation.get("rotation_id") or "").strip() == pending_rotation_id
+
+
+async def _committed_group_epoch_snapshot(client: AUNClient, group_id: str) -> tuple[int, dict | None, bool]:
+    epoch_result = await client.call("group.e2ee.get_epoch", {"group_id": group_id})
+    committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
+    pending = epoch_result.get("pending_rotation")
+    pending_active = isinstance(pending, dict) and not _truthy_bool(pending.get("expired"))
+    committed_rotation = epoch_result.get("committed_rotation")
+    if not isinstance(committed_rotation, dict):
+        committed_rotation = None
+    return committed_epoch, committed_rotation, pending_active
+
+
 async def _wait_for_group_secret_epoch(client: AUNClient, aid: str, group_id: str, *, min_epoch: int = 1, timeout: float = 15.0) -> int:
     deadline = asyncio.get_running_loop().time() + timeout
     last_epochs: list[int] = []
     last_committed = 0
+    last_pending = False
     while asyncio.get_running_loop().time() < deadline:
         all_secrets = load_all_group_secrets(client._keystore, aid, group_id)
         last_epochs = sorted(all_secrets)
         try:
-            epoch_result = await client.call("group.e2ee.get_epoch", {"group_id": group_id})
-            last_committed = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)))
+            last_committed, committed_rotation, last_pending = await _committed_group_epoch_snapshot(client, group_id)
         except Exception:
             last_committed = 0
-        eligible = [epoch for epoch in last_epochs if epoch >= min_epoch and epoch <= last_committed]
-        if eligible:
-            return max(eligible)
+            committed_rotation = None
+            last_pending = False
+        if not last_pending:
+            eligible = [epoch for epoch in last_epochs if epoch >= min_epoch and epoch <= last_committed]
+            for epoch in reversed(eligible):
+                secret_data = load_group_secret(client._keystore, aid, group_id, epoch)
+                if _group_secret_matches_committed_rotation(secret_data, committed_rotation):
+                    return epoch
         await asyncio.sleep(0.5)
     raise AssertionError(
         f"{aid} did not receive committed group {group_id} epoch >= {min_epoch} "
-        f"within {timeout}s; epochs={last_epochs}, committed={last_committed}"
+        f"within {timeout}s; epochs={last_epochs}, committed={last_committed}, pending={last_pending}"
     )
 
 
@@ -285,9 +328,9 @@ async def test_group_encrypted_messaging():
         group_id = await _create_group(alice, f"e2ee-test-{rid}")
         assert alice.group_e2ee.has_secret(group_id), "owner should have secret after create"
 
-        # Alice 加 Bob（SDK 自动分发密钥）
+        # Alice 加 Bob（SDK 自动分发并提交密钥）
         await _add_member(alice, group_id, b_aid)
-        await asyncio.sleep(2)  # 等 P2P 密钥分发到达
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         # Alice 发送加密群消息
         await alice.call("group.send", {
@@ -332,8 +375,9 @@ async def test_multiple_members():
         await _add_member(alice, group_id, c_aid)
         members = [a_aid, b_aid, c_aid]
 
-        # SDK 自动分发密钥给所有成员
-        await asyncio.sleep(2)  # 等 P2P 密钥分发到达
+        # SDK 自动分发并提交密钥给所有成员
+        current_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
+        await _wait_for_group_secret_epoch(carol, c_aid, group_id, min_epoch=current_epoch, timeout=20.0)
 
         await alice.call("group.send", {
             "group_id": group_id,
@@ -373,24 +417,16 @@ async def test_epoch_rotation_on_kick():
         await _add_member(alice, group_id, b_aid)
         await _add_member(alice, group_id, c_aid)
 
-        # 等待 SDK 自动分发/轮换密钥给 Bob 和 Carol
+        # 等待 SDK 自动分发/轮换提交，并确认 Bob/Carol 持有已提交密钥
         old_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
+        await _wait_for_group_secret_epoch(carol, c_aid, group_id, min_epoch=old_epoch, timeout=20.0)
 
         # 踢 Carol
         await _kick_member(alice, group_id, c_aid)
 
-        # kick 后 SDK 自动两阶段轮换 + 分发给 Bob，轮询等待 Bob 拿到已提交的新 epoch 密钥
-        for _wait in range(15):
-            await asyncio.sleep(1)
-            all_bob = load_all_group_secrets(bob._keystore, b_aid, group_id)
-            epoch_result = await bob.call("group.e2ee.get_epoch", {"group_id": group_id})
-            committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)))
-            if committed_epoch > old_epoch and committed_epoch in all_bob:
-                break
-        else:
-            assert False, f"Bob did not receive epoch > {old_epoch} secret within 15s"
-
-        new_epoch = committed_epoch
+        # kick 后 SDK 自动两阶段轮换 + 分发给 Bob，等待服务端提交且 Bob 本地密钥匹配
+        new_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=old_epoch + 1, timeout=20.0)
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=new_epoch, timeout=20.0)
 
         # Alice 用新 epoch 发加密消息
         await alice.call("group.send", {
@@ -423,9 +459,9 @@ async def test_epoch_rotation_on_kick():
         await alice.close(); await bob.close(); await carol.close()
 
 
-async def test_new_member_no_rotation():
-    """Test 4: 加人 → 无 epoch 轮换 → 新成员可解密当前 epoch 消息"""
-    print("\n=== Test 4: New member join no rotation ===")
+async def test_new_member_join_rotates_epoch():
+    """Test 4: 加人 → epoch 轮换 → 新成员可解密当前已提交 epoch 消息"""
+    print("\n=== Test 4: New member join rotates epoch ===")
     rid = _run_id()
     alice, bob, carol = _make_client("a", rid), _make_client("b", rid), _make_client("c", rid)
     try:
@@ -436,14 +472,15 @@ async def test_new_member_no_rotation():
         group_id = await _create_group(alice, f"e2ee-join-{rid}")
         await _add_member(alice, group_id, b_aid)
 
-        # 等待 SDK 自动分发密钥给 Bob
-        await asyncio.sleep(2)
+        # 等待 SDK 自动分发并提交 Bob 可用的群密钥
+        before_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
-        # 加 Carol（SDK 自动分发当前密钥）
+        # 加 Carol（SDK 自动轮换并分发已提交的新密钥）
         await _add_member(alice, group_id, c_aid)
-        await asyncio.sleep(2)
+        carol_epoch = await _wait_for_group_secret_epoch(carol, c_aid, group_id, min_epoch=before_epoch + 1, timeout=20.0)
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=carol_epoch, timeout=20.0)
 
-        # Alice 用 epoch 1 发消息
+        # Alice 用当前已提交 epoch 发消息
         await alice.call("group.send", {
             "group_id": group_id,
             "payload": {"type": "text", "text": "新成员能看到"},
@@ -480,8 +517,8 @@ async def test_burst_group_messages():
         group_id = await _create_group(alice, f"e2ee-burst-{rid}")
         await _add_member(alice, group_id, b_aid)
 
-        # 等待 SDK 自动分发密钥
-        await asyncio.sleep(2)
+        # 等待 SDK 自动分发并提交密钥
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         N = 5
         for i in range(N):
@@ -523,8 +560,8 @@ async def test_mixed_encrypted_plaintext():
         group_id = await _create_group(alice, f"e2ee-mixed-{rid}")
         await _add_member(alice, group_id, b_aid)
 
-        # 等待 SDK 自动分发密钥
-        await asyncio.sleep(2)
+        # 等待 SDK 自动分发并提交密钥
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         # 明文消息
         await alice.call("group.send", {
@@ -619,8 +656,8 @@ async def test_old_epoch_still_decryptable():
         await _add_member(alice, group_id, b_aid)
         members = [a_aid, b_aid]
 
-        # 等待 SDK 自动分发 epoch 1 密钥
-        await asyncio.sleep(2)
+        # 等待 SDK 自动分发并提交初始密钥
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         await alice.call("group.send", {
             "group_id": group_id,
@@ -697,7 +734,7 @@ async def test_review_join_request_auto_distribute():
         })
         assert review_result.get("status") == "approved", \
             f"expected approved, got {review_result.get('status')}"
-        await asyncio.sleep(2)  # 等待 SDK 自动 P2P 密钥分发到达
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         # Alice 发送加密群消息
         await alice.call("group.send", {
@@ -844,9 +881,7 @@ async def test_open_group_join_rotates_epoch_and_updates_memberlist():
         })
         group_id = created["group"]["group_id"]
         assert alice.group_e2ee.has_secret(group_id), "owner should have secret after create"
-        owner_secret_before = alice.group_e2ee.load_secret(group_id)
-        assert owner_secret_before is not None
-        before_epoch = owner_secret_before["epoch"]
+        before_epoch = await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=1, timeout=20.0)
 
         join_result = await bob.call("group.request_join", {
             "group_id": group_id,
@@ -854,20 +889,14 @@ async def test_open_group_join_rotates_epoch_and_updates_memberlist():
         })
         assert join_result.get("status") == "joined", f"expected joined, got {join_result}"
 
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            bob_secret = bob.group_e2ee.load_secret(group_id)
-            alice_secret = alice.group_e2ee.load_secret(group_id)
-            if bob_secret and alice_secret and int(alice_secret["epoch"]) > int(before_epoch):
-                break
-        else:
-            assert False, "open join did not rotate and distribute group secret within 10s"
+        rotated_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=before_epoch + 1, timeout=20.0)
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=rotated_epoch, timeout=20.0)
 
         alice_secret = alice.group_e2ee.load_secret(group_id)
         bob_secret = bob.group_e2ee.load_secret(group_id)
         assert alice_secret is not None and bob_secret is not None
-        assert int(alice_secret["epoch"]) > int(before_epoch), "owner epoch should rotate after open join"
-        assert int(bob_secret["epoch"]) == int(alice_secret["epoch"]), "new member should receive rotated epoch"
+        assert int(alice_secret["epoch"]) == rotated_epoch, "owner should hold committed rotated epoch"
+        assert int(bob_secret["epoch"]) == rotated_epoch, "new member should receive committed rotated epoch"
         assert b_aid in alice_secret.get("member_aids", []), "signed member list should include new member"
         assert b_aid in bob_secret.get("member_aids", []), "new member local member list should include itself"
 
@@ -937,7 +966,7 @@ async def test_plaintext_send_explicit():
         # Alice 建群 + 加 Bob
         group_id = await _create_group(alice, f"plaintext-test-{rid}")
         await _add_member(alice, group_id, b_aid)
-        await asyncio.sleep(2)
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         # Alice 显式发送明文消息
         await alice.call("group.send", {
@@ -987,32 +1016,23 @@ async def test_epoch_rotation_on_leave():
 
         group_id = await _create_group(alice, f"e2ee-leave-{rid}")
         await _add_member(alice, group_id, b_aid)
-        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=25.0)
+        old_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=25.0)
         await _add_member(alice, group_id, c_aid)
-        await _wait_for_group_secret_epoch(carol, c_aid, group_id, min_epoch=1, timeout=25.0)
+        old_epoch = await _wait_for_group_secret_epoch(carol, c_aid, group_id, min_epoch=old_epoch + 1, timeout=25.0)
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=old_epoch, timeout=25.0)
 
-        # 确认三方都有 epoch 1
+        # 确认三方都有退群前的已提交 epoch
         assert alice._group_e2ee.has_secret(group_id), "Alice missing secret"
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=old_epoch, timeout=25.0)
 
-        old_epoch = alice._group_e2ee.current_epoch(group_id)
-        assert old_epoch and old_epoch >= 1, f"expected existing epoch, got {old_epoch}"
+        assert old_epoch >= 1, f"expected existing epoch, got {old_epoch}"
 
         # Carol 主动退群（离开者自身不触发轮换）
         await carol.call("group.leave", {"group_id": group_id})
 
-        # Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换
-        # 轮询等待 Bob 拿到 epoch 2 密钥
-        for _wait in range(25):
-            await asyncio.sleep(1)
-            all_bob = load_all_group_secrets(bob._keystore, b_aid, group_id)
-            if any(epoch > old_epoch for epoch in all_bob):
-                break
-        else:
-            assert False, f"Bob did not receive epoch > {old_epoch} secret within 25s after leave"
-
-        new_epoch = max(load_all_group_secrets(bob._keystore, b_aid, group_id))
-        all_alice = load_all_group_secrets(alice._keystore, a_aid, group_id)
-        assert new_epoch in all_alice, f"Alice should have epoch {new_epoch}"
+        # Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换并提交
+        new_epoch = await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=old_epoch + 1, timeout=25.0)
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=new_epoch, timeout=25.0)
 
         # Alice 用新 epoch 发加密消息
         await alice.call("group.send", {
@@ -1061,7 +1081,7 @@ async def test_push_event_decrypt():
 
         group_id = await _create_group(alice, f"e2ee-push-{rid}")
         await _add_member(alice, group_id, b_aid)
-        await asyncio.sleep(2)  # 等密钥分发
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
         # 注册推送事件监听
         push_msgs = []
@@ -1114,7 +1134,7 @@ async def main():
         ("1. Group encrypted messaging",         test_group_encrypted_messaging),
         ("2. Multiple members decrypt",           test_multiple_members),
         ("3. Epoch rotation on kick",             test_epoch_rotation_on_kick),
-        ("4. New member join no rotation",        test_new_member_no_rotation),
+        ("4. New member join rotates epoch",      test_new_member_join_rotates_epoch),
         ("5. Burst group messages",               test_burst_group_messages),
         ("6. Mixed encrypted + plaintext",        test_mixed_encrypted_plaintext),
         ("7. Membership commitment verification", test_membership_commitment_verification),

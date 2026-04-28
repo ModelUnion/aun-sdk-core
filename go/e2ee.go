@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/internal"
-	"github.com/anthropics/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/internal"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
 	"golang.org/x/crypto/hkdf"
 )
 

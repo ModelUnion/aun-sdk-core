@@ -2147,9 +2147,19 @@ def handle_key_request(
         return None
 
     commitment = secret_data.get("commitment", "")
-    member_aids = secret_data.get("member_aids", [])
-    if not commitment:
-        commitment = compute_membership_commitment(member_aids or current_members, epoch, group_id, secret_data["secret"])
+    member_aids = sorted(str(m) for m in (secret_data.get("member_aids", []) or []) if m)
+    current_member_aids = sorted(str(m) for m in (current_members or []) if m)
+    response_member_aids = member_aids or current_member_aids
+    include_epoch_chain = True
+    if requester_aid in current_member_aids and requester_aid not in response_member_aids:
+        response_member_aids = current_member_aids
+        commitment = compute_membership_commitment(
+            response_member_aids, epoch, group_id, secret_data["secret"],
+        )
+        # epoch_chain 绑定原始 commitment；同 epoch 补成员时需要按兼容档接收。
+        include_epoch_chain = False
+    elif not commitment:
+        commitment = compute_membership_commitment(response_member_aids, epoch, group_id, secret_data["secret"])
 
     response = {
         "type": "e2ee.group_key_response",
@@ -2157,14 +2167,14 @@ def handle_key_request(
         "epoch": epoch,
         "group_secret": base64.b64encode(secret_data["secret"]).decode("ascii"),
         "commitment": commitment,
-        "member_aids": member_aids or sorted(current_members),
+        "member_aids": response_member_aids,
         "requester_aid": requester_aid,
         "request_id": payload.get("request_id", ""),
         "responder_aid": aid,
         "issued_at": int(_time_mod.time() * 1000),
     }
     epoch_chain = secret_data.get("epoch_chain")
-    if epoch_chain:
+    if include_epoch_chain and epoch_chain:
         response["epoch_chain"] = epoch_chain
     if private_key_pem:
         response = sign_group_key_response(response, private_key_pem)
@@ -2194,47 +2204,103 @@ def handle_key_response(
     member_aids = payload.get("member_aids", [])
 
     if not all([group_id, epoch is not None, group_secret_b64, commitment]):
+        _e2ee_log.warning(
+            "拒绝 group key response：字段不完整 aid=%s group=%s epoch=%s has_secret=%s has_commitment=%s",
+            aid, group_id, epoch, bool(group_secret_b64), bool(commitment),
+        )
         return False
 
     if expected_request is not None:
         if payload.get("requester_aid") != aid:
+            _e2ee_log.warning(
+                "拒绝 group key response：requester 不匹配 aid=%s group=%s epoch=%s requester=%s",
+                aid, group_id, epoch, payload.get("requester_aid"),
+            )
             return False
         expected_responder = str(expected_request.get("_expected_responder_aid") or "")
         if expected_responder and payload.get("responder_aid") != expected_responder:
+            _e2ee_log.warning(
+                "拒绝 group key response：responder 不匹配 aid=%s group=%s epoch=%s expected=%s actual=%s",
+                aid, group_id, epoch, expected_responder, payload.get("responder_aid"),
+            )
             return False
         if payload.get("request_id") != expected_request.get("request_id"):
+            _e2ee_log.warning(
+                "拒绝 group key response：request_id 不匹配 aid=%s group=%s epoch=%s expected=%s actual=%s",
+                aid, group_id, epoch, expected_request.get("request_id"), payload.get("request_id"),
+            )
             return False
         if payload.get("group_id") != expected_request.get("group_id"):
+            _e2ee_log.warning(
+                "拒绝 group key response：group 不匹配 aid=%s expected=%s actual=%s",
+                aid, expected_request.get("group_id"), payload.get("group_id"),
+            )
             return False
         if int(payload.get("epoch") or 0) != int(expected_request.get("epoch") or 0):
+            _e2ee_log.warning(
+                "拒绝 group key response：epoch 不匹配 aid=%s group=%s expected=%s actual=%s",
+                aid, group_id, expected_request.get("epoch"), payload.get("epoch"),
+            )
             return False
 
     responder_aid = str(payload.get("responder_aid") or "")
     if strict:
         if not responder_aid or not responder_cert_pem:
+            _e2ee_log.warning(
+                "拒绝 group key response：responder 身份不可校验 aid=%s group=%s epoch=%s responder=%s has_cert=%s",
+                aid, group_id, epoch, responder_aid, bool(responder_cert_pem),
+            )
             return False
         if current_members and responder_aid not in current_members:
+            _e2ee_log.warning(
+                "拒绝 group key response：responder 不在当前成员列表 aid=%s group=%s epoch=%s responder=%s current_members=%s",
+                aid, group_id, epoch, responder_aid, current_members,
+            )
             return False
         if not verify_group_key_response_signature(payload, responder_cert_pem):
+            _e2ee_log.warning(
+                "拒绝 group key response：签名无效 aid=%s group=%s epoch=%s responder=%s",
+                aid, group_id, epoch, responder_aid,
+            )
             return False
     elif responder_cert_pem is not None and payload.get("response_signature"):
         if not verify_group_key_response_signature(payload, responder_cert_pem):
+            _e2ee_log.warning(
+                "拒绝 group key response：签名无效 aid=%s group=%s epoch=%s responder=%s strict=false",
+                aid, group_id, epoch, responder_aid,
+            )
             return False
 
     group_secret = base64.b64decode(group_secret_b64)
 
     if not verify_membership_commitment(commitment, member_aids, epoch, group_id, aid, group_secret):
+        _e2ee_log.warning(
+            "拒绝 group key response：membership commitment 无效 aid=%s group=%s epoch=%s member_aids=%s commitment=%s",
+            aid, group_id, epoch, member_aids, str(commitment)[:16],
+        )
         return False
 
     # manifest 一致性校验（如果响应包含 manifest，验证其与 payload 匹配）
     manifest = payload.get("manifest")
     if manifest and isinstance(manifest, dict):
         if manifest.get("group_id") != group_id:
+            _e2ee_log.warning(
+                "拒绝 group key response：manifest group 不匹配 aid=%s group=%s epoch=%s manifest_group=%s",
+                aid, group_id, epoch, manifest.get("group_id"),
+            )
             return False
         if manifest.get("epoch") != epoch:
+            _e2ee_log.warning(
+                "拒绝 group key response：manifest epoch 不匹配 aid=%s group=%s epoch=%s manifest_epoch=%s",
+                aid, group_id, epoch, manifest.get("epoch"),
+            )
             return False
         manifest_members = manifest.get("member_aids", [])
         if manifest_members and sorted(manifest_members) != sorted(member_aids):
+            _e2ee_log.warning(
+                "拒绝 group key response：manifest members 不匹配 aid=%s group=%s epoch=%s manifest_members=%s member_aids=%s",
+                aid, group_id, epoch, manifest_members, member_aids,
+            )
             return False
 
     incoming_chain = payload.get("epoch_chain")
@@ -2247,15 +2313,20 @@ def handle_key_response(
         "key_response",
     )
     if not chain_ok:
+        _e2ee_log.warning(
+            "拒绝 group key response：epoch chain 无效 aid=%s group=%s epoch=%s rotation=%s chain=%s",
+            aid, group_id, epoch, rotation_id, str(incoming_chain or "")[:16],
+        )
         return False
 
-    return store_group_secret_epoch(
+    stored = store_group_secret_epoch(
         keystore, aid, group_id, epoch, group_secret, commitment, member_aids,
         epoch_chain=str(incoming_chain or "") or None,
         pending_rotation_id=rotation_id,
         epoch_chain_unverified=chain_unverified,
         epoch_chain_unverified_reason=chain_reason,
     )
+    return stored
 
 
 # ── GroupE2EEManager ─────────────────────────────────────────
@@ -2528,6 +2599,10 @@ class GroupE2EEManager:
             pending_key = f"{payload.get('group_id', '')}:{payload.get('epoch', '')}:{payload.get('request_id', '')}"
             expected = self._pending_key_requests.get(pending_key)
             if expected is None:
+                _e2ee_log.warning(
+                    "拒绝 group key response：找不到匹配的 pending request aid=%s pending_key=%s pending_count=%s",
+                    aid, pending_key, len(self._pending_key_requests),
+                )
                 return "response_rejected"
             responder = str(payload.get("responder_aid") or "")
             responder_cert = None

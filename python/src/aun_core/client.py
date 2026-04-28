@@ -571,6 +571,7 @@ class AUNClient:
                         await self._transport.call("group.ack_messages", {
                             "group_id": gid, "msg_seq": contig,
                             "device_id": self._device_id,
+                            "slot_id": self._slot_id,
                         })
                     except Exception as _ack_exc:
                         _client_log.debug("group.pull auto-ack 失败: group=%s %s", gid, _ack_exc)
@@ -1064,19 +1065,31 @@ class AUNClient:
         await self._ensure_group_epoch_ready(group_id, strict=False)
         await self._wait_for_group_membership_epoch_floor(group_id, timeout_s=5.0, strict=True)
 
+        message_id = str(params.get("message_id") or f"gm-{uuid.uuid4()}").strip()
+        timestamp = int(params.get("timestamp") or time.time() * 1000)
+
         for attempt in range(2):
             epoch_result = await self._committed_group_epoch_state(group_id)
             committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
             if committed_epoch > 0:
                 ready_epoch = await self._ensure_committed_group_secret_for_send(group_id, committed_epoch, epoch_result)
-                envelope = self._group_e2ee.encrypt_with_epoch(group_id, ready_epoch, payload)
+                envelope = self._group_e2ee.encrypt_with_epoch(
+                    group_id, ready_epoch, payload,
+                    message_id=message_id, timestamp=timestamp,
+                )
+                send_epoch = ready_epoch
             else:
-                envelope = self._group_e2ee.encrypt(group_id, payload)
+                envelope = self._group_e2ee.encrypt(
+                    group_id, payload,
+                    message_id=message_id, timestamp=timestamp,
+                )
+                send_epoch = int(envelope.get("epoch") or 0) if isinstance(envelope, dict) else 0
             send_params: dict[str, Any] = {
                 "group_id": group_id,
                 "payload": envelope,
                 "type": "e2ee.group_encrypted",
                 "encrypted": True,
+                "message_id": message_id,
             }
             self._sign_client_operation("group.send", send_params)
             try:
@@ -1134,17 +1147,31 @@ class AUNClient:
                 _client_log.info("惰性同步 P2P: pull %d 条消息, after_seq=%d", len(messages), after_seq)
         except Exception as exc:
             _client_log.warning("惰性同步 P2P 失败: %s", exc)
+
+    @staticmethod
     def _is_group_epoch_too_old_error(exc: Exception) -> bool:
-        return "e2ee epoch too old" in str(exc).lower()
+        text = str(exc).lower()
+        return (
+            "e2ee epoch too old" in text
+            or "epoch below sender membership floor" in text
+        )
 
     @staticmethod
     def _is_group_epoch_rotation_pending_error(exc: Exception) -> bool:
         text = str(exc).lower()
         return "e2ee epoch rotation pending" in text or "e2ee epoch not committed" in text
 
+    @staticmethod
+    def _is_group_epoch_changed_during_send_error(exc: Exception) -> bool:
+        return "e2ee epoch changed during send" in str(exc).lower()
+
     @classmethod
     def _is_recoverable_group_epoch_error(cls, exc: Exception) -> bool:
-        return cls._is_group_epoch_too_old_error(exc) or cls._is_group_epoch_rotation_pending_error(exc)
+        return (
+            cls._is_group_epoch_too_old_error(exc)
+            or cls._is_group_epoch_rotation_pending_error(exc)
+            or cls._is_group_epoch_changed_during_send_error(exc)
+        )
 
     @staticmethod
     def _is_expected_group_rotation_skip_error(exc: Exception) -> bool:
@@ -1180,7 +1207,8 @@ class AUNClient:
     async def _request_group_key_from_candidates(
         self, group_id: str, server_epoch: int, epoch_result: dict[str, Any]
     ) -> None:
-        for target_aid in self._group_key_recovery_candidates(group_id, epoch_result):
+        candidates = self._group_key_recovery_candidates(group_id, epoch_result)
+        for target_aid in candidates:
             await self._request_group_key_from(group_id, target_aid, epoch=server_epoch)
 
     async def _recover_initial_group_epoch_if_needed(
@@ -1404,11 +1432,9 @@ class AUNClient:
         timeout_s: float,
         strict: bool = False,
     ) -> None:
-        """成员加入后短暂等待 committed epoch 追上成员的最小可读 epoch。
-
-        strict=True 时若超时仍未追上则拒绝发送，避免服务端按成员 floor 拒绝旧 epoch 消息。
-        """
-        deadline = time.monotonic() + max(0.0, timeout_s)
+        """发送 epoch 以服务端 committed epoch 为准，成员 floor 只作为异常诊断。"""
+        _ = timeout_s
+        _ = strict
         while True:
             try:
                 epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
@@ -1418,8 +1444,6 @@ class AUNClient:
                 )
                 members_result = await self.call("group.get_members", {"group_id": group_id})
             except Exception as exc:
-                if strict:
-                    raise StateError(f"group {group_id} failed to verify membership epoch floor: {exc}") from exc
                 _client_log.debug("群 %s 成员 epoch floor 预检跳过: %s", group_id, exc)
                 return
 
@@ -1437,19 +1461,11 @@ class AUNClient:
             if max_min_read_epoch <= committed_epoch:
                 return
 
-            if time.monotonic() >= deadline:
-                message = (
-                    f"group {group_id} committed epoch {committed_epoch} is below "
-                    f"membership floor {max_min_read_epoch}"
-                )
-                if strict:
-                    raise StateError(message)
-                _client_log.info(
-                    "群 %s committed epoch 尚未追上成员可读下限，按当前 committed epoch 继续发送: committed=%s floor=%s",
-                    group_id, committed_epoch, max_min_read_epoch,
-                )
-                return
-            await asyncio.sleep(0.15)
+            _client_log.warning(
+                "群 %s 成员 min_read_epoch 高于 committed epoch，按 committed epoch 继续发送: committed=%s floor=%s",
+                group_id, committed_epoch, max_min_read_epoch,
+            )
+            return
 
     async def _committed_group_epoch(self, group_id: str) -> int:
         try:
@@ -1766,7 +1782,8 @@ class AUNClient:
         带 payload 的事件（消息推送）：解密后 re-publish。
         不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
 
-        PY-001: 解密失败的消息不 auto-ack，加入待重试队列等待密钥恢复。
+        解密失败的消息仍按已收到推进并 auto-ack，避免缺 key 期间游标长期卡住；
+        同时加入待重试队列，后续拿到密钥后再补发明文事件。
         """
         try:
             if not isinstance(data, dict):
@@ -1778,19 +1795,11 @@ class AUNClient:
             payload = msg.get("payload")
 
             payload_present = payload is not None and (not isinstance(payload, dict) or bool(payload))
-
-            # 空洞检测（无论带不带 payload 都检查）
-            if group_id and seq is not None:
+            if group_id:
                 self._group_synced.add(group_id)
-                ns = f"group:{group_id}"
-                need_pull = self._seq_tracker.on_message_seq(ns, int(seq))
-                self._persist_seq(ns)
-                if need_pull:
-                    loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                    loop.create_task(self._fill_group_gap(group_id))
 
-            if payload is None or (isinstance(payload, dict) and not payload):
-                # 不带 payload 的通知：自动 pull 最新消息
+            if not payload_present:
+                # 不带 payload 的通知不能先推进 seq，否则 auto-pull 会用推进后的 cursor 跳过该消息。
                 await self._auto_pull_group_messages(msg)
                 return
             decrypted = await self._decrypt_group_message(msg)
@@ -1798,6 +1807,14 @@ class AUNClient:
             # PY-001: 检查解密是否成功（成功时有 e2ee 字段）
             is_encrypted_payload = isinstance(payload, dict) and payload.get("type") == "e2ee.group_encrypted"
             decrypt_success = not is_encrypted_payload or (isinstance(decrypted, dict) and decrypted.get("e2ee"))
+
+            if group_id and seq is not None:
+                ns = f"group:{group_id}"
+                need_pull = self._seq_tracker.on_message_seq(ns, int(seq))
+                self._persist_seq(ns)
+                if need_pull:
+                    loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+                    loop.create_task(self._fill_group_gap(group_id))
 
             if decrypt_success:
                 # 解密成功：记录 pushed_seq + 发布 + auto-ack
@@ -1815,12 +1832,24 @@ class AUNClient:
                             await self._transport.call("group.ack_messages", {
                                 "group_id": group_id, "msg_seq": contig,
                                 "device_id": self._device_id,
+                                "slot_id": self._slot_id,
                             })
                         except Exception as _ack_exc:
                             _client_log.debug("群消息 auto-ack 失败: group=%s %s", group_id, _ack_exc)
             else:
-                # PY-001: 解密失败 → 不 auto-ack，加入待重试队列
+                # 解密失败 → 已尝试密钥恢复；仍失败也要推进/ack，避免无密钥消息卡住游标。
                 self._enqueue_pending_decrypt(group_id, msg)
+                if group_id and seq is not None:
+                    contig = self._seq_tracker.get_contiguous_seq(ns)
+                    if contig > 0:
+                        try:
+                            await self._transport.call("group.ack_messages", {
+                                "group_id": group_id, "msg_seq": contig,
+                                "device_id": self._device_id,
+                                "slot_id": self._slot_id,
+                            })
+                        except Exception as _ack_exc:
+                            _client_log.debug("群消息 auto-ack（解密失败）失败: group=%s %s", group_id, _ack_exc)
                 # 发布 undecryptable 事件（安全：不含密文 payload）
                 safe_event = {
                     "message_id": msg.get("message_id"),
@@ -1835,6 +1864,8 @@ class AUNClient:
             _client_log.warning("群消息 push 处理失败: %s", _exc)
             # H26: 解密失败改发 group.message_undecryptable 事件，不投递原始密文 payload
             if isinstance(data, dict):
+                _payload = data.get("payload")
+                _payload_present = _payload is not None and (not isinstance(_payload, dict) or bool(_payload))
                 safe_event = {
                     "message_id": data.get("message_id"),
                     "group_id": data.get("group_id"),
@@ -1844,10 +1875,28 @@ class AUNClient:
                     "_decrypt_error": str(_exc),
                 }
                 await self._dispatcher.publish("group.message_undecryptable", safe_event)
-                # PY-001: 异常路径也不 auto-ack，加入待重试队列
+                # 异常路径同样按已收到推进/ack，并加入待重试队列。
                 _exc_group_id = data.get("group_id", "")
-                if _exc_group_id:
+                if _payload_present and _exc_group_id:
                     self._enqueue_pending_decrypt(_exc_group_id, dict(data))
+                    _exc_seq = data.get("seq")
+                    if _exc_seq is not None:
+                        _exc_ns = f"group:{_exc_group_id}"
+                        need_pull = self._seq_tracker.on_message_seq(_exc_ns, int(_exc_seq))
+                        self._persist_seq(_exc_ns)
+                        if need_pull:
+                            loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+                            loop.create_task(self._fill_group_gap(_exc_group_id))
+                        _exc_contig = self._seq_tracker.get_contiguous_seq(_exc_ns)
+                        if _exc_contig > 0:
+                            try:
+                                await self._transport.call("group.ack_messages", {
+                                    "group_id": _exc_group_id, "msg_seq": _exc_contig,
+                                    "device_id": self._device_id,
+                                    "slot_id": self._slot_id,
+                                })
+                            except Exception as _ack_exc:
+                                _client_log.debug("群消息 auto-ack（异常路径）失败: group=%s %s", _exc_group_id, _ack_exc)
 
     async def _auto_pull_group_messages(self, notification: dict[str, Any]) -> None:
         """收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息。"""
@@ -2183,6 +2232,10 @@ class AUNClient:
         if isinstance(committed_rotation, dict) and int(committed_rotation.get("target_epoch") or committed_epoch) == epoch:
             committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
             if committed_commitment and commitment and committed_commitment != commitment:
+                _client_log.warning(
+                    "拒绝 group key response：commitment 与 committed rotation 不匹配 group=%s epoch=%s committed_commitment=%s response_commitment=%s",
+                    group_id, epoch, committed_commitment[:16], commitment[:16],
+                )
                 return False
         return True
 
@@ -2312,6 +2365,7 @@ class AUNClient:
                             await self._transport.call("group.ack_messages", {
                                 "group_id": group_id, "msg_seq": contig,
                                 "device_id": self._device_id,
+                                "slot_id": self._slot_id,
                             })
                         except Exception as _ack_exc:
                             _client_log.debug("重试 auto-ack 失败: group=%s %s", group_id, _ack_exc)
@@ -2415,18 +2469,31 @@ class AUNClient:
                 group_id, epoch, sender,
             )
             try:
-                if await self._recover_group_epoch_key(
+                recovered = await self._recover_group_epoch_key(
                     group_id,
                     int(epoch),
                     sender_aid=str(sender or ""),
                     timeout_s=5.0,
-                ):
+                )
+                if recovered:
                     retry = self._group_e2ee.decrypt(message, skip_replay=skip_replay)
                     if retry is not None and retry.get("e2ee"):
                         return retry
+                    _client_log.warning(
+                        "群消息密钥恢复后仍解密失败：group=%s seq=%s message_id=%s epoch=%s",
+                        group_id, msg_seq, message.get("message_id"), epoch,
+                    )
             except Exception as exc:
+                _client_log.warning(
+                    "群消息密钥恢复异常：group=%s seq=%s message_id=%s epoch=%s error=%s",
+                    group_id, msg_seq, message.get("message_id"), epoch, exc,
+                )
                 _client_log.debug("群 %s epoch %s 同步恢复失败: %s", group_id, epoch, exc)
 
+        _client_log.warning(
+            "群消息解密失败，已完成密钥恢复尝试：group=%s seq=%s message_id=%s epoch=%s",
+            group_id, msg_seq, message.get("message_id"), msg_epoch,
+        )
         return message
 
     async def _decrypt_group_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2479,6 +2546,10 @@ class AUNClient:
                 await self._ensure_sender_cert_cached(from_aid, sender_fp or None)
             decrypted = self._e2ee._decrypt_message(message, source="push:group_key")
             if decrypted is None:
+                _client_log.warning(
+                    "群组密钥控制消息 P2P 解密失败：from=%s message_id=%s",
+                    message.get("from"), message.get("message_id"),
+                )
                 return False
             self._schedule_prekey_replenish_if_consumed(decrypted)
             actual_payload = decrypted.get("payload", {})
@@ -2496,9 +2567,19 @@ class AUNClient:
         else:
             if actual_payload.get("type") == "e2ee.group_key_distribution":
                 if not await self._verify_active_group_rotation_distribution(actual_payload):
+                    _client_log.warning(
+                        "拒绝 group key distribution：group=%s epoch=%s rotation=%s",
+                        actual_payload.get("group_id"), actual_payload.get("epoch"),
+                        actual_payload.get("rotation_id"),
+                    )
                     return True
             elif actual_payload.get("type") == "e2ee.group_key_response":
                 if not await self._verify_group_key_response_epoch(actual_payload):
+                    _client_log.warning(
+                        "拒绝 group key response：group=%s epoch=%s commitment=%s",
+                        actual_payload.get("group_id"), actual_payload.get("epoch"),
+                        str(actual_payload.get("commitment") or "")[:16],
+                    )
                     return True
             result = self._group_e2ee.handle_incoming(actual_payload)
             if result == "distribution":

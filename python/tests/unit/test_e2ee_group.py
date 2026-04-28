@@ -884,6 +884,25 @@ class TestHandleKeyRequest:
         assert "commitment" in resp
         assert "member_aids" in resp
 
+    def test_response_expands_stale_epoch_membership_for_current_member(self, tmp_path):
+        ks_alice = _make_keystore(tmp_path / "alice")
+        ks_bob = _make_keystore(tmp_path / "bob")
+        old_members = [_AID]
+        gs = _random_secret()
+        old_commitment = compute_membership_commitment(old_members, 1, _GRP, gs)
+        store_group_secret(ks_alice, _AID, _GRP, 1, gs, old_commitment, old_members)
+
+        req = build_key_request(_GRP, 1, _BOB)
+        resp = handle_key_request(req, ks_alice, _AID, _MEMBERS)
+
+        assert resp is not None
+        assert resp["member_aids"] == sorted(_MEMBERS)
+        assert resp["commitment"] == compute_membership_commitment(_MEMBERS, 1, _GRP, gs)
+        assert handle_key_response(resp, ks_bob, _BOB) is True
+        loaded = load_group_secret(ks_bob, _BOB, _GRP, 1)
+        assert loaded is not None
+        assert loaded["member_aids"] == sorted(_MEMBERS)
+
 
 class TestHandleKeyResponse:
     def test_stores_secret(self, tmp_path):

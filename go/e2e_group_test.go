@@ -384,6 +384,58 @@ func waitForGroupEpochGreaterThan(client *AUNClient, aid, groupID string, oldEpo
 	return false
 }
 
+func committedGroupEpochSnapshot(t *testing.T, client *AUNClient, groupID string) (int, map[string]any, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := client.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
+	if err != nil {
+		return 0, nil, false
+	}
+	epochMap, ok := result.(map[string]any)
+	if !ok {
+		return 0, nil, false
+	}
+	pendingActive := false
+	if pending, ok := epochMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
+		pendingActive = true
+	}
+	committedRotation, _ := epochMap["committed_rotation"].(map[string]any)
+	return int(toInt64(firstNonNil(epochMap["committed_epoch"], epochMap["epoch"]))), committedRotation, pendingActive
+}
+
+func waitForCommittedGroupEpochReady(t *testing.T, client *AUNClient, groupID string, minEpoch int, timeout time.Duration) (int, bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		epoch, committedRotation, pendingActive := committedGroupEpochSnapshot(t, client, groupID)
+		if epoch >= minEpoch && !pendingActive {
+			secret, _ := client.groupE2EE.LoadSecretForEpoch(groupID, epoch)
+			if secret != nil && (committedRotation == nil || client.groupSecretMatchesCommittedRotation(secret, committedRotation)) {
+				return epoch, true
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return 0, false
+}
+
+func waitForCommittedGroupEpochGreaterThan(t *testing.T, client *AUNClient, groupID string, oldEpoch int, timeout time.Duration) (int, bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		epoch, committedRotation, pendingActive := committedGroupEpochSnapshot(t, client, groupID)
+		if epoch > oldEpoch && !pendingActive {
+			secret, _ := client.groupE2EE.LoadSecretForEpoch(groupID, epoch)
+			if secret != nil && (committedRotation == nil || client.groupSecretMatchesCommittedRotation(secret, committedRotation)) {
+				return epoch, true
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return 0, false
+}
+
 // ---------------------------------------------------------------------------
 // 测试用例
 // ---------------------------------------------------------------------------
@@ -543,16 +595,22 @@ func TestGroupE2EEpochRotationOnKick(t *testing.T) {
 		t.Fatal("Carol 未在超时内收到 epoch 1 密钥")
 	}
 
-	oldEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
+	oldEpoch, ok := waitForCommittedGroupEpochReady(t, bob, groupID, 2, 45*time.Second)
+	if !ok {
+		t.Fatal("Bob 未在超时内收到已提交的加人后 epoch 密钥")
+	}
+	if _, ok := waitForCommittedGroupEpochReady(t, carol, groupID, oldEpoch, 15*time.Second); !ok {
+		t.Fatalf("Carol 未在超时内收到已提交的 epoch %d 密钥", oldEpoch)
+	}
 
 	// 踢 Carol
 	kickMember(t, alice, groupID, cAID)
 
 	// kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到更高 epoch 密钥
-	if !waitForGroupEpochGreaterThan(bob, bAID, groupID, oldEpoch, 15*time.Second) {
-		t.Fatalf("Bob 未在 15s 内收到 epoch > %d 密钥", oldEpoch)
+	newEpoch, ok := waitForCommittedGroupEpochGreaterThan(t, bob, groupID, oldEpoch, 45*time.Second)
+	if !ok {
+		t.Fatalf("Bob 未在超时内收到已提交的 epoch > %d 密钥", oldEpoch)
 	}
-	newEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
 
 	bobWatch := watchGroupMessages(t, bob, groupID)
 	defer bobWatch.Stop()
@@ -616,7 +674,7 @@ func TestGroupE2EBurstMessages(t *testing.T) {
 	for i := 0; i < N; i++ {
 		groupSendEncrypted(t, alice, groupID, map[string]any{
 			"type": "text", "text": fmt.Sprintf("burst_%d", i),
-			"seq":  i,
+			"seq": i,
 		})
 	}
 
@@ -1066,7 +1124,13 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 		t.Fatal("Carol 未在超时内收到 group_secret")
 	}
 
-	oldEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
+	oldEpoch, ok := waitForCommittedGroupEpochReady(t, bob, groupID, 2, 45*time.Second)
+	if !ok {
+		t.Fatal("Bob 未在超时内收到已提交的加人后 epoch 密钥")
+	}
+	if _, ok := waitForCommittedGroupEpochReady(t, carol, groupID, oldEpoch, 15*time.Second); !ok {
+		t.Fatalf("Carol 未在超时内收到已提交的 epoch %d 密钥", oldEpoch)
+	}
 
 	// Carol 主动退群
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -1077,10 +1141,10 @@ func TestGroupE2EEpochRotationOnLeave(t *testing.T) {
 	}
 
 	// Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换
-	if !waitForGroupEpochGreaterThan(bob, bAID, groupID, oldEpoch, 15*time.Second) {
-		t.Fatalf("Bob 未在 15s 内收到 epoch > %d 密钥（leave 后自动轮换）", oldEpoch)
+	newEpoch, ok := waitForCommittedGroupEpochGreaterThan(t, bob, groupID, oldEpoch, 45*time.Second)
+	if !ok {
+		t.Fatalf("Bob 未在超时内收到已提交的 epoch > %d 密钥（leave 后自动轮换）", oldEpoch)
 	}
-	newEpoch := maxGroupSecretEpoch(bob, bAID, groupID)
 
 	// Alice 也应有新 epoch
 	allAlice := LoadAllGroupSecrets(alice.keyStore, aAID, groupID)

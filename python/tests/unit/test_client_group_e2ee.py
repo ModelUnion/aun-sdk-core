@@ -105,6 +105,22 @@ def _store_secret_for_client(client, group_id=_GRP, epoch=1, gs=None):
 # ── group.send encrypt=True ──────────────────────────────
 
 class TestGroupSendEncrypt:
+    def test_sender_membership_floor_error_is_retryable_epoch_error(self, tmp_path):
+        """服务端 membership floor 拒绝应触发群 epoch 恢复重试。"""
+        client = _make_client(tmp_path)
+        err = StateError("e2ee epoch below sender membership floor: epoch=1 floor=2")
+
+        assert client._is_group_epoch_too_old_error(err) is True
+        assert client._is_recoverable_group_epoch_error(err) is True
+
+    def test_epoch_changed_during_send_is_retryable_epoch_error(self, tmp_path):
+        """发送落库前 epoch 被推进应触发群 epoch 恢复重试。"""
+        client = _make_client(tmp_path)
+        err = StateError("e2ee epoch changed during send: expected 1, current 2")
+
+        assert client._is_group_epoch_changed_during_send_error(err) is True
+        assert client._is_recoverable_group_epoch_error(err) is True
+
     def test_calls_encrypt_group_message(self, tmp_path, monkeypatch):
         """group.send(encrypt=True) 触发群组加密"""
         client = _make_client(tmp_path)
@@ -155,8 +171,8 @@ class TestGroupSendEncrypt:
         assert call_order[0] == ("wait", _GRP, True)
         assert call_order[1] == ("send", "group.send", _GRP)
 
-    def test_membership_floor_strict_timeout_raises(self, tmp_path, monkeypatch):
-        """strict 模式下 committed epoch 未追上成员 floor 时拒绝发送。"""
+    def test_membership_floor_above_committed_uses_committed_epoch(self, tmp_path, monkeypatch):
+        """成员 floor 高于 committed epoch 时只记录诊断，不阻断发送。"""
         client = _make_client(tmp_path)
 
         async def fake_call(method, params=None):
@@ -171,12 +187,11 @@ class TestGroupSendEncrypt:
 
         monkeypatch.setattr(client, "call", fake_call)
 
-        with pytest.raises(StateError, match="membership floor 2"):
-            asyncio.run(client._wait_for_group_membership_epoch_floor(
-                _GRP,
-                timeout_s=0.0,
-                strict=True,
-            ))
+        asyncio.run(client._wait_for_group_membership_epoch_floor(
+            _GRP,
+            timeout_s=0.0,
+            strict=True,
+        ))
 
     def test_group_send_refuses_uncommitted_pending_secret(self, tmp_path, monkeypatch):
         """本地 pending epoch key 与服务端 committed rotation 不匹配时不得用于发送。"""
@@ -1752,6 +1767,37 @@ class TestGroupMessagePushPipeline:
 
         assert pull_called["params"]["after_message_seq"] == 10
 
+    def test_notification_auto_pull_does_not_advance_notified_seq(self, tmp_path):
+        """无 payload 通知只触发 pull，不应先推进通知 seq。"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        _store_secret_for_client(client, epoch=1)
+
+        pull_called = {}
+
+        async def fake_call(method, params):
+            if method == "group.pull":
+                pull_called["params"] = params
+                return {"messages": []}
+            return {}
+
+        import types
+        client.call = types.MethodType(lambda self, m, p: fake_call(m, p), client)
+
+        notification = {
+            "group_id": _GRP,
+            "seq": 1,
+            "sender_aid": _AID_ALICE,
+        }
+
+        async def run():
+            client._loop = asyncio.get_running_loop()
+            await client._process_and_publish_group_message(notification)
+
+        asyncio.run(run())
+
+        assert pull_called["params"]["after_message_seq"] == 0
+        assert client._seq_tracker.get_contiguous_seq(f"group:{_GRP}") == 0
+
     def test_seq_tracking_across_push_messages(self, tmp_path):
         """多条推送消息后 SeqTracker 正确跟踪序列号。"""
         client = _make_client(tmp_path, aid=_AID_BOB)
@@ -1865,11 +1911,7 @@ class TestReplayGuardSemantics:
 
 
 class TestGroupPushDecryptFailureAutoAck:
-    """group push 解密失败时，若 SeqTracker 已推进 contiguous，仍应发送 group.ack_messages。
-
-    Bug 场景：解密失败进入 except 块，auto-ack 代码在 try 块内（解密成功后），
-    导致 contiguous 已推进但 ack 未发送。
-    """
+    """group push 解密失败时，若 SeqTracker 已推进 contiguous，仍应发送 group.ack_messages。"""
 
     def _make_client_with_ack_tracking(self, tmp_path):
         """创建带 ack 追踪的客户端。"""
@@ -1886,11 +1928,7 @@ class TestGroupPushDecryptFailureAutoAck:
         return client
 
     def test_group_push_decrypt_failure_still_auto_acks(self, tmp_path):
-        """PY-001: group push 解密抛出异常时，不应 auto-ack（消息加入待重试队列）。
-
-        旧行为（已修复）：解密失败仍然 auto-ack，导致消息不可恢复。
-        新行为：解密失败不 auto-ack，消息进入 _pending_decrypt_msgs 等待密钥恢复后重试。
-        """
+        """解密失败仍应 auto-ack，并进入 _pending_decrypt_msgs 等待密钥恢复后补发。"""
         client = self._make_client_with_ack_tracking(tmp_path)
 
         # mock _decrypt_group_message 让它抛出异常（模拟解密失败）
@@ -1921,10 +1959,10 @@ class TestGroupPushDecryptFailureAutoAck:
         ns = f"group:{_GRP}"
         assert client._seq_tracker.get_contiguous_seq(ns) == 1
 
-        # PY-001: 解密失败不应 auto-ack（消息加入待重试队列）
-        assert len(client._ack_calls) == 0, (
-            f"PY-001: 解密失败时不应 auto-ack，实际 {len(client._ack_calls)} 次: {client._ack_calls}"
+        assert len(client._ack_calls) == 1, (
+            f"解密失败时仍应 auto-ack，实际 {len(client._ack_calls)} 次: {client._ack_calls}"
         )
+        assert client._ack_calls[0]["params"]["msg_seq"] == 1
         # 消息应进入待重试队列
         pending = client._pending_decrypt_msgs.get(ns, [])
         assert len(pending) == 1, f"解密失败的消息应进入待重试队列，实际 {len(pending)}"

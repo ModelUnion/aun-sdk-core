@@ -553,6 +553,25 @@ describe('buildKeyRequest / handleKeyRequest / handleKeyResponse', () => {
     expect(loaded!.epoch).toBe(1);
   });
 
+  it('当前成员请求旧 epoch 时应扩展响应 member_aids 并重算 commitment', () => {
+    const aliceKs = new FakeKeystore();
+    const bobKs = new FakeKeystore();
+    const gs = makeGroupSecret();
+    const oldMembers = ['alice.test'];
+    const currentMembers = ['alice.test', 'bob.test'];
+    const oldCommitment = computeMembershipCommitment(oldMembers, 1, 'grp-1', gs);
+    storeGroupSecret(aliceKs, 'alice.test', 'grp-1', 1, gs, oldCommitment, oldMembers);
+
+    const request = buildKeyRequest('grp-1', 1, 'bob.test');
+    const response = handleKeyRequest(request, aliceKs, 'alice.test', currentMembers);
+
+    expect(response).not.toBeNull();
+    expect(response!.member_aids).toEqual(currentMembers);
+    expect(response!.commitment).toBe(computeMembershipCommitment(currentMembers, 1, 'grp-1', gs));
+    expect(handleKeyResponse(response!, bobKs, 'bob.test')).toBe(true);
+    expect(loadGroupSecret(bobKs, 'bob.test', 'grp-1', 1)!.member_aids).toEqual(currentMembers);
+  });
+
   it('非成员请求密钥被拒绝', () => {
     const aliceKs = new FakeKeystore();
     const gs = makeGroupSecret();

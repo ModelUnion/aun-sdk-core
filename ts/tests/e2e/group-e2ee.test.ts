@@ -196,6 +196,84 @@ function getKeystore(client: AUNClient): KeyStore {
   return (client as AUNClient & { _keystore: KeyStore })._keystore;
 }
 
+function isPlainObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function truthyBool(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    return ['1', 'true', 'yes', 'y', 'on'].includes(value.trim().toLowerCase());
+  }
+  return Boolean(value);
+}
+
+function groupSecretMatchesCommittedRotation(
+  secretData: JsonObject | null,
+  committedRotation: JsonObject | null,
+): boolean {
+  if (!secretData) return false;
+  const committedCommitment = String(committedRotation?.key_commitment ?? '').trim();
+  const localCommitment = String(secretData.commitment ?? '').trim();
+  if (committedCommitment && committedCommitment !== localCommitment) return false;
+  const pendingRotationId = String(secretData.pending_rotation_id ?? '').trim();
+  if (!pendingRotationId) return true;
+  return String(committedRotation?.rotation_id ?? '').trim() === pendingRotationId;
+}
+
+async function committedGroupEpochSnapshot(
+  client: AUNClient,
+  groupId: string,
+): Promise<{ epoch: number; committedRotation: JsonObject | null; pendingActive: boolean }> {
+  const result = await client.call('group.e2ee.get_epoch', { group_id: groupId }) as JsonObject;
+  const epoch = Number(result.committed_epoch ?? result.epoch ?? 0);
+  const pending = result.pending_rotation;
+  const pendingActive = isPlainObject(pending) && !truthyBool(pending.expired);
+  const committedRotation = isPlainObject(result.committed_rotation) ? result.committed_rotation : null;
+  return {
+    epoch: Number.isFinite(epoch) ? epoch : 0,
+    committedRotation,
+    pendingActive,
+  };
+}
+
+async function waitForCommittedGroupEpochReady(
+  client: AUNClient,
+  groupId: string,
+  minEpoch: number,
+  timeoutMs: number = 15_000,
+): Promise<number> {
+  let readyEpoch = 0;
+  let lastEpoch = 0;
+  let lastPending = false;
+  const matched = await waitFor(async () => {
+    const snapshot = await committedGroupEpochSnapshot(client, groupId);
+    lastEpoch = snapshot.epoch;
+    lastPending = snapshot.pendingActive;
+    if (snapshot.epoch < minEpoch || snapshot.pendingActive) return false;
+    const secret = client.groupE2ee.loadSecret(groupId, snapshot.epoch) as unknown as JsonObject | null;
+    if (!groupSecretMatchesCommittedRotation(secret, snapshot.committedRotation)) return false;
+    readyEpoch = snapshot.epoch;
+    return true;
+  }, timeoutMs, 500);
+  if (!matched) {
+    throw new Error(
+      `timeout waiting committed group epoch >= ${minEpoch}; last_epoch=${lastEpoch}; pending=${lastPending}`,
+    );
+  }
+  return readyEpoch;
+}
+
+async function waitForCommittedGroupEpochGreaterThan(
+  client: AUNClient,
+  groupId: string,
+  oldEpoch: number,
+  timeoutMs: number = 15_000,
+): Promise<number> {
+  return waitForCommittedGroupEpochReady(client, groupId, oldEpoch + 1, timeoutMs);
+}
+
 // ── 测试用例 ──────────────────────────────────────────────────
 
 describe('Group E2EE E2E 测试', () => {
@@ -231,9 +309,9 @@ describe('Group E2EE E2E 测试', () => {
     const groupId = await createGroup(alice, `e2ee-test-${rid}`);
     expect(alice.groupE2ee.hasSecret(groupId), 'owner 建群后应有密钥').toBe(true);
 
-    // Alice 加 Bob（SDK 自动分发密钥）
+    // Alice 加 Bob（SDK 自动分发并提交密钥）
     await addMember(alice, groupId, bAid);
-    await sleep(2000); // 等 P2P 密钥分发到达
+    await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 
@@ -277,8 +355,9 @@ describe('Group E2EE E2E 测试', () => {
     await addMember(alice, groupId, bAid);
     await addMember(alice, groupId, cAid);
 
-    // 等 SDK 自动分发密钥给所有成员
-    await sleep(2000);
+    // 等 SDK 自动分发并提交密钥给所有成员
+    const currentEpoch = await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
+    await waitForCommittedGroupEpochReady(carol, groupId, currentEpoch, 20_000);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
     const carolWatch = await watchGroupMessages(carol, groupId);
@@ -326,20 +405,16 @@ describe('Group E2EE E2E 测试', () => {
     await addMember(alice, groupId, bAid);
     await addMember(alice, groupId, cAid);
 
-    // 等待初始成员变更轮换/分发完成，记录 kick 前 Bob 已知最高 epoch。
-    await sleep(2000);
-    const oldEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
+    // 等待初始成员变更轮换提交，并确认 Bob/Carol 持有已提交密钥。
+    const oldEpoch = await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
+    await waitForCommittedGroupEpochReady(carol, groupId, oldEpoch, 20_000);
 
     // 踢 Carol
     await kickMember(alice, groupId, cAid);
 
-    // kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，轮询等待 Bob 拿到更高 epoch 密钥。
-    const bobGotNewEpoch = await waitFor(() => {
-      const allBob = loadAllGroupSecrets(getKeystore(bob), bAid, groupId);
-      return Array.from(allBob.keys()).some((epoch) => epoch > oldEpoch);
-    }, 15_000);
-    expect(bobGotNewEpoch, `Bob 应在 15s 内收到 epoch > ${oldEpoch} 密钥`).toBe(true);
-    const newEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
+    // kick 后 SDK 自动 CAS 轮换 + 分发给 Bob，等待服务端提交且 Bob 本地密钥匹配。
+    const newEpoch = await waitForCommittedGroupEpochGreaterThan(bob, groupId, oldEpoch, 20_000);
+    await waitForCommittedGroupEpochReady(alice, groupId, newEpoch, 20_000);
 
 
     const bobWatch = await watchGroupMessages(bob, groupId);
@@ -367,9 +442,9 @@ describe('Group E2EE E2E 测试', () => {
     expect(allCarol.has(newEpoch), `Carol 不应有 epoch ${newEpoch} 密钥`).toBe(false);
   }, TEST_TIMEOUT);
 
-  // ── Test 4: 加人 → 无 epoch 轮换 → 新成员可解密当前 epoch 消息 ──
+  // ── Test 4: 加人 → epoch 轮换 → 新成员可解密当前已提交 epoch 消息 ──
 
-  it('新成员加入无 epoch 轮换', async () => {
+  it('新成员加入后 epoch 轮换', async () => {
     const rid = runId();
     const alice = tracked();
     const bob = tracked();
@@ -385,22 +460,17 @@ describe('Group E2EE E2E 测试', () => {
     const groupId = await createGroup(alice, `e2ee-join-${rid}`);
     await addMember(alice, groupId, bAid);
 
-    // 等待 SDK 自动分发密钥给 Bob
-    await sleep(2000);
+    // 等待 SDK 自动分发并提交 Bob 可用的群密钥。
+    const beforeCarolJoinEpoch = await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
-    // 加 Carol 后会触发成员变更 epoch 轮换，并向新成员分发新 epoch key。
-    const beforeCarolJoinEpoch = Math.max(...loadAllGroupSecrets(getKeystore(alice), aAid, groupId).keys());
+    // 加 Carol 后会触发成员变更 epoch 轮换，并向新成员分发已提交的新 epoch key。
     await addMember(alice, groupId, cAid);
-    const carolGotSecret = await waitFor(() => {
-      const aliceEpochs = loadAllGroupSecrets(getKeystore(alice), aAid, groupId);
-      const carolEpochs = loadAllGroupSecrets(getKeystore(carol), cAid, groupId);
-      return Array.from(aliceEpochs.keys()).some((epoch) => epoch > beforeCarolJoinEpoch && carolEpochs.has(epoch));
-    }, 15_000);
-    expect(carolGotSecret, 'Carol 应在 15s 内收到新 epoch group_secret').toBe(true);
+    const carolEpoch = await waitForCommittedGroupEpochGreaterThan(carol, groupId, beforeCarolJoinEpoch, 20_000);
+    await waitForCommittedGroupEpochReady(alice, groupId, carolEpoch, 20_000);
 
     const carolWatch = await watchGroupMessages(carol, groupId);
 
-    // Alice 用 epoch 1 发消息
+    // Alice 用当前已提交 epoch 发消息
     await alice.call('group.send', {
       group_id: groupId,
       payload: { type: 'text', text: '新成员能看到' },
@@ -434,8 +504,8 @@ describe('Group E2EE E2E 测试', () => {
     const groupId = await createGroup(alice, `e2ee-burst-${rid}`);
     await addMember(alice, groupId, bAid);
 
-    // 等待 SDK 自动分发密钥
-    await sleep(2000);
+    // 等待 SDK 自动分发并提交初始群密钥。
+    await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 
@@ -479,8 +549,8 @@ describe('Group E2EE E2E 测试', () => {
     const groupId = await createGroup(alice, `e2ee-mixed-${rid}`);
     await addMember(alice, groupId, bAid);
 
-    // 等待 SDK 自动分发密钥
-    await sleep(2000);
+    // 等待 SDK 自动分发并提交密钥
+    await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 
@@ -569,8 +639,8 @@ describe('Group E2EE E2E 测试', () => {
     const groupId = await createGroup(alice, `e2ee-old-${rid}`);
     await addMember(alice, groupId, bAid);
 
-    // 等待 SDK 自动分发 epoch 1 密钥
-    await sleep(2000);
+    // 等待 SDK 自动分发并提交初始密钥
+    await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 
@@ -629,7 +699,7 @@ describe('Group E2EE E2E 测试', () => {
     // Alice 建群 + 加 Bob
     const groupId = await createGroup(alice, `plaintext-test-${rid}`);
     await addMember(alice, groupId, bAid);
-    await sleep(2000);
+    await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 
@@ -682,32 +752,21 @@ describe('Group E2EE E2E 测试', () => {
     await addMember(alice, groupId, bAid);
     await addMember(alice, groupId, cAid);
 
-    // 等待 SDK 自动分发密钥
-    await sleep(2000);
+    // 等待 SDK 自动分发/轮换提交，并确认 Bob/Carol 持有已提交密钥。
+    const oldEpoch = await waitForCommittedGroupEpochReady(bob, groupId, 1, 20_000);
+    await waitForCommittedGroupEpochReady(carol, groupId, oldEpoch, 20_000);
 
-    // 确认三方都有初始 group secret。
+    // 确认 Alice 有退群前的 group secret。
     expect(alice.groupE2ee.hasSecret(groupId), 'Alice 应有密钥').toBe(true);
-    const allGotInitialSecret = await waitFor(() => {
-      return bob.groupE2ee.hasSecret(groupId) && carol.groupE2ee.hasSecret(groupId);
-    }, 10_000);
-    expect(allGotInitialSecret, 'Bob/Carol 应在 10s 内收到初始 group_secret').toBe(true);
-
-    const oldEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
 
     // Carol 主动退群
     await carol.call('group.leave', { group_id: groupId });
 
-    // Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换。
-    const bobGotNewEpoch = await waitFor(() => {
-      const allBob = loadAllGroupSecrets(getKeystore(bob), bAid, groupId);
-      return Array.from(allBob.keys()).some((epoch) => epoch > oldEpoch);
-    }, 15_000);
-    expect(bobGotNewEpoch, `Bob 应在 15s 内收到 epoch > ${oldEpoch} 密钥`).toBe(true);
-    const newEpoch = Math.max(...loadAllGroupSecrets(getKeystore(bob), bAid, groupId).keys());
+    // Alice（owner）收到 group.changed(member_left) 事件后应自动 CAS 轮换并提交。
+    const newEpoch = await waitForCommittedGroupEpochGreaterThan(bob, groupId, oldEpoch, 20_000);
 
     // Alice 也应有新 epoch
-    const allAlice = loadAllGroupSecrets(getKeystore(alice), aAid, groupId);
-    expect(allAlice.has(newEpoch), `Alice 应有 epoch ${newEpoch}`).toBe(true);
+    await waitForCommittedGroupEpochReady(alice, groupId, newEpoch, 20_000);
 
     const bobWatch = await watchGroupMessages(bob, groupId);
 

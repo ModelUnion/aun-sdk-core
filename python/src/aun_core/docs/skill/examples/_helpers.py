@@ -5,7 +5,7 @@ AUN-RPC-SDK 示例共享基础设施
 提供连接、认证、关闭的 boilerplate，让每个示例聚焦业务逻辑。
 
 前置条件：
-  1. pip install aun-core
+  1. pip install aunp
 
 环境变量（可选）：
   AUN_DATA_ROOT  — 数据存储根目录，默认 ~/.aun

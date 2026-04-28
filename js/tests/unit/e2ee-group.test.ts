@@ -923,6 +923,33 @@ describe('handleKeyRequest', () => {
   );
 
   it.skipIf(!hasSubtleCrypto)(
+    '当前成员请求旧 epoch 时应扩展响应 member_aids 并重算 commitment',
+    async () => {
+      const ksAlice = createMockKeyStore();
+      const ksBob = createMockKeyStore();
+      const secret = generateGroupSecret();
+      const oldMembers = ['alice'];
+      const currentMembers = ['alice', 'bob'];
+      const oldCommitment = await computeMembershipCommitment(oldMembers, 1, 'g1', secret);
+      await storeGroupSecret(ksAlice, 'alice', 'g1', 1, secret, oldCommitment, oldMembers);
+
+      const request = {
+        type: 'e2ee.group_key_request',
+        group_id: 'g1',
+        epoch: 1,
+        requester_aid: 'bob',
+      };
+      const response = await handleKeyRequest(request, ksAlice, 'alice', currentMembers);
+
+      expect(response).not.toBeNull();
+      expect(response!.member_aids).toEqual(currentMembers);
+      expect(response!.commitment).toBe(await computeMembershipCommitment(currentMembers, 1, 'g1', secret));
+      expect(await handleKeyResponse(response!, ksBob, 'bob')).toBe(true);
+      expect((await loadGroupSecret(ksBob, 'bob', 'g1', 1))!.member_aids).toEqual(currentMembers);
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
     '非成员的请求应返回 null',
     async () => {
       const ks = createMockKeyStore();

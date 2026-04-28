@@ -125,16 +125,19 @@ def _make_encrypted_group_msg(gs, group_id=_GRP, from_aid=_AID_ALICE, seq=1, epo
     }
 
 
-# ── PY-001: 解密失败后不应 auto-ack ──────────────────────────
+# ── PY-001: 解密失败后仍应 auto-ack ──────────────────────────
 
 
-class TestPY001DecryptFailNoAutoAck:
-    """PY-001: 群消息解密失败后不应执行 auto-ack，消息应进入待重试队列。"""
+class TestPY001DecryptFailStillAutoAck:
+    """PY-001: 群消息解密失败后仍应执行 auto-ack，消息同时进入待重试队列。"""
 
     @pytest.mark.asyncio
-    async def test_decrypt_fail_no_auto_ack(self, tmp_path):
-        """解密失败时不应调用 group.ack_messages。"""
+    async def test_decrypt_fail_still_auto_ack(self, tmp_path, monkeypatch):
+        """解密失败时也应调用 group.ack_messages，避免游标卡住。"""
         client = _make_client(tmp_path)
+        async def fake_recover(*args, **kwargs):
+            return False
+        monkeypatch.setattr(client, "_recover_group_epoch_key", fake_recover)
         # 不存储 group secret → 解密会失败
         gs = secrets.token_bytes(32)
         msg = _make_encrypted_group_msg(gs, seq=1)
@@ -152,13 +155,17 @@ class TestPY001DecryptFailNoAutoAck:
 
         await client._process_and_publish_group_message(msg)
 
-        assert len(ack_calls) == 0, \
-            f"解密失败时不应调用 auto-ack，但被调用了 {len(ack_calls)} 次"
+        assert len(ack_calls) == 1, \
+            f"解密失败时应调用 auto-ack 1 次，实际 {len(ack_calls)} 次"
+        assert ack_calls[0]["msg_seq"] == 1
 
     @pytest.mark.asyncio
-    async def test_decrypt_fail_adds_to_pending_queue(self, tmp_path):
+    async def test_decrypt_fail_adds_to_pending_queue(self, tmp_path, monkeypatch):
         """解密失败的消息应被添加到 _pending_decrypt_msgs 队列。"""
         client = _make_client(tmp_path)
+        async def fake_recover(*args, **kwargs):
+            return False
+        monkeypatch.setattr(client, "_recover_group_epoch_key", fake_recover)
         # 不存储 group secret → 解密会失败
         gs = secrets.token_bytes(32)
         msg = _make_encrypted_group_msg(gs, seq=1)
@@ -198,9 +205,12 @@ class TestPY001DecryptFailNoAutoAck:
             f"解密成功时应调用 auto-ack 1 次，实际 {len(ack_calls)} 次"
 
     @pytest.mark.asyncio
-    async def test_pending_queue_has_size_limit(self, tmp_path):
+    async def test_pending_queue_has_size_limit(self, tmp_path, monkeypatch):
         """待重试队列应有大小上限，防止无限增长。"""
         client = _make_client(tmp_path)
+        async def fake_recover(*args, **kwargs):
+            return False
+        monkeypatch.setattr(client, "_recover_group_epoch_key", fake_recover)
         gs = secrets.token_bytes(32)
 
         client._transport = MagicMock()

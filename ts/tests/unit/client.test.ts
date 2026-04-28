@@ -1100,6 +1100,22 @@ describe('GROUP epoch 轮换竞态防护', () => {
     expect(recoverSpy).toHaveBeenCalledWith('g1', 2, '', 5000);
   });
 
+  it('sender membership floor 错误应作为可恢复 epoch 错误重试', () => {
+    const client = new AUNClient();
+    const err = new StateError('e2ee epoch below sender membership floor: epoch=1 floor=2');
+
+    expect((client as any)._isGroupEpochTooOldError(err)).toBe(true);
+    expect((client as any)._isRecoverableGroupEpochError(err)).toBe(true);
+  });
+
+  it('epoch changed during send 错误应作为可恢复 epoch 错误重试', () => {
+    const client = new AUNClient();
+    const err = new StateError('e2ee epoch changed during send: expected 1, current 2');
+
+    expect((client as any)._isGroupEpochChangedDuringSendError(err)).toBe(true);
+    expect((client as any)._isRecoverableGroupEpochError(err)).toBe(true);
+  });
+
   it('本地 epoch 1 但服务端 epoch 0 时应先补同步初始 epoch', async () => {
     const client = new AUNClient();
     let getEpochCalls = 0;

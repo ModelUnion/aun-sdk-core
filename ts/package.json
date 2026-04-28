@@ -1,6 +1,6 @@
 {
-  "name": "@agentunion/core.node",
-  "version": "0.2.10",
+  "name": "@agentunion/aun-node",
+  "version": "0.2.11",
   "description": "AUN Protocol Core SDK for Node.js",
   "type": "module",
   "main": "dist/index.js",

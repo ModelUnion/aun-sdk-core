@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
 )
 
 // ErrReplayDetected 表示消息被防重放守卫拦截（非解密失败）。

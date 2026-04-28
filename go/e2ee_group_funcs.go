@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -1239,21 +1239,34 @@ func HandleKeyRequest(
 
 	secret, _ := secretData["secret"].([]byte)
 	commitmentStr, _ := secretData["commitment"].(string)
-	members := toStringSlice(secretData["member_aids"])
-	if commitmentStr == "" {
-		if len(members) == 0 {
-			members = currentMembers
+	members := sorted(toStringSlice(secretData["member_aids"]))
+	currentSorted := sorted(currentMembers)
+	responseMembers := members
+	if len(responseMembers) == 0 {
+		responseMembers = currentSorted
+	}
+	requesterInCurrent := false
+	for _, m := range currentSorted {
+		if m == requesterAID {
+			requesterInCurrent = true
+			break
 		}
-		commitmentStr = ComputeMembershipCommitment(members, epoch, groupID, secret)
 	}
-
-	sorted := make([]string, len(members))
-	copy(sorted, members)
-	if len(sorted) == 0 {
-		sorted = make([]string, len(currentMembers))
-		copy(sorted, currentMembers)
+	requesterInResponse := false
+	for _, m := range responseMembers {
+		if m == requesterAID {
+			requesterInResponse = true
+			break
+		}
 	}
-	sort.Strings(sorted)
+	includeEpochChain := true
+	if requesterInCurrent && !requesterInResponse {
+		responseMembers = currentSorted
+		commitmentStr = ComputeMembershipCommitment(responseMembers, epoch, groupID, secret)
+		includeEpochChain = false
+	} else if commitmentStr == "" {
+		commitmentStr = ComputeMembershipCommitment(responseMembers, epoch, groupID, secret)
+	}
 
 	response := map[string]any{
 		"type":          "e2ee.group_key_response",
@@ -1261,13 +1274,13 @@ func HandleKeyRequest(
 		"epoch":         epoch,
 		"group_secret":  base64.StdEncoding.EncodeToString(secret),
 		"commitment":    commitmentStr,
-		"member_aids":   sorted,
+		"member_aids":   responseMembers,
 		"requester_aid": requesterAID,
 		"request_id":    fmt.Sprint(payload["request_id"]),
 		"responder_aid": aid,
 		"issued_at":     time.Now().UnixMilli(),
 	}
-	if ec, ok := secretData["epoch_chain"].(string); ok && ec != "" {
+	if ec, ok := secretData["epoch_chain"].(string); includeEpochChain && ok && ec != "" {
 		response["epoch_chain"] = ec
 	}
 	return response

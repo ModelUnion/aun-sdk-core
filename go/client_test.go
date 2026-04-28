@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropics/aun-sdk-core/go/keystore"
+	"github.com/modelunion/aun-sdk-core/go/keystore"
 	"nhooyr.io/websocket"
 )
 
@@ -50,6 +50,26 @@ func TestMembershipRotationTriggerIDPrefersAIDAndEpoch(t *testing.T) {
 	})
 	if triggerID != "g1:member_added:aid:carol.aid:epoch:2" {
 		t.Fatalf("trigger_id 不一致: %s", triggerID)
+	}
+}
+
+func TestSenderMembershipFloorErrorIsRetryableEpochError(t *testing.T) {
+	err := NewStateError("e2ee epoch below sender membership floor: epoch=1 floor=2")
+	if !isGroupEpochTooOldError(err) {
+		t.Fatal("membership floor epoch 错误应识别为 epoch too old")
+	}
+	if !isRecoverableGroupEpochError(err) {
+		t.Fatal("membership floor epoch 错误应触发恢复重试")
+	}
+}
+
+func TestEpochChangedDuringSendErrorIsRetryableEpochError(t *testing.T) {
+	err := NewStateError("e2ee epoch changed during send: expected 1, current 2")
+	if !isGroupEpochChangedDuringSendError(err) {
+		t.Fatal("epoch changed during send 应被识别")
+	}
+	if !isRecoverableGroupEpochError(err) {
+		t.Fatal("epoch changed during send 应触发恢复重试")
 	}
 }
 

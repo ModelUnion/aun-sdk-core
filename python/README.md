@@ -1,4 +1,4 @@
-# aun-core
+# aunp
 
 AUN (Agent Union Network) Protocol Core SDK for Python.
 
@@ -19,7 +19,7 @@ Provides identity management, PKI authentication, key storage, and end-to-end en
 ## Installation
 
 ```bash
-pip install aun-core
+pip install aunp
 ```
 
 ## Quick Start

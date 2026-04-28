@@ -792,6 +792,7 @@ export class AUNClient {
             group_id: gid,
             msg_seq: contig,
             device_id: this._deviceId,
+            slot_id: this._slotId,
           }).catch((e) => { _clientLog('debug', 'group.pull auto-ack 失败: group=%s %s', gid, formatCaughtError(e)); });
         }
       }
@@ -1215,7 +1216,8 @@ export class AUNClient {
   }
 
   private _isGroupEpochTooOldError(exc: unknown): boolean {
-    return String(exc).toLowerCase().includes('e2ee epoch too old');
+    const text = String(exc).toLowerCase();
+    return text.includes('e2ee epoch too old') || text.includes('epoch below sender membership floor');
   }
 
   private _isGroupEpochRotationPendingError(exc: unknown): boolean {
@@ -1223,8 +1225,14 @@ export class AUNClient {
     return text.includes('e2ee epoch rotation pending') || text.includes('e2ee epoch not committed');
   }
 
+  private _isGroupEpochChangedDuringSendError(exc: unknown): boolean {
+    return String(exc).toLowerCase().includes('e2ee epoch changed during send');
+  }
+
   private _isRecoverableGroupEpochError(exc: unknown): boolean {
-    return this._isGroupEpochTooOldError(exc) || this._isGroupEpochRotationPendingError(exc);
+    return this._isGroupEpochTooOldError(exc)
+      || this._isGroupEpochRotationPendingError(exc)
+      || this._isGroupEpochChangedDuringSendError(exc);
   }
 
   private _groupKeyRecoveryCandidates(groupId: string, epochResult: JsonObject): string[] {
@@ -1360,7 +1368,7 @@ export class AUNClient {
   }
 
   private async _waitForGroupMembershipEpochFloor(groupId: string, timeoutMs: number): Promise<void> {
-    const deadline = Date.now() + Math.max(0, timeoutMs);
+    void timeoutMs;
     while (true) {
       let committedEpoch = 0;
       let members: unknown = null;
@@ -1383,17 +1391,14 @@ export class AUNClient {
         }
       }
       if (maxMinReadEpoch <= committedEpoch) return;
-      if (Date.now() >= deadline) {
-        _clientLog(
-          'info',
-          '群 %s committed epoch 尚未追上成员可读下限，按当前 committed epoch 继续发送: committed=%s floor=%s',
-          groupId,
-          committedEpoch,
-          maxMinReadEpoch,
-        );
-        return;
-      }
-      await new Promise(resolve => setTimeout(resolve, 150));
+      _clientLog(
+        'warn',
+        '群 %s 成员 min_read_epoch 高于 committed epoch，按 committed epoch 继续发送: committed=%s floor=%s',
+        groupId,
+        committedEpoch,
+        maxMinReadEpoch,
+      );
+      return;
     }
   }
 
@@ -1604,34 +1609,37 @@ export class AUNClient {
     const seq = msg.seq as number | undefined;
     const payload = msg.payload;
 
-    // 空洞检测（无论带不带 payload 都检查）
-    if (groupId && seq !== undefined && seq !== null) {
+    if (groupId) {
       this._groupSynced.add(groupId);  // 收到推送即视为已激活
+    }
+
+    if (payload === undefined || payload === null
+      || (typeof payload === 'object' && Object.keys(payload as object).length === 0)) {
+      // 不带 payload 的通知不能先推进 seq，否则 auto-pull 会用推进后的 cursor 跳过该消息。
+      await this._autoPullGroupMessages(msg);
+      return;
+    }
+    const decrypted = await this._decryptGroupMessage(msg);
+
+    // 只有带 payload 的真实消息，在同步解密/恢复尝试结束后才推进游标。
+    if (groupId && seq !== undefined && seq !== null) {
       const ns = `group:${groupId}`;
       const needPull = this._seqTracker.onMessageSeq(ns, seq);
       if (needPull) {
         this._fillGroupGap(groupId).catch(exc => _clientLog('warn', '后台补洞触发失败: %s', formatCaughtError(exc)));
       }
-      // auto-ack contiguous_seq
       const contig = this._seqTracker.getContiguousSeq(ns);
       if (contig > 0) {
         this._transport.call('group.ack_messages', {
           group_id: groupId,
           msg_seq: contig,
           device_id: this._deviceId,
+          slot_id: this._slotId,
         }).catch((e) => { _clientLog('debug', '群消息 auto-ack 失败: group=%s %s', groupId, formatCaughtError(e)); });
       }
-      // 即时持久化 cursor，异常断连后不回退
       this._saveSeqTrackerState();
     }
 
-    if (payload === undefined || payload === null
-      || (typeof payload === 'object' && Object.keys(payload as object).length === 0)) {
-      // 不带 payload 的通知：自动 pull 最新消息
-      await this._autoPullGroupMessages(msg);
-      return;
-    }
-    const decrypted = await this._decryptGroupMessage(msg);
     // 记录已推送的 seq，补洞路径据此去重
     if (groupId && seq !== undefined && seq !== null) {
       const nsKey = `group:${groupId}`;
