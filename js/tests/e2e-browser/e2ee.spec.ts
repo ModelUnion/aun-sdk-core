@@ -75,6 +75,104 @@ function testPageUrl(): string {
   return `${baseUrl}/tests/e2e-browser/test-page.html`;
 }
 
+async function installP2PTestHelpers(page: any): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as any;
+    if (w.__aunP2PTest) return;
+
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const waitForPushMessages = (
+      client: any,
+      fromAid: string,
+      expectedCount = 1,
+      timeout = 5000,
+      predicate?: (msg: any) => boolean,
+    ) => {
+      const inbox: any[] = [];
+      let done = false;
+      let timer: any = null;
+      let sub: any = null;
+
+      return new Promise<any[]>((resolve) => {
+        const finish = () => {
+          if (done) return;
+          done = true;
+          if (timer) clearTimeout(timer);
+          if (sub && typeof sub.unsubscribe === 'function') {
+            sub.unsubscribe();
+          }
+          resolve(inbox);
+        };
+
+        sub = client.on('message.received', (data: any) => {
+          if (data?.from === fromAid && (!predicate || predicate(data))) {
+            inbox.push(data);
+            if (inbox.length >= expectedCount) finish();
+          }
+        });
+        timer = setTimeout(finish, timeout);
+      });
+    };
+
+    const recvAfterSend = async (
+      waitPromise: Promise<any[]>,
+      client: any,
+      fromAid: string,
+      afterSeq = 0,
+    ) => {
+      const pushed = await waitPromise;
+      if (pushed.length > 0) return pushed;
+      const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 50 });
+      return (pullResult.messages || []).filter((m: any) => m.from === fromAid);
+    };
+
+    const currentMaxSeq = async (client: any) => {
+      let afterSeq = 0;
+      let maxSeq = 0;
+      for (;;) {
+        const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 50 });
+        const msgs = pullResult.messages || [];
+        if (!msgs.length) return maxSeq;
+        for (const msg of msgs) {
+          maxSeq = Math.max(maxSeq, Number(msg?.seq || 0));
+        }
+        if (msgs.length < 50) return maxSeq;
+        afterSeq = maxSeq;
+      }
+    };
+
+    const waitForPullText = async (
+      client: any,
+      fromAid: string,
+      afterSeq: number,
+      expectedText: string,
+      timeout = 15000,
+    ) => {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 50 });
+        const msgs = (pullResult.messages || []).filter((m: any) => m.from === fromAid);
+        for (const msg of msgs) {
+          if (msg?.payload?.text === expectedText) {
+            return msg;
+          }
+        }
+        await sleep(500);
+      }
+      throw new Error(`timeout waiting for ${expectedText}`);
+    };
+
+    w.__aunP2PTest = {
+      sleep,
+      waitForPushMessages,
+      recvAfterSend,
+      currentMaxSeq,
+      waitForPullText,
+    };
+  });
+}
+
 // ── 基础功能测试 ────────────────────────────────────────────
 
 test.describe('Browser SDK 基础功能', () => {
@@ -796,6 +894,7 @@ test.describe('P2P E2EE 集成测试', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto(`${baseUrl}/tests/e2e-browser/test-page.html`);
     await page.waitForFunction(() => (window as any).testReady === true, undefined, { timeout: 10_000 });
+    await installP2PTestHelpers(page);
   });
 
   test('SDK 创建 AID + 认证 + 连接 + 发送加密消息', async ({ page }) => {
@@ -817,17 +916,16 @@ test.describe('P2P E2EE 集成测试', () => {
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      // Alice 发送加密消息给 Bob
+      const helpers = (window as any).__aunP2PTest;
+      const waitBob = helpers.waitForPushMessages(bob, aliceAid);
+
       const sendResult = await alice.call('message.send', {
         to: bobAid,
         payload: { type: 'text', text: 'hello from browser' },
         encrypt: true,
       });
 
-      // Bob 拉取消息
-      await new Promise(r => setTimeout(r, 1000));
-      const pullResult = await bob.call('message.pull', { after_seq: 0, limit: 10 });
-      const msgs = pullResult.messages || [];
+      const msgs = await helpers.recvAfterSend(waitBob, bob, aliceAid);
 
       await alice.close();
       await bob.close();
@@ -1616,6 +1714,7 @@ test.describe('P2P E2EE 扩展测试', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto(`${baseUrl}/tests/e2e-browser/test-page.html`);
     await page.waitForFunction(() => (window as any).testReady === true, undefined, { timeout: 10_000 });
+    await installP2PTestHelpers(page);
   });
 
   test('SDK 到 SDK prekey 消息收发', async ({ page }) => {
@@ -1636,19 +1735,16 @@ test.describe('P2P E2EE 扩展测试', () => {
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      // Alice 发加密消息给 Bob
+      const helpers = (window as any).__aunP2PTest;
+      const waitBob = helpers.waitForPushMessages(bob, aliceAid);
+
       const sendResult = await alice.call('message.send', {
         to: bobAid,
         payload: { type: 'text', text: 'prekey消息测试' },
         encrypt: true,
       });
 
-      await new Promise(r => setTimeout(r, 1000));
-
-      // Bob 通过 pull 接收
-      const pullResult = await bob.call('message.pull', { after_seq: 0, limit: 10 });
-      const msgs = pullResult.messages || [];
-      const fromAlice = msgs.filter((m: any) => m.from === aliceAid);
+      const fromAlice = await helpers.recvAfterSend(waitBob, bob, aliceAid);
 
       await alice.close();
       await bob.close();
@@ -1713,9 +1809,14 @@ test.describe('P2P E2EE 扩展测试', () => {
         encrypt: true,
       });
 
+      const helpers = (window as any).__aunP2PTest;
+      const waitReceiver = helpers.waitForPushMessages(receiver, senderAid, 1, 5000, (msg: any) =>
+        msg?.payload?.text === 'missing-prekey',
+      );
       const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
       await receiver.connect(rAuth);
-      const msg = await waitForPullText(receiver, senderAid, 0, 'missing-prekey');
+      const pushed = await waitReceiver;
+      const msg = pushed[0] ?? await waitForPullText(receiver, senderAid, 0, 'missing-prekey');
 
       await sender.close();
       await receiver.close();
@@ -1800,6 +1901,11 @@ test.describe('P2P E2EE 扩展测试', () => {
       const baseBobLaptop = await currentMaxSeq(bobLaptop);
       const baseAliceSync = await currentMaxSeq(aliceSync);
       const text = `browser_multi_device_${Date.now()}`;
+      const helpers = (window as any).__aunP2PTest;
+      const matchText = (msg: any) => msg?.payload?.text === text;
+      const waitBobPhone = helpers.waitForPushMessages(bobPhone, aliceAid, 1, 10000, matchText);
+      const waitBobLaptop = helpers.waitForPushMessages(bobLaptop, aliceAid, 1, 10000, matchText);
+      const waitAliceSync = helpers.waitForPushMessages(aliceSync, aliceAid, 1, 10000, matchText);
 
       await aliceMain.call('message.send', {
         to: bobAid,
@@ -1807,9 +1913,14 @@ test.describe('P2P E2EE 扩展测试', () => {
         encrypt: true,
       });
 
-      const bobPhoneMsg = await waitForPullText(bobPhone, aliceAid, baseBobPhone, text);
-      const bobLaptopMsg = await waitForPullText(bobLaptop, aliceAid, baseBobLaptop, text);
-      const aliceSyncMsg = await waitForPullText(aliceSync, aliceAid, baseAliceSync, text);
+      const [bobPhonePush, bobLaptopPush, aliceSyncPush] = await Promise.all([
+        waitBobPhone,
+        waitBobLaptop,
+        waitAliceSync,
+      ]);
+      const bobPhoneMsg = bobPhonePush[0] ?? await waitForPullText(bobPhone, aliceAid, baseBobPhone, text);
+      const bobLaptopMsg = bobLaptopPush[0] ?? await waitForPullText(bobLaptop, aliceAid, baseBobLaptop, text);
+      const aliceSyncMsg = aliceSyncPush[0] ?? await waitForPullText(aliceSync, aliceAid, baseAliceSync, text);
 
       await aliceMain.close();
       await bobPhone.close();
@@ -1902,18 +2013,24 @@ test.describe('P2P E2EE 扩展测试', () => {
       await new Promise(r => setTimeout(r, 1000));
 
       const text = `browser_multi_device_offline_${Date.now()}`;
+      const helpers = (window as any).__aunP2PTest;
+      const matchText = (msg: any) => msg?.payload?.text === text;
+      const waitOnline = helpers.waitForPushMessages(bobPhone, aliceAid, 1, 10000, matchText);
       await aliceMain.call('message.send', {
         to: bobAid,
         payload: { type: 'text', text, kind: 'offline-pull' },
         encrypt: true,
       });
 
-      const onlineMsg = await waitForPullText(bobPhone, aliceAid, onlineBase, text);
+      const onlinePush = await waitOnline;
+      const onlineMsg = onlinePush[0] ?? await waitForPullText(bobPhone, aliceAid, onlineBase, text);
 
       bobLaptop = makeClient(`bob-laptop-${rid}`);
+      const waitOffline = helpers.waitForPushMessages(bobLaptop, aliceAid, 1, 10000, matchText);
       const bReconnectAuth = await bobLaptop.auth.authenticate({ aid: bobAid });
       await bobLaptop.connect(bReconnectAuth);
-      const offlineMsg = await waitForPullText(bobLaptop, aliceAid, offlineBase, text);
+      const offlinePush = await waitOffline;
+      const offlineMsg = offlinePush[0] ?? await waitForPullText(bobLaptop, aliceAid, offlineBase, text);
 
       await aliceMain.close();
       await bobPhone.close();
@@ -1950,29 +2067,27 @@ test.describe('P2P E2EE 扩展测试', () => {
       const bAuth = await bob.auth.authenticate({ aid: bobAid });
       await bob.connect(bAuth);
 
-      // Alice -> Bob
+      const helpers = (window as any).__aunP2PTest;
+
+      const waitBob = helpers.waitForPushMessages(bob, aliceAid, 1, 5000, (msg: any) =>
+        msg?.payload?.text === 'hello_bob',
+      );
       const send1 = await alice.call('message.send', {
         to: bobAid,
         payload: { type: 'text', text: 'hello_bob' },
         encrypt: true,
       });
+      const msgsBob = await helpers.recvAfterSend(waitBob, bob, aliceAid);
 
-      await new Promise(r => setTimeout(r, 1000));
-
-      // Bob -> Alice
+      const waitAlice = helpers.waitForPushMessages(alice, bobAid, 1, 5000, (msg: any) =>
+        msg?.payload?.text === 'hello_alice',
+      );
       const send2 = await bob.call('message.send', {
         to: aliceAid,
         payload: { type: 'text', text: 'hello_alice' },
         encrypt: true,
       });
-
-      await new Promise(r => setTimeout(r, 1000));
-
-      // 双方拉取
-      const pullBob = await bob.call('message.pull', { after_seq: 0, limit: 10 });
-      const pullAlice = await alice.call('message.pull', { after_seq: 0, limit: 10 });
-      const msgsBob = (pullBob.messages || []).filter((m: any) => m.from === aliceAid);
-      const msgsAlice = (pullAlice.messages || []).filter((m: any) => m.from === bobAid);
+      const msgsAlice = await helpers.recvAfterSend(waitAlice, alice, bobAid);
 
       await alice.close();
       await bob.close();
@@ -2018,6 +2133,10 @@ test.describe('P2P E2EE 扩展测试', () => {
 
       // 连续发 5 条加密消息
       const N = 5;
+      const helpers = (window as any).__aunP2PTest;
+      const waitReceiver = helpers.waitForPushMessages(receiver, senderAid, N, 10000, (msg: any) =>
+        String(msg?.payload?.text ?? '').startsWith('burst_'),
+      );
       for (let i = 0; i < N; i++) {
         await sender.call('message.send', {
           to: receiverAid,
@@ -2026,10 +2145,7 @@ test.describe('P2P E2EE 扩展测试', () => {
         });
       }
 
-      await new Promise(r => setTimeout(r, 2000));
-
-      const pullResult = await receiver.call('message.pull', { after_seq: 0, limit: 20 });
-      const msgs = (pullResult.messages || []).filter((m: any) => m.from === senderAid);
+      const msgs = await helpers.recvAfterSend(waitReceiver, receiver, senderAid);
 
       await sender.close();
       await receiver.close();
@@ -2069,7 +2185,11 @@ test.describe('P2P E2EE 扩展测试', () => {
       const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
       await receiver.connect(rAuth);
 
-      // 轮换前发消息
+      const helpers = (window as any).__aunP2PTest;
+      const waitReceiver = helpers.waitForPushMessages(receiver, senderAid, 2, 10000, (msg: any) =>
+        msg?.payload?.text === 'before_rotate' || msg?.payload?.text === 'after_rotate',
+      );
+
       await sender.call('message.send', {
         to: receiverAid,
         payload: { type: 'text', text: 'before_rotate' },
@@ -2083,18 +2203,17 @@ test.describe('P2P E2EE 扩展测试', () => {
       } else if (typeof receiver.uploadPrekey === 'function') {
         await receiver.uploadPrekey();
       }
+      if (sender.e2ee && typeof sender.e2ee.invalidatePrekeyCache === 'function') {
+        sender.e2ee.invalidatePrekeyCache(receiverAid);
+      }
 
-      // 轮换后发消息
       await sender.call('message.send', {
         to: receiverAid,
         payload: { type: 'text', text: 'after_rotate' },
         encrypt: true,
       });
 
-      await new Promise(r => setTimeout(r, 2000));
-
-      const pullResult = await receiver.call('message.pull', { after_seq: 0, limit: 20 });
-      const msgs = (pullResult.messages || []).filter((m: any) => m.from === senderAid);
+      const msgs = await helpers.recvAfterSend(waitReceiver, receiver, senderAid);
 
       await sender.close();
       await receiver.close();
@@ -2135,35 +2254,19 @@ test.describe('P2P E2EE 扩展测试', () => {
       const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
       await receiver.connect(rAuth);
 
-      // 收集 push 消息
-      const pushMsgs: any[] = [];
-      let pushResolved = false;
-      const pushPromise = new Promise<void>((resolve) => {
-        receiver.on('message.received', (data: any) => {
-          if (data?.from === senderAid) {
-            pushMsgs.push(data);
-            if (!pushResolved) {
-              pushResolved = true;
-              resolve();
-            }
-          }
-        });
-      });
+      const helpers = (window as any).__aunP2PTest;
+      const pushPromise = helpers.waitForPushMessages(receiver, senderAid, 1, 5000, (msg: any) =>
+        msg?.payload?.text === 'dup_test',
+      );
 
-      // 发送一条消息
       await sender.call('message.send', {
         to: receiverAid,
         payload: { type: 'text', text: 'dup_test' },
         encrypt: true,
       });
 
-      // 等待 push 到达（最多 5 秒）
-      await Promise.race([
-        pushPromise,
-        new Promise(r => setTimeout(r, 5000)),
-      ]);
+      const pushMsgs = await pushPromise;
 
-      // 然后再 pull
       const pullResult = await receiver.call('message.pull', { after_seq: 0, limit: 10 });
       const pullMsgs = (pullResult.messages || []).filter((m: any) => m.from === senderAid);
 
@@ -2185,14 +2288,13 @@ test.describe('P2P E2EE 扩展测试', () => {
         // push 和 pull 各自不应有重复
         noPushDuplicates: new Set(pushMsgs.map((m: any) => m.message_id)).size === pushMsgs.length,
         noPullDuplicates: new Set(pullMsgs.map((m: any) => m.message_id)).size === pullMsgs.length,
+        noCrossDuplicates: allIds.length === uniqueIds.size,
       };
     }, rid);
 
-    // 至少通过 pull 收到了消息
-    expect(result.pullCount).toBeGreaterThan(0);
-    // pull 自身无重复
+    expect(result.pushCount + result.pullCount).toBeGreaterThan(0);
+    expect(result.noCrossDuplicates).toBe(true);
     expect(result.noPullDuplicates).toBe(true);
-    // 如果 push 也收到了，push 自身也不应有重复
     if (result.pushCount > 0) {
       expect(result.noPushDuplicates).toBe(true);
     }

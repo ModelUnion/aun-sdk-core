@@ -76,13 +76,15 @@ func sdkSend(t *testing.T, client *AUNClient, toAID string, payload map[string]a
 	}
 }
 
-// sdkRecvPush 通过推送事件接收消息，超时后 pull 兜底
-func sdkRecvPush(t *testing.T, client *AUNClient, fromAID string, timeout time.Duration) []map[string]any {
-	t.Helper()
-	if timeout == 0 {
-		timeout = 5 * time.Second
+func collectSDKPushMessages(
+	client *AUNClient,
+	fromAID string,
+	expectedCount int,
+	predicate func(map[string]any) bool,
+) func(time.Duration) []map[string]any {
+	if expectedCount <= 0 {
+		expectedCount = 1
 	}
-
 	var mu sync.Mutex
 	var inbox []map[string]any
 	done := make(chan struct{}, 1)
@@ -93,10 +95,17 @@ func sdkRecvPush(t *testing.T, client *AUNClient, fromAID string, timeout time.D
 			return
 		}
 		from, _ := data["from"].(string)
-		if from == fromAID {
-			mu.Lock()
-			inbox = append(inbox, data)
-			mu.Unlock()
+		if from != fromAID {
+			return
+		}
+		if predicate != nil && !predicate(data) {
+			return
+		}
+		mu.Lock()
+		inbox = append(inbox, data)
+		complete := len(inbox) >= expectedCount
+		mu.Unlock()
+		if complete {
 			select {
 			case done <- struct{}{}:
 			default:
@@ -104,18 +113,47 @@ func sdkRecvPush(t *testing.T, client *AUNClient, fromAID string, timeout time.D
 		}
 	})
 
-	// 等待推送
-	timer := time.NewTimer(timeout)
-	select {
-	case <-done:
-	case <-timer.C:
-	}
-	timer.Stop()
-	sub.Unsubscribe()
+	return func(timeout time.Duration) []map[string]any {
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		timer := time.NewTimer(timeout)
+		select {
+		case <-done:
+		case <-timer.C:
+		}
+		timer.Stop()
+		sub.Unsubscribe()
 
-	mu.Lock()
-	result := inbox
-	mu.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
+		result := make([]map[string]any, len(inbox))
+		copy(result, inbox)
+		return result
+	}
+}
+
+func recvSDKAfterSend(
+	t *testing.T,
+	wait func(time.Duration) []map[string]any,
+	client *AUNClient,
+	fromAID string,
+	afterSeq int,
+	timeout time.Duration,
+) []map[string]any {
+	t.Helper()
+	if wait != nil {
+		if msgs := wait(timeout); len(msgs) > 0 {
+			return msgs
+		}
+	}
+	return sdkRecvPull(t, client, fromAID, afterSeq)
+}
+
+// sdkRecvPush 通过推送事件接收消息，超时后 pull 兜底
+func sdkRecvPush(t *testing.T, client *AUNClient, fromAID string, timeout time.Duration) []map[string]any {
+	t.Helper()
+	result := collectSDKPushMessages(client, fromAID, 1, nil)(timeout)
 
 	// 推送未收到，使用 pull 兜底
 	if len(result) == 0 {
@@ -495,16 +533,18 @@ func TestIntegrationSDKToSDKBidirectional(t *testing.T) {
 	bAID := ensureConnected(t, bob, fmt.Sprintf("e2ee-b-%s.agentid.pub", rid))
 
 	// alice -> bob
+	waitBob := collectSDKPushMessages(bob, aAID, 1, nil)
 	sdkSend(t, alice, bAID, map[string]any{"type": "text", "text": "hello_bob", "from": "alice"})
-	msgsBob := sdkRecvPush(t, bob, aAID, 5*time.Second)
+	msgsBob := recvSDKAfterSend(t, waitBob, bob, aAID, 0, 5*time.Second)
 	if len(msgsBob) < 1 {
 		t.Fatalf("bob 期望至少收到 1 条消息，实际 %d", len(msgsBob))
 	}
 	assertDecrypted(t, msgsBob[0], map[string]any{"type": "text", "text": "hello_bob"}, "A->B")
 
 	// bob -> alice
+	waitAlice := collectSDKPushMessages(alice, bAID, 1, nil)
 	sdkSend(t, bob, aAID, map[string]any{"type": "text", "text": "hello_alice", "from": "bob"})
-	msgsAlice := sdkRecvPush(t, alice, bAID, 5*time.Second)
+	msgsAlice := recvSDKAfterSend(t, waitAlice, alice, bAID, 0, 5*time.Second)
 	if len(msgsAlice) < 1 {
 		t.Fatalf("alice 期望至少收到 1 条消息，实际 %d", len(msgsAlice))
 	}
@@ -523,16 +563,15 @@ func TestIntegrationBurstMessages(t *testing.T) {
 	rAID := ensureConnected(t, receiver, fmt.Sprintf("e2ee-r-%s.agentid.pub", rid))
 
 	const N = 10
+	waitReceiver := collectSDKPushMessages(receiver, sAID, N, nil)
 	for i := 0; i < N; i++ {
 		sdkSend(t, sender, rAID, map[string]any{
 			"type": "text", "text": fmt.Sprintf("burst_%d", i),
-			"seq":  i,
+			"seq": i,
 		})
 	}
 
-	// 等待消息到达
-	time.Sleep(2 * time.Second)
-	msgs := sdkRecvPull(t, receiver, sAID, 0)
+	msgs := recvSDKAfterSend(t, waitReceiver, receiver, sAID, 0, 10*time.Second)
 	if len(msgs) < N {
 		t.Fatalf("期望 %d 条消息，实际收到 %d", N, len(msgs))
 	}
@@ -566,6 +605,7 @@ func TestIntegrationPrekeyRotation(t *testing.T) {
 	rAID := ensureConnected(t, receiver, fmt.Sprintf("e2ee-r-%s.agentid.pub", rid))
 
 	// 轮换前发送
+	waitReceiver := collectSDKPushMessages(receiver, sAID, 2, nil)
 	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "before_rotate", "phase": 1})
 
 	// receiver 轮换 prekey
@@ -578,8 +618,7 @@ func TestIntegrationPrekeyRotation(t *testing.T) {
 	// 轮换后发送（sender 的缓存可能仍是旧 prekey，但接收方应能解密两者）
 	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "after_rotate", "phase": 2})
 
-	time.Sleep(2 * time.Second)
-	msgs := sdkRecvPull(t, receiver, sAID, 0)
+	msgs := recvSDKAfterSend(t, waitReceiver, receiver, sAID, 0, 10*time.Second)
 	if len(msgs) < 2 {
 		t.Fatalf("期望至少 2 条消息，实际 %d", len(msgs))
 	}
@@ -746,10 +785,28 @@ func TestIntegrationSameAIDMultiSlotAckIsolation(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	uniqueText := fmt.Sprintf("slot_isolation_%d", time.Now().UnixMilli())
+	textPredicate := func(msg map[string]any) bool {
+		payload, _ := msg["payload"].(map[string]any)
+		return payload != nil && getStr(payload, "text", "") == uniqueText
+	}
+	waitSlotA := collectSDKPushMessages(receiverSlotA, sAID, 1, textPredicate)
+	waitSlotB := collectSDKPushMessages(receiverSlotB, sAID, 1, textPredicate)
 	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": uniqueText})
 
-	msgA := waitForSDKPullMessage(t, receiverSlotA, sAID, baseSeqA, uniqueText, 15*time.Second)
-	msgB := waitForSDKPullMessage(t, receiverSlotB, sAID, baseSeqB, uniqueText, 15*time.Second)
+	msgsA := waitSlotA(15 * time.Second)
+	msgsB := waitSlotB(15 * time.Second)
+	var msgA map[string]any
+	var msgB map[string]any
+	if len(msgsA) > 0 {
+		msgA = msgsA[0]
+	} else {
+		msgA = waitForSDKPullMessage(t, receiverSlotA, sAID, baseSeqA, uniqueText, 15*time.Second)
+	}
+	if len(msgsB) > 0 {
+		msgB = msgsB[0]
+	} else {
+		msgB = waitForSDKPullMessage(t, receiverSlotB, sAID, baseSeqB, uniqueText, 15*time.Second)
+	}
 	assertDecrypted(t, msgA, map[string]any{"type": "text", "text": uniqueText}, "slot-a")
 	assertDecrypted(t, msgB, map[string]any{"type": "text", "text": uniqueText}, "slot-b")
 
@@ -837,11 +894,36 @@ func TestIntegrationMultiDeviceRecipientAndSelfSync(t *testing.T) {
 	baseSync := currentMaxSeq(t, bobSync, 200)
 	baseAliceSync := currentMaxSeq(t, aliceSync, 200)
 	text := fmt.Sprintf("multi_device_sync_%d", time.Now().UnixMilli())
+	textPredicate := func(msg map[string]any) bool {
+		payload, _ := msg["payload"].(map[string]any)
+		return payload != nil && getStr(payload, "text", "") == text
+	}
+	waitMain := collectSDKPushMessages(bobSeed, aliceAID, 1, textPredicate)
+	waitSync := collectSDKPushMessages(bobSync, aliceAID, 1, textPredicate)
+	waitAliceSync := collectSDKPushMessages(aliceSync, aliceAID, 1, textPredicate)
 	sdkSend(t, aliceSeed, bobAID, map[string]any{"type": "text", "text": text, "kind": "multi-device"})
 
-	mainMsg := waitForSDKPullMessage(t, bobSeed, aliceAID, baseMain, text, 20*time.Second)
-	syncMsg := waitForSDKPullMessage(t, bobSync, aliceAID, baseSync, text, 20*time.Second)
-	aliceSyncMsg := waitForSDKPullMessage(t, aliceSync, aliceAID, baseAliceSync, text, 20*time.Second)
+	mainMsgs := waitMain(20 * time.Second)
+	syncMsgs := waitSync(20 * time.Second)
+	aliceSyncMsgs := waitAliceSync(20 * time.Second)
+	var mainMsg map[string]any
+	var syncMsg map[string]any
+	var aliceSyncMsg map[string]any
+	if len(mainMsgs) > 0 {
+		mainMsg = mainMsgs[0]
+	} else {
+		mainMsg = waitForSDKPullMessage(t, bobSeed, aliceAID, baseMain, text, 20*time.Second)
+	}
+	if len(syncMsgs) > 0 {
+		syncMsg = syncMsgs[0]
+	} else {
+		syncMsg = waitForSDKPullMessage(t, bobSync, aliceAID, baseSync, text, 20*time.Second)
+	}
+	if len(aliceSyncMsgs) > 0 {
+		aliceSyncMsg = aliceSyncMsgs[0]
+	} else {
+		aliceSyncMsg = waitForSDKPullMessage(t, aliceSync, aliceAID, baseAliceSync, text, 20*time.Second)
+	}
 	assertDecrypted(t, mainMsg, map[string]any{"type": "text", "text": text, "kind": "multi-device"}, "bob-main")
 	assertDecrypted(t, syncMsg, map[string]any{"type": "text", "text": text, "kind": "multi-device"}, "bob-sync")
 	assertDecrypted(t, aliceSyncMsg, map[string]any{"type": "text", "text": text, "kind": "multi-device"}, "alice-sync")

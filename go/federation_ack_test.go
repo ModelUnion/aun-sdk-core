@@ -11,6 +11,67 @@ import (
 	"time"
 )
 
+func waitFederationMessageByPushOrPull(
+	t *testing.T,
+	waitPush func(time.Duration) []map[string]any,
+	client *AUNClient,
+	fromAID string,
+	afterSeq int,
+	expectedText string,
+	label string,
+) []map[string]any {
+	t.Helper()
+	matches := func(items []map[string]any) bool {
+		for _, item := range items {
+			from, _ := item["from"].(string)
+			if from == fromAID && getPayloadText(item) == expectedText {
+				return true
+			}
+		}
+		return false
+	}
+	if waitPush != nil {
+		if msgs := waitPush(20 * time.Second); matches(msgs) {
+			return msgs
+		}
+	}
+	return federationWaitForMessages(t, client, func() []map[string]any {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pullResult, err := client.Call(ctx, "message.pull", map[string]any{
+			"after_seq": afterSeq,
+			"limit":     50,
+		})
+		if err != nil {
+			return nil
+		}
+		pullMap, _ := pullResult.(map[string]any)
+		if pullMap == nil {
+			return nil
+		}
+		msgsAny, _ := pullMap["messages"].([]any)
+		var items []map[string]any
+		for _, raw := range msgsAny {
+			if msg, ok := raw.(map[string]any); ok {
+				items = append(items, msg)
+			}
+		}
+		return items
+	}, 20*time.Second, matches, label)
+}
+
+func findFederationMessageByText(t *testing.T, msgs []map[string]any, fromAID string, text string) map[string]any {
+	t.Helper()
+	for _, msg := range msgs {
+		from, _ := msg["from"].(string)
+		if from == fromAID && getPayloadText(msg) == text {
+			return msg
+		}
+	}
+	t.Fatalf("未找到目标消息: from=%s text=%q messages=%#v", fromAID, text, msgs)
+	return nil
+}
+
 // TestFederationAckMainChain 跨域消息 ack 主链验证：
 // 发送方收到 ack 事件，ack_seq 正确，device_id 非空。
 func TestFederationAckMainChain(t *testing.T) {
@@ -49,6 +110,9 @@ func TestFederationAckMainChain(t *testing.T) {
 
 	// Alice 发送消息给 Bob
 	text := fmt.Sprintf("fed-ack-test-%s", rid)
+	waitBob := collectSDKPushMessages(bob, aliceAID, 1, func(msg map[string]any) bool {
+		return getPayloadText(msg) == text
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_, err := alice.Call(ctx, "message.send", map[string]any{
@@ -60,50 +124,11 @@ func TestFederationAckMainChain(t *testing.T) {
 		t.Fatalf("跨域发送失败: %v", err)
 	}
 
-	// Bob 拉取消息
-	msgs := federationWaitForMessages(t, bob, func() []map[string]any {
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel2()
-		pullResult, err := bob.Call(ctx2, "message.pull", map[string]any{
-			"after_seq": 0,
-			"limit":     50,
-		})
-		if err != nil {
-			return nil
-		}
-		pullMap, _ := pullResult.(map[string]any)
-		if pullMap == nil {
-			return nil
-		}
-		msgsAny, _ := pullMap["messages"].([]any)
-		var items []map[string]any
-		for _, raw := range msgsAny {
-			if msg, ok := raw.(map[string]any); ok {
-				items = append(items, msg)
-			}
-		}
-		return items
-	}, 20*time.Second, func(items []map[string]any) bool {
-		for _, item := range items {
-			from, _ := item["from"].(string)
-			if from == aliceAID && getPayloadText(item) == text {
-				return true
-			}
-		}
-		return false
-	}, "等待 Bob 收到跨域消息")
-
-	// 找到目标消息的 seq
-	var targetSeq int
-	for _, msg := range msgs {
-		from, _ := msg["from"].(string)
-		if from == aliceAID && getPayloadText(msg) == text {
-			targetSeq = int(toInt64(msg["seq"]))
-			break
-		}
-	}
+	msgs := waitFederationMessageByPushOrPull(t, waitBob, bob, aliceAID, 0, text, "等待 Bob 收到跨域消息")
+	targetMsg := findFederationMessageByText(t, msgs, aliceAID, text)
+	targetSeq := int(toInt64(targetMsg["seq"]))
 	if targetSeq == 0 {
-		t.Fatalf("未找到目标消息 seq")
+		t.Fatalf("目标消息缺少 seq: %#v", targetMsg)
 	}
 
 	// Bob ack
@@ -201,6 +226,11 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 
 	// Alice 发送
 	text := fmt.Sprintf("fed-multi-ack-%s", rid)
+	textPredicate := func(msg map[string]any) bool {
+		return getPayloadText(msg) == text
+	}
+	waitSlotA := collectSDKPushMessages(bobSlotA, aliceAID, 1, textPredicate)
+	waitSlotB := collectSDKPushMessages(bobSlotB, aliceAID, 1, textPredicate)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_, err := alice.Call(ctx, "message.send", map[string]any{
@@ -212,12 +242,17 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 		t.Fatalf("跨域发送失败: %v", err)
 	}
 
-	// 两个 slot 各自拉取
-	msgA := waitForSDKPullMessage(t, bobSlotA, aliceAID, baseA, text, 20*time.Second)
-	msgB := waitForSDKPullMessage(t, bobSlotB, aliceAID, baseB, text, 20*time.Second)
+	// 两个 slot 各自接收。full-direct 下在线收件方会优先收到 push 并自动 ACK。
+	msgsA := waitFederationMessageByPushOrPull(t, waitSlotA, bobSlotA, aliceAID, baseA, text, "等待 slot-a 收到跨域消息")
+	msgsB := waitFederationMessageByPushOrPull(t, waitSlotB, bobSlotB, aliceAID, baseB, text, "等待 slot-b 收到跨域消息")
+	msgA := findFederationMessageByText(t, msgsA, aliceAID, text)
+	msgB := findFederationMessageByText(t, msgsB, aliceAID, text)
 
 	seqA := int(toInt64(msgA["seq"]))
 	seqB := int(toInt64(msgB["seq"]))
+	if seqA == 0 || seqB == 0 {
+		t.Fatalf("目标消息缺少 seq: slotA=%#v slotB=%#v", msgA, msgB)
+	}
 	if seqA != seqB {
 		t.Fatalf("同 AID 不同 slot seq 应一致: %d != %d", seqA, seqB)
 	}
@@ -275,6 +310,9 @@ func TestFederationAckIdempotent(t *testing.T) {
 	bobAID := ensureFederationConnected(t, bob, fmt.Sprintf("go-idem-b-%s.aid.net", rid))
 
 	text := fmt.Sprintf("fed-idem-ack-%s", rid)
+	waitBob := collectSDKPushMessages(bob, aliceAID, 1, func(msg map[string]any) bool {
+		return getPayloadText(msg) == text
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_, err := alice.Call(ctx, "message.send", map[string]any{
@@ -286,42 +324,11 @@ func TestFederationAckIdempotent(t *testing.T) {
 		t.Fatalf("发送失败: %v", err)
 	}
 
-	msgs := federationWaitForMessages(t, bob, func() []map[string]any {
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel2()
-		pullResult, _ := bob.Call(ctx2, "message.pull", map[string]any{
-			"after_seq": 0,
-			"limit":     50,
-		})
-		pullMap, _ := pullResult.(map[string]any)
-		if pullMap == nil {
-			return nil
-		}
-		msgsAny, _ := pullMap["messages"].([]any)
-		var items []map[string]any
-		for _, raw := range msgsAny {
-			if msg, ok := raw.(map[string]any); ok {
-				items = append(items, msg)
-			}
-		}
-		return items
-	}, 20*time.Second, func(items []map[string]any) bool {
-		for _, item := range items {
-			from, _ := item["from"].(string)
-			if from == aliceAID && getPayloadText(item) == text {
-				return true
-			}
-		}
-		return false
-	}, "等待 Bob 收到消息")
-
-	var targetSeq int
-	for _, msg := range msgs {
-		from, _ := msg["from"].(string)
-		if from == aliceAID && getPayloadText(msg) == text {
-			targetSeq = int(toInt64(msg["seq"]))
-			break
-		}
+	msgs := waitFederationMessageByPushOrPull(t, waitBob, bob, aliceAID, 0, text, "等待 Bob 收到消息")
+	targetMsg := findFederationMessageByText(t, msgs, aliceAID, text)
+	targetSeq := int(toInt64(targetMsg["seq"]))
+	if targetSeq == 0 {
+		t.Fatalf("目标消息缺少 seq: %#v", targetMsg)
 	}
 
 	// 第一次 ack

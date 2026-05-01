@@ -72,6 +72,36 @@ async function pullMessages(client: AUNClient, afterSeq = 0, limit = 50): Promis
   return (result.messages ?? []) as Message[];
 }
 
+function waitForPushMessage(
+  client: AUNClient,
+  fromAid: string,
+  expectedText: string,
+  timeoutMs = 5_000,
+): Promise<Message | null> {
+  let sub: { unsubscribe: () => void } | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let done = false;
+
+  return new Promise<Message | null>((resolve) => {
+    const finish = (message: Message | null) => {
+      if (done) return;
+      done = true;
+      if (timer !== null) clearTimeout(timer);
+      sub?.unsubscribe();
+      resolve(message);
+    };
+
+    sub = client.on('message.received', (data) => {
+      const message = data as Message;
+      if (message?.from === fromAid && messageText(message) === expectedText) {
+        finish(message);
+      }
+    });
+
+    timer = setTimeout(() => finish(null), timeoutMs);
+  });
+}
+
 function messageText(message: Message): string {
   const payload = message.payload;
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -99,6 +129,7 @@ async function waitForFederationDelivery(
     async () => {
       attempt += 1;
       const text = `ts reconnect hello ${rid}-${attempt}`;
+      const pushWait = waitForPushMessage(bob, aliceAid, text, 5_000);
       try {
         const sendResult = await alice.call('message.send', {
           to: bobAid,
@@ -109,7 +140,13 @@ async function waitForFederationDelivery(
           return false;
         }
       } catch {
+        await pushWait;
         return false;
+      }
+
+      const pushed = await pushWait;
+      if (pushed !== null) {
+        return true;
       }
 
       const messages = await pullMessages(bob, 0, 50);

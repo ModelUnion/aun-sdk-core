@@ -74,6 +74,18 @@ func waitForFederationDelivery(
 	var lastMessages []map[string]any
 	for attempt := 1; attempt <= 30; attempt++ {
 		text := fmt.Sprintf("go federation reconnect %s-%d", rid, attempt)
+		matches := func(items []map[string]any) bool {
+			for _, msg := range items {
+				from, _ := msg["from"].(string)
+				if from == aliceAID && getPayloadText(msg) == text {
+					return true
+				}
+			}
+			return false
+		}
+		waitBob := collectSDKPushMessages(bob, aliceAID, 1, func(msg map[string]any) bool {
+			return getPayloadText(msg) == text
+		})
 
 		sendCtx, sendCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		_, sendErr := alice.Call(sendCtx, "message.send", map[string]any{
@@ -83,6 +95,10 @@ func waitForFederationDelivery(
 		})
 		sendCancel()
 		if sendErr == nil {
+			if pushed := waitBob(5 * time.Second); matches(pushed) {
+				return
+			}
+
 			pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			pullResult, pullErr := bob.Call(pullCtx, "message.pull", map[string]any{
 				"after_seq": 0,
@@ -96,14 +112,15 @@ func waitForFederationDelivery(
 					for _, raw := range msgsAny {
 						if msg, ok := raw.(map[string]any); ok {
 							lastMessages = append(lastMessages, msg)
-							from, _ := msg["from"].(string)
-							if from == aliceAID && getPayloadText(msg) == text {
+							if matches([]map[string]any{msg}) {
 								return
 							}
 						}
 					}
 				}
 			}
+		} else {
+			waitBob(time.Millisecond)
 		}
 
 		time.Sleep(2 * time.Second)

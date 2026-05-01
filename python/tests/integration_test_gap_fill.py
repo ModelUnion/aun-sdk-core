@@ -135,6 +135,7 @@ async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
     max_seq = 0
     while True:
         result = await client.call("message.pull", {"after_seq": after_seq, "limit": limit})
+        max_seq = max(max_seq, int(result.get("server_ack_seq") or 0), int(result.get("latest_seq") or 0))
         msgs = result.get("messages", [])
         if not msgs:
             return max_seq

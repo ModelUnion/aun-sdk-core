@@ -53,20 +53,29 @@ describe('P2P Message Gap Fill', { timeout: 30000 }, () => {
     await ensureConnected(alice, aliceAid);
     await ensureConnected(bob, bobAid);
 
+    const received: Array<{ seq: number; payload: any; from: string }> = [];
+    bob.on('message.received', (data: any) => {
+      if (data.from === aliceAid) {
+        received.push({ seq: data.seq, payload: data.payload, from: data.from });
+      }
+    });
+
     // Alice 发送 5 条消息
     for (let i = 1; i <= 5; i++) {
       await alice.call('message.send', { to: bobAid, payload: { type: 'text', text: `msg${i}` }, encrypt: false });
       await new Promise(r => setTimeout(r, 200));
     }
 
-    // 等待服务端处理
+    // 等待推送和服务端处理；full-direct 下在线收件方会先通过 push 收到并自动 ACK。
     await new Promise(r => setTimeout(r, 1500));
 
-    // Bob 拉取所有消息
-    const result = await bob.call('message.pull', { after_seq: 0, limit: 50 }) as {
-      messages?: Array<{ seq: number; payload: any; from: string }>;
-    };
-    const msgs = (result.messages ?? []).filter(m => m.from === aliceAid);
+    let msgs = received;
+    if (msgs.length < 5) {
+      const result = await bob.call('message.pull', { after_seq: 0, limit: 50 }) as {
+        messages?: Array<{ seq: number; payload: any; from: string }>;
+      };
+      msgs = (result.messages ?? []).filter(m => m.from === aliceAid);
+    }
 
     expect(msgs.length).toBe(5);
 
