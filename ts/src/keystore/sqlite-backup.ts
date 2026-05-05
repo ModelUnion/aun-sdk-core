@@ -7,15 +7,46 @@
  * - 业务层优先读取结构化主存，metadata 仅作为兼容视图和未过期回捞来源。
  */
 
-import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import type { JsonObject } from '../types.js';
 
 const SCHEMA_VERSION = 2;
 
 type JsonMap = JsonObject;
-type SQLiteParam = string | number | boolean | null | Buffer;
+type SQLiteParam = string | number | bigint | null | Buffer | Uint8Array;
+type NodeDatabaseSync = import('node:sqlite').DatabaseSync;
+type NodeDatabaseSyncOptions = import('node:sqlite').DatabaseSyncOptions;
+
+const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+  DatabaseSync: new (path: string, options?: NodeDatabaseSyncOptions) => NodeDatabaseSync;
+};
+
+function configureDatabase(db: NodeDatabaseSync, busyTimeoutMs: number): void {
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  const row = db.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: string } | undefined;
+  if (String(row?.journal_mode ?? '').toLowerCase() !== 'wal') {
+    throw new Error(`SQLite WAL 模式启用失败: journal_mode=${String(row?.journal_mode ?? '')}`);
+  }
+  db.exec('PRAGMA synchronous = NORMAL');
+}
+
+function runImmediateTransaction<T>(db: NodeDatabaseSync, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      if (db.isTransaction) db.exec('ROLLBACK');
+    } catch {
+      /* ignore rollback failure */
+    }
+    throw err;
+  }
+}
 
 function toNumber(value: string | number | boolean | null | undefined | object): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
@@ -31,7 +62,7 @@ function defaultNumber(...values: Array<string | number | boolean | null | undef
 }
 
 export class SQLiteBackup {
-  private _db: Database.Database | null = null;
+  private _db: NodeDatabaseSync | null = null;
   private _available = false;
 
   constructor(dbPath?: string) {
@@ -47,9 +78,8 @@ export class SQLiteBackup {
       } catch { /* ignore */ }
     }
     try {
-      this._db = new Database(dbPath);
-      this._db.pragma('journal_mode = WAL');
-      this._db.pragma('busy_timeout = 3000');
+      this._db = new DatabaseSync(dbPath, { timeout: 3000, readBigInts: false });
+      configureDatabase(this._db, 3000);
       this._initTables();
       this._available = true;
     } catch (err) {
@@ -62,7 +92,7 @@ export class SQLiteBackup {
   }
 
   close(): void {
-    this._db?.close();
+    if (this._db?.isOpen) this._db.close();
   }
 
   backupSeed(seed: Buffer): void {
@@ -70,7 +100,7 @@ export class SQLiteBackup {
   }
 
   restoreSeed(): Buffer | null {
-    const row = this._queryOne<{ seed: Buffer }>('SELECT seed FROM seed_backup WHERE id = 1');
+    const row = this._queryOne<{ seed: Buffer | Uint8Array }>('SELECT seed FROM seed_backup WHERE id = 1');
     return row ? Buffer.from(row.seed) : null;
   }
 
@@ -363,8 +393,7 @@ export class SQLiteBackup {
   private _runTransaction(fn: () => void, label: string): void {
     if (!this._db) return;
     try {
-      const txn = this._db.transaction(fn);
-      txn();
+      runImmediateTransaction(this._db, fn);
     } catch (err) {
       console.warn(`SQLite ${label} 失败: ${err}`);
     }

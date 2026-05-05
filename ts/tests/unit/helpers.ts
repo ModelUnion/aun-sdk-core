@@ -555,7 +555,10 @@ function derSet(content: Buffer): Buffer {
 }
 
 function derInteger(value: Buffer): Buffer {
-  // 确保正整数的前导 0
+  // DER INTEGER 必须使用最短编码；仅在最高位为 1 时补 0 保持正数。
+  while (value.length > 1 && value[0] === 0x00 && (value[1] & 0x80) === 0) {
+    value = value.subarray(1);
+  }
   if (value[0] & 0x80) {
     value = Buffer.concat([Buffer.from([0x00]), value]);
   }

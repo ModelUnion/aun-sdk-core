@@ -7,8 +7,8 @@
  * - 读取时兼容密文 JSON 与历史明文
  */
 
-import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 
 import type { SecretStore } from '../secret-store/index.js';
@@ -16,7 +16,39 @@ import type { SecretRecord } from '../types.js';
 
 const SCHEMA_VERSION = 1;
 
-const _dbPool = new Map<string, { db: Database.Database; refCount: number }>();
+type NodeDatabaseSync = import('node:sqlite').DatabaseSync;
+type NodeDatabaseSyncOptions = import('node:sqlite').DatabaseSyncOptions;
+
+const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+  DatabaseSync: new (path: string, options?: NodeDatabaseSyncOptions) => NodeDatabaseSync;
+};
+
+const _dbPool = new Map<string, { db: NodeDatabaseSync; refCount: number }>();
+
+function configureDatabase(db: NodeDatabaseSync, busyTimeoutMs: number): void {
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  const row = db.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: string } | undefined;
+  if (String(row?.journal_mode ?? '').toLowerCase() !== 'wal') {
+    throw new Error(`SQLite WAL 模式启用失败: journal_mode=${String(row?.journal_mode ?? '')}`);
+  }
+  db.exec('PRAGMA synchronous = NORMAL');
+}
+
+function runImmediateTransaction<T>(db: NodeDatabaseSync, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      if (db.isTransaction) db.exec('ROLLBACK');
+    } catch {
+      /* ignore rollback failure */
+    }
+    throw err;
+  }
+}
 
 const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS _schema_version (
@@ -93,7 +125,7 @@ function jsonParseObject(value: string): Record<string, unknown> {
 }
 
 export class AIDDatabase {
-  private _db: Database.Database;
+  private _db: NodeDatabaseSync;
   private _dbPath: string;
   private _secretStore: SecretStore | null;
   private _scope: string;
@@ -109,14 +141,8 @@ export class AIDDatabase {
       cached.refCount++;
       this._db = cached.db;
     } else {
-      this._db = new Database(dbPath);
-      try {
-        this._db.pragma('journal_mode = WAL');
-      } catch {
-        this._db.pragma('locking_mode = EXCLUSIVE');
-        this._db.pragma('journal_mode = DELETE');
-      }
-      this._db.pragma('busy_timeout = 5000');
+      this._db = new DatabaseSync(absPath, { timeout: 5000, readBigInts: false });
+      configureDatabase(this._db, 5000);
       _dbPool.set(absPath, { db: this._db, refCount: 1 });
     }
     this._initSchema();
@@ -128,10 +154,10 @@ export class AIDDatabase {
       cached.refCount--;
       if (cached.refCount <= 0) {
         _dbPool.delete(this._dbPath);
-        this._db.close();
+        if (this._db.isOpen) this._db.close();
       }
     } else {
-      this._db.close();
+      if (this._db.isOpen) this._db.close();
     }
   }
 
@@ -251,9 +277,9 @@ export class AIDDatabase {
       .map((row) => row.prekey_id);
     if (toDelete.length > 0) {
       const del = this._db.prepare('DELETE FROM prekeys WHERE device_id = ? AND prekey_id = ?');
-      this._db.transaction(() => {
+      runImmediateTransaction(this._db, () => {
         for (const id of toDelete) del.run(deviceId, id);
-      })();
+      });
     }
     return toDelete;
   }
@@ -375,7 +401,7 @@ export class AIDDatabase {
     const result = this._db.prepare(
       'DELETE FROM group_old_epochs WHERE group_id = ? AND updated_at <= ?',
     ).run(groupId, cutoffMs);
-    return result.changes;
+    return Number(result.changes);
   }
 
   storeGroupSecretTransition(groupId: string, opts: {
@@ -389,7 +415,7 @@ export class AIDDatabase {
     epochChainUnverifiedReason?: string | null;
     oldEpochRetentionMs: number;
   }): boolean {
-    const txn = this._db.transaction(() => {
+    return Boolean(runImmediateTransaction(this._db, () => {
       const now = Date.now();
       const epoch = Number(opts.epoch);
       const members = [...(opts.memberAids ?? [])].map((item) => String(item)).sort();
@@ -460,8 +486,7 @@ export class AIDDatabase {
 
       this._upsertGroupCurrent(groupId, epoch, opts.secret, this._buildGroupCurrentData(opts, members, now), now);
       return true;
-    });
-    return Boolean(txn());
+    }));
   }
 
   storeGroupSecretEpoch(groupId: string, opts: {
@@ -475,7 +500,7 @@ export class AIDDatabase {
     epochChainUnverifiedReason?: string | null;
     oldEpochRetentionMs: number;
   }): boolean {
-    const txn = this._db.transaction(() => {
+    return Boolean(runImmediateTransaction(this._db, () => {
       const now = Date.now();
       const epoch = Number(opts.epoch);
       const members = [...(opts.memberAids ?? [])].map((item) => String(item)).sort();
@@ -552,12 +577,11 @@ export class AIDDatabase {
       }
       this._upsertGroupOldEpoch(groupId, epoch, opts.secret, data, now, now + opts.oldEpochRetentionMs);
       return true;
-    });
-    return Boolean(txn());
+    }));
   }
 
   discardPendingGroupSecretState(groupId: string, epoch: number, rotationId: string): boolean {
-    const txn = this._db.transaction(() => {
+    return Boolean(runImmediateTransaction(this._db, () => {
       const rid = String(rotationId ?? '').trim();
       if (!rid) return false;
       const current = this._db.prepare(
@@ -580,8 +604,7 @@ export class AIDDatabase {
       this._upsertGroupCurrent(groupId, Number(old.epoch), secret, jsonParseObject(old.data), Date.now());
       this._db.prepare('DELETE FROM group_old_epochs WHERE group_id = ? AND epoch = ?').run(groupId, old.epoch);
       return true;
-    });
-    return Boolean(txn());
+    }));
   }
 
   private _buildGroupCurrentData(opts: {

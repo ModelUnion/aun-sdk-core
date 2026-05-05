@@ -19,6 +19,7 @@ import { AUNClient } from '../../src/index.js';
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
+const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 
 function runId(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 12);
@@ -32,6 +33,8 @@ function makeClient(): AUNClient {
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
+  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
+  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
   await client.auth.createAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth);

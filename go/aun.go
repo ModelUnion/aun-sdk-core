@@ -1,4 +1,4 @@
 package aun
 
 // Version SDK 版本号
-const Version = "0.2.11"
+const Version = "0.2.12"

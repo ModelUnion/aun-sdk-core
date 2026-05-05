@@ -5,8 +5,8 @@
  *
  * 前置条件：
  *   - Docker 环境运行中（docker compose up -d）
- *   - hosts 文件映射 *.agentid.pub → 127.0.0.1
- *   - Gateway 地址由 SDK 通过 AID 的 issuer domain 自动发现
+ *   - Docker network alias 可解析 gateway.agentid.pub
+ *   - Gateway 地址通过固定 alias 自动发现，测试 AID 不参与 DNS 解析
  *
  * 运行方法：
  *   npx vitest run tests/integration/e2ee.test.ts
@@ -30,6 +30,8 @@ const TEST_TIMEOUT = 30_000;
 
 /** 推送等待超时（毫秒） */
 const PUSH_TIMEOUT = 5_000;
+const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
+const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 
 // ── 辅助函数 ──────────────────────────────────────────────────
 
@@ -80,6 +82,8 @@ function copyIdentityTree(sourceRoot: string, targetRoot: string, aid: string): 
 
 /** 注册 AID 并连接到 Gateway */
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
+  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
+  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
   await client.auth.createAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth);

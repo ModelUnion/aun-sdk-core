@@ -2,16 +2,98 @@
  * KeyStore 单元测试 — 覆盖 FileSecretStore、FileKeyStore
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { execFile } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
+
+import { describe, it, expect, beforeEach } from 'vitest';
 
 import { FileSecretStore } from '../../src/secret-store/file-store.js';
 import { FileKeyStore } from '../../src/keystore/file.js';
 import type {
   GroupOldEpochRecord,
 } from '../../src/types.js';
+
+const execFileAsync = promisify(execFile);
+
+type KeystoreWorkerPayload = {
+  root: string;
+  seed: string;
+  aid: string;
+  worker: number;
+  rounds: number;
+  baseTime: number;
+};
+
+function writeKeystoreStressWorker(root: string): string {
+  const workerPath = join(root, 'keystore-multiprocess-worker.ts');
+  const fileKeyStoreUrl = pathToFileURL(join(process.cwd(), 'src', 'keystore', 'file.ts')).href;
+  writeFileSync(workerPath, `
+import { FileKeyStore } from ${JSON.stringify(fileKeyStoreUrl)};
+
+const payload = JSON.parse(process.argv[2] ?? '{}');
+const root = String(payload.root);
+const seed = String(payload.seed);
+const aid = String(payload.aid);
+const worker = Number(payload.worker);
+const rounds = Number(payload.rounds);
+const baseTime = Number(payload.baseTime);
+const deviceId = 'device-shared';
+const slotId = \`slot-\${worker}\`;
+const ks = new FileKeyStore(root, { encryptionSeed: seed });
+
+try {
+  const db = (ks as any)._getDB(aid);
+  for (let round = 1; round <= rounds; round += 1) {
+    const seq = worker * 10000 + round;
+    ks.saveInstanceState(aid, deviceId, slotId, {
+      worker,
+      round,
+      marker: \`state-\${worker}-\${round}\`,
+    });
+    ks.saveSeq(aid, deviceId, slotId, 'inbox', seq);
+    ks.saveSeq(aid, deviceId, slotId, \`ns-\${round % 4}\`, seq);
+    ks.saveE2EEPrekey(aid, \`pk-\${worker}-\${round}\`, {
+      private_key_pem: \`PEM-\${worker}-\${round}\`,
+      public_key: \`PUB-\${worker}-\${round}\`,
+      created_at: baseTime + seq,
+    }, \`device-\${worker}\`);
+    ks.saveE2EESession(aid, \`session-\${worker}-\${round}\`, {
+      key: \`session-key-\${worker}-\${round}\`,
+      worker,
+      round,
+    });
+    db.setToken(\`token_\${worker}_\${round}\`, \`token-value-\${worker}-\${round}\`);
+    db.setMetadata(\`meta_\${worker}_\${round}\`, JSON.stringify({ worker, round }));
+    const ok = ks.storeGroupSecretTransition(aid, \`group-\${worker}\`, {
+      epoch: round,
+      secret: Buffer.from(\`group-secret-\${worker}-\${round}\`).toString('base64'),
+      commitment: \`commit-\${worker}-\${round}\`,
+      memberAids: [aid, \`peer-\${worker}.agentid.pub\`],
+      oldEpochRetentionMs: 24 * 60 * 60 * 1000,
+    });
+    if (!ok) throw new Error(\`group transition failed: worker=\${worker} round=\${round}\`);
+  }
+  console.log(JSON.stringify({ worker, rounds }));
+} finally {
+  ks.close();
+}
+`);
+  return workerPath;
+}
+
+async function runKeystoreStressWorker(workerPath: string, payload: KeystoreWorkerPayload): Promise<void> {
+  const viteNodeBin = join(process.cwd(), 'node_modules', 'vite-node', 'vite-node.mjs');
+  await execFileAsync(process.execPath, [viteNodeBin, workerPath, JSON.stringify(payload)], {
+    cwd: process.cwd(),
+    timeout: 60_000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, AUN_ENV: 'test' },
+  });
+}
 
 // ── FileSecretStore 测试 ────────────────────────────────────
 
@@ -333,6 +415,135 @@ describe('FileKeyStore', () => {
     expect(singleton!.access_token).toBe('tok-a');
     expect(slot2!.access_token).toBe('tok-b');
   });
+
+  it('同进程多 FileKeyStore 实例共享同一 AID DB 时应隔离 slot/seq 并保留 group epoch', () => {
+    const seed = 'same-process-shared-seed';
+    const aid = 'same-process.agentid.pub';
+    const deviceId = 'device-shared';
+    const ks1 = new FileKeyStore(tmpDir, { encryptionSeed: seed });
+    const ks2 = new FileKeyStore(tmpDir, { encryptionSeed: seed });
+
+    try {
+      ks1.saveInstanceState(aid, deviceId, 'slot-a', { owner: 'a', cursor: 1 });
+      ks2.saveInstanceState(aid, deviceId, 'slot-b', { owner: 'b', cursor: 2 });
+      ks1.saveSeq(aid, deviceId, 'slot-a', 'inbox', 101);
+      ks2.saveSeq(aid, deviceId, 'slot-b', 'inbox', 202);
+      ks1.saveE2EEPrekey(aid, 'pk-a', { private_key_pem: 'PEM-A', public_key: 'PUB-A' }, 'device-a');
+      ks2.saveE2EEPrekey(aid, 'pk-b', { private_key_pem: 'PEM-B', public_key: 'PUB-B' }, 'device-b');
+      ks1.saveE2EESession!(aid, 'session-a', { key: 'SESSION-A', owner: 'a' });
+      ks2.saveE2EESession!(aid, 'session-b', { key: 'SESSION-B', owner: 'b' });
+
+      const oldSecret = Buffer.from('same-process-group-old').toString('base64');
+      const newSecret = Buffer.from('same-process-group-new').toString('base64');
+      ks1.storeGroupSecretTransition!(aid, 'group-shared', {
+        epoch: 1,
+        secret: oldSecret,
+        commitment: 'commit-1',
+        memberAids: [aid],
+        oldEpochRetentionMs: 24 * 60 * 60 * 1000,
+      });
+      ks2.storeGroupSecretTransition!(aid, 'group-shared', {
+        epoch: 2,
+        secret: newSecret,
+        commitment: 'commit-2',
+        memberAids: [aid, 'peer.agentid.pub'],
+        oldEpochRetentionMs: 24 * 60 * 60 * 1000,
+      });
+
+      const db1 = (ks1 as any)._getDB(aid);
+      db1.setToken('access_token', 'token-from-ks1');
+      db1.setMetadata('profile', JSON.stringify({ owner: 'ks1' }));
+
+      expect(ks2.loadInstanceState!(aid, deviceId, 'slot-a')).toMatchObject({ owner: 'a', cursor: 1 });
+      expect(ks1.loadInstanceState!(aid, deviceId, 'slot-b')).toMatchObject({ owner: 'b', cursor: 2 });
+      expect(ks2.loadSeq!(aid, deviceId, 'slot-a', 'inbox')).toBe(101);
+      expect(ks1.loadSeq!(aid, deviceId, 'slot-b', 'inbox')).toBe(202);
+      expect(ks2.loadE2EEPrekeys(aid, 'device-a')['pk-a']?.private_key_pem).toBe('PEM-A');
+      expect(ks1.loadE2EEPrekeys(aid, 'device-b')['pk-b']?.private_key_pem).toBe('PEM-B');
+
+      const sessions = ks1.loadE2EESessions!(aid);
+      expect(sessions.some((item) => item.session_id === 'session-a' && item.key === 'SESSION-A')).toBe(true);
+      expect(sessions.some((item) => item.session_id === 'session-b' && item.key === 'SESSION-B')).toBe(true);
+
+      expect(ks1.loadGroupSecretEpoch!(aid, 'group-shared')?.secret).toBe(newSecret);
+      expect(ks2.loadGroupSecretEpoch!(aid, 'group-shared', 1)?.secret).toBe(oldSecret);
+      expect(ks2.loadGroupSecretEpochs!(aid, 'group-shared').map((item) => item.epoch)).toEqual([2, 1]);
+      const db2 = (ks2 as any)._getDB(aid);
+      expect(db2.getToken('access_token')).toBe('token-from-ks1');
+      expect(JSON.parse(db2.getMetadata('profile') ?? '{}')).toEqual({ owner: 'ks1' });
+    } finally {
+      ks1.close();
+      ks2.close();
+    }
+  });
+
+  it('多进程共享同一 AID DB 并发写入时应覆盖 seq、instance、prekey、session、group epoch、token 和 metadata', async () => {
+    const workerPath = writeKeystoreStressWorker(tmpDir);
+    const seed = 'multiprocess-shared-seed';
+    const aid = 'multiprocess.agentid.pub';
+    const workers = 8;
+    const rounds = 16;
+    const baseTime = Date.now();
+
+    await Promise.all(Array.from({ length: workers }, (_, worker) => runKeystoreStressWorker(workerPath, {
+      root: tmpDir,
+      seed,
+      aid,
+      worker,
+      rounds,
+      baseTime,
+    })));
+
+    const ks = new FileKeyStore(tmpDir, { encryptionSeed: seed });
+    try {
+      const sessions = ks.loadE2EESessions!(aid);
+      expect(sessions).toHaveLength(workers * rounds);
+      const db = (ks as any)._getDB(aid);
+
+      for (let worker = 0; worker < workers; worker += 1) {
+        const slotId = `slot-${worker}`;
+        const deviceId = 'device-shared';
+        const finalSeq = worker * 10000 + rounds;
+        expect(ks.loadInstanceState!(aid, deviceId, slotId)).toMatchObject({
+          worker,
+          round: rounds,
+          marker: `state-${worker}-${rounds}`,
+        });
+        expect(ks.loadSeq!(aid, deviceId, slotId, 'inbox')).toBe(finalSeq);
+
+        const seqs = ks.loadAllSeqs!(aid, deviceId, slotId);
+        expect(seqs.inbox).toBe(finalSeq);
+        for (let ns = 0; ns < 4; ns += 1) {
+          const latestRound = Array.from({ length: rounds }, (_, index) => index + 1)
+            .filter((round) => round % 4 === ns)
+            .pop();
+          if (latestRound) expect(seqs[`ns-${ns}`]).toBe(worker * 10000 + latestRound);
+        }
+
+        const prekeys = ks.loadE2EEPrekeys(aid, `device-${worker}`);
+        expect(Object.keys(prekeys)).toHaveLength(rounds);
+        expect(prekeys[`pk-${worker}-${rounds}`]?.private_key_pem).toBe(`PEM-${worker}-${rounds}`);
+        expect(sessions.some((item) => item.session_id === `session-${worker}-${rounds}` && item.key === `session-key-${worker}-${rounds}`)).toBe(true);
+
+        const currentSecret = Buffer.from(`group-secret-${worker}-${rounds}`).toString('base64');
+        const firstSecret = Buffer.from(`group-secret-${worker}-1`).toString('base64');
+        const current = ks.loadGroupSecretEpoch!(aid, `group-${worker}`);
+        const old = ks.loadGroupSecretEpoch!(aid, `group-${worker}`, 1) as GroupOldEpochRecord;
+        const epochs = ks.loadGroupSecretEpochs!(aid, `group-${worker}`);
+        expect(current?.epoch).toBe(rounds);
+        expect(current?.secret).toBe(currentSecret);
+        expect(old.secret).toBe(firstSecret);
+        expect(epochs.map((item) => item.epoch).sort((a, b) => a - b)).toEqual(
+          Array.from({ length: rounds }, (_, index) => index + 1),
+        );
+
+        expect(db.getToken(`token_${worker}_${rounds}`)).toBe(`token-value-${worker}-${rounds}`);
+        expect(JSON.parse(db.getMetadata(`meta_${worker}_${rounds}`) ?? '{}')).toEqual({ worker, round: rounds });
+      }
+    } finally {
+      ks.close();
+    }
+  }, 90_000);
 
   it('cleanupE2EEPrekeys 应仅清理超过 7 天且不在最新 7 个里的 prekey', () => {
     const ks = new FileKeyStore(tmpDir);
