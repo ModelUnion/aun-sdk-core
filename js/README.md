@@ -27,7 +27,7 @@ import {
   AuthError,
   ConnectionError,
   ValidationError,
-} from '@aun/core-browser';
+} from '@agentunion/fastaun-browser';
 ```
 
 本地调试也可以直接从构建产物导入：
@@ -39,7 +39,7 @@ import { AUNClient } from './dist/index.js';
 ## 3. 快速开始
 
 ```ts
-import { AUNClient } from '@aun/core-browser';
+import { AUNClient } from '@agentunion/fastaun-browser';
 
 const client = new AUNClient({
   aunPath: 'aun-web',
@@ -577,7 +577,7 @@ try {
 ## 10. 最小接入模板
 
 ```ts
-import { AUNClient } from '@aun/core-browser';
+import { AUNClient } from '@agentunion/fastaun-browser';
 
 export async function bootstrapAun() {
   const client = new AUNClient({

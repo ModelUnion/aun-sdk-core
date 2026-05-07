@@ -1149,6 +1149,47 @@ describe('GROUP epoch 轮换竞态防护', () => {
       .rejects.toThrow('initial epoch sync has not completed');
   });
 
+  it('服务端 epoch 已领先且恢复超时时不应降级调用 group.send', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      (client as any)._state = 'connected';
+      (client as any)._aid = 'alice.aid.com';
+      (client as any)._identity = { aid: 'alice.aid.com' };
+      (client as any)._groupSynced.add('g1');
+      (client as any)._groupE2ee = {
+        currentEpoch: vi.fn().mockResolvedValue(1),
+        loadSecret: vi.fn().mockReturnValue({ epoch: 1, commitment: 'c1', member_aids: ['alice.aid.com'] }),
+        encrypt: vi.fn(),
+        encryptWithEpoch: vi.fn(),
+        getMemberAids: vi.fn().mockReturnValue([]),
+      };
+      vi.spyOn(client as any, '_requestGroupKeyFromCandidates').mockResolvedValue(undefined);
+      const transportCall = vi.fn().mockImplementation(async (method: string) => {
+        if (method === 'group.e2ee.get_epoch') {
+          return { epoch: 2, committed_epoch: 2, recovery_candidates: ['owner.aid.com'] };
+        }
+        if (method === 'group.send') return { ok: true };
+        return {};
+      });
+      (client as any)._transport.call = transportCall;
+
+      const sendPromise = (client as any)._sendGroupEncrypted({
+        group_id: 'g1',
+        payload: { type: 'text', text: 'hello' },
+      });
+      const assertion = expect(sendPromise).rejects.toThrow('key recovery has not completed');
+      await vi.advanceTimersByTimeAsync(5500);
+
+      await assertion;
+      expect(transportCall.mock.calls.some(([method]) => method === 'group.send')).toBe(false);
+      expect((client as any)._groupE2ee.encryptWithEpoch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
   it('stale pending secret 不应让 epoch key recovery 返回成功', async () => {
     const client = new AUNClient();
     (client as any)._groupE2ee = {

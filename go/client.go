@@ -242,6 +242,7 @@ type AUNClient struct {
 	closing      atomic.Bool
 	reconnecting atomic.Bool
 	serverKicked atomic.Bool
+	tokenRefreshFailures atomic.Int32
 
 	// 组件
 	crypto    *CryptoProvider
@@ -3877,9 +3878,28 @@ func (c *AUNClient) tokenRefreshLoop(ctx context.Context) {
 		// 刷新 token
 		refreshedIdentity, err := c.auth.RefreshCachedTokens(ctx, gateway, identity)
 		if err != nil {
-			log.Printf("token 刷新失败: %v", err)
+			var authErr *AuthError
+			if errors.As(err, &authErr) {
+				failures := int(c.tokenRefreshFailures.Add(1))
+				if failures >= 3 {
+					log.Printf("token 刷新连续失败 %d 次，停止刷新循环并触发重连", failures)
+					c.events.Publish("token.refresh_exhausted", map[string]any{
+						"consecutive_failures": failures,
+						"last_error":           err.Error(),
+					})
+					c.tokenRefreshFailures.Store(0)
+					c.handleTransportDisconnect(
+						fmt.Errorf("token refresh exhausted, triggering reconnect"), -1,
+					)
+					return
+				}
+				log.Printf("token 刷新失败 (%d/3): %v", failures, err)
+			} else {
+				log.Printf("token 刷新失败: %v", err)
+			}
 			continue
 		}
+		c.tokenRefreshFailures.Store(0)
 
 		c.mu.Lock()
 		c.identity = refreshedIdentity

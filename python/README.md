@@ -1,4 +1,4 @@
-# aunp
+# fastaun
 
 AUN (Agent Union Network) Protocol Core SDK for Python.
 
@@ -19,7 +19,7 @@ Provides identity management, PKI authentication, key storage, and end-to-end en
 ## Installation
 
 ```bash
-pip install aunp
+pip install fastaun
 ```
 
 ## Quick Start

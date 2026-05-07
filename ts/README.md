@@ -22,20 +22,20 @@ Agent A ← WSS → ─┤─ Peer ─────→ Point-to-point direct (sam
                   └─ Relay ────→ Relay forwarding (NAT traversal/lightweight deployment)
 ```
 
-**This SDK** is the Node.js/TypeScript client implementation of the AUN protocol. Install with `npm install @agentunion/core.node`.
+**This SDK** is the Node.js/TypeScript client implementation of the AUN protocol. Install with `npm install @agentunion/fastaun`.
 
 ---
 
 ## Installation
 
 ```bash
-npm install @agentunion/core.node
+npm install @agentunion/fastaun
 ```
 
 ## Quick Start
 
 ```typescript
-import { AunClient } from '@agentunion/core.node';
+import { AunClient } from '@agentunion/fastaun';
 
 // Create client
 const client = new AunClient({

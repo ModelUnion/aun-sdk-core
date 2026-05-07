@@ -20,6 +20,7 @@ from aun_core.client import _CachedPeerCert
 from aun_core.e2ee import (
     build_key_distribution,
     build_membership_manifest,
+    compute_epoch_chain,
     sign_membership_manifest,
     compute_membership_commitment,
     encrypt_group_message,
@@ -289,7 +290,24 @@ class TestPY002KeyRecoveryRetry:
             pk_pem,
         )
         dist = build_key_distribution(_GRP, 1, gs, _MEMBERS, _AID_ALICE, manifest=manifest)
+        dist["rotation_id"] = "rot-test-batch2"
+        dist["epoch_chain"] = compute_epoch_chain(None, 1, dist["commitment"], _AID_ALICE)
         key_msg = {"from": _AID_ALICE, "message_id": "key-dist-1", "payload": dist}
+
+        async def fake_call(method, params=None):
+            if method == "group.e2ee.get_epoch":
+                return {
+                    "epoch": 1,
+                    "committed_epoch": 1,
+                    "committed_rotation": {
+                        "rotation_id": "rot-test-batch2",
+                        "target_epoch": 1,
+                        "key_commitment": dist["commitment"],
+                    },
+                }
+            return {}
+
+        client._transport.call = AsyncMock(side_effect=fake_call)
 
         # 处理密钥分发消息（应触发 _retry_pending_decrypt_msgs）
         handled = await client._try_handle_group_key_message(key_msg)

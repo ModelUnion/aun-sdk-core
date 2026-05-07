@@ -1329,6 +1329,67 @@ func TestEnsureGroupEpochReadyRecoversInitialEpochZero(t *testing.T) {
 	}
 }
 
+func TestSendGroupEncryptedRefusesFallbackWhenEpochRecoveryTimesOut(t *testing.T) {
+	aid := "alice.example.com"
+	groupID := "g-recovery-timeout.example.com"
+	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
+	members := []string{aid}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 1, groupID, secret)
+	chain := ComputeEpochChain("", 1, commitment, aid)
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.pull":
+			return map[string]any{"messages": []any{}}
+		case "group.e2ee.get_epoch":
+			return map[string]any{"epoch": 2, "committed_epoch": 2}
+		case "group.send":
+			return map[string]any{"ok": true}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	if ok, err := StoreGroupSecret(c.keyStore, aid, groupID, 1, secret, commitment, members, chain); err != nil || !ok {
+		t.Fatalf("保存群密钥失败: ok=%v err=%v", ok, err)
+	}
+	c.mu.Lock()
+	c.aid = aid
+	c.identity = identity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	_, err := c.Call(ctx, "group.send", map[string]any{
+		"group_id": groupID,
+		"payload":  map[string]any{"type": "text", "text": "hello"},
+	})
+	if err == nil {
+		t.Fatal("epoch recovery 超时后不应降级发送成功")
+	}
+	if !strings.Contains(err.Error(), "key recovery has not completed") {
+		t.Fatalf("错误应说明密钥恢复未完成，实际: %v", err)
+	}
+	for _, call := range getCalls() {
+		if call.Method == "group.send" {
+			t.Fatalf("不应在本地 epoch 落后且恢复失败时调用 group.send: calls=%#v", getCalls())
+		}
+	}
+}
+
 func TestRecoverGroupEpochKeyChecksPendingSecretAgainstServer(t *testing.T) {
 	aid := "alice.example.com"
 	groupID := "g-stale-pending.example.com"

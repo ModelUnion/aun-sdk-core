@@ -131,6 +131,8 @@ class TestGroupSendEncrypt:
         async def fake_call(method, params):
             sent_params["method"] = method
             sent_params["params"] = params
+            if method == "group.e2ee.get_epoch":
+                return {"epoch": 1, "committed_epoch": 1}
             return {"ok": True}
 
         monkeypatch.setattr(client._transport, "call", fake_call)
@@ -314,8 +316,13 @@ class TestGroupSendEncrypt:
                 return {"epoch": 2, "pending_rotation_id": "rot-2", "commitment": c2}
             return None
 
-        def fake_encrypt_with_epoch(group_id, epoch, payload):
-            return {"type": "e2ee.group_encrypted", "epoch": epoch, "payload": payload}
+        def fake_encrypt_with_epoch(group_id, epoch, payload, **kwargs):
+            return {
+                "type": "e2ee.group_encrypted",
+                "epoch": epoch,
+                "payload": payload,
+                **kwargs,
+            }
 
         async def fake_transport(method, params):
             nonlocal get_epoch_calls
@@ -2145,7 +2152,7 @@ class TestGroupEpochRaceHardening:
                 },
             }
 
-        async def fake_request(group_id, epoch, epoch_result):
+        async def fake_request(group_id, epoch, epoch_result, **kwargs):
             recovery_requests.append((group_id, epoch, epoch_result))
 
         monkeypatch.setattr(client, "call", fake_call)
@@ -2179,7 +2186,7 @@ class TestGroupEpochRaceHardening:
             assert method == "group.e2ee.get_epoch"
             return {"epoch": 2, "committed_epoch": 2}
 
-        async def fake_request(group_id, epoch, epoch_result):
+        async def fake_request(group_id, epoch, epoch_result, **kwargs):
             return None
 
         monkeypatch.setattr(client._group_e2ee, "load_secret", fake_load_secret)

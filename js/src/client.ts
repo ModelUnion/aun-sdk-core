@@ -407,6 +407,7 @@ export class AUNClient {
   private _tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** 非连接状态下 token 刷新的退避计数器 */
   private _tokenDisconnectedRetries = 0;
+  private _tokenRefreshFailures = 0;
   private _prekeyRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _groupEpochCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private _groupEpochRotateTimer: ReturnType<typeof setInterval> | null = null;
@@ -3858,9 +3859,22 @@ export class AUNClient {
             aid: identity.aid,
             expires_at: identity.access_token_expires_at,
           });
+          this._tokenRefreshFailures = 0;
         } catch (exc) {
           if (exc instanceof AuthError) {
-            console.warn('token 刷新失败，下次重试:', exc);
+            this._tokenRefreshFailures++;
+            if (this._tokenRefreshFailures >= 3) {
+              console.warn(`token 刷新连续失败 ${this._tokenRefreshFailures} 次，停止刷新循环并触发重连`);
+              this._dispatcher.publish('token.refresh_exhausted', {
+                aid: this._identity?.aid ?? null,
+                consecutive_failures: this._tokenRefreshFailures,
+                last_error: String(exc),
+              });
+              this._tokenRefreshFailures = 0;
+              this._handleTransportDisconnect(new Error('token refresh exhausted, triggering reconnect'));
+              return;
+            }
+            console.warn(`token 刷新失败 (${this._tokenRefreshFailures}/3)，下次重试:`, exc);
           } else {
             this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) });
           }

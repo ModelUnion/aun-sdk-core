@@ -25,6 +25,7 @@ from aun_core.e2ee import (
     generate_group_secret,
     store_group_secret,
 )
+from aun_core.errors import StateError
 
 
 # ── 辅助函数 ──────────────────────────────────────────────
@@ -213,7 +214,7 @@ class TestPY005EpochWait:
         # mock _request_group_key_from：模拟密钥请求后异步收到密钥
         original_request = client._request_group_key_from
 
-        async def mock_request(group_id, target_aid):
+        async def mock_request(group_id, target_aid, **kwargs):
             nonlocal key_request_sent
             key_request_sent = True
             # 模拟请求发出后短暂延迟，密钥到达
@@ -237,7 +238,7 @@ class TestPY005EpochWait:
 
     @pytest.mark.asyncio
     async def test_timeout_degrades_with_old_epoch(self, tmp_path):
-        """等待超时后应降级使用旧 epoch 发送。"""
+        """等待超时后不应降级发送，应直接失败。"""
         client = _make_client(tmp_path, aid=_AID_BOB)
         gs_old = _store_secret(client, epoch=1)
 
@@ -256,7 +257,7 @@ class TestPY005EpochWait:
         client._transport.call = AsyncMock(side_effect=mock_call)
 
         # mock _request_group_key_from：不存入新密钥（模拟恢复失败）
-        async def mock_request_fail(group_id, target_aid):
+        async def mock_request_fail(group_id, target_aid, **kwargs):
             pass  # 不做任何事，密钥恢复将超时
 
         client._request_group_key_from = mock_request_fail
@@ -264,13 +265,13 @@ class TestPY005EpochWait:
         # 缩短等待时间
         with patch("aun_core.client._KEY_WAIT_TIMEOUT_S", 0.3), \
              patch("aun_core.client._KEY_WAIT_POLL_INTERVAL_S", 0.05):
-            await client._send_group_encrypted({
-                "group_id": _GRP,
-                "payload": {"type": "text", "text": "test"},
-            })
+            with pytest.raises(StateError, match="key recovery has not completed"):
+                await client._send_group_encrypted({
+                    "group_id": _GRP,
+                    "payload": {"type": "text", "text": "test"},
+                })
 
-        # 即使超时，也应最终发送消息
-        assert send_called, "超时后应降级使用旧 epoch 发送"
+        assert not send_called, "超时后不应降级发送"
 
     @pytest.mark.asyncio
     async def test_same_epoch_no_wait(self, tmp_path):

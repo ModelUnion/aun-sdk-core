@@ -336,13 +336,9 @@ class TestServerSideSignatureVerification:
     @staticmethod
     def _find_service_py() -> str:
         """查找 group/service.py 的路径。"""
-        # 从测试文件位置向上回溯到项目根目录
-        candidates = [
-            Path(__file__).resolve().parents[4] / "extensions" / "services" / "group" / "service.py",
-            Path(__file__).resolve().parents[3] / "extensions" / "services" / "group" / "service.py",
-            Path(__file__).resolve().parents[5] / "extensions" / "services" / "group" / "service.py",
-        ]
-        for p in candidates:
+        current = Path(__file__).resolve()
+        for parent in [current.parent, *current.parents]:
+            p = parent / "extensions" / "services" / "group" / "service.py"
             if p.exists():
                 return str(p)
         # 尝试从环境变量

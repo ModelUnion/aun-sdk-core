@@ -64,6 +64,8 @@ _RECONNECT_MIN_BASE_DELAY = 1.0
 _RECONNECT_MAX_BASE_DELAY = 64.0
 _GROUP_ROTATION_LEASE_MS = 120000
 _GROUP_ROTATION_RETRY_MAX_DELAY = 300.0
+_KEY_WAIT_TIMEOUT_S = 5.0
+_KEY_WAIT_POLL_INTERVAL_S = 0.15
 
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
     "auto_reconnect": True,
@@ -1303,7 +1305,7 @@ class AUNClient:
         await self._request_group_key_from_candidates(group_id, epoch, epoch_result)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(_KEY_WAIT_POLL_INTERVAL_S)
             secret = self._group_e2ee.load_secret(group_id, epoch)
             if await self._group_epoch_secret_ready_for_recovery(group_id, epoch, secret):
                 self._schedule_retry_pending_decrypt_msgs(group_id)
@@ -1393,9 +1395,9 @@ class AUNClient:
         if server_epoch <= local_epoch:
             if not strict or server_epoch <= 0:
                 return
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + _KEY_WAIT_TIMEOUT_S
             while time.monotonic() < deadline:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(_KEY_WAIT_POLL_INTERVAL_S)
                 refreshed = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
                 refreshed_epoch = int(refreshed.get("epoch", 0) if isinstance(refreshed, dict) else 0)
                 current_local = self._group_e2ee.current_epoch(group_id) or 0
@@ -1412,9 +1414,9 @@ class AUNClient:
         _client_log.warning("群 %s 本地 epoch=%d < 服务端 epoch=%d，触发密钥恢复", group_id, local_epoch, server_epoch)
         await self._request_group_key_from_candidates(group_id, server_epoch, epoch_result)
 
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + _KEY_WAIT_TIMEOUT_S
         while time.monotonic() < deadline:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(_KEY_WAIT_POLL_INTERVAL_S)
             refreshed_epoch = self._group_e2ee.current_epoch(group_id)
             if refreshed_epoch is not None and refreshed_epoch >= server_epoch:
                 return
@@ -1618,6 +1620,7 @@ class AUNClient:
             # 记录已推送的 seq，补洞路径据此去重
             if seq is not None and self._aid:
                 self._pushed_seqs.setdefault(ns, set()).add(int(seq))
+                self._enforce_pushed_seqs_limit(ns)
             await self._dispatcher.publish("message.received", decrypted)
 
             # auto-ack push 消息：ack contiguous_seq（连续确认到的最高位置，避免空洞时跳跃推进）
@@ -3205,7 +3208,7 @@ class AUNClient:
                     self._token_refresh_failures += 1
                     if self._token_refresh_failures >= _TOKEN_REFRESH_MAX_FAILURES:
                         _client_log.warning(
-                            "token 刷新连续失败 %d 次，发布 exhausted 事件",
+                            "token 刷新连续失败 %d 次，停止刷新循环并触发重连",
                             self._token_refresh_failures,
                         )
                         await self._dispatcher.publish("token.refresh_exhausted", {
@@ -3214,6 +3217,12 @@ class AUNClient:
                             "last_error": str(exc),
                         })
                         self._token_refresh_failures = 0
+                        # 主动触发断线重连，让 connect_session 的 fallback 链
+                        # （cached_token → refresh_token → 完整两阶段登录）接管
+                        await self._handle_transport_disconnect(
+                            ConnectionError("token refresh exhausted, triggering reconnect")
+                        )
+                        return
                     else:
                         _client_log.debug(
                             "token 刷新失败 (%d/%d)，下次重试: %s",

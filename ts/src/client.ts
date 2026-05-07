@@ -456,6 +456,7 @@ export class AUNClient {
   // ── 后台任务定时器 ──────────────────────────────────────────
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private _tokenRefreshFailures = 0;
   private _prekeyRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private _groupEpochCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private _groupEpochRotateTimer: ReturnType<typeof setInterval> | null = null;
@@ -3945,9 +3946,22 @@ export class AUNClient {
             aid: identity.aid,
             expires_at: identity.access_token_expires_at,
           });
+          this._tokenRefreshFailures = 0;
         } catch (exc) {
           if (exc instanceof AuthError) {
-            _clientLog('debug', 'token 刷新失败，下次重试: %s', exc);
+            this._tokenRefreshFailures++;
+            if (this._tokenRefreshFailures >= 3) {
+              _clientLog('warn', 'token 刷新连续失败 %d 次，停止刷新循环并触发重连', this._tokenRefreshFailures);
+              await this._dispatcher.publish('token.refresh_exhausted', {
+                aid: this._identity?.aid ?? null,
+                consecutive_failures: this._tokenRefreshFailures,
+                last_error: String(exc),
+              });
+              this._tokenRefreshFailures = 0;
+              this._handleTransportDisconnect(new Error('token refresh exhausted, triggering reconnect'));
+              return;
+            }
+            _clientLog('debug', 'token 刷新失败 (%d/3)，下次重试: %s', this._tokenRefreshFailures, exc);
           } else {
             await this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) });
           }
