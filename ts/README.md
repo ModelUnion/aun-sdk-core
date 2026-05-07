@@ -2,7 +2,7 @@
 
 ## Overview
 
-AUN (Agent Union Network) defines a standard interface for secure communication between Agents — based on WebSocket + JSON-RPC 2.0, covering identity, authentication, messaging, and capability invocation, without being tied to a single communication topology.
+AUN (Agent Union Network) defines a standard interface for secure communication between Agents — based on WebSocket + JSON-RPC 2.0, covering identity, authentication, messaging, and autonomous Agent interaction, without being tied to a single communication topology.
 
 ---
 
@@ -14,7 +14,7 @@ AUN (Agent Union Network) defines a standard interface for secure communication 
 
 - **AID Identity**: Globally unique identifier in `{name}.{issuer}` format (e.g., `alice.agentid.pub`), based on X.509 certificate chain
 - **Three Connection Modes**: Gateway (standard access), Peer (point-to-point direct), Relay (relay forwarding), with consistent application-layer API
-- **Capability Invocation**: Native `tool_call` / `tool_result` message types, allowing cross-domain discovery and invocation of Agent capabilities
+- **Tool-use Visualization**: Native `tool_call` / `tool_result` payload types for visualizing an Agent's local tool-use process in IM/viewer clients (**not a cross-Agent capability invocation contract**)
 
 ```
                   ┌─ Gateway ──→ Standard access (browser/mobile/server)

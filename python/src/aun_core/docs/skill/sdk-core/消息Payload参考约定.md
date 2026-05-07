@@ -22,8 +22,8 @@
 | `event` | 应用层事件通知 | 任务完成、流程节点变化、异步回调 |
 | `json` | 结构化业务数据 | 参数、配置、计划、表单数据 |
 | `json` + `kind: "poll"` | 投票或表单 | 群内投票、选项收集 |
-| `tool_call` | 工具或能力调用请求 | Agent 调用远端能力 |
-| `tool_result` | 工具或能力调用结果 | 返回执行结果或错误 |
+| `tool_call` | Agent 工具调用过程标注（请求段） | 发送方标注自身正在调用的本地工具，供查看端渲染 |
+| `tool_result` | Agent 工具调用过程标注（结果段） | 同一发送方标注本地工具执行结果，供查看端渲染 |
 | `custom` | 应用自定义消息 | 私有卡片、业务专用对象 |
 
 接收端应对未知 `payload.type`、未知 `kind` 和缺失展示字段做降级处理，优先使用 `text` / `fallback_text` 展示。
@@ -386,15 +386,22 @@
 }
 ```
 
-### `tool_call`：工具调用请求
+### `tool_call`：Agent 工具调用过程标注（请求段）
+
+> **定位说明（重要）**：本 payload 类型仅用于发送方把自身正在使用的本地工具的过程结构化展示给查看方，**不构成对接收方的调用契约**。
+>
+> - 接收方收到 `tool_call` **不需要执行任何动作**，**不需要返回 `tool_result`**
+> - `tool_result` 由**同一发送方**在本地工具执行完成后再发出
+> - `call_id` 用于把同一发送方先后发出的 `tool_call` 与 `tool_result` 在查看端关联展示
+> - 跨 Agent 的协作请求走普通消息（`text` / `json`），由接收方 Agent 自主决定是否、何时、如何回应
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| `call_id` | string | 是 | 调用 ID，用于关联结果 |
-| `name` | string | 是 | 工具或能力名称 |
-| `arguments` | object | 是 | 调用参数 |
-| `timeout_ms` | integer | 否 | 期望超时时间 |
-| `meta` | object | 否 | 调用方附加元数据 |
+| `call_id` | string | 是 | 调用 ID，用于在查看端关联同一发送方后续的 `tool_result` |
+| `name` | string | 是 | 发送方调用的本地工具或能力名称 |
+| `arguments` | object | 是 | 调用参数（用于展示） |
+| `timeout_ms` | integer | 否 | 发送方期望的超时时间（仅展示用） |
+| `meta` | object | 否 | 附加元数据 |
 
 ```json
 {
@@ -406,13 +413,15 @@
 }
 ```
 
-### `tool_result`：工具调用结果
+### `tool_result`：Agent 工具调用过程标注（结果段）
+
+由**同一发送方**在本地工具执行完毕后发出，与先前发出的 `tool_call` 通过 `call_id` 关联，供查看端渲染工具调用结果。**不是对其他 Agent `tool_call` 的响应**。
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| `call_id` | string | 是 | 对应 `tool_call.call_id` |
-| `ok` | boolean | 是 | 是否成功 |
-| `result` | object | 否 | 成功结果 |
+| `call_id` | string | 是 | 关联同一发送方先前发出的 `tool_call.call_id` |
+| `ok` | boolean | 是 | 工具是否执行成功 |
+| `result` | object | 否 | 成功结果（用于展示） |
 | `error` | object | 否 | 失败信息，推荐含 `code`、`message` |
 
 ```json
