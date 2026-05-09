@@ -584,7 +584,7 @@ def test_call_does_not_forward_message_send_delivery_mode():
     calls = []
 
     class _Transport:
-        async def call(self, method, params):
+        async def call(self, method, params, **kwargs):
             calls.append((method, dict(params)))
             return {"ok": True}
 
@@ -612,7 +612,7 @@ def test_call_injects_message_slot_context():
     calls = []
 
     class _Transport:
-        async def call(self, method, params):
+        async def call(self, method, params, **kwargs):
             calls.append((method, dict(params)))
             if method == "message.pull":
                 return {"messages": [], "count": 0, "latest_seq": 0}
@@ -643,7 +643,7 @@ def test_message_pull_empty_result_applies_server_ack_floor():
     calls = []
 
     class _Transport:
-        async def call(self, method, params):
+        async def call(self, method, params, **kwargs):
             calls.append((method, dict(params)))
             if method == "message.pull":
                 return {"messages": [], "count": 0, "latest_seq": 7, "server_ack_seq": 7}
@@ -655,7 +655,7 @@ def test_message_pull_empty_result_applies_server_ack_floor():
 
     assert result["server_ack_seq"] == 7
     assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 7
-    assert calls[-1] == ("message.ack", {"seq": 7, "device_id": "device-1"})
+    assert calls[-1] == ("message.ack", {"seq": 7, "device_id": "device-1", "slot_id": "slot-a"})
 
 
 def test_call_rejects_message_slot_context_override():
@@ -808,6 +808,113 @@ def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
 
     assert result == {"ok": True}
     assert calls == [("bob.example.com", "sha256:abc")]
+
+
+def test_message_thought_put_encrypts_and_signs(monkeypatch):
+    client = AUNClient()
+    client._state = "connected"
+    captured = {}
+
+    async def _fake_fetch_peer_prekey(peer_aid):
+        assert peer_aid == "bob.example.com"
+        return {"prekey_id": "pk-1", "cert_fingerprint": "sha256:abc"}
+
+    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
+        assert (aid, cert_fingerprint) == ("bob.example.com", "sha256:abc")
+        return b"PEM"
+
+    def _fake_encrypt_copy_payload(**kwargs):
+        assert kwargs["logical_to_aid"] == "bob.example.com"
+        assert kwargs["message_id"].startswith("mt-")
+        return {"type": "e2ee.encrypted", "ciphertext": "ok"}, {
+            "encrypted": True,
+            "forward_secrecy": True,
+            "mode": "prekey_ecdh_v2",
+        }
+
+    def _fake_sign(method, params):
+        assert method == "message.thought.put"
+        params["client_signature"] = {"aid": "alice.example.com"}
+
+    async def _fake_call(method, params):
+        captured["method"] = method
+        captured["params"] = params
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_fetch_peer_prekey", _fake_fetch_peer_prekey)
+    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
+    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
+    monkeypatch.setattr(client, "_sign_client_operation", _fake_sign)
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client.call("message.thought.put", {
+        "to": "bob.example.com",
+        "reply_to": {"message_id": "msg-root"},
+        "payload": {"type": "thought", "text": "推理片段"},
+    }))
+
+    assert result == {"ok": True}
+    assert captured["method"] == "message.thought.put"
+    params = captured["params"]
+    assert params["to"] == "bob.example.com"
+    assert params["reply_to"]["message_id"] == "msg-root"
+    assert params["encrypted"] is True
+    assert params["type"] == "e2ee.encrypted"
+    assert params["payload"]["type"] == "e2ee.encrypted"
+    assert params["thought_id"].startswith("mt-")
+    assert params["client_signature"] == {"aid": "alice.example.com"}
+
+
+def test_message_thought_get_auto_decrypts(monkeypatch):
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "bob.example.com"
+
+    async def _fake_call(method, params):
+        assert method == "message.thought.get"
+        return {
+            "found": True,
+            "sender_aid": "alice.example.com",
+            "peer_aid": "bob.example.com",
+            "reply_to": {"message_id": "msg-root"},
+            "thoughts": [
+                {
+                    "thought_id": "mt-1",
+                    "from": "alice.example.com",
+                    "to": "bob.example.com",
+                    "reply_to": {"message_id": "msg-root"},
+                    "payload": {"type": "e2ee.encrypted", "ciphertext": "abc"},
+                    "created_at": 1710504000000,
+                },
+            ],
+        }
+
+    async def _fake_cert(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(client, "_ensure_sender_cert_cached", _fake_cert)
+    monkeypatch.setattr(client._e2ee, "_should_decrypt_for_current_aid", lambda _m, _p: True)
+    monkeypatch.setattr(client._e2ee, "_decrypt_message", lambda _m, source="": {
+        "payload": {"type": "thought", "text": "只给感兴趣的人看"},
+        "e2ee": {"encryption_mode": "prekey_ecdh_v2"},
+    })
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client.call("message.thought.get", {
+        "sender_aid": "alice.example.com",
+        "reply_to": {"message_id": "msg-root"},
+    }))
+
+    assert result["thoughts"] == [{
+        "thought_id": "mt-1",
+        "message_id": "mt-1",
+        "reply_to": {"message_id": "msg-root"},
+        "from": "alice.example.com",
+        "to": "bob.example.com",
+        "payload": {"type": "thought", "text": "只给感兴趣的人看"},
+        "created_at": 1710504000000,
+        "e2ee": {"encryption_mode": "prekey_ecdh_v2"},
+    }]
 
 
 def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeypatch):
@@ -1237,6 +1344,26 @@ def test_seq_tracker_state_isolated_between_slots(tmp_path):
     assert client_b._seq_tracker.export_state() == {}
 
 
+def test_seq_tracking_context_switch_clears_pending_runtime_queues(tmp_path):
+    client = AUNClient({"aun_path": str(tmp_path / "aun_ctx_switch")})
+    client._aid = "alice.aid.com"
+    client._device_id = "device-a"
+    client._slot_id = "slot-a"
+    client._seq_tracker_context = ("alice.aid.com", "device-a", "slot-a")
+    client._pending_ordered_msgs["p2p:alice.aid.com"] = {
+        3: ("message.received", {"seq": 3})
+    }
+    client._pending_decrypt_msgs["group:g1"] = [
+        {"group_id": "g1", "seq": 4, "payload": {"type": "e2ee.group_encrypted"}}
+    ]
+
+    client._slot_id = "slot-b"
+    client._refresh_seq_tracking_context()
+
+    assert client._pending_ordered_msgs == {}
+    assert client._pending_decrypt_msgs == {}
+
+
 def test_schedule_prekey_replenish_only_once_per_consumed_prekey():
     """inflight 限流：同时多次消耗 prekey 只启动一个 upload，但 pending 会在 inflight 完成后再触发一次"""
     client = AUNClient()
@@ -1371,6 +1498,145 @@ async def test_group_changed_triggers_fill_when_gap():
     await client._on_raw_group_changed(data)
     await asyncio.sleep(0)
     assert fill_calls == ["G1"]
+
+
+@pytest.mark.asyncio
+async def test_group_changed_first_event_gap_does_not_force_local_cursor():
+    """首次看到 event_seq>1 时应补洞，不能用通知序号本地跳过历史事件。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._seq_tracker = SeqTracker()
+    client._loop = asyncio.get_running_loop()
+    client._verify_event_signature = AsyncMock(return_value=True)
+    fill_calls: list[str] = []
+
+    async def fake_fill(gid):
+        fill_calls.append(gid)
+
+    client._fill_group_event_gap = fake_fill
+
+    await client._on_raw_group_changed({"group_id": "G1", "event_seq": 5, "action": "foo"})
+    await asyncio.sleep(0)
+
+    assert fill_calls == ["G1"]
+    assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 0
+
+
+@pytest.mark.asyncio
+async def test_gap_fill_allows_zero_contiguous_and_uses_server_event_cursor():
+    """补洞 after=0 时应请求服务端，由服务端 cursor floor 决定本地推进位置。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    client._state = "connected"
+    client._closing = False
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._seq_tracker = SeqTracker()
+    client._gap_fill_done = {}
+    client._gap_fill_active = False
+    client._pushed_seqs = {}
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._persist_seq = lambda ns: None
+    client._prune_pushed_seqs = lambda ns: None
+    client._verify_event_signature = AsyncMock(return_value=True)
+    transport = MagicMock()
+    transport.call = AsyncMock(return_value={"ok": True})
+    client._transport = transport
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call(method, params):
+        calls.append((method, dict(params)))
+        if method == "message.pull":
+            return {"messages": [], "count": 0, "server_ack_seq": 0}
+        if method == "group.pull":
+            return {"messages": [], "count": 0, "cursor": {"current_seq": 0}}
+        if method == "group.pull_events":
+            return {"events": [], "count": 0, "cursor": {"current_seq": 7}}
+        return {}
+
+    client.call = fake_call
+
+    await client._fill_p2p_gap()
+    await client._fill_group_gap("G1")
+    await client._fill_group_event_gap("G1")
+
+    assert calls[0] == ("message.pull", {"after_seq": 0, "limit": 50})
+    assert calls[1][0] == "group.pull"
+    assert calls[1][1]["after_message_seq"] == 0
+    assert calls[2][0] == "group.pull_events"
+    assert calls[2][1]["after_event_seq"] == 0
+    assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 7
+    transport.call.assert_awaited_with(
+        "group.ack_events",
+        {"group_id": "G1", "event_seq": 7, "device_id": "device-1", "slot_id": "slot-a"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
+    """group.changed event_seq gap 应真实触发 group.pull_events，并用 contiguous_seq ack。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    client._state = "connected"
+    client._closing = False
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._seq_tracker = SeqTracker()
+    client._gap_fill_done = {}
+    client._pushed_seqs = {}
+    client._loop = asyncio.get_running_loop()
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._persist_seq = lambda ns: None
+    client._verify_event_signature = AsyncMock(return_value=True)
+    transport = MagicMock()
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_transport_call(method, params):
+        calls.append((method, dict(params)))
+        if method == "group.pull_events":
+            return {"events": [], "count": 0, "cursor": {"current_seq": 3}}
+        if method == "group.ack_events":
+            return {"ok": True}
+        return {}
+
+    transport.call = AsyncMock(side_effect=fake_transport_call)
+    client._transport = transport
+
+    await client._on_raw_group_changed({"group_id": "G1", "event_seq": 5, "action": "foo"})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(method == "group.ack_events" for method, _ in calls):
+        await asyncio.sleep(0.01)
+
+    pull_call = next(params for method, params in calls if method == "group.pull_events")
+    assert pull_call == {
+        "group_id": "G1",
+        "after_event_seq": 0,
+        "device_id": "device-1",
+        "limit": 50,
+        "slot_id": "slot-a",
+    }
+    ack_call = next(params for method, params in calls if method == "group.ack_events")
+    assert ack_call == {"group_id": "G1", "event_seq": 3, "device_id": "device-1", "slot_id": "slot-a"}
+    assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 3
+    assert client._gap_fill_done == {}
 
 
 @pytest.mark.asyncio
@@ -1550,6 +1816,8 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
     }
 
     await client._process_and_publish_message(msg)
+    # P1-17: auto-ack 改为 fire-and-forget，需让事件循环执行 pending task
+    await asyncio.sleep(0)
 
     # contiguous 应已推进到 1
     ns = "p2p:alice.aid.com"
@@ -1558,6 +1826,153 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
     # 即使解密返回 None，也应发送 message.ack
     assert len(ack_calls) == 1, f"期望 1 次 ack，实际 {len(ack_calls)} 次: {ack_calls}"
     assert ack_calls[0]["params"]["seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_p2p_gap_push_is_pending_until_gap_pull_fills_contiguous(tmp_path):
+    """P2P push 越过空洞时应先挂起，补洞 pull 补齐后再按序发布。"""
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "p2p_ordered_push")})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._state = "connected"
+    client._closing = False
+    client._loop = asyncio.get_running_loop()
+    ns = "p2p:alice.aid.com"
+    client._seq_tracker.on_message_seq(ns, 1)
+
+    published: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: published.append(data))
+    client._transport.call = AsyncMock(return_value={})
+    client._try_handle_group_key_message = AsyncMock(return_value=False)
+    client._decrypt_single_message = AsyncMock(side_effect=lambda msg, source=None: msg)
+
+    scheduled_fill_calls: list[bool] = []
+    original_fill_p2p_gap = AUNClient._fill_p2p_gap.__get__(client, AUNClient)
+
+    async def fake_scheduled_fill_p2p_gap():
+        scheduled_fill_calls.append(True)
+
+    client._fill_p2p_gap = fake_scheduled_fill_p2p_gap
+
+    await client._process_and_publish_message({
+        "message_id": "m3",
+        "from": "bob.aid.com",
+        "to": "alice.aid.com",
+        "seq": 3,
+        "payload": {"type": "text", "text": "三"},
+    })
+    await asyncio.sleep(0)
+
+    assert scheduled_fill_calls == [True]
+    assert published == []
+    assert 3 in client._pending_ordered_msgs[ns]
+
+    async def fake_call(method, params=None):
+        if method == "message.pull":
+            pulled = [
+                {"message_id": "m2", "from": "bob.aid.com", "to": "alice.aid.com", "seq": 2,
+                 "payload": {"type": "text", "text": "二"}},
+                {"message_id": "m3", "from": "bob.aid.com", "to": "alice.aid.com", "seq": 3,
+                 "payload": {"type": "text", "text": "三"}},
+            ]
+            client._seq_tracker.on_pull_result(ns, pulled)
+            return {"messages": pulled}
+        return {}
+
+    client.call = fake_call
+    client._fill_p2p_gap = original_fill_p2p_gap
+    await client._fill_p2p_gap()
+
+    assert [m["seq"] for m in published] == [2, 3]
+    assert ns not in client._pending_ordered_msgs
+
+
+@pytest.mark.asyncio
+async def test_published_message_events_fallback_current_instance_context(tmp_path):
+    client = AUNClient({"aun_path": str(tmp_path / "published_instance_context")})
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+
+    p2p_ns = "p2p:alice.aid.com"
+    group_ns = "group:g1"
+    client._seq_tracker.on_message_seq(p2p_ns, 1)
+    client._seq_tracker.on_message_seq(group_ns, 1)
+
+    p2p_events: list[dict] = []
+    group_events: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: p2p_events.append(data))
+    client._dispatcher.subscribe("group.message_created", lambda data: group_events.append(data))
+
+    assert await client._publish_ordered_message(
+        "message.received", p2p_ns, 1, {"seq": 1, "payload": {"type": "text"}}
+    )
+    assert await client._publish_ordered_message(
+        "group.message_created", group_ns, 1, {"group_id": "g1", "seq": 1, "payload": {"type": "text"}}
+    )
+
+    assert p2p_events[0]["device_id"] == "dev-1"
+    assert p2p_events[0]["slot_id"] == "slot-a"
+    assert group_events[0]["device_id"] == "dev-1"
+    assert group_events[0]["slot_id"] == "slot-a"
+
+
+@pytest.mark.asyncio
+async def test_p2p_push_ignores_other_slot_context(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "p2p_other_slot")})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+
+    published: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: published.append(data))
+    client._transport.call = AsyncMock(return_value={})
+    client._try_handle_group_key_message = AsyncMock(return_value=False)
+    client._decrypt_single_message = AsyncMock(side_effect=lambda msg, source=None: msg)
+
+    await client._process_and_publish_message({
+        "message_id": "m-other-slot",
+        "from": "bob.aid.com",
+        "to": "alice.aid.com",
+        "seq": 1,
+        "slot_id": "slot-b",
+        "payload": {"type": "text", "text": "wrong slot"},
+    })
+    await asyncio.sleep(0)
+
+    assert published == []
+    assert not client._decrypt_single_message.called
+
+
+@pytest.mark.asyncio
+async def test_group_push_accepts_other_slot_context(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "group_other_slot")})
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._transport.call = AsyncMock(return_value={})
+
+    published: list[dict] = []
+    client._dispatcher.subscribe("group.message_created", lambda data: published.append(data))
+
+    await client._process_and_publish_group_message({
+        "message_id": "gm-other-slot",
+        "group_id": "g1",
+        "from": "bob.aid.com",
+        "device_id": "dev-2",
+        "slot_id": "slot-b",
+        "payload": {"type": "text", "text": "group"},
+    })
+
+    assert len(published) == 1
+    assert published[0]["device_id"] == "dev-2"
+    assert published[0]["slot_id"] == "slot-b"
 
 
 # ─── ISSUE-SDK-PY-014: replay guard 已改为本地处理 ───

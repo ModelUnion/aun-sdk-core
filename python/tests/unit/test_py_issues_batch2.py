@@ -155,6 +155,7 @@ class TestPY001DecryptFailStillAutoAck:
         client._transport.call = AsyncMock(side_effect=capture_call)
 
         await client._process_and_publish_group_message(msg)
+        await asyncio.sleep(0)
 
         assert len(ack_calls) == 1, \
             f"解密失败时应调用 auto-ack 1 次，实际 {len(ack_calls)} 次"
@@ -201,6 +202,7 @@ class TestPY001DecryptFailStillAutoAck:
         client._transport.call = AsyncMock(side_effect=capture_call)
 
         await client._process_and_publish_group_message(msg)
+        await asyncio.sleep(0)
 
         assert len(ack_calls) == 1, \
             f"解密成功时应调用 auto-ack 1 次，实际 {len(ack_calls)} 次"

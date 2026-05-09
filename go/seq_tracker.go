@@ -187,6 +187,9 @@ func (st *SeqTracker) OnPullResult(ns string, messages []map[string]any) {
 	maxPulled := 0
 	for _, m := range messages {
 		s := int(toInt64(m["seq"]))
+		if s <= 0 {
+			s = int(toInt64(m["event_seq"]))
+		}
 		if s > 0 {
 			pulledSeqs[s] = true
 			if s > maxPulled {

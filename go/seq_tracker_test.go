@@ -28,6 +28,25 @@ func TestSeqTracker_BasicAdvance(t *testing.T) {
 	}
 }
 
+// TestSeqTracker_OnPullResult_UsesEventSeq 验证 group.pull_events 返回的 event_seq
+// 能推进 group_event 命名空间。
+func TestSeqTracker_OnPullResult_UsesEventSeq(t *testing.T) {
+	st := NewSeqTracker()
+	ns := "group_event:G1"
+
+	st.OnMessageSeq(ns, 1)
+	st.OnMessageSeq(ns, 4)
+
+	st.OnPullResult(ns, []map[string]any{
+		{"event_seq": 2, "event_type": "group.announcement_updated"},
+		{"event_seq": 3, "event_type": "group.rules_updated"},
+	})
+
+	if got := st.GetContiguousSeq(ns); got != 4 {
+		t.Fatalf("group event pull 应使用 event_seq 推进 contiguousSeq，实际 %d", got)
+	}
+}
+
 // TestSeqTracker_ForceCompact_TriggeredAtLimit 验证 receivedSeqs 超过上限时触发 forceCompact
 func TestSeqTracker_ForceCompact_TriggeredAtLimit(t *testing.T) {
 	st := NewSeqTracker()

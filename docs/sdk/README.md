@@ -144,9 +144,9 @@ graph TD
 | `auth.*` | 身份认证、JWT 签发与刷新 | create_aid / authenticate / refresh_token |
 | `peer.*` | 对等认证、证书互验 | hello / verify / establish |
 | `relay.*` | 中继注册与转发 | register / forward / unregister |
-| `message.*` | 消息收发、离线队列 | send / pull / ack / recall |
+| `message.*` | 消息收发、离线队列、P2P 思考内容 | send / pull / ack / recall / thought.put / thought.get |
 | `meta.*` | 元信息查询 | ping / status / trust_roots |
-| `group.*` | 群组生命周期、成员管理、群消息 | create / invite / send / dissolve |
+| `group.*` | 群组生命周期、成员管理、群设置、群消息 | create / invite / set_settings / send / thought.put / thought.get / dissolve |
 | `storage.*` | 文件上传下载、权限管理 | upload / download / share |
 | `stream.*` | 实时流式传输（推流 WS / 拉流 SSE） | create / close / get_info / list_active |
 | `mail.*` | 异步邮件式消息 | send / list / read |

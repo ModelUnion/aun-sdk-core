@@ -377,6 +377,80 @@ class TestGroupSendEncrypt:
             }))
 
 
+class TestGroupThoughtE2EE:
+    def test_group_thought_put_encrypts_and_signs(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path)
+        _store_secret_for_client(client)
+        sent_params = {}
+
+        async def fake_call(method, params):
+            if method == "group.e2ee.get_epoch":
+                return {"epoch": 1, "committed_epoch": 1}
+            sent_params["method"] = method
+            sent_params["params"] = params
+            return {"ok": True}
+
+        monkeypatch.setattr(client._transport, "call", fake_call)
+
+        asyncio.run(client.call("group.thought.put", {
+            "group_id": _GRP,
+            "reply_to": {"message_id": "gm-root"},
+            "payload": {"type": "thought", "text": "推理片段"},
+        }))
+
+        assert sent_params["method"] == "group.thought.put"
+        params = sent_params["params"]
+        assert params["reply_to"]["message_id"] == "gm-root"
+        assert params["encrypted"] is True
+        assert params["payload"]["type"] == "e2ee.group_encrypted"
+        assert params["thought_id"].startswith("gt-")
+        assert "client_signature" in params
+
+    def test_group_thought_get_auto_decrypts(self, tmp_path, monkeypatch):
+        alice = _make_client(tmp_path, aid=_AID_ALICE)
+        bob = _make_client(tmp_path, aid=_AID_BOB)
+        shared_secret = secrets.token_bytes(32)
+        _store_secret_for_client(alice, gs=shared_secret)
+        _store_secret_for_client(bob, gs=shared_secret)
+        envelope = alice._group_e2ee.encrypt(
+            _GRP,
+            {"type": "thought", "text": "只给感兴趣的人看"},
+            message_id="gt-1",
+            timestamp=1710504000000,
+        )
+
+        async def fake_call(method, params):
+            assert method == "group.thought.get"
+            return {
+                "found": True,
+                "group_id": _GRP,
+                "sender_aid": _AID_ALICE,
+                "reply_to": {"message_id": "gm-root"},
+                "thoughts": [
+                    {
+                        "thought_id": "gt-1",
+                        "reply_to": {"message_id": "gm-root"},
+                        "payload": envelope,
+                        "created_at": 1710504000000,
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(bob._transport, "call", fake_call)
+
+        result = asyncio.run(bob.call("group.thought.get", {
+            "group_id": _GRP,
+            "sender_aid": _AID_ALICE,
+            "reply_to": {"message_id": "gm-root"},
+        }))
+
+        assert result["found"] is True
+        assert result["thoughts"][0]["thought_id"] == "gt-1"
+        assert result["thoughts"][0]["payload"]["type"] == "thought"
+        assert result["thoughts"][0]["payload"]["text"] == "只给感兴趣的人看"
+        assert result["thoughts"][0]["e2ee"]["encryption_mode"] == "epoch_group_key"
+
+
 # ── 群组消息自动解密 ─────────────────────────────────────
 
 class TestGroupMessageAutoDecrypt:
@@ -406,8 +480,12 @@ class TestGroupMessageAutoDecrypt:
         gs = _store_secret_for_client(client, epoch=1)
 
         msg = self._make_encrypted_group_msg(gs)
+        msg["dispatch_mode"] = "mention"
         result = asyncio.run(client._decrypt_group_message(msg))
-        assert result["payload"] == {"type": "text", "text": "秘密"}
+        assert result["payload"]["type"] == "text"
+        assert result["payload"]["text"] == "秘密"
+        assert result["payload"]["dispatch_mode"] == "mention"
+        assert result["dispatch_mode"] == "mention"
         assert result["e2ee"]["encryption_mode"] == "epoch_group_key"
 
     def test_auto_decrypted_on_pull(self, tmp_path):
@@ -419,6 +497,8 @@ class TestGroupMessageAutoDecrypt:
         # 模拟 pull 返回的消息解密
         result = asyncio.run(client._decrypt_group_message(msg))
         assert result["payload"]["text"] == "秘密"
+        assert result["payload"]["dispatch_mode"] == "broadcast"
+        assert result["dispatch_mode"] == "broadcast"
 
     def test_plaintext_passthrough(self, tmp_path):
         """非加密群消息正常通过"""
@@ -429,9 +509,34 @@ class TestGroupMessageAutoDecrypt:
             "message_id": "gm-123",
             "timestamp": 1710504000000,
             "payload": {"type": "text", "text": "明文消息"},
+            "dispatch_mode": "mention",
         }
         result = asyncio.run(client._decrypt_group_message(msg))
         assert result["payload"]["text"] == "明文消息"
+        assert result["payload"]["dispatch_mode"] == "mention"
+
+    def test_plaintext_default_dispatch_mode_is_broadcast(self, tmp_path):
+        """服务端缺省 dispatch_mode 时 SDK 默认按 broadcast 交付"""
+        client = _make_client(tmp_path, aid=_AID_BOB)
+        msg = {
+            "group_id": _GRP,
+            "from": _AID_ALICE,
+            "message_id": "gm-default-dispatch",
+            "timestamp": 1710504000000,
+            "payload": {"type": "text", "text": "明文消息"},
+        }
+        result = asyncio.run(client._decrypt_group_message(msg))
+        assert result["payload"]["dispatch_mode"] == "broadcast"
+        assert result["dispatch_mode"] == "broadcast"
+
+    def test_attach_dispatch_mode_default_is_broadcast_without_tmp_path(self):
+        """缺省 dispatch_mode 的兜底不依赖本地 keystore。"""
+        result = AUNClient._attach_group_dispatch_mode_to_payload({
+            "group_id": _GRP,
+            "payload": {"type": "text", "text": "明文消息"},
+        })
+        assert result["payload"]["dispatch_mode"] == "broadcast"
+        assert result["dispatch_mode"] == "broadcast"
 
 
 # ── 密钥分发自动处理 ─────────────────────────────────────
@@ -1692,7 +1797,11 @@ class TestGroupMessagePushPipeline:
         asyncio.run(run())
 
         assert len(published) == 1
-        assert published[0]["payload"] == {"type": "text", "text": "推送消息"}
+        assert published[0]["payload"] == {
+            "type": "text",
+            "text": "推送消息",
+            "dispatch_mode": "broadcast",
+        }
         assert published[0]["e2ee"]["encryption_mode"] == "epoch_group_key"
         # 游标更新
         ns = f"group:{_GRP}"
@@ -1708,7 +1817,7 @@ class TestGroupMessagePushPipeline:
         client._dispatcher.subscribe("group.message_created", lambda data: published.append(data))
 
         # mock group.pull 返回
-        pull_msg = self._make_encrypted_group_msg(gs, seq=3)
+        pull_msg = self._make_encrypted_group_msg(gs, seq=1)
         pull_called = {}
 
         async def fake_call(method, params):
@@ -1717,13 +1826,12 @@ class TestGroupMessagePushPipeline:
                 return {"messages": [pull_msg]}
             return {}
 
-        import types
-        client.call = types.MethodType(lambda self, m, p: fake_call(m, p), client)
+        client._transport.call = fake_call
 
         notification = {
             "module_id": "group",
             "group_id": _GRP,
-            "seq": 3,
+            "seq": 1,
             "message_id": "gm-notify",
             "sender_aid": _AID_ALICE,
             "type": "text",
@@ -1851,8 +1959,8 @@ class TestGroupMessagePushPipeline:
 
         assert pull_called.get("called") is True
 
-    def test_push_with_payload_gap_triggers_fill_group_gap(self, tmp_path):
-        """带完整 payload 的 push 发现 gap 时，仍应触发 _fill_group_gap 补洞。"""
+    def test_push_with_payload_gap_is_pending_until_gap_pull_fills_contiguous(self, tmp_path):
+        """带完整 payload 的 push 发现 gap 时应先挂起，补洞 pull 后再按序发布。"""
         client = _make_client(tmp_path, aid=_AID_BOB)
         gs = _store_secret_for_client(client, epoch=1)
 
@@ -1863,6 +1971,7 @@ class TestGroupMessagePushPipeline:
 
         fill_gap_called = []
         fill_gap_done = asyncio.Event()
+        original_fill_group_gap = AUNClient._fill_group_gap.__get__(client, AUNClient)
 
         async def fake_fill_group_gap(group_id):
             fill_gap_called.append(group_id)
@@ -1879,11 +1988,33 @@ class TestGroupMessagePushPipeline:
 
         asyncio.run(run())
 
-        # 消息仍应被解密并发布
-        assert len(published) == 1
-        assert published[0]["seq"] == 3
+        # gap 未补齐前不应直接发布
+        assert published == []
         # 补洞必须被触发
         assert fill_gap_called == [_GRP]
+
+        async def fake_call(method, params):
+            if method == "group.pull":
+                pulled = [
+                    {"group_id": _GRP, "seq": 2, "from": _AID_ALICE,
+                     "payload": {"type": "text", "text": "二"}},
+                    {"group_id": _GRP, "seq": 3, "from": _AID_ALICE,
+                     "payload": {"type": "text", "text": "三"}},
+                ]
+                client._seq_tracker.on_pull_result(f"group:{_GRP}", pulled)
+                return {"messages": pulled}
+            return {}
+
+        async def run_release_by_pull():
+            client._loop = asyncio.get_running_loop()
+            client.call = fake_call
+            client._fill_group_gap = original_fill_group_gap
+            await client._fill_group_gap(_GRP)
+
+        asyncio.run(run_release_by_pull())
+
+        assert [m["seq"] for m in published] == [2, 3]
+        assert f"group:{_GRP}" not in client._pending_ordered_msgs
 
 
 # ══════════════════════════════════════════════════════════════

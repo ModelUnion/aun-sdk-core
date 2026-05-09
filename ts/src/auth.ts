@@ -1424,7 +1424,9 @@ export class AuthFlow {
     const tbsEnd = tbsSeq.contentOffset + tbsSeq.contentLength;
 
     // 跳过 version [0] EXPLICIT（如果存在）
-    if (tbsOffset < tbsEnd && (basicDer[tbsOffset] & 0xe0) === 0xa0) {
+    // 只能精确匹配 0xa0，不能用“任意 context-specific constructed tag”判断；
+    // responderID 也可能是 [2] / 0xa2，误判会把后续字段整体错位。
+    if (tbsOffset < tbsEnd && basicDer[tbsOffset] === 0xa0) {
       const versionTag = this._readAsn1Tag(basicDer, tbsOffset);
       if (versionTag) tbsOffset += versionTag.totalLength;
     }
@@ -1848,10 +1850,22 @@ export class AuthFlow {
 
   // ── 内部方法：根证书管理 ───────────────────────────────────
 
-  /** 加载受信根证书列表 */
+  /** 重新从磁盘加载信任根证书，供 meta.import_trust_roots 后刷新使用。 */
+  reloadTrustedRoots(): number {
+    this._rootCerts = this._loadRootCerts(this._rootCaPath);
+    this._gatewayCaVerified.clear();
+    this._chainVerifiedCache.clear();
+    return this._rootCerts.length;
+  }
+
+  /** 加载受信根证书列表（空时自动 fallback 重试一次磁盘加载） */
   private _loadTrustedRoots(): crypto.X509Certificate[] {
     if (!this._rootCerts.length) {
-      throw new AuthError('no trusted roots available for auth certificate verification');
+      // fallback: 证书可能在构造之后才写入磁盘，重新加载一次
+      this._rootCerts = this._loadRootCerts(this._rootCaPath);
+      if (!this._rootCerts.length) {
+        throw new AuthError('no trusted roots available for auth certificate verification');
+      }
     }
     return this._rootCerts;
   }

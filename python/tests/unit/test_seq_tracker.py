@@ -185,6 +185,19 @@ class TestSeqTrackerPullResult:
         # seq=2 补齐空洞 → received_seqs 有 3 → 连续推到 3
         assert t.get_contiguous_seq("g1") == 3
 
+    def test_group_event_pull_uses_event_seq(self):
+        """group.pull_events 返回 event_seq 时应推进 group_event tracker。"""
+        t = SeqTracker()
+        t.on_message_seq("group_event:G1", 1)
+        t.on_message_seq("group_event:G1", 4)
+
+        t.on_pull_result("group_event:G1", [
+            {"event_seq": 2, "event_type": "group.announcement_updated"},
+            {"event_seq": 3, "event_type": "group.rules_updated"},
+        ])
+
+        assert t.get_contiguous_seq("group_event:G1") == 4
+
 
 class TestSeqTrackerBackoff:
     """退避策略测试。"""

@@ -711,7 +711,10 @@ class AuthFlow:
 
     def _load_trusted_roots(self) -> list[x509.Certificate]:
         if not self._root_certs:
-            raise AuthError("no trusted roots available for auth certificate verification")
+            # fallback: 证书可能在构造之后才写入磁盘，重新加载一次
+            self._root_certs = self._load_root_certs(self._root_ca_path, keystore=self._keystore)
+            if not self._root_certs:
+                raise AuthError("no trusted roots available for auth certificate verification")
         return self._root_certs
 
     async def _fetch_gateway_ca_chain(self, gateway_url: str, chain_aid: str = "") -> list[str]:

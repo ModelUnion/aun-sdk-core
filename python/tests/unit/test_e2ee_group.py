@@ -13,6 +13,7 @@ import pytest
 
 from aun_core.e2ee import (
     AAD_FIELDS_GROUP,
+    AAD_MATCH_FIELDS_GROUP,
     MODE_EPOCH_GROUP_KEY,
     SUITE,
     GroupReplayGuard,
@@ -215,6 +216,8 @@ class TestEncryptDecryptRoundtrip:
 class TestAADGroup:
     def test_has_7_fields(self):
         assert len(AAD_FIELDS_GROUP) == 7
+        assert "dispatch_mode" not in AAD_FIELDS_GROUP
+        assert "dispatch_mode" not in AAD_MATCH_FIELDS_GROUP
 
     def test_deterministic_serialization(self):
         aad = {
@@ -233,6 +236,20 @@ class TestAADGroup:
         parsed = json.loads(b1.decode("utf-8"))
         keys = list(parsed.keys())
         assert keys == sorted(keys)
+
+    def test_dispatch_mode_is_not_in_aad(self):
+        aad = {
+            "group_id": "grp_1",
+            "from": "alice",
+            "message_id": "msg_1",
+            "timestamp": 100,
+            "epoch": 1,
+            "encryption_mode": MODE_EPOCH_GROUP_KEY,
+            "suite": SUITE,
+            "dispatch_mode": "mention",
+        }
+        parsed = json.loads(_aad_bytes_group(aad).decode("utf-8"))
+        assert "dispatch_mode" not in parsed
 
 
 # ── Membership Commitment ──────────────────────────────────

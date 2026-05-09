@@ -1345,6 +1345,24 @@ export class AuthFlow {
 
   // ── 内部方法：受信根证书 ──────────────────────────
 
+  /** 重新解析信任根证书，供导入新根证书后刷新使用。 */
+  reloadTrustedRoots(): number {
+    this._rootCerts = null;
+    this._gatewayCaVerified.clear();
+    this._chainVerifiedCache.clear();
+    const roots = this._loadTrustedRoots();
+    return roots.length;
+  }
+
+  /** 运行时追加根证书 PEM（追加到用户自定义根证书中） */
+  addTrustedRootPem(pem: string): void {
+    this._rootCaPem = this._rootCaPem ? this._rootCaPem + '\n' + pem : pem;
+    // 清空缓存，下次验证时重新加载
+    this._rootCerts = null;
+    this._gatewayCaVerified.clear();
+    this._chainVerifiedCache.clear();
+  }
+
   private _loadTrustedRoots(): ParsedCert[] {
     if (this._rootCerts) return this._rootCerts;
 

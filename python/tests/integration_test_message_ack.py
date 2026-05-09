@@ -17,6 +17,7 @@ import asyncio
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -73,9 +74,14 @@ def _fail(name: str, reason: str):
 # 辅助
 # ---------------------------------------------------------------------------
 
-def _make_client() -> AUNClient:
+def _build_test_slot_id(tag: str) -> str:
+    return f"message-ack-{tag}-{uuid.uuid4().hex[:12]}"
+
+
+def _make_client(tag: str = "client") -> AUNClient:
     client = AUNClient({"aun_path": _TEST_AUN_PATH})
     client._config_model.require_forward_secrecy = False
+    client._test_slot_id = _build_test_slot_id(tag)
     return client
 
 
@@ -87,7 +93,12 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     for attempt in range(4):
         try:
             auth = await client.auth.authenticate({"aid": aid})
-            await client.connect(auth)
+            connect_params = dict(auth)
+            slot_id = str(getattr(client, "_test_slot_id", "") or "")
+            if slot_id:
+                connect_params["slot_id"] = slot_id
+            connect_params["auto_reconnect"] = False
+            await client.connect(connect_params)
             return aid
         except (AuthError, RateLimitError) as exc:
             last_error = exc
@@ -110,12 +121,13 @@ async def _sdk_send(client: AUNClient, to_aid: str, payload: str):
     })
 
 
-async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: int = 0, timeout: float = 5.0):
-    """等待推送或主动拉取"""
+def _subscribe_push_after(client: AUNClient, from_aid: str, *, after_seq: int = 0):
     inbox = []
     event = asyncio.Event()
 
     def handler(data):
+        if not isinstance(data, dict):
+            return
         if data.get("from") != from_aid:
             return
         if _seq_of(data) <= after_seq:
@@ -124,17 +136,58 @@ async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: i
         event.set()
 
     sub = client.on("message.received", handler)
-    try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        pass
-    sub.unsubscribe()
+    return inbox, event, sub
 
-    if not inbox:
+
+async def _wait_for_messages_after(
+    client: AUNClient,
+    from_aid: str,
+    *,
+    after_seq: int = 0,
+    min_count: int = 1,
+    timeout: float = 5.0,
+    inbox: list[dict] | None = None,
+    event: asyncio.Event | None = None,
+):
+    """等待已订阅的推送消息，数量不足时再主动拉取兜底。"""
+    own_sub = None
+    if inbox is None or event is None:
+        inbox, event, own_sub = _subscribe_push_after(client, from_aid, after_seq=after_seq)
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while len(inbox) < min_count:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        event.clear()
+        if len(inbox) >= min_count:
+            break
+        try:
+            await asyncio.wait_for(event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+
+    if own_sub is not None:
+        own_sub.unsubscribe()
+
+    all_msgs = list(inbox)
+    if len(all_msgs) < min_count:
         result = await client.call("message.pull", {"after_seq": after_seq, "limit": 50})
-        inbox.extend(m for m in result.get("messages", []) if m.get("from") == from_aid)
+        all_msgs.extend(m for m in result.get("messages", []) if m.get("from") == from_aid)
 
-    return sorted(inbox, key=_seq_of)
+    by_seq = {}
+    for msg in all_msgs:
+        seq = _seq_of(msg)
+        if seq > after_seq:
+            by_seq[seq] = msg
+    return [by_seq[seq] for seq in sorted(by_seq)]
+
+
+async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: int = 0, timeout: float = 5.0):
+    """等待推送或主动拉取"""
+    return await _wait_for_messages_after(
+        client, from_aid, after_seq=after_seq, min_count=1, timeout=timeout,
+    )
 
 
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
@@ -160,8 +213,8 @@ async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
 
 async def test_message_ack_basic():
     """测试基本 ack 功能"""
-    alice = _make_client()
-    bob = _make_client()
+    alice = _make_client("basic-alice")
+    bob = _make_client("basic-bob")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
@@ -169,13 +222,16 @@ async def test_message_ack_basic():
 
         # 0. 获取 baseline seq，避免拉取历史消息
         baseline = await _current_max_seq(bob)
+        inbox, event, sub = _subscribe_push_after(bob, _ALICE_AID, after_seq=baseline)
 
         # 1. Alice 发送消息给 Bob
-        await _sdk_send(alice, _BOB_AID, "test_ack_message")
-        await asyncio.sleep(1.0)
-
-        # 2. Bob 拉取消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
+        try:
+            await _sdk_send(alice, _BOB_AID, "test_ack_message")
+            msgs = await _wait_for_messages_after(
+                bob, _ALICE_AID, after_seq=baseline, timeout=3.0, inbox=inbox, event=event,
+            )
+        finally:
+            sub.unsubscribe()
         if not msgs:
             _fail("message_ack_basic", "Bob 未收到消息")
             return
@@ -204,8 +260,8 @@ async def test_message_ack_basic():
 
 async def test_message_ack_event():
     """测试 ack 事件发布"""
-    alice = _make_client()
-    bob = _make_client()
+    alice = _make_client("event-alice")
+    bob = _make_client("event-bob")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
@@ -213,12 +269,17 @@ async def test_message_ack_event():
 
         # 0. 获取 baseline seq
         baseline = await _current_max_seq(bob)
+        inbox, event, sub = _subscribe_push_after(bob, _ALICE_AID, after_seq=baseline)
 
         # 1. Alice 订阅 ack 事件
         ack_events = []
         ack_event = asyncio.Event()
 
         def ack_handler(data):
+            if not isinstance(data, dict):
+                return
+            if data.get("to") != _BOB_AID:
+                return
             print(f"  [INFO] Alice 收到 ack 事件: {data}")
             ack_events.append(data)
             ack_event.set()
@@ -226,11 +287,13 @@ async def test_message_ack_event():
         alice.on("message.ack", ack_handler)
 
         # 2. Alice 发送消息给 Bob
-        send_result = await _sdk_send(alice, _BOB_AID, "test_ack_event")
-        await asyncio.sleep(1.0)
-
-        # 3. Bob 拉取消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
+        try:
+            await _sdk_send(alice, _BOB_AID, "test_ack_event")
+            msgs = await _wait_for_messages_after(
+                bob, _ALICE_AID, after_seq=baseline, timeout=3.0, inbox=inbox, event=event,
+            )
+        finally:
+            sub.unsubscribe()
         if not msgs:
             _fail("message_ack_event", "Bob 未收到消息")
             return
@@ -243,9 +306,19 @@ async def test_message_ack_event():
         print(f"  [INFO] ack 结果: {ack_result}")
 
         # 5. 等待 Alice 收到 ack 事件
-        try:
-            await asyncio.wait_for(ack_event.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while not any(int(item.get("ack_seq") or 0) >= msg_seq for item in ack_events):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            ack_event.clear()
+            if any(int(item.get("ack_seq") or 0) >= msg_seq for item in ack_events):
+                break
+            try:
+                await asyncio.wait_for(ack_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+        if not any(int(item.get("ack_seq") or 0) >= msg_seq for item in ack_events):
             _fail("message_ack_event", "Alice 未收到 ack 事件")
             return
 
@@ -254,7 +327,7 @@ async def test_message_ack_event():
             _fail("message_ack_event", "ack_events 为空")
             return
 
-        event_data = ack_events[0]
+        event_data = next(item for item in ack_events if int(item.get("ack_seq") or 0) >= msg_seq)
         # ack 事件的 "to" 字段是 ack 发起方（Bob）
         if event_data.get("to") != _BOB_AID:
             _fail("message_ack_event", f"ack 事件 to 不匹配: 期望 {_BOB_AID}, 实际 {event_data.get('to')}")
@@ -273,8 +346,8 @@ async def test_message_ack_event():
 
 async def test_message_ack_partial_success():
     """测试 ack 部分成功语义（DB 成功但事件发布失败）"""
-    alice = _make_client()
-    bob = _make_client()
+    alice = _make_client("partial-alice")
+    bob = _make_client("partial-bob")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
@@ -282,13 +355,16 @@ async def test_message_ack_partial_success():
 
         # 0. 获取 baseline seq
         baseline = await _current_max_seq(bob)
+        inbox, event, sub = _subscribe_push_after(bob, _ALICE_AID, after_seq=baseline)
 
         # 1. Alice 发送消息给 Bob
-        await _sdk_send(alice, _BOB_AID, "test_partial_success")
-        await asyncio.sleep(1.0)
-
-        # 2. Bob 拉取消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
+        try:
+            await _sdk_send(alice, _BOB_AID, "test_partial_success")
+            msgs = await _wait_for_messages_after(
+                bob, _ALICE_AID, after_seq=baseline, timeout=3.0, inbox=inbox, event=event,
+            )
+        finally:
+            sub.unsubscribe()
         if not msgs:
             _fail("message_ack_partial_success", "Bob 未收到消息")
             return
@@ -336,8 +412,8 @@ async def test_message_ack_partial_success():
 
 async def test_message_ack_sequence():
     """测试 ack 序列推进"""
-    alice = _make_client()
-    bob = _make_client()
+    alice = _make_client("sequence-alice")
+    bob = _make_client("sequence-bob")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
@@ -345,17 +421,26 @@ async def test_message_ack_sequence():
 
         # 0. 获取 baseline seq
         baseline = await _current_max_seq(bob)
+        inbox, event, sub = _subscribe_push_after(bob, _ALICE_AID, after_seq=baseline)
 
         # 1. Alice 发送 3 条消息给 Bob
-        await _sdk_send(alice, _BOB_AID, "msg1")
-        await asyncio.sleep(0.2)
-        await _sdk_send(alice, _BOB_AID, "msg2")
-        await asyncio.sleep(0.2)
-        await _sdk_send(alice, _BOB_AID, "msg3")
-        await asyncio.sleep(1.0)
-
-        # 2. Bob 拉取所有消息
-        msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline, timeout=2.0)
+        try:
+            await _sdk_send(alice, _BOB_AID, "msg1")
+            await asyncio.sleep(0.2)
+            await _sdk_send(alice, _BOB_AID, "msg2")
+            await asyncio.sleep(0.2)
+            await _sdk_send(alice, _BOB_AID, "msg3")
+            msgs = await _wait_for_messages_after(
+                bob,
+                _ALICE_AID,
+                after_seq=baseline,
+                min_count=3,
+                timeout=5.0,
+                inbox=inbox,
+                event=event,
+            )
+        finally:
+            sub.unsubscribe()
         if len(msgs) < 3:
             _fail("message_ack_sequence", f"Bob 未收到足够消息: 期望 3 条, 实际 {len(msgs)} 条")
             return

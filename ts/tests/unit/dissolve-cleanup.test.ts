@@ -77,6 +77,18 @@ describe('SeqTracker.removeNamespace', () => {
     expect(tracker.getContiguousSeq('group:grp-1')).toBe(0);
     expect(tracker.getContiguousSeq('group_event:grp-1')).toBe(0);
   });
+
+  it('group.pull_events 返回 event_seq 时推进 group_event 命名空间', () => {
+    tracker.onMessageSeq('group_event:grp-1', 1);
+    tracker.onMessageSeq('group_event:grp-1', 4);
+
+    tracker.onPullResult('group_event:grp-1', [
+      { event_seq: 2, event_type: 'group.announcement_updated' },
+      { event_seq: 3, event_type: 'group.rules_updated' },
+    ]);
+
+    expect(tracker.getContiguousSeq('group_event:grp-1')).toBe(4);
+  });
 });
 
 // ── KeyStore.deleteGroupSecretState ─────────────────────────

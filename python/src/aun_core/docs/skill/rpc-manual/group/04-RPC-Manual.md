@@ -24,7 +24,10 @@
 | [group.suspend](#groupsuspend) | 暂停群组 |
 | [group.resume](#groupresume) | 恢复群组 |
 | [group.dissolve](#groupdissolve) | 解散群组 |
-| [group.get_stats](#groupget_stats) | 获取统计信息 |
+| [group.get_stats](#groupget_stats) | 获取统计信息 *(deprecated: use group.info)* |
+| [group.set_settings](#groupset_settings) | 统一设置群参数 |
+| [group.get_settings](#groupget_settings) | 统一读取群参数 |
+| [group.info](#groupinfo) | 群组信息查询（支持 include 扩展） |
 
 ### 成员管理
 
@@ -1665,3 +1668,69 @@ Group 服务定义了以下专用错误码（-33xxx 段）：
 
 > SDK 客户端将 -33001 映射为 `GroupNotFoundError`，-33002~-33003 映射为 `GroupStateError`，其余映射为 `GroupError`。未识别的错误码 fallback 到 `AUNError`。
 
+---
+
+## 统一 Settings 接口
+
+> 以下三个方法是群参数统一接口，替代分散的 `get_rules` / `update_rules` / `get_announcement` / `update_announcement` / `get_join_requirements` / `update_join_requirements` / `update_duty_config` / `get_stats` 等方法。老方法保留但标记废弃。
+
+### group.set_settings
+
+统一设置群参数。根据 key 自动路由到对应存储。
+
+- **权限**: admin+
+- **签名**: 需要客户端签名
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `group_id` | string | 群组 ID |
+| `settings` | object | key-value 对象 |
+
+**支持的 key**:
+
+| key | 说明 | 存储位置 |
+|-----|------|---------|
+| `name` | 群名称 | groups 表 |
+| `description` | 群描述 | groups 表 |
+| `visibility` | 可见性 (public/private) | groups 表 |
+| `rules.content` | 群规内容 | group_settings 表 |
+| `rules.attachments` | 群规附件 | group_settings 表 |
+| `announcement.content` | 公告内容 | group_settings 表 |
+| `announcement.attachments` | 公告附件 | group_settings 表 |
+| `join.mode` | 入群模式 | group_settings 表 |
+| `join.question` | 入群问题 | group_settings 表 |
+| `join.auto_approve_patterns` | 自动审批模式 | group_settings 表 |
+| `join.max_pending` | 最大待审批数 | group_settings 表 |
+| `duty.config` | 值班配置对象 | group_settings 表 |
+
+### group.get_settings
+
+统一读取群参数。
+
+- **权限**: member+
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `group_id` | string | 群组 ID |
+| `keys` | string[] | 可选，指定读取的 key 列表。不传则返回全部 |
+
+### group.info
+
+群组信息查询，支持 `include` 扩展返回额外数据块。
+
+- **权限**: member（完整信息），非成员可查公开群基础信息
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `group_id` | string | 群组 ID |
+| `include` | string[] | 可选，扩展数据块：`"stats"`, `"e2ee"` |
+
+**返回字段**:
+
+基础字段始终返回：`group_id`, `name`, `visibility`, `status`, `description`, `member_count`, `created_at`。
+
+成员可见额外字段：`owner_aid`, `message_seq`, `event_seq`, `updated_at`。
+
+`include=["stats"]` 追加 `stats` 对象（`human_count`, `ai_count`, `admin_count`, `online_count`）。admin 额外看到 `pending_join_request_count`, `active_invite_code_count`, `ban_count`。
+
+`include=["e2ee"]` 追加 `e2ee` 对象（`epoch`, `epoch_updated_at`）。

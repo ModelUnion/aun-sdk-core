@@ -426,6 +426,10 @@ async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
     max_seq = 0
     while True:
         result = await client._transport.call("message.pull", _message_pull_params(client, after_seq, limit))
+        try:
+            max_seq = max(max_seq, int(result.get("server_ack_seq") or 0))
+        except (TypeError, ValueError):
+            pass
         msgs = result.get("messages", [])
         if not msgs:
             return max_seq
@@ -448,7 +452,6 @@ def _message_pull_params(client: AUNClient, after_seq: int, limit: int) -> dict:
 
 def _assert_decrypted(msg: dict, expected_payload: dict, label: str = ""):
     prefix = f"[{label}] " if label else ""
-    print(f"  DEBUG _assert_decrypted: encrypted={msg.get('encrypted')}, payload.type={msg.get('payload',{}).get('type')}, payload.keys={list(msg.get('payload',{}).keys())[:15]}, msg.keys={list(msg.keys())[:15]}")
     assert msg.get("encrypted") is True, f"{prefix}should be marked encrypted; msg.keys={list(msg.keys())}"
     for k, v in expected_payload.items():
         actual = msg["payload"].get(k)
@@ -507,9 +510,10 @@ async def test_sdk_to_sdk_prekey():
         base_seq = await _current_max_seq(receiver)
 
         await _sdk_send(sender, r_aid, {"type": "text", "text": "sdk2sdk prekey", "n": 1})
-        msgs = await _sdk_recv_push_after(receiver, s_aid, after_seq=base_seq)
-        assert len(msgs) >= 1
-        _assert_decrypted(msgs[0], {"type": "text", "text": "sdk2sdk prekey"})
+        msg = await _wait_for_sdk_pull_message(
+            receiver, s_aid, after_seq=base_seq, expected_text="sdk2sdk prekey",
+        )
+        _assert_decrypted(msg, {"type": "text", "text": "sdk2sdk prekey"})
 
         print("[PASS] Test 2")
         return True
@@ -910,14 +914,42 @@ async def test_same_aid_slots_ack_isolated():
                 ack_event.set()
 
         sub = sender.on("message.ack", _on_ack)
-        try:
-            unique_text = f"slot_isolation_{int(asyncio.get_running_loop().time() * 1000)}"
-            await _sdk_send(sender, r_aid, {"type": "text", "text": unique_text})
+        unique_text = f"slot_isolation_{int(asyncio.get_running_loop().time() * 1000)}"
+        slot_a_push: list[dict] = []
+        slot_b_push: list[dict] = []
+        slot_a_event = asyncio.Event()
+        slot_b_event = asyncio.Event()
 
-            msg_a = await _wait_for_sdk_pull_message(
+        def _capture_slot_push(target: list[dict], event: asyncio.Event):
+            def _handler(data):
+                if not isinstance(data, dict):
+                    return
+                if data.get("from") != s_aid:
+                    return
+                payload = data.get("payload")
+                if not isinstance(payload, dict) or payload.get("text") != unique_text:
+                    return
+                target.append(dict(data))
+                event.set()
+            return _handler
+
+        sub_slot_a = receiver_slot_a.on("message.received", _capture_slot_push(slot_a_push, slot_a_event))
+        sub_slot_b = receiver_slot_b.on("message.received", _capture_slot_push(slot_b_push, slot_b_event))
+        try:
+            await _sdk_send(sender, r_aid, {"type": "text", "text": unique_text})
+            try:
+                await asyncio.wait_for(slot_a_event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await asyncio.wait_for(slot_b_event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+
+            msg_a = slot_a_push[0] if slot_a_push else await _wait_for_sdk_pull_message(
                 receiver_slot_a, s_aid, after_seq=base_seq_a, expected_text=unique_text,
             )
-            msg_b = await _wait_for_sdk_pull_message(
+            msg_b = slot_b_push[0] if slot_b_push else await _wait_for_sdk_pull_message(
                 receiver_slot_b, s_aid, after_seq=base_seq_b, expected_text=unique_text,
             )
             _assert_decrypted(msg_a, {"type": "text", "text": unique_text}, "slot-a")
@@ -932,6 +964,8 @@ async def test_same_aid_slots_ack_isolated():
             await asyncio.wait_for(ack_event.wait(), timeout=5.0)
         finally:
             sub.unsubscribe()
+            sub_slot_a.unsubscribe()
+            sub_slot_b.unsubscribe()
 
         slots_seen = {str(item.get("slot_id") or "") for item in ack_events}
         assert slots_seen == expected_slots, f"ack 事件 slot 集合不完整: {slots_seen}"
@@ -1041,8 +1075,10 @@ async def test_multi_device_recipient_and_self_sync():
 
         phone_push: list[dict] = []
         laptop_push: list[dict] = []
+        sync_push: list[dict] = []
         phone_event = asyncio.Event()
         laptop_event = asyncio.Event()
+        sync_event = asyncio.Event()
 
         def _capture_push(target: list[dict], event: asyncio.Event):
             def _handler(data):
@@ -1057,19 +1093,25 @@ async def test_multi_device_recipient_and_self_sync():
 
         sub_phone = bob_phone.on("message.received", _capture_push(phone_push, phone_event))
         sub_laptop = bob_laptop.on("message.received", _capture_push(laptop_push, laptop_event))
+        sub_sync = alice_sync.on("message.received", _capture_push(sync_push, sync_event))
         try:
             result = await _sdk_send(alice_main, _BOBB_AID, {"type": "text", "text": text, "kind": "multi-device"})
             assert result.get("status") in {"sent", "delivered"}
             await asyncio.wait_for(phone_event.wait(), timeout=10.0)
             await asyncio.wait_for(laptop_event.wait(), timeout=10.0)
+            try:
+                await asyncio.wait_for(sync_event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
             assert phone_push and laptop_push, "fanout push should reach both online slots"
         finally:
             sub_phone.unsubscribe()
             sub_laptop.unsubscribe()
+            sub_sync.unsubscribe()
 
         phone_msg = phone_push[0]
         laptop_msg = laptop_push[0]
-        sync_msg = await _wait_for_sdk_pull_message(
+        sync_msg = sync_push[0] if sync_push else await _wait_for_sdk_pull_message(
             alice_sync, _ALICE_AID, after_seq=base_sync, expected_text=text,
         )
 

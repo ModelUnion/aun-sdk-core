@@ -1108,11 +1108,20 @@ func TestGroupAADFieldCount(t *testing.T) {
 		"group_id": "g1", "from": "alice", "message_id": "m1",
 		"timestamp": int64(12345), "epoch": 1,
 		"encryption_mode": ModeEpochGroupKey, "suite": SuiteP256,
+		"dispatch_mode": "mention",
 	}
 	data := aadBytesGroup(aad)
 	var parsed map[string]any
 	json.Unmarshal(data, &parsed)
 	if len(parsed) != len(aadFieldsGroup) {
 		t.Errorf("群组 AAD 字段数不正确: 期望 %d, 实际 %d", len(aadFieldsGroup), len(parsed))
+	}
+	if _, ok := parsed["dispatch_mode"]; ok {
+		t.Fatalf("群组 AAD 不应包含 dispatch_mode: %#v", parsed)
+	}
+	for _, field := range aadMatchFieldsGroup {
+		if field == "dispatch_mode" {
+			t.Fatalf("群组 AAD 匹配字段不应包含 dispatch_mode")
+		}
 	}
 }

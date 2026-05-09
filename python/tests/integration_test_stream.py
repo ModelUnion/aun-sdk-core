@@ -9,6 +9,9 @@
   - 多 puller 同时拉同一流
   - 推流端 close 后拉流端收到 done 事件
   - token 验证（错误 push_token / pull_token 被拒绝）
+  - RPC 权限与参数校验（target_aid / content_type / metadata / close 权限）
+  - Last-Event-ID 非法值与越界响应
+  - TEXT/BINARY 数据帧 seq 去重与非法 seq 拒绝
   - 并发多流互不干扰
 
 使用方法：
@@ -265,6 +268,14 @@ async def _pull_sse(pull_url: str, timeout: float = 10.0,
                     # 注释行（心跳）忽略
 
     return result
+
+
+async def _http_get_status_text(url: str, headers: dict[str, str] | None = None) -> tuple[int, str]:
+    """执行普通 HTTP GET，返回状态码与响应文本"""
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.get(_localize_url(url, ws=False), headers=headers or {}) as resp:
+            return resp.status, await resp.text()
 
 
 def _localize_url(url: str, ws: bool = False) -> str:
@@ -607,6 +618,100 @@ async def test_pull_token_validation():
         await client.close()
 
 
+async def test_rpc_permissions_and_input_validation():
+    """覆盖 RPC 参数校验、target_aid 查询权限和 close 权限"""
+    alice = _make_client()
+    bob = _make_client()
+    try:
+        await _ensure_connected(alice, _ALICE_AID)
+        await _ensure_connected(bob, _BOBB_AID)
+
+        async def _expect_error(factory, label: str):
+            try:
+                await factory()
+            except Exception as exc:
+                print(f"  [OK] {label}: {exc}")
+                return
+            raise AssertionError(f"{label}: 期望失败但实际成功")
+
+        await _expect_error(
+            lambda: alice.call("stream.create", {"content_type": "text"}),
+            "content_type 缺少 MIME 分隔符被拒绝",
+        )
+        await _expect_error(
+            lambda: alice.call("stream.create", {"content_type": "text/plain", "metadata": "bad"}),
+            "metadata 非 JSON 对象被拒绝",
+        )
+        await _expect_error(
+            lambda: alice.call("stream.create", {
+                "content_type": "text/plain",
+                "metadata": {"blob": "x" * 5000},
+            }),
+            "metadata 超过 4KB 被拒绝",
+        )
+        await _expect_error(
+            lambda: alice.call("stream.create", {"content_type": "text/plain", "target_aid": "bob"}),
+            "非法 target_aid 被拒绝",
+        )
+
+        created = await alice.call("stream.create", {
+            "content_type": "application/json-stream",
+            "target_aid": _BOBB_AID,
+            "metadata": {"purpose": "permission-check"},
+        })
+        stream_id = created["stream_id"]
+
+        info_by_target = await bob.call("stream.get_info", {"stream_id": stream_id})
+        assert info_by_target["stream_id"] == stream_id
+        assert info_by_target["metadata"].get("purpose") == "permission-check"
+
+        await _expect_error(
+            lambda: bob.call("stream.close", {"stream_id": stream_id}),
+            "target_aid 不能关闭创建者的流",
+        )
+        closed = await alice.call("stream.close", {"stream_id": stream_id})
+        assert closed.get("success") is True
+
+        idempotent = await alice.call("stream.close", {"stream_id": "missing-stream-id"})
+        assert idempotent.get("success") is True
+
+        print("  [OK] RPC 权限与参数校验通过")
+    finally:
+        await bob.close()
+        await alice.close()
+
+
+async def test_invalid_last_event_id_status_codes():
+    """Last-Event-ID 非整数、负数、越界时应返回明确 HTTP 错误"""
+    client = _make_client()
+    try:
+        await _ensure_connected(client, _ALICE_AID)
+        result = await client.call("stream.create", {"content_type": "text/plain"})
+        push_url = result["push_url"]
+        pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
+
+        await _push_ws(push_url, ["last-id-1", "last-id-2"], push_token=push_token)
+
+        base_headers = {
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {pull_token}",
+        }
+        for last_id, expected_status in [("abc", 400), ("-1", 400), ("999", 416)]:
+            headers = dict(base_headers)
+            headers["Last-Event-ID"] = last_id
+            status, text = await _http_get_status_text(pull_url, headers=headers)
+            assert status == expected_status, (
+                f"Last-Event-ID={last_id!r} 期望 HTTP {expected_status}，"
+                f"实际 {status}: {text}"
+            )
+
+        print("  [OK] Last-Event-ID 错误响应通过")
+    finally:
+        await client.close()
+
+
 async def test_stream_close_notifies_pullers():
     """推流方 close 后拉流端收到 event: done"""
     client = _make_client()
@@ -636,6 +741,79 @@ async def test_stream_close_notifies_pullers():
         assert len(done_frames) >= 1, "拉流端未收到 done 事件"
 
         print(f"  [OK] close 通知 puller 通过")
+    finally:
+        await client.close()
+
+
+async def test_text_frame_seq_validation_and_dedup():
+    """TEXT 数据帧非法 seq 被拒绝，重复 seq 被去重"""
+    client = _make_client()
+    try:
+        await _ensure_connected(client, _ALICE_AID)
+        result = await client.call("stream.create", {"content_type": "text/plain"})
+        push_url = result["push_url"]
+        pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
+
+        url = _localize_url(push_url, ws=True)
+        ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64 * 1024 * 1024) as ws:
+            await ws.send(json.dumps({"cmd": "data", "data": "seq_1", "seq": 1}))
+            await ws.send(json.dumps({"cmd": "data", "data": "dup_1", "seq": 1}))
+
+            await ws.send(json.dumps({"cmd": "data", "data": "bad_zero", "seq": 0}))
+            err_zero = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+            assert "seq" in str(err_zero.get("error") or ""), f"seq=0 错误响应异常: {err_zero}"
+
+            await ws.send(json.dumps({"cmd": "data", "data": "bad_text", "seq": "abc"}))
+            err_text = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+            assert "seq" in str(err_text.get("error") or ""), f"seq=abc 错误响应异常: {err_text}"
+
+            await ws.send(json.dumps({"cmd": "data", "data": "seq_2", "seq": 2}))
+            await ws.send(json.dumps({"cmd": "close"}))
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=2)
+            except Exception:
+                pass
+
+        frames = await _pull_sse(pull_url, timeout=5, pull_token=pull_token)
+        data_frames = [f for f in frames if f["event"] != "done"]
+        assert [f["seq"] for f in data_frames] == [1, 2], f"seq 去重异常: {data_frames}"
+        assert [f["data"] for f in data_frames] == ["seq_1", "seq_2"], f"重复/非法帧被错误投递: {data_frames}"
+
+        print("  [OK] TEXT seq 校验与去重通过")
+    finally:
+        await client.close()
+
+
+async def test_binary_frame_roundtrip_and_dedup():
+    """BINARY JSON 帧应与 TEXT 帧一致：可投递、重复 seq 去重"""
+    client = _make_client()
+    try:
+        await _ensure_connected(client, _ALICE_AID)
+        result = await client.call("stream.create", {"content_type": "application/json-stream"})
+        push_url = result["push_url"]
+        pull_url = result["pull_url"]
+        push_token = result["push_token"]
+        pull_token = result["pull_token"]
+
+        url = _localize_url(push_url, ws=True)
+        ssl_ctx = _nossl_ctx() if url.startswith("wss") else None
+        push_headers = {"Authorization": f"Bearer {push_token}"}
+        async with websockets.connect(url, ssl=ssl_ctx, **_ws_headers_kwarg(push_headers), max_size=64 * 1024 * 1024) as ws:
+            await ws.send(json.dumps({"cmd": "data", "data": "binary_1", "seq": 1}).encode("utf-8"))
+            await ws.send(json.dumps({"cmd": "data", "data": "binary_dup_1", "seq": 1}).encode("utf-8"))
+            await ws.send(json.dumps({"cmd": "data", "data": "binary_2", "seq": 2}).encode("utf-8"))
+            await ws.send(json.dumps({"cmd": "close"}).encode("utf-8"))
+
+        frames = await _pull_sse(pull_url, timeout=5, pull_token=pull_token)
+        data_frames = [f for f in frames if f["event"] != "done"]
+        assert [f["seq"] for f in data_frames] == [1, 2], f"BINARY seq 去重异常: {data_frames}"
+        assert [f["data"] for f in data_frames] == ["binary_1", "binary_2"], f"BINARY 帧内容异常: {data_frames}"
+
+        print("  [OK] BINARY 帧回路与去重通过")
     finally:
         await client.close()
 
@@ -945,7 +1123,11 @@ async def run_all():
         ("push_token 验证", test_push_token_validation),
         ("无效 JSON 后恢复", test_invalid_json_frame_then_recover),
         ("pull_token 验证", test_pull_token_validation),
+        ("RPC 权限与参数校验", test_rpc_permissions_and_input_validation),
+        ("Last-Event-ID 错误响应", test_invalid_last_event_id_status_codes),
         ("close 通知 puller", test_stream_close_notifies_pullers),
+        ("TEXT seq 校验与去重", test_text_frame_seq_validation_and_dedup),
+        ("BINARY 帧回路与去重", test_binary_frame_roundtrip_and_dedup),
         ("get_info 状态切换", test_stream_info_status_and_reject_push_after_close),
         ("get_info 查询", test_stream_get_info),
         ("list_active 列表", test_stream_list_active),

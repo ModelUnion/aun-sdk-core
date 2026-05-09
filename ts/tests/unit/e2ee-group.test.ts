@@ -68,6 +68,7 @@ describe('encryptGroupMessage', () => {
     expect(envelope.ciphertext).toBeTruthy();
     expect(envelope.tag).toBeTruthy();
     expect(envelope.aad).toBeTruthy();
+    expect((envelope.aad as JsonObject).dispatch_mode).toBeUndefined();
   });
 
   it('包含发送方签名（提供私钥时）', () => {
@@ -135,6 +136,7 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
       from: 'alice.test',
       message_id: mid,
       timestamp: ts,
+      dispatch_mode: 'mention',
       payload: envelope,
     };
     const secrets = new Map<number, Buffer>();
@@ -147,6 +149,7 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
     expect(e2ee.encryption_mode).toBe('epoch_group_key');
     expect(e2ee.epoch).toBe(1);
     expect(e2ee.sender_verified).toBe(true);
+    expect((result as Message).dispatch_mode).toBe('mention');
   });
 
   it('错误的 group_secret 无法解密', () => {
@@ -187,6 +190,7 @@ describe('群组 AAD', () => {
 
     // AAD 应相同（即使加密结果不同因为随机 nonce）
     expect(JSON.stringify(e1.aad)).toBe(JSON.stringify(e2.aad));
+    expect((e1.aad as JsonObject).dispatch_mode).toBeUndefined();
   });
 });
 

@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { AuthFlow } from '../../src/auth.js';
 import { AuthError, StateError } from '../../src/errors.js';
 
 describe('AuthFlow', () => {
@@ -52,5 +53,45 @@ describe('AuthFlow', () => {
     const err = new StateError('no identity');
     expect(err.name).toBe('StateError');
     expect(err.message).toBe('no identity');
+  });
+
+  it('OCSP DER 解析应支持 responderID byKey ([2]) 响应', () => {
+    const auth = new AuthFlow({
+      keystore: {} as any,
+      crypto: {} as any,
+      verifySsl: false,
+    });
+    // 来自本地 Gateway /pki/ocsp/{serial} 的真实 successful/good 响应。
+    // ResponseData 无 version 字段，responderID 使用 byKey [2] (0xa2) 编码。
+    const ocspB64 = 'MIIBWAoBAKCCAVEwggFNBgkrBgEFBQcwAQEEggE+MIIBOjCBwKIWBBQOakEDao+eTehZD3kHuzfc5Cgu0xgPMjAyNjA1MDgxNTI2MTVaMIGUMIGRMGkwDQYJYIZIAWUDBAIBBQAEII1IIaVHL73SrxXa7UIB0USYcFMRvzYDRqqlBX7Sf7sNBCCoqOR2Bp61FDCEvUEjq8nHZBCSWjI6wK6GRxv3979HlwIUPeGG/OKaOACVF4/6cYe50Ir/Y02AABgPMjAyNjA1MDgxNTI2MTVaoBEYDzIwMjYwNTA4MTYyNjE1WjAKBggqhkjOPQQDAwNpADBmAjEAw+wETjod6THb3+YQgh7gVbSlFg1i9Fzb/ZvW9vc+0nwkM/qvHOEmaGF38PEUORgIAjEAzq0F1C0eLiRFqvM0MpEYICWYiIn7EBv/W/hsbSfhxNC+4a/hb9mZfiiwDyx7SA3f';
+
+    const status = (auth as any)._parseOcspResponse(Buffer.from(ocspB64, 'base64'), null, null);
+
+    expect(status).toBe('good');
+  });
+
+  it('OCSP 非成功响应应回退到 JSON status 而不是误报结构缺失', () => {
+    const auth = new AuthFlow({
+      keystore: {} as any,
+      crypto: {} as any,
+      verifySsl: false,
+    });
+    const ocspB64 = 'MAMKAQY='; // unauthorized
+
+    expect(() => (auth as any)._parseOcspResponse(Buffer.from(ocspB64, 'base64'), null, null))
+      .toThrow(/unauthorized|non-successful/i);
+  });
+
+  it('OCSP DER 解析应支持 certStatus unknown 响应', () => {
+    const auth = new AuthFlow({
+      keystore: {} as any,
+      crypto: {} as any,
+      verifySsl: false,
+    });
+    const ocspB64 = 'MIIBNwoBAKCCATAwggEsBgkrBgEFBQcwAQEEggEdMIIBGTCBwKIWBBT+w/6sCcpmOxppLljRdNlY6aEWThgPMjAyNjA1MDkwMDQwMDlaMIGUMIGRMGkwDQYJYIZIAWUDBAIBBQAEIFDRAP0nT4Kon2gd1QNPhAGTjhif7qDiFd+SGbKjYQu7BCBpiE8i8ijmzvfYvjMVFtKdKFN6vzXMyvY4ZjjioU4rTAIUNpSEVz4WJWg3O930pb6kU0FR4NaCABgPMjAyNjA1MDkwMTAwMDBaoBEYDzIwMjYwNTA5MDEwNTAwWjAKBggqhkjOPQQDAgNIADBFAiB9qTqyI84W+y06CfHivBhAmPcqqy1VMeYvKNB+ZVvDtQIhAL5NIRkH9hDLfrzUZVmxLt0OQPCpQsgPpQdS+wN9/fSV';
+
+    const status = (auth as any)._parseOcspResponse(Buffer.from(ocspB64, 'base64'), null, null);
+
+    expect(status).toBe('unknown');
   });
 });

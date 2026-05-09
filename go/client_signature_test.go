@@ -70,6 +70,8 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.transfer_owner",
 		"group.review_join_request",
 		"group.batch_review_join_request",
+		"group.thought.put",
+		"message.thought.put",
 		"group.resources.put",
 		"group.resources.update",
 		"group.resources.delete",
@@ -79,6 +81,7 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.resources.reject_request",
 		"group.request_join",
 		"group.use_invite_code",
+		"group.set_settings",
 	}
 
 	if len(signedMethods) != len(expected) {

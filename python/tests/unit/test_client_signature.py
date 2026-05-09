@@ -79,6 +79,9 @@ class TestSignedMethodsCoverage:
         "group.transfer_owner", "group.review_join_request",
         "group.batch_review_join_request",
         "group.request_join", "group.use_invite_code",
+        "group.thought.put",
+        "message.thought.put",
+        "group.set_settings",
         # 群资源
         "group.resources.put", "group.resources.update",
         "group.resources.delete", "group.resources.request_add",
@@ -96,6 +99,7 @@ class TestSignedMethodsCoverage:
         "group.send",
         "group.request_join",
         "group.use_invite_code",
+        "group.thought.put",
         "group.update",
         "group.update_announcement",
         "group.update_join_requirements",

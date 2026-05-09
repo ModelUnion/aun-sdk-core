@@ -1572,9 +1572,21 @@ func (a *AuthFlow) loadRootCerts(rootCAPath string) []*x509.Certificate {
 	return certs
 }
 
-// loadTrustedRoots 返回已加载的受信根证书列表
+// loadTrustedRoots 返回已加载的受信根证书列表（空时自动 fallback 重试一次磁盘加载）
 func (a *AuthFlow) loadTrustedRoots() []*x509.Certificate {
+	if len(a.rootCerts) == 0 {
+		// fallback: 证书可能在构造之后才写入磁盘，重新加载一次
+		a.rootCerts = a.loadRootCerts(a.rootCAPath)
+	}
 	return a.rootCerts
+}
+
+// ReloadTrustedRoots 重新从磁盘加载信任根证书，供导入新根证书后刷新使用。
+func (a *AuthFlow) ReloadTrustedRoots() int {
+	a.rootCerts = a.loadRootCerts(a.rootCAPath)
+	a.gatewayCAVerified = make(map[string]bool)
+	a.chainVerifiedCache = make(map[string]float64)
+	return len(a.rootCerts)
 }
 
 // ── 静态辅助函数（auth 模块私有）────────────────────────────

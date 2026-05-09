@@ -270,12 +270,14 @@ describe('群组 E2EE 常量', () => {
     expect(AAD_FIELDS_GROUP).toContain('epoch');
     expect(AAD_FIELDS_GROUP).toContain('encryption_mode');
     expect(AAD_FIELDS_GROUP).toContain('suite');
+    expect(AAD_FIELDS_GROUP).not.toContain('dispatch_mode');
   });
 
   it('AAD_MATCH_FIELDS_GROUP 不含 timestamp', () => {
     expect(AAD_MATCH_FIELDS_GROUP).not.toContain('timestamp');
     expect(AAD_MATCH_FIELDS_GROUP).toContain('group_id');
     expect(AAD_MATCH_FIELDS_GROUP).toContain('epoch');
+    expect(AAD_MATCH_FIELDS_GROUP).not.toContain('dispatch_mode');
   });
 
   it('OLD_EPOCH_RETENTION_SECONDS 为 7 天', () => {

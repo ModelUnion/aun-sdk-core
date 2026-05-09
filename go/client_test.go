@@ -76,6 +76,9 @@ func TestEpochChangedDuringSendErrorIsRetryableEpochError(t *testing.T) {
 func TestRetryPendingDecryptMsgsKeepsConcurrentEnqueue(t *testing.T) {
 	c := &AUNClient{
 		pendingDecryptMsgs: make(map[string][]map[string]any),
+		pendingOrderedMsgs: make(map[string]map[int]pendingOrderedMessage),
+		pushedSeqs:         make(map[string]map[int]bool),
+		seqTracker:         NewSeqTracker(),
 		events:             NewEventDispatcher(),
 	}
 	groupID := "g1"
@@ -85,6 +88,7 @@ func TestRetryPendingDecryptMsgsKeepsConcurrentEnqueue(t *testing.T) {
 		"seq":      1,
 		"payload":  map[string]any{"type": "plain"},
 	}}
+	c.seqTracker.OnMessageSeq(ns, 1)
 	second := map[string]any{
 		"group_id": groupID,
 		"seq":      2,
@@ -100,6 +104,190 @@ func TestRetryPendingDecryptMsgsKeepsConcurrentEnqueue(t *testing.T) {
 	pending := c.pendingDecryptMsgs[ns]
 	if len(pending) != 1 || int(toInt64(pending[0]["seq"])) != 2 {
 		t.Fatalf("retry 期间新入队消息被覆盖: %#v", pending)
+	}
+}
+
+func TestOrderedP2PPublishWaitsForGapFill(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ns := "p2p:alice.example.com"
+	c.seqTracker.OnMessageSeq(ns, 1)
+	var received []int
+	c.events.Subscribe("message.received", func(payload any) {
+		if msg, ok := payload.(map[string]any); ok {
+			received = append(received, int(toInt64(msg["seq"])))
+		}
+	})
+
+	if c.publishOrderedMessage("message.received", ns, 3, map[string]any{"seq": 3}) {
+		t.Fatal("seq=3 越过空洞时不应立即发布")
+	}
+	if len(received) != 0 {
+		t.Fatalf("空洞补齐前不应发布消息: %v", received)
+	}
+
+	c.seqTracker.OnPullResult(ns, []map[string]any{{"seq": 2}, {"seq": 3}})
+	if !c.publishOrderedMessage("message.received", ns, 2, map[string]any{"seq": 2}) {
+		t.Fatal("seq=2 应触发有序放行")
+	}
+	if fmt.Sprint(received) != "[2 3]" {
+		t.Fatalf("消息应按 [2 3] 顺序发布，实际: %v", received)
+	}
+}
+
+func TestOrderedGroupPublishWaitsForGapFill(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ns := "group:g1"
+	c.seqTracker.OnMessageSeq(ns, 1)
+	var received []int
+	c.events.Subscribe("group.message_created", func(payload any) {
+		if msg, ok := payload.(map[string]any); ok {
+			received = append(received, int(toInt64(msg["seq"])))
+		}
+	})
+
+	if c.publishOrderedMessage("group.message_created", ns, 3, map[string]any{"seq": 3}) {
+		t.Fatal("群 seq=3 越过空洞时不应立即发布")
+	}
+	c.seqTracker.OnPullResult(ns, []map[string]any{{"seq": 2}, {"seq": 3}})
+	if !c.publishOrderedMessage("group.message_created", ns, 2, map[string]any{"seq": 2}) {
+		t.Fatal("群 seq=2 应触发有序放行")
+	}
+	if fmt.Sprint(received) != "[2 3]" {
+		t.Fatalf("群消息应按 [2 3] 顺序发布，实际: %v", received)
+	}
+}
+
+func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	c.deviceID = "dev-1"
+	c.slotID = "slot-a"
+	p2pNS := "p2p:alice.example.com"
+	groupNS := "group:g1"
+	c.seqTracker.OnMessageSeq(p2pNS, 1)
+	c.seqTracker.OnMessageSeq(groupNS, 1)
+
+	var p2pEvent map[string]any
+	var groupEvent map[string]any
+	c.events.Subscribe("message.received", func(payload any) {
+		p2pEvent, _ = payload.(map[string]any)
+	})
+	c.events.Subscribe("group.message_created", func(payload any) {
+		groupEvent, _ = payload.(map[string]any)
+	})
+
+	if !c.publishOrderedMessage("message.received", p2pNS, 1, map[string]any{"seq": 1, "payload": map[string]any{"type": "text"}}) {
+		t.Fatal("P2P seq=1 应发布")
+	}
+	if !c.publishOrderedMessage("group.message_created", groupNS, 1, map[string]any{"group_id": "g1", "seq": 1, "payload": map[string]any{"type": "text"}}) {
+		t.Fatal("群 seq=1 应发布")
+	}
+	if p2pEvent["device_id"] != "dev-1" || p2pEvent["slot_id"] != "slot-a" {
+		t.Fatalf("P2P 事件未 fallback 当前实例: %#v", p2pEvent)
+	}
+	if groupEvent["device_id"] != "dev-1" || groupEvent["slot_id"] != "slot-a" {
+		t.Fatalf("群消息事件未 fallback 当前实例: %#v", groupEvent)
+	}
+}
+
+func TestP2PPushIgnoresOtherSlotContext(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	c.deviceID = "dev-1"
+	c.slotID = "slot-a"
+
+	var received int32
+	c.events.Subscribe("message.received", func(payload any) {
+		atomic.AddInt32(&received, 1)
+	})
+
+	c.processAndPublishMessage(map[string]any{
+		"message_id": "m-other-slot",
+		"from":       "bob.example.com",
+		"to":         "alice.example.com",
+		"slot_id":    "slot-b",
+		"payload":    map[string]any{"type": "text", "text": "wrong slot"},
+	})
+
+	if atomic.LoadInt32(&received) != 0 {
+		t.Fatal("P2P push 明确指向其它 slot 时不应发布 message.received")
+	}
+}
+
+func TestGroupPushAcceptsOtherSlotContext(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	c.deviceID = "dev-1"
+	c.slotID = "slot-a"
+
+	delivered := make(chan map[string]any, 1)
+	c.events.Subscribe("group.message_created", func(payload any) {
+		if msg, ok := payload.(map[string]any); ok {
+			delivered <- msg
+		}
+	})
+
+	c.processAndPublishGroupMessage(map[string]any{
+		"message_id": "gm-other-slot",
+		"group_id":   "g1",
+		"from":       "bob.example.com",
+		"device_id":  "dev-2",
+		"slot_id":    "slot-b",
+		"payload":    map[string]any{"type": "text", "text": "group"},
+	})
+
+	select {
+	case msg := <-delivered:
+		if msg["device_id"] != "dev-2" || msg["slot_id"] != "slot-b" {
+			t.Fatalf("群消息不应覆盖显式实例字段: %#v", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("group push 明确带其它 slot 时仍应投递")
+	}
+}
+
+func TestOrderedQueueClearedOnSeqTrackerContextSwitch(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.deviceID = "device-a"
+	c.slotID = "slot-a"
+	c.seqTrackerContext = buildSeqTrackerContext(c.aid, c.deviceID, c.slotID)
+	c.mu.Unlock()
+	c.enqueueOrderedMessage("p2p:alice.example.com", "message.received", 3, map[string]any{"seq": 3})
+	c.pendingDecryptMsgsMu.Lock()
+	c.pendingDecryptMsgs["group:g1"] = []map[string]any{{
+		"group_id": "g1",
+		"seq":      4,
+		"payload":  map[string]any{"type": "e2ee.group_encrypted"},
+	}}
+	c.pendingDecryptMsgsMu.Unlock()
+
+	c.mu.Lock()
+	c.slotID = "slot-b"
+	c.refreshSeqTrackerContextLocked()
+	c.mu.Unlock()
+
+	c.pendingOrderedMsgsMu.Lock()
+	size := len(c.pendingOrderedMsgs)
+	c.pendingOrderedMsgsMu.Unlock()
+	if size != 0 {
+		t.Fatalf("slot 上下文切换后有序待发布队列应清空，实际 size=%d", size)
+	}
+	c.pendingDecryptMsgsMu.Lock()
+	decryptSize := len(c.pendingDecryptMsgs)
+	c.pendingDecryptMsgsMu.Unlock()
+	if decryptSize != 0 {
+		t.Fatalf("slot 上下文切换后待解密队列应清空，实际 size=%d", decryptSize)
 	}
 }
 
@@ -643,8 +831,16 @@ func TestPullEmptyResultAppliesRetentionFloor(t *testing.T) {
 				"count":    0,
 				"cursor":   map[string]any{"current_seq": 9},
 			}
+		case "group.pull_events":
+			return map[string]any{
+				"events": []any{},
+				"count":  0,
+				"cursor": map[string]any{"current_seq": 11},
+			}
 		case "group.ack_messages":
 			return map[string]any{"success": true, "ack_seq": params["msg_seq"]}
+		case "group.ack_events":
+			return map[string]any{"success": true, "ack_seq": params["event_seq"]}
 		default:
 			return map[string]any{"ok": true}
 		}
@@ -681,9 +877,27 @@ func TestPullEmptyResultAppliesRetentionFloor(t *testing.T) {
 		t.Fatalf("空 group.pull 应推进 contiguous 到 cursor.current_seq=9, got=%d", got)
 	}
 
+	c.fillGroupEventGap(groupID)
+	if got := c.seqTracker.GetContiguousSeq("group_event:" + groupID); got != 11 {
+		t.Fatalf("空 group.pull_events 应推进 contiguous 到 cursor.current_seq=11, got=%d", got)
+	}
+	sawPullEventsZero := false
+	for _, call := range getCalls() {
+		if call.Method == "group.pull_events" && toInt64(call.Params["after_event_seq"]) == 0 {
+			if call.Params["device_id"] != c.deviceID || call.Params["slot_id"] != "slot-a" {
+				t.Fatalf("group.pull_events 未注入当前实例上下文: %#v", call.Params)
+			}
+			sawPullEventsZero = true
+			break
+		}
+	}
+	if !sawPullEventsZero {
+		t.Fatalf("group event 补洞应允许 after_event_seq=0: %#v", getCalls())
+	}
+
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		var sawMessageAck, sawGroupAck bool
+		var sawMessageAck, sawGroupAck, sawEventAck bool
 		for _, call := range getCalls() {
 			if call.Method == "message.ack" && toInt64(call.Params["seq"]) == 7 {
 				sawMessageAck = true
@@ -691,13 +905,86 @@ func TestPullEmptyResultAppliesRetentionFloor(t *testing.T) {
 			if call.Method == "group.ack_messages" && toInt64(call.Params["msg_seq"]) == 9 {
 				sawGroupAck = true
 			}
+			if call.Method == "group.ack_events" && toInt64(call.Params["event_seq"]) == 11 &&
+				call.Params["device_id"] == c.deviceID && call.Params["slot_id"] == "slot-a" {
+				sawEventAck = true
+			}
 		}
-		if sawMessageAck && sawGroupAck {
+		if sawMessageAck && sawGroupAck && sawEventAck {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("空 pull 应触发 ack: %#v", getCalls())
+}
+
+func TestOnRawGroupChangedTriggersGroupEventGapFill(t *testing.T) {
+	groupID := "g-gap.example.com"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.pull_events":
+			return map[string]any{
+				"events": []any{},
+				"count":  0,
+				"cursor": map[string]any{"current_seq": 11},
+			}
+		case "group.ack_events":
+			return map[string]any{"success": true, "ack_seq": params["event_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.mu.Unlock()
+
+	c.onRawGroupChanged(map[string]any{
+		"group_id":  groupID,
+		"event_seq": 5,
+		"action":    "foo",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var sawPullEvents, sawEventAck bool
+		for _, call := range getCalls() {
+			if call.Method == "group.pull_events" &&
+				toInt64(call.Params["after_event_seq"]) == 0 &&
+				call.Params["device_id"] == c.deviceID &&
+				call.Params["slot_id"] == "slot-a" {
+				sawPullEvents = true
+			}
+			if call.Method == "group.ack_events" &&
+				toInt64(call.Params["event_seq"]) == 11 &&
+				call.Params["device_id"] == c.deviceID &&
+				call.Params["slot_id"] == "slot-a" {
+				sawEventAck = true
+			}
+		}
+		if sawPullEvents && sawEventAck &&
+			c.seqTracker.GetContiguousSeq("group_event:"+groupID) == 11 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("group.changed gap fill 未触发 pull/ack: %#v", getCalls())
 }
 
 func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
@@ -1239,6 +1526,260 @@ func TestSendGroupEncryptedUsesCommittedEpoch(t *testing.T) {
 	payload, _ := sendCall.Params["payload"].(map[string]any)
 	if payload == nil || int(toInt64(payload["epoch"])) != 2 {
 		t.Fatalf("group.send 应使用 committed epoch=2 加密: %#v", payload)
+	}
+}
+
+func TestPutGroupThoughtEncryptedSignsAndEncrypts(t *testing.T) {
+	aid := "alice.example.com"
+	groupID := "g-thought-put.example.com"
+	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
+	members := []string{aid, "bob.example.com"}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 1, groupID, secret)
+	chain := ComputeEpochChain("", 1, commitment, aid)
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.pull":
+			return map[string]any{"messages": []any{}}
+		case "group.e2ee.get_epoch":
+			return map[string]any{"epoch": 1, "committed_epoch": 1}
+		case "group.get_members":
+			return map[string]any{
+				"members": []any{
+					map[string]any{"aid": aid, "role": "owner", "min_read_epoch": 0},
+					map[string]any{"aid": "bob.example.com", "role": "member", "min_read_epoch": 0},
+				},
+			}
+		case "group.thought.put":
+			return map[string]any{"ok": true}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	if ok, err := StoreGroupSecret(c.keyStore, aid, groupID, 1, secret, commitment, members, chain); err != nil || !ok {
+		t.Fatalf("保存群密钥失败: ok=%v err=%v", ok, err)
+	}
+	c.mu.Lock()
+	c.aid = aid
+	c.identity = identity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "group.thought.put", map[string]any{
+		"group_id": groupID,
+		"reply_to": map[string]any{"message_id": "gm-root"},
+		"payload":  map[string]any{"type": "thought", "text": "推理片段"},
+	}); err != nil {
+		t.Fatalf("group.thought.put 失败: %v", err)
+	}
+
+	var thoughtCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "group.thought.put" {
+			captured := call
+			thoughtCall = &captured
+		}
+	}
+	if thoughtCall == nil {
+		t.Fatal("未捕获 group.thought.put")
+	}
+	payload, _ := thoughtCall.Params["payload"].(map[string]any)
+	if payload == nil || payload["type"] != "e2ee.group_encrypted" {
+		t.Fatalf("group.thought.put 应发送群 E2EE 密文: %#v", thoughtCall.Params)
+	}
+	if _, ok := thoughtCall.Params["client_signature"].(map[string]any); !ok {
+		t.Fatalf("group.thought.put 应附带 client_signature: %#v", thoughtCall.Params)
+	}
+	if thoughtID, _ := thoughtCall.Params["thought_id"].(string); !strings.HasPrefix(thoughtID, "gt-") {
+		t.Fatalf("group.thought.put 应生成 gt- thought_id: %#v", thoughtCall.Params)
+	}
+}
+
+func TestPutMessageThoughtEncryptedSignsAndEncrypts(t *testing.T) {
+	aliceAID := "alice.example.com"
+	bobAID := "bob.example.com"
+	aliceIdentity, _, _ := testBuildIdentityWithFingerprint(t, aliceAID)
+	bobIdentity, bobCertPEM, bobFingerprint := testBuildIdentityWithFingerprint(t, bobAID)
+	bobPrekey := testGeneratePrekeyForIdentity(t, t.TempDir(), bobIdentity)
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.e2ee.get_prekey":
+			if params["aid"] == bobAID {
+				return map[string]any{"found": true, "prekey": bobPrekey}
+			}
+			return map[string]any{"found": false}
+		case "message.thought.put":
+			return map[string]any{"ok": true}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aliceAID
+	c.identity = aliceIdentity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	now := float64(time.Now().Unix())
+	c.certCacheMu.Lock()
+	c.certCache[certCacheKey(bobAID, "")] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + 600}
+	c.certCache[certCacheKey(bobAID, bobFingerprint)] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + 600}
+	c.certCacheMu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "message.thought.put", map[string]any{
+		"to":       bobAID,
+		"reply_to": map[string]any{"message_id": "msg-root"},
+		"payload":  map[string]any{"type": "thought", "text": "推理片段"},
+	}); err != nil {
+		t.Fatalf("message.thought.put 失败: %v", err)
+	}
+
+	var thoughtCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.thought.put" {
+			captured := call
+			thoughtCall = &captured
+		}
+	}
+	if thoughtCall == nil {
+		t.Fatal("未捕获 message.thought.put")
+	}
+	payload, _ := thoughtCall.Params["payload"].(map[string]any)
+	if payload == nil || payload["type"] != "e2ee.encrypted" {
+		t.Fatalf("message.thought.put 应发送 P2P E2EE 密文: %#v", thoughtCall.Params)
+	}
+	if _, ok := thoughtCall.Params["client_signature"].(map[string]any); !ok {
+		t.Fatalf("message.thought.put 应附带 client_signature: %#v", thoughtCall.Params)
+	}
+	if thoughtID, _ := thoughtCall.Params["thought_id"].(string); !strings.HasPrefix(thoughtID, "mt-") {
+		t.Fatalf("message.thought.put 应生成 mt- thought_id: %#v", thoughtCall.Params)
+	}
+	if replyTo, _ := thoughtCall.Params["reply_to"].(map[string]any); replyTo["message_id"] != "msg-root" {
+		t.Fatalf("message.thought.put 应透传 reply_to: %#v", thoughtCall.Params)
+	}
+}
+
+func TestGroupThoughtGetAutoDecrypts(t *testing.T) {
+	groupID := "g-thought-get.example.com"
+	aliceAID := "alice.example.com"
+	bobAID := "bob.example.com"
+	aliceIdentity, aliceCertPEM, aliceFingerprint := testBuildIdentityWithFingerprint(t, aliceAID)
+	bobIdentity, _, _ := testBuildIdentityWithFingerprint(t, bobAID)
+	members := []string{aliceAID, bobAID}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 1, groupID, secret)
+	chain := ComputeEpochChain("", 1, commitment, aliceAID)
+	envelope, err := EncryptGroupMessage(
+		secret,
+		map[string]any{"type": "thought", "text": "只给感兴趣的人看"},
+		groupID,
+		aliceAID,
+		"gt-1",
+		1710504000000,
+		1,
+		aliceIdentity["private_key_pem"].(string),
+		[]byte(aliceCertPEM),
+	)
+	if err != nil {
+		t.Fatalf("构造 thought 密文失败: %v", err)
+	}
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.thought.get":
+			return map[string]any{
+				"found":      true,
+				"group_id":   groupID,
+				"sender_aid": aliceAID,
+				"reply_to":   map[string]any{"message_id": "gm-root"},
+				"thoughts": []any{
+					map[string]any{
+						"thought_id": "gt-1",
+						"reply_to":   map[string]any{"message_id": "gm-root"},
+						"payload":    envelope,
+						"created_at": int64(1710504000000),
+					},
+				},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	if ok, err := StoreGroupSecret(c.keyStore, bobAID, groupID, 1, secret, commitment, members, chain); err != nil || !ok {
+		t.Fatalf("保存群密钥失败: ok=%v err=%v", ok, err)
+	}
+	if err := c.keyStore.SaveCert(aliceAID, aliceCertPEM); err != nil {
+		t.Fatalf("保存发送方证书失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = bobAID
+	c.identity = bobIdentity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.certCache[certCacheKey(aliceAID, aliceFingerprint)] = &cachedPeerCert{
+		certBytes:    []byte(aliceCertPEM),
+		validatedAt:  float64(time.Now().Unix()),
+		refreshAfter: float64(time.Now().Unix() + 600),
+	}
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+	result, err := c.Call(ctx, "group.thought.get", map[string]any{
+		"group_id":   groupID,
+		"sender_aid": aliceAID,
+		"reply_to":   map[string]any{"message_id": "gm-root"},
+	})
+	if err != nil {
+		t.Fatalf("group.thought.get 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	thoughts, _ := resultMap["thoughts"].([]any)
+	if len(thoughts) != 1 {
+		t.Fatalf("期望 1 条解密 thought，实际: %#v", resultMap)
+	}
+	thought, _ := thoughts[0].(map[string]any)
+	payload, _ := thought["payload"].(map[string]any)
+	if payload["type"] != "thought" || payload["text"] != "只给感兴趣的人看" {
+		t.Fatalf("group.thought.get 应返回解密明文 payload: %#v", thought)
 	}
 }
 
@@ -2141,10 +2682,11 @@ func TestDecryptGroupMessagesDropsFailedCiphertext(t *testing.T) {
 
 	messages := []any{
 		map[string]any{
-			"message_id": "group-plain-1",
-			"group_id":   "g-1.example.com",
-			"from":       "bob.example.com",
-			"payload":    map[string]any{"type": "text", "text": "hello"},
+			"message_id":    "group-plain-1",
+			"group_id":      "g-1.example.com",
+			"from":          "bob.example.com",
+			"dispatch_mode": "mention",
+			"payload":       map[string]any{"type": "text", "text": "hello"},
 		},
 		map[string]any{
 			"message_id": "group-cipher-1",
@@ -2164,6 +2706,29 @@ func TestDecryptGroupMessagesDropsFailedCiphertext(t *testing.T) {
 	msg, _ := result[0].(map[string]any)
 	if msg["message_id"] != "group-plain-1" {
 		t.Fatalf("群补洞结果应仅保留可投递消息: %#v", result)
+	}
+	if msg["dispatch_mode"] != "mention" {
+		t.Fatalf("群补洞结果应保留顶层 dispatch_mode: %#v", msg)
+	}
+	payload, _ := msg["payload"].(map[string]any)
+	if payload["dispatch_mode"] != "mention" {
+		t.Fatalf("群补洞结果应向应用 payload 注入 dispatch_mode: %#v", msg)
+	}
+}
+
+func TestGroupDispatchModeDefaultsToBroadcast(t *testing.T) {
+	msg := attachGroupDispatchModeToPayload(map[string]any{
+		"message_id": "group-plain-default",
+		"group_id":   "g-1.example.com",
+		"from":       "bob.example.com",
+		"payload":    map[string]any{"type": "text", "text": "hello"},
+	})
+	if msg["dispatch_mode"] != "broadcast" {
+		t.Fatalf("缺省 dispatch_mode 应默认 broadcast: %#v", msg)
+	}
+	payload, _ := msg["payload"].(map[string]any)
+	if payload["dispatch_mode"] != "broadcast" {
+		t.Fatalf("缺省 dispatch_mode 应向 payload 注入 broadcast: %#v", msg)
 	}
 }
 
@@ -2185,6 +2750,9 @@ func TestPushedSeqsNoDuplicateOnGapFill(t *testing.T) {
 	}
 	c.pushedSeqs[ns][5] = true
 	c.pushedSeqsMu.Unlock()
+
+	// 补洞场景：seqTracker 已被 onPullResult 推进到覆盖所有消息
+	c.seqTracker.ForceContiguousSeq(ns, 6)
 
 	// 模拟补洞路径返回包含 seq=5 和 seq=6 的消息列表
 	messages := []any{
@@ -2235,6 +2803,9 @@ func TestPushedSeqsGroupNoDuplicateOnGapFill(t *testing.T) {
 	c.pushedSeqs[ns][10] = true
 	c.pushedSeqsMu.Unlock()
 
+	// 补洞场景：seqTracker 已被 onPullResult 推进到覆盖所有消息
+	c.seqTracker.ForceContiguousSeq(ns, 11)
+
 	messages := []any{
 		map[string]any{"message_id": "gm10", "group_id": groupID, "seq": float64(10), "payload": map[string]any{"type": "text", "text": "dup"}},
 		map[string]any{"message_id": "gm11", "group_id": groupID, "seq": float64(11), "payload": map[string]any{"type": "text", "text": "new"}},
@@ -2279,6 +2850,9 @@ func TestPushedSeqsPreMarkBeforeGapFill(t *testing.T) {
 
 	// 模拟：推送路径先预标记 seq=7（在启动补洞 goroutine 之前）
 	c.markPushedSeq(ns, 7)
+
+	// 补洞场景：seqTracker 已被 onPullResult 推进到覆盖所有消息
+	c.seqTracker.ForceContiguousSeq(ns, 8)
 
 	// 然后补洞路径立即读取（模拟 goroutine 调度到补洞路径先执行）
 	messages := []any{
