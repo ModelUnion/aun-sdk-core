@@ -36,11 +36,14 @@
 |------|----------|------|
 | `to` | `message.send.params` | P2P 接收方 AID |
 | `group_id` | `group.send.params` 和群消息信封 | 群组 ID |
+| `protected_headers` / `headers` | `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 参数 | E2EE 信封元数据，类似 HTTP headers；SDK 验 `_auth` 后在 `e2ee.protected_headers` 暴露 |
 | `from` / `sender_aid` | 服务端生成的消息信封 | 发送方身份 |
 | `message_id` / `seq` / `timestamp` / `created_at` | 服务端生成或发送参数 | 当前消息 ID、序号和服务端时间 |
 | `encrypted` / `delivery_mode` | 发送参数或连接上下文 | 加密和投递语义 |
 | `type` / `message_type` | 发送参数或消息信封 | 信封/封装类型，如 `e2ee.encrypted` / `e2ee.group_encrypted` |
 | `dispatch` / `duty_state` | `group.send` 响应 | 群消息分发状态 |
+
+`protected_headers` 用于可见但需防篡改的信封元数据，例如 `device_id`、`slot_id`、`sdk_version`。它不属于业务 payload，也不提供机密性；需要端到端保密的上下文仍应放在 `payload.client_context` 或其他 payload 字段内。
 
 ## 公共辅助字段
 

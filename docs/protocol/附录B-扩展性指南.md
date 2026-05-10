@@ -4,7 +4,7 @@
 
 ## B.1 可选命名空间
 
-通过 `initialize` 的 `capabilities.namespaces` 协商启用：
+服务端通过 `hello-ok.result.capabilities.namespaces` 公告可用命名空间；客户端侧需要声明的扩展能力通过 `auth.connect.params.capabilities` 扩展：
 
 - `group.*`: 群组管理
 - `storage.*`: 文件存储
@@ -69,7 +69,7 @@ gateway:
 **核心原则**：
 1. **向后兼容**：扩展不能破坏现有协议
 2. **可选实现**：客户端可以选择不实现扩展
-3. **能力协商**：通过 `initialize` 协商支持的扩展
+3. **能力声明与公告**：通过 `auth.connect` 声明客户端能力，通过 `hello-ok` 公告服务端能力；需要双向协商的扩展必须单独定义交集规则
 4. **文档清晰**：明确标注哪些是核心协议，哪些是扩展
 
 **不推荐的扩展**：

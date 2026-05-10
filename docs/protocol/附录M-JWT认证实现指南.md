@@ -58,7 +58,7 @@ eyJhbGciOiJFUzM4NCIsInR5cCI6IkpXVCJ9.eyJhaWQiOiJhbGljZS5haWQucHViIiwiaWF0IjoxNzA
 1. 服务收到请求（携带 JWT token）
    ↓
 2. 提取 token
-   - WebSocket: 从 initialize 消息中获取
+   - WebSocket: 从 `auth.connect.params.auth.token` 中获取
    - 连接状态：token 验证后存储在连接上下文
    ↓
 3. 解析 token
@@ -158,41 +158,45 @@ const token = response.token;
 
 ### M.3.2 Token 使用示例
 
-Token 统一通过 `initialize` 消息传递。每次 WebSocket 连接（包括重连）都必须调用 `initialize`：
+Token 统一通过 `auth.connect` 消息传递。每次 WebSocket 连接（包括重连）都必须在收到 Gateway `challenge` 后调用 `auth.connect`：
 
 ```javascript
-// 首次登录：先调用 auth.* 获取 token，再 initialize
-const ws = new WebSocket('wss://gateway.example.com/aun');
-ws.onopen = async () => {
-  // 1. 在 initialize 之前调用 auth.* 获取 token
-  const token = await loginFlow(ws); // login_aid1 + login_aid2
-
-  // 2. 用 token 调用 initialize 完成认证
+function sendAuthConnect(ws, nonce, token) {
   ws.send(JSON.stringify({
     jsonrpc: '2.0',
     id: 1,
-    method: 'initialize',
+    method: 'auth.connect',
     params: {
-      protocolVersion: '1.0',
-      token: token,
-      clientInfo: { name: 'MyApp', version: '1.0.0' }
+      nonce,
+      auth: { method: 'kite_token', token },
+      protocol: { min: '1.0', max: '1.0' },
+      device: { id: 'dev-001', type: 'browser' },
+      client: { name: 'MyApp', version: '1.0.0' },
+      capabilities: { e2ee: true, group_e2ee: true }
     }
   }));
+}
+
+// 首次登录：先调用 auth.* 获取 token，再 auth.connect
+const ws = new WebSocket('wss://gateway.example.com/aun');
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.method !== 'challenge') return;
+
+  // 1. 在 auth.connect 之前调用 auth.* 获取 token
+  const token = await loginFlow(ws); // login_aid1 + login_aid2
+
+  // 2. 用 token 调用 auth.connect 完成会话初始化
+  sendAuthConnect(ws, msg.params.nonce, token);
 };
 
-// 重连：直接用已有 token 调用 initialize
+// 重连：直接用已有 token 调用 auth.connect
 const ws2 = new WebSocket('wss://gateway.example.com/aun');
-ws2.onopen = () => {
-  ws2.send(JSON.stringify({
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'initialize',
-    params: {
-      protocolVersion: '1.0',
-      token: saved_jwt_token,
-      clientInfo: { name: 'MyApp', version: '1.0.0' }
-    }
-  }));
+ws2.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.method === 'challenge') {
+    sendAuthConnect(ws2, msg.params.nonce, saved_jwt_token);
+  }
 };
 ```
 

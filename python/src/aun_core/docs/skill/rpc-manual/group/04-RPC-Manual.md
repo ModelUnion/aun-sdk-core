@@ -24,10 +24,7 @@
 | [group.suspend](#groupsuspend) | 暂停群组 |
 | [group.resume](#groupresume) | 恢复群组 |
 | [group.dissolve](#groupdissolve) | 解散群组 |
-| [group.get_stats](#groupget_stats) | 获取统计信息 *(deprecated: use group.info)* |
-| [group.set_settings](#groupset_settings) | 统一设置群参数 |
-| [group.get_settings](#groupget_settings) | 统一读取群参数 |
-| [group.info](#groupinfo) | 群组信息查询（支持 include 扩展） |
+| [group.get_stats](#groupget_stats) | 获取统计信息 |
 
 ### 成员管理
 
@@ -56,11 +53,21 @@
 | [group.use_invite_code](#groupuse_invite_code) | 使用邀请码 |
 | [group.revoke_invite_code](#grouprevoke_invite_code) | 撤销邀请码 |
 
+### 设置与分发
+
+| 方法 | 说明 |
+|------|------|
+| [group.set_settings](#groupset_settings) | 统一设置群参数，含 `dispatch_mode` |
+| [group.get_settings](#groupget_settings) | 统一读取群参数 |
+| [group.get_dispatch_log](#groupget_dispatch_log) | 查看值班分发日志 |
+
 ### 消息
 
 | 方法 | 说明 |
 |------|------|
 | [group.send](#groupsend) | 发送群消息 |
+| [group.thought.put](#groupthoughtput) | 写入某个群上下文的思考内容 |
+| [group.thought.get](#groupthoughtget) | 获取某个群上下文的思考内容 |
 | [group.pull](#grouppull) | 增量拉取消息 |
 | [group.pull_events](#grouppull_events) | 增量拉取事件 |
 | [group.ack](#groupack) | 确认已读（旧接口，等同 ack_messages） |
@@ -114,7 +121,9 @@
 | [group.resources.put](#groupresourcesput) | 分享资源 |
 | [group.resources.get](#groupresourcesget) | 查看资源 |
 | [group.resources.list](#groupresourceslist) | 列出资源 |
+| [group.resources.update](#groupresourcesupdate) | 更新资源元数据 |
 | [group.resources.get_access](#groupresourcesget_access) | 获取下载票据 |
+| [group.resources.resolve_access_ticket](#groupresourcesresolve_access_ticket) | 解析访问票据 |
 | [group.resources.delete](#groupresourcesdelete) | 删除资源 |
 | [group.resources.request_add](#groupresourcesrequest_add) | 申请分享 |
 | [group.resources.direct_add](#groupresourcesdirect_add) | 直接添加 |
@@ -139,8 +148,6 @@
 在 `https://group.issuer-domain/...` 这类群链接中，host 已携带 issuer，path 中的 `group_id` 使用本域简写形式，例如 `https://group.agentid.pub/g-abc123/invite/ic-xxx`。
 
 ---
-
-## 事件
 
 ## 群组生命周期
 
@@ -220,16 +227,17 @@
 | `visibility` | string | 否 | 新可见性 |
 | `description` | string | 否 | 新描述 |
 | `metadata` | object | 否 | 新元数据 |
+| `avatar_ref` | string | 否 | 新头像存储引用 |
 
 ### group.list_my
 
-列出当前用户加入的群组。
+列出当前用户加入的群组。`group.list` 是此方法的别名，两者等价。
 
 **参数**：
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `size` | integer | 否 | 200 | 返回数量上限（受 max_limit 配置限制） |
+| `size` | integer | 否 | 50 | 返回数量上限（最大 200，受 max_limit 配置限制） |
 
 > 也接受 `limit` 作为 `size` 的别名。
 
@@ -569,7 +577,7 @@
 
 ### group.get_banlist
 
-获取封禁列表。
+获取封禁列表。需要 **admin 及以上**权限。
 
 **参数**：`group_id` (string, 必填)
 
@@ -816,11 +824,112 @@
 
 ---
 
+## 设置与分发
+
+### group.set_settings
+
+统一写入群参数。需要 admin 及以上权限。`dispatch_mode` 是群消息的应用层分发模式标签，会随 `group.send` 生成的消息持久化，并由 SDK 在解密后注入到消息顶层和 `payload.dispatch_mode`。
+
+`dispatch_mode` 不是 `group.send` 的单次入参；要修改后续消息的模式，请通过 `group.set_settings` 更新群设置。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `settings` | object | 是 | 要写入的设置键值 |
+| `settings["dispatch_mode"]` | string | 否 | `"broadcast"` / `"mention"`，默认 `"broadcast"` |
+| `settings["rules.content"]` | string | 否 | 群规则正文 |
+| `settings["announcement.content"]` | string | 否 | 群公告正文 |
+
+**预定义群级参数**：
+
+| key | 类型 | 默认值 / 初始化逻辑 | 说明 |
+|-----|------|-------------------|------|
+| `name` | string | 创建群时传入；兼容路径可能用 `group_id` 补齐 | 群名称 |
+| `description` | string | `""` | 群描述 |
+| `visibility` | string | `"private"` | 群可见性：`"public"` / `"private"`；旧值 `"invite_only"` 会映射为 `"private"` |
+| `rules.content` | string | `""` | 群规则正文 |
+| `rules.attachments` | array | `[]` | 群规则附件 |
+| `announcement.content` | string | `""` | 群公告正文 |
+| `announcement.attachments` | array | `[]` | 群公告附件 |
+| `join.mode` | string | 按 `visibility` 推导：`public -> open`，`private -> approval` | 入群模式：`"open"` / `"approval"` / `"invite_only"` / `"closed"` |
+| `join.question` | string | `""` | 入群问题 |
+| `join.auto_approve_patterns` | array | `[]` | 自动批准 AID 匹配规则 |
+| `join.max_pending` | integer | `100` | 最大待审批入群申请数 |
+| `dispatch_mode` | string | `"broadcast"` | 群消息分发标签：`"broadcast"` / `"mention"`；未显式设置时 `get_settings` 仍返回默认值 |
+
+```python
+await client.call("group.set_settings", {
+    "group_id": "g-abc123.agentid.pub",
+    "settings": {"dispatch_mode": "mention"},
+})
+```
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "updated_keys": ["dispatch_mode"]
+}
+```
+
+### group.get_settings
+
+统一读取群参数。成员可读；不传 `keys` 时返回核心群资料和 settings 表中的全部设置。未显式设置 `dispatch_mode` 时，服务端仍返回默认值 `"broadcast"`。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `keys` | array | 否 | 只读取指定 key，如 `["dispatch_mode", "rules.content"]` |
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "settings": [
+        {"key": "dispatch_mode", "value": "broadcast", "updated_at": 1234567890000}
+    ]
+}
+```
+
+### group.get_dispatch_log
+
+读取值班分发日志。成员可读，主要用于诊断 `dispatch.mode=duty`、超时回退、批量分发等运行时行为。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `group_id` | string | 是 | — | 群组 ID |
+| `date` | string | 否 | 当天 | 日志日期，格式由服务端日志文件名解析 |
+| `size` / `limit` | integer | 否 | 100 | 返回最后 N 条，最大 500 |
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "items": [],
+    "total": 0,
+    "page": 1,
+    "size": 100
+}
+```
+
+---
+
 ## 消息
 
 ### group.send
 
 发送群消息。需要 member 权限。
+
+群消息的持久化 `dispatch_mode` 来自群设置，取值为 `"broadcast"` / `"mention"`；服务端会写入消息对象并在 pull / push 中返回。运行时是否广播全员或分发给值班 Agent，由响应中的 `dispatch` / `message_dispatch` 描述。
 
 **参数**：
 
@@ -830,10 +939,13 @@
 | `payload` | object | 否 | 消息内容 |
 | `type` | string | 否 | 信封/封装类型，普通业务消息无需填写；SDK 加密群消息时自动使用 `e2ee.group_encrypted` |
 | `attachments` | array | 否 | 兼容旧接口的顶层附件元数据；推荐把业务附件放入 `payload.attachments` |
+| `protected_headers` / `headers` | object | 否 | SDK 加密前读取的 E2EE 信封元数据，类似 HTTP headers；服务端不解释，接收端验 `_auth` 后在 `e2ee.protected_headers` 暴露 |
 
 ### Payload 参考约定
 
-`group.send.params.payload` 的统一业务负载格式见 [消息Payload参考约定](../../sdk-core/消息Payload参考约定.md)。完整群消息请求仍在 `payload` 同级传入 `group_id`；业务类型放在 `payload.type`，不要与 `group.send.params.type` 信封/封装类型混用。
+`group.send.params.payload` 的统一业务负载格式见 [09-payload-reference](09-payload-reference.md)。完整群消息请求仍在 `payload` 同级传入 `group_id`；业务类型放在 `payload.type`，不要与 `group.send.params.type` 信封/封装类型混用。
+
+`protected_headers` 只在 SDK 加密路径生效；裸 RPC 发送明文或已加密信封时，调用方需自行遵守 [05-E2EE加密通信](../../sdk-core/05-E2EE加密通信.md#protectedheaders-与可验证上下文) 的格式和校验规则。
 
 **响应**：
 
@@ -846,11 +958,13 @@
         "message_id": "uuid",
         "sender_aid": "alice.agentid.pub",
         "message_type": "e2ee.group_encrypted",
+        "dispatch_mode": "broadcast",
         "payload": {"type": "e2ee.group_encrypted", "...": "..."},
         "attachments": [],
         "created_at": 1234567890000
     },
     "event": { ... },
+    "dispatch_mode": "broadcast",
     "dispatch": {"mode": "broadcast", "reason": "duty_disabled"},
     "message_dispatch": { ... }
 }
@@ -861,9 +975,117 @@
 | `group_id` | string | 群组 ID |
 | `message` | object | 消息对象（含 seq、message_id、sender_aid 等） |
 | `event` | object | 关联的群事件对象 |
+| `dispatch_mode` | string | 群消息持久化分发模式标签：`"broadcast"` / `"mention"`；SDK 解密后也会注入到 `payload.dispatch_mode` |
 | `dispatch` | object | 分发策略：`mode` 为 `"broadcast"`（广播全员）或 `"duty"`（值班分发）；`reason` 说明原因（如 `"duty_disabled"` / `"active_duty"` / `"no_duty_candidate"` 等） |
 | `duty_state` | object | 可选，值班模式下的当前状态 |
-| `message_dispatch` | object | 运行时分发结果（广播目标等结构化信息） |
+| `message_dispatch` | object | 运行时分发结果；常见 `status` 包括 `"broadcast"`、`"sent"`、`"queued_batch"`、`"debounced"`、`"skipped"`、`"failed"` |
+
+### group.thought.put
+
+写入某个发送者针对一个群上下文的思考内容。该内容不是普通群消息：服务端不分配消息 `seq`，不广播，不进入 `group.pull`，不需要 ack，也不持久化；只在内存中保留当前 head。
+
+SDK 调用时必须走群组 E2EE。应用层传入明文 `payload`，SDK 会加密成 `e2ee.group_encrypted` 信封、补齐 `thought_id` / `timestamp`，并附加 `client_signature`。裸 WebSocket 客户端若绕过 SDK，则必须自行完成同等加密和签名。
+
+存储键为 `group_id + sender_aid + context.type + context.id`。其中 `sender_aid` 由服务端认证态派生，不能由客户端指定；`context` 是 thought head 的唯一 selector，推荐使用 `{"type": "run", "id": "run-xxx"}`。同一 `(group_id, sender_aid)` 保留最近 N 个 context 对应的 head，N 由群服务配置 `max_thought_heads_per_sender` 控制，当前默认值为 5；同一个 head 下可追加多条 thought item。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `context.type` | string | 是 | 思考的上下文类型，推荐 `run` |
+| `context.id` | string | 是 | 思考的上下文 ID，如 `run_id` |
+| `payload` | object | 是 | SDK 加密前的思考内容；推荐格式见 [09-payload-reference](09-payload-reference.md#thought思考内容) |
+| `encrypt` | boolean | 否 | SDK 侧固定按 `true` 处理；`false` 会被拒绝 |
+| `thought_id` | string | 否 | thought item ID；不传时 SDK 生成 `gt-*` |
+| `timestamp` | integer | 否 | 客户端时间戳；不传时 SDK 生成 |
+| `protected_headers` / `headers` | object | 否 | SDK 加密前读取的 E2EE 信封元数据；`context` 会被 SDK 复制进信封并单独验 `_auth` |
+
+**SDK 调用示例**：
+
+```python
+await client.call("group.thought.put", {
+    "group_id": "g-abc123.agentid.pub",
+    "context": {"type": "run", "id": "run-xxx"},
+    "payload": {"type": "thought", "text": "这是 Agent 自己的 run 级思考"},
+})
+```
+
+**裸 RPC 加密后形态**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "context": {"type": "run", "id": "run-xxx"},
+    "thought_id": "gt-...",
+    "type": "e2ee.group_encrypted",
+    "encrypted": true,
+    "payload": {"type": "e2ee.group_encrypted", "...": "..."},
+    "client_signature": { "...": "..." }
+}
+```
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "sender_aid": "alice.agentid.pub",
+    "context": {"type": "run", "id": "run-xxx"},
+    "thought_id": "gt-...",
+    "stored_count": 1,
+    "updated_at": 1234567890000
+}
+```
+
+### group.thought.get
+
+读取指定发送者针对指定群上下文的当前思考内容。SDK 会在返回应用层前自动解密。`get` 是查询操作，可重复调用；它不触发 push/pull、ack 或 replay 消费。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `sender_aid` | string | 是 | thought 作者 AID |
+| `context.type` | string | 是 | 思考的上下文类型，推荐 `run` |
+| `context.id` | string | 是 | 思考的上下文 ID，如 `run_id` |
+
+**SDK 调用示例**：
+
+```python
+result = await client.call("group.thought.get", {
+    "group_id": "g-abc123.agentid.pub",
+    "sender_aid": "alice.agentid.pub",
+    "context": {"type": "run", "id": "run-xxx"},
+})
+```
+
+**SDK 返回**：
+
+响应会原样包含本次查询使用的 selector（`context`）。
+
+```json
+{
+    "found": true,
+    "group_id": "g-abc123.agentid.pub",
+    "sender_aid": "alice.agentid.pub",
+    "context": {"type": "run", "id": "run-xxx"},
+    "thoughts": [
+        {
+            "thought_id": "gt-...",
+            "message_id": "gt-...",
+            "context": {"type": "run", "id": "run-xxx"},
+            "payload": {"type": "thought", "text": "正在比较两个候选方案"},
+            "created_at": 1234567890000,
+            "e2ee": {"encryption_mode": "epoch_group_key"}
+        }
+    ],
+    "updated_at": 1234567890000
+}
+```
+
+未找到当前 head 时，SDK 返回 `found=false` 且 `thoughts=[]`。
 
 ### group.pull
 
@@ -891,6 +1113,8 @@
 ```
 
 多设备模式时额外返回 `cursor` 对象（含 `current_seq`、`join_seq`、`latest_seq`、`unread_count`）。
+
+返回的每条群消息包含 `dispatch_mode`。Python / Go / TS / JS SDK 在解密后会保留顶层 `dispatch_mode`，并把同一值注入到 `payload.dispatch_mode`，方便应用层按 `"broadcast"` / `"mention"` 做 UI 或通知策略。
 
 ### group.ack
 
@@ -1248,6 +1472,249 @@ Owner 直接添加资源（无需审批）。需要 **owner** 权限。
 
 ---
 
+## 多设备游标
+
+### group.pull_events
+
+增量拉取群事件，支持多设备独立游标。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `group_id` | string | 是 | — | 群组 ID |
+| `device_id` | string | 否 | — | 设备 ID，多设备模式必填 |
+| `device_name` | string | 否 | — | 设备名称（首次注册时使用） |
+| `device_type` | string | 否 | — | 设备类型 |
+| `after_event_seq` | integer | 否 | 游标位置 | 从该事件 seq 之后拉取；多设备模式下默认使用设备游标 |
+| `limit` | integer | 否 | 100 | 最大条数（受 `pull_max_limit` 配置限制） |
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "events": [ ... ],
+    "latest_event_seq": 100,
+    "has_more": false,
+    "limit": 100,
+    "cursor": {
+        "current_seq": 50,
+        "join_seq": 0,
+        "latest_seq": 100,
+        "unread_count": 50
+    }
+}
+```
+
+> `cursor` 仅多设备模式（提供 `device_id`）时返回。响应大小受 `pull_max_response_bytes` 配置限制。包含 E2EE epoch 范围检查，不返回成员加入前的加密事件。
+
+### group.ack_messages
+
+确认消息游标（多设备模式）。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `device_id` | string | 是 | 设备 ID |
+| `msg_seq` | integer | 是 | 确认到的消息序号 |
+
+**响应**：`{ "cursor": 123 }`
+
+> 不能确认加入位置之前的消息；序号自动截断到群组当前最大消息序号。
+
+### group.ack_events
+
+确认事件游标（多设备模式）。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `device_id` | string | 是 | 设备 ID |
+| `event_seq` | integer | 是 | 确认到的事件序号 |
+
+**响应**：`{ "cursor": 456 }`
+
+### group.list_devices
+
+列出当前用户在指定群组的所有设备及游标状态。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "devices": [
+        {
+            "device_id": "device-123",
+            "device_name": "My Phone",
+            "device_type": "mobile",
+            "last_pull_at": 1234567890000,
+            "msg_unread": 10,
+            "event_unread": 5
+        }
+    ]
+}
+```
+
+### group.unregister_device
+
+注销设备游标（清理不再使用的设备记录）。
+
+**参数**：`group_id` (必填), `device_id` (必填)
+
+**响应**：`{ "success": true }`
+
+---
+
+## 管理辅助
+
+### group.get_admins
+
+获取管理员列表（owner + admin 角色）。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "admins": [
+        {
+            "aid": "alice.agentid.pub",
+            "role": "owner",
+            "member_type": "human",
+            "joined_at": 1234567890
+        }
+    ]
+}
+```
+
+### group.get_master
+
+获取群主 AID。
+
+**参数**：`group_id` (必填)
+
+**响应**：`{ "group_id": "g-abc123.agentid.pub", "owner_aid": "alice.agentid.pub" }`
+
+### group.get_summary
+
+获取群组综合统计摘要。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "name": "My Group",
+    "owner_aid": "alice.agentid.pub",
+    "status": "active",
+    "visibility": "private",
+    "member_count": 10,
+    "human_count": 7,
+    "ai_count": 3,
+    "admin_count": 2,
+    "online_count": 5,
+    "message_seq": 1000,
+    "event_seq": 2000,
+    "e2ee_epoch": 3,
+    "created_at": 1234567890,
+    "updated_at": 1234567890
+}
+```
+
+### group.get_metrics
+
+获取群组性能指标，包含 E2EE epoch 范围记录。需要 **admin 及以上**权限。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "message_seq": 1000,
+    "event_seq": 2000,
+    "member_count": 10,
+    "online_count": 5,
+    "e2ee_epoch": 3,
+    "epoch_count": 4,
+    "epoch_ranges": [
+        {
+            "epoch": 0,
+            "start_msg_seq": 0,
+            "start_event_seq": 0,
+            "end_msg_seq": 100,
+            "end_event_seq": 200,
+            "rotated_by": "alice.agentid.pub",
+            "rotated_at": 1234567890
+        }
+    ]
+}
+```
+
+### group.refresh_member_types
+
+刷新成员类型分类统计。
+
+**参数**：`group_id` (必填)
+
+**响应**：
+
+```json
+{
+    "group_id": "g-abc123.agentid.pub",
+    "total": 10,
+    "human_count": 7,
+    "ai_count": 3,
+    "members": [
+        { "aid": "alice.agentid.pub", "role": "owner", "member_type": "human" }
+    ]
+}
+```
+
+---
+
+## E2EE
+
+### group.e2ee.rotate_epoch
+
+CAS 轮换群组 E2EE Epoch。需要 **admin 及以上**权限。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `current_epoch` | integer | 是 | 当前 epoch 值（CAS 校验） |
+| `rotation_signature` | string | 是 | 轮换签名（Base64，ECDSA SHA-256） |
+| `rotation_timestamp` | string | 是 | 轮换时间戳（秒） |
+
+**响应**：`{ "group_id": "g-abc123.agentid.pub", "success": true, "epoch": 4 }`
+
+> 签名格式：`{group_id}|{current_epoch}|{new_epoch}|{aid}|{rotation_timestamp}`。时间戳必须在 5 分钟窗口内。签名去重防止重放攻击（10 分钟窗口）。
+
+### group.e2ee.get_epoch
+
+获取当前 E2EE Epoch 值。
+
+**参数**：`group_id` (必填)
+
+**响应**：`{ "group_id": "g-abc123.agentid.pub", "epoch": 3 }`
+
+---
+
+---
+
 ## 事件
 
 ### event/group.created
@@ -1341,6 +1808,7 @@ client.on("group.changed", lambda ev: print(ev["action"]))
     "message_id": "uuid",
     "sender_aid": "alice.agentid.pub",
     "type": "e2ee.group_encrypted",
+    "dispatch_mode": "broadcast",
     "payload": { "type": "e2ee.group_encrypted", "..." : "..." },
     "dispatch": {"mode": "broadcast", "reason": "duty_disabled"},
     "kind": "group.broadcast",
@@ -1360,293 +1828,12 @@ SDK 收到后自动解密 `payload`，解密后的明文消息直接交付用户
     "message_id": "uuid",
     "sender_aid": "alice.agentid.pub",
     "type": "e2ee.group_encrypted",
+    "dispatch_mode": "broadcast",
     "dispatch": {"mode": "broadcast", "reason": "duty_disabled"}
 }
 ```
 
 SDK 收到后自动调用 `group.pull` 拉取最新消息并逐条解密后交付用户回调。
-
----
-
-## group.pull_events
-
-增量拉取群事件。支持多设备游标。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `group_id` | string | 是 | — | 群组 ID |
-| `after_event_seq` | integer | 否 | `0` | 事件起始序列号 |
-| `limit` | integer | 否 | `100` | 返回上限（最大 100） |
-| `device_id` | string | 否 | — | 设备 ID（多设备模式） |
-| `device_name` | string | 否 | — | 设备名称（首次注册时使用） |
-| `device_type` | string | 否 | — | 设备类型 |
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "events": [{ ... }],
-    "latest_event_seq": 15,
-    "has_more": false,
-    "limit": 100
-}
-```
-
-多设备模式时额外返回 `cursor` 对象（含 `current_seq`、`join_seq`、`latest_seq`、`unread_count`）。
-
----
-
-## group.ack_messages
-
-确认消息游标。需要 `device_id`。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `device_id` | string | 是 | 设备 ID |
-| `msg_seq` | integer | 是 | 确认到的消息序列号 |
-
-**响应**：
-
-```json
-{"cursor": 42}
-```
-
----
-
-## group.ack_events
-
-确认事件游标。需要 `device_id`。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `device_id` | string | 是 | 设备 ID |
-| `event_seq` | integer | 是 | 确认到的事件序列号 |
-
-**响应**：
-
-```json
-{"cursor": 15}
-```
-
----
-
-## group.list_devices
-
-列出某成员在某群的所有已注册设备。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-
-**响应**：
-
-```json
-{
-    "devices": [
-        {
-            "device_id": "dev-001",
-            "device_name": "iPhone",
-            "device_type": "mobile",
-            "last_pull_at": 1711234567890,
-            "msg_unread": 2,
-            "event_unread": 5
-        }
-    ]
-}
-```
-
----
-
-## group.unregister_device
-
-注销设备（删除该设备的游标记录）。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `device_id` | string | 是 | 设备 ID |
-
-**响应**：
-
-```json
-{"success": true}
-```
-
----
-
-## group.get_admins
-
-获取群管理员列表（含 owner 和 admin 角色）。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-
-**响应**：
-
-```json
-{
-    "admins": [
-        {"aid": "alice.agentid.pub", "role": "owner", "member_type": "human", ...}
-    ]
-}
-```
-
----
-
-## group.get_master
-
-获取群主信息。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-
-**响应**：
-
-```json
-{"owner_aid": "alice.agentid.pub", "group_id": "g-abc123.agentid.pub"}
-```
-
----
-
-## group.refresh_member_types
-
-刷新并统计群组内成员的类型分类。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "total": 5,
-    "human_count": 3,
-    "ai_count": 2,
-    "members": [
-        {"aid": "alice.agentid.pub", "role": "owner", "member_type": "human"}
-    ]
-}
-```
-
----
-
-## group.get_summary
-
-获取群组综合统计摘要。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-
-**响应**：
-
-```json
-{
-    "name": "测试群",
-    "owner_aid": "alice.agentid.pub",
-    "status": "active",
-    "visibility": "private",
-    "member_count": 5,
-    "human_count": 3,
-    "ai_count": 2,
-    "admin_count": 1,
-    "online_count": 2,
-    "message_seq": 42,
-    "event_seq": 15,
-    "e2ee_epoch": 3
-}
-```
-
----
-
-## group.get_metrics
-
-获取群组性能指标和 E2EE 纪元范围统计。仅 owner/admin 可查看。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-
-**响应**：
-
-```json
-{
-    "group_id": "g-abc123.agentid.pub",
-    "message_seq": 42,
-    "event_seq": 15,
-    "member_count": 5,
-    "online_count": 2,
-    "e2ee_epoch": 3,
-    "epoch_count": 3,
-    "epoch_ranges": [...]
-}
-```
-
----
-
-## group.e2ee.rotate_epoch
-
-轮换群组 E2EE 纪元。需 owner/admin 权限，需签名验证。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-| `rotation_signature` | string | 是 | 客户端轮换签名 |
-| `rotation_timestamp` | integer | 是 | 签名时间戳 |
-| `current_epoch` | integer | 否 | 当前纪元号（CAS 乐观锁） |
-
-**响应**：
-
-```json
-{"group_id": "g-abc123.agentid.pub", "success": true, "epoch": 4}
-```
-
----
-
-## group.e2ee.get_epoch
-
-获取群组当前 E2EE 纪元号。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `group_id` | string | 是 | 群组 ID |
-
-**响应**：
-
-```json
-{"group_id": "g-abc123.agentid.pub", "epoch": 3}
-```
 
 ---
 
@@ -1667,70 +1854,3 @@ Group 服务定义了以下专用错误码（-33xxx 段）：
 | -33009 | Resource request not found | 检查 request_id |
 
 > SDK 客户端将 -33001 映射为 `GroupNotFoundError`，-33002~-33003 映射为 `GroupStateError`，其余映射为 `GroupError`。未识别的错误码 fallback 到 `AUNError`。
-
----
-
-## 统一 Settings 接口
-
-> 以下三个方法是群参数统一接口，替代分散的 `get_rules` / `update_rules` / `get_announcement` / `update_announcement` / `get_join_requirements` / `update_join_requirements` / `update_duty_config` / `get_stats` 等方法。老方法保留但标记废弃。
-
-### group.set_settings
-
-统一设置群参数。根据 key 自动路由到对应存储。
-
-- **权限**: admin+
-- **签名**: 需要客户端签名
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `group_id` | string | 群组 ID |
-| `settings` | object | key-value 对象 |
-
-**支持的 key**:
-
-| key | 说明 | 存储位置 |
-|-----|------|---------|
-| `name` | 群名称 | groups 表 |
-| `description` | 群描述 | groups 表 |
-| `visibility` | 可见性 (public/private) | groups 表 |
-| `rules.content` | 群规内容 | group_settings 表 |
-| `rules.attachments` | 群规附件 | group_settings 表 |
-| `announcement.content` | 公告内容 | group_settings 表 |
-| `announcement.attachments` | 公告附件 | group_settings 表 |
-| `join.mode` | 入群模式 | group_settings 表 |
-| `join.question` | 入群问题 | group_settings 表 |
-| `join.auto_approve_patterns` | 自动审批模式 | group_settings 表 |
-| `join.max_pending` | 最大待审批数 | group_settings 表 |
-| `duty.config` | 值班配置对象 | group_settings 表 |
-
-### group.get_settings
-
-统一读取群参数。
-
-- **权限**: member+
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `group_id` | string | 群组 ID |
-| `keys` | string[] | 可选，指定读取的 key 列表。不传则返回全部 |
-
-### group.info
-
-群组信息查询，支持 `include` 扩展返回额外数据块。
-
-- **权限**: member（完整信息），非成员可查公开群基础信息
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `group_id` | string | 群组 ID |
-| `include` | string[] | 可选，扩展数据块：`"stats"`, `"e2ee"` |
-
-**返回字段**:
-
-基础字段始终返回：`group_id`, `name`, `visibility`, `status`, `description`, `member_count`, `created_at`。
-
-成员可见额外字段：`owner_aid`, `message_seq`, `event_seq`, `updated_at`。
-
-`include=["stats"]` 追加 `stats` 对象（`human_count`, `ai_count`, `admin_count`, `online_count`）。admin 额外看到 `pending_join_request_count`, `active_invite_code_count`, `ban_count`。
-
-`include=["e2ee"]` 追加 `e2ee` 对象（`epoch`, `epoch_updated_at`）。

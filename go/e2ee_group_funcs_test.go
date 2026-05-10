@@ -91,6 +91,14 @@ func TestEncryptDecryptGroupRoundtrip(t *testing.T) {
 	if payload["num"] != float64(7) {
 		t.Errorf("解密后 num 不匹配: %v", payload["num"])
 	}
+	e2ee, _ := result["e2ee"].(map[string]any)
+	protectedHeaders, _ := e2ee["protected_headers"].(map[string]any)
+	if protectedHeaders["payload_type"] != "text" {
+		t.Fatalf("普通群消息解密结果应回填 payload_type: %#v", e2ee)
+	}
+	if _, ok := e2ee["context"]; ok {
+		t.Fatalf("普通群消息解密结果不应包含 context: %#v", e2ee)
+	}
 }
 
 // TestEncryptDecryptGroupRoundtrip_WithSignature 验证带签名的群组消息加解密
@@ -1123,5 +1131,102 @@ func TestGroupAADFieldCount(t *testing.T) {
 		if field == "dispatch_mode" {
 			t.Fatalf("群组 AAD 匹配字段不应包含 dispatch_mode")
 		}
+	}
+}
+
+func TestGroupOptionalMetadataBoundWithIndependentAuth(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	payload := map[string]any{"type": "text", "text": "bound"}
+	context := map[string]any{"type": "thought", "id": "ctx-1"}
+	envelope, err := EncryptGroupMessage(
+		secret, payload, "g1", "alice", "msg-bound", time.Now().UnixMilli(), 1, "", nil,
+		E2EEEncryptOptions{
+			ProtectedHeaders: map[string]any{"Device_ID": "dev-a"},
+			Context:          context,
+		},
+	)
+	if err != nil {
+		t.Fatalf("群消息加密失败: %v", err)
+	}
+	if _, ok := envelope["payload_type"]; ok {
+		t.Fatalf("payload_type 不应写入信封顶层: %#v", envelope)
+	}
+	headers, _ := envelope["protected_headers"].(map[string]any)
+	if headers["payload_type"] != "text" || headers["device_id"] != "dev-a" {
+		t.Fatalf("protected_headers 未规范化: %#v", envelope["protected_headers"])
+	}
+	auth, _ := headers["_auth"].(map[string]any)
+	if auth["alg"] != metadataAuthAlg || auth["tag"] == "" {
+		t.Fatalf("protected_headers 缺少 _auth: %#v", headers)
+	}
+	aad := envelope["aad"].(map[string]any)
+	if _, ok := aad["payload_type"]; ok {
+		t.Fatalf("payload_type 不应写入 AAD: %#v", aad)
+	}
+	if _, ok := aad["protected_headers"]; ok {
+		t.Fatalf("protected_headers 不应写入 AAD: %#v", aad)
+	}
+	if _, ok := aad["context_type"]; ok {
+		t.Fatalf("context 不应写入 AAD: %#v", aad)
+	}
+	protectedContext, _ := envelope["context"].(map[string]any)
+	if protectedContext["type"] != "thought" || protectedContext["id"] != "ctx-1" {
+		t.Fatalf("context 未写入信封: %#v", envelope["context"])
+	}
+	contextAuth, _ := protectedContext["_auth"].(map[string]any)
+	if contextAuth["alg"] != metadataAuthAlg || contextAuth["tag"] == "" {
+		t.Fatalf("context 缺少 _auth: %#v", protectedContext)
+	}
+
+	message := map[string]any{
+		"group_id":   "g1",
+		"from":       "alice",
+		"message_id": "msg-bound",
+		"payload":    envelope,
+		"context":    context,
+	}
+	secrets := map[int][]byte{1: secret}
+	decrypted := DecryptGroupMessage(secrets, message, nil, false)
+	if decrypted == nil {
+		t.Fatal("带可选元数据的群消息应解密成功")
+	}
+	e2ee, _ := decrypted["e2ee"].(map[string]any)
+	protectedHeaders, _ := e2ee["protected_headers"].(map[string]any)
+	if protectedHeaders["payload_type"] != "text" || protectedHeaders["device_id"] != "dev-a" {
+		t.Fatalf("群消息解密结果 e2ee.protected_headers 未回填: %#v", e2ee)
+	}
+	if _, ok := protectedHeaders["_auth"]; ok {
+		t.Fatalf("群消息解密结果不应暴露 protected_headers._auth: %#v", protectedHeaders)
+	}
+	decryptedContext, _ := e2ee["context"].(map[string]any)
+	if decryptedContext["type"] != "thought" || decryptedContext["id"] != "ctx-1" {
+		t.Fatalf("群消息解密结果 e2ee.context 未回填: %#v", e2ee)
+	}
+	if _, ok := decryptedContext["_auth"]; ok {
+		t.Fatalf("群消息解密结果不应暴露 context._auth: %#v", decryptedContext)
+	}
+
+	tamperedHeaders := copyMapShallow(message)
+	tamperedPayload := copyMapShallow(envelope)
+	tamperedProtectedHeaders := copyMapShallow(headers)
+	tamperedProtectedHeaders["device_id"] = "dev-b"
+	tamperedPayload["protected_headers"] = tamperedProtectedHeaders
+	tamperedHeaders["payload"] = tamperedPayload
+	if decrypted := DecryptGroupMessage(secrets, tamperedHeaders, nil, false); decrypted != nil {
+		t.Fatalf("篡改 protected_headers 应解密失败: %#v", decrypted)
+	}
+
+	missingAuth := copyMapShallow(message)
+	missingAuthPayload := copyMapShallow(envelope)
+	missingAuthPayload["protected_headers"] = map[string]any{"payload_type": "text", "device_id": "dev-a"}
+	missingAuth["payload"] = missingAuthPayload
+	if decrypted := DecryptGroupMessage(secrets, missingAuth, nil, false); decrypted != nil {
+		t.Fatalf("删除 protected_headers._auth 应解密失败: %#v", decrypted)
+	}
+
+	tamperedContext := copyMapShallow(message)
+	tamperedContext["context"] = map[string]any{"type": "thought", "id": "ctx-2"}
+	if decrypted := DecryptGroupMessage(secrets, tamperedContext, nil, false); decrypted != nil {
+		t.Fatalf("篡改 context 应解密失败: %#v", decrypted)
 	}
 }

@@ -22,7 +22,7 @@ from .config import AUNConfig, normalize_instance_id
 from .logger import AUNLogger, AUNLogHandler
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
-from .e2ee import E2EEManager, GroupE2EEManager
+from .e2ee import E2EEManager, GroupE2EEManager, ProtectedHeaders
 from .errors import (
     AUNError,
     AuthError,
@@ -118,6 +118,7 @@ import logging as _logging
 
 _client_log = _logging.getLogger("aun_core.client")
 _ssl_warning_emitted = False
+_PREKEY_FALLBACK_DEVICE_ID = "aun_device_id"
 
 # SSL 上下文延迟创建，避免模块加载时即创建不安全的 SSL 上下文
 _no_verify_ssl_ctx: _ssl.SSLContext | None = None
@@ -517,12 +518,16 @@ class AUNClient:
             encrypt = params.pop("encrypt", True)
             if encrypt:
                 return await self._send_encrypted(params)
+            params.pop("protected_headers", None)
+            params.pop("headers", None)
 
         # 自动加密：group.send 默认加密（encrypt 默认 True）
         if method == "group.send":
             encrypt = params.pop("encrypt", True)
             if encrypt:
                 return await self._send_group_encrypted(params)
+            params.pop("protected_headers", None)
+            params.pop("headers", None)
             group_id = str(params.get("group_id") or "").strip()
             if group_id:
                 await self._wait_for_group_membership_epoch_floor(group_id, timeout_s=5.0, strict=True)
@@ -819,6 +824,19 @@ class AUNClient:
         except Exception as _pub_exc:
             _client_log.warning("发布 e2ee 编排事件失败: %s", _pub_exc)
 
+    @staticmethod
+    def _protected_headers_from_params(params: dict[str, Any]) -> dict[str, Any] | ProtectedHeaders | None:
+        headers = params.get("protected_headers")
+        if headers is None:
+            headers = params.get("headers")
+        if isinstance(headers, (dict, ProtectedHeaders)):
+            return headers
+        to_dict = getattr(headers, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+            return value if isinstance(value, dict) else None
+        return None
+
     async def _send_encrypted(self, params: dict[str, Any]) -> Any:
         """自动加密并发送消息。"""
         import time as _time
@@ -835,12 +853,14 @@ class AUNClient:
             await self._lazy_sync_p2p()
 
         persist_required = bool(params.get("persist_required") or params.get("durable"))
+        protected_headers = self._protected_headers_from_params(params)
         recipient_prekeys = await self._fetch_peer_prekeys(to_aid)
         self_sync_copies = await self._build_self_sync_copies(
             logical_to_aid=to_aid,
             payload=payload,
             message_id=message_id,
             timestamp=timestamp,
+            protected_headers=protected_headers,
         )
 
         # 仅在确实需要多设备语义时切到 e2ee.multi_device，单设备路径继续兼容旧语义。
@@ -852,6 +872,7 @@ class AUNClient:
                 timestamp=timestamp,
                 prekey=recipient_prekeys[0] if recipient_prekeys else None,
                 persist_required=persist_required,
+                protected_headers=protected_headers,
             )
 
         recipient_copies = await self._build_recipient_device_copies(
@@ -860,6 +881,7 @@ class AUNClient:
             message_id=message_id,
             timestamp=timestamp,
             prekeys=recipient_prekeys,
+            protected_headers=protected_headers,
         )
         send_params: dict[str, Any] = {
             "to": to_aid,
@@ -887,6 +909,7 @@ class AUNClient:
         timestamp: int,
         prekey: dict[str, Any] | None = None,
         persist_required: bool = False,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
     ) -> Any:
         if prekey is None:
             prekey = await self._fetch_peer_prekey(to_aid)
@@ -903,6 +926,7 @@ class AUNClient:
             prekey=prekey,
             message_id=message_id,
             timestamp=timestamp,
+            protected_headers=protected_headers,
         )
         self._ensure_encrypt_result(to_aid, encrypt_result)
 
@@ -926,11 +950,15 @@ class AUNClient:
         message_id: str,
         timestamp: int,
         prekeys: list[dict[str, Any]],
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
     ) -> list[dict[str, Any]]:
+        prekeys = self._normalize_peer_prekeys(prekeys)
         recipient_copies: list[dict[str, Any]] = []
         cert_cache: dict[str, bytes] = {}
         for prekey in prekeys:
             device_id = str(prekey.get("device_id") or "").strip()
+            if not device_id:
+                continue
             peer_cert_fingerprint = str(prekey.get("cert_fingerprint", "") or "").strip().lower()
             cache_key = peer_cert_fingerprint or "__default__"
             peer_cert_pem = cert_cache.get(cache_key)
@@ -944,6 +972,7 @@ class AUNClient:
                 prekey=prekey,
                 message_id=message_id,
                 timestamp=timestamp,
+                protected_headers=protected_headers,
             )
             self._ensure_encrypt_result(to_aid, encrypt_result)
             recipient_copies.append({
@@ -1002,16 +1031,19 @@ class AUNClient:
         payload: dict[str, Any],
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
     ) -> list[dict[str, Any]]:
         my_aid = self._aid
         if not my_aid:
             return []
-        prekeys = await self._fetch_peer_prekeys(my_aid)
+        prekeys = self._normalize_peer_prekeys(await self._fetch_peer_prekeys(my_aid))
         if not prekeys:
             return []
         copies: list[dict[str, Any]] = []
         for prekey in prekeys:
             device_id = str(prekey.get("device_id") or "").strip()
+            if not device_id:
+                continue
             if device_id == self._device_id:
                 continue
             peer_cert_pem = await self._resolve_self_copy_peer_cert(
@@ -1024,6 +1056,7 @@ class AUNClient:
                 prekey=prekey,
                 message_id=message_id,
                 timestamp=timestamp,
+                protected_headers=protected_headers,
             )
             self._ensure_encrypt_result(my_aid, encrypt_result)
             copies.append({
@@ -1041,6 +1074,8 @@ class AUNClient:
         prekey: dict[str, Any] | None,
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if prekey is not None:
             try:
@@ -1051,6 +1086,8 @@ class AUNClient:
                     peer_cert_pem,
                     message_id=message_id,
                     timestamp=timestamp,
+                    protected_headers=protected_headers,
+                    context=context,
                 )
                 return envelope, {
                     "encrypted": True,
@@ -1067,6 +1104,8 @@ class AUNClient:
             peer_cert_pem,
             message_id=message_id,
             timestamp=timestamp,
+            protected_headers=protected_headers,
+            context=context,
         )
         degraded = prekey is not None
         return envelope, {
@@ -1117,7 +1156,7 @@ class AUNClient:
             params,
             id_field="thought_id",
             id_prefix="gt",
-            extra_fields=("reply_to",),
+            extra_fields=("context",),
         )
 
     async def _put_message_thought_encrypted(self, params: dict[str, Any]) -> Any:
@@ -1143,6 +1182,8 @@ class AUNClient:
             prekey=prekey,
             message_id=thought_id,
             timestamp=timestamp,
+            protected_headers=self._protected_headers_from_params(params),
+            context=params.get("context") if isinstance(params.get("context"), dict) else None,
         )
         self._ensure_encrypt_result(to_aid, encrypt_result)
         send_params: dict[str, Any] = {
@@ -1152,8 +1193,9 @@ class AUNClient:
             "encrypted": True,
             "thought_id": thought_id,
             "timestamp": timestamp,
-            "reply_to": params["reply_to"],
         }
+        if "context" in params:
+            send_params["context"] = params["context"]
         self._sign_client_operation("message.thought.put", send_params)
         return await self._transport.call("message.thought.put", send_params)
 
@@ -1217,16 +1259,22 @@ class AUNClient:
         timestamp = int(params.get("timestamp") or time.time() * 1000)
         epoch_result = await self._committed_group_epoch_state(group_id)
         committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
+        protected_headers = self._protected_headers_from_params(params)
+        context = params.get("context") if method == "group.thought.put" and isinstance(params.get("context"), dict) else None
         if committed_epoch > 0:
             ready_epoch = await self._ensure_committed_group_secret_for_send(group_id, committed_epoch, epoch_result)
             envelope = self._group_e2ee.encrypt_with_epoch(
                 group_id, ready_epoch, payload,
                 message_id=operation_id, timestamp=timestamp,
+                protected_headers=protected_headers,
+                context=context,
             )
         else:
             envelope = self._group_e2ee.encrypt(
                 group_id, payload,
                 message_id=operation_id, timestamp=timestamp,
+                protected_headers=protected_headers,
+                context=context,
             )
         send_params: dict[str, Any] = {
             "group_id": group_id,
@@ -2831,14 +2879,16 @@ class AUNClient:
             if isinstance(payload, dict) and payload.get("type") == "e2ee.group_encrypted" and not decrypted.get("e2ee"):
                 self._enqueue_pending_decrypt(group_id, message)
                 continue
-            thoughts.append({
+            thought = {
                 "thought_id": thought_id,
                 "message_id": thought_id,
-                "reply_to": item.get("reply_to"),
                 "payload": decrypted.get("payload"),
                 "created_at": item.get("created_at"),
                 "e2ee": decrypted.get("e2ee"),
-            })
+            }
+            if item.get("context") is not None:
+                thought["context"] = item.get("context")
+            thoughts.append(thought)
 
         result_view = dict(result)
         result_view["thoughts"] = thoughts
@@ -2894,16 +2944,18 @@ class AUNClient:
                 decrypted = self._e2ee._decrypt_message(message, source="message.thought.get")
                 if decrypted is None:
                     continue
-            thoughts.append({
+            thought = {
                 "thought_id": thought_id,
                 "message_id": thought_id,
-                "reply_to": item.get("reply_to"),
                 "from": from_aid,
                 "to": to_aid,
                 "payload": decrypted.get("payload") if isinstance(decrypted, dict) else None,
                 "created_at": item.get("created_at"),
                 "e2ee": decrypted.get("e2ee") if isinstance(decrypted, dict) else None,
-            })
+            }
+            if item.get("context") is not None:
+                thought["context"] = item.get("context")
+            thoughts.append(thought)
 
         result_view = dict(result)
         result_view["thoughts"] = thoughts
@@ -3133,11 +3185,15 @@ class AUNClient:
         if cached_list is not None:
             items, expire_at = cached_list
             if time.time() < expire_at:
-                return [dict(item) for item in items]
+                normalized = self._normalize_peer_prekeys(items)
+                if normalized:
+                    return normalized
             self._peer_prekeys_cache.pop(peer_aid, None)
         cached = self._e2ee.get_cached_prekey(peer_aid)
         if cached is not None:
-            return [cached]
+            normalized = self._normalize_peer_prekeys([cached])
+            if normalized:
+                return normalized
         try:
             result = await self._transport.call("message.e2ee.get_prekey", {"aid": peer_aid})
         except Exception as exc:
@@ -3149,16 +3205,7 @@ class AUNClient:
 
         device_prekeys = result.get("device_prekeys")
         if isinstance(device_prekeys, list):
-            normalized: list[dict[str, Any]] = []
-            for item in device_prekeys:
-                if not isinstance(item, dict):
-                    continue
-                prekey_id = str(item.get("prekey_id") or "").strip()
-                public_key = str(item.get("public_key") or "").strip()
-                signature = str(item.get("signature") or "").strip()
-                if not prekey_id or not public_key or not signature:
-                    continue
-                normalized.append(dict(item))
+            normalized = self._normalize_peer_prekeys(device_prekeys)
             if normalized:
                 self._peer_prekeys_cache[peer_aid] = (
                     [dict(item) for item in normalized],
@@ -3169,9 +3216,14 @@ class AUNClient:
 
         prekey = result.get("prekey")
         if isinstance(prekey, dict):
-            self._peer_prekeys_cache[peer_aid] = ([dict(prekey)], time.time() + 300.0)
-            self._e2ee.cache_prekey(peer_aid, prekey)
-            return [prekey]
+            normalized = self._normalize_peer_prekeys([prekey])
+            if normalized:
+                self._peer_prekeys_cache[peer_aid] = (
+                    [dict(item) for item in normalized],
+                    time.time() + 300.0,
+                )
+                self._e2ee.cache_prekey(peer_aid, normalized[0])
+                return normalized
         if result.get("found"):
             raise ValidationError(f"invalid prekey response for {peer_aid}")
         return []
@@ -3182,13 +3234,56 @@ class AUNClient:
         if cached_list is not None:
             items, expire_at = cached_list
             if time.time() < expire_at and items:
-                return dict(items[0])
+                normalized = self._normalize_peer_prekeys(items)
+                if normalized:
+                    return dict(normalized[0])
             self._peer_prekeys_cache.pop(peer_aid, None)
         cached = self._e2ee.get_cached_prekey(peer_aid)
         if cached is not None:
-            return cached
+            normalized = self._normalize_peer_prekeys([cached])
+            if normalized:
+                return dict(normalized[0])
         prekeys = await self._fetch_peer_prekeys(peer_aid)
         return dict(prekeys[0]) if prekeys else None
+
+    def _normalize_peer_prekeys(self, prekeys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in prekeys:
+            if not isinstance(item, dict):
+                continue
+            prekey_id = str(item.get("prekey_id") or "").strip()
+            public_key = str(item.get("public_key") or "").strip()
+            signature = str(item.get("signature") or "").strip()
+            if not prekey_id or not public_key or not signature:
+                continue
+            candidate = dict(item)
+            candidate["prekey_id"] = prekey_id
+            candidate["public_key"] = public_key
+            candidate["signature"] = signature
+            candidate["device_id"] = str(candidate.get("device_id") or "").strip()
+            cert_fingerprint = str(candidate.get("cert_fingerprint") or "").strip().lower()
+            if cert_fingerprint:
+                candidate["cert_fingerprint"] = cert_fingerprint
+            elif "cert_fingerprint" in candidate:
+                candidate.pop("cert_fingerprint", None)
+            normalized.append(candidate)
+        if not normalized:
+            return []
+        if len(normalized) == 1:
+            if not normalized[0]["device_id"]:
+                normalized[0]["device_id"] = _PREKEY_FALLBACK_DEVICE_ID
+            return normalized
+        filtered: list[dict[str, Any]] = []
+        seen_device_ids: set[str] = set()
+        for item in normalized:
+            device_id = str(item.get("device_id") or "").strip()
+            if not device_id or device_id == _PREKEY_FALLBACK_DEVICE_ID:
+                continue
+            if device_id in seen_device_ids:
+                continue
+            seen_device_ids.add(device_id)
+            filtered.append(item)
+        return filtered
 
     async def _upload_prekey(self) -> dict[str, Any]:
         """生成 prekey 并上传到服务端"""
@@ -3674,9 +3769,14 @@ class AUNClient:
             if "delivery_mode" in params or "queue_routing" in params or "affinity_ttl_ms" in params:
                 raise ValidationError("group.send does not accept delivery_mode; group messages are always fanout")
         if method in {"group.thought.put", "group.thought.get", "message.thought.put", "message.thought.get"}:
-            reply_to = params.get("reply_to")
-            if not isinstance(reply_to, dict) or not str(reply_to.get("message_id") or "").strip():
-                raise ValidationError(f"{method} requires reply_to.message_id")
+            context = params.get("context")
+            has_context = (
+                isinstance(context, dict)
+                and bool(str(context.get("type") or "").strip())
+                and bool(str(context.get("id") or "").strip())
+            )
+            if not has_context:
+                raise ValidationError(f"{method} requires context.type + context.id")
         if method == "group.thought.get" and not str(params.get("sender_aid") or "").strip():
             raise ValidationError("group.thought.get requires sender_aid")
         if method == "message.thought.put":

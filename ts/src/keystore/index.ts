@@ -119,4 +119,13 @@ export interface KeyStore {
   listIdentities?(): string[];
   /** 加载指定 AID 的元数据（对齐 Python load_metadata） */
   loadMetadata?(aid: string): Record<string, unknown> | null;
+
+  /** 返回信任根证书存储目录路径 */
+  trustRootDir?(): string;
+  /** 返回信任根证书 bundle 路径 */
+  trustRootBundlePath?(): string;
+  /** 保存信任根列表和根证书，返回 bundle 路径 */
+  saveTrustRoots?(trustList: Record<string, unknown>, rootCerts: Array<{ id?: string; cert_pem: string; fingerprint_sha256?: string }>): string;
+  /** 保存 issuer 根证书并合并到 bundle，返回 [证书路径, bundle 路径] */
+  saveIssuerRootCert?(issuer: string, certPem: string, fingerprintSha256?: string): [string, string];
 }

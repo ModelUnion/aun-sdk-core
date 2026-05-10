@@ -434,6 +434,100 @@ export class FileKeyStore implements KeyStore {
     }
   }
 
+  // ── 信任根管理 ─────────────────────────────────────────────
+
+  trustRootDir(): string {
+    const dir = join(this._root, 'CA', 'root');
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  trustRootBundlePath(): string {
+    return join(this.trustRootDir(), 'trust-roots.pem');
+  }
+
+  saveTrustRoots(
+    trustList: Record<string, unknown>,
+    rootCerts: Array<{ id?: string; cert_pem: string; fingerprint_sha256?: string }>,
+  ): string {
+    const dir = this.trustRootDir();
+
+    // 保存每个根证书
+    for (let i = 0; i < rootCerts.length; i++) {
+      const item = rootCerts[i];
+      const certId = item.id || item.fingerprint_sha256 || `root-${i + 1}`;
+      const safeName = certId.replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120);
+      writeFileSync(join(dir, `${safeName}.crt`), item.cert_pem, 'utf-8');
+    }
+
+    // 生成合并 bundle
+    const bundlePath = this.trustRootBundlePath();
+    const bundle = rootCerts.map(i => i.cert_pem.trim()).join('\n') + '\n';
+    writeFileSync(bundlePath, bundle, 'utf-8');
+
+    // 保存元数据 JSON
+    writeFileSync(join(dir, 'trust-roots.json'), JSON.stringify(trustList, null, 2), 'utf-8');
+
+    return bundlePath;
+  }
+
+  saveIssuerRootCert(
+    issuer: string,
+    certPem: string,
+    fingerprintSha256: string = '',
+  ): [string, string] {
+    const dir = this.trustRootDir();
+    const issuersDir = join(dir, 'issuers');
+    mkdirSync(issuersDir, { recursive: true });
+
+    // 保存 issuer 根证书
+    const safeIssuer = (issuer || 'issuer').replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120);
+    const certPath = join(issuersDir, `${safeIssuer}.root.crt`);
+    const normalizedPem = certPem.trim() + '\n';
+    writeFileSync(certPath, normalizedPem, 'utf-8');
+
+    // 读取已有 bundle 并合并（按指纹去重）
+    const bundlePath = this.trustRootBundlePath();
+    const existingPems = new Map<string, string>();
+    try {
+      const bundleText = readFileSync(bundlePath, 'utf-8');
+      for (const pem of this._splitPemBundle(bundleText)) {
+        const fp = this._pemFingerprint(pem);
+        existingPems.set(fp, pem);
+      }
+    } catch { /* bundle 不存在时忽略 */ }
+
+    // 新证书的指纹
+    let newFp = this._pemFingerprint(normalizedPem);
+    if (fingerprintSha256) {
+      newFp = fingerprintSha256.toLowerCase().replace(/^sha256:/, '');
+    }
+    existingPems.set(newFp, normalizedPem);
+
+    // 重写 bundle
+    const merged = Array.from(existingPems.values()).map(p => p.trim()).join('\n') + '\n';
+    writeFileSync(bundlePath, merged, 'utf-8');
+
+    return [certPath, bundlePath];
+  }
+
+  private _splitPemBundle(bundleText: string): string[] {
+    return bundleText
+      .split(/(?<=-----END CERTIFICATE-----)\s*/)
+      .map(s => s.trim())
+      .filter(s => s.startsWith('-----BEGIN CERTIFICATE-----'));
+  }
+
+  private _pemFingerprint(pem: string): string {
+    try {
+      const der = pem.replace(/-----[A-Z ]+-----/g, '').replace(/\s/g, '');
+      const hash = crypto.createHash('sha256').update(Buffer.from(der, 'base64')).digest('hex');
+      return hash;
+    } catch {
+      return crypto.createHash('sha256').update(pem, 'utf-8').digest('hex');
+    }
+  }
+
   // ── 路径辅助 ─────────────────────────────────────────────
 
   private _keyPairPath(aid: string): string {

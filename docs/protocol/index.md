@@ -11,7 +11,7 @@
 | 00 | [00-总览与分层.md](00-总览与分层.md) | 协议目标、核心原则、四层架构、三种连接模式、文档导航 |
 | 01 | [01-身份与凭证协议-auth.md](01-身份与凭证协议-auth.md) | `auth.*` 方法定义、AID/证书/私钥/token 关系、JWT 机制 |
 | 02 | [02-证书与信任体系.md](02-证书与信任体系.md) | AID 体系、四级证书链、信任模型、吊销机制 |
-| 03 | [03-Gateway-连接模式.md](03-Gateway-连接模式.md) | Gateway 模式定位、initialize 握手、心跳重连 |
+| 03 | [03-Gateway-连接模式.md](03-Gateway-连接模式.md) | Gateway 模式定位、auth.connect 握手、心跳重连 |
 | 04 | [04-Peer-子协议.md](04-Peer-子协议.md) | `peer.*` 对等认证四步握手、nonce 签名、状态机 |
 | 05 | [05-Relay-子协议.md](05-Relay-子协议.md) | `relay.*` 中继注册转发、透明封装、与 peer.* 关系 |
 | 06 | [06-服务协议.md](06-服务协议.md) | 业务层：message.* / meta.* / search.* / task.* / group.* + 跨域消息路由 |
@@ -41,7 +41,7 @@
 | JWT Token 机制 | 01 §1.7 |
 | 证书续期与轮转（renew/rekey） | 01 §1.6 |
 | Gateway 连接模式 | 03 |
-| initialize 握手 | 03 §3.5 |
+| auth.connect 握手 | 03 §3.5 |
 | Peer 对等认证 | 04 |
 | Relay 中继传输 | 05 |
 | 消息收发（message.*） | 06 §6.2 |
@@ -81,7 +81,7 @@
 AID 格式与命名规则、AUN 网络与根证书管理局、四级证书链（Root CA → Registry CA → Issuer CA → Agent）、终端证书生命周期状态、信任模型与共识场景、CRL/OCSP 吊销机制、CT 公开查询入口概述。
 
 ### 03-Gateway-连接模式
-Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* → initialize → AUTHENTICATED）、initialize 请求/响应格式、心跳与重连策略。
+Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* → auth.connect → READY）、auth.connect 请求/响应格式、心跳与重连策略。
 
 ### 04-Peer-子协议
 `peer.*` 4 个方法：hello、hello_reply、confirm、confirmed。对称 challenge-response 双向认证，不依赖 JWT。状态机、证书链验证规则、nonce 签名规则、Peer 地址发现。

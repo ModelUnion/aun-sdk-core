@@ -7,6 +7,7 @@
 
 import * as crypto from 'node:crypto';
 import type { KeyStore } from './keystore/index.js';
+import type { ProtectedHeadersInput } from './e2ee.js';
 
 import {
   E2EEError,
@@ -57,6 +58,16 @@ const AAD_MATCH_FIELDS_GROUP: readonly string[] = [
   'group_id', 'from', 'message_id',
   'epoch', 'encryption_mode', 'suite',
 ] as const;
+
+const AAD_OPTIONAL_FIELDS: readonly string[] = [
+  'payload_type', 'protected_headers', 'context_type', 'context_id',
+] as const;
+
+const METADATA_AUTH_FIELD = '_auth';
+const METADATA_AUTH_ALG = 'HMAC-SHA256';
+const METADATA_KEY_DOMAIN = Buffer.from('aun-envelope-metadata-key-v1', 'utf-8');
+const PROTECTED_HEADERS_DOMAIN = Buffer.from('aun-protected-headers-v1', 'utf-8');
+const PROTECTED_CONTEXT_DOMAIN = Buffer.from('aun-protected-context-v1', 'utf-8');
 
 /** 旧 epoch 默认保留 7 天 */
 const OLD_EPOCH_RETENTION_SECONDS = 7 * 24 * 3600;
@@ -288,17 +299,174 @@ function pemToCertPublicKey(certPem: string | Buffer): crypto.KeyObject {
 
 // ── 群组 AAD 工具 ─────────────────────────────────────────────
 
+function canonicalStringify(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (Array.isArray(value)) {
+    return `[${value.map(item => canonicalStringify(item)).join(',')}]`;
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const pairs = Object.keys(record)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalStringify(record[key])}`);
+    return `{${pairs.join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function hasOwn(obj: JsonObject, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function normalizeProtectedHeaderKey(key: unknown): string {
+  const value = String(key ?? '').trim().toLowerCase();
+  if (!value || !/^[a-z0-9_-]+$/.test(value)) {
+    throw new E2EEError('protected header key must match [a-z0-9_-]+');
+  }
+  if (value === METADATA_AUTH_FIELD) {
+    throw new E2EEError('protected header key is reserved');
+  }
+  return value;
+}
+
+function normalizeProtectedHeaders(headers: ProtectedHeadersInput): JsonObject {
+  if (headers == null) return {};
+  const toObject = (headers as { toObject?: () => Record<string, unknown> }).toObject;
+  const raw = typeof toObject === 'function' ? toObject.call(headers) : headers;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new E2EEError('protected_headers must be an object');
+  }
+  const result: JsonObject = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    result[normalizeProtectedHeaderKey(key)] = value == null ? '' : String(value);
+  }
+  return result;
+}
+
+function copyOptionalEnvelopeMetadata(
+  envelope: JsonObject,
+  messageKey: Buffer,
+  opts?: {
+    payloadType?: unknown;
+    protectedHeaders?: ProtectedHeadersInput;
+    context?: unknown;
+  },
+): void {
+  const payloadType = String(opts?.payloadType ?? '').trim();
+  const protectedHeaders = normalizeProtectedHeaders(opts?.protectedHeaders);
+  if (payloadType) {
+    protectedHeaders.payload_type = payloadType;
+  }
+  if (Object.keys(protectedHeaders).length > 0) {
+    envelope.protected_headers = withMetadataAuth(
+      protectedHeaders,
+      messageKey,
+      PROTECTED_HEADERS_DOMAIN,
+    );
+  }
+  const contextMetadata = normalizeContextMetadata(opts?.context);
+  if (Object.keys(contextMetadata).length > 0) {
+    envelope.context = withMetadataAuth(
+      contextMetadata,
+      messageKey,
+      PROTECTED_CONTEXT_DOMAIN,
+    );
+  }
+}
+
+function metadataBody(metadata: Record<string, unknown>): JsonObject {
+  const body: JsonObject = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (key !== METADATA_AUTH_FIELD) {
+      body[key] = value as JsonObject[string];
+    }
+  }
+  return body;
+}
+
+function metadataAuthTag(key: Buffer, domain: Buffer, body: JsonObject): Buffer {
+  const metadataKey = crypto.createHmac('sha256', key).update(METADATA_KEY_DOMAIN).digest();
+  return crypto.createHmac('sha256', metadataKey)
+    .update(domain)
+    .update(Buffer.from([0]))
+    .update(Buffer.from(canonicalStringify(body), 'utf-8'))
+    .digest();
+}
+
+function withMetadataAuth(metadata: JsonObject, key: Buffer, domain: Buffer): JsonObject {
+  const body = metadataBody(metadata);
+  if (Object.keys(body).length === 0) return {};
+  const tag = metadataAuthTag(key, domain, body);
+  return {
+    ...body,
+    [METADATA_AUTH_FIELD]: {
+      alg: METADATA_AUTH_ALG,
+      tag: tag.toString('base64'),
+    },
+  };
+}
+
+function verifyMetadataAuth(metadata: unknown, key: Buffer, domain: Buffer): boolean {
+  if (metadata == null) return true;
+  if (typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  const record = metadata as Record<string, unknown>;
+  const auth = record[METADATA_AUTH_FIELD];
+  if (!auth || typeof auth !== 'object' || Array.isArray(auth)) return false;
+  const authObj = auth as Record<string, unknown>;
+  if (authObj.alg !== METADATA_AUTH_ALG) return false;
+  if (typeof authObj.tag !== 'string' || !authObj.tag) return false;
+  const body = metadataBody(record);
+  if (Object.keys(body).length === 0) return false;
+  const actual = Buffer.from(authObj.tag, 'base64');
+  const expected = metadataAuthTag(key, domain, body);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function verifyEnvelopeMetadataAuth(payload: JsonObject, messageKey: Buffer): boolean {
+  return verifyMetadataAuth(payload.protected_headers, messageKey, PROTECTED_HEADERS_DOMAIN)
+    && verifyMetadataAuth(payload.context, messageKey, PROTECTED_CONTEXT_DOMAIN);
+}
+
+function normalizeContextMetadata(context: unknown): JsonObject {
+  if (!context || typeof context !== 'object' || Array.isArray(context)) return {};
+  return metadataBody(context as Record<string, unknown>);
+}
+
+function exposedEnvelopeMetadata(metadata: unknown): JsonObject | undefined {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined;
+  const body = metadataBody(metadata as Record<string, unknown>);
+  return Object.keys(body).length > 0 ? body : undefined;
+}
+
+function validateDecryptedEnvelopeMetadata(
+  decoded: unknown,
+  payload: JsonObject,
+  message?: Message | null,
+): boolean {
+  if (payload.protected_headers && typeof payload.protected_headers === 'object' && !Array.isArray(payload.protected_headers)) {
+    const headers = metadataBody(payload.protected_headers as Record<string, unknown>);
+    if (hasOwn(headers, 'payload_type')) {
+      if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return false;
+      if (String((decoded as Record<string, unknown>).type ?? '') !== String(headers.payload_type ?? '')) {
+        return false;
+      }
+    }
+  }
+  if (payload.context && typeof payload.context === 'object' && !Array.isArray(payload.context)) {
+    const protectedContext = metadataBody(payload.context as Record<string, unknown>);
+    const outerContext = normalizeContextMetadata(message?.context);
+    if (canonicalStringify(outerContext) !== canonicalStringify(protectedContext)) return false;
+  }
+  return true;
+}
+
 /** 群组 AAD 序列化（sorted keys, compact JSON） */
 function aadBytesGroup(aad: JsonObject): Buffer {
   const obj: JsonObject = {};
   for (const field of AAD_FIELDS_GROUP) {
     obj[field] = aad[field] ?? null;
   }
-  const sorted: JsonObject = {};
-  for (const k of Object.keys(obj).sort()) {
-    sorted[k] = obj[k];
-  }
-  return Buffer.from(JSON.stringify(sorted), 'utf-8');
+  return Buffer.from(canonicalStringify(obj), 'utf-8');
 }
 
 /** 群组 AAD 字段匹配检查 */
@@ -339,6 +507,10 @@ export function encryptGroupMessage(
     timestamp: number;
     senderPrivateKeyPem?: string | null;
     senderCertPem?: string | null;
+    protectedHeaders?: ProtectedHeadersInput;
+    protected_headers?: ProtectedHeadersInput;
+    headers?: ProtectedHeadersInput;
+    context?: JsonObject | null;
   },
 ): JsonObject {
   const msgKey = deriveGroupMsgKey(groupSecret, groupId, opts.messageId);
@@ -353,20 +525,25 @@ export function encryptGroupMessage(
     encryption_mode: MODE_EPOCH_GROUP_KEY,
     suite: SUITE,
   };
-  const aadBytes = aadBytesGroup(aad);
-  const { ciphertext, tag, nonce } = aesGcmEncrypt(msgKey, plaintext, aadBytes);
-
   const envelope: JsonObject = {
     type: 'e2ee.group_encrypted',
     version: '1',
     encryption_mode: MODE_EPOCH_GROUP_KEY,
     suite: SUITE,
     epoch,
-    nonce: nonce.toString('base64'),
-    ciphertext: ciphertext.toString('base64'),
-    tag: tag.toString('base64'),
-    aad,
   };
+  copyOptionalEnvelopeMetadata(envelope, msgKey, {
+    payloadType: payload.type,
+    protectedHeaders: opts.protectedHeaders ?? opts.protected_headers ?? opts.headers,
+    context: opts.context ?? null,
+  });
+  const aadBytes = aadBytesGroup(aad);
+  const { ciphertext, tag, nonce } = aesGcmEncrypt(msgKey, plaintext, aadBytes);
+
+  envelope.nonce = nonce.toString('base64');
+  envelope.ciphertext = ciphertext.toString('base64');
+  envelope.tag = tag.toString('base64');
+  envelope.aad = aad;
 
   // 发送方签名
   if (opts.senderPrivateKeyPem) {
@@ -438,20 +615,32 @@ export function decryptGroupMessage(
     const ciphertext = Buffer.from(payload.ciphertext as string, 'base64');
     const tag = Buffer.from(payload.tag as string, 'base64');
 
+    if (!verifyEnvelopeMetadataAuth(payload, msgKey)) {
+      return null;
+    }
     const aadBytes = aad ? aadBytesGroup(aad) : Buffer.alloc(0);
     const plaintext = aesGcmDecrypt(msgKey, ciphertext, tag, nonce, aadBytes);
     const decoded = JSON.parse(plaintext.toString('utf-8'));
+    if (!validateDecryptedEnvelopeMetadata(decoded, payload, message)) {
+      return null;
+    }
+
+    const e2ee: JsonObject = {
+      encryption_mode: MODE_EPOCH_GROUP_KEY,
+      suite: SUITE,
+      epoch,
+      sender_verified: false,
+    };
+    const protectedHeaders = exposedEnvelopeMetadata(payload.protected_headers);
+    if (protectedHeaders) e2ee.protected_headers = protectedHeaders;
+    const context = exposedEnvelopeMetadata(payload.context);
+    if (context) e2ee.context = context;
 
     const result: Message = {
       ...message,
       payload: decoded,
       encrypted: true,
-      e2ee: {
-        encryption_mode: MODE_EPOCH_GROUP_KEY,
-        suite: SUITE,
-        epoch,
-        sender_verified: false,
-      },
+      e2ee,
     };
 
     // 发送方签名验证
@@ -1246,7 +1435,14 @@ export class GroupE2EEManager {
   }
 
   /** 加密群消息（含发送方签名）。无密钥时抛 E2EEGroupSecretMissingError。 */
-  encrypt(groupId: string, payload: JsonObject): JsonObject {
+  encrypt(groupId: string, payload: JsonObject, opts?: {
+    protectedHeaders?: ProtectedHeadersInput;
+    protected_headers?: ProtectedHeadersInput;
+    headers?: ProtectedHeadersInput;
+    context?: JsonObject | null;
+    messageId?: string;
+    timestamp?: number;
+  }): JsonObject {
     const aid = this._currentAid();
     const secretData = loadGroupSecret(this._keystore, aid, groupId);
     if (!secretData) {
@@ -1266,16 +1462,25 @@ export class GroupE2EEManager {
       payload,
       {
         fromAid: aid,
-        messageId: `gm-${crypto.randomUUID()}`,
-        timestamp: Date.now(),
+        messageId: opts?.messageId ?? `gm-${crypto.randomUUID()}`,
+        timestamp: opts?.timestamp ?? Date.now(),
         senderPrivateKeyPem: senderPkPem,
         senderCertPem,
+        protectedHeaders: opts?.protectedHeaders ?? opts?.protected_headers ?? opts?.headers,
+        context: opts?.context ?? null,
       },
     );
   }
 
   /** 使用指定 epoch 加密群消息。 */
-  encryptWithEpoch(groupId: string, epoch: number, payload: JsonObject): JsonObject {
+  encryptWithEpoch(groupId: string, epoch: number, payload: JsonObject, opts?: {
+    protectedHeaders?: ProtectedHeadersInput;
+    protected_headers?: ProtectedHeadersInput;
+    headers?: ProtectedHeadersInput;
+    context?: JsonObject | null;
+    messageId?: string;
+    timestamp?: number;
+  }): JsonObject {
     const aid = this._currentAid();
     const secretData = loadGroupSecret(this._keystore, aid, groupId, epoch);
     if (!secretData) {
@@ -1294,10 +1499,12 @@ export class GroupE2EEManager {
       payload,
       {
         fromAid: aid,
-        messageId: `gm-${crypto.randomUUID()}`,
-        timestamp: Date.now(),
+        messageId: opts?.messageId ?? `gm-${crypto.randomUUID()}`,
+        timestamp: opts?.timestamp ?? Date.now(),
         senderPrivateKeyPem: senderPkPem,
         senderCertPem,
+        protectedHeaders: opts?.protectedHeaders ?? opts?.protected_headers ?? opts?.headers,
+        context: opts?.context ?? null,
       },
     );
   }
@@ -1486,6 +1693,11 @@ export class GroupE2EEManager {
     } catch {
       // keystore 不支持 delete 时忽略（降级方案已在 deleteKeyStoreGroupState 中处理）
     }
+  }
+
+  /** 加载指定群组的所有 epoch 密钥。返回 Map<epoch, Buffer>。 */
+  loadAllSecrets(groupId: string): Map<number, Buffer> {
+    return loadAllGroupSecrets(this._keystore, this._currentAid(), groupId);
   }
 
   private _currentAid(): string {

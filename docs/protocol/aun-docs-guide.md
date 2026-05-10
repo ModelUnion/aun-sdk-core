@@ -14,7 +14,7 @@ AUN 协议采用**主协议 + 子协议**架构：
 
 子协议文档
 ├── 01-身份与凭证协议-auth.md  ← auth.* 方法、JWT Token
-├── 03-Gateway-连接模式.md     ← Gateway 模式、initialize
+├── 03-Gateway-连接模式.md     ← Gateway 模式、auth.connect
 ├── 04-Peer-子协议.md          ← peer.* 对等认证
 └── 05-Relay-子协议.md         ← relay.* 中继传输
 

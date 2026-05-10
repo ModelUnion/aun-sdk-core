@@ -134,3 +134,19 @@ type SeqTrackerStore interface {
 	// LoadAllSeqs 加载某 device+slot 下所有 namespace 的 contiguous_seq
 	LoadAllSeqs(aid, deviceID, slotID string) (map[string]int, error)
 }
+
+// TrustRootStore 提供信任根证书存储能力。
+// 与 Python SDK TrustRootStore 对应。
+type TrustRootStore interface {
+	// TrustRootDir 返回信任根存储目录路径
+	TrustRootDir() string
+
+	// SaveTrustRoots 保存信任根列表。
+	// trustList 为 trust-roots.json 的完整内容；imported 为已验证并导入的根证书摘要列表。
+	// 返回 (bundlePath, error)。
+	SaveTrustRoots(trustList map[string]any, imported []map[string]string) (string, error)
+
+	// SaveIssuerRootCert 保存 Issuer 根证书。
+	// 返回 (certPath, fingerprint, error)。
+	SaveIssuerRootCert(issuer, certPEM, fingerprint string) (string, string, error)
+}

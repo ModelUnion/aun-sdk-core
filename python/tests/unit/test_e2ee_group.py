@@ -181,6 +181,8 @@ class TestEncryptDecryptRoundtrip:
         assert result["encrypted"] is True
         assert result["e2ee"]["encryption_mode"] == MODE_EPOCH_GROUP_KEY
         assert result["e2ee"]["epoch"] == 1
+        assert result["e2ee"]["protected_headers"] == {"payload_type": "text"}
+        assert result["e2ee"].get("context") is None
 
     def test_wrong_epoch_fails(self):
         message, gs, _ = _make_group_msg(epoch=2)
@@ -209,6 +211,97 @@ class TestEncryptDecryptRoundtrip:
         message["payload"]["aad"]["group_id"] = "grp_hacked"
         result = decrypt_group_message(message, {1: gs}, sender_cert_pem=_default_cert())
         assert result is None
+
+    def test_payload_type_and_protected_headers_are_bound(self):
+        gs = _random_secret()
+        pk_pem, cert_pem = _ensure_default_signing_identity()
+        envelope = encrypt_group_message(
+            group_id="grp_test1",
+            epoch=1,
+            group_secret=gs,
+            payload={"type": "text", "text": "hello"},
+            from_aid="alice.agentid.pub",
+            message_id="gm-meta",
+            timestamp=1710504000000,
+            sender_private_key_pem=pk_pem,
+            sender_cert_pem=cert_pem,
+            protected_headers={"Device_ID": "dev-a", "slot_id": "slot-a"},
+        )
+        assert "payload_type" not in envelope
+        assert "protected_headers" not in envelope["aad"]
+        assert "payload_type" not in envelope["aad"]
+        assert envelope["protected_headers"]["payload_type"] == "text"
+        assert envelope["protected_headers"]["device_id"] == "dev-a"
+        assert envelope["protected_headers"]["slot_id"] == "slot-a"
+        assert envelope["protected_headers"]["_auth"]["alg"] == "HMAC-SHA256"
+        message = {
+            "group_id": "grp_test1",
+            "from": "alice.agentid.pub",
+            "message_id": "gm-meta",
+            "payload": envelope,
+            "encrypted": True,
+        }
+        result = decrypt_group_message(message, {1: gs}, sender_cert_pem=cert_pem)
+        assert result is not None
+        assert result["payload"]["text"] == "hello"
+        assert result["e2ee"]["protected_headers"] == {
+            "payload_type": "text",
+            "device_id": "dev-a",
+            "slot_id": "slot-a",
+        }
+        assert "_auth" not in result["e2ee"]["protected_headers"]
+        assert result["e2ee"].get("context") is None
+
+        tampered = copy.deepcopy(message)
+        tampered["payload"]["protected_headers"]["device_id"] = "dev-b"
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
+
+        tampered = copy.deepcopy(message)
+        del tampered["payload"]["protected_headers"]["_auth"]
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
+
+    def test_context_aad_is_checked_when_present(self):
+        gs = _random_secret()
+        pk_pem, cert_pem = _ensure_default_signing_identity()
+        envelope = encrypt_group_message(
+            group_id="grp_test1",
+            epoch=1,
+            group_secret=gs,
+            payload={"type": "thought", "text": "thinking"},
+            from_aid="alice.agentid.pub",
+            message_id="gt-1",
+            timestamp=1710504000000,
+            sender_private_key_pem=pk_pem,
+            sender_cert_pem=cert_pem,
+            context={"type": "run", "id": "run-1"},
+        )
+        assert "context_type" not in envelope["aad"]
+        assert "context_id" not in envelope["aad"]
+        assert envelope["context"]["type"] == "run"
+        assert envelope["context"]["id"] == "run-1"
+        assert envelope["context"]["_auth"]["alg"] == "HMAC-SHA256"
+        message = {
+            "group_id": "grp_test1",
+            "from": "alice.agentid.pub",
+            "message_id": "gt-1",
+            "context": {"type": "run", "id": "run-1"},
+            "payload": envelope,
+            "encrypted": True,
+        }
+        result = decrypt_group_message(message, {1: gs}, sender_cert_pem=cert_pem)
+        assert result is not None
+        assert result["e2ee"]["protected_headers"]["payload_type"] == "thought"
+        assert result["e2ee"].get("context") == {"type": "run", "id": "run-1"}
+        assert "_auth" not in result["e2ee"]["protected_headers"]
+        assert "_auth" not in result["e2ee"]["context"]
+
+        tampered = copy.deepcopy(message)
+        tampered["context"] = {"type": "run", "id": "run-2"}
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
+
+        tampered = copy.deepcopy(message)
+        tampered["payload"]["context"]["id"] = "run-2"
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
 
 
 # ── AAD 工具 ───────────────────────────────────────────────
@@ -250,6 +343,28 @@ class TestAADGroup:
         }
         parsed = json.loads(_aad_bytes_group(aad).decode("utf-8"))
         assert "dispatch_mode" not in parsed
+
+    def test_optional_metadata_is_not_in_group_aad(self):
+        base = {
+            "group_id": "grp_1",
+            "from": "alice",
+            "message_id": "msg_1",
+            "timestamp": 100,
+            "epoch": 1,
+            "encryption_mode": MODE_EPOCH_GROUP_KEY,
+            "suite": SUITE,
+        }
+        assert "payload_type" not in json.loads(_aad_bytes_group(base).decode("utf-8"))
+        aad = dict(base)
+        aad["payload_type"] = "text"
+        aad["protected_headers"] = {"device_id": "dev1", "slot_id": "slot1"}
+        aad["context_type"] = "run"
+        aad["context_id"] = "run-1"
+        parsed = json.loads(_aad_bytes_group(aad).decode("utf-8"))
+        assert "payload_type" not in parsed
+        assert "protected_headers" not in parsed
+        assert "context_type" not in parsed
+        assert "context_id" not in parsed
 
 
 # ── Membership Commitment ──────────────────────────────────

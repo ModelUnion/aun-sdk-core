@@ -21,6 +21,8 @@
 ### [AUNClient.Auth](#authnamespace-clientauth)
 - [create_aid()](#await-create_aidparams-dict---dict) - 注册新 AID
 - [authenticate()](#await-authenticateparams-dict--none---dict) - 认证获取令牌
+- [sign_agent_md()](#await-sign_agent_mdcontent-str-aid-str--none---str) - 为 agent.md 生成尾部签名
+- [verify_agent_md()](#await-verify_agent_mdcontent-str-aid-str--none-cert_pem-str--none---dict) - 验证 agent.md 尾部签名
 - [upload_agent_md()](#await-upload_agent_mdcontent-str---dict) - 上传自己的 agent.md
 - [download_agent_md()](#await-download_agent_mdaid-str---str) - 下载指定 AID 的 agent.md
 - [renew_cert()](#await-renew_certparams-dict--none---dict) - 续期证书
@@ -181,6 +183,7 @@ await client.connect(auth, {
 - P2P 消息的投递语义由连接阶段声明的 `delivery_mode` 决定
 - `group.send` 固定为 `fanout`，不支持 `queue`
 - 群消息的 `dispatch_mode` 来自群设置，SDK 会在解密后保留顶层 `dispatch_mode` 并注入 `payload.dispatch_mode`
+- `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 可传 `protected_headers`，SDK 会为它和 thought `context` 生成独立 `_auth`，接收端验通过后在 `message.e2ee.protected_headers` / `message.e2ee.context` 暴露给应用层
 - Python SDK 会为 `message.pull` / `message.ack` 自动附带当前实例的 `device_id` / `slot_id`，应用层不应手工覆盖
 
 ```python
@@ -210,6 +213,7 @@ await client.call("message.send", {
 | `encrypt` | `bool` | 否 | 是否加密消息（默认 `true`） |
 | `message_id` | `str` | 否 | 消息 ID（不传则自动生成） |
 | `timestamp` | `int` | 否 | 时间戳毫秒（不传则自动生成） |
+| `protected_headers` / `headers` | `dict` / `ProtectedHeaders` | 否 | E2EE 信封元数据，类似 HTTP headers；SDK 自动补 `payload_type` 并做 `_auth` 防篡改 |
 
 P2P 消息的 `delivery_mode` 由当前连接实例携带；应用层通过 `connect` 配置即可。
 
@@ -218,23 +222,45 @@ P2P 消息的 `delivery_mode` 由当前连接实例携带；应用层通过 `con
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `to` | `str` | put 必填 | P2P 会话另一方 AID |
-| `reply_to.message_id` | `str` | 是 | 被思考的 P2P 消息 ID |
+| `context.type` | `str` | 是 | 思考上下文类型，推荐 `run` |
+| `context.id` | `str` | 是 | 思考上下文 ID，如 `run_id` |
 | `payload` | `dict` | put 必填 | 思考内容，推荐 `{"type": "thought", "text": "..."}` |
 | `sender_aid` | `str` | get 必填 | thought 作者 AID |
 | `peer_aid` / `to` | `str` | 条件必填 | 读取自己写的 thought 时指定会话另一方 |
+| `protected_headers` / `headers` | `dict` / `ProtectedHeaders` | put 可选 | E2EE 信封元数据；`context` 会另行绑定到信封内并验 `_auth` |
+
+`message.thought.put/get` 只使用 `context.type + context.id` 定位 thought head。
 
 ```python
 await client.call("message.thought.put", {
     "to": "bob.agentid.pub",
-    "reply_to": {"message_id": "msg-quote"},
+    "context": {"type": "run", "id": "run-xxx"},
     "payload": {"type": "thought", "text": "先核对约束"},
 })
 
 result = await client.call("message.thought.get", {
     "sender_aid": "bob.agentid.pub",
-    "reply_to": {"message_id": "msg-quote"},
+    "context": {"type": "run", "id": "run-xxx"},
 })
 ```
+
+**ProtectedHeaders 读取位置**：
+
+```python
+from aun_core import ProtectedHeaders
+
+headers = ProtectedHeaders({"device_id": "dev-123"}).set("slot_id", "desktop")
+await client.call("group.send", {
+    "group_id": "10001.example.com",
+    "payload": {"type": "text", "text": "群组消息"},
+    "protected_headers": headers,
+})
+
+pulled = await client.call("group.pull", {"group_id": "10001.example.com"})
+received_headers = pulled["messages"][0].get("e2ee", {}).get("protected_headers", {})
+```
+
+`payload_type` 由 SDK 根据加密前 `payload.type` 自动设置，应用层不需要传。完整安全语义见 [05-E2EE加密通信](05-E2EE加密通信.md#protectedheaders-与可验证上下文)。
 
 **群消息 `dispatch_mode` 设置**：
 
@@ -423,6 +449,61 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 
 ---
 
+### `await sign_agent_md(content: str, aid: str | None = None) -> str`
+
+为 `agent.md` 生成尾部签名块。
+
+**参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `content` | `str` | 是 | 完整的 `agent.md` 文本（YAML frontmatter + Markdown 正文 + 可选尾部签名块） |
+| `aid` | `str` | 否 | 指定要使用的本地身份 AID；不传则使用当前 AID |
+
+**返回值**
+
+签名后的完整 `agent.md` 文本。
+
+**说明**
+
+- 若输入内容已经带有尾部签名块，会先剥离旧签名再重新签名
+- 签名块位于文件尾部，签名内容只覆盖签名块之前的全部字节
+- 签名块本身不参与验证时的 payload 计算
+
+---
+
+### `await verify_agent_md(content: str, aid: str | None = None, cert_pem: str | None = None) -> dict`
+
+验证 `agent.md` 尾部签名。
+
+**参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `content` | `str` | 是 | 完整的 `agent.md` 文本 |
+| `aid` | `str` | 否 | 预期 AID；用于校验 payload 中的 `aid` 与证书归属 |
+| `cert_pem` | `str` | 否 | 直接提供对端证书 PEM；不传时 SDK 会按 `aid + cert_fingerprint` 拉取 |
+
+**返回值**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | `str` | `verified` / `invalid` / `unsigned` |
+| `verified` | `bool` | 是否验签成功 |
+| `payload` | `str` | 去掉尾部签名块后的原始内容 |
+| `reason` | `str` | 失败原因（仅 `invalid` 时可能存在） |
+| `aid` | `str` | 关联 AID |
+| `cert_fingerprint` | `str` | 使用的证书指纹 |
+| `timestamp` | `int` | 签名时间戳 |
+
+**说明**
+
+- `unsigned` 表示文件未带签名块，不视为错误
+- 若 `cert_pem` 未提供，SDK 会根据 `aid` 和签名块里的 `cert_fingerprint` 拉取对端证书再验签
+- 验签失败不会抛异常，而是通过 `status=invalid` 返回原因
+
+---
+
 ### `await upload_agent_md(content: str) -> dict`
 
 上传当前 AID 的公开 `agent.md` 文档。
@@ -431,7 +512,7 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `content` | `str` | 是 | 完整的 `agent.md` 文本（YAML frontmatter + Markdown 正文） |
+| `content` | `str` | 是 | 完整的 `agent.md` 文本（YAML frontmatter + Markdown 正文 + 可选尾部签名块） |
 
 **返回值**
 

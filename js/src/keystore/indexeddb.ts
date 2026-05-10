@@ -1628,4 +1628,107 @@ export class IndexedDBKeyStore implements KeyStore {
     }
     return result;
   }
+
+  // ── Trust Root Storage（信任根证书存储） ─────────────────
+  // 浏览器环境无文件系统，统一存入 STORE_INSTANCE_STATE 并以特定前缀的 key 区分。
+  // 对外返回的"路径"为虚拟标识（indexeddb://...），仅用于日志/兼容字段。
+
+  /** 信任根列表 JSON 在 IndexedDB 中的 key */
+  private static readonly _TRUST_LIST_KEY = '__trust_roots:list';
+  /** 信任根 bundle PEM 在 IndexedDB 中的 key */
+  private static readonly _TRUST_BUNDLE_KEY = '__trust_roots:bundle';
+  /** 单个 root cert 在 IndexedDB 中的 key 前缀 */
+  private static readonly _TRUST_CERT_PREFIX = '__trust_roots:cert:';
+  /** 单个 issuer root cert 在 IndexedDB 中的 key 前缀 */
+  private static readonly _TRUST_ISSUER_PREFIX = '__trust_roots:issuer:';
+
+  /** 计算 PEM 证书的 SHA-256 指纹（hex，无冒号） */
+  private async _pemFingerprint(pem: string): Promise<string> {
+    try {
+      const der = new Uint8Array(pemToArrayBuffer(pem));
+      const hash = await crypto.subtle.digest('SHA-256', der);
+      return Array.from(new Uint8Array(hash))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      // 解析失败时退化为对 PEM 文本本身做哈希（仅用于去重，不暴露）
+      const enc = new TextEncoder().encode(pem);
+      const hash = await crypto.subtle.digest('SHA-256', enc);
+      return Array.from(new Uint8Array(hash))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+  }
+
+  /** 拆分 bundle PEM 文本为单个 PEM 证书数组 */
+  private _splitPemBundle(bundleText: string): string[] {
+    return bundleText
+      .split(/(?<=-----END CERTIFICATE-----)\s*/)
+      .map(s => s.trim())
+      .filter(s => s.startsWith('-----BEGIN CERTIFICATE-----'));
+  }
+
+  async saveTrustRoots(
+    trustList: Record<string, unknown>,
+    rootCerts: Array<{ id?: string; cert_pem: string; fingerprint_sha256?: string }>,
+  ): Promise<string> {
+    // 保存每个根证书到独立 key
+    for (let i = 0; i < rootCerts.length; i++) {
+      const item = rootCerts[i];
+      const certId = item.id || item.fingerprint_sha256 || `root-${i + 1}`;
+      const safeName = certId.replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120);
+      await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_CERT_PREFIX + safeName, item.cert_pem);
+    }
+
+    // 生成合并 bundle
+    const bundle = rootCerts.map(i => i.cert_pem.trim()).join('\n') + '\n';
+    await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_BUNDLE_KEY, bundle);
+
+    // 保存元数据 JSON
+    await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_LIST_KEY, deepClone(trustList));
+
+    return 'indexeddb://trust-roots/bundle';
+  }
+
+  async saveIssuerRootCert(
+    issuer: string,
+    certPem: string,
+    fingerprintSha256: string = '',
+  ): Promise<[string, string]> {
+    const safeIssuer = (issuer || 'issuer').replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120);
+    const certKey = IndexedDBKeyStore._TRUST_ISSUER_PREFIX + safeIssuer;
+    const normalizedPem = certPem.trim() + '\n';
+
+    // 保存 issuer 根证书
+    await idbPut(STORE_INSTANCE_STATE, certKey, normalizedPem);
+
+    // 读取已有 bundle 并合并（按指纹去重）
+    const existingPems = new Map<string, string>();
+    const existingBundle = await idbGet<string>(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_BUNDLE_KEY);
+    if (typeof existingBundle === 'string' && existingBundle) {
+      for (const pem of this._splitPemBundle(existingBundle)) {
+        const fp = await this._pemFingerprint(pem);
+        existingPems.set(fp, pem);
+      }
+    }
+
+    // 新证书的指纹
+    let newFp = await this._pemFingerprint(normalizedPem);
+    if (fingerprintSha256) {
+      newFp = fingerprintSha256.toLowerCase().replace(/^sha256:/, '');
+    }
+    existingPems.set(newFp, normalizedPem);
+
+    // 重写 bundle
+    const merged = Array.from(existingPems.values()).map(p => p.trim()).join('\n') + '\n';
+    await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_BUNDLE_KEY, merged);
+
+    return [`indexeddb://trust-roots/issuers/${safeIssuer}`, 'indexeddb://trust-roots/bundle'];
+  }
+
+  async loadTrustRoots(): Promise<Record<string, unknown> | null> {
+    const data = await idbGet<JsonObject>(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_LIST_KEY);
+    if (!isRecord(data)) return null;
+    return deepClone(data);
+  }
 }

@@ -45,7 +45,7 @@
 - **私钥**永不传输，客户端本地生成和存储
 - **AID** 格式为 `{name}.{issuer}`，全局唯一标识符（详见 [02-证书与信任体系](02-证书与信任体系.md) §2.1）
 - **证书**由 Issuer CA 签发，遵循四级证书链：Root CA → Registry CA → Issuer CA → Agent（详见 [02-证书与信任体系](02-证书与信任体系.md) §2.3）
-- **JWT Token** 由 Auth 服务签发，仅在 Gateway 模式下使用，用于 `initialize` 握手认证
+- **JWT Token** 由 Auth 服务签发，仅在 Gateway 模式下使用，用于 `auth.connect` 会话初始化认证
 - 创建 AID 时固定使用 P-256 曲线，额外曲线通过 `auth.request_cert` 申请
 
 ## 1.3 auth.create_aid
@@ -512,7 +512,7 @@ signature = ECDSA_sign(private_key, SHA256(message))
 
 任何 AUN 服务均可独立验证 JWT（持有 Auth 服务公钥即可）：
 
-1. 从 `initialize` 消息获取 token
+1. 从 `auth.connect.params.auth.token` 获取 token
 2. Base64 解码 Header 和 Payload
 3. 用 Auth 服务公钥验证 ECDSA 签名
 4. 检查 `exp`（过期时间）、`iss`（签发者）、`aud`（固定 `"aun"`）、`aid`（格式正确）

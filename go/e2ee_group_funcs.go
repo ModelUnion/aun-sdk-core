@@ -227,7 +227,9 @@ func EncryptGroupMessage(
 	epoch int,
 	senderPrivateKeyPEM string,
 	senderCertPEM []byte,
+	options ...E2EEEncryptOptions,
 ) (map[string]any, error) {
+	opts := firstE2EEEncryptOptions(options)
 	// 派生单条消息密钥
 	msgKey, err := deriveGroupMsgKey(groupSecret, groupID, messageID)
 	if err != nil {
@@ -253,6 +255,16 @@ func EncryptGroupMessage(
 		"encryption_mode": ModeEpochGroupKey,
 		"suite":           SuiteP256,
 	}
+	envelope := map[string]any{
+		"type":            "e2ee.group_encrypted",
+		"version":         "1",
+		"encryption_mode": ModeEpochGroupKey,
+		"suite":           SuiteP256,
+		"epoch":           epoch,
+	}
+	if err := copyOptionalEnvelopeMetadata(envelope, payload, opts, msgKey); err != nil {
+		return nil, err
+	}
 	aadBytes := aadBytesGroup(aad)
 
 	block, err := aes.NewCipher(msgKey)
@@ -268,17 +280,10 @@ func EncryptGroupMessage(
 	ciphertext := ciphertextWithTag[:tagStart]
 	tag := ciphertextWithTag[tagStart:]
 
-	envelope := map[string]any{
-		"type":            "e2ee.group_encrypted",
-		"version":         "1",
-		"encryption_mode": ModeEpochGroupKey,
-		"suite":           SuiteP256,
-		"epoch":           epoch,
-		"nonce":           base64.StdEncoding.EncodeToString(nonce),
-		"ciphertext":      base64.StdEncoding.EncodeToString(ciphertext),
-		"tag":             base64.StdEncoding.EncodeToString(tag),
-		"aad":             aad,
-	}
+	envelope["nonce"] = base64.StdEncoding.EncodeToString(nonce)
+	envelope["ciphertext"] = base64.StdEncoding.EncodeToString(ciphertext)
+	envelope["tag"] = base64.StdEncoding.EncodeToString(tag)
+	envelope["aad"] = aad
 
 	// 发送方签名
 	if senderPrivateKeyPEM != "" {
@@ -391,6 +396,9 @@ func DecryptGroupMessage(
 	if aad != nil {
 		aadBytes = aadBytesGroup(aad)
 	}
+	if !verifyEnvelopeMetadataAuth(payload, msgKey) {
+		return nil
+	}
 
 	plaintext, err := aesGCMDecrypt(msgKey, nonce, ciphertext, tag, aadBytes)
 	if err != nil {
@@ -401,16 +409,26 @@ func DecryptGroupMessage(
 	if err := json.Unmarshal(plaintext, &decoded); err != nil {
 		return nil
 	}
+	if !validateDecryptedEnvelopeMetadata(decoded, payload, message) {
+		return nil
+	}
 
 	result := copyMapShallow(message)
 	result["payload"] = decoded
 	result["encrypted"] = true
-	result["e2ee"] = map[string]any{
+	e2ee := map[string]any{
 		"encryption_mode": ModeEpochGroupKey,
 		"suite":           SuiteP256,
 		"epoch":           epoch,
 		"sender_verified": false,
 	}
+	if protectedHeaders := exposedEnvelopeMetadata(payload["protected_headers"]); protectedHeaders != nil {
+		e2ee["protected_headers"] = protectedHeaders
+	}
+	if context := exposedEnvelopeMetadata(payload["context"]); context != nil {
+		e2ee["context"] = context
+	}
+	result["e2ee"] = e2ee
 
 	// 发送方签名验证
 	sigB64, _ := payload["sender_signature"].(string)
@@ -429,7 +447,7 @@ func DecryptGroupMessage(
 			log.Printf("[e2ee_group] 群消息签名验证失败: group=%s from=%s", groupID, aadFrom)
 			return nil
 		}
-		result["e2ee"].(map[string]any)["sender_verified"] = true
+		e2ee["sender_verified"] = true
 	} else if senderCertPEM != nil {
 		// 非零信任但有证书：有证书时强制验签
 		if sigB64 == "" {
@@ -440,7 +458,7 @@ func DecryptGroupMessage(
 			log.Printf("[e2ee_group] 群消息签名验证失败: group=%s from=%s", groupID, aadFrom)
 			return nil
 		}
-		result["e2ee"].(map[string]any)["sender_verified"] = true
+		e2ee["sender_verified"] = true
 	}
 
 	return result
@@ -1391,12 +1409,7 @@ func HandleKeyResponse(
 
 // aadBytesGroup 群组 AAD 序列化
 func aadBytesGroup(aad map[string]any) []byte {
-	filtered := make(map[string]any, len(aadFieldsGroup))
-	for _, field := range aadFieldsGroup {
-		filtered[field] = aad[field]
-	}
-	data := canonicalJSONMarshal(filtered)
-	return data
+	return aadBytesWithOptionalFields(aad, aadFieldsGroup)
 }
 
 // deriveGroupMsgKey 从 group_secret 派生单条群消息的加密密钥

@@ -5,6 +5,7 @@ import copy
 import hmac as _hmac
 import json
 import logging
+import re
 import secrets
 import threading
 import time as _time_mod
@@ -60,6 +61,12 @@ PREKEY_MIN_KEEP_COUNT = 7
 # AES-256-GCM 认证标签长度（字节），标准值 16 字节 = 128-bit
 _AES_GCM_TAG_LEN = 16
 
+_METADATA_AUTH_FIELD = "_auth"
+_METADATA_AUTH_ALG = "HMAC-SHA256"
+_METADATA_KEY_DOMAIN = b"aun-envelope-metadata-key-v1"
+_PROTECTED_HEADERS_DOMAIN = b"aun-protected-headers-v1"
+_PROTECTED_CONTEXT_DOMAIN = b"aun-protected-context-v1"
+
 
 def _prekey_created_marker(prekey_data: dict[str, Any]) -> int:
     for key in ("created_at", "updated_at", "expires_at"):
@@ -94,6 +101,214 @@ AAD_MATCH_FIELDS_GROUP = (
     "group_id", "from", "message_id",
     "epoch", "encryption_mode", "suite",
 )
+
+
+class ProtectedHeaders:
+    """端到端保护的信封元数据，语义接近 HTTP headers。"""
+
+    def __init__(self, values: dict[str, Any] | None = None):
+        self._items: dict[str, str] = {}
+        if values:
+            for key, value in values.items():
+                self.set(key, value)
+
+    @staticmethod
+    def _normalize_key(key: object) -> str:
+        value = str(key or "").strip().lower()
+        if not value or not re.fullmatch(r"[a-z0-9_-]+", value):
+            raise ValueError("protected header key must match [a-z0-9_-]+")
+        if value == _METADATA_AUTH_FIELD:
+            raise ValueError("protected header key is reserved")
+        return value
+
+    def set(self, key: str, value: object) -> "ProtectedHeaders":
+        self._items[self._normalize_key(key)] = "" if value is None else str(value)
+        return self
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        return self._items.get(self._normalize_key(key), default)
+
+    def remove(self, key: str) -> "ProtectedHeaders":
+        self._items.pop(self._normalize_key(key), None)
+        return self
+
+    def to_dict(self) -> dict[str, str]:
+        return dict(self._items)
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any] | None) -> "ProtectedHeaders":
+        return cls(values or {})
+
+
+def _normalize_protected_headers(headers: object) -> dict[str, str]:
+    if headers is None:
+        return {}
+    if isinstance(headers, ProtectedHeaders):
+        return headers.to_dict()
+    if not isinstance(headers, dict):
+        raise ValueError("protected_headers must be an object")
+    return ProtectedHeaders(headers).to_dict()
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _metadata_body(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): copy.deepcopy(value)
+        for key, value in metadata.items()
+        if str(key) != _METADATA_AUTH_FIELD
+    }
+
+
+def _metadata_auth_tag(key: bytes, domain: bytes, body: dict[str, Any]) -> bytes:
+    metadata_key = _hmac.digest(key, _METADATA_KEY_DOMAIN, "sha256")
+    sign_input = domain + b"\0" + _canonical_json_bytes(body)
+    return _hmac.digest(metadata_key, sign_input, "sha256")
+
+
+def _with_metadata_auth(
+    metadata: dict[str, Any],
+    *,
+    key: bytes,
+    domain: bytes,
+) -> dict[str, Any]:
+    body = _metadata_body(metadata)
+    if not body:
+        return {}
+    tag = _metadata_auth_tag(key, domain, body)
+    result = copy.deepcopy(body)
+    result[_METADATA_AUTH_FIELD] = {
+        "alg": _METADATA_AUTH_ALG,
+        "tag": base64.b64encode(tag).decode("ascii"),
+    }
+    return result
+
+
+def _verify_metadata_auth(
+    metadata: object,
+    *,
+    key: bytes,
+    domain: bytes,
+) -> bool:
+    if metadata is None:
+        return True
+    if not isinstance(metadata, dict):
+        return False
+    auth = metadata.get(_METADATA_AUTH_FIELD)
+    if not isinstance(auth, dict):
+        return False
+    if auth.get("alg") != _METADATA_AUTH_ALG:
+        return False
+    tag_b64 = auth.get("tag")
+    if not isinstance(tag_b64, str) or not tag_b64:
+        return False
+    try:
+        actual = base64.b64decode(tag_b64, validate=True)
+    except Exception:
+        return False
+    body = _metadata_body(metadata)
+    if not body:
+        return False
+    expected = _metadata_auth_tag(key, domain, body)
+    return _hmac.compare_digest(actual, expected)
+
+
+def _normalize_context_metadata(context: object) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    return _metadata_body(context)
+
+
+def _exposed_envelope_metadata(metadata: object) -> dict[str, Any] | None:
+    if not isinstance(metadata, dict):
+        return None
+    body = _metadata_body(metadata)
+    return body or None
+
+
+def _copy_optional_envelope_metadata(
+    envelope: dict[str, Any],
+    *,
+    message_key: bytes,
+    payload_type: object = None,
+    protected_headers: object = None,
+    context: object = None,
+) -> None:
+    headers = _normalize_protected_headers(protected_headers)
+    ptype = str(payload_type or "").strip()
+    if ptype:
+        headers["payload_type"] = ptype
+    if headers:
+        envelope["protected_headers"] = _with_metadata_auth(
+            headers,
+            key=message_key,
+            domain=_PROTECTED_HEADERS_DOMAIN,
+        )
+    context_meta = _normalize_context_metadata(context)
+    if context_meta:
+        envelope["context"] = _with_metadata_auth(
+            context_meta,
+            key=message_key,
+            domain=_PROTECTED_CONTEXT_DOMAIN,
+        )
+
+
+def _aad_bytes_with_optional_fields(
+    aad: dict[str, Any],
+    base_fields: tuple[str, ...],
+) -> bytes:
+    body = {field: aad.get(field) for field in base_fields}
+    return _canonical_json_bytes(body)
+
+
+def _verify_envelope_metadata_auth(
+    payload: dict[str, Any],
+    message_key: bytes,
+) -> bool:
+    return (
+        _verify_metadata_auth(
+            payload.get("protected_headers"),
+            key=message_key,
+            domain=_PROTECTED_HEADERS_DOMAIN,
+        )
+        and _verify_metadata_auth(
+            payload.get("context"),
+            key=message_key,
+            domain=_PROTECTED_CONTEXT_DOMAIN,
+        )
+    )
+
+
+def _validate_decrypted_envelope_metadata(
+    decoded: object,
+    payload: dict[str, Any],
+    message: dict[str, Any] | None = None,
+) -> bool:
+    headers = payload.get("protected_headers")
+    if isinstance(headers, dict):
+        header_body = _metadata_body(headers)
+        if "payload_type" in header_body:
+            if not isinstance(decoded, dict):
+                return False
+            if str(decoded.get("type") or "") != str(header_body.get("payload_type") or ""):
+                return False
+
+    protected_context = payload.get("context")
+    if isinstance(protected_context, dict):
+        context_body = _metadata_body(protected_context)
+        outer_context = (message or {}).get("context")
+        if not isinstance(outer_context, dict):
+            return False
+        if _normalize_context_metadata(outer_context) != context_body:
+            return False
+    return True
 
 
 
@@ -440,6 +655,8 @@ class E2EEManager:
         prekey: dict[str, Any] | None = None,
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """加密出站消息：有 prekey → prekey_ecdh_v2（四路 ECDH），无 prekey → long_term_key。
 
@@ -458,6 +675,7 @@ class E2EEManager:
                 envelope, ok = self._encrypt_with_prekey(
                     peer_aid, payload, prekey, peer_cert_pem,
                     message_id=message_id, timestamp=timestamp,
+                    protected_headers=protected_headers, context=context,
                 )
                 return envelope, {
                     "encrypted": True,
@@ -473,6 +691,7 @@ class E2EEManager:
         envelope, ok = self._encrypt_with_long_term_key(
             peer_aid, payload, peer_cert_pem,
             message_id=message_id, timestamp=timestamp,
+            protected_headers=protected_headers, context=context,
         )
         degraded = prekey is not None  # 有 prekey 但失败了才算降级
         return envelope, {
@@ -492,6 +711,8 @@ class E2EEManager:
         *,
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """使用对方 prekey 加密（prekey_ecdh_v2 模式，四路 ECDH + 发送方签名）
 
@@ -571,6 +792,14 @@ class E2EEManager:
             "sender_cert_fingerprint": sender_fingerprint,
             "prekey_id": prekey["prekey_id"],
         }
+        envelope_meta: dict[str, Any] = {}
+        _copy_optional_envelope_metadata(
+            envelope_meta,
+            message_key=message_key,
+            payload_type=payload.get("type"),
+            protected_headers=protected_headers,
+            context=context,
+        )
         ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
         ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
         tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
@@ -586,6 +815,7 @@ class E2EEManager:
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
             "tag": base64.b64encode(tag).decode("ascii"),
             "aad": aad,
+            **envelope_meta,
         }
         # 发送方签名：对 ciphertext + tag + aad_bytes 签名（不可否认性）
         sign_payload = ciphertext + tag + self._aad_bytes_offline(aad)
@@ -601,6 +831,8 @@ class E2EEManager:
         *,
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """使用 2DH 加密（long_term_key 模式 + 发送方签名）
 
@@ -653,6 +885,14 @@ class E2EEManager:
             "recipient_cert_fingerprint": recipient_fingerprint,
             "sender_cert_fingerprint": sender_fingerprint,
         }
+        envelope_meta: dict[str, Any] = {}
+        _copy_optional_envelope_metadata(
+            envelope_meta,
+            message_key=message_key,
+            payload_type=payload.get("type"),
+            protected_headers=protected_headers,
+            context=context,
+        )
         ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
         ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
         tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
@@ -667,6 +907,7 @@ class E2EEManager:
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
             "tag": base64.b64encode(tag).decode("ascii"),
             "aad": aad,
+            **envelope_meta,
         }
         # 发送方签名（不可否认性）
         sign_payload = ciphertext + tag + self._aad_bytes_offline(aad)
@@ -840,17 +1081,28 @@ class E2EEManager:
             else:
                 # SC-MSG-015: AAD 缺失或非 dict 时显式拒绝，不尝试用空 AAD 解密
                 raise E2EEDecryptFailedError("missing or invalid aad field")
+            if not _verify_envelope_metadata_auth(payload, message_key):
+                raise E2EEDecryptFailedError("envelope metadata auth failed")
             plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
 
             decoded = json.loads(plaintext.decode("utf-8"))
+            if not _validate_decrypted_envelope_metadata(decoded, payload, message):
+                raise E2EEDecryptFailedError("envelope metadata mismatch")
             transformed = dict(message)
             transformed["payload"] = decoded
             transformed["encrypted"] = True
-            transformed["e2ee"] = {
+            e2ee = {
                 "encryption_mode": MODE_PREKEY_ECDH_V2,
                 "suite": payload.get("suite", SUITE),
                 "prekey_id": prekey_id,
             }
+            protected_headers = _exposed_envelope_metadata(payload.get("protected_headers"))
+            if protected_headers is not None:
+                e2ee["protected_headers"] = protected_headers
+            context_meta = _exposed_envelope_metadata(payload.get("context"))
+            if context_meta is not None:
+                e2ee["context"] = context_meta
+            transformed["e2ee"] = e2ee
             return transformed
         except E2EEError as exc:
             src_tag = f"[{source}] " if source else ""
@@ -916,16 +1168,27 @@ class E2EEManager:
             else:
                 # SC-MSG-015: AAD 缺失或非 dict 时显式拒绝，不尝试用空 AAD 解密
                 raise E2EEDecryptFailedError("missing or invalid aad field")
+            if not _verify_envelope_metadata_auth(payload, message_key):
+                raise E2EEDecryptFailedError("envelope metadata auth failed")
             plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
 
             decoded = json.loads(plaintext.decode("utf-8"))
+            if not _validate_decrypted_envelope_metadata(decoded, payload, message):
+                raise E2EEDecryptFailedError("envelope metadata mismatch")
             transformed = dict(message)
             transformed["payload"] = decoded
             transformed["encrypted"] = True
-            transformed["e2ee"] = {
+            e2ee = {
                 "encryption_mode": MODE_LONG_TERM_KEY,
                 "suite": payload["suite"],
             }
+            protected_headers = _exposed_envelope_metadata(payload.get("protected_headers"))
+            if protected_headers is not None:
+                e2ee["protected_headers"] = protected_headers
+            context_meta = _exposed_envelope_metadata(payload.get("context"))
+            if context_meta is not None:
+                e2ee["context"] = context_meta
+            transformed["e2ee"] = e2ee
             return transformed
         except E2EEError as exc:
             _e2ee_log.warning("long_term_key 解密失败 (E2EE): %s", exc)
@@ -938,10 +1201,7 @@ class E2EEManager:
 
     @staticmethod
     def _aad_bytes_offline(aad: dict[str, Any]) -> bytes:
-        return json.dumps(
-            {field: aad.get(field) for field in AAD_FIELDS_OFFLINE},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode("utf-8")
+        return _aad_bytes_with_optional_fields(aad, AAD_FIELDS_OFFLINE)
 
     @staticmethod
     def _aad_matches_offline(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
@@ -1219,10 +1479,7 @@ def _derive_group_msg_key(
 
 def _aad_bytes_group(aad: dict[str, Any]) -> bytes:
     """群组 AAD 序列化（sorted keys, compact JSON）。"""
-    return json.dumps(
-        {field: aad.get(field) for field in AAD_FIELDS_GROUP},
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")
+    return _aad_bytes_with_optional_fields(aad, AAD_FIELDS_GROUP)
 
 
 def _aad_matches_group(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
@@ -1241,6 +1498,8 @@ def encrypt_group_message(
     timestamp: int,
     sender_private_key_pem: str | None = None,
     sender_cert_pem: bytes | str | None = None,
+    protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """加密群组消息，返回 e2ee.group_encrypted 信封。
 
@@ -1260,6 +1519,14 @@ def encrypt_group_message(
         "encryption_mode": MODE_EPOCH_GROUP_KEY,
         "suite": SUITE,
     }
+    envelope_meta: dict[str, Any] = {}
+    _copy_optional_envelope_metadata(
+        envelope_meta,
+        message_key=msg_key,
+        payload_type=payload.get("type"),
+        protected_headers=protected_headers,
+        context=context,
+    )
     ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, _aad_bytes_group(aad))
     ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
     tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
@@ -1274,6 +1541,7 @@ def encrypt_group_message(
         "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
         "tag": base64.b64encode(tag).decode("ascii"),
         "aad": aad,
+        **envelope_meta,
     }
 
     # 发送方签名：对 ciphertext + tag + aad_bytes 签名（不可否认性）
@@ -1361,6 +1629,8 @@ def decrypt_group_message(
         nonce = base64.b64decode(payload["nonce"])
         ciphertext = base64.b64decode(payload["ciphertext"])
         tag = base64.b64decode(payload["tag"])
+        if not _verify_envelope_metadata_auth(payload, msg_key):
+            return None
 
         # AAD 校验：直接用 payload 中的 AAD（因为加密时写入的就是这些值）
         if isinstance(aad, dict):
@@ -1371,16 +1641,25 @@ def decrypt_group_message(
         aesgcm = AESGCM(msg_key)
         plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
         decoded = json.loads(plaintext.decode("utf-8"))
+        if not _validate_decrypted_envelope_metadata(decoded, payload, message):
+            return None
 
         result = dict(message)
         result["payload"] = decoded
         result["encrypted"] = True
-        result["e2ee"] = {
+        e2ee = {
             "encryption_mode": MODE_EPOCH_GROUP_KEY,
             "suite": SUITE,
             "epoch": epoch,
             "sender_verified": False,
         }
+        protected_headers = _exposed_envelope_metadata(payload.get("protected_headers"))
+        if protected_headers is not None:
+            e2ee["protected_headers"] = protected_headers
+        context_meta = _exposed_envelope_metadata(payload.get("context"))
+        if context_meta is not None:
+            e2ee["context"] = context_meta
+        result["e2ee"] = e2ee
 
         # 发送方签名验证（零信任：默认强制要求签名 + 证书）
         sender_sig_b64 = payload.get("sender_signature")
@@ -1404,7 +1683,7 @@ def decrypt_group_message(
                 sig_bytes = base64.b64decode(sender_sig_b64)
                 verify_payload = ciphertext + tag + aad_bytes
                 sender_pub.verify(sig_bytes, verify_payload, ec.ECDSA(hashes.SHA256()))
-                result["e2ee"]["sender_verified"] = True
+                e2ee["sender_verified"] = True
             except Exception:
                 _e2ee_log.warning("群消息发送方签名验证失败: group=%s from=%s", group_id, aad_from)
                 return None
@@ -1422,7 +1701,7 @@ def decrypt_group_message(
                 sig_bytes = base64.b64decode(sender_sig_b64)
                 verify_payload = ciphertext + tag + aad_bytes
                 sender_pub.verify(sig_bytes, verify_payload, ec.ECDSA(hashes.SHA256()))
-                result["e2ee"]["sender_verified"] = True
+                e2ee["sender_verified"] = True
             except Exception:
                 _e2ee_log.warning("群消息发送方签名验证失败: group=%s from=%s", group_id, aad_from)
                 return None
@@ -2482,6 +2761,8 @@ class GroupE2EEManager:
     def encrypt(
         self, group_id: str, payload: dict[str, Any], *,
         message_id: str | None = None, timestamp: int | None = None,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """加密群消息（含发送方签名）。无密钥时抛 E2EEGroupSecretMissingError。"""
         aid = self._current_aid()
@@ -2491,11 +2772,14 @@ class GroupE2EEManager:
         return self._encrypt_with_secret_data(
             group_id, payload, secret_data,
             message_id=message_id, timestamp=timestamp,
+            protected_headers=protected_headers, context=context,
         )
 
     def encrypt_with_epoch(
         self, group_id: str, epoch: int, payload: dict[str, Any], *,
         message_id: str | None = None, timestamp: int | None = None,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """使用指定 epoch 加密群消息。"""
         aid = self._current_aid()
@@ -2505,11 +2789,14 @@ class GroupE2EEManager:
         return self._encrypt_with_secret_data(
             group_id, payload, secret_data,
             message_id=message_id, timestamp=timestamp,
+            protected_headers=protected_headers, context=context,
         )
 
     def _encrypt_with_secret_data(
         self, group_id: str, payload: dict[str, Any], secret_data: dict[str, Any], *,
         message_id: str | None = None, timestamp: int | None = None,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         aid = self._current_aid()
         # 获取发送方私钥用于签名
@@ -2523,6 +2810,8 @@ class GroupE2EEManager:
             timestamp=timestamp or int(_time_mod.time() * 1000),
             sender_private_key_pem=sender_pk_pem,
             sender_cert_pem=sender_cert_pem,
+            protected_headers=protected_headers,
+            context=context,
         )
 
     def decrypt(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any] | None:

@@ -20,7 +20,7 @@ import { URL } from 'node:url';
 import { configFromMap, getDeviceId, normalizeInstanceId, type AUNConfig } from './config.js';
 import { CryptoProvider } from './crypto.js';
 import { GatewayDiscovery } from './discovery.js';
-import { E2EEManager, type PrekeyMaterial } from './e2ee.js';
+import { E2EEManager, type PrekeyMaterial, type ProtectedHeadersInput } from './e2ee.js';
 import {
   GroupE2EEManager,
   computeMembershipCommitment,
@@ -48,6 +48,7 @@ import { SQLiteBackup } from './keystore/sqlite-backup.js';
 
 import { AuthNamespace } from './namespaces/auth.js';
 import { CustodyNamespace } from './namespaces/custody.js';
+import { MetaNamespace } from './namespaces/meta.js';
 import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
@@ -282,6 +283,8 @@ interface CachedPeerPrekeys {
   expireAt: number;
 }
 
+const PREKEY_FALLBACK_DEVICE_ID = 'aun_device_id';
+
 function isGroupServiceAid(value: JsonValue | object | undefined): boolean {
   const text = String(value ?? '').trim();
   if (!text.includes('.')) return false;
@@ -305,6 +308,48 @@ function isPeerPrekeyResponse(value: JsonValue | object | undefined): value is P
   const candidate = value as Partial<PeerPrekeyResponse>;
   if (typeof candidate.found !== 'boolean') return false;
   return candidate.prekey === undefined || isPeerPrekeyMaterial(candidate.prekey);
+}
+
+function normalizePeerPrekeys(prekeys: Array<JsonValue | object | undefined>): PrekeyMaterial[] {
+  const normalized: PrekeyMaterial[] = [];
+  for (const item of prekeys) {
+    if (!isPeerPrekeyMaterial(item)) continue;
+    const prekeyId = item.prekey_id.trim();
+    const publicKey = item.public_key.trim();
+    const signature = item.signature.trim();
+    if (!prekeyId || !publicKey || !signature) continue;
+    const deviceId = String((item as JsonObject).device_id ?? '').trim();
+    const certFingerprint = String(item.cert_fingerprint ?? '').trim().toLowerCase();
+    const candidate: PrekeyMaterial = {
+      ...item,
+      prekey_id: prekeyId,
+      public_key: publicKey,
+      signature,
+      device_id: deviceId,
+    };
+    if (certFingerprint) {
+      candidate.cert_fingerprint = certFingerprint;
+    } else {
+      delete candidate.cert_fingerprint;
+    }
+    normalized.push(candidate);
+  }
+  if (normalized.length === 0) return [];
+  if (normalized.length === 1) {
+    if (!String(normalized[0].device_id ?? '').trim()) {
+      normalized[0].device_id = PREKEY_FALLBACK_DEVICE_ID;
+    }
+    return normalized;
+  }
+  const seen = new Set<string>();
+  const filtered: PrekeyMaterial[] = [];
+  for (const item of normalized) {
+    const deviceId = String(item.device_id ?? '').trim();
+    if (!deviceId || deviceId === PREKEY_FALLBACK_DEVICE_ID || seen.has(deviceId)) continue;
+    seen.add(deviceId);
+    filtered.push(item);
+  }
+  return filtered;
 }
 
 function formatCaughtError(error: any): Error | string {
@@ -434,6 +479,8 @@ export class AUNClient {
   readonly auth: AuthNamespace;
   /** AID 托管命名空间 */
   readonly custody: CustodyNamespace;
+  /** Meta 命名空间（心跳、状态、信任根管理） */
+  readonly meta: MetaNamespace;
 
   /** 会话参数（重连用） */
   private _sessionParams: ConnectParams | null = null;
@@ -552,6 +599,7 @@ export class AUNClient {
 
     this.auth = new AuthNamespace(this);
     this.custody = new CustodyNamespace(this);
+    this.meta = new MetaNamespace(this);
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => this._onRawMessageReceived(data));
     // 群组消息推送：自动解密后 re-publish
@@ -722,6 +770,8 @@ export class AUNClient {
       if (encrypt) {
         return await this._sendEncrypted(p);
       }
+      delete p.protected_headers;
+      delete p.headers;
     }
 
     // 自动加密：group.send 默认加密（encrypt 默认 True）
@@ -731,6 +781,8 @@ export class AUNClient {
       if (encrypt) {
         return await this._sendGroupEncrypted(p);
       }
+      delete p.protected_headers;
+      delete p.headers;
     }
     if (method === 'group.thought.put') {
       const encrypt = p.encrypt ?? true;
@@ -927,6 +979,16 @@ export class AUNClient {
 
   // ── E2EE 加密发送 ────────────────────────────────────────
 
+  private _protectedHeadersFromParams(params: RpcParams): ProtectedHeadersInput {
+    const value = params.protected_headers ?? params.headers;
+    if (value == null) return null;
+    if (isJsonObject(value)) return value;
+    if (typeof value === 'object' && typeof (value as { toObject?: () => unknown }).toObject === 'function') {
+      return value as unknown as ProtectedHeadersInput;
+    }
+    return null;
+  }
+
   /** 自动加密并发送 P2P 消息 */
   private async _sendEncrypted(params: RpcParams): Promise<RpcResult> {
     const toAid = String(params.to ?? '');
@@ -938,6 +1000,7 @@ export class AUNClient {
       throw new ValidationError('message.send payload must be an object when encrypt=true');
     }
     const persistRequired = Boolean(params.persist_required || params.durable);
+    const protectedHeaders = this._protectedHeadersFromParams(params);
 
     // 惰性同步：首次发送 P2P 消息时先 pull 一次
     if (!this._p2pSynced) {
@@ -950,6 +1013,7 @@ export class AUNClient {
       payload,
       messageId,
       timestamp,
+      protectedHeaders,
     });
 
     if (recipientPrekeys.length <= 1 && selfSyncCopies.length === 0) {
@@ -960,6 +1024,7 @@ export class AUNClient {
         timestamp,
         prekey: recipientPrekeys[0],
         persistRequired,
+        protectedHeaders,
       });
     }
 
@@ -969,6 +1034,7 @@ export class AUNClient {
       messageId,
       timestamp,
       prekeys: recipientPrekeys,
+      protectedHeaders,
     });
     const sendParams: RpcParams = {
       to: toAid,
@@ -996,6 +1062,7 @@ export class AUNClient {
     timestamp: number;
     prekey?: PrekeyMaterial | null;
     persistRequired?: boolean;
+    protectedHeaders?: ProtectedHeadersInput;
   }): Promise<RpcResult> {
     let prekey = opts.prekey ?? null;
     if (!prekey) {
@@ -1010,6 +1077,7 @@ export class AUNClient {
       prekey,
       messageId: opts.messageId,
       timestamp: opts.timestamp,
+      protectedHeaders: opts.protectedHeaders,
     });
     this._ensureEncryptResult(opts.toAid, encryptResult);
 
@@ -1033,10 +1101,11 @@ export class AUNClient {
     messageId: string;
     timestamp: number;
     prekeys: PrekeyMaterial[];
+    protectedHeaders?: ProtectedHeadersInput;
   }): Promise<JsonObject[]> {
     const recipientCopies: JsonObject[] = [];
     const certCache = new Map<string, string>();
-    for (const prekey of opts.prekeys) {
+    for (const prekey of normalizePeerPrekeys(opts.prekeys)) {
       const deviceId = String((prekey as JsonObject).device_id ?? '').trim();
       const peerCertFingerprint = String(prekey.cert_fingerprint ?? '').trim().toLowerCase();
       const cacheKey = peerCertFingerprint || '__default__';
@@ -1052,6 +1121,7 @@ export class AUNClient {
         prekey,
         messageId: opts.messageId,
         timestamp: opts.timestamp,
+        protectedHeaders: opts.protectedHeaders,
       });
       this._ensureEncryptResult(opts.toAid, encryptResult);
       recipientCopies.push({
@@ -1096,12 +1166,13 @@ export class AUNClient {
     payload: JsonObject;
     messageId: string;
     timestamp: number;
+    protectedHeaders?: ProtectedHeadersInput;
   }): Promise<JsonObject[]> {
     const myAid = this._aid;
     if (!myAid) {
       return [];
     }
-    const prekeys = await this._fetchPeerPrekeys(myAid);
+    const prekeys = normalizePeerPrekeys(await this._fetchPeerPrekeys(myAid));
     if (prekeys.length === 0) {
       return [];
     }
@@ -1121,6 +1192,7 @@ export class AUNClient {
         prekey,
         messageId: opts.messageId,
         timestamp: opts.timestamp,
+        protectedHeaders: opts.protectedHeaders,
       });
       this._ensureEncryptResult(myAid, encryptResult);
       copies.push({
@@ -1138,6 +1210,8 @@ export class AUNClient {
     prekey?: PrekeyMaterial | null;
     messageId: string;
     timestamp: number;
+    protectedHeaders?: ProtectedHeadersInput;
+    context?: JsonObject | null;
   }): [JsonObject, JsonObject] {
     const [envelope, encryptResult] = this._e2ee.encryptOutbound(
       opts.logicalToAid,
@@ -1146,6 +1220,8 @@ export class AUNClient {
       opts.prekey ?? null,
       opts.messageId,
       opts.timestamp,
+      opts.protectedHeaders,
+      opts.context ?? null,
     ) as [JsonObject, JsonObject];
     return [envelope, encryptResult];
   }
@@ -1183,7 +1259,7 @@ export class AUNClient {
     return await this._callGroupEncryptedRpc('group.thought.put', params, {
       idField: 'thought_id',
       idPrefix: 'gt',
-      extraFields: ['reply_to'],
+      extraFields: ['context'],
     });
   }
 
@@ -1209,6 +1285,8 @@ export class AUNClient {
       prekey,
       messageId: thoughtId,
       timestamp,
+      protectedHeaders: this._protectedHeadersFromParams(params),
+      context: isJsonObject(params.context) ? params.context : null,
     });
     this._ensureEncryptResult(toAid, encryptResult);
     const sendParams: RpcParams = {
@@ -1218,8 +1296,8 @@ export class AUNClient {
       encrypted: true,
       thought_id: thoughtId,
       timestamp,
-      reply_to: params.reply_to,
     };
+    if ('context' in params) sendParams.context = params.context;
     this._signClientOperation('message.thought.put', sendParams);
     return await this._transport.call('message.thought.put', sendParams);
   }
@@ -1269,16 +1347,31 @@ export class AUNClient {
 
     const epochResult = await this._committedGroupEpochState(groupId);
     const committedEpoch = Number(epochResult.committed_epoch ?? epochResult.epoch ?? 0);
+    const operationId = String(params[options.idField] ?? '').trim()
+      || `${options.idPrefix}-${crypto.randomUUID()}`;
+    const timestamp = Number(params.timestamp ?? Date.now());
+    const protectedHeaders = this._protectedHeadersFromParams(params);
+    const context = method === 'group.thought.put' && isJsonObject(params.context)
+      ? params.context
+      : null;
     const envelope = committedEpoch > 0
       ? this._groupE2ee.encryptWithEpoch(
         groupId,
         await this._ensureCommittedGroupSecretForSend(groupId, committedEpoch, epochResult),
         payload,
+        {
+          messageId: operationId,
+          timestamp,
+          protectedHeaders,
+          context,
+        },
       )
-      : await this._groupE2ee.encrypt(groupId, payload);
-    const operationId = String(params[options.idField] ?? '').trim()
-      || `${options.idPrefix}-${crypto.randomUUID()}`;
-    const timestamp = Number(params.timestamp ?? Date.now());
+      : await this._groupE2ee.encrypt(groupId, payload, {
+        messageId: operationId,
+        timestamp,
+        protectedHeaders,
+        context,
+      });
     const sendParams: RpcParams = {
       group_id: groupId,
       payload: envelope,
@@ -2718,10 +2811,16 @@ export class AUNClient {
   private async _fetchPeerPrekeys(peerAid: string): Promise<PrekeyMaterial[]> {
     const cachedList = this._peerPrekeysCache.get(peerAid);
     if (cachedList && Date.now() / 1000 < cachedList.expireAt) {
-      return cachedList.items.map((item) => ({ ...item }));
+      const normalized = normalizePeerPrekeys(cachedList.items);
+      if (normalized.length > 0) {
+        return normalized.map((item) => ({ ...item }));
+      }
     }
     const cached = this._e2ee.getCachedPrekey(peerAid);
-    if (cached !== null) return [{ ...cached }];
+    if (cached !== null) {
+      const normalized = normalizePeerPrekeys([cached]);
+      if (normalized.length > 0) return normalized.map((item) => ({ ...item }));
+    }
 
     try {
       const result = await this._transport.call('message.e2ee.get_prekey', { aid: peerAid });
@@ -2734,13 +2833,7 @@ export class AUNClient {
 
       const devicePrekeys = Array.isArray(result.device_prekeys) ? result.device_prekeys : null;
       if (devicePrekeys) {
-        const normalized: PrekeyMaterial[] = [];
-        for (const item of devicePrekeys) {
-          if (!isPeerPrekeyMaterial(item)) {
-            continue;
-          }
-          normalized.push({ ...item });
-        }
+        const normalized = normalizePeerPrekeys(devicePrekeys);
         if (normalized.length > 0) {
           this._peerPrekeysCache.set(peerAid, {
             items: normalized.map((item) => ({ ...item })),
@@ -2756,12 +2849,15 @@ export class AUNClient {
       }
       const prekey = result.prekey;
       if (prekey) {
-        this._peerPrekeysCache.set(peerAid, {
-          items: [{ ...prekey }],
-          expireAt: Date.now() / 1000 + 300,
-        });
-        this._e2ee.cachePrekey(peerAid, prekey);
-        return [{ ...prekey }];
+        const normalized = normalizePeerPrekeys([prekey]);
+        if (normalized.length > 0) {
+          this._peerPrekeysCache.set(peerAid, {
+            items: normalized.map((item) => ({ ...item })),
+            expireAt: Date.now() / 1000 + 300,
+          });
+          this._e2ee.cachePrekey(peerAid, normalized[0]);
+          return normalized.map((item) => ({ ...item }));
+        }
       }
       if (result.found) {
         throw new ValidationError(`invalid prekey response for ${peerAid}`);
@@ -2781,7 +2877,10 @@ export class AUNClient {
   private async _fetchPeerPrekey(peerAid: string): Promise<PrekeyMaterial | null> {
     const cachedList = this._peerPrekeysCache.get(peerAid);
     if (cachedList && Date.now() / 1000 < cachedList.expireAt && cachedList.items.length > 0) {
-      return { ...cachedList.items[0] };
+      const normalized = normalizePeerPrekeys(cachedList.items);
+      if (normalized.length > 0) {
+        return { ...normalized[0] };
+      }
     }
     const prekeys = await this._fetchPeerPrekeys(peerAid);
     if (prekeys.length === 0) {
@@ -3168,14 +3267,15 @@ export class AUNClient {
         this._enqueuePendingDecrypt(groupId, message);
         continue;
       }
-      thoughts.push({
+      const thought: JsonObject = {
         thought_id: thoughtId,
         message_id: thoughtId,
-        reply_to: item.reply_to,
         payload: decrypted.payload,
         created_at: item.created_at,
         e2ee: decrypted.e2ee,
-      });
+      };
+      if ('context' in item) thought.context = item.context;
+      thoughts.push(thought);
     }
     return { ...result, thoughts };
   }
@@ -3221,16 +3321,17 @@ export class AUNClient {
           continue;
         }
       }
-      thoughts.push({
+      const thought: JsonObject = {
         thought_id: thoughtId,
         message_id: thoughtId,
-        reply_to: item.reply_to,
         from: fromAid,
         to: toAid,
         payload: decrypted.payload,
         created_at: item.created_at,
         e2ee: decrypted.e2ee,
-      });
+      };
+      if ('context' in item) thought.context = item.context;
+      thoughts.push(thought);
     }
     return { ...result, thoughts };
   }
@@ -4384,10 +4485,12 @@ export class AUNClient {
       method === 'group.thought.put' || method === 'group.thought.get'
       || method === 'message.thought.put' || method === 'message.thought.get'
     ) {
-      const replyTo = isJsonObject(params.reply_to) ? params.reply_to : null;
-      const replyMsgId = String(replyTo?.message_id ?? '').trim();
-      if (!replyMsgId) {
-        throw new ValidationError(`${method} requires reply_to.message_id`);
+      const context = isJsonObject(params.context) ? params.context : null;
+      const contextType = String(context?.type ?? '').trim();
+      const contextId = String(context?.id ?? '').trim();
+      const hasContext = contextType.length > 0 && contextId.length > 0;
+      if (!hasContext) {
+        throw new ValidationError(`${method} requires context.type + context.id`);
       }
     }
     if (method === 'group.thought.get' && !String(params.sender_aid ?? '').trim()) {

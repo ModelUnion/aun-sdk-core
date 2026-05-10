@@ -1036,6 +1036,61 @@ func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
 	}
 }
 
+func TestCallDoesNotForwardPlaintextMessageProtectedHeaders(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "auth.connect" {
+			return map[string]any{"status": "ok"}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{
+		"aun_path": t.TempDir(),
+	})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	headers, err := NewProtectedHeaders(map[string]any{"Device_ID": "dev-a", "slot_id": "slot-a"})
+	if err != nil {
+		t.Fatalf("创建 protected headers 失败: %v", err)
+	}
+	if _, err := c.Call(ctx, "message.send", map[string]any{
+		"to":                "bob.example.com",
+		"payload":           map[string]any{"type": "text", "text": "hello"},
+		"encrypt":           false,
+		"protected_headers": headers,
+		"headers":           map[string]any{"device_id": "dev-b"},
+	}); err != nil {
+		t.Fatalf("message.send 失败: %v", err)
+	}
+
+	var sendCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.send" {
+			callCopy := call
+			sendCall = &callCopy
+		}
+	}
+	if sendCall == nil {
+		t.Fatal("未捕获 message.send")
+	}
+	if _, exists := sendCall.Params["protected_headers"]; exists {
+		t.Fatalf("message.send 不应转发 protected_headers: %#v", sendCall.Params)
+	}
+	if _, exists := sendCall.Params["headers"]; exists {
+		t.Fatalf("message.send 不应转发 headers: %#v", sendCall.Params)
+	}
+}
+
 func TestCallRejectsMessageSlotContextOverride(t *testing.T) {
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		if method == "auth.connect" {
@@ -1094,6 +1149,69 @@ func TestParsePeerPrekeyResponseSemantics(t *testing.T) {
 	}
 	if _, err := parsePeerPrekeyResponse("bob.example.com", map[string]any{"found": true}, nil); err == nil {
 		t.Fatal("非法响应应返回错误")
+	}
+}
+
+func TestNormalizePeerPrekeysSingleEmptyFallback(t *testing.T) {
+	prekeys := normalizePeerPrekeys([]map[string]any{
+		{
+			"device_id":  "",
+			"prekey_id":  "pk-legacy",
+			"public_key": "pub-legacy",
+			"signature":  "sig-legacy",
+		},
+	})
+	if len(prekeys) != 1 {
+		t.Fatalf("单条空 device_id 应保留 1 条: %#v", prekeys)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(prekeys[0]["device_id"])); got != "aun_device_id" {
+		t.Fatalf("单条空 device_id 应回退到固定值: %q", got)
+	}
+}
+
+func TestNormalizePeerPrekeysFiltersEmptyInMulti(t *testing.T) {
+	prekeys := normalizePeerPrekeys([]map[string]any{
+		{
+			"device_id":  "",
+			"prekey_id":  "pk-empty",
+			"public_key": "pub-empty",
+			"signature":  "sig-empty",
+		},
+		{
+			"device_id":  "device-b",
+			"prekey_id":  "pk-b",
+			"public_key": "pub-b",
+			"signature":  "sig-b",
+		},
+	})
+	if len(prekeys) != 1 {
+		t.Fatalf("多条中空 device_id 应被过滤: %#v", prekeys)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(prekeys[0]["device_id"])); got != "device-b" {
+		t.Fatalf("多条中应保留非空 device_id: %q", got)
+	}
+}
+
+func TestNormalizePeerPrekeysFiltersFallbackInMulti(t *testing.T) {
+	prekeys := normalizePeerPrekeys([]map[string]any{
+		{
+			"device_id":  prekeyFallbackDeviceID,
+			"prekey_id":  "pk-legacy",
+			"public_key": "pub-legacy",
+			"signature":  "sig-legacy",
+		},
+		{
+			"device_id":  "device-b",
+			"prekey_id":  "pk-b",
+			"public_key": "pub-b",
+			"signature":  "sig-b",
+		},
+	})
+	if len(prekeys) != 1 {
+		t.Fatalf("多条中 fallback device_id 应被过滤: %#v", prekeys)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(prekeys[0]["device_id"])); got != "device-b" {
+		t.Fatalf("多条中应保留真实 device_id: %q", got)
 	}
 }
 
@@ -1274,6 +1392,37 @@ func TestOnEventSubscription(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if received.Load() != "hello" {
 		t.Errorf("收到的 payload 不正确: %v", received.Load())
+	}
+}
+
+// TestOff 验证 Off/Unsubscribe 取消事件订阅
+func TestOff(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	var count atomic.Int32
+	sub := c.On("test.off", func(payload any) {
+		count.Add(1)
+	})
+	if sub == nil {
+		t.Fatal("On 应返回 Subscription")
+	}
+
+	// 第一次发布，handler 应触发
+	c.events.Publish("test.off", nil)
+	time.Sleep(50 * time.Millisecond)
+	if count.Load() != 1 {
+		t.Fatalf("取消前 handler 应触发 1 次，实际 %d", count.Load())
+	}
+
+	// 取消订阅
+	sub.Unsubscribe()
+
+	// 第二次发布，handler 不应触发
+	c.events.Publish("test.off", nil)
+	time.Sleep(50 * time.Millisecond)
+	if count.Load() != 1 {
+		t.Fatalf("取消后 handler 不应再触发，实际 %d", count.Load())
 	}
 }
 
@@ -1582,7 +1731,7 @@ func TestPutGroupThoughtEncryptedSignsAndEncrypts(t *testing.T) {
 
 	if _, err := c.Call(ctx, "group.thought.put", map[string]any{
 		"group_id": groupID,
-		"reply_to": map[string]any{"message_id": "gm-root"},
+		"context":  map[string]any{"type": "run", "id": "run-root"},
 		"payload":  map[string]any{"type": "thought", "text": "推理片段"},
 	}); err != nil {
 		t.Fatalf("group.thought.put 失败: %v", err)
@@ -1607,6 +1756,34 @@ func TestPutGroupThoughtEncryptedSignsAndEncrypts(t *testing.T) {
 	}
 	if thoughtID, _ := thoughtCall.Params["thought_id"].(string); !strings.HasPrefix(thoughtID, "gt-") {
 		t.Fatalf("group.thought.put 应生成 gt- thought_id: %#v", thoughtCall.Params)
+	}
+	if contextSelector, _ := thoughtCall.Params["context"].(map[string]any); contextSelector["id"] != "run-root" {
+		t.Fatalf("group.thought.put 应透传 context: %#v", thoughtCall.Params)
+	}
+
+	if _, err := c.Call(ctx, "group.thought.put", map[string]any{
+		"group_id": groupID,
+		"context":  map[string]any{"type": "run", "id": "run-1"},
+		"payload":  map[string]any{"type": "thought", "text": "自主推理片段"},
+	}); err != nil {
+		t.Fatalf("group.thought.put context 失败: %v", err)
+	}
+
+	thoughtCall = nil
+	for _, call := range getCalls() {
+		if call.Method == "group.thought.put" {
+			captured := call
+			thoughtCall = &captured
+		}
+	}
+	if thoughtCall == nil {
+		t.Fatal("未捕获 context group.thought.put")
+	}
+	if contextSelector, _ := thoughtCall.Params["context"].(map[string]any); contextSelector["id"] != "run-1" {
+		t.Fatalf("group.thought.put 应透传 context: %#v", thoughtCall.Params)
+	}
+	if _, ok := thoughtCall.Params["reply_to"]; ok {
+		t.Fatalf("group.thought.put context 场景不应发送 reply_to: %#v", thoughtCall.Params)
 	}
 }
 
@@ -1656,9 +1833,9 @@ func TestPutMessageThoughtEncryptedSignsAndEncrypts(t *testing.T) {
 	}
 
 	if _, err := c.Call(ctx, "message.thought.put", map[string]any{
-		"to":       bobAID,
-		"reply_to": map[string]any{"message_id": "msg-root"},
-		"payload":  map[string]any{"type": "thought", "text": "推理片段"},
+		"to":      bobAID,
+		"context": map[string]any{"type": "run", "id": "run-root"},
+		"payload": map[string]any{"type": "thought", "text": "推理片段"},
 	}); err != nil {
 		t.Fatalf("message.thought.put 失败: %v", err)
 	}
@@ -1683,8 +1860,48 @@ func TestPutMessageThoughtEncryptedSignsAndEncrypts(t *testing.T) {
 	if thoughtID, _ := thoughtCall.Params["thought_id"].(string); !strings.HasPrefix(thoughtID, "mt-") {
 		t.Fatalf("message.thought.put 应生成 mt- thought_id: %#v", thoughtCall.Params)
 	}
-	if replyTo, _ := thoughtCall.Params["reply_to"].(map[string]any); replyTo["message_id"] != "msg-root" {
-		t.Fatalf("message.thought.put 应透传 reply_to: %#v", thoughtCall.Params)
+	if contextSelector, _ := thoughtCall.Params["context"].(map[string]any); contextSelector["id"] != "run-root" {
+		t.Fatalf("message.thought.put 应透传 context: %#v", thoughtCall.Params)
+	}
+
+	if _, err := c.Call(ctx, "message.thought.put", map[string]any{
+		"to":      bobAID,
+		"context": map[string]any{"type": "run", "id": "run-1"},
+		"payload": map[string]any{"type": "thought", "text": "自主推理片段"},
+	}); err != nil {
+		t.Fatalf("message.thought.put context 失败: %v", err)
+	}
+
+	thoughtCall = nil
+	for _, call := range getCalls() {
+		if call.Method == "message.thought.put" {
+			captured := call
+			thoughtCall = &captured
+		}
+	}
+	if thoughtCall == nil {
+		t.Fatal("未捕获 context message.thought.put")
+	}
+	if contextSelector, _ := thoughtCall.Params["context"].(map[string]any); contextSelector["id"] != "run-1" {
+		t.Fatalf("message.thought.put 应透传 context: %#v", thoughtCall.Params)
+	}
+	if _, ok := thoughtCall.Params["reply_to"]; ok {
+		t.Fatalf("message.thought.put context 场景不应发送 reply_to: %#v", thoughtCall.Params)
+	}
+}
+
+func TestThoughtSelectorValidation(t *testing.T) {
+	c := NewClient(nil)
+	valid := map[string]any{
+		"to":      "bob.example.com",
+		"context": map[string]any{"type": "run", "id": "run-1"},
+	}
+	if err := c.validateOutboundCall("message.thought.put", valid); err != nil {
+		t.Fatalf("context selector 应通过校验: %v", err)
+	}
+	missing := map[string]any{"to": "bob.example.com"}
+	if err := c.validateOutboundCall("message.thought.put", missing); err == nil || !strings.Contains(err.Error(), "context.type") {
+		t.Fatalf("缺少 context selector 应报 context.type，实际: %v", err)
 	}
 }
 
@@ -1721,11 +1938,11 @@ func TestGroupThoughtGetAutoDecrypts(t *testing.T) {
 				"found":      true,
 				"group_id":   groupID,
 				"sender_aid": aliceAID,
-				"reply_to":   map[string]any{"message_id": "gm-root"},
+				"context":    map[string]any{"type": "run", "id": "run-root"},
 				"thoughts": []any{
 					map[string]any{
 						"thought_id": "gt-1",
-						"reply_to":   map[string]any{"message_id": "gm-root"},
+						"context":    map[string]any{"type": "run", "id": "run-root"},
 						"payload":    envelope,
 						"created_at": int64(1710504000000),
 					},
@@ -1766,7 +1983,7 @@ func TestGroupThoughtGetAutoDecrypts(t *testing.T) {
 	result, err := c.Call(ctx, "group.thought.get", map[string]any{
 		"group_id":   groupID,
 		"sender_aid": aliceAID,
-		"reply_to":   map[string]any{"message_id": "gm-root"},
+		"context":    map[string]any{"type": "run", "id": "run-root"},
 	})
 	if err != nil {
 		t.Fatalf("group.thought.get 失败: %v", err)

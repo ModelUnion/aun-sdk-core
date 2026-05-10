@@ -12,7 +12,7 @@
 | [02-WebSocket协议](02-WebSocket协议.md) | 握手流程 · 消息格式 · 裸 WebSocket 示例 |
 | [03-核心概念](03-核心概念.md) | AID · 连接状态机 · 认证流程 · E2EE |
 | [04-连接与认证](04-连接与认证.md) | 创建AID · 连接网关 · 网关发现 · 调用RPC · 事件订阅 |
-| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · 会话管理 · 自定义密钥存储 |
+| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · ProtectedHeaders · 会话管理 · 自定义密钥存储 |
 | [GROUP-E2EE轮换竞态清单](GROUP-E2EE轮换竞态清单.md) | GROUP epoch key 轮换状态 · 竞态条件 · 补测清单 |
 | [GROUP-E2EE现状对比与改进建议](GROUP-E2EE现状对比与改进建议.md) | 当前 GROUP E2EE 实现定位 · 成熟方案对比 · 风险边界 · 分阶段改进建议 |
 | [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · MetaNamespace（信任根列表 / issuer root 更新） · E2EEManager · 内置事件 · RPC手册索引 |
@@ -104,7 +104,7 @@ SDK 的核心抽象。AID 域名格式身份及本地密钥对管理；连接状
 SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数（含自动重连、心跳、令牌刷新）；`client.call()` RPC 调用模式；`client.on()` 事件订阅。
 
 ### 05-E2EE加密通信
-E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
+E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；`protected_headers` 与可验证 `context` 元数据；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
 
 ### GROUP-E2EE轮换竞态清单
 GROUP epoch key 两阶段轮换的状态边界和竞态检查项。覆盖 pending 期间成员变更、leader 竞争、分发/ack/commit 失败、stale pending、key recovery、旧 epoch 保留等场景，用于补充测试和实现审查。

@@ -394,17 +394,28 @@ class TestGroupThoughtE2EE:
 
         asyncio.run(client.call("group.thought.put", {
             "group_id": _GRP,
-            "reply_to": {"message_id": "gm-root"},
+            "context": {"type": "run", "id": "run-root"},
             "payload": {"type": "thought", "text": "推理片段"},
         }))
 
         assert sent_params["method"] == "group.thought.put"
         params = sent_params["params"]
-        assert params["reply_to"]["message_id"] == "gm-root"
+        assert params["context"] == {"type": "run", "id": "run-root"}
         assert params["encrypted"] is True
         assert params["payload"]["type"] == "e2ee.group_encrypted"
         assert params["thought_id"].startswith("gt-")
         assert "client_signature" in params
+
+        asyncio.run(client.call("group.thought.put", {
+            "group_id": _GRP,
+            "context": {"type": "run", "id": "run-1"},
+            "payload": {"type": "thought", "text": "自主推理片段"},
+        }))
+
+        params = sent_params["params"]
+        assert params["context"] == {"type": "run", "id": "run-1"}
+        assert "reply_to" not in params
+        assert params["encrypted"] is True
 
     def test_group_thought_get_auto_decrypts(self, tmp_path, monkeypatch):
         alice = _make_client(tmp_path, aid=_AID_ALICE)
@@ -425,11 +436,11 @@ class TestGroupThoughtE2EE:
                 "found": True,
                 "group_id": _GRP,
                 "sender_aid": _AID_ALICE,
-                "reply_to": {"message_id": "gm-root"},
+                "context": {"type": "run", "id": "run-root"},
                 "thoughts": [
                     {
                         "thought_id": "gt-1",
-                        "reply_to": {"message_id": "gm-root"},
+                        "context": {"type": "run", "id": "run-root"},
                         "payload": envelope,
                         "created_at": 1710504000000,
                     }
@@ -441,7 +452,7 @@ class TestGroupThoughtE2EE:
         result = asyncio.run(bob.call("group.thought.get", {
             "group_id": _GRP,
             "sender_aid": _AID_ALICE,
-            "reply_to": {"message_id": "gm-root"},
+            "context": {"type": "run", "id": "run-root"},
         }))
 
         assert result["found"] is True

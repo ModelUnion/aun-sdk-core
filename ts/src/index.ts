@@ -90,13 +90,16 @@ export { GatewayDiscovery } from './discovery.js';
 // ── 认证流程 ─────────────────────────────────────────────────
 export { AuthFlow } from './auth.js';
 export { CustodyNamespace } from './namespaces/custody.js';
+export { MetaNamespace } from './namespaces/meta.js';
 
 // ── E2EE ─────────────────────────────────────────────────────
 export {
   E2EEManager,
+  ProtectedHeaders,
   SUITE, MODE_PREKEY_ECDH_V2, MODE_LONG_TERM_KEY,
-  AAD_FIELDS_OFFLINE, AAD_MATCH_FIELDS_OFFLINE,
+  AAD_FIELDS_OFFLINE, AAD_MATCH_FIELDS_OFFLINE, AAD_OPTIONAL_FIELDS,
 } from './e2ee.js';
+export type { ProtectedHeadersInput } from './e2ee.js';
 export {
   GroupE2EEManager,
   GroupReplayGuard,

@@ -12,7 +12,7 @@
 | [02-WebSocket协议](02-WebSocket协议.md) | 握手流程 · 消息格式 · 裸 WebSocket 示例 |
 | [03-核心概念](03-核心概念.md) | AID · 连接状态机 · 认证流程 · E2EE |
 | [04-连接与认证](04-连接与认证.md) | 创建AID · 连接网关 · 网关发现 · 调用RPC · 事件订阅 |
-| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · 会话管理 · 自定义密钥存储 |
+| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · ProtectedHeaders · 会话管理 · 自定义密钥存储 |
 | [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · MetaNamespace（信任根列表 / issuer root 更新） · E2EEManager · 内置事件 · RPC手册索引 |
 | [07-错误处理](07-错误处理.md) | 错误类层级 · 错误码速查 · 重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等初始化 · 多AID隔离 · 环境变量 · 资源清理 |
@@ -96,7 +96,7 @@ SDK 的核心抽象。AID 域名格式身份及本地密钥对管理；连接状
 SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数（含自动重连、心跳、令牌刷新）；`client.call()` RPC 调用模式；`client.on()` 事件订阅。
 
 ### 05-E2EE加密通信
-E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
+E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；`protected_headers` 与可验证 `context` 元数据；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
 
 ### 06-API手册
 完整 API 文档。AUNClient 构造函数/属性/方法；AuthNamespace 方法；E2EEManager 方法；内置事件列表；RPC 手册索引。

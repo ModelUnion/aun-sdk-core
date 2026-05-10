@@ -220,6 +220,7 @@ var signedMethods = map[string]bool{
 
 // 对端证书缓存 TTL（秒）
 const peerCertCacheTTL = 600
+const prekeyFallbackDeviceID = "aun_device_id"
 
 // P1-23: 非幂等方法使用更长超时（35s），避免 SDK 10s 超时 < gateway 30s 处理时间
 const nonIdempotentTimeout = 35 * time.Second
@@ -353,6 +354,8 @@ type AUNClient struct {
 	Auth *namespace.AuthNamespace
 	// AID 托管命名空间
 	Custody *namespace.CustodyNamespace
+	// Meta 命名空间
+	Meta *namespace.MetaNamespace
 
 	// 调试日志
 	logger *AUNLogger
@@ -483,6 +486,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	// Auth 命名空间
 	c.Auth = namespace.NewAuthNamespace(c)
 	c.Custody = namespace.NewCustodyNamespace(c)
+	c.Meta = namespace.NewMetaNamespace(c)
 
 	// 订阅内部事件：推送消息自动解密后 re-publish
 	events.Subscribe("_raw.message.received", func(payload any) {
@@ -582,6 +586,28 @@ func (c *AUNClient) GetConfigVerifySSL() bool {
 	return c.configModel.VerifySSL
 }
 
+// GetKeyStoreRootPath 返回密钥存储根目录路径
+func (c *AUNClient) GetKeyStoreRootPath() string {
+	return c.configModel.AUNPath
+}
+
+// GetTrustRootStore 返回支持信任根持久化的 keystore 扩展。
+func (c *AUNClient) GetTrustRootStore() keystore.TrustRootStore {
+	store, ok := c.keyStore.(keystore.TrustRootStore)
+	if !ok {
+		return nil
+	}
+	return store
+}
+
+// ReloadTrustedRoots 重新加载 AuthFlow 信任根缓存。
+func (c *AUNClient) ReloadTrustedRoots() int {
+	if c.auth == nil {
+		return 0
+	}
+	return c.auth.ReloadTrustedRoots()
+}
+
 // AuthCreateAID 通过 AuthFlow 创建 AID
 func (c *AUNClient) AuthCreateAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
 	return c.auth.CreateAID(ctx, gatewayURL, aid)
@@ -595,6 +621,11 @@ func (c *AUNClient) AuthAuthenticate(ctx context.Context, gatewayURL, aid string
 // AuthLoadIdentityOrNil 通过 AuthFlow 加载身份，不存在返回 nil
 func (c *AUNClient) AuthLoadIdentityOrNil(aid string) map[string]any {
 	return c.auth.LoadIdentityOrNil(aid)
+}
+
+// AuthFetchPeerCert 通过 AuthFlow 获取并验证对端证书。
+func (c *AUNClient) AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error) {
+	return c.fetchPeerCert(ctx, aid, certFingerprint)
 }
 
 // DiscoverGateway 通过 GatewayDiscovery 发现 Gateway URL
@@ -867,6 +898,8 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		if encrypt {
 			return c.sendEncrypted(ctx, params)
 		}
+		delete(params, "protected_headers")
+		delete(params, "headers")
 	}
 
 	// 自动加密：group.send 默认加密
@@ -881,6 +914,8 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		if encrypt {
 			return c.sendGroupEncrypted(ctx, params)
 		}
+		delete(params, "protected_headers")
+		delete(params, "headers")
 	}
 	if method == "group.thought.put" {
 		encrypt := true
@@ -1156,6 +1191,16 @@ func (c *AUNClient) signClientOperation(method string, params map[string]any) {
 
 // ── 自动加密发送 ────────────────────────────────────────────
 
+func (c *AUNClient) protectedHeadersFromParams(params map[string]any) any {
+	if value, ok := params["protected_headers"]; ok {
+		return value
+	}
+	if value, ok := params["headers"]; ok {
+		return value
+	}
+	return nil
+}
+
 // sendEncrypted 自动加密并发送 P2P 消息
 func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (any, error) {
 	toAID, _ := params["to"].(string)
@@ -1175,6 +1220,7 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 		timestamp = time.Now().UnixMilli()
 	}
 	persistRequired := truthyBool(params["persist_required"]) || truthyBool(params["durable"])
+	encryptOpts := E2EEEncryptOptions{ProtectedHeaders: c.protectedHeadersFromParams(params)}
 
 	// 惰性同步：首次发送 P2P 消息时先 pull 一次，确保 seq 状态就绪
 	c.p2pSyncedMu.Lock()
@@ -1188,7 +1234,7 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	selfSyncCopies, err := c.buildSelfSyncCopies(ctx, toAID, payload, messageID, timestamp)
+	selfSyncCopies, err := c.buildSelfSyncCopies(ctx, toAID, payload, messageID, timestamp, encryptOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1197,9 +1243,9 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (a
 		if len(recipientPrekeys) == 1 {
 			prekey = recipientPrekeys[0]
 		}
-		return c.sendEncryptedSingle(ctx, toAID, payload, messageID, timestamp, prekey, persistRequired)
+		return c.sendEncryptedSingle(ctx, toAID, payload, messageID, timestamp, prekey, persistRequired, encryptOpts)
 	}
-	recipientCopies, err := c.buildRecipientDeviceCopies(ctx, toAID, payload, messageID, timestamp, recipientPrekeys)
+	recipientCopies, err := c.buildRecipientDeviceCopies(ctx, toAID, payload, messageID, timestamp, recipientPrekeys, encryptOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1234,6 +1280,7 @@ func (c *AUNClient) sendEncryptedSingle(
 	timestamp int64,
 	prekey map[string]any,
 	persistRequired bool,
+	encryptOpts E2EEEncryptOptions,
 ) (any, error) {
 	var err error
 	if prekey == nil {
@@ -1247,7 +1294,7 @@ func (c *AUNClient) sendEncryptedSingle(
 	if err != nil {
 		return nil, err
 	}
-	envelope, encryptResult, err := c.encryptCopyPayload(toAID, payload, peerCertPEM, prekey, messageID, timestamp)
+	envelope, encryptResult, err := c.encryptCopyPayload(toAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1280,11 +1327,18 @@ func (c *AUNClient) buildRecipientDeviceCopies(
 	messageID string,
 	timestamp int64,
 	prekeys []map[string]any,
+	encryptOpts E2EEEncryptOptions,
 ) ([]map[string]any, error) {
+	prekeys = normalizePeerPrekeys(prekeys)
 	recipientCopies := make([]map[string]any, 0, len(prekeys))
 	certCache := make(map[string][]byte)
 	for _, prekey := range prekeys {
-		deviceID := strings.TrimSpace(fmt.Sprint(prekey["device_id"]))
+		deviceID := strings.TrimSpace(getStr(prekey, "device_id", ""))
+		if deviceID == "" {
+			log.Printf("[aun_core] 跳过空 device_id 的 recipient prekey (to=%s, prekey_id=%s)",
+				toAID, getStr(prekey, "prekey_id", ""))
+			continue
+		}
 		peerCertFingerprint := strings.TrimSpace(strings.ToLower(getStr(prekey, "cert_fingerprint", "")))
 		cacheKey := peerCertFingerprint
 		if cacheKey == "" {
@@ -1299,7 +1353,7 @@ func (c *AUNClient) buildRecipientDeviceCopies(
 			}
 			certCache[cacheKey] = peerCertPEM
 		}
-		envelope, encryptResult, err := c.encryptCopyPayload(toAID, payload, peerCertPEM, prekey, messageID, timestamp)
+		envelope, encryptResult, err := c.encryptCopyPayload(toAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -1356,6 +1410,7 @@ func (c *AUNClient) buildSelfSyncCopies(
 	payload map[string]any,
 	messageID string,
 	timestamp int64,
+	encryptOpts E2EEEncryptOptions,
 ) ([]map[string]any, error) {
 	c.mu.RLock()
 	myAID := c.aid
@@ -1368,9 +1423,15 @@ func (c *AUNClient) buildSelfSyncCopies(
 	if err != nil {
 		return nil, err
 	}
+	prekeys = normalizePeerPrekeys(prekeys)
 	copies := make([]map[string]any, 0)
 	for _, prekey := range prekeys {
-		deviceID := strings.TrimSpace(fmt.Sprint(prekey["device_id"]))
+		deviceID := strings.TrimSpace(getStr(prekey, "device_id", ""))
+		if deviceID == "" {
+			log.Printf("[aun_core] 跳过空 device_id 的 self sync prekey (aid=%s, logical_to=%s, prekey_id=%s)",
+				myAID, logicalToAID, getStr(prekey, "prekey_id", ""))
+			continue
+		}
 		if deviceID != "" && deviceID == currentDeviceID {
 			continue
 		}
@@ -1378,7 +1439,7 @@ func (c *AUNClient) buildSelfSyncCopies(
 		if err != nil {
 			return nil, err
 		}
-		envelope, encryptResult, err := c.encryptCopyPayload(logicalToAID, payload, peerCertPEM, prekey, messageID, timestamp)
+		envelope, encryptResult, err := c.encryptCopyPayload(logicalToAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -1400,8 +1461,9 @@ func (c *AUNClient) encryptCopyPayload(
 	prekey map[string]any,
 	messageID string,
 	timestamp int64,
+	encryptOpts E2EEEncryptOptions,
 ) (map[string]any, map[string]any, error) {
-	return c.e2ee.EncryptOutbound(logicalToAID, payload, peerCertPEM, prekey, messageID, timestamp)
+	return c.e2ee.EncryptOutbound(logicalToAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
 }
 
 func (c *AUNClient) ensureEncryptResult(toAID string, encryptResult map[string]any) error {
@@ -1434,7 +1496,7 @@ func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]an
 }
 
 func (c *AUNClient) putGroupThoughtEncrypted(ctx context.Context, params map[string]any) (any, error) {
-	return c.callGroupEncryptedRPC(ctx, "group.thought.put", params, "thought_id", "gt", []string{"reply_to"})
+	return c.callGroupEncryptedRPC(ctx, "group.thought.put", params, "thought_id", "gt", []string{"context"})
 }
 
 func (c *AUNClient) putMessageThoughtEncrypted(ctx context.Context, params map[string]any) (any, error) {
@@ -1467,7 +1529,11 @@ func (c *AUNClient) putMessageThoughtEncrypted(ctx context.Context, params map[s
 	if err != nil {
 		return nil, err
 	}
-	envelope, encryptResult, err := c.encryptCopyPayload(toAID, payload, peerCertPEM, prekey, thoughtID, timestamp)
+	context, _ := params["context"].(map[string]any)
+	envelope, encryptResult, err := c.encryptCopyPayload(
+		toAID, payload, peerCertPEM, prekey, thoughtID, timestamp,
+		E2EEEncryptOptions{ProtectedHeaders: c.protectedHeadersFromParams(params), Context: context},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1481,7 +1547,9 @@ func (c *AUNClient) putMessageThoughtEncrypted(ctx context.Context, params map[s
 		"encrypted":  true,
 		"thought_id": thoughtID,
 		"timestamp":  timestamp,
-		"reply_to":   params["reply_to"],
+	}
+	if value, ok := params["context"]; ok {
+		sendParams["context"] = value
 	}
 	c.signClientOperation("message.thought.put", sendParams)
 	return c.transport.Call(ctx, "message.thought.put", sendParams)
@@ -1549,21 +1617,6 @@ func (c *AUNClient) prepareGroupEncryptedRPCParams(
 
 	epochResult := c.committedGroupEpochState(ctx, groupID)
 	committedEpoch := int(toInt64(firstNonNil(epochResult["committed_epoch"], epochResult["epoch"])))
-	var envelope map[string]any
-	var err error
-	if committedEpoch > 0 {
-		readyEpoch, readyErr := c.ensureCommittedGroupSecretForSend(ctx, groupID, committedEpoch, epochResult)
-		if readyErr != nil {
-			return nil, "", readyErr
-		}
-		envelope, err = c.groupE2EE.EncryptWithEpoch(groupID, readyEpoch, payload)
-	} else {
-		envelope, err = c.groupE2EE.Encrypt(groupID, payload)
-	}
-	if err != nil {
-		return nil, "", err
-	}
-
 	operationID := ""
 	if v, ok := params[idField].(string); ok {
 		operationID = strings.TrimSpace(v)
@@ -1576,6 +1629,30 @@ func (c *AUNClient) prepareGroupEncryptedRPCParams(
 		if parsed := toInt64(raw); parsed > 0 {
 			timestamp = parsed
 		}
+	}
+	var context map[string]any
+	if method == "group.thought.put" {
+		context, _ = params["context"].(map[string]any)
+	}
+	encryptOpts := E2EEEncryptOptions{
+		ProtectedHeaders: c.protectedHeadersFromParams(params),
+		Context:          context,
+		MessageID:        operationID,
+		Timestamp:        timestamp,
+	}
+	var envelope map[string]any
+	var err error
+	if committedEpoch > 0 {
+		readyEpoch, readyErr := c.ensureCommittedGroupSecretForSend(ctx, groupID, committedEpoch, epochResult)
+		if readyErr != nil {
+			return nil, "", readyErr
+		}
+		envelope, err = c.groupE2EE.EncryptWithEpoch(groupID, readyEpoch, payload, encryptOpts)
+	} else {
+		envelope, err = c.groupE2EE.Encrypt(groupID, payload, encryptOpts)
+	}
+	if err != nil {
+		return nil, "", err
 	}
 
 	sendParams := map[string]any{
@@ -1975,6 +2052,13 @@ func (c *AUNClient) epochPrecheck(ctx context.Context, groupID string) {
 // On 订阅事件
 func (c *AUNClient) On(event string, handler EventHandler) *Subscription {
 	return c.events.Subscribe(event, handler)
+}
+
+// Off 取消事件订阅。
+// 注意：Go 中函数不可直接比较，此方法使用尽力而为的移除策略。
+// 推荐使用 On() 返回的 Subscription.Unsubscribe() 替代。
+func (c *AUNClient) Off(event string, handler EventHandler) {
+	c.events.Unsubscribe(event, handler)
 }
 
 // Ping 发送心跳
@@ -3135,9 +3219,11 @@ func (c *AUNClient) verifyEventSignature(cs map[string]any) any {
 	if !ecdsa.VerifyASN1(pub, hash[:], sigBytes) {
 		log.Printf("[WARN] 群事件验签失败 aid=%s method=%s", sigAID, method)
 		// P1-16: 签名失败统一发布事件
-		c.events.Publish("signature.verification_failed", map[string]any{
-			"aid": sigAID, "method": method, "error": "ECDSA verification failed",
-		})
+		if c.events != nil {
+			c.events.Publish("signature.verification_failed", map[string]any{
+				"aid": sigAID, "method": method, "error": "ECDSA verification failed",
+			})
+		}
 		return false
 	}
 	return true
@@ -3336,14 +3422,24 @@ func (c *AUNClient) fetchPeerPrekeys(ctx context.Context, peerAID string) ([]map
 	cached := c.peerPrekeysCache[peerAID]
 	c.peerPrekeysMu.RUnlock()
 	if cached != nil && float64(time.Now().Unix()) < cached.expireAt {
-		items := make([]map[string]any, 0, len(cached.items))
-		for _, item := range cached.items {
-			items = append(items, copyMapShallow(item))
+		items := normalizePeerPrekeys(cached.items)
+		if len(items) > 0 {
+			cloned := make([]map[string]any, 0, len(items))
+			for _, item := range items {
+				cloned = append(cloned, copyMapShallow(item))
+			}
+			return cloned, nil
 		}
-		return items, nil
 	}
 	if cached := c.e2ee.GetCachedPrekey(peerAID); cached != nil {
-		return []map[string]any{copyMapShallow(cached)}, nil
+		items := normalizePeerPrekeys([]map[string]any{copyMapShallow(cached)})
+		if len(items) > 0 {
+			cloned := make([]map[string]any, 0, len(items))
+			for _, item := range items {
+				cloned = append(cloned, copyMapShallow(item))
+			}
+			return cloned, nil
+		}
 	}
 	result, err := c.transport.Call(ctx, "message.e2ee.get_prekey", map[string]any{"aid": peerAID})
 	if err != nil {
@@ -3357,12 +3453,13 @@ func (c *AUNClient) fetchPeerPrekeys(ctx context.Context, peerAID string) ([]map
 		return []map[string]any{}, nil
 	}
 	if devicePrekeys, ok := resultMap["device_prekeys"].([]any); ok {
-		normalized := make([]map[string]any, 0, len(devicePrekeys))
+		raw := make([]map[string]any, 0, len(devicePrekeys))
 		for _, item := range devicePrekeys {
 			if prekey, ok := extractPeerPrekeyMaterial(item); ok {
-				normalized = append(normalized, copyMapShallow(prekey))
+				raw = append(raw, copyMapShallow(prekey))
 			}
 		}
+		normalized := normalizePeerPrekeys(raw)
 		if len(normalized) > 0 {
 			c.peerPrekeysMu.Lock()
 			c.peerPrekeysCache[peerAID] = &cachedPeerPrekeys{
@@ -3371,7 +3468,11 @@ func (c *AUNClient) fetchPeerPrekeys(ctx context.Context, peerAID string) ([]map
 			}
 			c.peerPrekeysMu.Unlock()
 			c.e2ee.CachePrekey(peerAID, normalized[0])
-			return normalized, nil
+			cloned := make([]map[string]any, 0, len(normalized))
+			for _, item := range normalized {
+				cloned = append(cloned, copyMapShallow(item))
+			}
+			return cloned, nil
 		}
 	}
 	prekey, err := parsePeerPrekeyResponse(peerAID, result, nil)
@@ -3382,14 +3483,22 @@ func (c *AUNClient) fetchPeerPrekeys(ctx context.Context, peerAID string) ([]map
 		return nil, err
 	}
 	if prekey != nil {
+		normalized := normalizePeerPrekeys([]map[string]any{copyMapShallow(prekey)})
+		if len(normalized) == 0 {
+			return []map[string]any{}, nil
+		}
 		c.peerPrekeysMu.Lock()
 		c.peerPrekeysCache[peerAID] = &cachedPeerPrekeys{
-			items:    []map[string]any{copyMapShallow(prekey)},
+			items:    normalized,
 			expireAt: float64(time.Now().Unix()) + 300,
 		}
 		c.peerPrekeysMu.Unlock()
-		c.e2ee.CachePrekey(peerAID, prekey)
-		return []map[string]any{prekey}, nil
+		c.e2ee.CachePrekey(peerAID, normalized[0])
+		cloned := make([]map[string]any, 0, len(normalized))
+		for _, item := range normalized {
+			cloned = append(cloned, copyMapShallow(item))
+		}
+		return cloned, nil
 	}
 	return []map[string]any{}, nil
 }
@@ -4000,9 +4109,11 @@ func (c *AUNClient) decryptGroupThoughts(ctx context.Context, result map[string]
 		thought := map[string]any{
 			"thought_id": thoughtID,
 			"message_id": thoughtID,
-			"reply_to":   item["reply_to"],
 			"payload":    decrypted["payload"],
 			"created_at": item["created_at"],
+		}
+		if value, ok := item["context"]; ok {
+			thought["context"] = value
 		}
 		if e2ee, ok := decrypted["e2ee"]; ok {
 			thought["e2ee"] = e2ee
@@ -4079,11 +4190,13 @@ func (c *AUNClient) decryptMessageThoughts(ctx context.Context, result map[strin
 		thought := map[string]any{
 			"thought_id": thoughtID,
 			"message_id": thoughtID,
-			"reply_to":   item["reply_to"],
 			"from":       fromAID,
 			"to":         toAID,
 			"payload":    decrypted["payload"],
 			"created_at": item["created_at"],
+		}
+		if value, ok := item["context"]; ok {
+			thought["context"] = value
 		}
 		if e2ee, ok := decrypted["e2ee"]; ok {
 			thought["e2ee"] = e2ee
@@ -6065,6 +6178,17 @@ func validateMessageRecipient(to any) error {
 	return nil
 }
 
+func stringFieldFromObject(value any, key string) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		return strings.TrimSpace(stringFromAny(typed[key]))
+	case map[string]string:
+		return strings.TrimSpace(typed[key])
+	default:
+		return ""
+	}
+}
+
 func (c *AUNClient) validateOutboundCall(method string, params map[string]any) error {
 	if method == "message.send" {
 		if err := validateMessageRecipient(params["to"]); err != nil {
@@ -6099,10 +6223,11 @@ func (c *AUNClient) validateOutboundCall(method string, params map[string]any) e
 		}
 	}
 	if method == "group.thought.put" || method == "group.thought.get" || method == "message.thought.put" || method == "message.thought.get" {
-		replyTo, _ := params["reply_to"].(map[string]any)
-		replyMsgID, _ := replyTo["message_id"].(string)
-		if strings.TrimSpace(replyMsgID) == "" {
-			return NewValidationError(method + " requires reply_to.message_id")
+		contextType := stringFieldFromObject(params["context"], "type")
+		contextID := stringFieldFromObject(params["context"], "id")
+		hasContext := contextType != "" && contextID != ""
+		if !hasContext {
+			return NewValidationError(method + " requires context.type + context.id")
 		}
 	}
 	if method == "group.thought.get" {
@@ -6175,6 +6300,54 @@ func extractPeerPrekeyMaterial(value any) (map[string]any, bool) {
 		return nil, false
 	}
 	return prekey, true
+}
+
+func normalizePeerPrekeys(prekeys []map[string]any) []map[string]any {
+	normalized := make([]map[string]any, 0, len(prekeys))
+	for _, item := range prekeys {
+		if item == nil {
+			continue
+		}
+		prekeyID := strings.TrimSpace(fmt.Sprint(item["prekey_id"]))
+		publicKey := strings.TrimSpace(fmt.Sprint(item["public_key"]))
+		signature := strings.TrimSpace(fmt.Sprint(item["signature"]))
+		if prekeyID == "" || publicKey == "" || signature == "" {
+			continue
+		}
+		candidate := copyMapShallow(item)
+		candidate["prekey_id"] = prekeyID
+		candidate["public_key"] = publicKey
+		candidate["signature"] = signature
+		deviceID := strings.TrimSpace(fmt.Sprint(candidate["device_id"]))
+		candidate["device_id"] = deviceID
+		certFingerprint := strings.TrimSpace(strings.ToLower(fmt.Sprint(candidate["cert_fingerprint"])))
+		if certFingerprint != "" {
+			candidate["cert_fingerprint"] = certFingerprint
+		} else {
+			delete(candidate, "cert_fingerprint")
+		}
+		normalized = append(normalized, candidate)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	if len(normalized) == 1 {
+		if strings.TrimSpace(fmt.Sprint(normalized[0]["device_id"])) == "" {
+			normalized[0]["device_id"] = prekeyFallbackDeviceID
+		}
+		return normalized
+	}
+	filtered := make([]map[string]any, 0, len(normalized))
+	seen := make(map[string]bool)
+	for _, item := range normalized {
+		deviceID := strings.TrimSpace(fmt.Sprint(item["device_id"]))
+		if deviceID == "" || deviceID == prekeyFallbackDeviceID || seen[deviceID] {
+			continue
+		}
+		seen[deviceID] = true
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func parsePeerPrekeyResponse(peerAID string, result any, callErr error) (map[string]any, error) {

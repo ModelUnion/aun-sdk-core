@@ -8,7 +8,7 @@
 
 ## 文件格式
 
-agent.md 文件采用 YAML frontmatter + Markdown 内容的格式：
+agent.md 文件采用 **YAML frontmatter + Markdown 内容 + 签名块（可选，位于文件尾部）** 的格式：
 
 ```markdown
 ---
@@ -25,7 +25,56 @@ tags:
 
 # Markdown 正文内容
 详细说明、Skills、使用示例等...
+
+<!-- AUN-SIGNATURE
+cert_fingerprint: sha256:abc123...
+timestamp: 1715300000
+signature: MEUCIQDx...
+-->
 ```
+
+无签名的文件仍然合法，第一行直接以 `---` 开头。
+
+## 签名块规范
+
+### 位置
+
+文件尾部，位于 Markdown 正文之后。
+
+### 格式
+
+```
+<!-- AUN-SIGNATURE
+cert_fingerprint: sha256:<hex>
+timestamp: <unix_seconds>
+signature: <base64_der>
+-->
+```
+
+- **cert_fingerprint**: 签名证书的 SHA-256 指纹，格式 `sha256:<64位hex>`
+- **timestamp**: 签名时刻的 Unix 时间戳（秒）
+- **signature**: ECDSA P-256 签名的 DER 编码，Base64 表示
+
+### 签名计算
+
+1. **被签内容（payload）**：签名块开始标记 `<!-- AUN-SIGNATURE` 之前的全部字节
+2. **哈希**：对 payload 计算 SHA-256
+3. **签名**：使用 NIST P-256 私钥对哈希值进行 ECDSA 签名
+
+### 验签流程
+
+1. 检测文件尾部是否存在 `<!-- AUN-SIGNATURE` 签名块
+2. 提取签名块中的 `cert_fingerprint`、`timestamp`、`signature`
+3. 剥离签名块，取剩余内容为 payload
+4. 对 payload 计算 SHA-256
+5. 通过 `cert_fingerprint` 查找对应证书，获取公钥
+6. 使用公钥验证 ECDSA 签名
+
+### 约束
+
+- 签名块必须是文件的最后一个可见块（后面只允许可忽略的空白）
+- 签名块与正文之间应至少保留一个换行
+- 签名块不计入 4KB 文件大小限制
 
 ## YAML Schema (核心字段)
 
@@ -93,7 +142,8 @@ tags:
 | 文件 | Type | AID | 说明 |
 |------|------|-----|------|
 | [human-developer.md](examples/human-developer.md) | `human` | `zhangsan.aid.pub` | 全栈开发者 |
-| [openclaw-lobster.md](examples/openclaw-lobster.md) | `openclaw` | `lobster.aid.pub` | OpenClaw AI 助手 |
+| [openclaw-lobster.md](examples/openclaw-lobster.md) | `openclaw` | `lobster.aid.pub` | OpenClaw AI 助手（无签名） |
+| [signed-openclaw-lobster.md](examples/signed-openclaw-lobster.md) | `openclaw` | `lobster.aid.pub` | OpenClaw AI 助手（带签名） |
 | [codeagent-claudecode.md](examples/codeagent-claudecode.md) | `codeagent` | `claudecode.aid.pub` | Claude Code 编程助手 |
 
 ## Markdown 部分建议内容
@@ -108,9 +158,14 @@ YAML 只保留核心元数据，详细信息放在 Markdown 部分：
 
 ## 解析方式
 
-Go 中可以这样解析：
+解析时需先检测并跳过尾部签名块：
 
 ```go
+// 1. 检测尾部签名块
+if idx := strings.LastIndex(content, "<!-- AUN-SIGNATURE"); idx >= 0 {
+    content = content[:idx] // 跳过尾部签名块，取 payload
+}
+// 2. 按原规则解析 frontmatter
 parts := strings.SplitN(content, "---", 3)
 // parts[0] = "" (空)
 // parts[1] = YAML 内容

@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from aun_core import AUNClient
+from aun_core import AUNClient, ProtectedHeaders
 from aun_core.errors import AUNError, ClientSignatureError, NotFoundError, StateError, ValidationError
 import aun_core.namespaces.auth_namespace as auth_namespace_module
 
@@ -581,6 +581,7 @@ def test_call_does_not_forward_message_send_delivery_mode():
         "routing": "sender_affinity",
         "affinity_ttl_ms": 1000,
     }
+    protected_headers = ProtectedHeaders({"Device_ID": "dev-a", "slot_id": "slot-a"})
     calls = []
 
     class _Transport:
@@ -594,12 +595,24 @@ def test_call_does_not_forward_message_send_delivery_mode():
         "to": "bob.remote.example",
         "payload": {"type": "text", "text": "hello"},
         "encrypt": False,
+        "protected_headers": protected_headers,
+        "headers": {"device_id": "dev-b"},
     }))
 
     assert calls == [("message.send", {
         "to": "bob.remote.example",
         "payload": {"type": "text", "text": "hello"},
     })]
+
+
+def test_protected_headers_from_params_accepts_wrapper():
+    headers = ProtectedHeaders({"Device_ID": "dev-a", "slot_id": "slot-a"})
+
+    assert AUNClient._protected_headers_from_params({"protected_headers": headers}) is headers
+    assert AUNClient._protected_headers_from_params({"headers": headers}) is headers
+    assert AUNClient._protected_headers_from_params({"protected_headers": {"Device_ID": "dev-a"}}) == {
+        "Device_ID": "dev-a",
+    }
 
 
 def test_call_injects_message_slot_context():
@@ -735,6 +748,99 @@ def test_fetch_peer_prekey_accepts_device_prekeys_response():
     assert [item["device_id"] for item in all_prekeys] == ["device-b", "device-a"]
 
 
+def test_fetch_peer_prekey_normalizes_single_empty_device_id():
+    client = AUNClient()
+
+    async def _fake_call(method, params):
+        assert method == "message.e2ee.get_prekey"
+        return {
+            "found": True,
+            "device_prekeys": [
+                {
+                    "device_id": "",
+                    "prekey_id": "pk-legacy",
+                    "public_key": "pub-legacy",
+                    "signature": "sig-legacy",
+                    "cert_fingerprint": "sha256:legacy",
+                }
+            ],
+        }
+
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
+    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
+
+    assert result is not None
+    assert result["device_id"] == "aun_device_id"
+    assert result["prekey_id"] == "pk-legacy"
+    assert [item["device_id"] for item in all_prekeys] == ["aun_device_id"]
+
+
+def test_fetch_peer_prekey_filters_empty_device_id_in_multi_device_response():
+    client = AUNClient()
+
+    async def _fake_call(method, params):
+        assert method == "message.e2ee.get_prekey"
+        return {
+            "found": True,
+            "device_prekeys": [
+                {
+                    "device_id": "",
+                    "prekey_id": "pk-empty",
+                    "public_key": "pub-empty",
+                    "signature": "sig-empty",
+                },
+                {
+                    "device_id": "device-b",
+                    "prekey_id": "pk-b",
+                    "public_key": "pub-b",
+                    "signature": "sig-b",
+                },
+            ],
+        }
+
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
+    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
+
+    assert result["device_id"] == "device-b"
+    assert [item["device_id"] for item in all_prekeys] == ["device-b"]
+
+
+def test_fetch_peer_prekey_filters_fallback_device_id_in_multi_device_response():
+    client = AUNClient()
+
+    async def _fake_call(method, params):
+        assert method == "message.e2ee.get_prekey"
+        return {
+            "found": True,
+            "device_prekeys": [
+                {
+                    "device_id": "aun_device_id",
+                    "prekey_id": "pk-legacy",
+                    "public_key": "pub-legacy",
+                    "signature": "sig-legacy",
+                },
+                {
+                    "device_id": "device-b",
+                    "prekey_id": "pk-b",
+                    "public_key": "pub-b",
+                    "signature": "sig-b",
+                },
+            ],
+        }
+
+    client._transport.call = _fake_call
+
+    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
+    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
+
+    assert result["device_id"] == "device-b"
+    assert [item["device_id"] for item in all_prekeys] == ["device-b"]
+
+
 def test_fetch_peer_prekey_query_failure_raises_validation_error():
     client = AUNClient()
 
@@ -777,7 +883,7 @@ def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
     async def _fake_fetch_peer_prekeys(peer_aid):
         assert peer_aid == "bob.example.com"
         return [{
-            "device_id": "",
+            "device_id": "aun_device_id",
             "prekey_id": "pk-1",
             "public_key": "pub",
             "signature": "sig",
@@ -849,7 +955,7 @@ def test_message_thought_put_encrypts_and_signs(monkeypatch):
 
     result = asyncio.run(client.call("message.thought.put", {
         "to": "bob.example.com",
-        "reply_to": {"message_id": "msg-root"},
+        "context": {"type": "run", "id": "run-root"},
         "payload": {"type": "thought", "text": "推理片段"},
     }))
 
@@ -857,12 +963,36 @@ def test_message_thought_put_encrypts_and_signs(monkeypatch):
     assert captured["method"] == "message.thought.put"
     params = captured["params"]
     assert params["to"] == "bob.example.com"
-    assert params["reply_to"]["message_id"] == "msg-root"
+    assert params["context"] == {"type": "run", "id": "run-root"}
     assert params["encrypted"] is True
     assert params["type"] == "e2ee.encrypted"
     assert params["payload"]["type"] == "e2ee.encrypted"
     assert params["thought_id"].startswith("mt-")
     assert params["client_signature"] == {"aid": "alice.example.com"}
+
+    result = asyncio.run(client.call("message.thought.put", {
+        "to": "bob.example.com",
+        "context": {"type": "run", "id": "run-1"},
+        "payload": {"type": "thought", "text": "自主推理片段"},
+    }))
+
+    assert result == {"ok": True}
+    params = captured["params"]
+    assert params["context"] == {"type": "run", "id": "run-1"}
+    assert params["encrypted"] is True
+
+
+def test_thought_selector_validation_requires_context():
+    client = AUNClient()
+    client._validate_outbound_call("message.thought.put", {
+        "to": "bob.example.com",
+        "context": {"type": "run", "id": "run-1"},
+    })
+
+    with pytest.raises(ValidationError, match="context.type"):
+        client._validate_outbound_call("message.thought.put", {
+            "to": "bob.example.com",
+        })
 
 
 def test_message_thought_get_auto_decrypts(monkeypatch):
@@ -876,13 +1006,13 @@ def test_message_thought_get_auto_decrypts(monkeypatch):
             "found": True,
             "sender_aid": "alice.example.com",
             "peer_aid": "bob.example.com",
-            "reply_to": {"message_id": "msg-root"},
+            "context": {"type": "run", "id": "run-root"},
             "thoughts": [
                 {
                     "thought_id": "mt-1",
                     "from": "alice.example.com",
                     "to": "bob.example.com",
-                    "reply_to": {"message_id": "msg-root"},
+                    "context": {"type": "run", "id": "run-root"},
                     "payload": {"type": "e2ee.encrypted", "ciphertext": "abc"},
                     "created_at": 1710504000000,
                 },
@@ -902,13 +1032,13 @@ def test_message_thought_get_auto_decrypts(monkeypatch):
 
     result = asyncio.run(client.call("message.thought.get", {
         "sender_aid": "alice.example.com",
-        "reply_to": {"message_id": "msg-root"},
+        "context": {"type": "run", "id": "run-root"},
     }))
 
     assert result["thoughts"] == [{
         "thought_id": "mt-1",
         "message_id": "mt-1",
-        "reply_to": {"message_id": "msg-root"},
+        "context": {"type": "run", "id": "run-root"},
         "from": "alice.example.com",
         "to": "bob.example.com",
         "payload": {"type": "thought", "text": "只给感兴趣的人看"},

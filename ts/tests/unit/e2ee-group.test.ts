@@ -149,6 +149,8 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
     expect(e2ee.encryption_mode).toBe('epoch_group_key');
     expect(e2ee.epoch).toBe(1);
     expect(e2ee.sender_verified).toBe(true);
+    expect(e2ee.protected_headers).toEqual({ payload_type: 'text' });
+    expect(e2ee.context).toBeUndefined();
     expect((result as Message).dispatch_mode).toBe('mention');
   });
 
@@ -170,6 +172,68 @@ describe('encryptGroupMessage/decryptGroupMessage 往返', () => {
     // 无签名模式测试解密失败
     const result = decryptGroupMessage(message, secrets, null, { requireSignature: false });
     expect(result).toBeNull();
+  });
+
+  it('payload_type、protected_headers 和 context 使用独立认证标签绑定', () => {
+    const gs = makeGroupSecret();
+    const mid = `msg-${crypto.randomUUID()}`;
+    const context = { type: 'thought', id: 'ctx-1' };
+    const envelope = encryptGroupMessage('grp-1', 1, gs, { type: 'text', text: 'bound' }, {
+      fromAid: 'alice.test',
+      messageId: mid,
+      timestamp: Date.now(),
+      protectedHeaders: { Device_ID: 'dev-a' },
+      context,
+    });
+    expect(envelope.payload_type).toBeUndefined();
+    expect((envelope.aad as JsonObject).payload_type).toBeUndefined();
+    expect((envelope.aad as JsonObject).protected_headers).toBeUndefined();
+    expect((envelope.aad as JsonObject).context_type).toBeUndefined();
+    expect((envelope.protected_headers as JsonObject).payload_type).toBe('text');
+    expect((envelope.protected_headers as JsonObject).device_id).toBe('dev-a');
+    expect(((envelope.protected_headers as JsonObject)._auth as JsonObject).alg).toBe('HMAC-SHA256');
+    expect((envelope.context as JsonObject).type).toBe('thought');
+    expect((envelope.context as JsonObject).id).toBe('ctx-1');
+    expect(((envelope.context as JsonObject)._auth as JsonObject).alg).toBe('HMAC-SHA256');
+
+    const message: Message = { group_id: 'grp-1', from: 'alice.test', message_id: mid, payload: envelope, context };
+    const secrets = new Map<number, Buffer>([[1, gs]]);
+    const decrypted = decryptGroupMessage(message, secrets, null, { requireSignature: false });
+    expect(decrypted?.payload).toEqual({ type: 'text', text: 'bound' });
+    expect((decrypted?.e2ee as JsonObject).protected_headers).toEqual({
+      payload_type: 'text',
+      device_id: 'dev-a',
+    });
+    expect((decrypted?.e2ee as JsonObject).protected_headers).not.toHaveProperty('_auth');
+    expect((decrypted?.e2ee as JsonObject).context).toEqual({
+      type: 'thought',
+      id: 'ctx-1',
+    });
+    expect((decrypted?.e2ee as JsonObject).context).not.toHaveProperty('_auth');
+
+    const tampered = {
+      ...message,
+      payload: {
+        ...envelope,
+        protected_headers: {
+          ...(envelope.protected_headers as JsonObject),
+          device_id: 'dev-b',
+        },
+      },
+    };
+    expect(decryptGroupMessage(tampered, secrets, null, { requireSignature: false })).toBeNull();
+
+    const missingAuth = {
+      ...message,
+      payload: {
+        ...envelope,
+        protected_headers: { payload_type: 'text', device_id: 'dev-a' },
+      },
+    };
+    expect(decryptGroupMessage(missingAuth, secrets, null, { requireSignature: false })).toBeNull();
+
+    const tamperedContext = { ...message, context: { type: 'thought', id: 'ctx-2' } };
+    expect(decryptGroupMessage(tamperedContext, secrets, null, { requireSignature: false })).toBeNull();
   });
 });
 

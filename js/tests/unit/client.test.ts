@@ -6,6 +6,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { AUNClient } from '../../src/client.js';
 import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
+import { ProtectedHeaders } from '../../src/e2ee.js';
 
 describe('AUNClient 构造', () => {
   it('无参数构造应使用默认配置', () => {
@@ -269,15 +270,20 @@ describe('AUNClient message.send 接收者校验', () => {
       affinity_ttl_ms: 900,
     };
     (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+    const protectedHeaders = new ProtectedHeaders({ Device_ID: 'dev-a', slot_id: 'slot-a' });
 
     await client.call('message.send', {
       to: 'bob.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
+      protected_headers: protectedHeaders,
+      headers: { device_id: 'dev-b' },
     });
 
     const [, sentParams] = (client as any)._transport.call.mock.calls[0];
     expect(sentParams.delivery_mode).toBeUndefined();
+    expect(sentParams.protected_headers).toBeUndefined();
+    expect(sentParams.headers).toBeUndefined();
   });
 
   it('message.pull 自动注入当前实例 device_id/slot_id', async () => {
@@ -378,6 +384,54 @@ describe('AUNClient._fetchPeerPrekey', () => {
     await expect((client as any)._fetchPeerPrekey('bob.example.com')).rejects.toThrow(
       'invalid prekey response for bob.example.com',
     );
+  });
+
+  it('单条空 device_id 应回退到固定值', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      device_prekeys: [{
+        device_id: '',
+        prekey_id: 'pk-legacy',
+        public_key: 'pub-legacy',
+        signature: 'sig-legacy',
+      }],
+    });
+
+    await expect((client as any)._fetchPeerPrekey('bob.example.com')).resolves.toMatchObject({
+      device_id: 'aun_device_id',
+      prekey_id: 'pk-legacy',
+    });
+  });
+
+  it('多条 device_prekeys 中空 device_id 应被过滤', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      device_prekeys: [
+        { device_id: '', prekey_id: 'pk-empty', public_key: 'pub-empty', signature: 'sig-empty' },
+        { device_id: 'device-b', prekey_id: 'pk-b', public_key: 'pub-b', signature: 'sig-b' },
+      ],
+    });
+
+    await expect((client as any)._fetchPeerPrekeys('bob.example.com')).resolves.toEqual([
+      expect.objectContaining({ device_id: 'device-b', prekey_id: 'pk-b' }),
+    ]);
+  });
+
+  it('多条 device_prekeys 中 aun_device_id 占位项应被过滤', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      device_prekeys: [
+        { device_id: 'aun_device_id', prekey_id: 'pk-legacy', public_key: 'pub-legacy', signature: 'sig-legacy' },
+        { device_id: 'device-b', prekey_id: 'pk-b', public_key: 'pub-b', signature: 'sig-b' },
+      ],
+    });
+
+    await expect((client as any)._fetchPeerPrekeys('bob.example.com')).resolves.toEqual([
+      expect.objectContaining({ device_id: 'device-b', prekey_id: 'pk-b' }),
+    ]);
   });
 });
 
@@ -1212,18 +1266,34 @@ describe('GROUP epoch 轮换竞态防护', () => {
 
     await client.call('group.thought.put', {
       group_id: 'g1',
-      reply_to: { message_id: 'gm-root' },
+      context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: '推理片段' },
     });
 
     expect(transportCall).toHaveBeenCalledWith('group.thought.put', expect.objectContaining({
       group_id: 'g1',
-      reply_to: { message_id: 'gm-root' },
+      context: { type: 'run', id: 'run-root' },
       encrypted: true,
       type: 'e2ee.group_encrypted',
       thought_id: expect.stringMatching(/^gt-/),
       client_signature: { aid: 'alice.aid.com' },
     }));
+
+    await client.call('group.thought.put', {
+      group_id: 'g1',
+      context: { type: 'run', id: 'run-1' },
+      payload: { type: 'thought', text: '自主推理片段' },
+    });
+
+    expect(transportCall).toHaveBeenLastCalledWith('group.thought.put', expect.objectContaining({
+      group_id: 'g1',
+      context: { type: 'run', id: 'run-1' },
+      encrypted: true,
+      type: 'e2ee.group_encrypted',
+      thought_id: expect.stringMatching(/^gt-/),
+      client_signature: { aid: 'alice.aid.com' },
+    }));
+    expect(transportCall.mock.calls[transportCall.mock.calls.length - 1]?.[1]).not.toHaveProperty('reply_to');
   });
 
   it('group.thought.get 应逐条解密并返回 thoughts[]', async () => {
@@ -1237,11 +1307,11 @@ describe('GROUP epoch 轮换竞态防护', () => {
       found: true,
       group_id: 'g1',
       sender_aid: 'alice.aid.com',
-      reply_to: { message_id: 'gm-root' },
+      context: { type: 'run', id: 'run-root' },
       thoughts: [
         {
           thought_id: 'gt-1',
-          reply_to: { message_id: 'gm-root' },
+          context: { type: 'run', id: 'run-root' },
           payload: { type: 'e2ee.group_encrypted', ciphertext: 'abc' },
           created_at: 1710504000000,
         },
@@ -1251,14 +1321,14 @@ describe('GROUP epoch 轮换竞态防护', () => {
     const result = await client.call('group.thought.get', {
       group_id: 'g1',
       sender_aid: 'alice.aid.com',
-      reply_to: { message_id: 'gm-root' },
+      context: { type: 'run', id: 'run-root' },
     }) as any;
 
     expect(result.thoughts).toEqual([
       {
         thought_id: 'gt-1',
         message_id: 'gt-1',
-        reply_to: { message_id: 'gm-root' },
+        context: { type: 'run', id: 'run-root' },
         payload: { type: 'thought', text: '只给感兴趣的人看' },
         created_at: 1710504000000,
         e2ee: { encryption_mode: 'epoch_group_key' },
@@ -1287,18 +1357,49 @@ describe('GROUP epoch 轮换竞态防护', () => {
 
     await client.call('message.thought.put', {
       to: 'bob.aid.com',
-      reply_to: { message_id: 'msg-root' },
+      context: { type: 'run', id: 'run-root' },
       payload: { type: 'thought', text: '推理片段' },
     });
 
     expect(transportCall).toHaveBeenCalledWith('message.thought.put', expect.objectContaining({
       to: 'bob.aid.com',
-      reply_to: { message_id: 'msg-root' },
+      context: { type: 'run', id: 'run-root' },
       encrypted: true,
       type: 'e2ee.encrypted',
       thought_id: expect.stringMatching(/^mt-/),
       client_signature: { aid: 'alice.aid.com' },
     }));
+
+    await client.call('message.thought.put', {
+      to: 'bob.aid.com',
+      context: { type: 'run', id: 'run-1' },
+      payload: { type: 'thought', text: '自主推理片段' },
+    });
+
+    expect(transportCall).toHaveBeenLastCalledWith('message.thought.put', expect.objectContaining({
+      to: 'bob.aid.com',
+      context: { type: 'run', id: 'run-1' },
+      encrypted: true,
+      type: 'e2ee.encrypted',
+      thought_id: expect.stringMatching(/^mt-/),
+      client_signature: { aid: 'alice.aid.com' },
+    }));
+    expect(transportCall.mock.calls[transportCall.mock.calls.length - 1]?.[1]).not.toHaveProperty('reply_to');
+  });
+
+  it('thought selector 必须提供 context.type + context.id', async () => {
+    const client = new AUNClient();
+
+    expect(() => (client as any)._validateOutboundCall('message.thought.put', {
+      to: 'bob.aid.com',
+      payload: { type: 'thought' },
+    })).toThrow('context.type');
+
+    expect(() => (client as any)._validateOutboundCall('message.thought.put', {
+      to: 'bob.aid.com',
+      context: { type: 'run' },
+      payload: { type: 'thought' },
+    })).toThrow('context.type');
   });
 
   it('message.thought.get 应逐条解密并返回 thoughts[]', async () => {
@@ -1315,13 +1416,13 @@ describe('GROUP epoch 轮换竞态防护', () => {
       found: true,
       sender_aid: 'alice.aid.com',
       peer_aid: 'bob.aid.com',
-      reply_to: { message_id: 'msg-root' },
+      context: { type: 'run', id: 'run-root' },
       thoughts: [
         {
           thought_id: 'mt-1',
           from: 'alice.aid.com',
           to: 'bob.aid.com',
-          reply_to: { message_id: 'msg-root' },
+          context: { type: 'run', id: 'run-root' },
           payload: { type: 'e2ee.encrypted', ciphertext: 'abc' },
           created_at: 1710504000000,
         },
@@ -1330,14 +1431,14 @@ describe('GROUP epoch 轮换竞态防护', () => {
 
     const result = await client.call('message.thought.get', {
       sender_aid: 'alice.aid.com',
-      reply_to: { message_id: 'msg-root' },
+      context: { type: 'run', id: 'run-root' },
     }) as any;
 
     expect(result.thoughts).toEqual([
       {
         thought_id: 'mt-1',
         message_id: 'mt-1',
-        reply_to: { message_id: 'msg-root' },
+        context: { type: 'run', id: 'run-root' },
         from: 'alice.aid.com',
         to: 'bob.aid.com',
         payload: { type: 'thought', text: '只给感兴趣的人看' },

@@ -340,6 +340,8 @@ class TestPrekeyEncrypt:
         assert result is not None
         assert result["payload"] == payload
         assert result["e2ee"]["encryption_mode"] == MODE_PREKEY_ECDH_V2
+        assert result["e2ee"]["protected_headers"] == {"payload_type": "text"}
+        assert result["e2ee"].get("context") is None
 
     def test_sender_skips_its_own_outbound_prekey_message(self):
         sender_mgr, _, _, receiver_key, _, receiver_cert, _, _ = _make_e2ee_pair()
@@ -411,6 +413,69 @@ class TestLongTermKey:
         assert result is not None
         assert result["payload"] == payload
         assert result["e2ee"]["encryption_mode"] == MODE_LONG_TERM_KEY
+        assert result["e2ee"]["protected_headers"] == {"payload_type": "text"}
+        assert result["e2ee"].get("context") is None
+
+    def test_protected_headers_and_context_are_independently_authenticated(self):
+        sender_mgr, receiver_mgr, _, _, _, receiver_cert, _, _ = _make_e2ee_pair()
+
+        payload = {"type": "thought", "text": "mode3 metadata"}
+        mid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+
+        envelope, ok = sender_mgr._encrypt_with_long_term_key(
+            "receiver.test",
+            payload,
+            receiver_cert,
+            message_id=mid,
+            timestamp=ts,
+            protected_headers={"Device_ID": "dev-a"},
+            context={"type": "run", "id": "run-1"},
+        )
+        assert ok
+        assert "payload_type" not in envelope
+        assert "payload_type" not in envelope["aad"]
+        assert "protected_headers" not in envelope["aad"]
+        assert "context_type" not in envelope["aad"]
+        assert "context_id" not in envelope["aad"]
+        assert envelope["protected_headers"]["payload_type"] == "thought"
+        assert envelope["protected_headers"]["device_id"] == "dev-a"
+        assert envelope["protected_headers"]["_auth"]["alg"] == "HMAC-SHA256"
+        assert envelope["context"]["type"] == "run"
+        assert envelope["context"]["id"] == "run-1"
+        assert envelope["context"]["_auth"]["alg"] == "HMAC-SHA256"
+
+        message = {
+            "message_id": mid,
+            "from": "sender.test",
+            "to": "receiver.test",
+            "timestamp": ts,
+            "seq": 1,
+            "context": {"type": "run", "id": "run-1"},
+            "payload": envelope,
+            "encrypted": True,
+        }
+        result = receiver_mgr._decrypt_message_long_term(message)
+        assert result is not None
+        assert result["payload"] == payload
+        assert result["e2ee"]["protected_headers"]["payload_type"] == "thought"
+        assert result["e2ee"]["protected_headers"]["device_id"] == "dev-a"
+        assert "_auth" not in result["e2ee"]["protected_headers"]
+        assert result["e2ee"]["context"]["type"] == "run"
+        assert result["e2ee"]["context"]["id"] == "run-1"
+        assert "_auth" not in result["e2ee"]["context"]
+
+        tampered = json.loads(json.dumps(message))
+        tampered["payload"]["protected_headers"]["payload_type"] = "text"
+        assert receiver_mgr._decrypt_message_long_term(tampered) is None
+
+        tampered = json.loads(json.dumps(message))
+        tampered["payload"]["context"]["id"] = "run-2"
+        assert receiver_mgr._decrypt_message_long_term(tampered) is None
+
+        tampered = json.loads(json.dumps(message))
+        del tampered["payload"]["protected_headers"]["_auth"]
+        assert receiver_mgr._decrypt_message_long_term(tampered) is None
 
 
 # ---------------------------------------------------------------------------

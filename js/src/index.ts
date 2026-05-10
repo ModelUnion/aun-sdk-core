@@ -88,10 +88,16 @@ export { IndexedDBSecretStore } from './secret-store/indexeddb-store.js';
 export { AuthFlow } from './auth.js';
 export { AuthNamespace } from './namespaces/auth.js';
 export { CustodyNamespace } from './namespaces/custody.js';
+export { MetaNamespace } from './namespaces/meta.js';
 
 // E2EE — P2P
-export { E2EEManager, SUITE, MODE_PREKEY_ECDH_V2, MODE_LONG_TERM_KEY } from './e2ee.js';
-export type { EncryptResult } from './e2ee.js';
+export {
+  E2EEManager,
+  ProtectedHeaders,
+  SUITE, MODE_PREKEY_ECDH_V2, MODE_LONG_TERM_KEY,
+  AAD_OPTIONAL_FIELDS,
+} from './e2ee.js';
+export type { EncryptResult, ProtectedHeadersInput } from './e2ee.js';
 
 // E2EE — 群组
 export {

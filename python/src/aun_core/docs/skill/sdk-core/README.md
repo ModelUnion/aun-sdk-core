@@ -292,7 +292,7 @@ asyncio.run(main())
 | [02-WebSocket协议](02-WebSocket协议.md) | 握手流程、消息格式、裸 WebSocket 示例 |
 | [03-核心概念](03-核心概念.md) | AID、连接状态机、认证流程、E2EE |
 | [04-连接与认证](04-连接与认证.md) | 认证封装、call()、on()、网关发现 |
-| [05-E2EE加密通信](05-E2EE加密通信.md) | 端到端加密收发、密钥管理、自定义存储 |
+| [05-E2EE加密通信](05-E2EE加密通信.md) | 端到端加密收发、ProtectedHeaders、密钥管理、自定义存储 |
 | [06-API手册](06-API手册.md) | AUNClient / AuthNamespace / E2EEManager 完整 API |
 | [07-错误处理](07-错误处理.md) | 错误类层级、错误码速查、重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等初始化、多 AID 隔离、资源清理 |
