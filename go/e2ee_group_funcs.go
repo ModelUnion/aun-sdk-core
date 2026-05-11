@@ -1,6 +1,7 @@
 package aun
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
@@ -518,6 +519,64 @@ func ComputeEpochChain(prevChain string, epoch int, commitment string, rotatorAI
 func VerifyEpochChain(epochChain string, prevChain string, epoch int, commitment string, rotatorAID string) bool {
 	expected := ComputeEpochChain(prevChain, epoch, commitment, rotatorAID)
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(epochChain)) == 1
+}
+
+// ── State Hash ────────────────────────────────────────────
+
+// MemberRole represents a member's AID and role for state hash computation.
+type MemberRole struct {
+	AID  string `json:"aid"`
+	Role string `json:"role"`
+}
+
+// ComputeStateHash computes the group state hash binding members+roles+policy.
+// state_hash = SHA-256(group_id | 0x00 | state_version(uint64 BE) | 0x00 |
+//
+//	key_epoch(uint64 BE) | 0x00 | membership_block | 0x00 |
+//	policy_block | 0x00 | prev_state_hash(32 bytes))
+func ComputeStateHash(groupID string, stateVersion, keyEpoch int64, members []MemberRole, policy map[string]interface{}, prevStateHash string) string {
+	// Sort members by AID
+	sorted := make([]MemberRole, len(members))
+	copy(sorted, members)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].AID < sorted[j].AID })
+
+	// membership_block
+	parts := make([]string, len(sorted))
+	for i, m := range sorted {
+		parts[i] = m.AID + ":" + m.Role
+	}
+	membershipBlock := strings.Join(parts, "|")
+
+	// policy_block: canonical JSON (Go json.Marshal sorts keys by default)
+	policyBlock := ""
+	if len(policy) > 0 {
+		b, _ := json.Marshal(policy)
+		policyBlock = string(b)
+	}
+
+	// prev_state_hash bytes
+	var prevBytes [32]byte
+	if prevStateHash != "" {
+		decoded, _ := hex.DecodeString(prevStateHash)
+		copy(prevBytes[:], decoded)
+	}
+
+	// Concatenate and hash
+	var buf bytes.Buffer
+	buf.WriteString(groupID)
+	buf.WriteByte(0x00)
+	_ = binary.Write(&buf, binary.BigEndian, stateVersion)
+	buf.WriteByte(0x00)
+	_ = binary.Write(&buf, binary.BigEndian, keyEpoch)
+	buf.WriteByte(0x00)
+	buf.WriteString(membershipBlock)
+	buf.WriteByte(0x00)
+	buf.WriteString(policyBlock)
+	buf.WriteByte(0x00)
+	buf.Write(prevBytes[:])
+
+	h := sha256.Sum256(buf.Bytes())
+	return hex.EncodeToString(h[:])
 }
 
 // ── Membership Commitment ──────────────────────────────────
@@ -1258,31 +1317,28 @@ func HandleKeyRequest(
 	secret, _ := secretData["secret"].([]byte)
 	commitmentStr, _ := secretData["commitment"].(string)
 	members := sorted(toStringSlice(secretData["member_aids"]))
-	currentSorted := sorted(currentMembers)
+
+	// P0 历史隔离：如果 epoch 记录了 member_aids，请求者必须在其中
+	// 不允许用当前成员列表替换历史 epoch 的成员列表
+	if len(members) > 0 {
+		requesterInEpoch := false
+		for _, m := range members {
+			if m == requesterAID {
+				requesterInEpoch = true
+				break
+			}
+		}
+		if !requesterInEpoch {
+			log.Printf("群组密钥请求拒绝：%s 不在 epoch %d 的成员列表中（group=%s）", requesterAID, epoch, groupID)
+			return nil
+		}
+	}
+
 	responseMembers := members
 	if len(responseMembers) == 0 {
-		responseMembers = currentSorted
+		responseMembers = sorted(currentMembers)
 	}
-	requesterInCurrent := false
-	for _, m := range currentSorted {
-		if m == requesterAID {
-			requesterInCurrent = true
-			break
-		}
-	}
-	requesterInResponse := false
-	for _, m := range responseMembers {
-		if m == requesterAID {
-			requesterInResponse = true
-			break
-		}
-	}
-	includeEpochChain := true
-	if requesterInCurrent && !requesterInResponse {
-		responseMembers = currentSorted
-		commitmentStr = ComputeMembershipCommitment(responseMembers, epoch, groupID, secret)
-		includeEpochChain = false
-	} else if commitmentStr == "" {
+	if commitmentStr == "" {
 		commitmentStr = ComputeMembershipCommitment(responseMembers, epoch, groupID, secret)
 	}
 
@@ -1298,7 +1354,8 @@ func HandleKeyRequest(
 		"responder_aid": aid,
 		"issued_at":     time.Now().UnixMilli(),
 	}
-	if ec, ok := secretData["epoch_chain"].(string); includeEpochChain && ok && ec != "" {
+	// epoch_chain 始终包含（如果存在）
+	if ec, ok := secretData["epoch_chain"].(string); ok && ec != "" {
 		response["epoch_chain"] = ec
 	}
 	return response

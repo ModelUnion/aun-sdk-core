@@ -113,6 +113,15 @@ const DDL_STATEMENTS = [
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS group_state (
+    group_id TEXT PRIMARY KEY,
+    state_version INTEGER NOT NULL DEFAULT 0,
+    state_hash TEXT NOT NULL DEFAULT '',
+    key_epoch INTEGER NOT NULL DEFAULT 0,
+    membership_json TEXT NOT NULL DEFAULT '',
+    policy_json TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT 0
+  )`,
 ];
 
 function jsonParseObject(value: string): Record<string, unknown> {
@@ -734,5 +743,23 @@ export class AIDDatabase {
     const result: Record<string, string> = {};
     for (const row of rows) result[row.key] = row.value;
     return result;
+  }
+
+  // ── Group State ─────────────────────────────────────────────
+
+  saveGroupState(groupId: string, stateVersion: number, stateHash: string, keyEpoch: number, membershipJson: string, policyJson: string): void {
+    this._db.prepare(
+      `INSERT INTO group_state (group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(group_id) DO UPDATE SET state_version=excluded.state_version, state_hash=excluded.state_hash, key_epoch=excluded.key_epoch, membership_json=excluded.membership_json, policy_json=excluded.policy_json, updated_at=excluded.updated_at`,
+    ).run(groupId, stateVersion, stateHash, keyEpoch, membershipJson, policyJson, Date.now());
+  }
+
+  loadGroupState(groupId: string): { group_id: string; state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | null {
+    const row = this._db.prepare(
+      'SELECT state_version, state_hash, key_epoch, membership_json, policy_json, updated_at FROM group_state WHERE group_id = ?',
+    ).get(groupId) as { state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | undefined;
+    if (!row) return null;
+    return { group_id: groupId, ...row };
   }
 }

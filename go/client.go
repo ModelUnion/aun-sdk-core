@@ -3286,6 +3286,7 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 		members := c.groupE2EE.GetMemberAIDs(groupID)
 
 		// 请求者不在本地成员列表时，回源查询服务端最新成员列表
+		// 注意：仅用于向 HandleKeyRequest 传入 currentMembers，不再更新本地 epoch 存储
 		if requester != "" && !stringSliceContains(members, requester) {
 			ctx := context.Background()
 			membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
@@ -3293,19 +3294,6 @@ func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
 				if mr, ok := membersResult.(map[string]any); ok {
 					if membersList, ok := mr["members"].([]any); ok {
 						members = extractAIDsFromMembers(membersList)
-						// 更新本地当前 epoch 的 member_aids/commitment
-						if stringSliceContains(members, requester) {
-							secretData, _ := c.groupE2EE.LoadSecret(groupID)
-							if secretData != nil {
-								c.mu.RLock()
-								myAID := c.aid
-								c.mu.RUnlock()
-								epoch := int(toInt64(secretData["epoch"]))
-								secret, _ := secretData["secret"].([]byte)
-								commitment := ComputeMembershipCommitment(members, epoch, groupID, secret)
-								StoreGroupSecret(c.keyStore, myAID, groupID, epoch, secret, commitment, members, "")
-							}
-						}
 					}
 				}
 			}

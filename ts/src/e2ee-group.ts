@@ -714,6 +714,57 @@ export function verifyMembershipCommitment(
   return crypto.timingSafeEqual(a, b);
 }
 
+// ── State Hash ────────────────────────────────────────────────
+
+/**
+ * 计算群组状态哈希（链式）。
+ * state_hash = SHA-256(group_id | 0x00 | state_version(u64be) | 0x00 |
+ *   key_epoch(u64be) | 0x00 | membership_block | 0x00 | policy_block | 0x00 | prev_state_hash(32B))
+ */
+export function computeStateHash(params: {
+  groupId: string;
+  stateVersion: number;
+  keyEpoch: number;
+  members: Array<{ aid: string; role: string }>;
+  policy: Record<string, unknown>;
+  prevStateHash: string;
+}): string {
+  const { groupId, stateVersion, keyEpoch, members, policy, prevStateHash } = params;
+
+  // 按 AID 排序，构建 membership_block
+  const sorted = [...members].sort((a, b) => a.aid.localeCompare(b.aid));
+  const membershipBlock = sorted.map(m => `${m.aid}:${m.role}`).join('|');
+
+  // 按 key 排序的 canonical JSON（无空格）
+  const sortedPolicy: Record<string, unknown> = {};
+  for (const key of Object.keys(policy).sort()) {
+    sortedPolicy[key] = policy[key];
+  }
+  const policyBlock = Object.keys(policy).length > 0 ? JSON.stringify(sortedPolicy) : '';
+
+  // prev_state_hash: 32 字节，空则全零
+  const prevBytes = prevStateHash
+    ? Buffer.from(prevStateHash, 'hex')
+    : Buffer.alloc(32);
+
+  // state_version / key_epoch → uint64 big-endian
+  const svBuf = Buffer.alloc(8);
+  svBuf.writeBigUInt64BE(BigInt(stateVersion));
+  const keBuf = Buffer.alloc(8);
+  keBuf.writeBigUInt64BE(BigInt(keyEpoch));
+
+  const data = Buffer.concat([
+    Buffer.from(groupId, 'utf-8'), Buffer.from([0x00]),
+    svBuf, Buffer.from([0x00]),
+    keBuf, Buffer.from([0x00]),
+    Buffer.from(membershipBlock, 'utf-8'), Buffer.from([0x00]),
+    Buffer.from(policyBlock, 'utf-8'), Buffer.from([0x00]),
+    prevBytes,
+  ]);
+
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
 // ── Membership Manifest ───────────────────────────────────────
 
 /** 构建 Membership Manifest（未签名） */
@@ -1198,24 +1249,22 @@ export function handleKeyRequest(
   const secretData = loadGroupSecret(keystore, aid, groupId, epoch);
   if (!secretData) return null;
 
-  let commitmentStr = secretData.commitment as string ?? '';
+  // 历史隔离：密钥存储中记录了该 epoch 的成员列表，
+  // 若请求者不在该列表中，说明其不属于该 epoch，直接拒绝（不响应）。
   const memberAids = ((secretData.member_aids as string[]) ?? []).map(String).filter(Boolean).sort();
-  const currentMemberAids = currentMembers.map(String).filter(Boolean).sort();
-  let responseMemberAids = memberAids.length > 0 ? memberAids : currentMemberAids;
-  let includeEpochChain = true;
-  if (currentMemberAids.includes(requesterAid) && !responseMemberAids.includes(requesterAid)) {
-    responseMemberAids = currentMemberAids;
-    commitmentStr = computeMembershipCommitment(
-      responseMemberAids,
-      epoch, groupId, secretData.secret,
-    );
-    includeEpochChain = false;
-  } else if (!commitmentStr) {
-    commitmentStr = computeMembershipCommitment(
-      responseMemberAids,
-      epoch, groupId, secretData.secret,
-    );
+  if (memberAids.length > 0 && !memberAids.includes(requesterAid)) {
+    return null;
   }
+
+  // 确定响应使用的成员列表：优先使用密钥存储中的成员列表，
+  // 若为空（旧数据），则降级使用当前成员列表。
+  const responseMemberAids = memberAids.length > 0
+    ? memberAids
+    : currentMembers.map(String).filter(Boolean).sort();
+
+  // 若存储中无 commitment，按当前成员列表重新计算
+  const commitmentStr = (secretData.commitment as string)
+    || computeMembershipCommitment(responseMemberAids, epoch, groupId, secretData.secret);
 
   const response: JsonObject = {
     type: 'e2ee.group_key_response',
@@ -1229,7 +1278,8 @@ export function handleKeyRequest(
     responder_aid: aid,
     issued_at: Date.now(),
   };
-  if (includeEpochChain && secretData.epoch_chain !== undefined) {
+  // epoch_chain 始终包含（若有），供接收方验证历史轮转链
+  if (secretData.epoch_chain !== undefined) {
     response.epoch_chain = secretData.epoch_chain;
   }
   return privateKeyPem ? signGroupKeyResponse(response, privateKeyPem) : response;

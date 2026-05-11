@@ -413,6 +413,16 @@ class FileKeyStore(KeyStore):
                 conn.commit()
             return len(to_delete)
 
+    def save_group_state(self, aid: str, **kwargs) -> None:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            self._get_db(aid).save_group_state(**kwargs)
+
+    def load_group_state(self, aid: str, group_id: str) -> dict | None:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).load_group_state(group_id)
+
     def load_group_secret_epoch(self, aid: str, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
         lock = self._get_metadata_lock(aid)
         with lock:

@@ -2983,7 +2983,9 @@ export class AUNClient {
       const requester = (actualPayload.requester_aid ?? '') as string;
       let members = await this._groupE2ee.getMemberAids(groupId);
 
-      // 请求者不在本地成员列表时，回源查询服务端最新成员列表
+      // 请求者不在本地成员列表时，回源查询服务端最新成员列表（仅用于判断是否响应，不写回本地存储）
+      // P0 历史隔离：不再将回源结果更新到当前 epoch 的 member_aids/commitment，
+      // 避免用当前成员覆盖已固化的历史 epoch 快照。
       if (requester && !members.includes(requester)) {
         try {
           const membersResult = await this.call('group.get_members', { group_id: groupId });
@@ -2991,18 +2993,6 @@ export class AUNClient {
             ? membersResult.members as MemberRecord[]
             : [];
           members = memberList.map(m => String(m.aid ?? ''));
-          // 更新本地当前 epoch 的 member_aids/commitment
-          if (members.includes(requester)) {
-            const secretData = await this._groupE2ee.loadSecret(groupId);
-            if (secretData && this._aid) {
-              const epoch = secretData.epoch;
-              const commitment = await computeMembershipCommitment(members, epoch, groupId, secretData.secret);
-              await storeGroupSecret(
-                this._keystore, this._aid, groupId, epoch,
-                secretData.secret, commitment, members,
-              );
-            }
-          }
         } catch (exc) {
           console.warn(`群组 ${groupId} 成员列表回源失败:`, exc);
         }

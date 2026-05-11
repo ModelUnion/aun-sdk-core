@@ -1016,24 +1016,50 @@ class TestHandleKeyRequest:
         assert "commitment" in resp
         assert "member_aids" in resp
 
-    def test_response_expands_stale_epoch_membership_for_current_member(self, tmp_path):
+    def test_rejects_request_from_non_epoch_member(self, tmp_path):
+        """P0 历史隔离：请求者不属于目标 epoch 成员集时拒绝响应。"""
         ks_alice = _make_keystore(tmp_path / "alice")
-        ks_bob = _make_keystore(tmp_path / "bob")
-        old_members = [_AID]
+        old_members = [_AID]  # epoch 1 只有 alice
         gs = _random_secret()
         old_commitment = compute_membership_commitment(old_members, 1, _GRP, gs)
         store_group_secret(ks_alice, _AID, _GRP, 1, gs, old_commitment, old_members)
 
+        # bob 是当前成员但不属于 epoch 1
         req = build_key_request(_GRP, 1, _BOB)
         resp = handle_key_request(req, ks_alice, _AID, _MEMBERS)
 
+        # 应被拒绝
+        assert resp is None
+
+    def test_allows_request_from_epoch_member(self, tmp_path):
+        """P0 正向：请求者属于目标 epoch 成员集时正常返回密钥。"""
+        ks_alice = _make_keystore(tmp_path / "alice")
+        ks_bob = _make_keystore(tmp_path / "bob")
+        gs = _random_secret()
+        commitment = compute_membership_commitment(_MEMBERS, 2, _GRP, gs)
+        store_group_secret(ks_alice, _AID, _GRP, 2, gs, commitment, _MEMBERS)
+
+        req = build_key_request(_GRP, 2, _BOB)
+        resp = handle_key_request(req, ks_alice, _AID, _MEMBERS)
+
         assert resp is not None
-        assert resp["member_aids"] == sorted(_MEMBERS)
-        assert resp["commitment"] == compute_membership_commitment(_MEMBERS, 1, _GRP, gs)
+        assert resp["epoch"] == 2
+        assert base64.b64decode(resp["group_secret"]) == gs
+        # bob 能成功处理响应
         assert handle_key_response(resp, ks_bob, _BOB) is True
-        loaded = load_group_secret(ks_bob, _BOB, _GRP, 1)
-        assert loaded is not None
-        assert loaded["member_aids"] == sorted(_MEMBERS)
+
+    def test_rejects_request_when_member_aids_empty_fallback(self, tmp_path):
+        """当存储的 member_aids 为空时（旧数据），不做 epoch 成员校验，允许响应。"""
+        ks_alice = _make_keystore(tmp_path / "alice")
+        gs = _random_secret()
+        # 模拟旧数据：没有 member_aids
+        store_group_secret(ks_alice, _AID, _GRP, 1, gs, "", [])
+
+        req = build_key_request(_GRP, 1, _BOB)
+        resp = handle_key_request(req, ks_alice, _AID, _MEMBERS)
+
+        # member_aids 为空时跳过 epoch 成员校验（兼容旧数据）
+        assert resp is not None
 
 
 class TestHandleKeyResponse:
@@ -1800,3 +1826,159 @@ class TestCommitmentBindsGroupSecret:
         ks = _make_keystore(tmp_path)
         result = handle_key_distribution(dist, ks, _BOB, initiator_cert_pem=cert_pem)
         assert result is False  # commitment 不匹配
+
+
+# ── Group State Hash Tests ────────────────────────────────────
+
+
+class TestComputeStateHash:
+    """state_hash 计算测试"""
+
+    def test_deterministic(self):
+        """相同输入产生相同输出"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={"require_signature": True, "rotation_policy": "on_member_change"},
+            prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={"require_signature": True, "rotation_policy": "on_member_change"},
+            prev_state_hash="",
+        )
+        assert h1 == h2
+        assert len(h1) == 64
+
+    def test_member_order_independent(self):
+        """成员顺序不影响结果（按 AID 字典序排列）"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "bob.aid.com", "role": "member"}, {"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={}, prev_state_hash="",
+        )
+        assert h1 == h2
+
+    def test_role_change_changes_hash(self):
+        """角色变更导致 hash 变化"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={}, prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "admin"}],
+            policy={}, prev_state_hash=h1,
+        )
+        assert h1 != h2
+
+    def test_policy_change_changes_hash(self):
+        """策略变更导致 hash 变化"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={"require_signature": True, "rotation_policy": "on_member_change"},
+            prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={"require_signature": False, "rotation_policy": "manual"},
+            prev_state_hash=h1,
+        )
+        assert h1 != h2
+
+    def test_chain_linkage(self):
+        """prev_state_hash 参与计算，形成链"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        h2_a = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash=h1,
+        )
+        h2_b = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="0" * 64,
+        )
+        assert h2_a != h2_b
+
+    def test_empty_policy(self):
+        """空策略正常工作"""
+        from aun_core.e2ee import compute_state_hash
+        h = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        assert len(h) == 64
+
+    def test_genesis_prev_hash_empty(self):
+        """初始版本 prev_state_hash 为空字符串，使用 32 字节零"""
+        from aun_core.e2ee import compute_state_hash
+        h = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        assert isinstance(h, str) and len(h) == 64
+
+
+class TestGroupStateStorage:
+    """group_state 表的存取测试"""
+
+    def _make_db(self, tmp_path):
+        from aun_core.keystore.sqlite_db import AIDDatabase
+        return AIDDatabase(tmp_path / "test.db", b"test_seed_key_32bytes_padding!!")
+
+    def test_save_and_load(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.save_group_state(
+            group_id="grp_test",
+            state_version=3,
+            state_hash="ab" * 32,
+            key_epoch=2,
+            membership_json='[{"aid":"alice.aid.com","role":"owner"}]',
+            policy_json='{"require_signature":true}',
+        )
+        state = db.load_group_state("grp_test")
+        assert state is not None
+        assert state["state_version"] == 3
+        assert state["state_hash"] == "ab" * 32
+        assert state["key_epoch"] == 2
+        assert state["membership_json"] == '[{"aid":"alice.aid.com","role":"owner"}]'
+        assert state["policy_json"] == '{"require_signature":true}'
+
+    def test_load_nonexistent(self, tmp_path):
+        db = self._make_db(tmp_path)
+        assert db.load_group_state("grp_nonexist") is None
+
+    def test_upsert_overwrites(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.save_group_state(
+            group_id="grp_test", state_version=1, state_hash="aa" * 32,
+            key_epoch=1, membership_json="[]", policy_json="{}",
+        )
+        db.save_group_state(
+            group_id="grp_test", state_version=2, state_hash="bb" * 32,
+            key_epoch=1, membership_json="[]", policy_json="{}",
+        )
+        state = db.load_group_state("grp_test")
+        assert state["state_version"] == 2
+        assert state["state_hash"] == "bb" * 32

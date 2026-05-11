@@ -118,6 +118,15 @@ _DDL_STATEMENTS = [
         PRIMARY KEY (group_id, epoch)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_group_old_expires ON group_old_epochs (group_id, expires_at)",
+    """CREATE TABLE IF NOT EXISTS group_state (
+        group_id TEXT PRIMARY KEY,
+        state_version INTEGER NOT NULL DEFAULT 0,
+        state_hash TEXT NOT NULL DEFAULT '',
+        key_epoch INTEGER NOT NULL DEFAULT 0,
+        membership_json TEXT NOT NULL DEFAULT '',
+        policy_json TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL DEFAULT 0
+    )""",
     """CREATE TABLE IF NOT EXISTS e2ee_sessions (
         session_id TEXT PRIMARY KEY,
         data_enc TEXT NOT NULL DEFAULT '{}',
@@ -1149,6 +1158,47 @@ class AIDDatabase:
             conn.commit()
             return cur.rowcount
         return self._retry_on_locked(_do)
+
+    # ── Group State (state_hash) ──────────────────────────────
+
+    def save_group_state(
+        self, *, group_id: str, state_version: int, state_hash: str,
+        key_epoch: int, membership_json: str, policy_json: str,
+    ) -> None:
+        """保存/更新群组 state_hash 状态"""
+        def _do():
+            conn = self._get_conn()
+            now = _now_ms()
+            conn.execute(
+                "INSERT INTO group_state (group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(group_id) DO UPDATE SET "
+                "state_version=excluded.state_version, state_hash=excluded.state_hash, "
+                "key_epoch=excluded.key_epoch, membership_json=excluded.membership_json, "
+                "policy_json=excluded.policy_json, updated_at=excluded.updated_at",
+                (group_id, state_version, state_hash, key_epoch, membership_json, policy_json, now),
+            )
+            conn.commit()
+        self._retry_on_locked(_do)
+
+    def load_group_state(self, group_id: str) -> dict | None:
+        """加载群组 state_hash 状态"""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT state_version, state_hash, key_epoch, membership_json, policy_json, updated_at "
+            "FROM group_state WHERE group_id = ?", (group_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "group_id": group_id,
+            "state_version": row[0],
+            "state_hash": row[1],
+            "key_epoch": row[2],
+            "membership_json": row[3],
+            "policy_json": row[4],
+            "updated_at": row[5],
+        }
 
     # ── E2EE Sessions ────────────────────────────────────────
 

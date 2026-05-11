@@ -678,36 +678,51 @@ func TestHandleKeyRequest(t *testing.T) {
 	}
 }
 
-func TestHandleKeyRequest_ExpandsStaleEpochMembershipForCurrentMember(t *testing.T) {
+// TestHandleKeyRequest_RejectsNonEpochMember 验证 P0 历史隔离：
+// requester 在 currentMembers 中但不在 epoch 的 member_aids 中，请求应被拒绝
+func TestHandleKeyRequest_RejectsNonEpochMember(t *testing.T) {
 	aliceKS := testNewGroupKeyStore(t)
-	bobKS := testNewGroupKeyStore(t)
 	aid := "alice.test"
+	// epoch 1 只有 alice，bob 是后来加入的
 	oldMembers := []string{"alice.test"}
 	currentMembers := []string{"alice.test", "bob.test"}
 	secret := GenerateGroupSecret()
 	oldCommitment := ComputeMembershipCommitment(oldMembers, 1, "g1", secret)
 	StoreGroupSecret(aliceKS, aid, "g1", 1, secret, oldCommitment, oldMembers, "")
 
+	// bob 请求 epoch 1 的密钥，但 epoch 1 的 member_aids 不包含 bob
 	req := BuildKeyRequest("g1", 1, "bob.test")
 	resp := HandleKeyRequest(req, aliceKS, aid, currentMembers)
+	// P0 历史隔离：bob 不在 epoch 1 的成员中，必须拒绝
+	if resp != nil {
+		t.Fatal("requester 不在 epoch member_aids 中，应返回 nil 拒绝")
+	}
+}
+
+// TestHandleKeyRequest_AllowsEpochMember 验证 requester 在 epoch member_aids 中时正常响应
+func TestHandleKeyRequest_AllowsEpochMember(t *testing.T) {
+	aliceKS := testNewGroupKeyStore(t)
+	aid := "alice.test"
+	members := []string{"alice.test", "bob.test"}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 1, "g1", secret)
+	StoreGroupSecret(aliceKS, aid, "g1", 1, secret, commitment, members, "")
+
+	// bob 在 epoch 1 的 member_aids 中，请求应被接受
+	req := BuildKeyRequest("g1", 1, "bob.test")
+	resp := HandleKeyRequest(req, aliceKS, aid, members)
 	if resp == nil {
-		t.Fatal("应返回响应")
+		t.Fatal("requester 在 epoch member_aids 中，应返回响应")
+	}
+	if resp["type"] != "e2ee.group_key_response" {
+		t.Errorf("响应 type 不正确: %v", resp["type"])
 	}
 	responseMembers := toStringSlice(resp["member_aids"])
-	if !stringSliceEqual(responseMembers, currentMembers) {
-		t.Fatalf("响应 member_aids 应扩展到当前成员: %v", responseMembers)
+	if !stringSliceEqual(responseMembers, members) {
+		t.Fatalf("响应 member_aids 应与 epoch 成员一致: %v", responseMembers)
 	}
-	expectedCommitment := ComputeMembershipCommitment(currentMembers, 1, "g1", secret)
-	if resp["commitment"] != expectedCommitment {
-		t.Fatalf("响应 commitment 未按当前成员重算: %v", resp["commitment"])
-	}
-	if !HandleKeyResponse(resp, bobKS, "bob.test") {
-		t.Fatal("Bob 应接受扩展成员后的旧 epoch key response")
-	}
-	epochPtr := 1
-	loaded, _ := LoadGroupSecret(bobKS, "bob.test", "g1", &epochPtr)
-	if loaded == nil || !stringSliceEqual(toStringSlice(loaded["member_aids"]), currentMembers) {
-		t.Fatalf("Bob 存储的 member_aids 不正确: %#v", loaded)
+	if resp["commitment"] != commitment {
+		t.Fatalf("响应 commitment 应与存储值一致: %v", resp["commitment"])
 	}
 }
 
@@ -1228,5 +1243,63 @@ func TestGroupOptionalMetadataBoundWithIndependentAuth(t *testing.T) {
 	tamperedContext["context"] = map[string]any{"type": "thought", "id": "ctx-2"}
 	if decrypted := DecryptGroupMessage(secrets, tamperedContext, nil, false); decrypted != nil {
 		t.Fatalf("篡改 context 应解密失败: %#v", decrypted)
+	}
+}
+
+// ── ComputeStateHash 测试 ─────────────────────────────────
+
+func TestComputeStateHash_Deterministic(t *testing.T) {
+	members := []MemberRole{
+		{AID: "alice.aid.com", Role: "owner"},
+		{AID: "bob.aid.com", Role: "member"},
+	}
+	h1 := ComputeStateHash("grp_test", 1, 1, members, nil, "")
+	h2 := ComputeStateHash("grp_test", 1, 1, members, nil, "")
+	if h1 != h2 {
+		t.Fatalf("相同输入应产生相同哈希: h1=%s h2=%s", h1, h2)
+	}
+	if len(h1) != 64 {
+		t.Fatalf("哈希长度应为 64 hex 字符: got %d", len(h1))
+	}
+}
+
+func TestComputeStateHash_OrderIndependent(t *testing.T) {
+	m1 := []MemberRole{{AID: "bob.aid.com", Role: "member"}, {AID: "alice.aid.com", Role: "owner"}}
+	m2 := []MemberRole{{AID: "alice.aid.com", Role: "owner"}, {AID: "bob.aid.com", Role: "member"}}
+	h1 := ComputeStateHash("grp_test", 1, 1, m1, nil, "")
+	h2 := ComputeStateHash("grp_test", 1, 1, m2, nil, "")
+	if h1 != h2 {
+		t.Fatalf("成员顺序不同应产生相同哈希: h1=%s h2=%s", h1, h2)
+	}
+}
+
+func TestComputeStateHash_RoleChangeChangesHash(t *testing.T) {
+	m1 := []MemberRole{{AID: "alice.aid.com", Role: "owner"}, {AID: "bob.aid.com", Role: "member"}}
+	m2 := []MemberRole{{AID: "alice.aid.com", Role: "owner"}, {AID: "bob.aid.com", Role: "admin"}}
+	h1 := ComputeStateHash("grp_test", 1, 1, m1, nil, "")
+	h2 := ComputeStateHash("grp_test", 2, 1, m2, nil, h1)
+	if h1 == h2 {
+		t.Fatalf("角色变更应产生不同哈希")
+	}
+}
+
+func TestComputeStateHash_ChainLinkage(t *testing.T) {
+	members := []MemberRole{{AID: "alice.aid.com", Role: "owner"}}
+	h1 := ComputeStateHash("grp_test", 1, 1, members, nil, "")
+	h2a := ComputeStateHash("grp_test", 2, 1, members, nil, h1)
+	h2b := ComputeStateHash("grp_test", 2, 1, members, nil, strings.Repeat("0", 64))
+	if h2a == h2b {
+		t.Fatalf("不同 prevStateHash 应产生不同哈希")
+	}
+}
+
+func TestComputeStateHash_PolicyChangeChangesHash(t *testing.T) {
+	members := []MemberRole{{AID: "alice.aid.com", Role: "owner"}}
+	p1 := map[string]interface{}{"require_signature": true, "rotation_policy": "on_member_change"}
+	p2 := map[string]interface{}{"require_signature": false, "rotation_policy": "manual"}
+	h1 := ComputeStateHash("grp_test", 1, 1, members, p1, "")
+	h2 := ComputeStateHash("grp_test", 2, 1, members, p2, h1)
+	if h1 == h2 {
+		t.Fatalf("策略变更应产生不同哈希")
 	}
 }

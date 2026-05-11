@@ -2655,7 +2655,9 @@ export class AUNClient {
       const requester = String(actualPayload.requester_aid ?? '');
       let members = this._groupE2ee.getMemberAids(groupId);
 
-      // 请求者不在本地成员列表时，回源查询服务端最新成员列表
+      // 请求者不在本地成员列表时，回源查询服务端最新成员列表，
+      // 仅用于传递给 handleKeyRequestMsg 做鉴权，不更新本地密钥存储
+      // （历史 epoch 的成员隔离由 handleKeyRequest 内部负责）。
       if (requester && !members.includes(requester)) {
         try {
           const membersResult = await this.call('group.get_members', { group_id: groupId });
@@ -2665,20 +2667,6 @@ export class AUNClient {
           members = memberList.map(
             (m) => String(m.aid),
           );
-          // 更新本地当前 epoch 的 member_aids/commitment
-          if (members.includes(requester)) {
-            const secretData = this._groupE2ee.loadSecret(groupId);
-            if (secretData && this._aid) {
-              const epoch = secretData.epoch as number;
-              const commitment = computeMembershipCommitment(
-                members, epoch, groupId, secretData.secret,
-              );
-              storeGroupSecret(
-                this._keystore, this._aid, groupId, epoch,
-                secretData.secret, commitment, members,
-              );
-            }
-          }
         } catch (exc) {
           _clientLog('warn', '群组 %s 成员列表回源失败: %s', groupId, formatCaughtError(exc));
         }

@@ -88,6 +88,15 @@ var aidDBDDL = []string{
 		value TEXT NOT NULL,
 		updated_at INTEGER NOT NULL
 	)`,
+	`CREATE TABLE IF NOT EXISTS group_state (
+		group_id TEXT PRIMARY KEY,
+		state_version INTEGER NOT NULL DEFAULT 0,
+		state_hash TEXT NOT NULL DEFAULT '',
+		key_epoch INTEGER NOT NULL DEFAULT 0,
+		membership_json TEXT NOT NULL DEFAULT '',
+		policy_json TEXT NOT NULL DEFAULT '',
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`,
 }
 
 // AIDDatabase 单个 AID 的 SQLite 数据库。
@@ -1504,4 +1513,44 @@ func toInt64Local(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+// ── Group State ──────────────────────────────────────────────
+
+// SaveGroupState 保存群组 state_hash 状态（UPSERT）
+func (a *AIDDatabase) SaveGroupState(groupID string, stateVersion int64, stateHash string, keyEpoch int64, membershipJSON, policyJSON string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, err := a.db.Exec(
+		`INSERT INTO group_state (group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(group_id) DO UPDATE SET
+		   state_version=excluded.state_version,
+		   state_hash=excluded.state_hash,
+		   key_epoch=excluded.key_epoch,
+		   membership_json=excluded.membership_json,
+		   policy_json=excluded.policy_json,
+		   updated_at=excluded.updated_at`,
+		groupID, stateVersion, stateHash, keyEpoch, membershipJSON, policyJSON, nowMs(),
+	)
+	if err != nil {
+		return fmt.Errorf("SaveGroupState 失败 (group=%s): %w", groupID, err)
+	}
+	return nil
+}
+
+// LoadGroupState 加载群组 state_hash 状态
+func (a *AIDDatabase) LoadGroupState(groupID string) (*GroupState, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	row := a.db.QueryRow(
+		`SELECT group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at
+		 FROM group_state WHERE group_id = ?`, groupID,
+	)
+	var gs GroupState
+	err := row.Scan(&gs.GroupID, &gs.StateVersion, &gs.StateHash, &gs.KeyEpoch, &gs.MembershipJSON, &gs.PolicyJSON, &gs.UpdatedAt)
+	if err != nil {
+		return nil, nil // 不存在时返回 nil
+	}
+	return &gs, nil
 }

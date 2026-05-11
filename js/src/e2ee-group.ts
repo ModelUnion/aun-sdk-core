@@ -826,6 +826,106 @@ export async function verifyMembershipCommitment(
   return diff === 0;
 }
 
+// ── Group State Hash ─────────────────────────────────────────
+
+/** 将数值编码为 uint64 big-endian 8 字节 */
+function _uint64BE(n: number): Uint8Array {
+  const buf = new Uint8Array(8);
+  // JS number 安全整数范围内，高 4 字节用 Math.floor(n / 2^32)
+  const hi = Math.floor(n / 0x100000000);
+  const lo = n >>> 0;
+  buf[0] = (hi >>> 24) & 0xff;
+  buf[1] = (hi >>> 16) & 0xff;
+  buf[2] = (hi >>> 8) & 0xff;
+  buf[3] = hi & 0xff;
+  buf[4] = (lo >>> 24) & 0xff;
+  buf[5] = (lo >>> 16) & 0xff;
+  buf[6] = (lo >>> 8) & 0xff;
+  buf[7] = lo & 0xff;
+  return buf;
+}
+
+/** 递归排序 JSON 对象的 key（用于 canonical JSON） */
+function _sortObjectKeys(obj: unknown): unknown {
+  if (obj === null || obj === undefined || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(_sortObjectKeys);
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj as Record<string, unknown>).sort()) {
+    sorted[key] = _sortObjectKeys((obj as Record<string, unknown>)[key]);
+  }
+  return sorted;
+}
+
+/**
+ * 计算群组状态哈希（异步，SubtleCrypto SHA-256）。
+ *
+ * state_hash = SHA-256(
+ *   group_id | 0x00 |
+ *   state_version (uint64 big-endian 8 bytes) | 0x00 |
+ *   key_epoch (uint64 big-endian 8 bytes) | 0x00 |
+ *   membership_block | 0x00 |
+ *   policy_block | 0x00 |
+ *   prev_state_hash (32 bytes, 全零表示创世)
+ * )
+ */
+export async function computeStateHash(params: {
+  groupId: string;
+  stateVersion: number;
+  keyEpoch: number;
+  members: Array<{ aid: string; role: string }>;
+  policy: Record<string, unknown>;
+  prevStateHash: string;
+}): Promise<string> {
+  const { groupId, stateVersion, keyEpoch, members, policy, prevStateHash } = params;
+
+  // 按 AID 排序，构建 membership_block
+  const sorted = [...members].sort((a, b) => a.aid.localeCompare(b.aid));
+  const membershipBlock = sorted.map(m => `${m.aid}:${m.role}`).join('|');
+
+  // 按 key 递归排序的 canonical JSON（无空格）
+  const policyBlock = Object.keys(policy).length > 0
+    ? JSON.stringify(_sortObjectKeys(policy))
+    : '';
+
+  // prev_state_hash: 32 字节，空则全零
+  const prevBytes = prevStateHash
+    ? _hexToBytes(prevStateHash)
+    : new Uint8Array(32);
+
+  // state_version / key_epoch → uint64 big-endian
+  const svBuf = _uint64BE(stateVersion);
+  const keBuf = _uint64BE(keyEpoch);
+
+  const sep = new Uint8Array([0x00]);
+  const groupIdBytes = _encoder.encode(groupId);
+  const membershipBytes = _encoder.encode(membershipBlock);
+  const policyBytes = _encoder.encode(policyBlock);
+
+  // 拼接所有字段
+  const totalLen = groupIdBytes.length + 1
+    + svBuf.length + 1
+    + keBuf.length + 1
+    + membershipBytes.length + 1
+    + policyBytes.length + 1
+    + prevBytes.length;
+  const data = new Uint8Array(totalLen);
+  let offset = 0;
+  data.set(groupIdBytes, offset); offset += groupIdBytes.length;
+  data.set(sep, offset); offset += 1;
+  data.set(svBuf, offset); offset += svBuf.length;
+  data.set(sep, offset); offset += 1;
+  data.set(keBuf, offset); offset += keBuf.length;
+  data.set(sep, offset); offset += 1;
+  data.set(membershipBytes, offset); offset += membershipBytes.length;
+  data.set(sep, offset); offset += 1;
+  data.set(policyBytes, offset); offset += policyBytes.length;
+  data.set(sep, offset); offset += 1;
+  data.set(prevBytes, offset);
+
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return _bytesToHex(new Uint8Array(digest));
+}
+
 // ── Group Secret 生命周期管理 ────────────────────────────────
 
 /**
@@ -1216,18 +1316,14 @@ export async function handleKeyRequest(
   const secretData = await loadGroupSecret(keystore, aid, groupId, epoch);
   if (!secretData) return null;
 
-  let commitment = secretData.commitment;
+  // P0 历史隔离：若本 epoch 的 member_aids 非空且 requester 不在其中，拒绝响应
+  // 防止已退出成员通过 currentMembers 校验后拿到历史 epoch 密钥
   const memberAids = (secretData.member_aids ?? []).map(String).filter(Boolean).sort();
-  const currentMemberAids = currentMembers.map(String).filter(Boolean).sort();
-  let responseMemberAids = memberAids.length ? memberAids : currentMemberAids;
-  let includeEpochChain = true;
-  if (currentMemberAids.includes(requesterAid) && !responseMemberAids.includes(requesterAid)) {
-    responseMemberAids = currentMemberAids;
-    commitment = await computeMembershipCommitment(
-      responseMemberAids, epoch, groupId, secretData.secret,
-    );
-    includeEpochChain = false;
-  } else if (!commitment) {
+  if (memberAids.length > 0 && !memberAids.includes(requesterAid)) return null;
+
+  const responseMemberAids = memberAids.length ? memberAids : currentMembers.map(String).filter(Boolean).sort();
+  let commitment = secretData.commitment;
+  if (!commitment) {
     commitment = await computeMembershipCommitment(
       responseMemberAids, epoch, groupId, secretData.secret,
     );
@@ -1245,7 +1341,8 @@ export async function handleKeyRequest(
     responder_aid: aid,
     issued_at: Date.now(),
   };
-  if (includeEpochChain && secretData.epoch_chain !== undefined) {
+  // epoch_chain 始终随响应携带（若存在），不再因兼容分支而省略
+  if (secretData.epoch_chain !== undefined) {
     response.epoch_chain = secretData.epoch_chain;
   }
   return privateKeyPem ? await signGroupKeyResponse(response, privateKeyPem) : response;

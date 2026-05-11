@@ -1880,6 +1880,61 @@ def compute_epoch_chain(
     return digest.finalize().hex()
 
 
+# ── Group State Hash ──────────────────────────────────────
+
+
+def compute_state_hash(
+    *,
+    group_id: str,
+    state_version: int,
+    key_epoch: int,
+    members: list[dict],
+    policy: dict,
+    prev_state_hash: str,
+) -> str:
+    """计算群组状态哈希。
+
+    state_hash = SHA-256(
+        group_id | 0x00 |
+        state_version (uint64 big-endian 8 bytes) | 0x00 |
+        key_epoch (uint64 big-endian 8 bytes) | 0x00 |
+        membership_block | 0x00 |
+        policy_block | 0x00 |
+        prev_state_hash (32 bytes, 全零表示创世)
+    )
+
+    membership_block: 按 AID 字典序排列 "{aid}:{role}"，用 "|" 拼接
+    policy_block: JSON 规范化（key 字典序，无空格）
+    """
+    import json as _json
+
+    # membership_block: 按 AID 字典序
+    sorted_members = sorted(members, key=lambda m: m["aid"])
+    membership_block = "|".join(f"{m['aid']}:{m['role']}" for m in sorted_members)
+
+    # policy_block: 规范化 JSON
+    policy_block = _json.dumps(policy, sort_keys=True, separators=(",", ":")) if policy else ""
+
+    # prev_state_hash: 空字符串 → 32 字节零
+    if prev_state_hash:
+        prev_bytes = bytes.fromhex(prev_state_hash)
+    else:
+        prev_bytes = b"\x00" * 32
+
+    # 拼接并计算 SHA-256
+    data = (
+        group_id.encode("utf-8") + b"\x00"
+        + state_version.to_bytes(8, "big") + b"\x00"
+        + key_epoch.to_bytes(8, "big") + b"\x00"
+        + membership_block.encode("utf-8") + b"\x00"
+        + policy_block.encode("utf-8") + b"\x00"
+        + prev_bytes
+    )
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
+    return digest.finalize().hex()
+
+
 def verify_epoch_chain(
     epoch_chain: str,
     prev_chain: str | None,
@@ -2416,7 +2471,7 @@ def handle_key_request(
     if not all([requester_aid, group_id, epoch is not None]):
         return None
 
-    # 验证请求者是群成员
+    # 验证请求者是当前群成员
     if requester_aid not in current_members:
         return None
 
@@ -2425,19 +2480,19 @@ def handle_key_request(
     if secret_data is None:
         return None
 
-    commitment = secret_data.get("commitment", "")
+    # P0 历史隔离：请求者必须属于目标 epoch 的成员集，
+    # 拒绝新成员获取加入前的旧 epoch key。
     member_aids = sorted(str(m) for m in (secret_data.get("member_aids", []) or []) if m)
-    current_member_aids = sorted(str(m) for m in (current_members or []) if m)
-    response_member_aids = member_aids or current_member_aids
-    include_epoch_chain = True
-    if requester_aid in current_member_aids and requester_aid not in response_member_aids:
-        response_member_aids = current_member_aids
-        commitment = compute_membership_commitment(
-            response_member_aids, epoch, group_id, secret_data["secret"],
+    if member_aids and requester_aid not in member_aids:
+        _e2ee_log.warning(
+            "拒绝密钥恢复：%s 不属于 group=%s epoch=%s 的成员集",
+            requester_aid, group_id, epoch,
         )
-        # epoch_chain 绑定原始 commitment；同 epoch 补成员时需要按兼容档接收。
-        include_epoch_chain = False
-    elif not commitment:
+        return None
+
+    commitment = secret_data.get("commitment", "")
+    response_member_aids = member_aids or sorted(str(m) for m in (current_members or []) if m)
+    if not commitment:
         commitment = compute_membership_commitment(response_member_aids, epoch, group_id, secret_data["secret"])
 
     response = {
@@ -2453,7 +2508,7 @@ def handle_key_request(
         "issued_at": int(_time_mod.time() * 1000),
     }
     epoch_chain = secret_data.get("epoch_chain")
-    if include_epoch_chain and epoch_chain:
+    if epoch_chain:
         response["epoch_chain"] = epoch_chain
     if private_key_pem:
         response = sign_group_key_response(response, private_key_pem)

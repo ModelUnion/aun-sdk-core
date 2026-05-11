@@ -20,6 +20,7 @@ import {
   computeEpochChain,
   computeMembershipCommitment,
   verifyMembershipCommitment,
+  computeStateHash,
   storeGroupSecret,
   loadGroupSecret,
   loadAllGroupSecrets,
@@ -992,11 +993,11 @@ describe('handleKeyRequest', () => {
   );
 
   it.skipIf(!hasSubtleCrypto)(
-    '当前成员请求旧 epoch 时应扩展响应 member_aids 并重算 commitment',
+    'P0 历史隔离：当前成员请求旧 epoch 时若不在 epoch 成员集中应返回 null',
     async () => {
       const ksAlice = createMockKeyStore();
-      const ksBob = createMockKeyStore();
       const secret = generateGroupSecret();
+      // epoch 1 成员集只有 alice，bob 是后来加入的成员
       const oldMembers = ['alice'];
       const currentMembers = ['alice', 'bob'];
       const oldCommitment = await computeMembershipCommitment(oldMembers, 1, 'g1', secret);
@@ -1008,13 +1009,9 @@ describe('handleKeyRequest', () => {
         epoch: 1,
         requester_aid: 'bob',
       };
+      // P0：bob 不在旧 epoch 的 member_aids 中，必须拒绝
       const response = await handleKeyRequest(request, ksAlice, 'alice', currentMembers);
-
-      expect(response).not.toBeNull();
-      expect(response!.member_aids).toEqual(currentMembers);
-      expect(response!.commitment).toBe(await computeMembershipCommitment(currentMembers, 1, 'g1', secret));
-      expect(await handleKeyResponse(response!, ksBob, 'bob')).toBe(true);
-      expect((await loadGroupSecret(ksBob, 'bob', 'g1', 1))!.member_aids).toEqual(currentMembers);
+      expect(response).toBeNull();
     },
   );
 
@@ -1371,4 +1368,107 @@ describe('encryptGroupMessage 签名失败应抛出错误（ISSUE-SDK-JS-011/019
       ).rejects.toThrow();
     },
   );
+});
+
+// ── computeStateHash 测试 ──────────────────────────────────
+
+describe('computeStateHash', () => {
+  it.skipIf(!hasSubtleCrypto)('确定性：相同输入产生相同哈希', async () => {
+    const params = {
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'member' },
+      ],
+      policy: { require_signature: true, rotation_policy: 'on_member_change' },
+      prevStateHash: '',
+    };
+    const h1 = await computeStateHash(params);
+    const h2 = await computeStateHash(params);
+    expect(h1).toBe(h2);
+    expect(h1).toHaveLength(64);
+  });
+
+  it.skipIf(!hasSubtleCrypto)('成员顺序无关', async () => {
+    const h1 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'bob.aid.com', role: 'member' },
+        { aid: 'alice.aid.com', role: 'owner' },
+      ],
+      policy: {},
+      prevStateHash: '',
+    });
+    const h2 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'member' },
+      ],
+      policy: {},
+      prevStateHash: '',
+    });
+    expect(h1).toBe(h2);
+  });
+
+  it.skipIf(!hasSubtleCrypto)('角色变更导致哈希变化', async () => {
+    const h1 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'member' },
+      ],
+      policy: {},
+      prevStateHash: '',
+    });
+    const h2 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 2,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'admin' },
+      ],
+      policy: {},
+      prevStateHash: h1,
+    });
+    expect(h1).not.toBe(h2);
+  });
+
+  it.skipIf(!hasSubtleCrypto)('prevStateHash 链式绑定', async () => {
+    const members = [{ aid: 'alice.aid.com', role: 'owner' }];
+    const h1 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members,
+      policy: {},
+      prevStateHash: '',
+    });
+    const h2a = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 2,
+      keyEpoch: 1,
+      members,
+      policy: {},
+      prevStateHash: h1,
+    });
+    const h2b = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 2,
+      keyEpoch: 1,
+      members,
+      policy: {},
+      prevStateHash: '0'.repeat(64),
+    });
+    expect(h2a).not.toBe(h2b);
+  });
 });

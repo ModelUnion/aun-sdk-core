@@ -1635,7 +1635,8 @@ class TestKeyRequestFallbackToServer:
     """group_key_request 响应端：请求者不在本地成员列表时回源查询服务端"""
 
     def test_unknown_requester_triggers_server_lookup(self, tmp_path, monkeypatch):
-        """请求者不在本地 member_aids，应回源 group.get_members 后仍能响应"""
+        """P0 历史隔离：Carol 是当前成员但不在 epoch 1 的 member_aids 中，
+        回源查询服务端确认当前成员身份，但因 epoch 成员校验拒绝响应。"""
         client = _make_client(tmp_path, aid=_AID_ALICE)
         gs = _store_secret_for_client(client, epoch=1)
         _CAROL = "carol.agentid.pub"
@@ -1677,12 +1678,11 @@ class TestKeyRequestFallbackToServer:
 
         asyncio.run(run())
 
-        # 验证：回源查询了服务端
+        # 验证：回源查询了服务端（确认 Carol 是当前成员）
         assert len(server_lookup_called) == 1
         assert server_lookup_called[0]["group_id"] == _GRP
-        # 验证：成功向 Carol 发送了 group_key_response
-        assert len(sent_messages) == 1
-        assert sent_messages[0]["to"] == _CAROL
+        # 验证：因 epoch 成员校验拒绝响应（Carol 不属于 epoch 1 成员集）
+        assert len(sent_messages) == 0
 
     def test_known_requester_no_server_lookup(self, tmp_path, monkeypatch):
         """请求者已在本地 member_aids，不应回源查询"""

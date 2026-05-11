@@ -11,6 +11,7 @@ import {
   computeEpochChain,
   computeMembershipCommitment,
   verifyMembershipCommitment,
+  computeStateHash,
   storeGroupSecret,
   loadGroupSecret,
   loadAllGroupSecrets,
@@ -621,23 +622,41 @@ describe('buildKeyRequest / handleKeyRequest / handleKeyResponse', () => {
     expect(loaded!.epoch).toBe(1);
   });
 
-  it('当前成员请求旧 epoch 时应扩展响应 member_aids 并重算 commitment', () => {
+  it('P0 历史隔离：当前成员请求旧 epoch 时若不在 epoch 成员集中应返回 null', () => {
     const aliceKs = new FakeKeystore();
-    const bobKs = new FakeKeystore();
     const gs = makeGroupSecret();
+    // epoch 1 只有 alice，bob 是后加入的新成员
     const oldMembers = ['alice.test'];
     const currentMembers = ['alice.test', 'bob.test'];
     const oldCommitment = computeMembershipCommitment(oldMembers, 1, 'grp-1', gs);
     storeGroupSecret(aliceKs, 'alice.test', 'grp-1', 1, gs, oldCommitment, oldMembers);
 
+    // bob 不在 epoch 1 的成员集中，应被直接拒绝
+    const request = buildKeyRequest('grp-1', 1, 'bob.test');
+    const response = handleKeyRequest(request, aliceKs, 'alice.test', currentMembers);
+
+    expect(response).toBeNull();
+  });
+
+  it('P0 历史隔离：请求者在旧 epoch 成员集中时应正常响应', () => {
+    const aliceKs = new FakeKeystore();
+    const bobKs = new FakeKeystore();
+    const gs = makeGroupSecret();
+    // epoch 1 时 alice 和 bob 都是成员
+    const epochMembers = ['alice.test', 'bob.test'];
+    const currentMembers = ['alice.test', 'bob.test', 'carol.test'];
+    const commitment = computeMembershipCommitment(epochMembers, 1, 'grp-1', gs);
+    storeGroupSecret(aliceKs, 'alice.test', 'grp-1', 1, gs, commitment, epochMembers);
+
+    // bob 在 epoch 1 的成员集中，应正常获得密钥
     const request = buildKeyRequest('grp-1', 1, 'bob.test');
     const response = handleKeyRequest(request, aliceKs, 'alice.test', currentMembers);
 
     expect(response).not.toBeNull();
-    expect(response!.member_aids).toEqual(currentMembers);
-    expect(response!.commitment).toBe(computeMembershipCommitment(currentMembers, 1, 'grp-1', gs));
+    expect(response!.member_aids).toEqual(epochMembers);
+    expect(response!.commitment).toBe(commitment);
     expect(handleKeyResponse(response!, bobKs, 'bob.test')).toBe(true);
-    expect(loadGroupSecret(bobKs, 'bob.test', 'grp-1', 1)!.member_aids).toEqual(currentMembers);
+    expect(loadGroupSecret(bobKs, 'bob.test', 'grp-1', 1)!.member_aids).toEqual(epochMembers);
   });
 
   it('非成员请求密钥被拒绝', () => {
@@ -996,5 +1015,67 @@ describe('Commitment 绑定', () => {
     const c1 = computeMembershipCommitment(['a'], 1, 'grp-1', gs);
     const c2 = computeMembershipCommitment(['a', 'b'], 1, 'grp-1', gs);
     expect(c1).not.toBe(c2);
+  });
+});
+
+// ── computeStateHash ─────────────────────────────────────────
+
+describe('computeStateHash', () => {
+  it('确定性：相同输入产生相同哈希', () => {
+    const params = {
+      groupId: 'grp_test', stateVersion: 1, keyEpoch: 1,
+      members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob.aid.com', role: 'member' }],
+      policy: { require_signature: true, rotation_policy: 'on_member_change' },
+      prevStateHash: '',
+    };
+    const h1 = computeStateHash(params);
+    const h2 = computeStateHash(params);
+    expect(h1).toBe(h2);
+    expect(h1).toHaveLength(64);
+  });
+
+  it('成员顺序无关', () => {
+    const h1 = computeStateHash({
+      groupId: 'grp_test', stateVersion: 1, keyEpoch: 1,
+      members: [{ aid: 'bob.aid.com', role: 'member' }, { aid: 'alice.aid.com', role: 'owner' }],
+      policy: {}, prevStateHash: '',
+    });
+    const h2 = computeStateHash({
+      groupId: 'grp_test', stateVersion: 1, keyEpoch: 1,
+      members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob.aid.com', role: 'member' }],
+      policy: {}, prevStateHash: '',
+    });
+    expect(h1).toBe(h2);
+  });
+
+  it('角色变更导致哈希变化', () => {
+    const h1 = computeStateHash({
+      groupId: 'grp_test', stateVersion: 1, keyEpoch: 1,
+      members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob.aid.com', role: 'member' }],
+      policy: {}, prevStateHash: '',
+    });
+    const h2 = computeStateHash({
+      groupId: 'grp_test', stateVersion: 2, keyEpoch: 1,
+      members: [{ aid: 'alice.aid.com', role: 'owner' }, { aid: 'bob.aid.com', role: 'admin' }],
+      policy: {}, prevStateHash: h1,
+    });
+    expect(h1).not.toBe(h2);
+  });
+
+  it('prevStateHash 链式绑定', () => {
+    const members = [{ aid: 'alice.aid.com', role: 'owner' }];
+    const h1 = computeStateHash({
+      groupId: 'grp_test', stateVersion: 1, keyEpoch: 1,
+      members, policy: {}, prevStateHash: '',
+    });
+    const h2a = computeStateHash({
+      groupId: 'grp_test', stateVersion: 2, keyEpoch: 1,
+      members, policy: {}, prevStateHash: h1,
+    });
+    const h2b = computeStateHash({
+      groupId: 'grp_test', stateVersion: 2, keyEpoch: 1,
+      members, policy: {}, prevStateHash: '0'.repeat(64),
+    });
+    expect(h2a).not.toBe(h2b);
   });
 });

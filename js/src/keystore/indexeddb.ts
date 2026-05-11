@@ -2,7 +2,7 @@
 
 import { pemToArrayBuffer } from '../crypto.js';
 import { normalizeInstanceId } from '../config.js';
-import type { KeyStore } from './index.js';
+import type { KeyStore, GroupStateRecord } from './index.js';
 import {
   isJsonObject,
   type GroupOldEpochRecord,
@@ -134,7 +134,7 @@ async function _decryptPEM(enc: EncryptedEnvelope, seed: string): Promise<string
 // ── IndexedDB 工具 ──────────────────────────────────────
 
 const DB_NAME = 'aun-keystore';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 
 /** 对象仓库名称 */
 const STORE_KEY_PAIRS = 'key_pairs';
@@ -145,6 +145,7 @@ const STORE_PREKEYS = 'prekeys';
 const STORE_GROUP_CURRENT = 'group_current';
 const STORE_GROUP_OLD_EPOCHS = 'group_old_epochs';
 const STORE_SESSIONS = 'e2ee_sessions';
+const STORE_GROUP_STATE = 'group_state';
 
 const STRUCTURED_RECOVERY_RETENTION_MS = 7 * 24 * 3600 * 1000;
 const CRITICAL_METADATA_KEYS = [] as const;
@@ -279,6 +280,9 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_SESSIONS)) {
         db.createObjectStore(STORE_SESSIONS);
+      }
+      if (!db.objectStoreNames.contains(STORE_GROUP_STATE)) {
+        db.createObjectStore(STORE_GROUP_STATE);
       }
     };
 
@@ -1627,6 +1631,36 @@ export class IndexedDBKeyStore implements KeyStore {
       }
     }
     return result;
+  }
+
+  // ── Group State（群组状态快照） ─────────────────────────────
+
+  async saveGroupState(groupId: string, state: GroupStateRecord): Promise<void> {
+    const key = encodePart(groupId);
+    await idbPut(STORE_GROUP_STATE, key, {
+      group_id: groupId,
+      state_version: state.state_version,
+      state_hash: state.state_hash,
+      key_epoch: state.key_epoch,
+      membership_json: state.membership_json,
+      policy_json: state.policy_json,
+      updated_at: state.updated_at ?? Date.now(),
+    });
+  }
+
+  async loadGroupState(groupId: string): Promise<GroupStateRecord | null> {
+    const key = encodePart(groupId);
+    const data = await idbGet<GroupStateRecord>(STORE_GROUP_STATE, key);
+    if (!data || typeof data.state_version !== 'number') return null;
+    return {
+      group_id: groupId,
+      state_version: data.state_version,
+      state_hash: data.state_hash ?? '',
+      key_epoch: data.key_epoch ?? 0,
+      membership_json: data.membership_json ?? '[]',
+      policy_json: data.policy_json ?? '{}',
+      updated_at: data.updated_at ?? 0,
+    };
   }
 
   // ── Trust Root Storage（信任根证书存储） ─────────────────

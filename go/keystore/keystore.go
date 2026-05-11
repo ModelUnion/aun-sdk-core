@@ -26,6 +26,17 @@ type KeyStore interface {
 	ListIdentities() ([]string, error)
 }
 
+// GroupState represents the current state_hash state for a group.
+type GroupState struct {
+	GroupID        string `json:”group_id”`
+	StateVersion   int64  `json:”state_version”`
+	StateHash      string `json:”state_hash”`
+	KeyEpoch       int64  `json:”key_epoch”`
+	MembershipJSON string `json:”membership_json”`
+	PolicyJSON     string `json:”policy_json”`
+	UpdatedAt      int64  `json:”updated_at”`
+}
+
 // StructuredKeyStore 提供结构化主存能力。
 // 与 Python FileKeyStore 的 prekeys / group secret state 语义对齐。
 //
@@ -67,6 +78,12 @@ type StructuredKeyStore interface {
 
 	// DeleteGroupSecretState 删除单个群组的所有密钥状态
 	DeleteGroupSecretState(aid, groupID string) error
+
+	// SaveGroupState 保存群组 state_hash 状态
+	SaveGroupState(aid, groupID string, stateVersion int64, stateHash string, keyEpoch int64, membershipJSON, policyJSON string) error
+
+	// LoadGroupState 加载群组 state_hash 状态
+	LoadGroupState(aid, groupID string) (*GroupState, error)
 }
 
 type GroupSecretTransitionOptions struct {

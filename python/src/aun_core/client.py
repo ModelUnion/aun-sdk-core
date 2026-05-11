@@ -328,6 +328,8 @@ class AUNClient:
         self._dispatcher.subscribe("_raw.group.message_created", self._on_raw_group_message_created)
         # 群组变更事件：拦截处理成员变更触发的 epoch 轮换，然后透传
         self._dispatcher.subscribe("_raw.group.changed", self._on_raw_group_changed)
+        # 群组状态提交事件：验证 state_hash 链并更新本地存储
+        self._dispatcher.subscribe("_raw.group.state_committed", self._on_group_state_committed)
         # 其他事件直接透传
         for evt in ("message.recalled", "message.ack", "storage.object_changed"):
             self._dispatcher.subscribe(f"_raw.{evt}", lambda data, e=evt: self._dispatcher.publish(e, data))
@@ -1920,6 +1922,68 @@ class AUNClient:
         else:
             await self._dispatcher.publish("group.changed", data)
 
+    async def _on_group_state_committed(self, data: Any) -> None:
+        """处理 event/group.state_committed：验证 state_hash 链并更新本地存储"""
+        if not isinstance(data, dict):
+            return
+        group_id = str(data.get("group_id") or "").strip()
+        if not group_id:
+            return
+
+        state_version = int(data.get("state_version") or 0)
+        state_hash = str(data.get("state_hash") or "").strip()
+        prev_state_hash = str(data.get("prev_state_hash") or "").strip()
+        key_epoch = int(data.get("key_epoch") or 0)
+        membership_snapshot = str(data.get("membership_snapshot") or "").strip()
+        policy_snapshot = str(data.get("policy_snapshot") or "").strip()
+
+        # 1. 验证 prev_state_hash 连续性
+        local_state = self._keystore.load_group_state(self._aid, group_id)
+        if local_state and local_state["state_hash"] and local_state["state_hash"] != prev_state_hash:
+            _client_log.warning(
+                "state_hash 链不连续 group=%s local_sv=%d event_sv=%d",
+                group_id, local_state["state_version"], state_version,
+            )
+            # 回源同步
+            try:
+                server_state = await self._transport.call("group.get_state", {"group_id": group_id})
+                if server_state and "state_version" in server_state:
+                    self._keystore.save_group_state(
+                        self._aid,
+                        group_id=group_id,
+                        state_version=int(server_state["state_version"]),
+                        state_hash=str(server_state.get("state_hash", "")),
+                        key_epoch=int(server_state.get("key_epoch", 0)),
+                        membership_json=membership_snapshot,
+                        policy_json=policy_snapshot,
+                    )
+            except Exception as exc:
+                _client_log.warning("state 回源失败 group=%s: %s", group_id, exc)
+            return
+
+        # 2. 本地重算验证
+        import json as _json
+        members = _json.loads(membership_snapshot) if membership_snapshot else []
+        policy = _json.loads(policy_snapshot) if policy_snapshot else {}
+        from .e2ee import compute_state_hash
+        computed = compute_state_hash(
+            group_id=group_id, state_version=state_version, key_epoch=key_epoch,
+            members=members, policy=policy, prev_state_hash=prev_state_hash,
+        )
+        if computed != state_hash:
+            _client_log.warning(
+                "state_hash 重算不匹配 group=%s sv=%d expected=%s got=%s",
+                group_id, state_version, state_hash, computed,
+            )
+            return
+
+        # 3. 更新本地存储
+        self._keystore.save_group_state(
+            self._aid,
+            group_id=group_id, state_version=state_version, state_hash=state_hash,
+            key_epoch=key_epoch, membership_json=membership_snapshot, policy_json=policy_snapshot,
+        )
+
     async def _verify_event_signature(self, event: dict, cs: dict) -> str | bool:
         """验证群事件中的 client_signature。返回 True/False/"pending"。"""
         try:
@@ -3044,21 +3108,12 @@ class AUNClient:
 
             # 请求者不在本地成员列表时，回源查询服务端最新成员列表
             # （覆盖 use_invite_code 等不经过 owner 客户端的入群路径）
+            # 注意：仅用于传递 current_members 做当前成员校验，
+            # 不改写历史 epoch 的 member_aids，防止破坏历史隔离。
             if requester and requester not in members:
                 try:
                     members_result = await self.call("group.get_members", {"group_id": group_id})
                     members = [m["aid"] for m in members_result.get("members", [])]
-                    # 更新本地当前 epoch 的 member_aids/commitment
-                    if requester in members:
-                        secret_data = self._group_e2ee.load_secret(group_id)
-                        if secret_data:
-                            from .e2ee import compute_membership_commitment, store_group_secret
-                            epoch = secret_data["epoch"]
-                            commitment = compute_membership_commitment(members, epoch, group_id, secret_data["secret"])
-                            store_group_secret(
-                                self._keystore, self._aid, group_id, epoch,
-                                secret_data["secret"], commitment, members,
-                            )
                 except Exception as exc:
                     _client_log.warning("群组 %s 成员列表回源失败: %s", group_id, exc)
 

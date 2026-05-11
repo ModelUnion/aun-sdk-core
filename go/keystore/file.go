@@ -621,6 +621,28 @@ func (f *FileKeyStore) DeleteGroupSecretState(aid, groupID string) error {
 	return nil
 }
 
+func (f *FileKeyStore) SaveGroupState(aid, groupID string, stateVersion int64, stateHash string, keyEpoch int64, membershipJSON, policyJSON string) error {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return err
+	}
+	return db.SaveGroupState(groupID, stateVersion, stateHash, keyEpoch, membershipJSON, policyJSON)
+}
+
+func (f *FileKeyStore) LoadGroupState(aid, groupID string) (*GroupState, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return nil, err
+	}
+	return db.LoadGroupState(groupID)
+}
+
 // ── Instance State ───────────────────────────────────────────
 
 func (f *FileKeyStore) LoadInstanceState(aid, deviceID, slotID string) (map[string]any, error) {
