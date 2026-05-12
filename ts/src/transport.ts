@@ -13,7 +13,15 @@ import * as crypto from 'node:crypto';
 
 import { ConnectionError, SerializationError, TimeoutError, mapRemoteError } from './errors.js';
 import type { EventDispatcher } from './events.js';
+import type { ModuleLogger } from './logger.js';
 import { isJsonObject, type JsonObject, type JsonValue, type RpcMessage, type RpcParams, type RpcResult } from './types.js';
+
+const _noopLogger: ModuleLogger = {
+  error: () => {},
+  warn:  () => {},
+  info:  () => {},
+  debug: () => {},
+};
 
 /** 协议事件名映射 */
 const EVENT_NAME_MAP: Record<string, string> = {
@@ -32,6 +40,7 @@ export type DisconnectCallback = (error: Error | null, closeCode?: number) => vo
  * WebSocket JSON-RPC 2.0 传输层
  */
 export class RPCTransport {
+  private _logger: ModuleLogger;
   private _dispatcher: EventDispatcher;
   private _timeout: number;
   private _onDisconnect: DisconnectCallback | null;
@@ -51,7 +60,9 @@ export class RPCTransport {
     timeout?: number;
     onDisconnect?: DisconnectCallback | null;
     verifySsl?: boolean;
+    logger?: ModuleLogger;
   }) {
+    this._logger = opts.logger ?? _noopLogger;
     this._dispatcher = opts.eventDispatcher;
     this._timeout = opts.timeout ?? 10_000;
     this._onDisconnect = opts.onDisconnect ?? null;
@@ -294,7 +305,7 @@ export class RPCTransport {
       this._closed = true;
       if (!wasClosed && this._onDisconnect) {
         const cb = this._onDisconnect;
-        Promise.resolve(cb(null, code)).catch(() => console.warn('[aun_core.transport] disconnect 回调异常'));
+        Promise.resolve(cb(null, code)).catch(() => this._logger.warn('disconnect 回调异常'));
       }
     });
 

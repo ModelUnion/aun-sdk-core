@@ -598,6 +598,7 @@ export class AUNClient {
       timeout: 10_000,
       onDisconnect: (err, closeCode) => this._handleTransportDisconnect(err, closeCode),
       verifySsl: this._configModel.verifySsl,
+      logger: this._logger.for('aun_core.transport'),
     });
 
     this._e2ee = new E2EEManager({
