@@ -553,7 +553,7 @@ export class AUNClient {
       seed_password: this._configModel.seedPassword,
     };
 
-    this._dispatcher = new EventDispatcher();
+    this._dispatcher = new EventDispatcher(this._logger.for('aun_core.events'));
     this._discovery = new GatewayDiscovery({ verifySsl: this._configModel.verifySsl });
 
     const defaultSQLiteBackup = new SQLiteBackup(join(this._configModel.aunPath, '.aun_backup', 'aun_backup.db'));
