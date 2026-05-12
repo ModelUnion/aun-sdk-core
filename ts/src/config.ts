@@ -92,6 +92,8 @@ export interface AUNConfig {
   requireForwardSecrecy: boolean;
   /** 防重放窗口（秒） */
   replayWindowSeconds: number;
+  /** 是否启用 debug 模式（DEBUG 级别输出 + 文件日志） */
+  debug: boolean;
 }
 
 function readOptionalNumber(value: unknown, fallback: number | null): number | null {
@@ -128,6 +130,7 @@ export function defaultConfig(): AUNConfig {
     verifySsl: resolveVerifySslFromEnv(),
     requireForwardSecrecy: true,
     replayWindowSeconds: 300,
+    debug: false,
   };
 }
 
@@ -153,5 +156,6 @@ export function configFromMap(raw: JsonObject): AUNConfig {
     verifySsl: readBoolean(raw.verify_ssl ?? raw.verifySSL ?? raw.verifySsl, def.verifySsl),
     requireForwardSecrecy: readBoolean(raw.require_forward_secrecy ?? raw.requireForwardSecrecy, def.requireForwardSecrecy),
     replayWindowSeconds: readOptionalNumber(raw.replay_window_seconds ?? raw.replayWindowSeconds, def.replayWindowSeconds) ?? def.replayWindowSeconds,
+    debug: readBoolean(raw.debug, def.debug),
   };
 }
