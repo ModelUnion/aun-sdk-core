@@ -46,7 +46,7 @@ import {
 import { EventDispatcher, type EventPayload, type Subscription, type EventHandler } from './events.js';
 import { FileKeyStore } from './keystore/file.js';
 import type { KeyStore } from './keystore/index.js';
-import { AUNLogger } from './logger.js';
+import { AUNLogger, type ModuleLogger } from './logger.js';
 import { SQLiteBackup } from './keystore/sqlite-backup.js';
 
 import { AuthNamespace } from './namespaces/auth.js';
@@ -66,23 +66,6 @@ import {
   type RpcResult,
 } from './types.js';
 
-// ── 日志辅助 ──────────────────────────────────────────────────
-
-/** 文件日志（模块级单例） */
-let _debugLogger: AUNLogger | null = null;
-
-/** 简易日志：前缀 [aun_core.client] */
-function _clientLog(
-  level: string,
-  msg: string,
-  ...args: Array<string | number | boolean | null | undefined | Error | object>
-): void {
-  const ts = new Date().toISOString();
-  const formatted = args.reduce<string>((s, a) => s.replace('%s', String(a)), msg);
-  // eslint-disable-next-line no-console
-  console.log(`[${ts}] [aun_core.client] ${level}: ${formatted}`);
-  if (_debugLogger) _debugLogger.log(`${level}: ${formatted}`);
-}
 
 /**
  * 递归排序键的 JSON 序列化（Canonical JSON for AUN）
@@ -558,6 +541,8 @@ export class AUNClient {
   private _reconnectActive = false;
   private _reconnectAbort: AbortController | null = null;
   private _serverKicked = false;
+  private _logger!: AUNLogger;
+  private _clientLog!: ModuleLogger;
 
   constructor(config?: RpcParams, debug = false) {
     const rawConfig: RpcParams = { ...(config ?? {}) };
@@ -582,10 +567,15 @@ export class AUNClient {
     this._keystore = keystore;
     this._deviceId = getDeviceId(this._configModel.aunPath);
 
-    // 初始化文件日志（仅 debug 模式）
-    if (debug) {
-      _debugLogger = new AUNLogger();
-      _clientLog('info', 'AUNClient 初始化完成 (debug=true, aunPath=%s)', this._configModel.aunPath);
+    // 初始化 Logger（per-client 单例）
+    const debugFlag = this._configModel.debug || debug;
+    this._logger = new AUNLogger({
+      debug: debugFlag,
+      aunPath: this._configModel.aunPath,
+    });
+    this._clientLog = this._logger.for('aun_core.client');
+    if (debugFlag) {
+      this._clientLog.info(`AUNClient 初始化完成 (debug=true, aunPath=${this._configModel.aunPath})`);
     }
 
     this._slotId = '';
@@ -721,6 +711,7 @@ export class AUNClient {
       const closableKeyStore = this._keystore as KeyStore & { close?: () => void };
       closableKeyStore.close?.();
       this._state = 'closed';
+      this._logger.close();
       this._resetSeqTrackingState();
       return;
     }
@@ -728,6 +719,7 @@ export class AUNClient {
     const closableKeyStore = this._keystore as KeyStore & { close?: () => void };
     closableKeyStore.close?.();
     this._state = 'closed';
+    this._logger.close();
     await this._dispatcher.publish('connection.state', { state: this._state });
     this._resetSeqTrackingState();
   }
@@ -870,7 +862,7 @@ export class AUNClient {
         if (serverAck > 0) {
           const contig = this._seqTracker.getContiguousSeq(ns);
           if (contig < serverAck) {
-            _clientLog('info', 'message.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d', ns, contig, serverAck);
+            this._clientLog.info(`message.pull retention-floor 推进: ns=${ns} contiguous=${contig} -> server_ack_seq=${serverAck}`);
             this._seqTracker.forceContiguousSeq(ns, serverAck);
           }
         }
@@ -882,7 +874,7 @@ export class AUNClient {
             seq: contig,
             device_id: this._deviceId,
             slot_id: this._slotId,
-          }).catch((e) => { _clientLog('debug', 'message.pull auto-ack 失败: %s', formatCaughtError(e)); });
+          }).catch((e) => { this._clientLog.debug(`message.pull auto-ack 失败: ${formatCaughtError(e)}`); });
         }
       }
     }
@@ -910,7 +902,7 @@ export class AUNClient {
           if (serverAck > 0) {
             const contig = this._seqTracker.getContiguousSeq(ns);
             if (contig < serverAck) {
-              _clientLog('info', 'group.pull retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d', ns, contig, serverAck);
+              this._clientLog.info(`group.pull retention-floor 推进: ns=${ns} contiguous=${contig} -> cursor.current_seq=${serverAck}`);
               this._seqTracker.forceContiguousSeq(ns, serverAck);
             }
           }
@@ -925,7 +917,7 @@ export class AUNClient {
             msg_seq: contig,
             device_id: this._deviceId,
             slot_id: this._slotId,
-          }).catch((e) => { _clientLog('debug', 'group.pull auto-ack 失败: group=%s %s', gid, formatCaughtError(e)); });
+          }).catch((e) => { this._clientLog.debug(`group.pull auto-ack 失败: group=${gid} ${formatCaughtError(e)}`); });
         }
       }
     }
@@ -981,7 +973,7 @@ export class AUNClient {
         );
         const timeoutPromise = new Promise<void>((resolve) => globalThis.setTimeout(resolve, 5000));
         await Promise.race([rotationPromise, timeoutPromise]).catch((exc) =>
-          _clientLog('warn', 'membership RPC epoch rotation fallback failed: %s', formatCaughtError(exc)),
+          this._clientLog.warn(`membership RPC epoch rotation fallback failed: ${formatCaughtError(exc)}`),
         );
       }
     }
@@ -1114,7 +1106,7 @@ export class AUNClient {
       return await sendAttempt(false);
     } catch (exc) {
       if (!isRetryablePeerMaterialError(exc)) throw exc;
-      _clientLog('warn', 'peer cert/prekey mismatch for %s, refreshing and retrying once', toAid);
+      this._clientLog.warn(`peer cert/prekey mismatch for ${toAid}, refreshing and retrying once`);
     }
     return await sendAttempt(true);
   }
@@ -1254,7 +1246,7 @@ export class AUNClient {
         );
       } catch (e) {
         // 旧设备的 prekey 可能携带已轮换的证书指纹，跳过该设备的自同步副本
-        _clientLog('warn', `self-sync 跳过设备 ${deviceId}: 证书解析失败 (${e})，可能是旧 prekey`);
+        this._clientLog.warn(`self-sync 跳过设备 ${deviceId}: 证书解析失败 (${e})，可能是旧 prekey`);
         continue;
       }
       const [envelope, encryptResult] = this._encryptCopyPayload({
@@ -1314,7 +1306,7 @@ export class AUNClient {
         mode: encryptResult.mode,
         reason: encryptResult.degradation_reason,
       }).catch((exc) => {
-        _clientLog('warn', '发布 e2ee.degraded 事件失败: %s', formatCaughtError(exc));
+        this._clientLog.warn(`发布 e2ee.degraded 事件失败: ${formatCaughtError(exc)}`);
       });
     }
   }
@@ -1385,7 +1377,7 @@ export class AUNClient {
         return await this._transport.call(method, sendParams);
       } catch (exc) {
         if (attempt === 0 && this._isRecoverableGroupEpochError(exc)) {
-          _clientLog('warn', '群 %s 调用 %s 时 epoch 已过旧，恢复密钥后重加密重试一次: %s', groupId, method, formatCaughtError(exc));
+          this._clientLog.warn(`群 ${groupId} 调用 ${method} 时 epoch 已过旧，恢复密钥后重加密重试一次: ${formatCaughtError(exc)}`);
           ({ sendParams, groupId } = await this._prepareGroupEncryptedRpcParams(method, params, options, true));
           continue;
         }
@@ -1485,10 +1477,10 @@ export class AUNClient {
       }
       if (messages.length > 0) {
         this._saveSeqTrackerState();
-        _clientLog('info', '惰性同步群 %s: pull %d 条消息, after_seq=%d', groupId, messages.length, afterSeq);
+        this._clientLog.info(`惰性同步群 ${groupId}: pull ${messages.length} 条消息, after_seq=${afterSeq}`);
       }
     } catch (exc) {
-      _clientLog('warn', '惰性同步群 %s 失败: %s', groupId, formatCaughtError(exc));
+      this._clientLog.warn(`惰性同步群 ${groupId} 失败: ${formatCaughtError(exc)}`);
     }
   }
 
@@ -1510,10 +1502,10 @@ export class AUNClient {
       }
       if (messages.length > 0) {
         this._saveSeqTrackerState();
-        _clientLog('info', '惰性同步 P2P: pull %d 条消息, after_seq=%d', messages.length, afterSeq);
+        this._clientLog.info(`惰性同步 P2P: pull ${messages.length} 条消息, after_seq=${afterSeq}`);
       }
     } catch (exc) {
-      _clientLog('warn', '惰性同步 P2P 失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`惰性同步 P2P 失败: ${formatCaughtError(exc)}`);
     }
   }
 
@@ -1570,9 +1562,9 @@ export class AUNClient {
         encrypt: true,
         persist_required: true,
       });
-      _clientLog('info', '已向 %s 请求群 %s 的 epoch %s 密钥', targetAid, groupId, epoch);
+      this._clientLog.info(`已向 ${targetAid} 请求群 ${groupId} 的 epoch ${epoch} 密钥`);
     } catch (exc) {
-      _clientLog('warn', '向 %s 请求群 %s 密钥失败: %s', targetAid, groupId, formatCaughtError(exc));
+      this._clientLog.warn(`向 ${targetAid} 请求群 ${groupId} 密钥失败: ${formatCaughtError(exc)}`);
     }
   }
 
@@ -1591,13 +1583,13 @@ export class AUNClient {
     if (serverEpoch !== 0 || localEpoch !== 1) return epochResult;
     const secretData = this._groupE2ee.loadSecret(groupId, 1) as JsonObject | null;
     if (!secretData || secretData.pending_rotation_id) return epochResult;
-    _clientLog('warn', '群 %s 检测到本地 epoch 1 已存在但服务端 epoch 仍为 0，尝试补同步初始 epoch', groupId);
+    this._clientLog.warn(`群 ${groupId} 检测到本地 epoch 1 已存在但服务端 epoch 仍为 0，尝试补同步初始 epoch`);
     await this._syncEpochToServer(groupId);
     try {
       const refreshed = await this.call('group.e2ee.get_epoch', { group_id: groupId });
       if (isJsonObject(refreshed)) return refreshed;
     } catch (exc) {
-      _clientLog('warn', '群 %s 初始 epoch 补同步后刷新服务端 epoch 失败: %s', groupId, formatCaughtError(exc));
+      this._clientLog.warn(`群 ${groupId} 初始 epoch 补同步后刷新服务端 epoch 失败: ${formatCaughtError(exc)}`);
     }
     return epochResult;
   }
@@ -1612,7 +1604,7 @@ export class AUNClient {
       epochResult = rawEpochResult as JsonObject;
     } catch (exc) {
       if (strict) throw new StateError(`group ${groupId} failed to query server epoch before retry: ${formatCaughtError(exc)}`);
-      _clientLog('warn', 'group %s epoch precheck failed: %s', groupId, formatCaughtError(exc));
+      this._clientLog.warn(`group ${groupId} epoch precheck failed: ${formatCaughtError(exc)}`);
       return;
     }
     let serverEpoch = Number(epochResult.committed_epoch ?? epochResult.epoch ?? 0);
@@ -1658,7 +1650,7 @@ export class AUNClient {
       }
     }
 
-    _clientLog('warn', 'group %s local epoch=%s < server epoch=%s; requesting key recovery', groupId, effectiveLocalEpoch, serverEpoch);
+    this._clientLog.warn(`group ${groupId} local epoch=${effectiveLocalEpoch} < server epoch=${serverEpoch}; requesting key recovery`);
     await this._recoverGroupEpochKey(groupId, serverEpoch, '', 5000);
 
     const deadline = Date.now() + 5000;
@@ -1682,7 +1674,7 @@ export class AUNClient {
         const membersResult = await this.call('group.get_members', { group_id: groupId });
         members = isJsonObject(membersResult) ? membersResult.members : null;
       } catch (exc) {
-        _clientLog('debug', '群 %s 成员 epoch floor 预检跳过: %s', groupId, formatCaughtError(exc));
+        this._clientLog.debug(`群 ${groupId} 成员 epoch floor 预检跳过: ${formatCaughtError(exc)}`);
         return;
       }
 
@@ -1695,13 +1687,7 @@ export class AUNClient {
         }
       }
       if (maxMinReadEpoch <= committedEpoch) return;
-      _clientLog(
-        'warn',
-        '群 %s 成员 min_read_epoch 高于 committed epoch，按 committed epoch 继续发送: committed=%s floor=%s',
-        groupId,
-        committedEpoch,
-        maxMinReadEpoch,
-      );
+      this._clientLog.warn(`群 ${groupId} 成员 min_read_epoch 高于 committed epoch，按 committed epoch 继续发送: committed=${committedEpoch} floor=${maxMinReadEpoch}`);
       return;
     }
   }
@@ -1711,7 +1697,7 @@ export class AUNClient {
       const epochResult = await this.call('group.e2ee.get_epoch', { group_id: groupId });
       if (isJsonObject(epochResult)) return epochResult;
     } catch (exc) {
-      _clientLog('warn', '群 %s 查询 committed epoch 状态失败，回退本地 epoch: %s', groupId, formatCaughtError(exc));
+      this._clientLog.warn(`群 ${groupId} 查询 committed epoch 状态失败，回退本地 epoch: ${formatCaughtError(exc)}`);
     }
     const localEpoch = await this._groupE2ee.currentEpoch(groupId);
     return { epoch: localEpoch ?? 0, committed_epoch: localEpoch ?? 0 };
@@ -1739,7 +1725,7 @@ export class AUNClient {
     let committedRotation = isJsonObject(epochResult.committed_rotation) ? epochResult.committed_rotation : null;
     if (await this._committedRotationMembershipGap(groupId, committedEpoch, committedRotation)) {
       const allowMember = await this._groupAllowsMemberEpochRotation(groupId);
-      _clientLog('warn', '群 %s committed epoch %s 的成员快照与当前成员不一致，触发成员变更轮换修复', groupId, committedEpoch);
+      this._clientLog.warn(`群 ${groupId} committed epoch ${committedEpoch} 的成员快照与当前成员不一致，触发成员变更轮换修复`);
       await this._maybeLeadRotateGroupEpoch(
         groupId,
         `${groupId}:committed_membership_gap:aid:${this._aid}:epoch:${committedEpoch}`,
@@ -1761,13 +1747,7 @@ export class AUNClient {
       return committedEpoch;
     }
     const pendingRotationId = secretData ? String(secretData.pending_rotation_id ?? '') : '';
-    _clientLog(
-      'warn',
-      '群 %s epoch %s 本地 pending key 未匹配服务端 committed rotation，先恢复密钥: local_rotation=%s',
-      groupId,
-      committedEpoch,
-      pendingRotationId || '-',
-    );
+    this._clientLog.warn(`群 ${groupId} epoch ${committedEpoch} 本地 pending key 未匹配服务端 committed rotation，先恢复密钥: local_rotation=${pendingRotationId || '-'}`);
     await this._recoverGroupEpochKey(groupId, committedEpoch, '', 5000);
     let refreshed = await this._committedGroupEpochState(groupId);
     const refreshedCommittedEpoch = Number(refreshed.committed_epoch ?? refreshed.epoch ?? committedEpoch);
@@ -1813,13 +1793,12 @@ export class AUNClient {
       if (activeMembers.join('\n') !== expectedMembers.join('\n')) {
         const missing = activeMembers.filter((aid) => !expectedMembers.includes(aid));
         const extra = expectedMembers.filter((aid) => !activeMembers.includes(aid));
-        _clientLog('info', '群 %s committed membership gap: epoch=%s missing=%s extra=%s',
-          groupId, committedEpoch, JSON.stringify(missing), JSON.stringify(extra));
+        this._clientLog.info(`群 ${groupId} committed membership gap: epoch=${committedEpoch} missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}`);
         return true;
       }
       return false;
     } catch (exc) {
-      _clientLog('debug', '查询当前成员失败，无法判断 committed membership gap: group=%s err=%s', groupId, formatCaughtError(exc));
+      this._clientLog.debug(`查询当前成员失败，无法判断 committed membership gap: group=${groupId} err=${formatCaughtError(exc)}`);
       return false;
     }
   }
@@ -1878,7 +1857,7 @@ export class AUNClient {
   private async _onRawMessageReceived(data: EventPayload): Promise<void> {
     // 异步处理，不阻塞事件调度
     this._processAndPublishMessage(data).catch((exc) => {
-      _clientLog('warn', 'P2P 消息解密失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`P2P 消息解密失败: ${formatCaughtError(exc)}`);
       // H26: 不再投递原始密文 payload；改发 message.undecryptable 事件，仅携带安全 header
       if (isJsonObject(data)) {
         const safeEvent = {
@@ -1917,7 +1896,7 @@ export class AUNClient {
       const ns = `p2p:${this._aid}`;
       const needPull = this._seqTracker.onMessageSeq(ns, seq);
       if (needPull) {
-        this._fillP2pGap().catch(exc => _clientLog('warn', '后台补洞触发失败: %s', formatCaughtError(exc)));
+        this._fillP2pGap().catch(exc => this._clientLog.warn(`后台补洞触发失败: ${formatCaughtError(exc)}`));
       }
       // auto-ack contiguous_seq
       const contig = this._seqTracker.getContiguousSeq(ns);
@@ -1926,7 +1905,7 @@ export class AUNClient {
           seq: contig,
           device_id: this._deviceId,
           slot_id: this._slotId,
-        }).catch((e) => { _clientLog('debug', 'P2P auto-ack 失败: %s', formatCaughtError(e)); });
+        }).catch((e) => { this._clientLog.debug(`P2P auto-ack 失败: ${formatCaughtError(e)}`); });
       }
       // 即时持久化 cursor，异常断连后不回退
       this._saveSeqTrackerState();
@@ -1944,7 +1923,7 @@ export class AUNClient {
   /** 处理群组消息推送：自动解密后 re-publish */
   private async _onRawGroupMessageCreated(data: EventPayload): Promise<void> {
     this._processAndPublishGroupMessage(data).catch((exc) => {
-      _clientLog('warn', '群消息解密失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`群消息解密失败: ${formatCaughtError(exc)}`);
       // H26: 不再投递原始密文 payload；改发 group.message_undecryptable 事件
       if (isJsonObject(data)) {
         const safeEvent = {
@@ -1993,7 +1972,7 @@ export class AUNClient {
       const ns = `group:${groupId}`;
       const needPull = this._seqTracker.onMessageSeq(ns, seq);
       if (needPull) {
-        this._fillGroupGap(groupId).catch(exc => _clientLog('warn', '后台补洞触发失败: %s', formatCaughtError(exc)));
+        this._fillGroupGap(groupId).catch(exc => this._clientLog.warn(`后台补洞触发失败: ${formatCaughtError(exc)}`));
       }
       const contig = this._seqTracker.getContiguousSeq(ns);
       if (contig > 0) {
@@ -2002,7 +1981,7 @@ export class AUNClient {
           msg_seq: contig,
           device_id: this._deviceId,
           slot_id: this._slotId,
-        }).catch((e) => { _clientLog('debug', '群消息 auto-ack 失败: group=%s %s', groupId, formatCaughtError(e)); });
+        }).catch((e) => { this._clientLog.debug(`群消息 auto-ack 失败: group=${groupId} ${formatCaughtError(e)}`); });
       }
       this._saveSeqTrackerState();
     }
@@ -2069,7 +2048,7 @@ export class AUNClient {
         }
       }
     } catch (exc) {
-      _clientLog('debug', '自动 pull 群消息失败: %s', formatCaughtError(exc));
+      this._clientLog.debug(`自动 pull 群消息失败: ${formatCaughtError(exc)}`);
     }
     await this._publishAppEvent('group.message_created', notification);
   }
@@ -2109,7 +2088,7 @@ export class AUNClient {
         }
       }
     } catch (exc) {
-      _clientLog('warn', '群消息补洞失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`群消息补洞失败: ${formatCaughtError(exc)}`);
     } finally {
       this._gapFillDone.delete(dedupKey);
     }
@@ -2149,7 +2128,7 @@ export class AUNClient {
         }
       }
     } catch (exc) {
-      _clientLog('warn', 'P2P 消息补洞失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`P2P 消息补洞失败: ${formatCaughtError(exc)}`);
     } finally {
       this._gapFillDone.delete(dedupKey);
     }
@@ -2304,7 +2283,7 @@ export class AUNClient {
           if (serverAck > 0) {
             const contigBefore = this._seqTracker.getContiguousSeq(ns);
             if (contigBefore < serverAck) {
-              _clientLog('info', 'group.pull_events retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d', ns, contigBefore, serverAck);
+              this._clientLog.info(`group.pull_events retention-floor 推进: ns=${ns} contiguous=${contigBefore} -> cursor.current_seq=${serverAck}`);
               this._seqTracker.forceContiguousSeq(ns, serverAck);
             }
           }
@@ -2317,7 +2296,7 @@ export class AUNClient {
               event_seq: contig,
               device_id: this._deviceId,
               slot_id: this._slotId,
-            }).catch((e) => { _clientLog('debug', '群事件 auto-ack 失败: group=%s %s', groupId, formatCaughtError(e)); });
+            }).catch((e) => { this._clientLog.debug(`群事件 auto-ack 失败: group=${groupId} ${formatCaughtError(e)}`); });
           }
           for (const evt of events) {
             if (isJsonObject(evt)) {
@@ -2337,7 +2316,7 @@ export class AUNClient {
         }
       }
     } catch (exc) {
-      _clientLog('warn', '群事件补洞失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`群事件补洞失败: ${formatCaughtError(exc)}`);
     } finally {
       this._gapFillDone.delete(dedupKey);
     }
@@ -2476,13 +2455,13 @@ export class AUNClient {
             event_seq: contig,
             device_id: this._deviceId,
             slot_id: this._slotId,
-          }).catch((e) => { _clientLog('debug', '群事件推送 auto-ack 失败: group=%s %s', groupId, formatCaughtError(e)); });
+          }).catch((e) => { this._clientLog.debug(`群事件推送 auto-ack 失败: group=${groupId} ${formatCaughtError(e)}`); });
         }
       }
 
       // 仅在真实 event gap 时才触发补拉（补洞回来的事件不再触发新补洞）
       if (needPull && groupId && !d._from_gap_fill) {
-        this._fillGroupEventGap(groupId).catch(exc => _clientLog('warn', '后台补洞触发失败: %s', formatCaughtError(exc)));
+        this._fillGroupEventGap(groupId).catch(exc => this._clientLog.warn(`后台补洞触发失败: ${formatCaughtError(exc)}`));
       }
 
       // 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
@@ -2494,7 +2473,7 @@ export class AUNClient {
           {
             const expectedEpoch = this._membershipRotationExpectedEpoch(d);
             if (expectedEpoch === null) {
-              _clientLog('debug', 'membership event without old_epoch skipped for epoch rotation: aid=%s group=%s action=%s event_seq=%s', this._aid ?? '', groupId, String(d.action ?? ''), String(d.event_seq ?? ''));
+              this._clientLog.debug(`membership event without old_epoch skipped for epoch rotation: aid=${this._aid ?? ''} group=${groupId} action=${String(d.action ?? '')} event_seq=${String(d.event_seq ?? '')}`);
             } else {
               this._maybeLeadRotateGroupEpoch(groupId, this._membershipRotationTriggerId(groupId, d), expectedEpoch).catch((exc) =>
                 this._logE2eeError('rotate_epoch', groupId, '', exc as Error),
@@ -2514,7 +2493,7 @@ export class AUNClient {
             const expectedEpoch = this._membershipRotationExpectedEpoch(d);
             const joinedAids = this._joinedMemberAidsFromPayload(d);
             const isSelfJoining = joinedAids.includes(this._aid ?? '') && (action === 'joined' || action === 'invite_code_used');
-            _clientLog('warn', 'DEBUG: group.changed action=%s groupId=%s joinedAids=%s myAid=%s isSelfJoining=%s expectedEpoch=%s', action, groupId, JSON.stringify(joinedAids), this._aid, String(isSelfJoining), String(expectedEpoch));
+            this._clientLog.warn(`DEBUG: group.changed action=${action} groupId=${groupId} joinedAids=${JSON.stringify(joinedAids)} myAid=${this._aid} isSelfJoining=${String(isSelfJoining)} expectedEpoch=${String(expectedEpoch)}`);
 
             if (isSelfJoining || (action === 'joined' || action === 'invite_code_used')) {
               // open/invite_code 群：所有在线成员都参与延迟轮换
@@ -2575,7 +2554,7 @@ export class AUNClient {
     if (cs && isJsonObject(cs)) {
       const verified = await this._verifyEventSignatureAsync(d, cs);
       if (verified === false) {
-        _clientLog('warn', 'state_committed 提交者签名验证失败 group=%s', groupId);
+        this._clientLog.warn(`state_committed 提交者签名验证失败 group=${groupId}`);
         return;
       }
       d._verified = verified;
@@ -2592,7 +2571,7 @@ export class AUNClient {
     const loadFn = this._keystore.loadGroupState;
     const localState = loadFn ? loadFn.call(this._keystore, groupId) : null;
     if (localState && localState.state_hash && localState.state_hash !== prevStateHash) {
-      _clientLog('warn', 'state_hash 链不连续 group=%s local_sv=%d event_sv=%d', groupId, localState.state_version, stateVersion);
+      this._clientLog.warn(`state_hash 链不连续 group=${groupId} local_sv=${localState.state_version} event_sv=${stateVersion}`);
       // 回源同步
       try {
         const serverState = await this._transport.call('group.get_state', { group_id: groupId });
@@ -2612,7 +2591,7 @@ export class AUNClient {
               members: sMembers, policy: sPolicy, prevStateHash: sPrev,
             });
             if (computed !== sHash) {
-              _clientLog('warn', '回源 state_hash 验证失败 group=%s sv=%d expected=%s got=%s', groupId, sv, sHash, computed);
+              this._clientLog.warn(`回源 state_hash 验证失败 group=${groupId} sv=${sv} expected=${sHash} got=${computed}`);
               return;
             }
           }
@@ -2622,7 +2601,7 @@ export class AUNClient {
           }
         }
       } catch (exc) {
-        _clientLog('warn', 'state 回源失败 group=%s: %s', groupId, formatCaughtError(exc));
+        this._clientLog.warn(`state 回源失败 group=${groupId}: ${formatCaughtError(exc)}`);
       }
       return;
     }
@@ -2635,7 +2614,7 @@ export class AUNClient {
       members, policy, prevStateHash,
     });
     if (computed !== stateHash) {
-      _clientLog('warn', 'state_hash 重算不匹配 group=%s sv=%d expected=%s got=%s', groupId, stateVersion, stateHash, computed);
+      this._clientLog.warn(`state_hash 重算不匹配 group=${groupId} sv=${stateVersion} expected=${stateHash} got=${computed}`);
       return;
     }
 
@@ -2658,7 +2637,7 @@ export class AUNClient {
       if (triggerId && this._groupMembershipRotationDone.has(triggerId)) return;
       if (this._closing || this._state !== 'connected') return;
       if (Date.now() - started > 20000) {
-        _clientLog('warn', 'group epoch rotation still in-flight; skip pending trigger (group=%s trigger=%s)', groupId, triggerId || '-');
+        this._clientLog.warn(`group epoch rotation still in-flight; skip pending trigger (group=${groupId} trigger=${triggerId || '-'})`);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -2737,10 +2716,10 @@ export class AUNClient {
         });
         return;
       }
-      _clientLog('info', '[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s', groupId, myAid);
+      this._clientLog.info(`[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=${groupId} myAid=${myAid}`);
       await this._rotateGroupEpoch(groupId, triggerId, expectedEpoch);
     } catch (exc) {
-      _clientLog('warn', '_maybeLeadRotateGroupEpoch 失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`_maybeLeadRotateGroupEpoch 失败: ${formatCaughtError(exc)}`);
     } finally {
       this._groupEpochRotationInflight.delete(groupId);
     }
@@ -2757,7 +2736,7 @@ export class AUNClient {
     try {
       this._groupE2ee.removeGroup(groupId);
     } catch (exc) {
-      _clientLog('warn', '清理解散群组 %s epoch 密钥失败: %s', groupId, formatCaughtError(exc));
+      this._clientLog.warn(`清理解散群组 ${groupId} epoch 密钥失败: ${formatCaughtError(exc)}`);
     }
 
     // 2. 清理 seq_tracker 中的群消息和群事件命名空间
@@ -2778,7 +2757,7 @@ export class AUNClient {
     this._pendingOrderedMsgs.delete(`group:${groupId}`);
     this._pendingDecryptMsgs.delete(`group:${groupId}`);
 
-    _clientLog('info', '已清理解散群组 %s 的本地状态', groupId);
+    this._clientLog.info(`已清理解散群组 ${groupId} 的本地状态`);
   }
 
   /** 同步验签群事件 client_signature。返回 true/false/"pending"。 */
@@ -2813,7 +2792,7 @@ export class AUNClient {
       if (expectedFP) {
         const actualFP = 'sha256:' + certObj.fingerprint256.replace(/:/g, '').toLowerCase();
         if (actualFP !== expectedFP) {
-          _clientLog('warn', '验签失败：证书指纹不匹配 aid=%s', sigAid);
+          this._clientLog.warn(`验签失败：证书指纹不匹配 aid=${sigAid}`);
           return false;
         }
       }
@@ -2824,7 +2803,7 @@ export class AUNClient {
       const pubKey = certObj.publicKey;
       const ok = crypto.verify('SHA256', signData, pubKey, Buffer.from(sigB64, 'base64'));
       if (!ok) {
-        _clientLog('warn', '群事件验签失败 aid=%s method=%s', sigAid, method);
+        this._clientLog.warn(`群事件验签失败 aid=${sigAid} method=${method}`);
         // P1-16: 签名失败统一发布事件
         this._dispatcher.publish('signature.verification_failed', {
           aid: sigAid, method, error: 'ECDSA verification failed',
@@ -2832,7 +2811,7 @@ export class AUNClient {
       }
       return ok;
     } catch (exc) {
-      _clientLog('warn', '群事件验签异常: %s', formatCaughtError(exc));
+      this._clientLog.warn(`群事件验签异常: ${formatCaughtError(exc)}`);
       // P1-16: 签名失败统一发布事件
       this._dispatcher.publish('signature.verification_failed', {
         aid: String(cs.aid ?? ''), method: String(cs._method ?? ''),
@@ -2921,7 +2900,7 @@ export class AUNClient {
             (m) => String(m.aid),
           );
         } catch (exc) {
-          _clientLog('warn', '群组 %s 成员列表回源失败: %s', groupId, formatCaughtError(exc));
+          this._clientLog.warn(`群组 ${groupId} 成员列表回源失败: ${formatCaughtError(exc)}`);
         }
       }
 
@@ -2935,7 +2914,7 @@ export class AUNClient {
             persist_required: true,
           });
         } catch (exc) {
-          _clientLog('warn', '向 %s 回复群组密钥失败: %s', requester, formatCaughtError(exc));
+          this._clientLog.warn(`向 ${requester} 回复群组密钥失败: ${formatCaughtError(exc)}`);
         }
       }
     }
@@ -2947,7 +2926,7 @@ export class AUNClient {
       const keyCommitment = String(actualPayload.commitment ?? '');
       if (rotationId && keyCommitment) {
         this._ackGroupRotationKey(rotationId, keyCommitment)
-          .catch((exc) => _clientLog('warn', '提交 epoch key ack 失败: %s', formatCaughtError(exc)));
+          .catch((exc) => this._clientLog.warn(`提交 epoch key ack 失败: ${formatCaughtError(exc)}`));
       }
       this._scheduleRetryPendingDecryptMsgs(groupId);
     }
@@ -3036,13 +3015,7 @@ export class AUNClient {
       // peer 证书只存版本目录，不覆盖 cert.pem
       this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
     } catch (exc) {
-      _clientLog(
-        'error',
-        '写入证书到 keystore 失败 (aid=%s, fp=%s): %s',
-        aid,
-        certFingerprint ?? '',
-        formatCaughtError(exc),
-      );
+      this._clientLog.error(`写入证书到 keystore 失败 (aid=${aid}, fp=${certFingerprint ?? ''}): ${formatCaughtError(exc)}`);
     }
 
     return certPem;
@@ -3201,10 +3174,10 @@ export class AUNClient {
     } catch (exc) {
       // 刷新失败时：若内存缓存有 PKI 验证过的证书（未过期 x2 倍 TTL）则继续用
       if (cached && now < cached.validatedAt + PEER_CERT_CACHE_TTL * 2) {
-        _clientLog('debug', '刷新发送方 %s 证书失败，继续使用已验证的内存缓存: %s', aid, formatCaughtError(exc));
+        this._clientLog.debug(`刷新发送方 ${aid} 证书失败，继续使用已验证的内存缓存: ${formatCaughtError(exc)}`);
         return true;
       }
-      _clientLog('warn', '获取发送方 %s 证书失败且无已验证缓存，拒绝信任: %s', aid, formatCaughtError(exc));
+      this._clientLog.warn(`获取发送方 ${aid} 证书失败且无已验证缓存，拒绝信任: ${formatCaughtError(exc)}`);
       return false;
     }
   }
@@ -3242,7 +3215,7 @@ export class AUNClient {
     if (fromAid) {
       const certReady = await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
       if (!certReady) {
-        _clientLog('warn', '无法获取发送方 %s 的证书，跳过解密', fromAid);
+        this._clientLog.warn(`无法获取发送方 ${fromAid} 的证书，跳过解密`);
         throw new Error(`发送方证书不可用: from=${fromAid}, mid=${message.message_id}`);
       }
     }
@@ -3281,7 +3254,7 @@ export class AUNClient {
         if (fromAid) {
           const certReady = await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
           if (!certReady) {
-            _clientLog('warn', '无法获取发送方 %s 的证书，跳过解密', fromAid);
+            this._clientLog.warn(`无法获取发送方 ${fromAid} 的证书，跳过解密`);
             continue;
           }
         }
@@ -3291,7 +3264,7 @@ export class AUNClient {
           result.push(decrypted);
         } else {
           // TS-015: 解密失败不回退到密文，跳过该消息并记录
-          _clientLog('warn', 'pull 消息解密失败，跳过: from=%s mid=%s', msg.from, msg.message_id);
+          this._clientLog.warn(`pull 消息解密失败，跳过: from=${msg.from} mid=${msg.message_id}`);
         }
       } else {
         result.push(msg);
@@ -3341,7 +3314,7 @@ export class AUNClient {
   private _scheduleRetryPendingDecryptMsgs(groupId: string): void {
     if (!groupId || !this._pendingDecryptMsgs.has(`group:${groupId}`)) return;
     this._retryPendingDecryptMsgs(groupId).catch((exc) =>
-      _clientLog('warn', '群 %s pending 消息重试失败: %s', groupId, formatCaughtError(exc)),
+      this._clientLog.warn(`群 ${groupId} pending 消息重试失败: ${formatCaughtError(exc)}`),
     );
   }
 
@@ -3442,13 +3415,13 @@ export class AUNClient {
       const myAid = this._aid || '';
       const keyPair = this._keystore.loadKeyPair(myAid);
       if (!keyPair?.private_key_pem) {
-        _clientLog('warn', '无法加载 AID 私钥用于 ECIES 解密: aid=%s', myAid);
+        this._clientLog.warn(`无法加载 AID 私钥用于 ECIES 解密: aid=${myAid}`);
         return false;
       }
       const { eciesDecrypt } = await import('./e2ee-group.js');
       const groupSecret = eciesDecrypt(keyPair.private_key_pem, encryptedBytes);
       if (!groupSecret || groupSecret.length !== 32) {
-        _clientLog('warn', '服务端 epoch key ECIES 解密结果长度异常: group=%s epoch=%d len=%d', groupId, serverEpoch, groupSecret?.length ?? 0);
+        this._clientLog.warn(`服务端 epoch key ECIES 解密结果长度异常: group=${groupId} epoch=${serverEpoch} len=${groupSecret?.length ?? 0}`);
         return false;
       }
 
@@ -3483,7 +3456,7 @@ export class AUNClient {
       } catch { /* best effort */ }
 
       if (memberAids.length === 0) {
-        _clientLog('warn', '服务端 epoch key 恢复缺少成员快照: group=%s epoch=%d', groupId, serverEpoch);
+        this._clientLog.warn(`服务端 epoch key 恢复缺少成员快照: group=${groupId} epoch=${serverEpoch}`);
         return false;
       }
 
@@ -3496,7 +3469,7 @@ export class AUNClient {
         const committedEpoch = Number(committedRotation.target_epoch ?? serverEpoch);
         const committedCommitment = String(committedRotation.key_commitment ?? '').trim();
         if (committedEpoch === serverEpoch && committedCommitment && committedCommitment !== commitment) {
-          _clientLog('warn', '服务端 epoch key 恢复 commitment 不匹配: group=%s epoch=%d', groupId, serverEpoch);
+          this._clientLog.warn(`服务端 epoch key 恢复 commitment 不匹配: group=${groupId} epoch=${serverEpoch}`);
           return false;
         }
         if (epochChain && committedEpoch === serverEpoch) {
@@ -3509,7 +3482,7 @@ export class AUNClient {
           const prevChain = String(prevData?.epoch_chain ?? '').trim();
           if (prevChain && rotatorAid) {
             if (!verifyEpochChain(epochChain, prevChain, serverEpoch, commitment, rotatorAid)) {
-              _clientLog('warn', '服务端 epoch key 恢复 epoch_chain 验证失败: group=%s epoch=%d rotator=%s', groupId, serverEpoch, rotatorAid);
+              this._clientLog.warn(`服务端 epoch key 恢复 epoch_chain 验证失败: group=${groupId} epoch=${serverEpoch} rotator=${rotatorAid}`);
               return false;
             }
             epochChainUnverified = false;
@@ -3523,13 +3496,13 @@ export class AUNClient {
       const stored = storeGroupSecretEpoch(this._keystore, myAid, groupId, serverEpoch, groupSecret, commitment, memberAids,
         epochChain || undefined, '', epochChainUnverified, epochChainUnverifiedReason);
       if (!stored) {
-        _clientLog('warn', '服务端 epoch key 恢复存储失败: group=%s epoch=%d', groupId, serverEpoch);
+        this._clientLog.warn(`服务端 epoch key 恢复存储失败: group=${groupId} epoch=${serverEpoch}`);
         return false;
       }
-      _clientLog('info', '从服务端恢复 epoch key 成功: group=%s epoch=%d', groupId, serverEpoch);
+      this._clientLog.info(`从服务端恢复 epoch key 成功: group=${groupId} epoch=${serverEpoch}`);
       return true;
     } catch (exc) {
-      _clientLog('debug', '从服务端恢复 epoch key 失败: group=%s epoch=%d err=%s', groupId, epoch, formatCaughtError(exc));
+      this._clientLog.debug(`从服务端恢复 epoch key 失败: group=${groupId} epoch=${epoch} err=${formatCaughtError(exc)}`);
       return false;
     }
   }
@@ -3561,7 +3534,7 @@ export class AUNClient {
         if (loaded?.secret) {
           groupSecretBytes = loaded.secret;
         } else {
-          _clientLog('debug', '无法获取 group_secret 用于 ECIES 加密: group=%s epoch=%d', groupId, targetEpoch);
+          this._clientLog.debug(`无法获取 group_secret 用于 ECIES 加密: group=${groupId} epoch=${targetEpoch}`);
           return {};
         }
       }
@@ -3581,13 +3554,13 @@ export class AUNClient {
           const ciphertext = eciesEncrypt(pubkeyBytes, groupSecretBytes);
           encryptedKeys[aid] = ciphertext.toString('base64');
         } catch (exc) {
-          _clientLog('debug', '为成员 %s 构建 ECIES epoch key 失败: %s', aid, formatCaughtError(exc));
+          this._clientLog.debug(`为成员 ${aid} 构建 ECIES epoch key 失败: ${formatCaughtError(exc)}`);
           continue;
         }
       }
       return encryptedKeys;
     } catch (exc) {
-      _clientLog('debug', '构建 encrypted_keys 失败: group=%s err=%s', groupId, formatCaughtError(exc));
+      this._clientLog.debug(`构建 encrypted_keys 失败: group=${groupId} err=${formatCaughtError(exc)}`);
       return {};
     }
   }
@@ -3625,12 +3598,12 @@ export class AUNClient {
           .map(m => String(m.aid ?? ''));
       }
     } catch {
-      _clientLog('debug', '群 %s 查询在线成员失败，回退全量候选', groupId);
+      this._clientLog.debug(`群 ${groupId} 查询在线成员失败，回退全量候选`);
     }
 
     if (onlineAids !== null) {
       if (onlineAids.length === 0) {
-        _clientLog('info', '群 %s epoch %s 恢复失败：无在线成员可请求密钥', groupId, String(epoch));
+        this._clientLog.info(`群 ${groupId} epoch ${String(epoch)} 恢复失败：无在线成员可请求密钥`);
         return false;
       }
       await this._requestGroupKeyFromOnline(groupId, epoch, onlineAids, epochResult);
@@ -3714,7 +3687,7 @@ export class AUNClient {
     if (senderAid) {
       const certOk = await this._ensureSenderCertCached(senderAid);
       if (!certOk) {
-        _clientLog('warn', '群消息解密跳过：发送方 %s 证书不可用', senderAid);
+        this._clientLog.warn(`群消息解密跳过：发送方 ${senderAid} 证书不可用`);
         return message;
       }
     }
@@ -3742,7 +3715,7 @@ export class AUNClient {
           if (retry !== null && retry.e2ee) return this._attachGroupDispatchModeToPayload(retry);
         }
       } catch (exc) {
-        _clientLog('debug', '群 %s epoch %s 同步恢复失败: %s', groupId, epoch, formatCaughtError(exc));
+        this._clientLog.debug(`群 ${groupId} epoch ${epoch} 同步恢复失败: ${formatCaughtError(exc)}`);
       }
     }
 
@@ -3865,7 +3838,7 @@ export class AUNClient {
         if (fromAid) {
           const certReady = await this._ensureSenderCertCached(fromAid, senderCertFingerprint || undefined);
           if (!certReady) {
-            _clientLog('warn', '无法获取发送方 %s 的证书，跳过 message.thought.get 解密', fromAid);
+            this._clientLog.warn(`无法获取发送方 ${fromAid} 的证书，跳过 message.thought.get 解密`);
             decryptFailed = true;
           }
         }
@@ -3944,7 +3917,7 @@ export class AUNClient {
             await new Promise(resolve => setTimeout(resolve, (attempt + 1) * 1000));
           } else {
             failed.push(String(dist.to));
-            _clientLog('warn', 'epoch 密钥分发失败 (to=%s): %s', dist.to, formatCaughtError(exc));
+            this._clientLog.warn(`epoch 密钥分发失败 (to=${dist.to}): ${formatCaughtError(exc)}`);
           }
         }
       }
@@ -3961,7 +3934,7 @@ export class AUNClient {
       });
       return isJsonObject(result) && result.success === true;
     } catch (exc) {
-      _clientLog('warn', '刷新 epoch rotation lease 失败: rotation=%s err=%s', rotationId, formatCaughtError(exc));
+      this._clientLog.warn(`刷新 epoch rotation lease 失败: rotation=${rotationId} err=${formatCaughtError(exc)}`);
       return false;
     }
   }
@@ -3976,7 +3949,7 @@ export class AUNClient {
       });
       return isJsonObject(result) && result.success === true;
     } catch (exc) {
-      _clientLog('warn', '提交 epoch key ack 失败: rotation=%s err=%s', rotationId, formatCaughtError(exc));
+      this._clientLog.warn(`提交 epoch key ack 失败: rotation=${rotationId} err=${formatCaughtError(exc)}`);
       return false;
     }
   }
@@ -4002,8 +3975,7 @@ export class AUNClient {
                 ? committedRotation.expected_members.map((item) => String(item ?? '').trim()).filter(Boolean)
                 : [];
               if (this._aid && !expectedMembers.includes(this._aid)) {
-                _clientLog('debug', '放行 group key 分发：新成员恢复 commitment 不匹配属正常 group=%s epoch=%s',
-                  groupId, epoch);
+                this._clientLog.debug(`放行 group key 分发：新成员恢复 commitment 不匹配属正常 group=${groupId} epoch=${epoch}`);
               } else {
                 return false;
               }
@@ -4011,8 +3983,7 @@ export class AUNClient {
           }
           return true;
         }
-        _clientLog('info', '拒绝缺少 rotation_id 的未来 epoch key 分发: group=%s epoch=%s committed=%s',
-          groupId, epoch, committedEpoch);
+        this._clientLog.info(`拒绝缺少 rotation_id 的未来 epoch key 分发: group=${groupId} epoch=${epoch} committed=${committedEpoch}`);
         return false;
       }
       const pending = isJsonObject(epochResult.pending_rotation) ? epochResult.pending_rotation : null;
@@ -4036,12 +4007,10 @@ export class AUNClient {
         }
       }
     } catch (exc) {
-      _clientLog('warn', '拒绝无法校验 active rotation 的 epoch key 分发: group=%s rotation=%s err=%s',
-        groupId, rotationId, formatCaughtError(exc));
+      this._clientLog.warn(`拒绝无法校验 active rotation 的 epoch key 分发: group=${groupId} rotation=${rotationId} err=${formatCaughtError(exc)}`);
       return false;
     }
-    _clientLog('info', '拒绝非 pending/committed 状态的 epoch key 分发: group=%s rotation=%s epoch=%s',
-      groupId, rotationId, epoch);
+    this._clientLog.info(`拒绝非 pending/committed 状态的 epoch key 分发: group=${groupId} rotation=${rotationId} epoch=${epoch}`);
     return false;
   }
 
@@ -4054,11 +4023,9 @@ export class AUNClient {
     if (await this._verifyActiveGroupRotationDistribution(payload)) return;
     try {
       this._groupE2ee.discardPendingSecret(groupId, epoch, rotationId);
-      _clientLog('info', '丢弃 verify 后变为 stale 的 group epoch key: group=%s epoch=%s rotation=%s',
-        groupId, epoch, rotationId);
+      this._clientLog.info(`丢弃 verify 后变为 stale 的 group epoch key: group=${groupId} epoch=${epoch} rotation=${rotationId}`);
     } catch (exc) {
-      _clientLog('debug', '清理 stale group epoch key 失败: group=%s epoch=%s rotation=%s err=%s',
-        groupId, epoch, rotationId, formatCaughtError(exc));
+      this._clientLog.debug(`清理 stale group epoch key 失败: group=${groupId} epoch=${epoch} rotation=${rotationId} err=${formatCaughtError(exc)}`);
     }
   }
 
@@ -4073,8 +4040,7 @@ export class AUNClient {
       if (!isJsonObject(epochResult)) return false;
       const committedEpoch = Number(epochResult.committed_epoch ?? epochResult.epoch ?? 0);
       if (epoch > committedEpoch) {
-        _clientLog('info', '拒绝未提交 epoch 的 group key response: group=%s epoch=%s committed=%s',
-          groupId, epoch, committedEpoch);
+        this._clientLog.info(`拒绝未提交 epoch 的 group key response: group=${groupId} epoch=${epoch} committed=${committedEpoch}`);
         return false;
       }
       const committedRotation = isJsonObject(epochResult.committed_rotation) ? epochResult.committed_rotation : null;
@@ -4085,8 +4051,7 @@ export class AUNClient {
             ? committedRotation.expected_members.map((item) => String(item ?? '').trim()).filter(Boolean)
             : [];
           if (this._aid && !expectedMembers.includes(this._aid)) {
-            _clientLog('debug', '放行 group key response：新成员恢复 commitment 不匹配属正常 group=%s epoch=%s',
-              groupId, epoch);
+            this._clientLog.debug(`放行 group key response：新成员恢复 commitment 不匹配属正常 group=${groupId} epoch=${epoch}`);
           } else {
             return false;
           }
@@ -4094,8 +4059,7 @@ export class AUNClient {
       }
       return true;
     } catch (exc) {
-      _clientLog('warn', '拒绝无法校验 committed epoch 的 group key response: group=%s epoch=%s err=%s',
-        groupId, epoch, formatCaughtError(exc));
+      this._clientLog.warn(`拒绝无法校验 committed epoch 的 group key response: group=${groupId} epoch=${epoch} err=${formatCaughtError(exc)}`);
       return false;
     }
   }
@@ -4109,7 +4073,7 @@ export class AUNClient {
       });
       return isJsonObject(result) && result.success === true;
     } catch (exc) {
-      _clientLog('warn', '中止 epoch rotation 失败: rotation=%s err=%s', rotationId, formatCaughtError(exc));
+      this._clientLog.warn(`中止 epoch rotation 失败: rotation=${rotationId} err=${formatCaughtError(exc)}`);
       return false;
     }
   }
@@ -4145,7 +4109,7 @@ export class AUNClient {
       this._groupEpochRotationRetryTimers.delete(retryKey);
       if (this._closing || this._state !== 'connected') return;
       this._maybeLeadRotateGroupEpoch(groupId, opts.triggerId, opts.expectedEpoch)
-        .catch((exc) => _clientLog('warn', 'group epoch rotation retry failed: %s', formatCaughtError(exc)));
+        .catch((exc) => this._clientLog.warn(`group epoch rotation retry failed: ${formatCaughtError(exc)}`));
     }, this._rotationRetryDelayMs(opts.pending));
     this._groupEpochRotationRetryTimers.set(retryKey, timer);
     this._unrefTimer(timer);
@@ -4157,7 +4121,7 @@ export class AUNClient {
     while (this._groupEpochRotationInflight.has(groupId)) {
       if (this._closing || this._state !== 'connected') return;
       if (Date.now() - started > 20000) {
-        _clientLog('warn', 'group epoch create sync still in-flight; skip duplicate sync (group=%s)', groupId);
+        this._clientLog.warn(`group epoch create sync still in-flight; skip duplicate sync (group=${groupId})`);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -4187,12 +4151,12 @@ export class AUNClient {
           const beginResult = await this.call('group.e2ee.begin_rotation', rotateParams);
           const rotation = isJsonObject(beginResult) && isJsonObject(beginResult.rotation) ? beginResult.rotation : null;
           if (!isJsonObject(beginResult) || beginResult.success !== true || !rotation) {
-            _clientLog('warn', 'group epoch begin failed; stop key distribution (group=%s, returned=%s)', groupId, JSON.stringify(beginResult));
+            this._clientLog.warn(`group epoch begin failed; stop key distribution (group=${groupId}, returned=${JSON.stringify(beginResult)})`);
             return;
           }
           const activeRotationId = String(rotation.rotation_id ?? rotationId);
           if (!await this._ackGroupRotationKey(activeRotationId, secretData.commitment)) {
-            _clientLog('warn', 'group epoch self ack failed (group=%s, rotation=%s)', groupId, activeRotationId);
+            this._clientLog.warn(`group epoch self ack failed (group=${groupId}, rotation=${activeRotationId})`);
             await this._abortGroupRotation(activeRotationId, 'self_ack_failed');
             return;
           }
@@ -4221,17 +4185,15 @@ export class AUNClient {
             );
             return;
           }
-          _clientLog('warn', 'group epoch commit failed (group=%s, returned=%s)', groupId, JSON.stringify(commitResult));
+          this._clientLog.warn(`group epoch commit failed (group=${groupId}, returned=${JSON.stringify(commitResult)})`);
           return;
         } catch (exc) {
           if (attempt < maxRetries) {
             const delay = 500 * Math.pow(2, attempt - 1);
-            _clientLog('warn', '同步 epoch 到服务端失败 (group=%s, 第%d/%d次): %s, %dms后重试',
-              groupId, attempt, maxRetries, formatCaughtError(exc), delay);
+            this._clientLog.warn(`同步 epoch 到服务端失败 (group=${groupId}, 第${attempt}/${maxRetries}次): ${formatCaughtError(exc)}, ${delay}ms后重试`);
             await new Promise(r => setTimeout(r, delay));
           } else {
-            _clientLog('error', '同步 epoch 到服务端最终失败 (group=%s, 已重试%d次): %s',
-              groupId, maxRetries, formatCaughtError(exc));
+            this._clientLog.error(`同步 epoch 到服务端最终失败 (group=${groupId}, 已重试${maxRetries}次): ${formatCaughtError(exc)}`);
           }
         }
       }
@@ -4263,8 +4225,7 @@ export class AUNClient {
           && this._rotationExpectedMembersStale(pendingRotation, memberAids)
         );
         if (stalePending && await this._abortGroupRotation(pendingRotationId, 'membership_changed_during_rotation')) {
-          _clientLog('info', 'aborted stale pending group epoch rotation: group=%s rotation=%s',
-            groupId, pendingRotationId || '-');
+          this._clientLog.info(`aborted stale pending group epoch rotation: group=${groupId} rotation=${pendingRotationId || '-'}`);
         } else {
           this._scheduleGroupRotationRetry(groupId, {
             reason: 'membership_changed',
@@ -4277,8 +4238,7 @@ export class AUNClient {
       }
       if (expectedEpoch !== null && serverEpoch !== expectedEpoch) {
         if (triggerId) this._groupMembershipRotationDone.add(triggerId);
-        _clientLog('info', 'skip membership epoch rotation: group=%s expected_epoch=%d server_epoch=%d trigger=%s',
-          groupId, expectedEpoch, serverEpoch, triggerId || '-');
+        this._clientLog.info(`skip membership epoch rotation: group=${groupId} expected_epoch=${expectedEpoch} server_epoch=${serverEpoch} trigger=${triggerId || '-'}`);
         return;
       }
       const currentEpoch = expectedEpoch ?? serverEpoch;
@@ -4294,7 +4254,7 @@ export class AUNClient {
           const rawChain = String(cr.epoch_chain ?? '').trim();
           if (rawChain) {
             prevChainHint = rawChain;
-            _clientLog('info', '新成员轮换补充 prev epoch chain from server: group=%s epoch=%d', groupId, currentEpoch);
+            this._clientLog.info(`新成员轮换补充 prev epoch chain from server: group=${groupId} epoch=${currentEpoch}`);
           }
         }
       }
@@ -4305,14 +4265,7 @@ export class AUNClient {
         try {
           this._groupE2ee.discardPendingSecret(groupId, targetEpoch, rotationId);
         } catch (cleanupExc) {
-          _clientLog(
-            'debug',
-            '清理本地 pending group key 失败: group=%s epoch=%s rotation=%s err=%s',
-            groupId,
-            targetEpoch,
-            rotationId,
-            formatCaughtError(cleanupExc),
-          );
+          this._clientLog.debug(`清理本地 pending group key 失败: group=${groupId} epoch=${targetEpoch} rotation=${rotationId} err=${formatCaughtError(cleanupExc)}`);
         }
       };
 
@@ -4366,8 +4319,7 @@ export class AUNClient {
             pending: null,
           });
         }
-        _clientLog('warn', 'group epoch begin failed; stop key distribution (group=%s, current_epoch=%d, returned=%s)',
-          groupId, currentEpoch, JSON.stringify(beginResult));
+        this._clientLog.warn(`group epoch begin failed; stop key distribution (group=${groupId}, current_epoch=${currentEpoch}, returned=${JSON.stringify(beginResult)})`);
         discardGeneratedPending();
         return;
       }
@@ -4375,8 +4327,7 @@ export class AUNClient {
       const activeRotationId = String(rotation.rotation_id ?? rotationId);
       const distributeResult = await this._distributeGroupEpochKey(info, activeRotationId);
       if (distributeResult.failed.length > 0) {
-        _clientLog('warn', 'group epoch key distribution incomplete; abort rotation before retry (group=%s rotation=%s failed=%s)',
-          groupId, activeRotationId, distributeResult.failed.join(','));
+        this._clientLog.warn(`group epoch key distribution incomplete; abort rotation before retry (group=${groupId} rotation=${activeRotationId} failed=${distributeResult.failed.join(',')})`);
         await this._abortGroupRotation(activeRotationId, 'distribution_failed');
         this._scheduleGroupRotationRetry(groupId, {
           reason: 'membership_changed',
@@ -4389,7 +4340,7 @@ export class AUNClient {
       }
       await this._heartbeatGroupRotation(activeRotationId);
       if (!await this._ackGroupRotationKey(activeRotationId, String(info.commitment ?? ''))) {
-        _clientLog('warn', 'group epoch self ack failed; abort rotation before retry (group=%s rotation=%s)', groupId, activeRotationId);
+        this._clientLog.warn(`group epoch self ack failed; abort rotation before retry (group=${groupId} rotation=${activeRotationId})`);
         await this._abortGroupRotation(activeRotationId, 'self_ack_failed');
         this._scheduleGroupRotationRetry(groupId, {
           reason: 'membership_changed',
@@ -4410,8 +4361,7 @@ export class AUNClient {
       }
       const commitResult = await this.call('group.e2ee.commit_rotation', commitParams);
       if (!isJsonObject(commitResult) || commitResult.success !== true) {
-        _clientLog('warn', 'group epoch commit failed (group=%s, rotation=%s, returned=%s)',
-          groupId, activeRotationId, JSON.stringify(commitResult));
+        this._clientLog.warn(`group epoch commit failed (group=${groupId}, rotation=${activeRotationId}, returned=${JSON.stringify(commitResult)})`);
         this._scheduleGroupRotationRetry(groupId, {
           reason: 'membership_changed',
           triggerId,
@@ -4443,8 +4393,7 @@ export class AUNClient {
             committedSecret.epoch_chain,
           );
         } else {
-          _clientLog('warn', 'group epoch commit succeeded but local target key does not match committed rotation; keep pending blocked (group=%s rotation=%s epoch=%s)',
-            groupId, activeRotationId, targetEpoch);
+          this._clientLog.warn(`group epoch commit succeeded but local target key does not match committed rotation; keep pending blocked (group=${groupId} rotation=${activeRotationId} epoch=${targetEpoch})`);
         }
       }
       if (triggerId) {
@@ -4668,7 +4617,7 @@ export class AUNClient {
         }
       }
     } catch (exc) {
-      _clientLog('warn', '恢复 SeqTracker 状态失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`恢复 SeqTracker 状态失败: ${formatCaughtError(exc)}`);
       // 通过内部 dispatcher 发布可观测事件，便于上层监控
       this._dispatcher.publish('seq_tracker.persist_error', {
         phase: 'restore',
@@ -4739,7 +4688,7 @@ export class AUNClient {
         });
       }
     } catch (exc) {
-      _clientLog('warn', '保存 SeqTracker 状态失败: %s', formatCaughtError(exc));
+      this._clientLog.warn(`保存 SeqTracker 状态失败: ${formatCaughtError(exc)}`);
       // 通过内部 dispatcher 发布可观测事件，便于上层监控
       this._dispatcher.publish('seq_tracker.persist_error', {
         phase: 'save',
@@ -4832,7 +4781,7 @@ export class AUNClient {
           if (identity && isJsonObject(identity)) {
             this._identity = identity;
             this._aid = String(identity.aid ?? this._aid ?? '');
-            if (_debugLogger) _debugLogger.setAid(` [${this._aid}]`);
+            if (this._aid) this._logger.bindAid(this._aid);
             if (this._sessionParams !== null) {
               this._sessionParams.access_token = String(auth.token ?? params.access_token ?? '');
             }
@@ -4868,7 +4817,7 @@ export class AUNClient {
       try {
         await this._uploadPrekey();
       } catch (exc) {
-        _clientLog('warn', 'prekey 上传失败: %s', formatCaughtError(exc));
+        this._clientLog.warn(`prekey 上传失败: ${formatCaughtError(exc)}`);
       }
     } catch (err) {
       this._state = prevState === 'connected' ? 'disconnected' : 'idle';
@@ -4906,7 +4855,7 @@ export class AUNClient {
     identity.access_token = accessToken;
     this._identity = identity;
     this._aid = String(identity.aid ?? this._aid ?? '');
-    if (_debugLogger) _debugLogger.setAid(` [${this._aid}]`);
+    if (this._aid) this._logger.bindAid(this._aid);
     const persistIdentity = (this._auth as any)._persistIdentity as ((value: IdentityRecord) => void) | undefined;
     if (typeof persistIdentity === 'function') {
       persistIdentity.call(this._auth, identity);
@@ -5039,10 +4988,10 @@ export class AUNClient {
         consecutiveFailures = 0;
       }).catch((exc) => {
         consecutiveFailures++;
-        _clientLog('warn', '心跳失败 (%s/%s): %s', consecutiveFailures, maxFailures, formatCaughtError(exc));
+        this._clientLog.warn(`心跳失败 (${consecutiveFailures}/${maxFailures}): ${formatCaughtError(exc)}`);
         this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) }).catch(() => {});
         if (consecutiveFailures >= maxFailures) {
-          _clientLog('warn', '连续 %s 次心跳失败，触发断线重连', maxFailures);
+          this._clientLog.warn(`连续 ${maxFailures} 次心跳失败，触发断线重连`);
           this._handleTransportDisconnect(exc instanceof Error ? exc : new Error(String(exc)));
         }
       });
@@ -5107,7 +5056,7 @@ export class AUNClient {
           if (exc instanceof AuthError) {
             this._tokenRefreshFailures++;
             if (this._tokenRefreshFailures >= 3) {
-              _clientLog('warn', 'token 刷新连续失败 %d 次，停止刷新循环并触发重连', this._tokenRefreshFailures);
+              this._clientLog.warn(`token 刷新连续失败 ${this._tokenRefreshFailures} 次，停止刷新循环并触发重连`);
               await this._dispatcher.publish('token.refresh_exhausted', {
                 aid: this._identity?.aid ?? null,
                 consecutive_failures: this._tokenRefreshFailures,
@@ -5117,7 +5066,7 @@ export class AUNClient {
               this._handleTransportDisconnect(new Error('token refresh exhausted, triggering reconnect'));
               return;
             }
-            _clientLog('debug', 'token 刷新失败 (%d/3)，下次重试: %s', this._tokenRefreshFailures, exc);
+            this._clientLog.debug(`token 刷新失败 (${this._tokenRefreshFailures}/3)，下次重试: ${exc}`);
           } else {
             await this._dispatcher.publish('connection.error', { error: formatCaughtError(exc) });
           }
@@ -5223,7 +5172,7 @@ export class AUNClient {
         await this._uploadPrekey();
         this._prekeyReplenished.add(prekeyId);
       } catch (exc) {
-        _clientLog('warn', '消费 prekey %s 后补充 current prekey 失败: %s', prekeyId, formatCaughtError(exc));
+        this._clientLog.warn(`消费 prekey ${prekeyId} 后补充 current prekey 失败: ${formatCaughtError(exc)}`);
       } finally {
         this._prekeyReplenishInflight.delete(prekeyId);
       }
@@ -5247,7 +5196,7 @@ export class AUNClient {
             this._groupE2ee.cleanup(gid, retention);
           }
         } catch (exc) {
-          _clientLog('warn', 'epoch 清理失败: %s', formatCaughtError(exc));
+          this._clientLog.warn(`epoch 清理失败: ${formatCaughtError(exc)}`);
         }
       }, 3600_000);
       this._unrefTimer(this._groupEpochCleanupTimer);
@@ -5264,11 +5213,11 @@ export class AUNClient {
             : [];
           for (const gid of groupIds) {
             this._maybeLeadRotateGroupEpoch(gid).catch((exc) =>
-              _clientLog('warn', 'epoch 轮换失败: %s', formatCaughtError(exc)),
+              this._clientLog.warn(`epoch 轮换失败: ${formatCaughtError(exc)}`),
             );
           }
         } catch (exc) {
-          _clientLog('warn', 'epoch 轮换失败: %s', formatCaughtError(exc));
+          this._clientLog.warn(`epoch 轮换失败: ${formatCaughtError(exc)}`);
         }
       }, rotateInterval * 1000);
       this._unrefTimer(this._groupEpochRotateTimer);
@@ -5318,7 +5267,7 @@ export class AUNClient {
   private _onGatewayDisconnect(data: any): void {
     const code = data?.code;
     const reason = data?.reason ?? '';
-    _clientLog('warn', '服务端主动断开: code=%s, reason=%s', code, reason);
+    this._clientLog.warn(`服务端主动断开: code=${code}, reason=${reason}`);
     this._serverKicked = true;
   }
 
@@ -5337,7 +5286,7 @@ export class AUNClient {
     if (this._serverKicked || (closeCode !== undefined && AUNClient._NO_RECONNECT_CODES.has(closeCode))) {
       this._state = 'terminal_failed';
       const reason = this._serverKicked ? 'server kicked' : `close code ${closeCode}`;
-      _clientLog('warn', '抑制自动重连: %s', reason);
+      this._clientLog.warn(`抑制自动重连: ${reason}`);
       await this._dispatcher.publish('connection.state', {
         state: this._state, error, reason,
       });
@@ -5354,7 +5303,7 @@ export class AUNClient {
     this._reconnectActive = true;
     this._reconnectAbort = new AbortController();
     this._reconnectLoop(serverInitiated).catch((exc) => {
-      _clientLog('warn', '重连循环异常: %s', formatCaughtError(exc));
+      this._clientLog.warn(`重连循环异常: ${formatCaughtError(exc)}`);
     });
   }
 
