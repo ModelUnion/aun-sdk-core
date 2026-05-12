@@ -34,19 +34,14 @@ import {
   type RpcResult,
 } from './types.js';
 
-// ── 日志辅助 ──────────────────────────────────────────────────
+import type { ModuleLogger } from './logger.js';
 
-/** 简易日志：前缀 [aun_core.auth] */
-function _authLog(
-  level: string,
-  msg: string,
-  ...args: Array<string | number | boolean | null | undefined | Error | object>
-): void {
-  const ts = new Date().toISOString();
-  const formatted = args.reduce<string>((s, a) => s.replace('%s', String(a)), msg);
-  // eslint-disable-next-line no-console
-  console.log(`[${ts}] [aun_core.auth] ${level}: ${formatted}`);
-}
+const _noopLogger: ModuleLogger = {
+  error: () => {},
+  warn:  () => {},
+  info:  () => {},
+  debug: () => {},
+};
 
 // ── 签名验证辅助 ──────────────────────────────────────────────
 
@@ -288,6 +283,7 @@ export class AuthFlow {
     'access_token_expires_at',
   ] as const;
 
+  private _logger: ModuleLogger;
   private _keystore: KeyStore;
   private _crypto: CryptoProvider;
   private _aid: string | null;
@@ -322,7 +318,9 @@ export class AuthFlow {
     rootCaPath?: string | null;
     chainCacheTtl?: number;
     verifySsl?: boolean;
+    logger?: ModuleLogger;
   }) {
+    this._logger = opts.logger ?? _noopLogger;
     this._keystore = opts.keystore;
     this._crypto = opts.crypto;
     this._aid = opts.aid ?? null;
@@ -439,7 +437,7 @@ export class AuthFlow {
     } catch (e) {
       // 证书未在服务端注册或公钥不匹配 — 自动重新注册
       if (e instanceof AuthError && (String(e.message).includes('not registered') || String(e.message).includes('public key mismatch'))) {
-        _authLog('warn', '证书未在服务端注册，自动重新注册: aid=%s', identity.aid);
+        this._logger.warn(`证书未在服务端注册，自动重新注册: aid=${identity.aid}`);
         const created = await this._createAid(gatewayUrl, identity);
         identity.cert = created.cert as string;
         this._persistIdentity(identity);
@@ -571,7 +569,7 @@ export class AuthFlow {
         return { token: explicitToken, identity };
       } catch (exc) {
         if (!(exc instanceof AuthError)) throw exc;
-        _authLog('debug', 'explicit_token 认证失败，尝试下一方式: %s', exc.message);
+        this._logger.debug(`explicit_token 认证失败，尝试下一方式: ${exc.message}`);
       }
     }
 
@@ -599,7 +597,7 @@ export class AuthFlow {
         return { token: cachedToken, identity };
       } catch (exc) {
         if (!(exc instanceof AuthError)) throw exc;
-        _authLog('debug', 'cached_token 认证失败，尝试刷新: %s', exc.message);
+        this._logger.debug(`cached_token 认证失败，尝试刷新: ${exc.message}`);
       }
     }
 
@@ -619,7 +617,7 @@ export class AuthFlow {
         }
       } catch (exc) {
         if (!(exc instanceof AuthError)) throw exc;
-        _authLog('debug', 'refresh_token 认证失败，将重新登录: %s', exc.message);
+        this._logger.debug(`refresh_token 认证失败，将重新登录: ${exc.message}`);
       }
     }
 
@@ -658,7 +656,7 @@ export class AuthFlow {
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
-      _authLog('warn', 'CRL 检查不可用，降级继续: %s', errMsg);
+      this._logger.warn(`CRL 检查不可用，降级继续: ${errMsg}`);
     }
 
     try {
@@ -666,7 +664,7 @@ export class AuthFlow {
     } catch (exc) {
       const errMsg = exc instanceof Error ? exc.message : String(exc);
       if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
-      _authLog('warn', 'OCSP 校验不可用，降级继续: %s', errMsg);
+      this._logger.warn(`OCSP 校验不可用，降级继续: ${errMsg}`);
     }
 
     // 检查 CN 匹配
@@ -884,14 +882,14 @@ export class AuthFlow {
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
-      _authLog('warn', 'CRL 检查不可用，降级继续: %s', errMsg);
+      this._logger.warn(`CRL 检查不可用，降级继续: ${errMsg}`);
     }
     try {
       await this._verifyAuthCertOcsp(gatewayUrl, authCert);
     } catch (exc) {
       const errMsg = exc instanceof Error ? exc.message : String(exc);
       if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
-      _authLog('warn', 'OCSP 校验不可用，降级继续: %s', errMsg);
+      this._logger.warn(`OCSP 校验不可用，降级继续: ${errMsg}`);
     }
 
     // 验证 client_nonce 签名
@@ -1103,7 +1101,7 @@ export class AuthFlow {
         revokedSerials = new Set(serialsArr.map((s) => String(s).toLowerCase()));
       }
       // 如果两者都没有，返回空集合（无吊销记录）
-      _authLog('debug', 'CRL PEM 解析失败，使用 JSON revoked_serials 降级');
+      this._logger.debug('CRL PEM 解析失败，使用 JSON revoked_serials 降级');
     }
 
     // 缓存 TTL：默认 5 分钟，最大 24 小时
@@ -1306,7 +1304,7 @@ export class AuthFlow {
     } catch (e) {
       // OCSP DER 解析失败时，降级信赖 JSON status 字段
       if (e instanceof AuthError) throw e;
-      _authLog('debug', 'OCSP DER 解析失败，使用 JSON status 降级: %s', e instanceof Error ? e.message : String(e));
+      this._logger.debug(`OCSP DER 解析失败，使用 JSON status 降级: ${e instanceof Error ? e.message : String(e)}`);
       if (!status) {
         throw new AuthError('gateway OCSP endpoint returned invalid response and no status field');
       }
@@ -1613,14 +1611,14 @@ export class AuthFlow {
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
-          _authLog('warn', 'CRL 检查不可用，降级继续: %s', errMsg);
+          this._logger.warn(`CRL 检查不可用，降级继续: ${errMsg}`);
         }
         try {
           await this._verifyAuthCertOcsp(gatewayUrl, cert);
         } catch (exc) {
           const errMsg = exc instanceof Error ? exc.message : String(exc);
           if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
-          _authLog('warn', 'OCSP 校验不可用，降级继续: %s', errMsg);
+          this._logger.warn(`OCSP 校验不可用，降级继续: ${errMsg}`);
         }
       }
 
@@ -1628,9 +1626,9 @@ export class AuthFlow {
       identity.cert = certPemStr;
     } catch (e) {
       if (e instanceof AuthError) {
-        _authLog('warn', '拒绝服务端返回的 new_cert (%s): %s', identity.aid, e.message);
+        this._logger.warn(`拒绝服务端返回的 new_cert (${identity.aid}): ${e.message}`);
       } else {
-        _authLog('warn', 'new_cert 验证异常 (%s): %s', identity.aid, e instanceof Error ? e.message : String(e));
+        this._logger.warn(`new_cert 验证异常 (${identity.aid}): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
@@ -1647,11 +1645,11 @@ export class AuthFlow {
           if (actPubDer.equals(localPubDer)) {
             identity.cert = activeCertPem;
           } else {
-            _authLog('warn', '服务端 active_cert 公钥与本地私钥不匹配，拒绝同步 (aid=%s)', identity.aid);
+            this._logger.warn(`服务端 active_cert 公钥与本地私钥不匹配，拒绝同步 (aid=${identity.aid})`);
           }
         }
       } catch (e) {
-        _authLog('warn', 'active_cert 同步异常 (%s): %s', identity.aid, e instanceof Error ? e.message : String(e));
+        this._logger.warn(`active_cert 同步异常 (${identity.aid}): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }

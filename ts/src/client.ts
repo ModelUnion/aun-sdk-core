@@ -590,6 +590,7 @@ export class AUNClient {
       slotId: this._slotId,
       rootCaPath: this._configModel.rootCaPath ?? undefined,
       verifySsl: this._configModel.verifySsl,
+      logger: this._logger.for('aun_core.auth'),
     });
 
     this._transport = new RPCTransport({
