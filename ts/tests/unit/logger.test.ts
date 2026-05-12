@@ -1,10 +1,6 @@
-/**
- * AUNLogger 单元测试 — 日志格式验证
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 
-// mock fs 避免真正写文件
 vi.mock('fs', async () => {
   const actual = await vi.importActual<typeof fs>('fs');
   return {
@@ -19,46 +15,83 @@ vi.mock('fs', async () => {
 
 import { AUNLogger } from '../../src/logger.js';
 
-describe('AUNLogger 日志格式（TS-003）', () => {
-  let logger: AUNLogger;
+const FMT = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[(ERROR|WARN|INFO|DEBUG)\]\[aun_core\.[a-z-]+\] /;
+
+describe('AUNLogger 新格式', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     vi.mocked(fs.appendFileSync).mockClear();
-    logger = new AUNLogger();
+    vi.mocked(fs.mkdirSync).mockClear();
+    logSpy  = vi.spyOn(console, 'log').mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    errSpy  = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
   });
 
-  it('时间戳和 AID 之间应有空格分隔', () => {
-    logger.setAid('test.aid.com');
-    logger.log('hello world');
+  it('INFO 行符合规范格式', () => {
+    const logger = new AUNLogger({ debug: false, aunPath: '/tmp/aun' });
+    logger.for('aun_core.auth').info('login succeeded');
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const line = String(logSpy.mock.calls[0][0]);
+    expect(line).toMatch(FMT);
+    expect(line).toContain('[INFO]');
+    expect(line).toContain('[aun_core.auth]');
+    expect(line).toContain('login succeeded');
+  });
+
+  it('bindAid 前后 message 差异', () => {
+    const logger = new AUNLogger({ debug: false, aunPath: '/tmp/aun' });
+    logger.for('aun_core.client').info('before');
+    logger.bindAid('alice.com');
+    logger.for('aun_core.client').info('after');
+    const l0 = String(logSpy.mock.calls[0][0]);
+    const l1 = String(logSpy.mock.calls[1][0]);
+    expect(l0).not.toContain('[alice.com]');
+    expect(l0).toMatch(/\[aun_core\.client\] before$/);
+    expect(l1).toContain('[alice.com]');
+    expect(l1).toMatch(/\[aun_core\.client\] \[alice\.com\] after$/);
+  });
+
+  it('ERROR 带 Error：控制台只单行，文件追加 Traceback', () => {
+    const logger = new AUNLogger({ debug: true, aunPath: '/tmp/aun' });
+    const err = new Error('boom');
+    err.stack = 'Error: boom\n    at foo (bar.ts:1:1)';
+    logger.for('aun_core.e2ee').error('decrypt failed', err);
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const consoleLine = String(errSpy.mock.calls[0][0]);
+    expect(consoleLine).not.toContain('Traceback');
+    expect(consoleLine).not.toContain('    at foo');
 
     expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
-    const line = vi.mocked(fs.appendFileSync).mock.calls[0][1] as string;
-
-    // 格式应为：{timestamp} | [{aid}] {message}\n
-    // 时间戳后应有 " | " 分隔符，AID 应被方括号包裹
-    expect(line).toMatch(/^\d+ \| \[test\.aid\.com\] hello world\n$/);
+    const payload = String(vi.mocked(fs.appendFileSync).mock.calls[0][1]);
+    expect(payload).toContain('decrypt failed');
+    expect(payload).toContain('Traceback:');
+    expect(payload).toContain('    Error: boom');
+    expect(payload).toContain('    at foo (bar.ts:1:1)');
   });
 
-  it('无 AID 时不应输出空的方括号', () => {
-    // 未调用 setAid，AID 为空
-    logger.log('no aid message');
-
+  it('文件路径为 {aunPath}/logs/ts-sdk-{yyyy-mm-dd}.log', () => {
+    const logger = new AUNLogger({ debug: true, aunPath: '/custom/aun' });
+    logger.for('aun_core.client').info('hello');
     expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
-    const line = vi.mocked(fs.appendFileSync).mock.calls[0][1] as string;
-
-    // 无 AID 时格式应为：{timestamp} | {message}\n（不含 []）
-    expect(line).toMatch(/^\d+ \| no aid message\n$/);
-    expect(line).not.toContain('[]');
+    const path = String(vi.mocked(fs.appendFileSync).mock.calls[0][0]);
+    expect(path).toMatch(/[\\/]custom[\\/]aun[\\/]logs[\\/]ts-sdk-\d{4}-\d{2}-\d{2}\.log$/);
   });
 
-  it('时间戳应为毫秒级 Unix 时间', () => {
-    logger.log('timestamp check');
-
-    const line = vi.mocked(fs.appendFileSync).mock.calls[0][1] as string;
-    const tsStr = line.split(' ')[0];
-    const ts = parseInt(tsStr, 10);
-
-    // 应为合理的毫秒级时间戳（大于 2020-01-01 毫秒值）
-    expect(ts).toBeGreaterThan(1577836800000);
+  it('debug=false 时不建 logs 目录、不写文件', () => {
+    vi.mocked(fs.mkdirSync).mockClear();
+    const logger = new AUNLogger({ debug: false, aunPath: '/tmp/aun' });
+    logger.for('aun_core.client').info('hello');
+    expect(fs.mkdirSync).not.toHaveBeenCalled();
+    expect(fs.appendFileSync).not.toHaveBeenCalled();
+    logger.close();
   });
 });
