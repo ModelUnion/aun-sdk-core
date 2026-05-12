@@ -3015,7 +3015,7 @@ export class AUNClient {
       // peer 证书只存版本目录，不覆盖 cert.pem
       this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
     } catch (exc) {
-      this._clientLog.error(`写入证书到 keystore 失败 (aid=${aid}, fp=${certFingerprint ?? ''}): ${formatCaughtError(exc)}`);
+      this._clientLog.error(`写入证书到 keystore 失败 (aid=${aid}, fp=${certFingerprint ?? ''}): ${formatCaughtError(exc)}`, exc instanceof Error ? exc : undefined);
     }
 
     return certPem;
@@ -4193,7 +4193,7 @@ export class AUNClient {
             this._clientLog.warn(`同步 epoch 到服务端失败 (group=${groupId}, 第${attempt}/${maxRetries}次): ${formatCaughtError(exc)}, ${delay}ms后重试`);
             await new Promise(r => setTimeout(r, delay));
           } else {
-            this._clientLog.error(`同步 epoch 到服务端最终失败 (group=${groupId}, 已重试${maxRetries}次): ${formatCaughtError(exc)}`);
+            this._clientLog.error(`同步 epoch 到服务端最终失败 (group=${groupId}, 已重试${maxRetries}次): ${formatCaughtError(exc)}`, exc instanceof Error ? exc : undefined);
           }
         }
       }
