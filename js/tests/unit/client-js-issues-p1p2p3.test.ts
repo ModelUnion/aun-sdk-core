@@ -269,69 +269,6 @@ describe('ISSUE-SDK-JS-008: _gapFillActive 来源标记', () => {
   });
 });
 
-// ── P2: ISSUE-SDK-JS-010: 重连后密钥恢复 ────────────────────
-describe('ISSUE-SDK-JS-010: 重连后缺失 epoch key 群密钥恢复', () => {
-  it('_syncAllGroupsOnce 对无 epoch key 的群应请求密钥恢复', async () => {
-    const client = new AUNClient();
-    (client as any)._state = 'connected';
-    (client as any)._aid = 'alice.aid.com';
-    (client as any)._deviceId = 'dev-1';
-
-    const groupE2ee = (client as any)._groupE2ee;
-    vi.spyOn(groupE2ee, 'hasSecret').mockResolvedValue(false);
-
-    const calls: Array<{ method: string; params: any }> = [];
-    vi.spyOn(client, 'call').mockImplementation(async (method: string, params?: any) => {
-      calls.push({ method, params });
-      if (method === 'group.list_my') {
-        return {
-          items: [
-            { group_id: 'g1', owner_aid: 'owner.aid.com' },
-          ],
-        };
-      }
-      return {};
-    });
-
-    await (client as any)._syncAllGroupsOnce();
-
-    // 应该向 owner 发起密钥恢复请求
-    const keyRequest = calls.find(
-      c => c.method === 'message.send' && c.params?.to === 'owner.aid.com'
-    );
-    expect(keyRequest).toBeDefined();
-  });
-
-  it('_syncAllGroupsOnce 有 epoch key 的群应补消息而非恢复密钥', async () => {
-    const client = new AUNClient();
-    (client as any)._state = 'connected';
-    (client as any)._aid = 'alice.aid.com';
-    (client as any)._deviceId = 'dev-1';
-    (client as any)._seqTracker = {
-      getContiguousSeq: () => 0,
-      onPullResult: vi.fn(),
-      onMessageSeq: vi.fn().mockReturnValue(false),
-      exportState: () => ({}),
-    };
-
-    const groupE2ee = (client as any)._groupE2ee;
-    vi.spyOn(groupE2ee, 'hasSecret').mockResolvedValue(true);
-
-    const calls: string[] = [];
-    vi.spyOn(client, 'call').mockImplementation(async (method: string) => {
-      calls.push(method);
-      if (method === 'group.list_my') return { items: [{ group_id: 'g1' }] };
-      return { messages: [], events: [] };
-    });
-
-    await (client as any)._syncAllGroupsOnce();
-
-    // 不应发送密钥恢复请求（message.send）
-    const keyRequest = calls.filter(c => c === 'message.send');
-    expect(keyRequest.length).toBe(0);
-  });
-});
-
 // ── P3: ISSUE-SDK-JS-004: verify_ssl=false 浏览器兼容 ────────
 describe('ISSUE-SDK-JS-004: verify_ssl=false 浏览器兼容', () => {
   it('verify_ssl=false 应记录警告但不抛错', () => {

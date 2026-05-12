@@ -374,3 +374,701 @@ func TestIntegration_GroupE2EE_NonMemberCannotDecrypt(t *testing.T) {
 	}
 	t.Logf("非成员无法访问加密群消息验证通过")
 }
+
+// ---------------------------------------------------------------------------
+// TestIntegration_GroupE2EE_OpenJoinOnlinePriorityRecovery — 开放群入群在线优先密钥恢复
+// 验证：Owner 创建 open 群 → Member 通过 request_join 加入 → 在线优先恢复 committed_epoch
+//       → Owner 发加密消息 → Member 解密 → 等待延迟轮换 → 再次验证解密
+// ---------------------------------------------------------------------------
+
+func TestIntegration_GroupE2EE_OpenJoinOnlinePriorityRecovery(t *testing.T) {
+	rid := runID()
+	owner := makeClient(t)
+	member := makeClient(t)
+	defer owner.Close()
+	defer member.Close()
+
+	ownerAID := fmt.Sprintf("ge2e%s-oj-o.%s", rid, testIssuer())
+	memberAID := fmt.Sprintf("ge2e%s-oj-m.%s", rid, testIssuer())
+
+	ensureConnected(t, owner, ownerAID)
+	ensureConnected(t, member, memberAID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// ---- 创建 open 群组 ----
+	createResult, err := owner.Call(ctx, "group.create", map[string]any{
+		"name":       fmt.Sprintf("e2ee-open-join-%s", rid),
+		"visibility": "public",
+		"join_mode":  "open",
+	})
+	skipIfNotImplemented(t, err, "group.create")
+	if err != nil {
+		t.Fatalf("group.create 失败: %v", err)
+	}
+	groupID := extractGroupID(t, createResult)
+	defer cleanupGroup(t, owner, groupID)
+	t.Logf("创建 open 群组: %s", groupID)
+
+	// ---- 等待 Owner 的 committed epoch 就绪 ----
+	ownerEpoch, ok := waitForCommittedGroupEpochReady(t, owner, groupID, 1, 30*time.Second)
+	if !ok {
+		t.Skipf("Owner 未在超时内获得 committed epoch（服务端可能不支持）")
+	}
+	t.Logf("Owner committed epoch: %d", ownerEpoch)
+
+	// ---- Member 通过 request_join 加入 open 群 ----
+	joinResult, err := member.Call(ctx, "group.request_join", map[string]any{
+		"group_id": groupID,
+	})
+	skipIfNotImplemented(t, err, "group.request_join")
+	if err != nil {
+		t.Fatalf("group.request_join 失败: %v", err)
+	}
+	joinMap, _ := joinResult.(map[string]any)
+	status, _ := joinMap["status"].(string)
+	if status != "joined" {
+		t.Fatalf("open 群 request_join 应直接返回 joined，实际: %s (result: %#v)", status, joinMap)
+	}
+	t.Logf("Member 加入 open 群，status=%s", status)
+
+	// ---- Member 通过在线优先恢复获取 committed_epoch 密钥 ----
+	if !waitForGroupSecret(member, groupID, 30*time.Second) {
+		t.Fatalf("Member 未在超时内通过在线优先恢复获取群密钥")
+	}
+	t.Logf("Member 已通过在线优先恢复获取群密钥")
+
+	// ---- 设置消息监听 ----
+	memberWatch := watchGroupMessages(t, member, groupID)
+	defer memberWatch.Stop()
+
+	// ---- Owner 发送加密消息（恢复窗口内） ----
+	text1 := fmt.Sprintf("open-join-msg1-%d", time.Now().UnixMilli())
+	groupSendEncrypted(t, owner, groupID, map[string]any{"type": "text", "text": text1})
+	t.Logf("Owner 发送加密消息: %s", text1)
+
+	// ---- Member 解密消息 ----
+	msgs1 := memberWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecrypted(messages) {
+			if getPayloadText(msg) == text1 {
+				return true
+			}
+		}
+		return false
+	})
+	found1 := false
+	for _, msg := range filterDecrypted(msgs1) {
+		if getPayloadText(msg) == text1 {
+			found1 = true
+			break
+		}
+	}
+	if !found1 {
+		t.Fatalf("Member 未能解密恢复窗口内的加密消息: %s", text1)
+	}
+	t.Logf("Member 成功解密恢复窗口内消息")
+
+	// ---- 等待延迟轮换（新 epoch） ----
+	newEpoch, rotated := waitForCommittedGroupEpochGreaterThan(t, member, groupID, ownerEpoch, 45*time.Second)
+	if !rotated {
+		t.Logf("未检测到延迟轮换（可能服务端未触发），跳过轮换后验证")
+		return
+	}
+	t.Logf("检测到延迟轮换，新 epoch: %d", newEpoch)
+
+	// ---- Owner 发送轮换后消息 ----
+	text2 := fmt.Sprintf("open-join-msg2-%d", time.Now().UnixMilli())
+	groupSendEncrypted(t, owner, groupID, map[string]any{"type": "text", "text": text2})
+
+	// ---- Member 解密轮换后消息 ----
+	msgs2 := memberWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecryptedByEpoch(messages, newEpoch) {
+			if getPayloadText(msg) == text2 {
+				return true
+			}
+		}
+		return false
+	})
+	found2 := false
+	for _, msg := range filterDecryptedByEpoch(msgs2, newEpoch) {
+		if getPayloadText(msg) == text2 {
+			found2 = true
+			break
+		}
+	}
+	if !found2 {
+		t.Fatalf("Member 未能解密延迟轮换后的加密消息: %s", text2)
+	}
+	t.Logf("Open 群入群在线优先密钥恢复验证通过")
+}
+
+// ---------------------------------------------------------------------------
+// TestIntegration_GroupE2EE_InviteCodeJoinOnlinePriorityRecovery — 邀请码入群在线优先密钥恢复
+// 验证：Owner 创建 invite_code 群 → 生成邀请码 → Member 使用邀请码入群
+//       → 在线优先恢复 committed_epoch → Owner 发加密消息 → Member 解密
+// ---------------------------------------------------------------------------
+
+func TestIntegration_GroupE2EE_InviteCodeJoinOnlinePriorityRecovery(t *testing.T) {
+	rid := runID()
+	owner := makeClient(t)
+	member := makeClient(t)
+	defer owner.Close()
+	defer member.Close()
+
+	ownerAID := fmt.Sprintf("ge2e%s-ic-o.%s", rid, testIssuer())
+	memberAID := fmt.Sprintf("ge2e%s-ic-m.%s", rid, testIssuer())
+
+	ensureConnected(t, owner, ownerAID)
+	ensureConnected(t, member, memberAID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// ---- 创建 invite_code 群组 ----
+	createResult, err := owner.Call(ctx, "group.create", map[string]any{
+		"name":       fmt.Sprintf("e2ee-invite-code-%s", rid),
+		"visibility": "public",
+		"join_mode":  "invite_code",
+	})
+	skipIfNotImplemented(t, err, "group.create")
+	if err != nil {
+		t.Fatalf("group.create 失败: %v", err)
+	}
+	groupID := extractGroupID(t, createResult)
+	defer cleanupGroup(t, owner, groupID)
+	t.Logf("创建 invite_code 群组: %s", groupID)
+
+	// ---- 等待 Owner 的 committed epoch 就绪 ----
+	ownerEpoch, ok := waitForCommittedGroupEpochReady(t, owner, groupID, 1, 30*time.Second)
+	if !ok {
+		t.Skipf("Owner 未在超时内获得 committed epoch（服务端可能不支持）")
+	}
+	t.Logf("Owner committed epoch: %d", ownerEpoch)
+
+	// ---- Owner 创建邀请码 ----
+	inviteResult, err := owner.Call(ctx, "group.create_invite_code", map[string]any{
+		"group_id": groupID,
+	})
+	skipIfNotImplemented(t, err, "group.create_invite_code")
+	if err != nil {
+		t.Fatalf("group.create_invite_code 失败: %v", err)
+	}
+	inviteMap, _ := inviteResult.(map[string]any)
+	var inviteCode string
+	// 服务端返回 invite_code 为嵌套 map，包含 code / code_with_domain 等字段
+	if nested, ok := inviteMap["invite_code"].(map[string]any); ok {
+		// 优先使用 code_with_domain（跨域场景），其次 code
+		if cwd, _ := nested["code_with_domain"].(string); cwd != "" {
+			inviteCode = cwd
+		} else if c, _ := nested["code"].(string); c != "" {
+			inviteCode = c
+		}
+	}
+	// 兼容旧版：invite_code 直接是字符串
+	if inviteCode == "" {
+		inviteCode, _ = inviteMap["invite_code"].(string)
+	}
+	// 再尝试顶层 code 字段
+	if inviteCode == "" {
+		inviteCode, _ = inviteMap["code"].(string)
+	}
+	if inviteCode == "" {
+		t.Fatalf("创建邀请码返回中未找到有效的 invite_code: %#v", inviteMap)
+	}
+	t.Logf("创建邀请码: %s", inviteCode)
+
+	// ---- Member 使用邀请码入群 ----
+	useResult, err := member.Call(ctx, "group.use_invite_code", map[string]any{
+		"code": inviteCode,
+	})
+	skipIfNotImplemented(t, err, "group.use_invite_code")
+	if err != nil {
+		t.Fatalf("group.use_invite_code 失败: %v", err)
+	}
+	useMap, _ := useResult.(map[string]any)
+	useStatus, _ := useMap["status"].(string)
+	useGroupID, _ := useMap["group_id"].(string)
+	if useGroupID == "" {
+		useGroupID = groupID
+	}
+	t.Logf("Member 使用邀请码入群: status=%s, group_id=%s", useStatus, useGroupID)
+
+	// ---- Member 通过在线优先恢复获取 committed_epoch 密钥 ----
+	if !waitForGroupSecret(member, groupID, 30*time.Second) {
+		t.Fatalf("Member 未在超时内通过在线优先恢复获取群密钥")
+	}
+	t.Logf("Member 已通过在线优先恢复获取群密钥")
+
+	// ---- 设置消息监听 ----
+	memberWatch := watchGroupMessages(t, member, groupID)
+	defer memberWatch.Stop()
+
+	// ---- Owner 发送加密消息 ----
+	text1 := fmt.Sprintf("invite-code-msg-%d", time.Now().UnixMilli())
+	groupSendEncrypted(t, owner, groupID, map[string]any{"type": "text", "text": text1})
+	t.Logf("Owner 发送加密消息: %s", text1)
+
+	// ---- Member 解密消息 ----
+	msgs := memberWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecrypted(messages) {
+			if getPayloadText(msg) == text1 {
+				return true
+			}
+		}
+		return false
+	})
+	found := false
+	for _, msg := range filterDecrypted(msgs) {
+		if getPayloadText(msg) == text1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Member 未能解密邀请码入群后的加密消息: %s", text1)
+	}
+	t.Logf("Member 成功解密邀请码入群后消息")
+
+	// ---- 等待延迟轮换 ----
+	newEpoch, rotated := waitForCommittedGroupEpochGreaterThan(t, member, groupID, ownerEpoch, 45*time.Second)
+	if !rotated {
+		t.Logf("未检测到延迟轮换（可能服务端未触发），跳过轮换后验证")
+		return
+	}
+	t.Logf("检测到延迟轮换，新 epoch: %d", newEpoch)
+
+	// ---- Owner 发送轮换后消息 ----
+	text2 := fmt.Sprintf("invite-code-msg2-%d", time.Now().UnixMilli())
+	groupSendEncrypted(t, owner, groupID, map[string]any{"type": "text", "text": text2})
+
+	// ---- Member 解密轮换后消息 ----
+	msgs2 := memberWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecryptedByEpoch(messages, newEpoch) {
+			if getPayloadText(msg) == text2 {
+				return true
+			}
+		}
+		return false
+	})
+	found2 := false
+	for _, msg := range filterDecryptedByEpoch(msgs2, newEpoch) {
+		if getPayloadText(msg) == text2 {
+			found2 = true
+			break
+		}
+	}
+	if !found2 {
+		t.Fatalf("Member 未能解密延迟轮换后的加密消息: %s", text2)
+	}
+	t.Logf("邀请码入群在线优先密钥恢复验证通过")
+}
+
+// ---------------------------------------------------------------------------
+// TestIntegration_GroupE2EE_PrivateAddMemberImmediateRotation — 私有群 add_member 立即轮换（对照组）
+// 验证：Owner 创建私有群 → add_member → Member 通过立即轮换获取新 epoch
+//       → Owner 发加密消息 → Member 解密
+// ---------------------------------------------------------------------------
+
+func TestIntegration_GroupE2EE_PrivateAddMemberImmediateRotation(t *testing.T) {
+	rid := runID()
+	owner := makeClient(t)
+	member := makeClient(t)
+	defer owner.Close()
+	defer member.Close()
+
+	ownerAID := fmt.Sprintf("ge2e%s-pa-o.%s", rid, testIssuer())
+	memberAID := fmt.Sprintf("ge2e%s-pa-m.%s", rid, testIssuer())
+
+	ensureConnected(t, owner, ownerAID)
+	ensureConnected(t, member, memberAID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// ---- 创建私有群组（默认） ----
+	createResult, err := owner.Call(ctx, "group.create", map[string]any{
+		"name":       fmt.Sprintf("e2ee-private-add-%s", rid),
+		"visibility": "private",
+	})
+	skipIfNotImplemented(t, err, "group.create")
+	if err != nil {
+		t.Fatalf("group.create 失败: %v", err)
+	}
+	groupID := extractGroupID(t, createResult)
+	defer cleanupGroup(t, owner, groupID)
+	t.Logf("创建私有群组: %s", groupID)
+
+	// ---- 等待 Owner 的 committed epoch 就绪 ----
+	ownerEpoch, ok := waitForCommittedGroupEpochReady(t, owner, groupID, 1, 30*time.Second)
+	if !ok {
+		t.Skipf("Owner 未在超时内获得 committed epoch（服务端可能不支持）")
+	}
+	t.Logf("Owner committed epoch: %d", ownerEpoch)
+
+	// ---- Owner 添加 Member ----
+	_, err = owner.Call(ctx, "group.add_member", map[string]any{
+		"group_id": groupID,
+		"aid":      memberAID,
+		"role":     "member",
+	})
+	if err != nil {
+		t.Fatalf("group.add_member 失败: %v", err)
+	}
+	t.Logf("Owner 添加 Member: %s", memberAID)
+
+	// ---- Member 通过立即轮换获取新 epoch 密钥 ----
+	if !waitForGroupSecret(member, groupID, 30*time.Second) {
+		t.Fatalf("Member 未在超时内通过立即轮换获取群密钥")
+	}
+	t.Logf("Member 已通过立即轮换获取群密钥")
+
+	// ---- 验证 Member 获得的是新 epoch（立即轮换产生） ----
+	newEpoch, epochReady := waitForCommittedGroupEpochReady(t, member, groupID, ownerEpoch, 30*time.Second)
+	if !epochReady {
+		t.Logf("Member 未获得 committed epoch >= %d，但已有密钥，继续验证消息解密", ownerEpoch)
+	} else {
+		t.Logf("Member committed epoch: %d（立即轮换）", newEpoch)
+	}
+
+	// ---- 设置消息监听 ----
+	memberWatch := watchGroupMessages(t, member, groupID)
+	defer memberWatch.Stop()
+
+	// ---- Owner 发送加密消息 ----
+	text1 := fmt.Sprintf("private-add-msg-%d", time.Now().UnixMilli())
+	groupSendEncrypted(t, owner, groupID, map[string]any{"type": "text", "text": text1})
+	t.Logf("Owner 发送加密消息: %s", text1)
+
+	// ---- Member 解密消息 ----
+	msgs := memberWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecrypted(messages) {
+			if getPayloadText(msg) == text1 {
+				return true
+			}
+		}
+		return false
+	})
+	found := false
+	for _, msg := range filterDecrypted(msgs) {
+		if getPayloadText(msg) == text1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Member 未能解密 add_member 后的加密消息: %s", text1)
+	}
+	t.Logf("私有群 add_member 立即轮换验证通过")
+}
+
+// ---------------------------------------------------------------------------
+// TestIntegration_GroupE2EE_OpenJoinMemberLeadsRotation
+// open 群 owner 离线时，普通 member 代为轮换 epoch
+// ---------------------------------------------------------------------------
+
+func TestIntegration_GroupE2EE_OpenJoinMemberLeadsRotation(t *testing.T) {
+	rid := runID()
+	owner := makeClient(t)
+	charlie := makeClient(t)
+	bob := makeClient(t)
+	defer owner.Close()
+	defer charlie.Close()
+	defer bob.Close()
+
+	ownerAID := fmt.Sprintf("ge2e%s-mlr-o.%s", rid, testIssuer())
+	charlieAID := fmt.Sprintf("ge2e%s-mlr-c.%s", rid, testIssuer())
+	bobAID := fmt.Sprintf("ge2e%s-mlr-b.%s", rid, testIssuer())
+
+	ensureConnected(t, owner, ownerAID)
+	ensureConnected(t, charlie, charlieAID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// 1. Owner 建 open 群
+	createResult, err := owner.Call(ctx, "group.create", map[string]any{
+		"name":       fmt.Sprintf("e2ee-mlr-%s", rid),
+		"visibility": "public",
+		"join_mode":  "open",
+	})
+	skipIfNotImplemented(t, err, "group.create")
+	if err != nil {
+		t.Fatalf("group.create 失败: %v", err)
+	}
+	groupID := extractGroupID(t, createResult)
+	defer cleanupGroup(t, owner, groupID)
+
+	epoch1, ok := waitForCommittedGroupEpochReady(t, owner, groupID, 1, 30*time.Second)
+	if !ok {
+		t.Skipf("Owner 未在超时内获得 committed epoch")
+	}
+	t.Logf("epoch1=%d", epoch1)
+
+	// 2. Owner add_member Charlie
+	addMember(t, owner, groupID, charlieAID)
+	epoch2, ok := waitForCommittedGroupEpochReady(t, charlie, groupID, epoch1+1, 30*time.Second)
+	if !ok {
+		t.Fatalf("Charlie 未获得 epoch %d+", epoch1+1)
+	}
+	t.Logf("epoch2=%d", epoch2)
+
+	// 3. Owner 下线
+	owner.Close()
+	time.Sleep(1 * time.Second)
+
+	// 4. Bob 加入 open 群
+	ensureConnected(t, bob, bobAID)
+	joinResult, err := bob.Call(ctx, "group.request_join", map[string]any{"group_id": groupID})
+	if err != nil {
+		t.Fatalf("bob request_join 失败: %v", err)
+	}
+	joinMap, _ := joinResult.(map[string]any)
+	if joinMap["status"] != "joined" {
+		t.Fatalf("expected joined, got %v", joinMap)
+	}
+
+	// 5. Charlie（member）应代为轮换 epoch，Bob 拿到新 key
+	epoch3, ok := waitForCommittedGroupEpochReady(t, bob, groupID, epoch2+1, 30*time.Second)
+	if !ok {
+		t.Fatalf("Bob 未获得 member-led rotation epoch %d+", epoch2+1)
+	}
+	t.Logf("epoch3=%d (member-led rotation)", epoch3)
+
+	// 6. Charlie 发消息，Bob 能解密
+	bobWatch := watchGroupMessages(t, bob, groupID)
+	defer bobWatch.Stop()
+	text := fmt.Sprintf("mlr-msg-%d", time.Now().UnixMilli())
+	groupSendEncrypted(t, charlie, groupID, map[string]any{"type": "text", "text": text})
+
+	msgs := bobWatch.WaitFor(t, 20*time.Second, func(messages []map[string]any) bool {
+		for _, msg := range filterDecrypted(messages) {
+			if getPayloadText(msg) == text {
+				return true
+			}
+		}
+		return false
+	})
+	found := false
+	for _, msg := range filterDecrypted(msgs) {
+		if getPayloadText(msg) == text {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Bob 未能解密 member-led rotation 后的消息")
+	}
+	t.Logf("member leads rotation 验证通过")
+}
+
+// ---------------------------------------------------------------------------
+// TestIntegration_GroupE2EE_OpenJoinSendRepairsMissingCommittedMembership
+// open 群新成员在 committed membership 缺少自己时，发送前应先修复轮换
+// ---------------------------------------------------------------------------
+
+func TestIntegration_GroupE2EE_OpenJoinSendRepairsMissingCommittedMembership(t *testing.T) {
+	rid := runID()
+	owner := makeClient(t)
+	bob := makeClient(t)
+	charlie := makeClient(t)
+	defer owner.Close()
+	defer bob.Close()
+	defer charlie.Close()
+
+	ownerAID := fmt.Sprintf("ge2e%s-oms-o.%s", rid, testIssuer())
+	bobAID := fmt.Sprintf("ge2e%s-oms-b.%s", rid, testIssuer())
+	charlieAID := fmt.Sprintf("ge2e%s-oms-c.%s", rid, testIssuer())
+
+	ensureConnected(t, owner, ownerAID)
+	ensureConnected(t, bob, bobAID)
+	ensureConnected(t, charlie, charlieAID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// 1. Owner 建 open 群
+	createResult, err := owner.Call(ctx, "group.create", map[string]any{
+		"name":       fmt.Sprintf("e2ee-oms-%s", rid),
+		"visibility": "public",
+		"join_mode":  "open",
+	})
+	skipIfNotImplemented(t, err, "group.create")
+	if err != nil {
+		t.Fatalf("group.create 失败: %v", err)
+	}
+	groupID := extractGroupID(t, createResult)
+	defer cleanupGroup(t, owner, groupID)
+
+	epoch1, ok := waitForCommittedGroupEpochReady(t, owner, groupID, 1, 30*time.Second)
+	if !ok {
+		t.Skipf("Owner 未在超时内获得 committed epoch")
+	}
+
+	// 2. Bob 加入
+	joinResult, err := bob.Call(ctx, "group.request_join", map[string]any{"group_id": groupID})
+	if err != nil {
+		t.Fatalf("bob request_join 失败: %v", err)
+	}
+	joinMap, _ := joinResult.(map[string]any)
+	if joinMap["status"] != "joined" {
+		t.Fatalf("expected joined, got %v", joinMap)
+	}
+	epoch2, _ := waitForCommittedGroupEpochReady(t, bob, groupID, epoch1+1, 30*time.Second)
+	waitForCommittedGroupEpochReady(t, owner, groupID, epoch2, 20*time.Second)
+	t.Logf("epoch2=%d after bob join", epoch2)
+
+	// 3. Owner 下线，Charlie 加入（制造 committed membership gap）
+	owner.Close()
+	time.Sleep(500 * time.Millisecond)
+	charlieJoin, err := charlie.Call(ctx, "group.request_join", map[string]any{"group_id": groupID})
+	if err != nil {
+		t.Fatalf("charlie request_join 失败: %v", err)
+	}
+	charlieMap, _ := charlieJoin.(map[string]any)
+	if charlieMap["status"] != "joined" {
+		t.Fatalf("expected charlie joined, got %v", charlieMap)
+	}
+
+	// 4. Bob 发送加密消息 — 应触发 committed membership gap 修复
+	text := fmt.Sprintf("repair-send-%d", time.Now().UnixMilli())
+	_, err = bob.Call(ctx, "group.send", map[string]any{
+		"group_id": groupID,
+		"payload":  map[string]any{"type": "text", "text": text},
+		"encrypt":  true,
+	})
+	if err != nil {
+		t.Fatalf("bob group.send 失败: %v", err)
+	}
+
+	// 5. 验证 epoch 已推进（gap 被修复）
+	repairedEpoch, ok := waitForCommittedGroupEpochReady(t, bob, groupID, epoch2+1, 30*time.Second)
+	if !ok {
+		// 也可能在发送前已被其他 member 修复
+		t.Logf("epoch 未推进，可能已被其他路径修复")
+	} else {
+		t.Logf("repairedEpoch=%d (gap repaired)", repairedEpoch)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestIntegration_GroupE2EE_ThoughtGetRecoversMissingEpochKey
+// group.thought.get 缺 epoch key 时应恢复后解密
+// ---------------------------------------------------------------------------
+
+func TestIntegration_GroupE2EE_ThoughtGetRecoversMissingEpochKey(t *testing.T) {
+	rid := runID()
+	ownerPath := t.TempDir()
+	t.Setenv("AUN_ENV", "development")
+	owner := NewClient(map[string]any{"aun_path": ownerPath}, true)
+	owner.configModel.RequireForwardSecrecy = false
+	bob := makeClient(t)
+	charlie := makeClient(t)
+	defer owner.Close()
+	defer bob.Close()
+	defer charlie.Close()
+
+	ownerAID := fmt.Sprintf("ge2e%s-tgt-o.%s", rid, testIssuer())
+	bobAID := fmt.Sprintf("ge2e%s-tgt-b.%s", rid, testIssuer())
+	charlieAID := fmt.Sprintf("ge2e%s-tgt-c.%s", rid, testIssuer())
+
+	ensureConnected(t, owner, ownerAID)
+	ensureConnected(t, bob, bobAID)
+	ensureConnected(t, charlie, charlieAID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// 1. Owner 建 open 群
+	createResult, err := owner.Call(ctx, "group.create", map[string]any{
+		"name":       fmt.Sprintf("e2ee-thought-%s", rid),
+		"visibility": "public",
+		"join_mode":  "open",
+	})
+	skipIfNotImplemented(t, err, "group.create")
+	if err != nil {
+		t.Fatalf("group.create 失败: %v", err)
+	}
+	groupID := extractGroupID(t, createResult)
+	defer cleanupGroup(t, owner, groupID)
+
+	epoch1, ok := waitForCommittedGroupEpochReady(t, owner, groupID, 1, 30*time.Second)
+	if !ok {
+		t.Skipf("Owner 未在超时内获得 committed epoch")
+	}
+
+	// 2. Bob 加入
+	joinResult, err := bob.Call(ctx, "group.request_join", map[string]any{"group_id": groupID})
+	if err != nil {
+		t.Fatalf("bob request_join 失败: %v", err)
+	}
+	joinMap, _ := joinResult.(map[string]any)
+	if joinMap["status"] != "joined" {
+		t.Fatalf("expected joined, got %v", joinMap)
+	}
+	epoch2, _ := waitForCommittedGroupEpochReady(t, bob, groupID, epoch1+1, 30*time.Second)
+	waitForCommittedGroupEpochReady(t, owner, groupID, epoch2, 20*time.Second)
+
+	// 3. Owner 下线，Charlie 加入推进 epoch
+	owner.Close()
+	time.Sleep(500 * time.Millisecond)
+	charlieJoin, err := charlie.Call(ctx, "group.request_join", map[string]any{"group_id": groupID})
+	if err != nil {
+		t.Fatalf("charlie request_join 失败: %v", err)
+	}
+	charlieMap, _ := charlieJoin.(map[string]any)
+	if charlieMap["status"] != "joined" {
+		t.Fatalf("expected charlie joined, got %v", charlieMap)
+	}
+	epoch3, _ := waitForCommittedGroupEpochReady(t, bob, groupID, epoch2+1, 30*time.Second)
+	waitForCommittedGroupEpochReady(t, charlie, groupID, epoch3, 20*time.Second)
+	t.Logf("epoch3=%d (owner offline)", epoch3)
+
+	// 4. Bob 写 thought
+	thoughtText := fmt.Sprintf("thought-recover-%d", time.Now().UnixMilli())
+	thoughtContext := map[string]any{"type": "run", "id": fmt.Sprintf("thought-run-%s", rid)}
+	_, err = bob.Call(ctx, "group.thought.put", map[string]any{
+		"group_id": groupID,
+		"context":  thoughtContext,
+		"payload":  map[string]any{"type": "thought", "text": thoughtText},
+	})
+	if err != nil {
+		t.Fatalf("bob group.thought.put 失败: %v", err)
+	}
+
+	// 5. Owner 重新上线，读取 thought — 应触发 epoch key 恢复后解密
+	owner2 := NewClient(map[string]any{"aun_path": ownerPath}, true)
+	owner2.configModel.RequireForwardSecrecy = false
+	defer owner2.Close()
+	ensureConnected(t, owner2, ownerAID)
+
+	// 等待 owner2 恢复 epoch key
+	waitForCommittedGroupEpochReady(t, owner2, groupID, epoch3, 30*time.Second)
+
+	result, err := owner2.Call(ctx, "group.thought.get", map[string]any{
+		"group_id":   groupID,
+		"sender_aid": bobAID,
+		"context":    thoughtContext,
+	})
+	if err != nil {
+		t.Fatalf("owner2 group.thought.get 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	thoughts, _ := resultMap["thoughts"].([]any)
+	found := false
+	for _, item := range thoughts {
+		thought, _ := item.(map[string]any)
+		payload, _ := thought["payload"].(map[string]any)
+		if payload != nil && payload["text"] == thoughtText {
+			e2eeInfo, _ := thought["e2ee"].(map[string]any)
+			if e2eeInfo != nil && e2eeInfo["encryption_mode"] == "epoch_group_key" {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("Owner 重连后未能解密 thought: %v", resultMap)
+	}
+	t.Logf("thought.get 恢复 epoch key 后解密验证通过")
+}

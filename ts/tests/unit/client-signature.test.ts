@@ -24,7 +24,7 @@ function extractSignedMethods(): string[] {
   return methods;
 }
 
-/** 预期需要签名的 25 个方法 */
+/** 预期需要签名的 34 个方法 */
 const EXPECTED_SIGNED_METHODS = [
   'group.send',
   'group.kick',
@@ -51,13 +51,22 @@ const EXPECTED_SIGNED_METHODS = [
   'group.resources.direct_add',
   'group.resources.approve_request',
   'group.resources.reject_request',
+  'group.commit_state',
+  'group.e2ee.begin_rotation',
+  'group.e2ee.commit_rotation',
+  'group.e2ee.abort_rotation',
+  'group.ban',
+  'group.unban',
+  'group.dissolve',
+  'group.suspend',
+  'group.resume',
 ] as const;
 
 describe('SIGNED_METHODS 签名覆盖面', () => {
   const actual = extractSignedMethods();
 
-  it('应包含全部 25 个预期方法', () => {
-    expect(actual).toHaveLength(25);
+  it('应包含全部 34 个预期方法', () => {
+    expect(actual).toHaveLength(34);
   });
 
   it('每个预期方法都应在 SIGNED_METHODS 中', () => {

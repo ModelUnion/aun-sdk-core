@@ -82,6 +82,15 @@ func TestSignedMethodsCoverage(t *testing.T) {
 		"group.request_join",
 		"group.use_invite_code",
 		"group.set_settings",
+		"group.commit_state",
+		"group.e2ee.begin_rotation",
+		"group.e2ee.commit_rotation",
+		"group.e2ee.abort_rotation",
+		"group.ban",
+		"group.unban",
+		"group.dissolve",
+		"group.suspend",
+		"group.resume",
 	}
 
 	if len(signedMethods) != len(expected) {

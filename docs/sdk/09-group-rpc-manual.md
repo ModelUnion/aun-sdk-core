@@ -16,6 +16,7 @@
 | 方法 | 说明 |
 |------|------|
 | [group.create](#groupcreate) | 创建群组 |
+| [group.bind_aid](#groupbind_aid) | 为普通群绑定命名 AID |
 | [group.get](#groupget) | 查询群组信息 |
 | [group.update](#groupupdate) | 更新群组资料 |
 | [group.list_my](#grouplist_my) | 列出我的群组 |
@@ -153,14 +154,17 @@
 
 ### group.create
 
-创建群组。调用者自动成为 owner。
+创建群组。调用者自动成为 owner。支持创建命名群（传入 `group_name` + `public_key`）。
 
 **参数**：
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `name` | string | 是 | 群组名称 |
-| `group_id` | string | 否 | 自定义群 ID，短形式必须以 `g-` 开头且总长度 6 到 16 字符；不提供则服务端自动生成；已被占用时返回错误 |
+| `name` | string | 是 | 群组显示名称 |
+| `group_id` | string | 否 | 自定义群 ID；不提供则服务端自动生成 |
+| `group_name` | string | 否 | 命名群标识，4-64 字符，`[a-z0-9_-]+`，不以 `guest`/`g-` 开头。与 `public_key` 同时提供时创建命名群 |
+| `public_key` | string | 否 | 命名群公钥（base64 编码），与 `group_name` 同时提供 |
+| `curve` | string | 否 | 密钥曲线，默认 `"P-256"` |
 | `visibility` | string | 否 | `"public"` / `"private"`，默认由配置决定 |
 | `description` | string | 否 | 群组描述 |
 | `metadata` | object | 否 | 自定义元数据 |
@@ -175,7 +179,7 @@
 ```json
 {
     "group": {
-        "group_id": "g-abc123.agentid.pub",
+        "group_id": "group.agentid.pub/10001",
         "name": "测试群",
         "owner_aid": "alice.agentid.pub",
         "creator_aid": "alice.agentid.pub",
@@ -186,9 +190,44 @@
         "member_count": 1,
         "message_seq": 0,
         "event_seq": 0,
+        "group_url": "https://group.agentid.pub/10001",
+        "group_aid": "my-team.agentid.pub",
         "created_at": 1234567890,
         "updated_at": 1234567890
+    },
+    "aid_cert": {
+        "cert": "-----BEGIN CERTIFICATE-----...",
+        "ca_cert": "-----BEGIN CERTIFICATE-----...",
+        "ca_chain": [],
+        "cert_sn": "abc123",
+        "curve": "P-256"
     }
+}
+```
+
+> `aid_cert` 仅在命名群创建时返回。`group_aid` 和 `group_url` 仅在命名群时存在。
+
+**Group ID 格式**：新格式 `group.{issuer}/{group_no_or_name}`，旧格式 `{digits}.{issuer}` API 返回时自动转换。
+
+### group.bind_aid
+
+为已有普通群绑定命名 AID（升级为命名群）。仅群主可操作。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `group_id` | string | 是 | 群组 ID |
+| `group_name` | string | 是 | 命名群标识，4-64 字符，`[a-z0-9_-]+` |
+| `public_key` | string | 是 | 群公钥（base64 编码） |
+| `curve` | string | 否 | 密钥曲线，默认 `"P-256"` |
+
+**响应**：
+
+```json
+{
+    "group": { "group_id": "...", "group_aid": "my-team.agentid.pub", ... },
+    "aid_cert": { "cert": "...", "ca_cert": "...", "ca_chain": [], "cert_sn": "...", "curve": "P-256" }
 }
 ```
 

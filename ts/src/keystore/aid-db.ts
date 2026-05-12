@@ -490,6 +490,19 @@ export class AIDDatabase {
         if (localEpoch !== epoch) {
           const expiresAt = Number(current.updated_at || now) + opts.oldEpochRetentionMs;
           this._upsertGroupOldEpoch(groupId, localEpoch, currentSecret, currentData, Number(current.updated_at || now), expiresAt);
+        } else {
+          // epoch === localEpoch 但 currentSecret 为空：合并 data，不覆盖已有字段
+          const merged = { ...currentData, ...this._buildGroupCurrentData(opts, members, now) };
+          // 保留已有的 epoch_chain（如果新值为空）
+          if (!opts.epochChain && currentData.epoch_chain) {
+            merged.epoch_chain = currentData.epoch_chain;
+          }
+          if (currentData.pending_rotation_id && !opts.pendingRotationId) {
+            merged.pending_rotation_id = currentData.pending_rotation_id;
+            if (currentData.pending_created_at) merged.pending_created_at = currentData.pending_created_at;
+          }
+          this._upsertGroupCurrent(groupId, epoch, opts.secret, merged, now);
+          return true;
         }
       }
 
@@ -525,7 +538,15 @@ export class AIDDatabase {
       }
 
       const localEpoch = Number(current.epoch);
-      if (epoch > localEpoch) return false;
+      if (epoch > localEpoch) {
+        // 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
+        const oldSecret = this._revealText(`group/${groupId}/current`, current.secret_enc);
+        const oldData = jsonParseObject(current.data);
+        const expiresAt = now + (opts.oldEpochRetentionMs ?? 604800_000);
+        this._upsertGroupOldEpoch(groupId, localEpoch, oldSecret, oldData, current.updated_at, expiresAt);
+        this._upsertGroupCurrent(groupId, epoch, opts.secret, data, now);
+        return true;
+      }
 
       if (epoch === localEpoch) {
         const currentSecret = this._revealText(`group/${groupId}/current`, current.secret_enc);

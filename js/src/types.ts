@@ -26,7 +26,7 @@ export type ConnectionState =
   | 'closed';
 
 /** 判断值是否为普通 JSON 对象 */
-export function isJsonObject(value: JsonValue | object | null | undefined): value is JsonObject {
+export function isJsonObject(value: unknown): value is JsonObject {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }

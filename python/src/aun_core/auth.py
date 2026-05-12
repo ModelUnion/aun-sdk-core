@@ -947,6 +947,7 @@ class AuthFlow:
 
     @staticmethod
     def _remember_tokens(identity: dict[str, Any], auth_result: dict[str, Any]) -> None:
+        default_access_token_ttl = 3600
         access_token = auth_result.get("access_token") or auth_result.get("token") or auth_result.get("kite_token")
         refresh_token = auth_result.get("refresh_token")
         expires_in = auth_result.get("expires_in")
@@ -959,6 +960,8 @@ class AuthFlow:
             identity["kite_token"] = auth_result["token"]
         if isinstance(expires_in, (int, float)):
             identity["access_token_expires_at"] = int(time.time() + float(expires_in))
+        elif access_token:
+            identity["access_token_expires_at"] = int(time.time() + default_access_token_ttl)
         # 协议要求：login2 响应含 new_cert 时（证书过半自动续期），客户端必须保存
         # 先暂存到 _pending_new_cert，由 _validate_new_cert 验证后再正式接受
         new_cert = auth_result.get("new_cert")

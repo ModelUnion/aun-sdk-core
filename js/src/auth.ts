@@ -1406,8 +1406,10 @@ export class AuthFlow {
     if (typeof accessToken === 'string' && accessToken) identity.access_token = accessToken;
     if (typeof refreshToken === 'string' && refreshToken) identity.refresh_token = refreshToken;
     if (typeof authResult.token === 'string' && authResult.token) identity.kite_token = authResult.token;
-    if (typeof expiresIn === 'number') {
+    if (typeof expiresIn === 'number' && expiresIn > 0) {
       identity.access_token_expires_at = Math.floor(Date.now() / 1000 + expiresIn);
+    } else if (typeof accessToken === 'string' && accessToken) {
+      identity.access_token_expires_at = Math.floor(Date.now() / 1000 + 3600);
     }
     // login2 响应含 new_cert 时（证书过半自动续期），暂存待验证
     const newCert = authResult.new_cert;

@@ -72,6 +72,73 @@ const PROTECTED_CONTEXT_DOMAIN = Buffer.from('aun-protected-context-v1', 'utf-8'
 /** 旧 epoch 默认保留 7 天 */
 const OLD_EPOCH_RETENTION_SECONDS = 7 * 24 * 3600;
 
+// ── ECIES (P-256 ECDH + HKDF-SHA256 + AES-256-GCM) ──────────
+
+const ECIES_HKDF_INFO = Buffer.from('aun-epoch-key-ecies', 'utf-8');
+
+/**
+ * ECIES 加密：P-256 ECDH + HKDF-SHA256 + AES-256-GCM。
+ * @param peerPubkeyBytes 65 字节未压缩 P-256 公钥 (0x04 开头)
+ * @param plaintext 待加密明文
+ * @returns ephemeral_pubkey(65B) || iv(12B) || ciphertext || tag(16B)
+ */
+export function eciesEncrypt(peerPubkeyBytes: Buffer, plaintext: Buffer): Buffer {
+  // 生成临时密钥对
+  const ephemeral = crypto.createECDH('prime256v1');
+  ephemeral.generateKeys();
+  const ephemeralPubBytes = ephemeral.getPublicKey(); // 65 字节未压缩
+
+  // ECDH 共享密钥
+  const shared = ephemeral.computeSecret(peerPubkeyBytes);
+
+  // HKDF 派生 32 字节 AES 密钥
+  const derived = crypto.hkdfSync('sha256', shared, Buffer.alloc(0), ECIES_HKDF_INFO, 32);
+  const aesKey = Buffer.from(derived);
+
+  // AES-256-GCM 加密
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag(); // 16 字节
+
+  return Buffer.concat([ephemeralPubBytes, iv, encrypted, tag]);
+}
+
+/**
+ * ECIES 解密：对应 eciesEncrypt。
+ * @param privateKeyPem 自己的 PEM 格式 EC 私钥
+ * @param ciphertext ephemeral_pubkey(65B) || iv(12B) || encrypted || tag(16B)
+ * @returns 解密后的明文
+ */
+export function eciesDecrypt(privateKeyPem: string, ciphertext: Buffer): Buffer {
+  if (ciphertext.length < 65 + 12 + 16) {
+    throw new E2EEError('ECIES ciphertext too short');
+  }
+  const ephemeralPubBytes = ciphertext.subarray(0, 65);
+  const iv = ciphertext.subarray(65, 77);
+  const encryptedWithTag = ciphertext.subarray(77);
+  const tag = encryptedWithTag.subarray(encryptedWithTag.length - 16);
+  const encrypted = encryptedWithTag.subarray(0, encryptedWithTag.length - 16);
+
+  // 从 PEM 私钥创建 ECDH 并计算共享密钥
+  const privKeyObj = crypto.createPrivateKey(privateKeyPem);
+  const ecdh = crypto.createECDH('prime256v1');
+  // 从 JWK 提取私钥 d 值设置到 ECDH
+  const jwk = privKeyObj.export({ format: 'jwk' });
+  ecdh.setPrivateKey(Buffer.from(jwk.d!, 'base64url'));
+
+  const shared = ecdh.computeSecret(ephemeralPubBytes);
+
+  // HKDF 派生 AES 密钥
+  const derived = crypto.hkdfSync('sha256', shared, Buffer.alloc(0), ECIES_HKDF_INFO, 32);
+  const aesKey = Buffer.from(derived);
+
+  // AES-256-GCM 解密
+  const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]);
+}
+
 // ── Epoch Transcript Chain ────────────────────────────────────
 
 const EPOCH_CHAIN_GENESIS_PREFIX = Buffer.from('aun-epoch-chain:genesis', 'utf-8');
@@ -1334,6 +1401,16 @@ export function handleKeyResponse(
     return false;
   }
 
+  const manifest = isJsonObject(payload.manifest) ? payload.manifest : null;
+  if (manifest) {
+    if (manifest.group_id !== groupId || manifest.epoch !== epoch) return false;
+    const manifestMembers = Array.isArray(manifest.member_aids)
+      ? manifest.member_aids.map((item) => String(item ?? '').trim()).filter(Boolean).sort()
+      : [];
+    const payloadMembers = memberAids.map((item) => String(item ?? '').trim()).filter(Boolean).sort();
+    if (manifestMembers.length > 0 && manifestMembers.join('\n') !== payloadMembers.join('\n')) return false;
+  }
+
   const incomingChain = typeof payload.epoch_chain === 'string' ? payload.epoch_chain : undefined;
   const rotationId = typeof payload.rotation_id === 'string' ? payload.rotation_id : '';
   const chainAssessment = assessIncomingEpochChain(
@@ -1450,14 +1527,17 @@ export class GroupE2EEManager {
     groupId: string,
     newEpoch: number,
     memberAids: string[],
-    opts?: { rotationId?: string },
+    opts?: { rotationId?: string; prevChainHint?: string | null },
   ): JsonObject {
     const aid = this._currentAid();
     const current = loadGroupSecret(this._keystore, aid, groupId, newEpoch - 1)
       ?? loadGroupSecret(this._keystore, aid, groupId);
     const gs = generateGroupSecret();
     const commitment = computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
-    const prevChain = current?.epoch_chain ?? null;
+    let prevChain = current?.epoch_chain ?? null;
+    if (!prevChain && opts?.prevChainHint) {
+      prevChain = opts.prevChainHint;
+    }
     const epochChain = computeEpochChain(prevChain, newEpoch, commitment, aid);
     const rotationId = opts?.rotationId ?? '';
     const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids, epochChain, rotationId);

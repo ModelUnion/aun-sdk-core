@@ -83,13 +83,13 @@ type ocspCacheEntry struct {
 
 // AuthFlowConfig AuthFlow 配置
 type AuthFlowConfig struct {
-	Keystore          keystore.KeyStore  // 密钥存储后端
-	Crypto            *CryptoProvider    // 加密操作提供者
-	AID               string             // 当前 Agent ID
-	ConnectionFactory ConnectionFactory  // 可选的 WebSocket 连接工厂
-	RootCAPath        string             // 自定义根证书路径
-	ChainCacheTTL     int                // 证书链缓存 TTL（秒），默认 86400
-	VerifySSL         bool               // 是否验证 TLS 证书，默认 true
+	Keystore          keystore.KeyStore // 密钥存储后端
+	Crypto            *CryptoProvider   // 加密操作提供者
+	AID               string            // 当前 Agent ID
+	ConnectionFactory ConnectionFactory // 可选的 WebSocket 连接工厂
+	RootCAPath        string            // 自定义根证书路径
+	ChainCacheTTL     int               // 证书链缓存 TTL（秒），默认 86400
+	VerifySSL         bool              // 是否验证 TLS 证书，默认 true
 }
 
 // ── AuthFlow 认证流程管理 ────────────────────────────────────
@@ -1722,6 +1722,7 @@ func authRememberTokens(identity map[string]any, authResult map[string]any) {
 	}
 
 	// 计算过期时间
+	expiryRecorded := false
 	if expiresIn, ok := authResult["expires_in"]; ok {
 		var seconds float64
 		switch v := expiresIn.(type) {
@@ -1734,7 +1735,11 @@ func authRememberTokens(identity map[string]any, authResult map[string]any) {
 		}
 		if seconds > 0 {
 			identity["access_token_expires_at"] = int(float64(time.Now().Unix()) + seconds)
+			expiryRecorded = true
 		}
+	}
+	if !expiryRecorded && accessToken != "" {
+		identity["access_token_expires_at"] = int(time.Now().Unix()) + 3600
 	}
 
 	// 暂存 new_cert，由 validateNewCert 验证后正式接受

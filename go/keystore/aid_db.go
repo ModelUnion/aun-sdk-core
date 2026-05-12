@@ -841,6 +841,30 @@ func (a *AIDDatabase) StoreGroupSecretTransition(groupID string, opts GroupSecre
 			if err := a.upsertGroupOldEpochTx(tx, groupID, currentEpoch, currentSecret, currentData, currentUpdatedAt, &expiresAt); err != nil {
 				return false, err
 			}
+		} else {
+			// epoch == currentEpoch 但 currentSecret 为空：合并 data，保留已有字段
+			newData := buildGroupCurrentData(opts, members, now)
+			if opts.EpochChain == "" {
+				if ec, ok := currentData["epoch_chain"].(string); ok && ec != "" {
+					newData["epoch_chain"] = ec
+				}
+			}
+			if pendingID == "" {
+				if pid, ok := currentData["pending_rotation_id"].(string); ok && pid != "" {
+					newData["pending_rotation_id"] = pid
+					if pca, ok := currentData["pending_created_at"]; ok {
+						newData["pending_created_at"] = pca
+					}
+				}
+			}
+			if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, newData, now); err != nil {
+				return false, err
+			}
+			if err := tx.Commit(); err != nil {
+				return false, err
+			}
+			committed = true
+			return true, nil
 		}
 	}
 
@@ -902,11 +926,21 @@ func (a *AIDDatabase) StoreGroupSecretEpoch(groupID string, opts GroupSecretTran
 	}
 
 	if epoch > currentEpoch {
+		// 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
+		oldSecret := a.decryptText("group/"+groupID+"/current", currentEnc, "StoreGroupSecretEpoch")
+		oldData := jsonObjectLocal(currentDataStr)
+		expiresAt := now + opts.OldEpochRetentionMillis
+		if err := a.upsertGroupOldEpochTx(tx, groupID, currentEpoch, oldSecret, oldData, currentUpdatedAt, &expiresAt); err != nil {
+			return false, err
+		}
+		if err := a.upsertGroupCurrentTx(tx, groupID, epoch, opts.Secret, buildGroupCurrentData(opts, members, now), now); err != nil {
+			return false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return false, err
 		}
 		committed = true
-		return false, nil
+		return true, nil
 	}
 
 	if epoch == currentEpoch {

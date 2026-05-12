@@ -3,10 +3,20 @@
 // 此处测试可独立验证的构造、配置和状态管理逻辑。
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { AUNClient } from '../../src/client.js';
 import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
 import { ProtectedHeaders } from '../../src/e2ee.js';
+
+describe('AUNClient peer 证书缓存', () => {
+  it('TTL 应为 3600 秒', () => {
+    const source = readFileSync(join(process.cwd(), 'src', 'client.ts'), 'utf8');
+    expect(source).toContain('const PEER_CERT_CACHE_TTL = 3600;');
+    expect(source).toContain('const PEER_PREKEYS_CACHE_TTL = 3600;');
+  });
+});
 
 describe('AUNClient 构造', () => {
   it('无参数构造应使用默认配置', () => {
@@ -687,7 +697,31 @@ describe('AUNClient M25 重连行为', () => {
     }
   });
 
-  it('心跳连续 2 次失败才触发断线处理', async () => {
+  it('heartbeat_interval=0 不启动心跳', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      (client as any)._state = 'connected';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 0,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.5, max_delay: 30, max_attempts: 0 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.call = vi.fn().mockResolvedValue({ pong: true });
+
+      (client as any)._startHeartbeat();
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect((client as any)._heartbeatTimer).toBeNull();
+      expect((client as any)._transport.call).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('正数 heartbeat_interval 小于 30 秒时按 30 秒调度', async () => {
     vi.useFakeTimers();
     try {
       const client = new AUNClient();
@@ -703,12 +737,18 @@ describe('AUNClient M25 重连行为', () => {
       const disconnectSpy = vi.spyOn(client as any, '_handleTransportDisconnect').mockResolvedValue(undefined);
 
       (client as any)._startHeartbeat();
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(29_999);
       await Promise.resolve();
+      expect((client as any)._transport.call).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      expect((client as any)._transport.call).toHaveBeenCalledTimes(1);
       expect(disconnectSpy).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(30_000);
       await Promise.resolve();
+      expect((client as any)._transport.call).toHaveBeenCalledTimes(2);
       expect(disconnectSpy).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
@@ -1145,6 +1185,48 @@ describe('GROUP epoch 轮换竞态防护', () => {
     })).resolves.toBe(false);
   });
 
+  it('新成员恢复时 committed response commitment 不匹配应放行', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'bob.aid.com';
+    (client as any).call = vi.fn().mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: {
+        target_epoch: 2,
+        key_commitment: 'committed-old',
+        expected_members: ['alice.aid.com'],
+      },
+    });
+
+    await expect((client as any)._verifyGroupKeyResponseEpoch({
+      type: 'e2ee.group_key_response',
+      group_id: 'g1',
+      epoch: 2,
+      commitment: 'new-member-commitment',
+    })).resolves.toBe(true);
+  });
+
+  it('新成员 backfill 时 committed distribution commitment 不匹配应放行', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'bob.aid.com';
+    (client as any).call = vi.fn().mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: {
+        target_epoch: 2,
+        key_commitment: 'committed-old',
+        expected_members: ['alice.aid.com'],
+      },
+    });
+
+    await expect((client as any)._verifyActiveGroupRotationDistribution({
+      type: 'e2ee.group_key_distribution',
+      group_id: 'g1',
+      epoch: 2,
+      commitment: 'new-member-commitment',
+    })).resolves.toBe(true);
+  });
+
   it('发送前恢复等待期间 committed epoch 推进时应返回最新 epoch', async () => {
     const client = new AUNClient();
     (client as any)._groupE2ee = {
@@ -1170,6 +1252,52 @@ describe('GROUP epoch 轮换竞态防护', () => {
     expect(readyEpoch).toBe(2);
     expect(recoverSpy).toHaveBeenCalledWith('g1', 1, '', 5000);
     expect(recoverSpy).toHaveBeenCalledWith('g1', 2, '', 5000);
+  });
+
+  it('发送前 committed membership gap 应触发 repair 并等待新 committed epoch', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'bob.aid.com';
+    (client as any)._groupE2ee = {
+      loadSecret: vi.fn()
+        .mockResolvedValueOnce({ commitment: 'c1' })
+        .mockResolvedValueOnce({ commitment: 'c2' }),
+    };
+    (client as any).call = vi.fn().mockResolvedValue({
+      members: [
+        { aid: 'alice.aid.com', status: 'active' },
+        { aid: 'bob.aid.com', status: 'active' },
+        { aid: 'charlie.aid.com', status: 'active' },
+      ],
+    });
+    vi.spyOn(client as any, '_groupAllowsMemberEpochRotation').mockResolvedValue(true);
+    const repairSpy = vi.spyOn(client as any, '_maybeLeadRotateGroupEpoch').mockResolvedValue(undefined);
+    vi.spyOn(client as any, '_committedGroupEpochState').mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: {
+        rotation_id: 'rot-2',
+        key_commitment: 'c2',
+        expected_members: ['alice.aid.com', 'bob.aid.com', 'charlie.aid.com'],
+      },
+    });
+
+    const readyEpoch = await (client as any)._ensureCommittedGroupSecretForSend('g1', 1, {
+      epoch: 1,
+      committed_epoch: 1,
+      committed_rotation: {
+        rotation_id: 'rot-1',
+        key_commitment: 'c1',
+        expected_members: ['alice.aid.com', 'bob.aid.com'],
+      },
+    });
+
+    expect(readyEpoch).toBe(2);
+    expect(repairSpy).toHaveBeenCalledWith(
+      'g1',
+      'g1:committed_membership_gap:aid:bob.aid.com:epoch:1',
+      1,
+      true,
+    );
   });
 
   it('本地 epoch 1 但服务端 epoch 0 时应先补同步初始 epoch', async () => {
@@ -1301,7 +1429,10 @@ describe('GROUP epoch 轮换竞态防护', () => {
     (client as any)._state = 'connected';
     vi.spyOn(client as any, '_decryptGroupMessage').mockResolvedValue({
       payload: { type: 'thought', text: '只给感兴趣的人看' },
-      e2ee: { encryption_mode: 'epoch_group_key' },
+      e2ee: {
+        encryption_mode: 'epoch_group_key',
+        context: { type: 'run', id: 'run-root' },
+      },
     });
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       found: true,
@@ -1331,11 +1462,18 @@ describe('GROUP epoch 轮换竞态防护', () => {
         context: { type: 'run', id: 'run-root' },
         payload: { type: 'thought', text: '只给感兴趣的人看' },
         created_at: 1710504000000,
-        e2ee: { encryption_mode: 'epoch_group_key' },
+        e2ee: {
+          encryption_mode: 'epoch_group_key',
+          context: { type: 'run', id: 'run-root' },
+        },
       },
     ]);
     expect((client as any)._decryptGroupMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ message_id: 'gt-1', sender_aid: 'alice.aid.com' }),
+      expect.objectContaining({
+        message_id: 'gt-1',
+        sender_aid: 'alice.aid.com',
+        context: { type: 'run', id: 'run-root' },
+      }),
       { skipReplay: true },
     );
   });
@@ -1453,10 +1591,13 @@ describe('GROUP epoch 轮换竞态防护', () => {
     (client as any)._groupE2ee = {
       loadSecret: vi.fn().mockResolvedValue({ pending_rotation_id: 'rot-stale', commitment: 'c2' }),
     };
-    (client as any).call = vi.fn().mockResolvedValue({
-      epoch: 2,
-      committed_epoch: 2,
-      committed_rotation: { rotation_id: 'rot-committed', key_commitment: 'c2' },
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.get_online_members') throw new Error('not supported');
+      return {
+        epoch: 2,
+        committed_epoch: 2,
+        committed_rotation: { rotation_id: 'rot-committed', key_commitment: 'c2' },
+      };
     });
     const requestSpy = vi.spyOn(client as any, '_requestGroupKeyFromCandidates').mockResolvedValue(undefined);
 
@@ -1475,7 +1616,10 @@ describe('GROUP epoch 轮换竞态防护', () => {
       loadSecret: vi.fn()
         .mockResolvedValue({ epoch: 2, commitment: 'c2' }),
     };
-    (client as any).call = vi.fn().mockResolvedValue({ epoch: 2, committed_epoch: 2 });
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.get_online_members') throw new Error('not supported');
+      return { epoch: 2, committed_epoch: 2 };
+    });
     vi.spyOn(client as any, '_requestGroupKeyFromCandidates').mockResolvedValue(undefined);
     const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
 
@@ -1638,5 +1782,80 @@ describe('有序消息发布', () => {
 
     expect((client as any)._pendingOrderedMsgs.size).toBe(0);
     expect((client as any)._pendingDecryptMsgs.size).toBe(0);
+  });
+});
+
+// ── 服务端 epoch key 恢复测试 ──────────────────────────────
+
+describe('epoch key 恢复 join mode 路由', () => {
+  function makeRecoveryClient() {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'bob.test.com';
+    return client;
+  }
+
+  it('open 群恢复应调用 group.e2ee.get_epoch_key', async () => {
+    const client = makeRecoveryClient();
+    const rpcLog: string[] = [];
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      rpcLog.push(method);
+      if (method === 'group.get_join_requirements') {
+        return { join_requirements: { mode: 'open' } };
+      }
+      if (method === 'group.e2ee.get_epoch_key') {
+        return { epoch: 2 };
+      }
+      if (method === 'group.e2ee.get_epoch') {
+        return { epoch: 2, committed_epoch: 2, members: ['alice.test.com', 'bob.test.com'] };
+      }
+      return {};
+    });
+
+    await (client as any)._doRecoverGroupEpochKey('g1', 2, '', 500);
+    expect(rpcLog).toContain('group.e2ee.get_epoch_key');
+  });
+
+  it('private 群恢复不应调用 group.e2ee.get_epoch_key', async () => {
+    const client = makeRecoveryClient();
+    const rpcLog: string[] = [];
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      rpcLog.push(method);
+      if (method === 'group.get_join_requirements') {
+        return { join_requirements: { mode: 'approval' } };
+      }
+      if (method === 'group.e2ee.get_epoch') {
+        return {
+          epoch: 2, committed_epoch: 2,
+          owner_aid: 'alice.test.com',
+          members: ['alice.test.com', 'bob.test.com'],
+        };
+      }
+      if (method === 'group.get_online_members') {
+        return { members: [] };
+      }
+      if (method === 'message.send') return { ok: true };
+      return {};
+    });
+
+    const result = await (client as any)._doRecoverGroupEpochKey('g1', 2, '', 500);
+    expect(result).toBe(false);
+    expect(rpcLog).not.toContain('group.e2ee.get_epoch_key');
+  });
+
+  it('缺少成员快照时应拒绝服务端恢复', async () => {
+    const client = makeRecoveryClient();
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.e2ee.get_epoch_key') {
+        return { epoch: 2, encrypted_key: 'dGVzdA==' };
+      }
+      if (method === 'group.e2ee.get_epoch') {
+        return { epoch: 2, committed_epoch: 2 };
+      }
+      return {};
+    });
+
+    const result = await (client as any)._tryRecoverEpochKeyFromServer('g1', 2);
+    expect(result).toBe(false);
   });
 });

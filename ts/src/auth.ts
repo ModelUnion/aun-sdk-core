@@ -1673,8 +1673,10 @@ export class AuthFlow {
     if (typeof accessToken === 'string' && accessToken) identity.access_token = accessToken;
     if (typeof refreshToken === 'string' && refreshToken) identity.refresh_token = refreshToken;
     if (typeof authResult.token === 'string' && authResult.token) identity.kite_token = authResult.token;
-    if (typeof expiresIn === 'number') {
+    if (typeof expiresIn === 'number' && expiresIn > 0) {
       identity.access_token_expires_at = Math.floor(Date.now() / 1000 + expiresIn);
+    } else if (typeof accessToken === 'string' && accessToken) {
+      identity.access_token_expires_at = Math.floor(Date.now() / 1000 + 3600);
     }
     // 协议要求：login2 响应含 new_cert 时（证书过半自动续期），客户端必须保存
     // 先暂存到 _pending_new_cert，由 _validate_new_cert 验证后再正式接受

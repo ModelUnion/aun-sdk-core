@@ -3,6 +3,8 @@ package aun
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/elliptic"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -810,6 +812,38 @@ func TestHandleKeyResponse_BackfillsOldEpochWithoutOverwritingCurrent(t *testing
 	}
 }
 
+func TestHandleKeyResponse_RejectsManifestMemberMismatch(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 3, "g1", secret)
+	response := map[string]any{
+		"type":          "e2ee.group_key_response",
+		"group_id":      "g1",
+		"epoch":         3,
+		"group_secret":  base64.StdEncoding.EncodeToString(secret),
+		"commitment":    commitment,
+		"member_aids":   members,
+		"requester_aid": aid,
+		"responder_aid": "alice.test",
+		"request_id":    "req-manifest-mismatch",
+		"manifest": map[string]any{
+			"group_id":    "g1",
+			"epoch":       3,
+			"member_aids": []any{"alice.test", "charlie.test"},
+		},
+	}
+
+	if HandleKeyResponse(response, ks, aid) {
+		t.Fatal("manifest members 不匹配的 key response 应拒绝")
+	}
+	three := 3
+	if loaded, _ := LoadGroupSecret(ks, aid, "g1", &three); loaded != nil {
+		t.Fatalf("拒绝后不应写入 epoch 3: %#v", loaded)
+	}
+}
+
 func TestHandleKeyResponse_RejectsFutureEpoch(t *testing.T) {
 	ks := testNewGroupKeyStore(t)
 	aid := "bob.test"
@@ -1301,5 +1335,97 @@ func TestComputeStateHash_PolicyChangeChangesHash(t *testing.T) {
 	h2 := ComputeStateHash("grp_test", 2, 1, members, p2, h1)
 	if h1 == h2 {
 		t.Fatalf("策略变更应产生不同哈希")
+	}
+}
+
+// ── ECIES 加解密测试 ──────────────────────────────────────────
+
+func TestEciesEncryptDecryptRoundtrip(t *testing.T) {
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	ciphertext, err := EciesEncrypt(pubBytes, secret)
+	if err != nil {
+		t.Fatalf("EciesEncrypt failed: %v", err)
+	}
+	if len(ciphertext) != 125 {
+		t.Fatalf("expected ciphertext length 125, got %d", len(ciphertext))
+	}
+	if ciphertext[0] != 0x04 {
+		t.Fatalf("expected 0x04 prefix, got 0x%02x", ciphertext[0])
+	}
+
+	decrypted, err := EciesDecrypt(privKey, ciphertext)
+	if err != nil {
+		t.Fatalf("EciesDecrypt failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, secret) {
+		t.Fatalf("decrypted != original")
+	}
+}
+
+func TestEciesWrongKeyDecryptFails(t *testing.T) {
+	alice, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	bob, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	alicePub := elliptic.Marshal(elliptic.P256(), alice.PublicKey.X, alice.PublicKey.Y)
+
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	ct, _ := EciesEncrypt(alicePub, secret)
+	_, err := EciesDecrypt(bob, ct)
+	if err == nil {
+		t.Fatal("decryption with wrong key should fail")
+	}
+}
+
+func TestEciesTamperedCiphertextFails(t *testing.T) {
+	privKey, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	ct, _ := EciesEncrypt(pubBytes, secret)
+	ct[80] ^= 0xff
+	_, err := EciesDecrypt(privKey, ct)
+	if err == nil {
+		t.Fatal("tampered ciphertext should fail decryption")
+	}
+}
+
+func TestEciesMultiMember(t *testing.T) {
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	for i := 0; i < 3; i++ {
+		privKey, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+		pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+
+		ct, err := EciesEncrypt(pubBytes, secret)
+		if err != nil {
+			t.Fatalf("member %d encrypt failed: %v", i, err)
+		}
+		pt, err := EciesDecrypt(privKey, ct)
+		if err != nil {
+			t.Fatalf("member %d decrypt failed: %v", i, err)
+		}
+		if !bytes.Equal(pt, secret) {
+			t.Fatalf("member %d decrypted != original", i)
+		}
+	}
+}
+
+func TestEciesCiphertextTooShort(t *testing.T) {
+	privKey, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	_, err := EciesDecrypt(privKey, make([]byte, 50))
+	if err == nil || !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("expected 'too short' error, got: %v", err)
 	}
 }

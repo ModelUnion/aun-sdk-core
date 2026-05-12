@@ -210,6 +210,11 @@ func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, member
 			prevChain = ec
 		}
 	}
+	// 调用方可通过 rotationIDs 的第二个元素传入 prevChainHint（从服务端 committed_rotation 获取），
+	// 仅在本地没有 prev chain 时使用（新成员没有 prev epoch key 但需要发起轮换的场景）。
+	if prevChain == "" && len(rotationIDs) > 1 && strings.TrimSpace(rotationIDs[1]) != "" {
+		prevChain = strings.TrimSpace(rotationIDs[1])
+	}
 
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, targetEpoch, groupID, gs)

@@ -872,6 +872,27 @@ class AIDDatabase:
                             current_updated_at,
                             expires_at,
                         )
+                    elif current_epoch == epoch_i:
+                        # epoch 相同但 current_secret 为空：合并 data，保留已有字段
+                        merged_data = dict(current_data)
+                        merged_data.update(self._build_group_current_data(
+                            commitment=commitment,
+                            member_aids=members,
+                            epoch_chain=chain_value,
+                            pending_rotation_id=pending_id,
+                            pending_created_at=now if pending_id else None,
+                            epoch_chain_unverified=epoch_chain_unverified,
+                            epoch_chain_unverified_reason=epoch_chain_unverified_reason,
+                        ))
+                        if not chain_value and current_data.get("epoch_chain"):
+                            merged_data["epoch_chain"] = current_data["epoch_chain"]
+                        if not pending_id and current_data.get("pending_rotation_id"):
+                            merged_data["pending_rotation_id"] = current_data["pending_rotation_id"]
+                            if current_data.get("pending_created_at"):
+                                merged_data["pending_created_at"] = current_data["pending_created_at"]
+                        self._upsert_group_current(conn, group_id, epoch_i, incoming_secret, merged_data, now)
+                        conn.commit()
+                        return True
 
                 new_data = self._build_group_current_data(
                     commitment=commitment,
@@ -941,8 +962,14 @@ class AIDDatabase:
                 current_data = json.loads(row[2] or "{}")
 
                 if epoch_i > current_epoch:
+                    # 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
+                    expires_at = now + old_epoch_retention_ms
+                    self._upsert_group_old_epoch(
+                        conn, group_id, current_epoch, current_secret, current_data, int(row[3]), expires_at,
+                    )
+                    self._upsert_group_current(conn, group_id, epoch_i, incoming_secret, new_data, now)
                     conn.commit()
-                    return False
+                    return True
 
                 if epoch_i == current_epoch:
                     if current_secret and current_secret != incoming_secret:

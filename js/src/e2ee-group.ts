@@ -45,6 +45,90 @@ export interface LoadedGroupSecret {
   epoch_chain_unverified_reason?: string;
 }
 
+// ── ECIES (P-256 ECDH + HKDF-SHA256 + AES-256-GCM, SubtleCrypto) ──
+
+const _ECIES_HKDF_INFO = _encoder.encode('aun-epoch-key-ecies');
+
+/**
+ * ECIES 加密（异步，SubtleCrypto）。
+ * @param peerPubkeyBytes 65 字节未压缩 P-256 公钥 (0x04 开头)
+ * @param plaintext 待加密明文
+ * @returns ephemeral_pubkey(65B) || iv(12B) || ciphertext || tag(16B)
+ */
+export async function eciesEncrypt(peerPubkeyBytes: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
+  // 生成临时 ECDH 密钥对
+  const ephemeral = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  // 导出临时公钥（未压缩 65 字节）
+  const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', ephemeral.publicKey));
+
+  // 导入对方公钥
+  const peerKey = await crypto.subtle.importKey('raw', toBufferSource(peerPubkeyBytes), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+
+  // ECDH 共享密钥
+  const sharedBits = await crypto.subtle.deriveBits({ name: 'ECDH', public: peerKey }, ephemeral.privateKey, 256);
+  const shared = new Uint8Array(sharedBits);
+
+  // HKDF 派生 32 字节 AES 密钥
+  const hkdfKey = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+  const derivedBits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: _ECIES_HKDF_INFO },
+    hkdfKey, 256,
+  );
+  const aesKeyBytes = new Uint8Array(derivedBits);
+
+  // AES-256-GCM 加密
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await crypto.subtle.importKey('raw', aesKeyBytes, 'AES-GCM', false, ['encrypt']);
+  const ctBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: toBufferSource(iv), tagLength: 128 }, aesKey, toBufferSource(plaintext));
+  const ctArr = new Uint8Array(ctBuf); // ciphertext + tag(16B)
+
+  // 拼接: ephemeral_pubkey(65) || iv(12) || ciphertext+tag
+  const result = new Uint8Array(65 + 12 + ctArr.length);
+  result.set(ephPubRaw, 0);
+  result.set(iv, 65);
+  result.set(ctArr, 77);
+  return result;
+}
+
+/**
+ * ECIES 解密（异步，SubtleCrypto）。
+ * @param privateKeyPem PEM 格式 EC 私钥
+ * @param ciphertext ephemeral_pubkey(65B) || iv(12B) || encrypted+tag(16B)
+ * @returns 解密后的明文
+ */
+export async function eciesDecrypt(privateKeyPem: string, ciphertext: Uint8Array): Promise<Uint8Array> {
+  if (ciphertext.length < 65 + 12 + 16) {
+    throw new E2EEError('ECIES ciphertext too short');
+  }
+  const ephPubBytes = ciphertext.slice(0, 65);
+  const iv = ciphertext.slice(65, 77);
+  const encryptedWithTag = ciphertext.slice(77);
+
+  // 导入自己的私钥
+  const privKeyDer = pemToArrayBuffer(privateKeyPem);
+  const privKey = await crypto.subtle.importKey('pkcs8', privKeyDer, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+
+  // 导入临时公钥
+  const ephPubKey = await crypto.subtle.importKey('raw', toBufferSource(ephPubBytes), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+
+  // ECDH 共享密钥
+  const sharedBits = await crypto.subtle.deriveBits({ name: 'ECDH', public: ephPubKey }, privKey, 256);
+  const shared = new Uint8Array(sharedBits);
+
+  // HKDF 派生 AES 密钥
+  const hkdfKey = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+  const derivedBits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: _ECIES_HKDF_INFO },
+    hkdfKey, 256,
+  );
+  const aesKeyBytes = new Uint8Array(derivedBits);
+
+  // AES-256-GCM 解密（SubtleCrypto 要求 ciphertext+tag 拼接传入）
+  const aesKey = await crypto.subtle.importKey('raw', aesKeyBytes, 'AES-GCM', false, ['decrypt']);
+  const ptBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: toBufferSource(iv), tagLength: 128 }, aesKey, toBufferSource(encryptedWithTag));
+  return new Uint8Array(ptBuf);
+}
+
 // ── Epoch Transcript Chain 工具函数 ──────────────────────────
 
 /** Genesis 前缀：aun-epoch-chain:genesis（UTF-8 字节） */
@@ -1396,6 +1480,16 @@ export async function handleKeyResponse(
   const valid = await verifyMembershipCommitment(commitment, memberAids, epoch, groupId, aid, groupSecret);
   if (!valid) return false;
 
+  const manifest = isJsonObject(payload.manifest) ? payload.manifest : null;
+  if (manifest) {
+    if (manifest.group_id !== groupId || manifest.epoch !== epoch) return false;
+    const manifestMembers = Array.isArray(manifest.member_aids)
+      ? manifest.member_aids.map((item) => String(item ?? '').trim()).filter(Boolean).sort()
+      : [];
+    const payloadMembers = memberAids.map((item) => String(item ?? '').trim()).filter(Boolean).sort();
+    if (manifestMembers.length > 0 && manifestMembers.join('\n') !== payloadMembers.join('\n')) return false;
+  }
+
   const rotationId = typeof payload.rotation_id === 'string' ? payload.rotation_id : '';
   const chainAssessment = await assessIncomingEpochChain(
     keystore,
@@ -1606,12 +1700,15 @@ export class GroupE2EEManager {
     groupId: string,
     targetEpoch: number,
     memberAids: string[],
-    opts?: { rotationId?: string },
+    opts?: { rotationId?: string; prevChainHint?: string | null },
   ): Promise<JsonObject> {
     const aid = this._currentAid();
     const current = await loadGroupSecret(this._keystoreRef, aid, groupId, targetEpoch - 1)
       ?? await loadGroupSecret(this._keystoreRef, aid, groupId);
-    const prevChain = current?.epoch_chain ?? null;
+    let prevChain = current?.epoch_chain ?? null;
+    if (!prevChain && opts?.prevChainHint) {
+      prevChain = opts.prevChainHint;
+    }
     const gs = generateGroupSecret();
     const commitment = await computeMembershipCommitment(memberAids, targetEpoch, groupId, gs);
     const epochChain = await computeEpochChain(prevChain, targetEpoch, commitment, aid);

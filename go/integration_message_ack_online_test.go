@@ -25,6 +25,9 @@ func TestIntegration_MessageAckBasic(t *testing.T) {
 	defer alice.Close()
 	defer bob.Close()
 
+	// 持久化消息需要 queue 投递模式（connect 级别配置）
+	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
+
 	aliceAID := ensureConnected(t, alice, fmt.Sprintf("ack-alice-%s.%s", rid, testIssuer()))
 	bobAID := ensureConnected(t, bob, fmt.Sprintf("ack-bob-%s.%s", rid, testIssuer()))
 
@@ -36,7 +39,6 @@ func TestIntegration_MessageAckBasic(t *testing.T) {
 	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
 		"payload": map[string]any{"type": "text", "text": "ack_basic_test"},
-		"persist": true,
 		"encrypt": false,
 	})
 	if err != nil {
@@ -106,6 +108,9 @@ func TestIntegration_MessageAckEvent(t *testing.T) {
 	defer alice.Close()
 	defer bob.Close()
 
+	// 持久化消息需要 queue 投递模式（connect 级别配置）
+	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
+
 	_ = ensureConnected(t, alice, fmt.Sprintf("ackev-alice-%s.%s", rid, testIssuer()))
 	bobAID := ensureConnected(t, bob, fmt.Sprintf("ackev-bob-%s.%s", rid, testIssuer()))
 
@@ -135,7 +140,6 @@ func TestIntegration_MessageAckEvent(t *testing.T) {
 	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
 		"payload": map[string]any{"type": "text", "text": "ack_event_test"},
-		"persist": true,
 		"encrypt": false,
 	})
 	if err != nil {
@@ -212,6 +216,9 @@ func TestIntegration_MessageAckSequence(t *testing.T) {
 	defer alice.Close()
 	defer bob.Close()
 
+	// 持久化消息需要 queue 投递模式（connect 级别配置）
+	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
+
 	_ = ensureConnected(t, alice, fmt.Sprintf("ackseq-alice-%s.%s", rid, testIssuer()))
 	bobAID := ensureConnected(t, bob, fmt.Sprintf("ackseq-bob-%s.%s", rid, testIssuer()))
 
@@ -222,7 +229,6 @@ func TestIntegration_MessageAckSequence(t *testing.T) {
 		_, err := alice.Call(ctx, "message.send", map[string]any{
 			"to":      bobAID,
 			"payload": map[string]any{"type": "text", "text": fmt.Sprintf("seq_test_%d", i)},
-			"persist": true,
 			"encrypt": false,
 		})
 		if err != nil {

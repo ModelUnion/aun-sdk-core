@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -968,6 +969,9 @@ func assessIncomingEpochChain(
 		return epochChainAssessment{ok: true, set: true, unverified: true, reason: "missing_rotator_aid"}
 	}
 	if !VerifyEpochChain(chain, prevChain, epoch, commitment, rotator) {
+		expectedChain := ComputeEpochChain(prevChain, epoch, commitment, rotator)
+		log.Printf("DEBUG-CHAIN-VERIFY: FAILED group=%s epoch=%d source=%s rotation=%s rotator=%s incoming_chain=%s expected_chain=%s prev_chain=%s commitment=%s",
+			groupID, epoch, source, rid, rotator, chain[:min(len(chain), 16)], expectedChain[:min(len(expectedChain), 16)], prevChain[:min(len(prevChain), 16)], commitment[:min(len(commitment), 16)])
 		if rid != "" {
 			log.Printf("[e2ee_group] 拒绝 epoch_chain 验证失败的新 rotation key: source=%s group=%s epoch=%d rotation=%s", source, groupID, epoch, rid)
 			return epochChainAssessment{ok: false}
@@ -1438,6 +1442,18 @@ func HandleKeyResponse(
 		return false
 	}
 
+	if manifest, _ := payload["manifest"].(map[string]any); manifest != nil {
+		mGroupID, _ := manifest["group_id"].(string)
+		mEpoch := int(toInt64(manifest["epoch"]))
+		if mGroupID != groupID || mEpoch != epoch {
+			return false
+		}
+		mMembers := toStringSlice(manifest["member_aids"])
+		if len(mMembers) > 0 && !stringSliceEqual(sorted(mMembers), sorted(memberAIDs)) {
+			return false
+		}
+	}
+
 	epochChain, _ := payload["epoch_chain"].(string)
 	rotationID, _ := payload["rotation_id"].(string)
 	chainAssessment := assessIncomingEpochChain(
@@ -1532,4 +1548,112 @@ func stringSliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ── ECIES (P-256 ECDH + HKDF-SHA256 + AES-256-GCM) ──────────
+
+var eciesHKDFInfo = []byte("aun-epoch-key-ecies")
+
+// EciesEncrypt 使用 P-256 ECDH + HKDF-SHA256 + AES-256-GCM 加密。
+// peerPubkeyBytes: 65 字节未压缩 P-256 公钥 (0x04 开头)
+// 返回: ephemeral_pubkey(65B) || iv(12B) || ciphertext || tag(16B)
+func EciesEncrypt(peerPubkeyBytes []byte, plaintext []byte) ([]byte, error) {
+	curve := elliptic.P256()
+	x, y := elliptic.Unmarshal(curve, peerPubkeyBytes)
+	if x == nil {
+		return nil, fmt.Errorf("ecies: invalid peer public key")
+	}
+
+	// 生成临时密钥对
+	ephPriv, ephX, ephY, err := elliptic.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: generate ephemeral key: %w", err)
+	}
+	ephPubBytes := elliptic.Marshal(curve, ephX, ephY)
+
+	// ECDH 共享密钥
+	sharedX, _ := curve.ScalarMult(x, y, ephPriv)
+	shared := sharedX.Bytes()
+	if len(shared) < 32 {
+		padded := make([]byte, 32)
+		copy(padded[32-len(shared):], shared)
+		shared = padded
+	}
+
+	// HKDF 派生 32 字节 AES 密钥
+	hkdfReader := hkdf.New(sha256.New, shared, nil, eciesHKDFInfo)
+	aesKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, aesKey); err != nil {
+		return nil, fmt.Errorf("ecies: hkdf derive: %w", err)
+	}
+
+	// AES-256-GCM 加密
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: gcm: %w", err)
+	}
+	iv := make([]byte, 12)
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, fmt.Errorf("ecies: random iv: %w", err)
+	}
+	ciphertextWithTag := gcm.Seal(nil, iv, plaintext, nil)
+
+	result := make([]byte, 0, 65+12+len(ciphertextWithTag))
+	result = append(result, ephPubBytes...)
+	result = append(result, iv...)
+	result = append(result, ciphertextWithTag...)
+	return result, nil
+}
+
+// EciesDecrypt 使用 ECIES 解密，对应 EciesEncrypt。
+// privKey: 自己的 ECDSA P-256 私钥
+// ciphertext 格式: ephemeral_pubkey(65B) || iv(12B) || encrypted || tag(16B)
+func EciesDecrypt(privKey *ecdsa.PrivateKey, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < 65+12+16 {
+		return nil, fmt.Errorf("ecies: ciphertext too short")
+	}
+	ephPubBytes := ciphertext[:65]
+	iv := ciphertext[65:77]
+	encryptedWithTag := ciphertext[77:]
+
+	curve := elliptic.P256()
+	ephX, ephY := elliptic.Unmarshal(curve, ephPubBytes)
+	if ephX == nil {
+		return nil, fmt.Errorf("ecies: invalid ephemeral public key")
+	}
+
+	// ECDH 共享密钥
+	sharedX, _ := curve.ScalarMult(ephX, ephY, privKey.D.Bytes())
+	shared := sharedX.Bytes()
+	if len(shared) < 32 {
+		padded := make([]byte, 32)
+		copy(padded[32-len(shared):], shared)
+		shared = padded
+	}
+
+	// HKDF 派生 AES 密钥
+	hkdfReader := hkdf.New(sha256.New, shared, nil, eciesHKDFInfo)
+	aesKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, aesKey); err != nil {
+		return nil, fmt.Errorf("ecies: hkdf derive: %w", err)
+	}
+
+	// AES-256-GCM 解密
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: gcm: %w", err)
+	}
+	plaintext, err := gcm.Open(nil, iv, encryptedWithTag, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: decrypt failed: %w", err)
+	}
+	return plaintext, nil
 }

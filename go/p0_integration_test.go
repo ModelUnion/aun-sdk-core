@@ -198,6 +198,9 @@ func TestP0Integration_08_ReconnectGapFill(t *testing.T) {
 	bob := makeClient(t)
 	defer func() { _ = bob.Close() }()
 
+	// 持久化消息需要 queue 投递模式（connect 级别配置）
+	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
+
 	ensureConnected(t, alice, aliceAID)
 	ensureConnected(t, bob, bobAID)
 
@@ -237,7 +240,6 @@ func TestP0Integration_08_ReconnectGapFill(t *testing.T) {
 		_, err := alice.Call(ctx, "message.send", map[string]any{
 			"to":      bobAID,
 			"payload": map[string]any{"type": "text", "text": fmt.Sprintf("gap-%s-%d", tag, i)},
-			"persist": true,
 			"encrypt": false,
 		})
 		if err != nil {

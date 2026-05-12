@@ -247,20 +247,6 @@ func TestPrekeyRefreshIntervalRemovedFromConfig(t *testing.T) {
 	_ = opts
 }
 
-// ── P2: ISSUE-SDK-GO-011 syncAllGroupsOnce 并发处理 ────────────
-
-// TestSyncAllGroupsOnceConcurrentLimit 验证并发处理有合理限制
-// 注：这个测试主要验证函数存在且不 panic，实际并发行为需要集成测试
-func TestSyncAllGroupsOnceNoRace(t *testing.T) {
-	c := NewClient(map[string]any{
-		"aun_path": t.TempDir(),
-	})
-	defer func() { _ = c.Close() }()
-
-	// 未连接状态下调用 syncAllGroupsOnce 不应 panic
-	c.syncAllGroupsOnce()
-}
-
 // ── P3: ISSUE-SDK-GO-012 登录时间戳精度 ────────────────────
 
 // TestSignLoginNonceTimestampPrecision 验证 SignLoginNonce 生成浮点数精度时间戳

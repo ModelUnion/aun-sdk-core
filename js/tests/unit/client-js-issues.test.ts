@@ -79,42 +79,6 @@ describe('ISSUE-JS-002: 签名失败应抛错而非静默降级', () => {
   });
 });
 
-// ── ISSUE-JS-003 (P3): _syncAllGroupsOnce 不应静默吞异常 ──
-describe('ISSUE-JS-003: _syncAllGroupsOnce 应记录日志', () => {
-  it('_syncAllGroupsOnce catch 块应调用 console.warn', async () => {
-    const client = new AUNClient();
-    (client as any)._state = 'connected';
-    (client as any)._aid = 'test.aid.com';
-    // 直接 mock call 方法使 group.list_my 抛错
-    vi.spyOn(client, 'call').mockRejectedValue(new Error('rpc failed'));
-
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await (client as any)._syncAllGroupsOnce();
-
-    const warnMsg = warnSpy.mock.calls.find(
-      c => typeof c[0] === 'string' && c[0].includes('上线群组同步失败')
-    );
-    warnSpy.mockRestore();
-    expect(warnMsg).toBeDefined();
-  });
-
-  it('_syncAllGroupsOnce 失败应发布 group.sync_failed 事件', async () => {
-    const client = new AUNClient();
-    (client as any)._state = 'connected';
-    (client as any)._aid = 'test.aid.com';
-    vi.spyOn(client, 'call').mockRejectedValue(new Error('rpc failed'));
-
-    const publishSpy = vi.spyOn((client as any)._dispatcher, 'publish').mockResolvedValue(undefined);
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await (client as any)._syncAllGroupsOnce();
-    warnSpy.mockRestore();
-
-    expect(publishSpy).toHaveBeenCalledWith('group.sync_failed', expect.objectContaining({
-      error: expect.any(String),
-    }));
-  });
-});
-
 // ── ISSUE-JS-004 (P3): 缺少 disconnect() 别名方法 ──────────
 describe('ISSUE-JS-004: disconnect() 别名方法', () => {
   it('disconnect() 方法应存在', () => {

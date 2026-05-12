@@ -697,6 +697,33 @@ describe('buildKeyRequest / handleKeyRequest / handleKeyResponse', () => {
     expect(loadGroupSecret(ks, 'bob.test', 'grp-1', 3)!.secret.equals(oldSecret)).toBe(true);
   });
 
+  it('key response 的 manifest members 不匹配时应拒绝', () => {
+    const ks = new FakeKeystore();
+    const members = ['alice.test', 'bob.test'];
+    const secret = makeGroupSecret();
+    const commitment = computeMembershipCommitment(members, 3, 'grp-1', secret);
+
+    const ok = handleKeyResponse({
+      type: 'e2ee.group_key_response',
+      group_id: 'grp-1',
+      epoch: 3,
+      group_secret: secret.toString('base64'),
+      commitment,
+      member_aids: members,
+      requester_aid: 'bob.test',
+      responder_aid: 'alice.test',
+      request_id: 'req-manifest-mismatch',
+      manifest: {
+        group_id: 'grp-1',
+        epoch: 3,
+        member_aids: ['alice.test', 'charlie.test'],
+      },
+    }, ks, 'bob.test');
+
+    expect(ok).toBe(false);
+    expect(loadGroupSecret(ks, 'bob.test', 'grp-1', 3)).toBeNull();
+  });
+
   it('key response 不能绕过轮换推进到 future epoch', () => {
     const ks = new FakeKeystore();
     const members = ['alice.test', 'bob.test'];
@@ -1077,5 +1104,89 @@ describe('computeStateHash', () => {
       members, policy: {}, prevStateHash: '0'.repeat(64),
     });
     expect(h2a).not.toBe(h2b);
+  });
+});
+
+// ── ECIES 加解密测试 ──────────────────────────────────────────
+
+import { eciesEncrypt, eciesDecrypt } from '../../src/e2ee-group.js';
+
+describe('ECIES encrypt/decrypt', () => {
+  function makeEcKeyPair() {
+    const ecdh = crypto.createECDH('prime256v1');
+    ecdh.generateKeys();
+    const pubBytes = ecdh.getPublicKey(); // 65 字节未压缩
+    // 构造 PEM 私钥
+    const privKey = crypto.createPrivateKey({
+      key: {
+        kty: 'EC',
+        crv: 'P-256',
+        d: ecdh.getPrivateKey().toString('base64url'),
+        x: pubBytes.subarray(1, 33).toString('base64url'),
+        y: pubBytes.subarray(33, 65).toString('base64url'),
+      },
+      format: 'jwk',
+    });
+    const privPem = privKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+    return { pubBytes: Buffer.from(pubBytes), privPem };
+  }
+
+  it('roundtrip: 32 字节 secret 加解密', () => {
+    const { pubBytes, privPem } = makeEcKeyPair();
+    const secret = crypto.randomBytes(32);
+    const ciphertext = eciesEncrypt(pubBytes, secret);
+    // 格式验证: 65 + 12 + 32 + 16 = 125
+    expect(ciphertext.length).toBe(125);
+    expect(ciphertext[0]).toBe(0x04); // 未压缩公钥前缀
+    const decrypted = eciesDecrypt(privPem, ciphertext);
+    expect(decrypted).toEqual(secret);
+  });
+
+  it('不同明文产生不同密文', () => {
+    const { pubBytes } = makeEcKeyPair();
+    const a = eciesEncrypt(pubBytes, crypto.randomBytes(32));
+    const b = eciesEncrypt(pubBytes, crypto.randomBytes(32));
+    expect(a).not.toEqual(b);
+  });
+
+  it('同一明文每次加密密文不同（临时密钥不同）', () => {
+    const { pubBytes } = makeEcKeyPair();
+    const secret = crypto.randomBytes(32);
+    const a = eciesEncrypt(pubBytes, secret);
+    const b = eciesEncrypt(pubBytes, secret);
+    expect(a).not.toEqual(b);
+  });
+
+  it('错误私钥解密失败', () => {
+    const alice = makeEcKeyPair();
+    const bob = makeEcKeyPair();
+    const secret = crypto.randomBytes(32);
+    const ciphertext = eciesEncrypt(alice.pubBytes, secret);
+    expect(() => eciesDecrypt(bob.privPem, ciphertext)).toThrow();
+  });
+
+  it('篡改密文解密失败', () => {
+    const { pubBytes, privPem } = makeEcKeyPair();
+    const secret = crypto.randomBytes(32);
+    const ciphertext = eciesEncrypt(pubBytes, secret);
+    // 篡改密文中间字节
+    const tampered = Buffer.from(ciphertext);
+    tampered[80] ^= 0xff;
+    expect(() => eciesDecrypt(privPem, tampered)).toThrow();
+  });
+
+  it('多成员场景：同一 secret 用不同公钥加密，各自能解密', () => {
+    const members = [makeEcKeyPair(), makeEcKeyPair(), makeEcKeyPair()];
+    const secret = crypto.randomBytes(32);
+    for (const m of members) {
+      const ct = eciesEncrypt(m.pubBytes, secret);
+      const pt = eciesDecrypt(m.privPem, ct);
+      expect(pt).toEqual(secret);
+    }
+  });
+
+  it('密文过短抛出错误', () => {
+    const { privPem } = makeEcKeyPair();
+    expect(() => eciesDecrypt(privPem, Buffer.alloc(50))).toThrow('ECIES ciphertext too short');
   });
 });

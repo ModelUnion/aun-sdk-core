@@ -2,7 +2,12 @@ package aun
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,6 +28,18 @@ import (
 type testRPCCall struct {
 	Method string
 	Params map[string]any
+}
+
+func TestPeerCertCacheTTLIsOneHour(t *testing.T) {
+	if peerCertCacheTTL != 3600 {
+		t.Fatalf("peer cert cache TTL must be 3600 seconds, got %d", peerCertCacheTTL)
+	}
+}
+
+func TestPeerPrekeysCacheTTLIsOneHour(t *testing.T) {
+	if peerPrekeysCacheTTL != 3600 {
+		t.Fatalf("peer prekeys cache TTL must be 3600 seconds, got %d", peerPrekeysCacheTTL)
+	}
 }
 
 func cloneRPCParamsForTest(t *testing.T, params map[string]any) map[string]any {
@@ -345,6 +362,11 @@ func startTestRPCServer(
 	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 非 WebSocket 请求（如证书获取 HTTP GET）直接返回 200
+		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Errorf("接受 WebSocket 失败: %v", err)
@@ -563,6 +585,29 @@ func TestClientState(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	if c.State() != StateIdle {
 		t.Errorf("初始状态应为 idle: %s", c.State())
+	}
+}
+
+func TestEffectiveHeartbeatIntervalSeconds(t *testing.T) {
+	cases := []struct {
+		name string
+		in   float64
+		want float64
+	}{
+		{name: "zero disables heartbeat", in: 0, want: 0},
+		{name: "negative disables heartbeat", in: -1, want: 0},
+		{name: "positive value below floor", in: 1, want: 30},
+		{name: "fractional positive value below floor", in: 0.01, want: 30},
+		{name: "floor stays floor", in: 30, want: 30},
+		{name: "larger value preserved", in: 45, want: 45},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveHeartbeatIntervalSeconds(tc.in); got != tc.want {
+				t.Fatalf("effectiveHeartbeatIntervalSeconds(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1821,8 +1866,8 @@ func TestPutMessageThoughtEncryptedSignsAndEncrypts(t *testing.T) {
 	c.mu.Unlock()
 	now := float64(time.Now().Unix())
 	c.certCacheMu.Lock()
-	c.certCache[certCacheKey(bobAID, "")] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + 600}
-	c.certCache[certCacheKey(bobAID, bobFingerprint)] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + 600}
+	c.certCache[certCacheKey(bobAID, "")] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + peerCertCacheTTL}
+	c.certCache[certCacheKey(bobAID, bobFingerprint)] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + peerCertCacheTTL}
 	c.certCacheMu.Unlock()
 	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
 
@@ -1925,6 +1970,7 @@ func TestGroupThoughtGetAutoDecrypts(t *testing.T) {
 		1,
 		aliceIdentity["private_key_pem"].(string),
 		[]byte(aliceCertPEM),
+		E2EEEncryptOptions{Context: map[string]any{"type": "run", "id": "run-root"}},
 	)
 	if err != nil {
 		t.Fatalf("构造 thought 密文失败: %v", err)
@@ -1970,7 +2016,7 @@ func TestGroupThoughtGetAutoDecrypts(t *testing.T) {
 	c.certCache[certCacheKey(aliceAID, aliceFingerprint)] = &cachedPeerCert{
 		certBytes:    []byte(aliceCertPEM),
 		validatedAt:  float64(time.Now().Unix()),
-		refreshAfter: float64(time.Now().Unix() + 600),
+		refreshAfter: float64(time.Now().Unix() + peerCertCacheTTL),
 	}
 	c.mu.Unlock()
 	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
@@ -1997,6 +2043,16 @@ func TestGroupThoughtGetAutoDecrypts(t *testing.T) {
 	payload, _ := thought["payload"].(map[string]any)
 	if payload["type"] != "thought" || payload["text"] != "只给感兴趣的人看" {
 		t.Fatalf("group.thought.get 应返回解密明文 payload: %#v", thought)
+	}
+	if contextValue, _ := thought["context"].(map[string]any); contextValue["id"] != "run-root" {
+		t.Fatalf("group.thought.get 应返回 thought.context: %#v", thought)
+	}
+	if e2ee, _ := thought["e2ee"].(map[string]any); e2ee != nil {
+		if contextValue, _ := e2ee["context"].(map[string]any); contextValue["id"] != "run-root" {
+			t.Fatalf("group.thought.get 应返回 e2ee.context: %#v", thought)
+		}
+	} else {
+		t.Fatalf("group.thought.get 应返回 e2ee 元数据: %#v", thought)
 	}
 }
 
@@ -2356,8 +2412,8 @@ func TestRotateGroupEpochUsesTwoPhaseRotation(t *testing.T) {
 	c.mu.Unlock()
 	now := float64(time.Now().Unix())
 	c.certCacheMu.Lock()
-	c.certCache[certCacheKey(bobAID, "")] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + 600}
-	c.certCache[certCacheKey(bobAID, bobFingerprint)] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + 600}
+	c.certCache[certCacheKey(bobAID, "")] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + peerCertCacheTTL}
+	c.certCache[certCacheKey(bobAID, bobFingerprint)] = &cachedPeerCert{certBytes: []byte(bobCertPEM), validatedAt: now, refreshAfter: now + peerCertCacheTTL}
 	c.certCacheMu.Unlock()
 	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
 
@@ -3246,5 +3302,563 @@ func TestServerKickedSuppressesAnyCode(t *testing.T) {
 	c.mu.RUnlock()
 	if state != StateTerminalFailed {
 		t.Errorf("serverKicked=true 应抑制重连，实际: %s", state)
+	}
+}
+
+func TestGroupThoughtGetDecryptFailedIncludesThought(t *testing.T) {
+	groupID := "g-thought-fail.example.com"
+	aliceAID := "alice.example.com"
+	bobAID := "bob.example.com"
+	aliceIdentity, aliceCertPEM, aliceFingerprint := testBuildIdentityWithFingerprint(t, aliceAID)
+	bobIdentity, _, _ := testBuildIdentityWithFingerprint(t, bobAID)
+	members := []string{aliceAID, bobAID}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 1, groupID, secret)
+	envelope, err := EncryptGroupMessage(
+		secret,
+		map[string]any{"type": "thought", "text": "secret-thought"},
+		groupID,
+		aliceAID,
+		"gt-fail-1",
+		1710504000000,
+		1,
+		aliceIdentity["private_key_pem"].(string),
+		[]byte(aliceCertPEM),
+		E2EEEncryptOptions{Context: map[string]any{"type": "run", "id": "run-x"}},
+	)
+	if err != nil {
+		t.Fatalf("构造 thought 密文失败: %v", err)
+	}
+	_ = commitment
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.thought.get":
+			return map[string]any{
+				"found":      true,
+				"group_id":   groupID,
+				"sender_aid": aliceAID,
+				"context":    map[string]any{"type": "run", "id": "run-x"},
+				"thoughts": []any{
+					map[string]any{
+						"thought_id": "gt-fail-1",
+						"context":    map[string]any{"type": "run", "id": "run-x"},
+						"payload":    envelope,
+						"created_at": int64(1710504000000),
+					},
+				},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	// 存储 Alice 证书避免 HTTP fetch，但故意不存储 group secret 使解密失败
+	if err := c.keyStore.SaveCert(aliceAID, aliceCertPEM); err != nil {
+		t.Fatalf("保存发送方证书失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = bobAID
+	c.identity = bobIdentity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.certCache[certCacheKey(aliceAID, aliceFingerprint)] = &cachedPeerCert{
+		certBytes:    []byte(aliceCertPEM),
+		validatedAt:  float64(time.Now().Unix()),
+		refreshAfter: float64(time.Now().Unix() + peerCertCacheTTL),
+	}
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+	result, err := c.Call(ctx, "group.thought.get", map[string]any{
+		"group_id":   groupID,
+		"sender_aid": aliceAID,
+		"context":    map[string]any{"type": "run", "id": "run-x"},
+	})
+	if err != nil {
+		t.Fatalf("group.thought.get 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	thoughts, _ := resultMap["thoughts"].([]any)
+	if len(thoughts) != 1 {
+		t.Fatalf("解密失败时仍应返回 1 条 thought，实际: %d, result: %#v", len(thoughts), resultMap)
+	}
+	thought, _ := thoughts[0].(map[string]any)
+	if thought["decrypt_failed"] != true {
+		t.Fatalf("解密失败的 thought 应标记 decrypt_failed=true: %#v", thought)
+	}
+	payload, _ := thought["payload"].(map[string]any)
+	if payload == nil {
+		t.Fatalf("解密失败的 thought 应保留原始加密 payload: %#v", thought)
+	}
+	if payload["type"] != "e2ee.group_encrypted" {
+		t.Fatalf("解密失败的 thought payload.type 应为 e2ee.group_encrypted: %#v", payload)
+	}
+	if thought["thought_id"] != "gt-fail-1" {
+		t.Fatalf("thought_id 应保留: %#v", thought)
+	}
+}
+
+func TestMessageThoughtGetDecryptFailedIncludesThought(t *testing.T) {
+	aliceAID := "alice.example.com"
+	bobAID := "bob.example.com"
+	_, aliceCertPEM, _ := testBuildIdentityWithFingerprint(t, aliceAID)
+	bobIdentity, _, _ := testBuildIdentityWithFingerprint(t, bobAID)
+
+	// 构造一个伪造的加密 payload（无法解密）
+	fakeEncryptedPayload := map[string]any{
+		"type":                    "e2ee.encrypted",
+		"ciphertext":              "aW52YWxpZC1jaXBoZXJ0ZXh0",
+		"ephemeral_public_key":    "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+		"iv":                      "AAAAAAAAAAAAAAAA",
+		"sender_cert_fingerprint": "fake-fingerprint",
+		"aad": map[string]any{
+			"from":                    aliceAID,
+			"to":                      bobAID,
+			"message_id":              "mt-fail-1",
+			"timestamp":               int64(1710504000000),
+			"sender_cert_fingerprint": "fake-fingerprint",
+		},
+	}
+
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.thought.get":
+			return map[string]any{
+				"found":      true,
+				"sender_aid": aliceAID,
+				"peer_aid":   aliceAID,
+				"context":    map[string]any{"type": "task", "id": "task-1"},
+				"thoughts": []any{
+					map[string]any{
+						"thought_id": "mt-fail-1",
+						"from":       aliceAID,
+						"to":         bobAID,
+						"context":    map[string]any{"type": "task", "id": "task-1"},
+						"payload":    fakeEncryptedPayload,
+						"created_at": int64(1710504000000),
+					},
+				},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	// 存储 Alice 证书避免 HTTP fetch，但伪造的密文仍无法解密
+	if err := c.keyStore.SaveCert(aliceAID, aliceCertPEM); err != nil {
+		t.Fatalf("保存发送方证书失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = bobAID
+	c.identity = bobIdentity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	if c.certCache == nil {
+		c.certCache = make(map[string]*cachedPeerCert)
+	}
+	c.certCache[certCacheKey(aliceAID, "fake-fingerprint")] = &cachedPeerCert{
+		certBytes:    []byte(aliceCertPEM),
+		validatedAt:  float64(time.Now().Unix()),
+		refreshAfter: float64(time.Now().Unix() + peerCertCacheTTL),
+	}
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+	result, err := c.Call(ctx, "message.thought.get", map[string]any{
+		"peer_aid":   aliceAID,
+		"sender_aid": aliceAID,
+		"context":    map[string]any{"type": "task", "id": "task-1"},
+	})
+	if err != nil {
+		t.Fatalf("message.thought.get 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	thoughts, _ := resultMap["thoughts"].([]any)
+	if len(thoughts) != 1 {
+		t.Fatalf("解密失败时仍应返回 1 条 thought，实际: %d, result: %#v", len(thoughts), resultMap)
+	}
+	thought, _ := thoughts[0].(map[string]any)
+	if thought["decrypt_failed"] != true {
+		t.Fatalf("解密失败的 thought 应标记 decrypt_failed=true: %#v", thought)
+	}
+	payload, _ := thought["payload"].(map[string]any)
+	if payload == nil {
+		t.Fatalf("解密失败的 thought 应保留原始加密 payload: %#v", thought)
+	}
+	if payload["type"] != "e2ee.encrypted" {
+		t.Fatalf("解密失败的 thought payload.type 应为 e2ee.encrypted: %#v", payload)
+	}
+	if thought["thought_id"] != "mt-fail-1" {
+		t.Fatalf("thought_id 应保留: %#v", thought)
+	}
+}
+
+// ── 服务端 epoch key 恢复测试 ──────────────────────────────
+
+func testExtractPubkeyBytesFromIdentity(t *testing.T, identity map[string]any) []byte {
+	t.Helper()
+	certPEM, _ := identity["cert"].(string)
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		t.Fatal("解码证书 PEM 失败")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("解析证书失败: %v", err)
+	}
+	ecPub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatal("证书公钥不是 EC 类型")
+	}
+	return elliptic.Marshal(ecPub.Curve, ecPub.X, ecPub.Y)
+}
+
+func TestRecoveryUsesServerKeyForOpenGroupBeforeP2P(t *testing.T) {
+	aid := "bob.test.com"
+	groupID := "g-open-recovery.test.com"
+	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
+	members := []string{"alice.test.com", aid}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 2, groupID, secret)
+	pubkeyBytes := testExtractPubkeyBytesFromIdentity(t, identity)
+	encrypted, err := EciesEncrypt(pubkeyBytes, secret)
+	if err != nil {
+		t.Fatalf("ECIES 加密失败: %v", err)
+	}
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.get_join_requirements":
+			return map[string]any{"join_requirements": map[string]any{"mode": "open"}}
+		case "group.e2ee.get_epoch_key":
+			return map[string]any{"epoch": 2, "encrypted_key": base64.StdEncoding.EncodeToString(encrypted)}
+		case "group.e2ee.get_epoch":
+			return map[string]any{
+				"epoch": 2, "committed_epoch": 2,
+				"members": []any{members[0], members[1]},
+				"committed_rotation": map[string]any{
+					"target_epoch":     2,
+					"key_commitment":   commitment,
+					"expected_members": []any{members[0], members[1]},
+				},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aid
+	c.identity = identity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 5*time.Second, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	result := c.doRecoverGroupEpochKey(ctx, groupID, 2, "", 5*time.Second)
+	if !result {
+		t.Fatal("open 群恢复应成功")
+	}
+	calls := getCalls()
+	found := false
+	for _, call := range calls {
+		if call.Method == "group.e2ee.get_epoch_key" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("open 群应调用 group.e2ee.get_epoch_key")
+	}
+	loaded, err := LoadGroupSecret(c.keyStore, aid, groupID, intPtr(2))
+	if err != nil || loaded == nil {
+		t.Fatalf("恢复后应有 epoch 2 密钥: err=%v", err)
+	}
+}
+
+func TestVerifyGroupKeyResponseEpochAllowsNewMemberCommitmentMismatch(t *testing.T) {
+	aid := "bob.test.com"
+	groupID := "g-response-new-member.test.com"
+
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.e2ee.get_epoch":
+			return map[string]any{
+				"epoch": 2, "committed_epoch": 2,
+				"committed_rotation": map[string]any{
+					"target_epoch":     2,
+					"key_commitment":   "committed-old",
+					"expected_members": []any{"alice.test.com"},
+				},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aid
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 5*time.Second, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	if !c.verifyGroupKeyResponseEpoch(ctx, map[string]any{
+		"group_id":   groupID,
+		"epoch":      2,
+		"commitment": "new-member-commitment",
+	}) {
+		t.Fatal("新成员恢复时的 commitment mismatch 应放行")
+	}
+}
+
+func TestVerifyActiveGroupRotationDistributionAllowsNewMemberCommitmentMismatch(t *testing.T) {
+	aid := "bob.test.com"
+	groupID := "g-dist-new-member.test.com"
+
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.e2ee.get_epoch":
+			return map[string]any{
+				"epoch": 2, "committed_epoch": 2,
+				"committed_rotation": map[string]any{
+					"target_epoch":     2,
+					"key_commitment":   "committed-old",
+					"expected_members": []any{"alice.test.com"},
+				},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aid
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 5*time.Second, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	if !c.verifyActiveGroupRotationDistribution(ctx, map[string]any{
+		"group_id":   groupID,
+		"epoch":      2,
+		"commitment": "new-member-commitment",
+	}) {
+		t.Fatal("新成员 backfill 时的 commitment mismatch 应放行")
+	}
+}
+
+func TestRecoverySkipsServerKeyForPrivateGroupAndUsesP2P(t *testing.T) {
+	aid := "bob.test.com"
+	groupID := "g-private-recovery.test.com"
+	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
+
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.get_join_requirements":
+			return map[string]any{"join_requirements": map[string]any{"mode": "approval"}}
+		case "group.e2ee.get_epoch":
+			return map[string]any{
+				"epoch": 2, "committed_epoch": 2,
+				"owner_aid": "alice.test.com",
+				"members":   []any{"alice.test.com", aid},
+			}
+		case "group.get_online_members":
+			return map[string]any{"members": []any{
+				map[string]any{"aid": "alice.test.com", "role": "owner", "online": true},
+				map[string]any{"aid": aid, "role": "member", "online": true},
+			}}
+		case "message.send":
+			return map[string]any{"ok": true}
+		case "group.e2ee.get_epoch_key":
+			t.Fatal("private/approval 群不应调用 group.e2ee.get_epoch_key")
+			return nil
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aid
+	c.identity = identity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 5*time.Second, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	result := c.doRecoverGroupEpochKey(ctx, groupID, 2, "", 1*time.Second)
+	// P2P 恢复因无密钥响应会超时返回 false
+	_ = result
+	calls := getCalls()
+	for _, call := range calls {
+		if call.Method == "group.e2ee.get_epoch_key" {
+			t.Fatal("private 群不应调用 group.e2ee.get_epoch_key")
+		}
+	}
+}
+
+func TestServerEpochKeyRecoveryRejectsCommitmentMismatch(t *testing.T) {
+	aid := "bob.test.com"
+	groupID := "g-commit-mismatch.test.com"
+	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
+	members := []string{"alice.test.com", aid}
+	secret := GenerateGroupSecret()
+	wrongSecret := GenerateGroupSecret()
+	wrongCommitment := ComputeMembershipCommitment(members, 2, groupID, wrongSecret)
+	pubkeyBytes := testExtractPubkeyBytesFromIdentity(t, identity)
+	encrypted, err := EciesEncrypt(pubkeyBytes, secret)
+	if err != nil {
+		t.Fatalf("ECIES 加密失败: %v", err)
+	}
+
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.e2ee.get_epoch_key":
+			return map[string]any{"epoch": 2, "encrypted_key": base64.StdEncoding.EncodeToString(encrypted)}
+		case "group.e2ee.get_epoch":
+			return map[string]any{
+				"epoch": 2, "committed_epoch": 2,
+				"members": []any{members[0], members[1]},
+				"committed_rotation": map[string]any{
+					"target_epoch":     2,
+					"key_commitment":   wrongCommitment,
+					"expected_members": []any{members[0], members[1]},
+				},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aid
+	c.identity = identity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 5*time.Second, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	result := c.tryRecoverEpochKeyFromServer(ctx, groupID, 2)
+	if result {
+		t.Fatal("commitment 不匹配时应拒绝恢复")
+	}
+	loaded, _ := LoadGroupSecret(c.keyStore, aid, groupID, intPtr(2))
+	if loaded != nil {
+		t.Fatal("commitment 不匹配时不应存储密钥")
+	}
+}
+
+func TestServerEpochKeyRecoveryRequiresMembershipSnapshot(t *testing.T) {
+	aid := "bob.test.com"
+	groupID := "g-no-members.test.com"
+	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
+	secret := GenerateGroupSecret()
+	pubkeyBytes := testExtractPubkeyBytesFromIdentity(t, identity)
+	encrypted, err := EciesEncrypt(pubkeyBytes, secret)
+	if err != nil {
+		t.Fatalf("ECIES 加密失败: %v", err)
+	}
+
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.e2ee.get_epoch_key":
+			return map[string]any{"epoch": 2, "encrypted_key": base64.StdEncoding.EncodeToString(encrypted)}
+		case "group.e2ee.get_epoch":
+			return map[string]any{"epoch": 2, "committed_epoch": 2}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aid
+	c.identity = identity
+	c.state = StateConnected
+	c.gatewayURL = wsURL
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 5*time.Second, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	result := c.tryRecoverEpochKeyFromServer(ctx, groupID, 2)
+	if result {
+		t.Fatal("缺少成员快照时应拒绝恢复")
 	}
 }

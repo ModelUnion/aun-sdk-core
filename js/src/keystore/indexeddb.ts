@@ -1279,6 +1279,18 @@ export class IndexedDBKeyStore implements KeyStore {
           ...oldEntry,
           group_id: groupId,
         });
+      } else {
+        // epoch === localEpoch 但 secret 为空：合并 data，保留已有字段
+        const merged = { ...current, ...this._buildGroupCurrentRecord(groupId, opts, members, now) };
+        if (!opts.epochChain && current.epoch_chain) {
+          merged.epoch_chain = current.epoch_chain;
+        }
+        if (current.pending_rotation_id && !opts.pendingRotationId) {
+          merged.pending_rotation_id = current.pending_rotation_id;
+          if (current.pending_created_at) merged.pending_created_at = current.pending_created_at;
+        }
+        await idbPut(STORE_GROUP_CURRENT, currentKey, merged);
+        return true;
       }
     }
 
@@ -1319,7 +1331,15 @@ export class IndexedDBKeyStore implements KeyStore {
     const current = deepClone(currentRaw) as GroupSecretRecord;
     delete current.group_id;
     const localEpoch = Number(current.epoch ?? 0);
-    if (epoch > localEpoch) return false;
+    if (epoch > localEpoch) {
+      // 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
+      const expiresAt = Date.now() + (opts.oldEpochRetentionMs ?? 604800_000);
+      const oldRecord = { ...current, group_id: groupId, expires_at: expiresAt };
+      const oldKey = groupOldStoreKey(aid, groupId, localEpoch);
+      await idbPut(STORE_GROUP_OLD_EPOCHS, oldKey, oldRecord);
+      await idbPut(STORE_GROUP_CURRENT, currentKey, newRecord);
+      return true;
+    }
 
     if (epoch === localEpoch) {
       if (typeof current.secret === 'string' && current.secret !== opts.secret) {

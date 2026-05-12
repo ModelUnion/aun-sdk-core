@@ -120,6 +120,11 @@ export interface KeyStore {
   /** 加载指定 AID 的元数据（对齐 Python load_metadata） */
   loadMetadata?(aid: string): Record<string, unknown> | null;
 
+  /** 保存群组状态（state_hash 链） */
+  saveGroupState?(groupId: string, stateVersion: number, stateHash: string, keyEpoch: number, membershipJson: string, policyJson: string): void;
+  /** 加载群组状态 */
+  loadGroupState?(groupId: string): { group_id: string; state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | null;
+
   /** 返回信任根证书存储目录路径 */
   trustRootDir?(): string;
   /** 返回信任根证书 bundle 路径 */

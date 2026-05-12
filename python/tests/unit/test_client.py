@@ -4,6 +4,7 @@ import time
 import pytest
 
 from aun_core import AUNClient, ProtectedHeaders
+from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL, _PEER_PREKEYS_CACHE_TTL
 from aun_core.errors import AUNError, ClientSignatureError, NotFoundError, StateError, ValidationError
 import aun_core.namespaces.auth_namespace as auth_namespace_module
 
@@ -31,6 +32,14 @@ def _make_test_cert(cn: str) -> tuple[str, str]:
     cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
     cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
     return cert_pem, cert_fp
+
+
+def test_peer_cert_cache_ttl_is_one_hour():
+    assert _PEER_CERT_CACHE_TTL == 3600
+
+
+def test_peer_prekeys_cache_ttl_is_one_hour():
+    assert _PEER_PREKEYS_CACHE_TTL == 3600
 
 
 def test_construct_no_args():
@@ -77,6 +86,34 @@ def test_connect_uses_cached_gateway():
 
     normalized = client._normalize_connect_params({"access_token": "tok"})
     assert normalized["gateway"] == "ws://cached.example/aun"
+
+
+def test_heartbeat_interval_zero_disables_heartbeat():
+    client = AUNClient()
+    client._session_options["heartbeat_interval"] = 0
+
+    client._start_heartbeat_task()
+
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_positive_heartbeat_interval_has_30s_floor():
+    client = AUNClient()
+    client._session_options["heartbeat_interval"] = 0.01
+    captured: dict[str, float] = {}
+
+    async def fake_heartbeat_loop(interval: float) -> None:
+        captured["interval"] = interval
+
+    client._heartbeat_loop = fake_heartbeat_loop  # type: ignore[method-assign]
+
+    client._start_heartbeat_task()
+    await asyncio.sleep(0)
+
+    assert captured["interval"] == 30.0
+    assert client._heartbeat_task is not None
+    assert client._heartbeat_task.done()
 
 
 def test_normalize_connect_params_includes_slot_and_delivery_mode(tmp_path):
@@ -1047,6 +1084,61 @@ def test_message_thought_get_auto_decrypts(monkeypatch):
     }]
 
 
+def test_message_thought_get_is_not_replay_guarded(monkeypatch):
+    """message.thought.get 是 RPC 查询，重复读取不应消耗普通消息 replay guard。"""
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "bob.example.com"
+    decrypt_calls = 0
+
+    async def _fake_call(method, params):
+        assert method == "message.thought.get"
+        return {
+            "found": True,
+            "sender_aid": "alice.example.com",
+            "peer_aid": "bob.example.com",
+            "context": {"type": "run", "id": "run-repeat"},
+            "thoughts": [{
+                "thought_id": "mt-repeat",
+                "from": "alice.example.com",
+                "to": "bob.example.com",
+                "context": {"type": "run", "id": "run-repeat"},
+                "payload": {"type": "e2ee.encrypted", "ciphertext": "abc"},
+                "created_at": 1710504000000,
+            }],
+        }
+
+    async def _fake_cert(*_args, **_kwargs):
+        return True
+
+    def _fake_decrypt(_m, source=""):
+        nonlocal decrypt_calls
+        decrypt_calls += 1
+        return {
+            "payload": {"type": "thought", "text": "重复读取可见"},
+            "e2ee": {"encryption_mode": "prekey_ecdh_v2"},
+        }
+
+    client._e2ee._seen_messages["alice.example.com:mt-repeat"] = 1.0
+    monkeypatch.setattr(client, "_ensure_sender_cert_cached", _fake_cert)
+    monkeypatch.setattr(client._e2ee, "_should_decrypt_for_current_aid", lambda _m, _p: True)
+    monkeypatch.setattr(client._e2ee, "_decrypt_message", _fake_decrypt)
+    client._transport.call = _fake_call
+
+    first = asyncio.run(client.call("message.thought.get", {
+        "sender_aid": "alice.example.com",
+        "context": {"type": "run", "id": "run-repeat"},
+    }))
+    second = asyncio.run(client.call("message.thought.get", {
+        "sender_aid": "alice.example.com",
+        "context": {"type": "run", "id": "run-repeat"},
+    }))
+
+    assert first["thoughts"][0]["payload"]["text"] == "重复读取可见"
+    assert second["thoughts"][0]["payload"]["text"] == "重复读取可见"
+    assert decrypt_calls == 2
+
+
 def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeypatch):
     """零信任语义：keystore 中即便有匹配指纹的证书，仍必须经过 _fetch_peer_cert
     完成 PKI 验证后方可信任；mock 让 _fetch_peer_cert 成功返回，验证流程通过即可。
@@ -1090,6 +1182,19 @@ def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeyp
     # 零信任：必须调用 _fetch_peer_cert 做 PKI 验证，不能仅凭 keystore 信任
     assert called["fetch"] == 1
     assert called["last_fp"] == cert_fp
+
+
+def test_get_verified_peer_cert_resolves_versioned_cache_without_fingerprint(tmp_path):
+    cert_pem, cert_fp = _make_test_cert("bob.example.com")
+    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    now = time.time()
+    client._cert_cache[client._cert_cache_key("bob.example.com", cert_fp)] = _CachedPeerCert(
+        cert_bytes=cert_pem.encode("utf-8"),
+        validated_at=now,
+        refresh_after=now + _PEER_CERT_CACHE_TTL,
+    )
+
+    assert client._get_verified_peer_cert("bob.example.com") == cert_pem
 
 
 def test_send_encrypted_uses_multi_device_payload_when_needed(monkeypatch):

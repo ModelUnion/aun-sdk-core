@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aun_core import AUNClient
-from aun_core.client import _CachedPeerCert
+from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL
 from aun_core.e2ee import (
     build_key_distribution,
     build_membership_manifest,
@@ -88,7 +88,7 @@ def _make_client(tmp_path, aid=_AID_BOB):
             continue
         _, peer_cert = _get_signing_identity(peer_aid)
         client._cert_cache[peer_aid] = _CachedPeerCert(
-            cert_bytes=peer_cert, validated_at=now, refresh_after=now + 600,
+            cert_bytes=peer_cert, validated_at=now, refresh_after=now + _PEER_CERT_CACHE_TTL,
         )
         cert_str = peer_cert.decode("utf-8") if isinstance(peer_cert, bytes) else peer_cert
         client._keystore.save_cert(peer_aid, cert_str)
