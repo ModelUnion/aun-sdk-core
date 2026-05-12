@@ -15,7 +15,7 @@ vi.mock('fs', async () => {
 
 import { AUNLogger } from '../../src/logger.js';
 
-const FMT = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[(ERROR|WARN|INFO|DEBUG)\]\[aun_core\.[a-z-]+\] /;
+const FMT = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[(ERROR|WARN|INFO|DEBUG)\]\[aun_core\.[a-z0-9-]+\] /;
 
 describe('AUNLogger 新格式', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -76,6 +76,7 @@ describe('AUNLogger 新格式', () => {
     expect(payload).toContain('Traceback:');
     expect(payload).toContain('    Error: boom');
     expect(payload).toContain('    at foo (bar.ts:1:1)');
+    logger.close();
   });
 
   it('文件路径为 {aunPath}/logs/ts-sdk-{yyyy-mm-dd}.log', () => {
@@ -84,6 +85,7 @@ describe('AUNLogger 新格式', () => {
     expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
     const path = String(vi.mocked(fs.appendFileSync).mock.calls[0][0]);
     expect(path).toMatch(/[\\/]custom[\\/]aun[\\/]logs[\\/]ts-sdk-\d{4}-\d{2}-\d{2}\.log$/);
+    logger.close();
   });
 
   it('debug=false 时不建 logs 目录、不写文件', () => {
