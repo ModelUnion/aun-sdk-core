@@ -11,6 +11,14 @@ import type { KeyStore } from './keystore/index.js';
 
 import { E2EEError, E2EEDecryptFailedError } from './errors.js';
 import type { IdentityRecord, JsonObject, Message, PrekeyRecord } from './types.js';
+import type { ModuleLogger } from './logger.js';
+
+const _noopLogger: ModuleLogger = {
+  error: () => {},
+  warn:  () => {},
+  info:  () => {},
+  debug: () => {},
+};
 
 // ── 常量 ───────────────────────────────────────────────────────
 
@@ -525,6 +533,7 @@ export class E2EEManager {
   private _localPrekeyCache = new Map<string, string>();
   /** 防重放时间窗口（秒） */
   private _replayWindowSeconds: number;
+  private _logger: ModuleLogger;
 
   constructor(opts: {
     identityFn: () => IdentityRecord;
@@ -532,12 +541,14 @@ export class E2EEManager {
     keystore: KeyStore;
     prekeyCacheTtl?: number;
     replayWindowSeconds?: number;
+    logger?: ModuleLogger;
   }) {
     this._identityFn = opts.identityFn;
     this._deviceIdFn = opts.deviceIdFn ?? (() => '');
     this._keystore = opts.keystore;
     this._prekeyCacheTtl = opts.prekeyCacheTtl ?? 3600;
     this._replayWindowSeconds = opts.replayWindowSeconds ?? 300;
+    this._logger = opts.logger ?? _noopLogger;
   }
 
   // ── 便利方法 ──────────────────────────────────────────────
@@ -608,7 +619,7 @@ export class E2EEManager {
         }];
       } catch (exc) {
         // prekey 加密失败，降级到 long_term_key — 记录异常以便排查安全降级原因
-        console.warn('[aun_core.e2ee] prekey 加密失败，降级到 long_term_key:', exc);
+        this._logger.warn(`prekey 加密失败，降级到 long_term_key: ${exc instanceof Error ? exc.message : String(exc)}`);
       }
     }
 
@@ -846,7 +857,7 @@ export class E2EEManager {
     try {
       this._verifySenderSignature(payload, message);
     } catch (exc) {
-      console.warn('[aun_core.e2ee] 发送方签名验证失败');
+      this._logger.warn('发送方签名验证失败');
       return null;
     }
 
@@ -944,7 +955,10 @@ export class E2EEManager {
     } catch (exc) {
       const fromAid = (message.from ?? '') as string;
       const msgId = (message.message_id ?? '') as string;
-      console.warn(`[aun_core.e2ee] 解密失败: mode=prekey_ecdh_v2, from=${fromAid}, mid=${msgId}`, exc);
+      this._logger.error(
+        `解密失败: mode=prekey_ecdh_v2, from=${fromAid}, mid=${msgId}`,
+        exc instanceof Error ? exc : new Error(String(exc)),
+      );
       return null;
     }
   }
@@ -1023,7 +1037,10 @@ export class E2EEManager {
     } catch (exc) {
       const fromAid = (message.from ?? '') as string;
       const msgId = (message.message_id ?? '') as string;
-      console.warn(`[aun_core.e2ee] 解密失败: mode=long_term_key, from=${fromAid}, mid=${msgId}`, exc);
+      this._logger.error(
+        `解密失败: mode=long_term_key, from=${fromAid}, mid=${msgId}`,
+        exc instanceof Error ? exc : new Error(String(exc)),
+      );
       return null;
     }
   }

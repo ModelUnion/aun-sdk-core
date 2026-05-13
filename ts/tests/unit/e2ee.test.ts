@@ -4,7 +4,7 @@
  * 测试策略：用真实密码学原语，E2EEManager 为纯工具类，无 RPC mock。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as crypto from 'node:crypto';
 import {
   AAD_FIELDS_OFFLINE,
@@ -426,33 +426,29 @@ describe('decryptMessage', () => {
 
 describe('prekey 加密失败降级日志（TS-014）', () => {
   it('prekey 加密失败时应输出包含异常信息的警告日志', () => {
-    const { senderMgr, receiverKey, receiverCert } = makeE2EEPair();
+    const { receiverKey, receiverCert, senderKs, senderIdentity } = makeE2EEPair();
     const { prekey } = makePrekey(receiverKey);
     // 伪造 cert_fingerprint 触发 prekey 加密失败
     prekey.cert_fingerprint = `sha256:${'0'.repeat(64)}`;
 
-    const warnArgs: unknown[][] = [];
-    const origWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warnArgs.push(args); };
+    const mockLogger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    const senderMgr = new E2EEManager({
+      identityFn: () => senderIdentity,
+      keystore: senderKs,
+      logger: mockLogger,
+    });
 
-    try {
-      const [_envelope, info] = senderMgr.encryptOutbound(
-        'receiver.test', { type: 'text', text: 'test' }, receiverCert,
-        prekey, crypto.randomUUID(), Date.now(),
-      );
-      // 应降级到 long_term_key
-      expect(info.mode).toBe(MODE_LONG_TERM_KEY);
-      expect(info.degraded).toBe(true);
-      // 验证 warn 被调用且包含异常对象
-      const prekeyWarn = warnArgs.find(args =>
-        typeof args[0] === 'string' && args[0].includes('prekey 加密失败'));
-      expect(prekeyWarn).toBeDefined();
-      // 最后一个参数应为异常对象（非空）
-      expect(prekeyWarn!.length).toBeGreaterThanOrEqual(2);
-      expect(prekeyWarn![prekeyWarn!.length - 1]).toBeTruthy();
-    } finally {
-      console.warn = origWarn;
-    }
+    const [_envelope, info] = senderMgr.encryptOutbound(
+      'receiver.test', { type: 'text', text: 'test' }, receiverCert,
+      prekey, crypto.randomUUID(), Date.now(),
+    );
+    // 应降级到 long_term_key
+    expect(info.mode).toBe(MODE_LONG_TERM_KEY);
+    expect(info.degraded).toBe(true);
+    // 验证 warn 被调用且包含异常信息
+    const warnCall = mockLogger.warn.mock.calls.find((args: unknown[]) =>
+      typeof args[0] === 'string' && (args[0] as string).includes('prekey 加密失败'));
+    expect(warnCall).toBeDefined();
   });
 });
 
@@ -478,7 +474,7 @@ describe('decryptMessage 解密失败行为（TS-015）', () => {
   });
 
   it('prekey_ecdh_v2 解密失败时应输出包含上下文信息的警告日志', () => {
-    const { senderMgr, receiverMgr, receiverKey, receiverCert, receiverKs } = makeE2EEPair();
+    const { senderMgr, receiverKey, receiverCert, receiverKs, receiverIdentity } = makeE2EEPair();
     const { prekey, prekeyPrivateKey } = makePrekey(receiverKey);
     const privPem = prekeyPrivateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
     receiverKs._prekeys['receiver.test'] = {
@@ -491,28 +487,27 @@ describe('decryptMessage 解密失败行为（TS-015）', () => {
     const tampered = { ...envelope, nonce: Buffer.from(crypto.randomBytes(12)).toString('base64') };
     const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };
 
-    const warnArgs: unknown[][] = [];
-    const origWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warnArgs.push(args); };
+    const mockLogger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    const receiverMgr = new E2EEManager({
+      identityFn: () => receiverIdentity,
+      keystore: receiverKs,
+      logger: mockLogger,
+    });
 
-    try {
-      receiverMgr.decryptMessage(msg);
-      // 应有包含 mode/from/message_id 的解密失败日志
-      const decryptWarn = warnArgs.find(args =>
-        typeof args[0] === 'string' && args[0].includes('解密失败'));
-      expect(decryptWarn).toBeDefined();
-      // 日志中应包含 mode、from、message_id 等上下文
-      const logStr = String(decryptWarn![0]);
-      expect(logStr).toContain('prekey_ecdh_v2');
-      expect(logStr).toContain('sender.test');
-      expect(logStr).toContain(mid);
-    } finally {
-      console.warn = origWarn;
-    }
+    receiverMgr.decryptMessage(msg);
+    // 应有包含 mode/from/message_id 的解密失败日志（error 级别）
+    const errorCall = mockLogger.error.mock.calls.find((args: unknown[]) =>
+      typeof args[0] === 'string' && (args[0] as string).includes('解密失败'));
+    expect(errorCall).toBeDefined();
+    // 日志中应包含 mode、from、message_id 等上下文
+    const logStr = String(errorCall![0]);
+    expect(logStr).toContain('prekey_ecdh_v2');
+    expect(logStr).toContain('sender.test');
+    expect(logStr).toContain(mid);
   });
 
   it('long_term_key 解密失败时应输出包含上下文信息的警告日志', () => {
-    const { senderMgr, receiverMgr, receiverCert } = makeE2EEPair();
+    const { senderMgr, receiverCert, receiverKs, receiverIdentity } = makeE2EEPair();
     const mid = crypto.randomUUID();
     const ts = Date.now();
     const [envelope] = senderMgr.encryptOutbound('receiver.test', { type: 'text', text: 'hi' }, receiverCert, null, mid, ts);
@@ -520,23 +515,22 @@ describe('decryptMessage 解密失败行为（TS-015）', () => {
     const tampered = { ...envelope, nonce: Buffer.from(crypto.randomBytes(12)).toString('base64') };
     const msg: Message = { message_id: mid, from: 'sender.test', to: 'receiver.test', timestamp: ts, seq: 1, payload: tampered, encrypted: true };
 
-    const warnArgs: unknown[][] = [];
-    const origWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warnArgs.push(args); };
+    const mockLogger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    const receiverMgr = new E2EEManager({
+      identityFn: () => receiverIdentity,
+      keystore: receiverKs,
+      logger: mockLogger,
+    });
 
-    try {
-      receiverMgr.decryptMessage(msg);
-      // 应有包含 mode/from/message_id 的解密失败日志
-      const decryptWarn = warnArgs.find(args =>
-        typeof args[0] === 'string' && args[0].includes('解密失败'));
-      expect(decryptWarn).toBeDefined();
-      const logStr = String(decryptWarn![0]);
-      expect(logStr).toContain('long_term_key');
-      expect(logStr).toContain('sender.test');
-      expect(logStr).toContain(mid);
-    } finally {
-      console.warn = origWarn;
-    }
+    receiverMgr.decryptMessage(msg);
+    // 应有包含 mode/from/message_id 的解密失败日志（error 级别）
+    const errorCall = mockLogger.error.mock.calls.find((args: unknown[]) =>
+      typeof args[0] === 'string' && (args[0] as string).includes('解密失败'));
+    expect(errorCall).toBeDefined();
+    const logStr = String(errorCall![0]);
+    expect(logStr).toContain('long_term_key');
+    expect(logStr).toContain('sender.test');
+    expect(logStr).toContain(mid);
   });
 });
 

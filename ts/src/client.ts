@@ -606,6 +606,7 @@ export class AUNClient {
       deviceIdFn: () => this._deviceId,
       keystore,
       replayWindowSeconds: this._configModel.replayWindowSeconds,
+      logger: this._logger.for('aun_core.e2ee'),
     });
 
     this._groupE2ee = new GroupE2EEManager({
