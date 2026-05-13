@@ -573,6 +573,7 @@ export class AUNClient {
       {
         encryptionSeed: this._configModel.seedPassword ?? undefined,
         sqliteBackup: defaultSQLiteBackup,
+        logger: this._logger.for('aun_core.keystore'),
       },
     );
     this._keystore = keystore;

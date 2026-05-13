@@ -32,8 +32,8 @@ function getPrepareRootSource(): string {
 describe('_prepareRoot fallback 日志（ISSUE-TS-003）', () => {
   const methodBody = getPrepareRootSource();
 
-  it('fallback 路径应包含 console.warn 日志警告', () => {
+  it('fallback 路径应通过 _logger.warn 输出日志警告', () => {
     // catch 块中应有日志输出，告知用户数据存储位置发生了回退
-    expect(methodBody).toMatch(/console\.warn/);
+    expect(methodBody).toMatch(/this\._logger\.warn/);
   });
 });
