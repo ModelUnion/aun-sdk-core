@@ -52,21 +52,6 @@ export class AUNLogger {
     this._aid = aid || null;
   }
 
-  setDebug(flag: boolean): void {
-    if (flag === this._debug) return;
-    this._debug = flag;
-    if (flag) {
-      this._ensureLogDir();
-      this._cleanupOldLogs();
-      if (!this._cleanupTimer) {
-        this._cleanupTimer = setInterval(() => this._cleanupOldLogs(), DAY_MS);
-        this._cleanupTimer.unref?.();
-      }
-    } else {
-      this.close();
-    }
-  }
-
   close(): void {
     if (this._cleanupTimer) {
       clearInterval(this._cleanupTimer);
