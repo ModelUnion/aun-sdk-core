@@ -795,4 +795,330 @@ describe('Group E2EE E2E 测试', () => {
     const allCarol = loadAllGroupSecrets(getKeystore(carol), cAid, groupId);
     expect(allCarol.has(newEpoch), `Carol 不应有 epoch ${newEpoch} 密钥`).toBe(false);
   }, TEST_TIMEOUT);
+
+  // ── Test 14: open 群 request_join → 在线优先恢复 committed_epoch → 延迟轮换 ──
+
+  it('open 群加入成员轮换', async () => {
+    const rid = runId();
+    const alice = tracked();
+    const bob = tracked();
+
+    const aAid = `opr-a-${rid}.agentid.pub`;
+    const bAid = `opr-b-${rid}.agentid.pub`;
+    await ensureConnected(alice, aAid);
+    await ensureConnected(bob, bAid);
+
+    // 1. Alice 建 open 群
+    const result = await alice.call('group.create', {
+      name: `e2ee-opr-${rid}`,
+      visibility: 'public',
+      join_mode: 'open',
+    }) as JsonObject;
+    const group = result.group as JsonObject;
+    const groupId = String(group.group_id ?? '');
+    expect(alice.groupE2ee.hasSecret(groupId), 'owner 建群后应有密钥').toBe(true);
+
+    const beforeEpoch = await waitForCommittedGroupEpochReady(alice, groupId, 1, 20_000);
+
+    // 2. Bob 通过 request_join 加入 open 群
+    const joinResult = await bob.call('group.request_join', {
+      group_id: groupId,
+      message: 'open join for rotation test',
+    }) as JsonObject;
+    expect(String(joinResult.status ?? ''), 'open 群应直接 joined').toBe('joined');
+
+    // 3. 等待轮换完成：Bob 拿到 epoch > beforeEpoch 的密钥
+    const rotatedEpoch = await waitForCommittedGroupEpochGreaterThan(bob, groupId, beforeEpoch, 20_000);
+    expect(rotatedEpoch, 'epoch 应轮换').toBeGreaterThan(beforeEpoch);
+
+    // 4. Alice 用新 epoch 发消息，Bob 能解密
+    const bobWatch = await watchGroupMessages(bob, groupId);
+    await alice.call('group.send', {
+      group_id: groupId,
+      payload: { type: 'text', text: `轮换后消息-${rid}` },
+      encrypt: true,
+    });
+
+    try {
+      const msgs = await bobWatch.waitFor((messages) => filterDecrypted(messages).some((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `轮换后消息-${rid}`), 20_000);
+      const decrypted = filterDecrypted(msgs).find((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `轮换后消息-${rid}`);
+      expect(decrypted, 'Bob 应解密轮换后消息').toBeTruthy();
+    } finally {
+      bobWatch.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  // ── Test 15: 邀请码入群 → 在线优先恢复 → 延迟轮换 ──────────
+
+  it('邀请码入群成员轮换', async () => {
+    const rid = runId();
+    const alice = tracked();
+    const bob = tracked();
+
+    const aAid = `inv-a-${rid}.agentid.pub`;
+    const bAid = `inv-b-${rid}.agentid.pub`;
+    await ensureConnected(alice, aAid);
+    await ensureConnected(bob, bAid);
+
+    // 1. Alice 建群（invite_code 模式）
+    const result = await alice.call('group.create', {
+      name: `e2ee-inv-opr-${rid}`,
+      visibility: 'public',
+      join_mode: 'invite_code',
+    }) as JsonObject;
+    const group = result.group as JsonObject;
+    const groupId = String(group.group_id ?? '');
+    expect(alice.groupE2ee.hasSecret(groupId), 'owner 建群后应有密钥').toBe(true);
+
+    const beforeEpoch = await waitForCommittedGroupEpochReady(alice, groupId, 1, 20_000);
+
+    // 2. Alice 生成邀请码
+    const inviteResult = await alice.call('group.create_invite_code', {
+      group_id: groupId,
+      max_uses: 1,
+    }) as JsonObject;
+    const inviteObj = inviteResult.invite_code as JsonObject;
+    expect(inviteObj, '应返回 invite_code 对象').toBeTruthy();
+    const code = String(inviteObj.code ?? '');
+    expect(code.length, '邀请码不应为空').toBeGreaterThan(0);
+
+    // 3. Bob 使用邀请码加入
+    await bob.call('group.use_invite_code', { code });
+
+    // 4. 等待轮换完成：Bob 拿到 epoch > beforeEpoch 的密钥
+    const rotatedEpoch = await waitForCommittedGroupEpochGreaterThan(bob, groupId, beforeEpoch, 20_000);
+    expect(rotatedEpoch, 'epoch 应轮换').toBeGreaterThan(beforeEpoch);
+
+    // 5. Alice 用新 epoch 发消息，Bob 能解密
+    const bobWatch = await watchGroupMessages(bob, groupId);
+    await alice.call('group.send', {
+      group_id: groupId,
+      payload: { type: 'text', text: `邀请码轮换后消息-${rid}` },
+      encrypt: true,
+    });
+
+    try {
+      const msgs = await bobWatch.waitFor((messages) => filterDecrypted(messages).some((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `邀请码轮换后消息-${rid}`), 20_000);
+      const decrypted = filterDecrypted(msgs).find((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `邀请码轮换后消息-${rid}`);
+      expect(decrypted, 'Bob 应解密邀请码轮换后消息').toBeTruthy();
+    } finally {
+      bobWatch.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  // ── Test 16: 私密群 add_member → 立即轮换（对照测试） ──────
+
+  it('私密群 add_member 立即轮换', async () => {
+    const rid = runId();
+    const alice = tracked();
+    const bob = tracked();
+
+    const aAid = `priv-a-${rid}.agentid.pub`;
+    const bAid = `priv-b-${rid}.agentid.pub`;
+    await ensureConnected(alice, aAid);
+    await ensureConnected(bob, bAid);
+
+    // 1. Alice 建私密群（默认 visibility=private）
+    const groupId = await createGroup(alice, `e2ee-priv-imm-${rid}`);
+    expect(alice.groupE2ee.hasSecret(groupId), 'owner 建群后应有密钥').toBe(true);
+
+    const beforeEpoch = await waitForCommittedGroupEpochReady(alice, groupId, 1, 20_000);
+
+    // 2. Alice 添加 Bob（member_added → 立即轮换，无 3s 延迟）
+    await addMember(alice, groupId, bAid);
+
+    // 3. Bob 应通过立即轮换拿到新 epoch（不需要在线优先恢复）
+    const rotatedEpoch = await waitForCommittedGroupEpochGreaterThan(bob, groupId, beforeEpoch, 15_000);
+    expect(rotatedEpoch, '私密群 add_member 应立即轮换').toBeGreaterThan(beforeEpoch);
+
+    // 4. Alice 发消息，Bob 能解密
+    const bobWatch = await watchGroupMessages(bob, groupId);
+    await alice.call('group.send', {
+      group_id: groupId,
+      payload: { type: 'text', text: `私密群消息-${rid}` },
+      encrypt: true,
+    });
+
+    try {
+      const msgs = await bobWatch.waitFor((messages) => filterDecrypted(messages).some((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `私密群消息-${rid}`), 15_000);
+      const decrypted = filterDecrypted(msgs).find((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `私密群消息-${rid}`);
+      expect(decrypted, 'Bob 应解密私密群消息').toBeTruthy();
+    } finally {
+      bobWatch.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  it('open 群 owner 离线时 member 代为轮换', async () => {
+    const rid = crypto.randomUUID().slice(0, 8);
+    const owner = makeClient();
+    const charlie = makeClient();
+    const bob = makeClient();
+    clients.push(owner, charlie, bob);
+
+    const ownerAid = `ge2e-mlr-o-${rid}.${ISSUER}`;
+    const charlieAid = `ge2e-mlr-c-${rid}.${ISSUER}`;
+    const bobAid = `ge2e-mlr-b-${rid}.${ISSUER}`;
+
+    await ensureConnected(owner, ownerAid);
+    await ensureConnected(charlie, charlieAid);
+
+    // 1. Owner 建 open 群
+    const created = await owner.call('group.create', {
+      name: `e2ee-mlr-${rid}`, visibility: 'public', join_mode: 'open',
+    }) as JsonObject;
+    const groupId = String((created.group as JsonObject).group_id);
+    const epoch1 = await waitForCommittedGroupEpochReady(owner, groupId, 1, 30_000);
+
+    // 2. Owner add_member Charlie
+    await addMember(owner, groupId, charlieAid);
+    const epoch2 = await waitForCommittedGroupEpochGreaterThan(charlie, groupId, epoch1, 30_000);
+
+    // 3. Owner 下线
+    await owner.close();
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 4. Bob 加入 open 群
+    await ensureConnected(bob, bobAid);
+    const joinResult = await bob.call('group.request_join', { group_id: groupId }) as JsonObject;
+    expect(joinResult.status).toBe('joined');
+
+    // 5. Charlie（member）代为轮换，Bob 拿到新 epoch
+    const epoch3 = await waitForCommittedGroupEpochGreaterThan(bob, groupId, epoch2, 30_000);
+    expect(epoch3).toBeGreaterThan(epoch2);
+
+    // 6. Charlie 发消息，Bob 能解密
+    const bobWatch = await watchGroupMessages(bob, groupId);
+    await charlie.call('group.send', {
+      group_id: groupId,
+      payload: { type: 'text', text: `mlr-msg-${rid}` },
+      encrypt: true,
+    });
+    try {
+      const msgs = await bobWatch.waitFor((messages) => filterDecrypted(messages).some((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `mlr-msg-${rid}`), 20_000);
+      const decrypted = filterDecrypted(msgs).find((msg) =>
+        String(((msg.payload as JsonObject | undefined)?.text) ?? '') === `mlr-msg-${rid}`);
+      expect(decrypted, 'Bob 应解密 member-led rotation 后的消息').toBeTruthy();
+    } finally {
+      bobWatch.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  it('open 群发送前修复 committed membership gap', async () => {
+    const rid = crypto.randomUUID().slice(0, 8);
+    const owner = makeClient();
+    const bob = makeClient();
+    const charlie = makeClient();
+    clients.push(owner, bob, charlie);
+
+    const ownerAid = `ge2e-oms-o-${rid}.${ISSUER}`;
+    const bobAid = `ge2e-oms-b-${rid}.${ISSUER}`;
+    const charlieAid = `ge2e-oms-c-${rid}.${ISSUER}`;
+
+    await ensureConnected(owner, ownerAid);
+    await ensureConnected(bob, bobAid);
+    await ensureConnected(charlie, charlieAid);
+
+    // 1. Owner 建 open 群
+    const created = await owner.call('group.create', {
+      name: `e2ee-oms-${rid}`, visibility: 'public', join_mode: 'open',
+    }) as JsonObject;
+    const groupId = String((created.group as JsonObject).group_id);
+    const epoch1 = await waitForCommittedGroupEpochReady(owner, groupId, 1, 30_000);
+
+    // 2. Bob 加入
+    const joinResult = await bob.call('group.request_join', { group_id: groupId }) as JsonObject;
+    expect(joinResult.status).toBe('joined');
+    const epoch2 = await waitForCommittedGroupEpochGreaterThan(bob, groupId, epoch1, 30_000);
+    await waitForCommittedGroupEpochReady(owner, groupId, epoch2, 20_000);
+
+    // 3. Owner 下线，Charlie 加入（制造 gap）
+    await owner.close();
+    await new Promise(r => setTimeout(r, 500));
+    const charlieJoin = await charlie.call('group.request_join', { group_id: groupId }) as JsonObject;
+    expect(charlieJoin.status).toBe('joined');
+
+    // 4. Bob 发送加密消息 — 应触发 gap 修复
+    await bob.call('group.send', {
+      group_id: groupId,
+      payload: { type: 'text', text: `repair-send-${rid}` },
+      encrypt: true,
+    });
+
+    // 5. 验证 epoch 已推进
+    const repairedEpoch = await waitForCommittedGroupEpochGreaterThan(bob, groupId, epoch2, 30_000);
+    expect(repairedEpoch).toBeGreaterThan(epoch2);
+  }, TEST_TIMEOUT);
+
+  it('group.thought.get 恢复缺失 epoch key 后解密', async () => {
+    const rid = crypto.randomUUID().slice(0, 8);
+    const ownerPath = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-e2e-tgt-owner-'));
+    const owner = new AUNClient({ aun_path: ownerPath });
+    ((owner as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+    const bob = makeClient();
+    const charlie = makeClient();
+    clients.push(owner, bob, charlie);
+
+    const ownerAid = `ge2e-tgt-o-${rid}.${ISSUER}`;
+    const bobAid = `ge2e-tgt-b-${rid}.${ISSUER}`;
+    const charlieAid = `ge2e-tgt-c-${rid}.${ISSUER}`;
+
+    await ensureConnected(owner, ownerAid);
+    await ensureConnected(bob, bobAid);
+    await ensureConnected(charlie, charlieAid);
+
+    // 1. Owner 建 open 群
+    const created = await owner.call('group.create', {
+      name: `e2ee-thought-${rid}`, visibility: 'public', join_mode: 'open',
+    }) as JsonObject;
+    const groupId = String((created.group as JsonObject).group_id);
+    const epoch1 = await waitForCommittedGroupEpochReady(owner, groupId, 1, 30_000);
+
+    // 2. Bob 加入
+    const joinResult = await bob.call('group.request_join', { group_id: groupId }) as JsonObject;
+    expect(joinResult.status).toBe('joined');
+    const epoch2 = await waitForCommittedGroupEpochGreaterThan(bob, groupId, epoch1, 30_000);
+    await waitForCommittedGroupEpochReady(owner, groupId, epoch2, 20_000);
+
+    // 3. Owner 下线，Charlie 加入推进 epoch
+    await owner.close();
+    await new Promise(r => setTimeout(r, 500));
+    const charlieJoin = await charlie.call('group.request_join', { group_id: groupId }) as JsonObject;
+    expect(charlieJoin.status).toBe('joined');
+    const epoch3 = await waitForCommittedGroupEpochGreaterThan(bob, groupId, epoch2, 30_000);
+    await waitForCommittedGroupEpochReady(charlie, groupId, epoch3, 20_000);
+
+    // 4. Bob 写 thought
+    const thoughtText = `thought-recover-${rid}`;
+    const thoughtContext = { type: 'run', id: `thought-run-${rid}` };
+    await bob.call('group.thought.put', {
+      group_id: groupId,
+      context: thoughtContext,
+      payload: { type: 'thought', text: thoughtText },
+    });
+
+    // 5. Owner 重新上线，读取 thought — thought.get 内部会触发 epoch key 恢复后解密
+    const owner2 = new AUNClient({ aun_path: ownerPath });
+    ((owner2 as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+    clients.push(owner2);
+    await ensureConnected(owner2, ownerAid);
+
+    const result = await owner2.call('group.thought.get', {
+      group_id: groupId,
+      sender_aid: bobAid,
+      context: thoughtContext,
+    }) as JsonObject;
+    const thoughts = Array.isArray(result.thoughts) ? result.thoughts : [];
+    const decrypted = thoughts.find((item: any) =>
+      item?.e2ee?.encryption_mode === 'epoch_group_key' &&
+      item?.payload?.text === thoughtText
+    );
+    expect(decrypted, 'Owner 重连后应解密 thought').toBeTruthy();
+  }, TEST_TIMEOUT);
 });

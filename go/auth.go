@@ -83,13 +83,13 @@ type ocspCacheEntry struct {
 
 // AuthFlowConfig AuthFlow 配置
 type AuthFlowConfig struct {
-	Keystore          keystore.KeyStore  // 密钥存储后端
-	Crypto            *CryptoProvider    // 加密操作提供者
-	AID               string             // 当前 Agent ID
-	ConnectionFactory ConnectionFactory  // 可选的 WebSocket 连接工厂
-	RootCAPath        string             // 自定义根证书路径
-	ChainCacheTTL     int                // 证书链缓存 TTL（秒），默认 86400
-	VerifySSL         bool               // 是否验证 TLS 证书，默认 true
+	Keystore          keystore.KeyStore // 密钥存储后端
+	Crypto            *CryptoProvider   // 加密操作提供者
+	AID               string            // 当前 Agent ID
+	ConnectionFactory ConnectionFactory // 可选的 WebSocket 连接工厂
+	RootCAPath        string            // 自定义根证书路径
+	ChainCacheTTL     int               // 证书链缓存 TTL（秒），默认 86400
+	VerifySSL         bool              // 是否验证 TLS 证书，默认 true
 }
 
 // ── AuthFlow 认证流程管理 ────────────────────────────────────
@@ -1572,9 +1572,21 @@ func (a *AuthFlow) loadRootCerts(rootCAPath string) []*x509.Certificate {
 	return certs
 }
 
-// loadTrustedRoots 返回已加载的受信根证书列表
+// loadTrustedRoots 返回已加载的受信根证书列表（空时自动 fallback 重试一次磁盘加载）
 func (a *AuthFlow) loadTrustedRoots() []*x509.Certificate {
+	if len(a.rootCerts) == 0 {
+		// fallback: 证书可能在构造之后才写入磁盘，重新加载一次
+		a.rootCerts = a.loadRootCerts(a.rootCAPath)
+	}
 	return a.rootCerts
+}
+
+// ReloadTrustedRoots 重新从磁盘加载信任根证书，供导入新根证书后刷新使用。
+func (a *AuthFlow) ReloadTrustedRoots() int {
+	a.rootCerts = a.loadRootCerts(a.rootCAPath)
+	a.gatewayCAVerified = make(map[string]bool)
+	a.chainVerifiedCache = make(map[string]float64)
+	return len(a.rootCerts)
 }
 
 // ── 静态辅助函数（auth 模块私有）────────────────────────────
@@ -1710,6 +1722,7 @@ func authRememberTokens(identity map[string]any, authResult map[string]any) {
 	}
 
 	// 计算过期时间
+	expiryRecorded := false
 	if expiresIn, ok := authResult["expires_in"]; ok {
 		var seconds float64
 		switch v := expiresIn.(type) {
@@ -1722,7 +1735,11 @@ func authRememberTokens(identity map[string]any, authResult map[string]any) {
 		}
 		if seconds > 0 {
 			identity["access_token_expires_at"] = int(float64(time.Now().Unix()) + seconds)
+			expiryRecorded = true
 		}
+	}
+	if !expiryRecorded && accessToken != "" {
+		identity["access_token_expires_at"] = int(time.Now().Unix()) + 3600
 	}
 
 	// 暂存 new_cert，由 validateNewCert 验证后正式接受

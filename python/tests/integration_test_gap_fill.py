@@ -17,6 +17,7 @@ import asyncio
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -74,9 +75,14 @@ def _fail(name: str, reason: str):
 # 辅助
 # ---------------------------------------------------------------------------
 
-def _make_client() -> AUNClient:
+def _build_test_slot_id(tag: str) -> str:
+    return f"gap-fill-{tag}-{uuid.uuid4().hex[:12]}"
+
+
+def _make_client(tag: str = "client") -> AUNClient:
     client = AUNClient({"aun_path": _TEST_AUN_PATH})
     client._config_model.require_forward_secrecy = False
+    client._test_slot_id = _build_test_slot_id(tag)
     return client
 
 
@@ -85,7 +91,12 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
     if local is None:
         await client.auth.create_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth)
+    connect_params = dict(auth)
+    slot_id = str(getattr(client, "_test_slot_id", "") or "")
+    if slot_id:
+        connect_params["slot_id"] = slot_id
+    connect_params["auto_reconnect"] = False
+    await client.connect(connect_params)
     return aid
 
 
@@ -102,12 +113,13 @@ async def _sdk_send(client: AUNClient, to_aid: str, payload: str):
     })
 
 
-async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: int = 0, timeout: float = 5.0):
-    """等待推送或主动拉取"""
+def _subscribe_push_after(client: AUNClient, from_aid: str, *, after_seq: int = 0):
     inbox = []
     event = asyncio.Event()
 
     def handler(data):
+        if not isinstance(data, dict):
+            return
         if data.get("from") != from_aid:
             return
         if _seq_of(data) <= after_seq:
@@ -116,17 +128,58 @@ async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: i
         event.set()
 
     sub = client.on("message.received", handler)
-    try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        pass
-    sub.unsubscribe()
+    return inbox, event, sub
 
-    if not inbox:
+
+async def _wait_for_messages_after(
+    client: AUNClient,
+    from_aid: str,
+    *,
+    after_seq: int = 0,
+    min_count: int = 1,
+    timeout: float = 5.0,
+    inbox: list[dict] | None = None,
+    event: asyncio.Event | None = None,
+):
+    """等待已订阅的推送消息，数量不足时再主动拉取兜底。"""
+    own_sub = None
+    if inbox is None or event is None:
+        inbox, event, own_sub = _subscribe_push_after(client, from_aid, after_seq=after_seq)
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while len(inbox) < min_count:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        event.clear()
+        if len(inbox) >= min_count:
+            break
+        try:
+            await asyncio.wait_for(event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+
+    if own_sub is not None:
+        own_sub.unsubscribe()
+
+    all_msgs = list(inbox)
+    if len(all_msgs) < min_count:
         result = await client.call("message.pull", {"after_seq": after_seq, "limit": 50})
-        inbox.extend(m for m in result.get("messages", []) if m.get("from") == from_aid)
+        all_msgs.extend(m for m in result.get("messages", []) if m.get("from") == from_aid)
 
-    return sorted(inbox, key=_seq_of)
+    by_seq = {}
+    for msg in all_msgs:
+        seq = _seq_of(msg)
+        if seq > after_seq:
+            by_seq[seq] = msg
+    return [by_seq[seq] for seq in sorted(by_seq)]
+
+
+async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: int = 0, timeout: float = 5.0):
+    """等待推送或主动拉取"""
+    return await _wait_for_messages_after(
+        client, from_aid, after_seq=after_seq, min_count=1, timeout=timeout,
+    )
 
 
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
@@ -152,8 +205,8 @@ async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
 
 async def test_p2p_payload_gap_fill():
     """测试 P2P 消息 payload gap 自动补洞"""
-    alice = _make_client()
-    bob = _make_client()
+    alice = _make_client("p2p-alice")
+    bob = _make_client("p2p-bob")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
@@ -163,24 +216,34 @@ async def test_p2p_payload_gap_fill():
         baseline_seq = await _current_max_seq(bob)
         print(f"  [INFO] 基线 seq={baseline_seq}")
 
+        inbox, event, sub = _subscribe_push_after(bob, _ALICE_AID, after_seq=baseline_seq)
+
         # 1. Alice 发送 5 条消息给 Bob
-        await _sdk_send(alice, _BOB_AID, "msg1")
-        await asyncio.sleep(0.3)
-        await _sdk_send(alice, _BOB_AID, "msg2")
-        await asyncio.sleep(0.3)
-        await _sdk_send(alice, _BOB_AID, "msg3")
-        await asyncio.sleep(0.3)
-        await _sdk_send(alice, _BOB_AID, "msg4")
-        await asyncio.sleep(0.3)
-        await _sdk_send(alice, _BOB_AID, "msg5")
+        try:
+            await _sdk_send(alice, _BOB_AID, "msg1")
+            await asyncio.sleep(0.3)
+            await _sdk_send(alice, _BOB_AID, "msg2")
+            await asyncio.sleep(0.3)
+            await _sdk_send(alice, _BOB_AID, "msg3")
+            await asyncio.sleep(0.3)
+            await _sdk_send(alice, _BOB_AID, "msg4")
+            await asyncio.sleep(0.3)
+            await _sdk_send(alice, _BOB_AID, "msg5")
 
-        # 2. 等待服务端处理
-        await asyncio.sleep(2.0)
+            # 2. Bob 在线时优先通过 push 收集；pull 只处理离线/延迟投递兜底
+            all_msgs = await _wait_for_messages_after(
+                bob,
+                _ALICE_AID,
+                after_seq=baseline_seq,
+                min_count=5,
+                timeout=5.0,
+                inbox=inbox,
+                event=event,
+            )
+        finally:
+            sub.unsubscribe()
 
-        # 3. Bob 拉取基线之后的所有消息
-        all_msgs = await _sdk_recv_push_after(bob, _ALICE_AID, after_seq=baseline_seq, timeout=3.0)
-
-        # 4. 验证：应该收到 5 条消息，seq 连续
+        # 3. 验证：应该收到 5 条消息，seq 连续
         if len(all_msgs) < 5:
             _fail("p2p_payload_gap_fill", f"期望至少 5 条消息，实际 {len(all_msgs)} 条")
             return
@@ -209,9 +272,9 @@ async def test_p2p_payload_gap_fill():
 
 async def test_group_payload_gap_fill():
     """测试群消息 payload gap 自动补洞"""
-    alice = _make_client()
-    bob = _make_client()
-    carol = _make_client()
+    alice = _make_client("group-alice")
+    bob = _make_client("group-bob")
+    carol = _make_client("group-carol")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)

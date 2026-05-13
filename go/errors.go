@@ -159,9 +159,9 @@ func NewConnectionError(msg string, opts ...ErrorOption) *ConnectionError {
 	return e
 }
 
-// NewTimeoutError 创建超时错误（默认可重试）
+// NewTimeoutError 创建超时错误（P2-06: 默认不可重试，避免非幂等操作重复执行）
 func NewTimeoutError(msg string, opts ...ErrorOption) *TimeoutError {
-	e := &TimeoutError{AUNError{Message: msg, Code: -1, Retryable: true}}
+	e := &TimeoutError{AUNError{Message: msg, Code: -1, Retryable: false}}
 	for _, opt := range opts {
 		opt(&e.AUNError)
 	}
@@ -426,7 +426,7 @@ func MapRemoteError(errMap map[string]any) error {
 
 	// 按错误码创建对应类型的错误
 	switch {
-	case code == 4001 || code == 4010 || code == -32003:
+	case code == -32001 || code == 4001 || code == 4010 || code == -32003:
 		return &AuthError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
 
 	case code == 4030 || code == 403 || code == -32004: // -32004 = PERMISSION_DENIED
@@ -460,6 +460,22 @@ func MapRemoteError(errMap map[string]any) error {
 
 	case code >= -33009 && code <= -33004:
 		return &GroupError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}
+
+	// E2EE 错误码映射（-32040 ~ -32044, -32050, -32051）
+	case code == -32040:
+		return &E2EEGroupSecretMissingError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_SECRET_MISSING"}}
+	case code == -32041:
+		return &E2EEGroupEpochMismatchError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_EPOCH_MISMATCH"}}
+	case code == -32042:
+		return &E2EEGroupCommitmentInvalidError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_COMMITMENT_INVALID"}}
+	case code == -32043:
+		return &E2EEGroupNotMemberError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_NOT_MEMBER"}}
+	case code == -32044:
+		return &E2EEGroupDecryptFailedError{E2EEError{AUNError: AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}, LocalCode: "E2EE_GROUP_DECRYPT_FAILED"}}
+	case code == -32050:
+		return &CertificateRevokedError{AuthError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}}
+	case code == -32051:
+		return &ClientSignatureError{ValidationError{AUNError{Message: message, Code: code, Data: data, Retryable: false, TraceID: traceID}}}
 
 	default:
 		// 5000 <= code < 6000 为可重试的服务端错误

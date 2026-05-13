@@ -170,6 +170,8 @@ content = base64.b64decode(result["content"])
 
 列出对象。
 
+> 权限：仅允许查询自己的对象（`owner_aid` 默认为当前用户，不可指定他人的 AID）
+
 ### 参数
 
 | 参数 | 类型 | 必填 | 说明 |
@@ -220,6 +222,8 @@ for obj in result["items"]:
 ## storage.list_prefixes
 
 列出直接子目录（前缀）。
+
+> 权限：仅允许查询自己的对象（`owner_aid` 默认为当前用户，不可指定他人的 AID）
 
 ### 参数
 
@@ -389,4 +393,4 @@ for obj in result["items"]:
 | `owner_aid` | string | 对象所有者 AID |
 | `object_key` | string | 对象路径 |
 
-> 当前实现只在 `storage.put_object` 成功后推送 `action="put"`，以及 `storage.delete_object` 返回 `deleted=true` 时推送 `action="delete"`。`complete_upload` 当前不会自动发布该事件。
+> 当前实现在 `storage.put_object` 成功后推送 `action="put"`，`storage.delete_object` 返回 `deleted=true` 时推送 `action="delete"`，`storage.complete_upload` 成功后也会推送 `action="put"` 事件。

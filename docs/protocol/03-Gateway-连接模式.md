@@ -64,7 +64,7 @@ WebSocket 连接建立
   ← challenge（服务端推送 nonce）
   → auth.aid_login1 (可选，已有 token 时跳过)
   → auth.aid_login2 (可选)
-  → auth.connect(nonce, auth, protocol, device, client, delivery_mode)
+  → auth.connect(nonce, auth, protocol, device, client, delivery_mode, capabilities)
   ← {status: "ok", protocol, identity, ...}
   → READY，进入 Gateway 业务态
 ```
@@ -104,6 +104,15 @@ WebSocket 连接建立
 - 顶层 `nonce` 与 `auth.nonce` 语义不同：前者是 Gateway challenge nonce，后者仅 `aid` 模式使用，来自 `auth.aid_login1`
 - `aid` 模式的 `auth.signature` 由客户端对 `auth.nonce` 进行签名；裸 WebSocket 客户端若先获取了 JWT access_token，也可直接改用 `kite_token` 模式连接
 
+**协议版本与能力语义**：
+
+- `protocol.min/max` 在 `auth.connect` 阶段参与 Gateway 会话的协议版本协商。Gateway 将客户端版本范围与服务端支持范围取交集，并选择交集中的最高版本作为响应字段 `protocol`。
+- 若双方版本范围没有交集，Gateway 返回 JSON-RPC 错误 `-32000`，错误数据包含 `server_range` 和 `client_range`，随后关闭 WebSocket 连接。
+- 当前 Gateway 为兼容旧客户端，会把缺失的 `protocol.min/max` 按 `"1.0"` 处理；新客户端仍应显式发送 `protocol: {"min": "1.0", "max": "1.0"}`。
+- `auth.connect.params.capabilities` 是**客户端能力声明**，绑定到当前连接。Gateway 会把它记录到会话，并通过 `client.online` 事件转发给业务服务。
+- `hello-ok.result.capabilities` 是**服务端能力公告**，表示 Gateway/服务端当前暴露的命名空间和功能，不是对客户端能力取交集后的结果。
+- 因此当前机制应描述为“协议版本协商 + 客户端能力声明 + 服务端能力公告”。除非某个扩展明确规定交集规则，否则不要把 `capabilities` 理解为完整的双向能力协商。
+
 **连接约束**：
 
 - 未传 `device.id` 的客户端按 legacy 语义处理，不支持多实例槽位。
@@ -119,6 +128,8 @@ WebSocket 连接建立
 |------|------|------|
 | `e2ee` | boolean | 是否支持 P2P E2EE（接收和发送） |
 | `group_e2ee` | boolean | 是否支持群组 E2EE（接收、解密、密钥协议处理）。所有现代客户端必须声明为 `true` |
+
+当前 Group 服务会读取 `client.online` 中的 `group_e2ee`，用于本域客户端入群、加人等流程的准入检查。跨域客户端的能力声明不会随 `client.online` 跨域传播，服务端按跨域信任策略处理。
 
 请求示例：
 
@@ -137,6 +148,10 @@ WebSocket 连接建立
       "mode": "queue",
       "routing": "sender_affinity",
       "affinity_ttl_ms": 300000
+    },
+    "capabilities": {
+      "e2ee": true,
+      "group_e2ee": true
     }
   }
 }
@@ -176,7 +191,14 @@ WebSocket 连接建立
     "trust_level": "low",
     "connection": {"id": "conn_gateway-client-abc123", "device_id": "dev-001"},
     "bridgeInfo": {"name": "Kite Gateway", "version": "0.1"},
-    "capabilities": {}
+    "capabilities": {
+      "namespaces": ["auth", "message", "meta", "group", "storage", "stream"],
+      "features": {
+        "e2ee": false,
+        "binary_message": false,
+        "max_message_size": 1048576
+      }
+    }
   }
 }
 ```

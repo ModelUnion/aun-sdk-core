@@ -324,6 +324,115 @@ func TestPrekeyEncryptDecryptRoundtrip(t *testing.T) {
 	if e2ee["encryption_mode"] != ModePrekeyECDHV2 {
 		t.Errorf("e2ee 元数据 encryption_mode 不正确: %v", e2ee["encryption_mode"])
 	}
+	protectedHeaders, _ := e2ee["protected_headers"].(map[string]any)
+	if protectedHeaders["payload_type"] != "text" {
+		t.Fatalf("普通解密结果应回填 payload_type: %#v", e2ee)
+	}
+	if _, ok := e2ee["context"]; ok {
+		t.Fatalf("普通解密结果不应包含 context: %#v", e2ee)
+	}
+}
+
+func TestOptionalMetadataBoundWithIndependentAuth(t *testing.T) {
+	sender, receiver, senderAID, receiverAID, _, _, _, receiverCertPEM := testMakeE2EEPair(t)
+	payload := map[string]any{"type": "text", "text": "metadata bound"}
+	messageID := "test-msg-metadata"
+	ts := time.Now().UnixMilli()
+	context := map[string]any{"type": "thought", "id": "ctx-1"}
+
+	headers, err := NewProtectedHeaders(map[string]any{"Device_ID": "dev-a", "slot_id": "slot-a"})
+	if err != nil {
+		t.Fatalf("创建 protected headers 失败: %v", err)
+	}
+	envelope, _, err := sender.EncryptOutbound(
+		receiverAID, payload, []byte(receiverCertPEM), nil, messageID, ts,
+		E2EEEncryptOptions{ProtectedHeaders: headers, Context: context},
+	)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	if _, ok := envelope["payload_type"]; ok {
+		t.Fatalf("payload_type 不应写入信封顶层: %#v", envelope)
+	}
+	gotHeaders, _ := envelope["protected_headers"].(map[string]any)
+	if gotHeaders["payload_type"] != "text" || gotHeaders["device_id"] != "dev-a" || gotHeaders["slot_id"] != "slot-a" {
+		t.Fatalf("protected_headers 未规范化: %#v", envelope["protected_headers"])
+	}
+	auth, _ := gotHeaders["_auth"].(map[string]any)
+	if auth["alg"] != metadataAuthAlg || auth["tag"] == "" {
+		t.Fatalf("protected_headers 缺少 _auth: %#v", gotHeaders)
+	}
+	aad := envelope["aad"].(map[string]any)
+	if _, ok := aad["payload_type"]; ok {
+		t.Fatalf("payload_type 不应写入 AAD: %#v", aad)
+	}
+	if _, ok := aad["protected_headers"]; ok {
+		t.Fatalf("protected_headers 不应写入 AAD: %#v", aad)
+	}
+	if _, ok := aad["context_type"]; ok {
+		t.Fatalf("context 不应写入 AAD: %#v", aad)
+	}
+	protectedContext, _ := envelope["context"].(map[string]any)
+	if protectedContext["type"] != "thought" || protectedContext["id"] != "ctx-1" {
+		t.Fatalf("context 未写入信封: %#v", envelope["context"])
+	}
+	contextAuth, _ := protectedContext["_auth"].(map[string]any)
+	if contextAuth["alg"] != metadataAuthAlg || contextAuth["tag"] == "" {
+		t.Fatalf("context 缺少 _auth: %#v", protectedContext)
+	}
+
+	message := map[string]any{
+		"from":       senderAID,
+		"to":         receiverAID,
+		"message_id": messageID,
+		"timestamp":  ts,
+		"payload":    envelope,
+		"encrypted":  true,
+		"context":    context,
+	}
+	decrypted, err := receiver.decryptMessage(message)
+	if err != nil || decrypted == nil {
+		t.Fatalf("带可选元数据的消息应解密成功: result=%#v err=%v", decrypted, err)
+	}
+	e2ee, _ := decrypted["e2ee"].(map[string]any)
+	protectedHeaders, _ := e2ee["protected_headers"].(map[string]any)
+	if protectedHeaders["payload_type"] != "text" || protectedHeaders["device_id"] != "dev-a" || protectedHeaders["slot_id"] != "slot-a" {
+		t.Fatalf("解密结果 e2ee.protected_headers 未回填: %#v", e2ee)
+	}
+	if _, ok := protectedHeaders["_auth"]; ok {
+		t.Fatalf("解密结果不应暴露 protected_headers._auth: %#v", protectedHeaders)
+	}
+	decryptedContext, _ := e2ee["context"].(map[string]any)
+	if decryptedContext["type"] != "thought" || decryptedContext["id"] != "ctx-1" {
+		t.Fatalf("解密结果 e2ee.context 未回填: %#v", e2ee)
+	}
+	if _, ok := decryptedContext["_auth"]; ok {
+		t.Fatalf("解密结果不应暴露 context._auth: %#v", decryptedContext)
+	}
+
+	tamperedHeaders := copyMapShallow(message)
+	tamperedPayload := copyMapShallow(envelope)
+	tamperedProtectedHeaders := copyMapShallow(gotHeaders)
+	tamperedProtectedHeaders["device_id"] = "dev-b"
+	tamperedPayload["protected_headers"] = tamperedProtectedHeaders
+	tamperedHeaders["payload"] = tamperedPayload
+	if decrypted, err := receiver.decryptMessage(tamperedHeaders); err == nil || decrypted != nil {
+		t.Fatalf("篡改 protected_headers 应解密失败: result=%#v err=%v", decrypted, err)
+	}
+
+	missingAuth := copyMapShallow(message)
+	missingAuthPayload := copyMapShallow(envelope)
+	missingAuthPayload["protected_headers"] = map[string]any{"payload_type": "text", "device_id": "dev-a", "slot_id": "slot-a"}
+	missingAuth["payload"] = missingAuthPayload
+	if decrypted, err := receiver.decryptMessage(missingAuth); err == nil || decrypted != nil {
+		t.Fatalf("删除 protected_headers._auth 应解密失败: result=%#v err=%v", decrypted, err)
+	}
+
+	tamperedContext := copyMapShallow(message)
+	tamperedContext["context"] = map[string]any{"type": "thought", "id": "ctx-2"}
+	if decrypted, err := receiver.decryptMessage(tamperedContext); err == nil || decrypted != nil {
+		t.Fatalf("篡改 context 应解密失败: result=%#v err=%v", decrypted, err)
+	}
 }
 
 func TestPrekeyEncryptRejectsCertFingerprintMismatch(t *testing.T) {
@@ -452,6 +561,104 @@ func TestEncryptOutboundNoPrekeyFallback(t *testing.T) {
 	}
 	if info["forward_secrecy"] != false {
 		t.Error("long_term_key 模式不应有前向保密")
+	}
+}
+
+// ── EncryptMessage 便利包装测试 ─────────────────────────
+
+// TestEncryptMessageWithPrekey 验证 EncryptMessage 在有 prekey 时使用 prekey 模式，
+// 并能被接收方正常解密。
+func TestEncryptMessageWithPrekey(t *testing.T) {
+	sender, receiver, senderAID, receiverAID, _, _, _, receiverCertPEM := testMakeE2EEPair(t)
+
+	prekey, err := receiver.GeneratePrekey()
+	if err != nil {
+		t.Fatalf("生成 prekey 失败: %v", err)
+	}
+
+	originalPayload := map[string]any{"type": "text", "text": "encrypt-message-prekey"}
+	envelope, info, err := sender.EncryptMessage(
+		receiverAID, originalPayload, []byte(receiverCertPEM), prekey,
+	)
+	if err != nil {
+		t.Fatalf("EncryptMessage 失败: %v", err)
+	}
+
+	if info["mode"] != ModePrekeyECDHV2 {
+		t.Errorf("有 prekey 时应使用 prekey_ecdh_v2: %v", info["mode"])
+	}
+	if info["forward_secrecy"] != true {
+		t.Error("prekey 模式应有前向保密")
+	}
+
+	// 信封 ciphertext 字段非空（注意：实际字段名为 ciphertext，无下划线）
+	ciphertext, ok := envelope["ciphertext"].(string)
+	if !ok || ciphertext == "" {
+		t.Errorf("信封 ciphertext 字段应非空: %v", envelope["ciphertext"])
+	}
+
+	// 接收方应能正常解密
+	// EncryptMessage 内部生成 messageID/timestamp，这里从 envelope 的 aad 中取出对齐
+	aad, ok := envelope["aad"].(map[string]any)
+	if !ok {
+		t.Fatal("信封缺少 aad 字段")
+	}
+	messageID, _ := aad["message_id"].(string)
+	var ts int64
+	switch v := aad["timestamp"].(type) {
+	case int64:
+		ts = v
+	case float64:
+		ts = int64(v)
+	default:
+		t.Fatalf("aad.timestamp 类型不识别: %T", aad["timestamp"])
+	}
+
+	message := map[string]any{
+		"from":       senderAID,
+		"to":         receiverAID,
+		"message_id": messageID,
+		"timestamp":  ts,
+		"payload":    envelope,
+		"encrypted":  true,
+	}
+	decrypted, err := receiver.DecryptMessage(message)
+	if err != nil {
+		t.Fatalf("接收方解密失败: %v", err)
+	}
+	payload, ok := decrypted["payload"].(map[string]any)
+	if !ok {
+		t.Fatal("解密后 payload 类型不正确")
+	}
+	if payload["text"] != "encrypt-message-prekey" {
+		t.Errorf("解密后 text 不正确: %v", payload["text"])
+	}
+}
+
+// TestEncryptMessageNoPrekeyFallback 验证 EncryptMessage 在无 prekey 时降级到 long_term_key。
+//
+// 注意：当调用方未传入 prekey 且本地缓存也无 prekey 时，EncryptOutbound 中
+// degraded := prekey != nil 计算结果为 false（"有 prekey 但失败了才算降级"），
+// 因此此处 degraded 期望值为 false，而非 true。
+func TestEncryptMessageNoPrekeyFallback(t *testing.T) {
+	sender, _, _, receiverAID, _, _, _, receiverCertPEM := testMakeE2EEPair(t)
+
+	_, info, err := sender.EncryptMessage(
+		receiverAID, map[string]any{"type": "text", "text": "encrypt-message-lt"},
+		[]byte(receiverCertPEM), nil,
+	)
+	if err != nil {
+		t.Fatalf("EncryptMessage 失败: %v", err)
+	}
+	if info["mode"] != ModeLongTermKey {
+		t.Errorf("无 prekey 时应降级到 long_term_key: %v", info["mode"])
+	}
+	if info["forward_secrecy"] != false {
+		t.Error("long_term_key 模式不应有前向保密")
+	}
+	// 调用方未提供 prekey 不算降级，degraded 应为 false
+	if info["degraded"] != false {
+		t.Errorf("未传入 prekey 时 degraded 应为 false: %v", info["degraded"])
 	}
 }
 

@@ -621,6 +621,28 @@ func (f *FileKeyStore) DeleteGroupSecretState(aid, groupID string) error {
 	return nil
 }
 
+func (f *FileKeyStore) SaveGroupState(aid, groupID string, stateVersion int64, stateHash string, keyEpoch int64, membershipJSON, policyJSON string) error {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return err
+	}
+	return db.SaveGroupState(groupID, stateVersion, stateHash, keyEpoch, membershipJSON, policyJSON)
+}
+
+func (f *FileKeyStore) LoadGroupState(aid, groupID string) (*GroupState, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return nil, err
+	}
+	return db.LoadGroupState(groupID)
+}
+
 // ── Instance State ───────────────────────────────────────────
 
 func (f *FileKeyStore) LoadInstanceState(aid, deviceID, slotID string) (map[string]any, error) {
@@ -831,4 +853,92 @@ func (f *FileKeyStore) LoadAllSeqs(aid, deviceID, slotID string) (map[string]int
 		return nil, err
 	}
 	return db.LoadAllSeqs(deviceID, slotID), nil
+}
+
+// ── TrustRootStore 实现 ─────────────────────────────────
+
+// TrustRootDir 返回信任根存储目录：{root}/CA/root/
+func (f *FileKeyStore) TrustRootDir() string {
+	return filepath.Join(f.root, "CA", "root")
+}
+
+// SaveTrustRoots 保存信任根列表到文件系统。
+// 写入 trust-roots.json（元数据）+ trust-roots.pem（合并 bundle）+ 每个根证书独立文件。
+func (f *FileKeyStore) SaveTrustRoots(trustList map[string]any, imported []map[string]string) (string, error) {
+	dir := f.TrustRootDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("创建信任根目录失败: %w", err)
+	}
+
+	// 写入每个根证书独立文件，同时构建 bundle
+	var bundleBuilder strings.Builder
+	for _, entry := range imported {
+		certPEM := entry["cert_pem"]
+		safeID := safeAID(entry["id"])
+		if safeID == "" || certPEM == "" {
+			continue
+		}
+		certPath := filepath.Join(dir, safeID+".crt")
+		tmpPath := certPath + ".tmp"
+		if err := os.WriteFile(tmpPath, []byte(certPEM), 0o644); err != nil {
+			return "", fmt.Errorf("写入根证书 %s 失败: %w", safeID, err)
+		}
+		if err := safeRename(tmpPath, certPath); err != nil {
+			os.Remove(tmpPath)
+			return "", fmt.Errorf("重命名根证书 %s 失败: %w", safeID, err)
+		}
+		bundleBuilder.WriteString(certPEM)
+		if !strings.HasSuffix(certPEM, "\n") {
+			bundleBuilder.WriteByte('\n')
+		}
+	}
+
+	// 写入合并 bundle
+	bundlePath := filepath.Join(dir, "trust-roots.pem")
+	tmpBundle := bundlePath + ".tmp"
+	if err := os.WriteFile(tmpBundle, []byte(bundleBuilder.String()), 0o644); err != nil {
+		return "", fmt.Errorf("写入 trust-roots.pem 失败: %w", err)
+	}
+	if err := safeRename(tmpBundle, bundlePath); err != nil {
+		os.Remove(tmpBundle)
+		return "", fmt.Errorf("重命名 trust-roots.pem 失败: %w", err)
+	}
+
+	// 写入元数据 JSON
+	metaPath := filepath.Join(dir, "trust-roots.json")
+	metaData, err := json.MarshalIndent(trustList, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("序列化 trust-roots.json 失败: %w", err)
+	}
+	tmpMeta := metaPath + ".tmp"
+	if err := os.WriteFile(tmpMeta, metaData, 0o644); err != nil {
+		return "", fmt.Errorf("写入 trust-roots.json 失败: %w", err)
+	}
+	if err := safeRename(tmpMeta, metaPath); err != nil {
+		os.Remove(tmpMeta)
+		return "", fmt.Errorf("重命名 trust-roots.json 失败: %w", err)
+	}
+
+	return bundlePath, nil
+}
+
+// SaveIssuerRootCert 保存 Issuer 根证书到 {root}/CA/root/issuers/{safeIssuer}.root.crt。
+func (f *FileKeyStore) SaveIssuerRootCert(issuer, certPEM, fingerprint string) (string, string, error) {
+	dir := filepath.Join(f.TrustRootDir(), "issuers")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", fmt.Errorf("创建 issuer 目录失败: %w", err)
+	}
+
+	safeIssuer := safeAID(issuer)
+	certPath := filepath.Join(dir, safeIssuer+".root.crt")
+	tmpPath := certPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(certPEM), 0o644); err != nil {
+		return "", "", fmt.Errorf("写入 issuer 根证书失败: %w", err)
+	}
+	if err := safeRename(tmpPath, certPath); err != nil {
+		os.Remove(tmpPath)
+		return "", "", fmt.Errorf("重命名 issuer 根证书失败: %w", err)
+	}
+
+	return certPath, fingerprint, nil
 }

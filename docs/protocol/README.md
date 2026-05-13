@@ -29,7 +29,7 @@ AUN 是 ACP 协议的 2.0 版本，采用 WebSocket + JSON-RPC 2.0 定义 Agent 
 | 文档 | 命名空间 | 内容 |
 |------|---------|------|
 | [01-身份与凭证协议-auth.md](01-身份与凭证协议-auth.md) | `auth.*` | AID 创建、两阶段登录、证书生命周期、JWT Token 机制 |
-| [03-Gateway-连接模式.md](03-Gateway-连接模式.md) | `initialize` | Gateway 模式连接流程、initialize 握手、心跳重连 |
+| [03-Gateway-连接模式.md](03-Gateway-连接模式.md) | `auth.connect` | Gateway 模式连接流程、auth.connect 握手、心跳重连 |
 | [04-Peer-子协议.md](04-Peer-子协议.md) | `peer.*` | 对等认证四步握手、证书链验证、nonce 签名规则 |
 | [05-Relay-子协议.md](05-Relay-子协议.md) | `relay.*` | 中继注册与转发、透明封装、与 peer.* 的关系 |
 

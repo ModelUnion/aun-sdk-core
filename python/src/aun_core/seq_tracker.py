@@ -151,6 +151,8 @@ class SeqTracker:
         pulled_seqs: set[int] = set()
         for m in pulled_messages:
             s = m.get("seq")
+            if not (isinstance(s, int) and s > 0):
+                s = m.get("event_seq")
             if isinstance(s, int) and s > 0:
                 pulled_seqs.add(s)
 

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { AUNClient } from '../../src/client.js';
+import { buildIdentity, generateECKeypair } from './helpers.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -133,5 +134,83 @@ describe('AuthNamespace agent.md', () => {
 
     await assertion;
     vi.useRealTimers();
+  });
+
+  it('signAgentMd 应在尾部追加签名块并保留原 payload', async () => {
+    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity('alice.agentid.pub', privateKey);
+    (client as any)._aid = identity.aid;
+    (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
+
+    const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
+    const signed = await client.auth.signAgentMd(payload);
+
+    expect(signed.startsWith(payload)).toBe(true);
+    expect(signed).toContain('<!-- AUN-SIGNATURE');
+    expect(signed).toMatch(/signature: [A-Za-z0-9+/=]+/);
+    expect(signed).toMatch(/-->\s*$/);
+  });
+
+  it('verifyAgentMd 应返回 unsigned / verified / invalid 三态', async () => {
+    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity('alice.agentid.pub', privateKey);
+    (client as any)._aid = identity.aid;
+    (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
+
+    const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
+    const signed = await client.auth.signAgentMd(payload);
+
+    const unsigned = await client.auth.verifyAgentMd(payload);
+    expect(unsigned.status).toBe('unsigned');
+    expect(unsigned.verified).toBe(false);
+
+    const verified = await client.auth.verifyAgentMd(signed, {
+      aid: identity.aid,
+      certPem: identity.cert,
+    });
+    expect(verified.status).toBe('verified');
+    expect(verified.verified).toBe(true);
+    expect(verified.payload).toBe(payload);
+
+    const tampered = signed.replace('Alice', 'Mallory');
+    const invalid = await client.auth.verifyAgentMd(tampered, {
+      aid: identity.aid,
+      certPem: identity.cert,
+    });
+    expect(invalid.status).toBe('invalid');
+    expect(invalid.verified).toBe(false);
+  });
+
+  it('verifyAgentMd 应在未传 certPem 时回退 _fetchPeerCert', async () => {
+    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity('alice.agentid.pub', privateKey);
+    (client as any)._aid = identity.aid;
+    (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
+    (client as any)._fetchPeerCert = vi.fn().mockResolvedValue(identity.cert);
+
+    const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
+    const signed = await client.auth.signAgentMd(payload);
+    const verified = await client.auth.verifyAgentMd(signed, { aid: identity.aid });
+
+    expect(verified.status).toBe('verified');
+    expect((client as any)._fetchPeerCert).toHaveBeenCalledTimes(1);
+  });
+
+  it('signAgentMd 重新签名时应替换已有签名块', async () => {
+    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const { privateKey } = generateECKeypair();
+    const identity = buildIdentity('alice.agentid.pub', privateKey);
+    (client as any)._aid = identity.aid;
+    (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
+
+    const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
+    const signedOnce = await client.auth.signAgentMd(payload);
+    const signedTwice = await client.auth.signAgentMd(signedOnce);
+
+    expect(signedTwice.match(/<!-- AUN-SIGNATURE/g)?.length).toBe(1);
+    expect(signedTwice.startsWith(payload)).toBe(true);
   });
 });

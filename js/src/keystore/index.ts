@@ -115,4 +115,27 @@ export interface KeyStore {
   listIdentities?(): Promise<string[]>;
   /** 加载身份元数据（可选） */
   loadMetadata?(aid: string): Promise<Record<string, unknown> | null>;
+
+  /** 保存信任根列表和根证书，返回 bundle 标识 */
+  saveTrustRoots?(trustList: Record<string, unknown>, rootCerts: Array<{ id?: string; cert_pem: string; fingerprint_sha256?: string }>): Promise<string>;
+  /** 保存 issuer 根证书并合并到 bundle，返回 [证书标识, bundle 标识] */
+  saveIssuerRootCert?(issuer: string, certPem: string, fingerprintSha256?: string): Promise<[string, string]>;
+  /** 加载已存储的信任根列表 JSON */
+  loadTrustRoots?(): Promise<Record<string, unknown> | null>;
+
+  /** 保存群组状态快照 */
+  saveGroupState?(groupId: string, state: GroupStateRecord): Promise<void>;
+  /** 加载群组状态快照 */
+  loadGroupState?(groupId: string): Promise<GroupStateRecord | null>;
+}
+
+/** 群组状态记录 */
+export interface GroupStateRecord {
+  group_id: string;
+  state_version: number;
+  state_hash: string;
+  key_epoch: number;
+  membership_json: string;
+  policy_json: string;
+  updated_at: number;
 }

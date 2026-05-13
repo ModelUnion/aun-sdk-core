@@ -3,9 +3,20 @@
 // 此处测试可独立验证的构造、配置和状态管理逻辑。
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { AUNClient } from '../../src/client.js';
 import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
+import { ProtectedHeaders } from '../../src/e2ee.js';
+
+describe('AUNClient peer 证书缓存', () => {
+  it('TTL 应为 3600 秒', () => {
+    const source = readFileSync(join(process.cwd(), 'src', 'client.ts'), 'utf8');
+    expect(source).toContain('const PEER_CERT_CACHE_TTL = 3600;');
+    expect(source).toContain('const PEER_PREKEYS_CACHE_TTL = 3600;');
+  });
+});
 
 describe('AUNClient 构造', () => {
   it('无参数构造应使用默认配置', () => {
@@ -269,15 +280,20 @@ describe('AUNClient message.send 接收者校验', () => {
       affinity_ttl_ms: 900,
     };
     (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+    const protectedHeaders = new ProtectedHeaders({ Device_ID: 'dev-a', slot_id: 'slot-a' });
 
     await client.call('message.send', {
       to: 'bob.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
+      protected_headers: protectedHeaders,
+      headers: { device_id: 'dev-b' },
     });
 
     const [, sentParams] = (client as any)._transport.call.mock.calls[0];
     expect(sentParams.delivery_mode).toBeUndefined();
+    expect(sentParams.protected_headers).toBeUndefined();
+    expect(sentParams.headers).toBeUndefined();
   });
 
   it('message.pull 自动注入当前实例 device_id/slot_id', async () => {
@@ -378,6 +394,54 @@ describe('AUNClient._fetchPeerPrekey', () => {
     await expect((client as any)._fetchPeerPrekey('bob.example.com')).rejects.toThrow(
       'invalid prekey response for bob.example.com',
     );
+  });
+
+  it('单条空 device_id 应回退到固定值', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      device_prekeys: [{
+        device_id: '',
+        prekey_id: 'pk-legacy',
+        public_key: 'pub-legacy',
+        signature: 'sig-legacy',
+      }],
+    });
+
+    await expect((client as any)._fetchPeerPrekey('bob.example.com')).resolves.toMatchObject({
+      device_id: 'aun_device_id',
+      prekey_id: 'pk-legacy',
+    });
+  });
+
+  it('多条 device_prekeys 中空 device_id 应被过滤', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      device_prekeys: [
+        { device_id: '', prekey_id: 'pk-empty', public_key: 'pub-empty', signature: 'sig-empty' },
+        { device_id: 'device-b', prekey_id: 'pk-b', public_key: 'pub-b', signature: 'sig-b' },
+      ],
+    });
+
+    await expect((client as any)._fetchPeerPrekeys('bob.example.com')).resolves.toEqual([
+      expect.objectContaining({ device_id: 'device-b', prekey_id: 'pk-b' }),
+    ]);
+  });
+
+  it('多条 device_prekeys 中 aun_device_id 占位项应被过滤', async () => {
+    const client = new AUNClient();
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      device_prekeys: [
+        { device_id: 'aun_device_id', prekey_id: 'pk-legacy', public_key: 'pub-legacy', signature: 'sig-legacy' },
+        { device_id: 'device-b', prekey_id: 'pk-b', public_key: 'pub-b', signature: 'sig-b' },
+      ],
+    });
+
+    await expect((client as any)._fetchPeerPrekeys('bob.example.com')).resolves.toEqual([
+      expect.objectContaining({ device_id: 'device-b', prekey_id: 'pk-b' }),
+    ]);
   });
 });
 
@@ -633,7 +697,31 @@ describe('AUNClient M25 重连行为', () => {
     }
   });
 
-  it('心跳连续 2 次失败才触发断线处理', async () => {
+  it('heartbeat_interval=0 不启动心跳', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      (client as any)._state = 'connected';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 0,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.5, max_delay: 30, max_attempts: 0 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.call = vi.fn().mockResolvedValue({ pong: true });
+
+      (client as any)._startHeartbeat();
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect((client as any)._heartbeatTimer).toBeNull();
+      expect((client as any)._transport.call).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('正数 heartbeat_interval 小于 30 秒时按 30 秒调度', async () => {
     vi.useFakeTimers();
     try {
       const client = new AUNClient();
@@ -649,12 +737,18 @@ describe('AUNClient M25 重连行为', () => {
       const disconnectSpy = vi.spyOn(client as any, '_handleTransportDisconnect').mockResolvedValue(undefined);
 
       (client as any)._startHeartbeat();
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(29_999);
       await Promise.resolve();
+      expect((client as any)._transport.call).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      expect((client as any)._transport.call).toHaveBeenCalledTimes(1);
       expect(disconnectSpy).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(30_000);
       await Promise.resolve();
+      expect((client as any)._transport.call).toHaveBeenCalledTimes(2);
       expect(disconnectSpy).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
@@ -985,12 +1079,26 @@ describe('R3: 解密失败不应将密文 publish 给应用层', () => {
 
     const msgs = [
       { group_id: 'g1', from: 'a', seq: 1, payload: { type: 'e2ee.group_encrypted', epoch: 1, ciphertext: 'X' } },
-      { group_id: 'g1', from: 'b', seq: 2, payload: { type: 'text', text: 'hello' } },
+      { group_id: 'g1', from: 'b', seq: 2, dispatch_mode: 'mention', payload: { type: 'text', text: 'hello' } },
     ];
     const result = await (client as any)._decryptGroupMessages(msgs);
 
     expect(result.length).toBe(1);
     expect(result[0].payload.type).toBe('text');
+    expect(result[0].payload.dispatch_mode).toBe('mention');
+    expect(result[0].dispatch_mode).toBe('mention');
+  });
+
+  it('批量路径：缺省 dispatch_mode 时默认 broadcast', async () => {
+    const client = makeDecryptFailClient();
+
+    const result = await (client as any)._decryptGroupMessages([
+      { group_id: 'g1', from: 'b', seq: 2, payload: { type: 'text', text: 'hello' } },
+    ]);
+
+    expect(result.length).toBe(1);
+    expect(result[0].payload.dispatch_mode).toBe('broadcast');
+    expect(result[0].dispatch_mode).toBe('broadcast');
   });
 });
 
@@ -1077,6 +1185,48 @@ describe('GROUP epoch 轮换竞态防护', () => {
     })).resolves.toBe(false);
   });
 
+  it('新成员恢复时 committed response commitment 不匹配应放行', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'bob.aid.com';
+    (client as any).call = vi.fn().mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: {
+        target_epoch: 2,
+        key_commitment: 'committed-old',
+        expected_members: ['alice.aid.com'],
+      },
+    });
+
+    await expect((client as any)._verifyGroupKeyResponseEpoch({
+      type: 'e2ee.group_key_response',
+      group_id: 'g1',
+      epoch: 2,
+      commitment: 'new-member-commitment',
+    })).resolves.toBe(true);
+  });
+
+  it('新成员 backfill 时 committed distribution commitment 不匹配应放行', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'bob.aid.com';
+    (client as any).call = vi.fn().mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: {
+        target_epoch: 2,
+        key_commitment: 'committed-old',
+        expected_members: ['alice.aid.com'],
+      },
+    });
+
+    await expect((client as any)._verifyActiveGroupRotationDistribution({
+      type: 'e2ee.group_key_distribution',
+      group_id: 'g1',
+      epoch: 2,
+      commitment: 'new-member-commitment',
+    })).resolves.toBe(true);
+  });
+
   it('发送前恢复等待期间 committed epoch 推进时应返回最新 epoch', async () => {
     const client = new AUNClient();
     (client as any)._groupE2ee = {
@@ -1102,6 +1252,52 @@ describe('GROUP epoch 轮换竞态防护', () => {
     expect(readyEpoch).toBe(2);
     expect(recoverSpy).toHaveBeenCalledWith('g1', 1, '', 5000);
     expect(recoverSpy).toHaveBeenCalledWith('g1', 2, '', 5000);
+  });
+
+  it('发送前 committed membership gap 应触发 repair 并等待新 committed epoch', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'bob.aid.com';
+    (client as any)._groupE2ee = {
+      loadSecret: vi.fn()
+        .mockResolvedValueOnce({ commitment: 'c1' })
+        .mockResolvedValueOnce({ commitment: 'c2' }),
+    };
+    (client as any).call = vi.fn().mockResolvedValue({
+      members: [
+        { aid: 'alice.aid.com', status: 'active' },
+        { aid: 'bob.aid.com', status: 'active' },
+        { aid: 'charlie.aid.com', status: 'active' },
+      ],
+    });
+    vi.spyOn(client as any, '_groupAllowsMemberEpochRotation').mockResolvedValue(true);
+    const repairSpy = vi.spyOn(client as any, '_maybeLeadRotateGroupEpoch').mockResolvedValue(undefined);
+    vi.spyOn(client as any, '_committedGroupEpochState').mockResolvedValue({
+      epoch: 2,
+      committed_epoch: 2,
+      committed_rotation: {
+        rotation_id: 'rot-2',
+        key_commitment: 'c2',
+        expected_members: ['alice.aid.com', 'bob.aid.com', 'charlie.aid.com'],
+      },
+    });
+
+    const readyEpoch = await (client as any)._ensureCommittedGroupSecretForSend('g1', 1, {
+      epoch: 1,
+      committed_epoch: 1,
+      committed_rotation: {
+        rotation_id: 'rot-1',
+        key_commitment: 'c1',
+        expected_members: ['alice.aid.com', 'bob.aid.com'],
+      },
+    });
+
+    expect(readyEpoch).toBe(2);
+    expect(repairSpy).toHaveBeenCalledWith(
+      'g1',
+      'g1:committed_membership_gap:aid:bob.aid.com:epoch:1',
+      1,
+      true,
+    );
   });
 
   it('本地 epoch 1 但服务端 epoch 0 时应先补同步初始 epoch', async () => {
@@ -1178,15 +1374,230 @@ describe('GROUP epoch 轮换竞态防护', () => {
     }
   });
 
+  it('group.thought.put 应自动走群 E2EE 加密并附带签名', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._groupSynced.add('g1');
+    (client as any)._groupE2ee = {
+      encryptWithEpoch: vi.fn().mockResolvedValue({ type: 'e2ee.group_encrypted', epoch: 2, ciphertext: 'abc' }),
+    };
+    vi.spyOn(client as any, '_ensureGroupEpochReady').mockResolvedValue(undefined);
+    vi.spyOn(client as any, '_waitForGroupMembershipEpochFloor').mockResolvedValue(undefined);
+    vi.spyOn(client as any, '_committedGroupEpochState').mockResolvedValue({ epoch: 2, committed_epoch: 2 });
+    vi.spyOn(client as any, '_ensureCommittedGroupSecretForSend').mockResolvedValue(2);
+    vi.spyOn(client as any, '_signClientOperation').mockImplementation(async (_method: string, params: any) => {
+      params.client_signature = { aid: 'alice.aid.com' };
+    });
+    const transportCall = vi.fn().mockResolvedValue({ ok: true });
+    (client as any)._transport.call = transportCall;
+
+    await client.call('group.thought.put', {
+      group_id: 'g1',
+      context: { type: 'run', id: 'run-root' },
+      payload: { type: 'thought', text: '推理片段' },
+    });
+
+    expect(transportCall).toHaveBeenCalledWith('group.thought.put', expect.objectContaining({
+      group_id: 'g1',
+      context: { type: 'run', id: 'run-root' },
+      encrypted: true,
+      type: 'e2ee.group_encrypted',
+      thought_id: expect.stringMatching(/^gt-/),
+      client_signature: { aid: 'alice.aid.com' },
+    }));
+
+    await client.call('group.thought.put', {
+      group_id: 'g1',
+      context: { type: 'run', id: 'run-1' },
+      payload: { type: 'thought', text: '自主推理片段' },
+    });
+
+    expect(transportCall).toHaveBeenLastCalledWith('group.thought.put', expect.objectContaining({
+      group_id: 'g1',
+      context: { type: 'run', id: 'run-1' },
+      encrypted: true,
+      type: 'e2ee.group_encrypted',
+      thought_id: expect.stringMatching(/^gt-/),
+      client_signature: { aid: 'alice.aid.com' },
+    }));
+    expect(transportCall.mock.calls[transportCall.mock.calls.length - 1]?.[1]).not.toHaveProperty('reply_to');
+  });
+
+  it('group.thought.get 应逐条解密并返回 thoughts[]', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    vi.spyOn(client as any, '_decryptGroupMessage').mockResolvedValue({
+      payload: { type: 'thought', text: '只给感兴趣的人看' },
+      e2ee: {
+        encryption_mode: 'epoch_group_key',
+        context: { type: 'run', id: 'run-root' },
+      },
+    });
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      group_id: 'g1',
+      sender_aid: 'alice.aid.com',
+      context: { type: 'run', id: 'run-root' },
+      thoughts: [
+        {
+          thought_id: 'gt-1',
+          context: { type: 'run', id: 'run-root' },
+          payload: { type: 'e2ee.group_encrypted', ciphertext: 'abc' },
+          created_at: 1710504000000,
+        },
+      ],
+    });
+
+    const result = await client.call('group.thought.get', {
+      group_id: 'g1',
+      sender_aid: 'alice.aid.com',
+      context: { type: 'run', id: 'run-root' },
+    }) as any;
+
+    expect(result.thoughts).toEqual([
+      {
+        thought_id: 'gt-1',
+        message_id: 'gt-1',
+        context: { type: 'run', id: 'run-root' },
+        payload: { type: 'thought', text: '只给感兴趣的人看' },
+        created_at: 1710504000000,
+        e2ee: {
+          encryption_mode: 'epoch_group_key',
+          context: { type: 'run', id: 'run-root' },
+        },
+      },
+    ]);
+    expect((client as any)._decryptGroupMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message_id: 'gt-1',
+        sender_aid: 'alice.aid.com',
+        context: { type: 'run', id: 'run-root' },
+      }),
+      { skipReplay: true },
+    );
+  });
+
+  it('message.thought.put 应自动走 P2P E2EE 加密并附带签名', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    vi.spyOn(client as any, '_fetchPeerPrekey').mockResolvedValue({ prekey_id: 'pk-1', cert_fingerprint: 'sha256:abc' });
+    vi.spyOn(client as any, '_fetchPeerCert').mockResolvedValue('PEM');
+    vi.spyOn(client as any, '_encryptCopyPayload').mockResolvedValue([
+      { type: 'e2ee.encrypted', ciphertext: 'abc' },
+      { encrypted: true, forward_secrecy: true, mode: 'prekey_ecdh_v2' },
+    ]);
+    vi.spyOn(client as any, '_signClientOperation').mockImplementation(async (_method: string, params: any) => {
+      params.client_signature = { aid: 'alice.aid.com' };
+    });
+    const transportCall = vi.fn().mockResolvedValue({ ok: true });
+    (client as any)._transport.call = transportCall;
+
+    await client.call('message.thought.put', {
+      to: 'bob.aid.com',
+      context: { type: 'run', id: 'run-root' },
+      payload: { type: 'thought', text: '推理片段' },
+    });
+
+    expect(transportCall).toHaveBeenCalledWith('message.thought.put', expect.objectContaining({
+      to: 'bob.aid.com',
+      context: { type: 'run', id: 'run-root' },
+      encrypted: true,
+      type: 'e2ee.encrypted',
+      thought_id: expect.stringMatching(/^mt-/),
+      client_signature: { aid: 'alice.aid.com' },
+    }));
+
+    await client.call('message.thought.put', {
+      to: 'bob.aid.com',
+      context: { type: 'run', id: 'run-1' },
+      payload: { type: 'thought', text: '自主推理片段' },
+    });
+
+    expect(transportCall).toHaveBeenLastCalledWith('message.thought.put', expect.objectContaining({
+      to: 'bob.aid.com',
+      context: { type: 'run', id: 'run-1' },
+      encrypted: true,
+      type: 'e2ee.encrypted',
+      thought_id: expect.stringMatching(/^mt-/),
+      client_signature: { aid: 'alice.aid.com' },
+    }));
+    expect(transportCall.mock.calls[transportCall.mock.calls.length - 1]?.[1]).not.toHaveProperty('reply_to');
+  });
+
+  it('thought selector 必须提供 context.type + context.id', async () => {
+    const client = new AUNClient();
+
+    expect(() => (client as any)._validateOutboundCall('message.thought.put', {
+      to: 'bob.aid.com',
+      payload: { type: 'thought' },
+    })).toThrow('context.type');
+
+    expect(() => (client as any)._validateOutboundCall('message.thought.put', {
+      to: 'bob.aid.com',
+      context: { type: 'run' },
+      payload: { type: 'thought' },
+    })).toThrow('context.type');
+  });
+
+  it('message.thought.get 应逐条解密并返回 thoughts[]', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    vi.spyOn(client as any, '_ensureSenderCertCached').mockResolvedValue(true);
+    (client as any)._e2ee = {
+      decryptMessage: vi.fn().mockResolvedValue({
+        payload: { type: 'thought', text: '只给感兴趣的人看' },
+        e2ee: { encryption_mode: 'prekey_ecdh_v2' },
+      }),
+    };
+    (client as any)._transport.call = vi.fn().mockResolvedValue({
+      found: true,
+      sender_aid: 'alice.aid.com',
+      peer_aid: 'bob.aid.com',
+      context: { type: 'run', id: 'run-root' },
+      thoughts: [
+        {
+          thought_id: 'mt-1',
+          from: 'alice.aid.com',
+          to: 'bob.aid.com',
+          context: { type: 'run', id: 'run-root' },
+          payload: { type: 'e2ee.encrypted', ciphertext: 'abc' },
+          created_at: 1710504000000,
+        },
+      ],
+    });
+
+    const result = await client.call('message.thought.get', {
+      sender_aid: 'alice.aid.com',
+      context: { type: 'run', id: 'run-root' },
+    }) as any;
+
+    expect(result.thoughts).toEqual([
+      {
+        thought_id: 'mt-1',
+        message_id: 'mt-1',
+        context: { type: 'run', id: 'run-root' },
+        from: 'alice.aid.com',
+        to: 'bob.aid.com',
+        payload: { type: 'thought', text: '只给感兴趣的人看' },
+        created_at: 1710504000000,
+        e2ee: { encryption_mode: 'prekey_ecdh_v2' },
+      },
+    ]);
+  });
+
   it('stale pending secret 不应让 epoch key recovery 返回成功', async () => {
     const client = new AUNClient();
     (client as any)._groupE2ee = {
       loadSecret: vi.fn().mockResolvedValue({ pending_rotation_id: 'rot-stale', commitment: 'c2' }),
     };
-    (client as any).call = vi.fn().mockResolvedValue({
-      epoch: 2,
-      committed_epoch: 2,
-      committed_rotation: { rotation_id: 'rot-committed', key_commitment: 'c2' },
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.get_online_members') throw new Error('not supported');
+      return {
+        epoch: 2,
+        committed_epoch: 2,
+        committed_rotation: { rotation_id: 'rot-committed', key_commitment: 'c2' },
+      };
     });
     const requestSpy = vi.spyOn(client as any, '_requestGroupKeyFromCandidates').mockResolvedValue(undefined);
 
@@ -1205,7 +1616,10 @@ describe('GROUP epoch 轮换竞态防护', () => {
       loadSecret: vi.fn()
         .mockResolvedValue({ epoch: 2, commitment: 'c2' }),
     };
-    (client as any).call = vi.fn().mockResolvedValue({ epoch: 2, committed_epoch: 2 });
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.get_online_members') throw new Error('not supported');
+      return { epoch: 2, committed_epoch: 2 };
+    });
     vi.spyOn(client as any, '_requestGroupKeyFromCandidates').mockResolvedValue(undefined);
     const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
 
@@ -1223,5 +1637,225 @@ describe('GROUP epoch 轮换竞态防护', () => {
       old_epoch: 2,
     });
     expect(triggerId).toBe('g1:member_added:aid:carol.aid:epoch:2');
+  });
+});
+
+describe('有序消息发布', () => {
+  it('P2P push 越过空洞时应挂起，补洞后按 contiguous_seq 顺序放行', async () => {
+    const client = new AUNClient();
+    const ns = 'p2p:alice.aid.com';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._seqTracker.onMessageSeq(ns, 1);
+
+    const published: number[] = [];
+    client.on('message.received', (payload: any) => {
+      published.push(Number(payload.seq));
+    });
+
+    await expect((client as any)._publishOrderedMessage('message.received', ns, 3, { seq: 3 }))
+      .resolves.toBe(false);
+    expect(published).toEqual([]);
+    expect((client as any)._pendingOrderedMsgs.get(ns)?.has(3)).toBe(true);
+
+    (client as any)._seqTracker.onPullResult(ns, [{ seq: 2 }, { seq: 3 }]);
+    await expect((client as any)._publishOrderedMessage('message.received', ns, 2, { seq: 2 }))
+      .resolves.toBe(true);
+
+    expect(published).toEqual([2, 3]);
+    expect((client as any)._pendingOrderedMsgs.has(ns)).toBe(false);
+  });
+
+  it('发布的 P2P/群消息缺实例字段时应 fallback 当前 device_id/slot_id', async () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    const p2pNs = 'p2p:alice.aid.com';
+    const groupNs = 'group:g1';
+    (client as any)._seqTracker.onMessageSeq(p2pNs, 1);
+    (client as any)._seqTracker.onMessageSeq(groupNs, 1);
+
+    const p2pEvents: any[] = [];
+    const groupEvents: any[] = [];
+    client.on('message.received', (payload: any) => p2pEvents.push(payload));
+    client.on('group.message_created', (payload: any) => groupEvents.push(payload));
+
+    await (client as any)._publishOrderedMessage('message.received', p2pNs, 1, { seq: 1, payload: { type: 'text' } });
+    await (client as any)._publishOrderedMessage('group.message_created', groupNs, 1, {
+      group_id: 'g1',
+      seq: 1,
+      payload: { type: 'text' },
+    });
+
+    expect(p2pEvents[0].device_id).toBe('dev-1');
+    expect(p2pEvents[0].slot_id).toBe('slot-a');
+    expect(groupEvents[0].device_id).toBe('dev-1');
+    expect(groupEvents[0].slot_id).toBe('slot-a');
+  });
+
+  it('P2P push 明确指向其它 slot 时应忽略', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+    const decryptSpy = vi.spyOn(client as any, '_decryptSingleMessage').mockImplementation(async (msg: any) => msg);
+    vi.spyOn(client as any, '_tryHandleGroupKeyMessage').mockResolvedValue(false);
+
+    const published: any[] = [];
+    client.on('message.received', (payload: any) => published.push(payload));
+
+    await (client as any)._processAndPublishMessage({
+      message_id: 'm-other-slot',
+      from: 'bob.aid.com',
+      to: 'alice.aid.com',
+      slot_id: 'slot-b',
+      payload: { type: 'text', text: 'wrong slot' },
+    });
+
+    expect(published).toEqual([]);
+    expect(decryptSpy).not.toHaveBeenCalled();
+  });
+
+  it('group push 明确带其它 slot 时仍应投递且不覆盖实例字段', async () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+
+    const published: any[] = [];
+    client.on('group.message_created', (payload: any) => published.push(payload));
+
+    await (client as any)._processAndPublishGroupMessage({
+      message_id: 'gm-other-slot',
+      group_id: 'g1',
+      from: 'bob.aid.com',
+      device_id: 'dev-2',
+      slot_id: 'slot-b',
+      payload: { type: 'text', text: 'group' },
+    });
+
+    expect(published).toHaveLength(1);
+    expect(published[0].device_id).toBe('dev-2');
+    expect(published[0].slot_id).toBe('slot-b');
+  });
+
+  it('group pending decrypt 重试成功也应走有序放行', async () => {
+    const client = new AUNClient();
+    const ns = 'group:g1';
+    (client as any)._seqTracker.onMessageSeq(ns, 1);
+    (client as any)._seqTracker.onMessageSeq(ns, 3);
+    (client as any)._pendingDecryptMsgs.set(ns, [
+      { group_id: 'g1', seq: 3, payload: { type: 'text' } },
+    ]);
+    vi.spyOn(client as any, '_decryptGroupMessage').mockResolvedValue({ group_id: 'g1', seq: 3, e2ee: { ok: true } });
+    const published: number[] = [];
+    client.on('group.message_created', (payload: any) => {
+      published.push(Number(payload.seq));
+    });
+
+    await (client as any)._retryPendingDecryptMsgs('g1');
+    expect(published).toEqual([]);
+    expect((client as any)._pendingOrderedMsgs.get(ns)?.has(3)).toBe(true);
+
+    (client as any)._seqTracker.onPullResult(ns, [{ seq: 2 }, { seq: 3 }]);
+    await (client as any)._publishOrderedMessage('group.message_created', ns, 2, { seq: 2 });
+
+    expect(published).toEqual([2, 3]);
+  });
+
+  it('seq tracker 上下文切换时应清空有序待发布队列', () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'device-a';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._seqTrackerContext = JSON.stringify(['alice.aid.com', 'device-a', 'slot-a']);
+    (client as any)._pendingOrderedMsgs.set('p2p:alice.aid.com', new Map([[3, {
+      event: 'message.received',
+      payload: { seq: 3 },
+    }]]));
+    (client as any)._pendingDecryptMsgs.set('group:g1', [
+      { group_id: 'g1', seq: 4, payload: { type: 'e2ee.group_encrypted' } },
+    ]);
+
+    (client as any)._slotId = 'slot-b';
+    (client as any)._refreshSeqTrackerContext();
+
+    expect((client as any)._pendingOrderedMsgs.size).toBe(0);
+    expect((client as any)._pendingDecryptMsgs.size).toBe(0);
+  });
+});
+
+// ── 服务端 epoch key 恢复测试 ──────────────────────────────
+
+describe('epoch key 恢复 join mode 路由', () => {
+  function makeRecoveryClient() {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'bob.test.com';
+    return client;
+  }
+
+  it('open 群恢复应调用 group.e2ee.get_epoch_key', async () => {
+    const client = makeRecoveryClient();
+    const rpcLog: string[] = [];
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      rpcLog.push(method);
+      if (method === 'group.get_join_requirements') {
+        return { join_requirements: { mode: 'open' } };
+      }
+      if (method === 'group.e2ee.get_epoch_key') {
+        return { epoch: 2 };
+      }
+      if (method === 'group.e2ee.get_epoch') {
+        return { epoch: 2, committed_epoch: 2, members: ['alice.test.com', 'bob.test.com'] };
+      }
+      return {};
+    });
+
+    await (client as any)._doRecoverGroupEpochKey('g1', 2, '', 500);
+    expect(rpcLog).toContain('group.e2ee.get_epoch_key');
+  });
+
+  it('private 群恢复不应调用 group.e2ee.get_epoch_key', async () => {
+    const client = makeRecoveryClient();
+    const rpcLog: string[] = [];
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      rpcLog.push(method);
+      if (method === 'group.get_join_requirements') {
+        return { join_requirements: { mode: 'approval' } };
+      }
+      if (method === 'group.e2ee.get_epoch') {
+        return {
+          epoch: 2, committed_epoch: 2,
+          owner_aid: 'alice.test.com',
+          members: ['alice.test.com', 'bob.test.com'],
+        };
+      }
+      if (method === 'group.get_online_members') {
+        return { members: [] };
+      }
+      if (method === 'message.send') return { ok: true };
+      return {};
+    });
+
+    const result = await (client as any)._doRecoverGroupEpochKey('g1', 2, '', 500);
+    expect(result).toBe(false);
+    expect(rpcLog).not.toContain('group.e2ee.get_epoch_key');
+  });
+
+  it('缺少成员快照时应拒绝服务端恢复', async () => {
+    const client = makeRecoveryClient();
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.e2ee.get_epoch_key') {
+        return { epoch: 2, encrypted_key: 'dGVzdA==' };
+      }
+      if (method === 'group.e2ee.get_epoch') {
+        return { epoch: 2, committed_epoch: 2 };
+      }
+      return {};
+    });
+
+    const result = await (client as any)._tryRecoverEpochKeyFromServer('g1', 2);
+    expect(result).toBe(false);
   });
 });

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aun_core import AUNClient
-from aun_core.client import _CachedPeerCert, _PUSHED_SEQS_LIMIT
+from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL, _PUSHED_SEQS_LIMIT
 from aun_core.e2ee import (
     compute_membership_commitment,
     encrypt_group_message,
@@ -86,7 +86,7 @@ def _make_client(tmp_path, aid=_AID_BOB):
             continue
         _, peer_cert = _get_signing_identity(peer_aid)
         client._cert_cache[peer_aid] = _CachedPeerCert(
-            cert_bytes=peer_cert, validated_at=now, refresh_after=now + 600,
+            cert_bytes=peer_cert, validated_at=now, refresh_after=now + _PEER_CERT_CACHE_TTL,
         )
         cert_str = peer_cert.decode("utf-8") if isinstance(peer_cert, bytes) else peer_cert
         client._keystore.save_cert(peer_aid, cert_str)
@@ -204,6 +204,11 @@ class TestPY005EpochWait:
             nonlocal key_request_sent
             if method == "group.e2ee.get_epoch":
                 return {"epoch": 2, "owner_aid": _AID_ALICE}
+            if method == "group.get_online_members":
+                return {"members": [
+                    {"aid": _AID_ALICE, "role": "owner", "online": True},
+                    {"aid": _AID_BOB, "role": "member", "online": True},
+                ]}
             if method == "group.send":
                 return {}
             return {}

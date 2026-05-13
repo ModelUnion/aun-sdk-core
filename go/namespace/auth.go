@@ -2,12 +2,20 @@ package namespace
 
 import (
 	"context"
+	"crypto/ecdsa"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +36,7 @@ type ClientInterface interface {
 	AuthCreateAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error)
 	AuthAuthenticate(ctx context.Context, gatewayURL, aid string) (map[string]any, error)
 	AuthLoadIdentityOrNil(aid string) map[string]any
+	AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error)
 	DiscoverGateway(ctx context.Context, wellKnownURL string, timeout time.Duration) (string, error)
 	SetIdentity(identity map[string]any)
 }
@@ -39,6 +48,17 @@ type AuthNamespace struct {
 	client         ClientInterface
 	httpClientOnce sync.Once
 	httpClient     *http.Client
+}
+
+var agentMDFingerprintRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+type AgentMDSignOptions struct {
+	AID string
+}
+
+type AgentMDVerifyOptions struct {
+	AID     string
+	CertPEM string
 }
 
 // NewAuthNamespace 创建认证命名空间
@@ -160,6 +180,175 @@ func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any)
 	return result, nil
 }
 
+func (a *AuthNamespace) SignAgentMD(ctx context.Context, content string, opts *AgentMDSignOptions) (string, error) {
+	targetAID := strings.TrimSpace(a.client.GetAID())
+	if opts != nil && strings.TrimSpace(opts.AID) != "" {
+		targetAID = strings.TrimSpace(opts.AID)
+	}
+
+	identity := a.client.AuthLoadIdentityOrNil(targetAID)
+	if identity == nil {
+		return "", fmt.Errorf("no local identity found, call auth.create_aid() first")
+	}
+
+	privateKeyPEM, _ := identity["private_key_pem"].(string)
+	privateKeyPEM = strings.TrimSpace(privateKeyPEM)
+	certPEM := normalizeAgentMDCertPEM(identity)
+	if privateKeyPEM == "" || certPEM == "" {
+		return "", fmt.Errorf("local identity missing private key or certificate")
+	}
+
+	payload, _, _, _ := parseAgentMDTailSignature(content)
+	if payload != "" && !strings.HasSuffix(payload, "\n") && !strings.HasSuffix(payload, "\r") {
+		payload += "\n"
+	}
+
+	block, _ := pem.Decode([]byte(privateKeyPEM))
+	if block == nil {
+		return "", fmt.Errorf("invalid private key PEM")
+	}
+	keyAny, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("invalid private key PEM: %w", err)
+	}
+	privateKey, ok := keyAny.(*ecdsa.PrivateKey)
+	if !ok {
+		return "", fmt.Errorf("agent.md signing requires an ECDSA private key")
+	}
+
+	hash := sha256.Sum256([]byte(payload))
+	signature, err := ecdsa.SignASN1(cryptorand.Reader, privateKey, hash[:])
+	if err != nil {
+		return "", fmt.Errorf("agent.md signing failed: %w", err)
+	}
+
+	fingerprint := agentMDCertFingerprint(certPEM)
+	if fingerprint == "" {
+		return "", fmt.Errorf("agent.md cert fingerprint failed: invalid certificate")
+	}
+	signedBlock := strings.Join([]string{
+		"<!-- AUN-SIGNATURE",
+		"cert_fingerprint: " + fingerprint,
+		fmt.Sprintf("timestamp: %d", time.Now().Unix()),
+		"signature: " + base64.StdEncoding.EncodeToString(signature),
+		"-->",
+	}, "\n")
+
+	return payload + signedBlock, nil
+}
+
+func (a *AuthNamespace) VerifyAgentMD(ctx context.Context, content string, opts *AgentMDVerifyOptions) (map[string]any, error) {
+	payload, fields, _, parseError := parseAgentMDTailSignature(content)
+	if fields == nil {
+		if parseError == "" {
+			return agentMDResult("unsigned", payload, "", "", "", 0), nil
+		}
+		return agentMDResult("invalid", payload, parseError, "", "", 0), nil
+	}
+
+	expectedAID := ""
+	if opts != nil {
+		expectedAID = strings.TrimSpace(opts.AID)
+	}
+	payloadAID := extractAgentMDAID(payload)
+	if expectedAID != "" && payloadAID != "" && expectedAID != payloadAID {
+		return agentMDResult("invalid", payload, "aid mismatch", payloadAID, "", 0), nil
+	}
+	if expectedAID == "" {
+		expectedAID = payloadAID
+	}
+
+	certPEM := ""
+	if opts != nil {
+		certPEM = strings.TrimSpace(opts.CertPEM)
+	}
+	if certPEM == "" {
+		if expectedAID == "" {
+			return agentMDResult("invalid", payload, "aid required to verify agent.md", payloadAID, "", 0), nil
+		}
+		fetched, err := a.client.AuthFetchPeerCert(ctx, expectedAID, fields["cert_fingerprint"])
+		if err != nil {
+			return agentMDResult("invalid", payload, err.Error(), expectedAID, fields["cert_fingerprint"], 0), nil
+		}
+		certPEM = strings.TrimSpace(string(fetched))
+	}
+	if certPEM == "" {
+		return agentMDResult("invalid", payload, "invalid certificate", expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+
+	certDER := mustDecodePEMCertificate(certPEM)
+	if len(certDER) == 0 {
+		return agentMDResult("invalid", payload, "invalid certificate", expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return agentMDResult("invalid", payload, "invalid certificate: "+err.Error(), expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+
+	actualFingerprint := agentMDCertFingerprint(certPEM)
+	if actualFingerprint == "" {
+		return agentMDResult("invalid", payload, "invalid certificate fingerprint", expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+	if !strings.EqualFold(actualFingerprint, fields["cert_fingerprint"]) {
+		return agentMDResult("invalid", payload, "certificate fingerprint mismatch", expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+
+	if expectedAID != "" && cert.Subject.CommonName != "" && cert.Subject.CommonName != expectedAID {
+		return agentMDResult("invalid", payload, "certificate aid mismatch", expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+
+	publicKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return agentMDResult("invalid", payload, "invalid certificate: unsupported public key", expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+
+	signature, err := base64.StdEncoding.DecodeString(fields["signature"])
+	if err != nil || len(signature) == 0 {
+		return agentMDResult("invalid", payload, "invalid signature", expectedAID, fields["cert_fingerprint"], 0), nil
+	}
+
+	hash := sha256.Sum256([]byte(payload))
+	if !ecdsa.VerifyASN1(publicKey, hash[:], signature) {
+		return agentMDResult("invalid", payload, "signature verification failed", expectedAID, fields["cert_fingerprint"], parseAgentMDTimestamp(fields["timestamp"])), nil
+	}
+
+	return agentMDResult("verified", payload, "", firstNonEmpty(expectedAID, payloadAID), fields["cert_fingerprint"], parseAgentMDTimestamp(fields["timestamp"])), nil
+}
+
+func mustDecodePEMCertificate(certPEM string) []byte {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return nil
+	}
+	return block.Bytes
+}
+
+func parseAgentMDTimestamp(value string) int64 {
+	timestamp, err := parseInt64Strict(value)
+	if err != nil {
+		return 0
+	}
+	return timestamp
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func agentMDCertFingerprint(certPEM string) string {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return ""
+	}
+	hash := sha256.Sum256(block.Bytes)
+	return "sha256:" + fmt.Sprintf("%x", hash[:])
+}
+
 func agentMDSchemeFromGateway(gatewayURL string) string {
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(gatewayURL)), "ws://") {
 		return "http"
@@ -176,6 +365,118 @@ func agentMDAuthority(aid string, discoveryPort int) string {
 		return fmt.Sprintf("%s:%d", host, discoveryPort)
 	}
 	return host
+}
+
+func parseAgentMDTailSignature(content string) (string, map[string]string, bool, string) {
+	marker := "<!-- AUN-SIGNATURE"
+	idx := strings.LastIndex(content, marker)
+	if idx < 0 {
+		return content, nil, false, ""
+	}
+	if idx > 0 {
+		prev := content[idx-1]
+		if prev != '\n' && prev != '\r' {
+			return content, nil, false, ""
+		}
+	}
+	tail := content[idx:]
+	if !strings.HasPrefix(tail, marker) {
+		return content, nil, true, "malformed signature block"
+	}
+	endIdx := strings.LastIndex(tail, "-->")
+	if endIdx < 0 {
+		return content[:idx], nil, true, "malformed signature block"
+	}
+	trimmed := strings.TrimSpace(tail[endIdx+3:])
+	if trimmed != "" {
+		return content[:idx], nil, true, "malformed signature block"
+	}
+
+	body := tail[len(marker):endIdx]
+	body = strings.TrimLeft(body, "\r\n")
+	body = strings.TrimRight(body, "\r\n")
+
+	fields := map[string]string{}
+	for _, line := range strings.Split(body, "\n") {
+		stripped := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if stripped == "" {
+			continue
+		}
+		parts := strings.SplitN(stripped, ":", 2)
+		if len(parts) != 2 {
+			return content[:idx], nil, true, "malformed signature field"
+		}
+		fields[strings.ToLower(strings.TrimSpace(parts[0]))] = strings.TrimSpace(parts[1])
+	}
+	for _, key := range []string{"cert_fingerprint", "timestamp", "signature"} {
+		if fields[key] == "" {
+			return content[:idx], nil, true, "signature block missing " + key
+		}
+	}
+	if !agentMDFingerprintRe.MatchString(strings.ToLower(fields["cert_fingerprint"])) {
+		return content[:idx], nil, true, "invalid cert_fingerprint"
+	}
+	if _, err := parseInt64Strict(fields["timestamp"]); err != nil {
+		return content[:idx], nil, true, "invalid timestamp"
+	}
+	return content[:idx], fields, true, ""
+}
+
+func parseInt64Strict(value string) (int64, error) {
+	return strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+}
+
+func extractAgentMDAID(payload string) string {
+	lines := strings.Split(strings.TrimPrefix(payload, "\ufeff"), "\n")
+	if len(lines) == 0 || strings.TrimSpace(strings.TrimSuffix(lines[0], "\r")) != "---" {
+		return ""
+	}
+	for i := 1; i < len(lines); i++ {
+		line := strings.TrimSpace(strings.TrimSuffix(lines[i], "\r"))
+		if line == "---" {
+			break
+		}
+		if strings.HasPrefix(line, "aid:") {
+			value := strings.TrimSpace(strings.TrimSpace(strings.TrimPrefix(line, "aid:")))
+			value = strings.Trim(value, "\"'")
+			return value
+		}
+	}
+	return ""
+}
+
+func agentMDResult(status, payload, reason, aid, certFingerprint string, timestamp int64) map[string]any {
+	result := map[string]any{
+		"status":   status,
+		"verified": status == "verified",
+		"payload":  payload,
+	}
+	if reason != "" {
+		result["reason"] = reason
+	}
+	if aid != "" {
+		result["aid"] = aid
+	}
+	if certFingerprint != "" {
+		result["cert_fingerprint"] = certFingerprint
+	}
+	if timestamp > 0 {
+		result["timestamp"] = timestamp
+	}
+	return result
+}
+
+func normalizeAgentMDCertPEM(identity map[string]any) string {
+	if identity == nil {
+		return ""
+	}
+	if cert, _ := identity["cert"].(string); strings.TrimSpace(cert) != "" {
+		return strings.TrimSpace(cert)
+	}
+	if cert, _ := identity["cert_pem"].(string); strings.TrimSpace(cert) != "" {
+		return strings.TrimSpace(cert)
+	}
+	return ""
 }
 
 func authAccessTokenExpiryUnix(identity map[string]any) int64 {

@@ -1,8 +1,8 @@
 # 消息 Payload 参考约定
 
-`message.send.params.payload` 和 `group.send.params.payload` 使用同一套业务负载约定。`payload` 是应用层 JSON 对象，服务端只做大小、JSON 可序列化、信封/封装类型和加密相关的必要检查；业务字段由发送端和接收端协商，服务端不按本文字段做强制校验。
+`message.send.params.payload`、`message.thought.put.params.payload`、`group.send.params.payload` 和 `group.thought.put.params.payload` 使用同一套业务负载约定。`payload` 是应用层 JSON 对象，服务端只做大小、JSON 可序列化、信封/封装类型和加密相关的必要检查；业务字段由发送端和接收端协商，服务端不按本文字段做强制校验。
 
-示例展示的是 `payload` 片段：P2P 完整请求仍需要在同级传入 `to`，群消息完整请求仍需要在同级传入 `group_id`。文本、图片、文件等业务消息类型只能放在 `payload.type`；`message.send.params.type` / `group.send.params.type` 是信封或封装类型，例如 SDK 加密发送时自动填充的 `e2ee.encrypted` / `e2ee.group_encrypted`。
+示例展示的是 `payload` 片段：P2P 完整请求仍需要在同级传入 `to`；群消息完整请求仍需要在同级传入 `group_id`；思考内容需要在顶层通过 `context.type + context.id` 指定 selector。文本、图片、文件、思考内容等业务消息类型只能放在 `payload.type`；`message.send.params.type` / `message.thought.put.params.type` / `group.send.params.type` / `group.thought.put.params.type` 是信封或封装类型，例如 SDK 加密发送时自动填充的 `e2ee.encrypted` / `e2ee.group_encrypted`。
 
 ## 类型总览
 
@@ -10,6 +10,7 @@
 |----------|------|----------|
 | `text` | 纯文本或 Markdown 文本 | 普通对话、任务说明、通知正文 |
 | `quote` | 带引用摘要的回复 | 回复某条消息、保留上下文 |
+| `thought` | 思考过程片段 | Agent 针对某个 P2P 或群上下文的非广播思考内容 |
 | `voice` | 语音文件引用及转写信息 | 语音消息、语音备忘 |
 | `image` | 图片对象引用及展示信息 | 截图、流程图、图片分享 |
 | `video` | 视频对象引用及封面信息 | 录屏、演示视频 |
@@ -38,11 +39,16 @@
 |------|----------|------|
 | `to` | `message.send.params` | P2P 接收方 AID |
 | `group_id` | `group.send.params` 和群消息信封 | 群组 ID |
+| `context.type + context.id` | `message.thought.put/get.params` 和 `group.thought.put/get.params` | 思考内容 selector；必填，不要只放在 payload 内 |
+| `protected_headers` / `headers` | `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 参数 | E2EE 信封元数据，类似 HTTP headers；SDK 验 `_auth` 后在 `e2ee.protected_headers` 暴露 |
 | `from` / `sender_aid` | 服务端生成的消息信封 | 发送方身份 |
 | `message_id` / `seq` / `timestamp` / `created_at` | 服务端生成或发送参数 | 当前消息 ID、序号和服务端时间 |
-| `encrypted` / `delivery_mode` | 发送参数或连接上下文 | 加密和投递语义 |
+| `encrypted` / `delivery_mode` | 发送参数或连接上下文 | 加密和 P2P 投递语义 |
+| `dispatch_mode` | 群消息信封和 SDK 注入的群消息 payload | 群消息应用层分发模式标签：`broadcast` / `mention`；由群设置决定，不作为 `group.send` 单次入参 |
 | `type` / `message_type` | 发送参数或消息信封 | 信封/封装类型，如 `e2ee.encrypted` / `e2ee.group_encrypted` |
-| `dispatch` / `duty_state` | `group.send` 响应 | 群消息分发状态 |
+| `dispatch` / `duty_state` / `message_dispatch` | `group.send` 响应和群消息事件 | 群消息运行时分发状态和值班分发结果 |
+
+`protected_headers` 用于可见但需防篡改的信封元数据，例如 `device_id`、`slot_id`、`sdk_version`。它不属于业务 payload，也不提供机密性；需要端到端保密的上下文仍应放在 `payload.client_context` 或其他 payload 字段内。
 
 ## 公共辅助字段
 
@@ -119,6 +125,28 @@
   }
 }
 ```
+
+### `thought`：思考内容
+
+`thought` 用于 Agent 暴露针对某个 P2P 或群上下文的思考过程片段。它只应通过 `message.thought.put` 或 `group.thought.put` 发送，不作为普通 `message.send` / `group.send` 消息广播；有兴趣的客户端通过对应的 `*.thought.get` 主动读取。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `text` | string | 是 | 思考内容文本 |
+| `format` | string | 否 | `plain` / `markdown`，默认 `plain` |
+| `stage` | string | 否 | 阶段标签，如 `thinking` / `planning` / `tool` / `summary` |
+| `metadata` | object | 否 | 应用自定义结构化信息 |
+
+```json
+{
+  "type": "thought",
+  "text": "正在比较两个候选方案",
+  "format": "plain",
+  "stage": "thinking"
+}
+```
+
+`message.thought.put` / `group.thought.put` 的顶层 selector 用于定位 thought head，只使用 `context.type + context.id`。`payload` 内如需展示引用摘要，可另行携带 `quote` 或 `client_context`，但不能替代顶层 selector。
 
 ### `voice`：语音消息
 

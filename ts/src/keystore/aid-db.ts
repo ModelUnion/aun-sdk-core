@@ -113,6 +113,15 @@ const DDL_STATEMENTS = [
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS group_state (
+    group_id TEXT PRIMARY KEY,
+    state_version INTEGER NOT NULL DEFAULT 0,
+    state_hash TEXT NOT NULL DEFAULT '',
+    key_epoch INTEGER NOT NULL DEFAULT 0,
+    membership_json TEXT NOT NULL DEFAULT '',
+    policy_json TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT 0
+  )`,
 ];
 
 function jsonParseObject(value: string): Record<string, unknown> {
@@ -481,6 +490,19 @@ export class AIDDatabase {
         if (localEpoch !== epoch) {
           const expiresAt = Number(current.updated_at || now) + opts.oldEpochRetentionMs;
           this._upsertGroupOldEpoch(groupId, localEpoch, currentSecret, currentData, Number(current.updated_at || now), expiresAt);
+        } else {
+          // epoch === localEpoch 但 currentSecret 为空：合并 data，不覆盖已有字段
+          const merged = { ...currentData, ...this._buildGroupCurrentData(opts, members, now) };
+          // 保留已有的 epoch_chain（如果新值为空）
+          if (!opts.epochChain && currentData.epoch_chain) {
+            merged.epoch_chain = currentData.epoch_chain;
+          }
+          if (currentData.pending_rotation_id && !opts.pendingRotationId) {
+            merged.pending_rotation_id = currentData.pending_rotation_id;
+            if (currentData.pending_created_at) merged.pending_created_at = currentData.pending_created_at;
+          }
+          this._upsertGroupCurrent(groupId, epoch, opts.secret, merged, now);
+          return true;
         }
       }
 
@@ -516,7 +538,15 @@ export class AIDDatabase {
       }
 
       const localEpoch = Number(current.epoch);
-      if (epoch > localEpoch) return false;
+      if (epoch > localEpoch) {
+        // 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
+        const oldSecret = this._revealText(`group/${groupId}/current`, current.secret_enc);
+        const oldData = jsonParseObject(current.data);
+        const expiresAt = now + (opts.oldEpochRetentionMs ?? 604800_000);
+        this._upsertGroupOldEpoch(groupId, localEpoch, oldSecret, oldData, current.updated_at, expiresAt);
+        this._upsertGroupCurrent(groupId, epoch, opts.secret, data, now);
+        return true;
+      }
 
       if (epoch === localEpoch) {
         const currentSecret = this._revealText(`group/${groupId}/current`, current.secret_enc);
@@ -734,5 +764,23 @@ export class AIDDatabase {
     const result: Record<string, string> = {};
     for (const row of rows) result[row.key] = row.value;
     return result;
+  }
+
+  // ── Group State ─────────────────────────────────────────────
+
+  saveGroupState(groupId: string, stateVersion: number, stateHash: string, keyEpoch: number, membershipJson: string, policyJson: string): void {
+    this._db.prepare(
+      `INSERT INTO group_state (group_id, state_version, state_hash, key_epoch, membership_json, policy_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(group_id) DO UPDATE SET state_version=excluded.state_version, state_hash=excluded.state_hash, key_epoch=excluded.key_epoch, membership_json=excluded.membership_json, policy_json=excluded.policy_json, updated_at=excluded.updated_at`,
+    ).run(groupId, stateVersion, stateHash, keyEpoch, membershipJson, policyJson, Date.now());
+  }
+
+  loadGroupState(groupId: string): { group_id: string; state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | null {
+    const row = this._db.prepare(
+      'SELECT state_version, state_hash, key_epoch, membership_json, policy_json, updated_at FROM group_state WHERE group_id = ?',
+    ).get(groupId) as { state_version: number; state_hash: string; key_epoch: number; membership_json: string; policy_json: string; updated_at: number } | undefined;
+    if (!row) return null;
+    return { group_id: groupId, ...row };
   }
 }

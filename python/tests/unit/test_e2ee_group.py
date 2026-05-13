@@ -13,6 +13,7 @@ import pytest
 
 from aun_core.e2ee import (
     AAD_FIELDS_GROUP,
+    AAD_MATCH_FIELDS_GROUP,
     MODE_EPOCH_GROUP_KEY,
     SUITE,
     GroupReplayGuard,
@@ -180,6 +181,8 @@ class TestEncryptDecryptRoundtrip:
         assert result["encrypted"] is True
         assert result["e2ee"]["encryption_mode"] == MODE_EPOCH_GROUP_KEY
         assert result["e2ee"]["epoch"] == 1
+        assert result["e2ee"]["protected_headers"] == {"payload_type": "text"}
+        assert result["e2ee"].get("context") is None
 
     def test_wrong_epoch_fails(self):
         message, gs, _ = _make_group_msg(epoch=2)
@@ -209,12 +212,105 @@ class TestEncryptDecryptRoundtrip:
         result = decrypt_group_message(message, {1: gs}, sender_cert_pem=_default_cert())
         assert result is None
 
+    def test_payload_type_and_protected_headers_are_bound(self):
+        gs = _random_secret()
+        pk_pem, cert_pem = _ensure_default_signing_identity()
+        envelope = encrypt_group_message(
+            group_id="grp_test1",
+            epoch=1,
+            group_secret=gs,
+            payload={"type": "text", "text": "hello"},
+            from_aid="alice.agentid.pub",
+            message_id="gm-meta",
+            timestamp=1710504000000,
+            sender_private_key_pem=pk_pem,
+            sender_cert_pem=cert_pem,
+            protected_headers={"Device_ID": "dev-a", "slot_id": "slot-a"},
+        )
+        assert "payload_type" not in envelope
+        assert "protected_headers" not in envelope["aad"]
+        assert "payload_type" not in envelope["aad"]
+        assert envelope["protected_headers"]["payload_type"] == "text"
+        assert envelope["protected_headers"]["device_id"] == "dev-a"
+        assert envelope["protected_headers"]["slot_id"] == "slot-a"
+        assert envelope["protected_headers"]["_auth"]["alg"] == "HMAC-SHA256"
+        message = {
+            "group_id": "grp_test1",
+            "from": "alice.agentid.pub",
+            "message_id": "gm-meta",
+            "payload": envelope,
+            "encrypted": True,
+        }
+        result = decrypt_group_message(message, {1: gs}, sender_cert_pem=cert_pem)
+        assert result is not None
+        assert result["payload"]["text"] == "hello"
+        assert result["e2ee"]["protected_headers"] == {
+            "payload_type": "text",
+            "device_id": "dev-a",
+            "slot_id": "slot-a",
+        }
+        assert "_auth" not in result["e2ee"]["protected_headers"]
+        assert result["e2ee"].get("context") is None
+
+        tampered = copy.deepcopy(message)
+        tampered["payload"]["protected_headers"]["device_id"] = "dev-b"
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
+
+        tampered = copy.deepcopy(message)
+        del tampered["payload"]["protected_headers"]["_auth"]
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
+
+    def test_context_aad_is_checked_when_present(self):
+        gs = _random_secret()
+        pk_pem, cert_pem = _ensure_default_signing_identity()
+        envelope = encrypt_group_message(
+            group_id="grp_test1",
+            epoch=1,
+            group_secret=gs,
+            payload={"type": "thought", "text": "thinking"},
+            from_aid="alice.agentid.pub",
+            message_id="gt-1",
+            timestamp=1710504000000,
+            sender_private_key_pem=pk_pem,
+            sender_cert_pem=cert_pem,
+            context={"type": "run", "id": "run-1"},
+        )
+        assert "context_type" not in envelope["aad"]
+        assert "context_id" not in envelope["aad"]
+        assert envelope["context"]["type"] == "run"
+        assert envelope["context"]["id"] == "run-1"
+        assert envelope["context"]["_auth"]["alg"] == "HMAC-SHA256"
+        message = {
+            "group_id": "grp_test1",
+            "from": "alice.agentid.pub",
+            "message_id": "gt-1",
+            "context": {"type": "run", "id": "run-1"},
+            "payload": envelope,
+            "encrypted": True,
+        }
+        result = decrypt_group_message(message, {1: gs}, sender_cert_pem=cert_pem)
+        assert result is not None
+        assert result["e2ee"]["protected_headers"]["payload_type"] == "thought"
+        assert result["e2ee"].get("context") == {"type": "run", "id": "run-1"}
+        assert "_auth" not in result["e2ee"]["protected_headers"]
+        assert "_auth" not in result["e2ee"]["context"]
+
+        tampered = copy.deepcopy(message)
+        tampered["context"] = {"type": "run", "id": "run-2"}
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
+
+        tampered = copy.deepcopy(message)
+        tampered["payload"]["context"]["id"] = "run-2"
+        assert decrypt_group_message(tampered, {1: gs}, sender_cert_pem=cert_pem) is None
+
 
 # ── AAD 工具 ───────────────────────────────────────────────
 
 class TestAADGroup:
     def test_has_7_fields(self):
         assert len(AAD_FIELDS_GROUP) == 7
+        assert "dispatch_mode" not in AAD_FIELDS_GROUP
+        assert "dispatch_mode" not in AAD_MATCH_FIELDS_GROUP
 
     def test_deterministic_serialization(self):
         aad = {
@@ -233,6 +329,42 @@ class TestAADGroup:
         parsed = json.loads(b1.decode("utf-8"))
         keys = list(parsed.keys())
         assert keys == sorted(keys)
+
+    def test_dispatch_mode_is_not_in_aad(self):
+        aad = {
+            "group_id": "grp_1",
+            "from": "alice",
+            "message_id": "msg_1",
+            "timestamp": 100,
+            "epoch": 1,
+            "encryption_mode": MODE_EPOCH_GROUP_KEY,
+            "suite": SUITE,
+            "dispatch_mode": "mention",
+        }
+        parsed = json.loads(_aad_bytes_group(aad).decode("utf-8"))
+        assert "dispatch_mode" not in parsed
+
+    def test_optional_metadata_is_not_in_group_aad(self):
+        base = {
+            "group_id": "grp_1",
+            "from": "alice",
+            "message_id": "msg_1",
+            "timestamp": 100,
+            "epoch": 1,
+            "encryption_mode": MODE_EPOCH_GROUP_KEY,
+            "suite": SUITE,
+        }
+        assert "payload_type" not in json.loads(_aad_bytes_group(base).decode("utf-8"))
+        aad = dict(base)
+        aad["payload_type"] = "text"
+        aad["protected_headers"] = {"device_id": "dev1", "slot_id": "slot1"}
+        aad["context_type"] = "run"
+        aad["context_id"] = "run-1"
+        parsed = json.loads(_aad_bytes_group(aad).decode("utf-8"))
+        assert "payload_type" not in parsed
+        assert "protected_headers" not in parsed
+        assert "context_type" not in parsed
+        assert "context_id" not in parsed
 
 
 # ── Membership Commitment ──────────────────────────────────
@@ -884,24 +1016,50 @@ class TestHandleKeyRequest:
         assert "commitment" in resp
         assert "member_aids" in resp
 
-    def test_response_expands_stale_epoch_membership_for_current_member(self, tmp_path):
+    def test_rejects_request_from_non_epoch_member(self, tmp_path):
+        """P0 历史隔离：请求者不属于目标 epoch 成员集时拒绝响应。"""
         ks_alice = _make_keystore(tmp_path / "alice")
-        ks_bob = _make_keystore(tmp_path / "bob")
-        old_members = [_AID]
+        old_members = [_AID]  # epoch 1 只有 alice
         gs = _random_secret()
         old_commitment = compute_membership_commitment(old_members, 1, _GRP, gs)
         store_group_secret(ks_alice, _AID, _GRP, 1, gs, old_commitment, old_members)
 
+        # bob 是当前成员但不属于 epoch 1
         req = build_key_request(_GRP, 1, _BOB)
         resp = handle_key_request(req, ks_alice, _AID, _MEMBERS)
 
+        # 应被拒绝
+        assert resp is None
+
+    def test_allows_request_from_epoch_member(self, tmp_path):
+        """P0 正向：请求者属于目标 epoch 成员集时正常返回密钥。"""
+        ks_alice = _make_keystore(tmp_path / "alice")
+        ks_bob = _make_keystore(tmp_path / "bob")
+        gs = _random_secret()
+        commitment = compute_membership_commitment(_MEMBERS, 2, _GRP, gs)
+        store_group_secret(ks_alice, _AID, _GRP, 2, gs, commitment, _MEMBERS)
+
+        req = build_key_request(_GRP, 2, _BOB)
+        resp = handle_key_request(req, ks_alice, _AID, _MEMBERS)
+
         assert resp is not None
-        assert resp["member_aids"] == sorted(_MEMBERS)
-        assert resp["commitment"] == compute_membership_commitment(_MEMBERS, 1, _GRP, gs)
+        assert resp["epoch"] == 2
+        assert base64.b64decode(resp["group_secret"]) == gs
+        # bob 能成功处理响应
         assert handle_key_response(resp, ks_bob, _BOB) is True
-        loaded = load_group_secret(ks_bob, _BOB, _GRP, 1)
-        assert loaded is not None
-        assert loaded["member_aids"] == sorted(_MEMBERS)
+
+    def test_rejects_request_when_member_aids_empty_fallback(self, tmp_path):
+        """当存储的 member_aids 为空时（旧数据），不做 epoch 成员校验，允许响应。"""
+        ks_alice = _make_keystore(tmp_path / "alice")
+        gs = _random_secret()
+        # 模拟旧数据：没有 member_aids
+        store_group_secret(ks_alice, _AID, _GRP, 1, gs, "", [])
+
+        req = build_key_request(_GRP, 1, _BOB)
+        resp = handle_key_request(req, ks_alice, _AID, _MEMBERS)
+
+        # member_aids 为空时跳过 epoch 成员校验（兼容旧数据）
+        assert resp is not None
 
 
 class TestHandleKeyResponse:
@@ -1668,3 +1826,159 @@ class TestCommitmentBindsGroupSecret:
         ks = _make_keystore(tmp_path)
         result = handle_key_distribution(dist, ks, _BOB, initiator_cert_pem=cert_pem)
         assert result is False  # commitment 不匹配
+
+
+# ── Group State Hash Tests ────────────────────────────────────
+
+
+class TestComputeStateHash:
+    """state_hash 计算测试"""
+
+    def test_deterministic(self):
+        """相同输入产生相同输出"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={"require_signature": True, "rotation_policy": "on_member_change"},
+            prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={"require_signature": True, "rotation_policy": "on_member_change"},
+            prev_state_hash="",
+        )
+        assert h1 == h2
+        assert len(h1) == 64
+
+    def test_member_order_independent(self):
+        """成员顺序不影响结果（按 AID 字典序排列）"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "bob.aid.com", "role": "member"}, {"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={}, prev_state_hash="",
+        )
+        assert h1 == h2
+
+    def test_role_change_changes_hash(self):
+        """角色变更导致 hash 变化"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "member"}],
+            policy={}, prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}, {"aid": "bob.aid.com", "role": "admin"}],
+            policy={}, prev_state_hash=h1,
+        )
+        assert h1 != h2
+
+    def test_policy_change_changes_hash(self):
+        """策略变更导致 hash 变化"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={"require_signature": True, "rotation_policy": "on_member_change"},
+            prev_state_hash="",
+        )
+        h2 = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={"require_signature": False, "rotation_policy": "manual"},
+            prev_state_hash=h1,
+        )
+        assert h1 != h2
+
+    def test_chain_linkage(self):
+        """prev_state_hash 参与计算，形成链"""
+        from aun_core.e2ee import compute_state_hash
+        h1 = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        h2_a = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash=h1,
+        )
+        h2_b = compute_state_hash(
+            group_id="grp_test", state_version=2, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="0" * 64,
+        )
+        assert h2_a != h2_b
+
+    def test_empty_policy(self):
+        """空策略正常工作"""
+        from aun_core.e2ee import compute_state_hash
+        h = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        assert len(h) == 64
+
+    def test_genesis_prev_hash_empty(self):
+        """初始版本 prev_state_hash 为空字符串，使用 32 字节零"""
+        from aun_core.e2ee import compute_state_hash
+        h = compute_state_hash(
+            group_id="grp_test", state_version=1, key_epoch=1,
+            members=[{"aid": "alice.aid.com", "role": "owner"}],
+            policy={}, prev_state_hash="",
+        )
+        assert isinstance(h, str) and len(h) == 64
+
+
+class TestGroupStateStorage:
+    """group_state 表的存取测试"""
+
+    def _make_db(self, tmp_path):
+        from aun_core.keystore.sqlite_db import AIDDatabase
+        return AIDDatabase(tmp_path / "test.db", b"test_seed_key_32bytes_padding!!")
+
+    def test_save_and_load(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.save_group_state(
+            group_id="grp_test",
+            state_version=3,
+            state_hash="ab" * 32,
+            key_epoch=2,
+            membership_json='[{"aid":"alice.aid.com","role":"owner"}]',
+            policy_json='{"require_signature":true}',
+        )
+        state = db.load_group_state("grp_test")
+        assert state is not None
+        assert state["state_version"] == 3
+        assert state["state_hash"] == "ab" * 32
+        assert state["key_epoch"] == 2
+        assert state["membership_json"] == '[{"aid":"alice.aid.com","role":"owner"}]'
+        assert state["policy_json"] == '{"require_signature":true}'
+
+    def test_load_nonexistent(self, tmp_path):
+        db = self._make_db(tmp_path)
+        assert db.load_group_state("grp_nonexist") is None
+
+    def test_upsert_overwrites(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.save_group_state(
+            group_id="grp_test", state_version=1, state_hash="aa" * 32,
+            key_epoch=1, membership_json="[]", policy_json="{}",
+        )
+        db.save_group_state(
+            group_id="grp_test", state_version=2, state_hash="bb" * 32,
+            key_epoch=1, membership_json="[]", policy_json="{}",
+        )
+        state = db.load_group_state("grp_test")
+        assert state["state_version"] == 2
+        assert state["state_hash"] == "bb" * 32

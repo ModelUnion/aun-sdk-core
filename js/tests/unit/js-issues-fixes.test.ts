@@ -395,6 +395,20 @@ describe('JS-007: dissolve 后清理本地状态', () => {
     expect(state['group:grp-2']).toBe(1);
   });
 
+  it('group.pull_events 返回 event_seq 时推进 group_event 命名空间', async () => {
+    const { SeqTracker } = await import('../../src/seq-tracker.js');
+    const tracker = new SeqTracker();
+
+    tracker.onMessageSeq('group_event:grp-1', 1);
+    tracker.onMessageSeq('group_event:grp-1', 4);
+    tracker.onPullResult('group_event:grp-1', [
+      { event_seq: 2, event_type: 'group.announcement_updated' },
+      { event_seq: 3, event_type: 'group.rules_updated' },
+    ]);
+
+    expect(tracker.getContiguousSeq('group_event:grp-1')).toBe(4);
+  });
+
   // ── KeyStore.deleteGroupSecretState ──
   it('IndexedDBKeyStore 应有 deleteGroupSecretState 方法', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');

@@ -13,7 +13,7 @@ sequenceDiagram
 
     C->>G: WebSocket 连接
     G->>C: challenge（nonce, protocol, auth_methods）
-    C->>G: auth.connect（nonce, token, protocol, device, client, delivery_mode）
+    C->>G: auth.connect（nonce, token, protocol, device, client, delivery_mode, capabilities）
     G->>C: hello-ok（identity, capabilities）
     Note over C,G: 握手完成，进入双向 RPC / 事件通信
 ```
@@ -59,6 +59,10 @@ sequenceDiagram
             "mode": "queue",
             "routing": "sender_affinity",
             "affinity_ttl_ms": 300000
+        },
+        "capabilities": {
+            "e2ee": true,
+            "group_e2ee": true
         }
     }
 }
@@ -66,9 +70,11 @@ sequenceDiagram
 
 说明：
 
+- `protocol.min/max` 在 `auth.connect` 阶段完成 Gateway 会话版本协商；详细规则见协议文档 `03-Gateway-连接模式.md`。
 - `device.id` 是设备级稳定标识，Python SDK 默认从 `~/.aun/.device_id` 读取。
 - `client.slot_id` 由应用层显式传入，用于区分同设备上的多个实例槽位。
 - `delivery_mode` 决定该 AID 当前连接的投递语义；同一 AID 的所有在线连接必须保持一致。
+- `capabilities` 是客户端能力声明；`hello-ok.result.capabilities` 是服务端能力公告，不是双方能力交集。
 
 ### (3) hello-ok — 握手完成
 

@@ -85,6 +85,8 @@ class RPCTransport:
         future = loop.create_future()
         self._pending[rpc_id] = future
 
+        import time as _diag_time
+        _t0 = _diag_time.time()
         try:
             await self._ws.send(json.dumps({
                 "jsonrpc": "2.0",
@@ -96,10 +98,19 @@ class RPCTransport:
             self._pending.pop(rpc_id, None)
             raise ConnectionError(f"failed to send rpc {method}: {exc}") from exc
 
+        _t_sent = _diag_time.time()
         try:
             response = await asyncio.wait_for(future, timeout=timeout or self._timeout)
         except asyncio.TimeoutError as exc:
             self._pending.pop(rpc_id, None)
+            _elapsed = _diag_time.time() - _t0
+            print(
+                f"  DEBUG-TRANSPORT: RPC timeout method={method} rpc_id={rpc_id} "
+                f"send_took={_t_sent - _t0:.3f}s total={_elapsed:.3f}s "
+                f"pending_count={len(self._pending)} "
+                f"reader_alive={self._reader_task is not None and not self._reader_task.done() if self._reader_task else False}",
+                flush=True,
+            )
             raise TimeoutError(f"rpc timeout: {method}", retryable=True) from exc
 
         if "error" in response:
@@ -119,11 +130,22 @@ class RPCTransport:
     async def _reader_loop(self) -> None:
         disconnect_error: Exception | None = None
         unexpected_disconnect = False
+        import time as _diag_time
+        import logging
+        _diag_log = logging.getLogger("aun_core.transport")
         try:
             while not self._closed and self._ws is not None:
                 raw = await self._ws.recv()
+                _t_recv = _diag_time.time()
                 message = self._decode_message(raw)
                 await self._route_message(message)
+                _route_elapsed = _diag_time.time() - _t_recv
+                if _route_elapsed > 1.0:
+                    _msg_method = message.get("method", message.get("id", "?"))
+                    print(
+                        f"  DEBUG-TRANSPORT: _route_message slow: {_route_elapsed:.3f}s method/id={_msg_method} pending={len(self._pending)}",
+                        flush=True,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

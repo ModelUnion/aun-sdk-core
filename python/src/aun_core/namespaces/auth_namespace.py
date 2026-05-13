@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 import logging
+import base64
+import re
 import time
 from typing import Any
 
 import aiohttp
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
+from ..auth import _verify_signature
 from ..errors import AUNError, NotFoundError, StateError, ValidationError
 
 _auth_ns_log = logging.getLogger("aun_core")
+_AGENT_MD_SIGNATURE_MARKER = "<!-- AUN-SIGNATURE"
+_AGENT_MD_SIGNATURE_RE = re.compile(
+    r"<!-- AUN-SIGNATURE\r?\n(?P<body>.*?)\r?\n-->\s*\Z",
+    re.DOTALL,
+)
+_AGENT_MD_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
 
 
 def _agent_md_http_scheme(gateway_url: str) -> str:
@@ -23,6 +36,82 @@ def _agent_md_authority(aid: str, discovery_port: int | None) -> str:
     if discovery_port and ":" not in host:
         return f"{host}:{int(discovery_port)}"
     return host
+
+
+def _parse_agent_md_tail_signature(content: str) -> tuple[str, dict[str, str] | None, str | None]:
+    marker_index = content.rfind(_AGENT_MD_SIGNATURE_MARKER)
+    if marker_index < 0:
+        return content, None, None
+    if marker_index > 0 and content[marker_index - 1] not in "\r\n":
+        return content, None, None
+
+    tail = content[marker_index:]
+    match = _AGENT_MD_SIGNATURE_RE.fullmatch(tail)
+    if not match:
+        return content[:marker_index], None, "malformed signature block"
+
+    fields: dict[str, str] = {}
+    for line in match.group("body").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if ":" not in stripped:
+            return content[:marker_index], None, f"malformed signature field: {stripped}"
+        key, value = stripped.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+
+    for required in ("cert_fingerprint", "timestamp", "signature"):
+        if not fields.get(required):
+            return content[:marker_index], None, f"signature block missing {required}"
+    if not _AGENT_MD_FINGERPRINT_RE.fullmatch(fields["cert_fingerprint"]):
+        return content[:marker_index], None, "invalid cert_fingerprint"
+    try:
+        int(fields["timestamp"])
+    except ValueError:
+        return content[:marker_index], None, "invalid timestamp"
+
+    return content[:marker_index], fields, None
+
+
+def _extract_agent_md_aid(payload: str) -> str:
+    lines = payload.lstrip("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if stripped.startswith("aid:"):
+            value = stripped.split(":", 1)[1].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            return value.strip()
+    return ""
+
+
+def _agent_md_result(
+    status: str,
+    payload: str,
+    *,
+    reason: str = "",
+    aid: str = "",
+    cert_fingerprint: str = "",
+    timestamp: int | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": status,
+        "verified": status == "verified",
+        "payload": payload,
+    }
+    if reason:
+        result["reason"] = reason
+    if aid:
+        result["aid"] = aid
+    if cert_fingerprint:
+        result["cert_fingerprint"] = cert_fingerprint
+    if timestamp is not None:
+        result["timestamp"] = timestamp
+    return result
 
 
 class AuthNamespace:
@@ -193,6 +282,99 @@ class AuthNamespace:
                         + (f" - {message}" if message else "")
                     )
                 return await response.text()
+
+    async def sign_agent_md(self, content: str, *, aid: str | None = None) -> str:
+        target_aid = str(aid or self._client._aid or "").strip()
+        identity = self._client._auth.load_identity_or_none(target_aid or None)
+        if identity is None:
+            raise StateError("no local identity found, call auth.create_aid() first")
+
+        private_key_pem = str(identity.get("private_key_pem") or "").strip()
+        cert_pem = str(identity.get("cert") or "").strip()
+        if not private_key_pem or not cert_pem:
+            raise StateError("local identity missing private key or certificate")
+
+        payload, _, _ = _parse_agent_md_tail_signature(str(content or ""))
+        if payload and not payload.endswith(("\n", "\r")):
+            payload += "\n"
+
+        private_key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+        if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+            raise StateError("agent.md signing requires an EC private key")
+
+        signature = private_key.sign(payload.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        fingerprint = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+        signed_block = "\n".join([
+            "<!-- AUN-SIGNATURE",
+            f"cert_fingerprint: {fingerprint}",
+            f"timestamp: {int(time.time())}",
+            f"signature: {base64.b64encode(signature).decode('ascii')}",
+            "-->",
+        ])
+        return payload + signed_block
+
+    async def verify_agent_md(
+        self,
+        content: str,
+        *,
+        aid: str | None = None,
+        cert_pem: str | None = None,
+    ) -> dict[str, Any]:
+        payload, fields, parse_error = _parse_agent_md_tail_signature(str(content or ""))
+        if fields is None:
+            if parse_error is None:
+                return _agent_md_result("unsigned", payload)
+            return _agent_md_result("invalid", payload, reason=parse_error)
+
+        expected_aid = str(aid or "").strip()
+        payload_aid = _extract_agent_md_aid(payload)
+        if expected_aid and payload_aid and payload_aid != expected_aid:
+            return _agent_md_result("invalid", payload, reason="aid mismatch", aid=payload_aid)
+        if not expected_aid:
+            expected_aid = payload_aid
+
+        cert_text = str(cert_pem or "").strip()
+        if not cert_text:
+            if not expected_aid:
+                return _agent_md_result("invalid", payload, reason="aid required to verify agent.md")
+            try:
+                fetched = await self._client._fetch_peer_cert(expected_aid, fields["cert_fingerprint"])
+                cert_text = fetched.decode("utf-8") if isinstance(fetched, bytes) else str(fetched)
+            except Exception as exc:
+                return _agent_md_result("invalid", payload, reason=str(exc), aid=expected_aid)
+
+        try:
+            cert = x509.load_pem_x509_certificate(cert_text.encode("utf-8"))
+        except Exception as exc:
+            return _agent_md_result("invalid", payload, reason=f"invalid certificate: {exc}", aid=expected_aid)
+
+        actual_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+        if actual_fp.lower() != fields["cert_fingerprint"].lower():
+            return _agent_md_result("invalid", payload, reason="certificate fingerprint mismatch", aid=expected_aid)
+
+        if expected_aid:
+            try:
+                cn = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value
+            except Exception:
+                cn = ""
+            if cn and cn != expected_aid:
+                return _agent_md_result("invalid", payload, reason="certificate aid mismatch", aid=expected_aid)
+
+        try:
+            public_key = cert.public_key()
+            signature = base64.b64decode(fields["signature"], validate=True)
+            _verify_signature(public_key, signature, payload.encode("utf-8"))
+        except Exception as exc:
+            return _agent_md_result("invalid", payload, reason=f"signature verification failed: {exc}", aid=expected_aid, cert_fingerprint=fields["cert_fingerprint"], timestamp=int(fields["timestamp"]))
+
+        return _agent_md_result(
+            "verified",
+            payload,
+            aid=expected_aid or payload_aid,
+            cert_fingerprint=fields["cert_fingerprint"],
+            timestamp=int(fields["timestamp"]),
+        )
 
     async def download_cert(self, params: dict[str, Any] | None = None) -> Any:
         return await self._client.call("auth.download_cert", params or {})

@@ -1,5 +1,6 @@
 from .client import AUNClient
 from .config import get_device_id
+from .e2ee import ProtectedHeaders
 from .types import ConnectionState
 from .errors import (
     AUNError,
@@ -23,11 +24,12 @@ from .errors import (
     E2EEGroupDecryptFailedError,
 )
 
-__version__ = "0.2.8"
+__version__ = "0.2.16"
 
 __all__ = [
     "__version__",
     "AUNClient",
+    "ProtectedHeaders",
     "ConnectionState",
     "get_device_id",
     "AUNError",

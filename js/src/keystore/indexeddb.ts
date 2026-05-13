@@ -2,7 +2,7 @@
 
 import { pemToArrayBuffer } from '../crypto.js';
 import { normalizeInstanceId } from '../config.js';
-import type { KeyStore } from './index.js';
+import type { KeyStore, GroupStateRecord } from './index.js';
 import {
   isJsonObject,
   type GroupOldEpochRecord,
@@ -134,7 +134,7 @@ async function _decryptPEM(enc: EncryptedEnvelope, seed: string): Promise<string
 // ── IndexedDB 工具 ──────────────────────────────────────
 
 const DB_NAME = 'aun-keystore';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 
 /** 对象仓库名称 */
 const STORE_KEY_PAIRS = 'key_pairs';
@@ -145,6 +145,7 @@ const STORE_PREKEYS = 'prekeys';
 const STORE_GROUP_CURRENT = 'group_current';
 const STORE_GROUP_OLD_EPOCHS = 'group_old_epochs';
 const STORE_SESSIONS = 'e2ee_sessions';
+const STORE_GROUP_STATE = 'group_state';
 
 const STRUCTURED_RECOVERY_RETENTION_MS = 7 * 24 * 3600 * 1000;
 const CRITICAL_METADATA_KEYS = [] as const;
@@ -279,6 +280,9 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_SESSIONS)) {
         db.createObjectStore(STORE_SESSIONS);
+      }
+      if (!db.objectStoreNames.contains(STORE_GROUP_STATE)) {
+        db.createObjectStore(STORE_GROUP_STATE);
       }
     };
 
@@ -1275,6 +1279,18 @@ export class IndexedDBKeyStore implements KeyStore {
           ...oldEntry,
           group_id: groupId,
         });
+      } else {
+        // epoch === localEpoch 但 secret 为空：合并 data，保留已有字段
+        const merged = { ...current, ...this._buildGroupCurrentRecord(groupId, opts, members, now) };
+        if (!opts.epochChain && current.epoch_chain) {
+          merged.epoch_chain = current.epoch_chain;
+        }
+        if (current.pending_rotation_id && !opts.pendingRotationId) {
+          merged.pending_rotation_id = current.pending_rotation_id;
+          if (current.pending_created_at) merged.pending_created_at = current.pending_created_at;
+        }
+        await idbPut(STORE_GROUP_CURRENT, currentKey, merged);
+        return true;
       }
     }
 
@@ -1315,7 +1331,15 @@ export class IndexedDBKeyStore implements KeyStore {
     const current = deepClone(currentRaw) as GroupSecretRecord;
     delete current.group_id;
     const localEpoch = Number(current.epoch ?? 0);
-    if (epoch > localEpoch) return false;
+    if (epoch > localEpoch) {
+      // 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
+      const expiresAt = Date.now() + (opts.oldEpochRetentionMs ?? 604800_000);
+      const oldRecord = { ...current, group_id: groupId, expires_at: expiresAt };
+      const oldKey = groupOldStoreKey(aid, groupId, localEpoch);
+      await idbPut(STORE_GROUP_OLD_EPOCHS, oldKey, oldRecord);
+      await idbPut(STORE_GROUP_CURRENT, currentKey, newRecord);
+      return true;
+    }
 
     if (epoch === localEpoch) {
       if (typeof current.secret === 'string' && current.secret !== opts.secret) {
@@ -1627,5 +1651,138 @@ export class IndexedDBKeyStore implements KeyStore {
       }
     }
     return result;
+  }
+
+  // ── Group State（群组状态快照） ─────────────────────────────
+
+  async saveGroupState(groupId: string, state: GroupStateRecord): Promise<void> {
+    const key = encodePart(groupId);
+    await idbPut(STORE_GROUP_STATE, key, {
+      group_id: groupId,
+      state_version: state.state_version,
+      state_hash: state.state_hash,
+      key_epoch: state.key_epoch,
+      membership_json: state.membership_json,
+      policy_json: state.policy_json,
+      updated_at: state.updated_at ?? Date.now(),
+    });
+  }
+
+  async loadGroupState(groupId: string): Promise<GroupStateRecord | null> {
+    const key = encodePart(groupId);
+    const data = await idbGet<GroupStateRecord>(STORE_GROUP_STATE, key);
+    if (!data || typeof data.state_version !== 'number') return null;
+    return {
+      group_id: groupId,
+      state_version: data.state_version,
+      state_hash: data.state_hash ?? '',
+      key_epoch: data.key_epoch ?? 0,
+      membership_json: data.membership_json ?? '[]',
+      policy_json: data.policy_json ?? '{}',
+      updated_at: data.updated_at ?? 0,
+    };
+  }
+
+  // ── Trust Root Storage（信任根证书存储） ─────────────────
+  // 浏览器环境无文件系统，统一存入 STORE_INSTANCE_STATE 并以特定前缀的 key 区分。
+  // 对外返回的"路径"为虚拟标识（indexeddb://...），仅用于日志/兼容字段。
+
+  /** 信任根列表 JSON 在 IndexedDB 中的 key */
+  private static readonly _TRUST_LIST_KEY = '__trust_roots:list';
+  /** 信任根 bundle PEM 在 IndexedDB 中的 key */
+  private static readonly _TRUST_BUNDLE_KEY = '__trust_roots:bundle';
+  /** 单个 root cert 在 IndexedDB 中的 key 前缀 */
+  private static readonly _TRUST_CERT_PREFIX = '__trust_roots:cert:';
+  /** 单个 issuer root cert 在 IndexedDB 中的 key 前缀 */
+  private static readonly _TRUST_ISSUER_PREFIX = '__trust_roots:issuer:';
+
+  /** 计算 PEM 证书的 SHA-256 指纹（hex，无冒号） */
+  private async _pemFingerprint(pem: string): Promise<string> {
+    try {
+      const der = new Uint8Array(pemToArrayBuffer(pem));
+      const hash = await crypto.subtle.digest('SHA-256', der);
+      return Array.from(new Uint8Array(hash))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      // 解析失败时退化为对 PEM 文本本身做哈希（仅用于去重，不暴露）
+      const enc = new TextEncoder().encode(pem);
+      const hash = await crypto.subtle.digest('SHA-256', enc);
+      return Array.from(new Uint8Array(hash))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+  }
+
+  /** 拆分 bundle PEM 文本为单个 PEM 证书数组 */
+  private _splitPemBundle(bundleText: string): string[] {
+    return bundleText
+      .split(/(?<=-----END CERTIFICATE-----)\s*/)
+      .map(s => s.trim())
+      .filter(s => s.startsWith('-----BEGIN CERTIFICATE-----'));
+  }
+
+  async saveTrustRoots(
+    trustList: Record<string, unknown>,
+    rootCerts: Array<{ id?: string; cert_pem: string; fingerprint_sha256?: string }>,
+  ): Promise<string> {
+    // 保存每个根证书到独立 key
+    for (let i = 0; i < rootCerts.length; i++) {
+      const item = rootCerts[i];
+      const certId = item.id || item.fingerprint_sha256 || `root-${i + 1}`;
+      const safeName = certId.replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120);
+      await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_CERT_PREFIX + safeName, item.cert_pem);
+    }
+
+    // 生成合并 bundle
+    const bundle = rootCerts.map(i => i.cert_pem.trim()).join('\n') + '\n';
+    await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_BUNDLE_KEY, bundle);
+
+    // 保存元数据 JSON
+    await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_LIST_KEY, deepClone(trustList));
+
+    return 'indexeddb://trust-roots/bundle';
+  }
+
+  async saveIssuerRootCert(
+    issuer: string,
+    certPem: string,
+    fingerprintSha256: string = '',
+  ): Promise<[string, string]> {
+    const safeIssuer = (issuer || 'issuer').replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120);
+    const certKey = IndexedDBKeyStore._TRUST_ISSUER_PREFIX + safeIssuer;
+    const normalizedPem = certPem.trim() + '\n';
+
+    // 保存 issuer 根证书
+    await idbPut(STORE_INSTANCE_STATE, certKey, normalizedPem);
+
+    // 读取已有 bundle 并合并（按指纹去重）
+    const existingPems = new Map<string, string>();
+    const existingBundle = await idbGet<string>(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_BUNDLE_KEY);
+    if (typeof existingBundle === 'string' && existingBundle) {
+      for (const pem of this._splitPemBundle(existingBundle)) {
+        const fp = await this._pemFingerprint(pem);
+        existingPems.set(fp, pem);
+      }
+    }
+
+    // 新证书的指纹
+    let newFp = await this._pemFingerprint(normalizedPem);
+    if (fingerprintSha256) {
+      newFp = fingerprintSha256.toLowerCase().replace(/^sha256:/, '');
+    }
+    existingPems.set(newFp, normalizedPem);
+
+    // 重写 bundle
+    const merged = Array.from(existingPems.values()).map(p => p.trim()).join('\n') + '\n';
+    await idbPut(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_BUNDLE_KEY, merged);
+
+    return [`indexeddb://trust-roots/issuers/${safeIssuer}`, 'indexeddb://trust-roots/bundle'];
+  }
+
+  async loadTrustRoots(): Promise<Record<string, unknown> | null> {
+    const data = await idbGet<JsonObject>(STORE_INSTANCE_STATE, IndexedDBKeyStore._TRUST_LIST_KEY);
+    if (!isRecord(data)) return null;
+    return deepClone(data);
   }
 }

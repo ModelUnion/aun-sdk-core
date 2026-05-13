@@ -210,6 +210,11 @@ func (m *GroupE2EEManager) RotateEpochTo(groupID string, targetEpoch int, member
 			prevChain = ec
 		}
 	}
+	// 调用方可通过 rotationIDs 的第二个元素传入 prevChainHint（从服务端 committed_rotation 获取），
+	// 仅在本地没有 prev chain 时使用（新成员没有 prev epoch key 但需要发起轮换的场景）。
+	if prevChain == "" && len(rotationIDs) > 1 && strings.TrimSpace(rotationIDs[1]) != "" {
+		prevChain = strings.TrimSpace(rotationIDs[1])
+	}
 
 	gs := GenerateGroupSecret()
 	commitment := ComputeMembershipCommitment(memberAIDs, targetEpoch, groupID, gs)
@@ -294,7 +299,8 @@ func (m *GroupE2EEManager) CleanExpiredCaches() {
 
 // Encrypt 加密群组消息（含发送方签名）
 // 无密钥时返回 E2EEGroupSecretMissingError
-func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[string]any, error) {
+func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any, options ...E2EEEncryptOptions) (map[string]any, error) {
+	opts := firstE2EEEncryptOptions(options)
 	aid := m.currentAID()
 	lockKey, mu := acquireGroupSecretLock(aid, groupID)
 	secretData, err := LoadGroupSecret(m.keystore, aid, groupID, nil)
@@ -313,14 +319,21 @@ func (m *GroupE2EEManager) Encrypt(groupID string, payload map[string]any) (map[
 	epoch := int(toInt64(secretData["epoch"]))
 	secret, _ := secretData["secret"].([]byte)
 
-	msgID := fmt.Sprintf("gm-%s", generateUUID4())
+	msgID := opts.MessageID
+	if msgID == "" {
+		msgID = fmt.Sprintf("gm-%s", generateUUID4())
+	}
 	ts := time.Now().UnixMilli()
+	if opts.Timestamp > 0 {
+		ts = opts.Timestamp
+	}
 
-	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM, []byte(senderCertPEM))
+	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM, []byte(senderCertPEM), opts)
 }
 
 // EncryptWithEpoch 使用指定 committed epoch 加密群组消息。
-func (m *GroupE2EEManager) EncryptWithEpoch(groupID string, epoch int, payload map[string]any) (map[string]any, error) {
+func (m *GroupE2EEManager) EncryptWithEpoch(groupID string, epoch int, payload map[string]any, options ...E2EEEncryptOptions) (map[string]any, error) {
+	opts := firstE2EEEncryptOptions(options)
 	aid := m.currentAID()
 	lockKey, mu := acquireGroupSecretLock(aid, groupID)
 	secretData, err := LoadGroupSecret(m.keystore, aid, groupID, &epoch)
@@ -339,9 +352,15 @@ func (m *GroupE2EEManager) EncryptWithEpoch(groupID string, epoch int, payload m
 	}
 	senderCertPEM, _ := identity["cert"].(string)
 	secret, _ := secretData["secret"].([]byte)
-	msgID := fmt.Sprintf("gm-%s", generateUUID4())
+	msgID := opts.MessageID
+	if msgID == "" {
+		msgID = fmt.Sprintf("gm-%s", generateUUID4())
+	}
 	ts := time.Now().UnixMilli()
-	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM, []byte(senderCertPEM))
+	if opts.Timestamp > 0 {
+		ts = opts.Timestamp
+	}
+	return EncryptGroupMessage(secret, payload, groupID, aid, msgID, ts, epoch, senderPkPEM, []byte(senderCertPEM), opts)
 }
 
 // Decrypt 解密单条群组消息

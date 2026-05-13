@@ -160,6 +160,17 @@ class FileKeyStore(KeyStore):
                 self._aid_dbs[safe] = AIDDatabase(db_path, self._sqlite_key)
             return self._aid_dbs[safe]
 
+    def close(self) -> None:
+        """关闭当前 keystore 持有的 SQLite 连接。"""
+        with self._aid_dbs_lock:
+            dbs = list(self._aid_dbs.values())
+            self._aid_dbs.clear()
+        for db in dbs:
+            try:
+                db.close()
+            except Exception as exc:
+                _log.debug("关闭 AID 数据库失败: %s", exc)
+
     # ── 公共 API ─────────────────────────────────────────────
 
     def load_identity(self, aid: str) -> dict | None:
@@ -401,6 +412,16 @@ class FileKeyStore(KeyStore):
                 )
                 conn.commit()
             return len(to_delete)
+
+    def save_group_state(self, aid: str, **kwargs) -> None:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            self._get_db(aid).save_group_state(**kwargs)
+
+    def load_group_state(self, aid: str, group_id: str) -> dict | None:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).load_group_state(group_id)
 
     def load_group_secret_epoch(self, aid: str, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
         lock = self._get_metadata_lock(aid)

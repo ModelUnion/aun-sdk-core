@@ -10,11 +10,19 @@
 - [connect()](#await-connectauth-dict-options-dict--none---none) - 建立连接
 - [call()](#await-callmethod-str-params-dict--none---any) - 调用 RPC 方法
 - [on()](#onevent-str-handler-callable---subscription) - 订阅事件
+- [off()](#offevent-str-handler-callable---none) - 注销事件处理器
 - [close()](#await-close---none) - 关闭连接
+- [disconnect()](#await-disconnect---none) - 断开连接（可重连）
+- [list_identities()](#list_identities---listdict) - 列出本地身份
+- [ping()](#await-pingparams-dict--none---any) - 连通性探测
+- [status()](#await-statusparams-dict--none---any) - 网关状态查询
+- [check_gateway_health()](#await-check_gateway_healthgateway_url-str-timeout-float--50---bool) - 检查网关可用性
 
 ### [AUNClient.Auth](#authnamespace-clientauth)
 - [create_aid()](#await-create_aidparams-dict---dict) - 注册新 AID
 - [authenticate()](#await-authenticateparams-dict--none---dict) - 认证获取令牌
+- [sign_agent_md()](#await-sign_agent_mdcontent-str-aid-str--none---str) - 为 agent.md 生成尾部签名
+- [verify_agent_md()](#await-verify_agent_mdcontent-str-aid-str--none-cert_pem-str--none---dict) - 验证 agent.md 尾部签名
 - [upload_agent_md()](#await-upload_agent_mdcontent-str---dict) - 上传自己的 agent.md
 - [download_agent_md()](#await-download_agent_mdaid-str---str) - 下载指定 AID 的 agent.md
 - [renew_cert()](#await-renew_certparams-dict--none---dict) - 续期证书
@@ -23,6 +31,8 @@
 - [download_cert()](#await-download_certparams-dict--none---any) - 下载证书
 
 ### [AUNClient.Meta](#metanamespace-clientmeta)
+- [ping()](#await-clientmetapingparams-dict--none--none---any) - 连通性探测
+- [status()](#await-clientmetastatusparams-dict--none--none---any) - 网关状态查询
 - [trust_roots()](#await-clientmetatrust_rootsparams-dict--none--none---any) - 查询信任根
 - [download_trust_roots()](#await-clientmetadownload_trust_rootsurl-str--none--none--gateway_url-str--none--none-timeout-float--100---dict) - 下载信任根列表
 - [download_issuer_root_cert()](#await-clientmetadownload_issuer_root_certissuer-str-url-str--none--none-timeout-float--100---str) - 下载 issuer Root CA 证书
@@ -96,11 +106,12 @@ client = AUNClient({
 | 属性 | 类型 | 说明 |
 |------|------|------|
 | `aid` | `str \| None` | 当前连接的 AID |
-| `state` | `str` | 连接状态 (`idle` / `connecting` / `connected` / `disconnected` / `closed`) |
+| `state` | `str` | 连接状态 (`idle` / `connecting` / `authenticating` / `connected` / `disconnected` / `reconnecting` / `terminal_failed` / `closed`) |
 | `auth` | `AuthNamespace` | 认证命名空间 |
 | `meta` | `MetaNamespace` | 元信息与信任根管理命名空间 |
 | `e2ee` | `E2EEManager` | P2P E2EE 工具类 |
 | `group_e2ee` | `GroupE2EEManager` | 群组 E2EE 工具类（当前 Python SDK 固定可用） |
+| `gateway_health` | `bool \| None` | 最近一次 health check 结果，`None` 表示尚未检查 |
 
 ---
 
@@ -124,13 +135,13 @@ client = AUNClient({
 |------|------|--------|------|
 | `slot_id` | `str` | `""` | 同一设备上的实例槽位；空字符串表示该设备单实例模式 |
 | `delivery_mode.mode` | `str` | `"fanout"` | 连接级投递语义；同一 AID 的所有在线实例必须保持一致 |
-| `delivery_mode.routing` | `str` | `"sender_affinity"` | 仅 `queue` 模式有效 |
+| `delivery_mode.routing` | `str` | `"round_robin"` | 仅 `queue` 模式有效 |
 | `delivery_mode.affinity_ttl_ms` | `int` | `300000` | 仅 `queue + sender_affinity` 有效 |
 | `auto_reconnect` | `bool` | `True` | 断线自动重连 |
 | `heartbeat_interval` | `float` | `30.0` | 心跳间隔（秒） |
 | `token_refresh_before` | `float` | `60.0` | 令牌过期前多久刷新（秒） |
-| `retry.initial_delay` | `float` | `0.5` | 首次重连延迟（秒） |
-| `retry.max_delay` | `float` | `30.0` | 最大重连延迟（秒） |
+| `retry.initial_delay` | `float` | `1.0` | 首次重连延迟（秒） |
+| `retry.max_delay` | `float` | `64.0` | 最大重连延迟（秒） |
 | `timeouts.connect` | `float` | `5.0` | 连接超时（秒） |
 | `timeouts.call` | `float` | `10.0` | RPC 调用超时（秒） |
 | `timeouts.http` | `float` | `30.0` | HTTP 请求超时（秒） |
@@ -163,10 +174,16 @@ await client.connect(auth, {
 **E2EE 自动加密/解密**：
 
 - `message.send` 和 `group.send` **默认加密发送**（`encrypt` 默认 `True`），无需显式传参
+- `message.thought.put` **强制 P2P E2EE 加密**，`encrypt=False` 会被拒绝
+- `group.thought.put` **强制群组 E2EE 加密**，`encrypt=False` 会被拒绝
 - 发送明文消息需显式传 `encrypt=False`
 - `message.pull` / `group.pull` 返回的消息已自动解密，加密消息带有 `encrypted=True` 标记
+- `message.thought.get` 返回前自动解密服务端密文 `items`，应用层读取 `thoughts[]`
+- `group.thought.get` 返回前自动解密服务端密文 `items`，应用层读取 `thoughts[]`
 - P2P 消息的投递语义由连接阶段声明的 `delivery_mode` 决定
 - `group.send` 固定为 `fanout`，不支持 `queue`
+- 群消息的 `dispatch_mode` 来自群设置，SDK 会在解密后保留顶层 `dispatch_mode` 并注入 `payload.dispatch_mode`
+- `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 可传 `protected_headers`，SDK 会为它和 thought `context` 生成独立 `_auth`，接收端验通过后在 `message.e2ee.protected_headers` / `message.e2ee.context` 暴露给应用层
 - Python SDK 会为 `message.pull` / `message.ack` 自动附带当前实例的 `device_id` / `slot_id`，应用层不应手工覆盖
 
 ```python
@@ -196,8 +213,65 @@ await client.call("message.send", {
 | `encrypt` | `bool` | 否 | 是否加密消息（默认 `true`） |
 | `message_id` | `str` | 否 | 消息 ID（不传则自动生成） |
 | `timestamp` | `int` | 否 | 时间戳毫秒（不传则自动生成） |
+| `protected_headers` / `headers` | `dict` / `ProtectedHeaders` | 否 | E2EE 信封元数据，类似 HTTP headers；SDK 自动补 `payload_type` 并做 `_auth` 防篡改 |
 
 P2P 消息的 `delivery_mode` 由当前连接实例携带；应用层通过 `connect` 配置即可。
+
+**`message.thought.put/get` 额外参数**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `to` | `str` | put 必填 | P2P 会话另一方 AID |
+| `context.type` | `str` | 是 | 思考上下文类型，推荐 `run` |
+| `context.id` | `str` | 是 | 思考上下文 ID，如 `run_id` |
+| `payload` | `dict` | put 必填 | 思考内容，推荐 `{"type": "thought", "text": "..."}` |
+| `sender_aid` | `str` | get 必填 | thought 作者 AID |
+| `peer_aid` / `to` | `str` | 条件必填 | 读取自己写的 thought 时指定会话另一方 |
+| `protected_headers` / `headers` | `dict` / `ProtectedHeaders` | put 可选 | E2EE 信封元数据；`context` 会另行绑定到信封内并验 `_auth` |
+
+`message.thought.put/get` 只使用 `context.type + context.id` 定位 thought head。
+
+```python
+await client.call("message.thought.put", {
+    "to": "bob.agentid.pub",
+    "context": {"type": "run", "id": "run-xxx"},
+    "payload": {"type": "thought", "text": "先核对约束"},
+})
+
+result = await client.call("message.thought.get", {
+    "sender_aid": "bob.agentid.pub",
+    "context": {"type": "run", "id": "run-xxx"},
+})
+```
+
+**ProtectedHeaders 读取位置**：
+
+```python
+from aun_core import ProtectedHeaders
+
+headers = ProtectedHeaders({"device_id": "dev-123"}).set("slot_id", "desktop")
+await client.call("group.send", {
+    "group_id": "10001.example.com",
+    "payload": {"type": "text", "text": "群组消息"},
+    "protected_headers": headers,
+})
+
+pulled = await client.call("group.pull", {"group_id": "10001.example.com"})
+received_headers = pulled["messages"][0].get("e2ee", {}).get("protected_headers", {})
+```
+
+`payload_type` 由 SDK 根据加密前 `payload.type` 自动设置，应用层不需要传。完整安全语义见 [05-E2EE加密通信](05-E2EE加密通信.md#protectedheaders-与可验证上下文)。
+
+**群消息 `dispatch_mode` 设置**：
+
+```python
+await client.call("group.set_settings", {
+    "group_id": "g-abc123.agentid.pub",
+    "settings": {"dispatch_mode": "mention"},
+})
+```
+
+后续 `group.send` / `group.pull` / `group.message_created` 中的群消息会携带 `dispatch_mode`，取值为 `"broadcast"` 或 `"mention"`。
 
 ---
 
@@ -212,8 +286,6 @@ P2P 消息的 `delivery_mode` 由当前连接实例携带；应用层通过 `con
 
 **返回值**: `Subscription` 对象（可调用 `.unsubscribe()` 取消订阅）
 
-> 当前 Python SDK 不提供 `client.off(event, handler)` 便利方法。取消订阅请保留 `Subscription` 句柄并调用 `.unsubscribe()`。
-
 > 事件处理器内部抛出的异常会被 SDK 记录并吞掉，不会中断其他处理器，也不会自动重新抛回到调用方。
 
 ```python
@@ -223,9 +295,101 @@ sub.unsubscribe()
 
 ---
 
+### `off(event: str, handler: Callable) -> None`
+
+注销指定的事件处理器。等价于通过 `Subscription.unsubscribe()` 取消订阅，但无需保留订阅句柄。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `event` | `str` | 是 | 事件名 |
+| `handler` | `Callable` | 是 | 之前传给 `on()` 的同一处理函数引用 |
+
+> 若传入的 handler 未注册，调用无副作用（幂等）。
+
+```python
+def handle_msg(e):
+    print(e)
+
+client.on("message.received", handle_msg)
+# ... 之后取消订阅
+client.off("message.received", handle_msg)
+```
+
+---
+
 ### `await close() -> None`
 
-关闭连接，停止心跳、令牌刷新、重连等所有后台任务。
+关闭连接，停止心跳、令牌刷新、重连等所有后台任务。调用后客户端进入 `closed` 状态，不可再次 `connect()`。
+
+---
+
+### `await disconnect() -> None`
+
+断开 WebSocket 连接，但不销毁客户端。与 `close()` 的区别：`disconnect()` 后可再次调用 `connect()` 重新建立连接；`close()` 则彻底终止客户端生命周期。
+
+断开后状态变为 `disconnected`，并发布 `connection.state` 事件。若客户端已在 `closing` 流程中，调用无副作用。
+
+```python
+await client.disconnect()
+# 之后可重新连接
+auth = await client.auth.authenticate({"aid": MY_AID})
+await client.connect(auth)
+```
+
+---
+
+### `list_identities() -> list[dict]`
+
+返回本地 keystore 中所有已存储且拥有有效私钥的身份摘要列表（同步方法，无需 `await`）。
+
+**返回值**: 每个元素结构为：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `aid` | `str` | AID |
+| `metadata` | `dict` | 该 AID 的本地元数据（若存在） |
+
+```python
+identities = client.list_identities()
+for item in identities:
+    print(item["aid"])
+```
+
+---
+
+### `await ping(params: dict | None) -> Any`
+
+调用 `meta.ping` RPC，等价于 `await client.meta.ping(params)`。用于连通性探测或心跳检测。
+
+---
+
+### `await status(params: dict | None) -> Any`
+
+调用 `meta.status` RPC，等价于 `await client.meta.status(params)`。返回网关服务状态信息。
+
+---
+
+### `await check_gateway_health(gateway_url: str, timeout: float = 5.0) -> bool`
+
+基于传入的 Gateway WebSocket URL 动态构造健康检查地址：将末尾路径替换为 `/health`，并将 `wss://` / `ws://` 分别转换为 `https://` / `http://`。随后向该地址发送 `GET /health` 请求，检查网关可用性。结果同步更新 `gateway_health` 属性。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `gateway_url` | `str` | — | 服务器发现返回的网关 WebSocket URL（`wss://.../aun` 或 `ws://.../aun`） |
+| `timeout` | `float` | `5.0` | 超时秒数 |
+
+返回 `True` 表示网关可用（HTTP 200），`False` 表示不可用或超时。
+
+> **说明**：`discover()` 成功后会自动异步触发一次 health check，无需手动调用。
+
+**各语言对应 API**
+
+| 语言 | 属性 | 方法 |
+|------|------|------|
+| Python | `client.gateway_health` | `await client.check_gateway_health(url)` |
+| TypeScript | `client.gatewayHealth` | `await client.checkGatewayHealth(url)` |
+| Go | `client.GatewayHealth()` | `client.CheckGatewayHealth(ctx, url, timeout)` |
+| JS (browser) | `client.gatewayHealth` | `await client.checkGatewayHealth(url)` |
 
 ---
 
@@ -285,6 +449,61 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 
 ---
 
+### `await sign_agent_md(content: str, aid: str | None = None) -> str`
+
+为 `agent.md` 生成尾部签名块。
+
+**参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `content` | `str` | 是 | 完整的 `agent.md` 文本（YAML frontmatter + Markdown 正文 + 可选尾部签名块） |
+| `aid` | `str` | 否 | 指定要使用的本地身份 AID；不传则使用当前 AID |
+
+**返回值**
+
+签名后的完整 `agent.md` 文本。
+
+**说明**
+
+- 若输入内容已经带有尾部签名块，会先剥离旧签名再重新签名
+- 签名块位于文件尾部，签名内容只覆盖签名块之前的全部字节
+- 签名块本身不参与验证时的 payload 计算
+
+---
+
+### `await verify_agent_md(content: str, aid: str | None = None, cert_pem: str | None = None) -> dict`
+
+验证 `agent.md` 尾部签名。
+
+**参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `content` | `str` | 是 | 完整的 `agent.md` 文本 |
+| `aid` | `str` | 否 | 预期 AID；用于校验 payload 中的 `aid` 与证书归属 |
+| `cert_pem` | `str` | 否 | 直接提供对端证书 PEM；不传时 SDK 会按 `aid + cert_fingerprint` 拉取 |
+
+**返回值**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | `str` | `verified` / `invalid` / `unsigned` |
+| `verified` | `bool` | 是否验签成功 |
+| `payload` | `str` | 去掉尾部签名块后的原始内容 |
+| `reason` | `str` | 失败原因（仅 `invalid` 时可能存在） |
+| `aid` | `str` | 关联 AID |
+| `cert_fingerprint` | `str` | 使用的证书指纹 |
+| `timestamp` | `int` | 签名时间戳 |
+
+**说明**
+
+- `unsigned` 表示文件未带签名块，不视为错误
+- 若 `cert_pem` 未提供，SDK 会根据 `aid` 和签名块里的 `cert_fingerprint` 拉取对端证书再验签
+- 验签失败不会抛异常，而是通过 `status=invalid` 返回原因
+
+---
+
 ### `await upload_agent_md(content: str) -> dict`
 
 上传当前 AID 的公开 `agent.md` 文档。
@@ -293,7 +512,7 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `content` | `str` | 是 | 完整的 `agent.md` 文本（YAML frontmatter + Markdown 正文） |
+| `content` | `str` | 是 | 完整的 `agent.md` 文本（YAML frontmatter + Markdown 正文 + 可选尾部签名块） |
 
 **返回值**
 
@@ -359,72 +578,49 @@ agent_md = await client.auth.download_agent_md("bob.agentid.pub")
 
 ### `await renew_cert(params: dict | None) -> dict`
 
-续期当前 AID 的证书（保持相同密钥，只延长有效期）。
+续期当前 AID 的证书（保持相同密钥，只延长有效期）。透传到 `auth.renew_cert` RPC。
 
 **使用场景**: 证书即将过期时的日常续期操作
 
-**参数**
+**参数 / 返回值**: 详见协议文档 [01-身份与凭证协议-auth §1.6 auth.renew_cert](../../docs/protocol/01-身份与凭证协议-auth.md)
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `aid` | `str` | 是 | AID |
-| `public_key` | `str` | 是 | 公钥（Base64 编码的 SPKI 格式） |
-| `curve` | `str` | 否 | 曲线类型，默认 `P-256`（可选 `P-384` / `Ed25519`） |
-
-**返回值**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `cert` | `str` | 新证书（PEM 格式） |
-| `serial_number` | `str` | 证书序列号（十六进制） |
-| `valid_notbefore` | `int` | 生效时间戳（秒） |
-| `valid_notafter` | `int` | 过期时间戳（秒） |
-
-**注意**: 旧证书会被降级为 `verify_only` 状态，不再用于签名但仍可验证历史签名
+**注意**: 各 SDK 均提供对应便捷方法；也都可直接通过底层 `auth.renew_cert` RPC 调用
 
 ---
 
 ### `await rekey(params: dict | None) -> dict`
 
-重新生成密钥对并签发新证书（用于密钥泄露后的安全恢复）。
+重新生成密钥对并签发新证书（用于密钥泄露后的安全恢复）。透传到 `auth.rekey` RPC。
 
 **使用场景**: 密钥泄露、安全事件响应、主动密钥轮换
 
-**参数**
+**参数 / 返回值**: 详见协议文档 [01-身份与凭证协议-auth §1.6 auth.rekey](../../docs/protocol/01-身份与凭证协议-auth.md)
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `aid` | `str` | 是 | AID |
-| `new_public_key` | `str` | 是 | 新公钥（Base64 编码的 SPKI 格式） |
-| `curve` | `str` | 否 | 曲线类型，默认 `P-256` |
-| `old_serial` | `str` | 否 | 旧证书序列号（可选） |
-
-**返回值**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `cert` | `str` | 新证书（PEM 格式） |
-| `serial_number` | `str` | 证书序列号（十六进制） |
-| `valid_notbefore` | `int` | 生效时间戳（秒） |
-| `valid_notafter` | `int` | 过期时间戳（秒） |
-
-**注意**: 旧证书会被降级为 `verify_only` 后立即吊销，不再可用
+**注意**: 各 SDK 均提供对应便捷方法；也都可直接通过底层 `auth.rekey` RPC 调用
 
 ---
 
 ### `await request_cert(params: dict) -> dict`
 
-通用的证书请求接口（支持自定义参数）。
+通用的证书请求接口。透传到 `auth.request_cert` RPC。
 
-**使用场景**: 高级场景，需要指定特殊参数（如不同用途、自定义扩展等）
+**使用场景**: 为已有 AID 申请不同曲线的额外证书
 
-**参数**: 根据具体需求传递，详见后端 RPC 手册
+**参数 / 返回值**: 详见协议文档 [01-身份与凭证协议-auth §1.6 auth.request_cert](../../docs/protocol/01-身份与凭证协议-auth.md)
 
-**返回值**: 签发的证书信息
+**注意**: 各 SDK 均提供对应便捷方法；也都可直接通过底层 `auth.request_cert` RPC 调用
 
 ---
 
 ## MetaNamespace (`client.meta`)
+
+### `await client.meta.ping(params: dict | None = None) -> Any`
+
+调用 `meta.ping` RPC，检测与网关的连通性。需已连接。
+
+### `await client.meta.status(params: dict | None = None) -> Any`
+
+调用 `meta.status` RPC，获取网关服务状态信息。需已连接。
 
 ### `await client.meta.trust_roots(params: dict | None = None) -> Any`
 
@@ -771,11 +967,18 @@ GroupE2EEManager(
 | `message.received` | 收到新消息推送 | `Message` 对象 |
 | `message.recalled` | 消息被撤回 | 撤回信息 |
 | `message.ack` | 消息已读确认 | `{"ack_seq": N, "device_id": "...", "slot_id": "..."}` |
+| `message.undecryptable` | P2P 消息解密失败 | 原始加密消息 |
 | `group.changed` | 群组状态变更 | 变更详情 |
+| `group.message_created` | 收到群消息推送 | 群消息对象 |
+| `group.message_undecryptable` | 群消息解密失败 | 原始加密群消息 |
+| `storage.object_changed` | 存储对象变更（put/delete） | `{"action": "put"/"delete", "owner_aid": "...", "object_key": "..."}` |
+| `e2ee.degraded` | E2EE 降级为 long_term_key | `{"peer_aid": "...", "reason": "..."}` |
+| `e2ee.orchestration_error` | 群 E2EE 编排失败 | 错误详情 |
 | `connection.state` | 连接状态变化 | `{"state": "..."}` |
 | `connection.challenge` | 收到认证挑战 | 挑战参数 |
 | `connection.error` | 连接发生错误 | 异常信息 |
 | `token.refreshed` | 访问令牌已刷新 | `{"aid": "..."}` |
+| `token.refresh_exhausted` | Token 刷新重试耗尽 | `{"aid": "...", "consecutive_failures": N}` |
 | `notification` | 未分类推送通知 | 原始消息体 |
 
 ---

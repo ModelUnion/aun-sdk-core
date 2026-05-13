@@ -1345,6 +1345,24 @@ export class AuthFlow {
 
   // ── 内部方法：受信根证书 ──────────────────────────
 
+  /** 重新解析信任根证书，供导入新根证书后刷新使用。 */
+  reloadTrustedRoots(): number {
+    this._rootCerts = null;
+    this._gatewayCaVerified.clear();
+    this._chainVerifiedCache.clear();
+    const roots = this._loadTrustedRoots();
+    return roots.length;
+  }
+
+  /** 运行时追加根证书 PEM（追加到用户自定义根证书中） */
+  addTrustedRootPem(pem: string): void {
+    this._rootCaPem = this._rootCaPem ? this._rootCaPem + '\n' + pem : pem;
+    // 清空缓存，下次验证时重新加载
+    this._rootCerts = null;
+    this._gatewayCaVerified.clear();
+    this._chainVerifiedCache.clear();
+  }
+
   private _loadTrustedRoots(): ParsedCert[] {
     if (this._rootCerts) return this._rootCerts;
 
@@ -1388,8 +1406,10 @@ export class AuthFlow {
     if (typeof accessToken === 'string' && accessToken) identity.access_token = accessToken;
     if (typeof refreshToken === 'string' && refreshToken) identity.refresh_token = refreshToken;
     if (typeof authResult.token === 'string' && authResult.token) identity.kite_token = authResult.token;
-    if (typeof expiresIn === 'number') {
+    if (typeof expiresIn === 'number' && expiresIn > 0) {
       identity.access_token_expires_at = Math.floor(Date.now() / 1000 + expiresIn);
+    } else if (typeof accessToken === 'string' && accessToken) {
+      identity.access_token_expires_at = Math.floor(Date.now() / 1000 + 3600);
     }
     // login2 响应含 new_cert 时（证书过半自动续期），暂存待验证
     const newCert = authResult.new_cert;

@@ -64,6 +64,9 @@ def _build_ocsp_response(cert: x509.Certificate, issuer_cert: x509.Certificate, 
     elif status == "revoked":
         cert_status = ocsp.OCSPCertStatus.REVOKED
         revocation_time = now
+    elif status == "unknown":
+        cert_status = ocsp.OCSPCertStatus.UNKNOWN
+        revocation_time = None
     else:
         raise ValueError(f"unsupported status: {status}")
     issuer_name_hash = hashlib.sha256(issuer_cert.subject.public_bytes()).digest()
@@ -259,6 +262,33 @@ def test_fetch_gateway_ocsp_status_rejects_revoked_response():
         flow._fetch_gateway_ocsp_status("wss://gw.example/aun", identity_cert, issuer_cert)
     )
     assert result["status"] == "revoked"
+
+
+def test_fetch_gateway_ocsp_status_parses_unknown_response():
+    root_key, root_cert, root_pem = _build_cert("root.test", ca=True)
+    issuer_key, issuer_cert, _issuer_pem = _build_cert("issuer.test", issuer_cert=root_cert, issuer_key=root_key, ca=True)
+    _identity_key, identity_cert, _identity_pem = _build_cert(
+        "auth.identity",
+        issuer_cert=issuer_cert,
+        issuer_key=issuer_key,
+        ca=False,
+    )
+
+    flow = _make_auth_flow(root_pem)
+    response_b64 = _build_ocsp_response(identity_cert, issuer_cert, issuer_key, status="unknown")
+
+    async def fake_fetch_json(url: str) -> dict:
+        return {
+            "status": "unknown",
+            "ocsp_response": response_b64,
+        }
+
+    flow._fetch_json = fake_fetch_json  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        flow._fetch_gateway_ocsp_status("wss://gw.example/aun", identity_cert, issuer_cert)
+    )
+    assert result["status"] == "unknown"
 
 
 # ── P0-1: verify_peer_certificate 测试 ──────────────────────

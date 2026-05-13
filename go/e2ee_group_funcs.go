@@ -1,9 +1,11 @@
 package aun
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -227,7 +229,9 @@ func EncryptGroupMessage(
 	epoch int,
 	senderPrivateKeyPEM string,
 	senderCertPEM []byte,
+	options ...E2EEEncryptOptions,
 ) (map[string]any, error) {
+	opts := firstE2EEEncryptOptions(options)
 	// 派生单条消息密钥
 	msgKey, err := deriveGroupMsgKey(groupSecret, groupID, messageID)
 	if err != nil {
@@ -253,6 +257,16 @@ func EncryptGroupMessage(
 		"encryption_mode": ModeEpochGroupKey,
 		"suite":           SuiteP256,
 	}
+	envelope := map[string]any{
+		"type":            "e2ee.group_encrypted",
+		"version":         "1",
+		"encryption_mode": ModeEpochGroupKey,
+		"suite":           SuiteP256,
+		"epoch":           epoch,
+	}
+	if err := copyOptionalEnvelopeMetadata(envelope, payload, opts, msgKey); err != nil {
+		return nil, err
+	}
 	aadBytes := aadBytesGroup(aad)
 
 	block, err := aes.NewCipher(msgKey)
@@ -268,17 +282,10 @@ func EncryptGroupMessage(
 	ciphertext := ciphertextWithTag[:tagStart]
 	tag := ciphertextWithTag[tagStart:]
 
-	envelope := map[string]any{
-		"type":            "e2ee.group_encrypted",
-		"version":         "1",
-		"encryption_mode": ModeEpochGroupKey,
-		"suite":           SuiteP256,
-		"epoch":           epoch,
-		"nonce":           base64.StdEncoding.EncodeToString(nonce),
-		"ciphertext":      base64.StdEncoding.EncodeToString(ciphertext),
-		"tag":             base64.StdEncoding.EncodeToString(tag),
-		"aad":             aad,
-	}
+	envelope["nonce"] = base64.StdEncoding.EncodeToString(nonce)
+	envelope["ciphertext"] = base64.StdEncoding.EncodeToString(ciphertext)
+	envelope["tag"] = base64.StdEncoding.EncodeToString(tag)
+	envelope["aad"] = aad
 
 	// 发送方签名
 	if senderPrivateKeyPEM != "" {
@@ -391,6 +398,9 @@ func DecryptGroupMessage(
 	if aad != nil {
 		aadBytes = aadBytesGroup(aad)
 	}
+	if !verifyEnvelopeMetadataAuth(payload, msgKey) {
+		return nil
+	}
 
 	plaintext, err := aesGCMDecrypt(msgKey, nonce, ciphertext, tag, aadBytes)
 	if err != nil {
@@ -401,16 +411,26 @@ func DecryptGroupMessage(
 	if err := json.Unmarshal(plaintext, &decoded); err != nil {
 		return nil
 	}
+	if !validateDecryptedEnvelopeMetadata(decoded, payload, message) {
+		return nil
+	}
 
 	result := copyMapShallow(message)
 	result["payload"] = decoded
 	result["encrypted"] = true
-	result["e2ee"] = map[string]any{
+	e2ee := map[string]any{
 		"encryption_mode": ModeEpochGroupKey,
 		"suite":           SuiteP256,
 		"epoch":           epoch,
 		"sender_verified": false,
 	}
+	if protectedHeaders := exposedEnvelopeMetadata(payload["protected_headers"]); protectedHeaders != nil {
+		e2ee["protected_headers"] = protectedHeaders
+	}
+	if context := exposedEnvelopeMetadata(payload["context"]); context != nil {
+		e2ee["context"] = context
+	}
+	result["e2ee"] = e2ee
 
 	// 发送方签名验证
 	sigB64, _ := payload["sender_signature"].(string)
@@ -429,7 +449,7 @@ func DecryptGroupMessage(
 			log.Printf("[e2ee_group] 群消息签名验证失败: group=%s from=%s", groupID, aadFrom)
 			return nil
 		}
-		result["e2ee"].(map[string]any)["sender_verified"] = true
+		e2ee["sender_verified"] = true
 	} else if senderCertPEM != nil {
 		// 非零信任但有证书：有证书时强制验签
 		if sigB64 == "" {
@@ -440,7 +460,7 @@ func DecryptGroupMessage(
 			log.Printf("[e2ee_group] 群消息签名验证失败: group=%s from=%s", groupID, aadFrom)
 			return nil
 		}
-		result["e2ee"].(map[string]any)["sender_verified"] = true
+		e2ee["sender_verified"] = true
 	}
 
 	return result
@@ -500,6 +520,64 @@ func ComputeEpochChain(prevChain string, epoch int, commitment string, rotatorAI
 func VerifyEpochChain(epochChain string, prevChain string, epoch int, commitment string, rotatorAID string) bool {
 	expected := ComputeEpochChain(prevChain, epoch, commitment, rotatorAID)
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(epochChain)) == 1
+}
+
+// ── State Hash ────────────────────────────────────────────
+
+// MemberRole represents a member's AID and role for state hash computation.
+type MemberRole struct {
+	AID  string `json:"aid"`
+	Role string `json:"role"`
+}
+
+// ComputeStateHash computes the group state hash binding members+roles+policy.
+// state_hash = SHA-256(group_id | 0x00 | state_version(uint64 BE) | 0x00 |
+//
+//	key_epoch(uint64 BE) | 0x00 | membership_block | 0x00 |
+//	policy_block | 0x00 | prev_state_hash(32 bytes))
+func ComputeStateHash(groupID string, stateVersion, keyEpoch int64, members []MemberRole, policy map[string]interface{}, prevStateHash string) string {
+	// Sort members by AID
+	sorted := make([]MemberRole, len(members))
+	copy(sorted, members)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].AID < sorted[j].AID })
+
+	// membership_block
+	parts := make([]string, len(sorted))
+	for i, m := range sorted {
+		parts[i] = m.AID + ":" + m.Role
+	}
+	membershipBlock := strings.Join(parts, "|")
+
+	// policy_block: canonical JSON (Go json.Marshal sorts keys by default)
+	policyBlock := ""
+	if len(policy) > 0 {
+		b, _ := json.Marshal(policy)
+		policyBlock = string(b)
+	}
+
+	// prev_state_hash bytes
+	var prevBytes [32]byte
+	if prevStateHash != "" {
+		decoded, _ := hex.DecodeString(prevStateHash)
+		copy(prevBytes[:], decoded)
+	}
+
+	// Concatenate and hash
+	var buf bytes.Buffer
+	buf.WriteString(groupID)
+	buf.WriteByte(0x00)
+	_ = binary.Write(&buf, binary.BigEndian, stateVersion)
+	buf.WriteByte(0x00)
+	_ = binary.Write(&buf, binary.BigEndian, keyEpoch)
+	buf.WriteByte(0x00)
+	buf.WriteString(membershipBlock)
+	buf.WriteByte(0x00)
+	buf.WriteString(policyBlock)
+	buf.WriteByte(0x00)
+	buf.Write(prevBytes[:])
+
+	h := sha256.Sum256(buf.Bytes())
+	return hex.EncodeToString(h[:])
 }
 
 // ── Membership Commitment ──────────────────────────────────
@@ -891,6 +969,9 @@ func assessIncomingEpochChain(
 		return epochChainAssessment{ok: true, set: true, unverified: true, reason: "missing_rotator_aid"}
 	}
 	if !VerifyEpochChain(chain, prevChain, epoch, commitment, rotator) {
+		expectedChain := ComputeEpochChain(prevChain, epoch, commitment, rotator)
+		log.Printf("DEBUG-CHAIN-VERIFY: FAILED group=%s epoch=%d source=%s rotation=%s rotator=%s incoming_chain=%s expected_chain=%s prev_chain=%s commitment=%s",
+			groupID, epoch, source, rid, rotator, chain[:min(len(chain), 16)], expectedChain[:min(len(expectedChain), 16)], prevChain[:min(len(prevChain), 16)], commitment[:min(len(commitment), 16)])
 		if rid != "" {
 			log.Printf("[e2ee_group] 拒绝 epoch_chain 验证失败的新 rotation key: source=%s group=%s epoch=%d rotation=%s", source, groupID, epoch, rid)
 			return epochChainAssessment{ok: false}
@@ -1240,31 +1321,28 @@ func HandleKeyRequest(
 	secret, _ := secretData["secret"].([]byte)
 	commitmentStr, _ := secretData["commitment"].(string)
 	members := sorted(toStringSlice(secretData["member_aids"]))
-	currentSorted := sorted(currentMembers)
+
+	// P0 历史隔离：如果 epoch 记录了 member_aids，请求者必须在其中
+	// 不允许用当前成员列表替换历史 epoch 的成员列表
+	if len(members) > 0 {
+		requesterInEpoch := false
+		for _, m := range members {
+			if m == requesterAID {
+				requesterInEpoch = true
+				break
+			}
+		}
+		if !requesterInEpoch {
+			log.Printf("群组密钥请求拒绝：%s 不在 epoch %d 的成员列表中（group=%s）", requesterAID, epoch, groupID)
+			return nil
+		}
+	}
+
 	responseMembers := members
 	if len(responseMembers) == 0 {
-		responseMembers = currentSorted
+		responseMembers = sorted(currentMembers)
 	}
-	requesterInCurrent := false
-	for _, m := range currentSorted {
-		if m == requesterAID {
-			requesterInCurrent = true
-			break
-		}
-	}
-	requesterInResponse := false
-	for _, m := range responseMembers {
-		if m == requesterAID {
-			requesterInResponse = true
-			break
-		}
-	}
-	includeEpochChain := true
-	if requesterInCurrent && !requesterInResponse {
-		responseMembers = currentSorted
-		commitmentStr = ComputeMembershipCommitment(responseMembers, epoch, groupID, secret)
-		includeEpochChain = false
-	} else if commitmentStr == "" {
+	if commitmentStr == "" {
 		commitmentStr = ComputeMembershipCommitment(responseMembers, epoch, groupID, secret)
 	}
 
@@ -1280,7 +1358,8 @@ func HandleKeyRequest(
 		"responder_aid": aid,
 		"issued_at":     time.Now().UnixMilli(),
 	}
-	if ec, ok := secretData["epoch_chain"].(string); includeEpochChain && ok && ec != "" {
+	// epoch_chain 始终包含（如果存在）
+	if ec, ok := secretData["epoch_chain"].(string); ok && ec != "" {
 		response["epoch_chain"] = ec
 	}
 	return response
@@ -1363,6 +1442,18 @@ func HandleKeyResponse(
 		return false
 	}
 
+	if manifest, _ := payload["manifest"].(map[string]any); manifest != nil {
+		mGroupID, _ := manifest["group_id"].(string)
+		mEpoch := int(toInt64(manifest["epoch"]))
+		if mGroupID != groupID || mEpoch != epoch {
+			return false
+		}
+		mMembers := toStringSlice(manifest["member_aids"])
+		if len(mMembers) > 0 && !stringSliceEqual(sorted(mMembers), sorted(memberAIDs)) {
+			return false
+		}
+	}
+
 	epochChain, _ := payload["epoch_chain"].(string)
 	rotationID, _ := payload["rotation_id"].(string)
 	chainAssessment := assessIncomingEpochChain(
@@ -1391,12 +1482,7 @@ func HandleKeyResponse(
 
 // aadBytesGroup 群组 AAD 序列化
 func aadBytesGroup(aad map[string]any) []byte {
-	filtered := make(map[string]any, len(aadFieldsGroup))
-	for _, field := range aadFieldsGroup {
-		filtered[field] = aad[field]
-	}
-	data := canonicalJSONMarshal(filtered)
-	return data
+	return aadBytesWithOptionalFields(aad, aadFieldsGroup)
 }
 
 // deriveGroupMsgKey 从 group_secret 派生单条群消息的加密密钥
@@ -1462,4 +1548,112 @@ func stringSliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ── ECIES (P-256 ECDH + HKDF-SHA256 + AES-256-GCM) ──────────
+
+var eciesHKDFInfo = []byte("aun-epoch-key-ecies")
+
+// EciesEncrypt 使用 P-256 ECDH + HKDF-SHA256 + AES-256-GCM 加密。
+// peerPubkeyBytes: 65 字节未压缩 P-256 公钥 (0x04 开头)
+// 返回: ephemeral_pubkey(65B) || iv(12B) || ciphertext || tag(16B)
+func EciesEncrypt(peerPubkeyBytes []byte, plaintext []byte) ([]byte, error) {
+	curve := elliptic.P256()
+	x, y := elliptic.Unmarshal(curve, peerPubkeyBytes)
+	if x == nil {
+		return nil, fmt.Errorf("ecies: invalid peer public key")
+	}
+
+	// 生成临时密钥对
+	ephPriv, ephX, ephY, err := elliptic.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: generate ephemeral key: %w", err)
+	}
+	ephPubBytes := elliptic.Marshal(curve, ephX, ephY)
+
+	// ECDH 共享密钥
+	sharedX, _ := curve.ScalarMult(x, y, ephPriv)
+	shared := sharedX.Bytes()
+	if len(shared) < 32 {
+		padded := make([]byte, 32)
+		copy(padded[32-len(shared):], shared)
+		shared = padded
+	}
+
+	// HKDF 派生 32 字节 AES 密钥
+	hkdfReader := hkdf.New(sha256.New, shared, nil, eciesHKDFInfo)
+	aesKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, aesKey); err != nil {
+		return nil, fmt.Errorf("ecies: hkdf derive: %w", err)
+	}
+
+	// AES-256-GCM 加密
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: gcm: %w", err)
+	}
+	iv := make([]byte, 12)
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, fmt.Errorf("ecies: random iv: %w", err)
+	}
+	ciphertextWithTag := gcm.Seal(nil, iv, plaintext, nil)
+
+	result := make([]byte, 0, 65+12+len(ciphertextWithTag))
+	result = append(result, ephPubBytes...)
+	result = append(result, iv...)
+	result = append(result, ciphertextWithTag...)
+	return result, nil
+}
+
+// EciesDecrypt 使用 ECIES 解密，对应 EciesEncrypt。
+// privKey: 自己的 ECDSA P-256 私钥
+// ciphertext 格式: ephemeral_pubkey(65B) || iv(12B) || encrypted || tag(16B)
+func EciesDecrypt(privKey *ecdsa.PrivateKey, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < 65+12+16 {
+		return nil, fmt.Errorf("ecies: ciphertext too short")
+	}
+	ephPubBytes := ciphertext[:65]
+	iv := ciphertext[65:77]
+	encryptedWithTag := ciphertext[77:]
+
+	curve := elliptic.P256()
+	ephX, ephY := elliptic.Unmarshal(curve, ephPubBytes)
+	if ephX == nil {
+		return nil, fmt.Errorf("ecies: invalid ephemeral public key")
+	}
+
+	// ECDH 共享密钥
+	sharedX, _ := curve.ScalarMult(ephX, ephY, privKey.D.Bytes())
+	shared := sharedX.Bytes()
+	if len(shared) < 32 {
+		padded := make([]byte, 32)
+		copy(padded[32-len(shared):], shared)
+		shared = padded
+	}
+
+	// HKDF 派生 AES 密钥
+	hkdfReader := hkdf.New(sha256.New, shared, nil, eciesHKDFInfo)
+	aesKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, aesKey); err != nil {
+		return nil, fmt.Errorf("ecies: hkdf derive: %w", err)
+	}
+
+	// AES-256-GCM 解密
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: gcm: %w", err)
+	}
+	plaintext, err := gcm.Open(nil, iv, encryptedWithTag, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ecies: decrypt failed: %w", err)
+	}
+	return plaintext, nil
 }

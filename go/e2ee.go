@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -55,7 +57,110 @@ var (
 		"recipient_cert_fingerprint", "sender_cert_fingerprint",
 		"prekey_id",
 	}
+	aadOptionalFields = []string{
+		"payload_type", "protected_headers", "context_type", "context_id",
+	}
+	protectedHeaderKeyPattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
 )
+
+const (
+	metadataAuthField      = "_auth"
+	metadataAuthAlg        = "HMAC-SHA256"
+	metadataKeyDomain      = "aun-envelope-metadata-key-v1"
+	protectedHeadersDomain = "aun-protected-headers-v1"
+	protectedContextDomain = "aun-protected-context-v1"
+)
+
+// E2EEEncryptOptions 为信封可选元数据提供向后兼容的扩展参数。
+type E2EEEncryptOptions struct {
+	ProtectedHeaders any
+	Headers          any
+	Context          map[string]any
+	MessageID        string
+	Timestamp        int64
+}
+
+// ProtectedHeaders 是端到端保护的信封元数据，语义接近 HTTP headers。
+type ProtectedHeaders struct {
+	items map[string]string
+}
+
+// NewProtectedHeaders 创建 protected headers 包装对象。
+func NewProtectedHeaders(values map[string]any) (*ProtectedHeaders, error) {
+	headers := &ProtectedHeaders{items: map[string]string{}}
+	for key, value := range values {
+		if err := headers.Set(key, value); err != nil {
+			return nil, err
+		}
+	}
+	return headers, nil
+}
+
+func normalizeProtectedHeaderKey(key any) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(fmt.Sprint(key)))
+	if value == "" || !protectedHeaderKeyPattern.MatchString(value) {
+		return "", fmt.Errorf("protected header key must match [a-z0-9_-]+")
+	}
+	if value == metadataAuthField {
+		return "", fmt.Errorf("protected header key is reserved")
+	}
+	return value, nil
+}
+
+// Set 设置或覆盖一个 protected header。
+func (h *ProtectedHeaders) Set(key string, value any) error {
+	if h.items == nil {
+		h.items = map[string]string{}
+	}
+	normalized, err := normalizeProtectedHeaderKey(key)
+	if err != nil {
+		return err
+	}
+	if value == nil {
+		h.items[normalized] = ""
+	} else {
+		h.items[normalized] = fmt.Sprint(value)
+	}
+	return nil
+}
+
+// Get 获取一个 protected header。
+func (h *ProtectedHeaders) Get(key string) (string, bool) {
+	if h == nil {
+		return "", false
+	}
+	normalized, err := normalizeProtectedHeaderKey(key)
+	if err != nil {
+		return "", false
+	}
+	value, ok := h.items[normalized]
+	return value, ok
+}
+
+// Remove 移除一个 protected header。
+func (h *ProtectedHeaders) Remove(key string) error {
+	if h == nil {
+		return nil
+	}
+	normalized, err := normalizeProtectedHeaderKey(key)
+	if err != nil {
+		return err
+	}
+	delete(h.items, normalized)
+	return nil
+}
+
+// ToMap 返回普通 map 副本。
+func (h *ProtectedHeaders) ToMap() map[string]string {
+	out := make(map[string]string)
+	if h == nil {
+		return out
+	}
+	for key, value := range h.items {
+		out[key] = value
+	}
+	return out
+}
 
 // ── E2EEManager P2P 端到端加密管理器 ────────────────────────
 
@@ -216,6 +321,20 @@ func (m *E2EEManager) InvalidatePrekeyCache(peerAID string) {
 
 // ── 加密 ─────────────────────────────────────────────────
 
+// EncryptMessage 便利包装：自动生成 messageID 和 timestamp。
+// 适用于不关心 messageID / timestamp 细节的简单场景。
+func (m *E2EEManager) EncryptMessage(
+	peerAID string,
+	payload map[string]any,
+	peerCertPEM []byte,
+	prekey map[string]any,
+	options ...E2EEEncryptOptions,
+) (map[string]any, map[string]any, error) {
+	messageID := generateUUID4()
+	timestamp := time.Now().UnixMilli()
+	return m.EncryptOutbound(peerAID, payload, peerCertPEM, prekey, messageID, timestamp, options...)
+}
+
 // EncryptOutbound P2P 加密外发消息
 // 有 prekey -> prekey_ecdh_v2（四路 ECDH），无 prekey -> long_term_key（二路 ECDH）
 // 返回 (envelope, resultInfo, error)
@@ -226,7 +345,9 @@ func (m *E2EEManager) EncryptOutbound(
 	prekey map[string]any,
 	messageID string,
 	timestamp int64,
+	options ...E2EEEncryptOptions,
 ) (map[string]any, map[string]any, error) {
+	opts := firstE2EEEncryptOptions(options)
 	// 传入 prekey -> 缓存；传入 nil -> 查缓存
 	if prekey != nil {
 		m.CachePrekey(peerAID, prekey)
@@ -235,7 +356,7 @@ func (m *E2EEManager) EncryptOutbound(
 	}
 
 	if prekey != nil {
-		envelope, err := m.encryptWithPrekey(peerAID, payload, prekey, peerCertPEM, messageID, timestamp)
+		envelope, err := m.encryptWithPrekey(peerAID, payload, prekey, peerCertPEM, messageID, timestamp, opts)
 		if err == nil {
 			return envelope, map[string]any{
 				"encrypted":       true,
@@ -247,7 +368,7 @@ func (m *E2EEManager) EncryptOutbound(
 		log.Printf("[e2ee] prekey 加密失败，降级到 long_term_key: %v", err)
 	}
 
-	envelope, err := m.encryptWithLongTermKey(peerAID, payload, peerCertPEM, messageID, timestamp)
+	envelope, err := m.encryptWithLongTermKey(peerAID, payload, peerCertPEM, messageID, timestamp, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -273,7 +394,9 @@ func (m *E2EEManager) encryptWithPrekey(
 	peerCertPEM []byte,
 	messageID string,
 	timestamp int64,
+	options ...E2EEEncryptOptions,
 ) (map[string]any, error) {
+	opts := firstE2EEEncryptOptions(options)
 	// 解析对端证书
 	peerCert, err := parseCertPEM(peerCertPEM)
 	if err != nil {
@@ -386,6 +509,17 @@ func (m *E2EEManager) encryptWithPrekey(
 		"sender_cert_fingerprint":    senderFP,
 		"prekey_id":                  prekeyID,
 	}
+	envelope := map[string]any{
+		"type":                 "e2ee.encrypted",
+		"version":              "1",
+		"encryption_mode":      ModePrekeyECDHV2,
+		"suite":                SuiteP256,
+		"prekey_id":            prekeyID,
+		"ephemeral_public_key": ephPkB64,
+	}
+	if err := copyOptionalEnvelopeMetadata(envelope, payload, opts, messageKey); err != nil {
+		return nil, err
+	}
 	aadBytes := aadBytesOffline(aad)
 
 	block, err := aes.NewCipher(messageKey)
@@ -402,18 +536,10 @@ func (m *E2EEManager) encryptWithPrekey(
 	ciphertext := ciphertextWithTag[:tagStart]
 	tag := ciphertextWithTag[tagStart:]
 
-	envelope := map[string]any{
-		"type":                 "e2ee.encrypted",
-		"version":              "1",
-		"encryption_mode":      ModePrekeyECDHV2,
-		"suite":                SuiteP256,
-		"prekey_id":            prekeyID,
-		"ephemeral_public_key": ephPkB64,
-		"nonce":                base64.StdEncoding.EncodeToString(nonce),
-		"ciphertext":           base64.StdEncoding.EncodeToString(ciphertext),
-		"tag":                  base64.StdEncoding.EncodeToString(tag),
-		"aad":                  aad,
-	}
+	envelope["nonce"] = base64.StdEncoding.EncodeToString(nonce)
+	envelope["ciphertext"] = base64.StdEncoding.EncodeToString(ciphertext)
+	envelope["tag"] = base64.StdEncoding.EncodeToString(tag)
+	envelope["aad"] = aad
 
 	// 发送方签名：ciphertext + tag + aad_bytes（不可否认性）
 	signPayload := make([]byte, 0, len(ciphertext)+len(tag)+len(aadBytes))
@@ -437,7 +563,9 @@ func (m *E2EEManager) encryptWithLongTermKey(
 	peerCertPEM []byte,
 	messageID string,
 	timestamp int64,
+	options ...E2EEEncryptOptions,
 ) (map[string]any, error) {
+	opts := firstE2EEEncryptOptions(options)
 	peerCert, err := parseCertPEM(peerCertPEM)
 	if err != nil {
 		return nil, fmt.Errorf("解析对端证书失败: %w", err)
@@ -499,6 +627,16 @@ func (m *E2EEManager) encryptWithLongTermKey(
 		"recipient_cert_fingerprint": recipientFP,
 		"sender_cert_fingerprint":    senderFP,
 	}
+	envelope := map[string]any{
+		"type":                 "e2ee.encrypted",
+		"version":              "1",
+		"encryption_mode":      ModeLongTermKey,
+		"suite":                SuiteP256,
+		"ephemeral_public_key": ephPkB64,
+	}
+	if err := copyOptionalEnvelopeMetadata(envelope, payload, opts, messageKey); err != nil {
+		return nil, err
+	}
 	aadBytes := aadBytesOffline(aad)
 
 	block, err := aes.NewCipher(messageKey)
@@ -514,17 +652,10 @@ func (m *E2EEManager) encryptWithLongTermKey(
 	ciphertext := ciphertextWithTag[:tagStart]
 	tag := ciphertextWithTag[tagStart:]
 
-	envelope := map[string]any{
-		"type":                 "e2ee.encrypted",
-		"version":              "1",
-		"encryption_mode":      ModeLongTermKey,
-		"suite":                SuiteP256,
-		"ephemeral_public_key": ephPkB64,
-		"nonce":                base64.StdEncoding.EncodeToString(nonce),
-		"ciphertext":           base64.StdEncoding.EncodeToString(ciphertext),
-		"tag":                  base64.StdEncoding.EncodeToString(tag),
-		"aad":                  aad,
-	}
+	envelope["nonce"] = base64.StdEncoding.EncodeToString(nonce)
+	envelope["ciphertext"] = base64.StdEncoding.EncodeToString(ciphertext)
+	envelope["tag"] = base64.StdEncoding.EncodeToString(tag)
+	envelope["aad"] = aad
 
 	// 发送方签名
 	signPayload := make([]byte, 0, len(ciphertext)+len(tag)+len(aadBytes))
@@ -818,6 +949,9 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 		}
 		aadBytes = aadBytesOffline(aad)
 	}
+	if !verifyEnvelopeMetadataAuth(payload, messageKey) {
+		return nil, NewE2EEDecryptFailedError("信封元数据认证失败")
+	}
 
 	plaintext, err := aesGCMDecrypt(messageKey, nonce, ct, tag, aadBytes)
 	if err != nil {
@@ -828,15 +962,25 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 	if err := json.Unmarshal(plaintext, &decoded); err != nil {
 		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("解析明文 JSON 失败: %v", err))
 	}
+	if !validateDecryptedEnvelopeMetadata(decoded, payload, message) {
+		return nil, NewE2EEDecryptFailedError("信封元数据不匹配")
+	}
 
 	result := copyMapShallow(message)
 	result["payload"] = decoded
 	result["encrypted"] = true
-	result["e2ee"] = map[string]any{
+	e2ee := map[string]any{
 		"encryption_mode": ModePrekeyECDHV2,
 		"suite":           getStr(payload, "suite", SuiteP256),
 		"prekey_id":       prekeyID,
 	}
+	if protectedHeaders := exposedEnvelopeMetadata(payload["protected_headers"]); protectedHeaders != nil {
+		e2ee["protected_headers"] = protectedHeaders
+	}
+	if context := exposedEnvelopeMetadata(payload["context"]); context != nil {
+		e2ee["context"] = context
+	}
+	result["e2ee"] = e2ee
 	return result, nil
 }
 
@@ -912,6 +1056,9 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 		}
 		aadBytes = aadBytesOffline(aad)
 	}
+	if !verifyEnvelopeMetadataAuth(payload, messageKey) {
+		return nil, NewE2EEDecryptFailedError("信封元数据认证失败")
+	}
 
 	plaintext, err := aesGCMDecrypt(messageKey, nonce, ct, tag, aadBytes)
 	if err != nil {
@@ -922,14 +1069,24 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 	if err := json.Unmarshal(plaintext, &decoded); err != nil {
 		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("解析明文 JSON 失败: %v", err))
 	}
+	if !validateDecryptedEnvelopeMetadata(decoded, payload, message) {
+		return nil, NewE2EEDecryptFailedError("信封元数据不匹配")
+	}
 
 	result := copyMapShallow(message)
 	result["payload"] = decoded
 	result["encrypted"] = true
-	result["e2ee"] = map[string]any{
+	e2ee := map[string]any{
 		"encryption_mode": ModeLongTermKey,
 		"suite":           getStr(payload, "suite", SuiteP256),
 	}
+	if protectedHeaders := exposedEnvelopeMetadata(payload["protected_headers"]); protectedHeaders != nil {
+		e2ee["protected_headers"] = protectedHeaders
+	}
+	if context := exposedEnvelopeMetadata(payload["context"]); context != nil {
+		e2ee["context"] = context
+	}
+	result["e2ee"] = e2ee
 	return result, nil
 }
 
@@ -1091,6 +1248,14 @@ func canonicalJSONMarshal(m map[string]any) []byte {
 	return data
 }
 
+func canonicalJSONMarshalAny(v any) []byte {
+	data, err := json.Marshal(normalizeJSONValue(v))
+	if err != nil {
+		panic(fmt.Sprintf("canonicalJSONMarshalAny: marshal failed: %v", err))
+	}
+	return data
+}
+
 // normalizeJSONValue 递归将 float64 整数值转为 int64
 func normalizeJSONValue(v any) any {
 	switch val := v.(type) {
@@ -1116,14 +1281,202 @@ func normalizeJSONValue(v any) any {
 	}
 }
 
-// aadBytesOffline 序列化 P2P AAD（排序键 + 紧凑格式）
-func aadBytesOffline(aad map[string]any) []byte {
-	filtered := make(map[string]any, len(aadFieldsOffline))
-	for _, field := range aadFieldsOffline {
+func firstE2EEEncryptOptions(options []E2EEEncryptOptions) E2EEEncryptOptions {
+	if len(options) == 0 {
+		return E2EEEncryptOptions{}
+	}
+	return options[0]
+}
+
+func normalizeProtectedHeaders(headers any) (map[string]string, error) {
+	if headers == nil {
+		return map[string]string{}, nil
+	}
+	switch v := headers.(type) {
+	case *ProtectedHeaders:
+		return v.ToMap(), nil
+	case ProtectedHeaders:
+		return v.ToMap(), nil
+	case map[string]string:
+		out := make(map[string]string, len(v))
+		for key, value := range v {
+			normalized, err := normalizeProtectedHeaderKey(key)
+			if err != nil {
+				return nil, err
+			}
+			out[normalized] = value
+		}
+		return out, nil
+	case map[string]any:
+		h, err := NewProtectedHeaders(v)
+		if err != nil {
+			return nil, err
+		}
+		return h.ToMap(), nil
+	default:
+		return nil, fmt.Errorf("protected_headers must be an object")
+	}
+}
+
+func hmacSHA256(key, data []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(data)
+	return mac.Sum(nil)
+}
+
+func metadataBody(metadata map[string]any) map[string]any {
+	body := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		if key != metadataAuthField {
+			body[key] = value
+		}
+	}
+	return body
+}
+
+func metadataAuthTag(key []byte, domain string, body map[string]any) []byte {
+	metadataKey := hmacSHA256(key, []byte(metadataKeyDomain))
+	signInput := make([]byte, 0, len(domain)+1+len(canonicalJSONMarshal(body)))
+	signInput = append(signInput, []byte(domain)...)
+	signInput = append(signInput, 0)
+	signInput = append(signInput, canonicalJSONMarshal(body)...)
+	return hmacSHA256(metadataKey, signInput)
+}
+
+func withMetadataAuth(metadata map[string]any, key []byte, domain string) map[string]any {
+	body := metadataBody(metadata)
+	if len(body) == 0 {
+		return map[string]any{}
+	}
+	tag := metadataAuthTag(key, domain, body)
+	result := copyMapShallow(body)
+	result[metadataAuthField] = map[string]any{
+		"alg": metadataAuthAlg,
+		"tag": base64.StdEncoding.EncodeToString(tag),
+	}
+	return result
+}
+
+func verifyMetadataAuth(metadata any, key []byte, domain string) bool {
+	if metadata == nil {
+		return true
+	}
+	bodyWithAuth, ok := metadata.(map[string]any)
+	if !ok {
+		return false
+	}
+	auth, ok := bodyWithAuth[metadataAuthField].(map[string]any)
+	if !ok {
+		return false
+	}
+	if aadString(auth["alg"]) != metadataAuthAlg {
+		return false
+	}
+	tagB64, ok := auth["tag"].(string)
+	if !ok || strings.TrimSpace(tagB64) == "" {
+		return false
+	}
+	actual, err := base64.StdEncoding.DecodeString(tagB64)
+	if err != nil {
+		return false
+	}
+	body := metadataBody(bodyWithAuth)
+	if len(body) == 0 {
+		return false
+	}
+	expected := metadataAuthTag(key, domain, body)
+	return hmac.Equal(actual, expected)
+}
+
+func verifyEnvelopeMetadataAuth(payload map[string]any, messageKey []byte) bool {
+	return verifyMetadataAuth(payload["protected_headers"], messageKey, protectedHeadersDomain) &&
+		verifyMetadataAuth(payload["context"], messageKey, protectedContextDomain)
+}
+
+func normalizeContextMetadata(context any) map[string]any {
+	contextMap, ok := context.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	return metadataBody(contextMap)
+}
+
+func exposedEnvelopeMetadata(metadata any) map[string]any {
+	metadataMap, ok := metadata.(map[string]any)
+	if !ok {
+		return nil
+	}
+	body := metadataBody(metadataMap)
+	if len(body) == 0 {
+		return nil
+	}
+	return body
+}
+
+func copyOptionalEnvelopeMetadata(envelope, payload map[string]any, opts E2EEEncryptOptions, messageKey []byte) error {
+	headerSource := opts.ProtectedHeaders
+	if headerSource == nil {
+		headerSource = opts.Headers
+	}
+	headers, err := normalizeProtectedHeaders(headerSource)
+	if err != nil {
+		return err
+	}
+	headerBody := make(map[string]any, len(headers)+1)
+	for key, value := range headers {
+		headerBody[key] = value
+	}
+	payloadType := strings.TrimSpace(fmt.Sprint(payload["type"]))
+	if payloadType != "" && payloadType != "<nil>" {
+		headerBody["payload_type"] = payloadType
+	}
+	if len(headerBody) > 0 {
+		envelope["protected_headers"] = withMetadataAuth(headerBody, messageKey, protectedHeadersDomain)
+	}
+	contextBody := normalizeContextMetadata(opts.Context)
+	if len(contextBody) > 0 {
+		envelope["context"] = withMetadataAuth(contextBody, messageKey, protectedContextDomain)
+	}
+	return nil
+}
+
+func aadString(value any) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
+}
+
+func validateDecryptedEnvelopeMetadata(decoded, payload, message map[string]any) bool {
+	if headers, ok := payload["protected_headers"].(map[string]any); ok {
+		body := metadataBody(headers)
+		if payloadType, ok := body["payload_type"]; ok {
+			if aadString(decoded["type"]) != aadString(payloadType) {
+				return false
+			}
+		}
+	}
+	if protectedContext, ok := payload["context"].(map[string]any); ok {
+		protectedBody := metadataBody(protectedContext)
+		outerBody := normalizeContextMetadata(message["context"])
+		if string(canonicalJSONMarshal(protectedBody)) != string(canonicalJSONMarshal(outerBody)) {
+			return false
+		}
+	}
+	return true
+}
+
+func aadBytesWithOptionalFields(aad map[string]any, baseFields []string) []byte {
+	filtered := make(map[string]any, len(baseFields))
+	for _, field := range baseFields {
 		filtered[field] = aad[field]
 	}
-	data := canonicalJSONMarshal(filtered)
-	return data
+	return canonicalJSONMarshal(filtered)
+}
+
+// aadBytesOffline 序列化 P2P AAD（排序键 + 紧凑格式）
+func aadBytesOffline(aad map[string]any) []byte {
+	return aadBytesWithOptionalFields(aad, aadFieldsOffline)
 }
 
 // aadMatchesOffline P2P AAD 字段匹配检查

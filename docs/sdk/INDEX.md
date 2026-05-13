@@ -12,20 +12,22 @@
 | [02-WebSocket协议](02-WebSocket协议.md) | 握手流程 · 消息格式 · 裸 WebSocket 示例 |
 | [03-核心概念](03-核心概念.md) | AID · 连接状态机 · 认证流程 · E2EE |
 | [04-连接与认证](04-连接与认证.md) | 创建AID · 连接网关 · 网关发现 · 调用RPC · 事件订阅 |
-| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · 会话管理 · 自定义密钥存储 |
+| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · ProtectedHeaders · 会话管理 · 自定义密钥存储 |
 | [GROUP-E2EE轮换竞态清单](GROUP-E2EE轮换竞态清单.md) | GROUP epoch key 轮换状态 · 竞态条件 · 补测清单 |
+| [GROUP-E2EE现状对比与改进建议](GROUP-E2EE现状对比与改进建议.md) | 当前 GROUP E2EE 实现定位 · 成熟方案对比 · 风险边界 · 分阶段改进建议 |
 | [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · MetaNamespace（信任根列表 / issuer root 更新） · E2EEManager · 内置事件 · RPC手册索引 |
 | [07-错误处理](07-错误处理.md) | 错误类层级 · 错误码速查 · 重试策略 |
 | [08-最佳实践](08-最佳实践.md) | 幂等初始化 · 多AID隔离 · 环境变量 · 资源清理 |
 | [10-custody-api-manual](10-custody-api-manual.md) | AID 托管 · 手机号验证码 · 备份恢复 · 跨设备复制 |
+| [多语言SDK使用场景与调用链路对齐审查清单](多语言SDK使用场景与调用链路对齐审查清单.md) | 多语言场景清单 · 调用链路 · 字段对齐 · 竞态与服务端风险 · 旧清单复审 |
 
 ### RPC 手册
 
 | 文档 | 说明 |
 |------|------|
-| [09-payload-reference](09-payload-reference.md) | `message.send` / `group.send` 共用业务负载格式 · `payload.type` 类型总览 · 交互卡片/action_card_reply · 任务事件 · 附件引用 |
-| [09-group-rpc-manual](09-group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/消息收发 · `payload.type` 负载类型 |
-| [09-message-rpc-manual](09-message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认 · `payload.type` 负载类型 |
+| [09-payload-reference](09-payload-reference.md) | `message.send` / `message.thought.put` / `group.send` / `group.thought.put` 共用业务负载格式 · `payload.type` 类型总览 · 交互卡片/action_card_reply · 任务事件 · 附件引用 |
+| [09-group-rpc-manual](09-group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/设置与分发/消息收发/思考内容 · `payload.type` 负载类型 |
+| [09-message-rpc-manual](09-message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认/P2P 思考内容 · `payload.type` 负载类型 |
 | [09-meta-rpc-manual](09-meta-rpc-manual.md) | Meta 服务 RPC 接口 · ping/status/信任根列表与 PKI 下载端点 |
 | [09-storage-rpc-manual](09-storage-rpc-manual.md) | Storage 服务 RPC 接口 · 文件上传/下载/对象管理 |
 | [09-stream-rpc-manual](09-stream-rpc-manual.md) | Stream 服务 RPC 接口 · 流式数据传输 |
@@ -53,6 +55,7 @@
 - **加密消息收发** → [05-E2EE加密通信](05-E2EE加密通信.md)
 - **会话管理** → [05-E2EE加密通信](05-E2EE加密通信.md)
 - **GROUP epoch key 轮换竞态/补测清单** → [GROUP-E2EE轮换竞态清单](GROUP-E2EE轮换竞态清单.md)
+- **GROUP E2EE 现状对比与演进建议** → [GROUP-E2EE现状对比与改进建议](GROUP-E2EE现状对比与改进建议.md)
 - **E2EEManager API** → [06-API手册](06-API手册.md)
 - **E2EE 错误类** → [07-错误处理](07-错误处理.md)
 - **E2EE 幂等运行** → [08-最佳实践](08-最佳实践.md)
@@ -63,9 +66,10 @@
 - **裸 WebSocket RPC 调用** → [02-WebSocket协议](02-WebSocket协议.md)
 - **内置事件列表** → [06-API手册](06-API手册.md)
 - **RPC 手册索引** → [06-API手册](06-API手册.md)
+- **多语言 SDK gap、字段、事件、调用链路对齐审查** → [多语言SDK使用场景与调用链路对齐审查清单](多语言SDK使用场景与调用链路对齐审查清单.md)
 - **消息 payload 类型总览与格式约定** → [09-payload-reference](09-payload-reference.md)
-- **Group RPC 与群消息收发** → [09-group-rpc-manual](09-group-rpc-manual.md)
-- **Message RPC 与 P2P 消息收发** → [09-message-rpc-manual](09-message-rpc-manual.md)
+- **Group RPC 与群设置、群消息、群思考内容收发** → [09-group-rpc-manual](09-group-rpc-manual.md)
+- **Message RPC 与 P2P 消息、P2P 思考内容收发** → [09-message-rpc-manual](09-message-rpc-manual.md)
 - **Meta RPC** → [09-meta-rpc-manual](09-meta-rpc-manual.md)
 - **Storage RPC** → [09-storage-rpc-manual](09-storage-rpc-manual.md)
 - **Stream RPC** → [09-stream-rpc-manual](09-stream-rpc-manual.md)
@@ -100,10 +104,13 @@ SDK 的核心抽象。AID 域名格式身份及本地密钥对管理；连接状
 SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数（含自动重连、心跳、令牌刷新）；`client.call()` RPC 调用模式；`client.on()` 事件订阅。
 
 ### 05-E2EE加密通信
-E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
+E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；`protected_headers` 与可验证 `context` 元数据；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
 
 ### GROUP-E2EE轮换竞态清单
 GROUP epoch key 两阶段轮换的状态边界和竞态检查项。覆盖 pending 期间成员变更、leader 竞争、分发/ack/commit 失败、stale pending、key recovery、旧 epoch 保留等场景，用于补充测试和实现审查。
+
+### GROUP-E2EE现状对比与改进建议
+当前 GROUP E2EE 实现的架构评估。对比 Signal Private Groups、WhatsApp Sender Key、Matrix Megolm 和 MLS，明确 AUN 当前处于“内容 E2EE + 服务端可见成员关系”的安全层级；列出旧 epoch key 恢复、signed group state commit、manifest hash / epoch chain 绑定、多设备模型和 epoch 内前向安全等改进方向。
 
 ### 06-API手册
 完整 API 文档。AUNClient 构造函数/属性/方法；AuthNamespace 方法；E2EEManager 方法；内置事件列表；RPC 手册索引。
@@ -118,4 +125,7 @@ GROUP epoch key 两阶段轮换的状态边界和竞态检查项。覆盖 pendin
 AID 托管 HTTP API。通过手机号验证码上传和下载 AID 证书、客户端加密后的私钥密文；定义 `send-code`、`bind-phone`、`restore-phone` 主流程；补充旧设备 AID token 授权的跨设备复制流程、CT 记录要求及安全边界。
 
 ### 09-payload-reference
-`message.send` 和 `group.send` 共用的业务 payload 约定。包含 `payload.type` 类型总览、信封字段边界、公共辅助字段、提及语义、各类型字段格式、交互卡片及 `action_card_reply`、`status` / `event` 任务生命周期约定、附件引用规范和降级处理建议。
+`message.send`、`message.thought.put`、`group.send` 和 `group.thought.put` 共用的业务 payload 约定。包含 `payload.type` 类型总览、信封字段边界、公共辅助字段、提及语义、`thought` 思考内容、群消息 `dispatch_mode`、各类型字段格式、交互卡片及 `action_card_reply`、`status` / `event` 任务生命周期约定、附件引用规范和降级处理建议。
+
+### 多语言SDK使用场景与调用链路对齐审查清单
+多语言 SDK 与服务端的总审查文档。覆盖使用场景清单、主调用链路、错误/超时/竞态分支、字段与事件对齐矩阵、高影响问题总表，以及旧清单复审结论。

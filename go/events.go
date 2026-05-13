@@ -71,7 +71,7 @@ func (d *EventDispatcher) Subscribe(event string, handler EventHandler) *Subscri
 //
 // Deprecated: Use Subscription.Unsubscribe() instead.
 func (d *EventDispatcher) Unsubscribe(event string, handler EventHandler) {
-	log.Printf("警告: EventDispatcher.Unsubscribe(event, handler) 已废弃且无法精确匹配 handler，" +
+	log.Printf("警告: EventDispatcher.Unsubscribe(event, handler) 已废弃且无法精确匹配 handler，"+
 		"请使用 Subscription.Unsubscribe()。事件: %s", event)
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -110,13 +110,32 @@ func (d *EventDispatcher) unsubscribeByID(event string, id uint64) {
 // 处理函数中的 panic 会被 recover，不会导致其他 handler 或调用方崩溃。
 func (d *EventDispatcher) Publish(event string, payload any) {
 	d.mu.RLock()
-	// 复制一份 handler 列表，避免在执行过程中持锁
 	entries := make([]handlerEntry, len(d.handlers[event]))
 	copy(entries, d.handlers[event])
 	d.mu.RUnlock()
 
 	for _, entry := range entries {
 		go func(e handlerEntry) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("事件 %s 处理器执行异常 (panic): %v", event, r)
+				}
+			}()
+			e.handler(payload)
+		}(entry)
+	}
+}
+
+// publishSync 按注册顺序同步执行事件处理器。
+// 仅供 SDK 内部有序消息路径使用。
+func (d *EventDispatcher) publishSync(event string, payload any) {
+	d.mu.RLock()
+	entries := make([]handlerEntry, len(d.handlers[event]))
+	copy(entries, d.handlers[event])
+	d.mu.RUnlock()
+
+	for _, entry := range entries {
+		func(e handlerEntry) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("事件 %s 处理器执行异常 (panic): %v", event, r)

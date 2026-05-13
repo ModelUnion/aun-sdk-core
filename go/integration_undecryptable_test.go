@@ -23,10 +23,10 @@ func TestUndecryptableEventOnly(t *testing.T) {
 
 	// 订阅事件
 	var (
-		mu                    sync.Mutex
-		receivedEvents        []string
-		undecryptableEvents   []map[string]any
-		normalReceivedEvents  []map[string]any
+		mu                   sync.Mutex
+		receivedEvents       []string
+		undecryptableEvents  []map[string]any
+		normalReceivedEvents []map[string]any
 	)
 
 	client.On("message.undecryptable", func(data any) {
@@ -181,7 +181,7 @@ func TestPushFillGapNoDuplicateDelivery(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// 步骤 3: 模拟 fill-gap 返回 seq=1,2,3
-	gapMessages := []any{
+	pulledMessages := []map[string]any{
 		map[string]any{
 			"message_id": "msg-1",
 			"from":       "sender.agentid.pub",
@@ -201,6 +201,13 @@ func TestPushFillGapNoDuplicateDelivery(t *testing.T) {
 			"payload":    "message 3",
 		},
 	}
+	gapMessages := make([]any, 0, len(pulledMessages))
+	for _, msg := range pulledMessages {
+		gapMessages = append(gapMessages, msg)
+	}
+
+	// 模拟 message.pull 的 Call 拦截器先推进 SeqTracker，再发布补洞消息。
+	client.seqTracker.OnPullResult(ns, pulledMessages)
 
 	// 调用 publishGapFillMessages（应该跳过 seq=1 和 seq=3）
 	client.publishGapFillMessages(ns, gapMessages)
@@ -253,10 +260,10 @@ func TestGroupUndecryptableEventOnly(t *testing.T) {
 
 	// 订阅事件
 	var (
-		mu                    sync.Mutex
-		receivedEvents        []string
-		undecryptableEvents   []map[string]any
-		normalCreatedEvents   []map[string]any
+		mu                  sync.Mutex
+		receivedEvents      []string
+		undecryptableEvents []map[string]any
+		normalCreatedEvents []map[string]any
 	)
 
 	client.On("group.message_undecryptable", func(data any) {
@@ -335,4 +342,3 @@ func TestGroupUndecryptableEventOnly(t *testing.T) {
 		t.Errorf("from 不匹配: %v", event["from"])
 	}
 }
-

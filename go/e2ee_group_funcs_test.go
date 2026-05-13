@@ -3,6 +3,8 @@ package aun
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/elliptic"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -90,6 +92,14 @@ func TestEncryptDecryptGroupRoundtrip(t *testing.T) {
 	}
 	if payload["num"] != float64(7) {
 		t.Errorf("解密后 num 不匹配: %v", payload["num"])
+	}
+	e2ee, _ := result["e2ee"].(map[string]any)
+	protectedHeaders, _ := e2ee["protected_headers"].(map[string]any)
+	if protectedHeaders["payload_type"] != "text" {
+		t.Fatalf("普通群消息解密结果应回填 payload_type: %#v", e2ee)
+	}
+	if _, ok := e2ee["context"]; ok {
+		t.Fatalf("普通群消息解密结果不应包含 context: %#v", e2ee)
 	}
 }
 
@@ -670,36 +680,51 @@ func TestHandleKeyRequest(t *testing.T) {
 	}
 }
 
-func TestHandleKeyRequest_ExpandsStaleEpochMembershipForCurrentMember(t *testing.T) {
+// TestHandleKeyRequest_RejectsNonEpochMember 验证 P0 历史隔离：
+// requester 在 currentMembers 中但不在 epoch 的 member_aids 中，请求应被拒绝
+func TestHandleKeyRequest_RejectsNonEpochMember(t *testing.T) {
 	aliceKS := testNewGroupKeyStore(t)
-	bobKS := testNewGroupKeyStore(t)
 	aid := "alice.test"
+	// epoch 1 只有 alice，bob 是后来加入的
 	oldMembers := []string{"alice.test"}
 	currentMembers := []string{"alice.test", "bob.test"}
 	secret := GenerateGroupSecret()
 	oldCommitment := ComputeMembershipCommitment(oldMembers, 1, "g1", secret)
 	StoreGroupSecret(aliceKS, aid, "g1", 1, secret, oldCommitment, oldMembers, "")
 
+	// bob 请求 epoch 1 的密钥，但 epoch 1 的 member_aids 不包含 bob
 	req := BuildKeyRequest("g1", 1, "bob.test")
 	resp := HandleKeyRequest(req, aliceKS, aid, currentMembers)
+	// P0 历史隔离：bob 不在 epoch 1 的成员中，必须拒绝
+	if resp != nil {
+		t.Fatal("requester 不在 epoch member_aids 中，应返回 nil 拒绝")
+	}
+}
+
+// TestHandleKeyRequest_AllowsEpochMember 验证 requester 在 epoch member_aids 中时正常响应
+func TestHandleKeyRequest_AllowsEpochMember(t *testing.T) {
+	aliceKS := testNewGroupKeyStore(t)
+	aid := "alice.test"
+	members := []string{"alice.test", "bob.test"}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 1, "g1", secret)
+	StoreGroupSecret(aliceKS, aid, "g1", 1, secret, commitment, members, "")
+
+	// bob 在 epoch 1 的 member_aids 中，请求应被接受
+	req := BuildKeyRequest("g1", 1, "bob.test")
+	resp := HandleKeyRequest(req, aliceKS, aid, members)
 	if resp == nil {
-		t.Fatal("应返回响应")
+		t.Fatal("requester 在 epoch member_aids 中，应返回响应")
+	}
+	if resp["type"] != "e2ee.group_key_response" {
+		t.Errorf("响应 type 不正确: %v", resp["type"])
 	}
 	responseMembers := toStringSlice(resp["member_aids"])
-	if !stringSliceEqual(responseMembers, currentMembers) {
-		t.Fatalf("响应 member_aids 应扩展到当前成员: %v", responseMembers)
+	if !stringSliceEqual(responseMembers, members) {
+		t.Fatalf("响应 member_aids 应与 epoch 成员一致: %v", responseMembers)
 	}
-	expectedCommitment := ComputeMembershipCommitment(currentMembers, 1, "g1", secret)
-	if resp["commitment"] != expectedCommitment {
-		t.Fatalf("响应 commitment 未按当前成员重算: %v", resp["commitment"])
-	}
-	if !HandleKeyResponse(resp, bobKS, "bob.test") {
-		t.Fatal("Bob 应接受扩展成员后的旧 epoch key response")
-	}
-	epochPtr := 1
-	loaded, _ := LoadGroupSecret(bobKS, "bob.test", "g1", &epochPtr)
-	if loaded == nil || !stringSliceEqual(toStringSlice(loaded["member_aids"]), currentMembers) {
-		t.Fatalf("Bob 存储的 member_aids 不正确: %#v", loaded)
+	if resp["commitment"] != commitment {
+		t.Fatalf("响应 commitment 应与存储值一致: %v", resp["commitment"])
 	}
 }
 
@@ -784,6 +809,38 @@ func TestHandleKeyResponse_BackfillsOldEpochWithoutOverwritingCurrent(t *testing
 	old, _ := LoadGroupSecret(ks, aid, "g1", &three)
 	if old == nil || !bytes.Equal(old["secret"].([]byte), oldSecret) {
 		t.Fatalf("旧 epoch secret 未正确补写: %#v", old)
+	}
+}
+
+func TestHandleKeyResponse_RejectsManifestMemberMismatch(t *testing.T) {
+	ks := testNewGroupKeyStore(t)
+	aid := "bob.test"
+	members := []string{"alice.test", "bob.test"}
+	secret := GenerateGroupSecret()
+	commitment := ComputeMembershipCommitment(members, 3, "g1", secret)
+	response := map[string]any{
+		"type":          "e2ee.group_key_response",
+		"group_id":      "g1",
+		"epoch":         3,
+		"group_secret":  base64.StdEncoding.EncodeToString(secret),
+		"commitment":    commitment,
+		"member_aids":   members,
+		"requester_aid": aid,
+		"responder_aid": "alice.test",
+		"request_id":    "req-manifest-mismatch",
+		"manifest": map[string]any{
+			"group_id":    "g1",
+			"epoch":       3,
+			"member_aids": []any{"alice.test", "charlie.test"},
+		},
+	}
+
+	if HandleKeyResponse(response, ks, aid) {
+		t.Fatal("manifest members 不匹配的 key response 应拒绝")
+	}
+	three := 3
+	if loaded, _ := LoadGroupSecret(ks, aid, "g1", &three); loaded != nil {
+		t.Fatalf("拒绝后不应写入 epoch 3: %#v", loaded)
 	}
 }
 
@@ -1108,11 +1165,267 @@ func TestGroupAADFieldCount(t *testing.T) {
 		"group_id": "g1", "from": "alice", "message_id": "m1",
 		"timestamp": int64(12345), "epoch": 1,
 		"encryption_mode": ModeEpochGroupKey, "suite": SuiteP256,
+		"dispatch_mode": "mention",
 	}
 	data := aadBytesGroup(aad)
 	var parsed map[string]any
 	json.Unmarshal(data, &parsed)
 	if len(parsed) != len(aadFieldsGroup) {
 		t.Errorf("群组 AAD 字段数不正确: 期望 %d, 实际 %d", len(aadFieldsGroup), len(parsed))
+	}
+	if _, ok := parsed["dispatch_mode"]; ok {
+		t.Fatalf("群组 AAD 不应包含 dispatch_mode: %#v", parsed)
+	}
+	for _, field := range aadMatchFieldsGroup {
+		if field == "dispatch_mode" {
+			t.Fatalf("群组 AAD 匹配字段不应包含 dispatch_mode")
+		}
+	}
+}
+
+func TestGroupOptionalMetadataBoundWithIndependentAuth(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	payload := map[string]any{"type": "text", "text": "bound"}
+	context := map[string]any{"type": "thought", "id": "ctx-1"}
+	envelope, err := EncryptGroupMessage(
+		secret, payload, "g1", "alice", "msg-bound", time.Now().UnixMilli(), 1, "", nil,
+		E2EEEncryptOptions{
+			ProtectedHeaders: map[string]any{"Device_ID": "dev-a"},
+			Context:          context,
+		},
+	)
+	if err != nil {
+		t.Fatalf("群消息加密失败: %v", err)
+	}
+	if _, ok := envelope["payload_type"]; ok {
+		t.Fatalf("payload_type 不应写入信封顶层: %#v", envelope)
+	}
+	headers, _ := envelope["protected_headers"].(map[string]any)
+	if headers["payload_type"] != "text" || headers["device_id"] != "dev-a" {
+		t.Fatalf("protected_headers 未规范化: %#v", envelope["protected_headers"])
+	}
+	auth, _ := headers["_auth"].(map[string]any)
+	if auth["alg"] != metadataAuthAlg || auth["tag"] == "" {
+		t.Fatalf("protected_headers 缺少 _auth: %#v", headers)
+	}
+	aad := envelope["aad"].(map[string]any)
+	if _, ok := aad["payload_type"]; ok {
+		t.Fatalf("payload_type 不应写入 AAD: %#v", aad)
+	}
+	if _, ok := aad["protected_headers"]; ok {
+		t.Fatalf("protected_headers 不应写入 AAD: %#v", aad)
+	}
+	if _, ok := aad["context_type"]; ok {
+		t.Fatalf("context 不应写入 AAD: %#v", aad)
+	}
+	protectedContext, _ := envelope["context"].(map[string]any)
+	if protectedContext["type"] != "thought" || protectedContext["id"] != "ctx-1" {
+		t.Fatalf("context 未写入信封: %#v", envelope["context"])
+	}
+	contextAuth, _ := protectedContext["_auth"].(map[string]any)
+	if contextAuth["alg"] != metadataAuthAlg || contextAuth["tag"] == "" {
+		t.Fatalf("context 缺少 _auth: %#v", protectedContext)
+	}
+
+	message := map[string]any{
+		"group_id":   "g1",
+		"from":       "alice",
+		"message_id": "msg-bound",
+		"payload":    envelope,
+		"context":    context,
+	}
+	secrets := map[int][]byte{1: secret}
+	decrypted := DecryptGroupMessage(secrets, message, nil, false)
+	if decrypted == nil {
+		t.Fatal("带可选元数据的群消息应解密成功")
+	}
+	e2ee, _ := decrypted["e2ee"].(map[string]any)
+	protectedHeaders, _ := e2ee["protected_headers"].(map[string]any)
+	if protectedHeaders["payload_type"] != "text" || protectedHeaders["device_id"] != "dev-a" {
+		t.Fatalf("群消息解密结果 e2ee.protected_headers 未回填: %#v", e2ee)
+	}
+	if _, ok := protectedHeaders["_auth"]; ok {
+		t.Fatalf("群消息解密结果不应暴露 protected_headers._auth: %#v", protectedHeaders)
+	}
+	decryptedContext, _ := e2ee["context"].(map[string]any)
+	if decryptedContext["type"] != "thought" || decryptedContext["id"] != "ctx-1" {
+		t.Fatalf("群消息解密结果 e2ee.context 未回填: %#v", e2ee)
+	}
+	if _, ok := decryptedContext["_auth"]; ok {
+		t.Fatalf("群消息解密结果不应暴露 context._auth: %#v", decryptedContext)
+	}
+
+	tamperedHeaders := copyMapShallow(message)
+	tamperedPayload := copyMapShallow(envelope)
+	tamperedProtectedHeaders := copyMapShallow(headers)
+	tamperedProtectedHeaders["device_id"] = "dev-b"
+	tamperedPayload["protected_headers"] = tamperedProtectedHeaders
+	tamperedHeaders["payload"] = tamperedPayload
+	if decrypted := DecryptGroupMessage(secrets, tamperedHeaders, nil, false); decrypted != nil {
+		t.Fatalf("篡改 protected_headers 应解密失败: %#v", decrypted)
+	}
+
+	missingAuth := copyMapShallow(message)
+	missingAuthPayload := copyMapShallow(envelope)
+	missingAuthPayload["protected_headers"] = map[string]any{"payload_type": "text", "device_id": "dev-a"}
+	missingAuth["payload"] = missingAuthPayload
+	if decrypted := DecryptGroupMessage(secrets, missingAuth, nil, false); decrypted != nil {
+		t.Fatalf("删除 protected_headers._auth 应解密失败: %#v", decrypted)
+	}
+
+	tamperedContext := copyMapShallow(message)
+	tamperedContext["context"] = map[string]any{"type": "thought", "id": "ctx-2"}
+	if decrypted := DecryptGroupMessage(secrets, tamperedContext, nil, false); decrypted != nil {
+		t.Fatalf("篡改 context 应解密失败: %#v", decrypted)
+	}
+}
+
+// ── ComputeStateHash 测试 ─────────────────────────────────
+
+func TestComputeStateHash_Deterministic(t *testing.T) {
+	members := []MemberRole{
+		{AID: "alice.aid.com", Role: "owner"},
+		{AID: "bob.aid.com", Role: "member"},
+	}
+	h1 := ComputeStateHash("grp_test", 1, 1, members, nil, "")
+	h2 := ComputeStateHash("grp_test", 1, 1, members, nil, "")
+	if h1 != h2 {
+		t.Fatalf("相同输入应产生相同哈希: h1=%s h2=%s", h1, h2)
+	}
+	if len(h1) != 64 {
+		t.Fatalf("哈希长度应为 64 hex 字符: got %d", len(h1))
+	}
+}
+
+func TestComputeStateHash_OrderIndependent(t *testing.T) {
+	m1 := []MemberRole{{AID: "bob.aid.com", Role: "member"}, {AID: "alice.aid.com", Role: "owner"}}
+	m2 := []MemberRole{{AID: "alice.aid.com", Role: "owner"}, {AID: "bob.aid.com", Role: "member"}}
+	h1 := ComputeStateHash("grp_test", 1, 1, m1, nil, "")
+	h2 := ComputeStateHash("grp_test", 1, 1, m2, nil, "")
+	if h1 != h2 {
+		t.Fatalf("成员顺序不同应产生相同哈希: h1=%s h2=%s", h1, h2)
+	}
+}
+
+func TestComputeStateHash_RoleChangeChangesHash(t *testing.T) {
+	m1 := []MemberRole{{AID: "alice.aid.com", Role: "owner"}, {AID: "bob.aid.com", Role: "member"}}
+	m2 := []MemberRole{{AID: "alice.aid.com", Role: "owner"}, {AID: "bob.aid.com", Role: "admin"}}
+	h1 := ComputeStateHash("grp_test", 1, 1, m1, nil, "")
+	h2 := ComputeStateHash("grp_test", 2, 1, m2, nil, h1)
+	if h1 == h2 {
+		t.Fatalf("角色变更应产生不同哈希")
+	}
+}
+
+func TestComputeStateHash_ChainLinkage(t *testing.T) {
+	members := []MemberRole{{AID: "alice.aid.com", Role: "owner"}}
+	h1 := ComputeStateHash("grp_test", 1, 1, members, nil, "")
+	h2a := ComputeStateHash("grp_test", 2, 1, members, nil, h1)
+	h2b := ComputeStateHash("grp_test", 2, 1, members, nil, strings.Repeat("0", 64))
+	if h2a == h2b {
+		t.Fatalf("不同 prevStateHash 应产生不同哈希")
+	}
+}
+
+func TestComputeStateHash_PolicyChangeChangesHash(t *testing.T) {
+	members := []MemberRole{{AID: "alice.aid.com", Role: "owner"}}
+	p1 := map[string]interface{}{"require_signature": true, "rotation_policy": "on_member_change"}
+	p2 := map[string]interface{}{"require_signature": false, "rotation_policy": "manual"}
+	h1 := ComputeStateHash("grp_test", 1, 1, members, p1, "")
+	h2 := ComputeStateHash("grp_test", 2, 1, members, p2, h1)
+	if h1 == h2 {
+		t.Fatalf("策略变更应产生不同哈希")
+	}
+}
+
+// ── ECIES 加解密测试 ──────────────────────────────────────────
+
+func TestEciesEncryptDecryptRoundtrip(t *testing.T) {
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	ciphertext, err := EciesEncrypt(pubBytes, secret)
+	if err != nil {
+		t.Fatalf("EciesEncrypt failed: %v", err)
+	}
+	if len(ciphertext) != 125 {
+		t.Fatalf("expected ciphertext length 125, got %d", len(ciphertext))
+	}
+	if ciphertext[0] != 0x04 {
+		t.Fatalf("expected 0x04 prefix, got 0x%02x", ciphertext[0])
+	}
+
+	decrypted, err := EciesDecrypt(privKey, ciphertext)
+	if err != nil {
+		t.Fatalf("EciesDecrypt failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, secret) {
+		t.Fatalf("decrypted != original")
+	}
+}
+
+func TestEciesWrongKeyDecryptFails(t *testing.T) {
+	alice, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	bob, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	alicePub := elliptic.Marshal(elliptic.P256(), alice.PublicKey.X, alice.PublicKey.Y)
+
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	ct, _ := EciesEncrypt(alicePub, secret)
+	_, err := EciesDecrypt(bob, ct)
+	if err == nil {
+		t.Fatal("decryption with wrong key should fail")
+	}
+}
+
+func TestEciesTamperedCiphertextFails(t *testing.T) {
+	privKey, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	ct, _ := EciesEncrypt(pubBytes, secret)
+	ct[80] ^= 0xff
+	_, err := EciesDecrypt(privKey, ct)
+	if err == nil {
+		t.Fatal("tampered ciphertext should fail decryption")
+	}
+}
+
+func TestEciesMultiMember(t *testing.T) {
+	secret := make([]byte, 32)
+	cryptorand.Read(secret)
+
+	for i := 0; i < 3; i++ {
+		privKey, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+		pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+
+		ct, err := EciesEncrypt(pubBytes, secret)
+		if err != nil {
+			t.Fatalf("member %d encrypt failed: %v", i, err)
+		}
+		pt, err := EciesDecrypt(privKey, ct)
+		if err != nil {
+			t.Fatalf("member %d decrypt failed: %v", i, err)
+		}
+		if !bytes.Equal(pt, secret) {
+			t.Fatalf("member %d decrypted != original", i)
+		}
+	}
+}
+
+func TestEciesCiphertextTooShort(t *testing.T) {
+	privKey, _ := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	_, err := EciesDecrypt(privKey, make([]byte, 50))
+	if err == nil || !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("expected 'too short' error, got: %v", err)
 	}
 }

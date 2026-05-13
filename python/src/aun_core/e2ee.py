@@ -5,6 +5,7 @@ import copy
 import hmac as _hmac
 import json
 import logging
+import re
 import secrets
 import threading
 import time as _time_mod
@@ -33,6 +34,10 @@ _group_secret_locks_guard = threading.Lock()
 _group_secret_locks: dict[str, threading.RLock] = {}
 
 
+def _debug_group_e2ee(message: str, **fields: Any) -> None:
+    _ = (message, fields)
+
+
 SUITE = "P256_HKDF_SHA256_AES_256_GCM"
 
 # 加密模式
@@ -59,6 +64,12 @@ PREKEY_MIN_KEEP_COUNT = 7
 
 # AES-256-GCM 认证标签长度（字节），标准值 16 字节 = 128-bit
 _AES_GCM_TAG_LEN = 16
+
+_METADATA_AUTH_FIELD = "_auth"
+_METADATA_AUTH_ALG = "HMAC-SHA256"
+_METADATA_KEY_DOMAIN = b"aun-envelope-metadata-key-v1"
+_PROTECTED_HEADERS_DOMAIN = b"aun-protected-headers-v1"
+_PROTECTED_CONTEXT_DOMAIN = b"aun-protected-context-v1"
 
 
 def _prekey_created_marker(prekey_data: dict[str, Any]) -> int:
@@ -94,6 +105,214 @@ AAD_MATCH_FIELDS_GROUP = (
     "group_id", "from", "message_id",
     "epoch", "encryption_mode", "suite",
 )
+
+
+class ProtectedHeaders:
+    """端到端保护的信封元数据，语义接近 HTTP headers。"""
+
+    def __init__(self, values: dict[str, Any] | None = None):
+        self._items: dict[str, str] = {}
+        if values:
+            for key, value in values.items():
+                self.set(key, value)
+
+    @staticmethod
+    def _normalize_key(key: object) -> str:
+        value = str(key or "").strip().lower()
+        if not value or not re.fullmatch(r"[a-z0-9_-]+", value):
+            raise ValueError("protected header key must match [a-z0-9_-]+")
+        if value == _METADATA_AUTH_FIELD:
+            raise ValueError("protected header key is reserved")
+        return value
+
+    def set(self, key: str, value: object) -> "ProtectedHeaders":
+        self._items[self._normalize_key(key)] = "" if value is None else str(value)
+        return self
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        return self._items.get(self._normalize_key(key), default)
+
+    def remove(self, key: str) -> "ProtectedHeaders":
+        self._items.pop(self._normalize_key(key), None)
+        return self
+
+    def to_dict(self) -> dict[str, str]:
+        return dict(self._items)
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any] | None) -> "ProtectedHeaders":
+        return cls(values or {})
+
+
+def _normalize_protected_headers(headers: object) -> dict[str, str]:
+    if headers is None:
+        return {}
+    if isinstance(headers, ProtectedHeaders):
+        return headers.to_dict()
+    if not isinstance(headers, dict):
+        raise ValueError("protected_headers must be an object")
+    return ProtectedHeaders(headers).to_dict()
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _metadata_body(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): copy.deepcopy(value)
+        for key, value in metadata.items()
+        if str(key) != _METADATA_AUTH_FIELD
+    }
+
+
+def _metadata_auth_tag(key: bytes, domain: bytes, body: dict[str, Any]) -> bytes:
+    metadata_key = _hmac.digest(key, _METADATA_KEY_DOMAIN, "sha256")
+    sign_input = domain + b"\0" + _canonical_json_bytes(body)
+    return _hmac.digest(metadata_key, sign_input, "sha256")
+
+
+def _with_metadata_auth(
+    metadata: dict[str, Any],
+    *,
+    key: bytes,
+    domain: bytes,
+) -> dict[str, Any]:
+    body = _metadata_body(metadata)
+    if not body:
+        return {}
+    tag = _metadata_auth_tag(key, domain, body)
+    result = copy.deepcopy(body)
+    result[_METADATA_AUTH_FIELD] = {
+        "alg": _METADATA_AUTH_ALG,
+        "tag": base64.b64encode(tag).decode("ascii"),
+    }
+    return result
+
+
+def _verify_metadata_auth(
+    metadata: object,
+    *,
+    key: bytes,
+    domain: bytes,
+) -> bool:
+    if metadata is None:
+        return True
+    if not isinstance(metadata, dict):
+        return False
+    auth = metadata.get(_METADATA_AUTH_FIELD)
+    if not isinstance(auth, dict):
+        return False
+    if auth.get("alg") != _METADATA_AUTH_ALG:
+        return False
+    tag_b64 = auth.get("tag")
+    if not isinstance(tag_b64, str) or not tag_b64:
+        return False
+    try:
+        actual = base64.b64decode(tag_b64, validate=True)
+    except Exception:
+        return False
+    body = _metadata_body(metadata)
+    if not body:
+        return False
+    expected = _metadata_auth_tag(key, domain, body)
+    return _hmac.compare_digest(actual, expected)
+
+
+def _normalize_context_metadata(context: object) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    return _metadata_body(context)
+
+
+def _exposed_envelope_metadata(metadata: object) -> dict[str, Any] | None:
+    if not isinstance(metadata, dict):
+        return None
+    body = _metadata_body(metadata)
+    return body or None
+
+
+def _copy_optional_envelope_metadata(
+    envelope: dict[str, Any],
+    *,
+    message_key: bytes,
+    payload_type: object = None,
+    protected_headers: object = None,
+    context: object = None,
+) -> None:
+    headers = _normalize_protected_headers(protected_headers)
+    ptype = str(payload_type or "").strip()
+    if ptype:
+        headers["payload_type"] = ptype
+    if headers:
+        envelope["protected_headers"] = _with_metadata_auth(
+            headers,
+            key=message_key,
+            domain=_PROTECTED_HEADERS_DOMAIN,
+        )
+    context_meta = _normalize_context_metadata(context)
+    if context_meta:
+        envelope["context"] = _with_metadata_auth(
+            context_meta,
+            key=message_key,
+            domain=_PROTECTED_CONTEXT_DOMAIN,
+        )
+
+
+def _aad_bytes_with_optional_fields(
+    aad: dict[str, Any],
+    base_fields: tuple[str, ...],
+) -> bytes:
+    body = {field: aad.get(field) for field in base_fields}
+    return _canonical_json_bytes(body)
+
+
+def _verify_envelope_metadata_auth(
+    payload: dict[str, Any],
+    message_key: bytes,
+) -> bool:
+    return (
+        _verify_metadata_auth(
+            payload.get("protected_headers"),
+            key=message_key,
+            domain=_PROTECTED_HEADERS_DOMAIN,
+        )
+        and _verify_metadata_auth(
+            payload.get("context"),
+            key=message_key,
+            domain=_PROTECTED_CONTEXT_DOMAIN,
+        )
+    )
+
+
+def _validate_decrypted_envelope_metadata(
+    decoded: object,
+    payload: dict[str, Any],
+    message: dict[str, Any] | None = None,
+) -> bool:
+    headers = payload.get("protected_headers")
+    if isinstance(headers, dict):
+        header_body = _metadata_body(headers)
+        if "payload_type" in header_body:
+            if not isinstance(decoded, dict):
+                return False
+            if str(decoded.get("type") or "") != str(header_body.get("payload_type") or ""):
+                return False
+
+    protected_context = payload.get("context")
+    if isinstance(protected_context, dict):
+        context_body = _metadata_body(protected_context)
+        outer_context = (message or {}).get("context")
+        if not isinstance(outer_context, dict):
+            return False
+        if _normalize_context_metadata(outer_context) != context_body:
+            return False
+    return True
 
 
 
@@ -440,6 +659,8 @@ class E2EEManager:
         prekey: dict[str, Any] | None = None,
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """加密出站消息：有 prekey → prekey_ecdh_v2（四路 ECDH），无 prekey → long_term_key。
 
@@ -458,6 +679,7 @@ class E2EEManager:
                 envelope, ok = self._encrypt_with_prekey(
                     peer_aid, payload, prekey, peer_cert_pem,
                     message_id=message_id, timestamp=timestamp,
+                    protected_headers=protected_headers, context=context,
                 )
                 return envelope, {
                     "encrypted": True,
@@ -473,6 +695,7 @@ class E2EEManager:
         envelope, ok = self._encrypt_with_long_term_key(
             peer_aid, payload, peer_cert_pem,
             message_id=message_id, timestamp=timestamp,
+            protected_headers=protected_headers, context=context,
         )
         degraded = prekey is not None  # 有 prekey 但失败了才算降级
         return envelope, {
@@ -492,6 +715,8 @@ class E2EEManager:
         *,
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """使用对方 prekey 加密（prekey_ecdh_v2 模式，四路 ECDH + 发送方签名）
 
@@ -571,6 +796,14 @@ class E2EEManager:
             "sender_cert_fingerprint": sender_fingerprint,
             "prekey_id": prekey["prekey_id"],
         }
+        envelope_meta: dict[str, Any] = {}
+        _copy_optional_envelope_metadata(
+            envelope_meta,
+            message_key=message_key,
+            payload_type=payload.get("type"),
+            protected_headers=protected_headers,
+            context=context,
+        )
         ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
         ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
         tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
@@ -586,6 +819,7 @@ class E2EEManager:
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
             "tag": base64.b64encode(tag).decode("ascii"),
             "aad": aad,
+            **envelope_meta,
         }
         # 发送方签名：对 ciphertext + tag + aad_bytes 签名（不可否认性）
         sign_payload = ciphertext + tag + self._aad_bytes_offline(aad)
@@ -601,6 +835,8 @@ class E2EEManager:
         *,
         message_id: str,
         timestamp: int,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """使用 2DH 加密（long_term_key 模式 + 发送方签名）
 
@@ -653,6 +889,14 @@ class E2EEManager:
             "recipient_cert_fingerprint": recipient_fingerprint,
             "sender_cert_fingerprint": sender_fingerprint,
         }
+        envelope_meta: dict[str, Any] = {}
+        _copy_optional_envelope_metadata(
+            envelope_meta,
+            message_key=message_key,
+            payload_type=payload.get("type"),
+            protected_headers=protected_headers,
+            context=context,
+        )
         ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, self._aad_bytes_offline(aad))
         ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
         tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
@@ -667,6 +911,7 @@ class E2EEManager:
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
             "tag": base64.b64encode(tag).decode("ascii"),
             "aad": aad,
+            **envelope_meta,
         }
         # 发送方签名（不可否认性）
         sign_payload = ciphertext + tag + self._aad_bytes_offline(aad)
@@ -840,17 +1085,28 @@ class E2EEManager:
             else:
                 # SC-MSG-015: AAD 缺失或非 dict 时显式拒绝，不尝试用空 AAD 解密
                 raise E2EEDecryptFailedError("missing or invalid aad field")
+            if not _verify_envelope_metadata_auth(payload, message_key):
+                raise E2EEDecryptFailedError("envelope metadata auth failed")
             plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
 
             decoded = json.loads(plaintext.decode("utf-8"))
+            if not _validate_decrypted_envelope_metadata(decoded, payload, message):
+                raise E2EEDecryptFailedError("envelope metadata mismatch")
             transformed = dict(message)
             transformed["payload"] = decoded
             transformed["encrypted"] = True
-            transformed["e2ee"] = {
+            e2ee = {
                 "encryption_mode": MODE_PREKEY_ECDH_V2,
                 "suite": payload.get("suite", SUITE),
                 "prekey_id": prekey_id,
             }
+            protected_headers = _exposed_envelope_metadata(payload.get("protected_headers"))
+            if protected_headers is not None:
+                e2ee["protected_headers"] = protected_headers
+            context_meta = _exposed_envelope_metadata(payload.get("context"))
+            if context_meta is not None:
+                e2ee["context"] = context_meta
+            transformed["e2ee"] = e2ee
             return transformed
         except E2EEError as exc:
             src_tag = f"[{source}] " if source else ""
@@ -916,16 +1172,27 @@ class E2EEManager:
             else:
                 # SC-MSG-015: AAD 缺失或非 dict 时显式拒绝，不尝试用空 AAD 解密
                 raise E2EEDecryptFailedError("missing or invalid aad field")
+            if not _verify_envelope_metadata_auth(payload, message_key):
+                raise E2EEDecryptFailedError("envelope metadata auth failed")
             plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
 
             decoded = json.loads(plaintext.decode("utf-8"))
+            if not _validate_decrypted_envelope_metadata(decoded, payload, message):
+                raise E2EEDecryptFailedError("envelope metadata mismatch")
             transformed = dict(message)
             transformed["payload"] = decoded
             transformed["encrypted"] = True
-            transformed["e2ee"] = {
+            e2ee = {
                 "encryption_mode": MODE_LONG_TERM_KEY,
                 "suite": payload["suite"],
             }
+            protected_headers = _exposed_envelope_metadata(payload.get("protected_headers"))
+            if protected_headers is not None:
+                e2ee["protected_headers"] = protected_headers
+            context_meta = _exposed_envelope_metadata(payload.get("context"))
+            if context_meta is not None:
+                e2ee["context"] = context_meta
+            transformed["e2ee"] = e2ee
             return transformed
         except E2EEError as exc:
             _e2ee_log.warning("long_term_key 解密失败 (E2EE): %s", exc)
@@ -938,10 +1205,7 @@ class E2EEManager:
 
     @staticmethod
     def _aad_bytes_offline(aad: dict[str, Any]) -> bytes:
-        return json.dumps(
-            {field: aad.get(field) for field in AAD_FIELDS_OFFLINE},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode("utf-8")
+        return _aad_bytes_with_optional_fields(aad, AAD_FIELDS_OFFLINE)
 
     @staticmethod
     def _aad_matches_offline(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
@@ -1219,10 +1483,7 @@ def _derive_group_msg_key(
 
 def _aad_bytes_group(aad: dict[str, Any]) -> bytes:
     """群组 AAD 序列化（sorted keys, compact JSON）。"""
-    return json.dumps(
-        {field: aad.get(field) for field in AAD_FIELDS_GROUP},
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")
+    return _aad_bytes_with_optional_fields(aad, AAD_FIELDS_GROUP)
 
 
 def _aad_matches_group(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
@@ -1241,6 +1502,8 @@ def encrypt_group_message(
     timestamp: int,
     sender_private_key_pem: str | None = None,
     sender_cert_pem: bytes | str | None = None,
+    protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """加密群组消息，返回 e2ee.group_encrypted 信封。
 
@@ -1260,6 +1523,14 @@ def encrypt_group_message(
         "encryption_mode": MODE_EPOCH_GROUP_KEY,
         "suite": SUITE,
     }
+    envelope_meta: dict[str, Any] = {}
+    _copy_optional_envelope_metadata(
+        envelope_meta,
+        message_key=msg_key,
+        payload_type=payload.get("type"),
+        protected_headers=protected_headers,
+        context=context,
+    )
     ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, _aad_bytes_group(aad))
     ciphertext = ciphertext_with_tag[:-_AES_GCM_TAG_LEN]
     tag = ciphertext_with_tag[-_AES_GCM_TAG_LEN:]
@@ -1274,6 +1545,7 @@ def encrypt_group_message(
         "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
         "tag": base64.b64encode(tag).decode("ascii"),
         "aad": aad,
+        **envelope_meta,
     }
 
     # 发送方签名：对 ciphertext + tag + aad_bytes 签名（不可否认性）
@@ -1361,6 +1633,8 @@ def decrypt_group_message(
         nonce = base64.b64decode(payload["nonce"])
         ciphertext = base64.b64decode(payload["ciphertext"])
         tag = base64.b64decode(payload["tag"])
+        if not _verify_envelope_metadata_auth(payload, msg_key):
+            return None
 
         # AAD 校验：直接用 payload 中的 AAD（因为加密时写入的就是这些值）
         if isinstance(aad, dict):
@@ -1371,16 +1645,25 @@ def decrypt_group_message(
         aesgcm = AESGCM(msg_key)
         plaintext = aesgcm.decrypt(nonce, ciphertext + tag, aad_bytes)
         decoded = json.loads(plaintext.decode("utf-8"))
+        if not _validate_decrypted_envelope_metadata(decoded, payload, message):
+            return None
 
         result = dict(message)
         result["payload"] = decoded
         result["encrypted"] = True
-        result["e2ee"] = {
+        e2ee = {
             "encryption_mode": MODE_EPOCH_GROUP_KEY,
             "suite": SUITE,
             "epoch": epoch,
             "sender_verified": False,
         }
+        protected_headers = _exposed_envelope_metadata(payload.get("protected_headers"))
+        if protected_headers is not None:
+            e2ee["protected_headers"] = protected_headers
+        context_meta = _exposed_envelope_metadata(payload.get("context"))
+        if context_meta is not None:
+            e2ee["context"] = context_meta
+        result["e2ee"] = e2ee
 
         # 发送方签名验证（零信任：默认强制要求签名 + 证书）
         sender_sig_b64 = payload.get("sender_signature")
@@ -1404,7 +1687,7 @@ def decrypt_group_message(
                 sig_bytes = base64.b64decode(sender_sig_b64)
                 verify_payload = ciphertext + tag + aad_bytes
                 sender_pub.verify(sig_bytes, verify_payload, ec.ECDSA(hashes.SHA256()))
-                result["e2ee"]["sender_verified"] = True
+                e2ee["sender_verified"] = True
             except Exception:
                 _e2ee_log.warning("群消息发送方签名验证失败: group=%s from=%s", group_id, aad_from)
                 return None
@@ -1422,7 +1705,7 @@ def decrypt_group_message(
                 sig_bytes = base64.b64decode(sender_sig_b64)
                 verify_payload = ciphertext + tag + aad_bytes
                 sender_pub.verify(sig_bytes, verify_payload, ec.ECDSA(hashes.SHA256()))
-                result["e2ee"]["sender_verified"] = True
+                e2ee["sender_verified"] = True
             except Exception:
                 _e2ee_log.warning("群消息发送方签名验证失败: group=%s from=%s", group_id, aad_from)
                 return None
@@ -1596,6 +1879,61 @@ def compute_epoch_chain(
     """
     prefix = _EPOCH_CHAIN_GENESIS_PREFIX if prev_chain is None else bytes.fromhex(prev_chain)
     data = prefix + epoch.to_bytes(4, "big") + commitment.encode("utf-8") + rotator_aid.encode("utf-8")
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
+    return digest.finalize().hex()
+
+
+# ── Group State Hash ──────────────────────────────────────
+
+
+def compute_state_hash(
+    *,
+    group_id: str,
+    state_version: int,
+    key_epoch: int,
+    members: list[dict],
+    policy: dict,
+    prev_state_hash: str,
+) -> str:
+    """计算群组状态哈希。
+
+    state_hash = SHA-256(
+        group_id | 0x00 |
+        state_version (uint64 big-endian 8 bytes) | 0x00 |
+        key_epoch (uint64 big-endian 8 bytes) | 0x00 |
+        membership_block | 0x00 |
+        policy_block | 0x00 |
+        prev_state_hash (32 bytes, 全零表示创世)
+    )
+
+    membership_block: 按 AID 字典序排列 "{aid}:{role}"，用 "|" 拼接
+    policy_block: JSON 规范化（key 字典序，无空格）
+    """
+    import json as _json
+
+    # membership_block: 按 AID 字典序
+    sorted_members = sorted(members, key=lambda m: m["aid"])
+    membership_block = "|".join(f"{m['aid']}:{m['role']}" for m in sorted_members)
+
+    # policy_block: 规范化 JSON
+    policy_block = _json.dumps(policy, sort_keys=True, separators=(",", ":")) if policy else ""
+
+    # prev_state_hash: 空字符串 → 32 字节零
+    if prev_state_hash:
+        prev_bytes = bytes.fromhex(prev_state_hash)
+    else:
+        prev_bytes = b"\x00" * 32
+
+    # 拼接并计算 SHA-256
+    data = (
+        group_id.encode("utf-8") + b"\x00"
+        + state_version.to_bytes(8, "big") + b"\x00"
+        + key_epoch.to_bytes(8, "big") + b"\x00"
+        + membership_block.encode("utf-8") + b"\x00"
+        + policy_block.encode("utf-8") + b"\x00"
+        + prev_bytes
+    )
     digest = hashes.Hash(hashes.SHA256())
     digest.update(data)
     return digest.finalize().hex()
@@ -1809,19 +2147,54 @@ def _assess_incoming_epoch_chain(
     incoming_chain = str(incoming_chain or "").strip()
     rotation_id = str(rotation_id or "").strip()
     rotator_aid = str(rotator_aid or "").strip()
+    current_data = load_group_secret(keystore, aid, group_id)
+    prev_data = load_group_secret(keystore, aid, group_id, int(epoch) - 1)
+    current_chain_dbg = str(current_data.get("epoch_chain") or "") if current_data else ""
+    prev_chain_dbg = str(prev_data.get("epoch_chain") or "") if prev_data else ""
+    _debug_group_e2ee(
+        "chain_assess_enter",
+        aid=aid,
+        group=group_id,
+        epoch=epoch,
+        rotation=rotation_id or "-",
+        rotator=rotator_aid or "-",
+        source=source,
+        incoming=bool(incoming_chain),
+        incoming_prefix=incoming_chain[:16] if incoming_chain else "-",
+        current=bool(current_data),
+        current_prefix=current_chain_dbg[:16] if current_chain_dbg else "-",
+        prev=bool(prev_data),
+        prev_prefix=prev_chain_dbg[:16] if prev_chain_dbg else "-",
+        commitment=commitment[:16] if commitment else "-",
+    )
 
     if rotation_id and not incoming_chain:
         _e2ee_log.warning(
             "拒绝缺少 epoch_chain 的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
             source, group_id, epoch, rotation_id,
         )
+        _debug_group_e2ee(
+            "chain_reject_missing_chain",
+            aid=aid,
+            group=group_id,
+            epoch=epoch,
+            rotation=rotation_id,
+            source=source,
+        )
         return False, None, None
 
-    current_data = load_group_secret(keystore, aid, group_id)
     if current_data and int(current_data.get("epoch") or 0) == int(epoch):
         current_chain = str(current_data.get("epoch_chain") or "")
         current_pending_rotation_id = str(current_data.get("pending_rotation_id") or "")
         if incoming_chain and current_chain == incoming_chain:
+            _debug_group_e2ee(
+                "chain_accept_same_current",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                rotation=rotation_id or "-",
+                source=source,
+            )
             return True, None, None
         if rotation_id and incoming_chain and current_chain and current_chain != incoming_chain:
             if current_pending_rotation_id and current_pending_rotation_id != rotation_id:
@@ -1833,26 +2206,65 @@ def _assess_incoming_epoch_chain(
                     "拒绝同 epoch 分叉 chain: source=%s group=%s epoch=%s rotation=%s",
                     source, group_id, epoch, rotation_id,
                 )
+                _debug_group_e2ee(
+                    "chain_reject_same_epoch_fork",
+                    aid=aid,
+                    group=group_id,
+                    epoch=epoch,
+                    rotation=rotation_id,
+                    source=source,
+                    current_pending=current_pending_rotation_id or "-",
+                )
                 return False, None, None
         elif rotation_id and incoming_chain and current_pending_rotation_id == rotation_id and current_chain and current_chain != incoming_chain:
             _e2ee_log.warning(
                 "拒绝同 epoch 分叉 chain: source=%s group=%s epoch=%s rotation=%s",
                 source, group_id, epoch, rotation_id,
             )
+            _debug_group_e2ee(
+                "chain_reject_same_rotation_fork",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                rotation=rotation_id,
+                source=source,
+            )
             return False, None, None
 
-    prev_data = load_group_secret(keystore, aid, group_id, int(epoch) - 1)
     prev_chain = str(prev_data.get("epoch_chain") or "") if prev_data else ""
 
     if not incoming_chain:
+        _debug_group_e2ee(
+            "chain_accept_compat_missing_chain",
+            aid=aid,
+            group=group_id,
+            epoch=epoch,
+            source=source,
+        )
         return True, True, "missing_epoch_chain"
     if not prev_chain:
+        _debug_group_e2ee(
+            "chain_accept_unverified_missing_prev",
+            aid=aid,
+            group=group_id,
+            epoch=epoch,
+            rotation=rotation_id or "-",
+            source=source,
+        )
         return True, True, "missing_prev_chain"
     if not rotator_aid:
         if rotation_id:
             _e2ee_log.warning(
                 "拒绝缺少 rotator_aid 的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
                 source, group_id, epoch, rotation_id,
+            )
+            _debug_group_e2ee(
+                "chain_reject_missing_rotator",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                rotation=rotation_id,
+                source=source,
             )
             return False, None, None
         return True, True, "missing_rotator_aid"
@@ -1863,15 +2275,50 @@ def _assess_incoming_epoch_chain(
                 "拒绝 epoch chain 验证失败的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
                 source, group_id, epoch, rotation_id,
             )
+            _debug_group_e2ee(
+                "chain_reject_verify_failed",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                rotation=rotation_id,
+                rotator=rotator_aid,
+                source=source,
+                incoming_prefix=incoming_chain[:16],
+                prev_prefix=prev_chain[:16],
+                commitment=commitment[:16] if commitment else "-",
+            )
             return False, None, None
         _e2ee_log.warning(
             "epoch chain 验证失败，按兼容档接收并标记未验证: source=%s group=%s epoch=%s",
             source, group_id, epoch,
         )
+        _debug_group_e2ee(
+            "chain_accept_legacy_mismatch",
+            aid=aid,
+            group=group_id,
+            epoch=epoch,
+            source=source,
+        )
         return True, True, "chain_mismatch_legacy"
 
     if not rotation_id:
+        _debug_group_e2ee(
+            "chain_accept_missing_rotation_id",
+            aid=aid,
+            group=group_id,
+            epoch=epoch,
+            source=source,
+        )
         return True, True, "missing_rotation_id"
+    _debug_group_e2ee(
+        "chain_accept_verified",
+        aid=aid,
+        group=group_id,
+        epoch=epoch,
+        rotation=rotation_id,
+        rotator=rotator_aid,
+        source=source,
+    )
     return True, False, None
 
 
@@ -1987,6 +2434,52 @@ def check_epoch_downgrade(
 
 
 # ── Group Key 分发与恢复协议 ──────────────────────────────
+
+# ── ECIES：per-member epoch key 加密（服务端存储方案）──────
+
+_ECIES_HKDF_INFO = b"aun-epoch-key-ecies"
+
+
+def ecies_encrypt(peer_pubkey_bytes: bytes, plaintext: bytes) -> bytes:
+    """P-256 ECDH + HKDF-SHA256 + AES-256-GCM 加密。
+
+    peer_pubkey_bytes: 65 字节未压缩 P-256 公钥
+    返回: ephemeral_pubkey(65B) || iv(12B) || ciphertext || tag(16B)
+    """
+    peer_pubkey = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), peer_pubkey_bytes)
+    ephemeral_key = ec.generate_private_key(ec.SECP256R1())
+    shared = ephemeral_key.exchange(ec.ECDH(), peer_pubkey)
+    derived = HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=None, info=_ECIES_HKDF_INFO,
+    ).derive(shared)
+    iv = secrets.token_bytes(12)
+    ciphertext_with_tag = AESGCM(derived).encrypt(iv, plaintext, None)
+    ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    return ephemeral_pub_bytes + iv + ciphertext_with_tag
+
+
+def ecies_decrypt(own_privkey: ec.EllipticCurvePrivateKey, ciphertext: bytes) -> bytes:
+    """ECIES 解密，对应 ecies_encrypt。
+
+    ciphertext 格式: ephemeral_pubkey(65B) || iv(12B) || encrypted || tag(16B)
+    """
+    ephemeral_pub_bytes = ciphertext[:65]
+    iv = ciphertext[65:77]
+    encrypted_with_tag = ciphertext[77:]
+    ephemeral_pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), ephemeral_pub_bytes
+    )
+    shared = own_privkey.exchange(ec.ECDH(), ephemeral_pubkey)
+    derived = HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=None, info=_ECIES_HKDF_INFO,
+    ).derive(shared)
+    return AESGCM(derived).decrypt(iv, encrypted_with_tag, None)
+
 
 def generate_group_secret() -> bytes:
     """生成 32 字节随机 group_secret。"""
@@ -2137,7 +2630,7 @@ def handle_key_request(
     if not all([requester_aid, group_id, epoch is not None]):
         return None
 
-    # 验证请求者是群成员
+    # 验证请求者是当前群成员
     if requester_aid not in current_members:
         return None
 
@@ -2146,19 +2639,19 @@ def handle_key_request(
     if secret_data is None:
         return None
 
-    commitment = secret_data.get("commitment", "")
+    # P0 历史隔离：请求者必须属于目标 epoch 的成员集，
+    # 拒绝新成员获取加入前的旧 epoch key。
     member_aids = sorted(str(m) for m in (secret_data.get("member_aids", []) or []) if m)
-    current_member_aids = sorted(str(m) for m in (current_members or []) if m)
-    response_member_aids = member_aids or current_member_aids
-    include_epoch_chain = True
-    if requester_aid in current_member_aids and requester_aid not in response_member_aids:
-        response_member_aids = current_member_aids
-        commitment = compute_membership_commitment(
-            response_member_aids, epoch, group_id, secret_data["secret"],
+    if member_aids and requester_aid not in member_aids:
+        _e2ee_log.warning(
+            "拒绝密钥恢复：%s 不属于 group=%s epoch=%s 的成员集",
+            requester_aid, group_id, epoch,
         )
-        # epoch_chain 绑定原始 commitment；同 epoch 补成员时需要按兼容档接收。
-        include_epoch_chain = False
-    elif not commitment:
+        return None
+
+    commitment = secret_data.get("commitment", "")
+    response_member_aids = member_aids or sorted(str(m) for m in (current_members or []) if m)
+    if not commitment:
         commitment = compute_membership_commitment(response_member_aids, epoch, group_id, secret_data["secret"])
 
     response = {
@@ -2174,7 +2667,7 @@ def handle_key_request(
         "issued_at": int(_time_mod.time() * 1000),
     }
     epoch_chain = secret_data.get("epoch_chain")
-    if include_epoch_chain and epoch_chain:
+    if epoch_chain:
         response["epoch_chain"] = epoch_chain
     if private_key_pem:
         response = sign_group_key_response(response, private_key_pem)
@@ -2203,10 +2696,34 @@ def handle_key_response(
     commitment = payload.get("commitment")
     member_aids = payload.get("member_aids", [])
 
+    _debug_group_e2ee(
+        "key_response_enter",
+        aid=aid,
+        group=group_id or "-",
+        epoch=epoch if epoch is not None else "-",
+        responder=str(payload.get("responder_aid") or "-"),
+        requester=str(payload.get("requester_aid") or "-"),
+        request_id=str(payload.get("request_id") or "-"),
+        strict=strict,
+        has_expected=expected_request is not None,
+        has_cert=bool(responder_cert_pem),
+        has_sig=bool(payload.get("response_signature")),
+        members=len(member_aids) if isinstance(member_aids, list) else "-",
+        commitment=str(commitment or "")[:16] if commitment else "-",
+    )
+
     if not all([group_id, epoch is not None, group_secret_b64, commitment]):
         _e2ee_log.warning(
             "拒绝 group key response：字段不完整 aid=%s group=%s epoch=%s has_secret=%s has_commitment=%s",
             aid, group_id, epoch, bool(group_secret_b64), bool(commitment),
+        )
+        _debug_group_e2ee(
+            "key_response_reject_incomplete",
+            aid=aid,
+            group=group_id or "-",
+            epoch=epoch if epoch is not None else "-",
+            has_secret=bool(group_secret_b64),
+            has_commitment=bool(commitment),
         )
         return False
 
@@ -2216,6 +2733,13 @@ def handle_key_response(
                 "拒绝 group key response：requester 不匹配 aid=%s group=%s epoch=%s requester=%s",
                 aid, group_id, epoch, payload.get("requester_aid"),
             )
+            _debug_group_e2ee(
+                "key_response_reject_requester_mismatch",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                requester=str(payload.get("requester_aid") or "-"),
+            )
             return False
         expected_responder = str(expected_request.get("_expected_responder_aid") or "")
         if expected_responder and payload.get("responder_aid") != expected_responder:
@@ -2223,11 +2747,27 @@ def handle_key_response(
                 "拒绝 group key response：responder 不匹配 aid=%s group=%s epoch=%s expected=%s actual=%s",
                 aid, group_id, epoch, expected_responder, payload.get("responder_aid"),
             )
+            _debug_group_e2ee(
+                "key_response_reject_responder_mismatch",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                expected=expected_responder or "-",
+                actual=str(payload.get("responder_aid") or "-"),
+            )
             return False
         if payload.get("request_id") != expected_request.get("request_id"):
             _e2ee_log.warning(
                 "拒绝 group key response：request_id 不匹配 aid=%s group=%s epoch=%s expected=%s actual=%s",
                 aid, group_id, epoch, expected_request.get("request_id"), payload.get("request_id"),
+            )
+            _debug_group_e2ee(
+                "key_response_reject_request_id_mismatch",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                expected=str(expected_request.get("request_id") or "-"),
+                actual=str(payload.get("request_id") or "-"),
             )
             return False
         if payload.get("group_id") != expected_request.get("group_id"):
@@ -2235,11 +2775,24 @@ def handle_key_response(
                 "拒绝 group key response：group 不匹配 aid=%s expected=%s actual=%s",
                 aid, expected_request.get("group_id"), payload.get("group_id"),
             )
+            _debug_group_e2ee(
+                "key_response_reject_group_mismatch",
+                aid=aid,
+                expected=str(expected_request.get("group_id") or "-"),
+                actual=str(payload.get("group_id") or "-"),
+            )
             return False
         if int(payload.get("epoch") or 0) != int(expected_request.get("epoch") or 0):
             _e2ee_log.warning(
                 "拒绝 group key response：epoch 不匹配 aid=%s group=%s expected=%s actual=%s",
                 aid, group_id, expected_request.get("epoch"), payload.get("epoch"),
+            )
+            _debug_group_e2ee(
+                "key_response_reject_epoch_mismatch",
+                aid=aid,
+                group=group_id,
+                expected=str(expected_request.get("epoch") or "-"),
+                actual=str(payload.get("epoch") or "-"),
             )
             return False
 
@@ -2250,11 +2803,28 @@ def handle_key_response(
                 "拒绝 group key response：responder 身份不可校验 aid=%s group=%s epoch=%s responder=%s has_cert=%s",
                 aid, group_id, epoch, responder_aid, bool(responder_cert_pem),
             )
+            _debug_group_e2ee(
+                "key_response_reject_identity_unverifiable",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                responder=responder_aid or "-",
+                has_cert=bool(responder_cert_pem),
+                has_sig=bool(payload.get("response_signature")),
+            )
             return False
         if current_members and responder_aid not in current_members:
             _e2ee_log.warning(
                 "拒绝 group key response：responder 不在当前成员列表 aid=%s group=%s epoch=%s responder=%s current_members=%s",
                 aid, group_id, epoch, responder_aid, current_members,
+            )
+            _debug_group_e2ee(
+                "key_response_reject_responder_not_member",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                responder=responder_aid,
+                current_members=",".join(current_members),
             )
             return False
         if not verify_group_key_response_signature(payload, responder_cert_pem):
@@ -2262,12 +2832,26 @@ def handle_key_response(
                 "拒绝 group key response：签名无效 aid=%s group=%s epoch=%s responder=%s",
                 aid, group_id, epoch, responder_aid,
             )
+            _debug_group_e2ee(
+                "key_response_reject_bad_signature",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                responder=responder_aid,
+            )
             return False
     elif responder_cert_pem is not None and payload.get("response_signature"):
         if not verify_group_key_response_signature(payload, responder_cert_pem):
             _e2ee_log.warning(
                 "拒绝 group key response：签名无效 aid=%s group=%s epoch=%s responder=%s strict=false",
                 aid, group_id, epoch, responder_aid,
+            )
+            _debug_group_e2ee(
+                "key_response_reject_bad_signature_non_strict",
+                aid=aid,
+                group=group_id,
+                epoch=epoch,
+                responder=responder_aid or "-",
             )
             return False
 
@@ -2277,6 +2861,14 @@ def handle_key_response(
         _e2ee_log.warning(
             "拒绝 group key response：membership commitment 无效 aid=%s group=%s epoch=%s member_aids=%s commitment=%s",
             aid, group_id, epoch, member_aids, str(commitment)[:16],
+        )
+        _debug_group_e2ee(
+            "key_response_reject_commitment_verify",
+            aid=aid,
+            group=group_id,
+            epoch=epoch,
+            members=len(member_aids) if isinstance(member_aids, list) else "-",
+            commitment=str(commitment)[:16],
         )
         return False
 
@@ -2317,6 +2909,14 @@ def handle_key_response(
             "拒绝 group key response：epoch chain 无效 aid=%s group=%s epoch=%s rotation=%s chain=%s",
             aid, group_id, epoch, rotation_id, str(incoming_chain or "")[:16],
         )
+        _debug_group_e2ee(
+            "key_response_reject_chain",
+            aid=aid,
+            group=group_id,
+            epoch=epoch,
+            responder=str(payload.get("responder_aid") or "-"),
+            rotation=rotation_id or "-",
+        )
         return False
 
     stored = store_group_secret_epoch(
@@ -2325,6 +2925,16 @@ def handle_key_response(
         pending_rotation_id=rotation_id,
         epoch_chain_unverified=chain_unverified,
         epoch_chain_unverified_reason=chain_reason,
+    )
+    _debug_group_e2ee(
+        "key_response_store_result",
+        aid=aid,
+        group=group_id,
+        epoch=epoch,
+        responder=str(payload.get("responder_aid") or "-"),
+        stored=stored,
+        unverified=chain_unverified,
+        reason=chain_reason or "-",
     )
     return stored
 
@@ -2422,13 +3032,16 @@ class GroupE2EEManager:
         }
 
     def rotate_epoch_to(
-        self, group_id: str, target_epoch: int, member_aids: list[str], *, rotation_id: str = "",
+        self, group_id: str, target_epoch: int, member_aids: list[str], *,
+        rotation_id: str = "", prev_chain_hint: str | None = None,
     ) -> dict[str, Any]:
         """指定目标 epoch 号轮换（配合服务端 CAS 使用）。"""
         aid = self._current_aid()
         ks = self._keystore()
         current = load_group_secret(ks, aid, group_id, target_epoch - 1) or load_group_secret(ks, aid, group_id)
         prev_chain = current.get("epoch_chain") if current else None
+        if not prev_chain and prev_chain_hint:
+            prev_chain = prev_chain_hint
         gs = generate_group_secret()
         commitment = compute_membership_commitment(member_aids, target_epoch, group_id, gs)
         epoch_chain = compute_epoch_chain(prev_chain, target_epoch, commitment, aid)
@@ -2454,12 +3067,16 @@ class GroupE2EEManager:
         self, group_id: str, epoch: int, group_secret_bytes: bytes,
         commitment: str, member_aids: list[str],
         epoch_chain: str | None = None,
+        epoch_chain_unverified: bool | None = None,
+        epoch_chain_unverified_reason: str | None = None,
     ) -> bool:
         """手动存储 group_secret。返回 False 表示 epoch 降级被拒。"""
         return store_group_secret(
             self._keystore(), self._current_aid(), group_id, epoch,
             group_secret_bytes, commitment, member_aids,
             epoch_chain=epoch_chain,
+            epoch_chain_unverified=epoch_chain_unverified,
+            epoch_chain_unverified_reason=epoch_chain_unverified_reason,
         )
 
     def discard_pending_secret(self, group_id: str, epoch: int, rotation_id: str) -> bool:
@@ -2482,6 +3099,8 @@ class GroupE2EEManager:
     def encrypt(
         self, group_id: str, payload: dict[str, Any], *,
         message_id: str | None = None, timestamp: int | None = None,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """加密群消息（含发送方签名）。无密钥时抛 E2EEGroupSecretMissingError。"""
         aid = self._current_aid()
@@ -2491,11 +3110,14 @@ class GroupE2EEManager:
         return self._encrypt_with_secret_data(
             group_id, payload, secret_data,
             message_id=message_id, timestamp=timestamp,
+            protected_headers=protected_headers, context=context,
         )
 
     def encrypt_with_epoch(
         self, group_id: str, epoch: int, payload: dict[str, Any], *,
         message_id: str | None = None, timestamp: int | None = None,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """使用指定 epoch 加密群消息。"""
         aid = self._current_aid()
@@ -2505,11 +3127,14 @@ class GroupE2EEManager:
         return self._encrypt_with_secret_data(
             group_id, payload, secret_data,
             message_id=message_id, timestamp=timestamp,
+            protected_headers=protected_headers, context=context,
         )
 
     def _encrypt_with_secret_data(
         self, group_id: str, payload: dict[str, Any], secret_data: dict[str, Any], *,
         message_id: str | None = None, timestamp: int | None = None,
+        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         aid = self._current_aid()
         # 获取发送方私钥用于签名
@@ -2523,6 +3148,8 @@ class GroupE2EEManager:
             timestamp=timestamp or int(_time_mod.time() * 1000),
             sender_private_key_pem=sender_pk_pem,
             sender_cert_pem=sender_cert_pem,
+            protected_headers=protected_headers,
+            context=context,
         )
 
     def decrypt(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any] | None:
@@ -2591,9 +3218,42 @@ class GroupE2EEManager:
             distributed_by = payload.get("distributed_by", "")
             if self._initiator_cert_resolver and distributed_by:
                 raw = self._initiator_cert_resolver(distributed_by)
+                _debug_group_e2ee(
+                    "handle_incoming_distribution_resolver",
+                    aid=aid,
+                    group=str(payload.get("group_id") or "-"),
+                    epoch=payload.get("epoch", "-"),
+                    distributed_by=distributed_by or "-",
+                    raw_type=type(raw).__name__ if raw is not None else "None",
+                    raw_len=len(raw) if isinstance(raw, (bytes, str)) else "-",
+                )
                 if raw:
                     initiator_cert = raw.encode("utf-8") if isinstance(raw, str) else raw
+            elif distributed_by:
+                _debug_group_e2ee(
+                    "handle_incoming_distribution_no_resolver",
+                    aid=aid,
+                    group=str(payload.get("group_id") or "-"),
+                    epoch=payload.get("epoch", "-"),
+                    distributed_by=distributed_by or "-",
+                )
+            _debug_group_e2ee(
+                "handle_incoming_distribution",
+                aid=aid,
+                group=str(payload.get("group_id") or "-"),
+                epoch=payload.get("epoch", "-"),
+                distributed_by=distributed_by or "-",
+                has_cert=bool(initiator_cert),
+                rotation=str(payload.get("rotation_id") or "-"),
+            )
             ok = handle_key_distribution(payload, self._keystore(), aid, initiator_cert_pem=initiator_cert)
+            _debug_group_e2ee(
+                "handle_incoming_distribution_result",
+                aid=aid,
+                group=str(payload.get("group_id") or "-"),
+                epoch=payload.get("epoch", "-"),
+                ok=ok,
+            )
             return "distribution" if ok else "distribution_rejected"
         if msg_type == "e2ee.group_key_response":
             pending_key = f"{payload.get('group_id', '')}:{payload.get('epoch', '')}:{payload.get('request_id', '')}"
@@ -2608,8 +3268,39 @@ class GroupE2EEManager:
             responder_cert = None
             if self._initiator_cert_resolver and responder:
                 raw = self._initiator_cert_resolver(responder)
+                _debug_group_e2ee(
+                    "handle_incoming_response_resolver",
+                    aid=aid,
+                    group=str(payload.get("group_id") or "-"),
+                    epoch=payload.get("epoch", "-"),
+                    responder=responder or "-",
+                    raw_type=type(raw).__name__ if raw is not None else "None",
+                    raw_len=len(raw) if isinstance(raw, (bytes, str)) else "-",
+                )
                 if raw:
                     responder_cert = raw.encode("utf-8") if isinstance(raw, str) else raw
+            elif responder:
+                _debug_group_e2ee(
+                    "handle_incoming_response_no_resolver",
+                    aid=aid,
+                    group=str(payload.get("group_id") or "-"),
+                    epoch=payload.get("epoch", "-"),
+                    responder=responder or "-",
+                )
+            _debug_group_e2ee(
+                "handle_incoming_response",
+                aid=aid,
+                group=str(payload.get("group_id") or "-"),
+                epoch=payload.get("epoch", "-"),
+                responder=responder or "-",
+                request_id=str(payload.get("request_id") or "-"),
+                pending_count=len(self._pending_key_requests),
+                has_expected=expected is not None,
+                expected_responder=str(expected.get("_expected_responder_aid") or "-") if isinstance(expected, dict) else "-",
+                has_resolver=bool(self._initiator_cert_resolver),
+                has_cert=bool(responder_cert),
+                has_sig=bool(payload.get("response_signature")),
+            )
             ok = handle_key_response(
                 payload, self._keystore(), aid,
                 expected_request=expected,
@@ -2619,6 +3310,14 @@ class GroupE2EEManager:
             )
             if ok and expected is not None:
                 self._pending_key_requests.pop(pending_key, None)
+            _debug_group_e2ee(
+                "handle_incoming_response_result",
+                aid=aid,
+                group=str(payload.get("group_id") or "-"),
+                epoch=payload.get("epoch", "-"),
+                responder=responder or "-",
+                ok=ok,
+            )
             return "response" if ok else "response_rejected"
         if msg_type == "e2ee.group_key_request":
             return "request"

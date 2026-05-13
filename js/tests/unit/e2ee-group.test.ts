@@ -20,6 +20,7 @@ import {
   computeEpochChain,
   computeMembershipCommitment,
   verifyMembershipCommitment,
+  computeStateHash,
   storeGroupSecret,
   loadGroupSecret,
   loadAllGroupSecrets,
@@ -270,12 +271,14 @@ describe('群组 E2EE 常量', () => {
     expect(AAD_FIELDS_GROUP).toContain('epoch');
     expect(AAD_FIELDS_GROUP).toContain('encryption_mode');
     expect(AAD_FIELDS_GROUP).toContain('suite');
+    expect(AAD_FIELDS_GROUP).not.toContain('dispatch_mode');
   });
 
   it('AAD_MATCH_FIELDS_GROUP 不含 timestamp', () => {
     expect(AAD_MATCH_FIELDS_GROUP).not.toContain('timestamp');
     expect(AAD_MATCH_FIELDS_GROUP).toContain('group_id');
     expect(AAD_MATCH_FIELDS_GROUP).toContain('epoch');
+    expect(AAD_MATCH_FIELDS_GROUP).not.toContain('dispatch_mode');
   });
 
   it('OLD_EPOCH_RETENTION_SECONDS 为 7 天', () => {
@@ -691,6 +694,8 @@ describe('群组消息加密/解密往返', () => {
       expect((decrypted!.payload as JsonObject).num).toBe(42);
       expect((decrypted!.e2ee as JsonObject).encryption_mode).toBe(MODE_EPOCH_GROUP_KEY);
       expect((decrypted!.e2ee as JsonObject).epoch).toBe(epoch);
+      expect((decrypted!.e2ee as JsonObject).protected_headers).toEqual({ payload_type: 'text' });
+      expect((decrypted!.e2ee as JsonObject).context).toBeUndefined();
     },
   );
 
@@ -731,6 +736,71 @@ describe('群组消息加密/解密往返', () => {
 
       const decrypted = await decryptGroupMessage(message, secrets, null, { requireSignature: false });
       expect(decrypted).toBeNull();
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    'payload_type、protected_headers 和 context 使用独立认证标签绑定',
+    async () => {
+      const secret = generateGroupSecret();
+      const context = { type: 'thought', id: 'ctx-1' };
+      const envelope = await encryptGroupMessage('g1', 1, secret, { type: 'text', text: 'bound' }, {
+        fromAid: 'alice',
+        messageId: 'msg-bound',
+        timestamp: Date.now(),
+        protectedHeaders: { Device_ID: 'dev-a' },
+        context,
+      });
+
+      expect(envelope.payload_type).toBeUndefined();
+      expect((envelope.aad as JsonObject).payload_type).toBeUndefined();
+      expect((envelope.aad as JsonObject).protected_headers).toBeUndefined();
+      expect((envelope.aad as JsonObject).context_type).toBeUndefined();
+      expect((envelope.protected_headers as JsonObject).payload_type).toBe('text');
+      expect((envelope.protected_headers as JsonObject).device_id).toBe('dev-a');
+      expect(((envelope.protected_headers as JsonObject)._auth as JsonObject).alg).toBe('HMAC-SHA256');
+      expect((envelope.context as JsonObject).type).toBe('thought');
+      expect((envelope.context as JsonObject).id).toBe('ctx-1');
+      expect(((envelope.context as JsonObject)._auth as JsonObject).alg).toBe('HMAC-SHA256');
+
+      const message = { group_id: 'g1', from: 'alice', message_id: 'msg-bound', payload: envelope, context };
+      const secrets = new Map<number, Uint8Array>([[1, secret]]);
+      const decrypted = await decryptGroupMessage(message, secrets, null, { requireSignature: false });
+      expect(decrypted?.payload).toEqual({ type: 'text', text: 'bound' });
+      expect((decrypted?.e2ee as JsonObject).protected_headers).toEqual({
+        payload_type: 'text',
+        device_id: 'dev-a',
+      });
+      expect((decrypted?.e2ee as JsonObject).protected_headers).not.toHaveProperty('_auth');
+      expect((decrypted?.e2ee as JsonObject).context).toEqual({
+        type: 'thought',
+        id: 'ctx-1',
+      });
+      expect((decrypted?.e2ee as JsonObject).context).not.toHaveProperty('_auth');
+
+      const tampered = {
+        ...message,
+        payload: {
+          ...envelope,
+          protected_headers: {
+            ...(envelope.protected_headers as JsonObject),
+            device_id: 'dev-b',
+          },
+        },
+      };
+      expect(await decryptGroupMessage(tampered, secrets, null, { requireSignature: false })).toBeNull();
+
+      const missingAuth = {
+        ...message,
+        payload: {
+          ...envelope,
+          protected_headers: { payload_type: 'text', device_id: 'dev-a' },
+        },
+      };
+      expect(await decryptGroupMessage(missingAuth, secrets, null, { requireSignature: false })).toBeNull();
+
+      const tamperedContext = { ...message, context: { type: 'thought', id: 'ctx-2' } };
+      expect(await decryptGroupMessage(tamperedContext, secrets, null, { requireSignature: false })).toBeNull();
     },
   );
 
@@ -923,11 +993,11 @@ describe('handleKeyRequest', () => {
   );
 
   it.skipIf(!hasSubtleCrypto)(
-    '当前成员请求旧 epoch 时应扩展响应 member_aids 并重算 commitment',
+    'P0 历史隔离：当前成员请求旧 epoch 时若不在 epoch 成员集中应返回 null',
     async () => {
       const ksAlice = createMockKeyStore();
-      const ksBob = createMockKeyStore();
       const secret = generateGroupSecret();
+      // epoch 1 成员集只有 alice，bob 是后来加入的成员
       const oldMembers = ['alice'];
       const currentMembers = ['alice', 'bob'];
       const oldCommitment = await computeMembershipCommitment(oldMembers, 1, 'g1', secret);
@@ -939,13 +1009,9 @@ describe('handleKeyRequest', () => {
         epoch: 1,
         requester_aid: 'bob',
       };
+      // P0：bob 不在旧 epoch 的 member_aids 中，必须拒绝
       const response = await handleKeyRequest(request, ksAlice, 'alice', currentMembers);
-
-      expect(response).not.toBeNull();
-      expect(response!.member_aids).toEqual(currentMembers);
-      expect(response!.commitment).toBe(await computeMembershipCommitment(currentMembers, 1, 'g1', secret));
-      expect(await handleKeyResponse(response!, ksBob, 'bob')).toBe(true);
-      expect((await loadGroupSecret(ksBob, 'bob', 'g1', 1))!.member_aids).toEqual(currentMembers);
+      expect(response).toBeNull();
     },
   );
 
@@ -1023,6 +1089,36 @@ describe('handleKeyResponse', () => {
       expect(ok).toBe(true);
       expect((await loadGroupSecret(ks, 'bob', groupId))!.epoch).toBe(5);
       expect(Buffer.compare(Buffer.from((await loadGroupSecret(ks, 'bob', groupId, 3))!.secret), Buffer.from(oldSecret))).toBe(0);
+    },
+  );
+
+  it.skipIf(!hasSubtleCrypto)(
+    'key response 的 manifest members 不匹配时应拒绝',
+    async () => {
+      const ks = createMockKeyStore();
+      const members = ['alice', 'bob'];
+      const secret = generateGroupSecret();
+      const commitment = await computeMembershipCommitment(members, 3, 'g1', secret);
+
+      const ok = await handleKeyResponse({
+        type: 'e2ee.group_key_response',
+        group_id: 'g1',
+        epoch: 3,
+        group_secret: uint8ToBase64(secret),
+        commitment,
+        member_aids: members,
+        requester_aid: 'bob',
+        responder_aid: 'alice',
+        request_id: 'req-manifest-mismatch',
+        manifest: {
+          group_id: 'g1',
+          epoch: 3,
+          member_aids: ['alice', 'charlie'],
+        },
+      }, ks, 'bob');
+
+      expect(ok).toBe(false);
+      expect(await loadGroupSecret(ks, 'bob', 'g1', 3)).toBeNull();
     },
   );
 
@@ -1302,4 +1398,182 @@ describe('encryptGroupMessage 签名失败应抛出错误（ISSUE-SDK-JS-011/019
       ).rejects.toThrow();
     },
   );
+});
+
+// ── computeStateHash 测试 ──────────────────────────────────
+
+describe('computeStateHash', () => {
+  it.skipIf(!hasSubtleCrypto)('确定性：相同输入产生相同哈希', async () => {
+    const params = {
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'member' },
+      ],
+      policy: { require_signature: true, rotation_policy: 'on_member_change' },
+      prevStateHash: '',
+    };
+    const h1 = await computeStateHash(params);
+    const h2 = await computeStateHash(params);
+    expect(h1).toBe(h2);
+    expect(h1).toHaveLength(64);
+  });
+
+  it.skipIf(!hasSubtleCrypto)('成员顺序无关', async () => {
+    const h1 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'bob.aid.com', role: 'member' },
+        { aid: 'alice.aid.com', role: 'owner' },
+      ],
+      policy: {},
+      prevStateHash: '',
+    });
+    const h2 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'member' },
+      ],
+      policy: {},
+      prevStateHash: '',
+    });
+    expect(h1).toBe(h2);
+  });
+
+  it.skipIf(!hasSubtleCrypto)('角色变更导致哈希变化', async () => {
+    const h1 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'member' },
+      ],
+      policy: {},
+      prevStateHash: '',
+    });
+    const h2 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 2,
+      keyEpoch: 1,
+      members: [
+        { aid: 'alice.aid.com', role: 'owner' },
+        { aid: 'bob.aid.com', role: 'admin' },
+      ],
+      policy: {},
+      prevStateHash: h1,
+    });
+    expect(h1).not.toBe(h2);
+  });
+
+  it.skipIf(!hasSubtleCrypto)('prevStateHash 链式绑定', async () => {
+    const members = [{ aid: 'alice.aid.com', role: 'owner' }];
+    const h1 = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 1,
+      keyEpoch: 1,
+      members,
+      policy: {},
+      prevStateHash: '',
+    });
+    const h2a = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 2,
+      keyEpoch: 1,
+      members,
+      policy: {},
+      prevStateHash: h1,
+    });
+    const h2b = await computeStateHash({
+      groupId: 'grp_test',
+      stateVersion: 2,
+      keyEpoch: 1,
+      members,
+      policy: {},
+      prevStateHash: '0'.repeat(64),
+    });
+    expect(h2a).not.toBe(h2b);
+  });
+});
+
+// ── ECIES 加解密测试 ──────────────────────────────────────────
+
+import { eciesEncrypt, eciesDecrypt } from '../../src/e2ee-group.js';
+
+describe('ECIES encrypt/decrypt (SubtleCrypto)', () => {
+  /** 生成 P-256 密钥对，返回未压缩公钥和 PKCS8 PEM 私钥 */
+  async function makeEcKeyPair() {
+    const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+    const privDer = await crypto.subtle.exportKey('pkcs8', kp.privateKey);
+    // 转为 PEM
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(privDer)));
+    const pem = `-----BEGIN PRIVATE KEY-----\n${b64.match(/.{1,64}/g)!.join('\n')}\n-----END PRIVATE KEY-----`;
+    return { pubBytes: pubRaw, privPem: pem };
+  }
+
+  it('roundtrip: 32 字节 secret 加解密', async () => {
+    const { pubBytes, privPem } = await makeEcKeyPair();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const ciphertext = await eciesEncrypt(pubBytes, secret);
+    // 格式验证: 65 + 12 + 32 + 16 = 125
+    expect(ciphertext.length).toBe(125);
+    expect(ciphertext[0]).toBe(0x04);
+    const decrypted = await eciesDecrypt(privPem, ciphertext);
+    expect(decrypted).toEqual(secret);
+  });
+
+  it('不同明文产生不同密文', async () => {
+    const { pubBytes } = await makeEcKeyPair();
+    const a = await eciesEncrypt(pubBytes, crypto.getRandomValues(new Uint8Array(32)));
+    const b = await eciesEncrypt(pubBytes, crypto.getRandomValues(new Uint8Array(32)));
+    expect(a).not.toEqual(b);
+  });
+
+  it('同一明文每次加密密文不同（临时密钥不同）', async () => {
+    const { pubBytes } = await makeEcKeyPair();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const a = await eciesEncrypt(pubBytes, secret);
+    const b = await eciesEncrypt(pubBytes, secret);
+    expect(a).not.toEqual(b);
+  });
+
+  it('错误私钥解密失败', async () => {
+    const alice = await makeEcKeyPair();
+    const bob = await makeEcKeyPair();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const ciphertext = await eciesEncrypt(alice.pubBytes, secret);
+    await expect(eciesDecrypt(bob.privPem, ciphertext)).rejects.toThrow();
+  });
+
+  it('篡改密文解密失败', async () => {
+    const { pubBytes, privPem } = await makeEcKeyPair();
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    const ciphertext = await eciesEncrypt(pubBytes, secret);
+    const tampered = new Uint8Array(ciphertext);
+    tampered[80] ^= 0xff;
+    await expect(eciesDecrypt(privPem, tampered)).rejects.toThrow();
+  });
+
+  it('多成员场景：同一 secret 用不同公钥加密，各自能解密', async () => {
+    const members = await Promise.all([makeEcKeyPair(), makeEcKeyPair(), makeEcKeyPair()]);
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    for (const m of members) {
+      const ct = await eciesEncrypt(m.pubBytes, secret);
+      const pt = await eciesDecrypt(m.privPem, ct);
+      expect(pt).toEqual(secret);
+    }
+  });
+
+  it('密文过短抛出错误', async () => {
+    const { privPem } = await makeEcKeyPair();
+    await expect(eciesDecrypt(privPem, new Uint8Array(50))).rejects.toThrow('ECIES ciphertext too short');
+  });
 });

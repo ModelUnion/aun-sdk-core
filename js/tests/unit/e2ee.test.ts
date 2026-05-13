@@ -7,6 +7,7 @@ import {
   SUITE,
   MODE_PREKEY_ECDH_V2,
   MODE_LONG_TERM_KEY,
+  ProtectedHeaders,
   _aadBytesOffline,
 } from '../../src/e2ee.js';
 import { CryptoProvider, uint8ToBase64 } from '../../src/crypto.js';
@@ -60,6 +61,27 @@ describe('AAD 序列化', () => {
     const bytes1 = _aadBytesOffline(aad);
     const bytes2 = _aadBytesOffline(aad);
     expect(uint8ToBase64(bytes1)).toBe(uint8ToBase64(bytes2));
+  });
+
+  it('可选元数据不进入主 AAD，protected headers 仍规范化 key', () => {
+    const base = { from: 'a', to: 'b', message_id: 'm1', timestamp: 100 };
+    const parsedBase = JSON.parse(new TextDecoder().decode(_aadBytesOffline(base)));
+    expect(parsedBase.payload_type).toBeUndefined();
+    expect(parsedBase.protected_headers).toBeUndefined();
+
+    const headers = new ProtectedHeaders({ Device_ID: 'dev-a', slot_id: 'slot-a' });
+    const aad = {
+      ...base,
+      payload_type: 'text',
+      protected_headers: headers.toObject(),
+      context_type: 'thought',
+      context_id: 'ctx-1',
+    };
+    const parsed = JSON.parse(new TextDecoder().decode(_aadBytesOffline(aad)));
+    expect(parsed.payload_type).toBeUndefined();
+    expect(parsed.protected_headers).toBeUndefined();
+    expect(parsed.context_type).toBeUndefined();
+    expect(parsed.context_id).toBeUndefined();
   });
 });
 

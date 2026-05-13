@@ -9,30 +9,38 @@
 const ws = new WebSocket('wss://gateway.example.com/aun');
 let msgId = 1;
 let token = null;
+let gatewayNonce = null;
 let savedClientNonce = null;  // 保存 client_nonce 用于验证 Auth 服务签名
 let savedRequestId = null;
 
 ws.onopen = () => {
-  // 连接建立后，initialize 之前只允许 auth.* 方法
-  // 步骤1：发送 login_aid1（必需字段：aid, cert, request_id, client_nonce）
-  savedRequestId = `req-${Date.now()}`;
-  savedClientNonce = crypto.randomUUID();
-  ws.send(JSON.stringify({
-    jsonrpc: '2.0',
-    id: msgId++,
-    method: 'auth.aid_login1',
-    params: {
-      aid: 'alice.aid.pub',
-      cert: loadCert(),               // PEM 格式证书（必需）
-      request_id: savedRequestId,     // 关联两阶段登录（必需）
-      client_nonce: savedClientNonce   // 客户端随机 nonce（必需）
-    }
-  }));
+  // Gateway 会先推送 challenge；收到后再发 auth.* / auth.connect
 };
 
 // 处理响应和事件
 ws.onmessage = async (event) => {
   const msg = JSON.parse(event.data);
+
+  // challenge：保存 Gateway nonce，然后开始 auth.* 两阶段登录
+  if (msg.method === 'challenge') {
+    gatewayNonce = msg.params.nonce;
+
+    // 步骤1：发送 login_aid1（必需字段：aid, cert, request_id, client_nonce）
+    savedRequestId = `req-${Date.now()}`;
+    savedClientNonce = crypto.randomUUID();
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msgId++,
+      method: 'auth.aid_login1',
+      params: {
+        aid: 'alice.aid.pub',
+        cert: loadCert(),               // PEM 格式证书（必需）
+        request_id: savedRequestId,     // 关联两阶段登录（必需）
+        client_nonce: savedClientNonce   // 客户端随机 nonce（必需）
+      }
+    }));
+    return;
+  }
 
   // login_aid1 响应：返回 nonce + client_nonce_signature + auth_cert
   if (msg.result && msg.result.nonce && msg.result.client_nonce_signature) {
@@ -62,21 +70,23 @@ ws.onmessage = async (event) => {
   if (msg.result && msg.result.token && !msg.result.authenticated) {
     token = msg.result.token;
 
-    // 步骤3：用 token 调用 initialize 完成 Gateway 模式认证握手
+    // 步骤3：用 token 调用 auth.connect 完成 Gateway 模式会话初始化
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
       id: msgId++,
-      method: 'initialize',
+      method: 'auth.connect',
       params: {
-        mode: 'gateway',
+        nonce: gatewayNonce,
+        auth: { method: 'kite_token', token },
         protocol: {min: '1.0', max: '1.0'},
-        token: token,
-        clientInfo: {name: 'MyApp', version: '1.0.0'}
+        device: {id: 'browser-dev-001', type: 'browser'},
+        client: {name: 'MyApp', version: '1.0.0'},
+        capabilities: {e2ee: true, group_e2ee: true}
       }
     }));
   }
 
-  // initialize 响应（连接已认证）
+  // auth.connect 响应（连接已认证）
   if (msg.result && msg.result.authenticated) {
     console.log('Authenticated as:', msg.result.identity.aid);
 
@@ -123,8 +133,7 @@ ws.send(JSON.stringify({
           content_type: 'application/pdf'
         }
       ]
-    },
-    delivery_mode: { mode: 'fanout' }
+    }
   }
 }));
 ```
@@ -137,25 +146,32 @@ var request = URLRequest(url: URL(string: "wss://gateway.example.com/aun")!)
 let ws = WebSocket(request: request)
 var msgId = 1
 var token: String?
+var gatewayNonce: String?
 var savedClientNonce: String?
 var savedRequestId: String?
 
-// 2. 连接成功后，先调用 auth.* 获取 token（initialize 之前只允许 auth.*）
+// 2. 连接成功后，等待 Gateway challenge，再调用 auth.* 获取 token
 ws.onConnected = {
-    savedRequestId = UUID().uuidString
-    savedClientNonce = UUID().uuidString
-    ws.send(jsonrpc: "2.0", id: msgId, method: "auth.aid_login1",
-           params: [
-               "aid": "alice.aid.pub",
-               "cert": loadCert(),                    // PEM 格式证书（必需）
-               "request_id": savedRequestId!,         // 关联两阶段登录（必需）
-               "client_nonce": savedClientNonce!       // 客户端随机 nonce（必需）
-           ])
-    msgId += 1
+    // no-op: Gateway 会主动推送 challenge
 }
 
 // 3. 处理响应和事件
 ws.onMessage = { message in
+    if let challenge = message as? ChallengeMessage {
+        gatewayNonce = challenge.nonce
+        savedRequestId = UUID().uuidString
+        savedClientNonce = UUID().uuidString
+        ws.send(jsonrpc: "2.0", id: msgId, method: "auth.aid_login1",
+               params: [
+                   "aid": "alice.aid.pub",
+                   "cert": loadCert(),                    // PEM 格式证书（必需）
+                   "request_id": savedRequestId!,         // 关联两阶段登录（必需）
+                   "client_nonce": savedClientNonce!       // 客户端随机 nonce（必需）
+               ])
+        msgId += 1
+        return
+    }
+
     // login_aid1 响应：返回 nonce + client_nonce_signature + auth_cert
     if let loginResp = message as? LoginAid1Response {
         // 验证 Auth 服务身份：用 auth_cert 公钥验证 client_nonce_signature
@@ -182,19 +198,21 @@ ws.onMessage = { message in
     if let loginResp = message as? LoginAid2Response {
         token = loginResp.token
 
-        // 用 token 调用 initialize 完成 Gateway 模式认证握手
-        let initMsg = InitializeRequest(
-            mode: "gateway",
-            protocol: ProtocolRange(min: "1.0", max: "1.0"),
-            token: token!,
-            clientInfo: ClientInfo(name: "MyApp", version: "1.0.0")
-        )
-        ws.send(jsonrpc: "2.0", id: msgId, method: "initialize", params: initMsg)
+        // 用 token 调用 auth.connect 完成 Gateway 模式会话初始化
+        let connectParams: [String: Any] = [
+            "nonce": gatewayNonce!,
+            "auth": ["method": "kite_token", "token": token!],
+            "protocol": ["min": "1.0", "max": "1.0"],
+            "device": ["id": "ios-dev-001", "type": "mobile"],
+            "client": ["name": "MyApp", "version": "1.0.0"],
+            "capabilities": ["e2ee": true, "group_e2ee": true]
+        ]
+        ws.send(jsonrpc: "2.0", id: msgId, method: "auth.connect", params: connectParams)
         msgId += 1
     }
 
-    // initialize 响应（连接已认证）
-    if let response = message as? InitializeResponse, response.authenticated {
+    // auth.connect 响应（连接已认证）
+    if let response = message as? AuthConnectResponse, response.authenticated {
         print("Authenticated as: \(response.identity.aid)")
 
         // 现在可以调用所有方法

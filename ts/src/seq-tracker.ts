@@ -9,6 +9,8 @@ const BACKOFF_INTERVALS = [1, 3, 10, 30, 60]; // 秒
 // S2: 删除"probeCount >= 5 强制 resolved"的硬限制；仅用作 backoff 索引上限。
 // resolved 只应由"完整补齐"或服务端明确 tombstone 驱动。
 const MAX_PROBE_COUNT = 5;
+// P1-07: receivedSeqs 内存保护上限，超过时触发 forceCompact 释放内存
+const RECEIVED_SEQS_LIMIT = 5000;
 
 interface GapProbe {
   gapStart: number;
@@ -95,6 +97,11 @@ export class SeqTracker {
     t.receivedSeqs.add(seq);
     t.maxSeenSeq = Math.max(t.maxSeenSeq, seq);
 
+    // P1-07: 内存保护 — receivedSeqs 超限时强制推进 contiguousSeq 释放内存
+    if (t.receivedSeqs.size > RECEIVED_SEQS_LIMIT) {
+      this._forceCompact(t);
+    }
+
     if (seq === t.contiguousSeq + 1) {
       t.contiguousSeq = seq;
       t.receivedSeqs.delete(seq);
@@ -130,7 +137,7 @@ export class SeqTracker {
     const t = this._get(ns);
     const pulledSeqs = new Set<number>();
     for (const m of messages) {
-      const s = m.seq;
+      const s = typeof m.seq === 'number' && m.seq > 0 ? m.seq : m.event_seq;
       if (typeof s === 'number' && s > 0) pulledSeqs.add(s);
     }
 
@@ -158,6 +165,31 @@ export class SeqTracker {
 
     if (pulledSeqs.size) {
       t.maxSeenSeq = Math.max(t.maxSeenSeq, Math.max(...pulledSeqs));
+    }
+    this._tryAdvance(t);
+  }
+
+  /** P1-07: 内存保护 — 当 receivedSeqs 超过上限时，
+   *  找到最小 seq 强制推进 contiguousSeq，释放已无意义的条目。 */
+  private _forceCompact(t: TrackerState): void {
+    if (t.receivedSeqs.size === 0) return;
+    let minSeq = Infinity;
+    for (const s of t.receivedSeqs) {
+      if (s < minSeq) minSeq = s;
+    }
+    if (minSeq === Infinity) return;
+    // 强制推进到 minSeq（跳过空洞）
+    t.contiguousSeq = minSeq;
+    t.receivedSeqs.delete(minSeq);
+    // 清理被跳过区间内的 pendingGaps
+    for (const [key, probe] of t.pendingGaps) {
+      if (probe.gapEnd <= t.contiguousSeq) {
+        t.pendingGaps.delete(key);
+      }
+    }
+    // 清理 receivedSeqs 中 <= contiguousSeq 的条目
+    for (const s of t.receivedSeqs) {
+      if (s <= t.contiguousSeq) t.receivedSeqs.delete(s);
     }
     this._tryAdvance(t);
   }

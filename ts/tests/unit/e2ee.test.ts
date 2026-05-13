@@ -87,6 +87,8 @@ describe('prekey_ecdh_v2 加密', () => {
     expect((result as Message).payload).toEqual(payload);
     const e2ee = (result as Message).e2ee as JsonObject;
     expect(e2ee.encryption_mode).toBe(MODE_PREKEY_ECDH_V2);
+    expect(e2ee.protected_headers).toEqual({ payload_type: 'text' });
+    expect(e2ee.context).toBeUndefined();
   });
 });
 
@@ -132,6 +134,95 @@ describe('long_term_key 加密', () => {
     expect((result as Message).payload).toEqual(payload);
     const e2ee = (result as Message).e2ee as JsonObject;
     expect(e2ee.encryption_mode).toBe(MODE_LONG_TERM_KEY);
+    expect(e2ee.protected_headers).toEqual({ payload_type: 'text' });
+    expect(e2ee.context).toBeUndefined();
+  });
+
+  it('payload_type、protected_headers 和 context 使用独立认证标签绑定', () => {
+    const { senderMgr, receiverMgr, receiverCert } = makeE2EEPair();
+    const payload = { type: 'text', text: 'metadata bound' };
+    const mid = crypto.randomUUID();
+    const ts = Date.now();
+    const context = { type: 'thought', id: 'ctx-1' };
+
+    const [envelope] = senderMgr.encryptOutbound(
+      'receiver.test',
+      payload,
+      receiverCert,
+      null,
+      mid,
+      ts,
+      { Device_ID: 'dev-a', slot_id: 'slot-a' },
+      context,
+    );
+
+    expect(envelope.payload_type).toBeUndefined();
+    expect((envelope.aad as JsonObject).payload_type).toBeUndefined();
+    expect((envelope.aad as JsonObject).protected_headers).toBeUndefined();
+    expect((envelope.aad as JsonObject).context_type).toBeUndefined();
+    expect((envelope.aad as JsonObject).context_id).toBeUndefined();
+    expect((envelope.protected_headers as JsonObject).payload_type).toBe('text');
+    expect((envelope.protected_headers as JsonObject).device_id).toBe('dev-a');
+    expect((envelope.protected_headers as JsonObject).slot_id).toBe('slot-a');
+    expect(((envelope.protected_headers as JsonObject)._auth as JsonObject).alg).toBe('HMAC-SHA256');
+    expect((envelope.context as JsonObject).type).toBe('thought');
+    expect((envelope.context as JsonObject).id).toBe('ctx-1');
+    expect(((envelope.context as JsonObject)._auth as JsonObject).alg).toBe('HMAC-SHA256');
+
+    const message: Message = {
+      message_id: mid,
+      from: 'sender.test',
+      to: 'receiver.test',
+      timestamp: ts,
+      seq: 1,
+      payload: envelope,
+      encrypted: true,
+      context,
+    };
+    const decrypted = (receiverMgr as unknown as { _decryptMessage: (m: Message) => Message | null })._decryptMessage(message);
+    expect(decrypted?.payload).toEqual(payload);
+    expect((decrypted?.e2ee as JsonObject).protected_headers).toEqual({
+      payload_type: 'text',
+      device_id: 'dev-a',
+      slot_id: 'slot-a',
+    });
+    expect((decrypted?.e2ee as JsonObject).protected_headers).not.toHaveProperty('_auth');
+    expect((decrypted?.e2ee as JsonObject).context).toEqual({
+      type: 'thought',
+      id: 'ctx-1',
+    });
+    expect((decrypted?.e2ee as JsonObject).context).not.toHaveProperty('_auth');
+
+    const tamperedHeaders: Message = {
+      ...message,
+      payload: {
+        ...envelope,
+        protected_headers: {
+          ...(envelope.protected_headers as JsonObject),
+          device_id: 'dev-b',
+        },
+      },
+    };
+    expect((receiverMgr as unknown as { _decryptMessage: (m: Message) => Message | null })._decryptMessage(tamperedHeaders)).toBeNull();
+
+    const missingAuth: Message = {
+      ...message,
+      payload: {
+        ...envelope,
+        protected_headers: {
+          payload_type: 'text',
+          device_id: 'dev-a',
+          slot_id: 'slot-a',
+        },
+      },
+    };
+    expect((receiverMgr as unknown as { _decryptMessage: (m: Message) => Message | null })._decryptMessage(missingAuth)).toBeNull();
+
+    const tamperedContext: Message = {
+      ...message,
+      context: { type: 'thought', id: 'ctx-2' },
+    };
+    expect((receiverMgr as unknown as { _decryptMessage: (m: Message) => Message | null })._decryptMessage(tamperedContext)).toBeNull();
   });
 });
 

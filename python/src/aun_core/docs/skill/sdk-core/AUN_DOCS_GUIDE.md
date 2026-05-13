@@ -42,7 +42,7 @@ SDK 文档聚焦核心封装：**认证（`client.auth`）**、**元信息与信
 | 02 | [WebSocket协议](02-WebSocket协议.md) | 握手流程、消息格式、裸 WebSocket 示例 |
 | 03 | [核心概念](03-核心概念.md) | AID、状态机、认证、E2EE |
 | 04 | [连接与认证](04-连接与认证.md) | 认证封装、call()、on()、连接 |
-| 05 | [E2EE加密通信](05-E2EE加密通信.md) | E2EE封装、自定义存储 |
+| 05 | [E2EE加密通信](05-E2EE加密通信.md) | E2EE封装、ProtectedHeaders、自定义存储 |
 | 06 | [API手册](06-API手册.md) | AUNClient / AuthNamespace / MetaNamespace（信任根列表与 issuer root 更新） / E2EEManager |
 | 07 | [错误处理](07-错误处理.md) | 错误类层级、错误码、重试 |
 | 08 | [最佳实践](08-最佳实践.md) | 幂等、隔离、资源清理 |

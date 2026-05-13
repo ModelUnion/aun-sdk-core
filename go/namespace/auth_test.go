@@ -2,8 +2,15 @@ package namespace
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +28,9 @@ type mockAuthClient struct {
 	authAuthenticateCalls int
 	discoverGatewayResult string
 	discoverGatewayErr    error
+	fetchPeerCertResult   []byte
+	fetchPeerCertErr      error
+	fetchPeerCertCalls    int
 }
 
 func (m *mockAuthClient) GetGatewayURL() string {
@@ -64,12 +74,54 @@ func (m *mockAuthClient) AuthLoadIdentityOrNil(aid string) map[string]any {
 	return m.identity
 }
 
+func (m *mockAuthClient) AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error) {
+	m.fetchPeerCertCalls++
+	return m.fetchPeerCertResult, m.fetchPeerCertErr
+}
+
 func (m *mockAuthClient) DiscoverGateway(ctx context.Context, wellKnownURL string, timeout time.Duration) (string, error) {
 	return m.discoverGatewayResult, m.discoverGatewayErr
 }
 
 func (m *mockAuthClient) SetIdentity(identity map[string]any) {
 	m.identity = identity
+}
+
+func makeIdentity(t *testing.T, aid string) map[string]any {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key failed: %v", err)
+	}
+	certPEM := makeSelfSignedCert(t, privateKey, aid)
+	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatalf("marshal private key failed: %v", err)
+	}
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyDER})
+	return map[string]any{
+		"aid":             aid,
+		"private_key_pem": string(privateKeyPEM),
+		"cert":            certPEM,
+		"cert_pem":        certPEM,
+	}
+}
+
+func makeSelfSignedCert(t *testing.T, privateKey *ecdsa.PrivateKey, cn string) string {
+	t.Helper()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:         true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("create certificate failed: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
 func TestUploadAgentMDUsesCachedAccessToken(t *testing.T) {
@@ -200,5 +252,163 @@ func TestAgentMDHTTPClientIsReused(t *testing.T) {
 	}
 	if httpClient1 != httpClient2 {
 		t.Fatal("agentMDHTTPClient should reuse the same client instance")
+	}
+}
+
+func sampleAgentMD(aid string) string {
+	return "---\n" +
+		"aid: \"" + aid + "\"\n" +
+		"name: \"Alice\"\n" +
+		"type: \"assistant\"\n" +
+		"version: \"1.0.0\"\n" +
+		"description: \"Alice\"\n" +
+		"---\n\n" +
+		"# Alice\n"
+}
+
+func TestSignAgentMDAppendsTailSignature(t *testing.T) {
+	identity := makeIdentity(t, "alice.agentid.pub")
+	client := &mockAuthClient{
+		aid:      identity["aid"].(string),
+		identity: identity,
+	}
+	ns := NewAuthNamespace(client)
+
+	signed, err := ns.SignAgentMD(context.Background(), sampleAgentMD(identity["aid"].(string)), nil)
+	if err != nil {
+		t.Fatalf("SignAgentMD failed: %v", err)
+	}
+	if !strings.HasPrefix(signed, sampleAgentMD(identity["aid"].(string))) {
+		t.Fatalf("signed content should keep payload prefix: %s", signed)
+	}
+	if strings.Count(signed, "<!-- AUN-SIGNATURE") != 1 {
+		t.Fatalf("expected one signature block, got: %s", signed)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(signed), "-->") {
+		t.Fatalf("signature block should be tail block: %s", signed)
+	}
+}
+
+func TestVerifyAgentMDUnsignedReturnsUnsigned(t *testing.T) {
+	client := &mockAuthClient{}
+	ns := NewAuthNamespace(client)
+
+	result, err := ns.VerifyAgentMD(context.Background(), sampleAgentMD("alice.agentid.pub"), nil)
+	if err != nil {
+		t.Fatalf("VerifyAgentMD failed: %v", err)
+	}
+	if got, _ := result["status"].(string); got != "unsigned" {
+		t.Fatalf("unexpected status: %#v", result["status"])
+	}
+	if got, _ := result["verified"].(bool); got {
+		t.Fatalf("unsigned result should not be verified: %#v", result["verified"])
+	}
+}
+
+func TestVerifyAgentMDRoundTrip(t *testing.T) {
+	identity := makeIdentity(t, "alice.agentid.pub")
+	client := &mockAuthClient{
+		aid:      identity["aid"].(string),
+		identity: identity,
+	}
+	ns := NewAuthNamespace(client)
+
+	payload := sampleAgentMD(identity["aid"].(string))
+	signed, err := ns.SignAgentMD(context.Background(), payload, nil)
+	if err != nil {
+		t.Fatalf("SignAgentMD failed: %v", err)
+	}
+
+	result, err := ns.VerifyAgentMD(context.Background(), signed, &AgentMDVerifyOptions{
+		AID:     identity["aid"].(string),
+		CertPEM: identity["cert"].(string),
+	})
+	if err != nil {
+		t.Fatalf("VerifyAgentMD failed: %v", err)
+	}
+	if got, _ := result["status"].(string); got != "verified" {
+		t.Fatalf("unexpected status: %#v", result["status"])
+	}
+	if got, _ := result["verified"].(bool); !got {
+		t.Fatalf("verified result should be true: %#v", result["verified"])
+	}
+	if got, _ := result["payload"].(string); got != payload {
+		t.Fatalf("unexpected payload: %q", got)
+	}
+}
+
+func TestVerifyAgentMDRejectsTamper(t *testing.T) {
+	identity := makeIdentity(t, "alice.agentid.pub")
+	client := &mockAuthClient{
+		aid:      identity["aid"].(string),
+		identity: identity,
+	}
+	ns := NewAuthNamespace(client)
+
+	payload := sampleAgentMD(identity["aid"].(string))
+	signed, err := ns.SignAgentMD(context.Background(), payload, nil)
+	if err != nil {
+		t.Fatalf("SignAgentMD failed: %v", err)
+	}
+	tampered := strings.Replace(signed, "Alice", "Mallory", 1)
+
+	result, err := ns.VerifyAgentMD(context.Background(), tampered, &AgentMDVerifyOptions{
+		AID:     identity["aid"].(string),
+		CertPEM: identity["cert"].(string),
+	})
+	if err != nil {
+		t.Fatalf("VerifyAgentMD failed: %v", err)
+	}
+	if got, _ := result["status"].(string); got != "invalid" {
+		t.Fatalf("unexpected status: %#v", result["status"])
+	}
+}
+
+func TestSignAgentMDReplacesExistingSignature(t *testing.T) {
+	identity := makeIdentity(t, "alice.agentid.pub")
+	client := &mockAuthClient{
+		aid:      identity["aid"].(string),
+		identity: identity,
+	}
+	ns := NewAuthNamespace(client)
+
+	payload := sampleAgentMD(identity["aid"].(string))
+	signedOnce, err := ns.SignAgentMD(context.Background(), payload, nil)
+	if err != nil {
+		t.Fatalf("SignAgentMD failed: %v", err)
+	}
+	signedTwice, err := ns.SignAgentMD(context.Background(), signedOnce, nil)
+	if err != nil {
+		t.Fatalf("SignAgentMD failed: %v", err)
+	}
+	if strings.Count(signedTwice, "<!-- AUN-SIGNATURE") != 1 {
+		t.Fatalf("expected one signature block, got: %s", signedTwice)
+	}
+}
+
+func TestVerifyAgentMDFetchesPeerCert(t *testing.T) {
+	identity := makeIdentity(t, "alice.agentid.pub")
+	client := &mockAuthClient{
+		aid:                 identity["aid"].(string),
+		identity:            identity,
+		fetchPeerCertResult: []byte(identity["cert"].(string)),
+	}
+	ns := NewAuthNamespace(client)
+
+	payload := sampleAgentMD(identity["aid"].(string))
+	signed, err := ns.SignAgentMD(context.Background(), payload, nil)
+	if err != nil {
+		t.Fatalf("SignAgentMD failed: %v", err)
+	}
+
+	result, err := ns.VerifyAgentMD(context.Background(), signed, &AgentMDVerifyOptions{AID: identity["aid"].(string)})
+	if err != nil {
+		t.Fatalf("VerifyAgentMD failed: %v", err)
+	}
+	if got, _ := result["status"].(string); got != "verified" {
+		t.Fatalf("unexpected status: %#v", result["status"])
+	}
+	if client.fetchPeerCertCalls != 1 {
+		t.Fatalf("expected fetchPeerCert to be called once, got %d", client.fetchPeerCertCalls)
 	}
 }

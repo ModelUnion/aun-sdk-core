@@ -170,6 +170,8 @@ content = base64.b64decode(result["content"])
 
 列出对象。
 
+> 权限：仅允许查询自己的对象（`owner_aid` 默认为当前用户，不可指定他人的 AID）
+
 ### 参数
 
 | 参数 | 类型 | 必填 | 说明 |
@@ -220,6 +222,8 @@ for obj in result["items"]:
 ## storage.list_prefixes
 
 列出直接子目录（前缀）。
+
+> 权限：仅允许查询自己的对象（`owner_aid` 默认为当前用户，不可指定他人的 AID）
 
 ### 参数
 

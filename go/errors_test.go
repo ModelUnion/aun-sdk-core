@@ -166,3 +166,56 @@ func TestMapRemoteError_Message(t *testing.T) {
 		t.Errorf("Message 不正确: %s", ae.Message)
 	}
 }
+
+// TestMapRemoteError_E2EECodes 验证 E2EE 错误码映射（-32040 ~ -32044, -32050, -32051）
+func TestMapRemoteError_E2EECodes(t *testing.T) {
+	// -32040 → E2EEGroupSecretMissingError
+	err := MapRemoteError(map[string]any{"code": -32040, "message": "secret missing"})
+	if _, ok := err.(*E2EEGroupSecretMissingError); !ok {
+		t.Errorf("code=-32040 应映射为 E2EEGroupSecretMissingError, 实际: %T", err)
+	}
+
+	// -32041 → E2EEGroupEpochMismatchError
+	err = MapRemoteError(map[string]any{"code": -32041, "message": "epoch mismatch"})
+	if _, ok := err.(*E2EEGroupEpochMismatchError); !ok {
+		t.Errorf("code=-32041 应映射为 E2EEGroupEpochMismatchError, 实际: %T", err)
+	}
+
+	// -32042 → E2EEGroupCommitmentInvalidError
+	err = MapRemoteError(map[string]any{"code": -32042, "message": "commitment invalid"})
+	if _, ok := err.(*E2EEGroupCommitmentInvalidError); !ok {
+		t.Errorf("code=-32042 应映射为 E2EEGroupCommitmentInvalidError, 实际: %T", err)
+	}
+
+	// -32043 → E2EEGroupNotMemberError
+	err = MapRemoteError(map[string]any{"code": -32043, "message": "not member"})
+	if _, ok := err.(*E2EEGroupNotMemberError); !ok {
+		t.Errorf("code=-32043 应映射为 E2EEGroupNotMemberError, 实际: %T", err)
+	}
+
+	// -32044 → E2EEGroupDecryptFailedError
+	err = MapRemoteError(map[string]any{"code": -32044, "message": "decrypt failed"})
+	if _, ok := err.(*E2EEGroupDecryptFailedError); !ok {
+		t.Errorf("code=-32044 应映射为 E2EEGroupDecryptFailedError, 实际: %T", err)
+	}
+
+	// -32050 → CertificateRevokedError
+	err = MapRemoteError(map[string]any{"code": -32050, "message": "cert revoked"})
+	if _, ok := err.(*CertificateRevokedError); !ok {
+		t.Errorf("code=-32050 应映射为 CertificateRevokedError, 实际: %T", err)
+	}
+
+	// -32051 → ClientSignatureError
+	err = MapRemoteError(map[string]any{"code": -32051, "message": "sig failed"})
+	if _, ok := err.(*ClientSignatureError); !ok {
+		t.Errorf("code=-32051 应映射为 ClientSignatureError, 实际: %T", err)
+	}
+}
+
+// TestMapRemoteError_AuthCode32001 验证 -32001 映射为 AuthError
+func TestMapRemoteError_AuthCode32001(t *testing.T) {
+	err := MapRemoteError(map[string]any{"code": -32001, "message": "auth failed"})
+	if _, ok := err.(*AuthError); !ok {
+		t.Errorf("code=-32001 应映射为 AuthError, 实际: %T", err)
+	}
+}
