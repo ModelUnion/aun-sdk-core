@@ -567,13 +567,14 @@ export class AUNClient {
     this._dispatcher = new EventDispatcher(this._logger.for('aun_core.events'));
     this._discovery = new GatewayDiscovery({ verifySsl: this._configModel.verifySsl });
 
-    const defaultSQLiteBackup = new SQLiteBackup(join(this._configModel.aunPath, '.aun_backup', 'aun_backup.db'), { logger: this._logger.for('aun_core.sqlite_backup') });
+    const defaultSQLiteBackup = new SQLiteBackup(join(this._configModel.aunPath, '.aun_backup', 'aun_backup.db'), { logger: this._logger.for('aun_core.keystore') });
     const keystore = new FileKeyStore(
       this._configModel.aunPath,
       {
         encryptionSeed: this._configModel.seedPassword ?? undefined,
         sqliteBackup: defaultSQLiteBackup,
         logger: this._logger.for('aun_core.keystore'),
+        secretStoreLogger: this._logger.for('aun_core.secret-store'),
       },
     );
     this._keystore = keystore;
@@ -615,7 +616,7 @@ export class AUNClient {
       keystore,
       senderCertResolver: (aid: string) => this._getVerifiedPeerCert(aid),
       initiatorCertResolver: (aid: string) => this._getVerifiedPeerCert(aid),
-      logger: this._logger.for('aun_core.e2ee_group'),
+      logger: this._logger.for('aun_core.e2ee-group'),
     });
 
     this.auth = new AuthNamespace(this);

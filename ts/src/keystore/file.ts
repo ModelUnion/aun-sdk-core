@@ -84,13 +84,14 @@ export class FileKeyStore implements KeyStore {
       encryptionSeed?: string;
       sqliteBackup?: unknown; // 保留参数签名，但不再使用
       logger?: ModuleLogger;
+      secretStoreLogger?: ModuleLogger;
     },
   ) {
     this._logger = opts?.logger ?? _noopLogger;
     const preferred = root ?? join(homedir(), '.aun');
     const fallback = join(process.cwd(), '.aun');
     this._root = this._prepareRoot(preferred, fallback);
-    this._secretStore = opts?.secretStore ?? createDefaultSecretStore(this._root, opts?.encryptionSeed, undefined, { logger: this._logger });
+    this._secretStore = opts?.secretStore ?? createDefaultSecretStore(this._root, opts?.encryptionSeed, undefined, { logger: opts?.secretStoreLogger ?? this._logger });
     this._aidsRoot = join(this._root, 'AIDs');
     mkdirSync(this._aidsRoot, { recursive: true });
     this._deviceId = getDeviceId(this._root);
@@ -110,7 +111,7 @@ export class FileKeyStore implements KeyStore {
         db = new AIDDatabase(dbPath, this._secretStore, safe);
       } catch (exc) {
         // DB 损坏：备份后重建
-        this._logger.warn('[aun_core.keystore] 数据库损坏，备份后重建');
+        this._logger.warn('数据库损坏，备份后重建');
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const bakPath = dbPath + `.corrupt_${ts}.bak`;
         try { renameSync(dbPath, bakPath); } catch { /* 备份失败也继续重建 */ }
@@ -131,7 +132,7 @@ export class FileKeyStore implements KeyStore {
       return preferred;
     } catch {
       // ISSUE-TS-003: 回退时警告用户数据存储位置变更
-      this._logger.warn(`[aun_core.keystore] 首选路径 ${preferred} 不可用，回退到 ${fallback}`);
+      this._logger.warn(`首选路径 ${preferred} 不可用，回退到 ${fallback}`);
       mkdirSync(fallback, { recursive: true });
       return fallback;
     }
@@ -146,7 +147,7 @@ export class FileKeyStore implements KeyStore {
       const raw = JSON.parse(readFileSync(path, 'utf-8'));
       return this._restoreKeyPair(aid, raw);
     } catch (exc) {
-      this._logger.warn('[aun_core.keystore] key.json 读取或解析失败，视为不存在');
+      this._logger.warn('key.json 读取或解析失败，视为不存在');
       return null;
     }
   }
@@ -194,7 +195,7 @@ export class FileKeyStore implements KeyStore {
       return existsSync(path) ? readFileSync(path, 'utf-8') : null;
     } catch (exc) {
       // 文件被锁定、无权限、目录冲突等异常时降级返回 null
-      this._logger.warn('[aun_core.keystore] cert.pem 读取失败，视为不存在');
+      this._logger.warn('cert.pem 读取失败，视为不存在');
       return null;
     }
   }
@@ -238,7 +239,7 @@ export class FileKeyStore implements KeyStore {
           const certPubDer = x.publicKey.export({ type: 'spki', format: 'der' });
           const localPubDer = Buffer.from(localPubB64, 'base64');
           if (!certPubDer.equals(localPubDer)) {
-            this._logger.error('[keystore] key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert');
+            this._logger.error('key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert');
           } else {
             identity.cert = cert;
           }
