@@ -553,6 +553,17 @@ export class AUNClient {
       seed_password: this._configModel.seedPassword,
     };
 
+    // 初始化 Logger（per-client 单例，必须最早创建）
+    const debugFlag = this._configModel.debug || debug;
+    this._logger = new AUNLogger({
+      debug: debugFlag,
+      aunPath: this._configModel.aunPath,
+    });
+    this._clientLog = this._logger.for('aun_core.client');
+    if (debugFlag) {
+      this._clientLog.info(`AUNClient 初始化完成 (debug=true, aunPath=${this._configModel.aunPath})`);
+    }
+
     this._dispatcher = new EventDispatcher(this._logger.for('aun_core.events'));
     this._discovery = new GatewayDiscovery({ verifySsl: this._configModel.verifySsl });
 
@@ -566,17 +577,6 @@ export class AUNClient {
     );
     this._keystore = keystore;
     this._deviceId = getDeviceId(this._configModel.aunPath);
-
-    // 初始化 Logger（per-client 单例）
-    const debugFlag = this._configModel.debug || debug;
-    this._logger = new AUNLogger({
-      debug: debugFlag,
-      aunPath: this._configModel.aunPath,
-    });
-    this._clientLog = this._logger.for('aun_core.client');
-    if (debugFlag) {
-      this._clientLog.info(`AUNClient 初始化完成 (debug=true, aunPath=${this._configModel.aunPath})`);
-    }
 
     this._slotId = '';
     this._connectDeliveryMode = normalizeDeliveryModeConfig({ mode: 'fanout' });
