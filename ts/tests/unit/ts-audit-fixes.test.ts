@@ -323,38 +323,26 @@ describe('ISSUE-SDK-TS-007: max_attempts 默认值与 Python 对齐', () => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// P3-009: Logger 日志格式分隔符
+// P3-009: Logger 新格式（规范对齐）
 // ══════════════════════════════════════════════════════════════
 
-describe('ISSUE-SDK-TS-009: Logger 日志格式分隔符', () => {
-  it('日志行在时间戳与 AID 之间应有 | 分隔符', () => {
-    // 直接验证日志行格式，不依赖 AUNLogger 实例
-    const now = Date.now();
-    // 日志格式应该是：{timestamp} | [{aid}] {message}\n
-    const expectedPattern = /^\d+ \| \[test\.aid\.com\] /;
-    const line = `${now} | [test.aid.com] test message\n`;
-    expect(line).toMatch(expectedPattern);
+describe('ISSUE-SDK-TS-009: Logger 新格式（规范对齐）', () => {
+  it('日志行符合 [ts][LEVEL][module] 格式（无 AID）', () => {
+    const logger = new AUNLogger({ debug: false, aunPath: '/tmp/aun' });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    logger.for('aun_core.auth').info('hello');
+    const line = String(logSpy.mock.calls[0][0]);
+    logSpy.mockRestore();
+    expect(line).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[INFO\]\[aun_core\.auth\] hello$/);
   });
 
-  it('无 AID 时也应有 | 分隔符', () => {
-    // 验证无 AID 时的格式：{timestamp} | {message}\n
-    const now = Date.now();
-    const line = `${now} | no aid message\n`;
-    expect(line).toMatch(/^\d+ \| .*no aid message\n$/);
-  });
-
-  it('AUNLogger.log 格式与预期一致（集成验证）', () => {
-    // 通过读取 logger.ts 源码中的格式化逻辑确认
-    // logger.ts line 43: `${tsMs} | ${this._aid ? '[' + this._aid + '] ' : ''}${message}\n`
-    // 构造一组场景验证
-    const scenarios = [
-      { aid: 'alice.com', msg: 'hello', expected: /^\d+ \| \[alice\.com\] hello\n$/ },
-      { aid: '', msg: 'world', expected: /^\d+ \| world\n$/ },
-    ];
-    for (const s of scenarios) {
-      const ts = Date.now();
-      const line = `${ts} | ${s.aid ? '[' + s.aid + '] ' : ''}${s.msg}\n`;
-      expect(line).toMatch(s.expected);
-    }
+  it('bindAid 后 message 前缀带 [aid]', () => {
+    const logger = new AUNLogger({ debug: false, aunPath: '/tmp/aun' });
+    logger.bindAid('test.aid.com');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    logger.for('aun_core.client').info('hi');
+    const line = String(logSpy.mock.calls[0][0]);
+    logSpy.mockRestore();
+    expect(line).toMatch(/\[aun_core\.client\] \[test\.aid\.com\] hi$/);
   });
 });

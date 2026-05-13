@@ -119,7 +119,8 @@ export class FileSecretStore implements SecretStore {
   }
 
   /** 三级恢复：文件 → SQLite → 新建，双写确保一致 */
-  private _loadOrCreateSeed(backup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null }): Buffer {    const seedPath = join(this._root, '.seed');
+  private _loadOrCreateSeed(backup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null }): Buffer {
+    const seedPath = join(this._root, '.seed');
     let source = '';
 
     // 1. 先读文件
