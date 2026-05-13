@@ -11,6 +11,9 @@ import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import type { JsonObject } from '../types.js';
+import type { ModuleLogger } from '../logger.js';
+
+const _noopLogger: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 const SCHEMA_VERSION = 2;
 
@@ -64,8 +67,10 @@ function defaultNumber(...values: Array<string | number | boolean | null | undef
 export class SQLiteBackup {
   private _db: NodeDatabaseSync | null = null;
   private _available = false;
+  private _logger: ModuleLogger;
 
-  constructor(dbPath?: string) {
+  constructor(dbPath?: string, opts?: { logger?: ModuleLogger }) {
+    this._logger = opts?.logger ?? _noopLogger;
     if (!dbPath) {
       const dir = join(process.cwd(), '.aun_backup');
       try {
@@ -83,7 +88,7 @@ export class SQLiteBackup {
       this._initTables();
       this._available = true;
     } catch (err) {
-      console.warn(`SQLite 备份初始化失败，降级为无备份模式: ${err}`);
+      this._logger.warn(`SQLite 备份初始化失败，降级为无备份模式: ${err}`);
     }
   }
 
@@ -395,7 +400,7 @@ export class SQLiteBackup {
     try {
       runImmediateTransaction(this._db, fn);
     } catch (err) {
-      console.warn(`SQLite ${label} 失败: ${err}`);
+      this._logger.warn(`SQLite ${label} 失败: ${err}`);
     }
   }
 
@@ -404,7 +409,7 @@ export class SQLiteBackup {
     try {
       this._db.prepare(sql).run(...params);
     } catch (err) {
-      console.warn(`SQLite 备份写入失败: ${err}`);
+      this._logger.warn(`SQLite 备份写入失败: ${err}`);
     }
   }
 
@@ -413,7 +418,7 @@ export class SQLiteBackup {
     try {
       return this._db.prepare(sql).get(...params) as T | undefined;
     } catch (err) {
-      console.warn(`SQLite 备份读取失败: ${err}`);
+      this._logger.warn(`SQLite 备份读取失败: ${err}`);
       return undefined;
     }
   }
@@ -423,7 +428,7 @@ export class SQLiteBackup {
     try {
       return this._db.prepare(sql).all(...params) as T[];
     } catch (err) {
-      console.warn(`SQLite 备份读取失败: ${err}`);
+      this._logger.warn(`SQLite 备份读取失败: ${err}`);
       return [];
     }
   }

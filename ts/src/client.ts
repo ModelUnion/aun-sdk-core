@@ -567,7 +567,7 @@ export class AUNClient {
     this._dispatcher = new EventDispatcher(this._logger.for('aun_core.events'));
     this._discovery = new GatewayDiscovery({ verifySsl: this._configModel.verifySsl });
 
-    const defaultSQLiteBackup = new SQLiteBackup(join(this._configModel.aunPath, '.aun_backup', 'aun_backup.db'));
+    const defaultSQLiteBackup = new SQLiteBackup(join(this._configModel.aunPath, '.aun_backup', 'aun_backup.db'), { logger: this._logger.for('aun_core.sqlite_backup') });
     const keystore = new FileKeyStore(
       this._configModel.aunPath,
       {
