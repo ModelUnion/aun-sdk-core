@@ -26,6 +26,9 @@ import { join } from 'node:path';
 
 import type { SecretStore } from './index.js';
 import type { SecretRecord } from '../types.js';
+import type { ModuleLogger } from '../logger.js';
+
+const _noopLogger: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 function decodeSecretPart(value: string): Buffer {
   if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
@@ -37,9 +40,16 @@ function decodeSecretPart(value: string): Buffer {
 export class FileSecretStore implements SecretStore {
   private _root: string;
   private _masterKey: Buffer;
+  private _logger: ModuleLogger;
 
-  constructor(root: string, encryptionSeed?: string, sqliteBackup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null }) {
+  constructor(
+    root: string,
+    encryptionSeed?: string,
+    sqliteBackup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null },
+    opts?: { logger?: ModuleLogger },
+  ) {
     this._root = root;
+    this._logger = opts?.logger ?? _noopLogger;
     mkdirSync(this._root, { recursive: true });
 
     let seedBytes: Buffer;
@@ -109,8 +119,7 @@ export class FileSecretStore implements SecretStore {
   }
 
   /** 三级恢复：文件 → SQLite → 新建，双写确保一致 */
-  private _loadOrCreateSeed(backup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null }): Buffer {
-    const seedPath = join(this._root, '.seed');
+  private _loadOrCreateSeed(backup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null }): Buffer {    const seedPath = join(this._root, '.seed');
     let source = '';
 
     // 1. 先读文件
@@ -127,7 +136,7 @@ export class FileSecretStore implements SecretStore {
       const restored = backup.restoreSeed();
       if (restored && restored.length > 0) {
         source = 'sqlite';
-        console.log('从 SQLite 恢复 .seed 文件');
+        this._logger.info('从 SQLite 恢复 .seed 文件');
         writeFileSync(seedPath, restored);
         if (process.platform !== 'win32') {
           try { chmodSync(seedPath, 0o600); } catch { /* ignore */ }

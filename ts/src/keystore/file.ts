@@ -90,7 +90,7 @@ export class FileKeyStore implements KeyStore {
     const preferred = root ?? join(homedir(), '.aun');
     const fallback = join(process.cwd(), '.aun');
     this._root = this._prepareRoot(preferred, fallback);
-    this._secretStore = opts?.secretStore ?? createDefaultSecretStore(this._root, opts?.encryptionSeed);
+    this._secretStore = opts?.secretStore ?? createDefaultSecretStore(this._root, opts?.encryptionSeed, undefined, { logger: this._logger });
     this._aidsRoot = join(this._root, 'AIDs');
     mkdirSync(this._aidsRoot, { recursive: true });
     this._deviceId = getDeviceId(this._root);

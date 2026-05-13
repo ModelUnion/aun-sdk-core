@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { FileSecretStore } from './file-store.js';
 import type { SecretRecord } from '../types.js';
+import type { ModuleLogger } from '../logger.js';
 
 /** 密钥保护/恢复接口 */
 export interface SecretStore {
@@ -33,7 +34,8 @@ export function createDefaultSecretStore(
   root?: string,
   encryptionSeed?: string,
   sqliteBackup?: { backupSeed(seed: Buffer): void; restoreSeed(): Buffer | null },
+  opts?: { logger?: ModuleLogger },
 ): SecretStore {
   const storeRoot = root ?? join(homedir(), '.aun');
-  return new FileSecretStore(storeRoot, encryptionSeed, sqliteBackup);
+  return new FileSecretStore(storeRoot, encryptionSeed, sqliteBackup, opts);
 }
