@@ -20,6 +20,9 @@ import {
   type JsonObject,
   type Message,
 } from './types.js';
+import type { ModuleLogger } from './logger.js';
+
+const _noopLogger: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 export interface LoadedGroupSecret {
   epoch: number;
@@ -999,13 +1002,14 @@ function assessIncomingEpochChain(
   rotationId: string,
   rotatorAid: string,
   source: string,
+  logger: ModuleLogger = _noopLogger,
 ): { ok: boolean; unverified?: boolean | null; reason?: string | null } {
   const chain = (incomingChain ?? '').trim();
   const rid = rotationId.trim();
   const rotator = rotatorAid.trim();
 
   if (rid && !chain) {
-    console.warn(`[e2ee-group] 拒绝缺少 epoch_chain 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+    logger.warn(`[e2ee-group] 拒绝缺少 epoch_chain 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
     return { ok: false };
   }
 
@@ -1016,7 +1020,7 @@ function assessIncomingEpochChain(
     if (chain && currentChain === chain) return { ok: true };
     if (rid && chain && currentChain && currentChain !== chain) {
       if (!(currentPendingRotationId && currentPendingRotationId !== rid)) {
-        console.warn(`[e2ee-group] 拒绝同 epoch 分叉 chain source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+        logger.warn(`[e2ee-group] 拒绝同 epoch 分叉 chain source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
         return { ok: false };
       }
     }
@@ -1028,17 +1032,17 @@ function assessIncomingEpochChain(
   if (!prevChain) return { ok: true, unverified: true, reason: 'missing_prev_chain' };
   if (!rotator) {
     if (rid) {
-      console.warn(`[e2ee-group] 拒绝缺少 rotator_aid 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      logger.warn(`[e2ee-group] 拒绝缺少 rotator_aid 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
       return { ok: false };
     }
     return { ok: true, unverified: true, reason: 'missing_rotator_aid' };
   }
   if (!verifyEpochChain(chain, prevChain, epoch, commitment, rotator)) {
     if (rid) {
-      console.warn(`[e2ee-group] 拒绝 epoch_chain 验证失败的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      logger.warn(`[e2ee-group] 拒绝 epoch_chain 验证失败的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
       return { ok: false };
     }
-    console.warn(`[e2ee-group] epoch_chain 验证失败，按兼容档接收并标记未验证 source=${source} group=${groupId} epoch=${epoch}`);
+    logger.warn(`[e2ee-group] epoch_chain 验证失败，按兼容档接收并标记未验证 source=${source} group=${groupId} epoch=${epoch}`);
     return { ok: true, unverified: true, reason: 'chain_mismatch_legacy' };
   }
   if (!rid) return { ok: true, unverified: true, reason: 'missing_rotation_id' };
@@ -1214,6 +1218,7 @@ export function handleKeyDistribution(
   keystore: KeyStore,
   aid: string,
   initiatorCertPem?: string | null,
+  logger?: ModuleLogger,
 ): boolean {
   const payload = 'group_id' in message
     ? message
@@ -1262,6 +1267,7 @@ export function handleKeyDistribution(
     rotationId,
     String(payload.distributed_by ?? payload.rotator_aid ?? ''),
     'key_distribution',
+    logger,
   );
   if (!chainAssessment.ok) return false;
 
@@ -1362,6 +1368,7 @@ export function handleKeyResponse(
     responderCertPem?: string | null;
     currentMembers?: string[];
     strict?: boolean;
+    logger?: ModuleLogger;
   },
 ): boolean {
   const payload = 'group_id' in response
@@ -1423,6 +1430,7 @@ export function handleKeyResponse(
     rotationId,
     String(payload.distributed_by ?? payload.rotator_aid ?? payload.responder_aid ?? ''),
     'key_response',
+    opts?.logger,
   );
   if (!chainAssessment.ok) return false;
 
@@ -1446,6 +1454,7 @@ export class GroupE2EEManager {
   private _senderCertResolver: ((aid: string) => string | null) | null;
   private _initiatorCertResolver: ((aid: string) => string | null) | null;
   private _pendingKeyRequests: Map<string, JsonObject> = new Map();
+  private _logger: ModuleLogger;
 
   constructor(opts: {
     identityFn: () => IdentityRecord;
@@ -1454,6 +1463,7 @@ export class GroupE2EEManager {
     responseCooldown?: number;
     senderCertResolver?: (aid: string) => string | null;
     initiatorCertResolver?: (aid: string) => string | null;
+    logger?: ModuleLogger;
   }) {
     this._identityFn = opts.identityFn;
     this._keystore = opts.keystore;
@@ -1462,6 +1472,7 @@ export class GroupE2EEManager {
     this._responseThrottle = new GroupKeyRequestThrottle(opts.responseCooldown ?? 30);
     this._senderCertResolver = opts.senderCertResolver ?? null;
     this._initiatorCertResolver = opts.initiatorCertResolver ?? null;
+    this._logger = opts.logger ?? _noopLogger;
   }
 
   // ── 密钥管理 ──────────────────────────────────────────
@@ -1703,7 +1714,7 @@ export class GroupE2EEManager {
       if (this._initiatorCertResolver && distributedBy) {
         initiatorCert = this._initiatorCertResolver(distributedBy);
       }
-      const ok = handleKeyDistribution(payload, this._keystore, aid, initiatorCert);
+      const ok = handleKeyDistribution(payload, this._keystore, aid, initiatorCert, this._logger);
       return ok ? 'distribution' : 'distribution_rejected';
     }
     if (msgType === 'e2ee.group_key_response') {
@@ -1719,6 +1730,7 @@ export class GroupE2EEManager {
         responderCertPem,
         currentMembers: this.getMemberAids(String(payload.group_id ?? '')),
         strict: true,
+        logger: this._logger,
       });
       if (ok && expected) this._pendingKeyRequests.delete(pendingKey);
       return ok ? 'response' : 'response_rejected';

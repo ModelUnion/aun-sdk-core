@@ -614,6 +614,7 @@ export class AUNClient {
       keystore,
       senderCertResolver: (aid: string) => this._getVerifiedPeerCert(aid),
       initiatorCertResolver: (aid: string) => this._getVerifiedPeerCert(aid),
+      logger: this._logger.for('aun_core.e2ee_group'),
     });
 
     this.auth = new AuthNamespace(this);
