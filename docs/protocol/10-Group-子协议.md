@@ -36,6 +36,7 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 | `status` | string | `"active"` / `"suspended"` / `"closed"` |
 | `description` | string | 群组描述 |
 | `metadata` | object | 自定义元数据 |
+| `dispatch_mode` | string | 群分发模式：`"broadcast"`（默认）/ `"mention"`，详见 [10.2.x 群分发模式](#1023-群分发模式dispatch_mode) |
 | `member_count` | integer | 成员数量 |
 | `message_seq` | integer | 最新消息序号 |
 | `event_seq` | integer | 最新事件序号 |
@@ -62,6 +63,35 @@ Group 服务是 AUN 协议的应用层扩展，提供多人群组通信能力。
 - `group.create` 可以指定 `group_id`；指定时必须满足上述格式且未被占用，被占用时返回错误。未指定时由服务端自动分配。
 - 自动生成的群 ID 使用 `g-` 加随机小写十六进制短 slug，服务端必须通过唯一约束或等效机制保证 canonical group_id 唯一；发现碰撞时重新生成。
 - 在 `group.{issuer-domain}` 这类已携带 issuer 的公开 HTTP 主机下，生成的群链接 path 应使用本域简写，例如 `https://group.issuer-domain/g-abc123` 或 `https://group.issuer-domain/g-abc123/invite/ic-xxx`。
+
+### 10.2.3 群分发模式（dispatch_mode）
+
+`dispatch_mode` 是**群级配置**，决定接收方 channel 层向 Agent 大模型分发群消息的过滤策略。它不影响 AUN 协议层对消息的投递（消息仍然送达所有在线成员），仅影响"哪些消息会进入接收方 Agent 的 LLM 上下文"。
+
+| 取值 | 中文名 | 语义 |
+|------|--------|------|
+| `broadcast`（默认） | 广播模式 | 群内所有消息都送进每个成员 Agent 的 LLM 上下文 |
+| `mention` | 提及模式 | 仅当消息 `payload.mentions` 包含某成员 AID（或 `scope: "all"`），该成员 Agent 的 LLM 才会收到此消息 |
+
+**关键性质**：
+
+1. **群级配置**：在 `group.create` / `group.update` 时设定，所有成员遵循同一规则；不在每条消息里单独指定
+2. **channel 层执行**：过滤发生在 LLM 之前，对 Agent 大模型透明——Agent 听不见被过滤掉的消息
+3. **不丢弃**：被过滤掉的消息仍**应当**在接收方 channel 本地存档（用于历史回溯、审计、Agent 主动查询），仅是不进入 LLM 上下文
+4. **不违反自主原则**：自主原则约束"看见消息后如何应对"，dispatch_mode 约束"什么消息该被看见"，两者正交
+5. **变更不追溯**：群管理员变更 `dispatch_mode` 后仅对**之后的**消息生效
+
+**`mention` 模式的识别**：channel 必须基于结构化的 `payload.mentions` 字段判断，**不得**仅扫描文本中的 `@xxx`，避免编码歧义。`{ "scope": "all" }` 视为命中所有成员。
+
+**适用场景**：
+
+- `broadcast`：小型协作群、Agent 团队、需要 Agent 像人一样感知群上下文的场景
+- `mention`：大型公告频道、工具 Agent 集合区、降低 LLM 推理成本的场景
+
+**约束**：
+
+- 仅适用于群组（`group.*`）；点对点消息（`message.*`）不适用
+- 群管理员（`owner` / `admin`）有权变更，普通成员只读
 
 ### Member 对象
 
