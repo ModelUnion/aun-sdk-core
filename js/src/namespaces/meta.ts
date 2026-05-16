@@ -2,8 +2,12 @@
 // 与 TS SDK MetaNamespace 对齐，使用 WebCrypto + IndexedDB 替代 node:crypto + fs。
 
 import type { AUNClient } from '../client.js';
+import type { ModuleLogger } from '../logger.js';
 import { ValidationError } from '../errors.js';
 import type { JsonObject, JsonValue, RpcParams, RpcResult } from '../types.js';
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+
 import {
   pemToArrayBuffer, base64ToUint8, uint8ToBase64, toBufferSource,
 } from '../crypto.js';
@@ -33,6 +37,9 @@ interface MetaClientBridge {
  * - 无文件系统访问
  */
 export class MetaNamespace {
+  private _log: ModuleLogger = _noopLog;
+  setLogger(log: ModuleLogger): void { this._log = log; }
+
   private _client: AUNClient;
 
   constructor(client: AUNClient) {
@@ -46,15 +53,42 @@ export class MetaNamespace {
   // ── RPC 直通 ──────────────────────────────────────────────
 
   async ping(params?: RpcParams): Promise<RpcResult> {
-    return await this._client.call('meta.ping', params ?? {});
+    const tStart = Date.now();
+    this._log.debug('ping enter');
+    try {
+      const r = await this._client.call('meta.ping', params ?? {});
+      this._log.debug(`ping exit: elapsed=${Date.now() - tStart}ms`);
+      return r;
+    } catch (err) {
+      this._log.debug(`ping exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   async status(params?: RpcParams): Promise<RpcResult> {
-    return await this._client.call('meta.status', params ?? {});
+    const tStart = Date.now();
+    this._log.debug('status enter');
+    try {
+      const r = await this._client.call('meta.status', params ?? {});
+      this._log.debug(`status exit: elapsed=${Date.now() - tStart}ms`);
+      return r;
+    } catch (err) {
+      this._log.debug(`status exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   async trustRoots(params?: RpcParams): Promise<RpcResult> {
-    return await this._client.call('meta.trust_roots', params ?? {});
+    const tStart = Date.now();
+    this._log.debug('trustRoots enter');
+    try {
+      const r = await this._client.call('meta.trust_roots', params ?? {});
+      this._log.debug(`trustRoots exit: elapsed=${Date.now() - tStart}ms`);
+      return r;
+    } catch (err) {
+      this._log.debug(`trustRoots exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   // ── 信任根下载 ────────────────────────────────────────────
@@ -65,32 +99,40 @@ export class MetaNamespace {
     gateway_url?: string;
     timeout?: number;
   }): Promise<JsonObject> {
-    const target = this._resolveTrustRootsUrl(
-      opts?.url,
-      opts?.issuer,
-      opts?.gateway_url,
-    );
-    if (!target.toLowerCase().startsWith('https://') && !target.toLowerCase().startsWith('http://')) {
-      throw new ValidationError('trust roots url must be http(s)');
-    }
-    const timeoutMs = (opts?.timeout ?? 10) * 1000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const tStart = Date.now();
+    this._log.debug(`downloadTrustRoots enter: issuer=${opts?.issuer ?? '-'}`);
     try {
-      const response = await fetch(target, {
-        headers: { Accept: 'application/json' },
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new ValidationError(`trust roots download failed: HTTP ${response.status}`);
+      const target = this._resolveTrustRootsUrl(
+        opts?.url,
+        opts?.issuer,
+        opts?.gateway_url,
+      );
+      if (!target.toLowerCase().startsWith('https://') && !target.toLowerCase().startsWith('http://')) {
+        throw new ValidationError('trust roots url must be http(s)');
       }
-      const payload = await response.json();
-      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-        throw new ValidationError('trust roots endpoint returned non-object JSON');
+      const timeoutMs = (opts?.timeout ?? 10) * 1000;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(target, {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new ValidationError(`trust roots download failed: HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+          throw new ValidationError('trust roots endpoint returned non-object JSON');
+        }
+        this._log.debug(`downloadTrustRoots exit: elapsed=${Date.now() - tStart}ms`);
+        return payload as JsonObject;
+      } finally {
+        clearTimeout(timer);
       }
-      return payload as JsonObject;
-    } finally {
-      clearTimeout(timer);
+    } catch (err) {
+      this._log.debug(`downloadTrustRoots exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -98,27 +140,35 @@ export class MetaNamespace {
     issuer: string,
     opts?: { url?: string; timeout?: number },
   ): Promise<string> {
-    const normalizedIssuer = MetaNamespace._validateIssuer(issuer);
-    const target = opts?.url?.trim() || this._issuerRootCertUrl(normalizedIssuer);
-    if (!target.toLowerCase().startsWith('https://') && !target.toLowerCase().startsWith('http://')) {
-      throw new ValidationError('issuer root certificate url must be http(s)');
-    }
-    const timeoutMs = (opts?.timeout ?? 10) * 1000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const tStart = Date.now();
+    this._log.debug(`downloadIssuerRootCert enter: issuer=${issuer}`);
     try {
-      const response = await fetch(target, {
-        headers: { Accept: 'application/x-pem-file,text/plain' },
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new ValidationError(`issuer root cert download failed: HTTP ${response.status}`);
+      const normalizedIssuer = MetaNamespace._validateIssuer(issuer);
+      const target = opts?.url?.trim() || this._issuerRootCertUrl(normalizedIssuer);
+      if (!target.toLowerCase().startsWith('https://') && !target.toLowerCase().startsWith('http://')) {
+        throw new ValidationError('issuer root certificate url must be http(s)');
       }
-      const certPem = (await response.text()).trim();
-      MetaNamespace._validateCertPem(certPem, normalizedIssuer);
-      return certPem + '\n';
-    } finally {
-      clearTimeout(timer);
+      const timeoutMs = (opts?.timeout ?? 10) * 1000;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(target, {
+          headers: { Accept: 'application/x-pem-file,text/plain' },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new ValidationError(`issuer root cert download failed: HTTP ${response.status}`);
+        }
+        const certPem = (await response.text()).trim();
+        MetaNamespace._validateCertPem(certPem, normalizedIssuer);
+        this._log.debug(`downloadIssuerRootCert exit: elapsed=${Date.now() - tStart}ms issuer=${normalizedIssuer}`);
+        return certPem + '\n';
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      this._log.debug(`downloadIssuerRootCert exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -212,7 +262,7 @@ export class MetaNamespace {
     if (typeof ks.saveTrustRoots === 'function') {
       bundlePath = await ks.saveTrustRoots(trustList, verified.imported);
     } else {
-      console.warn('[MetaNamespace] keystore 没有 saveTrustRoots 方法，跳过持久化');
+      this._log.warn('[MetaNamespace] keystore missing saveTrustRoots method, skip persist');
     }
 
     const auth = this._internal._auth;
@@ -298,7 +348,7 @@ export class MetaNamespace {
     if (typeof ks.saveIssuerRootCert === 'function') {
       [certPath, bundlePath] = await ks.saveIssuerRootCert(normalizedIssuer, rootPem, fingerprint);
     } else {
-      console.warn('[MetaNamespace] keystore 没有 saveIssuerRootCert 方法，跳过持久化');
+      this._log.warn('[MetaNamespace] keystore missing saveIssuerRootCert method, skip persist');
     }
 
     const auth = this._internal._auth;

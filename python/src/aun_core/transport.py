@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import websockets
 
 from .errors import ConnectionError, SerializationError, TimeoutError, map_remote_error
 from .events import EventDispatcher
+
+if TYPE_CHECKING:
+    from .logger import AUNLogger, NullLogger
 
 
 ConnectionFactory = Callable[[str], Awaitable[Any]]
@@ -25,6 +29,53 @@ EVENT_NAME_MAP = {
 }
 
 
+# 提取诊断字段时使用的字段白名单（按 RPC method 前缀匹配）
+# 仅打印元数据/路由字段，绝不打印 payload 明文、token、私钥、密钥材料
+_DIAG_PARAM_FIELDS = (
+    "to", "to_aid", "from", "from_aid", "group_id", "message_id", "mid",
+    "method", "device_id", "slot_id", "epoch", "epoch_id", "rotation_id",
+    "after_seq", "after_event_seq", "seq", "event_seq", "limit", "cursor",
+    "aid", "session_id", "type", "encrypt", "encryption_mode", "suite",
+    "prekey_id", "trust_root_version", "version", "ok", "request_id",
+    "owner_aid", "rotated_by", "action",
+)
+_DIAG_RESULT_FIELDS = _DIAG_PARAM_FIELDS + (
+    "members", "messages", "events", "count", "imported", "skipped",
+    "next_cursor", "current_seq", "committed_epoch",
+)
+
+
+def _summarize_dict(payload: Any, fields: tuple[str, ...]) -> str:
+    """提取 dict 中的关键诊断字段，序列化为简短字符串。
+
+    敏感字段（payload/content/text/cert/private_key/token/secret/ciphertext 等）一律不打印。
+    list/dict 类型只打长度或键名。
+    """
+    if not isinstance(payload, dict):
+        if isinstance(payload, list):
+            return f"[list len={len(payload)}]"
+        return "<empty>" if payload is None else f"<{type(payload).__name__}>"
+    parts = []
+    for key in fields:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, tuple)):
+            parts.append(f"{key}=[len={len(value)}]")
+        elif isinstance(value, dict):
+            parts.append(f"{key}={{keys={len(value)}}}")
+        elif isinstance(value, (int, float, bool)):
+            parts.append(f"{key}={value}")
+        else:
+            s = str(value)
+            if len(s) > 64:
+                s = s[:61] + "..."
+            parts.append(f"{key}={s}")
+    return " ".join(parts) if parts else "<no diag fields>"
+
+
 class RPCTransport:
     def __init__(
         self,
@@ -33,6 +84,7 @@ class RPCTransport:
         connection_factory: ConnectionFactory,
         timeout: float = 10.0,
         on_disconnect: DisconnectCallback | None = None,
+        logger: "AUNLogger | NullLogger | None" = None,
     ) -> None:
         self._dispatcher = event_dispatcher
         self._connection_factory = connection_factory
@@ -43,6 +95,8 @@ class RPCTransport:
         self._pending: dict[str, asyncio.Future] = {}
         self._closed = True
         self._challenge: dict[str, Any] | None = None
+        from .logger import NullLogger as _NL
+        self._log = logger or _NL()
 
     def set_timeout(self, timeout: float) -> None:
         self._timeout = timeout
@@ -52,14 +106,23 @@ class RPCTransport:
         return self._challenge
 
     async def connect(self, url: str) -> dict[str, Any] | None:
-        self._ws = await self._connection_factory(url)
-        self._closed = False
-        challenge = await self._recv_initial_message()
-        self._challenge = challenge
-        self._reader_task = asyncio.create_task(self._reader_loop())
-        return challenge
+        _t_start = time.time()
+        self._log.debug("transport", "connect enter: url=%s", url)
+        try:
+            self._ws = await self._connection_factory(url)
+            self._closed = False
+            challenge = await self._recv_initial_message()
+            self._challenge = challenge
+            self._reader_task = asyncio.create_task(self._reader_loop())
+            self._log.debug("transport", "connect exit: elapsed=%.3fs url=%s has_challenge=%s", time.time() - _t_start, url, challenge is not None)
+            return challenge
+        except Exception as exc:
+            self._log.debug("transport", "connect exit (error): elapsed=%.3fs url=%s err=%s", time.time() - _t_start, url, exc)
+            raise
 
     async def close(self) -> None:
+        _t_start = time.time()
+        self._log.debug("transport", "close enter")
         self._closed = True
         if self._reader_task:
             self._reader_task.cancel()
@@ -71,13 +134,16 @@ class RPCTransport:
         if self._ws is not None:
             await self._ws.close()
             self._ws = None
+        pending_count = len(self._pending)
         for future in list(self._pending.values()):
             if not future.done():
                 future.set_exception(ConnectionError("transport closed"))
         self._pending.clear()
+        self._log.debug("transport", "close exit: elapsed=%.3fs cancelled_pending=%d", time.time() - _t_start, pending_count)
 
     async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> Any:
         if self._closed or self._ws is None:
+            self._log.warn("transport", "RPC call failed (not connected): method=%s", method)
             raise ConnectionError("transport not connected")
 
         rpc_id = f"rpc-{secrets.token_hex(8)}"
@@ -87,6 +153,11 @@ class RPCTransport:
 
         import time as _diag_time
         _t0 = _diag_time.time()
+        self._log.debug(
+            "transport",
+            "RPC send: method=%s rpc_id=%s %s",
+            method, rpc_id, _summarize_dict(params, _DIAG_PARAM_FIELDS),
+        )
         try:
             await self._ws.send(json.dumps({
                 "jsonrpc": "2.0",
@@ -96,6 +167,7 @@ class RPCTransport:
             }))
         except Exception as exc:
             self._pending.pop(rpc_id, None)
+            self._log.warn("transport", "RPC send failed: method=%s rpc_id=%s err=%s", method, rpc_id, exc)
             raise ConnectionError(f"failed to send rpc {method}: {exc}") from exc
 
         _t_sent = _diag_time.time()
@@ -104,17 +176,27 @@ class RPCTransport:
         except asyncio.TimeoutError as exc:
             self._pending.pop(rpc_id, None)
             _elapsed = _diag_time.time() - _t0
-            print(
-                f"  DEBUG-TRANSPORT: RPC timeout method={method} rpc_id={rpc_id} "
-                f"send_took={_t_sent - _t0:.3f}s total={_elapsed:.3f}s "
-                f"pending_count={len(self._pending)} "
-                f"reader_alive={self._reader_task is not None and not self._reader_task.done() if self._reader_task else False}",
-                flush=True,
+            self._log.warn(
+                "transport",
+                "RPC timeout method=%s rpc_id=%s send_took=%.3fs total=%.3fs pending_count=%d reader_alive=%s",
+                method, rpc_id, _t_sent - _t0, _elapsed, len(self._pending),
+                self._reader_task is not None and not self._reader_task.done() if self._reader_task else False,
             )
             raise TimeoutError(f"rpc timeout: {method}", retryable=True) from exc
 
         if "error" in response:
+            self._log.debug(
+                "transport",
+                "RPC error response: method=%s rpc_id=%s elapsed=%.3fs error=%s",
+                method, rpc_id, _diag_time.time() - _t0, response["error"],
+            )
             raise map_remote_error(response["error"])
+        self._log.debug(
+            "transport",
+            "RPC success: method=%s rpc_id=%s elapsed=%.3fs %s",
+            method, rpc_id, _diag_time.time() - _t0,
+            _summarize_dict(response.get("result"), _DIAG_RESULT_FIELDS),
+        )
         return response.get("result")
 
     async def _recv_initial_message(self) -> dict[str, Any] | None:
@@ -131,8 +213,6 @@ class RPCTransport:
         disconnect_error: Exception | None = None
         unexpected_disconnect = False
         import time as _diag_time
-        import logging
-        _diag_log = logging.getLogger("aun_core.transport")
         try:
             while not self._closed and self._ws is not None:
                 raw = await self._ws.recv()
@@ -142,9 +222,10 @@ class RPCTransport:
                 _route_elapsed = _diag_time.time() - _t_recv
                 if _route_elapsed > 1.0:
                     _msg_method = message.get("method", message.get("id", "?"))
-                    print(
-                        f"  DEBUG-TRANSPORT: _route_message slow: {_route_elapsed:.3f}s method/id={_msg_method} pending={len(self._pending)}",
-                        flush=True,
+                    self._log.warn(
+                        "transport",
+                        "_route_message slow: %.3fs method/id=%s pending=%d",
+                        _route_elapsed, _msg_method, len(self._pending),
                     )
         except asyncio.CancelledError:
             raise
@@ -152,6 +233,7 @@ class RPCTransport:
             disconnect_error = exc
             unexpected_disconnect = not self._closed
             if not self._closed:
+                self._log.error("transport", "connection unexpectedly closed: err=%s pending=%d", exc, len(self._pending), err=exc)
                 await self._dispatcher.publish("connection.error", {"error": exc})
         finally:
             self._closed = True
@@ -161,6 +243,7 @@ class RPCTransport:
                     close_code: int | None = None
                     if isinstance(disconnect_error, websockets.ConnectionClosed):
                         close_code = disconnect_error.code
+                    self._log.debug("transport", "triggering on_disconnect callback: close_code=%s", close_code)
                     await self._on_disconnect(disconnect_error, close_code)
 
     async def _route_message(self, message: dict[str, Any]) -> None:
@@ -174,16 +257,25 @@ class RPCTransport:
         method = str(message.get("method", ""))
         if method == "challenge":
             self._challenge = message
+            self._log.debug("transport", "challenge received")
             await self._dispatcher.publish("connection.challenge", message.get("params", {}))
             return
 
         if method.startswith("event/"):
             protocol_event = method.removeprefix("event/")
             sdk_event = EVENT_NAME_MAP.get(protocol_event, protocol_event)
-            # 发布为 _raw.{event}，由 AUNClient 处理后再发布用户可见的事件
-            await self._dispatcher.publish(f"_raw.{sdk_event}", message.get("params", {}))
+            params = message.get("params", {})
+            self._log.debug(
+                "transport",
+                "event recv: event=%s %s",
+                sdk_event, _summarize_dict(params, _DIAG_RESULT_FIELDS),
+            )
+            # 推送事件解耦：事件分发在后台 task 里跑，避免阻塞 reader 读取后续 ws 帧
+            # （否则 handler 内的解密/keystore 查询会卡住 RPC 响应的 future 唤醒，导致 RPC timeout）
+            asyncio.create_task(self._dispatcher.publish(f"_raw.{sdk_event}", params))
             return
 
+        self._log.debug("transport", "notification recv: method=%s", method or "<no-method>")
         await self._dispatcher.publish("notification", message)
 
     @staticmethod

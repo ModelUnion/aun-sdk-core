@@ -2,9 +2,16 @@
 // 所有密码学操作均为异步（SubtleCrypto API 要求）
 
 import { E2EEDecryptFailedError, E2EEError } from './errors.js';
+import type { ModuleLogger } from './logger.js';
 import { uint8ToBase64, base64ToUint8, pemToArrayBuffer, p1363ToDer, toArrayBuffer, toBufferSource } from './crypto.js';
 import type { KeyStore } from './keystore/index.js';
 import type { IdentityRecord, JsonObject, Message, PrekeyRecord } from './types.js';
+
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+// 顶层函数共享的模块 logger（client 构造时通过 setModuleLogger 注入）
+let _moduleLog: ModuleLogger = _noopLog;
+export function setModuleLogger(log: ModuleLogger): void { _moduleLog = log; }
 
 /** 加密套件标识 */
 export const SUITE = 'P256_HKDF_SHA256_AES_256_GCM';
@@ -736,6 +743,9 @@ async function importUncompressedPointEcdh(pointBytes: Uint8Array): Promise<Cryp
  * 所有密码学操作均为异步（SubtleCrypto 要求）。
  */
 export class E2EEManager {
+  private _log: ModuleLogger = _noopLog;
+  setLogger(log: ModuleLogger): void { this._log = log; }
+
   private _identityFn: () => IdentityRecord;
   private _deviceIdFn: () => string;
   private _keystoreRef: KeyStore;
@@ -810,16 +820,25 @@ export class E2EEManager {
       context?: JsonObject | null;
     },
   ): Promise<[JsonObject, EncryptResult]> {
-    const messageId = opts.messageId ?? uuidV4();
-    const timestamp = opts.timestamp ?? Date.now();
-    return this.encryptOutbound(toAid, payload, {
-      peerCertPem: opts.peerCertPem,
-      prekey: opts.prekey ?? null,
-      messageId,
-      timestamp,
-      protectedHeaders: opts.protectedHeaders ?? opts.protected_headers ?? opts.headers,
-      context: opts.context ?? null,
-    });
+    const tStart = Date.now();
+    this._log.debug(`encryptMessage enter: to_aid=${toAid} has_prekey=${!!opts.prekey}`);
+    try {
+      const messageId = opts.messageId ?? uuidV4();
+      const timestamp = opts.timestamp ?? Date.now();
+      const result = await this.encryptOutbound(toAid, payload, {
+        peerCertPem: opts.peerCertPem,
+        prekey: opts.prekey ?? null,
+        messageId,
+        timestamp,
+        protectedHeaders: opts.protectedHeaders ?? opts.protected_headers ?? opts.headers,
+        context: opts.context ?? null,
+      });
+      this._log.debug(`encryptMessage exit: elapsed=${Date.now() - tStart}ms to_aid=${toAid} mode=${result[1].mode}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`encryptMessage exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   // ── 加密 ──────────────────────────────────────────
@@ -844,48 +863,57 @@ export class E2EEManager {
       context?: JsonObject | null;
     },
   ): Promise<[JsonObject, EncryptResult]> {
-    let prekey = opts.prekey ?? null;
+    const tStart = Date.now();
+    this._log.debug(`encryptOutbound enter: peer_aid=${peerAid} mid=${opts.messageId} has_prekey=${!!opts.prekey}`);
+    try {
+      let prekey = opts.prekey ?? null;
 
-    // 传入 prekey → 缓存；传入 null → 查缓存
-    if (prekey !== null) {
-      this.cachePrekey(peerAid, prekey);
-    } else {
-      prekey = this.getCachedPrekey(peerAid);
-    }
-
-    if (prekey) {
-      try {
-        const envelope = await this._encryptWithPrekey(
-          peerAid, payload, prekey, opts.peerCertPem,
-          opts.messageId, opts.timestamp,
-          opts.protectedHeaders ?? opts.protected_headers ?? opts.headers,
-          opts.context ?? null,
-        );
-        return [envelope, {
-          encrypted: true,
-          forward_secrecy: true,
-          mode: MODE_PREKEY_ECDH_V2,
-          degraded: false,
-        }];
-      } catch (exc) {
-        console.warn('prekey 加密失败，降级到 long_term_key（无前向保密）:', exc);
+      // 传入 prekey → 缓存；传入 null → 查缓存
+      if (prekey !== null) {
+        this.cachePrekey(peerAid, prekey);
+      } else {
+        prekey = this.getCachedPrekey(peerAid);
       }
-    }
 
-    const envelope = await this._encryptWithLongTermKey(
-      peerAid, payload, opts.peerCertPem,
-      opts.messageId, opts.timestamp,
-      opts.protectedHeaders ?? opts.protected_headers ?? opts.headers,
-      opts.context ?? null,
-    );
-    const degraded = prekey !== null; // 有 prekey 但失败了才算降级
-    return [envelope, {
-      encrypted: true,
-      forward_secrecy: false,
-      mode: MODE_LONG_TERM_KEY,
-      degraded,
-      degradation_reason: degraded ? 'prekey_encrypt_failed' : 'no_prekey_available',
-    }];
+      if (prekey) {
+        try {
+          const envelope = await this._encryptWithPrekey(
+            peerAid, payload, prekey, opts.peerCertPem,
+            opts.messageId, opts.timestamp,
+            opts.protectedHeaders ?? opts.protected_headers ?? opts.headers,
+            opts.context ?? null,
+          );
+          this._log.debug(`encryptOutbound exit: elapsed=${Date.now() - tStart}ms peer_aid=${peerAid} mode=prekey_ecdh_v2`);
+          return [envelope, {
+            encrypted: true,
+            forward_secrecy: true,
+            mode: MODE_PREKEY_ECDH_V2,
+            degraded: false,
+          }];
+        } catch (exc) {
+          this._log.warn('prekey encrypt failed, degrade to long_term_key (no forward secrecy):', exc);
+        }
+      }
+
+      const envelope = await this._encryptWithLongTermKey(
+        peerAid, payload, opts.peerCertPem,
+        opts.messageId, opts.timestamp,
+        opts.protectedHeaders ?? opts.protected_headers ?? opts.headers,
+        opts.context ?? null,
+      );
+      const degraded = prekey !== null; // 有 prekey 但失败了才算降级
+      this._log.debug(`encryptOutbound exit: elapsed=${Date.now() - tStart}ms peer_aid=${peerAid} mode=long_term_key degraded=${degraded}`);
+      return [envelope, {
+        encrypted: true,
+        forward_secrecy: false,
+        mode: MODE_LONG_TERM_KEY,
+        degraded,
+        degradation_reason: degraded ? 'prekey_encrypt_failed' : 'no_prekey_available',
+      }];
+    } catch (err) {
+      this._log.debug(`encryptOutbound exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /**
@@ -1104,45 +1132,73 @@ export class E2EEManager {
     message: Message,
     opts?: { skipReplay?: boolean },
   ): Promise<Message | null> {
-    const payload = message.payload as JsonObject | undefined;
-    if (!payload || typeof payload !== 'object') return message;
-    if (payload.type !== 'e2ee.encrypted') return message;
-    if (message.encrypted === false) return message;
-    if (!this._shouldDecryptForCurrentAid(message, payload)) return message;
+    const tStart = Date.now();
+    const mid = String(message.message_id ?? '');
+    const fromAid = String(message.from ?? '');
+    this._log.debug(`decryptMessage enter: from=${fromAid} mid=${mid} skip_replay=${!!opts?.skipReplay}`);
+    try {
+      const payload = message.payload as JsonObject | undefined;
+      if (!payload || typeof payload !== 'object') {
+        this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=passthrough_no_payload`);
+        return message;
+      }
+      if (payload.type !== 'e2ee.encrypted') {
+        this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=passthrough_not_encrypted`);
+        return message;
+      }
+      if (message.encrypted === false) {
+        this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=passthrough_flag_false`);
+        return message;
+      }
+      if (!this._shouldDecryptForCurrentAid(message, payload)) {
+        this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=passthrough_not_for_current_aid`);
+        return message;
+      }
 
-    const skipReplay = opts?.skipReplay ?? false;
+      const skipReplay = opts?.skipReplay ?? false;
 
-    if (!skipReplay) {
-      // timestamp 窗口检查
-      const ts = (message.timestamp ?? (payload.aad as JsonObject | undefined)?.timestamp) as number | undefined;
-      if (typeof ts === 'number' && this._replayWindowSeconds > 0) {
-        const nowMs = Date.now();
-        const diffS = Math.abs(nowMs - ts) / 1000;
-        if (diffS > this._replayWindowSeconds) {
-          console.warn(
-            `消息 timestamp 超出窗口 (${Math.round(diffS)}s > ${this._replayWindowSeconds}s)，拒绝: from=${message.from} mid=${message.message_id}`,
-          );
-          return null;
+      if (!skipReplay) {
+        // timestamp 窗口检查
+        const ts = (message.timestamp ?? (payload.aad as JsonObject | undefined)?.timestamp) as number | undefined;
+        if (typeof ts === 'number' && this._replayWindowSeconds > 0) {
+          const nowMs = Date.now();
+          const diffS = Math.abs(nowMs - ts) / 1000;
+          if (diffS > this._replayWindowSeconds) {
+            this._log.warn(
+              `消息 timestamp 超出窗口 (${Math.round(diffS)}s > ${this._replayWindowSeconds}s)，拒绝: from=${message.from} mid=${message.message_id}`,
+            );
+            this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=rejected_timestamp_window`);
+            return null;
+          }
         }
+
+        // 本地防重放：先检查，解密成功后再记录。
+        const messageIdVal = message.message_id as string | undefined;
+        const fromAidLocal = message.from as string | undefined;
+        let seenKey = '';
+        if (messageIdVal && fromAidLocal) {
+          seenKey = `${fromAidLocal}:${messageIdVal}`;
+          if (this._seenMessages.has(seenKey)) {
+            this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=rejected_replay`);
+            return null;
+          }
+        }
+        const result = await this._decryptMessageInternal(message);
+        if (result !== null && seenKey) {
+          this._seenMessages.set(seenKey, true);
+          this._trimSeenSet();
+        }
+        this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=${result !== null ? 'ok' : 'failed'}`);
+        return result;
       }
 
-      // 本地防重放：先检查，解密成功后再记录。
-      const messageIdVal = message.message_id as string | undefined;
-      const fromAid = message.from as string | undefined;
-      let seenKey = '';
-      if (messageIdVal && fromAid) {
-        seenKey = `${fromAid}:${messageIdVal}`;
-        if (this._seenMessages.has(seenKey)) return null;
-      }
       const result = await this._decryptMessageInternal(message);
-      if (result !== null && seenKey) {
-        this._seenMessages.set(seenKey, true);
-        this._trimSeenSet();
-      }
+      this._log.debug(`decryptMessage exit: elapsed=${Date.now() - tStart}ms result=${result !== null ? 'ok' : 'failed'} skip_replay=true`);
       return result;
+    } catch (err) {
+      this._log.debug(`decryptMessage exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-
-    return this._decryptMessageInternal(message);
   }
 
   /** 判断是否应该为当前 AID 解密（避免发送端回显消息误走解密） */
@@ -1174,7 +1230,7 @@ export class E2EEManager {
     try {
       await this._verifySenderSignature(payload, message);
     } catch (exc) {
-      console.warn('发送方签名验证失败:', exc);
+      this._log.warn('sendersignature verifyfailed:', exc);
       return null;
     }
 
@@ -1184,7 +1240,7 @@ export class E2EEManager {
     } else if (encryptionMode === MODE_LONG_TERM_KEY) {
       return this._decryptMessageLongTerm(message);
     } else {
-      console.warn('不支持的加密模式:', encryptionMode);
+      this._log.warn('unsupported encryption mode:', encryptionMode);
       return null;
     }
   }
@@ -1317,9 +1373,9 @@ export class E2EEManager {
       };
     } catch (exc) {
       if (exc instanceof E2EEError) {
-        console.warn('prekey_ecdh_v2 解密失败 (E2EE):', exc);
+        this._log.warn('prekey_ecdh_v2 decryptfailed (E2EE):', exc);
       } else {
-        console.warn('prekey_ecdh_v2 解密失败:', exc);
+        this._log.warn('prekey_ecdh_v2 decryptfailed:', exc);
       }
       return null;
     }
@@ -1398,9 +1454,9 @@ export class E2EEManager {
       };
     } catch (exc) {
       if (exc instanceof E2EEError) {
-        console.warn('long_term_key 解密失败 (E2EE):', exc);
+        this._log.warn('long_term_key decryptfailed (E2EE):', exc);
       } else {
-        console.warn('long_term_key 解密失败:', exc);
+        this._log.warn('long_term_key decryptfailed:', exc);
       }
       return null;
     }
@@ -1436,58 +1492,66 @@ export class E2EEManager {
    * 返回 { prekey_id, public_key, signature, created_at }，可直接用于 RPC 上传。
    */
   async generatePrekey(): Promise<PrekeyMaterial> {
-    const aid = this._currentAid();
-    if (!aid) throw new E2EEError('AID unavailable for prekey generation');
-    const deviceId = this._currentDeviceId();
+    const tStart = Date.now();
+    this._log.debug('generatePrekey enter');
+    try {
+      const aid = this._currentAid();
+      if (!aid) throw new E2EEError('AID unavailable for prekey generation');
+      const deviceId = this._currentDeviceId();
 
-    // 生成新 ECDH 密钥对（标记为 ECDH 用途）
-    const keyPair = await crypto.subtle.generateKey(
-      { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits'],
-    );
+      // 生成新 ECDH 密钥对（标记为 ECDH 用途）
+      const keyPair = await crypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits'],
+      );
 
-    // 导出 SPKI 公钥（DER 格式）
-    const spki = await crypto.subtle.exportKey('spki', keyPair.publicKey);
-    const publicKeyB64 = uint8ToBase64(new Uint8Array(spki));
+      // 导出 SPKI 公钥（DER 格式）
+      const spki = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+      const publicKeyB64 = uint8ToBase64(new Uint8Array(spki));
 
-    // 导出 PKCS8 私钥（PEM 格式存储）
-    const pkcs8 = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
-    const privateKeyPem = arrayBufferToPemLocal(pkcs8, 'PRIVATE KEY');
+      // 导出 PKCS8 私钥（PEM 格式存储）
+      const pkcs8 = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+      const privateKeyPem = arrayBufferToPemLocal(pkcs8, 'PRIVATE KEY');
 
-    const prekeyId = uuidV4();
-    const nowMs = Date.now();
+      const prekeyId = uuidV4();
+      const nowMs = Date.now();
 
-    // 签名：prekey_id|public_key|created_at（绑定时间戳，防止旧 prekey 重放）
-    const signData = _encoder.encode(`${prekeyId}|${publicKeyB64}|${nowMs}`);
-    const senderSignKey = await this._loadSenderIdentityPrivateEcdsa();
-    const sig = await ecdsaSignDer(senderSignKey, signData);
-    const signatureB64 = uint8ToBase64(sig);
+      // 签名：prekey_id|public_key|created_at（绑定时间戳，防止旧 prekey 重放）
+      const signData = _encoder.encode(`${prekeyId}|${publicKeyB64}|${nowMs}`);
+      const senderSignKey = await this._loadSenderIdentityPrivateEcdsa();
+      const sig = await ecdsaSignDer(senderSignKey, signData);
+      const signatureB64 = uint8ToBase64(sig);
 
-    await saveKeyStorePrekey(this._keystoreRef, aid, deviceId, prekeyId, {
-      private_key_pem: privateKeyPem,
-      created_at: nowMs,
-      updated_at: nowMs,
-    });
+      await saveKeyStorePrekey(this._keystoreRef, aid, deviceId, prekeyId, {
+        private_key_pem: privateKeyPem,
+        created_at: nowMs,
+        updated_at: nowMs,
+      });
 
-    // 内存缓存私钥 PEM
-    this._localPrekeyCache.set(prekeyId, privateKeyPem);
+      // 内存缓存私钥 PEM
+      this._localPrekeyCache.set(prekeyId, privateKeyPem);
 
-    // 清理过期的旧 prekey
-    await this._cleanupExpiredPrekeys(aid, deviceId);
+      // 清理过期的旧 prekey
+      await this._cleanupExpiredPrekeys(aid, deviceId);
 
-    const result: PrekeyMaterial = {
-      prekey_id: prekeyId,
-      public_key: publicKeyB64,
-      signature: signatureB64,
-      created_at: nowMs,
-    };
-    const certFingerprint = await this._localCertSha256Fingerprint();
-    if (certFingerprint) {
-      result.cert_fingerprint = certFingerprint;
+      const result: PrekeyMaterial = {
+        prekey_id: prekeyId,
+        public_key: publicKeyB64,
+        signature: signatureB64,
+        created_at: nowMs,
+      };
+      const certFingerprint = await this._localCertSha256Fingerprint();
+      if (certFingerprint) {
+        result.cert_fingerprint = certFingerprint;
+      }
+      if (deviceId) {
+        result.device_id = deviceId;
+      }
+      this._log.debug(`generatePrekey exit: elapsed=${Date.now() - tStart}ms aid=${aid} prekey_id=${prekeyId}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`generatePrekey exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    if (deviceId) {
-      result.device_id = deviceId;
-    }
-    return result;
   }
 
   /** 清理过期的本地 prekey 私钥 */
@@ -1510,6 +1574,27 @@ export class E2EEManager {
 
     const aid = this._currentAid();
     if (!aid) return null;
+
+    // 优先按 prekey_id 单点查询（IndexedDB 主键直查 O(log N)）。
+    // 旧路径需要全量加载 prekey 池（prekey 数量大时是性能瓶颈），单查能直接命中信封里的目标 prekey。
+    const byIdLoader = (this._keystoreRef as { loadE2EEPrekeyById?: (aid: string, prekeyId: string) => Promise<Record<string, unknown> | null> }).loadE2EEPrekeyById;
+    if (typeof byIdLoader === 'function') {
+      try {
+        const byIdData = await byIdLoader.call(this._keystoreRef, aid, prekeyId);
+        if (byIdData) {
+          const pem = (byIdData as { private_key_pem?: unknown }).private_key_pem;
+          if (typeof pem === 'string' && pem) {
+            this._log.debug(`prekey ${prekeyId} by_id lookup hit`);
+            this._localPrekeyCache.set(prekeyId, pem);
+            return pem;
+          }
+        }
+      } catch (err) {
+        this._log.warn(`prekey ${prekeyId} by_id loader failed, falling back to full load: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // 回退：旧版 keystore 没有 by_id 方法，或单查未命中 → 全量扫描（保持向后兼容）。
     const prekeys = await loadKeyStorePrekeys(this._keystoreRef, aid, this._currentDeviceId());
     const prekeyData = prekeys[prekeyId];
     if (!prekeyData) return null;

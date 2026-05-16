@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelunion/aun-sdk-core/go/secretstore"
 )
@@ -169,7 +169,16 @@ func (f *FileKeyStore) Close() {
 
 // ── KeyPair ──────────────────────────────────────────────────
 
-func (f *FileKeyStore) LoadKeyPair(aid string) (map[string]any, error) {
+func (f *FileKeyStore) LoadKeyPair(aid string) (out map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("LoadKeyPair enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("LoadKeyPair exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("LoadKeyPair exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -182,13 +191,22 @@ func (f *FileKeyStore) LoadKeyPair(aid string) (map[string]any, error) {
 		return nil, err
 	}
 	var kp map[string]any
-	if err := json.Unmarshal(data, &kp); err != nil {
+	if err = json.Unmarshal(data, &kp); err != nil {
 		return nil, err
 	}
 	return f.restoreKeyPair(aid, kp), nil
 }
 
-func (f *FileKeyStore) SaveKeyPair(aid string, keyPair map[string]any) error {
+func (f *FileKeyStore) SaveKeyPair(aid string, keyPair map[string]any) (err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("SaveKeyPair enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("SaveKeyPair exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("SaveKeyPair exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -235,7 +253,16 @@ func (f *FileKeyStore) restoreKeyPair(aid string, kp map[string]any) map[string]
 
 // ── Cert ─────────────────────────────────────────────────────
 
-func (f *FileKeyStore) LoadCert(aid string) (string, error) {
+func (f *FileKeyStore) LoadCert(aid string) (cert string, err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("LoadCert enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("LoadCert exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("LoadCert exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -249,7 +276,16 @@ func (f *FileKeyStore) LoadCert(aid string) (string, error) {
 	return string(data), nil
 }
 
-func (f *FileKeyStore) SaveCert(aid, certPEM string) error {
+func (f *FileKeyStore) SaveCert(aid, certPEM string) (err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("SaveCert enter: aid=%s len=%d", aid, len(certPEM))
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("SaveCert exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("SaveCert exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -320,7 +356,16 @@ var identitySkipFields = map[string]bool{
 
 // ── Identity ─────────────────────────────────────────────────
 
-func (f *FileKeyStore) LoadIdentity(aid string) (map[string]any, error) {
+func (f *FileKeyStore) LoadIdentity(aid string) (out map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("LoadIdentity enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("LoadIdentity exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("LoadIdentity exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -363,7 +408,7 @@ func (f *FileKeyStore) LoadIdentity(aid string) (map[string]any, error) {
 		localPubB64, _ := kp["public_key_der_b64"].(string)
 		if localPubB64 != "" {
 			if matched := verifyCertKeyMatch(cert, localPubB64); !matched {
-				log.Printf("[keystore] 身份 %s 的 key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert", aid)
+				pkgLogKeystore().Error("identity %s key.json public key mismatches cert.pem public key, discard cert", aid)
 				cert = ""
 			}
 		}
@@ -395,7 +440,16 @@ func verifyCertKeyMatch(certPEM, localPubB64 string) bool {
 	return string(certPubDer) == string(localPubDer)
 }
 
-func (f *FileKeyStore) SaveIdentity(aid string, identity map[string]any) error {
+func (f *FileKeyStore) SaveIdentity(aid string, identity map[string]any) (err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("SaveIdentity enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("SaveIdentity exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("SaveIdentity exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	l := f.getLock(aid)
 	l.Lock()
 	defer l.Unlock()
@@ -478,6 +532,21 @@ func (f *FileKeyStore) LoadE2EEPrekeys(aid, deviceID string) (map[string]map[str
 		return nil, err
 	}
 	return db.LoadPrekeys(strings.TrimSpace(deviceID)), nil
+}
+
+// LoadE2EEPrekeyByID 按 prekey_id 单点查询（O(1) 数据库行级查询）。
+// 与 Python SDK keystore.file.FileKeyStore.load_e2ee_prekey_by_id 对应，
+// 用于解密入站消息时优先快速命中，避免 LoadE2EEPrekeys 的全量扫描。
+// 未命中返回 nil。
+func (f *FileKeyStore) LoadE2EEPrekeyByID(aid, prekeyID string) (map[string]any, error) {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return nil, err
+	}
+	return db.LoadPrekeyByID(strings.TrimSpace(prekeyID)), nil
 }
 
 func (f *FileKeyStore) SaveE2EEPrekey(aid, prekeyID, deviceID string, prekeyData map[string]any) error {
@@ -694,7 +763,16 @@ func (f *FileKeyStore) UpdateInstanceState(aid, deviceID, slotID string, updater
 // ── LoadAnyIdentity ──────────────────────────────────────────
 
 // ListIdentities 列出所有具有有效私钥的 AID（排序返回）。
-func (f *FileKeyStore) ListIdentities() ([]string, error) {
+func (f *FileKeyStore) ListIdentities() (aids []string, err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("ListIdentities enter")
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("ListIdentities exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("ListIdentities exit: count=%d elapsed=%dms", len(aids), time.Since(tStart).Milliseconds())
+		}
+	}()
 	entries, err := os.ReadDir(f.aidsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -702,7 +780,7 @@ func (f *FileKeyStore) ListIdentities() ([]string, error) {
 		}
 		return nil, err
 	}
-	var aids []string
+	var idents []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -715,9 +793,9 @@ func (f *FileKeyStore) ListIdentities() ([]string, error) {
 		if pk, _ := identity["private_key_pem"].(string); pk == "" {
 			continue
 		}
-		aids = append(aids, aid)
+		idents = append(idents, aid)
 	}
-	return aids, nil
+	return idents, nil
 }
 
 func (f *FileKeyStore) LoadAnyIdentity() (map[string]any, error) {
@@ -739,6 +817,50 @@ func (f *FileKeyStore) LoadAnyIdentity() (map[string]any, error) {
 		return identity, nil
 	}
 	return nil, nil
+}
+
+// ── Metadata 公共接口（MetadataKeyStore 实现）─────────────────
+
+// GetMetadataValue 读取指定 AID 的 metadata KV 值。
+// 与 Python keystore._get_db(aid).get_metadata(key) 对应，主要用于缓存
+// gateway_url 等非身份核心字段，避免跨进程重复发现。
+func (f *FileKeyStore) GetMetadataValue(aid, key string) string {
+	if aid == "" || key == "" {
+		return ""
+	}
+	db, err := f.getDB(aid)
+	if err != nil {
+		return ""
+	}
+	raw := db.GetMetadata(key)
+	if raw == "" {
+		return ""
+	}
+	// SaveIdentity 写入时会 json.Marshal，纯字符串值会带双引号；这里反向解开，
+	// 兼容直接 SetMetadataValue 的情况（裸字符串）。
+	var s string
+	if err := json.Unmarshal([]byte(raw), &s); err == nil {
+		return s
+	}
+	return raw
+}
+
+// SetMetadataValue 写入指定 AID 的 metadata KV 值。
+// 字符串以 JSON 编码后写入，与 SaveIdentity 的存储格式保持一致。
+func (f *FileKeyStore) SetMetadataValue(aid, key, value string) error {
+	if aid == "" || key == "" {
+		return fmt.Errorf("SetMetadataValue requires non-empty aid and key")
+	}
+	db, err := f.getDB(aid)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	db.SetMetadata(key, string(encoded))
+	return nil
 }
 
 // ── 工具函数 ─────────────────────────────────────────────────
@@ -853,6 +975,18 @@ func (f *FileKeyStore) LoadAllSeqs(aid, deviceID, slotID string) (map[string]int
 		return nil, err
 	}
 	return db.LoadAllSeqs(deviceID, slotID), nil
+}
+
+// DeleteSeq 删除单个 namespace 的 contiguous_seq 行。
+func (f *FileKeyStore) DeleteSeq(aid, deviceID, slotID, namespace string) error {
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(aid)
+	if err != nil {
+		return err
+	}
+	return db.DeleteSeq(deviceID, slotID, namespace)
 }
 
 // ── TrustRootStore 实现 ─────────────────────────────────

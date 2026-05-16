@@ -7,8 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +24,63 @@ var eventNameMap = map[string]string{
 	"group.changed":         "group.changed",
 	"group.message_created": "group.message_created", // ISSUE-SDK-GO-001: 补充群消息事件映射
 	"storage.object_changed": "storage.object_changed",
+}
+
+// 提取诊断字段时使用的字段白名单（按 RPC method 前缀匹配）
+// 仅打印元数据/路由字段，绝不打印 payload 明文、token、私钥、密钥材料
+var diagParamFields = []string{
+	"to", "to_aid", "from", "from_aid", "group_id", "message_id", "mid",
+	"method", "device_id", "slot_id", "epoch", "epoch_id", "rotation_id",
+	"after_seq", "after_event_seq", "seq", "event_seq", "limit", "cursor",
+	"aid", "session_id", "type", "encrypt", "encryption_mode", "suite",
+	"prekey_id", "trust_root_version", "version", "ok", "request_id",
+	"owner_aid", "rotated_by", "action",
+}
+
+var diagResultFields = append(append([]string{}, diagParamFields...),
+	"members", "messages", "events", "count", "imported", "skipped",
+	"next_cursor", "current_seq", "committed_epoch",
+)
+
+// summarizeDict 提取 map 中的关键诊断字段，序列化为简短字符串。
+// 敏感字段（payload/content/text/cert/private_key/token/secret/ciphertext 等）一律不打印。
+// list/map 类型只打长度或键名。
+func summarizeDict(payload any, fields []string) string {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		if arr, ok := payload.([]any); ok {
+			return fmt.Sprintf("[list len=%d]", len(arr))
+		}
+		if payload == nil {
+			return "<empty>"
+		}
+		return fmt.Sprintf("<%T>", payload)
+	}
+	var parts []string
+	for _, key := range fields {
+		v, exists := m[key]
+		if !exists || v == nil || v == "" {
+			continue
+		}
+		switch vv := v.(type) {
+		case []any:
+			parts = append(parts, fmt.Sprintf("%s=[len=%d]", key, len(vv)))
+		case map[string]any:
+			parts = append(parts, fmt.Sprintf("%s={keys=%d}", key, len(vv)))
+		case bool, int, int64, float64, uint, uint64:
+			parts = append(parts, fmt.Sprintf("%s=%v", key, vv))
+		default:
+			s := fmt.Sprintf("%v", vv)
+			if len(s) > 64 {
+				s = s[:61] + "..."
+			}
+			parts = append(parts, fmt.Sprintf("%s=%s", key, s))
+		}
+	}
+	if len(parts) == 0 {
+		return "<no diag fields>"
+	}
+	return strings.Join(parts, " ")
 }
 
 // RPCTransport WebSocket JSON-RPC 2.0 传输层
@@ -85,7 +142,16 @@ func (t *RPCTransport) setChallenge(c map[string]any) {
 }
 
 // Connect 连接到 WebSocket 服务端，返回 challenge 消息
-func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any, error) {
+func (t *RPCTransport) Connect(ctx context.Context, url string) (challenge map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogTransport().Debug("Connect enter: url=%s", url)
+	defer func() {
+		if err != nil {
+			pkgLogTransport().Debug("Connect exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogTransport().Debug("Connect exit: elapsed=%dms", time.Since(tStart).Milliseconds())
+		}
+	}()
 	opts := &websocket.DialOptions{}
 	if !t.verifySSL {
 		opts.HTTPClient = &http.Client{
@@ -94,10 +160,16 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 			},
 		}
 	}
-	conn, _, err := websocket.Dial(ctx, url, opts)
-	if err != nil {
-		return nil, NewConnectionError(fmt.Sprintf("连接 WebSocket 失败: %v", err))
+	conn, dialErr := func() (*websocket.Conn, error) {
+		c, _, e := websocket.Dial(ctx, url, opts)
+		return c, e
+	}()
+	if dialErr != nil {
+		err = NewConnectionError(fmt.Sprintf("WebSocket connection failed: %v", dialErr))
+		pkgLogTransport().Error("WebSocket connection failed: url=%s err=%v", url, dialErr)
+		return nil, err
 	}
+	pkgLogTransport().Debug("WebSocket connection established: url=%s", url)
 
 	t.closedMu.Lock()
 	t.ws = conn
@@ -105,8 +177,9 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 	t.closedMu.Unlock()
 
 	// 接收初始消息（challenge）
-	challenge, err := t.recvInitialMessage(ctx)
-	if err != nil {
+	challenge, recvErr := t.recvInitialMessage(ctx)
+	if recvErr != nil {
+		pkgLogTransport().Error("failed to receive challenge: url=%s err=%v", url, recvErr)
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 		t.closedMu.Lock()
 		if t.ws == conn {
@@ -114,9 +187,11 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 		}
 		t.closed = true
 		t.closedMu.Unlock()
+		err = recvErr
 		return nil, err
 	}
 	t.setChallenge(challenge)
+	pkgLogTransport().Debug("challenge received, starting reader loop: url=%s", url)
 
 	// 启动读取循环 — cancelReader/readerDone 在 closedMu 保护下写入，与 Close() 的读取保持一致
 	readerCtx, cancel := context.WithCancel(context.Background())
@@ -131,7 +206,16 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (map[string]any,
 }
 
 // Close 关闭传输层
-func (t *RPCTransport) Close() error {
+func (t *RPCTransport) Close() (err error) {
+	tStart := time.Now()
+	pkgLogTransport().Debug("Close enter")
+	defer func() {
+		if err != nil {
+			pkgLogTransport().Debug("Close exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogTransport().Debug("Close exit: elapsed=%dms", time.Since(tStart).Milliseconds())
+		}
+	}()
 	t.closedMu.Lock()
 	t.closed = true
 	ws := t.ws
@@ -156,22 +240,34 @@ func (t *RPCTransport) Close() error {
 
 	// 通知所有等待中的 RPC 调用
 	t.pendingMu.Lock()
+	pendingCount := len(t.pending)
 	for id, ch := range t.pending {
 		close(ch)
 		delete(t.pending, id)
 	}
 	t.pendingMu.Unlock()
+	pkgLogTransport().Debug("Close cancelled pending RPC calls: count=%d", pendingCount)
 
 	return nil
 }
 
 // Call 发起 JSON-RPC 调用
-func (t *RPCTransport) Call(ctx context.Context, method string, params map[string]any) (any, error) {
+func (t *RPCTransport) Call(ctx context.Context, method string, params map[string]any) (result any, err error) {
+	tStart := time.Now()
+	pkgLogTransport().Debug("Call enter: method=%s", method)
+	defer func() {
+		if err != nil {
+			pkgLogTransport().Debug("Call exit (error): method=%s elapsed=%dms err=%v", method, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogTransport().Debug("Call exit: method=%s elapsed=%dms", method, time.Since(tStart).Milliseconds())
+		}
+	}()
 	t.closedMu.RLock()
 	ws := t.ws
 	if t.closed || ws == nil {
 		t.closedMu.RUnlock()
-		return nil, NewConnectionError("传输层未连接")
+		pkgLogTransport().Error("RPC call failed, transport not connected: method=%s", method)
+		return nil, NewConnectionError("transport not connected")
 	}
 	t.closedMu.RUnlock()
 
@@ -199,8 +295,11 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 		t.pendingMu.Lock()
 		delete(t.pending, rpcID)
 		t.pendingMu.Unlock()
-		return nil, NewSerializationError(fmt.Sprintf("序列化 RPC 请求失败: %v", err))
+		pkgLogTransport().Error("failed to serialize RPC request: method=%s err=%v", method, err)
+		return nil, NewSerializationError(fmt.Sprintf("failed to serialize RPC request: %v", err))
 	}
+
+	pkgLogTransport().Debug("sending RPC request: method=%s id=%s %s", method, rpcID, summarizeDict(params, diagParamFields))
 
 	// 发送请求：write 超时跟随整体 timeout（不超过 30s 作为兜底上限），
 	// 避免慢网络下 5s 硬编码导致 RPC 还没等响应就先 fail。
@@ -215,7 +314,8 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 		t.pendingMu.Lock()
 		delete(t.pending, rpcID)
 		t.pendingMu.Unlock()
-		return nil, NewConnectionError(fmt.Sprintf("发送 RPC %s 失败: %v", method, err))
+		pkgLogTransport().Error("failed to send RPC request: method=%s id=%s err=%v", method, rpcID, err)
+		return nil, NewConnectionError(fmt.Sprintf("failed to send RPC %s: %v", method, err))
 	}
 
 	// 等待响应（带超时）
@@ -225,27 +325,32 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 	select {
 	case response, ok := <-resultCh:
 		if !ok {
-			return nil, NewConnectionError("传输层已关闭")
+			pkgLogTransport().Error("RPC response channel closed (transport disconnected): method=%s id=%s", method, rpcID)
+			return nil, NewConnectionError("transport closed")
 		}
 		// 检查错误
 		if errData, ok := response["error"]; ok {
 			if errMap, ok := errData.(map[string]any); ok {
+				pkgLogTransport().Warn("RPC response error: method=%s id=%s elapsed=%dms error=%v", method, rpcID, time.Since(tStart).Milliseconds(), errMap)
 				return nil, MapRemoteError(errMap)
 			}
 		}
+		pkgLogTransport().Debug("RPC response ok: method=%s id=%s elapsed=%dms %s", method, rpcID, time.Since(tStart).Milliseconds(), summarizeDict(response["result"], diagResultFields))
 		return response["result"], nil
 
 	case <-timer.C:
 		t.pendingMu.Lock()
 		delete(t.pending, rpcID)
 		t.pendingMu.Unlock()
-		return nil, NewTimeoutError(fmt.Sprintf("RPC 超时: %s", method))
+		pkgLogTransport().Error("RPC timeout: method=%s id=%s elapsed=%dms timeout=%v", method, rpcID, time.Since(tStart).Milliseconds(), currentTimeout)
+		return nil, NewTimeoutError(fmt.Sprintf("RPC timeout: %s", method))
 
 	case <-ctx.Done():
 		t.pendingMu.Lock()
 		delete(t.pending, rpcID)
 		t.pendingMu.Unlock()
-		return nil, NewTimeoutError(fmt.Sprintf("RPC 上下文取消: %s", method))
+		pkgLogTransport().Warn("RPC context cancelled: method=%s id=%s elapsed=%dms", method, rpcID, time.Since(tStart).Milliseconds())
+		return nil, NewTimeoutError(fmt.Sprintf("RPC context cancelled: %s", method))
 	}
 }
 
@@ -260,13 +365,13 @@ func (t *RPCTransport) recvInitialMessage(ctx context.Context) (map[string]any, 
 	ws := t.ws
 	t.closedMu.RUnlock()
 	if ws == nil {
-		return nil, NewConnectionError("接收初始消息失败: 连接已关闭")
+		return nil, NewConnectionError("failed to receive initial message: connection closed")
 	}
 
 	for {
 		_, data, err := ws.Read(readCtx)
 		if err != nil {
-			return nil, NewConnectionError(fmt.Sprintf("等待 challenge 超时或连接失败: %v", err))
+			return nil, NewConnectionError(fmt.Sprintf("waiting for challenge timed out or connection failed: %v", err))
 		}
 
 		message, err := decodeMessage(data)
@@ -296,6 +401,7 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 		t.closedMu.Unlock()
 
 		if unexpectedDisconnect && !wasClosed && t.onDisconnect != nil {
+			pkgLogTransport().Warn("unexpected disconnect: err=%v", disconnectErr)
 			// 从 nhooyr.io/websocket 错误中提取 close code（-1 表示无 close frame）
 			closeCode := int(websocket.CloseStatus(disconnectErr))
 			t.onDisconnect(disconnectErr, closeCode)
@@ -338,7 +444,7 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 
 		message, err := decodeMessage(data)
 		if err != nil {
-			log.Printf("解码消息失败: %v", err)
+			pkgLogTransport().Warn("failed to decode message: %v", err)
 			continue
 		}
 		t.routeMessage(message)
@@ -347,6 +453,8 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 
 // routeMessage 路由消息到对应的处理器
 func (t *RPCTransport) routeMessage(message map[string]any) {
+	pkgLogTransport().Debug("routeMessage entry")
+	defer pkgLogTransport().Debug("routeMessage exit")
 	// 有 id 的是 RPC 响应
 	if id, ok := message["id"]; ok {
 		rpcID := fmt.Sprintf("%v", id)
@@ -359,6 +467,8 @@ func (t *RPCTransport) routeMessage(message map[string]any) {
 
 		if exists {
 			ch <- message
+		} else {
+			pkgLogTransport().Warn("orphan RPC response: no pending call matches id=%s", rpcID)
 		}
 		return
 	}
@@ -368,6 +478,7 @@ func (t *RPCTransport) routeMessage(message map[string]any) {
 	if method == "challenge" {
 		t.setChallenge(message)
 		params, _ := message["params"].(map[string]any)
+		pkgLogTransport().Debug("challenge received")
 		t.dispatcher.Publish("connection.challenge", params)
 		return
 	}
@@ -380,19 +491,28 @@ func (t *RPCTransport) routeMessage(message map[string]any) {
 			sdkEvent = mapped
 		}
 		params, _ := message["params"].(map[string]any)
+		pkgLogTransport().Debug("event recv: event=%s %s", sdkEvent, summarizeDict(params, diagResultFields))
 		go t.dispatcher.Publish("_raw."+sdkEvent, params)
 		return
 	}
 
 	// 其他通知
+	pkgLogTransport().Debug("notification recv: method=%s", methodOrPlaceholder(method))
 	go t.dispatcher.Publish("notification", message)
+}
+
+func methodOrPlaceholder(s string) string {
+	if s == "" {
+		return "<no-method>"
+	}
+	return s
 }
 
 // decodeMessage 解码 WebSocket 消息为 map
 func decodeMessage(data []byte) (map[string]any, error) {
 	var message map[string]any
 	if err := json.Unmarshal(data, &message); err != nil {
-		return nil, NewSerializationError("无效的 JSON 载荷")
+		return nil, NewSerializationError("invalid JSON payload")
 	}
 	return message, nil
 }

@@ -26,16 +26,41 @@ _MAX_CLOCK_SKEW = 300
 class MetaNamespace:
     def __init__(self, client) -> None:
         self._client = client
+        self._log = client._log
 
     async def ping(self, params: dict[str, Any] | None = None) -> Any:
-        return await self._client.call("meta.ping", params or {})
+        _t_start = time.time()
+        self._log.debug("namespace.meta", "ping enter")
+        try:
+            result = await self._client.call("meta.ping", params or {})
+            self._log.debug("namespace.meta", "ping exit: elapsed=%.3fs", time.time() - _t_start)
+            return result
+        except Exception as exc:
+            self._log.debug("namespace.meta", "ping exit (error): elapsed=%.3fs err=%s", time.time() - _t_start, exc)
+            raise
 
     async def status(self, params: dict[str, Any] | None = None) -> Any:
-        return await self._client.call("meta.status", params or {})
+        _t_start = time.time()
+        self._log.debug("namespace.meta", "status enter")
+        try:
+            result = await self._client.call("meta.status", params or {})
+            self._log.debug("namespace.meta", "status exit: elapsed=%.3fs", time.time() - _t_start)
+            return result
+        except Exception as exc:
+            self._log.debug("namespace.meta", "status exit (error): elapsed=%.3fs err=%s", time.time() - _t_start, exc)
+            raise
 
     async def trust_roots(self, params: dict[str, Any] | None = None) -> Any:
         """通过已连接的 Gateway RPC 查询信任根列表。"""
-        return await self._client.call("meta.trust_roots", params or {})
+        _t_start = time.time()
+        self._log.debug("namespace.meta", "trust_roots enter")
+        try:
+            result = await self._client.call("meta.trust_roots", params or {})
+            self._log.debug("namespace.meta", "trust_roots exit: elapsed=%.3fs", time.time() - _t_start)
+            return result
+        except Exception as exc:
+            self._log.debug("namespace.meta", "trust_roots exit (error): elapsed=%.3fs err=%s", time.time() - _t_start, exc)
+            raise
 
     async def download_trust_roots(
         self,
@@ -46,18 +71,25 @@ class MetaNamespace:
         timeout: float = 10.0,
     ) -> dict[str, Any]:
         """从管理局权威端点或 Gateway 镜像端点下载 trust-roots.json。"""
+        _t_start = time.time()
         target = self._resolve_trust_roots_url(url, issuer=issuer, gateway_url=gateway_url)
         if not target.lower().startswith(("https://", "http://")):
             raise ValidationError("trust roots url must be http(s)")
 
+        self._log.debug("namespace.meta", "download_trust_roots enter: target=%s timeout=%s", target, timeout)
         ssl_param = None if self._client._config_model.verify_ssl else False
         http_timeout = aiohttp.ClientTimeout(total=float(timeout))
-        async with aiohttp.ClientSession(timeout=http_timeout) as session:
-            async with session.get(target, ssl=ssl_param, headers={"Accept": "application/json"}) as response:
-                response.raise_for_status()
-                payload = await response.json()
+        try:
+            async with aiohttp.ClientSession(timeout=http_timeout) as session:
+                async with session.get(target, ssl=ssl_param, headers={"Accept": "application/json"}) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+        except Exception as exc:
+            self._log.error("namespace.meta", "download_trust_roots failed: target=%s err=%s elapsed=%.3fs", target, exc, time.time() - _t_start, err=exc)
+            raise
         if not isinstance(payload, dict):
             raise ValidationError("trust roots endpoint returned non-object JSON")
+        self._log.debug("namespace.meta", "download_trust_roots exit: elapsed=%.3fs target=%s keys=%d", time.time() - _t_start, target, len(payload))
         return payload
 
     async def download_issuer_root_cert(
@@ -68,20 +100,32 @@ class MetaNamespace:
         timeout: float = 10.0,
     ) -> str:
         """从 pki.{issuer}/root.crt 下载指定 issuer 当前发布的 Root CA 证书。"""
+        _t_start = time.time()
         target = str(url or "").strip() or self._issuer_root_cert_url(issuer)
         if not target.lower().startswith(("https://", "http://")):
             raise ValidationError("issuer root certificate url must be http(s)")
+        self._log.debug("namespace.meta", "download_issuer_root_cert enter: issuer=%s target=%s", issuer, target)
         ssl_param = None if self._client._config_model.verify_ssl else False
         http_timeout = aiohttp.ClientTimeout(total=float(timeout))
-        async with aiohttp.ClientSession(timeout=http_timeout) as session:
-            async with session.get(
-                target,
-                ssl=ssl_param,
-                headers={"Accept": "application/x-pem-file,text/plain"},
-            ) as response:
-                response.raise_for_status()
-                cert_pem = await response.text()
+        try:
+            async with aiohttp.ClientSession(timeout=http_timeout) as session:
+                async with session.get(
+                    target,
+                    ssl=ssl_param,
+                    headers={"Accept": "application/x-pem-file,text/plain"},
+                ) as response:
+                    response.raise_for_status()
+                    cert_pem = await response.text()
+        except Exception as exc:
+            self._log.error(
+                "namespace.meta",
+                "download_issuer_root_cert failed: issuer=%s target=%s err=%s elapsed=%.3fs",
+                issuer, target, exc, time.time() - _t_start, err=exc,
+            )
+            raise
         self._load_root_certificate(cert_pem.strip(), issuer)
+        self._log.info("namespace.meta", "issuer root cert downloaded: issuer=%s", issuer)
+        self._log.debug("namespace.meta", "download_issuer_root_cert exit: elapsed=%.3fs issuer=%s", time.time() - _t_start, issuer)
         return cert_pem.strip() + "\n"
 
     def verify_trust_roots(
@@ -93,55 +137,62 @@ class MetaNamespace:
         allow_unsigned: bool = False,
     ) -> dict[str, Any]:
         """验证受信根列表签名和根证书结构，返回可导入摘要。"""
-        if not isinstance(trust_list, dict):
-            raise ValidationError("trust roots list must be a JSON object")
-        signature = str(trust_list.get("authority_signature") or "").strip()
-        if not signature and not allow_unsigned:
-            raise ValidationError("trust roots list missing authority_signature")
-        self._validate_list_metadata(trust_list)
-        if signature:
-            public_key = self._load_authority_public_key(
-                authority_cert_pem=authority_cert_pem,
-                authority_public_key_pem=authority_public_key_pem,
-                trust_list=trust_list,
-            )
-            signed_payload = self._canonical_signed_payload(trust_list)
-            try:
-                _verify_signature(public_key, self._decode_signature(signature), signed_payload)
-            except InvalidSignature as exc:
-                raise ValidationError("trust roots authority_signature verification failed") from exc
-            except Exception as exc:
-                raise ValidationError("trust roots authority_signature verification failed") from exc
+        _t_start = time.time()
+        self._log.debug("namespace.meta", "verify_trust_roots enter: allow_unsigned=%s", allow_unsigned)
+        try:
+            if not isinstance(trust_list, dict):
+                raise ValidationError("trust roots list must be a JSON object")
+            signature = str(trust_list.get("authority_signature") or "").strip()
+            if not signature and not allow_unsigned:
+                raise ValidationError("trust roots list missing authority_signature")
+            self._validate_list_metadata(trust_list)
+            if signature:
+                public_key = self._load_authority_public_key(
+                    authority_cert_pem=authority_cert_pem,
+                    authority_public_key_pem=authority_public_key_pem,
+                    trust_list=trust_list,
+                )
+                signed_payload = self._canonical_signed_payload(trust_list)
+                try:
+                    _verify_signature(public_key, self._decode_signature(signature), signed_payload)
+                except InvalidSignature as exc:
+                    raise ValidationError("trust roots authority_signature verification failed") from exc
+                except Exception as exc:
+                    raise ValidationError("trust roots authority_signature verification failed") from exc
 
-        roots = self._extract_root_entries(trust_list)
-        imported: list[dict[str, str]] = []
-        skipped: list[dict[str, str]] = []
-        now = time.time()
-        for item in roots:
-            status = str(item.get("status") or "active").strip().lower()
-            cert_pem = str(item.get("certificate") or item.get("cert_pem") or "").strip()
-            root_id = str(item.get("id") or item.get("agentid") or "").strip()
-            if status != "active":
-                skipped.append({"id": root_id, "reason": f"status={status}"})
-                continue
-            cert = self._load_root_certificate(cert_pem, root_id or "root")
-            self._validate_root_ca_certificate(cert, root_id or cert.subject.rfc4514_string())
-            if cert.not_valid_before_utc.timestamp() > now or cert.not_valid_after_utc.timestamp() < now:
-                raise ValidationError(f"root certificate is not currently valid: {root_id or cert.subject.rfc4514_string()}")
-            fingerprint = cert.fingerprint(hashes.SHA256()).hex()
-            expected_fp = self._normalize_fingerprint(item.get("fingerprint_sha256"))
-            if len(expected_fp) != 64:
-                raise ValidationError(f"root certificate missing or invalid fingerprint_sha256: {root_id or fingerprint}")
-            if expected_fp != fingerprint:
-                raise ValidationError(f"root certificate fingerprint mismatch: {root_id or fingerprint}")
-            imported.append({
-                "id": root_id or fingerprint,
-                "cert_pem": cert_pem,
-                "fingerprint_sha256": fingerprint,
-            })
-        if not imported:
-            raise ValidationError("trust roots list contains no active root certificates")
-        return {"imported": imported, "skipped": skipped, "count": len(imported)}
+            roots = self._extract_root_entries(trust_list)
+            imported: list[dict[str, str]] = []
+            skipped: list[dict[str, str]] = []
+            now = time.time()
+            for item in roots:
+                status = str(item.get("status") or "active").strip().lower()
+                cert_pem = str(item.get("certificate") or item.get("cert_pem") or "").strip()
+                root_id = str(item.get("id") or item.get("agentid") or "").strip()
+                if status != "active":
+                    skipped.append({"id": root_id, "reason": f"status={status}"})
+                    continue
+                cert = self._load_root_certificate(cert_pem, root_id or "root")
+                self._validate_root_ca_certificate(cert, root_id or cert.subject.rfc4514_string())
+                if cert.not_valid_before_utc.timestamp() > now or cert.not_valid_after_utc.timestamp() < now:
+                    raise ValidationError(f"root certificate is not currently valid: {root_id or cert.subject.rfc4514_string()}")
+                fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+                expected_fp = self._normalize_fingerprint(item.get("fingerprint_sha256"))
+                if len(expected_fp) != 64:
+                    raise ValidationError(f"root certificate missing or invalid fingerprint_sha256: {root_id or fingerprint}")
+                if expected_fp != fingerprint:
+                    raise ValidationError(f"root certificate fingerprint mismatch: {root_id or fingerprint}")
+                imported.append({
+                    "id": root_id or fingerprint,
+                    "cert_pem": cert_pem,
+                    "fingerprint_sha256": fingerprint,
+                })
+            if not imported:
+                raise ValidationError("trust roots list contains no active root certificates")
+            self._log.debug("namespace.meta", "verify_trust_roots exit: elapsed=%.3fs imported=%d skipped=%d", time.time() - _t_start, len(imported), len(skipped))
+            return {"imported": imported, "skipped": skipped, "count": len(imported)}
+        except Exception as exc:
+            self._log.debug("namespace.meta", "verify_trust_roots exit (error): elapsed=%.3fs err=%s", time.time() - _t_start, exc)
+            raise
 
     def import_trust_roots(
         self,
@@ -152,22 +203,34 @@ class MetaNamespace:
         allow_unsigned: bool = False,
     ) -> dict[str, Any]:
         """验证并导入信任根列表，随后刷新当前客户端的根证书缓存。"""
-        verified = self.verify_trust_roots(
-            trust_list,
-            authority_cert_pem=authority_cert_pem,
-            authority_public_key_pem=authority_public_key_pem,
-            allow_unsigned=allow_unsigned,
-        )
-        self._enforce_monotonic_version(trust_list)
-        bundle_path = self._client._keystore.save_trust_roots(trust_list, verified["imported"])
-        reloaded = self._client._auth.reload_trusted_roots()
-        return {
-            "imported": verified["count"],
-            "skipped": verified["skipped"],
-            "bundle_path": str(bundle_path),
-            "reloaded_roots": reloaded,
-            "fingerprints": [item["fingerprint_sha256"] for item in verified["imported"]],
-        }
+        _t_start = time.time()
+        self._log.debug("namespace.meta", "import_trust_roots enter")
+        try:
+            verified = self.verify_trust_roots(
+                trust_list,
+                authority_cert_pem=authority_cert_pem,
+                authority_public_key_pem=authority_public_key_pem,
+                allow_unsigned=allow_unsigned,
+            )
+            self._enforce_monotonic_version(trust_list)
+            bundle_path = self._client._keystore.save_trust_roots(trust_list, verified["imported"])
+            reloaded = self._client._auth.reload_trusted_roots()
+            self._log.info(
+                "namespace.meta",
+                "trust roots imported: count=%d skipped=%d reloaded=%d",
+                verified["count"], len(verified["skipped"]), reloaded,
+            )
+            self._log.debug("namespace.meta", "import_trust_roots exit: elapsed=%.3fs imported=%d reloaded=%d", time.time() - _t_start, verified["count"], reloaded)
+            return {
+                "imported": verified["count"],
+                "skipped": verified["skipped"],
+                "bundle_path": str(bundle_path),
+                "reloaded_roots": reloaded,
+                "fingerprints": [item["fingerprint_sha256"] for item in verified["imported"]],
+            }
+        except Exception as exc:
+            self._log.debug("namespace.meta", "import_trust_roots exit (error): elapsed=%.3fs err=%s", time.time() - _t_start, exc)
+            raise
 
     async def refresh_trust_roots(
         self,
@@ -181,16 +244,23 @@ class MetaNamespace:
         timeout: float = 10.0,
     ) -> dict[str, Any]:
         """下载、验签并导入受信根列表。"""
+        _t_start = time.time()
         source_url = self._resolve_trust_roots_url(url, issuer=issuer, gateway_url=gateway_url)
-        trust_list = await self.download_trust_roots(source_url, timeout=timeout)
-        result = self.import_trust_roots(
-            trust_list,
-            authority_cert_pem=authority_cert_pem,
-            authority_public_key_pem=authority_public_key_pem,
-            allow_unsigned=allow_unsigned,
-        )
-        result["source_url"] = source_url
-        return result
+        self._log.debug("namespace.meta", "refresh_trust_roots enter: source=%s", source_url)
+        try:
+            trust_list = await self.download_trust_roots(source_url, timeout=timeout)
+            result = self.import_trust_roots(
+                trust_list,
+                authority_cert_pem=authority_cert_pem,
+                authority_public_key_pem=authority_public_key_pem,
+                allow_unsigned=allow_unsigned,
+            )
+            result["source_url"] = source_url
+            self._log.debug("namespace.meta", "refresh_trust_roots exit: elapsed=%.3fs source=%s imported=%s", time.time() - _t_start, source_url, result.get("imported"))
+            return result
+        except Exception as exc:
+            self._log.debug("namespace.meta", "refresh_trust_roots exit (error): elapsed=%.3fs source=%s err=%s", time.time() - _t_start, source_url, exc)
+            raise
 
     async def update_issuer_root_cert(
         self,
@@ -205,53 +275,65 @@ class MetaNamespace:
         timeout: float = 10.0,
     ) -> dict[str, Any]:
         """下载或接收 issuer root.crt，确认其属于受信根列表后更新本地根证书 bundle。"""
+        _t_start = time.time()
         normalized_issuer = self._validate_issuer(issuer)
-        source_url = str(url or "").strip() or self._issuer_root_cert_url(normalized_issuer)
-        root_pem = cert_pem.strip() + "\n" if isinstance(cert_pem, str) and cert_pem.strip() else ""
-        if not root_pem:
-            root_pem = await self.download_issuer_root_cert(normalized_issuer, source_url, timeout=timeout)
-        cert = self._load_root_certificate(root_pem, normalized_issuer)
-        self._validate_root_ca_certificate(cert, normalized_issuer)
-        self._verify_self_signed_root(cert, normalized_issuer)
-        now = time.time()
-        if cert.not_valid_before_utc.timestamp() > now or cert.not_valid_after_utc.timestamp() < now:
-            raise ValidationError(f"issuer root certificate is not currently valid: {normalized_issuer}")
-        fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+        self._log.debug("namespace.meta", "update_issuer_root_cert enter: issuer=%s", normalized_issuer)
+        try:
+            source_url = str(url or "").strip() or self._issuer_root_cert_url(normalized_issuer)
+            root_pem = cert_pem.strip() + "\n" if isinstance(cert_pem, str) and cert_pem.strip() else ""
+            if not root_pem:
+                root_pem = await self.download_issuer_root_cert(normalized_issuer, source_url, timeout=timeout)
+            cert = self._load_root_certificate(root_pem, normalized_issuer)
+            self._validate_root_ca_certificate(cert, normalized_issuer)
+            self._verify_self_signed_root(cert, normalized_issuer)
+            now = time.time()
+            if cert.not_valid_before_utc.timestamp() > now or cert.not_valid_after_utc.timestamp() < now:
+                raise ValidationError(f"issuer root certificate is not currently valid: {normalized_issuer}")
+            fingerprint = cert.fingerprint(hashes.SHA256()).hex()
 
-        effective_trust_list = trust_list or self._load_local_trust_list()
-        trust_source = "local"
-        if effective_trust_list is None:
-            effective_trust_list = await self.download_trust_roots(
-                issuer=normalized_issuer,
-                timeout=timeout,
+            effective_trust_list = trust_list or self._load_local_trust_list()
+            trust_source = "local"
+            if effective_trust_list is None:
+                effective_trust_list = await self.download_trust_roots(
+                    issuer=normalized_issuer,
+                    timeout=timeout,
+                )
+                trust_source = self._issuer_trust_root_url(normalized_issuer)
+            verified = self.verify_trust_roots(
+                effective_trust_list,
+                authority_cert_pem=authority_cert_pem,
+                authority_public_key_pem=authority_public_key_pem,
+                allow_unsigned=allow_unsigned,
             )
-            trust_source = self._issuer_trust_root_url(normalized_issuer)
-        verified = self.verify_trust_roots(
-            effective_trust_list,
-            authority_cert_pem=authority_cert_pem,
-            authority_public_key_pem=authority_public_key_pem,
-            allow_unsigned=allow_unsigned,
-        )
-        self._enforce_monotonic_version(effective_trust_list)
-        trusted_fingerprints = {item["fingerprint_sha256"] for item in verified["imported"]}
-        if fingerprint not in trusted_fingerprints:
-            raise ValidationError("issuer root certificate is not in trusted root list")
+            self._enforce_monotonic_version(effective_trust_list)
+            trusted_fingerprints = {item["fingerprint_sha256"] for item in verified["imported"]}
+            if fingerprint not in trusted_fingerprints:
+                raise ValidationError("issuer root certificate is not in trusted root list")
 
-        cert_path, bundle_path = self._client._keystore.save_issuer_root_cert(
-            normalized_issuer,
-            root_pem,
-            fingerprint,
-        )
-        reloaded = self._client._auth.reload_trusted_roots()
-        return {
-            "issuer": normalized_issuer,
-            "fingerprint_sha256": fingerprint,
-            "cert_path": str(cert_path),
-            "bundle_path": str(bundle_path),
-            "reloaded_roots": reloaded,
-            "source_url": source_url,
-            "trust_source": trust_source,
-        }
+            cert_path, bundle_path = self._client._keystore.save_issuer_root_cert(
+                normalized_issuer,
+                root_pem,
+                fingerprint,
+            )
+            reloaded = self._client._auth.reload_trusted_roots()
+            self._log.info(
+                "namespace.meta",
+                "issuer root cert updated: issuer=%s fingerprint=%s reloaded=%d trust_source=%s",
+                normalized_issuer, fingerprint[:16] + "...", reloaded, trust_source,
+            )
+            self._log.debug("namespace.meta", "update_issuer_root_cert exit: elapsed=%.3fs issuer=%s reloaded=%d", time.time() - _t_start, normalized_issuer, reloaded)
+            return {
+                "issuer": normalized_issuer,
+                "fingerprint_sha256": fingerprint,
+                "cert_path": str(cert_path),
+                "bundle_path": str(bundle_path),
+                "reloaded_roots": reloaded,
+                "source_url": source_url,
+                "trust_source": trust_source,
+            }
+        except Exception as exc:
+            self._log.debug("namespace.meta", "update_issuer_root_cert exit (error): elapsed=%.3fs issuer=%s err=%s", time.time() - _t_start, normalized_issuer, exc)
+            raise
 
     def _resolve_trust_roots_url(
         self,

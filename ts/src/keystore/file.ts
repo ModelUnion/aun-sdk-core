@@ -98,6 +98,7 @@ export class FileKeyStore implements KeyStore {
   }
 
   close(): void {
+    this._logger.debug(`FileKeyStore close: closing ${this._aidDBs.size} AID databases`);
     for (const db of this._aidDBs.values()) db.close();
     this._aidDBs.clear();
   }
@@ -108,18 +109,20 @@ export class FileKeyStore implements KeyStore {
     if (!db) {
       const dbPath = join(this._aidsRoot, safe, 'aun.db');
       try {
-        db = new AIDDatabase(dbPath, this._secretStore, safe);
+        db = new AIDDatabase(dbPath, this._secretStore, safe, this._logger);
       } catch (exc) {
         // DB 损坏：备份后重建
-        this._logger.warn('数据库损坏，备份后重建');
+        this._logger.warn(`database corrupted, backing up and rebuilding: aid=${aid} err=${exc instanceof Error ? exc.message : String(exc)}`);
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const bakPath = dbPath + `.corrupt_${ts}.bak`;
-        try { renameSync(dbPath, bakPath); } catch { /* 备份失败也继续重建 */ }
+        try { renameSync(dbPath, bakPath); } catch (renameErr) {
+          this._logger.warn(`backup rename failed: ${renameErr instanceof Error ? renameErr.message : String(renameErr)}`);
+        }
         // 清理 WAL/SHM
         for (const suffix of ['-wal', '-shm', '-journal']) {
-          try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+          try { unlinkSync(dbPath + suffix); } catch { /* 文件不存在/无权限均可忽略，下方重建会重新创建 */ }
         }
-        db = new AIDDatabase(dbPath, this._secretStore, safe);
+        db = new AIDDatabase(dbPath, this._secretStore, safe, this._logger);
       }
       this._aidDBs.set(safe, db);
     }
@@ -132,7 +135,7 @@ export class FileKeyStore implements KeyStore {
       return preferred;
     } catch {
       // ISSUE-TS-003: 回退时警告用户数据存储位置变更
-      this._logger.warn(`首选路径 ${preferred} 不可用，回退到 ${fallback}`);
+      this._logger.warn(`preferred path ${preferred} unavailable, falling back to ${fallback}`);
       mkdirSync(fallback, { recursive: true });
       return fallback;
     }
@@ -147,7 +150,7 @@ export class FileKeyStore implements KeyStore {
       const raw = JSON.parse(readFileSync(path, 'utf-8'));
       return this._restoreKeyPair(aid, raw);
     } catch (exc) {
-      this._logger.warn('key.json 读取或解析失败，视为不存在');
+      this._logger.warn('key.json read or parse failed, treating as non-existent');
       return null;
     }
   }
@@ -195,7 +198,7 @@ export class FileKeyStore implements KeyStore {
       return existsSync(path) ? readFileSync(path, 'utf-8') : null;
     } catch (exc) {
       // 文件被锁定、无权限、目录冲突等异常时降级返回 null
-      this._logger.warn('cert.pem 读取失败，视为不存在');
+      this._logger.warn('cert.pem read failed, treating as non-existent');
       return null;
     }
   }
@@ -239,7 +242,7 @@ export class FileKeyStore implements KeyStore {
           const certPubDer = x.publicKey.export({ type: 'spki', format: 'der' });
           const localPubDer = Buffer.from(localPubB64, 'base64');
           if (!certPubDer.equals(localPubDer)) {
-            this._logger.error('key.json 公钥与 cert.pem 公钥不匹配，丢弃 cert');
+            this._logger.error('key.json public key does not match cert.pem public key, discarding cert');
           } else {
             identity.cert = cert;
           }
@@ -287,6 +290,15 @@ export class FileKeyStore implements KeyStore {
 
   loadE2EEPrekeys(aid: string, deviceId?: string): PrekeyMap {
     return this._getDB(aid).loadPrekeys(String(deviceId ?? '').trim()) as PrekeyMap;
+  }
+
+  /**
+   * 按 prekey_id 单点查询（数据库 WHERE prekey_id = ? LIMIT 1）。
+   * 相比 loadE2EEPrekeys 的全量加载（O(N)），单条查询是 O(1)。
+   * 解密入站消息时信封里有 prekey_id，应优先走这条路径。
+   */
+  loadE2EEPrekeyById(aid: string, prekeyId: string): PrekeyRecord | null {
+    return this._getDB(aid).loadPrekeyById(prekeyId) as PrekeyRecord | null;
   }
 
   saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): void {
@@ -410,6 +422,10 @@ export class FileKeyStore implements KeyStore {
 
   loadAllSeqs(aid: string, deviceId: string, slotId: string): Record<string, number> {
     return this._getDB(aid).loadAllSeqs(deviceId, slotId);
+  }
+
+  deleteSeq(aid: string, deviceId: string, slotId: string, namespace: string): void {
+    this._getDB(aid).deleteSeq(deviceId, slotId, namespace);
   }
 
   // ── 身份列表 ───────────────────────────────────────────

@@ -1,6 +1,9 @@
 import type { AUNClient } from '../client.js';
 import { AUNError, ValidationError } from '../errors.js';
+import type { ModuleLogger } from '../logger.js';
 import { isJsonObject, type JsonObject, type JsonValue } from '../types.js';
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 const CUSTODY_HTTP_TIMEOUT_MS = 30_000;
 
@@ -92,6 +95,8 @@ async function fetchJsonWithTimeout(
 export class CustodyNamespace {
   private _client: AUNClient;
   private _custodyUrl = '';
+  private _log: ModuleLogger = _noopLog;
+  setLogger(log: ModuleLogger): void { this._log = log; }
 
   constructor(client: AUNClient) {
     this._client = client;
@@ -110,29 +115,37 @@ export class CustodyNamespace {
   }
 
   async discoverUrl(params: { aid?: string | null; timeout?: number } = {}): Promise<string> {
-    const aid = String(params.aid ?? this._client.aid ?? '').trim();
-    if (!aid) {
-      throw new ValidationError('custody.discoverUrl requires aid or authenticated client');
-    }
-    let lastError: unknown = null;
-    const urls = custodyWellKnownUrls(aid, this._client.configModel.discoveryPort, this._client.configModel.verifySsl);
-    for (const wellKnownUrl of urls) {
-      try {
-        const payload = await fetchJsonWithTimeout(wellKnownUrl, { method: 'GET' }, params.timeout ?? 5_000);
-        if (!isJsonObject(payload)) {
-          throw new ValidationError('custody well-known returned invalid payload');
-        }
-        const custodyUrl = normalizeCustodyUrl(extractCustodyUrl(payload));
-        if (!custodyUrl) {
-          throw new ValidationError('custody well-known returned invalid custody url');
-        }
-        this._custodyUrl = custodyUrl;
-        return custodyUrl;
-      } catch (error) {
-        lastError = error;
+    const tStart = Date.now();
+    this._log.debug(`discoverUrl enter: aid=${params.aid ?? '<current>'}`);
+    try {
+      const aid = String(params.aid ?? this._client.aid ?? '').trim();
+      if (!aid) {
+        throw new ValidationError('custody.discoverUrl requires aid or authenticated client');
       }
+      let lastError: unknown = null;
+      const urls = custodyWellKnownUrls(aid, this._client.configModel.discoveryPort, this._client.configModel.verifySsl);
+      for (const wellKnownUrl of urls) {
+        try {
+          const payload = await fetchJsonWithTimeout(wellKnownUrl, { method: 'GET' }, params.timeout ?? 5_000);
+          if (!isJsonObject(payload)) {
+            throw new ValidationError('custody well-known returned invalid payload');
+          }
+          const custodyUrl = normalizeCustodyUrl(extractCustodyUrl(payload));
+          if (!custodyUrl) {
+            throw new ValidationError('custody well-known returned invalid custody url');
+          }
+          this._custodyUrl = custodyUrl;
+          this._log.debug(`discoverUrl exit: elapsed=${Date.now() - tStart}ms aid=${aid} url=${custodyUrl}`);
+          return custodyUrl;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw new AUNError(`custody discovery failed for ${aid}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+    } catch (err) {
+      this._log.debug(`discoverUrl exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    throw new AUNError(`custody discovery failed for ${aid}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
   }
 
   private async _resolveCustodyUrl(aid?: string | null): Promise<string> {
@@ -181,19 +194,28 @@ export class CustodyNamespace {
   }
 
   async sendCode(params: { phone: string; aid?: string | null }): Promise<JsonObject> {
-    const phone = String(params.phone ?? '').trim();
-    const aid = String(params.aid ?? '').trim();
-    if (!phone) {
-      throw new ValidationError('custody.sendCode requires non-empty phone');
+    const tStart = Date.now();
+    this._log.debug(`sendCode enter: aid=${params.aid ?? '<current>'}`);
+    try {
+      const phone = String(params.phone ?? '').trim();
+      const aid = String(params.aid ?? '').trim();
+      if (!phone) {
+        throw new ValidationError('custody.sendCode requires non-empty phone');
+      }
+      const body: JsonObject = {phone};
+      let token: string | null = null;
+      if (aid) {
+        body.aid = aid;
+      } else {
+        token = this._getAccessToken();
+      }
+      const r = await this._post('/custody/accounts/send-code', body, {token});
+      this._log.debug(`sendCode exit: elapsed=${Date.now() - tStart}ms`);
+      return r;
+    } catch (err) {
+      this._log.debug(`sendCode exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const body: JsonObject = {phone};
-    let token: string | null = null;
-    if (aid) {
-      body.aid = aid;
-    } else {
-      token = this._getAccessToken();
-    }
-    return this._post('/custody/accounts/send-code', body, {token});
   }
 
   async bindPhone(params: {
@@ -203,20 +225,29 @@ export class CustodyNamespace {
     key: string;
     metadata?: JsonObject | null;
   }): Promise<JsonObject> {
-    const phone = String(params.phone ?? '').trim();
-    const code = String(params.code ?? '').trim();
-    const cert = String(params.cert ?? '').trim();
-    const key = String(params.key ?? '').trim();
-    if (!phone || !code || !cert || !key) {
-      throw new ValidationError('custody.bindPhone requires phone, code, cert and key');
+    const tStart = Date.now();
+    this._log.debug('bindPhone enter');
+    try {
+      const phone = String(params.phone ?? '').trim();
+      const code = String(params.code ?? '').trim();
+      const cert = String(params.cert ?? '').trim();
+      const key = String(params.key ?? '').trim();
+      if (!phone || !code || !cert || !key) {
+        throw new ValidationError('custody.bindPhone requires phone, code, cert and key');
+      }
+      const body: JsonObject = {phone, code, cert, key};
+      if (params.metadata && isJsonObject(params.metadata)) {
+        body.metadata = params.metadata;
+      }
+      const r = await this._post('/custody/accounts/bind-phone', body, {
+        token: this._getAccessToken(),
+      });
+      this._log.debug(`bindPhone exit: elapsed=${Date.now() - tStart}ms`);
+      return r;
+    } catch (err) {
+      this._log.debug(`bindPhone exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const body: JsonObject = {phone, code, cert, key};
-    if (params.metadata && isJsonObject(params.metadata)) {
-      body.metadata = params.metadata;
-    }
-    return this._post('/custody/accounts/bind-phone', body, {
-      token: this._getAccessToken(),
-    });
   }
 
   async restorePhone(params: {
@@ -224,21 +255,39 @@ export class CustodyNamespace {
     code: string;
     aid: string;
   }): Promise<JsonObject> {
-    const phone = String(params.phone ?? '').trim();
-    const code = String(params.code ?? '').trim();
-    const aid = String(params.aid ?? '').trim();
-    if (!phone || !code || !aid) {
-      throw new ValidationError('custody.restorePhone requires phone, code and aid');
+    const tStart = Date.now();
+    this._log.debug(`restorePhone enter: aid=${params.aid}`);
+    try {
+      const phone = String(params.phone ?? '').trim();
+      const code = String(params.code ?? '').trim();
+      const aid = String(params.aid ?? '').trim();
+      if (!phone || !code || !aid) {
+        throw new ValidationError('custody.restorePhone requires phone, code and aid');
+      }
+      const r = await this._post('/custody/accounts/restore-phone', {phone, code, aid});
+      this._log.debug(`restorePhone exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      return r;
+    } catch (err) {
+      this._log.debug(`restorePhone exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    return this._post('/custody/accounts/restore-phone', {phone, code, aid});
   }
 
   async createDeviceCopy(params: { aid?: string | null } = {}): Promise<JsonObject> {
-    const aid = String(params.aid ?? this._client.aid ?? '').trim();
-    if (!aid) {
-      throw new ValidationError('custody.createDeviceCopy requires aid or authenticated client');
+    const tStart = Date.now();
+    this._log.debug(`createDeviceCopy enter: aid=${params.aid ?? '<current>'}`);
+    try {
+      const aid = String(params.aid ?? this._client.aid ?? '').trim();
+      if (!aid) {
+        throw new ValidationError('custody.createDeviceCopy requires aid or authenticated client');
+      }
+      const r = await this._post('/custody/transfers', {aid}, {token: this._getAccessToken()});
+      this._log.debug(`createDeviceCopy exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      return r;
+    } catch (err) {
+      this._log.debug(`createDeviceCopy exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    return this._post('/custody/transfers', {aid}, {token: this._getAccessToken()});
   }
 
   async uploadDeviceCopyMaterials(params: {
@@ -248,31 +297,49 @@ export class CustodyNamespace {
     aid?: string | null;
     metadata?: JsonObject | null;
   }): Promise<JsonObject> {
-    const transferCode = String(params.transferCode ?? '').trim();
-    const aid = String(params.aid ?? this._client.aid ?? '').trim();
-    const cert = String(params.cert ?? '').trim();
-    const key = String(params.key ?? '').trim();
-    if (!transferCode || !aid || !cert || !key) {
-      throw new ValidationError('custody.uploadDeviceCopyMaterials requires transferCode, aid, cert and key');
+    const tStart = Date.now();
+    this._log.debug(`uploadDeviceCopyMaterials enter: aid=${params.aid ?? '<current>'}`);
+    try {
+      const transferCode = String(params.transferCode ?? '').trim();
+      const aid = String(params.aid ?? this._client.aid ?? '').trim();
+      const cert = String(params.cert ?? '').trim();
+      const key = String(params.key ?? '').trim();
+      if (!transferCode || !aid || !cert || !key) {
+        throw new ValidationError('custody.uploadDeviceCopyMaterials requires transferCode, aid, cert and key');
+      }
+      const body: JsonObject = {aid, cert, key};
+      if (params.metadata && isJsonObject(params.metadata)) {
+        body.metadata = params.metadata;
+      }
+      const r = await this._post(`/custody/transfers/${encodeURIComponent(transferCode)}/materials`, body, {
+        token: this._getAccessToken(),
+      });
+      this._log.debug(`uploadDeviceCopyMaterials exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      return r;
+    } catch (err) {
+      this._log.debug(`uploadDeviceCopyMaterials exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const body: JsonObject = {aid, cert, key};
-    if (params.metadata && isJsonObject(params.metadata)) {
-      body.metadata = params.metadata;
-    }
-    return this._post(`/custody/transfers/${encodeURIComponent(transferCode)}/materials`, body, {
-      token: this._getAccessToken(),
-    });
   }
 
   async claimDeviceCopy(params: {
     aid: string;
     transferCode: string;
   }): Promise<JsonObject> {
-    const aid = String(params.aid ?? '').trim();
-    const transferCode = String(params.transferCode ?? '').trim();
-    if (!aid || !transferCode) {
-      throw new ValidationError('custody.claimDeviceCopy requires aid and transferCode');
+    const tStart = Date.now();
+    this._log.debug(`claimDeviceCopy enter: aid=${params.aid}`);
+    try {
+      const aid = String(params.aid ?? '').trim();
+      const transferCode = String(params.transferCode ?? '').trim();
+      if (!aid || !transferCode) {
+        throw new ValidationError('custody.claimDeviceCopy requires aid and transferCode');
+      }
+      const r = await this._post('/custody/transfers/claim', {aid, transfer_code: transferCode});
+      this._log.debug(`claimDeviceCopy exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      return r;
+    } catch (err) {
+      this._log.debug(`claimDeviceCopy exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    return this._post('/custody/transfers/claim', {aid, transfer_code: transferCode});
   }
 }

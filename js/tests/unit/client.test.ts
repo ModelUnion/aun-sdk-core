@@ -291,9 +291,11 @@ describe('AUNClient message.send 接收者校验', () => {
     });
 
     const [, sentParams] = (client as any)._transport.call.mock.calls[0];
+    // delivery_mode 不被转发到底层 RPC（与 Python SDK 对齐）
     expect(sentParams.delivery_mode).toBeUndefined();
-    expect(sentParams.protected_headers).toBeUndefined();
-    expect(sentParams.headers).toBeUndefined();
+    // protected_headers / headers 是信封元数据，加密与否都保留（与 Python SDK 对齐）
+    expect(sentParams.protected_headers).toBeDefined();
+    expect(sentParams.headers).toBeDefined();
   });
 
   it('message.pull 自动注入当前实例 device_id/slot_id', async () => {
@@ -575,6 +577,8 @@ describe('AUNClient prekey 补充', () => {
   it('同一个 prekey_id 只触发一次异步补充', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
+    // 仅活跃 prekey 被消费时才触发上传；测试需显式设置 active 模拟"刚上传"的状态
+    (client as any)._activePrekeyId = 'pk-1';
     (client as any)._uploadPrekey = vi.fn().mockResolvedValue({ ok: true });
 
     (client as any)._schedulePrekeyReplenishIfConsumed({
@@ -794,8 +798,8 @@ describe('AUNClient 群补拉实例上下文', () => {
 
 // ── Task 1 针对性测试 ──────────────────────────────────────────
 
-describe('group.pull 拦截器：onPullResult 应消费原始消息', () => {
-  it('onPullResult 应在解密前被调用（传入原始密文消息）', async () => {
+describe('group.pull 拦截器：onPullResult 应消费解密成功的消息', () => {
+  it('onPullResult 应在解密后被调用（仅传入解密成功的消息推进 contig）', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._aid = 'alice.aid.com';
@@ -818,16 +822,15 @@ describe('group.pull 拦截器：onPullResult 应消费原始消息', () => {
 
     await client.call('group.pull', { group_id: 'g1', after_message_seq: 0 });
 
-    // onPullResult 必须收到原始消息（rawMsg），而不是解密后的 decryptedMsg
+    // 群消息：onPullResult 收到解密成功的 decryptedMsg（与 P2P message.pull 不同——
+    // 群组解密失败的消息不能推进 contig，必须等 retry 成功。详见 client.ts:1010 的注释）
     expect(onPullResultSpy).toHaveBeenCalledWith(
       'group:g1',
-      expect.arrayContaining([expect.objectContaining({ payload: rawMsg.payload })]),
+      expect.arrayContaining([expect.objectContaining({ payload: decryptedMsg.payload })]),
     );
-    // 确认解密后的消息不被传给 onPullResult
     const callArgs = onPullResultSpy.mock.calls[0];
     const passedMessages = callArgs[1] as any[];
-    expect(passedMessages[0].payload).toEqual(rawMsg.payload);
-    expect(passedMessages[0].payload).not.toEqual(decryptedMsg.payload);
+    expect(passedMessages[0].payload).toEqual(decryptedMsg.payload);
   });
 });
 
@@ -1118,6 +1121,8 @@ describe('R4: 收到密钥后应触发 pending 消息重试', () => {
       decrypt: vi.fn(),
       loadSecret: vi.fn(),
       getMemberAids: vi.fn().mockReturnValue([]),
+      // _tryHandleGroupKeyMessage 用 currentEpoch 判定本地是否已 ahead
+      currentEpoch: vi.fn().mockReturnValue(0),
     };
 
     const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
@@ -1163,6 +1168,9 @@ describe('GROUP epoch 轮换竞态防护', () => {
 
   it('无 rotation_id 的未来 epoch 分发应被拒绝', async () => {
     const client = new AUNClient();
+    // 验证逻辑会跳过非活跃群（不在 _groupSynced 中）。本测试要走完整 RPC 校验路径，
+    // 必须先把目标群加入活跃列表。
+    (client as any)._groupSynced.add('g1');
     (client as any).call = vi.fn().mockResolvedValue({ epoch: 1, committed_epoch: 1 });
 
     await expect((client as any)._verifyActiveGroupRotationDistribution({

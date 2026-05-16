@@ -10,6 +10,8 @@
 import { AUNError, NotFoundError, StateError, ValidationError } from '../errors.js';
 import type { AUNConfig } from '../config.js';
 import type { AUNClient } from '../client.js';
+import type { ModuleLogger } from '../logger.js';
+import type { KeyStore } from '../keystore/index.js';
 import { isJsonObject, type IdentityRecord, type JsonObject, type JsonValue, type RpcParams, type RpcResult } from '../types.js';
 import { certificateSha256Fingerprint } from '../crypto.js';
 import { createSign, createVerify, X509Certificate } from 'node:crypto';
@@ -47,11 +49,13 @@ interface ClientBridge {
   _gatewayUrl: string | null;
   _identity: IdentityRecord | null;
   _configModel: AUNConfig;
+  _keystore: KeyStore;
   _fetchPeerCert?: (aid: string, certFingerprint?: string) => Promise<string>;
   _discovery: {
     discover: (url: string) => Promise<string>;
   };
   _auth: AuthFlowBridge;
+  _logger: { for: (module: string) => ModuleLogger };
 }
 
 interface AgentMdSignOptions {
@@ -196,9 +200,11 @@ async function fetchWithTimeout(
 
 export class AuthNamespace {
   private _client: AUNClient;
+  private _log: ModuleLogger;
 
   constructor(client: AUNClient) {
     this._client = client;
+    this._log = (client as any as ClientBridge)._logger.for('aun_core.namespace.auth');
   }
 
   private get _internal(): ClientBridge {
@@ -210,19 +216,34 @@ export class AuthNamespace {
    * 优先使用已预置的 _gatewayUrl，否则基于 AID 自动发现。
    *
    * 发现流程：
-   * 发现流程：
-   * 1. 若 _gatewayUrl 已预置，直接返回
-   * 2. 开发环境：先 gateway.{issuer}，再 fallback {aid}（泛域名在开发环境可能不可用）
-   * 3. 生产环境：先 {aid}（泛域名 nameservice），再 fallback gateway.{issuer}
+   * 1. 若 _gatewayUrl 已预置（内存），直接返回
+   * 2. 从 keystore metadata 读 cached gateway_url（跨进程复用）
+   * 3. 开发环境：先 gateway.{issuer}，再 fallback {aid}（泛域名在开发环境可能不可用）
+   * 4. 生产环境：先 {aid}（泛域名 nameservice），再 fallback gateway.{issuer}
    */
   async _resolveGateway(aid?: string): Promise<string> {
     // 访问内部属性
     const client = this._internal;
     const gatewayUrl = client._gatewayUrl;
-    if (gatewayUrl) return gatewayUrl;
+    if (gatewayUrl) {
+      this._log.debug(`_resolveGateway: using preset gateway=${gatewayUrl}`);
+      return gatewayUrl;
+    }
 
     const resolvedAid = aid ?? client._aid;
     if (resolvedAid) {
+      // 从 keystore metadata 读持久化的 gateway_url（避免每次进程启动都做 well-known discovery）
+      try {
+        const cachedGateway = this._loadCachedGatewayUrl(resolvedAid);
+        if (cachedGateway) {
+          this._log.debug(`_resolveGateway from keystore cache aid=${resolvedAid} gateway=${cachedGateway}`);
+          client._gatewayUrl = cachedGateway;
+          return cachedGateway;
+        }
+      } catch (exc) {
+        this._log.debug(`load cached gateway_url failed: ${exc instanceof Error ? exc.message : String(exc)}`);
+      }
+
       const parts = resolvedAid.split('.');
       const issuerDomain = parts.length > 1 ? parts.slice(1).join('.') : resolvedAid;
 
@@ -240,13 +261,21 @@ export class AuthNamespace {
         ? [aidUrl, gatewayDomainUrl]
         : [gatewayDomainUrl, aidUrl];
 
+      this._log.debug(`_resolveGateway start: aid=${resolvedAid} primary=${primaryUrl}`);
       try {
-        return await discovery.discover(primaryUrl);
-      } catch {
+        const url = await discovery.discover(primaryUrl);
+        this._log.debug(`_resolveGateway primary ok: aid=${resolvedAid} gateway=${url}`);
+        this._persistGatewayUrl(resolvedAid, url);
+        return url;
+      } catch (exc) {
         // 主路径失败，尝试 fallback
+        this._log.warn(`_resolveGateway primary failed, trying fallback: aid=${resolvedAid} primary=${primaryUrl} err=${exc instanceof Error ? exc.message : String(exc)}`);
       }
 
-      return await discovery.discover(fallbackUrl);
+      const url = await discovery.discover(fallbackUrl);
+      this._log.debug(`_resolveGateway fallback ok: aid=${resolvedAid} gateway=${url}`);
+      this._persistGatewayUrl(resolvedAid, url);
+      return url;
     }
 
     throw new ValidationError(
@@ -254,55 +283,118 @@ export class AuthNamespace {
     );
   }
 
+  /**
+   * 从 keystore metadata 读取 cached gateway_url（用于跨进程复用，避免重做 discovery）
+   */
+  _loadCachedGatewayUrl(aid: string): string {
+    if (!aid) return '';
+    const keystore = this._internal._keystore;
+    try {
+      const db = (keystore as KeyStore & { _getDB?: (aid: string) => { getMetadata: (k: string) => string | null } })._getDB?.(aid);
+      if (!db || typeof db.getMetadata !== 'function') return '';
+      const raw = db.getMetadata('gateway_url');
+      if (!raw) return '';
+      // saveIdentity 走 JSON.stringify；这里 JSON.parse 兼容；裸字符串也兼容
+      try {
+        const value = JSON.parse(raw);
+        if (typeof value === 'string') return value.trim();
+      } catch {
+        // 解析失败回退到裸字符串
+      }
+      return String(raw).trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * 持久化 gateway_url 到 keystore metadata，供跨进程复用
+   */
+  _persistGatewayUrl(aid: string, gatewayUrl: string): void {
+    if (!gatewayUrl || !aid) return;
+    try {
+      const keystore = this._internal._keystore;
+      const db = (keystore as KeyStore & { _getDB?: (aid: string) => { setMetadata: (k: string, v: string) => void } })._getDB?.(aid);
+      if (!db || typeof db.setMetadata !== 'function') return;
+      // 与 saveIdentity 保持一致用 JSON 编码，避免 saveIdentity 之后被覆盖时格式冲突
+      db.setMetadata('gateway_url', JSON.stringify(gatewayUrl));
+    } catch (exc) {
+      this._log.debug(`persist gateway_url failed aid=${aid} err=${exc instanceof Error ? exc.message : String(exc)}`);
+    }
+  }
+
   /** 创建新 AID */
   async createAid(params: RpcParams): Promise<AuthNamespaceResult> {
+    const tStart = Date.now();
     const aid = String(params?.aid ?? '');
     if (!aid) throw new Error("auth.create_aid requires 'aid'");
 
     const client = this._internal;
+    this._log.debug(`createAid enter: aid=${aid}`);
     const gatewayUrl = await this._resolveGateway(aid);
     client._gatewayUrl = gatewayUrl;
 
     const auth = client._auth;
-    const result = await auth.createAid(gatewayUrl, aid);
-    client._aid = result.aid ?? null;
-    client._identity = auth.loadIdentityOrNone(String(result.aid));
-
-    return {
-      aid: result.aid,
-      cert_pem: result.cert,
-      gateway: gatewayUrl,
-    };
+    try {
+      const result = await auth.createAid(gatewayUrl, aid);
+      client._aid = aid;
+      client._identity = auth.loadIdentityOrNone(aid);
+      this._log.info(`createAid success: aid=${aid} gateway=${gatewayUrl}`);
+      this._log.debug(`createAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      return {
+        aid: result.aid,
+        cert_pem: result.cert,
+        gateway: gatewayUrl,
+      };
+    } catch (err) {
+      this._log.error(`createAid failed: aid=${aid} err=${err instanceof Error ? err.message : String(err)}`, err instanceof Error ? err : undefined);
+      this._log.debug(`createAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 认证（登录） */
   async authenticate(params?: RpcParams): Promise<AuthNamespaceResult> {
+    const tStart = Date.now();
     const request = { ...(params ?? {}) };
     const aid = request.aid as string | undefined;
 
     const client = this._internal;
+    this._log.debug(`authenticate enter: aid=${aid ?? '-'}`);
     const gatewayUrl = await this._resolveGateway(aid);
     client._gatewayUrl = gatewayUrl;
 
     const auth = client._auth;
-    const result = await auth.authenticate(gatewayUrl, { aid });
-    client._aid = result.aid ?? null;
-    client._identity = auth.loadIdentityOrNone(String(result.aid));
-
-    return result;
+    try {
+      const result = await auth.authenticate(gatewayUrl, { aid });
+      client._aid = result.aid ?? null;
+      client._identity = auth.loadIdentityOrNone(String(result.aid));
+      this._log.info(`authenticate success: aid=${result.aid} gateway=${gatewayUrl}`);
+      this._log.debug(`authenticate exit: elapsed=${Date.now() - tStart}ms aid=${aid ?? '-'}`);
+      return result;
+    } catch (err) {
+      this._log.error(`authenticate failed: aid=${aid ?? '-'} err=${err instanceof Error ? err.message : String(err)}`, err instanceof Error ? err : undefined);
+      this._log.debug(`authenticate exit (error): elapsed=${Date.now() - tStart}ms aid=${aid ?? '-'} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   async signAgentMd(content: string, opts?: AgentMdSignOptions): Promise<string> {
+    const tStart = Date.now();
     const client = this._internal;
     const targetAid = String(opts?.aid ?? client._aid ?? '').trim();
+    this._log.debug(`signAgentMd enter: aid=${targetAid || '-'} content_len=${content?.length ?? 0}`);
+    try {
     const identity = client._auth.loadIdentityOrNone(targetAid || undefined);
     if (!identity) {
+      this._log.error(`signAgentMd failed: no local identity for aid=${targetAid || '-'}`);
       throw new StateError('no local identity found, call auth.createAid() first');
     }
 
     const privateKeyPem = String(identity.private_key_pem ?? '').trim();
     const certPem = normalizeIdentityCertPem(identity);
     if (!privateKeyPem || !certPem) {
+      this._log.error(`signAgentMd failed: identity missing key/cert aid=${identity.aid ?? '-'}`);
       throw new StateError('local identity missing private key or certificate');
     }
 
@@ -317,6 +409,7 @@ export class AuthNamespace {
     const signature = signer.sign(privateKeyPem).toString('base64');
     const fingerprint = certificateSha256Fingerprint(certPem);
     if (!fingerprint) {
+      this._log.error(`signAgentMd failed: cert fingerprint computation failed aid=${identity.aid ?? '-'}`);
       throw new StateError('agent.md cert fingerprint failed');
     }
 
@@ -328,21 +421,34 @@ export class AuthNamespace {
       '-->',
     ].join('\n');
 
+    this._log.debug(`signAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid ?? '-'} fingerprint=${fingerprint.slice(0, 23)}...`);
     return payload + signedBlock;
+    } catch (err) {
+      this._log.debug(`signAgentMd exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   async verifyAgentMd(content: string, opts?: AgentMdVerifyOptions): Promise<AgentMdVerifyResult> {
+    const tStart = Date.now();
+    this._log.debug(`verifyAgentMd enter: aid_hint=${opts?.aid ?? '-'} content_len=${content?.length ?? 0}`);
+    try {
     const { payload, fields, parseError } = parseAgentMdTailSignature(String(content ?? ''));
     if (!fields) {
       if (!parseError) {
+        this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (unsigned)`);
         return agentMdResult('unsigned', payload);
       }
+      this._log.warn(`verifyAgentMd invalid: parse_error=${parseError}`);
+      this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (parse_error)`);
       return agentMdResult('invalid', payload, parseError);
     }
 
     let expectedAid = String(opts?.aid ?? '').trim();
     const payloadAid = extractAgentMDAid(payload);
     if (expectedAid && payloadAid && expectedAid !== payloadAid) {
+      this._log.warn(`verifyAgentMd invalid: aid_mismatch hint=${expectedAid} payload_aid=${payloadAid}`);
+      this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (aid_mismatch)`);
       return agentMdResult('invalid', payload, 'aid mismatch', payloadAid);
     }
     if (!expectedAid) {
@@ -352,15 +458,21 @@ export class AuthNamespace {
     let certPem = String(opts?.certPem ?? opts?.cert_pem ?? '').trim();
     if (!certPem) {
       if (!expectedAid) {
+        this._log.warn('verifyAgentMd invalid: aid required to verify agent.md');
+        this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (aid_required)`);
         return agentMdResult('invalid', payload, 'aid required to verify agent.md');
       }
       const fetchPeerCert = this._internal._fetchPeerCert;
       if (typeof fetchPeerCert !== 'function') {
+        this._log.warn(`verifyAgentMd invalid: client cannot fetch peer cert aid=${expectedAid}`);
+        this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (no_fetch_fn)`);
         return agentMdResult('invalid', payload, 'aid required to verify agent.md', expectedAid);
       }
       try {
         certPem = String(await fetchPeerCert(expectedAid, fields.cert_fingerprint)).trim();
       } catch (error) {
+        this._log.warn(`verifyAgentMd invalid: peer cert fetch failed aid=${expectedAid} err=${String(error)}`);
+        this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (cert_fetch_failed)`);
         return agentMdResult('invalid', payload, String(error), expectedAid, fields.cert_fingerprint);
       }
     }
@@ -369,21 +481,29 @@ export class AuthNamespace {
     try {
       cert = new X509Certificate(certPem);
     } catch (error) {
+      this._log.warn(`verifyAgentMd invalid: cert parse failed aid=${expectedAid || '-'} err=${String(error)}`);
+      this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (cert_parse_failed)`);
       return agentMdResult('invalid', payload, `invalid certificate: ${String(error)}`, expectedAid, fields.cert_fingerprint);
     }
 
     const actualFingerprint = certificateSha256Fingerprint(certPem);
     if (!actualFingerprint || actualFingerprint.toLowerCase() !== fields.cert_fingerprint.toLowerCase()) {
+      this._log.warn(`verifyAgentMd invalid: fingerprint_mismatch expected=${fields.cert_fingerprint} actual=${actualFingerprint}`);
+      this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (fingerprint_mismatch)`);
       return agentMdResult('invalid', payload, 'certificate fingerprint mismatch', expectedAid, fields.cert_fingerprint);
     }
 
     const cn = extractCommonName(cert.subject);
     if (expectedAid && cn && cn !== expectedAid) {
+      this._log.warn(`verifyAgentMd invalid: cert cn=${cn} aid=${expectedAid}`);
+      this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (cn_mismatch)`);
       return agentMdResult('invalid', payload, 'certificate aid mismatch', expectedAid, fields.cert_fingerprint);
     }
 
     const signature = Buffer.from(fields.signature, 'base64');
     if (!signature.length) {
+      this._log.warn(`verifyAgentMd invalid: empty signature aid=${expectedAid || '-'}`);
+      this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (empty_signature)`);
       return agentMdResult('invalid', payload, 'invalid signature', expectedAid, fields.cert_fingerprint);
     }
 
@@ -392,10 +512,17 @@ export class AuthNamespace {
     verifier.end();
     const ok = verifier.verify(cert.publicKey, signature);
     if (!ok) {
+      this._log.warn(`verifyAgentMd invalid: signature verification failed aid=${expectedAid || '-'}`);
+      this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (signature_failed)`);
       return agentMdResult('invalid', payload, 'signature verification failed', expectedAid, fields.cert_fingerprint, parseAgentMdTimestamp(fields.timestamp));
     }
 
+    this._log.debug(`verifyAgentMd exit: elapsed=${Date.now() - tStart}ms (verified) aid=${expectedAid || payloadAid}`);
     return agentMdResult('verified', payload, '', expectedAid || payloadAid, fields.cert_fingerprint, parseAgentMdTimestamp(fields.timestamp));
+    } catch (err) {
+      this._log.debug(`verifyAgentMd exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   private async _resolveAgentMdUrl(aid: string): Promise<string> {
@@ -454,6 +581,9 @@ export class AuthNamespace {
   }
 
   async uploadAgentMd(content: string): Promise<JsonObject> {
+    const tStart = Date.now();
+    this._log.debug(`uploadAgentMd enter: content_len=${content?.length ?? 0}`);
+    try {
     const client = this._internal;
     const auth = client._auth;
     const identity = auth.loadIdentityOrNone(client._aid ?? undefined);
@@ -490,10 +620,18 @@ export class AuthNamespace {
     if (!isJsonObject(payload)) {
       throw new AUNError('upload agent.md returned invalid JSON payload');
     }
+    this._log.debug(`uploadAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
     return payload;
+    } catch (err) {
+      this._log.debug(`uploadAgentMd exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   async downloadAgentMd(aid: string): Promise<string> {
+    const tStart = Date.now();
+    this._log.debug(`downloadAgentMd enter: aid=${aid}`);
+    try {
     const targetAid = String(aid ?? '').trim();
     if (!targetAid) {
       throw new ValidationError('downloadAgentMd requires non-empty aid');
@@ -514,31 +652,82 @@ export class AuthNamespace {
         `download agent.md failed: HTTP ${response.status}${message ? ` - ${message}` : ''}`,
       );
     }
-    return await response.text();
+    const text = await response.text();
+    this._log.debug(`downloadAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} bytes=${text.length}`);
+    return text;
+    } catch (err) {
+      this._log.debug(`downloadAgentMd exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 下载证书 */
   async downloadCert(params?: RpcParams): Promise<RpcResult> {
-    return await this._client.call('auth.download_cert', params ?? {});
+    const tStart = Date.now();
+    this._log.debug(`downloadCert enter`);
+    try {
+      const result = await this._client.call('auth.download_cert', params ?? {});
+      this._log.debug(`downloadCert exit: elapsed=${Date.now() - tStart}ms`);
+      return result;
+    } catch (err) {
+      this._log.debug(`downloadCert exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 请求签发证书 */
   async requestCert(params: RpcParams): Promise<RpcResult> {
-    return await this._client.call('auth.request_cert', params);
+    const tStart = Date.now();
+    this._log.debug(`requestCert enter`);
+    try {
+      const result = await this._client.call('auth.request_cert', params);
+      this._log.debug(`requestCert exit: elapsed=${Date.now() - tStart}ms`);
+      return result;
+    } catch (err) {
+      this._log.debug(`requestCert exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 续期证书 */
   async renewCert(params?: RpcParams): Promise<RpcResult> {
-    return await this._client.call('auth.renew_cert', params ?? {});
+    const tStart = Date.now();
+    this._log.debug(`renewCert enter`);
+    try {
+      const result = await this._client.call('auth.renew_cert', params ?? {});
+      this._log.debug(`renewCert exit: elapsed=${Date.now() - tStart}ms`);
+      return result;
+    } catch (err) {
+      this._log.debug(`renewCert exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 密钥轮换 */
   async rekey(params?: RpcParams): Promise<RpcResult> {
-    return await this._client.call('auth.rekey', params ?? {});
+    const tStart = Date.now();
+    this._log.debug(`rekey enter`);
+    try {
+      const result = await this._client.call('auth.rekey', params ?? {});
+      this._log.debug(`rekey exit: elapsed=${Date.now() - tStart}ms`);
+      return result;
+    } catch (err) {
+      this._log.debug(`rekey exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 获取信任根证书列表 */
   async trustRoots(params?: RpcParams): Promise<RpcResult> {
-    return await this._client.call('meta.trust_roots', params ?? {});
+    const tStart = Date.now();
+    this._log.debug(`trustRoots enter`);
+    try {
+      const result = await this._client.call('meta.trust_roots', params ?? {});
+      this._log.debug(`trustRoots exit: elapsed=${Date.now() - tStart}ms`);
+      return result;
+    } catch (err) {
+      this._log.debug(`trustRoots exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 }

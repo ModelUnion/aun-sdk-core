@@ -9,12 +9,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
+	"time"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -93,7 +93,16 @@ func isNilSeedBackup(backup SeedBackup) bool {
 }
 
 // Protect 保护明文数据（AES-256-GCM 加密）
-func (f *FileSecretStore) Protect(scope, name string, plaintext []byte) (map[string]any, error) {
+func (f *FileSecretStore) Protect(scope, name string, plaintext []byte) (record map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogSecretStore().Debug("Protect enter: scope=%s name=%s len=%d", scope, name, len(plaintext))
+	defer func() {
+		if err != nil {
+			pkgLogSecretStore().Debug("Protect exit (error): scope=%s name=%s elapsed=%dms err=%v", scope, name, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogSecretStore().Debug("Protect exit: scope=%s name=%s elapsed=%dms", scope, name, time.Since(tStart).Milliseconds())
+		}
+	}()
 	key := f.deriveKey(scope, name)
 
 	// 生成 12 字节随机 nonce
@@ -129,7 +138,16 @@ func (f *FileSecretStore) Protect(scope, name string, plaintext []byte) (map[str
 }
 
 // Reveal 还原被保护的数据（AES-256-GCM 解密）
-func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) ([]byte, error) {
+func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) (plaintext []byte, err error) {
+	tStart := time.Now()
+	pkgLogSecretStore().Debug("Reveal enter: scope=%s name=%s", scope, name)
+	defer func() {
+		if err != nil {
+			pkgLogSecretStore().Debug("Reveal exit (error): scope=%s name=%s elapsed=%dms err=%v", scope, name, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogSecretStore().Debug("Reveal exit: scope=%s name=%s len=%d elapsed=%dms", scope, name, len(plaintext), time.Since(tStart).Milliseconds())
+		}
+	}()
 	// 验证 scheme 和 name — 不匹配返回 nil,nil（表示"不是我的 record"）
 	if scheme, ok := record["scheme"].(string); !ok || scheme != "file_aes" {
 		return nil, nil
@@ -174,7 +192,7 @@ func (f *FileSecretStore) Reveal(scope, name string, record map[string]any) ([]b
 
 	// 拼接 ciphertext + tag（GCM Open 期望的格式）
 	sealed := append(ciphertext, tag...)
-	plaintext, err := aead.Open(nil, nonce, sealed, nil)
+	plaintext, err = aead.Open(nil, nonce, sealed, nil)
 	if err != nil {
 		return nil, fmt.Errorf("secretstore.Reveal: GCM 解密失败（数据可能损坏）: %w", err)
 	}
@@ -212,10 +230,10 @@ func loadOrCreateSeed(root string, backup SeedBackup) ([]byte, error) {
 		restored := backup.RestoreSeed()
 		if len(restored) > 0 {
 			source = "sqlite"
-			log.Printf("从 SQLite 恢复 .seed 文件")
+			pkgLogSecretStore().Warn("restoring .seed from SQLite")
 			// 恢复到文件系统
 			if err := os.WriteFile(seedPath, restored, 0o600); err != nil {
-				log.Printf("[WARN] 恢复 .seed 到文件失败: %v", err)
+				pkgLogSecretStore().Warn("restore .seed to file failed: %v", err)
 			}
 			if runtime.GOOS != "windows" {
 				_ = os.Chmod(seedPath, 0o600)

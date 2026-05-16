@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,24 +38,24 @@ func verifySignature(pub interface{}, sig, data []byte) error {
 	switch k := pub.(type) {
 	case ed25519.PublicKey:
 		if !ed25519.Verify(k, data, sig) {
-			return NewAuthError("ed25519 签名验证失败")
+			return NewAuthError("ed25519 signature verification failed")
 		}
 		return nil
 	case *ecdsa.PublicKey:
 		if k.Curve == elliptic.P384() {
 			h := sha512.Sum384(data)
 			if !ecdsa.VerifyASN1(k, h[:], sig) {
-				return NewAuthError("ECDSA P-384 签名验证失败")
+				return NewAuthError("ECDSA P-384 signature verification failed")
 			}
 		} else {
 			h := sha256.Sum256(data)
 			if !ecdsa.VerifyASN1(k, h[:], sig) {
-				return NewAuthError("ECDSA P-256 签名验证失败")
+				return NewAuthError("ECDSA P-256 signature verification failed")
 			}
 		}
 		return nil
 	default:
-		return NewAuthError(fmt.Sprintf("不支持的公钥类型: %T", pub))
+		return NewAuthError(fmt.Sprintf("unsupported public key type: %T", pub))
 	}
 }
 
@@ -165,8 +164,17 @@ func NewAuthFlow(cfg AuthFlowConfig) *AuthFlow {
 // ── 身份加载 ────────────────────────────────────────────────
 
 // LoadIdentity 加载本地身份信息（密钥 + 证书 + 元数据合并）
-func (a *AuthFlow) LoadIdentity(aid string) (map[string]any, error) {
-	identity, err := a.loadIdentityOrRaise(aid)
+func (a *AuthFlow) LoadIdentity(aid string) (identity map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("LoadIdentity enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("LoadIdentity exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("LoadIdentity exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
+	identity, err = a.loadIdentityOrRaise(aid)
 	if err != nil {
 		return nil, err
 	}
@@ -194,10 +202,14 @@ func (a *AuthFlow) LoadIdentity(aid string) (map[string]any, error) {
 
 // LoadIdentityOrNil 加载本地身份信息，不存在时返回 nil
 func (a *AuthFlow) LoadIdentityOrNil(aid string) map[string]any {
+	tStart := time.Now()
+	pkgLogAuth().Debug("LoadIdentityOrNil enter: aid=%s", aid)
 	identity, err := a.LoadIdentity(aid)
 	if err != nil {
+		pkgLogAuth().Debug("LoadIdentityOrNil exit (nil): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
 		return nil
 	}
+	pkgLogAuth().Debug("LoadIdentityOrNil exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
 	return identity
 }
 
@@ -237,8 +249,17 @@ func (a *AuthFlow) SetDeliveryMode(deliveryMode map[string]any) {
 
 // CreateAID 注册新 AID，返回 {aid, cert}。
 // 本地有密钥但无证书时，先尝试注册；若 AID 已存在则尝试下载证书恢复。
-func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
-	if err := validateAIDName(aid); err != nil {
+func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (result map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("CreateAID enter: aid=%s gateway=%s", aid, gatewayURL)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("CreateAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("CreateAID exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
+	if err = validateAIDName(aid); err != nil {
 		return nil, err
 	}
 	identity := a.ensureLocalIdentity(aid)
@@ -247,36 +268,39 @@ func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (map[s
 	}
 
 	// 本地有密钥但无证书 — 尝试服务端注册
-	created, err := a.createAIDRemote(ctx, gatewayURL, identity)
-	if err != nil {
+	created, createErr := a.createAIDRemote(ctx, gatewayURL, identity)
+	if createErr != nil {
 		// 优先检查结构化错误码：4090/409 = Conflict（AID 已存在）
 		var aunErr *AUNError
 		isConflict := false
-		if errors.As(err, &aunErr) {
+		if errors.As(createErr, &aunErr) {
 			isConflict = aunErr.Code == 4090 || aunErr.Code == 409
 		}
 		// 降级：兼容旧版服务端的字符串匹配
 		if !isConflict {
-			isConflict = strings.Contains(err.Error(), "already exists")
+			isConflict = strings.Contains(createErr.Error(), "already exists")
 		}
 		if isConflict {
 			recovered, recoverErr := a.recoverCertViaDownload(ctx, gatewayURL, identity)
 			if recoverErr != nil {
-				return nil, NewStateError(fmt.Sprintf(
+				err = NewStateError(fmt.Sprintf(
 					"AID %s already registered on server but local certificate is missing. "+
 						"Certificate download recovery failed. Options: "+
 						"(1) use a different AID name, or "+
 						"(2) restart Kite server to clear registration.", aid))
+				return nil, err
 			}
 			identity = recovered
 		} else {
+			err = createErr
 			return nil, err
 		}
 	} else {
 		identity["cert"] = created["cert"]
 	}
 
-	if err := a.persistIdentity(identity); err != nil {
+	if persistErr := a.persistIdentity(identity); persistErr != nil {
+		err = persistErr
 		return nil, err
 	}
 	a.aid = authGetStr(identity, "aid")
@@ -286,16 +310,69 @@ func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (map[s
 // ── 认证流程 ────────────────────────────────────────────────
 
 // Authenticate 两阶段认证（login1 + login2），返回 {aid, access_token, refresh_token, expires_at, gateway}
-func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid string) (map[string]any, error) {
+func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid string) (result map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("Authenticate enter: aid=%s gateway=%s", aid, gatewayURL)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("Authenticate exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("Authenticate exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	identity, err := a.loadIdentityOrRaise(aid)
 	if err != nil {
+		pkgLogAuth().Error("failed to load identity: aid=%s err=%v", aid, err)
 		return nil, err
+	}
+
+	// 优先复用 keystore 里的 cached access_token（未过期且有 refresh_token）
+	// 避免每次调 Authenticate 都走两阶段重登的网络往返；与 Python SDK
+	// auth.py:authenticate 的快速路径对齐。
+	//
+	// 注意：loadIdentityOrRaise 走的是 keystore.LoadIdentity → tokens 表，
+	// 但 persistIdentity 在 deviceID 非空时会把 token 写到 instance_state
+	// （不是 tokens 表）。所以这里需要主动加载 instance_state 才能拿到 token。
+	identityWithState := identity
+	if a.deviceID != "" {
+		if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+			resolvedAID := authGetStr(identity, "aid")
+			if resolvedAID == "" {
+				resolvedAID = aid
+			}
+			if instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID); len(instanceState) > 0 {
+				merged := make(map[string]any, len(identity)+len(instanceState))
+				for k, v := range identity {
+					merged[k] = v
+				}
+				for k, v := range instanceState {
+					merged[k] = v
+				}
+				identityWithState = merged
+			}
+		}
+	}
+	if cachedToken := authGetCachedAccessToken(identityWithState); cachedToken != "" {
+		if cachedRefresh := authGetStr(identityWithState, "refresh_token"); cachedRefresh != "" {
+			pkgLogAuth().Debug("Authenticate reusing cached token: aid=%s expires_at=%v",
+				authGetStr(identityWithState, "aid"), identityWithState["access_token_expires_at"])
+			a.aid = authGetStr(identityWithState, "aid")
+			return map[string]any{
+				"aid":           identityWithState["aid"],
+				"access_token":  cachedToken,
+				"refresh_token": cachedRefresh,
+				"expires_at":    identityWithState["access_token_expires_at"],
+				"gateway":       gatewayURL,
+			}, nil
+		}
 	}
 
 	// 本地有密钥但无证书 — 尝试从 PKI 下载恢复
 	if authGetStr(identity, "cert") == "" {
+		pkgLogAuth().Warn("local certificate missing, attempting PKI download recovery: aid=%s", authGetStr(identity, "aid"))
 		recovered, recoverErr := a.recoverCertViaDownload(ctx, gatewayURL, identity)
 		if recoverErr != nil {
+			pkgLogAuth().Error("certificate recovery failed: aid=%s err=%v", authGetStr(identity, "aid"), recoverErr)
 			return nil, NewStateError(fmt.Sprintf(
 				"local certificate missing and recovery failed: %v. "+
 					"Run auth.create_aid() to register a new identity.", recoverErr))
@@ -310,9 +387,10 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 	if err != nil {
 		// 证书未在服务端注册或公钥不匹配 — 自动重新注册
 		if strings.Contains(err.Error(), "not registered") || strings.Contains(err.Error(), "public key mismatch") {
-			log.Printf("[auth] 证书未在服务端注册，自动重新注册: aid=%s", authGetStr(identity, "aid"))
+			pkgLogAuth().Warn("certificate not registered on server, auto re-registering: aid=%s", authGetStr(identity, "aid"))
 			created, createErr := a.createAIDRemote(ctx, gatewayURL, identity)
 			if createErr != nil {
+				pkgLogAuth().Error("auto re-registration failed: aid=%s err=%v", authGetStr(identity, "aid"), createErr)
 				return nil, err
 			}
 			identity["cert"] = created["cert"]
@@ -321,9 +399,11 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 			}
 			login, err = a.login(ctx, gatewayURL, identity)
 			if err != nil {
+				pkgLogAuth().Error("login still failed after re-registration: aid=%s err=%v", authGetStr(identity, "aid"), err)
 				return nil, err
 			}
 		} else {
+			pkgLogAuth().Error("login failed: aid=%s err=%v", authGetStr(identity, "aid"), err)
 			return nil, err
 		}
 	}
@@ -334,6 +414,7 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 		return nil, err
 	}
 	a.aid = authGetStr(identity, "aid")
+	pkgLogAuth().Debug("two-phase authentication succeeded: aid=%s", a.aid)
 	return map[string]any{
 		"aid":           identity["aid"],
 		"access_token":  identity["access_token"],
@@ -344,7 +425,16 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 }
 
 // EnsureAuthenticated 确保已认证（复用缓存 token 或重新认证）
-func (a *AuthFlow) EnsureAuthenticated(ctx context.Context, gatewayURL string) (map[string]any, error) {
+func (a *AuthFlow) EnsureAuthenticated(ctx context.Context, gatewayURL string) (result map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("EnsureAuthenticated enter: aid=%s gateway=%s", a.aid, gatewayURL)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("EnsureAuthenticated exit (error): aid=%s elapsed=%dms err=%v", a.aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("EnsureAuthenticated exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	identity := a.ensureIdentity()
 
 	if authGetStr(identity, "cert") == "" {
@@ -385,15 +475,29 @@ func (a *AuthFlow) EnsureAuthenticated(ctx context.Context, gatewayURL string) (
 // ── Token 刷新 ──────────────────────────────────────────────
 
 // RefreshCachedTokens 使用 refresh_token 刷新 access_token
-func (a *AuthFlow) RefreshCachedTokens(ctx context.Context, gatewayURL string, identity map[string]any) (map[string]any, error) {
+func (a *AuthFlow) RefreshCachedTokens(ctx context.Context, gatewayURL string, identity map[string]any) (out map[string]any, err error) {
+	tStart := time.Now()
+	aid := authGetStr(identity, "aid")
+	pkgLogAuth().Debug("RefreshCachedTokens enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("RefreshCachedTokens exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("RefreshCachedTokens exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	refreshToken := authGetStr(identity, "refresh_token")
 	if refreshToken == "" {
+		pkgLogAuth().Error("token refresh failed: missing refresh_token: aid=%s", authGetStr(identity, "aid"))
 		return nil, NewAuthError("missing refresh_token")
 	}
+	pkgLogAuth().Debug("refreshing access_token: aid=%s", authGetStr(identity, "aid"))
 	refreshed, err := a.refreshAccessToken(ctx, gatewayURL, refreshToken)
 	if err != nil {
+		pkgLogAuth().Error("token refresh failed: aid=%s err=%v", authGetStr(identity, "aid"), err)
 		return nil, err
 	}
+	pkgLogAuth().Debug("token refresh succeeded: aid=%s", authGetStr(identity, "aid"))
 	authRememberTokens(identity, refreshed)
 	a.validateNewCert(ctx, identity, gatewayURL)
 	syncActiveCert(identity)
@@ -406,12 +510,22 @@ func (a *AuthFlow) RefreshCachedTokens(ctx context.Context, gatewayURL string, i
 // ── 会话初始化 ──────────────────────────────────────────────
 
 // InitializeWithToken 使用已有 token 初始化会话
-func (a *AuthFlow) InitializeWithToken(ctx context.Context, transport *RPCTransport, challenge map[string]any, accessToken string) error {
+func (a *AuthFlow) InitializeWithToken(ctx context.Context, transport *RPCTransport, challenge map[string]any, accessToken string, connectionKind string, shortTtlMs int, extraInfo map[string]any) (err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("InitializeWithToken enter: aid=%s kind=%s", a.aid, connectionKind)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("InitializeWithToken exit (error): aid=%s elapsed=%dms err=%v", a.aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("InitializeWithToken exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	nonce := authExtractChallengeNonce(challenge)
 	if nonce == "" {
-		return NewAuthError("gateway challenge missing nonce")
+		err = NewAuthError("gateway challenge missing nonce")
+		return err
 	}
-	return a.initializeSession(ctx, transport, nonce, accessToken)
+	return a.initializeSession(ctx, transport, nonce, accessToken, connectionKind, shortTtlMs, extraInfo)
 }
 
 // ConnectSession 连接会话（多策略自动选择认证方式）。
@@ -422,9 +536,22 @@ func (a *AuthFlow) ConnectSession(
 	challenge map[string]any,
 	gatewayURL string,
 	accessToken string,
-) (map[string]any, error) {
+	connectionKind string,
+	shortTtlMs int,
+	extraInfo map[string]any,
+) (result map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("ConnectSession enter: aid=%s gateway=%s kind=%s", a.aid, gatewayURL, connectionKind)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("ConnectSession exit (error): aid=%s elapsed=%dms err=%v", a.aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("ConnectSession exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	nonce := authExtractChallengeNonce(challenge)
 	if nonce == "" {
+		pkgLogAuth().Error("ConnectSession failed: challenge missing nonce")
 		return nil, NewAuthError("gateway challenge missing nonce")
 	}
 
@@ -432,26 +559,31 @@ func (a *AuthFlow) ConnectSession(
 
 	// 策略 1：显式 token
 	if accessToken != "" && identity != nil {
-		if err := a.initializeSession(ctx, transport, nonce, accessToken); err == nil {
+		pkgLogAuth().Debug("ConnectSession strategy 1: using explicit token: aid=%s", a.aid)
+		if err := a.initializeSession(ctx, transport, nonce, accessToken, connectionKind, shortTtlMs, extraInfo); err == nil {
 			identity["access_token"] = accessToken
 			// H24: 持久化失败不能静默吞；打 ERROR 日志，调用方可以主动检查 GetLastPersistError
 			if perr := a.persistIdentity(identity); perr != nil {
-				log.Printf("[aun_core.auth] ERROR persistIdentity(explicit_token) 失败: %v", perr)
+				pkgLogAuth().Warn("[aun_core.auth] ERROR persistIdentity(explicit_token) failed: %v", perr)
 				a.lastPersistErr = perr
 			}
+			pkgLogAuth().Debug("ConnectSession strategy 1 succeeded: aid=%s", a.aid)
 			return map[string]any{"token": accessToken, "identity": identity}, nil
 		}
-		log.Printf("explicit_token 认证失败，尝试下一方式")
+		pkgLogAuth().Warn("explicit_token auth failed, trying next method")
 	}
 
 	// 无本地身份：完整注册+认证
 	if identity == nil {
+		pkgLogAuth().Debug("ConnectSession no local identity, performing full registration+auth")
 		authContext, err := a.EnsureAuthenticated(ctx, gatewayURL)
 		if err != nil {
+			pkgLogAuth().Error("ConnectSession EnsureAuthenticated failed: err=%v", err)
 			return nil, err
 		}
 		token := authGetStr(authContext, "token")
-		if err := a.initializeSession(ctx, transport, nonce, token); err != nil {
+		if err := a.initializeSession(ctx, transport, nonce, token, connectionKind, shortTtlMs, extraInfo); err != nil {
+			pkgLogAuth().Error("ConnectSession initializeSession failed: err=%v", err)
 			return nil, err
 		}
 		return authContext, nil
@@ -460,37 +592,46 @@ func (a *AuthFlow) ConnectSession(
 	// 策略 2：缓存的 access_token
 	cachedToken := authGetCachedAccessToken(identity)
 	if cachedToken != "" {
-		if err := a.initializeSession(ctx, transport, nonce, cachedToken); err == nil {
+		pkgLogAuth().Debug("ConnectSession strategy 2: using cached access_token: aid=%s", a.aid)
+		if err := a.initializeSession(ctx, transport, nonce, cachedToken, connectionKind, shortTtlMs, extraInfo); err == nil {
+			pkgLogAuth().Debug("ConnectSession strategy 2 succeeded: aid=%s", a.aid)
 			return map[string]any{"token": cachedToken, "identity": identity}, nil
 		}
-		log.Printf("cached_token 认证失败，尝试刷新")
+		pkgLogAuth().Warn("cached_token auth failed, trying refresh")
 	}
 
 	// 策略 3：refresh_token → 新 access_token
 	if refreshToken := authGetStr(identity, "refresh_token"); refreshToken != "" {
+		pkgLogAuth().Debug("ConnectSession strategy 3: using refresh_token: aid=%s", a.aid)
 		if refreshedIdentity, err := a.RefreshCachedTokens(ctx, gatewayURL, identity); err == nil {
 			identity = refreshedIdentity
 			if newToken := authGetCachedAccessToken(identity); newToken != "" {
-				if err := a.initializeSession(ctx, transport, nonce, newToken); err == nil {
+				if err := a.initializeSession(ctx, transport, nonce, newToken, connectionKind, shortTtlMs, extraInfo); err == nil {
+					pkgLogAuth().Debug("ConnectSession strategy 3 succeeded: aid=%s", a.aid)
 					return map[string]any{"token": newToken, "identity": identity}, nil
 				}
 			}
 		}
-		log.Printf("refresh_token 认证失败，将重新登录")
+		pkgLogAuth().Warn("refresh_token auth failed, will re-login")
 	}
 
 	// 策略 4：完整重认证
+	pkgLogAuth().Debug("ConnectSession strategy 4: full re-authentication: aid=%s", a.aid)
 	loginResult, err := a.Authenticate(ctx, gatewayURL, authGetStr(identity, "aid"))
 	if err != nil {
+		pkgLogAuth().Error("ConnectSession strategy 4 full re-authentication failed: aid=%s err=%v", a.aid, err)
 		return nil, err
 	}
 	token := authGetStr(loginResult, "access_token")
 	if token == "" {
+		pkgLogAuth().Error("ConnectSession auth did not return access_token: aid=%s", a.aid)
 		return nil, NewAuthError("authenticate did not return access_token")
 	}
-	if err := a.initializeSession(ctx, transport, nonce, token); err != nil {
+	if err := a.initializeSession(ctx, transport, nonce, token, connectionKind, shortTtlMs, extraInfo); err != nil {
+		pkgLogAuth().Error("ConnectSession initializeSession failed: aid=%s err=%v", a.aid, err)
 		return nil, err
 	}
+	pkgLogAuth().Debug("ConnectSession strategy 4 succeeded: aid=%s", a.aid)
 	identity, _ = a.LoadIdentity(authGetStr(identity, "aid"))
 	return map[string]any{"token": token, "identity": identity}, nil
 }
@@ -499,35 +640,48 @@ func (a *AuthFlow) ConnectSession(
 
 // VerifyPeerCertificate 验证对端证书（链 + CRL + OCSP + AID 绑定）。
 // certPEM 为 PEM 编码的证书字节。
-func (a *AuthFlow) VerifyPeerCertificate(ctx context.Context, gatewayURL string, certPEM []byte, expectedAID string) error {
-	cert, err := authParsePEMCertificate(string(certPEM))
-	if err != nil {
-		return NewAuthError(fmt.Sprintf("failed to parse peer certificate: %v", err))
+func (a *AuthFlow) VerifyPeerCertificate(ctx context.Context, gatewayURL string, certPEM []byte, expectedAID string) (err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("VerifyPeerCertificate enter: aid=%s gateway=%s", expectedAID, gatewayURL)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("VerifyPeerCertificate exit (error): aid=%s elapsed=%dms err=%v", expectedAID, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("VerifyPeerCertificate exit: aid=%s elapsed=%dms", expectedAID, time.Since(tStart).Milliseconds())
+		}
+	}()
+	cert, parseErr := authParsePEMCertificate(string(certPEM))
+	if parseErr != nil {
+		err = NewAuthError(fmt.Sprintf("failed to parse peer certificate: %v", parseErr))
+		return err
 	}
 
 	now := time.Now()
-	if err := authEnsureCertTimeValid(cert, "peer certificate", now); err != nil {
+	if err = authEnsureCertTimeValid(cert, "peer certificate", now); err != nil {
 		return err
 	}
-	if err := a.verifyAuthCertChain(ctx, gatewayURL, cert, expectedAID); err != nil {
+	if err = a.verifyAuthCertChain(ctx, gatewayURL, cert, expectedAID); err != nil {
 		return err
 	}
-	if err := a.verifyAuthCertRevocation(ctx, gatewayURL, cert, expectedAID); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
-			return NewAuthError(fmt.Sprintf("peer cert CRL check failed: %v", err))
+	if revErr := a.verifyAuthCertRevocation(ctx, gatewayURL, cert, expectedAID); revErr != nil {
+		if strings.Contains(strings.ToLower(revErr.Error()), "revoked") {
+			err = NewAuthError(fmt.Sprintf("peer cert CRL check failed: %v", revErr))
+			return err
 		}
-		log.Printf("[auth] CRL 检查不可用，降级继续: %v", err)
+		pkgLogAuth().Warn("CRL check unavailable, degrading gracefully: %v", revErr)
 	}
-	if err := a.verifyAuthCertOCSP(ctx, gatewayURL, cert, expectedAID); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
-			return NewAuthError(fmt.Sprintf("peer cert OCSP check failed: %v", err))
+	if ocspErr := a.verifyAuthCertOCSP(ctx, gatewayURL, cert, expectedAID); ocspErr != nil {
+		if strings.Contains(strings.ToLower(ocspErr.Error()), "revoked") {
+			err = NewAuthError(fmt.Sprintf("peer cert OCSP check failed: %v", ocspErr))
+			return err
 		}
-		log.Printf("[auth] OCSP 检查不可用，降级继续: %v", err)
+		pkgLogAuth().Warn("OCSP check unavailable, degrading gracefully: %v", ocspErr)
 	}
 	// CN 必须匹配 expectedAID
 	if cert.Subject.CommonName != expectedAID {
-		return NewAuthError(fmt.Sprintf(
+		err = NewAuthError(fmt.Sprintf(
 			"peer cert CN mismatch: expected %s, got %s", expectedAID, cert.Subject.CommonName))
+		return err
 	}
 	return nil
 }
@@ -539,7 +693,7 @@ func (a *AuthFlow) VerifyPeerCertificate(ctx context.Context, gatewayURL string,
 func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method string, params map[string]any) (map[string]any, error) {
 	conn, err := a.dialWebSocket(ctx, gatewayURL)
 	if err != nil {
-		return nil, NewConnectionError(fmt.Sprintf("shortRPC 连接失败: %v", err))
+		return nil, NewConnectionError(fmt.Sprintf("shortRPC connection failed: %v", err))
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
@@ -547,7 +701,7 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 	rCtx, rCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer rCancel()
 	if _, _, err = conn.Read(rCtx); err != nil {
-		return nil, NewConnectionError(fmt.Sprintf("shortRPC 接收 challenge 失败: %v", err))
+		return nil, NewConnectionError(fmt.Sprintf("shortRPC failed to receive challenge: %v", err))
 	}
 
 	// 发送 JSON-RPC 请求
@@ -559,12 +713,12 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 	}
 	data, err := json.Marshal(request)
 	if err != nil {
-		return nil, NewSerializationError(fmt.Sprintf("shortRPC 序列化请求失败: %v", err))
+		return nil, NewSerializationError(fmt.Sprintf("shortRPC failed to serialize request: %v", err))
 	}
 	wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wCancel()
 	if err := conn.Write(wCtx, websocket.MessageText, data); err != nil {
-		return nil, NewConnectionError(fmt.Sprintf("shortRPC 发送请求失败: %v", err))
+		return nil, NewConnectionError(fmt.Sprintf("shortRPC failed to send request: %v", err))
 	}
 
 	// 接收响应
@@ -572,12 +726,12 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 	defer rCancel2()
 	_, respData, err := conn.Read(rCtx2)
 	if err != nil {
-		return nil, NewConnectionError(fmt.Sprintf("shortRPC 接收响应失败: %v", err))
+		return nil, NewConnectionError(fmt.Sprintf("shortRPC failed to receive response: %v", err))
 	}
 
 	var message map[string]any
 	if err := json.Unmarshal(respData, &message); err != nil {
-		return nil, NewSerializationError("shortRPC 响应不是有效 JSON")
+		return nil, NewSerializationError("shortRPC response is not valid JSON")
 	}
 
 	if errData, ok := message["error"]; ok {
@@ -641,32 +795,52 @@ func (a *AuthFlow) createAIDRemote(ctx context.Context, gatewayURL string, ident
 // ── 内部：两阶段登录 ───────────────────────────────────────
 
 // login 两阶段登录：login1 发送 aid+cert+client_nonce，验证 phase1 响应后 login2 发送签名。
-func (a *AuthFlow) login(ctx context.Context, gatewayURL string, identity map[string]any) (map[string]any, error) {
+func (a *AuthFlow) login(ctx context.Context, gatewayURL string, identity map[string]any) (result map[string]any, err error) {
+	tStart := time.Now()
 	clientNonce := a.crypto.NewClientNonce()
+	aid := authGetStr(identity, "aid")
+	pkgLogAuth().Debug("login enter: aid=%s gateway=%s", aid, gatewayURL)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("login exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("login exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 
 	// Phase 1
+	tLogin1 := time.Now()
+	pkgLogAuth().Debug("login1 enter: aid=%s", aid)
 	phase1, err := a.shortRPC(ctx, gatewayURL, "auth.aid_login1", map[string]any{
 		"aid":          identity["aid"],
 		"cert":         identity["cert"],
 		"client_nonce": clientNonce,
 	})
 	if err != nil {
+		pkgLogAuth().Debug("login1 exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tLogin1).Milliseconds(), err)
+		pkgLogAuth().Error("login1 failed: aid=%s err=%v", aid, err)
 		return nil, err
 	}
+	pkgLogAuth().Debug("login1 exit: aid=%s elapsed=%dms", aid, time.Since(tLogin1).Milliseconds())
 
 	// 验证 phase1 响应
-	if err := a.verifyPhase1Response(ctx, gatewayURL, phase1, clientNonce); err != nil {
+	if err = a.verifyPhase1Response(ctx, gatewayURL, phase1, clientNonce); err != nil {
+		pkgLogAuth().Error("phase1 response verification failed: aid=%s err=%v", aid, err)
 		return nil, err
 	}
 
 	// Phase 2
 	nonce := authGetStr(phase1, "nonce")
 	privateKeyPEM := authGetStr(identity, "private_key_pem")
-	signature, clientTime, err := a.crypto.SignLoginNonce(privateKeyPEM, nonce, "")
-	if err != nil {
-		return nil, NewAuthError(fmt.Sprintf("签名 login nonce 失败: %v", err))
+	signature, clientTime, signErr := a.crypto.SignLoginNonce(privateKeyPEM, nonce, "")
+	if signErr != nil {
+		pkgLogAuth().Error("failed to sign login nonce: aid=%s err=%v", aid, signErr)
+		err = NewAuthError(fmt.Sprintf("failed to sign login nonce: %v", signErr))
+		return nil, err
 	}
 
+	tLogin2 := time.Now()
+	pkgLogAuth().Debug("login2 enter: aid=%s", aid)
 	phase2, err := a.shortRPC(ctx, gatewayURL, "auth.aid_login2", map[string]any{
 		"aid":         identity["aid"],
 		"request_id":  phase1["request_id"],
@@ -675,14 +849,26 @@ func (a *AuthFlow) login(ctx context.Context, gatewayURL string, identity map[st
 		"signature":   signature,
 	})
 	if err != nil {
+		pkgLogAuth().Debug("login2 exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tLogin2).Milliseconds(), err)
+		pkgLogAuth().Error("login2 failed: aid=%s err=%v", aid, err)
 		return nil, err
 	}
+	pkgLogAuth().Debug("login2 exit: aid=%s elapsed=%dms", aid, time.Since(tLogin2).Milliseconds())
 	return phase2, nil
 }
 
 // refreshAccessToken 通过 shortRPC 刷新 access_token
-func (a *AuthFlow) refreshAccessToken(ctx context.Context, gatewayURL string, refreshToken string) (map[string]any, error) {
-	result, err := a.shortRPC(ctx, gatewayURL, "auth.refresh_token", map[string]any{
+func (a *AuthFlow) refreshAccessToken(ctx context.Context, gatewayURL string, refreshToken string) (result map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("refreshAccessToken enter: aid=%s", a.aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("refreshAccessToken exit (error): aid=%s elapsed=%dms err=%v", a.aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("refreshAccessToken exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
+		}
+	}()
+	result, err = a.shortRPC(ctx, gatewayURL, "auth.refresh_token", map[string]any{
 		"refresh_token": refreshToken,
 	})
 	if err != nil {
@@ -694,7 +880,8 @@ func (a *AuthFlow) refreshAccessToken(ctx context.Context, gatewayURL string, re
 			if e, ok := result["error"].(string); ok {
 				errMsg = e
 			}
-			return nil, NewAuthError(errMsg)
+			err = NewAuthError(errMsg)
+			return nil, err
 		}
 	}
 	return result, nil
@@ -727,14 +914,14 @@ func (a *AuthFlow) verifyPhase1Response(ctx context.Context, gatewayURL string, 
 		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
 			return err
 		}
-		log.Printf("[auth] CRL 检查不可用，降级继续: %v", err)
+		pkgLogAuth().Warn("CRL check unavailable, degrading gracefully: %v", err)
 	}
 	// OCSP 验证
 	if err := a.verifyAuthCertOCSP(ctx, gatewayURL, authCert, ""); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "revoked") {
 			return err
 		}
-		log.Printf("[auth] OCSP 检查不可用，降级继续: %v", err)
+		pkgLogAuth().Warn("OCSP check unavailable, degrading gracefully: %v", err)
 	}
 
 	// 验证 client_nonce 签名
@@ -1134,8 +1321,17 @@ func (a *AuthFlow) fetchGatewayOCSPStatus(ctx context.Context, gatewayURL string
 // ── 内部：会话初始化 ────────────────────────────────────────
 
 // initializeSession 通过 auth.connect RPC 初始化会话
-func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTransport, nonce string, token string) error {
-	result, err := transport.Call(ctx, "auth.connect", map[string]any{
+func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTransport, nonce string, token string, connectionKind string, shortTtlMs int, extraInfo map[string]any) (err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("initializeSession enter: aid=%s deviceID=%s kind=%s", a.aid, a.deviceID, connectionKind)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("initializeSession exit (error): aid=%s elapsed=%dms err=%v", a.aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("initializeSession exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
+		}
+	}()
+	request := map[string]any{
 		"nonce": nonce,
 		"auth": map[string]any{
 			"method": "kite_token",
@@ -1157,7 +1353,20 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 			"e2ee":       true,
 			"group_e2ee": true,
 		},
-	})
+	}
+	// 长短连接选项：默认 long 时不写入 options（保持 wire 兼容）
+	if connectionKind == "short" {
+		opts := map[string]any{"kind": "short"}
+		if shortTtlMs > 0 {
+			opts["short_ttl_ms"] = shortTtlMs
+		}
+		request["options"] = opts
+	}
+	// extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
+	if len(extraInfo) > 0 {
+		request["extra_info"] = extraInfo
+	}
+	result, err := transport.Call(ctx, "auth.connect", request)
 	if err != nil {
 		return err
 	}
@@ -1191,13 +1400,13 @@ func (a *AuthFlow) validateNewCert(ctx context.Context, identity map[string]any,
 
 	cert, err := authParsePEMCertificate(pemStr)
 	if err != nil {
-		log.Printf("拒绝服务端返回的 new_cert (%s): 解析失败 %v", aid, err)
+		pkgLogAuth().Error("rejected server new_cert (%s): parse failed %v", aid, err)
 		return
 	}
 
 	// 1. CN 匹配
 	if cert.Subject.CommonName != aid {
-		log.Printf("拒绝服务端返回的 new_cert (%s): CN mismatch expected %s got %s",
+		pkgLogAuth().Error("rejected server new_cert (%s): CN mismatch expected %s got %s",
 			aid, aid, cert.Subject.CommonName)
 		return
 	}
@@ -1205,44 +1414,44 @@ func (a *AuthFlow) validateNewCert(ctx context.Context, identity map[string]any,
 	// 2. 公钥匹配
 	certPubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
 	if err != nil {
-		log.Printf("拒绝服务端返回的 new_cert (%s): 公钥序列化失败", aid)
+		pkgLogAuth().Error("rejected server new_cert (%s): failed to serialize public key", aid)
 		return
 	}
 	localPubB64 := authGetStr(identity, "public_key_der_b64")
 	if localPubB64 != "" {
 		localPubDER, err := base64.StdEncoding.DecodeString(localPubB64)
 		if err == nil && !authBytesEqual(certPubDER, localPubDER) {
-			log.Printf("拒绝服务端返回的 new_cert (%s): 公钥不匹配本地密钥", aid)
+			pkgLogAuth().Error("rejected server new_cert (%s): public key does not match local key", aid)
 			return
 		}
 	}
 
 	// 3. 时间有效性
 	if err := authEnsureCertTimeValid(cert, "new_cert", time.Now()); err != nil {
-		log.Printf("拒绝服务端返回的 new_cert (%s): %v", aid, err)
+		pkgLogAuth().Error("rejected server new_cert (%s): %v", aid, err)
 		return
 	}
 
 	// 4. 完整链验证 + CRL + OCSP
 	if gatewayURL != "" {
 		if err := a.verifyAuthCertChain(ctx, gatewayURL, cert, ""); err != nil {
-			log.Printf("拒绝服务端返回的 new_cert (%s): 链验证失败 %v", aid, err)
+			pkgLogAuth().Error("rejected server new_cert (%s): chain verification failed %v", aid, err)
 			return
 		}
 		if err := a.verifyAuthCertRevocation(ctx, gatewayURL, cert, ""); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "revoked") {
-				log.Printf("拒绝服务端返回的 new_cert (%s): CRL 验证失败 %v", aid, err)
+				pkgLogAuth().Error("rejected server new_cert (%s): CRL verification failed %v", aid, err)
 				return
 			}
-			log.Printf("[auth] CRL 检查不可用，降级继续: %v", err)
+			pkgLogAuth().Warn("CRL check unavailable, degrading gracefully: %v", err)
 		}
 		// OCSP 不可用时降级
 		if err := a.verifyAuthCertOCSP(ctx, gatewayURL, cert, ""); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "revoked") {
-				log.Printf("拒绝服务端返回的 new_cert (%s): OCSP 验证失败 %v", aid, err)
+				pkgLogAuth().Error("rejected server new_cert (%s): OCSP verification failed %v", aid, err)
 				return
 			}
-			log.Printf("[auth] OCSP 检查不可用，降级继续: %v", err)
+			pkgLogAuth().Warn("OCSP check unavailable, degrading gracefully: %v", err)
 		}
 	}
 
@@ -1264,7 +1473,7 @@ func syncActiveCert(identity map[string]any) {
 	aid := authGetStr(identity, "aid")
 	cert, err := authParsePEMCertificate(pemStr)
 	if err != nil {
-		log.Printf("[auth] active_cert 同步异常 (%s): %v", aid, err)
+		pkgLogAuth().Warn("active_cert sync error (%s): %v", aid, err)
 		return
 	}
 	certPubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
@@ -1282,7 +1491,7 @@ func syncActiveCert(identity map[string]any) {
 	if authBytesEqual(certPubDER, localPubDER) {
 		identity["cert"] = pemStr
 	} else {
-		log.Printf("[auth] 服务端 active_cert 公钥与本地私钥不匹配，拒绝同步 (aid=%s)", aid)
+		pkgLogAuth().Error("server active_cert public key does not match local private key, rejecting sync (aid=%s)", aid)
 	}
 }
 
@@ -1291,6 +1500,7 @@ func syncActiveCert(identity map[string]any) {
 // recoverCertViaDownload 本地有密钥但无证书、服务端已注册 — 通过 PKI HTTP 端点下载证书恢复。
 func (a *AuthFlow) recoverCertViaDownload(ctx context.Context, gatewayURL string, identity map[string]any) (map[string]any, error) {
 	aid := authGetStr(identity, "aid")
+	pkgLogAuth().Debug("recoverCertViaDownload entry: aid=%s gateway=%s", aid, gatewayURL)
 	certURL := authGatewayHTTPURL(gatewayURL, fmt.Sprintf("/pki/cert/%s", aid))
 	certPEM, err := a.fetchText(ctx, certURL)
 	if err != nil {
@@ -1395,21 +1605,42 @@ func validateAIDName(aid string) error {
 	return nil
 }
 
-// ensureLocalIdentity 确保本地有指定 AID 的密钥对（无则生成）
+// ensureLocalIdentity 确保本地有指定 AID 的密钥对（无则生成）。
+//
+// 必须确认有 keypair（private_key_pem + public_key_der_b64）才算"已存在"，
+// 否则 keystore 可能只有 metadata（如 gateway_url）但没有真正的密钥材料。
+// 与 Python SDK auth.py:_ensure_local_identity 对齐。
 func (a *AuthFlow) ensureLocalIdentity(aid string) map[string]any {
 	existing, _ := a.keystore.LoadIdentity(aid)
 	if existing != nil {
-		a.aid = aid
-		return existing
+		// 必须同时有 private_key_pem 和 public_key_der_b64 才算"真已存在"
+		hasPriv := authGetStr(existing, "private_key_pem") != ""
+		hasPub := authGetStr(existing, "public_key_der_b64") != ""
+		if hasPriv && hasPub {
+			a.aid = aid
+			return existing
+		}
 	}
 	identity, err := a.crypto.GenerateIdentity()
 	if err != nil {
 		return map[string]any{"aid": aid}
 	}
 	identity["aid"] = aid
+	// 保留 keystore 已有的 metadata（如 gateway_url），避免覆盖
+	if existing != nil {
+		for k, v := range existing {
+			if k == "aid" {
+				continue
+			}
+			if _, exists := identity[k]; exists {
+				continue
+			}
+			identity[k] = v
+		}
+	}
 	// H24: 持久化失败不能静默吞
 	if perr := a.persistIdentity(identity); perr != nil {
-		log.Printf("[aun_core.auth] ERROR persistIdentity 失败 aid=%s: %v", aid, perr)
+		pkgLogAuth().Warn("[aun_core.auth] ERROR persistIdentity failed aid=%s: %v", aid, perr)
 		a.lastPersistErr = perr
 	}
 	a.aid = aid
@@ -1470,7 +1701,7 @@ func (a *AuthFlow) ensureIdentity() map[string]any {
 	newIdentity["aid"] = a.aid
 	// H24: 持久化失败不能静默吞
 	if perr := a.persistIdentity(newIdentity); perr != nil {
-		log.Printf("[aun_core.auth] ERROR persistIdentity(rekey) 失败 aid=%s: %v", a.aid, perr)
+		pkgLogAuth().Warn("[aun_core.auth] ERROR persistIdentity(rekey) failed aid=%s: %v", a.aid, perr)
 		a.lastPersistErr = perr
 	}
 	return newIdentity
@@ -1525,6 +1756,39 @@ func (a *AuthFlow) persistIdentity(identity map[string]any) error {
 		return err
 	}
 	return nil
+}
+
+// ── Gateway URL 缓存（keystore metadata 持久化）────────────
+
+// LoadCachedGatewayURL 从 keystore metadata 读取 gateway_url 缓存。
+// 与 Python SDK namespaces/auth_namespace.py:_load_cached_gateway_url 对应：
+// 用于跨进程复用 gateway URL，避免每次启动都重做 well-known 发现。
+// 未实现 MetadataKeyStore 接口或读取失败时返回空字符串。
+func (a *AuthFlow) LoadCachedGatewayURL(aid string) string {
+	if aid == "" {
+		return ""
+	}
+	store, ok := a.keystore.(keystore.MetadataKeyStore)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(store.GetMetadataValue(aid, "gateway_url"))
+}
+
+// PersistGatewayURL 将 gateway_url 持久化到 keystore metadata。
+// 与 Python SDK namespaces/auth_namespace.py:_persist_gateway_url 对应。
+// gateway_url 为空时不写入；写入失败仅记日志，不阻断调用。
+func (a *AuthFlow) PersistGatewayURL(aid, gatewayURL string) {
+	if aid == "" || strings.TrimSpace(gatewayURL) == "" {
+		return
+	}
+	store, ok := a.keystore.(keystore.MetadataKeyStore)
+	if !ok {
+		return
+	}
+	if err := store.SetMetadataValue(aid, "gateway_url", strings.TrimSpace(gatewayURL)); err != nil {
+		pkgLogAuth().Debug("PersistGatewayURL failed aid=%s err=%v", aid, err)
+	}
 }
 
 // ── 内部：根证书加载 ────────────────────────────────────────
@@ -1635,7 +1899,7 @@ func authLoadCertBundle(pems []string) ([]*x509.Certificate, error) {
 func authParsePEMCertificate(pemStr string) (*x509.Certificate, error) {
 	block, _ := pem.Decode([]byte(pemStr))
 	if block == nil {
-		return nil, fmt.Errorf("无法解析 PEM 证书")
+		return nil, fmt.Errorf("failed to parse PEM certificate")
 	}
 	return x509.ParseCertificate(block.Bytes)
 }

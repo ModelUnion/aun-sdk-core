@@ -494,7 +494,29 @@ func TestIntegrationSDKLongTermFallback(t *testing.T) {
 	// sender 发送消息（对方无 prekey，应降级到 long_term_key）
 	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "fallback"})
 
-	// receiver 此时认证并连接
+	// 在 connect 之前订阅 message.received，避免被自动 P2P gap fill 提前消费
+	var mu sync.Mutex
+	var received []map[string]any
+	done := make(chan struct{}, 1)
+	receiver.On("message.received", func(payload any) {
+		data, ok := payload.(map[string]any)
+		if !ok {
+			return
+		}
+		from, _ := data["from"].(string)
+		if from != sAID {
+			return
+		}
+		mu.Lock()
+		received = append(received, data)
+		mu.Unlock()
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	})
+
+	// receiver 此时认证并连接：connect 成功后 SDK 会自动触发一次 P2P message.pull
 	authResult, err := receiver.Auth.Authenticate(ctx, map[string]any{"aid": rAID})
 	if err != nil {
 		t.Fatalf("接收方认证失败: %v", err)
@@ -503,9 +525,13 @@ func TestIntegrationSDKLongTermFallback(t *testing.T) {
 		t.Fatalf("接收方连接失败: %v", err)
 	}
 
-	// 通过 pull 拉取消息
-	time.Sleep(1 * time.Second)
-	msgs := sdkRecvPull(t, receiver, sAID, 0)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+	}
+	mu.Lock()
+	msgs := append([]map[string]any(nil), received...)
+	mu.Unlock()
 	if len(msgs) < 1 {
 		t.Fatalf("期望至少收到 1 条消息，实际 %d", len(msgs))
 	}

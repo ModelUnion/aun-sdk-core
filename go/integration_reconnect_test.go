@@ -5,6 +5,7 @@ package aun
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -86,18 +87,47 @@ func TestIntegration_ReconnectMessageAfterReconnect(t *testing.T) {
 	defer alice.Close()
 	defer bob.Close()
 
+	// 持久化消息需要 queue 投递模式（connect 级别配置）
+	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
+
 	ensureConnected(t, alice, aliceAID)
 	ensureConnected(t, bob, bobAID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Bob 通过事件订阅收消息（push + 自动 pull 都走 message.received）
+	const expected = 2
+	var mu sync.Mutex
+	var inbox []map[string]any
+	done := make(chan struct{}, 1)
+	sub := bob.On("message.received", func(payload any) {
+		data, ok := payload.(map[string]any)
+		if !ok {
+			return
+		}
+		from, _ := data["from"].(string)
+		if from != aliceAID {
+			return
+		}
+		mu.Lock()
+		inbox = append(inbox, data)
+		complete := len(inbox) >= expected
+		mu.Unlock()
+		if complete {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer sub.Unsubscribe()
+
 	// Alice 发送消息 1
 	text1 := fmt.Sprintf("rc-msg1-%s", rid)
 	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
 		"payload": map[string]any{"type": "text", "text": text1},
-		"persist": true,
 		"encrypt": false,
 	})
 	if err != nil {
@@ -130,7 +160,6 @@ func TestIntegration_ReconnectMessageAfterReconnect(t *testing.T) {
 	_, err = alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
 		"payload": map[string]any{"type": "text", "text": text2},
-		"persist": true,
 		"encrypt": false,
 	})
 	if err != nil {
@@ -138,37 +167,26 @@ func TestIntegration_ReconnectMessageAfterReconnect(t *testing.T) {
 	}
 	t.Logf("Alice 发送消息 2: %s", text2)
 
-	time.Sleep(1 * time.Second)
-
-	// Bob 拉取消息 — 应同时收到两条
-	pullResult, err := bob.Call(ctx, "message.pull", map[string]any{
-		"after_seq": 0,
-		"limit":     50,
-	})
-	if err != nil {
-		t.Fatalf("Bob pull 失败: %v", err)
+	timer := time.NewTimer(15 * time.Second)
+	select {
+	case <-done:
+	case <-timer.C:
 	}
+	timer.Stop()
 
-	pullMap, _ := pullResult.(map[string]any)
-	msgs, _ := pullMap["messages"].([]any)
+	mu.Lock()
+	msgs := append([]map[string]any(nil), inbox...)
+	mu.Unlock()
 
 	var found1, found2 bool
-	var seq1, seq2 float64
-	for _, m := range msgs {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		from, _ := msg["from"].(string)
-		if from != aliceAID {
-			continue
-		}
+	var seq1, seq2 int64
+	for _, msg := range msgs {
 		payload, _ := msg["payload"].(map[string]any)
 		if payload == nil {
 			continue
 		}
 		text, _ := payload["text"].(string)
-		seq, _ := msg["seq"].(float64)
+		seq := toInt64(msg["seq"])
 		if text == text1 {
 			found1 = true
 			seq1 = seq
@@ -188,9 +206,9 @@ func TestIntegration_ReconnectMessageAfterReconnect(t *testing.T) {
 
 	// 验证 seq 有序
 	if seq2 <= seq1 {
-		t.Fatalf("消息 seq 顺序异常: msg1_seq=%.0f msg2_seq=%.0f", seq1, seq2)
+		t.Fatalf("消息 seq 顺序异常: msg1_seq=%d msg2_seq=%d", seq1, seq2)
 	}
-	t.Logf("两条消息均已收到，seq 有序: msg1_seq=%.0f msg2_seq=%.0f", seq1, seq2)
+	t.Logf("两条消息均已收到，seq 有序: msg1_seq=%d msg2_seq=%d", seq1, seq2)
 }
 
 // ── 多次断线重连 ────────────────────────────────────────────────────────

@@ -1,7 +1,6 @@
 package aun
 
 import (
-	"log"
 	"sync"
 )
 
@@ -71,8 +70,7 @@ func (d *EventDispatcher) Subscribe(event string, handler EventHandler) *Subscri
 //
 // Deprecated: Use Subscription.Unsubscribe() instead.
 func (d *EventDispatcher) Unsubscribe(event string, handler EventHandler) {
-	log.Printf("警告: EventDispatcher.Unsubscribe(event, handler) 已废弃且无法精确匹配 handler，"+
-		"请使用 Subscription.Unsubscribe()。事件: %s", event)
+	pkgLogClient().Warn("EventDispatcher.Unsubscribe(event, handler) is deprecated and cannot precisely match handler, use Subscription.Unsubscribe() instead. event: %s", event)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	entries := d.handlers[event]
@@ -118,7 +116,7 @@ func (d *EventDispatcher) Publish(event string, payload any) {
 		go func(e handlerEntry) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("事件 %s 处理器执行异常 (panic): %v", event, r)
+					pkgLogClient().Error("event %s handler panic: %v", event, r)
 				}
 			}()
 			e.handler(payload)
@@ -138,7 +136,7 @@ func (d *EventDispatcher) publishSync(event string, payload any) {
 		func(e handlerEntry) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("事件 %s 处理器执行异常 (panic): %v", event, r)
+					pkgLogClient().Error("event %s handler panic: %v", event, r)
 				}
 			}()
 			e.handler(payload)

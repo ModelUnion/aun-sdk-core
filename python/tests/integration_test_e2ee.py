@@ -379,20 +379,56 @@ async def _wait_for_sdk_pull_message(
     expected_text: str,
     timeout: float = 20.0,
 ) -> dict:
+    """等待消息到达。
+
+    新契约（与 5 SDK 对齐）：connect 后 SDK 自动 fillP2pGap → message.received 事件投递。
+    用例先订阅事件捕获，pull 作为兜底。直接 pull 可能拿不到（cursor 已推进过）。
+    """
     deadline = asyncio.get_running_loop().time() + timeout
     last_messages: list[dict] = []
-    while asyncio.get_running_loop().time() < deadline:
-        messages = await _sdk_recv_pull(client, from_aid, after_seq=after_seq)
-        last_messages = messages
-        for message in messages:
-            payload = message.get("payload")
-            if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
-                return message
-        await asyncio.sleep(0.5)
-    raise AssertionError(
-        f"timeout waiting for message text={expected_text!r} from={from_aid}; "
-        f"last_messages={last_messages}"
-    )
+    event_inbox: list[dict] = []
+    received_event = asyncio.Event()
+
+    def _on_msg(payload):
+        if not isinstance(payload, dict):
+            return
+        if payload.get("from") != from_aid:
+            return
+        pl = payload.get("payload")
+        if isinstance(pl, dict) and str(pl.get("text") or "") == expected_text:
+            event_inbox.append(payload)
+            received_event.set()
+
+    sub = client.on("message.received", _on_msg)
+    try:
+        # 先快速等事件
+        try:
+            await asyncio.wait_for(received_event.wait(), timeout=min(2.0, timeout))
+            return event_inbox[0]
+        except asyncio.TimeoutError:
+            pass
+        # pull 兜底
+        while asyncio.get_running_loop().time() < deadline:
+            if event_inbox:
+                return event_inbox[0]
+            messages = await _sdk_recv_pull(client, from_aid, after_seq=after_seq)
+            last_messages = messages
+            for message in messages:
+                payload = message.get("payload")
+                if isinstance(payload, dict) and str(payload.get("text") or "") == expected_text:
+                    return message
+            await asyncio.sleep(0.5)
+        if event_inbox:
+            return event_inbox[0]
+        raise AssertionError(
+            f"timeout waiting for message text={expected_text!r} from={from_aid}; "
+            f"last_messages={last_messages}"
+        )
+    finally:
+        try:
+            sub()  # unsubscribe
+        except Exception:
+            pass
 
 
 async def _wait_for_raw_pull_message(
@@ -1301,20 +1337,55 @@ async def test_multi_device_offline_pull():
         await asyncio.sleep(1.0)
 
         text = f"multi_device_offline_{int(asyncio.get_running_loop().time() * 1000)}"
+
+        # 在 alice send **之前** 给 bob_phone 挂订阅，避免 push 比 send 返回快导致事件丢失
+        online_inbox: list[dict] = []
+        online_event = asyncio.Event()
+        def _on_online_msg(payload):
+            if not isinstance(payload, dict):
+                return
+            if payload.get("from") != _ALICE_AID:
+                return
+            pl = payload.get("payload")
+            if isinstance(pl, dict) and str(pl.get("text") or "") == text:
+                online_inbox.append(payload)
+                online_event.set()
+        bob_phone.on("message.received", _on_online_msg)
+
         result = await _sdk_send(alice_main, _BOBB_AID, {"type": "text", "text": text, "kind": "offline-pull"})
         assert result.get("status") in {"sent", "delivered"}
 
-        online_msg = await _wait_for_sdk_pull_message(
-            bob_phone, _ALICE_AID, after_seq=online_base, expected_text=text,
-        )
+        try:
+            await asyncio.wait_for(online_event.wait(), timeout=15.0)
+            online_msg = online_inbox[0]
+        except asyncio.TimeoutError:
+            online_msg = await _wait_for_sdk_pull_message(
+                bob_phone, _ALICE_AID, after_seq=online_base, expected_text=text, timeout=5.0,
+            )
         _assert_decrypted(online_msg, {"type": "text", "text": text, "kind": "offline-pull"}, "bob-phone-online")
         assert online_msg.get("direction") == "inbound"
 
         bob_laptop = _make_isolated_client("bob-laptop")
+        # 在 connect 前先订阅事件：connect 后 SDK 自动 fillP2pGap 通过 message.received
+        # 投递补洞消息，必须在 connect 前就挂上 listener，否则会错过事件。
+        offline_inbox: list[dict] = []
+        offline_event = asyncio.Event()
+        def _on_offline_msg(payload):
+            if not isinstance(payload, dict):
+                return
+            pl = payload.get("payload")
+            if isinstance(pl, dict) and str(pl.get("text") or "") == text:
+                offline_inbox.append(payload)
+                offline_event.set()
+        bob_laptop.on("message.received", _on_offline_msg)
         await _ensure_connected(bob_laptop, _BOBB_AID)
-        offline_msg = await _wait_for_sdk_pull_message(
-            bob_laptop, _ALICE_AID, after_seq=offline_base, expected_text=text, timeout=15.0,
-        )
+        try:
+            await asyncio.wait_for(offline_event.wait(), timeout=15.0)
+            offline_msg = offline_inbox[0]
+        except asyncio.TimeoutError:
+            offline_msg = await _wait_for_sdk_pull_message(
+                bob_laptop, _ALICE_AID, after_seq=offline_base, expected_text=text, timeout=5.0,
+            )
         _assert_decrypted(offline_msg, {"type": "text", "text": text, "kind": "offline-pull"}, "bob-laptop-offline")
         assert offline_msg.get("direction") == "inbound"
 

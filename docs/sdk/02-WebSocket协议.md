@@ -13,7 +13,7 @@ sequenceDiagram
 
     C->>G: WebSocket 连接
     G->>C: challenge（nonce, protocol, auth_methods）
-    C->>G: auth.connect（nonce, token, protocol, device, client, delivery_mode, capabilities）
+    C->>G: auth.connect（nonce, token, protocol, device, client, delivery_mode, options, capabilities）
     G->>C: hello-ok（identity, capabilities）
     Note over C,G: 握手完成，进入双向 RPC / 事件通信
 ```
@@ -60,6 +60,7 @@ sequenceDiagram
             "routing": "sender_affinity",
             "affinity_ttl_ms": 300000
         },
+        "options": { "kind": "long" },
         "capabilities": {
             "e2ee": true,
             "group_e2ee": true
@@ -74,6 +75,8 @@ sequenceDiagram
 - `device.id` 是设备级稳定标识，Python SDK 默认从 `~/.aun/.device_id` 读取。
 - `client.slot_id` 由应用层显式传入，用于区分同设备上的多个实例槽位。
 - `delivery_mode` 决定该 AID 当前连接的投递语义；同一 AID 的所有在线连接必须保持一致。
+- `options.kind` 声明连接类型：`"long"`（默认）= 长连接，承担服务端推送 / 事件订阅；`"short"` = 短连接，仅用于发送 RPC 并等待响应即断开。同 `(aid, device.id, client.slot_id)` 槽位下，长连接最多 1 条，短连接最多 10 条；短连接不会顶掉长连接。
+- `options.short_ttl_ms` 仅在 `kind="short"` 时有效，可选；服务端兜底超时后主动关闭短连接，防止占名额。
 - `capabilities` 是客户端能力声明；`hello-ok.result.capabilities` 是服务端能力公告，不是双方能力交集。
 
 ### (3) hello-ok — 握手完成
@@ -93,6 +96,11 @@ sequenceDiagram
             "module_id": "gateway-client-xxxx",
             "role": "agent",
             "aid": "alice1234.agentid.pub"
+        },
+        "connection": {
+            "id": "conn_gateway-client-xxxx",
+            "device_id": "dev-001",
+            "kind": "long"
         },
         "capabilities": { ... }
     }

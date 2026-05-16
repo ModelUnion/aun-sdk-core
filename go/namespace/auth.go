@@ -12,7 +12,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -39,6 +38,11 @@ type ClientInterface interface {
 	AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error)
 	DiscoverGateway(ctx context.Context, wellKnownURL string, timeout time.Duration) (string, error)
 	SetIdentity(identity map[string]any)
+
+	// gateway URL 缓存（keystore metadata 持久化），用于跨进程复用 discovery 结果。
+	// 实现方在没有 MetadataKeyStore 能力时可返回空字符串 / 空操作。
+	AuthLoadCachedGatewayURL(aid string) string
+	AuthPersistGatewayURL(aid, gatewayURL string)
 }
 
 // AuthNamespace 认证命名空间
@@ -69,9 +73,12 @@ func NewAuthNamespace(client ClientInterface) *AuthNamespace {
 // resolveGateway 解析 gateway URL。优先使用已预置的 gatewayURL，否则基于 AID 自动发现。
 //
 // 发现流程：
-//  1. 若 gatewayURL 已预置，直接返回
-//  2. 开发环境：先 gateway.{issuer}，再 fallback {aid}（泛域名在开发环境可能不可用）
-//  3. 生产环境：先 {aid}（泛域名 nameservice），再 fallback gateway.{issuer}
+//  1. 若 gatewayURL 已预置（内存），直接返回
+//  2. 从 keystore metadata 读 cached gateway_url（跨进程复用，避免每次启动都做 well-known discovery）
+//  3. 开发环境：先 gateway.{issuer}，再 fallback {aid}（泛域名在开发环境可能不可用）
+//  4. 生产环境：先 {aid}（泛域名 nameservice），再 fallback gateway.{issuer}
+//
+// 与 Python SDK namespaces/auth_namespace.py:_resolve_gateway 对齐。
 func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string, error) {
 	if gw := a.client.GetGatewayURL(); gw != "" {
 		return gw, nil
@@ -82,6 +89,13 @@ func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string,
 	}
 	if resolvedAID == "" {
 		return "", fmt.Errorf("无法解析 gateway：需设置 gateway_url 或提供 'aid' 进行自动发现")
+	}
+
+	// 从 keystore metadata 读持久化的 gateway_url（避免每次进程启动都做 well-known discovery）
+	if cached := strings.TrimSpace(a.client.AuthLoadCachedGatewayURL(resolvedAID)); cached != "" {
+		pkgLogAuth().Debug("resolveGateway from keystore cache aid=%s gateway=%s", resolvedAID, cached)
+		a.client.SetGatewayURL(cached)
+		return cached, nil
 	}
 
 	parts := strings.SplitN(resolvedAID, ".", 2)
@@ -108,24 +122,48 @@ func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string,
 
 	gwURL, err := a.client.DiscoverGateway(ctx, primaryURL, 5*time.Second)
 	if err == nil {
+		a.client.AuthPersistGatewayURL(resolvedAID, gwURL)
 		return gwURL, nil
 	}
-	log.Printf("gateway 发现失败 (%s): %v", primaryURL, err)
+	pkgLogAuth().Warn("gateway discovery failed (%s): %v", primaryURL, err)
 
-	return a.client.DiscoverGateway(ctx, fallbackURL, 5*time.Second)
+	gwURL, err = a.client.DiscoverGateway(ctx, fallbackURL, 5*time.Second)
+	if err == nil {
+		a.client.AuthPersistGatewayURL(resolvedAID, gwURL)
+	}
+	return gwURL, err
 }
 
 // CreateAIDWithName 类型安全的便捷方法，通过 AID 名称创建身份。
 // 内部构造 map 并调用 CreateAID。
-func (a *AuthNamespace) CreateAIDWithName(ctx context.Context, aid string) (map[string]any, error) {
+func (a *AuthNamespace) CreateAIDWithName(ctx context.Context, aid string) (out map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("CreateAIDWithName enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("CreateAIDWithName exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("CreateAIDWithName exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	return a.CreateAID(ctx, map[string]any{"aid": aid})
 }
 
 // CreateAID 创建新的 AID 身份
-func (a *AuthNamespace) CreateAID(ctx context.Context, params map[string]any) (map[string]any, error) {
+func (a *AuthNamespace) CreateAID(ctx context.Context, params map[string]any) (out map[string]any, err error) {
+	tStart := time.Now()
 	aid, _ := params["aid"].(string)
+	pkgLogAuth().Debug("CreateAID enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("CreateAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("CreateAID exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	if aid == "" {
-		return nil, fmt.Errorf("auth.create_aid 需要 'aid' 参数")
+		err = fmt.Errorf("auth.create_aid 需要 'aid' 参数")
+		return nil, err
 	}
 
 	gatewayURL, err := a.resolveGateway(ctx, aid)
@@ -152,7 +190,8 @@ func (a *AuthNamespace) CreateAID(ctx context.Context, params map[string]any) (m
 }
 
 // Authenticate 认证已有的 AID
-func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any) (map[string]any, error) {
+func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any) (out map[string]any, err error) {
+	tStart := time.Now()
 	request := make(map[string]any)
 	if params != nil {
 		for k, v := range params {
@@ -160,6 +199,14 @@ func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any)
 		}
 	}
 	aid, _ := request["aid"].(string)
+	pkgLogAuth().Debug("Authenticate enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("Authenticate exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("Authenticate exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 
 	gatewayURL, err := a.resolveGateway(ctx, aid)
 	if err != nil {
@@ -180,11 +227,20 @@ func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any)
 	return result, nil
 }
 
-func (a *AuthNamespace) SignAgentMD(ctx context.Context, content string, opts *AgentMDSignOptions) (string, error) {
+func (a *AuthNamespace) SignAgentMD(ctx context.Context, content string, opts *AgentMDSignOptions) (signed string, err error) {
+	tStart := time.Now()
 	targetAID := strings.TrimSpace(a.client.GetAID())
 	if opts != nil && strings.TrimSpace(opts.AID) != "" {
 		targetAID = strings.TrimSpace(opts.AID)
 	}
+	pkgLogAuth().Debug("SignAgentMD enter: aid=%s len=%d", targetAID, len(content))
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("SignAgentMD exit (error): aid=%s elapsed=%dms err=%v", targetAID, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("SignAgentMD exit: aid=%s elapsed=%dms", targetAID, time.Since(tStart).Milliseconds())
+		}
+	}()
 
 	identity := a.client.AuthLoadIdentityOrNil(targetAID)
 	if identity == nil {
@@ -237,7 +293,16 @@ func (a *AuthNamespace) SignAgentMD(ctx context.Context, content string, opts *A
 	return payload + signedBlock, nil
 }
 
-func (a *AuthNamespace) VerifyAgentMD(ctx context.Context, content string, opts *AgentMDVerifyOptions) (map[string]any, error) {
+func (a *AuthNamespace) VerifyAgentMD(ctx context.Context, content string, opts *AgentMDVerifyOptions) (out map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("VerifyAgentMD enter: len=%d", len(content))
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("VerifyAgentMD exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("VerifyAgentMD exit: elapsed=%dms", time.Since(tStart).Milliseconds())
+		}
+	}()
 	payload, fields, _, parseError := parseAgentMDTailSignature(content)
 	if fields == nil {
 		if parseError == "" {
@@ -564,8 +629,17 @@ func (a *AuthNamespace) ensureAgentMDUploadToken(ctx context.Context, aid string
 }
 
 // UploadAgentMD 上传当前身份的 agent.md 文档。
-func (a *AuthNamespace) UploadAgentMD(ctx context.Context, content string) (map[string]any, error) {
+func (a *AuthNamespace) UploadAgentMD(ctx context.Context, content string) (out map[string]any, err error) {
+	tStart := time.Now()
 	aid := strings.TrimSpace(a.client.GetAID())
+	pkgLogAuth().Debug("UploadAgentMD enter: aid=%s len=%d", aid, len(content))
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("UploadAgentMD exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("UploadAgentMD exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	identity := a.client.AuthLoadIdentityOrNil(aid)
 	if identity == nil {
 		return nil, fmt.Errorf("no local identity found, call auth.create_aid() first")
@@ -626,10 +700,20 @@ func (a *AuthNamespace) UploadAgentMD(ctx context.Context, content string) (map[
 }
 
 // DownloadAgentMD 匿名下载指定 AID 的 agent.md 文档。
-func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (string, error) {
+func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (content string, err error) {
+	tStart := time.Now()
+	pkgLogAuth().Debug("DownloadAgentMD enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("DownloadAgentMD exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("DownloadAgentMD exit: aid=%s len=%d elapsed=%dms", aid, len(content), time.Since(tStart).Milliseconds())
+		}
+	}()
 	targetAID := strings.TrimSpace(aid)
 	if targetAID == "" {
-		return "", fmt.Errorf("download_agent_md requires non-empty aid")
+		err = fmt.Errorf("download_agent_md requires non-empty aid")
+		return "", err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.resolveAgentMDURL(ctx, targetAID), nil)

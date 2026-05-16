@@ -5,6 +5,14 @@
  */
 
 import type { JsonValue } from './types.js';
+import type { ModuleLogger } from './logger.js';
+
+const _noopLogger: ModuleLogger = {
+  error: () => {},
+  warn:  () => {},
+  info:  () => {},
+  debug: () => {},
+};
 
 export type EventPayload =
   | JsonValue
@@ -45,7 +53,12 @@ export class Subscription {
  * 若未来需要在 Worker 线程中共享同一实例，须引入锁或消息传递机制。
  */
 export class EventDispatcher {
+  private _logger: ModuleLogger;
   private _handlers: Map<string, EventHandler[]> = new Map();
+
+  constructor(logger?: ModuleLogger) {
+    this._logger = logger ?? _noopLogger;
+  }
 
   /** 订阅指定事件，返回 Subscription 句柄 */
   subscribe(event: string, handler: EventHandler): Subscription {
@@ -85,10 +98,7 @@ export class EventDispatcher {
         }
       } catch (exc) {
         // 与 Python SDK 一致：处理器异常不阻断其他处理器
-        console.warn(
-          `事件 ${event} 处理器 ${handler.name || '<anonymous>'} 执行异常:`,
-          exc,
-        );
+        this._logger.warn(`event ${event} handler ${handler.name || '<anonymous>'} threw: ${exc instanceof Error ? exc.message : String(exc)}`);
       }
     }
   }

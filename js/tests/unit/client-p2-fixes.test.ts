@@ -412,7 +412,7 @@ describe('group.add_member 失败时不应分发密钥', () => {
       aid: 'new-member.aid.com',
     });
 
-    expect(rotateSpy).toHaveBeenCalledWith('group-123', expect.any(String), null);
+    expect(rotateSpy).toHaveBeenCalledWith('group-123', expect.any(String), null, false);
   });
 });
 

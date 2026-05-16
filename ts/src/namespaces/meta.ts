@@ -12,6 +12,7 @@ import { URL } from 'node:url';
 import { ValidationError } from '../errors.js';
 import type { JsonObject, JsonValue, RpcParams, RpcResult } from '../types.js';
 import type { AUNClient } from '../client.js';
+import type { ModuleLogger } from '../logger.js';
 
 const AUTHORITY_ENDPOINT = 'https://trust.aun.network/.well-known/aun/trust-roots.json';
 const MAX_CLOCK_SKEW = 300; // 秒
@@ -23,14 +24,17 @@ interface MetaClientBridge {
   _keystore: any;
   _auth: { reload_trusted_roots?: () => number; reloadTrustedRoots?: () => number };
   _rootCerts?: string[];
+  _logger: { for: (module: string) => ModuleLogger };
   call: (method: string, params: RpcParams) => Promise<RpcResult>;
 }
 
 export class MetaNamespace {
   private _client: AUNClient;
+  private _log: ModuleLogger;
 
   constructor(client: AUNClient) {
     this._client = client;
+    this._log = (client as any as MetaClientBridge)._logger.for('aun_core.namespace.meta');
   }
 
   private get _internal(): MetaClientBridge {
@@ -40,14 +44,17 @@ export class MetaNamespace {
   // ── RPC 直通 ──────────────────────────────────────────────────
 
   async ping(params?: RpcParams): Promise<RpcResult> {
+    this._log.debug('ping called');
     return await this._client.call('meta.ping', params ?? {});
   }
 
   async status(params?: RpcParams): Promise<RpcResult> {
+    this._log.debug('status called');
     return await this._client.call('meta.status', params ?? {});
   }
 
   async trustRoots(params?: RpcParams): Promise<RpcResult> {
+    this._log.debug('trustRoots called');
     return await this._client.call('meta.trust_roots', params ?? {});
   }
 
@@ -68,6 +75,7 @@ export class MetaNamespace {
       throw new ValidationError('trust roots url must be http(s)');
     }
     const timeoutMs = (opts?.timeout ?? 10) * 1000;
+    this._log.debug(`downloadTrustRoots start: target=${target} timeout=${timeoutMs}ms`);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -76,13 +84,21 @@ export class MetaNamespace {
         signal: controller.signal,
       });
       if (!response.ok) {
+        this._log.error(`downloadTrustRoots HTTP ${response.status}: target=${target}`);
         throw new ValidationError(`trust roots download failed: HTTP ${response.status}`);
       }
       const payload = await response.json();
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        this._log.error(`downloadTrustRoots non-object payload: target=${target}`);
         throw new ValidationError('trust roots endpoint returned non-object JSON');
       }
+      this._log.debug(`downloadTrustRoots ok: target=${target} keys=${Object.keys(payload as JsonObject).length}`);
       return payload as JsonObject;
+    } catch (error) {
+      if (!(error instanceof ValidationError)) {
+        this._log.error(`downloadTrustRoots failed: target=${target} err=${error instanceof Error ? error.message : String(error)}`, error instanceof Error ? error : undefined);
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
@@ -98,6 +114,7 @@ export class MetaNamespace {
       throw new ValidationError('issuer root certificate url must be http(s)');
     }
     const timeoutMs = (opts?.timeout ?? 10) * 1000;
+    this._log.debug(`downloadIssuerRootCert start: issuer=${normalizedIssuer} target=${target}`);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -106,11 +123,18 @@ export class MetaNamespace {
         signal: controller.signal,
       });
       if (!response.ok) {
+        this._log.error(`downloadIssuerRootCert HTTP ${response.status}: issuer=${normalizedIssuer} target=${target}`);
         throw new ValidationError(`issuer root cert download failed: HTTP ${response.status}`);
       }
       const certPem = (await response.text()).trim();
       MetaNamespace._loadRootCertificate(certPem, normalizedIssuer);
+      this._log.info(`issuer root cert downloaded: issuer=${normalizedIssuer}`);
       return certPem + '\n';
+    } catch (error) {
+      if (!(error instanceof ValidationError)) {
+        this._log.error(`downloadIssuerRootCert failed: issuer=${normalizedIssuer} target=${target} err=${error instanceof Error ? error.message : String(error)}`, error instanceof Error ? error : undefined);
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
@@ -203,6 +227,8 @@ export class MetaNamespace {
     const auth = this._internal._auth;
     const reloaded = auth.reloadTrustedRoots?.() ?? auth.reload_trusted_roots?.() ?? 0;
 
+    this._log.info(`trust roots imported: count=${verified.count} skipped=${verified.skipped.length} reloaded=${reloaded}`);
+
     return {
       imported: verified.count,
       skipped: verified.skipped,
@@ -222,6 +248,7 @@ export class MetaNamespace {
     timeout?: number;
   }): Promise<JsonObject> {
     const sourceUrl = this._resolveTrustRootsUrl(opts?.url, opts?.issuer, opts?.gateway_url);
+    this._log.debug(`refreshTrustRoots start: source=${sourceUrl}`);
     const trustList = await this.downloadTrustRoots({ url: sourceUrl, timeout: opts?.timeout });
     const result = this.importTrustRoots(trustList, {
       authority_cert_pem: opts?.authority_cert_pem,

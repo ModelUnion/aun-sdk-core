@@ -2,7 +2,10 @@
 
 import type { SecretStore } from './index.js';
 import { uint8ToBase64, base64ToUint8, toBufferSource } from '../crypto.js';
+import type { ModuleLogger } from '../logger.js';
 import type { SecretRecord } from '../types.js';
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 const SECRET_DB_NAME = 'aun-secret-store';
 const SECRET_DB_VERSION = 1;
@@ -62,6 +65,8 @@ async function secretPut(storeName: string, key: string, value: string | SecretR
 export class IndexedDBSecretStore implements SecretStore {
   private _encryptionSeed: string | undefined;
   private _masterKeyPromise: Promise<CryptoKey> | null = null;
+  private _log: ModuleLogger = _noopLog;
+  setLogger(log: ModuleLogger): void { this._log = log; }
 
   constructor(encryptionSeed?: string) {
     this._encryptionSeed = encryptionSeed;
@@ -125,28 +130,36 @@ export class IndexedDBSecretStore implements SecretStore {
     name: string,
     plaintext: Uint8Array,
   ): Promise<SecretRecord> {
-    const masterKey = await this._getMasterKey();
-    const iv = new Uint8Array(12);
-    crypto.getRandomValues(iv);
+    const tStart = Date.now();
+    this._log.debug(`protect enter: scope=${scope} name=${name} len=${plaintext.byteLength}`);
+    try {
+      const masterKey = await this._getMasterKey();
+      const iv = new Uint8Array(12);
+      crypto.getRandomValues(iv);
 
-    const ciphertext = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: toBufferSource(iv) },
-      masterKey,
-      toBufferSource(plaintext),
-    );
+      const ciphertext = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: toBufferSource(iv) },
+        masterKey,
+        toBufferSource(plaintext),
+      );
 
-    const record = {
-      scheme: 'indexeddb_aes_gcm',
-      name,
-      iv: uint8ToBase64(iv),
-      ciphertext: uint8ToBase64(new Uint8Array(ciphertext)),
-      persisted: true,
-    };
+      const record = {
+        scheme: 'indexeddb_aes_gcm',
+        name,
+        iv: uint8ToBase64(iv),
+        ciphertext: uint8ToBase64(new Uint8Array(ciphertext)),
+        persisted: true,
+      };
 
-    const storeKey = `${scope}:${name}`;
-    await secretPut(STORE_SECRETS, storeKey, record);
+      const storeKey = `${scope}:${name}`;
+      await secretPut(STORE_SECRETS, storeKey, record);
 
-    return record;
+      this._log.debug(`protect exit: elapsed=${Date.now() - tStart}ms scope=${scope} name=${name}`);
+      return record;
+    } catch (err) {
+      this._log.debug(`protect exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 解密还原 */
@@ -155,27 +168,45 @@ export class IndexedDBSecretStore implements SecretStore {
     name: string,
     record: SecretRecord,
   ): Promise<Uint8Array | null> {
-    if (record.scheme !== 'indexeddb_aes_gcm') return null;
-    if (String(record.name ?? '') !== name) return null;
-
-    const ivB64 = record.iv as string;
-    const ctB64 = record.ciphertext as string;
-    if (!ivB64 || !ctB64) return null;
-
+    const tStart = Date.now();
+    this._log.debug(`reveal enter: scope=${scope} name=${name}`);
     try {
-      const masterKey = await this._getMasterKey();
-      const iv = base64ToUint8(ivB64);
-      const ciphertext = base64ToUint8(ctB64);
+      if (record.scheme !== 'indexeddb_aes_gcm') {
+        this._log.debug(`reveal exit: elapsed=${Date.now() - tStart}ms result=null reason=scheme_mismatch`);
+        return null;
+      }
+      if (String(record.name ?? '') !== name) {
+        this._log.debug(`reveal exit: elapsed=${Date.now() - tStart}ms result=null reason=name_mismatch`);
+        return null;
+      }
 
-      const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: toBufferSource(iv) },
-        masterKey,
-        toBufferSource(ciphertext),
-      );
+      const ivB64 = record.iv as string;
+      const ctB64 = record.ciphertext as string;
+      if (!ivB64 || !ctB64) {
+        this._log.debug(`reveal exit: elapsed=${Date.now() - tStart}ms result=null reason=missing_fields`);
+        return null;
+      }
 
-      return new Uint8Array(plaintext);
-    } catch {
-      return null;
+      try {
+        const masterKey = await this._getMasterKey();
+        const iv = base64ToUint8(ivB64);
+        const ciphertext = base64ToUint8(ctB64);
+
+        const plaintext = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: toBufferSource(iv) },
+          masterKey,
+          toBufferSource(ciphertext),
+        );
+
+        this._log.debug(`reveal exit: elapsed=${Date.now() - tStart}ms scope=${scope} name=${name} bytes=${plaintext.byteLength}`);
+        return new Uint8Array(plaintext);
+      } catch {
+        this._log.debug(`reveal exit: elapsed=${Date.now() - tStart}ms result=null reason=decrypt_failed`);
+        return null;
+      }
+    } catch (err) {
+      this._log.debug(`reveal exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 }

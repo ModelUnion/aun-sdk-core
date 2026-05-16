@@ -23,6 +23,48 @@ const _noopLogger: ModuleLogger = {
   debug: () => {},
 };
 
+// 提取诊断字段时使用的字段白名单（仅元数据/路由字段，绝不打印 payload 明文/token/私钥/密钥/密文）
+const DIAG_PARAM_FIELDS = [
+  'to', 'to_aid', 'from', 'from_aid', 'group_id', 'message_id', 'mid',
+  'method', 'device_id', 'slot_id', 'epoch', 'epoch_id', 'rotation_id',
+  'after_seq', 'after_event_seq', 'seq', 'event_seq', 'limit', 'cursor',
+  'aid', 'session_id', 'type', 'encrypt', 'encryption_mode', 'suite',
+  'prekey_id', 'trust_root_version', 'version', 'ok', 'request_id',
+  'owner_aid', 'rotated_by', 'action',
+] as const;
+
+const DIAG_RESULT_FIELDS = [
+  ...DIAG_PARAM_FIELDS,
+  'members', 'messages', 'events', 'count', 'imported', 'skipped',
+  'next_cursor', 'current_seq', 'committed_epoch',
+] as const;
+
+function summarizeDict(payload: unknown, fields: readonly string[]): string {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    if (Array.isArray(payload)) return `[list len=${payload.length}]`;
+    if (payload === null || payload === undefined) return '<empty>';
+    return `<${typeof payload}>`;
+  }
+  const obj = payload as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const key of fields) {
+    const v = obj[key];
+    if (v === undefined || v === null || v === '') continue;
+    if (Array.isArray(v)) {
+      parts.push(`${key}=[len=${v.length}]`);
+    } else if (typeof v === 'object') {
+      parts.push(`${key}={keys=${Object.keys(v as object).length}}`);
+    } else if (typeof v === 'boolean' || typeof v === 'number') {
+      parts.push(`${key}=${v}`);
+    } else {
+      let s = String(v);
+      if (s.length > 64) s = s.slice(0, 61) + '...';
+      parts.push(`${key}=${s}`);
+    }
+  }
+  return parts.length === 0 ? '<no diag fields>' : parts.join(' ');
+}
+
 /** 协议事件名映射 */
 const EVENT_NAME_MAP: Record<string, string> = {
   'message.received': 'message.received',
@@ -84,6 +126,8 @@ export class RPCTransport {
    * 返回初始 challenge 消息（如果有）。
    */
   async connect(url: string): Promise<RpcMessage | null> {
+    const tStart = Date.now();
+    this._logger.debug(`connect enter: url=${url}`);
     // ws 8.x+ 中 rejectUnauthorized 需通过 https.Agent 传递
     let wsOpts: any = undefined;
     if (!this._verifySsl) {
@@ -91,7 +135,14 @@ export class RPCTransport {
       wsOpts = { agent: new https.Agent({ rejectUnauthorized: false }) };
     }
     const ws = new WebSocket(url, wsOpts);
-    return this._connectWithWs(ws);
+    try {
+      const result = await this._connectWithWs(ws);
+      this._logger.debug(`connect exit: elapsed=${Date.now() - tStart}ms, has_challenge=${result !== null}`);
+      return result;
+    } catch (err) {
+      this._logger.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /**
@@ -125,6 +176,7 @@ export class RPCTransport {
           if (connectTimeout) clearTimeout(connectTimeout);
           cleanupHandshakeListeners();
           rollback();
+          this._logger.error(`connection failed: ${err.message}`);
           reject(new ConnectionError(`websocket connect failed: ${err.message}`));
         }
       };
@@ -134,6 +186,7 @@ export class RPCTransport {
         if (initialResolved) return;
         this._ws = ws;
         this._closed = false;
+        this._logger.debug('WebSocket open, waiting for challenge');
         // 等待第一条消息作为 challenge
       };
 
@@ -177,6 +230,7 @@ export class RPCTransport {
           initialResolved = true;
           cleanupHandshakeListeners();
           rollback();
+          this._logger.error('connect timeout');
           reject(new ConnectionError('websocket connect timeout'));
         }
       }, this._timeout);
@@ -185,6 +239,9 @@ export class RPCTransport {
 
   /** 关闭连接 */
   async close(): Promise<void> {
+    const tStart = Date.now();
+    const pendingCount = this._pending.size;
+    this._logger.debug(`close enter: pending_rpc=${pendingCount}`);
     this._closed = true;
     // 取消所有待处理的 RPC
     for (const [id, pending] of this._pending) {
@@ -192,6 +249,7 @@ export class RPCTransport {
       pending.reject(new ConnectionError('transport closed'));
     }
     this._pending.clear();
+    this._logger.debug(`close: cancelled ${pendingCount} pending rpc(s)`);
 
     if (this._ws) {
       const ws = this._ws;
@@ -209,6 +267,7 @@ export class RPCTransport {
           clearTimeout(timer);
           try { ws.removeAllListeners(); } catch { /* noop */ }
           try { ws.terminate?.(); } catch { /* noop */ }
+          this._logger.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
           resolve();
         };
         ws.on('close', finish);
@@ -222,6 +281,7 @@ export class RPCTransport {
         const timer = setTimeout(finish, 3_000);
       });
     }
+    this._logger.debug(`close exit: elapsed=${Date.now() - tStart}ms (no ws)`);
   }
 
   /**
@@ -238,21 +298,27 @@ export class RPCTransport {
 
     const rpcId = `rpc-${crypto.randomBytes(8).toString('hex')}`;
     const effectiveTimeout = timeout ?? this._timeout;
+    const tStart = Date.now();
 
     return new Promise<RpcResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(rpcId);
+        this._logger.warn(`RPC timeout: method=${method}, id=${rpcId}, elapsed=${Date.now() - tStart}ms, timeout=${effectiveTimeout}ms`);
         reject(new TimeoutError(`rpc timeout: ${method}`, { retryable: true }));
       }, effectiveTimeout);
 
       this._pending.set(rpcId, {
         resolve: (response) => {
           clearTimeout(timer);
+          const elapsed = Date.now() - tStart;
           if (response.error !== undefined) {
+            this._logger.debug(`RPC error response: method=${method}, id=${rpcId}, elapsed=${elapsed}ms, error=${JSON.stringify(response.error)}`);
             reject(mapRemoteError(response.error));
           } else if (response.result !== undefined) {
+            this._logger.debug(`RPC response ok: method=${method}, id=${rpcId}, elapsed=${elapsed}ms ${summarizeDict(response.result, DIAG_RESULT_FIELDS)}`);
             resolve(response.result);
           } else {
+            this._logger.warn(`RPC response missing result or error: method=${method}, id=${rpcId}, elapsed=${elapsed}ms`);
             reject(new SerializationError(`rpc response missing result and error: ${method}`));
           }
         },
@@ -272,9 +338,11 @@ export class RPCTransport {
 
       try {
         this._ws!.send(payload);
+        this._logger.debug(`RPC request sent: method=${method}, id=${rpcId} ${summarizeDict(params, DIAG_PARAM_FIELDS)}`);
       } catch (err) {
         this._pending.delete(rpcId);
         clearTimeout(timer);
+        this._logger.error(`RPC send failed: method=${method}, id=${rpcId}, error=${err instanceof Error ? err.message : String(err)}`);
         reject(
           new ConnectionError(
             `failed to send rpc ${method}: ${err instanceof Error ? err.message : String(err)}`,
@@ -303,14 +371,16 @@ export class RPCTransport {
     ws.on('close', (code: number) => {
       const wasClosed = this._closed;
       this._closed = true;
+      this._logger.debug(`WebSocket closed: code=${code}, intentional close=${wasClosed}`);
       if (!wasClosed && this._onDisconnect) {
         const cb = this._onDisconnect;
-        Promise.resolve(cb(null, code)).catch(() => this._logger.warn('disconnect 回调异常'));
+        Promise.resolve(cb(null, code)).catch(() => this._logger.warn('disconnect callback error'));
       }
     });
 
     ws.on('error', (err) => {
       if (!this._closed) {
+        this._logger.error(`WebSocket error: ${err.message}`);
         this._dispatcher.publish('connection.error', { error: err });
       }
     });
@@ -318,6 +388,10 @@ export class RPCTransport {
 
   /** 路由消息：RPC 响应 / challenge / 事件 / 通知 */
   private _routeMessage(message: RpcMessage): void {
+    // 入口 debug: 识别消息类型
+    const hasId = 'id' in message;
+    const methodStr = String(message.method ?? '');
+    this._logger.debug(`_routeMessage enter: has_id=${hasId}, method=${methodStr || '<none>'}`);
     // RPC 响应（有 id 字段）
     if ('id' in message) {
       const rpcId = String(message.id);
@@ -334,6 +408,7 @@ export class RPCTransport {
     // Challenge 消息
     if (method === 'challenge') {
       this._challenge = message;
+      this._logger.debug('challenge received');
       this._dispatcher.publish('connection.challenge', message.params ?? {});
       return;
     }
@@ -342,6 +417,7 @@ export class RPCTransport {
     if (method.startsWith('event/')) {
       const protocolEvent = method.slice('event/'.length);
       const sdkEvent = EVENT_NAME_MAP[protocolEvent] ?? protocolEvent;
+      this._logger.debug(`event recv: event=${sdkEvent} ${summarizeDict(message.params, DIAG_RESULT_FIELDS)}`);
       // 发布为 _raw.{event}，由 AUNClient 处理后再发布用户可见的事件
       this._dispatcher.publish(`_raw.${sdkEvent}`, message.params ?? {});
       return;

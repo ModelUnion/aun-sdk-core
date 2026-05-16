@@ -11,7 +11,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,7 +48,7 @@ func NewSQLiteBackup(dbPath string) *SQLiteBackup {
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		log.Printf("[WARN] SQLite 备份初始化失败: %v", err)
+		pkgLogKeystore().Warn("SQLite backup initfailed: %v", err)
 		return &SQLiteBackup{available: false}
 	}
 	db.SetMaxOpenConns(1)
@@ -57,13 +56,13 @@ func NewSQLiteBackup(dbPath string) *SQLiteBackup {
 
 	sb := &SQLiteBackup{db: db, available: true}
 	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
-		log.Printf("[WARN] SQLite 设置 WAL 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite WAL setup failed: %v", err)
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeout)); err != nil {
-		log.Printf("[WARN] SQLite 设置 busy_timeout 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite busy_timeout setup failed: %v", err)
 	}
 	if err := sb.initTables(); err != nil {
-		log.Printf("[WARN] SQLite 建表失败: %v", err)
+		pkgLogKeystore().Warn("SQLite create table failed: %v", err)
 		sb.available = false
 	}
 	return sb
@@ -176,7 +175,7 @@ func (s *SQLiteBackup) LoadPrekeys(aid string) map[string]map[string]any {
 		}
 		return rows.Err()
 	}); err != nil {
-		log.Printf("[WARN] SQLite 读取 prekeys 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite read prekeys failed: %v", err)
 	}
 	return result
 }
@@ -216,7 +215,7 @@ func (s *SQLiteBackup) ReplacePrekeys(aid string, prekeys map[string]map[string]
 		}
 		return nil
 	}, "replace_prekeys"); err != nil {
-		log.Printf("[WARN] SQLite replace_prekeys 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite replace_prekeys failed: %v", err)
 	}
 }
 
@@ -267,7 +266,7 @@ func (s *SQLiteBackup) CleanupPrekeysBefore(aid string, cutoffMs int64, keepLate
 		}
 		return rows.Err()
 	}); err != nil {
-		log.Printf("[WARN] SQLite 查询待清理 prekeys 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite query expired prekeys failed: %v", err)
 		return nil
 	}
 	sort.Slice(rowsData, func(i, j int) bool {
@@ -304,7 +303,7 @@ func (s *SQLiteBackup) CleanupPrekeysBefore(aid string, cutoffMs int64, keepLate
 		}
 		return nil
 	}, "cleanup_prekeys"); err != nil {
-		log.Printf("[WARN] SQLite cleanup_prekeys 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite cleanup_prekeys failed: %v", err)
 		return nil
 	}
 	return prekeyIDs
@@ -380,7 +379,7 @@ func (s *SQLiteBackup) LoadGroupEntries(aid string) map[string]map[string]any {
 		}
 		return oldRows.Err()
 	}); err != nil {
-		log.Printf("[WARN] SQLite 读取 group entries 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite read group entries failed: %v", err)
 	}
 	return groups
 }
@@ -449,7 +448,7 @@ func (s *SQLiteBackup) ReplaceGroupEntries(aid string, entries map[string]map[st
 		}
 		return nil
 	}, "replace_group_entries"); err != nil {
-		log.Printf("[WARN] SQLite replace_group_entries 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite replace_group_entries failed: %v", err)
 	}
 }
 
@@ -484,7 +483,7 @@ func (s *SQLiteBackup) CleanupGroupOldEpochs(aid, groupID string, cutoffMs int64
 		}
 		return rows.Err()
 	}); err != nil {
-		log.Printf("[WARN] SQLite 查询待清理旧 epoch 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite query expired old epoch failed: %v", err)
 		return nil
 	}
 	if len(epochs) == 0 {
@@ -499,7 +498,7 @@ func (s *SQLiteBackup) CleanupGroupOldEpochs(aid, groupID string, cutoffMs int64
 		}
 		return nil
 	}, "cleanup_group_old_epochs"); err != nil {
-		log.Printf("[WARN] SQLite cleanup_group_old_epochs 失败: %v", err)
+		pkgLogKeystore().Warn("SQLite cleanup_group_old_epochs failed: %v", err)
 		return nil
 	}
 	return epochs
@@ -605,7 +604,7 @@ func (s *SQLiteBackup) exec(query string, args ...any) {
 		_, err := s.db.Exec(query, args...)
 		return err
 	}); err != nil {
-		log.Printf("[WARN] SQLite 备份写入失败: %v", err)
+		pkgLogKeystore().Warn("SQLite backup write failed: %v", err)
 	}
 }
 
@@ -625,7 +624,7 @@ func (s *SQLiteBackup) queryRow(query string, dest any, args ...any) {
 		}
 		return nil
 	}); err != nil {
-		log.Printf("[WARN] SQLite 备份读取失败: %v", err)
+		pkgLogKeystore().Warn("SQLite backup read failed: %v", err)
 	}
 }
 

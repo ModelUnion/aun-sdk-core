@@ -31,9 +31,28 @@ func TestIntegration_MessageAckBasic(t *testing.T) {
 	aliceAID := ensureConnected(t, alice, fmt.Sprintf("ack-alice-%s.%s", rid, testIssuer()))
 	bobAID := ensureConnected(t, bob, fmt.Sprintf("ack-bob-%s.%s", rid, testIssuer()))
 
-	// 记录 Bob 当前最大 seq，作为 pull 起点
-	baseSeq := currentMaxSeq(t, bob, 200)
-	t.Logf("Bob 基线 seq: %d", baseSeq)
+	// 通过事件订阅接收消息（SDK connect 后会自动触发一次 P2P pull，推送+pull 都走 message.received）
+	var mu sync.Mutex
+	var received []map[string]any
+	done := make(chan struct{}, 1)
+	sub := bob.On("message.received", func(payload any) {
+		data, ok := payload.(map[string]any)
+		if !ok {
+			return
+		}
+		from, _ := data["from"].(string)
+		if from != aliceAID {
+			return
+		}
+		mu.Lock()
+		received = append(received, data)
+		mu.Unlock()
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	})
+	defer sub.Unsubscribe()
 
 	// Alice 发送持久化明文消息给 Bob
 	_, err := alice.Call(ctx, "message.send", map[string]any{
@@ -45,40 +64,24 @@ func TestIntegration_MessageAckBasic(t *testing.T) {
 		t.Skipf("发送消息失败（Docker 环境可能未运行）: %v", err)
 	}
 
-	time.Sleep(1 * time.Second)
-
-	// Bob 拉取消息
-	pullResult, err := bob.Call(ctx, "message.pull", map[string]any{
-		"after_seq": baseSeq,
-		"limit":     50,
-	})
-	if err != nil {
-		t.Fatalf("Bob pull 失败: %v", err)
+	// 等待 Bob 通过推送或自动 pull 收到消息
+	timer := time.NewTimer(10 * time.Second)
+	select {
+	case <-done:
+	case <-timer.C:
 	}
-	pullMap, _ := pullResult.(map[string]any)
-	msgs, _ := pullMap["messages"].([]any)
+	timer.Stop()
 
-	// 找到来自 Alice 的消息
-	var msgSeq int
-	found := false
-	for _, m := range msgs {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		from, _ := msg["from"].(string)
-		if from == aliceAID {
-			msgSeq = int(toInt64(msg["seq"]))
-			found = true
-			t.Logf("收到消息 seq=%d from=%s", msgSeq, from)
-			break
-		}
+	mu.Lock()
+	msgs := append([]map[string]any(nil), received...)
+	mu.Unlock()
+	if len(msgs) == 0 {
+		t.Fatalf("Bob 未收到来自 Alice 的消息")
 	}
-	if !found {
-		t.Fatalf("Bob 未收到来自 Alice 的消息, pull 结果: %#v", pullMap)
-	}
+	msgSeq := int(toInt64(msgs[0]["seq"]))
+	t.Logf("收到消息 seq=%d from=%s", msgSeq, aliceAID)
 
-	// Bob 确认消息
+	// Bob 确认消息（SDK 自动 pull 后已 ack 一次，这里再次 ack 验证幂等返回值）
 	ackResult, err := bob.Call(ctx, "message.ack", map[string]any{"seq": msgSeq})
 	if err != nil {
 		t.Fatalf("Bob ack 失败: %v", err)
@@ -111,10 +114,8 @@ func TestIntegration_MessageAckEvent(t *testing.T) {
 	// 持久化消息需要 queue 投递模式（connect 级别配置）
 	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
 
-	_ = ensureConnected(t, alice, fmt.Sprintf("ackev-alice-%s.%s", rid, testIssuer()))
+	aliceAID := ensureConnected(t, alice, fmt.Sprintf("ackev-alice-%s.%s", rid, testIssuer()))
 	bobAID := ensureConnected(t, bob, fmt.Sprintf("ackev-bob-%s.%s", rid, testIssuer()))
-
-	baseSeq := currentMaxSeq(t, bob, 200)
 
 	// Alice 订阅 ack 事件
 	var mu sync.Mutex
@@ -136,6 +137,29 @@ func TestIntegration_MessageAckEvent(t *testing.T) {
 	})
 	defer sub.Unsubscribe()
 
+	// Bob 订阅消息（SDK connect 后自动 P2P pull 即触发 message.received）
+	var bmu sync.Mutex
+	var bobInbox []map[string]any
+	bobDone := make(chan struct{}, 1)
+	bobSub := bob.On("message.received", func(payload any) {
+		data, ok := payload.(map[string]any)
+		if !ok {
+			return
+		}
+		from, _ := data["from"].(string)
+		if from != aliceAID {
+			return
+		}
+		bmu.Lock()
+		bobInbox = append(bobInbox, data)
+		bmu.Unlock()
+		select {
+		case bobDone <- struct{}{}:
+		default:
+		}
+	})
+	defer bobSub.Unsubscribe()
+
 	// Alice 发送消息给 Bob
 	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      bobAID,
@@ -146,44 +170,35 @@ func TestIntegration_MessageAckEvent(t *testing.T) {
 		t.Skipf("发送消息失败: %v", err)
 	}
 
-	time.Sleep(1 * time.Second)
-
-	// Bob 拉取并确认
-	pullResult, err := bob.Call(ctx, "message.pull", map[string]any{
-		"after_seq": baseSeq,
-		"limit":     50,
-	})
-	if err != nil {
-		t.Fatalf("Bob pull 失败: %v", err)
+	// 等待 Bob 收到消息（SDK 自动 pull 已 ack 一次，但事件应触发）
+	timer := time.NewTimer(10 * time.Second)
+	select {
+	case <-bobDone:
+	case <-timer.C:
 	}
-	pullMap, _ := pullResult.(map[string]any)
-	msgs, _ := pullMap["messages"].([]any)
+	timer.Stop()
 
-	var msgSeq int
-	for _, m := range msgs {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		msgSeq = int(toInt64(msg["seq"]))
-	}
-	if msgSeq == 0 {
+	bmu.Lock()
+	bobMsgs := append([]map[string]any(nil), bobInbox...)
+	bmu.Unlock()
+	if len(bobMsgs) == 0 {
 		t.Fatalf("Bob 未收到消息")
 	}
+	msgSeq := int(toInt64(bobMsgs[0]["seq"]))
 
-	_, err = bob.Call(ctx, "message.ack", map[string]any{"seq": msgSeq})
-	if err != nil {
+	// Bob 主动再 ack 一次，确保 alice 一定能收到 ack 事件
+	if _, err := bob.Call(ctx, "message.ack", map[string]any{"seq": msgSeq}); err != nil {
 		t.Fatalf("Bob ack 失败: %v", err)
 	}
 
 	// 等待 Alice 收到 ack 事件
-	timer := time.NewTimer(10 * time.Second)
+	timer2 := time.NewTimer(10 * time.Second)
 	select {
 	case <-ackDone:
-	case <-timer.C:
+	case <-timer2.C:
 		t.Fatalf("等待 ack 事件超时")
 	}
-	timer.Stop()
+	timer2.Stop()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -219,13 +234,38 @@ func TestIntegration_MessageAckSequence(t *testing.T) {
 	// 持久化消息需要 queue 投递模式（connect 级别配置）
 	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
 
-	_ = ensureConnected(t, alice, fmt.Sprintf("ackseq-alice-%s.%s", rid, testIssuer()))
+	aliceAID := ensureConnected(t, alice, fmt.Sprintf("ackseq-alice-%s.%s", rid, testIssuer()))
 	bobAID := ensureConnected(t, bob, fmt.Sprintf("ackseq-bob-%s.%s", rid, testIssuer()))
 
-	baseSeq := currentMaxSeq(t, bob, 200)
+	// Bob 订阅消息事件，统一通过事件路径接收（push + 自动 pull 都通过 message.received 投递）
+	const expected = 3
+	var mu sync.Mutex
+	var inbox []map[string]any
+	done := make(chan struct{}, 1)
+	sub := bob.On("message.received", func(payload any) {
+		data, ok := payload.(map[string]any)
+		if !ok {
+			return
+		}
+		from, _ := data["from"].(string)
+		if from != aliceAID {
+			return
+		}
+		mu.Lock()
+		inbox = append(inbox, data)
+		complete := len(inbox) >= expected
+		mu.Unlock()
+		if complete {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer sub.Unsubscribe()
 
 	// Alice 连续发送 3 条消息
-	for i := 1; i <= 3; i++ {
+	for i := 1; i <= expected; i++ {
 		_, err := alice.Call(ctx, "message.send", map[string]any{
 			"to":      bobAID,
 			"payload": map[string]any{"type": "text", "text": fmt.Sprintf("seq_test_%d", i)},
@@ -240,39 +280,30 @@ func TestIntegration_MessageAckSequence(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	time.Sleep(1 * time.Second)
-
-	// Bob 拉取所有消息
-	pullResult, err := bob.Call(ctx, "message.pull", map[string]any{
-		"after_seq": baseSeq,
-		"limit":     50,
-	})
-	if err != nil {
-		t.Fatalf("Bob pull 失败: %v", err)
+	timer := time.NewTimer(15 * time.Second)
+	select {
+	case <-done:
+	case <-timer.C:
 	}
-	pullMap, _ := pullResult.(map[string]any)
-	allMsgs, _ := pullMap["messages"].([]any)
+	timer.Stop()
 
-	// 收集消息的 seq
-	var seqs []int
-	for _, m := range allMsgs {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		seq := int(toInt64(msg["seq"]))
-		if seq > baseSeq {
-			seqs = append(seqs, seq)
-		}
+	mu.Lock()
+	msgs := append([]map[string]any(nil), inbox...)
+	mu.Unlock()
+	if len(msgs) < expected {
+		t.Fatalf("期望至少 %d 条消息，实际 %d 条", expected, len(msgs))
 	}
-	if len(seqs) < 3 {
-		t.Fatalf("期望至少 3 条消息，实际 %d 条 (seqs=%v)", len(seqs), seqs)
+
+	// 收集 seq
+	seqs := make([]int, 0, expected)
+	for _, msg := range msgs[:expected] {
+		seqs = append(seqs, int(toInt64(msg["seq"])))
 	}
 	t.Logf("收到消息 seqs: %v", seqs)
 
-	// 逐条确认，验证 ack_seq 递增
+	// 逐条 ack，验证 ack_seq 递增（SDK 内部已经 ack 过，再次 ack 是幂等操作）
 	prevAckSeq := 0
-	for i, seq := range seqs[:3] {
+	for i, seq := range seqs {
 		ackResult, err := bob.Call(ctx, "message.ack", map[string]any{"seq": seq})
 		if err != nil {
 			t.Fatalf("第 %d 次 ack(seq=%d) 失败: %v", i+1, seq, err)

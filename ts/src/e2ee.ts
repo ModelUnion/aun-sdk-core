@@ -164,7 +164,7 @@ function loadKeyStorePrekeys(
   if (typeof keystore.loadE2EEPrekeys === 'function') {
     return (keystore.loadE2EEPrekeys(aid, normalizedDeviceId) ?? {}) as LocalPrekeyStore;
   }
-  throw new Error('keystore 缺少 loadE2EEPrekeys 方法');
+  throw new Error('keystore missing loadE2EEPrekeys method');
 }
 
 function saveKeyStorePrekey(
@@ -291,7 +291,7 @@ function certToDerBytes(certPem: string | Buffer): Buffer {
       .replace(/-----END CERTIFICATE-----/g, '')
       .replace(/\s+/g, '');
     if (!body) {
-      throw new E2EEError('无效证书 PEM：缺少 base64 内容');
+      throw new E2EEError('invalid certificate PEM: missing base64 content');
     }
     return Buffer.from(body, 'base64');
   }
@@ -332,7 +332,7 @@ function publicKeyToUncompressedPoint(pubKey: crypto.KeyObject): Buffer {
 function uncompressedPointToPublicKey(point: Buffer): crypto.KeyObject {
   // 构造 JWK
   if (point[0] !== 0x04 || point.length !== 65) {
-    throw new E2EEError('无效的未压缩公钥点格式');
+    throw new E2EEError('invalid uncompressed public key point format');
   }
   const x = point.subarray(1, 33).toString('base64url');
   const y = point.subarray(33, 65).toString('base64url');
@@ -597,6 +597,7 @@ export class E2EEManager {
     protectedHeaders?: ProtectedHeadersInput,
     context?: JsonObject | null,
   ): [JsonObject, JsonObject] {
+    this._logger.debug(`encrypt start: to=${peerAid}, mid=${messageId}, hasPrekey=${prekey != null}`);
     // 传入 prekey → 缓存；传入 null → 查缓存
     if (prekey != null) {
       this.cachePrekey(peerAid, prekey);
@@ -611,6 +612,7 @@ export class E2EEManager {
           peerCertPem, messageId, timestamp,
           protectedHeaders, context,
         );
+        this._logger.debug(`encrypt success: mode=prekey_ecdh_v2, to=${peerAid}, mid=${messageId}`);
         return [envelope, {
           encrypted: true,
           forward_secrecy: true,
@@ -619,7 +621,7 @@ export class E2EEManager {
         }];
       } catch (exc) {
         // prekey 加密失败，降级到 long_term_key — 记录异常以便排查安全降级原因
-        this._logger.warn(`prekey 加密失败，降级到 long_term_key: ${exc instanceof Error ? exc.message : String(exc)}`);
+        this._logger.warn(`prekey encrypt failed, degrading to long_term_key: to=${peerAid}, mid=${messageId}, error=${exc instanceof Error ? exc.message : String(exc)}`);
       }
     }
 
@@ -629,6 +631,7 @@ export class E2EEManager {
       protectedHeaders, context,
     );
     const degraded = prekey != null;
+    this._logger.debug(`encrypt success: mode=long_term_key, to=${peerAid}, mid=${messageId}, degraded=${degraded}`);
     return [envelope, {
       encrypted: true,
       forward_secrecy: false,
@@ -649,6 +652,7 @@ export class E2EEManager {
     protectedHeaders?: ProtectedHeadersInput,
     context?: JsonObject | null,
   ): JsonObject {
+    this._logger.debug(`_encryptWithPrekey enter: to=${peerAid}, mid=${messageId}, prekey_id=${String(prekey.prekey_id ?? '')}`);
     const peerIdentityPublic = pemToCertPublicKey(peerCertPem);
     const expectedCertFingerprint = String(prekey.cert_fingerprint ?? '').trim().toLowerCase();
     if (expectedCertFingerprint) {
@@ -749,6 +753,7 @@ export class E2EEManager {
     protectedHeaders?: ProtectedHeadersInput,
     context?: JsonObject | null,
   ): JsonObject {
+    this._logger.debug(`_encryptWithLongTermKey enter: to=${peerAid}, mid=${messageId}`);
     const peerPublicKey = pemToCertPublicKey(peerCertPem);
     const senderIdentityPrivate = this._loadSenderIdentityPrivate();
 
@@ -817,12 +822,17 @@ export class E2EEManager {
     if (payload.type !== 'e2ee.encrypted') return message;
     if (!this._shouldDecryptForCurrentAid(message, payload)) return message;
 
+    const fromAid = (message.from ?? '') as string;
+    const msgId = (message.message_id ?? '') as string;
+    this._logger.debug(`decrypt message start: from=${fromAid}, mid=${msgId}`);
+
     // timestamp 窗口检查
     const ts = (message.timestamp ?? (payload.aad as JsonObject | undefined)?.timestamp) as number | undefined;
     if (typeof ts === 'number' && this._replayWindowSeconds > 0) {
       const nowMs = Date.now();
       const diffS = Math.abs(nowMs - ts) / 1000;
       if (diffS > this._replayWindowSeconds) {
+        this._logger.warn(`message dropped: outside time window: from=${fromAid}, mid=${msgId}, diffS=${diffS.toFixed(1)}`);
         return null;
       }
     }
@@ -830,11 +840,14 @@ export class E2EEManager {
     // H27: 本地防重放——必须在 _decryptMessage 成功后再 set seenKey，
     // 否则解密/验签失败时合法重传会被当作重复丢弃。
     const messageId = message.message_id as string || '';
-    const fromAid = message.from as string || '';
+    const fromAidKey = message.from as string || '';
     let seenKey = '';
-    if (messageId && fromAid) {
-      seenKey = `${fromAid}:${messageId}`;
-      if (this._seenMessages.has(seenKey)) return null;
+    if (messageId && fromAidKey) {
+      seenKey = `${fromAidKey}:${messageId}`;
+      if (this._seenMessages.has(seenKey)) {
+        this._logger.debug(`message replay blocked: from=${fromAidKey}, mid=${messageId}`);
+        return null;
+      }
     }
 
     const result = this._decryptMessage(message);
@@ -857,7 +870,7 @@ export class E2EEManager {
     try {
       this._verifySenderSignature(payload, message);
     } catch (exc) {
-      this._logger.warn('发送方签名验证失败');
+      this._logger.warn('sender signature verification failed');
       return null;
     }
 
@@ -946,6 +959,7 @@ export class E2EEManager {
       const context = exposedEnvelopeMetadata(payload.context);
       if (context) e2ee.context = context;
 
+      this._logger.debug(`_decryptMessagePrekeyV2 success: from=${String(message.from ?? '')}, mid=${String(message.message_id ?? '')}, prekey_id=${prekeyId}`);
       return {
         ...message,
         payload: decoded,
@@ -1028,6 +1042,7 @@ export class E2EEManager {
       const context = exposedEnvelopeMetadata(payload.context);
       if (context) e2ee.context = context;
 
+      this._logger.debug(`_decryptMessageLongTerm success: from=${String(message.from ?? '')}, mid=${String(message.message_id ?? '')}`);
       return {
         ...message,
         payload: decoded,
@@ -1117,6 +1132,7 @@ export class E2EEManager {
     const aid = this._currentAid();
     if (!aid) throw new E2EEError('AID unavailable for prekey generation');
     const deviceId = this._currentDeviceId();
+    this._logger.debug(`generate prekey start: aid=${aid}, deviceId=${deviceId}`);
 
     // 生成新 prekey
     const { privateKey, publicKey } = generateECKeyPair();
@@ -1157,6 +1173,7 @@ export class E2EEManager {
     if (deviceId) {
       result.device_id = deviceId;
     }
+    this._logger.debug(`generate prekey success: aid=${aid}, prekeyId=${prekeyId}`);
     return result;
   }
 
@@ -1182,8 +1199,28 @@ export class E2EEManager {
 
     const aid = this._currentAid();
     if (!aid) return null;
-    const prekeys = loadKeyStorePrekeys(this._keystore, aid, this._currentDeviceId());
-    const prekeyData = prekeys[prekeyId];
+
+    // 优先按 prekey_id 单点查询（O(1) 数据库行级查询）。
+    // 信封里都带 prekey_id，没必要全量加载所有 prekey（旧路径在 9000+ prekey 下要 ~430ms/次）。
+    let prekeyData: LocalPrekeyRecord | undefined;
+    const byIdLoader = (this._keystore as { loadE2EEPrekeyById?: (aid: string, prekeyId: string) => LocalPrekeyRecord | null }).loadE2EEPrekeyById;
+    if (typeof byIdLoader === 'function') {
+      try {
+        const hit = byIdLoader.call(this._keystore, aid, prekeyId);
+        if (hit) {
+          prekeyData = hit;
+          this._logger.debug(`prekey ${prekeyId} by_id lookup hit`);
+        }
+      } catch (exc) {
+        this._logger.warn(`prekey ${prekeyId} by_id loader failed, falling back to full load: ${exc instanceof Error ? exc.message : String(exc)}`);
+      }
+    }
+
+    // 回退：旧版 keystore 没有 by_id 方法，或单点查询未命中 → 全量扫描
+    if (!prekeyData) {
+      const prekeys = loadKeyStorePrekeys(this._keystore, aid, this._currentDeviceId());
+      prekeyData = prekeys[prekeyId];
+    }
     if (!prekeyData) return null;
     const privateKeyPem = prekeyData.private_key_pem as string | undefined;
     if (!privateKeyPem) return null;

@@ -31,6 +31,10 @@ type mockAuthClient struct {
 	fetchPeerCertResult   []byte
 	fetchPeerCertErr      error
 	fetchPeerCertCalls    int
+	cachedGatewayURL      string
+	persistedGatewayURL   string
+	persistGatewayCalls   int
+	loadCachedGatewayCalls int
 }
 
 func (m *mockAuthClient) GetGatewayURL() string {
@@ -85,6 +89,16 @@ func (m *mockAuthClient) DiscoverGateway(ctx context.Context, wellKnownURL strin
 
 func (m *mockAuthClient) SetIdentity(identity map[string]any) {
 	m.identity = identity
+}
+
+func (m *mockAuthClient) AuthLoadCachedGatewayURL(aid string) string {
+	m.loadCachedGatewayCalls++
+	return m.cachedGatewayURL
+}
+
+func (m *mockAuthClient) AuthPersistGatewayURL(aid, gatewayURL string) {
+	m.persistGatewayCalls++
+	m.persistedGatewayURL = gatewayURL
 }
 
 func makeIdentity(t *testing.T, aid string) map[string]any {

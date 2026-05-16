@@ -106,7 +106,8 @@ export class FileSecretStore implements SecretStore {
         decipher.final(),
       ]);
       return decrypted;
-    } catch {
+    } catch (exc) {
+      this._logger.error(`field decryption failed (scope=${scope}, name=${name}): ${exc instanceof Error ? exc.message : String(exc)}`, exc instanceof Error ? exc : undefined);
       return null;
     }
   }
@@ -137,7 +138,7 @@ export class FileSecretStore implements SecretStore {
       const restored = backup.restoreSeed();
       if (restored && restored.length > 0) {
         source = 'sqlite';
-        this._logger.info('从 SQLite 恢复 .seed 文件');
+        this._logger.info('restoring .seed file from SQLite');
         writeFileSync(seedPath, restored);
         if (process.platform !== 'win32') {
           try { chmodSync(seedPath, 0o600); } catch { /* ignore */ }

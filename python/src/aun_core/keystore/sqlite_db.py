@@ -10,18 +10,18 @@ import base64
 import hashlib
 import hmac
 import json
-import logging
 import os
 import sqlite3 as _sqlite_mod
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-_log = logging.getLogger("aun_core.keystore")
+if TYPE_CHECKING:
+    from ..logger import AUNLogger, NullLogger
 
 _SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5000
@@ -74,7 +74,6 @@ def load_or_create_seed(root: Path, *, encryption_seed: str | None = None) -> by
             os.chmod(seed_path, 0o600)
         except OSError:
             pass
-    _log.info("新 seed 已生成: %s", seed_path)
     return seed
 
 
@@ -166,7 +165,9 @@ class AIDDatabase:
     线程安全由外部 RLock 保证。
     """
 
-    def __init__(self, db_path: Path, sqlite_key: bytes | str | None = None) -> None:
+    def __init__(self, db_path: Path, sqlite_key: bytes | str | None = None, logger=None) -> None:
+        from ..logger import NullLogger as _NL
+        self._log = logger or _NL()
         self._db_path = db_path
         if isinstance(sqlite_key, str):
             self._seed_bytes = sqlite_key.encode("utf-8")
@@ -208,9 +209,9 @@ class AIDDatabase:
             bak = p.with_suffix(f"{p.suffix}.{tag}_{ts}.bak")
             try:
                 shutil.copy2(str(p), str(bak))
-                _log.warning("已备份数据库文件: %s → %s", p, bak)
+                self._log.warn("keystore", "database file backed up: %s -> %s", p, bak)
             except OSError as exc:
-                _log.warning("备份数据库文件失败: %s — %s", p, exc)
+                self._log.warn("keystore", "database file backup failed: %s - %s", p, exc)
                 all_ok = False
         return all_ok
 
@@ -250,6 +251,11 @@ class AIDDatabase:
             try:
                 conn = self._open_and_init()
                 self._conn = conn
+                self._log.debug(
+                    "keystore",
+                    "AIDDatabase connection ready: path=%s exclusive_locking=%s",
+                    self._db_path, self._use_exclusive_locking,
+                )
                 return conn
             except Exception as exc:
                 last_exc = exc
@@ -260,10 +266,10 @@ class AIDDatabase:
                     try:
                         conn.close()
                     except Exception as close_exc:
-                        _log.debug("关闭失败连接时出错: %s", close_exc)
+                        self._log.debug("keystore", "error closing failed connection: %s", close_exc)
                 if is_malformed and attempt < self._MAX_CONNECT_RETRIES:
-                    _log.warning(
-                        "数据库文件损坏 (attempt %d/%d)，备份后重建: %s — %s",
+                    self._log.warn("keystore",
+                        "database file corrupted (attempt %d/%d), backup and rebuild: %s — %s",
                         attempt, self._MAX_CONNECT_RETRIES, self._db_path, exc,
                     )
                     try:
@@ -271,13 +277,13 @@ class AIDDatabase:
                         if backup_ok:
                             self._cleanup_broken_files()
                         else:
-                            _log.warning("备份不完整，跳过删除以防数据丢失: %s", self._db_path)
+                            self._log.warn("keystore", "backup incomplete, skipping delete to prevent data loss: %s", self._db_path)
                     except OSError as rm_err:
-                        _log.warning("删除损坏数据库文件失败: %s", rm_err)
+                        self._log.warn("keystore", "failed to delete corrupted database file: %s", rm_err)
                     continue
                 if "database is locked" in err_msg and attempt < self._MAX_CONNECT_RETRIES:
-                    _log.warning(
-                        "数据库被锁定 (attempt %d/%d)，%ss 后重试: %s",
+                    self._log.warn("keystore",
+                        "database locked (attempt %d/%d), retrying in %ss: %s",
                         attempt, self._MAX_CONNECT_RETRIES, self._RETRY_DELAY_S, self._db_path,
                     )
                     import time as _time
@@ -292,8 +298,8 @@ class AIDDatabase:
             return self._open_and_init_once(exclusive_locking=self._use_exclusive_locking)
         except Exception as exc:
             if self._should_enable_exclusive_fallback(exc):
-                _log.warning(
-                    "数据库初始化命中 disk I/O error，切换为 EXCLUSIVE locking 回退: %s",
+                self._log.warn("keystore",
+                    "database init hit disk I/O error, switching to EXCLUSIVE locking fallback: %s",
                     self._db_path,
                 )
                 conn = self._open_and_init_once(exclusive_locking=True)
@@ -322,7 +328,7 @@ class AIDDatabase:
             try:
                 conn.close()
             except Exception as close_exc:
-                _log.debug("关闭失败连接时出错: %s", close_exc)
+                self._log.debug("keystore", "error closing failed connection: %s", close_exc)
             del conn
             gc.collect()
             raise
@@ -378,7 +384,7 @@ class AIDDatabase:
             }
             return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         except Exception as exc:
-            _log.warning("字段加密失败 (scope=%s, name=%s)，降级明文存储: %s", self._scope, name, exc)
+            self._log.error("keystore", "field encryption failed (scope=%s, name=%s), degrading to plaintext: %s", self._scope, name, exc, err=exc)
             return plaintext
 
     def _reveal_text(self, name: str, stored: str) -> str:
@@ -400,7 +406,7 @@ class AIDDatabase:
             tag = _decode_secret_part(str(record.get("tag") or ""))
             return AESGCM(field_key).decrypt(nonce, ciphertext + tag, None).decode("utf-8")
         except Exception as exc:
-            _log.warning("字段解密失败 (scope=%s, name=%s): %s", self._scope, name, exc)
+            self._log.error("keystore", "field decryption failed (scope=%s, name=%s): %s", self._scope, name, exc, err=exc)
             return stored
 
     def close(self) -> None:
@@ -408,6 +414,7 @@ class AIDDatabase:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+                self._log.debug("keystore", "AIDDatabase closed: path=%s", self._db_path)
 
     def _retry_on_locked(self, fn, *args, max_retries: int = 3, delay: float = 0.05):
         """对 database is locked 和 malformed 异常自动重试。"""
@@ -417,25 +424,25 @@ class AIDDatabase:
             except Exception as exc:
                 err_msg = str(exc).lower()
                 if "database is locked" in err_msg and attempt < max_retries:
-                    _log.debug("数据库 locked (attempt %d/%d)，重试", attempt, max_retries)
+                    self._log.debug("keystore", "database locked (attempt %d/%d), retrying", attempt, max_retries)
                     time.sleep(delay * attempt)
                     continue
                 if self._is_recoverable_db_error(err_msg) and attempt < max_retries:
-                    _log.warning("数据库损坏 (attempt %d/%d)，重建连接", attempt, max_retries)
+                    self._log.warn("keystore", "database corrupted (attempt %d/%d), rebuilding connection", attempt, max_retries)
                     if self._conn is not None:
                         try:
                             self._conn.close()
                         except Exception as close_exc:
-                            _log.debug("关闭失败连接时出错: %s", close_exc)
+                            self._log.debug("keystore", "error closing failed connection: %s", close_exc)
                     self._conn = None  # 清除连接，下次 _get_conn 重建
                     try:
                         backup_ok = self._backup_broken_files()
                         if backup_ok:
                             self._cleanup_broken_files()
                         else:
-                            _log.warning("备份不完整，跳过删除以防数据丢失: %s", self._db_path)
+                            self._log.warn("keystore", "backup incomplete, skipping delete to prevent data loss: %s", self._db_path)
                     except OSError as rm_err:
-                        _log.warning("备份/删除损坏数据库文件失败: %s", rm_err)
+                        self._log.warn("keystore", "backup/delete corrupted database file failed: %s", rm_err)
                     continue
                 raise
 
@@ -1338,6 +1345,17 @@ class AIDDatabase:
             (device_id, slot),
         )
         return {row[0]: int(row[1]) for row in cur.fetchall()}
+
+    def delete_seq(self, device_id: str, slot_id: str, namespace: str) -> None:
+        def _do():
+            conn = self._get_conn()
+            slot = slot_id or "_singleton"
+            conn.execute(
+                "DELETE FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?",
+                (device_id, slot, namespace),
+            )
+            conn.commit()
+        self._retry_on_locked(_do)
 
     # ── Metadata KV ──────────────────────────────────────────
 

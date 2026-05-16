@@ -130,11 +130,18 @@ def _make_encrypted_group_msg(gs, group_id=_GRP, from_aid=_AID_ALICE, seq=1, epo
 
 
 class TestPY001DecryptFailStillAutoAck:
-    """PY-001: 群消息解密失败后仍应执行 auto-ack，消息同时进入待重试队列。"""
+    """PY-001: 群消息解密失败语义。
+
+    新契约（与 C++/TS/Go/JS 五 SDK 对齐）：
+      - 解密失败时**不立即 auto-ack**，等密钥恢复后 retry 解密成功才推进 + ack；
+      - recovery 真的失败时由 _retry_pending_decrypt_msgs(force_advance_on_fail=True)
+        兜底强制推进 + ack（30s 超时定时触发）。
+    旧契约"失败立即 ack"会让缺密钥的消息永久丢失，已废弃。
+    """
 
     @pytest.mark.asyncio
-    async def test_decrypt_fail_still_auto_ack(self, tmp_path, monkeypatch):
-        """解密失败时也应调用 group.ack_messages，避免游标卡住。"""
+    async def test_decrypt_fail_does_not_auto_ack(self, tmp_path, monkeypatch):
+        """解密失败时**不应立即** auto-ack（让服务端 cursor 留在原位等 retry）。"""
         client = _make_client(tmp_path)
         async def fake_recover(*args, **kwargs):
             return False
@@ -157,9 +164,8 @@ class TestPY001DecryptFailStillAutoAck:
         await client._process_and_publish_group_message(msg)
         await asyncio.sleep(0)
 
-        assert len(ack_calls) == 1, \
-            f"解密失败时应调用 auto-ack 1 次，实际 {len(ack_calls)} 次"
-        assert ack_calls[0]["msg_seq"] == 1
+        assert len(ack_calls) == 0, \
+            f"解密失败时不应 auto-ack，实际 {len(ack_calls)} 次"
 
     @pytest.mark.asyncio
     async def test_decrypt_fail_adds_to_pending_queue(self, tmp_path, monkeypatch):

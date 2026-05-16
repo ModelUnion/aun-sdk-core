@@ -168,7 +168,7 @@ class TestGroupSendEncrypt:
         assert p["payload"]["encryption_mode"] == "epoch_group_key"
 
     def test_plaintext_group_send_waits_for_membership_floor(self, tmp_path, monkeypatch):
-        """明文群消息也必须等待成员 epoch floor，避免服务端拒绝旧 epoch。"""
+        """明文群消息不受 group epoch 轮换状态影响：不再触发 epoch floor 预检。"""
         client = _make_client(tmp_path)
         call_order = []
 
@@ -188,8 +188,9 @@ class TestGroupSendEncrypt:
             "encrypt": False,
         }))
 
-        assert call_order[0] == ("wait", _GRP, True)
-        assert call_order[1] == ("send", "group.send", _GRP)
+        # 明文路径不调用 epoch floor 预检
+        assert ("wait", _GRP, True) not in call_order
+        assert call_order == [("send", "group.send", _GRP)]
 
     def test_membership_floor_above_committed_uses_committed_epoch(self, tmp_path, monkeypatch):
         """成员 floor 高于 committed epoch 时只记录诊断，不阻断发送。"""
@@ -2622,6 +2623,7 @@ class TestGroupEpochRaceHardening:
 
     def test_distribution_without_rotation_id_rejects_future_epoch(self, tmp_path, monkeypatch):
         client = _make_client(tmp_path)
+        client._group_synced.add(_GRP)
 
         async def fake_call(method, params):
             assert method == "group.e2ee.get_epoch"
@@ -3218,6 +3220,8 @@ class TestOpenJoinRotationLeaderElection:
         async def fake_rotate(group_id, **kwargs):
             rotate_calls.append((group_id, kwargs))
 
+        # bob 作为 member 仅当本地 epoch key 存在时才会参与选举；mock 成已持有
+        monkeypatch.setattr(client._group_e2ee, "load_secret", lambda gid, epoch: b"mock-secret")
         monkeypatch.setattr(client, "call", fake_call)
         monkeypatch.setattr("aun_core.client.random.random", lambda: 0.0)
         monkeypatch.setattr("aun_core.client.asyncio.sleep", fake_sleep)

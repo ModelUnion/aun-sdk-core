@@ -252,6 +252,32 @@ describe('IndexedDBKeyStore', () => {
     expect(await readStoreItems('prekeys')).toHaveLength(1);
   });
 
+  it('loadE2EEPrekeyById 应按 prekey_id 单点查询并匹配 device-scoped 记录', async () => {
+    const now = Date.now();
+    // 1) 无 device_id 的 canonical 路径
+    await ks.saveE2EEPrekey!('byid-aid', 'pk-direct', {
+      private_key_pem: 'PEM-DIRECT',
+      created_at: now,
+    });
+    const direct = await (ks as { loadE2EEPrekeyById?: (aid: string, id: string) => Promise<Record<string, unknown> | null> })
+      .loadE2EEPrekeyById!('byid-aid', 'pk-direct');
+    expect(direct).toEqual({ private_key_pem: 'PEM-DIRECT', created_at: now });
+
+    // 2) 设备级 prekey（key 形如 aid|device|prekey_id）→ 单查回退到前缀扫描后命中
+    await ks.saveE2EEPrekey!('byid-aid', 'pk-device', {
+      private_key_pem: 'PEM-DEVICE',
+      created_at: now,
+    }, 'phone');
+    const deviceHit = await (ks as { loadE2EEPrekeyById?: (aid: string, id: string) => Promise<Record<string, unknown> | null> })
+      .loadE2EEPrekeyById!('byid-aid', 'pk-device');
+    expect(deviceHit).toEqual({ private_key_pem: 'PEM-DEVICE', created_at: now });
+
+    // 3) 不存在的 prekey_id 应返回 null（未命中且不抛异常）
+    const miss = await (ks as { loadE2EEPrekeyById?: (aid: string, id: string) => Promise<Record<string, unknown> | null> })
+      .loadE2EEPrekeyById!('byid-aid', 'pk-missing');
+    expect(miss).toBeNull();
+  });
+
   // ── 身份组合操作 ──────────────────────────────────
 
   it('saveIdentity 应拆分保存到各仓库', async () => {

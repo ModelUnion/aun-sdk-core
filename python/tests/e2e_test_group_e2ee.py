@@ -102,9 +102,10 @@ def _normalize_slot_part(value: str) -> str:
 
 
 def _build_test_slot_id(tag: str, rid: str | None = None) -> str:
+    # 使用固定 slot_id（不含随机部分），让服务端 cursor 跨测试运行持久化，
+    # 避免每次新 slot 从 seq=0 拉全量历史触发 epoch 编排风暴。
     tag_part = _normalize_slot_part(tag)
-    rid_part = _normalize_slot_part(rid) if rid else uuid.uuid4().hex[:12]
-    slot_id = f"{tag_part}-{rid_part}"
+    slot_id = f"{tag_part}-main"
     return slot_id[:128]
 
 
@@ -143,13 +144,18 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
             if slot_id:
                 connect_params["slot_id"] = slot_id
             connect_params["auto_reconnect"] = False
+            print(f"[connect diag] aid={aid} attempt={attempt} gateway={connect_params.get('gateway')!r} topology={connect_params.get('topology')!r} access_token={'set' if connect_params.get('access_token') else 'missing'}")
             await client.connect(connect_params)
             return aid
         except (AuthError, RateLimitError) as exc:
             last_error = exc
+            print(f"[connect diag] aid={aid} attempt={attempt} retryable_error={type(exc).__name__}: {exc}")
             if attempt >= 3:
                 break
             await asyncio.sleep(1.5 * (attempt + 1))
+        except Exception as exc:
+            print(f"[connect diag] aid={aid} attempt={attempt} fatal_error={type(exc).__name__}: {exc}")
+            raise
     raise last_error or RuntimeError(f"{aid} connect failed")
 
 

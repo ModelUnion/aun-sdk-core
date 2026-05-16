@@ -918,7 +918,7 @@ func TestPullEmptyResultAppliesRetentionFloor(t *testing.T) {
 	if _, err := c.Call(ctx, "group.pull", map[string]any{"group_id": groupID, "after_message_seq": 0, "limit": 5}); err != nil {
 		t.Fatalf("group.pull 失败: %v", err)
 	}
-	if got := c.seqTracker.GetContiguousSeq("group:" + groupID); got != 9 {
+	if got := c.seqTracker.GetContiguousSeq("group:" + NormalizeGroupID(groupID, "")); got != 9 {
 		t.Fatalf("空 group.pull 应推进 contiguous 到 cursor.current_seq=9, got=%d", got)
 	}
 
@@ -1082,6 +1082,7 @@ func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
 }
 
 func TestCallDoesNotForwardPlaintextMessageProtectedHeaders(t *testing.T) {
+	// message.send 明文路径应保留 protected_headers/headers（信封元数据，加密与否都保留）
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		if method == "auth.connect" {
 			return map[string]any{"status": "ok"}
@@ -1128,11 +1129,123 @@ func TestCallDoesNotForwardPlaintextMessageProtectedHeaders(t *testing.T) {
 	if sendCall == nil {
 		t.Fatal("未捕获 message.send")
 	}
-	if _, exists := sendCall.Params["protected_headers"]; exists {
-		t.Fatalf("message.send 不应转发 protected_headers: %#v", sendCall.Params)
+	if _, exists := sendCall.Params["protected_headers"]; !exists {
+		t.Fatalf("message.send 明文路径应保留 protected_headers: %#v", sendCall.Params)
 	}
-	if _, exists := sendCall.Params["headers"]; exists {
-		t.Fatalf("message.send 不应转发 headers: %#v", sendCall.Params)
+	if _, exists := sendCall.Params["headers"]; !exists {
+		t.Fatalf("message.send 明文路径应保留 headers: %#v", sendCall.Params)
+	}
+}
+
+func TestCallPlaintextMessageThoughtPutPassesThrough(t *testing.T) {
+	// message.thought.put encrypt=false 应走通用 RPC 路径，保留 payload/protected_headers/context
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "auth.connect" {
+			return map[string]any{"status": "ok"}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "message.thought.put", map[string]any{
+		"to":                "bob.example.com",
+		"payload":           map[string]any{"type": "thought", "text": "明文 thought"},
+		"encrypt":           false,
+		"protected_headers": map[string]any{"trace": "t1"},
+		"context":           map[string]any{"type": "message", "id": "m-1"},
+	}); err != nil {
+		t.Fatalf("message.thought.put 失败: %v", err)
+	}
+
+	var call *testRPCCall
+	for _, c := range getCalls() {
+		if c.Method == "message.thought.put" {
+			cc := c
+			call = &cc
+		}
+	}
+	if call == nil {
+		t.Fatal("未捕获 message.thought.put")
+	}
+	if _, exists := call.Params["encrypt"]; exists {
+		t.Fatalf("encrypt 字段应被剥离: %#v", call.Params)
+	}
+	if _, exists := call.Params["protected_headers"]; !exists {
+		t.Fatalf("明文 thought.put 应保留 protected_headers: %#v", call.Params)
+	}
+	if _, exists := call.Params["payload"]; !exists {
+		t.Fatalf("明文 thought.put 应透传 payload: %#v", call.Params)
+	}
+	if _, exists := call.Params["context"]; !exists {
+		t.Fatalf("明文 thought.put 应透传 context: %#v", call.Params)
+	}
+}
+
+func TestCallPlaintextGroupSendPreservesProtectedHeaders(t *testing.T) {
+	// group.send encrypt=false 明文路径应保留 protected_headers/headers，且不触发 epoch floor 预检
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "auth.connect" {
+			return map[string]any{"status": "ok"}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "group.send", map[string]any{
+		"group_id":          "group.example.com/g-test",
+		"payload":           map[string]any{"type": "text", "text": "群明文"},
+		"encrypt":           false,
+		"protected_headers": map[string]any{"trace": "t1"},
+		"headers":           map[string]any{"misc": "h"},
+	}); err != nil {
+		t.Fatalf("group.send 失败: %v", err)
+	}
+
+	for _, cc := range getCalls() {
+		if cc.Method == "group.e2ee.get_epoch" || cc.Method == "group.get_members" {
+			t.Fatalf("明文 group.send 不应触发 epoch floor 预检 (%s)", cc.Method)
+		}
+	}
+
+	var call *testRPCCall
+	for _, c := range getCalls() {
+		if c.Method == "group.send" {
+			cc := c
+			call = &cc
+		}
+	}
+	if call == nil {
+		t.Fatal("未捕获 group.send")
+	}
+	if _, exists := call.Params["protected_headers"]; !exists {
+		t.Fatalf("明文 group.send 应保留 protected_headers: %#v", call.Params)
+	}
+	if _, exists := call.Params["headers"]; !exists {
+		t.Fatalf("明文 group.send 应保留 headers: %#v", call.Params)
 	}
 }
 
@@ -1267,6 +1380,8 @@ func TestSchedulePrekeyReplenishIfConsumedOnlyOnce(t *testing.T) {
 
 	c.mu.Lock()
 	c.state = StateConnected
+	// 仅活跃 prekey 被消费时才触发上传；测试需显式设置 active 模拟"刚上传"的状态。
+	c.activePrekeyID = "pk-1"
 	c.prekeyUploadHook = func(ctx context.Context) error {
 		done <- struct{}{}
 		return nil
@@ -1651,7 +1766,7 @@ func TestOnRawGroupChanged_MemberDoesNotRotateEpoch(t *testing.T) {
 
 func TestSendGroupEncryptedUsesCommittedEpoch(t *testing.T) {
 	aid := "alice.example.com"
-	groupID := "g-committed.example.com"
+	groupID := "group.example.com/g-committed"
 	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
 	members := []string{aid, "bob.example.com"}
 	secret := GenerateGroupSecret()
@@ -1725,7 +1840,7 @@ func TestSendGroupEncryptedUsesCommittedEpoch(t *testing.T) {
 
 func TestPutGroupThoughtEncryptedSignsAndEncrypts(t *testing.T) {
 	aid := "alice.example.com"
-	groupID := "g-thought-put.example.com"
+	groupID := "group.example.com/g-thought-put"
 	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
 	members := []string{aid, "bob.example.com"}
 	secret := GenerateGroupSecret()
@@ -2259,7 +2374,7 @@ func TestRecoverGroupEpochKeyChecksPendingSecretAgainstServer(t *testing.T) {
 
 func TestSendGroupEncryptedUsesAdvancedCommittedEpochAfterRecovery(t *testing.T) {
 	aid := "alice.example.com"
-	groupID := "g-committed-advance.example.com"
+	groupID := "group.example.com/g-committed-advance"
 	identity, _, _ := testBuildIdentityWithFingerprint(t, aid)
 	members := []string{aid, "bob.example.com"}
 	secret1 := GenerateGroupSecret()

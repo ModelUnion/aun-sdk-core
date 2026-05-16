@@ -1,6 +1,7 @@
 // ── GroupE2EEManager（群组端到端加密 — 浏览器 SubtleCrypto 实现）──
 // 所有密码学操作均为异步（SubtleCrypto API 要求）
 
+import type { ModuleLogger } from './logger.js';
 import {
   E2EEError,
   E2EEGroupSecretMissingError,
@@ -23,6 +24,12 @@ import {
   type ProtectedHeadersInput,
 } from './e2ee.js';
 import type { KeyStore } from './keystore/index.js';
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+// 顶层函数共享的模块 logger（client 构造时通过 setModuleLogger 注入）
+let _moduleLog: ModuleLogger = _noopLog;
+export function setModuleLogger(log: ModuleLogger): void { _moduleLog = log; }
+
 import {
   isJsonObject,
   type GroupSecretRecord,
@@ -663,7 +670,7 @@ export async function decryptGroupMessage(
 
   const groupSecret = groupSecrets.get(epoch);
   if (!groupSecret) {
-    console.warn('[aun_core.e2ee-group] 群消息解密失败：找不到对应 epoch 的密钥');
+    _moduleLog.warn('[aun_core.e2ee-group] group message decrypt failed: epoch key not found');
     return null;
   }
 
@@ -682,18 +689,18 @@ export async function decryptGroupMessage(
 
       // 外层路由字段与 AAD 绑定校验
       if (outerGroupId && groupId !== outerGroupId) {
-        console.warn('[aun_core.e2ee-group] AAD group_id 与外层路由不匹配');
+        _moduleLog.warn('[aun_core.e2ee-group] AAD group_id mismatches outer route');
         return null;
       }
       if (aadFrom) {
         const outerFrom = (message.from ?? '') as string;
         const outerSender = String(message.sender_aid ?? '');
         if (outerFrom && outerFrom !== aadFrom) {
-          console.warn('[aun_core.e2ee-group] AAD from 与外层 from 不匹配');
+          _moduleLog.warn('[aun_core.e2ee-group] AAD from mismatches outer from');
           return null;
         }
         if (outerSender && outerSender !== aadFrom) {
-          console.warn('[aun_core.e2ee-group] AAD sender_aid 与外层 sender_aid 不匹配');
+          _moduleLog.warn('[aun_core.e2ee-group] AAD sender_aid mismatches outer sender_aid');
           return null;
         }
       }
@@ -703,7 +710,7 @@ export async function decryptGroupMessage(
     }
 
     if (!groupId || !messageId) {
-      console.warn('[aun_core.e2ee-group] 群消息解密失败：缺少 groupId 或 messageId');
+      _moduleLog.warn('[aun_core.e2ee-group] group message decrypt failed: missing groupId or messageId');
       return null;
     }
 
@@ -747,30 +754,30 @@ export async function decryptGroupMessage(
     if (requireSignature) {
       // 零信任模式：必须有签名且有证书可验证
       if (!senderSigB64) {
-        console.warn(`拒绝无发送方签名的群消息（require_signature=true）: group=${groupId} from=${aadFrom}`);
+        _moduleLog.warn(`reject group msg without sender signature (require_signature=true): group=${groupId} from=${aadFrom}`);
         return null;
       }
       if (!senderCertPem) {
-        console.warn(
+        _moduleLog.warn(
           `拒绝群消息：有签名但无发送方证书可验证（零信任模式禁止跳过验签）: group=${groupId} from=${aadFrom}`,
         );
         return null;
       }
       const verified = await _verifySenderSigGroup(senderCertPem, senderSigB64, ciphertext, tag, aadBytes);
       if (!verified) {
-        console.warn(`群消息发送方签名验证失败: group=${groupId} from=${aadFrom}`);
+        _moduleLog.warn(`group msg sender signature verify failed: group=${groupId} from=${aadFrom}`);
         return null;
       }
       if (isJsonObject(result.e2ee)) result.e2ee.sender_verified = true;
     } else if (senderCertPem) {
       // 非零信任模式但提供了证书：有证书时强制验签
       if (!senderSigB64) {
-        console.warn(`拒绝无发送方签名的群消息: group=${groupId} from=${aadFrom}`);
+        _moduleLog.warn(`reject group msg without sender signature: group=${groupId} from=${aadFrom}`);
         return null;
       }
       const verified = await _verifySenderSigGroup(senderCertPem, senderSigB64, ciphertext, tag, aadBytes);
       if (!verified) {
-        console.warn(`群消息发送方签名验证失败: group=${groupId} from=${aadFrom}`);
+        _moduleLog.warn(`group msg sender signature verify failed: group=${groupId} from=${aadFrom}`);
         return null;
       }
       if (isJsonObject(result.e2ee)) result.e2ee.sender_verified = true;
@@ -778,7 +785,7 @@ export async function decryptGroupMessage(
 
     return result;
   } catch (exc) {
-    console.warn('[aun_core.e2ee-group] 群消息解密异常:', exc instanceof Error ? (exc.stack || exc.message) : String(exc));
+    _moduleLog.warn('[aun_core.e2ee-group] group message decrypt exception:', exc instanceof Error ? (exc.stack || exc.message) : String(exc));
     return null;
   }
 }
@@ -1156,7 +1163,7 @@ async function assessIncomingEpochChain(
   const rotator = rotatorAid.trim();
 
   if (rid && !chain) {
-    console.warn(`[aun_core.e2ee-group] 拒绝缺少 epoch_chain 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+    _moduleLog.warn(`[aun_core.e2ee-group] reject missing epoch_chain new rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
     return { ok: false };
   }
 
@@ -1167,7 +1174,7 @@ async function assessIncomingEpochChain(
     if (chain && currentChain === chain) return { ok: true };
     if (rid && chain && currentChain && currentChain !== chain) {
       if (!(currentPendingRotationId && currentPendingRotationId !== rid)) {
-        console.warn(`[aun_core.e2ee-group] 拒绝同 epoch 分叉 chain source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+        _moduleLog.warn(`[aun_core.e2ee-group] reject same epoch forked chain source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
         return { ok: false };
       }
     }
@@ -1179,17 +1186,17 @@ async function assessIncomingEpochChain(
   if (!prevChain) return { ok: true, unverified: true, reason: 'missing_prev_chain' };
   if (!rotator) {
     if (rid) {
-      console.warn(`[aun_core.e2ee-group] 拒绝缺少 rotator_aid 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      _moduleLog.warn(`[aun_core.e2ee-group] reject missing rotator_aid new rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
       return { ok: false };
     }
     return { ok: true, unverified: true, reason: 'missing_rotator_aid' };
   }
   if (!await verifyEpochChain(chain, prevChain, epoch, commitment, rotator)) {
     if (rid) {
-      console.warn(`[aun_core.e2ee-group] 拒绝 epoch_chain 验证失败的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      _moduleLog.warn(`[aun_core.e2ee-group] reject epoch_chain verify failed new rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
       return { ok: false };
     }
-    console.warn(`[aun_core.e2ee-group] epoch_chain 验证失败，按兼容档接收并标记未验证 source=${source} group=${groupId} epoch=${epoch}`);
+    _moduleLog.warn(`[aun_core.e2ee-group] epoch_chain verify failed, accept in compat mode and mark unverified source=${source} group=${groupId} epoch=${epoch}`);
     return { ok: true, unverified: true, reason: 'chain_mismatch_legacy' };
   }
   if (!rid) return { ok: true, unverified: true, reason: 'missing_rotation_id' };
@@ -1311,12 +1318,12 @@ export async function handleKeyDistribution(
   const manifest = isJsonObject(payload.manifest) ? payload.manifest : undefined;
   if (initiatorCertPem) {
     if (!manifest) {
-      console.warn(`拒绝无 manifest 的密钥分发: group=${groupId} epoch=${epoch}`);
+      _moduleLog.warn(`rejectno manifest  keydistribute: group=${groupId} epoch=${epoch}`);
       return false;
     }
     const valid = await verifyMembershipManifest(manifest, initiatorCertPem);
     if (!valid) {
-      console.warn(`group key distribution manifest 签名验证失败: group=${groupId} epoch=${epoch}`);
+      _moduleLog.warn(`group key distribution manifest signature verifyfailed: group=${groupId} epoch=${epoch}`);
       return false;
     }
     if (manifest.group_id !== groupId || manifest.epoch !== epoch) return false;
@@ -1609,6 +1616,9 @@ export class GroupKeyRequestThrottle {
  * 所有密码学操作均为异步。
  */
 export class GroupE2EEManager {
+  private _log: ModuleLogger = _noopLog;
+  setLogger(log: ModuleLogger): void { this._log = log; }
+
   private _identityFn: () => IdentityRecord;
   private _keystoreRef: KeyStore;
   private _replayGuard: GroupReplayGuard;
@@ -1650,21 +1660,29 @@ export class GroupE2EEManager {
     groupId: string,
     memberAids: string[],
   ): Promise<JsonObject> {
-    const aid = this._currentAid();
-    const gs = generateGroupSecret();
-    const epoch = 1;
-    const commitment = await computeMembershipCommitment(memberAids, epoch, groupId, gs);
-    const epochChain = await computeEpochChain(null, epoch, commitment, aid);
-    await storeGroupSecret(this._keystoreRef, aid, groupId, epoch, gs, commitment, memberAids, epochChain);
-    const manifest = await this._signManifest(buildMembershipManifest(
-      groupId, epoch, null, memberAids, { initiatorAid: aid },
-    ));
-    const distPayload = await buildKeyDistribution(groupId, epoch, gs, memberAids, aid, manifest, epochChain);
-    return {
-      epoch,
-      commitment,
-      distributions: memberAids.filter(m => m !== aid).map(m => ({ to: m, payload: distPayload })),
-    };
+    const tStart = Date.now();
+    this._log.debug(`createEpoch enter: group_id=${groupId} members=${memberAids.length}`);
+    try {
+      const aid = this._currentAid();
+      const gs = generateGroupSecret();
+      const epoch = 1;
+      const commitment = await computeMembershipCommitment(memberAids, epoch, groupId, gs);
+      const epochChain = await computeEpochChain(null, epoch, commitment, aid);
+      await storeGroupSecret(this._keystoreRef, aid, groupId, epoch, gs, commitment, memberAids, epochChain);
+      const manifest = await this._signManifest(buildMembershipManifest(
+        groupId, epoch, null, memberAids, { initiatorAid: aid },
+      ));
+      const distPayload = await buildKeyDistribution(groupId, epoch, gs, memberAids, aid, manifest, epochChain);
+      this._log.debug(`createEpoch exit: elapsed=${Date.now() - tStart}ms group_id=${groupId} epoch=${epoch}`);
+      return {
+        epoch,
+        commitment,
+        distributions: memberAids.filter(m => m !== aid).map(m => ({ to: m, payload: distPayload })),
+      };
+    } catch (err) {
+      this._log.debug(`createEpoch exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 轮换 epoch（踢人/退出后调用） */
@@ -1672,27 +1690,35 @@ export class GroupE2EEManager {
     groupId: string,
     memberAids: string[],
   ): Promise<JsonObject> {
-    const aid = this._currentAid();
-    const current = await loadGroupSecret(this._keystoreRef, aid, groupId);
-    const prevEpoch = current ? current.epoch : null;
-    const prevChain = current?.epoch_chain ?? null;
-    const newEpoch = (prevEpoch ?? 0) + 1;
-    const gs = generateGroupSecret();
-    const commitment = await computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
-    const epochChain = await computeEpochChain(prevChain, newEpoch, commitment, aid);
-    const stored = await storeGroupSecret(this._keystoreRef, aid, groupId, newEpoch, gs, commitment, memberAids, epochChain);
-    if (!stored) {
-      throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
+    const tStart = Date.now();
+    this._log.debug(`rotateEpoch enter: group_id=${groupId} members=${memberAids.length}`);
+    try {
+      const aid = this._currentAid();
+      const current = await loadGroupSecret(this._keystoreRef, aid, groupId);
+      const prevEpoch = current ? current.epoch : null;
+      const prevChain = current?.epoch_chain ?? null;
+      const newEpoch = (prevEpoch ?? 0) + 1;
+      const gs = generateGroupSecret();
+      const commitment = await computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
+      const epochChain = await computeEpochChain(prevChain, newEpoch, commitment, aid);
+      const stored = await storeGroupSecret(this._keystoreRef, aid, groupId, newEpoch, gs, commitment, memberAids, epochChain);
+      if (!stored) {
+        throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
+      }
+      const manifest = await this._signManifest(buildMembershipManifest(
+        groupId, newEpoch, prevEpoch, memberAids, { initiatorAid: aid },
+      ));
+      const distPayload = await buildKeyDistribution(groupId, newEpoch, gs, memberAids, aid, manifest, epochChain);
+      this._log.debug(`rotateEpoch exit: elapsed=${Date.now() - tStart}ms group_id=${groupId} epoch=${newEpoch}`);
+      return {
+        epoch: newEpoch,
+        commitment,
+        distributions: memberAids.filter(m => m !== aid).map(m => ({ to: m, payload: distPayload })),
+      };
+    } catch (err) {
+      this._log.debug(`rotateEpoch exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const manifest = await this._signManifest(buildMembershipManifest(
-      groupId, newEpoch, prevEpoch, memberAids, { initiatorAid: aid },
-    ));
-    const distPayload = await buildKeyDistribution(groupId, newEpoch, gs, memberAids, aid, manifest, epochChain);
-    return {
-      epoch: newEpoch,
-      commitment,
-      distributions: memberAids.filter(m => m !== aid).map(m => ({ to: m, payload: distPayload })),
-    };
   }
 
   /** 指定目标 epoch 号轮换（配合服务端 CAS 使用） */
@@ -1702,43 +1728,51 @@ export class GroupE2EEManager {
     memberAids: string[],
     opts?: { rotationId?: string; prevChainHint?: string | null },
   ): Promise<JsonObject> {
-    const aid = this._currentAid();
-    const current = await loadGroupSecret(this._keystoreRef, aid, groupId, targetEpoch - 1)
-      ?? await loadGroupSecret(this._keystoreRef, aid, groupId);
-    let prevChain = current?.epoch_chain ?? null;
-    if (!prevChain && opts?.prevChainHint) {
-      prevChain = opts.prevChainHint;
+    const tStart = Date.now();
+    this._log.debug(`rotateEpochTo enter: group_id=${groupId} target_epoch=${targetEpoch} members=${memberAids.length} rotation_id=${opts?.rotationId ?? ''}`);
+    try {
+      const aid = this._currentAid();
+      const current = await loadGroupSecret(this._keystoreRef, aid, groupId, targetEpoch - 1)
+        ?? await loadGroupSecret(this._keystoreRef, aid, groupId);
+      let prevChain = current?.epoch_chain ?? null;
+      if (!prevChain && opts?.prevChainHint) {
+        prevChain = opts.prevChainHint;
+      }
+      const gs = generateGroupSecret();
+      const commitment = await computeMembershipCommitment(memberAids, targetEpoch, groupId, gs);
+      const epochChain = await computeEpochChain(prevChain, targetEpoch, commitment, aid);
+      const rotationId = opts?.rotationId ?? '';
+      const stored = await storeGroupSecret(
+        this._keystoreRef,
+        aid,
+        groupId,
+        targetEpoch,
+        gs,
+        commitment,
+        memberAids,
+        epochChain,
+        rotationId,
+      );
+      if (!stored) {
+        throw new Error(`group ${groupId} epoch ${targetEpoch} secret already exists or is newer; abort distribution`);
+      }
+      const manifest = await this._signManifest(buildMembershipManifest(
+        groupId, targetEpoch, targetEpoch - 1, memberAids, { initiatorAid: aid },
+      ));
+      const distPayload = await buildKeyDistribution(groupId, targetEpoch, gs, memberAids, aid, manifest, epochChain);
+      if (rotationId) {
+        distPayload.rotation_id = rotationId;
+      }
+      this._log.debug(`rotateEpochTo exit: elapsed=${Date.now() - tStart}ms group_id=${groupId} epoch=${targetEpoch}`);
+      return {
+        epoch: targetEpoch,
+        commitment,
+        distributions: memberAids.filter(m => m !== aid).map(m => ({ to: m, payload: distPayload })),
+      };
+    } catch (err) {
+      this._log.debug(`rotateEpochTo exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const gs = generateGroupSecret();
-    const commitment = await computeMembershipCommitment(memberAids, targetEpoch, groupId, gs);
-    const epochChain = await computeEpochChain(prevChain, targetEpoch, commitment, aid);
-    const rotationId = opts?.rotationId ?? '';
-    const stored = await storeGroupSecret(
-      this._keystoreRef,
-      aid,
-      groupId,
-      targetEpoch,
-      gs,
-      commitment,
-      memberAids,
-      epochChain,
-      rotationId,
-    );
-    if (!stored) {
-      throw new Error(`group ${groupId} epoch ${targetEpoch} secret already exists or is newer; abort distribution`);
-    }
-    const manifest = await this._signManifest(buildMembershipManifest(
-      groupId, targetEpoch, targetEpoch - 1, memberAids, { initiatorAid: aid },
-    ));
-    const distPayload = await buildKeyDistribution(groupId, targetEpoch, gs, memberAids, aid, manifest, epochChain);
-    if (rotationId) {
-      distPayload.rotation_id = rotationId;
-    }
-    return {
-      epoch: targetEpoch,
-      commitment,
-      distributions: memberAids.filter(m => m !== aid).map(m => ({ to: m, payload: distPayload })),
-    };
   }
 
   /** 手动存储 group_secret。返回 false 表示 epoch 降级被拒。 */
@@ -1789,25 +1823,34 @@ export class GroupE2EEManager {
       context?: JsonObject | null;
     },
   ): Promise<JsonObject> {
-    const aid = this._currentAid();
-    const secretData = await loadGroupSecret(this._keystoreRef, aid, groupId);
-    if (!secretData) {
-      throw new E2EEGroupSecretMissingError(`no group secret for ${groupId}`);
+    const tStart = Date.now();
+    this._log.debug(`encrypt enter: group_id=${groupId} mid=${opts?.messageId ?? '<auto>'}`);
+    try {
+      const aid = this._currentAid();
+      const secretData = await loadGroupSecret(this._keystoreRef, aid, groupId);
+      if (!secretData) {
+        throw new E2EEGroupSecretMissingError(`no group secret for ${groupId}`);
+      }
+      const identity = this._identityFn();
+      const senderPkPem = (identity?.private_key_pem as string | undefined) ?? null;
+      const senderCertPem = (identity?.cert as string | undefined) ?? null;
+      const result = await encryptGroupMessage(
+        groupId, secretData.epoch, secretData.secret, payload, {
+          fromAid: aid,
+          messageId: opts?.messageId ?? `gm-${uuidV4()}`,
+          timestamp: opts?.timestamp ?? Date.now(),
+          senderPrivateKeyPem: senderPkPem,
+          senderCertPem,
+          protectedHeaders: opts?.protectedHeaders ?? opts?.protected_headers ?? opts?.headers,
+          context: opts?.context ?? null,
+        },
+      );
+      this._log.debug(`encrypt exit: elapsed=${Date.now() - tStart}ms group_id=${groupId} epoch=${secretData.epoch}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`encrypt exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const identity = this._identityFn();
-    const senderPkPem = (identity?.private_key_pem as string | undefined) ?? null;
-    const senderCertPem = (identity?.cert as string | undefined) ?? null;
-    return encryptGroupMessage(
-      groupId, secretData.epoch, secretData.secret, payload, {
-        fromAid: aid,
-        messageId: opts?.messageId ?? `gm-${uuidV4()}`,
-        timestamp: opts?.timestamp ?? Date.now(),
-        senderPrivateKeyPem: senderPkPem,
-        senderCertPem,
-        protectedHeaders: opts?.protectedHeaders ?? opts?.protected_headers ?? opts?.headers,
-        context: opts?.context ?? null,
-      },
-    );
   }
 
   /** 使用指定 epoch 加密群消息。 */
@@ -1824,32 +1867,41 @@ export class GroupE2EEManager {
       context?: JsonObject | null;
     },
   ): Promise<JsonObject> {
-    const aid = this._currentAid();
-    const secretData = await loadGroupSecret(this._keystoreRef, aid, groupId, epoch);
-    if (!secretData) {
-      throw new E2EEGroupSecretMissingError(`no group secret for ${groupId} epoch ${epoch}`);
+    const tStart = Date.now();
+    this._log.debug(`encryptWithEpoch enter: group_id=${groupId} epoch=${epoch} mid=${opts?.messageId ?? '<auto>'}`);
+    try {
+      const aid = this._currentAid();
+      const secretData = await loadGroupSecret(this._keystoreRef, aid, groupId, epoch);
+      if (!secretData) {
+        throw new E2EEGroupSecretMissingError(`no group secret for ${groupId} epoch ${epoch}`);
+      }
+      const identity = this._identityFn();
+      const senderPkPem = (identity?.private_key_pem as string | undefined) ?? null;
+      if (!senderPkPem) {
+        throw new E2EEError('sender identity private key unavailable for group message signing');
+      }
+      const senderCertPem = (identity?.cert as string | undefined) ?? null;
+      const result = await encryptGroupMessage(
+        groupId,
+        secretData.epoch,
+        secretData.secret,
+        payload,
+        {
+          fromAid: aid,
+          messageId: opts?.messageId ?? `gm-${uuidV4()}`,
+          timestamp: opts?.timestamp ?? Date.now(),
+          senderPrivateKeyPem: senderPkPem,
+          senderCertPem,
+          protectedHeaders: opts?.protectedHeaders ?? opts?.protected_headers ?? opts?.headers,
+          context: opts?.context ?? null,
+        },
+      );
+      this._log.debug(`encryptWithEpoch exit: elapsed=${Date.now() - tStart}ms group_id=${groupId} epoch=${secretData.epoch}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`encryptWithEpoch exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const identity = this._identityFn();
-    const senderPkPem = (identity?.private_key_pem as string | undefined) ?? null;
-    if (!senderPkPem) {
-      throw new E2EEError('sender identity private key unavailable for group message signing');
-    }
-    const senderCertPem = (identity?.cert as string | undefined) ?? null;
-    return encryptGroupMessage(
-      groupId,
-      secretData.epoch,
-      secretData.secret,
-      payload,
-      {
-        fromAid: aid,
-        messageId: opts?.messageId ?? `gm-${uuidV4()}`,
-        timestamp: opts?.timestamp ?? Date.now(),
-        senderPrivateKeyPem: senderPkPem,
-        senderCertPem,
-        protectedHeaders: opts?.protectedHeaders ?? opts?.protected_headers ?? opts?.headers,
-        context: opts?.context ?? null,
-      },
-    );
   }
 
   /**
@@ -1861,47 +1913,66 @@ export class GroupE2EEManager {
     message: Message,
     opts?: { skipReplay?: boolean },
   ): Promise<Message | null> {
-    const payload = isJsonObject(message.payload) ? message.payload : null;
-    if (payload === null || payload.type !== 'e2ee.group_encrypted') {
-      return message;
-    }
-    const groupId = String(message.group_id ?? '');
-    const sender = String(message.from ?? message.sender_aid ?? '');
-    const skipReplay = opts?.skipReplay ?? false;
-
-    // 防重放预检：优先使用 AAD 内 message_id
-    const aad = isJsonObject(payload.aad) ? payload.aad : undefined;
-    const aadMsgId = aad ? (aad.message_id ?? '') as string : '';
-    const msgId = aadMsgId || (message.message_id ?? '') as string;
-    if (!skipReplay && groupId && sender && msgId) {
-      // 返回原消息（不含 e2ee 字段），调用方可通过缺失 e2ee 识别 replay
-      if (this._replayGuard.isSeen(groupId, sender, msgId)) return message;
-    }
-
-    // 解析发送方证书（零信任：无证书则拒绝）
-    let senderCertPem: string | null = null;
-    if (this._senderCertResolver && sender) {
-      senderCertPem = this._senderCertResolver(sender);
-    }
-    if (!senderCertPem) {
-      console.warn(
-        `拒绝群消息：无法获取发送方 ${sender} 的证书（零信任模式禁止跳过验签）: group=${groupId}`,
-      );
-      return null;
-    }
-
-    const allSecrets = await loadAllGroupSecrets(this._keystoreRef, this._currentAid(), groupId);
-    if (!allSecrets.size) return null;
-    const result = await decryptGroupMessage(message, allSecrets, senderCertPem);
-
-    // 解密成功后记录防重放
-    if (result !== null) {
-      const finalMsgId = aadMsgId || (message.message_id ?? '') as string;
-      if (!skipReplay && groupId && sender && finalMsgId) {
-        this._replayGuard.record(groupId, sender, finalMsgId);
+    const tStart = Date.now();
+    const groupIdInit = String(message.group_id ?? '');
+    const senderInit = String(message.from ?? message.sender_aid ?? '');
+    const midInit = String(message.message_id ?? '');
+    this._log.debug(`decrypt enter: group_id=${groupIdInit} from=${senderInit} mid=${midInit} skip_replay=${!!opts?.skipReplay}`);
+    try {
+      const payload = isJsonObject(message.payload) ? message.payload : null;
+      if (payload === null || payload.type !== 'e2ee.group_encrypted') {
+        this._log.debug(`decrypt exit: elapsed=${Date.now() - tStart}ms result=passthrough_not_encrypted`);
+        return message;
       }
+      const groupId = String(message.group_id ?? '');
+      const sender = String(message.from ?? message.sender_aid ?? '');
+      const skipReplay = opts?.skipReplay ?? false;
+
+      // 防重放预检：优先使用 AAD 内 message_id
+      const aad = isJsonObject(payload.aad) ? payload.aad : undefined;
+      const aadMsgId = aad ? (aad.message_id ?? '') as string : '';
+      const msgId = aadMsgId || (message.message_id ?? '') as string;
+      if (!skipReplay && groupId && sender && msgId) {
+        // 返回原消息（不含 e2ee 字段），调用方可通过缺失 e2ee 识别 replay
+        if (this._replayGuard.isSeen(groupId, sender, msgId)) {
+          this._log.debug(`decrypt exit: elapsed=${Date.now() - tStart}ms result=replay_skipped group_id=${groupId}`);
+          return message;
+        }
+      }
+
+      // 解析发送方证书（零信任：无证书则拒绝）
+      let senderCertPem: string | null = null;
+      if (this._senderCertResolver && sender) {
+        senderCertPem = this._senderCertResolver(sender);
+      }
+      if (!senderCertPem) {
+        this._log.warn(
+          `拒绝群消息：无法获取发送方 ${sender} 的证书（零信任模式禁止跳过验签）: group=${groupId}`,
+        );
+        this._log.debug(`decrypt exit: elapsed=${Date.now() - tStart}ms result=rejected_no_sender_cert`);
+        return null;
+      }
+
+      const allSecrets = await loadAllGroupSecrets(this._keystoreRef, this._currentAid(), groupId);
+      if (!allSecrets.size) {
+        this._log.debug(`decrypt exit: elapsed=${Date.now() - tStart}ms result=no_secrets group_id=${groupId}`);
+        return null;
+      }
+      const result = await decryptGroupMessage(message, allSecrets, senderCertPem);
+
+      // 解密成功后记录防重放
+      if (result !== null) {
+        const finalMsgId = aadMsgId || (message.message_id ?? '') as string;
+        if (!skipReplay && groupId && sender && finalMsgId) {
+          this._replayGuard.record(groupId, sender, finalMsgId);
+        }
+      }
+      this._log.debug(`decrypt exit: elapsed=${Date.now() - tStart}ms result=${result !== null ? 'ok' : 'failed'} group_id=${groupId}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`decrypt exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    return result;
   }
 
   /** 批量解密 */
@@ -1909,11 +1980,19 @@ export class GroupE2EEManager {
     messages: Message[],
     opts?: { skipReplay?: boolean },
   ): Promise<Message[]> {
-    const results: Message[] = [];
-    for (const m of messages) {
-      results.push((await this.decrypt(m, opts)) ?? m);
+    const tStart = Date.now();
+    this._log.debug(`decryptBatch enter: count=${messages.length} skip_replay=${!!opts?.skipReplay}`);
+    try {
+      const results: Message[] = [];
+      for (const m of messages) {
+        results.push((await this.decrypt(m, opts)) ?? m);
+      }
+      this._log.debug(`decryptBatch exit: elapsed=${Date.now() - tStart}ms count=${results.length}`);
+      return results;
+    } catch (err) {
+      this._log.debug(`decryptBatch exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    return results;
   }
 
   // ── 密钥协议消息处理 ──────────────────────────────
@@ -1926,40 +2005,56 @@ export class GroupE2EEManager {
    * 返回 null 表示不是密钥消息。
    */
   async handleIncoming(payload: JsonObject): Promise<string | null> {
+    const tStart = Date.now();
     const msgType = (payload.type ?? '') as string;
-    const aid = this._currentAid();
+    this._log.debug(`handleIncoming enter: type=${msgType} group_id=${String(payload.group_id ?? '')}`);
+    try {
+      const aid = this._currentAid();
 
-    if (msgType === 'e2ee.group_key_distribution') {
-      // 解析发起者证书用于 manifest 验证
-      let initiatorCert: string | null = null;
-      const distributedBy = (payload.distributed_by ?? '') as string;
-      if (this._initiatorCertResolver && distributedBy) {
-        initiatorCert = this._initiatorCertResolver(distributedBy);
+      if (msgType === 'e2ee.group_key_distribution') {
+        // 解析发起者证书用于 manifest 验证
+        let initiatorCert: string | null = null;
+        const distributedBy = (payload.distributed_by ?? '') as string;
+        if (this._initiatorCertResolver && distributedBy) {
+          initiatorCert = this._initiatorCertResolver(distributedBy);
+        }
+        const ok = await handleKeyDistribution(payload, this._keystoreRef, aid, initiatorCert);
+        const r = ok ? 'distribution' : 'distribution_rejected';
+        this._log.debug(`handleIncoming exit: elapsed=${Date.now() - tStart}ms result=${r}`);
+        return r;
       }
-      const ok = await handleKeyDistribution(payload, this._keystoreRef, aid, initiatorCert);
-      return ok ? 'distribution' : 'distribution_rejected';
+      if (msgType === 'e2ee.group_key_response') {
+        const pendingKey = `${String(payload.group_id ?? '')}:${String(payload.epoch ?? '')}:${String(payload.request_id ?? '')}`;
+        const expected = this._pendingKeyRequests.get(pendingKey) ?? null;
+        if (expected === null) {
+          this._log.debug(`handleIncoming exit: elapsed=${Date.now() - tStart}ms result=response_rejected reason=no_pending`);
+          return 'response_rejected';
+        }
+        const responderAid = String(payload.responder_aid ?? '');
+        const responderCertPem = responderAid && this._initiatorCertResolver
+          ? this._initiatorCertResolver(responderAid)
+          : null;
+        const ok = await handleKeyResponse(payload, this._keystoreRef, aid, {
+          expectedRequest: expected,
+          responderCertPem,
+          currentMembers: await this.getMemberAids(String(payload.group_id ?? '')),
+          strict: true,
+        });
+        if (ok && expected) this._pendingKeyRequests.delete(pendingKey);
+        const r = ok ? 'response' : 'response_rejected';
+        this._log.debug(`handleIncoming exit: elapsed=${Date.now() - tStart}ms result=${r}`);
+        return r;
+      }
+      if (msgType === 'e2ee.group_key_request') {
+        this._log.debug(`handleIncoming exit: elapsed=${Date.now() - tStart}ms result=request`);
+        return 'request';
+      }
+      this._log.debug(`handleIncoming exit: elapsed=${Date.now() - tStart}ms result=null`);
+      return null;
+    } catch (err) {
+      this._log.debug(`handleIncoming exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    if (msgType === 'e2ee.group_key_response') {
-      const pendingKey = `${String(payload.group_id ?? '')}:${String(payload.epoch ?? '')}:${String(payload.request_id ?? '')}`;
-      const expected = this._pendingKeyRequests.get(pendingKey) ?? null;
-      if (expected === null) return 'response_rejected';
-      const responderAid = String(payload.responder_aid ?? '');
-      const responderCertPem = responderAid && this._initiatorCertResolver
-        ? this._initiatorCertResolver(responderAid)
-        : null;
-      const ok = await handleKeyResponse(payload, this._keystoreRef, aid, {
-        expectedRequest: expected,
-        responderCertPem,
-        currentMembers: await this.getMemberAids(String(payload.group_id ?? '')),
-        strict: true,
-      });
-      if (ok && expected) this._pendingKeyRequests.delete(pendingKey);
-      return ok ? 'response' : 'response_rejected';
-    }
-    if (msgType === 'e2ee.group_key_request') {
-      return 'request';
-    }
-    return null;
   }
 
   /** 构建恢复请求。返回 {to, payload} 或 null（限流/无目标）。 */
@@ -1968,20 +2063,34 @@ export class GroupE2EEManager {
     epoch: number,
     opts?: { senderAid?: string },
   ): Promise<JsonObject | null> {
-    const aid = this._currentAid();
-    if (!this._requestThrottle.allow(`request:${groupId}:${epoch}`)) return null;
-    let candidates: string[] = [];
-    const secretData = await loadGroupSecret(this._keystoreRef, aid, groupId);
-    if (secretData?.member_aids?.length) {
-      candidates = secretData.member_aids.filter(m => m !== aid);
+    const tStart = Date.now();
+    this._log.debug(`buildRecoveryRequest enter: group_id=${groupId} epoch=${epoch} sender_hint=${opts?.senderAid ?? ''}`);
+    try {
+      const aid = this._currentAid();
+      if (!this._requestThrottle.allow(`request:${groupId}:${epoch}`)) {
+        this._log.debug(`buildRecoveryRequest exit: elapsed=${Date.now() - tStart}ms result=throttled`);
+        return null;
+      }
+      let candidates: string[] = [];
+      const secretData = await loadGroupSecret(this._keystoreRef, aid, groupId);
+      if (secretData?.member_aids?.length) {
+        candidates = secretData.member_aids.filter(m => m !== aid);
+      }
+      if (!candidates.length && opts?.senderAid && opts.senderAid !== aid) {
+        candidates = [opts.senderAid];
+      }
+      if (!candidates.length) {
+        this._log.debug(`buildRecoveryRequest exit: elapsed=${Date.now() - tStart}ms result=no_candidates`);
+        return null;
+      }
+      const payload = buildKeyRequest(groupId, epoch, aid);
+      this.rememberKeyRequest(payload, candidates[0]);
+      this._log.debug(`buildRecoveryRequest exit: elapsed=${Date.now() - tStart}ms target=${candidates[0]}`);
+      return { to: candidates[0], payload };
+    } catch (err) {
+      this._log.debug(`buildRecoveryRequest exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    if (!candidates.length && opts?.senderAid && opts.senderAid !== aid) {
-      candidates = [opts.senderAid];
-    }
-    if (!candidates.length) return null;
-    const payload = buildKeyRequest(groupId, epoch, aid);
-    this.rememberKeyRequest(payload, candidates[0]);
-    return { to: candidates[0], payload };
   }
 
   rememberKeyRequest(payload: JsonObject, expectedResponderAid?: string | null): void {
@@ -1999,24 +2108,43 @@ export class GroupE2EEManager {
     requestPayload: JsonObject,
     currentMembers: string[],
   ): Promise<JsonObject | null> {
+    const tStart = Date.now();
     const requester = (requestPayload.requester_aid ?? '') as string;
     const groupId = (requestPayload.group_id ?? '') as string;
-    if (!requester || !groupId) return null;
-    if (!currentMembers.includes(requester)) {
-      console.warn(`拒绝密钥恢复请求：${requester} 不在群 ${groupId} 的当前成员列表中`);
-      return null;
+    this._log.debug(`handleKeyRequestMsg enter: group_id=${groupId} requester=${requester} members=${currentMembers.length}`);
+    try {
+      if (!requester || !groupId) {
+        this._log.debug(`handleKeyRequestMsg exit: elapsed=${Date.now() - tStart}ms result=invalid_payload`);
+        return null;
+      }
+      if (!currentMembers.includes(requester)) {
+        this._log.warn(`reject key recover request: ${requester} not in group ${groupId}  current member list`);
+        this._log.debug(`handleKeyRequestMsg exit: elapsed=${Date.now() - tStart}ms result=not_member`);
+        return null;
+      }
+      if (!this._responseThrottle.allow(`response:${groupId}:${requester}`)) {
+        this._log.debug(`handleKeyRequestMsg exit: elapsed=${Date.now() - tStart}ms result=throttled`);
+        return null;
+      }
+      const identity = this._identityFn();
+      const privateKeyPem = identity?.private_key_pem as string | undefined;
+      if (!privateKeyPem) {
+        this._log.debug(`handleKeyRequestMsg exit: elapsed=${Date.now() - tStart}ms result=no_private_key`);
+        return null;
+      }
+      const result = await handleKeyRequest(
+        requestPayload,
+        this._keystoreRef,
+        this._currentAid(),
+        currentMembers,
+        privateKeyPem,
+      );
+      this._log.debug(`handleKeyRequestMsg exit: elapsed=${Date.now() - tStart}ms result=${result !== null ? 'ok' : 'null'}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`handleKeyRequestMsg exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    if (!this._responseThrottle.allow(`response:${groupId}:${requester}`)) return null;
-    const identity = this._identityFn();
-    const privateKeyPem = identity?.private_key_pem as string | undefined;
-    if (!privateKeyPem) return null;
-    return handleKeyRequest(
-      requestPayload,
-      this._keystoreRef,
-      this._currentAid(),
-      currentMembers,
-      privateKeyPem,
-    );
   }
 
   // ── 状态查询 ──────────────────────────────────────

@@ -379,35 +379,46 @@ export class AuthFlow {
    * 如果 AID 已在服务端注册但本地证书丢失，尝试从 PKI 端点下载恢复。
    */
   async createAid(gatewayUrl: string, aid: string): Promise<JsonObject> {
+    const tStart = Date.now();
     AuthFlow._validateAidName(aid);
-    let identity = this._ensureLocalIdentity(aid);
-    if (identity.cert) {
-      return { aid: identity.aid, cert: identity.cert };
-    }
-
-    // 本地有密钥但无证书——尝试注册
+    this._logger.debug(`createAid enter: aid=${aid}, gateway=${gatewayUrl}`);
     try {
-      const created = await this._createAid(gatewayUrl, identity);
-      Object.assign(identity, created);
-    } catch (e) {
-      if (!(e instanceof AUNError) || !String(e.message).includes('already exists')) {
-        throw e;
+      let identity = this._ensureLocalIdentity(aid);
+      if (identity.cert) {
+        this._logger.debug(`createAid exit: elapsed=${Date.now() - tStart}ms (already has cert) aid=${aid}`);
+        return { aid: identity.aid, cert: identity.cert };
       }
-      // AID 已在服务端注册，尝试从 PKI 下载恢复证书
+
+      // 本地有密钥但无证书——尝试注册
       try {
-        identity = await this._recoverCertViaDownload(gatewayUrl, identity);
-      } catch {
-        throw new StateError(
-          `AID ${aid} already registered on server but local certificate is missing. ` +
-          `Certificate download recovery failed. Options: ` +
-          `(1) use a different AID name, or ` +
-          `(2) restart Kite server to clear registration.`,
-        );
+        const created = await this._createAid(gatewayUrl, identity);
+        Object.assign(identity, created);
+        this._logger.debug(`AID register ok: aid=${aid}`);
+      } catch (e) {
+        if (!(e instanceof AUNError) || !String(e.message).includes('already exists')) {
+          this._logger.error(`AID register failed: aid=${aid}, error=${e instanceof Error ? e.message : String(e)}`);
+          throw e;
+        }
+        // AID 已在服务端注册，尝试从 PKI 下载恢复证书
+        try {
+          identity = await this._recoverCertViaDownload(gatewayUrl, identity);
+        } catch {
+          throw new StateError(
+            `AID ${aid} already registered on server but local certificate is missing. ` +
+            `Certificate download recovery failed. Options: ` +
+            `(1) use a different AID name, or ` +
+            `(2) restart Kite server to clear registration.`,
+          );
+        }
       }
+      this._persistIdentity(identity);
+      this._aid = String(identity.aid);
+      this._logger.debug(`createAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      return { aid: identity.aid, cert: identity.cert };
+    } catch (err) {
+      this._logger.debug(`createAid exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    this._persistIdentity(identity);
-    this._aid = String(identity.aid);
-    return { aid: identity.aid, cert: identity.cert };
   }
 
   /**
@@ -418,45 +429,74 @@ export class AuthFlow {
     gatewayUrl: string,
     opts?: { aid?: string },
   ): Promise<JsonObject> {
+    const tStart = Date.now();
     let identity = this._loadIdentityOrRaise(opts?.aid);
-    if (!identity.cert) {
-      // 本地有密钥但无证书——尝试从 PKI 下载恢复
-      try {
-        identity = await this._recoverCertViaDownload(gatewayUrl, identity);
-        this._persistIdentity(identity);
-      } catch (e) {
-        throw new StateError(
-          `local certificate missing and recovery failed: ${e instanceof Error ? e.message : String(e)}. ` +
-          `Run auth.createAid() to register a new identity.`,
-        );
-      }
-    }
-    let login: JsonObject;
+    this._logger.debug(`authenticate enter: aid=${identity.aid}, gateway=${gatewayUrl}`);
     try {
-      login = await this._login(gatewayUrl, identity);
-    } catch (e) {
-      // 证书未在服务端注册或公钥不匹配 — 自动重新注册
-      if (e instanceof AuthError && (String(e.message).includes('not registered') || String(e.message).includes('public key mismatch'))) {
-        this._logger.warn(`证书未在服务端注册，自动重新注册: aid=${identity.aid}`);
-        const created = await this._createAid(gatewayUrl, identity);
-        identity.cert = created.cert as string;
-        this._persistIdentity(identity);
-        login = await this._login(gatewayUrl, identity);
-      } else {
-        throw e;
+      // 优先复用 keystore 里的 cached access_token（未过期且有 refresh_token）
+      // 避免每次调 authenticate 都走两阶段重登的网络往返
+      // 注意：_loadIdentityOrRaise 不带 instance_state（access_token 等），
+      // 这里需要主动走 _loadInstanceState 拿到 token
+      const instanceState = this._loadInstanceState(String(identity.aid)) || {};
+      const identityWithState: IdentityRecord = { ...identity, ...instanceState };
+      const cachedToken = AuthFlow._getCachedAccessToken(identityWithState);
+      const cachedRefresh = String(identityWithState.refresh_token ?? '');
+      if (cachedToken && cachedRefresh) {
+        this._logger.debug(`authenticate reusing cached token: aid=${identity.aid} expires_at=${identityWithState.access_token_expires_at}`);
+        this._aid = String(identity.aid);
+        return {
+          aid: identity.aid,
+          access_token: cachedToken,
+          refresh_token: cachedRefresh,
+          expires_at: identityWithState.access_token_expires_at,
+          gateway: gatewayUrl,
+        };
       }
+
+      if (!identity.cert) {
+        // 本地有密钥但无证书——尝试从 PKI 下载恢复
+        try {
+          identity = await this._recoverCertViaDownload(gatewayUrl, identity);
+          this._persistIdentity(identity);
+        } catch (e) {
+          throw new StateError(
+            `local certificate missing and recovery failed: ${e instanceof Error ? e.message : String(e)}. ` +
+            `Run auth.createAid() to register a new identity.`,
+          );
+        }
+      }
+      let login: JsonObject;
+      try {
+        login = await this._login(gatewayUrl, identity);
+        this._logger.debug(`auth login ok: aid=${identity.aid}`);
+      } catch (e) {
+        // 证书未在服务端注册或公钥不匹配 — 自动重新注册
+        if (e instanceof AuthError && (String(e.message).includes('not registered') || String(e.message).includes('public key mismatch'))) {
+          this._logger.warn(`cert not registered on server, auto re-register: aid=${identity.aid}`);
+          const created = await this._createAid(gatewayUrl, identity);
+          identity.cert = created.cert as string;
+          this._persistIdentity(identity);
+          login = await this._login(gatewayUrl, identity);
+        } else {
+          throw e;
+        }
+      }
+      AuthFlow._rememberTokens(identity, login);
+      await this._validateNewCert(identity, gatewayUrl);
+      this._persistIdentity(identity);
+      this._aid = String(identity.aid);
+      this._logger.debug(`authenticate exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid}`);
+      return {
+        aid: identity.aid,
+        access_token: identity.access_token,
+        refresh_token: identity.refresh_token,
+        expires_at: identity.access_token_expires_at,
+        gateway: gatewayUrl,
+      };
+    } catch (err) {
+      this._logger.debug(`authenticate exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    AuthFlow._rememberTokens(identity, login);
-    await this._validateNewCert(identity, gatewayUrl);
-    this._persistIdentity(identity);
-    this._aid = String(identity.aid);
-    return {
-      aid: identity.aid,
-      access_token: identity.access_token,
-      refresh_token: identity.refresh_token,
-      expires_at: identity.access_token_expires_at,
-      gateway: gatewayUrl,
-    };
   }
 
   /**
@@ -464,22 +504,30 @@ export class AuthFlow {
    * 如果没有本地身份则创建，然后执行登录流程。
    */
   async ensureAuthenticated(gatewayUrl: string): Promise<AuthContext> {
-    const identity = this._ensureIdentity();
-    if (!identity.cert) {
-      const created = await this._createAid(gatewayUrl, identity);
-      Object.assign(identity, created);
+    const tStart = Date.now();
+    this._logger.debug(`ensureAuthenticated enter: gateway=${gatewayUrl}`);
+    try {
+      const identity = this._ensureIdentity();
+      if (!identity.cert) {
+        const created = await this._createAid(gatewayUrl, identity);
+        Object.assign(identity, created);
+        this._persistIdentity(identity);
+      }
+      const login = await this._login(gatewayUrl, identity);
+      AuthFlow._rememberTokens(identity, login);
+      await this._validateNewCert(identity, gatewayUrl);
       this._persistIdentity(identity);
-    }
-    const login = await this._login(gatewayUrl, identity);
-    AuthFlow._rememberTokens(identity, login);
-    await this._validateNewCert(identity, gatewayUrl);
-    this._persistIdentity(identity);
 
-    const token = identity.access_token || identity.token || identity.kite_token;
-    if (!token) {
-      throw new AuthError('login2 did not return access token');
+      const token = identity.access_token || identity.token || identity.kite_token;
+      if (!token) {
+        throw new AuthError('login2 did not return access token');
+      }
+      this._logger.debug(`ensureAuthenticated exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid}`);
+      return { token, identity };
+    } catch (err) {
+      this._logger.debug(`ensureAuthenticated exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    return { token, identity };
   }
 
   /**
@@ -490,15 +538,24 @@ export class AuthFlow {
     gatewayUrl: string,
     identity: IdentityRecord,
   ): Promise<IdentityRecord> {
+    const tStart = Date.now();
     const refreshToken = String(identity.refresh_token || '');
     if (!refreshToken) {
+      this._logger.error(`token refresh failed: missing refresh_token, aid=${identity.aid}`);
       throw new AuthError('missing refresh_token');
     }
-    const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken);
-    AuthFlow._rememberTokens(identity, refreshed);
-    await this._validateNewCert(identity, gatewayUrl);
-    this._persistIdentity(identity);
-    return identity;
+    this._logger.debug(`refreshCachedTokens enter: aid=${identity.aid}`);
+    try {
+      const refreshed = await this._refreshAccessToken(gatewayUrl, refreshToken);
+      AuthFlow._rememberTokens(identity, refreshed);
+      await this._validateNewCert(identity, gatewayUrl);
+      this._persistIdentity(identity);
+      this._logger.debug(`refreshCachedTokens exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid}`);
+      return identity;
+    } catch (err) {
+      this._logger.debug(`refreshCachedTokens exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /**
@@ -513,18 +570,32 @@ export class AuthFlow {
       deviceId?: string;
       slotId?: string;
       deliveryMode?: JsonObject | null;
+      connectionKind?: string;
+      shortTtlMs?: number;
+      extraInfo?: Record<string, unknown>;
     },
   ): Promise<void> {
-    const nonce = this._extractChallengeNonce(challenge);
-    this.setInstanceContext({
-      deviceId: String(opts?.deviceId ?? ''),
-      slotId: String(opts?.slotId ?? ''),
-    });
-    await this._initializeSession(transport, nonce, accessToken, {
-      deviceId: String(opts?.deviceId ?? ''),
-      slotId: String(opts?.slotId ?? ''),
-      deliveryMode: opts?.deliveryMode ?? null,
-    });
+    const tStart = Date.now();
+    this._logger.debug(`initializeWithToken enter: deviceId=${opts?.deviceId ?? ''}, slotId=${opts?.slotId ?? ''}`);
+    try {
+      const nonce = this._extractChallengeNonce(challenge);
+      this.setInstanceContext({
+        deviceId: String(opts?.deviceId ?? ''),
+        slotId: String(opts?.slotId ?? ''),
+      });
+      await this._initializeSession(transport, nonce, accessToken, {
+        deviceId: String(opts?.deviceId ?? ''),
+        slotId: String(opts?.slotId ?? ''),
+        deliveryMode: opts?.deliveryMode ?? null,
+        connectionKind: opts?.connectionKind,
+        shortTtlMs: opts?.shortTtlMs,
+        extraInfo: opts?.extraInfo,
+      });
+      this._logger.debug(`initializeWithToken exit: elapsed=${Date.now() - tStart}ms`);
+    } catch (err) {
+      this._logger.debug(`initializeWithToken exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /**
@@ -540,100 +611,134 @@ export class AuthFlow {
       deviceId?: string;
       slotId?: string;
       deliveryMode?: JsonObject | null;
+      connectionKind?: string;
+      shortTtlMs?: number;
+      extraInfo?: Record<string, unknown>;
     },
   ): Promise<AuthContext> {
+    const tStart = Date.now();
     const nonce = this._extractChallengeNonce(challenge);
     const deviceId = String(opts?.deviceId ?? '');
     const slotId = String(opts?.slotId ?? '');
     const deliveryMode = opts?.deliveryMode ?? null;
+    const connectionKind = opts?.connectionKind;
+    const shortTtlMs = opts?.shortTtlMs;
+    const extraInfo = opts?.extraInfo;
     this.setInstanceContext({ deviceId, slotId });
 
-    let identity: IdentityRecord | null;
-    try {
-      identity = this.loadIdentity();
-    } catch {
-      identity = null;
-    }
+    this._logger.debug(`connectSession enter: gateway=${gatewayUrl}, device_id=${deviceId}, slot_id=${slotId}, has_explicit_token=${!!opts?.accessToken}, has_challenge_nonce=${!!nonce}`);
 
-    // 策略 1：显式 token
-    const explicitToken = String(opts?.accessToken || '');
-    if (explicitToken && identity !== null) {
+    try {
+      let identity: IdentityRecord | null;
       try {
-        await this._initializeSession(transport, nonce, explicitToken, {
+        identity = this.loadIdentity();
+      } catch {
+        identity = null;
+      }
+
+      // 策略 1：显式 token
+      const explicitToken = String(opts?.accessToken || '');
+      if (explicitToken && identity !== null) {
+        try {
+          await this._initializeSession(transport, nonce, explicitToken, {
+            deviceId,
+            slotId,
+            deliveryMode,
+            connectionKind,
+            shortTtlMs,
+            extraInfo,
+          });
+          identity.access_token = explicitToken;
+          this._persistIdentity(identity);
+          this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=explicit_token aid=${String(identity.aid ?? '')}`);
+          return { token: explicitToken, identity };
+        } catch (exc) {
+          if (!(exc instanceof AuthError)) throw exc;
+          this._logger.debug(`explicit_token auth failed, try next method: ${exc.message}`);
+        }
+      }
+
+      // 无本地身份时，执行完整认证
+      if (identity === null) {
+        const authContext = await this.ensureAuthenticated(gatewayUrl);
+        const token = String(authContext.token);
+        await this._initializeSession(transport, nonce, token, {
           deviceId,
           slotId,
           deliveryMode,
+          connectionKind,
+          shortTtlMs,
+          extraInfo,
         });
-        identity.access_token = explicitToken;
-        this._persistIdentity(identity);
-        return { token: explicitToken, identity };
-      } catch (exc) {
-        if (!(exc instanceof AuthError)) throw exc;
-        this._logger.debug(`explicit_token 认证失败，尝试下一方式: ${exc.message}`);
+        this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=ensure_authenticated aid=${String(authContext.identity?.aid ?? '')}`);
+        return authContext;
       }
-    }
 
-    // 无本地身份时，执行完整认证
-    if (identity === null) {
-      const authContext = await this.ensureAuthenticated(gatewayUrl);
-      const token = String(authContext.token);
+      // 策略 2：缓存的 access_token
+      const cachedToken = AuthFlow._getCachedAccessToken(identity);
+      if (cachedToken) {
+        try {
+          await this._initializeSession(transport, nonce, cachedToken, {
+            deviceId,
+            slotId,
+            deliveryMode,
+            connectionKind,
+            shortTtlMs,
+            extraInfo,
+          });
+          this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=cached_token aid=${String(identity.aid ?? '')}`);
+          return { token: cachedToken, identity };
+        } catch (exc) {
+          if (!(exc instanceof AuthError)) throw exc;
+          this._logger.debug(`cached_token auth failed, try refresh: ${exc.message}`);
+        }
+      }
+
+      // 策略 3：refresh_token
+      const refreshToken = String(identity.refresh_token || '');
+      if (refreshToken) {
+        try {
+          identity = await this.refreshCachedTokens(gatewayUrl, identity);
+          const newCachedToken = AuthFlow._getCachedAccessToken(identity);
+          if (newCachedToken) {
+            await this._initializeSession(transport, nonce, newCachedToken, {
+              deviceId,
+              slotId,
+              deliveryMode,
+              connectionKind,
+              shortTtlMs,
+              extraInfo,
+            });
+            this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=refresh_token aid=${String(identity.aid ?? '')}`);
+            return { token: newCachedToken, identity };
+          }
+        } catch (exc) {
+          if (!(exc instanceof AuthError)) throw exc;
+          this._logger.debug(`refresh_token auth failed, will re-login: ${exc.message}`);
+        }
+      }
+
+      // 策略 4：完整重认证
+      const login = await this.authenticate(gatewayUrl, { aid: identity.aid as string | undefined });
+      const token = String(login.access_token || '');
+      if (!token) {
+        throw new AuthError('authenticate did not return access_token');
+      }
       await this._initializeSession(transport, nonce, token, {
         deviceId,
         slotId,
         deliveryMode,
+        connectionKind,
+        shortTtlMs,
+        extraInfo,
       });
-      return authContext;
+      identity = this.loadIdentity(identity.aid as string | undefined);
+      this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=full_reauth aid=${String(identity?.aid ?? '')}`);
+      return { token, identity };
+    } catch (err) {
+      this._logger.debug(`connectSession exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-
-    // 策略 2：缓存的 access_token
-    const cachedToken = AuthFlow._getCachedAccessToken(identity);
-    if (cachedToken) {
-      try {
-        await this._initializeSession(transport, nonce, cachedToken, {
-          deviceId,
-          slotId,
-          deliveryMode,
-        });
-        return { token: cachedToken, identity };
-      } catch (exc) {
-        if (!(exc instanceof AuthError)) throw exc;
-        this._logger.debug(`cached_token 认证失败，尝试刷新: ${exc.message}`);
-      }
-    }
-
-    // 策略 3：refresh_token
-    const refreshToken = String(identity.refresh_token || '');
-    if (refreshToken) {
-      try {
-        identity = await this.refreshCachedTokens(gatewayUrl, identity);
-        const newCachedToken = AuthFlow._getCachedAccessToken(identity);
-        if (newCachedToken) {
-          await this._initializeSession(transport, nonce, newCachedToken, {
-            deviceId,
-            slotId,
-            deliveryMode,
-          });
-          return { token: newCachedToken, identity };
-        }
-      } catch (exc) {
-        if (!(exc instanceof AuthError)) throw exc;
-        this._logger.debug(`refresh_token 认证失败，将重新登录: ${exc.message}`);
-      }
-    }
-
-    // 策略 4：完整重认证
-    const login = await this.authenticate(gatewayUrl, { aid: identity.aid as string | undefined });
-    const token = String(login.access_token || '');
-    if (!token) {
-      throw new AuthError('authenticate did not return access_token');
-    }
-    await this._initializeSession(transport, nonce, token, {
-      deviceId,
-      slotId,
-      deliveryMode,
-    });
-    identity = this.loadIdentity(identity.aid as string | undefined);
-    return { token, identity };
   }
 
   /**
@@ -645,32 +750,40 @@ export class AuthFlow {
     certPem: string,
     expectedAid: string,
   ): Promise<void> {
-    const cert = _loadX509(certPem);
-    const nowMs = Date.now();
-    _ensureCertTimeValid(cert, 'peer certificate', nowMs);
-
-    await this._verifyAuthCertChain(gatewayUrl, cert, expectedAid);
-
+    const tStart = Date.now();
+    this._logger.debug(`verifyPeerCertificate enter: aid=${expectedAid}, gateway=${gatewayUrl}`);
     try {
-      await this._verifyAuthCertRevocation(gatewayUrl, cert, expectedAid);
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
-      this._logger.warn(`CRL 检查不可用，降级继续: ${errMsg}`);
-    }
+      const cert = _loadX509(certPem);
+      const nowMs = Date.now();
+      _ensureCertTimeValid(cert, 'peer certificate', nowMs);
 
-    try {
-      await this._verifyAuthCertOcsp(gatewayUrl, cert, expectedAid);
-    } catch (exc) {
-      const errMsg = exc instanceof Error ? exc.message : String(exc);
-      if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
-      this._logger.warn(`OCSP 校验不可用，降级继续: ${errMsg}`);
-    }
+      await this._verifyAuthCertChain(gatewayUrl, cert, expectedAid);
 
-    // 检查 CN 匹配
-    const cn = _certSubjectCN(cert);
-    if (cn !== expectedAid) {
-      throw new AuthError(`peer cert CN mismatch: expected ${expectedAid}, got ${cn || 'none'}`);
+      try {
+        await this._verifyAuthCertRevocation(gatewayUrl, cert, expectedAid);
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
+        this._logger.warn(`CRL verification unavailable, skipping: ${errMsg}`);
+      }
+
+      try {
+        await this._verifyAuthCertOcsp(gatewayUrl, cert, expectedAid);
+      } catch (exc) {
+        const errMsg = exc instanceof Error ? exc.message : String(exc);
+        if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
+        this._logger.warn(`OCSP verification unavailable, skipping: ${errMsg}`);
+      }
+
+      // 检查 CN 匹配
+      const cn = _certSubjectCN(cert);
+      if (cn !== expectedAid) {
+        throw new AuthError(`peer cert CN mismatch: expected ${expectedAid}, got ${cn || 'none'}`);
+      }
+      this._logger.debug(`verifyPeerCertificate exit: elapsed=${Date.now() - tStart}ms aid=${expectedAid}`);
+    } catch (err) {
+      this._logger.debug(`verifyPeerCertificate exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -685,6 +798,7 @@ export class AuthFlow {
     method: string,
     params: RpcParams,
   ): Promise<JsonObject> {
+    this._logger.debug(`_shortRpc enter: method=${method}, gateway=${gatewayUrl}`);
     const ws = await this._connectionFactory(gatewayUrl);
     try {
       // 接收 challenge（第一条消息）
@@ -774,31 +888,42 @@ export class AuthFlow {
     gatewayUrl: string,
     identity: IdentityRecord,
   ): Promise<JsonObject> {
+    const tStart = Date.now();
     const clientNonce = this._crypto.newClientNonce();
+    this._logger.debug(`_login enter: aid=${identity.aid}`);
 
-    // Phase 1: 发送 AID + 证书 + 客户端 nonce
-    const phase1 = await this._shortRpc(gatewayUrl, 'auth.aid_login1', {
-      aid: identity.aid,
-      cert: identity.cert,
-      client_nonce: clientNonce,
-    });
+    try {
+      // Phase 1: 发送 AID + 证书 + 客户端 nonce
+      const phase1 = await this._shortRpc(gatewayUrl, 'auth.aid_login1', {
+        aid: identity.aid,
+        cert: identity.cert,
+        client_nonce: clientNonce,
+      });
+      this._logger.debug(`login1 response recv: aid=${identity.aid}, request_id=${phase1.request_id}`);
 
-    // 验证 Phase 1 响应（证书链 + 签名）
-    await this._verifyPhase1Response(gatewayUrl, phase1, clientNonce);
+      // 验证 Phase 1 响应（证书链 + 签名）
+      await this._verifyPhase1Response(gatewayUrl, phase1, clientNonce);
+      this._logger.debug(`login1 verify ok: aid=${identity.aid}`);
 
-    // Phase 2: 用私钥签名 nonce
-    const [signature, clientTime] = this._crypto.signLoginNonce(
-      String(identity.private_key_pem),
-      String(phase1.nonce),
-    );
-    const phase2 = await this._shortRpc(gatewayUrl, 'auth.aid_login2', {
-      aid: identity.aid,
-      request_id: phase1.request_id,
-      nonce: phase1.nonce,
-      client_time: clientTime,
-      signature,
-    });
-    return phase2;
+      // Phase 2: 用私钥签名 nonce
+      const [signature, clientTime] = this._crypto.signLoginNonce(
+        String(identity.private_key_pem),
+        String(phase1.nonce),
+      );
+      this._logger.debug(`login2 start: aid=${identity.aid}`);
+      const phase2 = await this._shortRpc(gatewayUrl, 'auth.aid_login2', {
+        aid: identity.aid,
+        request_id: phase1.request_id,
+        nonce: phase1.nonce,
+        client_time: clientTime,
+        signature,
+      });
+      this._logger.debug(`_login exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid}, has_token=${!!phase2.access_token || !!phase2.token}`);
+      return phase2;
+    } catch (err) {
+      this._logger.debug(`_login exit (error): elapsed=${Date.now() - tStart}ms aid=${identity.aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /** 刷新 access_token */
@@ -806,13 +931,21 @@ export class AuthFlow {
     gatewayUrl: string,
     refreshToken: string,
   ): Promise<JsonObject> {
-    const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', {
-      refresh_token: refreshToken,
-    });
-    if (!result.success) {
-      throw new AuthError(String(result.error || 'refresh failed'));
+    const tStart = Date.now();
+    this._logger.debug(`_refreshAccessToken enter`);
+    try {
+      const result = await this._shortRpc(gatewayUrl, 'auth.refresh_token', {
+        refresh_token: refreshToken,
+      });
+      if (!result.success) {
+        throw new AuthError(String(result.error || 'refresh failed'));
+      }
+      this._logger.debug(`_refreshAccessToken exit: elapsed=${Date.now() - tStart}ms`);
+      return result;
+    } catch (err) {
+      this._logger.debug(`_refreshAccessToken exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    return result;
   }
 
   /** 会话初始化：发送 auth.connect RPC */
@@ -824,9 +957,14 @@ export class AuthFlow {
       deviceId?: string;
       slotId?: string;
       deliveryMode?: JsonObject | null;
+      connectionKind?: string;
+      shortTtlMs?: number;
+      extraInfo?: Record<string, unknown>;
     },
   ): Promise<void> {
-    const result = await transport.call('auth.connect', {
+    const connectionKind = String(opts?.connectionKind ?? 'long');
+    this._logger.debug(`session init start: deviceId=${opts?.deviceId ?? ''}, slotId=${opts?.slotId ?? ''}, kind=${connectionKind}`);
+    const request: JsonObject = {
       nonce,
       auth: { method: 'kite_token', token },
       protocol: { min: '1.0', max: '1.0' },
@@ -837,12 +975,29 @@ export class AuthFlow {
         e2ee: true,
         group_e2ee: true,
       },
-    });
+    };
+    // extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
+    const extraInfo = opts?.extraInfo;
+    if (extraInfo && Object.keys(extraInfo).length > 0) {
+      request.extra_info = extraInfo as JsonObject;
+    }
+    // 长短连接选项：默认 long 时不写入 options（保持 wire 兼容）
+    if (connectionKind === 'short') {
+      const options: JsonObject = { kind: 'short' };
+      const ttl = Number(opts?.shortTtlMs ?? 0);
+      if (ttl > 0) {
+        options.short_ttl_ms = ttl;
+      }
+      request.options = options;
+    }
+    const result = await transport.call('auth.connect', request as RpcParams);
 
     const status = isJsonObject(result) ? result.status : undefined;
     if (status !== 'ok') {
+      this._logger.error(`sessioninitfailed: status=${status}, result=${JSON.stringify(result)}`);
       throw new AuthError(`initialize failed: ${JSON.stringify(result)}`);
     }
+    this._logger.debug('sessioninitok');
   }
 
   // ── 内部方法：证书验证 ──────────────────────────────────────
@@ -882,14 +1037,14 @@ export class AuthFlow {
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
-      this._logger.warn(`CRL 检查不可用，降级继续: ${errMsg}`);
+      this._logger.warn(`CRL verification unavailable, skipping: ${errMsg}`);
     }
     try {
       await this._verifyAuthCertOcsp(gatewayUrl, authCert);
     } catch (exc) {
       const errMsg = exc instanceof Error ? exc.message : String(exc);
       if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
-      this._logger.warn(`OCSP 校验不可用，降级继续: ${errMsg}`);
+      this._logger.warn(`OCSP verification unavailable, skipping: ${errMsg}`);
     }
 
     // 验证 client_nonce 签名
@@ -1101,7 +1256,7 @@ export class AuthFlow {
         revokedSerials = new Set(serialsArr.map((s) => String(s).toLowerCase()));
       }
       // 如果两者都没有，返回空集合（无吊销记录）
-      this._logger.debug('CRL PEM 解析失败，使用 JSON revoked_serials 降级');
+      this._logger.debug('CRL PEM parse failed, using JSON revoked_serials fallback');
     }
 
     // 缓存 TTL：默认 5 分钟，最大 24 小时
@@ -1304,7 +1459,7 @@ export class AuthFlow {
     } catch (e) {
       // OCSP DER 解析失败时，降级信赖 JSON status 字段
       if (e instanceof AuthError) throw e;
-      this._logger.debug(`OCSP DER 解析失败，使用 JSON status 降级: ${e instanceof Error ? e.message : String(e)}`);
+      this._logger.debug(`OCSP DER parse failed, using JSON status fallback: ${e instanceof Error ? e.message : String(e)}`);
       if (!status) {
         throw new AuthError('gateway OCSP endpoint returned invalid response and no status field');
       }
@@ -1611,14 +1766,14 @@ export class AuthFlow {
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           if (/revoked/i.test(errMsg)) throw e instanceof AuthError ? e : new AuthError(errMsg);
-          this._logger.warn(`CRL 检查不可用，降级继续: ${errMsg}`);
+          this._logger.warn(`CRL verification unavailable, skipping: ${errMsg}`);
         }
         try {
           await this._verifyAuthCertOcsp(gatewayUrl, cert);
         } catch (exc) {
           const errMsg = exc instanceof Error ? exc.message : String(exc);
           if (/revoked/i.test(errMsg)) throw exc instanceof AuthError ? exc : new AuthError(errMsg);
-          this._logger.warn(`OCSP 校验不可用，降级继续: ${errMsg}`);
+          this._logger.warn(`OCSP verification unavailable, skipping: ${errMsg}`);
         }
       }
 
@@ -1626,9 +1781,9 @@ export class AuthFlow {
       identity.cert = certPemStr;
     } catch (e) {
       if (e instanceof AuthError) {
-        this._logger.warn(`拒绝服务端返回的 new_cert (${identity.aid}): ${e.message}`);
+        this._logger.warn(`rejected server new_cert (${identity.aid}): ${e.message}`);
       } else {
-        this._logger.warn(`new_cert 验证异常 (${identity.aid}): ${e instanceof Error ? e.message : String(e)}`);
+        this._logger.warn(`new_cert verification error (${identity.aid}): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
@@ -1645,11 +1800,11 @@ export class AuthFlow {
           if (actPubDer.equals(localPubDer)) {
             identity.cert = activeCertPem;
           } else {
-            this._logger.warn(`服务端 active_cert 公钥与本地私钥不匹配，拒绝同步 (aid=${identity.aid})`);
+            this._logger.warn(`active_cert public key mismatch with local private key, rejecting sync (aid=${identity.aid})`);
           }
         }
       } catch (e) {
-        this._logger.warn(`active_cert 同步异常 (${identity.aid}): ${e instanceof Error ? e.message : String(e)}`);
+        this._logger.warn(`active_cert sync error (${identity.aid}): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }
@@ -1723,12 +1878,22 @@ export class AuthFlow {
   /** 确保本地有指定 AID 的身份（不存在则创建密钥对） */
   private _ensureLocalIdentity(aid: string): IdentityRecord {
     const existing = this._keystore.loadIdentity(aid);
-    if (existing) {
+    // 必须确认有 keypair（private_key_pem + public_key_der_b64）才算"已存在"
+    // 否则 keystore 可能只有 metadata（如 gateway_url）但没有真正的密钥材料
+    if (existing && existing.private_key_pem && existing.public_key_der_b64) {
       this._aid = aid;
       return existing;
     }
     const identity = this._crypto.generateIdentity() as IdentityRecord;
     identity.aid = aid;
+    // 保留 keystore 已有的 metadata（如 gateway_url），避免覆盖
+    if (existing) {
+      for (const [k, v] of Object.entries(existing)) {
+        if (k !== 'aid' && !(k in identity)) {
+          (identity as IdentityRecord)[k] = v as JsonValue;
+        }
+      }
+    }
     this._persistIdentity(identity); // 立即持久化密钥对
     this._aid = aid;
     return identity;

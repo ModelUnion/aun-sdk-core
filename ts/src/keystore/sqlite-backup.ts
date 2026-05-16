@@ -88,7 +88,7 @@ export class SQLiteBackup {
       this._initTables();
       this._available = true;
     } catch (err) {
-      this._logger.warn(`备份初始化失败，降级为无备份模式: ${err}`);
+      this._logger.warn(`backup initialization failed, degrading to no-backup mode: ${err}`);
     }
   }
 
@@ -400,7 +400,7 @@ export class SQLiteBackup {
     try {
       runImmediateTransaction(this._db, fn);
     } catch (err) {
-      this._logger.warn(`${label} 失败: ${err}`);
+      this._logger.warn(`${label} failed: ${err}`);
     }
   }
 
@@ -409,7 +409,7 @@ export class SQLiteBackup {
     try {
       this._db.prepare(sql).run(...params);
     } catch (err) {
-      this._logger.warn(`备份写入失败: ${err}`);
+      this._logger.warn(`backup write failed: ${err}`);
     }
   }
 
@@ -418,7 +418,7 @@ export class SQLiteBackup {
     try {
       return this._db.prepare(sql).get(...params) as T | undefined;
     } catch (err) {
-      this._logger.warn(`备份读取失败: ${err}`);
+      this._logger.warn(`backup read failed: ${err}`);
       return undefined;
     }
   }
@@ -428,7 +428,7 @@ export class SQLiteBackup {
     try {
       return this._db.prepare(sql).all(...params) as T[];
     } catch (err) {
-      this._logger.warn(`备份读取失败: ${err}`);
+      this._logger.warn(`backup read failed: ${err}`);
       return [];
     }
   }

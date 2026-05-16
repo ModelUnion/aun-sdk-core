@@ -28,13 +28,13 @@ type KeyStore interface {
 
 // GroupState represents the current state_hash state for a group.
 type GroupState struct {
-	GroupID        string `json:”group_id”`
-	StateVersion   int64  `json:”state_version”`
-	StateHash      string `json:”state_hash”`
-	KeyEpoch       int64  `json:”key_epoch”`
-	MembershipJSON string `json:”membership_json”`
-	PolicyJSON     string `json:”policy_json”`
-	UpdatedAt      int64  `json:”updated_at”`
+	GroupID        string `json:"group_id"`
+	StateVersion   int64  `json:"state_version"`
+	StateHash      string `json:"state_hash"`
+	KeyEpoch       int64  `json:"key_epoch"`
+	MembershipJSON string `json:"membership_json"`
+	PolicyJSON     string `json:"policy_json"`
+	UpdatedAt      int64  `json:"updated_at"`
 }
 
 // StructuredKeyStore 提供结构化主存能力。
@@ -48,6 +48,11 @@ type StructuredKeyStore interface {
 
 	// LoadE2EEPrekeys 加载某个 AID 指定设备的全部 prekey 私钥状态；deviceID 为空时加载默认设备
 	LoadE2EEPrekeys(aid, deviceID string) (map[string]map[string]any, error)
+
+	// LoadE2EEPrekeyByID 按 prekey_id 单点查询（O(1) 数据库行级查询）。
+	// 解密入站消息时优先走该路径，避免 LoadE2EEPrekeys 的全量扫描。
+	// 与 Python SDK keystore.base.KeyStore.load_e2ee_prekey_by_id 对应。未命中返回 (nil, nil)。
+	LoadE2EEPrekeyByID(aid, prekeyID string) (map[string]any, error)
 
 	// SaveE2EEPrekey 保存单个 prekey 私钥状态；deviceID 为空时写入默认设备
 	SaveE2EEPrekey(aid, prekeyID, deviceID string, prekeyData map[string]any) error
@@ -150,6 +155,25 @@ type SeqTrackerStore interface {
 
 	// LoadAllSeqs 加载某 device+slot 下所有 namespace 的 contiguous_seq
 	LoadAllSeqs(aid, deviceID, slotID string) (map[string]int, error)
+}
+
+// SeqTrackerDeleter 是 SeqTrackerStore 的可选扩展，提供按 namespace 删除单行的能力。
+// 用于历史格式 group_id 的迁移：删除老 ns，写入 canonical ns。
+type SeqTrackerDeleter interface {
+	DeleteSeq(aid, deviceID, slotID, namespace string) error
+}
+
+// MetadataKeyStore 提供按 AID 隔离的轻量级 KV 元数据读写能力。
+// 用于缓存非身份核心字段（如 gateway_url 等）以跨进程复用。
+//
+// 与 Python SDK keystore.file.FileKeyStore._get_db(aid).get_metadata/set_metadata 对应。
+type MetadataKeyStore interface {
+	// GetMetadataValue 读取指定 AID 下 key 对应的字符串值；不存在或读取失败返回空字符串。
+	GetMetadataValue(aid, key string) string
+
+	// SetMetadataValue 写入指定 AID 下 key 对应的字符串值。
+	// value 为空字符串时按写入空字符串处理（不删除行）。
+	SetMetadataValue(aid, key, value string) error
 }
 
 // TrustRootStore 提供信任根证书存储能力。

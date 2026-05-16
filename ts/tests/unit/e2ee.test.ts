@@ -447,7 +447,7 @@ describe('prekey 加密失败降级日志（TS-014）', () => {
     expect(info.degraded).toBe(true);
     // 验证 warn 被调用且包含异常信息
     const warnCall = mockLogger.warn.mock.calls.find((args: unknown[]) =>
-      typeof args[0] === 'string' && (args[0] as string).includes('prekey 加密失败'));
+      typeof args[0] === 'string' && (args[0] as string).includes('prekey encrypt failed'));
     expect(warnCall).toBeDefined();
   });
 });

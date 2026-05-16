@@ -41,14 +41,15 @@ describe('ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检', () => {
       type: 'e2ee.group_encrypted',
       epoch: 3,
     });
-    (client as any)._requestGroupKeyFromCandidates = vi.fn().mockImplementation(async () => {
+    // 实现实际调用 _recoverGroupEpochKey 进行密钥恢复（与 Python SDK 对齐）
+    const recoverSpy = vi.spyOn(client as any, '_recoverGroupEpochKey').mockImplementation(async () => {
       recovered = true;
     });
 
     const calls: string[] = [];
     const callMock = vi.fn().mockImplementation(async (method: string, params: any) => {
       calls.push(method);
-      if (method === 'group.e2ee.get_epoch') return { epoch: 3 };
+      if (method === 'group.e2ee.get_epoch') return { epoch: 3, committed_epoch: 3 };
       if (method === 'group.get_info') return { owner_aid: 'owner.aid.com' };
       if (method === 'message.send') return { ok: true };
       if (method === 'group.send') return { ok: true };
@@ -65,6 +66,8 @@ describe('ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检', () => {
 
     // 应该先调用 group.e2ee.get_epoch 进行预检
     expect(calls).toContain('group.e2ee.get_epoch');
+    // 应该真的触发了密钥恢复（避免链路断裂）
+    expect(recoverSpy).toHaveBeenCalled();
   });
 
   it('本地无 epoch 时不应崩溃（静默跳过预检）', async () => {
@@ -342,6 +345,6 @@ describe('ISSUE-SDK-JS-009: group.add_member 检查返回结果后再分发密�
       aid: 'bob.aid.com',
     });
 
-    expect(rotateFn).toHaveBeenCalledWith('g1', expect.any(String), null);
+    expect(rotateFn).toHaveBeenCalledWith('g1', expect.any(String), null, false);
   });
 });

@@ -46,6 +46,8 @@ export interface KeyStore {
 
   /** 加载结构化 prekeys，deviceId 为空时等价于全局 */
   loadE2EEPrekeys?(aid: string, deviceId?: string): PrekeyMap;
+  /** 按 prekey_id 单点查询 prekey 私钥（O(1)，优先于 loadE2EEPrekeys 全量扫描） */
+  loadE2EEPrekeyById?(aid: string, prekeyId: string): PrekeyRecord | null;
   /** 保存单个 prekey，deviceId 为空时等价于全局 */
   saveE2EEPrekey?(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): void;
   /** 清理过期 prekeys，deviceId 为空时等价于全局 */
@@ -107,6 +109,8 @@ export interface KeyStore {
   loadSeq?(aid: string, deviceId: string, slotId: string, namespace: string): number;
   /** 加载某 device+slot 下所有 namespace 的 contiguous_seq */
   loadAllSeqs?(aid: string, deviceId: string, slotId: string): Record<string, number>;
+  /** 删除单个 namespace 的 contiguous_seq 行 */
+  deleteSeq?(aid: string, deviceId: string, slotId: string, namespace: string): void;
 
   // S2: 最近 ack seq（用作 SeqTracker 首条消息 baseline）。
   // 默认实现可直接复用 loadSeq/saveSeq（语义等价），实现方如已有独立字段可覆盖。

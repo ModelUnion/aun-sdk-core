@@ -7,10 +7,8 @@ import json
 import secrets
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
-
-import logging
 
 import aiohttp
 import websockets
@@ -24,8 +22,8 @@ from .crypto import CryptoProvider
 from .errors import AuthError, ConnectionError, StateError, ValidationError, map_remote_error, AUNError
 from .keystore.file import FileKeyStore
 
-
-_auth_log = logging.getLogger("aun_core.auth")
+if TYPE_CHECKING:
+    from .logger import AUNLogger, NullLogger
 
 
 def _verify_signature(public_key: Any, sig_bytes: bytes, data_bytes: bytes) -> None:
@@ -61,7 +59,10 @@ class AuthFlow:
         root_ca_path: str | None = None,
         chain_cache_ttl: int = 86400,
         verify_ssl: bool = False,
+        logger: "AUNLogger | NullLogger | None" = None,
     ) -> None:
+        from .logger import NullLogger as _NL
+        self._log = logger or _NL()
         self._keystore = keystore
         self._crypto = crypto
         self._aid = aid
@@ -107,36 +108,48 @@ class AuthFlow:
         self._slot_id = str(slot_id or "").strip()
 
     async def create_aid(self, gateway_url: str, aid: str) -> dict[str, Any]:
+        _t_start = time.time()
         self._validate_aid_name(aid)
-        identity = self._ensure_local_identity(aid)
-        if identity.get("cert"):
-            identity = await self._sync_existing_identity_cert(gateway_url, identity)
+        self._log.debug("auth", "create_aid enter: aid=%s gateway=%s", aid, gateway_url)
+        try:
+            identity = self._ensure_local_identity(aid)
+            if identity.get("cert"):
+                self._log.debug("auth", "local cert exists, syncing server state: aid=%s", aid)
+                identity = await self._sync_existing_identity_cert(gateway_url, identity)
+                self._persist_identity(identity)
+                self._aid = identity["aid"]
+                self._log.debug("auth", "create_aid exit (synced): elapsed=%.3fs aid=%s", time.time() - _t_start, identity["aid"])
+                return {"aid": identity["aid"], "cert": identity["cert"]}
+
+            # 本地有密钥但无证书 — 可能是上次 create_aid 网络失败后的残留状态，
+            # 也可能是服务端已注册但本地证书丢失。两种情况都先尝试注册。
+            try:
+                created = await self._create_aid(gateway_url, identity)
+                identity.update(created)
+            except AUNError as e:
+                if "already exists" not in str(e):
+                    self._log.warn("auth", "create_aid registration failed: aid=%s err=%s", aid, e)
+                    raise
+                # AID 已在服务端注册，本地有密钥但证书丢失。
+                # 通过 HTTP PKI 端点下载已注册的证书，验证公钥匹配后恢复。
+                self._log.debug("auth", "AID already exists, attempting cert download recovery: aid=%s", aid)
+                try:
+                    identity = await self._recover_cert_via_download(gateway_url, identity)
+                except Exception:
+                    self._log.warn("auth", "cert download recovery failed: aid=%s", aid)
+                    raise StateError(
+                        f"AID {aid} already registered on server but local certificate is missing. "
+                        f"Certificate download recovery failed. Options: "
+                        f"(1) use a different AID name, or "
+                        f"(2) restart Kite server to clear registration."
+                    ) from e
             self._persist_identity(identity)
             self._aid = identity["aid"]
+            self._log.debug("auth", "create_aid exit: elapsed=%.3fs aid=%s", time.time() - _t_start, identity["aid"])
             return {"aid": identity["aid"], "cert": identity["cert"]}
-
-        # 本地有密钥但无证书 — 可能是上次 create_aid 网络失败后的残留状态，
-        # 也可能是服务端已注册但本地证书丢失。两种情况都先尝试注册。
-        try:
-            created = await self._create_aid(gateway_url, identity)
-            identity.update(created)
-        except AUNError as e:
-            if "already exists" not in str(e):
-                raise
-            # AID 已在服务端注册，本地有密钥但证书丢失。
-            # 通过 HTTP PKI 端点下载已注册的证书，验证公钥匹配后恢复。
-            try:
-                identity = await self._recover_cert_via_download(gateway_url, identity)
-            except Exception:
-                raise StateError(
-                    f"AID {aid} already registered on server but local certificate is missing. "
-                    f"Certificate download recovery failed. Options: "
-                    f"(1) use a different AID name, or "
-                    f"(2) restart Kite server to clear registration."
-                ) from e
-        self._persist_identity(identity)
-        self._aid = identity["aid"]
-        return {"aid": identity["aid"], "cert": identity["cert"]}
+        except Exception as exc:
+            self._log.debug("auth", "create_aid exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, aid, exc)
+            raise
 
     async def _sync_existing_identity_cert(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
         """本地已有 cert 时，校准服务端登记状态并必要时补签恢复。"""
@@ -202,39 +215,69 @@ class AuthFlow:
         return cert_pem
 
     async def authenticate(self, gateway_url: str, *, aid: str | None = None) -> dict[str, Any]:
+        _t_start = time.time()
         identity = self._load_identity_or_raise(aid)
-        if not identity.get("cert"):
-            # 本地有密钥但无证书 — 尝试从 PKI 下载恢复
-            try:
-                identity = await self._recover_cert_via_download(gateway_url, identity)
-                self._persist_identity(identity)
-            except Exception as e:
-                raise StateError(
-                    f"local certificate missing and recovery failed: {e}. "
-                    f"Run auth.create_aid() to register a new identity."
-                ) from e
+        self._log.debug("auth", "authenticate enter: aid=%s gateway=%s", identity.get("aid"), gateway_url)
         try:
-            login = await self._login(gateway_url, identity)
-        except AuthError as e:
-            if "not registered" in str(e):
-                _auth_log.warning("证书未在服务端注册，自动重新注册: aid=%s", identity["aid"])
-                created = await self._create_aid(gateway_url, identity)
-                identity["cert"] = created["cert"]
-                self._persist_identity(identity)
+            # 优先复用 keystore 里的 cached access_token（未过期且有 refresh_token）
+            # 避免每次调 authenticate 都走两阶段重登的网络往返
+            # 注意：_load_identity_or_raise 不带 instance_state（access_token 等），
+            # 这里需要主动走 load_instance_state 拿到 token
+            instance_state = self._load_instance_state(identity["aid"]) or {}
+            identity_with_state = {**identity, **instance_state}
+            cached_token = self._get_cached_access_token(identity_with_state)
+            cached_refresh = str(identity_with_state.get("refresh_token") or "")
+            if cached_token and cached_refresh:
+                self._log.debug("auth", "authenticate reusing cached token: aid=%s expires_at=%s",
+                                identity["aid"], identity_with_state.get("access_token_expires_at"))
+                self._aid = identity["aid"]
+                return {
+                    "aid": identity["aid"],
+                    "access_token": cached_token,
+                    "refresh_token": cached_refresh,
+                    "expires_at": identity_with_state.get("access_token_expires_at"),
+                    "gateway": gateway_url,
+                }
+
+            if not identity.get("cert"):
+                # 本地有密钥但无证书 — 尝试从 PKI 下载恢复
+                self._log.debug("auth", "no local cert, attempting PKI download recovery: aid=%s", identity.get("aid"))
+                try:
+                    identity = await self._recover_cert_via_download(gateway_url, identity)
+                    self._persist_identity(identity)
+                except Exception as e:
+                    self._log.warn("auth", "cert recovery failed: aid=%s err=%s", identity.get("aid"), e)
+                    raise StateError(
+                        f"local certificate missing and recovery failed: {e}. "
+                        f"Run auth.create_aid() to register a new identity."
+                    ) from e
+            try:
                 login = await self._login(gateway_url, identity)
-            else:
-                raise
-        self._remember_tokens(identity, login)
-        await self._validate_new_cert(identity, gateway_url)
-        self._persist_identity(identity)
-        self._aid = identity["aid"]
-        return {
-            "aid": identity["aid"],
-            "access_token": identity.get("access_token"),
-            "refresh_token": identity.get("refresh_token"),
-            "expires_at": identity.get("access_token_expires_at"),
-            "gateway": gateway_url,
-        }
+            except AuthError as e:
+                if "not registered" in str(e):
+                    self._log.warn("auth", "cert not registered on server, auto re-registering: aid=%s", identity["aid"])
+                    created = await self._create_aid(gateway_url, identity)
+                    identity["cert"] = created["cert"]
+                    self._persist_identity(identity)
+                    login = await self._login(gateway_url, identity)
+                else:
+                    self._log.warn("auth", "auth failed: aid=%s err=%s", identity.get("aid"), e)
+                    raise
+            self._remember_tokens(identity, login)
+            await self._validate_new_cert(identity, gateway_url)
+            self._persist_identity(identity)
+            self._aid = identity["aid"]
+            self._log.debug("auth", "authenticate exit: elapsed=%.3fs aid=%s expires_at=%s", time.time() - _t_start, identity["aid"], identity.get("access_token_expires_at"))
+            return {
+                "aid": identity["aid"],
+                "access_token": identity.get("access_token"),
+                "refresh_token": identity.get("refresh_token"),
+                "expires_at": identity.get("access_token_expires_at"),
+                "gateway": gateway_url,
+            }
+        except Exception as exc:
+            self._log.debug("auth", "authenticate exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, identity.get("aid"), exc)
+            raise
 
     async def ensure_authenticated(self, gateway_url: str) -> dict[str, Any]:
         identity = self._ensure_identity()
@@ -254,14 +297,22 @@ class AuthFlow:
         return {"token": token, "identity": identity}
 
     async def refresh_cached_tokens(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
+        _t_start = time.time()
         refresh_token = str(identity.get("refresh_token") or "")
         if not refresh_token:
+            self._log.warn("auth", "token refresh failed: missing refresh_token aid=%s", identity.get("aid"))
             raise AuthError("missing refresh_token")
-        refreshed = await self._refresh_access_token(gateway_url, refresh_token)
-        self._remember_tokens(identity, refreshed)
-        await self._validate_new_cert(identity, gateway_url)
-        self._persist_identity(identity)
-        return identity
+        self._log.debug("auth", "refresh_cached_tokens enter: aid=%s gateway=%s", identity.get("aid"), gateway_url)
+        try:
+            refreshed = await self._refresh_access_token(gateway_url, refresh_token)
+            self._remember_tokens(identity, refreshed)
+            await self._validate_new_cert(identity, gateway_url)
+            self._persist_identity(identity)
+            self._log.debug("auth", "refresh_cached_tokens exit: elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
+            return identity
+        except Exception as exc:
+            self._log.debug("auth", "refresh_cached_tokens exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, identity.get("aid"), exc)
+            raise
 
     async def initialize_with_token(
         self,
@@ -272,10 +323,16 @@ class AuthFlow:
         device_id: str = "",
         slot_id: str = "",
         delivery_mode: dict[str, Any] | None = None,
+        connection_kind: str = "long",
+        short_ttl_ms: int = 0,
+        extra_info: dict[str, Any] | None = None,
     ) -> None:
         nonce = challenge.get("params", {}).get("nonce", "")
         if not nonce:
+            self._log.warn("auth", "challenge missing nonce, cannot initialize session")
             raise AuthError("gateway challenge missing nonce")
+        self._log.debug("auth", "initializing session with token: device_id=%s slot_id=%s kind=%s",
+                        device_id, slot_id, connection_kind)
         self.set_instance_context(device_id=device_id, slot_id=slot_id)
         await self._initialize_session(
             transport,
@@ -284,6 +341,9 @@ class AuthFlow:
             device_id=device_id,
             slot_id=slot_id,
             delivery_mode=delivery_mode,
+            connection_kind=connection_kind,
+            short_ttl_ms=short_ttl_ms,
+            extra_info=extra_info,
         )
 
     async def connect_session(
@@ -296,10 +356,17 @@ class AuthFlow:
         device_id: str = "",
         slot_id: str = "",
         delivery_mode: dict[str, Any] | None = None,
+        connection_kind: str = "long",
+        short_ttl_ms: int = 0,
+        extra_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        _t_start = time.time()
         nonce = challenge.get("params", {}).get("nonce", "")
         if not nonce:
+            self._log.warn("auth", "connect_session: challenge missing nonce")
             raise AuthError("gateway challenge missing nonce")
+        self._log.debug("auth", "connect_session enter: gateway=%s device_id=%s has_token=%s",
+                        gateway_url, device_id, bool(access_token))
         self.set_instance_context(device_id=device_id, slot_id=slot_id)
 
         try:
@@ -317,15 +384,19 @@ class AuthFlow:
                     device_id=device_id,
                     slot_id=slot_id,
                     delivery_mode=delivery_mode,
+                    connection_kind=connection_kind,
+                    short_ttl_ms=short_ttl_ms,
                 )
                 identity["access_token"] = explicit_token
                 self._persist_identity(identity)
+                self._log.debug("auth", "connect_session exit (explicit_token): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
                 return {"token": explicit_token, "identity": identity}
             except (AuthError, ConnectionError, AUNError) as exc:
-                _auth_log.debug("explicit_token 认证失败，尝试下一方式: %s", exc)
+                self._log.debug("auth", "explicit_token auth failed, trying next method: %s", exc)
                 # transport 被 Gateway 关闭（4001）时，后续 fallback 无法使用同一连接，
                 # 直接向上抛出让 _reconnect_loop 重新建立连接后再走完整 fallback 链
                 if getattr(transport, "_closed", False):
+                    self._log.debug("auth", "connect_session exit (transport closed): elapsed=%.3fs", time.time() - _t_start)
                     raise ConnectionError(
                         f"transport closed during auth fallback: {exc}"
                     ) from exc
@@ -340,7 +411,10 @@ class AuthFlow:
                 device_id=device_id,
                 slot_id=slot_id,
                 delivery_mode=delivery_mode,
+                connection_kind=connection_kind,
+                short_ttl_ms=short_ttl_ms,
             )
+            self._log.debug("auth", "connect_session exit (new identity): elapsed=%.3fs", time.time() - _t_start)
             return auth_context
 
         cached_token = self._get_cached_access_token(identity)
@@ -353,11 +427,15 @@ class AuthFlow:
                     device_id=device_id,
                     slot_id=slot_id,
                     delivery_mode=delivery_mode,
+                    connection_kind=connection_kind,
+                    short_ttl_ms=short_ttl_ms,
                 )
+                self._log.debug("auth", "connect_session exit (cached_token): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
                 return {"token": cached_token, "identity": identity}
             except (AuthError, ConnectionError, AUNError) as exc:
-                _auth_log.debug("cached_token 认证失败，尝试刷新: %s", exc)
+                self._log.debug("auth", "cached_token auth failed, trying refresh: %s", exc)
                 if getattr(transport, "_closed", False):
+                    self._log.debug("auth", "connect_session exit (transport closed): elapsed=%.3fs", time.time() - _t_start)
                     raise ConnectionError(
                         f"transport closed during auth fallback: {exc}"
                     ) from exc
@@ -375,11 +453,15 @@ class AuthFlow:
                         device_id=device_id,
                         slot_id=slot_id,
                         delivery_mode=delivery_mode,
+                        connection_kind=connection_kind,
+                        short_ttl_ms=short_ttl_ms,
                     )
+                    self._log.debug("auth", "connect_session exit (refreshed_token): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
                     return {"token": cached_token, "identity": identity}
             except (AuthError, ConnectionError, AUNError) as exc:
-                _auth_log.debug("refresh_token 认证失败，将重新登录: %s", exc)
+                self._log.debug("auth", "refresh_token auth failed, will re-login: %s", exc)
                 if getattr(transport, "_closed", False):
+                    self._log.debug("auth", "connect_session exit (transport closed): elapsed=%.3fs", time.time() - _t_start)
                     raise ConnectionError(
                         f"transport closed during auth fallback: {exc}"
                     ) from exc
@@ -395,8 +477,12 @@ class AuthFlow:
             device_id=device_id,
             slot_id=slot_id,
             delivery_mode=delivery_mode,
+            connection_kind=connection_kind,
+            short_ttl_ms=short_ttl_ms,
+            extra_info=extra_info,
         )
         identity = self.load_identity(identity.get("aid"))
+        self._log.debug("auth", "connect_session exit (re-login): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
         return {"token": token, "identity": identity}
 
     async def _initialize_session(
@@ -408,6 +494,9 @@ class AuthFlow:
         device_id: str = "",
         slot_id: str = "",
         delivery_mode: dict[str, Any] | None = None,
+        connection_kind: str = "long",
+        short_ttl_ms: int = 0,
+        extra_info: dict[str, Any] | None = None,
     ) -> None:
         # The SDK lifecycle concept is "initialize(token)"; the gateway currently
         # serves it through its internal auth.connect entrypoint.
@@ -423,10 +512,25 @@ class AuthFlow:
                 "group_e2ee": True,
             },
         }
+        # extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
+        if extra_info:
+            request["extra_info"] = extra_info
+        # 长短连接选项：默认 long 时不写入 options（保持 wire 兼容）
+        if connection_kind == "short":
+            options: dict[str, Any] = {"kind": "short"}
+            if int(short_ttl_ms or 0) > 0:
+                options["short_ttl_ms"] = int(short_ttl_ms)
+            request["options"] = options
+        self._log.debug(
+            "auth", "auth.connect send: device_id=%s slot_id=%s kind=%s",
+            device_id, slot_id, connection_kind,
+        )
         result = await transport.call("auth.connect", request)
         status = (result or {}).get("status")
         if status != "ok":
+            self._log.warn("auth", "auth.connect failed: status=%s result=%s", status, result)
             raise AuthError(f"initialize failed: {result}")
+        self._log.debug("auth", "auth.connect success")
 
     async def _create_aid(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
         response = await self._short_rpc(gateway_url, "auth.create_aid", {
@@ -437,30 +541,51 @@ class AuthFlow:
         return {"cert": response["cert"]}
 
     async def _login(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
-        client_nonce = self._crypto.new_client_nonce()
-        phase1 = await self._short_rpc(gateway_url, "auth.aid_login1", {
-            "aid": identity["aid"],
-            "cert": identity["cert"],
-            "client_nonce": client_nonce,
-        })
-        await self._verify_phase1_response(gateway_url, phase1, client_nonce)
-        signature, client_time = self._crypto.sign_login_nonce(identity["private_key_pem"], phase1["nonce"])
-        phase2 = await self._short_rpc(gateway_url, "auth.aid_login2", {
-            "aid": identity["aid"],
-            "request_id": phase1["request_id"],
-            "nonce": phase1["nonce"],
-            "client_time": client_time,
-            "signature": signature,
-        })
-        return phase2
+        _t_start = time.time()
+        self._log.debug("auth", "_login enter (login1): aid=%s gateway=%s", identity["aid"], gateway_url)
+        try:
+            client_nonce = self._crypto.new_client_nonce()
+            phase1 = await self._short_rpc(gateway_url, "auth.aid_login1", {
+                "aid": identity["aid"],
+                "cert": identity["cert"],
+                "client_nonce": client_nonce,
+            })
+            self._log.debug("auth", "login1 done, verifying server response: aid=%s request_id=%s", identity["aid"], phase1.get("request_id"))
+            await self._verify_phase1_response(gateway_url, phase1, client_nonce)
+            self._log.debug("auth", "_login (login2 start): aid=%s request_id=%s", identity["aid"], phase1["request_id"])
+            signature, client_time = self._crypto.sign_login_nonce(identity["private_key_pem"], phase1["nonce"])
+            phase2 = await self._short_rpc(gateway_url, "auth.aid_login2", {
+                "aid": identity["aid"],
+                "request_id": phase1["request_id"],
+                "nonce": phase1["nonce"],
+                "client_time": client_time,
+                "signature": signature,
+            })
+            self._log.debug("auth", "_login exit: elapsed=%.3fs aid=%s has_token=%s has_refresh=%s",
+                            time.time() - _t_start, identity["aid"],
+                            bool(phase2.get("access_token") or phase2.get("token")),
+                            bool(phase2.get("refresh_token")))
+            return phase2
+        except Exception as exc:
+            self._log.debug("auth", "_login exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, identity.get("aid"), exc)
+            raise
 
     async def _refresh_access_token(self, gateway_url: str, refresh_token: str) -> dict[str, Any]:
-        result = await self._short_rpc(gateway_url, "auth.refresh_token", {
-            "refresh_token": refresh_token,
-        })
-        if not result.get("success"):
-            raise AuthError(str(result.get("error", "refresh failed")))
-        return result
+        _t_start = time.time()
+        self._log.debug("auth", "_refresh_access_token enter: gateway=%s", gateway_url)
+        try:
+            result = await self._short_rpc(gateway_url, "auth.refresh_token", {
+                "refresh_token": refresh_token,
+            })
+            if not result.get("success"):
+                self._log.warn("auth", "_refresh_access_token exit (server-failed): elapsed=%.3fs err=%s", time.time() - _t_start, result.get("error", "refresh failed"))
+                raise AuthError(str(result.get("error", "refresh failed")))
+            self._log.debug("auth", "_refresh_access_token exit: elapsed=%.3fs has_token=%s expires_in=%s",
+                            time.time() - _t_start, bool(result.get("access_token")), result.get("expires_in"))
+            return result
+        except Exception as exc:
+            self._log.debug("auth", "_refresh_access_token exit (error): elapsed=%.3fs err=%s", time.time() - _t_start, exc)
+            raise
 
     async def _short_rpc(self, gateway_url: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
         _SHORT_RPC_TIMEOUT = 15.0  # 单次 recv 超时（秒）
@@ -518,13 +643,13 @@ class AuthFlow:
         except AuthError as _crl_exc:
             if "revoked" in str(_crl_exc).lower():
                 raise
-            _auth_log.warning("CRL 检查不可用，降级继续: %s", _crl_exc)
+            self._log.warn("auth", "CRL check unavailable, degrading gracefully: %s", _crl_exc)
         try:
             await self._verify_auth_cert_ocsp(gateway_url, auth_cert)
         except AuthError as _ocsp_exc:
             if "revoked" in str(_ocsp_exc).lower():
                 raise
-            _auth_log.warning("OCSP 检查不可用，降级继续: %s", _ocsp_exc)
+            self._log.warn("auth", "OCSP check unavailable, degrading gracefully: %s", _ocsp_exc)
 
         try:
             signature = base64.b64decode(signature_b64)
@@ -666,17 +791,17 @@ class AuthFlow:
         except AuthError as _crl_exc:
             if "revoked" in str(_crl_exc).lower():
                 raise
-            _auth_log.warning("peer cert CRL 检查不可用，降级继续: %s", _crl_exc)
+            self._log.warn("auth", "peer cert CRL check unavailable, degrading gracefully: %s", _crl_exc)
         except Exception as exc:
-            _auth_log.warning("peer cert CRL 检查不可用，降级继续: %s", exc)
+            self._log.warn("auth", "peer cert CRL check unavailable, degrading gracefully: %s", exc)
         try:
             await self._verify_auth_cert_ocsp(gateway_url, cert, chain_aid=expected_aid)
         except AuthError as _ocsp_exc:
             if "revoked" in str(_ocsp_exc).lower():
                 raise
-            _auth_log.warning("peer cert OCSP 检查不可用，降级继续: %s", _ocsp_exc)
+            self._log.warn("auth", "peer cert OCSP check unavailable, degrading gracefully: %s", _ocsp_exc)
         except Exception as exc:
-            _auth_log.warning("peer cert OCSP 检查不可用，降级继续: %s", exc)
+            self._log.warn("auth", "peer cert OCSP check unavailable, degrading gracefully: %s", exc)
         cn_attrs = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
         if not cn_attrs or cn_attrs[0].value != expected_aid:
             cert_cn = cn_attrs[0].value if cn_attrs else "none"
@@ -784,7 +909,7 @@ class AuthFlow:
             if response.response_status is not ocsp.OCSPResponseStatus.SUCCESSFUL:
                 # 非 successful（如 UNAUTHORIZED）表示 responder 无法回答，常见于 unknown 证书
                 # 降级到 JSON status 字段
-                _auth_log.debug(
+                self._log.debug("auth", 
                     "OCSP responseStatus=%s (non-successful)，降级使用 JSON status",
                     response.response_status.name,
                 )
@@ -829,7 +954,7 @@ class AuthFlow:
         except AuthError:
             raise
         except Exception as exc:
-            _auth_log.debug("OCSP DER 解析失败，降级使用 JSON status: %s", exc)
+            self._log.debug("auth", "OCSP DER parse failed, degrading to JSON status: %s", exc)
 
         # DER 解析未得出结果时，降级使用 JSON status
         if effective_status is None:
@@ -840,7 +965,8 @@ class AuthFlow:
         # 计算缓存 TTL
         try:
             next_refresh_at = response.next_update_utc.timestamp() if response.response_status == ocsp.OCSPResponseStatus.SUCCESSFUL and response.next_update_utc else time.time() + 300
-        except Exception:
+        except Exception as exc:
+            self._log.warn("auth", "OCSP next_update timestamp parse failed, default TTL=300s: %s", exc)
             next_refresh_at = time.time() + 300
         # 客户端最大缓存 TTL：不信任服务端设置超过 24 小时的 next_update
         max_refresh_at = time.time() + 86400
@@ -924,8 +1050,8 @@ class AuthFlow:
                 dynamic_bundle = keystore.trust_root_bundle_path()
                 if dynamic_bundle.exists():
                     candidate_paths.append(dynamic_bundle)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log.warn("auth", "trust root bundle path resolve failed: %s", exc)
         bundled_dir = Path(__file__).resolve().parent / "certs"
         if bundled_dir.exists():
             candidate_paths.extend(sorted(bundled_dir.glob("*.crt")))
@@ -1012,19 +1138,19 @@ class AuthFlow:
                 except AuthError as exc:
                     if "revoked" in str(exc).lower():
                         raise
-                    _auth_log.warning("CRL 检查不可用，降级继续: %s", exc)
+                    self._log.warn("auth", "CRL check unavailable, degrading gracefully: %s", exc)
                 try:
                     await self._verify_auth_cert_ocsp(gateway_url, cert)
                 except AuthError as exc:
                     if "revoked" in str(exc).lower():
                         raise
-                    _auth_log.info("OCSP 校验不可用，降级继续: %s", exc)
+                    self._log.info("auth", "OCSP check unavailable, degrading gracefully: %s", exc)
             # 验证通过，正式接受
             identity["cert"] = new_cert_pem if isinstance(new_cert_pem, str) else new_cert_pem.decode("utf-8")
         except AuthError as exc:
-            _auth_log.warning("拒绝服务端返回的 new_cert (%s): %s", identity.get("aid"), exc)
+            self._log.warn("auth", "rejected server new_cert (%s): %s", identity.get("aid"), exc)
         except Exception as exc:
-            _auth_log.warning("new_cert 验证异常 (%s): %s", identity.get("aid"), exc)
+            self._log.warn("auth", "new_cert validation error (%s): %s", identity.get("aid"), exc)
 
         # 同步服务端 active_signing 证书到本地
         active_cert_pem = identity.pop("_pending_active_cert", None)
@@ -1041,14 +1167,14 @@ class AuthFlow:
                 if local_pub_b64:
                     local_pub_der = base64.b64decode(local_pub_b64)
                     if act_pub_der != local_pub_der:
-                        _auth_log.error(
-                            "服务端 active_cert 公钥与本地私钥不匹配 (%s)，拒绝同步",
+                        self._log.error("auth",
+                            "server active_cert public key mismatch with local private key (%s), refusing sync",
                             identity.get("aid"),
                         )
                     else:
                         identity["cert"] = active_cert_pem if isinstance(active_cert_pem, str) else active_cert_pem.decode("utf-8")
             except Exception as exc:
-                _auth_log.warning("active_cert 同步异常 (%s): %s", identity.get("aid"), exc)
+                self._log.warn("auth", "active_cert sync error (%s): %s", identity.get("aid"), exc)
 
     @staticmethod
     def _get_cached_access_token(identity: dict[str, Any]) -> str:
@@ -1062,11 +1188,18 @@ class AuthFlow:
 
     def _ensure_local_identity(self, aid: str) -> dict[str, Any]:
         existing = self._keystore.load_identity(aid)
-        if existing:
+        # 必须确认有 keypair（private_key_pem + public_key_der_b64）才算"已存在"
+        # 否则 keystore 可能只有 metadata（如 gateway_url）但没有真正的密钥材料
+        if existing and existing.get("private_key_pem") and existing.get("public_key_der_b64"):
             self._aid = aid
             return existing
         identity = self._crypto.generate_identity()
         identity["aid"] = aid
+        # 保留 keystore 已有的 metadata（如 gateway_url），避免覆盖
+        if existing:
+            for k, v in existing.items():
+                if k not in identity and k != "aid":
+                    identity[k] = v
         self._persist_identity(identity)  # 立即持久化 keypair，避免服务端拒绝后丢失
         self._aid = aid
         return identity

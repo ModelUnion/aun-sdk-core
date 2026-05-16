@@ -319,7 +319,7 @@ def test_upload_agent_md_falls_back_to_authenticate(monkeypatch):
     assert result["etag"] == '"etag-2"'
 
 
-def test_upload_agent_md_refresh_failure_logs_and_falls_back_to_authenticate(monkeypatch, caplog):
+def test_upload_agent_md_refresh_failure_logs_and_falls_back_to_authenticate(monkeypatch):
     client = AUNClient()
     client._aid = "alice.agentid.pub"
     client._gateway_url = "ws://gateway.agentid.pub/aun"
@@ -382,11 +382,15 @@ def test_upload_agent_md_refresh_failure_logs_and_falls_back_to_authenticate(mon
 
     monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
 
-    with caplog.at_level("DEBUG", logger="aun_core"):
-        result = asyncio.run(client.auth.upload_agent_md("# Alice\n"))
+    from unittest.mock import MagicMock
+    mock_log = MagicMock()
+    monkeypatch.setattr(client, "_log", mock_log)
+
+    result = asyncio.run(client.auth.upload_agent_md("# Alice\n"))
 
     assert result["etag"] == '"etag-3"'
-    assert "agent.md upload refresh_token 失败" in caplog.text
+    debug_calls = [str(c) for c in mock_log.debug.call_args_list]
+    assert any("agent.md upload refresh_token 失败" in c for c in debug_calls)
 
 
 def test_upload_agent_md_403_raises_aunerror(monkeypatch):
@@ -611,6 +615,7 @@ def test_call_rejects_message_send_delivery_mode_param():
 
 
 def test_call_does_not_forward_message_send_delivery_mode():
+    """message.send 明文路径应保留 protected_headers/headers（信封元数据，加密与否都保留）。"""
     client = AUNClient()
     client._state = "connected"
     client._connect_delivery_mode = {
@@ -639,7 +644,106 @@ def test_call_does_not_forward_message_send_delivery_mode():
     assert calls == [("message.send", {
         "to": "bob.remote.example",
         "payload": {"type": "text", "text": "hello"},
+        "protected_headers": protected_headers,
+        "headers": {"device_id": "dev-b"},
     })]
+
+
+def test_message_thought_put_plaintext_passes_through():
+    """message.thought.put encrypt=false 应走通用 RPC 路径，保留 payload/protected_headers。"""
+    client = AUNClient()
+    client._state = "connected"
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    asyncio.run(client.call("message.thought.put", {
+        "to": "bob.remote.example",
+        "payload": {"type": "thought", "text": "明文 thought"},
+        "encrypt": False,
+        "protected_headers": {"purpose": "trace"},
+        "context": {"type": "message", "id": "m-1"},
+    }))
+
+    assert len(calls) == 1
+    method, params = calls[0]
+    assert method == "message.thought.put"
+    # encrypt 字段已被剥离
+    assert "encrypt" not in params
+    # 明文 payload 原样透传
+    assert params["payload"] == {"type": "thought", "text": "明文 thought"}
+    # protected_headers 保留
+    assert params["protected_headers"] == {"purpose": "trace"}
+    # context 保留
+    assert params["context"] == {"type": "message", "id": "m-1"}
+
+
+def test_group_thought_put_plaintext_passes_through():
+    """group.thought.put encrypt=false 应走通用 RPC 路径，原样透传 payload。"""
+    client = AUNClient()
+    client._state = "connected"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    asyncio.run(client.call("group.thought.put", {
+        "group_id": "group.example.com/g-test",
+        "payload": {"type": "thought", "text": "群明文 thought"},
+        "encrypt": False,
+        "protected_headers": {"trace": "t1"},
+        "context": {"type": "group", "id": "g-1"},
+    }))
+
+    assert len(calls) == 1
+    method, params = calls[0]
+    assert method == "group.thought.put"
+    assert "encrypt" not in params
+    assert params["payload"] == {"type": "thought", "text": "群明文 thought"}
+    assert params["protected_headers"] == {"trace": "t1"}
+
+
+def test_group_send_plaintext_preserves_protected_headers():
+    """group.send encrypt=false 明文路径应保留 protected_headers/headers。"""
+    client = AUNClient()
+    client._state = "connected"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    asyncio.run(client.call("group.send", {
+        "group_id": "group.example.com/g-test",
+        "payload": {"type": "text", "text": "群明文"},
+        "encrypt": False,
+        "protected_headers": {"trace": "t1"},
+        "headers": {"misc": "h"},
+    }))
+
+    assert len(calls) == 1
+    method, params = calls[0]
+    assert method == "group.send"
+    assert "encrypt" not in params
+    assert params["protected_headers"] == {"trace": "t1"}
+    assert params["headers"] == {"misc": "h"}
+    assert params["payload"] == {"type": "text", "text": "群明文"}
 
 
 def test_protected_headers_from_params_accepts_wrapper():
@@ -654,6 +758,7 @@ def test_protected_headers_from_params_accepts_wrapper():
 
 def test_call_injects_message_slot_context():
     client = object.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._state = "connected"
     client._device_id = "device-1"
     client._slot_id = "slot-a"
@@ -710,6 +815,7 @@ def test_message_pull_empty_result_applies_server_ack_floor():
 
 def test_call_rejects_message_slot_context_override():
     client = object.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._state = "connected"
     client._device_id = "device-1"
     client._slot_id = "slot-a"
@@ -1684,6 +1790,7 @@ async def test_group_changed_skips_fill_when_no_gap():
     from aun_core.seq_tracker import SeqTracker
 
     client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
     client._seq_tracker = SeqTracker()
@@ -1715,6 +1822,7 @@ async def test_group_changed_triggers_fill_when_gap():
     from aun_core.seq_tracker import SeqTracker
 
     client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
     client._seq_tracker = SeqTracker()
@@ -1744,6 +1852,7 @@ async def test_group_changed_first_event_gap_does_not_force_local_cursor():
     from aun_core.seq_tracker import SeqTracker
 
     client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
     client._seq_tracker = SeqTracker()
@@ -1772,6 +1881,7 @@ async def test_gap_fill_allows_zero_contiguous_and_uses_server_event_cursor():
     from aun_core.seq_tracker import SeqTracker
 
     client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._state = "connected"
     client._closing = False
     client._aid = "alice.agentid.pub"
@@ -1828,6 +1938,7 @@ async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
     from aun_core.seq_tracker import SeqTracker
 
     client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._state = "connected"
     client._closing = False
     client._aid = "alice.agentid.pub"
@@ -1855,22 +1966,22 @@ async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
     transport.call = AsyncMock(side_effect=fake_transport_call)
     client._transport = transport
 
-    await client._on_raw_group_changed({"group_id": "G1", "event_seq": 5, "action": "foo"})
+    await client._on_raw_group_changed({"group_id": "g1", "event_seq": 5, "action": "foo"})
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline and not any(method == "group.ack_events" for method, _ in calls):
         await asyncio.sleep(0.01)
 
     pull_call = next(params for method, params in calls if method == "group.pull_events")
     assert pull_call == {
-        "group_id": "G1",
+        "group_id": "g1",
         "after_event_seq": 0,
         "device_id": "device-1",
         "limit": 50,
         "slot_id": "slot-a",
     }
     ack_call = next(params for method, params in calls if method == "group.ack_events")
-    assert ack_call == {"group_id": "G1", "event_seq": 3, "device_id": "device-1", "slot_id": "slot-a"}
-    assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 3
+    assert ack_call == {"group_id": "g1", "event_seq": 3, "device_id": "device-1", "slot_id": "slot-a"}
+    assert client._seq_tracker.get_contiguous_seq("group_event:g1") == 3
     assert client._gap_fill_done == {}
 
 
@@ -1883,6 +1994,7 @@ async def test_restore_before_transport_connect():
     from aun_core.seq_tracker import SeqTracker
 
     client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._seq_tracker = SeqTracker()
     client._seq_tracker_context = None
     client._gap_fill_done = set()
@@ -1892,7 +2004,7 @@ async def test_restore_before_transport_connect():
     client._device_id = "dev1"
     client._slot_id = "s1"
     client._identity = {"aid": "alice.aid.com"}
-    client._logger = None
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._session_params = None
     client._connect_delivery_mode = {}
     client._state = "idle"
@@ -1949,6 +2061,7 @@ async def test_restore_after_aid_change_during_auth():
     from aun_core.seq_tracker import SeqTracker
 
     client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._seq_tracker = SeqTracker()
     client._seq_tracker_context = None
     client._gap_fill_done = set()
@@ -1958,7 +2071,7 @@ async def test_restore_after_aid_change_during_auth():
     client._device_id = "dev1"
     client._slot_id = "s1"
     client._identity = {"aid": "alice.aid.com"}
-    client._logger = None
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._session_params = {"access_token": "t"}
     client._connect_delivery_mode = {}
     client._state = "idle"
@@ -2221,11 +2334,14 @@ async def test_group_push_accepts_other_slot_context(tmp_path):
 
 def _make_disconnect_client():
     """构造用于 _handle_transport_disconnect 测试的 client 和参数捕获列表。"""
+    from aun_core.logger import NullLogger
     client = object.__new__(AUNClient)
+    client._log = NullLogger()
     client._closing = False
     client._state = "connected"
     client._reconnect_task = None
     client._server_kicked = False
+    client._aid = None
     client._session_options = {
         "auto_reconnect": True,
         "retry": {"initial_delay": 1.0, "max_delay": 64.0},
@@ -2509,12 +2625,13 @@ class TestClientListIdentities:
 def _make_reconnect_client():
     """构造用于 _reconnect_loop 测试的 client。"""
     client = object.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
     client._closing = False
     client._state = "connected"
     client._reconnect_task = None
     client._server_kicked = False
     client._gateway_url = "ws://gateway.example.com/aun"
-    client._logger = None
+    from aun_core.logger import NullLogger; client._log = NullLogger()
 
     published = []
 

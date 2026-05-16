@@ -140,6 +140,8 @@ client = AUNClient({
 | `auto_reconnect` | `bool` | `True` | 断线自动重连 |
 | `heartbeat_interval` | `float` | `30.0` | 心跳间隔（秒） |
 | `token_refresh_before` | `float` | `60.0` | 令牌过期前多久刷新（秒） |
+| `connection_kind` | `str` | `"long"` | 连接类型：`"long"` = 长连接（收推送）；`"short"` = 短连接（发 RPC 后断开） |
+| `short_ttl_ms` | `int` | `0` | 仅 `kind="short"` 时有效，服务端兜底关闭超时（毫秒）；0 = 不限时 |
 | `retry.initial_delay` | `float` | `1.0` | 首次重连延迟（秒） |
 | `retry.max_delay` | `float` | `64.0` | 最大重连延迟（秒） |
 | `timeouts.connect` | `float` | `5.0` | 连接超时（秒） |
@@ -157,6 +159,34 @@ await client.connect(auth, {
     "heartbeat_interval": 30.0,
 })
 ```
+
+**典型使用模式**
+
+长连接守护进程（常驻收件箱）：
+
+```python
+client = AUNClient({"aun_path": "/home/alice/.aun/alice"})
+auth = await client.auth.authenticate({"aid": "alice.example.com"})
+await client.connect(auth, {"connection_kind": "long", "slot_id": "main"})
+client.on("message.received", handle)
+await asyncio.Event().wait()  # 常驻
+```
+
+CLI 短连接（与长连接共享 keystore，自动复用 token）：
+
+```python
+client = AUNClient({"aun_path": "/home/alice/.aun/alice"})  # 同 path
+auth = await client.auth.authenticate({"aid": "alice.example.com"})  # 命中 cached token
+await client.connect(auth, {
+    "connection_kind": "short",
+    "slot_id": "main",        # 与长连接同槽位共存
+    "short_ttl_ms": 30000,
+})
+await client.call("message.send", {...})
+await client.close()
+```
+
+完整说明（token 复用机制、三种典型场景对比）见 [04-连接与认证.md](04-连接与认证.md#长连接--短连接代码示例)。
 
 ---
 

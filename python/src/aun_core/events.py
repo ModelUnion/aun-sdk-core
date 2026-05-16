@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging
 import threading
 from collections import defaultdict
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-_events_log = logging.getLogger("aun_core.events")
+if TYPE_CHECKING:
+    from .logger import AUNLogger, NullLogger
 
 EventHandler = Callable[[Any], Any]
 
@@ -36,7 +36,9 @@ class Subscription:
 
 
 class EventDispatcher:
-    def __init__(self) -> None:
+    def __init__(self, logger: "AUNLogger | NullLogger | None" = None) -> None:
+        from .logger import NullLogger as _NL
+        self._log = logger or _NL()
         self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
         # 订阅列表可能在不同线程/协程中被读写（主 loop publish + 工作线程 subscribe/unsubscribe），
         # 用 RLock 保护字典结构，避免迭代中发生 `dictionary changed size during iteration` 等竞态。
@@ -76,7 +78,7 @@ class EventDispatcher:
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
-                _events_log.warning("事件 %s 处理器 %s 执行异常: %s", event, getattr(h, "__name__", h), exc, exc_info=True)
+                self._log.warn("client", "event %s handler %s raised exception: %s", event, getattr(h, "__name__", h), exc)
                 # 发布 handler.error 事件通知调用方；防止无限递归：
                 # 如果当前事件本身就是 handler.error，不再递归发布
                 if event != "handler.error":

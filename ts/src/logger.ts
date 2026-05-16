@@ -1,5 +1,6 @@
-import { mkdirSync, appendFileSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { mkdirSync, appendFileSync, readdirSync, statSync, unlinkSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 
 export interface ModuleLogger {
   error(msg: string, err?: Error): void;
@@ -18,10 +19,37 @@ type Level = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG';
 const LOG_FILE_RE = /^ts-sdk-.*\.log$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_DAYS = 7;
+const LEVEL_ORDER: Record<Level, number> = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+
+function parseLogIni(path: string): Record<string, string> | null {
+  try {
+    if (!existsSync(path)) return null;
+    const content = readFileSync(path, 'utf-8');
+    const result: Record<string, string> = {};
+    for (const raw of content.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+      const idx = line.indexOf('=');
+      if (idx <= 0) continue;
+      const key = line.slice(0, idx).trim().toLowerCase();
+      const value = line.slice(idx + 1).trim().toLowerCase();
+      result[key] = value;
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+function parseBool(value: string | undefined): boolean {
+  return value === '1' || value === 'true' || value === 'on' || value === 'yes';
+}
 
 export class AUNLogger {
   private _debug: boolean;
   private _aunPath: string;
+  private _logDir: string;
+  private _minLevel: number;
   private _aid: string | null = null;
   private _fileWriteFailed = false;
   private _cleanupFailed = false;
@@ -29,8 +57,26 @@ export class AUNLogger {
   private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: AUNLoggerOptions) {
-    this._debug = opts.debug;
-    this._aunPath = opts.aunPath;
+    // ~/.aun/log.ini 存在时覆盖代码层 debug 标志，且日志目录强制为 ~/.aun/logs/
+    // 测试可通过环境变量 AUN_LOG_INI_DISABLE=1 跳过读取 ini，避免真实环境干扰
+    const iniDisabled = process.env.AUN_LOG_INI_DISABLE === '1' || process.env.AUN_LOG_INI_DISABLE === 'true';
+    const iniPath = join(homedir(), '.aun', 'log.ini');
+    const ini = iniDisabled ? null : parseLogIni(iniPath);
+    let levelStr: string;
+    if (ini) {
+      this._debug = parseBool(ini['debug']);
+      this._logDir = join(homedir(), '.aun', 'logs');
+      levelStr = (ini['level'] ?? (this._debug ? 'debug' : 'info')).toLowerCase();
+    } else {
+      this._debug = opts.debug;
+      this._aunPath = opts.aunPath;
+      this._logDir = join(opts.aunPath, 'logs');
+      levelStr = this._debug ? 'debug' : 'info';
+    }
+    this._aunPath = ini ? join(homedir(), '.aun') : opts.aunPath;
+    const lvl = LEVEL_ORDER[(levelStr.toUpperCase() as Level)] ?? LEVEL_ORDER.INFO;
+    this._minLevel = lvl;
+    // 仅 debug=ON 时建日志目录、清理过期日志、启动定时清理
     if (this._debug) {
       this._ensureLogDir();
       this._cleanupOldLogs();
@@ -60,13 +106,20 @@ export class AUNLogger {
   }
 
   private _emit(level: Level, module: string, msg: string, err?: Error): void {
+    // 低于最低级别一律不输出（控制台 + 文件均不输出）
+    if (LEVEL_ORDER[level] < this._minLevel) return;
+    // debug=OFF 时 DEBUG 一律不输出（控制台 + 文件均不输出）
+    if (level === 'DEBUG' && !this._debug) return;
     const { date, time, ms } = this._now();
     const head = `[${date} ${time}.${ms}][${level}][${module}]`;
     const aidPart = this._aid ? ` [${this._aid}]` : '';
     const line = `${head}${aidPart} ${msg}`;
 
     this._toConsole(level, line);
-    this._toFile(date, level, line, err);
+    // debug=OFF 时不写文件（与日志规范一致：debug=OFF → 仅控制台 INFO/WARN/ERROR）
+    if (this._debug) {
+      this._toFile(date, level, line, err);
+    }
   }
 
   private _toConsole(level: Level, line: string): void {
@@ -79,8 +132,7 @@ export class AUNLogger {
   }
 
   private _toFile(date: string, level: Level, line: string, err?: Error): void {
-    if (!this._debug) return;
-    const path = join(this._aunPath, 'logs', `ts-sdk-${date}.log`);
+    const path = join(this._logDir, `ts-sdk-${date}.log`);
     let payload = line + '\n';
     if (level === 'ERROR' && err?.stack) {
       const indented = err.stack.split('\n').map(l => '    ' + l).join('\n');
@@ -91,24 +143,24 @@ export class AUNLogger {
     } catch (exc) {
       if (!this._fileWriteFailed) {
         this._fileWriteFailed = true;
-        console.error(`[AUNLogger] 写日志文件失败: ${String(exc)}`);
+        console.error(`[AUNLogger] failed to write log file: ${String(exc)}`);
       }
     }
   }
 
   private _ensureLogDir(): void {
     try {
-      mkdirSync(join(this._aunPath, 'logs'), { recursive: true });
+      mkdirSync(this._logDir, { recursive: true });
     } catch (exc) {
       if (!this._mkdirFailed) {
         this._mkdirFailed = true;
-        console.error(`[AUNLogger] 创建日志目录失败: ${String(exc)}`);
+        console.error(`[AUNLogger] failed to create log directory: ${String(exc)}`);
       }
     }
   }
 
   private _cleanupOldLogs(): void {
-    const dir = join(this._aunPath, 'logs');
+    const dir = this._logDir;
     const cutoff = Date.now() - RETAIN_DAYS * DAY_MS;
     try {
       for (const name of readdirSync(dir)) {
@@ -119,14 +171,14 @@ export class AUNLogger {
         } catch (exc) {
           if (!this._cleanupFailed) {
             this._cleanupFailed = true;
-            console.warn(`[AUNLogger] 清理单个日志文件失败: ${name} ${String(exc)}`);
+            console.warn(`[AUNLogger] failed to cleanup log file: ${name} ${String(exc)}`);
           }
         }
       }
     } catch (exc) {
       if (!this._cleanupFailed) {
         this._cleanupFailed = true;
-        console.warn(`[AUNLogger] 扫描日志目录失败: ${String(exc)}`);
+        console.warn(`[AUNLogger] failed to scan log directory: ${String(exc)}`);
       }
     }
   }

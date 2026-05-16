@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -123,16 +122,16 @@ func newAIDDatabase(dbPath string, ss secretstore.SecretStore, aid string) (*AID
 
 	adb := &AIDDatabase{db: db, dbPath: dbPath, secretStore: ss, aid: aid}
 	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
-		log.Printf("[WARN] AIDDatabase WAL 设置失败: %v", err)
+		pkgLogKeystore().Warn("AIDDatabase WAL setup failed: %v", err)
 		if _, lockErr := db.Exec("PRAGMA locking_mode = EXCLUSIVE"); lockErr != nil {
-			log.Printf("[WARN] AIDDatabase EXCLUSIVE locking 设置失败: %v", lockErr)
+			pkgLogKeystore().Warn("AIDDatabase EXCLUSIVE locking setup failed: %v", lockErr)
 		}
 		if _, delErr := db.Exec("PRAGMA journal_mode = DELETE"); delErr != nil {
-			log.Printf("[WARN] AIDDatabase DELETE journal 设置失败: %v", delErr)
+			pkgLogKeystore().Warn("AIDDatabase DELETE journal setup failed: %v", delErr)
 		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", aidDBBusyTimeout)); err != nil {
-		log.Printf("[WARN] AIDDatabase busy_timeout 设置失败: %v", err)
+		pkgLogKeystore().Warn("AIDDatabase busy_timeout setup failed: %v", err)
 	}
 	if err := adb.initSchema(); err != nil {
 		_ = db.Close()
@@ -175,7 +174,7 @@ func (a *AIDDatabase) initSchema() error {
 		if _, err := tx.Exec("UPDATE _schema_version SET version = ? WHERE id = 1", aidDBSchemaVersion); err != nil {
 			return fmt.Errorf("更新 schema 版本号失败: %w", err)
 		}
-		log.Printf("[aid_db] schema 已从 v%d 迁移到 v%d", ver, aidDBSchemaVersion)
+		pkgLogKeystore().Warn("schema migrated from v%d to v%d", ver, aidDBSchemaVersion)
 	}
 	return tx.Commit()
 }
@@ -224,7 +223,7 @@ func (a *AIDDatabase) SetToken(key, value string) {
 		"INSERT INTO tokens (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
 		key, value, nowMs(),
 	); err != nil {
-		log.Printf("[aid_db] SetToken 失败 (key=%s): %v", key, err)
+		pkgLogKeystore().Warn("SetToken failed (key=%s): %v", key, err)
 	}
 }
 
@@ -232,7 +231,7 @@ func (a *AIDDatabase) DeleteToken(key string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, err := a.db.Exec("DELETE FROM tokens WHERE key = ?", key); err != nil {
-		log.Printf("[aid_db] DeleteToken 失败 (key=%s): %v", key, err)
+		pkgLogKeystore().Warn("DeleteToken failed (key=%s): %v", key, err)
 	}
 }
 
@@ -268,11 +267,11 @@ func (a *AIDDatabase) SavePrekey(prekeyID, privateKeyPEM, deviceID string, creat
 		rec, err := a.secretStore.Protect(scope, "prekey/"+prekeyID, []byte(privateKeyPEM))
 		if err != nil {
 			// 加密失败降级为明文，记录日志
-			log.Printf("[aid_db] SavePrekey 加密失败 (id=%s)，降级明文存储: %v", prekeyID, err)
+			pkgLogKeystore().Warn("SavePrekey encryption failed (id=%s), fallback to plaintext storage: %v", prekeyID, err)
 		} else {
 			encJSON, err2 := json.Marshal(rec)
 			if err2 != nil {
-				log.Printf("[aid_db] SavePrekey 序列化加密记录失败 (id=%s)，降级明文存储: %v", prekeyID, err2)
+				pkgLogKeystore().Warn("SavePrekey serialize encrypted record failed (id=%s), fallback to plaintext storage: %v", prekeyID, err2)
 			} else {
 				storedKey = string(encJSON)
 			}
@@ -281,7 +280,7 @@ func (a *AIDDatabase) SavePrekey(prekeyID, privateKeyPEM, deviceID string, creat
 
 	dataJSON, err := json.Marshal(extraData)
 	if err != nil {
-		log.Printf("[aid_db] SavePrekey json.Marshal 失败: %v", err)
+		pkgLogKeystore().Warn("SavePrekey json.Marshal failed: %v", err)
 		dataJSON = []byte("{}")
 	}
 	if _, err := a.db.Exec(
@@ -293,7 +292,7 @@ func (a *AIDDatabase) SavePrekey(prekeyID, privateKeyPEM, deviceID string, creat
 		prekeyID, deviceID, storedKey, string(dataJSON),
 		nullInt64Ptr(createdAt, now), now, nullInt64PtrSQL(expiresAt),
 	); err != nil {
-		log.Printf("[aid_db] SavePrekey 失败 (id=%s): %v", prekeyID, err)
+		pkgLogKeystore().Warn("SavePrekey failed (id=%s): %v", prekeyID, err)
 	}
 }
 
@@ -325,7 +324,7 @@ func (a *AIDDatabase) LoadPrekeys(deviceID string) map[string]map[string]any {
 				// 成功解析为 JSON → 尝试解密
 				scope := safeAID(a.aid)
 				if plain, err2 := a.secretStore.Reveal(scope, "prekey/"+id, rec); err2 != nil {
-					log.Printf("[aid_db] LoadPrekeys 解密失败 (id=%s): %v", id, err2)
+					pkgLogKeystore().Error("LoadPrekeys decryption failed (id=%s): %v", id, err2)
 					// 解密失败保留原始值（可能是旧的明文 PEM）
 				} else if plain != nil {
 					privateKeyPEM = string(plain)
@@ -358,11 +357,67 @@ func (a *AIDDatabase) LoadPrekeys(deviceID string) map[string]map[string]any {
 	return result
 }
 
+// LoadPrekeyByID 按 prekey_id 单点查询（WHERE prekey_id = ? LIMIT 1）。
+// 解密入站消息时信封里都带 prekey_id，应优先走这条路径，避免 LoadPrekeys 的全量扫描。
+// 不限 device_id，与 Python 实现保持一致（兼容旧数据）。未命中返回 nil。
+func (a *AIDDatabase) LoadPrekeyByID(prekeyID string) map[string]any {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	row := a.db.QueryRow(
+		`SELECT prekey_id, private_key_enc, data, created_at, updated_at, expires_at
+		 FROM prekeys WHERE prekey_id = ? LIMIT 1`, prekeyID,
+	)
+	var id, enc, dataStr string
+	var createdAt, updatedAt sql.NullInt64
+	var expiresAt sql.NullInt64
+	if err := row.Scan(&id, &enc, &dataStr, &createdAt, &updatedAt, &expiresAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		pkgLogKeystore().Warn("LoadPrekeyByID scan failed (id=%s): %v", prekeyID, err)
+		return nil
+	}
+
+	// 字段级解密：与 LoadPrekeys 保持一致
+	privateKeyPEM := enc
+	if a.secretStore != nil && enc != "" {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(enc), &rec); err == nil {
+			scope := safeAID(a.aid)
+			if plain, err2 := a.secretStore.Reveal(scope, "prekey/"+id, rec); err2 != nil {
+				pkgLogKeystore().Error("LoadPrekeyByID decryption failed (id=%s): %v", id, err2)
+			} else if plain != nil {
+				privateKeyPEM = string(plain)
+			}
+		}
+	}
+
+	entry := map[string]any{
+		"private_key_pem": privateKeyPEM,
+	}
+	if createdAt.Valid {
+		entry["created_at"] = createdAt.Int64
+	}
+	if updatedAt.Valid {
+		entry["updated_at"] = updatedAt.Int64
+	}
+	if expiresAt.Valid {
+		entry["expires_at"] = expiresAt.Int64
+	}
+	var extra map[string]any
+	if err := json.Unmarshal([]byte(dataStr), &extra); err == nil {
+		for k, v := range extra {
+			entry[k] = v
+		}
+	}
+	return entry
+}
+
 func (a *AIDDatabase) DeletePrekey(prekeyID, deviceID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, err := a.db.Exec("DELETE FROM prekeys WHERE prekey_id = ? AND device_id = ?", prekeyID, deviceID); err != nil {
-		log.Printf("[aid_db] DeletePrekey 失败 (id=%s, device=%s): %v", prekeyID, deviceID, err)
+		pkgLogKeystore().Warn("DeletePrekey failed (id=%s, device=%s): %v", prekeyID, deviceID, err)
 	}
 }
 
@@ -406,7 +461,7 @@ func (a *AIDDatabase) CleanupPrekeys(deviceID string, cutoffMs int64, keepLatest
 	}
 	for _, id := range toDelete {
 		if _, err := a.db.Exec("DELETE FROM prekeys WHERE device_id = ? AND prekey_id = ?", deviceID, id); err != nil {
-			log.Printf("[aid_db] CleanupPrekeys 删除失败 (device=%s, id=%s): %v", deviceID, id, err)
+			pkgLogKeystore().Warn("CleanupPrekeys deletefailed (device=%s, id=%s): %v", deviceID, id, err)
 		}
 	}
 	return toDelete
@@ -415,11 +470,16 @@ func (a *AIDDatabase) CleanupPrekeys(deviceID string, cutoffMs int64, keepLatest
 // ── Group Current ────────────────────────────────────────────
 
 func (a *AIDDatabase) SaveGroupCurrent(groupID string, epoch int64, secret string, data map[string]any) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("SaveGroupCurrent enter: group=%s epoch=%d", groupID, epoch)
+	defer func() {
+		pkgLogKeystore().Debug("SaveGroupCurrent exit: group=%s epoch=%d elapsed=%dms", groupID, epoch, time.Since(tStart).Milliseconds())
+	}()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	dataJSON, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("[aid_db] SaveGroupCurrent json.Marshal 失败: %v", err)
+		pkgLogKeystore().Warn("SaveGroupCurrent json.Marshal failed: %v", err)
 		dataJSON = []byte("{}")
 	}
 	storedSecret := a.encryptText("group/"+groupID+"/current", secret, "SaveGroupCurrent")
@@ -431,11 +491,16 @@ func (a *AIDDatabase) SaveGroupCurrent(groupID string, epoch int64, secret strin
 		   data=excluded.data, updated_at=excluded.updated_at`,
 		groupID, epoch, storedSecret, string(dataJSON), nowMs(),
 	); err != nil {
-		log.Printf("[aid_db] SaveGroupCurrent 失败 (group=%s): %v", groupID, err)
+		pkgLogKeystore().Warn("SaveGroupCurrent failed (group=%s): %v", groupID, err)
 	}
 }
 
 func (a *AIDDatabase) LoadGroupCurrent(groupID string) map[string]any {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("LoadGroupCurrent enter: group=%s", groupID)
+	defer func() {
+		pkgLogKeystore().Debug("LoadGroupCurrent exit: group=%s elapsed=%dms", groupID, time.Since(tStart).Milliseconds())
+	}()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var epoch int64
@@ -615,7 +680,7 @@ func (a *AIDDatabase) DeleteGroupCurrent(groupID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, err := a.db.Exec("DELETE FROM group_current WHERE group_id = ?", groupID); err != nil {
-		log.Printf("[aid_db] DeleteGroupCurrent 失败 (group=%s): %v", groupID, err)
+		pkgLogKeystore().Warn("DeleteGroupCurrent failed (group=%s): %v", groupID, err)
 	}
 }
 
@@ -630,7 +695,7 @@ func (a *AIDDatabase) SaveGroupOldEpoch(groupID string, epoch int64, secret stri
 	}
 	dataJSON, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("[aid_db] SaveGroupOldEpoch json.Marshal 失败: %v", err)
+		pkgLogKeystore().Warn("SaveGroupOldEpoch json.Marshal failed: %v", err)
 		dataJSON = []byte("{}")
 	}
 	storedSecret := a.encryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), secret, "SaveGroupOldEpoch")
@@ -642,7 +707,7 @@ func (a *AIDDatabase) SaveGroupOldEpoch(groupID string, epoch int64, secret stri
 		   updated_at=excluded.updated_at, expires_at=excluded.expires_at`,
 		groupID, epoch, storedSecret, string(dataJSON), now, nullInt64PtrSQL(expiresAt),
 	); err != nil {
-		log.Printf("[aid_db] SaveGroupOldEpoch 失败 (group=%s, epoch=%d): %v", groupID, epoch, err)
+		pkgLogKeystore().Warn("SaveGroupOldEpoch failed (group=%s, epoch=%d): %v", groupID, epoch, err)
 	}
 }
 
@@ -688,7 +753,7 @@ func (a *AIDDatabase) DeleteAllGroupOldEpochs(groupID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, err := a.db.Exec("DELETE FROM group_old_epochs WHERE group_id = ?", groupID); err != nil {
-		log.Printf("[aid_db] DeleteAllGroupOldEpochs 失败 (group=%s): %v", groupID, err)
+		pkgLogKeystore().Warn("DeleteAllGroupOldEpochs failed (group=%s): %v", groupID, err)
 	}
 }
 
@@ -718,14 +783,23 @@ func (a *AIDDatabase) CleanupGroupOldEpochs(groupID string, cutoffMs int64) int 
 		groupID, cutoffMs,
 	)
 	if err != nil {
-		log.Printf("[aid_db] CleanupGroupOldEpochs 失败 (group=%s): %v", groupID, err)
+		pkgLogKeystore().Warn("CleanupGroupOldEpochs failed (group=%s): %v", groupID, err)
 		return 0
 	}
 	n, _ := res.RowsAffected()
 	return int(n)
 }
 
-func (a *AIDDatabase) StoreGroupSecretTransition(groupID string, opts GroupSecretTransitionOptions) (bool, error) {
+func (a *AIDDatabase) StoreGroupSecretTransition(groupID string, opts GroupSecretTransitionOptions) (ok bool, err error) {
+	tStart := time.Now()
+	pkgLogKeystore().Debug("StoreGroupSecretTransition enter: group=%s", groupID)
+	defer func() {
+		if err != nil {
+			pkgLogKeystore().Debug("StoreGroupSecretTransition exit (error): group=%s ok=%v elapsed=%dms err=%v", groupID, ok, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogKeystore().Debug("StoreGroupSecretTransition exit: group=%s ok=%v elapsed=%dms", groupID, ok, time.Since(tStart).Milliseconds())
+		}
+	}()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -1161,7 +1235,7 @@ func (a *AIDDatabase) SaveSession(sessionID string, data map[string]any) {
 	defer a.mu.Unlock()
 	dataJSON, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("[aid_db] SaveSession json.Marshal 失败: %v", err)
+		pkgLogKeystore().Warn("SaveSession json.Marshal failed: %v", err)
 		dataJSON = []byte("{}")
 	}
 
@@ -1171,11 +1245,11 @@ func (a *AIDDatabase) SaveSession(sessionID string, data map[string]any) {
 		scope := safeAID(a.aid)
 		rec, err := a.secretStore.Protect(scope, "session/"+sessionID, dataJSON)
 		if err != nil {
-			log.Printf("[aid_db] SaveSession 加密失败 (id=%s)，降级明文存储: %v", sessionID, err)
+			pkgLogKeystore().Warn("SaveSession encryption failed (id=%s), fallback to plaintext storage: %v", sessionID, err)
 		} else {
 			encJSON, err2 := json.Marshal(rec)
 			if err2 != nil {
-				log.Printf("[aid_db] SaveSession 序列化加密记录失败 (id=%s)，降级明文存储: %v", sessionID, err2)
+				pkgLogKeystore().Warn("SaveSession serialize encrypted record failed (id=%s), fallback to plaintext storage: %v", sessionID, err2)
 			} else {
 				stored = string(encJSON)
 			}
@@ -1187,7 +1261,7 @@ func (a *AIDDatabase) SaveSession(sessionID string, data map[string]any) {
 		 ON CONFLICT(session_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at`,
 		sessionID, stored, nowMs(),
 	); err != nil {
-		log.Printf("[aid_db] SaveSession 失败 (id=%s): %v", sessionID, err)
+		pkgLogKeystore().Warn("SaveSession failed (id=%s): %v", sessionID, err)
 	}
 }
 
@@ -1241,7 +1315,7 @@ func (a *AIDDatabase) DeleteSession(sessionID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, err := a.db.Exec("DELETE FROM e2ee_sessions WHERE session_id = ?", sessionID); err != nil {
-		log.Printf("[aid_db] DeleteSession 失败 (id=%s): %v", sessionID, err)
+		pkgLogKeystore().Warn("DeleteSession failed (id=%s): %v", sessionID, err)
 	}
 }
 
@@ -1256,12 +1330,12 @@ func (a *AIDDatabase) encryptText(name, plaintext, label string) string {
 	}
 	rec, err := a.secretStore.Protect(safeAID(a.aid), name, []byte(plaintext))
 	if err != nil {
-		log.Printf("[aid_db] %s 加密失败 (name=%s)，降级明文存储: %v", label, name, err)
+		pkgLogKeystore().Warn("%s encryption failed (name=%s), fallback to plaintext storage: %v", label, name, err)
 		return plaintext
 	}
 	encJSON, err := json.Marshal(rec)
 	if err != nil {
-		log.Printf("[aid_db] %s 序列化加密记录失败 (name=%s)，降级明文存储: %v", label, name, err)
+		pkgLogKeystore().Warn("%s serialize encrypted record failed (name=%s), fallback to plaintext storage: %v", label, name, err)
 		return plaintext
 	}
 	return string(encJSON)
@@ -1274,7 +1348,7 @@ func (a *AIDDatabase) decryptText(name, enc, label string) string {
 	var rec map[string]any
 	if err := json.Unmarshal([]byte(enc), &rec); err == nil {
 		if plain, err2 := a.secretStore.Reveal(safeAID(a.aid), name, rec); err2 != nil {
-			log.Printf("[aid_db] %s 解密失败 (name=%s): %v", label, name, err2)
+			pkgLogKeystore().Error("%s decryption failed (name=%s): %v", label, name, err2)
 		} else if plain != nil {
 			return string(plain)
 		}
@@ -1292,7 +1366,7 @@ func (a *AIDDatabase) SaveInstanceState(deviceID, slotID string, state map[strin
 	}
 	dataJSON, err := json.Marshal(state)
 	if err != nil {
-		log.Printf("[aid_db] SaveInstanceState json.Marshal 失败: %v", err)
+		pkgLogKeystore().Warn("SaveInstanceState json.Marshal failed: %v", err)
 		dataJSON = []byte("{}")
 	}
 	if _, err := a.db.Exec(
@@ -1300,7 +1374,7 @@ func (a *AIDDatabase) SaveInstanceState(deviceID, slotID string, state map[strin
 		 ON CONFLICT(device_id, slot_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`,
 		deviceID, slotID, string(dataJSON), nowMs(),
 	); err != nil {
-		log.Printf("[aid_db] SaveInstanceState 失败 (device=%s, slot=%s): %v", deviceID, slotID, err)
+		pkgLogKeystore().Warn("SaveInstanceState failed (device=%s, slot=%s): %v", deviceID, slotID, err)
 	}
 }
 
@@ -1337,7 +1411,7 @@ func (a *AIDDatabase) SaveSeq(deviceID, slotID, namespace string, contiguousSeq 
 		 DO UPDATE SET contiguous_seq=excluded.contiguous_seq, updated_at=excluded.updated_at`,
 		deviceID, slotID, namespace, contiguousSeq, nowMs(),
 	); err != nil {
-		log.Printf("[aid_db] SaveSeq 失败 (device=%s, ns=%s): %v", deviceID, namespace, err)
+		pkgLogKeystore().Warn("SaveSeq failed (device=%s, ns=%s): %v", deviceID, namespace, err)
 	}
 }
 
@@ -1383,6 +1457,20 @@ func (a *AIDDatabase) LoadAllSeqs(deviceID, slotID string) map[string]int {
 	return result
 }
 
+// DeleteSeq 删除单个 namespace 的 contiguous_seq 行。
+func (a *AIDDatabase) DeleteSeq(deviceID, slotID, namespace string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if slotID == "" {
+		slotID = "_singleton"
+	}
+	_, err := a.db.Exec(
+		"DELETE FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?",
+		deviceID, slotID, namespace,
+	)
+	return err
+}
+
 // ── Metadata KV ──────────────────────────────────────────────
 
 func (a *AIDDatabase) GetMetadata(key string) string {
@@ -1403,7 +1491,7 @@ func (a *AIDDatabase) SetMetadata(key, value string) {
 		"INSERT INTO metadata_kv (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
 		key, value, nowMs(),
 	); err != nil {
-		log.Printf("[aid_db] SetMetadata 失败 (key=%s): %v", key, err)
+		pkgLogKeystore().Warn("SetMetadata failed (key=%s): %v", key, err)
 	}
 }
 
@@ -1411,7 +1499,7 @@ func (a *AIDDatabase) DeleteMetadata(key string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, err := a.db.Exec("DELETE FROM metadata_kv WHERE key = ?", key); err != nil {
-		log.Printf("[aid_db] DeleteMetadata 失败 (key=%s): %v", key, err)
+		pkgLogKeystore().Warn("DeleteMetadata failed (key=%s): %v", key, err)
 	}
 }
 

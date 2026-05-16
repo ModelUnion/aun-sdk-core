@@ -1,7 +1,11 @@
 // ── AUN 配置 ──────────────────────────────────────────────
 
 import { ValidationError } from './errors.js';
+import type { ModuleLogger } from './logger.js';
 import type { JsonObject } from './types.js';
+
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 const INSTANCE_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 
@@ -104,8 +108,9 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
   const data = (raw ?? {}) as AUNConfigInput;
   if (data.verifySsl === false || data.verifySSL === false || data.verify_ssl === false) {
     // 浏览器环境不支持跳过 SSL 验证，发出警告但不抛错（与 Python 对齐）
+    // 配置阶段尚无 logger 实例，直接走 console.warn（这是仅有的例外）
     console.warn(
-      '[aun_core] verify_ssl=false 在浏览器环境中不受支持，' +
+      '[aun_core.config] verify_ssl=false 在浏览器环境中不受支持，' +
       'SSL 证书验证将保持启用。浏览器 fetch API 不提供跳过证书验证的选项。',
     );
   }

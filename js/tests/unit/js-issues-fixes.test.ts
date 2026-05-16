@@ -165,14 +165,15 @@ describe('JS-003: _sendGroupEncrypted epoch 预检', () => {
       member_aids: ['alice.aid.com'],
     });
     vi.spyOn(groupE2ee, 'encryptWithEpoch').mockResolvedValue({ type: 'e2ee.group_encrypted', epoch: 3 });
-    (client as any)._requestGroupKeyFromCandidates = vi.fn().mockImplementation(async () => {
+    // 实现实际调用 _recoverGroupEpochKey 进行密钥恢复（与 Python SDK 对齐）
+    vi.spyOn(client as any, '_recoverGroupEpochKey').mockImplementation(async () => {
       recovered = true;
     });
 
     const methods: string[] = [];
     (client as any)._transport.call = vi.fn().mockImplementation(async (method: string) => {
       methods.push(method);
-      if (method === 'group.e2ee.get_epoch') return { epoch: 3 };
+      if (method === 'group.e2ee.get_epoch') return { epoch: 3, committed_epoch: 3 };
       if (method === 'group.get_info') return { owner_aid: 'owner.aid.com' };
       if (method === 'group.send') return { ok: true };
       if (method === 'message.send') return { ok: true };
@@ -222,9 +223,9 @@ describe('JS-004: decryptGroupMessage 异常日志保留堆栈', () => {
 
     await decryptGroupMessage(msg, secrets, null, { requireSignature: false });
 
-    // 查找异常日志
+    // 查找异常日志（日志已英文化）
     const exceptionLog = warnSpy.mock.calls.find(
-      c => typeof c[0] === 'string' && c[0].includes('群消息解密异常')
+      c => typeof c[0] === 'string' && c[0].includes('group message decrypt exception')
     );
     expect(exceptionLog).toBeDefined();
 

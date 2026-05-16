@@ -138,13 +138,15 @@ export class AIDDatabase {
   private _dbPath: string;
   private _secretStore: SecretStore | null;
   private _scope: string;
+  private _log: { error: (m: string, e?: Error) => void; warn: (m: string) => void; info: (m: string) => void; debug: (m: string) => void };
 
-  constructor(dbPath: string, secretStore?: SecretStore | null, scope?: string) {
+  constructor(dbPath: string, secretStore?: SecretStore | null, scope?: string, logger?: { error: (m: string, e?: Error) => void; warn: (m: string) => void; info: (m: string) => void; debug: (m: string) => void }) {
     mkdirSync(dirname(dbPath), { recursive: true });
     const absPath = resolve(dbPath);
     this._dbPath = absPath;
     this._secretStore = secretStore ?? null;
     this._scope = scope ?? dirname(absPath).split(/[\\/]/).pop() ?? '';
+    this._log = logger ?? { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
     const cached = _dbPool.get(absPath);
     if (cached) {
       cached.refCount++;
@@ -155,6 +157,7 @@ export class AIDDatabase {
       _dbPool.set(absPath, { db: this._db, refCount: 1 });
     }
     this._initSchema();
+    this._log.debug(`AIDDatabase ready: path=${this._dbPath} scope=${this._scope}`);
   }
 
   close(): void {
@@ -164,9 +167,11 @@ export class AIDDatabase {
       if (cached.refCount <= 0) {
         _dbPool.delete(this._dbPath);
         if (this._db.isOpen) this._db.close();
+        this._log.debug(`AIDDatabase closed: path=${this._dbPath}`);
       }
     } else {
       if (this._db.isOpen) this._db.close();
+      this._log.debug(`AIDDatabase closed (uncached): path=${this._dbPath}`);
     }
   }
 
@@ -196,7 +201,8 @@ export class AIDDatabase {
     if (!this._secretStore || !plaintext) return plaintext;
     try {
       return JSON.stringify(this._secretStore.protect(this._scope, name, Buffer.from(plaintext, 'utf-8')));
-    } catch {
+    } catch (exc) {
+      this._log.error(`field encryption failed (scope=${this._scope}, name=${name}), degrading to plaintext: ${exc instanceof Error ? exc.message : String(exc)}`, exc instanceof Error ? exc : undefined);
       return plaintext;
     }
   }
@@ -208,7 +214,8 @@ export class AIDDatabase {
       if (record?.scheme !== 'file_aes') return stored;
       const plain = this._secretStore.reveal(this._scope, name, record);
       return plain ? plain.toString('utf-8') : stored;
-    } catch {
+    } catch (exc) {
+      this._log.error(`field decryption failed (scope=${this._scope}, name=${name}): ${exc instanceof Error ? exc.message : String(exc)}`, exc instanceof Error ? exc : undefined);
       return stored;
     }
   }
@@ -270,6 +277,26 @@ export class AIDDatabase {
       result[row.prekey_id] = entry;
     }
     return result;
+  }
+
+  /**
+   * 按 prekey_id 单点查询（WHERE prekey_id = ? LIMIT 1）。
+   * 相比 loadPrekeys 的全量加载（O(N)），单条查询是 O(1)。
+   * 解密入站消息时信封里有 prekey_id，应优先走这条路径。
+   */
+  loadPrekeyById(prekeyId: string): Record<string, unknown> | null {
+    const row = this._db.prepare(
+      'SELECT prekey_id, private_key_enc, data, created_at, updated_at, expires_at FROM prekeys WHERE prekey_id = ? LIMIT 1',
+    ).get(prekeyId) as { prekey_id: string; private_key_enc: string; data: string; created_at: number | null; updated_at: number | null; expires_at: number | null } | undefined;
+    if (!row) return null;
+    const entry: Record<string, unknown> = {
+      private_key_pem: this._revealText(`prekey/${row.prekey_id}`, row.private_key_enc),
+    };
+    if (row.created_at != null) entry.created_at = row.created_at;
+    if (row.updated_at != null) entry.updated_at = row.updated_at;
+    if (row.expires_at != null) entry.expires_at = row.expires_at;
+    Object.assign(entry, jsonParseObject(row.data));
+    return entry;
   }
 
   deletePrekey(prekeyId: string, deviceId = ''): void {
@@ -742,6 +769,13 @@ export class AIDDatabase {
     const result: Record<string, number> = {};
     for (const row of rows) result[row.namespace] = row.contiguous_seq;
     return result;
+  }
+
+  deleteSeq(deviceId: string, slotId: string, namespace: string): void {
+    const slot = slotId || '_singleton';
+    this._db.prepare(
+      'DELETE FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?',
+    ).run(deviceId, slot, namespace);
   }
 
   getMetadata(key: string): string | null {

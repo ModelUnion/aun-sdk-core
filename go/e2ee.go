@@ -14,7 +14,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"log"
 	"regexp"
 	"sort"
 	"strings"
@@ -213,7 +212,7 @@ func saveKeyStorePrekey(ks keystore.KeyStore, aid, deviceID, prekeyID string, pr
 	if structured, ok := ks.(keystore.StructuredKeyStore); ok {
 		return structured.SaveE2EEPrekey(aid, prekeyID, normalizedDeviceID, prekeyData)
 	}
-	return fmt.Errorf("keystore 不支持 SaveE2EEPrekey")
+	return fmt.Errorf("keystore does not support SaveE2EEPrekey")
 }
 
 func prekeyCreatedMarker(prekeyData map[string]any) int64 {
@@ -260,7 +259,7 @@ func cleanupKeyStorePrekeys(ks keystore.KeyStore, aid, deviceID string, cutoffMs
 		}
 		return nil
 	}
-	log.Printf("[e2ee] keystore 不支持 CleanupE2EEPrekeys，跳过过期 prekey 清理")
+	pkgLogE2EE().Warn("keystore does not support CleanupE2EEPrekeys, skipping expired prekey cleanup")
 	return nil
 }
 
@@ -329,7 +328,16 @@ func (m *E2EEManager) EncryptMessage(
 	peerCertPEM []byte,
 	prekey map[string]any,
 	options ...E2EEEncryptOptions,
-) (map[string]any, map[string]any, error) {
+) (envelope map[string]any, info map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogE2EE().Debug("EncryptMessage enter: peer=%s", peerAID)
+	defer func() {
+		if err != nil {
+			pkgLogE2EE().Debug("EncryptMessage exit (error): peer=%s elapsed=%dms err=%v", peerAID, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogE2EE().Debug("EncryptMessage exit: peer=%s elapsed=%dms", peerAID, time.Since(tStart).Milliseconds())
+		}
+	}()
 	messageID := generateUUID4()
 	timestamp := time.Now().UnixMilli()
 	return m.EncryptOutbound(peerAID, payload, peerCertPEM, prekey, messageID, timestamp, options...)
@@ -346,8 +354,18 @@ func (m *E2EEManager) EncryptOutbound(
 	messageID string,
 	timestamp int64,
 	options ...E2EEEncryptOptions,
-) (map[string]any, map[string]any, error) {
+) (envelope map[string]any, info map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogE2EE().Debug("EncryptOutbound enter: peer=%s message_id=%s", peerAID, messageID)
+	defer func() {
+		if err != nil {
+			pkgLogE2EE().Debug("EncryptOutbound exit (error): peer=%s message_id=%s elapsed=%dms err=%v", peerAID, messageID, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogE2EE().Debug("EncryptOutbound exit: peer=%s message_id=%s elapsed=%dms", peerAID, messageID, time.Since(tStart).Milliseconds())
+		}
+	}()
 	opts := firstE2EEEncryptOptions(options)
+	pkgLogE2EE().Debug("P2P encryption started: peer=%s msgID=%s", peerAID, messageID)
 	// 传入 prekey -> 缓存；传入 nil -> 查缓存
 	if prekey != nil {
 		m.CachePrekey(peerAID, prekey)
@@ -356,8 +374,10 @@ func (m *E2EEManager) EncryptOutbound(
 	}
 
 	if prekey != nil {
-		envelope, err := m.encryptWithPrekey(peerAID, payload, prekey, peerCertPEM, messageID, timestamp, opts)
-		if err == nil {
+		var pkErr error
+		envelope, pkErr = m.encryptWithPrekey(peerAID, payload, prekey, peerCertPEM, messageID, timestamp, opts)
+		if pkErr == nil {
+			pkgLogE2EE().Debug("P2P prekey encryption succeeded: peer=%s mode=prekey_ecdh_v2", peerAID)
 			return envelope, map[string]any{
 				"encrypted":       true,
 				"forward_secrecy": true,
@@ -365,11 +385,12 @@ func (m *E2EEManager) EncryptOutbound(
 				"degraded":        false,
 			}, nil
 		}
-		log.Printf("[e2ee] prekey 加密失败，降级到 long_term_key: %v", err)
+		pkgLogE2EE().Warn("prekey encryption failed, degrading to long_term_key: peer=%s err=%v", peerAID, pkErr)
 	}
 
-	envelope, err := m.encryptWithLongTermKey(peerAID, payload, peerCertPEM, messageID, timestamp, opts)
+	envelope, err = m.encryptWithLongTermKey(peerAID, payload, peerCertPEM, messageID, timestamp, opts)
 	if err != nil {
+		pkgLogE2EE().Error("P2P long_term_key encryption failed: peer=%s err=%v", peerAID, err)
 		return nil, nil, err
 	}
 	degraded := prekey != nil // 有 prekey 但失败了才算降级
@@ -377,6 +398,7 @@ func (m *E2EEManager) EncryptOutbound(
 	if degraded {
 		reason = "prekey_encrypt_failed"
 	}
+	pkgLogE2EE().Debug("P2P encryption completed: peer=%s mode=long_term_key degraded=%v", peerAID, degraded)
 	return envelope, map[string]any{
 		"encrypted":          true,
 		"forward_secrecy":    false,
@@ -396,11 +418,12 @@ func (m *E2EEManager) encryptWithPrekey(
 	timestamp int64,
 	options ...E2EEEncryptOptions,
 ) (map[string]any, error) {
+	pkgLogE2EE().Debug("encryptWithPrekey entry: peer=%s msgID=%s", peerAID, messageID)
 	opts := firstE2EEEncryptOptions(options)
 	// 解析对端证书
 	peerCert, err := parseCertPEM(peerCertPEM)
 	if err != nil {
-		return nil, fmt.Errorf("解析对端证书失败: %w", err)
+		return nil, fmt.Errorf("failed to parse peer certificate: %w", err)
 	}
 	if expectedCertFingerprint, ok := prekey["cert_fingerprint"].(string); ok && strings.TrimSpace(expectedCertFingerprint) != "" {
 		actualCertFingerprint := certificateSHA256Fingerprint(peerCert)
@@ -410,7 +433,7 @@ func (m *E2EEManager) encryptWithPrekey(
 	}
 	peerIdentityPub, ok := peerCert.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
-		return nil, fmt.Errorf("对端证书非 EC 公钥")
+		return nil, fmt.Errorf("peer certificate is not an EC public key")
 	}
 
 	// 验证 prekey 签名
@@ -418,7 +441,7 @@ func (m *E2EEManager) encryptWithPrekey(
 	publicKeyB64, _ := prekey["public_key"].(string)
 	signatureB64, _ := prekey["signature"].(string)
 	if prekeyID == "" || publicKeyB64 == "" || signatureB64 == "" {
-		return nil, fmt.Errorf("prekey 字段不完整")
+		return nil, fmt.Errorf("prekey fields incomplete")
 	}
 
 	// 构建签名数据（支持含/不含 created_at）
@@ -432,20 +455,20 @@ func (m *E2EEManager) encryptWithPrekey(
 
 	sigBytes, err := base64.StdEncoding.DecodeString(signatureB64)
 	if err != nil {
-		return nil, fmt.Errorf("解码 prekey 签名失败: %w", err)
+		return nil, fmt.Errorf("failed to decode prekey signature: %w", err)
 	}
 	if !ecdsaVerify(peerIdentityPub, signData, sigBytes) {
-		return nil, fmt.Errorf("prekey 签名验证失败")
+		return nil, fmt.Errorf("prekey signature verification failed")
 	}
 
 	// 导入对方 prekey 公钥
 	prekeyPubDER, err := base64.StdEncoding.DecodeString(publicKeyB64)
 	if err != nil {
-		return nil, fmt.Errorf("解码 prekey 公钥失败: %w", err)
+		return nil, fmt.Errorf("failed to decode prekey public key: %w", err)
 	}
 	peerPrekeyPub, err := parseECPublicKeyDER(prekeyPubDER)
 	if err != nil {
-		return nil, fmt.Errorf("解析 prekey 公钥失败: %w", err)
+		return nil, fmt.Errorf("failed to parse prekey public key: %w", err)
 	}
 
 	// 加载发送方 identity 私钥
@@ -457,7 +480,7 @@ func (m *E2EEManager) encryptWithPrekey(
 	// 生成临时 ECDH 密钥对
 	ephPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("生成临时密钥失败: %w", err)
+		return nil, fmt.Errorf("failed to generate ephemeral key: %w", err)
 	}
 	ephPubBytes := elliptic.Marshal(elliptic.P256(), ephPriv.PublicKey.X, ephPriv.PublicKey.Y)
 
@@ -477,17 +500,17 @@ func (m *E2EEManager) encryptWithPrekey(
 	info := []byte(fmt.Sprintf("aun-prekey-v2:%s", prekeyID))
 	messageKey, err := hkdfDerive(combined, info, 32)
 	if err != nil {
-		return nil, fmt.Errorf("HKDF 派生失败: %w", err)
+		return nil, fmt.Errorf("HKDF derivation failed: %w", err)
 	}
 
 	// AES-256-GCM 加密
 	plaintext, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("序列化 payload 失败: %w", err)
+		return nil, fmt.Errorf("failed to serialize payload: %w", err)
 	}
 	nonce := make([]byte, 12)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("生成 nonce 失败: %w", err)
+		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
 	senderFP := m.localCertSHA256Fingerprint()
@@ -524,11 +547,11 @@ func (m *E2EEManager) encryptWithPrekey(
 
 	block, err := aes.NewCipher(messageKey)
 	if err != nil {
-		return nil, fmt.Errorf("创建 AES cipher 失败: %w", err)
+		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("创建 GCM 失败: %w", err)
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
 	}
 	ciphertextWithTag := gcm.Seal(nil, nonce, plaintext, aadBytes)
 	// 分割 ciphertext 和 tag（tag 是最后 16 字节）
@@ -548,7 +571,7 @@ func (m *E2EEManager) encryptWithPrekey(
 	signPayload = append(signPayload, aadBytes...)
 	sig, err := m.signBytes(signPayload)
 	if err != nil {
-		return nil, fmt.Errorf("发送方签名失败: %w", err)
+		return nil, fmt.Errorf("sender signature failed: %w", err)
 	}
 	envelope["sender_signature"] = sig
 	envelope["sender_cert_fingerprint"] = senderFP
@@ -565,14 +588,15 @@ func (m *E2EEManager) encryptWithLongTermKey(
 	timestamp int64,
 	options ...E2EEEncryptOptions,
 ) (map[string]any, error) {
+	pkgLogE2EE().Debug("encryptWithLongTermKey entry: peer=%s msgID=%s", peerAID, messageID)
 	opts := firstE2EEEncryptOptions(options)
 	peerCert, err := parseCertPEM(peerCertPEM)
 	if err != nil {
-		return nil, fmt.Errorf("解析对端证书失败: %w", err)
+		return nil, fmt.Errorf("failed to parse peer certificate: %w", err)
 	}
 	peerPub, ok := peerCert.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
-		return nil, fmt.Errorf("对端证书非 EC 公钥")
+		return nil, fmt.Errorf("peer certificate is not an EC public key")
 	}
 
 	senderPriv, err := m.loadSenderIdentityPrivate()
@@ -583,7 +607,7 @@ func (m *E2EEManager) encryptWithLongTermKey(
 	// 生成临时密钥对
 	ephPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("生成临时密钥失败: %w", err)
+		return nil, fmt.Errorf("failed to generate ephemeral key: %w", err)
 	}
 	ephPubBytes := elliptic.Marshal(elliptic.P256(), ephPriv.PublicKey.X, ephPriv.PublicKey.Y)
 
@@ -597,16 +621,16 @@ func (m *E2EEManager) encryptWithLongTermKey(
 
 	messageKey, err := hkdfDerive(combined, []byte("aun-longterm-v2"), 32)
 	if err != nil {
-		return nil, fmt.Errorf("HKDF 派生失败: %w", err)
+		return nil, fmt.Errorf("HKDF derivation failed: %w", err)
 	}
 
 	plaintext, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("序列化 payload 失败: %w", err)
+		return nil, fmt.Errorf("failed to serialize payload: %w", err)
 	}
 	nonce := make([]byte, 12)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("生成 nonce 失败: %w", err)
+		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
 	senderFP := m.localCertSHA256Fingerprint()
@@ -641,11 +665,11 @@ func (m *E2EEManager) encryptWithLongTermKey(
 
 	block, err := aes.NewCipher(messageKey)
 	if err != nil {
-		return nil, fmt.Errorf("创建 AES cipher 失败: %w", err)
+		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("创建 GCM 失败: %w", err)
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
 	}
 	ciphertextWithTag := gcm.Seal(nil, nonce, plaintext, aadBytes)
 	tagStart := len(ciphertextWithTag) - 16
@@ -664,7 +688,7 @@ func (m *E2EEManager) encryptWithLongTermKey(
 	signPayload = append(signPayload, aadBytes...)
 	sig, err := m.signBytes(signPayload)
 	if err != nil {
-		return nil, fmt.Errorf("发送方签名失败: %w", err)
+		return nil, fmt.Errorf("sender signature failed: %w", err)
 	}
 	envelope["sender_signature"] = sig
 	envelope["sender_cert_fingerprint"] = senderFP
@@ -675,7 +699,17 @@ func (m *E2EEManager) encryptWithLongTermKey(
 // ── 解密 ─────────────────────────────────────────────────
 
 // DecryptMessage 解密收到的 P2P 消息（内置防重放 + timestamp 窗口）
-func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, error) {
+func (m *E2EEManager) DecryptMessage(message map[string]any) (decrypted map[string]any, err error) {
+	tStart := time.Now()
+	mid, _ := message["message_id"].(string)
+	pkgLogE2EE().Debug("DecryptMessage enter: message_id=%s", mid)
+	defer func() {
+		if err != nil {
+			pkgLogE2EE().Debug("DecryptMessage exit (error): message_id=%s elapsed=%dms err=%v", mid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogE2EE().Debug("DecryptMessage exit: message_id=%s elapsed=%dms", mid, time.Since(tStart).Milliseconds())
+		}
+	}()
 	payload, ok := message["payload"].(map[string]any)
 	if !ok {
 		return message, nil
@@ -694,21 +728,23 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 		return nil, NewE2EEDecryptFailedError("encrypted message is not addressed to current aid")
 	}
 
+	fromAID, _ := message["from"].(string)
+	messageID, _ := message["message_id"].(string)
+	pkgLogE2EE().Debug("P2P decryption started: from=%s msgID=%s", fromAID, messageID)
+
 	// timestamp 窗口检查
 	ts := getTimestamp(message, payload)
 	if ts > 0 && m.replayWindow > 0 {
 		nowMs := time.Now().UnixMilli()
 		diffS := abs64(nowMs-ts) / 1000
 		if diffS > int64(m.replayWindow) {
-			log.Printf("[e2ee] 消息 timestamp 超出窗口 (%ds > %ds)，拒绝: from=%v mid=%v",
-				diffS, m.replayWindow, message["from"], message["message_id"])
-			return nil, NewE2EEDecryptFailedError("timestamp 超出窗口")
+			pkgLogE2EE().Error("message timestamp exceeds window (%ds > %ds), rejected: from=%s mid=%s",
+				diffS, m.replayWindow, fromAID, messageID)
+			return nil, NewE2EEDecryptFailedError("timestamp exceeds window")
 		}
 	}
 
 	// 本地防重放：检查通过后先预占，解密失败再释放，避免并发重复解密同一消息。
-	messageID, _ := message["message_id"].(string)
-	fromAID, _ := message["from"].(string)
 	seenKey := ""
 	reservedSeen := false
 	if messageID != "" && fromAID != "" {
@@ -716,7 +752,8 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 		m.mu.Lock()
 		if _, seen := m.seenMessages[seenKey]; seen {
 			m.mu.Unlock()
-			return nil, NewE2EEDecryptFailedError("重放消息")
+			pkgLogE2EE().Warn("replay detected: from=%s msgID=%s", fromAID, messageID)
+			return nil, NewE2EEDecryptFailedError("replay message")
 		}
 		m.seenCounter++
 		m.seenMessages[seenKey] = m.seenCounter
@@ -730,6 +767,9 @@ func (m *E2EEManager) DecryptMessage(message map[string]any) (map[string]any, er
 		m.mu.Lock()
 		delete(m.seenMessages, seenKey)
 		m.mu.Unlock()
+		pkgLogE2EE().Error("P2P decryption failed: from=%s msgID=%s err=%v", fromAID, messageID, err)
+	} else if err == nil && result != nil {
+		pkgLogE2EE().Debug("P2P decryption succeeded: from=%s msgID=%s", fromAID, messageID)
 	}
 	return result, err
 }
@@ -789,7 +829,7 @@ func (m *E2EEManager) decryptMessage(message map[string]any) (map[string]any, er
 
 	// 验证发送方签名
 	if err := m.verifySenderSignature(payload, message); err != nil {
-		log.Printf("[e2ee] 发送方签名验证失败: %v", err)
+		pkgLogE2EE().Error("sender signature verification failed: %v", err)
 		return nil, err
 	}
 
@@ -800,7 +840,7 @@ func (m *E2EEManager) decryptMessage(message map[string]any) (map[string]any, er
 	case ModeLongTermKey:
 		return m.decryptMessageLongTerm(message)
 	default:
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("不支持的加密模式: %s", mode))
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("unsupported encryption mode: %s", mode))
 	}
 }
 
@@ -808,7 +848,8 @@ func (m *E2EEManager) decryptMessage(message map[string]any) (map[string]any, er
 func (m *E2EEManager) verifySenderSignature(payload, message map[string]any) error {
 	sigB64, _ := payload["sender_signature"].(string)
 	if sigB64 == "" {
-		return NewE2EEDecryptFailedError("sender_signature 缺失")
+		pkgLogE2EE().Warn("verifySenderSignature: sender_signature missing")
+		return NewE2EEDecryptFailedError("sender_signature missing")
 	}
 
 	fromAID := ""
@@ -818,7 +859,8 @@ func (m *E2EEManager) verifySenderSignature(payload, message map[string]any) err
 		fromAID, _ = aad["from"].(string)
 	}
 	if fromAID == "" {
-		return NewE2EEDecryptFailedError("from_aid 缺失")
+		pkgLogE2EE().Warn("verifySenderSignature: from_aid missing")
+		return NewE2EEDecryptFailedError("from_aid missing")
 	}
 
 	senderFP := ""
@@ -829,16 +871,19 @@ func (m *E2EEManager) verifySenderSignature(payload, message map[string]any) err
 	}
 	senderCertPEM := m.getSenderCert(fromAID, senderFP)
 	if senderCertPEM == nil {
-		return NewE2EEDecryptFailedError(fmt.Sprintf("找不到 %s 的证书", fromAID))
+		pkgLogE2EE().Warn("verifySenderSignature: cannot find certificate: from=%s", fromAID)
+		return NewE2EEDecryptFailedError(fmt.Sprintf("cannot find certificate for %s", fromAID))
 	}
 
 	senderCert, err := parseCertPEM(senderCertPEM)
 	if err != nil {
-		return NewE2EEDecryptFailedError(fmt.Sprintf("解析发送方证书失败: %v", err))
+		pkgLogE2EE().Warn("verifySenderSignature: parse cert failed: from=%s err=%v", fromAID, err)
+		return NewE2EEDecryptFailedError(fmt.Sprintf("failed to parse sender certificate: %v", err))
 	}
 	senderPub, ok := senderCert.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
-		return NewE2EEDecryptFailedError("发送方证书非 EC 公钥")
+		pkgLogE2EE().Warn("verifySenderSignature: cert pubkey is not EC: from=%s", fromAID)
+		return NewE2EEDecryptFailedError("sender certificate is not an EC public key")
 	}
 
 	// 重建签名载荷 — 安全断言防止恶意消息触发 panic
@@ -857,25 +902,32 @@ func (m *E2EEManager) verifySenderSignature(payload, message map[string]any) err
 
 	sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
 	if err != nil {
-		return NewE2EEDecryptFailedError("解码签名失败")
+		pkgLogE2EE().Warn("verifySenderSignature: decode signature failed: from=%s", fromAID)
+		return NewE2EEDecryptFailedError("failed to decode signature")
 	}
 	if !ecdsaVerify(senderPub, signPayload, sigBytes) {
-		return NewE2EEDecryptFailedError("发送方签名验证失败")
+		pkgLogE2EE().Warn("verifySenderSignature: ECDSA verify failed: from=%s", fromAID)
+		return NewE2EEDecryptFailedError("sender signature verification failed")
 	}
 	return nil
 }
 
 // decryptMessagePrekeyV2 解密 prekey_ecdh_v2 模式的消息
 func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string]any, error) {
+	msgID, _ := message["message_id"].(string)
+	fromAID, _ := message["from"].(string)
+	pkgLogE2EE().Debug("decryptMessagePrekeyV2 entry: from=%s msgID=%s", fromAID, msgID)
 	payload, ok := message["payload"].(map[string]any)
 	if !ok {
-		return nil, NewE2EEDecryptFailedError("消息缺少 payload 或类型错误")
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: payload missing or wrong type: from=%s msgID=%s", fromAID, msgID)
+		return nil, NewE2EEDecryptFailedError("message missing payload or wrong type")
 	}
 
 	ephPubB64, _ := payload["ephemeral_public_key"].(string)
 	ephPubBytes, err := base64.StdEncoding.DecodeString(ephPubB64)
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError("解码 ephemeral key 失败")
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: decode ephemeral key failed: from=%s msgID=%s err=%v", fromAID, msgID, err)
+		return nil, NewE2EEDecryptFailedError("failed to decode ephemeral key")
 	}
 	prekeyID, _ := payload["prekey_id"].(string)
 	nonceB64, _ := payload["nonce"].(string)
@@ -888,21 +940,23 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 	// 加载 prekey 私钥
 	prekeyPriv := m.loadPrekeyPrivateKey(prekeyID)
 	if prekeyPriv == nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("prekey 不存在: %s", prekeyID))
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: prekey not found: prekeyID=%s from=%s", prekeyID, fromAID)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("prekey not found: %s", prekeyID))
 	}
 
 	// 加载接收方 identity 私钥
 	myPriv, err := m.loadMyIdentityPrivate()
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("identity 私钥加载失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: load identity private key failed: err=%v", err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("identity private key load failed: %v", err))
 	}
 
 	// 获取发送方公钥
-	fromAID := ""
+	fromAIDLocal := ""
 	if f, ok := message["from"].(string); ok {
-		fromAID = f
+		fromAIDLocal = f
 	} else if aad, ok := payload["aad"].(map[string]any); ok {
-		fromAID, _ = aad["from"].(string)
+		fromAIDLocal, _ = aad["from"].(string)
 	}
 	senderFP := ""
 	if fp, ok := payload["sender_cert_fingerprint"].(string); ok && strings.TrimSpace(fp) != "" {
@@ -910,15 +964,17 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 	} else if aad, ok := payload["aad"].(map[string]any); ok {
 		senderFP = strings.TrimSpace(strings.ToLower(getStr(aad, "sender_cert_fingerprint", "")))
 	}
-	senderPub := m.loadSenderPublicKey(fromAID, senderFP)
+	senderPub := m.loadSenderPublicKey(fromAIDLocal, senderFP)
 	if senderPub == nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("发送方 %s 公钥不可用", fromAID))
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: sender public key unavailable: from=%s", fromAIDLocal)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("sender %s public key unavailable", fromAIDLocal))
 	}
 
 	// 解析临时公钥
 	ephPubX, ephPubY := elliptic.Unmarshal(elliptic.P256(), ephPubBytes)
 	if ephPubX == nil {
-		return nil, NewE2EEDecryptFailedError("解析 ephemeral 公钥失败")
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: parse ephemeral pubkey failed: from=%s", fromAIDLocal)
+		return nil, NewE2EEDecryptFailedError("failed to parse ephemeral public key")
 	}
 	ephPub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: ephPubX, Y: ephPubY}
 
@@ -937,7 +993,8 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 	info := []byte(fmt.Sprintf("aun-prekey-v2:%s", prekeyID))
 	messageKey, err := hkdfDerive(combined, info, 32)
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("HKDF 派生失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: HKDF derivation failed: err=%v", err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("HKDF derivation failed: %v", err))
 	}
 
 	// AAD 校验 + 解密
@@ -945,25 +1002,30 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 	if aad, ok := payload["aad"].(map[string]any); ok {
 		expected := m.buildInboundAADOffline(message, payload)
 		if !aadMatchesOffline(expected, aad) {
-			return nil, NewE2EEDecryptFailedError("AAD 不匹配")
+			pkgLogE2EE().Warn("decryptMessagePrekeyV2: AAD mismatch: from=%s msgID=%s", fromAIDLocal, msgID)
+			return nil, NewE2EEDecryptFailedError("AAD mismatch")
 		}
 		aadBytes = aadBytesOffline(aad)
 	}
 	if !verifyEnvelopeMetadataAuth(payload, messageKey) {
-		return nil, NewE2EEDecryptFailedError("信封元数据认证失败")
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: envelope metadata authentication failed: from=%s msgID=%s", fromAIDLocal, msgID)
+		return nil, NewE2EEDecryptFailedError("envelope metadata authentication failed")
 	}
 
 	plaintext, err := aesGCMDecrypt(messageKey, nonce, ct, tag, aadBytes)
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("AES-GCM 解密失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: AES-GCM decryption failed: from=%s msgID=%s err=%v", fromAIDLocal, msgID, err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("AES-GCM decryption failed: %v", err))
 	}
 
 	var decoded map[string]any
 	if err := json.Unmarshal(plaintext, &decoded); err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("解析明文 JSON 失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: parse plaintext JSON failed: from=%s msgID=%s err=%v", fromAIDLocal, msgID, err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("failed to parse plaintext JSON: %v", err))
 	}
 	if !validateDecryptedEnvelopeMetadata(decoded, payload, message) {
-		return nil, NewE2EEDecryptFailedError("信封元数据不匹配")
+		pkgLogE2EE().Warn("decryptMessagePrekeyV2: envelope metadata mismatch: from=%s msgID=%s", fromAIDLocal, msgID)
+		return nil, NewE2EEDecryptFailedError("envelope metadata mismatch")
 	}
 
 	result := copyMapShallow(message)
@@ -981,20 +1043,26 @@ func (m *E2EEManager) decryptMessagePrekeyV2(message map[string]any) (map[string
 		e2ee["context"] = context
 	}
 	result["e2ee"] = e2ee
+	pkgLogE2EE().Debug("decryptMessagePrekeyV2 succeeded: from=%s msgID=%s", fromAIDLocal, msgID)
 	return result, nil
 }
 
 // decryptMessageLongTerm 解密 long_term_key 模式的消息
 func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string]any, error) {
+	msgID, _ := message["message_id"].(string)
+	fromAID, _ := message["from"].(string)
+	pkgLogE2EE().Debug("decryptMessageLongTerm entry: from=%s msgID=%s", fromAID, msgID)
 	payload, ok := message["payload"].(map[string]any)
 	if !ok {
-		return nil, NewE2EEDecryptFailedError("消息缺少 payload 或类型错误")
+		pkgLogE2EE().Warn("decryptMessageLongTerm: payload missing or wrong type: from=%s msgID=%s", fromAID, msgID)
+		return nil, NewE2EEDecryptFailedError("message missing payload or wrong type")
 	}
 
 	ephPubB64, _ := payload["ephemeral_public_key"].(string)
 	ephPubBytes, err := base64.StdEncoding.DecodeString(ephPubB64)
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError("解码 ephemeral key 失败")
+		pkgLogE2EE().Warn("decryptMessageLongTerm: decode ephemeral key failed: from=%s msgID=%s err=%v", fromAID, msgID, err)
+		return nil, NewE2EEDecryptFailedError("failed to decode ephemeral key")
 	}
 	nonceB64, _ := payload["nonce"].(string)
 	nonce, _ := base64.StdEncoding.DecodeString(nonceB64)
@@ -1006,15 +1074,16 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 	// 加载接收方 identity 私钥
 	myPriv, err := m.loadMyIdentityPrivate()
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("identity 私钥加载失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessageLongTerm: load identity private key failed: err=%v", err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("identity private key load failed: %v", err))
 	}
 
 	// 获取发送方公钥
-	fromAID := ""
+	fromAIDLocal := ""
 	if f, ok := message["from"].(string); ok {
-		fromAID = f
+		fromAIDLocal = f
 	} else if aad, ok := payload["aad"].(map[string]any); ok {
-		fromAID, _ = aad["from"].(string)
+		fromAIDLocal, _ = aad["from"].(string)
 	}
 	senderFP := ""
 	if fp, ok := payload["sender_cert_fingerprint"].(string); ok && strings.TrimSpace(fp) != "" {
@@ -1022,15 +1091,17 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 	} else if aad, ok := payload["aad"].(map[string]any); ok {
 		senderFP = strings.TrimSpace(strings.ToLower(getStr(aad, "sender_cert_fingerprint", "")))
 	}
-	senderPub := m.loadSenderPublicKey(fromAID, senderFP)
+	senderPub := m.loadSenderPublicKey(fromAIDLocal, senderFP)
 	if senderPub == nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("发送方 %s 公钥不可用", fromAID))
+		pkgLogE2EE().Warn("decryptMessageLongTerm: sender public key unavailable: from=%s", fromAIDLocal)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("sender %s public key unavailable", fromAIDLocal))
 	}
 
 	// 解析临时公钥
 	ephPubX, ephPubY := elliptic.Unmarshal(elliptic.P256(), ephPubBytes)
 	if ephPubX == nil {
-		return nil, NewE2EEDecryptFailedError("解析 ephemeral 公钥失败")
+		pkgLogE2EE().Warn("decryptMessageLongTerm: parse ephemeral pubkey failed: from=%s", fromAIDLocal)
+		return nil, NewE2EEDecryptFailedError("failed to parse ephemeral public key")
 	}
 	ephPub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: ephPubX, Y: ephPubY}
 
@@ -1044,7 +1115,8 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 
 	messageKey, err := hkdfDerive(combined, []byte("aun-longterm-v2"), 32)
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("HKDF 派生失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessageLongTerm: HKDF derivation failed: err=%v", err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("HKDF derivation failed: %v", err))
 	}
 
 	// AAD 校验 + 解密
@@ -1052,25 +1124,30 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 	if aad, ok := payload["aad"].(map[string]any); ok {
 		expected := m.buildInboundAADOffline(message, payload)
 		if !aadMatchesOffline(expected, aad) {
-			return nil, NewE2EEDecryptFailedError("AAD 不匹配")
+			pkgLogE2EE().Warn("decryptMessageLongTerm: AAD mismatch: from=%s msgID=%s", fromAIDLocal, msgID)
+			return nil, NewE2EEDecryptFailedError("AAD mismatch")
 		}
 		aadBytes = aadBytesOffline(aad)
 	}
 	if !verifyEnvelopeMetadataAuth(payload, messageKey) {
-		return nil, NewE2EEDecryptFailedError("信封元数据认证失败")
+		pkgLogE2EE().Warn("decryptMessageLongTerm: envelope metadata authentication failed: from=%s msgID=%s", fromAIDLocal, msgID)
+		return nil, NewE2EEDecryptFailedError("envelope metadata authentication failed")
 	}
 
 	plaintext, err := aesGCMDecrypt(messageKey, nonce, ct, tag, aadBytes)
 	if err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("AES-GCM 解密失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessageLongTerm: AES-GCM decryption failed: from=%s msgID=%s err=%v", fromAIDLocal, msgID, err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("AES-GCM decryption failed: %v", err))
 	}
 
 	var decoded map[string]any
 	if err := json.Unmarshal(plaintext, &decoded); err != nil {
-		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("解析明文 JSON 失败: %v", err))
+		pkgLogE2EE().Warn("decryptMessageLongTerm: parse plaintext JSON failed: from=%s msgID=%s err=%v", fromAIDLocal, msgID, err)
+		return nil, NewE2EEDecryptFailedError(fmt.Sprintf("failed to parse plaintext JSON: %v", err))
 	}
 	if !validateDecryptedEnvelopeMetadata(decoded, payload, message) {
-		return nil, NewE2EEDecryptFailedError("信封元数据不匹配")
+		pkgLogE2EE().Warn("decryptMessageLongTerm: envelope metadata mismatch: from=%s msgID=%s", fromAIDLocal, msgID)
+		return nil, NewE2EEDecryptFailedError("envelope metadata mismatch")
 	}
 
 	result := copyMapShallow(message)
@@ -1087,6 +1164,7 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 		e2ee["context"] = context
 	}
 	result["e2ee"] = e2ee
+	pkgLogE2EE().Debug("decryptMessageLongTerm succeeded: from=%s msgID=%s", fromAIDLocal, msgID)
 	return result, nil
 }
 
@@ -1094,27 +1172,38 @@ func (m *E2EEManager) decryptMessageLongTerm(message map[string]any) (map[string
 
 // GeneratePrekey 生成新的 prekey 并保存私钥到本地 keystore
 // 返回 dict 包含 prekey_id、public_key、signature、created_at，可直接用于 RPC 上传
-func (m *E2EEManager) GeneratePrekey() (map[string]any, error) {
+func (m *E2EEManager) GeneratePrekey() (out map[string]any, err error) {
+	tStart := time.Now()
+	pkgLogE2EE().Debug("GeneratePrekey enter")
+	defer func() {
+		if err != nil {
+			pkgLogE2EE().Debug("GeneratePrekey exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogE2EE().Debug("GeneratePrekey exit: elapsed=%dms", time.Since(tStart).Milliseconds())
+		}
+	}()
 	ks := m.keystore
 	if ks == nil {
-		return nil, NewE2EEError("keystore 不可用", "E2EE_NO_KEYSTORE")
+		err = NewE2EEError("keystore unavailable", "E2EE_NO_KEYSTORE")
+		return nil, err
 	}
 	aid := m.currentAID()
 	if aid == "" {
-		return nil, NewE2EEError("AID 不可用", "E2EE_NO_AID")
+		return nil, NewE2EEError("AID unavailable", "E2EE_NO_AID")
 	}
 	deviceID := m.currentDeviceID()
+	pkgLogE2EE().Debug("generating prekey: aid=%s deviceID=%s", aid, deviceID)
 
 	// 生成新 P-256 密钥对
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("生成 prekey 失败: %w", err)
+		return nil, fmt.Errorf("failed to generate prekey: %w", err)
 	}
 
 	// 公钥 DER（SubjectPublicKeyInfo）
 	pubDER, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("序列化 prekey 公钥失败: %w", err)
+		return nil, fmt.Errorf("failed to serialize prekey public key: %w", err)
 	}
 
 	prekeyID := generateUUID4()
@@ -1125,13 +1214,13 @@ func (m *E2EEManager) GeneratePrekey() (map[string]any, error) {
 	signData := []byte(fmt.Sprintf("%s|%s|%d", prekeyID, pubKeyB64, nowMs))
 	sig, err := m.signBytes(signData)
 	if err != nil {
-		return nil, fmt.Errorf("签名 prekey 失败: %w", err)
+		return nil, fmt.Errorf("failed to sign prekey: %w", err)
 	}
 
 	// 私钥 PEM
 	pkcs8Bytes, err := x509.MarshalPKCS8PrivateKey(privKey)
 	if err != nil {
-		return nil, fmt.Errorf("序列化 prekey 私钥失败: %w", err)
+		return nil, fmt.Errorf("failed to serialize prekey private key: %w", err)
 	}
 	privKeyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8Bytes}))
 
@@ -1140,7 +1229,7 @@ func (m *E2EEManager) GeneratePrekey() (map[string]any, error) {
 		"created_at":      nowMs,
 		"updated_at":      nowMs,
 	}); err != nil {
-		return nil, fmt.Errorf("保存 prekey 元数据失败: %w", err)
+		return nil, fmt.Errorf("failed to save prekey metadata: %w", err)
 	}
 
 	// 内存缓存私钥
@@ -1163,6 +1252,7 @@ func (m *E2EEManager) GeneratePrekey() (map[string]any, error) {
 	if deviceID != "" {
 		result["device_id"] = deviceID
 	}
+	pkgLogE2EE().Debug("prekey generated successfully: aid=%s prekeyID=%s", aid, prekeyID)
 	return result, nil
 }
 
@@ -1205,8 +1295,30 @@ func (m *E2EEManager) loadPrekeyPrivateKey(prekeyID string) *ecdsa.PrivateKey {
 	if aid == "" {
 		return nil
 	}
-	prekeys := loadKeyStorePrekeys(m.keystore, aid, m.currentDeviceID())
-	prekeyData := prekeys[prekeyID]
+
+	// 优先按 prekey_id 单点查询（O(1) 数据库行级查询）。
+	// 信封里都带 prekey_id，没必要全量加载所有 prekey（旧路径在 9000+ prekey 下 ~430ms/次）。
+	var prekeyData map[string]any
+	if structured, ok := m.keystore.(keystore.StructuredKeyStore); ok {
+		entry, err := structured.LoadE2EEPrekeyByID(aid, prekeyID)
+		if err != nil {
+			pkgLogE2EE().Warn("prekey %s by_id loader failed, falling back to full load: %v", prekeyID, err)
+		} else if entry != nil {
+			prekeyData = entry
+			pkgLogE2EE().Debug("prekey %s by_id lookup hit", prekeyID)
+		}
+	}
+
+	// 回退：旧版 keystore 没有 by_id 方法，或单点查询未命中 → 全量扫描（兼容路径）
+	if prekeyData == nil {
+		deviceID := m.currentDeviceID()
+		prekeys := loadKeyStorePrekeys(m.keystore, aid, deviceID)
+		_, hit := prekeys[prekeyID]
+		pkgLogE2EE().Debug("prekey %s keystore lookup: aid=%s device_id=%s local_prekey_count=%d hit=%v",
+			prekeyID, aid, deviceID, len(prekeys), hit)
+		prekeyData = prekeys[prekeyID]
+	}
+
 	if prekeyData == nil {
 		return nil
 	}
@@ -1217,7 +1329,7 @@ func (m *E2EEManager) loadPrekeyPrivateKey(prekeyID string) *ecdsa.PrivateKey {
 
 	pk, err := parseECPrivateKeyPEM(privPEM)
 	if err != nil {
-		log.Printf("[e2ee] prekey %s 私钥加载失败: %v", prekeyID, err)
+		pkgLogE2EE().Warn("prekey %s private key load failed: %v", prekeyID, err)
 		return nil
 	}
 
@@ -1607,7 +1719,7 @@ func (m *E2EEManager) signBytes(data []byte) (string, error) {
 	identity := m.identityFn()
 	privPEM, _ := identity["private_key_pem"].(string)
 	if privPEM == "" {
-		return "", fmt.Errorf("identity 私钥不可用")
+		return "", fmt.Errorf("identity private key unavailable")
 	}
 	pk, err := parseECPrivateKeyPEM(privPEM)
 	if err != nil {
@@ -1616,7 +1728,7 @@ func (m *E2EEManager) signBytes(data []byte) (string, error) {
 	hash := sha256.Sum256(data)
 	sig, err := ecdsa.SignASN1(rand.Reader, pk, hash[:])
 	if err != nil {
-		return "", fmt.Errorf("ECDSA 签名失败: %w", err)
+		return "", fmt.Errorf("ECDSA signature failed: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(sig), nil
 }
@@ -1626,7 +1738,7 @@ func (m *E2EEManager) loadSenderIdentityPrivate() (*ecdsa.PrivateKey, error) {
 	identity := m.identityFn()
 	privPEM, _ := identity["private_key_pem"].(string)
 	if privPEM == "" {
-		return nil, fmt.Errorf("发送方 identity 私钥不可用")
+		return nil, fmt.Errorf("sender identity private key unavailable")
 	}
 	return parseECPrivateKeyPEM(privPEM)
 }
@@ -1635,15 +1747,15 @@ func (m *E2EEManager) loadSenderIdentityPrivate() (*ecdsa.PrivateKey, error) {
 func (m *E2EEManager) loadMyIdentityPrivate() (*ecdsa.PrivateKey, error) {
 	aid := m.currentAID()
 	if aid == "" {
-		return nil, fmt.Errorf("AID 不可用")
+		return nil, fmt.Errorf("AID unavailable")
 	}
 	keyPair, err := m.keystore.LoadKeyPair(aid)
 	if err != nil || keyPair == nil {
-		return nil, fmt.Errorf("密钥对加载失败")
+		return nil, fmt.Errorf("key pair load failed")
 	}
 	privPEM, _ := keyPair["private_key_pem"].(string)
 	if privPEM == "" {
-		return nil, fmt.Errorf("identity 私钥不存在")
+		return nil, fmt.Errorf("identity private key not found")
 	}
 	return parseECPrivateKeyPEM(privPEM)
 }
@@ -1751,7 +1863,7 @@ func ecdsaVerify(pub *ecdsa.PublicKey, data, sig []byte) bool {
 func parseCertPEM(pemData []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(pemData)
 	if block == nil {
-		return nil, fmt.Errorf("无法解析 PEM 格式")
+		return nil, fmt.Errorf("failed to parse PEM format")
 	}
 	return x509.ParseCertificate(block.Bytes)
 }
@@ -1760,20 +1872,20 @@ func parseCertPEM(pemData []byte) (*x509.Certificate, error) {
 func parseECPrivateKeyPEM(pemStr string) (*ecdsa.PrivateKey, error) {
 	block, _ := pem.Decode([]byte(pemStr))
 	if block == nil {
-		return nil, fmt.Errorf("无法解析 PEM 格式私钥")
+		return nil, fmt.Errorf("failed to parse PEM format private key")
 	}
 	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
 		// 尝试 EC 私钥格式
 		ecKey, err2 := x509.ParseECPrivateKey(block.Bytes)
 		if err2 != nil {
-			return nil, fmt.Errorf("解析私钥失败: PKCS8=%v, EC=%v", err, err2)
+			return nil, fmt.Errorf("failed to parse private key: PKCS8=%v, EC=%v", err, err2)
 		}
 		return ecKey, nil
 	}
 	ecKey, ok := key.(*ecdsa.PrivateKey)
 	if !ok {
-		return nil, fmt.Errorf("私钥类型不是 ECDSA")
+		return nil, fmt.Errorf("private key type is not ECDSA")
 	}
 	return ecKey, nil
 }
@@ -1786,7 +1898,7 @@ func parseECPublicKeyDER(der []byte) (*ecdsa.PublicKey, error) {
 	}
 	ecPub, ok := pub.(*ecdsa.PublicKey)
 	if !ok {
-		return nil, fmt.Errorf("公钥不是 EC 类型")
+		return nil, fmt.Errorf("public key is not EC type")
 	}
 	return ecPub, nil
 }

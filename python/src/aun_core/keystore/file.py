@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import hashlib
@@ -9,7 +9,7 @@ import re
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -19,19 +19,19 @@ from .base import KeyStore
 from .sqlite_db import AIDDatabase, derive_sqlite_key, load_or_create_seed
 from ..config import normalize_instance_id
 
-import logging
-
-_log = logging.getLogger("aun_core.keystore")
+if TYPE_CHECKING:
+    from ..logger import AUNLogger, NullLogger
 
 _STRUCTURED_PREKEY_MIN_KEEP_COUNT = 7
 
 
-def _secure_file_permissions(path: Path) -> None:
+def _secure_file_permissions(path: Path, logger: "AUNLogger | NullLogger | None" = None) -> None:
     if sys.platform != "win32":
         try:
             os.chmod(path, 0o600)
         except OSError as exc:
-            _log.warning("设置文件权限 0o600 失败 (path=%s): %s", path, exc)
+            if logger:
+                logger.warn("keystore", "chmod 0600 failed (path=%s): %s", path, exc)
 
 
 def _prekey_created_marker(record: dict[str, Any]) -> int:
@@ -96,7 +96,7 @@ def _decode_field_bytes(value: str) -> bytes:
         return base64.b64decode(value)
 
 
-def _reveal_field(seed_bytes: bytes, scope: str, name: str, record: dict) -> bytes | None:
+def _reveal_field(seed_bytes: bytes, scope: str, name: str, record: dict, logger=None) -> bytes | None:
     scheme = record.get("scheme")
     if scheme not in ("file_aes", "file_secret_store"):
         return None
@@ -109,7 +109,8 @@ def _reveal_field(seed_bytes: bytes, scope: str, name: str, record: dict) -> byt
         aesgcm = AESGCM(field_key)
         return aesgcm.decrypt(nonce, ciphertext + tag, None)
     except Exception as exc:
-        _log.warning("解密字段失败 (scope=%s, name=%s): %s", scope, name, exc)
+        if logger:
+            logger.error("keystore", "decrypt field failed (scope=%s, name=%s): %s", scope, name, exc, err=exc)
         return None
 
 
@@ -122,7 +123,10 @@ class FileKeyStore(KeyStore):
         root: str | Path | None = None,
         *,
         encryption_seed: str | None = None,
+        logger: "AUNLogger | NullLogger | None" = None,
     ) -> None:
+        from ..logger import NullLogger as _NL
+        self._log = logger or _NL()
         preferred = Path(root or Path.home() / ".aun")
         fallback = Path.cwd() / ".aun"
         resolved_root = self._prepare_root(preferred, fallback)
@@ -149,6 +153,7 @@ class FileKeyStore(KeyStore):
         self._locks_lock = threading.Lock()
 
         self._sync_bundled_root_ca()
+        self._log.debug("keystore", "FileKeyStore initialized: root=%s aids_root=%s", self._root, self._aids_root)
 
     # ── AIDDatabase 访问 ─────────────────────────────────────
 
@@ -157,7 +162,7 @@ class FileKeyStore(KeyStore):
         with self._aid_dbs_lock:
             if safe not in self._aid_dbs:
                 db_path = self._identity_dir(aid) / "aun.db"
-                self._aid_dbs[safe] = AIDDatabase(db_path, self._sqlite_key)
+                self._aid_dbs[safe] = AIDDatabase(db_path, self._sqlite_key, logger=self._log)
             return self._aid_dbs[safe]
 
     def close(self) -> None:
@@ -165,20 +170,25 @@ class FileKeyStore(KeyStore):
         with self._aid_dbs_lock:
             dbs = list(self._aid_dbs.values())
             self._aid_dbs.clear()
+        self._log.debug("keystore", "FileKeyStore close: closing %d AID databases", len(dbs))
         for db in dbs:
             try:
                 db.close()
             except Exception as exc:
-                _log.debug("关闭 AID 数据库失败: %s", exc)
+                self._log.error("keystore", "failed to close AID database: %s", exc, err=exc)
 
     # ── 公共 API ─────────────────────────────────────────────
 
     def load_identity(self, aid: str) -> dict | None:
+        import time as _t
+        _t_start = _t.time()
+        self._log.debug("keystore", "load_identity enter: aid=%s", aid)
         lock = self._get_metadata_lock(aid)
         with lock:
             identity = self._load_identity_from_split_files(aid)
             if identity is not None:
                 identity.setdefault("aid", aid)
+                self._log.debug("keystore", "load_identity exit: elapsed=%.3fs aid=%s source=split", _t.time() - _t_start, aid)
                 return identity
             # 兼容旧格式整体 identity.json
             path = self._identity_path(aid)
@@ -186,6 +196,7 @@ class FileKeyStore(KeyStore):
                 identity = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(identity, dict):
                     identity.setdefault("aid", aid)
+                self._log.debug("keystore", "load_identity exit: elapsed=%.3fs aid=%s source=identity.json", _t.time() - _t_start, aid)
                 return identity
             # 兼容旧格式子目录
             legacy_subdir = self._root / self._safe_aid(aid)
@@ -196,10 +207,15 @@ class FileKeyStore(KeyStore):
                 identity = lks._load_identity_from_split_files(aid)
                 if isinstance(identity, dict):
                     identity.setdefault("aid", aid)
+                self._log.debug("keystore", "load_identity exit: elapsed=%.3fs aid=%s source=legacy", _t.time() - _t_start, aid)
                 return identity
+            self._log.debug("keystore", "load_identity exit: elapsed=%.3fs aid=%s found=false", _t.time() - _t_start, aid)
             return None
 
     def save_identity(self, aid: str, identity: dict) -> None:
+        import time as _t
+        _t_start = _t.time()
+        self._log.debug("keystore", "save_identity enter: aid=%s", aid)
         lock = self._get_metadata_lock(aid)
         with lock:
             key_pair = {k: identity[k] for k in ("private_key_pem", "public_key_der_b64", "curve") if k in identity}
@@ -212,18 +228,27 @@ class FileKeyStore(KeyStore):
             db = self._get_db(aid)
             token_fields = {"access_token", "refresh_token", "kite_token"}
             skip = token_fields | {"private_key_pem", "public_key_der_b64", "curve", "cert", "e2ee_prekeys", "group_secrets", "e2ee_sessions"}
+            token_count = 0
             for field in token_fields:
                 if field not in identity:
                     continue
                 value = identity.get(field)
                 if isinstance(value, str) and value:
                     db.set_token(field, value)
+                    token_count += 1
                 else:
                     db.delete_token(field)
+            kv_count = 0
             for k, v in identity.items():
                 if k in skip:
                     continue
                 db.set_metadata(k, json.dumps(v, ensure_ascii=False, separators=(",", ":")))
+                kv_count += 1
+            self._log.debug(
+                "keystore",
+                "save_identity exit: elapsed=%.3fs aid=%s key_pair=%s cert=%s tokens=%d kv=%d",
+                _t.time() - _t_start, aid, bool(key_pair), bool(cert), token_count, kv_count,
+            )
 
     def load_key_pair(self, aid: str) -> dict | None:
         lock = self._get_metadata_lock(aid)
@@ -243,6 +268,9 @@ class FileKeyStore(KeyStore):
             return None
 
     def save_key_pair(self, aid: str, key_pair: dict) -> None:
+        import time as _t
+        _t_start = _t.time()
+        self._log.debug("keystore", "save_key_pair enter: aid=%s curve=%s", aid, key_pair.get("curve", "-"))
         lock = self._get_metadata_lock(aid)
         with lock:
             path = self._key_pair_path(aid)
@@ -254,7 +282,8 @@ class FileKeyStore(KeyStore):
                 protection = _protect_field(self._seed_bytes, scope, "identity/private_key", private_key_pem.encode("utf-8"))
                 protected["private_key_protection"] = protection
             path.write_text(json.dumps(protected, ensure_ascii=False, indent=2), encoding="utf-8")
-            _secure_file_permissions(path)
+            _secure_file_permissions(path, self._log)
+            self._log.debug("keystore", "save_key_pair exit: elapsed=%.3fs aid=%s curve=%s has_private=%s", _t.time() - _t_start, aid, key_pair.get("curve", "-"), bool(private_key_pem))
 
     def load_cert(self, aid: str, cert_fingerprint: str | None = None) -> str | None:
         lock = self._get_metadata_lock(aid)
@@ -281,9 +310,12 @@ class FileKeyStore(KeyStore):
             return cert if isinstance(cert, str) and cert else None
 
     def save_cert(self, aid: str, cert_pem: str, cert_fingerprint: str | None = None, *, make_active: bool = True) -> None:
+        import time as _t
+        _t_start = _t.time()
         lock = self._get_metadata_lock(aid)
         with lock:
             normalized_fp = self._normalize_cert_fingerprint(cert_fingerprint) or self._fingerprint_from_cert_pem(cert_pem)
+            self._log.debug("keystore", "save_cert enter: aid=%s fingerprint=%s make_active=%s", aid, (normalized_fp[:16] + "...") if normalized_fp else "-", make_active)
             if normalized_fp:
                 version_path = self._cert_version_path(aid, normalized_fp)
                 version_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,6 +324,11 @@ class FileKeyStore(KeyStore):
                 path = self._cert_path(aid)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(cert_pem, encoding="utf-8")
+            self._log.debug(
+                "keystore",
+                "save_cert exit: elapsed=%.3fs aid=%s fingerprint=%s make_active=%s",
+                _t.time() - _t_start, aid, (normalized_fp[:16] + "...") if normalized_fp else "-", make_active,
+            )
 
     def load_any_identity(self) -> dict | None:
         candidates: set[str] = set()
@@ -347,7 +384,7 @@ class FileKeyStore(KeyStore):
             if kv:
                 metadata["fields"] = dict(kv)
         except Exception as exc:
-            _log.warning("加载 %s 元数据失败: %s", aid, exc)
+            self._log.error("keystore", "load_metadata failed aid=%s: %s", aid, exc, err=exc)
         return metadata
 
     # ── Prekeys ──────────────────────────────────────────────
@@ -357,6 +394,14 @@ class FileKeyStore(KeyStore):
         with lock:
             device_id = str(device_id or "").strip()
             return self._get_db(aid).load_prekeys(device_id)
+
+    def load_e2ee_prekey_by_id(self, aid: str, prekey_id: str) -> dict[str, Any] | None:
+        """按 prekey_id 单点查询（数据库 WHERE prekey_id = ? LIMIT 1）。
+        相比 load_e2ee_prekeys 的全量加载（O(N)），单条查询是 O(1)。
+        解密入站消息时信封里有 prekey_id，应优先走这条路径。"""
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            return self._get_db(aid).load_prekey_by_id(prekey_id)
 
     def save_e2ee_prekey(self, aid: str, prekey_id: str, prekey_data: dict[str, Any], device_id: str) -> None:
         lock = self._get_metadata_lock(aid)
@@ -374,10 +419,15 @@ class FileKeyStore(KeyStore):
             )
 
     def cleanup_e2ee_prekeys(self, aid: str, cutoff_ms: int, keep_latest: int = _STRUCTURED_PREKEY_MIN_KEEP_COUNT, device_id: str = "") -> list[str]:
+        import time as _t
+        _t_start = _t.time()
+        self._log.debug("keystore", "cleanup_e2ee_prekeys enter: aid=%s cutoff_ms=%d keep_latest=%d device_id=%s", aid, cutoff_ms, keep_latest, device_id or "-")
         lock = self._get_metadata_lock(aid)
         with lock:
             device_id = str(device_id or "").strip()
-            return self._get_db(aid).cleanup_prekeys(cutoff_ms, keep_latest=keep_latest, device_id=device_id)
+            removed = self._get_db(aid).cleanup_prekeys(cutoff_ms, keep_latest=keep_latest, device_id=device_id)
+            self._log.debug("keystore", "cleanup_e2ee_prekeys exit: elapsed=%.3fs aid=%s removed=%d", _t.time() - _t_start, aid, len(removed))
+            return removed
 
     # ── Group Secrets ────────────────────────────────────────
 
@@ -540,6 +590,11 @@ class FileKeyStore(KeyStore):
         with lock:
             return self._get_db(aid).load_all_seqs(device_id, slot_id)
 
+    def delete_seq(self, aid: str, device_id: str, slot_id: str, namespace: str) -> None:
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            self._get_db(aid).delete_seq(device_id, slot_id, namespace)
+
     # ── key.json 解密 ────────────────────────────────────────
 
     def _restore_key_pair(self, aid: str, key_pair: dict[str, Any]) -> dict[str, Any]:
@@ -547,7 +602,7 @@ class FileKeyStore(KeyStore):
         scope = self._safe_aid(aid)
         record = restored.get("private_key_protection")
         if isinstance(record, dict):
-            value = _reveal_field(self._seed_bytes, scope, "identity/private_key", record)
+            value = _reveal_field(self._seed_bytes, scope, "identity/private_key", record, self._log)
             if value is not None:
                 restored["private_key_pem"] = value.decode("utf-8")
             else:
@@ -625,7 +680,7 @@ class FileKeyStore(KeyStore):
                         import base64
                         cert_pub_b64 = base64.b64encode(cert_pub_der).decode()[:20]
                         local_pub_b64_short = local_pub_b64[:20]
-                        _log.error(
+                        self._log.error("keystore", 
                             "身份 %s 的 key.json 公钥与 cert.pem 公钥不匹配！"
                             "key.json=%s... cert.pem=%s... "
                             "cert.pem 可能被 peer 证书覆盖，将忽略损坏的 cert.pem",
@@ -634,7 +689,7 @@ class FileKeyStore(KeyStore):
                         # 丢弃损坏的 cert，以 key_pair 为准（后续登录会重新获取正确证书）
                         del identity["cert"]
             except Exception as exc:
-                _log.warning("身份 %s key/cert 一致性校验异常: %s", aid, exc)
+                self._log.error("keystore", "identity %s key/cert consistency check error: %s", aid, exc, err=exc)
         return identity
 
     # ── 静态辅助 ─────────────────────────────────────────────
@@ -702,7 +757,7 @@ class FileKeyStore(KeyStore):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(src.read_bytes())
             except OSError as exc:
-                _log.warning("同步根证书失败 (src=%s, dest=%s): %s", src, dest, exc)
+                self._log.warn("keystore", "sync root cert failed (src=%s, dest=%s): %s", src, dest, exc)
 
     def trust_root_dir(self) -> Path:
         """返回本地信任根证书目录。"""
@@ -716,6 +771,9 @@ class FileKeyStore(KeyStore):
 
     def save_trust_roots(self, trust_list: dict[str, Any], root_certs: list[dict[str, str]]) -> Path:
         """保存已通过管理局签名校验的信任根列表和 PEM bundle。"""
+        import time as _t
+        _t_start = _t.time()
+        self._log.debug("keystore", "save_trust_roots enter: count=%d", len(root_certs))
         dest_dir = self.trust_root_dir()
         bundle_parts: list[str] = []
         for index, item in enumerate(root_certs):
@@ -732,10 +790,19 @@ class FileKeyStore(KeyStore):
             json.dumps(trust_list, ensure_ascii=False, sort_keys=True, indent=2),
             encoding="utf-8",
         )
+        self._log.info(
+            "keystore",
+            "trust roots saved: count=%d bundle=%s",
+            len(bundle_parts), bundle_path,
+        )
+        self._log.debug("keystore", "save_trust_roots exit: elapsed=%.3fs count=%d", _t.time() - _t_start, len(bundle_parts))
         return bundle_path
 
     def save_issuer_root_cert(self, issuer: str, cert_pem: str, fingerprint_sha256: str = "") -> tuple[Path, Path]:
         """保存指定 issuer 发布的 Root CA 证书，并合并进动态 trust-roots bundle。"""
+        import time as _t
+        _t_start = _t.time()
+        self._log.debug("keystore", "save_issuer_root_cert enter: issuer=%s fingerprint=%s", issuer, (fingerprint_sha256[:16] + "...") if fingerprint_sha256 else "-")
         dest_dir = self.trust_root_dir()
         issuer_dir = dest_dir / "issuers"
         issuer_dir.mkdir(parents=True, exist_ok=True)
@@ -749,8 +816,8 @@ class FileKeyStore(KeyStore):
         if bundle_path.exists():
             try:
                 bundle_parts.extend(self._split_pem_bundle(bundle_path.read_text(encoding="utf-8")))
-            except OSError:
-                pass
+            except OSError as exc:
+                self._log.warn("keystore", "read existing trust bundle failed: %s", exc)
         bundle_parts.append(normalized_pem)
 
         deduped: list[str] = []
@@ -766,6 +833,7 @@ class FileKeyStore(KeyStore):
             seen.add(key)
             deduped.append(pem.strip() + "\n")
         bundle_path.write_text("".join(deduped), encoding="utf-8")
+        self._log.debug("keystore", "save_issuer_root_cert exit: elapsed=%.3fs issuer=%s bundle_count=%d", _t.time() - _t_start, issuer, len(deduped))
         return cert_path, bundle_path
 
     @staticmethod
@@ -785,6 +853,12 @@ class FileKeyStore(KeyStore):
             preferred.mkdir(parents=True, exist_ok=True)
             return preferred
         except OSError as exc:
-            _log.warning("无法创建首选目录 %s: %s，使用 fallback %s", preferred, exc, fallback)
+            # logger 此时还未注入，不能走 _log；属于初始化降级，写一行 stderr 提示，避免静默
+            import sys as _sys
+            print(
+                f"[keystore] preferred root mkdir failed ({preferred}): {exc}; falling back to {fallback}",
+                file=_sys.stderr,
+                flush=True,
+            )
             fallback.mkdir(parents=True, exist_ok=True)
             return fallback

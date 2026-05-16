@@ -4,13 +4,12 @@ import base64
 import copy
 import hmac as _hmac
 import json
-import logging
 import re
 import secrets
 import threading
 import time as _time_mod
 import uuid
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -28,8 +27,12 @@ from .errors import (
     E2EEGroupSecretMissingError,
 )
 
+if TYPE_CHECKING:
+    from .logger import AUNLogger, NullLogger
 
-_e2ee_log = logging.getLogger("aun_core.e2ee")
+from .logger import NullLogger as _NullLogger
+
+_null_logger = _NullLogger()
 _group_secret_locks_guard = threading.Lock()
 _group_secret_locks: dict[str, threading.RLock] = {}
 
@@ -477,7 +480,10 @@ class E2EEManager:
         keystore: Any,
         prekey_cache_ttl: float = 3600.0,
         replay_window_seconds: int = 300,
+        logger: "AUNLogger | NullLogger | None" = None,
     ) -> None:
+        from .logger import NullLogger as _NL
+        self._log = logger or _NL()
         self._identity_fn = identity_fn
         self._device_id_fn = device_id_fn or (lambda: "")
         self._keystore_ref = keystore
@@ -545,7 +551,7 @@ class E2EEManager:
             now_ms = int(_time_mod.time() * 1000)
             diff_s = abs(now_ms - ts) / 1000
             if diff_s > self._replay_window_seconds:
-                _e2ee_log.warning(
+                self._log.warn("e2ee", 
                     "消息 timestamp 超出窗口 (%.0fs > %ds)，拒绝: from=%s mid=%s",
                     diff_s, self._replay_window_seconds,
                     message.get("from"), message.get("message_id"),
@@ -674,6 +680,8 @@ class E2EEManager:
         else:
             prekey = self.get_cached_prekey(peer_aid)
 
+        self._log.debug("e2ee", "encrypting outbound message: to=%s mid=%s has_prekey=%s", peer_aid, message_id, prekey is not None)
+
         if prekey:
             try:
                 envelope, ok = self._encrypt_with_prekey(
@@ -681,6 +689,7 @@ class E2EEManager:
                     message_id=message_id, timestamp=timestamp,
                     protected_headers=protected_headers, context=context,
                 )
+                self._log.debug("e2ee", "prekey_ecdh_v2 encryption success: to=%s mid=%s", peer_aid, message_id)
                 return envelope, {
                     "encrypted": True,
                     "forward_secrecy": True,
@@ -688,8 +697,8 @@ class E2EEManager:
                     "degraded": False,
                 }
             except Exception as exc:
-                _e2ee_log.warning(
-                    "prekey 加密失败，降级到 long_term_key（无前向保密）: %s", exc
+                self._log.warn("e2ee",
+                    "prekey 加密失败，降级到 long_term_key（无前向保密）: to=%s err=%s", peer_aid, exc
                 )
 
         envelope, ok = self._encrypt_with_long_term_key(
@@ -698,6 +707,7 @@ class E2EEManager:
             protected_headers=protected_headers, context=context,
         )
         degraded = prekey is not None  # 有 prekey 但失败了才算降级
+        self._log.debug("e2ee", "long_term_key encryption done: to=%s mid=%s degraded=%s", peer_aid, message_id, degraded)
         return envelope, {
             "encrypted": True,
             "forward_secrecy": False,
@@ -985,7 +995,7 @@ class E2EEManager:
             if isinstance(pk, ec.EllipticCurvePublicKey):
                 return pk
         except Exception as exc:
-            _e2ee_log.warning("加载发送方 %s 证书公钥失败: %s", aid, exc)
+            self._log.error("e2ee", "failed to load sender %s cert public key: %s", aid, exc, err=exc)
         return None
 
     def _decrypt_message(self, message: dict[str, Any], *, source: str = "") -> dict[str, Any] | None:
@@ -994,11 +1004,15 @@ class E2EEManager:
             return message
         encryption_mode = payload.get("encryption_mode", "")
 
+        self._log.debug("e2ee", "decrypting inbound message: mode=%s from=%s mid=%s source=%s",
+                        encryption_mode, message.get("from"), message.get("message_id"), source or "-")
+
         # 验证发送方签名（适用于所有模式）
         try:
             self._verify_sender_signature(payload, message)
         except E2EEDecryptFailedError as exc:
-            _e2ee_log.warning("发送方签名验证失败: %s", exc)
+            self._log.warn("e2ee", "sender signature verification failed: from=%s mid=%s err=%s",
+                           message.get("from"), message.get("message_id"), exc)
             return None
 
         if encryption_mode == MODE_PREKEY_ECDH_V2:
@@ -1006,7 +1020,8 @@ class E2EEManager:
         elif encryption_mode == MODE_LONG_TERM_KEY:
             return self._decrypt_message_long_term(message)
         else:
-            _e2ee_log.warning("不支持的加密模式: %s", encryption_mode)
+            self._log.warn("e2ee", "unsupported encryption mode: %s from=%s mid=%s",
+                           encryption_mode, message.get("from"), message.get("message_id"))
             return None
 
     def _decrypt_message_prekey_v2(self, message: dict[str, Any], *, source: str = "") -> dict[str, Any] | None:
@@ -1031,7 +1046,7 @@ class E2EEManager:
                         self._missing_prekey_ids.add(prekey_id)
                         should_log_missing = True
                 if should_log_missing:
-                    _e2ee_log.warning("prekey 私钥不存在（不可恢复）%s: prekey_id=%s mid=%s seq=%s from=%s",
+                    self._log.warn("e2ee", "prekey private key not found (unrecoverable)%s: prekey_id=%s mid=%s seq=%s from=%s",
                                       src_tag, prekey_id,
                                       message.get("message_id", "?"), message.get("seq", "?"),
                                       message.get("from", "?"))
@@ -1110,10 +1125,10 @@ class E2EEManager:
             return transformed
         except E2EEError as exc:
             src_tag = f"[{source}] " if source else ""
-            _e2ee_log.debug("%sprekey_ecdh_v2 解密失败: %s", src_tag, exc)
+            self._log.debug("e2ee", "%sprekey_ecdh_v2 decrypt failed: %s", src_tag, exc)
             return None
         except Exception as exc:
-            _e2ee_log.warning("prekey_ecdh_v2 解密异常: %s", exc)
+            self._log.error("e2ee", "prekey_ecdh_v2 decrypt error: %s", exc, err=exc)
             return None
 
     def _decrypt_message_long_term(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -1195,10 +1210,10 @@ class E2EEManager:
             transformed["e2ee"] = e2ee
             return transformed
         except E2EEError as exc:
-            _e2ee_log.warning("long_term_key 解密失败 (E2EE): %s", exc)
+            self._log.warn("e2ee", "long_term_key decrypt failed (E2EE): %s", exc)
             return None
         except Exception as exc:
-            _e2ee_log.warning("long_term_key 解密失败: %s", exc)
+            self._log.error("e2ee", "long_term_key decrypt failed: %s", exc, err=exc)
             return None
 
     # ── AAD 工具 ─────────────────────────────────────────────
@@ -1273,7 +1288,7 @@ class E2EEManager:
                 "updated_at": now_ms,
             },
         )
-        _e2ee_log.info("prekey 生成并保存: prekey_id=%s aid=%s device_id=%s", prekey_id, aid, device_id)
+        self._log.info("e2ee", "prekey generated and saved: prekey_id=%s aid=%s device_id=%s", prekey_id, aid, device_id)
 
         # 内存缓存私钥（即使磁盘 metadata 被覆盖也不丢）
         with self._cache_lock:
@@ -1309,21 +1324,21 @@ class E2EEManager:
         """从内存缓存或 keystore 加载 prekey 私钥"""
         aid = self._current_aid()
         if not aid:
-            _e2ee_log.warning("prekey %s 查找失败: AID 不可用", prekey_id)
+            self._log.warn("e2ee", "prekey %s lookup failed: AID unavailable", prekey_id)
             return None
         device_id = self._current_device_id()
 
         with self._cache_lock:
             cached = self._local_prekey_cache.get(prekey_id)
             if cached is not None:
-                _e2ee_log.debug("prekey %s 从内存缓存命中", prekey_id)
+                self._log.debug("e2ee", "prekey %s hit from memory cache", prekey_id)
                 return cached
 
         with self._prekey_load_lock:
             with self._cache_lock:
                 cached = self._local_prekey_cache.get(prekey_id)
                 if cached is not None:
-                    _e2ee_log.debug("prekey %s 从内存缓存命中", prekey_id)
+                    self._log.debug("e2ee", "prekey %s hit from memory cache", prekey_id)
                     return cached
 
             return self._load_prekey_private_key_uncached(keystore, aid, device_id, prekey_id)
@@ -1335,24 +1350,39 @@ class E2EEManager:
         device_id: str,
         prekey_id: str,
     ) -> ec.EllipticCurvePrivateKey | None:
-        prekeys = _load_keystore_prekeys(keystore, aid, device_id)
-        _e2ee_log.debug("prekey %s keystore 查找: aid=%s device_id=%s 本地prekey总数=%d 命中=%s",
-                        prekey_id, aid, device_id, len(prekeys), prekey_id in prekeys)
-        prekey_data = prekeys.get(prekey_id)
+        # 优先按 prekey_id 单点查询（O(1) 数据库行级查询）。
+        # 信封里都带 prekey_id，没必要全量加载所有 prekey（旧路径在 9000+ prekey 下要 ~430ms/次）。
+        prekey_data = None
+        by_id_loader = getattr(keystore, "load_e2ee_prekey_by_id", None)
+        if callable(by_id_loader):
+            try:
+                prekey_data = by_id_loader(aid, prekey_id)
+            except Exception as exc:
+                self._log.warn("e2ee", "prekey %s by_id loader failed, falling back to full load: %s", prekey_id, exc)
+                prekey_data = None
+            if prekey_data:
+                self._log.debug("e2ee", "prekey %s by_id lookup hit", prekey_id)
+
+        # 回退：旧版 keystore 没有 by_id 方法，或单点查询未命中 → 全量扫描
+        if not prekey_data:
+            prekeys = _load_keystore_prekeys(keystore, aid, device_id)
+            self._log.debug("e2ee", "prekey %s keystore lookup: aid=%s device_id=%s local_prekey_count=%d hit=%s",
+                            prekey_id, aid, device_id, len(prekeys), prekey_id in prekeys)
+            prekey_data = prekeys.get(prekey_id)
         if not prekey_data and device_id:
             # 回退：按 prekey_id 精确查找，不限 device_id（兼容旧数据）
             loader = getattr(keystore, "load_prekey_by_id", None)
             if callable(loader):
                 prekey_data = loader(prekey_id)
                 if prekey_data:
-                    _e2ee_log.info("prekey %s 通过 load_prekey_by_id 回退命中", prekey_id)
+                    self._log.info("e2ee", "prekey %s hit via load_prekey_by_id fallback", prekey_id)
             if not prekey_data:
                 # 再回退：加载全部 prekey（无 device_id 参数的旧 keystore）
                 try:
                     prekeys_all = _load_keystore_prekeys(keystore, aid, "")
                     prekey_data = prekeys_all.get(prekey_id)
                     if prekey_data:
-                        _e2ee_log.info("prekey %s 在 device_id='' 回退查找中命中", prekey_id)
+                        self._log.info("e2ee", "prekey %s hit in device_id='' fallback lookup", prekey_id)
                 except Exception:
                     pass
         if not prekey_data:
@@ -1368,7 +1398,7 @@ class E2EEManager:
                     self._local_prekey_cache[prekey_id] = pk
                 return pk
         except Exception as exc:
-            _e2ee_log.warning("prekey %s 私钥 PEM 加载失败: %s", prekey_id, exc)
+            self._log.error("e2ee", "prekey %s private key PEM load failed: %s", prekey_id, exc, err=exc)
         return None
 
     # ── 证书指纹工具 ────────────────────────────────────────
@@ -1499,6 +1529,7 @@ def encrypt_group_message(
     *,
     from_aid: str,
     message_id: str,
+    logger=_null_logger,
     timestamp: int,
     sender_private_key_pem: str | None = None,
     sender_cert_pem: bytes | str | None = None,
@@ -1565,7 +1596,7 @@ def encrypt_group_message(
                 )
                 envelope["sender_cert_fingerprint"] = E2EEManager._certificate_sha256_fingerprint(sender_cert)
         except Exception as exc:
-            _e2ee_log.warning("群消息发送方签名失败: %s", exc)
+            logger.warn("e2ee", "group msg sender signature failed: %s", exc)
 
     return envelope
 
@@ -1576,6 +1607,7 @@ def decrypt_group_message(
     sender_cert_pem: bytes | None = None,
     *,
     require_signature: bool = True,
+    logger=_null_logger,
 ) -> dict[str, Any] | None:
     """解密群组消息。
 
@@ -1670,10 +1702,10 @@ def decrypt_group_message(
         if require_signature:
             # 零信任模式：必须有签名且有证书可验证
             if not sender_sig_b64:
-                _e2ee_log.warning("拒绝无发送方签名的群消息（require_signature=True）: group=%s from=%s", group_id, aad_from)
+                logger.warn("e2ee", "reject group msg without sender signature (require_signature=True): group=%s from=%s", group_id, aad_from)
                 return None
             if not sender_cert_pem:
-                _e2ee_log.warning(
+                logger.warn("e2ee", 
                     "拒绝群消息：有签名但无发送方证书可验证（零信任模式禁止跳过验签）: group=%s from=%s",
                     group_id, aad_from,
                 )
@@ -1689,12 +1721,12 @@ def decrypt_group_message(
                 sender_pub.verify(sig_bytes, verify_payload, ec.ECDSA(hashes.SHA256()))
                 e2ee["sender_verified"] = True
             except Exception:
-                _e2ee_log.warning("群消息发送方签名验证失败: group=%s from=%s", group_id, aad_from)
+                logger.warn("e2ee", "group msg sender signature verification failed: group=%s from=%s", group_id, aad_from)
                 return None
         elif sender_cert_pem:
             # 非零信任模式但提供了证书：有证书时强制验签
             if not sender_sig_b64:
-                _e2ee_log.warning("拒绝无发送方签名的群消息: group=%s from=%s", group_id, aad_from)
+                logger.warn("e2ee", "reject group msg without sender signature: group=%s from=%s", group_id, aad_from)
                 return None
             try:
                 sender_cert = x509.load_pem_x509_certificate(
@@ -1707,11 +1739,12 @@ def decrypt_group_message(
                 sender_pub.verify(sig_bytes, verify_payload, ec.ECDSA(hashes.SHA256()))
                 e2ee["sender_verified"] = True
             except Exception:
-                _e2ee_log.warning("群消息发送方签名验证失败: group=%s from=%s", group_id, aad_from)
+                logger.warn("e2ee", "group msg sender signature verification failed: group=%s from=%s", group_id, aad_from)
                 return None
 
         return result
-    except Exception:
+    except Exception as exc:
+        logger.warn("e2ee-group", "decrypt_group_message wrapper failed: group=%s err=%s", group_id, exc)
         return None
 
 
@@ -2143,6 +2176,7 @@ def _assess_incoming_epoch_chain(
     rotation_id: str,
     rotator_aid: str,
     source: str,
+    logger=_null_logger,
 ) -> tuple[bool, bool | None, str | None]:
     incoming_chain = str(incoming_chain or "").strip()
     rotation_id = str(rotation_id or "").strip()
@@ -2169,7 +2203,7 @@ def _assess_incoming_epoch_chain(
     )
 
     if rotation_id and not incoming_chain:
-        _e2ee_log.warning(
+        logger.warn("e2ee", 
             "拒绝缺少 epoch_chain 的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
             source, group_id, epoch, rotation_id,
         )
@@ -2202,7 +2236,7 @@ def _assess_incoming_epoch_chain(
                 # rotation 并重新 begin 同一 target_epoch；继续用上一 epoch 校验 incoming。
                 pass
             else:
-                _e2ee_log.warning(
+                logger.warn("e2ee", 
                     "拒绝同 epoch 分叉 chain: source=%s group=%s epoch=%s rotation=%s",
                     source, group_id, epoch, rotation_id,
                 )
@@ -2217,7 +2251,7 @@ def _assess_incoming_epoch_chain(
                 )
                 return False, None, None
         elif rotation_id and incoming_chain and current_pending_rotation_id == rotation_id and current_chain and current_chain != incoming_chain:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝同 epoch 分叉 chain: source=%s group=%s epoch=%s rotation=%s",
                 source, group_id, epoch, rotation_id,
             )
@@ -2254,7 +2288,7 @@ def _assess_incoming_epoch_chain(
         return True, True, "missing_prev_chain"
     if not rotator_aid:
         if rotation_id:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝缺少 rotator_aid 的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
                 source, group_id, epoch, rotation_id,
             )
@@ -2271,7 +2305,7 @@ def _assess_incoming_epoch_chain(
 
     if not verify_epoch_chain(incoming_chain, prev_chain, epoch, commitment, rotator_aid):
         if rotation_id:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 epoch chain 验证失败的新 rotation key: source=%s group=%s epoch=%s rotation=%s",
                 source, group_id, epoch, rotation_id,
             )
@@ -2288,7 +2322,7 @@ def _assess_incoming_epoch_chain(
                 commitment=commitment[:16] if commitment else "-",
             )
             return False, None, None
-        _e2ee_log.warning(
+        logger.warn("e2ee", 
             "epoch chain 验证失败，按兼容档接收并标记未验证: source=%s group=%s epoch=%s",
             source, group_id, epoch,
         )
@@ -2524,6 +2558,7 @@ def handle_key_distribution(
     keystore: Any,
     aid: str,
     initiator_cert_pem: bytes | None = None,
+    logger=_null_logger,
 ) -> bool:
     """处理收到的 group key 分发消息。
 
@@ -2539,7 +2574,11 @@ def handle_key_distribution(
     commitment = payload.get("commitment")
     member_aids = payload.get("member_aids", [])
 
+    logger.debug("e2ee", "handle_key_distribution start: group=%s epoch=%s aid=%s members=%d has_cert=%s",
+                 group_id, epoch, aid, len(member_aids) if isinstance(member_aids, list) else 0, bool(initiator_cert_pem))
+
     if not all([group_id, epoch is not None, group_secret_b64, commitment]):
+        logger.warn("e2ee", "reject key distribution: missing fields group=%s epoch=%s aid=%s", group_id, epoch, aid)
         return False
 
     # 验证 Membership Manifest 签名
@@ -2547,10 +2586,10 @@ def handle_key_distribution(
     if initiator_cert_pem:
         # 有验证能力时强制要求 manifest
         if not manifest:
-            _e2ee_log.warning("拒绝无 manifest 的密钥分发: group=%s epoch=%s", group_id, epoch)
+            logger.warn("e2ee", "reject key distribution without manifest: group=%s epoch=%s", group_id, epoch)
             return False
         if not verify_membership_manifest(manifest, initiator_cert_pem):
-            _e2ee_log.warning("group key distribution manifest 签名验证失败: group=%s epoch=%s", group_id, epoch)
+            logger.warn("e2ee", "group key distribution manifest signature verification failed: group=%s epoch=%s", group_id, epoch)
             return False
         # 验证 manifest 与分发消息一致
         if manifest.get("group_id") != group_id or manifest.get("epoch") != epoch:
@@ -2568,6 +2607,7 @@ def handle_key_distribution(
 
     # 验证 commitment（强制绑定 group_secret）
     if not verify_membership_commitment(commitment, member_aids, epoch, group_id, aid, group_secret):
+        logger.warn("e2ee", "reject key distribution: commitment verification failed group=%s epoch=%s aid=%s", group_id, epoch, aid)
         return False
 
     incoming_chain = payload.get("epoch_chain")
@@ -2578,11 +2618,12 @@ def handle_key_distribution(
         rotation_id,
         str(payload.get("distributed_by") or payload.get("rotator_aid") or ""),
         "key_distribution",
+        logger,
     )
     if not chain_ok:
         return False
 
-    return store_group_secret(
+    result = store_group_secret(
         keystore, aid, group_id, epoch, group_secret, commitment, member_aids,
         epoch_chain=str(incoming_chain or "") or None,
         pending_rotation_id=rotation_id,
@@ -2590,6 +2631,11 @@ def handle_key_distribution(
         epoch_chain_unverified=chain_unverified,
         epoch_chain_unverified_reason=chain_reason,
     )
+    if result:
+        logger.debug("e2ee", "handle_key_distribution store ok: group=%s epoch=%s aid=%s", group_id, epoch, aid)
+    else:
+        logger.error("e2ee-group", "handle_key_distribution store failed: group=%s epoch=%s aid=%s", group_id, epoch, aid)
+    return result
 
 
 def build_key_request(
@@ -2615,6 +2661,7 @@ def handle_key_request(
     aid: str,
     current_members: list[str],
     private_key_pem: str | None = None,
+    logger=_null_logger,
 ) -> dict[str, Any] | None:
     """处理收到的密钥请求。
 
@@ -2627,23 +2674,29 @@ def handle_key_request(
     group_id = payload.get("group_id")
     epoch = payload.get("epoch")
 
+    logger.debug("e2ee", "handle_key_request start: group=%s epoch=%s requester=%s aid=%s",
+                 group_id, epoch, requester_aid, aid)
+
     if not all([requester_aid, group_id, epoch is not None]):
+        logger.warn("e2ee", "reject key request: missing fields group=%s epoch=%s requester=%s", group_id, epoch, requester_aid)
         return None
 
     # 验证请求者是当前群成员
     if requester_aid not in current_members:
+        logger.warn("e2ee", "reject key request: %s not in current member list group=%s", requester_aid, group_id)
         return None
 
     # 查本地密钥
     secret_data = load_group_secret(keystore, aid, group_id, epoch)
     if secret_data is None:
+        logger.debug("e2ee", "reject key request: local missing epoch=%s key group=%s", epoch, group_id)
         return None
 
     # P0 历史隔离：请求者必须属于目标 epoch 的成员集，
     # 拒绝新成员获取加入前的旧 epoch key。
     member_aids = sorted(str(m) for m in (secret_data.get("member_aids", []) or []) if m)
     if member_aids and requester_aid not in member_aids:
-        _e2ee_log.warning(
+        logger.warn("e2ee",
             "拒绝密钥恢复：%s 不属于 group=%s epoch=%s 的成员集",
             requester_aid, group_id, epoch,
         )
@@ -2671,6 +2724,8 @@ def handle_key_request(
         response["epoch_chain"] = epoch_chain
     if private_key_pem:
         response = sign_group_key_response(response, private_key_pem)
+    logger.debug("e2ee", "handle_key_request response built: group=%s epoch=%s requester=%s signed=%s",
+                 group_id, epoch, requester_aid, bool(private_key_pem))
     return response
 
 
@@ -2680,6 +2735,7 @@ def handle_key_response(
     aid: str,
     *,
     expected_request: dict[str, Any] | None = None,
+    logger=_null_logger,
     responder_cert_pem: bytes | str | None = None,
     current_members: list[str] | None = None,
     strict: bool = False,
@@ -2695,6 +2751,9 @@ def handle_key_response(
     group_secret_b64 = payload.get("group_secret")
     commitment = payload.get("commitment")
     member_aids = payload.get("member_aids", [])
+
+    logger.debug("e2ee", "handle_key_response start: group=%s epoch=%s aid=%s responder=%s strict=%s",
+                 group_id, epoch, aid, payload.get("responder_aid"), strict)
 
     _debug_group_e2ee(
         "key_response_enter",
@@ -2713,7 +2772,7 @@ def handle_key_response(
     )
 
     if not all([group_id, epoch is not None, group_secret_b64, commitment]):
-        _e2ee_log.warning(
+        logger.warn("e2ee",
             "拒绝 group key response：字段不完整 aid=%s group=%s epoch=%s has_secret=%s has_commitment=%s",
             aid, group_id, epoch, bool(group_secret_b64), bool(commitment),
         )
@@ -2727,9 +2786,34 @@ def handle_key_response(
         )
         return False
 
+    # future-epoch 守卫：未带 expected_request 时，本地已有 epoch 的情况下拒绝高于本地最高 epoch 的响应。
+    # 防止恶意/错误响应绕过轮换流程把本地推进到未来 epoch。
+    # 本地完全没有 epoch（首次加群）时放行，由后续 commitment / chain 校验把关。
+    if expected_request is None:
+        try:
+            entries = _load_keystore_group_epochs(keystore, aid, group_id)
+            known_epochs = [int(e.get("epoch")) for e in entries if isinstance(e.get("epoch"), int)]
+        except Exception:
+            known_epochs = []
+        if known_epochs:
+            local_max_epoch = max(known_epochs)
+            if int(epoch) > local_max_epoch:
+                logger.warn("e2ee",
+                    "拒绝 group key response：epoch 超出本地最高已知 epoch aid=%s group=%s epoch=%s local_max=%s",
+                    aid, group_id, epoch, local_max_epoch,
+                )
+                _debug_group_e2ee(
+                    "key_response_reject_future_epoch",
+                    aid=aid,
+                    group=group_id,
+                    epoch=epoch,
+                    local_max=local_max_epoch,
+                )
+                return False
+
     if expected_request is not None:
         if payload.get("requester_aid") != aid:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：requester 不匹配 aid=%s group=%s epoch=%s requester=%s",
                 aid, group_id, epoch, payload.get("requester_aid"),
             )
@@ -2743,7 +2827,7 @@ def handle_key_response(
             return False
         expected_responder = str(expected_request.get("_expected_responder_aid") or "")
         if expected_responder and payload.get("responder_aid") != expected_responder:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：responder 不匹配 aid=%s group=%s epoch=%s expected=%s actual=%s",
                 aid, group_id, epoch, expected_responder, payload.get("responder_aid"),
             )
@@ -2757,7 +2841,7 @@ def handle_key_response(
             )
             return False
         if payload.get("request_id") != expected_request.get("request_id"):
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：request_id 不匹配 aid=%s group=%s epoch=%s expected=%s actual=%s",
                 aid, group_id, epoch, expected_request.get("request_id"), payload.get("request_id"),
             )
@@ -2771,7 +2855,7 @@ def handle_key_response(
             )
             return False
         if payload.get("group_id") != expected_request.get("group_id"):
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：group 不匹配 aid=%s expected=%s actual=%s",
                 aid, expected_request.get("group_id"), payload.get("group_id"),
             )
@@ -2783,7 +2867,7 @@ def handle_key_response(
             )
             return False
         if int(payload.get("epoch") or 0) != int(expected_request.get("epoch") or 0):
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：epoch 不匹配 aid=%s group=%s expected=%s actual=%s",
                 aid, group_id, expected_request.get("epoch"), payload.get("epoch"),
             )
@@ -2799,7 +2883,7 @@ def handle_key_response(
     responder_aid = str(payload.get("responder_aid") or "")
     if strict:
         if not responder_aid or not responder_cert_pem:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：responder 身份不可校验 aid=%s group=%s epoch=%s responder=%s has_cert=%s",
                 aid, group_id, epoch, responder_aid, bool(responder_cert_pem),
             )
@@ -2814,8 +2898,8 @@ def handle_key_response(
             )
             return False
         if current_members and responder_aid not in current_members:
-            _e2ee_log.warning(
-                "拒绝 group key response：responder 不在当前成员列表 aid=%s group=%s epoch=%s responder=%s current_members=%s",
+            logger.warn("e2ee", 
+                "拒绝 group key response：responder not in current member list aid=%s group=%s epoch=%s responder=%s current_members=%s",
                 aid, group_id, epoch, responder_aid, current_members,
             )
             _debug_group_e2ee(
@@ -2828,7 +2912,7 @@ def handle_key_response(
             )
             return False
         if not verify_group_key_response_signature(payload, responder_cert_pem):
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：签名无效 aid=%s group=%s epoch=%s responder=%s",
                 aid, group_id, epoch, responder_aid,
             )
@@ -2842,7 +2926,7 @@ def handle_key_response(
             return False
     elif responder_cert_pem is not None and payload.get("response_signature"):
         if not verify_group_key_response_signature(payload, responder_cert_pem):
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：签名无效 aid=%s group=%s epoch=%s responder=%s strict=false",
                 aid, group_id, epoch, responder_aid,
             )
@@ -2858,7 +2942,7 @@ def handle_key_response(
     group_secret = base64.b64decode(group_secret_b64)
 
     if not verify_membership_commitment(commitment, member_aids, epoch, group_id, aid, group_secret):
-        _e2ee_log.warning(
+        logger.warn("e2ee", 
             "拒绝 group key response：membership commitment 无效 aid=%s group=%s epoch=%s member_aids=%s commitment=%s",
             aid, group_id, epoch, member_aids, str(commitment)[:16],
         )
@@ -2876,20 +2960,20 @@ def handle_key_response(
     manifest = payload.get("manifest")
     if manifest and isinstance(manifest, dict):
         if manifest.get("group_id") != group_id:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：manifest group 不匹配 aid=%s group=%s epoch=%s manifest_group=%s",
                 aid, group_id, epoch, manifest.get("group_id"),
             )
             return False
         if manifest.get("epoch") != epoch:
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：manifest epoch 不匹配 aid=%s group=%s epoch=%s manifest_epoch=%s",
                 aid, group_id, epoch, manifest.get("epoch"),
             )
             return False
         manifest_members = manifest.get("member_aids", [])
         if manifest_members and sorted(manifest_members) != sorted(member_aids):
-            _e2ee_log.warning(
+            logger.warn("e2ee", 
                 "拒绝 group key response：manifest members 不匹配 aid=%s group=%s epoch=%s manifest_members=%s member_aids=%s",
                 aid, group_id, epoch, manifest_members, member_aids,
             )
@@ -2903,9 +2987,10 @@ def handle_key_response(
         rotation_id,
         str(payload.get("distributed_by") or payload.get("rotator_aid") or payload.get("responder_aid") or ""),
         "key_response",
+        logger,
     )
     if not chain_ok:
-        _e2ee_log.warning(
+        logger.warn("e2ee", 
             "拒绝 group key response：epoch chain 无效 aid=%s group=%s epoch=%s rotation=%s chain=%s",
             aid, group_id, epoch, rotation_id, str(incoming_chain or "")[:16],
         )
@@ -2936,6 +3021,11 @@ def handle_key_response(
         unverified=chain_unverified,
         reason=chain_reason or "-",
     )
+    if stored:
+        logger.debug("e2ee", "handle_key_response store ok: group=%s epoch=%s aid=%s responder=%s",
+                     group_id, epoch, aid, payload.get("responder_aid"))
+    else:
+        logger.warn("e2ee", "handle_key_response store failed: group=%s epoch=%s aid=%s", group_id, epoch, aid)
     return stored
 
 
@@ -2967,7 +3057,10 @@ class GroupE2EEManager:
         request_cooldown: float = 30.0, response_cooldown: float = 30.0,
         sender_cert_resolver: Any = None,
         initiator_cert_resolver: Any = None,
+        logger: "AUNLogger | NullLogger | None" = None,
     ) -> None:
+        from .logger import NullLogger as _NL
+        self._log = logger or _NL()
         self._identity_fn = identity_fn
         self._keystore_ref = keystore
         self._replay_guard = GroupReplayGuard()
@@ -2990,6 +3083,7 @@ class GroupE2EEManager:
     def create_epoch(self, group_id: str, member_aids: list[str]) -> dict[str, Any]:
         """创建首个 epoch。返回 {epoch, commitment, distributions: [{to, payload}]}。"""
         aid = self._current_aid()
+        self._log.debug("e2ee", "create_epoch start: group=%s aid=%s members=%d", group_id, aid, len(member_aids))
         gs = generate_group_secret()
         epoch = 1
         commitment = compute_membership_commitment(member_aids, epoch, group_id, gs)
@@ -3001,6 +3095,8 @@ class GroupE2EEManager:
         ))
         dist_payload = build_key_distribution(group_id, epoch, gs, member_aids, aid,
                                               manifest=manifest, epoch_chain=epoch_chain)
+        self._log.debug("e2ee", "create_epoch done: group=%s epoch=%d distribution_targets=%d",
+                        group_id, epoch, len(member_aids) - 1)
         return {
             "epoch": epoch, "commitment": commitment,
             "distributions": [{"to": m, "payload": dist_payload} for m in member_aids if m != aid],
@@ -3037,6 +3133,8 @@ class GroupE2EEManager:
     ) -> dict[str, Any]:
         """指定目标 epoch 号轮换（配合服务端 CAS 使用）。"""
         aid = self._current_aid()
+        self._log.debug("e2ee", "rotate_epoch_to start: group=%s target_epoch=%d members=%d rotation_id=%s",
+                        group_id, target_epoch, len(member_aids), rotation_id or "-")
         ks = self._keystore()
         current = load_group_secret(ks, aid, group_id, target_epoch - 1) or load_group_secret(ks, aid, group_id)
         prev_chain = current.get("epoch_chain") if current else None
@@ -3050,7 +3148,11 @@ class GroupE2EEManager:
                                     pending_rotation_id=rotation_id,
                                     allow_pending_overwrite=bool(rotation_id))
         if not stored:
+            self._log.warn("e2ee", "rotate_epoch_to store failed (epoch already exists or newer): group=%s target_epoch=%d",
+                           group_id, target_epoch)
             raise RuntimeError(f"group {group_id} epoch {target_epoch} secret already exists or is newer; abort distribution")
+        self._log.debug("e2ee", "rotate_epoch_to done: group=%s epoch=%d distribution_targets=%d",
+                        group_id, target_epoch, len(member_aids) - 1)
         manifest = self._sign_manifest(build_membership_manifest(
             group_id, target_epoch, target_epoch - 1, member_aids, initiator_aid=aid,
         ))
@@ -3071,13 +3173,17 @@ class GroupE2EEManager:
         epoch_chain_unverified_reason: str | None = None,
     ) -> bool:
         """手动存储 group_secret。返回 False 表示 epoch 降级被拒。"""
-        return store_group_secret(
+        self._log.debug("e2ee", "store_secret: group=%s epoch=%d members=%d", group_id, epoch, len(member_aids))
+        result = store_group_secret(
             self._keystore(), self._current_aid(), group_id, epoch,
             group_secret_bytes, commitment, member_aids,
             epoch_chain=epoch_chain,
             epoch_chain_unverified=epoch_chain_unverified,
             epoch_chain_unverified_reason=epoch_chain_unverified_reason,
         )
+        if not result:
+            self._log.warn("e2ee", "store_secret rejected (epoch downgrade): group=%s epoch=%d", group_id, epoch)
+        return result
 
     def discard_pending_secret(self, group_id: str, epoch: int, rotation_id: str) -> bool:
         """仅回滚指定 pending rotation 的本地 target epoch key。"""
@@ -3086,7 +3192,12 @@ class GroupE2EEManager:
         )
 
     def load_secret(self, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
-        return load_group_secret(self._keystore(), self._current_aid(), group_id, epoch)
+        result = load_group_secret(self._keystore(), self._current_aid(), group_id, epoch)
+        if result is None:
+            self._log.debug("e2ee", "load_secret not found: group=%s epoch=%s", group_id, epoch)
+        else:
+            self._log.debug("e2ee", "load_secret success: group=%s epoch=%s", group_id, result.get("epoch"))
+        return result
 
     def load_all_secrets(self, group_id: str) -> dict[int, bytes]:
         return load_all_group_secrets(self._keystore(), self._current_aid(), group_id)
@@ -3106,7 +3217,9 @@ class GroupE2EEManager:
         aid = self._current_aid()
         secret_data = load_group_secret(self._keystore(), aid, group_id)
         if secret_data is None:
+            self._log.warn("e2ee", "group message encryption failed (no key): group=%s aid=%s", group_id, aid)
             raise E2EEGroupSecretMissingError(f"no group secret for {group_id}")
+        self._log.debug("e2ee", "group message encryption: group=%s epoch=%d aid=%s", group_id, secret_data["epoch"], aid)
         return self._encrypt_with_secret_data(
             group_id, payload, secret_data,
             message_id=message_id, timestamp=timestamp,
@@ -3150,6 +3263,7 @@ class GroupE2EEManager:
             sender_cert_pem=sender_cert_pem,
             protected_headers=protected_headers,
             context=context,
+            logger=self._log,
         )
 
     def decrypt(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any] | None:
@@ -3166,6 +3280,7 @@ class GroupE2EEManager:
         msg_id = aad_msg_id or message.get("message_id", "")
         if not skip_replay and group_id and sender and msg_id:
             if self._replay_guard.is_seen(group_id, sender, msg_id):
+                self._log.debug("e2ee", "group message replay guard blocked: group=%s from=%s mid=%s", group_id, sender, msg_id)
                 # 重放：返回原消息（不携带 e2ee 字段），与 decrypt_batch "or m" 语义一致。
                 # 调用方可以通过缺失 e2ee 字段识别未解密。
                 return message
@@ -3177,16 +3292,19 @@ class GroupE2EEManager:
             if raw:
                 sender_cert_pem = raw.encode("utf-8") if isinstance(raw, str) else raw
         if sender_cert_pem is None:
-            _e2ee_log.warning(
-                "拒绝群消息：无法获取发送方 %s 的证书（零信任模式禁止跳过验签）: group=%s",
+            self._log.warn("e2ee",
+                "rejecting group message: cannot get sender %s cert (zero-trust mode forbids skipping signature verification): group=%s",
                 sender, group_id,
             )
             return None
 
         all_secrets = load_all_group_secrets(self._keystore(), self._current_aid(), group_id)
         if not all_secrets:
+            self._log.warn("e2ee", "group message decrypt failed (no local key): group=%s from=%s", group_id, sender)
             return None
-        result = decrypt_group_message(message, all_secrets, sender_cert_pem=sender_cert_pem)
+        self._log.debug("e2ee", "group message decryption: group=%s from=%s epoch=%s local_epoch_count=%d",
+                        group_id, sender, payload.get("epoch"), len(all_secrets))
+        result = decrypt_group_message(message, all_secrets, sender_cert_pem=sender_cert_pem, logger=self._log)
 
         # 解密成功后，使用 AAD 内 message_id 记录防重放
         if result is not None and not skip_replay:
@@ -3194,6 +3312,9 @@ class GroupE2EEManager:
             final_msg_id = aad_msg_id or message.get("message_id", "")
             if group_id and sender and final_msg_id:
                 self._replay_guard.record(group_id, sender, final_msg_id)
+        if result is None:
+            self._log.warn("e2ee", "group message decrypt failed: group=%s from=%s epoch=%s mid=%s",
+                           group_id, sender, payload.get("epoch"), msg_id)
         return result
 
     def decrypt_batch(self, messages: list[dict[str, Any]], *, skip_replay: bool = False) -> list[dict[str, Any]]:
@@ -3246,7 +3367,7 @@ class GroupE2EEManager:
                 has_cert=bool(initiator_cert),
                 rotation=str(payload.get("rotation_id") or "-"),
             )
-            ok = handle_key_distribution(payload, self._keystore(), aid, initiator_cert_pem=initiator_cert)
+            ok = handle_key_distribution(payload, self._keystore(), aid, initiator_cert_pem=initiator_cert, logger=self._log)
             _debug_group_e2ee(
                 "handle_incoming_distribution_result",
                 aid=aid,
@@ -3259,7 +3380,7 @@ class GroupE2EEManager:
             pending_key = f"{payload.get('group_id', '')}:{payload.get('epoch', '')}:{payload.get('request_id', '')}"
             expected = self._pending_key_requests.get(pending_key)
             if expected is None:
-                _e2ee_log.warning(
+                self._log.warn("e2ee", 
                     "拒绝 group key response：找不到匹配的 pending request aid=%s pending_key=%s pending_count=%s",
                     aid, pending_key, len(self._pending_key_requests),
                 )
@@ -3307,6 +3428,7 @@ class GroupE2EEManager:
                 responder_cert_pem=responder_cert,
                 current_members=self.get_member_aids(str(payload.get("group_id") or "")),
                 strict=True,
+                logger=self._log,
             )
             if ok and expected is not None:
                 self._pending_key_requests.pop(pending_key, None)
@@ -3377,7 +3499,7 @@ class GroupE2EEManager:
             return None
         # 成员资格验证：仅响应当前群成员的请求
         if requester not in current_members:
-            _e2ee_log.warning(
+            self._log.warn("e2ee", 
                 "拒绝密钥恢复请求：%s 不在群 %s 的当前成员列表中", requester, group_id,
             )
             return None
@@ -3386,11 +3508,12 @@ class GroupE2EEManager:
         identity = self._identity_fn() or {}
         private_key_pem = identity.get("private_key_pem")
         if not private_key_pem:
-            _e2ee_log.warning("拒绝密钥恢复响应：本地身份私钥不可用 group=%s requester=%s", group_id, requester)
+            self._log.warn("e2ee", "rejecting key recovery response: local identity private key unavailable group=%s requester=%s", group_id, requester)
             return None
         return handle_key_request(
             request_payload, self._keystore(), self._current_aid(), current_members,
             private_key_pem=private_key_pem,
+            logger=self._log,
         )
 
     # ── 状态查询 ──────────────────────────────────────────

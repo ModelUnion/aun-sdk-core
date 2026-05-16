@@ -638,18 +638,31 @@ export function decryptGroupMessage(
   message: Message,
   groupSecrets: Map<number, Buffer>,
   senderCertPem?: string | null,
-  opts?: { requireSignature?: boolean },
+  opts?: { requireSignature?: boolean; logger?: ModuleLogger },
 ): Message | null {
   const requireSignature = opts?.requireSignature ?? true;
+  const logger = opts?.logger;
   const payload = isJsonObject(message.payload) ? message.payload : null;
-  if (payload === null) return null;
-  if (payload.type !== 'e2ee.group_encrypted') return null;
+  if (payload === null) {
+    logger?.warn(`decryptGroupMessage rejected: payload is not an object mid=${String(message.message_id ?? '')}`);
+    return null;
+  }
+  if (payload.type !== 'e2ee.group_encrypted') {
+    logger?.warn(`decryptGroupMessage rejected: unexpected payload.type=${String(payload.type)} mid=${String(message.message_id ?? '')}`);
+    return null;
+  }
 
   const epoch = payload.epoch as number | undefined;
-  if (epoch == null) return null;
+  if (epoch == null) {
+    logger?.warn(`decryptGroupMessage rejected: missing epoch mid=${String(message.message_id ?? '')}`);
+    return null;
+  }
 
   const groupSecret = groupSecrets.get(epoch);
-  if (!groupSecret) return null;
+  if (!groupSecret) {
+    logger?.warn(`decryptGroupMessage rejected: no group secret for epoch=${epoch} mid=${String(message.message_id ?? '')}`);
+    return null;
+  }
 
   try {
     // 优先从 AAD 读取 group_id 和 message_id
@@ -666,19 +679,31 @@ export function decryptGroupMessage(
       aadFrom = (aad.from as string) || '';
 
       // 外层路由字段与 AAD 绑定校验
-      if (outerGroupId && groupId !== outerGroupId) return null;
+      if (outerGroupId && groupId !== outerGroupId) {
+        logger?.warn(`decryptGroupMessage rejected: outer group_id does not match aad.group_id outer=${outerGroupId} aad=${groupId}`);
+        return null;
+      }
       if (aadFrom) {
         const outerFrom = (message.from as string) || '';
         const outerSender = (message.sender_aid as string) || '';
-        if (outerFrom && outerFrom !== aadFrom) return null;
-        if (outerSender && outerSender !== aadFrom) return null;
+        if (outerFrom && outerFrom !== aadFrom) {
+          logger?.warn(`decryptGroupMessage rejected: outer from does not match aad.from outer=${outerFrom} aad=${aadFrom}`);
+          return null;
+        }
+        if (outerSender && outerSender !== aadFrom) {
+          logger?.warn(`decryptGroupMessage rejected: outer sender_aid does not match aad.from outer=${outerSender} aad=${aadFrom}`);
+          return null;
+        }
       }
     } else {
       groupId = outerGroupId;
       messageId = (message.message_id as string) || '';
     }
 
-    if (!groupId || !messageId) return null;
+    if (!groupId || !messageId) {
+      logger?.warn(`decryptGroupMessage rejected: missing group_id or message_id group=${groupId} mid=${messageId}`);
+      return null;
+    }
 
     const msgKey = deriveGroupMsgKey(groupSecret, groupId, messageId);
     const nonce = Buffer.from(payload.nonce as string, 'base64');
@@ -686,12 +711,14 @@ export function decryptGroupMessage(
     const tag = Buffer.from(payload.tag as string, 'base64');
 
     if (!verifyEnvelopeMetadataAuth(payload, msgKey)) {
+      logger?.warn(`decryptGroupMessage rejected: envelope metadata auth failed group=${groupId} mid=${messageId}`);
       return null;
     }
     const aadBytes = aad ? aadBytesGroup(aad) : Buffer.alloc(0);
     const plaintext = aesGcmDecrypt(msgKey, ciphertext, tag, nonce, aadBytes);
     const decoded = JSON.parse(plaintext.toString('utf-8'));
     if (!validateDecryptedEnvelopeMetadata(decoded, payload, message)) {
+      logger?.warn(`decryptGroupMessage rejected: decrypted envelope metadata validation failed group=${groupId} mid=${messageId}`);
       return null;
     }
 
@@ -716,33 +743,51 @@ export function decryptGroupMessage(
     // 发送方签名验证
     const senderSigB64 = payload.sender_signature as string | undefined;
     if (requireSignature) {
-      if (!senderSigB64) return null;
-      if (!senderCertPem) return null;
+      if (!senderSigB64) {
+        logger?.warn(`decryptGroupMessage rejected: sender signature required but missing group=${groupId} mid=${messageId}`);
+        return null;
+      }
+      if (!senderCertPem) {
+        logger?.warn(`decryptGroupMessage rejected: sender signature required but senderCertPem missing group=${groupId} mid=${messageId}`);
+        return null;
+      }
       try {
         const senderPub = pemToCertPublicKey(senderCertPem);
         const sigBytes = Buffer.from(senderSigB64, 'base64');
         const verifyPayload = Buffer.concat([ciphertext, tag, aadBytes]);
-        if (!ecdsaVerify(senderPub, sigBytes, verifyPayload)) return null;
+        if (!ecdsaVerify(senderPub, sigBytes, verifyPayload)) {
+          logger?.warn(`decryptGroupMessage rejected: sender signature verification failed group=${groupId} mid=${messageId}`);
+          return null;
+        }
         if (isJsonObject(result.e2ee)) result.e2ee.sender_verified = true;
-      } catch {
+      } catch (exc) {
+        logger?.warn(`decryptGroupMessage rejected: sender signature verification threw group=${groupId} mid=${messageId} err=${String(exc)}`);
         return null;
       }
     } else if (senderCertPem) {
       // 非零信任模式但提供了证书：有证书时强制验签
-      if (!senderSigB64) return null;
+      if (!senderSigB64) {
+        logger?.warn(`decryptGroupMessage rejected: senderCertPem present but signature missing group=${groupId} mid=${messageId}`);
+        return null;
+      }
       try {
         const senderPub = pemToCertPublicKey(senderCertPem);
         const sigBytes = Buffer.from(senderSigB64, 'base64');
         const verifyPayload = Buffer.concat([ciphertext, tag, aadBytes]);
-        if (!ecdsaVerify(senderPub, sigBytes, verifyPayload)) return null;
+        if (!ecdsaVerify(senderPub, sigBytes, verifyPayload)) {
+          logger?.warn(`decryptGroupMessage rejected: optional sender signature verification failed group=${groupId} mid=${messageId}`);
+          return null;
+        }
         if (isJsonObject(result.e2ee)) result.e2ee.sender_verified = true;
-      } catch {
+      } catch (exc) {
+        logger?.warn(`decryptGroupMessage rejected: optional sender signature verification threw group=${groupId} mid=${messageId} err=${String(exc)}`);
         return null;
       }
     }
 
     return result;
-  } catch {
+  } catch (exc) {
+    logger?.warn(`decryptGroupMessage rejected: decrypt threw mid=${String(message.message_id ?? '')} err=${String(exc)}`);
     return null;
   }
 }
@@ -1009,7 +1054,7 @@ function assessIncomingEpochChain(
   const rotator = rotatorAid.trim();
 
   if (rid && !chain) {
-    logger.warn(`[e2ee-group] 拒绝缺少 epoch_chain 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+    logger.warn(`[e2ee-group] rejecting rotation key missing epoch_chain source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
     return { ok: false };
   }
 
@@ -1020,7 +1065,7 @@ function assessIncomingEpochChain(
     if (chain && currentChain === chain) return { ok: true };
     if (rid && chain && currentChain && currentChain !== chain) {
       if (!(currentPendingRotationId && currentPendingRotationId !== rid)) {
-        logger.warn(`[e2ee-group] 拒绝同 epoch 分叉 chain source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+        logger.warn(`[e2ee-group] rejecting same-epoch chain fork source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
         return { ok: false };
       }
     }
@@ -1032,17 +1077,17 @@ function assessIncomingEpochChain(
   if (!prevChain) return { ok: true, unverified: true, reason: 'missing_prev_chain' };
   if (!rotator) {
     if (rid) {
-      logger.warn(`[e2ee-group] 拒绝缺少 rotator_aid 的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      logger.warn(`[e2ee-group] rejecting rotation key missing rotator_aid source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
       return { ok: false };
     }
     return { ok: true, unverified: true, reason: 'missing_rotator_aid' };
   }
   if (!verifyEpochChain(chain, prevChain, epoch, commitment, rotator)) {
     if (rid) {
-      logger.warn(`[e2ee-group] 拒绝 epoch_chain 验证失败的新 rotation key source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
+      logger.warn(`[e2ee-group] rejecting rotation key with failed epoch_chain verification source=${source} group=${groupId} epoch=${epoch} rotation=${rid}`);
       return { ok: false };
     }
-    logger.warn(`[e2ee-group] epoch_chain 验证失败，按兼容档接收并标记未验证 source=${source} group=${groupId} epoch=${epoch}`);
+    logger.warn(`[e2ee-group] epoch_chain verification failed, accepting as unverified for compatibility source=${source} group=${groupId} epoch=${epoch}`);
     return { ok: true, unverified: true, reason: 'chain_mismatch_legacy' };
   }
   if (!rid) return { ok: true, unverified: true, reason: 'missing_rotation_id' };
@@ -1230,28 +1275,52 @@ export function handleKeyDistribution(
   const commitment = payload.commitment as string | undefined;
   const memberAids = (payload.member_aids as string[]) ?? [];
 
-  if (!groupId || epoch == null || !groupSecretB64 || !commitment) return false;
+  logger?.debug(`handleKeyDistribution enter: group=${String(groupId ?? '')}, epoch=${String(epoch ?? '')}, aid=${aid}, members=${memberAids.length}`);
+
+  if (!groupId || epoch == null || !groupSecretB64 || !commitment) {
+    logger?.warn(`handleKeyDistribution rejected: missing required fields group=${String(groupId ?? '')} epoch=${String(epoch ?? '')} has_secret=${!!groupSecretB64} has_commitment=${!!commitment}`);
+    return false;
+  }
 
   // 验证 Membership Manifest 签名
   const manifest = isJsonObject(payload.manifest) ? payload.manifest : undefined;
   if (initiatorCertPem) {
-    if (!manifest) return false;
-    if (!verifyMembershipManifest(manifest, initiatorCertPem)) return false;
-    if (manifest.group_id !== groupId || manifest.epoch !== epoch) return false;
+    if (!manifest) {
+      logger?.warn(`handleKeyDistribution rejected: manifest required when initiatorCertPem present group=${groupId} epoch=${epoch}`);
+      return false;
+    }
+    if (!verifyMembershipManifest(manifest, initiatorCertPem)) {
+      logger?.warn(`handleKeyDistribution rejected: manifest signature verification failed group=${groupId} epoch=${epoch}`);
+      return false;
+    }
+    if (manifest.group_id !== groupId || manifest.epoch !== epoch) {
+      logger?.warn(`handleKeyDistribution rejected: manifest group_id/epoch mismatch group=${groupId} epoch=${epoch} manifest_group=${String(manifest.group_id)} manifest_epoch=${String(manifest.epoch)}`);
+      return false;
+    }
     const manifestMembers = [...((manifest.member_aids as string[]) ?? [])].sort();
     const payloadMembers = [...memberAids].sort();
-    if (JSON.stringify(manifestMembers) !== JSON.stringify(payloadMembers)) return false;
+    if (JSON.stringify(manifestMembers) !== JSON.stringify(payloadMembers)) {
+      logger?.warn(`handleKeyDistribution rejected: manifest members mismatch payload members group=${groupId} epoch=${epoch}`);
+      return false;
+    }
   } else if (manifest) {
-    if (manifest.group_id !== groupId || manifest.epoch !== epoch) return false;
+    if (manifest.group_id !== groupId || manifest.epoch !== epoch) {
+      logger?.warn(`handleKeyDistribution rejected: manifest group_id/epoch mismatch (no cert) group=${groupId} epoch=${epoch}`);
+      return false;
+    }
     const manifestMembers = [...((manifest.member_aids as string[]) ?? [])].sort();
     const payloadMembers = [...memberAids].sort();
-    if (JSON.stringify(manifestMembers) !== JSON.stringify(payloadMembers)) return false;
+    if (JSON.stringify(manifestMembers) !== JSON.stringify(payloadMembers)) {
+      logger?.warn(`handleKeyDistribution rejected: manifest members mismatch payload members (no cert) group=${groupId} epoch=${epoch}`);
+      return false;
+    }
   }
 
   const groupSecret = Buffer.from(groupSecretB64, 'base64');
 
   // 验证 commitment
   if (!verifyMembershipCommitment(commitment, memberAids, epoch, groupId, aid, groupSecret)) {
+    logger?.warn(`handleKeyDistribution rejected: commitment verification failed group=${groupId} epoch=${epoch}`);
     return false;
   }
 
@@ -1269,7 +1338,10 @@ export function handleKeyDistribution(
     'key_distribution',
     logger,
   );
-  if (!chainAssessment.ok) return false;
+  if (!chainAssessment.ok) {
+    logger?.warn(`handleKeyDistribution rejected: epoch chain assessment failed group=${groupId} epoch=${epoch} reason=${chainAssessment.reason ?? ''}`);
+    return false;
+  }
 
   return storeGroupSecret(
     keystore, aid, groupId, epoch, groupSecret, commitment, memberAids,
@@ -1304,6 +1376,7 @@ export function handleKeyRequest(
   aid: string,
   currentMembers: string[],
   privateKeyPem?: string | null,
+  logger?: ModuleLogger,
 ): JsonObject | null {
   const payload = 'group_id' in request
     ? request
@@ -1313,19 +1386,31 @@ export function handleKeyRequest(
   const groupId = payload.group_id as string | undefined;
   const epoch = payload.epoch as number | undefined;
 
-  if (!requesterAid || !groupId || epoch == null) return null;
+  logger?.debug(`handleKeyRequest enter: group=${String(groupId ?? '')}, epoch=${String(epoch ?? '')}, requester=${String(requesterAid ?? '')}, aid=${aid}`);
+
+  if (!requesterAid || !groupId || epoch == null) {
+    logger?.warn(`handleKeyRequest rejected: missing required fields requester=${String(requesterAid ?? '')} group=${String(groupId ?? '')} epoch=${String(epoch ?? '')}`);
+    return null;
+  }
 
   // 验证请求者是群成员
-  if (!currentMembers.includes(requesterAid)) return null;
+  if (!currentMembers.includes(requesterAid)) {
+    logger?.warn(`handleKeyRequest rejected: requester not in current members group=${groupId} requester=${requesterAid}`);
+    return null;
+  }
 
   // 查本地密钥
   const secretData = loadGroupSecret(keystore, aid, groupId, epoch);
-  if (!secretData) return null;
+  if (!secretData) {
+    logger?.warn(`handleKeyRequest rejected: no local secret for epoch group=${groupId} epoch=${epoch}`);
+    return null;
+  }
 
   // 历史隔离：密钥存储中记录了该 epoch 的成员列表，
   // 若请求者不在该列表中，说明其不属于该 epoch，直接拒绝（不响应）。
   const memberAids = ((secretData.member_aids as string[]) ?? []).map(String).filter(Boolean).sort();
   if (memberAids.length > 0 && !memberAids.includes(requesterAid)) {
+    logger?.warn(`handleKeyRequest rejected: requester not in epoch member list group=${groupId} epoch=${epoch} requester=${requesterAid}`);
     return null;
   }
 
@@ -1381,41 +1466,81 @@ export function handleKeyResponse(
   const commitment = payload.commitment as string | undefined;
   const memberAids = (payload.member_aids as string[]) ?? [];
 
-  if (!groupId || epoch == null || !groupSecretB64 || !commitment) return false;
+  const logger = opts?.logger;
+  logger?.debug(`handleKeyResponse enter: group=${String(groupId ?? '')}, epoch=${String(epoch ?? '')}, responder=${String(payload.responder_aid ?? '')}, aid=${aid}, strict=${!!opts?.strict}`);
+
+  if (!groupId || epoch == null || !groupSecretB64 || !commitment) {
+    logger?.warn(`handleKeyResponse rejected: missing required fields group=${String(groupId ?? '')} epoch=${String(epoch ?? '')} has_secret=${!!groupSecretB64} has_commitment=${!!commitment}`);
+    return false;
+  }
 
   const expected = opts?.expectedRequest ?? null;
   if (expected) {
-    if (payload.requester_aid !== aid) return false;
+    if (payload.requester_aid !== aid) {
+      logger?.warn(`handleKeyResponse rejected: requester_aid mismatch group=${groupId} epoch=${epoch} got=${String(payload.requester_aid)} expected=${aid}`);
+      return false;
+    }
     const expectedResponder = String(expected._expected_responder_aid ?? '');
-    if (expectedResponder && payload.responder_aid !== expectedResponder) return false;
-    if (payload.request_id !== expected.request_id) return false;
-    if (payload.group_id !== expected.group_id) return false;
-    if (Number(payload.epoch ?? 0) !== Number(expected.epoch ?? 0)) return false;
+    if (expectedResponder && payload.responder_aid !== expectedResponder) {
+      logger?.warn(`handleKeyResponse rejected: responder_aid mismatch group=${groupId} epoch=${epoch} got=${String(payload.responder_aid)} expected=${expectedResponder}`);
+      return false;
+    }
+    if (payload.request_id !== expected.request_id) {
+      logger?.warn(`handleKeyResponse rejected: request_id mismatch group=${groupId} epoch=${epoch}`);
+      return false;
+    }
+    if (payload.group_id !== expected.group_id) {
+      logger?.warn(`handleKeyResponse rejected: group_id mismatch with expected request`);
+      return false;
+    }
+    if (Number(payload.epoch ?? 0) !== Number(expected.epoch ?? 0)) {
+      logger?.warn(`handleKeyResponse rejected: epoch mismatch with expected request group=${groupId}`);
+      return false;
+    }
   }
 
   const responderAid = String(payload.responder_aid ?? '');
   if (opts?.strict) {
-    if (!responderAid || !opts.responderCertPem) return false;
-    if ((opts.currentMembers?.length ?? 0) > 0 && !opts.currentMembers!.includes(responderAid)) return false;
-    if (!verifyGroupKeyResponseSignature(payload, opts.responderCertPem)) return false;
+    if (!responderAid || !opts.responderCertPem) {
+      logger?.warn(`handleKeyResponse rejected (strict): missing responder aid or cert group=${groupId} epoch=${epoch}`);
+      return false;
+    }
+    if ((opts.currentMembers?.length ?? 0) > 0 && !opts.currentMembers!.includes(responderAid)) {
+      logger?.warn(`handleKeyResponse rejected (strict): responder not in current members group=${groupId} epoch=${epoch} responder=${responderAid}`);
+      return false;
+    }
+    if (!verifyGroupKeyResponseSignature(payload, opts.responderCertPem)) {
+      logger?.warn(`handleKeyResponse rejected (strict): response signature verification failed group=${groupId} epoch=${epoch} responder=${responderAid}`);
+      return false;
+    }
   } else if (opts?.responderCertPem && payload.response_signature) {
-    if (!verifyGroupKeyResponseSignature(payload, opts.responderCertPem)) return false;
+    if (!verifyGroupKeyResponseSignature(payload, opts.responderCertPem)) {
+      logger?.warn(`handleKeyResponse rejected: response signature verification failed group=${groupId} epoch=${epoch} responder=${responderAid}`);
+      return false;
+    }
   }
 
   const groupSecret = Buffer.from(groupSecretB64, 'base64');
 
   if (!verifyMembershipCommitment(commitment, memberAids, epoch, groupId, aid, groupSecret)) {
+    logger?.warn(`handleKeyResponse rejected: commitment verification failed group=${groupId} epoch=${epoch}`);
     return false;
   }
 
   const manifest = isJsonObject(payload.manifest) ? payload.manifest : null;
   if (manifest) {
-    if (manifest.group_id !== groupId || manifest.epoch !== epoch) return false;
+    if (manifest.group_id !== groupId || manifest.epoch !== epoch) {
+      logger?.warn(`handleKeyResponse rejected: manifest group_id/epoch mismatch group=${groupId} epoch=${epoch}`);
+      return false;
+    }
     const manifestMembers = Array.isArray(manifest.member_aids)
       ? manifest.member_aids.map((item) => String(item ?? '').trim()).filter(Boolean).sort()
       : [];
     const payloadMembers = memberAids.map((item) => String(item ?? '').trim()).filter(Boolean).sort();
-    if (manifestMembers.length > 0 && manifestMembers.join('\n') !== payloadMembers.join('\n')) return false;
+    if (manifestMembers.length > 0 && manifestMembers.join('\n') !== payloadMembers.join('\n')) {
+      logger?.warn(`handleKeyResponse rejected: manifest members mismatch payload members group=${groupId} epoch=${epoch}`);
+      return false;
+    }
   }
 
   const incomingChain = typeof payload.epoch_chain === 'string' ? payload.epoch_chain : undefined;
@@ -1432,7 +1557,10 @@ export function handleKeyResponse(
     'key_response',
     opts?.logger,
   );
-  if (!chainAssessment.ok) return false;
+  if (!chainAssessment.ok) {
+    logger?.warn(`handleKeyResponse rejected: epoch chain assessment failed group=${groupId} epoch=${epoch} reason=${chainAssessment.reason ?? ''}`);
+    return false;
+  }
 
   return storeGroupSecretEpoch(
     keystore, aid, groupId, epoch, groupSecret, commitment, memberAids,
@@ -1488,6 +1616,7 @@ export class GroupE2EEManager {
   /** 创建首个 epoch。返回 {epoch, commitment, distributions: [{to, payload}]} */
   createEpoch(groupId: string, memberAids: string[]): JsonObject {
     const aid = this._currentAid();
+    this._logger.debug(`create first epoch: groupId=${groupId}, members=${memberAids.length}, aid=${aid}`);
     const gs = generateGroupSecret();
     const epoch = 1;
     const commitment = computeMembershipCommitment(memberAids, epoch, groupId, gs);
@@ -1497,6 +1626,7 @@ export class GroupE2EEManager {
       groupId, epoch, null, memberAids, { initiatorAid: aid },
     ));
     const distPayload = buildKeyDistribution(groupId, epoch, gs, memberAids, aid, manifest, epochChain);
+    this._logger.debug(`create first epoch success: groupId=${groupId}, epoch=${epoch}`);
     return {
       epoch,
       commitment,
@@ -1512,18 +1642,21 @@ export class GroupE2EEManager {
     const current = loadGroupSecret(this._keystore, aid, groupId);
     const prevEpoch = current ? Number(current.epoch) : null;
     const newEpoch = (prevEpoch ?? 0) + 1;
+    this._logger.debug(`rotateEpoch start: groupId=${groupId}, prevEpoch=${prevEpoch}, newEpoch=${newEpoch}, members=${memberAids.length}`);
     const gs = generateGroupSecret();
     const commitment = computeMembershipCommitment(memberAids, newEpoch, groupId, gs);
     const prevChain = current?.epoch_chain ?? null;
     const epochChain = computeEpochChain(prevChain, newEpoch, commitment, aid);
     const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids, epochChain);
     if (!stored) {
+      this._logger.warn(`rotateEpoch failed (epoch already exists or newer): groupId=${groupId}, newEpoch=${newEpoch}`);
       throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
     }
     const manifest = this._signManifest(buildMembershipManifest(
       groupId, newEpoch, prevEpoch, memberAids, { initiatorAid: aid },
     ));
     const distPayload = buildKeyDistribution(groupId, newEpoch, gs, memberAids, aid, manifest, epochChain);
+    this._logger.debug(`rotateEpoch success: groupId=${groupId}, newEpoch=${newEpoch}`);
     return {
       epoch: newEpoch,
       commitment,
@@ -1541,6 +1674,7 @@ export class GroupE2EEManager {
     opts?: { rotationId?: string; prevChainHint?: string | null },
   ): JsonObject {
     const aid = this._currentAid();
+    this._logger.debug(`rotateEpochTo start: groupId=${groupId}, newEpoch=${newEpoch}, members=${memberAids.length}`);
     const current = loadGroupSecret(this._keystore, aid, groupId, newEpoch - 1)
       ?? loadGroupSecret(this._keystore, aid, groupId);
     const gs = generateGroupSecret();
@@ -1553,6 +1687,7 @@ export class GroupE2EEManager {
     const rotationId = opts?.rotationId ?? '';
     const stored = storeGroupSecret(this._keystore, aid, groupId, newEpoch, gs, commitment, memberAids, epochChain, rotationId);
     if (!stored) {
+      this._logger.warn(`rotateEpochTo failed (epoch already exists or newer): groupId=${groupId}, newEpoch=${newEpoch}`);
       throw new Error(`group ${groupId} epoch ${newEpoch} secret already exists or is newer; abort distribution`);
     }
     const manifest = this._signManifest(buildMembershipManifest(
@@ -1562,6 +1697,7 @@ export class GroupE2EEManager {
     if (rotationId) {
       distPayload.rotation_id = rotationId;
     }
+    this._logger.debug(`rotateEpochTo success: groupId=${groupId}, newEpoch=${newEpoch}, rotationId=${rotationId}`);
     return {
       epoch: newEpoch,
       commitment,
@@ -1585,8 +1721,10 @@ export class GroupE2EEManager {
     timestamp?: number;
   }): JsonObject {
     const aid = this._currentAid();
+    this._logger.debug(`group message encrypt start: groupId=${groupId}, aid=${aid}`);
     const secretData = loadGroupSecret(this._keystore, aid, groupId);
     if (!secretData) {
+      this._logger.error(`group message encrypt failed: missing group secret, groupId=${groupId}`);
       throw new E2EEGroupSecretMissingError(`no group secret for ${groupId}`);
     }
     const identity = this._identityFn();
@@ -1596,7 +1734,7 @@ export class GroupE2EEManager {
       throw new E2EEError('sender identity private key unavailable for group message signing');
     }
     const senderCertPem = identity ? (identity.cert as string | undefined) ?? null : null;
-    return encryptGroupMessage(
+    const result = encryptGroupMessage(
       groupId,
       secretData.epoch as number,
       secretData.secret,
@@ -1611,6 +1749,8 @@ export class GroupE2EEManager {
         context: opts?.context ?? null,
       },
     );
+    this._logger.debug(`group message encrypt success: groupId=${groupId}, epoch=${secretData.epoch}`);
+    return result;
   }
 
   /** 使用指定 epoch 加密群消息。 */
@@ -1658,6 +1798,7 @@ export class GroupE2EEManager {
     }
     const groupId = (message.group_id as string) || '';
     const sender = (message.from as string) || (message.sender_aid as string) || '';
+    this._logger.debug(`group message decrypt start: groupId=${groupId}, from=${sender}`);
 
     // 防重放预检：优先使用 AAD 内 message_id
     const aad = isJsonObject(payload.aad) ? payload.aad : undefined;
@@ -1665,6 +1806,7 @@ export class GroupE2EEManager {
     const msgId = aadMsgId || (message.message_id as string) || '';
     if (!opts?.skipReplay && groupId && sender && msgId) {
       if (this._replayGuard.isSeen(groupId, sender, msgId)) {
+        this._logger.debug(`group message replay blocked: groupId=${groupId}, from=${sender}, mid=${msgId}`);
         // 返回原消息（不含 e2ee 字段），调用方可通过缺失 e2ee 识别 replay
         return message;
       }
@@ -1675,11 +1817,17 @@ export class GroupE2EEManager {
     if (this._senderCertResolver && sender) {
       senderCertPem = this._senderCertResolver(sender);
     }
-    if (!senderCertPem) return null;
+    if (!senderCertPem) {
+      this._logger.warn(`group message decrypt rejected: sender cert unavailable, groupId=${groupId}, from=${sender}`);
+      return null;
+    }
 
     const allSecrets = loadAllGroupSecrets(this._keystore, this._currentAid(), groupId);
-    if (allSecrets.size === 0) return null;
-    const result = decryptGroupMessage(message, allSecrets, senderCertPem);
+    if (allSecrets.size === 0) {
+      this._logger.warn(`group message decrypt failed: no group secret, groupId=${groupId}`);
+      return null;
+    }
+    const result = decryptGroupMessage(message, allSecrets, senderCertPem, { logger: this._logger });
 
     // 解密成功后记录防重放
     if (result != null) {
@@ -1687,6 +1835,9 @@ export class GroupE2EEManager {
       if (!opts?.skipReplay && groupId && sender && finalMsgId) {
         this._replayGuard.record(groupId, sender, finalMsgId);
       }
+      this._logger.debug(`group message decrypt success: groupId=${groupId}, from=${sender}, mid=${msgId}`);
+    } else {
+      this._logger.warn(`group message decrypt failed: groupId=${groupId}, from=${sender}, mid=${msgId}`);
     }
     return result;
   }
@@ -1709,18 +1860,32 @@ export class GroupE2EEManager {
     const aid = this._currentAid();
 
     if (msgType === 'e2ee.group_key_distribution') {
-      let initiatorCert: string | null = null;
+      const groupId = (payload.group_id as string) || '';
+      const epoch = payload.epoch as number | undefined;
       const distributedBy = (payload.distributed_by as string) || '';
+      this._logger.debug(`received key distribution: groupId=${groupId}, epoch=${epoch}, from=${distributedBy}`);
+      let initiatorCert: string | null = null;
       if (this._initiatorCertResolver && distributedBy) {
         initiatorCert = this._initiatorCertResolver(distributedBy);
       }
       const ok = handleKeyDistribution(payload, this._keystore, aid, initiatorCert, this._logger);
+      if (ok) {
+        this._logger.debug(`key distribution handled successfully: groupId=${groupId}, epoch=${epoch}`);
+      } else {
+        this._logger.warn(`key distribution rejected: groupId=${groupId}, epoch=${epoch}, from=${distributedBy}`);
+      }
       return ok ? 'distribution' : 'distribution_rejected';
     }
     if (msgType === 'e2ee.group_key_response') {
+      const groupId = (payload.group_id as string) || '';
+      const epoch = payload.epoch as number | undefined;
+      this._logger.debug(`received key response: groupId=${groupId}, epoch=${epoch}`);
       const pendingKey = `${String(payload.group_id ?? '')}:${String(payload.epoch ?? '')}:${String(payload.request_id ?? '')}`;
       const expected = this._pendingKeyRequests.get(pendingKey) ?? null;
-      if (expected === null) return 'response_rejected';
+      if (expected === null) {
+        this._logger.warn(`key response rejected (no matching request): groupId=${groupId}, epoch=${epoch}`);
+        return 'response_rejected';
+      }
       const responderAid = String(payload.responder_aid ?? '');
       const responderCertPem = responderAid && this._initiatorCertResolver
         ? this._initiatorCertResolver(responderAid)
@@ -1733,9 +1898,17 @@ export class GroupE2EEManager {
         logger: this._logger,
       });
       if (ok && expected) this._pendingKeyRequests.delete(pendingKey);
+      if (ok) {
+        this._logger.debug(`key response handled successfully: groupId=${groupId}, epoch=${epoch}, responder=${responderAid}`);
+      } else {
+        this._logger.warn(`key response verification failed: groupId=${groupId}, epoch=${epoch}, responder=${responderAid}`);
+      }
       return ok ? 'response' : 'response_rejected';
     }
     if (msgType === 'e2ee.group_key_request') {
+      const groupId = (payload.group_id as string) || '';
+      const requester = (payload.requester_aid as string) || '';
+      this._logger.debug(`received key request: groupId=${groupId}, requester=${requester}, epoch=${payload.epoch}`);
       return 'request';
     }
     return null;
@@ -1784,14 +1957,27 @@ export class GroupE2EEManager {
     const groupId = (requestPayload.group_id as string) || '';
     if (!requester || !groupId) return null;
     // 成员资格验证
-    if (!members.includes(requester)) return null;
+    if (!members.includes(requester)) {
+      this._logger.warn(`key request rejected (not a member): groupId=${groupId}, requester=${requester}`);
+      return null;
+    }
     if (!this._responseThrottle.allow(`response:${groupId}:${requester}`)) {
+      this._logger.debug(`key request throttled: groupId=${groupId}, requester=${requester}`);
       return null;
     }
     const identity = this._identityFn();
     const privateKeyPem = identity.private_key_pem as string | undefined;
-    if (!privateKeyPem) return null;
-    return handleKeyRequest(requestPayload, this._keystore, this._currentAid(), members, privateKeyPem);
+    if (!privateKeyPem) {
+      this._logger.error(`key request handling failed: missing private key, groupId=${groupId}`);
+      return null;
+    }
+    const response = handleKeyRequest(requestPayload, this._keystore, this._currentAid(), members, privateKeyPem, this._logger);
+    if (response) {
+      this._logger.debug(`key request responded: groupId=${groupId}, requester=${requester}, epoch=${requestPayload.epoch}`);
+    } else {
+      this._logger.warn(`key request handling failed (no local key or requester not in epoch members): groupId=${groupId}, requester=${requester}`);
+    }
+    return response;
   }
 
   // ── 状态查询 ──────────────────────────────────────────
@@ -1815,7 +2001,13 @@ export class GroupE2EEManager {
 
   /** 加载群组密钥数据 */
   loadSecret(groupId: string, epoch?: number | null): LoadedGroupSecret | null {
-    return loadGroupSecret(this._keystore, this._currentAid(), groupId, epoch);
+    const result = loadGroupSecret(this._keystore, this._currentAid(), groupId, epoch);
+    if (result) {
+      this._logger.debug(`load group secret success: groupId=${groupId}, epoch=${result.epoch}`);
+    } else {
+      this._logger.debug(`load group secret not found: groupId=${groupId}, requestedEpoch=${epoch ?? 'latest'}`);
+    }
+    return result;
   }
 
   /** 清理过期的旧 epoch */

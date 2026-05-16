@@ -2,6 +2,9 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import { ConnectionError, ValidationError } from './errors.js';
 import { isJsonObject, type GatewayDiscoveryDocument, type GatewayEntry, type JsonValue } from './types.js';
+import type { ModuleLogger } from './logger.js';
+
+const _noopLogger: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 function _httpGetJson(url: string, verifySsl: boolean, timeout: number): Promise<JsonValue> {
   return new Promise((resolve, reject) => {
@@ -57,9 +60,11 @@ function _httpGetOk(url: string, verifySsl: boolean, timeout: number): Promise<b
 export class GatewayDiscovery {
   private _verifySsl: boolean;
   private _lastHealthy: boolean | null = null;
+  private _logger: ModuleLogger;
 
-  constructor(opts?: { verifySsl?: boolean }) {
+  constructor(opts?: { verifySsl?: boolean; logger?: ModuleLogger }) {
     this._verifySsl = opts?.verifySsl ?? true;
+    this._logger = opts?.logger ?? _noopLogger;
   }
 
   /** 最近一次 health check 结果，null 表示尚未检查 */
@@ -70,14 +75,27 @@ export class GatewayDiscovery {
    * 结果缓存到 lastHealthy，同时返回检查结果。
    */
   async checkHealth(gatewayUrl: string, timeout = 5_000): Promise<boolean> {
+    const tStart = Date.now();
     const parsed = new URL(gatewayUrl);
     parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
     parsed.pathname = '/health';
     parsed.search = '';
     parsed.hash = '';
     const healthUrl = parsed.toString();
-    this._lastHealthy = await _httpGetOk(healthUrl, this._verifySsl, timeout);
-    return this._lastHealthy;
+    this._logger.debug(`checkHealth enter: url=${healthUrl}`);
+    try {
+      this._lastHealthy = await _httpGetOk(healthUrl, this._verifySsl, timeout);
+      if (this._lastHealthy) {
+        this._logger.debug(`checkHealth exit: elapsed=${Date.now() - tStart}ms healthy=true url=${healthUrl}`);
+      } else {
+        this._logger.warn(`health check failed: url=${healthUrl}`);
+        this._logger.debug(`checkHealth exit: elapsed=${Date.now() - tStart}ms healthy=false url=${healthUrl}`);
+      }
+      return this._lastHealthy;
+    } catch (err) {
+      this._logger.debug(`checkHealth exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   /**
@@ -88,6 +106,8 @@ export class GatewayDiscovery {
    * @returns Gateway WebSocket URL
    */
   async discover(wellKnownUrl: string, timeout = 5_000): Promise<string> {
+    const tStart = Date.now();
+    this._logger.debug(`discover enter: url=${wellKnownUrl}`);
     let payload: GatewayDiscoveryDocument;
     try {
       const rawPayload = await _httpGetJson(wellKnownUrl, this._verifySsl, timeout);
@@ -96,6 +116,8 @@ export class GatewayDiscovery {
       }
       payload = rawPayload as GatewayDiscoveryDocument;
     } catch (err) {
+      this._logger.error(`gateway discover failed: url=${wellKnownUrl}, error=${err instanceof Error ? err.message : String(err)}`);
+      this._logger.debug(`discover exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw new ConnectionError(
         `gateway discovery failed for ${wellKnownUrl}: ${err instanceof Error ? err.message : String(err)}`,
         { retryable: true },
@@ -104,6 +126,8 @@ export class GatewayDiscovery {
 
     const gateways = payload.gateways;
     if (!Array.isArray(gateways) || gateways.length === 0) {
+      this._logger.error(`gateway discover returned empty list: url=${wellKnownUrl}`);
+      this._logger.debug(`discover exit (error): elapsed=${Date.now() - tStart}ms err=empty_gateways`);
       throw new ValidationError('well-known returned empty gateways');
     }
 
@@ -114,8 +138,12 @@ export class GatewayDiscovery {
 
     const url = sorted[0]?.url;
     if (!url || typeof url !== 'string') {
+      this._logger.error(`gateway discover missing url field: wellKnown=${wellKnownUrl}`);
+      this._logger.debug(`discover exit (error): elapsed=${Date.now() - tStart}ms err=missing_url`);
       throw new ValidationError('well-known missing gateway url');
     }
+
+    this._logger.debug(`discover exit: elapsed=${Date.now() - tStart}ms gateway=${url}, candidates=${gateways.length}`);
 
     // 发现后自动检查网关可用性（不阻塞，失败不影响返回）
     this.checkHealth(url, timeout).catch(() => {});

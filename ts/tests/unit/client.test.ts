@@ -223,9 +223,11 @@ describe('AUNClient message.send 接收者校验', () => {
     });
 
     const [, sentParams] = (client as any)._transport.call.mock.calls[0];
+    // delivery_mode 不被转发到底层 RPC（与 Python SDK 对齐）
     expect(sentParams.delivery_mode).toBeUndefined();
-    expect(sentParams.protected_headers).toBeUndefined();
-    expect(sentParams.headers).toBeUndefined();
+    // protected_headers / headers 是信封元数据，加密与否都保留（与 Python SDK 对齐）
+    expect(sentParams.protected_headers).toBeDefined();
+    expect(sentParams.headers).toBeDefined();
   });
 
   it('message.pull 自动注入当前实例 device_id/slot_id', async () => {
@@ -426,6 +428,8 @@ describe('AUNClient prekey 补充', () => {
   it('同一个 prekey_id 只触发一次异步补充', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
+    // 仅活跃 prekey 被消费时才触发上传；测试需显式设置 active 模拟"刚上传"的状态
+    (client as any)._activePrekeyId = 'pk-1';
     (client as any)._uploadPrekey = vi.fn().mockResolvedValue({ ok: true });
 
     (client as any)._schedulePrekeyReplenishIfConsumed({
@@ -1131,6 +1135,8 @@ describe('R4: 收到密钥后应触发 pending 消息重试', () => {
       decrypt: vi.fn(),
       loadSecret: vi.fn(),
       getMemberAids: vi.fn().mockReturnValue([]),
+      // _tryHandleGroupKeyMessage 用 currentEpoch 判定本地是否已 ahead
+      currentEpoch: vi.fn().mockReturnValue(0),
     };
 
     const retrySpy = vi.spyOn(client as any, '_retryPendingDecryptMsgs').mockResolvedValue(undefined);
@@ -1176,6 +1182,9 @@ describe('GROUP epoch 轮换竞态防护', () => {
 
   it('无 rotation_id 的未来 epoch 分发应被拒绝', async () => {
     const client = new AUNClient();
+    // 验证逻辑会跳过非活跃群（不在 _groupSynced 中）。本测试要走完整 RPC 校验路径，
+    // 必须先把目标群加入活跃列表。
+    (client as any)._groupSynced.add('g1');
     (client as any).call = vi.fn().mockResolvedValue({ epoch: 1, committed_epoch: 1 });
 
     await expect((client as any)._verifyActiveGroupRotationDistribution({

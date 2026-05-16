@@ -1,6 +1,10 @@
 // ── 事件调度器 ──────────────────────────────────────────
 
 import type { JsonValue } from './types.js';
+import type { ModuleLogger } from './logger.js';
+
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 /** 事件处理函数类型 */
 export type EventPayload =
@@ -33,6 +37,9 @@ export class Subscription {
 
 /** 事件调度器：支持订阅、取消订阅、发布（同步/异步处理函数） */
 export class EventDispatcher {
+  private _log: ModuleLogger = _noopLog;
+  setLogger(log: ModuleLogger): void { this._log = log; }
+
   private _handlers: Map<string, EventHandler[]> = new Map();
 
   /**
@@ -73,7 +80,7 @@ export class EventDispatcher {
           await result;
         }
       } catch (exc) {
-        console.warn(`事件 ${event} 处理器执行异常:`, exc);
+        this._log.warn(`event ${event} handler execution exception:`, exc);
       }
     }
   }

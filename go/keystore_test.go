@@ -516,6 +516,55 @@ func TestPrekeyPersistence(t *testing.T) {
 	}
 }
 
+// TestLoadE2EEPrekeyByID 验证按 prekey_id 单点查询（与 Python load_e2ee_prekey_by_id 对齐）
+func TestLoadE2EEPrekeyByID(t *testing.T) {
+	ks := testNewFileKeyStoreWithSQLite(t)
+	aid := "by-id-test.example"
+
+	// 写入两条 prekey，分属不同 device
+	if err := ks.SaveE2EEPrekey(aid, "pk-A", "phone", map[string]any{
+		"private_key_pem": "PEM-A",
+		"created_at":      int64(1700000000000),
+	}); err != nil {
+		t.Fatalf("SaveE2EEPrekey(A) 失败: %v", err)
+	}
+	if err := ks.SaveE2EEPrekey(aid, "pk-B", "laptop", map[string]any{
+		"private_key_pem": "PEM-B",
+		"created_at":      int64(1700000000001),
+	}); err != nil {
+		t.Fatalf("SaveE2EEPrekey(B) 失败: %v", err)
+	}
+
+	// 命中：不限 device，按 prekey_id 单查
+	got, err := ks.LoadE2EEPrekeyByID(aid, "pk-A")
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeyByID(pk-A) 失败: %v", err)
+	}
+	if got == nil {
+		t.Fatal("LoadE2EEPrekeyByID(pk-A) 应命中")
+	}
+	if got["private_key_pem"] != "PEM-A" {
+		t.Errorf("LoadE2EEPrekeyByID(pk-A) PEM 不匹配: %v", got["private_key_pem"])
+	}
+
+	got, err = ks.LoadE2EEPrekeyByID(aid, "pk-B")
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeyByID(pk-B) 失败: %v", err)
+	}
+	if got == nil || got["private_key_pem"] != "PEM-B" {
+		t.Errorf("LoadE2EEPrekeyByID(pk-B) 应命中且 PEM 匹配")
+	}
+
+	// 未命中：未知 prekey_id
+	got, err = ks.LoadE2EEPrekeyByID(aid, "pk-missing")
+	if err != nil {
+		t.Fatalf("LoadE2EEPrekeyByID(pk-missing) 失败: %v", err)
+	}
+	if got != nil {
+		t.Errorf("LoadE2EEPrekeyByID(pk-missing) 未命中应返回 nil，实际: %v", got)
+	}
+}
+
 // ── Group Secret 持久化测试 ──────────────────────────────
 
 // TestGroupSecretPersistence 验证 group secret 持久化

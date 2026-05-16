@@ -1,8 +1,12 @@
 // ── IndexedDB KeyStore 实现 ──────────────────────────────
 
 import { pemToArrayBuffer } from '../crypto.js';
+import type { ModuleLogger } from '../logger.js';
 import { normalizeInstanceId } from '../config.js';
 import type { KeyStore, GroupStateRecord } from './index.js';
+
+const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+
 import {
   isJsonObject,
   type GroupOldEpochRecord,
@@ -440,6 +444,9 @@ async function idbDelete(storeName: string, key: string): Promise<void> {
  * - 若检测到旧版本把结构化数据写进了 metadata，会自动迁移到结构化 store。
  */
 export class IndexedDBKeyStore implements KeyStore {
+  private _log: ModuleLogger = _noopLog;
+  setLogger(log: ModuleLogger): void { this._log = log; }
+
   private static _aidTails = new Map<string, Promise<void>>();
 
   /** 私钥加密种子；为空时降级为明文存储（向后兼容） */
@@ -474,26 +481,35 @@ export class IndexedDBKeyStore implements KeyStore {
   }
 
   async listIdentities(): Promise<string[]> {
-    const records = await idbGetAll<JsonObject | string>(STORE_METADATA);
-    const aids = new Set<string>();
-    for (const item of records) {
-      if (item.key.startsWith('_seq_|')) continue;
-      const value = item.value;
-      const aid = typeof value === 'object' && value !== null && isRecord(value) && typeof value.aid === 'string' && value.aid
-        ? value.aid
-        : item.key;
-      aids.add(String(aid));
-    }
+    const tStart = Date.now();
+    this._log.debug('listIdentities enter');
+    try {
+      const records = await idbGetAll<JsonObject | string>(STORE_METADATA);
+      const aids = new Set<string>();
+      for (const item of records) {
+        if (item.key.startsWith('_seq_|')) continue;
+        const value = item.value;
+        const aid = typeof value === 'object' && value !== null && isRecord(value) && typeof value.aid === 'string' && value.aid
+          ? value.aid
+          : item.key;
+        aids.add(String(aid));
+      }
 
-    for (const item of await idbGetAll<JsonObject>(STORE_KEY_PAIRS)) {
-      if (!item.key.startsWith('_seq_|')) aids.add(item.key);
+      for (const item of await idbGetAll<JsonObject>(STORE_KEY_PAIRS)) {
+        if (!item.key.startsWith('_seq_|')) aids.add(item.key);
+      }
+      for (const item of await idbGetAll<string>(STORE_CERTS)) {
+        if (item.key.startsWith('_seq_|')) continue;
+        const [safe] = item.key.split('|', 1);
+        if (safe) aids.add(safe);
+      }
+      const result = [...aids].sort();
+      this._log.debug(`listIdentities exit: elapsed=${Date.now() - tStart}ms count=${result.length}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`listIdentities exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    for (const item of await idbGetAll<string>(STORE_CERTS)) {
-      if (item.key.startsWith('_seq_|')) continue;
-      const [safe] = item.key.split('|', 1);
-      if (safe) aids.add(safe);
-    }
-    return [...aids].sort();
   }
 
   // ── 密钥对 ──────────────────────────────────────────
@@ -510,7 +526,7 @@ export class IndexedDBKeyStore implements KeyStore {
         result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
         delete result._encrypted_pk;
       } catch {
-        console.error(`[keystore] 解密 ${aid} 私钥失败，可能 encryptionSeed 不匹配`);
+        this._log.error(`[keystore] decrypt ${aid} private keyfailed, maybe encryptionSeed mismatch`);
       }
     } else if (
       // 透明迁移：旧版明文数据自动加密回写
@@ -538,18 +554,32 @@ export class IndexedDBKeyStore implements KeyStore {
   // ── 证书 ──────────────────────────────────────────
 
   async loadCert(aid: string, certFingerprint?: string): Promise<string | null> {
-    const normalized = normalizeCertFingerprint(certFingerprint);
-    if (normalized) {
-      const versioned = await idbGet(STORE_CERTS, certStoreKey(aid, normalized));
-      if (typeof versioned === 'string') return versioned;
-      const active = await idbGet(STORE_CERTS, certStoreKey(aid));
-      if (typeof active === 'string' && await fingerprintFromCertPem(active) === normalized) {
-        return active;
+    const tStart = Date.now();
+    this._log.debug(`loadCert enter: aid=${aid} fingerprint=${certFingerprint ?? '<none>'}`);
+    try {
+      const normalized = normalizeCertFingerprint(certFingerprint);
+      if (normalized) {
+        const versioned = await idbGet(STORE_CERTS, certStoreKey(aid, normalized));
+        if (typeof versioned === 'string') {
+          this._log.debug(`loadCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} found=true source=versioned`);
+          return versioned;
+        }
+        const active = await idbGet(STORE_CERTS, certStoreKey(aid));
+        if (typeof active === 'string' && await fingerprintFromCertPem(active) === normalized) {
+          this._log.debug(`loadCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} found=true source=active`);
+          return active;
+        }
+        this._log.debug(`loadCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} found=false`);
+        return null;
       }
-      return null;
+      const data = await idbGet(STORE_CERTS, certStoreKey(aid));
+      const found = typeof data === 'string';
+      this._log.debug(`loadCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} found=${found}`);
+      return found ? data as string : null;
+    } catch (err) {
+      this._log.debug(`loadCert exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    const data = await idbGet(STORE_CERTS, certStoreKey(aid));
-    return typeof data === 'string' ? data : null;
   }
 
   async saveCert(
@@ -558,15 +588,24 @@ export class IndexedDBKeyStore implements KeyStore {
     certFingerprint?: string,
     opts?: { makeActive?: boolean },
   ): Promise<void> {
-    const normalized = normalizeCertFingerprint(certFingerprint);
-    if (normalized) {
-      await idbPut(STORE_CERTS, certStoreKey(aid, normalized), certPem);
-      if (opts?.makeActive) {
-        await idbPut(STORE_CERTS, certStoreKey(aid), certPem);
+    const tStart = Date.now();
+    this._log.debug(`saveCert enter: aid=${aid} fingerprint=${certFingerprint ?? '<none>'} make_active=${opts?.makeActive ?? false}`);
+    try {
+      const normalized = normalizeCertFingerprint(certFingerprint);
+      if (normalized) {
+        await idbPut(STORE_CERTS, certStoreKey(aid, normalized), certPem);
+        if (opts?.makeActive) {
+          await idbPut(STORE_CERTS, certStoreKey(aid), certPem);
+        }
+        this._log.debug(`saveCert exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+        return;
       }
-      return;
+      await idbPut(STORE_CERTS, certStoreKey(aid), certPem);
+      this._log.debug(`saveCert exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+    } catch (err) {
+      this._log.debug(`saveCert exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
-    await idbPut(STORE_CERTS, certStoreKey(aid), certPem);
   }
 
   // ── 实例态 ──────────────────────────────────────────
@@ -603,71 +642,88 @@ export class IndexedDBKeyStore implements KeyStore {
   // ── 身份信息（组合操作） ──────────────────────────
 
   async loadIdentity(aid: string): Promise<IdentityRecord | null> {
-    return this._withAidLock(aid, async () => {
-      const [keyPair, cert] = await Promise.all([
-        this._loadKeyPairUnlocked(aid),
-        this._loadCertUnlocked(aid),
-      ]);
-      // 直接读取 metadata KV（含旧数据迁移）
-      const metadataOnly = await this._migrateLegacyStructuredStateUnlocked(aid);
-      const hasMeta = Object.keys(metadataOnly).length > 0;
+    const tStart = Date.now();
+    this._log.debug(`loadIdentity enter: aid=${aid}`);
+    try {
+      const result = await this._withAidLock(aid, async () => {
+        const [keyPair, cert] = await Promise.all([
+          this._loadKeyPairUnlocked(aid),
+          this._loadCertUnlocked(aid),
+        ]);
+        // 直接读取 metadata KV（含旧数据迁移）
+        const metadataOnly = await this._migrateLegacyStructuredStateUnlocked(aid);
+        const hasMeta = Object.keys(metadataOnly).length > 0;
 
-      if (!keyPair && !cert && !hasMeta) return null;
+        if (!keyPair && !cert && !hasMeta) return null;
 
-      const identity: IdentityRecord = {};
-      if (hasMeta) Object.assign(identity, metadataOnly);
-      if (keyPair) Object.assign(identity, keyPair);
-      if (cert) {
-        // key/cert 公钥一致性校验：防止 cert 被意外覆盖
-        const localPubB64 = keyPair?.public_key_der_b64;
-        if (typeof localPubB64 === 'string' && localPubB64) {
-          const certSpkiB64 = extractSpkiB64FromCertPem(cert);
-          if (certSpkiB64 && certSpkiB64 !== localPubB64) {
-            console.error(`[keystore] 身份 ${aid} 的 key 公钥与 cert 公钥不匹配，丢弃 cert`);
+        const identity: IdentityRecord = {};
+        if (hasMeta) Object.assign(identity, metadataOnly);
+        if (keyPair) Object.assign(identity, keyPair);
+        if (cert) {
+          // key/cert 公钥一致性校验：防止 cert 被意外覆盖
+          const localPubB64 = keyPair?.public_key_der_b64;
+          if (typeof localPubB64 === 'string' && localPubB64) {
+            const certSpkiB64 = extractSpkiB64FromCertPem(cert);
+            if (certSpkiB64 && certSpkiB64 !== localPubB64) {
+              this._log.error(`[keystore] identity ${aid}  key public key mismatches cert public key, discard cert`);
+            } else {
+              identity.cert = cert;
+            }
           } else {
             identity.cert = cert;
           }
-        } else {
-          identity.cert = cert;
         }
-      }
-      return identity;
-    });
+        return identity;
+      });
+      this._log.debug(`loadIdentity exit: elapsed=${Date.now() - tStart}ms aid=${aid} found=${result !== null}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`loadIdentity exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   async saveIdentity(aid: string, identity: IdentityRecord): Promise<void> {
-    await this._withAidLock(aid, async () => {
-      const keyPairFields: KeyPairRecord = {};
-      for (const key of ['private_key_pem', 'public_key_der_b64', 'curve']) {
-        if (key in identity) keyPairFields[key] = identity[key];
-      }
-      if (Object.keys(keyPairFields).length > 0) {
-        await this._saveKeyPairUnlocked(aid, keyPairFields);
-      }
-
-      const cert = identity.cert;
-      if (typeof cert === 'string' && cert) {
-        await this._saveCertUnlocked(aid, cert);
-      }
-
-      const metadataFields: MetadataRecord = {};
-      for (const [key, value] of Object.entries(identity)) {
-        if (!['private_key_pem', 'public_key_der_b64', 'curve', 'cert'].includes(key)) {
-          metadataFields[key] = value;
+    const tStart = Date.now();
+    this._log.debug(`saveIdentity enter: aid=${aid} has_cert=${!!identity.cert}`);
+    try {
+      await this._withAidLock(aid, async () => {
+        const keyPairFields: KeyPairRecord = {};
+        for (const key of ['private_key_pem', 'public_key_der_b64', 'curve']) {
+          if (key in identity) keyPairFields[key] = identity[key];
         }
-      }
-
-      // 增量保存 metadata 字段
-      if (Object.keys(metadataFields).length > 0) {
-        await this._replaceStructuredStateUnlocked(aid, metadataFields);
-        const plain = stripStructuredFields(metadataFields);
-        if (Object.keys(plain).length > 0) {
-          const current = await this._migrateLegacyStructuredStateUnlocked(aid);
-          Object.assign(current, plain);
-          await this._saveMetadataOnlyUnlocked(aid, current);
+        if (Object.keys(keyPairFields).length > 0) {
+          await this._saveKeyPairUnlocked(aid, keyPairFields);
         }
-      }
-    });
+
+        const cert = identity.cert;
+        if (typeof cert === 'string' && cert) {
+          await this._saveCertUnlocked(aid, cert);
+        }
+
+        const metadataFields: MetadataRecord = {};
+        for (const [key, value] of Object.entries(identity)) {
+          if (!['private_key_pem', 'public_key_der_b64', 'curve', 'cert'].includes(key)) {
+            metadataFields[key] = value;
+          }
+        }
+
+        // 增量保存 metadata 字段
+        if (Object.keys(metadataFields).length > 0) {
+          await this._replaceStructuredStateUnlocked(aid, metadataFields);
+          const plain = stripStructuredFields(metadataFields);
+          if (Object.keys(plain).length > 0) {
+            const current = await this._migrateLegacyStructuredStateUnlocked(aid);
+            Object.assign(current, plain);
+            await this._saveMetadataOnlyUnlocked(aid, current);
+          }
+        }
+      });
+      this._log.debug(`saveIdentity exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+    } catch (err) {
+      this._log.debug(`saveIdentity exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   // ── 结构化 prekeys ───────────────────────────────────
@@ -676,6 +732,23 @@ export class IndexedDBKeyStore implements KeyStore {
     return this._withAidLock(aid, async () => {
       await this._migrateLegacyStructuredStateUnlocked(aid);
       return this._loadPrekeysUnlocked(aid, String(deviceId ?? '').trim());
+    });
+  }
+
+  /**
+   * 按 prekey_id 单点查询本地 prekey（O(log N) IndexedDB primary-key 查找）。
+   *
+   * 解密入站消息时，envelope 里只带 prekey_id，没有 device_id。原先要走
+   * `loadE2EEPrekeys` 全量加载（prekey 池大时一次扫描数百毫秒）。
+   * 本方法优先用 IndexedDB 主键直查；命中则 O(log N)，未命中再回退到前缀扫描，
+   * 保证跨 device_id 也能找到（兼容设备级 prekey 场景）。
+   *
+   * 返回结构与 `_loadPrekeysUnlocked` 单条值一致（已剥离 prekey_id / device_id 字段）。
+   */
+  async loadE2EEPrekeyById(aid: string, prekeyId: string): Promise<Record<string, unknown> | null> {
+    return this._withAidLock(aid, async () => {
+      await this._migrateLegacyStructuredStateUnlocked(aid);
+      return this._loadPrekeyByIdUnlocked(aid, prekeyId);
     });
   }
 
@@ -894,6 +967,41 @@ export class IndexedDBKeyStore implements KeyStore {
     });
   }
 
+  /**
+   * 读取单个 metadata KV（如 gateway_url 等跨进程缓存项）。
+   *
+   * 不存在时返回空字符串，与 Python keystore 的 get_metadata 语义保持一致。
+   */
+  async getMetadata(aid: string, key: string): Promise<string> {
+    if (!key) return '';
+    return this._withAidLock(aid, async () => {
+      const md = (await this._loadMetadataOnlyUnlocked(aid)) ?? {};
+      const value = (md as Record<string, unknown>)[key];
+      if (typeof value === 'string') return value;
+      if (value === null || value === undefined) return '';
+      return String(value);
+    });
+  }
+
+  /**
+   * 写入单个 metadata KV。空字符串视为删除该字段。
+   *
+   * 与 _saveMetadataOnlyUnlocked 不同，本方法只更新指定 key，不影响其他字段。
+   */
+  async setMetadata(aid: string, key: string, value: string): Promise<void> {
+    if (!key) return;
+    await this._withAidLock(aid, async () => {
+      const current = (await this._loadMetadataOnlyUnlocked(aid)) ?? {};
+      const next = deepClone(current) as Record<string, unknown>;
+      if (value === '' || value === undefined || value === null) {
+        delete next[key];
+      } else {
+        next[key] = value;
+      }
+      await this._saveMetadataOnlyUnlocked(aid, next as MetadataRecord);
+    });
+  }
+
   // ── 内部辅助 ─────────────────────────────────────────
 
   private async _loadKeyPairUnlocked(aid: string): Promise<KeyPairRecord | null> {
@@ -907,7 +1015,7 @@ export class IndexedDBKeyStore implements KeyStore {
         result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
         delete result._encrypted_pk;
       } catch {
-        console.error(`[keystore] 解密 ${aid} 私钥失败，可能 encryptionSeed 不匹配`);
+        this._log.error(`[keystore] decrypt ${aid} private keyfailed, maybe encryptionSeed mismatch`);
       }
     } else if (
       // 透明迁移：旧版明文数据自动加密回写
@@ -1057,6 +1165,47 @@ export class IndexedDBKeyStore implements KeyStore {
     }
 
     return result;
+  }
+
+  /**
+   * 按 prekey_id 单点查找（不锁外部，调用方负责加锁）。
+   *
+   * 实现策略：
+   * 1) 先按"无 device_id"的 canonical key 直查（命中即 O(log N)）。
+   * 2) 未命中（设备级 prekey 走的是含 device_id 的复合 key）→ 回退前缀扫描，
+   *    在 prekey_id 字段匹配的第一条记录上返回；这种情况下扫描代价仍存在，但
+   *    只在边缘 case 触发。
+   *
+   * 返回结构与 `_loadPrekeysUnlocked` 单条值保持一致：剥离 prekey_id / device_id。
+   */
+  private async _loadPrekeyByIdUnlocked(
+    aid: string,
+    prekeyId: string,
+  ): Promise<Record<string, unknown> | null> {
+    if (!prekeyId) return null;
+
+    // 优先：deviceId='' 形态的 canonical key（generatePrekey 默认走这条路径）。
+    const directKey = prekeyStoreKey(aid, prekeyId, '');
+    const direct = await idbGet<JsonObject>(STORE_PREKEYS, directKey);
+    if (isRecord(direct)) {
+      const record = deepClone(direct);
+      delete record.prekey_id;
+      delete record.device_id;
+      return record;
+    }
+
+    // 回退：设备级 prekey（key 形如 aid|device|prekey_id）→ 前缀扫描匹配 prekey_id 字段。
+    for (const item of await idbGetAllByPrefix<JsonObject>(STORE_PREKEYS, prekeyPrefix(aid))) {
+      if (!isRecord(item.value)) continue;
+      const itemPrekeyId = typeof item.value.prekey_id === 'string' ? item.value.prekey_id : '';
+      if (itemPrekeyId !== prekeyId) continue;
+      const record = deepClone(item.value);
+      delete record.prekey_id;
+      delete record.device_id;
+      return record;
+    }
+
+    return null;
   }
 
   private async _replacePrekeysUnlocked(
@@ -1651,6 +1800,11 @@ export class IndexedDBKeyStore implements KeyStore {
       }
     }
     return result;
+  }
+
+  async deleteSeq(aid: string, deviceId: string, slotId: string, namespace: string): Promise<void> {
+    const key = seqTrackerStoreKey(aid, deviceId, slotId, namespace);
+    await idbDelete(STORE_INSTANCE_STATE, key);
   }
 
   // ── Group State（群组状态快照） ─────────────────────────────

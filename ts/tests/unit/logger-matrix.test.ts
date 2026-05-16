@@ -10,6 +10,9 @@ vi.mock('fs', async () => {
     readdirSync: vi.fn().mockReturnValue([]),
     statSync: vi.fn(),
     unlinkSync: vi.fn(),
+    // 测试隔离：避免读真实 ~/.aun/log.ini 影响行为
+    existsSync: vi.fn().mockReturnValue(false),
+    readFileSync: vi.fn(),
   };
 });
 

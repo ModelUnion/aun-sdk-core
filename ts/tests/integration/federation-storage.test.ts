@@ -69,7 +69,7 @@ async function waitFor<T>(
   throw new Error(`${label} 超时: ${JSON.stringify(lastValue)}`);
 }
 
-async function downloadBytes(urlText: string): Promise<Buffer> {
+async function downloadBytes(urlText: string, redirectsLeft: number = 5): Promise<Buffer> {
   const parsed = new URL(urlText);
   const mod = parsed.protocol === 'https:' ? https : http;
   const options = parsed.protocol === 'https:'
@@ -79,6 +79,22 @@ async function downloadBytes(urlText: string): Promise<Buffer> {
   return await new Promise<Buffer>((resolve, reject) => {
     const req = mod.get(urlText, options, (res) => {
       const statusCode = res.statusCode ?? 0;
+      // 跨域 storage 代理通过 302/301/307/308 重定向到真实下载 URL，需要跟随
+      if ([301, 302, 303, 307, 308].includes(statusCode)) {
+        const location = res.headers['location'];
+        res.resume();
+        if (!location) {
+          reject(new Error(`HTTP ${statusCode} without Location from ${urlText}`));
+          return;
+        }
+        if (redirectsLeft <= 0) {
+          reject(new Error(`too many redirects starting from ${urlText}`));
+          return;
+        }
+        const nextUrl = new URL(location, urlText).toString();
+        downloadBytes(nextUrl, redirectsLeft - 1).then(resolve, reject);
+        return;
+      }
       if (statusCode < 200 || statusCode >= 300) {
         reject(new Error(`HTTP ${statusCode} from ${urlText}`));
         res.resume();

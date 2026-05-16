@@ -46,7 +46,12 @@ func (d *GatewayDiscovery) LastHealthy() *bool {
 }
 
 // CheckHealth 向 gatewayURL 对应的 /health 端点发送 GET 请求，检查网关可用性。
-func (d *GatewayDiscovery) CheckHealth(ctx context.Context, gatewayURL string, timeout time.Duration) bool {
+func (d *GatewayDiscovery) CheckHealth(ctx context.Context, gatewayURL string, timeout time.Duration) (ok bool) {
+	tStart := time.Now()
+	pkgLogDiscovery().Debug("CheckHealth enter: gateway=%s timeout=%v", gatewayURL, timeout)
+	defer func() {
+		pkgLogDiscovery().Debug("CheckHealth exit: gateway=%s ok=%v elapsed=%dms", gatewayURL, ok, time.Since(tStart).Milliseconds())
+	}()
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
@@ -67,13 +72,19 @@ func (d *GatewayDiscovery) CheckHealth(ctx context.Context, gatewayURL string, t
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, healthURL, nil)
-	ok := false
 	if err == nil {
 		resp, err := d.httpClient().Do(req)
 		if err == nil {
 			resp.Body.Close()
 			ok = resp.StatusCode == http.StatusOK
+		} else {
+			pkgLogDiscovery().Warn("health check request failed: url=%s err=%v", healthURL, err)
 		}
+	}
+	if ok {
+		pkgLogDiscovery().Debug("health check passed: gateway=%s", gatewayURL)
+	} else {
+		pkgLogDiscovery().Warn("health check failed: gateway=%s", gatewayURL)
 	}
 	d.lastHealthy.Store(&ok)
 	return ok
@@ -81,7 +92,16 @@ func (d *GatewayDiscovery) CheckHealth(ctx context.Context, gatewayURL string, t
 
 // Discover 从 well-known URL 发现 Gateway
 // 返回优先级最高的 Gateway WebSocket URL
-func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, timeout time.Duration) (string, error) {
+func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, timeout time.Duration) (gatewayURL string, err error) {
+	tStart := time.Now()
+	pkgLogDiscovery().Debug("Discover enter: well_known=%s timeout=%v", wellKnownURL, timeout)
+	defer func() {
+		if err != nil {
+			pkgLogDiscovery().Debug("Discover exit (error): elapsed=%dms err=%v", time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogDiscovery().Debug("Discover exit: gateway=%s elapsed=%dms", gatewayURL, time.Since(tStart).Milliseconds())
+		}
+	}()
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
@@ -91,32 +111,36 @@ func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, ti
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, wellKnownURL, nil)
 	if err != nil {
+		pkgLogDiscovery().Error("gateway discovery request creation failed: url=%s err=%v", wellKnownURL, err)
 		return "", NewConnectionError(
-			fmt.Sprintf("gateway 发现请求创建失败 (%s): %v", wellKnownURL, err),
+			fmt.Sprintf("gateway discovery request creation failed (%s): %v", wellKnownURL, err),
 			WithRetryable(true),
 		)
 	}
 
 	resp, err := d.httpClient().Do(req)
 	if err != nil {
+		pkgLogDiscovery().Error("gateway discovery request failed: url=%s err=%v", wellKnownURL, err)
 		return "", NewConnectionError(
-			fmt.Sprintf("gateway 发现失败 (%s): %v", wellKnownURL, err),
+			fmt.Sprintf("gateway discovery failed (%s): %v", wellKnownURL, err),
 			WithRetryable(true),
 		)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		pkgLogDiscovery().Error("gateway discovery returned non-200 status: url=%s status=%d", wellKnownURL, resp.StatusCode)
 		return "", NewConnectionError(
-			fmt.Sprintf("gateway 发现失败 (%s): HTTP %d", wellKnownURL, resp.StatusCode),
+			fmt.Sprintf("gateway discovery failed (%s): HTTP %d", wellKnownURL, resp.StatusCode),
 			WithRetryable(true),
 		)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		pkgLogDiscovery().Error("failed to read gateway discovery response: url=%s err=%v", wellKnownURL, err)
 		return "", NewConnectionError(
-			fmt.Sprintf("读取 gateway 发现响应失败 (%s): %v", wellKnownURL, err),
+			fmt.Sprintf("failed to read gateway discovery response (%s): %v", wellKnownURL, err),
 			WithRetryable(true),
 		)
 	}
@@ -125,11 +149,13 @@ func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, ti
 		Gateways []gatewayEntry `json:"gateways"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", NewValidationError(fmt.Sprintf("解析 well-known 响应失败: %v", err))
+		pkgLogDiscovery().Error("failed to parse well-known response: url=%s err=%v", wellKnownURL, err)
+		return "", NewValidationError(fmt.Sprintf("failed to parse well-known response: %v", err))
 	}
 
 	if len(payload.Gateways) == 0 {
-		return "", NewValidationError("well-known 返回空的 gateways 列表")
+		pkgLogDiscovery().Error("well-known returned empty gateways list: url=%s", wellKnownURL)
+		return "", NewValidationError("well-known returned empty gateways list")
 	}
 
 	// 按 priority 排序（升序）
@@ -147,8 +173,11 @@ func (d *GatewayDiscovery) Discover(ctx context.Context, wellKnownURL string, ti
 
 	url := payload.Gateways[0].URL
 	if url == "" {
-		return "", NewValidationError("well-known 缺少 gateway url")
+		pkgLogDiscovery().Error("well-known missing gateway url: source=%s", wellKnownURL)
+		return "", NewValidationError("well-known missing gateway url")
 	}
+
+	pkgLogDiscovery().Debug("gateway discovery succeeded: url=%s (%d candidates)", url, len(payload.Gateways))
 
 	// 发现后异步触发 health check（不阻塞）
 	go d.CheckHealth(context.Background(), url, timeout)

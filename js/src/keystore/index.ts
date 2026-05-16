@@ -50,6 +50,13 @@ export interface KeyStore {
 
   /** 加载结构化 prekeys（deviceId 可选，不传等价于 deviceId=''） */
   loadE2EEPrekeys?(aid: string, deviceId?: string): Promise<PrekeyMap>;
+  /**
+   * 按 prekey_id 单点查询（O(log N)），跳过全量扫描。
+   *
+   * 解密入站消息时，envelope 只带 prekey_id，没有 device_id。直接走单查可省去
+   * 全量加载的开销。未命中时调用方应回退到 `loadE2EEPrekeys`，保持兼容。
+   */
+  loadE2EEPrekeyById?(aid: string, prekeyId: string): Promise<Record<string, unknown> | null>;
   /** 保存单个 prekey（deviceId 可选，不传等价于 deviceId=''） */
   saveE2EEPrekey?(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): Promise<void>;
   /** 清理过期 prekeys（deviceId 可选，不传等价于 deviceId=''） */
@@ -111,10 +118,16 @@ export interface KeyStore {
   loadSeq?(aid: string, deviceId: string, slotId: string, namespace: string): Promise<number>;
   /** 加载某 device+slot 下所有 namespace 的 contiguous_seq */
   loadAllSeqs?(aid: string, deviceId: string, slotId: string): Promise<Record<string, number>>;
+  /** 删除单个 namespace 的 contiguous_seq 行 */
+  deleteSeq?(aid: string, deviceId: string, slotId: string, namespace: string): Promise<void>;
   /** 列出已存储的所有身份 AID（可选） */
   listIdentities?(): Promise<string[]>;
   /** 加载身份元数据（可选） */
   loadMetadata?(aid: string): Promise<Record<string, unknown> | null>;
+  /** 读取单个 metadata KV（可选） */
+  getMetadata?(aid: string, key: string): Promise<string>;
+  /** 写入单个 metadata KV（可选；空值视为删除） */
+  setMetadata?(aid: string, key: string, value: string): Promise<void>;
 
   /** 保存信任根列表和根证书，返回 bundle 标识 */
   saveTrustRoots?(trustList: Record<string, unknown>, rootCerts: Array<{ id?: string; cert_pem: string; fingerprint_sha256?: string }>): Promise<string>;
