@@ -6,3 +6,4 @@ export {
 } from './ecdh';
 export { hkdfSha256 } from './hkdf';
 export { aesGcmEncrypt, aesGcmDecrypt } from './aead';
+export { ecdsaSignRaw, ecdsaVerifyRaw } from './ecdsa';
