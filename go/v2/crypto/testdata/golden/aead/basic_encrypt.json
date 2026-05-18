@@ -1,0 +1,9 @@
+{
+  "description": "AES-256-GCM basic encryption",
+  "key_hex": "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308",
+  "nonce_hex": "cafebabefacedbaddecaf888",
+  "plaintext_b64": "aGVsbG8gYXVuIHYyIGUyZWU=",
+  "aad_b64": "eyJmcm9tIjoiYWxpY2UuYWlkIiwidG8iOiJib2IuYWlkIn0=",
+  "expected_ciphertext_b64": "43mfuQ7yGpc/BkhUpRRWgoc=",
+  "expected_tag_b64": "UtDtOk/nNEz3dbEUj2WzfA=="
+}
