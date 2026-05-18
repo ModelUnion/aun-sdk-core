@@ -4,3 +4,4 @@ export {
   generateP256Keypair,
   privateToPublicDer,
 } from './ecdh';
+export { hkdfSha256 } from './hkdf';
