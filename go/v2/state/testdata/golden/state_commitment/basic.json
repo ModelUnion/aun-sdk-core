@@ -1,0 +1,52 @@
+{
+  "description": "Basic state_commitment with 2 members",
+  "group_id": "g-test-group.agentid.pub",
+  "epoch": 12,
+  "state_payload": {
+    "members": [
+      {
+        "aid": "alice.agentid.pub",
+        "devices": [
+          {
+            "device_id": "dev-a1",
+            "fp": "sha256:fp_alice"
+          }
+        ]
+      },
+      {
+        "aid": "bob.agentid.pub",
+        "devices": [
+          {
+            "device_id": "dev-b1",
+            "fp": "sha256:fp_bob_b1"
+          },
+          {
+            "device_id": "dev-b2",
+            "fp": "sha256:fp_bob_b2"
+          }
+        ]
+      }
+    ],
+    "audit_aids": [
+      "audit1.regulator.pub"
+    ],
+    "join_policy_hash": null,
+    "admin_set": {
+      "admin_aids": [
+        "alice.agentid.pub"
+      ],
+      "threshold": 1
+    },
+    "recovery_quorum": {
+      "trigger": "all_admins_offline_30d",
+      "quorum_aids": [
+        "alice.agentid.pub",
+        "bob.agentid.pub"
+      ],
+      "threshold": 2
+    },
+    "history_policy": "none",
+    "wrap_protocol": "3DH"
+  },
+  "expected_commitment_hex": "df10b503be42c3c6cd141b152cc9cfdd97b0b61f09b0f99c4bc75bb8394aebfd"
+}
