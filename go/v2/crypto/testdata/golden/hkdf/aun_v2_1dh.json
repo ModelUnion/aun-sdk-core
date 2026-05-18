@@ -1,0 +1,8 @@
+{
+  "description": "HKDF with AUN-V2-1DH info",
+  "ikm_b64": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=",
+  "salt_b64": "u7u7u7u7u7u7u7u7u7u7uw==",
+  "info": "AUN-V2-1DH",
+  "length": 32,
+  "expected_okm_b64": "Qh2P9Y0+0PR8UIUUH8DDTSjOEtQ9b1L7iPhL/7vKLas="
+}

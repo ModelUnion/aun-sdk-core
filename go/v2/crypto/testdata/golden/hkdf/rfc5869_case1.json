@@ -1,0 +1,8 @@
+{
+  "description": "RFC 5869 Test Case 1",
+  "ikm_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+  "salt_hex": "000102030405060708090a0b0c",
+  "info_hex": "f0f1f2f3f4f5f6f7f8f9",
+  "length": 42,
+  "expected_okm_b64": "PLJfJfqs1XqQQ09k0DYvKi0tCpDPGlpMXbAtVuzExb80AHII1biHGFhl"
+}
