@@ -12,6 +12,7 @@
  */
 
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { join } from 'node:path';
@@ -149,6 +150,7 @@ interface ConnectParams extends RpcParams {
 interface AuthContext extends JsonObject {
   identity?: IdentityRecord;
   token?: string;
+  hello?: JsonObject;
 }
 
 interface MemberRecord extends JsonObject {
@@ -186,7 +188,7 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
   },
   timeouts: {
     connect: 5.0,
-    call: 10.0,
+    call: 35.0,
     http: 30.0,
   },
 };
@@ -199,6 +201,19 @@ const GROUP_ROTATION_RETRY_MAX_DELAY_MS = 300_000;
 const PENDING_DECRYPT_LIMIT = 100;
 const PUSHED_SEQS_LIMIT = 50_000;
 const PENDING_ORDERED_LIMIT = 50_000;
+
+// 心跳间隔下/上限（秒）。0 = 关闭心跳；负值视为 0；其余值 clamp 到 [10, 600]。
+// 服务端通过 hello.heartbeat_interval 与 meta.ping pong 中的同名字段下发。
+const HEARTBEAT_MIN_INTERVAL_SECONDS = 10;
+const HEARTBEAT_MAX_INTERVAL_SECONDS = 600;
+
+function clampHeartbeatInterval(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  if (n < HEARTBEAT_MIN_INTERVAL_SECONDS) return HEARTBEAT_MIN_INTERVAL_SECONDS;
+  if (n > HEARTBEAT_MAX_INTERVAL_SECONDS) return HEARTBEAT_MAX_INTERVAL_SECONDS;
+  return n;
+}
 
 // P1-23: 非幂等方法使用更长超时（35s），避免 SDK 10s 超时 < gateway 30s 处理时间
 const NON_IDEMPOTENT_TIMEOUT_MS = 35_000;
@@ -503,6 +518,7 @@ export class AUNClient {
   /** 当前实例上下文 */
   private _deviceId: string;
   private _slotId: string;
+  private _connectedAt: number = 0;
   private _connectDeliveryMode: JsonObject;
   private _defaultConnectDeliveryMode: JsonObject;
 
@@ -514,14 +530,20 @@ export class AUNClient {
   // 当前活跃 prekey：只有这个 prekey 被消费时才触发 replenish 上传
   private _activePrekeyId = '';
 
+  // 本地 agent.md 文件路径与对应 etag（quoted sha256 hex，与服务端 _agent_md_etag 一致）。
+  // 由 setLocalAgentMdPath() 设置；用于跟服务端 RPC 注入的 _meta.agent_md_etag 比对，
+  // 触发"本地未发布到服务端"或"服务端版本更新"的 UI 提示。
+  private _localAgentMdPath: string = '';
+  private _localAgentMdEtag: string = '';
+  // gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
+  private _remoteAgentMdEtag: string = '';
+
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
   private _seqTrackerContext: string | null = null;
 
   /** 惰性群同步：已同步过的 group_id 集合 */
   private _groupSynced: Set<string> = new Set();
-  /** 惰性 P2P 同步：是否已同步过 */
-  private _p2pSynced = false;
 
   /** 补洞去重：已完成/进行中的 key -> 开始时间戳，防止重复 pull 同一区间 */
   private _gapFillDone: Map<string, number> = new Map();
@@ -613,6 +635,7 @@ export class AUNClient {
       verifySsl: this._configModel.verifySsl,
       logger: this._logger.for('aun_core.transport'),
     });
+    this._transport.setMetaObserver((meta) => this._observeRpcMeta(meta));
 
     this._e2ee = new E2EEManager({
       identityFn: () => this._identity ?? {},
@@ -654,6 +677,67 @@ export class AUNClient {
   /** 当前 AID */
   get aid(): string | null {
     return this._aid;
+  }
+
+  /**
+   * 记录本地 agent.md 文件路径并一次性计算 etag（quoted sha256，与服务端一致）。
+   *
+   * - path 为空字符串：清除本地 path 与 etag。
+   * - 文件不存在 / 读取失败：清除 etag 并返回空串，不抛异常（应用可读 getLocalAgentMdEtag()
+   *   为空判断）。
+   * - 浏览器环境无文件系统：直接返回空串，记录 warn 日志。
+   * - 文件变更后需要重新调用 setLocalAgentMdPath() 触发重算（按设计：设置时一次性计算）。
+   *
+   * 返回当前 etag（quoted hex 或空串）。
+   */
+  setLocalAgentMdPath(path: string): string {
+    const rawPath = String(path ?? '').trim();
+    if (!rawPath) {
+      this._localAgentMdPath = '';
+      this._localAgentMdEtag = '';
+      return '';
+    }
+    // 浏览器环境没有 fs，直接退回空串。Node 环境才尝试读文件。
+    const isNode = typeof process !== 'undefined' && !!process.versions?.node;
+    if (!isNode) {
+      this._clientLog.warn(`setLocalAgentMdPath skipped: not running in Node.js (path=${rawPath})`);
+      this._localAgentMdPath = rawPath;
+      this._localAgentMdEtag = '';
+      return '';
+    }
+    this._localAgentMdPath = rawPath;
+    try {
+      const data = fs.readFileSync(rawPath);
+      const digest = crypto.createHash('sha256').update(data).digest('hex');
+      this._localAgentMdEtag = `"${digest}"`;
+    } catch (err) {
+      this._clientLog.warn(`setLocalAgentMdPath 读取失败 path=${rawPath} err=${err instanceof Error ? err.message : String(err)}`);
+      this._localAgentMdEtag = '';
+    }
+    return this._localAgentMdEtag;
+  }
+
+  /** 返回 setLocalAgentMdPath 计算的 etag；未设置或读取失败时返回空串。 */
+  getLocalAgentMdEtag(): string {
+    return this._localAgentMdEtag;
+  }
+
+  /**
+   * 返回 gateway 在最近一次 RPC envelope._meta 注入的服务端 agent.md etag。
+   *
+   * 未收到过则为空串；不阻塞调用，纯内存读。
+   */
+  getRemoteAgentMdEtag(): string {
+    return this._remoteAgentMdEtag;
+  }
+
+  /** transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。 */
+  private _observeRpcMeta(meta: Record<string, unknown>): void {
+    if (!meta || typeof meta !== 'object') return;
+    const etag = String(meta.agent_md_etag ?? '').trim();
+    if (etag) {
+      this._remoteAgentMdEtag = etag;
+    }
   }
 
   /** 连接状态 */
@@ -714,7 +798,7 @@ export class AUNClient {
     this._sessionOptions = this._buildSessionOptions(normalized);
     const callTimeoutSec = this._sessionOptions.timeouts.call;
     this._transport.setTimeout(
-      callTimeoutSec != null ? callTimeoutSec * 1000 : 10_000,
+      callTimeoutSec != null ? callTimeoutSec * 1000 : 35_000,
     );
     this._closing = false;
     this._clientLog.debug(`connect enter: gateway=${String(normalized.gateway ?? '')}, device_id=${this._deviceId}`);
@@ -868,6 +952,7 @@ export class AUNClient {
         return await this._sendEncrypted(p);
       }
       // encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
+      this._maybeAppendEchoTraceSend(p);
     }
 
     // 自动加密：group.send 默认加密（encrypt 默认 True）
@@ -877,6 +962,7 @@ export class AUNClient {
       if (encrypt) {
         return await this._sendGroupEncrypted(p);
       }
+      this._maybeAppendEchoTraceSend(p);
     }
     if (method === 'group.thought.put') {
       const encrypt = p.encrypt ?? true;
@@ -1163,10 +1249,8 @@ export class AUNClient {
 
     this._clientLog.debug(`_sendEncrypted enter: to=${toAid}, message_id=${messageId}`);
 
-    // 惰性同步：首次发送 P2P 消息时先 pull 一次
-    if (!this._p2pSynced) {
-      await this._lazySyncP2p();
-    }
+    // 惰性 P2P 同步由 connect/reconnect 完成后的 _fillP2pGap 异步触发，
+    // 不再在 send 路径上 await（与 C++ FillP2PGap 行为对齐，避免阻塞用户发送）。
 
     // 内部发送逻辑，refreshPeerMaterial=true 时强制清缓存重新拉取对端材料
     const sendAttempt = async (refreshPeerMaterial = false): Promise<RpcResult> => {
@@ -1181,27 +1265,13 @@ export class AUNClient {
         protectedHeaders,
       });
 
-      // 多设备过滤：只保留有有效 device_id 的可路由 prekey，
-      // 占位符 PREKEY_FALLBACK_DEVICE_ID 表示服务端未分配真实设备 ID，不可用于多设备路由
+      // 统一 multi-device 路径：必须有 routable prekey
       const routablePrekeys = recipientPrekeys.filter(pk => {
         const did = String((pk as JsonObject).device_id ?? '').trim();
         return did && did !== PREKEY_FALLBACK_DEVICE_ID;
       });
-      // 只要有 routable prekey 就走 multi_device 路径（即使只有 1 个 recipient device + 0 self copies）。
-      // 这确保服务端为每个已注册设备存储副本，离线设备重连后能 pull 到。
-      // single 路径仅在完全没有 routable prekey 时使用（legacy 兼容）。
-      const canUseMultiDevice = routablePrekeys.length > 0;
-
-      if (!canUseMultiDevice) {
-        return await this._sendEncryptedSingle({
-          toAid,
-          payload,
-          messageId,
-          timestamp,
-          prekey: routablePrekeys[0] ?? recipientPrekeys[0],
-          persistRequired,
-          protectedHeaders,
-        });
+      if (routablePrekeys.length === 0) {
+        throw new Error(`no registered device prekeys for ${toAid}, cannot send encrypted message`);
       }
 
       const recipientCopies = await this._buildRecipientDeviceCopies({
@@ -1254,49 +1324,6 @@ export class AUNClient {
     }
   }
 
-
-  private async _sendEncryptedSingle(opts: {
-    toAid: string;
-    payload: JsonObject;
-    messageId: string;
-    timestamp: number;
-    prekey?: PrekeyMaterial | null;
-    persistRequired?: boolean;
-    protectedHeaders?: ProtectedHeadersInput;
-  }): Promise<RpcResult> {
-    this._clientLog.debug(`_sendEncryptedSingle enter: to=${opts.toAid}, message_id=${opts.messageId}, has_prekey=${!!opts.prekey}, persist_required=${!!opts.persistRequired}`);
-    let prekey = opts.prekey ?? null;
-    if (!prekey) {
-      this._clientLog.debug(`_sendEncryptedSingle fetching peer prekey: to=${opts.toAid}`);
-      prekey = await this._fetchPeerPrekey(opts.toAid);
-    }
-    const peerCertFingerprint = typeof prekey?.cert_fingerprint === 'string' ? prekey.cert_fingerprint : undefined;
-    const peerCertPem = await this._fetchPeerCert(opts.toAid, peerCertFingerprint);
-    const [envelope, encryptResult] = this._encryptCopyPayload({
-      logicalToAid: opts.toAid,
-      payload: opts.payload,
-      peerCertPem,
-      prekey,
-      messageId: opts.messageId,
-      timestamp: opts.timestamp,
-      protectedHeaders: opts.protectedHeaders,
-    });
-    this._ensureEncryptResult(opts.toAid, encryptResult);
-    this._clientLog.debug(`_sendEncryptedSingle envelope built: to=${opts.toAid}, message_id=${opts.messageId}, scheme=${String((envelope as JsonObject)?.scheme ?? '')}`);
-
-    const sendParams: RpcParams = {
-      to: opts.toAid,
-      payload: envelope,
-      type: 'e2ee.encrypted',
-      encrypted: true,
-      message_id: opts.messageId,
-      timestamp: opts.timestamp,
-    };
-    if (opts.persistRequired) {
-      sendParams.persist_required = true;
-    }
-    return await this._transport.call('message.send', sendParams);
-  }
 
   private async _buildRecipientDeviceCopies(opts: {
     toAid: string;
@@ -1644,31 +1671,6 @@ export class AUNClient {
       }
     } catch (exc) {
       this._clientLog.warn(`lazy sync group ${groupId} failed: ${formatCaughtError(exc)}`);
-    }
-  }
-
-  /** 惰性同步：首次激活 P2P 通道时 pull 最近消息，建立 seq 基线 */
-  private async _lazySyncP2p(): Promise<void> {
-    this._p2pSynced = true;
-    if (!this._aid) return;
-    try {
-      const ns = `p2p:${this._aid}`;
-      const afterSeq = this._seqTracker.getContiguousSeq(ns);
-      const result = await this._transport.call('message.pull', {
-        after_seq: afterSeq,
-        limit: 200,
-      });
-      const messages = Array.isArray((result as JsonObject)?.messages) ? (result as JsonObject).messages as JsonObject[] : [];
-      for (const msg of messages) {
-        const seq = (msg as JsonObject)?.seq;
-        if (seq != null) this._seqTracker.onMessageSeq(ns, Number(seq));
-      }
-      if (messages.length > 0) {
-        this._saveSeqTrackerState();
-        this._clientLog.info(`lazy sync P2P: pull ${messages.length} messages, after_seq=${afterSeq}`);
-      }
-    } catch (exc) {
-      this._clientLog.warn(`lazy sync P2P failed: ${formatCaughtError(exc)}`);
     }
   }
 
@@ -2078,7 +2080,6 @@ export class AUNClient {
     // P2P 空洞检测
     const seq = msg.seq as number | undefined;
     if (seq !== undefined && seq !== null && this._aid) {
-      this._p2pSynced = true;  // 收到推送即视为已激活
       const ns = `p2p:${this._aid}`;
       const needPull = this._seqTracker.onMessageSeq(ns, seq);
       if (needPull) {
@@ -2409,7 +2410,61 @@ export class AUNClient {
   }
 
   private async _publishAppEvent(event: string, payload: EventPayload): Promise<void> {
+    if ((event === 'message.received' || event === 'group.message_created') && isJsonObject(payload)) {
+      this._maybeAppendEchoTraceReceive(payload as Record<string, unknown>);
+    }
+    // 注入本地/远端 agent.md etag，让应用层判断版本一致性；失败不影响业务。
+    if (isJsonObject(payload)) {
+      try {
+        const localEtag = this._localAgentMdEtag || '';
+        const remoteEtag = this._remoteAgentMdEtag || '';
+        if (localEtag || remoteEtag) {
+          const obj = payload as Record<string, unknown>;
+          if (!('_agent_md' in obj)) {
+            obj._agent_md = {
+              local_etag: localEtag,
+              remote_etag: remoteEtag,
+            };
+          }
+        }
+      } catch (err) {
+        this._clientLog.debug(`agent_md etag inject skipped: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     await this._dispatcher.publish(event, this._normalizePublishedMessagePayload(event, payload));
+  }
+
+  private _echoTimestamp(): string {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+    return `${hh}:${mm}:${ss}.${ms}`;
+  }
+
+  private _isEchoPayload(payload: unknown): payload is { text: string; [k: string]: unknown } {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    const text = (payload as Record<string, unknown>).text;
+    if (typeof text !== 'string' || text.length > 4096) return false;
+    return text.split('\n', 1)[0].toLowerCase().includes('echo');
+  }
+
+  private _maybeAppendEchoTraceSend(params: Record<string, unknown>): void {
+    const payload = params.payload;
+    if (!this._isEchoPayload(payload)) return;
+    const uptime = this._connectedAt ? Math.floor((Date.now() - this._connectedAt) / 1000) : 0;
+    const trace = `${this._echoTimestamp()} [AUN-SDK.send] aid=${this._aid ?? '-'} conn_uptime=${uptime}s`;
+    params.payload = { ...payload, text: payload.text + '\n' + trace };
+  }
+
+  private _maybeAppendEchoTraceReceive(msg: Record<string, unknown>): void {
+    if (msg.encrypted) return;
+    const payload = msg.payload;
+    if (!this._isEchoPayload(payload)) return;
+    const uptime = this._connectedAt ? Math.floor((Date.now() - this._connectedAt) / 1000) : 0;
+    const trace = `${this._echoTimestamp()} [AUN-SDK.receive] aid=${this._aid ?? '-'} conn_uptime=${uptime}s`;
+    msg.payload = { ...payload, text: payload.text + '\n' + trace };
   }
 
   private _messageTargetsCurrentInstance(message: EventPayload): boolean {
@@ -5151,7 +5206,6 @@ export class AUNClient {
     this._pendingOrderedMsgs.clear();
     this._pendingDecryptMsgs.clear();
     this._groupSynced.clear();
-    this._p2pSynced = false;
   }
 
   private _refreshSeqTrackerContext(): void {
@@ -5163,7 +5217,6 @@ export class AUNClient {
     this._pendingOrderedMsgs.clear();
     this._pendingDecryptMsgs.clear();
     this._groupSynced.clear();
-    this._p2pSynced = false;
     this._seqTrackerContext = nextContext;
   }
 
@@ -5304,9 +5357,12 @@ export class AUNClient {
               this._sessionParams.access_token = String(auth.token ?? params.access_token ?? '');
             }
           }
+          if (isJsonObject(auth.hello) && 'heartbeat_interval' in auth.hello) {
+            this._applyServerHeartbeatInterval(auth.hello.heartbeat_interval, 'auth');
+          }
         }
       } else {
-        await this._auth.initializeWithToken(
+        const hello = await this._auth.initializeWithToken(
           this._transport,
           challenge,
           String(params.access_token),
@@ -5320,9 +5376,13 @@ export class AUNClient {
           },
         );
         this._syncIdentityAfterConnect(String(params.access_token));
+        if (isJsonObject(hello) && 'heartbeat_interval' in hello) {
+          this._applyServerHeartbeatInterval(hello.heartbeat_interval, 'auth');
+        }
       }
 
       this._state = 'connected';
+      this._connectedAt = Date.now();
       this._clientLog.debug(`auth complete, connection ready: aid=${this._aid ?? ''}, gateway=${gatewayUrl}`);
       await this._dispatcher.publish('connection.state', { state: this._state, gateway: gatewayUrl });
 
@@ -5449,7 +5509,7 @@ export class AUNClient {
   private _buildSessionOptions(params: ConnectParams): SessionOptions {
     const connectionKind = String(params.connection_kind ?? 'long');
     const options: SessionOptions = {
-      auto_reconnect: connectionKind === 'short' ? false : DEFAULT_SESSION_OPTIONS.auto_reconnect,
+      auto_reconnect: DEFAULT_SESSION_OPTIONS.auto_reconnect,
       heartbeat_interval: DEFAULT_SESSION_OPTIONS.heartbeat_interval,
       token_refresh_before: DEFAULT_SESSION_OPTIONS.token_refresh_before,
       retry: { ...DEFAULT_SESSION_OPTIONS.retry },
@@ -5472,10 +5532,12 @@ export class AUNClient {
 
   /** 启动所有后台任务 */
   private _startBackgroundTasks(): void {
-    // 短连接生命周期短，禁用心跳与 token 刷新（不接收推送、不需要长期会话维护）
-    if (this._sessionOptions.connection_kind === 'short') return;
-    this._startHeartbeatTask();
-    this._startTokenRefreshTask();
+    // 短连接不启动 heartbeat 与 token 刷新（生命周期短，不需要长期会话维护）；
+    // auto_reconnect 仍允许，由 _sessionOptions.auto_reconnect 决定
+    if (this._sessionOptions.connection_kind !== 'short') {
+      this._startHeartbeatTask();
+      this._startTokenRefreshTask();
+    }
     this._startGroupEpochTasks();
   }
 
@@ -5514,11 +5576,10 @@ export class AUNClient {
   /** 启动心跳任务 */
   private _startHeartbeatTask(): void {
     if (this._heartbeatTimer !== null) return;
-    const rawIntervalSeconds = Number(
+    const interval = clampHeartbeatInterval(
       this._sessionOptions.heartbeat_interval ?? DEFAULT_SESSION_OPTIONS.heartbeat_interval,
     );
-    if (!Number.isFinite(rawIntervalSeconds) || rawIntervalSeconds <= 0) return;
-    const interval = Math.max(rawIntervalSeconds, 30) * 1000;
+    if (interval <= 0) return;
 
     // M25: 把连续失败阈值从 3 次收窄到 2 次。既能容忍一次网络抖动/GC 暂停，
     // 又把半开连接的检测延迟从 3 个心跳周期降到 2 个。
@@ -5529,8 +5590,12 @@ export class AUNClient {
 
     this._heartbeatTimer = setInterval(() => {
       if (this._closing || this._state !== 'connected') return;
-      this._transport.call('meta.ping', {}).then(() => {
+      this._transport.call('meta.ping', {}).then((pong) => {
         consecutiveFailures = 0;
+        // 服务端可在 pong 中下发新的 heartbeat_interval（秒，0=关闭）
+        if (isJsonObject(pong) && 'heartbeat_interval' in pong) {
+          this._applyServerHeartbeatInterval((pong as JsonObject).heartbeat_interval, 'pong');
+        }
       }).catch((exc) => {
         consecutiveFailures++;
         this._clientLog.warn(`heartbeat failed (${consecutiveFailures}/${maxFailures}): ${formatCaughtError(exc)}`);
@@ -5540,10 +5605,26 @@ export class AUNClient {
           this._handleTransportDisconnect(exc instanceof Error ? exc : new Error(String(exc)));
         }
       });
-    }, interval);
+    }, interval * 1000);
     // 允许 Node.js 进程在只剩定时器时退出
     if (this._heartbeatTimer && typeof this._heartbeatTimer === 'object' && 'unref' in this._heartbeatTimer) {
       (this._heartbeatTimer as NodeJS.Timer).unref();
+    }
+  }
+
+  /** 服务端通过 hello/pong 下发 heartbeat_interval；clamp 后写入 session_options 并按需重启心跳。 */
+  private _applyServerHeartbeatInterval(raw: unknown, source: 'auth' | 'pong'): void {
+    const newInterval = clampHeartbeatInterval(raw);
+    const oldInterval = clampHeartbeatInterval(this._sessionOptions.heartbeat_interval);
+    if (newInterval === oldInterval) return;
+    this._sessionOptions.heartbeat_interval = newInterval;
+    this._clientLog.debug(`heartbeat_interval updated by ${source}: ${oldInterval} -> ${newInterval}`);
+    if (this._heartbeatTimer !== null) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+    if (newInterval > 0 && this._state === 'connected' && !this._closing) {
+      this._startHeartbeatTask();
     }
   }
 

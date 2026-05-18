@@ -387,6 +387,7 @@ describe('AUNClient 证书 URL 与 prekey 指纹编排', () => {
       public_key: 'pub',
       signature: 'sig',
       cert_fingerprint: 'sha256:abc',
+      device_id: 'dev-1',
     }]);
     (client as any)._fetchPeerCert = vi.fn().mockResolvedValue('CERT');
     (client as any)._e2ee.encryptOutbound = vi.fn().mockReturnValue([
@@ -532,7 +533,7 @@ describe('AUNClient M25 重连行为', () => {
     }
   });
 
-  it('正数 heartbeat_interval 小于 30 秒时按 30 秒调度', async () => {
+  it('正数 heartbeat_interval 小于 10 秒时按 10 秒调度（M25 后阈值=2）', async () => {
     vi.useFakeTimers();
     try {
       const client = new AUNClient();
@@ -548,7 +549,7 @@ describe('AUNClient M25 重连行为', () => {
       const disconnectSpy = vi.spyOn(client as any, '_handleTransportDisconnect').mockResolvedValue(undefined);
 
       (client as any)._startHeartbeatTask();
-      await vi.advanceTimersByTimeAsync(29_999);
+      await vi.advanceTimersByTimeAsync(9_999);
       await Promise.resolve();
       expect((client as any)._transport.call).not.toHaveBeenCalled();
 
@@ -557,7 +558,7 @@ describe('AUNClient M25 重连行为', () => {
       expect((client as any)._transport.call).toHaveBeenCalledTimes(1);
       expect(disconnectSpy).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(10_000);
       await Promise.resolve();
       expect((client as any)._transport.call).toHaveBeenCalledTimes(2);
       expect(disconnectSpy).toHaveBeenCalledTimes(1);

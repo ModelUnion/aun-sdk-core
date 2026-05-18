@@ -1,0 +1,7 @@
+{
+  "description": "1DH wrap_key computation",
+  "sender_session_priv_b64": "YSJfT/BHTE6J9sDXN495hou7PdjbRqBMLvi46W0NSI4=",
+  "recv_ik_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w==",
+  "salt_b64": "7+/v7+/v7+/v7+/v7+/v7w==",
+  "expected_wrap_key_b64": "fX8kqFD/y+Kh9NsfQPvxfsaGrkZTom1oMawJoto++fs="
+}

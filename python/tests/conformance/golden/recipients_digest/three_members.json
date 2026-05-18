@@ -1,0 +1,68 @@
+{
+  "description": "3 recipients (sorted) → digest",
+  "input_rows": [
+    [
+      "alice.aid",
+      "dev-1",
+      "member",
+      "group_device_prekey",
+      "sha256:fp1",
+      "sha256:spk1",
+      "nonce1",
+      "wrap1"
+    ],
+    [
+      "audit.aid",
+      "",
+      "audit",
+      "aid_master",
+      "sha256:fp2",
+      "",
+      "nonce2",
+      "wrap2"
+    ],
+    [
+      "bob.aid",
+      "dev-2",
+      "member",
+      "group_device",
+      "sha256:fp3",
+      "",
+      "nonce3",
+      "wrap3"
+    ]
+  ],
+  "expected_sorted_rows": [
+    [
+      "alice.aid",
+      "dev-1",
+      "member",
+      "group_device_prekey",
+      "sha256:fp1",
+      "sha256:spk1",
+      "nonce1",
+      "wrap1"
+    ],
+    [
+      "audit.aid",
+      "",
+      "audit",
+      "aid_master",
+      "sha256:fp2",
+      "",
+      "nonce2",
+      "wrap2"
+    ],
+    [
+      "bob.aid",
+      "dev-2",
+      "member",
+      "group_device",
+      "sha256:fp3",
+      "",
+      "nonce3",
+      "wrap3"
+    ]
+  ],
+  "expected_digest_hex": "ee8dd1d73b664aaa579de078da60796f55fcc72d5334dc597b6e5ab1bff84d2d"
+}

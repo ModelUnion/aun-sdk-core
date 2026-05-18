@@ -48,3 +48,8 @@ CLAUDE.md
 docs/AUN测试运行指南.md
 docs/superpowers/
 docs/sdk/AUN C++ SDK与四语言SDK Gap分析.md
+
+# 打包临时目录（由 scripts/sync_packed_docs.py 生成，发包前生成、发包后保留亦可）
+python/src/aun_core/_packed_docs/
+ts/_packed_docs/
+js/_packed_docs/

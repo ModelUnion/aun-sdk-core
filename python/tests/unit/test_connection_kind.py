@@ -172,14 +172,15 @@ def test_long_connection_starts_heartbeat_and_token_refresh():
 
 # ── 5. 短连接 auto_reconnect 默认 False ─────────────────────────────
 
-def test_short_connection_disables_auto_reconnect_by_default():
+def test_short_connection_allows_auto_reconnect_by_default():
+    """短连接允许自动重连（与长连接一致），但不启动 heartbeat 和 token 刷新。"""
     client = AUNClient()
     options = client._build_session_options({
         "access_token": "tok",
         "gateway": "ws://x/aun",
         "connection_kind": "short",
     })
-    assert options["auto_reconnect"] is False
+    assert options["auto_reconnect"] is True
 
 
 def test_long_connection_keeps_default_auto_reconnect():

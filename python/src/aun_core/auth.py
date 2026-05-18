@@ -326,7 +326,7 @@ class AuthFlow:
         connection_kind: str = "long",
         short_ttl_ms: int = 0,
         extra_info: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         nonce = challenge.get("params", {}).get("nonce", "")
         if not nonce:
             self._log.warn("auth", "challenge missing nonce, cannot initialize session")
@@ -334,7 +334,7 @@ class AuthFlow:
         self._log.debug("auth", "initializing session with token: device_id=%s slot_id=%s kind=%s",
                         device_id, slot_id, connection_kind)
         self.set_instance_context(device_id=device_id, slot_id=slot_id)
-        await self._initialize_session(
+        return await self._initialize_session(
             transport,
             nonce,
             access_token,
@@ -377,7 +377,7 @@ class AuthFlow:
         explicit_token = str(access_token or "")
         if explicit_token and identity is not None:
             try:
-                await self._initialize_session(
+                hello = await self._initialize_session(
                     transport,
                     nonce,
                     explicit_token,
@@ -390,7 +390,7 @@ class AuthFlow:
                 identity["access_token"] = explicit_token
                 self._persist_identity(identity)
                 self._log.debug("auth", "connect_session exit (explicit_token): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
-                return {"token": explicit_token, "identity": identity}
+                return {"token": explicit_token, "identity": identity, "hello": hello}
             except (AuthError, ConnectionError, AUNError) as exc:
                 self._log.debug("auth", "explicit_token auth failed, trying next method: %s", exc)
                 # transport 被 Gateway 关闭（4001）时，后续 fallback 无法使用同一连接，
@@ -404,7 +404,7 @@ class AuthFlow:
         if identity is None:
             auth_context = await self.ensure_authenticated(gateway_url)
             token = auth_context["token"]
-            await self._initialize_session(
+            hello = await self._initialize_session(
                 transport,
                 nonce,
                 token,
@@ -415,12 +415,13 @@ class AuthFlow:
                 short_ttl_ms=short_ttl_ms,
             )
             self._log.debug("auth", "connect_session exit (new identity): elapsed=%.3fs", time.time() - _t_start)
+            auth_context["hello"] = hello
             return auth_context
 
         cached_token = self._get_cached_access_token(identity)
         if cached_token:
             try:
-                await self._initialize_session(
+                hello = await self._initialize_session(
                     transport,
                     nonce,
                     cached_token,
@@ -431,7 +432,7 @@ class AuthFlow:
                     short_ttl_ms=short_ttl_ms,
                 )
                 self._log.debug("auth", "connect_session exit (cached_token): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
-                return {"token": cached_token, "identity": identity}
+                return {"token": cached_token, "identity": identity, "hello": hello}
             except (AuthError, ConnectionError, AUNError) as exc:
                 self._log.debug("auth", "cached_token auth failed, trying refresh: %s", exc)
                 if getattr(transport, "_closed", False):
@@ -446,7 +447,7 @@ class AuthFlow:
                 identity = await self.refresh_cached_tokens(gateway_url, identity)
                 cached_token = self._get_cached_access_token(identity)
                 if cached_token:
-                    await self._initialize_session(
+                    hello = await self._initialize_session(
                         transport,
                         nonce,
                         cached_token,
@@ -457,7 +458,7 @@ class AuthFlow:
                         short_ttl_ms=short_ttl_ms,
                     )
                     self._log.debug("auth", "connect_session exit (refreshed_token): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
-                    return {"token": cached_token, "identity": identity}
+                    return {"token": cached_token, "identity": identity, "hello": hello}
             except (AuthError, ConnectionError, AUNError) as exc:
                 self._log.debug("auth", "refresh_token auth failed, will re-login: %s", exc)
                 if getattr(transport, "_closed", False):
@@ -470,7 +471,7 @@ class AuthFlow:
         token = str(login.get("access_token") or "")
         if not token:
             raise AuthError("authenticate did not return access_token")
-        await self._initialize_session(
+        hello = await self._initialize_session(
             transport,
             nonce,
             token,
@@ -483,7 +484,7 @@ class AuthFlow:
         )
         identity = self.load_identity(identity.get("aid"))
         self._log.debug("auth", "connect_session exit (re-login): elapsed=%.3fs aid=%s", time.time() - _t_start, identity.get("aid"))
-        return {"token": token, "identity": identity}
+        return {"token": token, "identity": identity, "hello": hello}
 
     async def _initialize_session(
         self,
@@ -497,7 +498,7 @@ class AuthFlow:
         connection_kind: str = "long",
         short_ttl_ms: int = 0,
         extra_info: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         # The SDK lifecycle concept is "initialize(token)"; the gateway currently
         # serves it through its internal auth.connect entrypoint.
         request = {
@@ -510,6 +511,9 @@ class AuthFlow:
             "capabilities": {
                 "e2ee": True,
                 "group_e2ee": True,
+                # AUN E2EE V2: 上报支持的加密协议版本
+                "supported_p2p_e2ee": ["e2ee", "e2ee_v2"],
+                "supported_group_e2ee": ["group_e2ee", "group_e2ee_v2"],
             },
         }
         # extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
@@ -531,6 +535,7 @@ class AuthFlow:
             self._log.warn("auth", "auth.connect failed: status=%s result=%s", status, result)
             raise AuthError(f"initialize failed: {result}")
         self._log.debug("auth", "auth.connect success")
+        return result if isinstance(result, dict) else {}
 
     async def _create_aid(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
         response = await self._short_rpc(gateway_url, "auth.create_aid", {

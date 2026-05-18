@@ -112,8 +112,8 @@ describe('长短连接共存', () => {
     expect(payload.options).toBeUndefined();
   });
 
-  // 7. 短连接禁用心跳和 token_refresh（_startBackgroundTasks 跳过）
-  it('短连接禁用后台任务', () => {
+  // 7. 短连接禁用 heartbeat 与 token_refresh（短连接生命周期短，不需要长期会话维护）
+  it('短连接禁用 heartbeat 与 token_refresh', () => {
     const client = new AUNClient({ aun_path: tmpDir });
     // 设置 _sessionOptions 为 short
     (client as any)._sessionOptions = { connection_kind: 'short' };
@@ -137,13 +137,13 @@ describe('长短连接共存', () => {
     expect(startTokenRefresh).toHaveBeenCalled();
   });
 
-  // 9. 短连接默认 auto_reconnect=false
-  it('短连接默认 auto_reconnect=false', () => {
+  // 9. 短连接不改变 auto_reconnect 默认值
+  it('短连接 auto_reconnect 保持默认 true', () => {
     const client = new AUNClient({ aun_path: tmpDir });
     const options = (client as any)._buildSessionOptions({
       connection_kind: 'short',
     });
-    expect(options.auto_reconnect).toBe(false);
+    expect(options.auto_reconnect).toBe(true);
   });
 
   // 10. 长连接保持默认 auto_reconnect=true

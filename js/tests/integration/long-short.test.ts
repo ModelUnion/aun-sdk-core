@@ -9,7 +9,7 @@
  *   Test 5: 长连接互踢（同槽位 4009）→ 不影响同槽位短连接
  *   Test 6: 短连接不发布 client.online
  *   Test 7: hello-ok 回包 connection.kind 字段
- *   Test 8: 短连接禁用 auto_reconnect / 心跳
+ *   Test 8: 短连接禁用 token 刷新
  *
  * 前置条件：
  *   - Docker 单域环境运行中（kite-app + kite-mysql）
@@ -436,9 +436,9 @@ describe('长短连接共存集成测试', () => {
     expect(sessionOpts.connection_kind).toBe('short');
   }, 15000);
 
-  // ── Test 8: 短连接禁用 auto_reconnect / 心跳 ──────────
+  // ── Test 8: 短连接禁用 token 刷新 ──────────
 
-  it('Test 8: 短连接默认禁用 auto_reconnect 和心跳', async () => {
+  it('Test 8: 短连接禁用 token 刷新（心跳保留）', async () => {
     if (skip()) return;
 
     const r = rid();
@@ -454,14 +454,13 @@ describe('长短连接共存集成测试', () => {
     clients.push(short);
     await connectShort(short, aid, { slot_id: 'd8' });
 
-    // session_options 应反映短连接默认值
+    // session_options 应反映短连接
     const sessionOpts = (short as unknown as { _sessionOptions: SessionOptions })._sessionOptions;
-    expect(sessionOpts.auto_reconnect).toBe(false);
     expect(sessionOpts.connection_kind).toBe('short');
 
-    // 心跳 timer 不应启动
+    // 心跳 timer 应正常启动
     const heartbeatTimer = (short as unknown as { _heartbeatTimer: unknown })._heartbeatTimer;
-    expect(heartbeatTimer).toBeNull();
+    expect(heartbeatTimer).not.toBeNull();
 
     // token refresh timer 不应启动
     const tokenRefreshTimer = (short as unknown as { _tokenRefreshTimer: unknown })._tokenRefreshTimer;

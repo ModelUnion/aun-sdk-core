@@ -82,7 +82,7 @@ class RPCTransport:
         *,
         event_dispatcher: EventDispatcher,
         connection_factory: ConnectionFactory,
-        timeout: float = 10.0,
+        timeout: float = 35.0,
         on_disconnect: DisconnectCallback | None = None,
         logger: "AUNLogger | NullLogger | None" = None,
     ) -> None:
@@ -95,8 +95,19 @@ class RPCTransport:
         self._pending: dict[str, asyncio.Future] = {}
         self._closed = True
         self._challenge: dict[str, Any] | None = None
+        # Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
+        # 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
+        self._meta_observer: "callable | None" = None
         from .logger import NullLogger as _NL
         self._log = logger or _NL()
+
+    def set_meta_observer(self, observer) -> None:
+        """注册 RPC envelope _meta 字段观察者；observer(meta_dict) 在每次成功 RPC 时调用。
+
+        Gateway 注入的 _meta 与业务无关（如 agent_md_etag），observer 抛异常会被吞掉，
+        不影响 RPC result 返回。
+        """
+        self._meta_observer = observer
 
     def set_timeout(self, timeout: float) -> None:
         self._timeout = timeout
@@ -197,6 +208,14 @@ class RPCTransport:
             method, rpc_id, _diag_time.time() - _t0,
             _summarize_dict(response.get("result"), _DIAG_RESULT_FIELDS),
         )
+        # 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
+        if self._meta_observer is not None:
+            meta = response.get("_meta")
+            if isinstance(meta, dict):
+                try:
+                    self._meta_observer(meta)
+                except Exception as exc:
+                    self._log.debug("transport", "meta_observer raised: %s", exc)
         return response.get("result")
 
     async def _recv_initial_message(self) -> dict[str, Any] | None:

@@ -1,0 +1,8 @@
+{
+  "description": "canonical_json input",
+  "input": {
+    "b": 1,
+    "a": 2
+  },
+  "expected_output_b64": "eyJhIjoyLCJiIjoxfQ=="
+}

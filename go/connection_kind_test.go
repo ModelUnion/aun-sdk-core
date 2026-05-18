@@ -183,15 +183,15 @@ func TestConnectionKind_AuthPayloadLongOmitsOptions(t *testing.T) {
 	}
 }
 
-// ── 7. 短连接禁用心跳和 token_refresh ──────────────────────────────
+// ── 7. 短连接禁用 token 自动刷新（心跳保留） ──────────────────────────────
 
-func TestConnectionKind_ShortDisablesBackgroundTasks(t *testing.T) {
+func TestConnectionKind_ShortDisablesTokenRefresh(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.mu.Lock()
 	c.sessionOptions = map[string]any{
-		"auto_reconnect":       false,
+		"auto_reconnect":       true,
 		"heartbeat_interval":   30.0,
 		"token_refresh_before": 1800.0,
 		"connection_kind":      "short",
@@ -199,16 +199,16 @@ func TestConnectionKind_ShortDisablesBackgroundTasks(t *testing.T) {
 	c.state = StateConnected
 	c.mu.Unlock()
 
-	// startBackgroundTasks 在 kind=short 时应直接 return（不启动心跳/token刷新 goroutine）
+	// startBackgroundTasks 在 kind=short 时应启动心跳但跳过 token 刷新
 	c.startBackgroundTasks(context.Background())
 
-	// 验证 cancel 被设置（ctx 初始化完成）但无后台 goroutine 泄漏
+	// 验证 cancel 被设置（ctx 初始化完成）
 	c.mu.RLock()
 	hasCancel := c.cancel != nil
 	c.mu.RUnlock()
 
 	if !hasCancel {
-		t.Fatal("startBackgroundTasks 应设置 cancel（即使 short 也需要初始化 ctx）")
+		t.Fatal("startBackgroundTasks 应设置 cancel")
 	}
 }
 
@@ -248,9 +248,9 @@ func TestConnectionKind_LongStartsBackgroundTasks(t *testing.T) {
 	c.mu.Unlock()
 }
 
-// ── 9. 短连接默认 auto_reconnect=false ─────────────────────────────
+// ── 9. 短连接不改变 auto_reconnect 默认值 ─────────────────────────────
 
-func TestConnectionKind_ShortDefaultAutoReconnectFalse(t *testing.T) {
+func TestConnectionKind_ShortDefaultAutoReconnectTrue(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
@@ -260,8 +260,8 @@ func TestConnectionKind_ShortDefaultAutoReconnectFalse(t *testing.T) {
 		"connection_kind": "short",
 	})
 	autoReconnect, _ := options["auto_reconnect"].(bool)
-	if autoReconnect {
-		t.Fatal("短连接 auto_reconnect 应默认为 false")
+	if !autoReconnect {
+		t.Fatal("短连接 auto_reconnect 应保持默认 true")
 	}
 }
 
@@ -318,8 +318,8 @@ func TestConnectionKind_ShortConnectSetsSessionOptions(t *testing.T) {
 		t.Fatalf("sessionOptions.connection_kind 应为 'short', got '%s'", kind)
 	}
 	autoReconnect, _ := opts["auto_reconnect"].(bool)
-	if autoReconnect {
-		t.Fatal("短连接 sessionOptions.auto_reconnect 应为 false")
+	if !autoReconnect {
+		t.Fatal("短连接 sessionOptions.auto_reconnect 应保持默认 true")
 	}
 }
 

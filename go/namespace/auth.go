@@ -52,6 +52,14 @@ type AuthNamespace struct {
 	client         ClientInterface
 	httpClientOnce sync.Once
 	httpClient     *http.Client
+	agentMDCache   map[string]*agentMDCacheEntry
+	agentMDCacheMu sync.Mutex
+}
+
+type agentMDCacheEntry struct {
+	text         string
+	etag         string
+	lastModified string
 }
 
 var agentMDFingerprintRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -722,11 +730,28 @@ func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (conten
 	}
 	req.Header.Set("Accept", "text/markdown")
 
+	a.agentMDCacheMu.Lock()
+	cached := a.agentMDCache[targetAID]
+	a.agentMDCacheMu.Unlock()
+	if cached != nil {
+		if cached.etag != "" {
+			req.Header.Set("If-None-Match", cached.etag)
+		}
+		if cached.lastModified != "" {
+			req.Header.Set("If-Modified-Since", cached.lastModified)
+		}
+	}
+
 	resp, err := a.agentMDHTTPClient().Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified && cached != nil {
+		pkgLogAuth().Debug("DownloadAgentMD not_modified: aid=%s", targetAID)
+		return cached.text, nil
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -742,7 +767,18 @@ func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (conten
 		}
 		return "", fmt.Errorf("download agent.md failed: HTTP %d", resp.StatusCode)
 	}
-	return string(body), nil
+	text := string(body)
+	etag := strings.TrimSpace(resp.Header.Get("ETag"))
+	lastModified := strings.TrimSpace(resp.Header.Get("Last-Modified"))
+	if etag != "" || lastModified != "" {
+		a.agentMDCacheMu.Lock()
+		if a.agentMDCache == nil {
+			a.agentMDCache = make(map[string]*agentMDCacheEntry)
+		}
+		a.agentMDCache[targetAID] = &agentMDCacheEntry{text: text, etag: etag, lastModified: lastModified}
+		a.agentMDCacheMu.Unlock()
+	}
+	return text, nil
 }
 
 // DownloadCert 下载证书

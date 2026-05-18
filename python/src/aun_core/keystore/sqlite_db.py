@@ -151,6 +151,15 @@ _DDL_STATEMENTS = [
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS v2_device_keys (
+        device_id TEXT NOT NULL,
+        key_type TEXT NOT NULL,
+        key_id TEXT NOT NULL DEFAULT '',
+        private_key BLOB NOT NULL,
+        public_key BLOB NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (device_id, key_type, key_id)
+    )""",
 ]
 
 

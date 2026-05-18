@@ -98,22 +98,60 @@ def test_heartbeat_interval_zero_disables_heartbeat():
 
 
 @pytest.mark.asyncio
-async def test_positive_heartbeat_interval_has_30s_floor():
+async def test_positive_heartbeat_interval_has_10s_floor():
+    """interval 在 [10, 600] 内 clamp；< 10 被钳到 10。"""
     client = AUNClient()
     client._session_options["heartbeat_interval"] = 0.01
-    captured: dict[str, float] = {}
-
-    async def fake_heartbeat_loop(interval: float) -> None:
-        captured["interval"] = interval
-
-    client._heartbeat_loop = fake_heartbeat_loop  # type: ignore[method-assign]
 
     client._start_heartbeat_task()
     await asyncio.sleep(0)
 
-    assert captured["interval"] == 30.0
+    # _start_heartbeat_task 通过 _clamp_heartbeat_interval 读 session_options，
+    # 写回 session_options 由 _apply_server_heartbeat_interval 完成；这里只断言任务被启动
     assert client._heartbeat_task is not None
-    assert client._heartbeat_task.done()
+    client._closing = True
+    if client._heartbeat_nudge is not None:
+        client._heartbeat_nudge.set()
+    try:
+        await asyncio.wait_for(client._heartbeat_task, timeout=1.0)
+    except asyncio.TimeoutError:
+        client._heartbeat_task.cancel()
+
+
+def test_clamp_heartbeat_interval_bounds():
+    from aun_core.client import _clamp_heartbeat_interval
+    assert _clamp_heartbeat_interval(0) == 0.0
+    assert _clamp_heartbeat_interval(-5) == 0.0
+    assert _clamp_heartbeat_interval(0.01) == 10.0
+    assert _clamp_heartbeat_interval(30) == 30.0
+    assert _clamp_heartbeat_interval(1000) == 600.0
+    assert _clamp_heartbeat_interval("bad") == 0.0
+    assert _clamp_heartbeat_interval(None) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_apply_server_heartbeat_interval_writes_back():
+    client = AUNClient()
+    client._session_options["heartbeat_interval"] = 30.0
+    client._apply_server_heartbeat_interval(60, source="pong")
+    assert client._session_options["heartbeat_interval"] == 60.0
+    # 服务端下发 0 → 关闭
+    client._apply_server_heartbeat_interval(0, source="pong")
+    assert client._session_options["heartbeat_interval"] == 0.0
+    # 越界值 → clamp
+    client._apply_server_heartbeat_interval(5, source="pong")
+    assert client._session_options["heartbeat_interval"] == 10.0
+    client._apply_server_heartbeat_interval(9999, source="pong")
+    assert client._session_options["heartbeat_interval"] == 600.0
+    # 收尾：取消可能启动的心跳 task
+    if client._heartbeat_task is not None:
+        client._closing = True
+        if client._heartbeat_nudge is not None:
+            client._heartbeat_nudge.set()
+        try:
+            await asyncio.wait_for(client._heartbeat_task, timeout=1.0)
+        except asyncio.TimeoutError:
+            client._heartbeat_task.cancel()
 
 
 def test_normalize_connect_params_includes_slot_and_delivery_mode(tmp_path):

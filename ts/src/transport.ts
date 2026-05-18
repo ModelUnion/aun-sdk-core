@@ -78,6 +78,9 @@ const EVENT_NAME_MAP: Record<string, string> = {
 /** 断线回调，closeCode 为 WebSocket close code（1006 = 网络异常断开，其他 = 服务端主动关闭） */
 export type DisconnectCallback = (error: Error | null, closeCode?: number) => void | Promise<void>;
 
+/** RPC envelope 的 _meta 字段观察者；observer 抛错被吞掉，不影响业务。 */
+export type MetaObserver = (meta: Record<string, unknown>) => void;
+
 /**
  * WebSocket JSON-RPC 2.0 传输层
  */
@@ -96,6 +99,9 @@ export class RPCTransport {
     timer: ReturnType<typeof setTimeout>;
   }> = new Map();
   private _idCounter = 0;
+  // Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
+  // observer 抛异常会被吞掉，不影响 RPC result 返回。
+  private _metaObserver: MetaObserver | null = null;
 
   constructor(opts: {
     eventDispatcher: EventDispatcher;
@@ -114,6 +120,16 @@ export class RPCTransport {
   /** 设置默认 RPC 超时（毫秒） */
   setTimeout(timeout: number): void {
     this._timeout = timeout;
+  }
+
+  /**
+   * 注册 RPC envelope _meta 字段观察者；observer(meta) 在每次成功 RPC 时调用。
+   *
+   * Gateway 注入的 _meta 与业务无关（如 agent_md_etag），observer 抛异常会被吞掉，
+   * 不影响 RPC 结果返回。
+   */
+  setMetaObserver(observer: MetaObserver | null): void {
+    this._metaObserver = observer;
   }
 
   /** 获取上次连接的 challenge 消息 */
@@ -316,6 +332,17 @@ export class RPCTransport {
             reject(mapRemoteError(response.error));
           } else if (response.result !== undefined) {
             this._logger.debug(`RPC response ok: method=${method}, id=${rpcId}, elapsed=${elapsed}ms ${summarizeDict(response.result, DIAG_RESULT_FIELDS)}`);
+            // 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
+            if (this._metaObserver !== null) {
+              const meta = (response as Record<string, unknown>)._meta;
+              if (meta !== null && typeof meta === 'object' && !Array.isArray(meta)) {
+                try {
+                  this._metaObserver(meta as Record<string, unknown>);
+                } catch (err) {
+                  this._logger.debug(`meta_observer raised: ${err instanceof Error ? err.message : String(err)}`);
+                }
+              }
+            }
             resolve(response.result);
           } else {
             this._logger.warn(`RPC response missing result or error: method=${method}, id=${rpcId}, elapsed=${elapsed}ms`);

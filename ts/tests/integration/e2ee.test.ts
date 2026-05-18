@@ -478,9 +478,9 @@ describe('E2EE 集成测试', () => {
     assertDecrypted(msgs[0], { type: 'text', text: 'sdk2sdk prekey' });
   }, TEST_TIMEOUT);
 
-  // ── 3. SDK 无 prekey 时降级到 long_term_key ─────────────────
+  // ── 3. SDK 无 prekey 时应报错（multi-device 架构不再降级） ─────────────────
 
-  it('SDK 无 prekey 时降级到 long_term_key', async () => {
+  it('SDK 无 prekey 时应报错', async () => {
     const rid = runId();
     const sender = tracked();
     const receiver = tracked();
@@ -492,15 +492,9 @@ describe('E2EE 集成测试', () => {
     // Receiver 仅创建 AID，不连接（不上传 prekey）
     await receiver.auth.createAid({ aid: rAid });
 
-    await sdkSend(sender, rAid, { type: 'text', text: 'missing-prekey' });
-
-    const auth = await receiver.auth.authenticate({ aid: rAid });
-    await receiver.connect(auth);
-
-    const msgs = await sdkRecvPull(receiver, sAid);
-    expect(msgs.length, '应收到至少 1 条降级消息').toBeGreaterThanOrEqual(1);
-    assertDecrypted(msgs[0], { type: 'text', text: 'missing-prekey' });
-    expect(((msgs[0].e2ee ?? {}) as JsonObject).encryption_mode).toBe('long_term_key');
+    await expect(
+      sdkSend(sender, rAid, { type: 'text', text: 'missing-prekey' }),
+    ).rejects.toThrow(/no registered device prekeys/);
   }, TEST_TIMEOUT);
 
   // ── 4. SDK 双向消息 ────────────────────────────────────────
@@ -943,16 +937,22 @@ describe('E2EE 集成测试', () => {
     await new Promise((r) => setTimeout(r, 1000));
 
     const offlineBase = await currentMaxSeq(bobLaptop);
-    const onlineBase = await currentMaxSeq(bobPhone);
     await bobLaptop.close();
     await new Promise((r) => setTimeout(r, 1000));
 
     const text = `multi_device_offline_${Date.now()}`;
+
+    // 在线设备用事件订阅捕获 push（auto-ack 会推进 cursor，pull 可能拿不到）
+    const waitOnline = waitForSdkPushMessages(bobPhone, aliceAid, 1, 15_000, (msg) =>
+      (msg as any)?.payload?.text === text,
+    );
+
     await sdkSend(aliceMain, bobAid, { type: 'text', text, kind: 'offline-pull' });
 
-    const onlineMsg = await waitForSdkPullMessage(bobPhone, aliceAid, onlineBase, text, 15_000);
-    assertDecrypted(onlineMsg, { type: 'text', text, kind: 'offline-pull' }, 'bob-phone-online');
-    expect(String(onlineMsg.direction ?? '')).toBe('inbound');
+    const onlineMsgs = await waitOnline;
+    expect(onlineMsgs.length, '在线设备应收到 push 消息').toBeGreaterThanOrEqual(1);
+    assertDecrypted(onlineMsgs[0], { type: 'text', text, kind: 'offline-pull' }, 'bob-phone-online');
+    expect(String((onlineMsgs[0] as any).direction ?? '')).toBe('inbound');
 
     bobLaptop = makeClientAtPath(bobLaptopRoot);
     clients.push(bobLaptop);

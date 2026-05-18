@@ -47,22 +47,16 @@ func TestIntegration_PlaintextSendNoPrekey(t *testing.T) {
 	}
 
 	// Alice 发送明文消息给目标（encrypt: false）
-	result, err := alice.Call(ctx, "message.send", map[string]any{
+	// multi-device 架构下，接收方无注册设备时服务端拒绝投递
+	_, err = alice.Call(ctx, "message.send", map[string]any{
 		"to":      targetAID,
 		"payload": map[string]any{"type": "text", "text": fmt.Sprintf("plain-no-prekey-%s", rid)},
 		"encrypt": false,
 	})
-	if err != nil {
-		t.Fatalf("明文发送失败（不应依赖 prekey）: %v", err)
+	if err == nil {
+		t.Fatalf("发送到无注册设备的 AID 应返回错误")
 	}
-
-	// 验证返回了 message_id
-	resultMap, _ := result.(map[string]any)
-	msgID, _ := resultMap["message_id"].(string)
-	if msgID == "" {
-		t.Fatalf("明文发送未返回 message_id: %v", result)
-	}
-	t.Logf("明文发送成功，message_id=%s", msgID)
+	t.Logf("正确返回错误: %v", err)
 }
 
 // ── 测试 2: 发送到不存在的 AID 应失败 ──────────────────────────────────

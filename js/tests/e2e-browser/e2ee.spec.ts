@@ -1765,32 +1765,12 @@ test.describe('P2P E2EE 扩展测试', () => {
     }
   });
 
-  test('SDK 无 prekey 时降级到 long_term_key', async ({ page }) => {
+  test('SDK 无 prekey 时应报错（multi-device 架构不再降级）', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const AUN = (window as any).AUN;
       const senderAid = `br-lt-s-${rid}.agentid.pub`;
       const receiverAid = `br-lt-r-${rid}.agentid.pub`;
-      const waitForPullText = async (
-        client: any,
-        fromAid: string,
-        afterSeq: number,
-        expectedText: string,
-        timeout = 15000,
-      ) => {
-        const deadline = Date.now() + timeout;
-        while (Date.now() < deadline) {
-          const pullResult = await client.call('message.pull', { after_seq: afterSeq, limit: 20 });
-          const msgs = (pullResult.messages || []).filter((m: any) => m.from === fromAid);
-          for (const msg of msgs) {
-            if (msg?.payload?.text === expectedText) {
-              return msg;
-            }
-          }
-          await new Promise(r => setTimeout(r, 500));
-        }
-        throw new Error(`timeout waiting for ${expectedText}`);
-      };
 
       // Sender 连接
       const sender = new AUN.AUNClient();
@@ -1803,32 +1783,22 @@ test.describe('P2P E2EE 扩展测试', () => {
       const receiver = new AUN.AUNClient();
       await receiver.auth.createAid({ aid: receiverAid });
 
-      await sender.call('message.send', {
-        to: receiverAid,
-        payload: { type: 'text', text: 'missing-prekey' },
-        encrypt: true,
-      });
-
-      const helpers = (window as any).__aunP2PTest;
-      const waitReceiver = helpers.waitForPushMessages(receiver, senderAid, 1, 5000, (msg: any) =>
-        msg?.payload?.text === 'missing-prekey',
-      );
-      const rAuth = await receiver.auth.authenticate({ aid: receiverAid });
-      await receiver.connect(rAuth);
-      const pushed = await waitReceiver;
-      const msg = pushed[0] ?? await waitForPullText(receiver, senderAid, 0, 'missing-prekey');
+      let errorMsg = '';
+      try {
+        await sender.call('message.send', {
+          to: receiverAid,
+          payload: { type: 'text', text: 'missing-prekey' },
+          encrypt: true,
+        });
+      } catch (e: any) {
+        errorMsg = e?.message ?? String(e);
+      }
 
       await sender.close();
-      await receiver.close();
-
-      return {
-        text: msg?.payload?.text ?? null,
-        mode: msg?.e2ee?.encryption_mode ?? null,
-      };
+      return { errorMsg };
     }, rid);
 
-    expect(result.text).toBe('missing-prekey');
-    expect(result.mode).toBe('long_term_key');
+    expect(result.errorMsg).toMatch(/no registered device prekeys/);
   });
 
   test('同一 AID 多设备 fanout + 发件同步副本', async ({ page }) => {

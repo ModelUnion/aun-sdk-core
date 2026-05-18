@@ -248,6 +248,7 @@ async function fetchWithTimeout(
 export class AuthNamespace {
   private _client: AUNClient;
   private _log: ModuleLogger = _noopLog;
+  private _agentMdCache: Map<string, { text: string; etag: string; lastModified: string }> = new Map();
   setLogger(log: ModuleLogger): void { this._log = log; }
 
   constructor(client: AUNClient) {
@@ -495,12 +496,12 @@ export class AuthNamespace {
       if (!expectedAid) {
         return agentMdResult('invalid', payload, 'aid required to verify agent.md');
       }
-      const fetchPeerCert = this._internal._fetchPeerCert;
-      if (typeof fetchPeerCert !== 'function') {
+      // 通过 _internal 直接调用，保留 this 绑定（解构后调用会丢失 this，导致 _clientLog 等成员访问失败）
+      if (typeof this._internal._fetchPeerCert !== 'function') {
         return agentMdResult('invalid', payload, 'aid required to verify agent.md', expectedAid);
       }
       try {
-        certPem = String(await fetchPeerCert(expectedAid, fields.cert_fingerprint)).trim();
+        certPem = String(await this._internal._fetchPeerCert(expectedAid, fields.cert_fingerprint)).trim();
       } catch (error) {
         return agentMdResult('invalid', payload, String(error), expectedAid, fields.cert_fingerprint);
       }
@@ -648,12 +649,19 @@ export class AuthNamespace {
       if (!targetAid) {
         throw new ValidationError('downloadAgentMd requires non-empty aid');
       }
+      const cached = this._agentMdCache.get(targetAid);
+      const requestHeaders: Record<string, string> = { Accept: 'text/markdown' };
+      if (cached?.etag) requestHeaders['If-None-Match'] = cached.etag;
+      if (cached?.lastModified) requestHeaders['If-Modified-Since'] = cached.lastModified;
+
       const response = await fetchWithTimeout(await this._resolveAgentMdUrl(targetAid), {
         method: 'GET',
-        headers: {
-          Accept: 'text/markdown',
-        },
+        headers: requestHeaders,
       });
+      if (response.status === 304 && cached) {
+        this._log.debug(`downloadAgentMd exit (not_modified): elapsed=${Date.now() - tStart}ms aid=${targetAid}`);
+        return cached.text;
+      }
       if (response.status === 404) {
         throw new NotFoundError(`agent.md not found for aid: ${targetAid}`);
       }
@@ -664,6 +672,11 @@ export class AuthNamespace {
         );
       }
       const text = await response.text();
+      const etag = String(response.headers.get('ETag') ?? '').trim();
+      const lastModified = String(response.headers.get('Last-Modified') ?? '').trim();
+      if (etag || lastModified) {
+        this._agentMdCache.set(targetAid, { text, etag, lastModified });
+      }
       this._log.debug(`downloadAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} bytes=${text.length}`);
       return text;
     } catch (err) {

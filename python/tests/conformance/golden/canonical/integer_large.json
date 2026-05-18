@@ -1,0 +1,5 @@
+{
+  "description": "canonical_json input",
+  "input": 1710504000000,
+  "expected_output_b64": "MTcxMDUwNDAwMDAwMA=="
+}

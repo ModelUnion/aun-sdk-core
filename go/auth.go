@@ -509,8 +509,8 @@ func (a *AuthFlow) RefreshCachedTokens(ctx context.Context, gatewayURL string, i
 
 // ── 会话初始化 ──────────────────────────────────────────────
 
-// InitializeWithToken 使用已有 token 初始化会话
-func (a *AuthFlow) InitializeWithToken(ctx context.Context, transport *RPCTransport, challenge map[string]any, accessToken string, connectionKind string, shortTtlMs int, extraInfo map[string]any) (err error) {
+// InitializeWithToken 使用已有 token 初始化会话；返回 hello result（含 heartbeat_interval 等）。
+func (a *AuthFlow) InitializeWithToken(ctx context.Context, transport *RPCTransport, challenge map[string]any, accessToken string, connectionKind string, shortTtlMs int, extraInfo map[string]any) (hello map[string]any, err error) {
 	tStart := time.Now()
 	pkgLogAuth().Debug("InitializeWithToken enter: aid=%s kind=%s", a.aid, connectionKind)
 	defer func() {
@@ -523,7 +523,7 @@ func (a *AuthFlow) InitializeWithToken(ctx context.Context, transport *RPCTransp
 	nonce := authExtractChallengeNonce(challenge)
 	if nonce == "" {
 		err = NewAuthError("gateway challenge missing nonce")
-		return err
+		return nil, err
 	}
 	return a.initializeSession(ctx, transport, nonce, accessToken, connectionKind, shortTtlMs, extraInfo)
 }
@@ -560,7 +560,7 @@ func (a *AuthFlow) ConnectSession(
 	// 策略 1：显式 token
 	if accessToken != "" && identity != nil {
 		pkgLogAuth().Debug("ConnectSession strategy 1: using explicit token: aid=%s", a.aid)
-		if err := a.initializeSession(ctx, transport, nonce, accessToken, connectionKind, shortTtlMs, extraInfo); err == nil {
+		if hello, err := a.initializeSession(ctx, transport, nonce, accessToken, connectionKind, shortTtlMs, extraInfo); err == nil {
 			identity["access_token"] = accessToken
 			// H24: 持久化失败不能静默吞；打 ERROR 日志，调用方可以主动检查 GetLastPersistError
 			if perr := a.persistIdentity(identity); perr != nil {
@@ -568,7 +568,7 @@ func (a *AuthFlow) ConnectSession(
 				a.lastPersistErr = perr
 			}
 			pkgLogAuth().Debug("ConnectSession strategy 1 succeeded: aid=%s", a.aid)
-			return map[string]any{"token": accessToken, "identity": identity}, nil
+			return map[string]any{"token": accessToken, "identity": identity, "hello": hello}, nil
 		}
 		pkgLogAuth().Warn("explicit_token auth failed, trying next method")
 	}
@@ -582,10 +582,12 @@ func (a *AuthFlow) ConnectSession(
 			return nil, err
 		}
 		token := authGetStr(authContext, "token")
-		if err := a.initializeSession(ctx, transport, nonce, token, connectionKind, shortTtlMs, extraInfo); err != nil {
+		hello, err := a.initializeSession(ctx, transport, nonce, token, connectionKind, shortTtlMs, extraInfo)
+		if err != nil {
 			pkgLogAuth().Error("ConnectSession initializeSession failed: err=%v", err)
 			return nil, err
 		}
+		authContext["hello"] = hello
 		return authContext, nil
 	}
 
@@ -593,9 +595,9 @@ func (a *AuthFlow) ConnectSession(
 	cachedToken := authGetCachedAccessToken(identity)
 	if cachedToken != "" {
 		pkgLogAuth().Debug("ConnectSession strategy 2: using cached access_token: aid=%s", a.aid)
-		if err := a.initializeSession(ctx, transport, nonce, cachedToken, connectionKind, shortTtlMs, extraInfo); err == nil {
+		if hello, err := a.initializeSession(ctx, transport, nonce, cachedToken, connectionKind, shortTtlMs, extraInfo); err == nil {
 			pkgLogAuth().Debug("ConnectSession strategy 2 succeeded: aid=%s", a.aid)
-			return map[string]any{"token": cachedToken, "identity": identity}, nil
+			return map[string]any{"token": cachedToken, "identity": identity, "hello": hello}, nil
 		}
 		pkgLogAuth().Warn("cached_token auth failed, trying refresh")
 	}
@@ -606,9 +608,9 @@ func (a *AuthFlow) ConnectSession(
 		if refreshedIdentity, err := a.RefreshCachedTokens(ctx, gatewayURL, identity); err == nil {
 			identity = refreshedIdentity
 			if newToken := authGetCachedAccessToken(identity); newToken != "" {
-				if err := a.initializeSession(ctx, transport, nonce, newToken, connectionKind, shortTtlMs, extraInfo); err == nil {
+				if hello, err := a.initializeSession(ctx, transport, nonce, newToken, connectionKind, shortTtlMs, extraInfo); err == nil {
 					pkgLogAuth().Debug("ConnectSession strategy 3 succeeded: aid=%s", a.aid)
-					return map[string]any{"token": newToken, "identity": identity}, nil
+					return map[string]any{"token": newToken, "identity": identity, "hello": hello}, nil
 				}
 			}
 		}
@@ -627,13 +629,14 @@ func (a *AuthFlow) ConnectSession(
 		pkgLogAuth().Error("ConnectSession auth did not return access_token: aid=%s", a.aid)
 		return nil, NewAuthError("authenticate did not return access_token")
 	}
-	if err := a.initializeSession(ctx, transport, nonce, token, connectionKind, shortTtlMs, extraInfo); err != nil {
+	hello, err := a.initializeSession(ctx, transport, nonce, token, connectionKind, shortTtlMs, extraInfo)
+	if err != nil {
 		pkgLogAuth().Error("ConnectSession initializeSession failed: aid=%s err=%v", a.aid, err)
 		return nil, err
 	}
 	pkgLogAuth().Debug("ConnectSession strategy 4 succeeded: aid=%s", a.aid)
 	identity, _ = a.LoadIdentity(authGetStr(identity, "aid"))
-	return map[string]any{"token": token, "identity": identity}, nil
+	return map[string]any{"token": token, "identity": identity, "hello": hello}, nil
 }
 
 // ── 对端证书验证 ────────────────────────────────────────────
@@ -1320,8 +1323,8 @@ func (a *AuthFlow) fetchGatewayOCSPStatus(ctx context.Context, gatewayURL string
 
 // ── 内部：会话初始化 ────────────────────────────────────────
 
-// initializeSession 通过 auth.connect RPC 初始化会话
-func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTransport, nonce string, token string, connectionKind string, shortTtlMs int, extraInfo map[string]any) (err error) {
+// initializeSession 通过 auth.connect RPC 初始化会话；返回 hello result（map）。
+func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTransport, nonce string, token string, connectionKind string, shortTtlMs int, extraInfo map[string]any) (hello map[string]any, err error) {
 	tStart := time.Now()
 	pkgLogAuth().Debug("initializeSession enter: aid=%s deviceID=%s kind=%s", a.aid, a.deviceID, connectionKind)
 	defer func() {
@@ -1368,7 +1371,7 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 	}
 	result, err := transport.Call(ctx, "auth.connect", request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	resultMap, _ := result.(map[string]any)
 	status := ""
@@ -1376,9 +1379,9 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 		status, _ = resultMap["status"].(string)
 	}
 	if status != "ok" {
-		return NewAuthError(fmt.Sprintf("initialize failed: %v", result))
+		return nil, NewAuthError(fmt.Sprintf("initialize failed: %v", result))
 	}
-	return nil
+	return resultMap, nil
 }
 
 // ── 内部：new_cert 验证 ─────────────────────────────────────

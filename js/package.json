@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/fastaun-browser",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "description": "AUN Protocol Core SDK for Browser",
   "type": "module",
   "main": "dist/index.js",
@@ -15,11 +15,14 @@
   "license": "Apache-2.0",
   "files": [
     "dist",
+    "_packed_docs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
+    "prepack": "python ../scripts/sync_packed_docs.py js",
     "test": "vitest run --environment jsdom",
     "test:unit": "vitest run --environment jsdom tests/unit",
     "test:integration": "vitest run --environment jsdom tests/integration",

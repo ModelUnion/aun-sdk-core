@@ -120,3 +120,103 @@ def test_sign_agent_md_replaces_existing_signature(monkeypatch):
     signed_twice = asyncio.run(client.auth.sign_agent_md(signed_once))
 
     assert signed_twice.count("<!-- AUN-SIGNATURE") == 1
+
+
+# ── download_agent_md 条件请求缓存 ────────────────────────────────────
+
+
+class _FakeResponse:
+    def __init__(self, status: int, text: str = "", headers: dict[str, str] | None = None):
+        self.status = status
+        self._text = text
+        self.headers = headers or {}
+
+    async def text(self) -> str:
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[dict[str, str]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None):
+        self.calls.append(dict(headers or {}))
+        return self._responses.pop(0)
+
+
+def _patch_session(monkeypatch, session: _FakeSession):
+    import aun_core.namespaces.auth_namespace as mod
+
+    monkeypatch.setattr(mod.aiohttp, "ClientSession", lambda *a, **kw: session)
+
+
+def test_download_agent_md_caches_etag_and_last_modified(monkeypatch):
+    client = AUNClient()
+    namespace = client.auth
+
+    async def _fake_resolve(_self, _aid):
+        return "https://alice.agentid.pub/agent.md"
+
+    monkeypatch.setattr(type(namespace), "_resolve_agent_md_url", _fake_resolve)
+
+    payload = _sample_agent_md()
+    headers = {
+        "ETag": "\"abc123\"",
+        "Last-Modified": "Sun, 18 May 2026 00:00:00 GMT",
+    }
+    session = _FakeSession([
+        _FakeResponse(200, payload, headers),
+        _FakeResponse(304, "", headers),
+    ])
+    _patch_session(monkeypatch, session)
+
+    first = asyncio.run(namespace.download_agent_md("alice.agentid.pub"))
+    assert first == payload
+    # 第一次没有条件头
+    assert "If-None-Match" not in session.calls[0]
+    assert "If-Modified-Since" not in session.calls[0]
+
+    # 第二次应当自动带上条件头，遇到 304 时返回上次缓存
+    second = asyncio.run(namespace.download_agent_md("alice.agentid.pub"))
+    assert second == payload
+    assert session.calls[1].get("If-None-Match") == "\"abc123\""
+    assert session.calls[1].get("If-Modified-Since") == "Sun, 18 May 2026 00:00:00 GMT"
+
+
+def test_download_agent_md_updates_cache_on_change(monkeypatch):
+    client = AUNClient()
+    namespace = client.auth
+
+    async def _fake_resolve(_self, _aid):
+        return "https://alice.agentid.pub/agent.md"
+
+    monkeypatch.setattr(type(namespace), "_resolve_agent_md_url", _fake_resolve)
+
+    payload_v1 = _sample_agent_md()
+    payload_v2 = _sample_agent_md() + "# v2\n"
+    session = _FakeSession([
+        _FakeResponse(200, payload_v1, {"ETag": "\"v1\"", "Last-Modified": "Sun, 18 May 2026 00:00:00 GMT"}),
+        _FakeResponse(200, payload_v2, {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
+        _FakeResponse(304, "", {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
+    ])
+    _patch_session(monkeypatch, session)
+
+    assert asyncio.run(namespace.download_agent_md("alice.agentid.pub")) == payload_v1
+    assert asyncio.run(namespace.download_agent_md("alice.agentid.pub")) == payload_v2
+    # 第三次 304 应返回 v2
+    assert asyncio.run(namespace.download_agent_md("alice.agentid.pub")) == payload_v2
+    assert session.calls[1].get("If-None-Match") == "\"v1\""
+    assert session.calls[2].get("If-None-Match") == "\"v2\""

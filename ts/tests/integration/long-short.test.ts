@@ -9,7 +9,7 @@
  *   5. 长连接互踢，短连接不受影响
  *   6. 短连接不发布 client.online
  *   7. hello-ok 回包 connection.kind
- *   8. 短连接禁用 auto_reconnect / 心跳
+ *   8. 短连接禁用 token 刷新
  *
  * E2E 测试（5 个）：
  *   1. CLI 顺序发 5 条
@@ -451,8 +451,8 @@ describe('长短连接 集成 - hello-ok 回包 connection.kind', { timeout: 60_
   });
 });
 
-describe('长短连接 集成 - 短连接禁用 auto_reconnect / 心跳', { timeout: 60_000 }, () => {
-  it('短连接 connect 后无心跳/无 token 刷新/auto_reconnect=false', async () => {
+describe('长短连接 集成 - 短连接禁用 token 刷新', { timeout: 60_000 }, () => {
+  it('短连接 connect 后有心跳/无 token 刷新', async () => {
     const r = rid();
     const aid = `lst-d8-${r}.${ISSUER}`;
 
@@ -471,8 +471,7 @@ describe('长短连接 集成 - 短连接禁用 auto_reconnect / 心跳', { time
         _heartbeatTimer: unknown;
         _tokenRefreshTimer: unknown;
       };
-      expect(internals._sessionOptions.auto_reconnect).toBe(false);
-      expect(internals._heartbeatTimer).toBeNull();
+      expect(internals._heartbeatTimer).not.toBeNull();
       expect(internals._tokenRefreshTimer).toBeNull();
     } finally {
       await safeClose(setup);

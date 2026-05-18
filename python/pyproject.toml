@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastaun"
-version = "0.2.19"
+version = "0.2.20"
 description = "AUN Protocol Core SDK — identity, authentication, key management, E2EE"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -42,7 +42,15 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"aun_core" = ["py.typed", "certs/*.crt", "docs/**/*.md", "docs/**/*.py"]
+"aun_core" = [
+    "py.typed",
+    "certs/*.crt",
+    "docs/**/*.md",
+    "docs/**/*.py",
+    # 仓库根 docs/ 通过 scripts/sync_packed_docs.py 同步进来；
+    # 内含 protocol、agent.md 规范、SDK 手册等文档，已自动排除 .gitignore 项
+    "_packed_docs/**/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

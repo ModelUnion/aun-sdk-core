@@ -471,7 +471,7 @@ func TestIntegrationSDKToSDKPrekey(t *testing.T) {
 	assertDecrypted(t, msgs[0], map[string]any{"type": "text", "text": "sdk2sdk prekey"}, "")
 }
 
-// TestIntegrationSDKLongTermFallback 未上传 prekey 时，验证 long_term_key 降级模式。
+// TestIntegrationSDKLongTermFallback multi-device 架构下，对方无 prekey 时应报错（不再降级）。
 func TestIntegrationSDKLongTermFallback(t *testing.T) {
 	rid := runID()
 	sender := makeClient(t)
@@ -479,7 +479,7 @@ func TestIntegrationSDKLongTermFallback(t *testing.T) {
 	defer sender.Close()
 	defer receiver.Close()
 
-	sAID := ensureConnected(t, sender, fmt.Sprintf("e2ee-s-%s.agentid.pub", rid))
+	_ = ensureConnected(t, sender, fmt.Sprintf("e2ee-s-%s.agentid.pub", rid))
 
 	// receiver 仅创建 AID，不连接（模拟离线接收方，无 prekey）
 	rAID := fmt.Sprintf("e2ee-r-%s.agentid.pub", rid)
@@ -491,60 +491,16 @@ func TestIntegrationSDKLongTermFallback(t *testing.T) {
 		t.Skipf("无法创建 AID: %v", err)
 	}
 
-	// sender 发送消息（对方无 prekey，应降级到 long_term_key）
-	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "fallback"})
-
-	// 在 connect 之前订阅 message.received，避免被自动 P2P gap fill 提前消费
-	var mu sync.Mutex
-	var received []map[string]any
-	done := make(chan struct{}, 1)
-	receiver.On("message.received", func(payload any) {
-		data, ok := payload.(map[string]any)
-		if !ok {
-			return
-		}
-		from, _ := data["from"].(string)
-		if from != sAID {
-			return
-		}
-		mu.Lock()
-		received = append(received, data)
-		mu.Unlock()
-		select {
-		case done <- struct{}{}:
-		default:
-		}
+	// multi-device 架构下，对方无 prekey 时 SDK 应报错
+	_, err = sender.Call(ctx, "message.send", map[string]any{
+		"to":      rAID,
+		"payload": map[string]any{"type": "text", "text": "fallback"},
+		"encrypt": true,
 	})
-
-	// receiver 此时认证并连接：connect 成功后 SDK 会自动触发一次 P2P message.pull
-	authResult, err := receiver.Auth.Authenticate(ctx, map[string]any{"aid": rAID})
-	if err != nil {
-		t.Fatalf("接收方认证失败: %v", err)
+	if err == nil {
+		t.Fatalf("发送到无 prekey 的 AID 应返回错误")
 	}
-	if err := receiver.Connect(ctx, authResult, nil); err != nil {
-		t.Fatalf("接收方连接失败: %v", err)
-	}
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-	}
-	mu.Lock()
-	msgs := append([]map[string]any(nil), received...)
-	mu.Unlock()
-	if len(msgs) < 1 {
-		t.Fatalf("期望至少收到 1 条消息，实际 %d", len(msgs))
-	}
-	assertDecrypted(t, msgs[0], map[string]any{"type": "text", "text": "fallback"}, "")
-
-	// 验证加密模式为 long_term_key
-	e2eeMeta, _ := msgs[0]["e2ee"].(map[string]any)
-	if e2eeMeta != nil {
-		mode, _ := e2eeMeta["encryption_mode"].(string)
-		if mode != "long_term_key" {
-			t.Errorf("期望加密模式 long_term_key，实际 %s", mode)
-		}
-	}
+	t.Logf("正确返回错误: %v", err)
 }
 
 // TestIntegrationSDKToSDKBidirectional 双向加密消息测试。
@@ -1000,14 +956,24 @@ func TestIntegrationMultiDeviceOfflinePull(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	offlineBase := currentMaxSeq(t, bobLaptop, 200)
-	onlineBase := currentMaxSeq(t, bobPhone, 200)
 	bobLaptop.Close()
 	time.Sleep(1 * time.Second)
 
 	text := fmt.Sprintf("multi_device_offline_%d", time.Now().UnixMilli())
+
+	// 在线设备用事件订阅捕获 push（auto-ack 会推进 cursor，pull 可能拿不到）
+	waitOnline := collectSDKPushMessages(bobPhone, aliceAID, 1, func(msg map[string]any) bool {
+		p, _ := msg["payload"].(map[string]any)
+		return p != nil && p["text"] == text
+	})
+
 	sdkSend(t, aliceMain, bobAID, map[string]any{"type": "text", "text": text, "kind": "offline-pull"})
 
-	onlineMsg := waitForSDKPullMessage(t, bobPhone, aliceAID, onlineBase, text, 15*time.Second)
+	onlineMsgs := waitOnline(15 * time.Second)
+	if len(onlineMsgs) < 1 {
+		t.Fatalf("在线设备未收到 push 消息")
+	}
+	onlineMsg := onlineMsgs[0]
 	assertDecrypted(t, onlineMsg, map[string]any{"type": "text", "text": text, "kind": "offline-pull"}, "bob-phone-online")
 	if getStr(onlineMsg, "direction", "") != "inbound" {
 		t.Fatalf("在线设备消息 direction 不正确: %#v", onlineMsg["direction"])

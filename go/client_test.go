@@ -596,10 +596,11 @@ func TestEffectiveHeartbeatIntervalSeconds(t *testing.T) {
 	}{
 		{name: "zero disables heartbeat", in: 0, want: 0},
 		{name: "negative disables heartbeat", in: -1, want: 0},
-		{name: "positive value below floor", in: 1, want: 30},
-		{name: "fractional positive value below floor", in: 0.01, want: 30},
-		{name: "floor stays floor", in: 30, want: 30},
+		{name: "positive value below floor", in: 1, want: 10},
+		{name: "fractional positive value below floor", in: 0.01, want: 10},
+		{name: "floor stays floor", in: 10, want: 10},
 		{name: "larger value preserved", in: 45, want: 45},
+		{name: "value above ceiling", in: 1000, want: 600},
 	}
 
 	for _, tc := range cases {
@@ -608,6 +609,55 @@ func TestEffectiveHeartbeatIntervalSeconds(t *testing.T) {
 				t.Fatalf("effectiveHeartbeatIntervalSeconds(%v) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestClampHeartbeatInterval 验证 clampHeartbeatInterval 接受多种数值类型并落在 [10, 600]。
+func TestClampHeartbeatInterval(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want float64
+	}{
+		{"int zero", int(0), 0},
+		{"int floor", int(5), 10},
+		{"int ok", int(45), 45},
+		{"int ceiling", int(9999), 600},
+		{"float ok", float64(60), 60},
+		{"float negative", float64(-1), 0},
+		{"unsupported string", "abc", 0},
+		{"nil", nil, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampHeartbeatInterval(tc.in); got != tc.want {
+				t.Fatalf("clampHeartbeatInterval(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestApplyServerHeartbeatInterval 验证 applyServerHeartbeatInterval 写回 sessionOptions。
+func TestApplyServerHeartbeatInterval(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.sessionOptions["heartbeat_interval"] = float64(30)
+
+	c.applyServerHeartbeatInterval(60, "auth")
+	if got := c.sessionOptions["heartbeat_interval"]; got != float64(60) {
+		t.Fatalf("after apply 60: got %v, want 60", got)
+	}
+	c.applyServerHeartbeatInterval(5, "pong")
+	if got := c.sessionOptions["heartbeat_interval"]; got != float64(10) {
+		t.Fatalf("after apply 5 (clamp): got %v, want 10", got)
+	}
+	c.applyServerHeartbeatInterval(9999, "pong")
+	if got := c.sessionOptions["heartbeat_interval"]; got != float64(600) {
+		t.Fatalf("after apply 9999 (clamp): got %v, want 600", got)
+	}
+	c.applyServerHeartbeatInterval(0, "pong")
+	if got := c.sessionOptions["heartbeat_interval"]; got != float64(0) {
+		t.Fatalf("after apply 0: got %v, want 0", got)
 	}
 }
 

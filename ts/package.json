@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/fastaun",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "description": "AUN Protocol Core SDK for Node.js",
   "type": "module",
   "main": "dist/index.js",
@@ -17,11 +17,14 @@
   "license": "Apache-2.0",
   "files": [
     "dist",
+    "_packed_docs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
+    "prepack": "python ../scripts/sync_packed_docs.py ts",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration/e2ee.test.ts",

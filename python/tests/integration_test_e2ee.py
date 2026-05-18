@@ -1221,7 +1221,10 @@ async def test_multi_device_recipient_and_self_sync():
         await _ensure_connected(alice_sync, _ALICE_AID)
         await _ensure_connected(bob_phone, _BOBB_AID)
         await _ensure_connected(bob_laptop, _BOBB_AID)
-        await asyncio.sleep(1.0)
+        # 等待所有 client 的 gap_fill 完成，避免 gap_fill 期间连接被踢导致 push 丢失
+        await _wait_sdk_stable(bob_phone)
+        await _wait_sdk_stable(bob_laptop)
+        await _wait_sdk_stable(alice_sync)
 
         alice_main_device = str(alice_main._device_id or "")
         alice_sync_device = str(alice_sync._device_id or "")

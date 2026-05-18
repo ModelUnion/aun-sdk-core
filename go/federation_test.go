@@ -76,6 +76,12 @@ func TestFederationSDKToSDKPrekey(t *testing.T) {
 	bobAID := ensureFederationConnected(t, bob, fmt.Sprintf("go-fed-b-%s.aid.net", rid))
 
 	text := fmt.Sprintf("go federation hello %s", rid)
+
+	// 用事件订阅捕获 push（auto-ack 会推进 cursor，pull 可能拿不到）
+	waitBob := collectSDKPushMessages(bob, aliceAID, 1, func(msg map[string]any) bool {
+		return getPayloadText(msg) == text
+	})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -91,52 +97,12 @@ func TestFederationSDKToSDKPrekey(t *testing.T) {
 		t.Fatalf("跨域发送返回 nil")
 	}
 
-	msgs := federationWaitForMessages(t, bob, func() []map[string]any {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		pullResult, err := bob.Call(ctx, "message.pull", map[string]any{
-			"after_seq": 0,
-			"limit":     50,
-		})
-		if err != nil {
-			return nil
-		}
-		pullMap, _ := pullResult.(map[string]any)
-		if pullMap == nil {
-			return nil
-		}
-		msgsAny, _ := pullMap["messages"].([]any)
-		var items []map[string]any
-		for _, raw := range msgsAny {
-			if msg, ok := raw.(map[string]any); ok {
-				items = append(items, msg)
-			}
-		}
-		return items
-	}, 20*time.Second, func(items []map[string]any) bool {
-		for _, item := range items {
-			from, _ := item["from"].(string)
-			if from != aliceAID {
-				continue
-			}
-			if getPayloadText(item) == text {
-				return true
-			}
-		}
-		return false
-	}, "等待 Bob 收到跨域 E2EE 消息")
+	msgs := waitBob(20 * time.Second)
+	if len(msgs) < 1 {
+		t.Fatalf("等待 Bob 收到跨域 E2EE 消息 超时")
+	}
 
-	var target map[string]any
-	for _, item := range msgs {
-		from, _ := item["from"].(string)
-		if from == aliceAID && getPayloadText(item) == text {
-			target = item
-			break
-		}
-	}
-	if target == nil {
-		t.Fatalf("未找到跨域目标消息")
-	}
+	target := msgs[0]
 
 	encrypted, _ := target["encrypted"].(bool)
 	if !encrypted {

@@ -182,6 +182,15 @@ AUN 使用 JSON-RPC 2.0 原生三类消息：
 - **Token 体系**：access_token（短期）+ refresh_token（长期，一次性）
 - **E2EE**：协议层可扩展多种密码学套件，当前 Python SDK 仅实现 P-256 + HKDF-SHA256 + AES-256-GCM。可叠加于任意连接模式
 
+> **⚠️ V2 群 E2EE 安全等级警示**
+>
+> V2 群消息加密强度取决于群的 `join_mode`：
+>
+> - **end_to_end（真正端到端）**：`approval` / `closed` 群。新成员必须经 owner/admin 签名确认，可防服务端注入幽灵成员窃听
+> - **transport（仅传输加密）**：`open` / `invite_code` / `invite_only` 群。任何人可自由入群，wrap 接收方不绑定到授权成员，**E2EE 等同传输层加密，不提供"仅授权成员可读"保证**
+>
+> `group.v2.bootstrap` 响应中的 `e2ee_security_level` 字段标识当前群的安全等级。**UI 应在 transport 等级群中显著提示用户"非端到端加密"**，避免用户对安全保证产生误判。
+
 ### Gateway 模式连接流程
 
 ```mermaid

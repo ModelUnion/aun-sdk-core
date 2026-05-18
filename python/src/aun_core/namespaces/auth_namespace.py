@@ -348,9 +348,24 @@ class AuthNamespace:
         try:
             agent_md_url = await self._resolve_agent_md_url(target_aid)
 
+            cache_store = self._agent_md_cache_store()
+            cached = cache_store.get(target_aid) or {}
+            request_headers: dict[str, str] = {"Accept": "text/markdown"}
+            if cached.get("etag"):
+                request_headers["If-None-Match"] = cached["etag"]
+            if cached.get("last_modified"):
+                request_headers["If-Modified-Since"] = cached["last_modified"]
+
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(agent_md_url, headers={"Accept": "text/markdown"}) as response:
+                async with session.get(agent_md_url, headers=request_headers) as response:
+                    if response.status == 304 and cached.get("text") is not None:
+                        self._client._log.debug(
+                            "auth",
+                            "download_agent_md exit (not_modified): elapsed=%.3fs aid=%s",
+                            _t.time() - _t_start, target_aid,
+                        )
+                        return cached["text"]
                     if response.status == 404:
                         raise NotFoundError(f"agent.md not found for aid: {target_aid}")
                     if response.status < 200 or response.status >= 300:
@@ -360,11 +375,27 @@ class AuthNamespace:
                             + (f" - {message}" if message else "")
                         )
                     text = await response.text()
+                    response_headers = getattr(response, "headers", None) or {}
+                    etag = str(response_headers.get("ETag") or "").strip() if hasattr(response_headers, "get") else ""
+                    last_modified = str(response_headers.get("Last-Modified") or "").strip() if hasattr(response_headers, "get") else ""
+                    if etag or last_modified:
+                        cache_store[target_aid] = {
+                            "text": text,
+                            "etag": etag,
+                            "last_modified": last_modified,
+                        }
                     self._client._log.debug("auth", "download_agent_md exit: elapsed=%.3fs aid=%s content_len=%d", _t.time() - _t_start, target_aid, len(text))
                     return text
         except Exception as exc:
             self._client._log.debug("auth", "download_agent_md exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, target_aid, exc)
             raise
+
+    def _agent_md_cache_store(self) -> dict[str, dict[str, str]]:
+        store = getattr(self, "_agent_md_cache", None)
+        if store is None:
+            store = {}
+            self._agent_md_cache = store
+        return store
 
     async def sign_agent_md(self, content: str, *, aid: str | None = None) -> str:
         import time as _t

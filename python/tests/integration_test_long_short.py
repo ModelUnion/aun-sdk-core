@@ -538,8 +538,8 @@ async def test_hello_ok_returns_connection_kind() -> bool:
 # Test 8: 短连接禁用 auto_reconnect / 心跳
 # ---------------------------------------------------------------------------
 
-async def test_short_disables_background_tasks() -> bool:
-    name = "Test 8: short disables auto_reconnect & heartbeat"
+async def test_short_disables_token_refresh() -> bool:
+    name = "Test 8: short disables token_refresh"
     print(f"\n=== {name} ===")
     rid = _rid()
     aid = f"ls-d8-{rid}.{_ISSUER}"
@@ -555,14 +555,11 @@ async def test_short_disables_background_tasks() -> bool:
 
         # session_options 应反映短连接默认值
         opts = short._session_options
-        if opts.get("auto_reconnect") is not False:
-            _fail(name, f"auto_reconnect should be False for short, got {opts.get('auto_reconnect')}")
-            return False
 
-        # 心跳 task 不应启动
+        # 心跳 task 应正常启动
         hb = getattr(short, "_heartbeat_task", None)
-        if hb is not None and not hb.done():
-            _fail(name, "_heartbeat_task started for short connection")
+        if hb is None or hb.done():
+            _fail(name, "_heartbeat_task should be started for short connection")
             return False
 
         # token_refresh 任务不应启动
@@ -603,7 +600,7 @@ async def main() -> int:
         ("long replaces long, shorts unaffected",    test_long_replaces_long_keeps_shorts),
         ("short does not publish client.online",     test_short_does_not_publish_client_online),
         ("hello-ok includes connection.kind",        test_hello_ok_returns_connection_kind),
-        ("short disables auto_reconnect & heartbeat",test_short_disables_background_tasks),
+        ("short disables token_refresh",test_short_disables_token_refresh),
     ]
 
     results: list[tuple[str, bool]] = []

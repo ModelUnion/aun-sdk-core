@@ -574,7 +574,7 @@ export class AuthFlow {
       shortTtlMs?: number;
       extraInfo?: Record<string, unknown>;
     },
-  ): Promise<void> {
+  ): Promise<JsonObject> {
     const tStart = Date.now();
     this._logger.debug(`initializeWithToken enter: deviceId=${opts?.deviceId ?? ''}, slotId=${opts?.slotId ?? ''}`);
     try {
@@ -583,7 +583,7 @@ export class AuthFlow {
         deviceId: String(opts?.deviceId ?? ''),
         slotId: String(opts?.slotId ?? ''),
       });
-      await this._initializeSession(transport, nonce, accessToken, {
+      const hello = await this._initializeSession(transport, nonce, accessToken, {
         deviceId: String(opts?.deviceId ?? ''),
         slotId: String(opts?.slotId ?? ''),
         deliveryMode: opts?.deliveryMode ?? null,
@@ -592,6 +592,7 @@ export class AuthFlow {
         extraInfo: opts?.extraInfo,
       });
       this._logger.debug(`initializeWithToken exit: elapsed=${Date.now() - tStart}ms`);
+      return hello;
     } catch (err) {
       this._logger.debug(`initializeWithToken exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
@@ -640,7 +641,7 @@ export class AuthFlow {
       const explicitToken = String(opts?.accessToken || '');
       if (explicitToken && identity !== null) {
         try {
-          await this._initializeSession(transport, nonce, explicitToken, {
+          const hello = await this._initializeSession(transport, nonce, explicitToken, {
             deviceId,
             slotId,
             deliveryMode,
@@ -651,7 +652,7 @@ export class AuthFlow {
           identity.access_token = explicitToken;
           this._persistIdentity(identity);
           this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=explicit_token aid=${String(identity.aid ?? '')}`);
-          return { token: explicitToken, identity };
+          return { token: explicitToken, identity, hello };
         } catch (exc) {
           if (!(exc instanceof AuthError)) throw exc;
           this._logger.debug(`explicit_token auth failed, try next method: ${exc.message}`);
@@ -662,7 +663,7 @@ export class AuthFlow {
       if (identity === null) {
         const authContext = await this.ensureAuthenticated(gatewayUrl);
         const token = String(authContext.token);
-        await this._initializeSession(transport, nonce, token, {
+        const hello = await this._initializeSession(transport, nonce, token, {
           deviceId,
           slotId,
           deliveryMode,
@@ -671,14 +672,14 @@ export class AuthFlow {
           extraInfo,
         });
         this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=ensure_authenticated aid=${String(authContext.identity?.aid ?? '')}`);
-        return authContext;
+        return { ...authContext, hello };
       }
 
       // 策略 2：缓存的 access_token
       const cachedToken = AuthFlow._getCachedAccessToken(identity);
       if (cachedToken) {
         try {
-          await this._initializeSession(transport, nonce, cachedToken, {
+          const hello = await this._initializeSession(transport, nonce, cachedToken, {
             deviceId,
             slotId,
             deliveryMode,
@@ -687,7 +688,7 @@ export class AuthFlow {
             extraInfo,
           });
           this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=cached_token aid=${String(identity.aid ?? '')}`);
-          return { token: cachedToken, identity };
+          return { token: cachedToken, identity, hello };
         } catch (exc) {
           if (!(exc instanceof AuthError)) throw exc;
           this._logger.debug(`cached_token auth failed, try refresh: ${exc.message}`);
@@ -701,7 +702,7 @@ export class AuthFlow {
           identity = await this.refreshCachedTokens(gatewayUrl, identity);
           const newCachedToken = AuthFlow._getCachedAccessToken(identity);
           if (newCachedToken) {
-            await this._initializeSession(transport, nonce, newCachedToken, {
+            const hello = await this._initializeSession(transport, nonce, newCachedToken, {
               deviceId,
               slotId,
               deliveryMode,
@@ -710,7 +711,7 @@ export class AuthFlow {
               extraInfo,
             });
             this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=refresh_token aid=${String(identity.aid ?? '')}`);
-            return { token: newCachedToken, identity };
+            return { token: newCachedToken, identity, hello };
           }
         } catch (exc) {
           if (!(exc instanceof AuthError)) throw exc;
@@ -724,7 +725,7 @@ export class AuthFlow {
       if (!token) {
         throw new AuthError('authenticate did not return access_token');
       }
-      await this._initializeSession(transport, nonce, token, {
+      const hello = await this._initializeSession(transport, nonce, token, {
         deviceId,
         slotId,
         deliveryMode,
@@ -734,7 +735,7 @@ export class AuthFlow {
       });
       identity = this.loadIdentity(identity.aid as string | undefined);
       this._logger.debug(`connectSession exit: elapsed=${Date.now() - tStart}ms strategy=full_reauth aid=${String(identity?.aid ?? '')}`);
-      return { token, identity };
+      return { token, identity, hello };
     } catch (err) {
       this._logger.debug(`connectSession exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
@@ -961,7 +962,7 @@ export class AuthFlow {
       shortTtlMs?: number;
       extraInfo?: Record<string, unknown>;
     },
-  ): Promise<void> {
+  ): Promise<JsonObject> {
     const connectionKind = String(opts?.connectionKind ?? 'long');
     this._logger.debug(`session init start: deviceId=${opts?.deviceId ?? ''}, slotId=${opts?.slotId ?? ''}, kind=${connectionKind}`);
     const request: JsonObject = {
@@ -998,6 +999,7 @@ export class AuthFlow {
       throw new AuthError(`initialize failed: ${JSON.stringify(result)}`);
     }
     this._logger.debug('sessioninitok');
+    return isJsonObject(result) ? (result as JsonObject) : ({} as JsonObject);
   }
 
   // ── 内部方法：证书验证 ──────────────────────────────────────
@@ -2127,6 +2129,7 @@ interface ExportedJwk extends JsonObject {
 interface AuthContext extends JsonObject {
   token?: string;
   identity?: IdentityRecord;
+  hello?: JsonObject;
 }
 
 interface AnyIdentityKeyStore extends KeyStore {

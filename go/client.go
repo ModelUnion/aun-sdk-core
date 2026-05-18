@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -97,14 +98,43 @@ func reconnectSleepDelaySeconds(baseDelay float64, maxBaseDelay float64) float64
 	return baseDelay + secureRandFloat64()*maxBaseDelay
 }
 
-func effectiveHeartbeatIntervalSeconds(interval float64) float64 {
-	if interval <= 0 {
+// 心跳间隔下/上限（秒）。0 = 关闭心跳；负值视为 0；其余值 clamp 到 [10, 600]。
+// 服务端通过 hello.heartbeat_interval 与 meta.ping pong 中的同名字段下发。
+const (
+	heartbeatMinIntervalSeconds = 10.0
+	heartbeatMaxIntervalSeconds = 600.0
+)
+
+func clampHeartbeatInterval(value any) float64 {
+	var v float64
+	switch x := value.(type) {
+	case float64:
+		v = x
+	case float32:
+		v = float64(x)
+	case int:
+		v = float64(x)
+	case int64:
+		v = float64(x)
+	case int32:
+		v = float64(x)
+	default:
 		return 0
 	}
-	if interval < 30 {
-		return 30
+	if v != v || v <= 0 { // NaN check via self-equality
+		return 0
 	}
-	return interval
+	if v < heartbeatMinIntervalSeconds {
+		return heartbeatMinIntervalSeconds
+	}
+	if v > heartbeatMaxIntervalSeconds {
+		return heartbeatMaxIntervalSeconds
+	}
+	return v
+}
+
+func effectiveHeartbeatIntervalSeconds(interval float64) float64 {
+	return clampHeartbeatInterval(interval)
 }
 
 // 等价于 Python json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)
@@ -353,6 +383,7 @@ type AUNClient struct {
 	configModel          *AUNConfig
 	state                ClientState
 	aid                  string
+	connectedAt          time.Time
 	identity             map[string]any
 	gatewayURL           string
 	deviceID             string
@@ -380,6 +411,9 @@ type AUNClient struct {
 	// 会话参数
 	sessionParams  map[string]any
 	sessionOptions map[string]any
+
+	// 心跳唤醒：interval 通过 sessionOptions 写入；nudge channel 让心跳循环立即重读
+	heartbeatNudge chan struct{}
 
 	// 对端证书缓存
 	certCache                  map[string]*cachedPeerCert
@@ -413,9 +447,7 @@ type AUNClient struct {
 	groupSynced   map[string]bool
 	groupSyncedMu sync.Mutex
 
-	// P2P 惰性同步标志：首次发送/收到 P2P 消息后标记
-	p2pSynced   bool
-	p2pSyncedMu sync.Mutex
+	// P2P 惰性同步标志：首次发送/收到 P2P 消息后标记 — 已废弃，由 fillP2pGap 在 connect 后异步触发，字段删除
 
 	// 群消息缺少 epoch key 时的待解队列
 	pendingDecryptMsgs   map[string][]map[string]any
@@ -448,6 +480,15 @@ type AUNClient struct {
 	Custody *namespace.CustodyNamespace
 	// Meta 命名空间
 	Meta *namespace.MetaNamespace
+
+	// 本地 agent.md 文件路径与对应 etag（quoted sha256 hex，与服务端 _agent_md_etag 一致）。
+	// 由 SetLocalAgentMDPath() 设置；用于跟服务端 RPC envelope._meta.agent_md_etag 比对，
+	// 触发"本地未发布到服务端"或"服务端版本更新"的 UI 提示。
+	// gateway 在 RPC envelope._meta.agent_md_etag 注入服务端 etag；纯观察，无下游依赖。
+	agentMdMu         sync.RWMutex
+	localAgentMDPath  string
+	localAgentMDEtag  string
+	remoteAgentMDEtag string
 
 	// 日志
 	logger *AUNLogger
@@ -528,6 +569,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		pushedSeqs:                 make(map[string]map[int]bool),
 		pendingOrderedMsgs:         make(map[string]map[int]pendingOrderedMessage),
 		groupSynced:                make(map[string]bool),
+		heartbeatNudge:             make(chan struct{}, 1),
 		sessionOptions: map[string]any{
 			"auto_reconnect":       true,
 			"heartbeat_interval":   30.0,
@@ -538,7 +580,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 			},
 			"timeouts": map[string]any{
 				"connect": 5.0,
-				"call":    10.0,
+				"call":    35.0,
 				"http":    30.0,
 			},
 		},
@@ -562,6 +604,8 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	c.transport = NewRPCTransport(events, 10*time.Second, func(err error, closeCode int) {
 		c.handleTransportDisconnect(err, closeCode)
 	}, cfg.VerifySSL)
+	// 注册 RPC envelope._meta 观察者（吸收 gateway 注入的 agent_md_etag 等元数据）
+	c.transport.SetMetaObserver(c.observeRPCMeta)
 
 	// 创建 E2EE 管理器
 	c.e2ee = NewE2EEManager(E2EEManagerConfig{
@@ -662,6 +706,74 @@ func (c *AUNClient) E2EE() *E2EEManager {
 // GroupE2EE 返回群组 E2EE 管理器
 func (c *AUNClient) GroupE2EE() *GroupE2EEManager {
 	return c.groupE2EE
+}
+
+// SetLocalAgentMDPath 记录本地 agent.md 文件路径并一次性计算 etag（quoted sha256 hex，与服务端一致）。
+//
+//   - path 为空字符串：清除本地 path 与 etag。
+//   - 文件不存在 / 读取失败：清除 etag 并返回空串，不 panic（应用可读 GetLocalAgentMDEtag()
+//     为空判断）。
+//   - 文件变更后需要重新调用 SetLocalAgentMDPath() 触发重算（按设计：设置时一次性计算）。
+//
+// 返回当前 etag（quoted hex 或空串）。
+func (c *AUNClient) SetLocalAgentMDPath(path string) string {
+	raw := strings.TrimSpace(path)
+	if raw == "" {
+		c.agentMdMu.Lock()
+		c.localAgentMDPath = ""
+		c.localAgentMDEtag = ""
+		c.agentMdMu.Unlock()
+		return ""
+	}
+	data, err := os.ReadFile(raw)
+	if err != nil {
+		if c.log != nil {
+			c.log.Warn("SetLocalAgentMDPath 读取失败 path=%s err=%v", raw, err)
+		}
+		c.agentMdMu.Lock()
+		c.localAgentMDPath = raw
+		c.localAgentMDEtag = ""
+		c.agentMdMu.Unlock()
+		return ""
+	}
+	digest := sha256.Sum256(data)
+	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(digest[:]))
+	c.agentMdMu.Lock()
+	c.localAgentMDPath = raw
+	c.localAgentMDEtag = etag
+	c.agentMdMu.Unlock()
+	return etag
+}
+
+// GetLocalAgentMDEtag 返回 SetLocalAgentMDPath 计算的 etag；未设置或读取失败时返回空串。
+func (c *AUNClient) GetLocalAgentMDEtag() string {
+	c.agentMdMu.RLock()
+	defer c.agentMdMu.RUnlock()
+	return c.localAgentMDEtag
+}
+
+// GetRemoteAgentMDEtag 返回 gateway 在最近一次 RPC envelope._meta 注入的服务端 agent.md etag。
+// 未收到过则为空串；不阻塞调用，纯内存读。
+func (c *AUNClient) GetRemoteAgentMDEtag() string {
+	c.agentMdMu.RLock()
+	defer c.agentMdMu.RUnlock()
+	return c.remoteAgentMDEtag
+}
+
+// observeRPCMeta transport 的 _meta observer：吸收 gateway 注入的 agent_md_etag 等元数据。
+// observer 失败 / 字段缺失时不影响业务路径。
+func (c *AUNClient) observeRPCMeta(meta map[string]any) {
+	if meta == nil {
+		return
+	}
+	raw, _ := meta["agent_md_etag"].(string)
+	etag := strings.TrimSpace(raw)
+	if etag == "" {
+		return
+	}
+	c.agentMdMu.Lock()
+	c.remoteAgentMDEtag = etag
+	c.agentMdMu.Unlock()
 }
 
 // ── namespace.ClientInterface 实现 ─────────────────────────
@@ -1127,6 +1239,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			return c.sendEncrypted(ctx, params)
 		}
 		// encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
+		c.maybeAppendEchoTraceSend(params)
 	}
 
 	// 自动加密：group.send 默认加密
@@ -1141,6 +1254,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		if encrypt {
 			return c.sendGroupEncrypted(ctx, params)
 		}
+		c.maybeAppendEchoTraceSend(params)
 	}
 	if method == "group.thought.put" {
 		encrypt := true
@@ -1516,13 +1630,8 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (r
 	persistRequired := truthyBool(params["persist_required"]) || truthyBool(params["durable"])
 	encryptOpts := E2EEEncryptOptions{ProtectedHeaders: c.protectedHeadersFromParams(params)}
 
-	// 惰性同步：首次发送 P2P 消息时先 pull 一次，确保 seq 状态就绪
-	c.p2pSyncedMu.Lock()
-	synced := c.p2pSynced
-	c.p2pSyncedMu.Unlock()
-	if !synced {
-		c.lazySyncP2p()
-	}
+	// 惰性 P2P 同步由 connect/reconnect 完成后的 fillP2pGap goroutine 触发，
+	// 不再在 send 路径上阻塞（与 C++ FillP2PGap 行为对齐）。
 
 	// sendAttempt 封装单次发送逻辑；refresh=true 时强制刷新对端 prekey/cert 缓存
 	sendAttempt := func(refresh bool) (any, error) {
@@ -1540,15 +1649,9 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (r
 		if err != nil {
 			return nil, err
 		}
-		// 只要有 recipient prekey 就走 multi_device 路径（即使只有 1 个 device + 0 self copies）。
-		// 这确保服务端为每个已注册设备存储副本，离线设备重连后能 pull 到。
-		// single 路径仅在完全没有 recipient prekey 时使用（legacy 兼容）。
+		// 统一 multi-device 路径：必须有 recipient prekey
 		if len(recipientPrekeys) == 0 {
-			var prekey map[string]any
-			if len(recipientPrekeys) == 1 {
-				prekey = recipientPrekeys[0]
-			}
-			return c.sendEncryptedSingle(ctx, toAID, payload, messageID, timestamp, prekey, persistRequired, encryptOpts)
+			return nil, fmt.Errorf("no registered device prekeys for %s, cannot send encrypted message", toAID)
 		}
 		recipientCopies, err := c.buildRecipientDeviceCopies(ctx, toAID, payload, messageID, timestamp, recipientPrekeys, encryptOpts)
 		if err != nil {
@@ -1595,54 +1698,6 @@ func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (r
 	}
 	c.logE2.Debug("message.send encrypted send succeeded: to=%s message_id=%s", toAID, messageID)
 	return result, nil
-}
-
-func (c *AUNClient) sendEncryptedSingle(
-	ctx context.Context,
-	toAID string,
-	payload map[string]any,
-	messageID string,
-	timestamp int64,
-	prekey map[string]any,
-	persistRequired bool,
-	encryptOpts E2EEEncryptOptions,
-) (any, error) {
-	var err error
-	if prekey == nil {
-		prekey, err = c.fetchPeerPrekey(ctx, toAID)
-		if err != nil {
-			return nil, err
-		}
-	}
-	peerCertFingerprint := strings.TrimSpace(strings.ToLower(getStr(prekey, "cert_fingerprint", "")))
-	peerCertPEM, err := c.fetchPeerCert(ctx, toAID, peerCertFingerprint)
-	if err != nil {
-		return nil, err
-	}
-	envelope, encryptResult, err := c.encryptCopyPayload(toAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.ensureEncryptResult(toAID, encryptResult); err != nil {
-		return nil, err
-	}
-	sendParams := map[string]any{
-		"to":         toAID,
-		"payload":    envelope,
-		"type":       "e2ee.encrypted",
-		"encrypted":  true,
-		"message_id": messageID,
-		"timestamp":  timestamp,
-	}
-	if persistRequired {
-		sendParams["persist_required"] = true
-	}
-	result, err := c.transport.Call(ctx, "message.send", sendParams)
-	if err != nil {
-		prekeyID, _ := prekey["prekey_id"].(string)
-		c.logE2.Warn("warning: E2EE message send failed, prekey consumed and cannot be rolled back (to=%s, prekey_id=%s): %v", toAID, prekeyID, err)
-	}
-	return result, err
 }
 
 func (c *AUNClient) buildRecipientDeviceCopies(
@@ -2531,11 +2586,114 @@ func (c *AUNClient) normalizePublishedMessagePayload(event string, payload any) 
 }
 
 func (c *AUNClient) publishAppEvent(event string, payload any) {
+	if event == "message.received" || event == "group.message_created" {
+		if msg, ok := payload.(map[string]any); ok {
+			c.maybeAppendEchoTraceReceive(msg)
+		}
+	}
+	c.injectAgentMDEtag(payload)
 	c.events.Publish(event, c.normalizePublishedMessagePayload(event, payload))
 }
 
 func (c *AUNClient) publishAppEventSync(event string, payload any) {
+	if event == "message.received" || event == "group.message_created" {
+		if msg, ok := payload.(map[string]any); ok {
+			c.maybeAppendEchoTraceReceive(msg)
+		}
+	}
+	c.injectAgentMDEtag(payload)
 	c.events.publishSync(event, c.normalizePublishedMessagePayload(event, payload))
+}
+
+// injectAgentMDEtag 在应用层事件 payload 中注入 _agent_md 字段，让应用层判断版本一致性；
+// 仅当 payload 是 map 且尚未携带 _agent_md 时注入；任一 etag 非空即注入；失败不影响业务。
+func (c *AUNClient) injectAgentMDEtag(payload any) {
+	m, ok := payload.(map[string]any)
+	if !ok || m == nil {
+		return
+	}
+	if _, exists := m["_agent_md"]; exists {
+		return
+	}
+	c.agentMdMu.RLock()
+	localEtag := c.localAgentMDEtag
+	remoteEtag := c.remoteAgentMDEtag
+	c.agentMdMu.RUnlock()
+	if localEtag == "" && remoteEtag == "" {
+		return
+	}
+	m["_agent_md"] = map[string]any{
+		"local_etag":  localEtag,
+		"remote_etag": remoteEtag,
+	}
+}
+
+func (c *AUNClient) isEchoPayload(payload any) (map[string]any, string, bool) {
+	p, ok := payload.(map[string]any)
+	if !ok {
+		return nil, "", false
+	}
+	text, ok := p["text"].(string)
+	if !ok || len(text) > 4096 {
+		return nil, "", false
+	}
+	firstLine := text
+	if idx := strings.IndexByte(text, '\n'); idx >= 0 {
+		firstLine = text[:idx]
+	}
+	if !strings.Contains(strings.ToLower(firstLine), "echo") {
+		return nil, "", false
+	}
+	return p, text, true
+}
+
+func (c *AUNClient) echoTimestamp() string {
+	now := time.Now()
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", now.Hour(), now.Minute(), now.Second(), now.Nanosecond()/1e6)
+}
+
+func (c *AUNClient) maybeAppendEchoTraceSend(params map[string]any) {
+	if enc, ok := params["encrypted"].(bool); ok && enc {
+		return
+	}
+	p, text, ok := c.isEchoPayload(params["payload"])
+	if !ok {
+		return
+	}
+	c.mu.RLock()
+	aid := c.aid
+	connAt := c.connectedAt
+	c.mu.RUnlock()
+	uptime := int(time.Since(connAt).Seconds())
+	trace := fmt.Sprintf("%s [AUN-SDK.send] aid=%s conn_uptime=%ds", c.echoTimestamp(), aid, uptime)
+	newPayload := make(map[string]any, len(p))
+	for k, v := range p {
+		newPayload[k] = v
+	}
+	newPayload["text"] = text + "\n" + trace
+	params["payload"] = newPayload
+}
+
+func (c *AUNClient) maybeAppendEchoTraceReceive(msg map[string]any) {
+	if enc, ok := msg["encrypted"].(bool); ok && enc {
+		return
+	}
+	p, text, ok := c.isEchoPayload(msg["payload"])
+	if !ok {
+		return
+	}
+	c.mu.RLock()
+	aid := c.aid
+	connAt := c.connectedAt
+	c.mu.RUnlock()
+	uptime := int(time.Since(connAt).Seconds())
+	trace := fmt.Sprintf("%s [AUN-SDK.receive] aid=%s conn_uptime=%ds", c.echoTimestamp(), aid, uptime)
+	newPayload := make(map[string]any, len(p))
+	for k, v := range p {
+		newPayload[k] = v
+	}
+	newPayload["text"] = text + "\n" + trace
+	msg["payload"] = newPayload
 }
 
 func (c *AUNClient) messageTargetsCurrentInstance(message any) bool {
@@ -2617,11 +2775,6 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 	myAID := c.aid
 	c.mu.RUnlock()
 	if seq > 0 && myAID != "" {
-		// 收到推送即标记 P2P 已同步
-		c.p2pSyncedMu.Lock()
-		c.p2pSynced = true
-		c.p2pSyncedMu.Unlock()
-
 		ns := "p2p:" + myAID
 		needPull := c.seqTracker.OnMessageSeq(ns, seq)
 		if needPull {
@@ -3061,54 +3214,6 @@ func (c *AUNClient) fillP2pGap() {
 	nsKey := "p2p:" + myAID
 	c.log.Debug("fillP2pGap completed: recovered %d messages", len(messages))
 	c.publishGapFillMessages(nsKey, messages)
-}
-
-// lazySyncP2p 惰性同步：首次激活 P2P 通道时 pull 最近消息，建立 seq 基线。
-func (c *AUNClient) lazySyncP2p() {
-	c.log.Debug("lazySyncP2p entry")
-	c.p2pSyncedMu.Lock()
-	c.p2pSynced = true
-	c.p2pSyncedMu.Unlock()
-
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	if myAID == "" {
-		return
-	}
-
-	ns := "p2p:" + myAID
-	afterSeq := c.seqTracker.GetContiguousSeq(ns)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	result, err := c.transport.Call(ctx, "message.pull", map[string]any{
-		"after_seq": afterSeq,
-		"limit":     200,
-	})
-	if err != nil {
-		c.log.Warn("lazy sync P2P failed: %v", err)
-		return
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return
-	}
-	messages, ok := resultMap["messages"].([]any)
-	if !ok {
-		return
-	}
-	for _, raw := range messages {
-		if msg, ok := raw.(map[string]any); ok {
-			s := int(toInt64(msg["seq"]))
-			if s > 0 {
-				c.seqTracker.OnMessageSeq(ns, s)
-			}
-		}
-	}
-	if len(messages) > 0 {
-		c.saveSeqTrackerState()
-		c.log.Warn("lazy sync P2P: pulled %d messages, after_seq=%d", len(messages), afterSeq)
-	}
 }
 
 // prunePushedSeqs 清理 pushedSeqs 中 <= contiguousSeq 的条目，防止无限增长
@@ -5534,20 +5639,32 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 				}
 				c.mu.Unlock()
 			}
+			if hello, ok := authContext["hello"].(map[string]any); ok && hello != nil {
+				if raw, exists := hello["heartbeat_interval"]; exists {
+					c.applyServerHeartbeatInterval(raw, "auth")
+				}
+			}
 		}
 	} else {
 		accessToken, _ := params["access_token"].(string)
-		if initErr := c.auth.InitializeWithToken(ctx, c.transport, challenge, accessToken, connectionKind, shortTtlMs, extraInfo); initErr != nil {
+		hello, initErr := c.auth.InitializeWithToken(ctx, c.transport, challenge, accessToken, connectionKind, shortTtlMs, extraInfo)
+		if initErr != nil {
 			c.log.Error("auth failed (InitializeWithToken): gateway=%s err=%v", gatewayURL, initErr)
 			err = initErr
 			return err
 		}
 		c.syncIdentityAfterConnect(accessToken)
+		if hello != nil {
+			if raw, exists := hello["heartbeat_interval"]; exists {
+				c.applyServerHeartbeatInterval(raw, "auth")
+			}
+		}
 	}
 
 	// auth 阶段 aid 可能被 identity 覆盖；若 context 发生变化，重做 refresh + restore 兜底
 	c.mu.Lock()
 	c.state = StateConnected
+	c.connectedAt = time.Now()
 	prevContext := c.seqTrackerContext
 	c.refreshSeqTrackerContextLocked()
 	contextChanged := c.seqTrackerContext != prevContext
@@ -5607,9 +5724,6 @@ func (c *AUNClient) resetSeqTrackingStateLocked() {
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
-	c.p2pSyncedMu.Lock()
-	c.p2pSynced = false
-	c.p2pSyncedMu.Unlock()
 }
 
 func (c *AUNClient) refreshSeqTrackerContextLocked() {
@@ -5634,9 +5748,6 @@ func (c *AUNClient) refreshSeqTrackerContextLocked() {
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
-	c.p2pSyncedMu.Lock()
-	c.p2pSynced = false
-	c.p2pSyncedMu.Unlock()
 }
 
 // resolveGateway 解析 Gateway URL
@@ -5697,59 +5808,55 @@ func (c *AUNClient) startBackgroundTasks(_ context.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ctx = ctx
 	c.cancel = cancel
-	// 短连接生命周期短，禁用心跳与 token 刷新（不接收推送、不需要长期会话维护）
 	connectionKind := ""
 	if opts := c.sessionOptions; opts != nil {
 		connectionKind, _ = opts["connection_kind"].(string)
 	}
 	c.mu.Unlock()
 
-	if connectionKind == "short" {
-		return
+	// 短连接不启动 heartbeat 与 token 自动刷新（短连接生命周期短，不需要长期会话维护；
+	// 但 auto_reconnect 仍允许，由上层根据 sessionOptions.auto_reconnect 决定）
+	if connectionKind != "short" {
+		go c.heartbeatLoop(ctx)
+		go c.tokenRefreshLoop(ctx)
 	}
-
-	// 心跳循环
-	go c.heartbeatLoop(ctx)
-	// Token 刷新循环
-	go c.tokenRefreshLoop(ctx)
 	// 群组 epoch 相关任务
 	c.startGroupEpochTasks(ctx)
 }
 
-// heartbeatLoop 心跳循环
+// heartbeatLoop 心跳循环；支持运行时通过 applyServerHeartbeatInterval 调整间隔。
 func (c *AUNClient) heartbeatLoop(ctx context.Context) {
-	c.mu.RLock()
-	interval := 30.0
-	if opts := c.sessionOptions; opts != nil {
-		if raw, exists := opts["heartbeat_interval"]; exists {
-			if v, ok := raw.(float64); ok {
-				if v <= 0 {
-					c.mu.RUnlock()
-					return
-				}
-				interval = v
-			}
-		}
-	}
-	c.mu.RUnlock()
-
-	interval = effectiveHeartbeatIntervalSeconds(interval)
-	if interval <= 0 {
-		return
-	}
-
-	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
-	defer ticker.Stop()
-
 	consecutiveFailures := 0
 	maxFailures := 3 // 连续失败 3 次触发重连
+
+	currentInterval := c.readEffectiveHeartbeatInterval()
+	if currentInterval <= 0 {
+		// 启动时已关闭：等 nudge 唤醒（pong/auth 下发新值后才会启动）
+		// 这里先 return；调用方在 applyServerHeartbeatInterval 检测到值变化时会 go heartbeatLoop 重新启动
+		return
+	}
+	timer := time.NewTimer(time.Duration(currentInterval * float64(time.Second)))
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// 先检查 ctx 是否已取消，避免用已取消的 context 发心跳导致误判
+		case <-c.heartbeatNudge:
+			// 间隔变化：重读，重置 timer；不发心跳
+			newInterval := c.readEffectiveHeartbeatInterval()
+			if newInterval <= 0 {
+				return
+			}
+			currentInterval = newInterval
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(time.Duration(currentInterval * float64(time.Second)))
+		case <-timer.C:
 			select {
 			case <-ctx.Done():
 				return
@@ -5764,11 +5871,11 @@ func (c *AUNClient) heartbeatLoop(ctx context.Context) {
 			}
 			if state != StateConnected {
 				consecutiveFailures = 0
+				timer.Reset(time.Duration(currentInterval * float64(time.Second)))
 				continue
 			}
-			_, err := c.transport.Call(ctx, "meta.ping", map[string]any{})
+			result, err := c.transport.Call(ctx, "meta.ping", map[string]any{})
 			if err != nil {
-				// ctx 取消导致的失败不算心跳失败
 				if ctx.Err() != nil {
 					return
 				}
@@ -5782,8 +5889,63 @@ func (c *AUNClient) heartbeatLoop(ctx context.Context) {
 				}
 			} else {
 				consecutiveFailures = 0
+				// 服务端可在 pong 中下发新的 heartbeat_interval（秒，0=关闭）
+				if pong, ok := result.(map[string]any); ok {
+					if raw, exists := pong["heartbeat_interval"]; exists {
+						c.applyServerHeartbeatInterval(raw, "pong")
+					}
+				}
 			}
+			// 重读，可能在上面 applyServerHeartbeatInterval 中改了
+			newInterval := c.readEffectiveHeartbeatInterval()
+			if newInterval <= 0 {
+				return
+			}
+			currentInterval = newInterval
+			timer.Reset(time.Duration(currentInterval * float64(time.Second)))
 		}
+	}
+}
+
+// readEffectiveHeartbeatInterval 读取并 clamp 当前的心跳间隔（秒）。
+func (c *AUNClient) readEffectiveHeartbeatInterval() float64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if opts := c.sessionOptions; opts != nil {
+		if raw, exists := opts["heartbeat_interval"]; exists {
+			return clampHeartbeatInterval(raw)
+		}
+	}
+	return 0
+}
+
+// applyServerHeartbeatInterval 服务端通过 hello/pong 下发心跳间隔；
+// clamp 后写入 sessionOptions 并通过 heartbeatNudge 唤醒心跳循环。
+// 若当前心跳未运行（之前是 0），且新值为正，则启动心跳。
+func (c *AUNClient) applyServerHeartbeatInterval(raw any, source string) {
+	newInterval := clampHeartbeatInterval(raw)
+	c.mu.Lock()
+	var oldInterval float64
+	if opts := c.sessionOptions; opts != nil {
+		if cur, ok := opts["heartbeat_interval"]; ok {
+			oldInterval = clampHeartbeatInterval(cur)
+		}
+		opts["heartbeat_interval"] = newInterval
+	}
+	ctx := c.ctx
+	c.mu.Unlock()
+	if newInterval == oldInterval {
+		return
+	}
+	c.log.Debug("heartbeat_interval updated by %s: %v -> %v", source, oldInterval, newInterval)
+	// 唤醒已在跑的心跳循环
+	select {
+	case c.heartbeatNudge <- struct{}{}:
+	default:
+	}
+	// 之前 interval=0 没起循环，新值为正时启动
+	if oldInterval <= 0 && newInterval > 0 && ctx != nil {
+		go c.heartbeatLoop(ctx)
 	}
 }
 
@@ -7726,11 +7888,6 @@ func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 	if v, ok := params["connection_kind"].(string); ok && v != "" {
 		connectionKind = v
 	}
-	// 短连接默认禁用 auto_reconnect：短连接生命周期短，自动重连无意义
-	defaultAutoReconnect := true
-	if connectionKind == "short" {
-		defaultAutoReconnect = false
-	}
 
 	shortTtlMs := 0
 	if v, ok := params["short_ttl_ms"].(int); ok {
@@ -7738,7 +7895,7 @@ func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 	}
 
 	options := map[string]any{
-		"auto_reconnect":       defaultAutoReconnect,
+		"auto_reconnect":       true,
 		"heartbeat_interval":   30.0,
 		"token_refresh_before": 1800.0,
 		"retry": map[string]any{
@@ -7747,7 +7904,7 @@ func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 		},
 		"timeouts": map[string]any{
 			"connect": 5.0,
-			"call":    10.0,
+			"call":    35.0,
 			"http":    30.0,
 		},
 		"connection_kind": connectionKind,

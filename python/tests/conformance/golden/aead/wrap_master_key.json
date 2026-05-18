@@ -1,0 +1,7 @@
+{
+  "description": "Wrap 32-byte master_key (V2 scenario)",
+  "wrap_key_b64": "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0=",
+  "wrap_nonce_b64": "7+/v7+/v7+/v7+/v",
+  "master_key_b64": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=",
+  "expected_wrapped_key_b64": "nyvdkvMat3yl4ro4XH+gVU7TB3lREGhNXdO23y7jz+m0cgkQVnxC31isNo8CDM4b"
+}

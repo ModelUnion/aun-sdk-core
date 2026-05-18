@@ -508,6 +508,7 @@ describe('AUNClient prekey 证书指纹编排', () => {
       public_key: 'pub',
       signature: 'sig',
       cert_fingerprint: 'sha256:abc',
+      device_id: 'dev-1',
     }]);
     (client as any)._fetchPeerCert = vi.fn().mockResolvedValue('CERT');
     (client as any)._e2ee.encryptOutbound = vi.fn().mockResolvedValue([
@@ -525,32 +526,19 @@ describe('AUNClient prekey 证书指纹编排', () => {
     expect((client as any)._fetchPeerCert).toHaveBeenCalledWith('bob.example.com', 'sha256:abc');
   });
 
-  it('无 prekey 时应继续走 long_term_key 路径', async () => {
+  it('无 prekey 时应报错（multi-device 架构不再降级）', async () => {
     const client = new AUNClient();
     ((client as any).configModel).requireForwardSecrecy = false;
     (client as any)._fetchPeerPrekeys = vi.fn().mockResolvedValue([]);
     (client as any)._fetchPeerPrekey = vi.fn().mockResolvedValue(null);
     (client as any)._fetchPeerCert = vi.fn().mockResolvedValue('CERT');
-    (client as any)._e2ee.encryptOutbound = vi.fn().mockResolvedValue([
-      { ciphertext: 'ok', sender_cert_fingerprint: 'sha256:sender' },
-      { encrypted: true, forward_secrecy: false, mode: 'long_term_key', degraded: true, degradation_reason: 'no_prekey_available' },
-    ]);
-    (client as any)._dispatcher.publish = vi.fn().mockResolvedValue(undefined);
-    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
 
-    const result = await (client as any)._sendEncrypted({
-      to: 'bob.example.com',
-      payload: { type: 'text', text: 'hello' },
-    });
-
-    expect(result).toEqual({ ok: true });
-    expect((client as any)._fetchPeerPrekey).toHaveBeenCalledWith('bob.example.com');
-    expect((client as any)._fetchPeerCert).toHaveBeenCalledWith('bob.example.com', undefined);
-    expect((client as any)._e2ee.encryptOutbound).toHaveBeenCalledWith(
-      'bob.example.com',
-      { type: 'text', text: 'hello' },
-      expect.objectContaining({ prekey: null }),
-    );
+    await expect(
+      (client as any)._sendEncrypted({
+        to: 'bob.example.com',
+        payload: { type: 'text', text: 'hello' },
+      }),
+    ).rejects.toThrow(/no registered device prekeys/);
   });
 });
 
@@ -725,7 +713,7 @@ describe('AUNClient M25 重连行为', () => {
     }
   });
 
-  it('正数 heartbeat_interval 小于 30 秒时按 30 秒调度', async () => {
+  it('正数 heartbeat_interval 小于 10 秒时按 10 秒调度（M25 后阈值=2）', async () => {
     vi.useFakeTimers();
     try {
       const client = new AUNClient();
@@ -741,7 +729,7 @@ describe('AUNClient M25 重连行为', () => {
       const disconnectSpy = vi.spyOn(client as any, '_handleTransportDisconnect').mockResolvedValue(undefined);
 
       (client as any)._startHeartbeat();
-      await vi.advanceTimersByTimeAsync(29_999);
+      await vi.advanceTimersByTimeAsync(9_999);
       await Promise.resolve();
       expect((client as any)._transport.call).not.toHaveBeenCalled();
 
@@ -750,10 +738,95 @@ describe('AUNClient M25 重连行为', () => {
       expect((client as any)._transport.call).toHaveBeenCalledTimes(1);
       expect(disconnectSpy).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(10_000);
       await Promise.resolve();
       expect((client as any)._transport.call).toHaveBeenCalledTimes(2);
       expect(disconnectSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('_applyServerHeartbeatInterval 处理 clamp 与启停', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      (client as any)._state = 'connected';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.5, max_delay: 30, max_attempts: 0 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.call = vi.fn().mockResolvedValue({ pong: true });
+
+      // 服务端下发 60 → clamp 通过，写回
+      (client as any)._applyServerHeartbeatInterval(60, 'auth');
+      expect((client as any)._sessionOptions.heartbeat_interval).toBe(60);
+
+      // 服务端下发 5 → clamp 到 10
+      (client as any)._applyServerHeartbeatInterval(5, 'pong');
+      expect((client as any)._sessionOptions.heartbeat_interval).toBe(10);
+
+      // 服务端下发 9999 → clamp 到 600
+      (client as any)._applyServerHeartbeatInterval(9999, 'pong');
+      expect((client as any)._sessionOptions.heartbeat_interval).toBe(600);
+
+      // 服务端下发 0 → 关闭，定时器被清
+      (client as any)._applyServerHeartbeatInterval(0, 'pong');
+      expect((client as any)._sessionOptions.heartbeat_interval).toBe(0);
+      expect((client as any)._heartbeatTimer).toBeNull();
+
+      // 再下发非零 → 重新启动
+      (client as any)._applyServerHeartbeatInterval(45, 'auth');
+      expect((client as any)._sessionOptions.heartbeat_interval).toBe(45);
+      expect((client as any)._heartbeatTimer).not.toBeNull();
+
+      // 收尾
+      (client as any)._closing = true;
+      if ((client as any)._heartbeatTimer) clearInterval((client as any)._heartbeatTimer);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('心跳收到 pong.heartbeat_interval 后下次按新间隔调度', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AUNClient();
+      (client as any)._state = 'connected';
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.5, max_delay: 30, max_attempts: 0 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      const callMock = vi.fn().mockResolvedValue({ pong: true, heartbeat_interval: 60 });
+      (client as any)._transport.call = callMock;
+
+      (client as any)._startHeartbeat();
+      // 触发第一次心跳（30s 后）
+      await vi.advanceTimersByTimeAsync(30_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(callMock).toHaveBeenCalledTimes(1);
+      expect((client as any)._sessionOptions.heartbeat_interval).toBe(60);
+
+      // 30s 后不该触发，60s 后才触发
+      await vi.advanceTimersByTimeAsync(30_000);
+      await Promise.resolve();
+      expect(callMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(callMock).toHaveBeenCalledTimes(2);
+
+      // 收尾
+      (client as any)._closing = true;
+      if ((client as any)._heartbeatTimer) clearInterval((client as any)._heartbeatTimer);
     } finally {
       vi.useRealTimers();
     }

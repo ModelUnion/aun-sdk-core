@@ -15,6 +15,7 @@
 - [disconnect()](#await-disconnect---none) - 断开连接（可重连）
 - [list_identities()](#list_identities---listdict) - 列出本地身份
 - [ping()](#await-pingparams-dict--none---any) - 连通性探测
+- [set_local_agent_md_path()](#set_local_agent_md_pathpath-str---str--agentmd-版本一致性) - 配置本地 agent.md 路径，与服务端 etag 比对
 - [status()](#await-statusparams-dict--none---any) - 网关状态查询
 - [check_gateway_health()](#await-check_gateway_healthgateway_url-str-timeout-float--50---bool) - 检查网关可用性
 
@@ -390,6 +391,61 @@ for item in identities:
 ### `await ping(params: dict | None) -> Any`
 
 调用 `meta.ping` RPC，等价于 `await client.meta.ping(params)`。用于连通性探测或心跳检测。
+
+---
+
+### `set_local_agent_md_path(path: str) -> str` — agent.md 版本一致性
+
+记录本地 `agent.md` 文件路径并一次性计算 etag（带引号的 sha256 hex，与服务端 `_agent_md_etag` 算法严格一致）。
+
+**用途：** 配合服务端 Gateway 在每次 RPC 响应注入的 `_meta.agent_md_etag`，让 SDK 应用层判断 "本地 agent.md 是否已发布到服务端 / 服务端是否有新版本"。
+
+**API 跨语言对齐：**
+
+| SDK | 设置方法 | 读本地 etag | 读远端 etag |
+|------|---------|-----------|----------|
+| Python | `client.set_local_agent_md_path(path)` | `client.get_local_agent_md_etag()` | `client.get_remote_agent_md_etag()` |
+| TypeScript | `client.setLocalAgentMdPath(path)` | `client.getLocalAgentMdEtag()` | `client.getRemoteAgentMdEtag()` |
+| Go | `client.SetLocalAgentMDPath(path) string` | `client.GetLocalAgentMDEtag() string` | `client.GetRemoteAgentMDEtag() string` |
+| C++ | `client.SetLocalAgentMdPath(path)` | `client.GetLocalAgentMdEtag()` | `client.GetRemoteAgentMdEtag()` |
+| JavaScript（浏览器） | `client.setLocalAgentMdContent(content)` | `client.getLocalAgentMdEtag()` | `client.getRemoteAgentMdEtag()` |
+
+**JavaScript 特殊说明：** 浏览器无法读本地文件，改为接收文本内容直接计算 etag（业务侧可用 `<input type=file>` 读出文本传入）。TS SDK 在 Node 环境读文件，浏览器环境返回空串并 warn。
+
+**返回值：** 当前 etag（形如 `"abc123..."` 带引号），文件不存在/读取失败时返回空串，**不抛异常**。
+
+**应用层事件注入：** SDK 在 publish `message.received` / `group.message_created` 等应用事件时，会自动给 payload 加 `_agent_md` 字段：
+
+```python
+{
+  "_agent_md": {
+    "local_etag": "\"abc...\"",   # 本地 agent.md 的 etag
+    "remote_etag": "\"def...\"",  # gateway 注入的服务端 etag
+  },
+  # ... 原有业务字段
+}
+```
+
+**典型用法：**
+
+```python
+client = AUNClient()
+client.set_local_agent_md_path("/path/to/agent.md")  # 启动时调一次
+
+await client.connect(auth)
+
+@client.on("message.received")
+async def on_msg(payload):
+    meta = payload.get("_agent_md", {})
+    if meta["local_etag"] and meta["remote_etag"] and meta["local_etag"] != meta["remote_etag"]:
+        # 本地与服务端不一致，提示用户重新上传
+        print("agent.md 已变化，请调用 client.auth.upload_agent_md() 同步")
+```
+
+**注意事项：**
+- 文件改了之后需要再次调用 `set_local_agent_md_path()` 触发重算（设计上一次性计算，不监听文件 mtime）
+- 服务端 etag 来自 Gateway 缓存（5 分钟 TTL，上传后通过 kernel 事件立即失效）
+- 注入失败被吞，**绝不影响业务路径**
 
 ---
 

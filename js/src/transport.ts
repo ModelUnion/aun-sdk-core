@@ -91,6 +91,9 @@ export class RPCTransport {
     resolve: (value: RpcMessage) => void;
     reject: (error: Error) => void;
   }> = new Map();
+  // Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
+  // 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
+  private _metaObserver: ((meta: JsonObject) => void) | null = null;
 
   constructor(opts: {
     eventDispatcher: EventDispatcher;
@@ -105,6 +108,16 @@ export class RPCTransport {
   /** 设置默认超时（秒） */
   setTimeout(timeout: number): void {
     this._timeout = timeout;
+  }
+
+  /**
+   * 注册 RPC envelope `_meta` 字段观察者；observer(meta) 在每次成功 RPC 时调用。
+   *
+   * Gateway 注入的 `_meta` 与业务无关（如 `agent_md_etag`），observer 抛异常会被吞掉，
+   * 不影响 RPC result 返回。
+   */
+  setMetaObserver(observer: ((meta: JsonObject) => void) | null): void {
+    this._metaObserver = observer;
   }
 
   /** 获取连接时收到的 challenge */
@@ -263,6 +276,17 @@ export class RPCTransport {
         throw new SerializationError(`rpc response missing result and error: ${method}`);
       }
       this._log.debug(`RPC response ok: method=${method}, id=${rpcId}, elapsed=${elapsed}ms ${summarizeDict(response.result, DIAG_RESULT_FIELDS)}`);
+      // 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
+      if (this._metaObserver !== null) {
+        const meta = (response as Record<string, unknown>)._meta;
+        if (isJsonObject(meta)) {
+          try {
+            this._metaObserver(meta as JsonObject);
+          } catch (exc) {
+            this._log.debug(`meta_observer raised: ${String(exc)}`);
+          }
+        }
+      }
       return response.result;
     } finally {
       if (timeoutHandle !== null) {

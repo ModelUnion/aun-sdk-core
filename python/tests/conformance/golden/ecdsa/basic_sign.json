@@ -1,0 +1,7 @@
+{
+  "description": "ECDSA-SHA256 RAW sign (RFC 6979)",
+  "private_key_b64": "pixVw1Nzw9kwG88AXzwvln1EDj59XpREtdl19ohv84E=",
+  "public_key_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w==",
+  "message_b64": "aGVsbG8gYXVuIHYy",
+  "expected_signature_b64": "NXRwQ7VRkDpKnO4MkQN4lX5KrJbv7zENoPrwQMA1Sh0HJUlo+1cc9ncX04QRKjMLHzHUeti7RVvQPzqXwtz0rg=="
+}

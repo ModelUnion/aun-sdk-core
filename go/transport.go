@@ -99,12 +99,17 @@ type RPCTransport struct {
 	challengeMu   sync.RWMutex
 	cancelReader  context.CancelFunc
 	readerDone    chan struct{}
+
+	// Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
+	// 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
+	metaObserver   func(map[string]any)
+	metaObserverMu sync.RWMutex
 }
 
 // NewRPCTransport 创建 RPC 传输层
 func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisconnect func(error, int), verifySSL bool) *RPCTransport {
 	if timeout == 0 {
-		timeout = 10 * time.Second
+		timeout = 35 * time.Second
 	}
 	t := &RPCTransport{
 		dispatcher:   dispatcher,
@@ -120,6 +125,32 @@ func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisco
 // SetTimeout 设置 RPC 调用超时时间（线程安全）
 func (t *RPCTransport) SetTimeout(timeout time.Duration) {
 	t.timeout.Store(int64(timeout))
+}
+
+// SetMetaObserver 注册 RPC envelope _meta 字段观察者；observer(meta) 在每次成功 RPC 时调用。
+//
+// Gateway 注入的 _meta 与业务无关（如 agent_md_etag），observer panic 会被 recover 吞掉，
+// 不影响 RPC result 返回。传入 nil 表示移除观察者。
+func (t *RPCTransport) SetMetaObserver(observer func(map[string]any)) {
+	t.metaObserverMu.Lock()
+	t.metaObserver = observer
+	t.metaObserverMu.Unlock()
+}
+
+// invokeMetaObserver 安全调用 metaObserver；observer panic 被 recover 吞掉。
+func (t *RPCTransport) invokeMetaObserver(meta map[string]any) {
+	t.metaObserverMu.RLock()
+	observer := t.metaObserver
+	t.metaObserverMu.RUnlock()
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			pkgLogTransport().Debug("metaObserver panic: %v", r)
+		}
+	}()
+	observer(meta)
 }
 
 // getTimeout 获取当前超时设置（线程安全）
@@ -336,6 +367,10 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 			}
 		}
 		pkgLogTransport().Debug("RPC response ok: method=%s id=%s elapsed=%dms %s", method, rpcID, time.Since(tStart).Milliseconds(), summarizeDict(response["result"], diagResultFields))
+		// 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
+		if meta, ok := response["_meta"].(map[string]any); ok {
+			t.invokeMetaObserver(meta)
+		}
 		return response["result"], nil
 
 	case <-timer.C:

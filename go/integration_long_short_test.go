@@ -549,10 +549,10 @@ func TestLongShort_HelloOkConnectionKind(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 集成测试 8: 短连接 connect 后验证 auto_reconnect=false
+// 集成测试 8: 短连接 connect 后验证 connection_kind=short
 // ---------------------------------------------------------------------------
 
-func TestLongShort_ShortDisablesBackgroundTasks(t *testing.T) {
+func TestLongShort_ShortDisablesTokenRefresh(t *testing.T) {
 	rid := rid8()
 	sharedPath := t.TempDir()
 	aid := makeAID("d8", rid)
@@ -566,17 +566,13 @@ func TestLongShort_ShortDisablesBackgroundTasks(t *testing.T) {
 	}
 
 	short.mu.RLock()
-	autoReconnect, _ := short.sessionOptions["auto_reconnect"].(bool)
 	kind, _ := short.sessionOptions["connection_kind"].(string)
 	short.mu.RUnlock()
 
-	if autoReconnect {
-		t.Fatalf("短连接 auto_reconnect 应为 false, got true")
-	}
 	if kind != "short" {
 		t.Fatalf("短连接 connection_kind 应为 'short', got '%s'", kind)
 	}
-	t.Log("[OK] 短连接 auto_reconnect=false, connection_kind=short")
+	t.Log("[OK] 短连接 connection_kind=short")
 }
 
 // ---------------------------------------------------------------------------
