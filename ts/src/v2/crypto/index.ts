@@ -3,3 +3,10 @@ export { ecdhComputeShared, generateP256Keypair, privateToPublicDer } from './ec
 export { hkdfSha256 } from './hkdf.js';
 export { aesGcmEncrypt, aesGcmDecrypt } from './aead.js';
 export { ecdsaSignRaw, ecdsaVerifyRaw, privateScalarToPublicDer } from './ecdsa.js';
+export {
+  compute1DHWrap,
+  compute3DHWrap,
+  INFO_1DH,
+  INFO_3DH,
+  WRAP_KEY_LENGTH,
+} from './dh-path.js';
