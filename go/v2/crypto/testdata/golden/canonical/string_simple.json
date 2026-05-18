@@ -1,0 +1,5 @@
+{
+  "description": "canonical_json input",
+  "input": "hello",
+  "expected_output_b64": "ImhlbGxvIg=="
+}
