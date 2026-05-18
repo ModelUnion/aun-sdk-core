@@ -10,3 +10,12 @@ export {
   INFO_3DH,
   WRAP_KEY_LENGTH,
 } from './dh-path.js';
+export {
+  sortRecipients,
+  computeLeafHash,
+  computeMerkleRoot,
+  computeMerkleProof,
+  verifyMerkleProof,
+  computeRecipientsDigest,
+} from './recipients.js';
+export type { ProofStep } from './recipients.js';
