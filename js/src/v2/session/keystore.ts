@@ -92,7 +92,8 @@ export class V2KeyStore {
       const req = this.store('readonly').get([deviceId, 'spk', spkId]);
       req.onsuccess = () => {
         const r = req.result as V2KeyRecord | undefined;
-        resolve(r ? r.private_key : null);
+        // 用 new Uint8Array(...) 拷贝，规避 fake-indexeddb / 跨 realm 实例对象
+        resolve(r ? new Uint8Array(r.private_key) : null);
       };
       req.onerror = () => reject(req.error);
     });
@@ -116,7 +117,11 @@ export class V2KeyStore {
           return;
         }
         const r = cursor.value as V2KeyRecord;
-        resolve({ spkId: r.key_id, priv: r.private_key, pubDer: r.public_key });
+        resolve({
+          spkId: r.key_id,
+          priv: new Uint8Array(r.private_key),
+          pubDer: new Uint8Array(r.public_key),
+        });
       };
       req.onerror = () => reject(req.error);
     });
@@ -179,7 +184,9 @@ export class V2KeyStore {
       const req = this.store('readonly').get([deviceId, 'ik', '']);
       req.onsuccess = () => {
         const r = req.result as V2KeyRecord | undefined;
-        resolve(r ? { priv: r.private_key, pubDer: r.public_key } : null);
+        resolve(
+          r ? { priv: new Uint8Array(r.private_key), pubDer: new Uint8Array(r.public_key) } : null,
+        );
       };
       req.onerror = () => reject(req.error);
     });
