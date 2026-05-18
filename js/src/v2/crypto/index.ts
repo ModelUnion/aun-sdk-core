@@ -14,3 +14,12 @@ export {
   INFO_3DH,
   WRAP_KEY_LENGTH,
 } from './dh-path';
+export {
+  sortRecipients,
+  computeLeafHash,
+  computeMerkleRoot,
+  computeMerkleProof,
+  verifyMerkleProof,
+  computeRecipientsDigest,
+} from './recipients';
+export type { ProofStep } from './recipients';

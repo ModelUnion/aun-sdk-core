@@ -1,0 +1,6 @@
+{
+  "description": "empty recipients → digest",
+  "input_rows": [],
+  "expected_sorted_rows": [],
+  "expected_digest_hex": ""
+}
