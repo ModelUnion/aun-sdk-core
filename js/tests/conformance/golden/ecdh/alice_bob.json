@@ -1,0 +1,6 @@
+{
+  "description": "ECDH(Alice_priv, Bob_pub) = shared_secret",
+  "alice_priv_b64": "pixVw1Nzw9kwG88AXzwvln1EDj59XpREtdl19ohv84E=",
+  "bob_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAy/dR85gB8u3wafx7xGDfHfQaCFsOEiHsVRyLTiMoWnIj2Hqp3/HaX9fx1XLbWTG7q5v8HAO202Yj8WtYH1YEA==",
+  "expected_shared_b64": "nBEMVW6CwbU/D+zIPUu9aQmTHwrefhmtyryG+hn8hnk="
+}

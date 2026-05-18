@@ -1,0 +1,6 @@
+{
+  "description": "ECDH(Session_priv, Alice_pub)",
+  "session_priv_b64": "YSJfT/BHTE6J9sDXN495hou7PdjbRqBMLvi46W0NSI4=",
+  "alice_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w==",
+  "expected_shared_b64": "7O4VYvMAcJjngEzMguLygafGTn/zhKMArAR2C2g8dCg="
+}
