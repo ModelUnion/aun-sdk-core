@@ -36,3 +36,11 @@ def main(
     ctx.obj["debug"] = debug
     ctx.obj["no_color"] = no_color
     ctx.obj["timeout"] = timeout
+
+
+from aun_cli.commands.identity import identity_app, register, login, whoami
+
+app.add_typer(identity_app)
+app.command("register")(register)
+app.command("login")(login)
+app.command("whoami")(whoami)
