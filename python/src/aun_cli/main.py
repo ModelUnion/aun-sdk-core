@@ -39,8 +39,11 @@ def main(
 
 
 from aun_cli.commands.identity import identity_app, register, login, whoami
+from aun_cli.commands.message import send, pull
 
 app.add_typer(identity_app)
 app.command("register")(register)
 app.command("login")(login)
 app.command("whoami")(whoami)
+app.command("send")(send)
+app.command("pull")(pull)
