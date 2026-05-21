@@ -41,33 +41,47 @@
 
 每个服务产生 **两个 span**：
 
-**Enter span（进入时）：**
+**Enter span（承载所有诊断信息）：**
 ```python
 {
     "node": "message",           # 模块名
     "ts": 1234567890123,         # 毫秒时间戳
     "action": "enter",           # 固定 "enter"
     "method": "v2.put_peer_pk",  # RPC 方法短名
-    # 业务诊断字段（按模块定制）
+    # 业务诊断字段（按模块定制，尽可能详细）
+    "caller_aid": "yayi2000.agentid.pub",
     "peer_aid": "yayi2000.agentid.pub",
     "key_source": "peer_device_prekey",
+    "spk_id": "sha256:abc123ab",
+    "device_id": "device-xyz",
 }
 ```
 
-**Exit span（退出时）：**
+**Exit span：**
 ```python
 {
     "node": "message",
     "ts": 1234567890130,
     "action": "exit",
-    "method": "v2.put_peer_pk",
-    "ms": 7,                     # 本次调用耗时
-    "status": "ok",              # ok / error
-    # 失败时补充
+    "ms": 7,                     # 耗时（必需）
+    "status": "error",           # ok / error（必需）
+    # 失败时补充错误信息 + 上下文
     "error_code": -32603,
-    "error_msg": "AID cert not found for yayi2000.agentid.pub",
+    "error_msg": "AID cert not found",
+    "peer_aid": "yayi2000.agentid.pub",  # 失败相关的关键上下文
+    "method": "v2.put_peer_pk",
+    # 成功时补充关键结果（可选）
+    "found": false,              # CA 查询结果
+    "delivered_count": 2,        # Message 发送结果
 }
 ```
+
+**设计原则：**
+- **Enter span 承载完整上下文**，方便定位问题根因
+- **Exit span 关注结果和性能**：
+  - 成功时：`ms`、`status=ok`、关键结果字段（found/delivered_count）
+  - 失败时：`ms`、`status=error`、`error_code`、`error_msg`、**失败相关的上下文字段**（aid/method/peer_aid 等）
+- SDK 展示时，enter 行显示完整诊断信息，exit 行显示结果和耗时
 
 #### 1.2 嵌套调用处理
 
@@ -99,23 +113,30 @@
     "node": "gateway",
     "action": "enter",
     "ts": <timestamp>,
+    # 详细诊断信息
     "route": "service_plane",  # direct / service_plane / kernel / fallback
     "namespace": "message",
     "method": "v2.put_peer_pk",
     "aid": "yayi2000.agentid.pub",
     "instance_id": "message#1",  # service_plane 时有值
+    "connection_id": "conn-abc123",
+    "device_id": "device-xyz",
 }
 ```
 
-**Exit span (`relay_out`)：**
+**Exit span：**
 ```python
 {
     "node": "gateway",
     "action": "exit",
     "ts": <timestamp>,
-    "ms": 10,
-    "status": "error",  # ok / error
-    "error_code": -32603,  # 失败时
+    "ms": 10,              # 耗时（必需）
+    "status": "error",     # ok / error（必需）
+    # 失败时补充错误信息 + 上下文
+    "error_code": -32603,
+    "error_msg": "AID cert not found",
+    "method": "v2.put_peer_pk",
+    "aid": "yayi2000.agentid.pub",
 }
 ```
 
@@ -131,10 +152,15 @@
     "node": "message",
     "action": "enter",
     "ts": <timestamp>,
+    # 详细诊断信息
     "method": "v2.put_peer_pk",
     "caller_aid": "yayi2000.agentid.pub",
-    "peer_aid": "yayi2000.agentid.pub",  # 按方法不同
-    # 或 "to_aid" / "group_id" / "from_aid"
+    "peer_aid": "yayi2000.agentid.pub",
+    "key_source": "peer_device_prekey",
+    "spk_id": "sha256:abc123ab",
+    "device_id": "device-xyz",
+    # 或按方法不同：
+    # "to_aid" / "from_aid" / "group_id" / "message_id"
 }
 ```
 
@@ -144,13 +170,17 @@
     "node": "message",
     "action": "exit",
     "ts": <timestamp>,
-    "ms": 7,
-    "status": "error",
+    "ms": 7,               # 耗时（必需）
+    "status": "error",     # ok / error（必需）
+    # 失败时补充错误信息 + 上下文
     "error_code": -32603,
-    "error_msg": "AID cert not found for yayi2000.agentid.pub",
-    # 成功时补充业务字段
-    "found": True,  # bootstrap 方法
+    "error_msg": "AID cert not found",
+    "method": "v2.put_peer_pk",
+    "peer_aid": "yayi2000.agentid.pub",
+    # 成功时补充关键结果
+    "found": true,         # bootstrap 方法
     "delivered_count": 2,  # send 方法
+    "message_id": "msg-xyz",
 }
 ```
 
@@ -169,9 +199,12 @@
     "node": "auth",
     "action": "enter",
     "ts": <timestamp>,
+    # 详细诊断信息
     "method": "verify",  # 或 login_phase1 / login_phase2 / create_aid
     "aid": "yayi2000.agentid.pub",
     "auth_method": "aid",  # pairing_code / kite_token / aid
+    "device_id": "device-xyz",
+    "client_nonce": "nonce-abc...",  # 前 16 位
 }
 ```
 
@@ -181,10 +214,14 @@
     "node": "auth",
     "action": "exit",
     "ts": <timestamp>,
-    "ms": 15,
-    "status": "ok",
-    "success": True,  # verify 方法
-    "created": False,  # create_aid 方法（幂等标识）
+    "ms": 15,              # 耗时（必需）
+    "status": "ok",        # ok / error（必需）
+    # 成功时补充
+    "success": true,       # verify 方法
+    "created": false,      # create_aid 方法（幂等标识）
+    # 失败时补充
+    "error_code": -32001,
+    "error_msg": "invalid signature",
 }
 ```
 
@@ -199,11 +236,13 @@
     "node": "ca",
     "action": "enter",
     "ts": <timestamp>,
+    # 详细诊断信息
     "method": "get_cert",
     "aid": "yayi2000.agentid.pub",
     "curve": "P-256",
     "lifecycle_state": "active_signing",
     "cert_sn": "abc123...",  # 按序列号查询时
+    "cert_fingerprint": "sha256:abc123ab...",  # 按指纹查询时（前 16 位）
 }
 ```
 
@@ -213,10 +252,19 @@
     "node": "ca",
     "action": "exit",
     "ts": <timestamp>,
-    "ms": 2,
-    "status": "ok",
-    "found": False,
+    "ms": 2,               # 耗时（必需）
+    "status": "ok",        # ok / error（必需）
+    # 成功时补充
+    "found": true,
     "cert_sn_prefix": "abc123ab",  # 找到时返回前 8 位
+    "lifecycle_state": "active_signing",
+    # 失败时补充错误信息 + 上下文
+    "found": false,
+    "error_code": -32002,
+    "error_msg": "certificate not found",
+    "method": "get_cert",
+    "aid": "yayi2000.agentid.pub",
+    "curve": "P-256",
 }
 ```
 
@@ -231,10 +279,12 @@
     "node": "group",
     "action": "enter",
     "ts": <timestamp>,
+    # 详细诊断信息
     "method": "create",
     "group_id": "group-abc123",
     "caller_aid": "alice.aid.com",
-    "member_count": 5,
+    "member_aids": ["alice.aid.com", "bob.aid.com", "carol.aid.com"],  # 或 member_count
+    "group_name": "Project Team",
 }
 ```
 
@@ -244,10 +294,16 @@
     "node": "group",
     "action": "exit",
     "ts": <timestamp>,
-    "ms": 12,
-    "status": "ok",
+    "ms": 12,              # 耗时（必需）
+    "status": "ok",        # ok / error（必需）
+    # 成功时补充
     "group_id": "group-abc123",
-    "member_count": 5,
+    "member_count": 3,
+    # 失败时补充错误信息 + 上下文
+    "error_code": -32603,
+    "error_msg": "member not found",
+    "method": "create",
+    "caller_aid": "alice.aid.com",
 }
 ```
 

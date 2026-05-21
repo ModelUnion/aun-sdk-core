@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import typer
 
-from aun_cli.adapter import CLISession, run_async, handle_error
-from aun_cli.output import output_json, output_dict, is_json_mode, set_json_mode
+from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config
+from aun_cli.output import output_json, output_dict, output_error, is_json_mode, set_json_mode
 
 
 def status(ctx: typer.Context) -> None:
@@ -67,3 +68,122 @@ def ping(
     else:
         for r in results:
             print(f"  {target} reachable (latency: {r['latency_ms']}ms)")
+
+
+def doctor(ctx: typer.Context) -> None:
+    """一键健康检查"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved = resolve_profile_config(ctx)
+    checks: list[dict] = []
+
+    profile_ok = bool(resolved["profile_name"])
+    checks.append({"name": "Profile exists", "ok": profile_ok,
+                   "detail": resolved["profile_name"]})
+
+    aid = resolved["aid"]
+    checks.append({"name": "AID configured", "ok": bool(aid),
+                   "detail": aid or "(not set)"})
+
+    aun_path = Path(resolved["aun_path"])
+    path_ok = aun_path.exists()
+    checks.append({"name": "Data directory exists", "ok": path_ok,
+                   "detail": str(aun_path)})
+
+    key_ok = False
+    if aid and path_ok:
+        aids_dir = aun_path / "AIDs" / aid / "private"
+        key_file = aids_dir / f"{aid}.key"
+        key_ok = key_file.exists()
+    checks.append({"name": "Private key intact", "ok": key_ok,
+                   "detail": "P-256" if key_ok else "not found"})
+
+    gateway_ok = False
+    auth_ok = False
+    gateway_url = resolved["gateway"] or ""
+
+    if aid and gateway_url:
+        async def _check():
+            nonlocal gateway_ok, auth_ok
+            from aun_core import AUNClient
+            client = AUNClient(config={"aun_path": str(aun_path)},
+                               debug=resolved["debug"])
+            try:
+                gateway_ok = await client.check_gateway_health(
+                    gateway_url, timeout=resolved["timeout"])
+                if gateway_ok:
+                    auth_result = await client.auth.authenticate({"aid": aid})
+                    await client.connect(auth_result)
+                    auth_ok = client.state.value == "connected"
+            except Exception:
+                pass
+            finally:
+                await client.close()
+
+        try:
+            run_async(_check())
+        except Exception:
+            pass
+
+    checks.append({"name": "Gateway reachable", "ok": gateway_ok,
+                   "detail": gateway_url or "(not configured)"})
+    checks.append({"name": "Authentication", "ok": auth_ok,
+                   "detail": "success" if auth_ok else "failed"})
+
+    passed = sum(1 for c in checks if c["ok"])
+    total = len(checks)
+
+    if is_json_mode():
+        output_json({"checks": checks, "passed": passed, "total": total})
+    else:
+        for c in checks:
+            mark = "+" if c["ok"] else "x"
+            print(f"  [{mark}] {c['name']}: {c['detail']}")
+        print(f"\n  {passed}/{total} checks passed")
+
+
+def logs(
+    ctx: typer.Context,
+    tail: int = typer.Option(50, "--tail", "-n", help="显示最后 N 行"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="实时跟踪"),
+) -> None:
+    """查看本地 SDK 日志"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved = resolve_profile_config(ctx)
+    aun_path = Path(resolved["aun_path"])
+    log_dir = aun_path / "logs"
+
+    if not log_dir.exists():
+        log_dir = Path.home() / ".aun" / "logs"
+
+    if not log_dir.exists():
+        output_error("No log directory found", hint="Enable debug mode to generate logs")
+        raise typer.Exit(1)
+
+    log_files = sorted(log_dir.glob("python-sdk-*.log"), key=lambda f: f.name, reverse=True)
+    if not log_files:
+        output_error("No log files found", hint="Enable debug mode to generate logs")
+        raise typer.Exit(1)
+
+    latest = log_files[0]
+
+    if not follow:
+        lines = latest.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in lines[-tail:]:
+            print(line)
+        return
+
+    import time as _time
+    try:
+        with open(latest, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+            for line in all_lines[-tail:]:
+                print(line.rstrip())
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if line:
+                    print(line.rstrip(), flush=True)
+                else:
+                    _time.sleep(0.3)
+    except KeyboardInterrupt:
+        pass

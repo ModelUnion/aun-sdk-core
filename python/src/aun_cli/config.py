@@ -89,5 +89,5 @@ def _toml_value(v: Any) -> str:
     if isinstance(v, int):
         return str(v)
     if isinstance(v, str):
-        return f'"{v}"'
-    return f'"{v}"'
+        return f"'{v}'"
+    return f"'{v}'"

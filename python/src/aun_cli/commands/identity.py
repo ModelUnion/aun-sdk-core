@@ -41,7 +41,7 @@ def identity_list(ctx: typer.Context) -> None:
 def register(
     ctx: typer.Context,
     aid: str = typer.Argument(..., help="要注册的 AID (如 alice@aid.com)"),
-    gateway: str = typer.Option(..., "--gateway", "-g", help="网关地址"),
+    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="网关地址（可选，SDK 支持自动发现）"),
 ) -> None:
     """注册新 AID"""
     set_json_mode(ctx.obj.get("json", False))
@@ -50,9 +50,12 @@ def register(
     async def _run():
         from aun_core import AUNClient
         aun_path = str(Path.home() / ".aun" / "profiles" / profile_name)
-        client = AUNClient(config={"aun_path": aun_path}, debug=ctx.obj.get("debug", False))
+        config: dict = {"aun_path": aun_path}
+        if gateway:
+            config["gateway"] = gateway
+        client = AUNClient(config=config, debug=ctx.obj.get("debug", False))
         try:
-            result = await client.auth.create_aid({"aid": aid, "gateway": gateway})
+            result = await client.auth.create_aid({"aid": aid})
             return result
         finally:
             await client.close()
@@ -64,7 +67,11 @@ def register(
         return
 
     aun_path = str(Path.home() / ".aun" / "profiles" / profile_name)
-    set_profile(profile_name, {"aid": aid, "gateway": gateway, "aun_path": aun_path})
+    profile_data: dict = {"aid": aid, "aun_path": aun_path}
+    discovered_gateway = result.get("gateway") or gateway
+    if discovered_gateway:
+        profile_data["gateway"] = discovered_gateway
+    set_profile(profile_name, profile_data)
 
     if is_json_mode():
         output_json({"status": "registered", "aid": aid, "profile": profile_name})
@@ -75,19 +82,18 @@ def register(
 def login(
     ctx: typer.Context,
     aid: Optional[str] = typer.Argument(None, help="要登录的 AID（默认使用 profile 中的 AID）"),
+    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="网关地址（可选，SDK 支持自动发现）"),
 ) -> None:
     """登录已有 AID（验证密钥可用，刷新 token）"""
     set_json_mode(ctx.obj.get("json", False))
-
-    if aid:
-        ctx.obj["_override_aid"] = aid
 
     async def _run():
         resolved = resolve_profile_config(ctx)
         login_aid = aid or resolved["aid"]
         if not login_aid:
             raise typer.BadParameter("No AID specified and no default AID in profile")
-        async with CLISession(ctx) as client:
+        login_gateway = gateway or resolved["gateway"]
+        async with CLISession(ctx, aid=login_aid, gateway=login_gateway) as client:
             return {"aid": client.aid, "state": client.state}
 
     try:
@@ -99,6 +105,21 @@ def login(
     except Exception as e:
         handle_error(e)
         return
+
+    # 登录成功后更新 profile 中的 aid，后续命令自动使用
+    resolved = resolve_profile_config(ctx)
+    profile_name = resolved["profile_name"]
+    from aun_cli.config import get_profile, set_profile as _set_profile
+    try:
+        prof = get_profile(profile_name)
+    except KeyError:
+        prof = {}
+    prof["aid"] = result["aid"]
+    if resolved["gateway"]:
+        prof["gateway"] = resolved["gateway"]
+    if resolved["aun_path"]:
+        prof["aun_path"] = resolved["aun_path"]
+    _set_profile(profile_name, prof)
 
     if is_json_mode():
         output_json({"status": "authenticated", "aid": result["aid"]})

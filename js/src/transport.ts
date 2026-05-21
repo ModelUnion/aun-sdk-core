@@ -6,10 +6,13 @@ import {
   ConnectionError,
   SerializationError,
   TimeoutError,
+  ValidationError,
   mapRemoteError,
 } from './errors.js';
 import { isJsonObject, type JsonObject, type JsonValue, type RpcMessage, type RpcParams, type RpcResult } from './types.js';
 
+
+const MAX_WS_PAYLOAD_SIZE = 1_000_000;
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
@@ -240,13 +243,21 @@ export class RPCTransport {
     });
 
     // 发送请求
+    const payload = JSON.stringify({
+      jsonrpc: '2.0',
+      id: rpcId,
+      method,
+      params: params ?? {},
+    });
+
+    const payloadSize = new TextEncoder().encode(payload).length;
+    if (payloadSize > MAX_WS_PAYLOAD_SIZE) {
+      this._pending.delete(rpcId);
+      throw new ValidationError('payload is too large');
+    }
+
     try {
-      this._ws.send(JSON.stringify({
-        jsonrpc: '2.0',
-        id: rpcId,
-        method,
-        params: params ?? {},
-      }));
+      this._ws.send(payload);
       this._log.debug(`RPC request sent: method=${method}, id=${rpcId} ${summarizeDict(params, DIAG_PARAM_FIELDS)}`);
     } catch (exc) {
       this._pending.delete(rpcId);

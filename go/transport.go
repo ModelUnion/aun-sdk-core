@@ -17,6 +17,8 @@ import (
 	"nhooyr.io/websocket"
 )
 
+const MaxWSPayloadSize = 1_000_000
+
 // eventNameMap 协议事件名到 SDK 事件名的映射
 var eventNameMap = map[string]string{
 	"message.received":       "message.received",
@@ -329,6 +331,13 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 		t.pendingMu.Unlock()
 		pkgLogTransport().Error("failed to serialize RPC request: method=%s err=%v", method, err)
 		return nil, NewSerializationError(fmt.Sprintf("failed to serialize RPC request: %v", err))
+	}
+
+	if len(data) > MaxWSPayloadSize {
+		t.pendingMu.Lock()
+		delete(t.pending, rpcID)
+		t.pendingMu.Unlock()
+		return nil, fmt.Errorf("payload is too large")
 	}
 
 	pkgLogTransport().Debug("sending RPC request: method=%s id=%s %s", method, rpcID, summarizeDict(params, diagParamFields))

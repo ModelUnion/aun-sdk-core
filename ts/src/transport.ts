@@ -11,10 +11,12 @@
 import WebSocket from 'ws';
 import * as crypto from 'node:crypto';
 
-import { ConnectionError, SerializationError, TimeoutError, mapRemoteError } from './errors.js';
+import { ConnectionError, SerializationError, TimeoutError, ValidationError, mapRemoteError } from './errors.js';
 import type { EventDispatcher } from './events.js';
 import type { ModuleLogger } from './logger.js';
 import { isJsonObject, type JsonObject, type JsonValue, type RpcMessage, type RpcParams, type RpcResult } from './types.js';
+
+const MAX_WS_PAYLOAD_SIZE = 1_000_000;
 
 const _noopLogger: ModuleLogger = {
   error: () => {},
@@ -362,6 +364,13 @@ export class RPCTransport {
         method,
         params: params ?? {},
       });
+
+      const payloadSize = new TextEncoder().encode(payload).length;
+      if (payloadSize > MAX_WS_PAYLOAD_SIZE) {
+        this._pending.delete(rpcId);
+        clearTimeout(timer);
+        throw new ValidationError('payload is too large');
+      }
 
       try {
         this._ws!.send(payload);

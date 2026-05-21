@@ -9,12 +9,14 @@ from typing import Any, TYPE_CHECKING
 
 import websockets
 
-from .errors import ConnectionError, SerializationError, TimeoutError, map_remote_error
+from .errors import ConnectionError, SerializationError, TimeoutError, ValidationError, map_remote_error
 from .events import EventDispatcher
 
 if TYPE_CHECKING:
     from .logger import AUNLogger, NullLogger
 
+
+MAX_WS_PAYLOAD_SIZE = 1_000_000
 
 ConnectionFactory = Callable[[str], Awaitable[Any]]
 DisconnectCallback = Callable[[Exception | None, int | None], Awaitable[None]]
@@ -98,6 +100,8 @@ class RPCTransport:
         # Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
         # 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
         self._meta_observer: "callable | None" = None
+        self._trace_mode: str = "off"
+        self._trace_observer: "callable | None" = None
         from .logger import NullLogger as _NL
         self._log = logger or _NL()
 
@@ -108,6 +112,15 @@ class RPCTransport:
         不影响 RPC result 返回。
         """
         self._meta_observer = observer
+
+    def set_trace_mode(self, mode: str) -> None:
+        if mode not in ("off", "log", "diag"):
+            raise ValueError(f"invalid trace mode: {mode!r}, must be off/log/diag")
+        self._trace_mode = mode
+
+    def set_trace_observer(self, observer) -> None:
+        """注册 trace observer；observer(trace_info: dict) 在每次 RPC/事件携带 _trace 时调用。"""
+        self._trace_observer = observer
 
     def set_timeout(self, timeout: float) -> None:
         self._timeout = timeout
@@ -152,7 +165,7 @@ class RPCTransport:
         self._pending.clear()
         self._log.debug("transport", "close exit: elapsed=%.3fs cancelled_pending=%d", time.time() - _t_start, pending_count)
 
-    async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> Any:
+    async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None, trace: str | None = None) -> Any:
         if self._closed or self._ws is None:
             self._log.warn("transport", "RPC call failed (not connected): method=%s", method)
             raise ConnectionError("transport not connected")
@@ -164,18 +177,35 @@ class RPCTransport:
 
         import time as _diag_time
         _t0 = _diag_time.time()
+
+        # 注入 _trace（会话级或调用级 mode 非 off 时）
+        effective_trace_mode = trace if trace in ("off", "log", "diag") else self._trace_mode
+        trace_id = ""
+        if effective_trace_mode != "off":
+            trace_id = secrets.token_hex(16)
+            params = dict(params) if params else {}
+            _trace_payload: dict = {"trace_id": trace_id, "mode": effective_trace_mode}
+            if effective_trace_mode == "diag":
+                _trace_payload["spans"] = [{"node": "sdk", "ts": int(_t0 * 1000), "action": "send"}]
+            params["_trace"] = _trace_payload
+            self._log.info("transport", "[trace=%s] rpc_send method=%s rpc_id=%s", trace_id, method, rpc_id)
+
         self._log.debug(
             "transport",
             "RPC send: method=%s rpc_id=%s %s",
             method, rpc_id, _summarize_dict(params, _DIAG_PARAM_FIELDS),
         )
         try:
-            await self._ws.send(json.dumps({
+            payload = json.dumps({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
                 "method": method,
                 "params": params or {},
-            }))
+            })
+            payload_bytes = payload.encode("utf-8")
+            if len(payload_bytes) > MAX_WS_PAYLOAD_SIZE:
+                raise ValidationError("payload is too large")
+            await self._ws.send(payload)
         except Exception as exc:
             self._pending.pop(rpc_id, None)
             self._log.warn("transport", "RPC send failed: method=%s rpc_id=%s err=%s", method, rpc_id, exc)
@@ -195,19 +225,38 @@ class RPCTransport:
             )
             raise TimeoutError(f"rpc timeout: {method}", retryable=True) from exc
 
+        _elapsed = _diag_time.time() - _t0
         if "error" in response:
             self._log.debug(
                 "transport",
                 "RPC error response: method=%s rpc_id=%s elapsed=%.3fs error=%s",
-                method, rpc_id, _diag_time.time() - _t0, response["error"],
+                method, rpc_id, _elapsed, response["error"],
             )
+            if trace_id:
+                self._log.info("transport", "[trace=%s] rpc_recv method=%s rpc_id=%s duration_ms=%d status=error",
+                               trace_id, method, rpc_id, int(_elapsed * 1000))
+            if self._trace_observer is not None:
+                resp_trace = response.get("_trace")
+                if isinstance(resp_trace, dict):
+                    try:
+                        sdk_recv_span = {"node": "sdk", "action": "recv", "ms": int(_elapsed * 1000)}
+                        spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
+                        enriched = dict(resp_trace)
+                        enriched["spans"] = spans
+                        self._trace_observer({"type": "rpc", "method": method, "trace": enriched,
+                                              "status": "error", "duration_ms": int(_elapsed * 1000)})
+                    except Exception as exc:
+                        self._log.debug("transport", "trace_observer raised: %s", exc)
             raise map_remote_error(response["error"])
         self._log.debug(
             "transport",
             "RPC success: method=%s rpc_id=%s elapsed=%.3fs %s",
-            method, rpc_id, _diag_time.time() - _t0,
+            method, rpc_id, _elapsed,
             _summarize_dict(response.get("result"), _DIAG_RESULT_FIELDS),
         )
+        if trace_id:
+            self._log.info("transport", "[trace=%s] rpc_recv method=%s rpc_id=%s duration_ms=%d status=ok",
+                           trace_id, method, rpc_id, int(_elapsed * 1000))
         # 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
         if self._meta_observer is not None:
             meta = response.get("_meta")
@@ -216,6 +265,20 @@ class RPCTransport:
                     self._meta_observer(meta)
                 except Exception as exc:
                     self._log.debug("transport", "meta_observer raised: %s", exc)
+        # 透传 envelope._trace 给 trace observer（diag 模式回传 spans）
+        if self._trace_observer is not None:
+            resp_trace = response.get("_trace")
+            if isinstance(resp_trace, dict):
+                try:
+                    # 追加 sdk.recv span，记录 SDK 端总耗时
+                    sdk_recv_span = {"node": "sdk", "action": "recv", "ms": int(_elapsed * 1000)}
+                    spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
+                    enriched = dict(resp_trace)
+                    enriched["spans"] = spans
+                    self._trace_observer({"type": "rpc", "method": method, "trace": enriched,
+                                          "duration_ms": int(_elapsed * 1000)})
+                except Exception as exc:
+                    self._log.debug("transport", "trace_observer raised: %s", exc)
         return response.get("result")
 
     async def _recv_initial_message(self) -> dict[str, Any] | None:
@@ -289,10 +352,19 @@ class RPCTransport:
                 "event recv: event=%s %s",
                 sdk_event, _summarize_dict(params, _DIAG_RESULT_FIELDS),
             )
+            # 提取事件中的 _trace 并回调 observer，然后从 params 中剥离
+            if isinstance(params, dict) and "_trace" in params:
+                event_trace = params.pop("_trace", None)
+                if self._trace_observer is not None and isinstance(event_trace, dict):
+                    try:
+                        self._trace_observer({"type": "event", "event": sdk_event, "trace": event_trace})
+                    except Exception:
+                        pass
+                if event_trace and isinstance(event_trace, dict):
+                    self._log.info("transport", "[trace=%s] event_recv event=%s",
+                                   event_trace.get("trace_id", ""), sdk_event)
             if "v2" in sdk_event:
                 self._log.info("transport", "DEBUG: V2 event arrived at transport: %s params_keys=%s", sdk_event, list(params.keys()) if isinstance(params, dict) else "?")
-            # 推送事件解耦：事件分发在后台 task 里跑，避免阻塞 reader 读取后续 ws 帧
-            # （否则 handler 内的解密/keystore 查询会卡住 RPC 响应的 future 唤醒，导致 RPC timeout）
             asyncio.create_task(self._dispatcher.publish(f"_raw.{sdk_event}", params))
             return
 

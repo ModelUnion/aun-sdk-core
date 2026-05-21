@@ -37,10 +37,20 @@ def main(
     ctx.obj["no_color"] = no_color
     ctx.obj["timeout"] = timeout
 
+    # 输出 banner（JSON 模式下静默）
+    if not json_output:
+        from aun_cli.adapter import resolve_profile_config
+        resolved = resolve_profile_config(ctx)
+        aid = resolved["aid"] or "(none)"
+        gw = resolved["gateway"] or "(none)"
+        trace = resolved.get("trace", "off")
+        print(f"[aun-cli] profile={resolved['profile_name']} aid={aid} gateway={gw} trace={trace}")
+
 
 from aun_cli.commands.identity import identity_app, register, login, whoami
-from aun_cli.commands.message import send, pull
+from aun_cli.commands.message import send, pull, ack
 from aun_cli.commands.group import group_app
+from aun_cli.commands.listen import listen
 
 app.add_typer(identity_app)
 app.command("register")(register)
@@ -48,10 +58,46 @@ app.command("login")(login)
 app.command("whoami")(whoami)
 app.command("send")(send)
 app.command("pull")(pull)
+app.command("ack")(ack)
+app.command("listen")(listen)
 
 app.add_typer(group_app)
 
-from aun_cli.commands.diag import status, ping
+from aun_cli.commands.diag import status, ping, doctor, logs
 
 app.command("status")(status)
 app.command("ping")(ping)
+app.command("doctor")(doctor)
+app.command("logs")(logs)
+
+from aun_cli.commands.config import config_app
+
+app.add_typer(config_app)
+
+from aun_cli.commands.storage import storage_app
+
+app.add_typer(storage_app)
+
+from aun_cli.commands.keys import keys_app
+
+app.add_typer(keys_app)
+
+
+@app.command("help", hidden=True)
+def help_cmd(ctx: typer.Context, command: str = typer.Argument(None, help="命令名称")) -> None:
+    """显示帮助信息"""
+    if not command:
+        print(ctx.parent.get_help())
+        return
+
+    # 查找顶层命令或子命令组
+    parent = ctx.parent
+    target = parent.command.get_command(parent, command)
+    if target is None:
+        from aun_cli.output import output_error
+        output_error(f"Unknown command: {command}")
+        raise typer.Exit(2)
+
+    import click
+    sub_ctx = click.Context(target, info_name=command, parent=parent)
+    print(target.get_help(sub_ctx))

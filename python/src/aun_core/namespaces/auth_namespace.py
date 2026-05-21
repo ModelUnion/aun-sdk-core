@@ -302,6 +302,7 @@ class AuthNamespace:
 
     async def upload_agent_md(self, content: str) -> dict[str, Any]:
         import time as _t
+        import secrets as _secrets
         _t_start = _t.time()
         identity = self._client._auth.load_identity_or_none(self._client._aid)
         if identity is None:
@@ -310,6 +311,11 @@ class AuthNamespace:
         if not aid:
             raise StateError("no local identity found, call auth.create_aid() first")
         self._client._log.debug("auth", "upload_agent_md enter: aid=%s content_len=%d", aid, len(content or ""))
+        # HTTP trace
+        trace_mode = getattr(self._client._transport, "_trace_mode", "off")
+        trace_id = _secrets.token_hex(16) if trace_mode != "off" else ""
+        if trace_id:
+            self._client._log.info("auth", "[trace=%s] http_out PUT agent.md aid=%s", trace_id, aid)
         try:
             gateway_url = await self._resolve_gateway(aid)
             self._client._gateway_url = gateway_url
@@ -321,8 +327,19 @@ class AuthNamespace:
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "text/markdown; charset=utf-8",
             }
+            if trace_id:
+                headers["X-AUN-Trace"] = trace_id
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.put(agent_md_url, data=content.encode("utf-8"), headers=headers) as response:
+                    duration_ms = int((_t.time() - _t_start) * 1000)
+                    if trace_id:
+                        self._client._log.info("auth", "[trace=%s] http_in status=%d duration_ms=%d", trace_id, response.status, duration_ms)
+                        observer = getattr(self._client._transport, "_trace_observer", None)
+                        if observer:
+                            try:
+                                observer({"type": "http", "trace_id": trace_id, "method": "PUT", "url": agent_md_url, "status": response.status, "duration_ms": duration_ms})
+                            except Exception:
+                                pass
                     if response.status == 404:
                         raise NotFoundError(f"agent.md endpoint not found for aid: {aid}")
                     if response.status < 200 or response.status >= 300:
@@ -340,11 +357,17 @@ class AuthNamespace:
 
     async def download_agent_md(self, aid: str) -> str:
         import time as _t
+        import secrets as _secrets
         _t_start = _t.time()
         target_aid = str(aid or "").strip()
         if not target_aid:
             raise ValidationError("download_agent_md requires non-empty aid")
         self._client._log.debug("auth", "download_agent_md enter: aid=%s", target_aid)
+        # HTTP trace
+        trace_mode = getattr(self._client._transport, "_trace_mode", "off")
+        trace_id = _secrets.token_hex(16) if trace_mode != "off" else ""
+        if trace_id:
+            self._client._log.info("auth", "[trace=%s] http_out GET agent.md aid=%s", trace_id, target_aid)
         try:
             agent_md_url = await self._resolve_agent_md_url(target_aid)
 
@@ -355,10 +378,21 @@ class AuthNamespace:
                 request_headers["If-None-Match"] = cached["etag"]
             if cached.get("last_modified"):
                 request_headers["If-Modified-Since"] = cached["last_modified"]
+            if trace_id:
+                request_headers["X-AUN-Trace"] = trace_id
 
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(agent_md_url, headers=request_headers) as response:
+                    duration_ms = int((_t.time() - _t_start) * 1000)
+                    if trace_id:
+                        self._client._log.info("auth", "[trace=%s] http_in status=%d duration_ms=%d", trace_id, response.status, duration_ms)
+                        observer = getattr(self._client._transport, "_trace_observer", None)
+                        if observer:
+                            try:
+                                observer({"type": "http", "trace_id": trace_id, "method": "GET", "url": agent_md_url, "status": response.status, "duration_ms": duration_ms})
+                            except Exception:
+                                pass
                     if response.status == 304 and cached.get("text") is not None:
                         self._client._log.debug(
                             "auth",

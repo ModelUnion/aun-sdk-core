@@ -522,6 +522,14 @@ class AUNClient:
         if etag:
             self._remote_agent_md_etag = etag
 
+    def set_trace_mode(self, mode: str) -> None:
+        """设置会话级 trace mode（off/log/diag），影响后续所有 RPC 调用。"""
+        self._transport.set_trace_mode(mode)
+
+    def set_trace_observer(self, observer) -> None:
+        """注册 trace observer，签名 observer(trace_info: dict)。diag 模式下 RPC response 和事件会回调。"""
+        self._transport.set_trace_observer(observer)
+
     def _local_issuer_domain(self) -> str:
         """从本地 AID 提取 issuer 域名（{name}.{issuer}）。"""
         aid = self._aid or ""
@@ -702,7 +710,7 @@ class AUNClient:
         except Exception as exc:
             raise ClientSignatureError(f"客户端签名失败，拒绝发送无签名请求: {exc}") from exc
 
-    async def call(self, method: str, params: dict | None = None) -> Any:
+    async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
         _t_call_start = time.time()
         if self._state != "connected":
             raise ConnectionError("client is not connected")
@@ -823,11 +831,15 @@ class AUNClient:
         call_kwargs: dict[str, Any] = {}
         if method in _NON_IDEMPOTENT_METHODS:
             call_kwargs["timeout"] = _NON_IDEMPOTENT_TIMEOUT
+        if trace:
+            call_kwargs["trace"] = trace
         try:
             result = await self._transport.call(method, params, **call_kwargs)
         except TypeError as exc:
-            if call_kwargs and "unexpected keyword argument 'timeout'" in str(exc):
-                result = await self._transport.call(method, params)
+            if call_kwargs and "unexpected keyword argument" in str(exc):
+                call_kwargs.pop("timeout", None)
+                call_kwargs.pop("trace", None)
+                result = await self._transport.call(method, params, **call_kwargs) if call_kwargs else await self._transport.call(method, params)
             else:
                 self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
                 raise

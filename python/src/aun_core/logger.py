@@ -103,14 +103,26 @@ class AUNLogger:
         return f"[{ts}][{level}][{module}] {text}"
 
     def _console(self, line: str) -> None:
-        # 直接写 UTF-8 字节，绕开 sys.stderr.encoding（Windows 默认 cp936 会对 emoji/生僻字报错）
-        data = (line + "\n").encode("utf-8", errors="replace")
+        colored = self._colorize(line)
+        data = (colored + "\n").encode("utf-8", errors="replace")
         try:
             sys.stderr.buffer.write(data)
             sys.stderr.flush()
         except (AttributeError, OSError):
-            # stderr 被替换为无 buffer 对象（pytest capsys / StringIO 等）时降级
-            print(line, file=sys.stderr, flush=True)
+            print(colored, file=sys.stderr, flush=True)
+
+    def _colorize(self, line: str) -> str:
+        if not sys.stderr.isatty():
+            return line
+        if "[ERROR]" in line:
+            return f"\033[31m{line}\033[0m"
+        if "[WARN]" in line:
+            return f"\033[33m{line}\033[0m"
+        if "[INFO]" in line:
+            return f"\033[36m{line}\033[0m"
+        if "[DEBUG]" in line:
+            return f"\033[90m{line}\033[0m"
+        return line
 
     def _file(self, line: str, err: BaseException | None = None) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
