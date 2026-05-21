@@ -6,6 +6,30 @@
 
 ---
 
+## 0.3.0 — 2026-05-21 ⚠️ BREAKING CHANGE
+
+> **V2-only 版本**：移除全部 V1 E2EE（含群组加密），新增 V2 加密原语，API 不向后兼容。
+
+### BREAKING
+- **移除 V1 E2EE 全部实现**：`e2ee-group.ts`、V1 epoch key 逻辑全部删除
+- **移除 V1 群组加密测试**：`e2ee.spec.ts`、`epoch-key-server.spec.ts`、`group-e2ee.spec.ts`、`group-join-key-recovery.spec.ts` 等
+- **E2EE 接口简化**：`e2ee.ts` 仅保留 V2 路径，V1 加解密方法不再可用
+- **配置变更**：`config.ts` 移除 V1 相关配置项
+
+### Added
+- **agent.md 主 API（浏览器版本）**：`AUNClient.publishAgentMd(content)` / `AUNClient.fetchAgentMd(aid?)`
+- **V2 加密原语**（跨语言 golden vector 一致性）：ECDH P-256、HKDF-SHA256、AES-256-GCM、ECDSA-SHA256 RAW、1DH/3DH wrap_key、Recipients Sort + Merkle Digest、State Commitment
+- **V2 Session**：SPK 生命周期 + 对端 IK 缓存 + PFS 三重销毁
+- **V2 KeyStore**：IndexedDB 持久化 SPK/IK 异步实现
+
+### Removed
+- `AUNClient.setLocalAgentMdContent()` / `getLocalAgentMdEtag()` / `getRemoteAgentMdEtag()` — 由主 API 自动维护
+
+### Deprecated
+- `client.auth.signAgentMd` / `verifyAgentMd` / `uploadAgentMd` / `downloadAgentMd` — 建议迁移到 `client.publishAgentMd` / `client.fetchAgentMd`
+
+---
+
 ## 0.2.20 — 2026-05-18
 
 ### Added

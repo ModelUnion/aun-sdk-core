@@ -24,7 +24,7 @@ function extractSignedMethods(): string[] {
   return methods;
 }
 
-/** 预期需要签名的 34 个方法 */
+/** 预期需要签名的 31 个方法 */
 const EXPECTED_SIGNED_METHODS = [
   'group.send',
   'group.kick',
@@ -52,9 +52,6 @@ const EXPECTED_SIGNED_METHODS = [
   'group.resources.approve_request',
   'group.resources.reject_request',
   'group.commit_state',
-  'group.e2ee.begin_rotation',
-  'group.e2ee.commit_rotation',
-  'group.e2ee.abort_rotation',
   'group.ban',
   'group.unban',
   'group.dissolve',
@@ -65,8 +62,8 @@ const EXPECTED_SIGNED_METHODS = [
 describe('SIGNED_METHODS 签名覆盖面', () => {
   const actual = extractSignedMethods();
 
-  it('应包含全部 34 个预期方法', () => {
-    expect(actual).toHaveLength(34);
+  it('应包含全部 31 个预期方法', () => {
+    expect(actual).toHaveLength(31);
   });
 
   it('每个预期方法都应在 SIGNED_METHODS 中', () => {
@@ -79,5 +76,10 @@ describe('SIGNED_METHODS 签名覆盖面', () => {
     const expectedSet = new Set<string>(EXPECTED_SIGNED_METHODS);
     const unexpected = actual.filter((m) => !expectedSet.has(m));
     expect(unexpected, `意外的签名方法: ${unexpected.join(', ')}`).toHaveLength(0);
+  });
+
+  it('不应包含已移除的 V1 E2EE 控制面方法', () => {
+    expect(actual.some((m) => m.startsWith('message.e2ee.') || m.startsWith('group.e2ee.'))).toBe(false);
+    expect(actual).not.toContain('group.rotate_epoch');
   });
 });

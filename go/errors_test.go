@@ -17,6 +17,13 @@ func TestMapRemoteError_AuthCodes(t *testing.T) {
 	}
 }
 
+func TestMapRemoteError_Int64Code(t *testing.T) {
+	err := MapRemoteError(map[string]any{"code": int64(-32004), "message": "permission denied"})
+	if _, ok := err.(*PermissionError); !ok {
+		t.Fatalf("int64 code 应映射为 PermissionError，实际: %T", err)
+	}
+}
+
 // TestMapRemoteError_PermissionCodes 验证权限错误码映射（含 -32004 PERMISSION_DENIED）
 func TestMapRemoteError_PermissionCodes(t *testing.T) {
 	for _, code := range []int{4030, 403, -32004} {

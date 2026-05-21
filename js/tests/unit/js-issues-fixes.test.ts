@@ -2,7 +2,9 @@
 // TDD: 先写失败测试暴露问题 → 确认失败 → 修复代码 → 确认通过
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Message, GroupSecretRecord, GroupOldEpochRecord } from '../../src/types.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { Message, GroupSecretRecord } from '../../src/types.js';
 
 // ── JS-001: Message 类型应声明 group_id 和 sender_aid 字段 ──────
 describe('JS-001: Message 类型字段声明', () => {
@@ -144,97 +146,35 @@ describe('JS-002: IndexedDB 群组密钥操作原子性', () => {
   });
 });
 
-// ── JS-003: _sendGroupEncrypted epoch 预检（已实现，验证存在性） ──
-describe('JS-003: _sendGroupEncrypted epoch 预检', () => {
-  it('epoch 预检逻辑应已在 _sendGroupEncrypted 中实现', async () => {
+// ── JS-003: V2-only 后旧 group epoch 发送预检已移除 ──
+describe('JS-003: V2-only group E2EE 编排', () => {
+  it('旧 _sendGroupEncrypted 与 group.e2ee.* RPC 不应再可用', async () => {
     const { AUNClient } = await import('../../src/client.js');
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._aid = 'alice.aid.com';
     (client as any)._deviceId = 'dev-1';
     (client as any)._identity = { aid: 'alice.aid.com', private_key_pem: null, cert: null };
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
 
-    const groupE2ee = (client as any)._groupE2ee;
-    let recovered = false;
-    vi.spyOn(groupE2ee, 'currentEpoch').mockImplementation(async () => (recovered ? 3 : 1));
-    vi.spyOn(groupE2ee, 'encrypt').mockResolvedValue({ type: 'e2ee.group_encrypted', epoch: 1 });
-    vi.spyOn(groupE2ee, 'loadSecret').mockResolvedValue({
-      epoch: 3,
-      secret: new Uint8Array(32),
-      commitment: 'c3',
-      member_aids: ['alice.aid.com'],
-    });
-    vi.spyOn(groupE2ee, 'encryptWithEpoch').mockResolvedValue({ type: 'e2ee.group_encrypted', epoch: 3 });
-    // 实现实际调用 _recoverGroupEpochKey 进行密钥恢复（与 Python SDK 对齐）
-    vi.spyOn(client as any, '_recoverGroupEpochKey').mockImplementation(async () => {
-      recovered = true;
-    });
-
-    const methods: string[] = [];
-    (client as any)._transport.call = vi.fn().mockImplementation(async (method: string) => {
-      methods.push(method);
-      if (method === 'group.e2ee.get_epoch') return { epoch: 3, committed_epoch: 3 };
-      if (method === 'group.get_info') return { owner_aid: 'owner.aid.com' };
-      if (method === 'group.send') return { ok: true };
-      if (method === 'message.send') return { ok: true };
-      return {};
-    });
-
-    await (client as any)._sendGroupEncrypted({
-      group_id: 'g1',
-      payload: { type: 'text', text: 'hello' },
-    });
-
-    expect(methods).toContain('group.e2ee.get_epoch');
+    expect((client as any)._groupE2ee).toBeUndefined();
+    expect((client as any)._sendGroupEncrypted).toBeUndefined();
+    expect((client as any)._recoverGroupEpochKey).toBeUndefined();
+    await expect(client.call('group.e2ee.get_epoch', { group_id: 'g1' }))
+      .rejects.toThrow('legacy E2EE method is removed');
+    expect((client as any)._transport.call).not.toHaveBeenCalled();
   });
 });
 
-// ── JS-004: decryptGroupMessage 异常日志应保留堆栈 ──────────────
-describe('JS-004: decryptGroupMessage 异常日志保留堆栈', () => {
-  it('解密异常时 console.warn 应包含堆栈信息', async () => {
-    const { decryptGroupMessage } = await import('../../src/e2ee-group.js');
+// ── JS-004: V2-only 后旧 decryptGroupMessage 模块已移除 ──────────────
+describe('JS-004: V2-only group decrypt cleanup', () => {
+  it('旧 e2ee-group.ts 与 client 解密 helper 不应再存在', async () => {
+    const { AUNClient } = await import('../../src/client.js');
+    const proto = Object.getPrototypeOf(new AUNClient()) as Record<string, unknown>;
 
-    const msg: Message = {
-      message_id: 'msg-1',
-      group_id: 'grp-1',
-      from: 'alice.aid.com',
-      payload: {
-        type: 'e2ee.group_encrypted',
-        epoch: 1,
-        nonce: 'invalid-base64!!!',  // 故意用无效 base64 触发异常
-        ciphertext: 'AAAA',
-        tag: 'AAAA',
-        aad: {
-          group_id: 'grp-1',
-          from: 'alice.aid.com',
-          message_id: 'msg-1',
-          timestamp: Date.now(),
-          epoch: 1,
-          encryption_mode: 'epoch_group_key',
-          suite: 'AES-256-GCM',
-        },
-      },
-    };
-
-    const secrets = new Map<number, Uint8Array>();
-    secrets.set(1, new Uint8Array(32));
-
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    await decryptGroupMessage(msg, secrets, null, { requireSignature: false });
-
-    // 查找异常日志（日志已英文化）
-    const exceptionLog = warnSpy.mock.calls.find(
-      c => typeof c[0] === 'string' && c[0].includes('group message decrypt exception')
-    );
-    expect(exceptionLog).toBeDefined();
-
-    // 异常信息应包含 stack 或至少包含 Error 消息（而非仅 [object Error]）
-    const loggedMsg = String(exceptionLog![1] ?? exceptionLog![0]);
-    // 修复后应包含 at 或有意义的错误消息，而非 "[object Object]"
-    expect(loggedMsg).not.toBe('[object Object]');
-
-    warnSpy.mockRestore();
+    expect(existsSync(join(process.cwd(), 'src', 'e2ee-group.ts'))).toBe(false);
+    expect(proto._decryptGroupMessage).toBeUndefined();
+    expect(proto._decryptGroupMessages).toBeUndefined();
   });
 });
 
@@ -296,52 +236,15 @@ describe('JS-005: _isGroupEpochRecoverable 空字符串 secret 判断', () => {
   });
 });
 
-// ── JS-006: GroupReplayGuard 上限优化 ────────────────────────────
-describe('JS-006: GroupReplayGuard 上限优化', () => {
-  it('默认上限应为 10000（适配移动浏览器）', async () => {
-    const { GroupReplayGuard } = await import('../../src/e2ee-group.js');
-    const guard = new GroupReplayGuard();
+// ── JS-006: V1 GroupReplayGuard 已随 e2ee-group 移除 ────────────────────────────
+describe('JS-006: V1 group replay cleanup', () => {
+  it('e2ee.ts 仅保留 protected headers 兼容入口', () => {
+    const source = readFileSync(join(process.cwd(), 'src', 'e2ee.ts'), 'utf8');
 
-    // 默认上限改为 10000
-    // 填入超过默认上限的条目后 trim 应生效
-    for (let i = 0; i < 10100; i++) {
-      guard.checkAndRecord('g1', 'sender', `msg-${i}`);
-    }
-
-    // trim 后 size 应在 10000 * 0.8 = 8000 范围附近
-    expect(guard.size).toBeLessThanOrEqual(10000);
-  });
-
-  it('自定义 maxSize 应生效', async () => {
-    const { GroupReplayGuard } = await import('../../src/e2ee-group.js');
-    const guard = new GroupReplayGuard(500);
-
-    for (let i = 0; i < 600; i++) {
-      guard.checkAndRecord('g1', 'sender', `msg-${i}`);
-    }
-
-    expect(guard.size).toBeLessThanOrEqual(500);
-  });
-
-  it('trim 后旧条目应被移除', async () => {
-    const { GroupReplayGuard } = await import('../../src/e2ee-group.js');
-    const guard = new GroupReplayGuard(100);
-
-    // 先添加 msg-0 到 msg-49
-    for (let i = 0; i < 50; i++) {
-      guard.checkAndRecord('g1', 'sender', `msg-${i}`);
-    }
-    expect(guard.isSeen('g1', 'sender', 'msg-0')).toBe(true);
-
-    // 再添加大量条目触发 trim
-    for (let i = 50; i < 200; i++) {
-      guard.checkAndRecord('g1', 'sender', `msg-${i}`);
-    }
-
-    // 最早的条目应被 trim 掉
-    expect(guard.isSeen('g1', 'sender', 'msg-0')).toBe(false);
-    // 最新的条目应保留
-    expect(guard.isSeen('g1', 'sender', 'msg-199')).toBe(true);
+    expect(source).toContain('ProtectedHeaders');
+    expect(source).not.toContain('class E2EEManager');
+    expect(source).not.toContain('prekey_ecdh_v2');
+    expect(source).not.toContain('long_term_key');
   });
 });
 
@@ -458,35 +361,8 @@ describe('JS-007: dissolve 后清理本地状态', () => {
   });
 
   // ── GroupE2EEManager.removeGroup ──
-  it('GroupE2EEManager 应有 removeGroup 方法', async () => {
-    const { GroupE2EEManager } = await import('../../src/e2ee-group.js');
-    const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-mgr' });
-    const mgr = new GroupE2EEManager({
-      identityFn: () => ({ aid: 'alice.test' }),
-      keystore: ks,
-    });
-    expect(typeof mgr.removeGroup).toBe('function');
-  });
-
-  it('removeGroup 后 hasSecret 返回 false', async () => {
-    const { GroupE2EEManager, storeGroupSecret, computeMembershipCommitment } = await import('../../src/e2ee-group.js');
-    const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-mgr-2' });
-    const mgr = new GroupE2EEManager({
-      identityFn: () => ({ aid: 'alice.test' }),
-      keystore: ks,
-    });
-
-    const gs = new Uint8Array(32);
-    crypto.getRandomValues(gs);
-    const commitment = await computeMembershipCommitment(['alice.test', 'bob.test'], 1, 'grp-1', gs);
-    await storeGroupSecret(ks, 'alice.test', 'grp-1', 1, gs, commitment, ['alice.test', 'bob.test']);
-
-    expect(await mgr.hasSecret('grp-1')).toBe(true);
-
-    await mgr.removeGroup('grp-1');
-    expect(await mgr.hasSecret('grp-1')).toBe(false);
+  it('GroupE2EEManager 已移除，dissolve 清理只保留客户端本地状态清理', () => {
+    expect(existsSync(join(process.cwd(), 'src', 'e2ee-group.ts'))).toBe(false);
   });
 
   // ── AUNClient group.dissolved 事件处理 ──
@@ -496,10 +372,6 @@ describe('JS-007: dissolve 后清理本地状态', () => {
     (client as any)._state = 'connected';
     (client as any)._aid = 'alice.aid.com';
     (client as any)._deviceId = 'dev-1';
-
-    // mock removeGroup
-    const removeGroupSpy = vi.fn().mockResolvedValue(undefined);
-    (client as any)._groupE2ee.removeGroup = removeGroupSpy;
 
     // mock _saveSeqTrackerState
     const saveSeqSpy = vi.fn();
@@ -515,8 +387,8 @@ describe('JS-007: dissolve 后清理本地状态', () => {
       group_id: 'grp-1',
     });
 
-    // 应调用 removeGroup 清理 epoch 密钥
-    expect(removeGroupSpy).toHaveBeenCalledWith('grp-1');
+    // V2-only 客户端不再持有 V1 group epoch manager
+    expect((client as any)._groupE2ee).toBeUndefined();
 
     // seq_tracker 中相关命名空间应被清理
     expect((client as any)._seqTracker.getContiguousSeq('group:grp-1')).toBe(0);
@@ -530,8 +402,6 @@ describe('JS-007: dissolve 后清理本地状态', () => {
     (client as any)._aid = 'alice.aid.com';
     (client as any)._deviceId = 'dev-1';
 
-    // mock removeGroup
-    (client as any)._groupE2ee.removeGroup = vi.fn().mockResolvedValue(undefined);
     (client as any)._saveSeqTrackerState = vi.fn();
 
     const publishSpy = vi.spyOn((client as any)._dispatcher, 'publish');

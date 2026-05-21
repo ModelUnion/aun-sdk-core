@@ -22,7 +22,7 @@ from .config import AUNConfig, normalize_instance_id
 from .logger import AUNLogger, NullLogger
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
-from .e2ee import E2EEManager, GroupE2EEManager, ProtectedHeaders
+from .e2ee import ProtectedHeaders
 from .errors import (
     AUNError,
     AuthError,
@@ -314,8 +314,8 @@ class AUNClient:
         self._prekey_replenish_inflight: bool = False
         self._prekey_pending_replenish: int = 0
         # 本地 agent.md 文件路径与对应 etag（quoted sha256 hex，与服务端 _agent_md_etag 一致）。
-        # 由 set_local_agent_md_path() 设置；用于跟服务端 RPC 注入的 _meta.agent_md_etag 比对，
-        # 触发"本地未发布到服务端"或"服务端版本更新"的 UI 提示。
+        # 由 publish_agent_md() / fetch_agent_md(自身 aid) 写入；用于跟服务端 RPC 注入的
+        # _meta.agent_md_etag 比对，触发"本地未发布到服务端"或"服务端版本更新"的 UI 提示。
         self._local_agent_md_path: str = ""
         self._local_agent_md_etag: str = ""
         # gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
@@ -337,6 +337,9 @@ class AUNClient:
         self._slot_id = ""
         self._connect_delivery_mode = _normalize_delivery_mode_config({"mode": "fanout"})
         self._default_connect_delivery_mode = dict(self._connect_delivery_mode)
+        # 当前连接的能力声明（来自 connect 参数 extra_info._capabilities），
+        # 用于按 V1/V2 路由 RPC 调用。None 视为"双向兼容"（同时支持 V1 与 V2）。
+        self._connect_capabilities: dict[str, Any] | None = None
         self._auth = AuthFlow(
             keystore=keystore,
             crypto=CryptoProvider(),
@@ -356,23 +359,7 @@ class AUNClient:
             logger=self._log,
         )
         self._transport.set_meta_observer(self._observe_rpc_meta)
-        self._e2ee = E2EEManager(
-            identity_fn=lambda: self._identity or {},
-            device_id_fn=lambda: self._device_id,
-            keystore=keystore,
-            replay_window_seconds=self._config_model.replay_window_seconds,
-            logger=self._log,
-        )
-        self._group_e2ee = GroupE2EEManager(
-            identity_fn=lambda: self._identity or {},
-            keystore=keystore,
-            sender_cert_resolver=lambda aid: self._get_verified_peer_cert(aid),
-            initiator_cert_resolver=lambda aid: self._get_verified_peer_cert(aid),
-            logger=self._log,
-        )
         self._token_refresh_failures = 0  # token 刷新连续失败计数
-        self._group_epoch_rotate_task: asyncio.Task | None = None
-        self._group_epoch_cleanup_task: asyncio.Task | None = None
         self._cache_cleanup_task: asyncio.Task | None = None
         # 消息序列号跟踪器（群消息 + P2P 共用，按命名空间隔离）
         self._seq_tracker = SeqTracker()
@@ -387,15 +374,6 @@ class AUNClient:
         # 群惰性同步标志：只有收到推送或主动 pull 后才标记为已同步
         # 发送消息前如果未同步，先做一次 pull
         self._group_synced: set[str] = set()
-        # PY-001: 解密失败的群消息待重试队列（按 namespace 分组）
-        self._pending_decrypt_msgs: dict[str, list[dict[str, Any]]] = {}
-        # recovery 兜底定时去重：每个 group 在 30s 内最多调度一次"超时强制推进"任务
-        self._recovery_timeout_scheduled: dict[str, float] = {}
-        self._group_epoch_rotation_inflight: set[str] = set()
-        self._group_epoch_rotation_retry_tasks: dict[str, asyncio.Task] = {}
-        self._group_epoch_recovery_inflight: dict[str, asyncio.Future[bool]] = {}
-        self._group_membership_rotation_done: set[str] = set()
-        self._group_member_key_backfill_done: set[str] = set()
 
         self.auth = AuthNamespace(self)
         self.custody = CustodyNamespace(self)
@@ -404,16 +382,27 @@ class AUNClient:
         self._v2_session: V2Session | None = None
         # V2 state chain 本地存储（分叉检测）：group_id -> (state_version, state_chain)
         self._v2_state_chains: dict[str, tuple[int, str]] = {}
+        # 同一 group 的 V2 自动提案必须串行，避免 group.create 与后续成员变更抢同一 state_version。
+        self._v2_auto_propose_locks: dict[str, asyncio.Lock] = {}
+        self._v2_auto_propose_locks_guard = asyncio.Lock()
+        self._v2_auto_propose_last_snapshot: dict[str, str] = {}
+        self._v2_lazy_propose_triggered: dict[str, float] = {}
         # 内部订阅：推送消息自动解密后 re-publish 给用户
         self._dispatcher.subscribe("_raw.message.received", self._on_raw_message_received)
         # V2 P2P 推送通知
         self._dispatcher.subscribe("_raw.peer.v2.message_received", self._on_v2_push_notification)
-        # 群组消息推送：自动解密后 re-publish
+        # 群组消息推送（明文 / 兼容）：直接透传给应用层
         self._dispatcher.subscribe("_raw.group.message_created", self._on_raw_group_message_created)
+        # V2 群组消息推送：服务端发的 group.v2.message_created 事件，触发自动 pull + 解密
+        self._dispatcher.subscribe("_raw.group.v2.message_created", self._on_raw_group_v2_message_created)
         # 群组变更事件：拦截处理成员变更触发的 epoch 轮换，然后透传
         self._dispatcher.subscribe("_raw.group.changed", self._on_raw_group_changed)
         # V2 epoch 轮换事件：清除 bootstrap 缓存 + 触发 SPK rotation
         self._dispatcher.subscribe("_raw.group.v2.epoch_rotated", self._on_v2_epoch_rotated)
+        # V2 state proposal 服务平面事件：owner/admin 负责确认或重新提案
+        self._dispatcher.subscribe("_raw.group.v2.state_proposed", self._on_v2_state_proposed)
+        self._dispatcher.subscribe("_raw.group.v2.state_retry_needed", self._on_v2_state_retry_needed)
+        self._dispatcher.subscribe("_raw.group.v2.state_confirmed", self._on_v2_state_confirmed)
         # 群组状态提交事件：验证 state_hash 链并更新本地存储
         self._dispatcher.subscribe("_raw.group.state_committed", self._on_group_state_committed)
         # 其他事件直接透传
@@ -429,42 +418,101 @@ class AUNClient:
     def aid(self) -> str | None:
         return self._aid
 
-    def set_local_agent_md_path(self, path: str | None) -> str:
-        """记录本地 agent.md 文件路径并一次性计算 etag（quoted sha256，与服务端一致）。
-
-        - path 为空字符串 / None：清除本地 path 与 etag。
-        - 文件不存在 / 读取失败：清除 etag 并返回空串，不抛异常（应用可读 get_local_agent_md_etag()
-          为空判断）。
-        - 文件变更后需要重新调用 set_local_agent_md_path() 触发重算（按设计：设置时一次性计算）。
-
-        返回当前 etag（quoted hex 或空串）。
-        """
-        raw_path = str(path or "").strip()
-        if not raw_path:
-            self._local_agent_md_path = ""
-            self._local_agent_md_etag = ""
-            return ""
-        self._local_agent_md_path = raw_path
-        try:
-            with open(raw_path, "rb") as f:
-                data = f.read()
-            digest = hashlib.sha256(data).hexdigest()
-            self._local_agent_md_etag = f'"{digest}"'
-        except OSError as exc:
-            self._log.warn("client", "set_local_agent_md_path 读取失败 path=%s err=%s", raw_path, exc)
-            self._local_agent_md_etag = ""
-        return self._local_agent_md_etag
-
-    def get_local_agent_md_etag(self) -> str:
-        """返回 set_local_agent_md_path 计算的 etag；未设置或读取失败时返回空串。"""
-        return self._local_agent_md_etag
-
     def get_remote_agent_md_etag(self) -> str:
         """返回 gateway 在最近一次 RPC envelope._meta 注入的服务端 agent.md etag。
 
         未收到过则为空串；不阻塞调用，纯内存读。
         """
         return getattr(self, "_remote_agent_md_etag", "") or ""
+
+    async def publish_agent_md(self, path: str) -> dict[str, Any]:
+        """读取本地 agent.md → 签名 → 上传到服务端，并刷新内部 _local_agent_md_etag。
+
+        Args:
+            path: 本地 agent.md 文件路径（必填，不可为空）
+
+        Returns:
+            auth.upload_agent_md 的原始返回（含 aid / etag / last_modified / agent_md_url 等）
+
+        Raises:
+            ValidationError: path 为空
+            FileNotFoundError: 文件不存在
+            StateError: 本地无身份
+            AUNError: 上传失败
+        """
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            raise ValidationError("publish_agent_md requires non-empty path")
+        with open(raw_path, "rb") as f:
+            data = f.read()
+        content = data.decode("utf-8")
+        signed = await self.auth.sign_agent_md(content)
+        result = await self.auth.upload_agent_md(signed)
+        digest = hashlib.sha256(signed.encode("utf-8")).hexdigest()
+        self._local_agent_md_etag = f'"{digest}"'
+        self._local_agent_md_path = raw_path
+        return result
+
+    async def fetch_agent_md(
+        self,
+        aid: str | None = None,
+        save_path: str | None = None,
+    ) -> dict[str, Any]:
+        """下载 agent.md 并自动验签；可选写盘；若 aid 是自己则更新本地 etag。
+
+        Args:
+            aid: 目标 AID；为空时取本地身份
+            save_path: 写盘路径；不传则不写盘（浏览器版本无此参数）
+
+        Returns:
+            {
+              "aid": str,
+              "content": str,
+              "signature": dict,                # auth.verify_agent_md 的返回
+              "in_sync": bool | None,           # aid 是自己时给出 True/False；否则 None
+              "saved_to": str | None,
+              "save_error": str | None,
+            }
+
+        Raises:
+            ValidationError: aid 为空且无本地身份
+            NotFoundError: 服务端 404
+            AUNError: 其它非 2xx
+        """
+        target = (aid or self._aid or "").strip()
+        if not target:
+            raise ValidationError("fetch_agent_md requires aid (or local AID)")
+
+        content = await self.auth.download_agent_md(target)
+        signature = await self.auth.verify_agent_md(content, aid=target)
+
+        is_self = target == (self._aid or "")
+        in_sync: bool | None = None
+        if is_self:
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            self._local_agent_md_etag = f'"{digest}"'
+            local = self._local_agent_md_etag or ""
+            remote = self._remote_agent_md_etag or ""
+            in_sync = (local == remote) if (local and remote) else False
+
+        saved_to: str | None = None
+        save_error: str | None = None
+        if save_path:
+            try:
+                with open(save_path, "wb") as f:
+                    f.write(content.encode("utf-8"))
+                saved_to = save_path
+            except OSError as exc:
+                save_error = str(exc)
+
+        return {
+            "aid": target,
+            "content": content,
+            "signature": signature,
+            "in_sync": in_sync,
+            "saved_to": saved_to,
+            "save_error": save_error,
+        }
 
     def _observe_rpc_meta(self, meta: dict) -> None:
         """transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。"""
@@ -484,14 +532,6 @@ class AUNClient:
     @property
     def state(self) -> ConnectionState:
         return ConnectionState(self._state)
-
-    @property
-    def e2ee(self) -> E2EEManager:
-        return self._e2ee
-
-    @property
-    def group_e2ee(self) -> GroupE2EEManager:
-        return self._group_e2ee
 
     # ── 生命周期 ──────────────────────────────────────────
 
@@ -690,13 +730,18 @@ class AUNClient:
         if method.startswith("group.") and "slot_id" not in params:
             params["slot_id"] = self._slot_id
 
-        # 自动加密：message.send 默认加密（encrypt 默认 True）
+        # 自动加密：message.send 默认加密（encrypt 默认 True）— V2-only 客户端必须走 V2 路径
         if method == "message.send":
             encrypt = params.pop("encrypt", True)
+            self._log.info("client", "DEBUG call message.send: to=%s encrypt=%s payload_keys=%s",
+                           params.get("to", "-"), encrypt,
+                           list(params.get("payload", {}).keys()) if isinstance(params.get("payload"), dict) else type(params.get("payload")).__name__)
             if encrypt:
-                self._log.debug("client", "call encrypt branch: method=message.send to=%s", params.get("to", "-"))
+                if not self._v2_session:
+                    raise StateError("V2 session not initialized; encrypted message.send requires V2 (V1 E2EE removed)")
+                self._log.debug("client", "call encrypt branch: method=message.send to=%s v2=True", params.get("to", "-"))
                 try:
-                    result = await self._send_encrypted(params)
+                    result = await self._send_encrypted_v2(params)
                     self._log.debug("client", "call exit (encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
                     return result
                 except Exception as exc:
@@ -705,13 +750,15 @@ class AUNClient:
             # encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
             self._maybe_append_echo_trace_send(params)
 
-        # 自动加密：group.send 默认加密（encrypt 默认 True）
+        # 自动加密：group.send 默认加密（encrypt 默认 True）— V2-only 客户端必须走 V2 路径
         if method == "group.send":
             encrypt = params.pop("encrypt", True)
             if encrypt:
-                self._log.debug("client", "call encrypt branch: method=group.send group_id=%s", params.get("group_id", "-"))
+                if not self._v2_session:
+                    raise StateError("V2 session not initialized; encrypted group.send requires V2 (V1 E2EE removed)")
+                self._log.debug("client", "call encrypt branch: method=group.send group_id=%s v2=True", params.get("group_id", "-"))
                 try:
-                    result = await self._send_group_encrypted(params)
+                    result = await self._send_group_encrypted_v2(params)
                     self._log.debug("client", "call exit (group-encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
                     return result
                 except Exception as exc:
@@ -719,11 +766,34 @@ class AUNClient:
                     raise
             # encrypt=false：明文走通用 RPC 路径，不受 group epoch 轮换/恢复约束
             self._maybe_append_echo_trace_send(params)
+
+        # message.pull：V2 就绪时走 V2 pull（V2-only：跳过 V1 envelope）
+        if method == "message.pull" and getattr(self, "_v2_session", None):
+            self._log.debug("client", "call route: message.pull → V2 pull")
+            return await self._pull_v2_internal(params)
+
+        # message.ack：V2 就绪时走 V2 ack
+        if method == "message.ack" and getattr(self, "_v2_session", None):
+            self._log.debug("client", "call route: message.ack → V2 ack")
+            return await self._ack_v2_internal(params)
+
+        # group.pull：V2 就绪时走 V2 pull
+        if method == "group.pull" and self._v2_session and params.get("group_id"):
+            self._log.debug("client", "call route: group.pull → V2 pull")
+            return await self._pull_group_v2_internal(params)
+
+        # group.ack_messages：V2 就绪时走 V2 ack
+        if method == "group.ack_messages" and self._v2_session and params.get("group_id"):
+            self._log.debug("client", "call route: group.ack_messages → V2 ack")
+            return await self._ack_group_v2_internal(params)
         if method == "group.thought.put":
             encrypt = params.pop("encrypt", True)
             if encrypt:
+                if not self._v2_session or not params.get("group_id"):
+                    raise StateError("V2 session not initialized; encrypted group.thought.put requires V2 (V1 E2EE removed)")
                 try:
-                    result = await self._put_group_thought_encrypted(params)
+                    self._log.debug("client", "call route: group.thought.put → V2 encrypted put")
+                    result = await self._put_group_thought_encrypted_v2(params)
                     self._log.debug("client", "call exit (thought-encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
                     return result
                 except Exception as exc:
@@ -733,8 +803,11 @@ class AUNClient:
         if method == "message.thought.put":
             encrypt = params.pop("encrypt", True)
             if encrypt:
+                if not self._v2_session or not params.get("to"):
+                    raise StateError("V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)")
                 try:
-                    result = await self._put_message_thought_encrypted(params)
+                    self._log.debug("client", "call route: message.thought.put → V2 encrypted put")
+                    result = await self._put_message_thought_encrypted_v2(params)
                     self._log.debug("client", "call exit (msg-thought-encrypted): elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
                     return result
                 except Exception as exc:
@@ -762,66 +835,38 @@ class AUNClient:
             self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
             raise
 
-        # 自动解密：message.pull 返回的消息
+        # 自动解密：message.pull 返回的消息（V2 路径已在 call() 开头路由，此处为 plaintext pull 的 seq 跟踪）
         if method == "message.pull" and isinstance(result, dict):
-            messages = result.get("messages")
             ns = f"p2p:{self._aid}" if self._aid else ""
-            if isinstance(messages, list) and messages:
-                pull_source = "gap_fill" if getattr(self, "_gap_fill_active", False) else "pull"
-                result["messages"] = await self._decrypt_messages(messages, source=pull_source)
-                if self._aid and getattr(self, "_seq_tracker", None) is not None:
-                    self._seq_tracker.on_pull_result(ns, messages)
+            messages = result.get("messages")
+            contig_before = self._seq_tracker.get_contiguous_seq(ns) if self._aid and getattr(self, "_seq_tracker", None) is not None else 0
+            if isinstance(messages, list) and messages and self._aid and getattr(self, "_seq_tracker", None) is not None:
+                self._seq_tracker.on_pull_result(ns, messages, after_seq=int((params or {}).get("after_seq", 0) or 0))
             if self._aid and getattr(self, "_seq_tracker", None) is not None:
-                # P2P retention floor 即使本次没有消息也必须生效，否则空拉时的历史 gap 会一直悬挂。
                 server_ack = int(result.get("server_ack_seq") or 0)
                 if server_ack > 0:
                     contig = self._seq_tracker.get_contiguous_seq(ns)
                     if contig < server_ack:
-                        self._log.info("client", 
+                        self._log.info("client",
                             "message.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d",
                             ns, contig, server_ack,
                         )
                         self._seq_tracker.force_contiguous_seq(ns, server_ack)
-                self._persist_seq(ns)
-                # auto-ack：ack contiguous_seq
                 contig = self._seq_tracker.get_contiguous_seq(ns)
-                should_ack = bool(isinstance(messages, list) and messages) or server_ack > 0
-                if contig > 0 and should_ack:
-                    try:
-                        await self._transport.call("message.ack", {
-                            "seq": contig, "device_id": self._device_id, "slot_id": self._slot_id,
-                        })
-                    except Exception as _ack_exc:
-                        self._log.debug("client", "message.pull auto-ack failed: %s", _ack_exc)
+                if contig != contig_before:
+                    self._persist_seq(ns)
+                # auto-ack 延迟到 publish 完成后（由 _fill_p2p_gap 负责）
+                result["_contig_before"] = contig_before
 
-        # 自动解密：group.pull 返回的群消息
+        # 自动解密：group.pull 返回的群消息（V2 路径已在 call() 开头路由，此处为 plaintext pull 的 seq 跟踪）
         if method == "group.pull" and isinstance(result, dict):
             messages = result.get("messages")
             gid = (params or {}).get("group_id", "")
             ns = f"group:{gid}" if gid else ""
-            decrypted_messages: list = []
-            failed_count = 0
-            if isinstance(messages, list) and messages:
-                result["messages"] = await self._decrypt_group_messages(messages)
-                # 区分解密成功 / 失败：失败的 payload 仍是 e2ee.group_encrypted；
-                # 成功后 ApplyGroupDecryptedPayload 会改成明文 type。
-                for m in (result["messages"] or []):
-                    if not isinstance(m, dict):
-                        continue
-                    payload = m.get("payload") or {}
-                    ptype = payload.get("type") if isinstance(payload, dict) else None
-                    if ptype == "e2ee.group_encrypted":
-                        failed_count += 1
-                        # 失败的入 pending queue，等密钥恢复后 retry
-                        if gid:
-                            self._enqueue_pending_decrypt(gid, m)
-                    else:
-                        decrypted_messages.append(m)
-                if gid and getattr(self, "_seq_tracker", None) is not None:
-                    # 仅用解密成功的消息推进 contig；失败的等 retry 解密成功才推进。
-                    self._seq_tracker.on_pull_result(ns, decrypted_messages)
+            contig_before = self._seq_tracker.get_contiguous_seq(ns) if gid and getattr(self, "_seq_tracker", None) is not None else 0
+            if isinstance(messages, list) and messages and gid and getattr(self, "_seq_tracker", None) is not None:
+                self._seq_tracker.on_pull_result(ns, messages, after_seq=int((params or {}).get("after_seq", 0) or 0))
             if gid and getattr(self, "_seq_tracker", None) is not None:
-                # group retention floor 由 cursor.current_seq 表达，也需要在空拉时推进。
                 cursor = result.get("cursor")
                 if isinstance(cursor, dict):
                     server_ack = int(cursor.get("current_seq") or 0)
@@ -833,228 +878,36 @@ class AUNClient:
                                 ns, contig, server_ack,
                             )
                             self._seq_tracker.force_contiguous_seq(ns, server_ack)
-                self._persist_seq(ns)
-                # auto-ack：仅在没有解密失败时 auto-ack；
-                # 有失败时让服务端 cursor 留在原位等 retry。
                 contig = self._seq_tracker.get_contiguous_seq(ns)
-                should_ack = failed_count == 0 and (
-                    bool(decrypted_messages) or (
-                        isinstance(cursor, dict) and int(cursor.get("current_seq") or 0) > 0
-                    )
-                )
-                if contig > 0 and should_ack:
-                    try:
-                        await self._transport.call("group.ack_messages", {
-                            "group_id": gid, "msg_seq": contig,
-                            "device_id": self._device_id,
-                            "slot_id": self._slot_id,
-                        })
-                    except Exception as _ack_exc:
-                        self._log.debug("client", "group.pull auto-ack failed: group=%s %s", gid, _ack_exc)
-                # 有解密失败时调度 recovery 兜底定时
-                if failed_count > 0 and gid:
-                    self._schedule_recovery_timeout(gid)
-
-        if method == "group.thought.get" and isinstance(result, dict):
-            result = await self._decrypt_group_thoughts(result)
-        if method == "message.thought.get" and isinstance(result, dict):
-            result = await self._decrypt_message_thoughts(result)
+                if contig != contig_before:
+                    self._persist_seq(ns)
+                # auto-ack 延迟到 publish 完成后（由 _fill_group_gap / _fill_p2p_gap 负责）
+                result["_contig_before"] = contig_before
 
         # ── Group E2EE 自动编排 ────────────────────────────
-        # 群组 E2EE 是必备能力，始终启用自动编排
-
-        # 建群后自动创建 epoch（幂等：已有 secret 时跳过）
-        # 同步到服务端确保 epoch 一致
-        if method == "group.create" and isinstance(result, dict):
-            group = result.get("group", {})
-            gid = group.get("group_id", "")
-            if gid and self._aid and not self._group_e2ee.has_secret(gid):
-                try:
-                    self._group_e2ee.create_epoch(gid, [self._aid])
-                    # 同步到服务端：将服务端 epoch 从 0 推到 1（await 确保完成后再返回）
-                    await self._sync_epoch_to_server(gid)
-                except Exception as exc:
-                    self._log_e2ee_error("create_epoch", gid, "", exc)
-
-        # 成员集变更必须触发 epoch 轮换并重新签名发布 member list。
-        # 事件路径仍是主路径；RPC 成功返回路径做幂等兜底，避免 group.changed 推送/补洞丢失或延迟时不轮换。
+        # V2-only 客户端：群密钥/状态由 group.v2.bootstrap + group.v2.propose_state 体系管理，
+        # V1 group.e2ee.* RPC 已移除，所有 V1 编排路径已删除。
+        # 建群/成员变更后同步 propose+confirm（保证返回后 committed state 已推进）
         if method in {
-            "group.add_member", "group.kick", "group.remove_member", "group.leave",
+            "group.create", "group.add_member", "group.kick", "group.remove_member", "group.leave",
             "group.review_join_request", "group.batch_review_join_request",
             "group.use_invite_code", "group.request_join",
-        } and isinstance(result, dict):
-            gid = self._extract_group_id_from_result(result) or str(params.get("group_id") or "")
-            expected_epoch = self._membership_rotation_expected_epoch(result)
-            if gid and self._membership_rotation_changed(method, result):
-                # 自加入方法（request_join/use_invite_code）需要 allow_member=True，
-                # 因为新成员角色是 member，必须允许 member 参与 leader 选举。
-                am = method in ("group.request_join", "group.use_invite_code")
-                await self._maybe_lead_rotate_group_epoch(
-                    gid,
-                    reason="membership_changed",
-                    trigger_id=self._membership_rotation_trigger_id(gid, result),
-                    expected_epoch=expected_epoch,
-                    allow_member=am,
-                )
+        } and isinstance(result, dict) and getattr(self, "_v2_session", None):
+            gid = ""
+            if isinstance(result.get("group"), dict):
+                gid = str(result["group"].get("group_id") or "").strip()
+            if not gid:
+                gid = str(params.get("group_id") or "").strip()
+            if gid:
+                try:
+                    await self._v2_auto_propose_state(gid)
+                except Exception as exc:
+                    self._log.debug("client", "V2 post-membership propose failed (non-fatal): group=%s err=%s", gid, exc)
 
         self._log.debug("client", "call exit: elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
         return result
 
 
-
-    @staticmethod
-    def _membership_rotation_trigger_id(group_id: str, payload: dict[str, Any]) -> str:
-        action = str(payload.get("action") or "").strip()
-        if not action:
-            if payload.get("removed_aid"):
-                action = "member_removed"
-            elif payload.get("left_aid"):
-                action = "member_left"
-            elif isinstance(payload.get("member"), dict):
-                action = "member_added"
-            else:
-                action = str(payload.get("status") or payload.get("reason") or "membership_changed")
-        event_seq = payload.get("event_seq") or payload.get("seq") or ""
-        group = payload.get("group")
-        if isinstance(group, dict):
-            event_seq = event_seq or group.get("event_seq") or ""
-        changed_aids: set[str] = set()
-        changed_aid = (
-            payload.get("aid") or payload.get("removed_aid") or payload.get("left_aid")
-            or payload.get("member_aid") or payload.get("target_aid") or ""
-        )
-        if changed_aid:
-            changed_aids.add(str(changed_aid))
-        member = payload.get("member")
-        if isinstance(member, dict):
-            changed_aid = changed_aid or member.get("aid") or ""
-            if member.get("aid"):
-                changed_aids.add(str(member.get("aid")))
-        request = payload.get("request")
-        if isinstance(request, dict):
-            changed_aid = changed_aid or request.get("aid") or ""
-            if request.get("aid"):
-                changed_aids.add(str(request.get("aid")))
-        invite_code = payload.get("invite_code")
-        if isinstance(invite_code, dict):
-            changed_aid = changed_aid or invite_code.get("used_by") or invite_code.get("aid") or ""
-            for key in ("used_by", "aid"):
-                if invite_code.get(key):
-                    changed_aids.add(str(invite_code.get(key)))
-        results = payload.get("results")
-        if isinstance(results, list):
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                item_status = str(item.get("status") or "").strip().lower()
-                if item_status != "approved" and not bool(item.get("approved")):
-                    continue
-                for key in ("aid", "member_aid", "target_aid"):
-                    if item.get(key):
-                        changed_aids.add(str(item.get(key)))
-                for key in ("member", "request"):
-                    nested = item.get(key)
-                    if isinstance(nested, dict) and nested.get("aid"):
-                        changed_aids.add(str(nested.get("aid")))
-        changed_aid_key = ",".join(sorted(aid for aid in changed_aids if aid))
-        expected_epoch = AUNClient._membership_rotation_expected_epoch(payload)
-        if changed_aid_key and expected_epoch is not None:
-            return f"{group_id}:{action}:aid:{changed_aid_key}:epoch:{expected_epoch}"
-        if event_seq:
-            return f"{group_id}:{action}:event:{event_seq}"
-        return f"{group_id}:{action}:aid:{changed_aid_key or changed_aid or '-'}"
-
-    @staticmethod
-    def _membership_rotation_changed(method: str, payload: dict[str, Any]) -> bool:
-        """判断 RPC 成功返回是否真的意味着成员集合变更。"""
-        if method in {"group.add_member", "group.kick", "group.remove_member", "group.leave"}:
-            return True
-        status = str(payload.get("status") or "").strip().lower()
-        if method in {"group.use_invite_code", "group.request_join"}:
-            return status in {"joined", "approved"} or isinstance(payload.get("member"), dict)
-        if method == "group.review_join_request":
-            return status == "approved" or bool(payload.get("approved")) or isinstance(payload.get("member"), dict)
-        if method == "group.batch_review_join_request":
-            results = payload.get("results")
-            if not isinstance(results, list):
-                return False
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                item_status = str(item.get("status") or "").strip().lower()
-                if item_status == "approved" or bool(item.get("approved")):
-                    return True
-            return False
-        return False
-
-    @staticmethod
-    def _membership_rotation_expected_epoch(payload: dict[str, Any]) -> int | None:
-        for key in ("old_epoch", "current_epoch", "e2ee_epoch"):
-            value = payload.get(key)
-            if value is not None:
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    pass
-        group = payload.get("group")
-        if isinstance(group, dict):
-            value = group.get("old_epoch", group.get("current_epoch", group.get("e2ee_epoch")))
-            if value is not None:
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    pass
-        return None
-
-    @staticmethod
-    def _extract_group_id_from_result(result: dict[str, Any]) -> str:
-        group = result.get("group")
-        if isinstance(group, dict):
-            gid = str(group.get("group_id") or "").strip()
-            if gid:
-                return gid
-        for key in ("group_id",):
-            gid = str(result.get(key) or "").strip()
-            if gid:
-                return gid
-        member = result.get("member")
-        if isinstance(member, dict):
-            gid = str(member.get("group_id") or "").strip()
-            if gid:
-                return gid
-        return ""
-
-    async def _get_group_member_aids(self, group_id: str) -> list[str]:
-        members_result = await self.call("group.get_members", {"group_id": group_id})
-        raw_list = members_result.get("members") or members_result.get("items") if isinstance(members_result, dict) else []
-        if not isinstance(raw_list, list):
-            return []
-        member_aids: list[str] = []
-        for item in raw_list:
-            if isinstance(item, dict):
-                aid = str(item.get("aid") or "").strip()
-                if aid:
-                    member_aids.append(aid)
-        return sorted(set(member_aids))
-
-    def _local_group_members_match(self, group_id: str, member_aids: list[str]) -> bool:
-        secret_data = self._group_e2ee.load_secret(group_id)
-        if not secret_data:
-            return False
-        local_members = sorted(set(str(aid) for aid in secret_data.get("member_aids", []) if aid))
-        return local_members == sorted(set(member_aids))
-
-    def _log_e2ee_error(self, stage: str, group_id: str, aid: str, exc: Exception) -> None:
-        """记录 E2EE 自动编排错误（发布事件，不吞掉异常信息）。"""
-        try:
-            loop = getattr(self, "_loop", None)
-            if loop and loop.is_running():
-                loop.create_task(self._dispatcher.publish(
-                    "e2ee.orchestration_error",
-                    {"stage": stage, "group_id": group_id, "aid": aid, "error": str(exc)},
-                ))
-        except Exception as _pub_exc:
-            self._log.warn("client", "failed to publish e2ee orchestration event: %s", _pub_exc)
 
     @staticmethod
     def _protected_headers_from_params(params: dict[str, Any]) -> dict[str, Any] | ProtectedHeaders | None:
@@ -1069,130 +922,6 @@ class AUNClient:
             return value if isinstance(value, dict) else None
         return None
 
-    async def _send_encrypted(self, params: dict[str, Any]) -> Any:
-        """自动加密并发送消息。首次失败时若为对端材料错误则刷新缓存重试一次。"""
-        import time as _time
-        import uuid as _uuid
-
-        _t_start = _time.time()
-        to_aid = params.get("to")
-        self._validate_message_recipient(to_aid)
-        payload = params.get("payload")
-        message_id = params.get("message_id") or str(_uuid.uuid4())
-        timestamp = params.get("timestamp") or int(_time.time() * 1000)
-        self._log.debug("client", "_send_encrypted enter: to=%s message_id=%s", to_aid, message_id)
-
-        # 惰性 P2P 同步：connect 完成后由 _start_background_tasks 异步触发一次，
-        # 与 C++ FillP2PGap 行为对齐。这里不再 await 阻塞用户发送，保持 send 路径轻量。
-        # 后续 push gap 检测与 reconnect 钩子负责其余补齐场景。
-
-        persist_required = bool(params.get("persist_required") or params.get("durable"))
-        protected_headers = self._protected_headers_from_params(params)
-
-        async def _attempt(refresh: bool = False) -> Any:
-            recipient_prekeys = (
-                await self._refresh_peer_prekeys(to_aid)
-                if refresh
-                else await self._fetch_peer_prekeys(to_aid)
-            )
-            self_sync_copies = await self._build_self_sync_copies(
-                logical_to_aid=to_aid,
-                payload=payload,
-                message_id=message_id,
-                timestamp=timestamp,
-                protected_headers=protected_headers,
-            )
-
-            # 统一 multi-device 路径：必须有 recipient prekey
-            if not recipient_prekeys:
-                raise RuntimeError(f"no registered device prekeys for {to_aid}, cannot send encrypted message")
-
-            recipient_copies = await self._build_recipient_device_copies(
-                to_aid=to_aid,
-                payload=payload,
-                message_id=message_id,
-                timestamp=timestamp,
-                prekeys=recipient_prekeys,
-                protected_headers=protected_headers,
-            )
-            send_params: dict[str, Any] = {
-                "to": to_aid,
-                "payload": {
-                    "type": "e2ee.multi_device",
-                    "logical_message_id": message_id,
-                    "recipient_copies": recipient_copies,
-                    "self_copies": self_sync_copies,
-                },
-                "type": "e2ee.multi_device",
-                "encrypted": True,
-                "message_id": message_id,
-                "timestamp": timestamp,
-            }
-            if persist_required:
-                send_params["persist_required"] = True
-            return await self._transport.call("message.send", send_params)
-
-        try:
-            result = await _attempt(False)
-            self._log.debug("client", "_send_encrypted exit: elapsed=%.3fs to=%s message_id=%s", _time.time() - _t_start, to_aid, message_id)
-            return result
-        except Exception as exc:
-            if not _is_retryable_peer_material_error(exc):
-                self._log.debug("client", "_send_encrypted exit (error): elapsed=%.3fs to=%s message_id=%s err=%s", _time.time() - _t_start, to_aid, message_id, exc)
-                raise
-            self._log.warn("client",
-                "peer cert/prekey mismatch for %s, refreshing and retrying once", to_aid,
-            )
-        try:
-            result = await _attempt(True)
-            self._log.debug("client", "_send_encrypted exit (retry): elapsed=%.3fs to=%s message_id=%s", _time.time() - _t_start, to_aid, message_id)
-            return result
-        except Exception as exc:
-            self._log.debug("client", "_send_encrypted exit (retry-error): elapsed=%.3fs to=%s message_id=%s err=%s", _time.time() - _t_start, to_aid, message_id, exc)
-            raise
-
-    async def _build_recipient_device_copies(
-        self,
-        *,
-        to_aid: str,
-        payload: dict[str, Any],
-        message_id: str,
-        timestamp: int,
-        prekeys: list[dict[str, Any]],
-        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
-    ) -> list[dict[str, Any]]:
-        prekeys = self._normalize_peer_prekeys(prekeys)
-        recipient_copies: list[dict[str, Any]] = []
-        cert_cache: dict[str, bytes] = {}
-        for prekey in prekeys:
-            device_id = str(prekey.get("device_id") or "").strip()
-            if not device_id:
-                continue
-            peer_cert_fingerprint = str(prekey.get("cert_fingerprint", "") or "").strip().lower()
-            cache_key = peer_cert_fingerprint or "__default__"
-            peer_cert_pem = cert_cache.get(cache_key)
-            if peer_cert_pem is None:
-                peer_cert_pem = await self._fetch_peer_cert(to_aid, peer_cert_fingerprint or None)
-                cert_cache[cache_key] = peer_cert_pem
-            envelope, encrypt_result = self._encrypt_copy_payload(
-                logical_to_aid=to_aid,
-                payload=payload,
-                peer_cert_pem=peer_cert_pem,
-                prekey=prekey,
-                message_id=message_id,
-                timestamp=timestamp,
-                protected_headers=protected_headers,
-            )
-            self._ensure_encrypt_result(to_aid, encrypt_result)
-            recipient_copies.append({
-                "device_id": device_id,
-                "envelope": envelope,
-            })
-        if not recipient_copies:
-            raise E2EEError(f"no recipient device copies generated for {to_aid}")
-        return recipient_copies
-
-    @staticmethod
     def _cert_sha256_fingerprint(cert_pem: bytes | str | None) -> str:
         if not cert_pem:
             return ""
@@ -1206,332 +935,6 @@ class AUNClient:
         except Exception as _fp_exc:
             self._log.debug("client", "failed to extract cert fingerprint: %s", _fp_exc)
             return ""
-
-    async def _resolve_self_copy_peer_cert(self, cert_fingerprint: str | None = None) -> bytes:
-        """为 self_copies 选择目标设备对应的证书版本。"""
-        my_aid = self._aid
-        if not my_aid:
-            raise E2EEError("self sync copy requires current aid")
-
-        normalized_fp = str(cert_fingerprint or "").strip().lower()
-        identity_cert = (self._identity or {}).get("cert")
-        if isinstance(identity_cert, str) and identity_cert:
-            identity_cert_fp = self._cert_sha256_fingerprint(identity_cert)
-            if not normalized_fp or identity_cert_fp == normalized_fp:
-                return identity_cert.encode("utf-8")
-
-        local_cert = None
-        try:
-            local_cert = self._keystore.load_cert(my_aid, normalized_fp or None)
-        except TypeError:
-            local_cert = self._keystore.load_cert(my_aid)
-        except Exception as _lc_exc:
-            self._log.debug("client", "failed to load local cert: %s", _lc_exc)
-            local_cert = None
-        if local_cert:
-            return local_cert.encode("utf-8") if isinstance(local_cert, str) else local_cert
-
-        return await self._fetch_peer_cert(my_aid, normalized_fp or None)
-
-    async def _build_self_sync_copies(
-        self,
-        *,
-        logical_to_aid: str,
-        payload: dict[str, Any],
-        message_id: str,
-        timestamp: int,
-        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
-    ) -> list[dict[str, Any]]:
-        my_aid = self._aid
-        if not my_aid:
-            return []
-        prekeys = self._normalize_peer_prekeys(await self._fetch_peer_prekeys(my_aid))
-        if not prekeys:
-            return []
-        copies: list[dict[str, Any]] = []
-        for prekey in prekeys:
-            device_id = str(prekey.get("device_id") or "").strip()
-            if not device_id:
-                continue
-            if device_id == self._device_id:
-                continue
-            try:
-                peer_cert_pem = await self._resolve_self_copy_peer_cert(
-                    str(prekey.get("cert_fingerprint", "") or "").strip().lower() or None,
-                )
-            except (ValidationError, Exception) as exc:
-                # 旧设备的 prekey 可能携带已轮换的证书指纹，跳过该设备的自同步副本
-                self._log.warn("client", 
-                    "self-sync 跳过设备 %s: 证书解析失败 (%s)，可能是旧 prekey",
-                    device_id, exc,
-                )
-                continue
-            envelope, encrypt_result = self._encrypt_copy_payload(
-                logical_to_aid=logical_to_aid,
-                payload=payload,
-                peer_cert_pem=peer_cert_pem,
-                prekey=prekey,
-                message_id=message_id,
-                timestamp=timestamp,
-                protected_headers=protected_headers,
-            )
-            self._ensure_encrypt_result(my_aid, encrypt_result)
-            copies.append({
-                "device_id": device_id,
-                "envelope": envelope,
-            })
-        return copies
-
-    def _encrypt_copy_payload(
-        self,
-        *,
-        logical_to_aid: str,
-        payload: dict[str, Any],
-        peer_cert_pem: bytes,
-        prekey: dict[str, Any] | None,
-        message_id: str,
-        timestamp: int,
-        protected_headers: dict[str, Any] | ProtectedHeaders | None = None,
-        context: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if prekey is not None:
-            try:
-                envelope, _ = self._e2ee._encrypt_with_prekey(
-                    logical_to_aid,
-                    payload,
-                    prekey,
-                    peer_cert_pem,
-                    message_id=message_id,
-                    timestamp=timestamp,
-                    protected_headers=protected_headers,
-                    context=context,
-                )
-                return envelope, {
-                    "encrypted": True,
-                    "forward_secrecy": True,
-                    "mode": "prekey_ecdh_v2",
-                    "degraded": False,
-                }
-            except Exception as exc:
-                self._log.warn("client", "prekey encryption failed, degrading to long_term_key: %s", exc)
-
-        envelope, _ = self._e2ee._encrypt_with_long_term_key(
-            logical_to_aid,
-            payload,
-            peer_cert_pem,
-            message_id=message_id,
-            timestamp=timestamp,
-            protected_headers=protected_headers,
-            context=context,
-        )
-        degraded = prekey is not None
-        return envelope, {
-            "encrypted": True,
-            "forward_secrecy": False,
-            "mode": "long_term_key",
-            "degraded": degraded,
-            "degradation_reason": "prekey_encrypt_failed" if degraded else "no_prekey_available",
-        }
-
-    def _ensure_encrypt_result(self, peer_aid: str, encrypt_result: dict[str, Any]) -> None:
-        if not encrypt_result.get("encrypted"):
-            raise E2EEError(f"failed to encrypt message to {peer_aid}")
-
-        if self._config_model.require_forward_secrecy and not encrypt_result.get("forward_secrecy"):
-            raise E2EEError(
-                f"forward secrecy required but unavailable for {peer_aid} "
-                f"(mode={encrypt_result.get('mode')})"
-            )
-
-        if encrypt_result.get("degraded"):
-            loop = getattr(self, "_loop", None)
-            payload = {
-                "peer_aid": peer_aid,
-                "mode": encrypt_result.get("mode"),
-                "reason": encrypt_result.get("degradation_reason"),
-            }
-            try:
-                if loop and loop.is_running():
-                    loop.create_task(self._dispatcher.publish("e2ee.degraded", payload))
-                else:
-                    self._log.warn("client", "e2ee.degraded event not published: event loop not running")
-            except Exception as exc:
-                self._log.warn("client", "failed to publish e2ee.degraded event: %s", exc)
-
-    async def _send_group_encrypted(self, params: dict[str, Any]) -> Any:
-        """自动加密并发送群组消息。发送前预检本地 epoch 是否与服务端一致。"""
-        _t_start = time.time()
-        gid = str(params.get("group_id") or "")
-        self._log.debug("client", "_send_group_encrypted enter: group_id=%s", gid)
-        try:
-            result = await self._call_group_encrypted_rpc(
-                "group.send",
-                params,
-                id_field="message_id",
-                id_prefix="gm",
-            )
-            self._log.debug("client", "_send_group_encrypted exit: elapsed=%.3fs group_id=%s", time.time() - _t_start, gid)
-            return result
-        except Exception as exc:
-            self._log.debug("client", "_send_group_encrypted exit (error): elapsed=%.3fs group_id=%s err=%s", time.time() - _t_start, gid, exc)
-            raise
-
-    async def _put_group_thought_encrypted(self, params: dict[str, Any]) -> Any:
-        return await self._call_group_encrypted_rpc(
-            "group.thought.put",
-            params,
-            id_field="thought_id",
-            id_prefix="gt",
-            extra_fields=("context",),
-        )
-
-    async def _put_message_thought_encrypted(self, params: dict[str, Any]) -> Any:
-        to_aid = str(params.get("to") or "").strip()
-        self._validate_message_recipient(to_aid)
-        payload = params.get("payload")
-        if not to_aid:
-            raise ValidationError("message.thought.put requires to")
-        if not isinstance(payload, dict):
-            raise ValidationError("message.thought.put payload must be an object when encrypt=true")
-
-        thought_id = str(params.get("thought_id") or f"mt-{uuid.uuid4()}").strip()
-        timestamp = int(params.get("timestamp") or time.time() * 1000)
-        prekey = await self._fetch_peer_prekey(to_aid)
-        peer_cert_fingerprint = ""
-        if isinstance(prekey, dict):
-            peer_cert_fingerprint = str(prekey.get("cert_fingerprint", "") or "").strip().lower()
-        peer_cert_pem = await self._fetch_peer_cert(to_aid, peer_cert_fingerprint or None)
-        envelope, encrypt_result = self._encrypt_copy_payload(
-            logical_to_aid=to_aid,
-            payload=payload,
-            peer_cert_pem=peer_cert_pem,
-            prekey=prekey,
-            message_id=thought_id,
-            timestamp=timestamp,
-            protected_headers=self._protected_headers_from_params(params),
-            context=params.get("context") if isinstance(params.get("context"), dict) else None,
-        )
-        self._ensure_encrypt_result(to_aid, encrypt_result)
-        send_params: dict[str, Any] = {
-            "to": to_aid,
-            "payload": envelope,
-            "type": "e2ee.encrypted",
-            "encrypted": True,
-            "thought_id": thought_id,
-            "timestamp": timestamp,
-        }
-        if "context" in params:
-            send_params["context"] = params["context"]
-        self._sign_client_operation("message.thought.put", send_params)
-        return await self._transport.call("message.thought.put", send_params)
-
-    async def _call_group_encrypted_rpc(
-        self,
-        method: str,
-        params: dict[str, Any],
-        *,
-        id_field: str,
-        id_prefix: str,
-        extra_fields: tuple[str, ...] = (),
-    ) -> Any:
-        self._log.debug(
-            "client",
-            "_call_group_encrypted_rpc entry method=%s group_id=%s id_field=%s",
-            method, str(params.get("group_id") or ""), id_field,
-        )
-        send_params, group_id = await self._prepare_group_encrypted_rpc_params(
-            method,
-            params,
-            id_field=id_field,
-            id_prefix=id_prefix,
-            extra_fields=extra_fields,
-        )
-        for attempt in range(2):
-            try:
-                result = await self._transport.call(method, send_params)
-                self._log.debug(
-                    "client",
-                    "_call_group_encrypted_rpc completed method=%s group_id=%s attempt=%d",
-                    method, group_id, attempt,
-                )
-                return result
-            except AUNError as exc:
-                if attempt == 0 and self._is_recoverable_group_epoch_error(exc):
-                    self._log.warn("client", "group %s calling %s epoch unavailable, retrying after recovery: %s", group_id, method, exc)
-                    send_params, _ = await self._prepare_group_encrypted_rpc_params(
-                        method,
-                        params,
-                        id_field=id_field,
-                        id_prefix=id_prefix,
-                        extra_fields=extra_fields,
-                        strict_epoch_ready=True,
-                    )
-                    continue
-                raise
-
-        raise StateError(f"{method} failed after epoch recovery retry: group={group_id}")
-
-    async def _prepare_group_encrypted_rpc_params(
-        self,
-        method: str,
-        params: dict[str, Any],
-        *,
-        id_field: str,
-        id_prefix: str,
-        extra_fields: tuple[str, ...] = (),
-        strict_epoch_ready: bool = False,
-    ) -> tuple[dict[str, Any], str]:
-        group_id = str(params.get("group_id") or "").strip()
-        payload = params.get("payload")
-        if not group_id:
-            raise ValidationError(f"{method} requires group_id")
-
-        self._log.debug(
-            "client",
-            "_prepare_group_encrypted_rpc_params entry method=%s group_id=%s synced=%s strict_epoch_ready=%s",
-            method, group_id, group_id in self._group_synced, strict_epoch_ready,
-        )
-
-        if group_id not in self._group_synced:
-            await self._lazy_sync_group(group_id)
-
-        await self._ensure_group_epoch_ready(group_id, strict=strict_epoch_ready)
-        await self._wait_for_group_membership_epoch_floor(group_id, timeout_s=5.0, strict=True)
-
-        operation_id = str(params.get(id_field) or f"{id_prefix}-{uuid.uuid4()}").strip()
-        timestamp = int(params.get("timestamp") or time.time() * 1000)
-        epoch_result = await self._committed_group_epoch_state(group_id)
-        committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
-        protected_headers = self._protected_headers_from_params(params)
-        context = params.get("context") if method == "group.thought.put" and isinstance(params.get("context"), dict) else None
-        if committed_epoch > 0:
-            ready_epoch = await self._ensure_committed_group_secret_for_send(group_id, committed_epoch, epoch_result)
-            envelope = self._group_e2ee.encrypt_with_epoch(
-                group_id, ready_epoch, payload,
-                message_id=operation_id, timestamp=timestamp,
-                protected_headers=protected_headers,
-                context=context,
-            )
-        else:
-            envelope = self._group_e2ee.encrypt(
-                group_id, payload,
-                message_id=operation_id, timestamp=timestamp,
-                protected_headers=protected_headers,
-                context=context,
-            )
-        send_params: dict[str, Any] = {
-            "group_id": group_id,
-            "payload": envelope,
-            "type": "e2ee.group_encrypted",
-            "encrypted": True,
-            id_field: operation_id,
-            "timestamp": timestamp,
-        }
-        for field in extra_fields:
-            if field in params:
-                send_params[field] = params[field]
-        self._sign_client_operation(method, send_params)
-        return send_params, group_id
 
     async def _lazy_sync_group(self, group_id: str) -> None:
         """惰性同步：首次激活群时 pull 最近消息，建立 seq 基线。"""
@@ -1556,796 +959,9 @@ class AUNClient:
             self._log.warn("client", "lazy sync group %s failed: %s", group_id, exc)
 
 
-    @staticmethod
-    def _is_group_epoch_too_old_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        return (
-            "e2ee epoch too old" in text
-            or "epoch below sender membership floor" in text
-        )
-
-    @staticmethod
-    def _is_group_epoch_rotation_pending_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        return "e2ee epoch rotation pending" in text or "e2ee epoch not committed" in text
-
-    @staticmethod
-    def _is_group_epoch_changed_during_send_error(exc: Exception) -> bool:
-        return "e2ee epoch changed during send" in str(exc).lower()
-
-    @classmethod
-    def _is_recoverable_group_epoch_error(cls, exc: Exception) -> bool:
-        return (
-            cls._is_group_epoch_too_old_error(exc)
-            or cls._is_group_epoch_rotation_pending_error(exc)
-            or cls._is_group_epoch_changed_during_send_error(exc)
-        )
-
-    @staticmethod
-    def _is_expected_group_rotation_skip_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        return (
-            "is not a member" in text
-            or "client is not connected" in text
-            or "not connected" in text
-        )
-
-    @staticmethod
-    def _extract_group_join_mode(payload: Any) -> str:
-        if not isinstance(payload, dict):
-            return ""
-        for key in ("join_mode", "mode"):
-            value = str(payload.get(key) or "").strip().lower()
-            if value:
-                return value
-        for key in ("join_requirements", "join"):
-            nested = payload.get(key)
-            if isinstance(nested, dict):
-                value = str(nested.get("mode") or nested.get("join_mode") or "").strip().lower()
-                if value:
-                    return value
-        group = payload.get("group")
-        if isinstance(group, dict):
-            value = AUNClient._extract_group_join_mode(group)
-            if value:
-                return value
-        settings = payload.get("settings")
-        if isinstance(settings, dict):
-            for key in ("join.mode", "join_mode", "mode"):
-                value = str(settings.get(key) or "").strip().lower()
-                if value:
-                    return value
-        if isinstance(settings, list):
-            for item in settings:
-                if not isinstance(item, dict):
-                    continue
-                key = str(item.get("key") or item.get("name") or "").strip().lower()
-                if key in {"join.mode", "join_mode", "mode"}:
-                    value = str(item.get("value") or "").strip().lower()
-                    if value:
-                        return value
-        return ""
-
-    @staticmethod
     def _join_mode_allows_member_epoch_rotation(mode: str) -> bool:
         return str(mode or "").strip().lower() in {"open", "invite_only", "invite_code"}
 
-    async def _group_allows_member_epoch_rotation(self, group_id: str) -> bool:
-        """仅 open / invite code 群允许普通成员参与轮换及服务端 epoch key 存取。"""
-        try:
-            resp = await self.call("group.get_join_requirements", {"group_id": group_id})
-            mode = self._extract_group_join_mode(resp)
-            if mode:
-                return self._join_mode_allows_member_epoch_rotation(mode)
-        except Exception as exc:
-            self._log.debug("client", "failed to read group join mode: group=%s method=get_join_requirements err=%s", group_id, exc)
-        try:
-            resp = await self.call("group.get_settings", {
-                "group_id": group_id,
-                "keys": ["join.mode"],
-            })
-            mode = self._extract_group_join_mode(resp)
-            if mode:
-                return self._join_mode_allows_member_epoch_rotation(mode)
-        except Exception as exc:
-            self._log.debug("client", "failed to read group settings: group=%s method=get_settings err=%s", group_id, exc)
-        try:
-            resp = await self.call("group.get", {"group_id": group_id})
-            mode = self._extract_group_join_mode(resp)
-            if mode:
-                return self._join_mode_allows_member_epoch_rotation(mode)
-        except Exception as exc:
-            self._log.debug("client", "failed to read group info: group=%s method=get err=%s", group_id, exc)
-        return False
-
-    def _group_key_recovery_candidates(self, group_id: str, epoch_result: dict[str, Any]) -> list[str]:
-        candidates: list[str] = []
-
-        def add(value: Any) -> None:
-            if isinstance(value, str):
-                aid = value.strip()
-                if aid and aid != self._aid and aid not in candidates:
-                    candidates.append(aid)
-
-        for key in ("rotated_by", "owner_aid"):
-            add(epoch_result.get(key))
-        for key in ("recovery_candidates", "admins", "members"):
-            values = epoch_result.get(key)
-            if isinstance(values, list):
-                for value in values:
-                    add(value)
-                    if isinstance(value, dict):
-                        add(value.get("aid"))
-        for aid in self._group_e2ee.get_member_aids(group_id):
-            add(aid)
-        return candidates
-
-    async def _request_group_key_from_candidates(
-        self, group_id: str, server_epoch: int, epoch_result: dict[str, Any]
-    ) -> None:
-        candidates = self._group_key_recovery_candidates(group_id, epoch_result)
-        for target_aid in candidates:
-            await self._request_group_key_from(group_id, target_aid, epoch=server_epoch)
-
-    async def _recover_initial_group_epoch_if_needed(
-        self,
-        group_id: str,
-        local_epoch: int,
-        epoch_result: dict[str, Any],
-    ) -> dict[str, Any]:
-        """恢复建群后本地 epoch 1 已创建、服务端 epoch 仍为 0 的崩溃窗口。"""
-        server_epoch = int(epoch_result.get("epoch", 0) if isinstance(epoch_result, dict) else 0)
-        if server_epoch != 0 or local_epoch != 1:
-            return epoch_result
-        secret_data = self._group_e2ee.load_secret(group_id, 1)
-        if not isinstance(secret_data, dict) or secret_data.get("pending_rotation_id"):
-            return epoch_result
-        self._log.warn("client",
-            "group %s detected local epoch 1 exists but server epoch still 0, attempting initial epoch sync",
-            group_id,
-        )
-        await self._sync_epoch_to_server(group_id)
-        try:
-            refreshed = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-            if isinstance(refreshed, dict):
-                return refreshed
-        except Exception as exc:
-            self._log.warn("client", "group %s initial epoch sync refresh failed: %s", group_id, exc)
-        return epoch_result
-
-    async def _recover_group_epoch_key(
-        self,
-        group_id: str,
-        epoch: int,
-        *,
-        sender_aid: str = "",
-        timeout_s: float = 5.0,
-    ) -> bool:
-        _t_start = time.time()
-        self._log.debug("client", "_recover_group_epoch_key enter: group=%s epoch=%s sender=%s timeout=%.1fs", group_id, epoch, sender_aid or "-", timeout_s)
-        existing = self._group_e2ee.load_secret(group_id, epoch)
-        _debug_group_e2ee(
-            "recover_enter",
-            aid=self._aid or "",
-            group=group_id,
-            epoch=epoch,
-            sender=sender_aid or "-",
-            has_local=bool(existing),
-            local_pending=str(existing.get("pending_rotation_id") or "-") if isinstance(existing, dict) else "-",
-        )
-        if await self._group_epoch_secret_ready_for_recovery(group_id, epoch, existing):
-            self._log.debug("client",
-                "group epoch key recovery skipped: group=%s epoch=%s key already local", group_id, epoch,
-            )
-            _debug_group_e2ee(
-                "recover_skip_ready",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-            )
-            self._schedule_retry_pending_decrypt_msgs(group_id)
-            self._log.debug("client", "_recover_group_epoch_key exit (already-ready): elapsed=%.3fs group=%s epoch=%s", time.time() - _t_start, group_id, epoch)
-            return True
-
-        # inflight 去重：同 group_id:epoch 的并发恢复共享同一个 Future
-        key = f"{group_id}:{epoch}"
-        inflight = self._group_epoch_recovery_inflight.get(key)
-        if inflight is not None:
-            self._log.info("client",
-                "group epoch key recovery reusing inflight request: group=%s epoch=%s", group_id, epoch,
-            )
-            _debug_group_e2ee(
-                "recover_inflight_join",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-            )
-            joined = await asyncio.shield(inflight)
-            self._log.debug("client", "_recover_group_epoch_key exit (inflight-joined): elapsed=%.3fs group=%s epoch=%s result=%s", time.time() - _t_start, group_id, epoch, joined)
-            return joined
-
-        self._log.info("client",
-            "group epoch key recovery initiated: group=%s epoch=%s sender=%s", group_id, epoch, sender_aid,
-        )
-
-        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
-        self._group_epoch_recovery_inflight[key] = future
-        try:
-            result = await self._do_recover_group_epoch_key(
-                group_id, epoch, sender_aid=sender_aid, timeout_s=timeout_s,
-            )
-            _debug_group_e2ee(
-                "recover_done",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                result=result,
-            )
-            future.set_result(result)
-            self._log.debug("client", "_recover_group_epoch_key exit: elapsed=%.3fs group=%s epoch=%s result=%s", time.time() - _t_start, group_id, epoch, result)
-            return result
-        except Exception as exc:
-            _debug_group_e2ee(
-                "recover_exception",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                error=type(exc).__name__,
-                detail=str(exc),
-            )
-            future.set_exception(exc)
-            self._log.debug("client", "_recover_group_epoch_key exit (error): elapsed=%.3fs group=%s epoch=%s err=%s", time.time() - _t_start, group_id, epoch, exc)
-            raise
-        finally:
-            self._group_epoch_recovery_inflight.pop(key, None)
-
-    async def _try_recover_epoch_key_from_server(self, group_id: str, epoch: int) -> bool:
-        """尝试从 Group 服务端拉取 ECIES 加密的 epoch key 并解密存入 keystore。"""
-        try:
-            params: dict[str, Any] = {"group_id": group_id}
-            if epoch > 0:
-                params["epoch"] = epoch
-            _debug_group_e2ee(
-                "server_recover_request",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-            )
-            result = await self.call("group.e2ee.get_epoch_key", params)
-            _debug_group_e2ee(
-                "server_recover_response",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                result_type=type(result).__name__,
-                has_encrypted=isinstance(result, dict) and bool(result.get("encrypted_key")),
-                server_epoch=result.get("epoch") if isinstance(result, dict) else "-",
-            )
-            if not isinstance(result, dict):
-                return False
-            encrypted_b64 = result.get("encrypted_key")
-            server_epoch = int(result.get("epoch", epoch))
-            if not encrypted_b64:
-                _debug_group_e2ee(
-                    "server_recover_no_key",
-                    aid=self._aid or "",
-                    group=group_id,
-                    epoch=server_epoch,
-                )
-                return False
-            encrypted_bytes = base64.b64decode(encrypted_b64)
-            # 用自己的 AID 私钥 ECIES 解密
-            from .e2ee import ecies_decrypt
-            from cryptography.hazmat.primitives import serialization as _ser
-            my_aid = self._aid or ""
-            key_pair = self._auth._keystore.load_key_pair(my_aid)
-            if not key_pair or not key_pair.get("private_key_pem"):
-                self._log.warn("client", "cannot load AID private key for ECIES decryption: aid=%s", my_aid)
-                _debug_group_e2ee(
-                    "server_recover_no_private_key",
-                    aid=my_aid,
-                    group=group_id,
-                    epoch=server_epoch,
-                )
-                return False
-            privkey = _ser.load_pem_private_key(key_pair["private_key_pem"].encode("utf-8"), password=None)
-            group_secret = ecies_decrypt(privkey, encrypted_bytes)
-            if not group_secret or len(group_secret) != 32:
-                self._log.warn("client", "server epoch key ECIES decrypt result length abnormal: group=%s epoch=%s len=%s", group_id, server_epoch, len(group_secret) if group_secret else 0)
-                _debug_group_e2ee(
-                    "server_recover_decrypt_bad_length",
-                    aid=my_aid,
-                    group=group_id,
-                    epoch=server_epoch,
-                    secret_len=len(group_secret) if group_secret else 0,
-                )
-                return False
-            member_aids: list[str] = []
-            committed_rotation: dict[str, Any] | None = None
-            epoch_chain: str | None = None
-            try:
-                epoch_info = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-                if isinstance(epoch_info, dict):
-                    committed_dbg = epoch_info.get("committed_rotation")
-                    _debug_group_e2ee(
-                        "server_recover_epoch_info",
-                        aid=my_aid,
-                        group=group_id,
-                        requested_epoch=server_epoch,
-                        committed_epoch=epoch_info.get("committed_epoch", epoch_info.get("epoch", "-")),
-                        has_committed=isinstance(committed_dbg, dict),
-                    )
-                    raw_members = epoch_info.get("members")
-                    if isinstance(raw_members, list):
-                        for item in raw_members:
-                            if isinstance(item, dict):
-                                aid = str(item.get("aid") or "").strip()
-                            else:
-                                aid = str(item or "").strip()
-                            if aid:
-                                member_aids.append(aid)
-                    committed = epoch_info.get("committed_rotation")
-                    if isinstance(committed, dict):
-                        committed_rotation = committed
-                        raw_chain = str(committed.get("epoch_chain") or "").strip()
-                        if raw_chain:
-                            epoch_chain = raw_chain
-                        expected_members = committed.get("expected_members")
-                        if isinstance(expected_members, list):
-                            member_aids = []
-                            for item in expected_members:
-                                aid = str(item or "").strip()
-                                if aid:
-                                    member_aids.append(aid)
-            except Exception as exc:
-                _debug_group_e2ee(
-                    "server_recover_epoch_info_error",
-                    aid=my_aid,
-                    group=group_id,
-                    epoch=server_epoch,
-                    error=type(exc).__name__,
-                    detail=str(exc),
-                )
-            if not member_aids:
-                self._log.warn("client", "server epoch key recovery missing member snapshot: group=%s epoch=%s", group_id, server_epoch)
-                _debug_group_e2ee(
-                    "server_recover_no_members",
-                    aid=my_aid,
-                    group=group_id,
-                    epoch=server_epoch,
-                )
-                return False
-            from .e2ee import compute_membership_commitment, verify_epoch_chain
-            commitment = compute_membership_commitment(member_aids, server_epoch, group_id, group_secret)
-            epoch_chain_unverified: bool | None = None
-            epoch_chain_unverified_reason: str | None = None
-            if isinstance(committed_rotation, dict):
-                committed_epoch = int(committed_rotation.get("target_epoch") or server_epoch)
-                committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
-                rotator_aid = str(
-                    committed_rotation.get("rotated_by")
-                    or committed_rotation.get("lease_owner")
-                    or committed_rotation.get("committed_by")
-                    or ""
-                ).strip()
-                _debug_group_e2ee(
-                    "server_recover_commitment_check",
-                    aid=my_aid,
-                    group=group_id,
-                    epoch=server_epoch,
-                    members=len(member_aids),
-                    committed_epoch=committed_epoch,
-                    computed=commitment[:16],
-                    committed=committed_commitment[:16] if committed_commitment else "-",
-                    rotation=str(committed_rotation.get("rotation_id") or "-"),
-                )
-                if committed_epoch == server_epoch and committed_commitment and committed_commitment != commitment:
-                    self._log.warn("client", 
-                        "服务端 epoch key 恢复 commitment 不匹配: group=%s epoch=%s",
-                        group_id, server_epoch,
-                    )
-                    _debug_group_e2ee(
-                        "server_recover_commitment_mismatch",
-                        aid=my_aid,
-                        group=group_id,
-                        epoch=server_epoch,
-                    )
-                    return False
-                if epoch_chain and committed_epoch == server_epoch:
-                    prev_secret = self._group_e2ee.load_secret(group_id, server_epoch - 1)
-                    prev_chain = str(prev_secret.get("epoch_chain") or "").strip() if isinstance(prev_secret, dict) else ""
-                    if prev_chain and rotator_aid:
-                        if not verify_epoch_chain(epoch_chain, prev_chain, server_epoch, commitment, rotator_aid):
-                            self._log.warn("client", 
-                                "服务端 epoch key 恢复 epoch_chain 验证失败: group=%s epoch=%s rotator=%s",
-                                group_id, server_epoch, rotator_aid,
-                            )
-                            _debug_group_e2ee(
-                                "server_recover_chain_mismatch",
-                                aid=my_aid,
-                                group=group_id,
-                                epoch=server_epoch,
-                                rotator=rotator_aid,
-                            )
-                            return False
-                        epoch_chain_unverified = False
-                    else:
-                        epoch_chain_unverified = True
-                        epoch_chain_unverified_reason = "missing_prev_chain" if not prev_chain else "missing_rotator_aid"
-                        _debug_group_e2ee(
-                            "server_recover_chain_unverified",
-                            aid=my_aid,
-                            group=group_id,
-                            epoch=server_epoch,
-                            reason=epoch_chain_unverified_reason,
-                        )
-            self._group_e2ee.store_secret(
-                group_id, server_epoch, group_secret, commitment, member_aids,
-                epoch_chain=epoch_chain,
-                epoch_chain_unverified=epoch_chain_unverified,
-                epoch_chain_unverified_reason=epoch_chain_unverified_reason,
-            )
-            self._log.info("client", "epoch key recovered from server: group=%s epoch=%s", group_id, server_epoch)
-            _debug_group_e2ee(
-                "server_recover_store_ok",
-                aid=my_aid,
-                group=group_id,
-                epoch=server_epoch,
-                members=len(member_aids),
-                commitment=commitment[:16],
-            )
-            return True
-        except Exception as exc:
-            self._log.debug("client", "epoch key recovery from server failed: group=%s epoch=%s err=%s", group_id, epoch, exc)
-            _debug_group_e2ee(
-                "server_recover_exception",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                error=type(exc).__name__,
-                detail=str(exc),
-            )
-            return False
-
-    async def _do_recover_group_epoch_key(
-        self,
-        group_id: str,
-        epoch: int,
-        *,
-        sender_aid: str = "",
-        timeout_s: float = 5.0,
-    ) -> bool:
-        epoch_result: dict[str, Any] = {"epoch": epoch}
-        try:
-            raw = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-            if isinstance(raw, dict):
-                epoch_result.update(raw)
-        except Exception as exc:
-            self._log.debug("client", "group %s epoch recovery candidate query failed: %s", group_id, exc)
-            _debug_group_e2ee(
-                "recover_epoch_info_error",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                error=type(exc).__name__,
-                detail=str(exc),
-            )
-
-        _debug_group_e2ee(
-            "recover_epoch_info",
-            aid=self._aid or "",
-            group=group_id,
-            requested_epoch=epoch,
-            server_epoch=epoch_result.get("committed_epoch", epoch_result.get("epoch", "-")),
-            has_pending=isinstance(epoch_result.get("pending_rotation"), dict),
-            has_committed=isinstance(epoch_result.get("committed_rotation"), dict),
-            candidates=len(self._group_key_recovery_candidates(group_id, epoch_result)),
-        )
-
-        server_key_allowed = await self._group_allows_member_epoch_rotation(group_id)
-        _debug_group_e2ee(
-            "recover_route",
-            aid=self._aid or "",
-            group=group_id,
-            epoch=epoch,
-            server_key_allowed=server_key_allowed,
-        )
-        if server_key_allowed:
-            # 仅 open / invite code 群允许从服务端拉取 ECIES 加密的 epoch key。
-            if await self._try_recover_epoch_key_from_server(group_id, epoch):
-                self._schedule_retry_pending_decrypt_msgs(group_id)
-                _debug_group_e2ee(
-                    "recover_server_success",
-                    aid=self._aid or "",
-                    group=group_id,
-                    epoch=epoch,
-                )
-                return True
-            _debug_group_e2ee(
-                "recover_server_miss_fallback_p2p",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-            )
-
-        if sender_aid:
-            epoch_result.setdefault("recovery_candidates", [])
-            if isinstance(epoch_result["recovery_candidates"], list):
-                epoch_result["recovery_candidates"].insert(0, sender_aid)
-
-        # 在线优先恢复：先查在线成员列表，只向在线成员发送密钥请求
-        online_aids: list[str] | None = None
-        try:
-            online_resp = await self.call("group.get_online_members", {"group_id": group_id})
-            if isinstance(online_resp, dict):
-                raw_members = online_resp.get("members") or online_resp.get("items") or []
-                if isinstance(raw_members, list):
-                    online_aids = [
-                        str(m.get("aid", ""))
-                        for m in raw_members
-                        if isinstance(m, dict) and m.get("online") is True and str(m.get("aid", "")) != self._aid
-                    ]
-        except Exception as exc:
-            self._log.debug("client", "group %s online member query failed, falling back to full candidate recovery: %s", group_id, exc)
-            _debug_group_e2ee(
-                "recover_online_error",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                error=type(exc).__name__,
-                detail=str(exc),
-            )
-
-        if online_aids is not None:
-            _debug_group_e2ee(
-                "recover_online_members",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                online_count=len(online_aids),
-                online=",".join(online_aids) if online_aids else "-",
-            )
-            if not online_aids:
-                # 无在线成员，恢复失败
-                self._log.info("client", "group epoch key recovery no online candidates: group=%s epoch=%s", group_id, epoch)
-                _debug_group_e2ee(
-                    "recover_no_online_candidates",
-                    aid=self._aid or "",
-                    group=group_id,
-                    epoch=epoch,
-                )
-                return False
-            # 用在线成员过滤候选列表
-            await self._request_group_key_from_online(group_id, epoch, online_aids, epoch_result)
-        else:
-            # 回退：get_online_members 不可用时走原有全量候选逻辑
-            await self._request_group_key_from_candidates(group_id, epoch, epoch_result)
-
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            await asyncio.sleep(_KEY_WAIT_POLL_INTERVAL_S)
-            secret = self._group_e2ee.load_secret(group_id, epoch)
-            if await self._group_epoch_secret_ready_for_recovery(group_id, epoch, secret):
-                self._schedule_retry_pending_decrypt_msgs(group_id)
-                self._log.info("client", "group epoch key recovery complete: group=%s epoch=%s", group_id, epoch)
-                return True
-        secret = self._group_e2ee.load_secret(group_id, epoch)
-        ready = await self._group_epoch_secret_ready_for_recovery(group_id, epoch, secret)
-        if ready:
-            self._schedule_retry_pending_decrypt_msgs(group_id)
-        if not ready:
-            self._log.warn("client", "group epoch key recovery timeout: group=%s epoch=%s", group_id, epoch)
-            _debug_group_e2ee(
-                "recover_timeout",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                has_secret=bool(secret),
-                pending=str(secret.get("pending_rotation_id") or "-") if isinstance(secret, dict) else "-",
-            )
-        return ready
-
-    async def _request_group_key_from_online(
-        self, group_id: str, server_epoch: int, online_aids: list[str], epoch_result: dict[str, Any]
-    ) -> None:
-        """只向在线成员发送密钥恢复请求，优先级：候选列表中的在线成员 > 其他在线成员。"""
-        candidates = self._group_key_recovery_candidates(group_id, epoch_result)
-        # 优先发送给候选列表中在线的成员
-        ordered: list[str] = []
-        for aid in candidates:
-            if aid in online_aids and aid not in ordered:
-                ordered.append(aid)
-        # 补充其他在线成员
-        for aid in online_aids:
-            if aid not in ordered:
-                ordered.append(aid)
-        _debug_group_e2ee(
-            "recover_p2p_ordered_targets",
-            aid=self._aid or "",
-            group=group_id,
-            epoch=server_epoch,
-            targets=",".join(ordered) if ordered else "-",
-            candidates=",".join(candidates) if candidates else "-",
-        )
-        for target_aid in ordered:
-            await self._request_group_key_from(group_id, target_aid, epoch=server_epoch)
-
-    async def _group_epoch_secret_ready_for_recovery(
-        self,
-        group_id: str,
-        epoch: int,
-        secret_data: Any,
-    ) -> bool:
-        if not isinstance(secret_data, dict):
-            return False
-        pending_rotation_id = str(secret_data.get("pending_rotation_id") or "").strip()
-        if not pending_rotation_id:
-            return True
-        return await self._pending_group_secret_still_current(group_id, epoch, pending_rotation_id)
-
-    async def _pending_group_secret_still_current(
-        self,
-        group_id: str,
-        epoch: int,
-        pending_rotation_id: str,
-    ) -> bool:
-        try:
-            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-        except Exception:
-            return False
-        if not isinstance(epoch_result, dict):
-            return False
-        pending = epoch_result.get("pending_rotation")
-        if (
-            isinstance(pending, dict)
-            and not pending.get("expired")
-            and str(pending.get("rotation_id") or "").strip() == pending_rotation_id
-        ):
-            return True
-        committed_rotation = epoch_result.get("committed_rotation")
-        if isinstance(committed_rotation, dict):
-            try:
-                committed_epoch = int(committed_rotation.get("target_epoch") or 0)
-            except (TypeError, ValueError):
-                committed_epoch = 0
-            if committed_epoch == epoch and str(committed_rotation.get("rotation_id") or "").strip() == pending_rotation_id:
-                return True
-        return False
-
-    async def _ensure_group_epoch_ready(self, group_id: str, *, strict: bool) -> None:
-        local_epoch = self._group_e2ee.current_epoch(group_id)
-        if local_epoch is None:
-            local_epoch = 0
-        try:
-            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-        except Exception as exc:
-            if strict:
-                raise StateError(f"group {group_id} failed to query server epoch before retry: {exc}") from exc
-            self._log.warn("client", "group %s epoch pre-check failed: %s", group_id, exc)
-            return
-
-        advertised_epoch = int(epoch_result.get("epoch", 0) if isinstance(epoch_result, dict) else 0)
-        server_epoch = int(
-            epoch_result.get("committed_epoch", advertised_epoch)
-            if isinstance(epoch_result, dict) else advertised_epoch
-        )
-        pending = epoch_result.get("pending_rotation") if isinstance(epoch_result, dict) else None
-        if isinstance(pending, dict):
-            try:
-                pending_base_epoch = int(pending.get("base_epoch") or server_epoch)
-            except (TypeError, ValueError):
-                pending_base_epoch = server_epoch
-            self._schedule_group_rotation_retry(
-                group_id,
-                reason="pending_recovery",
-                trigger_id=str(pending.get("rotation_id") or ""),
-                expected_epoch=pending_base_epoch,
-                pending=pending,
-            )
-        if server_epoch == 0 and local_epoch == 1:
-            epoch_result = await self._recover_initial_group_epoch_if_needed(group_id, local_epoch, epoch_result)
-            advertised_epoch = int(epoch_result.get("epoch", 0) if isinstance(epoch_result, dict) else 0)
-            server_epoch = int(
-                epoch_result.get("committed_epoch", advertised_epoch)
-                if isinstance(epoch_result, dict) else advertised_epoch
-            )
-            if server_epoch == 0:
-                raise StateError(
-                    f"group {group_id} initial epoch sync has not completed; "
-                    "refuse to send with local epoch 1 while server epoch is 0"
-                )
-        if server_epoch <= local_epoch:
-            if not strict or server_epoch <= 0:
-                return
-            deadline = time.monotonic() + _KEY_WAIT_TIMEOUT_S
-            while time.monotonic() < deadline:
-                await asyncio.sleep(_KEY_WAIT_POLL_INTERVAL_S)
-                refreshed = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-                refreshed_advertised = int(refreshed.get("epoch", 0) if isinstance(refreshed, dict) else 0)
-                refreshed_epoch = int(
-                    refreshed.get("committed_epoch", refreshed_advertised)
-                    if isinstance(refreshed, dict) else refreshed_advertised
-                )
-                current_local = self._group_e2ee.current_epoch(group_id) or 0
-                if refreshed_epoch > server_epoch:
-                    epoch_result = refreshed
-                    server_epoch = refreshed_epoch
-                    local_epoch = current_local
-                    break
-                if current_local > local_epoch:
-                    return
-            else:
-                raise StateError(f"group {group_id} epoch rotation has not completed")
-
-        self._log.warn("client", "group %s local epoch=%d < server epoch=%d, triggering key recovery", group_id, local_epoch, server_epoch)
-        await self._recover_group_epoch_key(group_id, server_epoch, timeout_s=_KEY_WAIT_TIMEOUT_S)
-
-        deadline = time.monotonic() + _KEY_WAIT_TIMEOUT_S
-        while time.monotonic() < deadline:
-            await asyncio.sleep(_KEY_WAIT_POLL_INTERVAL_S)
-            refreshed_epoch = self._group_e2ee.current_epoch(group_id)
-            if refreshed_epoch is not None and refreshed_epoch >= server_epoch:
-                return
-
-        refreshed_epoch = self._group_e2ee.current_epoch(group_id)
-        raise StateError(
-            f"group {group_id} local epoch {refreshed_epoch} is behind server epoch {server_epoch}; "
-            "key recovery has not completed"
-        )
-
-    async def _wait_for_group_membership_epoch_floor(
-        self,
-        group_id: str,
-        *,
-        timeout_s: float,
-        strict: bool = False,
-    ) -> None:
-        """发送 epoch 以服务端 committed epoch 为准，成员 floor 只作为异常诊断。"""
-        _ = timeout_s
-        _ = strict
-        while True:
-            try:
-                epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-                committed_epoch = int(
-                    epoch_result.get("committed_epoch", epoch_result.get("epoch", 0))
-                    if isinstance(epoch_result, dict) else 0
-                )
-                members_result = await self.call("group.get_members", {"group_id": group_id})
-            except Exception as exc:
-                self._log.debug("client", "group %s member epoch floor pre-check skipped: %s", group_id, exc)
-                return
-
-            members = members_result.get("members") if isinstance(members_result, dict) else None
-            max_min_read_epoch = 0
-            if isinstance(members, list):
-                for member in members:
-                    if not isinstance(member, dict):
-                        continue
-                    try:
-                        max_min_read_epoch = max(max_min_read_epoch, int(member.get("min_read_epoch") or 0))
-                    except (TypeError, ValueError):
-                        continue
-
-            if max_min_read_epoch <= committed_epoch:
-                return
-
-            self._log.warn("client",
-                "group %s member min_read_epoch above committed epoch, sending with committed epoch: committed=%s floor=%s",
-                group_id, committed_epoch, max_min_read_epoch,
-            )
-            return
-
-    async def _committed_group_epoch(self, group_id: str) -> int:
-        try:
-            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-        except Exception as exc:
-            self._log.warn("client", "group %s committed epoch query failed, falling back to local epoch: %s", group_id, exc)
-            return self._group_e2ee.current_epoch(group_id) or 0
-        if not isinstance(epoch_result, dict):
-            return self._group_e2ee.current_epoch(group_id) or 0
-        return int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
-
-    @staticmethod
     def _group_secret_matches_committed_rotation(
         secret_data: dict[str, Any] | None,
         committed_rotation: dict[str, Any] | None,
@@ -2368,131 +984,6 @@ class AUNClient:
         if str(committed_rotation.get("rotation_id") or "").strip() != pending_rotation_id:
             return False
         return True
-
-    async def _committed_group_epoch_state(self, group_id: str) -> dict[str, Any]:
-        try:
-            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-            if isinstance(epoch_result, dict):
-                return epoch_result
-        except Exception as exc:
-            self._log.warn("client", "group %s committed epoch state query failed, falling back to local epoch: %s", group_id, exc)
-        return {
-            "epoch": self._group_e2ee.current_epoch(group_id) or 0,
-            "committed_epoch": self._group_e2ee.current_epoch(group_id) or 0,
-        }
-
-    async def _ensure_committed_group_secret_for_send(
-        self,
-        group_id: str,
-        committed_epoch: int,
-        epoch_result: dict[str, Any],
-    ) -> int:
-        if committed_epoch <= 0:
-            return committed_epoch
-        secret_data = self._group_e2ee.load_secret(group_id, committed_epoch)
-        committed_rotation = epoch_result.get("committed_rotation") if isinstance(epoch_result, dict) else None
-        if await self._committed_rotation_membership_gap(group_id, committed_epoch, committed_rotation):
-            allow_member = await self._group_allows_member_epoch_rotation(group_id)
-            self._log.warn("client", 
-                "群 %s committed epoch %s 的成员快照与当前成员不一致，触发成员变更轮换修复",
-                group_id, committed_epoch,
-            )
-            await self._maybe_lead_rotate_group_epoch(
-                group_id,
-                reason="membership_changed",
-                trigger_id=f"{group_id}:committed_membership_gap:aid:{self._aid}:epoch:{committed_epoch}",
-                expected_epoch=committed_epoch,
-                allow_member=allow_member,
-            )
-            refreshed = await self._committed_group_epoch_state(group_id)
-            refreshed_committed_epoch = int(
-                (
-                    refreshed.get("committed_epoch", refreshed.get("epoch", committed_epoch))
-                    if isinstance(refreshed, dict) else committed_epoch
-                ) or committed_epoch
-            )
-            if refreshed_committed_epoch > committed_epoch:
-                committed_epoch = refreshed_committed_epoch
-                committed_rotation = refreshed.get("committed_rotation") if isinstance(refreshed, dict) else None
-                secret_data = self._group_e2ee.load_secret(group_id, committed_epoch)
-            if await self._committed_rotation_membership_gap(group_id, committed_epoch, committed_rotation):
-                raise StateError(
-                    f"group {group_id} committed membership is stale at epoch {committed_epoch}; "
-                    "key rotation repair has not completed"
-                )
-        if self._group_secret_matches_committed_rotation(secret_data, committed_rotation, local_aid=self._aid or ""):
-            return committed_epoch
-        pending_rotation_id = str(secret_data.get("pending_rotation_id") or "") if isinstance(secret_data, dict) else ""
-        self._log.warn("client", 
-            "群 %s epoch %s 本地 pending key 未匹配服务端 committed rotation，先恢复密钥: local_rotation=%s",
-            group_id, committed_epoch, pending_rotation_id or "-",
-        )
-        await self._recover_group_epoch_key(group_id, committed_epoch, timeout_s=5.0)
-        refreshed = await self._committed_group_epoch_state(group_id)
-        refreshed_committed_epoch = int(
-            (
-                refreshed.get("committed_epoch", refreshed.get("epoch", committed_epoch))
-                if isinstance(refreshed, dict) else committed_epoch
-            ) or committed_epoch
-        )
-        if refreshed_committed_epoch > committed_epoch:
-            committed_epoch = refreshed_committed_epoch
-            await self._recover_group_epoch_key(group_id, committed_epoch, timeout_s=5.0)
-            refreshed = await self._committed_group_epoch_state(group_id)
-        refreshed_rotation = refreshed.get("committed_rotation") if isinstance(refreshed, dict) else None
-        refreshed_secret = self._group_e2ee.load_secret(group_id, committed_epoch)
-        if not self._group_secret_matches_committed_rotation(refreshed_secret, refreshed_rotation, local_aid=self._aid or ""):
-            raise StateError(
-                f"group {group_id} epoch {committed_epoch} local key is pending or mismatched; "
-                "refuse to send with uncommitted group key"
-            )
-        return committed_epoch
-
-    async def _committed_rotation_membership_gap(
-        self,
-        group_id: str,
-        committed_epoch: int,
-        committed_rotation: dict[str, Any] | None,
-    ) -> bool:
-        if not self._aid or committed_epoch <= 0 or not isinstance(committed_rotation, dict):
-            return False
-        expected_members = committed_rotation.get("expected_members")
-        if not isinstance(expected_members, list):
-            return False
-        expected_set = {str(item).strip() for item in expected_members if str(item or "").strip()}
-        if not expected_set:
-            return False
-        try:
-            members_result = await self.call("group.get_members", {"group_id": group_id})
-        except Exception as exc:
-            self._log.debug("client", "query current members failed, cannot determine committed membership gap: group=%s err=%s", group_id, exc)
-            return False
-        raw_members = members_result.get("members") or members_result.get("items") if isinstance(members_result, dict) else []
-        if not isinstance(raw_members, list):
-            return False
-        active_set: set[str] = set()
-        for item in raw_members:
-            if not isinstance(item, dict):
-                continue
-            aid = str(item.get("aid") or "").strip()
-            status = str(item.get("status") or "active").strip().lower()
-            if aid and status in {"", "active"}:
-                active_set.add(aid)
-        if self._aid not in active_set:
-            return False
-        if not active_set:
-            return False
-        if active_set != expected_set:
-            missing = sorted(active_set - expected_set)
-            extra = sorted(expected_set - active_set)
-            self._log.info("client",
-                "group %s committed membership gap: epoch=%s missing=%s extra=%s",
-                group_id, committed_epoch, missing, extra,
-            )
-            return True
-        return False
-
-    # ── 便利方法 ──────────────────────────────────────────
 
     async def ping(self, params: dict | None = None) -> Any:
         return await self.meta.ping(params or {})
@@ -2548,43 +1039,20 @@ class AUNClient:
                 await self._publish_app_event("message.received", data)
                 return
             msg = dict(data)
-            self._log.debug(
+            self._log.info(
                 "client",
-                "DIAG _process_and_publish_message enter: message_id=%s seq=%s from=%s device_id=%s slot_id=%s",
+                "DEBUG _process_and_publish_message enter: message_id=%s seq=%s from=%s device_id=%s slot_id=%s",
                 msg.get("message_id"), msg.get("seq"), msg.get("from"),
                 msg.get("device_id"), msg.get("slot_id"),
             )
             if not self._message_targets_current_instance(msg):
-                self._log.debug(
+                self._log.info(
                     "client",
-                    "DIAG _process_and_publish_message filtered (instance mismatch): "
+                    "DEBUG _process_and_publish_message FILTERED (instance mismatch): "
                     "msg_device=%s self_device=%s msg_slot=%s self_slot=%s",
                     msg.get("device_id"), self._device_id,
                     msg.get("slot_id"), self._slot_id,
                 )
-                return
-
-            # 拦截 P2P 传输的群组密钥分发/请求/响应消息
-            if await self._try_handle_group_key_message(msg):
-                self._log.debug(
-                    "client",
-                    "DIAG group_key intercepted: message_id=%s seq=%s elapsed=%.3fs",
-                    msg.get("message_id"), msg.get("seq"), time.time() - _t_start,
-                )
-                # group_key 控制消息也要推进 seq tracker + auto-ack，
-                # 否则 fillP2pGap 会因为 contig 卡在此 seq 之前而重复拉取同样的历史消息。
-                seq = msg.get("seq")
-                if seq is not None and self._aid:
-                    ns = f"p2p:{self._aid}"
-                    self._seq_tracker.on_message_seq(ns, int(seq))
-                    self._persist_seq(ns)
-                    contig = self._seq_tracker.get_contiguous_seq(ns)
-                    if contig > 0:
-                        self._fire_ack("message.ack", {
-                            "seq": contig, "device_id": self._device_id, "slot_id": self._slot_id,
-                        }, "P2P auto-ack（group_key control）")
-                # 让出事件循环，避免连续处理大量 group_key 消息时阻塞 ws 握手等 IO
-                await asyncio.sleep(0)
                 return
 
             # P2P 空洞检测
@@ -2601,32 +1069,21 @@ class AUNClient:
                     loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
                     loop.create_task(self._fill_p2p_gap())
 
-            decrypted = await self._decrypt_single_message(msg, source="push")
-            if decrypted is None:
-                # 解密返回 None（replay guard 判定重复或解密失败），不投递消息，
-                # 但 SeqTracker 已推进 contiguous，仍需 auto-ack 避免服务端重推。
-                if seq is not None and self._aid:
-                    contig = self._seq_tracker.get_contiguous_seq(ns)
-                    await self._drain_ordered_messages(ns)
-                    if contig > 0:
-                        self._fire_ack("message.ack", {
-                            "seq": contig, "device_id": self._device_id, "slot_id": self._slot_id,
-                        }, "P2P auto-ack（解密None）")
-                return
+            # 明文消息直接透传（V2 加密消息走 _on_v2_push_notification）
             if seq is not None and self._aid:
-                self._log.debug(
+                self._log.info(
                     "client",
-                    "DIAG publish ordered: ns=%s seq=%s message_id=%s",
-                    ns, seq, decrypted.get("message_id") if isinstance(decrypted, dict) else "?",
+                    "DEBUG publish ordered: ns=%s seq=%s message_id=%s",
+                    ns, seq, msg.get("message_id", "?"),
                 )
-                await self._publish_ordered_message("message.received", ns, seq, decrypted)
+                await self._publish_ordered_message("message.received", ns, seq, msg)
             else:
-                self._log.debug(
+                self._log.info(
                     "client",
-                    "DIAG publish app event (no seq): message_id=%s",
-                    decrypted.get("message_id") if isinstance(decrypted, dict) else "?",
+                    "DEBUG publish app event (no seq): message_id=%s",
+                    msg.get("message_id", "?"),
                 )
-                await self._publish_app_event("message.received", decrypted)
+                await self._publish_app_event("message.received", msg)
 
             # auto-ack push 消息：ack contiguous_seq（连续确认到的最高位置，避免空洞时跳跃推进）
             if seq is not None and self._aid:
@@ -2658,20 +1115,118 @@ class AUNClient:
                 await self._publish_app_event("message.undecryptable", safe_event)
 
     async def _on_raw_group_message_created(self, data: Any) -> None:
-        """处理群组消息推送：自动解密后 re-publish。"""
-        _t_start = time.time()
-        if isinstance(data, dict):
-            self._log.debug(
-                "client",
-                "_on_raw_group_message_created enter: message_id=%s seq=%s group_id=%s from=%s",
-                data.get("message_id", "-"), data.get("seq", "-"),
-                data.get("group_id", "-"), data.get("from", "-"),
-            )
+        """处理 group.message_created 推送。
+        V2-only 模式：推送不带 payload，触发 group.v2.pull 获取完整消息。
+        V1 兼容模式：直接透传（payload 已在推送中）。
+        """
+        if not isinstance(data, dict):
+            await self._publish_app_event("group.message_created", data)
+            return
+        group_id = data.get("group_id", "")
+        seq = data.get("seq")
+        if group_id:
+            self._group_synced.add(group_id)
+
+        # V2-only 模式：V1 明文推送不带 payload，需要通过 group.v2.pull 获取完整消息
+        if getattr(self, "_v2_session", None) and group_id and seq is not None:
+            ns = f"group:{group_id}"
+            seq_i = int(seq)
+            if self._is_published_seq(ns, seq_i) or self._is_pending_ordered_seq(ns, seq_i):
+                return
+            # 复用 V2 push 的 pull 逻辑
+            async def _v1_pull_and_publish() -> None:
+                try:
+                    dedup_key = f"group_pull:{ns}"
+                    if dedup_key in self._gap_fill_done:
+                        return
+                    self._gap_fill_done[dedup_key] = time.time()
+                    try:
+                        contig = self._seq_tracker.get_contiguous_seq(ns)
+                        after_seq = max(0, contig)
+                        await self._pull_group_v2_internal({"group_id": group_id, "after_seq": after_seq, "limit": 50})
+                    finally:
+                        self._gap_fill_done.pop(dedup_key, None)
+                except Exception as exc:
+                    self._log.warn("client", "_on_raw_group_message_created v2 pull failed group=%s: %s", group_id, exc)
+            loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+            loop.create_task(_v1_pull_and_publish())
+            return
+
+        # V1 兼容路径（非 V2-only 模式）
+        if group_id and seq is not None:
+            ns = f"group:{group_id}"
+            seq_i = int(seq)
+            if self._is_published_seq(ns, seq_i) or self._is_pending_ordered_seq(ns, seq_i):
+                return
+            self._seq_tracker.on_message_seq(ns, seq_i)
+            self._persist_seq(ns)
+            await self._publish_ordered_message("group.message_created", ns, seq, data)
+            contig = self._seq_tracker.get_contiguous_seq(ns)
+            if contig > 0:
+                self._fire_ack("group.ack_messages", {
+                    "group_id": group_id, "msg_seq": contig,
+                    "device_id": self._device_id,
+                    "slot_id": self._slot_id,
+                }, f"群消息 auto-ack group={group_id}")
         else:
-            self._log.debug("client", "_on_raw_group_message_created enter (non-dict): type=%s", type(data).__name__)
+            await self._publish_app_event("group.message_created", data)
+
+    async def _on_raw_group_v2_message_created(self, data: Any) -> None:
+        """处理 V2 群消息推送：服务端 push 仅携带 seq + message_id + sender_aid + group_id，
+        SDK 收到后主动 group.v2.pull 拉取 envelope 并自动解密，转发为 group.message_created
+        事件给应用层（与 V1 群路径对齐）。
+        """
+        _t_start = time.time()
+        if not isinstance(data, dict):
+            self._log.debug("client", "_on_raw_group_v2_message_created skipped (non-dict): type=%s", type(data).__name__)
+            return
+        group_id = str(data.get("group_id") or "").strip()
+        seq = int(data.get("seq", 0) or 0)
+        message_id = str(data.get("message_id") or "").strip()
+        sender_aid = str(data.get("sender_aid") or "").strip()
+        self._log.debug("client",
+            "_on_raw_group_v2_message_created group=%s seq=%d message_id=%s sender=%s",
+            group_id, seq, message_id, sender_aid,
+        )
+        if not group_id or seq <= 0:
+            self._log.debug("client", "_on_raw_group_v2_message_created skipped: missing group_id or seq")
+            return
+        if not getattr(self, "_v2_session", None):
+            self._log.debug("client", "_on_raw_group_v2_message_created skipped: V2 session not initialized")
+            return
+
+        async def _pull_and_publish() -> None:
+            try:
+                ns = f"group:{group_id}"
+                # per-namespace 去重：同一 group namespace 只允许 1 个 in-flight pull
+                dedup_key = f"group_pull:{ns}"
+                if dedup_key in self._gap_fill_done:
+                    return
+                self._gap_fill_done[dedup_key] = time.time()
+                try:
+                    contig = self._seq_tracker.get_contiguous_seq(ns)
+                    after_seq = max(0, contig)
+                    pull_params = {"group_id": group_id, "after_seq": after_seq, "limit": 50}
+                    self._log.debug("client",
+                        "_on_raw_group_v2_message_created -> group.v2.pull group=%s after_seq=%d",
+                        group_id, after_seq,
+                    )
+                    pulled = await self._pull_group_v2_internal(pull_params)
+                    msgs = pulled.get("messages", []) if isinstance(pulled, dict) else []
+                    self._log.debug("client",
+                        "_on_raw_group_v2_message_created pulled %d msgs for group=%s",
+                        len(msgs), group_id,
+                    )
+                finally:
+                    self._gap_fill_done.pop(dedup_key, None)
+            except Exception as exc:
+                self._log.warn("client",
+                    "_on_raw_group_v2_message_created pull failed group=%s: %s", group_id, exc,
+                )
+
         loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(self._process_and_publish_group_message(data))
-        self._log.debug("client", "_on_raw_group_message_created exit: elapsed=%.3fs", time.time() - _t_start)
+        loop.create_task(_pull_and_publish())
+        self._log.debug("client", "_on_raw_group_v2_message_created exit: elapsed=%.3fs", time.time() - _t_start)
 
     async def _on_raw_group_changed(self, data: Any) -> None:
         """处理群组变更事件：验签 → 透传给用户 → 基于 gap 检测补齐 → epoch 轮换。
@@ -2701,7 +1256,7 @@ class AUNClient:
             # V2 自动 propose_state：owner/admin 在成员变更后自动提交 state proposal
             if group_id and action in ("upsert",) and getattr(self, "_v2_session", None):
                 loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                loop.create_task(self._v2_auto_propose_state(group_id))
+                loop.create_task(self._v2_auto_propose_state(group_id, leader_delay=True))
 
             # event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq
             # 用 on_message_seq 返回值决定是否补拉，与 P2P / group.message 路径对齐
@@ -2725,63 +1280,6 @@ class AUNClient:
                 loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
                 loop.create_task(self._fill_group_event_gap(group_id))
 
-            # 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
-            if data.get("action") in ("member_left", "member_removed") and group_id:
-                loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                expected_epoch = self._membership_rotation_expected_epoch(data)
-                if expected_epoch is None:
-                    self._log.debug("client", "membership event without old_epoch skipped for epoch rotation: aid=%s group=%s action=%s event_seq=%s", self._aid, group_id, data.get("action"), data.get("event_seq"))
-                else:
-                    loop.create_task(self._maybe_lead_rotate_group_epoch(
-                        group_id,
-                        reason="membership_changed",
-                        trigger_id=self._membership_rotation_trigger_id(group_id, data),
-                        expected_epoch=expected_epoch,
-                    ))
-
-            # 成员加入同样改变成员集：按 action 区分策略
-            # - member_added / join_approved（私密群/审批群）：admin 必然在线，立即轮换
-            # - joined / invite_code_used（开放群/邀请码群）：新成员先恢复 committed_epoch，延迟轮换
-            if data.get("action") in ("member_added", "joined", "join_approved", "invite_code_used") and group_id:
-                loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                action = data.get("action")
-                expected_epoch = self._membership_rotation_expected_epoch(data)
-
-                # 新成员自身入群（open/invite_code）：走延迟轮换 + backfill
-                joined_aids = self._joined_member_aids_from_payload(data)
-                is_self_joining = self._aid in joined_aids and action in ("joined", "invite_code_used")
-                if is_self_joining or action in ("joined", "invite_code_used"):
-                    # open/invite_code 群：所有在线成员都参与延迟轮换
-                    # 新成员自己延迟更长，优先让其他在线成员先轮换
-                    trigger_id = self._membership_rotation_trigger_id(group_id, data)
-                    if not is_self_joining:
-                        loop.create_task(self._maybe_backfill_key_to_joined_member(group_id, data, trigger_id))
-                    if expected_epoch is not None:
-                        delay = self._SELF_JOIN_ROTATION_DELAY_S if is_self_joining else None
-                        loop.create_task(self._delayed_rotate_after_join(
-                            group_id,
-                            reason="membership_changed",
-                            trigger_id=trigger_id,
-                            expected_epoch=expected_epoch,
-                            allow_member=True,
-                            delay_s=delay,
-                        ))
-                else:
-                    # member_added / join_approved：立即轮换
-                    if expected_epoch is None:
-                        trigger_id = self._membership_rotation_trigger_id(group_id, data)
-                        loop.create_task(self._maybe_backfill_key_to_joined_member(group_id, data, trigger_id))
-                    else:
-                        loop.create_task(self._maybe_lead_rotate_group_epoch(
-                            group_id,
-                            reason="membership_changed",
-                            trigger_id=self._membership_rotation_trigger_id(group_id, data),
-                            expected_epoch=expected_epoch,
-                        ))
-
-            # PY-003: 群组解散 → 清理本地 epoch key、seq_tracker 等状态
-            if data.get("action") == "dissolved" and group_id:
-                self._cleanup_group_state(group_id)
             self._log.debug("client", "_on_raw_group_changed exit: elapsed=%.3fs group=%s action=%s", time.time() - _t_start, group_id, action)
         else:
             await self._dispatcher.publish("group.changed", data)
@@ -2956,220 +1454,13 @@ class AUNClient:
             }))
             return False
 
-    async def _process_and_publish_group_message(self, data: Any) -> None:
-        """处理群组推送消息的异步任务。
-
-        带 payload 的事件（消息推送）：解密后 re-publish。
-        不带 payload 的事件（通知）：自动 pull 最新消息，逐条解密后 re-publish。
-
-        解密失败的消息仍按已收到推进并 auto-ack，避免缺 key 期间游标长期卡住；
-        同时加入待重试队列，后续拿到密钥后再补发明文事件。
-        """
-        try:
-            if not isinstance(data, dict):
-                await self._publish_app_event("group.message_created", data)
-                return
-            msg = dict(data)
-            group_id = msg.get("group_id", "")
-            seq = msg.get("seq")
-            payload = msg.get("payload")
-
-            payload_present = payload is not None and (not isinstance(payload, dict) or bool(payload))
-            if group_id:
-                self._group_synced.add(group_id)
-
-            if not payload_present:
-                # 不带 payload 的通知不能先推进 seq，否则 auto-pull 会用推进后的 cursor 跳过该消息。
-                await self._auto_pull_group_messages(msg)
-                return
-            if group_id and seq is not None:
-                ns_key = f"group:{group_id}"
-                seq_i = int(seq)
-                if self._is_published_seq(ns_key, seq_i) or self._is_pending_ordered_seq(ns_key, seq_i):
-                    # republish guard：已投递或已解密待投递的 seq 不再进入解密/recover/pending 流程。
-                    return
-            decrypted = await self._decrypt_group_message(msg)
-
-            # PY-001: 检查解密是否成功（成功时有 e2ee 字段）
-            is_encrypted_payload = isinstance(payload, dict) and payload.get("type") == "e2ee.group_encrypted"
-            decrypt_success = not is_encrypted_payload or (isinstance(decrypted, dict) and decrypted.get("e2ee"))
-
-            if group_id and seq is not None:
-                ns = f"group:{group_id}"
-                if decrypt_success:
-                    need_pull = self._seq_tracker.on_message_seq(ns, int(seq))
-                    self._persist_seq(ns)
-                    if need_pull:
-                        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                        loop.create_task(self._fill_group_gap(group_id))
-
-            if decrypt_success:
-                # 解密成功：按 contiguous_seq 有序放行 + auto-ack
-                if group_id and seq is not None:
-                    ns_key = f"group:{group_id}"
-                    await self._publish_ordered_message("group.message_created", ns_key, seq, decrypted)
-                else:
-                    await self._publish_app_event("group.message_created", decrypted)
-
-                # auto-ack：ack contiguous_seq（避免空洞时跳跃推进）
-                if group_id and seq is not None:
-                    contig = self._seq_tracker.get_contiguous_seq(ns)
-                    if contig > 0:
-                        self._fire_ack("group.ack_messages", {
-                            "group_id": group_id, "msg_seq": contig,
-                            "device_id": self._device_id,
-                            "slot_id": self._slot_id,
-                        }, f"群消息 auto-ack group={group_id}")
-            else:
-                # 解密失败 → 入 pending queue，**不推进 seq tracker 也不 auto-ack**：
-                # 让服务端 cursor 留在原位，等密钥恢复后 retry 解密成功才推进 + ack。
-                # 兜底：恢复彻底失败时由 _retry_pending_decrypt_msgs(force_advance_on_fail=True)
-                # 强制推进，避免一条永远解不开的消息无限卡住整个群的 cursor。
-                self._enqueue_pending_decrypt(group_id, msg)
-                # 发布 undecryptable 事件（安全：不含密文 payload）
-                safe_event = {
-                    "message_id": msg.get("message_id"),
-                    "group_id": group_id,
-                    "from": msg.get("from"),
-                    "seq": seq,
-                    "timestamp": msg.get("timestamp"),
-                    "_decrypt_error": "group secret unavailable",
-                }
-                await self._publish_app_event("group.message_undecryptable", safe_event)
-                # 触发兜底定时（30s 后如果仍未解开，强制推进 + ack）
-                self._schedule_recovery_timeout(group_id)
-        except Exception as _exc:
-            self._log.warn("client", "group message push processing failed: %s", _exc)
-            # H26: 解密失败改发 group.message_undecryptable 事件，不投递原始密文 payload
-            if isinstance(data, dict):
-                _payload = data.get("payload")
-                _payload_present = _payload is not None and (not isinstance(_payload, dict) or bool(_payload))
-                safe_event = {
-                    "message_id": data.get("message_id"),
-                    "group_id": data.get("group_id"),
-                    "from": data.get("from"),
-                    "seq": data.get("seq"),
-                    "timestamp": data.get("timestamp"),
-                    "_decrypt_error": str(_exc),
-                }
-                await self._publish_app_event("group.message_undecryptable", safe_event)
-                # 异常路径同样按已收到推进/ack，并加入待重试队列。
-                _exc_group_id = data.get("group_id", "")
-                if _payload_present and _exc_group_id:
-                    self._enqueue_pending_decrypt(_exc_group_id, dict(data))
-                    _exc_seq = data.get("seq")
-                    if _exc_seq is not None:
-                        _exc_ns = f"group:{_exc_group_id}"
-                        need_pull = self._seq_tracker.on_message_seq(_exc_ns, int(_exc_seq))
-                        self._persist_seq(_exc_ns)
-                        if need_pull:
-                            loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                            loop.create_task(self._fill_group_gap(_exc_group_id))
-                        _exc_contig = self._seq_tracker.get_contiguous_seq(_exc_ns)
-                        await self._drain_ordered_messages(_exc_ns)
-                        if _exc_contig > 0:
-                            self._fire_ack("group.ack_messages", {
-                                "group_id": _exc_group_id, "msg_seq": _exc_contig,
-                                "device_id": self._device_id,
-                                "slot_id": self._slot_id,
-                            }, f"群消息 auto-ack（异常路径）group={_exc_group_id}")
-
-    async def _auto_pull_group_messages(self, notification: dict[str, Any]) -> None:
-        """收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息。"""
-        group_id = notification.get("group_id", "")
-        if not group_id:
-            await self._publish_app_event("group.message_created", notification)
-            return
-        notification_seq = notification.get("seq")
-        local_after_seq = self._seq_tracker.get_contiguous_seq(f"group:{group_id}")
-        if notification_seq is not None:
-            try:
-                # 已有本地游标时从本地 contiguous 位置继续拉取，避免通知 seq 跳过中间空洞。
-                # 冷启动没有本地游标时，只拉通知对应的新消息，避免一次性拉取全部历史。
-                after_seq = local_after_seq if local_after_seq > 0 else max(0, int(notification_seq) - 1)
-            except Exception:
-                after_seq = local_after_seq
-        else:
-            after_seq = local_after_seq
-        try:
-            result = await self.call("group.pull", {
-                "group_id": group_id,
-                "after_message_seq": after_seq,
-                "device_id": self._device_id,
-                "slot_id": self._slot_id,
-                "limit": 50,
-            })
-            if isinstance(result, dict):
-                messages = result.get("messages", [])
-                if isinstance(messages, list):
-                    # seq_tracker 更新和 auto-ack 已在 call() 拦截器中完成
-                    ns_key = f"group:{group_id}"
-                    pushed = self._pushed_seqs.get(ns_key)
-                    for msg in messages:
-                        if isinstance(msg, dict):
-                            s = msg.get("seq")
-                            if pushed and s is not None and int(s) in pushed:
-                                continue  # 已发布到应用层，跳过重复投递
-                            if s is not None:
-                                await self._publish_ordered_message("group.message_created", ns_key, s, msg)
-                            else:
-                                await self._publish_app_event("group.message_created", msg)
-                    self._prune_pushed_seqs(ns_key)
-                    return
-        except Exception as _exc:
-            self._log.warn("client", "auto pull group messages failed: %s", _exc)
-        # pull 失败时仍透传原始通知
-        await self._publish_app_event("group.message_created", notification)
-
-    async def _fill_group_gap(self, group_id: str) -> None:
-        """后台补齐群消息空洞。"""
-        if self._state != "connected" or self._closing:
-            return
-        after_seq = self._seq_tracker.get_contiguous_seq(f"group:{group_id}")
-        dedup_key = f"group_msg:{group_id}:{after_seq}"
-        if dedup_key in self._gap_fill_done:
-            return
-        self._gap_fill_done[dedup_key] = time.time()
-        # S1: dedup 键必须在所有出口（成功/异常/空返）清理，避免"成功但返回 0 条"永久占位。
-        # 真实空洞下次 push 还会触发；同窗口内并发由 add 前的 in 检查保证幂等。
-        try:
-            self._log.info("client", "group message gap fill start: group=%s after_seq=%d", group_id, after_seq)
-            result = await self.call("group.pull", {
-                "group_id": group_id,
-                "after_message_seq": after_seq,
-                "device_id": self._device_id,
-                "limit": 50,
-            })
-            if isinstance(result, dict):
-                messages = result.get("messages", [])
-                if isinstance(messages, list):
-                    self._log.info("client", "group message gap fill done: group=%s after_seq=%d pulled=%d", group_id, after_seq, len(messages))
-                    ns_key = f"group:{group_id}"
-                    pushed = self._pushed_seqs.get(ns_key)
-                    # seq_tracker 在 call() 中自动处理；ack 由 push 路径负责
-                    for msg in messages:
-                        if isinstance(msg, dict):
-                            s = msg.get("seq")
-                            if pushed and s is not None and int(s) in pushed:
-                                continue  # 已发布到应用层，跳过重复投递
-                            if s is not None:
-                                await self._publish_ordered_message("group.message_created", ns_key, s, msg)
-                            else:
-                                await self._publish_app_event("group.message_created", msg)
-                    # 维护 republish guard 上限
-                    self._prune_pushed_seqs(ns_key)
-        except Exception as exc:
-            self._log.warn("client", "group message gap fill failed: group=%s after_seq=%d error=%s", group_id, after_seq, exc)
-        finally:
-            self._gap_fill_done.pop(dedup_key, None)
-
     async def _fill_group_event_gap(self, group_id: str) -> None:
         """后台补齐群事件空洞。"""
         if self._state != "connected" or self._closing:
             return
         ns = f"group_event:{group_id}"
         after_seq = self._seq_tracker.get_contiguous_seq(ns)
-        dedup_key = f"group_evt:{group_id}:{after_seq}"
+        dedup_key = f"group_event_pull:{ns}"
         if dedup_key in self._gap_fill_done:
             return
         self._gap_fill_done[dedup_key] = time.time()
@@ -3186,7 +1477,8 @@ class AUNClient:
                 events = result.get("events", [])
                 if isinstance(events, list):
                     self._log.info("client", "group event gap fill done: group=%s after_seq=%d pulled=%d", group_id, after_seq, len(events))
-                    self._seq_tracker.on_pull_result(ns, events)
+                    contig_before = self._seq_tracker.get_contiguous_seq(ns)
+                    self._seq_tracker.on_pull_result(ns, events, after_seq=after_seq)
                     cursor = result.get("cursor")
                     server_ack = int(cursor.get("current_seq") or 0) if isinstance(cursor, dict) else 0
                     if server_ack > 0:
@@ -3197,10 +1489,11 @@ class AUNClient:
                                 ns, contig_before, server_ack,
                             )
                             self._seq_tracker.force_contiguous_seq(ns, server_ack)
-                    self._persist_seq(ns)
                     # auto-ack contiguous_seq
                     contig = self._seq_tracker.get_contiguous_seq(ns)
-                    if contig > 0:
+                    if contig != contig_before:
+                        self._persist_seq(ns)
+                    if contig > 0 and contig != contig_before:
                         try:
                             await self._transport.call("group.ack_events", {
                                 "group_id": group_id, "event_seq": contig,
@@ -3213,7 +1506,7 @@ class AUNClient:
                         if isinstance(evt, dict):
                             evt["_from_gap_fill"] = True
                             et = evt.get("event_type", "")
-                            # 消息事件由 _fill_group_gap 负责，事件补洞不重复投递
+                            # 消息事件由群消息 pull 负责，事件补洞不重复投递
                             if et == "group.message_created":
                                 continue
                             # 验签：有 client_signature 就验（与实时事件路径对齐）
@@ -3227,262 +1520,6 @@ class AUNClient:
         finally:
             self._gap_fill_done.pop(dedup_key, None)
 
-    async def _request_group_key_from(self, group_id: str, target_aid: str, *, epoch: int = 0) -> None:
-        """主动向指定成员请求群组密钥（用于重连时无 epoch key 的群）。"""
-        try:
-            from .e2ee import build_key_request
-            req_payload = build_key_request(group_id, epoch, self._aid or "")
-            self._group_e2ee.remember_key_request(req_payload, expected_responder_aid=target_aid)
-            _debug_group_e2ee(
-                "p2p_key_request_send",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                target=target_aid,
-                request_id=str(req_payload.get("request_id") or "-"),
-            )
-            await self.call("message.send", {
-                "to": target_aid,
-                "payload": req_payload,
-                "encrypt": True,
-                "persist_required": True,
-            })
-            self._log.info("client", "group key recovery request sent: group=%s target=%s epoch=%s", group_id, target_aid, epoch)
-            _debug_group_e2ee(
-                "p2p_key_request_sent",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                target=target_aid,
-                request_id=str(req_payload.get("request_id") or "-"),
-            )
-        except Exception as exc:
-            self._log.warn("client", "group key recovery request send failed: group=%s target=%s epoch=%s err=%s", group_id, target_aid, epoch, exc)
-            _debug_group_e2ee(
-                "p2p_key_request_failed",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                target=target_aid,
-                error=type(exc).__name__,
-                detail=str(exc),
-            )
-
-    async def _ack_group_rotation_key(
-        self,
-        *,
-        rotation_id: str,
-        key_commitment: str,
-        device_id: str | None = None,
-    ) -> bool:
-        if not rotation_id:
-            return False
-        self._log.debug(
-            "client",
-            "_ack_group_rotation_key entry rotation_id=%s device_id=%s",
-            rotation_id, device_id if device_id is not None else self._device_id,
-        )
-        try:
-            result = await self.call("group.e2ee.ack_rotation_key", {
-                "rotation_id": rotation_id,
-                "key_commitment": key_commitment,
-                "device_id": device_id if device_id is not None else self._device_id,
-            })
-            success = bool(isinstance(result, dict) and result.get("success"))
-            self._log.debug(
-                "client",
-                "_ack_group_rotation_key completed rotation_id=%s success=%s",
-                rotation_id, success,
-            )
-            return success
-        except Exception as exc:
-            self._log.warn("client", "epoch key ack submission failed: rotation=%s err=%s", rotation_id, exc)
-            return False
-
-    async def _verify_active_group_rotation_distribution(self, payload: dict[str, Any]) -> bool:
-        """只接受服务端 pending 或已 committed 的 rotation 分发。
-
-        对于不在当前 session 活跃群列表中的群（历史消息激活的），
-        跳过 RPC 验证直接返回 True（让 handle_incoming 本地处理），
-        避免 fillP2pGap 拉到大量历史群密钥消息时触发 epoch 编排风暴。
-        """
-        rotation_id = str(payload.get("rotation_id") or "").strip()
-        group_id = str(payload.get("group_id") or "").strip()
-        if not group_id:
-            return False
-        # 历史群（不在当前 session 活跃列表）：跳过 RPC 验证，只做本地 handle_incoming
-        if group_id not in self._group_synced:
-            self._log.debug("client",
-                "skip RPC verify for inactive group: group=%s rotation=%s (not in group_synced)",
-                group_id, rotation_id,
-            )
-            return True
-        try:
-            epoch = int(payload.get("epoch") or 0)
-        except (TypeError, ValueError):
-            return False
-        commitment = str(payload.get("commitment") or "").strip()
-        try:
-            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-        except Exception as exc:
-            self._log.warn("client",
-                "rejecting epoch key distribution: cannot verify active rotation: group=%s rotation=%s err=%s",
-                group_id, rotation_id, exc,
-            )
-            return False
-        committed_epoch = int(
-            epoch_result.get("committed_epoch", epoch_result.get("epoch", 0))
-            if isinstance(epoch_result, dict) else 0
-        )
-        committed_rotation = epoch_result.get("committed_rotation") if isinstance(epoch_result, dict) else None
-        if not rotation_id:
-            if epoch > 0 and epoch <= committed_epoch:
-                if isinstance(committed_rotation, dict) and int(committed_rotation.get("target_epoch") or committed_epoch) == epoch:
-                    committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
-                    if committed_commitment and commitment and committed_commitment != commitment:
-                        expected_members = committed_rotation.get("expected_members") or []
-                        if self._aid and self._aid not in expected_members:
-                            pass  # 新成员 backfill 场景，放行
-                        else:
-                            return False
-                return True
-            self._log.info("client", 
-                "拒绝缺少 rotation_id 的未来 epoch key 分发: group=%s epoch=%s committed=%s",
-                group_id, epoch, committed_epoch,
-            )
-            return False
-        pending = epoch_result.get("pending_rotation") if isinstance(epoch_result, dict) else None
-        if isinstance(pending, dict) and not pending.get("expired"):
-            pending_commitment = str(pending.get("key_commitment") or "").strip()
-            if (
-                str(pending.get("rotation_id") or "") == rotation_id
-                and int(pending.get("target_epoch") or 0) == epoch
-                and (not pending_commitment or commitment == pending_commitment)
-            ):
-                return True
-
-        if isinstance(committed_rotation, dict) and committed_epoch >= epoch:
-            committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
-            if (
-                str(committed_rotation.get("rotation_id") or "") == rotation_id
-                and (not committed_commitment or commitment == committed_commitment)
-            ):
-                return True
-
-        self._log.info("client", 
-            "拒绝非 pending/committed 状态的 epoch key 分发: group=%s rotation=%s epoch=%s",
-            group_id, rotation_id, epoch,
-        )
-        return False
-
-    async def _discard_group_distribution_if_stale(self, payload: dict[str, Any]) -> None:
-        """处理后再校验一次，关闭 verify/store 之间的状态变化窗口。"""
-        rotation_id = str(payload.get("rotation_id") or "").strip()
-        if not rotation_id:
-            return
-        group_id = str(payload.get("group_id") or "").strip()
-        try:
-            epoch = int(payload.get("epoch") or 0)
-        except (TypeError, ValueError):
-            return
-        if not group_id or epoch <= 0:
-            return
-        if await self._verify_active_group_rotation_distribution(payload):
-            return
-        try:
-            if self._group_e2ee.discard_pending_secret(group_id, epoch, rotation_id):
-                self._log.info("client", 
-                    "丢弃 verify 后变为 stale 的 group epoch key: group=%s epoch=%s rotation=%s",
-                    group_id, epoch, rotation_id,
-                )
-        except Exception as exc:
-            self._log.debug("client", 
-                "清理 stale group epoch key 失败: group=%s epoch=%s rotation=%s err=%s",
-                group_id, epoch, rotation_id, exc,
-            )
-
-    async def _verify_group_key_response_epoch(self, payload: dict[str, Any]) -> bool:
-        group_id = str(payload.get("group_id") or "").strip()
-        if not group_id:
-            return False
-        try:
-            epoch = int(payload.get("epoch") or 0)
-        except (TypeError, ValueError):
-            return False
-        if epoch <= 0:
-            return False
-        commitment = str(payload.get("commitment") or "").strip()
-        try:
-            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-        except Exception as exc:
-            self._log.warn("client", 
-                "拒绝无法校验 committed epoch 的 group key response: group=%s epoch=%s err=%s",
-                group_id, epoch, exc,
-            )
-            return False
-        if not isinstance(epoch_result, dict):
-            return False
-        committed_epoch = int(epoch_result.get("committed_epoch", epoch_result.get("epoch", 0)) or 0)
-        committed_rotation = epoch_result.get("committed_rotation")
-        _debug_group_e2ee(
-            "p2p_response_epoch_check",
-            aid=self._aid or "",
-            group=group_id,
-            epoch=epoch,
-            committed_epoch=committed_epoch,
-            has_committed=isinstance(committed_rotation, dict),
-            response_commitment=commitment[:16] if commitment else "-",
-            rotation=str(committed_rotation.get("rotation_id") or "-") if isinstance(committed_rotation, dict) else "-",
-        )
-        if epoch > committed_epoch:
-            self._log.info("client", 
-                "拒绝未提交 epoch 的 group key response: group=%s epoch=%s committed=%s",
-                group_id, epoch, committed_epoch,
-            )
-            _debug_group_e2ee(
-                "p2p_response_reject_future_epoch",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=epoch,
-                committed_epoch=committed_epoch,
-            )
-            return False
-        if isinstance(committed_rotation, dict) and int(committed_rotation.get("target_epoch") or committed_epoch) == epoch:
-            committed_commitment = str(committed_rotation.get("key_commitment") or "").strip()
-            if committed_commitment and commitment and committed_commitment != commitment:
-                # open/invite_code 新成员恢复：自己不在原始 expected_members 中，放行
-                expected_members = committed_rotation.get("expected_members") or []
-                if self._aid and self._aid not in expected_members:
-                    _debug_group_e2ee(
-                        "p2p_response_allow_new_member_commitment_mismatch",
-                        aid=self._aid or "",
-                        group=group_id,
-                        epoch=epoch,
-                        expected_members=len(expected_members),
-                        committed=committed_commitment[:16],
-                        response=commitment[:16],
-                    )
-                    self._log.debug("client", 
-                        "放行 group key response：新成员恢复 commitment 不匹配属正常 group=%s epoch=%s",
-                        group_id, epoch,
-                    )
-                else:
-                    self._log.warn("client", 
-                        "拒绝 group key response：commitment 与 committed rotation 不匹配 group=%s epoch=%s committed_commitment=%s response_commitment=%s",
-                        group_id, epoch, committed_commitment[:16], commitment[:16],
-                    )
-                    _debug_group_e2ee(
-                        "p2p_response_reject_commitment_mismatch",
-                        aid=self._aid or "",
-                        group=group_id,
-                        epoch=epoch,
-                        expected_members=len(expected_members) if isinstance(expected_members, list) else "-",
-                        committed=committed_commitment[:16],
-                        response=commitment[:16],
-                    )
-                    return False
-        return True
-
     async def _fill_p2p_gap(self) -> None:
         """后台补齐 P2P 消息空洞。"""
         if self._state != "connected" or self._closing:
@@ -3491,7 +1528,7 @@ class AUNClient:
             return
         ns = f"p2p:{self._aid}"
         after_seq = self._seq_tracker.get_contiguous_seq(ns)
-        dedup_key = f"p2p:{after_seq}"
+        dedup_key = f"p2p_pull:{ns}"
         if dedup_key in self._gap_fill_done:
             return
         self._gap_fill_done[dedup_key] = time.time()
@@ -3525,13 +1562,23 @@ class AUNClient:
                             if pushed and s is not None and int(s) in pushed:
                                 continue  # 已发布到应用层，跳过重复投递
                             if s is not None:
-                                await self._publish_ordered_message("message.received", ns_key, s, msg)
+                                await self._publish_pulled_message("message.received", ns_key, s, msg)
                             else:
                                 await self._publish_app_event("message.received", msg)
                             # 每条消息处理后让出事件循环，避免大量历史消息解密阻塞 ws 握手等 IO
                             await asyncio.sleep(0)
                     # 维护 republish guard 上限
                     self._prune_pushed_seqs(ns_key)
+                    # publish 完成后 auto-ack
+                    contig_before = int(result.get("_contig_before", 0) or 0)
+                    contig = self._seq_tracker.get_contiguous_seq(ns_key)
+                    if contig > 0 and contig != contig_before:
+                        try:
+                            await self._transport.call("message.ack", {
+                                "seq": contig, "device_id": self._device_id, "slot_id": self._slot_id,
+                            })
+                        except Exception as _ack_exc:
+                            self._log.debug("client", "P2P gap fill auto-ack failed: %s", _ack_exc)
         except Exception as exc:
             self._log.warn("client", "P2P message gap fill failed: after_seq=%d error=%s", after_seq, exc)
         finally:
@@ -3689,6 +1736,32 @@ class AUNClient:
         await self._drain_ordered_messages(ns)
         return True
 
+    async def _publish_pulled_message(self, event: str, ns: str, seq: Any, payload: Any) -> bool:
+        """发布 pull 批中的消息，只按 namespace+seq 去重，不受批内部空洞阻塞。"""
+        try:
+            seq_i = int(seq)
+        except (TypeError, ValueError):
+            await self._publish_app_event(event, payload)
+            return True
+        if seq_i <= 0 or not ns:
+            await self._publish_app_event(event, payload)
+            return True
+        if self._is_published_seq(ns, seq_i):
+            pending = self._pending_ordered().get(ns)
+            if pending:
+                pending.pop(seq_i, None)
+                if not pending:
+                    self._pending_ordered().pop(ns, None)
+            return False
+        pending = self._pending_ordered().get(ns)
+        if pending:
+            pending.pop(seq_i, None)
+            if not pending:
+                self._pending_ordered().pop(ns, None)
+        await self._publish_app_event(event, payload)
+        self._mark_published_seq(ns, seq_i)
+        return True
+
     def _prune_pushed_seqs(self, ns: str) -> None:
         """维护已发布 seq 集合的内存上限。
 
@@ -3710,257 +1783,6 @@ class AUNClient:
         keep = set(sorted_seqs[-_PUSHED_SEQS_LIMIT:])
         self._pushed_seqs[ns] = keep
 
-    def _enqueue_pending_decrypt(self, group_id: str, msg: dict[str, Any]) -> None:
-        """PY-001: 将解密失败的消息加入待重试队列（有大小上限）。"""
-        ns = f"group:{group_id}"
-        queue = self._pending_decrypt_msgs.setdefault(ns, [])
-        queue.append(msg)
-        # 超过上限时丢弃最旧的
-        if len(queue) > _PENDING_DECRYPT_LIMIT:
-            self._pending_decrypt_msgs[ns] = queue[-_PENDING_DECRYPT_LIMIT:]
-
-    def _schedule_retry_pending_decrypt_msgs(self, group_id: str) -> None:
-        ns = f"group:{group_id}"
-        if not group_id or not self._pending_decrypt_msgs.get(ns):
-            return
-        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(self._retry_pending_decrypt_msgs(group_id))
-
-    async def _retry_pending_decrypt_msgs(self, group_id: str, *, force_advance_on_fail: bool = False) -> None:
-        """PY-002: 密钥恢复后重试待解密队列中的消息。
-
-        成功解密的消息发布到 group.message_created 并推进 seq tracker + auto-ack。
-        force_advance_on_fail=True 时（recovery 兜底超时调用），仍解密失败的消息也强制
-        推进 seq tracker + 发 undecryptable + ack，避免永久卡住游标；False 时保留在队列里。
-        """
-        ns = f"group:{group_id}"
-        queue = self._pending_decrypt_msgs.get(ns)
-        if not queue:
-            return
-        # 取出队列，逐条重试
-        pending = list(queue)
-        self._pending_decrypt_msgs[ns] = []
-        still_pending: list[dict[str, Any]] = []
-
-        for msg in pending:
-            try:
-                decrypted = await self._decrypt_group_message(msg, skip_replay=False)
-                is_encrypted = isinstance(msg.get("payload"), dict) and msg["payload"].get("type") == "e2ee.group_encrypted"
-                if is_encrypted and (not isinstance(decrypted, dict) or not decrypted.get("e2ee")):
-                    # 仍然解密失败
-                    if force_advance_on_fail:
-                        self._log.info(
-                            "client",
-                            "group recovery give up: group=%s seq=%s → force advance + publish undecryptable",
-                            group_id, msg.get("seq"),
-                        )
-                        seq = msg.get("seq")
-                        if seq is not None:
-                            self._seq_tracker.on_message_seq(ns, int(seq))
-                            self._persist_seq(ns)
-                        safe_event = {
-                            "message_id": msg.get("message_id"),
-                            "group_id": group_id,
-                            "from": msg.get("from"),
-                            "seq": seq,
-                            "timestamp": msg.get("timestamp"),
-                            "_decrypt_error": "epoch recovery failed",
-                        }
-                        await self._publish_app_event("group.message_undecryptable", safe_event)
-                        contig = self._seq_tracker.get_contiguous_seq(ns)
-                        if contig > 0:
-                            self._fire_ack("group.ack_messages", {
-                                "group_id": group_id, "msg_seq": contig,
-                                "device_id": self._device_id,
-                                "slot_id": self._slot_id,
-                            }, f"recovery 超时 force advance group={group_id}")
-                    else:
-                        still_pending.append(msg)
-                    continue
-                # 解密成功
-                seq = msg.get("seq")
-                if group_id and seq is not None:
-                    # 推进 seq tracker（之前 push 失败时没推进）
-                    self._seq_tracker.on_message_seq(ns, int(seq))
-                    self._persist_seq(ns)
-                    ns_key = f"group:{group_id}"
-                    await self._publish_ordered_message("group.message_created", ns_key, seq, decrypted)
-                else:
-                    await self._dispatcher.publish("group.message_created", decrypted)
-                # auto-ack
-                if group_id and seq is not None:
-                    contig = self._seq_tracker.get_contiguous_seq(ns)
-                    if contig > 0:
-                        self._fire_ack("group.ack_messages", {
-                            "group_id": group_id, "msg_seq": contig,
-                            "device_id": self._device_id,
-                            "slot_id": self._slot_id,
-                        }, f"重试 auto-ack group={group_id}")
-            except Exception as _exc:
-                self._log.debug("client", "retry decrypt failed: group=%s seq=%s: %s", group_id, msg.get("seq"), _exc)
-                still_pending.append(msg)
-
-        queued_during_retry = list(self._pending_decrypt_msgs.get(ns) or [])
-        merged_pending = still_pending + queued_during_retry
-        if merged_pending:
-            self._pending_decrypt_msgs[ns] = merged_pending[-_PENDING_DECRYPT_LIMIT:]
-        else:
-            self._pending_decrypt_msgs.pop(ns, None)
-
-    def _schedule_recovery_timeout(self, group_id: str, *, timeout_seconds: int = 30) -> None:
-        """recovery 兜底定时：N 秒后如果 pending queue 仍有未解密消息，强制推进 cursor。"""
-        if not group_id:
-            return
-        # 去重：同一 group 短时间内只调度一次
-        now = time.time()
-        last = self._recovery_timeout_scheduled.get(group_id, 0.0)
-        if last and (last + timeout_seconds) > now:
-            return
-        self._recovery_timeout_scheduled[group_id] = now
-        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-
-        async def _run():
-            try:
-                await asyncio.sleep(timeout_seconds)
-                if self._closing:
-                    return
-                ns = f"group:{group_id}"
-                if not self._pending_decrypt_msgs.get(ns):
-                    return
-                self._log.info("client", "group recovery timeout: group=%s → force advance", group_id)
-                await self._retry_pending_decrypt_msgs(group_id, force_advance_on_fail=True)
-            except Exception as _exc:
-                self._log.debug("client", "_schedule_recovery_timeout failed: group=%s err=%s", group_id, _exc)
-
-        loop.create_task(_run())
-
-    def _cleanup_group_state(self, group_id: str) -> None:
-        """PY-003: 群组 dissolve/leave 后清理该群组的全部本地状态。
-
-        包括 epoch key、seq_tracker、pushed_seqs、待重试解密队列。
-        """
-        ns_msg = f"group:{group_id}"
-        ns_evt = f"group_event:{group_id}"
-
-        # 清理 keystore 中的 epoch key
-        if self._aid:
-            try:
-                db = self._keystore._get_db(self._aid)
-                db.delete_group_current(group_id)
-                db.delete_all_group_old_epochs(group_id)
-            except Exception as _exc:
-                self._log.debug("client", "cleanup group %s epoch key failed: %s", group_id, _exc)
-
-        # 清理 seq_tracker
-        self._seq_tracker.remove_namespace(ns_msg)
-        self._seq_tracker.remove_namespace(ns_evt)
-
-        # 清理 pushed_seqs
-        self._pushed_seqs.pop(ns_msg, None)
-
-        # 清理有序放行待发布队列
-        self._pending_ordered().pop(ns_msg, None)
-
-        # 清理待重试解密队列
-        self._pending_decrypt_msgs.pop(ns_msg, None)
-
-        # 清理补洞去重状态
-        for k in list(self._gap_fill_done):
-            if group_id in k:
-                self._gap_fill_done.pop(k, None)
-
-        self._log.info("client", "cleaned up group %s local state (epoch key + seq + pushed_seqs)", group_id)
-
-    async def _decrypt_group_message(self, message: dict[str, Any], *, skip_replay: bool = False) -> dict[str, Any]:
-        """解密单条群组消息。"""
-        _t_start = time.time()
-        payload = message.get("payload")
-        if not isinstance(payload, dict) or payload.get("type") != "e2ee.group_encrypted":
-            return self._attach_group_dispatch_mode_to_payload(message)
-
-        group_id = message.get("group_id", "")
-        msg_epoch = payload.get("epoch")
-        msg_seq = message.get("seq")
-        self._log.debug("client", "_decrypt_group_message enter: group=%s epoch=%s seq=%s", group_id, msg_epoch, msg_seq)
-
-        # 确保发送方证书已缓存（签名验证需要）— 失败时拒绝解密
-        sender_aid = message.get("from", message.get("sender_aid", ""))
-        if sender_aid:
-            cert_ok = await self._ensure_sender_cert_cached(sender_aid)
-            if not cert_ok:
-                self._log.warn("client",
-                    "群消息解密跳过：发送方 %s 证书不可用 (group=%s epoch=%s seq=%s)",
-                    sender_aid, group_id, msg_epoch, msg_seq,
-                )
-                self._log.debug("client", "_decrypt_group_message exit (cert-missing): elapsed=%.3fs group=%s seq=%s", time.time() - _t_start, group_id, msg_seq)
-                return message
-
-        # 先尝试直接解密
-        result = self._group_e2ee.decrypt(message, skip_replay=skip_replay)
-        if result is not None and result.get("e2ee"):
-            self._log.debug("client", "_decrypt_group_message exit (ok): elapsed=%.3fs group=%s seq=%s", time.time() - _t_start, group_id, msg_seq)
-            return self._attach_group_dispatch_mode_to_payload(result)
-
-        # replay guard 命中：decrypt 返回了原消息（非 None）但无 e2ee 字段
-        # 这不是解密失败，不应触发 recover
-        if result is not None:
-            self._log.debug("client",
-                "群消息 replay guard 命中，跳过 recover: group=%s seq=%s sender=%s",
-                group_id, msg_seq, sender_aid,
-            )
-            self._log.debug("client", "_decrypt_group_message exit (replay): elapsed=%.3fs group=%s seq=%s", time.time() - _t_start, group_id, msg_seq)
-            return result
-
-        # 真正的解密失败（result is None），记录原因
-        _has_cert = self._get_verified_peer_cert(sender_aid) is not None if sender_aid else False
-        _local_secrets = self._group_e2ee.load_all_secrets(group_id)
-        self._log.info("client",
-            "群消息解密返回 None：group=%s epoch=%s seq=%s sender=%s "
-            "has_cert=%s local_epochs=%s skip_replay=%s",
-            group_id, msg_epoch, msg_seq, sender_aid,
-            _has_cert, sorted(_local_secrets.keys()) if _local_secrets else [],
-            skip_replay,
-        )
-
-        # 解密失败时，先同步请求目标 epoch key；5 秒内拿到则立即重解。
-        sender = message.get("from", message.get("sender_aid", ""))
-        epoch = msg_epoch
-        if epoch is not None and group_id:
-            self._log.info("client",
-                "触发群组 epoch 密钥恢复：group=%s epoch=%s sender=%s",
-                group_id, epoch, sender,
-            )
-            try:
-                recovered = await self._recover_group_epoch_key(
-                    group_id,
-                    int(epoch),
-                    sender_aid=str(sender or ""),
-                    timeout_s=5.0,
-                )
-                if recovered:
-                    retry = self._group_e2ee.decrypt(message, skip_replay=skip_replay)
-                    if retry is not None and retry.get("e2ee"):
-                        self._log.debug("client", "_decrypt_group_message exit (recovered): elapsed=%.3fs group=%s seq=%s", time.time() - _t_start, group_id, msg_seq)
-                        return self._attach_group_dispatch_mode_to_payload(retry)
-                    self._log.warn("client",
-                        "群消息密钥恢复后仍解密失败：group=%s seq=%s message_id=%s epoch=%s",
-                        group_id, msg_seq, message.get("message_id"), epoch,
-                    )
-            except Exception as exc:
-                self._log.warn("client",
-                    "group message key recovery error: group=%s seq=%s message_id=%s epoch=%s error=%s",
-                    group_id, msg_seq, message.get("message_id"), epoch, exc,
-                )
-                self._log.debug("client", "group %s epoch %s sync recovery failed: %s", group_id, epoch, exc)
-
-        self._log.warn("client",
-            "group message decrypt failed after key recovery attempt: group=%s seq=%s message_id=%s epoch=%s",
-            group_id, msg_seq, message.get("message_id"), msg_epoch,
-        )
-        self._log.debug("client", "_decrypt_group_message exit (failed): elapsed=%.3fs group=%s seq=%s", time.time() - _t_start, group_id, msg_seq)
-        return message
-
-    @staticmethod
     def _attach_group_dispatch_mode_to_payload(message: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(message, dict):
             return message
@@ -3976,370 +1798,6 @@ class AUNClient:
         result["payload"] = payload_view
         result["dispatch_mode"] = mode
         return result
-
-    async def _decrypt_group_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """批量解密群组消息（用于 group.pull/补洞）。"""
-        result = []
-        for msg in messages:
-            # pull/补洞可能重新拿到已由 push 解密但尚未按序投递的消息；
-            # 这里跳过本地 replay guard，避免 burst/乱序场景把待补齐消息误判为重复。
-            decrypted = await self._decrypt_group_message(msg, skip_replay=True)
-            payload = msg.get("payload") if isinstance(msg, dict) else None
-            group_id = msg.get("group_id", "") if isinstance(msg, dict) else ""
-            is_encrypted = isinstance(payload, dict) and payload.get("type") == "e2ee.group_encrypted"
-            if is_encrypted and isinstance(msg, dict) and group_id and not decrypted.get("e2ee"):
-                self._enqueue_pending_decrypt(group_id, msg)
-                continue  # R3: 解密失败不入 result，不 publish 密文给应用层
-            result.append(decrypted)
-        return result
-
-    async def _decrypt_group_thoughts(self, result: dict[str, Any]) -> dict[str, Any]:
-        """解密 group.thought.get 的 RPC 查询结果。
-
-        thought 不是群消息推送/拉取结果，不分配 seq、不发布应用层事件、不 ack。
-        因此它必须跳过 group replay guard，也不能进入 republish guard 或有序发布队列。
-        """
-        if not isinstance(result, dict):
-            return result
-        items = result.get("thoughts")
-        if not result.get("found"):
-            result = dict(result)
-            result["thoughts"] = []
-            return result
-        if not isinstance(items, list):
-            result = dict(result)
-            result["thoughts"] = []
-            return result
-
-        group_id = str(result.get("group_id") or "").strip()
-        sender_aid = str(result.get("sender_aid") or "").strip()
-        thoughts: list[dict[str, Any]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            payload = item.get("payload")
-            thought_id = str(item.get("thought_id") or item.get("message_id") or "").strip()
-            message = {
-                "group_id": group_id,
-                "sender_aid": sender_aid,
-                "from": sender_aid,
-                "message_id": thought_id,
-                "payload": payload,
-                "created_at": item.get("created_at"),
-            }
-            if isinstance(item.get("context"), dict):
-                message["context"] = item["context"]
-            decrypted = await self._decrypt_group_message(message, skip_replay=True)
-            decrypt_failed = (
-                isinstance(payload, dict)
-                and payload.get("type") == "e2ee.group_encrypted"
-                and not decrypted.get("e2ee")
-            )
-            thought = {
-                "thought_id": thought_id,
-                "message_id": thought_id,
-                "payload": decrypted.get("payload"),
-                "created_at": item.get("created_at"),
-                "e2ee": decrypted.get("e2ee"),
-            }
-            if decrypt_failed:
-                thought["decrypt_failed"] = True
-            if item.get("context") is not None:
-                thought["context"] = item.get("context")
-            thoughts.append(thought)
-
-        result_view = dict(result)
-        result_view["thoughts"] = thoughts
-        return result_view
-
-    async def _decrypt_message_thoughts(self, result: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(result, dict):
-            return result
-        items = result.get("thoughts")
-        if not result.get("found"):
-            result = dict(result)
-            result["thoughts"] = []
-            return result
-        if not isinstance(items, list):
-            result = dict(result)
-            result["thoughts"] = []
-            return result
-
-        sender_aid = str(result.get("sender_aid") or "").strip()
-        peer_aid = str(result.get("peer_aid") or "").strip()
-        thoughts: list[dict[str, Any]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            payload = item.get("payload")
-            thought_id = str(item.get("thought_id") or item.get("message_id") or "").strip()
-            from_aid = str(item.get("from") or sender_aid).strip()
-            to_aid = str(item.get("to") or peer_aid).strip()
-            message = {
-                "from": from_aid,
-                "to": to_aid,
-                "message_id": thought_id,
-                "payload": payload,
-                "encrypted": item.get("encrypted", True),
-                "timestamp": item.get("created_at"),
-            }
-            if isinstance(item.get("context"), dict):
-                message["context"] = item["context"]
-            decrypted = message
-            decrypt_failed = False
-            if isinstance(payload, dict) and payload.get("type") == "e2ee.encrypted":
-                if not self._e2ee._should_decrypt_for_current_aid(message, payload):
-                    decrypt_failed = True
-                else:
-                    sender_cert_fingerprint = str(
-                        payload.get("sender_cert_fingerprint")
-                        or (payload.get("aad") or {}).get("sender_cert_fingerprint")
-                        or ""
-                    ).strip().lower()
-                    if from_aid:
-                        cert_ready = await self._ensure_sender_cert_cached(
-                            from_aid, sender_cert_fingerprint or None,
-                        )
-                        if not cert_ready:
-                            self._log.warn("client", 
-                                "p2p.thought.decrypt failed: 无法获取发送方证书 thought_id=%s from=%s",
-                                thought_id, from_aid,
-                            )
-                            decrypt_failed = True
-                    if not decrypt_failed:
-                        decrypted = self._e2ee._decrypt_message(message, source="message.thought.get")
-                        if decrypted is None:
-                            self._log.warn("client", "p2p.thought.decrypt failed thought_id=%s", thought_id)
-                            decrypt_failed = True
-                            decrypted = message
-            thought = {
-                "thought_id": thought_id,
-                "message_id": thought_id,
-                "from": from_aid,
-                "to": to_aid,
-                "payload": decrypted.get("payload") if isinstance(decrypted, dict) else None,
-                "created_at": item.get("created_at"),
-                "e2ee": decrypted.get("e2ee") if isinstance(decrypted, dict) else None,
-            }
-            if decrypt_failed:
-                thought["decrypt_failed"] = True
-            if item.get("context") is not None:
-                thought["context"] = item.get("context")
-            thoughts.append(thought)
-
-        result_view = dict(result)
-        result_view["thoughts"] = thoughts
-        return result_view
-
-    async def _try_handle_group_key_message(self, message: dict[str, Any]) -> bool:
-        """尝试处理 P2P 传输的群组密钥消息。返回 True 表示已处理（不再传播）。
-
-        只有明文 type 或 P2P 加密信封解密后的内层 type 明确命中
-        e2ee.group_key_* 时才拦截。外层 E2EE 解密失败交给普通链路处理，
-        普通链路不会投递原始密文。
-        """
-        _t_start = time.time()
-        payload = message.get("payload")
-        if not isinstance(payload, dict):
-            return False
-
-        _GROUP_KEY_TYPES = (
-            "e2ee.group_key_distribution",
-            "e2ee.group_key_request",
-            "e2ee.group_key_response",
-        )
-
-        # S14: 明文控制面消息（payload.type 直接命中）— 立即识别为控制面
-        outer_type = payload.get("type")
-        is_control_plane = outer_type in _GROUP_KEY_TYPES
-        # 先解密 P2P E2EE（如果是加密的）
-        # 注意：用 _decrypt_message 而非 decrypt_message，避免消耗 seen set
-        actual_payload = payload
-        if outer_type == "e2ee.encrypted":
-            # 确保发送方证书已缓存（签名验证需要）
-            from_aid = message.get("from", "")
-            if from_aid:
-                sender_fp = str(
-                    payload.get("sender_cert_fingerprint")
-                    or (payload.get("aad") or {}).get("sender_cert_fingerprint")
-                    or ""
-                ).strip().lower()
-                await self._ensure_sender_cert_cached(from_aid, sender_fp or None)
-            decrypted = self._e2ee._decrypt_message(message, source="push:group_key")
-            if decrypted is None:
-                self._log.warn("client", 
-                    "群组密钥控制消息 P2P 解密失败：from=%s message_id=%s",
-                    message.get("from"), message.get("message_id"),
-                )
-                return False
-            self._schedule_prekey_replenish_if_consumed(decrypted)
-            actual_payload = decrypted.get("payload", {})
-            if not isinstance(actual_payload, dict):
-                return False
-            inner_type = actual_payload.get("type")
-            if inner_type in _GROUP_KEY_TYPES:
-                is_control_plane = True
-
-        if is_control_plane:
-            _debug_group_e2ee(
-                "control_message",
-                aid=self._aid or "",
-                outer_type=outer_type or "-",
-                inner_type=str(actual_payload.get("type") or "-") if isinstance(actual_payload, dict) else "-",
-                from_aid=str(message.get("from") or "-"),
-                group=str(actual_payload.get("group_id") or "-") if isinstance(actual_payload, dict) else "-",
-                epoch=actual_payload.get("epoch", "-") if isinstance(actual_payload, dict) else "-",
-                rotation=str(actual_payload.get("rotation_id") or "-") if isinstance(actual_payload, dict) else "-",
-                request_id=str(actual_payload.get("request_id") or "-") if isinstance(actual_payload, dict) else "-",
-            )
-
-        if not is_control_plane:
-            # 不是控制面消息，交给原 handle_incoming 兜底（其只对 group_key_* 返回非 None）
-            result = self._group_e2ee.handle_incoming(actual_payload)
-            if result is None:
-                return False
-        else:
-            if actual_payload.get("type") == "e2ee.group_key_distribution":
-                # 快速跳过已过期的历史 epoch 分发：本地已有更高 committed epoch 时，
-                # 不发任何 RPC（verify/ack/sync），避免 fillP2pGap 拉到大量历史群密钥
-                # 消息时触发 epoch 编排风暴（几十个群 × 多次轮换 = 上百条 RPC）。
-                dist_group_id = str(actual_payload.get("group_id") or "").strip()
-                dist_epoch = int(actual_payload.get("epoch") or 0)
-                if dist_group_id and dist_epoch > 0:
-                    local_epoch = self._group_e2ee.current_epoch(dist_group_id) or 0
-                    if local_epoch >= dist_epoch:
-                        self._log.debug("client",
-                            "skip stale group_key_distribution: group=%s msg_epoch=%d local_epoch=%d",
-                            dist_group_id, dist_epoch, local_epoch,
-                        )
-                        return True
-                if not await self._verify_active_group_rotation_distribution(actual_payload):
-                    self._log.warn("client",
-                        "拒绝 group key distribution：group=%s epoch=%s rotation=%s",
-                        actual_payload.get("group_id"), actual_payload.get("epoch"),
-                        actual_payload.get("rotation_id"),
-                    )
-                    return True
-            elif actual_payload.get("type") == "e2ee.group_key_response":
-                # 同样跳过已过期的 key_response
-                resp_group_id = str(actual_payload.get("group_id") or "").strip()
-                resp_epoch = int(actual_payload.get("epoch") or 0)
-                if resp_group_id and resp_epoch > 0:
-                    local_epoch = self._group_e2ee.current_epoch(resp_group_id) or 0
-                    if local_epoch >= resp_epoch:
-                        self._log.debug("client",
-                            "skip stale group_key_response: group=%s msg_epoch=%d local_epoch=%d",
-                            resp_group_id, resp_epoch, local_epoch,
-                        )
-                        return True
-                if not await self._verify_group_key_response_epoch(actual_payload):
-                    self._log.warn("client",
-                        "拒绝 group key response：group=%s epoch=%s commitment=%s",
-                        actual_payload.get("group_id"), actual_payload.get("epoch"),
-                        str(actual_payload.get("commitment") or "")[:16],
-                    )
-                    return True
-            result = self._group_e2ee.handle_incoming(actual_payload)
-            if result == "distribution":
-                await self._discard_group_distribution_if_stale(actual_payload)
-                # 收到 epoch key 说明该群有活动，触发惰性同步建立 seq 基线
-                dist_group_id = actual_payload.get("group_id", "")
-                if dist_group_id and dist_group_id not in self._group_synced:
-                    asyncio.ensure_future(self._lazy_sync_group(dist_group_id))
-
-        if result == "request":
-            # 处理密钥请求并回复
-            group_id = actual_payload.get("group_id", "")
-            requester = actual_payload.get("requester_aid", "")
-            members = self._group_e2ee.get_member_aids(group_id)
-            # 请求者不在本地成员列表时，回源查询服务端最新成员列表
-            # （覆盖 use_invite_code 等不经过 owner 客户端的入群路径）
-            # 注意：仅用于传递 current_members 做当前成员校验，
-            # 不改写历史 epoch 的 member_aids，防止破坏历史隔离。
-            if requester and requester not in members:
-                try:
-                    members_result = await self.call("group.get_members", {"group_id": group_id})
-                    members = [m["aid"] for m in members_result.get("members", [])]
-                except Exception as exc:
-                    self._log.warn("client", "group %s member list origin fetch failed: %s", group_id, exc)
-
-            response = self._group_e2ee.handle_key_request_msg(actual_payload, members)
-            _debug_group_e2ee(
-                "p2p_key_request_handle",
-                aid=self._aid or "",
-                group=group_id,
-                epoch=actual_payload.get("epoch", "-"),
-                requester=requester or "-",
-                members=len(members) if isinstance(members, list) else "-",
-                has_response=bool(response),
-            )
-            if response:
-                if requester:
-                    try:
-                        _debug_group_e2ee(
-                            "p2p_key_response_send",
-                            aid=self._aid or "",
-                            group=group_id,
-                            epoch=response.get("epoch", "-"),
-                            requester=requester,
-                            request_id=str(response.get("request_id") or "-"),
-                            responder=str(response.get("responder_aid") or "-"),
-                            has_sig=bool(response.get("response_signature")),
-                        )
-                        await self.call("message.send", {
-                            "to": requester,
-                            "payload": response,
-                            "encrypt": True,
-                            "persist_required": True,
-                        })
-                        _debug_group_e2ee(
-                            "p2p_key_response_sent",
-                            aid=self._aid or "",
-                            group=group_id,
-                            epoch=response.get("epoch", "-"),
-                            requester=requester,
-                            request_id=str(response.get("request_id") or "-"),
-                        )
-                    except Exception as exc:
-                        self._log.warn("client", "failed to reply group key to %s: %s", requester, exc)
-                        _debug_group_e2ee(
-                            "p2p_key_response_failed",
-                            aid=self._aid or "",
-                            group=group_id,
-                            epoch=response.get("epoch", "-"),
-                            requester=requester,
-                            error=type(exc).__name__,
-                            detail=str(exc),
-                        )
-
-        # PY-002: 密钥分发/响应成功后，触发待解密消息重试
-        if result in ("distribution", "response"):
-            group_id_for_retry = actual_payload.get("group_id", "")
-            rotation_id = str(actual_payload.get("rotation_id") or "")
-            key_commitment = str(actual_payload.get("commitment") or "")
-            if rotation_id and key_commitment:
-                loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-                loop.create_task(self._ack_group_rotation_key(
-                    rotation_id=rotation_id,
-                    key_commitment=key_commitment,
-                ))
-            self._schedule_retry_pending_decrypt_msgs(group_id_for_retry)
-
-        if is_control_plane:
-            _debug_group_e2ee(
-                "control_message_result",
-                aid=self._aid or "",
-                group=str(actual_payload.get("group_id") or "-") if isinstance(actual_payload, dict) else "-",
-                epoch=actual_payload.get("epoch", "-") if isinstance(actual_payload, dict) else "-",
-                type=str(actual_payload.get("type") or "-") if isinstance(actual_payload, dict) else "-",
-                result=result or "-",
-            )
-
-        # S14: 控制面消息无论 handle_incoming 是否返回 rejected/None 都吞掉，
-        # 避免发布到业务消息流。
-        return True
-
-    # ── E2EE 编排（从 E2EEManager 上提）─────────────────
 
     @staticmethod
     def _cert_cache_key(aid: str, cert_fingerprint: str | None = None) -> str:
@@ -4507,263 +1965,31 @@ class AUNClient:
         self._log.debug("client", "_fetch_peer_cert exit: elapsed=%.3fs peer=%s fp=%s", time.time() - _t_start, aid, normalized_fp or "-")
         return cert_bytes
 
-    def _invalidate_peer_prekey_cache(self, peer_aid: str) -> None:
-        """清除指定对端的 prekey 缓存。"""
-        self._peer_prekeys_cache.pop(peer_aid, None)
-        self._e2ee.invalidate_prekey_cache(peer_aid)
+    @staticmethod
+    def _list_contains_token(value: Any, token: str) -> bool:
+        if not isinstance(value, list):
+            return False
+        return token in value
 
-    def _clear_peer_cert_cache(self, peer_aid: str) -> None:
-        """清除指定对端的证书缓存。"""
-        keys_to_remove = [k for k in self._cert_cache if k == peer_aid or k.startswith(f"{peer_aid}#")]
-        for k in keys_to_remove:
-            del self._cert_cache[k]
+    def _client_uses_v2_p2p(self) -> bool:
+        """当前连接是否被服务端按 V2 P2P 客户端处理（与 gateway _client_p2p_version 对齐）。
 
-    async def _refresh_peer_prekeys(self, peer_aid: str) -> list[dict[str, Any]]:
-        """清除对端缓存后重新获取 prekeys。"""
-        self._invalidate_peer_prekey_cache(peer_aid)
-        self._clear_peer_cert_cache(peer_aid)
-        return await self._fetch_peer_prekeys(peer_aid)
-
-    async def _fetch_peer_prekeys(self, peer_aid: str) -> list[dict[str, Any]]:
-        """获取对方所有设备的 prekey 列表。"""
-        _t_start = time.time()
-        self._log.debug("client", "_fetch_peer_prekeys enter: peer=%s", peer_aid)
-        cached_list = self._peer_prekeys_cache.get(peer_aid)
-        if cached_list is not None:
-            items, expire_at = cached_list
-            if time.time() < expire_at:
-                normalized = self._normalize_peer_prekeys(items)
-                if normalized:
-                    self._log.debug("client", "_fetch_peer_prekeys exit (cache-hit): elapsed=%.3fs peer=%s count=%d", time.time() - _t_start, peer_aid, len(normalized))
-                    return normalized
-            self._peer_prekeys_cache.pop(peer_aid, None)
-        cached = self._e2ee.get_cached_prekey(peer_aid)
-        if cached is not None:
-            normalized = self._normalize_peer_prekeys([cached])
-            if normalized:
-                self._log.debug("client", "_fetch_peer_prekeys exit (e2ee-cache): elapsed=%.3fs peer=%s count=%d", time.time() - _t_start, peer_aid, len(normalized))
-                return normalized
-        try:
-            result = await self._transport.call("message.e2ee.get_prekey", {"aid": peer_aid})
-        except Exception as exc:
-            self._log.debug("client", "_fetch_peer_prekeys exit (rpc-error): elapsed=%.3fs peer=%s err=%s", time.time() - _t_start, peer_aid, exc)
-            raise ValidationError(f"failed to fetch peer prekey for {peer_aid}: {exc}") from exc
-        if not isinstance(result, dict):
-            raise ValidationError(f"invalid prekey response for {peer_aid}")
-        if result.get("found") is False:
-            self._log.debug("client", "_fetch_peer_prekeys exit (not-found): elapsed=%.3fs peer=%s", time.time() - _t_start, peer_aid)
-            return []
-
-        device_prekeys = result.get("device_prekeys")
-        if isinstance(device_prekeys, list):
-            normalized = self._normalize_peer_prekeys(device_prekeys)
-            if normalized:
-                self._peer_prekeys_cache[peer_aid] = (
-                    [dict(item) for item in normalized],
-                    time.time() + _PEER_PREKEYS_CACHE_TTL,
-                )
-                self._e2ee.cache_prekey(peer_aid, normalized[0])
-                self._log.debug("client", "_fetch_peer_prekeys exit: elapsed=%.3fs peer=%s count=%d", time.time() - _t_start, peer_aid, len(normalized))
-                return normalized
-
-        prekey = result.get("prekey")
-        if isinstance(prekey, dict):
-            normalized = self._normalize_peer_prekeys([prekey])
-            if normalized:
-                self._peer_prekeys_cache[peer_aid] = (
-                    [dict(item) for item in normalized],
-                    time.time() + _PEER_PREKEYS_CACHE_TTL,
-                )
-                self._e2ee.cache_prekey(peer_aid, normalized[0])
-                self._log.debug("client", "_fetch_peer_prekeys exit (single): elapsed=%.3fs peer=%s count=%d", time.time() - _t_start, peer_aid, len(normalized))
-                return normalized
-        if result.get("found"):
-            raise ValidationError(f"invalid prekey response for {peer_aid}")
-        self._log.debug("client", "_fetch_peer_prekeys exit (empty): elapsed=%.3fs peer=%s", time.time() - _t_start, peer_aid)
-        return []
-
-    async def _fetch_peer_prekey(self, peer_aid: str) -> dict[str, Any] | None:
-        """获取对方的单个 prekey（兼容接口，优先返回第一条 device prekey）。"""
-        cached_list = self._peer_prekeys_cache.get(peer_aid)
-        if cached_list is not None:
-            items, expire_at = cached_list
-            if time.time() < expire_at and items:
-                normalized = self._normalize_peer_prekeys(items)
-                if normalized:
-                    return dict(normalized[0])
-            self._peer_prekeys_cache.pop(peer_aid, None)
-        cached = self._e2ee.get_cached_prekey(peer_aid)
-        if cached is not None:
-            normalized = self._normalize_peer_prekeys([cached])
-            if normalized:
-                return dict(normalized[0])
-        prekeys = await self._fetch_peer_prekeys(peer_aid)
-        return dict(prekeys[0]) if prekeys else None
-
-    def _normalize_peer_prekeys(self, prekeys: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        normalized: list[dict[str, Any]] = []
-        for item in prekeys:
-            if not isinstance(item, dict):
-                continue
-            prekey_id = str(item.get("prekey_id") or "").strip()
-            public_key = str(item.get("public_key") or "").strip()
-            signature = str(item.get("signature") or "").strip()
-            if not prekey_id or not public_key or not signature:
-                continue
-            candidate = dict(item)
-            candidate["prekey_id"] = prekey_id
-            candidate["public_key"] = public_key
-            candidate["signature"] = signature
-            candidate["device_id"] = str(candidate.get("device_id") or "").strip()
-            cert_fingerprint = str(candidate.get("cert_fingerprint") or "").strip().lower()
-            if cert_fingerprint:
-                candidate["cert_fingerprint"] = cert_fingerprint
-            elif "cert_fingerprint" in candidate:
-                candidate.pop("cert_fingerprint", None)
-            normalized.append(candidate)
-        if not normalized:
-            return []
-        if len(normalized) == 1:
-            if not normalized[0]["device_id"]:
-                normalized[0]["device_id"] = _PREKEY_FALLBACK_DEVICE_ID
-            return normalized
-        filtered: list[dict[str, Any]] = []
-        seen_device_ids: set[str] = set()
-        for item in normalized:
-            device_id = str(item.get("device_id") or "").strip()
-            if not device_id or device_id == _PREKEY_FALLBACK_DEVICE_ID:
-                continue
-            if device_id in seen_device_ids:
-                continue
-            seen_device_ids.add(device_id)
-            filtered.append(item)
-        return filtered
-
-    async def _upload_prekey(self) -> dict[str, Any]:
-        """生成 prekey 并上传到服务端"""
-        prekey_material = self._e2ee.generate_prekey()
-        prekey_id = prekey_material.get("prekey_id", "?")
-        self._log.info("client", "prekey uploading: prekey_id=%s", prekey_id)
-        result = await self._transport.call("message.e2ee.put_prekey", prekey_material)
-        self._log.info("client", "prekey upload done: prekey_id=%s result=%s", prekey_id, result)
-        # 上传成功后记录为活跃 prekey：只有活跃 prekey 被消费时才触发 replenish
-        self._active_prekey_id = str(prekey_id)
-        return result if isinstance(result, dict) else {"ok": True}
-
-    async def _decrypt_messages(self, messages: list[dict[str, Any]], *, source: str = "pull") -> list[dict[str, Any]]:
-        """批量解密消息（用于 message.pull）。
-
-        直接解密，不经过 E2EEManager 的 seen set（避免与推送冲突）。
-        同一批次内按 message_id 去重。
-        群组密钥控制面消息只更新本地群密钥状态，不暴露给业务消息流。
+        gateway 口径：capabilities.supported_p2p_e2ee 含 'e2ee_v2' 即 V2，否则 V1。
+        capabilities 缺失时按 SDK 默认值（含 e2ee_v2）→ V2。
         """
-        seen_in_batch: set[str] = set()
-        result = []
-        for msg in messages:
-            mid = msg.get("message_id", "")
-            if mid and mid in seen_in_batch:
-                continue
-            if mid:
-                seen_in_batch.add(mid)
-            payload = msg.get("payload")
-            if isinstance(payload, dict) and payload.get("type") != "e2ee.encrypted" and msg.get("encrypted") is True:
-                self._log.debug("client", "pull skipping encrypted message: payload.type=%r mid=%s keys=%s",
-                                  payload.get("type"), mid, list(payload.keys())[:10])
-            if (isinstance(payload, dict)
-                and payload.get("type") == "e2ee.encrypted"
-                and (msg.get("encrypted") is True or "encrypted" not in msg)):
-                if await self._try_handle_group_key_message(msg):
-                    continue
-                if not self._e2ee._should_decrypt_for_current_aid(msg, payload):
-                    self._log.debug("client", "[%s] P2P decrypt skipped: message not targeting current AID message_id=%s", source, mid)
-                    continue
-                # prekey 预检查：prekey_ecdh_v2 模式下，local missing prekey 私钥则跳过解密
-                enc_mode = payload.get("encryption_mode", "")
-                prekey_id = payload.get("prekey_id") or (payload.get("aad") or {}).get("prekey_id") or ""
-                if enc_mode == "prekey_ecdh_v2" and prekey_id:
-                    if prekey_id in self._e2ee._missing_prekey_ids:
-                        self._log.debug("client", "[%s] P2P decrypt skipped: missing local prekey private key message_id=%s prekey_id=%s",
-                                          source, mid, prekey_id)
-                        continue
-                # 确保发送方证书已缓存（签名验证需要）
-                from_aid = msg.get("from", "")
-                sender_cert_fingerprint = str(
-                    payload.get("sender_cert_fingerprint")
-                    or (payload.get("aad") or {}).get("sender_cert_fingerprint")
-                    or ""
-                ).strip().lower()
-                if from_aid:
-                    cert_ready = await self._ensure_sender_cert_cached(
-                        from_aid, sender_cert_fingerprint or None,
-                    )
-                    if not cert_ready:
-                        self._log.warn("client", "cannot get sender %s cert, skipping decrypt", from_aid)
-                        continue
-                decrypted = self._e2ee._decrypt_message(msg, source=source)
-                mid = msg.get("message_id", "")
-                seq_val = msg.get("seq", "?")
-                if decrypted is not None:
-                    self._log.debug("client", "[%s] P2P decrypt success: message_id=%s seq=%s from=%s", source, mid, seq_val, from_aid)
-                else:
-                    self._log.debug("client", "[%s] P2P decrypt failed: message_id=%s seq=%s from=%s", source, mid, seq_val, from_aid)
-                # pull 路径不触发 prekey 补充（历史消息，prekey 早在推送时消耗过）
-                if decrypted is not None:
-                    result.append(decrypted)
-            else:
-                result.append(msg)
-        return result
+        caps = getattr(self, "_connect_capabilities", None)
+        if not isinstance(caps, dict):
+            return True
+        return self._list_contains_token(caps.get("supported_p2p_e2ee"), "e2ee_v2")
 
-    async def _decrypt_single_message(self, message: dict[str, Any], *, source: str = "push") -> dict[str, Any] | None:
-        """解密单条消息：本地实例级防重放 + 密码学解密。"""
-        payload = message.get("payload")
-        if not isinstance(payload, dict):
-            self._log.debug("client", "_decrypt_single skipped: payload is not dict, mid=%s", message.get("message_id"))
-            return message
-        ptype = payload.get("type")
-        if ptype != "e2ee.encrypted":
-            self._log.debug("client", "_decrypt_single skipped: payload.type=%r != 'e2ee.encrypted', mid=%s encrypted=%r keys=%s",
-                              ptype, message.get("message_id"), message.get("encrypted"), list(payload.keys())[:10])
-            return message
-        if message.get("encrypted") is not True and "encrypted" in message:
-            self._log.debug("client", "_decrypt_single skipped: encrypted=%r, mid=%s", message.get("encrypted"), message.get("message_id"))
-            return message
-        if not self._e2ee._should_decrypt_for_current_aid(message, payload):
-            self._log.debug("client", "[%s] P2P decrypt skipped: message not targeting current AID message_id=%s", source, message.get("message_id"))
-            return None
+    def _client_uses_v2_group(self) -> bool:
+        """当前连接是否被服务端按 V2 Group 客户端处理（与 gateway _client_group_version 对齐）。"""
+        caps = getattr(self, "_connect_capabilities", None)
+        if not isinstance(caps, dict):
+            return True
+        return self._list_contains_token(caps.get("supported_group_e2ee"), "group_e2ee_v2")
 
-        # 接收侧不再调用服务端 replay guard；服务端入口已做 AID 级防重放。
-        # 这里依赖当前 SDK 实例本地 seen set，避免多设备/多 slot fanout 被全局去重误杀。
-        message_id = message.get("message_id", "")
-        from_aid = message.get("from", "")
-        encryption_mode = payload.get("encryption_mode", "")
-        sender_cert_fingerprint = str(
-            payload.get("sender_cert_fingerprint")
-            or (payload.get("aad") or {}).get("sender_cert_fingerprint")
-            or ""
-        ).strip().lower()
-
-        # 确保发送方证书已缓存到 keystore（三路 ECDH + 签名验证需要）
-        if from_aid:
-            cert_ready = await self._ensure_sender_cert_cached(
-                from_aid, sender_cert_fingerprint or None,
-            )
-            if not cert_ready:
-                self._log.warn("client", "cannot get sender %s cert, skipping decrypt", from_aid)
-                return None
-
-        # 密码学解密（E2EEManager.decrypt_message 内含本地防重放）
-        decrypted = self._e2ee.decrypt_message(message, source=source)
-        if decrypted is None:
-            self._log.warn("client", "[%s] message decrypt returned None: message_id=%s seq=%s from=%s encryption_mode=%s",
-                                source, message_id, message.get("seq"), from_aid, encryption_mode)
-        else:
-            e2ee_info = decrypted.get("e2ee", {}) if isinstance(decrypted, dict) else {}
-            self._log.debug("client", "[%s] P2P decrypt success: message_id=%s seq=%s from=%s mode=%s prekey=%s",
-                              source, message_id, message.get("seq"), from_aid,
-                              e2ee_info.get("encryption_mode", "?"), e2ee_info.get("prekey_id", "?"))
-        self._schedule_prekey_replenish_if_consumed(decrypted)
-        return decrypted
-
+    # 兼容别名：旧调用点仍可用
     async def _ensure_sender_cert_cached(self, aid: str, cert_fingerprint: str | None = None) -> bool:
         """确保发送方证书在本地 keystore 中可用且未过期。
 
@@ -5007,6 +2233,17 @@ class AUNClient:
         connection_kind = str(params.get("connection_kind") or "long")
         short_ttl_ms = int(params.get("short_ttl_ms") or 0)
         extra_info = params.get("extra_info") if isinstance(params.get("extra_info"), dict) else None
+        # 记录 connect 时声明的 capabilities，供后续按 V1/V2 路由 RPC 调用
+        if extra_info and isinstance(extra_info.get("_capabilities"), dict):
+            self._connect_capabilities = dict(extra_info["_capabilities"])
+        else:
+            # 默认能力（与 auth.py initialize_with_token 中的默认值保持一致）
+            self._connect_capabilities = {
+                "e2ee": True,
+                "group_e2ee": True,
+                "supported_p2p_e2ee": ["e2ee", "e2ee_v2"],
+                "supported_group_e2ee": ["group_e2ee", "group_e2ee_v2"],
+            }
         self._auth.set_instance_context(device_id=self._device_id, slot_id=self._slot_id)
         self._state = "connecting"
         self._log.debug("client", "_connect_once enter: gateway=%s allow_reauth=%s kind=%s",
@@ -5072,16 +2309,6 @@ class AUNClient:
 
             self._start_background_tasks()
 
-            # 上线后自动上传 prekey（最多重试 3 次，指数退避）
-            for _prekey_attempt in range(3):
-                try:
-                    await self._upload_prekey()
-                    break
-                except Exception as exc:
-                    self._log.warn("client", "prekey upload failed (attempt %d/3): %s", _prekey_attempt + 1, exc)
-                    if _prekey_attempt < 2:
-                        await asyncio.sleep(0.5 * (2 ** _prekey_attempt))
-
             # connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
             # 群消息按惰性触发，不在此处主动 pull
             try:
@@ -5137,12 +2364,10 @@ class AUNClient:
         if self._session_options.get("connection_kind") != "short":
             self._start_heartbeat_task()
             self._start_token_refresh_task()
-        self._start_group_epoch_tasks()
 
     async def _stop_background_tasks(self) -> None:
         current_task = asyncio.current_task()
-        for attr in ("_heartbeat_task", "_token_refresh_task", "_prekey_refresh_task",
-                      "_group_epoch_rotate_task", "_group_epoch_cleanup_task",
+        for attr in ("_heartbeat_task", "_token_refresh_task",
                       "_cache_cleanup_task"):
             task = getattr(self, attr, None)
             if task is None:
@@ -5154,17 +2379,8 @@ class AUNClient:
             try:
                 await task
             except asyncio.CancelledError:
-                pass  # 任务取消，正常清理
-            setattr(self, attr, None)
-        for key, task in list(self._group_epoch_rotation_retry_tasks.items()):
-            task.cancel()
-            if task is current_task:
-                continue
-            try:
-                await task
-            except asyncio.CancelledError:
                 pass
-            self._group_epoch_rotation_retry_tasks.pop(key, None)
+            setattr(self, attr, None)
 
     def _start_heartbeat_task(self) -> None:
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
@@ -5182,14 +2398,6 @@ class AUNClient:
         if self._token_refresh_task is not None and not self._token_refresh_task.done():
             return
         self._token_refresh_task = asyncio.create_task(self._token_refresh_loop())
-
-    def _start_prekey_refresh_task(self) -> None:
-        if self._prekey_refresh_task is not None and not self._prekey_refresh_task.done():
-            return
-        interval = 3600.0  # 每小时检查一次 prekey 是否需要补充
-        self._prekey_refresh_task = asyncio.get_event_loop().create_task(
-            self._prekey_refresh_loop(interval)
-        )
 
     async def _heartbeat_loop(self) -> None:
         consecutive_failures = 0
@@ -5308,21 +2516,6 @@ class AUNClient:
         except asyncio.CancelledError:
             raise
 
-    async def _prekey_refresh_loop(self, interval: float) -> None:
-        """定期检查并补充 prekey，防止长时间无通信后 prekey 耗尽。"""
-        try:
-            while not self._closing:
-                await asyncio.sleep(interval)
-                if self._state != "connected":
-                    continue
-                try:
-                    await self._upload_prekey()
-                except Exception as exc:
-                    self._log.warn("client", "prekey periodic refresh failed: %s", exc)
-        except asyncio.CancelledError:
-            raise
-
-    @staticmethod
     def _extract_consumed_prekey_id(message: dict[str, Any] | None) -> str:
         if not isinstance(message, dict):
             return ""
@@ -5341,11 +2534,15 @@ class AUNClient:
         """明文 echo 消息发送时追加 SDK.send trace"""
         payload = params.get("payload")
         if not isinstance(payload, dict):
+            self._log.info("client", "DEBUG echo_trace_send skip: payload not dict, type=%s", type(payload).__name__)
             return
         text = payload.get("text")
         if not isinstance(text, str) or len(text) > 4096:
+            self._log.info("client", "DEBUG echo_trace_send skip: text invalid, type=%s len=%s", type(text).__name__, len(text) if isinstance(text, str) else "?")
             return
-        if "echo" not in text.split("\n", 1)[0].lower():
+        first_line = text.split("\n", 1)[0].lower()
+        if "echo" not in first_line:
+            self._log.info("client", "DEBUG echo_trace_send skip: no 'echo' in first line=%r", first_line[:80])
             return
         import datetime
         now = datetime.datetime.now()
@@ -5353,6 +2550,7 @@ class AUNClient:
         uptime = int(time.time() - getattr(self, "_connected_at", time.time()))
         trace = f"{ts} [AUN-SDK.send] aid={self._aid or '-'} conn_uptime={uptime}s"
         params["payload"] = {**payload, "text": text + "\n" + trace}
+        self._log.info("client", "DEBUG echo_trace_send appended: %s", trace)
 
     def _maybe_append_echo_trace_receive(self, msg: dict[str, Any]) -> None:
         """明文 echo 消息接收时追加 SDK.receive trace"""
@@ -5417,36 +2615,6 @@ class AUNClient:
             raise ValidationError("message.pull/message.ack slot_id must match the current client instance")
         params["device_id"] = self._device_id
         params["slot_id"] = self._slot_id
-
-    def _schedule_prekey_replenish_if_consumed(self, message: dict[str, Any] | None) -> None:
-        """活跃 prekey 被消费时上传新 prekey。
-
-        只有当前活跃 prekey（connect 后最近一次上传的）被消费才触发上传。
-        历史 prekey 被消费（如 fillP2pGap 拉到的旧消息）不触发，避免上传风暴。
-        活跃 prekey 只有一个且只能被消费一次，天然串行，无需 inflight 限流。
-        """
-        prekey_id = self._extract_consumed_prekey_id(message)
-        if not prekey_id or self._state != "connected":
-            return
-        if not self._active_prekey_id or prekey_id != self._active_prekey_id:
-            return
-        # 清空活跃标记，防止重复触发（新上传完成后会设新的 active）
-        self._active_prekey_id = ""
-
-        async def _replenish() -> None:
-            try:
-                await self._upload_prekey()
-            except Exception as exc:
-                self._log.warn("client", "prekey replenish after consumption failed: %s", exc)
-
-        loop = getattr(self, "_loop", None)
-        if loop and loop.is_running():
-            loop.create_task(_replenish())
-        else:
-            try:
-                asyncio.get_running_loop().create_task(_replenish())
-            except RuntimeError:
-                pass
 
     def _restore_seq_tracker_state(self) -> None:
         """从 keystore seq_tracker 表按行恢复 SeqTracker 状态。
@@ -5544,8 +2712,6 @@ class AUNClient:
         self._gap_fill_active = False
         self._pushed_seqs.clear()
         self._pending_ordered().clear()
-        if hasattr(self, "_pending_decrypt_msgs"):
-            self._pending_decrypt_msgs.clear()
         if hasattr(self, "_group_synced"):
             self._group_synced.clear()
 
@@ -5564,8 +2730,6 @@ class AUNClient:
         self._gap_fill_active = False
         self._pushed_seqs.clear()
         self._pending_ordered().clear()
-        if hasattr(self, "_pending_decrypt_msgs"):
-            self._pending_decrypt_msgs.clear()
         if hasattr(self, "_group_synced"):
             self._group_synced.clear()
         self._seq_tracker_context = next_context
@@ -5613,58 +2777,6 @@ class AUNClient:
         except Exception as exc:
             self._log.warn("client", "failed to save SeqTracker state: %s", exc)
 
-    def _build_rotation_signature(
-        self,
-        group_id: str,
-        current_epoch: int,
-        new_epoch: int = 0,
-        params: dict[str, Any] | None = None,
-    ) -> dict[str, str]:
-        """构建 epoch 轮换签名参数。"""
-        identity = self._identity
-        if not identity or not identity.get("private_key_pem"):
-            return {}
-        try:
-            from cryptography.hazmat.primitives.asymmetric import ec as _ec
-            from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
-            aid = identity.get("aid", "")
-            ts = str(int(time.time()))
-            target_epoch = int(new_epoch or current_epoch + 1)
-            source = params or {}
-            sign_payload = {
-                "version": "v2",
-                "group_id": group_id,
-                "base_epoch": int(current_epoch),
-                "target_epoch": target_epoch,
-                "aid": aid,
-                "rotation_timestamp": ts,
-                "rotation_id": str(source.get("rotation_id") or source.get("new_rotation_id") or ""),
-                "reason": str(source.get("reason") or ""),
-                "key_commitment": str(source.get("key_commitment") or ""),
-                "manifest_hash": str(source.get("manifest_hash") or ""),
-                "epoch_chain": str(source.get("epoch_chain") or ""),
-                "expected_members": sorted(str(item) for item in source.get("expected_members", []) if str(item or "").strip())
-                if isinstance(source.get("expected_members"), list) else [],
-                "required_acks": sorted(str(item) for item in source.get("required_acks", []) if str(item or "").strip())
-                if isinstance(source.get("required_acks"), list) else [],
-            }
-            sign_data = json.dumps(
-                sign_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-            ).encode("utf-8")
-            pk = _ser.load_pem_private_key(
-                identity["private_key_pem"].encode("utf-8"), password=None,
-            )
-            sig = pk.sign(sign_data, _ec.ECDSA(_hashes.SHA256()))
-            return {
-                "rotation_sig_version": "v2",
-                "rotation_signature": base64.b64encode(sig).decode("ascii"),
-                "rotation_timestamp": ts,
-            }
-        except Exception as _sig_exc:
-            self._log.warn("client", "failed to build rotation signature: %s", _sig_exc)
-            return {}
-
-    @staticmethod
     def _attach_rotation_id(info: dict[str, Any], rotation_id: str) -> None:
         if not rotation_id:
             return
@@ -5675,125 +2787,6 @@ class AUNClient:
             if isinstance(payload, dict):
                 payload["rotation_id"] = rotation_id
 
-    async def _build_epoch_encrypted_keys(
-        self,
-        info: dict[str, Any],
-        member_aids: list[str],
-        target_epoch: int,
-        group_id: str,
-    ) -> dict[str, str]:
-        """为每个成员用其 AID 证书公钥 ECIES 加密 group_secret，返回 {aid: base64_ciphertext}。"""
-        from cryptography import x509 as _x509
-        from cryptography.hazmat.primitives import serialization as _ser
-        from cryptography.hazmat.primitives.asymmetric import ec as _ec
-        from .e2ee import ecies_encrypt
-        # 从 distribution payload 中提取 group_secret
-        distributions = info.get("distributions", [])
-        group_secret_b64 = ""
-        for dist in distributions:
-            if isinstance(dist, dict) and isinstance(dist.get("payload"), dict):
-                group_secret_b64 = dist["payload"].get("group_secret", "")
-                if group_secret_b64:
-                    break
-        if not group_secret_b64:
-            # fallback: 从本地 keystore 加载
-            loaded = self._group_e2ee.load_secret(group_id, target_epoch)
-            if loaded and loaded.get("secret"):
-                group_secret_bytes = loaded["secret"]
-            else:
-                self._log.warn("client", "cannot get group_secret for ECIES encryption: group=%s epoch=%s", group_id, target_epoch)
-                return {}
-        else:
-            group_secret_bytes = base64.b64decode(group_secret_b64)
-
-        encrypted_keys: dict[str, str] = {}
-        for aid in member_aids:
-            try:
-                if aid == self._aid and isinstance(self._identity, dict) and self._identity.get("cert"):
-                    raw_cert = self._identity.get("cert")
-                    cert_bytes = raw_cert.encode("utf-8") if isinstance(raw_cert, str) else bytes(raw_cert)
-                else:
-                    cert_bytes = await self._fetch_peer_cert(aid)
-                cert_obj = _x509.load_pem_x509_certificate(cert_bytes)
-                pubkey = cert_obj.public_key()
-                if not isinstance(pubkey, _ec.EllipticCurvePublicKey):
-                    self._log.debug("client", "member %s cert public key is not EC type, skipping ECIES encryption", aid)
-                    continue
-                pubkey_bytes = pubkey.public_bytes(
-                    _ser.Encoding.X962,
-                    _ser.PublicFormat.UncompressedPoint,
-                )
-                ciphertext = ecies_encrypt(pubkey_bytes, group_secret_bytes)
-                encrypted_keys[aid] = base64.b64encode(ciphertext).decode("ascii")
-            except Exception as exc:
-                self._log.warn("client", "failed to build ECIES epoch key for member %s: %s", aid, exc)
-                continue
-        return encrypted_keys
-
-    async def _distribute_group_epoch_key(
-        self,
-        info: dict[str, Any],
-        *,
-        rotation_id: str = "",
-    ) -> dict[str, list[str]]:
-        sent: list[str] = []
-        failed: list[str] = []
-        last_heartbeat = time.monotonic()
-        for dist in info.get("distributions", []):
-            if not isinstance(dist, dict):
-                continue
-            target = dist.get("to")
-            payload = dist.get("payload")
-            if not target or not isinstance(payload, dict):
-                continue
-            if rotation_id and time.monotonic() - last_heartbeat >= 20.0:
-                if await self._heartbeat_group_rotation(rotation_id):
-                    last_heartbeat = time.monotonic()
-            for attempt in range(3):
-                try:
-                    await self.call("message.send", {
-                        "to": target,
-                        "payload": payload,
-                        "encrypt": True,
-                        "persist_required": True,
-                    })
-                    sent.append(str(target))
-                    break
-                except Exception as exc:
-                    if attempt < 2:
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                    else:
-                        failed.append(str(target))
-                        self._log.warn("client", "epoch key distribution failed (to=%s): %s", target, exc)
-        return {"sent": sent, "failed": failed}
-
-    async def _heartbeat_group_rotation(self, rotation_id: str) -> bool:
-        if not rotation_id:
-            return False
-        try:
-            result = await self.call("group.e2ee.heartbeat_rotation", {
-                "rotation_id": rotation_id,
-                "lease_ms": _GROUP_ROTATION_LEASE_MS,
-            })
-            return bool(isinstance(result, dict) and result.get("success"))
-        except Exception as exc:
-            self._log.warn("client", "refresh epoch rotation lease failed: rotation=%s err=%s", rotation_id, exc)
-            return False
-
-    async def _abort_group_rotation(self, rotation_id: str, *, reason: str = "") -> bool:
-        if not rotation_id:
-            return False
-        try:
-            result = await self.call("group.e2ee.abort_rotation", {
-                "rotation_id": rotation_id,
-                "reason": reason or "client_abort",
-            })
-            return bool(isinstance(result, dict) and result.get("success"))
-        except Exception as exc:
-            self._log.warn("client", "abort epoch rotation failed: rotation=%s err=%s", rotation_id, exc)
-            return False
-
-    @staticmethod
     def _rotation_expected_members_stale(rotation: dict[str, Any], member_aids: list[str]) -> bool:
         expected = rotation.get("expected_members")
         if not isinstance(expected, list) or not expected:
@@ -5802,7 +2795,6 @@ class AUNClient:
         current_members = sorted({str(item) for item in member_aids if str(item or "").strip()})
         return bool(expected_members and current_members and expected_members != current_members)
 
-    @staticmethod
     def _rotation_retry_delay_s(pending: dict[str, Any] | None) -> float:
         now_ms = int(time.time() * 1000)
         lease_expires_at = 0
@@ -5816,828 +2808,6 @@ class AUNClient:
                     lease_expires_at = 0
         base = max(1.0, (lease_expires_at - now_ms) / 1000.0 + 1.0) if lease_expires_at else 5.0
         return min(base + random.random() * 2.0, _GROUP_ROTATION_RETRY_MAX_DELAY)
-
-    def _schedule_group_rotation_retry(
-        self,
-        group_id: str,
-        *,
-        reason: str,
-        trigger_id: str,
-        expected_epoch: int | None,
-        pending: dict[str, Any] | None,
-    ) -> None:
-        if self._closing or self._state != "connected":
-            return
-        retry_key = f"{group_id}:{trigger_id or reason}:{expected_epoch if expected_epoch is not None else '-'}"
-        existing = self._group_epoch_rotation_retry_tasks.get(retry_key)
-        if existing is not None and not existing.done():
-            return
-        delay = self._rotation_retry_delay_s(pending)
-
-        async def _retry_later() -> None:
-            try:
-                await asyncio.sleep(delay)
-                if self._closing or self._state != "connected":
-                    return
-                await self._maybe_lead_rotate_group_epoch(
-                    group_id,
-                    reason=reason,
-                    trigger_id=trigger_id,
-                    expected_epoch=expected_epoch,
-                )
-            except asyncio.CancelledError:
-                raise
-            finally:
-                self._group_epoch_rotation_retry_tasks.pop(retry_key, None)
-
-        self._group_epoch_rotation_retry_tasks[retry_key] = asyncio.create_task(_retry_later())
-
-    async def _sync_epoch_to_server(self, group_id: str) -> None:
-        """建群后将本地 epoch 1 同步到服务端（服务端初始为 0），最多重试 3 次。"""
-        wait_started = time.monotonic()
-        while group_id in self._group_epoch_rotation_inflight:
-            if self._closing or self._state != "connected":
-                return
-            if time.monotonic() - wait_started > 20.0:
-                self._log.warn("client", "group epoch create sync still in-flight; skip duplicate sync (group=%s)", group_id)
-                return
-            await asyncio.sleep(0.2)
-        self._group_epoch_rotation_inflight.add(group_id)
-        try:
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    secret_data = self._group_e2ee.load_secret(group_id, 1)
-                    if not secret_data:
-                        raise StateError(f"group {group_id} epoch 1 secret missing")
-                    rotation_id = f"rot-{uuid.uuid4().hex}"
-                    rotate_params = {
-                        "group_id": group_id,
-                        "base_epoch": 0,
-                        "target_epoch": 1,
-                        "rotation_id": rotation_id,
-                        "reason": "create_group",
-                        "key_commitment": secret_data.get("commitment", ""),
-                        "expected_members": secret_data.get("member_aids", [self._aid] if self._aid else []),
-                        "required_acks": [self._aid] if self._aid else [],
-                        "lease_ms": _GROUP_ROTATION_LEASE_MS,
-                    }
-                    rotate_params.update(self._build_rotation_signature(group_id, 0, 1, rotate_params))
-                    begin_result = await self.call("group.e2ee.begin_rotation", rotate_params)
-                    rotation = begin_result.get("rotation") if isinstance(begin_result, dict) else None
-                    if not begin_result.get("success") or not isinstance(rotation, dict):
-                        self._log.warn("client", 
-                            "group epoch begin failed; stop key distribution (group=%s, returned=%s)",
-                            group_id, begin_result,
-                        )
-                        return
-                    if not await self._ack_group_rotation_key(
-                        rotation_id=rotation.get("rotation_id", rotation_id),
-                        key_commitment=secret_data.get("commitment", ""),
-                    ):
-                        self._log.warn("client", "group epoch self ack failed (group=%s, rotation=%s)", group_id, rotation_id)
-                        await self._abort_group_rotation(rotation.get("rotation_id", rotation_id), reason="self_ack_failed")
-                        return
-                    commit_result = await self.call("group.e2ee.commit_rotation", {
-                        "rotation_id": rotation.get("rotation_id", rotation_id),
-                    })
-                    if commit_result.get("success"):
-                        self._group_e2ee.store_secret(
-                            group_id,
-                            1,
-                            secret_data["secret"],
-                            secret_data.get("commitment", ""),
-                            secret_data.get("member_aids", [self._aid] if self._aid else []),
-                            epoch_chain=secret_data.get("epoch_chain"),
-                        )
-                        return
-                    self._log.warn("client", 
-                        "group epoch commit failed (group=%s, returned=%s)",
-                        group_id, commit_result,
-                    )
-                    return
-                except Exception as exc:
-                    if attempt < max_retries:
-                        delay = 0.5 * (2 ** (attempt - 1))
-                        self._log.warn("client", 
-                            "同步 epoch 到服务端失败 (group=%s, 第%d/%d次): %s, %.1fs后重试",
-                            group_id, attempt, max_retries, exc, delay,
-                        )
-                        await asyncio.sleep(delay)
-                    else:
-                        self._log.error("client", 
-                            "同步 epoch 到服务端最终失败 (group=%s, 已重试%d次): %s",
-                            group_id, max_retries, exc,
-                        )
-        finally:
-            self._group_epoch_rotation_inflight.discard(group_id)
-
-    async def _maybe_lead_rotate_group_epoch(self, group_id: str, *, reason: str = "membership_changed", trigger_id: str = "", expected_epoch: int | None = None, allow_member: bool = False) -> None:
-        """基于"排序最小 admin = leader"选举，其他 admin 走 jitter 兜底重试。
-
-        allow_member=True 时（open/invite_code 群），普通 member 也参与选举，
-        优先级：owner/admin 排序在前 > member 排序在后。
-        V2 群强制 owner/admin-only（无论 allow_member 参数）。
-        """
-        # V2 群：强制 owner/admin-only rotation
-        cache_key = f"group:{group_id}"
-        cached = self._v2_bootstrap_cache.get(cache_key)
-        if cached and len(cached) > 2 and cached[2] is not None:
-            allow_member = False
-        _t_start = time.time()
-        my_aid = self._aid
-        if not my_aid or self._closing or self._state != "connected":
-            return
-        self._log.debug("client", "_maybe_lead_rotate_group_epoch enter: group=%s reason=%s trigger=%s expected_epoch=%s allow_member=%s", group_id, reason, trigger_id or "-", expected_epoch, allow_member)
-        wait_started = time.monotonic()
-        while group_id in self._group_epoch_rotation_inflight:
-            if reason == "membership_changed" and trigger_id and trigger_id in self._group_membership_rotation_done:
-                self._log.debug("client", "_maybe_lead_rotate_group_epoch exit (already-done): elapsed=%.3fs group=%s trigger=%s", time.time() - _t_start, group_id, trigger_id)
-                return
-            if self._closing or self._state != "connected":
-                self._log.debug("client", "_maybe_lead_rotate_group_epoch exit (closing): elapsed=%.3fs group=%s", time.time() - _t_start, group_id)
-                return
-            if time.monotonic() - wait_started > 20.0:
-                self._log.warn("client",
-                    "group epoch rotation still in-flight; skip pending trigger (group=%s trigger=%s)",
-                    group_id, trigger_id or "-",
-                )
-                self._log.debug("client", "_maybe_lead_rotate_group_epoch exit (timeout): elapsed=%.3fs group=%s", time.time() - _t_start, group_id)
-                return
-            await asyncio.sleep(0.2)
-        self._group_epoch_rotation_inflight.add(group_id)
-        try:
-            if self._closing or self._state != "connected":
-                self._log.debug("client", "_maybe_lead_rotate_group_epoch exit (closing-2): elapsed=%.3fs group=%s", time.time() - _t_start, group_id)
-                return
-            # 1. 获取候选成员。open/invite_code 场景优先使用在线成员列表。
-            members_resp = await self.call("group.get_members", {"group_id": group_id})
-            if not isinstance(members_resp, dict):
-                members_resp = {}
-            candidates = await self._ranked_group_rotation_candidates(
-                group_id,
-                allow_member=allow_member,
-                members_resp=members_resp,
-            )
-            if not candidates:
-                self._log.debug("client", "epoch rotation no candidates, skipping: group=%s", group_id)
-                return
-
-            # 没有当前 epoch key 的成员不参与 leader 选举：
-            # 缺少 prev epoch chain 的成员无法正确计算 epoch_chain。
-            # 但如果排除后候选列表为空且是 open/invite_code 群，新成员保留自己兜底
-            # （从服务端 committed_rotation.epoch_chain 获取 prev chain 发起轮换）。
-            if expected_epoch is not None and expected_epoch > 0:
-                local_secret = self._group_e2ee.load_secret(group_id, expected_epoch)
-                if local_secret is None:
-                    filtered = [c for c in candidates if c != my_aid]
-                    if filtered:
-                        candidates = filtered
-                    elif not allow_member:
-                        return
-                    # else: open/invite_code 群只剩自己时保留兜底
-
-            if my_aid not in candidates:
-                self._log.debug("client", "epoch rotation this node not in candidate list, skipping: group=%s my_aid=%s candidates=%s", group_id, my_aid, candidates[:3])
-                return
-
-            my_rank = candidates.index(my_aid)
-            self._log.debug("client", "epoch rotation leader election: group=%s my_rank=%d/%d is_leader=%s", group_id, my_rank, len(candidates), my_rank == 0)
-            if allow_member:
-                delay_s = my_rank * _GROUP_JOIN_ROTATION_STAGGER_S + random.random() * _GROUP_JOIN_ROTATION_STAGGER_S
-                if delay_s > 0:
-                    await asyncio.sleep(delay_s)
-                if self._closing or self._state != "connected":
-                    return
-                try:
-                    after_resp = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-                    after_epoch = after_resp.get("epoch", 0) if isinstance(after_resp, dict) else 0
-                except Exception:
-                    after_resp = {}
-                    after_epoch = self._group_e2ee.current_epoch(group_id) or 0
-                if expected_epoch is not None and after_epoch != expected_epoch:
-                    return
-                pending = after_resp.get("pending_rotation") if isinstance(after_resp, dict) else None
-                if isinstance(pending, dict) and not pending.get("expired"):
-                    self._schedule_group_rotation_retry(
-                        group_id,
-                        reason=reason,
-                        trigger_id=trigger_id,
-                        expected_epoch=expected_epoch,
-                        pending=pending,
-                    )
-                    return
-                await self._rotate_group_epoch(
-                    group_id, reason=reason, trigger_id=trigger_id, expected_epoch=expected_epoch,
-                )
-                return
-
-            if my_rank == 0:
-                await self._rotate_group_epoch(
-                    group_id, reason=reason, trigger_id=trigger_id, expected_epoch=expected_epoch,
-                )
-                return
-
-            # 非 leader：随机 jitter（2~6s）后查询服务端 epoch 是否已被 leader 推进
-            jitter_ms = 2000 + random.randint(0, 4000)
-            # 记录 jitter 前的服务端 epoch
-            try:
-                before_resp = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-                before_epoch = before_resp.get("epoch", 0) if isinstance(before_resp, dict) else 0
-            except Exception:
-                before_epoch = self._group_e2ee.current_epoch(group_id) or 0
-            await asyncio.sleep(jitter_ms / 1000.0)
-            # jitter 后查询服务端 epoch
-            try:
-                after_resp = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-                after_epoch = after_resp.get("epoch", 0) if isinstance(after_resp, dict) else 0
-            except Exception:
-                after_resp = {}
-                after_epoch = self._group_e2ee.current_epoch(group_id) or 0
-
-            if self._closing or self._state != "connected":
-                return
-            if after_epoch > before_epoch:
-                return  # leader 已完成
-            pending = after_resp.get("pending_rotation") if isinstance(after_resp, dict) else None
-            if isinstance(pending, dict) and not pending.get("expired"):
-                self._schedule_group_rotation_retry(
-                    group_id,
-                    reason=reason,
-                    trigger_id=trigger_id,
-                    expected_epoch=expected_epoch,
-                    pending=pending,
-                )
-                return
-
-            self._log.info("client",
-                "[H21] leader 未完成 epoch 轮换，非 leader 兜底: group=%s myAid=%s",
-                group_id, my_aid
-            )
-            await self._rotate_group_epoch(group_id, reason=reason, trigger_id=trigger_id, expected_epoch=expected_epoch)
-        except Exception as exc:
-            if self._is_expected_group_rotation_skip_error(exc):
-                self._log.debug("client",
-                    "跳过 group epoch 轮换兜底: group=%s aid=%s reason=%s err=%s",
-                    group_id, my_aid, reason, exc,
-                )
-                self._log.debug("client", "_maybe_lead_rotate_group_epoch exit (skip): elapsed=%.3fs group=%s", time.time() - _t_start, group_id)
-                return
-            self._log.warn("client", "_maybe_lead_rotate_group_epoch failed: %s", exc)
-        finally:
-            self._group_epoch_rotation_inflight.discard(group_id)
-            self._log.debug("client", "_maybe_lead_rotate_group_epoch exit: elapsed=%.3fs group=%s", time.time() - _t_start, group_id)
-
-    async def _ranked_group_rotation_candidates(
-        self,
-        group_id: str,
-        *,
-        allow_member: bool,
-        members_resp: dict[str, Any] | None = None,
-    ) -> list[str]:
-        """返回当前可发起群密钥轮换的候选 AID，按 owner > admin > member 排序。"""
-        my_aid = self._aid or ""
-        raw_list: list[Any] = []
-        online_seen = False
-        try:
-            online_resp = await self.call("group.get_online_members", {"group_id": group_id})
-            if isinstance(online_resp, dict):
-                raw_online = online_resp.get("members") or online_resp.get("items") or online_resp.get("online_members")
-                if isinstance(raw_online, list):
-                    raw_list = raw_online
-                    online_seen = True
-        except Exception as exc:
-            self._log.debug("client", "failed to get online members, falling back to member list election: group=%s err=%s", group_id, exc)
-
-        if not raw_list:
-            if members_resp is None:
-                members_resp = await self.call("group.get_members", {"group_id": group_id})
-            raw_members = members_resp.get("members") or members_resp.get("items") if isinstance(members_resp, dict) else []
-            raw_list = raw_members if isinstance(raw_members, list) else []
-
-        buckets: dict[str, set[str]] = {"owner": set(), "admin": set(), "member": set()}
-        for item in raw_list:
-            if not isinstance(item, dict):
-                continue
-            aid = str(item.get("aid") or "").strip()
-            if not aid:
-                continue
-            if online_seen and item.get("online") is not True and aid != my_aid:
-                continue
-            role = str(item.get("role") or "").strip().lower()
-            if role == "owner":
-                buckets["owner"].add(aid)
-            elif role == "admin":
-                buckets["admin"].add(aid)
-            elif allow_member and role == "member":
-                buckets["member"].add(aid)
-
-        candidates = sorted(buckets["owner"]) + sorted(buckets["admin"])
-        if allow_member:
-            candidates += sorted(buckets["member"])
-        return candidates
-
-    async def _rotate_group_epoch(self, group_id: str, *, reason: str = "manual", trigger_id: str = "", expected_epoch: int | None = None) -> None:
-        """为指定群组轮换 epoch 并分发新密钥。
-
-        使用服务端 CAS 保证只有一方成功。
-        服务端同时校验 owner/admin 角色。
-        """
-        _t_rotate_start = time.time()
-        self._log.debug("client", "_rotate_group_epoch enter: group=%s reason=%s trigger=%s expected_epoch=%s", group_id, reason, trigger_id or "-", expected_epoch)
-        try:
-            # 1. 先获取最新成员列表。若本地当前 epoch 的签名成员集已经一致，
-            #    说明事件路径/RPC 兜底重复触发，必须在 CAS 前幂等跳过，避免无谓推进服务端 epoch。
-            member_aids = await self._get_group_member_aids(group_id)
-            if reason == "membership_changed" and trigger_id:
-                if trigger_id in self._group_membership_rotation_done:
-                    return
-
-            # 2. 读取服务端当前 epoch。成员变更触发的轮换必须绑定到变更发生时的 old_epoch，
-            #    只允许 old_epoch -> old_epoch + 1；若 epoch 已推进，说明同一变更已被其它路径处理。
-            epoch_result = await self.call("group.e2ee.get_epoch", {"group_id": group_id})
-            server_epoch = int(epoch_result.get("epoch", 0))
-            pending_rotation = epoch_result.get("pending_rotation") if isinstance(epoch_result, dict) else None
-            if isinstance(pending_rotation, dict) and not pending_rotation.get("expired"):
-                stale_pending = (
-                    reason == "membership_changed"
-                    and expected_epoch is not None
-                    and server_epoch == expected_epoch
-                    and self._rotation_expected_members_stale(pending_rotation, member_aids)
-                )
-                if stale_pending and await self._abort_group_rotation(
-                    str(pending_rotation.get("rotation_id") or ""),
-                    reason="membership_changed_during_rotation",
-                ):
-                    self._log.info("client", 
-                        "aborted stale pending group epoch rotation: group=%s rotation=%s",
-                        group_id, pending_rotation.get("rotation_id") or "-",
-                    )
-                else:
-                    self._schedule_group_rotation_retry(
-                        group_id,
-                        reason=reason,
-                        trigger_id=trigger_id,
-                        expected_epoch=expected_epoch,
-                        pending=pending_rotation,
-                    )
-                    return
-            if reason == "membership_changed" and expected_epoch is not None and server_epoch != expected_epoch:
-                if trigger_id:
-                    self._group_membership_rotation_done.add(trigger_id)
-                self._log.info("client", 
-                    "skip membership epoch rotation: group=%s expected_epoch=%s server_epoch=%s trigger=%s",
-                    group_id, expected_epoch, server_epoch, trigger_id or "-",
-                )
-                return
-            current_epoch = expected_epoch if expected_epoch is not None else server_epoch
-
-            target_epoch = current_epoch + 1
-            # 3. 本地生成目标 epoch 密钥；服务端 begin 只创建 pending，不推进 committed epoch。
-            # 新成员可能没有 prev epoch key，或有 key 但缺少 epoch_chain（通过 backfill 接收）。
-            # 从 committed_rotation.epoch_chain 获取 prev chain hint。
-            prev_chain_hint: str | None = None
-            local_prev = self._group_e2ee.load_secret(group_id, current_epoch)
-            local_prev_chain = str(local_prev.get("epoch_chain") or "").strip() if local_prev else ""
-            if not local_prev_chain:
-                committed_rotation = epoch_result.get("committed_rotation") if isinstance(epoch_result, dict) else None
-                if isinstance(committed_rotation, dict):
-                    raw_chain = str(committed_rotation.get("epoch_chain") or "").strip()
-                    if raw_chain:
-                        prev_chain_hint = raw_chain
-                        self._log.info("client", 
-                            "轮换补充 prev epoch chain from server: group=%s epoch=%s",
-                            group_id, current_epoch,
-                        )
-            rotation_id = f"rot-{uuid.uuid4().hex}"
-            self._log.debug("client", "epoch rotation begin phase: group=%s base_epoch=%s target_epoch=%s rotation_id=%s members=%d", group_id, current_epoch, target_epoch, rotation_id, len(member_aids))
-            info = self._group_e2ee.rotate_epoch_to(
-                group_id, target_epoch, member_aids, rotation_id=rotation_id,
-                prev_chain_hint=prev_chain_hint,
-            )
-            self._attach_rotation_id(info, rotation_id)
-            def discard_generated_pending() -> None:
-                try:
-                    self._group_e2ee.discard_pending_secret(group_id, target_epoch, rotation_id)
-                except Exception as cleanup_exc:
-                    self._log.debug("client", 
-                        "清理本地 pending group key 失败: group=%s epoch=%s rotation=%s err=%s",
-                        group_id, target_epoch, rotation_id, cleanup_exc,
-                    )
-
-            rotate_params = {
-                "group_id": group_id,
-                "base_epoch": current_epoch,
-                "target_epoch": target_epoch,
-                "rotation_id": rotation_id,
-                "reason": reason,
-                "key_commitment": info.get("commitment", ""),
-                "expected_members": member_aids,
-                "required_acks": [self._aid] if self._aid else [],
-                "lease_ms": _GROUP_ROTATION_LEASE_MS,
-            }
-            rotate_params.update(self._build_rotation_signature(group_id, current_epoch, target_epoch, rotate_params))
-            try:
-                begin_result = await self.call("group.e2ee.begin_rotation", rotate_params)
-            except Exception:
-                discard_generated_pending()
-                raise
-            rotation = begin_result.get("rotation") if isinstance(begin_result, dict) else None
-            if not isinstance(begin_result, dict) or not begin_result.get("success") or not isinstance(rotation, dict):
-                if isinstance(rotation, dict) and not rotation.get("expired"):
-                    if (
-                        reason == "membership_changed"
-                        and self._rotation_expected_members_stale(rotation, member_aids)
-                        and await self._abort_group_rotation(
-                            str(rotation.get("rotation_id") or ""),
-                            reason="membership_changed_during_rotation",
-                        )
-                    ):
-                        self._schedule_group_rotation_retry(
-                            group_id,
-                            reason=reason,
-                            trigger_id=trigger_id,
-                            expected_epoch=expected_epoch,
-                            pending=None,
-                        )
-                    else:
-                        self._schedule_group_rotation_retry(
-                            group_id,
-                            reason=reason,
-                            trigger_id=trigger_id,
-                            expected_epoch=expected_epoch,
-                            pending=rotation,
-                        )
-                elif isinstance(begin_result, dict) and begin_result.get("reason") == "expected_members_mismatch":
-                    self._schedule_group_rotation_retry(
-                        group_id,
-                        reason=reason,
-                        trigger_id=trigger_id,
-                        expected_epoch=expected_epoch,
-                        pending=None,
-                    )
-                self._log.warn("client", 
-                    "group epoch begin failed; stop key distribution (group=%s, current_epoch=%s, returned=%s)",
-                    group_id, current_epoch, begin_result,
-                )
-                discard_generated_pending()
-                return
-            active_rotation_id = str(rotation.get("rotation_id") or rotation_id)
-            self._log.debug("client", "epoch rotation distribute phase: group=%s rotation=%s target_epoch=%s", group_id, active_rotation_id, target_epoch)
-            distribute_result = await self._distribute_group_epoch_key(info, rotation_id=active_rotation_id)
-            failed = distribute_result.get("failed", [])
-            if failed:
-                self._log.warn("client", 
-                    "group epoch key distribution incomplete; abort rotation before retry "
-                    "(group=%s rotation=%s failed=%s)",
-                    group_id, active_rotation_id, failed,
-                )
-                await self._abort_group_rotation(active_rotation_id, reason="distribution_failed")
-                self._schedule_group_rotation_retry(
-                    group_id,
-                    reason=reason,
-                    trigger_id=trigger_id,
-                    expected_epoch=expected_epoch,
-                    pending=None,
-                )
-                discard_generated_pending()
-                return
-            await self._heartbeat_group_rotation(rotation.get("rotation_id", rotation_id))
-            if not await self._ack_group_rotation_key(
-                rotation_id=active_rotation_id,
-                key_commitment=info.get("commitment", ""),
-            ):
-                self._log.warn("client", 
-                    "group epoch self ack failed; abort rotation before retry "
-                    "(group=%s rotation=%s)",
-                    group_id, active_rotation_id,
-                )
-                await self._abort_group_rotation(active_rotation_id, reason="self_ack_failed")
-                self._schedule_group_rotation_retry(
-                    group_id,
-                    reason=reason,
-                    trigger_id=trigger_id,
-                    expected_epoch=expected_epoch,
-                    pending=None,
-                )
-                discard_generated_pending()
-                return
-            commit_params: dict[str, Any] = {
-                "rotation_id": active_rotation_id,
-            }
-            if await self._group_allows_member_epoch_rotation(group_id):
-                # 只有 open / invite code 群把 per-member ECIES epoch key 交给服务端托管。
-                encrypted_keys = await self._build_epoch_encrypted_keys(
-                    info, member_aids, target_epoch, group_id
-                )
-                if encrypted_keys:
-                    commit_params["encrypted_keys"] = encrypted_keys
-            self._log.debug("client", "epoch rotation commit phase: group=%s rotation=%s target_epoch=%s", group_id, active_rotation_id, target_epoch)
-            commit_result = await self.call("group.e2ee.commit_rotation", commit_params)
-            if not commit_result.get("success"):
-                self._log.warn("client", 
-                    "group epoch commit failed (group=%s, rotation=%s, returned=%s)",
-                    group_id, active_rotation_id, commit_result,
-                )
-                self._schedule_group_rotation_retry(
-                    group_id,
-                    reason=reason,
-                    trigger_id=trigger_id,
-                    expected_epoch=expected_epoch,
-                    pending=commit_result.get("rotation") if isinstance(commit_result, dict) else rotation,
-                )
-                returned_rotation = commit_result.get("rotation") if isinstance(commit_result, dict) else None
-                if not (
-                    isinstance(returned_rotation, dict)
-                    and str(returned_rotation.get("rotation_id") or "") == active_rotation_id
-                    and str(returned_rotation.get("status") or "") == "distributing"
-                ):
-                    discard_generated_pending()
-                return
-            committed_secret = self._group_e2ee.load_secret(group_id, target_epoch)
-            committed_rotation = (
-                commit_result.get("rotation")
-                if isinstance(commit_result, dict) and isinstance(commit_result.get("rotation"), dict)
-                else {
-                    "rotation_id": active_rotation_id,
-                    "key_commitment": info.get("commitment", ""),
-                }
-            )
-            if committed_secret and self._group_secret_matches_committed_rotation(committed_secret, committed_rotation, local_aid=self._aid or ""):
-                self._group_e2ee.store_secret(
-                    group_id,
-                    target_epoch,
-                    committed_secret["secret"],
-                    committed_secret.get("commitment", ""),
-                    committed_secret.get("member_aids", member_aids),
-                    epoch_chain=committed_secret.get("epoch_chain"),
-                )
-                self._log.debug("client", "epoch rotation complete: group=%s epoch=%s->%s rotation=%s reason=%s", group_id, current_epoch, target_epoch, active_rotation_id, reason)
-            else:
-                self._log.warn("client", 
-                    "group epoch commit succeeded but local target key does not match committed rotation; keep pending blocked "
-                    "(group=%s rotation=%s epoch=%s)",
-                    group_id, active_rotation_id, target_epoch,
-                )
-            if reason == "membership_changed" and trigger_id:
-                self._group_membership_rotation_done.add(trigger_id)
-                if len(self._group_membership_rotation_done) > 2000:
-                    self._group_membership_rotation_done = set(list(self._group_membership_rotation_done)[-1000:])
-        except Exception as exc:
-            self._log_e2ee_error("rotate_epoch", group_id, "", exc)
-            self._log.debug("client", "_rotate_group_epoch exit (error): elapsed=%.3fs group=%s err=%s", time.time() - _t_rotate_start, group_id, exc)
-            return
-        self._log.debug("client", "_rotate_group_epoch exit: elapsed=%.3fs group=%s", time.time() - _t_rotate_start, group_id)
-    def _joined_member_aids_from_payload(self, payload: dict[str, Any]) -> list[str]:
-        """从成员加入事件 payload 中提取新加入的成员 AID 列表。"""
-        aids: set[str] = set()
-
-        def add_aid(value: Any) -> None:
-            aid = str(value or '').strip()
-            if aid:
-                aids.add(aid)
-
-        add_aid(payload.get('aid') or payload.get('applicant_aid') or payload.get('applicantAid'))
-        add_aid(payload.get('actor_aid'))
-        for key in ('member_aid', 'target_aid', 'new_member_aid', 'used_by'):
-            add_aid(payload.get(key))
-        for key in ('member', 'request', 'invite_code'):
-            nested = payload.get(key)
-            if not isinstance(nested, dict):
-                continue
-            add_aid(nested.get('aid') or nested.get('applicant_aid') or nested.get('applicantAid'))
-            for nk in ('member_aid', 'target_aid', 'used_by'):
-                add_aid(nested.get(nk))
-        results = payload.get('results')
-        if isinstance(results, list):
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                status = str(item.get('status') or '').strip().lower()
-                if status != 'approved' and item.get('approved') is not True:
-                    continue
-                add_aid(item.get('aid') or item.get('applicant_aid') or item.get('applicantAid'))
-                for key in ('member_aid', 'target_aid'):
-                    add_aid(item.get(key))
-                for key in ('member', 'request'):
-                    nested = item.get(key)
-                    if not isinstance(nested, dict):
-                        continue
-                    add_aid(nested.get('aid') or nested.get('applicant_aid'))
-                    for nk in ('member_aid', 'target_aid'):
-                        add_aid(nested.get(nk))
-        return list(aids)
-
-    # ── 入群密钥恢复策略 ──────────────────────────────────────
-
-    # 延迟轮换等待时间（秒）：给新成员恢复 committed_epoch 的窗口
-    _JOIN_ROTATION_DELAY_S = 3.0
-    # 新成员自身延迟轮换时间（秒）：优先让其他在线成员先轮换
-    _SELF_JOIN_ROTATION_DELAY_S = 6.0
-
-    async def _delayed_rotate_after_join(
-        self,
-        group_id: str,
-        reason: str = "membership_changed",
-        trigger_id: str = "",
-        expected_epoch: int = 0,
-        allow_member: bool = False,
-        delay_s: float | None = None,
-    ) -> None:
-        """open/invite_code 入群后延迟轮换。"""
-        await asyncio.sleep(delay_s if delay_s is not None else self._JOIN_ROTATION_DELAY_S)
-        await self._maybe_lead_rotate_group_epoch(
-            group_id,
-            reason=reason,
-            trigger_id=trigger_id,
-            expected_epoch=expected_epoch,
-            allow_member=allow_member,
-        )
-
-    async def _maybe_backfill_key_to_joined_member(
-        self, group_id: str, payload: dict[str, Any], trigger_id: str = ''
-    ) -> None:
-        """当新成员加入但缺少 old_epoch 时，将当前 epoch 密钥分发给新成员。"""
-        member_aids = [
-            aid for aid in self._joined_member_aids_from_payload(payload)
-            if aid and aid != self._aid
-        ]
-        if not group_id or not self._aid or not member_aids:
-            return
-        self._log.debug("client", "backfill key evaluation: group=%s new_members=%s trigger=%s", group_id, member_aids, trigger_id or "-")
-        secret_data = self._group_e2ee.load_secret(group_id)
-        if secret_data is None:
-            self._log.debug("client", "backfill skipped: no local epoch key: group=%s", group_id)
-            return
-        for member_aid in member_aids:
-            dedupe_key = (
-                f"{trigger_id or self._membership_rotation_trigger_id(group_id, payload)}"
-                f":backfill:{member_aid}"
-            )
-            if dedupe_key in self._group_member_key_backfill_done:
-                continue
-            self._group_member_key_backfill_done.add(dedupe_key)
-            if len(self._group_member_key_backfill_done) > 2000:
-                self._group_member_key_backfill_done = set(
-                    list(self._group_member_key_backfill_done)[-1000:]
-                )
-            self._log.debug("client", "backfill distributing key to new member: group=%s member=%s epoch=%s", group_id, member_aid, secret_data.get("epoch", "-"))
-            await self._distribute_key_to_new_member(group_id, member_aid)
-
-    async def _distribute_key_to_new_member(self, group_id: str, new_member_aid: str) -> None:
-        """将当前 group_secret 通过 P2P E2EE 分发给新成员。
-
-        先拉服务端最新成员列表，更新本地 member_aids/commitment，构建签名 manifest，再分发。
-        """
-        try:
-            secret_data = self._group_e2ee.load_secret(group_id)
-            if secret_data is None:
-                return
-
-            # 拉服务端最新成员列表（确保一致性）
-            members_result = await self.call("group.get_members", {"group_id": group_id})
-            member_aids = [m["aid"] for m in members_result.get("members", [])]
-
-            # 用最新成员列表计算 commitment（仅用于 distribution payload，不覆写本地存储）
-            from .e2ee import (
-                compute_membership_commitment,
-                build_key_distribution, build_membership_manifest, sign_membership_manifest,
-            )
-            epoch = secret_data["epoch"]
-            commitment = compute_membership_commitment(member_aids, epoch, group_id, secret_data["secret"])
-
-            # 构建并签名 manifest
-            manifest = build_membership_manifest(
-                group_id=group_id,
-                epoch=epoch,
-                prev_epoch=epoch,
-                member_aids=member_aids,
-                added=[new_member_aid],
-                removed=[],
-                initiator_aid=self._aid or "",
-            )
-            identity = self._identity
-            if identity and identity.get("private_key_pem"):
-                manifest = sign_membership_manifest(manifest, identity["private_key_pem"])
-
-            dist_payload = build_key_distribution(
-                group_id, epoch, secret_data["secret"],
-                member_aids, self._aid or "",
-                manifest=manifest,
-                epoch_chain=secret_data.get("epoch_chain"),
-            )
-            for _attempt in range(3):
-                try:
-                    await self.call("message.send", {
-                        "to": new_member_aid,
-                        "payload": dist_payload,
-                        "encrypt": True,
-                        "persist_required": True,
-                    })
-                    self._log.debug("client", "backfill key distribution success: group=%s member=%s epoch=%s", group_id, new_member_aid, epoch)
-                    break
-                except Exception as _send_exc:
-                    if _attempt < 2:
-                        await asyncio.sleep(1.0 * (_attempt + 1))
-                    else:
-                        self._log.warn("client", "backfill key distribution failed (retries exhausted): group=%s member=%s epoch=%s error=%s", group_id, new_member_aid, epoch, _send_exc)
-                        raise _send_exc
-        except Exception as exc:
-            self._log_e2ee_error("distribute_key", group_id, new_member_aid, exc)
-
-    def _start_group_epoch_tasks(self) -> None:
-        """启动群组 epoch 相关后台任务"""
-        # 旧 epoch 清理（每小时检查一次）
-        if self._group_epoch_cleanup_task is None or self._group_epoch_cleanup_task.done():
-            self._group_epoch_cleanup_task = asyncio.create_task(
-                self._group_epoch_cleanup_loop(3600.0)
-            )
-        # 定时 epoch 轮换
-        rotate_interval = self._config_model.epoch_auto_rotate_interval
-        if rotate_interval > 0:
-            if self._group_epoch_rotate_task is None or self._group_epoch_rotate_task.done():
-                self._group_epoch_rotate_task = asyncio.create_task(
-                    self._group_epoch_rotate_loop(float(rotate_interval))
-                )
-        # 内存缓存定时清理（每小时扫描过期条目）
-        if self._cache_cleanup_task is None or self._cache_cleanup_task.done():
-            self._cache_cleanup_task = asyncio.create_task(
-                self._cache_cleanup_loop(3600.0)
-            )
-
-    async def _is_rotation_leader(self, group_id: str) -> bool:
-        """PY-005: 判断自己是否为该群组定时轮换的 leader。
-
-        规则：所有 admin/owner 按 AID 字典序排序，最小的为 leader。
-        普通 member 始终返回 False。
-        """
-        my_aid = self._aid
-        if not my_aid:
-            return False
-        try:
-            members_resp = await self._transport.call("group.get_members", {"group_id": group_id})
-            if not isinstance(members_resp, dict):
-                return False
-            raw_list = members_resp.get("members") or members_resp.get("items")
-            if not isinstance(raw_list, list):
-                return False
-            admins = []
-            for m in raw_list:
-                if not isinstance(m, dict):
-                    continue
-                role = str(m.get("role", ""))
-                aid = str(m.get("aid", ""))
-                if aid and role in ("admin", "owner"):
-                    admins.append(aid)
-            if not admins or my_aid not in admins:
-                return False
-            admins.sort()
-            return admins[0] == my_aid
-        except Exception as _exc:
-            self._log.debug("client", "leader election query failed: group=%s: %s", group_id, _exc)
-            return False
-
-    async def _group_epoch_rotate_loop(self, interval: float) -> None:
-        """定时轮换所有已知群组的 epoch。
-
-        PY-005: 只有 leader admin 执行定时轮换，避免多 admin 同时竞争。
-        """
-        try:
-            while not self._closing:
-                await asyncio.sleep(interval)
-                if self._state != "connected":
-                    continue
-                my_aid = self._aid
-                if not my_aid:
-                    continue
-                try:
-                    group_ids = self._keystore.list_group_secret_ids(my_aid)
-                    for gid in list(group_ids):
-                        await self._maybe_lead_rotate_group_epoch(gid, reason="scheduled")
-                except Exception as _exc:
-                    self._log.warn("client", "epoch rotation failed: %s", _exc)
-        except asyncio.CancelledError:
-            raise
-
-    async def _group_epoch_cleanup_loop(self, interval: float) -> None:
-        """定时清理过期的旧 epoch 密钥"""
-        try:
-            while not self._closing:
-                await asyncio.sleep(interval)
-                if self._state != "connected":
-                    continue
-                my_aid = self._aid
-                if not my_aid:
-                    continue
-                try:
-                    group_ids = self._keystore.list_group_secret_ids(my_aid)
-                    retention = self._config_model.old_epoch_retention_seconds
-                    for gid in list(group_ids):
-                        self._group_e2ee.cleanup(gid, retention)
-                except Exception as _exc:
-                    self._log.warn("client", "epoch rotation failed: %s", _exc)
-        except asyncio.CancelledError:
-            raise
 
     async def _cache_cleanup_loop(self, interval: float) -> None:
         """定时清理过期的内存缓存条目"""
@@ -6660,8 +2830,6 @@ class AUNClient:
                 for k in stale_keys:
                     self._gap_fill_done.pop(k, None)
                 # e2ee prekey 缓存
-                self._e2ee.clean_expired_caches()
-                self._group_e2ee.clean_expired_caches()
                 # auth gateway 缓存
                 self._auth.clean_expired_caches()
         except asyncio.CancelledError:
@@ -7074,18 +3242,21 @@ class AUNClient:
         await self._v2_session.ensure_registered(self.call)
         self._log.debug("client", "V2 session initialized (IK=AID identity): aid=%s device=%s", self._aid, self._device_id)
 
-    async def send_v2(self, to: str, payload: dict[str, Any], **kwargs) -> dict[str, Any]:
+    async def _send_encrypted_v2(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 P2P 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。
 
-        Args:
-            to: 目标 AID
-            payload: 业务 payload（将被加密）
-
-        Returns:
-            服务端响应 dict
+        内部方法，由 call("message.send") 拦截路由调用。
+        params 中需要 to（目标 AID）和 payload（业务 payload）。
         """
         if not self._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
+
+        to = str(params.get("to") or "").strip()
+        payload = params.get("payload") or {}
+        if not to:
+            raise ValidationError("message.send requires 'to'")
+        if not isinstance(payload, dict):
+            raise ValidationError("message.send payload must be a dict for V2 encryption")
 
         async def _attempt(use_cache: bool) -> dict[str, Any]:
             if use_cache:
@@ -7101,6 +3272,9 @@ class AUNClient:
                 bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
                 peer_devices = bootstrap.get("peer_devices", [])
                 audit_recipients_raw = bootstrap.get("audit_recipients", [])
+                self._log.info("client", "DEBUG _send_encrypted_v2 bootstrap: to=%s peer_devices=%d spk_pks=%s",
+                               to, len(peer_devices),
+                               [d.get("spk_pk", "")[:20] or "<empty>" for d in peer_devices[:3]])
                 if peer_devices:
                     self._v2_bootstrap_cache[to] = (peer_devices, time.time(), audit_recipients_raw)
             else:
@@ -7177,7 +3351,10 @@ class AUNClient:
                 sender=sender,
                 target_set=target_set,
                 payload=payload,
-                **kwargs,
+                message_id=params.get("message_id"),
+                timestamp=params.get("timestamp"),
+                protected_headers=params.get("protected_headers") if isinstance(params.get("protected_headers"), dict) else None,
+                context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
 
             return await self.call("message.send", {
@@ -7189,25 +3366,19 @@ class AUNClient:
         try:
             return await _attempt(use_cache=True)
         except Exception as exc:
-            err_msg = str(exc).lower()
-            if "device" in err_msg or "prekey" in err_msg or "recipient" in err_msg or "stale" in err_msg:
-                self._log.debug("client", "V2 P2P speculative send rejected, refreshing bootstrap: %s", exc)
+            exc_code = getattr(exc, "code", None)
+            if exc_code in (-33011, -33012, -33050, -33052, -33054):
+                self._log.debug("client", "V2 P2P speculative send rejected (code=%s), refreshing bootstrap: %s", exc_code, exc)
                 self._v2_bootstrap_cache.pop(to, None)
                 return await _attempt(use_cache=False)
             raise
 
-    async def pull_v2(self, after_seq: int = 0, limit: int = 50) -> list[dict[str, Any]]:
-        """拉取并解密 V2 P2P 消息。
-
-        Args:
-            after_seq: 从此 seq 之后开始拉取（0 表示从头）
-            limit: 最多拉取条数
-
-        Returns:
-            解密后的消息列表
-        """
+    async def _pull_v2_internal(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """V2 P2P 拉取并解密消息。内部方法，由 call("message.pull") 路由调用。"""
         if not self._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
+        after_seq = int(params.get("after_seq", 0) or 0)
+        limit = int(params.get("limit", 50) or 50)
 
         ns = f"p2p:{self._aid}" if self._aid else ""
         effective_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
@@ -7217,15 +3388,52 @@ class AUNClient:
             "limit": limit,
         })
         messages = result.get("messages", [])
+        seqs = [
+            int(m.get("seq") or 0)
+            for m in messages
+            if isinstance(m, dict) and int(m.get("seq") or 0) > 0
+        ]
+        contig_before = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
+        if ns and seqs and seqs[0] > contig_before:
+            self._seq_tracker.force_contiguous_seq(ns, seqs[0])
+
         decrypted = []
-        max_seq = effective_after_seq
         for msg in messages:
             seq = msg.get("seq", 0)
-            if seq > max_seq:
-                max_seq = seq
-            plaintext = await self._decrypt_v2_message(msg)
-            if plaintext is not None:
-                decrypted.append(plaintext)
+            if seq <= 0:
+                continue
+
+            # V1 行（服务端 v2.pull 合并的 V1 历史）：V2-only 客户端跳过 V1 envelope，
+            # 仅明文消息照常 publish；e2ee.encrypted / e2ee.group_encrypted / 未知类型一律
+            # 推进 seq tracker 并丢弃。
+            if str(msg.get("version", "") or "") == "v1":
+                legacy = msg.get("legacy_v1") or {}
+                v1_payload = legacy.get("payload")
+                v1_payload_type = ""
+                if isinstance(v1_payload, dict):
+                    v1_payload_type = str(v1_payload.get("type") or "").strip()
+                # 仅放行明文（非 V1 E2EE 包装类型）
+                if v1_payload_type not in ("e2ee.encrypted", "e2ee.group_encrypted") and v1_payload is not None:
+                    v1_msg = {
+                        "message_id": msg.get("message_id", ""),
+                        "from": msg.get("from_aid", ""),
+                        "to": legacy.get("to", self._aid),
+                        "seq": seq,
+                        "type": msg.get("type", ""),
+                        "timestamp": msg.get("t_server", 0),
+                        "payload": v1_payload,
+                        "encrypted": False,
+                    }
+                    if ns:
+                        await self._publish_pulled_message("message.received", ns, seq, v1_msg)
+                    else:
+                        await self._publish_app_event("message.received", v1_msg)
+                    decrypted.append(v1_msg)
+                else:
+                    self._log.debug("client", "v2.pull skipping V1 envelope seq=%d payload_type=%s (V1 E2EE removed)",
+                                    seq, v1_payload_type or "<none>")
+                continue
+
             # 跟踪每个旧 SPK 引用的最大 seq（用于消费后销毁）
             try:
                 msg_spk_id = str(msg.get("spk_id", "") or "")
@@ -7233,20 +3441,50 @@ class AUNClient:
                     self._v2_session.track_old_spk_max_seq(msg_spk_id, seq)
             except Exception:
                 pass
-        # 推进 SeqTracker：V2 消息 seq 可能远高于当前 contiguous（共享 seq 空间），
-        # 直接 restore 到 max_seq 避免 gap 检测误判
-        if ns and max_seq > self._seq_tracker.get_contiguous_seq(ns):
-            self._seq_tracker.restore_state({ns: max_seq})
-            self._persist_seq(ns)
-        return decrypted
+            # 解密
+            plaintext = await self._decrypt_v2_message(msg)
+            if plaintext is None:
+                continue
+            # pull 批发布只做去重，不受批内部永久空洞阻塞
+            if ns:
+                await self._publish_pulled_message("message.received", ns, seq, plaintext)
+            else:
+                await self._publish_app_event("message.received", plaintext)
+            decrypted.append(plaintext)
 
-    async def ack_v2(self, up_to_seq: int | None = None) -> dict[str, Any]:
-        """确认 V2 消息已消费 + 自检销毁旧 SPK。"""
+        if ns and seqs:
+            max_seq = max(seqs)
+            current_contig = self._seq_tracker.get_contiguous_seq(ns)
+            if max_seq > current_contig:
+                self._seq_tracker.force_contiguous_seq(ns, max_seq)
+                await self._drain_ordered_messages(ns)
+
+        if ns:
+            contig = self._seq_tracker.get_contiguous_seq(ns)
+            if contig != contig_before:
+                self._persist_seq(ns)
+            if contig > 0 and contig != contig_before:
+                self._fire_ack("message.v2.ack", {
+                    "up_to_seq": contig,
+                }, "V2 P2P auto-ack")
+        return {"messages": decrypted}
+
+    async def _ack_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
+        """V2 P2P 确认消费 + 自检销毁旧 SPK。内部方法，由 call("message.ack") 路由调用。"""
         ns = f"p2p:{self._aid}" if self._aid else ""
+        up_to_seq = int(params.get("seq", 0) or params.get("up_to_seq", 0) or 0)
         seq = up_to_seq or (self._seq_tracker.get_contiguous_seq(ns) if ns else 0)
         if seq <= 0:
             return {"acked": 0}
         result = await self.call("message.v2.ack", {"up_to_seq": seq})
+        # 补充兼容字段
+        if isinstance(result, dict):
+            result["ack_seq"] = seq
+            result["success"] = True
+            # V1+V2 共享 seq 空间：即使 V2 inbox 没 wrap 行（明文消息在 V1 表），
+            # V1 cursor 也被推进了，视为 ack 成功
+            if result.get("acked", 0) == 0 and seq > 0:
+                result["acked"] = seq
         # 自检：所有旧 SPK 引用的消息都已 ack → 销毁旧 SPK 私钥（PFS）
         if self._v2_session:
             try:
@@ -7261,12 +3499,19 @@ class AUNClient:
 
     _V2_GROUP_BOOTSTRAP_TTL = 3600
 
-    async def send_group_v2(self, group_id: str, payload: dict[str, Any], **kwargs) -> dict[str, Any]:
-        """V2 Group 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。"""
+    async def _send_group_encrypted_v2(self, params: dict[str, Any]) -> dict[str, Any]:
+        """V2 Group 加密发送。内部方法，由 call("group.send") 路由调用。"""
         if not self._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
 
         from .v2.e2ee.encrypt_group import encrypt_group_message
+
+        group_id = str(params.get("group_id") or "").strip()
+        payload = params.get("payload") or {}
+        if not group_id:
+            raise ValidationError("group.send requires 'group_id'")
+        if not isinstance(payload, dict):
+            raise ValidationError("group.send payload must be a dict for V2 encryption")
 
         async def _attempt(use_cache: bool) -> dict[str, Any]:
             cache_key = f"group:{group_id}"
@@ -7318,6 +3563,9 @@ class AUNClient:
                         all_devices, time.time(), epoch, pending_adds, committed_aids,
                         state_commitment, audit_recipients_raw,
                     )
+                # lazy sync 触发：发现 pending members 且自己是 owner/admin 时异步发起提案
+                if pending_adds and self._v2_session:
+                    self._v2_maybe_trigger_auto_propose(group_id)
             else:
                 pending_adds = cached[3] if len(cached) > 3 else set()
                 committed_aids = cached[4] if len(cached) > 4 else set()
@@ -7375,7 +3623,10 @@ class AUNClient:
                 targets=targets,
                 payload=payload,
                 state_commitment=state_commitment,
-                **kwargs,
+                message_id=params.get("message_id"),
+                timestamp=params.get("timestamp"),
+                protected_headers=params.get("protected_headers") if isinstance(params.get("protected_headers"), dict) else None,
+                context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
 
             return await self.call("group.v2.send", {
@@ -7384,19 +3635,408 @@ class AUNClient:
             })
 
         try:
+            result = await _attempt(use_cache=True)
+        except Exception as exc:
+            exc_code = getattr(exc, "code", None)
+            if exc_code in (-33011, -33012, -33050, -33052, -33054):
+                self._log.debug("client", "group V2 speculative send rejected (code=%s), refreshing bootstrap: %s", exc_code, exc)
+                self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
+                result = await _attempt(use_cache=False)
+            else:
+                raise
+
+        # 发送成功后记录自己发的消息 seq，保证 SeqTracker 连续
+        if isinstance(result, dict) and result.get("seq"):
+            ns = f"group:{group_id}"
+            seq = int(result["seq"])
+            self._seq_tracker.on_message_seq(ns, seq)
+            self._mark_published_seq(ns, seq)
+            self._persist_seq(ns)
+        return result
+
+    # ── V2 thought（per-device wrap，服务端不持久化）─────────────
+
+    async def _build_v2_p2p_envelope(
+        self,
+        *,
+        to: str,
+        payload: dict[str, Any],
+        message_id: str | None,
+        timestamp: int | None,
+        use_cache: bool = True,
+        protected_headers: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """V2 P2P 多设备 wrap envelope 构造（不发送）。
+
+        thought.put 复用此函数构造与 message.send 相同的 V2 envelope。
+        """
+        from .v2.e2ee.encrypt_p2p import encrypt_p2p_message
+
+        cached = self._v2_bootstrap_cache.get(to) if use_cache else None
+        if cached and (time.time() - cached[1]) < self._V2_BOOTSTRAP_TTL:
+            peer_devices = cached[0]
+            audit_recipients_raw = cached[2] if len(cached) > 2 and isinstance(cached[2], list) else []
+        else:
+            bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
+            peer_devices = bootstrap.get("peer_devices", [])
+            audit_recipients_raw = bootstrap.get("audit_recipients", []) or []
+            if peer_devices:
+                self._v2_bootstrap_cache[to] = (peer_devices, time.time(), audit_recipients_raw)
+
+        if not peer_devices:
+            raise E2EEError(f"V2 bootstrap: no devices found for {to}")
+
+        targets: list[dict[str, Any]] = []
+        for dev in peer_devices:
+            ik_pk_der = base64.b64decode(dev["ik_pk"])
+            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
+            self._v2_session.cache_peer_ik(to, dev.get("device_id", ""), ik_pk_der)
+            targets.append({
+                "aid": to,
+                "device_id": dev.get("device_id", ""),
+                "role": "peer",
+                "key_source": dev.get("key_source", "peer_device_prekey"),
+                "ik_pk_der": ik_pk_der,
+                "spk_pk_der": spk_pk_der,
+                "spk_id": dev.get("spk_id", ""),
+            })
+
+        for dev in audit_recipients_raw:
+            ik_b64 = dev.get("ik_pk")
+            if not ik_b64:
+                continue
+            ik_pk_der = base64.b64decode(ik_b64)
+            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
+            targets.append({
+                "aid": dev.get("aid", ""),
+                "device_id": dev.get("device_id", ""),
+                "role": "audit",
+                "key_source": dev.get("key_source", "peer_device_prekey"),
+                "ik_pk_der": ik_pk_der,
+                "spk_pk_der": spk_pk_der,
+                "spk_id": dev.get("spk_id", ""),
+            })
+
+        # Self-sync：自己其它设备
+        if self._aid and self._aid != to:
+            try:
+                self_cached = self._v2_bootstrap_cache.get(self._aid)
+                if self_cached and (time.time() - self_cached[1]) < self._V2_BOOTSTRAP_TTL:
+                    self_devices = self_cached[0]
+                else:
+                    self_bs = await self.call("message.v2.bootstrap", {"peer_aid": self._aid})
+                    self_devices = self_bs.get("peer_devices", [])
+                    if self_devices:
+                        self._v2_bootstrap_cache[self._aid] = (self_devices, time.time())
+                for dev in self_devices:
+                    dev_id = dev.get("owner_device_id") or dev.get("device_id", "")
+                    if dev_id == self._device_id:
+                        continue
+                    ik_pk_der = base64.b64decode(dev["ik_pk"])
+                    spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
+                    targets.append({
+                        "aid": self._aid,
+                        "device_id": dev_id,
+                        "role": "self_sync",
+                        "key_source": dev.get("key_source", "peer_device_prekey"),
+                        "ik_pk_der": ik_pk_der,
+                        "spk_pk_der": spk_pk_der,
+                        "spk_id": dev.get("spk_id", ""),
+                    })
+            except Exception as exc:
+                self._log.debug("client", "V2 thought self-sync bootstrap failed (non-fatal): %s", exc)
+
+        sender = self._v2_session.get_sender_identity()
+        target_set = {"targets": targets, "audit_recipients": []}
+        envelope = encrypt_p2p_message(
+            sender=sender,
+            target_set=target_set,
+            payload=payload,
+            message_id=message_id,
+            timestamp=timestamp,
+            protected_headers=protected_headers,
+            context=context,
+        )
+        return envelope
+
+    async def _put_message_thought_encrypted_v2(self, params: dict[str, Any]) -> Any:
+        """V2 P2P thought.put：使用 V2 多设备 wrap envelope。
+
+        服务端仍走 message.thought.put（内存 KV），envelope 透传，由接收端单设备解密。
+        """
+        to_aid = str(params.get("to") or "").strip()
+        self._validate_message_recipient(to_aid)
+        payload = params.get("payload")
+        if not to_aid:
+            raise ValidationError("message.thought.put requires to")
+        if not isinstance(payload, dict):
+            raise ValidationError("message.thought.put payload must be an object when encrypt=true")
+
+        thought_id = str(params.get("thought_id") or f"mt-{uuid.uuid4()}").strip()
+        timestamp = int(params.get("timestamp") or time.time() * 1000)
+
+        async def _attempt(use_cache: bool) -> Any:
+            envelope = await self._build_v2_p2p_envelope(
+                to=to_aid,
+                payload=payload,
+                message_id=thought_id,
+                timestamp=timestamp,
+                use_cache=use_cache,
+                context=params.get("context") if isinstance(params.get("context"), dict) else None,
+            )
+            send_params: dict[str, Any] = {
+                "to": to_aid,
+                "payload": envelope,
+                "encrypted": True,
+                "thought_id": thought_id,
+                "timestamp": timestamp,
+            }
+            if "context" in params:
+                send_params["context"] = params["context"]
+            self._sign_client_operation("message.thought.put", send_params)
+            return await self._transport.call("message.thought.put", send_params)
+
+        try:
+            return await _attempt(use_cache=True)
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            if "device" in err_msg or "prekey" in err_msg or "recipient" in err_msg or "stale" in err_msg:
+                self._log.debug("client", "V2 P2P thought put speculative rejected, refreshing bootstrap: %s", exc)
+                self._v2_bootstrap_cache.pop(to_aid, None)
+                return await _attempt(use_cache=False)
+            raise
+
+    async def _build_v2_group_envelope(
+        self,
+        *,
+        group_id: str,
+        payload: dict[str, Any],
+        message_id: str | None,
+        timestamp: int | None,
+        use_cache: bool = True,
+        protected_headers: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """V2 Group 多设备 wrap envelope 构造（不发送）。"""
+        from .v2.e2ee.encrypt_group import encrypt_group_message
+
+        cache_key = f"group:{group_id}"
+        cached = self._v2_bootstrap_cache.get(cache_key) if use_cache else None
+        if cached and (time.time() - cached[1]) < self._V2_GROUP_BOOTSTRAP_TTL:
+            all_devices = cached[0]
+            epoch = cached[2] if len(cached) > 2 else 0
+            state_commitment = cached[5] if len(cached) > 5 else {"state_version": 0, "state_hash": "", "state_chain": ""}
+            audit_recipients_raw = cached[6] if len(cached) > 6 else []
+        else:
+            bootstrap = await self.call("group.v2.bootstrap", {"group_id": group_id})
+            all_devices = bootstrap.get("devices", [])
+            epoch = int(bootstrap.get("epoch", 0))
+            server_chain = str(bootstrap.get("state_chain", "") or "")
+            await self._v2_check_fork(group_id, server_chain)
+            await self._v2_verify_state_signature(group_id, bootstrap)
+            state_commitment = {
+                "state_version": int(bootstrap.get("state_version", 0) or 0),
+                "state_hash": str(bootstrap.get("state_hash_signed") or bootstrap.get("state_hash") or ""),
+                "state_chain": server_chain,
+            }
+            audit_recipients_raw = bootstrap.get("audit_recipients", []) or []
+            pending_adds = set(bootstrap.get("pending_adds", []))
+            committed_aids = set(bootstrap.get("committed_member_aids", []))
+            if all_devices:
+                self._v2_bootstrap_cache[cache_key] = (
+                    all_devices, time.time(), epoch, pending_adds, committed_aids,
+                    state_commitment, audit_recipients_raw,
+                )
+            # lazy sync 触发：发现 pending members 且自己是 owner/admin 时异步发起提案
+            if pending_adds and self._v2_session:
+                self._v2_maybe_trigger_auto_propose(group_id)
+
+        if not all_devices:
+            raise E2EEError(f"V2 group bootstrap: no devices for {group_id}")
+
+        targets: list[dict[str, Any]] = []
+        for dev in all_devices:
+            dev_aid = dev.get("aid", "")
+            dev_id = dev.get("device_id", "")
+            if dev_aid == self._aid and dev_id == self._device_id:
+                continue
+            ik_pk_der = base64.b64decode(dev["ik_pk"])
+            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
+            role = "self_sync" if dev_aid == self._aid else "member"
+            targets.append({
+                "aid": dev_aid,
+                "device_id": dev_id,
+                "role": role,
+                "key_source": dev.get("key_source", "peer_device_prekey"),
+                "ik_pk_der": ik_pk_der,
+                "spk_pk_der": spk_pk_der,
+                "spk_id": dev.get("spk_id", ""),
+            })
+
+        for dev in audit_recipients_raw:
+            ik_b64 = dev.get("ik_pk")
+            if not ik_b64:
+                continue
+            ik_pk_der = base64.b64decode(ik_b64)
+            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
+            targets.append({
+                "aid": dev.get("aid", ""),
+                "device_id": dev.get("device_id", ""),
+                "role": "audit",
+                "key_source": dev.get("key_source", "peer_device_prekey"),
+                "ik_pk_der": ik_pk_der,
+                "spk_pk_der": spk_pk_der,
+                "spk_id": dev.get("spk_id", ""),
+            })
+
+        if not targets:
+            raise E2EEError(f"V2 group: no target devices for {group_id}")
+
+        sender = self._v2_session.get_sender_identity()
+        envelope = encrypt_group_message(
+            sender=sender,
+            group_id=group_id,
+            epoch=epoch,
+            targets=targets,
+            payload=payload,
+            state_commitment=state_commitment,
+            message_id=message_id,
+            timestamp=timestamp,
+            protected_headers=protected_headers,
+            context=context,
+        )
+        return envelope
+
+    async def _put_group_thought_encrypted_v2(self, params: dict[str, Any]) -> Any:
+        """V2 Group thought.put：多设备 wrap envelope。"""
+        group_id = str(params.get("group_id") or "").strip()
+        payload = params.get("payload")
+        if not group_id:
+            raise ValidationError("group.thought.put requires 'group_id'")
+        if not isinstance(payload, dict):
+            raise ValidationError("group.thought.put payload must be an object when encrypt=true")
+
+        thought_id = str(params.get("thought_id") or f"gt-{uuid.uuid4()}").strip()
+        timestamp = int(params.get("timestamp") or time.time() * 1000)
+
+        async def _attempt(use_cache: bool) -> Any:
+            envelope = await self._build_v2_group_envelope(
+                group_id=group_id,
+                payload=payload,
+                message_id=thought_id,
+                timestamp=timestamp,
+                use_cache=use_cache,
+                context=params.get("context") if isinstance(params.get("context"), dict) else None,
+            )
+            send_params: dict[str, Any] = {
+                "group_id": group_id,
+                "payload": envelope,
+                "encrypted": True,
+                "thought_id": thought_id,
+                "timestamp": timestamp,
+            }
+            if "context" in params:
+                send_params["context"] = params["context"]
+            self._sign_client_operation("group.thought.put", send_params)
+            return await self._transport.call("group.thought.put", send_params)
+
+        try:
             return await _attempt(use_cache=True)
         except Exception as exc:
             err_msg = str(exc).lower()
             if "member" in err_msg or "device" in err_msg or "recipient" in err_msg or "stale" in err_msg or "epoch" in err_msg:
-                self._log.debug("client", "group V2 speculative send rejected, refreshing bootstrap: %s", exc)
+                self._log.debug("client", "V2 group thought put speculative rejected, refreshing bootstrap: %s", exc)
                 self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
                 return await _attempt(use_cache=False)
             raise
 
-    async def pull_group_v2(self, group_id: str, after_seq: int = 0, limit: int = 50) -> list[dict[str, Any]]:
-        """拉取并解密 V2 Group 消息。"""
+    async def _decrypt_v2_envelope_for_thought(
+        self,
+        *,
+        envelope: dict[str, Any],
+        from_aid: str,
+    ) -> dict[str, Any] | None:
+        """解密一个 V2 thought envelope（P2P 或 Group），返回 payload dict。
+
+        与 _decrypt_v2_message 不同：
+        - 不依赖 msg.envelope_json 包装
+        - 失败返回 None，不发布 message.undecryptable 事件
+        """
+        from .v2.e2ee.decrypt import decrypt_message as v2_decrypt_message
+
+        if not self._v2_session or not isinstance(envelope, dict):
+            return None
+
+        # 确定接收方 SPK：根据 envelope.recipients 中本设备所引用的 spk_id
+        spk_id = ""
+        recipients = envelope.get("recipients")
+        if isinstance(recipients, list):
+            for row in recipients:
+                if isinstance(row, list) and len(row) >= 6:
+                    if row[0] == self._aid and row[1] == self._device_id:
+                        spk_id = str(row[5] or "")
+                        break
+        ik_priv, spk_priv = self._v2_session.get_decrypt_keys(spk_id)
+
+        sender_device_id = (envelope.get("aad") or {}).get("from_device", "")
+        sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
+        if not sender_pub_der:
+            try:
+                bs = await self.call("message.v2.bootstrap", {"peer_aid": from_aid})
+                for dev in bs.get("peer_devices", []):
+                    dev_id = dev.get("device_id") or dev.get("owner_device_id", "")
+                    ik_der = base64.b64decode(dev["ik_pk"])
+                    self._v2_session.cache_peer_ik(from_aid, dev_id, ik_der)
+                sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
+            except Exception as exc:
+                self._log.warn("client", "V2 thought decrypt: bootstrap sender %s failed: %s", from_aid, exc)
+        # CA fallback：bootstrap 拿不到时从 CA 拉证书提取 IK 公钥
+        if not sender_pub_der and from_aid:
+            try:
+                cert_pem = await self._fetch_peer_cert(from_aid)
+                if cert_pem:
+                    from cryptography import x509
+                    from cryptography.hazmat.primitives import serialization as _ser
+                    cert = x509.load_pem_x509_certificate(cert_pem)
+                    sender_pub_der = cert.public_key().public_bytes(
+                        encoding=_ser.Encoding.DER,
+                        format=_ser.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    if sender_device_id:
+                        self._v2_session.cache_peer_ik(from_aid, sender_device_id, sender_pub_der)
+                    self._log.debug("client", "V2 thought decrypt: sender IK fallback from CA cert for %s", from_aid)
+            except Exception as exc:
+                self._log.warn("client", "V2 thought decrypt: CA fallback for %s failed: %s", from_aid, exc)
+        if not sender_pub_der:
+            self._log.warn("client", "V2 thought decrypt: no sender IK for %s device=%s", from_aid, sender_device_id)
+            return None
+
+        try:
+            return v2_decrypt_message(
+                envelope=envelope,
+                self_aid=self._aid,
+                self_device_id=self._device_id,
+                self_ik_priv=ik_priv,
+                self_spk_priv=spk_priv,
+                sender_pub_der=sender_pub_der,
+            )
+        except Exception as exc:
+            self._log.warn("client", "V2 thought decrypt failed from=%s: %s", from_aid, exc)
+            return None
+
+    async def _pull_group_v2_internal(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """V2 Group 拉取并解密消息。内部方法，由 call("group.pull") 路由调用。
+
+        注：明文消息（encrypt=False）由服务端 group.v2.pull 自动从 group_messages
+        合并到返回结果（version=v1，明文 payload 直接 publish），密文走 V2 解密。
+        """
         if not self._v2_session:
             raise StateError("V2 session not initialized (not connected?)")
+
+        group_id = str(params.get("group_id") or "").strip()
+        after_seq = int(params.get("after_seq", 0) or 0)
+        limit = int(params.get("limit", 50) or 50)
 
         ns = f"group:{group_id}"
         effective_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
@@ -7407,23 +4047,70 @@ class AUNClient:
             "limit": limit,
         })
         messages = result.get("messages", [])
+        seqs = [
+            int(m.get("seq") or 0)
+            for m in messages
+            if isinstance(m, dict) and int(m.get("seq") or 0) > 0
+        ]
+        contig_before = self._seq_tracker.get_contiguous_seq(ns)
+        if seqs and seqs[0] > contig_before:
+            self._seq_tracker.force_contiguous_seq(ns, seqs[0])
+
         decrypted = []
-        max_seq = effective_after_seq
         for msg in messages:
             seq = msg.get("seq", 0)
-            if seq > max_seq:
-                max_seq = seq
-            plaintext = await self._decrypt_v2_message(msg)
-            if plaintext is not None:
-                plaintext["group_id"] = group_id
-                decrypted.append(plaintext)
-        if ns and max_seq > self._seq_tracker.get_contiguous_seq(ns):
-            self._seq_tracker.restore_state({ns: max_seq})
-            self._persist_seq(ns)
-        return decrypted
+            if seq <= 0:
+                continue
 
-    async def ack_group_v2(self, group_id: str, up_to_seq: int | None = None) -> dict[str, Any]:
-        """确认 V2 群消息已消费。"""
+            # 服务端合并的 V1 明文行：version=v1 + payload 已是明文
+            if str(msg.get("version", "") or "") == "v1":
+                payload = msg.get("payload")
+                if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
+                    # 兜底：V1 加密 envelope 在 V2-only 客户端跳过
+                    continue
+                v1_msg = {
+                    "message_id": msg.get("message_id", ""),
+                    "from": msg.get("from_aid", ""),
+                    "group_id": group_id,
+                    "seq": seq,
+                    "type": msg.get("type", ""),
+                    "timestamp": msg.get("t_server", 0),
+                    "payload": payload,
+                    "encrypted": False,
+                }
+                await self._publish_pulled_message("group.message_created", ns, seq, v1_msg)
+                decrypted.append(v1_msg)
+                continue
+
+            # V2 加密消息：解密
+            plaintext = await self._decrypt_v2_message(msg)
+            if plaintext is None:
+                # V2 解密失败：跳过并推进 seq tracker（避免卡 contiguous_seq）
+                continue
+            plaintext["group_id"] = group_id
+            await self._publish_pulled_message("group.message_created", ns, seq, plaintext)
+            decrypted.append(plaintext)
+
+        if seqs:
+            max_seq = max(seqs)
+            current_contig = self._seq_tracker.get_contiguous_seq(ns)
+            if max_seq > current_contig:
+                self._seq_tracker.force_contiguous_seq(ns, max_seq)
+                await self._drain_ordered_messages(ns)
+
+        contig = self._seq_tracker.get_contiguous_seq(ns)
+        if contig != contig_before:
+            self._persist_seq(ns)
+        if contig > 0 and contig != contig_before:
+            self._fire_ack("group.v2.ack", {
+                "group_id": group_id, "up_to_seq": contig,
+            }, f"V2 群消息 auto-ack group={group_id}")
+        return {"messages": decrypted}
+
+    async def _ack_group_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
+        """V2 Group 确认消费。内部方法，由 call("group.ack_messages") 路由调用。"""
+        group_id = str(params.get("group_id") or "").strip()
+        up_to_seq = int(params.get("msg_seq", 0) or params.get("up_to_seq", 0) or 0)
         ns = f"group:{group_id}"
         seq = up_to_seq or (self._seq_tracker.get_contiguous_seq(ns) if ns else 0)
         if seq <= 0:
@@ -7469,11 +4156,9 @@ class AUNClient:
             if cached_exp is not None and cached_exp > now_ts:
                 self._log.debug("client", "V2 state signature cache hit: group=%s sv=%d", group_id, state_version)
             else:
-                # 获取 actor 证书
-                cert_result = await self.call("ca.get_cert", {"aid": actor_aid})
-                cert_pem = ""
-                if isinstance(cert_result, dict):
-                    cert_pem = str(cert_result.get("cert_pem") or cert_result.get("cert") or "")
+                # 获取 actor 证书（通过 HTTP PKI 端点，不走 ca.get_cert RPC）
+                cert_pem_bytes = await self._fetch_peer_cert(actor_aid)
+                cert_pem = cert_pem_bytes.decode("utf-8") if isinstance(cert_pem_bytes, bytes) else str(cert_pem_bytes or "")
                 if not cert_pem:
                     self._log.warn("client", "V2 state verify: no cert for actor=%s, group=%s", actor_aid, group_id)
                     raise E2EEError(f"V2 state verify: cannot fetch actor cert for {actor_aid}")
@@ -7569,7 +4254,116 @@ class AUNClient:
         except Exception as exc:
             self._log.debug("client", "V2 fork check failed (non-fatal): %s", exc)
 
-    async def _v2_auto_propose_state(self, group_id: str) -> None:
+    def _v2_maybe_trigger_auto_propose(self, group_id: str) -> None:
+        """lazy sync 路径：发现 pending members 时异步触发 auto propose（fire-and-forget，去重）。"""
+        now = time.time()
+        last = self._v2_lazy_propose_triggered.get(group_id, 0.0)
+        if now - last < 10.0:
+            return
+        self._v2_lazy_propose_triggered[group_id] = now
+        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+        loop.create_task(self._v2_auto_propose_state(group_id, leader_delay=True))
+
+    async def _v2_auto_propose_state(self, group_id: str, *, leader_delay: bool = False) -> None:
+        normalized_group_id = _normalize_group_id(str(group_id or "").strip()) if group_id else ""
+        if not normalized_group_id:
+            return
+        if leader_delay:
+            should_continue = await self._v2_auto_propose_leader_delay(normalized_group_id)
+            if not should_continue:
+                return
+        async with self._v2_auto_propose_locks_guard:
+            lock = self._v2_auto_propose_locks.get(normalized_group_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._v2_auto_propose_locks[normalized_group_id] = lock
+        async with lock:
+            await self._do_v2_auto_propose_state(normalized_group_id)
+
+    async def _v2_auto_propose_leader_delay(self, group_id: str) -> bool:
+        """事件触发路径的 leader 选举：仅在线 owner/admin 参与，leader 立即提案，非 leader jitter 后兜底。"""
+        try:
+            members_resp = await self.call("group.get_online_members", {"group_id": group_id})
+            members = members_resp.get("members") or members_resp.get("items") or members_resp.get("online_members") or []
+            my_aid = self._aid or ""
+            my_role = ""
+            online_admin_aids: list[str] = []
+            for m in members:
+                if not isinstance(m, dict):
+                    continue
+                aid = str(m.get("aid") or "").strip()
+                role = str(m.get("role") or "").strip()
+                if not aid:
+                    continue
+                if "online" in m and not m.get("online"):
+                    continue
+                if role in ("owner", "admin"):
+                    online_admin_aids.append(aid)
+                if aid == my_aid:
+                    my_role = role
+            online_admin_aids = sorted(set(online_admin_aids))
+            if my_role not in ("owner", "admin"):
+                return False
+
+            bootstrap_resp = await self.call("group.v2.bootstrap", {"group_id": group_id})
+            devices = bootstrap_resp.get("devices", []) if isinstance(bootstrap_resp, dict) else []
+            online_admin_set = set(online_admin_aids)
+            candidates: list[str] = []
+            for dev in devices:
+                if not isinstance(dev, dict):
+                    continue
+                aid = str(dev.get("aid") or "").strip()
+                device_id = str(dev.get("device_id") or "").strip()
+                if aid in online_admin_set and device_id:
+                    candidates.append(f"{aid}\x1f{device_id}")
+            if not candidates:
+                candidates = [f"{aid}\x1f" for aid in online_admin_aids]
+            my_key = f"{my_aid}\x1f{self._device_id or ''}"
+            if my_key not in candidates:
+                candidates.append(my_key)
+            leader = sorted(set(candidates))[0]
+            if leader == my_key:
+                self._log.debug("client", "V2 auto propose leader elected: group=%s leader=%s", group_id, leader)
+                return True
+
+            seed = f"{group_id}\0{my_key}".encode("utf-8")
+            delay_ms = 2000 + (int.from_bytes(hashlib.sha256(seed).digest()[:4], "big") % 4000)
+            self._log.debug(
+                "client",
+                "V2 auto propose non-leader delay: group=%s leader=%s self=%s delay_ms=%d",
+                group_id, leader, my_key, delay_ms,
+            )
+            await asyncio.sleep(delay_ms / 1000)
+            return True
+        except Exception as exc:
+            self._log.debug("client", "V2 auto propose leader check failed, fallback immediate: group=%s err=%s", group_id, exc)
+            return True
+
+    def _v2_verify_committed_state_base(self, group_id: str, state_resp: dict[str, Any]) -> bool:
+        current_sv = int(state_resp.get("state_version") or 0)
+        if current_sv <= 0:
+            return True
+        current_sh = str(state_resp.get("state_hash") or "").strip()
+        membership_snapshot = str(state_resp.get("membership_snapshot") or "").strip()
+        if not current_sh or not membership_snapshot:
+            self._log.warn("client", "V2 committed state base incomplete: group=%s sv=%d", group_id, current_sv)
+            return False
+        try:
+            parsed = json.loads(membership_snapshot)
+            if not isinstance(parsed, dict):
+                self._log.warn("client", "V2 committed state base snapshot is not object: group=%s sv=%d", group_id, current_sv)
+                return False
+            from .v2.state.commitment import compute_state_commitment
+            computed = compute_state_commitment(group_id, current_sv, parsed)
+            if computed != current_sh:
+                self._log.warn("client", "V2 committed state base hash mismatch: group=%s sv=%d", group_id, current_sv)
+                return False
+            return True
+        except Exception as exc:
+            self._log.warn("client", "V2 committed state base verification failed: group=%s sv=%d err=%s", group_id, current_sv, exc)
+            return False
+
+    async def _do_v2_auto_propose_state(self, group_id: str) -> None:
         """成员变更后自动 propose state（仅 owner/admin 执行）。
 
         使用完整 state commitment（覆盖 members+devices, audit_aids, admin_set,
@@ -7597,6 +4391,21 @@ class AUNClient:
 
             if my_role not in ("owner", "admin"):
                 return
+
+            # 前置检查：如果已有 pending proposal，先尝试 confirm 而非重复 propose
+            proposal_resp = await self.call("group.v2.get_proposal", {"group_id": group_id})
+            if isinstance(proposal_resp, dict):
+                pending_proposal = proposal_resp.get("proposal")
+                if isinstance(pending_proposal, dict) and pending_proposal.get("proposal_id"):
+                    confirmed = await self._v2_confirm_pending_proposal(group_id)
+                    if confirmed:
+                        return
+                    auto_confirm_at = int(pending_proposal.get("auto_confirm_at") or 0)
+                    now_ms = int(time.time() * 1000)
+                    if auto_confirm_at > now_ms:
+                        wait_s = min((auto_confirm_at - now_ms) / 1000 + 0.5, 35.0)
+                        self._log.debug("client", "V2 auto propose: pending proposal exists, waiting %.1fs group=%s", wait_s, group_id)
+                        await asyncio.sleep(wait_s)
 
             # 获取群所有成员的设备列表（V2 bootstrap）
             bootstrap_resp = await self.call("group.v2.bootstrap", {"group_id": group_id})
@@ -7637,6 +4446,8 @@ class AUNClient:
             state_resp = await self.call("group.get_state", {"group_id": group_id})
             if not isinstance(state_resp, dict):
                 return
+            if not self._v2_verify_committed_state_base(group_id, state_resp):
+                return
             current_sv = int(state_resp.get("state_version", 0))
             current_sh = str(state_resp.get("state_hash", ""))
             key_epoch = int(state_resp.get("key_epoch", 0))
@@ -7647,6 +4458,12 @@ class AUNClient:
 
             # 签名 state proposal（绑定完整 state_payload）
             membership_snapshot = json.dumps(state_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if self._v2_auto_propose_last_snapshot.get(group_id) == membership_snapshot:
+                return
+            current_membership_snapshot = str(state_resp.get("membership_snapshot") or "")
+            if current_membership_snapshot and current_membership_snapshot == membership_snapshot:
+                self._v2_auto_propose_last_snapshot[group_id] = membership_snapshot
+                return
             signature = ""
             identity = self._identity
             if identity and identity.get("private_key_pem"):
@@ -7665,7 +4482,7 @@ class AUNClient:
                 except Exception as _sig_exc:
                     self._log.debug("client", "propose_state signature failed: %s", _sig_exc)
 
-            await self.call("group.v2.propose_state", {
+            propose_result = await self.call("group.v2.propose_state", {
                 "group_id": group_id,
                 "state_version": current_sv + 1,
                 "key_epoch": key_epoch,
@@ -7677,16 +4494,89 @@ class AUNClient:
                 "auto_confirm_seconds": 30,
             })
             self._log.debug("client", "V2 auto propose_state: group=%s sv=%d", group_id, current_sv + 1)
+            # 单 owner/admin 签即可生效：propose 成功后立即 confirm
+            proposal_id = ""
+            if isinstance(propose_result, dict):
+                proposal_id = str(propose_result.get("proposal_id") or "").strip()
+            if proposal_id:
+                try:
+                    await self.call("group.v2.confirm_state", {"proposal_id": proposal_id})
+                    self._v2_auto_propose_last_snapshot[group_id] = membership_snapshot
+                    self._log.debug("client", "V2 auto confirm_state: group=%s proposal=%s", group_id, proposal_id)
+                except Exception as confirm_exc:
+                    self._log.debug("client", "V2 auto confirm_state failed (non-fatal): group=%s err=%s", group_id, confirm_exc)
         except Exception as exc:
             self._log.debug("client", "V2 auto propose_state failed (non-fatal): group=%s err=%s", group_id, exc)
 
+    def _v2_verify_pending_proposal_against_base(
+        self,
+        group_id: str,
+        proposal: dict[str, Any],
+        state_resp: dict[str, Any],
+    ) -> bool:
+        if not self._v2_verify_committed_state_base(group_id, state_resp):
+            return False
+        current_sv = int(state_resp.get("state_version") or 0)
+        current_sh = str(state_resp.get("state_hash") or "").strip()
+        proposal_sv = int(proposal.get("state_version") or 0)
+        proposal_hash = str(proposal.get("state_hash") or "").strip()
+        proposal_prev = str(proposal.get("prev_state_hash") or "").strip()
+        membership_snapshot = str(proposal.get("membership_snapshot") or "").strip()
+        if proposal_sv != current_sv + 1 or proposal_prev != current_sh or not proposal_hash or not membership_snapshot:
+            self._log.warn(
+                "client",
+                "V2 pending proposal base mismatch: group=%s current_sv=%d proposal_sv=%d",
+                group_id, current_sv, proposal_sv,
+            )
+            return False
+        try:
+            parsed = json.loads(membership_snapshot)
+            if not isinstance(parsed, dict):
+                return False
+            from .v2.state.commitment import compute_state_commitment
+            computed = compute_state_commitment(group_id, proposal_sv, parsed)
+            if computed != proposal_hash:
+                self._log.warn("client", "V2 pending proposal hash mismatch: group=%s proposal_sv=%d", group_id, proposal_sv)
+                return False
+            return True
+        except Exception as exc:
+            self._log.warn("client", "V2 pending proposal verification failed: group=%s err=%s", group_id, exc)
+            return False
+
+    async def _v2_confirm_pending_proposal(self, group_id: str) -> bool:
+        proposal_resp = await self.call("group.v2.get_proposal", {"group_id": group_id})
+        proposal = proposal_resp.get("proposal") if isinstance(proposal_resp, dict) else None
+        if not isinstance(proposal, dict):
+            return False
+        proposal_id = str(proposal.get("proposal_id") or "").strip()
+        if not proposal_id:
+            return False
+
+        state_resp = await self.call("group.get_state", {"group_id": group_id})
+        if not isinstance(state_resp, dict):
+            return False
+        current_sv = int(state_resp.get("state_version") or 0)
+        proposal_sv = int(proposal.get("state_version") or 0)
+        if proposal_sv <= current_sv:
+            self._log.debug(
+                "client",
+                "V2 pending proposal already settled: group=%s current_sv=%d proposal_sv=%d",
+                group_id, current_sv, proposal_sv,
+            )
+            return False
+        if not self._v2_verify_pending_proposal_against_base(group_id, proposal, state_resp):
+            return False
+
+        await self.call("group.v2.confirm_state", {"proposal_id": proposal_id})
+        self._log.info("client", "V2 confirmed pending proposal: group=%s proposal=%s", group_id, proposal_id)
+        return True
+
     async def _v2_auto_confirm_pending_proposals(self) -> None:
-        """Owner 上线时自动检查并签名确认 pending state proposals。"""
+        """Owner/admin 上线时自动检查：confirm pending proposals 或发起新 propose。"""
         try:
             my_aid = self._aid or ""
             if not my_aid:
                 return
-            # 获取我参与的群列表
             groups_resp = await self.call("group.list_my", {})
             groups = groups_resp.get("groups") or groups_resp.get("items") or []
             for g in groups:
@@ -7697,31 +4587,70 @@ class AUNClient:
                 if not group_id or my_role not in ("owner", "admin"):
                     continue
                 try:
-                    proposal_resp = await self.call("group.v2.get_proposal", {"group_id": group_id})
-                    proposal = proposal_resp.get("proposal")
-                    if not proposal:
-                        continue
-                    proposal_id = proposal.get("proposal_id", "")
-                    if not proposal_id:
-                        continue
-                    # 签名确认
-                    await self.call("group.v2.confirm_state", {"proposal_id": proposal_id})
-                    self._log.info("client", "V2 auto confirmed pending proposal: group=%s proposal=%s", group_id, proposal_id)
+                    confirmed = await self._v2_confirm_pending_proposal(group_id)
+                    if not confirmed:
+                        # 没有 pending proposal，检查是否有 pending members 需要发起新 propose
+                        await self._v2_auto_propose_state(group_id)
                 except Exception as exc:
-                    self._log.debug("client", "V2 auto confirm proposal failed (non-fatal): group=%s err=%s", group_id, exc)
+                    self._log.debug("client", "V2 auto confirm/propose failed (non-fatal): group=%s err=%s", group_id, exc)
         except Exception as exc:
             self._log.debug("client", "V2 auto confirm pending proposals failed (non-fatal): %s", exc)
 
-    async def _on_v2_push_notification(self, data: Any) -> None:
-        """处理 V2 push 通知：自动 pull + decrypt + emit。"""
-        if not self._v2_session:
+    async def _on_v2_state_proposed(self, data: Any) -> None:
+        if not isinstance(data, dict) or not self._v2_session:
             return
+        group_id = str(data.get("group_id") or "").strip()
+        if not group_id:
+            return
+        await self._dispatcher.publish("group.v2.state_proposed", data)
         try:
-            messages = await self.pull_v2()
-            for msg in messages:
-                await self._dispatcher.publish("message.received", msg)
+            await self._v2_confirm_pending_proposal(group_id)
+        except Exception as exc:
+            self._log.debug("client", "V2 state_proposed handling failed (non-fatal): group=%s err=%s", group_id, exc)
+
+    async def _on_v2_state_retry_needed(self, data: Any) -> None:
+        if not isinstance(data, dict) or not self._v2_session:
+            return
+        group_id = str(data.get("group_id") or "").strip()
+        if not group_id:
+            return
+        await self._dispatcher.publish("group.v2.state_retry_needed", data)
+        try:
+            await self._v2_auto_propose_state(group_id, leader_delay=True)
+        except Exception as exc:
+            self._log.debug("client", "V2 state_retry_needed handling failed (non-fatal): group=%s err=%s", group_id, exc)
+
+    async def _on_v2_state_confirmed(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        group_id = str(data.get("group_id") or "").strip()
+        if group_id:
+            self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
+            self._v2_auto_propose_last_snapshot.pop(group_id, None)
+        await self._dispatcher.publish("group.v2.state_confirmed", data)
+
+    async def _on_v2_push_notification(self, data: Any) -> None:
+        """处理 V2 push 通知：自动 pull + decrypt + emit。
+        only one in flight：用 dedup_key 保证同一时间只有一个 pull 在执行。
+        """
+        if not self._v2_session:
+            self._log.debug("client", "_on_v2_push_notification skipped: no v2_session")
+            return
+        ns = f"p2p:{self._aid}" if self._aid else ""
+        after_seq = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
+        dedup_key = f"p2p_pull:{ns}"
+        if dedup_key in self._gap_fill_done:
+            self._log.debug("client", "_on_v2_push_notification skipped: dedup_key=%s already in flight", dedup_key)
+            return
+        self._gap_fill_done[dedup_key] = time.time()
+        self._log.debug("client", "_on_v2_push_notification executing: dedup_key=%s after_seq=%d", dedup_key, after_seq)
+        try:
+            await self._pull_v2_internal({})
+            self._log.debug("client", "_on_v2_push_notification pull done, new contiguous=%d", self._seq_tracker.get_contiguous_seq(ns) if ns else -1)
         except Exception as exc:
             self._log.warn("client", "V2 push auto-pull failed: %s", exc)
+        finally:
+            self._gap_fill_done.pop(dedup_key, None)
 
     async def _decrypt_v2_message(self, msg: dict[str, Any]) -> dict[str, Any] | None:
         """解密单条 V2 消息。
@@ -7749,14 +4678,20 @@ class AUNClient:
         else:
             spk_id = ""
 
+        self._log.info("client", "DEBUG _decrypt_v2_message: seq=%s spk_id=%s from=%s has_recipient=%s has_recipients=%s",
+                       msg.get("seq"), spk_id or "<empty>", msg.get("from_aid", ""),
+                       "recipient" in envelope, "recipients" in envelope)
+
         ik_priv, spk_priv = self._v2_session.get_decrypt_keys(spk_id)
+        self._log.info("client", "DEBUG _decrypt_v2_message: ik_priv=%d bytes spk_priv=%s",
+                       len(ik_priv) if ik_priv else 0, f"{len(spk_priv)} bytes" if spk_priv else "None")
 
         # 获取 sender IK 公钥（按 sender device_id 精确匹配）
         from_aid = msg.get("from_aid", "")
         sender_device_id = envelope.get("aad", {}).get("from_device", "")
         sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
         if not sender_pub_der:
-            # 尝试 bootstrap 获取
+            # 尝试 bootstrap 获取（V2 设备列表）
             try:
                 bs = await self.call("message.v2.bootstrap", {"peer_aid": from_aid})
                 for dev in bs.get("peer_devices", []):
@@ -7767,6 +4702,26 @@ class AUNClient:
                 sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
             except Exception as exc:
                 self._log.warn("client", "V2 decrypt: bootstrap for sender %s failed: %s", from_aid, exc)
+
+        # CA fallback：bootstrap 拿不到对端 SPK 时（对端从未 V2 上线 / 不同 device），
+        # 从 CA 拉对端 AID 证书 → 公钥即 IK 公钥（V2 设计：IK = AID 长期密钥）
+        if not sender_pub_der and from_aid:
+            try:
+                cert_pem = await self._fetch_peer_cert(from_aid)
+                if cert_pem:
+                    from cryptography import x509
+                    from cryptography.hazmat.primitives import serialization as _ser
+                    cert = x509.load_pem_x509_certificate(cert_pem)
+                    sender_pub_der = cert.public_key().public_bytes(
+                        encoding=_ser.Encoding.DER,
+                        format=_ser.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    # 缓存到 V2 session（同一 AID 的所有 device 共享 IK）
+                    if sender_device_id:
+                        self._v2_session.cache_peer_ik(from_aid, sender_device_id, sender_pub_der)
+                    self._log.debug("client", "V2 decrypt: sender IK fallback from CA cert for %s", from_aid)
+            except Exception as exc:
+                self._log.warn("client", "V2 decrypt: CA fallback for %s failed: %s", from_aid, exc)
 
         if not sender_pub_der:
             self._log.warn("client", "V2 decrypt: no sender IK for %s, cannot verify signature", from_aid)
@@ -7801,6 +4756,8 @@ class AUNClient:
             return None
 
         # SPK 轮换：当前活跃 SPK 被消费后立即轮换（后台执行，不阻塞消息处理）
+        self._log.info("client", "DEBUG SPK rotation check: spk_id=%s current=%s is_current=%s",
+                       spk_id, self._v2_session._spk_id, self._v2_session.is_current_spk(spk_id))
         if self._v2_session.is_current_spk(spk_id):
             async def _do_rotate():
                 try:
@@ -7822,5 +4779,7 @@ class AUNClient:
             "e2ee": {
                 "version": "v2",
                 "suite": envelope.get("suite", ""),
+                "encryption_mode": "v2_" + envelope.get("suite", "unknown"),
+                "forward_secrecy": True,
             },
         }

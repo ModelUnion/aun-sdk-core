@@ -174,22 +174,6 @@ export class E2EEDecryptFailedError extends E2EEError {
 
 // ── 群组 E2EE 错误 ────────────────────────────────────────────
 
-/** 缺少该群的 group_secret */
-export class E2EEGroupSecretMissingError extends E2EEError {
-  constructor(message: string = 'group secret missing', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
-    super(message, { ...opts, code: -32040, localCode: 'E2EE_GROUP_SECRET_MISSING' });
-    this.name = 'E2EEGroupSecretMissingError';
-  }
-}
-
-/** 消息 epoch 与本地不匹配 */
-export class E2EEGroupEpochMismatchError extends E2EEError {
-  constructor(message: string = 'group epoch mismatch', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {
-    super(message, { ...opts, code: -32041, localCode: 'E2EE_GROUP_EPOCH_MISMATCH' });
-    this.name = 'E2EEGroupEpochMismatchError';
-  }
-}
-
 /** Membership Commitment 验证失败 */
 export class E2EEGroupCommitmentInvalidError extends E2EEError {
   constructor(message: string = 'group commitment invalid', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {

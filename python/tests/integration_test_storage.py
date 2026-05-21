@@ -129,7 +129,24 @@ async def _http_request(url: str, *, method: str = "GET", payload: bytes | None 
         req = urllib.request.Request(url, data=payload, method=method)
         for key, value in (headers or {}).items():
             req.add_header(key, value)
-        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+
+        class _AllMethodRedirectHandler(urllib.request.HTTPRedirectHandler):
+            """跟随所有 HTTP 方法的 302/307 重定向（urllib 默认只跟随 GET/HEAD）。"""
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                m = req.get_method()
+                if code in (301, 302, 303, 307, 308) and m in ("PUT", "POST", "DELETE", "PATCH"):
+                    newreq = urllib.request.Request(
+                        newurl, data=req.data, method=m,
+                        headers={k: v for k, v in req.header_items() if k.lower() != "host"},
+                    )
+                    return newreq
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            _AllMethodRedirectHandler(),
+        )
+        with opener.open(req, timeout=20) as resp:
             return int(resp.status), resp.read()
 
     return await asyncio.to_thread(_run)

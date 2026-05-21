@@ -222,6 +222,7 @@ describe('AuthNamespace agent.md', () => {
       ok: true,
       status: 200,
       text: async () => '# Bob\n',
+      headers: new Headers(),
     });
     vi.stubGlobal('fetch', fetchMock);
 

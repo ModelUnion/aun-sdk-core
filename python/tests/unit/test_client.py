@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import pytest
@@ -581,8 +582,9 @@ def test_no_callable_prefix_restriction():
 
 
 def test_e2ee_property():
+    """V1 E2EE Manager 已移除，e2ee property 不再存在。"""
     client = AUNClient()
-    assert client.e2ee is not None
+    assert not hasattr(client, "e2ee")
 
 
 def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
@@ -879,173 +881,6 @@ def test_call_rejects_message_slot_context_override():
         }))
 
 
-def test_fetch_peer_prekey_returns_none_when_missing():
-    client = AUNClient()
-
-    async def _fake_call(method, params):
-        assert method == "message.e2ee.get_prekey"
-        assert params == {"aid": "bob.remote.example"}
-        return {"found": False}
-
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
-
-    assert result is None
-
-
-def test_fetch_peer_prekey_accepts_device_prekeys_response():
-    client = AUNClient()
-
-    async def _fake_call(method, params):
-        assert method == "message.e2ee.get_prekey"
-        return {
-            "found": True,
-            "device_prekeys": [
-                {
-                    "device_id": "device-b",
-                    "prekey_id": "pk-b",
-                    "public_key": "pub-b",
-                    "signature": "sig-b",
-                    "cert_fingerprint": "sha256:b",
-                },
-                {
-                    "device_id": "device-a",
-                    "prekey_id": "pk-a",
-                    "public_key": "pub-a",
-                    "signature": "sig-a",
-                    "cert_fingerprint": "sha256:a",
-                },
-            ],
-        }
-
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
-    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
-
-    assert result["device_id"] == "device-b"
-    assert result["prekey_id"] == "pk-b"
-    assert [item["device_id"] for item in all_prekeys] == ["device-b", "device-a"]
-
-
-def test_fetch_peer_prekey_normalizes_single_empty_device_id():
-    client = AUNClient()
-
-    async def _fake_call(method, params):
-        assert method == "message.e2ee.get_prekey"
-        return {
-            "found": True,
-            "device_prekeys": [
-                {
-                    "device_id": "",
-                    "prekey_id": "pk-legacy",
-                    "public_key": "pub-legacy",
-                    "signature": "sig-legacy",
-                    "cert_fingerprint": "sha256:legacy",
-                }
-            ],
-        }
-
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
-    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
-
-    assert result is not None
-    assert result["device_id"] == "aun_device_id"
-    assert result["prekey_id"] == "pk-legacy"
-    assert [item["device_id"] for item in all_prekeys] == ["aun_device_id"]
-
-
-def test_fetch_peer_prekey_filters_empty_device_id_in_multi_device_response():
-    client = AUNClient()
-
-    async def _fake_call(method, params):
-        assert method == "message.e2ee.get_prekey"
-        return {
-            "found": True,
-            "device_prekeys": [
-                {
-                    "device_id": "",
-                    "prekey_id": "pk-empty",
-                    "public_key": "pub-empty",
-                    "signature": "sig-empty",
-                },
-                {
-                    "device_id": "device-b",
-                    "prekey_id": "pk-b",
-                    "public_key": "pub-b",
-                    "signature": "sig-b",
-                },
-            ],
-        }
-
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
-    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
-
-    assert result["device_id"] == "device-b"
-    assert [item["device_id"] for item in all_prekeys] == ["device-b"]
-
-
-def test_fetch_peer_prekey_filters_fallback_device_id_in_multi_device_response():
-    client = AUNClient()
-
-    async def _fake_call(method, params):
-        assert method == "message.e2ee.get_prekey"
-        return {
-            "found": True,
-            "device_prekeys": [
-                {
-                    "device_id": "aun_device_id",
-                    "prekey_id": "pk-legacy",
-                    "public_key": "pub-legacy",
-                    "signature": "sig-legacy",
-                },
-                {
-                    "device_id": "device-b",
-                    "prekey_id": "pk-b",
-                    "public_key": "pub-b",
-                    "signature": "sig-b",
-                },
-            ],
-        }
-
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
-    all_prekeys = asyncio.run(client._fetch_peer_prekeys("bob.remote.example"))
-
-    assert result["device_id"] == "device-b"
-    assert [item["device_id"] for item in all_prekeys] == ["device-b"]
-
-
-def test_fetch_peer_prekey_query_failure_raises_validation_error():
-    client = AUNClient()
-
-    async def _fake_call(method, params):
-        raise RuntimeError("network down")
-
-    client._transport.call = _fake_call
-
-    with pytest.raises(ValidationError, match="failed to fetch peer prekey for bob.remote.example: network down"):
-        asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
-
-
-def test_fetch_peer_prekey_invalid_response_raises_validation_error():
-    client = AUNClient()
-
-    async def _fake_call(method, params):
-        return {"found": True}
-
-    client._transport.call = _fake_call
-
-    with pytest.raises(ValidationError, match="invalid prekey response for bob.remote.example"):
-        asyncio.run(client._fetch_peer_prekey("bob.remote.example"))
-
-
 def test_build_cert_url_with_cert_fingerprint():
     url = AUNClient._build_cert_url(
         "wss://gateway.example.com/aun",
@@ -1053,114 +888,6 @@ def test_build_cert_url_with_cert_fingerprint():
         "sha256:abc",
     )
     assert url == "https://gateway.example.com/pki/cert/bob.example.com?cert_fingerprint=sha256%3Aabc"
-
-
-def test_send_encrypted_fetches_peer_cert_by_prekey_fingerprint(monkeypatch):
-    client = AUNClient()
-    client._gateway_url = "wss://gateway.example.com/aun"
-
-    calls = []
-
-    async def _fake_fetch_peer_prekeys(peer_aid):
-        assert peer_aid == "bob.example.com"
-        return [{
-            "device_id": "aun_device_id",
-            "prekey_id": "pk-1",
-            "public_key": "pub",
-            "signature": "sig",
-            "cert_fingerprint": "sha256:abc",
-        }]
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        calls.append((aid, cert_fingerprint))
-        return b"PEM"
-
-    def _fake_encrypt_copy_payload(**kwargs):
-        assert kwargs["prekey"]["cert_fingerprint"] == "sha256:abc"
-        return {"ciphertext": "ok"}, {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2"}
-
-    async def _fake_call(method, params):
-        assert method == "message.send"
-        return {"ok": True}
-
-    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._send_encrypted({
-        "to": "bob.example.com",
-        "payload": {"type": "text", "text": "hello"},
-    }))
-
-    assert result == {"ok": True}
-    assert calls == [("bob.example.com", "sha256:abc")]
-
-
-def test_message_thought_put_encrypts_and_signs(monkeypatch):
-    client = AUNClient()
-    client._state = "connected"
-    captured = {}
-
-    async def _fake_fetch_peer_prekey(peer_aid):
-        assert peer_aid == "bob.example.com"
-        return {"prekey_id": "pk-1", "cert_fingerprint": "sha256:abc"}
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        assert (aid, cert_fingerprint) == ("bob.example.com", "sha256:abc")
-        return b"PEM"
-
-    def _fake_encrypt_copy_payload(**kwargs):
-        assert kwargs["logical_to_aid"] == "bob.example.com"
-        assert kwargs["message_id"].startswith("mt-")
-        return {"type": "e2ee.encrypted", "ciphertext": "ok"}, {
-            "encrypted": True,
-            "forward_secrecy": True,
-            "mode": "prekey_ecdh_v2",
-        }
-
-    def _fake_sign(method, params):
-        assert method == "message.thought.put"
-        params["client_signature"] = {"aid": "alice.example.com"}
-
-    async def _fake_call(method, params):
-        captured["method"] = method
-        captured["params"] = params
-        return {"ok": True}
-
-    monkeypatch.setattr(client, "_fetch_peer_prekey", _fake_fetch_peer_prekey)
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
-    monkeypatch.setattr(client, "_sign_client_operation", _fake_sign)
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client.call("message.thought.put", {
-        "to": "bob.example.com",
-        "context": {"type": "run", "id": "run-root"},
-        "payload": {"type": "thought", "text": "推理片段"},
-    }))
-
-    assert result == {"ok": True}
-    assert captured["method"] == "message.thought.put"
-    params = captured["params"]
-    assert params["to"] == "bob.example.com"
-    assert params["context"] == {"type": "run", "id": "run-root"}
-    assert params["encrypted"] is True
-    assert params["type"] == "e2ee.encrypted"
-    assert params["payload"]["type"] == "e2ee.encrypted"
-    assert params["thought_id"].startswith("mt-")
-    assert params["client_signature"] == {"aid": "alice.example.com"}
-
-    result = asyncio.run(client.call("message.thought.put", {
-        "to": "bob.example.com",
-        "context": {"type": "run", "id": "run-1"},
-        "payload": {"type": "thought", "text": "自主推理片段"},
-    }))
-
-    assert result == {"ok": True}
-    params = captured["params"]
-    assert params["context"] == {"type": "run", "id": "run-1"}
-    assert params["encrypted"] is True
 
 
 def test_thought_selector_validation_requires_context():
@@ -1174,113 +901,6 @@ def test_thought_selector_validation_requires_context():
         client._validate_outbound_call("message.thought.put", {
             "to": "bob.example.com",
         })
-
-
-def test_message_thought_get_auto_decrypts(monkeypatch):
-    client = AUNClient()
-    client._state = "connected"
-    client._aid = "bob.example.com"
-
-    async def _fake_call(method, params):
-        assert method == "message.thought.get"
-        return {
-            "found": True,
-            "sender_aid": "alice.example.com",
-            "peer_aid": "bob.example.com",
-            "context": {"type": "run", "id": "run-root"},
-            "thoughts": [
-                {
-                    "thought_id": "mt-1",
-                    "from": "alice.example.com",
-                    "to": "bob.example.com",
-                    "context": {"type": "run", "id": "run-root"},
-                    "payload": {"type": "e2ee.encrypted", "ciphertext": "abc"},
-                    "created_at": 1710504000000,
-                },
-            ],
-        }
-
-    async def _fake_cert(*_args, **_kwargs):
-        return True
-
-    monkeypatch.setattr(client, "_ensure_sender_cert_cached", _fake_cert)
-    monkeypatch.setattr(client._e2ee, "_should_decrypt_for_current_aid", lambda _m, _p: True)
-    monkeypatch.setattr(client._e2ee, "_decrypt_message", lambda _m, source="": {
-        "payload": {"type": "thought", "text": "只给感兴趣的人看"},
-        "e2ee": {"encryption_mode": "prekey_ecdh_v2"},
-    })
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client.call("message.thought.get", {
-        "sender_aid": "alice.example.com",
-        "context": {"type": "run", "id": "run-root"},
-    }))
-
-    assert result["thoughts"] == [{
-        "thought_id": "mt-1",
-        "message_id": "mt-1",
-        "context": {"type": "run", "id": "run-root"},
-        "from": "alice.example.com",
-        "to": "bob.example.com",
-        "payload": {"type": "thought", "text": "只给感兴趣的人看"},
-        "created_at": 1710504000000,
-        "e2ee": {"encryption_mode": "prekey_ecdh_v2"},
-    }]
-
-
-def test_message_thought_get_is_not_replay_guarded(monkeypatch):
-    """message.thought.get 是 RPC 查询，重复读取不应消耗普通消息 replay guard。"""
-    client = AUNClient()
-    client._state = "connected"
-    client._aid = "bob.example.com"
-    decrypt_calls = 0
-
-    async def _fake_call(method, params):
-        assert method == "message.thought.get"
-        return {
-            "found": True,
-            "sender_aid": "alice.example.com",
-            "peer_aid": "bob.example.com",
-            "context": {"type": "run", "id": "run-repeat"},
-            "thoughts": [{
-                "thought_id": "mt-repeat",
-                "from": "alice.example.com",
-                "to": "bob.example.com",
-                "context": {"type": "run", "id": "run-repeat"},
-                "payload": {"type": "e2ee.encrypted", "ciphertext": "abc"},
-                "created_at": 1710504000000,
-            }],
-        }
-
-    async def _fake_cert(*_args, **_kwargs):
-        return True
-
-    def _fake_decrypt(_m, source=""):
-        nonlocal decrypt_calls
-        decrypt_calls += 1
-        return {
-            "payload": {"type": "thought", "text": "重复读取可见"},
-            "e2ee": {"encryption_mode": "prekey_ecdh_v2"},
-        }
-
-    client._e2ee._seen_messages["alice.example.com:mt-repeat"] = 1.0
-    monkeypatch.setattr(client, "_ensure_sender_cert_cached", _fake_cert)
-    monkeypatch.setattr(client._e2ee, "_should_decrypt_for_current_aid", lambda _m, _p: True)
-    monkeypatch.setattr(client._e2ee, "_decrypt_message", _fake_decrypt)
-    client._transport.call = _fake_call
-
-    first = asyncio.run(client.call("message.thought.get", {
-        "sender_aid": "alice.example.com",
-        "context": {"type": "run", "id": "run-repeat"},
-    }))
-    second = asyncio.run(client.call("message.thought.get", {
-        "sender_aid": "alice.example.com",
-        "context": {"type": "run", "id": "run-repeat"},
-    }))
-
-    assert first["thoughts"][0]["payload"]["text"] == "重复读取可见"
-    assert second["thoughts"][0]["payload"]["text"] == "重复读取可见"
-    assert decrypt_calls == 2
 
 
 def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeypatch):
@@ -1341,362 +961,6 @@ def test_get_verified_peer_cert_resolves_versioned_cache_without_fingerprint(tmp
     assert client._get_verified_peer_cert("bob.example.com") == cert_pem
 
 
-def test_send_encrypted_uses_multi_device_payload_when_needed(monkeypatch):
-    client = AUNClient()
-    sent = {}
-
-    async def _fake_fetch_peer_prekeys(peer_aid):
-        assert peer_aid == "bob.example.com"
-        return [
-            {
-                "device_id": "phone",
-                "prekey_id": "pk-phone",
-                "public_key": "pub-phone",
-                "signature": "sig-phone",
-                "cert_fingerprint": "sha256:cert",
-            },
-            {
-                "device_id": "laptop",
-                "prekey_id": "pk-laptop",
-                "public_key": "pub-laptop",
-                "signature": "sig-laptop",
-                "cert_fingerprint": "sha256:cert",
-            },
-        ]
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        assert aid == "bob.example.com"
-        assert cert_fingerprint == "sha256:cert"
-        return b"PEM"
-
-    def _fake_encrypt_copy_payload(**kwargs):
-        prekey = kwargs["prekey"]
-        return (
-            {"type": "e2ee.encrypted", "ciphertext": prekey["prekey_id"]},
-            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
-        )
-
-    async def _fake_call(method, params):
-        sent["method"] = method
-        sent["params"] = dict(params)
-        return {"ok": True}
-
-    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._send_encrypted({
-        "to": "bob.example.com",
-        "payload": {"type": "text", "text": "hello"},
-    }))
-
-    assert result == {"ok": True}
-    assert sent["method"] == "message.send"
-    assert sent["params"]["type"] == "e2ee.multi_device"
-    assert [item["device_id"] for item in sent["params"]["payload"]["recipient_copies"]] == ["phone", "laptop"]
-    assert sent["params"]["payload"]["self_copies"] == []
-
-
-def test_send_encrypted_generates_self_sync_copies(monkeypatch):
-    client = AUNClient()
-    active_cert, active_fp = _make_test_cert("alice.example.com")
-    client._aid = "alice.example.com"
-    client._device_id = "phone"
-    client._identity = {
-        "aid": "alice.example.com",
-        "cert": active_cert,
-    }
-    sent = {}
-
-    async def _fake_fetch_peer_prekeys(peer_aid):
-        if peer_aid == "bob.example.com":
-            return [{
-                "device_id": "bob-phone",
-                "prekey_id": "pk-bob",
-                "public_key": "pub-bob",
-                "signature": "sig-bob",
-                "cert_fingerprint": "sha256:bob",
-            }]
-        if peer_aid == "alice.example.com":
-            return [
-                {
-                    "device_id": "phone",
-                    "prekey_id": "pk-self",
-                    "public_key": "pub-self",
-                    "signature": "sig-self",
-                    "cert_fingerprint": active_fp,
-                },
-                {
-                    "device_id": "tablet",
-                    "prekey_id": "pk-tablet",
-                    "public_key": "pub-tablet",
-                    "signature": "sig-tablet",
-                    "cert_fingerprint": active_fp,
-                },
-            ]
-        raise AssertionError(peer_aid)
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        assert aid == "bob.example.com"
-        return b"BOB-CERT"
-
-    def _fake_encrypt_copy_payload(**kwargs):
-        prekey = kwargs["prekey"]
-        return (
-            {
-                "type": "e2ee.encrypted",
-                "ciphertext": prekey["prekey_id"],
-                "aad": {"to": kwargs["logical_to_aid"]},
-            },
-            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
-        )
-
-    async def _fake_call(method, params):
-        sent["method"] = method
-        sent["params"] = dict(params)
-        return {"ok": True}
-
-    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._send_encrypted({
-        "to": "bob.example.com",
-        "payload": {"type": "text", "text": "hi"},
-    }))
-
-    assert result == {"ok": True}
-    assert sent["params"]["type"] == "e2ee.multi_device"
-    assert [item["device_id"] for item in sent["params"]["payload"]["recipient_copies"]] == ["bob-phone"]
-    assert [item["device_id"] for item in sent["params"]["payload"]["self_copies"]] == ["tablet"]
-    assert sent["params"]["payload"]["self_copies"][0]["envelope"]["aad"]["to"] == "bob.example.com"
-
-
-def test_send_encrypted_self_sync_uses_cert_fingerprint_specific_cert(monkeypatch):
-    client = AUNClient()
-    active_cert, active_fp = _make_test_cert("alice-active.example.com")
-    old_cert, old_fp = _make_test_cert("alice-rotated.example.com")
-    client._aid = "alice.example.com"
-    client._device_id = "phone"
-    client._identity = {
-        "aid": "alice.example.com",
-        "cert": active_cert,
-    }
-    sent = {}
-    cert_calls = []
-
-    async def _fake_fetch_peer_prekeys(peer_aid):
-        if peer_aid == "bob.example.com":
-            return [{
-                "device_id": "bob-phone",
-                "prekey_id": "pk-bob",
-                "public_key": "pub-bob",
-                "signature": "sig-bob",
-                "cert_fingerprint": "sha256:bob",
-            }]
-        if peer_aid == "alice.example.com":
-            return [
-                {
-                    "device_id": "phone",
-                    "prekey_id": "pk-self",
-                    "public_key": "pub-self",
-                    "signature": "sig-self",
-                    "cert_fingerprint": active_fp,
-                },
-                {
-                    "device_id": "tablet",
-                    "prekey_id": "pk-tablet",
-                    "public_key": "pub-tablet",
-                    "signature": "sig-tablet",
-                    "cert_fingerprint": old_fp,
-                },
-            ]
-        raise AssertionError(peer_aid)
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        cert_calls.append((aid, cert_fingerprint))
-        if aid == "bob.example.com":
-            return b"BOB-CERT"
-        if aid == "alice.example.com":
-            assert cert_fingerprint == old_fp
-            return old_cert.encode("utf-8")
-        raise AssertionError(aid)
-
-    def _fake_encrypt_copy_payload(**kwargs):
-        prekey = kwargs["prekey"]
-        return (
-            {
-                "type": "e2ee.encrypted",
-                "ciphertext": prekey["prekey_id"],
-                "aad": {"to": kwargs["logical_to_aid"]},
-            },
-            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
-        )
-
-    async def _fake_call(method, params):
-        sent["method"] = method
-        sent["params"] = dict(params)
-        return {"ok": True}
-
-    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._send_encrypted({
-        "to": "bob.example.com",
-        "payload": {"type": "text", "text": "hi"},
-    }))
-
-    assert result == {"ok": True}
-    assert sent["params"]["type"] == "e2ee.multi_device"
-    assert [item["device_id"] for item in sent["params"]["payload"]["self_copies"]] == ["tablet"]
-    assert ("alice.example.com", old_fp) in cert_calls
-    assert ("alice.example.com", active_fp) not in cert_calls
-
-
-def test_outbound_sync_messages_are_decryptable_for_current_aid():
-    client = AUNClient()
-    client._identity = {"aid": "alice.example.com"}
-
-    allowed = client._e2ee._should_decrypt_for_current_aid(
-        {"to": "bob.example.com", "direction": "outbound_sync"},
-        {"aad": {"to": "bob.example.com"}},
-    )
-
-    assert allowed is True
-
-
-def test_upload_prekey_forwards_device_id(monkeypatch):
-    client = AUNClient()
-    client._device_id = "device-7"
-    sent = {}
-
-    monkeypatch.setattr(client._e2ee, "generate_prekey", lambda: {
-        "device_id": "device-7",
-        "prekey_id": "pk-1",
-        "public_key": "pub",
-        "signature": "sig",
-        "created_at": 1,
-    })
-
-    async def _fake_call(method, params):
-        sent["method"] = method
-        sent["params"] = dict(params)
-        return {"ok": True}
-
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._upload_prekey())
-
-    assert result == {"ok": True}
-    assert sent["method"] == "message.e2ee.put_prekey"
-    assert sent["params"]["device_id"] == "device-7"
-
-
-def test_send_encrypted_does_not_forward_delivery_mode(monkeypatch):
-    client = AUNClient()
-    client._gateway_url = "wss://gateway.example.com/aun"
-    client._connect_delivery_mode = {
-        "mode": "queue",
-        "routing": "sender_affinity",
-        "affinity_ttl_ms": 1000,
-    }
-    sent = {}
-
-    async def _fake_fetch_peer_prekeys(peer_aid):
-        return [{
-            "device_id": "phone",
-            "prekey_id": "pk-1",
-            "public_key": "pub",
-            "signature": "sig",
-            "cert_fingerprint": "sha256:abc",
-        }]
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        return b"PEM"
-
-    def _fake_encrypt_copy_payload(**kwargs):
-        return {"ciphertext": "ok"}, {"encrypted": True, "forward_secrecy": True, "mode": "sealed_box"}
-
-    async def _fake_call(method, params):
-        sent.update(params)
-        return {"ok": True}
-
-    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
-    client._transport.call = _fake_call
-
-    asyncio.run(client._send_encrypted({
-        "to": "bob.example.com",
-        "payload": {"type": "text", "text": "hello"},
-    }))
-
-    assert "delivery_mode" not in sent
-
-
-def test_send_encrypted_queue_mode_still_uses_multi_device_payload(monkeypatch):
-    client = AUNClient()
-    client._connect_delivery_mode = {
-        "mode": "queue",
-        "routing": "sender_affinity",
-        "affinity_ttl_ms": 1000,
-    }
-    sent = {}
-
-    async def _fake_fetch_peer_prekeys(peer_aid):
-        return [
-            {
-                "device_id": "phone",
-                "prekey_id": "pk-phone",
-                "public_key": "pub-phone",
-                "signature": "sig-phone",
-                "cert_fingerprint": "sha256:cert",
-            },
-            {
-                "device_id": "laptop",
-                "prekey_id": "pk-laptop",
-                "public_key": "pub-laptop",
-                "signature": "sig-laptop",
-                "cert_fingerprint": "sha256:cert",
-            },
-        ]
-
-    async def _fake_fetch_peer_cert(aid, cert_fingerprint=None):
-        return b"PEM"
-
-    def _fake_encrypt_copy_payload(**kwargs):
-        prekey = kwargs["prekey"]
-        return (
-            {"type": "e2ee.encrypted", "ciphertext": prekey["prekey_id"]},
-            {"encrypted": True, "forward_secrecy": True, "mode": "prekey_ecdh_v2", "degraded": False},
-        )
-
-    async def _fake_call(method, params):
-        sent["method"] = method
-        sent["params"] = dict(params)
-        return {"ok": True}
-
-    monkeypatch.setattr(client, "_fetch_peer_prekeys", _fake_fetch_peer_prekeys)
-    monkeypatch.setattr(client, "_fetch_peer_cert", _fake_fetch_peer_cert)
-    monkeypatch.setattr(client, "_encrypt_copy_payload", _fake_encrypt_copy_payload)
-    client._transport.call = _fake_call
-
-    result = asyncio.run(client._send_encrypted({
-        "to": "bob.example.com",
-        "payload": {"type": "text", "text": "hello"},
-    }))
-
-    assert result == {"ok": True}
-    assert sent["method"] == "message.send"
-    assert sent["params"]["type"] == "e2ee.multi_device"
-    assert "delivery_mode" not in sent["params"]
-    assert [item["device_id"] for item in sent["params"]["payload"]["recipient_copies"]] == ["phone", "laptop"]
-
-
 def test_seq_tracker_state_isolated_between_slots(tmp_path):
     root = tmp_path / "aun"
     aid = "demo.agentid.pub"
@@ -1721,57 +985,6 @@ def test_seq_tracker_state_isolated_between_slots(tmp_path):
     client_b._restore_seq_tracker_state()
 
     assert client_b._seq_tracker.export_state() == {}
-
-
-def test_seq_tracking_context_switch_clears_pending_runtime_queues(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "aun_ctx_switch")})
-    client._aid = "alice.aid.com"
-    client._device_id = "device-a"
-    client._slot_id = "slot-a"
-    client._seq_tracker_context = ("alice.aid.com", "device-a", "slot-a")
-    client._pending_ordered_msgs["p2p:alice.aid.com"] = {
-        3: ("message.received", {"seq": 3})
-    }
-    client._pending_decrypt_msgs["group:g1"] = [
-        {"group_id": "g1", "seq": 4, "payload": {"type": "e2ee.group_encrypted"}}
-    ]
-
-    client._slot_id = "slot-b"
-    client._refresh_seq_tracking_context()
-
-    assert client._pending_ordered_msgs == {}
-    assert client._pending_decrypt_msgs == {}
-
-
-def test_schedule_prekey_replenish_only_once_per_consumed_prekey():
-    """inflight 限流：同时多次消耗 prekey 只启动一个 upload，但 pending 会在 inflight 完成后再触发一次"""
-    client = AUNClient()
-    client._state = "connected"
-
-    async def _case():
-        client._loop = asyncio.get_running_loop()
-        uploads: list[str] = []
-
-        async def _fake_upload():
-            uploads.append("ok")
-            await asyncio.sleep(0)
-            return {"ok": True}
-
-        client._upload_prekey = _fake_upload
-        consumed = {"e2ee": {"encryption_mode": "prekey_ecdh_v2", "prekey_id": "pk-1"}}
-        # 第一次触发 → 启动 inflight
-        client._schedule_prekey_replenish_if_consumed(consumed)
-        # 第二次 → inflight 中，计入 pending
-        client._schedule_prekey_replenish_if_consumed(consumed)
-        # 让 event loop 运行完成第一次 upload + pending 触发第二次
-        for _ in range(10):
-            await asyncio.sleep(0)
-        return uploads
-
-    uploads = asyncio.run(_case())
-
-    # inflight 限流确保不会并发 upload；pending 合并确保完成后补充一次
-    assert len(uploads) <= 2
 
 
 def test_seq_tracker_same_context_refresh_keeps_in_memory_state(tmp_path):
@@ -1911,63 +1124,6 @@ async def test_group_changed_first_event_gap_does_not_force_local_cursor():
 
 
 @pytest.mark.asyncio
-async def test_gap_fill_allows_zero_contiguous_and_uses_server_event_cursor():
-    """补洞 after=0 时应请求服务端，由服务端 cursor floor 决定本地推进位置。"""
-    from unittest.mock import AsyncMock, MagicMock
-
-    from aun_core.client import AUNClient
-    from aun_core.seq_tracker import SeqTracker
-
-    client = AUNClient.__new__(AUNClient)
-    from aun_core.logger import NullLogger; client._log = NullLogger()
-    client._state = "connected"
-    client._closing = False
-    client._aid = "alice.agentid.pub"
-    client._device_id = "device-1"
-    client._slot_id = "slot-a"
-    client._seq_tracker = SeqTracker()
-    client._gap_fill_done = {}
-    client._gap_fill_active = False
-    client._pushed_seqs = {}
-    client._dispatcher = MagicMock()
-    client._dispatcher.publish = AsyncMock()
-    client._persist_seq = lambda ns: None
-    client._prune_pushed_seqs = lambda ns: None
-    client._verify_event_signature = AsyncMock(return_value=True)
-    transport = MagicMock()
-    transport.call = AsyncMock(return_value={"ok": True})
-    client._transport = transport
-    calls: list[tuple[str, dict]] = []
-
-    async def fake_call(method, params):
-        calls.append((method, dict(params)))
-        if method == "message.pull":
-            return {"messages": [], "count": 0, "server_ack_seq": 0}
-        if method == "group.pull":
-            return {"messages": [], "count": 0, "cursor": {"current_seq": 0}}
-        if method == "group.pull_events":
-            return {"events": [], "count": 0, "cursor": {"current_seq": 7}}
-        return {}
-
-    client.call = fake_call
-
-    await client._fill_p2p_gap()
-    await client._fill_group_gap("G1")
-    await client._fill_group_event_gap("G1")
-
-    assert calls[0] == ("message.pull", {"after_seq": 0, "limit": 50})
-    assert calls[1][0] == "group.pull"
-    assert calls[1][1]["after_message_seq"] == 0
-    assert calls[2][0] == "group.pull_events"
-    assert calls[2][1]["after_event_seq"] == 0
-    assert client._seq_tracker.get_contiguous_seq("group_event:G1") == 7
-    transport.call.assert_awaited_with(
-        "group.ack_events",
-        {"group_id": "G1", "event_seq": 7, "device_id": "device-1", "slot_id": "slot-a"},
-    )
-
-
-@pytest.mark.asyncio
 async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
     """group.changed event_seq gap 应真实触发 group.pull_events，并用 contiguous_seq ack。"""
     from unittest.mock import AsyncMock, MagicMock
@@ -2021,6 +1177,215 @@ async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
     assert ack_call == {"group_id": "g1", "event_seq": 3, "device_id": "device-1", "slot_id": "slot-a"}
     assert client._seq_tracker.get_contiguous_seq("group_event:g1") == 3
     assert client._gap_fill_done == {}
+
+
+@pytest.mark.asyncio
+async def test_group_create_blocks_until_v2_state_confirmed():
+    from unittest.mock import AsyncMock
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-alice"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    calls: list[tuple[str, dict]] = []
+    group_id = "group.agentid.pub/g-create"
+
+    async def fake_transport_call(method, params):
+        calls.append((method, dict(params)))
+        if method == "group.create":
+            return {"group": {"group_id": group_id}}
+        if method == "group.get_members":
+            return {"members": [{"aid": "alice.agentid.pub", "role": "owner"}]}
+        if method == "group.v2.bootstrap":
+            return {
+                "devices": [{"aid": "alice.agentid.pub", "device_id": "dev-alice", "ik_fp": "ik-a"}],
+                "audit_recipients": [],
+            }
+        if method == "group.get_state":
+            return {"state_version": 0, "state_hash": "", "key_epoch": 0, "membership_snapshot": ""}
+        if method == "group.v2.propose_state":
+            return {"proposal_id": "proposal-create"}
+        if method == "group.v2.confirm_state":
+            return {"ok": True}
+        return {}
+
+    client._transport.call = AsyncMock(side_effect=fake_transport_call)
+
+    await client.call("group.create", {"name": "v2-create"})
+    methods = [method for method, _ in calls]
+    assert methods.index("group.create") < methods.index("group.v2.propose_state") < methods.index("group.v2.confirm_state")
+
+
+@pytest.mark.asyncio
+async def test_v2_auto_propose_leader_delay_uses_only_online_owner_admins(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "z-owner.agentid.pub"
+    client._device_id = "dev-owner"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    calls: list[str] = []
+
+    async def fake_call(method, params):
+        calls.append(method)
+        if method == "group.get_online_members":
+            return {
+                "members": [
+                    {"aid": "z-owner.agentid.pub", "role": "owner", "online": True},
+                    {"aid": "m-member.agentid.pub", "role": "member", "online": True},
+                ]
+            }
+        if method == "group.get_members":
+            return {
+                "members": [
+                    {"aid": "a-offline-admin.agentid.pub", "role": "admin"},
+                    {"aid": "z-owner.agentid.pub", "role": "owner"},
+                ]
+            }
+        if method == "group.v2.bootstrap":
+            return {
+                "devices": [
+                    {"aid": "a-offline-admin.agentid.pub", "device_id": "dev-offline", "ik_fp": "ik-a"},
+                    {"aid": "z-owner.agentid.pub", "device_id": "dev-owner", "ik_fp": "ik-z"},
+                ],
+                "audit_recipients": [],
+            }
+        return {"ok": True}
+
+    client.call = AsyncMock(side_effect=fake_call)
+
+    async def fail_sleep(delay):
+        raise AssertionError("leader delay should not sleep when only online owner/admin may participate")
+
+    monkeypatch.setattr(asyncio, "sleep", fail_sleep)
+
+    assert await client._v2_auto_propose_leader_delay("group.agentid.pub/12345") is True
+    assert calls == ["group.get_online_members", "group.v2.bootstrap"]
+
+
+@pytest.mark.asyncio
+async def test_v2_auto_propose_verifies_committed_state_base_before_propose():
+    from unittest.mock import AsyncMock
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-alice"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    calls: list[str] = []
+
+    async def fake_call(method, params):
+        calls.append(method)
+        if method == "group.get_members":
+            return {"members": [
+                {"aid": "alice.agentid.pub", "role": "owner"},
+                {"aid": "bob.agentid.pub", "role": "member"},
+            ]}
+        if method == "group.v2.bootstrap":
+            return {"devices": [], "audit_recipients": []}
+        if method == "group.get_state":
+            return {
+                "state_version": 1,
+                "state_hash": "not-a-valid-committed-hash",
+                "key_epoch": 0,
+                "membership_snapshot": json.dumps({
+                    "members": [{"aid": "alice.agentid.pub", "devices": []}],
+                    "audit_aids": [],
+                    "admin_set": {"admin_aids": ["alice.agentid.pub"], "threshold": 1},
+                    "join_policy_hash": None,
+                    "recovery_quorum": None,
+                    "history_policy": "recent_7_days",
+                    "wrap_protocol": "3DH",
+                }, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            }
+        return {"ok": True}
+
+    client.call = AsyncMock(side_effect=fake_call)
+
+    await client._v2_auto_propose_state("group.agentid.pub/12345")
+
+    assert "group.get_state" in calls
+    assert "group.v2.propose_state" not in calls
+    assert "group.v2.confirm_state" not in calls
+
+
+@pytest.mark.asyncio
+async def test_v2_pending_proposal_confirm_verifies_committed_base_and_hash():
+    from unittest.mock import AsyncMock
+    from aun_core.v2.state.commitment import compute_state_commitment
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-alice"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    group_id = "group.agentid.pub/12345"
+    base_payload = {
+        "members": [{"aid": "alice.agentid.pub", "devices": []}],
+        "audit_aids": [],
+        "admin_set": {"admin_aids": ["alice.agentid.pub"], "threshold": 1},
+        "join_policy_hash": None,
+        "recovery_quorum": None,
+        "history_policy": "recent_7_days",
+        "wrap_protocol": "3DH",
+    }
+    next_payload = {
+        **base_payload,
+        "members": [
+            {"aid": "alice.agentid.pub", "devices": []},
+            {"aid": "bob.agentid.pub", "devices": []},
+        ],
+    }
+    base_hash = compute_state_commitment(group_id, 1, base_payload)
+    next_hash = compute_state_commitment(group_id, 2, next_payload)
+    calls: list[str] = []
+
+    async def fake_call(method, params):
+        calls.append(method)
+        if method == "group.v2.get_proposal":
+            return {"proposal": {
+                "proposal_id": "sp-1",
+                "state_version": 2,
+                "state_hash": next_hash,
+                "prev_state_hash": base_hash,
+                "membership_snapshot": json.dumps(next_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            }}
+        if method == "group.get_state":
+            return {
+                "state_version": 1,
+                "state_hash": base_hash,
+                "key_epoch": 0,
+                "membership_snapshot": json.dumps(base_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            }
+        return {"ok": True}
+
+    client.call = AsyncMock(side_effect=fake_call)
+
+    assert await client._v2_confirm_pending_proposal(group_id) is True
+    assert calls == ["group.v2.get_proposal", "group.get_state", "group.v2.confirm_state"]
+
+
+@pytest.mark.asyncio
+async def test_v2_state_retry_needed_triggers_leader_delay_reproposal():
+    from unittest.mock import AsyncMock
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-alice"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._v2_auto_propose_state = AsyncMock()
+
+    await client._on_v2_state_retry_needed({"group_id": "group.agentid.pub/12345"})
+
+    client._v2_auto_propose_state.assert_awaited_once_with("group.agentid.pub/12345", leader_delay=True)
 
 
 @pytest.mark.asyncio
@@ -2215,67 +1580,6 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
 
 
 @pytest.mark.asyncio
-async def test_p2p_gap_push_is_pending_until_gap_pull_fills_contiguous(tmp_path):
-    """P2P push 越过空洞时应先挂起，补洞 pull 补齐后再按序发布。"""
-    from unittest.mock import AsyncMock
-
-    client = AUNClient({"aun_path": str(tmp_path / "p2p_ordered_push")})
-    client._aid = "alice.aid.com"
-    client._device_id = "dev-1"
-    client._state = "connected"
-    client._closing = False
-    client._loop = asyncio.get_running_loop()
-    ns = "p2p:alice.aid.com"
-    client._seq_tracker.on_message_seq(ns, 1)
-
-    published: list[dict] = []
-    client._dispatcher.subscribe("message.received", lambda data: published.append(data))
-    client._transport.call = AsyncMock(return_value={})
-    client._try_handle_group_key_message = AsyncMock(return_value=False)
-    client._decrypt_single_message = AsyncMock(side_effect=lambda msg, source=None: msg)
-
-    scheduled_fill_calls: list[bool] = []
-    original_fill_p2p_gap = AUNClient._fill_p2p_gap.__get__(client, AUNClient)
-
-    async def fake_scheduled_fill_p2p_gap():
-        scheduled_fill_calls.append(True)
-
-    client._fill_p2p_gap = fake_scheduled_fill_p2p_gap
-
-    await client._process_and_publish_message({
-        "message_id": "m3",
-        "from": "bob.aid.com",
-        "to": "alice.aid.com",
-        "seq": 3,
-        "payload": {"type": "text", "text": "三"},
-    })
-    await asyncio.sleep(0)
-
-    assert scheduled_fill_calls == [True]
-    assert published == []
-    assert 3 in client._pending_ordered_msgs[ns]
-
-    async def fake_call(method, params=None):
-        if method == "message.pull":
-            pulled = [
-                {"message_id": "m2", "from": "bob.aid.com", "to": "alice.aid.com", "seq": 2,
-                 "payload": {"type": "text", "text": "二"}},
-                {"message_id": "m3", "from": "bob.aid.com", "to": "alice.aid.com", "seq": 3,
-                 "payload": {"type": "text", "text": "三"}},
-            ]
-            client._seq_tracker.on_pull_result(ns, pulled)
-            return {"messages": pulled}
-        return {}
-
-    client.call = fake_call
-    client._fill_p2p_gap = original_fill_p2p_gap
-    await client._fill_p2p_gap()
-
-    assert [m["seq"] for m in published] == [2, 3]
-    assert ns not in client._pending_ordered_msgs
-
-
-@pytest.mark.asyncio
 async def test_published_message_events_fallback_current_instance_context(tmp_path):
     client = AUNClient({"aun_path": str(tmp_path / "published_instance_context")})
     client._device_id = "dev-1"
@@ -2302,6 +1606,28 @@ async def test_published_message_events_fallback_current_instance_context(tmp_pa
     assert p2p_events[0]["slot_id"] == "slot-a"
     assert group_events[0]["device_id"] == "dev-1"
     assert group_events[0]["slot_id"] == "slot-a"
+
+
+@pytest.mark.asyncio
+async def test_pulled_batch_publishes_internal_gap(tmp_path):
+    client = AUNClient({"aun_path": str(tmp_path / "pulled_batch_gap")})
+    ns = "p2p:alice.aid.com"
+    client._seq_tracker.on_message_seq(ns, 1)
+    client._seq_tracker.force_contiguous_seq(ns, 2)
+
+    published: list[int] = []
+    client._dispatcher.subscribe("message.received", lambda data: published.append(int(data["seq"])))
+
+    assert await client._publish_pulled_message("message.received", ns, 2, {"seq": 2})
+    assert await client._publish_pulled_message("message.received", ns, 4, {"seq": 4})
+    client._seq_tracker.force_contiguous_seq(ns, 4)
+
+    assert published == [2, 4]
+    assert client._is_published_seq(ns, 2)
+    assert client._is_published_seq(ns, 4)
+    client._prune_pushed_seqs(ns)
+    assert client._is_published_seq(ns, 2)
+    assert client._is_published_seq(ns, 4)
 
 
 @pytest.mark.asyncio
@@ -2333,41 +1659,6 @@ async def test_p2p_push_ignores_other_slot_context(tmp_path):
 
     assert published == []
     assert not client._decrypt_single_message.called
-
-
-@pytest.mark.asyncio
-async def test_group_push_accepts_other_slot_context(tmp_path):
-    from unittest.mock import AsyncMock
-
-    client = AUNClient({"aun_path": str(tmp_path / "group_other_slot")})
-    client._device_id = "dev-1"
-    client._slot_id = "slot-a"
-    client._transport.call = AsyncMock(return_value={})
-
-    published: list[dict] = []
-    client._dispatcher.subscribe("group.message_created", lambda data: published.append(data))
-
-    await client._process_and_publish_group_message({
-        "message_id": "gm-other-slot",
-        "group_id": "g1",
-        "from": "bob.aid.com",
-        "device_id": "dev-2",
-        "slot_id": "slot-b",
-        "payload": {"type": "text", "text": "group"},
-    })
-
-    assert len(published) == 1
-    assert published[0]["device_id"] == "dev-2"
-    assert published[0]["slot_id"] == "slot-b"
-
-
-# ─── ISSUE-SDK-PY-014: replay guard 已改为本地处理 ───
-# _check_replay_guard 方法已移除，防重放改由 _group_e2ee.decrypt(skip_replay=)
-# 在本地完成；服务端入口已做 AID 级防重放（见 client.py:2210 注释）。
-# 原 3 个 RPC replay guard 测试不再适用，已删除。
-
-
-# ─── ISSUE-SDK-PY-021: close_code 1000 不应视为 server_initiated ───
 
 
 def _make_disconnect_client():
@@ -2781,29 +2072,3 @@ async def test_max_attempts_stops_reconnect_on_connect_fail():
 
 
 # ── R3: 批量路径解密失败不应出现在返回结果中 ──────────────────
-
-@pytest.mark.asyncio
-async def test_decrypt_group_messages_excludes_undecryptable():
-    """R3: _decrypt_group_messages 解密失败的消息不应出现在返回结果中。"""
-    client = AUNClient()
-    client._state = "connected"
-    client._aid = "test.aid.com"
-    client._device_id = "device-001"
-
-    # _decrypt_group_message 返回原始消息（无 e2ee 字段）= 解密失败
-    async def fake_decrypt(msg, skip_replay=False):
-        return msg
-
-    client._decrypt_group_message = fake_decrypt
-
-    msgs = [
-        {"group_id": "g1", "from": "a", "seq": 1,
-         "payload": {"type": "e2ee.group_encrypted", "epoch": 1, "ciphertext": "X"}},
-        {"group_id": "g1", "from": "b", "seq": 2,
-         "payload": {"type": "text", "text": "hello"}},
-    ]
-    result = await client._decrypt_group_messages(msgs)
-
-    # 只有非加密消息应在结果中
-    assert len(result) == 1
-    assert result[0]["payload"]["type"] == "text"

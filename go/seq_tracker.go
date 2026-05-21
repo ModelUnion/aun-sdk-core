@@ -177,8 +177,11 @@ func (st *SeqTracker) onMessageSeqLocked(ns string, seq int) bool {
 	return true
 }
 
-// OnPullResult pull 返回后更新 tracker 状态
-func (st *SeqTracker) OnPullResult(ns string, messages []map[string]any) {
+// OnPullResult pull 返回后更新 tracker 状态。
+// 可选 afterSeq 参数：当 afterSeq == contiguousSeq（gap fill 场景）且服务端返回的消息
+// 跳过了某些 seq（永久丢失/过期），直接将 contiguousSeq 推进到 maxPulled，
+// 避免 contiguousSeq 永远卡住。
+func (st *SeqTracker) OnPullResult(ns string, messages []map[string]any, afterSeq ...int) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -200,6 +203,28 @@ func (st *SeqTracker) OnPullResult(ns string, messages []map[string]any) {
 
 	for s := range pulledSeqs {
 		t.receivedSeqs[s] = true
+	}
+
+	// 服务端永久空洞处理：当 afterSeq == contiguousSeq 且拉取结果跳过了某些 seq，
+	// 说明那些 seq 在服务端已不可恢复，直接推进 contiguousSeq 到 maxPulled。
+	if len(pulledSeqs) > 0 && len(afterSeq) > 0 && afterSeq[0] == t.contiguousSeq {
+		if maxPulled > t.contiguousSeq {
+			t.contiguousSeq = maxPulled
+			// 清理被跳过区间内的 pendingGaps
+			for key, probe := range t.pendingGaps {
+				if probe.gapEnd <= t.contiguousSeq {
+					delete(t.pendingGaps, key)
+				}
+			}
+			// 清理 receivedSeqs 中 <= contiguousSeq 的条目
+			newReceived := make(map[int]bool)
+			for s := range t.receivedSeqs {
+				if s > t.contiguousSeq {
+					newReceived[s] = true
+				}
+			}
+			t.receivedSeqs = newReceived
+		}
 	}
 
 	now := float64(time.Now().UnixNano()) / 1e9

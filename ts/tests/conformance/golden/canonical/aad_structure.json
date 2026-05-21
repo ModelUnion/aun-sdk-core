@@ -1,0 +1,15 @@
+{
+  "description": "canonical_json input",
+  "input": {
+    "epoch": 12,
+    "from": "alice.agentid.pub",
+    "from_device": "dev-uuid-A",
+    "group_id": "g-abc.agentid.pub",
+    "message_id": "gm-550e8400",
+    "state_commitment": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "suite": "P256_HKDF_SHA256_AES_256_GCM",
+    "timestamp": 1710504000000,
+    "wrap_protocol": "3DH"
+  },
+  "expected_output_b64": "eyJlcG9jaCI6MTIsImZyb20iOiJhbGljZS5hZ2VudGlkLnB1YiIsImZyb21fZGV2aWNlIjoiZGV2LXV1aWQtQSIsImdyb3VwX2lkIjoiZy1hYmMuYWdlbnRpZC5wdWIiLCJtZXNzYWdlX2lkIjoiZ20tNTUwZTg0MDAiLCJzdGF0ZV9jb21taXRtZW50IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInN1aXRlIjoiUDI1Nl9IS0RGX1NIQTI1Nl9BRVNfMjU2X0dDTSIsInRpbWVzdGFtcCI6MTcxMDUwNDAwMDAwMCwid3JhcF9wcm90b2NvbCI6IjNESCJ9"
+}

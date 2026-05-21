@@ -46,7 +46,7 @@ function makeSharedPath(tag: string): string {
 
 function makeClient(aunPath: string): AUNClient {
   const client = new AUNClient({ aun_path: aunPath });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }
 
@@ -438,7 +438,7 @@ describe('长短连接共存集成测试', () => {
 
   // ── Test 8: 短连接禁用 token 刷新 ──────────
 
-  it('Test 8: 短连接禁用 token 刷新（心跳保留）', async () => {
+  it('Test 8: 短连接禁用 heartbeat 与 token 刷新', async () => {
     if (skip()) return;
 
     const r = rid();
@@ -458,9 +458,9 @@ describe('长短连接共存集成测试', () => {
     const sessionOpts = (short as unknown as { _sessionOptions: SessionOptions })._sessionOptions;
     expect(sessionOpts.connection_kind).toBe('short');
 
-    // 心跳 timer 应正常启动
+    // 短连接生命周期短，不启动 heartbeat
     const heartbeatTimer = (short as unknown as { _heartbeatTimer: unknown })._heartbeatTimer;
-    expect(heartbeatTimer).not.toBeNull();
+    expect(heartbeatTimer).toBeNull();
 
     // token refresh timer 不应启动
     const tokenRefreshTimer = (short as unknown as { _tokenRefreshTimer: unknown })._tokenRefreshTimer;

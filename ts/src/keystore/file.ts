@@ -3,7 +3,7 @@
  *
  * 与 Python SDK FileKeyStore / Go FileKeyStore 对齐：
  * - key.json / cert.pem 仍用文件存储
- * - tokens / prekeys / group_secrets / sessions / instance_state / metadata_kv 全部存 SQLite
+ * - tokens / instance_state / metadata_kv / group_state 全部存 SQLite
  * - 废弃 meta.json
  */
 
@@ -25,18 +25,16 @@ import type { KeyStore } from './index.js';
 import type { SecretStore } from '../secret-store/index.js';
 import type { ModuleLogger } from '../logger.js';
 import { AIDDatabase } from './aid-db.js';
+import { V2KeyStore } from '../v2/session/keystore.js';
 import { getDeviceId, normalizeInstanceId } from '../config.js';
 import { certificateSha256Fingerprint } from '../crypto.js';
 import { createDefaultSecretStore } from '../secret-store/index.js';
 import {
   isJsonObject,
-  type GroupSecretRecord,
   type IdentityRecord,
   type JsonObject,
   type KeyPairRecord,
   type MetadataRecord,
-  type PrekeyMap,
-  type PrekeyRecord,
 } from '../types.js';
 
 const _noopLogger: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
@@ -263,7 +261,7 @@ export class FileKeyStore implements KeyStore {
     if (typeof identity.cert === 'string' && identity.cert) this.saveCert(aid, identity.cert);
     // 直接写入 tokens + KV
     const db = this._getDB(aid);
-    const skip = new Set([...TOKEN_FIELDS, 'private_key_pem', 'public_key_der_b64', 'curve', 'cert', 'e2ee_prekeys', 'group_secrets', 'e2ee_sessions']);
+    const skip = new Set([...TOKEN_FIELDS, 'private_key_pem', 'public_key_der_b64', 'curve', 'cert']);
     for (const field of TOKEN_FIELDS) {
       if (!(field in identity)) continue;
       const v = identity[field];
@@ -286,101 +284,6 @@ export class FileKeyStore implements KeyStore {
     return null;
   }
 
-  // ── Prekeys ──────────────────────────────────────────────
-
-  loadE2EEPrekeys(aid: string, deviceId?: string): PrekeyMap {
-    return this._getDB(aid).loadPrekeys(String(deviceId ?? '').trim()) as PrekeyMap;
-  }
-
-  /**
-   * 按 prekey_id 单点查询（数据库 WHERE prekey_id = ? LIMIT 1）。
-   * 相比 loadE2EEPrekeys 的全量加载（O(N)），单条查询是 O(1)。
-   * 解密入站消息时信封里有 prekey_id，应优先走这条路径。
-   */
-  loadE2EEPrekeyById(aid: string, prekeyId: string): PrekeyRecord | null {
-    return this._getDB(aid).loadPrekeyById(prekeyId) as PrekeyRecord | null;
-  }
-
-  saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: PrekeyRecord, deviceId?: string): void {
-    const pem = typeof prekeyData.private_key_pem === 'string' ? prekeyData.private_key_pem : '';
-    const extra: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(prekeyData)) {
-      if (!['private_key_pem', 'created_at', 'updated_at', 'expires_at'].includes(k)) extra[k] = v;
-    }
-    this._getDB(aid).savePrekey(prekeyId, pem, String(deviceId ?? '').trim(), prekeyData.created_at, prekeyData.expires_at, extra);
-  }
-
-  cleanupE2EEPrekeys(aid: string, cutoffMs: number, keepLatest = 7, deviceId?: string): string[] {
-    return this._getDB(aid).cleanupPrekeys(String(deviceId ?? '').trim(), cutoffMs, keepLatest);
-  }
-
-  // ── Group Secrets ────────────────────────────────────────
-
-  listGroupSecretIds(aid: string): string[] {
-    const db = this._getDB(aid);
-    const ids = new Set<string>(Object.keys(db.loadAllGroupCurrent()));
-    for (const groupId of db.loadAllGroupIdsWithOldEpochs()) ids.add(groupId);
-    return [...ids].sort();
-  }
-
-  cleanupGroupOldEpochsState(aid: string, groupId: string, cutoffMs: number): number {
-    return this._getDB(aid).cleanupGroupOldEpochs(groupId, cutoffMs);
-  }
-
-  loadGroupSecretEpoch(aid: string, groupId: string, epoch?: number | null): GroupSecretRecord | null {
-    return this._getDB(aid).loadGroupSecretEpoch(groupId, epoch) as GroupSecretRecord | null;
-  }
-
-  loadGroupSecretEpochs(aid: string, groupId: string): GroupSecretRecord[] {
-    return this._getDB(aid).loadGroupSecretEpochs(groupId) as GroupSecretRecord[];
-  }
-
-  storeGroupSecretTransition(
-    aid: string,
-    groupId: string,
-    opts: {
-      epoch: number;
-      secret: string;
-      commitment: string;
-      memberAids: string[];
-      epochChain?: string;
-      pendingRotationId?: string;
-      epochChainUnverified?: boolean | null;
-      epochChainUnverifiedReason?: string | null;
-      oldEpochRetentionMs: number;
-    },
-  ): boolean {
-    return this._getDB(aid).storeGroupSecretTransition(groupId, opts);
-  }
-
-  storeGroupSecretEpoch(
-    aid: string,
-    groupId: string,
-    opts: {
-      epoch: number;
-      secret: string;
-      commitment: string;
-      memberAids: string[];
-      epochChain?: string;
-      pendingRotationId?: string;
-      epochChainUnverified?: boolean | null;
-      epochChainUnverifiedReason?: string | null;
-      oldEpochRetentionMs: number;
-    },
-  ): boolean {
-    return this._getDB(aid).storeGroupSecretEpoch(groupId, opts);
-  }
-
-  discardPendingGroupSecretState(aid: string, groupId: string, epoch: number, rotationId: string): boolean {
-    return this._getDB(aid).discardPendingGroupSecretState(groupId, epoch, rotationId);
-  }
-
-  deleteGroupSecretState(aid: string, groupId: string): void {
-    const db = this._getDB(aid);
-    db.deleteGroupCurrent(groupId);
-    db.deleteAllGroupOldEpochs(groupId);
-  }
-
   // ── Instance State ───────────────────────────────────────
 
   loadInstanceState(aid: string, deviceId: string, slotId = ''): MetadataRecord | null {
@@ -398,16 +301,6 @@ export class FileKeyStore implements KeyStore {
     const updated = updater(working) ?? working;
     db.saveInstanceState(deviceId, slotId, updated);
     return deepClone(updated);
-  }
-
-  // ── E2EE Sessions ────────────────────────────────────────
-
-  loadE2EESessions(aid: string): Array<Record<string, unknown>> {
-    return this._getDB(aid).loadAllSessions();
-  }
-
-  saveE2EESession(aid: string, sessionId: string, data: Record<string, unknown>): void {
-    this._getDB(aid).saveSession(sessionId, data);
   }
 
   // ── Seq Tracker ───────────────────────────────────────────
@@ -563,5 +456,11 @@ export class FileKeyStore implements KeyStore {
 
   private _certVersionPath(aid: string, fp: string): string {
     return join(this._aidsRoot, safeAid(aid), 'public', 'certs', `${fp.replace(/:/g, '_')}.pem`);
+  }
+
+  /** 获取指定 AID 的 V2KeyStore（共享同一 SQLite 连接）。 */
+  getV2KeyStore(aid: string): V2KeyStore {
+    const db = this._getDB(aid);
+    return new V2KeyStore(db.getSqliteHandle());
   }
 }

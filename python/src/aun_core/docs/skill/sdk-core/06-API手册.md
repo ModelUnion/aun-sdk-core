@@ -15,17 +15,19 @@
 - [disconnect()](#await-disconnect---none) - 断开连接（可重连）
 - [list_identities()](#list_identities---listdict) - 列出本地身份
 - [ping()](#await-pingparams-dict--none---any) - 连通性探测
-- [set_local_agent_md_path()](#set_local_agent_md_pathpath-str---str--agentmd-版本一致性) - 配置本地 agent.md 路径，与服务端 etag 比对
+- [set_local_agent_md_path()](#set_local_agent_md_pathpath-str---str--agentmd-版本一致性) - **已删除**，请改用 `publish_agent_md()` / `fetch_agent_md()`
+- [publish_agent_md()](#await-publish_agent_mdpath-str---dict--agentmd-发布主-api) - 读取本地 agent.md → 签名 → 上传，并刷新内部 etag
+- [fetch_agent_md()](#await-fetch_agent_mdaid-str--none-save_path-str--none---dict--agentmd-下载主-api) - 下载 agent.md → 自动验签 → 可选写盘
 - [status()](#await-statusparams-dict--none---any) - 网关状态查询
 - [check_gateway_health()](#await-check_gateway_healthgateway_url-str-timeout-float--50---bool) - 检查网关可用性
 
 ### [AUNClient.Auth](#authnamespace-clientauth)
 - [create_aid()](#await-create_aidparams-dict---dict) - 注册新 AID
 - [authenticate()](#await-authenticateparams-dict--none---dict) - 认证获取令牌
-- [sign_agent_md()](#await-sign_agent_mdcontent-str-aid-str--none---str) - 为 agent.md 生成尾部签名
-- [verify_agent_md()](#await-verify_agent_mdcontent-str-aid-str--none-cert_pem-str--none---dict) - 验证 agent.md 尾部签名
-- [upload_agent_md()](#await-upload_agent_mdcontent-str---dict) - 上传自己的 agent.md
-- [download_agent_md()](#await-download_agent_mdaid-str---str) - 下载指定 AID 的 agent.md
+- [sign_agent_md()](#await-sign_agent_mdcontent-str-aid-str--none---str) - 为 agent.md 生成尾部签名 **（已 deprecated，建议改用 `client.publish_agent_md`）**
+- [verify_agent_md()](#await-verify_agent_mdcontent-str-aid-str--none-cert_pem-str--none---dict) - 验证 agent.md 尾部签名 **（已 deprecated，建议改用 `client.fetch_agent_md`）**
+- [upload_agent_md()](#await-upload_agent_mdcontent-str---dict) - 上传自己的 agent.md **（已 deprecated，建议改用 `client.publish_agent_md`）**
+- [download_agent_md()](#await-download_agent_mdaid-str---str) - 下载指定 AID 的 agent.md **（已 deprecated，建议改用 `client.fetch_agent_md`）**
 - [renew_cert()](#await-renew_certparams-dict--none---dict) - 续期证书
 - [rekey()](#await-rekeyparams-dict--none---dict) - 密钥轮换
 - [request_cert()](#await-request_certparams-dict---dict) - 通用证书请求
@@ -141,6 +143,8 @@ client = AUNClient({
 | `auto_reconnect` | `bool` | `True` | 断线自动重连 |
 | `heartbeat_interval` | `float` | `30.0` | 心跳间隔（秒） |
 | `token_refresh_before` | `float` | `60.0` | 令牌过期前多久刷新（秒） |
+| `connection_kind` | `str` | `"long"` | 连接类型：`"long"` = 长连接（收推送）；`"short"` = 短连接（发 RPC 后断开） |
+| `short_ttl_ms` | `int` | `0` | 仅 `kind="short"` 时有效，服务端兜底关闭超时（毫秒）；0 = 不限时 |
 | `retry.initial_delay` | `float` | `1.0` | 首次重连延迟（秒） |
 | `retry.max_delay` | `float` | `64.0` | 最大重连延迟（秒） |
 | `timeouts.connect` | `float` | `5.0` | 连接超时（秒） |
@@ -158,6 +162,34 @@ await client.connect(auth, {
     "heartbeat_interval": 30.0,
 })
 ```
+
+**典型使用模式**
+
+长连接守护进程（常驻收件箱）：
+
+```python
+client = AUNClient({"aun_path": "/home/alice/.aun/alice"})
+auth = await client.auth.authenticate({"aid": "alice.example.com"})
+await client.connect(auth, {"connection_kind": "long", "slot_id": "main"})
+client.on("message.received", handle)
+await asyncio.Event().wait()  # 常驻
+```
+
+CLI 短连接（与长连接共享 keystore，自动复用 token）：
+
+```python
+client = AUNClient({"aun_path": "/home/alice/.aun/alice"})  # 同 path
+auth = await client.auth.authenticate({"aid": "alice.example.com"})  # 命中 cached token
+await client.connect(auth, {
+    "connection_kind": "short",
+    "slot_id": "main",        # 与长连接同槽位共存
+    "short_ttl_ms": 30000,
+})
+await client.call("message.send", {...})
+await client.close()
+```
+
+完整说明（token 复用机制、三种典型场景对比）见 [04-连接与认证.md](04-连接与认证.md#长连接--短连接代码示例)。
 
 ---
 
@@ -364,58 +396,99 @@ for item in identities:
 
 ---
 
-### `set_local_agent_md_path(path: str) -> str` — agent.md 版本一致性
+### `await publish_agent_md(path: str) -> dict` — agent.md 发布主 API
 
-记录本地 `agent.md` 文件路径并一次性计算 etag（带引号的 sha256 hex，与服务端 `_agent_md_etag` 算法严格一致）。
-
-**用途：** 配合服务端 Gateway 在每次 RPC 响应注入的 `_meta.agent_md_etag`，让 SDK 应用层判断 "本地 agent.md 是否已发布到服务端 / 服务端是否有新版本"。
+读取本地 `agent.md` 文件 → 调用 `auth.sign_agent_md` 在尾部追加 `<!-- AUN-SIGNATURE -->` 块 → 调用 `auth.upload_agent_md` 上传到服务端，并以**上传字节的 sha256**计算 quoted etag 写入内部 `_local_agent_md_etag`，使后续应用事件 payload 中的 `_agent_md.local_etag` 字段反映服务端实际生效的版本。
 
 **API 跨语言对齐：**
 
-| SDK | 设置方法 | 读本地 etag | 读远端 etag |
-|------|---------|-----------|----------|
-| Python | `client.set_local_agent_md_path(path)` | `client.get_local_agent_md_etag()` | `client.get_remote_agent_md_etag()` |
-| TypeScript | `client.setLocalAgentMdPath(path)` | `client.getLocalAgentMdEtag()` | `client.getRemoteAgentMdEtag()` |
-| Go | `client.SetLocalAgentMDPath(path) string` | `client.GetLocalAgentMDEtag() string` | `client.GetRemoteAgentMDEtag() string` |
-| C++ | `client.SetLocalAgentMdPath(path)` | `client.GetLocalAgentMdEtag()` | `client.GetRemoteAgentMdEtag()` |
-| JavaScript（浏览器） | `client.setLocalAgentMdContent(content)` | `client.getLocalAgentMdEtag()` | `client.getRemoteAgentMdEtag()` |
+| SDK | 签名 |
+|------|------|
+| Python | `await client.publish_agent_md(path: str) -> dict` |
+| TypeScript（Node） | `await client.publishAgentMd(path: string)` |
+| Go | `client.PublishAgentMD(ctx, path string) (map[string]any, error)` |
+| C++ | `client.PublishAgentMd(path, callback)` |
+| JavaScript（浏览器） | `await client.publishAgentMd(content: string)` — 浏览器无文件系统，接收 markdown 文本 |
 
-**JavaScript 特殊说明：** 浏览器无法读本地文件，改为接收文本内容直接计算 etag（业务侧可用 `<input type=file>` 读出文本传入）。TS SDK 在 Node 环境读文件，浏览器环境返回空串并 warn。
+**返回值：** 透传 `auth.upload_agent_md` 的返回，含 `aid` / `etag` / `last_modified` / `agent_md_url` / `bytes`。
 
-**返回值：** 当前 etag（形如 `"abc123..."` 带引号），文件不存在/读取失败时返回空串，**不抛异常**。
+**异常：**
+- `ValidationError`：path / content 为空
+- `FileNotFoundError`（其它语言对应）：文件不存在
+- `StateError`：尚未持有本地身份
+- `AUNError`：上传失败
 
-**应用层事件注入：** SDK 在 publish `message.received` / `group.message_created` 等应用事件时，会自动给 payload 加 `_agent_md` 字段：
+**示例：**
+
+```python
+result = await client.publish_agent_md("/path/to/agent.md")
+print(result["agent_md_url"])
+```
+
+---
+
+### `await fetch_agent_md(aid: str | None = None, save_path: str | None = None) -> dict` — agent.md 下载主 API
+
+下载指定 AID 的 `agent.md`，自动调用 `auth.verify_agent_md` 验签；`aid` 缺省取本地身份；可选 `save_path` 写盘；若目标 aid 是自己则同步刷新内部 `_local_agent_md_etag` 并计算 `in_sync`。
+
+**API 跨语言对齐：**
+
+| SDK | 签名 |
+|------|------|
+| Python | `await client.fetch_agent_md(aid=None, save_path=None) -> dict` |
+| TypeScript（Node） | `await client.fetchAgentMd(aid?, savePath?)` |
+| Go | `client.FetchAgentMD(ctx, aid string, savePath string) (*AgentMDInfo, error)` |
+| C++ | `client.FetchAgentMd(aid, save_path, callback)` |
+| JavaScript（浏览器） | `await client.fetchAgentMd(aid?)` — 无 savePath（浏览器无文件系统） |
+
+**返回字段：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `aid` | `str` | 实际下载的 AID（缺省时为自身 AID） |
+| `content` | `str` | agent.md 完整文本 |
+| `signature` | `dict` | `auth.verify_agent_md` 的返回（status / verified / reason / cert_fingerprint / timestamp） |
+| `in_sync` | `bool \| None` | 仅当 aid 是自己时给出：本地 etag == 服务端 etag；否则为 `null` |
+| `saved_to` | `str \| None` | 若传了 save_path 且写盘成功，返回路径；其他情况为 `null`（JS 浏览器版无此字段） |
+| `save_error` | `str \| None` | 写盘失败原因；不影响下载成功（JS 浏览器版无此字段） |
+
+**异常：**
+- `ValidationError`：未传 aid 且本地无身份
+- `NotFoundError`：服务端 404
+- `AUNError`：其他 HTTP 错误
+
+**etag 缓存：** 内部沿用 `auth.download_agent_md` 的 If-None-Match / 304 缓存机制；命中 304 时返回上次缓存的内容。
+
+**示例：**
+
+```python
+# 拉自己的 agent.md，并判断是否与服务端同步
+info = await client.fetch_agent_md()
+print(info["signature"]["status"], info["in_sync"])
+
+# 拉别人的 agent.md，并存到本地路径
+info = await client.fetch_agent_md("bob.agentid.pub", save_path="./bob.md")
+```
+
+---
+
+### `_agent_md` 事件 payload 字段（保留）
+
+SDK 在 publish `message.received` / `group.message_created` 等应用事件时仍会自动注入：
 
 ```python
 {
   "_agent_md": {
-    "local_etag": "\"abc...\"",   # 本地 agent.md 的 etag
-    "remote_etag": "\"def...\"",  # gateway 注入的服务端 etag
+    "local_etag": "\"abc...\"",   # publish_agent_md / fetch_agent_md（自身）后内部计算
+    "remote_etag": "\"def...\"",  # gateway 在每次 RPC envelope._meta.agent_md_etag 注入
   },
   # ... 原有业务字段
 }
 ```
 
-**典型用法：**
+应用层比对二者是否一致即可知本地是否需要重新 publish。
 
-```python
-client = AUNClient()
-client.set_local_agent_md_path("/path/to/agent.md")  # 启动时调一次
-
-await client.connect(auth)
-
-@client.on("message.received")
-async def on_msg(payload):
-    meta = payload.get("_agent_md", {})
-    if meta["local_etag"] and meta["remote_etag"] and meta["local_etag"] != meta["remote_etag"]:
-        # 本地与服务端不一致，提示用户重新上传
-        print("agent.md 已变化，请调用 client.auth.upload_agent_md() 同步")
-```
-
-**注意事项：**
-- 文件改了之后需要再次调用 `set_local_agent_md_path()` 触发重算（设计上一次性计算，不监听文件 mtime）
-- 服务端 etag 来自 Gateway 缓存（5 分钟 TTL，上传后通过 kernel 事件立即失效）
-- 注入失败被吞，**绝不影响业务路径**
+> **注意：** v0.x 起删除了 `set_local_agent_md_path()` / `get_local_agent_md_etag()` / `get_remote_agent_md_etag()` 三个旧 API。`_local_etag` 现在由 `publish_agent_md` / `fetch_agent_md(自身 aid)` 自动计算并缓存；不再支持外部直接设置或读取。
 
 ---
 
@@ -507,6 +580,8 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 
 ### `await sign_agent_md(content: str, aid: str | None = None) -> str`
 
+> **⚠️ Deprecated。** 主要场景请改用 `client.publish_agent_md(path)`，它内部已包含读文件 + 签名 + 上传一整套流程。`sign_agent_md` 仅作为离线签名（先签名后异步发布、给非 SDK 渠道发送等）的底层工具继续保留，未来版本将移除。
+
 为 `agent.md` 生成尾部签名块。
 
 **参数**
@@ -529,6 +604,8 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 ---
 
 ### `await verify_agent_md(content: str, aid: str | None = None, cert_pem: str | None = None) -> dict`
+
+> **⚠️ Deprecated。** 主要场景请改用 `client.fetch_agent_md(aid)`，它内部已包含下载 + 自动验签 + etag 缓存。`verify_agent_md` 仅作为对纯文本 agent.md（来自非 SDK 渠道）的验签底层工具继续保留，未来版本将移除。
 
 验证 `agent.md` 尾部签名。
 
@@ -561,6 +638,8 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 ---
 
 ### `await upload_agent_md(content: str) -> dict`
+
+> **⚠️ Deprecated。** 请改用 `client.publish_agent_md(path)`，它会自动读文件、签名、上传并刷新内部 etag。`upload_agent_md` 仅作底层 API 继续保留以兼容旧代码，未来版本将移除。
 
 上传当前 AID 的公开 `agent.md` 文档。
 
@@ -606,6 +685,8 @@ name: Alice
 
 ### `await download_agent_md(aid: str) -> str`
 
+> **⚠️ Deprecated。** 请改用 `client.fetch_agent_md(aid)`，它会自动下载、验签、刷新内部 etag，并支持可选写盘。`download_agent_md` 仅作底层 API 继续保留以兼容旧代码，未来版本将移除。
+
 匿名下载指定 AID 的公开 `agent.md` 文档。
 
 **参数**
@@ -640,7 +721,7 @@ agent_md = await client.auth.download_agent_md("bob.agentid.pub")
 
 **参数 / 返回值**: 详见协议文档 [01-身份与凭证协议-auth §1.6 auth.renew_cert](../../docs/protocol/01-身份与凭证协议-auth.md)
 
-**注意**: 各 SDK 均提供对应便捷方法；也都可直接通过底层 `auth.renew_cert` RPC 调用
+**注意**: 仅 Python SDK 提供此便捷方法；其他语言通过 `client.call("auth.renew_cert", params)` 调用
 
 ---
 
@@ -652,7 +733,7 @@ agent_md = await client.auth.download_agent_md("bob.agentid.pub")
 
 **参数 / 返回值**: 详见协议文档 [01-身份与凭证协议-auth §1.6 auth.rekey](../../docs/protocol/01-身份与凭证协议-auth.md)
 
-**注意**: 各 SDK 均提供对应便捷方法；也都可直接通过底层 `auth.rekey` RPC 调用
+**注意**: 仅 Python SDK 提供此便捷方法；其他语言通过 `client.call("auth.rekey", params)` 调用
 
 ---
 
@@ -664,7 +745,7 @@ agent_md = await client.auth.download_agent_md("bob.agentid.pub")
 
 **参数 / 返回值**: 详见协议文档 [01-身份与凭证协议-auth §1.6 auth.request_cert](../../docs/protocol/01-身份与凭证协议-auth.md)
 
-**注意**: 各 SDK 均提供对应便捷方法；也都可直接通过底层 `auth.request_cert` RPC 调用
+**注意**: 仅 Python SDK 提供此便捷方法；其他语言通过 `client.call("auth.request_cert", params)` 调用
 
 ---
 

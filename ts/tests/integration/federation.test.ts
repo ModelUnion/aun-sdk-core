@@ -134,8 +134,9 @@ describe('双域 Federation 集成测试', () => {
     expect(target?.encrypted).toBe(true);
 
     const e2ee = (target?.e2ee ?? {}) as JsonObject;
-    expect(String(e2ee.encryption_mode ?? '')).toBe('prekey_ecdh_v2');
-    expect(String(e2ee.prekey_id ?? '')).not.toBe('');
+    expect(e2ee.version).toBe('v2');
+    expect(String(e2ee.encryption_mode ?? '')).toMatch(/^v2_/);
+    expect(e2ee.forward_secrecy).toBe(true);
   }, TEST_TIMEOUT);
 
   it('group 跨域加人、发消息、邀请码入群走公开接口', async () => {

@@ -130,8 +130,8 @@ describe('长短连接共存', () => {
     (client as any)._sessionOptions = { connection_kind: 'long' };
     const startHeartbeat = vi.spyOn(client as any, '_startHeartbeatTask').mockImplementation(() => {});
     const startTokenRefresh = vi.spyOn(client as any, '_startTokenRefreshTask').mockImplementation(() => {});
-    // 也 mock group epoch tasks 避免副作用
-    vi.spyOn(client as any, '_startGroupEpochTasks').mockImplementation(() => {});
+    // 也 mock V2 maintenance tasks 避免副作用
+    vi.spyOn(client as any, '_startV2MaintenanceTasks').mockImplementation(() => {});
     (client as any)._startBackgroundTasks();
     expect(startHeartbeat).toHaveBeenCalled();
     expect(startTokenRefresh).toHaveBeenCalled();

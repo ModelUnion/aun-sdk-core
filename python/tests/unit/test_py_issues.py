@@ -225,30 +225,6 @@ class TestPY003PY005DisconnectSavesSeqTracker:
 # ── PY-004: _prekey_refresh_loop 实现 ─────────────────────
 
 
-class TestPY004PrekeyRefreshLoop:
-    """PY-004: _prekey_refresh_loop 不应为空实现，应定期上传 prekey。"""
-
-    def test_prekey_refresh_loop_not_empty(self):
-        """_prekey_refresh_loop 不应直接 return（空实现）。"""
-        import inspect
-        from aun_core import AUNClient
-        source = inspect.getsource(AUNClient._prekey_refresh_loop)
-        # 空实现只有 return 语句
-        lines = [l.strip() for l in source.splitlines() if l.strip() and not l.strip().startswith(("#", "\"\"\"", "async"))]
-        assert len(lines) > 1, "_prekey_refresh_loop 不应为空实现（仅 return）"
-
-    def test_start_prekey_refresh_task_not_empty(self):
-        """_start_prekey_refresh_task 不应直接 return（空实现）。"""
-        import inspect
-        from aun_core import AUNClient
-        source = inspect.getsource(AUNClient._start_prekey_refresh_task)
-        lines = [l.strip() for l in source.splitlines() if l.strip() and not l.strip().startswith(("#", "\"\"\"", "def"))]
-        assert len(lines) > 1, "_start_prekey_refresh_task 不应为空实现（仅 return）"
-
-
-# ── PY-006: discovery check_health 异常日志 ───────────────
-
-
 class TestPY006DiscoveryCheckHealthLogging:
     """PY-006: check_health 异常不应被静默吞掉，应记录日志。"""
 

@@ -5,7 +5,7 @@
  * 复杂的集成场景需要 Docker 环境。这里用 stub 覆盖可单元测试的部分。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { AuthFlow } from '../../src/auth.js';
 import { AuthError, StateError } from '../../src/errors.js';
 
@@ -53,6 +53,80 @@ describe('AuthFlow', () => {
     const err = new StateError('no identity');
     expect(err.name).toBe('StateError');
     expect(err.message).toBe('no identity');
+  });
+
+  it('默认 capabilities 仅声明 E2EE V2 能力', async () => {
+    const auth = new AuthFlow({
+      keystore: {} as any,
+      crypto: {} as any,
+      verifySsl: false,
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+        info: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const mockTransport = {
+      call: vi.fn().mockResolvedValue({ status: 'ok' }),
+    };
+
+    await (auth as any)._initializeSession(mockTransport, 'nonce123', 'token123', {
+      deviceId: 'dev1',
+      slotId: '',
+      deliveryMode: { mode: 'fanout' },
+      connectionKind: 'long',
+      shortTtlMs: 0,
+    });
+
+    const args = mockTransport.call.mock.calls[0][1] as Record<string, unknown>;
+    expect(args.capabilities).toBeDefined();
+    const capabilities = args.capabilities as Record<string, unknown>;
+    expect(capabilities.supported_p2p_e2ee).toEqual(['e2ee_v2']);
+    expect(capabilities.supported_group_e2ee).toEqual(['group_e2ee_v2']);
+    expect(capabilities.e2ee).toBe(true);
+    expect(capabilities.group_e2ee).toBe(true);
+  });
+
+  it('覆盖 capabilities 也会被规范化为 V2-only', async () => {
+    const auth = new AuthFlow({
+      keystore: {} as any,
+      crypto: {} as any,
+      verifySsl: false,
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+        info: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const mockTransport = {
+      call: vi.fn().mockResolvedValue({ status: 'ok' }),
+    };
+
+    await (auth as any)._initializeSession(mockTransport, 'nonce123', 'token123', {
+      deviceId: 'dev1',
+      slotId: '',
+      deliveryMode: { mode: 'fanout' },
+      connectionKind: 'long',
+      shortTtlMs: 0,
+      extraInfo: {
+        _capabilities: {
+          e2ee: false,
+          group_e2ee: false,
+          supported_p2p_e2ee: ['e2ee'],
+          supported_group_e2ee: ['group_e2ee'],
+        },
+      },
+    });
+
+    const args = mockTransport.call.mock.calls[0][1] as Record<string, unknown>;
+    const capabilities = args.capabilities as Record<string, unknown>;
+    expect(capabilities.supported_p2p_e2ee).toEqual(['e2ee_v2']);
+    expect(capabilities.supported_group_e2ee).toEqual(['group_e2ee_v2']);
+    expect(capabilities.e2ee).toBe(true);
+    expect(capabilities.group_e2ee).toBe(true);
+    expect((args.extra_info as Record<string, unknown> | undefined)?._capabilities).toBeUndefined();
   });
 
   it('OCSP DER 解析应支持 responderID byKey ([2]) 响应', () => {

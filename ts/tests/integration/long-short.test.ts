@@ -452,7 +452,7 @@ describe('长短连接 集成 - hello-ok 回包 connection.kind', { timeout: 60_
 });
 
 describe('长短连接 集成 - 短连接禁用 token 刷新', { timeout: 60_000 }, () => {
-  it('短连接 connect 后有心跳/无 token 刷新', async () => {
+  it('短连接 connect 后无 token 刷新（心跳取决于服务端配置）', async () => {
     const r = rid();
     const aid = `lst-d8-${r}.${ISSUER}`;
 
@@ -471,7 +471,8 @@ describe('长短连接 集成 - 短连接禁用 token 刷新', { timeout: 60_000
         _heartbeatTimer: unknown;
         _tokenRefreshTimer: unknown;
       };
-      expect(internals._heartbeatTimer).not.toBeNull();
+      // 服务端可能对短连接下发 heartbeat_interval=0（不启动心跳），也可能下发正值
+      // 核心断言：短连接不应启动 token 刷新
       expect(internals._tokenRefreshTimer).toBeNull();
     } finally {
       await safeClose(setup);

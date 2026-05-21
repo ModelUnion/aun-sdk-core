@@ -33,10 +33,16 @@ func writeValue(buf *strings.Builder, v any) {
 		buf.WriteString(val.String())
 	case float64:
 		// 不应出现（使用 UseNumber 解析），但作为兜底
-		if val == float64(int64(val)) {
-			buf.WriteString(fmt.Sprintf("%d", int64(val)))
+		// 对齐 Python：整数值保留 ".0"，非整数用定点（不用科学计数法）
+		if val == float64(int64(val)) && val >= -1e15 && val <= 1e15 {
+			buf.WriteString(fmt.Sprintf("%.1f", val))
 		} else {
-			buf.WriteString(fmt.Sprintf("%g", val))
+			s := fmt.Sprintf("%.20f", val)
+			s = strings.TrimRight(s, "0")
+			if s[len(s)-1] == '.' {
+				s += "0"
+			}
+			buf.WriteString(s)
 		}
 	case string:
 		writeString(buf, val)

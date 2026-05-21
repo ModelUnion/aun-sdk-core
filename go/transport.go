@@ -1,6 +1,7 @@
 package aun
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -18,11 +19,11 @@ import (
 
 // eventNameMap 协议事件名到 SDK 事件名的映射
 var eventNameMap = map[string]string{
-	"message.received":      "message.received",
-	"message.recalled":      "message.recalled",
-	"message.ack":           "message.ack",
-	"group.changed":         "group.changed",
-	"group.message_created": "group.message_created", // ISSUE-SDK-GO-001: 补充群消息事件映射
+	"message.received":       "message.received",
+	"message.recalled":       "message.recalled",
+	"message.ack":            "message.ack",
+	"group.changed":          "group.changed",
+	"group.message_created":  "group.message_created", // ISSUE-SDK-GO-001: 补充群消息事件映射
 	"storage.object_changed": "storage.object_changed",
 }
 
@@ -86,19 +87,19 @@ func summarizeDict(payload any, fields []string) string {
 // RPCTransport WebSocket JSON-RPC 2.0 传输层
 // 与 Python SDK transport.py 对应。
 type RPCTransport struct {
-	dispatcher    *EventDispatcher
-	timeout       atomic.Int64 // 纳秒，使用 atomic 保证跨 goroutine 安全
-	onDisconnect  func(error, int)
-	verifySSL     bool
-	ws            *websocket.Conn
-	pending       map[string]chan map[string]any
-	pendingMu     sync.Mutex
-	closed        bool
-	closedMu      sync.RWMutex
-	challenge     map[string]any
-	challengeMu   sync.RWMutex
-	cancelReader  context.CancelFunc
-	readerDone    chan struct{}
+	dispatcher   *EventDispatcher
+	timeout      atomic.Int64 // 纳秒，使用 atomic 保证跨 goroutine 安全
+	onDisconnect func(error, int)
+	verifySSL    bool
+	ws           *websocket.Conn
+	pending      map[string]chan map[string]any
+	pendingMu    sync.Mutex
+	closed       bool
+	closedMu     sync.RWMutex
+	challenge    map[string]any
+	challengeMu  sync.RWMutex
+	cancelReader context.CancelFunc
+	readerDone   chan struct{}
 
 	// Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
 	// 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
@@ -546,10 +547,37 @@ func methodOrPlaceholder(s string) string {
 // decodeMessage 解码 WebSocket 消息为 map
 func decodeMessage(data []byte) (map[string]any, error) {
 	var message map[string]any
-	if err := json.Unmarshal(data, &message); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&message); err != nil {
 		return nil, NewSerializationError("invalid JSON payload")
 	}
-	return message, nil
+	return normalizeDecodedJSONNumbers(message).(map[string]any), nil
+}
+
+func normalizeDecodedJSONNumbers(v any) any {
+	switch value := v.(type) {
+	case map[string]any:
+		for k, item := range value {
+			value[k] = normalizeDecodedJSONNumbers(item)
+		}
+		return value
+	case []any:
+		for i, item := range value {
+			value[i] = normalizeDecodedJSONNumbers(item)
+		}
+		return value
+	case json.Number:
+		if i, err := value.Int64(); err == nil {
+			return i
+		}
+		if f, err := value.Float64(); err == nil {
+			return f
+		}
+		return value.String()
+	default:
+		return value
+	}
 }
 
 // generateRPCID 生成随机的 RPC 请求 ID

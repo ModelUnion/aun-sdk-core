@@ -217,12 +217,14 @@ class MultiDeviceTestRunner:
     # ── 场景 1：两个设备各自注册独立 V2 session ──
 
     async def test_independent_sessions(self):
-        """两个设备各自有独立的 IK 和 SPK"""
+        """两个设备共享 AID 身份（IK 相同），但 SPK 必须独立"""
         s1 = self.alice_main._v2_session
         s2 = self.alice_sync._v2_session
         assert s1 is not None and s2 is not None
-        assert s1._ik_pub_der != s2._ik_pub_der, "IK should differ"
-        assert s1._spk_id != s2._spk_id, "SPK should differ"
+        # IK = AID 身份密钥，多设备共享 AID 必然相同
+        assert s1._ik_pub_der == s2._ik_pub_der, "IK should be shared across devices of the same AID"
+        # SPK 是每设备独立生成的 Signed Pre-Key
+        assert s1._spk_id != s2._spk_id, "SPK should differ per device"
 
     # ── 场景 2：Alice(main) 发给 Bob，Bob 能解密 ──
 
@@ -237,7 +239,7 @@ class MultiDeviceTestRunner:
         print(f"\n    [diag] bootstrap Bob: {len(bs.get('peer_devices', []))} devices", end="")
         for d in bs.get("peer_devices", []):
             print(f"\n      device_id={d.get('owner_device_id', d.get('device_id', '?'))}", end="")
-        result = await self.alice_main.send_v2(_BOB_AID, self._payload)
+        result = await self.alice_main.call("message.send", {"to": _BOB_AID, "payload": self._payload})
         assert result.get("status") == "accepted" or result.get("message_id")
         print(f"\n    (msg_id={result.get('message_id', '')[:12]}...)", end=" ")
 
@@ -251,7 +253,7 @@ class MultiDeviceTestRunner:
                     print(f"(Bob: '{m['payload']['text'][:25]}...')", end=" ")
                     return
         # push 没到，尝试 pull
-        msgs = await self.bob_phone.pull_v2()
+        msgs = (await self.bob_phone.call("message.pull", {})).get("messages", [])
         for m in msgs:
             if m.get("payload", {}).get("text") == expected_text:
                 print(f"(Bob via pull: '{m['payload']['text'][:25]}...')", end=" ")
@@ -269,7 +271,7 @@ class MultiDeviceTestRunner:
                 if m.get("payload", {}).get("text") == expected_text and m.get("from") == _ALICE_AID:
                     print(f"(sync: '{m['payload']['text'][:25]}...')", end=" ")
                     return
-        msgs = await self.alice_sync.pull_v2()
+        msgs = (await self.alice_sync.call("message.pull", {})).get("messages", [])
         for m in msgs:
             if m.get("payload", {}).get("text") == expected_text:
                 print(f"(sync via pull: '{m['payload']['text'][:25]}...')", end=" ")
@@ -280,13 +282,13 @@ class MultiDeviceTestRunner:
 
     async def test_bob_reply_both_devices(self):
         """Bob 回复 Alice，两个设备都能解密"""
-        await self.alice_main.ack_v2()
-        await self.alice_sync.ack_v2()
+        await self.alice_main.call("message.ack", {})
+        await self.alice_sync.call("message.ack", {})
         self._main_msgs.clear()
         self._sync_msgs.clear()
 
         reply = {"text": f"bob-reply-v2 {int(time.time())}"}
-        await self.bob_phone.send_v2(_ALICE_AID, reply)
+        await self.bob_phone.call("message.send", {"to": _ALICE_AID, "payload": reply})
 
         expected = reply["text"]
 
@@ -300,12 +302,12 @@ class MultiDeviceTestRunner:
 
         # 兜底
         if not _has(self._main_msgs):
-            for m in await self.alice_main.pull_v2():
+            for m in (await self.alice_main.call("message.pull", {})).get("messages", []):
                 if m.get("payload", {}).get("text") == expected:
                     self._main_msgs.append(m)
                     break
         if not _has(self._sync_msgs):
-            for m in await self.alice_sync.pull_v2():
+            for m in (await self.alice_sync.call("message.pull", {})).get("messages", []):
                 if m.get("payload", {}).get("text") == expected:
                     self._sync_msgs.append(m)
                     break
@@ -318,15 +320,15 @@ class MultiDeviceTestRunner:
 
     async def test_sync_send_main_receives(self):
         """Alice(sync) 发给 Bob，Alice(main) 也能 self-sync"""
-        await self.alice_main.ack_v2()
-        await self.alice_sync.ack_v2()
-        await self.bob_phone.ack_v2()
+        await self.alice_main.call("message.ack", {})
+        await self.alice_sync.call("message.ack", {})
+        await self.bob_phone.call("message.ack", {})
         self._main_msgs.clear()
         self._sync_msgs.clear()
         self._bob_msgs.clear()
 
         payload = {"text": f"from-sync {int(time.time())}"}
-        result = await self.alice_sync.send_v2(_BOB_AID, payload)
+        result = await self.alice_sync.call("message.send", {"to": _BOB_AID, "payload": payload})
         assert result.get("status") == "accepted" or result.get("message_id")
 
         expected = payload["text"]
@@ -340,12 +342,12 @@ class MultiDeviceTestRunner:
                 break
 
         if not _has(self._main_msgs):
-            for m in await self.alice_main.pull_v2():
+            for m in (await self.alice_main.call("message.pull", {})).get("messages", []):
                 if m.get("payload", {}).get("text") == expected:
                     self._main_msgs.append(m)
                     break
         if not _has(self._bob_msgs):
-            for m in await self.bob_phone.pull_v2():
+            for m in (await self.bob_phone.call("message.pull", {})).get("messages", []):
                 if m.get("payload", {}).get("text") == expected:
                     self._bob_msgs.append(m)
                     break

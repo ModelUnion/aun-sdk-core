@@ -458,7 +458,7 @@ window.stepPullGroup = async function() {
     log('info', '收到 ' + msgs.length + ' 条群消息');
     msgs.forEach(function(m, i) {
       const e2eeInfo = m.e2ee
-        ? '已解密 (epoch=' + (m.e2ee.epoch || '?') + ', mode=' + (m.e2ee.encryption_mode || '?') + ')'
+        ? '已解密 (version=' + (m.e2ee.version || '?') + ', suite=' + (m.e2ee.suite || '?') + ')'
         : (m.encrypted ? '加密(未解密)' : '明文');
       const payloadStr = JSON.stringify(m.payload).slice(0, 120);
       log('info', '  [' + i + '] ' + e2eeInfo + ': ' + payloadStr);
@@ -474,9 +474,9 @@ window.stepKickMember = async function() {
   await runStep('btn-kickMember', '踢出: ' + bobAidVal, async () => {
     return await alice.call('group.kick', { group_id: groupId, aid: bobAidVal });
   });
-  log('info', '等待 epoch 轮换 (5s)...');
+  log('info', '等待 V2 state/SPK 同步 (5s)...');
   await new Promise(function(r) { setTimeout(r, 5000); });
-  log('success', 'epoch 轮换等待完成');
+  log('success', 'V2 state/SPK 同步等待完成');
 };
 
 // ── 断言工具 ────────────────────────────────────────
@@ -572,9 +572,9 @@ window.runP2PTest = async function() {
     assert('消息解密成功', !!decrypted);
 
     if (decrypted && decrypted.e2ee) {
-      log('info', '  加密模式: ' + (decrypted.e2ee.encryption_mode || '未知'));
-      log('dim', '  prekey_id: ' + (decrypted.e2ee.prekey_id || '无'));
-      log('dim', '  forward_secrecy: ' + (decrypted.e2ee.encryption_mode === 'prekey_ecdh_v2' ? '是' : '否'));
+      log('info', '  V2 suite: ' + (decrypted.e2ee.suite || '未知'));
+      log('dim', '  version: ' + (decrypted.e2ee.version || '未知'));
+      log('dim', '  forward_secrecy: ' + (decrypted.e2ee.forward_secrecy ? '是' : '否'));
     } else if (decrypted) {
       log('dim', '  明文消息（未加密或已解密但无 e2ee 元数据）');
     } else {
@@ -673,7 +673,7 @@ window.runGroupTest = async function() {
     assert('群消息解密成功', !!decrypted);
 
     if (decrypted && decrypted.e2ee) {
-      log('info', '  加密模式: ' + (decrypted.e2ee.encryption_mode || '未知') + ', epoch=' + decrypted.e2ee.epoch);
+      log('info', '  V2 suite: ' + (decrypted.e2ee.suite || '未知') + ', version=' + (decrypted.e2ee.version || '未知'));
       log('dim', '  sender_verified: ' + (decrypted.e2ee.sender_verified || false));
     } else {
       log('dim', '  消息详情: ' + JSON.stringify(msgs.map(function(m) { return { type: m.payload && m.payload.type, text: m.payload && m.payload.text, e2ee: !!m.e2ee }; })));

@@ -1,7 +1,7 @@
 /**
  * 后台任务管理集成测试 — 对应 P2-11 修复
  *
- * 验证重连后不重复创建后台任务（心跳、prekey 上传等）。
+ * 验证重连后不重复创建后台任务（心跳、token 刷新等）。
  * 测试场景与 Python integration_test_reconnect.py 中的
  * test_no_duplicate_background_tasks 对齐。
  *
@@ -30,7 +30,7 @@ function makeClient(): AUNClient {
   const client = new AUNClient({
     aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-bg-')),
   });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }
 
@@ -169,6 +169,11 @@ describe('后台任务管理集成测试', () => {
 
     await ensureConnected(client, `bg-t1-${r}.agentid.pub`);
     expect(client.state).toBe('connected');
+    const initialHeartbeatInterval = Number((client as any)._sessionOptions?.heartbeat_interval ?? 0);
+    if (!Number.isFinite(initialHeartbeatInterval) || initialHeartbeatInterval <= 0) {
+      console.log('SKIP: 当前服务端未下发长连接业务心跳（heartbeat_interval=0），跳过心跳重复创建校验');
+      return;
+    }
 
     // 记录初始心跳计数（如果 SDK 暴露）
     const initialHeartbeatCount = (client as any)._heartbeatCount ?? 0;
@@ -184,8 +189,14 @@ describe('后台任务管理集成测试', () => {
     const reconnected = await waitForState(client, 'connected', 60000);
     expect(reconnected).toBe(true);
 
-    // 等待一段时间，验证心跳任务未重复创建
-    await sleep(10000);
+    // 等待至少一次心跳实际发生，再判断增量，避免把固定 sleep 卡在重连时序边界上
+    const heartbeatAdvanced = await waitFor(
+      () => ((client as any)._heartbeatCount ?? 0) > initialHeartbeatCount,
+      20000,
+      250,
+    );
+    expect(heartbeatAdvanced).toBe(true);
+
     const finalHeartbeatCount = (client as any)._heartbeatCount ?? 0;
 
     // 验证心跳计数增长正常（约 2 次，允许误差）
@@ -207,13 +218,22 @@ describe('后台任务管理集成测试', () => {
     await ensureConnected(alice, aliceAid);
     await ensureConnected(bob, bobAid);
 
+    const received: any[] = [];
+    bob.on('message.received', (msg: any) => {
+      if (msg?.from === aliceAid) received.push(msg);
+    });
+    const waitForPayload = (text: string, timeoutMs = 10000): Promise<boolean> => waitFor(
+      () => received.some((m) => m?.payload === text || m?.payload?.text === text),
+      timeoutMs,
+    );
+
     // 发送第一条消息
     await alice.call('message.send', {
       to: bobAid,
       payload: 'msg_before_disconnect',
       encrypt: false,
     });
-    await sleep(1000);
+    expect(await waitForPayload('msg_before_disconnect')).toBe(true);
 
     // 触发重连
     const ok = await dockerRestart();
@@ -233,15 +253,8 @@ describe('后台任务管理集成测试', () => {
       payload: 'msg_after_reconnect',
       encrypt: false,
     });
-    await sleep(1000);
-
-    // Bob 拉取消息，验证两条都收到
-    const result = await bob.call('message.pull', { after_seq: 0, limit: 50 }) as any;
-    const messages = (result.messages ?? []) as any[];
-    const payloads = messages
-      .filter((m: any) => m.from === aliceAid)
-      .map((m: any) => m.payload);
-
+    expect(await waitForPayload('msg_after_reconnect')).toBe(true);
+    const payloads = received.map((m: any) => m.payload?.text ?? m.payload);
     expect(payloads).toContain('msg_before_disconnect');
     expect(payloads).toContain('msg_after_reconnect');
   }, 120000);

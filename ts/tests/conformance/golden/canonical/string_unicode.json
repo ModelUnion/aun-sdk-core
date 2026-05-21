@@ -1,0 +1,5 @@
+{
+  "description": "canonical_json input",
+  "input": "中文",
+  "expected_output_b64": "IuS4reaWhyI="
+}

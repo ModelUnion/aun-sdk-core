@@ -5,6 +5,7 @@ package aun
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,11 +113,14 @@ func TestFederationSDKToSDKPrekey(t *testing.T) {
 	if e2ee == nil {
 		t.Fatalf("目标消息缺少 e2ee 字段: %+v", target)
 	}
-	if mode, _ := e2ee["encryption_mode"].(string); mode != ModePrekeyECDHV2 {
+	if ver, _ := e2ee["version"].(string); ver != "v2" {
+		t.Fatalf("跨域消息 E2EE version 错误: %+v", e2ee)
+	}
+	if mode, _ := e2ee["encryption_mode"].(string); !strings.HasPrefix(mode, "v2_") {
 		t.Fatalf("跨域消息加密模式错误: %v", e2ee["encryption_mode"])
 	}
-	if prekeyID, _ := e2ee["prekey_id"].(string); prekeyID == "" {
-		t.Fatalf("prekey_id 为空: %+v", e2ee)
+	if fs, _ := e2ee["forward_secrecy"].(bool); !fs {
+		t.Fatalf("跨域消息应标记 forward_secrecy=true: %+v", e2ee)
 	}
 }
 

@@ -95,3 +95,15 @@ class V2KeyStore:
             (device_id, int(n)),
         ).fetchall()
         return [str(r[0]) for r in rows]
+
+    def list_expired_spk_ids(self, device_id: str, max_age_seconds: float) -> list[str]:
+        """返回 created_at 超过 max_age_seconds 的 SPK key_id 列表（不含当前 SPK）。"""
+        import time
+        cutoff = time.time() - max_age_seconds
+        conn = self._db._get_conn()
+        rows = conn.execute(
+            "SELECT key_id FROM v2_device_keys "
+            "WHERE device_id=? AND key_type='spk' AND created_at < ?",
+            (device_id, cutoff),
+        ).fetchall()
+        return [str(r[0]) for r in rows]

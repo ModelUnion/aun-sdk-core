@@ -74,7 +74,8 @@ describe('P2-5: group.pull 应喂原始消息给 onPullResult', () => {
       expect.arrayContaining([
         expect.objectContaining({ seq: 1, content: 'encrypted-payload-1' }),
         expect.objectContaining({ seq: 2, content: 'encrypted-payload-2' }),
-      ])
+      ]),
+      0,
     );
   });
 });
@@ -186,7 +187,7 @@ describe('P2-6.6: group.changed 事件补洞链路', () => {
 
     const pullCall = transportCalls.find(({ method }) => method === 'group.pull_events');
     expect(pullCall?.params).toMatchObject({
-      group_id: 'G1',
+      group_id: 'g1',
       after_event_seq: 0,
       device_id: 'device-1',
       slot_id: 'slot-a',
@@ -321,7 +322,6 @@ describe('P2-8: _restoreSeqTrackerState 应真正 await', () => {
       cleanExpiredCaches: vi.fn(),
     };
     (client as any)._startBackgroundTasks = vi.fn();
-    (client as any)._uploadPrekey = vi.fn().mockResolvedValue({ ok: true });
 
     await (client as any)._connectOnce({
       access_token: 'token-123',
@@ -370,7 +370,7 @@ describe('close_code 1000 不应视为 serverInitiated', () => {
 
 // ── group.add_member 密钥分发结果检查测试 ──────────────────
 
-describe('group.add_member 失败时不应分发密钥', () => {
+describe('group.add_member V2-only 编排', () => {
   let client: AUNClient;
 
   beforeEach(() => {
@@ -380,51 +380,50 @@ describe('group.add_member 失败时不应分发密钥', () => {
     (client as any)._deviceId = 'device-001';
   });
 
-  it('group.add_member 返回 error 时不应触发密钥分发', async () => {
+  it('group.add_member 返回 error 时不应触发 V1 密钥分发，且不触发 V2 state propose', async () => {
     // 模拟 transport.call 返回错误结果
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       error: { code: -33003, message: 'not authorized' },
     });
 
-    const distributeSpy = vi.spyOn(client as any, '_distributeKeyToNewMember').mockResolvedValue(undefined);
-    const rotateSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
+    (client as any)._v2Session = {};
+    const proposeSpy = vi.spyOn(client as any, '_v2AutoProposeState').mockResolvedValue(undefined);
 
     await client.call('group.add_member', {
       group_id: 'group-123',
       aid: 'new-member.aid.com',
     });
 
-    // 失败的 add_member 不应触发密钥分发
-    expect(distributeSpy).not.toHaveBeenCalled();
-    expect(rotateSpy).not.toHaveBeenCalled();
+    expect((client as any)._distributeKeyToNewMember).toBeUndefined();
+    expect((client as any)._rotateGroupEpoch).toBeUndefined();
+    expect(proposeSpy).not.toHaveBeenCalled();
   });
 
-  it('group.add_member 成功时应触发 epoch 轮换兜底', async () => {
+  it('group.add_member 成功时应触发 V2 state auto-propose，而不是 V1 epoch 轮换', async () => {
     // 模拟成功结果
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       ok: true,
     });
 
-    const rotateSpy = vi.spyOn(client as any, '_maybeLeadRotateGroupEpoch').mockResolvedValue(undefined);
+    (client as any)._v2Session = {};
+    const proposeSpy = vi.spyOn(client as any, '_v2AutoProposeState').mockResolvedValue(undefined);
 
     await client.call('group.add_member', {
       group_id: 'group-123',
       aid: 'new-member.aid.com',
     });
 
-    expect(rotateSpy).toHaveBeenCalledWith('group-123', expect.any(String), null, false);
+    expect((client as any)._maybeLeadRotateGroupEpoch).toBeUndefined();
+    expect(proposeSpy).toHaveBeenCalledWith('group-123');
   });
 });
 
-// ── JS-012: _buildRotationSignature 不应使用动态 import ──────────
+// ── JS-012: V1 rotation signature helper 已移除 ──────────
 
-describe('JS-012: _buildRotationSignature 不应使用冗余动态 import', () => {
-  it('源码中 _buildRotationSignature 不应包含动态 import("./crypto")', async () => {
-    // 读取 _buildRotationSignature 方法源码，确认没有动态 import
+describe('JS-012: _buildRotationSignature V1 helper 已移除', () => {
+  it('client 不再保留 _buildRotationSignature', async () => {
     const client = new AUNClient();
-    const methodSrc = (client as any)._buildRotationSignature.toString();
-    // 修复后不应再包含 import('./crypto 这样的动态导入
-    expect(methodSrc).not.toContain("import(");
+    expect((client as any)._buildRotationSignature).toBeUndefined();
   });
 });
 

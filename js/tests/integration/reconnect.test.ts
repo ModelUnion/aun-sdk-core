@@ -30,7 +30,7 @@ function makeClient(): AUNClient {
   const client = new AUNClient({
     aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-')),
   });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }
 
@@ -250,17 +250,26 @@ describe('断线重连集成测试', () => {
     expect(await waitForState(bob, 'connected', 60000)).toBe(true);
     await sleep(3000);
 
+    const received: Message[] = [];
+    const expectedText = `重连后消息-${r}`;
+    const gotMessage = new Promise<void>((resolve) => {
+      bob.on('message.received', (msg: unknown) => {
+        const m = msg as Message;
+        received.push(m);
+        const payload = m.payload as JsonObject | undefined;
+        if (payload?.text === expectedText) resolve();
+      });
+    });
+
     const sendResult = await alice.call('message.send', {
       to: bobAid,
-      payload: { type: 'text', text: '重连后消息' },
+      payload: { type: 'text', text: expectedText },
       encrypt: false,
     }) as JsonObject;
     expect(sendResult.message_id).toBeTruthy();
 
-    await sleep(1000);
-    const pullResult = await bob.call('message.pull', { after_seq: 0, limit: 10 }) as JsonObject;
-    const messages = (pullResult.messages ?? []) as Message[];
-    expect(messages.length).toBeGreaterThan(0);
+    await Promise.race([gotMessage, sleep(10000)]);
+    expect(received.some((m) => (m.payload as JsonObject | undefined)?.text === expectedText)).toBe(true);
   }, 120000);
 
   it('停止 Gateway 后保持自动重连，恢复后重新 connected', async () => {

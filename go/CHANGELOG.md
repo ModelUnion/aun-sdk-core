@@ -8,6 +8,29 @@
 
 ---
 
+## 0.3.0 — 2026-05-21 ⚠️ BREAKING CHANGE
+
+> **V2-only 版本**：移除全部 V1 E2EE（含群组加密），新增 V2 加密原语，API 不向后兼容。
+
+### BREAKING
+- **移除 V1 E2EE 全部实现**：`e2ee_group.go`、`e2ee_group_funcs.go`、epoch key 相关逻辑全部删除
+- **移除 V1 群组加密测试**：`e2e_group_test.go`、`integration_epoch_key_server_test.go`、`integration_group_e2ee_test.go`
+- **E2EE 接口简化**：`e2ee.go` 仅保留 V2 路径，V1 加解密方法不再可用
+- **配置变更**：移除 V1 相关配置项
+
+### Added
+- **agent.md 主 API**：`AUNClient.PublishAgentMD(ctx, path)` / `AUNClient.FetchAgentMD(ctx, aid, savePath)` 返回 `*AgentMDInfo`
+- **V2 加密原语**（跨语言 golden vector 一致性）：ECDH P-256、HKDF-SHA256、AES-256-GCM、ECDSA-SHA256 RAW (RFC 6979)、1DH/3DH wrap_key、Recipients Sort + Merkle Digest、State Commitment
+- **V2 canonical JSON**：`v2/crypto/canonical.go`
+
+### Removed
+- `AUNClient.SetLocalAgentMDPath()` / `GetLocalAgentMDEtag()` / `GetRemoteAgentMDEtag()` — 由主 API 自动维护
+
+### Deprecated
+- `client.Auth.SignAgentMD` / `VerifyAgentMD` / `UploadAgentMD` / `DownloadAgentMD` — 建议迁移到 `client.PublishAgentMD` / `client.FetchAgentMD`
+
+---
+
 ## 0.2.20 — 2026-05-18
 
 ### Added

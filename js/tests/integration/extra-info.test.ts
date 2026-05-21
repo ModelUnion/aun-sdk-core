@@ -23,6 +23,7 @@ import type { JsonObject } from '../../src/types.js';
 
 const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
+const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
 
 function rid(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 8);
@@ -38,7 +39,7 @@ function makePath(tag: string): string {
 
 function makeClient(aunPath: string): AUNClient {
   const client = new AUNClient({ aun_path: aunPath });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }
 
@@ -134,7 +135,7 @@ describe('extra_info 集成测试', () => {
 
     const tag = rid();
     const sharedPath = makePath(tag);
-    const aid = `test-ei-${tag}`;
+    const aid = `test-ei-${tag}.${ISSUER}`;
 
     // 第一个客户端连接，带 extra_info
     const client1 = makeClient(sharedPath);
@@ -183,7 +184,7 @@ describe('extra_info 集成测试', () => {
 
     const tag = rid();
     const sharedPath = makePath(tag);
-    const aid = `test-ei-compat-${tag}`;
+    const aid = `test-ei-compat-${tag}.${ISSUER}`;
 
     // 不传 extra_info 正常连接
     const client1 = makeClient(sharedPath);

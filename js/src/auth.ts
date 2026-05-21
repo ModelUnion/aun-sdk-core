@@ -1167,6 +1167,16 @@ export class AuthFlow {
   ): Promise<JsonObject> {
     const connectionKind = opts?.connectionKind ?? 'long';
     const shortTtlMs = opts?.shortTtlMs ?? 0;
+    const extraInfo = opts?.extraInfo ?? {};
+    // _capabilities 来自 extra_info；可选覆盖默认能力声明，不会透传到服务端
+    const overrideCaps = (extraInfo as Record<string, unknown>)._capabilities;
+    const capabilities = isJsonObject(overrideCaps) ? overrideCaps : {
+      e2ee: true,
+      group_e2ee: true,
+      // AUN E2EE V2: 默认仅声明 V2 能力（V2-only 客户端）
+      supported_p2p_e2ee: ['e2ee_v2'],
+      supported_group_e2ee: ['group_e2ee_v2'],
+    };
     const request: Record<string, any> = {
       nonce,
       auth: { method: 'kite_token', token },
@@ -1174,7 +1184,7 @@ export class AuthFlow {
       device: { id: String(opts?.deviceId ?? this._deviceId ?? ''), type: 'sdk' },
       client: { slot_id: String(opts?.slotId ?? this._slotId ?? '') },
       delivery_mode: opts?.deliveryMode ?? { mode: 'fanout' },
-      capabilities: { e2ee: true, group_e2ee: true },
+      capabilities,
     };
     // 长短连接选项：默认 long 时不写入 options（保持 wire 兼容）
     if (connectionKind === 'short') {
@@ -1185,9 +1195,15 @@ export class AuthFlow {
       request.options = options;
     }
     // extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
-    const extraInfo = opts?.extraInfo;
+    // _ 前缀字段是内部覆盖字段，不透传到服务端
     if (extraInfo && Object.keys(extraInfo).length > 0) {
-      request.extra_info = extraInfo;
+      const filtered: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(extraInfo)) {
+        if (!k.startsWith('_')) filtered[k] = v;
+      }
+      if (Object.keys(filtered).length > 0) {
+        request.extra_info = filtered;
+      }
     }
     this._log.debug(`auth.connect send: device_id=${opts?.deviceId ?? ''} slot_id=${opts?.slotId ?? ''} kind=${connectionKind}`);
     const result = await transport.call('auth.connect', request as RpcParams);

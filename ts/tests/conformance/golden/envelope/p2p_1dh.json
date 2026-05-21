@@ -1,0 +1,51 @@
+{
+  "description": "P2P encrypted message (1DH path, no SPK)",
+  "envelope": {
+    "type": "e2ee.p2p_encrypted",
+    "version": "v2",
+    "suite": "P256_HKDF_SHA256_AES_256_GCM",
+    "msg_type": "original",
+    "t_send": 1710504000000,
+    "t_supplement": null,
+    "t_server": null,
+    "nonce": "DCscJrBf3j9SCiGy",
+    "ciphertext": "9/4xPxmc7YoW0AmboY9Oe2tXILr8EwL8agYP5xEPmg/MvN6XWrkjyDp2kRbtctY=",
+    "tag": "Tj+OKwGO4qO3rgu7Ggp3pg==",
+    "sender_signature": "tuySIrayo9QpPF7P2skt1be9BxB9NT7wS0BQ/cc92Zn2XaGHPDHaz3LHTc6bTbRCXOg1FGICibzaSKqnJdbyaw==",
+    "sender_cert_fingerprint": "sha256:6bf6b248a19e5777",
+    "sender_session_pk": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEN7y6/J5IPNewscu2l3V6zmwjI13wA2U7o15E3ArL8DcFvQg2+9wY9NMyhO47cgThRqDGKV318y1BUgorl9KQ8Q==",
+    "recipients_digest": "16415ff4d9328abd9fcc9d655da8e9458a925df85ededc663febf41d33b99726",
+    "recipients": [
+      [
+        "bob.aid.com",
+        "dev-bob-1",
+        "peer",
+        "aid_master",
+        "sha256:b788f533b9358b48",
+        "",
+        "kNrwXr8fRDFOo2ev",
+        "5iKeKUY4UfHpmxESda0TrPvsBjYUOL6uDms7oTJwYD5PHkLYOXeXnYdeAFy7W6t+"
+      ]
+    ],
+    "aad": {
+      "from": "alice.aid.com",
+      "from_device": "dev-alice-1",
+      "to": "bob.aid.com",
+      "message_id": "m-test-1dh-001",
+      "timestamp": 1710504000000,
+      "suite": "P256_HKDF_SHA256_AES_256_GCM",
+      "wrap_protocol": "1DH"
+    }
+  },
+  "decryption_inputs": {
+    "self_aid": "bob.aid.com",
+    "self_device_id": "dev-bob-1",
+    "self_ik_priv_b64": "kucXls+1l1JEL84puz+hIVGNMQpaBu2GVO1FSAC1Gpg=",
+    "self_spk_priv_b64": null,
+    "sender_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w=="
+  },
+  "expected_payload": {
+    "text": "Hello from Alice (1DH)",
+    "type": "text"
+  }
+}

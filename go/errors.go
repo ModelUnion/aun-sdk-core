@@ -394,6 +394,8 @@ func MapRemoteError(errMap map[string]any) error {
 			code = int(v)
 		case int:
 			code = v
+		case int64:
+			code = int(v)
 		}
 	}
 

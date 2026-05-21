@@ -30,8 +30,6 @@ export {
   GroupStateError,
   E2EEError,
   E2EEDecryptFailedError,
-  E2EEGroupSecretMissingError,
-  E2EEGroupEpochMismatchError,
   E2EEGroupCommitmentInvalidError,
   E2EEGroupNotMemberError,
   E2EEGroupDecryptFailedError,
@@ -55,10 +53,6 @@ export {
   type GatewayEntry,
   type GatewayDiscoveryDocument,
   type KeyPairRecord,
-  type PrekeyRecord,
-  type PrekeyMap,
-  type GroupOldEpochRecord,
-  type GroupSecretRecord,
   type MetadataRecord,
   type IdentityRecord,
   type SecretRecord,
@@ -93,33 +87,22 @@ export { CustodyNamespace } from './namespaces/custody.js';
 export { MetaNamespace } from './namespaces/meta.js';
 
 // ── E2EE ─────────────────────────────────────────────────────
+export { ProtectedHeaders } from './protected-headers.js';
+export type { ProtectedHeadersInput } from './protected-headers.js';
+
+// ── E2EE V2 ──────────────────────────────────────────────────
 export {
-  E2EEManager,
-  ProtectedHeaders,
-  SUITE, MODE_PREKEY_ECDH_V2, MODE_LONG_TERM_KEY,
-  AAD_FIELDS_OFFLINE, AAD_MATCH_FIELDS_OFFLINE, AAD_OPTIONAL_FIELDS,
-} from './e2ee.js';
-export type { ProtectedHeadersInput } from './e2ee.js';
-export {
-  GroupE2EEManager,
-  GroupReplayGuard,
-  GroupKeyRequestThrottle,
+  encryptP2PMessage,
   encryptGroupMessage,
-  decryptGroupMessage,
-  computeMembershipCommitment,
-  verifyMembershipCommitment,
-  buildMembershipManifest,
-  signMembershipManifest,
-  verifyMembershipManifest,
-  storeGroupSecret,
-  storeGroupSecretEpoch,
-  loadGroupSecret,
-  loadAllGroupSecrets,
-  cleanupOldEpochs,
-  generateGroupSecret,
-  buildKeyDistribution,
-  handleKeyDistribution,
-  buildKeyRequest,
-  handleKeyRequest,
-  handleKeyResponse,
-} from './e2ee-group.js';
+  decryptMessage,
+} from './v2/e2ee/index.js';
+export type {
+  Sender,
+  Target,
+  TargetSet,
+  EncryptOptions,
+  StateCommitmentAAD,
+} from './v2/e2ee/index.js';
+export { V2Session, V2KeyStore } from './v2/session/index.js';
+export type { CallFn } from './v2/session/index.js';
+export { computeStateCommitment, STATE_PREFIX } from './v2/state/index.js';

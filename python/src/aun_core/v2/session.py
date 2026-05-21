@@ -180,6 +180,24 @@ class V2Session:
                 pass
             self._old_spk_max_seq.pop(spk_id, None)
             destroyed.append(spk_id)
+
+        # 180 天硬上限：无论是否被引用，超龄 SPK 强制销毁
+        HARD_LIMIT_SECONDS = 180 * 24 * 3600
+        try:
+            expired = self._store.list_expired_spk_ids(self._device_id, HARD_LIMIT_SECONDS)
+            for spk_id in expired:
+                if spk_id == self._spk_id:
+                    continue
+                try:
+                    self._store.delete_spk(self._device_id, spk_id)
+                except Exception:
+                    pass
+                self._old_spk_max_seq.pop(spk_id, None)
+                if spk_id not in destroyed:
+                    destroyed.append(spk_id)
+        except Exception:
+            pass
+
         return destroyed
 
     async def rotate_spk(self, call_fn) -> None:

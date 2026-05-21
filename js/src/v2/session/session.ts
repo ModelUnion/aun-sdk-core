@@ -23,6 +23,8 @@ export const PEER_KEY_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
 export const DESTROY_DELAY_MS = 7 * 60 * 60 * 1000; // 7h
 /** SPK 销毁时保留的最近代数。 */
 export const RECENT_GENERATIONS = 7;
+/** SPK 180 天硬上限。 */
+export const HARD_LIMIT_MS = 180 * 24 * 60 * 60 * 1000;
 
 /** 服务端 RPC 调用函数签名（与 Python `call_fn` 等价）。 */
 export type CallFn = (
@@ -258,6 +260,18 @@ export class V2Session {
       this._oldSPKMaxSeq.delete(spkId);
       destroyed.push(spkId);
     }
+
+    // 180 天硬上限：无论是否被引用，超龄 SPK 强制销毁
+    try {
+      const expired = await this._store.listExpiredSPKIds(this._deviceId, HARD_LIMIT_MS);
+      for (const spkId of expired) {
+        if (spkId === this._spkId) continue;
+        try { await this._store.deleteSPK(this._deviceId, spkId); } catch { continue; }
+        this._oldSPKMaxSeq.delete(spkId);
+        if (!destroyed.includes(spkId)) destroyed.push(spkId);
+      }
+    } catch { /* ignore */ }
+
     return destroyed;
   }
 

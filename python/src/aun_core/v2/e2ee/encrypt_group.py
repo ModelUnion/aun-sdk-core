@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac as _hmac
 import os
 import time
 import uuid
@@ -31,6 +32,8 @@ def encrypt_group_message(
     message_id: str | None = None,
     timestamp: int | None = None,
     state_commitment: dict[str, Any] | None = None,
+    protected_headers: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造完整的 V2 Group 加密 envelope。
 
@@ -143,6 +146,29 @@ def encrypt_group_message(
         "recipients": recipients_rows,
         "aad": aad,
     }
+
+    # protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
+    if isinstance(protected_headers, dict) and protected_headers:
+        from .encrypt_p2p import _with_metadata_auth, _normalize_headers, _PROTECTED_HEADERS_DOMAIN
+        headers = _normalize_headers(protected_headers, payload_type=payload.get("type") if isinstance(payload, dict) else None)
+        if headers:
+            envelope["protected_headers"] = _with_metadata_auth(
+                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
+            )
+    elif isinstance(payload, dict) and payload.get("type"):
+        from .encrypt_p2p import _with_metadata_auth, _normalize_headers, _PROTECTED_HEADERS_DOMAIN
+        headers = _normalize_headers({}, payload_type=payload.get("type"))
+        if headers:
+            envelope["protected_headers"] = _with_metadata_auth(
+                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
+            )
+    if isinstance(context, dict) and context:
+        from .encrypt_p2p import _with_metadata_auth, _PROTECTED_CONTEXT_DOMAIN
+        ctx_body = {k: v for k, v in context.items() if k != "_auth"}
+        if ctx_body:
+            envelope["context"] = _with_metadata_auth(
+                ctx_body, key=master_key, domain=_PROTECTED_CONTEXT_DOMAIN,
+            )
 
     return envelope
 

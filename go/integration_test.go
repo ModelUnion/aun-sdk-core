@@ -383,75 +383,7 @@ func assertDecrypted(t *testing.T, msg map[string]any, expectedPayload map[strin
 // 测试用例
 // ---------------------------------------------------------------------------
 
-// TestIntegrationPrekeyUploadAndGet 注册 AID、连接、上传 prekey，验证另一客户端可获取。
-func TestIntegrationPrekeyUploadAndGet(t *testing.T) {
-	rid := runID()
-	alice := makeClient(t)
-	bob := makeClient(t)
-	defer alice.Close()
-	defer bob.Close()
-
-	aliceAID := ensureConnected(t, alice, fmt.Sprintf("e2ee-alice-%s.agentid.pub", rid))
-	_ = aliceAID
-	bobAID := ensureConnected(t, bob, fmt.Sprintf("e2ee-bob-%s.agentid.pub", rid))
-
-	// bob 生成并上传 prekey
-	prekeyMaterial, err := bob.E2EE().GeneratePrekey()
-	if err != nil {
-		t.Fatalf("生成 prekey 失败: %v", err)
-	}
-	if fp, ok := prekeyMaterial["cert_fingerprint"].(string); !ok || !strings.HasPrefix(fp, "sha256:") {
-		t.Fatalf("prekey 应包含 cert_fingerprint: %v", prekeyMaterial["cert_fingerprint"])
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	result, err := bob.transport.Call(ctx, "message.e2ee.put_prekey", prekeyMaterial)
-	if err != nil {
-		t.Fatalf("上传 prekey 失败: %v", err)
-	}
-	resultMap, _ := result.(map[string]any)
-	if resultMap == nil {
-		t.Fatalf("上传 prekey 返回 nil")
-	}
-
-	// alice 获取 bob 的 prekey
-	pk1Result, err := alice.transport.Call(ctx, "message.e2ee.get_prekey", map[string]any{"aid": bobAID})
-	if err != nil {
-		t.Fatalf("获取 prekey 失败: %v", err)
-	}
-	pk1Map, _ := pk1Result.(map[string]any)
-	found1, _ := pk1Map["found"].(bool)
-	if !found1 {
-		t.Fatalf("预期找到 prekey")
-	}
-	prekey1, _ := pk1Map["prekey"].(map[string]any)
-	if prekey1 == nil || prekey1["cert_fingerprint"] != prekeyMaterial["cert_fingerprint"] {
-		t.Fatalf("返回的 prekey cert_fingerprint 不正确: %#v", prekey1)
-	}
-
-	// 再次获取，应返回同一 prekey
-	pk2Result, err := alice.transport.Call(ctx, "message.e2ee.get_prekey", map[string]any{"aid": bobAID})
-	if err != nil {
-		t.Fatalf("第二次获取 prekey 失败: %v", err)
-	}
-	pk2Map, _ := pk2Result.(map[string]any)
-	found2, _ := pk2Map["found"].(bool)
-	if !found2 {
-		t.Fatalf("第二次应找到 prekey")
-	}
-
-	pk1Prekey, _ := pk1Map["prekey"].(map[string]any)
-	pk2Prekey, _ := pk2Map["prekey"].(map[string]any)
-	pk1ID, _ := pk1Prekey["prekey_id"].(string)
-	pk2ID, _ := pk2Prekey["prekey_id"].(string)
-	if pk1ID != pk2ID {
-		t.Errorf("两次获取的 prekey_id 不一致: %s != %s", pk1ID, pk2ID)
-	}
-}
-
-// TestIntegrationSDKToSDKPrekey 两个 SDK 客户端：alice 发送加密消息（prekey_ecdh_v2），bob 解密。
+// TestIntegrationSDKToSDKPrekey 两个 SDK 客户端：alice 发送 V2 加密消息，bob 解密。
 func TestIntegrationSDKToSDKPrekey(t *testing.T) {
 	rid := runID()
 	sender := makeClient(t)
@@ -575,8 +507,8 @@ func TestIntegrationBurstMessages(t *testing.T) {
 	}
 }
 
-// TestIntegrationPrekeyRotation 会话中轮换 prekey，验证新旧消息均可解密。
-func TestIntegrationPrekeyRotation(t *testing.T) {
+// TestIntegrationSPKRotation 会话中轮换 V2 SPK，验证新旧消息均可解密。
+func TestIntegrationSPKRotation(t *testing.T) {
 	rid := runID()
 	sender := makeClient(t)
 	receiver := makeClient(t)
@@ -590,14 +522,18 @@ func TestIntegrationPrekeyRotation(t *testing.T) {
 	waitReceiver := collectSDKPushMessages(receiver, sAID, 2, nil)
 	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "before_rotate", "phase": 1})
 
-	// receiver 轮换 prekey
+	// receiver 轮换 V2 SPK
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := receiver.uploadPrekey(ctx); err != nil {
-		t.Fatalf("轮换 prekey 失败: %v", err)
+	state := receiver.v2GetState()
+	if state == nil || state.session == nil {
+		t.Fatal("receiver V2 session 未初始化")
+	}
+	if err := state.session.RotateSPK(ctx, receiver.v2CallFn()); err != nil {
+		t.Fatalf("轮换 V2 SPK 失败: %v", err)
 	}
 
-	// 轮换后发送（sender 的缓存可能仍是旧 prekey，但接收方应能解密两者）
+	// 轮换后发送（sender 可能仍命中旧 bootstrap 缓存，接收方应能解密两者）
 	sdkSend(t, sender, rAID, map[string]any{"type": "text", "text": "after_rotate", "phase": 2})
 
 	msgs := recvSDKAfterSend(t, waitReceiver, receiver, sAID, 0, 10*time.Second)

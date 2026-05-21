@@ -106,8 +106,8 @@ describe('明文发送不依赖对端 prekey', () => {
     try {
       await ensureConnected(alice, aliceAid);
 
-      // target 只创建 AID，不连接 — 不会上传 prekey
-      await target.auth.createAid({ aid: targetAid });
+      // target 创建 AID 并连接（注册设备），但不会主动上传 V2 SPK prekey
+      await ensureConnected(target, targetAid);
 
       // Alice 明文发送给 target（encrypt: false）
       const sendResult = await alice.call('message.send', {

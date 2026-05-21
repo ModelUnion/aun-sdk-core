@@ -4,14 +4,16 @@ import type { AUNClient } from '../client.js';
 import { AUNError, NotFoundError, StateError, ValidationError } from '../errors.js';
 import type { ModuleLogger } from '../logger.js';
 import { isJsonObject, type IdentityRecord, type JsonObject, type JsonValue, type RpcParams, type RpcResult } from '../types.js';
-import { base64ToUint8, pemToArrayBuffer, uint8ToBase64 } from '../crypto.js';
 import {
-  _certificateSha256Fingerprint as certificateSha256Fingerprint,
-  _ecdsaSignDer as ecdsaSignDer,
-  _ecdsaVerifyDer as ecdsaVerifyDer,
-  _importCertPublicKeyEcdsa as importCertPublicKeyEcdsa,
-  _importPrivateKeyEcdsa as importPrivateKeyEcdsa,
-} from '../e2ee.js';
+  base64ToUint8,
+  pemToArrayBuffer,
+  uint8ToBase64,
+  certificateSha256Fingerprint,
+  ecdsaSignDer,
+  ecdsaVerifyDer,
+  importCertPublicKeyEcdsa,
+  importPrivateKeyEcdsa,
+} from '../crypto.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
@@ -672,8 +674,10 @@ export class AuthNamespace {
         );
       }
       const text = await response.text();
-      const etag = String(response.headers.get('ETag') ?? '').trim();
-      const lastModified = String(response.headers.get('Last-Modified') ?? '').trim();
+      // headers 在某些 fake response（测试 mock）下可能缺失，做一次容错处理。
+      const respHeaders = response.headers;
+      const etag = respHeaders ? String(respHeaders.get('ETag') ?? '').trim() : '';
+      const lastModified = respHeaders ? String(respHeaders.get('Last-Modified') ?? '').trim() : '';
       if (etag || lastModified) {
         this._agentMdCache.set(targetAid, { text, etag, lastModified });
       }

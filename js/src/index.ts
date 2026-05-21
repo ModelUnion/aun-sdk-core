@@ -90,27 +90,24 @@ export { AuthNamespace } from './namespaces/auth.js';
 export { CustodyNamespace } from './namespaces/custody.js';
 export { MetaNamespace } from './namespaces/meta.js';
 
-// E2EE — P2P
+// E2EE V2-only 公开 API
+export { ProtectedHeaders } from './protected-headers.js';
+export type { ProtectedHeadersInput } from './protected-headers.js';
 export {
-  E2EEManager,
-  ProtectedHeaders,
-  SUITE, MODE_PREKEY_ECDH_V2, MODE_LONG_TERM_KEY,
-  AAD_OPTIONAL_FIELDS,
-} from './e2ee.js';
-export type { EncryptResult, ProtectedHeadersInput } from './e2ee.js';
-
-// E2EE — 群组
-export {
-  GroupE2EEManager, MODE_EPOCH_GROUP_KEY,
-  GroupReplayGuard, GroupKeyRequestThrottle,
-  encryptGroupMessage, decryptGroupMessage,
-  buildMembershipManifest, signMembershipManifest, verifyMembershipManifest,
-  computeMembershipCommitment, verifyMembershipCommitment,
-  storeGroupSecret, storeGroupSecretEpoch, loadGroupSecret, loadAllGroupSecrets, cleanupOldEpochs,
-  generateGroupSecret, buildKeyDistribution,
-  handleKeyDistribution, handleKeyRequest, handleKeyResponse,
-  buildKeyRequest, checkEpochDowngrade,
-} from './e2ee-group.js';
+  encryptP2PMessage,
+  encryptGroupMessage,
+  decryptMessage,
+} from './v2/e2ee/index.js';
+export type {
+  Sender,
+  Target,
+  TargetSet,
+  EncryptOptions,
+  StateCommitmentAAD,
+} from './v2/e2ee/index.js';
+export { V2Session, V2KeyStore } from './v2/session/index.js';
+export type { CallFn } from './v2/session/index.js';
+export { computeStateCommitment, STATE_PREFIX } from './v2/state/index.js';
 
 // 根证书
 export { ROOT_CA_PEM } from './certs/root.js';

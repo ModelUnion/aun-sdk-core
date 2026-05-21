@@ -145,8 +145,13 @@ class SeqTracker:
 
         return True
 
-    def on_pull_result(self, ns: str, pulled_messages: list[dict]) -> None:
-        """pull 返回后更新 tracker 状态。"""
+    def on_pull_result(self, ns: str, pulled_messages: list[dict], *, after_seq: int | None = None) -> None:
+        """pull 返回后更新 tracker 状态。
+
+        after_seq: pull 请求使用的 after_seq 参数。如果等于当前 contiguous_seq（gap fill 场景），
+        直接把 pull 到的最大 seq 作为新的 contiguous_seq——服务端返回的就是当前可用的全部消息，
+        中间的空洞是永久性的（竞态跳跃/未持久化/过期清理），不应阻塞后续消息投递。
+        """
         t = self._get(ns)
         pulled_seqs: set[int] = set()
         for m in pulled_messages:
@@ -159,6 +164,18 @@ class SeqTracker:
         # 将 pulled 的 seq 加入 received_seqs
         t.received_seqs.update(pulled_seqs)
 
+        # gap fill 场景：从 contiguous_seq 开始 pull，直接推进到 pull 返回的最大 seq
+        if pulled_seqs and after_seq is not None and after_seq == t.contiguous_seq:
+            max_pulled = max(pulled_seqs)
+            if max_pulled > t.contiguous_seq:
+                t.contiguous_seq = max_pulled
+                # 清理被跳过区间内的 pending_gaps 和 received_seqs
+                for gap_key in list(t.pending_gaps):
+                    probe = t.pending_gaps[gap_key]
+                    if probe.gap_end <= t.contiguous_seq:
+                        del t.pending_gaps[gap_key]
+                t.received_seqs = {s for s in t.received_seqs if s > t.contiguous_seq}
+
         now = time.monotonic()
         for gap_key in list(t.pending_gaps):
             probe = t.pending_gaps[gap_key]
@@ -169,10 +186,7 @@ class SeqTracker:
 
             gap_range = set(range(probe.gap_start, probe.gap_end + 1))
             if gap_range <= pulled_seqs:
-                # 完全补齐 → 明确 resolved
                 probe.resolved = True
-            # S2: 不再因 probe_count >= 3 自动 resolved；
-            # "探测 N 次无回应"不代表消息真的不存在，只能由服务端 tombstone/完整补齐驱动。
 
         t.max_seen_seq = max(t.max_seen_seq, max(pulled_seqs) if pulled_seqs else 0)
         self._try_advance(t)

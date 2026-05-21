@@ -1,0 +1,75 @@
+{
+  "description": "Group encrypted message (Bob 3DH + Carol 1DH)",
+  "envelope": {
+    "type": "e2ee.group_encrypted",
+    "version": "v2",
+    "suite": "P256_HKDF_SHA256_AES_256_GCM",
+    "msg_type": "original",
+    "group_id": "g-test.aid.com",
+    "epoch": 5,
+    "t_send": 1710504000000,
+    "t_server": null,
+    "nonce": "M3LRKmxDLFHjsQr2",
+    "ciphertext": "r5YREg2PFp1fu2rBV3AwpM5NKhiDe0+jEELGdaWxz61ignrYnrXpgrwNbws=",
+    "tag": "RW3SAd9fExCWxwNusUA55g==",
+    "sender_signature": "xY9pmSQeloTXhhgjyGe9ZAYbHYOBhTU37YaTHtJNSYJ7uAgK2VPOgKFBDC+/WHaPEe7f2PcHiPL4H6hGoCrQzw==",
+    "sender_cert_fingerprint": "sha256:6bf6b248a19e5777",
+    "sender_session_pk": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGMvJF1Sbmiv1aKqUcarhWkELL6dacSn9JJZVH1GiwQA2GXYxURqURgU+ehH+tasjSrxapPJ9nIP55YUthNz2Vg==",
+    "recipients_digest": "ab3861503f8455f4240b5279abd6d8895c0701d7a3f23cb2dede567c5476151a",
+    "recipients": [
+      [
+        "bob.aid.com",
+        "dev-bob-1",
+        "member",
+        "group_device_prekey",
+        "sha256:b788f533b9358b48",
+        "sha256:bob_spk_1",
+        "z+PIRcz8feB6qFWs",
+        "BmWdsOKCemVKB+eXN8IZ9pOh0l3ZD03t0VdQmxBjzE+76CYj6oz93FjYr36q56DX"
+      ],
+      [
+        "carol.aid.com",
+        "dev-carol-1",
+        "member",
+        "aid_master",
+        "sha256:e4498347b287d19c",
+        "",
+        "1ZIqEVZpKPdaCvzN",
+        "ajY8WsnXwWT0wFoILrTe1Lq9GOdYrrXNBT3f+efbZRrotReG1b8EQxQi+qwELMRO"
+      ]
+    ],
+    "aad": {
+      "from": "alice.aid.com",
+      "from_device": "dev-alice-1",
+      "group_id": "g-test.aid.com",
+      "epoch": 5,
+      "message_id": "m-group-001",
+      "timestamp": 1710504000000,
+      "suite": "P256_HKDF_SHA256_AES_256_GCM",
+      "wrap_protocol": "1DH+3DH",
+      "state_commitment": {
+        "state_version": 1,
+        "state_hash": "abc123",
+        "state_chain": "chain-link-1"
+      }
+    }
+  },
+  "decryption_inputs_bob": {
+    "self_aid": "bob.aid.com",
+    "self_device_id": "dev-bob-1",
+    "self_ik_priv_b64": "kucXls+1l1JEL84puz+hIVGNMQpaBu2GVO1FSAC1Gpg=",
+    "self_spk_priv_b64": "YSJfT/BHTE6J9sDXN495hou7PdjbRqBMLvi46W0NSI4=",
+    "sender_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w=="
+  },
+  "decryption_inputs_carol": {
+    "self_aid": "carol.aid.com",
+    "self_device_id": "dev-carol-1",
+    "self_ik_priv_b64": "90MdEDhLSFBux7S2xNkl76QhMr42LY3gMr6ccoVMjwc=",
+    "self_spk_priv_b64": null,
+    "sender_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w=="
+  },
+  "expected_payload": {
+    "text": "Group message",
+    "type": "group_text"
+  }
+}

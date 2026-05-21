@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -18,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -68,9 +66,6 @@ func secureRandFloat64() float64 {
 const (
 	reconnectMinBaseDelaySeconds = 1.0
 	reconnectMaxBaseDelaySeconds = 64.0
-	groupRotationLeaseMS         = 120000
-	groupRotationRetryMaxDelay   = 300 * time.Second
-	pendingDecryptLimit          = 100
 	pushedSeqsLimit              = 50000
 	pendingOrderedLimit          = 50000
 )
@@ -315,9 +310,6 @@ var signedMethods = map[string]bool{
 	"group.resources.approve_request": true,
 	"group.resources.reject_request":  true,
 	"group.commit_state":              true,
-	"group.e2ee.begin_rotation":       true,
-	"group.e2ee.commit_rotation":      true,
-	"group.e2ee.abort_rotation":       true,
 	"group.ban":                       true,
 	"group.unban":                     true,
 	"group.dissolve":                  true,
@@ -327,8 +319,6 @@ var signedMethods = map[string]bool{
 
 // 对端证书缓存 TTL（秒）
 const peerCertCacheTTL = 3600
-const peerPrekeysCacheTTL = 3600
-const prekeyFallbackDeviceID = "aun_device_id"
 
 // P1-23: 非幂等方法使用更长超时（35s），避免 SDK 10s 超时 < gateway 30s 处理时间
 const nonIdempotentTimeout = 35 * time.Second
@@ -365,18 +355,7 @@ type cachedPeerCert struct {
 	refreshAfter float64 // 缓存过期时间（Unix 秒）
 }
 
-type cachedPeerPrekeys struct {
-	items    []map[string]any
-	expireAt float64
-}
-
 // AUNClient AUN 协议客户端主类
-// epochRecoveryResult 用于 epoch key recovery 的 singleflight 去重
-type epochRecoveryResult struct {
-	done chan struct{}
-	ok   bool
-}
-
 type AUNClient struct {
 	mu                   sync.RWMutex
 	config               map[string]any
@@ -405,8 +384,6 @@ type AUNClient struct {
 	transport *RPCTransport
 	events    *EventDispatcher
 	discovery *GatewayDiscovery
-	e2ee      *E2EEManager
-	groupE2EE *GroupE2EEManager
 
 	// 会话参数
 	sessionParams  map[string]any
@@ -418,14 +395,8 @@ type AUNClient struct {
 	// 对端证书缓存
 	certCache                  map[string]*cachedPeerCert
 	certCacheMu                sync.RWMutex
-	peerPrekeysCache           map[string]*cachedPeerPrekeys
-	peerPrekeysMu              sync.RWMutex
 	connectDeliveryMode        map[string]any
 	defaultConnectDeliveryMode map[string]any
-	prekeyReplenishInflight    map[string]bool
-	prekeyReplenished          map[string]bool
-	// 当前活跃 prekey：只有这个 prekey 被消费时才触发 replenish 上传
-	activePrekeyID             string
 
 	// 消息序列号跟踪器（群消息 + P2P 空洞检测）
 	seqTracker        *SeqTracker
@@ -449,30 +420,9 @@ type AUNClient struct {
 
 	// P2P 惰性同步标志：首次发送/收到 P2P 消息后标记 — 已废弃，由 fillP2pGap 在 connect 后异步触发，字段删除
 
-	// 群消息缺少 epoch key 时的待解队列
-	pendingDecryptMsgs   map[string][]map[string]any
-	pendingDecryptMsgsMu sync.Mutex
-	// recovery 兜底定时去重：每个 group 在 30s 内最多调度一次"超时强制推进"任务
-	recoveryTimeoutScheduled map[string]time.Time
-	recoveryTimeoutMu        sync.Mutex
-
-	groupEpochRotationInflight  map[string]bool
-	groupEpochRotationMu        sync.Mutex
-	groupMembershipRotationDone map[string]bool
-	groupEpochRotationRetrying  map[string]bool
-
-	// 新成员加入时的密钥 backfill 去重记录
-	groupMemberKeyBackfillDone map[string]bool
-	groupBackfillMu            sync.Mutex
-
-	// epoch key recovery inflight 去重（singleflight 模式）
-	groupEpochRecoveryInflight   map[string]*epochRecoveryResult
-	groupEpochRecoveryInflightMu sync.Mutex
-
 	// 后台任务上下文
-	ctx              context.Context
-	cancel           context.CancelFunc
-	prekeyUploadHook func(context.Context) error
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// Auth 命名空间
 	Auth *namespace.AuthNamespace
@@ -482,7 +432,7 @@ type AUNClient struct {
 	Meta *namespace.MetaNamespace
 
 	// 本地 agent.md 文件路径与对应 etag（quoted sha256 hex，与服务端 _agent_md_etag 一致）。
-	// 由 SetLocalAgentMDPath() 设置；用于跟服务端 RPC envelope._meta.agent_md_etag 比对，
+	// 由 PublishAgentMD() / FetchAgentMD(自身 aid) 写入；用于跟服务端 RPC envelope._meta.agent_md_etag 比对，
 	// 触发"本地未发布到服务端"或"服务端版本更新"的 UI 提示。
 	// gateway 在 RPC envelope._meta.agent_md_etag 注入服务端 etag；纯观察，无下游依赖。
 	agentMdMu         sync.RWMutex
@@ -490,12 +440,36 @@ type AUNClient struct {
 	localAgentMDEtag  string
 	remoteAgentMDEtag string
 
+	// 测试可注入的 agent.md 底层操作；nil 时使用 c.Auth。
+	agentMDOps agentMDOps
+
 	// 日志
 	logger *AUNLogger
 	log    *ModuleLogger // aun_core.client
 	logE2  *ModuleLogger // aun_core.e2ee
 	logEG  *ModuleLogger // aun_core.e2ee-group
 	logAuS *ModuleLogger // aun_core.auth (client 内使用)
+
+	// V2 E2EE 状态（参见 v2_p2p.go）
+	v2State *v2P2PState
+	// V2 安全增强状态（验签缓存 + fork 检测，参见 v2_state.go）
+	v2Security *v2StateSecurityState
+
+	// V2 push 通知 → auto-pull 串行化（only-one-in-flight + drain pending）
+	v2PushPullInflight atomic.Bool
+	v2PushPullPending  atomic.Bool
+
+	// V2 P2P / Group push 通知 only-one-in-flight 序列化（gap fill 拉取）
+	// 与 v2PushPullInflight 区分：那个是 _raw.peer.v2.message_received 触发；
+	// 这个用于一般 V2 拉取去重。
+	v2PullInflight atomic.Bool
+	v2PullPending  atomic.Bool
+
+	// 同一 group 的 V2 自动提案串行化，避免建群初始化 state 与后续成员变更抢同一 state_version。
+	v2AutoProposeLocksMu      sync.Mutex
+	v2AutoProposeLocks        map[string]*sync.Mutex
+	v2AutoProposeLastSnapshot map[string]string
+	v2LazyProposeTriggered    map[string]int64
 }
 
 // NewClient 创建 AUN 客户端
@@ -561,7 +535,6 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		events:                     events,
 		discovery:                  NewGatewayDiscovery(cfg.VerifySSL),
 		certCache:                  make(map[string]*cachedPeerCert),
-		peerPrekeysCache:           make(map[string]*cachedPeerPrekeys),
 		connectDeliveryMode:        copyMapShallow(connectDeliveryMode),
 		defaultConnectDeliveryMode: copyMapShallow(connectDeliveryMode),
 		seqTracker:                 NewSeqTracker(),
@@ -569,6 +542,8 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		pushedSeqs:                 make(map[string]map[int]bool),
 		pendingOrderedMsgs:         make(map[string]map[int]pendingOrderedMessage),
 		groupSynced:                make(map[string]bool),
+		v2AutoProposeLocks:         make(map[string]*sync.Mutex),
+		v2AutoProposeLastSnapshot:  make(map[string]string),
 		heartbeatNudge:             make(chan struct{}, 1),
 		sessionOptions: map[string]any{
 			"auto_reconnect":       true,
@@ -584,20 +559,11 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 				"http":    30.0,
 			},
 		},
-		pendingDecryptMsgs:          make(map[string][]map[string]any),
-		recoveryTimeoutScheduled:    make(map[string]time.Time),
-		groupEpochRotationInflight:  make(map[string]bool),
-		groupMembershipRotationDone: make(map[string]bool),
-		groupEpochRotationRetrying:  make(map[string]bool),
-		groupEpochRecoveryInflight:  make(map[string]*epochRecoveryResult),
-		prekeyReplenishInflight:     make(map[string]bool),
-		prekeyReplenished:           make(map[string]bool),
-		groupMemberKeyBackfillDone:  make(map[string]bool),
-		logger:                      aunLogger,
-		log:                         clientLog,
-		logE2:                       aunLogger.For("aun_core.e2ee"),
-		logEG:                       aunLogger.For("aun_core.e2ee-group"),
-		logAuS:                      aunLogger.For("aun_core.auth"),
+		logger: aunLogger,
+		log:    clientLog,
+		logE2:  aunLogger.For("aun_core.e2ee"),
+		logEG:  aunLogger.For("aun_core.e2ee-group"),
+		logAuS: aunLogger.For("aun_core.auth"),
 	}
 
 	// 创建 RPCTransport（使用断线回调）
@@ -606,41 +572,6 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	}, cfg.VerifySSL)
 	// 注册 RPC envelope._meta 观察者（吸收 gateway 注入的 agent_md_etag 等元数据）
 	c.transport.SetMetaObserver(c.observeRPCMeta)
-
-	// 创建 E2EE 管理器
-	c.e2ee = NewE2EEManager(E2EEManagerConfig{
-		IdentityFn: func() map[string]any {
-			c.mu.RLock()
-			defer c.mu.RUnlock()
-			if c.identity != nil {
-				return c.identity
-			}
-			return map[string]any{}
-		},
-		DeviceIDFn: func() string {
-			c.mu.RLock()
-			defer c.mu.RUnlock()
-			return c.deviceID
-		},
-		Keystore:         ks,
-		ReplayWindowSecs: cfg.ReplayWindowSeconds,
-	})
-
-	// 创建群组 E2EE 管理器
-	c.groupE2EE = NewGroupE2EEManager(GroupE2EEManagerConfig{
-		IdentityFn: func() map[string]any {
-			c.mu.RLock()
-			defer c.mu.RUnlock()
-			if c.identity != nil {
-				return c.identity
-			}
-			return map[string]any{}
-		},
-		Keystore:              ks,
-		Config:                cfg,
-		SenderCertResolver:    func(aid, fingerprint string) string { return c.getVerifiedPeerCert(aid, fingerprint) },
-		InitiatorCertResolver: func(aid, fingerprint string) string { return c.getVerifiedPeerCert(aid, fingerprint) },
-	})
 
 	// Auth 命名空间
 	c.Auth = namespace.NewAuthNamespace(c)
@@ -678,6 +609,8 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	events.Subscribe("_raw.gateway.disconnect", func(payload any) {
 		c.onGatewayDisconnect(payload)
 	})
+	// V2 事件订阅：push 通知 + epoch 轮换
+	c.registerV2EventSubscriptions()
 
 	return c
 }
@@ -698,66 +631,119 @@ func (c *AUNClient) State() ClientState {
 	return c.state
 }
 
-// E2EE 返回 P2P E2EE 管理器
-func (c *AUNClient) E2EE() *E2EEManager {
-	return c.e2ee
+// agentMDOps 是 PublishAgentMD / FetchAgentMD 调用底层 sign/verify/upload/download 的接口。
+// 默认指向 c.Auth；测试可替换以隔离 HTTP/签名逻辑，专门验证主 API 编排。
+type agentMDOps interface {
+	SignAgentMD(ctx context.Context, content string, opts *namespace.AgentMDSignOptions) (string, error)
+	VerifyAgentMD(ctx context.Context, content string, opts *namespace.AgentMDVerifyOptions) (map[string]any, error)
+	UploadAgentMD(ctx context.Context, content string) (map[string]any, error)
+	DownloadAgentMD(ctx context.Context, aid string) (string, error)
 }
 
-// GroupE2EE 返回群组 E2EE 管理器
-func (c *AUNClient) GroupE2EE() *GroupE2EEManager {
-	return c.groupE2EE
+// AgentMDInfo 描述 FetchAgentMD 的返回结构。
+type AgentMDInfo struct {
+	AID       string         `json:"aid"`
+	Content   string         `json:"content"`
+	Signature map[string]any `json:"signature"`
+	// InSync 仅在 aid 是自身时给出指针；外部 aid 时为 nil（语义上不适用）。
+	InSync    *bool  `json:"in_sync,omitempty"`
+	SavedTo   string `json:"saved_to,omitempty"`
+	SaveError string `json:"save_error,omitempty"`
 }
 
-// SetLocalAgentMDPath 记录本地 agent.md 文件路径并一次性计算 etag（quoted sha256 hex，与服务端一致）。
+// PublishAgentMD 读取本地 agent.md → 签名 → 上传到服务端，并刷新内部 localAgentMDEtag。
 //
-//   - path 为空字符串：清除本地 path 与 etag。
-//   - 文件不存在 / 读取失败：清除 etag 并返回空串，不 panic（应用可读 GetLocalAgentMDEtag()
-//     为空判断）。
-//   - 文件变更后需要重新调用 SetLocalAgentMDPath() 触发重算（按设计：设置时一次性计算）。
-//
-// 返回当前 etag（quoted hex 或空串）。
-func (c *AUNClient) SetLocalAgentMDPath(path string) string {
+// path 为空 / 文件不存在时返回 error；上传失败时透传底层错误。
+func (c *AUNClient) PublishAgentMD(ctx context.Context, path string) (map[string]any, error) {
 	raw := strings.TrimSpace(path)
 	if raw == "" {
-		c.agentMdMu.Lock()
-		c.localAgentMDPath = ""
-		c.localAgentMDEtag = ""
-		c.agentMdMu.Unlock()
-		return ""
+		return nil, fmt.Errorf("PublishAgentMD requires non-empty path")
 	}
 	data, err := os.ReadFile(raw)
 	if err != nil {
-		if c.log != nil {
-			c.log.Warn("SetLocalAgentMDPath 读取失败 path=%s err=%v", raw, err)
-		}
-		c.agentMdMu.Lock()
-		c.localAgentMDPath = raw
-		c.localAgentMDEtag = ""
-		c.agentMdMu.Unlock()
-		return ""
+		return nil, fmt.Errorf("PublishAgentMD read file: %w", err)
 	}
-	digest := sha256.Sum256(data)
-	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(digest[:]))
+	content := string(data)
+	ops := c.resolveAgentMDOps()
+	signed, err := ops.SignAgentMD(ctx, content, nil)
+	if err != nil {
+		return nil, err
+	}
+	result, err := ops.UploadAgentMD(ctx, signed)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(signed))
+	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(sum[:]))
 	c.agentMdMu.Lock()
 	c.localAgentMDPath = raw
 	c.localAgentMDEtag = etag
 	c.agentMdMu.Unlock()
-	return etag
+	return result, nil
 }
 
-// GetLocalAgentMDEtag 返回 SetLocalAgentMDPath 计算的 etag；未设置或读取失败时返回空串。
-func (c *AUNClient) GetLocalAgentMDEtag() string {
-	c.agentMdMu.RLock()
-	defer c.agentMdMu.RUnlock()
-	return c.localAgentMDEtag
+// FetchAgentMD 下载 agent.md 并自动验签；aid 为空时取自身 AID；可选 savePath 写盘；
+// 若 aid 是自己则同步刷新 localAgentMDEtag 与 InSync。
+//
+// 写盘失败不影响 FetchAgentMD 整体成功，错误信息回填到 AgentMDInfo.SaveError。
+func (c *AUNClient) FetchAgentMD(ctx context.Context, aid string, savePath string) (*AgentMDInfo, error) {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		c.mu.RLock()
+		target = strings.TrimSpace(c.aid)
+		c.mu.RUnlock()
+	}
+	if target == "" {
+		return nil, fmt.Errorf("FetchAgentMD requires aid (or local AID)")
+	}
+
+	ops := c.resolveAgentMDOps()
+	content, err := ops.DownloadAgentMD(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := ops.VerifyAgentMD(ctx, content, &namespace.AgentMDVerifyOptions{AID: target})
+	if err != nil {
+		return nil, err
+	}
+
+	info := &AgentMDInfo{AID: target, Content: content, Signature: sig}
+
+	c.mu.RLock()
+	selfAid := strings.TrimSpace(c.aid)
+	c.mu.RUnlock()
+
+	if target == selfAid {
+		sum := sha256.Sum256([]byte(content))
+		etag := "\"" + hex.EncodeToString(sum[:]) + "\""
+		c.agentMdMu.Lock()
+		c.localAgentMDEtag = etag
+		local := c.localAgentMDEtag
+		remote := c.remoteAgentMDEtag
+		c.agentMdMu.Unlock()
+		var inSync bool
+		if local != "" && remote != "" {
+			inSync = local == remote
+		}
+		info.InSync = &inSync
+	}
+
+	if savePath != "" {
+		if err := os.WriteFile(savePath, []byte(content), 0o644); err != nil {
+			info.SaveError = err.Error()
+		} else {
+			info.SavedTo = savePath
+		}
+	}
+	return info, nil
 }
 
-// GetRemoteAgentMDEtag 返回 gateway 在最近一次 RPC envelope._meta 注入的服务端 agent.md etag。
-// 未收到过则为空串；不阻塞调用，纯内存读。
-func (c *AUNClient) GetRemoteAgentMDEtag() string {
-	c.agentMdMu.RLock()
-	defer c.agentMdMu.RUnlock()
-	return c.remoteAgentMDEtag
+// resolveAgentMDOps 返回测试注入的 agentMDOps 或默认 c.Auth。
+func (c *AUNClient) resolveAgentMDOps() agentMDOps {
+	if c.agentMDOps != nil {
+		return c.agentMDOps
+	}
+	return c.Auth
 }
 
 // observeRPCMeta transport 的 _meta observer：吸收 gateway 注入的 agent_md_etag 等元数据。
@@ -1139,6 +1125,7 @@ func (c *AUNClient) Close() (err error) {
 		if closer, ok := c.keyStore.(interface{ Close() }); ok {
 			closer.Close()
 		}
+		c.releaseV2State()
 		c.mu.Lock()
 		c.state = StateClosed
 		c.resetSeqTrackingStateLocked()
@@ -1153,6 +1140,7 @@ func (c *AUNClient) Close() (err error) {
 	if closer, ok := c.keyStore.(interface{ Close() }); ok {
 		closer.Close()
 	}
+	c.releaseV2State()
 
 	c.mu.Lock()
 	c.state = StateClosed
@@ -1236,7 +1224,12 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			delete(params, "encrypt")
 		}
 		if encrypt {
-			return c.sendEncrypted(ctx, params)
+			// V2-only：必须走 V2 路径
+			if c.v2GetState() != nil {
+				c.log.Debug("call route: message.send → V2 send")
+				return c.sendV2Internal(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot send encrypted message")
 		}
 		// encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
 		c.maybeAppendEchoTraceSend(params)
@@ -1252,10 +1245,40 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			delete(params, "encrypt")
 		}
 		if encrypt {
-			return c.sendGroupEncrypted(ctx, params)
+			// V2-only：必须走 V2 路径
+			if c.v2GetState() != nil {
+				c.logEG.Debug("call route: group.send → V2 send")
+				return c.sendGroupV2Internal(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot send encrypted group message")
 		}
 		c.maybeAppendEchoTraceSend(params)
 	}
+
+	// V2 就绪时把 message.pull / message.ack / group.pull / group.ack_messages 路由到 V2 内部方法。
+	if method == "message.pull" && c.v2GetState() != nil {
+		c.log.Debug("call route: message.pull → V2 pull")
+		return c.pullV2Internal(ctx, params)
+	}
+	if method == "message.ack" && c.v2GetState() != nil {
+		c.log.Debug("call route: message.ack → V2 ack")
+		return c.ackV2Internal(ctx, params)
+	}
+	if method == "group.pull" {
+		gid, _ := params["group_id"].(string)
+		if c.v2GetState() != nil && gid != "" {
+			c.logEG.Debug("call route: group.pull → V2 pull group=%s", gid)
+			return c.pullGroupV2Internal(ctx, params)
+		}
+	}
+	if method == "group.ack_messages" {
+		gid, _ := params["group_id"].(string)
+		if c.v2GetState() != nil && gid != "" {
+			c.logEG.Debug("call route: group.ack_messages → V2 ack group=%s", gid)
+			return c.ackGroupV2Internal(ctx, params)
+		}
+	}
+
 	if method == "group.thought.put" {
 		encrypt := true
 		if enc, ok := params["encrypt"]; ok {
@@ -1265,7 +1288,12 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			delete(params, "encrypt")
 		}
 		if encrypt {
-			return c.putGroupThoughtEncrypted(ctx, params)
+			gid, _ := params["group_id"].(string)
+			if c.v2GetState() != nil && gid != "" {
+				c.logEG.Debug("call route: group.thought.put → V2 encrypted put group=%s", gid)
+				return c.putGroupThoughtEncryptedV2(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot encrypt group thought")
 		}
 	}
 	if method == "message.thought.put" {
@@ -1277,7 +1305,12 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			delete(params, "encrypt")
 		}
 		if encrypt {
-			return c.putMessageThoughtEncrypted(ctx, params)
+			toAID, _ := params["to"].(string)
+			if c.v2GetState() != nil && toAID != "" {
+				c.log.Debug("call route: message.thought.put → V2 encrypted put to=%s", toAID)
+				return c.putMessageThoughtEncryptedV2(ctx, params)
+			}
+			return nil, NewStateError("V2 session not initialized, cannot encrypt message thought")
 		}
 	}
 
@@ -1299,14 +1332,21 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		return nil, err
 	}
 
-	// 自动解密：message.pull 返回的消息
+	// V2-only thought.get：服务端只存 envelope，SDK 读取时按当前设备解密。
+	if method == "message.thought.get" && c.v2GetState() != nil {
+		fromAID := strings.TrimSpace(getStr(params, "sender_aid", ""))
+		c.decryptV2ThoughtGetResult(ctx, result, fromAID, false)
+	}
+	if method == "group.thought.get" && c.v2GetState() != nil {
+		fromAID := strings.TrimSpace(getStr(params, "sender_aid", ""))
+		c.decryptV2ThoughtGetResult(ctx, result, fromAID, true)
+	}
+
+	// 自动解密：message.pull 返回的消息（V2-only：V1 解密已移除，仅做 seq 跟踪）
 	if method == "message.pull" {
 		if resultMap, ok := result.(map[string]any); ok {
 			messages, _ := resultMap["messages"].([]any)
 			c.log.Debug("message.pull returned %d messages", len(messages))
-			if len(messages) > 0 {
-				resultMap["messages"] = c.decryptMessages(ctx, messages)
-			}
 			// 更新 SeqTracker；server_ack_seq 即使空 pull 也必须生效。
 			c.mu.RLock()
 			myAID := c.aid
@@ -1320,7 +1360,8 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 					}
 				}
 				if len(pullMsgs) > 0 {
-					c.seqTracker.OnPullResult(ns, pullMsgs)
+					pullAfterSeq := int(toInt64(params["after_seq"]))
+					c.seqTracker.OnPullResult(ns, pullMsgs, pullAfterSeq)
 				}
 				// ⚠️ 逻辑边界 L1/L3：P2P retention floor 通道 = server_ack_seq
 				// 服务端在持久化/设备视图分支返回 server_ack_seq，客户端若 contiguous 落后必须 force 跳过
@@ -1335,60 +1376,32 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 					}
 				}
 				c.saveSeqTrackerState()
-				// auto-ack contiguous_seq
-				contig := c.seqTracker.GetContiguousSeq(ns)
-				shouldAck := len(messages) > 0 || serverAck > 0
-				if contig > 0 && shouldAck {
-					go func() {
-						ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer ackCancel()
-						if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-							"seq":       contig,
-							"device_id": c.deviceID,
-							"slot_id":   c.slotID,
-						}); ackErr != nil {
-							c.log.Warn("message.pull auto-ack failed: %v", ackErr)
-						}
-					}()
-				}
+				// auto-ack 延迟到 publish 完成后（由 fillP2pGap 负责）
 			}
 		}
 	}
 
-	// 自动解密：group.pull 返回的群消息
+	// 自动解密：group.pull 返回的群消息（V2-only：V1 解密已移除，仅做 seq 跟踪）
 	if method == "group.pull" {
 		if resultMap, ok := result.(map[string]any); ok {
 			messages, _ := resultMap["messages"].([]any)
 			gid, _ := params["group_id"].(string)
 			c.logEG.Debug("group.pull returned %d messages: group=%s", len(messages), gid)
-			if len(messages) > 0 {
-				resultMap["messages"] = c.decryptGroupMessages(ctx, messages)
-			}
 			// 更新 SeqTracker；cursor.current_seq 即使空 pull 也必须生效。
 			if gid != "" {
 				ns := "group:" + gid
-				// 区分解密成功 / 失败：失败的 payload 仍是 e2ee.group_encrypted。
-				var decryptedOnly []map[string]any
-				failedCount := 0
-				if dmsgs, ok := resultMap["messages"].([]any); ok {
-					for _, raw := range dmsgs {
-						m, ok := raw.(map[string]any)
-						if !ok {
-							continue
-						}
-						pl, _ := m["payload"].(map[string]any)
-						ptype, _ := pl["type"].(string)
-						if ptype == "e2ee.group_encrypted" {
-							failedCount++
-							c.enqueuePendingDecrypt(gid, m)
-						} else {
-							decryptedOnly = append(decryptedOnly, m)
-						}
+				var pullMsgs []map[string]any
+				for _, raw := range messages {
+					if m, ok := raw.(map[string]any); ok {
+						pullMsgs = append(pullMsgs, m)
 					}
 				}
-				// 仅用解密成功的消息推进 contig；失败的等 retry 解密成功才推进。
-				if len(decryptedOnly) > 0 {
-					c.seqTracker.OnPullResult(ns, decryptedOnly)
+				if len(pullMsgs) > 0 {
+					pullAfterSeq := int(toInt64(params["after_seq"]))
+					if pullAfterSeq == 0 {
+						pullAfterSeq = int(toInt64(params["after_message_seq"]))
+					}
+					c.seqTracker.OnPullResult(ns, pullMsgs, pullAfterSeq)
 				}
 				// ⚠️ 逻辑边界 L4：group retention floor 通道 = cursor.current_seq
 				// 群路径目前无独立 earliest_available_seq 字段；若未来引入 group retention，需新增字段并同步更新此处。
@@ -1405,89 +1418,56 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 					}
 				}
 				c.saveSeqTrackerState()
-				// auto-ack：仅当没有解密失败时才 ack。失败时让服务端 cursor 留在原位等 retry。
-				contig := c.seqTracker.GetContiguousSeq(ns)
-				shouldAck := failedCount == 0 && (len(decryptedOnly) > 0 || serverAck > 0)
-				if contig > 0 && shouldAck {
-					go func() {
-						ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer ackCancel()
-						if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-							"group_id":  gid,
-							"msg_seq":   contig,
-							"device_id": c.deviceID,
-							"slot_id":   c.slotID,
-						}); ackErr != nil {
-							c.logEG.Warn("group.pull auto-ack failed: group=%s %v", gid, ackErr)
-						}
-					}()
-				}
-				// 有解密失败时调度 recovery 兜底定时
-				if failedCount > 0 {
-					c.scheduleRecoveryTimeout(gid)
-				}
+				// auto-ack 延迟到 publish 完成后（由 fillGroupGap 负责）
 			}
 		}
 	}
-	if method == "group.thought.get" {
-		if resultMap, ok := result.(map[string]any); ok {
-			result = c.decryptGroupThoughts(ctx, resultMap)
-		}
-	}
-	if method == "message.thought.get" {
-		if resultMap, ok := result.(map[string]any); ok {
-			result = c.decryptMessageThoughts(ctx, resultMap)
-		}
-	}
+	// V2-only: thought 解密通过 V2 push 路径处理，RPC 结果直接透传
 
-	// ── Group E2EE 自动编排 ────────────────────────────────
-	// 群组 E2EE 是必备能力，始终启用自动编排
-	{
-		c.orchestrateGroupE2EE(ctx, method, params, result)
+	// V2-only 群状态编排：建群/成员变更后同步 propose+confirm state。
+	if isV2StateMembershipMethod(method) && c.v2GetState() != nil {
+		groupID := extractGroupIDFromMutationResult(result, params)
+		if groupID != "" {
+			c.v2AutoProposeState(ctx, groupID)
+		}
 	}
 
 	return result, nil
 }
 
-// orchestrateGroupE2EE 群组 E2EE 自动编排（建群、加人、踢人等后自动处理密钥）
-func (c *AUNClient) orchestrateGroupE2EE(ctx context.Context, method string, params map[string]any, result any) {
-	resultMap, _ := result.(map[string]any)
+func isV2StateMembershipMethod(method string) bool {
+	switch method {
+	case "group.create", "group.add_member", "group.kick", "group.remove_member", "group.leave",
+		"group.review_join_request", "group.batch_review_join_request",
+		"group.use_invite_code", "group.request_join":
+		return true
+	default:
+		return false
+	}
+}
 
-	// 建群后自动创建 epoch
-	if method == "group.create" && resultMap != nil {
-		group, _ := resultMap["group"].(map[string]any)
-		gid, _ := group["group_id"].(string)
-		c.mu.RLock()
-		myAID := c.aid
-		c.mu.RUnlock()
-		if gid != "" && myAID != "" && !c.groupE2EE.HasSecret(gid) {
-			_, err := c.groupE2EE.CreateEpoch(gid, []string{myAID})
-			if err != nil {
-				c.logE2EEError("create_epoch", gid, "", err)
-			} else {
-				// 建群初始化必须在 group.create 返回前完成；否则调用方紧接着加成员时，
-				// 初始 rotation 会因成员集变化被服务端拒绝提交。
-				c.syncEpochToServer(ctx, gid)
+func extractGroupIDFromMutationResult(result any, params map[string]any) string {
+	if resultMap, ok := result.(map[string]any); ok {
+		if group, ok := resultMap["group"].(map[string]any); ok {
+			if gid := strings.TrimSpace(stringFromAny(group["group_id"])); gid != "" {
+				return NormalizeGroupID(gid, "")
+			}
+		}
+		if gid := strings.TrimSpace(stringFromAny(resultMap["group_id"])); gid != "" {
+			return NormalizeGroupID(gid, "")
+		}
+		if member, ok := resultMap["member"].(map[string]any); ok {
+			if gid := strings.TrimSpace(stringFromAny(member["group_id"])); gid != "" {
+				return NormalizeGroupID(gid, "")
 			}
 		}
 	}
-
-	// 成员集变更主要由 group.changed 事件驱动；RPC 成功返回路径做幂等兜底，避免事件丢失或延迟时不轮换。
-	if isMembershipChangeMethod(method) && resultMap != nil {
-		gid := extractGroupIDFromResult(resultMap)
-		if gid == "" {
-			gid = stringFromAny(params["group_id"])
-		}
-		if gid != "" && membershipRotationChanged(method, resultMap) {
-			expectedEpoch := membershipRotationExpectedEpoch(resultMap)
-			triggerID := membershipRotationTriggerID(gid, resultMap)
-			// 自加入方法（request_join/use_invite_code）需要 allowMember=true，
-			// 因为新成员角色是 member，不是 admin，必须允许 member 参与 leader 选举。
-			allowMember := method == "group.request_join" || method == "group.use_invite_code"
-			go c.maybeLeadRotateGroupEpoch(context.Background(), gid, triggerID, expectedEpoch, allowMember)
+	if params != nil {
+		if gid := strings.TrimSpace(stringFromAny(params["group_id"])); gid != "" {
+			return NormalizeGroupID(gid, "")
 		}
 	}
-
+	return ""
 }
 
 // signClientOperation 为关键操作附加客户端 ECDSA 签名
@@ -1547,979 +1527,6 @@ func (c *AUNClient) signClientOperation(method string, params map[string]any) {
 		"params_hash":      paramsHash,
 		"signature":        base64.StdEncoding.EncodeToString(sig),
 	}
-}
-
-// ── 自动加密发送 ────────────────────────────────────────────
-
-// isRetryablePeerMaterialError 判断是否为可重试的对端材料错误（证书/prekey 指纹不匹配）
-func isRetryablePeerMaterialError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "peer cert fingerprint mismatch for ") ||
-		strings.Contains(msg, "prekey cert fingerprint mismatch") ||
-		strings.Contains(msg, "prekey 签名验证失败")
-}
-
-// invalidatePeerPrekeyCache 清除指定对端的 prekey 缓存（client 层 + E2EE 层）
-func (c *AUNClient) invalidatePeerPrekeyCache(peerAID string) {
-	c.peerPrekeysMu.Lock()
-	delete(c.peerPrekeysCache, peerAID)
-	c.peerPrekeysMu.Unlock()
-	c.e2ee.InvalidatePrekeyCache(peerAID)
-}
-
-// clearPeerCertCache 清除指定对端的证书缓存（精确匹配 aid 或 aid# 前缀）
-func (c *AUNClient) clearPeerCertCache(peerAID string) {
-	c.certCacheMu.Lock()
-	for k := range c.certCache {
-		if k == peerAID || strings.HasPrefix(k, peerAID+"#") {
-			delete(c.certCache, k)
-		}
-	}
-	c.certCacheMu.Unlock()
-}
-
-// refreshPeerPrekeys 强制刷新对端 prekey：先清缓存，再重新拉取
-func (c *AUNClient) refreshPeerPrekeys(ctx context.Context, peerAID string) ([]map[string]any, error) {
-	c.invalidatePeerPrekeyCache(peerAID)
-	c.clearPeerCertCache(peerAID)
-	return c.fetchPeerPrekeys(ctx, peerAID)
-}
-
-func (c *AUNClient) protectedHeadersFromParams(params map[string]any) any {
-	if value, ok := params["protected_headers"]; ok {
-		return value
-	}
-	if value, ok := params["headers"]; ok {
-		return value
-	}
-	return nil
-}
-
-// sendEncrypted 自动加密并发送 P2P 消息
-// 当遇到对端证书/prekey 指纹不匹配时，自动清缓存并重试一次（两阶段重试）
-func (c *AUNClient) sendEncrypted(ctx context.Context, params map[string]any) (result any, err error) {
-	tStart := time.Now()
-	toAID, _ := params["to"].(string)
-	c.logE2.Debug("sendEncrypted enter: to=%s", toAID)
-	defer func() {
-		if err != nil {
-			c.logE2.Debug("sendEncrypted exit (error): to=%s elapsed=%dms err=%v", toAID, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.logE2.Debug("sendEncrypted exit: to=%s elapsed=%dms", toAID, time.Since(tStart).Milliseconds())
-		}
-	}()
-	if err = validateMessageRecipient(toAID); err != nil {
-		return nil, err
-	}
-	payload, _ := params["payload"].(map[string]any)
-	if payload == nil {
-		return nil, NewValidationError("message.send payload must be an object when encrypt=true")
-	}
-	messageID, _ := params["message_id"].(string)
-	if messageID == "" {
-		messageID = generateUUID4()
-	}
-	c.logE2.Debug("message.send encryption started: to=%s message_id=%s", toAID, messageID)
-	timestamp := toInt64(params["timestamp"])
-	if timestamp == 0 {
-		timestamp = time.Now().UnixMilli()
-	}
-	persistRequired := truthyBool(params["persist_required"]) || truthyBool(params["durable"])
-	encryptOpts := E2EEEncryptOptions{ProtectedHeaders: c.protectedHeadersFromParams(params)}
-
-	// 惰性 P2P 同步由 connect/reconnect 完成后的 fillP2pGap goroutine 触发，
-	// 不再在 send 路径上阻塞（与 C++ FillP2PGap 行为对齐）。
-
-	// sendAttempt 封装单次发送逻辑；refresh=true 时强制刷新对端 prekey/cert 缓存
-	sendAttempt := func(refresh bool) (any, error) {
-		var recipientPrekeys []map[string]any
-		var err error
-		if refresh {
-			recipientPrekeys, err = c.refreshPeerPrekeys(ctx, toAID)
-		} else {
-			recipientPrekeys, err = c.fetchPeerPrekeys(ctx, toAID)
-		}
-		if err != nil {
-			return nil, err
-		}
-		selfSyncCopies, err := c.buildSelfSyncCopies(ctx, toAID, payload, messageID, timestamp, encryptOpts)
-		if err != nil {
-			return nil, err
-		}
-		// 统一 multi-device 路径：必须有 recipient prekey
-		if len(recipientPrekeys) == 0 {
-			return nil, fmt.Errorf("no registered device prekeys for %s, cannot send encrypted message", toAID)
-		}
-		recipientCopies, err := c.buildRecipientDeviceCopies(ctx, toAID, payload, messageID, timestamp, recipientPrekeys, encryptOpts)
-		if err != nil {
-			return nil, err
-		}
-		sendParams := map[string]any{
-			"to": toAID,
-			"payload": map[string]any{
-				"type":               "e2ee.multi_device",
-				"logical_message_id": messageID,
-				"recipient_copies":   recipientCopies,
-				"self_copies":        selfSyncCopies,
-			},
-			"type":       "e2ee.multi_device",
-			"encrypted":  true,
-			"message_id": messageID,
-			"timestamp":  timestamp,
-		}
-		if persistRequired {
-			sendParams["persist_required"] = true
-		}
-		result, err := c.transport.Call(ctx, "message.send", sendParams)
-		if err != nil {
-			c.logE2.Warn("warning: E2EE multi-device send failed, prekey consumed and cannot be rolled back (to=%s, copies=%d): %v", toAID, len(recipientCopies), err)
-		}
-		return result, err
-	}
-
-	result, err = sendAttempt(false)
-	if err != nil {
-		if !isRetryablePeerMaterialError(err) {
-			c.logE2.Error("message.send encrypted send failed: to=%s message_id=%s err=%v", toAID, messageID, err)
-			return nil, err
-		}
-		// 对端证书或 prekey 指纹不匹配，清缓存后重试一次
-		c.logE2.Warn("peer cert/prekey mismatch for %s, refreshing and retrying once", toAID)
-		result, err = sendAttempt(true)
-		if err != nil {
-			c.logE2.Error("message.send still failed after retry: to=%s message_id=%s err=%v", toAID, messageID, err)
-		} else {
-			c.logE2.Debug("message.send retry succeeded: to=%s message_id=%s", toAID, messageID)
-		}
-		return result, err
-	}
-	c.logE2.Debug("message.send encrypted send succeeded: to=%s message_id=%s", toAID, messageID)
-	return result, nil
-}
-
-func (c *AUNClient) buildRecipientDeviceCopies(
-	ctx context.Context,
-	toAID string,
-	payload map[string]any,
-	messageID string,
-	timestamp int64,
-	prekeys []map[string]any,
-	encryptOpts E2EEEncryptOptions,
-) ([]map[string]any, error) {
-	prekeys = normalizePeerPrekeys(prekeys)
-	recipientCopies := make([]map[string]any, 0, len(prekeys))
-	certCache := make(map[string][]byte)
-	for _, prekey := range prekeys {
-		deviceID := strings.TrimSpace(getStr(prekey, "device_id", ""))
-		if deviceID == "" {
-			c.logE2.Warn("skipping recipient prekey with empty device_id (to=%s, prekey_id=%s)",
-				toAID, getStr(prekey, "prekey_id", ""))
-			continue
-		}
-		peerCertFingerprint := strings.TrimSpace(strings.ToLower(getStr(prekey, "cert_fingerprint", "")))
-		cacheKey := peerCertFingerprint
-		if cacheKey == "" {
-			cacheKey = "__default__"
-		}
-		peerCertPEM := certCache[cacheKey]
-		if peerCertPEM == nil {
-			var err error
-			peerCertPEM, err = c.fetchPeerCert(ctx, toAID, peerCertFingerprint)
-			if err != nil {
-				return nil, err
-			}
-			certCache[cacheKey] = peerCertPEM
-		}
-		envelope, encryptResult, err := c.encryptCopyPayload(toAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
-		if err != nil {
-			return nil, err
-		}
-		if err := c.ensureEncryptResult(toAID, encryptResult); err != nil {
-			return nil, err
-		}
-		recipientCopies = append(recipientCopies, map[string]any{
-			"device_id": deviceID,
-			"envelope":  envelope,
-		})
-	}
-	if len(recipientCopies) == 0 {
-		return nil, NewE2EEError(fmt.Sprintf("no recipient device copies generated for %s", toAID), "E2EE_ENCRYPT_FAILED")
-	}
-	return recipientCopies, nil
-}
-
-func (c *AUNClient) resolveSelfCopyPeerCert(ctx context.Context, certFingerprint string) ([]byte, error) {
-	c.mu.RLock()
-	myAID := c.aid
-	identity := c.identity
-	c.mu.RUnlock()
-	if myAID == "" {
-		return nil, NewE2EEError("self sync copy requires current aid", "E2EE_ENCRYPT_FAILED")
-	}
-	normalized := strings.TrimSpace(strings.ToLower(certFingerprint))
-	if certPEM, ok := identity["cert"].(string); ok && certPEM != "" {
-		if normalized == "" {
-			return []byte(certPEM), nil
-		}
-		if fp, err := certSHA256Fingerprint([]byte(certPEM)); err == nil && fp == normalized {
-			return []byte(certPEM), nil
-		}
-	}
-	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok && normalized != "" {
-		if certPEM, err := versioned.LoadCertVersion(myAID, normalized); err == nil && certPEM != "" {
-			return []byte(certPEM), nil
-		}
-	}
-	if certPEM, err := c.keyStore.LoadCert(myAID); err == nil && certPEM != "" {
-		if normalized == "" {
-			return []byte(certPEM), nil
-		}
-		if actualFingerprint, fpErr := certSHA256Fingerprint([]byte(certPEM)); fpErr == nil && actualFingerprint == normalized {
-			return []byte(certPEM), nil
-		}
-	}
-	return c.fetchPeerCert(ctx, myAID, normalized)
-}
-
-func (c *AUNClient) buildSelfSyncCopies(
-	ctx context.Context,
-	logicalToAID string,
-	payload map[string]any,
-	messageID string,
-	timestamp int64,
-	encryptOpts E2EEEncryptOptions,
-) ([]map[string]any, error) {
-	c.mu.RLock()
-	myAID := c.aid
-	currentDeviceID := c.deviceID
-	c.mu.RUnlock()
-	if myAID == "" {
-		return []map[string]any{}, nil
-	}
-	prekeys, err := c.fetchPeerPrekeys(ctx, myAID)
-	if err != nil {
-		return nil, err
-	}
-	prekeys = normalizePeerPrekeys(prekeys)
-	copies := make([]map[string]any, 0)
-	for _, prekey := range prekeys {
-		deviceID := strings.TrimSpace(getStr(prekey, "device_id", ""))
-		if deviceID == "" {
-			c.logE2.Warn("skipping self sync prekey with empty device_id (aid=%s, logical_to=%s, prekey_id=%s)",
-				myAID, logicalToAID, getStr(prekey, "prekey_id", ""))
-			continue
-		}
-		if deviceID != "" && deviceID == currentDeviceID {
-			continue
-		}
-		peerCertPEM, err := c.resolveSelfCopyPeerCert(ctx, strings.TrimSpace(strings.ToLower(getStr(prekey, "cert_fingerprint", ""))))
-		if err != nil {
-			// 旧设备的 prekey 可能携带已轮换的证书指纹，跳过该设备的自同步副本
-			c.logE2.Warn("self-sync skipping device %s: cert parse failed (%v), possibly stale prekey", deviceID, err)
-			continue
-		}
-		envelope, encryptResult, err := c.encryptCopyPayload(logicalToAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
-		if err != nil {
-			return nil, err
-		}
-		if err := c.ensureEncryptResult(myAID, encryptResult); err != nil {
-			return nil, err
-		}
-		copies = append(copies, map[string]any{
-			"device_id": deviceID,
-			"envelope":  envelope,
-		})
-	}
-	return copies, nil
-}
-
-func (c *AUNClient) encryptCopyPayload(
-	logicalToAID string,
-	payload map[string]any,
-	peerCertPEM []byte,
-	prekey map[string]any,
-	messageID string,
-	timestamp int64,
-	encryptOpts E2EEEncryptOptions,
-) (map[string]any, map[string]any, error) {
-	return c.e2ee.EncryptOutbound(logicalToAID, payload, peerCertPEM, prekey, messageID, timestamp, encryptOpts)
-}
-
-func (c *AUNClient) ensureEncryptResult(toAID string, encryptResult map[string]any) error {
-	encrypted, _ := encryptResult["encrypted"].(bool)
-	if !encrypted {
-		return NewE2EEError(fmt.Sprintf("加密消息到 %s 失败", toAID), "E2EE_ENCRYPT_FAILED")
-	}
-	forwardSecrecy, _ := encryptResult["forward_secrecy"].(bool)
-	if c.configModel.RequireForwardSecrecy && !forwardSecrecy {
-		return NewE2EEError(
-			fmt.Sprintf("前向保密要求但 %s 不可用 (mode=%s)", toAID, getStr(encryptResult, "mode", "")),
-			"E2EE_FORWARD_SECRECY_REQUIRED",
-		)
-	}
-	degraded, _ := encryptResult["degraded"].(bool)
-	if degraded {
-		c.events.Publish("e2ee.degraded", map[string]any{
-			"peer_aid": toAID,
-			"mode":     encryptResult["mode"],
-			"reason":   encryptResult["degradation_reason"],
-		})
-	}
-	return nil
-}
-
-// sendGroupEncrypted 自动加密并发送群组消息
-// GO-001: 发送前预检本地 epoch 是否与服务端一致
-func (c *AUNClient) sendGroupEncrypted(ctx context.Context, params map[string]any) (result any, err error) {
-	tStart := time.Now()
-	groupID, _ := params["group_id"].(string)
-	c.logEG.Debug("sendGroupEncrypted enter: group=%s", groupID)
-	defer func() {
-		if err != nil {
-			c.logEG.Debug("sendGroupEncrypted exit (error): group=%s elapsed=%dms err=%v", groupID, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.logEG.Debug("sendGroupEncrypted exit: group=%s elapsed=%dms", groupID, time.Since(tStart).Milliseconds())
-		}
-	}()
-	return c.callGroupEncryptedRPC(ctx, "group.send", params, "message_id", "gm", nil)
-}
-
-func (c *AUNClient) putGroupThoughtEncrypted(ctx context.Context, params map[string]any) (any, error) {
-	gid, _ := params["group_id"].(string)
-	c.logEG.Debug("putGroupThoughtEncrypted entry: group=%s", gid)
-	return c.callGroupEncryptedRPC(ctx, "group.thought.put", params, "thought_id", "gt", []string{"context"})
-}
-
-func (c *AUNClient) putMessageThoughtEncrypted(ctx context.Context, params map[string]any) (any, error) {
-	toAID, _ := params["to"].(string)
-	toAID = strings.TrimSpace(toAID)
-	c.log.Debug("putMessageThoughtEncrypted entry: to=%s", toAID)
-	if err := validateMessageRecipient(toAID); err != nil {
-		return nil, err
-	}
-	if toAID == "" {
-		return nil, NewValidationError("message.thought.put requires to")
-	}
-	payload, _ := params["payload"].(map[string]any)
-	if payload == nil {
-		return nil, NewValidationError("message.thought.put payload must be an object when encrypt=true")
-	}
-	thoughtID, _ := params["thought_id"].(string)
-	if thoughtID == "" {
-		thoughtID = "mt-" + generateUUID4()
-	}
-	timestamp := toInt64(params["timestamp"])
-	if timestamp == 0 {
-		timestamp = time.Now().UnixMilli()
-	}
-	prekey, err := c.fetchPeerPrekey(ctx, toAID)
-	if err != nil {
-		return nil, err
-	}
-	peerCertFingerprint := strings.TrimSpace(strings.ToLower(getStr(prekey, "cert_fingerprint", "")))
-	peerCertPEM, err := c.fetchPeerCert(ctx, toAID, peerCertFingerprint)
-	if err != nil {
-		return nil, err
-	}
-	context, _ := params["context"].(map[string]any)
-	envelope, encryptResult, err := c.encryptCopyPayload(
-		toAID, payload, peerCertPEM, prekey, thoughtID, timestamp,
-		E2EEEncryptOptions{ProtectedHeaders: c.protectedHeadersFromParams(params), Context: context},
-	)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.ensureEncryptResult(toAID, encryptResult); err != nil {
-		return nil, err
-	}
-	sendParams := map[string]any{
-		"to":         toAID,
-		"payload":    envelope,
-		"type":       "e2ee.encrypted",
-		"encrypted":  true,
-		"thought_id": thoughtID,
-		"timestamp":  timestamp,
-	}
-	if value, ok := params["context"]; ok {
-		sendParams["context"] = value
-	}
-	c.signClientOperation("message.thought.put", sendParams)
-	return c.transport.Call(ctx, "message.thought.put", sendParams)
-}
-
-func (c *AUNClient) callGroupEncryptedRPC(
-	ctx context.Context,
-	method string,
-	params map[string]any,
-	idField string,
-	idPrefix string,
-	extraFields []string,
-) (any, error) {
-	sendParams, groupID, err := c.prepareGroupEncryptedRPCParams(ctx, method, params, idField, idPrefix, extraFields, false)
-	if err != nil {
-		return nil, err
-	}
-	for attempt := 0; attempt < 2; attempt++ {
-		result, callErr := c.transport.Call(ctx, method, sendParams)
-		if callErr == nil {
-			c.logEG.Debug("%s encrypted send succeeded: group=%s", method, groupID)
-			return result, nil
-		}
-		if attempt == 0 && isRecoverableGroupEpochError(callErr) {
-			c.logEG.Warn("group %s epoch stale when calling %s, recovering key and retrying once: %v", groupID, method, callErr)
-			sendParams, _, err = c.prepareGroupEncryptedRPCParams(ctx, method, params, idField, idPrefix, extraFields, true)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		return nil, callErr
-	}
-	return nil, NewStateError(fmt.Sprintf("%s failed after epoch recovery retry: group=%s", method, groupID))
-}
-
-func (c *AUNClient) prepareGroupEncryptedRPCParams(
-	ctx context.Context,
-	method string,
-	params map[string]any,
-	idField string,
-	idPrefix string,
-	extraFields []string,
-	strictEpochReady bool,
-) (map[string]any, string, error) {
-	groupID, _ := params["group_id"].(string)
-	payload, _ := params["payload"].(map[string]any)
-	if groupID == "" {
-		return nil, "", NewValidationError(fmt.Sprintf("%s 需要 group_id", method))
-	}
-	if payload == nil {
-		return nil, "", NewValidationError(fmt.Sprintf("%s encrypt=true 时 payload 必须是对象", method))
-	}
-
-	c.groupSyncedMu.Lock()
-	synced := c.groupSynced[groupID]
-	c.groupSyncedMu.Unlock()
-	if !synced {
-		c.lazySyncGroup(groupID)
-	}
-
-	if err := c.ensureGroupEpochReady(ctx, groupID, strictEpochReady); err != nil {
-		c.logEG.Warn("group.send epoch not ready: group=%s err=%v", groupID, err)
-		return nil, "", err
-	}
-	c.waitForGroupMembershipEpochFloor(ctx, groupID, 2*time.Second)
-
-	epochResult := c.committedGroupEpochState(ctx, groupID)
-	committedEpoch := int(toInt64(firstNonNil(epochResult["committed_epoch"], epochResult["epoch"])))
-	operationID := ""
-	if v, ok := params[idField].(string); ok {
-		operationID = strings.TrimSpace(v)
-	}
-	if operationID == "" {
-		operationID = fmt.Sprintf("%s-%s", idPrefix, generateUUID4())
-	}
-	timestamp := time.Now().UnixMilli()
-	if raw, ok := params["timestamp"]; ok {
-		if parsed := toInt64(raw); parsed > 0 {
-			timestamp = parsed
-		}
-	}
-	var context map[string]any
-	if method == "group.thought.put" {
-		context, _ = params["context"].(map[string]any)
-	}
-	encryptOpts := E2EEEncryptOptions{
-		ProtectedHeaders: c.protectedHeadersFromParams(params),
-		Context:          context,
-		MessageID:        operationID,
-		Timestamp:        timestamp,
-	}
-	var envelope map[string]any
-	var err error
-	if committedEpoch > 0 {
-		readyEpoch, readyErr := c.ensureCommittedGroupSecretForSend(ctx, groupID, committedEpoch, epochResult)
-		if readyErr != nil {
-			return nil, "", readyErr
-		}
-		envelope, err = c.groupE2EE.EncryptWithEpoch(groupID, readyEpoch, payload, encryptOpts)
-	} else {
-		envelope, err = c.groupE2EE.Encrypt(groupID, payload, encryptOpts)
-	}
-	if err != nil {
-		return nil, "", err
-	}
-
-	sendParams := map[string]any{
-		"group_id":  groupID,
-		"payload":   envelope,
-		"type":      "e2ee.group_encrypted",
-		"encrypted": true,
-		idField:     operationID,
-		"timestamp": timestamp,
-	}
-	if c.deviceID != "" {
-		sendParams["device_id"] = c.deviceID
-	}
-	if c.slotID != "" {
-		sendParams["slot_id"] = c.slotID
-	}
-	for _, field := range extraFields {
-		if value, ok := params[field]; ok {
-			sendParams[field] = value
-		}
-	}
-	c.signClientOperation(method, sendParams)
-	return sendParams, groupID, nil
-}
-
-func isGroupEpochTooOldError(err error) bool {
-	if err == nil {
-		return false
-	}
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "e2ee epoch too old") ||
-		strings.Contains(text, "epoch below sender membership floor")
-}
-
-func isGroupEpochRotationPendingError(err error) bool {
-	if err == nil {
-		return false
-	}
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "e2ee epoch rotation pending") || strings.Contains(text, "e2ee epoch not committed")
-}
-
-func isGroupEpochChangedDuringSendError(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "e2ee epoch changed during send")
-}
-
-func isRecoverableGroupEpochError(err error) bool {
-	return isGroupEpochTooOldError(err) ||
-		isGroupEpochRotationPendingError(err) ||
-		isGroupEpochChangedDuringSendError(err)
-}
-
-func (c *AUNClient) groupKeyRecoveryCandidates(groupID string, epochResult map[string]any) []string {
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	candidates := make([]string, 0)
-	seen := make(map[string]bool)
-	add := func(value any) {
-		aid := strings.TrimSpace(fmt.Sprint(value))
-		if aid == "" || aid == "<nil>" || aid == myAID || seen[aid] {
-			return
-		}
-		seen[aid] = true
-		candidates = append(candidates, aid)
-	}
-	add(epochResult["rotated_by"])
-	add(epochResult["owner_aid"])
-	for _, key := range []string{"recovery_candidates", "admins", "members"} {
-		switch values := epochResult[key].(type) {
-		case []any:
-			for _, value := range values {
-				if m, ok := value.(map[string]any); ok {
-					add(m["aid"])
-				} else {
-					add(value)
-				}
-			}
-		case []string:
-			for _, value := range values {
-				add(value)
-			}
-		}
-	}
-	for _, aid := range c.groupE2EE.GetMemberAIDs(groupID) {
-		add(aid)
-	}
-	return candidates
-}
-
-func (c *AUNClient) requestGroupKeyFromCandidates(ctx context.Context, groupID string, serverEpoch int, epochResult map[string]any) {
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	for _, target := range c.groupKeyRecoveryCandidates(groupID, epochResult) {
-		reqPayload := BuildKeyRequest(groupID, serverEpoch, myAID)
-		c.groupE2EE.RememberKeyRequest(reqPayload, target)
-		if _, err := c.Call(ctx, "message.send", map[string]any{
-			"to":               target,
-			"payload":          reqPayload,
-			"encrypt":          true,
-			"persist_required": true,
-		}); err != nil {
-			c.logEG.Warn("requesting group %s epoch %d key from %s failed: %v", groupID, serverEpoch, target, err)
-		}
-	}
-}
-
-func (c *AUNClient) recoverInitialGroupEpochIfNeeded(ctx context.Context, groupID string, localEpoch int, epochResult map[string]any) map[string]any {
-	serverEpoch := int(toInt64(epochResult["epoch"]))
-	if serverEpoch != 0 || localEpoch != 1 {
-		return epochResult
-	}
-	secretData, err := c.groupE2EE.LoadSecretForEpoch(groupID, 1)
-	if err != nil || secretData == nil || strings.TrimSpace(stringFromAny(secretData["pending_rotation_id"])) != "" {
-		return epochResult
-	}
-	c.logEG.Warn("group %s detected local epoch 1 exists but server epoch is still 0, attempting initial epoch sync", groupID)
-	c.syncEpochToServer(ctx, groupID)
-	refreshedRaw, refreshErr := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-	if refreshErr != nil {
-		c.logEG.Warn("group %s initial epoch sync failed to refresh server epoch: %v", groupID, refreshErr)
-		return epochResult
-	}
-	if refreshedMap, ok := refreshedRaw.(map[string]any); ok {
-		return refreshedMap
-	}
-	return epochResult
-}
-
-func (c *AUNClient) ensureGroupEpochReady(ctx context.Context, groupID string, strict bool) error {
-	localEpoch := c.groupE2EE.CurrentEpoch(groupID)
-	effectiveLocalEpoch := 0
-	if localEpoch != nil {
-		effectiveLocalEpoch = *localEpoch
-	}
-	epochResult, err := c.transport.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-	if err != nil {
-		if strict {
-			return NewStateError(fmt.Sprintf("group %s failed to query server epoch before retry: %v", groupID, err))
-		}
-		c.logEG.Warn("group %s epoch precheck failed: %v", groupID, err)
-		return nil
-	}
-	resultMap, ok := epochResult.(map[string]any)
-	if !ok {
-		return nil
-	}
-	serverEpoch := int(toInt64(firstNonNil(resultMap["committed_epoch"], resultMap["epoch"])))
-	if pending, ok := resultMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
-		pendingBaseEpoch := int(toInt64(firstNonNil(pending["base_epoch"], serverEpoch)))
-		c.scheduleGroupRotationRetry(groupID, "pending_recovery", stringFromAny(pending["rotation_id"]), pendingBaseEpoch, pending)
-	}
-	if serverEpoch == 0 && effectiveLocalEpoch == 1 {
-		resultMap = c.recoverInitialGroupEpochIfNeeded(ctx, groupID, effectiveLocalEpoch, resultMap)
-		serverEpoch = int(toInt64(firstNonNil(resultMap["committed_epoch"], resultMap["epoch"])))
-		if serverEpoch == 0 {
-			return NewStateError(fmt.Sprintf("group %s initial epoch sync has not completed; refuse to send with local epoch 1 while server epoch is 0", groupID))
-		}
-	}
-	if serverEpoch <= effectiveLocalEpoch {
-		if !strict || serverEpoch <= 0 {
-			return nil
-		}
-		waitDeadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(waitDeadline) {
-			time.Sleep(150 * time.Millisecond)
-			refreshedRaw, refreshErr := c.transport.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-			if refreshErr != nil {
-				continue
-			}
-			refreshedMap, ok := refreshedRaw.(map[string]any)
-			if !ok {
-				continue
-			}
-			refreshedEpoch := int(toInt64(firstNonNil(refreshedMap["committed_epoch"], refreshedMap["epoch"])))
-			currentLocal := c.groupE2EE.CurrentEpoch(groupID)
-			if refreshedEpoch > serverEpoch {
-				resultMap = refreshedMap
-				serverEpoch = refreshedEpoch
-				if currentLocal != nil {
-					effectiveLocalEpoch = *currentLocal
-				}
-				break
-			}
-			if currentLocal != nil && *currentLocal > effectiveLocalEpoch {
-				return nil
-			}
-		}
-		if serverEpoch <= effectiveLocalEpoch {
-			return NewStateError(fmt.Sprintf("group %s epoch rotation has not completed", groupID))
-		}
-	}
-	c.logEG.Warn("group %s local epoch=%d < server epoch=%d; requesting key recovery", groupID, effectiveLocalEpoch, serverEpoch)
-	c.recoverGroupEpochKey(ctx, groupID, serverEpoch, "", 5*time.Second)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(150 * time.Millisecond)
-		refreshed := c.groupE2EE.CurrentEpoch(groupID)
-		if refreshed != nil && *refreshed >= serverEpoch {
-			return nil
-		}
-	}
-	refreshed := c.groupE2EE.CurrentEpoch(groupID)
-	refreshedText := "<nil>"
-	if refreshed != nil {
-		refreshedText = fmt.Sprint(*refreshed)
-	}
-	return NewStateError(fmt.Sprintf("group %s local epoch %s is behind server epoch %d; key recovery has not completed", groupID, refreshedText, serverEpoch))
-}
-
-func (c *AUNClient) waitForGroupMembershipEpochFloor(ctx context.Context, groupID string, timeout time.Duration) {
-	_ = timeout
-	for {
-		epochRaw, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-		if err != nil {
-			c.logEG.Warn("group %s member epoch floor precheck skipped: %v", groupID, err)
-			return
-		}
-		epochMap, _ := epochRaw.(map[string]any)
-		committedEpoch := int(toInt64(firstNonNil(epochMap["committed_epoch"], epochMap["epoch"])))
-
-		membersRaw, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
-		if err != nil {
-			c.logEG.Warn("group %s member epoch floor member query skipped: %v", groupID, err)
-			return
-		}
-		membersMap, _ := membersRaw.(map[string]any)
-		members, _ := membersMap["members"].([]any)
-		maxMinReadEpoch := 0
-		for _, raw := range members {
-			member, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			value := int(toInt64(member["min_read_epoch"]))
-			if value > maxMinReadEpoch {
-				maxMinReadEpoch = value
-			}
-		}
-		if maxMinReadEpoch <= committedEpoch {
-			return
-		}
-		c.logEG.Warn("group %s member min_read_epoch exceeds committed epoch, continuing with committed epoch: committed=%d floor=%d",
-			groupID, committedEpoch, maxMinReadEpoch)
-		return
-	}
-}
-
-func (c *AUNClient) committedGroupEpochState(ctx context.Context, groupID string) map[string]any {
-	raw, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-	if err == nil {
-		if result, ok := raw.(map[string]any); ok {
-			return result
-		}
-	}
-	if err != nil {
-		c.logEG.Warn("group %s committed epoch state query failed, falling back to local epoch: %v", groupID, err)
-	}
-	localEpoch := 0
-	if ep := c.groupE2EE.CurrentEpoch(groupID); ep != nil {
-		localEpoch = *ep
-	}
-	return map[string]any{"epoch": localEpoch, "committed_epoch": localEpoch}
-}
-
-func (c *AUNClient) groupSecretMatchesCommittedRotation(secretData map[string]any, committedRotation map[string]any) bool {
-	if secretData == nil {
-		return false
-	}
-	committedCommitment := ""
-	if committedRotation != nil {
-		committedCommitment = strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
-	}
-	localCommitment := strings.TrimSpace(stringFromAny(secretData["commitment"]))
-	if committedCommitment != "" && committedCommitment != localCommitment {
-		return false
-	}
-	pendingRotationID := strings.TrimSpace(stringFromAny(secretData["pending_rotation_id"]))
-	if pendingRotationID == "" {
-		return true
-	}
-	if committedRotation == nil {
-		return false
-	}
-	if strings.TrimSpace(stringFromAny(committedRotation["rotation_id"])) != pendingRotationID {
-		return false
-	}
-	return true
-}
-
-func (c *AUNClient) ensureCommittedGroupSecretForSend(ctx context.Context, groupID string, committedEpoch int, epochResult map[string]any) (int, error) {
-	if committedEpoch <= 0 {
-		return committedEpoch, nil
-	}
-	secretData, err := c.groupE2EE.LoadSecretForEpoch(groupID, committedEpoch)
-	if err != nil {
-		return 0, err
-	}
-	committedRotation, _ := epochResult["committed_rotation"].(map[string]any)
-	if c.committedRotationMembershipGap(ctx, groupID, committedEpoch, committedRotation) {
-		allowMember := c.groupAllowsMemberEpochRotation(ctx, groupID)
-		c.logEG.Warn("group %s committed epoch %d member snapshot differs from current members, triggering membership rotation fix",
-			groupID, committedEpoch)
-		triggerID := fmt.Sprintf("%s:committed_membership_gap:aid:%s:epoch:%d", groupID, c.aid, committedEpoch)
-		c.maybeLeadRotateGroupEpoch(ctx, groupID, triggerID, &committedEpoch, allowMember)
-		refreshed := c.committedGroupEpochState(ctx, groupID)
-		refreshedCommittedEpoch := int(toInt64(firstNonNil(refreshed["committed_epoch"], refreshed["epoch"], committedEpoch)))
-		if refreshedCommittedEpoch > committedEpoch {
-			committedEpoch = refreshedCommittedEpoch
-			committedRotation, _ = refreshed["committed_rotation"].(map[string]any)
-			secretData, err = c.groupE2EE.LoadSecretForEpoch(groupID, committedEpoch)
-			if err != nil {
-				return 0, err
-			}
-		}
-		if c.committedRotationMembershipGap(ctx, groupID, committedEpoch, committedRotation) {
-			return 0, NewStateError(fmt.Sprintf("group %s committed membership is stale at epoch %d; key rotation repair has not completed", groupID, committedEpoch))
-		}
-	}
-	if c.groupSecretMatchesCommittedRotation(secretData, committedRotation) {
-		return committedEpoch, nil
-	}
-	pendingRotationID := ""
-	if secretData != nil {
-		pendingRotationID = stringFromAny(secretData["pending_rotation_id"])
-	}
-	c.logEG.Warn("group %s epoch %d local pending key does not match server committed rotation, recovering key first: local_rotation=%s",
-		groupID, committedEpoch, firstNonEmpty(pendingRotationID, "-"))
-	c.recoverGroupEpochKey(ctx, groupID, committedEpoch, "", 5*time.Second)
-	refreshed := c.committedGroupEpochState(ctx, groupID)
-	refreshedCommittedEpoch := int(toInt64(firstNonNil(refreshed["committed_epoch"], refreshed["epoch"], committedEpoch)))
-	if refreshedCommittedEpoch > committedEpoch {
-		committedEpoch = refreshedCommittedEpoch
-		c.recoverGroupEpochKey(ctx, groupID, committedEpoch, "", 5*time.Second)
-		refreshed = c.committedGroupEpochState(ctx, groupID)
-	}
-	refreshedRotation, _ := refreshed["committed_rotation"].(map[string]any)
-	refreshedSecret, _ := c.groupE2EE.LoadSecretForEpoch(groupID, committedEpoch)
-	if !c.groupSecretMatchesCommittedRotation(refreshedSecret, refreshedRotation) {
-		return 0, NewStateError(fmt.Sprintf("group %s epoch %d local key is pending or mismatched; refuse to send with uncommitted group key", groupID, committedEpoch))
-	}
-	return committedEpoch, nil
-}
-
-func (c *AUNClient) committedRotationMembershipGap(ctx context.Context, groupID string, committedEpoch int, committedRotation map[string]any) bool {
-	if strings.TrimSpace(c.aid) == "" || committedEpoch <= 0 || committedRotation == nil {
-		return false
-	}
-	expectedMembers := sortedStringListFromAny(committedRotation["expected_members"])
-	if len(expectedMembers) == 0 {
-		return false
-	}
-	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
-	if err != nil {
-		c.logEG.Warn("failed to query current members, cannot determine committed membership gap: group=%s err=%v", groupID, err)
-		return false
-	}
-	membersMap, _ := membersResult.(map[string]any)
-	rawMembers := any(nil)
-	if membersMap != nil {
-		rawMembers = firstNonNil(membersMap["members"], membersMap["items"])
-	}
-	memberList, _ := rawMembers.([]any)
-	if len(memberList) == 0 {
-		return false
-	}
-	activeMembers := make([]string, 0, len(memberList))
-	for _, item := range memberList {
-		member, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		aid := strings.TrimSpace(stringFromAny(member["aid"]))
-		status := strings.ToLower(strings.TrimSpace(firstNonEmpty(stringFromAny(member["status"]), "active")))
-		if aid != "" && (status == "" || status == "active") {
-			activeMembers = append(activeMembers, aid)
-		}
-	}
-	if len(activeMembers) == 0 || !stringSliceContains(activeMembers, c.aid) {
-		return false
-	}
-	sort.Strings(activeMembers)
-	if strings.Join(activeMembers, "\n") != strings.Join(expectedMembers, "\n") {
-		missing := make([]string, 0)
-		extra := make([]string, 0)
-		for _, aid := range activeMembers {
-			if !stringSliceContains(expectedMembers, aid) {
-				missing = append(missing, aid)
-			}
-		}
-		for _, aid := range expectedMembers {
-			if !stringSliceContains(activeMembers, aid) {
-				extra = append(extra, aid)
-			}
-		}
-		c.logEG.Warn("group %s committed membership gap: epoch=%d missing=%v extra=%v",
-			groupID, committedEpoch, missing, extra)
-		return true
-	}
-	return false
-}
-
-// epochPrecheck 检查本地 epoch 是否落后于服务端，落后则触发密钥恢复
-// GO-001: 参考 Python SDK _send_group_encrypted 的 epoch 预检逻辑
-func (c *AUNClient) epochPrecheck(ctx context.Context, groupID string) {
-	localEpoch := c.groupE2EE.CurrentEpoch(groupID)
-	if localEpoch == nil {
-		return // 无本地密钥时跳过预检（Encrypt 会返回 SecretMissingError）
-	}
-
-	epochResult, err := c.transport.Call(ctx, "group.e2ee.get_epoch", map[string]any{
-		"group_id": groupID,
-	})
-	if err != nil {
-		c.logEG.Warn("group %s epoch precheck query failed: %v", groupID, err)
-		return // 查询失败不阻塞发送
-	}
-
-	resultMap, ok := epochResult.(map[string]any)
-	if !ok {
-		return
-	}
-	serverEpoch := int(toInt64(resultMap["epoch"]))
-	if serverEpoch <= *localEpoch {
-		return // 本地 epoch 不落后
-	}
-
-	c.logEG.Warn("group %s local epoch=%d < server epoch=%d, triggering key recovery",
-		groupID, *localEpoch, serverEpoch)
-
-	// 向 owner 请求最新密钥
-	ownerAID, _ := resultMap["owner_aid"].(string)
-	if ownerAID == "" {
-		// 尝试通过 group.get 获取 owner；Group 服务没有 group.get_info 方法。
-		info, infoErr := c.transport.Call(ctx, "group.get", map[string]any{
-			"group_id": groupID,
-		})
-		if infoErr == nil {
-			if infoMap, ok := info.(map[string]any); ok {
-				ownerAID, _ = infoMap["owner_aid"].(string)
-				if ownerAID == "" {
-					if groupMap, ok := infoMap["group"].(map[string]any); ok {
-						ownerAID, _ = groupMap["owner_aid"].(string)
-					}
-				}
-			}
-		}
-	}
-
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	if ownerAID != "" && ownerAID != myAID {
-		recovery := c.groupE2EE.BuildRecoveryRequest(groupID, serverEpoch, ownerAID)
-		if recovery != nil {
-			to, _ := recovery["to"].(string)
-			recPayload, _ := recovery["payload"].(map[string]any)
-			if to != "" && recPayload != nil {
-				if _, sendErr := c.Call(ctx, "message.send", map[string]any{
-					"to":      to,
-					"payload": recPayload,
-					"encrypt": true,
-				}); sendErr != nil {
-					c.logEG.Warn("epoch precheck key recovery request failed: %v", sendErr)
-				}
-			}
-		}
-	}
-	// 不阻塞发送：使用当前本地 epoch 发送，服务端若拒绝由上层处理
 }
 
 // ── 便利方法 ──────────────────────────────────────────────
@@ -2712,6 +1719,15 @@ func (c *AUNClient) messageTargetsCurrentInstance(message any) bool {
 	return true
 }
 
+func isLegacyEncryptedPayload(payload any) bool {
+	pm, ok := payload.(map[string]any)
+	if !ok || pm == nil {
+		return false
+	}
+	payloadType := strings.TrimSpace(stringFromAny(pm["type"]))
+	return payloadType == "e2ee.encrypted" || payloadType == "e2ee.group_encrypted"
+}
+
 // onRawMessageReceived 处理 transport 层推送的原始消息
 func (c *AUNClient) onRawMessageReceived(data any) {
 	tStart := time.Now()
@@ -2738,32 +1754,6 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 
 	msg := copyMapShallow(dataMap)
 	if !c.messageTargetsCurrentInstance(msg) {
-		return
-	}
-
-	// 拦截 P2P 传输的群组密钥分发/请求/响应消息
-	if c.tryHandleGroupKeyMessage(msg) {
-		// group_key 控制消息也要推进 seq tracker + auto-ack，
-		// 否则 fillP2pGap 会因为 contig 卡在此 seq 之前而重复拉取同样的历史消息。
-		seq := int(toInt64(msg["seq"]))
-		c.mu.RLock()
-		myAID := c.aid
-		c.mu.RUnlock()
-		if seq > 0 && myAID != "" {
-			ns := "p2p:" + myAID
-			c.seqTracker.OnMessageSeq(ns, seq)
-			c.saveSeqTrackerState()
-			contig := c.seqTracker.GetContiguousSeq(ns)
-			if contig > 0 {
-				go func() {
-					ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer ackCancel()
-					c.transport.Call(ackCtx, "message.ack", map[string]any{
-						"seq": contig, "device_id": c.deviceID, "slot_id": c.slotID,
-					})
-				}()
-			}
-		}
 		return
 	}
 
@@ -2800,26 +1790,13 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 		c.saveSeqTrackerState()
 	}
 
-	ctx := context.Background()
-	decrypted := c.decryptSingleMessage(ctx, msg)
-	if decrypted == nil {
-		if seq > 0 && myAID != "" {
-			c.drainOrderedMessages("p2p:" + myAID)
-		}
-		// H26: 解密失败不再投递原始密文 payload（避免元数据泄漏 + 语义混淆），
-		// 改为发布 message.undecryptable 事件，仅携带安全的 header 信息。
-		c.log.Error("P2P message decryption failed, publishing message.undecryptable: seq=%d", seq)
-		safeEvent := map[string]any{
-			"message_id":     msg["message_id"],
-			"from":           msg["from"],
-			"to":             msg["to"],
-			"seq":            msg["seq"],
-			"timestamp":      msg["timestamp"],
-			"_decrypt_error": "decryption failed",
-		}
-		c.publishAppEvent("message.undecryptable", safeEvent)
+	if isLegacyEncryptedPayload(msg["payload"]) {
+		c.log.Debug("V2-only: skipped legacy encrypted P2P push: from=%s seq=%d", fromAID, seq)
 		return
 	}
+
+	// V2-only: V2 P2P 消息通过 V2 push 路径解密；明文/兼容消息在此处透传
+	decrypted := msg
 	if seq > 0 && myAID != "" {
 		c.publishOrderedMessage("message.received", "p2p:"+myAID, seq, decrypted)
 	} else {
@@ -2883,12 +1860,14 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 		return
 	}
 
-	ctx := context.Background()
-	decrypted := c.decryptGroupMessage(ctx, msg)
+	if isLegacyEncryptedPayload(payload) {
+		c.logEG.Debug("V2-only: skipped legacy encrypted group push: group=%s seq=%d", groupID, seq)
+		return
+	}
 
-	// 解密失败时**不推进 seq tracker / 不 auto-ack**：让服务端 cursor 留在原位，
-	// 等密钥恢复后 retry 解密成功才推进 + ack；recovery 真的失败时由
-	// retryPendingDecryptMsgs(forceAdvanceOnFail=true) 兜底强制推进。
+	// V2-only: V2 群组消息通过 V2 push 路径解密；明文/兼容消息在此处透传
+	decrypted := msg
+
 	if decrypted != nil && groupID != "" && seq > 0 {
 		ns := "group:" + groupID
 		needPull := c.seqTracker.OnMessageSeq(ns, seq)
@@ -2914,23 +1893,7 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 		c.saveSeqTrackerState()
 	}
 
-	if decrypted == nil {
-		c.enqueuePendingDecrypt(groupID, msg)
-		// 不推进 cursor，但仍发 undecryptable 事件让应用层知道有未解开的消息。
-		c.logEG.Warn("group message decryption failed, enqueued for retry: group=%s seq=%d", groupID, seq)
-		safeEvent := map[string]any{
-			"message_id":     msg["message_id"],
-			"group_id":       msg["group_id"],
-			"from":           msg["from"],
-			"seq":            msg["seq"],
-			"timestamp":      msg["timestamp"],
-			"_decrypt_error": "decryption failed",
-		}
-		c.publishAppEvent("group.message_undecryptable", safeEvent)
-		// 调度 recovery 兜底定时（30s 后如果仍未解开，强制推进）
-		c.scheduleRecoveryTimeout(groupID)
-		return
-	}
+	// V2-only: 不再有 pending decrypt 队列，decrypted 始终非 nil
 	if groupID != "" && seq > 0 {
 		c.publishOrderedMessage("group.message_created", "group:"+groupID, seq, decrypted)
 	} else {
@@ -2950,11 +1913,26 @@ func (c *AUNClient) autoPullGroupMessages(notification map[string]any) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// V2-only 模式：走 group.v2.pull（合并 V1 明文 + V2 密文并自动解密）
+	v2State := c.v2GetState()
+	if v2State != nil && v2State.session != nil {
+		_, err := c.pullGroupV2Internal(ctx, map[string]any{
+			"group_id":  groupID,
+			"after_seq": afterSeq,
+			"limit":     50,
+		})
+		if err != nil {
+			c.logEG.Warn("auto pull group messages (v2) failed: %v", err)
+			c.publishAppEvent("group.message_created", notification)
+		}
+		return
+	}
+
 	result, err := c.Call(ctx, "group.pull", map[string]any{
-		"group_id":          groupID,
-		"after_message_seq": afterSeq,
-		"device_id":         c.deviceID,
-		"limit":             50,
+		"group_id":  groupID,
+		"after_seq": afterSeq,
+		"limit":     50,
 	})
 	if err != nil {
 		c.logEG.Warn("auto pull group messages failed: %v", err)
@@ -2978,7 +1956,7 @@ func (c *AUNClient) autoPullGroupMessages(notification map[string]any) {
 			pullMsgs = append(pullMsgs, m)
 		}
 	}
-	c.seqTracker.OnPullResult(ns, pullMsgs)
+	c.seqTracker.OnPullResult(ns, pullMsgs, afterSeq)
 	// pushedSeqs 去重：使用 publishGapFillGroupMessages 安全发布，避免锁外读取竞态
 	c.publishGapFillGroupMessages(ns, messages)
 }
@@ -2988,8 +1966,8 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 	ns := "group:" + groupID
 	afterSeq := c.seqTracker.GetContiguousSeq(ns)
 	c.logEG.Debug("fillGroupGap triggered: group=%s afterSeq=%d", groupID, afterSeq)
-	// 去重：同一 (group:id:after_seq) 只补一次
-	dedupKey := fmt.Sprintf("group_msg:%s:%d", groupID, afterSeq)
+	// per-namespace 去重：同一 group namespace 只允许 1 个 in-flight pull
+	dedupKey := "group_pull:" + ns
 	c.gapFillDoneMu.Lock()
 	if c.gapFillDone[dedupKey] {
 		c.gapFillDoneMu.Unlock()
@@ -3006,10 +1984,9 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := c.Call(ctx, "group.pull", map[string]any{
-		"group_id":          groupID,
-		"after_message_seq": afterSeq,
-		"device_id":         c.deviceID,
-		"limit":             50,
+		"group_id":  groupID,
+		"after_seq": afterSeq,
+		"limit":     50,
 	})
 	if err != nil {
 		c.logEG.Warn("background gap fill failed (fillGroupGap group=%s): %v", groupID, err)
@@ -3023,10 +2000,27 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 	if !ok {
 		return
 	}
-	// seq_tracker 更新和 auto-ack 已在 Call() 拦截器中完成
+	// seq_tracker 更新已在 Call() 拦截器中完成；auto-ack 在 publish 后执行
 	nsKey := "group:" + groupID
+	contigBefore := c.seqTracker.GetContiguousSeq(nsKey)
 	c.logEG.Debug("fillGroupGap completed: group=%s recovered %d messages", groupID, len(messages))
 	c.publishGapFillGroupMessages(nsKey, messages)
+	// publish 完成后 auto-ack
+	contig := c.seqTracker.GetContiguousSeq(nsKey)
+	if contig > 0 && contig != contigBefore {
+		go func() {
+			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer ackCancel()
+			if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
+				"group_id":  groupID,
+				"msg_seq":   contig,
+				"device_id": c.deviceID,
+				"slot_id":   c.slotID,
+			}); ackErr != nil {
+				c.logEG.Warn("fillGroupGap auto-ack failed: group=%s %v", groupID, ackErr)
+			}
+		}()
+	}
 }
 
 // lazySyncGroup 惰性同步：首次激活群时 pull 最近消息，建立 seq 基线。
@@ -3076,8 +2070,8 @@ func (c *AUNClient) fillGroupEventGap(groupID string) {
 	ns := "group_event:" + groupID
 	afterSeq := c.seqTracker.GetContiguousSeq(ns)
 	c.logEG.Debug("fillGroupEventGap triggered: group=%s afterSeq=%d", groupID, afterSeq)
-	// 去重：同一 (group_evt:id:after_seq) 只补一次
-	dedupKey := fmt.Sprintf("group_evt:%s:%d", groupID, afterSeq)
+	// per-namespace 去重：同一 group_event namespace 只允许 1 个 in-flight pull
+	dedupKey := "group_event_pull:" + ns
 	c.gapFillDoneMu.Lock()
 	if c.gapFillDone[dedupKey] {
 		c.gapFillDoneMu.Unlock()
@@ -3117,7 +2111,8 @@ func (c *AUNClient) fillGroupEventGap(groupID string) {
 			pullEvts = append(pullEvts, e)
 		}
 	}
-	c.seqTracker.OnPullResult(ns, pullEvts)
+	contigBefore := c.seqTracker.GetContiguousSeq(ns)
+	c.seqTracker.OnPullResult(ns, pullEvts, afterSeq)
 	serverAck := 0
 	if cursor, ok := resultMap["cursor"].(map[string]any); ok {
 		serverAck = int(toInt64(cursor["current_seq"]))
@@ -3132,7 +2127,7 @@ func (c *AUNClient) fillGroupEventGap(groupID string) {
 	// 持久化 cursor + ack_events（与 Python 对齐）
 	c.saveSeqTrackerState()
 	contig := c.seqTracker.GetContiguousSeq(ns)
-	if contig > 0 && (len(events) > 0 || serverAck > 0) {
+	if contig > 0 && contig != contigBefore {
 		go func() {
 			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ackCancel()
@@ -3176,8 +2171,8 @@ func (c *AUNClient) fillP2pGap() {
 	ns := "p2p:" + myAID
 	afterSeq := c.seqTracker.GetContiguousSeq(ns)
 	c.log.Debug("fillP2pGap triggered: afterSeq=%d", afterSeq)
-	// 去重：同一 (type:after_seq) 只补一次
-	dedupKey := fmt.Sprintf("p2p:%d", afterSeq)
+	// per-namespace 去重：同一 namespace 只允许 1 个 in-flight pull
+	dedupKey := "p2p_pull:" + ns
 	c.gapFillDoneMu.Lock()
 	if c.gapFillDone[dedupKey] {
 		c.gapFillDoneMu.Unlock()
@@ -3195,7 +2190,6 @@ func (c *AUNClient) fillP2pGap() {
 	defer cancel()
 	result, err := c.Call(ctx, "message.pull", map[string]any{
 		"after_seq": afterSeq,
-		"device_id": c.deviceID,
 		"limit":     50,
 	})
 	if err != nil {
@@ -3210,28 +2204,50 @@ func (c *AUNClient) fillP2pGap() {
 	if !ok {
 		return
 	}
-	// seq_tracker 更新和 auto-ack 已在 Call() 拦截器中完成
+	// seq_tracker 更新已在 Call() 拦截器中完成；auto-ack 在 publish 后执行
 	nsKey := "p2p:" + myAID
+	contigBefore := c.seqTracker.GetContiguousSeq(nsKey)
 	c.log.Debug("fillP2pGap completed: recovered %d messages", len(messages))
 	c.publishGapFillMessages(nsKey, messages)
+	// publish 完成后 auto-ack
+	contig := c.seqTracker.GetContiguousSeq(nsKey)
+	if contig > 0 && contig != contigBefore {
+		go func() {
+			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer ackCancel()
+			if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
+				"seq":       contig,
+				"device_id": c.deviceID,
+				"slot_id":   c.slotID,
+			}); ackErr != nil {
+				c.log.Warn("fillP2pGap auto-ack failed: %v", ackErr)
+			}
+		}()
+	}
 }
 
-// prunePushedSeqs 清理 pushedSeqs 中 <= contiguousSeq 的条目，防止无限增长
+// prunePushedSeqs 只按硬上限裁剪 published guard。
+// 不能按 contiguousSeq 清理：pull/补洞可能在 cursor 推进后再次拿到旧消息，
+// 去重状态必须保留，否则会重复 publish。
 func (c *AUNClient) prunePushedSeqs(ns string) {
-	contig := c.seqTracker.GetContiguousSeq(ns)
 	c.pushedSeqsMu.Lock()
 	defer c.pushedSeqsMu.Unlock()
 	pushed := c.pushedSeqs[ns]
 	if pushed == nil {
 		return
 	}
-	for s := range pushed {
-		if s <= contig {
-			delete(pushed, s)
+	if len(pushed) > pushedSeqsLimit {
+		seqs := make([]int, 0, len(pushed))
+		for s := range pushed {
+			seqs = append(seqs, s)
 		}
-	}
-	if len(pushed) == 0 {
-		delete(c.pushedSeqs, ns)
+		sort.Ints(seqs)
+		keepStart := len(seqs) - pushedSeqsLimit
+		next := make(map[int]bool, pushedSeqsLimit)
+		for _, s := range seqs[keepStart:] {
+			next[s] = true
+		}
+		c.pushedSeqs[ns] = next
 	}
 }
 
@@ -3390,19 +2406,33 @@ func (c *AUNClient) publishOrderedMessage(event, ns string, seq int, payload any
 	return true
 }
 
+// publishPulledMessage 发布 pull 批中的消息，只做 seq 级去重，不受 contiguous gate 限制。
+// pull 返回的批内部空洞可能是永久空洞，不能因此阻塞批内后续消息投递。
+func (c *AUNClient) publishPulledMessage(event, ns string, seq int, payload any) bool {
+	if ns == "" || seq <= 0 {
+		c.publishAppEventSync(event, payload)
+		return true
+	}
+	if c.isPushedSeq(ns, seq) {
+		c.removePendingOrderedSeq(ns, seq)
+		return false
+	}
+	c.removePendingOrderedSeq(ns, seq)
+	c.publishAppEventSync(event, payload)
+	c.markPushedSeq(ns, seq)
+	return true
+}
+
 // publishGapFillMessages 补洞路径发布 P2P 消息，跳过已发布到应用层的 seq。
 // 使用 isPushedSeq 逐条检查，避免取出内层 map 引用后在锁外读取的竞态。
 func (c *AUNClient) publishGapFillMessages(ns string, messages []any) {
 	for _, raw := range messages {
 		if msg, ok := raw.(map[string]any); ok {
 			s := int(toInt64(msg["seq"]))
-			if c.isPushedSeq(ns, s) {
-				continue // 已发布到应用层，跳过
-			}
 			if s > 0 {
-				c.publishOrderedMessage("message.received", ns, s, msg)
+				c.publishPulledMessage("message.received", ns, s, msg)
 			} else {
-				c.publishAppEvent("message.received", msg)
+				c.publishPulledMessage("message.received", ns, s, msg)
 			}
 		}
 	}
@@ -3414,155 +2444,14 @@ func (c *AUNClient) publishGapFillGroupMessages(ns string, messages []any) {
 	for _, raw := range messages {
 		if msg, ok := raw.(map[string]any); ok {
 			s := int(toInt64(msg["seq"]))
-			if c.isPushedSeq(ns, s) {
-				continue // 已发布到应用层，跳过
-			}
 			if s > 0 {
-				c.publishOrderedMessage("group.message_created", ns, s, msg)
+				c.publishPulledMessage("group.message_created", ns, s, msg)
 			} else {
-				c.publishAppEvent("group.message_created", msg)
+				c.publishPulledMessage("group.message_created", ns, s, msg)
 			}
 		}
 	}
 	c.prunePushedSeqs(ns)
-}
-
-func membershipRotationExpectedEpoch(payload map[string]any) *int {
-	for _, key := range []string{"old_epoch", "current_epoch", "e2ee_epoch"} {
-		if value, ok := payload[key]; ok && value != nil {
-			n := int(toInt64(value))
-			return &n
-		}
-	}
-	if group, ok := payload["group"].(map[string]any); ok {
-		for _, key := range []string{"old_epoch", "current_epoch", "e2ee_epoch"} {
-			if value, ok := group[key]; ok && value != nil {
-				n := int(toInt64(value))
-				return &n
-			}
-		}
-	}
-	return nil
-}
-
-func membershipRotationTriggerID(groupID string, payload map[string]any) string {
-	action := strings.TrimSpace(stringFromAny(payload["action"]))
-	if action == "" {
-		if stringFromAny(payload["removed_aid"]) != "" {
-			action = "member_removed"
-		} else if stringFromAny(payload["left_aid"]) != "" {
-			action = "member_left"
-		} else if _, ok := payload["member"].(map[string]any); ok {
-			action = "member_added"
-		} else {
-			action = strings.TrimSpace(stringFromAny(payload["status"]))
-			if action == "" {
-				action = strings.TrimSpace(stringFromAny(payload["reason"]))
-			}
-			if action == "" {
-				action = "membership_changed"
-			}
-		}
-	}
-	eventSeq := stringFromAny(payload["event_seq"])
-	if eventSeq == "" {
-		eventSeq = stringFromAny(payload["seq"])
-	}
-	if eventSeq == "" {
-		if group, ok := payload["group"].(map[string]any); ok {
-			eventSeq = stringFromAny(group["event_seq"])
-		}
-	}
-	changedAID := ""
-	changedAIDs := make(map[string]bool)
-	for _, key := range []string{"aid", "removed_aid", "left_aid", "member_aid", "target_aid"} {
-		changedAID = stringFromAny(payload[key])
-		if changedAID != "" {
-			changedAIDs[changedAID] = true
-			break
-		}
-	}
-	if changedAID == "" {
-		if member, ok := payload["member"].(map[string]any); ok {
-			changedAID = stringFromAny(member["aid"])
-			if changedAID != "" {
-				changedAIDs[changedAID] = true
-			}
-		}
-	} else if member, ok := payload["member"].(map[string]any); ok {
-		if aid := stringFromAny(member["aid"]); aid != "" {
-			changedAIDs[aid] = true
-		}
-	}
-	if changedAID == "" {
-		if request, ok := payload["request"].(map[string]any); ok {
-			changedAID = stringFromAny(request["aid"])
-			if changedAID != "" {
-				changedAIDs[changedAID] = true
-			}
-		}
-	} else if request, ok := payload["request"].(map[string]any); ok {
-		if aid := stringFromAny(request["aid"]); aid != "" {
-			changedAIDs[aid] = true
-		}
-	}
-	if changedAID == "" {
-		if inviteCode, ok := payload["invite_code"].(map[string]any); ok {
-			changedAID = firstNonEmpty(stringFromAny(inviteCode["used_by"]), stringFromAny(inviteCode["aid"]))
-			if changedAID != "" {
-				changedAIDs[changedAID] = true
-			}
-		}
-	} else if inviteCode, ok := payload["invite_code"].(map[string]any); ok {
-		for _, aid := range []string{stringFromAny(inviteCode["used_by"]), stringFromAny(inviteCode["aid"])} {
-			if aid != "" {
-				changedAIDs[aid] = true
-			}
-		}
-	}
-	if results, ok := payload["results"].([]any); ok {
-		for _, raw := range results {
-			item, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			status := strings.ToLower(strings.TrimSpace(stringFromAny(item["status"])))
-			if status != "approved" && !truthyBool(item["approved"]) {
-				continue
-			}
-			for _, key := range []string{"aid", "member_aid", "target_aid"} {
-				if aid := stringFromAny(item[key]); aid != "" {
-					changedAIDs[aid] = true
-				}
-			}
-			for _, key := range []string{"member", "request"} {
-				if nested, ok := item[key].(map[string]any); ok {
-					if aid := stringFromAny(nested["aid"]); aid != "" {
-						changedAIDs[aid] = true
-					}
-				}
-			}
-		}
-	}
-	changedAidList := make([]string, 0, len(changedAIDs))
-	for aid := range changedAIDs {
-		changedAidList = append(changedAidList, aid)
-	}
-	sort.Strings(changedAidList)
-	changedAidKey := strings.Join(changedAidList, ",")
-	if changedAID == "" {
-		changedAID = "-"
-	}
-	if expectedEpoch := membershipRotationExpectedEpoch(payload); changedAidKey != "" && expectedEpoch != nil {
-		return fmt.Sprintf("%s:%s:aid:%s:epoch:%d", groupID, action, changedAidKey, *expectedEpoch)
-	}
-	if eventSeq != "" {
-		return fmt.Sprintf("%s:%s:event:%s", groupID, action, eventSeq)
-	}
-	if changedAidKey != "" {
-		return fmt.Sprintf("%s:%s:aid:%s", groupID, action, changedAidKey)
-	}
-	return fmt.Sprintf("%s:%s:aid:%s", groupID, action, changedAID)
 }
 
 func stringFromAny(value any) string {
@@ -3576,95 +2465,9 @@ func stringFromAny(value any) string {
 	}
 }
 
-func firstNonNil(values ...any) any {
-	for _, value := range values {
-		if value != nil {
-			return value
-		}
-	}
-	return nil
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
-
 func truthyBool(value any) bool {
 	v, ok := value.(bool)
 	return ok && v
-}
-
-func extractGroupIDFromResult(result map[string]any) string {
-	if group, ok := result["group"].(map[string]any); ok {
-		if gid := stringFromAny(group["group_id"]); gid != "" {
-			return gid
-		}
-	}
-	if gid := stringFromAny(result["group_id"]); gid != "" {
-		return gid
-	}
-	if member, ok := result["member"].(map[string]any); ok {
-		if gid := stringFromAny(member["group_id"]); gid != "" {
-			return gid
-		}
-	}
-	return ""
-}
-
-func isMembershipChangeMethod(method string) bool {
-	switch method {
-	case "group.add_member", "group.kick", "group.remove_member", "group.leave",
-		"group.review_join_request", "group.batch_review_join_request",
-		"group.use_invite_code", "group.request_join":
-		return true
-	default:
-		return false
-	}
-}
-
-func membershipRotationChanged(method string, payload map[string]any) bool {
-	switch method {
-	case "group.add_member", "group.kick", "group.remove_member", "group.leave":
-		return true
-	case "group.use_invite_code", "group.request_join":
-		status := strings.ToLower(strings.TrimSpace(stringFromAny(payload["status"])))
-		if status == "joined" || status == "approved" {
-			return true
-		}
-		_, hasMember := payload["member"].(map[string]any)
-		return hasMember
-	case "group.review_join_request":
-		status := strings.ToLower(strings.TrimSpace(stringFromAny(payload["status"])))
-		if status == "approved" {
-			return true
-		}
-		if approved, ok := payload["approved"].(bool); ok && approved {
-			return true
-		}
-		_, hasMember := payload["member"].(map[string]any)
-		return hasMember
-	case "group.batch_review_join_request":
-		results, _ := payload["results"].([]any)
-		for _, raw := range results {
-			item, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			status := strings.ToLower(strings.TrimSpace(stringFromAny(item["status"])))
-			if status == "approved" {
-				return true
-			}
-			if approved, ok := item["approved"].(bool); ok && approved {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // onRawGroupChanged 处理群组变更事件
@@ -3689,6 +2492,9 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 
 	c.events.Publish("group.changed", dataMap)
 
+	// V2 bootstrap 缓存失效 + auto_propose 触发
+	c.onRawGroupChangedV2(groupID, action)
+
 	// event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq
 	needPull := false
 	if rawES, ok := dataMap["event_seq"]; ok && groupID != "" {
@@ -3703,56 +2509,10 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 		go c.fillGroupEventGap(groupID)
 	}
 
-	// 成员退出或被踢 → 剩余 admin/owner 自动补位轮换
-	if action == "member_left" || action == "member_removed" {
-		if groupID != "" {
-			expectedEpoch := membershipRotationExpectedEpoch(dataMap)
-			if expectedEpoch == nil {
-				_ = expectedEpoch
-			} else {
-				go c.maybeLeadRotateGroupEpoch(context.Background(), groupID, membershipRotationTriggerID(groupID, dataMap), expectedEpoch, false)
-			}
-		}
-	}
+	// V2-only: epoch 轮换由 V2 session 层处理，此处不再触发 V1 轮换逻辑
 
-	// 成员加入：按 action 区分策略
-	// - member_added / join_approved（私密群/审批群）：admin 必然在线，立即轮换
-	// - joined / invite_code_used（开放群/邀请码群）：所有在线成员延迟轮换，新成员自己延迟更长
-	if action == "member_added" || action == "joined" || action == "join_approved" || action == "invite_code_used" {
-		if groupID != "" {
-			joinedAids := joinedMemberAidsFromPayload(dataMap)
-			isSelfJoining := contains(joinedAids, c.aid) && (action == "joined" || action == "invite_code_used")
-
-			if isSelfJoining || action == "joined" || action == "invite_code_used" {
-				// open/invite_code 群：所有在线成员都参与延迟轮换
-				// 新成员自己延迟更长，优先让其他在线成员先轮换
-				expectedEpoch := membershipRotationExpectedEpoch(dataMap)
-				triggerID := membershipRotationTriggerID(groupID, dataMap)
-				if !isSelfJoining {
-					go c.maybeBackfillKeyToJoinedMember(context.Background(), groupID, dataMap, triggerID)
-				}
-				if expectedEpoch != nil {
-					delay := joinRotationDelay
-					if isSelfJoining {
-						delay = selfJoinRotationDelay
-					}
-					go c.delayedRotateAfterJoinWithDelay(context.Background(), groupID, triggerID, expectedEpoch, true, delay)
-				}
-			} else {
-				expectedEpoch := membershipRotationExpectedEpoch(dataMap)
-				if expectedEpoch == nil {
-					triggerID := membershipRotationTriggerID(groupID, dataMap)
-					go c.maybeBackfillKeyToJoinedMember(context.Background(), groupID, dataMap, triggerID)
-				} else {
-					go c.maybeLeadRotateGroupEpoch(context.Background(), groupID, membershipRotationTriggerID(groupID, dataMap), expectedEpoch, false)
-				}
-			}
-		}
-	}
-
-	// GO-006: 群组解散 → 清理本地 epoch key 和 seq_tracker
+	// 群组解散：清理本地 V2/seq 运行态。V1 epoch key 编排已移除。
 	if action == "dissolved" && groupID != "" {
-		c.groupE2EE.PurgeGroupData(groupID)
 		c.seqTracker.RemoveNamespace("group:" + groupID)
 		c.seqTracker.RemoveNamespace("group_event:" + groupID)
 		c.pushedSeqsMu.Lock()
@@ -3762,10 +2522,12 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 		c.pendingOrderedMsgsMu.Lock()
 		delete(c.pendingOrderedMsgs, "group:"+groupID)
 		c.pendingOrderedMsgsMu.Unlock()
-		c.pendingDecryptMsgsMu.Lock()
-		delete(c.pendingDecryptMsgs, "group:"+groupID)
-		c.pendingDecryptMsgsMu.Unlock()
-		c.logEG.Info("group %s dissolved, cleaned up local epoch keys and seq tracker", groupID)
+		if state := c.v2GetState(); state != nil {
+			state.bootstrapCacheM.Lock()
+			delete(state.groupBootstrapCache, groupID)
+			state.bootstrapCacheM.Unlock()
+		}
+		c.logEG.Info("group %s dissolved, cleaned up local V2 group runtime state and seq tracker", groupID)
 	}
 }
 
@@ -3975,142 +2737,7 @@ func (c *AUNClient) verifyEventSignature(cs map[string]any) any {
 	return true
 }
 
-// tryHandleGroupKeyMessage 尝试处理 P2P 传输的群组密钥消息。返回 true 表示已处理。
-func (c *AUNClient) tryHandleGroupKeyMessage(message map[string]any) bool {
-	payload, ok := message["payload"].(map[string]any)
-	if !ok {
-		return false
-	}
-
-	// 先解密 P2P E2EE（如果是加密的）
-	actualPayload := payload
-	payloadType, _ := payload["type"].(string)
-	isGroupKeyCtrl := strings.HasPrefix(payloadType, "e2ee.group_key_")
-	if payloadType == "e2ee.encrypted" {
-		fromAID, _ := message["from"].(string)
-		if fromAID != "" {
-			c.ensureSenderCertCached(context.Background(), fromAID)
-		}
-		// 使用内部解密，避免消耗 seen set
-		decrypted, err := c.e2ee.decryptMessage(message)
-		if err != nil || decrypted == nil {
-			return false
-		}
-		c.schedulePrekeyReplenishIfConsumed(decrypted)
-		ap, ok := decrypted["payload"].(map[string]any)
-		if !ok {
-			return false
-		}
-		actualPayload = ap
-	}
-	innerType, _ := actualPayload["type"].(string)
-	if strings.HasPrefix(innerType, "e2ee.group_key_") {
-		isGroupKeyCtrl = true
-	}
-
-	if !isGroupKeyCtrl {
-		return false
-	}
-
-	groupID, _ := actualPayload["group_id"].(string)
-	fromAID, _ := message["from"].(string)
-	c.logEG.Debug("received group key control message: type=%s group=%s from=%s", innerType, groupID, fromAID)
-
-	if innerType == "e2ee.group_key_distribution" {
-		// 快速跳过已过期的历史 epoch 分发：本地已有更高 epoch 时不发任何 RPC，
-		// 避免 fillP2pGap 拉到大量历史群密钥消息时触发 epoch 编排风暴。
-		distEpoch := int(toInt64(actualPayload["epoch"]))
-		if groupID != "" && distEpoch > 0 {
-			if lep := c.groupE2EE.CurrentEpoch(groupID); lep != nil && *lep >= distEpoch {
-				c.logEG.Debug("skip stale group_key_distribution: group=%s msg_epoch=%d local_epoch=%d", groupID, distEpoch, *lep)
-				return true
-			}
-		}
-		if !c.verifyActiveGroupRotationDistribution(context.Background(), actualPayload) {
-			return true
-		}
-	} else if innerType == "e2ee.group_key_response" {
-		respEpoch := int(toInt64(actualPayload["epoch"]))
-		if groupID != "" && respEpoch > 0 {
-			if lep := c.groupE2EE.CurrentEpoch(groupID); lep != nil && *lep >= respEpoch {
-				c.logEG.Debug("skip stale group_key_response: group=%s msg_epoch=%d local_epoch=%d", groupID, respEpoch, *lep)
-				return true
-			}
-		}
-		if !c.verifyGroupKeyResponseEpoch(context.Background(), actualPayload) {
-			return true
-		}
-	}
-	result := c.groupE2EE.HandleIncoming(actualPayload)
-	if result == "distribution" {
-		c.logEG.Debug("group key distribution received and processed: group=%s", groupID)
-		c.discardGroupDistributionIfStale(context.Background(), actualPayload)
-		// 收到 epoch key 说明该群有活动，触发惰性同步建立 seq 基线
-		if distGroupID, _ := actualPayload["group_id"].(string); distGroupID != "" {
-			c.groupSyncedMu.Lock()
-			synced := c.groupSynced[distGroupID]
-			c.groupSyncedMu.Unlock()
-			if !synced {
-				go c.lazySyncGroup(distGroupID)
-			}
-		}
-	}
-	if result == "" {
-		return isGroupKeyCtrl
-	}
-
-	if result == "request" {
-		// 处理密钥请求并回复
-		groupID, _ := actualPayload["group_id"].(string)
-		requester, _ := actualPayload["requester_aid"].(string)
-		c.logEG.Debug("received group key request: group=%s requester=%s", groupID, requester)
-		members := c.groupE2EE.GetMemberAIDs(groupID)
-
-		// 请求者不在本地成员列表时，回源查询服务端最新成员列表
-		// 注意：仅用于向 HandleKeyRequest 传入 currentMembers，不再更新本地 epoch 存储
-		if requester != "" && !stringSliceContains(members, requester) {
-			ctx := context.Background()
-			membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
-			if err == nil {
-				if mr, ok := membersResult.(map[string]any); ok {
-					if membersList, ok := mr["members"].([]any); ok {
-						members = extractAIDsFromMembers(membersList)
-					}
-				}
-			}
-		}
-
-		response := c.groupE2EE.HandleKeyRequestMsg(actualPayload, members)
-		if response != nil && requester != "" {
-			ctx := context.Background()
-			_, err := c.Call(ctx, "message.send", map[string]any{
-				"to":               requester,
-				"payload":          response,
-				"encrypt":          true,
-				"persist_required": true,
-			})
-			if err != nil {
-				c.logEG.Warn("failed to reply group key to %s: %v", requester, err)
-			}
-		}
-	}
-
-	if result == "distribution" || result == "response" {
-		groupID, _ := actualPayload["group_id"].(string)
-		rotationID := strings.TrimSpace(stringFromAny(actualPayload["rotation_id"]))
-		keyCommitment := strings.TrimSpace(stringFromAny(actualPayload["commitment"]))
-		if rotationID != "" && keyCommitment != "" {
-			go c.ackGroupRotationKey(context.Background(), rotationID, keyCommitment)
-		}
-		if groupID != "" {
-			go c.retryPendingDecryptMsgs(groupID)
-		}
-	}
-
-	return true
-}
-
-// ── E2EE 编排辅助 ────────────────────────────────────────
+// ── 证书与信任辅助 ────────────────────────────────────────
 
 func certCacheKey(aid, certFingerprint string) string {
 	normalized := strings.TrimSpace(strings.ToLower(certFingerprint))
@@ -4211,136 +2838,6 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	return certBytes, nil
 }
 
-func (c *AUNClient) fetchPeerPrekeys(ctx context.Context, peerAID string) (out []map[string]any, err error) {
-	tStart := time.Now()
-	c.logE2.Debug("fetchPeerPrekeys enter: aid=%s", peerAID)
-	defer func() {
-		if err != nil {
-			c.logE2.Debug("fetchPeerPrekeys exit (error): aid=%s elapsed=%dms err=%v", peerAID, time.Since(tStart).Milliseconds(), err)
-		} else {
-			c.logE2.Debug("fetchPeerPrekeys exit: aid=%s count=%d elapsed=%dms", peerAID, len(out), time.Since(tStart).Milliseconds())
-		}
-	}()
-	c.peerPrekeysMu.RLock()
-	cached := c.peerPrekeysCache[peerAID]
-	c.peerPrekeysMu.RUnlock()
-	if cached != nil && float64(time.Now().Unix()) < cached.expireAt {
-		items := normalizePeerPrekeys(cached.items)
-		if len(items) > 0 {
-			cloned := make([]map[string]any, 0, len(items))
-			for _, item := range items {
-				cloned = append(cloned, copyMapShallow(item))
-			}
-			return cloned, nil
-		}
-	}
-	if cached := c.e2ee.GetCachedPrekey(peerAID); cached != nil {
-		items := normalizePeerPrekeys([]map[string]any{copyMapShallow(cached)})
-		if len(items) > 0 {
-			cloned := make([]map[string]any, 0, len(items))
-			for _, item := range items {
-				cloned = append(cloned, copyMapShallow(item))
-			}
-			return cloned, nil
-		}
-	}
-	result, callErr := c.transport.Call(ctx, "message.e2ee.get_prekey", map[string]any{"aid": peerAID})
-	if callErr != nil {
-		err = NewValidationError(fmt.Sprintf("failed to fetch peer prekey for %s: %v", peerAID, callErr))
-		return nil, err
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok || resultMap == nil {
-		return nil, NewValidationError(fmt.Sprintf("invalid prekey response for %s", peerAID))
-	}
-	if found, ok := resultMap["found"].(bool); ok && !found {
-		return []map[string]any{}, nil
-	}
-	if devicePrekeys, ok := resultMap["device_prekeys"].([]any); ok {
-		raw := make([]map[string]any, 0, len(devicePrekeys))
-		for _, item := range devicePrekeys {
-			if prekey, ok := extractPeerPrekeyMaterial(item); ok {
-				raw = append(raw, copyMapShallow(prekey))
-			}
-		}
-		normalized := normalizePeerPrekeys(raw)
-		if len(normalized) > 0 {
-			c.peerPrekeysMu.Lock()
-			c.peerPrekeysCache[peerAID] = &cachedPeerPrekeys{
-				items:    normalized,
-				expireAt: float64(time.Now().Unix()) + peerPrekeysCacheTTL,
-			}
-			c.peerPrekeysMu.Unlock()
-			c.e2ee.CachePrekey(peerAID, normalized[0])
-			cloned := make([]map[string]any, 0, len(normalized))
-			for _, item := range normalized {
-				cloned = append(cloned, copyMapShallow(item))
-			}
-			return cloned, nil
-		}
-	}
-	prekey, parseErr := parsePeerPrekeyResponse(peerAID, result, nil)
-	if parseErr != nil {
-		if _, ok := parseErr.(*NotFoundError); ok {
-			return []map[string]any{}, nil
-		}
-		err = parseErr
-		return nil, err
-	}
-	if prekey != nil {
-		normalized := normalizePeerPrekeys([]map[string]any{copyMapShallow(prekey)})
-		if len(normalized) == 0 {
-			return []map[string]any{}, nil
-		}
-		c.peerPrekeysMu.Lock()
-		c.peerPrekeysCache[peerAID] = &cachedPeerPrekeys{
-			items:    normalized,
-			expireAt: float64(time.Now().Unix()) + peerPrekeysCacheTTL,
-		}
-		c.peerPrekeysMu.Unlock()
-		c.e2ee.CachePrekey(peerAID, normalized[0])
-		cloned := make([]map[string]any, 0, len(normalized))
-		for _, item := range normalized {
-			cloned = append(cloned, copyMapShallow(item))
-		}
-		return cloned, nil
-	}
-	return []map[string]any{}, nil
-}
-
-// fetchPeerPrekey 获取对方的单个 prekey
-func (c *AUNClient) fetchPeerPrekey(ctx context.Context, peerAID string) (map[string]any, error) {
-	prekeys, err := c.fetchPeerPrekeys(ctx, peerAID)
-	if err != nil {
-		return nil, err
-	}
-	if len(prekeys) == 0 {
-		return nil, nil
-	}
-	return copyMapShallow(prekeys[0]), nil
-}
-
-// uploadPrekey 生成 prekey 并上传到服务端
-func (c *AUNClient) uploadPrekey(ctx context.Context) error {
-	if c.prekeyUploadHook != nil {
-		return c.prekeyUploadHook(ctx)
-	}
-	prekeyMaterial, err := c.e2ee.GeneratePrekey()
-	if err != nil {
-		return err
-	}
-	_, err = c.transport.Call(ctx, "message.e2ee.put_prekey", prekeyMaterial)
-	if err == nil {
-		// 上传成功后记录为活跃 prekey
-		if id, ok := prekeyMaterial["prekey_id"].(string); ok && id != "" {
-			c.mu.Lock()
-			c.activePrekeyID = id
-			c.mu.Unlock()
-		}
-	}
-	return err
-}
-
 // ensureSenderCertCached 确保发送方证书在本地 keystore 中可用
 func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string, certFingerprint ...string) bool {
 	requestedFingerprint := ""
@@ -4421,202 +2918,6 @@ func (c *AUNClient) getVerifiedPeerCert(aid string, certFingerprint string) stri
 	return ""
 }
 
-// ── 解密辅助 ──────────────────────────────────────────────
-
-// decryptSingleMessage 解密单条 P2P 消息
-func (c *AUNClient) decryptSingleMessage(ctx context.Context, message map[string]any) map[string]any {
-	payload, ok := message["payload"].(map[string]any)
-	if !ok {
-		return message
-	}
-	payloadType, _ := payload["type"].(string)
-	if payloadType != "e2ee.encrypted" {
-		if enc, ok := message["encrypted"].(bool); ok && enc {
-			errMsg := fmt.Sprintf("不支持的 P2P 加密消息类型: %s", payloadType)
-			c.log.Error("P2P decryption failed: %s", errMsg)
-			message["_decrypt_error"] = errMsg
-			return nil
-		}
-		return message
-	}
-	// 检查 encrypted 标记
-	if enc, exists := message["encrypted"]; exists {
-		if encBool, ok := enc.(bool); ok && !encBool {
-			return message
-		}
-	}
-
-	// 确保发送方证书已缓存
-	fromAID, _ := message["from"].(string)
-	senderCertFingerprint := ""
-	if aad, ok := payload["aad"].(map[string]any); ok {
-		senderCertFingerprint = strings.TrimSpace(strings.ToLower(getStr(aad, "sender_cert_fingerprint", "")))
-	}
-	if fp, ok := payload["sender_cert_fingerprint"].(string); ok && strings.TrimSpace(fp) != "" {
-		senderCertFingerprint = strings.TrimSpace(strings.ToLower(fp))
-	}
-	if fromAID != "" {
-		if !c.ensureSenderCertCached(ctx, fromAID, senderCertFingerprint) {
-			errMsg := fmt.Sprintf("无法获取发送方 %s 的证书，跳过解密", fromAID)
-			c.log.Error("P2P decryption failed: %s", errMsg)
-			message["_decrypt_error"] = errMsg
-			return nil
-		}
-	}
-
-	// 密码学解密（E2EEManager.DecryptMessage 内含本地防重放）
-	decrypted, err := c.e2ee.DecryptMessage(message)
-	if err != nil || decrypted == nil {
-		if err != nil {
-			c.log.Error("P2P decryption failed: %v", err)
-		} else {
-			c.log.Error("P2P decryption failed: DecryptMessage returned nil")
-		}
-		return nil
-	}
-	c.schedulePrekeyReplenishIfConsumed(decrypted)
-	if mid, ok := decrypted["message_id"].(string); ok {
-		c.log.Debug("P2P single message decryption succeeded: from=%s msgID=%s", fromAID, mid)
-	} else {
-		c.log.Debug("P2P single message decryption succeeded: from=%s", fromAID)
-	}
-	return decrypted
-}
-
-// decryptMessages 批量解密 P2P 消息（用于 message.pull）
-func (c *AUNClient) decryptMessages(ctx context.Context, messages []any) []any {
-	seenInBatch := make(map[string]bool)
-	var result []any
-	for _, raw := range messages {
-		msg, ok := raw.(map[string]any)
-		if !ok {
-			result = append(result, raw)
-			continue
-		}
-		mid, _ := msg["message_id"].(string)
-		if mid != "" && seenInBatch[mid] {
-			continue
-		}
-		if mid != "" {
-			seenInBatch[mid] = true
-		}
-
-		if c.tryHandleGroupKeyMessage(msg) {
-			continue
-		}
-
-		payload, _ := msg["payload"].(map[string]any)
-		payloadType, _ := payload["type"].(string)
-		if payloadType == "e2ee.encrypted" {
-			fromAID, _ := msg["from"].(string)
-			if fromAID != "" {
-				if !c.ensureSenderCertCached(ctx, fromAID) {
-					// 证书不可用，丢弃密文，不投递给应用层
-					continue
-				}
-			}
-			// 使用内部解密，避免消耗 seen set
-			decrypted, err := c.e2ee.decryptMessage(msg)
-			if err == nil && decrypted != nil {
-				// ISSUE-SDK-GO-002: pull 批量解密路径也需要补充 prekey
-				c.schedulePrekeyReplenishIfConsumed(decrypted)
-				result = append(result, decrypted)
-			}
-			// 解密失败：丢弃密文，不投递给应用层
-		} else {
-			result = append(result, raw)
-		}
-	}
-	return result
-}
-
-// decryptGroupMessage 解密单条群组消息
-func (c *AUNClient) decryptGroupMessage(ctx context.Context, message map[string]any) (decoded map[string]any) {
-	tStart := time.Now()
-	groupID, _ := message["group_id"].(string)
-	mid, _ := message["message_id"].(string)
-	c.logEG.Debug("decryptGroupMessage enter: group=%s message_id=%s", groupID, mid)
-	defer func() {
-		c.logEG.Debug("decryptGroupMessage exit: group=%s message_id=%s elapsed=%dms", groupID, mid, time.Since(tStart).Milliseconds())
-	}()
-	payload, ok := message["payload"].(map[string]any)
-	if !ok {
-		return message
-	}
-	payloadType, _ := payload["type"].(string)
-	if payloadType != "e2ee.group_encrypted" {
-		if enc, ok := message["encrypted"].(bool); ok && enc {
-			errMsg := fmt.Sprintf("不支持的群加密消息类型: %s", payloadType)
-			c.logEG.Error("group message decryption failed: %s", errMsg)
-			message["_decrypt_error"] = errMsg
-			return nil
-		}
-		return attachGroupDispatchModeToPayload(message)
-	}
-
-	// 确保发送方证书已缓存
-	senderAID, _ := message["from"].(string)
-	if senderAID == "" {
-		senderAID, _ = message["sender_aid"].(string)
-	}
-	// 提取 sender_cert_fingerprint，确保缓存 key 与 Decrypt 内部 senderCertResolver 一致
-	senderCertFP := ""
-	if fp, ok := payload["sender_cert_fingerprint"].(string); ok && fp != "" {
-		senderCertFP = fp
-	} else if aad, ok := payload["aad"].(map[string]any); ok {
-		senderCertFP, _ = aad["sender_cert_fingerprint"].(string)
-	}
-	if senderAID != "" {
-		if !c.ensureSenderCertCached(ctx, senderAID, senderCertFP) {
-			errMsg := fmt.Sprintf("群消息解密跳过：发送方 %s 证书不可用", senderAID)
-			c.log.Warn("%s", errMsg)
-			message["_decrypt_error"] = errMsg
-			return nil
-		}
-	}
-
-	// 尝试直接解密
-	result, decryptErr := c.groupE2EE.Decrypt(message, false)
-	if decryptErr == nil && result != nil {
-		if _, ok := result["e2ee"]; ok {
-			return attachGroupDispatchModeToPayload(result)
-		}
-	}
-
-	// replay guard 命中：不是解密失败，不应触发 recover
-	if errors.Is(decryptErr, ErrReplayDetected) {
-		return nil
-	}
-
-	// 真正的解密失败，先同步请求目标 epoch key；5 秒内拿到则立即重解。
-	groupID, _ = message["group_id"].(string)
-	sender, _ := message["from"].(string)
-	if sender == "" {
-		sender, _ = message["sender_aid"].(string)
-	}
-	epoch := int(toInt64(payload["epoch"]))
-	if epoch > 0 && groupID != "" {
-		c.logEG.Debug("group message decryption failed, attempting epoch key recovery: group=%s epoch=%d sender=%s", groupID, epoch, sender)
-		if c.recoverGroupEpochKey(ctx, groupID, epoch, sender, 5*time.Second) {
-			retry, retryErr := c.groupE2EE.Decrypt(message, false)
-			if retryErr == nil && retry != nil {
-				if _, ok := retry["e2ee"]; ok {
-					return attachGroupDispatchModeToPayload(retry)
-				}
-			}
-		}
-	}
-
-	// 密钥恢复后仍无法解密时返回 nil，由调用方发布 undecryptable 事件
-	if decryptErr != nil {
-		c.logEG.Error("group message decryption failed: group=%s %v", groupID, decryptErr)
-	} else {
-		c.logEG.Error("group message decryption failed: group=%s decrypted result missing e2ee field", groupID)
-	}
-
-	return nil
-}
-
 func normalizeGroupDispatchMode(value any) string {
 	mode := strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))
 	if mode == "mention" || mode == "broadcast" {
@@ -4640,919 +2941,6 @@ func attachGroupDispatchModeToPayload(message map[string]any) map[string]any {
 	result["payload"] = payloadView
 	result["dispatch_mode"] = mode
 	return result
-}
-
-func (c *AUNClient) enqueuePendingDecrypt(groupID string, msg map[string]any) {
-	if groupID == "" || msg == nil {
-		return
-	}
-	ns := "group:" + groupID
-	c.pendingDecryptMsgsMu.Lock()
-	defer c.pendingDecryptMsgsMu.Unlock()
-	if c.pendingDecryptMsgs == nil {
-		c.pendingDecryptMsgs = make(map[string][]map[string]any)
-	}
-	queue := append(c.pendingDecryptMsgs[ns], copyMapShallow(msg))
-	if len(queue) > pendingDecryptLimit {
-		queue = queue[len(queue)-pendingDecryptLimit:]
-	}
-	c.pendingDecryptMsgs[ns] = queue
-}
-
-func (c *AUNClient) retryPendingDecryptMsgs(groupID string) {
-	c.retryPendingDecryptMsgsWith(groupID, false)
-}
-
-// retryPendingDecryptMsgsWith 重试 pending queue 中的群消息解密。
-// forceAdvanceOnFail=true 时（recovery 兜底超时调用），仍解密失败的消息也强制推进
-// seq tracker + 发 undecryptable + ack，避免一条永远解不开的消息卡住整个群的 cursor。
-func (c *AUNClient) retryPendingDecryptMsgsWith(groupID string, forceAdvanceOnFail bool) {
-	ns := "group:" + groupID
-	c.pendingDecryptMsgsMu.Lock()
-	queue := append([]map[string]any(nil), c.pendingDecryptMsgs[ns]...)
-	c.pendingDecryptMsgs[ns] = nil
-	c.pendingDecryptMsgsMu.Unlock()
-	if len(queue) == 0 {
-		return
-	}
-	c.logEG.Debug("retryPendingDecryptMsgs started: group=%s pending=%d force_advance=%v", groupID, len(queue), forceAdvanceOnFail)
-	stillPending := make([]map[string]any, 0)
-	forceAdvancedAny := false
-	ctx := context.Background()
-	for _, msg := range queue {
-		decrypted := c.decryptGroupMessage(ctx, msg)
-		if decrypted == nil {
-			if forceAdvanceOnFail {
-				// recovery 真的失败：强制推进 + 发 undecryptable
-				seq := int(toInt64(msg["seq"]))
-				c.logEG.Info("group recovery give up: group=%s seq=%d → force advance + publish undecryptable", groupID, seq)
-				if seq > 0 {
-					c.seqTracker.OnMessageSeq(ns, seq)
-					c.saveSeqTrackerState()
-					forceAdvancedAny = true
-				}
-				safeEvent := map[string]any{
-					"message_id":     msg["message_id"],
-					"group_id":       groupID,
-					"from":           msg["from"],
-					"seq":            msg["seq"],
-					"timestamp":      msg["timestamp"],
-					"_decrypt_error": "epoch recovery failed",
-				}
-				c.publishAppEvent("group.message_undecryptable", safeEvent)
-			} else {
-				stillPending = append(stillPending, msg)
-			}
-			continue
-		}
-		seq := int(toInt64(msg["seq"]))
-		if seq > 0 {
-			// 推进 seq tracker（之前 push/pull 失败时没推进）
-			c.seqTracker.OnMessageSeq(ns, seq)
-			c.saveSeqTrackerState()
-			c.publishOrderedMessage("group.message_created", ns, seq, decrypted)
-		} else {
-			c.publishAppEvent("group.message_created", decrypted)
-		}
-	}
-	// 强制推进有变更时，按 contig auto-ack
-	if forceAdvancedAny {
-		contig := c.seqTracker.GetContiguousSeq(ns)
-		if contig > 0 {
-			go func() {
-				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer ackCancel()
-				if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
-					"group_id":  groupID,
-					"msg_seq":   contig,
-					"device_id": c.deviceID,
-					"slot_id":   c.slotID,
-				}); ackErr != nil {
-					c.logEG.Warn("group recovery force-advance ack failed: group=%s %v", groupID, ackErr)
-				}
-			}()
-		}
-	}
-	c.pendingDecryptMsgsMu.Lock()
-	queuedDuringRetry := append([]map[string]any(nil), c.pendingDecryptMsgs[ns]...)
-	mergedPending := append(stillPending, queuedDuringRetry...)
-	if len(mergedPending) > pendingDecryptLimit {
-		mergedPending = mergedPending[len(mergedPending)-pendingDecryptLimit:]
-	}
-	if len(mergedPending) > 0 {
-		c.pendingDecryptMsgs[ns] = mergedPending
-	} else {
-		delete(c.pendingDecryptMsgs, ns)
-	}
-	c.pendingDecryptMsgsMu.Unlock()
-}
-
-// scheduleRecoveryTimeout 调度 recovery 兜底定时：N 秒后如果 pending queue 仍有未解密消息，
-// 强制推进 cursor。同一 group 短时间内只调度一次。
-func (c *AUNClient) scheduleRecoveryTimeout(groupID string) {
-	if groupID == "" {
-		return
-	}
-	timeout := 30 * time.Second
-	c.recoveryTimeoutMu.Lock()
-	now := time.Now()
-	if last, ok := c.recoveryTimeoutScheduled[groupID]; ok && last.Add(timeout).After(now) {
-		c.recoveryTimeoutMu.Unlock()
-		return
-	}
-	if c.recoveryTimeoutScheduled == nil {
-		c.recoveryTimeoutScheduled = make(map[string]time.Time)
-	}
-	c.recoveryTimeoutScheduled[groupID] = now
-	c.recoveryTimeoutMu.Unlock()
-	go func() {
-		time.Sleep(timeout)
-		ns := "group:" + groupID
-		c.pendingDecryptMsgsMu.Lock()
-		hasPending := len(c.pendingDecryptMsgs[ns]) > 0
-		c.pendingDecryptMsgsMu.Unlock()
-		if !hasPending {
-			return
-		}
-		c.logEG.Info("group recovery timeout: group=%s → force advance", groupID)
-		c.retryPendingDecryptMsgsWith(groupID, true)
-	}()
-}
-
-func (c *AUNClient) recoverGroupEpochKey(ctx context.Context, groupID string, epoch int, senderAID string, timeout time.Duration) (ok bool) {
-	tStart := time.Now()
-	c.logEG.Debug("recoverGroupEpochKey enter: group=%s epoch=%d sender=%s", groupID, epoch, senderAID)
-	defer func() {
-		c.logEG.Debug("recoverGroupEpochKey exit: group=%s epoch=%d ok=%v elapsed=%dms", groupID, epoch, ok, time.Since(tStart).Milliseconds())
-	}()
-	// 快速路径：本地已有 committed epoch 密钥。pending key 必须先确认仍对应服务端状态，
-	// 否则要继续发起 recovery，避免 stale pending key 阻断恢复。
-	if secret, err := c.groupE2EE.LoadSecretForEpoch(groupID, epoch); err == nil && secret != nil {
-		if c.groupEpochSecretReadyForRecovery(ctx, groupID, epoch, secret) {
-			c.logEG.Debug("recoverGroupEpochKey fast path hit: group=%s epoch=%d", groupID, epoch)
-			go c.retryPendingDecryptMsgs(groupID)
-			return true
-		}
-	}
-
-	key := fmt.Sprintf("%s:%d", groupID, epoch)
-
-	c.groupEpochRecoveryInflightMu.Lock()
-	if entry, ok := c.groupEpochRecoveryInflight[key]; ok {
-		// 已有恢复进行中，等待其完成
-		c.groupEpochRecoveryInflightMu.Unlock()
-		select {
-		case <-entry.done:
-			return entry.ok
-		case <-ctx.Done():
-			return false
-		}
-	}
-	// 首个请求，注册 inflight 条目
-	entry := &epochRecoveryResult{done: make(chan struct{})}
-	c.groupEpochRecoveryInflight[key] = entry
-	c.groupEpochRecoveryInflightMu.Unlock()
-
-	// 执行实际恢复逻辑
-	entry.ok = c.doRecoverGroupEpochKey(ctx, groupID, epoch, senderAID, timeout)
-	close(entry.done)
-
-	// 清理 inflight 条目
-	c.groupEpochRecoveryInflightMu.Lock()
-	delete(c.groupEpochRecoveryInflight, key)
-	c.groupEpochRecoveryInflightMu.Unlock()
-
-	return entry.ok
-}
-
-func (c *AUNClient) groupEpochSecretReadyForRecovery(ctx context.Context, groupID string, epoch int, secret map[string]any) bool {
-	if secret == nil {
-		c.logEG.Debug("groupEpochSecretReadyForRecovery: no secret cached, ready=false: group=%s epoch=%d", groupID, epoch)
-		return false
-	}
-	pendingRotationID := strings.TrimSpace(stringFromAny(secret["pending_rotation_id"]))
-	if pendingRotationID == "" {
-		c.logEG.Debug("groupEpochSecretReadyForRecovery: no pending rotation, ready=true: group=%s epoch=%d", groupID, epoch)
-		return true
-	}
-	c.logEG.Debug("groupEpochSecretReadyForRecovery: checking pending rotation: group=%s epoch=%d rotation=%s", groupID, epoch, pendingRotationID)
-	return c.pendingGroupSecretStillCurrent(ctx, groupID, epoch, pendingRotationID)
-}
-
-func (c *AUNClient) pendingGroupSecretStillCurrent(ctx context.Context, groupID string, epoch int, pendingRotationID string) bool {
-	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-	if err != nil {
-		c.logEG.Debug("pendingGroupSecretStillCurrent: get_epoch failed, treat as not current: group=%s err=%v", groupID, err)
-		return false
-	}
-	epochMap, ok := epochResult.(map[string]any)
-	if !ok {
-		return false
-	}
-	if pending, ok := epochMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
-		if strings.TrimSpace(stringFromAny(pending["rotation_id"])) == pendingRotationID {
-			c.logEG.Debug("pendingGroupSecretStillCurrent: matches pending rotation: group=%s rotation=%s", groupID, pendingRotationID)
-			return true
-		}
-	}
-	if committedRotation, ok := epochMap["committed_rotation"].(map[string]any); ok {
-		if int(toInt64(committedRotation["target_epoch"])) == epoch &&
-			strings.TrimSpace(stringFromAny(committedRotation["rotation_id"])) == pendingRotationID {
-			c.logEG.Debug("pendingGroupSecretStillCurrent: matches committed rotation: group=%s rotation=%s", groupID, pendingRotationID)
-			return true
-		}
-	}
-	c.logEG.Debug("pendingGroupSecretStillCurrent: rotation no longer current: group=%s rotation=%s", groupID, pendingRotationID)
-	return false
-}
-
-// loadMyECPrivateKey 从 keystore 加载自己的 AID EC 私钥
-func (c *AUNClient) loadMyECPrivateKey(aid string) (*ecdsa.PrivateKey, error) {
-	c.mu.RLock()
-	identity := c.identity
-	c.mu.RUnlock()
-	if identity == nil {
-		return nil, fmt.Errorf("identity not loaded")
-	}
-	privPEM, _ := identity["private_key_pem"].(string)
-	if privPEM == "" {
-		return nil, fmt.Errorf("private_key_pem not found for aid=%s", aid)
-	}
-	return parseECPrivateKeyPEM(privPEM)
-}
-
-// extractECPubkeyFromCert 从 PEM 证书中提取 EC 公钥的未压缩字节（65B）
-func extractECPubkeyFromCert(certPEM []byte) ([]byte, error) {
-	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		return nil, fmt.Errorf("无法解析证书 PEM")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("解析证书失败: %w", err)
-	}
-	ecPub, ok := cert.PublicKey.(*ecdsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("证书公钥不是 EC 类型")
-	}
-	return elliptic.Marshal(ecPub.Curve, ecPub.X, ecPub.Y), nil
-}
-
-// joinModeAllowsMemberEpochRotation 判断 join mode 是否允许普通成员参与轮换及服务端 epoch key 存取
-func joinModeAllowsMemberEpochRotation(mode string) bool {
-	m := strings.TrimSpace(strings.ToLower(mode))
-	return m == "open" || m == "invite_only" || m == "invite_code"
-}
-
-// extractGroupJoinMode 从各种响应格式中提取 join_mode
-func extractGroupJoinMode(payload map[string]any) string {
-	for _, key := range []string{"join_mode", "mode"} {
-		if v, ok := payload[key].(string); ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(strings.ToLower(v))
-		}
-	}
-	for _, key := range []string{"join_requirements", "join"} {
-		if nested, ok := payload[key].(map[string]any); ok {
-			for _, nk := range []string{"mode", "join_mode"} {
-				if v, ok := nested[nk].(string); ok && strings.TrimSpace(v) != "" {
-					return strings.TrimSpace(strings.ToLower(v))
-				}
-			}
-		}
-	}
-	if group, ok := payload["group"].(map[string]any); ok {
-		if v := extractGroupJoinMode(group); v != "" {
-			return v
-		}
-	}
-	if settings, ok := payload["settings"].(map[string]any); ok {
-		for _, key := range []string{"join.mode", "join_mode", "mode"} {
-			if v, ok := settings[key].(string); ok && strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(strings.ToLower(v))
-			}
-		}
-	}
-	if settingsList, ok := payload["settings"].([]any); ok {
-		for _, item := range settingsList {
-			if m, ok := item.(map[string]any); ok {
-				key := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", m["key"])))
-				if key == "" {
-					key = strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", m["name"])))
-				}
-				if key == "join.mode" || key == "join_mode" || key == "mode" {
-					if v, ok := m["value"].(string); ok && strings.TrimSpace(v) != "" {
-						return strings.TrimSpace(strings.ToLower(v))
-					}
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// groupAllowsMemberEpochRotation 仅 open / invite_code 群允许普通成员参与轮换及服务端 epoch key 存取
-func (c *AUNClient) groupAllowsMemberEpochRotation(ctx context.Context, groupID string) bool {
-	if resp, err := c.Call(ctx, "group.get_join_requirements", map[string]any{"group_id": groupID}); err == nil {
-		if m, ok := resp.(map[string]any); ok {
-			if mode := extractGroupJoinMode(m); mode != "" {
-				return joinModeAllowsMemberEpochRotation(mode)
-			}
-		}
-	}
-	if resp, err := c.Call(ctx, "group.get_settings", map[string]any{"group_id": groupID, "keys": []string{"join.mode"}}); err == nil {
-		if m, ok := resp.(map[string]any); ok {
-			if mode := extractGroupJoinMode(m); mode != "" {
-				return joinModeAllowsMemberEpochRotation(mode)
-			}
-		}
-	}
-	if resp, err := c.Call(ctx, "group.get", map[string]any{"group_id": groupID}); err == nil {
-		if m, ok := resp.(map[string]any); ok {
-			if mode := extractGroupJoinMode(m); mode != "" {
-				return joinModeAllowsMemberEpochRotation(mode)
-			}
-		}
-	}
-	return false
-}
-
-// tryRecoverEpochKeyFromServer 尝试从服务端拉取 ECIES 加密的 epoch key 并解密存入 keystore
-func (c *AUNClient) tryRecoverEpochKeyFromServer(ctx context.Context, groupID string, epoch int) bool {
-	c.logEG.Debug("tryRecoverEpochKeyFromServer entry: group=%s epoch=%d", groupID, epoch)
-	params := map[string]any{"group_id": groupID}
-	if epoch > 0 {
-		params["epoch"] = epoch
-	}
-	result, err := c.Call(ctx, "group.e2ee.get_epoch_key", params)
-	if err != nil {
-		c.logEG.Warn("tryRecoverEpochKeyFromServer get_epoch_key call failed: group=%s epoch=%d err=%v", groupID, epoch, err)
-		return false
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return false
-	}
-	encryptedB64, _ := resultMap["encrypted_key"].(string)
-	if encryptedB64 == "" {
-		return false
-	}
-	serverEpoch := int(toInt64(resultMap["epoch"]))
-	if serverEpoch == 0 {
-		serverEpoch = epoch
-	}
-
-	encryptedBytes, err := base64.StdEncoding.DecodeString(encryptedB64)
-	if err != nil {
-		c.logEG.Warn("tryRecoverEpochKeyFromServer base64 decode failed: group=%s epoch=%d err=%v", groupID, serverEpoch, err)
-		return false
-	}
-
-	// 用自己的 AID 私钥 ECIES 解密
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	privKey, err := c.loadMyECPrivateKey(myAID)
-	if err != nil || privKey == nil {
-		c.logEG.Warn("tryRecoverEpochKeyFromServer load private key failed: aid=%s err=%v", myAID, err)
-		return false
-	}
-	groupSecret, err := EciesDecrypt(privKey, encryptedBytes)
-	if err != nil || len(groupSecret) != 32 {
-		c.logEG.Warn("tryRecoverEpochKeyFromServer ECIES decrypt failed: group=%s epoch=%d secretLen=%d err=%v",
-			groupID, serverEpoch, len(groupSecret), err)
-		return false
-	}
-
-	// 获取成员列表和 committed_rotation 用于 commitment / epoch_chain 验证
-	var memberAIDs []string
-	var committedRotation map[string]any
-	var epochChain string
-	if epochInfo, epochErr := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); epochErr == nil {
-		if infoMap, ok := epochInfo.(map[string]any); ok {
-			// 先从 members 字段获取
-			if members, ok := infoMap["members"].([]any); ok {
-				for _, m := range members {
-					switch v := m.(type) {
-					case string:
-						if v != "" {
-							memberAIDs = append(memberAIDs, v)
-						}
-					case map[string]any:
-						if aid, ok := v["aid"].(string); ok && aid != "" {
-							memberAIDs = append(memberAIDs, aid)
-						}
-					}
-				}
-			}
-			// 解析 committed_rotation
-			if cr, ok := infoMap["committed_rotation"].(map[string]any); ok {
-				committedRotation = cr
-				if chain, ok := cr["epoch_chain"].(string); ok && strings.TrimSpace(chain) != "" {
-					epochChain = strings.TrimSpace(chain)
-				}
-				// 如果有 expected_members，用它覆盖 memberAIDs
-				if expectedMembers, ok := cr["expected_members"].([]any); ok && len(expectedMembers) > 0 {
-					memberAIDs = nil
-					for _, item := range expectedMembers {
-						if aid, ok := item.(string); ok && strings.TrimSpace(aid) != "" {
-							memberAIDs = append(memberAIDs, strings.TrimSpace(aid))
-						}
-					}
-				}
-			}
-		}
-	} else {
-		c.logEG.Warn("tryRecoverEpochKeyFromServer get_epoch call failed: group=%s err=%v", groupID, epochErr)
-	}
-
-	if len(memberAIDs) == 0 {
-		c.logEG.Warn("server epoch key recovery missing member snapshot: group=%s epoch=%d", groupID, serverEpoch)
-		return false
-	}
-
-	commitment := ComputeMembershipCommitment(memberAIDs, serverEpoch, groupID, groupSecret)
-
-	// committed_rotation 存在时验证 commitment 和 epoch_chain
-	storeOpts := GroupSecretStoreOptions{EpochChain: epochChain}
-	if committedRotation != nil {
-		committedEpoch := int(toInt64(committedRotation["target_epoch"]))
-		if committedEpoch == 0 {
-			committedEpoch = serverEpoch
-		}
-		committedCommitment, _ := committedRotation["key_commitment"].(string)
-		committedCommitment = strings.TrimSpace(committedCommitment)
-		if committedEpoch == serverEpoch && committedCommitment != "" && committedCommitment != commitment {
-			c.logEG.Error("server epoch key recovery commitment mismatch: group=%s epoch=%d", groupID, serverEpoch)
-			return false
-		}
-		// epoch_chain 验证
-		if epochChain != "" && committedEpoch == serverEpoch {
-			rotatorAID := ""
-			for _, key := range []string{"rotated_by", "lease_owner", "committed_by"} {
-				if v, ok := committedRotation[key].(string); ok && strings.TrimSpace(v) != "" {
-					rotatorAID = strings.TrimSpace(v)
-					break
-				}
-			}
-			prevData, _ := LoadGroupSecret(c.keyStore, myAID, groupID, intPtr(serverEpoch-1))
-			prevChain := ""
-			if prevData != nil {
-				if pc, ok := prevData["epoch_chain"].(string); ok {
-					prevChain = strings.TrimSpace(pc)
-				}
-			}
-			if prevChain != "" && rotatorAID != "" {
-				if !VerifyEpochChain(epochChain, prevChain, serverEpoch, commitment, rotatorAID) {
-					c.logEG.Error("server epoch key recovery epoch_chain verification failed: group=%s epoch=%d rotator=%s", groupID, serverEpoch, rotatorAID)
-					return false
-				}
-				storeOpts.EpochChainUnverified = false
-				storeOpts.EpochChainUnverifiedSet = true
-			} else {
-				storeOpts.EpochChainUnverified = true
-				storeOpts.EpochChainUnverifiedSet = true
-				if prevChain == "" {
-					storeOpts.EpochChainUnverifiedReason = "missing_prev_chain"
-				} else {
-					storeOpts.EpochChainUnverifiedReason = "missing_rotator_aid"
-				}
-			}
-		}
-	}
-
-	stored, storeErr := StoreGroupSecretEpochWithOptions(c.keyStore, myAID, groupID, serverEpoch, groupSecret, commitment, memberAIDs, storeOpts)
-	if storeErr != nil || !stored {
-		c.logEG.Warn("server epoch key recovery store failed: group=%s epoch=%d stored=%v err=%v",
-			groupID, serverEpoch, stored, storeErr)
-		return false
-	}
-	c.logEG.Warn("epoch key recovery from server succeeded: group=%s epoch=%d", groupID, serverEpoch)
-	return true
-}
-
-// buildEpochEncryptedKeys 为每个成员用其 AID 证书公钥 ECIES 加密 group_secret
-func (c *AUNClient) buildEpochEncryptedKeys(ctx context.Context, info map[string]any, memberAIDs []string, targetEpoch int, groupID string) map[string]string {
-	// 从 distribution payload 中提取 group_secret
-	var groupSecretBytes []byte
-	if distributions, ok := info["distributions"].([]any); ok {
-		for _, dist := range distributions {
-			if dm, ok := dist.(map[string]any); ok {
-				if payload, ok := dm["payload"].(map[string]any); ok {
-					if gsB64, ok := payload["group_secret"].(string); ok && gsB64 != "" {
-						if decoded, err := base64.StdEncoding.DecodeString(gsB64); err == nil {
-							groupSecretBytes = decoded
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-	if groupSecretBytes == nil {
-		// fallback: 从本地 keystore 加载
-		if loaded, err := c.groupE2EE.LoadSecretForEpoch(groupID, targetEpoch); err == nil && loaded != nil {
-			if secret, ok := loaded["secret"].([]byte); ok {
-				groupSecretBytes = secret
-			}
-		}
-	}
-	if groupSecretBytes == nil {
-		return nil
-	}
-
-	encryptedKeys := make(map[string]string)
-	for _, aid := range memberAIDs {
-		certBytes, err := c.fetchPeerCert(ctx, aid, "")
-		if err != nil {
-			continue
-		}
-		pubkeyBytes, err := extractECPubkeyFromCert(certBytes)
-		if err != nil || pubkeyBytes == nil {
-			continue
-		}
-		ciphertext, err := EciesEncrypt(pubkeyBytes, groupSecretBytes)
-		if err != nil {
-			continue
-		}
-		encryptedKeys[aid] = base64.StdEncoding.EncodeToString(ciphertext)
-	}
-	return encryptedKeys
-}
-
-// doRecoverGroupEpochKey 执行实际的 epoch key 恢复逻辑
-func (c *AUNClient) doRecoverGroupEpochKey(ctx context.Context, groupID string, epoch int, senderAID string, timeout time.Duration) bool {
-	c.logEG.Debug("doRecoverGroupEpochKey started: group=%s epoch=%d sender=%s timeout=%v", groupID, epoch, senderAID, timeout)
-	// 仅 open / invite_code 群允许从服务端拉取 ECIES 加密的 epoch key
-	if c.groupAllowsMemberEpochRotation(ctx, groupID) {
-		if c.tryRecoverEpochKeyFromServer(ctx, groupID, epoch) {
-			c.logEG.Debug("doRecoverGroupEpochKey recovered from server: group=%s epoch=%d", groupID, epoch)
-			go c.retryPendingDecryptMsgs(groupID)
-			return true
-		}
-	}
-
-	epochResult := map[string]any{"epoch": epoch}
-	if raw, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
-		if m, ok := raw.(map[string]any); ok {
-			for k, v := range m {
-				epochResult[k] = v
-			}
-		}
-	}
-	if senderAID != "" {
-		candidates, _ := epochResult["recovery_candidates"].([]any)
-		epochResult["recovery_candidates"] = append([]any{senderAID}, candidates...)
-	}
-
-	// 在线优先恢复：先查在线成员列表，只向在线成员发送密钥请求
-	var onlineAids []string
-	onlineQueried := false
-	if raw, err := c.Call(ctx, "group.get_online_members", map[string]any{"group_id": groupID}); err == nil {
-		if resp, ok := raw.(map[string]any); ok {
-			onlineQueried = true
-			members, _ := resp["members"].([]any)
-			if members == nil {
-				members, _ = resp["items"].([]any)
-			}
-			c.mu.RLock()
-			myAID := c.aid
-			c.mu.RUnlock()
-			for _, item := range members {
-				m, ok := item.(map[string]any)
-				if !ok {
-					continue
-				}
-				if m["online"] == true {
-					aid, _ := m["aid"].(string)
-					if aid != "" && aid != myAID {
-						onlineAids = append(onlineAids, aid)
-					}
-				}
-			}
-		}
-	}
-
-	if onlineQueried {
-		if len(onlineAids) == 0 {
-			c.logEG.Warn("group %s epoch %d recovery failed: no online members to request key from", groupID, epoch)
-			return false
-		}
-		c.requestGroupKeyFromOnline(ctx, groupID, epoch, onlineAids, epochResult)
-	} else {
-		c.requestGroupKeyFromCandidates(ctx, groupID, epoch, epochResult)
-	}
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		time.Sleep(150 * time.Millisecond)
-		if secret, err := c.groupE2EE.LoadSecretForEpoch(groupID, epoch); err == nil && secret != nil {
-			if c.groupEpochSecretReadyForRecovery(ctx, groupID, epoch, secret) {
-				c.logEG.Debug("doRecoverGroupEpochKey wait recovery succeeded: group=%s epoch=%d", groupID, epoch)
-				go c.retryPendingDecryptMsgs(groupID)
-				return true
-			}
-		}
-	}
-	if secret, err := c.groupE2EE.LoadSecretForEpoch(groupID, epoch); err == nil && secret != nil {
-		if c.groupEpochSecretReadyForRecovery(ctx, groupID, epoch, secret) {
-			c.logEG.Debug("doRecoverGroupEpochKey final check recovery succeeded: group=%s epoch=%d", groupID, epoch)
-			go c.retryPendingDecryptMsgs(groupID)
-			return true
-		}
-	}
-	c.logEG.Warn("doRecoverGroupEpochKey timed out: group=%s epoch=%d timeout=%v", groupID, epoch, timeout)
-	return false
-}
-
-// requestGroupKeyFromOnline 只向在线成员发送密钥恢复请求
-func (c *AUNClient) requestGroupKeyFromOnline(ctx context.Context, groupID string, epoch int, onlineAids []string, epochResult map[string]any) {
-	candidates := c.groupKeyRecoveryCandidates(groupID, epochResult)
-	var ordered []string
-	for _, aid := range candidates {
-		if contains(onlineAids, aid) && !contains(ordered, aid) {
-			ordered = append(ordered, aid)
-		}
-	}
-	for _, aid := range onlineAids {
-		if !contains(ordered, aid) {
-			ordered = append(ordered, aid)
-		}
-	}
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	for _, target := range ordered {
-		reqPayload := BuildKeyRequest(groupID, epoch, myAID)
-		c.groupE2EE.RememberKeyRequest(reqPayload, target)
-		if _, err := c.Call(ctx, "message.send", map[string]any{
-			"to":               target,
-			"payload":          reqPayload,
-			"encrypt":          true,
-			"persist_required": true,
-		}); err != nil {
-			c.logEG.Warn("requesting group %s epoch %d key from %s failed: %v", groupID, epoch, target, err)
-		}
-	}
-}
-
-// decryptGroupMessages 批量解密群组消息（用于 group.pull，跳过防重放）
-func (c *AUNClient) decryptGroupMessages(ctx context.Context, messages []any) []any {
-	var result []any
-	for _, raw := range messages {
-		msg, ok := raw.(map[string]any)
-		if !ok {
-			result = append(result, raw)
-			continue
-		}
-		payload, ok := msg["payload"].(map[string]any)
-		if !ok {
-			result = append(result, raw)
-			continue
-		}
-		payloadType, _ := payload["type"].(string)
-		if payloadType != "e2ee.group_encrypted" {
-			result = append(result, attachGroupDispatchModeToPayload(msg))
-			continue
-		}
-		senderAID, _ := msg["from"].(string)
-		if senderAID == "" {
-			senderAID, _ = msg["sender_aid"].(string)
-		}
-		senderCertFingerprint := ""
-		if payload, ok := msg["payload"].(map[string]any); ok {
-			if aad, ok := payload["aad"].(map[string]any); ok {
-				senderCertFingerprint = strings.TrimSpace(strings.ToLower(getStr(aad, "sender_cert_fingerprint", "")))
-			}
-			if fp, ok := payload["sender_cert_fingerprint"].(string); ok && strings.TrimSpace(fp) != "" {
-				senderCertFingerprint = strings.TrimSpace(strings.ToLower(fp))
-			}
-		}
-		if senderAID != "" {
-			if !c.ensureSenderCertCached(ctx, senderAID, senderCertFingerprint) {
-				// 证书不可用，丢弃密文，不投递给应用层
-				continue
-			}
-		}
-		decrypted := c.decryptGroupMessage(ctx, msg)
-		if decrypted != nil {
-			result = append(result, decrypted)
-		} else if groupID, _ := msg["group_id"].(string); groupID != "" {
-			c.enqueuePendingDecrypt(groupID, msg)
-		}
-		// 解密失败：保留待解队列，不投递密文给应用层
-	}
-	return result
-}
-
-func (c *AUNClient) decryptGroupThoughtMessage(ctx context.Context, message map[string]any) map[string]any {
-	payload, ok := message["payload"].(map[string]any)
-	if !ok {
-		return message
-	}
-	payloadType, _ := payload["type"].(string)
-	if payloadType != "e2ee.group_encrypted" {
-		return message
-	}
-
-	senderAID, _ := message["from"].(string)
-	if senderAID == "" {
-		senderAID, _ = message["sender_aid"].(string)
-	}
-	if senderAID != "" && !c.ensureSenderCertCached(ctx, senderAID) {
-		return nil
-	}
-
-	result, decryptErr := c.groupE2EE.Decrypt(message, true)
-	if decryptErr == nil && result != nil {
-		if _, ok := result["e2ee"]; ok {
-			return result
-		}
-		return result
-	}
-
-	groupID, _ := message["group_id"].(string)
-	sender := senderAID
-	epoch := int(toInt64(payload["epoch"]))
-	if epoch > 0 && groupID != "" {
-		if c.recoverGroupEpochKey(ctx, groupID, epoch, sender, 5*time.Second) {
-			retry, retryErr := c.groupE2EE.Decrypt(message, true)
-			if retryErr == nil && retry != nil {
-				if _, ok := retry["e2ee"]; ok {
-					return retry
-				}
-				return retry
-			}
-		}
-	}
-	return nil
-}
-
-func (c *AUNClient) decryptGroupThoughts(ctx context.Context, result map[string]any) map[string]any {
-	resultView := make(map[string]any, len(result)+1)
-	for k, v := range result {
-		resultView[k] = v
-	}
-	found, _ := result["found"].(bool)
-	if !found {
-		resultView["thoughts"] = []any{}
-		return resultView
-	}
-	items, _ := result["thoughts"].([]any)
-	if len(items) == 0 {
-		resultView["thoughts"] = []any{}
-		return resultView
-	}
-	groupID, _ := result["group_id"].(string)
-	senderAID, _ := result["sender_aid"].(string)
-	thoughts := make([]any, 0, len(items))
-	for _, raw := range items {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		payload, _ := item["payload"].(map[string]any)
-		thoughtID, _ := item["thought_id"].(string)
-		if thoughtID == "" {
-			thoughtID, _ = item["message_id"].(string)
-		}
-		msg := map[string]any{
-			"group_id":   groupID,
-			"sender_aid": senderAID,
-			"from":       senderAID,
-			"message_id": thoughtID,
-			"payload":    payload,
-			"created_at": item["created_at"],
-		}
-		if value, ok := item["context"].(map[string]any); ok {
-			msg["context"] = value
-		}
-		decrypted := c.decryptGroupThoughtMessage(ctx, msg)
-		decryptFailed := false
-		if payload != nil {
-			if payloadType, _ := payload["type"].(string); payloadType == "e2ee.group_encrypted" && decrypted == nil {
-				decryptFailed = true
-			}
-		}
-		if decrypted == nil && !decryptFailed {
-			// 非加密消息且解密返回 nil，跳过（不应发生）
-			decryptFailed = true
-		}
-		thought := map[string]any{
-			"thought_id": thoughtID,
-			"message_id": thoughtID,
-			"created_at": item["created_at"],
-		}
-		if decryptFailed {
-			thought["payload"] = payload
-			thought["decrypt_failed"] = true
-		} else {
-			thought["payload"] = decrypted["payload"]
-			if e2ee, ok := decrypted["e2ee"]; ok {
-				thought["e2ee"] = e2ee
-			}
-		}
-		if value, ok := item["context"]; ok {
-			thought["context"] = value
-		}
-		thoughts = append(thoughts, thought)
-	}
-	resultView["thoughts"] = thoughts
-	return resultView
-}
-
-func (c *AUNClient) decryptMessageThoughts(ctx context.Context, result map[string]any) map[string]any {
-	resultView := make(map[string]any, len(result)+1)
-	for k, v := range result {
-		resultView[k] = v
-	}
-	found, _ := result["found"].(bool)
-	if !found {
-		resultView["thoughts"] = []any{}
-		return resultView
-	}
-	items, _ := result["thoughts"].([]any)
-	if len(items) == 0 {
-		resultView["thoughts"] = []any{}
-		return resultView
-	}
-	senderAID, _ := result["sender_aid"].(string)
-	peerAID, _ := result["peer_aid"].(string)
-	thoughts := make([]any, 0, len(items))
-	for _, raw := range items {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		payload, _ := item["payload"].(map[string]any)
-		thoughtID, _ := item["thought_id"].(string)
-		if thoughtID == "" {
-			thoughtID, _ = item["message_id"].(string)
-		}
-		fromAID, _ := item["from"].(string)
-		if fromAID == "" {
-			fromAID = senderAID
-		}
-		toAID, _ := item["to"].(string)
-		if toAID == "" {
-			toAID = peerAID
-		}
-		msg := map[string]any{
-			"from":       fromAID,
-			"to":         toAID,
-			"message_id": thoughtID,
-			"payload":    payload,
-			"encrypted":  true,
-			"timestamp":  item["created_at"],
-		}
-		if value, ok := item["context"].(map[string]any); ok {
-			msg["context"] = value
-		}
-		decrypted := msg
-		decryptFailed := false
-		if payload != nil {
-			if payloadType, _ := payload["type"].(string); payloadType == "e2ee.encrypted" {
-				senderCertFingerprint := getStr(payload, "sender_cert_fingerprint", "")
-				if senderCertFingerprint == "" {
-					if aad, ok := payload["aad"].(map[string]any); ok {
-						senderCertFingerprint = getStr(aad, "sender_cert_fingerprint", "")
-					}
-				}
-				if fromAID != "" && !c.ensureSenderCertCached(ctx, fromAID, senderCertFingerprint) {
-					decryptFailed = true
-				}
-				if !decryptFailed {
-					plain, err := c.e2ee.decryptMessage(msg)
-					if err != nil || plain == nil {
-						decryptFailed = true
-					} else {
-						decrypted = plain
-					}
-				}
-			}
-		}
-		thought := map[string]any{
-			"thought_id": thoughtID,
-			"message_id": thoughtID,
-			"from":       fromAID,
-			"to":         toAID,
-			"created_at": item["created_at"],
-		}
-		if decryptFailed {
-			thought["payload"] = payload
-			thought["decrypt_failed"] = true
-		} else {
-			thought["payload"] = decrypted["payload"]
-			if e2ee, ok := decrypted["e2ee"]; ok {
-				thought["e2ee"] = e2ee
-			}
-		}
-		if value, ok := item["context"]; ok {
-			thought["context"] = value
-		}
-		thoughts = append(thoughts, thought)
-	}
-	resultView["thoughts"] = thoughts
-	return resultView
 }
 
 // ── 内部：连接 ──────────────────────────────────────────────
@@ -5679,11 +3067,6 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 	}
 	c.startBackgroundTasks(ctx)
 
-	// 上线后自动上传 prekey
-	if upErr := c.uploadPrekey(ctx); upErr != nil {
-		c.logE2.Warn("prekey upload failed: %v", upErr)
-	}
-
 	// connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
 	// 群消息按惰性触发，不在此处主动 pull
 	go func() {
@@ -5694,6 +3077,22 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 		}()
 		c.fillP2pGap()
 	}()
+
+	// V2 E2EE: 初始化 session 并注册设备 SPK（best-effort，失败不阻塞 connect）
+	if v2Err := c.InitV2Session(ctx); v2Err != nil {
+		c.logE2.Warn("V2 session init failed (non-fatal): %v", v2Err)
+	}
+
+	// V2: 上线后自动确认 pending state proposals（后台执行）
+	c.mu.RLock()
+	bgCtx := c.ctx
+	c.mu.RUnlock()
+	if bgCtx == nil {
+		bgCtx = context.Background()
+	}
+	if c.v2GetState() != nil {
+		go c.v2AutoConfirmPendingProposals(bgCtx)
+	}
 
 	return nil
 }
@@ -5718,9 +3117,6 @@ func (c *AUNClient) resetSeqTrackingStateLocked() {
 	c.pendingOrderedMsgsMu.Lock()
 	c.pendingOrderedMsgs = make(map[string]map[int]pendingOrderedMessage)
 	c.pendingOrderedMsgsMu.Unlock()
-	c.pendingDecryptMsgsMu.Lock()
-	c.pendingDecryptMsgs = make(map[string][]map[string]any)
-	c.pendingDecryptMsgsMu.Unlock()
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
@@ -5742,9 +3138,6 @@ func (c *AUNClient) refreshSeqTrackerContextLocked() {
 	c.pendingOrderedMsgsMu.Lock()
 	c.pendingOrderedMsgs = make(map[string]map[int]pendingOrderedMessage)
 	c.pendingOrderedMsgsMu.Unlock()
-	c.pendingDecryptMsgsMu.Lock()
-	c.pendingDecryptMsgs = make(map[string][]map[string]any)
-	c.pendingDecryptMsgsMu.Unlock()
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
@@ -5820,8 +3213,7 @@ func (c *AUNClient) startBackgroundTasks(_ context.Context) {
 		go c.heartbeatLoop(ctx)
 		go c.tokenRefreshLoop(ctx)
 	}
-	// 群组 epoch 相关任务
-	c.startGroupEpochTasks(ctx)
+	c.startCacheCleanupTask(ctx)
 }
 
 // heartbeatLoop 心跳循环；支持运行时通过 applyServerHeartbeatInterval 调整间隔。
@@ -6051,84 +3443,9 @@ func (c *AUNClient) tokenRefreshLoop(ctx context.Context) {
 	}
 }
 
-// prekeyRefreshLoop Prekey 定时轮换循环
-func (c *AUNClient) prekeyRefreshLoop(ctx context.Context) {
-	return
-}
-
-// startGroupEpochTasks 启动群组 epoch 相关后台任务
-func (c *AUNClient) startGroupEpochTasks(ctx context.Context) {
-
-	// 旧 epoch 清理（每小时检查一次）
-	go c.groupEpochCleanupLoop(ctx, 3600.0)
-
-	// 定时 epoch 轮换
-	rotateInterval := c.configModel.EpochAutoRotateInterval
-	if rotateInterval > 0 {
-		go c.groupEpochRotateLoop(ctx, float64(rotateInterval))
-	}
-
-	// 内存缓存定时清理（每小时扫描过期条目）
+// startCacheCleanupTask 启动进程内缓存清理任务。
+func (c *AUNClient) startCacheCleanupTask(ctx context.Context) {
 	go c.cacheCleanupLoop(ctx, 3600.0)
-}
-
-// groupEpochRotateLoop 定时轮换所有已知群组的 epoch
-func (c *AUNClient) groupEpochRotateLoop(ctx context.Context, interval float64) {
-	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.mu.RLock()
-			isClosing := c.closing.Load()
-			state := c.state
-			myAID := c.aid
-			c.mu.RUnlock()
-			if isClosing {
-				return
-			}
-			if state != StateConnected || myAID == "" {
-				continue
-			}
-
-			for _, gid := range listKeyStoreGroupIDs(c.keyStore, myAID) {
-				c.maybeLeadRotateGroupEpoch(ctx, gid, "", nil, false)
-			}
-		}
-	}
-}
-
-// groupEpochCleanupLoop 定时清理过期的旧 epoch 密钥
-func (c *AUNClient) groupEpochCleanupLoop(ctx context.Context, interval float64) {
-	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.mu.RLock()
-			isClosing := c.closing.Load()
-			state := c.state
-			myAID := c.aid
-			c.mu.RUnlock()
-			if isClosing {
-				return
-			}
-			if state != StateConnected || myAID == "" {
-				continue
-			}
-
-			retention := c.configModel.OldEpochRetentionSeconds
-			for _, gid := range listKeyStoreGroupIDs(c.keyStore, myAID) {
-				c.groupE2EE.Cleanup(gid, retention)
-			}
-		}
-	}
 }
 
 // cacheCleanupLoop 定时清理过期的内存缓存条目
@@ -6155,15 +3472,6 @@ func (c *AUNClient) cacheCleanupLoop(ctx context.Context, interval float64) {
 			}
 			c.certCacheMu.Unlock()
 
-			// prekey 列表缓存
-			c.peerPrekeysMu.Lock()
-			for k, v := range c.peerPrekeysCache {
-				if now >= v.expireAt {
-					delete(c.peerPrekeysCache, k)
-				}
-			}
-			c.peerPrekeysMu.Unlock()
-
 			// 补洞去重集合（保留最近 5000 条）
 			c.gapFillDoneMu.Lock()
 			if len(c.gapFillDone) > 10000 {
@@ -6180,1194 +3488,8 @@ func (c *AUNClient) cacheCleanupLoop(ctx context.Context, interval float64) {
 			}
 			c.gapFillDoneMu.Unlock()
 
-			// e2ee prekey 缓存
-			c.e2ee.CleanExpiredCaches()
-			// group e2ee replay guard 缓存
-			c.groupE2EE.CleanExpiredCaches()
 			// auth gateway 缓存
 			c.auth.CleanExpiredCaches()
-		}
-	}
-}
-
-// ── Group E2EE 编排 ─────────────────────────────────────────
-
-// buildRotationSignature 构建 epoch 轮换签名参数。
-// 传入 source 时使用 v2 canonical JSON 签名，覆盖 rotation_id/key_commitment/成员 ack 集。
-func (c *AUNClient) buildRotationSignature(groupID string, currentEpoch, newEpoch int, source ...map[string]any) map[string]any {
-	c.mu.RLock()
-	identity := c.identity
-	c.mu.RUnlock()
-	if identity == nil {
-		return nil
-	}
-	privPEM, _ := identity["private_key_pem"].(string)
-	if privPEM == "" {
-		return nil
-	}
-
-	aidStr, _ := identity["aid"].(string)
-	ts := fmt.Sprintf("%d", time.Now().Unix())
-	var signData []byte
-	useV2 := len(source) > 0 && source[0] != nil
-	if useV2 {
-		src := source[0]
-		signData = []byte(stableStringify(map[string]any{
-			"version":            "v2",
-			"group_id":           groupID,
-			"base_epoch":         currentEpoch,
-			"target_epoch":       newEpoch,
-			"aid":                aidStr,
-			"rotation_timestamp": ts,
-			"rotation_id":        stringFromAny(firstNonNil(src["rotation_id"], src["new_rotation_id"])),
-			"reason":             stringFromAny(src["reason"]),
-			"key_commitment":     stringFromAny(src["key_commitment"]),
-			"manifest_hash":      stringFromAny(src["manifest_hash"]),
-			"epoch_chain":        stringFromAny(src["epoch_chain"]),
-			"expected_members":   sortedStringListFromAny(src["expected_members"]),
-			"required_acks":      sortedStringListFromAny(src["required_acks"]),
-		}))
-	} else {
-		signData = []byte(fmt.Sprintf("%s|%d|%d|%s|%s", groupID, currentEpoch, newEpoch, aidStr, ts))
-	}
-
-	pk, err := parseECPrivateKeyPEM(privPEM)
-	if err != nil {
-		return nil
-	}
-	hash := sha256.Sum256(signData)
-	sig, err := ecdsa.SignASN1(cryptorand.Reader, pk, hash[:])
-	if err != nil {
-		return nil
-	}
-
-	result := map[string]any{
-		"rotation_signature": base64.StdEncoding.EncodeToString(sig),
-		"rotation_timestamp": ts,
-	}
-	if useV2 {
-		result["rotation_sig_version"] = "v2"
-	}
-	return result
-}
-
-func (c *AUNClient) getGroupMemberAIDs(ctx context.Context, groupID string) ([]string, error) {
-	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
-	if err != nil {
-		return nil, err
-	}
-	membersMap, ok := membersResult.(map[string]any)
-	if !ok {
-		return nil, NewStateError(fmt.Sprintf("group %s members response invalid", groupID))
-	}
-	membersList, _ := membersMap["members"].([]any)
-	return extractAIDsFromMembers(membersList), nil
-}
-
-func (c *AUNClient) distributeGroupEpochKey(ctx context.Context, info map[string]any, rotationID string) (sent []string, failed []string) {
-	rawDist := info["distributions"]
-	distributions := make([]map[string]any, 0)
-	switch v := rawDist.(type) {
-	case []map[string]any:
-		distributions = v
-	case []any:
-		for _, item := range v {
-			if m, ok := item.(map[string]any); ok {
-				distributions = append(distributions, m)
-			}
-		}
-	}
-	c.logEG.Debug("epoch key distribution started: rotation=%s targets=%d", rotationID, len(distributions))
-
-	lastHeartbeat := time.Now()
-	for _, dist := range distributions {
-		to, _ := dist["to"].(string)
-		distPayload, _ := dist["payload"].(map[string]any)
-		if to == "" || distPayload == nil {
-			continue
-		}
-		if rotationID != "" && time.Since(lastHeartbeat) >= 20*time.Second {
-			if c.heartbeatGroupRotation(ctx, rotationID) {
-				lastHeartbeat = time.Now()
-			}
-		}
-		ok := false
-		for attempt := 0; attempt < 3; attempt++ {
-			_, sendErr := c.Call(ctx, "message.send", map[string]any{
-				"to":               to,
-				"payload":          distPayload,
-				"encrypt":          true,
-				"persist_required": true,
-			})
-			if sendErr == nil {
-				sent = append(sent, to)
-				ok = true
-				break
-			}
-			if attempt < 2 {
-				time.Sleep(time.Duration(attempt+1) * time.Second)
-			} else {
-				c.logEG.Warn("epoch key distribution failed (to=%s): %v", to, sendErr)
-			}
-		}
-		if !ok {
-			failed = append(failed, to)
-		}
-	}
-	return sent, failed
-}
-
-func (c *AUNClient) heartbeatGroupRotation(ctx context.Context, rotationID string) bool {
-	if strings.TrimSpace(rotationID) == "" {
-		return false
-	}
-	c.logEG.Debug("heartbeatGroupRotation entry: rotation=%s", rotationID)
-	result, err := c.Call(ctx, "group.e2ee.heartbeat_rotation", map[string]any{
-		"rotation_id": rotationID,
-		"lease_ms":    groupRotationLeaseMS,
-	})
-	if err != nil {
-		c.logEG.Warn("failed to refresh epoch rotation lease: rotation=%s err=%v", rotationID, err)
-		return false
-	}
-	resultMap, _ := result.(map[string]any)
-	ok := truthyBool(resultMap["success"])
-	c.logEG.Debug("heartbeatGroupRotation result: rotation=%s success=%v", rotationID, ok)
-	return ok
-}
-
-func (c *AUNClient) ackGroupRotationKey(ctx context.Context, rotationID string, keyCommitment string) bool {
-	if strings.TrimSpace(rotationID) == "" {
-		return false
-	}
-	c.logEG.Debug("ackGroupRotationKey entry: rotation=%s", rotationID)
-	result, err := c.Call(ctx, "group.e2ee.ack_rotation_key", map[string]any{
-		"rotation_id":    rotationID,
-		"key_commitment": keyCommitment,
-		"device_id":      c.deviceID,
-	})
-	if err != nil {
-		c.logEG.Warn("epoch key ack commit failed: rotation=%s err=%v", rotationID, err)
-		return false
-	}
-	resultMap, _ := result.(map[string]any)
-	ok := truthyBool(resultMap["success"])
-	c.logEG.Debug("ackGroupRotationKey result: rotation=%s success=%v", rotationID, ok)
-	return ok
-}
-
-func (c *AUNClient) verifyActiveGroupRotationDistribution(ctx context.Context, payload map[string]any) bool {
-	rotationID := strings.TrimSpace(stringFromAny(payload["rotation_id"]))
-	groupID := strings.TrimSpace(stringFromAny(payload["group_id"]))
-	if groupID == "" {
-		return false
-	}
-	// 历史群（不在当前 session 活跃列表）：跳过 RPC 验证，只做本地 handle_incoming
-	c.groupSyncedMu.Lock()
-	synced := c.groupSynced[groupID]
-	c.groupSyncedMu.Unlock()
-	if !synced {
-		c.logEG.Debug("skip RPC verify for inactive group: group=%s rotation=%s", groupID, rotationID)
-		return true
-	}
-	epoch := int(toInt64(payload["epoch"]))
-	if epoch <= 0 {
-		return false
-	}
-	commitment := strings.TrimSpace(stringFromAny(payload["commitment"]))
-	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-	if err != nil {
-		c.logEG.Error("rejected epoch key distribution: cannot verify active rotation: group=%s rotation=%s err=%v", groupID, rotationID, err)
-		return false
-	}
-	epochMap, ok := epochResult.(map[string]any)
-	if !ok {
-		return false
-	}
-	committedEpoch := int(toInt64(firstNonNil(epochMap["committed_epoch"], epochMap["epoch"])))
-	committedRotation, _ := epochMap["committed_rotation"].(map[string]any)
-	if rotationID == "" {
-		if epoch > 0 && epoch <= committedEpoch {
-			if committedRotation != nil && int(toInt64(firstNonNil(committedRotation["target_epoch"], committedEpoch))) == epoch {
-				committedCommitment := strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
-				if committedCommitment != "" && commitment != "" && committedCommitment != commitment {
-					expectedMembers := sortedStringListFromAny(committedRotation["expected_members"])
-					if strings.TrimSpace(c.aid) != "" && !stringSliceContains(expectedMembers, c.aid) {
-						c.logEG.Error("allowing group key distribution: new member recovery commitment mismatch is normal group=%s epoch=%d",
-							groupID, epoch)
-					} else {
-						return false
-					}
-				}
-			}
-			return true
-		}
-		c.logEG.Error("rejected future epoch key distribution missing rotation_id: group=%s epoch=%d committed=%d", groupID, epoch, committedEpoch)
-		return false
-	}
-	if pending, ok := epochMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
-		pendingCommitment := strings.TrimSpace(stringFromAny(pending["key_commitment"]))
-		if strings.TrimSpace(stringFromAny(pending["rotation_id"])) == rotationID &&
-			int(toInt64(pending["target_epoch"])) == epoch &&
-			(pendingCommitment == "" || pendingCommitment == commitment) {
-			return true
-		}
-	}
-	if committedRotation != nil && committedEpoch >= epoch {
-		committedCommitment := strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
-		if strings.TrimSpace(stringFromAny(committedRotation["rotation_id"])) == rotationID &&
-			(committedCommitment == "" || committedCommitment == commitment) {
-			return true
-		}
-	}
-	c.logEG.Error("rejected epoch key distribution with non-pending/committed status: group=%s rotation=%s epoch=%d", groupID, rotationID, epoch)
-	return false
-}
-
-func (c *AUNClient) discardGroupDistributionIfStale(ctx context.Context, payload map[string]any) {
-	rotationID := strings.TrimSpace(stringFromAny(payload["rotation_id"]))
-	if rotationID == "" {
-		return
-	}
-	groupID := strings.TrimSpace(stringFromAny(payload["group_id"]))
-	epoch := int(toInt64(payload["epoch"]))
-	if groupID == "" || epoch <= 0 {
-		return
-	}
-	if c.verifyActiveGroupRotationDistribution(ctx, payload) {
-		return
-	}
-	if ok, err := c.groupE2EE.DiscardPendingSecret(groupID, epoch, rotationID); err != nil {
-		c.logEG.Warn("failed to clean stale group epoch key: group=%s epoch=%d rotation=%s err=%v", groupID, epoch, rotationID, err)
-	} else if ok {
-		c.logEG.Warn("discarding stale group epoch key after verify: group=%s epoch=%d rotation=%s", groupID, epoch, rotationID)
-	}
-}
-
-func (c *AUNClient) verifyGroupKeyResponseEpoch(ctx context.Context, payload map[string]any) bool {
-	groupID := strings.TrimSpace(stringFromAny(payload["group_id"]))
-	if groupID == "" {
-		return false
-	}
-	epoch := int(toInt64(payload["epoch"]))
-	if epoch <= 0 {
-		return false
-	}
-	commitment := strings.TrimSpace(stringFromAny(payload["commitment"]))
-	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-	if err != nil {
-		c.logEG.Error("rejected group key response: cannot verify committed epoch: group=%s epoch=%d err=%v", groupID, epoch, err)
-		return false
-	}
-	epochMap, ok := epochResult.(map[string]any)
-	if !ok {
-		return false
-	}
-	committedEpoch := int(toInt64(firstNonNil(epochMap["committed_epoch"], epochMap["epoch"])))
-	if epoch > committedEpoch {
-		c.logEG.Error("rejected group key response for uncommitted epoch: group=%s epoch=%d committed=%d", groupID, epoch, committedEpoch)
-		return false
-	}
-	committedRotation, _ := epochMap["committed_rotation"].(map[string]any)
-	if committedRotation != nil && int(toInt64(firstNonNil(committedRotation["target_epoch"], committedEpoch))) == epoch {
-		committedCommitment := strings.TrimSpace(stringFromAny(committedRotation["key_commitment"]))
-		if committedCommitment != "" && commitment != "" && committedCommitment != commitment {
-			expectedMembers := sortedStringListFromAny(committedRotation["expected_members"])
-			if strings.TrimSpace(c.aid) != "" && !stringSliceContains(expectedMembers, c.aid) {
-				c.logEG.Error("allowing group key response: new member recovery commitment mismatch is normal group=%s epoch=%d",
-					groupID, epoch)
-			} else {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func (c *AUNClient) abortGroupRotation(ctx context.Context, rotationID string, reason string) bool {
-	if strings.TrimSpace(rotationID) == "" {
-		return false
-	}
-	if strings.TrimSpace(reason) == "" {
-		reason = "client_abort"
-	}
-	c.logEG.Debug("abortGroupRotation entry: rotation=%s reason=%s", rotationID, reason)
-	result, err := c.Call(ctx, "group.e2ee.abort_rotation", map[string]any{
-		"rotation_id": rotationID,
-		"reason":      reason,
-	})
-	if err != nil {
-		c.logEG.Warn("failed to abort epoch rotation: rotation=%s err=%v", rotationID, err)
-		return false
-	}
-	resultMap, _ := result.(map[string]any)
-	ok := truthyBool(resultMap["success"])
-	c.logEG.Debug("abortGroupRotation result: rotation=%s success=%v", rotationID, ok)
-	return ok
-}
-
-func rotationExpectedMembersStale(rotation map[string]any, memberAIDs []string) bool {
-	expected := sortedStringListFromAny(rotation["expected_members"])
-	current := append([]string(nil), memberAIDs...)
-	sort.Strings(current)
-	return len(expected) > 0 && len(current) > 0 && strings.Join(expected, "\n") != strings.Join(current, "\n")
-}
-
-func (c *AUNClient) rotationRetryDelay(pending map[string]any) time.Duration {
-	var leaseExpiresAt int64
-	if pending != nil && !truthyBool(pending["expired"]) {
-		status := strings.TrimSpace(stringFromAny(pending["status"]))
-		if status == "" || status == "distributing" {
-			leaseExpiresAt = toInt64(pending["lease_expires_at"])
-		}
-	}
-	base := 5 * time.Second
-	if leaseExpiresAt > 0 {
-		remaining := time.Until(time.UnixMilli(leaseExpiresAt)) + time.Second
-		if remaining > base {
-			base = remaining
-		}
-	}
-	jitterMs, _ := cryptorand.Int(cryptorand.Reader, big.NewInt(2000))
-	delay := base + time.Duration(jitterMs.Int64())*time.Millisecond
-	if delay > groupRotationRetryMaxDelay {
-		return groupRotationRetryMaxDelay
-	}
-	return delay
-}
-
-func (c *AUNClient) scheduleGroupRotationRetry(groupID, reason, triggerID string, expectedEpoch int, pending map[string]any) {
-	retryKey := fmt.Sprintf("%s:%s:%s:%d", groupID, firstNonEmpty(triggerID, reason), reason, expectedEpoch)
-	c.groupEpochRotationMu.Lock()
-	if c.groupEpochRotationRetrying[retryKey] {
-		c.groupEpochRotationMu.Unlock()
-		c.logEG.Debug("scheduleGroupRotationRetry skipped (already retrying): group=%s reason=%s", groupID, reason)
-		return
-	}
-	c.groupEpochRotationRetrying[retryKey] = true
-	c.groupEpochRotationMu.Unlock()
-
-	delay := c.rotationRetryDelay(pending)
-	c.logEG.Debug("scheduleGroupRotationRetry scheduled: group=%s reason=%s delay=%v expectedEpoch=%d", groupID, reason, delay, expectedEpoch)
-	go func() {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		c.mu.RLock()
-		baseCtx := c.ctx
-		c.mu.RUnlock()
-		if baseCtx == nil {
-			baseCtx = context.Background()
-		}
-		select {
-		case <-baseCtx.Done():
-		case <-timer.C:
-		}
-		c.groupEpochRotationMu.Lock()
-		delete(c.groupEpochRotationRetrying, retryKey)
-		c.groupEpochRotationMu.Unlock()
-		if baseCtx.Err() != nil || c.closing.Load() {
-			return
-		}
-		c.mu.RLock()
-		state := c.state
-		c.mu.RUnlock()
-		if state != StateConnected {
-			return
-		}
-		expected := expectedEpoch
-		c.maybeLeadRotateGroupEpoch(context.Background(), groupID, triggerID, &expected, false)
-	}()
-}
-
-// syncEpochToServer 建群后将本地 epoch 1 同步到服务端，最多重试 3 次
-func (c *AUNClient) syncEpochToServer(ctx context.Context, groupID string) {
-	c.logEG.Debug("syncEpochToServer started: group=%s", groupID)
-	const maxRetries = 3
-	started := time.Now()
-	for {
-		c.groupEpochRotationMu.Lock()
-		if !c.groupEpochRotationInflight[groupID] {
-			c.groupEpochRotationInflight[groupID] = true
-			c.groupEpochRotationMu.Unlock()
-			break
-		}
-		c.groupEpochRotationMu.Unlock()
-		if time.Since(started) > 20*time.Second {
-			c.logEG.Warn("group epoch create sync still in-flight; skip duplicate sync (group=%s)", groupID)
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-	defer func() {
-		c.groupEpochRotationMu.Lock()
-		delete(c.groupEpochRotationInflight, groupID)
-		c.groupEpochRotationMu.Unlock()
-	}()
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		c.mu.RLock()
-		myAID := c.aid
-		c.mu.RUnlock()
-		if myAID == "" {
-			return
-		}
-		secretData, secretErr := c.groupE2EE.LoadSecretForEpoch(groupID, 1)
-		if secretErr != nil || secretData == nil {
-			c.logEG.Warn("sync epoch to server failed: group=%s epoch1 secret missing err=%v", groupID, secretErr)
-			return
-		}
-		rotationID := "rot-" + strings.ReplaceAll(generateUUID4(), "-", "")
-		members := toStringSlice(secretData["member_aids"])
-		if len(members) == 0 {
-			members = []string{myAID}
-		}
-		rotateParams := map[string]any{
-			"group_id":         groupID,
-			"base_epoch":       0,
-			"target_epoch":     1,
-			"rotation_id":      rotationID,
-			"reason":           "create_group",
-			"key_commitment":   stringFromAny(secretData["commitment"]),
-			"epoch_chain":      stringFromAny(secretData["epoch_chain"]),
-			"expected_members": members,
-			"required_acks":    []string{myAID},
-			"lease_ms":         groupRotationLeaseMS,
-		}
-		sigParams := c.buildRotationSignature(groupID, 0, 1, rotateParams)
-		for k, v := range sigParams {
-			rotateParams[k] = v
-		}
-		beginResult, err := c.Call(ctx, "group.e2ee.begin_rotation", rotateParams)
-		if err == nil {
-			beginMap, ok := beginResult.(map[string]any)
-			rotation, _ := beginMap["rotation"].(map[string]any)
-			if ok && truthyBool(beginMap["success"]) && rotation != nil {
-				activeRotationID := firstNonEmpty(stringFromAny(rotation["rotation_id"]), rotationID)
-				if !c.ackGroupRotationKey(ctx, activeRotationID, stringFromAny(secretData["commitment"])) {
-					c.logEG.Warn("group epoch self ack failed (group=%s, rotation=%s)", groupID, activeRotationID)
-					c.abortGroupRotation(ctx, activeRotationID, "self_ack_failed")
-					return
-				}
-				commitParams2 := map[string]any{"rotation_id": activeRotationID}
-				secret2, _ := secretData["secret"].([]byte)
-				if secret2 != nil {
-					createInfo := map[string]any{
-						"distributions": []any{map[string]any{"payload": map[string]any{"group_secret": base64.StdEncoding.EncodeToString(secret2)}}},
-					}
-					if c.groupAllowsMemberEpochRotation(ctx, groupID) {
-						if encKeys2 := c.buildEpochEncryptedKeys(ctx, createInfo, members, 1, groupID); len(encKeys2) > 0 {
-							commitParams2["encrypted_keys"] = encKeys2
-						}
-					}
-				}
-				commitResult, commitErr := c.Call(ctx, "group.e2ee.commit_rotation", commitParams2)
-				if commitErr == nil {
-					commitMap, _ := commitResult.(map[string]any)
-					if truthyBool(commitMap["success"]) {
-						secret, _ := secretData["secret"].([]byte)
-						StoreGroupSecret(c.keyStore, myAID, groupID, 1, secret, stringFromAny(secretData["commitment"]), members, stringFromAny(secretData["epoch_chain"]))
-						c.logEG.Debug("syncEpochToServer completed: group=%s", groupID)
-						return
-					}
-					c.logEG.Warn("group epoch commit failed (group=%s, returned=%v)", groupID, commitResult)
-					return
-				}
-				c.logEG.Warn("group epoch commit failed (group=%s): %v", groupID, commitErr)
-				return
-			}
-			c.logEG.Warn("group epoch begin failed; stop key distribution (group=%s, returned=%v)", groupID, beginResult)
-			return
-		}
-		if attempt < maxRetries {
-			delay := time.Duration(500*(1<<(attempt-1))) * time.Millisecond
-			c.logEG.Warn("sync epoch to server failed (group=%s, attempt %d/%d): %v, retrying in %v", groupID, attempt, maxRetries, err, delay)
-			time.Sleep(delay)
-		} else {
-			c.logEG.Warn("sync epoch to server final failure (group=%s, retried %d times): %v", groupID, maxRetries, err)
-		}
-	}
-}
-
-func randomLeaderRotateJitter() time.Duration {
-	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(4000))
-	if err != nil {
-		return 3 * time.Second
-	}
-	return time.Duration(2000+n.Int64()) * time.Millisecond
-}
-
-// maybeLeadRotateGroupEpoch 基于"排序最小候选 = leader"选举自动触发 epoch 轮换。
-// allowMember=true 时（open/invite_code 群），普通 member 也参与选举，
-// 优先级：owner/admin 排序在前 > member 排序在后。
-func (c *AUNClient) maybeLeadRotateGroupEpoch(ctx context.Context, groupID string, triggerID string, expectedEpoch *int, allowMember bool) {
-	tStart := time.Now()
-	c.logEG.Debug("maybeLeadRotateGroupEpoch enter: group=%s trigger=%s allowMember=%v", groupID, triggerID, allowMember)
-	defer func() {
-		c.logEG.Debug("maybeLeadRotateGroupEpoch exit: group=%s trigger=%s elapsed=%dms", groupID, triggerID, time.Since(tStart).Milliseconds())
-	}()
-	c.mu.RLock()
-	myAID := c.aid
-	state := c.state
-	c.mu.RUnlock()
-	if groupID == "" || myAID == "" || c.closing.Load() || state != StateConnected {
-		return
-	}
-	epStr := "<nil>"
-	if expectedEpoch != nil {
-		epStr = fmt.Sprintf("%d", *expectedEpoch)
-	}
-	c.logEG.Debug("maybeLeadRotateGroupEpoch started: group=%s trigger=%s expectedEpoch=%s allowMember=%v", groupID, triggerID, epStr, allowMember)
-
-	started := time.Now()
-	for {
-		c.groupEpochRotationMu.Lock()
-		if !c.groupEpochRotationInflight[groupID] {
-			c.groupEpochRotationInflight[groupID] = true
-			c.groupEpochRotationMu.Unlock()
-			break
-		}
-		done := triggerID != "" && c.groupMembershipRotationDone[triggerID]
-		c.groupEpochRotationMu.Unlock()
-		if done {
-			return
-		}
-		c.mu.RLock()
-		state = c.state
-		c.mu.RUnlock()
-		if c.closing.Load() || state != StateConnected {
-			return
-		}
-		if time.Since(started) > 20*time.Second {
-			c.logEG.Warn("group epoch rotation still in-flight; skip pending trigger (group=%s trigger=%s)", groupID, triggerID)
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-	defer func() {
-		c.groupEpochRotationMu.Lock()
-		delete(c.groupEpochRotationInflight, groupID)
-		c.groupEpochRotationMu.Unlock()
-	}()
-	c.mu.RLock()
-	state = c.state
-	c.mu.RUnlock()
-	if c.closing.Load() || state != StateConnected {
-		return
-	}
-
-	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
-	if err != nil {
-		c.logEG.Warn("_maybeLeadRotateGroupEpoch failed to get members: group=%s %v", groupID, err)
-		return
-	}
-	membersMap, ok := membersResult.(map[string]any)
-	if !ok {
-		return
-	}
-	membersList, _ := membersMap["members"].([]any)
-	admins := make([]string, 0, len(membersList))
-	members := make([]string, 0)
-	for _, item := range membersList {
-		member, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		aid, _ := member["aid"].(string)
-		role, _ := member["role"].(string)
-		if aid == "" {
-			continue
-		}
-		if role == "owner" || role == "admin" {
-			admins = append(admins, aid)
-		} else if allowMember && role == "member" {
-			members = append(members, aid)
-		}
-	}
-	// 候选列表：admin/owner 排序在前，member 排序在后
-	sort.Strings(admins)
-	sort.Strings(members)
-	candidates := append(admins, members...)
-	if len(candidates) == 0 {
-		return
-	}
-
-	// 没有当前 epoch key 的成员不参与 leader 选举：
-	// 缺少 prev epoch chain 的成员无法正确计算 epoch_chain。
-	// 但如果排除后候选列表为空且是 open/invite_code 群（allowMember=true），
-	// 新成员保留自己兜底（从服务端 committed_rotation.epoch_chain 获取 prev chain 发起轮换）。
-	if expectedEpoch != nil && *expectedEpoch > 0 {
-		localSecret, _ := c.groupE2EE.LoadSecretForEpoch(groupID, *expectedEpoch)
-		if localSecret == nil {
-			filtered := make([]string, 0, len(candidates))
-			for _, aid := range candidates {
-				if aid != myAID {
-					filtered = append(filtered, aid)
-				}
-			}
-			if len(filtered) > 0 {
-				candidates = filtered
-			} else if !allowMember {
-				return
-			}
-			// else: open/invite_code 群只剩自己时保留兜底
-		}
-	}
-
-	leader := candidates[0]
-	if leader == myAID {
-		c.logEG.Debug("maybeLeadRotateGroupEpoch: this node is leader, executing rotation: group=%s", groupID)
-		c.rotateGroupEpoch(ctx, groupID, triggerID, expectedEpoch)
-		return
-	}
-	if !stringSliceContains(candidates, myAID) {
-		c.logEG.Debug("maybeLeadRotateGroupEpoch: this node not in candidate list, skipping: group=%s leader=%s", groupID, leader)
-		return
-	}
-
-	// 查询服务端 epoch（本地可能因未收到密钥分发而滞后）
-	beforeEpoch := 0
-	if resp, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
-		if m, ok := resp.(map[string]any); ok {
-			beforeEpoch = int(toInt64(m["epoch"]))
-		}
-	} else if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
-		beforeEpoch = *epoch
-	}
-	timer := time.NewTimer(randomLeaderRotateJitter())
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return
-	case <-timer.C:
-	}
-	c.mu.RLock()
-	state = c.state
-	c.mu.RUnlock()
-	if c.closing.Load() || state != StateConnected {
-		return
-	}
-	afterEpoch := 0
-	var afterMap map[string]any
-	if resp, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID}); err == nil {
-		if m, ok := resp.(map[string]any); ok {
-			afterMap = m
-			afterEpoch = int(toInt64(m["epoch"]))
-		}
-	} else if epoch := c.groupE2EE.CurrentEpoch(groupID); epoch != nil {
-		afterEpoch = *epoch
-	}
-	if afterEpoch > beforeEpoch {
-		return
-	}
-	if pending, ok := afterMap["pending_rotation"].(map[string]any); ok && !truthyBool(pending["expired"]) {
-		exp := afterEpoch
-		if expectedEpoch != nil {
-			exp = *expectedEpoch
-		}
-		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, pending)
-		return
-	}
-	c.logEG.Info("leader did not complete epoch rotation, non-leader fallback: group=%s myAid=%s", groupID, myAID)
-	c.rotateGroupEpoch(ctx, groupID, triggerID, expectedEpoch)
-}
-
-// rotateGroupEpoch 为指定群组轮换 epoch 并分发新密钥（使用服务端两阶段 rotation）
-func (c *AUNClient) rotateGroupEpoch(ctx context.Context, groupID string, triggerID string, expectedEpoch *int) {
-	tStart := time.Now()
-	c.logEG.Debug("rotateGroupEpoch enter: group=%s trigger=%s", groupID, triggerID)
-	defer func() {
-		if r := recover(); r != nil {
-			c.logEG.Error("rotateGroupEpoch panic: %v", r)
-			c.logEG.Debug("rotateGroupEpoch exit (panic): group=%s trigger=%s elapsed=%dms", groupID, triggerID, time.Since(tStart).Milliseconds())
-			return
-		}
-		c.logEG.Debug("rotateGroupEpoch exit: group=%s trigger=%s elapsed=%dms", groupID, triggerID, time.Since(tStart).Milliseconds())
-	}()
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-	if myAID == "" {
-		return
-	}
-	c.logEG.Debug("rotateGroupEpoch started: group=%s trigger=%s", groupID, triggerID)
-
-	memberAIDs, err := c.getGroupMemberAIDs(ctx, groupID)
-	if err != nil {
-		c.logE2EEError("rotate_epoch", groupID, "", err)
-		return
-	}
-	if triggerID != "" {
-		c.groupEpochRotationMu.Lock()
-		done := c.groupMembershipRotationDone[triggerID]
-		c.groupEpochRotationMu.Unlock()
-		if done {
-			return
-		}
-	}
-
-	epochResult, err := c.Call(ctx, "group.e2ee.get_epoch", map[string]any{"group_id": groupID})
-	if err != nil {
-		c.logE2EEError("rotate_epoch", groupID, "", err)
-		return
-	}
-	epochMap, ok := epochResult.(map[string]any)
-	if !ok {
-		return
-	}
-	serverEpoch := int(toInt64(epochMap["epoch"]))
-	if pendingRotation, ok := epochMap["pending_rotation"].(map[string]any); ok && !truthyBool(pendingRotation["expired"]) {
-		pendingRotationID := stringFromAny(pendingRotation["rotation_id"])
-		if expectedEpoch != nil && serverEpoch == *expectedEpoch && rotationExpectedMembersStale(pendingRotation, memberAIDs) &&
-			c.abortGroupRotation(ctx, pendingRotationID, "membership_changed_during_rotation") {
-			c.logEG.Warn("aborted stale pending group epoch rotation: group=%s rotation=%s", groupID, firstNonEmpty(pendingRotationID, "-"))
-		} else {
-			exp := serverEpoch
-			if expectedEpoch != nil {
-				exp = *expectedEpoch
-			}
-			c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, pendingRotation)
-			return
-		}
-	}
-	if expectedEpoch != nil && serverEpoch != *expectedEpoch {
-		if triggerID != "" {
-			c.groupEpochRotationMu.Lock()
-			c.groupMembershipRotationDone[triggerID] = true
-			c.groupEpochRotationMu.Unlock()
-		}
-		c.logEG.Warn("skip membership epoch rotation: group=%s expected_epoch=%d server_epoch=%d trigger=%s", groupID, *expectedEpoch, serverEpoch, triggerID)
-		return
-	}
-	currentEpoch := serverEpoch
-	if expectedEpoch != nil {
-		currentEpoch = *expectedEpoch
-	}
-	targetEpoch := currentEpoch + 1
-	rotationID := "rot-" + strings.ReplaceAll(generateUUID4(), "-", "")
-
-	// 新成员可能没有 prev epoch key，或有 key 但缺少 epoch_chain（通过 backfill 接收）。
-	// 从服务端 committed_rotation.epoch_chain 获取 prev chain 用于计算新 epoch_chain。
-	var prevChainHint string
-	prevEpochPtr := currentEpoch
-	prevSecret, _ := LoadGroupSecret(c.keyStore, myAID, groupID, &prevEpochPtr)
-	prevChainLocal := ""
-	if prevSecret != nil {
-		prevChainLocal, _ = prevSecret["epoch_chain"].(string)
-	}
-	if strings.TrimSpace(prevChainLocal) == "" {
-		if cr, ok := epochMap["committed_rotation"].(map[string]any); ok {
-			prevChainHint = strings.TrimSpace(stringFromAny(cr["epoch_chain"]))
-			if prevChainHint != "" {
-				c.logEG.Warn("rotation supplementing prev epoch chain from server: group=%s epoch=%d", groupID, currentEpoch)
-			}
-		}
-	}
-
-	info, err := c.groupE2EE.RotateEpochTo(groupID, targetEpoch, memberAIDs, rotationID, prevChainHint)
-	if err != nil {
-		c.logE2EEError("rotate_epoch", groupID, "", err)
-		return
-	}
-	c.logEG.Debug("rotateGroupEpoch RotateEpochTo succeeded: group=%s targetEpoch=%d rotation=%s members=%d", groupID, targetEpoch, rotationID, len(memberAIDs))
-	discardGeneratedPending := func() {
-		if _, err := c.groupE2EE.DiscardPendingSecret(groupID, targetEpoch, rotationID); err != nil {
-			c.logEG.Warn("failed to clean local pending group key: group=%s epoch=%d rotation=%s err=%v",
-				groupID, targetEpoch, rotationID, err)
-		}
-	}
-	commitment := stringFromAny(info["commitment"])
-	rotationReason := "manual"
-	if triggerID != "" || expectedEpoch != nil {
-		rotationReason = "membership_changed"
-	}
-	rotateParams := map[string]any{
-		"group_id":         groupID,
-		"base_epoch":       currentEpoch,
-		"target_epoch":     targetEpoch,
-		"rotation_id":      rotationID,
-		"reason":           rotationReason,
-		"key_commitment":   commitment,
-		"expected_members": memberAIDs,
-		"required_acks":    []string{myAID},
-		"lease_ms":         groupRotationLeaseMS,
-	}
-	sigParams := c.buildRotationSignature(groupID, currentEpoch, targetEpoch, rotateParams)
-	for k, v := range sigParams {
-		rotateParams[k] = v
-	}
-	beginResult, err := c.Call(ctx, "group.e2ee.begin_rotation", rotateParams)
-	if err != nil {
-		discardGeneratedPending()
-		c.logE2EEError("rotate_epoch", groupID, "", err)
-		return
-	}
-	beginMap, ok := beginResult.(map[string]any)
-	if !ok {
-		discardGeneratedPending()
-		return
-	}
-	rotation, _ := beginMap["rotation"].(map[string]any)
-	if !truthyBool(beginMap["success"]) || rotation == nil {
-		if rotation != nil && !truthyBool(rotation["expired"]) {
-			exp := currentEpoch
-			if expectedEpoch != nil {
-				exp = *expectedEpoch
-			}
-			if rotationExpectedMembersStale(rotation, memberAIDs) &&
-				c.abortGroupRotation(ctx, stringFromAny(rotation["rotation_id"]), "membership_changed_during_rotation") {
-				c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
-			} else {
-				c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, rotation)
-			}
-		} else if stringFromAny(beginMap["reason"]) == "expected_members_mismatch" {
-			exp := currentEpoch
-			if expectedEpoch != nil {
-				exp = *expectedEpoch
-			}
-			c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
-		}
-		c.logEG.Warn("group epoch begin failed; stop key distribution (group=%s current_epoch=%d returned=%v)", groupID, currentEpoch, beginResult)
-		discardGeneratedPending()
-		return
-	}
-	activeRotationID := firstNonEmpty(stringFromAny(rotation["rotation_id"]), rotationID)
-	_, failed := c.distributeGroupEpochKey(ctx, info, activeRotationID)
-	if len(failed) > 0 {
-		c.logEG.Warn("group epoch key distribution incomplete; abort rotation before retry (group=%s rotation=%s failed=%s)",
-			groupID, activeRotationID, strings.Join(failed, ","))
-		c.abortGroupRotation(ctx, activeRotationID, "distribution_failed")
-		exp := currentEpoch
-		if expectedEpoch != nil {
-			exp = *expectedEpoch
-		}
-		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
-		discardGeneratedPending()
-		return
-	}
-	c.heartbeatGroupRotation(ctx, activeRotationID)
-	if !c.ackGroupRotationKey(ctx, activeRotationID, commitment) {
-		c.logEG.Warn("group epoch self ack failed; abort rotation before retry (group=%s rotation=%s)", groupID, activeRotationID)
-		c.abortGroupRotation(ctx, activeRotationID, "self_ack_failed")
-		exp := currentEpoch
-		if expectedEpoch != nil {
-			exp = *expectedEpoch
-		}
-		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, nil)
-		discardGeneratedPending()
-		return
-	}
-	commitParams := map[string]any{"rotation_id": activeRotationID}
-	// 只有 open / invite_code 群把 per-member ECIES epoch key 交给服务端托管。
-	if c.groupAllowsMemberEpochRotation(ctx, groupID) {
-		if encryptedKeys := c.buildEpochEncryptedKeys(ctx, info, memberAIDs, targetEpoch, groupID); len(encryptedKeys) > 0 {
-			commitParams["encrypted_keys"] = encryptedKeys
-		}
-	}
-	commitResult, err := c.Call(ctx, "group.e2ee.commit_rotation", commitParams)
-	if err != nil {
-		c.logE2EEError("rotate_epoch", groupID, "", err)
-		exp := currentEpoch
-		if expectedEpoch != nil {
-			exp = *expectedEpoch
-		}
-		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, rotation)
-		return
-	}
-	commitMap, _ := commitResult.(map[string]any)
-	if !truthyBool(commitMap["success"]) {
-		pending, _ := commitMap["rotation"].(map[string]any)
-		exp := currentEpoch
-		if expectedEpoch != nil {
-			exp = *expectedEpoch
-		}
-		c.scheduleGroupRotationRetry(groupID, "membership_changed", triggerID, exp, pending)
-		c.logEG.Warn("group epoch commit failed (group=%s rotation=%s returned=%v)", groupID, activeRotationID, commitResult)
-		if !(pending != nil &&
-			stringFromAny(pending["rotation_id"]) == activeRotationID &&
-			stringFromAny(pending["status"]) == "distributing") {
-			discardGeneratedPending()
-		}
-		return
-	}
-	if committedSecret, _ := c.groupE2EE.LoadSecretForEpoch(groupID, targetEpoch); committedSecret != nil {
-		committedRotation, _ := commitMap["rotation"].(map[string]any)
-		if committedRotation == nil {
-			committedRotation = map[string]any{
-				"rotation_id":    activeRotationID,
-				"key_commitment": commitment,
-			}
-		}
-		if c.groupSecretMatchesCommittedRotation(committedSecret, committedRotation) {
-			secret, _ := committedSecret["secret"].([]byte)
-			members := toStringSlice(committedSecret["member_aids"])
-			if len(members) == 0 {
-				members = memberAIDs
-			}
-			StoreGroupSecret(c.keyStore, myAID, groupID, targetEpoch, secret, stringFromAny(committedSecret["commitment"]), members, stringFromAny(committedSecret["epoch_chain"]))
-		} else {
-			c.logEG.Warn("group epoch commit succeeded but local target key does not match committed rotation; keep pending blocked (group=%s rotation=%s epoch=%d)",
-				groupID, activeRotationID, targetEpoch)
-		}
-	}
-	if triggerID != "" {
-		c.groupEpochRotationMu.Lock()
-		c.groupMembershipRotationDone[triggerID] = true
-		if len(c.groupMembershipRotationDone) > 2000 {
-			c.groupMembershipRotationDone = make(map[string]bool)
-		}
-		c.groupEpochRotationMu.Unlock()
-	}
-	c.logEG.Debug("rotateGroupEpoch completed: group=%s targetEpoch=%d rotation=%s trigger=%s", groupID, targetEpoch, activeRotationID, triggerID)
-}
-
-// getFirstNonEmpty 从 map 中按 keys 顺序取第一个非空值
-func getFirstNonEmpty(m map[string]any, keys ...string) any {
-	for _, k := range keys {
-		if v, ok := m[k]; ok {
-			s := strings.TrimSpace(fmt.Sprint(v))
-			if s != "" && s != "<nil>" {
-				return v
-			}
-		}
-	}
-	return nil
-}
-
-// joinedMemberAidsFromPayload 从 group.changed 事件 payload 中提取新加入成员的 AID 列表
-func joinedMemberAidsFromPayload(payload map[string]any) []string {
-	aids := make(map[string]bool)
-	addAid := func(v any) {
-		if v == nil {
-			return
-		}
-		aid := strings.TrimSpace(fmt.Sprint(v))
-		if aid != "" && aid != "<nil>" {
-			aids[aid] = true
-		}
-	}
-	// 顶层字段
-	addAid(getFirstNonEmpty(payload, "aid", "applicant_aid", "applicantAid"))
-	for _, key := range []string{"member_aid", "target_aid", "new_member_aid", "used_by"} {
-		if v, ok := payload[key]; ok {
-			addAid(v)
-		}
-	}
-	// 嵌套对象（member / request / invite_code）
-	for _, key := range []string{"member", "request", "invite_code"} {
-		nested, _ := payload[key].(map[string]any)
-		if nested == nil {
-			continue
-		}
-		addAid(getFirstNonEmpty(nested, "aid", "applicant_aid", "applicantAid"))
-		for _, nk := range []string{"member_aid", "target_aid", "used_by"} {
-			if v, ok := nested[nk]; ok {
-				addAid(v)
-			}
-		}
-	}
-	// results 数组（批量审批场景）
-	if results, ok := payload["results"].([]any); ok {
-		for _, item := range results {
-			obj, _ := item.(map[string]any)
-			if obj == nil {
-				continue
-			}
-			status := strings.TrimSpace(strings.ToLower(fmt.Sprint(obj["status"])))
-			approved, _ := obj["approved"].(bool)
-			if status != "approved" && !approved {
-				continue
-			}
-			addAid(getFirstNonEmpty(obj, "aid", "applicant_aid", "applicantAid"))
-			for _, key := range []string{"member_aid", "target_aid"} {
-				if v, ok := obj[key]; ok {
-					addAid(v)
-				}
-			}
-			for _, key := range []string{"member", "request"} {
-				nested, _ := obj[key].(map[string]any)
-				if nested == nil {
-					continue
-				}
-				addAid(getFirstNonEmpty(nested, "aid", "applicant_aid"))
-				for _, nk := range []string{"member_aid", "target_aid"} {
-					if v, ok := nested[nk]; ok {
-						addAid(v)
-					}
-				}
-			}
-		}
-	}
-	result := make([]string, 0, len(aids))
-	for aid := range aids {
-		result = append(result, aid)
-	}
-	return result
-}
-
-// contains 检查字符串切片是否包含指定元素
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-// 延迟轮换等待时间
-const joinRotationDelay = 3 * time.Second
-
-// 新成员自身延迟轮换时间：优先让其他在线成员先轮换
-const selfJoinRotationDelay = 6 * time.Second
-
-// delayedRotateAfterJoin open/invite_code 入群后延迟轮换
-func (c *AUNClient) delayedRotateAfterJoin(ctx context.Context, groupID string, triggerID string, expectedEpoch *int, allowMember bool) {
-	c.logEG.Debug("delayedRotateAfterJoin waiting %v: group=%s trigger=%s", joinRotationDelay, groupID, triggerID)
-	time.Sleep(joinRotationDelay)
-	c.maybeLeadRotateGroupEpoch(ctx, groupID, triggerID, expectedEpoch, allowMember)
-}
-
-// delayedRotateAfterJoinWithDelay 带自定义延迟的延迟轮换
-func (c *AUNClient) delayedRotateAfterJoinWithDelay(ctx context.Context, groupID string, triggerID string, expectedEpoch *int, allowMember bool, delay time.Duration) {
-	c.logEG.Debug("delayedRotateAfterJoinWithDelay waiting %v: group=%s trigger=%s", delay, groupID, triggerID)
-	time.Sleep(delay)
-	c.maybeLeadRotateGroupEpoch(ctx, groupID, triggerID, expectedEpoch, allowMember)
-}
-
-// maybeBackfillKeyToJoinedMember 当新成员加入且无需 epoch 轮换时，向新成员 backfill 当前群密钥
-func (c *AUNClient) maybeBackfillKeyToJoinedMember(ctx context.Context, groupID string, payload map[string]any, triggerID string) {
-	memberAids := joinedMemberAidsFromPayload(payload)
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-
-	// 过滤掉空值和自身
-	filtered := make([]string, 0, len(memberAids))
-	for _, aid := range memberAids {
-		if aid != "" && aid != myAID {
-			filtered = append(filtered, aid)
-		}
-	}
-	if groupID == "" || myAID == "" || len(filtered) == 0 {
-		return
-	}
-	// 本地没有群密钥则无法 backfill
-	if !c.groupE2EE.HasSecret(groupID) {
-		c.logEG.Debug("BackfillKeyToJoinedMember skipped: no local group key group=%s", groupID)
-		return
-	}
-	c.logEG.Debug("BackfillKeyToJoinedMember started: group=%s targets=%v trigger=%s", groupID, filtered, triggerID)
-
-	c.groupBackfillMu.Lock()
-	defer c.groupBackfillMu.Unlock()
-
-	for _, memberAid := range filtered {
-		dedupeKey := fmt.Sprintf("%s:backfill:%s", triggerID, memberAid)
-		if c.groupMemberKeyBackfillDone[dedupeKey] {
-			continue
-		}
-		c.groupMemberKeyBackfillDone[dedupeKey] = true
-		// 防止 map 无限增长：超过 2000 条时裁剪到 1000 条
-		if len(c.groupMemberKeyBackfillDone) > 2000 {
-			newMap := make(map[string]bool, 1000)
-			count := 0
-			for k, v := range c.groupMemberKeyBackfillDone {
-				if count >= 1000 {
-					break
-				}
-				newMap[k] = v
-				count++
-			}
-			c.groupMemberKeyBackfillDone = newMap
-		}
-		// 释放锁后执行 I/O 密集的分发操作，完成后重新加锁
-		c.groupBackfillMu.Unlock()
-		c.distributeKeyToNewMember(ctx, groupID, memberAid)
-		c.groupBackfillMu.Lock()
-	}
-}
-
-// distributeKeyToNewMember 将当前 group_secret 通过 P2P E2EE 分发给新成员
-func (c *AUNClient) distributeKeyToNewMember(ctx context.Context, groupID, newMemberAID string) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.log.Error("distributeKeyToNewMember panic: %v", r)
-		}
-	}()
-	c.logEG.Debug("distributeKeyToNewMember started: group=%s target=%s", groupID, newMemberAID)
-
-	secretData, _ := c.groupE2EE.LoadSecret(groupID)
-	if secretData == nil {
-		return
-	}
-
-	// 拉服务端最新成员列表
-	membersResult, err := c.Call(ctx, "group.get_members", map[string]any{"group_id": groupID})
-	if err != nil {
-		c.logE2EEError("distribute_key", groupID, newMemberAID, err)
-		return
-	}
-	membersMap, ok := membersResult.(map[string]any)
-	if !ok {
-		return
-	}
-	membersList, _ := membersMap["members"].([]any)
-	memberAIDs := extractAIDsFromMembers(membersList)
-
-	// 更新本地 member_aids/commitment
-	c.mu.RLock()
-	myAID := c.aid
-	c.mu.RUnlock()
-
-	epoch := int(toInt64(secretData["epoch"]))
-	secret, _ := secretData["secret"].([]byte)
-	commitment := ComputeMembershipCommitment(memberAIDs, epoch, groupID, secret)
-	StoreGroupSecret(c.keyStore, myAID, groupID, epoch, secret, commitment, memberAIDs, "")
-
-	// 构建并签名 manifest
-	prevEpoch := epoch
-	manifest := BuildMembershipManifest(
-		groupID, epoch, &prevEpoch,
-		memberAIDs, []string{newMemberAID}, nil, myAID,
-	)
-
-	c.mu.RLock()
-	identity := c.identity
-	c.mu.RUnlock()
-	if identity != nil {
-		if privPEM, ok := identity["private_key_pem"].(string); ok && privPEM != "" {
-			signed, err := SignMembershipManifest(manifest, privPEM)
-			if err == nil {
-				manifest = signed
-			}
-		}
-	}
-
-	distPayload := BuildKeyDistribution(groupID, epoch, secret, memberAIDs, myAID, manifest, stringFromAny(secretData["epoch_chain"]))
-	// 重试 3 次，间隔递增（1s, 2s）
-	for attempt := 0; attempt < 3; attempt++ {
-		_, err = c.Call(ctx, "message.send", map[string]any{
-			"to":               newMemberAID,
-			"payload":          distPayload,
-			"encrypt":          true,
-			"persist_required": true,
-		})
-		if err == nil {
-			c.logEG.Debug("distributeKeyToNewMember succeeded: group=%s target=%s epoch=%d", groupID, newMemberAID, epoch)
-			break
-		}
-		if attempt < 2 {
-			time.Sleep(time.Duration(attempt+1) * time.Second)
-		} else {
-			c.logEG.Error("distributeKeyToNewMember failed: group=%s target=%s epoch=%d err=%v", groupID, newMemberAID, epoch, err)
-			c.logE2EEError("distribute_key", groupID, newMemberAID, err)
 		}
 	}
 }
@@ -7491,15 +3613,6 @@ func (c *AUNClient) saveSeqTrackerState() {
 }
 
 // logE2EEError 记录 E2EE 自动编排错误
-func (c *AUNClient) logE2EEError(stage, groupID, aid string, err error) {
-	c.logEG.Warn("orchestration error: stage=%s group=%s aid=%s error=%v", stage, groupID, aid, err)
-	c.events.Publish("e2ee.orchestration_error", map[string]any{
-		"stage":    stage,
-		"group_id": groupID,
-		"aid":      aid,
-		"error":    err.Error(),
-	})
-}
 
 // ── 断线重连 ──────────────────────────────────────────────
 
@@ -8101,135 +4214,6 @@ func (c *AUNClient) injectMessageCursorContext(method string, params map[string]
 	return nil
 }
 
-func extractPeerPrekeyMaterial(value any) (map[string]any, bool) {
-	prekey, ok := value.(map[string]any)
-	if !ok || prekey == nil {
-		return nil, false
-	}
-	prekeyID, ok := prekey["prekey_id"].(string)
-	if !ok || prekeyID == "" {
-		return nil, false
-	}
-	publicKey, ok := prekey["public_key"].(string)
-	if !ok || publicKey == "" {
-		return nil, false
-	}
-	signature, ok := prekey["signature"].(string)
-	if !ok || signature == "" {
-		return nil, false
-	}
-	return prekey, true
-}
-
-func normalizePeerPrekeys(prekeys []map[string]any) []map[string]any {
-	normalized := make([]map[string]any, 0, len(prekeys))
-	for _, item := range prekeys {
-		if item == nil {
-			continue
-		}
-		prekeyID := strings.TrimSpace(fmt.Sprint(item["prekey_id"]))
-		publicKey := strings.TrimSpace(fmt.Sprint(item["public_key"]))
-		signature := strings.TrimSpace(fmt.Sprint(item["signature"]))
-		if prekeyID == "" || publicKey == "" || signature == "" {
-			continue
-		}
-		candidate := copyMapShallow(item)
-		candidate["prekey_id"] = prekeyID
-		candidate["public_key"] = publicKey
-		candidate["signature"] = signature
-		deviceID := strings.TrimSpace(fmt.Sprint(candidate["device_id"]))
-		candidate["device_id"] = deviceID
-		certFingerprint := strings.TrimSpace(strings.ToLower(fmt.Sprint(candidate["cert_fingerprint"])))
-		if certFingerprint != "" {
-			candidate["cert_fingerprint"] = certFingerprint
-		} else {
-			delete(candidate, "cert_fingerprint")
-		}
-		normalized = append(normalized, candidate)
-	}
-	if len(normalized) == 0 {
-		return nil
-	}
-	if len(normalized) == 1 {
-		if strings.TrimSpace(fmt.Sprint(normalized[0]["device_id"])) == "" {
-			normalized[0]["device_id"] = prekeyFallbackDeviceID
-		}
-		return normalized
-	}
-	filtered := make([]map[string]any, 0, len(normalized))
-	seen := make(map[string]bool)
-	for _, item := range normalized {
-		deviceID := strings.TrimSpace(fmt.Sprint(item["device_id"]))
-		if deviceID == "" || deviceID == prekeyFallbackDeviceID || seen[deviceID] {
-			continue
-		}
-		seen[deviceID] = true
-		filtered = append(filtered, item)
-	}
-	return filtered
-}
-
-func parsePeerPrekeyResponse(peerAID string, result any, callErr error) (map[string]any, error) {
-	if callErr != nil {
-		return nil, NewValidationError(fmt.Sprintf("failed to fetch peer prekey for %s: %v", peerAID, callErr))
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok || resultMap == nil {
-		return nil, NewValidationError(fmt.Sprintf("invalid prekey response for %s", peerAID))
-	}
-	found, ok := resultMap["found"].(bool)
-	if !ok {
-		return nil, NewValidationError(fmt.Sprintf("invalid prekey response for %s", peerAID))
-	}
-	if !found {
-		return nil, NewNotFoundError(fmt.Sprintf("peer prekey not found for %s", peerAID))
-	}
-	prekey, ok := extractPeerPrekeyMaterial(resultMap["prekey"])
-	if !ok {
-		return nil, NewValidationError(fmt.Sprintf("invalid prekey response for %s", peerAID))
-	}
-	return prekey, nil
-}
-
-func extractConsumedPrekeyID(message map[string]any) string {
-	if message == nil {
-		return ""
-	}
-	e2ee, ok := message["e2ee"].(map[string]any)
-	if !ok || e2ee == nil {
-		return ""
-	}
-	mode, _ := e2ee["encryption_mode"].(string)
-	if mode != ModePrekeyECDHV2 {
-		return ""
-	}
-	prekeyID, _ := e2ee["prekey_id"].(string)
-	return strings.TrimSpace(prekeyID)
-}
-
-func (c *AUNClient) schedulePrekeyReplenishIfConsumed(message map[string]any) {
-	prekeyID := extractConsumedPrekeyID(message)
-	if prekeyID == "" {
-		return
-	}
-
-	c.mu.Lock()
-	// 只有活跃 prekey 被消费时才触发上传。历史 prekey 被消费不触发，避免上传风暴。
-	if c.state != StateConnected || c.activePrekeyID == "" || prekeyID != c.activePrekeyID {
-		c.mu.Unlock()
-		return
-	}
-	// 清空活跃标记，防止重复触发（新上传完成后会设新的 active）
-	c.activePrekeyID = ""
-	c.mu.Unlock()
-
-	go func() {
-		if err := c.uploadPrekey(context.Background()); err != nil {
-			c.logE2.Warn("replenishing current prekey after consuming %s failed: %v", prekeyID, err)
-		}
-	}()
-}
-
 // buildCertURL 构建证书下载 URL
 func buildCertURL(gatewayURL, aid, certFingerprint string) string {
 	parsed, err := url.Parse(gatewayURL)
@@ -8351,49 +4335,6 @@ func sleepWithCancel(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-timer.C:
 	}
-}
-
-// stringSliceContains 检查字符串切片是否包含指定元素
-func stringSliceContains(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
-}
-
-// extractAIDsFromMembers 从成员列表中提取 AID 列表
-func extractAIDsFromMembers(membersList []any) []string {
-	var aids []string
-	for _, item := range membersList {
-		if m, ok := item.(map[string]any); ok {
-			if aid, ok := m["aid"].(string); ok {
-				aids = append(aids, aid)
-			}
-		}
-	}
-	return aids
-}
-
-func sortedStringListFromAny(value any) []string {
-	result := make([]string, 0)
-	switch v := value.(type) {
-	case []string:
-		for _, item := range v {
-			if s := strings.TrimSpace(item); s != "" {
-				result = append(result, s)
-			}
-		}
-	case []any:
-		for _, item := range v {
-			if s := strings.TrimSpace(stringFromAny(item)); s != "" {
-				result = append(result, s)
-			}
-		}
-	}
-	sort.Strings(result)
-	return result
 }
 
 // CreateNamedGroup 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，

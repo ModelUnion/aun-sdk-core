@@ -289,6 +289,8 @@ class RPCTransport:
                 "event recv: event=%s %s",
                 sdk_event, _summarize_dict(params, _DIAG_RESULT_FIELDS),
             )
+            if "v2" in sdk_event:
+                self._log.info("transport", "DEBUG: V2 event arrived at transport: %s params_keys=%s", sdk_event, list(params.keys()) if isinstance(params, dict) else "?")
             # 推送事件解耦：事件分发在后台 task 里跑，避免阻塞 reader 读取后续 ws 帧
             # （否则 handler 内的解密/keystore 查询会卡住 RPC 响应的 future 唤醒，导致 RPC timeout）
             asyncio.create_task(self._dispatcher.publish(f"_raw.{sdk_event}", params))

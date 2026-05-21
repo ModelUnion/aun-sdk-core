@@ -15,7 +15,6 @@ import { RPCTransport } from '../../src/transport.js';
 import { EventDispatcher } from '../../src/events.js';
 import { AUNLogger } from '../../src/logger.js';
 import { ConnectionError, StateError } from '../../src/errors.js';
-import { E2EEManager } from '../../src/e2ee.js';
 import { certificateSha256Fingerprint } from '../../src/crypto.js';
 
 // ── Mock WebSocket ────────────────────────────────────────
@@ -161,10 +160,6 @@ describe('ISSUE-SDK-TS-002: listIdentities() 方法', () => {
 // ══════════════════════════════════════════════════════════════
 
 describe('ISSUE-SDK-TS-008: 证书指纹计算统一', () => {
-  it('E2EEManager.fingerprintCertPem 导出可用', () => {
-    expect(typeof E2EEManager.fingerprintCertPem).toBe('function');
-  });
-
   it('keystore/file.ts 使用统一的指纹计算（通过 certificateSha256Fingerprint）', () => {
     // 验证 crypto.ts 中存在并导出了 certificateSha256Fingerprint
     expect(typeof certificateSha256Fingerprint).toBe('function');

@@ -661,8 +661,10 @@ export class AuthNamespace {
       );
     }
     const text = await response.text();
-    const etag = String(response.headers.get('ETag') ?? '').trim();
-    const lastModified = String(response.headers.get('Last-Modified') ?? '').trim();
+    // headers 在某些 fake response（测试 mock）下可能缺失，做一次容错处理。
+    const respHeaders = response.headers;
+    const etag = respHeaders ? String(respHeaders.get('ETag') ?? '').trim() : '';
+    const lastModified = respHeaders ? String(respHeaders.get('Last-Modified') ?? '').trim() : '';
     if (etag || lastModified) {
       this._agentMdCache.set(targetAid, { text, etag, lastModified });
     }

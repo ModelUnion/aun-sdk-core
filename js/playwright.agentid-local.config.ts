@@ -1,4 +1,8 @@
 import { defineConfig } from '@playwright/test';
+import { buildChromeHostResolverRules, collectLocalDockerIssuers } from './tests/local-docker.js';
+
+const localDockerIssuers = collectLocalDockerIssuers();
+const hostResolverRules = buildChromeHostResolverRules(localDockerIssuers);
 
 export default defineConfig({
   testDir: './tests/e2e-browser',
@@ -9,6 +13,16 @@ export default defineConfig({
     headless: true,
     ignoreHTTPSErrors: true,
     launchOptions: {
+      env: {
+        HTTP_PROXY: '',
+        HTTPS_PROXY: '',
+        ALL_PROXY: '',
+        http_proxy: '',
+        https_proxy: '',
+        all_proxy: '',
+        NO_PROXY: '*',
+        no_proxy: '*',
+      },
       args: [
         '--disable-web-security',
         '--disable-features=IsolateOrigins,site-per-process',
@@ -16,7 +30,7 @@ export default defineConfig({
         '--no-proxy-server',
         '--proxy-server=direct://',
         '--proxy-bypass-list=*',
-        '--host-resolver-rules=MAP *.agentid.pub 127.0.0.1,MAP agentid.pub 127.0.0.1,EXCLUDE localhost',
+        `--host-resolver-rules=${hostResolverRules}`,
       ],
     },
   },

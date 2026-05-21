@@ -75,10 +75,6 @@ export interface AUNConfig {
   discoveryPort: number | null;
   /** 是否启用群组 E2EE（默认 true） */
   groupE2ee: boolean;
-  /** epoch 自动轮换间隔（秒，0 表示禁用） */
-  epochAutoRotateInterval: number;
-  /** 旧 epoch 保留时间（秒，默认 7 天） */
-  oldEpochRetentionSeconds: number;
   /** 是否验证 SSL 证书（默认 true） */
   verifySsl: boolean;
   /** 是否要求前向保密（默认 true） */
@@ -94,8 +90,6 @@ const DEFAULTS: AUNConfig = {
   seedPassword: null,
   discoveryPort: null,
   groupE2ee: true,
-  epochAutoRotateInterval: 0,
-  oldEpochRetentionSeconds: 604800,
   verifySsl: true,
   requireForwardSecrecy: true,
   replayWindowSeconds: 300,
@@ -123,8 +117,6 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
     ),
     discoveryPort: readOptionalNumber(data.discoveryPort ?? data.discovery_port, DEFAULTS.discoveryPort),
     groupE2ee: true,  // 必备能力，不可配置
-    epochAutoRotateInterval: readOptionalNumber(data.epochAutoRotateInterval ?? data.epoch_auto_rotate_interval, DEFAULTS.epochAutoRotateInterval) ?? DEFAULTS.epochAutoRotateInterval,
-    oldEpochRetentionSeconds: readOptionalNumber(data.oldEpochRetentionSeconds ?? data.old_epoch_retention_seconds, DEFAULTS.oldEpochRetentionSeconds) ?? DEFAULTS.oldEpochRetentionSeconds,
     verifySsl: DEFAULTS.verifySsl,
     requireForwardSecrecy: readBoolean(data.requireForwardSecrecy ?? data.require_forward_secrecy, DEFAULTS.requireForwardSecrecy),
     replayWindowSeconds: readOptionalNumber(data.replayWindowSeconds ?? data.replay_window_seconds, DEFAULTS.replayWindowSeconds) ?? DEFAULTS.replayWindowSeconds,

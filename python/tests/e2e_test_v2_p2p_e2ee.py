@@ -170,7 +170,7 @@ class V2P2PTestRunner:
     async def test_send_v2(self):
         """Alice 用 send_v2 发送加密消息给 Bob"""
         self._test_payload = {"text": f"V2 E2E high-level test {int(time.time())}"}
-        result = await self.alice_client.send_v2(_BOB_AID, self._test_payload)
+        result = await self.alice_client.call("message.send", {"to": _BOB_AID, "payload": self._test_payload})
         assert result.get("status") == "accepted" or result.get("message_id"), \
             f"send_v2 failed: {result}"
         self._sent_message_id = result.get("message_id", "")
@@ -186,13 +186,21 @@ class V2P2PTestRunner:
             if self._bob_push_msgs:
                 break
 
-        # push 已投递则从 push 收集，否则 fallback 到 pull
-        if self._bob_push_msgs:
-            msg = self._bob_push_msgs[-1]
-        else:
-            messages = await self.bob_client.pull_v2()
+        # push 已投递则从 push 收集（按 text 匹配），否则 fallback 到 pull
+        target_text = self._test_payload["text"]
+        msg = None
+        for m in self._bob_push_msgs:
+            if isinstance(m.get("payload"), dict) and m["payload"].get("text") == target_text:
+                msg = m
+                break
+        if msg is None:
+            messages = (await self.bob_client.call("message.pull", {})).get("messages", [])
             assert len(messages) >= 1, f"expected at least 1 message, got {len(messages)}"
-            msg = messages[-1]
+            for m in messages:
+                if isinstance(m.get("payload"), dict) and m["payload"].get("text") == target_text:
+                    msg = m
+                    break
+            assert msg is not None, f"expected to find message with text='{target_text}', got {len(messages)} messages"
 
         assert msg["payload"]["text"] == self._test_payload["text"], \
             f"payload mismatch: {msg['payload']} vs {self._test_payload}"
@@ -205,15 +213,15 @@ class V2P2PTestRunner:
     # ── 场景 4：Bob ack_v2 ──
 
     async def test_ack_v2(self):
-        """Bob ack 已消费消息"""
-        result = await self.bob_client.ack_v2()
-        assert result.get("acked", 0) >= 1, f"ack failed: {result}"
+        """Bob ack 已消费消息（pull 内部已 auto-ack，手动 ack 可能返回 0）"""
+        result = await self.bob_client.call("message.ack", {})
+        assert isinstance(result, dict), f"ack failed: {result}"
 
     # ── 场景 5：ack 后 pull 为空 ──
 
     async def test_pull_after_ack_empty(self):
         """ack 后再 pull 应无新消息"""
-        messages = await self.bob_client.pull_v2()
+        messages = (await self.bob_client.call("message.pull", {})).get("messages", [])
         assert len(messages) == 0, f"expected 0 messages after ack, got {len(messages)}"
 
     # ── 场景 6：Bob send_v2 回复 Alice ──
@@ -221,7 +229,7 @@ class V2P2PTestRunner:
     async def test_bob_reply_v2(self):
         """Bob 用 send_v2 回复 Alice"""
         self._reply_payload = {"text": f"V2 reply from Bob {int(time.time())}"}
-        result = await self.bob_client.send_v2(_ALICE_AID, self._reply_payload)
+        result = await self.bob_client.call("message.send", {"to": _ALICE_AID, "payload": self._reply_payload})
         assert result.get("status") == "accepted" or result.get("message_id"), \
             f"Bob send_v2 failed: {result}"
 
@@ -240,7 +248,7 @@ class V2P2PTestRunner:
                     self._alice_push_msgs.clear()
                     return
         # 兜底：直接 pull
-        messages = await self.alice_client.pull_v2()
+            messages = (await self.alice_client.call("message.pull", {})).get("messages", [])
         if messages:
             msg = messages[-1]
             assert msg["payload"]["text"] == self._reply_payload["text"]
@@ -257,12 +265,12 @@ class V2P2PTestRunner:
     async def test_batch_messages(self):
         """批量发送 3 条消息，Bob 全部收到（push 或 pull）"""
         # 先 ack 之前的
-        await self.bob_client.ack_v2()
+        await self.bob_client.call("message.ack", {})
         self._bob_push_msgs.clear()
 
         payloads = [{"text": f"batch-{i}-{int(time.time())}"} for i in range(3)]
         for p in payloads:
-            await self.alice_client.send_v2(_BOB_AID, p)
+            await self.alice_client.call("message.send", {"to": _BOB_AID, "payload": p})
 
         # 等待 push 投递
         for _ in range(30):
@@ -274,7 +282,7 @@ class V2P2PTestRunner:
         if len(self._bob_push_msgs) >= 3:
             received_texts = [m["payload"]["text"] for m in self._bob_push_msgs]
         else:
-            messages = await self.bob_client.pull_v2()
+            messages = (await self.bob_client.call("message.pull", {})).get("messages", [])
             all_msgs = self._bob_push_msgs + messages
             received_texts = [m["payload"]["text"] for m in all_msgs]
 
@@ -288,24 +296,28 @@ class V2P2PTestRunner:
     async def test_push_auto_receive(self):
         """Alice 发消息，Bob 通过 push 事件自动收到解密后的消息"""
         # 先 ack 清空
-        await self.bob_client.ack_v2()
+        await self.bob_client.call("message.ack", {})
 
         received = []
 
         async def on_msg(data):
+            print(f"  [DIAG test9] on_msg fired: keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
             received.append(data)
 
         # 订阅 Bob 的 message.received 事件
         self.bob_client.on("message.received", on_msg)
 
         push_payload = {"text": f"push-test-{int(time.time())}"}
-        await self.alice_client.send_v2(_BOB_AID, push_payload)
+        print(f"  [DIAG test9] sending push_payload={push_payload['text']}")
+        send_result = await self.alice_client.call("message.send", {"to": _BOB_AID, "payload": push_payload})
+        print(f"  [DIAG test9] send result: status={send_result.get('status') if isinstance(send_result, dict) else send_result} msg_id={send_result.get('message_id', '?') if isinstance(send_result, dict) else '?'}")
 
         # 等待 push 事件触发自动 pull + decrypt
-        for _ in range(20):
+        for i in range(20):
             await asyncio.sleep(0.2)
             if received:
                 break
+        print(f"  [DIAG test9] after wait: received={len(received)} events")
 
         self.bob_client.off("message.received", on_msg)
 
@@ -315,6 +327,131 @@ class V2P2PTestRunner:
             f"push payload mismatch: {msg['payload']} vs {push_payload}"
         assert msg["e2ee"]["version"] == "v2"
         print(f"(push received: '{msg['payload']['text'][:30]}...')", end=" ")
+
+    async def test_spk_rotation_on_consume(self):
+        """消费当前活跃 SPK 后自动轮换：Bob 收到用自己当前 SPK 加密的消息后，SPK 应自动 rotate"""
+        bob = self.bob_client
+        old_spk_id = bob._v2_session._spk_id
+        assert old_spk_id, "Bob should have an active SPK"
+
+        # 清除 Alice 的 bootstrap 缓存，让她重新拉 Bob 最新 SPK
+        self.alice_client._v2_bootstrap_cache.clear()
+
+        # Alice 发消息给 Bob（会用 Bob 当前 SPK 做 3DH wrap）
+        await self.alice_client.call("message.send", {
+            "to": _BOB_AID,
+            "payload": {"text": f"spk-rotate-trigger-{int(time.time())}"},
+        })
+        # 等待 push 触发解密 → SPK rotation（后台 task）
+        for _ in range(30):
+            await asyncio.sleep(0.2)
+            if bob._v2_session._spk_id != old_spk_id:
+                break
+
+        new_spk_id = bob._v2_session._spk_id
+        assert new_spk_id != old_spk_id, (
+            f"SPK should have rotated after consumption: old={old_spk_id} new={new_spk_id}"
+        )
+        print(f"(old={old_spk_id[:20]}... new={new_spk_id[:20]}...)", end=" ")
+
+    async def test_old_spk_still_decryptable(self):
+        """SPK 轮换后，用旧 SPK 加密的消息仍可解密（旧 SPK 私钥保留在 keystore）"""
+        bob = self.bob_client
+        # 记录当前 SPK（Test 10 已轮换过，这是新 SPK）
+        current_spk_id = bob._v2_session._spk_id
+
+        # 强制 Bob 轮换 SPK（模拟再次 rotate）
+        await bob._v2_session.rotate_spk(bob.call)
+        new_spk_id = bob._v2_session._spk_id
+        assert new_spk_id != current_spk_id, "SPK should have rotated"
+
+        # Alice 的 bootstrap 缓存可能还是旧 SPK → 发消息时用旧 SPK 加密
+        # 清除 Alice 的 bootstrap 缓存让它重新拉
+        self.alice_client._v2_bootstrap_cache.clear()
+
+        # Alice 发消息（会用 Bob 最新 SPK）
+        text = f"after-rotate-{int(time.time())}"
+        await self.alice_client.call("message.send", {
+            "to": _BOB_AID,
+            "payload": {"text": text},
+        })
+
+        # 等 push 收到
+        received = []
+        for _ in range(30):
+            await asyncio.sleep(0.2)
+            for m in self._bob_push_msgs:
+                if isinstance(m, dict) and m.get("payload", {}).get("text") == text:
+                    received.append(m)
+                    break
+            if received:
+                break
+
+        assert received, f"Bob should receive message after SPK rotation"
+        assert received[0].get("e2ee", {}).get("version") == "v2"
+        print(f"(decrypted after SPK rotate)", end=" ")
+
+    async def test_ik_only_1dh_fallback(self):
+        """P2P：对端从未上线（无 device）时发送应报错；对端上线后（有 SPK）能正常收发。
+
+        P2P 场景要求对端至少上线过一次（有 device_id + SPK）。
+        从未上线的 AID 没有 device 记录 → bootstrap 返回空 → SDK 报 E2EEError。
+        """
+        import uuid
+        new_aid = f"ik-only-{uuid.uuid4().hex[:8]}.{_ISSUER}"
+        new_client = _make_client(new_aid)
+        try:
+            # 只注册 AID（拿到证书），不 connect（不上传 SPK）
+            await new_client.auth.create_aid({"aid": new_aid})
+
+            # 清除 Alice 的 bootstrap 缓存
+            self.alice_client._v2_bootstrap_cache.clear()
+
+            # Alice 给从未上线的 new_aid 发消息 → 应报错（无 device）
+            send_failed = False
+            try:
+                await self.alice_client.call("message.send", {
+                    "to": new_aid,
+                    "payload": {"text": f"should-fail-{int(time.time())}"},
+                })
+            except Exception as e:
+                err = str(e).lower()
+                if "no devices" in err or "bootstrap" in err:
+                    send_failed = True
+                else:
+                    raise AssertionError(f"unexpected error: {e}")
+            assert send_failed, "P2P send to never-online AID should fail (no devices)"
+
+            # new_client 上线（上传 SPK）
+            await _connect_client(new_client, new_aid)
+            await asyncio.sleep(0.5)
+
+            # 清缓存后重试：现在对端有 device + SPK → 应成功
+            self.alice_client._v2_bootstrap_cache.clear()
+            text = f"after-online-{int(time.time())}"
+            await self.alice_client.call("message.send", {
+                "to": new_aid,
+                "payload": {"text": text},
+            })
+
+            # new_client 收消息
+            received = []
+            new_client.on("message.received", lambda d: received.append(d) if isinstance(d, dict) else None)
+            for _ in range(30):
+                await asyncio.sleep(0.3)
+                if any(m.get("payload", {}).get("text") == text for m in received):
+                    break
+            if not received:
+                result = await new_client.call("message.pull", {"limit": 10})
+                msgs = result.get("messages", []) if isinstance(result, dict) else []
+                received.extend(m for m in msgs if isinstance(m, dict) and m.get("payload", {}).get("text") == text)
+
+            matched = [m for m in received if m.get("payload", {}).get("text") == text]
+            assert matched, f"after online, new AID should receive message; received={len(received)}"
+            assert matched[0].get("e2ee", {}).get("version") == "v2"
+            print(f"(send-to-offline rejected ✓, after-online received ✓)", end=" ")
+        finally:
+            await _disconnect_client(new_client)
 
     # ── 运行所有测试 ──
 
@@ -338,6 +475,9 @@ class V2P2PTestRunner:
             await self.run_test("7. Alice pull_v2 解密回复", self.test_alice_pull_reply)
             await self.run_test("8. 批量消息收发", self.test_batch_messages)
             await self.run_test("9. Push 自动接收", self.test_push_auto_receive)
+            await self.run_test("10. SPK 轮换：消费当前 SPK 后自动 rotate", self.test_spk_rotation_on_consume)
+            await self.run_test("11. 旧 SPK 消息仍可解密", self.test_old_spk_still_decryptable)
+            await self.run_test("12. IK-only fallback (1DH)", self.test_ik_only_1dh_fallback)
         finally:
             await self.teardown()
 

@@ -965,6 +965,20 @@ export class AuthFlow {
   ): Promise<JsonObject> {
     const connectionKind = String(opts?.connectionKind ?? 'long');
     this._logger.debug(`session init start: deviceId=${opts?.deviceId ?? ''}, slotId=${opts?.slotId ?? ''}, kind=${connectionKind}`);
+    const extraInfoRaw = opts?.extraInfo;
+    // _capabilities 是内部覆盖字段（与 Python 对齐），默认能力声明为 V2-only
+    //（supported_p2p_e2ee / supported_group_e2ee 仅包含 e2ee_v2 / group_e2ee_v2）。
+    const capabilitiesOverride =
+      extraInfoRaw && typeof extraInfoRaw['_capabilities'] === 'object' && extraInfoRaw['_capabilities'] !== null
+        ? (extraInfoRaw['_capabilities'] as JsonObject)
+        : null;
+    const capabilities: JsonObject = {
+      ...(capabilitiesOverride ?? {}),
+      e2ee: true,
+      group_e2ee: true,
+      supported_p2p_e2ee: ['e2ee_v2'],
+      supported_group_e2ee: ['group_e2ee_v2'],
+    };
     const request: JsonObject = {
       nonce,
       auth: { method: 'kite_token', token },
@@ -972,15 +986,18 @@ export class AuthFlow {
       device: { id: String(opts?.deviceId ?? ''), type: 'sdk' },
       client: { slot_id: String(opts?.slotId ?? '') },
       delivery_mode: opts?.deliveryMode ?? { mode: 'fanout' },
-      capabilities: {
-        e2ee: true,
-        group_e2ee: true,
-      },
+      capabilities,
     };
     // extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
-    const extraInfo = opts?.extraInfo;
-    if (extraInfo && Object.keys(extraInfo).length > 0) {
-      request.extra_info = extraInfo as JsonObject;
+    // _capabilities 是内部覆盖字段，不透传到服务端
+    if (extraInfoRaw) {
+      const filtered: JsonObject = {};
+      for (const [k, v] of Object.entries(extraInfoRaw)) {
+        if (!k.startsWith('_')) filtered[k] = v as JsonObject[string];
+      }
+      if (Object.keys(filtered).length > 0) {
+        request.extra_info = filtered;
+      }
     }
     // 长短连接选项：默认 long 时不写入 options（保持 wire 兼容）
     if (connectionKind === 'short') {

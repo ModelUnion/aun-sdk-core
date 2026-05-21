@@ -132,13 +132,41 @@ export class SeqTracker {
     return true;
   }
 
-  /** pull 返回后更新 tracker 状态 */
-  onPullResult(ns: string, messages: JsonObject[]): void {
+  /** pull 返回后更新 tracker 状态。
+   *
+   * afterSeq: pull 请求使用的 after_seq 参数。如果等于当前 contiguousSeq（gap fill 场景），
+   * 直接把 pull 到的最大 seq 作为新的 contiguousSeq——服务端返回的就是当前可用的全部消息，
+   * 中间的空洞是永久性的（竞态跳跃/未持久化/过期清理），不应阻塞后续消息投递。
+   */
+  onPullResult(ns: string, messages: JsonObject[], afterSeq?: number): void {
     const t = this._get(ns);
     const pulledSeqs = new Set<number>();
     for (const m of messages) {
       const s = typeof m.seq === 'number' && m.seq > 0 ? m.seq : m.event_seq;
       if (typeof s === 'number' && s > 0) pulledSeqs.add(s);
+    }
+
+    // 将 pulled 的 seq 加入 receivedSeqs
+    for (const s of pulledSeqs) {
+      t.receivedSeqs.add(s);
+    }
+
+    // gap fill 场景：从 contiguousSeq 开始 pull，直接推进到 pull 返回的最大 seq
+    if (pulledSeqs.size > 0 && afterSeq !== undefined && afterSeq === t.contiguousSeq) {
+      const maxPulled = Math.max(...pulledSeqs);
+      if (maxPulled > t.contiguousSeq) {
+        t.contiguousSeq = maxPulled;
+        // 清理被跳过区间内的 pendingGaps
+        for (const [key, probe] of t.pendingGaps) {
+          if (probe.gapEnd <= t.contiguousSeq) {
+            t.pendingGaps.delete(key);
+          }
+        }
+        // 清理 receivedSeqs 中 <= contiguousSeq 的条目
+        for (const s of t.receivedSeqs) {
+          if (s <= t.contiguousSeq) t.receivedSeqs.delete(s);
+        }
+      }
     }
 
     const now = nowMs();
@@ -148,19 +176,13 @@ export class SeqTracker {
       probe.probeCount += 1;
 
       let allCovered = true;
-      let anyHit = false;
       for (let s = probe.gapStart; s <= probe.gapEnd; s++) {
-        if (pulledSeqs.has(s)) { anyHit = true; }
-        else { allCovered = false; }
+        if (!pulledSeqs.has(s)) { allCovered = false; break; }
       }
       if (allCovered) {
         probe.resolved = true;
       }
       // S2: 不再因 probeCount >= 3 自动 resolved；仅由完整补齐 / 服务端 tombstone 驱动。
-    }
-
-    for (const s of pulledSeqs) {
-      t.receivedSeqs.add(s);
     }
 
     if (pulledSeqs.size) {

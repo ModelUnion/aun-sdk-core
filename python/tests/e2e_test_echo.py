@@ -73,8 +73,23 @@ async def _ensure_connected(client: AUNClient, aid: str) -> None:
                 connect_params["slot_id"] = slot_id
             connect_params["auto_reconnect"] = False
             await client.connect(connect_params)
-            # 短暂等待连接稳定
-            await asyncio.sleep(2)
+            # 清空旧 V2 inbox（ack 到最大 seq），避免历史 gap 卡住 ordered queue
+            try:
+                result = await client.call("message.v2.pull", {"after_seq": 0, "limit": 200})
+                msgs = result.get("messages", [])
+                if msgs:
+                    max_seq = max(m.get("seq", 0) for m in msgs)
+                    await client.call("message.v2.ack", {"up_to_seq": max_seq})
+                    if aid and client._aid:
+                        ns = f"p2p:{client._aid}"
+                        tracker = client._seq_tracker._get(ns)
+                        tracker.contiguous_seq = max_seq
+                        tracker.max_seen_seq = max_seq
+                        tracker.received_seqs.clear()
+                        tracker.pending_gaps.clear()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
             return
         except (AuthError, RateLimitError) as exc:
             if attempt >= 3:

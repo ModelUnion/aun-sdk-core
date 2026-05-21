@@ -159,6 +159,30 @@ export class V2KeyStore {
     });
   }
 
+  async listExpiredSPKIds(deviceId: string, maxAgeMs: number): Promise<string[]> {
+    const cutoff = Date.now() - maxAgeMs;
+    return new Promise((resolve, reject) => {
+      const idx = this.store('readonly').index(V2_INDEX_BY_DEVICE_TYPE_CREATED);
+      const range = IDBKeyRange.bound(
+        [deviceId, 'spk', -Infinity],
+        [deviceId, 'spk', cutoff],
+        false, true,
+      );
+      const req = idx.openCursor(range);
+      const out: string[] = [];
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (cursor) {
+          out.push((cursor.value as V2KeyRecord).key_id);
+          cursor.continue();
+        } else {
+          resolve(out);
+        }
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   // ---------- IK ----------
 
   async saveIK(deviceId: string, priv: Uint8Array, pubDer: Uint8Array): Promise<void> {

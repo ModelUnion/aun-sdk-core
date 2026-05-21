@@ -508,17 +508,20 @@ class AuthFlow:
             "device": {"id": str(device_id or ""), "type": "sdk"},
             "client": {"slot_id": str(slot_id or "")},
             "delivery_mode": delivery_mode or {"mode": "fanout"},
-            "capabilities": {
+            "capabilities": (extra_info or {}).get("_capabilities") or {
                 "e2ee": True,
                 "group_e2ee": True,
-                # AUN E2EE V2: 上报支持的加密协议版本
-                "supported_p2p_e2ee": ["e2ee", "e2ee_v2"],
-                "supported_group_e2ee": ["group_e2ee", "group_e2ee_v2"],
+                # AUN E2EE V2: 默认仅声明 V2 能力（V2-only 客户端）
+                "supported_p2p_e2ee": ["e2ee_v2"],
+                "supported_group_e2ee": ["group_e2ee_v2"],
             },
         }
         # extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
         if extra_info:
-            request["extra_info"] = extra_info
+            # _capabilities 是内部覆盖字段，不透传到服务端
+            ei = {k: v for k, v in extra_info.items() if not k.startswith("_")}
+            if ei:
+                request["extra_info"] = ei
         # 长短连接选项：默认 long 时不写入 options（保持 wire 兼容）
         if connection_kind == "short":
             options: dict[str, Any] = {"kind": "short"}

@@ -22,6 +22,7 @@
 | 10 | [10-Group-子协议.md](10-Group-子协议.md) | `group.*` 群组管理、群消息、邀请码、资源共享、在线状态 |
 | 11 | [11-Storage-子协议.md](11-Storage-子协议.md) | `storage.*` 对象存储、大文件上传下载、预签名 URL |
 | 12 | [12-Stream-子协议.md](12-Stream-子协议.md) | `stream.*` 实时流式传输、WebSocket 推流、HTTP SSE 拉流、跨域拉流 |
+| 15 | [15-离线推送通知协议.md](15-离线推送通知协议.md) | `push.*` 离线推送、push_notify_aid 代理、事件通知 + 背压 ack、白名单与去重 |
 
 **附录**：A-术语表 | B-扩展性 | C-私钥管理 | D-Root CA 治理 | E-Root CA 准入 | F-Issuer CA 申请 | G-孤儿 AID | H-Auth 实现 | I-跨域消息路由 | J-客户端接入 | K-Agent Web | L-E2EE 实现 | M-JWT 实现
 
@@ -61,6 +62,12 @@
 | 推流（WebSocket） | 12 §12.6 推流端点 |
 | 拉流（HTTP SSE） | 12 §12.6 拉流端点 |
 | 跨域拉流 | 12 §12.7 |
+| 离线推送通知 | 15 |
+| push_notify_aid 推送代理 | 15 §2, §10.1 |
+| push_token 鉴权 | 15 §10 |
+| 推送背压与 in-flight | 15 §5 |
+| 推送去重与频控 | 15 §8.2, §8.4 |
+| 跨域推送 | 15 §7 |
 | 错误码 | 07 §7.1 |
 | 连接状态机 | 07 §7.3 |
 | 威胁模型与安全 | 09 |
@@ -112,3 +119,6 @@ Gateway 模式定位与职责、Gateway 发现机制、连接时序（auth.* →
 
 ### 12-Stream-子协议
 `stream.*` 命名空间完整协议规范。控制面通过 JSON-RPC（stream.create / close / get_info / list_active）管理流生命周期，数据面通过独立端口的 WebSocket（推流）和 HTTP SSE（拉流）传输。当前实现以 push/pull URL 中的 token 作为能力凭证，拉流可跨域使用，并支持 Late Joiner 回放、Last-Event-ID 断线续拉、空闲/离线超时自动关闭。
+
+### 15-离线推送通知协议
+目标 AID 全部设备离线时的推送机制。push_notify_aid 作为普通客户端 AID 连接 Gateway，通过 `event/push.offline_message` 事件接收推送摘要（仅元数据，不含正文），处理后回 `push.ack` RPC 释放 in-flight 槽位（默认 max_in_flight=1 串行确认，30s 超时不重试）。聚合机制：同一 target_aid 60s 冷却期内合并为一条推送（unread_count++、senders 去重追加）。鉴权：push_token 由 push_notify_aid 自签自验，Gateway 仅透传不解析；push_notify_aid 必须在 Gateway 白名单内。跨域：推送由目标 AID 所属域的 Gateway 触发，push_notify_aid 必须与目标 AID 同域。

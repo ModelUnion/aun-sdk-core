@@ -1,0 +1,68 @@
+{
+  "description": "P2P multi-recipient (Bob 3DH + Alice-2 1DH self-sync)",
+  "envelope": {
+    "type": "e2ee.p2p_encrypted",
+    "version": "v2",
+    "suite": "P256_HKDF_SHA256_AES_256_GCM",
+    "msg_type": "original",
+    "t_send": 1710504000000,
+    "t_supplement": null,
+    "t_server": null,
+    "nonce": "N2S3Rg30iBGMZ1sZ",
+    "ciphertext": "taTCZMEWqy+cipMyHwLYFOpNsobZ1ZkrjjtPJiU5aOSvgFYmT94ePX8=",
+    "tag": "2Z01XFqNvPCBJ5qVzDBz1Q==",
+    "sender_signature": "ABuwWLK2naSrx9qgMVCBSgVuphBVbA61b4BRoPow2ns868DTu0Ky5V1DevtCsTwSztcBJi0ervvaAjjZzOKE/Q==",
+    "sender_cert_fingerprint": "sha256:6bf6b248a19e5777",
+    "sender_session_pk": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEMbYHjgIWKvZW2KlUDhWna5UmvZUxhYTgZSk2JVoiZry34M/REKzUOu+Jzh6xoizlTvljNRFk88cLV7Nc2q+eQQ==",
+    "recipients_digest": "e5f24d2dffc5296e51b712200d0d454238d4388ce72aaef9b434499a73f59954",
+    "recipients": [
+      [
+        "alice.aid.com",
+        "dev-alice-2",
+        "self_sync",
+        "peer_device_prekey",
+        "sha256:e4498347b287d19c",
+        "",
+        "zsieWRaN6X6S9TWx",
+        "KQtDT0kXVCt7nSr0eJL8FNI/20OKMd8scf++hithqu6Rulf8uxZENz0uNS8AWZ0O"
+      ],
+      [
+        "bob.aid.com",
+        "dev-bob-1",
+        "peer",
+        "peer_device_prekey",
+        "sha256:b788f533b9358b48",
+        "sha256:bob_spk_1",
+        "CI1sD96ZwSskWtGx",
+        "6wlaTaimO8eIjPRfiqpJawYTnU1BdnE2JHvk27pz/h+srrV2yltN7Dreqz7xyq4i"
+      ]
+    ],
+    "aad": {
+      "from": "alice.aid.com",
+      "from_device": "dev-alice-1",
+      "to": "bob.aid.com",
+      "message_id": "m-test-multi-001",
+      "timestamp": 1710504000000,
+      "suite": "P256_HKDF_SHA256_AES_256_GCM",
+      "wrap_protocol": "1DH+3DH"
+    }
+  },
+  "decryption_inputs_bob": {
+    "self_aid": "bob.aid.com",
+    "self_device_id": "dev-bob-1",
+    "self_ik_priv_b64": "kucXls+1l1JEL84puz+hIVGNMQpaBu2GVO1FSAC1Gpg=",
+    "self_spk_priv_b64": "YSJfT/BHTE6J9sDXN495hou7PdjbRqBMLvi46W0NSI4=",
+    "sender_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w=="
+  },
+  "decryption_inputs_alice2": {
+    "self_aid": "alice.aid.com",
+    "self_device_id": "dev-alice-2",
+    "self_ik_priv_b64": "90MdEDhLSFBux7S2xNkl76QhMr42LY3gMr6ccoVMjwc=",
+    "self_spk_priv_b64": null,
+    "sender_pub_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDU8HhWlb8vRbPSiisDf/jOfGz72hFuyLcJ/+EGJM4fu6KPzKFPAGPWe+QTjqUKmklvGNk9BlKYnCRYM+hwyT1w=="
+  },
+  "expected_payload": {
+    "text": "Multi-recipient",
+    "to_devices": 2
+  }
+}

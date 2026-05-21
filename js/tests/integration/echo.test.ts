@@ -25,11 +25,16 @@ const AUN_DATA_ROOT = (process.env.AUN_DATA_ROOT ?? '').trim();
 
 const TEST_AUN_PATH = (process.env.AUN_TEST_AUN_PATH ?? (() => {
   if (AUN_DATA_ROOT) return `${AUN_DATA_ROOT}/single-domain/persistent`;
-  return './.aun_test';
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'aun-echo-'));
 })()).trim();
 
-const ALICE_AID = process.env.AUN_TEST_ALICE_AID ?? `alice.${ISSUER}`;
-const BOBB_AID = process.env.AUN_TEST_BOB_AID ?? `bobb.${ISSUER}`;
+function testAids(): { aliceAid: string; bobAid: string } {
+  const runId = rid();
+  return {
+    aliceAid: process.env.AUN_TEST_ALICE_AID ?? `echo-a-${runId}.${ISSUER}`,
+    bobAid: process.env.AUN_TEST_BOB_AID ?? `echo-b-${runId}.${ISSUER}`,
+  };
+}
 
 function rid(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 8);
@@ -37,7 +42,7 @@ function rid(): string {
 
 function makeClient(tag: string): AUNClient {
   const client = new AUNClient({ aun_path: TEST_AUN_PATH }, false);
-  (client as any)._configModel.requireForwardSecrecy = false;
+  (client as any).configModel.requireForwardSecrecy = false;
   (client as any)._testSlotId = `echo-${tag}-${rid()}`;
   return client;
 }
@@ -75,12 +80,13 @@ afterEach(async () => {
 describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
 
   it('P2P 明文 echo 消息包含完整 trace 链', async () => {
+    const { aliceAid, bobAid } = testAids();
     const alice = makeClient('alice-echo');
     const bob = makeClient('bob-echo');
     clients.push(alice, bob);
 
-    await connectClient(alice, ALICE_AID);
-    await connectClient(bob, BOBB_AID);
+    await connectClient(alice, aliceAid);
+    await connectClient(bob, bobAid);
 
     const received: any[] = [];
     const event = new Promise<void>((resolve) => {
@@ -92,7 +98,7 @@ describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
 
     const echoText = `echo 测试-${rid()}`;
     await alice.call('message.send', {
-      to: BOBB_AID,
+      to: bobAid,
       payload: { type: 'text', text: echoText },
       encrypt: false,
     });
@@ -108,12 +114,13 @@ describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
   });
 
   it('加密消息不包含 echo trace', async () => {
+    const { aliceAid, bobAid } = testAids();
     const alice = makeClient('alice-noecho');
     const bob = makeClient('bob-noecho');
     clients.push(alice, bob);
 
-    await connectClient(alice, ALICE_AID);
-    await connectClient(bob, BOBB_AID);
+    await connectClient(alice, aliceAid);
+    await connectClient(bob, bobAid);
 
     const received: any[] = [];
     const event = new Promise<void>((resolve) => {
@@ -124,7 +131,7 @@ describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
     });
 
     await alice.call('message.send', {
-      to: BOBB_AID,
+      to: bobAid,
       payload: { type: 'text', text: `echo 加密-${rid()}` },
       encrypt: true,
     });
@@ -136,12 +143,13 @@ describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
   });
 
   it('非 echo 明文消息不包含 trace', async () => {
+    const { aliceAid, bobAid } = testAids();
     const alice = makeClient('alice-normal');
     const bob = makeClient('bob-normal');
     clients.push(alice, bob);
 
-    await connectClient(alice, ALICE_AID);
-    await connectClient(bob, BOBB_AID);
+    await connectClient(alice, aliceAid);
+    await connectClient(bob, bobAid);
 
     const received: any[] = [];
     const event = new Promise<void>((resolve) => {
@@ -152,7 +160,7 @@ describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
     });
 
     await alice.call('message.send', {
-      to: BOBB_AID,
+      to: bobAid,
       payload: { type: 'text', text: `普通消息-${rid()}` },
       encrypt: false,
     });
@@ -164,12 +172,13 @@ describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
   });
 
   it('Echo trace 顺序正确', async () => {
+    const { aliceAid, bobAid } = testAids();
     const alice = makeClient('alice-order');
     const bob = makeClient('bob-order');
     clients.push(alice, bob);
 
-    await connectClient(alice, ALICE_AID);
-    await connectClient(bob, BOBB_AID);
+    await connectClient(alice, aliceAid);
+    await connectClient(bob, bobAid);
 
     const received: any[] = [];
     const event = new Promise<void>((resolve) => {
@@ -180,7 +189,7 @@ describe('Echo 链路追踪 E2E (JS)', { timeout: 60_000 }, () => {
     });
 
     await alice.call('message.send', {
-      to: BOBB_AID,
+      to: bobAid,
       payload: { type: 'text', text: `echo order-${rid()}` },
       encrypt: false,
     });

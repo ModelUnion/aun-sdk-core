@@ -112,17 +112,15 @@ describe('connection_kind 长短连接', () => {
     (client as any)._transport = { call: vi.fn().mockResolvedValue({}) };
     const startHeartbeat = vi.spyOn(client as any, '_startHeartbeat').mockImplementation(() => {});
     const startTokenRefresh = vi.spyOn(client as any, '_startTokenRefresh').mockImplementation(() => {});
-    const startPrekeyRefresh = vi.spyOn(client as any, '_startPrekeyRefresh').mockImplementation(() => {});
-    const startGroupEpochTasks = vi.spyOn(client as any, '_startGroupEpochTasks').mockImplementation(() => {});
 
     (client as any)._startBackgroundTasks();
 
     expect(startHeartbeat).toHaveBeenCalled();
     expect(startTokenRefresh).toHaveBeenCalled();
+    expect((client as any)._startPrekeyRefresh).toBeUndefined();
+    expect((client as any)._startGroupEpochTasks).toBeUndefined();
     startHeartbeat.mockRestore();
     startTokenRefresh.mockRestore();
-    startPrekeyRefresh.mockRestore();
-    startGroupEpochTasks.mockRestore();
   });
 
   // 9. 短连接不改变 auto_reconnect 默认值

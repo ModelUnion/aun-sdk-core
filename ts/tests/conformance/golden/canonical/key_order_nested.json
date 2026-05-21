@@ -1,0 +1,11 @@
+{
+  "description": "canonical_json input",
+  "input": {
+    "z": {
+      "b": 2,
+      "a": 1
+    },
+    "a": 0
+  },
+  "expected_output_b64": "eyJhIjowLCJ6Ijp7ImEiOjEsImIiOjJ9fQ=="
+}

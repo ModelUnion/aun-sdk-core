@@ -162,6 +162,32 @@ function p1363ToDer(p1363: Uint8Array): Uint8Array {
   return der;
 }
 
+/** 将 DER 格式 ECDSA 签名转为 IEEE P1363。 */
+function derToP1363(der: Uint8Array, coordLen = 32): Uint8Array {
+  if (der[0] !== 0x30) throw new Error('invalid DER signature: missing SEQUENCE');
+  let offset = 2;
+  if (der[1] & 0x80) {
+    const lenBytes = der[1] & 0x7f;
+    offset = 2 + lenBytes;
+  }
+  if (der[offset] !== 0x02) throw new Error('invalid DER signature: missing r');
+  const rLen = der[offset + 1];
+  let r = der.slice(offset + 2, offset + 2 + rLen);
+  offset += 2 + rLen;
+  if (der[offset] !== 0x02) throw new Error('invalid DER signature: missing s');
+  const sLen = der[offset + 1];
+  let s = der.slice(offset + 2, offset + 2 + sLen);
+  while (r.length > 1 && r[0] === 0) r = r.slice(1);
+  while (s.length > 1 && s[0] === 0) s = s.slice(1);
+  if (r.length > coordLen || s.length > coordLen) {
+    throw new Error('invalid DER signature: coordinate too long');
+  }
+  const out = new Uint8Array(coordLen * 2);
+  out.set(r, coordLen - r.length);
+  out.set(s, coordLen * 2 - s.length);
+  return out;
+}
+
 /** 去除前导零字节（保留至少一个字节） */
 function trimLeadingZeros(bytes: Uint8Array): Uint8Array {
   let start = 0;
@@ -171,5 +197,130 @@ function trimLeadingZeros(bytes: Uint8Array): Uint8Array {
   return bytes.slice(start);
 }
 
+function parseDerLength(data: Uint8Array, offset: number): { value: number; lenBytes: number } | null {
+  if (offset >= data.length) return null;
+  const first = data[offset];
+  if (first < 0x80) {
+    return { value: first, lenBytes: 1 };
+  }
+  const numBytes = first & 0x7f;
+  if (numBytes === 0 || numBytes > 4) return null;
+  let value = 0;
+  for (let i = 0; i < numBytes; i++) {
+    if (offset + 1 + i >= data.length) return null;
+    value = (value << 8) | data[offset + 1 + i];
+  }
+  return { value, lenBytes: 1 + numBytes };
+}
+
+function extractSpkiFromCertPem(certPem: string): ArrayBuffer {
+  const certDer = new Uint8Array(pemToArrayBuffer(certPem));
+  const p256Oid = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+  for (let i = 0; i <= certDer.length - p256Oid.length; i++) {
+    let match = true;
+    for (let j = 0; j < p256Oid.length; j++) {
+      if (certDer[i + j] !== p256Oid[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (!match) continue;
+    for (let seqStart = Math.max(0, i - 32); seqStart <= i; seqStart++) {
+      if (certDer[seqStart] !== 0x30) continue;
+      const seqLen = parseDerLength(certDer, seqStart + 1);
+      if (seqLen === null) continue;
+      const totalLen = 1 + seqLen.lenBytes + seqLen.value;
+      if (totalLen < 50 || totalLen > 140) continue;
+      const spkiCandidate = certDer.slice(seqStart, seqStart + totalLen);
+      let hasBitString = false;
+      for (let k = 20; k < spkiCandidate.length - 10; k++) {
+        if (spkiCandidate[k] === 0x03 && spkiCandidate[k + 2] === 0x00) {
+          hasBitString = true;
+          break;
+        }
+      }
+      if (hasBitString) {
+        return spkiCandidate.buffer.slice(
+          spkiCandidate.byteOffset,
+          spkiCandidate.byteOffset + spkiCandidate.byteLength,
+        ) as ArrayBuffer;
+      }
+    }
+  }
+  throw new Error('unable to extract SPKI public key from certificate');
+}
+
+async function certificateSha256Fingerprint(certPem: string): Promise<string> {
+  const der = pemToArrayBuffer(certPem);
+  const hash = await crypto.subtle.digest('SHA-256', der);
+  const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `sha256:${hex}`;
+}
+
+async function importCertPublicKeyEcdsa(certPem: string): Promise<CryptoKey> {
+  const spki = extractSpkiFromCertPem(certPem);
+  return crypto.subtle.importKey(
+    'spki',
+    spki,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['verify'],
+  );
+}
+
+const ecdsaKeyCache = new Map<string, CryptoKey>();
+
+async function importPrivateKeyEcdsa(pem: string): Promise<CryptoKey> {
+  const cached = ecdsaKeyCache.get(pem);
+  if (cached) return cached;
+  const pkcs8 = pemToArrayBuffer(pem);
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    pkcs8,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign'],
+  );
+  ecdsaKeyCache.set(pem, key);
+  return key;
+}
+
+async function ecdsaSignDer(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Array> {
+  const sig = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    privateKey,
+    toBufferSource(data),
+  );
+  return p1363ToDer(new Uint8Array(sig));
+}
+
+async function ecdsaVerifyDer(
+  publicKey: CryptoKey,
+  signature: Uint8Array,
+  data: Uint8Array,
+): Promise<boolean> {
+  const p1363 = derToP1363(signature);
+  return crypto.subtle.verify(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    publicKey,
+    toBufferSource(p1363),
+    toBufferSource(data),
+  );
+}
+
 // 导出工具函数，供其他模块使用
-export { uint8ToBase64, base64ToUint8, arrayBufferToPem, pemToArrayBuffer, p1363ToDer, toArrayBuffer, toBufferSource };
+export {
+  uint8ToBase64,
+  base64ToUint8,
+  arrayBufferToPem,
+  pemToArrayBuffer,
+  p1363ToDer,
+  derToP1363,
+  toArrayBuffer,
+  toBufferSource,
+  certificateSha256Fingerprint,
+  importCertPublicKeyEcdsa,
+  importPrivateKeyEcdsa,
+  ecdsaSignDer,
+  ecdsaVerifyDer,
+};

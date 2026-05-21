@@ -79,7 +79,7 @@ describe('Group Message Gap Fill', { timeout: 60000 }, () => {
     const allReceived = new Promise<void>((resolve) => {
       bob.on('group.message_created', (data: any) => {
         const sender = data.sender_aid ?? data.from ?? '';
-        if (sender === aliceAid && data.group_id === groupId && data.message_type === 'text') {
+        if (sender === aliceAid && data.group_id === groupId && (data.type === 'text' || data.message_type === 'text')) {
           const seq = Number(data.seq);
           if (!seqMap.has(seq)) {
             seqMap.set(seq, { seq, payload: data.payload });

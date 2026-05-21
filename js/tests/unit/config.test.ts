@@ -38,8 +38,8 @@ describe('createConfig', () => {
     expect(cfg.seedPassword).toBeNull();
     expect(cfg.discoveryPort).toBeNull();
     expect(cfg.groupE2ee).toBe(true);
-    expect(cfg.epochAutoRotateInterval).toBe(0);
-    expect(cfg.oldEpochRetentionSeconds).toBe(604800);
+    expect((cfg as any).epochAutoRotateInterval).toBeUndefined();
+    expect((cfg as any).oldEpochRetentionSeconds).toBeUndefined();
     expect(cfg.verifySsl).toBe(true);
     expect(cfg.requireForwardSecrecy).toBe(true);
     expect(cfg.replayWindowSeconds).toBe(300);
@@ -66,8 +66,8 @@ describe('createConfig', () => {
     expect(cfg.rootCaPem).toBe('ROOT-CA-PEM');
     expect(cfg.discoveryPort).toBe(20001);
     expect(cfg.groupE2ee).toBe(true); // 必备能力，不可关闭
-    expect(cfg.epochAutoRotateInterval).toBe(3600);
-    expect(cfg.oldEpochRetentionSeconds).toBe(86400);
+    expect((cfg as any).epochAutoRotateInterval).toBeUndefined();
+    expect((cfg as any).oldEpochRetentionSeconds).toBeUndefined();
     expect(cfg.requireForwardSecrecy).toBe(false);
     expect(cfg.replayWindowSeconds).toBe(600);
     expect(cfg.verifySsl).toBe(true);

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac as _hmac
 import os
 import time
 import uuid
@@ -22,6 +23,43 @@ from ..crypto.aead import aes_gcm_encrypt
 from ..crypto.dh_path import compute_3dh_wrap, compute_1dh_wrap
 from ..crypto.recipients import sort_recipients, compute_recipients_digest
 
+_METADATA_KEY_DOMAIN = b"aun-envelope-metadata-key-v1"
+_PROTECTED_HEADERS_DOMAIN = b"aun-protected-headers-v1"
+_PROTECTED_CONTEXT_DOMAIN = b"aun-protected-context-v1"
+
+
+def _metadata_auth_tag(key: bytes, domain: bytes, body: dict[str, Any]) -> bytes:
+    metadata_key = _hmac.digest(key, _METADATA_KEY_DOMAIN, "sha256")
+    sign_input = domain + b"\0" + canonical_json(body)
+    return _hmac.digest(metadata_key, sign_input, "sha256")
+
+
+def _with_metadata_auth(metadata: dict[str, Any], *, key: bytes, domain: bytes) -> dict[str, Any]:
+    body = {k: v for k, v in metadata.items() if k != "_auth"}
+    if not body:
+        return {}
+    tag = _metadata_auth_tag(key, domain, body)
+    result = dict(body)
+    result["_auth"] = {
+        "alg": "HMAC-SHA256",
+        "tag": base64.b64encode(tag).decode("ascii"),
+    }
+    return result
+
+
+def _normalize_headers(headers: dict[str, Any], payload_type: str | None = None) -> dict[str, str]:
+    """与 V1 对齐：所有 value 转 string，自动注入 payload_type。"""
+    normalized: dict[str, str] = {}
+    for k, v in headers.items():
+        if k == "_auth":
+            continue
+        sv = str(v) if v is not None else ""
+        if sv:
+            normalized[k] = sv
+    if payload_type:
+        normalized.setdefault("payload_type", payload_type)
+    return normalized
+
 
 def encrypt_p2p_message(
     sender: dict[str, Any],
@@ -30,6 +68,8 @@ def encrypt_p2p_message(
     *,
     message_id: str | None = None,
     timestamp: int | None = None,
+    protected_headers: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造完整的 V2 P2P 加密 envelope。
 
@@ -150,6 +190,26 @@ def encrypt_p2p_message(
         "recipients": recipients_rows,
         "aad": aad,
     }
+
+    # protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
+    if isinstance(protected_headers, dict) and protected_headers:
+        headers = _normalize_headers(protected_headers, payload_type=payload.get("type") if isinstance(payload, dict) else None)
+        if headers:
+            envelope["protected_headers"] = _with_metadata_auth(
+                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
+            )
+    elif isinstance(payload, dict) and payload.get("type"):
+        headers = _normalize_headers({}, payload_type=payload.get("type"))
+        if headers:
+            envelope["protected_headers"] = _with_metadata_auth(
+                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
+            )
+    if isinstance(context, dict) and context:
+        ctx_body = {k: v for k, v in context.items() if k != "_auth"}
+        if ctx_body:
+            envelope["context"] = _with_metadata_auth(
+                ctx_body, key=master_key, domain=_PROTECTED_CONTEXT_DOMAIN,
+            )
 
     return envelope
 

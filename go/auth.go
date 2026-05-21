@@ -1323,6 +1323,17 @@ func (a *AuthFlow) fetchGatewayOCSPStatus(ctx context.Context, gatewayURL string
 
 // ── 内部：会话初始化 ────────────────────────────────────────
 
+// authConnectCapabilities 返回 auth.connect 发送的 V2-only 能力声明。
+// extraInfo 参数保留在调用边界上，但当前不参与能力计算。
+func authConnectCapabilities(_ map[string]any) map[string]any {
+	return map[string]any{
+		"e2ee":                 true,
+		"group_e2ee":           true,
+		"supported_p2p_e2ee":   []string{"e2ee_v2"},
+		"supported_group_e2ee": []string{"group_e2ee_v2"},
+	}
+}
+
 // initializeSession 通过 auth.connect RPC 初始化会话；返回 hello result（map）。
 func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTransport, nonce string, token string, connectionKind string, shortTtlMs int, extraInfo map[string]any) (hello map[string]any, err error) {
 	tStart := time.Now()
@@ -1334,6 +1345,8 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 			pkgLogAuth().Debug("initializeSession exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
 		}
 	}()
+	// 默认能力声明：固定为 V2-only；extra_info._capabilities 不参与服务端声明。
+	caps := authConnectCapabilities(extraInfo)
 	request := map[string]any{
 		"nonce": nonce,
 		"auth": map[string]any{
@@ -1352,10 +1365,7 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 			"slot_id": a.slotID,
 		},
 		"delivery_mode": copyMapShallow(a.deliveryMode),
-		"capabilities": map[string]any{
-			"e2ee":       true,
-			"group_e2ee": true,
-		},
+		"capabilities":  caps,
 	}
 	// 长短连接选项：默认 long 时不写入 options（保持 wire 兼容）
 	if connectionKind == "short" {
@@ -1365,9 +1375,19 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 		}
 		request["options"] = opts
 	}
-	// extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
+	// extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方。
+	// 下划线前缀字段不透传到服务端。
 	if len(extraInfo) > 0 {
-		request["extra_info"] = extraInfo
+		filtered := make(map[string]any, len(extraInfo))
+		for k, v := range extraInfo {
+			if strings.HasPrefix(k, "_") {
+				continue
+			}
+			filtered[k] = v
+		}
+		if len(filtered) > 0 {
+			request["extra_info"] = filtered
+		}
 	}
 	result, err := transport.Call(ctx, "auth.connect", request)
 	if err != nil {

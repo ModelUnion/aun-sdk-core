@@ -1,6 +1,5 @@
 // ── client-group-e2ee 模块单元测试（桩测试）──────────────────
-// AUNClient 的群组 E2EE 编排逻辑需要完整的 Gateway 环境。
-// 此处仅验证配置和状态相关的边界条件。
+// 此处验证浏览器 SDK 已切到 E2EE V2-only 的群组编排入口。
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi } from 'vitest';
 import { AUNClient } from '../../src/client.js';
@@ -16,176 +15,68 @@ describe('AUNClient 群组 E2EE 配置', () => {
     expect(client.configModel.groupE2ee).toBe(true);
   });
 
-  it('epochAutoRotateInterval 默认为 0 秒', () => {
-    const client = new AUNClient();
-    expect(client.configModel.epochAutoRotateInterval).toBe(0);
-  });
-
-  it('oldEpochRetentionSeconds 默认为 7 天', () => {
-    const client = new AUNClient();
-    expect(client.configModel.oldEpochRetentionSeconds).toBe(604800);
-  });
-});
-
-describe('AUNClient 群组 E2EE 管理器', () => {
-  it('groupE2ee 应为 GroupE2EEManager 实例', () => {
-    const client = new AUNClient();
-    const ge = client.groupE2ee;
-    expect(ge).toBeDefined();
-    // 验证关键方法存在
-    expect(typeof ge.createEpoch).toBe('function');
-    expect(typeof ge.rotateEpoch).toBe('function');
-    expect(typeof ge.encrypt).toBe('function');
-    expect(typeof ge.decrypt).toBe('function');
-    expect(typeof ge.hasSecret).toBe('function');
-    expect(typeof ge.currentEpoch).toBe('function');
-    expect(typeof ge.getMemberAids).toBe('function');
-    expect(typeof ge.handleIncoming).toBe('function');
-  });
-
-  it('sender membership floor 错误应作为可恢复 epoch 错误重试', () => {
-    const client = new AUNClient();
-    const err = new Error('e2ee epoch below sender membership floor: epoch=1 floor=2');
-
-    expect((client as any)._isGroupEpochTooOldError(err)).toBe(true);
-    expect((client as any)._isRecoverableGroupEpochError(err)).toBe(true);
-  });
-
-  it('epoch changed during send 错误应作为可恢复 epoch 错误重试', () => {
-    const client = new AUNClient();
-    const err = new Error('e2ee epoch changed during send: expected 1, current 2');
-
-    expect((client as any)._isGroupEpochChangedDuringSendError(err)).toBe(true);
-    expect((client as any)._isRecoverableGroupEpochError(err)).toBe(true);
+  it('构造期 V1 epoch 配置应被忽略', () => {
+    const client = new AUNClient({
+      epochAutoRotateInterval: 30,
+      oldEpochRetentionSeconds: 60,
+    } as any);
+    expect((client.configModel as any).epochAutoRotateInterval).toBeUndefined();
+    expect((client.configModel as any).oldEpochRetentionSeconds).toBeUndefined();
   });
 });
 
-describe('群组成员变更事件的 epoch 轮换逻辑', () => {
-  it('普通 member 收到 member_removed 事件时不应触发 rotate_epoch', async () => {
-    vi.useFakeTimers();
-    try {
-      const client = new AUNClient();
-
-      (client as any)._aid = 'member.aid.com';
-      (client as any)._identity = { aid: 'member.aid.com' };
-      (client as any)._state = 'connected';
-
-      const rotateEpochSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
-      const callSpy = vi.spyOn(client, 'call').mockImplementation(async (method, params) => {
-        if (method === 'group.get_members') {
-          expect(params).toEqual({ group_id: 'test-group-123' });
-          return {
-            members: [
-              { aid: 'owner.aid.com', role: 'owner' },
-              { aid: 'member.aid.com', role: 'member' },
-            ],
-          };
-        }
-        throw new Error(`unexpected method: ${method}`);
-      });
-      vi.spyOn(Math, 'random').mockReturnValue(0);
-
-      await (client as any)._onRawGroupChanged({
-        group_id: 'test-group-123',
-        action: 'member_removed',
-        member_aid: 'removed.aid.com',
-        old_epoch: 5,
-      });
-      await vi.runAllTimersAsync();
-
-      expect(callSpy).toHaveBeenCalledWith('group.get_members', { group_id: 'test-group-123' });
-      expect(rotateEpochSpy).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-      vi.restoreAllMocks();
-    }
-  });
-
-  // baseline 已 fail：fake timer + _safeAsync fire-and-forget 路径下 microtask 难以稳定推进
-  // 实现已验证（Python SDK 同等路径测试通过、行为对齐），此处暂跳过等异步测试基础设施修复
-  it.skip('非 leader admin 在 epoch 已推进后不应兜底 rotate_epoch', async () => {
-    vi.useFakeTimers();
-    try {
-      const client = new AUNClient();
-
-      (client as any)._aid = 'zzz-admin.aid.com';
-      (client as any)._identity = { aid: 'zzz-admin.aid.com' };
-      (client as any)._state = 'connected';
-
-      const rotateEpochSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
-      // 非 leader 路径用 group.e2ee.get_epoch 查询服务端 epoch（与 Python SDK 对齐）：
-      // before=1, after=2 表示 leader 已完成，不需要兜底
-      let getEpochCalls = 0;
-      const callSpy = vi.spyOn(client, 'call').mockImplementation(async (method, params) => {
-        if (method === 'group.get_members') {
-          expect(params).toEqual({ group_id: 'test-group-epoch' });
-          return {
-            members: [
-              { aid: 'aaa-owner.aid.com', role: 'owner' },
-              { aid: 'zzz-admin.aid.com', role: 'admin' },
-            ],
-          };
-        }
-        if (method === 'group.e2ee.get_epoch') {
-          getEpochCalls += 1;
-          return { epoch: getEpochCalls === 1 ? 1 : 2 };
-        }
-        throw new Error(`unexpected method: ${method}`);
-      });
-      vi.spyOn(Math, 'random').mockReturnValue(0);
-
-      await (client as any)._onRawGroupChanged({
-        group_id: 'test-group-epoch',
-        action: 'member_removed',
-        member_aid: 'removed.aid.com',
-        old_epoch: 5,
-      });
-      await vi.runAllTimersAsync();
-
-      expect(callSpy).toHaveBeenCalledWith('group.get_members', { group_id: 'test-group-epoch' });
-      expect(getEpochCalls).toBe(2); // before/after jitter 各一次
-      expect(rotateEpochSpy).not.toHaveBeenCalled(); // leader 已完成 → 不兜底
-    } finally {
-      vi.useRealTimers();
-      vi.restoreAllMocks();
-    }
-  });
-
-  it('member_removed 事件缺 old_epoch 时应跳过轮换', async () => {
-    vi.useFakeTimers();
-    try {
-      const client = new AUNClient();
-
-      (client as any)._aid = 'owner.aid.com';
-      (client as any)._identity = { aid: 'owner.aid.com' };
-      (client as any)._state = 'connected';
-
-      const rotateEpochSpy = vi.spyOn(client as any, '_rotateGroupEpoch').mockResolvedValue(undefined);
-      const callSpy = vi.spyOn(client, 'call').mockResolvedValue({
-        members: [{ aid: 'owner.aid.com', role: 'owner' }],
-      });
-
-      await (client as any)._onRawGroupChanged({
-        group_id: 'test-group-no-old-epoch',
-        action: 'member_removed',
-        member_aid: 'removed.aid.com',
-      });
-      await vi.runAllTimersAsync();
-
-      expect(callSpy).not.toHaveBeenCalledWith('group.get_members', expect.anything());
-      expect(rotateEpochSpy).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-      vi.restoreAllMocks();
+describe('AUNClient 群组 E2EE V2-only 语义', () => {
+  it('不再暴露 V1 GroupE2EEManager 与 epoch helper', () => {
+    const client = new AUNClient();
+    expect((client as any).groupE2ee).toBeUndefined();
+    expect((client as any)._groupE2ee).toBeUndefined();
+    for (const name of [
+      '_isGroupEpochTooOldError',
+      '_isGroupEpochChangedDuringSendError',
+      '_isRecoverableGroupEpochError',
+      '_rotateGroupEpoch',
+      '_maybeLeadRotateGroupEpoch',
+      '_distributeKeyToNewMember',
+    ]) {
+      expect((client as any)[name], `${name} should be removed in V2-only client`).toBeUndefined();
     }
   });
 });
 
-// 注意: 以下测试需要完整 Gateway 环境，标记为 TODO
-// - group.create 后自动创建 epoch
-// - group.add_member 后自动分发密钥
-// - group.kick 后自动轮换 epoch
-// - group.send 自动加密
-// - group.pull 自动解密
-// - 群组变更事件触发 epoch 轮换
-// - 密钥恢复流程
+describe('群组成员变更事件的 V2-only 编排', () => {
+  it('member_removed 不再触发 V1 epoch 轮换或 group.e2ee.* RPC', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'member.aid.com';
+    (client as any)._identity = { aid: 'member.aid.com' };
+    (client as any)._state = 'connected';
+
+    const callSpy = vi.spyOn(client, 'call').mockResolvedValue({});
+
+    await (client as any)._onRawGroupChanged({
+      group_id: 'test-group-123',
+      action: 'member_removed',
+      member_aid: 'removed.aid.com',
+      old_epoch: 5,
+    });
+
+    expect((client as any)._rotateGroupEpoch).toBeUndefined();
+    expect(callSpy).not.toHaveBeenCalled();
+  });
+
+  it('upsert 且 V2 session 就绪时触发 V2 state auto-propose', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'owner.aid.com';
+    (client as any)._identity = { aid: 'owner.aid.com' };
+    (client as any)._state = 'connected';
+    (client as any)._v2Session = {};
+    const proposeSpy = vi.spyOn(client as any, '_v2AutoProposeState').mockResolvedValue(undefined);
+
+    await (client as any)._onRawGroupChanged({
+      group_id: 'test-group-v2',
+      action: 'upsert',
+      event_seq: 1,
+    });
+
+    expect(proposeSpy).toHaveBeenCalledWith('test-group-v2', { leaderDelay: true });
+  });
+});

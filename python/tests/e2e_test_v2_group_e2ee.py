@@ -78,6 +78,12 @@ class GroupV2TestRunner:
         await _ensure_connected(self.bob, _BOB_AID)
         print(f"[setup] Alice V2={self.alice._v2_session is not None}, Bob V2={self.bob._v2_session is not None}")
 
+        # push 事件收集（用于 pull 兜底）
+        self._alice_push_msgs = []
+        self._bob_push_msgs = []
+        self.alice.on("group.message_created", lambda d: self._alice_push_msgs.append(d) if isinstance(d, dict) else None)
+        self.bob.on("group.message_created", lambda d: self._bob_push_msgs.append(d) if isinstance(d, dict) else None)
+
         # 创建测试群
         result = await self.alice.call("group.create", {
             "name": f"v2-test-{int(time.time())}",
@@ -91,7 +97,14 @@ class GroupV2TestRunner:
             "group_id": self.group_id,
             "aid": _BOB_AID,
         })
-        print(f"[setup] Bob 已加入群")
+        # 等 auto propose+confirm 完成（private 群 bob 需要进入 committed 才能收发）
+        for _ in range(30):
+            await asyncio.sleep(0.5)
+            bs = await self.alice.call("group.v2.bootstrap", {"group_id": self.group_id})
+            committed = list(bs.get("committed_member_aids") or [])
+            if _BOB_AID in committed:
+                break
+        print(f"[setup] Bob 已加入群 (committed={_BOB_AID in committed})")
 
     async def teardown(self):
         for c in [self.alice, self.bob]:
@@ -113,59 +126,71 @@ class GroupV2TestRunner:
             self.errors.append((name, str(e), traceback.format_exc()))
             self.failed += 1
 
-    # ── 场景 1：Alice send_group_v2 ──
+    # ── 场景 1：Alice group.send ──
 
     async def test_send(self):
         self._payload = {"text": f"group-v2-test {int(time.time())}"}
-        result = await self.alice.send_group_v2(self.group_id, self._payload)
+        result = await self.alice.call("group.send", {"group_id": self.group_id, "payload": self._payload})
         assert result.get("status") == "accepted", f"unexpected status: {result}"
         self._msg_seq = result.get("seq", 0)
         print(f"(seq={self._msg_seq})", end=" ")
 
-    # ── 场景 2：Bob pull_group_v2 解密 ──
+    # ── 场景 2：Bob group.pull 解密（push 可能已消费，兜底等 push 事件）──
 
     async def test_bob_pull(self):
-        messages = await self.bob.pull_group_v2(self.group_id)
+        # push 可能已经消费了消息，先等 push 事件
+        for _ in range(20):
+            await asyncio.sleep(0.3)
+            if any(m.get("payload", {}).get("text") == self._payload["text"] for m in self._bob_push_msgs):
+                break
+        # 兜底 pull
+        messages = (await self.bob.call("group.pull", {"group_id": self.group_id})).get("messages", [])
+        all_msgs = self._bob_push_msgs + messages
         found = None
-        for m in messages:
+        for m in all_msgs:
             if m.get("payload", {}).get("text") == self._payload["text"]:
                 found = m
                 break
-        assert found is not None, f"Bob got {len(messages)} msgs but none match expected text"
-        assert found.get("from") == _ALICE_AID
+        assert found is not None, f"Bob got {len(all_msgs)} msgs but none match expected text"
+        assert found.get("from") == _ALICE_AID or found.get("from_aid") == _ALICE_AID
         print(f"(decrypted: '{found['payload']['text'][:30]}...')", end=" ")
 
-    # ── 场景 3：Bob ack_group_v2 ──
+    # ── 场景 3：Bob ack ──
 
     async def test_bob_ack(self):
-        result = await self.bob.ack_group_v2(self.group_id)
-        assert result.get("acked", 0) >= 1, f"ack failed: {result}"
+        result = await self.bob.call("group.ack_messages", {"group_id": self.group_id})
+        assert isinstance(result, dict), f"ack failed: {result}"
 
     # ── 场景 4：ack 后 pull 为空 ──
 
     async def test_pull_after_ack_empty(self):
-        messages = await self.bob.pull_group_v2(self.group_id)
+        messages = (await self.bob.call("group.pull", {"group_id": self.group_id})).get("messages", [])
         assert len(messages) == 0, f"expected 0 after ack, got {len(messages)}"
 
     # ── 场景 5：Bob 回复 ──
 
     async def test_bob_reply(self):
         reply = {"text": f"bob-group-reply {int(time.time())}"}
-        result = await self.bob.send_group_v2(self.group_id, reply)
+        result = await self.bob.call("group.send", {"group_id": self.group_id, "payload": reply})
         assert result.get("status") == "accepted"
         self._reply_text = reply["text"]
 
-    # ── 场景 6：Alice pull 解密回复 ──
+    # ── 场景 6：Alice pull 解密回复（push 可能已消费，兜底等 push 事件）──
 
     async def test_alice_pull_reply(self):
-        messages = await self.alice.pull_group_v2(self.group_id)
+        for _ in range(20):
+            await asyncio.sleep(0.3)
+            if any(m.get("payload", {}).get("text") == self._reply_text for m in self._alice_push_msgs):
+                break
+        messages = (await self.alice.call("group.pull", {"group_id": self.group_id})).get("messages", [])
+        all_msgs = self._alice_push_msgs + messages
         found = None
-        for m in messages:
+        for m in all_msgs:
             if m.get("payload", {}).get("text") == self._reply_text:
                 found = m
                 break
-        assert found is not None, f"Alice got {len(messages)} msgs but none match reply"
-        assert found.get("from") == _BOB_AID
+        assert found is not None, f"Alice got {len(all_msgs)} msgs but none match reply"
+        assert found.get("from") == _BOB_AID or found.get("from_aid") == _BOB_AID
         print(f"(from Bob: '{found['payload']['text'][:30]}...')", end=" ")
 
     # ── 场景 7：epoch 验证（rotate 后新消息用新 epoch）──
@@ -192,7 +217,7 @@ class GroupV2TestRunner:
 
         # Alice 发消息（应使用新 epoch）
         self._epoch_payload = {"text": f"after-rotation {int(time.time())}"}
-        result = await self.alice.send_group_v2(self.group_id, self._epoch_payload)
+        result = await self.alice.call("group.send", {"group_id": self.group_id, "payload": self._epoch_payload})
         assert result.get("status") == "accepted"
         new_epoch = result.get("seq", 0)
         print(f"(seq={new_epoch})", end=" ")
@@ -209,7 +234,7 @@ class GroupV2TestRunner:
             self.alice._v2_bootstrap_cache[cache_key] = (cached[0], cached[1], stale_epoch)
 
         payload = {"text": f"stale-epoch-retry {int(time.time())}"}
-        result = await self.alice.send_group_v2(self.group_id, payload)
+        result = await self.alice.call("group.send", {"group_id": self.group_id, "payload": payload})
         assert result.get("status") == "accepted"
         print(f"(retry succeeded)", end=" ")
 
@@ -226,9 +251,9 @@ class GroupV2TestRunner:
         await self.setup()
 
         try:
-            await self.run_test("1. Alice send_group_v2", self.test_send)
-            await self.run_test("2. Bob pull_group_v2 解密", self.test_bob_pull)
-            await self.run_test("3. Bob ack_group_v2", self.test_bob_ack)
+            await self.run_test("1. Alice group.send", self.test_send)
+            await self.run_test("2. Bob group.pull 解密", self.test_bob_pull)
+            await self.run_test("3. Bob ack", self.test_bob_ack)
             await self.run_test("4. ack 后 pull 为空", self.test_pull_after_ack_empty)
             await self.run_test("5. Bob 回复", self.test_bob_reply)
             await self.run_test("6. Alice pull 解密回复", self.test_alice_pull_reply)

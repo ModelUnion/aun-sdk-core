@@ -1,5 +1,5 @@
 /**
- * Group E2EE 集成测试 — 需要运行中的 AUN Gateway + Group Service。
+ * Group E2EE V2 集成测试 — 需要运行中的 AUN Gateway + Group Service。
  *
  * 使用 SDK 公开 API 测试群组端到端加密功能：
  *   1. 创建加密群组
@@ -59,6 +59,66 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForV2BootstrapDevice(owner: AUNClient, groupId: string, memberAid: string): Promise<void> {
+  const timeoutMs = 50_000;
+  const deadline = Date.now() + timeoutMs;
+  let attempt = 0;
+  let lastEpoch = 0;
+  let lastDeviceCount = 0;
+  let lastCommitted: string[] = [];
+  let lastPendingAdds: string[] = [];
+  let lastPendingRemoves: string[] = [];
+  let lastSnapshot = '';
+  while (Date.now() < deadline) {
+    attempt += 1;
+    const bootstrap = await owner.call('group.v2.bootstrap', { group_id: groupId }) as JsonObject;
+    const devices = Array.isArray(bootstrap.devices) ? bootstrap.devices : [];
+    lastEpoch = Number(bootstrap.epoch ?? 0) || 0;
+    lastDeviceCount = devices.filter((item) => {
+      if (!item || typeof item !== 'object') return false;
+      return String((item as JsonObject).aid ?? '').trim() === memberAid;
+    }).length;
+    lastCommitted = Array.isArray(bootstrap.committed_member_aids)
+      ? bootstrap.committed_member_aids.map(aid => String(aid))
+      : [];
+    lastPendingAdds = Array.isArray(bootstrap.pending_adds)
+      ? bootstrap.pending_adds.map(aid => String(aid))
+      : [];
+    lastPendingRemoves = Array.isArray(bootstrap.pending_removes)
+      ? bootstrap.pending_removes.map(aid => String(aid))
+      : [];
+    const snapshot = JSON.stringify({
+      epoch: lastEpoch,
+      devices: lastDeviceCount,
+      committed: lastCommitted,
+      pending_adds: lastPendingAdds,
+      pending_removes: lastPendingRemoves,
+    });
+    if (attempt === 1 || attempt % 5 === 0 || snapshot !== lastSnapshot) {
+      console.log(
+        `  [wait] group=${groupId} member=${memberAid} attempt=${attempt} `
+        + `epoch=${lastEpoch} devices=${lastDeviceCount} `
+        + `committed=${JSON.stringify(lastCommitted)} `
+        + `pending_adds=${JSON.stringify(lastPendingAdds)} `
+        + `pending_removes=${JSON.stringify(lastPendingRemoves)}`,
+      );
+      lastSnapshot = snapshot;
+    }
+    if (
+      lastDeviceCount > 0
+      && lastCommitted.includes(memberAid)
+      && lastPendingAdds.length === 0
+      && lastPendingRemoves.length === 0
+    ) return;
+    await sleep(500);
+  }
+  throw new Error(
+    `等待群成员 V2 就绪超时: group=${groupId} member=${memberAid} `
+    + `last_epoch=${lastEpoch} devices_for_member=${lastDeviceCount} `
+    + `committed=${JSON.stringify(lastCommitted)} pending_adds=${JSON.stringify(lastPendingAdds)} pending_removes=${JSON.stringify(lastPendingRemoves)}`,
+  );
 }
 
 /** 判断错误是否为"服务未实现"，用于优雅跳过 */
@@ -193,6 +253,7 @@ describe('Group E2EE: 发送加密群消息', () => {
       const createResult = await owner.call('group.create', {
         name: `e2ee-send-${rid}`,
         visibility: 'private',
+        group_e2ee_protocol: 'group_e2ee_v2',
       }) as JsonObject;
       const group = createResult.group as JsonObject | undefined;
       groupId = String(group?.group_id ?? '');
@@ -221,7 +282,7 @@ describe('Group E2EE: 发送加密群消息', () => {
       throw e;
     }
 
-    await sleep(2000);
+    await waitForV2BootstrapDevice(owner, groupId, memberAid);
 
     // member 监听群消息事件
     const receivedMessages: JsonObject[] = [];
@@ -328,6 +389,7 @@ describe('Group E2EE: 非成员无法访问加密群消息', () => {
       const createResult = await owner.call('group.create', {
         name: `e2ee-acl-${rid}`,
         visibility: 'private',
+        group_e2ee_protocol: 'group_e2ee_v2',
       }) as JsonObject;
       const group = createResult.group as JsonObject | undefined;
       groupId = String(group?.group_id ?? '');
@@ -355,7 +417,7 @@ describe('Group E2EE: 非成员无法访问加密群消息', () => {
       throw e;
     }
 
-    await sleep(2000);
+    await waitForV2BootstrapDevice(owner, groupId, memberAid);
 
     // owner 发送加密群消息
     const msgText = `secret-${rid}`;

@@ -69,61 +69,11 @@ export interface KeyPairRecord extends JsonObject {
   curve?: string;
 }
 
-/** E2EE prekey 记录 */
-export interface PrekeyRecord extends JsonObject {
-  prekey_id?: string;
-  public_key?: string;
-  signature?: string;
-  private_key_pem?: string;
-  created_at?: number;
-  updated_at?: number;
-  expires_at?: number;
-}
-
-/** prekey 映射 */
-export type PrekeyMap = Record<string, PrekeyRecord>;
-
-/** 群组旧 epoch 记录 */
-export interface GroupOldEpochRecord extends JsonObject {
-  epoch?: number;
-  secret?: string;
-  commitment?: string;
-  member_aids?: string[];
-  epoch_chain?: string;
-  epoch_chain_unverified?: boolean;
-  epoch_chain_unverified_reason?: string;
-  pending_rotation_id?: string;
-  pending_created_at?: number;
-  secret_protection?: JsonObject;
-  created_at?: number;
-  updated_at?: number;
-  expires_at?: number;
-}
-
-/** 群组密钥状态 */
-export interface GroupSecretRecord extends JsonObject {
-  group_id?: string;
-  epoch?: number;
-  secret?: string;
-  commitment?: string;
-  member_aids?: string[];
-  epoch_chain?: string;
-  epoch_chain_unverified?: boolean;
-  epoch_chain_unverified_reason?: string;
-  pending_rotation_id?: string;
-  pending_created_at?: number;
-  updated_at?: number;
-  secret_protection?: JsonObject;
-  old_epochs?: GroupOldEpochRecord[];
-}
-
 /** metadata 记录 */
 export interface MetadataRecord extends JsonObject {
   access_token?: string;
   refresh_token?: string;
   kite_token?: string;
-  e2ee_prekeys?: PrekeyMap;
-  e2ee_sessions?: JsonObject[];
 }
 
 /** 身份记录 */
@@ -133,17 +83,6 @@ export interface IdentityRecord extends MetadataRecord, KeyPairRecord {
   cert_pem?: string;
   token?: string;
   token_exp?: number;
-  expires_at?: number;
-}
-
-/** E2EE session 记录 */
-export interface SessionRecord extends JsonObject {
-  session_id?: string;
-  key?: string;
-  key_protection?: JsonObject;
-  peer_aid?: string;
-  created_at?: number;
-  updated_at?: number;
   expires_at?: number;
 }
 

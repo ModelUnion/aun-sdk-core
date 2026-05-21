@@ -116,7 +116,7 @@ async def _sdk_send(client: AUNClient, to_aid: str, payload: str):
     """发送加密消息"""
     return await client.call("message.send", {
         "to": to_aid,
-        "payload": payload,
+        "payload": {"type": "text", "text": payload},
         "encrypt": True
     })
 

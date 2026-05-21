@@ -58,7 +58,7 @@ function makeSharedPath(tag: string): string {
 
 function makeClient(aunPath: string, deviceId?: string): AUNClient {
   const client = new AUNClient({ aun_path: aunPath });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
+  ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   if (deviceId) {
     // jsdom 下所有 client 共享 localStorage，默认 _deviceId 相同；
     // 这里直接覆写 _deviceId，模拟不同设备。
@@ -132,6 +132,10 @@ async function waitFor(
     await sleep(intervalMs);
   }
   return false;
+}
+
+function disconnectedWithCode(captured: { events: CapturedDisconnect[] }, code: number): boolean {
+  return captured.events.some((event) => event.code === code);
 }
 
 // ── 环境检测 ──────────────────────────────────────
@@ -225,6 +229,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       filled.push(c);
       clients.push(c);
       await connectLong(c, aid, `slot-${i}`);
+      await sleep(150);
     }
     await sleep(500);
 
@@ -235,10 +240,10 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     // 第 SLOTS+1 个新 slot 进入 → 服务端踢最早的（slot-0）
     const overflow = makeClient(sharedPath, deviceId);
     clients.push(overflow);
-    await connectLong(overflow, aid, `slot-NEW-${r}`);
+    await connectLong(overflow, aid, `slot-new-${r}`);
 
-    // 等待最早连接收到 4015
-    const kicked = await waitFor(() => oldest.state === 'terminal_failed', 10000);
+    // 等待最早连接收到 4015；auto_reconnect=false 时状态可能停在 disconnected
+    const kicked = await waitFor(() => disconnectedWithCode(captured, 4015), 10000);
     expect(kicked).toBe(true);
 
     // gateway.disconnect 事件包含 4015 + 配额信息
@@ -252,14 +257,15 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     expect(evt.detail!.slot_id).toBe('slot-0');
     const evictedBy = evt.detail!.evicted_by as JsonObject | undefined;
     expect(evictedBy).toBeDefined();
-    expect(evictedBy!.slot_id).toBe(`slot-NEW-${r}`);
+    expect(evictedBy!.slot_id).toBe(`slot-new-${r}`);
 
-    // connection.state(terminal_failed) 也带 detail（4015 不重连）
+    // 如果 SDK 进入 terminal_failed，connection.state 也应带 detail；auto_reconnect=false 时不会进入该状态。
     const terminal = captured.states.find(s => s.state === 'terminal_failed');
-    expect(terminal).toBeDefined();
-    expect(terminal!.code).toBe(4015);
-    expect(terminal!.detail).toBeDefined();
-    expect((terminal!.detail as JsonObject).quota_kind).toBe('aid_device_slot_quota_exceeded');
+    if (terminal) {
+      expect(terminal.code).toBe(4015);
+      expect(terminal.detail).toBeDefined();
+      expect((terminal.detail as JsonObject).quota_kind).toBe('aid_device_slot_quota_exceeded');
+    }
 
     // 新连接和其他未被踢的连接仍正常
     expect(overflow.state).toBe('connected');
@@ -282,6 +288,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       filled.push(c);
       clients.push(c);
       await connectLong(c, aid, 'main');
+      await sleep(150);
     }
     await sleep(500);
 
@@ -290,12 +297,12 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     const captured = captureDisconnect(oldest);
 
     // 第 DEVICES+1 个新 device 进入 → 服务端踢最早 device 的所有连接
-    const newDeviceClient = makeClient(sharedPath, `q-d2-dev-NEW-${r}`);
+    const newDeviceClient = makeClient(sharedPath, `q-d2-dev-new-${r}`);
     clients.push(newDeviceClient);
     await connectLong(newDeviceClient, aid, 'main');
 
     // 最早 device 上的连接被踢
-    const kicked = await waitFor(() => oldest.state === 'terminal_failed', 10000);
+    const kicked = await waitFor(() => disconnectedWithCode(captured, 4015), 10000);
     expect(kicked).toBe(true);
 
     expect(captured.events.length).toBeGreaterThan(0);
@@ -305,7 +312,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     expect(evt.detail!.aid).toBe(aid);
     expect(evt.detail!.device_id).toBe(`q-d2-dev-0-${r}`);
     const evictedBy = evt.detail!.evicted_by as JsonObject | undefined;
-    expect(evictedBy!.device_id).toBe(`q-d2-dev-NEW-${r}`);
+    expect(evictedBy!.device_id).toBe(`q-d2-dev-new-${r}`);
 
     // 新连接仍正常
     expect(newDeviceClient.state).toBe('connected');
@@ -331,6 +338,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       filled.push(c);
       clients.push(c);
       await connectLong(c, aid, 'main');
+      await sleep(150);
     }
     await sleep(500);
 
@@ -339,12 +347,12 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     const captured = captureDisconnect(oldest);
 
     // 第 AIDS+1 个新 aid 在同 device 上进入
-    const newAid = `q-a3-NEW-${r}.${ISSUER}`;
+    const newAid = `q-a3-new-${r}.${ISSUER}`;
     const newAidClient = makeClient(sharedPath, sharedDevice);
     clients.push(newAidClient);
     await connectLong(newAidClient, newAid, 'main');
 
-    const kicked = await waitFor(() => oldest.state === 'terminal_failed', 10000);
+    const kicked = await waitFor(() => disconnectedWithCode(captured, 4015), 10000);
     expect(kicked).toBe(true);
 
     expect(captured.events.length).toBeGreaterThan(0);

@@ -3,11 +3,9 @@
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AUNClient } from '../../src/client.js';
-import { E2EEError } from '../../src/errors.js';
-import type { GroupE2EEManager } from '../../src/e2ee-group.js';
 
-// ── P1: ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检 ────
-describe('ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检', () => {
+// ── P1: ISSUE-SDK-JS-006: V2-only 后旧 group epoch 预检已退役 ────
+describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
   let client: AUNClient;
 
   beforeEach(() => {
@@ -22,115 +20,43 @@ describe('ISSUE-SDK-JS-006: _sendGroupEncrypted epoch 预检', () => {
     (client as any)._deviceId = 'dev-1';
   });
 
-  it('本地 epoch < 服务端 epoch 时应触发密钥恢复请求', async () => {
-    // mock group e2ee: 有 epoch 1 的密钥
-    const groupE2ee = (client as any)._groupE2ee as GroupE2EEManager;
-    let recovered = false;
-    vi.spyOn(groupE2ee, 'currentEpoch').mockImplementation(async () => (recovered ? 3 : 1));
-    vi.spyOn(groupE2ee, 'encrypt').mockResolvedValue({
-      type: 'e2ee.group_encrypted',
-      epoch: 1,
-    });
-    vi.spyOn(groupE2ee, 'loadSecret').mockResolvedValue({
-      epoch: 3,
-      secret: new Uint8Array(32),
-      commitment: 'c3',
-      member_aids: ['alice.aid.com'],
-    });
-    vi.spyOn(groupE2ee, 'encryptWithEpoch').mockResolvedValue({
-      type: 'e2ee.group_encrypted',
-      epoch: 3,
-    });
-    // 实现实际调用 _recoverGroupEpochKey 进行密钥恢复（与 Python SDK 对齐）
-    const recoverSpy = vi.spyOn(client as any, '_recoverGroupEpochKey').mockImplementation(async () => {
-      recovered = true;
-    });
+  it('V1 group epoch manager 与发送 helper 不应再暴露', () => {
+    const proto = Object.getPrototypeOf(client) as Record<string, unknown>;
 
-    const calls: string[] = [];
-    const callMock = vi.fn().mockImplementation(async (method: string, params: any) => {
-      calls.push(method);
-      if (method === 'group.e2ee.get_epoch') return { epoch: 3, committed_epoch: 3 };
-      if (method === 'group.get_info') return { owner_aid: 'owner.aid.com' };
-      if (method === 'message.send') return { ok: true };
-      if (method === 'group.send') return { ok: true };
-      return {};
-    });
-    // 用 transport.call 来模拟所有 RPC
-    (client as any)._transport.call = callMock;
-
-    // 调用 _sendGroupEncrypted
-    await (client as any)._sendGroupEncrypted({
-      group_id: 'g1',
-      payload: { type: 'text', text: 'hello' },
-    });
-
-    // 应该先调用 group.e2ee.get_epoch 进行预检
-    expect(calls).toContain('group.e2ee.get_epoch');
-    // 应该真的触发了密钥恢复（避免链路断裂）
-    expect(recoverSpy).toHaveBeenCalled();
+    expect((client as any)._groupE2ee).toBeUndefined();
+    expect(proto._sendGroupEncrypted).toBeUndefined();
+    expect(proto._recoverGroupEpochKey).toBeUndefined();
+    expect(proto._rotateGroupEpoch).toBeUndefined();
   });
 
-  it('本地无 epoch 时不应崩溃（静默跳过预检）', async () => {
-    const groupE2ee = (client as any)._groupE2ee as GroupE2EEManager;
-    vi.spyOn(groupE2ee, 'currentEpoch').mockResolvedValue(null);
-    vi.spyOn(groupE2ee, 'encrypt').mockResolvedValue({
-      type: 'e2ee.group_encrypted',
-      epoch: 1,
-    });
-    vi.spyOn(groupE2ee, 'loadSecret').mockResolvedValue({
-      epoch: 1,
-      secret: new Uint8Array(32),
-      commitment: 'c1',
-      member_aids: ['alice.aid.com'],
-    });
-    vi.spyOn(groupE2ee, 'encryptWithEpoch').mockResolvedValue({
-      type: 'e2ee.group_encrypted',
-      epoch: 1,
-    });
-
+  it('legacy group.e2ee RPC 应被客户端拦截，不透传 transport', async () => {
     (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
 
-    // 不应抛错
-    await expect(
-      (client as any)._sendGroupEncrypted({
-        group_id: 'g1',
-        payload: { type: 'text', text: 'hello' },
-      })
-    ).resolves.toBeDefined();
+    await expect(client.call('group.e2ee.get_epoch', { group_id: 'g1' }))
+      .rejects.toThrow('legacy E2EE method is removed');
+
+    expect((client as any)._transport.call).not.toHaveBeenCalled();
   });
 
-  it('epoch 预检失败不应阻塞发送', async () => {
-    const groupE2ee = (client as any)._groupE2ee as GroupE2EEManager;
-    vi.spyOn(groupE2ee, 'currentEpoch').mockResolvedValue(1);
-    vi.spyOn(groupE2ee, 'encrypt').mockResolvedValue({
-      type: 'e2ee.group_encrypted',
-      epoch: 1,
-    });
-    vi.spyOn(groupE2ee, 'loadSecret').mockResolvedValue({
-      epoch: 1,
-      secret: new Uint8Array(32),
-      commitment: 'c1',
-      member_aids: ['alice.aid.com'],
-    });
-    vi.spyOn(groupE2ee, 'encryptWithEpoch').mockResolvedValue({
-      type: 'e2ee.group_encrypted',
-      epoch: 1,
-    });
+  it('group.send 默认加密必须走 V2 session，encrypt=false 才能走明文 RPC', async () => {
+    const transportCall = vi.fn().mockResolvedValue({ ok: true });
+    (client as any)._transport.call = transportCall;
 
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    (client as any)._transport.call = vi.fn().mockImplementation(async (method: string) => {
-      if (method === 'group.e2ee.get_epoch') throw new Error('network error');
-      if (method === 'group.send') return { ok: true };
-      return {};
-    });
-
-    const result = await (client as any)._sendGroupEncrypted({
+    await expect(client.call('group.send', {
       group_id: 'g1',
       payload: { type: 'text', text: 'hello' },
-    });
+    })).rejects.toThrow('V2 session not initialized');
 
-    expect(result).toBeDefined();
-    warnSpy.mockRestore();
+    await expect(client.call('group.send', {
+      group_id: 'g1',
+      payload: { type: 'text', text: 'plain' },
+      encrypt: false,
+    })).resolves.toEqual({ ok: true });
+    expect(transportCall).toHaveBeenCalledWith('group.send', expect.objectContaining({
+      group_id: 'g1',
+      payload: { type: 'text', text: 'plain' },
+    }), expect.any(Number));
+    expect(transportCall.mock.calls.map(([method]) => method)).not.toContain('group.e2ee.get_epoch');
   });
 });
 
@@ -220,7 +146,6 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
   it('connected 状态 _fillGroupGap 应正常执行', async () => {
     (client as any)._state = 'connected';
     (client as any)._closing = false;
-    (client as any)._groupE2ee = { hasSecret: vi.fn().mockResolvedValue(true) };
     const callSpy = vi.fn().mockResolvedValue({ messages: [] });
     vi.spyOn(client, 'call').mockImplementation(callSpy);
 
@@ -242,7 +167,6 @@ describe('ISSUE-SDK-JS-008: _gapFillActive 来源标记', () => {
     (client as any)._closing = false;
     (client as any)._aid = 'test.aid.com';
     (client as any)._deviceId = 'dev-1';
-    (client as any)._groupE2ee = { hasSecret: vi.fn().mockResolvedValue(true) };
     (client as any)._seqTracker = {
       getContiguousSeq: () => 1,
       onPullResult: vi.fn(),
@@ -313,9 +237,8 @@ describe('ISSUE-SDK-JS-009: group.add_member 检查返回结果后再分发密�
   });
 
   it('add_member RPC 失败时不应触发密钥分发', async () => {
-    const distributeKeyFn = vi.fn().mockResolvedValue(undefined);
-    (client as any)._distributeKeyToNewMember = distributeKeyFn;
-    (client as any)._rotateGroupEpoch = vi.fn().mockResolvedValue(undefined);
+    (client as any)._v2Session = {};
+    const proposeSpy = vi.spyOn(client as any, '_v2AutoProposeState').mockResolvedValue(undefined);
 
     // RPC 返回错误
     (client as any)._transport.call = vi.fn().mockResolvedValue({
@@ -328,12 +251,14 @@ describe('ISSUE-SDK-JS-009: group.add_member 检查返回结果后再分发密�
     });
 
     // result 包含 error
-    expect(distributeKeyFn).not.toHaveBeenCalled();
+    expect((client as any)._distributeKeyToNewMember).toBeUndefined();
+    expect((client as any)._rotateGroupEpoch).toBeUndefined();
+    expect(proposeSpy).not.toHaveBeenCalled();
   });
 
-  it('add_member RPC 成功时应触发 epoch 轮换兜底', async () => {
-    const rotateFn = vi.fn().mockResolvedValue(undefined);
-    (client as any)._maybeLeadRotateGroupEpoch = rotateFn;
+  it('add_member RPC 成功时应触发 V2 state auto-propose', async () => {
+    (client as any)._v2Session = {};
+    const proposeSpy = vi.spyOn(client as any, '_v2AutoProposeState').mockResolvedValue(undefined);
 
     (client as any)._transport.call = vi.fn().mockResolvedValue({
       ok: true,
@@ -345,6 +270,7 @@ describe('ISSUE-SDK-JS-009: group.add_member 检查返回结果后再分发密�
       aid: 'bob.aid.com',
     });
 
-    expect(rotateFn).toHaveBeenCalledWith('g1', expect.any(String), null, false);
+    expect(proposeSpy).toHaveBeenCalledWith('g1');
+    expect((client as any)._maybeLeadRotateGroupEpoch).toBeUndefined();
   });
 });

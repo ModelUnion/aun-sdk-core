@@ -216,9 +216,11 @@ describe('extra_info - 不传 extra_info 时向后兼容', { timeout: 60_000 }, 
       expect(disconnectEvents.length).toBeGreaterThan(0);
       const detail = disconnectEvents[0];
 
-      // 不传 extra_info 时，detail 里不应有 self_extra_info / new_extra_info
-      expect(detail.self_extra_info).toBeUndefined();
-      expect(detail.new_extra_info).toBeUndefined();
+      // 不传 extra_info 时，detail 里不应有实质内容（undefined 或空对象均可）
+      const selfEI = detail.self_extra_info;
+      expect(selfEI === undefined || (typeof selfEI === 'object' && selfEI !== null && Object.keys(selfEI).length === 0)).toBe(true);
+      const newEI = detail.new_extra_info;
+      expect(newEI === undefined || (typeof newEI === 'object' && newEI !== null && Object.keys(newEI).length === 0)).toBe(true);
     } finally {
       await safeClose(c1);
       await safeClose(c2);

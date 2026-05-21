@@ -14,6 +14,23 @@ import (
 	"nhooyr.io/websocket"
 )
 
+func TestDecodeMessagePreservesLargeIntegers(t *testing.T) {
+	const raw = `{"jsonrpc":"2.0","id":"rpc-1","result":{"payload":{"type":"e2ee.p2p_encrypted","aad":{"timestamp":1779276080044847100,"epoch":5}}}}`
+	msg, err := decodeMessage([]byte(raw))
+	if err != nil {
+		t.Fatalf("decodeMessage failed: %v", err)
+	}
+	result, _ := msg["result"].(map[string]any)
+	payload, _ := result["payload"].(map[string]any)
+	aad, _ := payload["aad"].(map[string]any)
+	if got, ok := aad["timestamp"].(int64); !ok || got != 1779276080044847100 {
+		t.Fatalf("timestamp 应保留为精确 int64，got=%T %v", aad["timestamp"], aad["timestamp"])
+	}
+	if got, ok := aad["epoch"].(int64); !ok || got != 5 {
+		t.Fatalf("epoch 应规范化为 int64，got=%T %v", aad["epoch"], aad["epoch"])
+	}
+}
+
 func TestRecvInitialMessageNonChallengeThenChallenge(t *testing.T) {
 	// GO-015: 服务端先发非 challenge 消息，再发 challenge，应成功返回 challenge
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
