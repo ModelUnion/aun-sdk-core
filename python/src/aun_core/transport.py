@@ -78,6 +78,89 @@ def _summarize_dict(payload: Any, fields: tuple[str, ...]) -> str:
     return " ".join(parts) if parts else "<no diag fields>"
 
 
+def _format_trace_tree(spans: list) -> str:
+    """将 span 列表格式化为树状结构字符串。
+
+    按 ts 排序，维护栈识别嵌套，enter/exit 配对显示。
+    """
+    if not spans:
+        return ""
+
+    # 按时间戳排序
+    sorted_spans = sorted(spans, key=lambda s: s.get("ts", 0))
+
+    lines = []
+    stack = []  # 栈：[(node, enter_span), ...]
+
+    for span in sorted_spans:
+        node = span.get("node", "?")
+        action = span.get("action", "process")
+
+        if action == "enter":
+            # Enter span：显示关键业务字段
+            indent = "  " * len(stack)
+            fields = []
+            for key in ("method", "route", "namespace", "aid", "peer_aid", "to_aid",
+                        "group_id", "caller_aid", "curve", "lifecycle_state",
+                        "auth_method", "device_id", "key_source", "spk_id"):
+                if key in span:
+                    value = span[key]
+                    if isinstance(value, str) and len(value) > 32:
+                        value = value[:29] + "..."
+                    fields.append(f"{key}={value}")
+
+            ts_str = _format_ts(span.get("ts", 0))
+            fields_str = " ".join(fields[:4])  # 最多显示 4 个字段
+            lines.append(f"{indent}├─ {node}.enter {fields_str} @{ts_str}")
+            stack.append((node, span))
+
+        elif action == "exit":
+            # Exit span：显示结果和耗时
+            if stack and stack[-1][0] == node:
+                enter_span = stack.pop()[1]
+                indent = "  " * len(stack)
+            else:
+                indent = "  " * len(stack)
+
+            fields = []
+            status = span.get("status", "?")
+            fields.append(f"status={status}")
+
+            if status == "error":
+                if "error_code" in span:
+                    fields.append(f"error_code={span['error_code']}")
+                if "error_msg" in span:
+                    msg = str(span["error_msg"])
+                    if len(msg) > 50:
+                        msg = msg[:47] + "..."
+                    fields.append(f'error="{msg}"')
+            else:
+                for key in ("found", "delivered_count", "message_id", "success", "created"):
+                    if key in span:
+                        fields.append(f"{key}={span[key]}")
+
+            dur = span.get("ms", 0)
+            ts_str = _format_ts(span.get("ts", 0))
+            fields_str = " ".join(fields[:3])
+            lines.append(f"{indent}└─ {node}.exit {fields_str} dur={dur}ms @{ts_str}")
+
+        else:
+            # 旧格式 action=process：单行展示
+            indent = "  " * len(stack)
+            dur = span.get("ms", 0)
+            ts_str = _format_ts(span.get("ts", 0))
+            lines.append(f"{indent}├─ {node}.process dur={dur}ms @{ts_str}")
+
+    return "\n".join(lines)
+
+
+def _format_ts(ts_ms: int) -> str:
+    """格式化时间戳为 HH:MM:SS.mmm"""
+    import datetime
+    dt = datetime.datetime.fromtimestamp(ts_ms / 1000.0)
+    return dt.strftime("%H:%M:%S.%f")[:-3]
+
+
 class RPCTransport:
     def __init__(
         self,
@@ -243,6 +326,16 @@ class RPCTransport:
                         spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
                         enriched = dict(resp_trace)
                         enriched["spans"] = spans
+
+                        # 格式化为树状结构并输出
+                        tree_str = _format_trace_tree(spans)
+                        self._log.info(
+                            "transport",
+                            "[TRACE][%s][error] total=%dms trace_id=%s\n%s",
+                            method, int(_elapsed * 1000),
+                            resp_trace.get("trace_id", ""), tree_str
+                        )
+
                         self._trace_observer({"type": "rpc", "method": method, "trace": enriched,
                                               "status": "error", "duration_ms": int(_elapsed * 1000)})
                     except Exception as exc:
@@ -275,6 +368,16 @@ class RPCTransport:
                     spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
                     enriched = dict(resp_trace)
                     enriched["spans"] = spans
+
+                    # 格式化为树状结构并输出
+                    tree_str = _format_trace_tree(spans)
+                    self._log.info(
+                        "transport",
+                        "[TRACE][%s][ok] total=%dms trace_id=%s\n%s",
+                        method, int(_elapsed * 1000),
+                        resp_trace.get("trace_id", ""), tree_str
+                    )
+
                     self._trace_observer({"type": "rpc", "method": method, "trace": enriched,
                                           "duration_ms": int(_elapsed * 1000)})
                 except Exception as exc:
