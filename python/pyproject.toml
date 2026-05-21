@@ -31,6 +31,12 @@ dependencies = [
     "websockets>=13.0,<15",
 ]
 
+[project.optional-dependencies]
+cli = ["typer>=0.9", "rich>=13.0"]
+
+[project.scripts]
+aun = "aun_cli.main:app"
+
 [project.urls]
 Homepage = "https://github.com/ModelUnion/aun-sdk-core"
 Repository = "https://github.com/ModelUnion/aun-sdk-core"
