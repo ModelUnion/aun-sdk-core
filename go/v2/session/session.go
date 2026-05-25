@@ -87,6 +87,9 @@ type V2Session struct {
 	// 旧 SPK 引用最大 seq 跟踪：key = spk_id
 	oldSPKMaxSeq map[string]oldSPKSeq
 
+	// 旧 SPK 私钥内存缓存：key = spk_id
+	spkCache map[string][]byte
+
 	// nowFn 时间源 hook（测试可注入）
 	nowFn func() time.Time
 
@@ -107,6 +110,7 @@ func NewV2Session(store *V2KeyStore, deviceID, aid string, aidPriv, aidPubDER []
 		peerIKCache:           make(map[string]peerIKCacheEntry),
 		verifiedSPKs:          make(map[string]bool),
 		oldSPKMaxSeq:          make(map[string]oldSPKSeq),
+		spkCache:              make(map[string][]byte),
 		lastUploadedGroupSPKs: make(map[string]string),
 		nowFn:                 time.Now,
 	}
@@ -275,11 +279,15 @@ func (s *V2Session) GetDecryptKeys(spkID string) (ikPriv, spkPriv []byte, err er
 	if spkID == s.spkID {
 		return s.ikPriv, s.spkPriv, nil
 	}
+	if cached, ok := s.spkCache[spkID]; ok {
+		return s.ikPriv, cached, nil
+	}
 	oldSPK, err := s.store.LoadSPK(s.deviceID, spkID)
 	if err != nil {
 		return nil, nil, err
 	}
 	if len(oldSPK) > 0 {
+		s.spkCache[spkID] = oldSPK
 		return s.ikPriv, oldSPK, nil
 	}
 	ikAliasPriv, _, err := s.store.LoadIKSPK(s.deviceID, spkID)

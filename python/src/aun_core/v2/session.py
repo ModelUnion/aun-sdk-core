@@ -56,6 +56,8 @@ class V2Session:
         self._peer_ik_cache: dict[str, tuple[bytes, float]] = {}
         # 已验证的 SPK 签名缓存：{(peer_aid, device_id, spk_id)}
         self._verified_spks: set[tuple[str, str, str]] = set()
+        # 旧 SPK 私钥内存缓存：{spk_id: priv}
+        self._spk_cache: dict[str, bytes] = {}
 
     @staticmethod
     def _group_key(group_id: str) -> str:
@@ -150,8 +152,11 @@ class V2Session:
             return (self._ik_priv, None)
         if spk_id == self._spk_id:
             return (self._ik_priv, self._spk_priv)
+        if spk_id in self._spk_cache:
+            return (self._ik_priv, self._spk_cache[spk_id])
         old_spk = self._store.load_spk(self._device_id, spk_id)
         if old_spk is not None:
+            self._spk_cache[spk_id] = old_spk
             return (self._ik_priv, old_spk)
         ik_spk = self._store.load_ik_spk(self._device_id, spk_id)
         if ik_spk is not None:

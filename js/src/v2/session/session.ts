@@ -94,6 +94,7 @@ export class V2Session {
   private _peerIKCache = new Map<string, { pubDer: Uint8Array; cachedAt: number }>();
   private _verifiedSPKs = new Set<string>();
   private _oldSPKMaxSeq = new Map<string, { seq: number; lastSeenAt: number }>();
+  private _spkCache = new Map<string, Uint8Array>();
   private _nowFn: () => number = () => Date.now();
 
   constructor(
@@ -233,8 +234,13 @@ export class V2Session {
     await this.ensureKeys();
     if (!spkId) return { ikPriv: this._ikPriv };
     if (spkId === this._spkId) return { ikPriv: this._ikPriv, spkPriv: this._spkPriv };
+    const cached = this._spkCache.get(spkId);
+    if (cached) return { ikPriv: this._ikPriv, spkPriv: cached };
     const oldSPK = await this._loadSPK(spkId);
-    if (oldSPK) return { ikPriv: this._ikPriv, spkPriv: oldSPK };
+    if (oldSPK) {
+      this._spkCache.set(spkId, oldSPK);
+      return { ikPriv: this._ikPriv, spkPriv: oldSPK };
+    }
     const ikAlias = await this._loadIKSPK(spkId);
     if (ikAlias) return { ikPriv: ikAlias.priv, spkPriv: ikAlias.priv };
     if (spkId === await this._ikSPKId()) {
