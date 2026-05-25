@@ -8,6 +8,46 @@
 
 ---
 
+## 0.3.3 — 2026-05-25
+
+### Added
+- **V2 Thought 加解密**：`attachV2EnvelopeMetadata` / `v2EnvelopePayloadType` 支持 thought 消息的 V2 envelope 元数据附加与类型判断
+- **V2 Sender IK 延迟解密**：`scheduleV2SenderIKPending` / `scheduleV2SenderIKFetch` / `resolveV2SenderIKPending` / `decryptV2MessageWithPending`，对端 IK 未缓存时挂起消息、异步拉取后重试
+- **V2 Group 事件处理**：`onRawGroupChangedV2` 处理群组变更事件的 V2 路径
+- **agent.md 本地缓存体系**：`SetAgentMDPath` / `CheckAgentMD` / `PublishAgentMD` / `FetchAgentMD`；基于文件系统的 list.json 索引 + 按 AID 存储 + etag 比对
+- **KeyStore agent_md_cache 持久化**：`AgentMDCacheRecord` / `AgentMDCacheUpsert` 结构体 + `LoadAgentMDCache` / `UpsertAgentMDCache`
+- **`AuthLoadKeyPair` / `AuthLoadCert`**：从持久化 keystore 直接加载身份材料的便捷方法
+- **`SeqTracker.UpdateMaxSeen` / `RepairContiguousSeq`**：支持 server_ack_seq 推进 retention floor
+- **`GatewayDiscovery.DiscoverAll`**：返回所有可用网关 URL 列表（多网关容灾）
+- **DNS 容灾**：`NewRPCTransport` / `NewGatewayDiscovery` 支持 `DnsResilientNet` 参数注入
+- **签名跳过策略**：`shouldSkipClientSignature` / `shouldSkipEventSignature` 对内部方法和系统事件跳过签名
+- **`clampAckSeq` / `clampAckParams`**：message.ack seq 参数自动钳位
+- **`normalizeOutboundMessagePayload`**：发送前规范化消息载荷
+- **`resolveGateways`**：从连接参数解析多网关列表
+
+### Changed
+- **V2 P2P 解密路径重构**：`getV2SenderPubDER` + `cacheV2PeerIKFromDevice` 统一对端 IK 获取与缓存
+- **消息调试日志增强**：`logMessageDebug` / `logMessageDebugWithPayload` / `messagePayloadForDebug` / `messageEnvelopeFieldsForDebug`
+
+### Fixed
+- **service-plane envelope 解包**：修复 Kernel trace 字段传递丢失
+- **trace 树状展示**：enter/exit 配对 + 嵌套缩进 + 按 ts 排序
+
+---
+
+## 0.3.1 — 2026-05-22
+
+### Added
+- **`AuthNamespace.CheckAID`**：本地证书自检（`inspectCert` 解析 X.509 有效期与公钥）+ 远端注册状态查询（`checkRemoteAIDRegistration`）；新增 `authValidateAIDName` / `checkLocalAID`
+- **`AUNClient.AuthLoadKeyPair` / `AuthLoadCert`**：从持久化 keystore 直接加载身份材料的便捷方法
+- **RPC trace 增强**：`RPCTransport` 增加 `SetTraceMode` / `GetTraceMode` / `SetTraceObserver`；`handleResponseTrace` / `invokeTraceObserver` 实现 enter/exit span 收集与树状展示
+- **V2 群组 SPK 生命周期**：`V2KeyStore.SaveGroupSPK` / `LoadGroupSPK` / `LoadCurrentGroupSPK`；`V2Session.EnsureGroupSPK` / `EnsureGroupRegistered` / `RotateGroupSPK` / `GetGroupDecryptKeys` / `IsLastUploadedSPK` / `IsLastUploadedGroupSPK` / `publishGroupSPKLocked`
+
+### Fixed
+- short RPC 请求/响应增加 `Debug` 完整报文日志（`shortRPC` 双向打点），便于跨语言诊断
+
+---
+
 ## 0.3.0 — 2026-05-21 ⚠️ BREAKING CHANGE
 
 > **V2-only 版本**：移除全部 V1 E2EE（含群组加密），新增 V2 加密原语，API 不向后兼容。

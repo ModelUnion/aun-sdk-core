@@ -2,7 +2,7 @@
 // 注意: jsdom 环境下 SubtleCrypto 的支持依赖 Node.js 内置 crypto，
 // vitest + jsdom 通常可以正常使用。若不支持则跳过。
 import { describe, it, expect } from 'vitest';
-import { CryptoProvider } from '../../src/crypto.js';
+import { CryptoProvider, importCertPublicKeyEcdsa } from '../../src/crypto.js';
 
 // 检测 SubtleCrypto 是否可用
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
@@ -87,5 +87,26 @@ describe('CryptoProvider', () => {
       const n2 = provider.newClientNonce();
       expect(n1).not.toBe(n2);
     });
+  });
+
+  describe('importCertPublicKeyEcdsa', () => {
+    it.skipIf(!hasSubtleCrypto)(
+      '应从 CN 含 0F 的真实 X.509 证书中精确提取 SPKI',
+      async () => {
+        const certPem = `-----BEGIN CERTIFICATE-----
+MIIBQTCB6KADAgECAhQMS5i3yJsyPE23UtwCdEoLvbsAKjAKBggqhkjOPQQDAjAh
+MR8wHQYDVQQDDBZzYW1wbGUtMTBGLmFnZW50aWQucHViMB4XDTI2MDUyMzE1NDI0
+NloXDTI2MDUyNDE1NDI0NlowITEfMB0GA1UEAwwWc2FtcGxlLTEwRi5hZ2VudGlk
+LnB1YjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAO3kR7TqBcHydO+cpQLzPle
+H0kkKXa8wPsfEMzZ7nKoD7LxTj5xBw+mzA+dcxPsckSNGHTDQXsd5x4JheEMxnEw
+CgYIKoZIzj0EAwIDSAAwRQIgXXGFLstzgq5MTKxBoruotXbL5hwgUnWRwoCXq+HR
+wJICIQCEY0MTYgPbFCqHnPeGUSb/xI7OCnIeVdxFruAvwPxRNw==
+-----END CERTIFICATE-----`;
+
+        const key = await importCertPublicKeyEcdsa(certPem);
+        const exported = new Uint8Array(await crypto.subtle.exportKey('spki', key));
+        expect(exported.length).toBe(91);
+      },
+    );
   });
 });

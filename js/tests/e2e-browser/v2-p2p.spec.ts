@@ -3,7 +3,7 @@
 // 覆盖（对齐 Python e2e_test_v2_p2p_e2ee.py）：
 //   1. V2 session 初始化
 //   2. Alice sendV2 → Bob pullV2 解密
-//   3. ack 后 pull 为空
+//   3. 收到消息后 SDK 内部推进 cursor，后续 pull 不重复
 //   4. 双向通信
 //   5. 批量消息
 //
@@ -204,9 +204,9 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
     expect(result.version).toBe('v2');
   });
 
-  // ── 3. ack 后 pull 为空 ──
+  // ── 3. 收到消息后无需应用层 ack，后续 pull 不重复 ──
 
-  test('ack 后 pull 为空', async ({ page }) => {
+  test('收到消息后无需手动 ack，pull 不重复', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (rid) => {
       const { makeAndConnect, waitForPush, sleep, ISSUER } = (window as any).__v2p2p;
@@ -215,6 +215,7 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
 
       const alice = await makeAndConnect(aliceAid);
       const bob = await makeAndConnect(bobAid);
+      const ns = `p2p:${bobAid}`;
 
       const testText = `v2-ack-test-${Date.now()}`;
       const pushPromise = waitForPush(bob, aliceAid, 1, 15000, (msg: any) =>
@@ -227,25 +228,29 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
       let pushed = await pushPromise;
       if (pushed.length === 0) {
         await sleep(1000);
-        await bob.pullV2();
+        pushed = await bob.pullV2();
       }
 
-      // ack
-      const ackResult = await bob.ackV2();
+      const pushedSeq = Number(pushed[0]?.seq ?? 0);
+      const contiguousSeq = bob._seqTracker.getContiguousSeq(ns);
 
-      // ack 后再 pull 应为空
-      const afterAck = await bob.pullV2();
+      // 应用层不调用 ackV2；SDK 已基于本地 contiguous_seq 避免重复拉取。
+      const afterReceivePull = await bob.pullV2();
 
       await alice.close();
       await bob.close();
 
       return {
-        acked: (ackResult as any)?.acked >= 1 || (ackResult as any)?.status === 'ok',
-        afterAckCount: (afterAck as any[]).length,
+        received: pushed.length > 0,
+        pushedSeq,
+        contiguousSeq,
+        afterReceivePullCount: (afterReceivePull as any[]).length,
       };
     }, rid);
 
-    expect(result.afterAckCount).toBe(0);
+    expect(result.received).toBe(true);
+    expect(result.contiguousSeq).toBeGreaterThanOrEqual(result.pushedSeq);
+    expect(result.afterReceivePullCount).toBe(0);
   });
 
   // ── 4. 双向通信 ──
@@ -365,4 +370,3 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
   });
 
 });
-

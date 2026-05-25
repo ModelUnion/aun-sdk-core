@@ -2,14 +2,16 @@
 """P2P 消息失败路径集成测试。
 
 覆盖重点：
-  1. 显式明文发送不依赖对端 prekey。
-  2. 坏密文（缺 sender_signature）不会投递给业务层，并会推进/确认游标，避免反复 backlog。
+  1. 显式明文发送不走发送端加密/prekey 路径。
+  2. 坏密文（签名篡改）不会投递给业务层，并会推进/确认游标，避免反复 backlog。
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -82,39 +84,39 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
     after_seq = 0
     max_seq = 0
-    while True:
+    for _ in range(100):
         result = await client.call("message.pull", {"after_seq": after_seq, "limit": limit})
-        max_seq = max(max_seq, int(result.get("server_ack_seq") or 0), int(result.get("latest_seq") or 0))
+        latest_seq = int(result.get("latest_seq") or 0)
+        server_ack_seq = int(result.get("server_ack_seq") or 0)
+        raw_count = int(result.get("raw_count") or 0)
+        max_seq = max(max_seq, server_ack_seq, latest_seq)
         messages = result.get("messages", [])
-        if not messages:
-            return max_seq
         for message in messages:
             max_seq = max(max_seq, int(message.get("seq") or 0))
-        if len(messages) < limit:
+        next_after = max(max_seq, after_seq)
+        if raw_count <= 0 or next_after <= after_seq:
             return max_seq
-        after_seq = max_seq
+        after_seq = next_after
+    return max_seq
 
 
 async def _raw_bad_encrypted_send(alice: AUNClient, to_aid: str, text: str) -> dict:
-    peer_cert = await alice._fetch_peer_cert(to_aid)
-    prekey = await alice._fetch_peer_prekey(to_aid)
-    envelope, info = alice._e2ee.encrypt_message(
-        to_aid=to_aid,
+    message_id = f"bad-{uuid.uuid4().hex}"
+    envelope = await alice._build_v2_p2p_envelope(
+        to=to_aid,
         payload={"type": "text", "text": text},
-        peer_cert_pem=peer_cert,
-        prekey=prekey,
+        message_id=message_id,
+        timestamp=int(time.time() * 1000),
+        use_cache=False,
     )
-    if not info or not envelope:
-        raise AssertionError(f"构造密文失败: {info}")
-    envelope.pop("sender_signature", None)
-    aad = envelope.get("aad") or {}
+    sig = bytearray(base64.b64decode(str(envelope.get("sender_signature") or "")))
+    if not sig:
+        raise AssertionError("构造坏密文失败: sender_signature 为空")
+    sig[0] ^= 0x01
+    envelope["sender_signature"] = base64.b64encode(bytes(sig)).decode("ascii")
     return await alice._transport.call("message.send", {
         "to": to_aid,
         "payload": envelope,
-        "type": "e2ee.encrypted",
-        "encrypted": True,
-        "message_id": aad.get("message_id"),
-        "timestamp": aad.get("timestamp"),
     })
 
 
@@ -125,8 +127,9 @@ async def test_plaintext_send_does_not_require_recipient_prekey():
     target_aid = f"plain-{rid}.{_ISSUER}"
     try:
         await _ensure_connected(alice, _ALICE_AID)
-        if target._auth._keystore.load_identity(target_aid) is None:
-            await target.auth.create_aid({"aid": target_aid})
+        # multi-device 持久消息需要接收方至少注册过设备；本用例验证 sender 的 encrypt=false
+        # 明文路径不依赖发送端拉取或使用对端 prekey。
+        await _ensure_connected(target, target_aid)
 
         sent = await alice.call("message.send", {
             "to": target_aid,
@@ -146,27 +149,56 @@ async def test_bad_encrypted_message_advances_cursor_without_backlog():
     alice = _make_client()
     bobb = _make_client()
     delivered: list[dict] = []
+    undecryptable: list[dict] = []
 
     def on_message(data):
         if isinstance(data, dict):
             delivered.append(dict(data))
+
+    def on_undecryptable(data):
+        if isinstance(data, dict):
+            undecryptable.append(dict(data))
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bobb, _BOBB_AID)
         baseline = await _current_max_seq(bobb)
         sub = bobb.on("message.received", on_message)
+        bad_sub = bobb.on("message.undecryptable", on_undecryptable)
         try:
             sent = await _raw_bad_encrypted_send(alice, _BOBB_AID, f"bad-signature-{rid}")
-            bad_seq = int(sent.get("seq") or sent.get("message", {}).get("seq") or 0)
-            if bad_seq <= baseline:
-                raise AssertionError(f"坏密文发送 seq 异常: baseline={baseline}, sent={sent}")
+            if not sent.get("message_id"):
+                raise AssertionError(f"坏密文发送未返回 message_id: {sent}")
 
-            await asyncio.sleep(1.0)
+            first_pull: dict | None = None
+            for _ in range(20):
+                await asyncio.sleep(0.25)
+                first_pull = await bobb.call("message.pull", {"after_seq": baseline, "limit": 20})
+                observed_seq = max(
+                    [int(item.get("seq") or 0) for item in undecryptable]
+                    + [
+                        int(first_pull.get("latest_seq") or 0),
+                        int(first_pull.get("server_ack_seq") or 0),
+                    ]
+                )
+                if observed_seq > baseline:
+                    break
+            if first_pull is None:
+                first_pull = await bobb.call("message.pull", {"after_seq": baseline, "limit": 20})
+
+            bad_seq = max(
+                [int(item.get("seq") or 0) for item in undecryptable]
+                + [
+                    int(first_pull.get("latest_seq") or 0),
+                    int(first_pull.get("server_ack_seq") or 0),
+                ]
+            )
+            if bad_seq <= baseline:
+                raise AssertionError(f"坏密文发送 seq 异常: baseline={baseline}, sent={sent}, first={first_pull}")
+
             if any(item.get("seq") == bad_seq for item in delivered):
                 raise AssertionError(f"坏密文不应投递 message.received: {delivered}")
 
-            first_pull = await bobb.call("message.pull", {"after_seq": baseline, "limit": 20})
             if any(int(item.get("seq") or 0) == bad_seq for item in first_pull.get("messages", [])):
                 raise AssertionError(f"坏密文不应出现在 SDK pull 结果: {first_pull}")
 
@@ -185,6 +217,7 @@ async def test_bad_encrypted_message_advances_cursor_without_backlog():
                 )
             _ok("坏密文不投递且不会反复 backlog")
         finally:
+            bad_sub.unsubscribe()
             sub.unsubscribe()
     finally:
         await alice.close()

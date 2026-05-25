@@ -990,16 +990,19 @@ export class AuthFlow {
           if (!receivedChallenge) {
             // 首条消息是 challenge，忽略并发送 RPC 请求
             receivedChallenge = true;
-            ws.send(JSON.stringify({
+            const requestPayload = JSON.stringify({
               jsonrpc: '2.0',
               id: `pre-${method}`,
               method,
               params,
-            }));
+            });
+            this._log.debug(`short RPC request full: ${requestPayload}`);
+            ws.send(requestPayload);
             return;
           }
           // 第二条消息是 RPC 响应
           globalThis.clearTimeout(timeout);
+          this._log.debug(`short RPC response full: method=${method} ${JSON.stringify(msg)}`);
           try { ws.close(); } catch { /* 忽略 */ }
 
           if (msg.error) {
@@ -1753,7 +1756,7 @@ export class AuthFlow {
   }
 
   private async _loadInstanceState(aid: string): Promise<IdentityRecord | null> {
-    if (!this._deviceId || typeof this._keystore.loadInstanceState !== 'function') {
+    if (typeof this._keystore.loadInstanceState !== 'function') {
       return null;
     }
     return (await this._keystore.loadInstanceState(aid, this._deviceId, this._slotId)) as IdentityRecord | null;
@@ -1777,10 +1780,6 @@ export class AuthFlow {
     }
 
     await this._keystore.saveIdentity(aid, persisted);
-
-    if (!this._deviceId) {
-      return;
-    }
 
     // 实例级字段已拆分到 instance_state，无需从共享 metadata 清理
 

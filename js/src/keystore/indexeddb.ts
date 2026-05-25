@@ -3,7 +3,7 @@
 import { pemToArrayBuffer } from '../crypto.js';
 import type { ModuleLogger } from '../logger.js';
 import { normalizeInstanceId } from '../config.js';
-import type { KeyStore, GroupStateRecord } from './index.js';
+import type { AgentMdCacheRecord, AgentMdCacheUpsert, KeyStore, GroupStateRecord } from './index.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
@@ -138,7 +138,7 @@ async function _decryptPEM(enc: EncryptedEnvelope, seed: string): Promise<string
 // ── IndexedDB 工具 ──────────────────────────────────────
 
 const DB_NAME = 'aun-keystore';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 /** 对象仓库名称 */
 const STORE_KEY_PAIRS = 'key_pairs';
@@ -150,6 +150,7 @@ const STORE_GROUP_CURRENT = 'group_current';
 const STORE_GROUP_OLD_EPOCHS = 'group_old_epochs';
 const STORE_SESSIONS = 'e2ee_sessions';
 const STORE_GROUP_STATE = 'group_state';
+const STORE_AGENT_MD_CACHE = 'agent_md_cache';
 
 const STRUCTURED_RECOVERY_RETENTION_MS = 7 * 24 * 3600 * 1000;
 const CRITICAL_METADATA_KEYS = [] as const;
@@ -238,6 +239,64 @@ function seqTrackerStoreKey(aid: string, deviceId: string, slotId: string, names
   return `${seqTrackerPrefix(aid, deviceId, slotId)}${encodePart(namespace)}`;
 }
 
+function agentMdCachePrefix(ownerAid: string): string {
+  return `${safeAid(ownerAid)}|`;
+}
+
+function agentMdCacheStoreKey(ownerAid: string, targetAid: string): string {
+  return `${agentMdCachePrefix(ownerAid)}${encodePart(targetAid)}`;
+}
+
+function defaultAgentMdCacheRecord(aid: string): AgentMdCacheRecord {
+  return {
+    aid,
+    content: '',
+    local_etag: '',
+    remote_etag: '',
+    last_modified: '',
+    fetched_at: 0,
+    observed_at: 0,
+    checked_at: 0,
+    remote_status: '',
+    verify_status: '',
+    verify_error: '',
+    last_error: '',
+    updated_at: 0,
+  };
+}
+
+function normalizeAgentMdCacheRecord(aid: string, value: unknown): AgentMdCacheRecord | null {
+  if (!isRecord(value)) return null;
+  const out = defaultAgentMdCacheRecord(aid);
+  for (const key of ['content', 'local_etag', 'remote_etag', 'last_modified', 'remote_status', 'verify_status', 'verify_error', 'last_error'] as const) {
+    out[key] = String(value[key] ?? '');
+  }
+  for (const key of ['fetched_at', 'observed_at', 'checked_at', 'updated_at'] as const) {
+    const n = Number(value[key] ?? 0);
+    out[key] = Number.isFinite(n) ? Math.trunc(n) : 0;
+  }
+  out.aid = String(value.aid ?? aid).trim() || aid;
+  return out;
+}
+
+function mergeAgentMdCacheRecord(aid: string, current: AgentMdCacheRecord | null, fields: AgentMdCacheUpsert): AgentMdCacheRecord {
+  const out = current ? { ...current } : defaultAgentMdCacheRecord(aid);
+  out.aid = aid;
+  for (const key of ['content', 'local_etag', 'remote_etag', 'last_modified', 'remote_status', 'verify_status', 'verify_error', 'last_error'] as const) {
+    if (Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== undefined && fields[key] !== null) {
+      out[key] = String(fields[key] ?? '');
+    }
+  }
+  for (const key of ['fetched_at', 'observed_at', 'checked_at'] as const) {
+    if (Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== undefined && fields[key] !== null) {
+      const n = Number(fields[key] ?? 0);
+      out[key] = Number.isFinite(n) ? Math.trunc(n) : 0;
+    }
+  }
+  out.updated_at = Date.now();
+  return out;
+}
+
 function stripStructuredFields(metadata: MetadataRecord): MetadataRecord {
   const plain = deepClone(metadata);
   delete plain.e2ee_prekeys;
@@ -287,6 +346,9 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_GROUP_STATE)) {
         db.createObjectStore(STORE_GROUP_STATE);
+      }
+      if (!db.objectStoreNames.contains(STORE_AGENT_MD_CACHE)) {
+        db.createObjectStore(STORE_AGENT_MD_CACHE);
       }
     };
 
@@ -1807,6 +1869,49 @@ export class IndexedDBKeyStore implements KeyStore {
     await idbDelete(STORE_INSTANCE_STATE, key);
   }
 
+  // ── agent.md Cache ───────────────────────────────────────
+
+  async loadAgentMdCache(ownerAid: string, targetAid: string): Promise<AgentMdCacheRecord | null> {
+    const owner = String(ownerAid ?? '').trim();
+    const target = String(targetAid ?? '').trim();
+    if (!owner || !target) return null;
+    const data = await idbGet<JsonObject>(STORE_AGENT_MD_CACHE, agentMdCacheStoreKey(owner, target));
+    const record = normalizeAgentMdCacheRecord(target, data);
+    return record ? deepClone(record) : null;
+  }
+
+  async upsertAgentMdCache(ownerAid: string, targetAid: string, fields: AgentMdCacheUpsert): Promise<AgentMdCacheRecord> {
+    const owner = String(ownerAid ?? '').trim();
+    const target = String(targetAid ?? '').trim();
+    if (!owner || !target) {
+      throw new Error('upsertAgentMdCache requires ownerAid and targetAid');
+    }
+    const current = await this.loadAgentMdCache(owner, target);
+    const record = mergeAgentMdCacheRecord(target, current, fields ?? {});
+    await idbPut(STORE_AGENT_MD_CACHE, agentMdCacheStoreKey(owner, target), record);
+    return deepClone(record);
+  }
+
+  async listAgentMdContentAids(agentMdPath: string): Promise<string[]> {
+    const root = String(agentMdPath ?? '').trim();
+    if (!root) return [];
+    const prefix = agentMdCachePrefix(root);
+    const suffix = '/agent.md';
+    const aids = new Set<string>();
+    for (const item of await idbGetAllByPrefix<JsonObject>(STORE_AGENT_MD_CACHE, prefix)) {
+      const encodedTarget = item.key.slice(prefix.length);
+      let target = '';
+      try {
+        target = decodeURIComponent(encodedTarget);
+      } catch {
+        target = encodedTarget;
+      }
+      if (!target.endsWith(suffix)) continue;
+      const aid = target.slice(0, -suffix.length).trim();
+      if (aid) aids.add(aid);
+    }
+    return [...aids].sort();
+  }
   // ── Group State（群组状态快照） ─────────────────────────────
 
   async saveGroupState(groupId: string, state: GroupStateRecord): Promise<void> {

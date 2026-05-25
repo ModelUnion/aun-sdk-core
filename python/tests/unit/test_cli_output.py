@@ -35,3 +35,33 @@ def test_output_error():
     text = mock_err.getvalue()
     assert "connection failed" in text
     assert "check gateway URL" in text
+
+
+def test_output_error_json_includes_hint():
+    from aun_cli.output import output_error, set_json_mode
+
+    set_json_mode(True)
+    try:
+        with patch("sys.stderr", new_callable=StringIO) as mock_err:
+            output_error("connection failed", hint="check gateway URL", code=4)
+        data = json.loads(mock_err.getvalue())
+    finally:
+        set_json_mode(False)
+
+    assert data["message"] == "connection failed"
+    assert data["hint"] == "check gateway URL"
+    assert data["code"] == 4
+
+
+def test_cli_invocation_resets_json_mode():
+    from aun_cli.adapter import finish_cli_invocation, start_cli_invocation
+    from aun_cli.output import is_json_mode, output_error
+
+    start_cli_invocation(json_mode=True)
+    assert is_json_mode() is True
+    finish_cli_invocation()
+    assert is_json_mode() is False
+
+    with patch("sys.stderr", new_callable=StringIO) as mock_err:
+        output_error("connection failed", hint="check gateway URL")
+    assert "Hint: check gateway URL" in mock_err.getvalue()

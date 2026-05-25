@@ -89,6 +89,7 @@ type AuthFlowConfig struct {
 	RootCAPath        string            // 自定义根证书路径
 	ChainCacheTTL     int               // 证书链缓存 TTL（秒），默认 86400
 	VerifySSL         bool              // 是否验证 TLS 证书，默认 true
+	DnsNet            *DnsResilientNet  // DNS 容灾网络层
 }
 
 // ── AuthFlow 认证流程管理 ────────────────────────────────────
@@ -106,6 +107,7 @@ type AuthFlow struct {
 	rootCAPath        string
 	chainCacheTTL     int
 	verifySSL         bool
+	dnsNet            *DnsResilientNet
 
 	// H24: 记录最近一次关键持久化失败，调用方可通过 GetLastPersistError 主动轮询
 	lastPersistErr error
@@ -151,6 +153,7 @@ func NewAuthFlow(cfg AuthFlowConfig) *AuthFlow {
 		rootCAPath:         cfg.RootCAPath,
 		chainCacheTTL:      ttl,
 		verifySSL:          cfg.VerifySSL,
+		dnsNet:             cfg.DnsNet,
 		gatewayChainCache:  make(map[string][]string),
 		gatewayCRLCache:    make(map[string]*crlCacheEntry),
 		gatewayOCSPCache:   make(map[string]map[string]*ocspCacheEntry),
@@ -189,12 +192,10 @@ func (a *AuthFlow) LoadIdentity(aid string) (identity map[string]any, err error)
 	if cert != "" {
 		identity["cert"] = cert
 	}
-	if a.deviceID != "" {
-		if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
-			instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID)
-			for k, v := range instanceState {
-				identity[k] = v
-			}
+	if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+		instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID)
+		for k, v := range instanceState {
+			identity[k] = v
 		}
 	}
 	return identity, nil
@@ -331,25 +332,23 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 	// auth.py:authenticate 的快速路径对齐。
 	//
 	// 注意：loadIdentityOrRaise 走的是 keystore.LoadIdentity → tokens 表，
-	// 但 persistIdentity 在 deviceID 非空时会把 token 写到 instance_state
+	// 但 persistIdentity 会把 token 写到 instance_state
 	// （不是 tokens 表）。所以这里需要主动加载 instance_state 才能拿到 token。
 	identityWithState := identity
-	if a.deviceID != "" {
-		if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
-			resolvedAID := authGetStr(identity, "aid")
-			if resolvedAID == "" {
-				resolvedAID = aid
+	if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+		resolvedAID := authGetStr(identity, "aid")
+		if resolvedAID == "" {
+			resolvedAID = aid
+		}
+		if instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID); len(instanceState) > 0 {
+			merged := make(map[string]any, len(identity)+len(instanceState))
+			for k, v := range identity {
+				merged[k] = v
 			}
-			if instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID); len(instanceState) > 0 {
-				merged := make(map[string]any, len(identity)+len(instanceState))
-				for k, v := range identity {
-					merged[k] = v
-				}
-				for k, v := range instanceState {
-					merged[k] = v
-				}
-				identityWithState = merged
+			for k, v := range instanceState {
+				merged[k] = v
 			}
+			identityWithState = merged
 		}
 	}
 	if cachedToken := authGetCachedAccessToken(identityWithState); cachedToken != "" {
@@ -718,6 +717,7 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 	if err != nil {
 		return nil, NewSerializationError(fmt.Sprintf("shortRPC failed to serialize request: %v", err))
 	}
+	pkgLogAuth().Debug("short RPC request full: %s", string(data))
 	wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wCancel()
 	if err := conn.Write(wCtx, websocket.MessageText, data); err != nil {
@@ -736,6 +736,7 @@ func (a *AuthFlow) shortRPC(ctx context.Context, gatewayURL string, method strin
 	if err := json.Unmarshal(respData, &message); err != nil {
 		return nil, NewSerializationError("shortRPC response is not valid JSON")
 	}
+	pkgLogAuth().Debug("short RPC response full: method=%s %s", method, string(respData))
 
 	if errData, ok := message["error"]; ok {
 		if errMap, ok := errData.(map[string]any); ok {
@@ -1561,6 +1562,13 @@ func (a *AuthFlow) recoverCertViaDownload(ctx context.Context, gatewayURL string
 
 // fetchText HTTP GET 返回文本
 func (a *AuthFlow) fetchText(ctx context.Context, targetURL string) (string, error) {
+	if a.dnsNet != nil {
+		body, err := a.dnsNet.HTTPGet(ctx, targetURL, 5*time.Second)
+		if err != nil {
+			return "", NewAuthError(fmt.Sprintf("failed to fetch %s: %v", targetURL, err))
+		}
+		return string(body), nil
+	}
 	client := a.httpClient()
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -1758,9 +1766,6 @@ func (a *AuthFlow) persistIdentity(identity map[string]any) error {
 
 	if err := a.keystore.SaveIdentity(aid, persisted); err != nil {
 		return err
-	}
-	if a.deviceID == "" {
-		return nil
 	}
 	// 实例级字段已拆分到 instance_state，无需从共享 metadata 清理
 	if len(instanceState) == 0 {

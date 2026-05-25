@@ -213,41 +213,66 @@ function parseDerLength(data: Uint8Array, offset: number): { value: number; lenB
   return { value, lenBytes: 1 + numBytes };
 }
 
+function readDerTlvRange(
+  data: Uint8Array,
+  offset: number,
+  expectedTag?: number,
+): { fullStart: number; valueStart: number; valueEnd: number; fullEnd: number; tag: number } | null {
+  if (offset >= data.length) return null;
+  const tag = data[offset];
+  if (expectedTag !== undefined && tag !== expectedTag) return null;
+  const len = parseDerLength(data, offset + 1);
+  if (!len) return null;
+  const valueStart = offset + 1 + len.lenBytes;
+  const valueEnd = valueStart + len.value;
+  if (valueStart > data.length || valueEnd > data.length) return null;
+  return { fullStart: offset, valueStart, valueEnd, fullEnd: valueEnd, tag };
+}
+
+function skipDerTlv(data: Uint8Array, offset: number, expectedTag?: number): number | null {
+  const tlv = readDerTlvRange(data, offset, expectedTag);
+  return tlv?.fullEnd ?? null;
+}
+
 function extractSpkiFromCertPem(certPem: string): ArrayBuffer {
   const certDer = new Uint8Array(pemToArrayBuffer(certPem));
-  const p256Oid = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
-  for (let i = 0; i <= certDer.length - p256Oid.length; i++) {
-    let match = true;
-    for (let j = 0; j < p256Oid.length; j++) {
-      if (certDer[i + j] !== p256Oid[j]) {
-        match = false;
-        break;
-      }
-    }
-    if (!match) continue;
-    for (let seqStart = Math.max(0, i - 32); seqStart <= i; seqStart++) {
-      if (certDer[seqStart] !== 0x30) continue;
-      const seqLen = parseDerLength(certDer, seqStart + 1);
-      if (seqLen === null) continue;
-      const totalLen = 1 + seqLen.lenBytes + seqLen.value;
-      if (totalLen < 50 || totalLen > 140) continue;
-      const spkiCandidate = certDer.slice(seqStart, seqStart + totalLen);
-      let hasBitString = false;
-      for (let k = 20; k < spkiCandidate.length - 10; k++) {
-        if (spkiCandidate[k] === 0x03 && spkiCandidate[k + 2] === 0x00) {
-          hasBitString = true;
-          break;
-        }
-      }
-      if (hasBitString) {
-        return spkiCandidate.buffer.slice(
-          spkiCandidate.byteOffset,
-          spkiCandidate.byteOffset + spkiCandidate.byteLength,
-        ) as ArrayBuffer;
-      }
-    }
+
+  const cert = readDerTlvRange(certDer, 0, 0x30);
+  if (!cert) {
+    throw new Error('unable to extract SPKI public key from certificate');
   }
-  throw new Error('unable to extract SPKI public key from certificate');
+
+  const tbs = readDerTlvRange(certDer, cert.valueStart, 0x30);
+  if (!tbs) {
+    throw new Error('unable to extract SPKI public key from certificate');
+  }
+
+  let pos = tbs.valueStart;
+  if (certDer[pos] === 0xa0) {
+    const next = skipDerTlv(certDer, pos, 0xa0);
+    if (next === null || next > tbs.valueEnd) {
+      throw new Error('unable to extract SPKI public key from certificate');
+    }
+    pos = next;
+  }
+
+  for (const tag of [0x02, 0x30, 0x30, 0x30, 0x30]) {
+    const next = skipDerTlv(certDer, pos, tag);
+    if (next === null || next > tbs.valueEnd) {
+      throw new Error('unable to extract SPKI public key from certificate');
+    }
+    pos = next;
+  }
+
+  const spki = readDerTlvRange(certDer, pos, 0x30);
+  if (!spki || spki.fullEnd > tbs.valueEnd) {
+    throw new Error('unable to extract SPKI public key from certificate');
+  }
+  const spkiDer = certDer.slice(spki.fullStart, spki.fullEnd);
+  return spkiDer.buffer.slice(
+    spkiDer.byteOffset,
+    spkiDer.byteOffset + spkiDer.byteLength,
+  ) as ArrayBuffer;
 }
 
 async function certificateSha256Fingerprint(certPem: string): Promise<string> {

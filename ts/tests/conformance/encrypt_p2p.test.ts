@@ -4,6 +4,8 @@ import { decryptMessage } from '../../src/v2/e2ee/decrypt.js';
 import { generateP256Keypair, privateToPublicDer } from '../../src/v2/crypto/ecdh.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
 
+const SDK_VERSION = '0.3.2';
+
 /**
  * P2P 加密自加密自解密回环：
  *   - 3DH 路径（target 带 SPK）
@@ -73,6 +75,10 @@ describe('encryptP2PMessage roundtrip', () => {
 
     const envelope = encryptP2PMessage(sender, { targets: [target] }, payload);
     expect((envelope.aad as Record<string, unknown>).wrap_protocol).toBe('1DH');
+    expect(envelope.protected_headers).toMatchObject({
+      sdk_lang: 'typescript',
+      sdk_vesion: SDK_VERSION,
+    });
 
     const decrypted = decryptMessage(
       envelope as Record<string, unknown>,
@@ -83,6 +89,43 @@ describe('encryptP2PMessage roundtrip', () => {
       aliceIkPubDer,
     );
     expect(decrypted).toEqual(payload);
+  });
+
+  it('spkPkDer 存在但 spkId 为空时按 1DH 写信封', () => {
+    const [aliceIkPriv, aliceIkPubDer] = generateP256Keypair();
+    const [bobIkPriv, bobIkPubDer] = generateP256Keypair();
+    const [, bobSpkPubDer] = generateP256Keypair();
+
+    const sender = {
+      aid: 'alice.aid.com',
+      deviceId: 'dev-alice-1',
+      ikPriv: aliceIkPriv,
+      ikPubDer: aliceIkPubDer,
+    };
+    const target = {
+      aid: 'bob.aid.com',
+      deviceId: 'dev-bob-1',
+      role: 'peer',
+      keySource: 'peer_device_prekey',
+      ikPkDer: bobIkPubDer,
+      spkPkDer: bobSpkPubDer,
+      spkId: '',
+    };
+    const payload = { text: 'SPK pub without SPK ID uses 1DH' };
+
+    const envelope = encryptP2PMessage(sender, { targets: [target] }, payload);
+    expect((envelope.aad as Record<string, unknown>).wrap_protocol).toBe('1DH');
+    const row = (envelope.recipients as string[][])[0]!;
+    expect(row[3]).toBe('aid_master');
+    expect(row[5]).toBe('');
+    expect(decryptMessage(
+      envelope as Record<string, unknown>,
+      'bob.aid.com',
+      'dev-bob-1',
+      bobIkPriv,
+      undefined,
+      aliceIkPubDer,
+    )).toEqual(payload);
   });
 
   it('protected_headers 支持 ProtectedHeaders 实例并自动注入 payload_type', () => {
@@ -151,7 +194,14 @@ describe('encryptP2PMessage roundtrip', () => {
       { targets: [target] },
       { type: 'text', text: 'plain headers' },
       {
-        protectedHeaders: { Device_ID: 'dev-bob-1', priority: 1 },
+        protectedHeaders: {
+          Device_ID: 'dev-bob-1',
+          priority: 1,
+          flag: true,
+          ratio: 1.0,
+          empty: null,
+          nested: { b: 2, a: 1 },
+        },
         context: { type: 'run', id: 'run-1', _auth: 'ignored' },
       },
     );
@@ -159,6 +209,10 @@ describe('encryptP2PMessage roundtrip', () => {
     expect(envelope.protected_headers).toMatchObject({
       device_id: 'dev-bob-1',
       priority: '1',
+      flag: 'true',
+      ratio: '1',
+      empty: '',
+      nested: '{"a":1,"b":2}',
       payload_type: 'text',
     });
     expect((envelope.protected_headers as Record<string, unknown>)._auth).toBeDefined();
@@ -172,6 +226,43 @@ describe('encryptP2PMessage roundtrip', () => {
       undefined,
       aliceIkPubDer,
     )).toEqual({ type: 'text', text: 'plain headers' });
+  });
+
+  it('protected_headers 被篡改时解密应拒绝', () => {
+    const [aliceIkPriv, aliceIkPubDer] = generateP256Keypair();
+    const [bobIkPriv, bobIkPubDer] = generateP256Keypair();
+    const sender = {
+      aid: 'alice.aid.com',
+      deviceId: 'dev-alice-1',
+      ikPriv: aliceIkPriv,
+      ikPubDer: aliceIkPubDer,
+    };
+    const target = {
+      aid: 'bob.aid.com',
+      deviceId: 'dev-bob-1',
+      role: 'peer',
+      keySource: 'aid_master',
+      ikPkDer: bobIkPubDer,
+    };
+
+    const envelope = encryptP2PMessage(
+      sender,
+      { targets: [target] },
+      { type: 'text', text: 'tamper headers' },
+      { protectedHeaders: { trace_id: 'trace-1' } },
+    ) as Record<string, unknown>;
+    (envelope.protected_headers as Record<string, unknown>).trace_id = 'trace-2';
+
+    expect(() =>
+      decryptMessage(
+        envelope,
+        'bob.aid.com',
+        'dev-bob-1',
+        bobIkPriv,
+        undefined,
+        aliceIkPubDer,
+      ),
+    ).toThrow(/protected_headers _auth verification failed/);
   });
 
   it('未显式传 protected_headers 时也应自动注入 payload_type', () => {
@@ -342,6 +433,39 @@ describe('encryptP2PMessage signature integrity', () => {
         aliceIkPubDer,
       ),
     ).toThrow();
+  });
+
+  it('payload.type 应复制到信封顶层 payload_type', () => {
+    const [aliceIkPriv, aliceIkPubDer] = generateP256Keypair();
+    const [bobIkPriv, bobIkPubDer] = generateP256Keypair();
+    const sender = {
+      aid: 'alice.aid.com',
+      deviceId: 'dev-alice-1',
+      ikPriv: aliceIkPriv,
+      ikPubDer: aliceIkPubDer,
+    };
+    const target = {
+      aid: 'bob.aid.com',
+      deviceId: 'dev-bob-1',
+      role: 'peer',
+      keySource: 'aid_master',
+      ikPkDer: bobIkPubDer,
+    };
+
+    const envelope = encryptP2PMessage(sender, { targets: [target] }, { type: 'text', text: 'visible type' });
+
+    expect(envelope.payload_type).toBe('text');
+    expect((envelope.protected_headers as Record<string, unknown>).payload_type).toBe('text');
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_lang).toBe('typescript');
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBe(SDK_VERSION);
+    expect(decryptMessage(
+      envelope as Record<string, unknown>,
+      'bob.aid.com',
+      'dev-bob-1',
+      bobIkPriv,
+      undefined,
+      aliceIkPubDer,
+    )).toEqual({ type: 'text', text: 'visible type' });
   });
 });
 

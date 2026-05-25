@@ -151,14 +151,30 @@ _DDL_STATEMENTS = [
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS agent_md_cache (
+        aid TEXT PRIMARY KEY,
+        content TEXT NOT NULL DEFAULT '',
+        local_etag TEXT NOT NULL DEFAULT '',
+        remote_etag TEXT NOT NULL DEFAULT '',
+        last_modified TEXT NOT NULL DEFAULT '',
+        fetched_at INTEGER NOT NULL DEFAULT 0,
+        observed_at INTEGER NOT NULL DEFAULT 0,
+        checked_at INTEGER NOT NULL DEFAULT 0,
+        remote_status TEXT NOT NULL DEFAULT 'unknown',
+        verify_status TEXT NOT NULL DEFAULT '',
+        verify_error TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL
+    )""",
     """CREATE TABLE IF NOT EXISTS v2_device_keys (
         device_id TEXT NOT NULL,
         key_type TEXT NOT NULL,
+        group_id TEXT NOT NULL DEFAULT '',
         key_id TEXT NOT NULL DEFAULT '',
         private_key BLOB NOT NULL,
         public_key BLOB NOT NULL,
         created_at INTEGER NOT NULL,
-        PRIMARY KEY (device_id, key_type, key_id)
+        PRIMARY KEY (device_id, key_type, group_id, key_id)
     )""",
 ]
 
@@ -361,6 +377,61 @@ class AIDDatabase:
         self._rename_column_if_exists(conn, "group_current", "secret", "secret_enc")
         self._rename_column_if_exists(conn, "group_old_epochs", "secret", "secret_enc")
         self._rename_column_if_exists(conn, "e2ee_sessions", "data", "data_enc")
+        self._migrate_v2_device_keys(conn)
+
+    @staticmethod
+    def _migrate_v2_device_keys(conn: Any) -> None:
+        rows = conn.execute("PRAGMA table_info(v2_device_keys)").fetchall()
+        if not rows:
+            return
+        columns = {str(row[1]) for row in rows}
+        pk_columns = [str(row[1]) for row in sorted((r for r in rows if int(r[5] or 0) > 0), key=lambda r: int(r[5]))]
+        if "group_id" in columns and pk_columns == ["device_id", "key_type", "group_id", "key_id"]:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_v2_device_keys_scope_created "
+                "ON v2_device_keys(device_id, key_type, group_id, created_at)"
+            )
+            return
+
+        conn.execute("ALTER TABLE v2_device_keys RENAME TO v2_device_keys_legacy")
+        conn.execute(
+            """CREATE TABLE v2_device_keys (
+                device_id TEXT NOT NULL,
+                key_type TEXT NOT NULL,
+                group_id TEXT NOT NULL DEFAULT '',
+                key_id TEXT NOT NULL DEFAULT '',
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (device_id, key_type, group_id, key_id)
+            )"""
+        )
+        legacy_has_group_id = "group_id" in columns
+        select_cols = "device_id, key_type, group_id, key_id, private_key, public_key, created_at" if legacy_has_group_id else "device_id, key_type, '' AS group_id, key_id, private_key, public_key, created_at"
+        legacy_rows = conn.execute(f"SELECT {select_cols} FROM v2_device_keys_legacy").fetchall()
+        for device_id, key_type, group_id, key_id, private_key, public_key, created_at in legacy_rows:
+            migrated_group_id = str(group_id or "")
+            migrated_key_id = str(key_id or "")
+            if key_type in ("group_spk", "group_spk_uploaded") and "\0" in migrated_key_id:
+                migrated_group_id, migrated_key_id = migrated_key_id.split("\0", 1)
+            if private_key is None or public_key is None:
+                if key_type not in ("spk_uploaded", "group_spk_uploaded"):
+                    continue
+                if private_key is None:
+                    private_key = b""
+                if public_key is None:
+                    public_key = b""
+            conn.execute(
+                "INSERT OR REPLACE INTO v2_device_keys "
+                "(device_id, key_type, group_id, key_id, private_key, public_key, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (device_id, key_type, migrated_group_id, migrated_key_id, private_key, public_key, created_at),
+            )
+        conn.execute("DROP TABLE v2_device_keys_legacy")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_v2_device_keys_scope_created "
+            "ON v2_device_keys(device_id, key_type, group_id, created_at)"
+        )
 
     @staticmethod
     def _rename_column_if_exists(conn: Any, table: str, old_name: str, new_name: str) -> None:
@@ -1365,6 +1436,132 @@ class AIDDatabase:
             )
             conn.commit()
         self._retry_on_locked(_do)
+
+    # ── agent.md Cache ───────────────────────────────────────
+
+    @staticmethod
+    def _agent_md_cache_columns() -> list[str]:
+        return [
+            "aid",
+            "content",
+            "local_etag",
+            "remote_etag",
+            "last_modified",
+            "fetched_at",
+            "observed_at",
+            "checked_at",
+            "remote_status",
+            "verify_status",
+            "verify_error",
+            "last_error",
+            "updated_at",
+        ]
+
+    def load_agent_md_cache(self, aid: str) -> dict[str, Any] | None:
+        target = str(aid or "").strip()
+        if not target:
+            return None
+        columns = self._agent_md_cache_columns()
+        conn = self._get_conn()
+        cur = conn.execute(
+            "SELECT " + ", ".join(columns) + " FROM agent_md_cache WHERE aid = ?",
+            (target,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        record = {columns[i]: row[i] for i in range(len(columns))}
+        for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
+            record[key] = int(record.get(key) or 0)
+        return record
+
+    def upsert_agent_md_cache(
+        self,
+        aid: str,
+        *,
+        content: str | None = None,
+        local_etag: str | None = None,
+        remote_etag: str | None = None,
+        last_modified: str | None = None,
+        fetched_at: int | None = None,
+        observed_at: int | None = None,
+        checked_at: int | None = None,
+        remote_status: str | None = None,
+        verify_status: str | None = None,
+        verify_error: str | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, Any]:
+        target = str(aid or "").strip()
+        if not target:
+            return {}
+
+        def _do():
+            columns = self._agent_md_cache_columns()
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT " + ", ".join(columns) + " FROM agent_md_cache WHERE aid = ?",
+                (target,),
+            ).fetchone()
+            if row is None:
+                record: dict[str, Any] = {
+                    "aid": target,
+                    "content": "",
+                    "local_etag": "",
+                    "remote_etag": "",
+                    "last_modified": "",
+                    "fetched_at": 0,
+                    "observed_at": 0,
+                    "checked_at": 0,
+                    "remote_status": "unknown",
+                    "verify_status": "",
+                    "verify_error": "",
+                    "last_error": "",
+                    "updated_at": 0,
+                }
+            else:
+                record = {columns[i]: row[i] for i in range(len(columns))}
+
+            string_updates = {
+                "content": content,
+                "local_etag": local_etag,
+                "remote_etag": remote_etag,
+                "last_modified": last_modified,
+                "remote_status": remote_status,
+                "verify_status": verify_status,
+                "verify_error": verify_error,
+                "last_error": last_error,
+            }
+            for key, value in string_updates.items():
+                if value is not None:
+                    record[key] = str(value or "")
+
+            int_updates = {
+                "fetched_at": fetched_at,
+                "observed_at": observed_at,
+                "checked_at": checked_at,
+            }
+            for key, value in int_updates.items():
+                if value is not None:
+                    record[key] = int(value or 0)
+
+            record["aid"] = target
+            record["updated_at"] = _now_ms()
+            conn.execute(
+                "INSERT INTO agent_md_cache ("
+                + ", ".join(columns)
+                + ") VALUES ("
+                + ", ".join("?" for _ in columns)
+                + ") ON CONFLICT(aid) DO UPDATE SET "
+                + ", ".join(f"{col} = excluded.{col}" for col in columns if col != "aid"),
+                tuple(record.get(col, "") for col in columns),
+            )
+            conn.commit()
+            for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
+                record[key] = int(record.get(key) or 0)
+            return record
+
+        return self._retry_on_locked(_do)
+
 
     # ── Metadata KV ──────────────────────────────────────────
 

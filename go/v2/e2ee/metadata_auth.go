@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
 
 	"github.com/modelunion/aun-sdk-core/go/v2/crypto"
@@ -75,6 +73,45 @@ func withMetadataAuth(metadata map[string]any, key []byte, domain []byte) map[st
 	return result
 }
 
+func verifyMetadataAuth(metadata any, key []byte, domain []byte, fieldName string) error {
+	if metadata == nil {
+		return nil
+	}
+	obj, ok := metadata.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be an object", fieldName)
+	}
+	body := make(map[string]any, len(obj))
+	for k, v := range obj {
+		if k != "_auth" {
+			body[k] = v
+		}
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	auth, ok := obj["_auth"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s missing _auth", fieldName)
+	}
+	if alg, _ := auth["alg"].(string); alg != "HMAC-SHA256" {
+		return fmt.Errorf("%s unsupported _auth alg", fieldName)
+	}
+	tagB64, _ := auth["tag"].(string)
+	if tagB64 == "" {
+		return fmt.Errorf("%s missing _auth tag", fieldName)
+	}
+	actual, err := base64.StdEncoding.DecodeString(tagB64)
+	if err != nil {
+		return fmt.Errorf("%s invalid _auth tag: %w", fieldName, err)
+	}
+	expected := metadataAuthTag(key, domain, body)
+	if !hmac.Equal(actual, expected) {
+		return fmt.Errorf("%s _auth verification failed", fieldName)
+	}
+	return nil
+}
+
 // normalizeProtectedHeaderKey 与 Python ProtectedHeaders._normalize_key 对齐。
 func normalizeProtectedHeaderKey(key string) (string, error) {
 	value := strings.ToLower(strings.TrimSpace(key))
@@ -93,59 +130,20 @@ func normalizeProtectedHeaderKey(key string) (string, error) {
 	return value, nil
 }
 
-// pythonProtectedHeaderValueString 与 Python str(value) 的常见标量语义对齐。
-func pythonProtectedHeaderValueString(v any) string {
+// protectedHeaderValueString 使用语言无关规则把 header value 转为字符串：
+// string 原样，nil 为空串，其它 JSON 值使用 canonical JSON。
+func protectedHeaderValueString(v any) (out string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
 	switch x := v.(type) {
 	case nil:
-		return ""
+		return "", nil
 	case string:
-		return x
-	case bool:
-		if x {
-			return "True"
-		}
-		return "False"
-	case int:
-		return strconv.Itoa(x)
-	case int8:
-		return strconv.FormatInt(int64(x), 10)
-	case int16:
-		return strconv.FormatInt(int64(x), 10)
-	case int32:
-		return strconv.FormatInt(int64(x), 10)
-	case int64:
-		return strconv.FormatInt(x, 10)
-	case uint:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint8:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint16:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint32:
-		return strconv.FormatUint(uint64(x), 10)
-	case uint64:
-		return strconv.FormatUint(x, 10)
-	case float32:
-		return pythonProtectedHeaderFloatString(float64(x))
-	case float64:
-		return pythonProtectedHeaderFloatString(x)
+		return x, nil
 	default:
-		return fmt.Sprint(v)
+		return string(crypto.CanonicalJSON(x)), nil
 	}
-}
-
-func pythonProtectedHeaderFloatString(f float64) string {
-	switch {
-	case math.IsNaN(f):
-		return "nan"
-	case math.IsInf(f, 1):
-		return "inf"
-	case math.IsInf(f, -1):
-		return "-inf"
-	}
-	s := strconv.FormatFloat(f, 'g', -1, 64)
-	if !strings.ContainsAny(s, ".eE") {
-		s += ".0"
-	}
-	return s
 }

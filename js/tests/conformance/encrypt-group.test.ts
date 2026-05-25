@@ -3,6 +3,8 @@ import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group';
 import { decryptMessage } from '../../src/v2/e2ee/decrypt';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh';
 
+const SDK_VERSION = '0.3.2';
+
 describe('encryptGroupMessage - self loop', () => {
   it('group 3DH+1DH: bob 3DH, carol 1DH', async () => {
     const [aliceIkPriv, aliceIkPub] = await generateP256Keypair();
@@ -51,6 +53,10 @@ describe('encryptGroupMessage - self loop', () => {
       state_version: 1,
       state_hash: 'abc123',
       state_chain: 'chain-link-1',
+    });
+    expect((env as any).protected_headers).toMatchObject({
+      sdk_lang: 'javascript',
+      sdk_vesion: SDK_VERSION,
     });
 
     // Bob 解密
@@ -118,5 +124,86 @@ describe('encryptGroupMessage - self loop', () => {
       aliceIkPub,
     );
     expect(decBob).toEqual(payload);
+  });
+
+  it('spkPkDer 存在但 spkId 为空时按 1DH 写群信封', async () => {
+    const [aliceIkPriv, aliceIkPub] = await generateP256Keypair();
+    const [bobIkPriv, bobIkPub] = await generateP256Keypair();
+    const [, bobSpkPub] = await generateP256Keypair();
+
+    const payload = { text: 'group SPK pub without ID uses 1DH' };
+    const env = await encryptGroupMessage(
+      {
+        aid: 'alice.aid.com',
+        deviceId: 'dev-alice-1',
+        ikPriv: aliceIkPriv,
+        ikPubDer: aliceIkPub,
+      },
+      'g-x',
+      1,
+      [
+        {
+          aid: 'bob.aid.com',
+          deviceId: 'dev-bob-1',
+          role: 'member',
+          keySource: 'group_device_prekey',
+          ikPkDer: bobIkPub,
+          spkPkDer: bobSpkPub,
+          spkId: '',
+        },
+      ],
+      payload,
+    );
+
+    expect((env as any).aad.wrap_protocol).toBe('1DH');
+    expect((env as any).recipients[0][3]).toBe('aid_master');
+    expect((env as any).recipients[0][5]).toBe('');
+    const decBob = await decryptMessage(
+      env,
+      'bob.aid.com',
+      'dev-bob-1',
+      bobIkPriv,
+      undefined,
+      aliceIkPub,
+    );
+    expect(decBob).toEqual(payload);
+  });
+
+  it('group payload.type 应复制到信封顶层 payload_type', async () => {
+    const [aliceIkPriv, aliceIkPub] = await generateP256Keypair();
+    const [bobIkPriv, bobIkPub] = await generateP256Keypair();
+    const env = await encryptGroupMessage(
+      {
+        aid: 'alice.aid.com',
+        deviceId: 'dev-alice-1',
+        ikPriv: aliceIkPriv,
+        ikPubDer: aliceIkPub,
+      },
+      'g-x',
+      1,
+      [
+        {
+          aid: 'bob.aid.com',
+          deviceId: 'dev-bob-1',
+          role: 'member',
+          keySource: 'aid_master',
+          ikPkDer: bobIkPub,
+        },
+      ],
+      { type: 'group-text', text: 'visible group type' },
+    );
+
+    expect((env as any).payload_type).toBe('group-text');
+    expect((env as any).protected_headers.payload_type).toBe('group-text');
+    expect((env as any).protected_headers.sdk_lang).toBe('javascript');
+    expect((env as any).protected_headers.sdk_vesion).toBe(SDK_VERSION);
+    await expect(decryptMessage(
+      env,
+      'bob.aid.com',
+      'dev-bob-1',
+      bobIkPriv,
+      undefined,
+      aliceIkPub,
+    )).resolves.toEqual({ type: 'group-text', text: 'visible group type' });
   });
 });

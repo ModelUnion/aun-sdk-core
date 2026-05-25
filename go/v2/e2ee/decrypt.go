@@ -27,8 +27,8 @@ import (
 // 找不到自己 row 时返回 nil, nil（与 Python `return None` 等价）。
 // 验签 / digest / 解密失败返回 error。
 //
-// selfSPKPriv 为 nil 表示自己只有 1DH 路径；当 row 的 spk_id 非空且
-// selfSPKPriv 非空时走 3DH 接收方路径。
+// selfSPKPriv 为 nil 表示自己只有 1DH 路径；row 的 spk_id 非空但
+// selfSPKPriv 为空时返回 spk_missing，不允许静默降级到 1DH。
 func DecryptMessage(envelope map[string]any, selfAID, selfDeviceID string,
 	selfIKPriv []byte, selfSPKPriv []byte, senderPubDER []byte) (map[string]any, error) {
 
@@ -86,7 +86,16 @@ func DecryptMessage(envelope map[string]any, selfAID, selfDeviceID string,
 	wrappedTag := wrappedKey[len(wrappedKey)-16:]
 	masterKey, err := crypto.AESGCMDecrypt(wrapKey, wrapNonce, wrappedCT, wrappedTag, nil)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt: 解 master_key 失败: %w", err)
+		return nil, fmt.Errorf(
+			"wrap_key_decrypt_failed: %s; master_key unwrap AEAD authentication failed; likely wrong local SPK/IK, stale sender bootstrap, or tampered recipient wrap; cause=%w",
+			rowContext(row), err,
+		)
+	}
+	if err := verifyMetadataAuth(envelope["protected_headers"], masterKey, protectedHeadersDomain, "protected_headers"); err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
+	}
+	if err := verifyMetadataAuth(envelope["context"], masterKey, protectedContextDomain, "context"); err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
 	}
 
 	// 5. 解密正文
@@ -104,7 +113,10 @@ func DecryptMessage(envelope map[string]any, selfAID, selfDeviceID string,
 	}
 	plaintext, err := crypto.AESGCMDecrypt(masterKey, msgNonce, ct, tag, aadBytes)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt: 解密正文失败: %w", err)
+		return nil, fmt.Errorf(
+			"body_decrypt_failed: %s; message body AEAD authentication failed after master_key unwrap; likely AAD/ciphertext/tag mismatch or envelope body corruption; cause=%w",
+			envelopeContext(envelope, row), err,
+		)
 	}
 
 	// 6. JSON 解析（保留数字精度）
@@ -219,6 +231,9 @@ func locateRecipientRow(envelope map[string]any, selfAID, selfDeviceID string) (
 // computeWrapKey 根据 row 的 spk_id 与 selfSPKPriv 是否齐备分流 3DH/1DH。
 func computeWrapKey(row []string, selfIKPriv, selfSPKPriv, senderSessionPKDER, senderMasterPKDER, salt []byte) ([]byte, error) {
 	spkID := safe(row, 5)
+	if spkID != "" && len(selfSPKPriv) == 0 {
+		return nil, fmt.Errorf("spk_missing: spk_id=%s", spkID)
+	}
 	if spkID != "" && len(selfSPKPriv) > 0 {
 		// 3DH 接收方：
 		//   DH1 = ECDH(self_ik_priv, sender_session_pk)
@@ -336,5 +351,36 @@ func envStr(envelope map[string]any, key string) string {
 
 func mapStr(m map[string]any, key string) string {
 	s, _ := m[key].(string)
+	return s
+}
+
+func rowContext(row []string) string {
+	spkID := safe(row, 5)
+	if spkID == "" {
+		spkID = "<empty>"
+	}
+	return fmt.Sprintf("recipient=%s/%s; role=%s; key_source=%s; spk_id=%s",
+		safe(row, 0), safe(row, 1), safe(row, 2), safe(row, 3), spkID)
+}
+
+func envelopeContext(envelope map[string]any, row []string) string {
+	aad, _ := envelope["aad"].(map[string]any)
+	messageID := v2String(aad["message_id"])
+	if messageID == "" {
+		messageID = v2String(envelope["message_id"])
+	}
+	groupID := v2String(aad["group_id"])
+	if groupID == "" {
+		groupID = v2String(envelope["group_id"])
+	}
+	if groupID == "" {
+		groupID = "<p2p>"
+	}
+	return fmt.Sprintf("message_id=%s; group_id=%s; from=%s; from_device=%s; %s",
+		messageID, groupID, v2String(aad["from"]), v2String(aad["from_device"]), rowContext(row))
+}
+
+func v2String(value any) string {
+	s, _ := value.(string)
 	return s
 }

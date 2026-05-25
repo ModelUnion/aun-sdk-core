@@ -13,6 +13,7 @@
 | [03-核心概念](03-核心概念.md) | AID · 连接状态机 · 认证流程 · E2EE |
 | [04-连接与认证](04-连接与认证.md) | 创建AID · 连接网关 · 网关发现 · 调用RPC · 事件订阅 |
 | [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · ProtectedHeaders · 会话管理 · 自定义密钥存储 |
+| [E2EE_V2消息通信时序图](E2EE_V2消息通信时序图.md) | V2-only 明文/加密 P2P/GROUP 消息主链路 · Mermaid 时序图 |
 | [GROUP-E2EE轮换竞态清单](GROUP-E2EE轮换竞态清单.md) | GROUP epoch key 轮换状态 · 竞态条件 · 补测清单 |
 | [GROUP-E2EE现状对比与改进建议](GROUP-E2EE现状对比与改进建议.md) | 当前 GROUP E2EE 实现定位 · 成熟方案对比 · 风险边界 · 分阶段改进建议 |
 | [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · MetaNamespace（信任根列表 / issuer root 更新） · E2EEManager · 内置事件 · RPC手册索引 |
@@ -53,6 +54,7 @@
 ### E2EE 端到端加密
 - **E2EE 机制概述** → [03-核心概念](03-核心概念.md)
 - **加密消息收发** → [05-E2EE加密通信](05-E2EE加密通信.md)
+- **V2-only P2P/GROUP 明文与加密时序** → [E2EE_V2消息通信时序图](E2EE_V2消息通信时序图.md)
 - **会话管理** → [05-E2EE加密通信](05-E2EE加密通信.md)
 - **GROUP epoch key 轮换竞态/补测清单** → [GROUP-E2EE轮换竞态清单](GROUP-E2EE轮换竞态清单.md)
 - **GROUP E2EE 现状对比与演进建议** → [GROUP-E2EE现状对比与改进建议](GROUP-E2EE现状对比与改进建议.md)
@@ -105,6 +107,9 @@ SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数
 
 ### 05-E2EE加密通信
 E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；`protected_headers` 与可验证 `context` 元数据；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
+
+### E2EE_V2消息通信时序图
+当前 V2-only 实现下的主通信链路图。覆盖 V2 设备密钥注册、P2P 明文、P2P 加密、GROUP 明文、GROUP 加密五条时序；明确 P2P 加密走 `message.send` 承载 `e2ee.p2p_encrypted`，GROUP 加密走 `group.v2.send` 承载 `e2ee.group_encrypted`，接收端统一通过 V2 pull 后由 SDK 解密。
 
 ### GROUP-E2EE轮换竞态清单
 GROUP epoch key 两阶段轮换的状态边界和竞态检查项。覆盖 pending 期间成员变更、leader 竞争、分发/ack/commit 失败、stale pending、key recovery、旧 epoch 保留等场景，用于补充测试和实现审查。

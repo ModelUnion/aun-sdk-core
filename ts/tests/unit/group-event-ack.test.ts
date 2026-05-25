@@ -112,7 +112,15 @@ describe('group.changed 事件补洞行为', () => {
         params: JSON.parse(JSON.stringify(params)),
       });
       if (method === 'group.pull_events') {
-        return { events: [], cursor: { current_seq: 7 } };
+        return {
+          events: [{
+            group_id: 'G1',
+            event_seq: 7,
+            event_type: 'group.announcement_updated',
+            action: 'announcement_updated',
+          }],
+          cursor: { current_seq: 7 },
+        };
       }
       if (method === 'group.ack_events') {
         return { ok: true };
@@ -129,7 +137,7 @@ describe('group.changed 事件补洞行为', () => {
 
     const pullCall = transportCalls.find(({ method }) => method === 'group.pull_events');
     expect(pullCall?.params).toMatchObject({
-      group_id: 'G1',
+      group_id: 'g1',
       after_event_seq: 0,
       device_id: 'device-1',
       slot_id: 'slot-a',
@@ -143,6 +151,76 @@ describe('group.changed 事件补洞行为', () => {
     });
     expect((client as any)._seqTracker.getContiguousSeq('group_event:G1')).toBe(7);
     expect((client as any)._gapFillDone.size).toBe(0);
+    saveSpy.mockRestore();
+  });
+
+  it('group.pull_events 空页只修正 cursor，不发送 ack_events', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._closing = false;
+    (client as any)._deviceId = 'device-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._seqTracker.restoreState({ 'group_event:G1': 5 });
+    (client as any)._dispatcher.publish = vi.fn().mockResolvedValue(undefined);
+    const saveSpy = vi.spyOn(client as any, '_saveSeqTrackerState').mockImplementation(() => {});
+    const transportCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    (client as any)._transport.call = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      transportCalls.push({ method, params: JSON.parse(JSON.stringify(params)) });
+      if (method === 'group.pull_events') {
+        return { events: [], cursor: { current_seq: 9 } };
+      }
+      return { ok: true };
+    });
+
+    await (client as any)._fillGroupEventGap('G1');
+
+    expect((client as any)._seqTracker.getContiguousSeq('group_event:G1')).toBe(9);
+    expect(transportCalls.some(({ method }) => method === 'group.ack_events')).toBe(false);
+    saveSpy.mockRestore();
+  });
+
+  it('group.pull_events 发布事件后只 ack 一次最终 contiguous_seq', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._closing = false;
+    (client as any)._deviceId = 'device-1';
+    (client as any)._slotId = 'slot-a';
+    const ns = 'group_event:G1';
+    (client as any)._seqTracker.onMessageSeq(ns, 3);
+    const saveSpy = vi.spyOn(client as any, '_saveSeqTrackerState').mockImplementation(() => {});
+    const transportCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    (client as any)._transport.call = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      transportCalls.push({ method, params: JSON.parse(JSON.stringify(params)) });
+      if (method === 'group.pull_events') {
+        return {
+          events: [{
+            group_id: 'G1',
+            event_seq: 2,
+            event_type: 'group.announcement_updated',
+            action: 'announcement_updated',
+          }],
+          cursor: { current_seq: 2 },
+        };
+      }
+      return { ok: true };
+    });
+    (client as any)._dispatcher.publish = vi.fn(async (event: string, payload: Record<string, unknown>) => {
+      if (event === 'group.changed' && payload?._from_gap_fill) {
+        (client as any)._seqTracker.onMessageSeq(ns, 4);
+      }
+    });
+
+    await (client as any)._fillGroupEventGap('G1');
+
+    const ackCalls = transportCalls.filter(({ method }) => method === 'group.ack_events');
+    expect(ackCalls).toHaveLength(1);
+    expect(ackCalls[0].params).toMatchObject({
+      group_id: 'G1',
+      event_seq: 4,
+      device_id: 'device-1',
+      slot_id: 'slot-a',
+    });
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(4);
     saveSpy.mockRestore();
   });
 });

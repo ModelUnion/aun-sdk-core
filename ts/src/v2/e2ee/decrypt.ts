@@ -29,6 +29,11 @@ import {
   ProofStep,
 } from '../crypto/recipients.js';
 import { SUITE_NAME } from './types.js';
+import {
+  verifyMetadataAuth,
+  PROTECTED_HEADERS_DOMAIN,
+  PROTECTED_CONTEXT_DOMAIN,
+} from './metadata-auth.js';
 
 const TEXT = new TextEncoder();
 const INFO_3DH = TEXT.encode('AUN-V2-3DH');
@@ -121,13 +126,35 @@ export function decryptMessage(
   }
   const wrappedCt = wrappedKey.subarray(0, wrappedKey.length - 16);
   const wrappedTag = wrappedKey.subarray(wrappedKey.length - 16);
-  const masterKey = aesGcmDecrypt(wrapKey, wrapNonce, wrappedCt, wrappedTag, new Uint8Array(0));
+  let masterKey: Uint8Array;
+  try {
+    masterKey = aesGcmDecrypt(wrapKey, wrapNonce, wrappedCt, wrappedTag, new Uint8Array(0));
+  } catch (exc) {
+    throw new Error(
+      `wrap_key_decrypt_failed: ${rowContext(row)}; ` +
+      'master_key unwrap AEAD authentication failed; ' +
+      'likely wrong local SPK/IK, stale sender bootstrap, or tampered recipient wrap; ' +
+      `cause=${formatCaught(exc)}`,
+    );
+  }
+  verifyMetadataAuth(envelope.protected_headers, masterKey, PROTECTED_HEADERS_DOMAIN, 'protected_headers');
+  verifyMetadataAuth(envelope.context, masterKey, PROTECTED_CONTEXT_DOMAIN, 'context');
 
   // 6. decrypt body
   const msgNonce = new Uint8Array(Buffer.from(String(envelope.nonce ?? ''), 'base64'));
   const ct = new Uint8Array(Buffer.from(String(envelope.ciphertext ?? ''), 'base64'));
   const tag = new Uint8Array(Buffer.from(String(envelope.tag ?? ''), 'base64'));
-  const plaintext = aesGcmDecrypt(masterKey, msgNonce, ct, tag, aadBytes);
+  let plaintext: Uint8Array;
+  try {
+    plaintext = aesGcmDecrypt(masterKey, msgNonce, ct, tag, aadBytes);
+  } catch (exc) {
+    throw new Error(
+      `body_decrypt_failed: ${envelopeContext(envelope, row)}; ` +
+      'message body AEAD authentication failed after master_key unwrap; ' +
+      'likely AAD/ciphertext/tag mismatch or envelope body corruption; ' +
+      `cause=${formatCaught(exc)}`,
+    );
+  }
 
   // 7. parse JSON
   return JSON.parse(Buffer.from(plaintext).toString('utf-8')) as Record<string, unknown>;
@@ -155,6 +182,9 @@ function computeWrapKey(
   salt: Uint8Array,
 ): Uint8Array {
   const spkId = row[5];
+  if (spkId && !selfSpkPriv) {
+    throw new Error(`spk_missing: spk_id=${spkId}`);
+  }
   if (spkId && selfSpkPriv) {
     // 3DH 接收方：DH1=ECDH(self_ik, sender_session)；DH2=ECDH(self_spk, sender_master)；DH3=ECDH(self_spk, sender_session)
     const dh1 = ecdhComputeShared(selfIkPriv, senderSessionPkDer);
@@ -176,6 +206,39 @@ function findMyRow(rows: string[][], aid: string, deviceId: string): string[] | 
     if (r[0] === aid && r[1] === deviceId) return r;
   }
   return null;
+}
+
+function formatCaught(exc: unknown): string {
+  if (exc instanceof Error) {
+    return exc.message ? `${exc.name}: ${exc.message}` : exc.name;
+  }
+  return String(exc);
+}
+
+function rowContext(row: string[]): string {
+  return [
+    `recipient=${String(row[0] ?? '')}/${String(row[1] ?? '')}`,
+    `role=${String(row[2] ?? '')}`,
+    `key_source=${String(row[3] ?? '')}`,
+    `spk_id=${String(row[5] ?? '') || '<empty>'}`,
+  ].join('; ');
+}
+
+function envelopeContext(envelope: Record<string, unknown>, row: string[]): string {
+  const aad = envelope.aad && typeof envelope.aad === 'object' && !Array.isArray(envelope.aad)
+    ? envelope.aad as Record<string, unknown>
+    : {};
+  const messageId = String(aad.message_id ?? envelope.message_id ?? '');
+  const groupId = String(aad.group_id ?? envelope.group_id ?? '') || '<p2p>';
+  const from = String(aad.from ?? '');
+  const fromDevice = String(aad.from_device ?? '');
+  return [
+    `message_id=${messageId}`,
+    `group_id=${groupId}`,
+    `from=${from}`,
+    `from_device=${fromDevice}`,
+    rowContext(row),
+  ].join('; ');
 }
 
 function verifySenderSignature(

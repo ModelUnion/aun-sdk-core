@@ -19,6 +19,169 @@ const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}
 /** RPC 请求递增计数器，避免 Date.now() 高并发碰撞 */
 let _rpcIdCounter = 0;
 
+// ── Trace 树状展示 ─────────────────────────────────────────────
+
+const TRACE_SPAN_DETAIL_FIELDS = [
+  'method', 'route', 'namespace', 'instance_id', 'aid', 'caller_aid',
+  'peer_aid', 'to_aid', 'from_aid', 'group_id', 'message_id', 'event',
+  'status', 'error_code', 'error_msg', 'found', 'delivered_count',
+  'success', 'created', 'connection_id', 'device_id', 'slot_id',
+  'key_source', 'spk_id', 'curve', 'lifecycle_state', 'auth_method',
+] as const;
+
+/** 按因果顺序排序 trace spans（不依赖绝对 ts，避免跨进程时钟偏差） */
+function sortTraceSpansForDisplay(spans: Record<string, unknown>[]): Record<string, unknown>[] {
+  const indexed = spans
+    .map((span, idx) => ({ idx, span }))
+    .filter(({ span }) => span !== null && typeof span === 'object');
+
+  indexed.sort((a, b) => {
+    const stageA = _spanStage(a.span);
+    const stageB = _spanStage(b.span);
+    if (stageA !== stageB) return stageA - stageB;
+    return a.idx - b.idx;
+  });
+
+  return indexed.map(({ span }) => span);
+}
+
+function _spanStage(span: Record<string, unknown>): number {
+  const node = String(span.node ?? '');
+  const action = String(span.action ?? 'process');
+  if (node === 'sdk' && action === 'send') return 0;
+  if (node === 'gateway' && (action === 'relay_in' || action === 'enter')) return 10;
+  if (node === 'gateway' && (action === 'relay_out' || action === 'exit')) return 90;
+  if (node === 'sdk' && action === 'recv') return 100;
+  return 50;
+}
+
+/** 生成单调逻辑时间偏移（以 sdk.send 为 0 点，sdk.recv 为总耗时） */
+function traceLogicalOffsets(spans: Record<string, unknown>[]): number[] {
+  let totalMs: number | null = null;
+  for (const span of spans) {
+    if (span.node === 'sdk' && span.action === 'recv') {
+      const ms = span.ms;
+      if (typeof ms === 'number' && ms >= 0) {
+        totalMs = Math.round(ms);
+        break;
+      }
+    }
+  }
+
+  const serverTs: number[] = [];
+  for (const span of spans) {
+    if (span.node !== 'sdk' && typeof span.ts === 'number' && span.ts > 0) {
+      serverTs.push(Math.round(span.ts as number));
+    }
+  }
+  const serverMin = serverTs.length > 0 ? Math.min(...serverTs) : null;
+  const serverMax = serverTs.length > 0 ? Math.max(...serverTs) : null;
+  const serverDur = (serverMin !== null && serverMax !== null) ? serverMax - serverMin : 0;
+
+  let serverBase: number;
+  let serverScale: number;
+  if (totalMs !== null && serverMin !== null) {
+    if (serverDur > totalMs && serverDur > 0) {
+      serverBase = 0;
+      serverScale = totalMs / serverDur;
+    } else {
+      serverBase = Math.max(0, totalMs - serverDur);
+      serverScale = 1.0;
+    }
+  } else {
+    serverBase = 0;
+    serverScale = 1.0;
+  }
+
+  const offsets: number[] = [];
+  let lastOffset = 0;
+  for (let idx = 0; idx < spans.length; idx++) {
+    const span = spans[idx];
+    const node = span.node;
+    const action = span.action;
+    const ts = span.ts;
+    let offset: number;
+
+    if (node === 'sdk' && action === 'send') {
+      offset = 0;
+    } else if (node === 'sdk' && action === 'recv' && totalMs !== null) {
+      offset = totalMs;
+    } else if (node !== 'sdk' && serverMin !== null && typeof ts === 'number' && ts > 0) {
+      offset = Math.round(serverBase + (Math.round(ts) - serverMin) * serverScale);
+    } else {
+      offset = idx === 0 ? 0 : lastOffset;
+    }
+
+    if (offset < lastOffset) offset = lastOffset;
+    offsets.push(offset);
+    lastOffset = offset;
+  }
+  return offsets;
+}
+
+/** 格式化 span 的业务字段为 key=value 字符串 */
+function formatTraceFields(span: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const key of TRACE_SPAN_DETAIL_FIELDS) {
+    const value = span[key];
+    if (value === undefined || value === null || value === '') continue;
+    let s = String(value);
+    if (s.length > 48) s = s.slice(0, 45) + '...';
+    parts.push(`${key}=${s}`);
+  }
+  return parts.join(' ');
+}
+
+/** 将 span 列表格式化为树状结构字符串 */
+function formatTraceTree(spans: Record<string, unknown>[]): string {
+  if (!spans || spans.length === 0) return '';
+
+  const sortedSpans = sortTraceSpansForDisplay(spans);
+  const offsets = traceLogicalOffsets(sortedSpans);
+
+  const lines: string[] = [];
+  const stack: Array<{ node: string; span: Record<string, unknown> }> = [];
+
+  for (let idx = 0; idx < sortedSpans.length; idx++) {
+    const span = sortedSpans[idx];
+    const node = String(span.node ?? '?');
+    const action = String(span.action ?? 'process');
+    const timePart = ` +${offsets[idx]}ms`;
+
+    if (action === 'enter') {
+      const indent = '  '.repeat(stack.length);
+      const fieldsStr = formatTraceFields(span);
+      const detail = fieldsStr ? ` ${fieldsStr}` : '';
+      lines.push(`${indent}├─ ${node}.enter${detail}${timePart}`);
+      stack.push({ node, span });
+    } else if (action === 'exit') {
+      if (stack.length > 0 && stack[stack.length - 1].node === node) {
+        stack.pop();
+      }
+      const indent = '  '.repeat(stack.length);
+      const dur = span.ms ?? 0;
+      const fieldsStr = formatTraceFields(span);
+      const detail = fieldsStr ? ` ${fieldsStr}` : '';
+      lines.push(`${indent}└─ ${node}.exit${detail} dur=${dur}ms${timePart}`);
+    } else {
+      const indent = '  '.repeat(stack.length);
+      const fieldsStr = formatTraceFields(span);
+      const dur = span.ms;
+      const durPart = dur !== undefined && dur !== null ? ` dur=${dur}ms` : '';
+      const detail = fieldsStr ? ` ${fieldsStr}` : '';
+      lines.push(`${indent}├─ ${node}.${action}${detail}${durPart}${timePart}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+/** 格式化完整 trace 展示（header + tree） */
+function traceDisplay(method: string, status: string, durationMs: number, trace: Record<string, unknown>, spans: Record<string, unknown>[]): string {
+  const tree = formatTraceTree(spans);
+  const header = `[TRACE][${method}][${status}] total=${durationMs}ms trace_id=${String(trace.trace_id ?? '')}`;
+  return tree ? `${header}\n${tree}` : header;
+}
+
 /** 协议事件名映射 */
 const EVENT_NAME_MAP: Record<string, string> = {
   'message.received': 'message.received',
@@ -97,6 +260,10 @@ export class RPCTransport {
   // Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
   // 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
   private _metaObserver: ((meta: JsonObject) => void) | null = null;
+  // Trace 模式：off / log / diag
+  private _traceMode: string = 'off';
+  // Trace observer：observer(traceInfo) 在每次 RPC/事件携带 _trace 时调用
+  private _traceObserver: ((traceInfo: Record<string, unknown>) => void) | null = null;
 
   constructor(opts: {
     eventDispatcher: EventDispatcher;
@@ -121,6 +288,19 @@ export class RPCTransport {
    */
   setMetaObserver(observer: ((meta: JsonObject) => void) | null): void {
     this._metaObserver = observer;
+  }
+
+  /** 设置 trace 模式：off / log / diag */
+  setTraceMode(mode: string): void {
+    if (mode !== 'off' && mode !== 'log' && mode !== 'diag') {
+      throw new ValidationError(`invalid trace mode: ${mode}, must be off/log/diag`);
+    }
+    this._traceMode = mode;
+  }
+
+  /** 注册 trace observer；observer(traceInfo) 在每次 RPC/事件携带 _trace 时调用。 */
+  setTraceObserver(observer: ((traceInfo: Record<string, unknown>) => void) | null): void {
+    this._traceObserver = observer;
   }
 
   /** 获取连接时收到的 challenge */
@@ -228,6 +408,7 @@ export class RPCTransport {
     method: string,
     params?: RpcParams | null,
     timeout?: number,
+    trace?: string,
   ): Promise<RpcResult> {
     if (this._closed || !this._ws) {
       throw new ConnectionError('transport not connected');
@@ -238,6 +419,24 @@ export class RPCTransport {
     const effectiveTimeout = (timeout ?? this._timeout) * 1000;
     const tStart = Date.now();
 
+    // 注入 _trace（会话级或调用级 mode 非 off 时）
+    const effectiveTraceMode = (trace === 'off' || trace === 'log' || trace === 'diag') ? trace : this._traceMode;
+    let traceId = '';
+    let sendParams = params ?? {};
+    if (effectiveTraceMode !== 'off') {
+      // 浏览器环境使用 crypto.randomUUID 或 Math.random 生成 trace_id
+      traceId = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID().replace(/-/g, '')
+        : Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+      sendParams = { ...(params ?? {}) };
+      const tracePayload: Record<string, unknown> = { trace_id: traceId, mode: effectiveTraceMode };
+      if (effectiveTraceMode === 'diag') {
+        tracePayload.spans = [{ node: 'sdk', ts: tStart, action: 'send' }];
+      }
+      (sendParams as Record<string, unknown>)._trace = tracePayload;
+      this._log.info(`[trace=${traceId}] rpc_send method=${method} rpc_id=${rpcId}`);
+    }
+
     const promise = new Promise<RpcMessage>((resolve, reject) => {
       this._pending.set(rpcId, { resolve, reject });
     });
@@ -247,7 +446,7 @@ export class RPCTransport {
       jsonrpc: '2.0',
       id: rpcId,
       method,
-      params: params ?? {},
+      params: sendParams,
     });
 
     const payloadSize = new TextEncoder().encode(payload).length;
@@ -258,7 +457,7 @@ export class RPCTransport {
 
     try {
       this._ws.send(payload);
-      this._log.debug(`RPC request sent: method=${method}, id=${rpcId} ${summarizeDict(params, DIAG_PARAM_FIELDS)}`);
+      this._log.debug(`RPC request sent: method=${method}, id=${rpcId} ${summarizeDict(sendParams, DIAG_PARAM_FIELDS)}`);
     } catch (exc) {
       this._pending.delete(rpcId);
       this._log.error(`RPC send failed: method=${method}, id=${rpcId}, error=${String(exc)}`, exc instanceof Error ? exc : undefined);
@@ -281,12 +480,23 @@ export class RPCTransport {
       const elapsed = Date.now() - tStart;
       if (response.error !== undefined) {
         this._log.debug(`RPC error response: method=${method}, id=${rpcId}, elapsed=${elapsed}ms, error=${JSON.stringify(response.error)}`);
+        if (traceId) {
+          this._log.info(`[trace=${traceId}] rpc_recv method=${method} rpc_id=${rpcId} duration_ms=${elapsed} status=error`);
+        }
+        // 处理 error 路径的 _trace
+        const respTrace = (response as Record<string, unknown>)._trace;
+        if (respTrace && typeof respTrace === 'object' && !Array.isArray(respTrace)) {
+          this._handleResponseTrace(method, 'error', elapsed, respTrace as Record<string, unknown>);
+        }
         throw mapRemoteError(response.error);
       }
       if (response.result === undefined) {
         throw new SerializationError(`rpc response missing result and error: ${method}`);
       }
       this._log.debug(`RPC response ok: method=${method}, id=${rpcId}, elapsed=${elapsed}ms ${summarizeDict(response.result, DIAG_RESULT_FIELDS)}`);
+      if (traceId) {
+        this._log.info(`[trace=${traceId}] rpc_recv method=${method} rpc_id=${rpcId} duration_ms=${elapsed} status=ok`);
+      }
       // 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
       if (this._metaObserver !== null) {
         const meta = (response as Record<string, unknown>)._meta;
@@ -298,11 +508,39 @@ export class RPCTransport {
           }
         }
       }
+      // 处理 success 路径的 _trace
+      const respTrace = (response as Record<string, unknown>)._trace;
+      if (respTrace && typeof respTrace === 'object' && !Array.isArray(respTrace)) {
+        this._handleResponseTrace(method, 'ok', elapsed, respTrace as Record<string, unknown>);
+      }
       return response.result;
     } finally {
       if (timeoutHandle !== null) {
         globalThis.clearTimeout(timeoutHandle);
       }
+    }
+  }
+
+  /** 处理 RPC 响应中的 _trace 字段：追加 sdk.recv span，格式化输出，通知 observer */
+  private _handleResponseTrace(method: string, status: string, elapsedMs: number, respTrace: Record<string, unknown>): void {
+    try {
+      const sdkRecvSpan: Record<string, unknown> = {
+        node: 'sdk',
+        ts: Date.now(),
+        action: 'recv',
+        ms: elapsedMs,
+      };
+      const existingSpans = Array.isArray(respTrace.spans) ? respTrace.spans : [];
+      const spans = [...existingSpans, sdkRecvSpan] as Record<string, unknown>[];
+      const enriched = { ...respTrace, spans };
+
+      this._log.info(traceDisplay(method, status, elapsedMs, respTrace, spans));
+
+      if (this._traceObserver !== null) {
+        this._traceObserver({ type: 'rpc', method, trace: enriched, status, duration_ms: elapsedMs });
+      }
+    } catch (err) {
+      this._log.debug(`trace handling raised: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -367,12 +605,43 @@ export class RPCTransport {
       const protocolEvent = method.slice(6);
       const sdkEvent = EVENT_NAME_MAP[protocolEvent] ?? protocolEvent;
       this._log.debug(`event recv: event=${sdkEvent} ${summarizeDict(message.params, DIAG_RESULT_FIELDS)}`);
+      const meta = (message as Record<string, unknown>)._meta;
+      if (this._metaObserver !== null && isJsonObject(meta)) {
+        try {
+          this._metaObserver(meta as JsonObject);
+        } catch (exc) {
+          this._log.debug(`event meta_observer raised: ${String(exc)}`);
+        }
+      }
+      // 提取事件中的 _trace 并回调 observer，然后从 params 中剥离
+      const params = (message.params ?? {}) as Record<string, unknown>;
+      if ('_trace' in params) {
+        const eventTrace = params._trace;
+        delete params._trace;
+        if (eventTrace && typeof eventTrace === 'object' && !Array.isArray(eventTrace)) {
+          if (this._traceObserver !== null) {
+            try {
+              this._traceObserver({ type: 'event', event: sdkEvent, trace: eventTrace as Record<string, unknown> });
+            } catch { /* observer 抛错被吞 */ }
+          }
+          const traceObj = eventTrace as Record<string, unknown>;
+          this._log.info(`[trace=${String(traceObj.trace_id ?? '')}] event_recv event=${sdkEvent}`);
+        }
+      }
       // 发布为 _raw.{event}，由 AUNClient 处理后再发布用户可见的事件
-      this._dispatcher.publish(`_raw.${sdkEvent}`, message.params ?? {});
+      this._dispatcher.publish(`_raw.${sdkEvent}`, params as unknown as import('./types.js').JsonValue);
       return;
     }
 
     // 其他通知
+    const meta = (message as Record<string, unknown>)._meta;
+    if (this._metaObserver !== null && isJsonObject(meta)) {
+      try {
+        this._metaObserver(meta as JsonObject);
+      } catch (exc) {
+        this._log.debug(`notification meta_observer raised: ${String(exc)}`);
+      }
+    }
     this._log.debug(`notification recv: method=${method || '<no-method>'}`);
     this._dispatcher.publish('notification', message);
   }

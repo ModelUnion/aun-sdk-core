@@ -12,7 +12,7 @@ import (
 
 // AUNLogger 统一日志记录器，格式：
 //
-//	[yyyy-mm-dd HH:mm:ss.SSS][LEVEL][module] message
+//	[yyyy-mm-dd HH:mm:ss.SSS][LEVEL][module][aun_path=...][device_id=...] message
 //
 // 行为矩阵：
 //
@@ -23,17 +23,19 @@ import (
 // 文件路径：{aun_path}/logs/go-sdk-{yyyy-mm-dd}.log，按天切割，启动清理 7 天前旧文件
 // 全局配置 ~/.aun/log.ini：debug / level 覆盖代码参数，日志目录强制 ~/.aun/logs/
 type AUNLogger struct {
-	mu             sync.Mutex
-	debug          bool
-	minLevel       int
-	logDir         string
-	aid            string
-	cleanupTicker  *time.Ticker
-	cleanupStop    chan struct{}
-	mkdirFailed    bool
-	fileWriteFail  bool
-	cleanupFailed  bool
-	closed         bool
+	mu            sync.Mutex
+	debug         bool
+	minLevel      int
+	logDir        string
+	aunPath       string
+	deviceID      string
+	aid           string
+	cleanupTicker *time.Ticker
+	cleanupStop   chan struct{}
+	mkdirFailed   bool
+	fileWriteFail bool
+	cleanupFailed bool
+	closed        bool
 }
 
 type logLevel int
@@ -77,6 +79,10 @@ func NewAUNLogger(debug bool, aunPath string) *AUNLogger {
 		levelStr       string
 		logDir         string
 	)
+	base := strings.TrimSpace(aunPath)
+	if base == "" {
+		base = filepath.Join(home, ".aun")
+	}
 	if ini != nil {
 		effectiveDebug = parseBool(ini["debug"])
 		logDir = filepath.Join(home, ".aun", "logs")
@@ -89,10 +95,6 @@ func NewAUNLogger(debug bool, aunPath string) *AUNLogger {
 		}
 	} else {
 		effectiveDebug = debug
-		base := strings.TrimSpace(aunPath)
-		if base == "" {
-			base = filepath.Join(home, ".aun")
-		}
 		logDir = filepath.Join(base, "logs")
 		if effectiveDebug {
 			levelStr = "debug"
@@ -110,6 +112,8 @@ func NewAUNLogger(debug bool, aunPath string) *AUNLogger {
 		debug:    effectiveDebug,
 		minLevel: lvl,
 		logDir:   logDir,
+		aunPath:  base,
+		deviceID: "-",
 	}
 	if effectiveDebug {
 		l.ensureLogDir()
@@ -129,6 +133,16 @@ func (l *AUNLogger) For(module string) *ModuleLogger {
 func (l *AUNLogger) BindAID(aid string) {
 	l.mu.Lock()
 	l.aid = aid
+	l.mu.Unlock()
+}
+
+// BindDeviceID 将当前实例 device_id 附加到所有日志行。
+func (l *AUNLogger) BindDeviceID(deviceID string) {
+	l.mu.Lock()
+	l.deviceID = strings.TrimSpace(deviceID)
+	if l.deviceID == "" {
+		l.deviceID = "-"
+	}
 	l.mu.Unlock()
 }
 
@@ -166,6 +180,8 @@ func (l *AUNLogger) emit(level logLevel, module, msg string, err error) {
 	debugOn := l.debug
 	aid := l.aid
 	dir := l.logDir
+	aunPath := l.aunPath
+	deviceID := l.deviceID
 	l.mu.Unlock()
 
 	now := time.Now()
@@ -174,7 +190,13 @@ func (l *AUNLogger) emit(level logLevel, module, msg string, err error) {
 	if aid != "" {
 		aidSuffix = " [" + aid + "]"
 	}
-	line := fmt.Sprintf("[%s][%s][%s] %s%s", ts, levelName[level], module, msg, aidSuffix)
+	if strings.TrimSpace(aunPath) == "" {
+		aunPath = "-"
+	}
+	if strings.TrimSpace(deviceID) == "" {
+		deviceID = "-"
+	}
+	line := fmt.Sprintf("[%s][%s][%s][aun_path=%s][device_id=%s] %s%s", ts, levelName[level], module, aunPath, deviceID, msg, aidSuffix)
 
 	writeConsole(level, line)
 	if debugOn {

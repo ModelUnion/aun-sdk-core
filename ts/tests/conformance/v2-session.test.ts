@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import {
   V2KeyStore,
   V2Session,
@@ -20,6 +21,7 @@ const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
 interface SessionFixture {
   session: V2Session;
   store: V2KeyStore;
+  ikPriv: Uint8Array;
   ikPub: Uint8Array;
 }
 
@@ -28,9 +30,12 @@ function newSession(deviceId = 'dev-1', aid = 'alice.aid.com'): SessionFixture {
   const store = new V2KeyStore(db);
   const [ikPriv, ikPub] = generateP256Keypair();
   const session = new V2Session(store, deviceId, aid, ikPriv, ikPub);
-  return { session, store, ikPub };
+  return { session, store, ikPriv, ikPub };
 }
 
+function keyIdForPub(pubDer: Uint8Array): string {
+  return `sha256:${createHash('sha256').update(Buffer.from(pubDer)).digest('hex').slice(0, 16)}`;
+}
 function captureCallFn(): { calls: Array<{ method: string; params: Record<string, unknown> }>; fn: CallFn } {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   const fn: CallFn = async (method, params) => {
@@ -124,6 +129,39 @@ describe('V2Session.ensureRegistered / rotateSPK', () => {
     // 旧 SPK 仍在 store 中（用于解密历史消息）
     expect(store.loadSPK('dev-1', oldSpkId)).not.toBeNull();
   });
+
+  it('ensureRegistered 从本地 uploaded marker 恢复时不再 RPC', async () => {
+    const { session, store, ikPriv, ikPub } = newSession();
+    const { calls, fn } = captureCallFn();
+    await session.ensureRegistered(fn);
+    const uploadedSpkId = session.currentSpkId;
+    expect(calls).toHaveLength(1);
+
+    const sess2 = new V2Session(store, 'dev-1', 'alice.aid.com', ikPriv, ikPub);
+    const { calls: calls2, fn: fn2 } = captureCallFn();
+    await sess2.ensureRegistered(fn2);
+
+    expect(calls2).toHaveLength(0);
+    expect(sess2.isLastUploadedSPK(uploadedSpkId)).toBe(true);
+  });
+
+  it('ensureGroupRegistered 从本地 uploaded marker 恢复时不再 RPC', async () => {
+    const { session, store, ikPriv, ikPub } = newSession();
+    const { calls, fn } = captureCallFn();
+    const groupId = 'group.aid/marker';
+    await session.ensureGroupRegistered(groupId, fn);
+    const uploadedSpkId = calls[0]!.params.spk_id as string;
+    expect(calls).toHaveLength(1);
+    expect(store.loadCurrentGroupSPK('dev-1', groupId)?.spkId).toBe(uploadedSpkId);
+    expect(store.loadLatestUploadedGroupSPKId('dev-1', groupId)).toBe(uploadedSpkId);
+
+    const sess2 = new V2Session(store, 'dev-1', 'alice.aid.com', ikPriv, ikPub);
+    const { calls: calls2, fn: fn2 } = captureCallFn();
+    await sess2.ensureGroupRegistered(groupId, fn2);
+
+    expect(calls2).toHaveLength(0);
+    expect(sess2.isLastUploadedGroupSPK(groupId, uploadedSpkId)).toBe(true);
+  });
 });
 
 describe('V2Session.getDecryptKeys', () => {
@@ -159,12 +197,56 @@ describe('V2Session.getDecryptKeys', () => {
     expect(Array.from(rCur.spkPriv!)).not.toEqual(Array.from(r.spkPriv!));
   });
 
-  it('spkId 已被销毁 → spkPriv undefined（不抛错）', () => {
+  it('spkId 已被销毁 → 显式报 spk_missing', () => {
     const { session } = newSession();
     session.ensureKeys();
-    const r = session.getDecryptKeys('sha256:nonexistent_id');
-    expect(r.spkPriv).toBeUndefined();
-    expect(r.ikPriv).toBeInstanceOf(Uint8Array);
+    expect(() => session.getDecryptKeys('sha256:nonexistent_id')).toThrow(/spk_missing/);
+  });
+
+  it('spkId 命中 IK 指纹 → 返回 IK 作为 SPK 私钥', () => {
+    const { session, ikPub } = newSession();
+    session.ensureKeys();
+    const r = session.getDecryptKeys(keyIdForPub(ikPub));
+    expect(Array.from(r.spkPriv!)).toEqual(Array.from(r.ikPriv));
+  });
+
+  it('group spkId 命中 IK 指纹 → 返回 IK 作为 SPK 私钥', () => {
+    const { session, ikPub } = newSession();
+    session.ensureKeys();
+    const r = session.getGroupDecryptKeys('group.aid/1', keyIdForPub(ikPub));
+    expect(Array.from(r.spkPriv!)).toEqual(Array.from(r.ikPriv));
+  });
+
+  it('group spkId 命中 device SPK → 返回 device SPK 私钥', () => {
+    const { session } = newSession();
+    session.ensureKeys();
+    const r = session.getGroupDecryptKeys('group.aid/1', session.currentSpkId);
+    const p2p = session.getDecryptKeys(session.currentSpkId);
+    expect(Array.from(r.spkPriv!)).toEqual(Array.from(p2p.spkPriv!));
+  });
+
+  it('group spkId 兼容旧 composite 格式，同时新格式直接查询', () => {
+    const { session, store } = newSession();
+    session.ensureKeys();
+    const groupId = 'group.aid/legacy';
+    const spkId = 'sha256:legacy_group';
+    const [groupPriv, groupPub] = generateP256Keypair();
+    store.saveGroupSPK('dev-1', groupId, spkId, groupPriv, groupPub);
+
+    const direct = session.getGroupDecryptKeys(groupId, spkId);
+    const legacy = session.getGroupDecryptKeys(groupId, `${groupId}\0${spkId}`);
+
+    expect(Array.from(direct.spkPriv!)).toEqual(Array.from(groupPriv));
+    expect(Array.from(legacy.spkPriv!)).toEqual(Array.from(groupPriv));
+    (session as unknown as { _lastUploadedGroupSPKIds: Map<string, string> })
+      ._lastUploadedGroupSPKIds.set(groupId, spkId);
+    expect(session.isLastUploadedGroupSPK(groupId, `${groupId}\0${spkId}`)).toBe(true);
+  });
+
+  it('group SPK 和 legacy P2P SPK 都找不到 → 显式报 spk_missing', () => {
+    const { session } = newSession();
+    session.ensureKeys();
+    expect(() => session.getGroupDecryptKeys('group.aid/1', 'sha256:nonexistent_id')).toThrow(/spk_missing/);
   });
 });
 
@@ -245,7 +327,7 @@ describe('V2Session.maybeDestroyOldSPKs（PFS 三重条件）', () => {
     let now = Date.now();
     session._setNowFn(() => now);
     session.trackOldSPKMaxSeq(oldSpkId, 100);
-    // 推进时间超过 7h
+    // 推进时间超过 7 天
     now += DESTROY_DELAY_MS + 1000;
     expect(session.maybeDestroyOldSPKs(100)).toEqual([]);
     expect(store.loadSPK('dev-1', oldSpkId)).not.toBeNull();

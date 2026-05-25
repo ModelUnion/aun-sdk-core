@@ -5,10 +5,12 @@ import base64
 import hashlib
 import json
 import math
+import os
 import random
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,7 +20,7 @@ import aiohttp
 import websockets
 
 from .auth import AuthFlow
-from .config import AUNConfig, normalize_instance_id
+from .config import AUNConfig, get_device_id, normalize_instance_id
 from .logger import AUNLogger, NullLogger
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
@@ -45,6 +47,7 @@ from .types import ConnectionState
 from .v2.session import V2Session
 from .v2.e2ee.encrypt_p2p import encrypt_p2p_message
 from .v2.e2ee.decrypt import decrypt_message as v2_decrypt_message
+from .v2.crypto.ecdsa import ecdsa_verify_raw
 
 _INTERNAL_ONLY_METHODS = {
     "auth.login1",
@@ -81,6 +84,23 @@ def _clamp_heartbeat_interval(value: Any) -> float:
         return _HEARTBEAT_MAX_INTERVAL
     return v
 
+
+def _length_prefixed_bytes_key(*parts: bytes) -> bytes:
+    chunks: list[bytes] = []
+    for part in parts:
+        chunks.append(str(len(part)).encode("ascii"))
+        chunks.append(b":")
+        chunks.append(part)
+        chunks.append(b";")
+    return b"".join(chunks)
+
+
+def _length_prefixed_text_key(*parts: str) -> str:
+    chunks: list[str] = []
+    for part in parts:
+        encoded = part.encode("utf-8")
+        chunks.append(f"{len(encoded)}:{part};")
+    return "".join(chunks)
 # PY-001: 解密失败的群消息待重试队列上限
 _PENDING_DECRYPT_LIMIT = 100
 
@@ -111,6 +131,7 @@ _NON_IDEMPOTENT_METHODS = frozenset({
 
 _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
     "auto_reconnect": True,
+    "background_sync": True,
     "heartbeat_interval": 30.0,
     "token_refresh_before": _TOKEN_REFRESH_DEFAULT_LEAD,
     "retry": {
@@ -146,6 +167,14 @@ _ssl_warning_emitted = False
 _PREKEY_FALLBACK_DEVICE_ID = "aun_device_id"
 
 
+def _v2_device_id_from_device(dev: dict[str, Any]) -> tuple[bool, str]:
+    if "device_id" in dev:
+        return True, str(dev.get("device_id") or "").strip()
+    if "owner_device_id" in dev:
+        return True, str(dev.get("owner_device_id") or "").strip()
+    return False, ""
+
+
 def _debug_group_e2ee(message: str, **fields: Any) -> None:
     _ = (message, fields)
 
@@ -164,8 +193,9 @@ def _get_no_verify_ssl() -> _ssl.SSLContext:
     return _no_verify_ssl_ctx
 
 
-def _make_connection_factory(verify_ssl: bool = True, logger: AUNLogger | NullLogger | None = None):
-    """根据 verify_ssl 配置创建 WebSocket 连接工厂"""
+def _make_connection_factory(verify_ssl: bool = True, logger: AUNLogger | NullLogger | None = None, net=None):
+    """根据 verify_ssl 配置创建 WebSocket 连接工厂（支持 DNS 容灾）"""
+    from .net import _is_dns_error, _parse_host_port, _replace_host_with_ip
     _log = logger or NullLogger()
 
     async def _factory(url: str) -> Any:
@@ -173,7 +203,7 @@ def _make_connection_factory(verify_ssl: bool = True, logger: AUNLogger | NullLo
         kw: dict[str, Any] = {"open_timeout": 5, "close_timeout": 5, "ping_interval": None}
         if url.startswith("wss://"):
             if verify_ssl:
-                pass  # 使用默认 SSL 上下文（验证证书）
+                pass
             else:
                 kw["ssl"] = _get_no_verify_ssl()
                 if not _ssl_warning_emitted:
@@ -183,7 +213,31 @@ def _make_connection_factory(verify_ssl: bool = True, logger: AUNLogger | NullLo
                         "生产环境应设为 True 以防止中间人攻击。"
                     )
                     _ssl_warning_emitted = True
-        return await websockets.connect(url, **kw)
+        try:
+            return await websockets.connect(url, **kw)
+        except Exception as exc:
+            if not net or not _is_dns_error(exc):
+                raise
+
+        hostname, port = _parse_host_port(url)
+        _log.debug("client", "WS DNS failed for %s, trying cached IP", hostname)
+        cached = net._load_dns_cache(hostname)
+        if not cached:
+            raise ConnectionError(f"DNS failed and no cached IP for {hostname}")
+
+        ip, cached_port = cached
+        ip_url = _replace_host_with_ip(url, ip)
+        ws_kw = dict(kw)
+        if url.startswith("wss://"):
+            if verify_ssl:
+                import ssl as _ssl_mod
+                ssl_ctx = _ssl_mod.create_default_context()
+                ssl_ctx.check_hostname = True
+                ssl_ctx.verify_mode = _ssl_mod.CERT_REQUIRED
+                ws_kw["ssl"] = ssl_ctx
+            ws_kw["additional_headers"] = {"Host": hostname if port in (80, 443) else f"{hostname}:{port}"}
+            ws_kw["server_hostname"] = hostname
+        return await websockets.connect(ip_url, **ws_kw)
     return _factory
 
 
@@ -269,11 +323,13 @@ class AUNClient:
         raw_config = dict(config or {})
         self._config_model = AUNConfig.from_dict(raw_config)
         init_aid = str(raw_config.get("aid") or "").strip() or None
+        self._device_id = get_device_id(self._config_model.aun_path)
         # AUNLogger 自身已处理 debug=False：INFO/WARN/ERROR 输出 stderr，DEBUG 不输出，无文件日志
         # 不再用 NullLogger 整个静默掉，否则用户排查问题时看不到任何 SDK 异常
         self._log: AUNLogger | NullLogger = AUNLogger(
             debug=debug, aun_path=str(self._config_model.aun_path)
         )
+        self._log.bind_device_id(self._device_id)
         self._log.info(
             "client",
             "AUNClient initialized: debug=%s aun_path=%s aid=%s",
@@ -298,7 +354,13 @@ class AUNClient:
         self._session_params: dict[str, Any] | None = None
         self._session_options: dict[str, Any] = dict(_DEFAULT_SESSION_OPTIONS)
         self._dispatcher = EventDispatcher(logger=self._log)
-        self._discovery = GatewayDiscovery(verify_ssl=self._config_model.verify_ssl, logger=self._log)
+        from .net import DnsResilientNet
+        self._net = DnsResilientNet(
+            aun_path=self._config_model.aun_path,
+            verify_ssl=self._config_model.verify_ssl,
+            logger=self._log,
+        )
+        self._discovery = GatewayDiscovery(verify_ssl=self._config_model.verify_ssl, logger=self._log, net=self._net)
 
         # E2EE 编排状态（内存缓存，进程退出即清空）
         self._cert_cache: dict[str, _CachedPeerCert] = {}
@@ -310,30 +372,29 @@ class AUNClient:
         # 但 epoch rotation 等路径会无条件访问，需先以空值占位避免 AttributeError。
         self._v2_session = None
         self._v2_bootstrap_cache: dict[str, tuple] = {}
+        self._v2_sender_ik_pending: dict[str, dict[str, Any]] = {}
+        self._v2_sender_ik_fetching: set[str] = set()
         self._peer_prekeys_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._prekey_replenish_inflight: bool = False
         self._prekey_pending_replenish: int = 0
-        # 本地 agent.md 文件路径与对应 etag（quoted sha256 hex，与服务端 _agent_md_etag 一致）。
-        # 由 publish_agent_md() / fetch_agent_md(自身 aid) 写入；用于跟服务端 RPC 注入的
-        # _meta.agent_md_etag 比对，触发"本地未发布到服务端"或"服务端版本更新"的 UI 提示。
-        self._local_agent_md_path: str = ""
+        # AgentMDs 目录：{agent_md_path}/list.json 保存元数据，{agent_md_path}/{aid}/agent.md 保存正文。
+        self._agent_md_path: str = str(Path(self._config_model.aun_path) / "AgentMDs")
         self._local_agent_md_etag: str = ""
         # gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
         self._remote_agent_md_etag: str = ""
+        self._agent_md_cache: dict[str, dict[str, Any]] = {}
+        self._agent_md_last_list_rebuilt: bool = False
         # 当前活跃 prekey：只有这个 prekey 被消费时才触发 replenish 上传。
         # connect 成功后上传的 prekey 记录为活跃；历史 prekey 被消费不触发上传。
         self._active_prekey_id: str = ""
 
-        connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log)
+        connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
         keystore = FileKeyStore(
             self._config_model.aun_path,
             encryption_seed=self._config_model.seed_password,
             logger=self._log,
         )
         self._keystore = keystore
-        # 获取并缓存 device_id
-        from .config import get_device_id
-        self._device_id = get_device_id(self._config_model.aun_path)
         self._slot_id = ""
         self._connect_delivery_mode = _normalize_delivery_mode_config({"mode": "fanout"})
         self._default_connect_delivery_mode = dict(self._connect_delivery_mode)
@@ -350,6 +411,7 @@ class AUNClient:
             root_ca_path=self._config_model.root_ca_path,
             verify_ssl=self._config_model.verify_ssl,
             logger=self._log,
+            net=self._net,
         )
         self._transport = RPCTransport(
             event_dispatcher=self._dispatcher,
@@ -387,6 +449,9 @@ class AUNClient:
         self._v2_auto_propose_locks_guard = asyncio.Lock()
         self._v2_auto_propose_last_snapshot: dict[str, str] = {}
         self._v2_lazy_propose_triggered: dict[str, float] = {}
+        self._group_spk_registration_inflight: set[str] = set()
+        self._group_spk_rotation_inflight: set[str] = set()
+        self._group_spk_peer_fallback_registered: set[str] = set()
         # 内部订阅：推送消息自动解密后 re-publish 给用户
         self._dispatcher.subscribe("_raw.message.received", self._on_raw_message_received)
         # V2 P2P 推送通知
@@ -425,60 +490,451 @@ class AUNClient:
         """
         return getattr(self, "_remote_agent_md_etag", "") or ""
 
-    async def publish_agent_md(self, path: str) -> dict[str, Any]:
-        """读取本地 agent.md → 签名 → 上传到服务端，并刷新内部 _local_agent_md_etag。
+    @staticmethod
+    def _agent_md_content_etag(content: str) -> str:
+        digest = hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+        return f'"{digest}"'
 
-        Args:
-            path: 本地 agent.md 文件路径（必填，不可为空）
+    def _agent_md_owner_aid(self) -> str:
+        return str(self._aid or "").strip()
 
-        Returns:
-            auth.upload_agent_md 的原始返回（含 aid / etag / last_modified / agent_md_url 等）
+    def set_agent_md_path(self, path: str | None = None) -> str:
+        """设置 agent.md 本地存储根目录；为空时恢复默认 {aun_path}/AgentMDs。"""
+        raw = str(path or "").strip()
+        root = Path(raw) if raw else Path(self._config_model.aun_path) / "AgentMDs"
+        root.mkdir(parents=True, exist_ok=True)
+        self._agent_md_path = str(root)
+        self._agent_md_cache.clear()
+        return self._agent_md_path
 
-        Raises:
-            ValidationError: path 为空
-            FileNotFoundError: 文件不存在
-            StateError: 本地无身份
-            AUNError: 上传失败
+    def SetAgentMDPath(self, path: str | None = None) -> str:
+        return self.set_agent_md_path(path)
+
+    def _agent_md_root(self) -> Path:
+        root = Path(getattr(self, "_agent_md_path", "") or (Path(self._config_model.aun_path) / "AgentMDs"))
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _agent_md_safe_aid(aid: str) -> str:
+        target = str(aid or "").strip()
+        if not target or any(ch in target for ch in ("/", "\\", "\x00")):
+            raise ValidationError("agent.md aid is empty or contains path separators")
+        return target
+
+    def _agent_md_file_path(self, aid: str) -> Path:
+        return self._agent_md_root() / self._agent_md_safe_aid(aid) / "agent.md"
+
+    def _agent_md_list_path(self) -> Path:
+        return self._agent_md_root() / "list.json"
+
+    @contextmanager
+    def _agent_md_list_lock(self):
+        root = self._agent_md_root()
+        lock_path = root / "list.json.lock"
+        with open(lock_path, "a+b") as fp:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fp.seek(0)
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        fp.seek(0)
+                        msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fp:
+                fp.write(content)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp, path)
+            if os.name != "nt":
+                try:
+                    dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    def _write_agent_md_list_unlocked(self, records: dict[str, dict[str, Any]]) -> None:
+        payload = {
+            "version": 1,
+            "updated_at": int(time.time() * 1000),
+            "records": {aid: rec for aid, rec in sorted(records.items())},
+        }
+        self._atomic_write_text(
+            self._agent_md_list_path(),
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+
+    def _normalize_agent_md_list(self, data: Any) -> dict[str, dict[str, Any]]:
+        raw_records = data.get("records") if isinstance(data, dict) else None
+        if isinstance(raw_records, list):
+            iterable = raw_records
+        elif isinstance(raw_records, dict):
+            iterable = raw_records.values()
+        elif isinstance(data, list):
+            iterable = data
+        else:
+            iterable = []
+        records: dict[str, dict[str, Any]] = {}
+        for item in iterable:
+            if not isinstance(item, dict):
+                continue
+            aid = str(item.get("aid") or "").strip()
+            if not aid:
+                continue
+            record = {k: v for k, v in item.items() if k != "content"}
+            record["aid"] = aid
+            for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
+                try:
+                    record[key] = int(record.get(key) or 0)
+                except Exception:
+                    record[key] = 0
+            records[aid] = record
+        return records
+
+    def _rebuild_agent_md_list_unlocked(self) -> dict[str, dict[str, Any]]:
+        records: dict[str, dict[str, Any]] = {}
+        now = int(time.time() * 1000)
+        for child in self._agent_md_root().iterdir():
+            if not child.is_dir():
+                continue
+            aid = child.name
+            path = child / "agent.md"
+            if not path.is_file():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except Exception as exc:
+                self._log.warn("client", "agent.md rebuild skipped unreadable file aid=%s err=%s", aid, exc)
+                continue
+            record = {
+                "aid": aid,
+                "local_etag": self._agent_md_content_etag(content),
+                "updated_at": now,
+            }
+            try:
+                record["fetched_at"] = int(path.stat().st_mtime * 1000)
+            except Exception:
+                record["fetched_at"] = now
+            records[aid] = record
+        self._write_agent_md_list_unlocked(records)
+        self._agent_md_cache.clear()
+        return records
+
+    def _read_agent_md_list_unlocked(self) -> dict[str, dict[str, Any]]:
+        path = self._agent_md_list_path()
+        if not path.exists():
+            self._agent_md_last_list_rebuilt = True
+            return self._rebuild_agent_md_list_unlocked()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._agent_md_last_list_rebuilt = False
+            return self._normalize_agent_md_list(data)
+        except Exception as exc:
+            self._log.warn("client", "agent.md list.json damaged, rebuilding: %s", exc)
+            self._agent_md_last_list_rebuilt = True
+            return self._rebuild_agent_md_list_unlocked()
+
+    def _read_agent_md_content(self, aid: str) -> str:
+        return self._agent_md_file_path(aid).read_text(encoding="utf-8")
+
+    def _write_agent_md_content(self, aid: str, content: str) -> str:
+        path = self._agent_md_file_path(aid)
+        self._atomic_write_text(path, str(content or ""))
+        return str(path)
+
+    def _load_agent_md_record(self, aid: str) -> dict[str, Any] | None:
+        target = str(aid or "").strip()
+        if not target:
+            return None
+        try:
+            with self._agent_md_list_lock():
+                records = self._read_agent_md_list_unlocked()
+            record = records.get(target)
+            if isinstance(record, dict):
+                loaded = dict(record)
+                loaded["aid"] = target
+                try:
+                    content = self._read_agent_md_content(target)
+                    loaded["content"] = content
+                    loaded["local_etag"] = self._agent_md_content_etag(content)
+                except Exception as exc:
+                    self._log.warn("client", "agent.md content read failed: aid=%s err=%s", target, exc)
+                self._agent_md_cache[target] = dict(loaded)
+                return dict(loaded)
+        except Exception as exc:
+            self._log.debug("client", "agent.md cache load skipped: aid=%s err=%s", target, exc)
+        return None
+
+    def _save_agent_md_record(self, aid: str, **fields: Any) -> dict[str, Any]:
+        target = str(aid or "").strip()
+        if not target:
+            return {}
+        try:
+            content_marker = object()
+            content = fields.pop("content", content_marker)
+            saved_to = ""
+            if content is not content_marker and content is not None:
+                saved_to = self._write_agent_md_content(target, str(content))
+                fields.setdefault("local_etag", self._agent_md_content_etag(str(content)))
+                fields.setdefault("fetched_at", int(time.time() * 1000))
+            with self._agent_md_list_lock():
+                records = self._read_agent_md_list_unlocked()
+                record = dict(records.get(target) or {})
+                record["aid"] = target
+                for key, value in fields.items():
+                    if value is not None:
+                        record[key] = value
+                record["updated_at"] = int(time.time() * 1000)
+                records[target] = {k: v for k, v in record.items() if k != "content"}
+                self._write_agent_md_list_unlocked(records)
+            loaded = dict(record)
+            if content is not content_marker and content is not None:
+                loaded["content"] = str(content)
+                if saved_to:
+                    loaded["saved_to"] = saved_to
+            else:
+                cached = self._agent_md_cache.get(target)
+                if isinstance(cached, dict) and "content" in cached:
+                    loaded["content"] = cached["content"]
+            self._agent_md_cache[target] = dict(loaded)
+            owner = self._agent_md_owner_aid()
+            if target == owner:
+                local_etag = str(loaded.get("local_etag") or "").strip()
+                remote_etag = str(loaded.get("remote_etag") or "").strip()
+                if local_etag:
+                    self._local_agent_md_etag = local_etag
+                if remote_etag:
+                    self._remote_agent_md_etag = remote_etag
+            return dict(loaded)
+        except Exception as exc:
+            self._log.debug("client", "agent.md cache save skipped: aid=%s err=%s", target, exc)
+        return {}
+
+    def _agent_md_has_local_content(self, aid: str, record: dict[str, Any] | None = None) -> bool:
+        if isinstance(record, dict) and record.get("content"):
+            return True
+        try:
+            return self._agent_md_file_path(aid).is_file()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _agent_md_checked_at_fresh(checked_at_ms: int, max_unsynced_days: float) -> bool:
+        """判断上次 HEAD 时间距今是否在允许窗口内。
+
+        - max_unsynced_days <= 0：每次都强制 HEAD（返回 False）
+        - checked_at_ms 无效：视为从未 HEAD（返回 False）
         """
-        raw_path = str(path or "").strip()
-        if not raw_path:
-            raise ValidationError("publish_agent_md requires non-empty path")
-        with open(raw_path, "rb") as f:
-            data = f.read()
-        content = data.decode("utf-8")
-        signed = await self.auth.sign_agent_md(content)
-        result = await self.auth.upload_agent_md(signed)
-        digest = hashlib.sha256(signed.encode("utf-8")).hexdigest()
-        self._local_agent_md_etag = f'"{digest}"'
-        self._local_agent_md_path = raw_path
-        return result
+        try:
+            days = float(max_unsynced_days or 0)
+        except (TypeError, ValueError):
+            return False
+        if days <= 0 or checked_at_ms <= 0:
+            return False
+        return (time.time() * 1000 - float(checked_at_ms)) <= days * 86400_000
 
-    async def fetch_agent_md(
-        self,
-        aid: str | None = None,
-        save_path: str | None = None,
-    ) -> dict[str, Any]:
-        """下载 agent.md 并自动验签；可选写盘；若 aid 是自己则更新本地 etag。
+    def _schedule_agent_md_fetch_if_missing(self, aid: str, record: dict[str, Any] | None, *, source: str = "") -> None:
+        target = str(aid or "").strip()
+        if not target or self._agent_md_has_local_content(target, record):
+            return
+        inflight = getattr(self, "_agent_md_fetch_inflight", set())
+        self._agent_md_fetch_inflight = inflight
+        if target in inflight:
+            return
 
-        Args:
-            aid: 目标 AID；为空时取本地身份
-            save_path: 写盘路径；不传则不写盘（浏览器版本无此参数）
+        async def _fetch_missing() -> None:
+            try:
+                await self.fetch_agent_md(target)
+            except Exception as exc:
+                self._save_agent_md_record(target, last_error=str(exc), remote_status="found")
+                self._log.debug("client", "agent.md auto fetch failed: aid=%s source=%s err=%s", target, source or "-", exc)
+            finally:
+                inflight.discard(target)
 
-        Returns:
-            {
-              "aid": str,
-              "content": str,
-              "signature": dict,                # auth.verify_agent_md 的返回
-              "in_sync": bool | None,           # aid 是自己时给出 True/False；否则 None
-              "saved_to": str | None,
-              "save_error": str | None,
+        inflight.add(target)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_fetch_missing())
+        except RuntimeError:
+            asyncio.run(_fetch_missing())
+
+    def _observe_agent_md_meta(self, aid: str, etag: str = "", last_modified: str = "", *, source: str = "") -> None:
+        target = str(aid or "").strip()
+        remote_etag = str(etag or "").strip()
+        remote_last_modified = str(last_modified or "").strip()
+        if not target or not (remote_etag or remote_last_modified):
+            return
+        before = self._agent_md_cache.get(target)
+        if not isinstance(before, dict):
+            before = self._load_agent_md_record(target) or {}
+        same = (
+            (not remote_etag or str(before.get("remote_etag") or "").strip() == remote_etag)
+            and (not remote_last_modified or str(before.get("last_modified") or "").strip() == remote_last_modified)
+        )
+        record = dict(before)
+        if not same or not before:
+            fields: dict[str, Any] = {
+                "observed_at": int(time.time() * 1000),
+                "remote_status": "found",
+            }
+            if remote_etag:
+                fields["remote_etag"] = remote_etag
+            if remote_last_modified:
+                fields["last_modified"] = remote_last_modified
+            record = self._save_agent_md_record(target, **fields) or record
+        if target == self._agent_md_owner_aid() and remote_etag:
+            self._remote_agent_md_etag = remote_etag
+        self._schedule_agent_md_fetch_if_missing(target, record, source=source)
+        self._log.debug(
+            "client",
+            "agent.md meta observed: aid=%s etag=%s last_modified=%s source=%s",
+            target,
+            remote_etag or "-",
+            remote_last_modified or "-",
+            source or "-",
+        )
+
+    def _observe_agent_md_etag(self, aid: str, etag: str, *, source: str = "") -> None:
+        self._observe_agent_md_meta(aid, etag, "", source=source)
+
+    def _observe_agent_md_from_envelope(self, envelope: Any) -> None:
+        if not isinstance(envelope, dict):
+            return
+        agent_md = envelope.get("agent_md")
+        if not isinstance(agent_md, dict):
+            return
+        sender = agent_md.get("sender")
+        if not isinstance(sender, dict):
+            return
+        sender_aid = str(sender.get("aid") or "").strip()
+        if not sender_aid:
+            aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+            sender_aid = str(aad.get("from") or envelope.get("from") or "").strip()
+        self._observe_agent_md_meta(
+            sender_aid,
+            str(sender.get("etag") or ""),
+            str(sender.get("last_modified") or sender.get("lastModified") or ""),
+            source="envelope",
+        )
+
+    async def check_agent_md(self, aid: str | None = None, max_unsynced_days: float = 0) -> dict[str, Any]:
+        target = str(aid or self._aid or "").strip()
+        if not target:
+            raise ValidationError("check_agent_md requires aid (or local AID)")
+        before = self._load_agent_md_record(target) or {}
+        local_etag = str(before.get("local_etag") or "").strip()
+        local_found = bool(before and (before.get("content") or local_etag))
+        remote_etag_cached = str(before.get("remote_etag") or "").strip()
+        last_modified_cached = str(before.get("last_modified") or "").strip()
+        checked_at_cached = int(before.get("checked_at") or 0)
+        cached_in_sync = bool(local_found and local_etag and remote_etag_cached and local_etag == remote_etag_cached)
+        # max_unsynced_days > 0 时，距上次 HEAD 在窗口内则跳过 HEAD（直接返回缓存）；
+        # max_unsynced_days <= 0 时，每次都强制 HEAD 确认远端状态。
+        if cached_in_sync and self._agent_md_checked_at_fresh(checked_at_cached, max_unsynced_days):
+            return {
+                "aid": target,
+                "local_found": True,
+                "remote_found": True,
+                "local_etag": local_etag,
+                "remote_etag": remote_etag_cached,
+                "in_sync": True,
+                "last_modified": last_modified_cached,
+                "status": 200,
+                "cached": True,
+                "verify_status": str(before.get("verify_status") or ""),
+                "verify_error": str(before.get("verify_error") or ""),
             }
 
-        Raises:
-            ValidationError: aid 为空且无本地身份
-            NotFoundError: 服务端 404
-            AUNError: 其它非 2xx
-        """
+        now_ms = int(time.time() * 1000)
+        try:
+            remote = await self.auth.head_agent_md(target)
+        except Exception as exc:
+            self._save_agent_md_record(target, checked_at=now_ms, remote_status="error", last_error=str(exc))
+            raise
+
+        remote_found = bool(remote.get("found"))
+        remote_etag = str(remote.get("etag") or "").strip()
+        last_modified = str(remote.get("last_modified") or remote.get("lastModified") or "").strip()
+        remote_status = "found" if remote_found else "missing"
+        saved = self._save_agent_md_record(
+            target,
+            remote_etag=remote_etag if remote_found else "",
+            last_modified=last_modified,
+            checked_at=now_ms,
+            remote_status=remote_status,
+            last_error="",
+        )
+        if target == self._agent_md_owner_aid() and remote_etag:
+            self._remote_agent_md_etag = remote_etag
+        in_sync = bool(local_found and remote_found and local_etag and remote_etag and local_etag == remote_etag)
+        return {
+            "aid": target,
+            "local_found": local_found,
+            "remote_found": remote_found,
+            "local_etag": local_etag,
+            "remote_etag": remote_etag,
+            "in_sync": in_sync,
+            "last_modified": last_modified,
+            "status": int(remote.get("status") or (200 if remote_found else 404)),
+            "cached": False,
+            "verify_status": str(saved.get("verify_status") or before.get("verify_status") or ""),
+            "verify_error": str(saved.get("verify_error") or before.get("verify_error") or ""),
+        }
+
+    async def publish_agent_md(self) -> dict[str, Any]:
+        """读取 {agent_md_path}/{self_aid}/agent.md，签名后上传，并把签名结果原子写回本地。"""
+        target = self._agent_md_owner_aid()
+        if not target:
+            raise ValidationError("publish_agent_md requires local AID")
+        content = self._read_agent_md_content(target)
+        signed = await self.auth.sign_agent_md(content)
+        result = await self.auth.upload_agent_md(signed)
+        local_etag = self._agent_md_content_etag(signed)
+        self._local_agent_md_etag = local_etag
+        remote_etag = str(result.get("etag") or "").strip() if isinstance(result, dict) else ""
+        if remote_etag:
+            self._remote_agent_md_etag = remote_etag
+        self._save_agent_md_record(
+            target,
+            content=signed,
+            local_etag=local_etag,
+            remote_etag=remote_etag,
+            last_modified=str(result.get("last_modified") or "").strip() if isinstance(result, dict) else "",
+            fetched_at=int(time.time() * 1000),
+            remote_status="found" if remote_etag else "unknown",
+            last_error="",
+        )
+        return result
+
+    async def fetch_agent_md(self, aid: str | None = None) -> dict[str, Any]:
+        """下载 agent.md 并自动验签；内容固定保存到 {agent_md_path}/{aid}/agent.md。"""
         target = (aid or self._aid or "").strip()
         if not target:
             raise ValidationError("fetch_agent_md requires aid (or local AID)")
@@ -487,33 +943,43 @@ class AUNClient:
         signature = await self.auth.verify_agent_md(content, aid=target)
 
         is_self = target == (self._aid or "")
+        local_etag = self._agent_md_content_etag(content)
+        cache_meta = {}
+        try:
+            cache_meta = dict(self.auth._agent_md_cache_store().get(target) or {})
+        except Exception:
+            cache_meta = {}
+        remote_etag = str(cache_meta.get("etag") or "").strip()
+        last_modified = str(cache_meta.get("last_modified") or "").strip()
+        if is_self:
+            self._local_agent_md_etag = local_etag
+            if remote_etag:
+                self._remote_agent_md_etag = remote_etag
+        saved = self._save_agent_md_record(
+            target,
+            content=content,
+            local_etag=local_etag,
+            remote_etag=remote_etag if remote_etag else None,
+            last_modified=last_modified if last_modified else None,
+            fetched_at=int(time.time() * 1000),
+            remote_status="found",
+            verify_status=str(signature.get("status") or "") if isinstance(signature, dict) else "",
+            verify_error=str(signature.get("reason") or "") if isinstance(signature, dict) else "",
+            last_error="",
+        )
         in_sync: bool | None = None
         if is_self:
-            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            self._local_agent_md_etag = f'"{digest}"'
-            local = self._local_agent_md_etag or ""
-            remote = self._remote_agent_md_etag or ""
-            in_sync = (local == remote) if (local and remote) else False
-
-        saved_to: str | None = None
-        save_error: str | None = None
-        if save_path:
-            try:
-                with open(save_path, "wb") as f:
-                    f.write(content.encode("utf-8"))
-                saved_to = save_path
-            except OSError as exc:
-                save_error = str(exc)
+            remote = remote_etag or self._remote_agent_md_etag or ""
+            in_sync = (local_etag == remote) if (local_etag and remote) else False
 
         return {
             "aid": target,
             "content": content,
             "signature": signature,
             "in_sync": in_sync,
-            "saved_to": saved_to,
-            "save_error": save_error,
+            "saved_to": saved.get("saved_to") or str(self._agent_md_file_path(target)),
+            "save_error": None,
         }
-
     def _observe_rpc_meta(self, meta: dict) -> None:
         """transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。"""
         if not isinstance(meta, dict):
@@ -521,7 +987,21 @@ class AUNClient:
         etag = str(meta.get("agent_md_etag") or "").strip()
         if etag:
             self._remote_agent_md_etag = etag
-
+            self._observe_agent_md_meta(self._aid or "", etag, "", source="rpc.self")
+        etags = meta.get("agent_md_etags")
+        if isinstance(etags, dict):
+            # role key 优先级：requester / peer 是新规范，其余是兼容旧 SDK 的别名。
+            # 同一 AID 在多个 role 下出现时，set_default 自动去重（首次写入即生效）。
+            for key in ("requester", "peer", "receiver", "target", "to", "sender", "from"):
+                item = etags.get(key)
+                if not isinstance(item, dict):
+                    continue
+                self._observe_agent_md_meta(
+                    str(item.get("aid") or ""),
+                    str(item.get("etag") or ""),
+                    str(item.get("last_modified") or item.get("lastModified") or ""),
+                    source=f"rpc.{key}",
+                )
     def set_trace_mode(self, mode: str) -> None:
         """设置会话级 trace mode（off/log/diag），影响后续所有 RPC 调用。"""
         self._transport.set_trace_mode(mode)
@@ -565,16 +1045,28 @@ class AUNClient:
         self._session_options = self._build_session_options(normalized)
         self._transport.set_timeout(self._session_options["timeouts"]["call"])
         self._closing = False
-        self._log.debug("client", "connect enter: gateway=%s", normalized.get("gateway", "-"))
-        try:
-            await self._connect_once(normalized, allow_reauth=False)
-            self._log.debug("client", "connect exit: elapsed=%.3fs gateway=%s aid=%s", time.time() - _t_start, self._gateway_url, self._aid or "-")
-        except BaseException as exc:
-            # 连接失败时回退状态，允许重试
-            if self._state in ("connecting", "authenticating"):
-                self._state = "disconnected"
-            self._log.warn("client", "connect exit (error): elapsed=%.3fs gateway=%s err=%s", time.time() - _t_start, normalized.get("gateway", "-"), exc)
-            raise
+
+        gateways = self._resolve_gateways(normalized)
+        self._log.debug("client", "connect enter: gateways=%s", gateways)
+        last_error: BaseException | None = None
+        for gw in gateways:
+            try:
+                gw_params = dict(normalized)
+                gw_params["gateway"] = gw
+                await self._connect_once(gw_params, allow_reauth=False)
+                self._log.debug("client", "connect exit: elapsed=%.3fs gateway=%s aid=%s", time.time() - _t_start, self._gateway_url, self._aid or "-")
+                return
+            except BaseException as exc:
+                last_error = exc
+                if len(gateways) > 1:
+                    self._log.warn("client", "connect: gateway %s failed, trying next: %s", gw, exc)
+                if self._state in ("connecting", "authenticating"):
+                    self._state = "connecting"
+
+        if self._state in ("connecting", "authenticating"):
+            self._state = "disconnected"
+        self._log.warn("client", "connect exit (error): elapsed=%.3fs gateways=%s err=%s", time.time() - _t_start, gateways, last_error)
+        raise last_error  # type: ignore[misc]
 
     async def disconnect(self) -> None:
         """断开连接但不关闭客户端（可重新 connect，对齐 C++ Disconnect）"""
@@ -651,7 +1143,16 @@ class AUNClient:
 
     # 需要客户端签名的关键方法（渐进式部署：服务端有签名则验，无签名则放行）
     _SIGNED_METHODS = frozenset({
-        "group.send", "group.kick", "group.add_member",
+        "message.send",
+        "message.v2.put_peer_pk", "message.v2.bootstrap",
+        "message.v2.group_bootstrap", "message.v2.pull",
+        "message.v2.ack",
+        "group.send",
+        "group.v2.put_group_pk", "group.v2.bootstrap",
+        "group.v2.send", "group.v2.pull", "group.v2.ack",
+        "group.v2.propose_state", "group.v2.confirm_state",
+        "group.v2.get_proposal",
+        "group.kick", "group.add_member",
         "group.leave", "group.remove_member", "group.update_rules",
         "group.update", "group.update_announcement",
         "group.update_join_requirements", "group.set_role",
@@ -719,6 +1220,8 @@ class AUNClient:
 
         params = dict(params) if params else {}
         self._log.debug("client", "call enter: method=%s", method)
+        if method in {"message.send", "group.send"}:
+            self._normalize_outbound_message_payload(params, method=method)
         self._validate_outbound_call(method, params)
         self._inject_message_cursor_context(method, params)
 
@@ -733,7 +1236,7 @@ class AUNClient:
                 params["group_id"] = normalized_gid
 
         # group.* 方法注入 device_id（服务端用于多设备消息路由）
-        if method.startswith("group.") and self._device_id and "device_id" not in params:
+        if method.startswith("group.") and "device_id" not in params:
             params["device_id"] = self._device_id
         if method.startswith("group.") and "slot_id" not in params:
             params["slot_id"] = self._slot_id
@@ -741,9 +1244,17 @@ class AUNClient:
         # 自动加密：message.send 默认加密（encrypt 默认 True）— V2-only 客户端必须走 V2 路径
         if method == "message.send":
             encrypt = params.pop("encrypt", True)
-            self._log.info("client", "DEBUG call message.send: to=%s encrypt=%s payload_keys=%s",
-                           params.get("to", "-"), encrypt,
-                           list(params.get("payload", {}).keys()) if isinstance(params.get("payload"), dict) else type(params.get("payload")).__name__)
+            self._log_message_debug(
+                "send-input",
+                "message.send",
+                "message.send",
+                params,
+                payload_override=params.get("payload", params.get("content")),
+                extra={"encrypt": encrypt},
+            )
+            self._log.debug("client", "call message.send: to=%s encrypt=%s payload_keys=%s",
+                            params.get("to", "-"), encrypt,
+                            list(params.get("payload", {}).keys()) if isinstance(params.get("payload"), dict) else type(params.get("payload")).__name__)
             if encrypt:
                 if not self._v2_session:
                     raise StateError("V2 session not initialized; encrypted message.send requires V2 (V1 E2EE removed)")
@@ -761,6 +1272,14 @@ class AUNClient:
         # 自动加密：group.send 默认加密（encrypt 默认 True）— V2-only 客户端必须走 V2 路径
         if method == "group.send":
             encrypt = params.pop("encrypt", True)
+            self._log_message_debug(
+                "send-input",
+                "group.send",
+                "group.send",
+                params,
+                payload_override=params.get("payload", params.get("content")),
+                extra={"encrypt": encrypt},
+            )
             if encrypt:
                 if not self._v2_session:
                     raise StateError("V2 session not initialized; encrypted group.send requires V2 (V1 E2EE removed)")
@@ -825,7 +1344,10 @@ class AUNClient:
 
         # 关键操作自动附加客户端签名
         if method in self._SIGNED_METHODS:
-            self._sign_client_operation(method, params)
+            if self._should_skip_client_signature(method, params):
+                params.pop("client_signature", None)
+            else:
+                self._sign_client_operation(method, params)
 
         # P1-23: 非幂等方法使用更长超时
         call_kwargs: dict[str, Any] = {}
@@ -833,6 +1355,8 @@ class AUNClient:
             call_kwargs["timeout"] = _NON_IDEMPOTENT_TIMEOUT
         if trace:
             call_kwargs["trace"] = trace
+        if method in ("group.thought.get", "message.thought.get"):
+            self._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
         try:
             result = await self._transport.call(method, params, **call_kwargs)
         except TypeError as exc:
@@ -847,10 +1371,29 @@ class AUNClient:
             self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
             raise
 
+        if method == "group.thought.get" and isinstance(result, dict):
+            self._log.debug(
+                "client",
+                "group.thought.get transport result: found=%s raw_count=%d",
+                result.get("found"),
+                len(result.get("thoughts", [])) if isinstance(result.get("thoughts"), list) else 0,
+            )
+            result = await self._decrypt_group_thoughts(result)
+        if method == "message.thought.get" and isinstance(result, dict):
+            self._log.debug(
+                "client",
+                "message.thought.get transport result: found=%s raw_count=%d",
+                result.get("found"),
+                len(result.get("thoughts", [])) if isinstance(result.get("thoughts"), list) else 0,
+            )
+            result = await self._decrypt_message_thoughts(result)
         # 自动解密：message.pull 返回的消息（V2 路径已在 call() 开头路由，此处为 plaintext pull 的 seq 跟踪）
         if method == "message.pull" and isinstance(result, dict):
             ns = f"p2p:{self._aid}" if self._aid else ""
             messages = result.get("messages")
+            if isinstance(messages, list):
+                for msg in messages:
+                    self._log_message_debug("pull-raw", "message.pull", "message.received", msg)
             contig_before = self._seq_tracker.get_contiguous_seq(ns) if self._aid and getattr(self, "_seq_tracker", None) is not None else 0
             if isinstance(messages, list) and messages and self._aid and getattr(self, "_seq_tracker", None) is not None:
                 self._seq_tracker.on_pull_result(ns, messages, after_seq=int((params or {}).get("after_seq", 0) or 0))
@@ -873,6 +1416,9 @@ class AUNClient:
         # 自动解密：group.pull 返回的群消息（V2 路径已在 call() 开头路由，此处为 plaintext pull 的 seq 跟踪）
         if method == "group.pull" and isinstance(result, dict):
             messages = result.get("messages")
+            if isinstance(messages, list):
+                for msg in messages:
+                    self._log_message_debug("pull-raw", "group.pull", "group.message_created", msg)
             gid = (params or {}).get("group_id", "")
             ns = f"group:{gid}" if gid else ""
             contig_before = self._seq_tracker.get_contiguous_seq(ns) if gid and getattr(self, "_seq_tracker", None) is not None else 0
@@ -915,6 +1461,10 @@ class AUNClient:
                     await self._v2_auto_propose_state(gid)
                 except Exception as exc:
                     self._log.debug("client", "V2 post-membership propose failed (non-fatal): group=%s err=%s", gid, exc)
+                if method in {"group.create", "group.use_invite_code"}:
+                    self._schedule_group_spk_registration(gid, reason=method)
+                # group SPK 轮换只由 group.changed 成员关系事件或解密消费当前 group SPK 触发。
+                # 这里不在本地 RPC 返回后直接轮换，避免 lazy/propose 路径和事件路径重复触发。
 
         self._log.debug("client", "call exit: elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
         return result
@@ -1017,14 +1567,73 @@ class AUNClient:
 
     # ── P1-17: auto-ack fire-and-forget 辅助 ──────────────────
     def _fire_ack(self, method: str, params: dict[str, Any], label: str = "") -> None:
-        """将 ack RPC 以 fire-and-forget 方式发送，不阻塞消息事件分发。"""
+        """将 ack RPC 以 fire-and-forget 方式发送，不阻塞消息事件分发。
+
+        防御：ack 调用前 clamp，永远不发送超过本地已知上界（max_seen_seq）的 seq，
+        避免把本地脏数据/异常状态回传服务端污染数据库。
+        """
+        params = self._clamp_ack_params(method, params) if isinstance(params, dict) else params
         loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
         loop.create_task(self._safe_ack(method, params, label))
+
+    def _clamp_ack_params(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """ack 参数边界保护：clamp 到 [0, max_seen_seq]。
+
+        覆盖以下方法：
+        - message.v2.ack: up_to_seq
+        - message.ack: seq
+        - group.v2.ack: up_to_seq（per-group ns）
+        - group.ack_messages: msg_seq（per-group ns）
+        - group.ack_events: event_seq（per-group ns，事件 ns 与消息 ns 共享 max_seen）
+        """
+        def _clamp_field(p: dict, field: str, ns: str) -> dict:
+            value = p.get(field)
+            if not isinstance(value, (int, float)):
+                return p
+            ivalue = int(value)
+            new_value = ivalue
+            if ivalue < 0:
+                new_value = 0
+            if ns:
+                max_seen = self._seq_tracker.get_max_seen_seq(ns)
+                if max_seen > 0 and new_value > max_seen:
+                    self._log.warn(
+                        "client",
+                        "ack clamp: method=%s %s=%d > max_seen=%d, clamp",
+                        method, field, ivalue, max_seen,
+                    )
+                    new_value = max_seen
+            if new_value != ivalue:
+                return {**p, field: new_value}
+            return p
+
+        if method == "message.v2.ack":
+            ns = f"p2p:{self._aid}" if self._aid else ""
+            return _clamp_field(params, "up_to_seq", ns)
+        if method == "message.ack":
+            ns = f"p2p:{self._aid}" if self._aid else ""
+            return _clamp_field(params, "seq", ns)
+        # Group ack: ns 来自 group_id
+        if method in ("group.v2.ack", "group.ack_messages", "group.ack_events"):
+            group_id = str(params.get("group_id") or "").strip()
+            ns = f"group:{group_id}" if group_id else ""
+            if method == "group.v2.ack":
+                return _clamp_field(params, "up_to_seq", ns)
+            if method == "group.ack_messages":
+                return _clamp_field(params, "msg_seq", ns)
+            if method == "group.ack_events":
+                return _clamp_field(params, "event_seq", ns)
+        return params
 
     async def _safe_ack(self, method: str, params: dict[str, Any], label: str = "") -> None:
         """安全执行 ack RPC，失败仅记录日志。"""
         try:
-            await self._transport.call(method, params)
+            params = dict(params)
+            if method in self._SIGNED_METHODS:
+                self._sign_client_operation(method, params)
+            self._log.debug("client", "%s auto-ack send: method=%s params=%s", label or method, method, params)
+            result = await self._transport.call(method, params)
+            self._log.debug("client", "%s auto-ack ok: method=%s result=%s", label or method, method, result)
         except Exception as exc:
             self._log.debug("client", "%s auto-ack failed: %s", label or method, exc)
 
@@ -1032,6 +1641,7 @@ class AUNClient:
         """处理 transport 层推送的原始消息：解密后 re-publish 给用户。"""
         _t_start = time.time()
         if isinstance(data, dict):
+            self._log_message_debug("server-push", "_raw.message.received", "message.received", data)
             self._log.debug(
                 "client",
                 "_on_raw_message_received enter: message_id=%s seq=%s from=%s",
@@ -1051,16 +1661,16 @@ class AUNClient:
                 await self._publish_app_event("message.received", data)
                 return
             msg = dict(data)
-            self._log.info(
+            self._log.debug(
                 "client",
-                "DEBUG _process_and_publish_message enter: message_id=%s seq=%s from=%s device_id=%s slot_id=%s",
+                "_process_and_publish_message enter: message_id=%s seq=%s from=%s device_id=%s slot_id=%s",
                 msg.get("message_id"), msg.get("seq"), msg.get("from"),
                 msg.get("device_id"), msg.get("slot_id"),
             )
             if not self._message_targets_current_instance(msg):
-                self._log.info(
+                self._log.debug(
                     "client",
-                    "DEBUG _process_and_publish_message FILTERED (instance mismatch): "
+                    "_process_and_publish_message filtered (instance mismatch): "
                     "msg_device=%s self_device=%s msg_slot=%s self_slot=%s",
                     msg.get("device_id"), self._device_id,
                     msg.get("slot_id"), self._slot_id,
@@ -1071,11 +1681,15 @@ class AUNClient:
             seq = msg.get("seq")
             if seq is not None and self._aid:
                 ns = f"p2p:{self._aid}"
+                # Push 修上界：先更新 max_seen_seq，让上界反映服务端状态（即使后续被去重/旁路）
+                seq_int = int(seq) if isinstance(seq, (int, float)) else 0
+                if seq_int > 0:
+                    self._seq_tracker.update_max_seen(ns, seq_int)
                 old_contig = self._seq_tracker.get_contiguous_seq(ns)
-                need_pull = self._seq_tracker.on_message_seq(ns, int(seq))
+                need_pull = self._seq_tracker.on_message_seq(ns, seq_int)
                 new_contig = self._seq_tracker.get_contiguous_seq(ns)
                 self._log.debug("client", "P2P push seq tracking: seq=%d contig=%d->%d need_pull=%s",
-                                  int(seq), old_contig, new_contig, need_pull)
+                                  seq_int, old_contig, new_contig, need_pull)
                 self._persist_seq(ns)
                 if need_pull:
                     loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
@@ -1083,19 +1697,19 @@ class AUNClient:
 
             # 明文消息直接透传（V2 加密消息走 _on_v2_push_notification）
             if seq is not None and self._aid:
-                self._log.info(
+                self._log.debug(
                     "client",
-                    "DEBUG publish ordered: ns=%s seq=%s message_id=%s",
+                    "publish ordered: ns=%s seq=%s message_id=%s",
                     ns, seq, msg.get("message_id", "?"),
                 )
                 await self._publish_ordered_message("message.received", ns, seq, msg)
             else:
-                self._log.info(
+                self._log.debug(
                     "client",
-                    "DEBUG publish app event (no seq): message_id=%s",
+                    "publish app event (no seq): message_id=%s",
                     msg.get("message_id", "?"),
                 )
-                await self._publish_app_event("message.received", msg)
+                await self._publish_app_event("message.received", msg, source="push")
 
             # auto-ack push 消息：ack contiguous_seq（连续确认到的最高位置，避免空洞时跳跃推进）
             if seq is not None and self._aid:
@@ -1124,6 +1738,7 @@ class AUNClient:
                     "timestamp": data.get("timestamp"),
                     "_decrypt_error": str(_exc),
                 }
+                self._attach_v2_envelope_metadata_from_source(safe_event, data)
                 await self._publish_app_event("message.undecryptable", safe_event)
 
     async def _on_raw_group_message_created(self, data: Any) -> None:
@@ -1132,8 +1747,9 @@ class AUNClient:
         V1 兼容模式：直接透传（payload 已在推送中）。
         """
         if not isinstance(data, dict):
-            await self._publish_app_event("group.message_created", data)
+            await self._publish_app_event("group.message_created", data, source="group-push")
             return
+        self._log_message_debug("server-push", "_raw.group.message_created", "group.message_created", data)
         group_id = data.get("group_id", "")
         seq = data.get("seq")
         if group_id:
@@ -1143,6 +1759,19 @@ class AUNClient:
         if getattr(self, "_v2_session", None) and group_id and seq is not None:
             ns = f"group:{group_id}"
             seq_i = int(seq)
+            # Push 修上界：先更新 max_seen_seq
+            if seq_i > 0:
+                self._seq_tracker.update_max_seen(ns, seq_i)
+                if self._seq_tracker.get_contiguous_seq(ns) == seq_i:
+                    self._log.debug(
+                        "client",
+                        "_raw.group.message_created duplicate push already covered: group=%s seq=%d",
+                        group_id, seq_i,
+                    )
+                    return
+                self._repair_push_contiguous_bound(
+                    ns, seq_i, has_payload=False, label="_raw.group.message_created",
+                )
             if self._is_published_seq(ns, seq_i) or self._is_pending_ordered_seq(ns, seq_i):
                 return
             # 复用 V2 push 的 pull 逻辑
@@ -1168,6 +1797,19 @@ class AUNClient:
         if group_id and seq is not None:
             ns = f"group:{group_id}"
             seq_i = int(seq)
+            # Push 修上界：先更新 max_seen_seq
+            if seq_i > 0:
+                self._seq_tracker.update_max_seen(ns, seq_i)
+                if self._seq_tracker.get_contiguous_seq(ns) == seq_i:
+                    self._log.debug(
+                        "client",
+                        "_raw.group.message_created payload push already covered: group=%s seq=%d",
+                        group_id, seq_i,
+                    )
+                    return
+                self._repair_push_contiguous_bound(
+                    ns, seq_i, has_payload=True, label="_raw.group.message_created",
+                )
             if self._is_published_seq(ns, seq_i) or self._is_pending_ordered_seq(ns, seq_i):
                 return
             self._seq_tracker.on_message_seq(ns, seq_i)
@@ -1181,7 +1823,7 @@ class AUNClient:
                     "slot_id": self._slot_id,
                 }, f"群消息 auto-ack group={group_id}")
         else:
-            await self._publish_app_event("group.message_created", data)
+            await self._publish_app_event("group.message_created", data, source="group-push")
 
     async def _on_raw_group_v2_message_created(self, data: Any) -> None:
         """处理 V2 群消息推送：服务端 push 仅携带 seq + message_id + sender_aid + group_id，
@@ -1192,6 +1834,7 @@ class AUNClient:
         if not isinstance(data, dict):
             self._log.debug("client", "_on_raw_group_v2_message_created skipped (non-dict): type=%s", type(data).__name__)
             return
+        self._log_message_debug("server-push", "_raw.group.v2.message_created", "group.message_created", data)
         group_id = str(data.get("group_id") or "").strip()
         seq = int(data.get("seq", 0) or 0)
         message_id = str(data.get("message_id") or "").strip()
@@ -1206,6 +1849,20 @@ class AUNClient:
         if not getattr(self, "_v2_session", None):
             self._log.debug("client", "_on_raw_group_v2_message_created skipped: V2 session not initialized")
             return
+
+        # Push 修上界：先更新 max_seen_seq
+        ns_for_max = f"group:{group_id}"
+        self._seq_tracker.update_max_seen(ns_for_max, seq)
+        if self._seq_tracker.get_contiguous_seq(ns_for_max) == seq:
+            self._log.debug(
+                "client",
+                "_on_raw_group_v2_message_created duplicate push already covered: group=%s seq=%d",
+                group_id, seq,
+            )
+            return
+        self._repair_push_contiguous_bound(
+            ns_for_max, seq, has_payload=False, label="_raw.group.v2.message_created",
+        )
 
         async def _pull_and_publish() -> None:
             try:
@@ -1253,7 +1910,10 @@ class AUNClient:
             # 验签：有签名就验证操作者身份
             cs = data.get("client_signature")
             if cs and isinstance(cs, dict):
-                data["_verified"] = await self._verify_event_signature(data, cs)
+                if self._should_skip_event_signature(data):
+                    data.pop("client_signature", None)
+                else:
+                    data["_verified"] = await self._verify_event_signature(data, cs)
             # 发布给用户（publish 流程保持不变）
             await self._dispatcher.publish("group.changed", data)
 
@@ -1264,9 +1924,39 @@ class AUNClient:
                 bootstrap_cache = getattr(self, "_v2_bootstrap_cache", None)
                 if bootstrap_cache is not None:
                     bootstrap_cache.pop(f"group:{group_id}", None)
+                membership_actions = {
+                    "member_added", "member_left", "member_removed", "role_changed",
+                    "owner_transferred", "joined", "join_approved", "invite_code_used",
+                }
+                if action in membership_actions and getattr(self, "_v2_session", None):
+                    joined_aid = str(
+                        data.get("joined_aid")
+                        or data.get("member_aid")
+                        or data.get("aid")
+                        or ""
+                    ).strip()
+                    actor_aid = str(data.get("actor_aid") or "").strip()
+                    self_aid = str(getattr(self, "_aid", "") or "").strip()
+                    join_actions = {"member_added", "joined", "join_approved", "invite_code_used"}
+                    is_self_join = (
+                        action in join_actions
+                        and self_aid
+                        and (
+                            joined_aid == self_aid
+                            or (
+                                not joined_aid
+                                and action in {"joined", "invite_code_used"}
+                                and actor_aid == self_aid
+                            )
+                        )
+                    )
+                    if is_self_join:
+                        self._schedule_group_spk_registration(group_id, reason=f"group.changed:{action}")
+                    else:
+                        self._schedule_group_spk_rotation(group_id, reason=f"group.changed:{action}")
 
             # V2 自动 propose_state：owner/admin 在成员变更后自动提交 state proposal
-            if group_id and action in ("upsert",) and getattr(self, "_v2_session", None):
+            if group_id and action in ("upsert", "member_added", "member_left", "member_removed", "role_changed", "owner_transferred", "joined", "join_approved", "invite_code_used") and getattr(self, "_v2_session", None):
                 loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
                 loop.create_task(self._v2_auto_propose_state(group_id, leader_delay=True))
 
@@ -1329,14 +2019,17 @@ class AUNClient:
         # 0. 验证提交者签名
         cs = data.get("client_signature")
         if cs and isinstance(cs, dict):
-            verified = await self._verify_event_signature(data, cs)
-            if verified is False:
-                self._log.warn("client", 
-                    "state_committed 提交者签名验证失败 group=%s actor=%s",
-                    group_id, data.get("actor_aid"),
-                )
-                return
-            data["_verified"] = verified
+            if self._should_skip_event_signature(data):
+                data.pop("client_signature", None)
+            else:
+                verified = await self._verify_event_signature(data, cs)
+                if verified is False:
+                    self._log.warn("client", 
+                        "state_committed 提交者签名验证失败 group=%s actor=%s",
+                        group_id, data.get("actor_aid"),
+                    )
+                    return
+                data["_verified"] = verified
 
         state_version = int(data.get("state_version") or 0)
         state_hash = str(data.get("state_hash") or "").strip()
@@ -1478,55 +2171,88 @@ class AUNClient:
         self._gap_fill_done[dedup_key] = time.time()
         # S1: try/finally 保证 dedup 键在所有出口清理
         try:
-            self._log.info("client", "group event gap fill start: group=%s after_seq=%d", group_id, after_seq)
-            result = await self.call("group.pull_events", {
-                "group_id": group_id,
-                "after_event_seq": after_seq,
-                "device_id": self._device_id,
-                "limit": 50,
-            })
-            if isinstance(result, dict):
+            next_after_seq = after_seq
+            max_pages = 100
+            page_count = 0
+            while page_count < max_pages:
+                page_count += 1
+                self._log.info("client", "group event gap fill start: group=%s after_seq=%d", group_id, next_after_seq)
+                result = await self.call("group.pull_events", {
+                    "group_id": group_id,
+                    "after_event_seq": next_after_seq,
+                    "device_id": self._device_id,
+                    "limit": 50,
+                })
+                if not isinstance(result, dict):
+                    return
                 events = result.get("events", [])
-                if isinstance(events, list):
-                    self._log.info("client", "group event gap fill done: group=%s after_seq=%d pulled=%d", group_id, after_seq, len(events))
-                    contig_before = self._seq_tracker.get_contiguous_seq(ns)
-                    self._seq_tracker.on_pull_result(ns, events, after_seq=after_seq)
-                    cursor = result.get("cursor")
-                    server_ack = int(cursor.get("current_seq") or 0) if isinstance(cursor, dict) else 0
-                    if server_ack > 0:
-                        contig_before = self._seq_tracker.get_contiguous_seq(ns)
-                        if contig_before < server_ack:
-                            self._log.info("client", 
-                                "group.pull_events retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d",
-                                ns, contig_before, server_ack,
-                            )
-                            self._seq_tracker.force_contiguous_seq(ns, server_ack)
-                    # auto-ack contiguous_seq
-                    contig = self._seq_tracker.get_contiguous_seq(ns)
-                    if contig != contig_before:
-                        self._persist_seq(ns)
-                    if contig > 0 and contig != contig_before:
+                if not isinstance(events, list):
+                    return
+
+                self._log.info("client", "group event gap fill page done: group=%s after_seq=%d pulled=%d",
+                               group_id, next_after_seq, len(events))
+                page_contig_before = self._seq_tracker.get_contiguous_seq(ns)
+                if events:
+                    self._seq_tracker.on_pull_result(ns, events, after_seq=next_after_seq)
+
+                cursor = result.get("cursor")
+                server_ack = int(cursor.get("current_seq") or 0) if isinstance(cursor, dict) else 0
+                if server_ack > 0:
+                    contig_before_floor = self._seq_tracker.get_contiguous_seq(ns)
+                    if contig_before_floor < server_ack:
+                        self._log.info(
+                            "client",
+                            "group.pull_events retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d",
+                            ns, contig_before_floor, server_ack,
+                        )
+                        self._seq_tracker.force_contiguous_seq(ns, server_ack)
+
+                event_seqs: list[int] = []
+                for evt in events:
+                    if isinstance(evt, dict):
                         try:
-                            await self._transport.call("group.ack_events", {
-                                "group_id": group_id, "event_seq": contig,
-                                "device_id": self._device_id,
-                                "slot_id": self._slot_id,
-                            })
-                        except Exception as _ack_exc:
-                            self._log.debug("client", "group event auto-ack failed: group=%s %s", group_id, _ack_exc)
-                    for evt in events:
-                        if isinstance(evt, dict):
-                            evt["_from_gap_fill"] = True
-                            et = evt.get("event_type", "")
-                            # 消息事件由群消息 pull 负责，事件补洞不重复投递
-                            if et == "group.message_created":
-                                continue
-                            # 验签：有 client_signature 就验（与实时事件路径对齐）
-                            cs = evt.get("client_signature")
-                            if cs and isinstance(cs, dict):
+                            es = int(evt.get("event_seq") or 0)
+                        except (TypeError, ValueError):
+                            es = 0
+                        if es > 0:
+                            event_seqs.append(es)
+                        evt["_from_gap_fill"] = True
+                        et = evt.get("event_type", "")
+                        # 消息事件由群消息 pull 负责，事件补洞不重复投递
+                        if et == "group.message_created":
+                            continue
+                        # 验签：有 client_signature 就验（与实时事件路径对齐）
+                        cs = evt.get("client_signature")
+                        if cs and isinstance(cs, dict):
+                            if self._should_skip_event_signature(evt):
+                                evt.pop("client_signature", None)
+                            else:
                                 evt["_verified"] = await self._verify_event_signature(evt, cs)
-                            # group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
-                            await self._dispatcher.publish("group.changed", evt)
+                        # group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
+                        await self._dispatcher.publish("group.changed", evt)
+
+                contig = self._seq_tracker.get_contiguous_seq(ns)
+                if contig != page_contig_before:
+                    self._persist_seq(ns)
+                if events and contig > 0 and contig != page_contig_before:
+                    max_seen_ack = self._seq_tracker.get_max_seen_seq(ns)
+                    ack_seq = min(contig, max_seen_ack) if max_seen_ack > 0 else contig
+                    try:
+                        await self._transport.call("group.ack_events", {
+                            "group_id": group_id, "event_seq": ack_seq,
+                            "device_id": self._device_id,
+                            "slot_id": self._slot_id,
+                        })
+                    except Exception as _ack_exc:
+                        self._log.debug("client", "group event auto-ack failed: group=%s %s", group_id, _ack_exc)
+
+                next_after = max(max(event_seqs) if event_seqs else next_after_seq, next_after_seq)
+                if not events or next_after <= next_after_seq or result.get("has_more") is False:
+                    break
+                next_after_seq = next_after
+            if page_count >= max_pages:
+                self._log.warn("client", "group event gap fill reached max_pages=%d group=%s after_seq=%d",
+                               max_pages, group_id, next_after_seq)
         except Exception as exc:
             self._log.warn("client", "group event gap fill failed: group=%s after_seq=%d error=%s", group_id, after_seq, exc)
         finally:
@@ -1576,7 +2302,7 @@ class AUNClient:
                             if s is not None:
                                 await self._publish_pulled_message("message.received", ns_key, s, msg)
                             else:
-                                await self._publish_app_event("message.received", msg)
+                                await self._publish_app_event("message.received", msg, source="pull")
                             # 每条消息处理后让出事件循环，避免大量历史消息解密阻塞 ws 握手等 IO
                             await asyncio.sleep(0)
                     # 维护 republish guard 上限
@@ -1637,7 +2363,7 @@ class AUNClient:
         if not isinstance(payload, dict):
             return payload
         result = dict(payload)
-        if self._device_id and not str(result.get("device_id") or "").strip():
+        if "device_id" not in result:
             result["device_id"] = self._device_id
         if self._slot_id and not str(result.get("slot_id") or "").strip():
             result["slot_id"] = self._slot_id
@@ -1648,9 +2374,90 @@ class AUNClient:
             return payload
         return self._attach_current_instance_context(payload)
 
-    async def _publish_app_event(self, event: str, payload: Any) -> None:
+    @staticmethod
+    def _debug_json_default(value: Any) -> Any:
+        if isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+            return {
+                "_type": "bytes",
+                "len": len(raw),
+                "base64": base64.b64encode(raw).decode("ascii"),
+            }
+        return str(value)
+
+    @classmethod
+    def _debug_json(cls, value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=cls._debug_json_default)
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _message_payload_for_debug(message: Any) -> Any:
+        if not isinstance(message, dict):
+            return message
+        if "payload" in message:
+            return message.get("payload")
+        if "content" in message:
+            return message.get("content")
+        if "envelope_json" in message:
+            raw = message.get("envelope_json")
+            if isinstance(raw, str):
+                try:
+                    return json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return raw
+            return raw
+        legacy = message.get("legacy_v1")
+        if isinstance(legacy, dict):
+            if "payload" in legacy:
+                return legacy.get("payload")
+            if "content" in legacy:
+                return legacy.get("content")
+        return None
+
+    @staticmethod
+    def _message_envelope_fields_for_debug(message: Any) -> Any:
+        if not isinstance(message, dict):
+            return {"value_type": type(message).__name__}
+        keys = (
+            "message_id", "id", "from", "from_aid", "sender_aid", "to", "to_aid",
+            "group_id", "seq", "msg_seq", "type", "version", "timestamp", "t_server",
+            "device_id", "slot_id", "encrypted", "dispatch_mode", "dispatch",
+            "e2ee", "headers", "protected_headers", "context", "status",
+        )
+        return {key: message[key] for key in keys if key in message}
+
+    def _log_message_debug(
+        self,
+        stage: str,
+        source: str,
+        event: str,
+        message: Any,
+        *,
+        payload_override: Any = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "stage": stage,
+            "source": source,
+            "event": event,
+            "envelope": self._message_envelope_fields_for_debug(message),
+            "payload": payload_override if payload_override is not None else self._message_payload_for_debug(message),
+        }
+        if extra:
+            record["extra"] = extra
+        self._log.debug("client", "message.debug %s", self._debug_json(record))
+
+    def _log_app_message_publish(self, event: str, payload: Any, source: str) -> None:
+        if event not in ("message.received", "group.message_created"):
+            return
+        self._log_message_debug("publish", source, event, payload)
+
+    async def _publish_app_event(self, event: str, payload: Any, *, source: str = "direct") -> None:
         if event in ("message.received", "group.message_created") and isinstance(payload, dict):
             self._maybe_append_echo_trace_receive(payload)
+            self._log_app_message_publish(event, payload, source)
         # 注入本地/远端 agent.md etag，让应用层判断版本一致性；失败不影响业务。
         if isinstance(payload, dict):
             try:
@@ -1671,9 +2478,10 @@ class AUNClient:
     def _message_targets_current_instance(self, message: Any) -> bool:
         if not isinstance(message, dict):
             return True
-        target_device_id = str(message.get("device_id") or "").strip()
-        if target_device_id and self._device_id and target_device_id != self._device_id:
-            return False
+        if "device_id" in message:
+            target_device_id = str(message.get("device_id") or "").strip()
+            if target_device_id != self._device_id:
+                return False
         target_slot_id = str(message.get("slot_id") or "").strip()
         if target_slot_id and self._slot_id and target_slot_id != self._slot_id:
             return False
@@ -1692,9 +2500,11 @@ class AUNClient:
         for seq in ready:
             event, payload = pending.pop(seq)
             if self._is_published_seq(ns, seq):
+                self._log.debug("client", "publish ordered drain skipped duplicate: ns=%s seq=%d event=%s", ns, seq, event)
                 continue
-            await self._publish_app_event(event, payload)
+            await self._publish_app_event(event, payload, source="ordered-drain")
             self._mark_published_seq(ns, seq)
+            self._log.debug("client", "publish ordered drain delivered: ns=%s seq=%d event=%s", ns, seq, event)
         if not pending:
             self._pending_ordered().pop(ns, None)
 
@@ -1706,10 +2516,12 @@ class AUNClient:
         try:
             seq_i = int(seq)
         except (TypeError, ValueError):
-            await self._publish_app_event(event, payload)
+            self._log.debug("client", "publish ordered direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq)
+            await self._publish_app_event(event, payload, source="ordered")
             return True
         if seq_i <= 0:
-            await self._publish_app_event(event, payload)
+            self._log.debug("client", "publish ordered direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq_i)
+            await self._publish_app_event(event, payload, source="ordered")
             return True
         if self._is_published_seq(ns, seq_i):
             # 如果同 seq 也曾挂起，顺手清理，避免后续 drain 重复处理。
@@ -1743,8 +2555,9 @@ class AUNClient:
             pending.pop(seq_i, None)
             if not pending:
                 self._pending_ordered().pop(ns, None)
-        await self._publish_app_event(event, payload)
+        await self._publish_app_event(event, payload, source="ordered")
         self._mark_published_seq(ns, seq_i)
+        self._log.debug("client", "publish ordered delivered: event=%s ns=%s seq=%d", event, ns, seq_i)
         await self._drain_ordered_messages(ns)
         return True
 
@@ -1753,12 +2566,15 @@ class AUNClient:
         try:
             seq_i = int(seq)
         except (TypeError, ValueError):
-            await self._publish_app_event(event, payload)
+            self._log.debug("client", "publish pulled direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq)
+            await self._publish_app_event(event, payload, source="pull")
             return True
         if seq_i <= 0 or not ns:
-            await self._publish_app_event(event, payload)
+            self._log.debug("client", "publish pulled direct(no-seq): event=%s ns=%s seq=%s", event, ns or "<none>", seq_i)
+            await self._publish_app_event(event, payload, source="pull")
             return True
         if self._is_published_seq(ns, seq_i):
+            self._log.debug("client", "publish pulled skipped duplicate: event=%s ns=%s seq=%d", event, ns, seq_i)
             pending = self._pending_ordered().get(ns)
             if pending:
                 pending.pop(seq_i, None)
@@ -1770,8 +2586,9 @@ class AUNClient:
             pending.pop(seq_i, None)
             if not pending:
                 self._pending_ordered().pop(ns, None)
-        await self._publish_app_event(event, payload)
+        await self._publish_app_event(event, payload, source="pull")
         self._mark_published_seq(ns, seq_i)
+        self._log.debug("client", "publish pulled delivered: event=%s ns=%s seq=%d", event, ns, seq_i)
         return True
 
     def _prune_pushed_seqs(self, ns: str) -> None:
@@ -1810,6 +2627,158 @@ class AUNClient:
         result["payload"] = payload_view
         result["dispatch_mode"] = mode
         return result
+
+    def _v2_pending_sender_ik_message_key(self, msg: dict[str, Any], group_id: str) -> str:
+        message_id = str(msg.get("message_id") or "").strip()
+        seq = str(msg.get("seq") or "").strip()
+        prefix = f"group:{group_id}" if group_id else f"p2p:{self._aid or ''}"
+        return f"{prefix}:{message_id or seq or id(msg)}"
+
+    def _v2_pending_sender_ik_fetch_key(self, from_aid: str, sender_device_id: str, group_id: str) -> str:
+        return f"{from_aid}#{sender_device_id}#{group_id or ''}"
+
+    async def _v2_sender_pub_der_from_cache_or_cert(self, from_aid: str, sender_device_id: str) -> bytes | None:
+        """只查本地 IK 缓存和独立 PKI HTTP 证书，不在解密栈里调用 bootstrap RPC。"""
+        if not self._v2_session or not from_aid:
+            return None
+        sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
+        if sender_pub_der:
+            return sender_pub_der
+        try:
+            cert_pem = await asyncio.wait_for(self._fetch_peer_cert(from_aid), timeout=3.0)
+            if not cert_pem:
+                return None
+            from cryptography import x509
+            from cryptography.hazmat.primitives import serialization as _ser
+            cert = x509.load_pem_x509_certificate(cert_pem)
+            sender_pub_der = cert.public_key().public_bytes(
+                encoding=_ser.Encoding.DER,
+                format=_ser.PublicFormat.SubjectPublicKeyInfo,
+            )
+            # AID 证书公钥是 IK；同一 AID 多设备共享该 IK，按当前 device 精确缓存。
+            self._v2_session.cache_peer_ik(from_aid, sender_device_id, sender_pub_der)
+            self._log.debug("client", "V2 decrypt: sender IK fallback from PKI cert for %s", from_aid)
+            return sender_pub_der
+        except Exception as exc:
+            self._log.warn("client", "V2 decrypt: PKI cert sender IK fallback failed for %s: %s", from_aid, exc)
+            return None
+
+    def _v2_cache_peer_ik_from_device(self, dev: Any, fallback_aid: str = "") -> None:
+        if not self._v2_session or not isinstance(dev, dict):
+            return
+        has_dev_id, dev_id = _v2_device_id_from_device(dev)
+        ik_b64 = str(dev.get("ik_pk") or "").strip()
+        aid = str(dev.get("aid") or fallback_aid or "").strip()
+        if not has_dev_id or not ik_b64 or not aid:
+            return
+        try:
+            ik_der = base64.b64decode(ik_b64)
+            self._v2_session.cache_peer_ik(aid, dev_id, ik_der)
+        except Exception as exc:
+            self._log.debug("client", "V2 sender IK cache from bootstrap skipped aid=%s dev=%s: %s", aid, dev_id, exc)
+
+    def _schedule_v2_sender_ik_pending(
+        self,
+        *,
+        msg: dict[str, Any],
+        envelope: dict[str, Any],
+        from_aid: str,
+        sender_device_id: str,
+        group_id: str,
+    ) -> None:
+        if not from_aid:
+            return
+        message_key = self._v2_pending_sender_ik_message_key(msg, group_id)
+        self._v2_sender_ik_pending[message_key] = {
+            "msg": dict(msg),
+            "from_aid": from_aid,
+            "sender_device_id": sender_device_id,
+            "group_id": group_id,
+            "created_at": time.time(),
+        }
+        self._log.debug(
+            "client",
+            "V2 decrypt pending sender IK: key=%s from=%s device=%s group=%s pending=%d",
+            message_key, from_aid, sender_device_id or "-", group_id or "<p2p>", len(self._v2_sender_ik_pending),
+        )
+        fetch_key = self._v2_pending_sender_ik_fetch_key(from_aid, sender_device_id, group_id)
+        if fetch_key in self._v2_sender_ik_fetching:
+            return
+        self._v2_sender_ik_fetching.add(fetch_key)
+        loop = self._loop or asyncio.get_running_loop()
+        loop.create_task(self._resolve_v2_sender_ik_pending(from_aid, sender_device_id, group_id, fetch_key))
+
+    def _schedule_v2_sender_ik_fetch(self, from_aid: str, sender_device_id: str, group_id: str) -> None:
+        if not from_aid:
+            return
+        fetch_key = self._v2_pending_sender_ik_fetch_key(from_aid, sender_device_id, group_id)
+        if fetch_key in self._v2_sender_ik_fetching:
+            return
+        self._v2_sender_ik_fetching.add(fetch_key)
+        loop = self._loop or asyncio.get_running_loop()
+        loop.create_task(self._resolve_v2_sender_ik_pending(from_aid, sender_device_id, group_id, fetch_key))
+
+    async def _resolve_v2_sender_ik_pending(
+        self,
+        from_aid: str,
+        sender_device_id: str,
+        group_id: str,
+        fetch_key: str,
+    ) -> None:
+        try:
+            if self._v2_session and from_aid:
+                try:
+                    bs = await self.call("message.v2.bootstrap", {"peer_aid": from_aid})
+                    if isinstance(bs, dict):
+                        for dev in bs.get("peer_devices", []) or []:
+                            self._v2_cache_peer_ik_from_device(dev, from_aid)
+                except Exception as exc:
+                    self._log.warn("client", "V2 sender IK pending bootstrap failed peer=%s: %s", from_aid, exc)
+                if group_id:
+                    try:
+                        gbs = await self.call("group.v2.bootstrap", {"group_id": group_id})
+                        if isinstance(gbs, dict):
+                            for dev in gbs.get("devices", []) or []:
+                                self._v2_cache_peer_ik_from_device(dev)
+                            for dev in gbs.get("audit_recipients", []) or []:
+                                self._v2_cache_peer_ik_from_device(dev)
+                    except Exception as exc:
+                        self._log.warn("client", "V2 sender IK pending group bootstrap failed group=%s: %s", group_id, exc)
+                if not self._v2_session.get_peer_ik(from_aid, sender_device_id):
+                    await self._v2_sender_pub_der_from_cache_or_cert(from_aid, sender_device_id)
+
+            pending_items = [
+                (key, entry)
+                for key, entry in list(self._v2_sender_ik_pending.items())
+                if entry.get("from_aid") == from_aid
+                and entry.get("sender_device_id") == sender_device_id
+                and entry.get("group_id", "") == group_id
+            ]
+            for key, entry in pending_items:
+                msg = entry.get("msg")
+                if not isinstance(msg, dict):
+                    self._v2_sender_ik_pending.pop(key, None)
+                    continue
+                try:
+                    plaintext = await self._decrypt_v2_message(msg, allow_pending=False)
+                except Exception as exc:
+                    self._log.warn("client", "V2 sender IK pending retry raised: key=%s err=%s", key, exc)
+                    self._v2_sender_ik_pending.pop(key, None)
+                    continue
+                if plaintext is None:
+                    self._log.debug("client", "V2 sender IK pending retry failed: key=%s", key)
+                    self._v2_sender_ik_pending.pop(key, None)
+                    continue
+                self._v2_sender_ik_pending.pop(key, None)
+                seq = int(msg.get("seq") or 0)
+                if group_id:
+                    plaintext["group_id"] = group_id
+                    await self._publish_pulled_message("group.message_created", f"group:{group_id}", seq, plaintext)
+                else:
+                    await self._publish_pulled_message("message.received", f"p2p:{self._aid}", seq, plaintext)
+                self._log.debug("client", "V2 sender IK pending retry delivered: key=%s", key)
+        finally:
+            self._v2_sender_ik_fetching.discard(fetch_key)
 
     @staticmethod
     def _cert_cache_key(aid: str, cert_fingerprint: str | None = None) -> str:
@@ -1874,19 +2843,17 @@ class AUNClient:
         )
         ssl_param = None if self._config_model.verify_ssl else False
         # PY-017: 显式设置 HTTP 超时，避免 aiohttp 默认 300s 阻塞
-        http_timeout = aiohttp.ClientTimeout(total=10.0)
-        async with aiohttp.ClientSession(timeout=http_timeout) as session:
-            async with session.get(cert_url, ssl=ssl_param) as response:
-                response.raise_for_status()
-                cert_pem = await response.text()
-                _debug_group_e2ee(
-                    "peer_cert_fetch_http_result",
-                    aid=self._aid or "-",
-                    peer=aid,
-                    fp=normalized_fp or "-",
-                    status=response.status,
-                    bytes=len(cert_pem),
-                )
+        try:
+            cert_pem = await self._net.http_get_text(cert_url, timeout=10.0)
+        except Exception as exc:
+            raise ConnectionError(f"failed to fetch cert from {cert_url}: {exc}", retryable=True) from exc
+        _debug_group_e2ee(
+            "peer_cert_fetch_http_result",
+            aid=self._aid or "-",
+            peer=aid,
+            fp=normalized_fp or "-",
+            bytes=len(cert_pem),
+        )
         cert_bytes = cert_pem.encode("utf-8")
 
         # 完整 PKI 验证：链 + CRL + OCSP + AID 绑定
@@ -1976,6 +2943,128 @@ class AUNClient:
             self._log.error("client", "failed to write peer cert to keystore (aid=%s, fp=%s): %s", aid, cert_fingerprint or "", exc)
         self._log.debug("client", "_fetch_peer_cert exit: elapsed=%.3fs peer=%s fp=%s", time.time() - _t_start, aid, normalized_fp or "-")
         return cert_bytes
+
+    async def _v2_trusted_ik_pub_der(self, aid: str) -> bytes:
+        """返回经信任锚确认的 IK 公钥 DER；本 AID 用本地身份，其它 AID 用已 PKI 校验证书。"""
+        normalized_aid = str(aid or "").strip()
+        if not normalized_aid:
+            raise E2EEError("spk_aid_missing")
+        if self._aid and normalized_aid == self._aid:
+            if not self._v2_session:
+                raise E2EEError("V2 session not initialized")
+            return self._v2_session.ik_pub_der
+
+        cert_pem = await self._fetch_peer_cert(normalized_aid)
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives import serialization as _ser
+
+        cert_obj = _x509.load_pem_x509_certificate(
+            cert_pem if isinstance(cert_pem, bytes) else str(cert_pem).encode("utf-8")
+        )
+        return cert_obj.public_key().public_bytes(
+            encoding=_ser.Encoding.DER,
+            format=_ser.PublicFormat.SubjectPublicKeyInfo,
+        )
+
+    @staticmethod
+    def _v2_spk_timestamp_text(value: Any, *, aid: str, device_id: str, spk_id: str) -> str:
+        if value is None or value == "":
+            raise E2EEError(f"spk_timestamp_missing: aid={aid} device_id={device_id} spk_id={spk_id}")
+        if isinstance(value, bool):
+            raise E2EEError(f"spk_timestamp_invalid: aid={aid} device_id={device_id} spk_id={spk_id}")
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise E2EEError(f"spk_timestamp_invalid: aid={aid} device_id={device_id} spk_id={spk_id}")
+            return str(int(value))
+        text = str(value).strip()
+        if not text or not text.isdigit():
+            raise E2EEError(f"spk_timestamp_invalid: aid={aid} device_id={device_id} spk_id={spk_id}")
+        return str(int(text))
+
+    async def _v2_verify_spk_device(
+        self,
+        dev: dict[str, Any],
+        *,
+        aid: str,
+        device_id: str,
+        ik_pk_der: bytes,
+        spk_pk_der: bytes | None,
+        key_source: str,
+    ) -> None:
+        """发送端校验 bootstrap 中的 SPK 确实由 AID 证书 IK 背书。"""
+        if not self._v2_session:
+            raise E2EEError("V2 session not initialized")
+        spk_id = str(dev.get("spk_id") or "").strip()
+        if not spk_id:
+            return
+        if key_source not in {"peer_device_prekey", "group_device_prekey"}:
+            raise E2EEError(f"spk_key_source_invalid: aid={aid} device_id={device_id} spk_id={spk_id} key_source={key_source}")
+        if not spk_pk_der:
+            raise E2EEError(f"spk_public_key_missing: aid={aid} device_id={device_id} spk_id={spk_id}")
+
+        expected_spk_id = "sha256:" + hashlib.sha256(spk_pk_der).hexdigest()[:16]
+        if spk_id != expected_spk_id:
+            raise E2EEError(f"spk_id_mismatch: aid={aid} device_id={device_id} spk_id={spk_id} expected={expected_spk_id}")
+
+        trusted_ik = await self._v2_trusted_ik_pub_der(aid)
+        if trusted_ik != ik_pk_der:
+            raise E2EEError(f"spk_ik_mismatch: aid={aid} device_id={device_id} spk_id={spk_id}")
+        if spk_pk_der == trusted_ik:
+            self._v2_session.mark_peer_spk_verified(aid, device_id, spk_id)
+            return
+
+        sig_b64 = str(dev.get("spk_signature") or "").strip()
+        if not sig_b64:
+            raise E2EEError(f"spk_signature_missing: aid={aid} device_id={device_id} spk_id={spk_id}")
+        try:
+            signature = base64.b64decode(sig_b64, validate=True)
+        except Exception as exc:
+            raise E2EEError(f"spk_signature_invalid_base64: aid={aid} device_id={device_id} spk_id={spk_id}") from exc
+        ts_text = self._v2_spk_timestamp_text(dev.get("spk_timestamp"), aid=aid, device_id=device_id, spk_id=spk_id)
+        sign_data = spk_pk_der + spk_id.encode("utf-8") + ts_text.encode("utf-8")
+        if not ecdsa_verify_raw(trusted_ik, signature, sign_data):
+            raise E2EEError(f"spk_signature_invalid: aid={aid} device_id={device_id} spk_id={spk_id}")
+        self._v2_session.mark_peer_spk_verified(aid, device_id, spk_id)
+
+    async def _v2_build_target_from_device(
+        self,
+        dev: dict[str, Any],
+        *,
+        aid: str,
+        device_id: str,
+        role: str,
+        default_key_source: str,
+    ) -> dict[str, Any] | None:
+        aid = str(aid or "").strip()
+        has_device_id, normalized_device_id = _v2_device_id_from_device(dev)
+        device_id = normalized_device_id if has_device_id else str(device_id or "").strip()
+        ik_b64 = str(dev.get("ik_pk") or "").strip()
+        if not aid or not has_device_id or not ik_b64:
+            return None
+        ik_pk_der = base64.b64decode(ik_b64)
+        spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
+        key_source = str(dev.get("key_source") or default_key_source).strip() or default_key_source
+        await self._v2_verify_spk_device(
+            dev,
+            aid=aid,
+            device_id=device_id,
+            ik_pk_der=ik_pk_der,
+            spk_pk_der=spk_pk_der,
+            key_source=key_source,
+        )
+        if self._v2_session:
+            self._v2_session.cache_peer_ik(aid, device_id, ik_pk_der)
+        return {
+            "aid": aid,
+            "device_id": device_id,
+            "role": role,
+            "key_source": key_source,
+            "ik_pk_der": ik_pk_der,
+            "spk_pk_der": spk_pk_der,
+            "spk_id": str(dev.get("spk_id") or "").strip(),
+        }
 
     @staticmethod
     def _list_contains_token(value: Any, token: str) -> bool:
@@ -2269,6 +3358,13 @@ class AUNClient:
 
             self._log.debug("client", "transport.connect start: gateway=%s allow_reauth=%s", gateway_url, allow_reauth)
             challenge = await self._transport.connect(gateway_url)
+            # 连接成功：刷新 DNS 缓存
+            net = getattr(self, "_net", None)
+            if net is not None:
+                try:
+                    net._refresh_dns_cache_after_success(gateway_url)
+                except Exception as exc:
+                    self._log.debug("client", "DNS cache refresh skipped: %s", exc)
             self._state = "authenticating"
             self._log.debug("client", "auth phase start: mode=%s", "reauth" if allow_reauth else "token")
             if allow_reauth:
@@ -2321,23 +3417,26 @@ class AUNClient:
 
             self._start_background_tasks()
 
-            # connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
-            # 群消息按惰性触发，不在此处主动 pull
-            try:
-                loop = self._loop or asyncio.get_running_loop()
-                loop.create_task(self._fill_p2p_gap())
-            except Exception as exc:
-                self._log.warn("client", "schedule post-connect P2P gap fill failed: %s", exc)
+            session_options = getattr(self, "_session_options", {}) or {}
+            background_sync = bool(params.get("background_sync", session_options.get("background_sync", True)))
+
+            # connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压。
+            # CLI 这类一次性短命令可通过 background_sync=False 跳过，避免无关 RPC 增加延迟。
+            if background_sync:
+                try:
+                    loop = self._loop or asyncio.get_running_loop()
+                    loop.create_task(self._fill_p2p_gap())
+                except Exception as exc:
+                    self._log.warn("client", "schedule post-connect P2P gap fill failed: %s", exc)
 
             # V2 E2EE: 初始化 session 并注册设备密钥
             try:
                 await self._init_v2_session()
             except Exception as exc:
                 self._log.warn("client", "V2 session init failed (non-fatal): %s", exc)
-
             # V2: Owner 上线时自动确认 pending state proposals
             # （兼容测试用 __new__ 绕过 __init__ 直接调 _connect_once 的场景）
-            if getattr(self, "_v2_session", None):
+            if background_sync and getattr(self, "_v2_session", None):
                 loop = self._loop or asyncio.get_running_loop()
                 loop.create_task(self._v2_auto_confirm_pending_proposals())
             self._log.debug("client", "_connect_once exit: elapsed=%.3fs gateway=%s aid=%s", time.time() - _t_start, gateway_url, self._aid or "-")
@@ -2346,6 +3445,10 @@ class AUNClient:
             raise
 
     def _resolve_gateway(self, params: dict[str, Any]) -> str:
+        gateways = self._resolve_gateways(params)
+        return gateways[0]
+
+    def _resolve_gateways(self, params: dict[str, Any]) -> list[str]:
         topology = params.get("topology")
         if isinstance(topology, dict):
             mode = str(topology.get("mode") or "gateway")
@@ -2360,10 +3463,14 @@ class AUNClient:
                 if not relay or not target:
                     raise ValidationError("relay topology requires 'relay' and 'target'")
                 raise ValidationError("relay topology is not implemented in the Python SDK")
-        gateway = str(params.get("gateway") or "")
-        if not gateway:
-            raise StateError("missing gateway in connect params")
-        return gateway
+        gateway = params.get("gateway") or params.get("gateways")
+        if isinstance(gateway, list):
+            urls = [str(g) for g in gateway if g]
+            if urls:
+                return urls
+        if isinstance(gateway, str) and gateway:
+            return [gateway]
+        raise StateError("missing gateway in connect params")
 
     @staticmethod
     def _is_internal_only_method(method: str) -> bool:
@@ -2373,6 +3480,8 @@ class AUNClient:
 
     def _start_background_tasks(self) -> None:
         # 短连接生命周期短，禁用心跳与 token 刷新（不接收推送、不需要长期会话维护）
+        if not self._session_options.get("background_sync", True):
+            return
         if self._session_options.get("connection_kind") != "short":
             self._start_heartbeat_task()
             self._start_token_refresh_task()
@@ -2542,19 +3651,45 @@ class AUNClient:
         if _is_group_service_aid(to_aid):
             raise ValidationError("message.send receiver cannot be group.{issuer}; use group.send instead")
 
+    def _normalize_outbound_message_payload(self, params: dict[str, Any], *, method: str = "") -> None:
+        if "payload" not in params and "content" in params:
+            params["payload"] = params.pop("content")
+        payload = params.get("payload")
+        if isinstance(payload, dict) and "type" not in payload and isinstance(payload.get("text"), str):
+            params["payload"] = {"type": "text", **payload}
+
+    def _is_echo_message_params(self, params: dict[str, Any]) -> bool:
+        if params.get("encrypted") or params.get("encrypt"):
+            return False
+        payload = params.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        text = payload.get("text")
+        if not isinstance(text, str) or len(text) > 4096:
+            return False
+        return "echo" in text.split("\n", 1)[0].lower()
+
+    def _should_skip_client_signature(self, method: str, params: dict[str, Any]) -> bool:
+        # echo 是链路测试消息，中间节点会追加 trace 行，不能参与客户端操作签名。
+        return method in {"message.send", "group.send"} and self._is_echo_message_params(params)
+
+    def _should_skip_event_signature(self, event: dict[str, Any]) -> bool:
+        # echo 是链路测试消息，服务端/SDK 会追加 trace 行；误带签名时也不验签。
+        return self._is_echo_message_params(event)
+
     def _maybe_append_echo_trace_send(self, params: dict[str, Any]) -> None:
         """明文 echo 消息发送时追加 SDK.send trace"""
         payload = params.get("payload")
         if not isinstance(payload, dict):
-            self._log.info("client", "DEBUG echo_trace_send skip: payload not dict, type=%s", type(payload).__name__)
+            self._log.debug("client", "echo_trace_send skip: payload not dict, type=%s", type(payload).__name__)
             return
         text = payload.get("text")
         if not isinstance(text, str) or len(text) > 4096:
-            self._log.info("client", "DEBUG echo_trace_send skip: text invalid, type=%s len=%s", type(text).__name__, len(text) if isinstance(text, str) else "?")
+            self._log.debug("client", "echo_trace_send skip: text invalid, type=%s len=%s", type(text).__name__, len(text) if isinstance(text, str) else "?")
             return
         first_line = text.split("\n", 1)[0].lower()
         if "echo" not in first_line:
-            self._log.info("client", "DEBUG echo_trace_send skip: no 'echo' in first line=%r", first_line[:80])
+            self._log.debug("client", "echo_trace_send skip: no 'echo' in first line=%r", first_line[:80])
             return
         import datetime
         now = datetime.datetime.now()
@@ -2562,7 +3697,7 @@ class AUNClient:
         uptime = int(time.time() - getattr(self, "_connected_at", time.time()))
         trace = f"{ts} [AUN-SDK.send] aid={self._aid or '-'} conn_uptime={uptime}s"
         params["payload"] = {**payload, "text": text + "\n" + trace}
-        self._log.info("client", "DEBUG echo_trace_send appended: %s", trace)
+        self._log.debug("client", "echo_trace_send appended: %s", trace)
 
     def _maybe_append_echo_trace_receive(self, msg: dict[str, Any]) -> None:
         """明文 echo 消息接收时追加 SDK.receive trace"""
@@ -2724,6 +3859,10 @@ class AUNClient:
         self._gap_fill_active = False
         self._pushed_seqs.clear()
         self._pending_ordered().clear()
+        if hasattr(self, "_v2_sender_ik_pending"):
+            self._v2_sender_ik_pending.clear()
+        if hasattr(self, "_v2_sender_ik_fetching"):
+            self._v2_sender_ik_fetching.clear()
         if hasattr(self, "_group_synced"):
             self._group_synced.clear()
 
@@ -2742,6 +3881,10 @@ class AUNClient:
         self._gap_fill_active = False
         self._pushed_seqs.clear()
         self._pending_ordered().clear()
+        if hasattr(self, "_v2_sender_ik_pending"):
+            self._v2_sender_ik_pending.clear()
+        if hasattr(self, "_v2_sender_ik_fetching"):
+            self._v2_sender_ik_fetching.clear()
         if hasattr(self, "_group_synced"):
             self._group_synced.clear()
         self._seq_tracker_context = next_context
@@ -2764,6 +3907,40 @@ class AUNClient:
                 saver(self._aid, self._device_id, self._slot_id, ns, seq)
         except Exception as _seq_exc:
             self._log.debug("client", "save seq failed: %s", _seq_exc)
+
+    def _persist_repaired_seq(self, ns: str) -> None:
+        """持久化倒退修复后的 seq；修复到 0 时删除旧落盘游标。"""
+        if not self._aid:
+            return
+        seq = self._seq_tracker.get_contiguous_seq(ns)
+        if seq > 0:
+            self._persist_seq(ns)
+            return
+        deleter = getattr(self._keystore, "delete_seq", None)
+        if callable(deleter):
+            try:
+                deleter(self._aid, self._device_id, self._slot_id, ns)
+            except Exception as exc:
+                self._log.debug("client", "delete repaired seq failed: ns=%s err=%s", ns, exc)
+
+    def _repair_push_contiguous_bound(self, ns: str, push_seq: int, *, has_payload: bool, label: str) -> int:
+        """按 push 类型修复异常过高的 contiguous_seq，并返回修复后的值。"""
+        if not ns or push_seq <= 0:
+            return self._seq_tracker.get_contiguous_seq(ns) if ns else 0
+        contig = self._seq_tracker.get_contiguous_seq(ns)
+        should_repair = contig > push_seq
+        if not should_repair:
+            return contig
+        repaired_to = max(0, push_seq - 1)
+        self._seq_tracker.repair_contiguous_seq(ns, repaired_to)
+        repaired = self._seq_tracker.get_contiguous_seq(ns)
+        self._persist_repaired_seq(ns)
+        self._log.warn(
+            "client",
+            "%s push repaired contiguous_seq: ns=%s payload=%s push_seq=%d contiguous=%d->%d",
+            label, ns, has_payload, push_seq, contig, repaired,
+        )
+        return repaired
 
     def _save_seq_tracker_state(self) -> None:
         """将 SeqTracker 状态按行保存到 keystore seq_tracker 表。"""
@@ -3143,9 +4320,12 @@ class AUNClient:
             "timeouts": dict(_DEFAULT_SESSION_OPTIONS["timeouts"]),
             "connection_kind": connection_kind,
             "short_ttl_ms": int(params.get("short_ttl_ms") or 0),
+            "background_sync": bool(params.get("background_sync", _DEFAULT_SESSION_OPTIONS["background_sync"])),
         }
         if "auto_reconnect" in params:
             options["auto_reconnect"] = bool(params["auto_reconnect"])
+        if "background_sync" in params:
+            options["background_sync"] = bool(params["background_sync"])
         if "heartbeat_interval" in params:
             options["heartbeat_interval"] = float(params["heartbeat_interval"])
         if "token_refresh_before" in params:
@@ -3219,7 +4399,7 @@ class AUNClient:
 
     _V2_BOOTSTRAP_TTL = 3600  # 发送端 bootstrap 缓存 1 小时
 
-    _V2_SIG_CACHE_TTL = 600  # 验签结果缓存 10 分钟
+    _V2_SIG_CACHE_TTL = 3600  # 验签结果缓存 1 小时
     _V2_SIG_CACHE_MAX = 16384
 
     async def _init_v2_session(self) -> None:
@@ -3250,9 +4430,68 @@ class AUNClient:
             aid_priv_der=aid_priv_der, aid_pub_der=aid_pub_der,
         )
         self._v2_session.ensure_keys()
-        self._v2_bootstrap_cache: dict[str, tuple[list[dict], float]] = {}
+        self._v2_bootstrap_cache: dict[str, tuple] = {}
         await self._v2_session.ensure_registered(self.call)
         self._log.debug("client", "V2 session initialized (IK=AID identity): aid=%s device=%s", self._aid, self._device_id)
+
+    def _schedule_group_spk_registration(self, group_id: str, *, reason: str) -> None:
+        group_id = str(group_id or "").strip()
+        if not group_id or not self._v2_session:
+            return
+        inflight = getattr(self, "_group_spk_registration_inflight", None)
+        if inflight is None:
+            inflight = set()
+            self._group_spk_registration_inflight = inflight
+        if group_id in inflight:
+            return
+        inflight.add(group_id)
+        async def _run() -> None:
+            try:
+                if self._state != "connected" or not self._v2_session:
+                    return
+                await self._v2_session.ensure_group_registered(group_id, self.call)
+                self._log.debug("client", "group SPK registered: group=%s reason=%s", group_id, reason)
+            except Exception as exc:
+                self._log.debug("client", "group SPK registration failed (non-fatal): group=%s reason=%s err=%s", group_id, reason, exc)
+            finally:
+                inflight.discard(group_id)
+        loop = self._loop or asyncio.get_running_loop()
+        loop.create_task(_run())
+
+    def _schedule_group_spk_rotation(self, group_id: str, *, reason: str) -> None:
+        group_id = str(group_id or "").strip()
+        if not group_id or not self._v2_session:
+            return
+        inflight = getattr(self, "_group_spk_rotation_inflight", None)
+        if inflight is None:
+            inflight = set()
+            self._group_spk_rotation_inflight = inflight
+        if group_id in inflight:
+            return
+        inflight.add(group_id)
+        async def _run() -> None:
+            try:
+                if self._state != "connected" or not self._v2_session:
+                    return
+                await self._v2_session.rotate_group_spk(group_id, self.call)
+                self._log.debug("client", "group SPK rotated: group=%s reason=%s", group_id, reason)
+            except Exception as exc:
+                self._log.debug("client", "group SPK rotation failed (non-fatal): group=%s reason=%s err=%s", group_id, reason, exc)
+            finally:
+                inflight.discard(group_id)
+        loop = self._loop or asyncio.get_running_loop()
+        loop.create_task(_run())
+
+    def _schedule_group_spk_registration_after_peer_fallback(self, group_id: str) -> None:
+        group_id = str(group_id or "").strip()
+        registered = getattr(self, "_group_spk_peer_fallback_registered", None)
+        if registered is None:
+            registered = set()
+            self._group_spk_peer_fallback_registered = registered
+        if not group_id or group_id in registered:
+            return
+        registered.add(group_id)
+        self._schedule_group_spk_registration(group_id, reason="peer_device_prekey_fallback")
 
     async def _send_encrypted_v2(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 P2P 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。
@@ -3269,26 +4508,47 @@ class AUNClient:
             raise ValidationError("message.send requires 'to'")
         if not isinstance(payload, dict):
             raise ValidationError("message.send payload must be a dict for V2 encryption")
+        self._log_message_debug(
+            "send-plaintext",
+            "message.send.v2",
+            "message.send",
+            params,
+            payload_override=payload,
+            extra={"to": to},
+        )
 
         async def _attempt(use_cache: bool) -> dict[str, Any]:
+            self._log.debug("client", "message.v2.send attempt: to=%s use_cache=%s", to, use_cache)
             if use_cache:
                 cached = self._v2_bootstrap_cache.get(to)
                 if cached and (time.time() - cached[1]) < self._V2_BOOTSTRAP_TTL:
                     peer_devices = cached[0]
+                    self_devices_from_bootstrap = cached[3] if len(cached) > 3 and isinstance(cached[3], list) else None
                 else:
                     peer_devices = None
+                    self_devices_from_bootstrap = None
             else:
                 peer_devices = None
+                self_devices_from_bootstrap = None
 
             if peer_devices is None:
                 bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
                 peer_devices = bootstrap.get("peer_devices", [])
                 audit_recipients_raw = bootstrap.get("audit_recipients", [])
-                self._log.info("client", "DEBUG _send_encrypted_v2 bootstrap: to=%s peer_devices=%d spk_pks=%s",
-                               to, len(peer_devices),
-                               [d.get("spk_pk", "")[:20] or "<empty>" for d in peer_devices[:3]])
+                raw_self_devices = bootstrap.get("self_devices")
+                self_devices_from_bootstrap = raw_self_devices if isinstance(raw_self_devices, list) else None
+                self._log.debug("client", "_send_encrypted_v2 bootstrap: to=%s peer_devices=%d spk_pks=%s",
+                                to, len(peer_devices),
+                                [d.get("spk_pk", "")[:20] or "<empty>" for d in peer_devices[:3]])
                 if peer_devices:
-                    self._v2_bootstrap_cache[to] = (peer_devices, time.time(), audit_recipients_raw)
+                    self._v2_bootstrap_cache[to] = (
+                        peer_devices,
+                        time.time(),
+                        audit_recipients_raw,
+                        self_devices_from_bootstrap,
+                    )
+                if self._aid and self_devices_from_bootstrap:
+                    self._v2_bootstrap_cache[self._aid] = (self_devices_from_bootstrap, time.time())
             else:
                 audit_recipients_raw = cached[2] if len(cached) > 2 and isinstance(cached[2], list) else []
 
@@ -3297,35 +4557,28 @@ class AUNClient:
 
             targets = []
             for dev in peer_devices:
-                ik_pk_der = base64.b64decode(dev["ik_pk"])
-                spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-                self._v2_session.cache_peer_ik(to, dev.get("device_id", ""), ik_pk_der)
-                targets.append({
-                    "aid": to,
-                    "device_id": dev.get("device_id", ""),
-                    "role": "peer",
-                    "key_source": dev.get("key_source", "peer_device_prekey"),
-                    "ik_pk_der": ik_pk_der,
-                    "spk_pk_der": spk_pk_der,
-                    "spk_id": dev.get("spk_id", ""),
-                })
+                target = await self._v2_build_target_from_device(
+                    dev,
+                    aid=to,
+                    device_id=dev.get("device_id", ""),
+                    role="peer",
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    targets.append(target)
 
             # 构造 audit_recipients
             audit_targets = []
             for dev in audit_recipients_raw:
-                ik_pk_der = base64.b64decode(dev["ik_pk"]) if dev.get("ik_pk") else None
-                if not ik_pk_der:
-                    continue
-                spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-                audit_targets.append({
-                    "aid": dev.get("aid", ""),
-                    "device_id": dev.get("device_id", ""),
-                    "role": "audit",
-                    "key_source": dev.get("key_source", "peer_device_prekey"),
-                    "ik_pk_der": ik_pk_der,
-                    "spk_pk_der": spk_pk_der,
-                    "spk_id": dev.get("spk_id", ""),
-                })
+                target = await self._v2_build_target_from_device(
+                    dev,
+                    aid=dev.get("aid", ""),
+                    device_id=dev.get("device_id", ""),
+                    role="audit",
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    audit_targets.append(target)
 
             target_set = {"targets": targets, "audit_recipients": audit_targets}
             sender = self._v2_session.get_sender_identity()
@@ -3333,29 +4586,29 @@ class AUNClient:
             # Self-sync
             if self._aid and self._aid != to:
                 try:
-                    self_cached = self._v2_bootstrap_cache.get(self._aid)
-                    if self_cached and (time.time() - self_cached[1]) < self._V2_BOOTSTRAP_TTL:
-                        self_devices = self_cached[0]
-                    else:
-                        self_bs = await self.call("message.v2.bootstrap", {"peer_aid": self._aid})
-                        self_devices = self_bs.get("peer_devices", [])
-                        if self_devices:
-                            self._v2_bootstrap_cache[self._aid] = (self_devices, time.time())
+                    self_devices = self_devices_from_bootstrap if self_devices_from_bootstrap else None
+                    if self_devices is None:
+                        self_cached = self._v2_bootstrap_cache.get(self._aid)
+                        if self_cached and (time.time() - self_cached[1]) < self._V2_BOOTSTRAP_TTL:
+                            self_devices = self_cached[0]
+                        else:
+                            self_bs = await self.call("message.v2.bootstrap", {"peer_aid": self._aid})
+                            self_devices = self_bs.get("peer_devices", [])
+                            if self_devices:
+                                self._v2_bootstrap_cache[self._aid] = (self_devices, time.time())
                     for dev in self_devices:
-                        dev_id = dev.get("owner_device_id") or dev.get("device_id", "")
-                        if dev_id == self._device_id:
+                        has_dev_id, dev_id = _v2_device_id_from_device(dev)
+                        if not has_dev_id or dev_id == self._device_id:
                             continue
-                        ik_pk_der = base64.b64decode(dev["ik_pk"])
-                        spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-                        targets.append({
-                            "aid": self._aid,
-                            "device_id": dev_id,
-                            "role": "self_sync",
-                            "key_source": dev.get("key_source", "peer_device_prekey"),
-                            "ik_pk_der": ik_pk_der,
-                            "spk_pk_der": spk_pk_der,
-                            "spk_id": dev.get("spk_id", ""),
-                        })
+                        target = await self._v2_build_target_from_device(
+                            dev,
+                            aid=self._aid,
+                            device_id=dev_id,
+                            role="self_sync",
+                            default_key_source="peer_device_prekey",
+                        )
+                        if target:
+                            targets.append(target)
                 except Exception as exc:
                     self._log.debug("client", "V2 self-sync bootstrap failed (non-fatal): %s", exc)
 
@@ -3369,11 +4622,29 @@ class AUNClient:
                 context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
 
-            return await self.call("message.send", {
+            self._log_message_debug(
+                "send-envelope",
+                "message.send.v2",
+                "message.send",
+                {
+                    "to": to,
+                    "message_id": envelope.get("message_id"),
+                    "type": envelope.get("type"),
+                    "version": envelope.get("version"),
+                    "headers": envelope.get("protected_headers"),
+                    "context": envelope.get("context"),
+                },
+                payload_override=envelope,
+                extra={"plaintext_payload": payload},
+            )
+
+            result = await self.call("message.send", {
                 "to": to,
                 "payload": envelope,
                 "encrypt": False,
             })
+            self._log.debug("client", "message.v2.send ok: to=%s use_cache=%s seq=%s", to, use_cache, result.get("seq") if isinstance(result, dict) else "")
+            return result
 
         try:
             return await _attempt(use_cache=True)
@@ -3393,93 +4664,170 @@ class AUNClient:
         limit = int(params.get("limit", 50) or 50)
 
         ns = f"p2p:{self._aid}" if self._aid else ""
-        effective_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
+        next_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
+        first_contig_before = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
+        response: dict[str, Any] = {}
+        decrypted: list[dict[str, Any]] = []
+        total_raw_count = 0
+        latest_seq = 0
+        server_ack_seq = 0
+        page_count = 0
+        max_pages = int(params.get("max_pages", 100) or 100)
 
-        result = await self.call("message.v2.pull", {
-            "after_seq": effective_after_seq,
-            "limit": limit,
-        })
-        messages = result.get("messages", [])
-        seqs = [
-            int(m.get("seq") or 0)
-            for m in messages
-            if isinstance(m, dict) and int(m.get("seq") or 0) > 0
-        ]
-        contig_before = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
-        if ns and seqs and seqs[0] > contig_before:
-            self._seq_tracker.force_contiguous_seq(ns, seqs[0])
-
-        decrypted = []
-        for msg in messages:
-            seq = msg.get("seq", 0)
-            if seq <= 0:
-                continue
-
-            # V1 行（服务端 v2.pull 合并的 V1 历史）：V2-only 客户端跳过 V1 envelope，
-            # 仅明文消息照常 publish；e2ee.encrypted / e2ee.group_encrypted / 未知类型一律
-            # 推进 seq tracker 并丢弃。
-            if str(msg.get("version", "") or "") == "v1":
-                legacy = msg.get("legacy_v1") or {}
-                v1_payload = legacy.get("payload")
-                v1_payload_type = ""
-                if isinstance(v1_payload, dict):
-                    v1_payload_type = str(v1_payload.get("type") or "").strip()
-                # 仅放行明文（非 V1 E2EE 包装类型）
-                if v1_payload_type not in ("e2ee.encrypted", "e2ee.group_encrypted") and v1_payload is not None:
-                    v1_msg = {
-                        "message_id": msg.get("message_id", ""),
-                        "from": msg.get("from_aid", ""),
-                        "to": legacy.get("to", self._aid),
-                        "seq": seq,
-                        "type": msg.get("type", ""),
-                        "timestamp": msg.get("t_server", 0),
-                        "payload": v1_payload,
-                        "encrypted": False,
-                    }
-                    if ns:
-                        await self._publish_pulled_message("message.received", ns, seq, v1_msg)
-                    else:
-                        await self._publish_app_event("message.received", v1_msg)
-                    decrypted.append(v1_msg)
-                else:
-                    self._log.debug("client", "v2.pull skipping V1 envelope seq=%d payload_type=%s (V1 E2EE removed)",
-                                    seq, v1_payload_type or "<none>")
-                continue
-
-            # 跟踪每个旧 SPK 引用的最大 seq（用于消费后销毁）
-            try:
-                msg_spk_id = str(msg.get("spk_id", "") or "")
-                if msg_spk_id and self._v2_session and not self._v2_session.is_current_spk(msg_spk_id):
-                    self._v2_session.track_old_spk_max_seq(msg_spk_id, seq)
-            except Exception:
-                pass
-            # 解密
-            plaintext = await self._decrypt_v2_message(msg)
-            if plaintext is None:
-                continue
-            # pull 批发布只做去重，不受批内部永久空洞阻塞
-            if ns:
-                await self._publish_pulled_message("message.received", ns, seq, plaintext)
+        while page_count < max_pages:
+            page_count += 1
+            self._log.debug(
+                "client",
+                "message.v2.pull page request: page=%d after_seq=%d limit=%d ns=%s",
+                page_count, next_after_seq, limit, ns or "<none>",
+            )
+            result = await self.call("message.v2.pull", {
+                "after_seq": next_after_seq,
+                "limit": limit,
+            })
+            if isinstance(result, dict):
+                response.update(result)
             else:
-                await self._publish_app_event("message.received", plaintext)
-            decrypted.append(plaintext)
+                result = {}
 
-        if ns and seqs:
-            max_seq = max(seqs)
-            current_contig = self._seq_tracker.get_contiguous_seq(ns)
-            if max_seq > current_contig:
-                self._seq_tracker.force_contiguous_seq(ns, max_seq)
-                await self._drain_ordered_messages(ns)
+            messages = result.get("messages", [])
+            raw_messages = messages if isinstance(messages, list) else []
+            total_raw_count += len(raw_messages)
+            self._log.debug(
+                "client",
+                "message.v2.pull page response: page=%d raw_count=%d has_more=%s server_ack_seq=%s",
+                page_count, len(raw_messages), result.get("has_more"), result.get("server_ack_seq"),
+            )
+            for msg in raw_messages:
+                self._log_message_debug("pull-raw", "message.v2.pull", "message.received", msg)
+            seqs = [
+                int(m.get("seq") or 0)
+                for m in raw_messages
+                if isinstance(m, dict) and int(m.get("seq") or 0) > 0
+            ]
+            page_contig_before = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
 
-        if ns:
-            contig = self._seq_tracker.get_contiguous_seq(ns)
-            if contig != contig_before:
-                self._persist_seq(ns)
-            if contig > 0 and contig != contig_before:
-                self._fire_ack("message.v2.ack", {
-                    "up_to_seq": contig,
-                }, "V2 P2P auto-ack")
-        return {"messages": decrypted}
+            if seqs:
+                page_max_seq = max(seqs)
+                latest_seq = max(latest_seq, page_max_seq)
+                if ns:
+                    self._seq_tracker.force_contiguous_seq(ns, page_max_seq)
+                    self._log.debug(
+                        "client",
+                        "message.v2.pull force contiguous: ns=%s page_max_seq=%d previous=%d",
+                        ns, page_max_seq, page_contig_before,
+                    )
+            else:
+                page_max_seq = next_after_seq
+
+            for msg in raw_messages:
+                if not isinstance(msg, dict):
+                    continue
+                seq = int(msg.get("seq", 0) or 0)
+                if seq <= 0:
+                    continue
+
+                # V1 行（服务端 v2.pull 合并的 V1 历史）：V2-only 客户端跳过 V1 envelope，
+                # 仅明文消息照常 publish；e2ee.encrypted / e2ee.group_encrypted / 未知类型一律
+                # 推进 seq tracker 并丢弃。
+                if str(msg.get("version", "") or "") == "v1":
+                    legacy = msg.get("legacy_v1") or {}
+                    v1_payload = legacy.get("payload")
+                    v1_payload_type = ""
+                    if isinstance(v1_payload, dict):
+                        v1_payload_type = str(v1_payload.get("type") or "").strip()
+                    # 仅放行明文（非 V1 E2EE 包装类型）
+                    if v1_payload_type not in ("e2ee.encrypted", "e2ee.group_encrypted") and v1_payload is not None:
+                        v1_msg = {
+                            "message_id": msg.get("message_id", ""),
+                            "from": msg.get("from_aid", ""),
+                            "to": legacy.get("to", self._aid),
+                            "seq": seq,
+                            "type": msg.get("type", ""),
+                            "timestamp": msg.get("t_server", 0),
+                            "payload": v1_payload,
+                            "encrypted": False,
+                        }
+                        if ns:
+                            await self._publish_pulled_message("message.received", ns, seq, v1_msg)
+                        else:
+                            await self._publish_app_event("message.received", v1_msg, source="pull")
+                        decrypted.append(v1_msg)
+                        self._log.debug("client", "message.v2.pull plaintext V1 delivered: ns=%s seq=%d", ns or "<none>", seq)
+                    else:
+                        self._log.debug("client", "v2.pull skipping V1 envelope seq=%d payload_type=%s (V1 E2EE removed)",
+                                        seq, v1_payload_type or "<none>")
+                    continue
+
+                # 跟踪每个旧 SPK 引用的最大 seq（用于消费后销毁）
+                try:
+                    msg_spk_id = str(msg.get("spk_id", "") or "")
+                    if msg_spk_id and self._v2_session and msg_spk_id != self._v2_session._spk_id:
+                        self._v2_session.track_old_spk_max_seq(msg_spk_id, seq)
+                except Exception:
+                    pass
+                # 解密失败不阻断本页 seq 下界推进和 ack。
+                plaintext = await self._decrypt_v2_message(msg)
+                if plaintext is None:
+                    self._log.debug("client", "message.v2.pull decrypt returned None: ns=%s seq=%d", ns or "<none>", seq)
+                    continue
+                if ns:
+                    await self._publish_pulled_message("message.received", ns, seq, plaintext)
+                else:
+                    await self._publish_app_event("message.received", plaintext, source="pull")
+                decrypted.append(plaintext)
+                self._log_message_debug("decrypt-ok", "message.v2.pull", "message.received", plaintext)
+
+            if ns:
+                page_server_ack = int(result.get("server_ack_seq") or 0)
+                server_ack_seq = max(server_ack_seq, page_server_ack)
+                if page_server_ack > 0:
+                    contig = self._seq_tracker.get_contiguous_seq(ns)
+                    if contig < page_server_ack:
+                        self._log.info(
+                            "client",
+                            "message.v2.pull retention-floor 推进: ns=%s contiguous=%d -> server_ack_seq=%d",
+                            ns, contig, page_server_ack,
+                        )
+                        self._seq_tracker.force_contiguous_seq(ns, page_server_ack)
+
+                if not raw_messages and not decrypted and self._seq_tracker.has_pending_gaps(ns):
+                    self._log.info(
+                        "client",
+                        "message.v2.pull 返回空但有 pending gaps: ns=%s contiguous=%d, 可能原因：多设备竞态/临时消息过期/Push-Pull 时序差",
+                        ns, self._seq_tracker.get_contiguous_seq(ns),
+                    )
+
+                contig = self._seq_tracker.get_contiguous_seq(ns)
+                contig_advanced = contig != page_contig_before
+                if contig_advanced:
+                    await self._drain_ordered_messages(ns)
+                    self._persist_seq(ns)
+                if raw_messages and contig_advanced and contig > 0:
+                    self._log.debug("client", "message.v2.pull scheduling auto-ack: ns=%s ack_seq=%d raw_count=%d", ns, contig, len(raw_messages))
+                    self._fire_ack("message.v2.ack", {"up_to_seq": contig}, "V2 P2P page auto-ack")
+
+            next_after = max(page_max_seq, next_after_seq)
+            if not raw_messages or next_after <= next_after_seq or result.get("has_more") is False:
+                break
+            next_after_seq = next_after
+
+        if page_count >= max_pages:
+            self._log.warn("client", "message.v2.pull reached max_pages=%d after_seq=%d", max_pages, next_after_seq)
+
+        response["messages"] = decrypted
+        response["_contig_before"] = first_contig_before
+        response["raw_count"] = total_raw_count
+        if latest_seq:
+            response["latest_seq"] = max(int(response.get("latest_seq") or 0), latest_seq)
+        if server_ack_seq:
+            response["server_ack_seq"] = max(int(response.get("server_ack_seq") or 0), server_ack_seq)
+        self._log.debug(
+            "client",
+            "message.v2.pull done: requested_after_seq=%d pages=%d raw_count=%d decrypted=%d ns=%s",
+            after_seq, page_count, total_raw_count, len(decrypted), ns or "<none>",
+        )
+        return response
 
     async def _ack_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 P2P 确认消费 + 自检销毁旧 SPK。内部方法，由 call("message.ack") 路由调用。"""
@@ -3487,24 +4835,47 @@ class AUNClient:
         up_to_seq = int(params.get("seq", 0) or params.get("up_to_seq", 0) or 0)
         seq = up_to_seq or (self._seq_tracker.get_contiguous_seq(ns) if ns else 0)
         if seq <= 0:
+            self._log.debug("client", "message.v2.ack skipped: ns=%s up_to_seq=%s", ns or "<none>", up_to_seq)
             return {"acked": 0}
+        # ack clamp：永远不发送超过 max_seen_seq 的 up_to_seq
+        if ns:
+            max_seen = self._seq_tracker.get_max_seen_seq(ns)
+            if max_seen > 0 and seq > max_seen:
+                self._log.warn(
+                    "client",
+                    "_ack_v2_internal clamp: up_to_seq=%d > max_seen=%d, clamp",
+                    seq, max_seen,
+                )
+                seq = max_seen
+        self._log.debug("client", "message.v2.ack send: ns=%s up_to_seq=%d", ns or "<none>", seq)
         result = await self.call("message.v2.ack", {"up_to_seq": seq})
+        actual_ack_seq = seq
         # 补充兼容字段
         if isinstance(result, dict):
-            result["ack_seq"] = seq
+            try:
+                if "effective_ack_seq" in result:
+                    actual_ack_seq = int(result.get("effective_ack_seq") or 0)
+                elif "ack_seq" in result:
+                    actual_ack_seq = int(result.get("ack_seq") or 0)
+                elif "cursor" in result:
+                    actual_ack_seq = int(result.get("cursor") or 0)
+            except Exception:
+                actual_ack_seq = seq
+            result["ack_seq"] = actual_ack_seq
             result["success"] = True
             # V1+V2 共享 seq 空间：即使 V2 inbox 没 wrap 行（明文消息在 V1 表），
             # V1 cursor 也被推进了，视为 ack 成功
-            if result.get("acked", 0) == 0 and seq > 0:
-                result["acked"] = seq
+            if result.get("acked", 0) == 0 and actual_ack_seq > 0:
+                result["acked"] = actual_ack_seq
         # 自检：所有旧 SPK 引用的消息都已 ack → 销毁旧 SPK 私钥（PFS）
         if self._v2_session:
             try:
-                destroyed = self._v2_session.maybe_destroy_old_spks(seq)
+                destroyed = self._v2_session.maybe_destroy_old_spks(actual_ack_seq)
                 if destroyed:
                     self._log.info("client", "V2 destroyed old SPKs after ack: %s (PFS)", destroyed[:3])
             except Exception as exc:
                 self._log.debug("client", "V2 SPK destroy failed (non-fatal): %s", exc)
+        self._log.debug("client", "message.v2.ack ok: ns=%s requested=%d effective=%d result=%s", ns or "<none>", seq, actual_ack_seq, result)
         return result
 
     # ── V2 Group E2EE API ─────────────────────────────────────────
@@ -3524,8 +4895,17 @@ class AUNClient:
             raise ValidationError("group.send requires 'group_id'")
         if not isinstance(payload, dict):
             raise ValidationError("group.send payload must be a dict for V2 encryption")
+        self._log_message_debug(
+            "send-plaintext",
+            "group.send.v2",
+            "group.send",
+            params,
+            payload_override=payload,
+            extra={"group_id": group_id},
+        )
 
         async def _attempt(use_cache: bool) -> dict[str, Any]:
+            self._log.debug("client", "group.v2.send attempt: group=%s use_cache=%s", group_id, use_cache)
             cache_key = f"group:{group_id}"
             epoch = 0
             if use_cache:
@@ -3590,42 +4970,35 @@ class AUNClient:
             targets = []
             for dev in all_devices:
                 dev_aid = dev.get("aid", "")
-                dev_id = dev.get("device_id", "")
-                if dev_aid == self._aid and dev_id == self._device_id:
+                has_dev_id, dev_id = _v2_device_id_from_device(dev)
+                if dev_aid == self._aid and has_dev_id and dev_id == self._device_id:
                     continue
                 # pending 成员默认可收发（可用性优先），安全敏感群可通过配置严格过滤
-                ik_pk_der = base64.b64decode(dev["ik_pk"])
-                spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
                 role = "self_sync" if dev_aid == self._aid else "member"
-                targets.append({
-                    "aid": dev_aid,
-                    "device_id": dev_id,
-                    "role": role,
-                    "key_source": dev.get("key_source", "peer_device_prekey"),
-                    "ik_pk_der": ik_pk_der,
-                    "spk_pk_der": spk_pk_der,
-                    "spk_id": dev.get("spk_id", ""),
-                })
+                target = await self._v2_build_target_from_device(
+                    dev,
+                    aid=dev_aid,
+                    device_id=dev_id,
+                    role=role,
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    targets.append(target)
 
             if not targets:
                 raise E2EEError(f"V2 group: no target devices for group {group_id}")
 
             # 监管 AID：把 audit_recipients 一并加入 targets（role="audit"）
             for dev in audit_recipients_raw:
-                ik_b64 = dev.get("ik_pk")
-                if not ik_b64:
-                    continue
-                ik_pk_der = base64.b64decode(ik_b64)
-                spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-                targets.append({
-                    "aid": dev.get("aid", ""),
-                    "device_id": dev.get("device_id", ""),
-                    "role": "audit",
-                    "key_source": dev.get("key_source", "peer_device_prekey"),
-                    "ik_pk_der": ik_pk_der,
-                    "spk_pk_der": spk_pk_der,
-                    "spk_id": dev.get("spk_id", ""),
-                })
+                target = await self._v2_build_target_from_device(
+                    dev,
+                    aid=dev.get("aid", ""),
+                    device_id=dev.get("device_id", ""),
+                    role="audit",
+                    default_key_source="peer_device_prekey",
+                )
+                if target:
+                    targets.append(target)
 
             sender = self._v2_session.get_sender_identity()
             envelope = encrypt_group_message(
@@ -3641,10 +5014,28 @@ class AUNClient:
                 context=params.get("context") if isinstance(params.get("context"), dict) else None,
             )
 
-            return await self.call("group.v2.send", {
+            self._log_message_debug(
+                "send-envelope",
+                "group.send.v2",
+                "group.send",
+                {
+                    "group_id": group_id,
+                    "message_id": envelope.get("message_id"),
+                    "type": envelope.get("type"),
+                    "version": envelope.get("version"),
+                    "headers": envelope.get("protected_headers"),
+                    "context": envelope.get("context"),
+                },
+                payload_override=envelope,
+                extra={"plaintext_payload": payload, "epoch": epoch},
+            )
+
+            result = await self.call("group.v2.send", {
                 "group_id": group_id,
                 "envelope": envelope,
             })
+            self._log.debug("client", "group.v2.send ok: group=%s use_cache=%s seq=%s", group_id, use_cache, result.get("seq") if isinstance(result, dict) else "")
+            return result
 
         try:
             result = await _attempt(use_cache=True)
@@ -3664,6 +5055,7 @@ class AUNClient:
             self._seq_tracker.on_message_seq(ns, seq)
             self._mark_published_seq(ns, seq)
             self._persist_seq(ns)
+            self._log.debug("client", "group.v2.send marked own seq: group=%s ns=%s seq=%d", group_id, ns, seq)
         return result
 
     # ── V2 thought（per-device wrap，服务端不持久化）─────────────
@@ -3689,73 +5081,75 @@ class AUNClient:
         if cached and (time.time() - cached[1]) < self._V2_BOOTSTRAP_TTL:
             peer_devices = cached[0]
             audit_recipients_raw = cached[2] if len(cached) > 2 and isinstance(cached[2], list) else []
+            self_devices_from_bootstrap = cached[3] if len(cached) > 3 and isinstance(cached[3], list) else None
         else:
             bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
             peer_devices = bootstrap.get("peer_devices", [])
             audit_recipients_raw = bootstrap.get("audit_recipients", []) or []
+            raw_self_devices = bootstrap.get("self_devices")
+            self_devices_from_bootstrap = raw_self_devices if isinstance(raw_self_devices, list) else None
             if peer_devices:
-                self._v2_bootstrap_cache[to] = (peer_devices, time.time(), audit_recipients_raw)
+                self._v2_bootstrap_cache[to] = (
+                    peer_devices,
+                    time.time(),
+                    audit_recipients_raw,
+                    self_devices_from_bootstrap,
+                )
+            if self._aid and self_devices_from_bootstrap:
+                self._v2_bootstrap_cache[self._aid] = (self_devices_from_bootstrap, time.time())
 
         if not peer_devices:
             raise E2EEError(f"V2 bootstrap: no devices found for {to}")
 
         targets: list[dict[str, Any]] = []
         for dev in peer_devices:
-            ik_pk_der = base64.b64decode(dev["ik_pk"])
-            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-            self._v2_session.cache_peer_ik(to, dev.get("device_id", ""), ik_pk_der)
-            targets.append({
-                "aid": to,
-                "device_id": dev.get("device_id", ""),
-                "role": "peer",
-                "key_source": dev.get("key_source", "peer_device_prekey"),
-                "ik_pk_der": ik_pk_der,
-                "spk_pk_der": spk_pk_der,
-                "spk_id": dev.get("spk_id", ""),
-            })
+            target = await self._v2_build_target_from_device(
+                dev,
+                aid=to,
+                device_id=dev.get("device_id", ""),
+                role="peer",
+                default_key_source="peer_device_prekey",
+            )
+            if target:
+                targets.append(target)
 
         for dev in audit_recipients_raw:
-            ik_b64 = dev.get("ik_pk")
-            if not ik_b64:
-                continue
-            ik_pk_der = base64.b64decode(ik_b64)
-            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-            targets.append({
-                "aid": dev.get("aid", ""),
-                "device_id": dev.get("device_id", ""),
-                "role": "audit",
-                "key_source": dev.get("key_source", "peer_device_prekey"),
-                "ik_pk_der": ik_pk_der,
-                "spk_pk_der": spk_pk_der,
-                "spk_id": dev.get("spk_id", ""),
-            })
+            target = await self._v2_build_target_from_device(
+                dev,
+                aid=dev.get("aid", ""),
+                device_id=dev.get("device_id", ""),
+                role="audit",
+                default_key_source="peer_device_prekey",
+            )
+            if target:
+                targets.append(target)
 
         # Self-sync：自己其它设备
         if self._aid and self._aid != to:
             try:
-                self_cached = self._v2_bootstrap_cache.get(self._aid)
-                if self_cached and (time.time() - self_cached[1]) < self._V2_BOOTSTRAP_TTL:
-                    self_devices = self_cached[0]
-                else:
-                    self_bs = await self.call("message.v2.bootstrap", {"peer_aid": self._aid})
-                    self_devices = self_bs.get("peer_devices", [])
-                    if self_devices:
-                        self._v2_bootstrap_cache[self._aid] = (self_devices, time.time())
+                self_devices = self_devices_from_bootstrap if self_devices_from_bootstrap else None
+                if self_devices is None:
+                    self_cached = self._v2_bootstrap_cache.get(self._aid)
+                    if self_cached and (time.time() - self_cached[1]) < self._V2_BOOTSTRAP_TTL:
+                        self_devices = self_cached[0]
+                    else:
+                        self_bs = await self.call("message.v2.bootstrap", {"peer_aid": self._aid})
+                        self_devices = self_bs.get("peer_devices", [])
+                        if self_devices:
+                            self._v2_bootstrap_cache[self._aid] = (self_devices, time.time())
                 for dev in self_devices:
-                    dev_id = dev.get("owner_device_id") or dev.get("device_id", "")
-                    if dev_id == self._device_id:
+                    has_dev_id, dev_id = _v2_device_id_from_device(dev)
+                    if not has_dev_id or dev_id == self._device_id:
                         continue
-                    ik_pk_der = base64.b64decode(dev["ik_pk"])
-                    spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-                    targets.append({
-                        "aid": self._aid,
-                        "device_id": dev_id,
-                        "role": "self_sync",
-                        "key_source": dev.get("key_source", "peer_device_prekey"),
-                        "ik_pk_der": ik_pk_der,
-                        "spk_pk_der": spk_pk_der,
-                        "spk_id": dev.get("spk_id", ""),
-                    })
+                    target = await self._v2_build_target_from_device(
+                        dev,
+                        aid=self._aid,
+                        device_id=dev_id,
+                        role="self_sync",
+                        default_key_source="peer_device_prekey",
+                    )
+                    if target:
+                        targets.append(target)
             except Exception as exc:
                 self._log.debug("client", "V2 thought self-sync bootstrap failed (non-fatal): %s", exc)
 
@@ -3787,8 +5181,16 @@ class AUNClient:
 
         thought_id = str(params.get("thought_id") or f"mt-{uuid.uuid4()}").strip()
         timestamp = int(params.get("timestamp") or time.time() * 1000)
+        self._log_message_debug(
+            "thought-send-plaintext",
+            "message.thought.put.v2",
+            "message.thought.put",
+            {"to": to_aid, "thought_id": thought_id, "timestamp": timestamp, "payload": payload},
+            payload_override=payload,
+        )
 
         async def _attempt(use_cache: bool) -> Any:
+            self._log.debug("client", "message.thought.put attempt: to=%s thought_id=%s use_cache=%s", to_aid, thought_id, use_cache)
             envelope = await self._build_v2_p2p_envelope(
                 to=to_aid,
                 payload=payload,
@@ -3807,7 +5209,17 @@ class AUNClient:
             if "context" in params:
                 send_params["context"] = params["context"]
             self._sign_client_operation("message.thought.put", send_params)
-            return await self._transport.call("message.thought.put", send_params)
+            self._log_message_debug(
+                "thought-send-envelope",
+                "message.thought.put.v2",
+                "message.thought.put",
+                send_params,
+                payload_override=envelope,
+                extra={"to": to_aid, "thought_id": thought_id, "use_cache": use_cache},
+            )
+            result = await self._transport.call("message.thought.put", send_params)
+            self._log.debug("client", "message.thought.put ok: to=%s thought_id=%s use_cache=%s", to_aid, thought_id, use_cache)
+            return result
 
         try:
             return await _attempt(use_cache=True)
@@ -3840,10 +5252,24 @@ class AUNClient:
             epoch = cached[2] if len(cached) > 2 else 0
             state_commitment = cached[5] if len(cached) > 5 else {"state_version": 0, "state_hash": "", "state_chain": ""}
             audit_recipients_raw = cached[6] if len(cached) > 6 else []
+            self._log.debug(
+                "client",
+                "group.v2.bootstrap cache hit: group=%s devices=%d audit=%d epoch=%s state_version=%s",
+                group_id, len(all_devices), len(audit_recipients_raw), epoch, state_commitment.get("state_version"),
+            )
         else:
             bootstrap = await self.call("group.v2.bootstrap", {"group_id": group_id})
             all_devices = bootstrap.get("devices", [])
             epoch = int(bootstrap.get("epoch", 0))
+            self._log.debug(
+                "client",
+                "group.v2.bootstrap fetched: group=%s devices=%d audit=%d epoch=%s members=%d",
+                group_id,
+                len(all_devices) if isinstance(all_devices, list) else 0,
+                len(bootstrap.get("audit_recipients", []) or []),
+                epoch,
+                len(bootstrap.get("member_aids", []) or []),
+            )
             server_chain = str(bootstrap.get("state_chain", "") or "")
             await self._v2_check_fork(group_id, server_chain)
             await self._v2_verify_state_signature(group_id, bootstrap)
@@ -3870,37 +5296,30 @@ class AUNClient:
         targets: list[dict[str, Any]] = []
         for dev in all_devices:
             dev_aid = dev.get("aid", "")
-            dev_id = dev.get("device_id", "")
-            if dev_aid == self._aid and dev_id == self._device_id:
+            has_dev_id, dev_id = _v2_device_id_from_device(dev)
+            if dev_aid == self._aid and has_dev_id and dev_id == self._device_id:
                 continue
-            ik_pk_der = base64.b64decode(dev["ik_pk"])
-            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
             role = "self_sync" if dev_aid == self._aid else "member"
-            targets.append({
-                "aid": dev_aid,
-                "device_id": dev_id,
-                "role": role,
-                "key_source": dev.get("key_source", "peer_device_prekey"),
-                "ik_pk_der": ik_pk_der,
-                "spk_pk_der": spk_pk_der,
-                "spk_id": dev.get("spk_id", ""),
-            })
+            target = await self._v2_build_target_from_device(
+                dev,
+                aid=dev_aid,
+                device_id=dev_id,
+                role=role,
+                default_key_source="peer_device_prekey",
+            )
+            if target:
+                targets.append(target)
 
         for dev in audit_recipients_raw:
-            ik_b64 = dev.get("ik_pk")
-            if not ik_b64:
-                continue
-            ik_pk_der = base64.b64decode(ik_b64)
-            spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
-            targets.append({
-                "aid": dev.get("aid", ""),
-                "device_id": dev.get("device_id", ""),
-                "role": "audit",
-                "key_source": dev.get("key_source", "peer_device_prekey"),
-                "ik_pk_der": ik_pk_der,
-                "spk_pk_der": spk_pk_der,
-                "spk_id": dev.get("spk_id", ""),
-            })
+            target = await self._v2_build_target_from_device(
+                dev,
+                aid=dev.get("aid", ""),
+                device_id=dev.get("device_id", ""),
+                role="audit",
+                default_key_source="peer_device_prekey",
+            )
+            if target:
+                targets.append(target)
 
         if not targets:
             raise E2EEError(f"V2 group: no target devices for {group_id}")
@@ -3918,6 +5337,28 @@ class AUNClient:
             protected_headers=protected_headers,
             context=context,
         )
+        self._log_message_debug(
+            "send-envelope",
+            "group.send.v2",
+            "group.send",
+            {
+                "group_id": group_id,
+                "message_id": envelope.get("message_id"),
+                "type": envelope.get("type"),
+                "version": envelope.get("version"),
+                "headers": envelope.get("protected_headers"),
+                "context": envelope.get("context"),
+            },
+            payload_override=envelope,
+            extra={
+                "plaintext_payload": payload,
+                "epoch": epoch,
+                "target_count": len(targets),
+                "audit_count": len(audit_recipients_raw),
+                "state_version": state_commitment.get("state_version"),
+                "use_cache": use_cache,
+            },
+        )
         return envelope
 
     async def _put_group_thought_encrypted_v2(self, params: dict[str, Any]) -> Any:
@@ -3928,11 +5369,18 @@ class AUNClient:
             raise ValidationError("group.thought.put requires 'group_id'")
         if not isinstance(payload, dict):
             raise ValidationError("group.thought.put payload must be an object when encrypt=true")
-
         thought_id = str(params.get("thought_id") or f"gt-{uuid.uuid4()}").strip()
         timestamp = int(params.get("timestamp") or time.time() * 1000)
+        self._log_message_debug(
+            "thought-send-plaintext",
+            "group.thought.put.v2",
+            "group.thought.put",
+            {"group_id": group_id, "thought_id": thought_id, "timestamp": timestamp, "payload": payload},
+            payload_override=payload,
+        )
 
         async def _attempt(use_cache: bool) -> Any:
+            self._log.debug("client", "group.thought.put attempt: group=%s thought_id=%s use_cache=%s", group_id, thought_id, use_cache)
             envelope = await self._build_v2_group_envelope(
                 group_id=group_id,
                 payload=payload,
@@ -3951,7 +5399,17 @@ class AUNClient:
             if "context" in params:
                 send_params["context"] = params["context"]
             self._sign_client_operation("group.thought.put", send_params)
-            return await self._transport.call("group.thought.put", send_params)
+            self._log_message_debug(
+                "thought-send-envelope",
+                "group.thought.put.v2",
+                "group.thought.put",
+                send_params,
+                payload_override=envelope,
+                extra={"group_id": group_id, "thought_id": thought_id, "use_cache": use_cache},
+            )
+            result = await self._transport.call("group.thought.put", send_params)
+            self._log.debug("client", "group.thought.put ok: group=%s thought_id=%s use_cache=%s", group_id, thought_id, use_cache)
+            return result
 
         try:
             return await _attempt(use_cache=True)
@@ -3962,6 +5420,191 @@ class AUNClient:
                 self._v2_bootstrap_cache.pop(f"group:{group_id}", None)
                 return await _attempt(use_cache=False)
             raise
+
+    async def _decrypt_group_thoughts(self, result: dict[str, Any]) -> dict[str, Any]:
+        return await self._decrypt_thought_get_result(result, group=True)
+
+    async def _decrypt_message_thoughts(self, result: dict[str, Any]) -> dict[str, Any]:
+        return await self._decrypt_thought_get_result(result, group=False)
+
+    async def _decrypt_thought_get_result(self, result: dict[str, Any], *, group: bool) -> dict[str, Any]:
+        """解密 thought.get 返回中的 V2 envelope，并保留服务端返回的元数据字段。"""
+        label = "group" if group else "message"
+        self._log.debug(
+            "client",
+            "%s.thought.get decrypt enter: found=%s sender=%s group=%s peer=%s",
+            label,
+            result.get("found"),
+            result.get("sender_aid"),
+            result.get("group_id"),
+            result.get("peer_aid"),
+        )
+        if not result.get("found"):
+            self._log.debug("client", "%s.thought.get decrypt exit: not found", label)
+            return {**result, "thoughts": []}
+        raw_items = result.get("thoughts")
+        if not isinstance(raw_items, list):
+            self._log.debug("client", "%s.thought.get decrypt exit: invalid thoughts", label)
+            return {**result, "thoughts": []}
+
+        sender_aid = str(result.get("sender_aid") or "").strip()
+        peer_aid = str(result.get("peer_aid") or "").strip()
+        thoughts: list[dict[str, Any]] = []
+        decrypted_count = 0
+        failed_count = 0
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else None
+            from_aid = str(item.get("from") or item.get("sender_aid") or sender_aid).strip()
+            thought_id = str(item.get("thought_id") or item.get("message_id") or "").strip()
+            self._log_message_debug(
+                "thought-get-raw",
+                f"{label}.thought.get",
+                f"{label}.thought.get",
+                item,
+                extra={"thought_id": thought_id, "from": from_aid},
+            )
+            if group:
+                if from_aid and "sender_aid" not in item:
+                    item["sender_aid"] = from_aid
+            else:
+                to_aid = str(item.get("to") or item.get("peer_aid") or peer_aid or self._aid or "").strip()
+                if from_aid and "from" not in item:
+                    item["from"] = from_aid
+                if to_aid and "to" not in item:
+                    item["to"] = to_aid
+
+            if payload and self._is_v2_thought_envelope(payload, group=group):
+                meta = self._v2_thought_e2ee_metadata(payload)
+                plaintext = await self._decrypt_v2_envelope_for_thought(envelope=payload, from_aid=from_aid)
+                item["e2ee"] = meta
+                self._attach_v2_envelope_metadata(item, meta)
+                if plaintext is None:
+                    item["decrypt_failed"] = True
+                    failed_count += 1
+                    self._log.debug("client", "%s.thought.get decrypt returned None: thought_id=%s from=%s", label, thought_id, from_aid)
+                else:
+                    item["payload"] = plaintext
+                    item["encrypted"] = True
+                    item.pop("decrypt_failed", None)
+                    decrypted_count += 1
+                    self._log_message_debug(
+                        "thought-decrypt-ok",
+                        f"{label}.thought.get",
+                        f"{label}.thought.get",
+                        item,
+                        payload_override=plaintext,
+                        extra={"thought_id": thought_id, "from": from_aid},
+                    )
+            elif payload and self._is_encrypted_thought_payload(payload):
+                item["decrypt_failed"] = True
+                failed_count += 1
+                self._log.debug(
+                    "client",
+                    "%s.thought.get unsupported encrypted payload: thought_id=%s type=%s version=%s",
+                    label, thought_id, payload.get("type"), payload.get("version"),
+                )
+            self._log_message_debug(
+                "thought-result",
+                f"{label}.thought.get",
+                f"{label}.thought.get",
+                item,
+                extra={"thought_id": thought_id, "decrypt_failed": bool(item.get("decrypt_failed"))},
+            )
+            thoughts.append(item)
+
+        self._log.debug(
+            "client",
+            "%s.thought.get post-decrypt: total=%d decrypted=%d failed=%d",
+            label,
+            len(thoughts),
+            decrypted_count,
+            failed_count,
+        )
+        return {**result, "thoughts": thoughts}
+
+    @staticmethod
+    def _is_v2_thought_envelope(payload: dict[str, Any], *, group: bool) -> bool:
+        expected_type = "e2ee.group_encrypted" if group else "e2ee.p2p_encrypted"
+        if str(payload.get("type") or "") != expected_type:
+            return False
+        return str(payload.get("version") or "") == "v2" or isinstance(payload.get("recipients"), list)
+
+    @staticmethod
+    def _is_encrypted_thought_payload(payload: dict[str, Any]) -> bool:
+        return str(payload.get("type") or "") in {
+            "e2ee.encrypted",
+            "e2ee.p2p_encrypted",
+            "e2ee.group_encrypted",
+        }
+
+    @staticmethod
+    def _metadata_without_auth(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return {k: v for k, v in value.items() if k != "_auth"}
+
+    @staticmethod
+    def _v2_envelope_payload_type(envelope: dict[str, Any], protected_headers: dict[str, Any] | None = None) -> str:
+        value = envelope.get("payload_type")
+        if value is None and isinstance(protected_headers, dict):
+            value = protected_headers.get("payload_type")
+        return str(value or "").strip()
+
+    def _v2_thought_e2ee_metadata(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        suite = str(envelope.get("suite") or "")
+        meta: dict[str, Any] = {
+            "version": "v2",
+            "suite": suite,
+            "encryption_mode": "v2_" + (suite or "unknown"),
+            "forward_secrecy": True,
+        }
+        protected_headers = self._metadata_without_auth(envelope.get("protected_headers"))
+        if protected_headers:
+            meta["protected_headers"] = protected_headers
+        payload_type = self._v2_envelope_payload_type(envelope, protected_headers)
+        if payload_type:
+            meta["payload_type"] = payload_type
+        context = self._metadata_without_auth(envelope.get("context"))
+        if context:
+            meta["context"] = context
+        agent_md = self._metadata_without_auth(envelope.get("agent_md"))
+        if agent_md:
+            meta["agent_md"] = agent_md
+        return meta
+
+    @staticmethod
+    def _attach_v2_envelope_metadata(message: dict[str, Any], meta: dict[str, Any]) -> None:
+        payload_type = str(meta.get("payload_type") or "").strip()
+        if payload_type:
+            message["payload_type"] = payload_type
+        protected_headers = meta.get("protected_headers")
+        if isinstance(protected_headers, dict) and protected_headers:
+            message["protected_headers"] = dict(protected_headers)
+        agent_md = meta.get("agent_md")
+        if isinstance(agent_md, dict) and agent_md:
+            message["agent_md"] = dict(agent_md)
+
+    def _attach_v2_envelope_metadata_from_source(self, message: dict[str, Any], source: Any) -> None:
+        envelope: dict[str, Any] | None = None
+        if isinstance(source, dict):
+            payload = source.get("payload")
+            if isinstance(payload, dict):
+                envelope = payload
+            if envelope is None:
+                envelope_json = source.get("envelope_json")
+                if isinstance(envelope_json, str) and envelope_json:
+                    try:
+                        parsed = json.loads(envelope_json)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        envelope = parsed
+        if envelope is not None:
+            self._observe_agent_md_from_envelope(envelope)
+            self._attach_v2_envelope_metadata(message, self._v2_thought_e2ee_metadata(envelope))
 
     async def _decrypt_v2_envelope_for_thought(
         self,
@@ -3979,53 +5622,53 @@ class AUNClient:
 
         if not self._v2_session or not isinstance(envelope, dict):
             return None
+        self._observe_agent_md_from_envelope(envelope)
 
         # 确定接收方 SPK：根据 envelope.recipients 中本设备所引用的 spk_id
         spk_id = ""
+        recipient_key_source = ""
         recipients = envelope.get("recipients")
         if isinstance(recipients, list):
             for row in recipients:
                 if isinstance(row, list) and len(row) >= 6:
                     if row[0] == self._aid and row[1] == self._device_id:
                         spk_id = str(row[5] or "")
+                        recipient_key_source = str(row[3] or "") if len(row) > 3 else ""
                         break
-        ik_priv, spk_priv = self._v2_session.get_decrypt_keys(spk_id)
+        aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+        group_id_for_keys = str(aad.get("group_id") or envelope.get("group_id") or "").strip()
+        self._log.debug(
+            "client",
+            "V2 thought decrypt start: from=%s sender_device=%s group=%s spk_id=%s key_source=%s type=%s",
+            from_aid,
+            aad.get("from_device", ""),
+            group_id_for_keys or "<p2p>",
+            spk_id or "<empty>",
+            recipient_key_source or "<empty>",
+            envelope.get("type", ""),
+        )
+        try:
+            if group_id_for_keys:
+                ik_priv, spk_priv = self._v2_session.get_group_decrypt_keys(group_id_for_keys, spk_id)
+            else:
+                ik_priv, spk_priv = self._v2_session.get_decrypt_keys(spk_id)
+        except Exception as exc:
+            self._log.warn(
+                "client",
+                "V2 thought decrypt: key lookup failed from=%s group=%s spk_id=%s: %s",
+                from_aid, group_id_for_keys or "<p2p>", spk_id, exc,
+            )
+            return None
 
-        sender_device_id = (envelope.get("aad") or {}).get("from_device", "")
-        sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
+        sender_device_id = str(aad.get("from_device") or "")
+        sender_pub_der = await self._v2_sender_pub_der_from_cache_or_cert(from_aid, sender_device_id)
         if not sender_pub_der:
-            try:
-                bs = await self.call("message.v2.bootstrap", {"peer_aid": from_aid})
-                for dev in bs.get("peer_devices", []):
-                    dev_id = dev.get("device_id") or dev.get("owner_device_id", "")
-                    ik_der = base64.b64decode(dev["ik_pk"])
-                    self._v2_session.cache_peer_ik(from_aid, dev_id, ik_der)
-                sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
-            except Exception as exc:
-                self._log.warn("client", "V2 thought decrypt: bootstrap sender %s failed: %s", from_aid, exc)
-        # CA fallback：bootstrap 拿不到时从 CA 拉证书提取 IK 公钥
-        if not sender_pub_der and from_aid:
-            try:
-                cert_pem = await self._fetch_peer_cert(from_aid)
-                if cert_pem:
-                    from cryptography import x509
-                    from cryptography.hazmat.primitives import serialization as _ser
-                    cert = x509.load_pem_x509_certificate(cert_pem)
-                    sender_pub_der = cert.public_key().public_bytes(
-                        encoding=_ser.Encoding.DER,
-                        format=_ser.PublicFormat.SubjectPublicKeyInfo,
-                    )
-                    if sender_device_id:
-                        self._v2_session.cache_peer_ik(from_aid, sender_device_id, sender_pub_der)
-                    self._log.debug("client", "V2 thought decrypt: sender IK fallback from CA cert for %s", from_aid)
-            except Exception as exc:
-                self._log.warn("client", "V2 thought decrypt: CA fallback for %s failed: %s", from_aid, exc)
-        if not sender_pub_der:
-            self._log.warn("client", "V2 thought decrypt: no sender IK for %s device=%s", from_aid, sender_device_id)
+            self._log.warn("client", "V2 thought decrypt pending: no sender IK for %s device=%s", from_aid, sender_device_id)
+            self._schedule_v2_sender_ik_fetch(from_aid, sender_device_id, group_id_for_keys)
             return None
 
         try:
-            return v2_decrypt_message(
+            plaintext = v2_decrypt_message(
                 envelope=envelope,
                 self_aid=self._aid,
                 self_device_id=self._device_id,
@@ -4033,6 +5676,21 @@ class AUNClient:
                 self_spk_priv=spk_priv,
                 sender_pub_der=sender_pub_der,
             )
+            self._log.debug(
+                "client",
+                "V2 thought decrypt ok: from=%s sender_device=%s group=%s",
+                from_aid, sender_device_id, group_id_for_keys or "<p2p>",
+            )
+            if (
+                plaintext is not None
+                and group_id_for_keys
+                and recipient_key_source == "group_device_prekey"
+                and self._v2_session.is_last_uploaded_group_spk(group_id_for_keys, spk_id)
+            ):
+                self._schedule_group_spk_rotation(group_id_for_keys, reason="group_spk_consumed")
+            elif plaintext is not None and group_id_for_keys and recipient_key_source == "peer_device_prekey":
+                self._schedule_group_spk_registration_after_peer_fallback(group_id_for_keys)
+            return plaintext
         except Exception as exc:
             self._log.warn("client", "V2 thought decrypt failed from=%s: %s", from_aid, exc)
             return None
@@ -4051,73 +5709,143 @@ class AUNClient:
         limit = int(params.get("limit", 50) or 50)
 
         ns = f"group:{group_id}"
-        effective_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
+        next_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
+        first_contig_before = self._seq_tracker.get_contiguous_seq(ns)
+        response: dict[str, Any] = {}
+        decrypted: list[dict[str, Any]] = []
+        total_raw_count = 0
+        latest_seq = 0
+        page_count = 0
+        max_pages = int(params.get("max_pages", 100) or 100)
 
-        result = await self.call("group.v2.pull", {
-            "group_id": group_id,
-            "after_seq": effective_after_seq,
-            "limit": limit,
-        })
-        messages = result.get("messages", [])
-        seqs = [
-            int(m.get("seq") or 0)
-            for m in messages
-            if isinstance(m, dict) and int(m.get("seq") or 0) > 0
-        ]
-        contig_before = self._seq_tracker.get_contiguous_seq(ns)
-        if seqs and seqs[0] > contig_before:
-            self._seq_tracker.force_contiguous_seq(ns, seqs[0])
+        while page_count < max_pages:
+            page_count += 1
+            self._log.debug(
+                "client",
+                "group.v2.pull page request: group=%s page=%d after_seq=%d limit=%d ns=%s",
+                group_id, page_count, next_after_seq, limit, ns,
+            )
+            result = await self.call("group.v2.pull", {
+                "group_id": group_id,
+                "after_seq": next_after_seq,
+                "limit": limit,
+            })
+            if isinstance(result, dict):
+                response.update(result)
+            else:
+                result = {}
 
-        decrypted = []
-        for msg in messages:
-            seq = msg.get("seq", 0)
-            if seq <= 0:
-                continue
+            messages = result.get("messages", [])
+            raw_messages = messages if isinstance(messages, list) else []
+            total_raw_count += len(raw_messages)
+            cursor = result.get("cursor") if isinstance(result.get("cursor"), dict) else {}
+            self._log.debug(
+                "client",
+                "group.v2.pull page response: group=%s page=%d raw_count=%d has_more=%s cursor_current=%s",
+                group_id, page_count, len(raw_messages), result.get("has_more"), cursor.get("current_seq"),
+            )
+            for msg in raw_messages:
+                self._log_message_debug("pull-raw", "group.v2.pull", "group.message_created", msg)
+            seqs = [
+                int(m.get("seq") or 0)
+                for m in raw_messages
+                if isinstance(m, dict) and int(m.get("seq") or 0) > 0
+            ]
+            page_contig_before = self._seq_tracker.get_contiguous_seq(ns)
 
-            # 服务端合并的 V1 明文行：version=v1 + payload 已是明文
-            if str(msg.get("version", "") or "") == "v1":
-                payload = msg.get("payload")
-                if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
-                    # 兜底：V1 加密 envelope 在 V2-only 客户端跳过
+            if seqs:
+                page_max_seq = max(seqs)
+                latest_seq = max(latest_seq, page_max_seq)
+                self._seq_tracker.force_contiguous_seq(ns, page_max_seq)
+                self._log.debug(
+                    "client",
+                    "group.v2.pull force contiguous: group=%s ns=%s page_max_seq=%d previous=%d",
+                    group_id, ns, page_max_seq, page_contig_before,
+                )
+            else:
+                page_max_seq = next_after_seq
+
+            for msg in raw_messages:
+                if not isinstance(msg, dict):
                     continue
-                v1_msg = {
-                    "message_id": msg.get("message_id", ""),
-                    "from": msg.get("from_aid", ""),
-                    "group_id": group_id,
-                    "seq": seq,
-                    "type": msg.get("type", ""),
-                    "timestamp": msg.get("t_server", 0),
-                    "payload": payload,
-                    "encrypted": False,
-                }
-                await self._publish_pulled_message("group.message_created", ns, seq, v1_msg)
-                decrypted.append(v1_msg)
-                continue
+                seq = int(msg.get("seq", 0) or 0)
+                if seq <= 0:
+                    continue
 
-            # V2 加密消息：解密
-            plaintext = await self._decrypt_v2_message(msg)
-            if plaintext is None:
-                # V2 解密失败：跳过并推进 seq tracker（避免卡 contiguous_seq）
-                continue
-            plaintext["group_id"] = group_id
-            await self._publish_pulled_message("group.message_created", ns, seq, plaintext)
-            decrypted.append(plaintext)
+                # 服务端合并的 V1 明文行：version=v1 + payload 已是明文
+                if str(msg.get("version", "") or "") == "v1":
+                    payload = msg.get("payload")
+                    if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
+                        # 兜底：V1 加密 envelope 在 V2-only 客户端跳过
+                        continue
+                    v1_msg = {
+                        "message_id": msg.get("message_id", ""),
+                        "from": msg.get("from_aid", ""),
+                        "group_id": group_id,
+                        "seq": seq,
+                        "type": msg.get("type", ""),
+                        "timestamp": msg.get("t_server", 0),
+                        "payload": payload,
+                        "encrypted": False,
+                    }
+                    await self._publish_pulled_message("group.message_created", ns, seq, v1_msg)
+                    decrypted.append(v1_msg)
+                    self._log.debug("client", "group.v2.pull plaintext V1 delivered: group=%s seq=%d", group_id, seq)
+                    continue
 
-        if seqs:
-            max_seq = max(seqs)
-            current_contig = self._seq_tracker.get_contiguous_seq(ns)
-            if max_seq > current_contig:
-                self._seq_tracker.force_contiguous_seq(ns, max_seq)
+                # 解密失败不阻断本页 seq 下界推进和 ack。
+                plaintext = await self._decrypt_v2_message(msg)
+                if plaintext is None:
+                    self._log.debug("client", "group.v2.pull decrypt returned None: group=%s seq=%d", group_id, seq)
+                    continue
+                plaintext["group_id"] = group_id
+                await self._publish_pulled_message("group.message_created", ns, seq, plaintext)
+                decrypted.append(plaintext)
+                self._log_message_debug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext)
+
+            cursor = result.get("cursor")
+            if isinstance(cursor, dict):
+                server_ack = int(cursor.get("current_seq") or 0)
+                if server_ack > 0:
+                    contig_before_ack = self._seq_tracker.get_contiguous_seq(ns)
+                    if contig_before_ack < server_ack:
+                        self._log.info(
+                            "client",
+                            "group.v2.pull retention-floor 推进: ns=%s contiguous=%d -> cursor.current_seq=%d",
+                            ns, contig_before_ack, server_ack,
+                        )
+                        self._seq_tracker.force_contiguous_seq(ns, server_ack)
+
+            contig = self._seq_tracker.get_contiguous_seq(ns)
+            contig_advanced = contig != page_contig_before
+            if contig_advanced:
                 await self._drain_ordered_messages(ns)
+                self._persist_seq(ns)
+            if raw_messages and contig_advanced and contig > 0:
+                self._log.debug("client", "group.v2.pull scheduling auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d", group_id, ns, contig, len(raw_messages))
+                self._fire_ack("group.v2.ack", {
+                    "group_id": group_id, "up_to_seq": contig,
+                }, f"V2 群消息 page auto-ack group={group_id}")
 
-        contig = self._seq_tracker.get_contiguous_seq(ns)
-        if contig != contig_before:
-            self._persist_seq(ns)
-        if contig > 0 and contig != contig_before:
-            self._fire_ack("group.v2.ack", {
-                "group_id": group_id, "up_to_seq": contig,
-            }, f"V2 群消息 auto-ack group={group_id}")
-        return {"messages": decrypted}
+            next_after = max(page_max_seq, next_after_seq)
+            if not raw_messages or next_after <= next_after_seq or result.get("has_more") is False:
+                break
+            next_after_seq = next_after
+
+        if page_count >= max_pages:
+            self._log.warn("client", "group.v2.pull reached max_pages=%d group=%s after_seq=%d", max_pages, group_id, next_after_seq)
+
+        response["messages"] = decrypted
+        response["_contig_before"] = first_contig_before
+        response["raw_count"] = total_raw_count
+        if latest_seq:
+            response["latest_seq"] = max(int(response.get("latest_seq") or 0), latest_seq)
+        self._log.debug(
+            "client",
+            "group.v2.pull done: group=%s requested_after_seq=%d pages=%d raw_count=%d decrypted=%d ns=%s",
+            group_id, after_seq, page_count, total_raw_count, len(decrypted), ns,
+        )
+        return response
 
     async def _ack_group_v2_internal(self, params: dict[str, Any]) -> dict[str, Any]:
         """V2 Group 确认消费。内部方法，由 call("group.ack_messages") 路由调用。"""
@@ -4126,8 +5854,21 @@ class AUNClient:
         ns = f"group:{group_id}"
         seq = up_to_seq or (self._seq_tracker.get_contiguous_seq(ns) if ns else 0)
         if seq <= 0:
+            self._log.debug("client", "group.v2.ack skipped: group=%s ns=%s up_to_seq=%s", group_id, ns, up_to_seq)
             return {"acked": 0}
-        return await self.call("group.v2.ack", {"group_id": group_id, "up_to_seq": seq})
+        # ack clamp：永远不发送超过 max_seen_seq 的 up_to_seq
+        max_seen = self._seq_tracker.get_max_seen_seq(ns) if ns else 0
+        if max_seen > 0 and seq > max_seen:
+            self._log.warn(
+                "client",
+                "_ack_group_v2_internal clamp: group=%s up_to_seq=%d > max_seen=%d, clamp",
+                group_id, seq, max_seen,
+            )
+            seq = max_seen
+        self._log.debug("client", "group.v2.ack send: group=%s ns=%s up_to_seq=%d", group_id, ns, seq)
+        result = await self.call("group.v2.ack", {"group_id": group_id, "up_to_seq": seq})
+        self._log.debug("client", "group.v2.ack ok: group=%s ns=%s requested=%d result=%s", group_id, ns, seq, result)
+        return result
 
     async def _v2_verify_state_signature(self, group_id: str, bootstrap: dict) -> None:
         """验证 owner/admin 对 state 的 ECDSA 签名（防服务端篡改 bootstrap 字段）。
@@ -4159,8 +5900,7 @@ class AUNClient:
             # 先查验签缓存（命中即跳过 cert 拉取 + ECDSA 验证）
             import hashlib as _hl
             sig_cache_key = _hl.sha256(
-                actor_aid.encode("utf-8") + b"\x00"
-                + sign_payload + b"\x00"
+                _length_prefixed_bytes_key(actor_aid.encode("utf-8"), sign_payload)
                 + sig_bytes
             ).digest()
             now_ts = time.time()
@@ -4325,8 +6065,8 @@ class AUNClient:
                 if not isinstance(dev, dict):
                     continue
                 aid = str(dev.get("aid") or "").strip()
-                device_id = str(dev.get("device_id") or "").strip()
-                if aid in online_admin_set and device_id:
+                has_device_id, device_id = _v2_device_id_from_device(dev)
+                if aid in online_admin_set and has_device_id:
                     candidates.append(f"{aid}\x1f{device_id}")
             if not candidates:
                 candidates = [f"{aid}\x1f" for aid in online_admin_aids]
@@ -4338,7 +6078,7 @@ class AUNClient:
                 self._log.debug("client", "V2 auto propose leader elected: group=%s leader=%s", group_id, leader)
                 return True
 
-            seed = f"{group_id}\0{my_key}".encode("utf-8")
+            seed = _length_prefixed_text_key(group_id, my_key).encode("utf-8")
             delay_ms = 2000 + (int.from_bytes(hashlib.sha256(seed).digest()[:4], "big") % 4000)
             self._log.debug(
                 "client",
@@ -4643,28 +6383,128 @@ class AUNClient:
 
     async def _on_v2_push_notification(self, data: Any) -> None:
         """处理 V2 push 通知：自动 pull + decrypt + emit。
-        only one in flight：用 dedup_key 保证同一时间只有一个 pull 在执行。
+
+        Push-Pull 双重修复机制：
+        - Push 带 payload 且解密成功：contiguous_seq 上界 = push_seq（消息已拿到）
+        - Push 不带 payload（纯通知）：contiguous_seq 上界 = push_seq - 1（消息还需 pull）
+        - Pull 确定下界：server_ack_seq 以下的消息已被消费
         """
+        self._log_message_debug("server-push", "_raw.peer.v2.message_received", "message.received", data)
         if not self._v2_session:
             self._log.debug("client", "_on_v2_push_notification skipped: no v2_session")
             return
+
+        # 提取 push 通知中的元数据
+        push_seq = data.get("seq") if isinstance(data, dict) else None
+        push_from = data.get("from_aid") if isinstance(data, dict) else None
+        push_msg_id = data.get("message_id") if isinstance(data, dict) else None
+        envelope_json = data.get("envelope_json") if isinstance(data, dict) else None
+
         ns = f"p2p:{self._aid}" if self._aid else ""
-        after_seq = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
+        contig_before = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
         dedup_key = f"p2p_pull:{ns}"
-        if dedup_key in self._gap_fill_done:
-            self._log.debug("client", "_on_v2_push_notification skipped: dedup_key=%s already in flight", dedup_key)
-            return
+        pull_in_flight = dedup_key in self._gap_fill_done
+
+        self._log.debug(
+            "client",
+            "_on_v2_push_notification: push_seq=%s push_from=%s push_msg_id=%s has_payload=%s contiguous_seq=%d pull_in_flight=%s",
+            push_seq, push_from, push_msg_id, bool(envelope_json), contig_before, pull_in_flight,
+        )
+
+        push_seq_int = int(push_seq) if push_seq and isinstance(push_seq, (int, float)) and push_seq > 0 else 0
+
+        # ── Push 修上界：只更新 max_seen_seq，不动 contiguous_seq ──
+        # 即使 push_seq 是脏数据（如服务端 bug 导致的 99999），也只影响"已知上界"，
+        # 不会污染下界 contiguous_seq，更不会导致 SDK 把脏数据 ack 回服务端。
+        if push_seq_int > 0 and ns:
+            self._seq_tracker.update_max_seen(ns, push_seq_int)
+            if contig_before == push_seq_int:
+                self._log.debug(
+                    "client",
+                    "_on_v2_push_notification: push seq=%d already covered by contiguous_seq=%d, ignore duplicate push",
+                    push_seq_int, contig_before,
+                )
+                return
+            contig_before = self._repair_push_contiguous_bound(
+                ns, push_seq_int, has_payload=bool(envelope_json), label="_raw.peer.v2.message_received",
+            )
+
+        # ── 带 payload 的 push：尝试就地解密 ──
+        if envelope_json and push_seq_int > 0 and ns:
+            try:
+                decrypted = await self._decrypt_v2_message(data)
+                if decrypted is not None:
+                    # 解密成功：把 push_seq 加入 received_seqs，让 _try_advance 自然推进
+                    # （如果 push_seq == contiguous_seq + 1 会自动推进到 push_seq）
+                    need_pull = self._seq_tracker.on_message_seq(ns, push_seq_int)
+                    published = await self._publish_ordered_message("message.received", ns, push_seq_int, decrypted)
+                    new_contig = self._seq_tracker.get_contiguous_seq(ns)
+                    if new_contig != contig_before:
+                        self._persist_seq(ns)
+                    if new_contig > 0 and new_contig != contig_before:
+                        # ack clamp：永远不发送超过 max_seen_seq 的 up_to_seq
+                        max_seen = self._seq_tracker.get_max_seen_seq(ns)
+                        ack_seq = min(new_contig, max_seen) if max_seen > 0 else new_contig
+                        self._fire_ack("message.v2.ack", {"up_to_seq": ack_seq}, "V2 P2P push-ack")
+                    self._log.debug(
+                        "client",
+                        "_on_v2_push_notification: push 带 payload 解密成功, contiguous_seq=%d->%d push_seq=%d",
+                        contig_before, new_contig, push_seq_int,
+                    )
+                    if not need_pull and (published or new_contig >= push_seq_int or push_seq_int <= contig_before):
+                        return
+                    self._log.debug(
+                        "client",
+                        "_on_v2_push_notification: payload push seq=%d 因空洞挂起，继续 pull 补齐 after_seq=%d",
+                        push_seq_int, new_contig,
+                    )
+                    if pull_in_flight:
+                        self._log.debug(
+                            "client",
+                            "_on_v2_push_notification: payload push seq=%d 已挂起，复用进行中的 pull",
+                            push_seq_int,
+                        )
+                        return
+            except Exception as exc:
+                self._log.debug("client", "_on_v2_push_notification: push payload 解密失败, fallback to pull: %s", exc)
+
+        # ── 不带 payload 或解密失败：触发 pull ──
+        # 关键：push 通知只表示"服务端有 seq=push_seq 的新消息"，
+        # 此时消息内容尚未到达本地，绝不能调用 on_message_seq() 推进 contiguous_seq
+        # （那会让随后的 pull 用 after_seq=push_seq，跳过这条消息本身导致拉空）。
+        # 正确做法：保持 contiguous_seq 不变，用它作为 pull 的 after_seq；
+        # pull 成功 + 解密成功后再由 pull 路径推进 contiguous_seq。
+        if push_seq_int > 0 and ns:
+            # 纯通知：不更新 contiguous_seq，由 pull 结果驱动推进
+            self._log.debug(
+                "client",
+                "_on_v2_push_notification: 纯通知 push_seq=%d > contiguous_seq=%d, 触发 pull(after_seq=%d)",
+                push_seq_int, contig_before, contig_before,
+            )
+            if pull_in_flight:
+                self._log.debug(
+                    "client",
+                    "_on_v2_push_notification: pull 已在进行中，仅记录上界 push_seq=%d",
+                    push_seq_int,
+                )
+                return
+
         self._gap_fill_done[dedup_key] = time.time()
-        self._log.debug("client", "_on_v2_push_notification executing: dedup_key=%s after_seq=%d", dedup_key, after_seq)
+
         try:
             await self._pull_v2_internal({})
-            self._log.debug("client", "_on_v2_push_notification pull done, new contiguous=%d", self._seq_tracker.get_contiguous_seq(ns) if ns else -1)
+            new_contig = self._seq_tracker.get_contiguous_seq(ns) if ns else -1
+            self._log.debug(
+                "client",
+                "_on_v2_push_notification pull done: contiguous_seq=%d->%d (push_seq=%s)",
+                contig_before, new_contig, push_seq,
+            )
         except Exception as exc:
             self._log.warn("client", "V2 push auto-pull failed: %s", exc)
         finally:
             self._gap_fill_done.pop(dedup_key, None)
 
-    async def _decrypt_v2_message(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+    async def _decrypt_v2_message(self, msg: dict[str, Any], *, allow_pending: bool = True) -> dict[str, Any] | None:
         """解密单条 V2 消息。
 
         Args:
@@ -4681,68 +6521,115 @@ class AUNClient:
         except (json.JSONDecodeError, TypeError):
             self._log.warn("client", "V2 decrypt: invalid envelope_json for msg seq=%s", msg.get("seq"))
             return None
+        self._observe_agent_md_from_envelope(envelope)
 
         # 确定 spk_id
+        recipient_key_source = ""
         if "recipient" in envelope:
-            spk_id = envelope["recipient"].get("spk_id", "")
+            recipient = envelope["recipient"]
+            spk_id = recipient.get("spk_id", "")
+            recipient_key_source = str(recipient.get("key_source") or "")
         elif "recipients" in envelope:
             spk_id = msg.get("spk_id", "")
+            selected_row = None
+            if not spk_id:
+                recipients = envelope.get("recipients")
+                if isinstance(recipients, list):
+                    for row in recipients:
+                        if (
+                            isinstance(row, list)
+                            and len(row) >= 6
+                            and row[0] == self._aid
+                            and row[1] == self._device_id
+                        ):
+                            selected_row = row
+                            spk_id = str(row[5] or "")
+                            break
+            if selected_row is None:
+                recipients = envelope.get("recipients")
+                if isinstance(recipients, list):
+                    for row in recipients:
+                        if (
+                            isinstance(row, list)
+                            and len(row) >= 6
+                            and row[0] == self._aid
+                            and row[1] == self._device_id
+                        ):
+                            selected_row = row
+                            break
+            if isinstance(selected_row, list) and len(selected_row) >= 4:
+                recipient_key_source = str(selected_row[3] or "")
         else:
             spk_id = ""
 
-        self._log.info("client", "DEBUG _decrypt_v2_message: seq=%s spk_id=%s from=%s has_recipient=%s has_recipients=%s",
-                       msg.get("seq"), spk_id or "<empty>", msg.get("from_aid", ""),
-                       "recipient" in envelope, "recipients" in envelope)
+        aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+        group_id_for_keys = str(msg.get("group_id") or aad.get("group_id") or envelope.get("group_id") or "").strip()
+        e2ee_meta = self._v2_thought_e2ee_metadata(envelope)
+        undecryptable_event = "group.message_undecryptable" if group_id_for_keys else "message.undecryptable"
 
-        ik_priv, spk_priv = self._v2_session.get_decrypt_keys(spk_id)
-        self._log.info("client", "DEBUG _decrypt_v2_message: ik_priv=%d bytes spk_priv=%s",
-                       len(ik_priv) if ik_priv else 0, f"{len(spk_priv)} bytes" if spk_priv else "None")
+        self._log.debug("client", "_decrypt_v2_message: seq=%s spk_id=%s group_id=%s from=%s has_recipient=%s has_recipients=%s",
+                        msg.get("seq"), spk_id or "<empty>", group_id_for_keys or "<p2p>",
+                        msg.get("from_aid", ""), "recipient" in envelope, "recipients" in envelope)
+
+        try:
+            if group_id_for_keys:
+                ik_priv, spk_priv = self._v2_session.get_group_decrypt_keys(group_id_for_keys, spk_id)
+            else:
+                ik_priv, spk_priv = self._v2_session.get_decrypt_keys(spk_id)
+        except Exception as exc:
+            self._log.warn("client", "V2 decrypt: SPK lookup failed seq=%s spk_id=%s: %s", msg.get("seq"), spk_id, exc)
+            event = {
+                "message_id":     msg.get("message_id", ""),
+                "from":           msg.get("from_aid", ""),
+                "to":             msg.get("to", ""),
+                "seq":            msg.get("seq"),
+                "timestamp":      msg.get("t_server") or msg.get("timestamp"),
+                "device_id":      msg.get("device_id", ""),
+                "slot_id":        msg.get("slot_id", ""),
+                "_decrypt_error": str(exc),
+                "_decrypt_stage": "spk_lookup",
+                "_envelope_type": envelope.get("type", ""),
+                "_suite":         envelope.get("suite", ""),
+                "_spk_id":        spk_id,
+            }
+            self._attach_v2_envelope_metadata(event, e2ee_meta)
+            await self._dispatcher.publish(undecryptable_event, event)
+            return None
+        self._log.debug("client", "_decrypt_v2_message: ik_priv=%d bytes spk_priv=%s",
+                        len(ik_priv) if ik_priv else 0, f"{len(spk_priv)} bytes" if spk_priv else "None")
 
         # 获取 sender IK 公钥（按 sender device_id 精确匹配）
         from_aid = msg.get("from_aid", "")
         sender_device_id = envelope.get("aad", {}).get("from_device", "")
-        sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
-        if not sender_pub_der:
-            # 尝试 bootstrap 获取（V2 设备列表）
-            try:
-                bs = await self.call("message.v2.bootstrap", {"peer_aid": from_aid})
-                for dev in bs.get("peer_devices", []):
-                    dev_id = dev.get("device_id") or dev.get("owner_device_id", "")
-                    ik_der = base64.b64decode(dev["ik_pk"])
-                    self._v2_session.cache_peer_ik(from_aid, dev_id, ik_der)
-                # 重新查找精确匹配的 sender device IK
-                sender_pub_der = self._v2_session.get_peer_ik(from_aid, sender_device_id)
-            except Exception as exc:
-                self._log.warn("client", "V2 decrypt: bootstrap for sender %s failed: %s", from_aid, exc)
-
-        # CA fallback：bootstrap 拿不到对端 SPK 时（对端从未 V2 上线 / 不同 device），
-        # 从 CA 拉对端 AID 证书 → 公钥即 IK 公钥（V2 设计：IK = AID 长期密钥）
-        if not sender_pub_der and from_aid:
-            try:
-                cert_pem = await self._fetch_peer_cert(from_aid)
-                if cert_pem:
-                    from cryptography import x509
-                    from cryptography.hazmat.primitives import serialization as _ser
-                    cert = x509.load_pem_x509_certificate(cert_pem)
-                    sender_pub_der = cert.public_key().public_bytes(
-                        encoding=_ser.Encoding.DER,
-                        format=_ser.PublicFormat.SubjectPublicKeyInfo,
-                    )
-                    # 缓存到 V2 session（同一 AID 的所有 device 共享 IK）
-                    if sender_device_id:
-                        self._v2_session.cache_peer_ik(from_aid, sender_device_id, sender_pub_der)
-                    self._log.debug("client", "V2 decrypt: sender IK fallback from CA cert for %s", from_aid)
-            except Exception as exc:
-                self._log.warn("client", "V2 decrypt: CA fallback for %s failed: %s", from_aid, exc)
+        sender_pub_der = await self._v2_sender_pub_der_from_cache_or_cert(from_aid, sender_device_id)
 
         if not sender_pub_der:
-            self._log.warn("client", "V2 decrypt: no sender IK for %s, cannot verify signature", from_aid)
-            await self._dispatcher.publish("message.undecryptable", {
-                "message_id": msg.get("message_id", ""),
-                "from": from_aid,
-                "seq": msg.get("seq"),
-                "_decrypt_error": "sender_ik_not_found",
-            })
+            self._log.warn("client", "V2 decrypt: no sender IK for %s device=%s", from_aid, sender_device_id)
+            if allow_pending:
+                self._schedule_v2_sender_ik_pending(
+                    msg=msg,
+                    envelope=envelope,
+                    from_aid=str(from_aid or ""),
+                    sender_device_id=str(sender_device_id or ""),
+                    group_id=group_id_for_keys,
+                )
+                return None
+            event = {
+                "message_id":        msg.get("message_id", ""),
+                "from":              from_aid,
+                "to":                msg.get("to", ""),
+                "seq":               msg.get("seq"),
+                "timestamp":         msg.get("t_server") or msg.get("timestamp"),
+                "device_id":         msg.get("device_id", ""),
+                "slot_id":           msg.get("slot_id", ""),
+                "_decrypt_error":    "sender_ik_not_found",
+                "_decrypt_stage":    "sender_ik",
+                "_envelope_type":    envelope.get("type", ""),
+                "_suite":            envelope.get("suite", ""),
+                "_sender_device_id": aad.get("from_device", ""),
+            }
+            self._attach_v2_envelope_metadata(event, e2ee_meta)
+            await self._dispatcher.publish(undecryptable_event, event)
             return None
 
         try:
@@ -4756,21 +6643,41 @@ class AUNClient:
             )
         except Exception as exc:
             self._log.warn("client", "V2 decrypt failed for msg seq=%s: %s", msg.get("seq"), exc)
-            await self._dispatcher.publish("message.undecryptable", {
-                "message_id": msg.get("message_id", ""),
-                "from": from_aid,
-                "seq": msg.get("seq"),
-                "_decrypt_error": str(exc),
-            })
+            event = {
+                "message_id":        msg.get("message_id", ""),
+                "from":              from_aid,
+                "to":                msg.get("to", ""),
+                "seq":               msg.get("seq"),
+                "timestamp":         msg.get("t_server") or msg.get("timestamp"),
+                "device_id":         msg.get("device_id", ""),
+                "slot_id":           msg.get("slot_id", ""),
+                "_decrypt_error":    str(exc),
+                "_decrypt_stage":    "decrypt",
+                "_envelope_type":    envelope.get("type", ""),
+                "_suite":            envelope.get("suite", ""),
+                "_sender_device_id": aad.get("from_device", ""),
+            }
+            self._attach_v2_envelope_metadata(event, e2ee_meta)
+            await self._dispatcher.publish(undecryptable_event, event)
             return None
 
         if plaintext is None:
             return None
 
-        # SPK 轮换：当前活跃 SPK 被消费后立即轮换（后台执行，不阻塞消息处理）
-        self._log.info("client", "DEBUG SPK rotation check: spk_id=%s current=%s is_current=%s",
-                       spk_id, self._v2_session._spk_id, self._v2_session.is_current_spk(spk_id))
-        if self._v2_session.is_current_spk(spk_id):
+        # SPK 处理：P2P 与 Group 分开。群消息 fallback 到 peer_device_prekey 时，
+        # 补注册一次 group SPK；只有真正消费 group_device_prekey 时才轮换该群的 group SPK。
+        group_spk_consumed = (
+            group_id_for_keys
+            and recipient_key_source == "group_device_prekey"
+            and self._v2_session.is_last_uploaded_group_spk(group_id_for_keys, spk_id)
+        )
+        if group_spk_consumed:
+            self._schedule_group_spk_rotation(group_id_for_keys, reason="group_spk_consumed")
+        elif group_id_for_keys and recipient_key_source == "peer_device_prekey":
+            self._schedule_group_spk_registration_after_peer_fallback(group_id_for_keys)
+        elif not group_id_for_keys and self._v2_session.is_last_uploaded_spk(spk_id):
+            self._log.debug("client", "SPK rotation check: spk_id=%s last_uploaded=%s matched=%s",
+                            spk_id, self._v2_session._last_uploaded_spk_id, True)
             async def _do_rotate():
                 try:
                     await self._v2_session.rotate_spk(self.call)
@@ -4780,7 +6687,8 @@ class AUNClient:
             loop = self._loop or asyncio.get_running_loop()
             loop.create_task(_do_rotate())
 
-        return {
+        meta = self._v2_thought_e2ee_metadata(envelope)
+        result = {
             "message_id": msg.get("message_id", ""),
             "from": from_aid,
             "to": self._aid,
@@ -4788,10 +6696,7 @@ class AUNClient:
             "t_server": msg.get("t_server"),
             "payload": plaintext,
             "encrypted": True,
-            "e2ee": {
-                "version": "v2",
-                "suite": envelope.get("suite", ""),
-                "encryption_mode": "v2_" + envelope.get("suite", "unknown"),
-                "forward_secrecy": True,
-            },
+            "e2ee": meta,
         }
+        self._attach_v2_envelope_metadata(result, meta)
+        return result

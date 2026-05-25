@@ -27,6 +27,9 @@ import {
 } from './metadata-auth';
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const E2EE_SDK_LANG = 'javascript';
+const E2EE_SDK_VERSION = '0.3.2';
 
 async function sha256(data: Uint8Array): Promise<Uint8Array> {
   const buf = await crypto.subtle.digest('SHA-256', data.slice().buffer);
@@ -113,10 +116,7 @@ export async function encryptP2PMessage(
   ];
   const protocolSet = new Set<string>();
   for (const t of allTargetsForProto) {
-    if (
-      t.spkPkDer
-      && (t.keySource === 'peer_device_prekey' || t.keySource === 'group_device_prekey')
-    ) {
+    if (usesSPKWrap(t)) {
       protocolSet.add('3DH');
     } else {
       protocolSet.add('1DH');
@@ -218,6 +218,10 @@ export async function encryptP2PMessage(
     recipients: sortedRows,
     aad,
   };
+  const payloadType = payload?.type == null ? '' : String(payload.type);
+  if (payloadType) {
+    envelope.payload_type = payloadType;
+  }
 
   // 11. protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
   // payload_type 自动注入 + value 转 string（与 Python _normalize_headers 对齐）
@@ -244,9 +248,7 @@ export function normalizeProtectedHeaders(
   const normalized: Record<string, string> = {};
   if (headers && typeof headers === 'object') {
     for (const [k, v] of Object.entries(headers)) {
-      if (k === '_auth') continue;
-      const sv = v != null ? String(v) : '';
-      if (sv) normalized[k] = sv;
+      normalized[normalizeProtectedHeaderKey(k)] = normalizeProtectedHeaderValue(v);
     }
   }
   // payload_type 自动注入（与 Python 对齐：payload.get("type") → protected_headers["payload_type"]）
@@ -254,7 +256,26 @@ export function normalizeProtectedHeaders(
   if (payloadType && !('payload_type' in normalized)) {
     normalized['payload_type'] = payloadType;
   }
+  normalized.sdk_lang = E2EE_SDK_LANG;
+  normalized.sdk_vesion = E2EE_SDK_VERSION;
   return normalized;
+}
+
+function normalizeProtectedHeaderKey(key: unknown): string {
+  const value = String(key ?? '').trim().toLowerCase();
+  if (!value || !/^[a-z0-9_-]+$/.test(value)) {
+    throw new Error('protected header key must match [a-z0-9_-]+');
+  }
+  if (value === '_auth') {
+    throw new Error('protected header key is reserved');
+  }
+  return value;
+}
+
+function normalizeProtectedHeaderValue(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  return decoder.decode(canonicalJson(value));
 }
 
 /**
@@ -277,12 +298,12 @@ async function wrapForRecipient(
   const fp = `sha256:${fpHash.substring(0, 16)}`;
 
   const wrapNonce = randomBytes(12);
+  const use3DH = usesSPKWrap(target);
+  const rowKeySource = use3DH ? keySource : 'aid_master';
+  const rowSpkId = use3DH ? (target.spkId ?? '') : '';
 
   let wrapKey: Uint8Array;
-  if (
-    target.spkPkDer
-    && (keySource === 'peer_device_prekey' || keySource === 'group_device_prekey')
-  ) {
+  if (use3DH) {
     wrapKey = await compute3DHWrap(
       senderSessionPriv,
       senderMasterPriv,
@@ -309,10 +330,24 @@ async function wrapForRecipient(
     target.aid,
     target.deviceId,
     role,
-    keySource,
+    rowKeySource,
     fp,
-    target.spkId ?? '',
+    rowSpkId,
     bytesToBase64(wrapNonce),
     bytesToBase64(wrappedKey),
   ];
+}
+
+function usesSPKWrap(
+  target: Target,
+): target is Target & {
+  spkId: string;
+  spkPkDer: Uint8Array;
+  keySource: 'peer_device_prekey' | 'group_device_prekey';
+} {
+  return Boolean(
+    target.spkId &&
+      target.spkPkDer &&
+      (target.keySource === 'peer_device_prekey' || target.keySource === 'group_device_prekey'),
+  );
 }

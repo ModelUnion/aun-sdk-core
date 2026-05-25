@@ -24,6 +24,7 @@ import { AuthError, StateError, ValidationError, AUNError, mapRemoteError } from
 import type { CryptoProvider } from './crypto.js';
 import type { KeyStore } from './keystore/index.js';
 import type { RPCTransport } from './transport.js';
+import type { DnsResilientNet } from './net.js';
 import {
   isJsonObject,
   type IdentityRecord,
@@ -192,8 +193,11 @@ function _gatewayHttpUrl(gatewayUrl: string, urlPath: string): string {
 }
 
 /** 发起 HTTP GET 请求，返回文本内容 */
-async function _fetchText(url: string, verifySsl: boolean): Promise<string> {
+async function _fetchText(url: string, verifySsl: boolean, net?: DnsResilientNet | null): Promise<string> {
   try {
+    if (net) {
+      return await net.httpGetText(url, 5_000);
+    }
     return await _httpGet(url, verifySsl);
   } catch (err) {
     throw new AuthError(`failed to fetch ${url}: ${err instanceof Error ? err.message : String(err)}`);
@@ -201,8 +205,8 @@ async function _fetchText(url: string, verifySsl: boolean): Promise<string> {
 }
 
 /** 发起 HTTP GET 请求，返回 JSON 对象 */
-async function _fetchJson(url: string, verifySsl: boolean): Promise<JsonObject> {
-  const text = await _fetchText(url, verifySsl);
+async function _fetchJson(url: string, verifySsl: boolean, net?: DnsResilientNet | null): Promise<JsonObject> {
+  const text = await _fetchText(url, verifySsl, net);
   try {
     const payload = JSON.parse(text);
     if (!isJsonObject(payload)) {
@@ -290,6 +294,7 @@ export class AuthFlow {
   private _deviceId: string;
   private _slotId: string;
   private _verifySsl: boolean;
+  private _net: DnsResilientNet | null;
   private _connectionFactory: ConnectionFactory;
   private _rootCaPath: string | null;
   private _chainCacheTtl: number;
@@ -319,6 +324,7 @@ export class AuthFlow {
     chainCacheTtl?: number;
     verifySsl?: boolean;
     logger?: ModuleLogger;
+    net?: DnsResilientNet | null;
   }) {
     this._logger = opts.logger ?? _noopLogger;
     this._keystore = opts.keystore;
@@ -328,6 +334,7 @@ export class AuthFlow {
     this._slotId = String(opts.slotId ?? '').trim();
     this._connectionFactory = opts.connectionFactory ?? _defaultConnectionFactory;
     this._rootCaPath = opts.rootCaPath ?? null;
+    this._net = opts.net ?? null;
     this._verifySsl = opts.verifySsl ?? false;
     this._chainCacheTtl = (opts.chainCacheTtl ?? 86400) * 1000; // 转为毫秒
     this._rootCerts = this._loadRootCerts(this._rootCaPath);
@@ -812,11 +819,13 @@ export class AuthFlow {
         method,
         params,
       });
+      this._logger.debug(`short RPC request full: ${payload}`);
       ws.send(payload);
 
       // 接收响应
       const raw = await this._wsRecv(ws);
       const message = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      this._logger.debug(`short RPC response full: method=${method} ${JSON.stringify(message)}`);
 
       if (message.error) {
         throw mapRemoteError(message.error);
@@ -1186,7 +1195,7 @@ export class AuthFlow {
     _chainAid: string = '',
   ): Promise<string[]> {
     const url = _gatewayHttpUrl(gatewayUrl, '/pki/chain');
-    const text = await _fetchText(url, this._verifySsl);
+    const text = await _fetchText(url, this._verifySsl, this._net);
     return _splitPemBundle(text);
   }
 
@@ -1254,7 +1263,7 @@ export class AuthFlow {
     _issuerCert: crypto.X509Certificate,
   ): Promise<CrlCacheEntry> {
     const url = _gatewayHttpUrl(gatewayUrl, '/pki/crl.json');
-    const payload = await _fetchJson(url, this._verifySsl);
+    const payload = await _fetchJson(url, this._verifySsl, this._net);
     const crlPem = String(payload.crl_pem || '');
     if (!crlPem) {
       throw new AuthError('gateway CRL endpoint returned no signed CRL');
@@ -1461,7 +1470,7 @@ export class AuthFlow {
   ): Promise<OcspCacheEntry> {
     const serialHex = _certSerialHex(authCert);
     const url = _gatewayHttpUrl(gatewayUrl, `/pki/ocsp/${serialHex}`);
-    const payload = await _fetchJson(url, this._verifySsl);
+    const payload = await _fetchJson(url, this._verifySsl, this._net);
     const status = String(payload.status || '');
     const ocspB64 = String(payload.ocsp_response || '');
 
@@ -1962,9 +1971,6 @@ export class AuthFlow {
   }
 
   private _loadInstanceState(aid: string): IdentityRecord | null {
-    if (!this._deviceId) {
-      return null;
-    }
     const loader = (this._keystore as KeyStore & {
       loadInstanceState?: (aid: string, deviceId: string, slotId?: string) => IdentityRecord | null;
     }).loadInstanceState;
@@ -1991,18 +1997,15 @@ export class AuthFlow {
 
     this._keystore.saveIdentity(aid, persisted);
 
-    if (this._deviceId) {
-      // 从共享 metadata_kv 中移除实例级字段（它们已保存到 instance_state）
-      const db = (this._keystore as any)._getDB?.(aid);
-      if (db && typeof db.deleteMetadata === 'function') {
-        for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
-          db.deleteMetadata(key);
-          db.deleteMetadata(`${key}_protection`);
-        }
+    // 从共享 metadata_kv 中移除实例级字段（它们已保存到 instance_state）
+    const db = (this._keystore as any)._getDB?.(aid);
+    if (db && typeof db.deleteMetadata === 'function') {
+      for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
+        db.deleteMetadata(key);
+        db.deleteMetadata(`${key}_protection`);
       }
     }
-
-    if (!this._deviceId || Object.keys(instanceState).length === 0) {
+    if (Object.keys(instanceState).length === 0) {
       return;
     }
     const updater = (this._keystore as KeyStore & {

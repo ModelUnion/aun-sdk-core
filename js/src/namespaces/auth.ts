@@ -1,4 +1,4 @@
-// ── AuthNamespace（认证命名空间 — 完整实现）──────────────────
+﻿// ── AuthNamespace（认证命名空间 — 完整实现）──────────────────
 
 import type { AUNClient } from '../client.js';
 import { AUNError, NotFoundError, StateError, ValidationError } from '../errors.js';
@@ -53,6 +53,8 @@ interface ClientBridge {
   _keystore?: {
     getMetadata?: (aid: string, key: string) => Promise<string>;
     setMetadata?: (aid: string, key: string, value: string) => Promise<void>;
+    loadKeyPair?: (aid: string) => Promise<{ private_key_pem?: string; public_key_der_b64?: string } | null>;
+    loadCert?: (aid: string) => Promise<string | null>;
   };
 }
 
@@ -221,6 +223,67 @@ function extractCommonNameFromCertPem(certPem: string): string {
     return commonName;
   } catch {
     return '';
+  }
+}
+
+/** 从 PEM 证书 DER 中解析 validity（notBefore / notAfter）时间戳 */
+function parseCertValidity(certPem: string): { notBefore: number; notAfter: number } | null {
+  try {
+    const der = new Uint8Array(pemToArrayBuffer(certPem));
+    // ASN.1 X.509 结构：SEQUENCE { tbsCertificate SEQUENCE { version, serial, sigAlg, issuer, validity, ... } }
+    // validity 是 tbsCertificate 中第 5 个字段（0-indexed: 4）
+    // 简化方法：搜索连续两个 UTCTime 或 GeneralizedTime 标签
+    const dates: number[] = [];
+    for (let i = 0; i < der.length - 2 && dates.length < 2; i++) {
+      const tag = der[i];
+      if (tag !== 0x17 && tag !== 0x18) continue; // UTCTime=0x17, GeneralizedTime=0x18
+      const len = der[i + 1];
+      if (len === 0 || len > 20 || i + 2 + len > der.length) continue;
+      const str = new TextDecoder().decode(der.slice(i + 2, i + 2 + len));
+      const ts = parseAsn1Time(tag, str);
+      if (ts !== null) {
+        dates.push(ts);
+        i += 1 + len; // 跳过已解析的时间
+      }
+    }
+    if (dates.length >= 2) {
+      return { notBefore: dates[0], notAfter: dates[1] };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseAsn1Time(tag: number, str: string): number | null {
+  try {
+    if (tag === 0x17) {
+      // UTCTime: YYMMDDHHMMSSZ
+      const cleaned = str.replace(/Z$/i, '');
+      if (cleaned.length < 12) return null;
+      let year = parseInt(cleaned.slice(0, 2), 10);
+      year += year >= 50 ? 1900 : 2000;
+      const month = parseInt(cleaned.slice(2, 4), 10) - 1;
+      const day = parseInt(cleaned.slice(4, 6), 10);
+      const hour = parseInt(cleaned.slice(6, 8), 10);
+      const min = parseInt(cleaned.slice(8, 10), 10);
+      const sec = parseInt(cleaned.slice(10, 12), 10);
+      return Date.UTC(year, month, day, hour, min, sec);
+    } else if (tag === 0x18) {
+      // GeneralizedTime: YYYYMMDDHHMMSSZ
+      const cleaned = str.replace(/Z$/i, '');
+      if (cleaned.length < 14) return null;
+      const year = parseInt(cleaned.slice(0, 4), 10);
+      const month = parseInt(cleaned.slice(4, 6), 10) - 1;
+      const day = parseInt(cleaned.slice(6, 8), 10);
+      const hour = parseInt(cleaned.slice(8, 10), 10);
+      const min = parseInt(cleaned.slice(10, 12), 10);
+      const sec = parseInt(cleaned.slice(12, 14), 10);
+      return Date.UTC(year, month, day, hour, min, sec);
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -643,6 +706,43 @@ export class AuthNamespace {
     }
   }
 
+  async headAgentMd(aid: string): Promise<JsonObject> {
+    const tStart = Date.now();
+    const targetAid = String(aid ?? '').trim();
+    if (!targetAid) {
+      throw new ValidationError('headAgentMd requires non-empty aid');
+    }
+    this._log.debug(`headAgentMd enter: aid=${targetAid}`);
+    try {
+      const response = await fetchWithTimeout(await this._resolveAgentMdUrl(targetAid), {
+        method: 'HEAD',
+        headers: { Accept: 'text/markdown' },
+      });
+      const respHeaders = response.headers;
+      const etag = respHeaders ? String(respHeaders.get('ETag') ?? '').trim() : '';
+      const lastModified = respHeaders ? String(respHeaders.get('Last-Modified') ?? '').trim() : '';
+      if (response.status === 404) {
+        this._log.debug(`headAgentMd exit (not_found): elapsed=${Date.now() - tStart}ms aid=${targetAid}`);
+        return { aid: targetAid, found: false, etag: '', last_modified: '', status: 404 };
+      }
+      if (response.status < 200 || response.status >= 300) {
+        throw new AUNError(`head agent.md failed: HTTP ${response.status}`);
+      }
+      if (etag || lastModified) {
+        const cached = this._agentMdCache.get(targetAid) ?? { text: '', etag: '', lastModified: '' };
+        this._agentMdCache.set(targetAid, {
+          text: cached.text ?? '',
+          etag,
+          lastModified,
+        });
+      }
+      this._log.debug(`headAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} status=${response.status} etag=${etag || '-'}`);
+      return { aid: targetAid, found: true, etag, last_modified: lastModified, status: response.status };
+    } catch (err) {
+      this._log.debug(`headAgentMd exit (error): elapsed=${Date.now() - tStart}ms aid=${targetAid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  }
   async downloadAgentMd(aid: string): Promise<string> {
     const tStart = Date.now();
     this._log.debug(`downloadAgentMd enter: aid=${aid}`);
@@ -756,6 +856,178 @@ export class AuthNamespace {
     } catch (err) {
       this._log.debug(`trustRoots exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
+    }
+  }
+
+  /**
+   * 检查指定 AID 的本地和远程状态。
+   * 与 Python SDK namespaces/auth_namespace.py:check_aid 对应。
+   */
+  async checkAid(params: RpcParams): Promise<JsonObject> {
+    const tStart = Date.now();
+    const aid = String(params?.aid ?? '').trim();
+    if (!aid) throw new ValidationError("auth.check_aid requires 'aid'");
+    this._log.debug(`checkAid enter: aid=${aid}`);
+    try {
+      const result = await this._checkLocalAid(aid);
+      const local = result.local as JsonObject;
+      if (!local?.complete) {
+        const remote = await this._checkRemoteAidRegistration(aid);
+        result.remote = remote;
+        const remoteStatus = (remote as JsonObject)?.status;
+        if (remoteStatus === 'available') {
+          result.status = 'available';
+          result.can_register = true;
+        } else if (remoteStatus === 'registered') {
+          result.status = 'registered_remote';
+          result.can_register = false;
+        } else {
+          result.status = 'unknown';
+          result.can_register = false;
+        }
+      }
+      this._log.debug(`checkAid exit: elapsed=${Date.now() - tStart}ms aid=${aid} status=${String(result.status)}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`checkAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  }
+
+  private async _checkLocalAid(aid: string): Promise<JsonObject> {
+    const client = this._internal;
+    const ks = client._keystore;
+    const identity = await client._auth.loadIdentityOrNone(aid);
+
+    let keyPair: { private_key_pem?: string; public_key_der_b64?: string } | null = null;
+    let keyError = '';
+    try {
+      if (ks && typeof ks.loadKeyPair === 'function') {
+        keyPair = await ks.loadKeyPair(aid);
+      }
+    } catch (e) {
+      keyError = e instanceof Error ? e.message : String(e);
+    }
+
+    let certPem: string | null = null;
+    let certError = '';
+    try {
+      if (ks && typeof ks.loadCert === 'function') {
+        certPem = await ks.loadCert(aid);
+      }
+    } catch (e) {
+      certError = e instanceof Error ? e.message : String(e);
+    }
+
+    const privateKeyPresent = !!(keyPair && keyPair.private_key_pem);
+    const publicKeyPresent = !!(keyPair && keyPair.public_key_der_b64);
+    const certPresent = !!certPem;
+    const certInfo: JsonObject = certPresent
+      ? await this._inspectCertBrowser(aid, certPem!)
+      : { present: false, valid: false, expired: false };
+    const certValid = !!(certInfo as any).valid;
+    const localComplete = privateKeyPresent && publicKeyPresent && certPresent && certValid;
+
+    const issues: string[] = [];
+    if (!identity) issues.push('local identity not found');
+    if (!privateKeyPresent) issues.push('private key missing');
+    if (!publicKeyPresent) issues.push('public key missing');
+    if (!certPresent) {
+      issues.push('certificate missing');
+    } else if ((certInfo as any).parse_error) {
+      issues.push(`certificate invalid: ${(certInfo as any).parse_error}`);
+    } else if ((certInfo as any).expired) {
+      issues.push('certificate expired');
+    } else if (!certValid) {
+      issues.push('certificate not currently valid');
+    }
+    if (keyError) issues.push(`key load error: ${keyError}`);
+    if (certError) issues.push(`certificate load error: ${certError}`);
+
+    return {
+      aid,
+      status: localComplete ? 'local_ready' : 'local_incomplete',
+      can_register: localComplete ? false : null,
+      local: {
+        exists: identity !== null,
+        complete: localComplete,
+        private_key: privateKeyPresent,
+        public_key: publicKeyPresent,
+        certificate: certInfo,
+        issues,
+      },
+      remote: {
+        status: localComplete ? 'not_checked' : 'pending',
+      },
+    };
+  }
+
+  /** 浏览器环境证书检查（无 node:crypto X509Certificate） */
+  private async _inspectCertBrowser(aid: string, certPem: string): Promise<JsonObject> {
+    const result: JsonObject = { present: true, valid: false, expired: false };
+    try {
+      const fingerprint = await certificateSha256Fingerprint(certPem);
+      const cn = extractCommonNameFromCertPem(certPem);
+      const aidMatches = !cn || cn === aid;
+
+      // 从 DER 解析有效期
+      const validity = parseCertValidity(certPem);
+      if (validity) {
+        const now = Date.now();
+        const valid = now >= validity.notBefore && now <= validity.notAfter && aidMatches;
+        const expired = now > validity.notAfter;
+        result.valid = valid;
+        result.expired = expired;
+        result.not_before = new Date(validity.notBefore).toISOString();
+        result.not_after = new Date(validity.notAfter).toISOString();
+        result.expires_at = Math.floor(validity.notAfter / 1000);
+        result.seconds_until_expiry = Math.floor((validity.notAfter - now) / 1000);
+      } else {
+        // 无法解析有效期，仅检查 CN
+        result.valid = aidMatches;
+      }
+
+      result.fingerprint = fingerprint;
+      result.subject_cn = cn;
+      result.aid_matches = aidMatches;
+
+      if (cn && cn !== aid) {
+        result.valid = false;
+        result.parse_error = `certificate CN mismatch: ${cn}`;
+      }
+    } catch (e) {
+      result.parse_error = e instanceof Error ? e.message : String(e);
+    }
+    return result;
+  }
+
+  private async _checkRemoteAidRegistration(aid: string): Promise<JsonObject> {
+    try {
+      const content = await this.downloadAgentMd(aid);
+      return {
+        status: 'registered',
+        registered: true,
+        available: false,
+        source: 'agent.md',
+        agent_md_bytes: new TextEncoder().encode(content).length,
+        agent_md_aid: extractAgentMDAid(content),
+      };
+    } catch (err) {
+      if (err instanceof NotFoundError) {
+        return {
+          status: 'available',
+          registered: false,
+          available: true,
+          source: 'agent.md',
+        };
+      }
+      return {
+        status: 'unknown',
+        registered: null,
+        available: null,
+        source: 'agent.md',
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
   }
 }

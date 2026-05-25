@@ -80,7 +80,7 @@ describe('V2 PFS 接线 - _ackV2Internal 触发 maybeDestroyOldSPKs', () => {
     let now = Date.now();
     session._setNowFn(() => now);
     session.trackOldSPKMaxSeq(oldSpkId, 100);
-    // 推进时间超过 7h 安全窗口
+    // 推进时间超过 7 天安全窗口
     now += DESTROY_DELAY_MS + 1000;
 
     expect(store.loadSPK('dev-1', oldSpkId)).not.toBeNull();

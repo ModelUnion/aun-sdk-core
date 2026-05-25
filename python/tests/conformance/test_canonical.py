@@ -3,7 +3,7 @@ AUN E2EE V2 Conformance: canonical_json
 
 规范引用: §10.2 Canonical JSON
 规则:
-- 键递归字典序排序
+- 键递归按 Unicode code point 排序
 - UTF-8 直出（不转义非 ASCII）
 - 数值无前导零、不科学计数法
 - 字符串最小转义（仅 \"\\\\\\b\\f\\n\\r\\t，其它控制字符 \\u00XX）
@@ -55,6 +55,16 @@ class TestCanonicalBasic:
         # 0.5 应输出 "0.5" 而非 "5e-1"
         assert canonical_json(0.5) == b"0.5"
 
+    def test_float_integer_value_as_integer(self):
+        assert canonical_json(1.0) == b"1"
+
+    def test_float_small_scientific_expanded(self):
+        assert canonical_json(1e-7) == b"0.0000001"
+
+    def test_unsafe_integer_rejected(self):
+        with pytest.raises(ValueError, match="outside safe range"):
+            canonical_json(9007199254740992)
+
     def test_string_simple(self):
         assert canonical_json("hello") == b'"hello"'
 
@@ -81,6 +91,10 @@ class TestCanonicalKeyOrder:
         obj = {"c": {"z": {"y": 1, "x": 2}, "a": 3}, "b": 4}
         result = canonical_json(obj)
         assert result == b'{"b":4,"c":{"a":3,"z":{"x":2,"y":1}}}'
+
+    def test_unicode_code_point_order(self):
+        result = canonical_json({"\U00010000": 1, "\uE000": 2})
+        assert result == '{"\uE000":2,"𐀀":1}'.encode("utf-8")
 
 
 class TestCanonicalArrayOrder:

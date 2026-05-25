@@ -48,6 +48,7 @@ function parseBool(value: string | undefined): boolean {
 export class AUNLogger {
   private _debug: boolean;
   private _aunPath: string;
+  private _deviceId: string = '-';
   private _logDir: string;
   private _minLevel: number;
   private _aid: string | null = null;
@@ -57,6 +58,7 @@ export class AUNLogger {
   private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: AUNLoggerOptions) {
+    this._aunPath = opts.aunPath || join(homedir(), '.aun');
     // ~/.aun/log.ini 存在时覆盖代码层 debug 标志，且日志目录强制为 ~/.aun/logs/
     // 测试可通过环境变量 AUN_LOG_INI_DISABLE=1 跳过读取 ini，避免真实环境干扰
     const iniDisabled = process.env.AUN_LOG_INI_DISABLE === '1' || process.env.AUN_LOG_INI_DISABLE === 'true';
@@ -69,11 +71,9 @@ export class AUNLogger {
       levelStr = (ini['level'] ?? (this._debug ? 'debug' : 'info')).toLowerCase();
     } else {
       this._debug = opts.debug;
-      this._aunPath = opts.aunPath;
-      this._logDir = join(opts.aunPath, 'logs');
+      this._logDir = join(this._aunPath, 'logs');
       levelStr = this._debug ? 'debug' : 'info';
     }
-    this._aunPath = ini ? join(homedir(), '.aun') : opts.aunPath;
     const lvl = LEVEL_ORDER[(levelStr.toUpperCase() as Level)] ?? LEVEL_ORDER.INFO;
     this._minLevel = lvl;
     // 仅 debug=ON 时建日志目录、清理过期日志、启动定时清理
@@ -98,6 +98,10 @@ export class AUNLogger {
     this._aid = aid || null;
   }
 
+  bindDeviceId(deviceId: string): void {
+    this._deviceId = String(deviceId || '').trim() || '-';
+  }
+
   close(): void {
     if (this._cleanupTimer) {
       clearInterval(this._cleanupTimer);
@@ -111,7 +115,7 @@ export class AUNLogger {
     // debug=OFF 时 DEBUG 一律不输出（控制台 + 文件均不输出）
     if (level === 'DEBUG' && !this._debug) return;
     const { date, time, ms } = this._now();
-    const head = `[${date} ${time}.${ms}][${level}][${module}]`;
+    const head = `[${date} ${time}.${ms}][${level}][${module}][aun_path=${this._aunPath || '-'}][device_id=${this._deviceId || '-'}]`;
     const aidPart = this._aid ? ` [${this._aid}]` : '';
     const line = `${head}${aidPart} ${msg}`;
 

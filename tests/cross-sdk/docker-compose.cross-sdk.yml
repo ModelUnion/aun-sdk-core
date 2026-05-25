@@ -1,0 +1,141 @@
+services:
+  cross-sdk-python:
+    image: aun-sdk-tester:latest
+    container_name: cross-sdk-python
+    command: ["python", "/cross-sdk/python/test_agent.py"]
+    environment:
+      PYTHONPATH: /sdk/python/src
+      AUN_ENV: development
+      AUN_DATA_ROOT: /data/aun
+      AUN_TEST_AID: ${CROSS_SDK_PY_AID:-cross-py.agentid.pub}
+      AUN_TEST_ISSUER: ${AUN_TEST_ISSUER:-agentid.pub}
+      AUN_GATEWAY_AID: ${AUN_GATEWAY_AID:-gateway.agentid.pub}
+      AUN_TEST_SLOT_ID: ${CROSS_SDK_PY_SLOT:-cross-sdk-python}
+      AUN_CONTROL_HOST: 0.0.0.0
+      AUN_CONTROL_PORT: 9001
+      AUN_TEST_DEBUG: ${AUN_TEST_DEBUG:-0}
+    volumes:
+      - ../../python/src:/sdk/python/src:ro
+      - ./python:/cross-sdk/python:ro
+      - ./data/python:/data/aun
+      - ./artifacts/logs/python:/root/.aun/logs
+    networks:
+      - kite-net
+
+  cross-sdk-ts:
+    image: node:22-bookworm
+    container_name: cross-sdk-ts
+    working_dir: /workspace/ts
+    command:
+      - bash
+      - -lc
+      - |
+        if [ ! -x node_modules/.bin/tsc ]; then npm ci --legacy-peer-deps; fi
+        npm run build
+        node dist/tools/cross-sdk-agent.js
+    environment:
+      AUN_ENV: development
+      AUN_DATA_ROOT: /data/aun
+      AUN_TEST_AID: ${CROSS_SDK_TS_AID:-cross-ts.agentid.pub}
+      AUN_TEST_ISSUER: ${AUN_TEST_ISSUER:-agentid.pub}
+      AUN_GATEWAY_AID: ${AUN_GATEWAY_AID:-gateway.agentid.pub}
+      AUN_TEST_SLOT_ID: ${CROSS_SDK_TS_SLOT:-cross-sdk-ts}
+      AUN_CONTROL_HOST: 0.0.0.0
+      AUN_CONTROL_PORT: 9001
+      AUN_TEST_DEBUG: ${AUN_TEST_DEBUG:-0}
+    volumes:
+      - ../../ts:/workspace/ts
+      - cross-sdk-ts-node-modules:/workspace/ts/node_modules
+      - ./data/ts:/data/aun
+      - ./artifacts/logs/ts:/root/.aun/logs
+    networks:
+      - kite-net
+
+  cross-sdk-go:
+    image: golang:1.22-bookworm
+    container_name: cross-sdk-go
+    working_dir: /workspace/go
+    command: ["go", "run", "-mod=vendor", "./cmd/cross-sdk-agent"]
+    environment:
+      AUN_ENV: development
+      AUN_DATA_ROOT: /data/aun
+      AUN_TEST_AID: ${CROSS_SDK_GO_AID:-cross-go.agentid.pub}
+      AUN_TEST_ISSUER: ${AUN_TEST_ISSUER:-agentid.pub}
+      AUN_GATEWAY_AID: ${AUN_GATEWAY_AID:-gateway.agentid.pub}
+      AUN_TEST_SLOT_ID: ${CROSS_SDK_GO_SLOT:-cross-sdk-go}
+      AUN_CONTROL_HOST: 0.0.0.0
+      AUN_CONTROL_PORT: 9001
+      AUN_TEST_DEBUG: ${AUN_TEST_DEBUG:-0}
+      GOCACHE: /tmp/go-cache
+      GOMODCACHE: /tmp/go-mod
+    volumes:
+      - ../../go:/workspace/go:ro
+      - ./data/go:/data/aun
+      - ./artifacts/logs/go:/root/.aun/logs
+      - cross-sdk-go-cache:/tmp/go-cache
+    networks:
+      - kite-net
+
+  cross-sdk-cpp:
+    image: aun-cpp-tester:local
+    container_name: cross-sdk-cpp
+    working_dir: /cross-sdk/cpp
+    command:
+      - bash
+      - -lc
+      - |
+        cmake -S /cross-sdk/cpp -B /tmp/cross-sdk-cpp-build -DAUN_CORE_ROOT=/workspace/aun-core -DBUILD_TESTS=OFF
+        cmake --build /tmp/cross-sdk-cpp-build --target cross-sdk-cpp-agent -j "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+        /tmp/cross-sdk-cpp-build/cross-sdk-cpp-agent
+    environment:
+      AUN_ENV: development
+      AUN_DATA_ROOT: /data/aun
+      AUN_TEST_AID: ${CROSS_SDK_CPP_AID:-cross-cpp.agentid.pub}
+      AUN_TEST_ISSUER: ${AUN_TEST_ISSUER:-agentid.pub}
+      AUN_GATEWAY_AID: ${AUN_GATEWAY_AID:-gateway.agentid.pub}
+      AUN_TEST_SLOT_ID: ${CROSS_SDK_CPP_SLOT:-cross-sdk-cpp}
+      AUN_CONTROL_HOST: 0.0.0.0
+      AUN_CONTROL_PORT: 9001
+      AUN_TEST_DEBUG: ${AUN_TEST_DEBUG:-0}
+      CMAKE_BUILD_PARALLEL_LEVEL: ${CMAKE_BUILD_PARALLEL_LEVEL:-2}
+    volumes:
+      - ./cpp:/cross-sdk/cpp:ro
+      - ../../../../ACP-APP/aun-so/core:/workspace/aun-core:ro
+      - ./data/cpp:/data/aun
+      - ./artifacts/logs/cpp:/root/.aun/logs
+    networks:
+      - kite-net
+
+  cross-sdk-runner:
+    image: aun-sdk-tester:latest
+    container_name: cross-sdk-runner
+    depends_on:
+      - cross-sdk-python
+      - cross-sdk-ts
+      - cross-sdk-go
+      - cross-sdk-cpp
+    command: ["python", "/cross-sdk/runner/run_cross_sdk_e2e.py"]
+    environment:
+      CROSS_SDK_CLIENTS: ${CROSS_SDK_CLIENTS:-python,ts,go,cpp}
+      PY_CLIENT_URL: http://cross-sdk-python:9001
+      TS_CLIENT_URL: http://cross-sdk-ts:9001
+      GO_CLIENT_URL: http://cross-sdk-go:9001
+      CPP_CLIENT_URL: http://cross-sdk-cpp:9001
+      CROSS_SDK_CASES: /cross-sdk/cases.single-domain.json
+      ARTIFACT_DIR: /artifacts
+      CROSS_SDK_WAIT_TIMEOUT_MS: ${CROSS_SDK_WAIT_TIMEOUT_MS:-300000}
+    volumes:
+      - ./runner:/cross-sdk/runner:ro
+      - ./cases.single-domain.json:/cross-sdk/cases.single-domain.json:ro
+      - ./artifacts:/artifacts
+    networks:
+      - kite-net
+
+volumes:
+  cross-sdk-ts-node-modules:
+  cross-sdk-go-cache:
+
+networks:
+  kite-net:
+    external: true
+    name: ${AUN_DOCKER_NETWORK:-docker-deploy_kite-net}

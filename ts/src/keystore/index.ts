@@ -10,6 +10,24 @@ import type {
   MetadataRecord,
 } from '../types.js';
 
+
+export interface AgentMdCacheRecord {
+  aid: string;
+  content: string;
+  local_etag: string;
+  remote_etag: string;
+  last_modified: string;
+  fetched_at: number;
+  observed_at: number;
+  checked_at: number;
+  remote_status: string;
+  verify_status: string;
+  verify_error: string;
+  last_error: string;
+  updated_at: number;
+}
+
+export type AgentMdCacheUpsert = Partial<Omit<AgentMdCacheRecord, 'aid' | 'updated_at'>>;
 export interface KeyStore {
   /** 加载密钥对 */
   loadKeyPair(aid: string): KeyPairRecord | null;
@@ -61,6 +79,10 @@ export interface KeyStore {
   /** 加载指定 AID 的元数据（对齐 Python load_metadata） */
   loadMetadata?(aid: string): Record<string, unknown> | null;
 
+  /** 加载本地持久化的某个远端/自身 agent.md 缓存记录 */
+  loadAgentMdCache?(ownerAid: string, targetAid: string): AgentMdCacheRecord | null;
+  /** 更新本地持久化的某个远端/自身 agent.md 缓存记录 */
+  upsertAgentMdCache?(ownerAid: string, targetAid: string, fields: AgentMdCacheUpsert): AgentMdCacheRecord;
   /** 保存群组状态（state_hash 链） */
   saveGroupState?(groupId: string, stateVersion: number, stateHash: string, keyEpoch: number, membershipJson: string, policyJson: string): void;
   /** 加载群组状态 */

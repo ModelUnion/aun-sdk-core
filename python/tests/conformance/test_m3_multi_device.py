@@ -18,6 +18,17 @@ from aun_core.v2.keystore import V2KeyStore
 from aun_core.v2.crypto.ecdh import generate_p256_keypair
 
 
+def _session(tmp_db, device_id: str, aid_keypair: tuple[bytes, bytes] | None = None) -> V2Session:
+    aid_priv, aid_pub = aid_keypair or generate_p256_keypair()
+    return V2Session(
+        tmp_db,
+        device_id,
+        "alice.agentid.pub",
+        aid_priv_der=aid_priv,
+        aid_pub_der=aid_pub,
+    )
+
+
 @pytest.fixture
 def tmp_db(tmp_path):
     """创建临时 SQLite 数据库，模拟 AIDDatabase。"""
@@ -98,26 +109,28 @@ class TestMultiDeviceSession:
     """V2Session 多设备隔离测试"""
 
     def test_two_sessions_different_device_id(self, tmp_db):
-        """同一 AID 两个 V2Session 使用不同 device_id，密钥独立"""
-        session1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
-        session2 = V2Session(tmp_db, "dev-2", "alice.agentid.pub")
+        """同一 AID 两个 V2Session 使用不同 device_id；IK 共享，SPK 独立"""
+        aid_keypair = generate_p256_keypair()
+        session1 = _session(tmp_db, "dev-1", aid_keypair)
+        session2 = _session(tmp_db, "dev-2", aid_keypair)
 
         session1.ensure_keys()
         session2.ensure_keys()
 
-        assert session1._ik_priv != session2._ik_priv
-        assert session1._ik_pub_der != session2._ik_pub_der
+        assert session1._ik_priv == session2._ik_priv
+        assert session1._ik_pub_der == session2._ik_pub_der
         assert session1._spk_id != session2._spk_id
 
     def test_session_persists_and_reloads(self, tmp_db):
         """V2Session 密钥持久化后重新加载一致"""
-        session1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
+        aid_keypair = generate_p256_keypair()
+        session1 = _session(tmp_db, "dev-1", aid_keypair)
         session1.ensure_keys()
         ik_priv = session1._ik_priv
         spk_id = session1._spk_id
 
         # 模拟重启：新建 session 实例
-        session1_reload = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
+        session1_reload = _session(tmp_db, "dev-1", aid_keypair)
         session1_reload.ensure_keys()
 
         assert session1_reload._ik_priv == ik_priv
@@ -125,9 +138,10 @@ class TestMultiDeviceSession:
 
     @pytest.mark.asyncio
     async def test_two_sessions_register_independently(self, tmp_db):
-        """两个 session 各自注册到服务端，RPC 参数中 device_id 不同"""
-        session1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
-        session2 = V2Session(tmp_db, "dev-2", "alice.agentid.pub")
+        """两个 session 各自注册到服务端，SPK 独立"""
+        aid_keypair = generate_p256_keypair()
+        session1 = _session(tmp_db, "dev-1", aid_keypair)
+        session2 = _session(tmp_db, "dev-2", aid_keypair)
 
         calls = []
 
@@ -141,24 +155,57 @@ class TestMultiDeviceSession:
         assert len(calls) == 2
         assert calls[0][0] == "message.v2.put_peer_pk"
         assert calls[1][0] == "message.v2.put_peer_pk"
-        # 两次注册的 ik_pk 不同
-        assert calls[0][1]["ik_pk"] != calls[1][1]["ik_pk"]
+        assert calls[0][1]["peer_aid"] == "alice.agentid.pub"
+        assert calls[1][1]["peer_aid"] == "alice.agentid.pub"
+        assert calls[0][1]["spk_id"] != calls[1][1]["spk_id"]
 
     def test_get_decrypt_keys_cross_device(self, tmp_db):
         """dev-1 的 SPK 不能被 dev-2 的 session 解密"""
-        session1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
-        session2 = V2Session(tmp_db, "dev-2", "alice.agentid.pub")
+        aid_keypair = generate_p256_keypair()
+        session1 = _session(tmp_db, "dev-1", aid_keypair)
+        session2 = _session(tmp_db, "dev-2", aid_keypair)
         session1.ensure_keys()
         session2.ensure_keys()
 
-        # dev-2 尝试用 dev-1 的 spk_id 解密
-        ik_priv, spk_priv = session2.get_decrypt_keys(session1._spk_id)
-        assert ik_priv == session2._ik_priv
-        assert spk_priv is None  # 找不到 dev-1 的 SPK
+        # dev-2 尝试用 dev-1 的 spk_id 解密，应准确报告缺失 SPK
+        with pytest.raises(ValueError, match="spk_missing"):
+            session2.get_decrypt_keys(session1._spk_id)
+
+    def test_get_decrypt_keys_falls_back_to_matching_ik_id(self, tmp_db):
+        """spk_id 命中本设备 IK 指纹时，按 IK-as-SPK 路径返回 IK 私钥。"""
+        session = _session(tmp_db, "dev-1")
+        session.ensure_keys()
+        ik_id = "sha256:" + hashlib.sha256(session._ik_pub_der).hexdigest()[:16]
+
+        ik_priv, spk_priv = session.get_decrypt_keys(ik_id)
+
+        assert ik_priv == session._ik_priv
+        assert spk_priv == session._ik_priv
+
+    def test_get_group_decrypt_keys_falls_back_to_matching_ik_id(self, tmp_db):
+        """group 解密 lookup 顺序应覆盖 group SPK、device SPK、IK。"""
+        session = _session(tmp_db, "dev-1")
+        session.ensure_keys()
+        ik_id = "sha256:" + hashlib.sha256(session._ik_pub_der).hexdigest()[:16]
+
+        ik_priv, spk_priv = session.get_group_decrypt_keys("group.agentid.pub/1", ik_id)
+
+        assert ik_priv == session._ik_priv
+        assert spk_priv == session._ik_priv
+
+    def test_get_group_decrypt_keys_falls_back_to_device_spk(self, tmp_db):
+        """group 消息未命中 group SPK 时，应继续按 device SPK 查找。"""
+        session = _session(tmp_db, "dev-1")
+        session.ensure_keys()
+
+        ik_priv, spk_priv = session.get_group_decrypt_keys("group.agentid.pub/1", session._spk_id)
+
+        assert ik_priv == session._ik_priv
+        assert spk_priv == session._spk_priv
 
     def test_spk_rotation_preserves_old(self, tmp_db):
         """SPK 轮换后旧 SPK 仍可用于解密"""
-        session = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
+        session = _session(tmp_db, "dev-1")
         session.ensure_keys()
         old_spk_id = session._spk_id
         old_spk_priv = session._spk_priv

@@ -101,6 +101,24 @@ func (m *mockAuthClient) AuthPersistGatewayURL(aid, gatewayURL string) {
 	m.persistedGatewayURL = gatewayURL
 }
 
+func (m *mockAuthClient) AuthLoadKeyPair(aid string) (map[string]any, error) {
+	if m.identity == nil {
+		return nil, nil
+	}
+	return map[string]any{
+		"private_key_pem":    m.identity["private_key_pem"],
+		"public_key_der_b64": m.identity["public_key_der_b64"],
+	}, nil
+}
+
+func (m *mockAuthClient) AuthLoadCert(aid string) (string, error) {
+	if m.identity == nil {
+		return "", nil
+	}
+	cert, _ := m.identity["cert"].(string)
+	return cert, nil
+}
+
 func makeIdentity(t *testing.T, aid string) map[string]any {
 	t.Helper()
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

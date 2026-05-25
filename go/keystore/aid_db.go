@@ -87,7 +87,21 @@ var aidDBDDL = []string{
 		value TEXT NOT NULL,
 		updated_at INTEGER NOT NULL
 	)`,
-	`CREATE TABLE IF NOT EXISTS group_state (
+	`CREATE TABLE IF NOT EXISTS agent_md_cache (
+		aid TEXT PRIMARY KEY,
+		content TEXT NOT NULL DEFAULT '',
+		local_etag TEXT NOT NULL DEFAULT '',
+		remote_etag TEXT NOT NULL DEFAULT '',
+		last_modified TEXT NOT NULL DEFAULT '',
+		fetched_at INTEGER NOT NULL DEFAULT 0,
+		observed_at INTEGER NOT NULL DEFAULT 0,
+		checked_at INTEGER NOT NULL DEFAULT 0,
+		remote_status TEXT NOT NULL DEFAULT '',
+		verify_status TEXT NOT NULL DEFAULT '',
+		verify_error TEXT NOT NULL DEFAULT '',
+		last_error TEXT NOT NULL DEFAULT '',
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`, `CREATE TABLE IF NOT EXISTS group_state (
 		group_id TEXT PRIMARY KEY,
 		state_version INTEGER NOT NULL DEFAULT 0,
 		state_hash TEXT NOT NULL DEFAULT '',
@@ -1635,6 +1649,157 @@ func toInt64Local(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+// ── Agent.md Cache ───────────────────────────────────────────
+
+type agentMDCacheScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAgentMDCacheRecord(scanner agentMDCacheScanner) (*AgentMDCacheRecord, error) {
+	var rec AgentMDCacheRecord
+	err := scanner.Scan(
+		&rec.AID,
+		&rec.Content,
+		&rec.LocalEtag,
+		&rec.RemoteEtag,
+		&rec.LastModified,
+		&rec.FetchedAt,
+		&rec.ObservedAt,
+		&rec.CheckedAt,
+		&rec.RemoteStatus,
+		&rec.VerifyStatus,
+		&rec.VerifyError,
+		&rec.LastError,
+		&rec.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func applyAgentMDCacheUpsert(rec *AgentMDCacheRecord, fields AgentMDCacheUpsert) {
+	if fields.Content != nil {
+		rec.Content = *fields.Content
+	}
+	if fields.LocalEtag != nil {
+		rec.LocalEtag = *fields.LocalEtag
+	}
+	if fields.RemoteEtag != nil {
+		rec.RemoteEtag = *fields.RemoteEtag
+	}
+	if fields.LastModified != nil {
+		rec.LastModified = *fields.LastModified
+	}
+	if fields.FetchedAt != nil {
+		rec.FetchedAt = *fields.FetchedAt
+	}
+	if fields.ObservedAt != nil {
+		rec.ObservedAt = *fields.ObservedAt
+	}
+	if fields.CheckedAt != nil {
+		rec.CheckedAt = *fields.CheckedAt
+	}
+	if fields.RemoteStatus != nil {
+		rec.RemoteStatus = *fields.RemoteStatus
+	}
+	if fields.VerifyStatus != nil {
+		rec.VerifyStatus = *fields.VerifyStatus
+	}
+	if fields.VerifyError != nil {
+		rec.VerifyError = *fields.VerifyError
+	}
+	if fields.LastError != nil {
+		rec.LastError = *fields.LastError
+	}
+	rec.UpdatedAt = nowMs()
+}
+
+func (a *AIDDatabase) LoadAgentMDCache(aid string) (*AgentMDCacheRecord, error) {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return nil, nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rec, err := scanAgentMDCacheRecord(a.db.QueryRow(
+		`SELECT aid, content, local_etag, remote_etag, last_modified,
+			fetched_at, observed_at, checked_at, remote_status, verify_status,
+			verify_error, last_error, updated_at
+		 FROM agent_md_cache WHERE aid = ?`,
+		target,
+	))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+func (a *AIDDatabase) UpsertAgentMDCache(aid string, fields AgentMDCacheUpsert) (*AgentMDCacheRecord, error) {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return nil, fmt.Errorf("UpsertAgentMDCache requires non-empty aid")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	rec, err := scanAgentMDCacheRecord(a.db.QueryRow(
+		`SELECT aid, content, local_etag, remote_etag, last_modified,
+			fetched_at, observed_at, checked_at, remote_status, verify_status,
+			verify_error, last_error, updated_at
+		 FROM agent_md_cache WHERE aid = ?`,
+		target,
+	))
+	if err == sql.ErrNoRows {
+		rec = &AgentMDCacheRecord{AID: target}
+	} else if err != nil {
+		return nil, err
+	}
+
+	applyAgentMDCacheUpsert(rec, fields)
+	_, err = a.db.Exec(
+		`INSERT INTO agent_md_cache
+			(aid, content, local_etag, remote_etag, last_modified,
+			 fetched_at, observed_at, checked_at, remote_status, verify_status,
+			 verify_error, last_error, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(aid) DO UPDATE SET
+			content=excluded.content,
+			local_etag=excluded.local_etag,
+			remote_etag=excluded.remote_etag,
+			last_modified=excluded.last_modified,
+			fetched_at=excluded.fetched_at,
+			observed_at=excluded.observed_at,
+			checked_at=excluded.checked_at,
+			remote_status=excluded.remote_status,
+			verify_status=excluded.verify_status,
+			verify_error=excluded.verify_error,
+			last_error=excluded.last_error,
+			updated_at=excluded.updated_at`,
+		rec.AID,
+		rec.Content,
+		rec.LocalEtag,
+		rec.RemoteEtag,
+		rec.LastModified,
+		rec.FetchedAt,
+		rec.ObservedAt,
+		rec.CheckedAt,
+		rec.RemoteStatus,
+		rec.VerifyStatus,
+		rec.VerifyError,
+		rec.LastError,
+		rec.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out := *rec
+	return &out, nil
 }
 
 // ── Group State ──────────────────────────────────────────────

@@ -1,10 +1,13 @@
 import asyncio
+import base64
+import hashlib
 import json
 import time
 
 import pytest
 
 from aun_core import AUNClient, ProtectedHeaders
+import aun_core.client as client_module
 from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL, _PEER_PREKEYS_CACHE_TTL
 from aun_core.errors import AUNError, ClientSignatureError, NotFoundError, StateError, ValidationError
 import aun_core.namespaces.auth_namespace as auth_namespace_module
@@ -42,6 +45,138 @@ def test_peer_cert_cache_ttl_is_one_hour():
 def test_peer_prekeys_cache_ttl_is_one_hour():
     assert _PEER_PREKEYS_CACHE_TTL == 3600
 
+
+@pytest.mark.asyncio
+async def test_v2_build_target_allows_explicit_empty_device_id():
+    from unittest.mock import AsyncMock
+
+    class FakeV2Session:
+        def __init__(self):
+            self.cached = []
+
+        def cache_peer_ik(self, aid, device_id, pub_der):
+            self.cached.append((aid, device_id, pub_der))
+
+    client = AUNClient()
+    fake_session = FakeV2Session()
+    client._v2_session = fake_session
+    client._v2_verify_spk_device = AsyncMock()
+    ik_der = b"\x01\x02\x03"
+
+    target = await client._v2_build_target_from_device(
+        {"device_id": "", "ik_pk": base64.b64encode(ik_der).decode("ascii")},
+        aid="bob.aid.com",
+        device_id="",
+        role="peer",
+        default_key_source="peer_device_prekey",
+    )
+
+    assert target is not None
+    assert target["aid"] == "bob.aid.com"
+    assert target["device_id"] == ""
+    assert fake_session.cached == [("bob.aid.com", "", ik_der)]
+
+
+def test_v2_bootstrap_sender_ik_cache_allows_explicit_empty_device_id():
+    class FakeV2Session:
+        def __init__(self):
+            self.cached = []
+
+        def cache_peer_ik(self, aid, device_id, pub_der):
+            self.cached.append((aid, device_id, pub_der))
+
+    client = AUNClient()
+    fake_session = FakeV2Session()
+    client._v2_session = fake_session
+    ik_der = b"\x01\x02\x03"
+
+    client._v2_cache_peer_ik_from_device(
+        {"device_id": "", "ik_pk": base64.b64encode(ik_der).decode("ascii")},
+        "bob.aid.com",
+    )
+
+    assert fake_session.cached == [("bob.aid.com", "", ik_der)]
+
+
+@pytest.mark.asyncio
+async def test_v2_build_target_accepts_ik_in_spk_fields(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    class FakeV2Session:
+        def __init__(self):
+            self.cached = []
+            self.verified = []
+
+        def cache_peer_ik(self, aid, device_id, pub_der):
+            self.cached.append((aid, device_id, pub_der))
+
+        def mark_peer_spk_verified(self, aid, device_id, spk_id):
+            self.verified.append((aid, device_id, spk_id))
+
+    client = AUNClient()
+    fake_session = FakeV2Session()
+    client._v2_session = fake_session
+    ik_der = b"\x01\x02\x03"
+    ik_b64 = base64.b64encode(ik_der).decode("ascii")
+    ik_id = "sha256:" + hashlib.sha256(ik_der).hexdigest()[:16]
+    monkeypatch.setattr(client, "_v2_trusted_ik_pub_der", AsyncMock(return_value=ik_der))
+
+    target = await client._v2_build_target_from_device(
+        {
+            "device_id": "",
+            "ik_pk": ik_b64,
+            "spk_pk": ik_b64,
+            "spk_id": ik_id,
+            "key_source": "peer_device_prekey",
+        },
+        aid="bob.aid.com",
+        device_id="",
+        role="peer",
+        default_key_source="peer_device_prekey",
+    )
+
+    assert target is not None
+    assert target["aid"] == "bob.aid.com"
+    assert target["device_id"] == ""
+    assert target["spk_id"] == ik_id
+    assert target["spk_pk_der"] == ik_der
+    assert fake_session.cached == [("bob.aid.com", "", ik_der)]
+    assert fake_session.verified == [("bob.aid.com", "", ik_id)]
+
+@pytest.mark.asyncio
+async def test_v2_auto_propose_leader_delay_treats_empty_device_id_as_candidate(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "b-owner.aid.com"
+    client._device_id = "dev-b"
+    client._slot_id = "slot-b"
+    client._v2_session = object()
+
+    async def fake_call(method, params):
+        if method == "group.get_online_members":
+            return {"members": [
+                {"aid": "a-owner.aid.com", "role": "owner", "online": True},
+                {"aid": "b-owner.aid.com", "role": "owner", "online": True},
+            ]}
+        if method == "group.v2.bootstrap":
+            return {"devices": [
+                {"aid": "a-owner.aid.com", "device_id": "", "ik_fp": "ik-empty"},
+                {"aid": "b-owner.aid.com", "device_id": "dev-b", "ik_fp": "ik-b"},
+            ]}
+        return {}
+
+    sleep_calls = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    client.call = AsyncMock(side_effect=fake_call)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    assert await client._v2_auto_propose_leader_delay("group.agentid.pub/12345") is True
+    assert sleep_calls, "空 device_id 候选应排在当前设备前并触发 leader delay"
 
 def test_construct_no_args():
     client = AUNClient()
@@ -88,6 +223,255 @@ def test_connect_uses_cached_gateway():
     normalized = client._normalize_connect_params({"access_token": "tok"})
     assert normalized["gateway"] == "ws://cached.example/aun"
 
+
+def test_connect_options_can_disable_background_sync():
+    client = AUNClient()
+
+    options = client._build_session_options({"background_sync": False})
+
+    assert options["background_sync"] is False
+
+
+def test_background_sync_false_disables_background_tasks():
+    client = AUNClient()
+    client._session_options["background_sync"] = False
+    client._session_options["heartbeat_interval"] = 30
+
+    client._start_background_tasks()
+
+    assert client._heartbeat_task is None
+    assert client._token_refresh_task is None
+
+
+@pytest.mark.asyncio
+async def test_group_spk_register_and_rotate_do_not_clear_bootstrap_cache():
+    class FakeV2Session:
+        def __init__(self):
+            self.calls = []
+
+        async def ensure_group_registered(self, group_id, _call):
+            self.calls.append(("register", group_id))
+
+        async def rotate_group_spk(self, group_id, _call):
+            self.calls.append(("rotate", group_id))
+
+    client = AUNClient()
+    client._state = "connected"
+    client._v2_session = FakeV2Session()
+    client._v2_bootstrap_cache = {"group:group.agentid.pub/1": (["cached-device"], time.time())}
+
+    client._schedule_group_spk_registration("group.agentid.pub/1", reason="unit")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    client._schedule_group_spk_rotation("group.agentid.pub/1", reason="unit")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert client._v2_bootstrap_cache["group:group.agentid.pub/1"][0] == ["cached-device"]
+    assert client._v2_session.calls == [
+        ("register", "group.agentid.pub/1"),
+        ("rotate", "group.agentid.pub/1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_peer_prekey_fallback_does_not_rotate_p2p_spk(tmp_path, monkeypatch):
+    class FakeV2Session:
+        _last_uploaded_spk_id = "sha256:peer-spk"
+
+        def __init__(self):
+            self.rotate_called = False
+            self.register_calls = []
+
+        def get_group_decrypt_keys(self, group_id, spk_id):
+            assert group_id == "group.agentid.pub/1"
+            assert spk_id == "sha256:peer-spk"
+            return (b"\x01" * 32, b"\x02" * 32)
+
+        def get_peer_ik(self, _from_aid, _sender_device_id):
+            return b"sender-public-key"
+
+        def is_last_uploaded_group_spk(self, _group_id, _spk_id):
+            return False
+
+        def is_last_uploaded_spk(self, spk_id):
+            return spk_id == "sha256:peer-spk"
+
+        async def rotate_spk(self, _call):
+            self.rotate_called = True
+
+        async def ensure_group_registered(self, group_id, _call):
+            self.register_calls.append(group_id)
+
+    monkeypatch.setattr(
+        client_module,
+        "v2_decrypt_message",
+        lambda **_kwargs: {"text": "group fallback"},
+    )
+
+    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    fake_session = FakeV2Session()
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-1"
+    client._v2_session = fake_session
+    client._state = "connected"
+
+    envelope = {
+        "type": "e2ee.group_encrypted",
+        "group_id": "group.agentid.pub/1",
+        "aad": {
+            "from": "bob.agentid.pub",
+            "from_device": "bob-dev",
+            "group_id": "group.agentid.pub/1",
+        },
+        "recipient": {
+            "aid": "alice.agentid.pub",
+            "device_id": "dev-1",
+            "key_source": "peer_device_prekey",
+            "spk_id": "sha256:peer-spk",
+        },
+    }
+
+    result = await client._decrypt_v2_message({
+        "seq": 1,
+        "message_id": "m1",
+        "from_aid": "bob.agentid.pub",
+        "group_id": "group.agentid.pub/1",
+        "envelope_json": json.dumps(envelope),
+        "t_server": 123,
+    })
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    result2 = await client._decrypt_v2_message({
+        "seq": 2,
+        "message_id": "m2",
+        "from_aid": "bob.agentid.pub",
+        "group_id": "group.agentid.pub/1",
+        "envelope_json": json.dumps(envelope),
+        "t_server": 124,
+    })
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert result["payload"] == {"text": "group fallback"}
+    assert result2["payload"] == {"text": "group fallback"}
+    assert fake_session.rotate_called is False
+    assert fake_session.register_calls == ["group.agentid.pub/1"]
+
+
+
+def test_v2_e2ee_metadata_exposes_payload_type_with_fallback():
+    client = AUNClient()
+    envelope = {
+        "suite": "P256_HKDF_SHA256_AES_256_GCM",
+        "payload_type": "text",
+        "protected_headers": {"payload_type": "fallback", "trace_id": "trace-1", "_auth": "secret"},
+        "context": {"type": "run", "id": "run-1", "_auth": "secret"},
+    }
+
+    meta = client._v2_thought_e2ee_metadata(envelope)
+
+    assert meta["payload_type"] == "text"
+    assert meta["protected_headers"] == {"payload_type": "fallback", "trace_id": "trace-1"}
+    assert meta["context"] == {"type": "run", "id": "run-1"}
+
+    fallback_meta = client._v2_thought_e2ee_metadata({
+        "suite": "P256_HKDF_SHA256_AES_256_GCM",
+        "protected_headers": {"payload_type": "fallback", "_auth": "secret"},
+    })
+    assert fallback_meta["payload_type"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_decrypt_v2_message_exposes_payload_type_in_e2ee(tmp_path, monkeypatch):
+    class FakeV2Session:
+        def get_decrypt_keys(self, spk_id):
+            assert spk_id == ""
+            return (b"\\x01" * 32, None)
+
+        def get_peer_ik(self, _from_aid, _sender_device_id):
+            return b"sender-public-key"
+
+        def is_last_uploaded_spk(self, _spk_id):
+            return False
+
+    monkeypatch.setattr(
+        client_module,
+        "v2_decrypt_message",
+        lambda **_kwargs: {"type": "text", "text": "decrypted"},
+    )
+
+    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-1"
+    client._v2_session = FakeV2Session()
+    client._state = "connected"
+    envelope = {
+        "type": "e2ee.p2p_encrypted",
+        "version": "v2",
+        "suite": "P256_HKDF_SHA256_AES_256_GCM",
+        "payload_type": "text",
+        "aad": {"from": "bob.agentid.pub", "from_device": "bob-dev"},
+        "recipients": [["alice.agentid.pub", "dev-1", "peer", "aid_master", "fp", "", "n", "w"]],
+        "protected_headers": {"payload_type": "text", "_auth": "secret"},
+    }
+
+    result = await client._decrypt_v2_message({
+        "seq": 1,
+        "message_id": "m1",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": json.dumps(envelope),
+        "t_server": 123,
+    })
+
+    assert result["payload"] == {"type": "text", "text": "decrypted"}
+    assert result["payload_type"] == "text"
+    assert result["protected_headers"] == {"payload_type": "text"}
+    assert result["e2ee"]["payload_type"] == "text"
+
+@pytest.mark.asyncio
+async def test_decrypt_v2_message_undecryptable_event_preserves_metadata(tmp_path):
+    class FakeV2Session:
+        def get_decrypt_keys(self, spk_id):
+            assert spk_id == "missing-spk"
+            raise RuntimeError("spk missing")
+
+    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-1"
+    client._v2_session = FakeV2Session()
+    client._state = "connected"
+    published: list[tuple[str, dict]] = []
+
+    async def _publish(event, payload):
+        published.append((event, payload))
+
+    client._dispatcher.publish = _publish
+    envelope = {
+        "type": "e2ee.p2p_encrypted",
+        "version": "v2",
+        "suite": "P256_HKDF_SHA256_AES_256_GCM",
+        "payload_type": "text",
+        "aad": {"from": "bob.agentid.pub", "from_device": "bob-dev"},
+        "recipients": [["alice.agentid.pub", "dev-1", "peer", "peer_device_prekey", "fp", "missing-spk", "n", "w"]],
+        "protected_headers": {"payload_type": "text", "trace_id": "trace-1", "_auth": "secret"},
+    }
+
+    result = await client._decrypt_v2_message({
+        "seq": 1,
+        "message_id": "m1",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": json.dumps(envelope),
+        "t_server": 123,
+    })
+
+    assert result is None
+    assert published[0][0] == "message.undecryptable"
+    event = published[0][1]
+    assert event["payload_type"] == "text"
+    assert event["protected_headers"] == {"payload_type": "text", "trace_id": "trace-1"}
+    assert "_auth" not in event["protected_headers"]
 
 def test_heartbeat_interval_zero_disables_heartbeat():
     client = AUNClient()
@@ -689,6 +1073,78 @@ def test_call_does_not_forward_message_send_delivery_mode():
     })]
 
 
+def test_message_send_content_alias_is_normalized_for_plaintext():
+    client = AUNClient()
+    client._state = "connected"
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    asyncio.run(client.call("message.send", {
+        "to": "bob.remote.example",
+        "content": {"text": "hello"},
+        "encrypt": False,
+    }))
+
+    assert calls == [("message.send", {
+        "to": "bob.remote.example",
+        "payload": {"type": "text", "text": "hello"},
+    })]
+
+
+def test_message_send_content_alias_reaches_encrypted_payload():
+    client = AUNClient()
+    client._state = "connected"
+    client._v2_session = object()
+    captured = []
+
+    async def _fake_send(params):
+        captured.append(dict(params))
+        return {"ok": True}
+
+    client._send_encrypted_v2 = _fake_send
+
+    asyncio.run(client.call("message.send", {
+        "to": "bob.remote.example",
+        "content": {"text": "hello"},
+    }))
+
+    assert captured == [{
+        "to": "bob.remote.example",
+        "payload": {"type": "text", "text": "hello"},
+    }]
+
+
+def test_group_send_text_payload_gets_default_payload_type():
+    client = AUNClient()
+    client._state = "connected"
+    client._v2_session = object()
+    captured = []
+
+    async def _fake_send(params):
+        captured.append(dict(params))
+        return {"ok": True}
+
+    client._send_group_encrypted_v2 = _fake_send
+
+    asyncio.run(client.call("group.send", {
+        "group_id": "g1.example.com",
+        "payload": {"text": "hello group"},
+    }))
+
+    assert captured == [{
+        "group_id": "group.example.com/g1",
+        "payload": {"type": "text", "text": "hello group"},
+        "device_id": client._device_id,
+        "slot_id": client._slot_id,
+    }]
+
+
 def test_message_thought_put_plaintext_passes_through():
     """message.thought.put encrypt=false 应走通用 RPC 路径，保留 payload/protected_headers。"""
     client = AUNClient()
@@ -753,6 +1209,183 @@ def test_group_thought_put_plaintext_passes_through():
     assert params["payload"] == {"type": "thought", "text": "群明文 thought"}
     assert params["protected_headers"] == {"trace": "t1"}
 
+@pytest.mark.asyncio
+async def test_message_thought_get_decrypts_v2_envelope_and_preserves_metadata():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "bob.agentid.pub"
+    client._device_id = "dev-b"
+    client._slot_id = "slot-b"
+    client._v2_session = object()
+
+    calls: list[tuple[str, dict]] = []
+    decrypt_calls: list[tuple[dict, str]] = []
+    envelope = {
+        "type": "e2ee.p2p_encrypted",
+        "version": "v2",
+        "suite": "x25519-hkdf-aesgcm",
+        "payload_type": "thought",
+        "protected_headers": {"payload_type": "thought", "trace_id": "trace-1", "_auth": "secret"},
+        "context": {"type": "run", "id": "run-1", "_auth": "secret"},
+    }
+    raw_item = {
+        "thought_id": "mt-1",
+        "message_id": "m-1",
+        "from": "alice.agentid.pub",
+        "to": "bob.agentid.pub",
+        "payload": envelope,
+        "context": {"type": "run", "id": "run-1"},
+        "created_at": 12345,
+        "client_signature": {"sig": "keep"},
+    }
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            return {
+                "found": True,
+                "sender_aid": "alice.agentid.pub",
+                "peer_aid": "bob.agentid.pub",
+                "thoughts": [dict(raw_item)],
+            }
+
+    async def _decrypt(envelope, from_aid):
+        decrypt_calls.append((envelope, from_aid))
+        return {"type": "thought", "text": "hello"}
+
+    client._transport = _Transport()
+    client._decrypt_v2_envelope_for_thought = _decrypt
+
+    result = await client.call("message.thought.get", {
+        "sender_aid": "alice.agentid.pub",
+        "context": {"type": "run", "id": "run-1"},
+    })
+
+    thought = result["thoughts"][0]
+    assert calls[0][0] == "message.thought.get"
+    assert decrypt_calls == [(envelope, "alice.agentid.pub")]
+    assert thought["payload"] == {"type": "thought", "text": "hello"}
+    assert thought["thought_id"] == "mt-1"
+    assert thought["message_id"] == "m-1"
+    assert thought["from"] == "alice.agentid.pub"
+    assert thought["to"] == "bob.agentid.pub"
+    assert thought["context"] == {"type": "run", "id": "run-1"}
+    assert thought["created_at"] == 12345
+    assert thought["client_signature"] == {"sig": "keep"}
+    assert thought["encrypted"] is True
+    assert thought["payload_type"] == "thought"
+    assert thought["protected_headers"] == {"payload_type": "thought", "trace_id": "trace-1"}
+    assert thought["e2ee"]["version"] == "v2"
+    assert thought["e2ee"]["payload_type"] == "thought"
+    assert thought["e2ee"]["protected_headers"] == {"payload_type": "thought", "trace_id": "trace-1"}
+    assert thought["e2ee"]["context"] == {"type": "run", "id": "run-1"}
+
+    repeat = await client.call("message.thought.get", {
+        "sender_aid": "alice.agentid.pub",
+        "context": {"type": "run", "id": "run-1"},
+    })
+    assert repeat["thoughts"][0]["payload"]["text"] == "hello"
+    assert len(decrypt_calls) == 2
+
+@pytest.mark.asyncio
+async def test_message_thought_get_decrypt_failed_preserves_metadata():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "bob.agentid.pub"
+    client._device_id = "dev-b"
+    client._v2_session = object()
+    envelope = {
+        "type": "e2ee.p2p_encrypted",
+        "version": "v2",
+        "suite": "x25519-hkdf-aesgcm",
+        "payload_type": "thought",
+        "protected_headers": {"payload_type": "thought", "trace_id": "trace-1", "_auth": "secret"},
+    }
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            return {
+                "found": True,
+                "sender_aid": "alice.agentid.pub",
+                "peer_aid": "bob.agentid.pub",
+                "thoughts": [{"thought_id": "mt-1", "payload": envelope}],
+            }
+
+    async def _decrypt(envelope, from_aid):
+        return None
+
+    client._transport = _Transport()
+    client._decrypt_v2_envelope_for_thought = _decrypt
+
+    result = await client.call("message.thought.get", {
+        "sender_aid": "alice.agentid.pub",
+        "context": {"type": "run", "id": "run-1"},
+    })
+
+    thought = result["thoughts"][0]
+    assert thought["decrypt_failed"] is True
+    assert thought["payload_type"] == "thought"
+    assert thought["protected_headers"] == {"payload_type": "thought", "trace_id": "trace-1"}
+    assert "_auth" not in thought["protected_headers"]
+
+@pytest.mark.asyncio
+async def test_group_thought_get_decrypts_v2_envelope_and_preserves_metadata():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "bob.agentid.pub"
+    client._device_id = "dev-b"
+    client._slot_id = "slot-b"
+    client._v2_session = object()
+
+    decrypt_calls: list[tuple[dict, str]] = []
+    envelope = {
+        "type": "e2ee.group_encrypted",
+        "version": "v2",
+        "suite": "x25519-hkdf-aesgcm",
+        "context": {"type": "group", "id": "g-run"},
+    }
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            return {
+                "found": True,
+                "group_id": "group.agentid.pub/g-1",
+                "sender_aid": "alice.agentid.pub",
+                "thoughts": [{
+                    "thought_id": "gt-1",
+                    "message_id": "gm-1",
+                    "sender_aid": "alice.agentid.pub",
+                    "payload": envelope,
+                    "context": {"type": "group", "id": "g-run"},
+                    "created_at": 67890,
+                    "audit": {"keep": True},
+                }],
+            }
+
+    async def _decrypt(envelope, from_aid):
+        decrypt_calls.append((envelope, from_aid))
+        return {"type": "thought", "text": "group hello"}
+
+    client._transport = _Transport()
+    client._decrypt_v2_envelope_for_thought = _decrypt
+
+    result = await client.call("group.thought.get", {
+        "group_id": "group.agentid.pub/g-1",
+        "sender_aid": "alice.agentid.pub",
+        "context": {"type": "group", "id": "g-run"},
+    })
+
+    thought = result["thoughts"][0]
+    assert decrypt_calls == [(envelope, "alice.agentid.pub")]
+    assert thought["payload"] == {"type": "thought", "text": "group hello"}
+    assert thought["thought_id"] == "gt-1"
+    assert thought["message_id"] == "gm-1"
+    assert thought["sender_aid"] == "alice.agentid.pub"
+    assert thought["context"] == {"type": "group", "id": "g-run"}
+    assert thought["created_at"] == 67890
+    assert thought["audit"] == {"keep": True}
+    assert thought["encrypted"] is True
+    assert thought["e2ee"]["version"] == "v2"
 
 def test_group_send_plaintext_preserves_protected_headers():
     """group.send encrypt=false 明文路径应保留 protected_headers/headers。"""
@@ -784,6 +1417,57 @@ def test_group_send_plaintext_preserves_protected_headers():
     assert params["protected_headers"] == {"trace": "t1"}
     assert params["headers"] == {"misc": "h"}
     assert params["payload"] == {"type": "text", "text": "群明文"}
+
+
+def test_group_send_content_alias_is_normalized_for_plaintext():
+    client = AUNClient()
+    client._state = "connected"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    asyncio.run(client.call("group.send", {
+        "group_id": "group.example.com/g-test",
+        "content": {"text": "群明文"},
+        "encrypt": False,
+    }))
+
+    assert len(calls) == 1
+    method, params = calls[0]
+    assert method == "group.send"
+    assert "content" not in params
+    assert params["payload"] == {"type": "text", "text": "群明文"}
+
+
+def test_group_send_content_alias_reaches_encrypted_payload():
+    client = AUNClient()
+    client._state = "connected"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    captured = []
+
+    async def _fake_send(params):
+        captured.append(dict(params))
+        return {"ok": True}
+
+    client._send_group_encrypted_v2 = _fake_send
+
+    asyncio.run(client.call("group.send", {
+        "group_id": "group.example.com/g-test",
+        "content": {"text": "群密文"},
+    }))
+
+    assert len(captured) == 1
+    assert "content" not in captured[0]
+    assert captured[0]["payload"] == {"type": "text", "text": "群密文"}
 
 
 def test_protected_headers_from_params_accepts_wrapper():
@@ -828,7 +1512,7 @@ def test_call_injects_message_slot_context():
     assert calls[1][1]["slot_id"] == "slot-a"
 
 
-def test_message_pull_empty_result_applies_server_ack_floor():
+def test_message_pull_empty_result_applies_server_ack_floor_without_direct_ack():
     client = AUNClient()
     client._state = "connected"
     client._aid = "alice.agentid.pub"
@@ -850,7 +1534,1182 @@ def test_message_pull_empty_result_applies_server_ack_floor():
 
     assert result["server_ack_seq"] == 7
     assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 7
-    assert calls[-1] == ("message.ack", {"seq": 7, "device_id": "device-1", "slot_id": "slot-a"})
+    assert calls == [("message.pull", {
+        "after_seq": 0,
+        "limit": 5,
+        "device_id": "device-1",
+        "slot_id": "slot-a",
+    })]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_batches_auto_ack_once_with_final_contiguous_seq():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"m-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "legacy_v1": {
+                                "to": "alice.agentid.pub",
+                                "payload": {"type": "text", "text": f"m-{seq}"},
+                            },
+                        }
+                        for seq in (1, 2, 3)
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("message.pull", {"after_seq": 0, "limit": 10})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
+        await asyncio.sleep(0.01)
+
+    ack_calls = [(method, params) for method, params in calls if method == "message.v2.ack"]
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2, 3]
+    assert ack_calls == [("message.v2.ack", {"up_to_seq": 3})]
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_batches_auto_ack_once_with_final_contiguous_seq():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"gm-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "type": "message",
+                            "payload": {"type": "text", "text": f"gm-{seq}"},
+                        }
+                        for seq in (1, 2, 3)
+                    ],
+                }
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("group.pull", {"group_id": "group.agentid.pub/g1", "after_seq": 0, "limit": 10})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(method == "group.v2.ack" for method, _ in calls):
+        await asyncio.sleep(0.01)
+
+    ack_calls = [(method, params) for method, params in calls if method == "group.v2.ack"]
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2, 3]
+    assert ack_calls == [("group.v2.ack", {"group_id": "group.agentid.pub/g1", "up_to_seq": 3})]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_continues_pages_and_acks_each_page():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                after_seq = int(params.get("after_seq") or 0)
+                if after_seq == 0:
+                    seqs = (1, 2)
+                elif after_seq == 2:
+                    seqs = (3,)
+                else:
+                    seqs = ()
+                return {
+                    "has_more": after_seq == 0,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"m-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "legacy_v1": {
+                                "to": "alice.agentid.pub",
+                                "payload": {"type": "text", "text": f"m-{seq}"},
+                            },
+                        }
+                        for seq in seqs
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("message.pull", {"after_seq": 0, "limit": 2})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and len([c for c in calls if c[0] == "message.v2.ack"]) < 2:
+        await asyncio.sleep(0.01)
+
+    pull_calls = [(method, params) for method, params in calls if method == "message.v2.pull"]
+    ack_calls = [(method, params) for method, params in calls if method == "message.v2.ack"]
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2, 3]
+    assert result["raw_count"] == 3
+    assert result["latest_seq"] == 3
+    assert pull_calls == [
+        ("message.v2.pull", {"after_seq": 0, "limit": 2}),
+        ("message.v2.pull", {"after_seq": 2, "limit": 2}),
+    ]
+    assert ack_calls == [
+        ("message.v2.ack", {"up_to_seq": 2}),
+        ("message.v2.ack", {"up_to_seq": 3}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_continues_pages_and_acks_each_page():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                after_seq = int(params.get("after_seq") or 0)
+                if after_seq == 0:
+                    seqs = (1, 2)
+                elif after_seq == 2:
+                    seqs = (3,)
+                else:
+                    seqs = ()
+                return {
+                    "has_more": after_seq == 0,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"gm-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "type": "message",
+                            "payload": {"type": "text", "text": f"gm-{seq}"},
+                        }
+                        for seq in seqs
+                    ],
+                }
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("group.pull", {"group_id": "group.agentid.pub/g1", "after_seq": 0, "limit": 2})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and len([c for c in calls if c[0] == "group.v2.ack"]) < 2:
+        await asyncio.sleep(0.01)
+
+    pull_calls = [(method, params) for method, params in calls if method == "group.v2.pull"]
+    ack_calls = [(method, params) for method, params in calls if method == "group.v2.ack"]
+    assert [msg["seq"] for msg in result["messages"]] == [1, 2, 3]
+    assert result["raw_count"] == 3
+    assert result["latest_seq"] == 3
+    assert pull_calls == [
+        ("group.v2.pull", {
+            "group_id": "group.agentid.pub/g1",
+            "after_seq": 0,
+            "limit": 2,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+        }),
+        ("group.v2.pull", {
+            "group_id": "group.agentid.pub/g1",
+            "after_seq": 2,
+            "limit": 2,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+        }),
+    ]
+    assert ack_calls == [
+        ("group.v2.ack", {"group_id": "group.agentid.pub/g1", "up_to_seq": 2}),
+        ("group.v2.ack", {"group_id": "group.agentid.pub/g1", "up_to_seq": 3}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_empty_page_does_not_ack_existing_contiguous_seq():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    client._seq_tracker.force_contiguous_seq("p2p:alice.agentid.pub", 5)
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {"has_more": False, "messages": []}
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("message.pull", {"after_seq": 5, "limit": 10})
+    await asyncio.sleep(0.05)
+
+    assert result["raw_count"] == 0
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_stale_raw_without_contiguous_advance_does_not_ack():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    client._seq_tracker.force_contiguous_seq("p2p:alice.agentid.pub", 5)
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": 5,
+                            "message_id": "m-5",
+                            "from_aid": "bob.agentid.pub",
+                            "legacy_v1": {"payload": {"type": "text", "text": "old"}},
+                        },
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("message.pull", {"after_seq": 5, "limit": 10})
+    await asyncio.sleep(0.05)
+
+    assert result["raw_count"] == 1
+    assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 5
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == []
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_publishes_after_contiguous_advance_and_acks_once():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    calls: list[tuple[str, dict]] = []
+    observed_contig: list[int] = []
+    client.on("message.received", lambda _msg: observed_contig.append(client._seq_tracker.get_contiguous_seq(ns)))
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"m-event-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "legacy_v1": {
+                                "to": "alice.agentid.pub",
+                                "payload": {"type": "text", "text": f"m-event-{seq}"},
+                            },
+                        }
+                        for seq in (1, 2, 3)
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    await client.call("message.pull", {"after_seq": 0, "limit": 10})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
+        await asyncio.sleep(0.01)
+
+    assert observed_contig == [3, 3, 3]
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
+        ("message.v2.ack", {"up_to_seq": 3}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_empty_page_does_not_ack_existing_contiguous_seq():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    client._seq_tracker.force_contiguous_seq("group:group.agentid.pub/g1", 5)
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                return {"has_more": False, "messages": []}
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("group.pull", {"group_id": "group.agentid.pub/g1", "after_seq": 5, "limit": 10})
+    await asyncio.sleep(0.05)
+
+    assert result["raw_count"] == 0
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == []
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_stale_raw_without_contiguous_advance_does_not_ack():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    client._seq_tracker.force_contiguous_seq("group:group.agentid.pub/g1", 5)
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": 5,
+                            "message_id": "gm-5",
+                            "from_aid": "bob.agentid.pub",
+                            "payload": {"type": "text", "text": "old"},
+                        },
+                    ],
+                }
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("group.pull", {"group_id": "group.agentid.pub/g1", "after_seq": 5, "limit": 10})
+    await asyncio.sleep(0.05)
+
+    assert result["raw_count"] == 1
+    assert client._seq_tracker.get_contiguous_seq("group:group.agentid.pub/g1") == 5
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == []
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_publishes_after_contiguous_advance_and_acks_once():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "group:group.agentid.pub/g1"
+    calls: list[tuple[str, dict]] = []
+    observed_contig: list[int] = []
+    client.on("group.message_created", lambda _msg: observed_contig.append(client._seq_tracker.get_contiguous_seq(ns)))
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {
+                            "version": "v1",
+                            "seq": seq,
+                            "message_id": f"gm-event-{seq}",
+                            "from_aid": "bob.agentid.pub",
+                            "t_server": seq,
+                            "type": "message",
+                            "payload": {"type": "text", "text": f"gm-event-{seq}"},
+                        }
+                        for seq in (1, 2, 3)
+                    ],
+                }
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    await client.call("group.pull", {"group_id": "group.agentid.pub/g1", "after_seq": 0, "limit": 10})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(method == "group.v2.ack" for method, _ in calls):
+        await asyncio.sleep(0.01)
+
+    assert observed_contig == [3, 3, 3]
+    assert [(method, params) for method, params in calls if method == "group.v2.ack"] == [
+        ("group.v2.ack", {"group_id": "group.agentid.pub/g1", "up_to_seq": 3}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_payload_push_gap_falls_through_to_pull():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.on_message_seq(ns, 1)
+
+    async def fake_decrypt(msg):
+        return {
+            "message_id": msg["message_id"],
+            "from": msg["from_aid"],
+            "to": "alice.agentid.pub",
+            "seq": msg["seq"],
+            "payload": {"type": "text", "text": "push-3"},
+            "encrypted": True,
+        }
+
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._decrypt_v2_message = fake_decrypt
+    client._pull_v2_internal = fake_pull
+
+    await client._on_v2_push_notification({
+        "seq": 3,
+        "message_id": "m-push-3",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": "{}",
+    })
+
+    assert pull_calls == [{}]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 1
+    assert client._seq_tracker.get_max_seen_seq(ns) == 3
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_payload_push_contiguous_publishes_without_pull():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.on_message_seq(ns, 1)
+    events: list[dict] = []
+    pull_calls: list[dict] = []
+
+    client._dispatcher.subscribe("message.received", lambda data: events.append(data))
+
+    async def fake_decrypt(msg):
+        return {
+            "message_id": msg["message_id"],
+            "from": msg["from_aid"],
+            "to": "alice.agentid.pub",
+            "seq": msg["seq"],
+            "payload": {"type": "text", "text": "push-2"},
+            "encrypted": True,
+        }
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._decrypt_v2_message = fake_decrypt
+    client._pull_v2_internal = fake_pull
+
+    await client._on_v2_push_notification({
+        "seq": 2,
+        "message_id": "m-push-2",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": "{}",
+    })
+
+    assert pull_calls == []
+    assert client._seq_tracker.get_contiguous_seq(ns) == 2
+    assert client._seq_tracker.get_max_seen_seq(ns) == 2
+    assert [event["payload"]["text"] for event in events] == ["push-2"]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_payload_push_inflight_gap_still_records_upper_bound_and_pending():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.on_message_seq(ns, 1)
+    client._gap_fill_done[f"p2p_pull:{ns}"] = time.time()
+    events: list[dict] = []
+    pull_calls: list[dict] = []
+
+    client._dispatcher.subscribe("message.received", lambda data: events.append(data))
+
+    async def fake_decrypt(msg):
+        return {
+            "message_id": msg["message_id"],
+            "from": msg["from_aid"],
+            "to": "alice.agentid.pub",
+            "seq": msg["seq"],
+            "payload": {"type": "text", "text": "push-3"},
+            "encrypted": True,
+        }
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._decrypt_v2_message = fake_decrypt
+    client._pull_v2_internal = fake_pull
+
+    await client._on_v2_push_notification({
+        "seq": 3,
+        "message_id": "m-push-3",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": "{}",
+    })
+
+    assert pull_calls == []
+    assert events == []
+    assert client._seq_tracker.get_contiguous_seq(ns) == 1
+    assert client._seq_tracker.get_max_seen_seq(ns) == 3
+    assert client._is_pending_ordered_seq(ns, 3)
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_payload_push_decrypt_failure_with_gap_triggers_pull():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.on_message_seq(ns, 1)
+    pull_calls: list[dict] = []
+
+    async def fake_decrypt(msg):
+        return None
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._decrypt_v2_message = fake_decrypt
+    client._pull_v2_internal = fake_pull
+
+    await client._on_v2_push_notification({
+        "seq": 3,
+        "message_id": "m-push-3",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": "{}",
+    })
+
+    assert pull_calls == [{}]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 1
+    assert client._seq_tracker.get_max_seen_seq(ns) == 3
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_preserves_raw_seq_metadata_when_decrypt_fails():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "server_ack_seq": 9,
+                    "messages": [
+                        {"seq": 2, "message_id": "m2", "from_aid": "bob.agentid.pub", "envelope_json": "{}"},
+                        {"seq": 3, "message_id": "m3", "from_aid": "bob.agentid.pub", "envelope_json": "{}"},
+                    ],
+                }
+            return {"ok": True}
+
+    async def fake_decrypt(msg):
+        return None
+
+    client._transport = _Transport()
+    client._decrypt_v2_message = fake_decrypt
+
+    result = await client.call("message.pull", {"after_seq": 1, "limit": 10})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
+        await asyncio.sleep(0.01)
+
+    assert result["messages"] == []
+    assert result["latest_seq"] == 3
+    assert result["raw_count"] == 2
+    assert result["server_ack_seq"] == 9
+    assert result["_contig_before"] == 0
+    assert client._seq_tracker.get_contiguous_seq(ns) == 9
+    assert client._seq_tracker.get_max_seen_seq(ns) == 9
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
+        ("message.v2.ack", {"up_to_seq": 9})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_drains_pending_payload_after_gap_is_filled_and_acks_once():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.on_message_seq(ns, 1)
+    client._seq_tracker.on_message_seq(ns, 3)
+    client._enqueue_ordered_message(
+        ns,
+        "message.received",
+        3,
+        {
+            "message_id": "m3",
+            "from": "bob.agentid.pub",
+            "to": "alice.agentid.pub",
+            "seq": 3,
+            "payload": {"type": "text", "text": "push-3"},
+        },
+    )
+    events: list[dict] = []
+    calls: list[tuple[str, dict]] = []
+    client._dispatcher.subscribe("message.received", lambda data: events.append(data))
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {"seq": 2, "message_id": "m2", "from_aid": "bob.agentid.pub", "envelope_json": "{}"},
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    async def fake_decrypt(msg):
+        return {
+            "message_id": msg["message_id"],
+            "from": msg["from_aid"],
+            "to": "alice.agentid.pub",
+            "seq": msg["seq"],
+            "payload": {"type": "text", "text": "pull-2"},
+            "encrypted": True,
+        }
+
+    client._transport = _Transport()
+    client._decrypt_v2_message = fake_decrypt
+
+    result = await client.call("message.pull", {"after_seq": 1, "limit": 10})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(method == "message.v2.ack" for method, _ in calls):
+        await asyncio.sleep(0.01)
+
+    assert [msg["seq"] for msg in result["messages"]] == [2]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 3
+    assert [event["payload"]["text"] for event in events] == ["pull-2", "push-3"]
+    assert not client._is_pending_ordered_seq(ns, 3)
+    assert [(method, params) for method, params in calls if method == "message.v2.ack"] == [
+        ("message.v2.ack", {"up_to_seq": 3})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_large_gap_skipped_rows_still_advances_to_max_seq():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {"version": "legacy", "seq": 10005, "message_id": "m-10005", "from_aid": "bob.agentid.pub"},
+                        {"version": "legacy", "seq": 10008, "message_id": "m-10008", "from_aid": "bob.agentid.pub"},
+                    ],
+                }
+            if method == "message.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client._pull_v2_internal({"after_seq": 0, "limit": 10})
+
+    assert result["messages"] == []
+    assert result["latest_seq"] == 10008
+    assert result["raw_count"] == 2
+    assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 10008
+
+
+@pytest.mark.asyncio
+async def test_v2_group_pull_large_gap_skipped_rows_still_advances_to_max_seq():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "group.v2.pull":
+                return {
+                    "has_more": False,
+                    "messages": [
+                        {"version": "v1", "seq": 10005, "message_id": "gm-10005", "from_aid": "bob.agentid.pub", "payload": {"type": "e2ee.group_encrypted"}},
+                        {"version": "v1", "seq": 10008, "message_id": "gm-10008", "from_aid": "bob.agentid.pub", "payload": {"type": "e2ee.group_encrypted"}},
+                    ],
+                }
+            if method == "group.v2.ack":
+                return {"acked": params.get("up_to_seq", 0)}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client._pull_group_v2_internal({"group_id": "group.agentid.pub/g1", "after_seq": 0, "limit": 10})
+
+    assert result["messages"] == []
+    assert result["latest_seq"] == 10008
+    assert result["raw_count"] == 2
+    assert client._seq_tracker.get_contiguous_seq("group:group.agentid.pub/g1") == 10008
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_payload_push_repairs_dirty_contiguous_then_publishes():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    client._save_seq_tracker_state = lambda: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.force_contiguous_seq(ns, 99999)
+    pull_calls: list[dict] = []
+    ack_calls: list[tuple[str, dict]] = []
+    events: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: events.append(data))
+
+    async def fake_decrypt(msg):
+        return {
+            "message_id": msg["message_id"],
+            "from": msg["from_aid"],
+            "to": "alice.agentid.pub",
+            "seq": msg["seq"],
+            "payload": {"type": "text", "text": "push-3"},
+            "encrypted": True,
+        }
+
+    async def fake_pull(params):
+        pull_calls.append({
+            "params": dict(params),
+            "contiguous_seq": client._seq_tracker.get_contiguous_seq(ns),
+        })
+        return {"messages": []}
+
+    client._decrypt_v2_message = fake_decrypt
+    client._pull_v2_internal = fake_pull
+    client._fire_ack = lambda method, params, reason: ack_calls.append((method, dict(params)))
+
+    await client._on_v2_push_notification({
+        "seq": 3,
+        "message_id": "m-push-3",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": "{}",
+    })
+
+    assert pull_calls == []
+    assert [event["payload"]["text"] for event in events] == ["push-3"]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 3
+    assert client._seq_tracker.get_max_seen_seq(ns) == 99999
+    assert ack_calls == [("message.v2.ack", {"up_to_seq": 3})]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_payload_push_equal_contiguous_is_idempotent():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.force_contiguous_seq(ns, 3)
+    events: list[dict] = []
+    pull_calls: list[dict] = []
+    decrypt_calls: list[dict] = []
+    ack_calls: list[tuple[str, dict]] = []
+    client._dispatcher.subscribe("message.received", lambda data: events.append(data))
+
+    async def fake_decrypt(msg):
+        decrypt_calls.append(dict(msg))
+        return {
+            "message_id": msg["message_id"],
+            "from": msg["from_aid"],
+            "to": "alice.agentid.pub",
+            "seq": msg["seq"],
+            "payload": {"type": "text", "text": "push-3"},
+            "encrypted": True,
+        }
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._decrypt_v2_message = fake_decrypt
+    client._pull_v2_internal = fake_pull
+    client._fire_ack = lambda method, params, reason: ack_calls.append((method, dict(params)))
+
+    await client._on_v2_push_notification({
+        "seq": 3,
+        "message_id": "m-push-3",
+        "from_aid": "bob.agentid.pub",
+        "envelope_json": "{}",
+    })
+
+    assert decrypt_calls == []
+    assert pull_calls == []
+    assert events == []
+    assert ack_calls == []
+    assert client._seq_tracker.get_contiguous_seq(ns) == 3
+    assert client._seq_tracker.get_max_seen_seq(ns) == 3
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_notification_push_equal_contiguous_is_idempotent():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.force_contiguous_seq(ns, 3)
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._pull_v2_internal = fake_pull
+
+    await client._on_v2_push_notification({
+        "seq": 3,
+        "message_id": "m-push-3",
+        "from_aid": "bob.agentid.pub",
+    })
+
+    assert pull_calls == []
+    assert client._seq_tracker.get_contiguous_seq(ns) == 3
+    assert client._seq_tracker.get_max_seen_seq(ns) == 3
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_notification_push_repairs_dirty_contiguous_below_push_then_pulls():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.force_contiguous_seq(ns, 99999)
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append({
+            "params": dict(params),
+            "contiguous_seq": client._seq_tracker.get_contiguous_seq(ns),
+        })
+        return {"messages": []}
+
+    client._pull_v2_internal = fake_pull
+
+    await client._on_v2_push_notification({
+        "seq": 3,
+        "message_id": "m-push-3",
+        "from_aid": "bob.agentid.pub",
+    })
+
+    assert pull_calls == [{"params": {}, "contiguous_seq": 2}]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 2
+    assert client._seq_tracker.get_max_seen_seq(ns) == 99999
+
+
+@pytest.mark.asyncio
+async def test_v2_group_notification_push_equal_contiguous_is_idempotent():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    group_id = "group.agentid.pub/g1"
+    ns = f"group:{group_id}"
+    client._seq_tracker.force_contiguous_seq(ns, 3)
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._pull_group_v2_internal = fake_pull
+
+    await client._on_raw_group_v2_message_created({
+        "group_id": group_id,
+        "seq": 3,
+        "message_id": "gm-push-3",
+        "sender_aid": "bob.agentid.pub",
+    })
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert pull_calls == []
+    assert client._seq_tracker.get_contiguous_seq(ns) == 3
+    assert client._seq_tracker.get_max_seen_seq(ns) == 3
+
+
+@pytest.mark.asyncio
+async def test_v2_group_notification_push_repairs_dirty_contiguous_below_push_then_pulls():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    group_id = "group.agentid.pub/g1"
+    ns = f"group:{group_id}"
+    client._seq_tracker.force_contiguous_seq(ns, 99999)
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append({
+            "params": dict(params),
+            "contiguous_seq": client._seq_tracker.get_contiguous_seq(ns),
+        })
+        return {"messages": []}
+
+    client._pull_group_v2_internal = fake_pull
+
+    await client._on_raw_group_v2_message_created({
+        "group_id": group_id,
+        "seq": 3,
+        "message_id": "gm-push-3",
+        "sender_aid": "bob.agentid.pub",
+    })
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not pull_calls:
+        await asyncio.sleep(0.01)
+
+    assert pull_calls == [{
+        "params": {"group_id": group_id, "after_seq": 2, "limit": 50},
+        "contiguous_seq": 2,
+    }]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 2
+    assert client._seq_tracker.get_max_seen_seq(ns) == 99999
+@pytest.mark.asyncio
+async def test_group_call_injects_empty_device_id_value(tmp_path):
+    client = AUNClient({"aun_path": str(tmp_path / "group_empty_device")})
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = ""
+    client._slot_id = "slot-a"
+    client._v2_session = None
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params):
+            calls.append((method, dict(params)))
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    await client.call("group.get_state", {"group_id": "group.agentid.pub/1"})
+
+    assert calls == [
+        ("group.get_state", {
+            "group_id": "group.agentid.pub/1",
+            "device_id": "",
+            "slot_id": "slot-a",
+        }),
+    ]
+
+
+def test_attach_current_instance_context_includes_empty_device_id(tmp_path):
+    client = AUNClient({"aun_path": str(tmp_path / "attach_empty_device")})
+    client._device_id = ""
+    client._slot_id = "slot-a"
+
+    payload = client._attach_current_instance_context({"seq": 1})
+
+    assert "device_id" in payload
+    assert payload["device_id"] == ""
+    assert payload["slot_id"] == "slot-a"
+
+
+def test_message_targets_current_instance_treats_empty_device_id_as_explicit(tmp_path):
+    client = AUNClient({"aun_path": str(tmp_path / "target_empty_device")})
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+
+    assert client._message_targets_current_instance({}) is True
+    assert client._message_targets_current_instance({"device_id": "device-1"}) is True
+    assert client._message_targets_current_instance({"device_id": ""}) is False
+
+    client._device_id = ""
+    assert client._message_targets_current_instance({"device_id": ""}) is True
+
+
+@pytest.mark.asyncio
+async def test_p2p_gap_fill_empty_result_acks_server_ack_floor():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._persist_seq = lambda ns: None
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.pull":
+                return {"messages": [], "count": 0, "latest_seq": 7, "server_ack_seq": 7}
+            return {"success": True, "ack_seq": params.get("seq")}
+
+    client._transport = _Transport()
+
+    await client._fill_p2p_gap()
+
+    assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 7
+    assert calls == [
+        ("message.pull", {
+            "after_seq": 0,
+            "limit": 50,
+            "device_id": "device-1",
+            "slot_id": "slot-a",
+        }),
+        ("message.ack", {"seq": 7, "device_id": "device-1", "slot_id": "slot-a"}),
+    ]
 
 
 def test_call_rejects_message_slot_context_override():
@@ -1152,7 +3011,16 @@ async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
     async def fake_transport_call(method, params):
         calls.append((method, dict(params)))
         if method == "group.pull_events":
-            return {"events": [], "count": 0, "cursor": {"current_seq": 3}}
+            return {
+                "events": [{
+                    "group_id": "g1",
+                    "event_seq": 3,
+                    "event_type": "group.announcement_updated",
+                    "action": "announcement_updated",
+                }],
+                "count": 1,
+                "cursor": {"current_seq": 3},
+            }
         if method == "group.ack_events":
             return {"ok": True}
         return {}
@@ -1177,6 +3045,103 @@ async def test_group_changed_gap_fills_events_and_acks_contiguous_cursor():
     assert ack_call == {"group_id": "g1", "event_seq": 3, "device_id": "device-1", "slot_id": "slot-a"}
     assert client._seq_tracker.get_contiguous_seq("group_event:g1") == 3
     assert client._gap_fill_done == {}
+
+
+@pytest.mark.asyncio
+async def test_group_pull_events_empty_page_advances_cursor_without_ack():
+    """group.pull_events 空页可修正本地 cursor，但不应发送 ack_events。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
+    client._state = "connected"
+    client._closing = False
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._seq_tracker = SeqTracker()
+    client._seq_tracker.restore_state({"group_event:g1": 5})
+    client._gap_fill_done = {}
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock()
+    client._persist_seq = lambda ns: None
+    client._verify_event_signature = AsyncMock(return_value=True)
+    transport = MagicMock()
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_transport_call(method, params):
+        calls.append((method, dict(params)))
+        if method == "group.pull_events":
+            return {"events": [], "count": 0, "cursor": {"current_seq": 9}}
+        if method == "group.ack_events":
+            return {"ok": True}
+        return {}
+
+    transport.call = AsyncMock(side_effect=fake_transport_call)
+    client._transport = transport
+
+    await client._fill_group_event_gap("g1")
+
+    assert client._seq_tracker.get_contiguous_seq("group_event:g1") == 9
+    assert [method for method, _ in calls].count("group.ack_events") == 0
+
+
+@pytest.mark.asyncio
+async def test_group_pull_events_acks_once_after_event_publish_final_contiguous():
+    """事件发布阶段可继续推进 tracker，pull 结束后只 ack 一次最终 contiguous_seq。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aun_core.client import AUNClient
+    from aun_core.seq_tracker import SeqTracker
+
+    client = AUNClient.__new__(AUNClient)
+    from aun_core.logger import NullLogger; client._log = NullLogger()
+    client._state = "connected"
+    client._closing = False
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._seq_tracker = SeqTracker()
+    ns = "group_event:g1"
+    assert client._seq_tracker.on_message_seq(ns, 3) is True
+    client._gap_fill_done = {}
+    client._persist_seq = lambda ns: None
+    client._verify_event_signature = AsyncMock(return_value=True)
+    transport = MagicMock()
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_transport_call(method, params):
+        calls.append((method, dict(params)))
+        if method == "group.pull_events":
+            return {
+                "events": [{
+                    "group_id": "g1",
+                    "event_seq": 2,
+                    "event_type": "group.announcement_updated",
+                    "action": "announcement_updated",
+                }],
+                "count": 1,
+                "cursor": {"current_seq": 2},
+            }
+        if method == "group.ack_events":
+            return {"ok": True}
+        return {}
+
+    async def fake_publish(event, payload):
+        if event == "group.changed" and isinstance(payload, dict) and payload.get("_from_gap_fill"):
+            client._seq_tracker.on_message_seq(ns, 4)
+
+    transport.call = AsyncMock(side_effect=fake_transport_call)
+    client._transport = transport
+    client._dispatcher = MagicMock()
+    client._dispatcher.publish = AsyncMock(side_effect=fake_publish)
+
+    await client._fill_group_event_gap("g1")
+
+    ack_calls = [params for method, params in calls if method == "group.ack_events"]
+    assert ack_calls == [{"group_id": "g1", "event_seq": 4, "device_id": "device-1", "slot_id": "slot-a"}]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 4
 
 
 @pytest.mark.asyncio
@@ -1386,6 +3351,70 @@ async def test_v2_state_retry_needed_triggers_leader_delay_reproposal():
     await client._on_v2_state_retry_needed({"group_id": "group.agentid.pub/12345"})
 
     client._v2_auto_propose_state.assert_awaited_once_with("group.agentid.pub/12345", leader_delay=True)
+
+
+@pytest.mark.asyncio
+async def test_group_changed_invite_code_used_triggers_v2_membership_recovery():
+    from unittest.mock import AsyncMock, MagicMock
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "dev-alice"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._dispatcher.publish = AsyncMock()
+    client._schedule_group_spk_rotation = MagicMock()
+    client._schedule_group_spk_registration = MagicMock()
+    client._v2_auto_propose_state = AsyncMock()
+
+    await client._on_raw_group_changed({
+        "group_id": "group.agentid.pub/12345",
+        "action": "invite_code_used",
+        "member_aid": "bob.agentid.pub",
+        "actor_aid": "bob.agentid.pub",
+    })
+    await asyncio.sleep(0)
+
+    client._schedule_group_spk_rotation.assert_called_once_with(
+        "group.agentid.pub/12345", reason="group.changed:invite_code_used"
+    )
+    client._schedule_group_spk_registration.assert_not_called()
+    client._v2_auto_propose_state.assert_awaited_once_with(
+        "group.agentid.pub/12345", leader_delay=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_changed_joined_for_self_registers_group_spk():
+    from unittest.mock import AsyncMock, MagicMock
+
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "bob.agentid.pub"
+    client._device_id = "dev-bob"
+    client._slot_id = "slot-b"
+    client._v2_session = object()
+    client._dispatcher.publish = AsyncMock()
+    client._schedule_group_spk_rotation = MagicMock()
+    client._schedule_group_spk_registration = MagicMock()
+    client._v2_auto_propose_state = AsyncMock()
+
+    await client._on_raw_group_changed({
+        "group_id": "group.agentid.pub/12345",
+        "action": "joined",
+        "member_aid": "bob.agentid.pub",
+        "actor_aid": "bob.agentid.pub",
+    })
+    await asyncio.sleep(0)
+
+    client._schedule_group_spk_registration.assert_called_once_with(
+        "group.agentid.pub/12345", reason="group.changed:joined"
+    )
+    client._schedule_group_spk_rotation.assert_not_called()
+    client._v2_auto_propose_state.assert_awaited_once_with(
+        "group.agentid.pub/12345", leader_delay=True
+    )
 
 
 @pytest.mark.asyncio
@@ -1631,6 +3660,39 @@ async def test_pulled_batch_publishes_internal_gap(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_published_message_logs_content(tmp_path):
+    class CaptureLogger:
+        def __init__(self):
+            self.debug_lines: list[str] = []
+
+        def debug(self, module, msg, *args):
+            self.debug_lines.append(msg % args if args else msg)
+
+        def info(self, module, msg, *args):
+            pass
+
+        def warn(self, module, msg, *args):
+            pass
+
+        def error(self, module, msg, *args, err=None):
+            pass
+
+    client = AUNClient({"aun_path": str(tmp_path / "published_content_log")})
+    logger = CaptureLogger()
+    client._log = logger
+    ns = "p2p:alice.aid.com"
+
+    await client._publish_pulled_message(
+        "message.received",
+        ns,
+        1,
+        {"message_id": "m1", "from": "bob.aid.com", "seq": 1, "payload": {"type": "text", "text": "hello"}},
+    )
+
+    assert any('"source":"pull"' in line and '"payload":{"type":"text","text":"hello"}' in line for line in logger.debug_lines)
+
+
+@pytest.mark.asyncio
 async def test_p2p_push_ignores_other_slot_context(tmp_path):
     from unittest.mock import AsyncMock
 
@@ -1773,6 +3835,8 @@ def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch):
 
     class FakeResponse:
         status = 200
+        async def read(self):
+            return cert_pem.encode("utf-8")
         async def text(self):
             return cert_pem
         async def __aenter__(self):
@@ -1811,6 +3875,35 @@ def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch):
     assert timeout_obj.total is not None and timeout_obj.total <= 30, (
         f"PY-017: HTTP 超时应不超过 30s，实际为 {timeout_obj.total}s"
     )
+
+
+@pytest.mark.asyncio
+async def test_fetch_peer_cert_net_path_does_not_reference_removed_response(tmp_path, monkeypatch):
+    client = AUNClient({"aun_path": str(tmp_path / "fetch_cert_net_path")})
+    client._gateway_url = "wss://gateway.agentid.pub:20001/aun"
+    cert_pem, _ = _make_test_cert("bob.agentid.pub")
+    calls = []
+
+    class FakeNet:
+        async def http_get_text(self, url, *, timeout=5.0, headers=None):
+            calls.append({"url": url, "timeout": timeout, "headers": headers})
+            return cert_pem
+
+    async def fake_verify(gateway_url, cert_obj, aid):
+        assert gateway_url == "wss://gateway.agentid.pub:20001/aun"
+        assert aid == "bob.agentid.pub"
+
+    client._net = FakeNet()
+    monkeypatch.setattr(client._auth, "verify_peer_certificate", fake_verify)
+
+    cert_bytes = await client._fetch_peer_cert("bob.agentid.pub")
+
+    assert cert_bytes == cert_pem.encode("utf-8")
+    assert calls == [{
+        "url": "https://gateway.agentid.pub:20001/pki/cert/bob.agentid.pub",
+        "timeout": 10.0,
+        "headers": None,
+    }]
 
 
 # ── PY-003: off() 事件注销方法 ────────────────────────────

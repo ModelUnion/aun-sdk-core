@@ -100,126 +100,6 @@ func TestIntegration_MessageAckBasic(t *testing.T) {
 	}
 }
 
-// TestIntegration_MessageAckEvent 验证 ACK 事件通知：发送方收到接收方的 ack 事件
-func TestIntegration_MessageAckEvent(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	rid := runID()
-	alice := makeClient(t)
-	bob := makeClient(t)
-	defer alice.Close()
-	defer bob.Close()
-
-	// 持久化消息需要 queue 投递模式（connect 级别配置）
-	alice.auth.SetDeliveryMode(map[string]any{"mode": "queue"})
-
-	aliceAID := ensureConnected(t, alice, fmt.Sprintf("ackev-alice-%s.%s", rid, testIssuer()))
-	bobAID := ensureConnected(t, bob, fmt.Sprintf("ackev-bob-%s.%s", rid, testIssuer()))
-
-	// Alice 订阅 ack 事件
-	var mu sync.Mutex
-	var ackEvents []map[string]any
-	ackDone := make(chan struct{}, 1)
-
-	sub := alice.On("message.ack", func(payload any) {
-		data, ok := payload.(map[string]any)
-		if !ok {
-			return
-		}
-		mu.Lock()
-		ackEvents = append(ackEvents, data)
-		mu.Unlock()
-		select {
-		case ackDone <- struct{}{}:
-		default:
-		}
-	})
-	defer sub.Unsubscribe()
-
-	// Bob 订阅消息（SDK connect 后自动 P2P pull 即触发 message.received）
-	var bmu sync.Mutex
-	var bobInbox []map[string]any
-	bobDone := make(chan struct{}, 1)
-	bobSub := bob.On("message.received", func(payload any) {
-		data, ok := payload.(map[string]any)
-		if !ok {
-			return
-		}
-		from, _ := data["from"].(string)
-		if from != aliceAID {
-			return
-		}
-		bmu.Lock()
-		bobInbox = append(bobInbox, data)
-		bmu.Unlock()
-		select {
-		case bobDone <- struct{}{}:
-		default:
-		}
-	})
-	defer bobSub.Unsubscribe()
-
-	// Alice 发送消息给 Bob
-	_, err := alice.Call(ctx, "message.send", map[string]any{
-		"to":      bobAID,
-		"payload": map[string]any{"type": "text", "text": "ack_event_test"},
-		"encrypt": false,
-	})
-	if err != nil {
-		t.Skipf("发送消息失败: %v", err)
-	}
-
-	// 等待 Bob 收到消息（SDK 自动 pull 已 ack 一次，但事件应触发）
-	timer := time.NewTimer(10 * time.Second)
-	select {
-	case <-bobDone:
-	case <-timer.C:
-	}
-	timer.Stop()
-
-	bmu.Lock()
-	bobMsgs := append([]map[string]any(nil), bobInbox...)
-	bmu.Unlock()
-	if len(bobMsgs) == 0 {
-		t.Fatalf("Bob 未收到消息")
-	}
-	msgSeq := int(toInt64(bobMsgs[0]["seq"]))
-
-	// Bob 主动再 ack 一次，确保 alice 一定能收到 ack 事件
-	if _, err := bob.Call(ctx, "message.ack", map[string]any{"seq": msgSeq}); err != nil {
-		t.Fatalf("Bob ack 失败: %v", err)
-	}
-
-	// 等待 Alice 收到 ack 事件
-	timer2 := time.NewTimer(10 * time.Second)
-	select {
-	case <-ackDone:
-	case <-timer2.C:
-		t.Fatalf("等待 ack 事件超时")
-	}
-	timer2.Stop()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(ackEvents) == 0 {
-		t.Fatalf("Alice 未收到 ack 事件")
-	}
-
-	evt := ackEvents[0]
-	t.Logf("ack 事件: %#v", evt)
-
-	// 验证事件中的 to 字段（接收方 AID）和 ack_seq
-	to := getStr(evt, "to", "")
-	if to != bobAID {
-		t.Errorf("ack 事件 to 应为 %s, 实际: %s", bobAID, to)
-	}
-	evtAckSeq := int(toInt64(evt["ack_seq"]))
-	if evtAckSeq < msgSeq {
-		t.Errorf("ack 事件 ack_seq(%d) 应 >= msg_seq(%d)", evtAckSeq, msgSeq)
-	}
-}
-
 // TestIntegration_MessageAckSequence 顺序 ACK：连续发送 3 条消息，逐条确认，验证 ack_seq 递增
 func TestIntegration_MessageAckSequence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -516,7 +396,8 @@ func TestIntegration_ReconnectOnlineStatus(t *testing.T) {
 
 	rid := runID()
 	alice := makeClient(t)
-	bob := makeClient(t)
+	bobPath := t.TempDir()
+	bob := makeIsolatedClient(t, bobPath, "")
 	defer alice.Close()
 
 	_ = ensureConnected(t, alice, fmt.Sprintf("recon-alice-%s.%s", rid, testIssuer()))
@@ -561,8 +442,8 @@ func TestIntegration_ReconnectOnlineStatus(t *testing.T) {
 	}
 	t.Logf("Bob 断开后: 离线")
 
-	// Bob 用新客户端重连
-	bob2 := makeClient(t)
+	// Bob 用新客户端重连；同一 AID 必须复用本地身份目录，否则会生成新 key 与已有证书不匹配。
+	bob2 := makeIsolatedClient(t, bobPath, "")
 	defer bob2.Close()
 	ensureConnected(t, bob2, bobAID)
 	time.Sleep(1 * time.Second)

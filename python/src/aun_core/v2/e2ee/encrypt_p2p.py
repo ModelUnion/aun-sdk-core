@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac as _hmac
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -26,6 +27,8 @@ from ..crypto.recipients import sort_recipients, compute_recipients_digest
 _METADATA_KEY_DOMAIN = b"aun-envelope-metadata-key-v1"
 _PROTECTED_HEADERS_DOMAIN = b"aun-protected-headers-v1"
 _PROTECTED_CONTEXT_DOMAIN = b"aun-protected-context-v1"
+_SDK_LANG = "python"
+_SDK_VERSION = "0.3.2"
 
 
 def _metadata_auth_tag(key: bytes, domain: bytes, body: dict[str, Any]) -> bytes:
@@ -47,17 +50,35 @@ def _with_metadata_auth(metadata: dict[str, Any], *, key: bytes, domain: bytes) 
     return result
 
 
+_PROTECTED_HEADER_KEY_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def _normalize_header_key(key: Any) -> str:
+    value = str(key or "").strip().lower()
+    if not value or not _PROTECTED_HEADER_KEY_RE.fullmatch(value):
+        raise ValueError("protected header key must match [a-z0-9_-]+")
+    if value == "_auth":
+        raise ValueError("protected header key is reserved")
+    return value
+
+
+def _normalize_header_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return canonical_json(value).decode("utf-8")
+
+
 def _normalize_headers(headers: dict[str, Any], payload_type: str | None = None) -> dict[str, str]:
-    """与 V1 对齐：所有 value 转 string，自动注入 payload_type。"""
+    """规范化 protected_headers：key 归一化，value 使用跨语言 canonical 字符串。"""
     normalized: dict[str, str] = {}
     for k, v in headers.items():
-        if k == "_auth":
-            continue
-        sv = str(v) if v is not None else ""
-        if sv:
-            normalized[k] = sv
+        normalized[_normalize_header_key(k)] = _normalize_header_value(v)
     if payload_type:
         normalized.setdefault("payload_type", payload_type)
+    normalized["sdk_lang"] = _SDK_LANG
+    normalized["sdk_vesion"] = _SDK_VERSION
     return normalized
 
 
@@ -106,11 +127,11 @@ def encrypt_p2p_message(
             peer_aid = t["aid"]
             break
 
-    # 计算 wrap_protocol_set（防服务端篡改 key_source 引导接收方走 1DH）
+    # 计算 wrap_protocol_set：spk_id 非空才允许声明/使用 3DH。
     all_targets_for_proto = target_set["targets"] + target_set.get("audit_recipients", [])
     protocols: set[str] = set()
     for t in all_targets_for_proto:
-        if t.get("spk_pk_der") and t.get("key_source") in ("peer_device_prekey", "group_device_prekey"):
+        if _uses_spk_wrap(t):
             protocols.add("3DH")
         else:
             protocols.add("1DH")
@@ -171,6 +192,10 @@ def encrypt_p2p_message(
     # 9. 计算 sender_cert_fingerprint
     cert_fp = "sha256:" + hashlib.sha256(sender["ik_pub_der"]).hexdigest()[:16]
 
+    payload_type = ""
+    if isinstance(payload, dict) and payload.get("type") is not None:
+        payload_type = str(payload.get("type") or "")
+
     # 10. 组装 envelope
     envelope = {
         "type": "e2ee.p2p_encrypted",
@@ -190,20 +215,16 @@ def encrypt_p2p_message(
         "recipients": recipients_rows,
         "aad": aad,
     }
+    if payload_type:
+        envelope["payload_type"] = payload_type
 
     # protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
-    if isinstance(protected_headers, dict) and protected_headers:
-        headers = _normalize_headers(protected_headers, payload_type=payload.get("type") if isinstance(payload, dict) else None)
-        if headers:
-            envelope["protected_headers"] = _with_metadata_auth(
-                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
-            )
-    elif isinstance(payload, dict) and payload.get("type"):
-        headers = _normalize_headers({}, payload_type=payload.get("type"))
-        if headers:
-            envelope["protected_headers"] = _with_metadata_auth(
-                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
-            )
+    header_input = protected_headers if isinstance(protected_headers, dict) else {}
+    headers = _normalize_headers(header_input, payload_type=payload_type or None)
+    if headers:
+        envelope["protected_headers"] = _with_metadata_auth(
+            headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
+        )
     if isinstance(context, dict) and context:
         ctx_body = {k: v for k, v in context.items() if k != "_auth"}
         if ctx_body:
@@ -233,6 +254,9 @@ def _wrap_for_recipient(
     ik_pk_der = target["ik_pk_der"]
     spk_pk_der = target.get("spk_pk_der")
     spk_id = target.get("spk_id", "")
+    use_3dh = _uses_spk_wrap(target)
+    row_key_source = key_source if use_3dh else "aid_master"
+    row_spk_id = spk_id if use_3dh else ""
 
     # 计算 fp（IK 公钥指纹）
     fp = "sha256:" + hashlib.sha256(ik_pk_der).hexdigest()[:16]
@@ -244,7 +268,7 @@ def _wrap_for_recipient(
     # 选择 DH 路径
     wrap_nonce = os.urandom(12)
 
-    if spk_pk_der and key_source in ("peer_device_prekey", "group_device_prekey"):
+    if use_3dh:
         # 3DH
         result = compute_3dh_wrap(
             sender_session_priv=sender_session_priv,
@@ -271,9 +295,16 @@ def _wrap_for_recipient(
         aid,
         device_id,
         role,
-        key_source,
+        row_key_source,
         fp,
-        spk_id,
+        row_spk_id,
         base64.b64encode(wrap_nonce).decode("ascii"),
         base64.b64encode(wrapped_key).decode("ascii"),
     ]
+
+
+def _uses_spk_wrap(target: dict[str, Any]) -> bool:
+    return bool(target.get("spk_id")) and bool(target.get("spk_pk_der")) and target.get("key_source") in (
+        "peer_device_prekey",
+        "group_device_prekey",
+    )

@@ -24,6 +24,7 @@ from .keystore.file import FileKeyStore
 
 if TYPE_CHECKING:
     from .logger import AUNLogger, NullLogger
+    from .net import DnsResilientNet
 
 
 def _verify_signature(public_key: Any, sig_bytes: bytes, data_bytes: bytes) -> None:
@@ -60,6 +61,7 @@ class AuthFlow:
         chain_cache_ttl: int = 86400,
         verify_ssl: bool = False,
         logger: "AUNLogger | NullLogger | None" = None,
+        net: "DnsResilientNet | None" = None,
     ) -> None:
         from .logger import NullLogger as _NL
         self._log = logger or _NL()
@@ -71,6 +73,7 @@ class AuthFlow:
         self._connection_factory = connection_factory or self._default_connection_factory
         self._root_ca_path = root_ca_path
         self._verify_ssl = verify_ssl
+        self._net = net
         self._root_certs = self._load_root_certs(root_ca_path, keystore=keystore)
         self._gateway_chain_cache: dict[str, list[str]] = {}
         self._gateway_crl_cache: dict[str, dict[str, Any]] = {}
@@ -199,15 +202,21 @@ class AuthFlow:
         """下载服务端当前登记的证书；404 视为未登记，其它错误抛异常。"""
         cert_url = self._gateway_http_url(gateway_url, f"/pki/cert/{aid}")
         try:
-            timeout = aiohttp.ClientTimeout(total=5.0)
-            ssl_param = None if self._verify_ssl else False
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(cert_url, ssl=ssl_param) as response:
-                    if response.status == 404:
-                        return None
-                    response.raise_for_status()
-                    cert_pem = await response.text()
+            if self._net:
+                data = await self._net.http_get_text(cert_url, timeout=5.0)
+                cert_pem = data
+            else:
+                timeout = aiohttp.ClientTimeout(total=5.0)
+                ssl_param = None if self._verify_ssl else False
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(cert_url, ssl=ssl_param) as response:
+                        if response.status == 404:
+                            return None
+                        response.raise_for_status()
+                        cert_pem = await response.text()
         except Exception as exc:
+            if "404" in str(exc) or "Not Found" in str(exc):
+                return None
             raise AuthError(f"failed to fetch {cert_url}") from exc
 
         if "BEGIN CERTIFICATE" not in cert_pem:
@@ -606,12 +615,14 @@ class AuthFlow:
                 raise ConnectionError(
                     f"gateway {gateway_url} handshake recv timeout ({_SHORT_RPC_TIMEOUT}s)"
                 )
-            await ws.send(json.dumps({
+            request_envelope = {
                 "jsonrpc": "2.0",
                 "id": f"pre-{method}",
                 "method": method,
                 "params": params,
-            }))
+            }
+            self._log.debug("auth", "short RPC request full: %s", json.dumps(request_envelope, ensure_ascii=False, separators=(",", ":"), default=str))
+            await ws.send(json.dumps(request_envelope, ensure_ascii=False, separators=(",", ":")))
             # RPC 响应接收
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=_SHORT_RPC_TIMEOUT)
@@ -620,6 +631,7 @@ class AuthFlow:
                     f"gateway {gateway_url} RPC recv timeout for {method} ({_SHORT_RPC_TIMEOUT}s)"
                 )
             message = raw if isinstance(raw, dict) else json.loads(raw)
+            self._log.debug("auth", "short RPC response full: method=%s %s", method, json.dumps(message, ensure_ascii=False, separators=(",", ":"), default=str))
         finally:
             await ws.close()
 
@@ -985,6 +997,11 @@ class AuthFlow:
         }
 
     async def _fetch_text(self, url: str) -> str:
+        if self._net:
+            try:
+                return await self._net.http_get_text(url, timeout=5.0)
+            except Exception as exc:
+                raise AuthError(f"failed to fetch {url}") from exc
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
             ssl_param = None if self._verify_ssl else False
@@ -996,6 +1013,14 @@ class AuthFlow:
             raise AuthError(f"failed to fetch {url}") from exc
 
     async def _fetch_json(self, url: str) -> dict[str, Any]:
+        if self._net:
+            try:
+                payload = await self._net.http_get_json(url, timeout=5.0)
+            except Exception as exc:
+                raise AuthError(f"failed to fetch {url}") from exc
+            if not isinstance(payload, dict):
+                raise AuthError(f"unexpected response type from {url}: {type(payload)}")
+            return payload
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
             ssl_param = None if self._verify_ssl else False
@@ -1262,8 +1287,6 @@ class AuthFlow:
             return identity
 
     def _load_instance_state(self, aid: str) -> dict[str, Any] | None:
-        if not self._device_id:
-            return None
         loader = getattr(self._keystore, "load_instance_state", None)
         if not callable(loader):
             return None
@@ -1279,15 +1302,14 @@ class AuthFlow:
             if key in persisted:
                 instance_state[key] = persisted.pop(key)
         self._keystore.save_identity(aid, persisted)
-        if self._device_id:
-            # 从共享 metadata 中移除实例级字段（它们已保存到 instance_state）
-            db = getattr(self._keystore, "_get_db", None)
-            if callable(db):
-                aid_db = db(aid)
-                for key in self._INSTANCE_STATE_FIELDS:
-                    aid_db.delete_metadata(key)
-                    aid_db.delete_metadata(f"{key}_protection")
-        if not self._device_id or not instance_state:
+        # 从共享 metadata 中移除实例级字段（它们已保存到 instance_state）
+        db = getattr(self._keystore, "_get_db", None)
+        if callable(db):
+            aid_db = db(aid)
+            for key in self._INSTANCE_STATE_FIELDS:
+                aid_db.delete_metadata(key)
+                aid_db.delete_metadata(f"{key}_protection")
+        if not instance_state:
             return
         updater = getattr(self._keystore, "update_instance_state", None)
         if not callable(updater):

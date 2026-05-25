@@ -4,6 +4,8 @@ import { decryptMessage } from '../../src/v2/e2ee/decrypt.js';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
 
+const SDK_VERSION = '0.3.2';
+
 /**
  * Group 加密自加密自解密回环：
  *   - 多成员（3DH + 1DH 混合）
@@ -63,6 +65,10 @@ describe('encryptGroupMessage roundtrip', () => {
       state_hash: 'abc',
       state_chain: 'chain-1',
     });
+    expect(envelope.protected_headers).toMatchObject({
+      sdk_lang: 'typescript',
+      sdk_vesion: SDK_VERSION,
+    });
 
     // Bob 3DH
     const decBob = decryptMessage(
@@ -120,6 +126,42 @@ describe('encryptGroupMessage roundtrip', () => {
       aliceIkPubDer,
     );
     expect(dec).toEqual({ hi: 1 });
+  });
+
+  it('spkPkDer 存在但 spkId 为空时按 1DH 写群信封', () => {
+    const [aliceIkPriv, aliceIkPubDer] = generateP256Keypair();
+    const [bobIkPriv, bobIkPubDer] = generateP256Keypair();
+    const [, bobSpkPubDer] = generateP256Keypair();
+    const sender = {
+      aid: 'alice.aid.com',
+      deviceId: 'dev-alice-1',
+      ikPriv: aliceIkPriv,
+      ikPubDer: aliceIkPubDer,
+    };
+    const target = {
+      aid: 'bob.aid.com',
+      deviceId: 'dev-bob-1',
+      role: 'member',
+      keySource: 'group_device_prekey',
+      ikPkDer: bobIkPubDer,
+      spkPkDer: bobSpkPubDer,
+      spkId: '',
+    };
+    const payload = { text: 'group SPK pub without ID uses 1DH' };
+
+    const envelope = encryptGroupMessage(sender, 'g-x', 0, [target], payload);
+    expect((envelope.aad as Record<string, unknown>).wrap_protocol).toBe('1DH');
+    const row = (envelope.recipients as string[][])[0]!;
+    expect(row[3]).toBe('aid_master');
+    expect(row[5]).toBe('');
+    expect(decryptMessage(
+      envelope as Record<string, unknown>,
+      'bob.aid.com',
+      'dev-bob-1',
+      bobIkPriv,
+      undefined,
+      aliceIkPubDer,
+    )).toEqual(payload);
   });
 
   it('protected_headers 支持 ProtectedHeaders 实例并绑定 group V2 envelope', () => {
@@ -213,5 +255,44 @@ describe('encryptGroupMessage roundtrip', () => {
       undefined,
       aliceIkPubDer,
     )).toEqual({ type: 'group-text', text: 'default headers' });
+  });
+
+  it('group payload.type 应复制到信封顶层 payload_type', () => {
+    const [aliceIkPriv, aliceIkPubDer] = generateP256Keypair();
+    const [bobIkPriv, bobIkPubDer] = generateP256Keypair();
+    const sender = {
+      aid: 'alice.aid.com',
+      deviceId: 'dev-alice-1',
+      ikPriv: aliceIkPriv,
+      ikPubDer: aliceIkPubDer,
+    };
+    const target = {
+      aid: 'bob.aid.com',
+      deviceId: 'dev-bob-1',
+      role: 'member',
+      keySource: 'aid_master',
+      ikPkDer: bobIkPubDer,
+    };
+
+    const envelope = encryptGroupMessage(
+      sender,
+      'g-test.aid.com',
+      2,
+      [target],
+      { type: 'group-text', text: 'visible group type' },
+    );
+
+    expect(envelope.payload_type).toBe('group-text');
+    expect((envelope.protected_headers as Record<string, unknown>).payload_type).toBe('group-text');
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_lang).toBe('typescript');
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBe(SDK_VERSION);
+    expect(decryptMessage(
+      envelope as Record<string, unknown>,
+      'bob.aid.com',
+      'dev-bob-1',
+      bobIkPriv,
+      undefined,
+      aliceIkPubDer,
+    )).toEqual({ type: 'group-text', text: 'visible group type' });
   });
 });

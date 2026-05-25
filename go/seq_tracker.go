@@ -81,6 +81,22 @@ func (st *SeqTracker) GetMaxSeenSeq(ns string) int {
 	return st.getState(ns).maxSeenSeq
 }
 
+// UpdateMaxSeen Push 专用：只扩展上界 maxSeenSeq，不动 contiguousSeq。
+//
+// 语义：服务端告诉 SDK"我有 seq 这条消息"，SDK 仅更新已知上界。
+// 消息内容是否解密成功、是否进入连续前缀，由 pull/decrypt 路径决定。
+func (st *SeqTracker) UpdateMaxSeen(ns string, seq int) {
+	if seq <= 0 {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	t := st.getState(ns)
+	if seq > t.maxSeenSeq {
+		t.maxSeenSeq = seq
+	}
+}
+
 // OnMessageSeq 记录收到的 seq，返回 true 表示需要 pull 补齐空洞
 func (st *SeqTracker) OnMessageSeq(ns string, seq int) bool {
 	st.mu.Lock()
@@ -344,10 +360,14 @@ func seqGapKey(start, end int) string {
 	return intToStr(start) + ":" + intToStr(end)
 }
 
-// ForceContiguousSeq 强制跳过不连续区间，将 contiguousSeq 拨到指定位置。
+// ForceContiguousSeq Pull 专用：强制推进 contiguousSeq（已连续到达的下界）。
 // 当服务端返回 server_ack_seq 且本地 contiguousSeq 落后时调用，
 // 跳过 [contiguousSeq, server_ack_seq) 这段不连续区间。
+// 仅增不减，防止 server_ack 倒退污染本地下界。
 func (st *SeqTracker) ForceContiguousSeq(ns string, seq int) {
+	if seq <= 0 {
+		return
+	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	t := st.getState(ns)
@@ -370,6 +390,35 @@ func (st *SeqTracker) ForceContiguousSeq(ns string, seq int) {
 		}
 		st.tryAdvance(t)
 	}
+}
+
+// RepairContiguousSeq 脏数据修复：允许 contiguousSeq 倒退到指定值。
+//
+// 仅在 push 路径检测到 contiguousSeq > pushSeq 等异常时使用。
+// 倒退后会清理不再可靠的 receivedSeqs / pendingGaps。
+func (st *SeqTracker) RepairContiguousSeq(ns string, seq int) {
+	if seq < 0 {
+		seq = 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	t := st.getState(ns)
+	if seq >= t.contiguousSeq {
+		return
+	}
+	newReceived := make(map[int]bool)
+	for s := range t.receivedSeqs {
+		if s > seq {
+			newReceived[s] = true
+		}
+	}
+	t.receivedSeqs = newReceived
+	for key, probe := range t.pendingGaps {
+		if probe.gapStart <= seq {
+			delete(t.pendingGaps, key)
+		}
+	}
+	t.contiguousSeq = seq
 }
 
 // ExportState 导出各命名空间的 contiguousSeq，用于持久化

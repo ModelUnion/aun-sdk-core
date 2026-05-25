@@ -6,6 +6,52 @@
 
 ---
 
+## 0.3.3 — 2026-05-25
+
+### Added
+- **V2 Thought 加解密**：`_decrypt_group_thoughts` / `_decrypt_message_thoughts` 支持 `group.thought.get` / `message.thought.get` 返回值自动解密；发送端 `message.thought.put` 自动加密
+- **V2 Sender IK 延迟解密**：`_schedule_v2_sender_ik_pending` / `_schedule_v2_sender_ik_fetch` / `_resolve_v2_sender_ik_pending`，对端 IK 未缓存时挂起消息、异步拉取后重试解密
+- **agent.md 本地缓存体系**：`set_agent_md_path` / `check_agent_md` / `publish_agent_md` / `fetch_agent_md`；基于文件系统的 list.json 索引 + 按 AID 存储内容 + etag 比对 + 自动拉取缺失
+- **KeyStore agent_md_cache 持久化**：`FileKeyStore.load_agent_md_cache` / `upsert_agent_md_cache`；SQLite 版本同步支持
+- **`auth.head_agent_md` handler**：仅获取对端 agent.md 元信息（etag/last_modified），不下载内容
+- **`SeqTracker.update_max_seen` / `repair_contiguous_seq`**：支持 server_ack_seq 推进 retention floor
+- **`GatewayDiscovery.discover_all`**：返回所有可用网关 URL 列表（多网关容灾）
+- **DNS 容灾连接工厂**：`_make_connection_factory` 支持 `net` 参数注入 DNS 容灾层
+- **V2 SPK 设备验签**：`_v2_verify_spk_device` 验证对端 SPK 签名合法性
+- **签名跳过策略**：`_should_skip_client_signature` / `_should_skip_event_signature` 对内部方法和系统事件跳过签名
+- **`_clamp_ack_params`**：message.ack seq 参数自动钳位，防止客户端发送超前 seq
+
+### Changed
+- **V2 消息处理路径重构**：`_decrypt_v2_message` 统一 P2P/Group 解密入口，支持 `allow_pending` 延迟解密模式
+- **`_process_and_publish_message`**：增加 slot_id 传递、V2 envelope metadata 附加
+- **CLI `aun_cli`**：group 子命令增强（create/join/leave/info/list/send/pull）、diag 子命令增强、config 支持多 profile 切换
+- **session 默认选项**：新增 `background_sync: True`
+
+### Fixed
+- **service-plane envelope 解包**：修复 Kernel trace 字段传递丢失
+- **trace 树状展示**：enter/exit 配对 + 嵌套缩进 + 按 ts 排序 + offset 时间轴
+
+---
+
+## 0.3.1 — 2026-05-22
+
+### Added
+- **CLI 工具 `aun_cli`**：基于 typer 的命令行工具，支持 identity（register / login / whoami / list）、message（send / pull）、group、diag 等子命令；TOML profile 配置；统一 table/json/dict/error 输出格式
+- **RPC trace 增强**：`RPCTransport` 增加 `set_trace_mode()` / `set_trace_observer()`；client trace 树状展示按 ts 排序 + 嵌套缩进，enter span 携带业务字段、exit span 携带结果或失败上下文
+- **`auth.check_aid` handler**：本地证书自检 + 远端注册状态查询
+- **V2 群组 SPK 生命周期**：`V2KeyStore.{save,load,load_current}_group_spk`、`V2Session.ensure_group_spk` / `ensure_group_registered` / `rotate_group_spk` / `get_group_decrypt_keys` / `is_last_uploaded_group_spk`
+- **`SeqTracker.has_pending_gaps(ns)`**：Pull 返回空时判断是否仍有 push 标记的上界，用于双重修复机制
+- **AUNClient 群组 SPK 调度**：`_schedule_group_spk_registration` / `_schedule_group_spk_rotation` / `_schedule_group_spk_registration_after_peer_fallback`
+- **消息载荷调试日志**：`_log_message_debug` / `_log_app_message_publish` / `_message_payload_for_debug` 等内部诊断辅助
+
+### Changed
+- **`AUNClient._publish_app_event`** 与消息发布路径重构，`_normalize_outbound_message_payload` 在发送前规范化 message params
+
+### Fixed
+- short RPC 请求/响应增加完整报文 debug 日志，便于跨语言诊断
+
+---
+
 ## 0.3.0 — 2026-05-21 ⚠️ BREAKING CHANGE
 
 > **V2-only 版本**：移除全部 V1 E2EE（含群组加密），新增 V2 加密原语，API 不向后兼容。

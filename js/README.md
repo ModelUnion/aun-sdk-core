@@ -511,7 +511,6 @@ SDK 内部已自动处理以下群组 E2EE 场景：
 | `message.received` | P2P 消息，SDK 已优先自动解密 |
 | `message.undecryptable` | 无法解密的 P2P 消息 |
 | `message.recalled` | 撤回事件 |
-| `message.ack` | ack 事件 |
 | `group.message_created` | 群消息，SDK 已优先自动解密 |
 | `group.message_undecryptable` | 无法解密的群消息 |
 | `group.changed` | 群组事件 |

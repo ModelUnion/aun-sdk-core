@@ -57,7 +57,21 @@ func genTestIdentity(t *testing.T) (privPEM string, certPEM string, privKey *ecd
 
 func TestSignedMethodsCoverage(t *testing.T) {
 	expected := []string{
+		"message.send",
+		"message.v2.put_peer_pk",
+		"message.v2.bootstrap",
+		"message.v2.group_bootstrap",
+		"message.v2.pull",
+		"message.v2.ack",
 		"group.send",
+		"group.v2.put_group_pk",
+		"group.v2.bootstrap",
+		"group.v2.send",
+		"group.v2.pull",
+		"group.v2.ack",
+		"group.v2.propose_state",
+		"group.v2.confirm_state",
+		"group.v2.get_proposal",
 		"group.kick",
 		"group.add_member",
 		"group.leave",

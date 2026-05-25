@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import base64
 import hashlib
 import shutil
@@ -440,6 +440,63 @@ def test_load_identity_prefers_instance_state_tokens(tmp_path):
     assert loaded["refresh_token"] == "slot-refresh"
     assert loaded["access_token_expires_at"] == 123456
 
+
+def test_load_identity_empty_device_id_prefers_instance_state_tokens(tmp_path):
+    keystore = FileKeyStore(tmp_path / "aun")
+    aid = "alice-empty-device.example.aid"
+    keystore.save_identity(aid, {
+        "aid": aid,
+        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+        "public_key_der_b64": "pub",
+        "curve": "P-256",
+        "access_token": "shared-token",
+        "refresh_token": "shared-refresh",
+    })
+    keystore.save_instance_state(aid, "", "slot-a", {
+        "access_token": "empty-device-token",
+        "refresh_token": "empty-device-refresh",
+        "access_token_expires_at": 234567,
+    })
+    flow = AuthFlow(
+        keystore=keystore,
+        crypto=CryptoProvider(),
+        connection_factory=lambda url: None,
+        device_id="",
+        slot_id="slot-a",
+    )
+
+    loaded = flow.load_identity(aid)
+
+    assert loaded["access_token"] == "empty-device-token"
+    assert loaded["refresh_token"] == "empty-device-refresh"
+    assert loaded["access_token_expires_at"] == 234567
+
+
+def test_persist_identity_empty_device_id_saves_instance_state(tmp_path):
+    keystore = FileKeyStore(tmp_path / "aun")
+    aid = "persist-empty-device.example.aid"
+    flow = AuthFlow(
+        keystore=keystore,
+        crypto=CryptoProvider(),
+        connection_factory=lambda url: None,
+        device_id="",
+        slot_id="slot-a",
+    )
+
+    flow._persist_identity({
+        "aid": aid,
+        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+        "public_key_der_b64": "pub",
+        "curve": "P-256",
+        "access_token": "empty-device-token",
+        "refresh_token": "empty-device-refresh",
+        "access_token_expires_at": 345678,
+    })
+
+    instance_state = keystore.load_instance_state(aid, "", "slot-a")
+    assert instance_state["access_token"] == "empty-device-token"
+    assert instance_state["refresh_token"] == "empty-device-refresh"
+    assert instance_state["access_token_expires_at"] == 345678
 
 # ── P0-2: _validate_new_cert 测试 ───────────────────────────
 

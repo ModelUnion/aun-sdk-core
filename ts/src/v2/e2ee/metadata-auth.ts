@@ -5,7 +5,7 @@
  * 用 master_key 派生 HMAC key，对 metadata body 做签名，生成 `_auth` 字段。
  */
 
-import { createHmac } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { canonicalJson } from '../crypto/canonical.js';
 
 export const METADATA_KEY_DOMAIN = Buffer.from('aun-envelope-metadata-key-v1', 'utf-8');
@@ -52,4 +52,46 @@ export function withMetadataAuth(
       tag: tag.toString('base64'),
     },
   };
+}
+
+export function verifyMetadataAuth(
+  metadata: unknown,
+  key: Uint8Array,
+  domain: Buffer,
+  fieldName: string,
+): void {
+  if (metadata == null) return;
+  if (!isPlainObject(metadata)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  const body: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(metadata)) {
+    if (k !== '_auth') body[k] = v;
+  }
+  if (Object.keys(body).length === 0) return;
+
+  const auth = metadata._auth;
+  if (!isPlainObject(auth)) {
+    throw new Error(`${fieldName} missing _auth`);
+  }
+  if (auth.alg !== 'HMAC-SHA256') {
+    throw new Error(`${fieldName} unsupported _auth alg`);
+  }
+  if (typeof auth.tag !== 'string' || auth.tag.length === 0) {
+    throw new Error(`${fieldName} missing _auth tag`);
+  }
+
+  const actual = Buffer.from(auth.tag, 'base64');
+  const expected = metadataAuthTag(key, domain, body);
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    throw new Error(`${fieldName} _auth verification failed`);
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }

@@ -24,7 +24,7 @@ def send(
         async with CLISession(ctx) as client:
             return await client.call("message.send", {
                 "to": target,
-                "content": {"text": content},
+                "payload": {"text": content},
                 "encrypt": not no_encrypt,
             })
 
@@ -75,7 +75,7 @@ def pull(
             return
         for msg in messages:
             sender = msg.get("from", "?")
-            content = msg.get("content", {})
+            content = msg.get("content", msg.get("payload", {}))
             text = content.get("text", "") if isinstance(content, dict) else str(content)
             seq = msg.get("seq", "")
             print(f"  [{seq}] {sender}: {text}")

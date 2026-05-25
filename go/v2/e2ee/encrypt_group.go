@@ -141,6 +141,11 @@ func EncryptGroupMessage(sender Sender, groupID string, epoch int, targets []Tar
 		"recipients":              recipientsAny,
 		"aad":                     aad,
 	}
+	if payloadType, err := payloadTypeFromPayload(payload); err != nil {
+		return nil, fmt.Errorf("encrypt_group: payload_type 无效: %w", err)
+	} else if payloadType != "" {
+		envelope["payload_type"] = payloadType
+	}
 
 	// protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
 	// payload_type 自动注入 + value 转 string（与 Python _normalize_headers 对齐）

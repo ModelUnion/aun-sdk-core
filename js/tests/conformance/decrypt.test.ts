@@ -90,6 +90,40 @@ describe('decryptMessage - golden interop (Python ↔ JS)', () => {
   });
 });
 
+describe('decryptMessage - error classification', () => {
+  it('3DH row 缺少本地 SPK 私钥 → spk_missing', async () => {
+    const v = loadGolden('p2p_3dh.json');
+    if (!v.decryption_inputs) throw new Error('missing decryption_inputs');
+    const inputs = v.decryption_inputs;
+    await expect(
+      decryptMessage(
+        v.envelope,
+        inputs.self_aid,
+        inputs.self_device_id,
+        b64(inputs.self_ik_priv_b64),
+        undefined,
+        b64(inputs.sender_pub_der_b64),
+      ),
+    ).rejects.toThrow(/spk_missing/);
+  });
+
+  it('3DH row 使用错误 SPK 私钥 → wrap_key_decrypt_failed', async () => {
+    const v = loadGolden('group_3dh_1dh.json');
+    if (!v.decryption_inputs_bob) throw new Error('missing decryption_inputs_bob');
+    const inputs = v.decryption_inputs_bob;
+    await expect(
+      decryptMessage(
+        v.envelope,
+        inputs.self_aid,
+        inputs.self_device_id,
+        b64(inputs.self_ik_priv_b64),
+        b64(inputs.self_ik_priv_b64),
+        b64(inputs.sender_pub_der_b64),
+      ),
+    ).rejects.toThrow(/wrap_key_decrypt_failed: .*key_source=group_device_prekey.*spk_id=/);
+  });
+});
+
 describe('decryptMessage - tamper detection', () => {
   it('tampered ciphertext → throws / fails', async () => {
     const v = loadGolden('p2p_1dh.json');

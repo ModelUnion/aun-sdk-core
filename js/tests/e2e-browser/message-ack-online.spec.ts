@@ -2,9 +2,8 @@
 //
 // 覆盖：
 //   1. 消息 ACK 基础 — 发送后 ack 推进 ack_seq
-//   2. 消息 ACK 事件 — ack 后发送方收到 ack 事件
-//   3. 消息 ACK 序列 — 连续 ack 按顺序推进
-//   4. 在线状态 — 连接/断开后状态变化、批量查询
+//   2. 消息 ACK 序列 — 连续 ack 按顺序推进
+//   3. 在线状态 — 连接/断开后状态变化、批量查询
 //
 // 运行方法：
 //   npm run build && playwright test --config=playwright.agentid-local.config.ts tests/e2e-browser/message-ack-online.spec.ts --reporter=line
@@ -221,124 +220,6 @@ test.describe('消息 ACK 基础（浏览器）', () => {
     // ack_seq 应等于或大于已 ack 的 seq
     if (r.ack_seq !== null) {
       expect(r.ack_seq).toBeGreaterThanOrEqual(r.acked_seq);
-    }
-  });
-});
-
-// ── 消息 ACK 事件 ────────────────────────────────────────────
-
-test.describe('消息 ACK 事件（浏览器）', () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto(testPageUrl());
-    await page.waitForFunction(() => (window as any).testReady === true, null, { timeout: 10_000 });
-    await installP0Helpers(page);
-  });
-
-  test('ack 后发送方应收到 ack 事件', async ({ page }) => {
-    const result = await page.evaluate(async (iss: string) => {
-      const { sleep, makeAndConnect, ensureConnected } = (window as any).__aunP0;
-      const rid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
-      const aliceAid = `ackea${rid}.${iss}`;
-      const bobAid = `ackeb${rid}.${iss}`;
-
-      const alice = await makeAndConnect(`ack-evt-alice-${rid}`);
-      const bob = await makeAndConnect(`ack-evt-bob-${rid}`);
-
-      try {
-        await ensureConnected(alice, aliceAid);
-        await ensureConnected(bob, bobAid);
-
-        // Alice 订阅 message.ack 事件
-        let ackEvent: any = null;
-        let resolveAck: (() => void) | null = null;
-        const ackPromise = new Promise<void>(r => { resolveAck = r; });
-
-        alice.on('message.ack', (data: any) => {
-          ackEvent = data;
-          if (resolveAck) resolveAck();
-        });
-
-        const text = `ack-evt-${rid}`;
-        const received: any[] = [];
-        let resolveReceived: (() => void) | null = null;
-        const receivedPromise = new Promise<void>(resolve => { resolveReceived = resolve; });
-        bob.on('message.received', (data: any) => {
-          if (data?.from === aliceAid && data?.payload?.text === text) {
-            received.push(data);
-            if (resolveReceived) resolveReceived();
-          }
-        });
-
-        // Alice 发消息给 Bob
-        const sendResult = await alice.call('message.send', {
-          to: bobAid,
-          payload: { type: 'text', text },
-          durable: true,
-          encrypt: false,
-        });
-        if (!sendResult?.message_id) {
-          return { skip: true, reason: 'send 未返回 message_id' };
-        }
-
-        await Promise.race([receivedPromise, sleep(10_000)]);
-        let matching = received;
-        if (matching.length === 0) {
-          const pullResult = await bob.call('message.pull', { after_seq: 0, limit: 50 });
-          const messages = pullResult?.messages ?? [];
-          matching = messages.filter((m: any) => m?.payload?.text === text);
-        }
-        if (matching.length === 0) {
-          return { skip: true, reason: 'Bob 未收到消息' };
-        }
-
-        const maxSeq = Math.max(...matching.map((m: any) => m.seq));
-
-        try {
-          await bob.call('message.ack', { seq: maxSeq });
-        } catch (e: any) {
-          const msg = (e.message ?? '').toLowerCase();
-          if (msg.includes('not implement') || msg.includes('method not found')) {
-            return { skip: true, reason: 'message.ack 未实现' };
-          }
-          return { skip: false, error: 'ack 失败: ' + e.message };
-        }
-
-        // 等待 Alice 收到 ack 事件（最多 5 秒）
-        const timeout = new Promise<void>((_, reject) =>
-          setTimeout(() => reject(new Error('timeout')), 5000),
-        );
-
-        let eventReceived = false;
-        try {
-          await Promise.race([ackPromise, timeout]);
-          eventReceived = true;
-        } catch {
-          eventReceived = false;
-        }
-
-        return {
-          skip: false,
-          event_received: eventReceived,
-          ack_event: ackEvent,
-          acked_seq: maxSeq,
-        };
-      } finally {
-        await alice.close();
-        await bob.close();
-      }
-    }, ISSUER);
-
-    if ((result as any).skip) {
-      test.skip();
-      return;
-    }
-    const r = result as any;
-    expect(r.error).toBeUndefined();
-    // ack 事件可能不一定由所有实现支持，记录结果
-    if (r.event_received) {
-      console.log('ack 事件已收到:', JSON.stringify(r.ack_event));
-    } else {
-      console.log('警告: 5 秒内未收到 ack 事件（实现可能不发送此事件）');
     }
   });
 });

@@ -54,6 +54,10 @@ func (c *AUNClient) SendGroupV2WithOpts(ctx context.Context, groupID string, pay
 	if groupID == "" {
 		return nil, errors.New("send_group_v2: group_id 不能为空")
 	}
+	c.logMessageDebugWithPayload("send-plaintext", "group.send.v2", "group.send", map[string]any{
+		"group_id": groupID,
+		"payload":  payload,
+	}, payload, nil)
 
 	resp, err := c.v2GroupSendOnce(ctx, state, groupID, payload, true, opts)
 	if err == nil {
@@ -71,6 +75,7 @@ func (c *AUNClient) SendGroupV2WithOpts(ctx context.Context, groupID string, pay
 
 // v2GroupSendOnce 单次 group 发送尝试。
 func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, groupID string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
+	c.logE2.Debug("group.v2.send attempt: group=%s use_cache=%v", groupID, useCache)
 	allDevices, epoch, sc, auditRaw, err := c.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
@@ -88,28 +93,21 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 	targets := make([]e2ee.Target, 0, len(allDevices))
 	for _, dev := range allDevices {
 		devAID := v2AsString(dev["aid"])
-		devID := v2AsString(dev["device_id"])
-		if devAID == myAID && devID == myDeviceID {
+		devID, hasDeviceID := v2DeviceIDFromDevice(dev)
+		if devAID == myAID && hasDeviceID && devID == myDeviceID {
 			continue
 		}
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
-		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
 		role := "member"
 		if devAID == myAID {
 			role = "self_sync"
 		}
-		targets = append(targets, e2ee.Target{
-			AID:       devAID,
-			DeviceID:  devID,
-			Role:      role,
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, devAID, devID, role, "peer_device_prekey")
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			targets = append(targets, target)
+		}
 	}
 
 	if len(targets) == 0 {
@@ -117,20 +115,13 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 	}
 	// 监管 AID：audit_recipients 加入 targets（role="audit"）
 	for _, dev := range auditRaw {
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
+		if err != nil {
+			return nil, err
 		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
-		targets = append(targets, e2ee.Target{
-			AID:       v2AsString(dev["aid"]),
-			DeviceID:  v2AsString(dev["device_id"]),
-			Role:      "audit",
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		if ok {
+			targets = append(targets, target)
+		}
 	}
 
 	sender, err := state.session.GetSenderIdentity()
@@ -155,6 +146,18 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 	if err != nil {
 		return nil, fmt.Errorf("send_group_v2: 加密失败: %w", err)
 	}
+	c.logMessageDebugWithPayload("send-envelope", "group.send.v2", "group.send", map[string]any{
+		"group_id":   groupID,
+		"message_id": envelope["message_id"],
+		"type":       envelope["type"],
+		"version":    envelope["version"],
+	}, envelope, map[string]any{
+		"plaintext_payload": payload,
+		"epoch":             epoch,
+		"target_count":      len(targets),
+		"audit_count":       len(auditRaw),
+		"use_cache":         useCache,
+	})
 
 	raw, err := c.Call(ctx, "group.v2.send", map[string]any{
 		"group_id": groupID,
@@ -164,8 +167,10 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 		return nil, err
 	}
 	if m, ok := raw.(map[string]any); ok {
+		c.logE2.Debug("group.v2.send ok: group=%s use_cache=%v seq=%d", groupID, useCache, toInt64(m["seq"]))
 		return m, nil
 	}
+	c.logE2.Debug("group.v2.send ok: group=%s use_cache=%v seq=<unknown>", groupID, useCache)
 	return map[string]any{}, nil
 }
 
@@ -177,6 +182,7 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 		entry, ok := state.groupBootstrapCache[groupID]
 		state.bootstrapCacheM.Unlock()
 		if ok && time.Since(entry.CachedAt) < v2GroupBootstrapTTL {
+			c.logE2.Debug("group.v2.bootstrap cache hit: group=%s devices=%d audit=%d epoch=%d", groupID, len(entry.Devices), len(entry.AuditRecipients), entry.Epoch)
 			return entry.Devices, entry.Epoch, entry.StateCommitment, entry.AuditRecipients, nil
 		}
 	}
@@ -189,6 +195,7 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 	devices := v2ToMapList(bs["devices"])
 	epoch := int(toInt64(bs["epoch"]))
 	auditRecipients := v2ToMapList(bs["audit_recipients"])
+	c.logE2.Debug("group.v2.bootstrap fetched: group=%s devices=%d audit=%d epoch=%d members=%d", groupID, len(devices), len(auditRecipients), epoch, len(v2ToStringList(bs["member_aids"])))
 
 	c.v2CheckFork(ctx, groupID, v2AsString(bs["state_chain"]))
 	if err := c.v2VerifyStateSignature(ctx, groupID, bs); err != nil {
@@ -246,6 +253,7 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 		effectiveAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 
+	c.logE2.Debug("group.v2.pull request: group=%s after_seq=%d limit=%d ns=%s", groupID, effectiveAfterSeq, limit, ns)
 	raw, err := c.Call(ctx, "group.v2.pull", map[string]any{
 		"group_id":  groupID,
 		"after_seq": effectiveAfterSeq,
@@ -256,6 +264,14 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 	}
 	result, _ := raw.(map[string]any)
 	messages := v2ToMapList(result["messages"])
+	serverAckSeq := int64(0)
+	if cursor, ok := result["cursor"].(map[string]any); ok {
+		serverAckSeq = toInt64(cursor["current_seq"])
+	}
+	c.logE2.Debug("group.v2.pull response: group=%s raw_count=%d cursor_current=%d has_more=%v", groupID, len(messages), serverAckSeq, result["has_more"])
+	for _, msg := range messages {
+		c.logMessageDebug("pull-raw", "group.v2.pull", "group.message_created", msg, nil)
+	}
 
 	decrypted := make([]map[string]any, 0, len(messages))
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
@@ -275,6 +291,7 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 	}
 	if firstSeq > 0 && int(firstSeq) > contigBefore {
 		c.seqTracker.ForceContiguousSeq(ns, int(firstSeq))
+		c.logE2.Debug("group.v2.pull force contiguous first_seq: group=%s ns=%s previous=%d first_seq=%d", groupID, ns, contigBefore, firstSeq)
 	}
 
 	for _, msg := range messages {
@@ -286,6 +303,7 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 		if v2AsString(msg["version"]) == "v1" {
 			if legacy, ok := v2BuildLegacyGroupMessage(msg, groupID); ok {
 				decrypted = append(decrypted, legacy)
+				c.logE2.Debug("group.v2.pull plaintext V1 decrypted: group=%s seq=%d", groupID, seq)
 			} else {
 				c.logE2.Debug("V2 group pull skipped legacy V1 encrypted/empty message: group=%s seq=%d", groupID, seq)
 			}
@@ -296,6 +314,9 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 		if plaintext != nil {
 			plaintext["group_id"] = groupID
 			decrypted = append(decrypted, plaintext)
+			c.logMessageDebug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext, nil)
+		} else {
+			c.logE2.Debug("group.v2.pull decrypt returned nil: group=%s seq=%d", groupID, seq)
 		}
 		// Group 不跟踪旧 SPK（不触发 PFS 销毁）
 	}
@@ -308,10 +329,19 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 			c.drainOrderedMessages(ns)
 		}
 	}
+	if serverAckSeq > 0 {
+		currentContig := c.seqTracker.GetContiguousSeq(ns)
+		if int(serverAckSeq) > currentContig {
+			c.seqTracker.ForceContiguousSeq(ns, int(serverAckSeq))
+			c.logE2.Info("V2 group pull retention-floor advanced: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, currentContig, serverAckSeq)
+			c.drainOrderedMessages(ns)
+		}
+	}
 	if c.seqTracker.GetContiguousSeq(ns) != contigBefore {
 		c.saveSeqTrackerState()
 	}
 
+	c.logE2.Debug("group.v2.pull done: group=%s requested_after_seq=%d raw_count=%d decrypted=%d ns=%s", groupID, afterSeq, len(messages), len(decrypted), ns)
 	return decrypted, nil
 }
 
@@ -330,9 +360,15 @@ func (c *AUNClient) AckGroupV2(ctx context.Context, groupID string, upToSeq int6
 		seq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 	if seq <= 0 {
+		c.logE2.Debug("group.v2.ack skipped: group=%s ns=%s up_to_seq=%d", groupID, ns, upToSeq)
+		return map[string]any{"acked": int64(0)}, nil
+	}
+	seq = c.clampAckSeq("group.v2.ack", "up_to_seq", ns, seq)
+	if seq <= 0 {
 		return map[string]any{"acked": int64(0)}, nil
 	}
 
+	c.logE2.Debug("group.v2.ack send: group=%s ns=%s up_to_seq=%d", groupID, ns, seq)
 	raw, err := c.Call(ctx, "group.v2.ack", map[string]any{
 		"group_id":  groupID,
 		"up_to_seq": seq,
@@ -344,5 +380,6 @@ func (c *AUNClient) AckGroupV2(ctx context.Context, groupID string, upToSeq int6
 	if result == nil {
 		result = map[string]any{}
 	}
+	c.logE2.Debug("group.v2.ack ok: group=%s ns=%s requested=%d result=%v", groupID, ns, seq, result)
 	return result, nil
 }

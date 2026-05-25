@@ -129,6 +129,65 @@ describe('AuthFlow', () => {
     expect((args.extra_info as Record<string, unknown> | undefined)?._capabilities).toBeUndefined();
   });
 
+  it('空 device_id 应从 instance_state 加载实例级 token', () => {
+    const keystore = {
+      loadInstanceState: vi.fn().mockReturnValue({ access_token: 'tok-empty-device' }),
+      saveIdentity: vi.fn(),
+    };
+    const auth = new AuthFlow({
+      keystore: keystore as any,
+      crypto: {} as any,
+      deviceId: '',
+      verifySsl: false,
+    });
+
+    const state = (auth as any)._loadInstanceState('alice.agentid.pub');
+
+    expect(keystore.loadInstanceState).toHaveBeenCalledWith('alice.agentid.pub', '', '');
+    expect(state.access_token).toBe('tok-empty-device');
+  });
+
+  it('空 device_id 应写入 instance_state 而不是留在共享身份元数据', () => {
+    const deletedKeys: string[] = [];
+    const updatedStates: Record<string, unknown>[] = [];
+    const keystore = {
+      saveIdentity: vi.fn(),
+      _getDB: vi.fn().mockReturnValue({
+        deleteMetadata: vi.fn((key: string) => deletedKeys.push(key)),
+      }),
+      updateInstanceState: vi.fn((_aid: string, _deviceId: string, _slotId: string, updater: (state: Record<string, unknown>) => Record<string, unknown> | void) => {
+        const current: Record<string, unknown> = {};
+        updater(current);
+        updatedStates.push({ ...current });
+        return current;
+      }),
+    };
+    const auth = new AuthFlow({
+      keystore: keystore as any,
+      crypto: {} as any,
+      deviceId: '',
+      verifySsl: false,
+    });
+
+    (auth as any)._persistIdentity({
+      aid: 'alice.agentid.pub',
+      private_key_pem: 'PRIVATE',
+      access_token: 'tok-empty-device',
+      refresh_token: 'ref-empty-device',
+    });
+
+    expect(keystore.saveIdentity).toHaveBeenCalledWith('alice.agentid.pub', expect.not.objectContaining({
+      access_token: expect.anything(),
+      refresh_token: expect.anything(),
+    }));
+    expect(keystore.updateInstanceState).toHaveBeenCalledWith('alice.agentid.pub', '', '', expect.any(Function));
+    expect(updatedStates[0]).toMatchObject({
+      access_token: 'tok-empty-device',
+      refresh_token: 'ref-empty-device',
+    });
+    expect(deletedKeys).toContain('access_token');
+  });
+
   it('OCSP DER 解析应支持 responderID byKey ([2]) 响应', () => {
     const auth = new AuthFlow({
       keystore: {} as any,

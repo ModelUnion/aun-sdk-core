@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,4 +84,76 @@ func TestCanonicalGolden(t *testing.T) {
 		t.Fatal("未找到任何 golden 向量文件")
 	}
 	t.Logf("共测试 %d 个 golden 向量", count)
+}
+
+func TestCanonicalNumberNormalization(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want string
+	}{
+		{"float_integer", 1.0, "1"},
+		{"small_exponent", 1e-7, "0.0000001"},
+		{"negative_zero", math.Copysign(0, -1), "0"},
+		{"json_number_fraction", json.Number("1.2300"), "1.23"},
+		{"json_number_exponent", json.Number("1e-7"), "0.0000001"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(CanonicalJSON(tc.in)); got != tc.want {
+				t.Fatalf("期望 %q，实际 %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestCanonicalRejectsUnsafeNumbers(t *testing.T) {
+	cases := []any{
+		int64(9007199254740992),
+		uint64(9007199254740992),
+		json.Number("9007199254740992"),
+		math.NaN(),
+		math.Inf(1),
+	}
+	for _, in := range cases {
+		t.Run(fmtAny(in), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("期望 CanonicalJSON 拒绝非法数字: %#v", in)
+				}
+			}()
+			_ = CanonicalJSON(in)
+		})
+	}
+}
+
+func TestCanonicalUnicodeCodePointKeyOrder(t *testing.T) {
+	got := string(CanonicalJSON(map[string]any{
+		"\U00010000": 1,
+		"\uE000":     2,
+	}))
+	want := "{\"\uE000\":2,\"𐀀\":1}"
+	if got != want {
+		t.Fatalf("Unicode code point 排序不一致\n期望: %s\n实际: %s", want, got)
+	}
+}
+
+func fmtAny(v any) string {
+	return strings.NewReplacer(" ", "_", "+", "plus", "-", "minus").Replace(jsonSafeString(v))
+}
+
+func jsonSafeString(v any) string {
+	switch x := v.(type) {
+	case json.Number:
+		return "json_number_" + x.String()
+	case float64:
+		if math.IsNaN(x) {
+			return "nan"
+		}
+		if math.IsInf(x, 1) {
+			return "inf"
+		}
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
 }

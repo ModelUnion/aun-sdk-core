@@ -4,7 +4,7 @@
  * 包入口：统一导出所有公开 API。
  */
 
-export const VERSION = '0.2.5';
+export const VERSION = '0.3.2';
 
 // ── 主客户端 ─────────────────────────────────────────────────
 export { AUNClient } from './client.js';

@@ -60,6 +60,8 @@ def output_success(message: str) -> None:
 def output_error(message: str, hint: str | None = None, code: int = 1) -> None:
     if _json_mode:
         err = {"error": "error", "message": message, "code": code}
+        if hint:
+            err["hint"] = hint
         print(json.dumps(err, ensure_ascii=False), file=sys.stderr)
         return
     print(f"Error: {message}", file=sys.stderr)

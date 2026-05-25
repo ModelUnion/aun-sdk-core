@@ -3,7 +3,7 @@
  *
  * 规范引用: §10.2
  * 规则:
- * - 键递归字典序排序
+ * - 键递归按 Unicode code point 排序
  * - UTF-8 直出（非 ASCII 不转义）
  * - 数值无前导零、不科学计数法
  * - 字符串最小转义（仅 " \\ \b \f \n \r \t，其它控制字符 \u00XX）
@@ -15,6 +15,7 @@
  */
 
 const encoder = new TextEncoder();
+const MAX_SAFE_JSON_INTEGER = 9007199254740991;
 
 /**
  * 将任意 JS 值序列化为 Canonical JSON 的 UTF-8 字节。
@@ -48,20 +49,38 @@ function serializeNumber(n: number): string {
   if (!isFinite(n)) {
     throw new RangeError('canonicalJson: Infinity and NaN not allowed');
   }
+  if (Object.is(n, -0)) return '0';
+
   if (Number.isInteger(n)) {
-    // 整数：直接 toString，无前导零、无科学计数法（安全整数范围内）
-    return n.toString(10);
-  }
-  // 浮点数：确保不使用科学计数法
-  let s = String(n);
-  if (s.includes('e') || s.includes('E')) {
-    // 科学计数法 → 转为定点
-    s = n.toFixed(20).replace(/0+$/, '');
-    if (s.endsWith('.')) {
-      s += '0';
+    if (Math.abs(n) > MAX_SAFE_JSON_INTEGER) {
+      throw new RangeError(`canonicalJson: integer outside safe range ${n}`);
     }
+    return String(n);
   }
-  return s;
+  return expandExponent(String(n));
+}
+
+function expandExponent(s: string): string {
+  if (!/[eE]/.test(s)) return s;
+
+  const match = /^(-?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(s);
+  if (!match) {
+    throw new TypeError(`canonicalJson: invalid number ${s}`);
+  }
+  const sign = match[1] ?? '';
+  const intPart = match[2] ?? '';
+  const fracPart = match[3] ?? '';
+  const exp = Number(match[4]);
+  const digits = intPart + fracPart;
+  const point = intPart.length + exp;
+
+  if (point <= 0) {
+    return `${sign}0.${'0'.repeat(-point)}${digits}`;
+  }
+  if (point >= digits.length) {
+    return `${sign}${digits}${'0'.repeat(point - digits.length)}`;
+  }
+  return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
 }
 
 function serializeString(s: string): string {
@@ -102,9 +121,21 @@ function serializeArray(arr: unknown[]): string {
 }
 
 function serializeObject(obj: Record<string, unknown>): string {
-  const sortedKeys = Object.keys(obj).sort();
+  const sortedKeys = Object.keys(obj).sort(compareCodePoints);
   const pairs = sortedKeys.map(
     (key) => serializeString(key) + ':' + serialize(obj[key])
   );
   return '{' + pairs.join(',') + '}';
+}
+
+function compareCodePoints(a: string, b: string): number {
+  const ac = Array.from(a);
+  const bc = Array.from(b);
+  const n = Math.min(ac.length, bc.length);
+  for (let i = 0; i < n; i++) {
+    const av = ac[i].codePointAt(0) ?? 0;
+    const bv = bc[i].codePointAt(0) ?? 0;
+    if (av !== bv) return av - bv;
+  }
+  return ac.length - bc.length;
 }

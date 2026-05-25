@@ -10,7 +10,7 @@
   Test 5: 长连接互踢（同槽位）→ 4009；同槽位 3 个短连接不受影响
   Test 6: 短连接进入不发布 client.online（第三方订阅者收不到）
   Test 7: hello-ok 回包 connection.kind 字段
-  Test 8: 短连接默认禁用 auto_reconnect / 心跳
+  Test 8: 短连接默认禁用 heartbeat / token_refresh
 
 使用方法（必须在 kite-sdk-tester 容器内运行）：
   MSYS_NO_PATHCONV=1 docker exec kite-sdk-tester python /tests/integration_test_long_short.py
@@ -535,11 +535,11 @@ async def test_hello_ok_returns_connection_kind() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Test 8: 短连接禁用 auto_reconnect / 心跳
+# Test 8: 短连接禁用 heartbeat / token_refresh
 # ---------------------------------------------------------------------------
 
 async def test_short_disables_token_refresh() -> bool:
-    name = "Test 8: short disables token_refresh"
+    name = "Test 8: short disables heartbeat and token_refresh"
     print(f"\n=== {name} ===")
     rid = _rid()
     aid = f"ls-d8-{rid}.{_ISSUER}"
@@ -556,10 +556,14 @@ async def test_short_disables_token_refresh() -> bool:
         # session_options 应反映短连接默认值
         opts = short._session_options
 
-        # 心跳 task 应正常启动
+        if opts.get("connection_kind") != "short":
+            _fail(name, f"session_options.connection_kind={opts.get('connection_kind')}")
+            return False
+
+        # 短连接生命周期短，不启动后台心跳
         hb = getattr(short, "_heartbeat_task", None)
-        if hb is None or hb.done():
-            _fail(name, "_heartbeat_task should be started for short connection")
+        if hb is not None and not hb.done():
+            _fail(name, "_heartbeat_task started for short connection")
             return False
 
         # token_refresh 任务不应启动
@@ -600,7 +604,7 @@ async def main() -> int:
         ("long replaces long, shorts unaffected",    test_long_replaces_long_keeps_shorts),
         ("short does not publish client.online",     test_short_does_not_publish_client_online),
         ("hello-ok includes connection.kind",        test_hello_ok_returns_connection_kind),
-        ("short disables token_refresh",test_short_disables_token_refresh),
+        ("short disables heartbeat and token_refresh", test_short_disables_token_refresh),
     ]
 
     results: list[tuple[str, bool]] = []

@@ -629,6 +629,45 @@ export class AuthNamespace {
     }
   }
 
+
+  async headAgentMd(aid: string): Promise<JsonObject> {
+    const tStart = Date.now();
+    const targetAid = String(aid ?? '').trim();
+    if (!targetAid) {
+      throw new ValidationError('headAgentMd requires non-empty aid');
+    }
+    this._log.debug(`headAgentMd enter: aid=${targetAid}`);
+    try {
+      const response = await fetchWithTimeout(await this._resolveAgentMdUrl(targetAid), {
+        method: 'HEAD',
+        headers: { Accept: 'text/markdown' },
+      }, 15_000);
+      const respHeaders = response.headers;
+      const etag = respHeaders ? String(respHeaders.get('ETag') ?? '').trim() : '';
+      const lastModified = respHeaders ? String(respHeaders.get('Last-Modified') ?? '').trim() : '';
+      if (response.status === 404) {
+        this._log.debug(`headAgentMd exit (not_found): elapsed=${Date.now() - tStart}ms aid=${targetAid}`);
+        return { aid: targetAid, found: false, etag: '', last_modified: '', status: 404 };
+      }
+      if (response.status < 200 || response.status >= 300) {
+        throw new AUNError(`head agent.md failed: HTTP ${response.status}`);
+      }
+      if (etag || lastModified) {
+        const cached = this._agentMdCache.get(targetAid) ?? { text: '', etag: '', lastModified: '' };
+        this._agentMdCache.set(targetAid, {
+          text: cached.text ?? '',
+          etag,
+          lastModified,
+        });
+      }
+      this._log.debug(`headAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} status=${response.status} etag=${etag || '-'}`);
+      return { aid: targetAid, found: true, etag, last_modified: lastModified, status: response.status };
+    } catch (err) {
+      this._log.debug(`headAgentMd exit (error): elapsed=${Date.now() - tStart}ms aid=${targetAid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  }
+
   async downloadAgentMd(aid: string): Promise<string> {
     const tStart = Date.now();
     this._log.debug(`downloadAgentMd enter: aid=${aid}`);
@@ -743,6 +782,166 @@ export class AuthNamespace {
     } catch (err) {
       this._log.debug(`trustRoots exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
+    }
+  }
+
+  /**
+   * 检查指定 AID 的本地和远程状态。
+   * 与 Python SDK namespaces/auth_namespace.py:check_aid 对应。
+   */
+  async checkAid(params: RpcParams): Promise<JsonObject> {
+    const tStart = Date.now();
+    const aid = String(params?.aid ?? '').trim();
+    if (!aid) throw new ValidationError("auth.check_aid requires 'aid'");
+    this._log.debug(`checkAid enter: aid=${aid}`);
+    try {
+      const result = this._checkLocalAid(aid);
+      const local = result.local as JsonObject;
+      if (!local?.complete) {
+        const remote = await this._checkRemoteAidRegistration(aid);
+        result.remote = remote;
+        const remoteStatus = (remote as JsonObject)?.status;
+        if (remoteStatus === 'available') {
+          result.status = 'available';
+          result.can_register = true;
+        } else if (remoteStatus === 'registered') {
+          result.status = 'registered_remote';
+          result.can_register = false;
+        } else {
+          result.status = 'unknown';
+          result.can_register = false;
+        }
+      }
+      this._log.debug(`checkAid exit: elapsed=${Date.now() - tStart}ms aid=${aid} status=${result.status}`);
+      return result;
+    } catch (err) {
+      this._log.debug(`checkAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  }
+
+  private _checkLocalAid(aid: string): JsonObject {
+    const client = this._internal;
+    const keystore = client._keystore;
+    const identity = client._auth.loadIdentityOrNone(aid);
+
+    let keyPair: { private_key_pem?: string; public_key_der_b64?: string } | null = null;
+    let keyError = '';
+    try {
+      keyPair = keystore.loadKeyPair(aid) as any;
+    } catch (e) {
+      keyError = e instanceof Error ? e.message : String(e);
+    }
+
+    let certPem: string | null = null;
+    let certError = '';
+    try {
+      certPem = keystore.loadCert(aid);
+    } catch (e) {
+      certError = e instanceof Error ? e.message : String(e);
+    }
+
+    const privateKeyPresent = !!(keyPair && keyPair.private_key_pem);
+    const publicKeyPresent = !!(keyPair && keyPair.public_key_der_b64);
+    const certPresent = !!certPem;
+    const certInfo = certPresent ? this._inspectCert(aid, certPem!) : { present: false, valid: false, expired: false };
+    const certValid = !!(certInfo as any).valid;
+    const localComplete = privateKeyPresent && publicKeyPresent && certPresent && certValid;
+
+    const issues: string[] = [];
+    if (!identity) issues.push('local identity not found');
+    if (!privateKeyPresent) issues.push('private key missing');
+    if (!publicKeyPresent) issues.push('public key missing');
+    if (!certPresent) {
+      issues.push('certificate missing');
+    } else if ((certInfo as any).parse_error) {
+      issues.push(`certificate invalid: ${(certInfo as any).parse_error}`);
+    } else if ((certInfo as any).expired) {
+      issues.push('certificate expired');
+    } else if (!certValid) {
+      issues.push('certificate not currently valid');
+    }
+    if (keyError) issues.push(`key load error: ${keyError}`);
+    if (certError) issues.push(`certificate load error: ${certError}`);
+
+    return {
+      aid,
+      status: localComplete ? 'local_ready' : 'local_incomplete',
+      can_register: localComplete ? false : null,
+      local: {
+        exists: identity !== null,
+        complete: localComplete,
+        private_key: privateKeyPresent,
+        public_key: publicKeyPresent,
+        certificate: certInfo,
+        issues,
+      },
+      remote: {
+        status: localComplete ? 'not_checked' : 'pending',
+      },
+    };
+  }
+
+  private _inspectCert(aid: string, certPem: string): JsonObject {
+    const result: JsonObject = { present: true, valid: false, expired: false };
+    try {
+      const cert = new X509Certificate(certPem);
+      const now = Date.now();
+      const notBefore = new Date(cert.validFrom).getTime();
+      const notAfter = new Date(cert.validTo).getTime();
+      const valid = now >= notBefore && now <= notAfter;
+      const expired = now > notAfter;
+      const fingerprint = certificateSha256Fingerprint(certPem);
+      const cn = extractCommonName(cert.subject);
+      const aidMatches = !cn || cn === aid;
+
+      result.valid = valid && aidMatches;
+      result.expired = expired;
+      result.not_before = new Date(cert.validFrom).toISOString();
+      result.not_after = new Date(cert.validTo).toISOString();
+      result.expires_at = Math.floor(notAfter / 1000);
+      result.seconds_until_expiry = Math.floor((notAfter - now) / 1000);
+      result.fingerprint = fingerprint;
+      result.subject_cn = cn;
+      result.aid_matches = aidMatches;
+
+      if (cn && cn !== aid) {
+        result.valid = false;
+        result.parse_error = `certificate CN mismatch: ${cn}`;
+      }
+    } catch (e) {
+      result.parse_error = e instanceof Error ? e.message : String(e);
+    }
+    return result;
+  }
+
+  private async _checkRemoteAidRegistration(aid: string): Promise<JsonObject> {
+    try {
+      const content = await this.downloadAgentMd(aid);
+      return {
+        status: 'registered',
+        registered: true,
+        available: false,
+        source: 'agent.md',
+        agent_md_bytes: new TextEncoder().encode(content).length,
+        agent_md_aid: extractAgentMDAid(content),
+      };
+    } catch (err) {
+      if (err instanceof NotFoundError) {
+        return {
+          status: 'available',
+          registered: false,
+          available: true,
+          source: 'agent.md',
+        };
+      }
+      return {
+        status: 'unknown',
+        registered: null,
+        available: null,
+        source: 'agent.md',
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
   }
 }

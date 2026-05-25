@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional
 
 import typer
 
 from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config
-from aun_cli.config import set_profile
+from aun_cli.config import get_profile, set_profile
 from aun_cli.output import output_dict, output_success, output_json, output_table, is_json_mode, set_json_mode
 
 identity_app = typer.Typer(name="identity", help="身份管理", no_args_is_help=True)
@@ -38,27 +37,17 @@ def identity_list(ctx: typer.Context) -> None:
         output_table(headers, rows)
 
 
-def register(
+@identity_app.command("check")
+def identity_check(
     ctx: typer.Context,
-    aid: str = typer.Argument(..., help="要注册的 AID (如 alice@aid.com)"),
-    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="网关地址（可选，SDK 支持自动发现）"),
+    aid: str = typer.Argument(..., help="要检查的 AID"),
 ) -> None:
-    """注册新 AID"""
+    """检查 AID 本地身份材料和远端注册可用性"""
     set_json_mode(ctx.obj.get("json", False))
-    profile_name = ctx.obj.get("profile", "default")
 
     async def _run():
-        from aun_core import AUNClient
-        aun_path = str(Path.home() / ".aun" / "profiles" / profile_name)
-        config: dict = {"aun_path": aun_path}
-        if gateway:
-            config["gateway"] = gateway
-        client = AUNClient(config=config, debug=ctx.obj.get("debug", False))
-        try:
-            result = await client.auth.create_aid({"aid": aid})
-            return result
-        finally:
-            await client.close()
+        async with CLISession(ctx, need_auth=False) as client:
+            return await client.auth.check_aid({"aid": aid})
 
     try:
         result = run_async(_run())
@@ -66,8 +55,64 @@ def register(
         handle_error(e)
         return
 
-    aun_path = str(Path.home() / ".aun" / "profiles" / profile_name)
-    profile_data: dict = {"aid": aid, "aun_path": aun_path}
+    if is_json_mode():
+        output_json(result)
+        return
+
+    local = result.get("local", {})
+    cert = local.get("certificate", {}) if isinstance(local, dict) else {}
+    remote = result.get("remote", {})
+    rows = [
+        ["AID", result.get("aid", aid)],
+        ["Status", result.get("status", "")],
+        ["Can Register", str(result.get("can_register"))],
+        ["Local Exists", str(local.get("exists", False))],
+        ["Local Complete", str(local.get("complete", False))],
+        ["Private Key", str(local.get("private_key", False))],
+        ["Public Key", str(local.get("public_key", False))],
+        ["Certificate", str(cert.get("present", False))],
+        ["Certificate Valid", str(cert.get("valid", False))],
+        ["Certificate Expired", str(cert.get("expired", False))],
+        ["Certificate Not After", str(cert.get("not_after", ""))],
+        ["Certificate Fingerprint", str(cert.get("fingerprint", ""))],
+        ["Remote Status", str(remote.get("status", ""))],
+        ["Remote Source", str(remote.get("source", ""))],
+    ]
+    if remote.get("error"):
+        rows.append(["Remote Error", str(remote.get("error"))])
+    issues = local.get("issues", []) if isinstance(local, dict) else []
+    if issues:
+        rows.append(["Local Issues", "; ".join(str(item) for item in issues)])
+    output_table(["FIELD", "VALUE"], rows)
+
+
+def register(
+    ctx: typer.Context,
+    aid: str = typer.Argument(..., help="要注册的 AID (如 alice@aid.com)"),
+    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="网关地址（可选，SDK 支持自动发现）"),
+) -> None:
+    """注册新 AID"""
+    set_json_mode(ctx.obj.get("json", False))
+    resolved = resolve_profile_config(ctx)
+    profile_name = resolved["profile_name"]
+    aun_path = resolved["aun_path"]
+
+    async def _run():
+        async with CLISession(ctx, need_auth=False, gateway=gateway) as client:
+            return await client.auth.create_aid({"aid": aid})
+
+    try:
+        result = run_async(_run())
+    except Exception as e:
+        handle_error(e)
+        return
+
+    try:
+        profile_data: dict = get_profile(profile_name)
+    except KeyError:
+        profile_data = {}
+    profile_data["aid"] = aid
+    profile_data["aun_path"] = aun_path
     discovered_gateway = result.get("gateway") or gateway
     if discovered_gateway:
         profile_data["gateway"] = discovered_gateway

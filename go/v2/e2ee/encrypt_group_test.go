@@ -55,6 +55,67 @@ func TestEncryptGroupRoundtrip3DH(t *testing.T) {
 	}
 }
 
+func TestEncryptGroupSPKPublicKeyWithoutIDUses1DH(t *testing.T) {
+	sender := makeTestSender(t)
+	target, ikPriv, _ := makeTestRecipient(t, "member", "group_device_prekey", true)
+	target.SPKID = ""
+	payload := map[string]any{"text": "group SPK pub without ID"}
+
+	envelope, err := EncryptGroupMessage(sender, "g-test.aid.com", 5,
+		[]Target{target}, payload, EncryptOptions{}, nil)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	if got := envelope["aad"].(map[string]any)["wrap_protocol"]; got != "1DH" {
+		t.Fatalf("wrap_protocol 应为 1DH，实际: %v", got)
+	}
+	rows, err := convertRecipientsToStringMatrix(envelope["recipients"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0][3] != "aid_master" || rows[0][5] != "" {
+		t.Fatalf("1DH row 应写 aid_master/空 spk_id，实际: %v", rows[0])
+	}
+	decrypted, err := DecryptMessage(envelope, target.AID, target.DeviceID, ikPriv, nil, sender.IKPubDER)
+	if err != nil {
+		t.Fatalf("1DH 解密失败: %v", err)
+	}
+	if !reflect.DeepEqual(decrypted, payload) {
+		t.Fatalf("payload 不一致\n期望: %v\n实际: %v", payload, decrypted)
+	}
+}
+
+func TestEncryptGroupPayloadTypeTopLevel(t *testing.T) {
+	sender := makeTestSender(t)
+	target, ikPriv, _ := makeTestRecipient(t, "member", "aid_master", false)
+	payload := map[string]any{"type": "group-text", "text": "visible group type"}
+
+	envelope, err := EncryptGroupMessage(sender, "g-test.aid.com", 5, []Target{target}, payload, EncryptOptions{}, nil)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	if got := envelope["payload_type"]; got != "group-text" {
+		t.Fatalf("payload_type 应在群信封顶层透传，实际: %#v", got)
+	}
+	headers, ok := envelope["protected_headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("protected_headers 应存在，实际: %#v", envelope["protected_headers"])
+	}
+	if got := headers["payload_type"]; got != "group-text" {
+		t.Fatalf("protected_headers.payload_type 应保留兼容校验，实际: %#v", got)
+	}
+	if headers["sdk_lang"] != e2eeSDKLang || headers["sdk_vesion"] != e2eeSDKVersion {
+		t.Fatalf("protected_headers SDK 元信息错误: %#v", headers)
+	}
+	decrypted, err := DecryptMessage(envelope, target.AID, target.DeviceID, ikPriv, nil, sender.IKPubDER)
+	if err != nil {
+		t.Fatalf("解密失败: %v", err)
+	}
+	if !reflect.DeepEqual(decrypted, payload) {
+		t.Fatalf("payload 不一致\n期望: %v\n实际: %v", payload, decrypted)
+	}
+}
+
 // TestEncryptGroupMixedProtocol 群多成员（3DH + 1DH）。
 func TestEncryptGroupMixedProtocol(t *testing.T) {
 	sender := makeTestSender(t)

@@ -24,11 +24,11 @@ import (
 // TestIntegration_ReplayGuardBasicMessageFlow 基本消息收发 + replay guard 字段验证
 //
 // 场景：
-//   1. Alice 和 Bob 连接
-//   2. Alice 发送加密消息给 Bob
-//   3. Bob 通过推送或 pull 接收
-//   4. 验证消息包含 timestamp 和 message_id
-//   5. 发送第二条消息，验证 message_id 不同
+//  1. Alice 和 Bob 连接
+//  2. Alice 发送加密消息给 Bob
+//  3. Bob 通过推送或 pull 接收
+//  4. 验证消息包含 timestamp 和 message_id
+//  5. 发送第二条消息，验证 message_id 不同
 func TestIntegration_ReplayGuardBasicMessageFlow(t *testing.T) {
 	rid := runID()
 	alice := makeClient(t)
@@ -69,11 +69,21 @@ func TestIntegration_ReplayGuardBasicMessageFlow(t *testing.T) {
 
 	msg1 := msgs[0]
 
-	// 验证 timestamp 字段存在
-	if _, ok := msg1["timestamp"]; !ok {
-		t.Errorf("消息缺少 timestamp 字段: %v", msg1)
-	} else {
+	// 当前 V2 成功解密后的应用层消息使用 t_server；失败事件仍可能使用 timestamp。
+	// 这里校验至少有一个服务端时间字段，而不是固定旧字段名。
+	if _, ok := msg1["timestamp"]; ok {
 		t.Logf("消息 timestamp: %v", msg1["timestamp"])
+	} else if _, ok := msg1["t_server"]; ok {
+		t.Logf("消息 t_server: %v", msg1["t_server"])
+	} else {
+		t.Errorf("消息缺少 timestamp/t_server 字段: %v", msg1)
+	}
+
+	if int(toInt64(msg1["seq"])) <= 0 {
+		t.Errorf("消息缺少有效 seq 字段: %v", msg1)
+	}
+	if e2eeMeta, ok := msg1["e2ee"].(map[string]any); !ok || e2eeMeta == nil {
+		t.Errorf("消息缺少 e2ee 元数据: %v", msg1)
 	}
 
 	// 验证 message_id 字段存在
@@ -146,10 +156,10 @@ func TestIntegration_ReplayGuardBasicMessageFlow(t *testing.T) {
 // TestIntegration_ReplayGuardDuplicatePullIdempotent 重复 pull 幂等性验证
 //
 // 场景：
-//   1. Alice 发送消息给 Bob
-//   2. Bob 以 after_seq=0 拉取
-//   3. Bob 再次以 after_seq=0 拉取
-//   4. 两次 pull 应返回相同消息（幂等），不应崩溃或报错
+//  1. Alice 发送消息给 Bob
+//  2. Bob 以 after_seq=0 拉取
+//  3. Bob 再次以 after_seq=0 拉取
+//  4. 两次 pull 应返回相同消息（幂等），不应崩溃或报错
 func TestIntegration_ReplayGuardDuplicatePullIdempotent(t *testing.T) {
 	rid := runID()
 	alice := makeClient(t)
@@ -265,10 +275,10 @@ func TestIntegration_ReplayGuardDuplicatePullIdempotent(t *testing.T) {
 // TestIntegration_ReplayGuardSequenceProgression 消息序列号严格递增验证
 //
 // 场景：
-//   1. Alice 连续发送 5 条消息给 Bob
-//   2. Bob 拉取所有消息
-//   3. 验证 seq 严格递增
-//   4. 验证 seq 无间隙
+//  1. Alice 连续发送 5 条消息给 Bob
+//  2. Bob 拉取所有消息
+//  3. 验证 seq 严格递增
+//  4. 验证 seq 无间隙
 func TestIntegration_ReplayGuardSequenceProgression(t *testing.T) {
 	rid := runID()
 	alice := makeClient(t)

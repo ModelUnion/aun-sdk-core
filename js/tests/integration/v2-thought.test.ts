@@ -16,12 +16,42 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AUNClient } from '../../src/client.js';
 import { V2KeyStore, V2Session } from '../../src/v2/session/index.js';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh.js';
+import { ecdsaSignRaw } from '../../src/v2/crypto/ecdsa.js';
 import { decryptMessage } from '../../src/v2/e2ee/decrypt.js';
 
 function uint8ToB64(bytes: Uint8Array): string {
   let bin = '';
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin);
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+async function signedSPKFields(ikPriv: Uint8Array, spkPub: Uint8Array): Promise<Record<string, unknown>> {
+  const hex = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', spkPub.slice().buffer)));
+  const spkId = `sha256:${hex.substring(0, 16)}`;
+  const spkTimestamp = 1700000000;
+  const encoder = new TextEncoder();
+  const signData = concatBytes(spkPub, encoder.encode(spkId), encoder.encode(String(spkTimestamp)));
+  const signature = await ecdsaSignRaw(ikPriv, signData);
+  return {
+    spk_id: spkId,
+    spk_signature: uint8ToB64(signature),
+    spk_timestamp: spkTimestamp,
+  };
 }
 
 async function newClientWithV2(aid: string, deviceId = 'dev-self'): Promise<{
@@ -60,6 +90,8 @@ describe('V2 thought 集成测试（mock transport）', () => {
     const [bobSpkPriv, bobSpkPub] = await generateP256Keypair();
     const bobIkB64 = uint8ToB64(bobIkPub);
     const bobSpkB64 = uint8ToB64(bobSpkPub);
+    const bobSPK = await signedSPKFields(bobIkPriv, bobSpkPub);
+    vi.spyOn(aliceCtx.client as any, '_v2TrustedIKPubDer').mockResolvedValue(bobIkPub);
 
     vi.spyOn(aliceCtx.client as any, 'call').mockImplementation(async (method: any, params: any): Promise<any> => {
       if (method === 'message.v2.bootstrap') {
@@ -70,7 +102,7 @@ describe('V2 thought 集成测试（mock transport）', () => {
               device_id: 'dev-bob-1',
               ik_pk: bobIkB64,
               spk_pk: bobSpkB64,
-              spk_id: 'sha256:bob_spk_1',
+              ...bobSPK,
               key_source: 'peer_device_prekey',
             }],
             audit_recipients: [],
@@ -126,6 +158,8 @@ describe('V2 thought 集成测试（mock transport）', () => {
     const [bobSpkPriv, bobSpkPub] = await generateP256Keypair();
     const bobIkB64 = uint8ToB64(bobIkPub);
     const bobSpkB64 = uint8ToB64(bobSpkPub);
+    const bobSPK = await signedSPKFields(bobIkPriv, bobSpkPub);
+    vi.spyOn(aliceCtx.client as any, '_v2TrustedIKPubDer').mockResolvedValue(bobIkPub);
 
     vi.spyOn(aliceCtx.client as any, 'call').mockImplementation(async (method: any): Promise<any> => {
       if (method === 'group.v2.bootstrap') {
@@ -135,7 +169,7 @@ describe('V2 thought 集成测试（mock transport）', () => {
             device_id: 'dev-bob-1',
             ik_pk: bobIkB64,
             spk_pk: bobSpkB64,
-            spk_id: 'sha256:bob_spk_1',
+            ...bobSPK,
             key_source: 'peer_device_prekey',
           }],
           epoch: 1,

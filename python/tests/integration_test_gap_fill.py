@@ -47,7 +47,7 @@ _TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).s
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
-_CAROL_AID = os.environ.get("AUN_TEST_CAROL_AID", f"carol.{_ISSUER}").strip()
+_CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
 
 # ---------------------------------------------------------------------------
 # 计数
@@ -102,6 +102,14 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
 
 def _seq_of(msg: dict) -> int:
     return int(msg.get("seq") or 0)
+
+
+def _payload_text(msg: dict) -> str | None:
+    payload = msg.get("payload")
+    if isinstance(payload, dict):
+        text = payload.get("text")
+        return text if isinstance(text, str) else None
+    return payload if isinstance(payload, str) else None
 
 
 async def _sdk_send(client: AUNClient, to_aid: str, payload: str):
@@ -183,20 +191,27 @@ async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: i
 
 
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
-    """获取当前最大 seq"""
+    """获取当前最大 seq。
+
+    V2 pull 的下界推进以 raw 服务端行和 cursor 为准，不能用解密后的
+    messages 数量判断是否还有下一页；否则历史解密失败会导致 baseline 低估。
+    """
     after_seq = 0
     max_seq = 0
-    while True:
+    for _ in range(100):
         result = await client.call("message.pull", {"after_seq": after_seq, "limit": limit})
-        max_seq = max(max_seq, int(result.get("server_ack_seq") or 0), int(result.get("latest_seq") or 0))
+        latest_seq = int(result.get("latest_seq") or 0)
+        server_ack_seq = int(result.get("server_ack_seq") or 0)
+        raw_count = int(result.get("raw_count") or 0)
+        max_seq = max(max_seq, server_ack_seq, latest_seq)
         msgs = result.get("messages", [])
-        if not msgs:
-            return max_seq
         for msg in msgs:
             max_seq = max(max_seq, _seq_of(msg))
-        if len(msgs) < limit:
+        next_after = max(max_seq, after_seq)
+        if raw_count <= 0 or next_after <= after_seq:
             return max_seq
-        after_seq = max_seq
+        after_seq = next_after
+    return max_seq
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +272,7 @@ async def test_p2p_payload_gap_fill():
             _fail("p2p_payload_gap_fill", f"seq 不连续：期望 {expected_seqs}，实际 {seqs}")
             return
 
-        payloads = [m.get("payload") for m in recent_msgs]
+        payloads = [_payload_text(m) for m in recent_msgs]
         expected_payloads = ["msg1", "msg2", "msg3", "msg4", "msg5"]
         if payloads != expected_payloads:
             _fail("p2p_payload_gap_fill", f"payload 不匹配：期望 {expected_payloads}，实际 {payloads}")
@@ -274,12 +289,12 @@ async def test_group_payload_gap_fill():
     """测试群消息 payload gap 自动补洞"""
     alice = _make_client("group-alice")
     bob = _make_client("group-bob")
-    carol = _make_client("group-carol")
+    charlie = _make_client("group-charlie")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
         await _ensure_connected(bob, _BOB_AID)
-        await _ensure_connected(carol, _CAROL_AID)
+        await _ensure_connected(charlie, _CHARLIE_AID)
 
         # 1. Alice 创建群组并添加成员
         group_result = await alice.call("group.create", {
@@ -289,7 +304,7 @@ async def test_group_payload_gap_fill():
         print(f"  [INFO] 创建群组 {group_id}")
 
         await alice.call("group.add_member", {"group_id": group_id, "aid": _BOB_AID})
-        await alice.call("group.add_member", {"group_id": group_id, "aid": _CAROL_AID})
+        await alice.call("group.add_member", {"group_id": group_id, "aid": _CHARLIE_AID})
 
         await asyncio.sleep(2.0)  # 等待成员同步 + E2EE 密钥分发
 
@@ -329,7 +344,7 @@ async def test_group_payload_gap_fill():
             _fail("group_payload_gap_fill", f"seq 不连续：期望 {expected_seqs}，实际 {seqs}")
             return
 
-        payloads = [m.get("payload") for m in recent_msgs]
+        payloads = [_payload_text(m) for m in recent_msgs]
         expected_payloads = ["group_msg1", "group_msg2", "group_msg3", "group_msg4", "group_msg5"]
         if payloads != expected_payloads:
             _fail("group_payload_gap_fill", f"payload 不匹配：期望 {expected_payloads}，实际 {payloads}")
@@ -340,7 +355,7 @@ async def test_group_payload_gap_fill():
     finally:
         await alice.close()
         await bob.close()
-        await carol.close()
+        await charlie.close()
 
 
 async def main():

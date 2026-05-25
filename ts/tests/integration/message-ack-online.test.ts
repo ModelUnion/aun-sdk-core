@@ -3,7 +3,6 @@
  *
  * 覆盖：
  *   - 消息 ACK 基础：发送 → pull → ack → ack_seq 推进
- *   - 消息 ACK 事件：ack 后发送方收到 ack 事件
  *   - 消息 ACK 序列：连续 ack 按顺序推进
  *   - 在线状态：连接后在线、断开后离线、批量查询、重连恢复
  *
@@ -137,78 +136,6 @@ describe('消息 ACK 基础', () => {
       expect(ackResult?.success).toBe(true);
       expect(ackResult?.ack_seq).toBeDefined();
       expect(Number(ackResult?.ack_seq)).toBeGreaterThanOrEqual(ackTargetSeq);
-    } finally {
-      await alice.close();
-      await bob.close();
-    }
-  }, 60_000);
-});
-
-// ── 消息 ACK 事件 ──────────────────────────────────────────────────
-
-describe('消息 ACK 事件', () => {
-  it('ack 后发送方应收到 ack 事件', async () => {
-    const rid = runId();
-    const aliceAid = `ackea${rid}.${ISSUER}`;
-    const bobAid = `ackeb${rid}.${ISSUER}`;
-
-    const alice = makeClient();
-    const bob = makeClient();
-
-    try {
-      await ensureConnected(alice, aliceAid);
-      await ensureConnected(bob, bobAid);
-
-      // Alice 订阅 ack 事件
-      let ackEvent: Record<string, unknown> | null = null;
-      let resolveAck: (() => void) | null = null;
-      const ackReceived = new Promise<void>(r => { resolveAck = r; });
-
-      alice.on('message.ack', (data: unknown) => {
-        if (typeof data === 'object' && data !== null) {
-          ackEvent = data as Record<string, unknown>;
-          if (resolveAck) resolveAck();
-        }
-      });
-
-      const text = `ack-event-${rid}`;
-      const pushed = waitForP2pMessages(
-        bob,
-        aliceAid,
-        1,
-        10_000,
-        message => payloadText(message) === text,
-      );
-
-      // Alice 发送消息给 Bob
-      await alice.call('message.send', {
-        to: bobAid,
-        payload: { type: 'text', text },
-        durable: true,
-        encrypt: false,
-      });
-
-      const messages = await pushed;
-      expect(messages.length).toBe(1);
-
-      const ackTargetSeq = Number(messages[0]?.seq ?? 0);
-      expect(ackTargetSeq).toBeGreaterThan(0);
-
-      await bob.call('message.ack', { seq: ackTargetSeq });
-
-      // 等待 Alice 收到 ack 事件（最多 10 秒）
-      const timeout = new Promise<void>((_, reject) =>
-        setTimeout(() => reject(new Error('等待 ack 事件超时')), 10_000),
-      );
-
-      await Promise.race([ackReceived, timeout]);
-      expect(ackEvent).not.toBeNull();
-      // 验证事件中包含正确的目标 AID 和 ack_seq
-      if (ackEvent) {
-        expect(ackEvent.to ?? ackEvent.from ?? ackEvent.aid).toBeDefined();
-        expect(Number(ackEvent.ack_seq ?? 0)).toBeGreaterThanOrEqual(ackTargetSeq);
-        console.log(`收到 ack 事件: ack_seq=${ackEvent.ack_seq}`);
-      }
     } finally {
       await alice.close();
       await bob.close();

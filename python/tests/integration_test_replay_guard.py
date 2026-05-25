@@ -144,7 +144,7 @@ async def test_replay_guard_fail_close():
         wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
         send_result = await alice.call("message.send", {
             "to": _BOB_AID,
-            "payload": "test replay guard",
+            "payload": {"type": "text", "text": "test replay guard"},
             "encrypt": True
         })
         message_id = send_result.get("message_id")
@@ -206,7 +206,7 @@ async def test_replay_guard_rpc_timeout():
         wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
         await alice.call("message.send", {
             "to": _BOB_AID,
-            "payload": "test timeout",
+            "payload": {"type": "text", "text": "test timeout"},
             "encrypt": True
         })
 
@@ -245,7 +245,7 @@ async def test_replay_guard_error_handling():
         wait_task = asyncio.create_task(_wait_for_message(bob, _ALICE_AID))
         await alice.call("message.send", {
             "to": _BOB_AID,
-            "payload": "test error handling",
+            "payload": {"type": "text", "text": "test error handling"},
             "encrypt": True
         })
 
@@ -257,10 +257,16 @@ async def test_replay_guard_error_handling():
 
         print(f"  [INFO] 收到消息: seq={msg.get('seq')}, message_id={msg.get('message_id')}")
 
-        # 3. 验证消息包含必要的 replay guard 字段
-        # 实际实现中，replay guard 可能使用 nonce、timestamp 等字段
-        if "timestamp" not in msg:
-            _fail("replay_guard_error_handling", "消息缺少 timestamp 字段")
+        # 3. 验证消息包含当前应用层信封语义下的必要字段。
+        # V2 成功解密消息使用 t_server 表示服务端时间；timestamp 保留给旧路径或失败事件。
+        if "timestamp" not in msg and "t_server" not in msg:
+            _fail("replay_guard_error_handling", "消息缺少 timestamp/t_server 字段")
+            return
+        if not msg.get("message_id") or msg.get("seq") is None:
+            _fail("replay_guard_error_handling", "消息缺少 message_id 或 seq 字段")
+            return
+        if not msg.get("encrypted") or not isinstance(msg.get("e2ee"), dict):
+            _fail("replay_guard_error_handling", "消息缺少 V2 E2EE 元数据")
             return
 
         _ok("replay_guard_error_handling_basic")

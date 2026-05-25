@@ -57,6 +57,15 @@ export class SeqTracker {
     return this._get(ns).maxSeenSeq;
   }
 
+  /** Push 专用：只扩展上界 maxSeenSeq，不动 contiguousSeq。 */
+  updateMaxSeen(ns: string, seq: number): void {
+    if (seq <= 0) return;
+    const t = this._get(ns);
+    if (seq > t.maxSeenSeq) {
+      t.maxSeenSeq = seq;
+    }
+  }
+
   /** S2: 从持久化（keystore 最近 ack seq）恢复 baseline，
    *  以便首条 push 消息能构造 [baseline+1, seq-1] 的历史 gap。
    *  必须在收到首条消息前调用。 */
@@ -200,9 +209,8 @@ export class SeqTracker {
       if (s < minSeq) minSeq = s;
     }
     if (minSeq === Infinity) return;
-    // 强制推进到 minSeq（跳过空洞）
-    t.contiguousSeq = minSeq;
-    t.receivedSeqs.delete(minSeq);
+    // 强制推进到 minSeq 前一位，再按连续前缀自然推进。
+    t.contiguousSeq = minSeq - 1;
     // 清理被跳过区间内的 pendingGaps
     for (const [key, probe] of t.pendingGaps) {
       if (probe.gapEnd <= t.contiguousSeq) {
@@ -261,10 +269,9 @@ export class SeqTracker {
     this._trackers.delete(ns);
   }
 
-  /** 强制跳过不连续区间，将 contiguousSeq 拨到指定位置。
-   *  当服务端返回 server_ack_seq 且本地 contiguousSeq 落后时调用，
-   *  跳过 [contiguousSeq, server_ack_seq) 这段不连续区间。 */
+  /** Pull 专用：强制推进 contiguousSeq（已连续到达的下界）。 */
   forceContiguousSeq(ns: string, seq: number): void {
+    if (seq <= 0) return;
     const t = this._get(ns);
     if (seq > t.contiguousSeq) {
       // 清除被跳过区间内的 pendingGaps
@@ -280,6 +287,23 @@ export class SeqTracker {
       t.contiguousSeq = seq;
       t.maxSeenSeq = Math.max(t.maxSeenSeq, seq);
       this._tryAdvance(t);
+    }
+  }
+
+  /** 脏数据修复：允许 contiguousSeq 倒退到指定值。 */
+  repairContiguousSeq(ns: string, seq: number): void {
+    if (seq < 0) seq = 0;
+    const t = this._get(ns);
+    if (seq < t.contiguousSeq) {
+      for (const s of t.receivedSeqs) {
+        if (s <= seq) t.receivedSeqs.delete(s);
+      }
+      for (const [key, probe] of t.pendingGaps) {
+        if (probe.gapStart <= seq) {
+          t.pendingGaps.delete(key);
+        }
+      }
+      t.contiguousSeq = seq;
     }
   }
 

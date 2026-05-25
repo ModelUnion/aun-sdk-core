@@ -373,7 +373,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
   it('Test 4: 短连接 short_ttl_ms 滑动窗口 — 不保活被关闭，保活不关闭', async () => {
     if (skip()) return;
 
-    const ttl = 1500; // 1.5s
+    const ttl = 3000; // 留出 connect 后 V2 初始化时间，测试重点仍是 idle 滑动窗口
 
     // 4a. 不保活：建立后空闲，应被服务端 4014 关闭
     {

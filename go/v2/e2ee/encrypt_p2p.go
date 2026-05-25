@@ -15,6 +15,11 @@ import (
 	"github.com/modelunion/aun-sdk-core/go/v2/crypto"
 )
 
+const (
+	e2eeSDKLang    = "go"
+	e2eeSDKVersion = "0.3.2"
+)
+
 // EncryptP2PMessage 构造完整的 V2 P2P 加密 envelope（type=e2ee.p2p_encrypted）。
 //
 // 与 Python `encrypt_p2p_message` 字节级对齐：
@@ -22,7 +27,7 @@ import (
 //  1. 生成 master_key(32B) + msg_nonce(12B)
 //  2. 决定 message_id / timestamp（缺省自动生成）
 //  3. 选取第一个非 audit 的 target.AID 作为 AAD.to
-//  4. 根据 (key_source, spk_pk_der) 推导 wrap_protocol（"3DH" / "1DH" / "1DH+3DH"）
+//  4. 根据 (spk_id, key_source, spk_pk_der) 推导 wrap_protocol（"3DH" / "1DH" / "1DH+3DH"）
 //  5. 用 AAD 加密 payload，得到 ciphertext + tag
 //  6. 生成一次性 sender_session keypair，计算 wrap_salt
 //  7. 为每个 recipient（targets + audit_recipients）wrap master_key
@@ -57,7 +62,7 @@ func EncryptP2PMessage(sender Sender, targetSet TargetSet, payload map[string]an
 		}
 	}
 
-	// wrap_protocol: 根据所有 target（含 audit）的 (spk_pk_der, key_source) 聚合
+	// wrap_protocol: 根据所有 target（含 audit）的 (spk_id, spk_pk_der, key_source) 聚合
 	allTargets := make([]Target, 0, len(targetSet.Targets)+len(targetSet.AuditRecipients))
 	allTargets = append(allTargets, targetSet.Targets...)
 	allTargets = append(allTargets, targetSet.AuditRecipients...)
@@ -147,6 +152,11 @@ func EncryptP2PMessage(sender Sender, targetSet TargetSet, payload map[string]an
 		"recipients":              recipientsAny,
 		"aad":                     aad,
 	}
+	if payloadType, err := payloadTypeFromPayload(payload); err != nil {
+		return nil, fmt.Errorf("encrypt_p2p: payload_type 无效: %w", err)
+	} else if payloadType != "" {
+		envelope["payload_type"] = payloadType
+	}
 
 	// protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
 	// payload_type 自动注入 + value 转 string（与 Python _normalize_headers 对齐）
@@ -165,12 +175,13 @@ func EncryptP2PMessage(sender Sender, targetSet TargetSet, payload map[string]an
 }
 
 // deriveWrapProtocol 根据 targets 聚合 wrap_protocol 字符串。
-// 与 Python 一致：仅当 spk_pk_der 非空且 key_source ∈ {peer_device_prekey, group_device_prekey} 时记 3DH，
-// 其它（含 audit 走 aid_master）记 1DH；空集合兜底返回 "1DH"。
+// 与 Python 一致：仅当 spk_id/spk_pk_der 非空且 key_source ∈
+// {peer_device_prekey, group_device_prekey} 时记 3DH，其它记 1DH；
+// 空集合兜底返回 "1DH"。
 func deriveWrapProtocol(targets []Target) string {
 	protoSet := map[string]bool{}
 	for _, t := range targets {
-		if len(t.SPKPkDER) > 0 && (t.KeySource == "peer_device_prekey" || t.KeySource == "group_device_prekey") {
+		if usesSPKWrap(t) {
 			protoSet["3DH"] = true
 		} else {
 			protoSet["1DH"] = true
@@ -207,6 +218,17 @@ func computeCertFingerprint(ikPubDER []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])[:16]
 }
 
+func payloadTypeFromPayload(payload map[string]any) (string, error) {
+	if payload == nil {
+		return "", nil
+	}
+	value, ok := payload["type"]
+	if !ok {
+		return "", nil
+	}
+	return protectedHeaderValueString(value)
+}
+
 // normalizeProtectedHeaders 规范化 protected_headers：value 转 string + 自动注入 payload_type。
 // 与 Python `_normalize_headers` 对齐。
 func normalizeProtectedHeaders(headers map[string]any, payload map[string]any) (map[string]any, error) {
@@ -216,12 +238,19 @@ func normalizeProtectedHeaders(headers map[string]any, payload map[string]any) (
 		if err != nil {
 			return nil, err
 		}
-		normalized[key] = pythonProtectedHeaderValueString(v)
+		value, err := protectedHeaderValueString(v)
+		if err != nil {
+			return nil, err
+		}
+		normalized[key] = value
 	}
 	// payload_type 自动注入（与 Python 对齐：payload.get("type") → protected_headers["payload_type"]）
 	if payload != nil {
 		if pt, ok := payload["type"]; ok {
-			ptStr := pythonProtectedHeaderValueString(pt)
+			ptStr, err := protectedHeaderValueString(pt)
+			if err != nil {
+				return nil, err
+			}
 			if ptStr != "" {
 				if _, exists := normalized["payload_type"]; !exists {
 					normalized["payload_type"] = ptStr
@@ -229,6 +258,8 @@ func normalizeProtectedHeaders(headers map[string]any, payload map[string]any) (
 			}
 		}
 	}
+	normalized["sdk_lang"] = e2eeSDKLang
+	normalized["sdk_vesion"] = e2eeSDKVersion
 	return normalized, nil
 }
 
@@ -248,7 +279,12 @@ func wrapForRecipient(target Target, masterKey, senderSessionPriv, senderMasterP
 
 	var wrapKey []byte
 	var err error
-	if len(target.SPKPkDER) > 0 && (target.KeySource == "peer_device_prekey" || target.KeySource == "group_device_prekey") {
+	use3DH := usesSPKWrap(target)
+	rowKeySource := "aid_master"
+	rowSPKID := ""
+	if use3DH {
+		rowKeySource = target.KeySource
+		rowSPKID = target.SPKID
 		wrapKey, err = crypto.Compute3DHWrap(senderSessionPriv, senderMasterPriv, target.IKPkDER, target.SPKPkDER, wrapSalt)
 	} else {
 		wrapKey, err = crypto.Compute1DHWrap(senderSessionPriv, target.IKPkDER, wrapSalt)
@@ -269,10 +305,16 @@ func wrapForRecipient(target Target, masterKey, senderSessionPriv, senderMasterP
 		target.AID,
 		target.DeviceID,
 		target.Role,
-		target.KeySource,
+		rowKeySource,
 		fp,
-		target.SPKID,
+		rowSPKID,
 		base64.StdEncoding.EncodeToString(wrapNonce),
 		base64.StdEncoding.EncodeToString(wrappedKey),
 	}, nil
+}
+
+func usesSPKWrap(target Target) bool {
+	return target.SPKID != "" &&
+		len(target.SPKPkDER) > 0 &&
+		(target.KeySource == "peer_device_prekey" || target.KeySource == "group_device_prekey")
 }

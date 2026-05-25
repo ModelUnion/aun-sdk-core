@@ -16,6 +16,23 @@ import type {
  * 与 Python SDK 的 KeyStore Protocol 等价，但由于 IndexedDB
  * 的异步特性，所有方法返回 Promise。
  */
+export interface AgentMdCacheRecord {
+  aid: string;
+  content: string;
+  local_etag: string;
+  remote_etag: string;
+  last_modified: string;
+  fetched_at: number;
+  observed_at: number;
+  checked_at: number;
+  remote_status: string;
+  verify_status: string;
+  verify_error: string;
+  last_error: string;
+  updated_at: number;
+}
+
+export type AgentMdCacheUpsert = Partial<Omit<AgentMdCacheRecord, 'aid' | 'updated_at'>>;
 export interface KeyStore {
   /** 列出本地已有身份 */
   listIdentities?(): Promise<string[]>;
@@ -136,6 +153,12 @@ export interface KeyStore {
   /** 加载已存储的信任根列表 JSON */
   loadTrustRoots?(): Promise<Record<string, unknown> | null>;
 
+  /** 加载本地持久化的某个远端/自身 agent.md 缓存记录 */
+  loadAgentMdCache?(ownerAid: string, targetAid: string): Promise<AgentMdCacheRecord | null>;
+  /** 更新本地持久化的某个远端/自身 agent.md 缓存记录 */
+  upsertAgentMdCache?(ownerAid: string, targetAid: string, fields: AgentMdCacheUpsert): Promise<AgentMdCacheRecord>;
+  /** 列出指定 AgentMDs 逻辑根目录下已有正文文件对应的 aid */
+  listAgentMdContentAids?(agentMdPath: string): Promise<string[]>;
   /** 保存群组状态快照 */
   saveGroupState?(groupId: string, state: GroupStateRecord): Promise<void>;
   /** 加载群组状态快照 */

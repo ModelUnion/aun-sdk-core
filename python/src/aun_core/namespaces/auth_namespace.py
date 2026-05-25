@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import re
 import time
 from typing import Any
@@ -229,6 +230,162 @@ class AuthNamespace:
             self._client._log.debug("auth", "namespace.create_aid exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, aid, exc)
             raise
 
+    async def check_aid(self, params: dict[str, Any]) -> dict[str, Any]:
+        import time as _t
+        _t_start = _t.time()
+        aid = str((params or {}).get("aid") or "").strip()
+        if not aid:
+            raise ValueError("auth.check_aid requires 'aid'")
+        self._client._log.debug("auth", "namespace.check_aid enter: aid=%s", aid)
+        try:
+            self._client._auth._validate_aid_name(aid)
+            result = self._check_local_aid(aid)
+            if not result["local"]["complete"]:
+                result["remote"] = await self._check_remote_aid_registration(aid)
+                remote_status = result["remote"].get("status")
+                if remote_status == "available":
+                    result["status"] = "available"
+                    result["can_register"] = True
+                elif remote_status == "registered":
+                    result["status"] = "registered_remote"
+                    result["can_register"] = False
+                else:
+                    result["status"] = "unknown"
+                    result["can_register"] = False
+            self._client._log.debug("auth", "namespace.check_aid exit: elapsed=%.3fs aid=%s status=%s", _t.time() - _t_start, aid, result.get("status"))
+            return result
+        except Exception as exc:
+            self._client._log.debug("auth", "namespace.check_aid exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, aid, exc)
+            raise
+
+    def _check_local_aid(self, aid: str) -> dict[str, Any]:
+        keystore = self._client._keystore
+        identity = self._client._auth.load_identity_or_none(aid)
+        try:
+            key_pair = keystore.load_key_pair(aid)
+        except Exception as exc:
+            key_pair = None
+            key_error = str(exc)
+        else:
+            key_error = ""
+        try:
+            cert_pem = keystore.load_cert(aid)
+        except Exception as exc:
+            cert_pem = None
+            cert_error = str(exc)
+        else:
+            cert_error = ""
+
+        private_key_present = bool(isinstance(key_pair, dict) and key_pair.get("private_key_pem"))
+        public_key_present = bool(isinstance(key_pair, dict) and key_pair.get("public_key_der_b64"))
+        cert_present = bool(cert_pem)
+        cert_info = self._inspect_cert(aid, cert_pem) if cert_pem else {
+            "present": False,
+            "valid": False,
+            "expired": False,
+        }
+        local_complete = bool(private_key_present and public_key_present and cert_present and cert_info.get("valid"))
+        issues: list[str] = []
+        if identity is None:
+            issues.append("local identity not found")
+        if not private_key_present:
+            issues.append("private key missing")
+        if not public_key_present:
+            issues.append("public key missing")
+        if not cert_present:
+            issues.append("certificate missing")
+        elif cert_info.get("parse_error"):
+            issues.append(f"certificate invalid: {cert_info['parse_error']}")
+        elif cert_info.get("expired"):
+            issues.append("certificate expired")
+        elif not cert_info.get("valid"):
+            issues.append("certificate not currently valid")
+        if key_error:
+            issues.append(f"key load error: {key_error}")
+        if cert_error:
+            issues.append(f"certificate load error: {cert_error}")
+
+        return {
+            "aid": aid,
+            "status": "local_ready" if local_complete else "local_incomplete",
+            "can_register": False if local_complete else None,
+            "local": {
+                "exists": identity is not None,
+                "complete": local_complete,
+                "private_key": private_key_present,
+                "public_key": public_key_present,
+                "certificate": cert_info,
+                "issues": issues,
+            },
+            "remote": {
+                "status": "not_checked" if local_complete else "pending",
+            },
+        }
+
+    @staticmethod
+    def _inspect_cert(aid: str, cert_pem: str | None) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "present": bool(cert_pem),
+            "valid": False,
+            "expired": False,
+        }
+        if not cert_pem:
+            return result
+        try:
+            cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+            now = datetime.now(timezone.utc)
+            not_before = cert.not_valid_before_utc
+            not_after = cert.not_valid_after_utc
+            fingerprint = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
+            try:
+                cn = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value
+            except Exception:
+                cn = ""
+            result.update({
+                "valid": not_before <= now <= not_after,
+                "expired": now > not_after,
+                "not_before": not_before.isoformat(),
+                "not_after": not_after.isoformat(),
+                "expires_at": int(not_after.timestamp()),
+                "seconds_until_expiry": int((not_after - now).total_seconds()),
+                "fingerprint": fingerprint,
+                "subject_cn": cn,
+                "aid_matches": (not cn) or cn == aid,
+            })
+            if cn and cn != aid:
+                result["valid"] = False
+                result["parse_error"] = f"certificate CN mismatch: {cn}"
+        except Exception as exc:
+            result["parse_error"] = str(exc)
+        return result
+
+    async def _check_remote_aid_registration(self, aid: str) -> dict[str, Any]:
+        try:
+            content = await self.download_agent_md(aid)
+            return {
+                "status": "registered",
+                "registered": True,
+                "available": False,
+                "source": "agent.md",
+                "agent_md_bytes": len(content.encode("utf-8")),
+                "agent_md_aid": _extract_agent_md_aid(content),
+            }
+        except NotFoundError:
+            return {
+                "status": "available",
+                "registered": False,
+                "available": True,
+                "source": "agent.md",
+            }
+        except Exception as exc:
+            return {
+                "status": "unknown",
+                "registered": None,
+                "available": None,
+                "source": "agent.md",
+                "error": str(exc),
+            }
+
     async def authenticate(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
         import time as _t
         _t_start = _t.time()
@@ -355,6 +512,63 @@ class AuthNamespace:
             self._client._log.debug("auth", "upload_agent_md exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, aid, exc)
             raise
 
+    async def head_agent_md(self, aid: str) -> dict[str, Any]:
+        import time as _t
+        _t_start = _t.time()
+        target_aid = str(aid or "").strip()
+        if not target_aid:
+            raise ValidationError("head_agent_md requires non-empty aid")
+        self._client._log.debug("auth", "head_agent_md enter: aid=%s", target_aid)
+        try:
+            agent_md_url = await self._resolve_agent_md_url(target_aid)
+            timeout = aiohttp.ClientTimeout(total=15)
+            headers = {"Accept": "text/markdown"}
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.head(agent_md_url, headers=headers) as response:
+                    response_headers = getattr(response, "headers", None) or {}
+                    etag = str(response_headers.get("ETag") or "").strip() if hasattr(response_headers, "get") else ""
+                    last_modified = str(response_headers.get("Last-Modified") or "").strip() if hasattr(response_headers, "get") else ""
+                    if response.status == 404:
+                        result = {
+                            "aid": target_aid,
+                            "found": False,
+                            "etag": "",
+                            "last_modified": "",
+                            "status": 404,
+                        }
+                        self._client._log.debug(
+                            "auth",
+                            "head_agent_md exit (not_found): elapsed=%.3fs aid=%s",
+                            _t.time() - _t_start,
+                            target_aid,
+                        )
+                        return result
+                    if response.status < 200 or response.status >= 300:
+                        raise AUNError(f"head agent.md failed: HTTP {response.status}")
+                    if etag or last_modified:
+                        cached = dict(self._agent_md_cache_store().get(target_aid) or {})
+                        cached["etag"] = etag
+                        cached["last_modified"] = last_modified
+                        self._agent_md_cache_store()[target_aid] = cached
+                    result = {
+                        "aid": target_aid,
+                        "found": True,
+                        "etag": etag,
+                        "last_modified": last_modified,
+                        "status": response.status,
+                    }
+                    self._client._log.debug(
+                        "auth",
+                        "head_agent_md exit: elapsed=%.3fs aid=%s status=%d etag=%s",
+                        _t.time() - _t_start,
+                        target_aid,
+                        response.status,
+                        etag or "-",
+                    )
+                    return result
+        except Exception as exc:
+            self._client._log.debug("auth", "head_agent_md exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, target_aid, exc)
+            raise
     async def download_agent_md(self, aid: str) -> str:
         import time as _t
         import secrets as _secrets

@@ -169,6 +169,42 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 	}
 }
 
+func TestPublishedMessageEventsAttachEmptyDeviceID(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	c.deviceID = ""
+	c.slotID = "slot-a"
+	payload := c.attachCurrentInstanceContext(map[string]any{"seq": 1}).(map[string]any)
+	if _, ok := payload["device_id"]; !ok {
+		t.Fatalf("空 device_id 是显式设备值，事件 payload 应保留字段: %#v", payload)
+	}
+	if payload["device_id"] != "" || payload["slot_id"] != "slot-a" {
+		t.Fatalf("事件实例上下文不正确: %#v", payload)
+	}
+}
+
+func TestMessageTargetsCurrentInstanceTreatsEmptyDeviceIDAsExplicit(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	c.deviceID = "device-1"
+	c.slotID = "slot-a"
+	if !c.messageTargetsCurrentInstance(map[string]any{}) {
+		t.Fatal("缺省 device_id 的广播消息应允许投递")
+	}
+	if !c.messageTargetsCurrentInstance(map[string]any{"device_id": "device-1"}) {
+		t.Fatal("匹配当前 device_id 的消息应允许投递")
+	}
+	if c.messageTargetsCurrentInstance(map[string]any{"device_id": ""}) {
+		t.Fatal("显式空 device_id 不应投递给非空 device_id 实例")
+	}
+
+	c.deviceID = ""
+	if !c.messageTargetsCurrentInstance(map[string]any{"device_id": ""}) {
+		t.Fatal("显式空 device_id 应投递给空 device_id 实例")
+	}
+}
 func TestP2PPushIgnoresOtherSlotContext(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
@@ -613,6 +649,73 @@ func TestCallRejectsMessageSendDeliveryModeOverride(t *testing.T) {
 	}
 }
 
+func TestAuthFlowEmptyDeviceIDLoadsInstanceState(t *testing.T) {
+	ks, err := keystore.NewFileKeyStore(t.TempDir(), nil, "seed")
+	if err != nil {
+		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+	}
+	t.Cleanup(func() { ks.Close() })
+	aid := "auth-empty-device.example"
+
+	if err := ks.SaveIdentity(aid, map[string]any{
+		"aid":                aid,
+		"private_key_pem":    "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+		"public_key_der_b64": "pub",
+		"curve":              "P-256",
+		"access_token":       "shared-token",
+		"refresh_token":      "shared-refresh",
+	}); err != nil {
+		t.Fatalf("保存身份失败: %v", err)
+	}
+	if err := ks.SaveInstanceState(aid, "", "slot-a", map[string]any{
+		"access_token":            "empty-device-token",
+		"refresh_token":           "empty-device-refresh",
+		"access_token_expires_at": int64(234567),
+	}); err != nil {
+		t.Fatalf("保存空 device instance_state 失败: %v", err)
+	}
+
+	flow := NewAuthFlow(AuthFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
+	flow.SetInstanceContext("", "slot-a")
+	loaded, err := flow.LoadIdentity(aid)
+	if err != nil {
+		t.Fatalf("LoadIdentity 失败: %v", err)
+	}
+	if loaded["access_token"] != "empty-device-token" || loaded["refresh_token"] != "empty-device-refresh" {
+		t.Fatalf("空 device_id 未加载 instance_state token: %#v", loaded)
+	}
+}
+
+func TestAuthFlowEmptyDeviceIDPersistsInstanceState(t *testing.T) {
+	ks, err := keystore.NewFileKeyStore(t.TempDir(), nil, "seed")
+	if err != nil {
+		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+	}
+	t.Cleanup(func() { ks.Close() })
+	aid := "persist-empty-device.example"
+
+	flow := NewAuthFlow(AuthFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
+	flow.SetInstanceContext("", "slot-a")
+	if err := flow.persistIdentity(map[string]any{
+		"aid":                     aid,
+		"private_key_pem":         "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+		"public_key_der_b64":      "pub",
+		"curve":                   "P-256",
+		"access_token":            "empty-device-token",
+		"refresh_token":           "empty-device-refresh",
+		"access_token_expires_at": int64(345678),
+	}); err != nil {
+		t.Fatalf("persistIdentity 失败: %v", err)
+	}
+
+	state, err := ks.LoadInstanceState(aid, "", "slot-a")
+	if err != nil {
+		t.Fatalf("LoadInstanceState 失败: %v", err)
+	}
+	if state["access_token"] != "empty-device-token" || state["refresh_token"] != "empty-device-refresh" {
+		t.Fatalf("空 device_id 未持久化 instance_state token: %#v", state)
+	}
+}
 func TestNormalizeConnectParamsIncludesSlotAndDeliveryMode(t *testing.T) {
 	c := NewClient(map[string]any{
 		"aun_path": t.TempDir(),
@@ -645,6 +748,42 @@ func TestNormalizeConnectParamsIncludesSlotAndDeliveryMode(t *testing.T) {
 	}
 }
 
+func TestGroupCallInjectsEmptyDeviceIDValue(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "auth.connect" {
+			return map[string]any{"status": "ok"}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{"access_token": "tok", "gateway": wsURL, "slot_id": "slot-a"}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+	c.deviceID = ""
+	c.slotID = "slot-a"
+
+	if _, err := c.Call(ctx, "group.get_state", map[string]any{"group_id": "group.agentid.pub/1"}); err != nil {
+		t.Fatalf("group.get_state 失败: %v", err)
+	}
+
+	for _, call := range getCalls() {
+		if call.Method == "group.get_state" {
+			if _, ok := call.Params["device_id"]; !ok {
+				t.Fatalf("group.get_state 应显式携带空 device_id: %#v", call.Params)
+			}
+			if call.Params["device_id"] != "" || call.Params["slot_id"] != "slot-a" {
+				t.Fatalf("group.get_state 实例上下文不正确: %#v", call.Params)
+			}
+			return
+		}
+	}
+	t.Fatalf("未捕获 group.get_state: %#v", getCalls())
+}
 func TestConnectIncludesDeviceSlotAndDeliveryMode(t *testing.T) {
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
@@ -853,27 +992,108 @@ func TestPullEmptyResultAppliesRetentionFloor(t *testing.T) {
 		t.Fatalf("group event 补洞应允许 after_event_seq=0: %#v", getCalls())
 	}
 
+	time.Sleep(120 * time.Millisecond)
+	for _, call := range getCalls() {
+		if call.Method == "group.ack_events" {
+			t.Fatalf("空 group.pull_events 不应触发 ack_events: %#v", getCalls())
+		}
+	}
+}
+
+func TestP2PGapFillEmptyResultAcksRetentionFloor(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.pull":
+			return map[string]any{"messages": []any{}, "count": 0, "latest_seq": 7, "server_ack_seq": 7}
+		case "message.ack":
+			return map[string]any{"success": true, "ack_seq": params["seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.mu.Unlock()
+
+	c.fillP2pGap()
+
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		var sawMessageAck, sawGroupAck, sawEventAck bool
 		for _, call := range getCalls() {
-			if call.Method == "message.ack" && toInt64(call.Params["seq"]) == 7 {
-				sawMessageAck = true
-			}
-			if call.Method == "group.ack_messages" && toInt64(call.Params["msg_seq"]) == 9 {
-				sawGroupAck = true
-			}
-			if call.Method == "group.ack_events" && toInt64(call.Params["event_seq"]) == 11 &&
+			if call.Method == "message.ack" && toInt64(call.Params["seq"]) == 7 &&
 				call.Params["device_id"] == c.deviceID && call.Params["slot_id"] == "slot-a" {
-				sawEventAck = true
+				return
 			}
-		}
-		if sawMessageAck && sawGroupAck && sawEventAck {
-			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("空 pull 应触发 ack: %#v", getCalls())
+	t.Fatalf("空 P2P gap fill 应按 server_ack_seq 触发 message.ack: %#v", getCalls())
+}
+
+func TestGroupGapFillEmptyResultAcksRetentionFloor(t *testing.T) {
+	groupID := "group.example.com/g-empty"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "message.pull":
+			return map[string]any{"messages": []any{}, "count": 0}
+		case "group.pull":
+			return map[string]any{
+				"messages": []any{},
+				"count":    0,
+				"cursor":   map[string]any{"current_seq": 9},
+			}
+		case "group.ack_messages":
+			return map[string]any{"success": true, "ack_seq": params["msg_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	c.fillGroupGap(groupID)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, call := range getCalls() {
+			if call.Method == "group.ack_messages" && toInt64(call.Params["msg_seq"]) == 9 &&
+				call.Params["device_id"] == c.deviceID && call.Params["slot_id"] == "slot-a" {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("空 group gap fill 应按 cursor.current_seq 触发 group.ack_messages: %#v", getCalls())
 }
 
 func TestOnRawGroupChangedTriggersGroupEventGapFill(t *testing.T) {
@@ -884,8 +1104,15 @@ func TestOnRawGroupChangedTriggersGroupEventGapFill(t *testing.T) {
 			return map[string]any{"status": "ok"}
 		case "group.pull_events":
 			return map[string]any{
-				"events": []any{},
-				"count":  0,
+				"events": []any{
+					map[string]any{
+						"group_id":   groupID,
+						"event_seq":  4,
+						"event_type": "group.announcement_updated",
+						"action":     "announcement_updated",
+					},
+				},
+				"count":  1,
 				"cursor": map[string]any{"current_seq": 11},
 			}
 		case "group.ack_events":
@@ -945,6 +1172,122 @@ func TestOnRawGroupChangedTriggersGroupEventGapFill(t *testing.T) {
 	t.Fatalf("group.changed gap fill 未触发 pull/ack: %#v", getCalls())
 }
 
+func TestOnRawGroupChangedInviteCodeUsedTriggersV2AutoPropose(t *testing.T) {
+	groupID := "group.example.com/g-invite"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.get_online_members":
+			return map[string]any{"members": []any{
+				map[string]any{"aid": "alice.example.com", "role": "owner", "online": true, "device_id": "dev-1"},
+			}}
+		case "group.get_members":
+			return map[string]any{"members": []any{
+				map[string]any{"aid": "alice.example.com", "role": "owner"},
+				map[string]any{"aid": "bob.example.com", "role": "member"},
+			}}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+
+	c.onRawGroupChanged(map[string]any{
+		"group_id":   groupID,
+		"action":     "invite_code_used",
+		"member_aid": "bob.example.com",
+		"actor_aid":  "bob.example.com",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, call := range getCalls() {
+			if call.Method == "group.get_online_members" && call.Params["group_id"] == groupID {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("invite_code_used 成员变更未触发 V2 event-path auto propose: %#v", getCalls())
+}
+
+func TestGroupEventGapFillAcksFinalContiguousAfterPublish(t *testing.T) {
+	groupID := "g-event-publish.example.com"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "auth.connect":
+			return map[string]any{"status": "ok"}
+		case "group.pull_events":
+			return map[string]any{
+				"events": []any{
+					map[string]any{
+						"group_id":   groupID,
+						"event_seq":  2,
+						"event_type": "group.announcement_updated",
+						"action":     "announcement_updated",
+					},
+				},
+				"count":  1,
+				"cursor": map[string]any{"current_seq": 2},
+			}
+		case "group.ack_events":
+			return map[string]any{"success": true, "ack_seq": params["event_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+		"slot_id":      "slot-a",
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+	c.mu.Lock()
+	c.aid = "alice.example.com"
+	c.mu.Unlock()
+
+	ns := "group_event:" + groupID
+	if !c.seqTracker.OnMessageSeq(ns, 3) {
+		t.Fatal("预置 event_seq=3 应产生 group_event gap")
+	}
+	c.events.Subscribe("group.changed", func(payload any) {
+		if evt, ok := payload.(map[string]any); ok && evt["_from_gap_fill"] == true {
+			c.seqTracker.OnMessageSeq(ns, 4)
+		}
+	})
+
+	c.fillGroupEventGap(groupID)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var ackCount int
+		var ackSeq int64
+		for _, call := range getCalls() {
+			if call.Method == "group.ack_events" {
+				ackCount++
+				ackSeq = toInt64(call.Params["event_seq"])
+			}
+		}
+		if ackCount == 1 && ackSeq == 4 && c.seqTracker.GetContiguousSeq(ns) == 4 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("group.pull_events 应在发布后只 ack 一次最终 contiguous_seq=4: %#v", getCalls())
+}
+
 func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		if method == "auth.connect" {
@@ -994,6 +1337,69 @@ func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
 	}
 }
 
+func TestCallNormalizesOutboundMessagePayload(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		if method == "auth.connect" {
+			return map[string]any{"status": "ok"}
+		}
+		return map[string]any{"ok": true}
+	})
+	defer closeServer()
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, map[string]any{
+		"access_token": "tok",
+		"gateway":      wsURL,
+	}, nil); err != nil {
+		t.Fatalf("Connect 失败: %v", err)
+	}
+
+	if _, err := c.Call(ctx, "message.send", map[string]any{
+		"to":      "bob.example.com",
+		"content": map[string]any{"text": "hello"},
+		"encrypt": false,
+	}); err != nil {
+		t.Fatalf("message.send 失败: %v", err)
+	}
+	if _, err := c.Call(ctx, "group.send", map[string]any{
+		"group_id": "group.example.com/g-normalize",
+		"payload":  map[string]any{"text": "群明文"},
+		"encrypt":  false,
+	}); err != nil {
+		t.Fatalf("group.send 失败: %v", err)
+	}
+
+	var messageCall *testRPCCall
+	var groupCall *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.send" {
+			cc := call
+			messageCall = &cc
+		}
+		if call.Method == "group.send" {
+			cc := call
+			groupCall = &cc
+		}
+	}
+	if messageCall == nil || groupCall == nil {
+		t.Fatalf("未捕获发送调用: %#v", getCalls())
+	}
+	if _, exists := messageCall.Params["content"]; exists {
+		t.Fatalf("message.send 不应继续转发 content: %#v", messageCall.Params)
+	}
+	messagePayload, _ := messageCall.Params["payload"].(map[string]any)
+	if messagePayload["type"] != "text" || messagePayload["text"] != "hello" {
+		t.Fatalf("message.send payload 应补齐 type=text: %#v", messageCall.Params)
+	}
+	groupPayload, _ := groupCall.Params["payload"].(map[string]any)
+	if groupPayload["type"] != "text" || groupPayload["text"] != "群明文" {
+		t.Fatalf("group.send payload 应补齐 type=text: %#v", groupCall.Params)
+	}
+}
 func TestCallDoesNotForwardPlaintextMessageProtectedHeaders(t *testing.T) {
 	// message.send 明文路径应保留 protected_headers/headers（信封元数据，加密与否都保留）
 	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
@@ -1358,6 +1764,40 @@ func TestOff(t *testing.T) {
 	if count.Load() != 1 {
 		t.Fatalf("取消后 handler 不应再触发，实际 %d", count.Load())
 	}
+}
+
+func TestOnReregisterSubscriptionUsesActualPublishDispatcher(t *testing.T) {
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+
+	dispatcher := c.events
+	if dispatcher == nil {
+		t.Fatal("client events dispatcher must not be nil")
+	}
+	if c.transport == nil || c.transport.dispatcher != dispatcher {
+		t.Fatal("transport must route pushed events through the same dispatcher used by client.On")
+	}
+
+	var oldCount atomic.Int32
+	var newCount atomic.Int32
+	sub := c.On("message.received", func(payload any) {
+		oldCount.Add(1)
+	})
+	sub.Unsubscribe()
+	sub = c.On("message.received", func(payload any) {
+		newCount.Add(1)
+	})
+
+	dispatcher.Publish("message.received", map[string]any{"id": "after-reregister"})
+	time.Sleep(50 * time.Millisecond)
+
+	if oldCount.Load() != 0 {
+		t.Fatalf("重新注册后旧 handler 不应再触发，实际 %d", oldCount.Load())
+	}
+	if newCount.Load() != 1 {
+		t.Fatalf("重新注册后新 handler 应挂在实际发布 dispatcher 上，实际 %d", newCount.Load())
+	}
+	sub.Unsubscribe()
 }
 
 // ── Client 配置测试 ──────────────────────────────────────
@@ -1814,5 +2254,27 @@ func TestServerKickedSuppressesAnyCode(t *testing.T) {
 	c.mu.RUnlock()
 	if state != StateTerminalFailed {
 		t.Errorf("serverKicked=true 应抑制重连，实际: %s", state)
+	}
+}
+
+func TestBuildSeqTrackerContextDoesNotUseNULSeparator(t *testing.T) {
+	ctx := buildSeqTrackerContext(" alice ", "dev", "slot")
+	if strings.Contains(ctx, "\x00") {
+		t.Fatalf("seq tracker context must not generate NUL separators: %q", ctx)
+	}
+	if buildSeqTrackerContext("ab", "c", "") == buildSeqTrackerContext("a", "bc", "") {
+		t.Fatal("length-prefixed seq tracker context should be unambiguous")
+	}
+}
+
+func TestBuildLengthPrefixedBytesKeyDoesNotUseNULSeparator(t *testing.T) {
+	key := buildLengthPrefixedBytesKey([]byte("actor"), []byte("payload"), []byte("signature"))
+	if strings.Contains(string(key), "\x00") {
+		t.Fatalf("length-prefixed bytes key must not generate NUL separators: %q", string(key))
+	}
+	left := string(buildLengthPrefixedBytesKey([]byte("ab"), []byte("c")))
+	right := string(buildLengthPrefixedBytesKey([]byte("a"), []byte("bc")))
+	if left == right {
+		t.Fatal("length-prefixed bytes key should be unambiguous")
 	}
 }

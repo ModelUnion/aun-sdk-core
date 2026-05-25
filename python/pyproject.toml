@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastaun"
-version = "0.3.0"
+version = "0.3.3"
 description = "AUN Protocol Core SDK — identity, authentication, key management, E2EE"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -28,11 +28,13 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.10",
     "cryptography>=43.0",
+    "rich>=13.0",
+    "typer>=0.9",
     "websockets>=13.0,<15",
 ]
 
 [project.optional-dependencies]
-cli = ["typer>=0.9", "rich>=13.0"]
+cli = []
 
 [project.scripts]
 aun = "aun_cli.main:app"

@@ -79,4 +79,26 @@ describe('群组成员变更事件的 V2-only 编排', () => {
 
     expect(proposeSpy).toHaveBeenCalledWith('test-group-v2', { leaderDelay: true });
   });
+
+  it('invite_code_used 应触发 propose，并让已有成员轮换 group SPK', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._identity = { aid: 'alice.aid.com' };
+    (client as any)._state = 'connected';
+    const ensureGroupRegistered = vi.fn().mockResolvedValue(undefined);
+    const rotateGroupSPK = vi.fn().mockResolvedValue(undefined);
+    (client as any)._v2Session = { ensureGroupRegistered, rotateGroupSPK };
+    const proposeSpy = vi.spyOn(client as any, '_v2AutoProposeState').mockResolvedValue(undefined);
+
+    await (client as any)._onRawGroupChanged({
+      group_id: 'test-group-v2',
+      action: 'invite_code_used',
+      member_aid: 'bob.aid.com',
+      actor_aid: 'bob.aid.com',
+    });
+
+    expect(proposeSpy).toHaveBeenCalledWith('test-group-v2', { leaderDelay: true });
+    expect(rotateGroupSPK).toHaveBeenCalled();
+    expect(ensureGroupRegistered).not.toHaveBeenCalled();
+  });
 });

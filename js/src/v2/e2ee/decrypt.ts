@@ -19,6 +19,11 @@ import {
   type ProofStep,
 } from '../crypto/recipients';
 import { SUITE_NAME } from './types';
+import {
+  verifyMetadataAuth,
+  PROTECTED_HEADERS_DOMAIN,
+  PROTECTED_CONTEXT_DOMAIN,
+} from './metadata-auth';
 
 const encoder = new TextEncoder();
 const INFO_3DH = encoder.encode('AUN-V2-3DH');
@@ -71,6 +76,8 @@ interface EnvelopeShape {
   recipients?: string[][];
   recipient?: RecipientShape;
   merkle_proof?: ProofStep[];
+  protected_headers?: Record<string, unknown>;
+  context?: Record<string, unknown>;
 }
 
 /**
@@ -167,19 +174,41 @@ export async function decryptMessage(
   }
   const wrappedCt = wrappedKey.subarray(0, wrappedKey.length - 16);
   const wrappedTag = wrappedKey.subarray(wrappedKey.length - 16);
-  const masterKey = await aesGcmDecrypt(
-    wrapKey,
-    wrapNonce,
-    wrappedCt,
-    wrappedTag,
-    new Uint8Array(0),
-  );
+  let masterKey: Uint8Array;
+  try {
+    masterKey = await aesGcmDecrypt(
+      wrapKey,
+      wrapNonce,
+      wrappedCt,
+      wrappedTag,
+      new Uint8Array(0),
+    );
+  } catch (exc) {
+    throw new Error(
+      `wrap_key_decrypt_failed: ${rowContext(row)}; ` +
+      'master_key unwrap AEAD authentication failed; ' +
+      'likely wrong local SPK/IK, stale sender bootstrap, or tampered recipient wrap; ' +
+      `cause=${formatCaught(exc)}`,
+    );
+  }
+  await verifyMetadataAuth(env.protected_headers, masterKey, PROTECTED_HEADERS_DOMAIN, 'protected_headers');
+  await verifyMetadataAuth(env.context, masterKey, PROTECTED_CONTEXT_DOMAIN, 'context');
 
   // 6. decrypt body
   const msgNonce = base64ToBytes(env.nonce);
   const ct = base64ToBytes(env.ciphertext);
   const tag = base64ToBytes(env.tag);
-  const plaintext = await aesGcmDecrypt(masterKey, msgNonce, ct, tag, aadBytes);
+  let plaintext: Uint8Array;
+  try {
+    plaintext = await aesGcmDecrypt(masterKey, msgNonce, ct, tag, aadBytes);
+  } catch (exc) {
+    throw new Error(
+      `body_decrypt_failed: ${envelopeContext(env, row)}; ` +
+      'message body AEAD authentication failed after master_key unwrap; ' +
+      'likely AAD/ciphertext/tag mismatch or envelope body corruption; ' +
+      `cause=${formatCaught(exc)}`,
+    );
+  }
 
   // 7. 解析 payload
   return JSON.parse(new TextDecoder().decode(plaintext)) as Record<string, unknown>;
@@ -221,6 +250,39 @@ function findMyRow(
   return null;
 }
 
+function formatCaught(exc: unknown): string {
+  if (exc instanceof Error) {
+    return exc.message ? `${exc.name}: ${exc.message}` : exc.name;
+  }
+  return String(exc);
+}
+
+function rowContext(row: string[]): string {
+  return [
+    `recipient=${String(row[0] ?? '')}/${String(row[1] ?? '')}`,
+    `role=${String(row[2] ?? '')}`,
+    `key_source=${String(row[3] ?? '')}`,
+    `spk_id=${String(row[5] ?? '') || '<empty>'}`,
+  ].join('; ');
+}
+
+function envelopeContext(env: EnvelopeShape, row: string[]): string {
+  const aad = env.aad && typeof env.aad === 'object' && !Array.isArray(env.aad)
+    ? env.aad
+    : {};
+  const messageId = String(aad.message_id ?? '');
+  const groupId = String(aad.group_id ?? '') || '<p2p>';
+  const from = String(aad.from ?? '');
+  const fromDevice = String(aad.from_device ?? '');
+  return [
+    `message_id=${messageId}`,
+    `group_id=${groupId}`,
+    `from=${from}`,
+    `from_device=${fromDevice}`,
+    rowContext(row),
+  ].join('; ');
+}
+
 async function computeWrapKey(
   row: string[],
   selfIkPriv: Uint8Array,
@@ -230,6 +292,9 @@ async function computeWrapKey(
   salt: Uint8Array,
 ): Promise<Uint8Array> {
   const spkId = row[5];
+  if (spkId && !selfSpkPriv) {
+    throw new Error(`spk_missing: spk_id=${spkId}`);
+  }
   if (spkId && selfSpkPriv) {
     // 3DH 接收方路径
     // dh1 = ECDH(self_ik_priv, sender_session_pk)

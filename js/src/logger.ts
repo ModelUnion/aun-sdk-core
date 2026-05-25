@@ -4,7 +4,7 @@
  * 与 TS SDK Logger 接口对齐，但行为简化：
  * - 仅输出到控制台（浏览器环境无文件系统）
  * - 不读 ~/.aun/log.ini（浏览器无 home 目录）
- * - 格式：[yyyy-mm-dd HH:mm:ss.SSS][LEVEL][module] message
+ * - 格式：[yyyy-mm-dd HH:mm:ss.SSS][LEVEL][module][aun_path=...][device_id=...] message
  * - debug=OFF 时仅输出 INFO/WARN/ERROR
  * - debug=ON 时额外输出 DEBUG
  *
@@ -24,6 +24,7 @@ export interface ModuleLogger {
 
 export interface AUNLoggerOptions {
   debug: boolean;
+  aunPath?: string;
 }
 
 type Level = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG';
@@ -55,11 +56,14 @@ function formatMessage(template: string, args: unknown[]): string {
 
 export class AUNLogger {
   private _debug: boolean;
+  private _aunPath: string;
+  private _deviceId: string = '-';
   private _aid: string | null = null;
   private _minLevel: number;
 
   constructor(opts: AUNLoggerOptions) {
     this._debug = opts.debug;
+    this._aunPath = String(opts.aunPath || '-');
     this._minLevel = this._debug ? LEVEL_ORDER.DEBUG : LEVEL_ORDER.INFO;
   }
 
@@ -76,6 +80,10 @@ export class AUNLogger {
     this._aid = aid || null;
   }
 
+  bindDeviceId(deviceId: string): void {
+    this._deviceId = String(deviceId || '').trim() || '-';
+  }
+
   close(): void {
     // 浏览器环境无文件清理，no-op
   }
@@ -84,7 +92,7 @@ export class AUNLogger {
     if (LEVEL_ORDER[level] < this._minLevel) return;
     if (level === 'DEBUG' && !this._debug) return;
     const { date, time, ms } = this._now();
-    const head = `[${date} ${time}.${ms}][${level}][${module}]`;
+    const head = `[${date} ${time}.${ms}][${level}][${module}][aun_path=${this._aunPath || '-'}][device_id=${this._deviceId || '-'}]`;
     const aidPart = this._aid ? ` [${this._aid}]` : '';
     const formatted = formatMessage(msg, args);
     const line = `${head}${aidPart} ${formatted}`;

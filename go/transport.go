@@ -93,6 +93,7 @@ type RPCTransport struct {
 	timeout      atomic.Int64 // 纳秒，使用 atomic 保证跨 goroutine 安全
 	onDisconnect func(error, int)
 	verifySSL    bool
+	dnsNet       *DnsResilientNet
 	ws           *websocket.Conn
 	pending      map[string]chan map[string]any
 	pendingMu    sync.Mutex
@@ -107,10 +108,18 @@ type RPCTransport struct {
 	// 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
 	metaObserver   func(map[string]any)
 	metaObserverMu sync.RWMutex
+
+	// Trace 模式：off / log / diag
+	traceMode   string
+	traceModeMu sync.RWMutex
+
+	// Trace observer：observer(traceInfo) 在每次 RPC/事件携带 _trace 时调用
+	traceObserver   func(map[string]any)
+	traceObserverMu sync.RWMutex
 }
 
 // NewRPCTransport 创建 RPC 传输层
-func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisconnect func(error, int), verifySSL bool) *RPCTransport {
+func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisconnect func(error, int), verifySSL bool, dnsNet ...*DnsResilientNet) *RPCTransport {
 	if timeout == 0 {
 		timeout = 35 * time.Second
 	}
@@ -120,6 +129,9 @@ func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisco
 		verifySSL:    verifySSL,
 		pending:      make(map[string]chan map[string]any),
 		closed:       true,
+	}
+	if len(dnsNet) > 0 {
+		t.dnsNet = dnsNet[0]
 	}
 	t.timeout.Store(int64(timeout))
 	return t
@@ -140,6 +152,47 @@ func (t *RPCTransport) SetMetaObserver(observer func(map[string]any)) {
 	t.metaObserverMu.Unlock()
 }
 
+// SetTraceMode 设置 trace 模式：off / log / diag
+func (t *RPCTransport) SetTraceMode(mode string) {
+	t.traceModeMu.Lock()
+	t.traceMode = mode
+	t.traceModeMu.Unlock()
+}
+
+// GetTraceMode 获取当前 trace 模式（线程安全）
+func (t *RPCTransport) GetTraceMode() string {
+	t.traceModeMu.RLock()
+	defer t.traceModeMu.RUnlock()
+	if t.traceMode == "" {
+		return "off"
+	}
+	return t.traceMode
+}
+
+// SetTraceObserver 注册 trace observer；observer(traceInfo) 在每次 RPC/事件携带 _trace 时调用。
+// 传入 nil 表示移除观察者。
+func (t *RPCTransport) SetTraceObserver(observer func(map[string]any)) {
+	t.traceObserverMu.Lock()
+	t.traceObserver = observer
+	t.traceObserverMu.Unlock()
+}
+
+// invokeTraceObserver 安全调用 traceObserver；observer panic 被 recover 吞掉。
+func (t *RPCTransport) invokeTraceObserver(info map[string]any) {
+	t.traceObserverMu.RLock()
+	observer := t.traceObserver
+	t.traceObserverMu.RUnlock()
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			pkgLogTransport().Debug("traceObserver panic: %v", r)
+		}
+	}()
+	observer(info)
+}
+
 // invokeMetaObserver 安全调用 metaObserver；observer panic 被 recover 吞掉。
 func (t *RPCTransport) invokeMetaObserver(meta map[string]any) {
 	t.metaObserverMu.RLock()
@@ -154,6 +207,54 @@ func (t *RPCTransport) invokeMetaObserver(meta map[string]any) {
 		}
 	}()
 	observer(meta)
+}
+
+// handleResponseTrace 处理 RPC 响应中的 _trace 字段：追加 sdk.recv span，格式化输出，调用 observer。
+func (t *RPCTransport) handleResponseTrace(response map[string]any, method, status string, elapsedMs int) {
+	respTrace, ok := response["_trace"].(map[string]any)
+	if !ok {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			pkgLogTransport().Debug("trace handling panic: %v", r)
+		}
+	}()
+
+	// 追加 sdk.recv span
+	sdkRecvSpan := map[string]any{
+		"node":   "sdk",
+		"ts":     time.Now().UnixMilli(),
+		"action": "recv",
+		"ms":     elapsedMs,
+	}
+	var spans []map[string]any
+	if rawSpans, ok := respTrace["spans"].([]any); ok {
+		for _, s := range rawSpans {
+			if sm, ok := s.(map[string]any); ok {
+				spans = append(spans, sm)
+			}
+		}
+	}
+	spans = append(spans, sdkRecvSpan)
+
+	// 格式化输出
+	display := traceDisplay(method, status, elapsedMs, respTrace, spans)
+	pkgLogTransport().Info("%s", display)
+
+	// 调用 trace observer
+	enriched := make(map[string]any, len(respTrace)+1)
+	for k, v := range respTrace {
+		enriched[k] = v
+	}
+	enriched["spans"] = spans
+	t.invokeTraceObserver(map[string]any{
+		"type":        "rpc",
+		"method":      method,
+		"trace":       enriched,
+		"status":      status,
+		"duration_ms": elapsedMs,
+	})
 }
 
 // getTimeout 获取当前超时设置（线程安全）
@@ -198,6 +299,34 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (challenge map[s
 		c, _, e := websocket.Dial(ctx, url, opts)
 		return c, e
 	}()
+	if dialErr != nil && t.dnsNet != nil && isDNSError(dialErr) {
+		hostname, port := parseHostPort(url)
+		pkgLogTransport().Debug("WS DNS failed for %s, trying cached IP", hostname)
+		cachedIP, _, ok := t.dnsNet.loadDNSCache(hostname)
+		if ok {
+			ipURL := replaceHostWithIP(url, cachedIP, port)
+			ipOpts := &websocket.DialOptions{}
+			if !t.verifySSL {
+				ipOpts.HTTPClient = &http.Client{
+					Transport: &http.Transport{
+						TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+					},
+				}
+			} else {
+				ipOpts.HTTPClient = &http.Client{
+					Transport: &http.Transport{
+						TLSClientConfig: &tls.Config{ServerName: hostname},
+					},
+				}
+			}
+			ipOpts.HTTPHeader = http.Header{"Host": {hostname}}
+			c, _, e := websocket.Dial(ctx, ipURL, ipOpts)
+			if e == nil {
+				conn = c
+				dialErr = nil
+			}
+		}
+	}
 	if dialErr != nil {
 		err = NewConnectionError(fmt.Sprintf("WebSocket connection failed: %v", dialErr))
 		pkgLogTransport().Error("WebSocket connection failed: url=%s err=%v", url, dialErr)
@@ -317,6 +446,27 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 	if params == nil {
 		params = make(map[string]any)
 	}
+
+	// 注入 _trace（会话级 mode 非 off 时）
+	effectiveTraceMode := t.GetTraceMode()
+	var traceID string
+	if effectiveTraceMode != "off" {
+		b := make([]byte, 16)
+		_, _ = rand.Read(b)
+		traceID = hex.EncodeToString(b)
+		tracePayload := map[string]any{
+			"trace_id": traceID,
+			"mode":     effectiveTraceMode,
+		}
+		if effectiveTraceMode == "diag" {
+			tracePayload["spans"] = []map[string]any{
+				{"node": "sdk", "ts": time.Now().UnixMilli(), "action": "send"},
+			}
+		}
+		params["_trace"] = tracePayload
+		pkgLogTransport().Info("[trace=%s] rpc_send method=%s rpc_id=%s", traceID, method, rpcID)
+	}
+
 	request := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      rpcID,
@@ -369,18 +519,29 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 			pkgLogTransport().Error("RPC response channel closed (transport disconnected): method=%s id=%s", method, rpcID)
 			return nil, NewConnectionError("transport closed")
 		}
+		elapsedMs := int(time.Since(tStart).Milliseconds())
 		// 检查错误
 		if errData, ok := response["error"]; ok {
 			if errMap, ok := errData.(map[string]any); ok {
-				pkgLogTransport().Warn("RPC response error: method=%s id=%s elapsed=%dms error=%v", method, rpcID, time.Since(tStart).Milliseconds(), errMap)
+				pkgLogTransport().Warn("RPC response error: method=%s id=%s elapsed=%dms error=%v", method, rpcID, elapsedMs, errMap)
+				// 处理 _trace（错误路径）
+				if traceID != "" {
+					pkgLogTransport().Info("[trace=%s] rpc_recv method=%s rpc_id=%s duration_ms=%d status=error", traceID, method, rpcID, elapsedMs)
+				}
+				t.handleResponseTrace(response, method, "error", elapsedMs)
 				return nil, MapRemoteError(errMap)
 			}
 		}
-		pkgLogTransport().Debug("RPC response ok: method=%s id=%s elapsed=%dms %s", method, rpcID, time.Since(tStart).Milliseconds(), summarizeDict(response["result"], diagResultFields))
+		pkgLogTransport().Debug("RPC response ok: method=%s id=%s elapsed=%dms %s", method, rpcID, elapsedMs, summarizeDict(response["result"], diagResultFields))
+		if traceID != "" {
+			pkgLogTransport().Info("[trace=%s] rpc_recv method=%s rpc_id=%s duration_ms=%d status=ok", traceID, method, rpcID, elapsedMs)
+		}
 		// 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
 		if meta, ok := response["_meta"].(map[string]any); ok {
 			t.invokeMetaObserver(meta)
 		}
+		// 处理 _trace（成功路径）
+		t.handleResponseTrace(response, method, "ok", elapsedMs)
 		return response["result"], nil
 
 	case <-timer.C:
@@ -535,13 +696,33 @@ func (t *RPCTransport) routeMessage(message map[string]any) {
 		if mapped, ok := eventNameMap[protocolEvent]; ok {
 			sdkEvent = mapped
 		}
+		if meta, ok := message["_meta"].(map[string]any); ok {
+			t.invokeMetaObserver(meta)
+		}
 		params, _ := message["params"].(map[string]any)
+		// 提取事件中的 _trace 并回调 observer，然后从 params 中剥离
+		if params != nil {
+			if eventTrace, ok := params["_trace"].(map[string]any); ok {
+				delete(params, "_trace")
+				t.invokeTraceObserver(map[string]any{
+					"type":  "event",
+					"event": sdkEvent,
+					"trace": eventTrace,
+				})
+				if tid, _ := eventTrace["trace_id"].(string); tid != "" {
+					pkgLogTransport().Info("[trace=%s] event_recv event=%s", tid, sdkEvent)
+				}
+			}
+		}
 		pkgLogTransport().Debug("event recv: event=%s %s", sdkEvent, summarizeDict(params, diagResultFields))
 		go t.dispatcher.Publish("_raw."+sdkEvent, params)
 		return
 	}
 
 	// 其他通知
+	if meta, ok := message["_meta"].(map[string]any); ok {
+		t.invokeMetaObserver(meta)
+	}
 	pkgLogTransport().Debug("notification recv: method=%s", methodOrPlaceholder(method))
 	go t.dispatcher.Publish("notification", message)
 }

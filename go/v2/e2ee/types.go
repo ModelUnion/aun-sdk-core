@@ -23,8 +23,9 @@ type Sender struct {
 
 // Target 表示单个接收方设备。
 //
-// SPKPkDER 为 nil 时走 1DH 路径；非空且 KeySource 属于
-// {"peer_device_prekey", "group_device_prekey"} 时走 3DH 路径。
+// 只有 SPKID、SPKPkDER 同时非空，且 KeySource 属于
+// {"peer_device_prekey", "group_device_prekey"} 时才走 3DH 路径；
+// 其它情况统一走 1DH，信封行会写 key_source=aid_master 且 spk_id=""。
 //
 // Role 取值通常为 "peer" / "member" / "self_sync" / "audit"。
 // KeySource 取值通常为 "peer_device_prekey" / "group_device_prekey" / "aid_master"。

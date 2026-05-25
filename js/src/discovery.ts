@@ -52,8 +52,16 @@ export class GatewayDiscovery {
    * 选择 priority 最小的网关。
    */
   async discover(wellKnownUrl: string, timeout = 5000): Promise<string> {
+    const urls = await this.discoverAll(wellKnownUrl, timeout);
+    return urls[0];
+  }
+
+  /**
+   * 从 well-known URL 发现所有 Gateway WebSocket 地址（按 priority 排序）。
+   */
+  async discoverAll(wellKnownUrl: string, timeout = 5000): Promise<string[]> {
     const tStart = Date.now();
-    this._log.debug(`discover enter: url=${wellKnownUrl}`);
+    this._log.debug(`discoverAll enter: url=${wellKnownUrl}`);
     let payload: GatewayDiscoveryDocument;
     try {
       const controller = new AbortController();
@@ -73,7 +81,7 @@ export class GatewayDiscovery {
       }
       payload = rawPayload as GatewayDiscoveryDocument;
     } catch (exc) {
-      this._log.debug(`discover exit (error): elapsed=${Date.now() - tStart}ms err=${exc instanceof Error ? exc.message : String(exc)}`);
+      this._log.debug(`discoverAll exit (error): elapsed=${Date.now() - tStart}ms err=${exc instanceof Error ? exc.message : String(exc)}`);
       throw new ConnectionError(
         `gateway discovery failed for ${wellKnownUrl}: ${exc}`,
         { retryable: true },
@@ -82,26 +90,24 @@ export class GatewayDiscovery {
 
     const gateways = payload.gateways;
     if (!Array.isArray(gateways) || gateways.length === 0) {
-      this._log.debug(`discover exit (error): elapsed=${Date.now() - tStart}ms err=empty_gateways`);
+      this._log.debug(`discoverAll exit (error): elapsed=${Date.now() - tStart}ms err=empty_gateways`);
       throw new ValidationError('well-known returned empty gateways');
     }
 
-    // 按 priority 排序（低优先级数字 = 高优先级）
     const sorted = [...gateways].sort(
       (a: GatewayEntry, b: GatewayEntry) =>
         (Number(a.priority ?? 999)) - (Number(b.priority ?? 999)),
     );
 
-    const url = sorted[0]?.url;
-    if (!url) {
-      this._log.debug(`discover exit (error): elapsed=${Date.now() - tStart}ms err=missing_url`);
+    const urls = sorted.map(g => String(g.url ?? '')).filter(u => u.length > 0);
+    if (urls.length === 0) {
+      this._log.debug(`discoverAll exit (error): elapsed=${Date.now() - tStart}ms err=missing_url`);
       throw new ValidationError('well-known missing gateway url');
     }
 
-    // 发现后异步触发 health check（不阻塞）
-    this.checkHealth(String(url), timeout).catch(() => {});
+    this.checkHealth(urls[0], timeout).catch(() => {});
 
-    this._log.debug(`discover exit: elapsed=${Date.now() - tStart}ms gateway=${String(url)} candidates=${gateways.length}`);
-    return String(url);
+    this._log.debug(`discoverAll exit: elapsed=${Date.now() - tStart}ms gateways=${JSON.stringify(urls)}`);
+    return urls;
   }
 }

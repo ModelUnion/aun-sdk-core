@@ -5,8 +5,6 @@ package aun
 import (
 	"context"
 	"fmt"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -72,8 +70,7 @@ func findFederationMessageByText(t *testing.T, msgs []map[string]any, fromAID st
 	return nil
 }
 
-// TestFederationAckMainChain 跨域消息 ack 主链验证：
-// 发送方收到 ack 事件，ack_seq 正确，device_id 非空。
+// TestFederationAckMainChain 跨域消息 ack 主链验证：ack_seq 正确推进。
 func TestFederationAckMainChain(t *testing.T) {
 	rid := federationRunID()
 	alice := makeFederationClient(t)
@@ -83,30 +80,6 @@ func TestFederationAckMainChain(t *testing.T) {
 
 	aliceAID := ensureFederationConnected(t, alice, fmt.Sprintf("go-ack-a-%s.aid.com", rid))
 	bobAID := ensureFederationConnected(t, bob, fmt.Sprintf("go-ack-b-%s.aid.net", rid))
-
-	// 监听 alice 收到的 ack 事件
-	var ackMu sync.Mutex
-	var ackEvents []map[string]any
-	ackDone := make(chan struct{}, 1)
-
-	sub := alice.On("message.ack", func(payload any) {
-		data, ok := payload.(map[string]any)
-		if !ok {
-			return
-		}
-		to, _ := data["to"].(string)
-		if to != bobAID {
-			return
-		}
-		ackMu.Lock()
-		ackEvents = append(ackEvents, data)
-		ackMu.Unlock()
-		select {
-		case ackDone <- struct{}{}:
-		default:
-		}
-	})
-	defer sub.Unsubscribe()
 
 	// Alice 发送消息给 Bob
 	text := fmt.Sprintf("fed-ack-test-%s", rid)
@@ -142,34 +115,10 @@ func TestFederationAckMainChain(t *testing.T) {
 	if int(toInt64(ackMap["ack_seq"])) != targetSeq {
 		t.Fatalf("ack_seq 不正确: got=%v want=%d", ackMap["ack_seq"], targetSeq)
 	}
-
-	// 等待 Alice 收到 ack 事件
-	timer := time.NewTimer(10 * time.Second)
-	select {
-	case <-ackDone:
-	case <-timer.C:
-		t.Fatalf("等待跨域 ack 事件超时")
-	}
-	timer.Stop()
-
-	ackMu.Lock()
-	defer ackMu.Unlock()
-	if len(ackEvents) == 0 {
-		t.Fatalf("未收到 ack 事件")
-	}
-	evt := ackEvents[0]
-	deviceID := strings.TrimSpace(getStr(evt, "device_id", ""))
-	if deviceID == "" {
-		t.Fatalf("ack 事件缺少 device_id: %+v", evt)
-	}
-	ackSeq := int(toInt64(evt["ack_seq"]))
-	if ackSeq != targetSeq {
-		t.Fatalf("ack 事件 ack_seq 不正确: got=%d want=%d", ackSeq, targetSeq)
-	}
 }
 
 // TestFederationMultiDeviceAck 跨域多设备 ack 隔离验证：
-// 同一 AID 两个 slot 各自 ack，发送方收到两个独立 ack 事件。
+// 同一 AID 两个 slot 各自 ack，cursor 互不污染。
 func TestFederationMultiDeviceAck(t *testing.T) {
 	rid := federationRunID()
 	alice := makeFederationClient(t)
@@ -187,42 +136,6 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 	// 两个 slot 各自记录基线 seq（必须在 Alice 发送之前）
 	baseA := currentMaxSeq(t, bobSlotA, 200)
 	baseB := currentMaxSeq(t, bobSlotB, 200)
-
-	// 监听 ack 事件
-	expectedSlots := map[string]bool{"fed-slot-a": true, "fed-slot-b": true}
-	var ackMu sync.Mutex
-	ackEvents := make([]map[string]any, 0, 2)
-	ackDone := make(chan struct{}, 1)
-
-	sub := alice.On("message.ack", func(payload any) {
-		data, ok := payload.(map[string]any)
-		if !ok {
-			return
-		}
-		to, _ := data["to"].(string)
-		if to != bobAID {
-			return
-		}
-		slotID := strings.TrimSpace(getStr(data, "slot_id", ""))
-		if !expectedSlots[slotID] {
-			return
-		}
-		ackMu.Lock()
-		ackEvents = append(ackEvents, data)
-		seen := map[string]bool{}
-		for _, item := range ackEvents {
-			seen[strings.TrimSpace(getStr(item, "slot_id", ""))] = true
-		}
-		complete := len(seen) == len(expectedSlots)
-		ackMu.Unlock()
-		if complete {
-			select {
-			case ackDone <- struct{}{}:
-			default:
-			}
-		}
-	})
-	defer sub.Unsubscribe()
 
 	// Alice 发送
 	text := fmt.Sprintf("fed-multi-ack-%s", rid)
@@ -259,41 +172,24 @@ func TestFederationMultiDeviceAck(t *testing.T) {
 
 	// 各自 ack
 	ctxA, cancelA := context.WithTimeout(context.Background(), 10*time.Second)
-	_, err = bobSlotA.Call(ctxA, "message.ack", map[string]any{"seq": seqA})
+	ackA, err := bobSlotA.Call(ctxA, "message.ack", map[string]any{"seq": seqA})
 	cancelA()
 	if err != nil {
 		t.Fatalf("slot-a ack 失败: %v", err)
 	}
 	ctxB, cancelB := context.WithTimeout(context.Background(), 10*time.Second)
-	_, err = bobSlotB.Call(ctxB, "message.ack", map[string]any{"seq": seqB})
+	ackB, err := bobSlotB.Call(ctxB, "message.ack", map[string]any{"seq": seqB})
 	cancelB()
 	if err != nil {
 		t.Fatalf("slot-b ack 失败: %v", err)
 	}
-
-	// 等待 Alice 收到两个 ack 事件
-	timer := time.NewTimer(10 * time.Second)
-	select {
-	case <-ackDone:
-	case <-timer.C:
-		t.Fatalf("等待双 slot ack 事件超时: %+v", ackEvents)
+	ackAMap, _ := ackA.(map[string]any)
+	ackBMap, _ := ackB.(map[string]any)
+	if int(toInt64(ackAMap["ack_seq"])) != seqA {
+		t.Fatalf("slot-a ack_seq 不正确: %#v", ackAMap)
 	}
-	timer.Stop()
-
-	ackMu.Lock()
-	defer ackMu.Unlock()
-	slotsSeen := map[string]bool{}
-	deviceIDs := map[string]bool{}
-	for _, item := range ackEvents {
-		slotsSeen[strings.TrimSpace(getStr(item, "slot_id", ""))] = true
-		deviceIDs[strings.TrimSpace(getStr(item, "device_id", ""))] = true
-	}
-	if len(slotsSeen) != 2 {
-		t.Fatalf("应收到 2 个不同 slot 的 ack 事件: %+v", ackEvents)
-	}
-	// 同设备多 slot：device_id 应相同（只有 1 个唯一值）
-	if len(deviceIDs) != 1 {
-		t.Fatalf("同设备多 slot 的 device_id 应相同: %+v", ackEvents)
+	if int(toInt64(ackBMap["ack_seq"])) != seqB {
+		t.Fatalf("slot-b ack_seq 不正确: %#v", ackBMap)
 	}
 }
 

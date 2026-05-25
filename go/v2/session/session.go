@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,8 +18,8 @@ import (
 const (
 	// PeerKeyCacheTTL 对端 IK 缓存有效期（1 小时）
 	PeerKeyCacheTTL = 1 * time.Hour
-	// DestroyDelaySeconds 旧 SPK 销毁安全窗口（7 小时）
-	DestroyDelaySeconds = 7 * 3600
+	// DestroyDelaySeconds 旧 SPK 销毁安全窗口（7 天）
+	DestroyDelaySeconds = 7 * 24 * 3600
 	// RecentGenerations 最近 N 代 SPK 保留窗口
 	RecentGenerations = 7
 	// HardLimitSeconds SPK 180 天硬上限
@@ -73,6 +74,10 @@ type V2Session struct {
 	spkPubDER  []byte
 	registered bool
 
+	// SPK 上传去重
+	lastUploadedSPKID     string
+	lastUploadedGroupSPKs map[string]string // group_id -> spk_id
+
 	// 对端 IK 缓存：key = peer_aid#device_id
 	peerIKCache map[string]peerIKCacheEntry
 
@@ -94,15 +99,16 @@ type V2Session struct {
 // IK 不在本包生成，因为 IK = AID 身份本身。
 func NewV2Session(store *V2KeyStore, deviceID, aid string, aidPriv, aidPubDER []byte) *V2Session {
 	return &V2Session{
-		store:        store,
-		deviceID:     deviceID,
-		aid:          aid,
-		ikPriv:       aidPriv,
-		ikPubDER:     aidPubDER,
-		peerIKCache:  make(map[string]peerIKCacheEntry),
-		verifiedSPKs: make(map[string]bool),
-		oldSPKMaxSeq: make(map[string]oldSPKSeq),
-		nowFn:        time.Now,
+		store:                 store,
+		deviceID:              deviceID,
+		aid:                   aid,
+		ikPriv:                aidPriv,
+		ikPubDER:              aidPubDER,
+		peerIKCache:           make(map[string]peerIKCacheEntry),
+		verifiedSPKs:          make(map[string]bool),
+		oldSPKMaxSeq:          make(map[string]oldSPKSeq),
+		lastUploadedGroupSPKs: make(map[string]string),
+		nowFn:                 time.Now,
 	}
 }
 
@@ -128,6 +134,9 @@ func (s *V2Session) EnsureKeys() error {
 func (s *V2Session) ensureKeysLocked() error {
 	if len(s.ikPriv) == 0 || len(s.ikPubDER) == 0 {
 		return fmt.Errorf("V2Session: 缺少 AID 主密钥（IK = AID identity）")
+	}
+	if err := s.store.SaveIK(s.deviceID, s.ikPriv, s.ikPubDER); err != nil {
+		return err
 	}
 	if len(s.spkPriv) > 0 {
 		return nil
@@ -164,6 +173,19 @@ func (s *V2Session) generateNewSPKLocked() error {
 	return nil
 }
 
+func (s *V2Session) ikSPKIDLocked() string {
+	h := sha256.Sum256(s.ikPubDER)
+	return "sha256:" + hex.EncodeToString(h[:])[:16]
+}
+
+func normalizeGroupSPKLookup(groupID, spkID string) (string, string) {
+	parts := strings.SplitN(spkID, "\x00", 2)
+	if len(parts) != 2 {
+		return groupID, spkID
+	}
+	return parts[0], parts[1]
+}
+
 // putPeerPKParams 构造 message.v2.put_peer_pk 调用参数（已锁定状态下使用）。
 func (s *V2Session) putPeerPKParamsLocked() (map[string]any, error) {
 	spkTimestamp := s.nowFn().Unix()
@@ -196,6 +218,15 @@ func (s *V2Session) EnsureRegistered(ctx context.Context, callFn CallFn) error {
 	if err := s.ensureKeysLocked(); err != nil {
 		return err
 	}
+	uploadedSPKID, err := s.store.LoadLatestUploadedSPKID(s.deviceID)
+	if err != nil {
+		return err
+	}
+	if uploadedSPKID != "" {
+		s.registered = true
+		s.lastUploadedSPKID = uploadedSPKID
+		return nil
+	}
 	params, err := s.putPeerPKParamsLocked()
 	if err != nil {
 		return err
@@ -203,7 +234,11 @@ func (s *V2Session) EnsureRegistered(ctx context.Context, callFn CallFn) error {
 	if _, err := callFn(ctx, "message.v2.put_peer_pk", params); err != nil {
 		return fmt.Errorf("V2Session.EnsureRegistered: %w", err)
 	}
+	if err := s.store.MarkSPKUploaded(s.deviceID, s.spkID); err != nil {
+		return err
+	}
 	s.registered = true
+	s.lastUploadedSPKID = s.spkID
 	return nil
 }
 
@@ -225,8 +260,9 @@ func (s *V2Session) GetSenderIdentity() (SenderIdentity, error) {
 // GetDecryptKeys 根据消息中的 spk_id 返回 (ikPriv, spkPriv)。
 //
 //   - spkID == "" → 1DH 路径，spkPriv 为 nil
-//   - spkID == 当前 SPK → 返回当前 spkPriv
-//   - 其它 → 从 store 加载历史 SPK，未找到则 spkPriv 为 nil
+//   - spkID == 当前/历史 device SPK → 返回对应 spkPriv
+//   - spkID == IK 指纹 → 走 IK 特殊 fallback，返回 IK 私钥作为 spkPriv
+//   - 其它 → 返回 spk_missing
 func (s *V2Session) GetDecryptKeys(spkID string) (ikPriv, spkPriv []byte, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -243,7 +279,23 @@ func (s *V2Session) GetDecryptKeys(spkID string) (ikPriv, spkPriv []byte, err er
 	if err != nil {
 		return nil, nil, err
 	}
-	return s.ikPriv, oldSPK, nil
+	if len(oldSPK) > 0 {
+		return s.ikPriv, oldSPK, nil
+	}
+	ikAliasPriv, _, err := s.store.LoadIKSPK(s.deviceID, spkID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(ikAliasPriv) > 0 {
+		return ikAliasPriv, ikAliasPriv, nil
+	}
+	if spkID == s.ikSPKIDLocked() {
+		if err := s.store.SaveIK(s.deviceID, s.ikPriv, s.ikPubDER); err != nil {
+			return nil, nil, err
+		}
+		return s.ikPriv, s.ikPriv, nil
+	}
+	return nil, nil, fmt.Errorf("spk_missing: spk_id=%s", spkID)
 }
 
 // IsCurrentSPK 判断 spk_id 是否命中当前活跃 SPK。
@@ -279,7 +331,7 @@ func (s *V2Session) TrackOldSPKMaxSeq(spkID string, seq int64) {
 //
 // 销毁条件（必须全部满足）：
 //   - contig_seq >= 该 SPK 引用的最大 seq（接收方已消费）
-//   - now - last_seen_at >= 7 小时
+//   - now - last_seen_at >= 7 天
 //   - 不在最近 7 代保留窗口内
 func (s *V2Session) MaybeDestroyOldSPKs(contigSeq int64) []string {
 	s.mu.Lock()
@@ -365,7 +417,180 @@ func (s *V2Session) RotateSPK(ctx context.Context, callFn CallFn) error {
 	if _, err := callFn(ctx, "message.v2.put_peer_pk", params); err != nil {
 		return fmt.Errorf("V2Session.RotateSPK: %w", err)
 	}
+	if err := s.store.MarkSPKUploaded(s.deviceID, s.spkID); err != nil {
+		return err
+	}
 	s.registered = true
+	s.lastUploadedSPKID = s.spkID
+	return nil
+}
+
+// ── Group SPK 独立管理 ──────────────────────────────────────────
+
+// EnsureGroupSPK 确保指定群有独立 group SPK，返回 (spkID, priv, pubDER)。
+func (s *V2Session) EnsureGroupSPK(groupID string) (string, []byte, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureKeysLocked(); err != nil {
+		return "", nil, nil, err
+	}
+	spkID, priv, pub, err := s.store.LoadCurrentGroupSPK(s.deviceID, groupID)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if spkID != "" {
+		return spkID, priv, pub, nil
+	}
+	priv, pub, err = crypto.GenerateP256Keypair()
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("V2Session.EnsureGroupSPK generate: %w", err)
+	}
+	h := sha256.Sum256(pub)
+	spkID = "sha256:" + hex.EncodeToString(h[:])[:16]
+	if err := s.store.SaveGroupSPK(s.deviceID, groupID, spkID, priv, pub); err != nil {
+		return "", nil, nil, err
+	}
+	return spkID, priv, pub, nil
+}
+
+// EnsureGroupRegistered 注册指定群的 group SPK。group 服务负责成员鉴权。
+func (s *V2Session) EnsureGroupRegistered(ctx context.Context, groupID string, callFn CallFn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureKeysLocked(); err != nil {
+		return err
+	}
+	uploadedSPKID, err := s.store.LoadLatestUploadedGroupSPKID(s.deviceID, groupID)
+	if err != nil {
+		return err
+	}
+	if uploadedSPKID != "" {
+		s.lastUploadedGroupSPKs[groupID] = uploadedSPKID
+		return nil
+	}
+	// 加载或生成 group SPK（需要先解锁再加锁，因为 EnsureGroupSPK 也加锁）
+	s.mu.Unlock()
+	spkID, _, pubDER, err := s.EnsureGroupSPK(groupID)
+	s.mu.Lock()
+	if err != nil {
+		return err
+	}
+	uploadedSPKID, err = s.store.LoadLatestUploadedGroupSPKID(s.deviceID, groupID)
+	if err != nil {
+		return err
+	}
+	if uploadedSPKID != "" {
+		s.lastUploadedGroupSPKs[groupID] = uploadedSPKID
+		return nil
+	}
+	return s.publishGroupSPKLocked(ctx, groupID, spkID, pubDER, callFn)
+}
+
+// RotateGroupSPK 轮换指定群的 group SPK，保留旧私钥用于缓存窗口内的历史 wrap 解密。
+func (s *V2Session) RotateGroupSPK(ctx context.Context, groupID string, callFn CallFn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.ikPriv) == 0 {
+		return fmt.Errorf("V2Session.RotateGroupSPK: 缺少 AID 主密钥")
+	}
+	priv, pub, err := crypto.GenerateP256Keypair()
+	if err != nil {
+		return fmt.Errorf("V2Session.RotateGroupSPK generate: %w", err)
+	}
+	h := sha256.Sum256(pub)
+	spkID := "sha256:" + hex.EncodeToString(h[:])[:16]
+	if err := s.store.SaveGroupSPK(s.deviceID, groupID, spkID, priv, pub); err != nil {
+		return err
+	}
+	return s.publishGroupSPKLocked(ctx, groupID, spkID, pub, callFn)
+}
+
+// GetGroupDecryptKeys 群消息解密按 group SPK -> device SPK -> IK fallback 查找。
+// spkID 非空但三条路径都找不到时返回 spk_missing。
+func (s *V2Session) GetGroupDecryptKeys(groupID, spkID string) (ikPriv, spkPriv []byte, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureKeysLocked(); err != nil {
+		return nil, nil, err
+	}
+	if spkID == "" {
+		return s.ikPriv, nil, nil
+	}
+	lookupGroupID, lookupSPKID := normalizeGroupSPKLookup(groupID, spkID)
+	groupSPK, err := s.store.LoadGroupSPK(s.deviceID, lookupGroupID, lookupSPKID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if groupSPK != nil {
+		return s.ikPriv, groupSPK, nil
+	}
+	// fallback 到 device SPK，再 fallback 到 IK 特殊 fallback（兼容历史消息）
+	if lookupSPKID == s.spkID {
+		return s.ikPriv, s.spkPriv, nil
+	}
+	oldSPK, err := s.store.LoadSPK(s.deviceID, lookupSPKID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(oldSPK) > 0 {
+		return s.ikPriv, oldSPK, nil
+	}
+	ikAliasPriv, _, err := s.store.LoadIKSPK(s.deviceID, lookupSPKID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(ikAliasPriv) > 0 {
+		return ikAliasPriv, ikAliasPriv, nil
+	}
+	if lookupSPKID == s.ikSPKIDLocked() {
+		if err := s.store.SaveIK(s.deviceID, s.ikPriv, s.ikPubDER); err != nil {
+			return nil, nil, err
+		}
+		return s.ikPriv, s.ikPriv, nil
+	}
+	return nil, nil, fmt.Errorf("spk_missing: spk_id=%s", lookupSPKID)
+}
+
+// IsLastUploadedSPK 判断 spk_id 是否为本进程最后一次成功上传的 P2P SPK。
+func (s *V2Session) IsLastUploadedSPK(spkID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return spkID != "" && spkID == s.lastUploadedSPKID
+}
+
+// IsLastUploadedGroupSPK 判断 spk_id 是否为本进程在该群最后一次成功上传的 group SPK。
+func (s *V2Session) IsLastUploadedGroupSPK(groupID, spkID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if spkID == "" {
+		return false
+	}
+	lookupGroupID, lookupSPKID := normalizeGroupSPKLookup(groupID, spkID)
+	return s.lastUploadedGroupSPKs[lookupGroupID] == lookupSPKID
+}
+
+func (s *V2Session) publishGroupSPKLocked(ctx context.Context, groupID, spkID string, pubDER []byte, callFn CallFn) error {
+	spkTimestamp := strconv.FormatInt(s.nowFn().Unix(), 10)
+	signData := append(append(pubDER, []byte(spkID)...), []byte(spkTimestamp)...)
+	sig, err := crypto.ECDSASignRaw(s.ikPriv, signData)
+	if err != nil {
+		return fmt.Errorf("V2Session.publishGroupSPK sign: %w", err)
+	}
+	params := map[string]any{
+		"group_id":      groupID,
+		"key_source":    "group_device_prekey",
+		"spk_id":        spkID,
+		"spk_pk":        base64.StdEncoding.EncodeToString(pubDER),
+		"spk_signature": base64.StdEncoding.EncodeToString(sig),
+		"spk_timestamp": spkTimestamp,
+	}
+	if _, err := callFn(ctx, "group.v2.put_group_pk", params); err != nil {
+		return fmt.Errorf("V2Session.publishGroupSPK: %w", err)
+	}
+	if err := s.store.MarkGroupSPKUploaded(s.deviceID, groupID, spkID); err != nil {
+		return err
+	}
+	s.lastUploadedGroupSPKs[groupID] = spkID
 	return nil
 }
 

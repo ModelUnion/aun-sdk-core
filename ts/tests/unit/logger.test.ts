@@ -18,7 +18,7 @@ vi.mock('fs', async () => {
 
 import { AUNLogger } from '../../src/logger.js';
 
-const FMT = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[(ERROR|WARN|INFO|DEBUG)\]\[aun_core\.[a-z0-9-]+\] /;
+const FMT = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[(ERROR|WARN|INFO|DEBUG)\]\[aun_core\.[a-z0-9-]+\]\[aun_path=\/tmp\/aun\]\[device_id=-\] /;
 
 describe('AUNLogger 新格式', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -46,6 +46,8 @@ describe('AUNLogger 新格式', () => {
     expect(line).toMatch(FMT);
     expect(line).toContain('[INFO]');
     expect(line).toContain('[aun_core.auth]');
+    expect(line).toContain('[aun_path=/tmp/aun]');
+    expect(line).toContain('[device_id=-]');
     expect(line).toContain('login succeeded');
   });
 
@@ -57,9 +59,19 @@ describe('AUNLogger 新格式', () => {
     const l0 = String(logSpy.mock.calls[0][0]);
     const l1 = String(logSpy.mock.calls[1][0]);
     expect(l0).not.toContain('[alice.com]');
-    expect(l0).toMatch(/\[aun_core\.client\] before$/);
+    expect(l0).toMatch(/\[aun_core\.client\]\[aun_path=\/tmp\/aun\]\[device_id=-\] before$/);
     expect(l1).toContain('[alice.com]');
-    expect(l1).toMatch(/\[aun_core\.client\] \[alice\.com\] after$/);
+    expect(l1).toMatch(/\[aun_core\.client\]\[aun_path=\/tmp\/aun\]\[device_id=-\] \[alice\.com\] after$/);
+  });
+
+  it('bindDeviceId 后日志上下文带 device_id', () => {
+    const logger = new AUNLogger({ debug: false, aunPath: '/tmp/aun' });
+    logger.bindDeviceId('device-123');
+    logger.for('aun_core.client').info('hello');
+    const line = String(logSpy.mock.calls[0][0]);
+    expect(line).toContain('[aun_path=/tmp/aun]');
+    expect(line).toContain('[device_id=device-123]');
+    expect(line).toMatch(/ hello$/);
   });
 
   it('ERROR 带 Error：控制台只单行，文件追加 Traceback', () => {

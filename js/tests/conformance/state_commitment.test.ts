@@ -63,4 +63,18 @@ describe('state_commitment - golden', () => {
     const c2 = await computeStateCommitment(groupId, 2, payload);
     expect(c1).not.toBe(c2);
   });
+
+  it('rejects epoch outside uint32 instead of wrapping', async () => {
+    const payload = {
+      members: [],
+      audit_aids: [],
+      admin_set: { admin_aids: [], threshold: 0 },
+      history_policy: 'none',
+      wrap_protocol: '1DH',
+    };
+    await expect(computeStateCommitment('g-test.agentid.pub', -1, payload))
+      .rejects.toThrow(/epoch out of uint32 range/);
+    await expect(computeStateCommitment('g-test.agentid.pub', 0x1_0000_0000, payload))
+      .rejects.toThrow(/epoch out of uint32 range/);
+  });
 });

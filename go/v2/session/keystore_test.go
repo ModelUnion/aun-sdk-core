@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,5 +210,89 @@ func TestSaveLoadSPK_MultiDevice(t *testing.T) {
 	pb, _ := s.LoadSPK("devB", "spk-1")
 	if !bytes.Equal(pa, []byte("A1")) || !bytes.Equal(pb, []byte("B1")) {
 		t.Fatal("device-scoped lookup failed")
+	}
+}
+
+func TestMigrateLegacyDeviceKeysAllowsNullUploadedMarkers(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	_, err = db.Exec(`CREATE TABLE v2_device_keys (
+		device_id TEXT NOT NULL,
+		key_type TEXT NOT NULL,
+		key_id TEXT NOT NULL DEFAULT '',
+		private_key BLOB,
+		public_key BLOB,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (device_id, key_type, key_id)
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO v2_device_keys (device_id, key_type, key_id, private_key, public_key, created_at) VALUES
+		('dev1', 'spk', 'spk-1', x'01', x'02', 1),
+		('dev1', 'spk_uploaded', 'spk-1', NULL, NULL, 2),
+		('dev1', 'group_spk', 'group-1' || char(0) || 'gspk-1', x'03', x'04', 3),
+		('dev1', 'group_spk_uploaded', 'group-1' || char(0) || 'gspk-1', NULL, NULL, 4)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewV2KeyStore(db)
+	if err != nil {
+		t.Fatalf("legacy migration should tolerate NULL uploaded markers: %v", err)
+	}
+	spkID, err := store.LoadLatestUploadedSPKID("dev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spkID != "spk-1" {
+		t.Fatalf("uploaded SPK marker mismatch: got %q", spkID)
+	}
+	groupSPKID, err := store.LoadLatestUploadedGroupSPKID("dev1", "group-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groupSPKID != "gspk-1" {
+		t.Fatalf("uploaded group SPK marker mismatch: got %q", groupSPKID)
+	}
+}
+
+func TestGroupSPKNewRecordsDoNotUseLegacyCompositeKey(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SaveGroupSPK("dev1", "group-1", "gspk-1", []byte("gpriv"), []byte("gpub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkGroupSPKUploaded("dev1", "group-1", "gspk-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.db.Query(`SELECT group_id, key_id FROM v2_device_keys WHERE device_id='dev1' AND key_type IN ('group_spk', 'group_spk_uploaded')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		var groupID, keyID string
+		if err := rows.Scan(&groupID, &keyID); err != nil {
+			t.Fatal(err)
+		}
+		if groupID != "group-1" || keyID != "gspk-1" {
+			t.Fatalf("new group SPK record should use group_id/key_id columns, got group_id=%q key_id=%q", groupID, keyID)
+		}
+		if strings.Contains(keyID, "\x00") {
+			t.Fatalf("new group SPK key_id must not contain NUL: %q", keyID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected group key + uploaded marker, got %d rows", count)
 	}
 }

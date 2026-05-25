@@ -102,10 +102,7 @@ export async function encryptGroupMessage(
 
   const protocolSet = new Set<string>();
   for (const t of targets) {
-    if (
-      t.spkPkDer
-      && (t.keySource === 'peer_device_prekey' || t.keySource === 'group_device_prekey')
-    ) {
+    if (usesSPKWrap(t)) {
       protocolSet.add('3DH');
     } else {
       protocolSet.add('1DH');
@@ -193,6 +190,10 @@ export async function encryptGroupMessage(
     recipients: sortedRows,
     aad,
   };
+  const payloadType = payload?.type == null ? '' : String(payload.type);
+  if (payloadType) {
+    envelope.payload_type = payloadType;
+  }
 
   // protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
   // payload_type 自动注入 + value 转 string（与 Python _normalize_headers 对齐）
@@ -222,12 +223,12 @@ async function wrapForRecipient(
   const fp = `sha256:${fpHash.substring(0, 16)}`;
 
   const wrapNonce = randomBytes(12);
+  const use3DH = usesSPKWrap(target);
+  const rowKeySource = use3DH ? keySource : 'aid_master';
+  const rowSpkId = use3DH ? (target.spkId ?? '') : '';
 
   let wrapKey: Uint8Array;
-  if (
-    target.spkPkDer
-    && (keySource === 'peer_device_prekey' || keySource === 'group_device_prekey')
-  ) {
+  if (use3DH) {
     wrapKey = await compute3DHWrap(
       senderSessionPriv,
       senderMasterPriv,
@@ -253,10 +254,24 @@ async function wrapForRecipient(
     target.aid,
     target.deviceId,
     role,
-    keySource,
+    rowKeySource,
     fp,
-    target.spkId ?? '',
+    rowSpkId,
     bytesToBase64(wrapNonce),
     bytesToBase64(wrappedKey),
   ];
+}
+
+function usesSPKWrap(
+  target: Target,
+): target is Target & {
+  spkId: string;
+  spkPkDer: Uint8Array;
+  keySource: 'peer_device_prekey' | 'group_device_prekey';
+} {
+  return Boolean(
+    target.spkId &&
+      target.spkPkDer &&
+      (target.keySource === 'peer_device_prekey' || target.keySource === 'group_device_prekey'),
+  );
 }

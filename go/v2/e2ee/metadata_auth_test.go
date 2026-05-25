@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	"github.com/modelunion/aun-sdk-core/go/v2/crypto"
@@ -114,13 +115,14 @@ func TestWithMetadataAuthFiltersAuth(t *testing.T) {
 	}
 }
 
-func TestNormalizeProtectedHeadersPythonParity(t *testing.T) {
+func TestNormalizeProtectedHeadersCanonicalParity(t *testing.T) {
 	got, err := normalizeProtectedHeaders(map[string]any{
 		"Device_ID": "dev-a",
 		"Slot_ID":   nil,
 		"empty":     "",
 		"flag":      true,
 		"ratio":     1.0,
+		"nested":    map[string]any{"b": 2, "a": 1},
 	}, map[string]any{"type": "thought"})
 	if err != nil {
 		t.Fatalf("normalizeProtectedHeaders 失败: %v", err)
@@ -134,20 +136,50 @@ func TestNormalizeProtectedHeadersPythonParity(t *testing.T) {
 	if value, ok := got["empty"]; !ok || value != "" {
 		t.Fatalf("空字符串 value 应保留: %#v", got)
 	}
-	if got["flag"] != "True" {
-		t.Fatalf("bool value 应按 Python str(True) 输出 True: %#v", got)
+	if got["flag"] != "true" {
+		t.Fatalf("bool value 应按 canonical JSON 输出 true: %#v", got)
 	}
-	if got["ratio"] != "1.0" {
-		t.Fatalf("float value 应按 Python str(1.0) 输出 1.0: %#v", got)
+	if got["ratio"] != "1" {
+		t.Fatalf("float value 应按 canonical JSON 输出 1: %#v", got)
+	}
+	if got["nested"] != `{"a":1,"b":2}` {
+		t.Fatalf("object value 应按 canonical JSON 输出: %#v", got)
 	}
 	if got["payload_type"] != "thought" {
 		t.Fatalf("payload_type 自动注入失败: %#v", got)
+	}
+	if got["sdk_lang"] != e2eeSDKLang {
+		t.Fatalf("sdk_lang 自动注入失败: %#v", got)
+	}
+	if got["sdk_vesion"] != e2eeSDKVersion {
+		t.Fatalf("sdk_vesion 自动注入失败: %#v", got)
 	}
 }
 
 func TestNormalizeProtectedHeadersRejectsAuthKey(t *testing.T) {
 	if _, err := normalizeProtectedHeaders(map[string]any{"_auth": "bad"}, nil); err == nil {
 		t.Fatal("_auth 应作为 protected header 保留字段被拒绝")
+	}
+}
+
+func TestDecryptRejectsTamperedProtectedHeaders(t *testing.T) {
+	sender := makeTestSender(t)
+	target, ikPriv, _ := makeTestRecipient(t, "peer", "aid_master", false)
+	envelope, err := EncryptP2PMessage(
+		sender,
+		TargetSet{Targets: []Target{target}},
+		map[string]any{"type": "text", "text": "metadata"},
+		EncryptOptions{ProtectedHeaders: map[string]any{"trace_id": "trace-1"}},
+	)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	headers := envelope["protected_headers"].(map[string]any)
+	headers["trace_id"] = "trace-2"
+	if _, err := DecryptMessage(envelope, target.AID, target.DeviceID, ikPriv, nil, sender.IKPubDER); err == nil {
+		t.Fatal("篡改 protected_headers 后应解密失败")
+	} else if !strings.Contains(err.Error(), "protected_headers _auth verification failed") {
+		t.Fatalf("错误信息不准确: %v", err)
 	}
 }
 
@@ -161,6 +193,8 @@ func TestEncryptP2PWithProtectedHeaders(t *testing.T) {
 		ProtectedHeaders: map[string]any{
 			"payload_type": "text",
 			"priority":     "normal",
+			"sdk_lang":     "spoofed",
+			"sdk_vesion":   "0.0.0",
 		},
 		Context: map[string]any{
 			"thread_id": "t-123",
@@ -180,6 +214,9 @@ func TestEncryptP2PWithProtectedHeaders(t *testing.T) {
 	}
 	if ph["payload_type"] != "text" {
 		t.Fatalf("protected_headers.payload_type 错误: %v", ph["payload_type"])
+	}
+	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_vesion"] != e2eeSDKVersion {
+		t.Fatalf("protected_headers SDK 元信息错误: %v", ph)
 	}
 	phAuth, ok := ph["_auth"].(map[string]any)
 	if !ok {
@@ -217,8 +254,12 @@ func TestEncryptP2PWithoutProtectedHeaders(t *testing.T) {
 		t.Fatalf("加密失败: %v", err)
 	}
 
-	if _, ok := envelope["protected_headers"]; ok {
-		t.Fatalf("不传 ProtectedHeaders 时 envelope 不应含 protected_headers 字段")
+	ph, ok := envelope["protected_headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("不传 ProtectedHeaders 时 envelope 仍应含 SDK protected_headers: %#v", envelope["protected_headers"])
+	}
+	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_vesion"] != e2eeSDKVersion {
+		t.Fatalf("protected_headers SDK 元信息错误: %#v", ph)
 	}
 	if _, ok := envelope["context"]; ok {
 		t.Fatalf("不传 Context 时 envelope 不应含 context 字段")
@@ -248,6 +289,9 @@ func TestEncryptGroupWithProtectedHeaders(t *testing.T) {
 	}
 	if ph["payload_type"] != "image" {
 		t.Fatalf("protected_headers.payload_type 错误: %v", ph["payload_type"])
+	}
+	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_vesion"] != e2eeSDKVersion {
+		t.Fatalf("protected_headers SDK 元信息错误: %v", ph)
 	}
 	phAuth, ok := ph["_auth"].(map[string]any)
 	if !ok {

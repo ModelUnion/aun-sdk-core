@@ -3,8 +3,10 @@ package session
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -64,6 +66,11 @@ func newSessionForTest(t *testing.T) (*V2Session, *V2KeyStore) {
 	}
 	sess := NewV2Session(store, "dev-1", "alice.aid.com", priv, pub)
 	return sess, store
+}
+
+func keyIDForPubDER(pub []byte) string {
+	sum := sha256.Sum256(pub)
+	return "sha256:" + hex.EncodeToString(sum[:])[:16]
 }
 
 func TestEnsureKeys_GeneratesSPK_WhenNoneExists(t *testing.T) {
@@ -201,6 +208,57 @@ func TestEnsureRegistered_RPCError_NotMarked(t *testing.T) {
 	}
 }
 
+func TestEnsureRegistered_RestoresUploadedMarkerWithoutRPC(t *testing.T) {
+	sess, store := newSessionForTest(t)
+	rpc := &mockRPC{}
+	if err := sess.EnsureRegistered(context.Background(), rpc.call); err != nil {
+		t.Fatal(err)
+	}
+	uploadedSPK := sess.CurrentSPKID()
+	if uploadedSPK == "" {
+		t.Fatal("expected uploaded spk id")
+	}
+
+	sess2 := NewV2Session(store, "dev-1", "alice.aid.com", sess.ikPriv, sess.ikPubDER)
+	rpc2 := &mockRPC{}
+	if err := sess2.EnsureRegistered(context.Background(), rpc2.call); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rpc2.Calls()); got != 0 {
+		t.Fatalf("expected no RPC when uploaded marker exists, got %d", got)
+	}
+	if !sess2.IsLastUploadedSPK(uploadedSPK) {
+		t.Fatalf("expected restored last uploaded SPK %s", uploadedSPK)
+	}
+}
+
+func TestEnsureGroupRegistered_RestoresUploadedMarkerWithoutRPC(t *testing.T) {
+	sess, store := newSessionForTest(t)
+	rpc := &mockRPC{}
+	groupID := "group.aid/1"
+	if err := sess.EnsureGroupRegistered(context.Background(), groupID, rpc.call); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rpc.Calls()); got != 1 {
+		t.Fatalf("expected first group registration RPC, got %d", got)
+	}
+	uploadedSPK := sess.lastUploadedGroupSPKs[groupID]
+	if uploadedSPK == "" {
+		t.Fatal("expected uploaded group spk id")
+	}
+
+	sess2 := NewV2Session(store, "dev-1", "alice.aid.com", sess.ikPriv, sess.ikPubDER)
+	rpc2 := &mockRPC{}
+	if err := sess2.EnsureGroupRegistered(context.Background(), groupID, rpc2.call); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rpc2.Calls()); got != 0 {
+		t.Fatalf("expected no RPC when group uploaded marker exists, got %d", got)
+	}
+	if !sess2.IsLastUploadedGroupSPK(groupID, uploadedSPK) {
+		t.Fatalf("expected restored last uploaded group SPK %s", uploadedSPK)
+	}
+}
 func TestRotateSPK_NewKeyAndRegister(t *testing.T) {
 	sess, _ := newSessionForTest(t)
 	rpc := &mockRPC{}
@@ -265,13 +323,81 @@ func TestGetDecryptKeys_Cases(t *testing.T) {
 		t.Fatal("old SPK priv mismatch")
 	}
 
-	// 4) 不存在的 spk_id → spk priv 为 nil（不 error）
-	_, spk, err = sess.GetDecryptKeys("sha256:nonexistent00000")
+	// 4) 不存在的 spk_id → 显式报 spk_missing
+	_, _, err = sess.GetDecryptKeys("sha256:nonexistent00000")
+	if err == nil || !strings.Contains(err.Error(), "spk_missing: spk_id=sha256:nonexistent00000") {
+		t.Fatalf("missing spk should return spk_missing, got %v", err)
+	}
+
+	// 5) spk_id 命中 IK 指纹 → 返回 IK 作为 SPK 私钥
+	ikID := keyIDForPubDER(sess.ikPubDER)
+	ik, spk, err = sess.GetDecryptKeys(ikID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spk != nil {
-		t.Fatal("missing spk should return nil")
+	if !bytes.Equal(ik, sess.ikPriv) || !bytes.Equal(spk, sess.ikPriv) {
+		t.Fatal("IK spk_id should resolve to IK private key")
+	}
+}
+
+func TestGetGroupDecryptKeys_Cases(t *testing.T) {
+	sess, store := newSessionForTest(t)
+	if err := sess.EnsureKeys(); err != nil {
+		t.Fatal(err)
+	}
+
+	ik, spk, err := sess.GetGroupDecryptKeys("group.aid/1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ik) != 32 || spk != nil {
+		t.Fatalf("empty spk_id should use IK/1DH, ik=%d spk=%v", len(ik), spk)
+	}
+
+	groupPriv := bytes.Repeat([]byte{0x88}, 32)
+	if err := store.SaveGroupSPK("dev-1", "group.aid/1", "sha256:group01234567", groupPriv, []byte("grouppub")); err != nil {
+		t.Fatal(err)
+	}
+	_, spk, err = sess.GetGroupDecryptKeys("group.aid/1", "sha256:group01234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(spk, groupPriv) {
+		t.Fatal("group SPK priv mismatch")
+	}
+
+	_, spk, err = sess.GetGroupDecryptKeys("group.aid/1", "group.aid/1\x00sha256:group01234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(spk, groupPriv) {
+		t.Fatal("legacy composite group SPK id should resolve through group_id + spk_id")
+	}
+	sess.lastUploadedGroupSPKs["group.aid/1"] = "sha256:group01234567"
+	if !sess.IsLastUploadedGroupSPK("group.aid/1", "group.aid/1\x00sha256:group01234567") {
+		t.Fatal("legacy composite group SPK id should match uploaded marker")
+	}
+
+	_, spk, err = sess.GetGroupDecryptKeys("group.aid/1", sess.spkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(spk, sess.spkPriv) {
+		t.Fatal("group lookup should fall back to current device SPK")
+	}
+
+	ikID := keyIDForPubDER(sess.ikPubDER)
+	ik, spk, err = sess.GetGroupDecryptKeys("group.aid/1", ikID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(ik, sess.ikPriv) || !bytes.Equal(spk, sess.ikPriv) {
+		t.Fatal("group IK spk_id should resolve to IK private key")
+	}
+
+	_, _, err = sess.GetGroupDecryptKeys("group.aid/1", "sha256:missinggroup00")
+	if err == nil || !strings.Contains(err.Error(), "spk_missing: spk_id=sha256:missinggroup00") {
+		t.Fatalf("missing group spk should return spk_missing, got %v", err)
 	}
 }
 
@@ -307,8 +433,8 @@ func TestTrackOldSPKMaxSeq_OnlyTracksNonCurrent(t *testing.T) {
 	sess.TrackOldSPKMaxSeq("sha256:old1234567890ab", 10) // 升高
 	sess.TrackOldSPKMaxSeq("sha256:old1234567890ab", 8)  // 不降低
 
-	// MaybeDestroyOldSPKs 在 contig=20、时间已超过 7h 时应包含此 spk
-	sess.SetNowFnForTest(func() time.Time { return time.Now().Add(8 * time.Hour) })
+	// MaybeDestroyOldSPKs 在 contig=20、时间已超过 7 天时应包含此 spk
+	sess.SetNowFnForTest(func() time.Time { return time.Now().Add(8 * 24 * time.Hour) })
 	destroyed := sess.MaybeDestroyOldSPKs(20)
 	// 但旧 SPK 不在 store（未保存），DeleteSPK 不会失败但跟踪 map 应清理
 	// 检查：destroyed 包含此 id
@@ -358,11 +484,11 @@ func TestMaybeDestroyOldSPKs_TripleCondition(t *testing.T) {
 		t.Fatalf("contig<max should not destroy, got %v", dest)
 	}
 
-	// 条件 2：contig 满足，但时间不到 7h → 不销毁
+	// 条件 2：contig 满足，但时间不到 7 天 → 不销毁
 	sess.SetNowFnForTest(func() time.Time { return t0.Add(2 * time.Hour) })
 	dest = sess.MaybeDestroyOldSPKs(20)
 	if len(dest) != 0 {
-		t.Fatalf("time<7h should not destroy, got %v", dest)
+		t.Fatalf("time<7d should not destroy, got %v", dest)
 	}
 
 	// 条件 3：contig 满足、时间满足，但仍在最近 7 代窗口内 → 不销毁
@@ -372,7 +498,7 @@ func TestMaybeDestroyOldSPKs_TripleCondition(t *testing.T) {
 		_ = store.DeleteSPK("dev-1", spkID)
 	}
 	// 现在 oldID 是唯一的 SPK，必然在最近 7 代里
-	sess.SetNowFnForTest(func() time.Time { return t0.Add(8 * time.Hour) })
+	sess.SetNowFnForTest(func() time.Time { return t0.Add(8 * 24 * time.Hour) })
 	dest = sess.MaybeDestroyOldSPKs(20)
 	if len(dest) != 0 {
 		t.Fatalf("recent-7 keep window should not destroy, got %v", dest)

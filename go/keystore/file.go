@@ -819,6 +819,40 @@ func (f *FileKeyStore) LoadAnyIdentity() (map[string]any, error) {
 	return nil, nil
 }
 
+// ── Agent.md Cache（AgentMDCacheStore 实现）────────────────────
+
+func (f *FileKeyStore) LoadAgentMDCache(ownerAid, targetAid string) (*AgentMDCacheRecord, error) {
+	owner := strings.TrimSpace(ownerAid)
+	target := strings.TrimSpace(targetAid)
+	if owner == "" || target == "" {
+		return nil, nil
+	}
+	l := f.getLock(owner)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(owner)
+	if err != nil {
+		return nil, err
+	}
+	return db.LoadAgentMDCache(target)
+}
+
+func (f *FileKeyStore) UpsertAgentMDCache(ownerAid, targetAid string, fields AgentMDCacheUpsert) (*AgentMDCacheRecord, error) {
+	owner := strings.TrimSpace(ownerAid)
+	target := strings.TrimSpace(targetAid)
+	if owner == "" || target == "" {
+		return nil, fmt.Errorf("UpsertAgentMDCache requires non-empty ownerAid and targetAid")
+	}
+	l := f.getLock(owner)
+	l.Lock()
+	defer l.Unlock()
+	db, err := f.getDB(owner)
+	if err != nil {
+		return nil, err
+	}
+	return db.UpsertAgentMDCache(target, fields)
+}
+
 // ── Metadata 公共接口（MetadataKeyStore 实现）─────────────────
 
 // GetMetadataValue 读取指定 AID 的 metadata KV 值。

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""E2E 复现场景：slot_id 变化是否触发不必要的 epoch key request storm。
+"""E2E 复现场景：slot_id 变化是否触发不必要的群消息解密风暴。
 
 场景：
-  1. Alice + Bob 建群，Alice 发送加密消息（建立 epoch key）
+  1. Alice + Bob 建群，Bob 发送加密消息给 Alice（建立 V2 group SPK 使用路径）
   2. Alice 断开连接
   3. Alice 用不同 slot_id 重连（同 aid/device_id）
   4. 重连后观察：
      - SeqTracker 是否重置？
      - group.pull 是否从 seq=0 拉回旧消息？
-     - 旧消息解密是否成功（group secret 仍在本地）？
-     - 是否触发了不必要的 _recover_group_epoch_key？
+     - 旧消息解密是否成功（group SPK 仍在本地）？
+     - 是否出现不必要的解密失败事件？
 
 前置条件：
   - Docker 环境运行中
@@ -30,7 +30,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
-from aun_core.e2ee import load_all_group_secrets
 
 # ---------------------------------------------------------------------------
 # 日志配置 — 打开 SDK 内部 DIAG 日志
@@ -96,6 +95,52 @@ def _make_client(tag: str, rid: str, *, slot_suffix: str = "") -> AUNClient:
     return client
 
 
+def _current_group_spk_id(client: AUNClient, group_id: str) -> str:
+    session = getattr(client, "_v2_session", None)
+    device_id = str(getattr(client, "_device_id", "") or "")
+    store = getattr(session, "_store", None)
+    if session is None or store is None or not device_id:
+        return ""
+    result = store.load_current_group_spk(device_id, group_id)
+    if not result:
+        return ""
+    return str(result[0] or "")
+
+
+async def _wait_for_group_spk(client: AUNClient, group_id: str, *, timeout: float = 8.0) -> str:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_spk = ""
+    while asyncio.get_running_loop().time() < deadline:
+        last_spk = _current_group_spk_id(client, group_id)
+        if last_spk:
+            return last_spk
+        await asyncio.sleep(0.2)
+    raise AssertionError(f"本地 V2 group SPK 未就绪: group={group_id} last={last_spk!r}")
+
+
+async def _wait_group_committed(client: AUNClient, group_id: str, aid: str, *, timeout: float = 12.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_committed: list[str] = []
+    last_pending: list[str] = []
+    while asyncio.get_running_loop().time() < deadline:
+        bootstrap = await client.call("group.v2.bootstrap", {"group_id": group_id})
+        last_committed = list(bootstrap.get("committed_member_aids") or bootstrap.get("member_aids") or [])
+        pending_adds = list(bootstrap.get("pending_adds") or [])
+        pending_removes = list(bootstrap.get("pending_removes") or [])
+        last_pending = pending_adds + pending_removes
+        if aid in last_committed and not last_pending:
+            return
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"{aid} 未进入 committed 成员集: committed={last_committed} pending={last_pending}")
+
+
+def _payload_text(message: dict) -> str:
+    payload = message.get("payload") if isinstance(message, dict) else None
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("text") or "")
+
+
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
@@ -125,9 +170,9 @@ async def _add_member(client: AUNClient, group_id: str, member_aid: str) -> None
 # ---------------------------------------------------------------------------
 
 async def test_slot_id_change_storm():
-    """复现场景：slot_id 变化是否触发 epoch key request storm。"""
+    """复现场景：slot_id 变化是否触发群消息解密风暴。"""
     print("\n" + "=" * 70)
-    print("E2E: slot_id 变化 epoch key request storm 复现")
+    print("E2E: slot_id 变化 group SPK 解密风暴复现")
     print("=" * 70)
 
     rid = _run_id()
@@ -136,7 +181,7 @@ async def test_slot_id_change_storm():
 
     try:
         # Step 1: Alice(slot-v1) + Bob 建群
-        print("\n--- Step 1: 建群 + 发消息（建立 epoch key）---")
+        print("\n--- Step 1: 建群 + Bob 发消息（验证 Alice group SPK 接收路径）---")
         a_aid = await _ensure_connected(alice_1, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
 
@@ -144,25 +189,26 @@ async def test_slot_id_change_storm():
         print(f"  建群成功: {group_id}")
 
         await _add_member(alice_1, group_id, b_aid)
-        await asyncio.sleep(2)
+        await _wait_group_committed(alice_1, group_id, b_aid)
+        await _wait_group_committed(bob, group_id, b_aid)
+        alice_spk = await _wait_for_group_spk(alice_1, group_id)
+        print(f"  Alice 本地 V2 group SPK: {alice_spk}")
 
-        # 发送几条加密群消息
-        for i in range(3):
-            await alice_1.call("group.send", {
+        expected_texts = [f"slot-storm-{rid}-{i}" for i in range(3)]
+        for i, text in enumerate(expected_texts):
+            await bob.call("group.send", {
                 "group_id": group_id,
-                "payload": {"type": "text", "text": f"消息-{i}"},
+                "payload": {"type": "text", "text": text},
                 "encrypt": True,
             })
             await asyncio.sleep(0.5)
-        print(f"  Alice 发送 3 条加密消息")
+        print("  Bob 发送 3 条加密消息")
 
         await asyncio.sleep(2)
 
-        # 确认 Alice 本地有 group secret
-        local_secrets = load_all_group_secrets(alice_1._keystore, a_aid, group_id)
-        print(f"  Alice 本地 epoch keys: {sorted(local_secrets.keys())}")
-        assert local_secrets, "Alice 应该有本地 group secret"
-
+        # 确认 Alice 本地仍有 V2 group SPK。V2-only 群不再写入旧 epoch group secret。
+        alice_spk_after = await _wait_for_group_spk(alice_1, group_id)
+        print(f"  Alice 当前 V2 group SPK: {alice_spk_after}")
         # 记录 Alice 当前 slot_id 和 seq 状态
         old_slot = alice_1._slot_id
         old_seq_state = alice_1._seq_tracker.export_state()
@@ -179,22 +225,21 @@ async def test_slot_id_change_storm():
 
         print(f"  新 slot_id={alice_2._test_slot_id}")
         print(f"  期望：SeqTracker 重置 → group.pull 从 seq=0 拉回旧消息")
-        print(f"  期望：group secret 仍在本地 → 不应触发 recover")
+        print(f"  期望：group SPK 仍在本地 → 旧消息可正常解密")
         print()
         print("  ⬇⬇⬇ 以下 DIAG 日志将显示实际行为 ⬇⬇⬇")
         print()
 
         a_aid_2 = await _ensure_connected(alice_2, _ALICE_AID)
 
-        # 确认重连后 group secret 仍在本地
-        local_secrets_2 = load_all_group_secrets(alice_2._keystore, a_aid_2, group_id)
-        print(f"\n  重连后 Alice 本地 epoch keys: {sorted(local_secrets_2.keys())}")
-
+        # 确认重连后 group SPK 仍在本地
+        alice_spk_2 = await _wait_for_group_spk(alice_2, group_id)
+        print(f"\n  重连后 Alice 本地 V2 group SPK: {alice_spk_2}")
         new_slot = alice_2._slot_id
         new_seq_state = alice_2._seq_tracker.export_state()
         print(f"  重连后 slot_id={new_slot}, seq_state={new_seq_state}")
 
-        # 等待推送消息到达 + 自动解密
+        # 等待可能的后台补洞/推送消息到达 + 自动解密
         await asyncio.sleep(5)
 
         # Step 4: 分析结果
@@ -204,7 +249,7 @@ async def test_slot_id_change_storm():
         print(f"  收到群消息数: {len(inbox)}")
         print(f"  undecryptable 事件数: {len(undecryptable)}")
 
-        decrypted_ok = [m for m in inbox if m.get("e2ee", {}).get("encryption_mode") == "epoch_group_key"]
+        decrypted_ok = [m for m in inbox if m.get("e2ee")]
         decrypted_fail = [m for m in inbox if not m.get("e2ee")]
         print(f"  成功解密: {len(decrypted_ok)}")
         print(f"  解密失败（密文泄露到应用层）: {len(decrypted_fail)}")
@@ -221,7 +266,8 @@ async def test_slot_id_change_storm():
         print("\n--- Step 5: 主动 group.pull（after_seq=0）---")
         pull_result = await alice_2.call("group.pull", {
             "group_id": group_id,
-            "after_message_seq": 0,
+            "after_seq": 0,
+            "limit": 20,
         })
         pulled_msgs = pull_result.get("messages", [])
         print(f"  pull 返回消息数: {len(pulled_msgs)}")
@@ -231,15 +277,22 @@ async def test_slot_id_change_storm():
                   f"epoch={p.get('epoch') if isinstance(p, dict) else 'N/A'} "
                   f"e2ee={bool(m.get('e2ee'))}")
 
+        combined = inbox + pulled_msgs
+        found_texts = {_payload_text(m) for m in combined}
+        missing = [text for text in expected_texts if text not in found_texts]
+        print(f"  期望消息数: {len(expected_texts)}")
+        print(f"  成功匹配消息数: {len(expected_texts) - len(missing)}")
+        if missing:
+            print(f"  缺失消息: {missing}")
+
         print("\n" + "=" * 70)
-        if not undecryptable and not decrypted_fail:
-            print("✅ 无 epoch key request storm — slot_id 变化后解密仍正常")
+        if not undecryptable and not decrypted_fail and not missing:
+            print("✅ 无 group SPK 解密风暴 — slot_id 变化后解密仍正常")
         else:
             print("❌ 存在问题 — 需要根据上方 DIAG 日志分析根因")
         print("=" * 70)
 
-        return not undecryptable and not decrypted_fail
-
+        return not undecryptable and not decrypted_fail and not missing
     except Exception as e:
         print(f"\n❌ 测试异常: {e}")
         import traceback

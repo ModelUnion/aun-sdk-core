@@ -38,6 +38,7 @@ async function deleteDb(name: string): Promise<void> {
 interface SessionFixture {
   session: V2Session;
   store: V2KeyStore;
+  ikPriv: Uint8Array;
   ikPub: Uint8Array;
 }
 
@@ -48,7 +49,17 @@ async function newSession(
   const store = await openStore();
   const [ikPriv, ikPub] = await generateP256Keypair();
   const session = new V2Session(store, deviceId, aid, ikPriv, ikPub);
-  return { session, store, ikPub };
+  return { session, store, ikPriv, ikPub };
+}
+
+async function keyIdForPub(pubDer: Uint8Array): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', pubDer.slice().buffer);
+  const hex = Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `sha256:${hex.slice(0, 16)}`;
+}
+
+function scopedDeviceId(aid = 'alice.aid.com', deviceId = 'dev-1'): string {
+  return `aid:${encodeURIComponent(aid)}|device:${encodeURIComponent(deviceId)}`;
 }
 
 function captureCallFn(): {
@@ -103,7 +114,7 @@ describe('V2Session.ensureKeys', () => {
     await session.ensureKeys();
     const spkId = session.currentSpkId;
     expect(spkId).toMatch(/^sha256:[0-9a-f]{16}$/);
-    const cur = await store.loadCurrentSPK('dev-1');
+    const cur = await store.loadCurrentSPK(scopedDeviceId());
     expect(cur?.spkId).toBe(spkId);
   });
 
@@ -171,7 +182,60 @@ describe('V2Session.ensureRegistered / rotateSPK', () => {
     expect(session.currentSpkId).not.toBe(oldSpkId);
     expect(calls).toHaveLength(2);
     expect(calls[1]!.params.spk_id).toBe(session.currentSpkId);
-    expect(await store.loadSPK('dev-1', oldSpkId)).not.toBeNull();
+    expect(await store.loadSPK(scopedDeviceId(), oldSpkId)).not.toBeNull();
+  });
+
+  it('ensureRegistered 从本地 uploaded marker 恢复时不再 RPC', async () => {
+    const { session, store, ikPriv, ikPub } = await newSession();
+    const { calls, fn } = captureCallFn();
+    await session.ensureRegistered(fn);
+    const uploadedSpkId = session.currentSpkId;
+    expect(calls).toHaveLength(1);
+
+    const sess2 = new V2Session(store, 'dev-1', 'alice.aid.com', ikPriv, ikPub);
+    const { calls: calls2, fn: fn2 } = captureCallFn();
+    await sess2.ensureRegistered(fn2);
+
+    expect(calls2).toHaveLength(0);
+    expect(sess2.isLastUploadedSPK(uploadedSpkId)).toBe(true);
+  });
+
+  it('同一 device_id 下不同 AID 的 uploaded marker 必须隔离', async () => {
+    const store = await openStore();
+    const [aliceIkPriv, aliceIkPub] = await generateP256Keypair();
+    const alice = new V2Session(store, 'shared-dev', 'alice.aid.com', aliceIkPriv, aliceIkPub);
+    const { calls: aliceCalls, fn: aliceFn } = captureCallFn();
+    await alice.ensureRegistered(aliceFn);
+    expect(aliceCalls).toHaveLength(1);
+    expect(aliceCalls[0]!.params.peer_aid).toBe('alice.aid.com');
+
+    const [bobIkPriv, bobIkPub] = await generateP256Keypair();
+    const bob = new V2Session(store, 'shared-dev', 'bob.aid.com', bobIkPriv, bobIkPub);
+    const { calls: bobCalls, fn: bobFn } = captureCallFn();
+    await bob.ensureRegistered(bobFn);
+
+    expect(bobCalls).toHaveLength(1);
+    expect(bobCalls[0]!.params.peer_aid).toBe('bob.aid.com');
+    expect(bob.currentSpkId).toMatch(/^sha256:[0-9a-f]{16}$/);
+    expect(bob.currentSpkId).not.toBe(alice.currentSpkId);
+  });
+
+  it('ensureGroupRegistered 从本地 uploaded marker 恢复时不再 RPC', async () => {
+    const { session, store, ikPriv, ikPub } = await newSession();
+    const { calls, fn } = captureCallFn();
+    const groupId = 'group.aid/marker';
+    await session.ensureGroupRegistered(groupId, fn);
+    const uploadedSpkId = calls[0]!.params.spk_id as string;
+    expect(calls).toHaveLength(1);
+    expect((await store.loadCurrentGroupSPK(scopedDeviceId(), groupId))?.spkId).toBe(uploadedSpkId);
+    expect(await store.loadLatestUploadedGroupSPKId(scopedDeviceId(), groupId)).toBe(uploadedSpkId);
+
+    const sess2 = new V2Session(store, 'dev-1', 'alice.aid.com', ikPriv, ikPub);
+    const { calls: calls2, fn: fn2 } = captureCallFn();
+    await sess2.ensureGroupRegistered(groupId, fn2);
+
+    expect(calls2).toHaveLength(0);
+    expect(sess2.isLastUploadedGroupSPK(groupId, uploadedSpkId)).toBe(true);
   });
 });
 
@@ -204,12 +268,56 @@ describe('V2Session.getDecryptKeys', () => {
     expect(Array.from(rCur.spkPriv!)).not.toEqual(Array.from(r.spkPriv!));
   });
 
-  it('spkId 已被销毁 → spkPriv undefined（不抛错）', async () => {
+  it('spkId 已被销毁 → 显式报 spk_missing', async () => {
     const { session } = await newSession();
     await session.ensureKeys();
-    const r = await session.getDecryptKeys('sha256:nonexistent_id');
-    expect(r.spkPriv).toBeUndefined();
-    expect(r.ikPriv).toBeInstanceOf(Uint8Array);
+    await expect(session.getDecryptKeys('sha256:nonexistent_id')).rejects.toThrow(/spk_missing/);
+  });
+
+  it('spkId 命中 IK 指纹 → 返回 IK 作为 SPK 私钥', async () => {
+    const { session, ikPub } = await newSession();
+    await session.ensureKeys();
+    const r = await session.getDecryptKeys(await keyIdForPub(ikPub));
+    expect(Array.from(r.spkPriv!)).toEqual(Array.from(r.ikPriv));
+  });
+
+  it('group spkId 命中 IK 指纹 → 返回 IK 作为 SPK 私钥', async () => {
+    const { session, ikPub } = await newSession();
+    await session.ensureKeys();
+    const r = await session.getGroupDecryptKeys('group.aid/1', await keyIdForPub(ikPub));
+    expect(Array.from(r.spkPriv!)).toEqual(Array.from(r.ikPriv));
+  });
+
+  it('group spkId 命中 device SPK → 返回 device SPK 私钥', async () => {
+    const { session } = await newSession();
+    await session.ensureKeys();
+    const r = await session.getGroupDecryptKeys('group.aid/1', session.currentSpkId);
+    const p2p = await session.getDecryptKeys(session.currentSpkId);
+    expect(Array.from(r.spkPriv!)).toEqual(Array.from(p2p.spkPriv!));
+  });
+
+  it('group spkId 兼容旧 composite 格式，同时新格式直接查询', async () => {
+    const { session, store } = await newSession();
+    await session.ensureKeys();
+    const groupId = 'group.aid/legacy';
+    const spkId = 'sha256:legacy_group';
+    const [groupPriv, groupPub] = await generateP256Keypair();
+    await store.saveGroupSPK('dev-1', groupId, spkId, groupPriv, groupPub);
+
+    const direct = await session.getGroupDecryptKeys(groupId, spkId);
+    const legacy = await session.getGroupDecryptKeys(groupId, `${groupId}\0${spkId}`);
+
+    expect(Array.from(direct.spkPriv!)).toEqual(Array.from(groupPriv));
+    expect(Array.from(legacy.spkPriv!)).toEqual(Array.from(groupPriv));
+    (session as unknown as { _lastUploadedGroupSPKIds: Map<string, string> })
+      ._lastUploadedGroupSPKIds.set(groupId, spkId);
+    expect(session.isLastUploadedGroupSPK(groupId, `${groupId}\0${spkId}`)).toBe(true);
+  });
+
+  it('group SPK 和 legacy P2P SPK 都找不到 → 显式报 spk_missing', async () => {
+    const { session } = await newSession();
+    await session.ensureKeys();
+    await expect(session.getGroupDecryptKeys('group.aid/1', 'sha256:nonexistent_id')).rejects.toThrow(/spk_missing/);
   });
 });
 
@@ -258,7 +366,7 @@ describe('V2Session.maybeDestroyOldSPKs（PFS 三重条件）', () => {
 
     session.trackOldSPKMaxSeq(oldSpkId, 100);
     expect(await session.maybeDestroyOldSPKs(50)).toEqual([]);
-    expect(await store.loadSPK('dev-1', oldSpkId)).not.toBeNull();
+    expect(await store.loadSPK(scopedDeviceId(), oldSpkId)).not.toBeNull();
   });
 
   it('contig_seq 够但时间不够 → 不销毁', async () => {
@@ -272,7 +380,7 @@ describe('V2Session.maybeDestroyOldSPKs（PFS 三重条件）', () => {
     session._setNowFn(() => now);
     session.trackOldSPKMaxSeq(oldSpkId, 100);
     expect(await session.maybeDestroyOldSPKs(100)).toEqual([]);
-    expect(await store.loadSPK('dev-1', oldSpkId)).not.toBeNull();
+    expect(await store.loadSPK(scopedDeviceId(), oldSpkId)).not.toBeNull();
   });
 
   it('contig_seq + 时间满足，但在最近 7 代窗口内 → 不销毁', async () => {
@@ -289,7 +397,7 @@ describe('V2Session.maybeDestroyOldSPKs（PFS 三重条件）', () => {
     now += DESTROY_DELAY_MS + 1000;
 
     expect(await session.maybeDestroyOldSPKs(100)).toEqual([]);
-    expect(await store.loadSPK('dev-1', oldSpkId)).not.toBeNull();
+    expect(await store.loadSPK(scopedDeviceId(), oldSpkId)).not.toBeNull();
   });
 
   it('三重条件都满足 → 销毁', async () => {
@@ -308,7 +416,7 @@ describe('V2Session.maybeDestroyOldSPKs（PFS 三重条件）', () => {
 
     const destroyed = await session.maybeDestroyOldSPKs(100);
     expect(destroyed).toContain(oldSpkId);
-    expect(await store.loadSPK('dev-1', oldSpkId)).toBeNull();
+    expect(await store.loadSPK(scopedDeviceId(), oldSpkId)).toBeNull();
     expect(await session.maybeDestroyOldSPKs(100)).toEqual([]);
   });
 
@@ -328,7 +436,7 @@ describe('V2Session.maybeDestroyOldSPKs（PFS 三重条件）', () => {
     now += DESTROY_DELAY_MS + 1000;
 
     expect(await session.maybeDestroyOldSPKs(150)).toEqual([]);
-    expect(await store.loadSPK('dev-1', oldSpkId)).not.toBeNull();
+    expect(await store.loadSPK(scopedDeviceId(), oldSpkId)).not.toBeNull();
     expect(await session.maybeDestroyOldSPKs(200)).toContain(oldSpkId);
   });
 });

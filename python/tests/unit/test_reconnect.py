@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -177,6 +176,36 @@ class TestBasicReconnect:
 
         assert client._reconnect_task is None
 
+    @pytest.mark.asyncio
+    @patch("aun_core.client.random")
+    async def test_event_subscription_uses_same_dispatcher_after_reconnect(self, mock_random):
+        """重连不应替换应用层事件分发器，已注册/重注册 handler 都应挂到实际发布对象。"""
+        mock_random.random.return_value = 0.0
+        client = _make_client(auto_reconnect=True)
+        dispatcher = client._dispatcher
+        received: list[str] = []
+
+        async def mock_reconnect():
+            assert client._dispatcher is dispatcher
+            client._state = "connected"
+
+        client._invoke_reconnect_connect_once = mock_reconnect
+
+        sub = client.on("message.received", lambda data: received.append(data["id"]))
+        await client._handle_transport_disconnect(None)
+        await asyncio.sleep(0.1)
+
+        assert client._dispatcher is dispatcher
+        await client._dispatcher.publish("message.received", {"id": "after-reconnect"})
+        assert received == ["after-reconnect"]
+
+        sub.unsubscribe()
+        received.clear()
+        sub = client.on("message.received", lambda data: received.append("new:" + data["id"]))
+        await client._dispatcher.publish("message.received", {"id": "after-reregister"})
+        assert received == ["new:after-reregister"]
+        sub.unsubscribe()
+
 
 class TestExponentialBackoff:
     """指数退避（固定上限抖动）：base 递增，jitter 上限固定为 max_base"""
@@ -191,36 +220,36 @@ class TestExponentialBackoff:
     @pytest.mark.asyncio
     @patch("aun_core.client.random")
     async def test_backoff_delays(self, mock_random):
-        # random.random() 返回 1.0 时 jitter = max_base
-        mock_random.random.return_value = 1.0
+        # random.random() 返回 0.0 时去掉 jitter，只验证 base 指数递增。
+        mock_random.random.return_value = 0.0
         client = _make_client(auto_reconnect=True)
         client._session_options["retry"] = {
-            "initial_delay": 0.05,
-            "max_delay": 0.15,
+            "initial_delay": 1.0,
+            "max_delay": 4.0,
         }
 
-        attempt_times: list[float] = []
+        sleep_delays: list[float] = []
         call_count = 0
+
+        async def capture_reconnect_sleep(delay: float) -> None:
+            sleep_delays.append(delay)
+            await asyncio.sleep(0)
 
         async def mock_reconnect():
             nonlocal call_count
             call_count += 1
-            attempt_times.append(time.monotonic())
             if call_count < 4:
                 raise ConnectionError("simulated failure")
             client._state = "connected"
 
+        client._reconnect_sleep = capture_reconnect_sleep
         client._invoke_reconnect_connect_once = mock_reconnect
 
         await client._handle_transport_disconnect(None)
-        await asyncio.sleep(2.0)  # 足够完成 4 次尝试
+        await asyncio.sleep(0.1)  # 让零延迟重连循环完成 4 次尝试
 
         assert call_count == 4
-        # 验证延迟递增（允许 50% 误差）
-        if len(attempt_times) >= 3:
-            d1 = attempt_times[1] - attempt_times[0]
-            d2 = attempt_times[2] - attempt_times[1]
-            assert d2 > d1 * 0.5, f"第二次延迟 {d2:.3f}s 应大于第一次 {d1:.3f}s 的一半"
+        assert sleep_delays[:4] == pytest.approx([1.0, 2.0, 4.0, 4.0])
 
 
 class TestReconnectInfiniteRetry:

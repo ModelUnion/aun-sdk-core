@@ -43,6 +43,10 @@ type ClientInterface interface {
 	// 实现方在没有 MetadataKeyStore 能力时可返回空字符串 / 空操作。
 	AuthLoadCachedGatewayURL(aid string) string
 	AuthPersistGatewayURL(aid, gatewayURL string)
+
+	// CheckAID 所需的 keystore 访问方法
+	AuthLoadKeyPair(aid string) (map[string]any, error)
+	AuthLoadCert(aid string) (string, error)
 }
 
 // AuthNamespace 认证命名空间
@@ -63,6 +67,25 @@ type agentMDCacheEntry struct {
 }
 
 var agentMDFingerprintRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// aidNameRe AID name 验证：4-64 字符，仅 [a-z0-9_-]，首字符不为 -
+var aidNameRe = regexp.MustCompile(`^[a-z0-9_][a-z0-9_-]{3,63}$`)
+
+// authValidateAIDName 验证 AID name 部分是否符合协议规范
+func authValidateAIDName(aid string) error {
+	name := aid
+	if idx := strings.Index(aid, "."); idx >= 0 {
+		name = aid[:idx]
+	}
+	if !aidNameRe.MatchString(name) {
+		return fmt.Errorf(
+			"invalid AID name '%s': must be 4-64 characters, only [a-z0-9_-], cannot start with '-'", name)
+	}
+	if strings.HasPrefix(name, "guest") {
+		return fmt.Errorf("AID name must not start with 'guest'")
+	}
+	return nil
+}
 
 type AgentMDSignOptions struct {
 	AID string
@@ -616,6 +639,23 @@ func (a *AuthNamespace) agentMDHTTPClient() *http.Client {
 	return a.httpClient
 }
 
+// CachedAgentMDMeta 返回最近一次 GET/HEAD 观察到的 agent.md ETag 元数据。
+func (a *AuthNamespace) CachedAgentMDMeta(aid string) map[string]string {
+	targetAID := strings.TrimSpace(aid)
+	if targetAID == "" {
+		return nil
+	}
+	a.agentMDCacheMu.Lock()
+	defer a.agentMDCacheMu.Unlock()
+	cached := a.agentMDCache[targetAID]
+	if cached == nil {
+		return nil
+	}
+	return map[string]string{
+		"etag":          cached.etag,
+		"last_modified": cached.lastModified,
+	}
+}
 func (a *AuthNamespace) ensureAgentMDUploadToken(ctx context.Context, aid string) (string, error) {
 	identity := a.client.AuthLoadIdentityOrNil(aid)
 	if identity == nil {
@@ -781,6 +821,64 @@ func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (conten
 	return text, nil
 }
 
+// HeadAgentMD 通过 HEAD 检查指定 AID 的 agent.md 云端 ETag。
+func (a *AuthNamespace) HeadAgentMD(ctx context.Context, aid string) (out map[string]any, err error) {
+	tStart := time.Now()
+	targetAID := strings.TrimSpace(aid)
+	pkgLogAuth().Debug("HeadAgentMD enter: aid=%s", targetAID)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("HeadAgentMD exit (error): aid=%s elapsed=%dms err=%v", targetAID, time.Since(tStart).Milliseconds(), err)
+		} else {
+			pkgLogAuth().Debug("HeadAgentMD exit: aid=%s found=%v etag=%s elapsed=%dms", targetAID, out["found"], out["etag"], time.Since(tStart).Milliseconds())
+		}
+	}()
+	if targetAID == "" {
+		return nil, fmt.Errorf("head_agent_md requires non-empty aid")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, a.resolveAgentMDURL(ctx, targetAID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/markdown")
+
+	resp, err := a.agentMDHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	etag := strings.TrimSpace(resp.Header.Get("ETag"))
+	lastModified := strings.TrimSpace(resp.Header.Get("Last-Modified"))
+	result := map[string]any{
+		"aid":           targetAID,
+		"found":         resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"etag":          etag,
+		"last_modified": lastModified,
+		"status":        resp.StatusCode,
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return result, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("head agent.md failed: HTTP %d", resp.StatusCode)
+	}
+
+	a.agentMDCacheMu.Lock()
+	if a.agentMDCache == nil {
+		a.agentMDCache = make(map[string]*agentMDCacheEntry)
+	}
+	cached := a.agentMDCache[targetAID]
+	if cached == nil {
+		cached = &agentMDCacheEntry{}
+		a.agentMDCache[targetAID] = cached
+	}
+	cached.etag = etag
+	cached.lastModified = lastModified
+	a.agentMDCacheMu.Unlock()
+	return result, nil
+}
+
 // DownloadCert 下载证书
 func (a *AuthNamespace) DownloadCert(ctx context.Context, params map[string]any) (any, error) {
 	return a.client.Call(ctx, "auth.download_cert", params)
@@ -804,4 +902,223 @@ func (a *AuthNamespace) Rekey(ctx context.Context, params map[string]any) (any, 
 // TrustRoots 获取信任根
 func (a *AuthNamespace) TrustRoots(ctx context.Context, params map[string]any) (any, error) {
 	return a.client.Call(ctx, "meta.trust_roots", params)
+}
+
+// CheckAID 检查指定 AID 的本地和远程状态。
+// 与 Python SDK namespaces/auth_namespace.py:check_aid 对应。
+func (a *AuthNamespace) CheckAID(ctx context.Context, params map[string]any) (out map[string]any, err error) {
+	tStart := time.Now()
+	aid, _ := params["aid"].(string)
+	aid = strings.TrimSpace(aid)
+	if aid == "" {
+		return nil, fmt.Errorf("auth.check_aid requires 'aid'")
+	}
+	pkgLogAuth().Debug("CheckAID enter: aid=%s", aid)
+	defer func() {
+		if err != nil {
+			pkgLogAuth().Debug("CheckAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+		} else {
+			status, _ := out["status"].(string)
+			pkgLogAuth().Debug("CheckAID exit: aid=%s elapsed=%dms status=%s", aid, time.Since(tStart).Milliseconds(), status)
+		}
+	}()
+
+	if err := authValidateAIDName(aid); err != nil {
+		return nil, err
+	}
+
+	result := a.checkLocalAID(aid)
+	localMap, _ := result["local"].(map[string]any)
+	localComplete := false
+	if localMap != nil {
+		localComplete, _ = localMap["complete"].(bool)
+	}
+
+	if !localComplete {
+		remote := a.checkRemoteAIDRegistration(ctx, aid)
+		result["remote"] = remote
+		remoteStatus, _ := remote["status"].(string)
+		switch remoteStatus {
+		case "available":
+			result["status"] = "available"
+			result["can_register"] = true
+		case "registered":
+			result["status"] = "registered_remote"
+			result["can_register"] = false
+		default:
+			result["status"] = "unknown"
+			result["can_register"] = false
+		}
+	}
+
+	return result, nil
+}
+
+// checkLocalAID 检查本地 AID 状态（密钥对 + 证书）
+func (a *AuthNamespace) checkLocalAID(aid string) map[string]any {
+	identity := a.client.AuthLoadIdentityOrNil(aid)
+
+	keyPair, keyErr := a.client.AuthLoadKeyPair(aid)
+	certPEM, certErr := a.client.AuthLoadCert(aid)
+
+	privateKeyPresent := false
+	publicKeyPresent := false
+	if keyPair != nil {
+		if pkPem, _ := keyPair["private_key_pem"].(string); pkPem != "" {
+			privateKeyPresent = true
+		}
+		if pubDer, _ := keyPair["public_key_der_b64"].(string); pubDer != "" {
+			publicKeyPresent = true
+		}
+	}
+
+	certPresent := certPEM != ""
+	certInfo := map[string]any{
+		"present": false,
+		"valid":   false,
+		"expired": false,
+	}
+	if certPresent {
+		certInfo = a.inspectCert(aid, certPEM)
+	}
+
+	certValid, _ := certInfo["valid"].(bool)
+	localComplete := privateKeyPresent && publicKeyPresent && certPresent && certValid
+
+	issues := []string{}
+	if identity == nil {
+		issues = append(issues, "local identity not found")
+	}
+	if !privateKeyPresent {
+		issues = append(issues, "private key missing")
+	}
+	if !publicKeyPresent {
+		issues = append(issues, "public key missing")
+	}
+	if !certPresent {
+		issues = append(issues, "certificate missing")
+	} else if parseErr, _ := certInfo["parse_error"].(string); parseErr != "" {
+		issues = append(issues, "certificate invalid: "+parseErr)
+	} else if expired, _ := certInfo["expired"].(bool); expired {
+		issues = append(issues, "certificate expired")
+	} else if !certValid {
+		issues = append(issues, "certificate not currently valid")
+	}
+	if keyErr != nil {
+		issues = append(issues, "key load error: "+keyErr.Error())
+	}
+	if certErr != nil {
+		issues = append(issues, "certificate load error: "+certErr.Error())
+	}
+
+	status := "local_incomplete"
+	if localComplete {
+		status = "local_ready"
+	}
+
+	remoteStatus := "pending"
+	if localComplete {
+		remoteStatus = "not_checked"
+	}
+
+	var canRegister any
+	if localComplete {
+		canRegister = false
+	} else {
+		canRegister = nil
+	}
+
+	return map[string]any{
+		"aid":          aid,
+		"status":       status,
+		"can_register": canRegister,
+		"local": map[string]any{
+			"exists":      identity != nil,
+			"complete":    localComplete,
+			"private_key": privateKeyPresent,
+			"public_key":  publicKeyPresent,
+			"certificate": certInfo,
+			"issues":      issues,
+		},
+		"remote": map[string]any{
+			"status": remoteStatus,
+		},
+	}
+}
+
+// inspectCert 检查证书有效性
+func (a *AuthNamespace) inspectCert(aid, certPEM string) map[string]any {
+	result := map[string]any{
+		"present": true,
+		"valid":   false,
+		"expired": false,
+	}
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		result["parse_error"] = "invalid PEM"
+		return result
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		result["parse_error"] = err.Error()
+		return result
+	}
+
+	now := time.Now().UTC()
+	notBefore := cert.NotBefore.UTC()
+	notAfter := cert.NotAfter.UTC()
+	valid := !now.Before(notBefore) && !now.After(notAfter)
+	expired := now.After(notAfter)
+
+	fingerprint := fmt.Sprintf("sha256:%x", sha256.Sum256(block.Bytes))
+	cn := cert.Subject.CommonName
+	aidMatches := cn == "" || cn == aid
+
+	result["valid"] = valid
+	result["expired"] = expired
+	result["not_before"] = notBefore.Format(time.RFC3339)
+	result["not_after"] = notAfter.Format(time.RFC3339)
+	result["expires_at"] = notAfter.Unix()
+	result["seconds_until_expiry"] = int64(notAfter.Sub(now).Seconds())
+	result["fingerprint"] = fingerprint
+	result["subject_cn"] = cn
+	result["aid_matches"] = aidMatches
+
+	if cn != "" && cn != aid {
+		result["valid"] = false
+		result["parse_error"] = fmt.Sprintf("certificate CN mismatch: %s", cn)
+	}
+
+	return result
+}
+
+// checkRemoteAIDRegistration 通过 DownloadAgentMD 检查远程注册状态
+func (a *AuthNamespace) checkRemoteAIDRegistration(ctx context.Context, aid string) map[string]any {
+	content, err := a.DownloadAgentMD(ctx, aid)
+	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "not found") {
+			return map[string]any{
+				"status":     "available",
+				"registered": false,
+				"available":  true,
+				"source":     "agent.md",
+			}
+		}
+		return map[string]any{
+			"status":     "unknown",
+			"registered": nil,
+			"available":  nil,
+			"source":     "agent.md",
+			"error":      errStr,
+		}
+	}
+	return map[string]any{
+		"status":         "registered",
+		"registered":     true,
+		"available":      false,
+		"source":         "agent.md",
+		"agent_md_bytes": len([]byte(content)),
+		"agent_md_aid":   extractAgentMDAID(content),
+	}
 }

@@ -30,6 +30,23 @@ function b64UrlToBytes(s: string): Uint8Array {
   return out;
 }
 
+function b64UrlToFixed32(s: string): Uint8Array {
+  const raw = b64UrlToBytes(s);
+  if (raw.length === 32) return raw;
+  if (raw.length < 32) {
+    const out = new Uint8Array(32);
+    out.set(raw, 32 - raw.length);
+    return out;
+  }
+  const extra = raw.length - 32;
+  for (let i = 0; i < extra; i++) {
+    if (raw[i] !== 0) {
+      throw new Error(`invalid P-256 private scalar length=${raw.length}`);
+    }
+  }
+  return raw.slice(extra);
+}
+
 /** 从 raw 32B scalar 推算 P-256 公钥的未压缩 (X, Y) 字节，各 32B */
 function p256PublicXY(privateKeyScalar: Uint8Array): { x: Uint8Array; y: Uint8Array } {
   // p256.getPublicKey(secretKey, isCompressed=false) → 65 字节 0x04 || X || Y
@@ -113,7 +130,7 @@ export async function generateP256Keypair(): Promise<[Uint8Array, Uint8Array]> {
   if (!jwk.d) {
     throw new Error('exportKey(jwk) returned no private component');
   }
-  const priv = b64UrlToBytes(jwk.d);
+  const priv = b64UrlToFixed32(jwk.d);
 
   const pubDerBuf = await crypto.subtle.exportKey('spki', keyPair.publicKey);
   return [priv, new Uint8Array(pubDerBuf)];

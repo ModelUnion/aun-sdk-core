@@ -2,8 +2,8 @@
 """Group 消息/事件同步集成测试。
 
 覆盖重点：
-  1. group.pull 分页、cursor、ack_messages 单调推进和 future ack 拒绝
-  2. group.pull_events、ack_events 单调推进和 future ack 拒绝
+  1. group.pull 分页、cursor、ack_messages 单调推进和 future ack 上界 clamp
+  2. group.pull_events、ack_events 单调推进和 future ack 上界 clamp
   3. 多 device_id/slot_id 游标隔离、list_devices、unregister_device
 
 使用方法（Docker 容器内）：
@@ -81,18 +81,6 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
                 break
             await asyncio.sleep(1.5 * (attempt + 1))
     raise last_error or RuntimeError(f"{aid} connect failed")
-
-
-async def _expect_failure(factory, label: str, *, contains: str | None = None):
-    try:
-        await factory()
-    except Exception as exc:
-        text = str(exc)
-        if contains and contains.lower() not in text.lower():
-            raise AssertionError(f"{label}: 失败信息不匹配: {text}") from exc
-        print(f"  [OK] {label}: {exc}")
-        return
-    raise AssertionError(f"{label}: 期望失败但实际成功")
 
 
 async def _create_group_with_bobb(alice: AUNClient, name: str) -> str:
@@ -245,17 +233,15 @@ async def test_message_cursor_ack_and_device_slots():
         _ok("unregister_device 删除指定 slot")
 
         latest = int((cursor.get("msg_cursor") or {}).get("latest_seq") or 0)
-        await _expect_failure(
-            lambda: bobb._transport.call("group.ack_messages", {
-                "group_id": group_id,
-                "msg_seq": latest + 100,
-                "device_id": device_a,
-                "slot_id": slot_a,
-            }),
-            "ack future message seq 被拒绝",
-            contains="exceeds",
-        )
-        _ok("future msg ack 被拒绝")
+        future_ack = await bobb._transport.call("group.ack_messages", {
+            "group_id": group_id,
+            "msg_seq": latest + 100,
+            "device_id": device_a,
+            "slot_id": slot_a,
+        })
+        if int(future_ack.get("cursor") or 0) != latest:
+            raise AssertionError(f"future msg ack 应 clamp 到 latest={latest}: {future_ack}")
+        _ok("future msg ack clamp 到 latest")
     finally:
         await _cleanup_group(alice, group_id)
         await alice.close()
@@ -337,17 +323,15 @@ async def test_event_cursor_ack_and_future_guard():
         _ok("get_cursor 反映事件 ack")
 
         latest_event_seq = int(event_cursor.get("latest_seq") or 0)
-        await _expect_failure(
-            lambda: bobb._transport.call("group.ack_events", {
-                "group_id": group_id,
-                "event_seq": latest_event_seq + 100,
-                "device_id": device,
-                "slot_id": slot,
-            }),
-            "ack future event seq 被拒绝",
-            contains="exceeds",
-        )
-        _ok("future event ack 被拒绝")
+        future_ack = await bobb._transport.call("group.ack_events", {
+            "group_id": group_id,
+            "event_seq": latest_event_seq + 100,
+            "device_id": device,
+            "slot_id": slot,
+        })
+        if int(future_ack.get("cursor") or 0) != latest_event_seq:
+            raise AssertionError(f"future event ack 应 clamp 到 latest={latest_event_seq}: {future_ack}")
+        _ok("future event ack clamp 到 latest")
     finally:
         await _cleanup_group(alice, group_id)
         await alice.close()

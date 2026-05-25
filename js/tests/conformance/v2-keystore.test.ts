@@ -186,3 +186,79 @@ describe('V2KeyStore - persistence', () => {
     expect(Array.from(cur!.priv)).toEqual([42]);
   });
 });
+
+describe('V2KeyStore - group SPK legacy migration', () => {
+  async function openLegacyV1Db(name: string): Promise<IDBDatabase> {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(name, 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore('v2_device_keys', {
+          keyPath: ['device_id', 'key_type', 'key_id'],
+        });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function putLegacyRecord(db: IDBDatabase, record: Record<string, unknown>): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('v2_device_keys', 'readwrite');
+      tx.objectStore('v2_device_keys').put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  }
+
+  async function getAllRawRecords(store: V2KeyStore): Promise<Array<Record<string, unknown>>> {
+    const db = (store as unknown as { db: IDBDatabase }).db;
+    return new Promise((resolve, reject) => {
+      const req = db.transaction('v2_device_keys', 'readonly').objectStore('v2_device_keys').getAll();
+      req.onsuccess = () => resolve(req.result as Array<Record<string, unknown>>);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  it('migrates legacy nullable uploaded markers and NUL composite group SPK IDs', async () => {
+    const legacy = await openLegacyV1Db(V2_DB_NAME);
+    await putLegacyRecord(legacy, {
+      device_id: 'dev1', key_type: 'spk', key_id: 'spk-1', private_key: new Uint8Array([1]), public_key: new Uint8Array([2]), created_at: 1,
+    });
+    await putLegacyRecord(legacy, {
+      device_id: 'dev1', key_type: 'spk_uploaded', key_id: 'spk-1', private_key: undefined, public_key: undefined, created_at: 2,
+    });
+    await putLegacyRecord(legacy, {
+      device_id: 'dev1', key_type: 'group_spk', key_id: 'group-1\0gspk-1', private_key: new Uint8Array([3]), public_key: new Uint8Array([4]), created_at: 3,
+    });
+    await putLegacyRecord(legacy, {
+      device_id: 'dev1', key_type: 'group_spk_uploaded', key_id: 'group-1\0gspk-1', private_key: undefined, public_key: undefined, created_at: 4,
+    });
+    legacy.close();
+
+    const store = await openStore();
+    expect(await store.loadLatestUploadedSPKId('dev1')).toBe('spk-1');
+    expect(await store.loadLatestUploadedGroupSPKId('dev1', 'group-1')).toBe('gspk-1');
+    const rows = (await getAllRawRecords(store)).filter((row) => String(row.key_type).startsWith('group_spk'));
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.group_id).toBe('group-1');
+      expect(row.key_id).toBe('gspk-1');
+      expect(String(row.key_id).includes('\0')).toBe(false);
+    }
+  });
+
+  it('stores new group SPK records without legacy NUL composite key', async () => {
+    const store = await openStore();
+    await store.saveGroupSPK('dev1', 'group-1', 'gspk-1', new Uint8Array([1]), new Uint8Array([2]));
+    await store.markGroupSPKUploaded('dev1', 'group-1', 'gspk-1');
+
+    const rows = (await getAllRawRecords(store)).filter((row) => String(row.key_type).startsWith('group_spk'));
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.group_id).toBe('group-1');
+      expect(row.key_id).toBe('gspk-1');
+      expect(String(row.key_id).includes('\0')).toBe(false);
+    }
+  });
+});

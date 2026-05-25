@@ -59,6 +59,21 @@ const DDL_STATEMENTS = [
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS agent_md_cache (
+    aid TEXT PRIMARY KEY,
+    content TEXT NOT NULL DEFAULT '',
+    local_etag TEXT NOT NULL DEFAULT '',
+    remote_etag TEXT NOT NULL DEFAULT '',
+    last_modified TEXT NOT NULL DEFAULT '',
+    fetched_at INTEGER NOT NULL DEFAULT 0,
+    observed_at INTEGER NOT NULL DEFAULT 0,
+    checked_at INTEGER NOT NULL DEFAULT 0,
+    remote_status TEXT NOT NULL DEFAULT '',
+    verify_status TEXT NOT NULL DEFAULT '',
+    verify_error TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS group_state (
     group_id TEXT PRIMARY KEY,
     state_version INTEGER NOT NULL DEFAULT 0,
@@ -217,6 +232,91 @@ export class AIDDatabase {
     const result: Record<string, string> = {};
     for (const row of rows) result[row.key] = row.value;
     return result;
+  }
+
+
+  private _agentMdCacheColumns(): string[] {
+    return [
+      'aid',
+      'content',
+      'local_etag',
+      'remote_etag',
+      'last_modified',
+      'fetched_at',
+      'observed_at',
+      'checked_at',
+      'remote_status',
+      'verify_status',
+      'verify_error',
+      'last_error',
+      'updated_at',
+    ];
+  }
+
+  private _normalizeAgentMdRecord(row: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const col of this._agentMdCacheColumns()) out[col] = row[col];
+    for (const col of ['fetched_at', 'observed_at', 'checked_at', 'updated_at']) {
+      out[col] = Number(out[col] ?? 0);
+    }
+    return out;
+  }
+
+  loadAgentMdCache(aid: string): Record<string, unknown> | null {
+    const target = String(aid ?? '').trim();
+    if (!target) return null;
+    const columns = this._agentMdCacheColumns();
+    const row = this._db.prepare(
+      `SELECT ${columns.join(', ')} FROM agent_md_cache WHERE aid = ?`,
+    ).get(target) as Record<string, unknown> | undefined;
+    return row ? this._normalizeAgentMdRecord(row) : null;
+  }
+
+  upsertAgentMdCache(aid: string, fields: Record<string, unknown>): Record<string, unknown> {
+    const target = String(aid ?? '').trim();
+    if (!target) throw new Error('agent_md_cache aid is required');
+    const current = this.loadAgentMdCache(target) ?? {
+      aid: target,
+      content: '',
+      local_etag: '',
+      remote_etag: '',
+      last_modified: '',
+      fetched_at: 0,
+      observed_at: 0,
+      checked_at: 0,
+      remote_status: '',
+      verify_status: '',
+      verify_error: '',
+      last_error: '',
+      updated_at: 0,
+    };
+    for (const key of [
+      'content',
+      'local_etag',
+      'remote_etag',
+      'last_modified',
+      'remote_status',
+      'verify_status',
+      'verify_error',
+      'last_error',
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== undefined && fields[key] !== null) {
+        current[key] = String(fields[key] ?? '');
+      }
+    }
+    for (const key of ['fetched_at', 'observed_at', 'checked_at']) {
+      if (Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== undefined && fields[key] !== null) {
+        const value = Number(fields[key] ?? 0);
+        current[key] = Number.isFinite(value) ? Math.trunc(value) : 0;
+      }
+    }
+    current.updated_at = Date.now();
+    const columns = this._agentMdCacheColumns();
+    this._db.prepare(
+      `INSERT INTO agent_md_cache (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})
+       ON CONFLICT(aid) DO UPDATE SET ${columns.filter(col => col !== 'aid').map(col => `${col}=excluded.${col}`).join(', ')}`,
+    ).run(...columns.map(col => current[col] as string | number));
+    return this.loadAgentMdCache(target) ?? current;
   }
 
   saveGroupState(groupId: string, stateVersion: number, stateHash: string, keyEpoch: number, membershipJson: string, policyJson: string): void {

@@ -57,6 +57,7 @@ _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 _CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
 _DAVE_AID = os.environ.get("AUN_TEST_DAVE_AID", f"dave.{_ISSUER}").strip()
+_GROUP_E2E_TRACE_MODE = os.environ.get("AUN_GROUP_E2E_TRACE", "diag").strip().lower() or "diag"
 
 
 def _assert_fixed_aid_layout() -> None:
@@ -109,6 +110,12 @@ def _build_test_slot_id(tag: str, rid: str | None = None) -> str:
     return slot_id[:128]
 
 
+def _install_trace_diag(client: AUNClient, tag: str, rid: str | None) -> None:
+    if _GROUP_E2E_TRACE_MODE not in {"log", "diag"}:
+        return
+    client.set_trace_mode(_GROUP_E2E_TRACE_MODE)
+
+
 def _make_client(tag: str, rid: str | None = None) -> AUNClient:
     """创建测试客户端。所有客户端共享同一 aun_path，各 AID 数据在 AIDs/{aid}/ 下自然隔离。"""
     client = AUNClient({
@@ -128,6 +135,7 @@ def _make_client(tag: str, rid: str | None = None) -> AUNClient:
             client._test_group_inbox.setdefault(gid, []).append(data)
 
     client._dispatcher.subscribe("group.message_created", _collect_group_msg)
+    _install_trace_diag(client, tag, rid)
     return client
 
 
@@ -146,6 +154,12 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
             connect_params["auto_reconnect"] = False
             print(f"[connect diag] aid={aid} attempt={attempt} gateway={connect_params.get('gateway')!r} topology={connect_params.get('topology')!r} access_token={'set' if connect_params.get('access_token') else 'missing'}")
             await client.connect(connect_params)
+            print(
+                f"[group-e2e] DEBUG: connected aid={aid} "
+                f"slot_id={getattr(client, '_slot_id', '-') or '-'} "
+                f"device_id={getattr(client, '_device_id', '-') or '-'} "
+                f"trace={_GROUP_E2E_TRACE_MODE}"
+            )
             return aid
         except (AuthError, RateLimitError) as exc:
             last_error = exc
@@ -1615,6 +1629,12 @@ async def _ensure_connected_with_caps(client: AUNClient, aid: str, caps: dict) -
             # _capabilities 覆盖：让该客户端以指定能力声明上线（auth.py 内部规则）
             connect_params["extra_info"] = {"_capabilities": dict(caps)}
             await client.connect(connect_params)
+            print(
+                f"[group-e2e] DEBUG: connected aid={aid} "
+                f"slot_id={getattr(client, '_slot_id', '-') or '-'} "
+                f"device_id={getattr(client, '_device_id', '-') or '-'} "
+                f"trace={_GROUP_E2E_TRACE_MODE} caps={sorted(caps.keys())}"
+            )
             return aid
         except (AuthError, RateLimitError) as exc:
             last_error = exc
@@ -1999,6 +2019,7 @@ async def main():
     print("=" * 60)
     print("Group E2EE E2E Tests")
     print("=" * 60)
+    print(f"[group-e2e] DEBUG: trace_mode={_GROUP_E2E_TRACE_MODE}")
 
     tests = [
         ("1. Group encrypted messaging",         test_group_encrypted_messaging),
@@ -2062,4 +2083,3 @@ async def main():
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
-

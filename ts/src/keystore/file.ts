@@ -21,7 +21,7 @@ import {
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
-import type { KeyStore } from './index.js';
+import type { AgentMdCacheRecord, AgentMdCacheUpsert, KeyStore } from './index.js';
 import type { SecretStore } from '../secret-store/index.js';
 import type { ModuleLogger } from '../logger.js';
 import { AIDDatabase } from './aid-db.js';
@@ -350,6 +350,26 @@ export class FileKeyStore implements KeyStore {
     }
   }
 
+
+  // ── agent.md Cache ───────────────────────────────────────
+
+  loadAgentMdCache(ownerAid: string, targetAid: string): AgentMdCacheRecord | null {
+    const owner = String(ownerAid ?? '').trim();
+    const target = String(targetAid ?? '').trim();
+    if (!owner || !target) return null;
+    const record = this._getDB(owner).loadAgentMdCache(target);
+    return record ? deepClone(record) as unknown as AgentMdCacheRecord : null;
+  }
+
+  upsertAgentMdCache(ownerAid: string, targetAid: string, fields: AgentMdCacheUpsert): AgentMdCacheRecord {
+    const owner = String(ownerAid ?? '').trim();
+    const target = String(targetAid ?? '').trim();
+    if (!owner || !target) {
+      throw new Error('upsertAgentMdCache requires ownerAid and targetAid');
+    }
+    const record = this._getDB(owner).upsertAgentMdCache(target, fields as Record<string, unknown>);
+    return deepClone(record) as unknown as AgentMdCacheRecord;
+  }
   // ── 信任根管理 ─────────────────────────────────────────────
 
   trustRootDir(): string {

@@ -79,6 +79,34 @@ describe('Python ↔ TS interop: P2P', () => {
     runVector('p2p_multi.json', 'decryption_inputs_alice2'));
 });
 
+describe('decryptMessage error classification', () => {
+  it('3DH row 缺少本地 SPK 私钥 → spk_missing', () => {
+    const v = loadVector('p2p_3dh.json');
+    const inputs = v.decryption_inputs as DecryptionInputs;
+    expect(() => decryptMessage(
+      v.envelope as Record<string, unknown>,
+      inputs.self_aid,
+      inputs.self_device_id,
+      b64(inputs.self_ik_priv_b64),
+      undefined,
+      b64(inputs.sender_pub_der_b64),
+    )).toThrow(/spk_missing/);
+  });
+
+  it('3DH row 使用错误 SPK 私钥 → wrap_key_decrypt_failed', () => {
+    const v = loadVector('group_3dh_1dh.json');
+    const inputs = v.decryption_inputs_bob as DecryptionInputs;
+    expect(() => decryptMessage(
+      v.envelope as Record<string, unknown>,
+      inputs.self_aid,
+      inputs.self_device_id,
+      b64(inputs.self_ik_priv_b64),
+      b64(inputs.self_ik_priv_b64),
+      b64(inputs.sender_pub_der_b64),
+    )).toThrow(/wrap_key_decrypt_failed: .*key_source=group_device_prekey.*spk_id=/);
+  });
+});
+
 describe('Python ↔ TS interop: Group', () => {
   it('group_3dh_1dh.json (Bob 3DH)', () =>
     runVector('group_3dh_1dh.json', 'decryption_inputs_bob'));

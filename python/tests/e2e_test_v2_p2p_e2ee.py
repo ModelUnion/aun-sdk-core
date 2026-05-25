@@ -119,6 +119,17 @@ class V2P2PTestRunner:
         print(f"[setup] Alice ({_ALICE_AID}) 已连接, V2 session: {self.alice_client._v2_session is not None}")
         print(f"[setup] Bob ({_BOB_AID}) 已连接, V2 session: {self.bob_client._v2_session is not None}")
 
+        # 启用 trace 诊断
+        self.alice_client.set_trace_mode("diag")
+        self.bob_client.set_trace_mode("diag")
+
+        # 收集 trace 信息
+        self._trace_logs = []
+        def trace_observer(trace_info):
+            self._trace_logs.append(trace_info)
+        self.alice_client.set_trace_observer(trace_observer)
+        self.bob_client.set_trace_observer(trace_observer)
+
         # 清空旧的 V2 inbox（ack 到最大 seq）
         for client, name in [(self.alice_client, "Alice"), (self.bob_client, "Bob")]:
             try:
@@ -309,8 +320,21 @@ class V2P2PTestRunner:
 
         push_payload = {"text": f"push-test-{int(time.time())}"}
         print(f"  [DIAG test9] sending push_payload={push_payload['text']}")
+
+        # 清空之前的 trace logs
+        self._trace_logs.clear()
+
         send_result = await self.alice_client.call("message.send", {"to": _BOB_AID, "payload": push_payload})
         print(f"  [DIAG test9] send result: status={send_result.get('status') if isinstance(send_result, dict) else send_result} msg_id={send_result.get('message_id', '?') if isinstance(send_result, dict) else '?'}")
+
+        # 打印 trace 信息
+        if self._trace_logs:
+            for trace_info in self._trace_logs:
+                if trace_info.get("method") == "message.send":
+                    trace = trace_info.get("trace", {})
+                    print(f"  [TRACE test9] trace_id={trace.get('trace_id')}, spans={len(trace.get('spans', []))}")
+                    for span in trace.get("spans", []):
+                        print(f"    - {span.get('node')}.{span.get('action')} ms={span.get('ms')}")
 
         # 等待 push 事件触发自动 pull + decrypt
         for i in range(20):

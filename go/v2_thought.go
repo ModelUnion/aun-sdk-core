@@ -17,9 +17,7 @@ package aun
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"strings"
@@ -49,41 +47,26 @@ func (c *AUNClient) buildV2P2PEnvelope(
 
 	targets := make([]e2ee.Target, 0, len(peerDevices))
 	for _, dev := range peerDevices {
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
-		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
 		devID := v2AsString(dev["device_id"])
-		state.session.CachePeerIK(to, devID, ikDER)
-		targets = append(targets, e2ee.Target{
-			AID:       to,
-			DeviceID:  devID,
-			Role:      "peer",
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, to, devID, "peer", "peer_device_prekey")
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			targets = append(targets, target)
+		}
 	}
 
 	// audit recipients 也按 target 处理（与 Python _build_v2_p2p_envelope 对齐：
 	// audit 直接进入 targets 列表，target_set.audit_recipients 留空）
 	for _, dev := range auditRaw {
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
+		if err != nil {
+			return nil, err
 		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
-		targets = append(targets, e2ee.Target{
-			AID:       v2AsString(dev["aid"]),
-			DeviceID:  v2AsString(dev["device_id"]),
-			Role:      "audit",
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		if ok {
+			targets = append(targets, target)
+		}
 	}
 
 	// self-sync：自己其它设备
@@ -94,27 +77,17 @@ func (c *AUNClient) buildV2P2PEnvelope(
 	if myAID != "" && myAID != to {
 		selfDevices := c.v2FetchSelfDevices(ctx, state, myAID)
 		for _, dev := range selfDevices {
-			devID := v2AsString(dev["owner_device_id"])
-			if devID == "" {
-				devID = v2AsString(dev["device_id"])
-			}
-			if devID == "" || devID == myDeviceID {
+			devID, hasDeviceID := v2DeviceIDFromDevice(dev)
+			if !hasDeviceID || devID == myDeviceID {
 				continue
 			}
-			ikDER := v2DecodeBase64Field(dev, "ik_pk")
-			if len(ikDER) == 0 {
-				continue
+			target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, myAID, devID, "self_sync", "peer_device_prekey")
+			if err != nil {
+				return nil, err
 			}
-			spkDER := v2DecodeBase64Field(dev, "spk_pk")
-			targets = append(targets, e2ee.Target{
-				AID:       myAID,
-				DeviceID:  devID,
-				Role:      "self_sync",
-				KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-				IKPkDER:   ikDER,
-				SPKPkDER:  spkDER,
-				SPKID:     v2AsString(dev["spk_id"]),
-			})
+			if ok {
+				targets = append(targets, target)
+			}
 		}
 	}
 
@@ -137,6 +110,19 @@ func (c *AUNClient) buildV2P2PEnvelope(
 	if err != nil {
 		return nil, fmt.Errorf("buildV2P2PEnvelope: 加密失败: %w", err)
 	}
+	c.logMessageDebugWithPayload("thought-send-envelope", "message.thought.put.v2", "message.thought.put", map[string]any{
+		"to":         to,
+		"thought_id": opts.MessageID,
+		"message_id": envelope["message_id"],
+		"type":       envelope["type"],
+		"version":    envelope["version"],
+		"timestamp":  opts.Timestamp,
+	}, envelope, map[string]any{
+		"plaintext_payload": payload,
+		"target_count":      len(targets),
+		"audit_count":       len(auditRaw),
+		"use_cache":         useCache,
+	})
 	return envelope, nil
 }
 
@@ -165,46 +151,32 @@ func (c *AUNClient) buildV2GroupEnvelope(
 	targets := make([]e2ee.Target, 0, len(allDevices))
 	for _, dev := range allDevices {
 		devAID := v2AsString(dev["aid"])
-		devID := v2AsString(dev["device_id"])
-		if devAID == myAID && devID == myDeviceID {
+		devID, hasDeviceID := v2DeviceIDFromDevice(dev)
+		if devAID == myAID && hasDeviceID && devID == myDeviceID {
 			continue
 		}
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
-		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
 		role := "member"
 		if devAID == myAID {
 			role = "self_sync"
 		}
-		targets = append(targets, e2ee.Target{
-			AID:       devAID,
-			DeviceID:  devID,
-			Role:      role,
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, devAID, devID, role, "peer_device_prekey")
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			targets = append(targets, target)
+		}
 	}
 
 	// audit recipients
 	for _, dev := range auditRaw {
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
+		if err != nil {
+			return nil, err
 		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
-		targets = append(targets, e2ee.Target{
-			AID:       v2AsString(dev["aid"]),
-			DeviceID:  v2AsString(dev["device_id"]),
-			Role:      "audit",
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		if ok {
+			targets = append(targets, target)
+		}
 	}
 
 	if len(targets) == 0 {
@@ -233,6 +205,20 @@ func (c *AUNClient) buildV2GroupEnvelope(
 	if err != nil {
 		return nil, fmt.Errorf("buildV2GroupEnvelope: 加密失败: %w", err)
 	}
+	c.logMessageDebugWithPayload("thought-send-envelope", "group.thought.put.v2", "group.thought.put", map[string]any{
+		"group_id":   groupID,
+		"thought_id": opts.MessageID,
+		"message_id": envelope["message_id"],
+		"type":       envelope["type"],
+		"version":    envelope["version"],
+		"timestamp":  opts.Timestamp,
+	}, envelope, map[string]any{
+		"plaintext_payload": payload,
+		"epoch":             epoch,
+		"target_count":      len(targets),
+		"audit_count":       len(auditRaw),
+		"use_cache":         useCache,
+	})
 	return envelope, nil
 }
 
@@ -265,8 +251,16 @@ func (c *AUNClient) putMessageThoughtEncryptedV2(ctx context.Context, params map
 	if timestamp == 0 {
 		timestamp = time.Now().UnixMilli()
 	}
+	c.logMessageDebugWithPayload("thought-send-plaintext", "message.thought.put.v2", "message.thought.put", map[string]any{
+		"to":         toAID,
+		"thought_id": thoughtID,
+		"timestamp":  timestamp,
+		"encrypted":  true,
+		"context":    params["context"],
+	}, payload, nil)
 
 	attempt := func(useCache bool) (any, error) {
+		c.log.Debug("message.thought.put v2 attempt: to=%s thought_id=%s use_cache=%v", toAID, thoughtID, useCache)
 		// context 传入 envelope HMAC（与 Python _put_message_thought_encrypted_v2 对齐）
 		var ctxMeta map[string]any
 		if cm, ok := params["context"].(map[string]any); ok && len(cm) > 0 {
@@ -291,7 +285,19 @@ func (c *AUNClient) putMessageThoughtEncryptedV2(ctx context.Context, params map
 			sendParams["context"] = value
 		}
 		c.signClientOperation("message.thought.put", sendParams)
-		return c.transport.Call(ctx, "message.thought.put", sendParams)
+		c.logMessageDebugWithPayload("thought-send-call", "message.thought.put.v2", "message.thought.put", sendParams, envelope, map[string]any{
+			"use_cache": useCache,
+		})
+		resp, err := c.transport.Call(ctx, "message.thought.put", sendParams)
+		if err != nil {
+			c.log.Debug("message.thought.put v2 failed: to=%s thought_id=%s use_cache=%v err=%v", toAID, thoughtID, useCache, err)
+			return nil, err
+		}
+		c.log.Debug("message.thought.put v2 ok: to=%s thought_id=%s use_cache=%v result=%v", toAID, thoughtID, useCache, resp)
+		c.logMessageDebugWithPayload("thought-send-ok", "message.thought.put.v2", "message.thought.put", sendParams, resp, map[string]any{
+			"use_cache": useCache,
+		})
+		return resp, nil
 	}
 
 	resp, err := attempt(true)
@@ -332,8 +338,16 @@ func (c *AUNClient) putGroupThoughtEncryptedV2(ctx context.Context, params map[s
 	if timestamp == 0 {
 		timestamp = time.Now().UnixMilli()
 	}
+	c.logMessageDebugWithPayload("thought-send-plaintext", "group.thought.put.v2", "group.thought.put", map[string]any{
+		"group_id":   groupID,
+		"thought_id": thoughtID,
+		"timestamp":  timestamp,
+		"encrypted":  true,
+		"context":    params["context"],
+	}, payload, nil)
 
 	attempt := func(useCache bool) (any, error) {
+		c.logEG.Debug("group.thought.put v2 attempt: group=%s thought_id=%s use_cache=%v", groupID, thoughtID, useCache)
 		// context 传入 envelope HMAC（与 Python _put_group_thought_encrypted_v2 对齐）
 		var ctxMeta map[string]any
 		if cm, ok := params["context"].(map[string]any); ok && len(cm) > 0 {
@@ -357,14 +371,24 @@ func (c *AUNClient) putGroupThoughtEncryptedV2(ctx context.Context, params map[s
 		if value, ok := params["context"]; ok {
 			sendParams["context"] = value
 		}
-		if c.deviceID != "" {
-			sendParams["device_id"] = c.deviceID
-		}
+		sendParams["device_id"] = c.deviceID
 		if c.slotID != "" {
 			sendParams["slot_id"] = c.slotID
 		}
 		c.signClientOperation("group.thought.put", sendParams)
-		return c.transport.Call(ctx, "group.thought.put", sendParams)
+		c.logMessageDebugWithPayload("thought-send-call", "group.thought.put.v2", "group.thought.put", sendParams, envelope, map[string]any{
+			"use_cache": useCache,
+		})
+		resp, err := c.transport.Call(ctx, "group.thought.put", sendParams)
+		if err != nil {
+			c.logEG.Debug("group.thought.put v2 failed: group=%s thought_id=%s use_cache=%v err=%v", groupID, thoughtID, useCache, err)
+			return nil, err
+		}
+		c.logEG.Debug("group.thought.put v2 ok: group=%s thought_id=%s use_cache=%v result=%v", groupID, thoughtID, useCache, resp)
+		c.logMessageDebugWithPayload("thought-send-ok", "group.thought.put.v2", "group.thought.put", sendParams, resp, map[string]any{
+			"use_cache": useCache,
+		})
+		return resp, nil
 	}
 
 	resp, err := attempt(true)
@@ -389,6 +413,7 @@ func (c *AUNClient) putGroupThoughtEncryptedV2(ctx context.Context, params map[s
 func (c *AUNClient) decryptV2EnvelopeForThought(ctx context.Context, envelope map[string]any, fromAID string) map[string]any {
 	state := c.v2GetState()
 	if state == nil || state.session == nil || envelope == nil {
+		c.log.Debug("V2 thought decrypt skipped: state_ready=%v envelope_nil=%v from=%s", state != nil && state.session != nil, envelope == nil, fromAID)
 		return nil
 	}
 
@@ -396,9 +421,15 @@ func (c *AUNClient) decryptV2EnvelopeForThought(ctx context.Context, envelope ma
 	selfAID := c.aid
 	selfDeviceID := c.deviceID
 	c.mu.RUnlock()
+	eventName := "message.thought.get"
+	if isV2GroupThoughtEnvelope(envelope) {
+		eventName = "group.thought.get"
+	}
+	c.observeAgentMDFromEnvelope(envelope)
 
 	// 在 envelope.recipients 中找到本设备 row，提取 spk_id
 	spkID := ""
+	recipientKeySource := ""
 	if recipients, ok := envelope["recipients"].([]any); ok {
 		for _, raw := range recipients {
 			row, _ := raw.([]any)
@@ -408,6 +439,9 @@ func (c *AUNClient) decryptV2EnvelopeForThought(ctx context.Context, envelope ma
 			rowAID, _ := row[0].(string)
 			rowDevID, _ := row[1].(string)
 			if rowAID == selfAID && rowDevID == selfDeviceID {
+				if s, ok := row[3].(string); ok {
+					recipientKeySource = s
+				}
 				if s, ok := row[5].(string); ok {
 					spkID = s
 				}
@@ -415,103 +449,191 @@ func (c *AUNClient) decryptV2EnvelopeForThought(ctx context.Context, envelope ma
 			}
 		}
 	}
-
-	ikPriv, spkPriv, err := state.session.GetDecryptKeys(spkID)
-	if err != nil {
-		c.logE2.Warn("V2 thought decrypt: GetDecryptKeys 失败 from=%s err=%v", fromAID, err)
-		return nil
-	}
-
-	// sender 公钥（按 sender device_id 精确匹配）
 	senderDeviceID := ""
+	groupIDForKeys := ""
 	if aad, ok := envelope["aad"].(map[string]any); ok {
 		senderDeviceID = v2AsString(aad["from_device"])
+		groupIDForKeys = strings.TrimSpace(v2AsString(aad["group_id"]))
 	}
-	senderPubDER := state.session.GetPeerIK(fromAID, senderDeviceID)
-	if len(senderPubDER) == 0 && fromAID != "" {
-		raw, bsErr := c.Call(ctx, "message.v2.bootstrap", map[string]any{"peer_aid": fromAID})
-		if bsErr == nil {
-			bs, _ := raw.(map[string]any)
-			for _, dev := range v2ToMapList(bs["peer_devices"]) {
-				devID := v2AsString(dev["device_id"])
-				if devID == "" {
-					devID = v2AsString(dev["owner_device_id"])
-				}
-				ikDER := v2DecodeBase64Field(dev, "ik_pk")
-				if len(ikDER) > 0 && devID != "" {
-					state.session.CachePeerIK(fromAID, devID, ikDER)
-				}
-			}
-			senderPubDER = state.session.GetPeerIK(fromAID, senderDeviceID)
-		} else {
-			c.logE2.Warn("V2 thought decrypt: bootstrap sender %s failed: %v", fromAID, bsErr)
-		}
+	c.logE2.Debug("V2 thought decrypt start: type=%s group=%s from=%s sender_device=%s self=%s device=%s spk_id=%s",
+		v2AsString(envelope["type"]), valueOrDefault(groupIDForKeys, "<p2p>"), fromAID, valueOrDefault(senderDeviceID, "<empty>"), selfAID, selfDeviceID, valueOrDefault(spkID, "<empty>"))
+	c.logMessageDebug("thought-decrypt-start", "v2.thought.decrypt", eventName, envelope, map[string]any{
+		"from_aid":         fromAID,
+		"self_aid":         selfAID,
+		"self_device_id":   selfDeviceID,
+		"sender_device_id": senderDeviceID,
+		"group_id":         groupIDForKeys,
+		"spk_id":           spkID,
+		"key_source":       recipientKeySource,
+	})
+
+	var ikPriv, spkPriv []byte
+	var err error
+	if groupIDForKeys != "" {
+		ikPriv, spkPriv, err = state.session.GetGroupDecryptKeys(groupIDForKeys, spkID)
+	} else {
+		ikPriv, spkPriv, err = state.session.GetDecryptKeys(spkID)
 	}
-	if len(senderPubDER) == 0 && fromAID != "" {
-		certBytes, certErr := c.fetchPeerCert(ctx, fromAID, "")
-		if certErr == nil && len(certBytes) > 0 {
-			if block, _ := pem.Decode(certBytes); block != nil {
-				if cert, parseErr := x509.ParseCertificate(block.Bytes); parseErr == nil {
-					if der, marshalErr := x509.MarshalPKIXPublicKey(cert.PublicKey); marshalErr == nil {
-						senderPubDER = der
-						state.session.CachePeerIK(fromAID, senderDeviceID, der)
-						c.logE2.Debug("V2 thought decrypt: sender IK fallback from CA cert for %s", fromAID)
-					}
-				}
-			}
-		} else if certErr != nil {
-			c.logE2.Warn("V2 thought decrypt: CA fallback for %s failed: %v", fromAID, certErr)
-		}
+	if err != nil {
+		c.logE2.Warn("V2 thought decrypt: GetDecryptKeys 失败 from=%s err=%v", fromAID, err)
+		c.logMessageDebugWithPayload("thought-decrypt-fail", "v2.thought.decrypt", eventName, map[string]any{
+			"from":           fromAID,
+			"_decrypt_error": err.Error(),
+			"_decrypt_stage": "spk_lookup",
+			"_envelope_type": v2AsString(envelope["type"]),
+			"_suite":         v2AsString(envelope["suite"]),
+			"_spk_id":        spkID,
+			"_key_source":    recipientKeySource,
+		}, envelope, nil)
+		return nil
 	}
+	c.logE2.Debug("V2 thought decrypt key lookup ok: from=%s group=%s ik_len=%d spk_len=%d", fromAID, valueOrDefault(groupIDForKeys, "<p2p>"), len(ikPriv), len(spkPriv))
+
+	// sender 公钥（按 sender device_id 精确匹配）；当前解密栈不走 bootstrap RPC，避免阻塞 RPC 回调线。
+	senderPubDER := c.getV2SenderPubDER(ctx, state, fromAID, senderDeviceID)
 	if len(senderPubDER) == 0 {
 		c.logE2.Warn("V2 thought decrypt: no sender IK for %s device=%s", fromAID, senderDeviceID)
+		c.scheduleV2SenderIKFetch(fromAID, senderDeviceID, groupIDForKeys)
+		c.logMessageDebugWithPayload("thought-decrypt-fail", "v2.thought.decrypt", eventName, map[string]any{
+			"from":              fromAID,
+			"_decrypt_error":    "sender_ik_not_found",
+			"_decrypt_stage":    "sender_ik",
+			"_envelope_type":    v2AsString(envelope["type"]),
+			"_suite":            v2AsString(envelope["suite"]),
+			"_sender_device_id": senderDeviceID,
+		}, envelope, nil)
 		return nil
 	}
 
 	plaintext, err := e2ee.DecryptMessage(envelope, selfAID, selfDeviceID, ikPriv, spkPriv, senderPubDER)
 	if err != nil {
 		c.logE2.Warn("V2 thought decrypt failed from=%s: %v", fromAID, err)
+		c.logMessageDebugWithPayload("thought-decrypt-fail", "v2.thought.decrypt", eventName, map[string]any{
+			"from":              fromAID,
+			"_decrypt_error":    err.Error(),
+			"_decrypt_stage":    "decrypt",
+			"_envelope_type":    v2AsString(envelope["type"]),
+			"_suite":            v2AsString(envelope["suite"]),
+			"_sender_device_id": senderDeviceID,
+		}, envelope, nil)
 		return nil
 	}
+	if plaintext == nil {
+		c.logE2.Debug("V2 thought decrypt returned nil plaintext: from=%s group=%s", fromAID, valueOrDefault(groupIDForKeys, "<p2p>"))
+		c.logMessageDebugWithPayload("thought-decrypt-null", "v2.thought.decrypt", eventName, map[string]any{
+			"from":              fromAID,
+			"_decrypt_stage":    "decrypt",
+			"_envelope_type":    v2AsString(envelope["type"]),
+			"_suite":            v2AsString(envelope["suite"]),
+			"_sender_device_id": senderDeviceID,
+		}, envelope, nil)
+		return nil
+	}
+	c.logMessageDebugWithPayload("thought-decrypt-ok", "v2.thought.decrypt", eventName, map[string]any{
+		"from":      fromAID,
+		"to":        selfAID,
+		"group_id":  groupIDForKeys,
+		"encrypted": true,
+		"payload":   plaintext,
+	}, plaintext, map[string]any{
+		"sender_device_id": senderDeviceID,
+		"spk_id":           spkID,
+	})
 	return plaintext
 }
 
 func (c *AUNClient) decryptV2ThoughtGetResult(ctx context.Context, result any, fromAID string, group bool) {
+	method := "message.thought.get"
+	if group {
+		method = "group.thought.get"
+	}
 	resultMap, ok := result.(map[string]any)
-	if !ok || fromAID == "" {
+	if !ok {
+		c.log.Debug("%s decrypt skipped: invalid result type=%T from=%s", method, result, fromAID)
+		return
+	}
+	if fromAID == "" {
+		c.log.Debug("%s decrypt skipped: empty sender_aid", method)
 		return
 	}
 	rawThoughts, ok := resultMap["thoughts"].([]any)
-	if !ok || len(rawThoughts) == 0 {
+	if !ok {
+		c.log.Debug("%s decrypt skipped: thoughts field type=%T found=%v", method, resultMap["thoughts"], resultMap["found"])
 		return
 	}
-	for _, raw := range rawThoughts {
+	decryptedCount := 0
+	failedCount := 0
+	skippedCount := 0
+	c.log.Debug("%s decrypt enter: from=%s raw_count=%d group=%v found=%v", method, fromAID, len(rawThoughts), group, resultMap["found"])
+	defer func() {
+		c.log.Debug("%s decrypt exit: from=%s raw_count=%d decrypted=%d failed=%d skipped=%d", method, fromAID, len(rawThoughts), decryptedCount, failedCount, skippedCount)
+	}()
+	if len(rawThoughts) == 0 {
+		return
+	}
+	for index, raw := range rawThoughts {
 		thought, ok := raw.(map[string]any)
 		if !ok {
+			skippedCount++
+			c.log.Debug("%s thought[%d] skipped: invalid item type=%T", method, index, raw)
 			continue
 		}
 		payload, _ := thought["payload"].(map[string]any)
+		c.logMessageDebugWithPayload("thought-get-raw", "thought.get", method, thought, payload, map[string]any{
+			"index":    index,
+			"from_aid": fromAID,
+			"group":    group,
+		})
 		if payload == nil {
+			skippedCount++
+			c.log.Debug("%s thought[%d] skipped: payload type=%T", method, index, thought["payload"])
 			continue
 		}
 		if group {
 			if !isV2GroupThoughtEnvelope(payload) {
+				skippedCount++
+				c.logMessageDebugWithPayload("thought-get-unsupported", "thought.get", method, thought, payload, map[string]any{
+					"index":         index,
+					"expected_type": "e2ee.group_encrypted",
+					"actual_type":   v2AsString(payload["type"]),
+				})
 				continue
 			}
 		} else if !isV2P2PThoughtEnvelope(payload) {
+			skippedCount++
+			c.logMessageDebugWithPayload("thought-get-unsupported", "thought.get", method, thought, payload, map[string]any{
+				"index":         index,
+				"expected_type": "e2ee.p2p_encrypted",
+				"actual_type":   v2AsString(payload["type"]),
+			})
 			continue
 		}
 
+		meta := v2ThoughtE2EEMetadata(payload)
 		plaintext := c.decryptV2EnvelopeForThought(ctx, payload, fromAID)
 		if plaintext == nil {
+			failedCount++
 			thought["decrypt_failed"] = true
-			thought["e2ee"] = v2ThoughtE2EEMetadata(payload)
+			thought["e2ee"] = meta
+			attachV2EnvelopeMetadata(thought, meta)
+			c.logMessageDebugWithPayload("thought-decrypt-null", "thought.get", method, thought, payload, map[string]any{
+				"index":    index,
+				"from_aid": fromAID,
+				"group":    group,
+			})
 			continue
 		}
 		thought["payload"] = plaintext
 		thought["encrypted"] = true
-		thought["e2ee"] = v2ThoughtE2EEMetadata(payload)
+		thought["e2ee"] = meta
+		attachV2EnvelopeMetadata(thought, meta)
 		delete(thought, "decrypt_failed")
+		decryptedCount++
+		c.logMessageDebug("thought-result", "thought.get", method, thought, map[string]any{
+			"index":    index,
+			"from_aid": fromAID,
+			"group":    group,
+		})
 	}
 }
 
@@ -527,13 +649,54 @@ func v2ThoughtE2EEMetadata(envelope map[string]any) map[string]any {
 		"encryption_mode": encryptionMode,
 		"forward_secrecy": true,
 	}
-	if ph := v2MetadataWithoutAuth(envelope["protected_headers"]); len(ph) > 0 {
+	ph := v2MetadataWithoutAuth(envelope["protected_headers"])
+	if len(ph) > 0 {
 		meta["protected_headers"] = ph
+	}
+	if payloadType := v2EnvelopePayloadType(envelope, ph); payloadType != "" {
+		meta["payload_type"] = payloadType
 	}
 	if ctx := v2MetadataWithoutAuth(envelope["context"]); len(ctx) > 0 {
 		meta["context"] = ctx
 	}
+	if agentMD := v2MetadataWithoutAuth(envelope["agent_md"]); len(agentMD) > 0 {
+		meta["agent_md"] = agentMD
+	}
 	return meta
+}
+
+func attachV2EnvelopeMetadata(message map[string]any, meta map[string]any) {
+	if message == nil || meta == nil {
+		return
+	}
+	if payloadType := strings.TrimSpace(v2AsString(meta["payload_type"])); payloadType != "" {
+		message["payload_type"] = payloadType
+	}
+	if headers, ok := meta["protected_headers"].(map[string]any); ok && len(headers) > 0 {
+		copyHeaders := make(map[string]any, len(headers))
+		for key, value := range headers {
+			copyHeaders[key] = value
+		}
+		message["protected_headers"] = copyHeaders
+	}
+	if agentMD, ok := meta["agent_md"].(map[string]any); ok && len(agentMD) > 0 {
+		copyAgentMD := make(map[string]any, len(agentMD))
+		for key, value := range agentMD {
+			copyAgentMD[key] = value
+		}
+		message["agent_md"] = copyAgentMD
+	}
+}
+
+func v2EnvelopePayloadType(envelope map[string]any, protectedHeaders map[string]any) string {
+	if envelope == nil {
+		return ""
+	}
+	value := envelope["payload_type"]
+	if value == nil && len(protectedHeaders) > 0 {
+		value = protectedHeaders["payload_type"]
+	}
+	return strings.TrimSpace(v2AsString(value))
 }
 
 func v2MetadataWithoutAuth(value any) map[string]any {

@@ -3,6 +3,7 @@
 // 此处测试可独立验证的构造、配置和状态管理逻辑。
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AUNClient } from '../../src/client.js';
@@ -10,6 +11,9 @@ import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
 import { ProtectedHeaders } from '../../src/e2ee.js';
 
+function keyIdForBytes(bytes: Uint8Array): string {
+  return `sha256:${createHash('sha256').update(Buffer.from(bytes)).digest('hex').slice(0, 16)}`;
+}
 describe('AUNClient peer 证书缓存', () => {
   it('TTL 应为 3600 秒', () => {
     const source = readFileSync(join(process.cwd(), 'src', 'client.ts'), 'utf8');
@@ -129,6 +133,55 @@ describe('AUNClient.on', () => {
     expect(sub).toBeDefined();
     expect(typeof sub.unsubscribe).toBe('function');
     sub.unsubscribe();
+  });
+
+  it('重连流程后应用层订阅仍挂在实际发布的 dispatcher 上', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
+      const client = new AUNClient();
+      const dispatcher = (client as any)._dispatcher;
+      const received: string[] = [];
+      const sub = client.on('message.received', (payload: any) => {
+        received.push(String(payload.id));
+      });
+
+      (client as any)._sessionParams = { access_token: 'tok-1', gateway: 'ws://gateway.example.com/aun' };
+      (client as any)._sessionOptions = {
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        token_refresh_before: 60,
+        retry: { initial_delay: 0.01, max_delay: 0.01, max_attempts: 1 },
+        timeouts: { connect: 5, call: 10, http: 30 },
+      };
+      (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
+      (client as any)._connectOnce = vi.fn().mockImplementation(async () => {
+        expect((client as any)._dispatcher).toBe(dispatcher);
+        (client as any)._state = 'connected';
+      });
+      (client as any)._reconnectAbort = new AbortController();
+      (client as any)._reconnectActive = true;
+
+      const reconnectLoop = (client as any)._reconnectLoop(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await reconnectLoop;
+
+      expect((client as any)._dispatcher).toBe(dispatcher);
+      await dispatcher.publish('message.received', { id: 'after-reconnect' });
+      expect(received).toEqual(['after-reconnect']);
+
+      sub.unsubscribe();
+      received.length = 0;
+      const newSub = client.on('message.received', (payload: any) => {
+        received.push(`new:${String(payload.id)}`);
+      });
+      await dispatcher.publish('message.received', { id: 'after-reregister' });
+      expect(received).toEqual(['new:after-reregister']);
+      newSub.unsubscribe();
+    } finally {
+      randomSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -312,6 +365,19 @@ describe('AUNClient message.send 接收者校验', () => {
     }));
   });
 
+  it('group RPC 应注入空 device_id 作为显式实例值', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._deviceId = '';
+    (client as any)._slotId = 'slot-empty-device';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ members: [] });
+
+    await client.call('group.get_members', { group_id: 'group.agentid.pub/g1' });
+
+    const [, sentParams] = (client as any)._transport.call.mock.calls[0];
+    expect(sentParams).toHaveProperty('device_id', '');
+    expect(sentParams).toHaveProperty('slot_id', 'slot-empty-device');
+  });
 });
 
 describe('AUNClient 重连错误分类', () => {
@@ -555,6 +621,111 @@ describe('AUNClient M25 重连行为', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+describe('AUNClient V2 空 device_id E2EE 路径', () => {
+  it('V2 target 构建应接受显式空 device_id', async () => {
+    const client = new AUNClient();
+    const cachePeerIK = vi.fn();
+    (client as any)._v2Session = { cachePeerIK };
+    vi.spyOn(client as any, '_v2VerifySPKDevice').mockResolvedValue(undefined);
+
+    const target = await (client as any)._v2BuildTargetFromDevice({
+      dev: { device_id: '', ik_pk: 'AQID' },
+      aid: 'bob.aid.com',
+      deviceId: '',
+      hasDeviceId: true,
+      role: 'peer',
+      defaultKeySource: 'peer_device_prekey',
+    });
+
+    expect(target).toEqual(expect.objectContaining({
+      aid: 'bob.aid.com',
+      deviceId: '',
+      role: 'peer',
+    }));
+    expect(cachePeerIK).toHaveBeenCalledWith('bob.aid.com', '', expect.any(Uint8Array));
+  });
+
+  it('V2 target 构建应接受 bootstrap 中 SPK 字段实际为 IK', async () => {
+    const client = new AUNClient();
+    const ik = new Uint8Array([1, 2, 3]);
+    const ikB64 = Buffer.from(ik).toString('base64');
+    const ikId = keyIdForBytes(ik);
+    const cachePeerIK = vi.fn();
+    const markPeerSPKVerified = vi.fn();
+    (client as any)._v2Session = { cachePeerIK, markPeerSPKVerified };
+    vi.spyOn(client as any, '_v2TrustedIKPubDer').mockResolvedValue(ik);
+
+    const target = await (client as any)._v2BuildTargetFromDevice({
+      dev: { device_id: '', ik_pk: ikB64, spk_pk: ikB64, spk_id: ikId, key_source: 'peer_device_prekey' },
+      aid: 'bob.aid.com',
+      deviceId: '',
+      role: 'peer',
+      defaultKeySource: 'peer_device_prekey',
+    });
+
+    expect(target).toEqual(expect.objectContaining({ aid: 'bob.aid.com', deviceId: '', spkId: ikId }));
+    expect(cachePeerIK).toHaveBeenCalledWith('bob.aid.com', '', expect.any(Uint8Array));
+    expect(markPeerSPKVerified).toHaveBeenCalledWith('bob.aid.com', '', ikId);
+  });
+  it('V2 sender IK pending resolver 应通过 bootstrap 缓存显式空 device_id 的 IK', async () => {
+    const client = new AUNClient();
+    const peerCache = new Map<string, Uint8Array>();
+    const peerKey = (aid: string, deviceId: string) => `${new TextEncoder().encode(aid).length}:${aid};${new TextEncoder().encode(deviceId).length}:${deviceId};`;
+    const cachePeerIK = vi.fn((aid: string, deviceId: string, pub: Uint8Array) => {
+      peerCache.set(peerKey(aid, deviceId), pub);
+    });
+    (client as any)._v2Session = {
+      getPeerIK: vi.fn((aid: string, deviceId: string) => peerCache.get(peerKey(aid, deviceId)) ?? null),
+      cachePeerIK,
+    };
+    (client as any).call = vi.fn().mockResolvedValue({
+      peer_devices: [{ device_id: '', ik_pk: 'AQID' }],
+    });
+    vi.spyOn(client as any, '_fetchPeerCert').mockRejectedValue(new Error('no cert'));
+
+    await (client as any)._resolveV2SenderIKPending('bob.aid.com', '', '', 'bob.aid.com||');
+    const pub = (client as any)._v2Session.getPeerIK('bob.aid.com', '');
+
+    expect(Array.from(pub ?? [])).toEqual([1, 2, 3]);
+    expect((client as any).call).toHaveBeenCalledWith('message.v2.bootstrap', { peer_aid: 'bob.aid.com' });
+    expect(cachePeerIK).toHaveBeenCalledWith('bob.aid.com', '', expect.any(Uint8Array));
+    expect((client as any)._fetchPeerCert).not.toHaveBeenCalled();
+  });
+});
+describe('AUNClient V2 群状态 leader delay', () => {
+  it('应把空 device_id 作为候选设备', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'b-owner.aid.com';
+    (client as any)._deviceId = 'dev-b';
+    (client as any)._slotId = 'slot-b';
+    (client as any).call = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.get_online_members') {
+        return {
+          members: [
+            { aid: 'a-owner.aid.com', role: 'owner', online: true },
+            { aid: 'b-owner.aid.com', role: 'owner', online: true },
+          ],
+        };
+      }
+      if (method === 'group.v2.bootstrap') {
+        return {
+          devices: [
+            { aid: 'a-owner.aid.com', device_id: '', ik_fp: 'ik-a-empty' },
+            { aid: 'b-owner.aid.com', device_id: 'dev-b', ik_fp: 'ik-b' },
+          ],
+        };
+      }
+      return { ok: true };
+    });
+    vi.spyOn(client as any, '_v2LeaderDelayMs').mockResolvedValue(1);
+    const sleepSpy = vi.spyOn(client as any, '_sleep').mockResolvedValue(undefined);
+
+    await expect((client as any)._v2AutoProposeLeaderDelay('group.agentid.pub/12345')).resolves.toBe(true);
+
+    expect(sleepSpy).toHaveBeenCalledWith(1);
   });
 });
 
@@ -824,6 +995,315 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
 });
 
 
+
+describe('AUNClient V2 e2ee payload_type 元数据', () => {
+  it('message.thought.get 应把信封 payload_type 送达应用层 e2ee', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'bob.aid.com';
+    (client as any)._deviceId = 'dev-b';
+    const envelope = {
+      type: 'e2ee.p2p_encrypted',
+      version: 'v2',
+      suite: 'P256_HKDF_SHA256_AES_256_GCM',
+      payload_type: 'text',
+      protected_headers: { payload_type: 'fallback', trace_id: 'trace-1', _auth: 'secret' },
+      context: { type: 'run', id: 'run-1', _auth: 'secret' },
+    };
+    (client as any)._transport = {
+      call: vi.fn().mockResolvedValue({
+        found: true,
+        sender_aid: 'alice.aid.com',
+        thoughts: [{ thought_id: "t-1", payload: envelope }],
+      }),
+    };
+    (client as any)._decryptV2EnvelopeForThought = vi.fn().mockResolvedValue({ type: "text", text: "decrypted" });
+
+    const result = await client.call("message.thought.get", {
+      sender_aid: 'alice.aid.com',
+      context: { type: 'run', id: 'run-1' },
+    });
+
+    const thought = (result as any).thoughts[0];
+    expect(thought.payload).toEqual({ type: 'text', text: 'decrypted' });
+    expect(thought.payload_type).toBe('text');
+    expect(thought.protected_headers).toEqual({ payload_type: 'fallback', trace_id: 'trace-1' });
+    expect(thought.e2ee.payload_type).toBe('text');
+    expect(thought.e2ee.protected_headers).toEqual({ payload_type: 'fallback', trace_id: 'trace-1' });
+    expect(thought.e2ee.context).toEqual({ type: 'run', id: 'run-1' });
+  });
+
+  it('message.undecryptable 事件应透传 payload_type 和 protected_headers', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'device-001';
+    const publish = vi.fn().mockResolvedValue(undefined);
+    (client as any)._dispatcher.publish = publish;
+    (client as any)._v2Session = {
+      getDecryptKeys: vi.fn(() => { throw new Error('spk missing'); }),
+    };
+    const envelope = {
+      type: 'e2ee.p2p_encrypted',
+      version: 'v2',
+      suite: 'P256_HKDF_SHA256_AES_256_GCM',
+      payload_type: 'text',
+      aad: { from: 'bob.aid.com', from_device: 'bob-dev' },
+      recipients: [['alice.aid.com', 'device-001', 'peer', 'peer_device_prekey', 'fp', 'missing-spk', 'n', 'w']],
+      protected_headers: { payload_type: 'text', trace_id: 'trace-1', _auth: 'secret' },
+    };
+
+    const result = await (client as any)._decryptV2Message({
+      seq: 1,
+      message_id: 'm1',
+      from_aid: 'bob.aid.com',
+      envelope_json: JSON.stringify(envelope),
+      t_server: 123,
+    });
+
+    expect(result).toBeNull();
+    expect(publish).toHaveBeenCalledWith('message.undecryptable', expect.objectContaining({
+      payload_type: 'text',
+      protected_headers: { payload_type: 'text', trace_id: 'trace-1' },
+    }));
+  });
+
+  it('message.thought.get 解密失败项应透传 payload_type 和 protected_headers', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'bob.aid.com';
+    (client as any)._deviceId = 'dev-b';
+    (client as any)._transport = {
+      call: vi.fn().mockResolvedValue({
+        found: true,
+        sender_aid: 'alice.aid.com',
+        thoughts: [{
+          thought_id: 'mt-fail',
+          payload: {
+            type: 'e2ee.p2p_encrypted',
+            version: 'v2',
+            suite: 'P256_HKDF_SHA256_AES_256_GCM',
+            payload_type: 'thought',
+            protected_headers: { payload_type: 'thought', trace_id: 'trace-p2p', _auth: 'secret' },
+          },
+        }],
+      }),
+    };
+    (client as any)._decryptV2EnvelopeForThought = vi.fn().mockResolvedValue(null);
+
+    const result = await client.call('message.thought.get', {
+      sender_aid: 'alice.aid.com',
+      context: { type: 'run', id: 'run-1' },
+    });
+
+    const thought = (result as any).thoughts[0];
+    expect(thought.decrypt_failed).toBe(true);
+    expect(thought.payload_type).toBe('thought');
+    expect(thought.protected_headers).toEqual({ payload_type: 'thought', trace_id: 'trace-p2p' });
+    expect(thought.e2ee.payload_type).toBe('thought');
+    expect(thought.e2ee.protected_headers).toEqual({ payload_type: 'thought', trace_id: 'trace-p2p' });
+  });
+});
+describe('AUNClient agent.md ETag 缓存与透传', () => {
+  let agentMdCounter = 0;
+  const makeAgentClient = (): AUNClient => new AUNClient({ aunPath: `aun-agent-md-${++agentMdCounter}` });
+  const agentRoot = (client: AUNClient): string => (client as any)._agentMdPath as string;
+  const agentEtag = (content: string): string => `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
+  const readAgentStorage = async (client: AUNClient, key: string): Promise<any> => {
+    const record = await (client as any)._keystore.loadAgentMdCache(agentRoot(client), key);
+    if (!record) throw new Error(`missing agent.md storage key: ${key}`);
+    return record;
+  };
+  const readAgentList = async (client: AUNClient): Promise<any> => {
+    const record = await readAgentStorage(client, 'list.json');
+    return JSON.parse(record.content || '{"records":{}}');
+  };
+  const writeAgentFile = async (client: AUNClient, aid: string, content: string): Promise<void> => {
+    await (client as any)._writeAgentMdContent(aid, content);
+  };
+
+  it('publishAgentMd 成功后应持久化自身 agent.md 正文和 list.json 元数据', async () => {
+    const client = makeAgentClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    const body = '---\naid: alice.agentid.pub\n---\n# Alice\n';
+    const signed = `${body}\n<!-- AUN-SIGNATURE\nsignature: x\n-->\n`;
+    await writeAgentFile(client, 'alice.agentid.pub', body);
+    (client.auth as any).signAgentMd = vi.fn(async () => signed);
+    (client.auth as any).uploadAgentMd = vi.fn(async () => ({
+      etag: '"alice-cloud"',
+      last_modified: 'Sun, 24 May 2026 13:00:00 GMT',
+    }));
+
+    await client.publishAgentMd();
+
+    const saved = await readAgentStorage(client, 'alice.agentid.pub/agent.md');
+    const record = (await readAgentList(client)).records['alice.agentid.pub'];
+    expect(saved.content).toBe(signed);
+    expect(record.content).toBeUndefined();
+    expect(record.local_etag).toBe(agentEtag(signed));
+    expect(record.remote_etag).toBe('"alice-cloud"');
+    expect(record.remote_status).toBe('found');
+  });
+
+  it('fetchAgentMd 成功后应持久化远端 agent.md 正文和 list.json 元数据', async () => {
+    const client = makeAgentClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
+    (client.auth as any).downloadAgentMd = vi.fn(async () => body);
+    (client.auth as any).verifyAgentMd = vi.fn(async () => ({ status: 'verified', verified: true }));
+    (client.auth as any)._agentMdCache = new Map([
+      ['bob.agentid.pub', {
+        text: body,
+        etag: '"bob-cloud"',
+        lastModified: 'Sun, 24 May 2026 13:10:00 GMT',
+      }],
+    ]);
+
+    const info = await client.fetchAgentMd('bob.agentid.pub');
+
+    expect(info.aid).toBe('bob.agentid.pub');
+    const saved = await readAgentStorage(client, 'bob.agentid.pub/agent.md');
+    const record = (await readAgentList(client)).records['bob.agentid.pub'];
+    expect(saved.content).toBe(body);
+    expect(record.content).toBeUndefined();
+    expect(record.local_etag).toBe(agentEtag(body));
+    expect(record.remote_etag).toBe('"bob-cloud"');
+    expect(record.verify_status).toBe('verified');
+  });
+
+  it('_observeRpcMeta 应分别缓存发送者自身和 message.send 目标的云端 ETag', async () => {
+    const client = makeAgentClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    await writeAgentFile(client, 'alice.agentid.pub', '# Alice\n');
+    await writeAgentFile(client, 'bob.agentid.pub', '# Bob\n');
+    await writeAgentFile(client, 'carol.agentid.pub', '# Carol\n');
+    await writeAgentFile(client, 'dave.agentid.pub', '# Dave\n');
+
+    await (client as any)._observeRpcMeta({
+      agent_md_etag: '"alice-cloud"',
+      agent_md_etags: {
+        to: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' },
+        target: { aid: 'carol.agentid.pub', etag: '"carol-cloud"' },
+        sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' },
+      },
+    });
+
+    expect(client.getRemoteAgentMdEtag()).toBe('"alice-cloud"');
+    const records = (await readAgentList(client)).records;
+    expect(records['alice.agentid.pub'].remote_etag).toBe('"alice-cloud"');
+    expect(records['bob.agentid.pub'].remote_etag).toBe('"bob-cloud"');
+    expect(records['carol.agentid.pub'].remote_etag).toBe('"carol-cloud"');
+    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
+  });
+
+  it('transport 事件和通知的顶层 _meta 应进入 agent.md ETag 缓存', async () => {
+    const client = makeAgentClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    await writeAgentFile(client, 'carol.agentid.pub', '# Carol\n');
+    await writeAgentFile(client, 'dave.agentid.pub', '# Dave\n');
+
+    (client as any)._transport._routeMessage({
+      method: 'event/custom.notice',
+      params: {},
+      _meta: { agent_md_etags: { target: { aid: 'carol.agentid.pub', etag: '"carol-cloud"' } } },
+    });
+    (client as any)._transport._routeMessage({
+      method: 'custom.notice',
+      params: {},
+      _meta: { agent_md_etags: { sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' } } },
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    const records = (await readAgentList(client)).records;
+    expect(records['carol.agentid.pub'].remote_etag).toBe('"carol-cloud"');
+    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
+  });
+
+  it('V2 解密失败事件应透传 agent_md.sender 并缓存发送者 ETag', async () => {
+    const client = makeAgentClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    await writeAgentFile(client, 'bob.agentid.pub', '# Bob\n');
+    const publish = vi.fn().mockResolvedValue(undefined);
+    (client as any)._dispatcher.publish = publish;
+    (client as any)._v2Session = {
+      getDecryptKeys: vi.fn(() => { throw new Error('spk missing'); }),
+    };
+
+    const result = await (client as any)._decryptV2Message({
+      seq: 1,
+      message_id: 'm-agent-md',
+      from_aid: 'bob.agentid.pub',
+      envelope_json: JSON.stringify({
+        type: 'e2ee.p2p_encrypted',
+        version: 'v2',
+        suite: 'P256_HKDF_SHA256_AES_256_GCM',
+        payload_type: 'chat.text',
+        aad: { from: 'bob.agentid.pub', from_device: 'bob-dev' },
+        recipients: [['alice.agentid.pub', 'device-001', 'peer', 'peer_device_prekey', 'fp', 'missing-spk', 'n', 'w']],
+        protected_headers: { payload_type: 'chat.text', sdk_lang: 'js', _auth: 'secret' },
+        agent_md: { sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' } },
+      }),
+      t_server: 123,
+    });
+
+    expect(result).toBeNull();
+    expect(publish).toHaveBeenCalledWith('message.undecryptable', expect.objectContaining({
+      payload_type: 'chat.text',
+      protected_headers: { payload_type: 'chat.text', sdk_lang: 'js' },
+      agent_md: { sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' } },
+    }));
+    const record = (await readAgentList(client)).records['bob.agentid.pub'];
+    expect(record.remote_etag).toBe('"bob-cloud"');
+  });
+
+  it('checkAgentMd 应使用 HEAD 返回的云端 ETag 与本地 content ETag 比较并落到 list.json', async () => {
+    const client = makeAgentClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    const body = '# Bob\n';
+    await (client as any)._saveAgentMdRecord('bob.agentid.pub', {
+      content: body,
+      local_etag: agentEtag(body),
+      remote_etag: '"old"',
+    });
+    (client.auth as any).headAgentMd = vi.fn(async (aid: string) => ({
+      aid,
+      found: true,
+      etag: agentEtag(body),
+      last_modified: 'Sun, 24 May 2026 13:20:00 GMT',
+      status: 200,
+    }));
+
+    const result = await client.checkAgentMd('bob.agentid.pub');
+
+    expect(result.local_found).toBe(true);
+    expect(result.remote_found).toBe(true);
+    expect(result.in_sync).toBe(true);
+    const record = (await readAgentList(client)).records['bob.agentid.pub'];
+    expect(record.remote_status).toBe('found');
+    expect(record.remote_etag).toBe(agentEtag(body));
+    expect(record.checked_at).toBeGreaterThan(0);
+  });
+
+  it('checkAgentMd 本地无记录时仍应 HEAD 云端并返回 local_found=false', async () => {
+    const client = makeAgentClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    (client.auth as any).headAgentMd = vi.fn(async (aid: string) => ({
+      aid,
+      found: true,
+      etag: '"remote"',
+      last_modified: '',
+      status: 200,
+    }));
+
+    const result = await client.checkAgentMd('carol.agentid.pub');
+
+    expect(result.local_found).toBe(false);
+    expect(result.remote_found).toBe(true);
+    expect(result.in_sync).toBe(false);
+    const record = (await readAgentList(client)).records['carol.agentid.pub'];
+    expect(record.remote_etag).toBe('"remote"');
+  });
+});
 describe('有序消息发布', () => {
   it('P2P push 越过空洞时应挂起，补洞后按 contiguous_seq 顺序放行', async () => {
     const client = new AUNClient();
@@ -897,6 +1377,41 @@ describe('有序消息发布', () => {
     expect(p2pEvents[0].slot_id).toBe('slot-a');
     expect(groupEvents[0].device_id).toBe('dev-1');
     expect(groupEvents[0].slot_id).toBe('slot-a');
+  });
+  it('发布消息缺实例字段且当前 device_id 为空时仍应注入空值', () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = '';
+    (client as any)._slotId = 'slot-empty-device';
+
+    const attached = (client as any)._attachCurrentInstanceContext({ seq: 1, payload: { type: 'text' } });
+
+    expect(attached).toHaveProperty('device_id', '');
+    expect(attached).toHaveProperty('slot_id', 'slot-empty-device');
+  });
+
+  it('发布消息已有空 device_id 时不应被非空当前 device_id 覆盖', () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+
+    const attached = (client as any)._attachCurrentInstanceContext({
+      device_id: '',
+      seq: 1,
+      payload: { type: 'text' },
+    });
+
+    expect(attached).toHaveProperty('device_id', '');
+    expect(attached).toHaveProperty('slot_id', 'slot-a');
+  });
+
+  it('P2P push 显式空 device_id 应按实例值匹配', () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'dev-1';
+    expect((client as any)._messageTargetsCurrentInstance({ device_id: '' })).toBe(false);
+
+    (client as any)._deviceId = '';
+    expect((client as any)._messageTargetsCurrentInstance({ device_id: '' })).toBe(true);
+    expect((client as any)._messageTargetsCurrentInstance({ device_id: 'dev-1' })).toBe(false);
   });
 
   it('P2P push 明确指向其它 slot 时应忽略', async () => {

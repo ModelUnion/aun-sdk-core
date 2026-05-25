@@ -3,7 +3,7 @@ AUN E2EE V2: Canonical JSON 序列化
 
 规范引用: §10.2
 规则:
-- 键递归字典序排序
+- 键递归按 Unicode code point 排序
 - UTF-8 直出（不转义非 ASCII）
 - 数值无前导零、不科学计数法
 - 字符串最小转义（仅 " \\ \\b \\f \\n \\r \\t，其它控制字符 \\u00XX）
@@ -16,6 +16,8 @@ AUN E2EE V2: Canonical JSON 序列化
 from __future__ import annotations
 
 import math
+
+_MAX_SAFE_JSON_INTEGER = 9007199254740991
 
 
 def canonical_json(obj) -> bytes:
@@ -52,24 +54,47 @@ def _serialize(obj) -> str:
 
 
 def _serialize_int(n: int) -> str:
+    if abs(n) > _MAX_SAFE_JSON_INTEGER:
+        raise ValueError(f"canonical_json: integer outside safe range {n}")
     return str(n)
 
 
 def _serialize_float(f: float) -> str:
     if math.isinf(f) or math.isnan(f):
         raise ValueError("canonical_json: Infinity and NaN not allowed")
-    # 不使用科学计数法
-    # 如果是整数值的 float（如 1.0），输出 "1.0" 还是 "1"？
-    # JSON 规范中 1.0 和 1 是不同的 token。保留小数点。
-    # 但如果值恰好是整数且无小数部分，Python repr 会输出 "1.0"
-    # 我们用 repr 然后确保不含 'e'/'E'
+    if f == 0:
+        return "0"
+    # 与 JS/TS 收敛：整数值 float 统一为整数 token。
+    if f.is_integer():
+        i = int(f)
+        if abs(i) > _MAX_SAFE_JSON_INTEGER:
+            raise ValueError(f"canonical_json: integer outside safe range {i}")
+        return str(i)
+
     s = repr(f)
     if "e" in s or "E" in s:
-        # 科学计数法 → 转为定点
-        s = f"{f:.20f}".rstrip("0")
-        if s.endswith("."):
-            s += "0"
+        s = _expand_exponent(s)
     return s
+
+
+def _expand_exponent(s: str) -> str:
+    mantissa, exp_text = s.lower().split("e", 1)
+    exp = int(exp_text)
+    sign = ""
+    if mantissa.startswith("-"):
+        sign = "-"
+        mantissa = mantissa[1:]
+    if "." in mantissa:
+        int_part, frac_part = mantissa.split(".", 1)
+    else:
+        int_part, frac_part = mantissa, ""
+    digits = int_part + frac_part
+    point = len(int_part) + exp
+    if point <= 0:
+        return sign + "0." + ("0" * (-point)) + digits
+    if point >= len(digits):
+        return sign + digits + ("0" * (point - len(digits)))
+    return sign + digits[:point] + "." + digits[point:]
 
 
 def _serialize_string(s: str) -> str:
@@ -106,7 +131,7 @@ def _serialize_array(arr) -> str:
 
 
 def _serialize_object(obj: dict) -> str:
-    # 键递归字典序排序
+    # Python 字符串排序按 Unicode code point，与 TS/JS/C++ canonical 规则一致。
     sorted_keys = sorted(obj.keys())
     pairs = []
     for key in sorted_keys:

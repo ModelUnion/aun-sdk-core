@@ -45,6 +45,13 @@ _DIAG_RESULT_FIELDS = _DIAG_PARAM_FIELDS + (
     "members", "messages", "events", "count", "imported", "skipped",
     "next_cursor", "current_seq", "committed_epoch",
 )
+_TRACE_SPAN_DETAIL_FIELDS = (
+    "method", "route", "namespace", "instance_id", "aid", "caller_aid",
+    "peer_aid", "to_aid", "from_aid", "group_id", "message_id", "event",
+    "status", "error_code", "error_msg", "found", "delivered_count",
+    "success", "created", "connection_id", "device_id", "slot_id",
+    "key_source", "spk_id", "curve", "lifecycle_state", "auth_method",
+)
 
 
 def _summarize_dict(payload: Any, fields: tuple[str, ...]) -> str:
@@ -78,40 +85,80 @@ def _summarize_dict(payload: Any, fields: tuple[str, ...]) -> str:
     return " ".join(parts) if parts else "<no diag fields>"
 
 
+def _debug_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _sort_trace_spans_for_display(spans: list) -> list:
+    """按因果顺序展示 trace spans。
+
+    不按绝对 ts 全局排序：客户端、Gateway、服务模块可能存在毫秒级时钟偏差，
+    纯 ts 排序会把 sdk.recv 排到服务端处理之前。这里使用固定链路阶段排序，
+    并在同一阶段内保持服务端返回的原始嵌套顺序。
+    """
+    indexed = [(idx, span) for idx, span in enumerate(spans) if isinstance(span, dict)]
+
+    def _key(item):
+        idx, span = item
+        node = str(span.get("node") or "")
+        action = str(span.get("action") or "process")
+        if node == "sdk" and action == "send":
+            stage = 0
+        elif node == "gateway" and action in {"relay_in", "enter"}:
+            stage = 10
+        elif node == "gateway" and action in {"relay_out", "exit"}:
+            stage = 90
+        elif node == "sdk" and action == "recv":
+            stage = 100
+        else:
+            stage = 50
+        return (stage, idx)
+
+    return [span for _, span in sorted(indexed, key=_key)]
+
+
+def _format_trace_fields(span: dict, keys: tuple[str, ...] = _TRACE_SPAN_DETAIL_FIELDS, limit: int | None = None) -> str:
+    fields = []
+    for key in keys:
+        if key not in span:
+            continue
+        value = span[key]
+        if value in (None, ""):
+            continue
+        if isinstance(value, str) and len(value) > 48:
+            value = value[:45] + "..."
+        fields.append(f"{key}={value}")
+    if limit is not None:
+        fields = fields[:limit]
+    return " ".join(fields)
+
+
 def _format_trace_tree(spans: list) -> str:
     """将 span 列表格式化为树状结构字符串。
 
-    按 ts 排序，维护栈识别嵌套，enter/exit 配对显示。
+    按因果顺序展示，维护栈识别嵌套，enter/exit 配对显示。
+    输出使用以 sdk.send 为 0 点的逻辑时间 +Nms，避免跨进程时钟偏差造成倒序。
     """
     if not spans:
         return ""
 
-    # 按时间戳排序
-    sorted_spans = sorted(spans, key=lambda s: s.get("ts", 0))
+    sorted_spans = _sort_trace_spans_for_display(spans)
+    offsets = _trace_logical_offsets(sorted_spans)
 
     lines = []
     stack = []  # 栈：[(node, enter_span), ...]
 
-    for span in sorted_spans:
+    for idx, span in enumerate(sorted_spans):
         node = span.get("node", "?")
         action = span.get("action", "process")
+        time_part = _format_trace_offset_part(offsets[idx])
 
         if action == "enter":
             # Enter span：显示关键业务字段
             indent = "  " * len(stack)
-            fields = []
-            for key in ("method", "route", "namespace", "aid", "peer_aid", "to_aid",
-                        "group_id", "caller_aid", "curve", "lifecycle_state",
-                        "auth_method", "device_id", "key_source", "spk_id"):
-                if key in span:
-                    value = span[key]
-                    if isinstance(value, str) and len(value) > 32:
-                        value = value[:29] + "..."
-                    fields.append(f"{key}={value}")
-
-            ts_str = _format_ts(span.get("ts", 0))
-            fields_str = " ".join(fields[:4])  # 最多显示 4 个字段
-            lines.append(f"{indent}├─ {node}.enter {fields_str} @{ts_str}")
+            fields_str = _format_trace_fields(span)
+            detail = f" {fields_str}" if fields_str else ""
+            lines.append(f"{indent}├─ {node}.enter{detail}{time_part}")
             stack.append((node, span))
 
         elif action == "exit":
@@ -122,43 +169,103 @@ def _format_trace_tree(spans: list) -> str:
             else:
                 indent = "  " * len(stack)
 
-            fields = []
-            status = span.get("status", "?")
-            fields.append(f"status={status}")
-
-            if status == "error":
-                if "error_code" in span:
-                    fields.append(f"error_code={span['error_code']}")
-                if "error_msg" in span:
-                    msg = str(span["error_msg"])
-                    if len(msg) > 50:
-                        msg = msg[:47] + "..."
-                    fields.append(f'error="{msg}"')
-            else:
-                for key in ("found", "delivered_count", "message_id", "success", "created"):
-                    if key in span:
-                        fields.append(f"{key}={span[key]}")
-
             dur = span.get("ms", 0)
-            ts_str = _format_ts(span.get("ts", 0))
-            fields_str = " ".join(fields[:3])
-            lines.append(f"{indent}└─ {node}.exit {fields_str} dur={dur}ms @{ts_str}")
+            fields_str = _format_trace_fields(span)
+            detail = f" {fields_str}" if fields_str else ""
+            lines.append(f"{indent}└─ {node}.exit{detail} dur={dur}ms{time_part}")
 
         else:
-            # 旧格式 action=process：单行展示
+            # send/recv/relay_in/relay_out/process 等非成对 span：单行展示真实 action
             indent = "  " * len(stack)
-            dur = span.get("ms", 0)
-            ts_str = _format_ts(span.get("ts", 0))
-            lines.append(f"{indent}├─ {node}.process dur={dur}ms @{ts_str}")
+            fields_str = _format_trace_fields(span)
+            dur = span.get("ms")
+            dur_part = f" dur={dur}ms" if dur is not None else ""
+            detail = f" {fields_str}" if fields_str else ""
+            lines.append(f"{indent}├─ {node}.{action}{detail}{dur_part}{time_part}")
 
     return "\n".join(lines)
 
 
+def _trace_logical_offsets(spans: list) -> list[int]:
+    """为已排序 spans 生成单调逻辑时间。
+
+    服务端时钟可能整体领先或落后 SDK。这里保留服端内部相对间隔，
+    并把服务端片段放进 SDK 总耗时窗口内。
+    """
+    total_ms = None
+    for span in spans:
+        if span.get("node") == "sdk" and span.get("action") == "recv":
+            ms = span.get("ms")
+            if isinstance(ms, (int, float)) and ms >= 0:
+                total_ms = int(ms)
+                break
+
+    server_ts = [
+        int(span.get("ts"))
+        for span in spans
+        if span.get("node") != "sdk" and isinstance(span.get("ts"), (int, float)) and span.get("ts") > 0
+    ]
+    server_min = min(server_ts) if server_ts else None
+    server_max = max(server_ts) if server_ts else None
+    server_dur = (server_max - server_min) if server_min is not None and server_max is not None else 0
+
+    if total_ms is not None and server_min is not None:
+        if server_dur > total_ms and server_dur > 0:
+            server_base = 0
+            server_scale = total_ms / server_dur
+        else:
+            server_base = max(0, total_ms - server_dur)
+            server_scale = 1.0
+    else:
+        server_base = 0
+        server_scale = 1.0
+
+    offsets: list[int] = []
+    last_offset = 0
+    for idx, span in enumerate(spans):
+        node = span.get("node")
+        action = span.get("action")
+        ts = span.get("ts")
+        if node == "sdk" and action == "send":
+            offset = 0
+        elif node == "sdk" and action == "recv" and total_ms is not None:
+            offset = total_ms
+        elif node != "sdk" and server_min is not None and isinstance(ts, (int, float)) and ts > 0:
+            offset = int(round(server_base + (int(ts) - server_min) * server_scale))
+        else:
+            offset = last_offset if idx else 0
+        if offset < last_offset:
+            offset = last_offset
+        offsets.append(offset)
+        last_offset = offset
+    return offsets
+
+
+def _format_trace_offset_part(offset_ms: int) -> str:
+    return f" +{offset_ms}ms"
+
+
+def _format_ts_part(ts_ms: int) -> str:
+    ts = _format_ts(ts_ms)
+    return f" @{ts}" if ts else ""
+
+
 def _format_ts(ts_ms: int) -> str:
     """格式化时间戳为 HH:MM:SS.mmm"""
+    if not isinstance(ts_ms, (int, float)) or ts_ms <= 0:
+        return ""
     import datetime
     dt = datetime.datetime.fromtimestamp(ts_ms / 1000.0)
     return dt.strftime("%H:%M:%S.%f")[:-3]
+
+
+def _trace_display(method: str, status: str, duration_ms: int, trace: dict, spans: list) -> str:
+    tree_str = _format_trace_tree(spans)
+    header = (
+        f"[TRACE][{method}][{status}] total={duration_ms}ms "
+        f"trace_id={trace.get('trace_id', '')}"
+    )
+    return f"{header}\n{tree_str}" if tree_str else header
 
 
 class RPCTransport:
@@ -279,12 +386,14 @@ class RPCTransport:
             method, rpc_id, _summarize_dict(params, _DIAG_PARAM_FIELDS),
         )
         try:
-            payload = json.dumps({
+            request_envelope = {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
                 "method": method,
                 "params": params or {},
-            })
+            }
+            self._log.debug("transport", "RPC request full: %s", _debug_json(request_envelope))
+            payload = json.dumps(request_envelope, ensure_ascii=False, separators=(",", ":"))
             payload_bytes = payload.encode("utf-8")
             if len(payload_bytes) > MAX_WS_PAYLOAD_SIZE:
                 raise ValidationError("payload is too large")
@@ -309,6 +418,7 @@ class RPCTransport:
             raise TimeoutError(f"rpc timeout: {method}", retryable=True) from exc
 
         _elapsed = _diag_time.time() - _t0
+        self._log.debug("transport", "RPC response full: method=%s rpc_id=%s %s", method, rpc_id, _debug_json(response))
         if "error" in response:
             self._log.debug(
                 "transport",
@@ -318,28 +428,29 @@ class RPCTransport:
             if trace_id:
                 self._log.info("transport", "[trace=%s] rpc_recv method=%s rpc_id=%s duration_ms=%d status=error",
                                trace_id, method, rpc_id, int(_elapsed * 1000))
-            if self._trace_observer is not None:
-                resp_trace = response.get("_trace")
-                if isinstance(resp_trace, dict):
-                    try:
-                        sdk_recv_span = {"node": "sdk", "action": "recv", "ms": int(_elapsed * 1000)}
-                        spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
-                        enriched = dict(resp_trace)
-                        enriched["spans"] = spans
+            resp_trace = response.get("_trace")
+            if isinstance(resp_trace, dict):
+                try:
+                    sdk_recv_span = {
+                        "node": "sdk",
+                        "ts": int(_diag_time.time() * 1000),
+                        "action": "recv",
+                        "ms": int(_elapsed * 1000),
+                    }
+                    spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
+                    enriched = dict(resp_trace)
+                    enriched["spans"] = spans
 
-                        # 格式化为树状结构并输出
-                        tree_str = _format_trace_tree(spans)
-                        self._log.info(
-                            "transport",
-                            "[TRACE][%s][error] total=%dms trace_id=%s\n%s",
-                            method, int(_elapsed * 1000),
-                            resp_trace.get("trace_id", ""), tree_str
-                        )
-
+                    self._log.info(
+                        "transport",
+                        "%s",
+                        _trace_display(method, "error", int(_elapsed * 1000), resp_trace, spans),
+                    )
+                    if self._trace_observer is not None:
                         self._trace_observer({"type": "rpc", "method": method, "trace": enriched,
                                               "status": "error", "duration_ms": int(_elapsed * 1000)})
-                    except Exception as exc:
-                        self._log.debug("transport", "trace_observer raised: %s", exc)
+                except Exception as exc:
+                    self._log.debug("transport", "trace handling raised: %s", exc)
             raise map_remote_error(response["error"])
         self._log.debug(
             "transport",
@@ -358,30 +469,31 @@ class RPCTransport:
                     self._meta_observer(meta)
                 except Exception as exc:
                     self._log.debug("transport", "meta_observer raised: %s", exc)
-        # 透传 envelope._trace 给 trace observer（diag 模式回传 spans）
-        if self._trace_observer is not None:
-            resp_trace = response.get("_trace")
-            if isinstance(resp_trace, dict):
-                try:
-                    # 追加 sdk.recv span，记录 SDK 端总耗时
-                    sdk_recv_span = {"node": "sdk", "action": "recv", "ms": int(_elapsed * 1000)}
-                    spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
-                    enriched = dict(resp_trace)
-                    enriched["spans"] = spans
+        # SDK 默认打印 envelope._trace；observer 仅用于程序化收集，不负责默认输出。
+        resp_trace = response.get("_trace")
+        if isinstance(resp_trace, dict):
+            try:
+                # 追加 sdk.recv span，记录 SDK 端总耗时
+                sdk_recv_span = {
+                    "node": "sdk",
+                    "ts": int(_diag_time.time() * 1000),
+                    "action": "recv",
+                    "ms": int(_elapsed * 1000),
+                }
+                spans = list(resp_trace.get("spans") or []) + [sdk_recv_span]
+                enriched = dict(resp_trace)
+                enriched["spans"] = spans
 
-                    # 格式化为树状结构并输出
-                    tree_str = _format_trace_tree(spans)
-                    self._log.info(
-                        "transport",
-                        "[TRACE][%s][ok] total=%dms trace_id=%s\n%s",
-                        method, int(_elapsed * 1000),
-                        resp_trace.get("trace_id", ""), tree_str
-                    )
-
+                self._log.info(
+                    "transport",
+                    "%s",
+                    _trace_display(method, "ok", int(_elapsed * 1000), resp_trace, spans),
+                )
+                if self._trace_observer is not None:
                     self._trace_observer({"type": "rpc", "method": method, "trace": enriched,
                                           "duration_ms": int(_elapsed * 1000)})
-                except Exception as exc:
-                    self._log.debug("transport", "trace_observer raised: %s", exc)
+            except Exception as exc:
+                self._log.debug("transport", "trace handling raised: %s", exc)
         return response.get("result")
 
     async def _recv_initial_message(self) -> dict[str, Any] | None:
@@ -434,6 +546,7 @@ class RPCTransport:
     async def _route_message(self, message: dict[str, Any]) -> None:
         if "id" in message:
             rpc_id = str(message["id"])
+            self._log.debug("transport", "RPC inbound response full: %s", _debug_json(message))
             future = self._pending.pop(rpc_id, None)
             if future is not None and not future.done():
                 future.set_result(message)
@@ -442,7 +555,7 @@ class RPCTransport:
         method = str(message.get("method", ""))
         if method == "challenge":
             self._challenge = message
-            self._log.debug("transport", "challenge received")
+            self._log.debug("transport", "challenge received: %s", _debug_json(message))
             await self._dispatcher.publish("connection.challenge", message.get("params", {}))
             return
 
@@ -450,6 +563,14 @@ class RPCTransport:
             protocol_event = method.removeprefix("event/")
             sdk_event = EVENT_NAME_MAP.get(protocol_event, protocol_event)
             params = message.get("params", {})
+            self._log.debug("transport", "RPC event full: %s", _debug_json(message))
+            if self._meta_observer is not None:
+                meta = message.get("_meta")
+                if isinstance(meta, dict):
+                    try:
+                        self._meta_observer(meta)
+                    except Exception as exc:
+                        self._log.debug("transport", "event meta_observer raised: %s", exc)
             self._log.debug(
                 "transport",
                 "event recv: event=%s %s",
@@ -467,11 +588,18 @@ class RPCTransport:
                     self._log.info("transport", "[trace=%s] event_recv event=%s",
                                    event_trace.get("trace_id", ""), sdk_event)
             if "v2" in sdk_event:
-                self._log.info("transport", "DEBUG: V2 event arrived at transport: %s params_keys=%s", sdk_event, list(params.keys()) if isinstance(params, dict) else "?")
+                self._log.debug("transport", "V2 event arrived at transport: %s params_keys=%s", sdk_event, list(params.keys()) if isinstance(params, dict) else "?")
             asyncio.create_task(self._dispatcher.publish(f"_raw.{sdk_event}", params))
             return
 
-        self._log.debug("transport", "notification recv: method=%s", method or "<no-method>")
+        if self._meta_observer is not None:
+            meta = message.get("_meta")
+            if isinstance(meta, dict):
+                try:
+                    self._meta_observer(meta)
+                except Exception as exc:
+                    self._log.debug("transport", "notification meta_observer raised: %s", exc)
+        self._log.debug("transport", "notification recv: method=%s full=%s", method or "<no-method>", _debug_json(message))
         await self._dispatcher.publish("notification", message)
 
     @staticmethod

@@ -65,10 +65,10 @@ def encrypt_group_message(
     if timestamp is None:
         timestamp = int(time.time() * 1000)
 
-    # 计算 wrap_protocol_set：根据 targets 的 key_source 推断
+    # 计算 wrap_protocol_set：spk_id 非空才允许声明/使用 3DH。
     protocols: set[str] = set()
     for t in targets:
-        if t.get("spk_pk_der") and t.get("key_source") in ("peer_device_prekey", "group_device_prekey"):
+        if _uses_spk_wrap(t):
             protocols.add("3DH")
         else:
             protocols.add("1DH")
@@ -127,6 +127,10 @@ def encrypt_group_message(
 
     cert_fp = "sha256:" + hashlib.sha256(sender["ik_pub_der"]).hexdigest()[:16]
 
+    payload_type = ""
+    if isinstance(payload, dict) and payload.get("type") is not None:
+        payload_type = str(payload.get("type") or "")
+
     envelope = {
         "type": "e2ee.group_encrypted",
         "version": "v2",
@@ -146,22 +150,17 @@ def encrypt_group_message(
         "recipients": recipients_rows,
         "aad": aad,
     }
+    if payload_type:
+        envelope["payload_type"] = payload_type
 
     # protected_headers / context：HMAC 签名（与 V1 对齐），不进 AAD
-    if isinstance(protected_headers, dict) and protected_headers:
-        from .encrypt_p2p import _with_metadata_auth, _normalize_headers, _PROTECTED_HEADERS_DOMAIN
-        headers = _normalize_headers(protected_headers, payload_type=payload.get("type") if isinstance(payload, dict) else None)
-        if headers:
-            envelope["protected_headers"] = _with_metadata_auth(
-                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
-            )
-    elif isinstance(payload, dict) and payload.get("type"):
-        from .encrypt_p2p import _with_metadata_auth, _normalize_headers, _PROTECTED_HEADERS_DOMAIN
-        headers = _normalize_headers({}, payload_type=payload.get("type"))
-        if headers:
-            envelope["protected_headers"] = _with_metadata_auth(
-                headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
-            )
+    from .encrypt_p2p import _with_metadata_auth, _normalize_headers, _PROTECTED_HEADERS_DOMAIN
+    header_input = protected_headers if isinstance(protected_headers, dict) else {}
+    headers = _normalize_headers(header_input, payload_type=payload_type or None)
+    if headers:
+        envelope["protected_headers"] = _with_metadata_auth(
+            headers, key=master_key, domain=_PROTECTED_HEADERS_DOMAIN,
+        )
     if isinstance(context, dict) and context:
         from .encrypt_p2p import _with_metadata_auth, _PROTECTED_CONTEXT_DOMAIN
         ctx_body = {k: v for k, v in context.items() if k != "_auth"}
@@ -188,13 +187,16 @@ def _wrap_for_recipient(
     ik_pk_der = target["ik_pk_der"]
     spk_pk_der = target.get("spk_pk_der")
     spk_id = target.get("spk_id", "")
+    use_3dh = _uses_spk_wrap(target)
+    row_key_source = key_source if use_3dh else "aid_master"
+    row_spk_id = spk_id if use_3dh else ""
 
     fp = "sha256:" + hashlib.sha256(ik_pk_der).hexdigest()[:16]
 
     salt = wrap_salt
     wrap_nonce = os.urandom(12)
 
-    if spk_pk_der and key_source in ("peer_device_prekey", "group_device_prekey"):
+    if use_3dh:
         result = compute_3dh_wrap(
             sender_session_priv=sender_session_priv,
             sender_master_priv=sender_master_priv,
@@ -217,9 +219,16 @@ def _wrap_for_recipient(
         aid,
         device_id,
         role,
-        key_source,
+        row_key_source,
         fp,
-        spk_id,
+        row_spk_id,
         base64.b64encode(wrap_nonce).decode("ascii"),
         base64.b64encode(wrapped_key).decode("ascii"),
     ]
+
+
+def _uses_spk_wrap(target: dict[str, Any]) -> bool:
+    return bool(target.get("spk_id")) and bool(target.get("spk_pk_der")) and target.get("key_source") in (
+        "peer_device_prekey",
+        "group_device_prekey",
+    )

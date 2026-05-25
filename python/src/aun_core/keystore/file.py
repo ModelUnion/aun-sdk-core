@@ -573,6 +573,28 @@ class FileKeyStore(KeyStore):
             self._get_db(aid).save_instance_state(device_id, slot_id, updated)
             return copy.deepcopy(updated)
 
+    # ── agent.md Cache ───────────────────────────────────────
+
+    def load_agent_md_cache(self, owner_aid: str, target_aid: str) -> dict[str, Any] | None:
+        owner = str(owner_aid or "").strip()
+        target = str(target_aid or "").strip()
+        if not owner or not target:
+            return None
+        lock = self._get_metadata_lock(owner)
+        with lock:
+            record = self._get_db(owner).load_agent_md_cache(target)
+            return copy.deepcopy(record) if record is not None else None
+
+    def upsert_agent_md_cache(self, owner_aid: str, target_aid: str, **fields: Any) -> dict[str, Any]:
+        owner = str(owner_aid or "").strip()
+        target = str(target_aid or "").strip()
+        if not owner or not target:
+            return {}
+        lock = self._get_metadata_lock(owner)
+        with lock:
+            record = self._get_db(owner).upsert_agent_md_cache(target, **fields)
+            return copy.deepcopy(record)
+
     # ── Seq Tracker ───────────────────────────────────────────
 
     def save_seq(self, aid: str, device_id: str, slot_id: str, namespace: str, contiguous_seq: int) -> None:

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import {
@@ -15,7 +15,17 @@ function b64(s: string): Uint8Array {
   return out;
 }
 
+function b64url(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 const GOLDEN_DIR = join(__dirname, 'golden', 'ecdh');
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('ECDH P-256 - golden vectors', () => {
   const files = readdirSync(GOLDEN_DIR).filter((f) => f.endsWith('.json'));
@@ -75,5 +85,29 @@ describe('ECDH P-256 - symmetry & keypair', () => {
     const recomputed = await privateToPublicDer(priv);
     // SPKI 编码确定，应该字节级一致
     expect(Array.from(recomputed)).toEqual(Array.from(pub));
+  });
+
+  it('generateP256Keypair pads short JWK d to 32 bytes', async () => {
+    const privateKey = { kind: 'private' };
+    const publicKey = { kind: 'public' };
+    const shortD = new Uint8Array([1]);
+    const pubDer = new Uint8Array([0x30, 0x03, 0x02, 0x01, 0x01]);
+
+    vi.spyOn(crypto.subtle, 'generateKey').mockImplementation(async () => ({
+      privateKey,
+      publicKey,
+    }) as unknown as CryptoKeyPair);
+    vi.spyOn(crypto.subtle, 'exportKey').mockImplementation(async (_format, key) => {
+      if (key === privateKey) {
+        return { kty: 'EC', crv: 'P-256', d: b64url(shortD) } as JsonWebKey;
+      }
+      return pubDer.buffer.slice(0);
+    });
+
+    const [priv, pub] = await generateP256Keypair();
+    expect(priv.length).toBe(32);
+    expect(Array.from(priv.slice(0, 31))).toEqual(Array(31).fill(0));
+    expect(priv[31]).toBe(1);
+    expect(Array.from(pub)).toEqual(Array.from(pubDer));
   });
 });

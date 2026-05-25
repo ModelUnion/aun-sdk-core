@@ -26,6 +26,45 @@ type KeyStore interface {
 	ListIdentities() ([]string, error)
 }
 
+// AgentMDCacheRecord 是单个 owner AID 本地缓存的某个 target AID 的 agent.md 状态。
+// local_etag 是本地 content 的内容 ETag，remote_etag 是云端 HEAD/RPC/envelope 观察到的 ETag。
+type AgentMDCacheRecord struct {
+	AID          string `json:"aid"`
+	Content      string `json:"content"`
+	LocalEtag    string `json:"local_etag"`
+	RemoteEtag   string `json:"remote_etag"`
+	LastModified string `json:"last_modified"`
+	FetchedAt    int64  `json:"fetched_at"`
+	ObservedAt   int64  `json:"observed_at"`
+	CheckedAt    int64  `json:"checked_at"`
+	RemoteStatus string `json:"remote_status"`
+	VerifyStatus string `json:"verify_status"`
+	VerifyError  string `json:"verify_error"`
+	LastError    string `json:"last_error"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+// AgentMDCacheUpsert 表示 agent.md 缓存的局部更新；nil 字段保持原值，非 nil 字段可写入空串。
+type AgentMDCacheUpsert struct {
+	Content      *string
+	LocalEtag    *string
+	RemoteEtag   *string
+	LastModified *string
+	FetchedAt    *int64
+	ObservedAt   *int64
+	CheckedAt    *int64
+	RemoteStatus *string
+	VerifyStatus *string
+	VerifyError  *string
+	LastError    *string
+}
+
+// AgentMDCacheStore 提供按 owner AID 隔离的 agent.md 缓存持久化能力。
+type AgentMDCacheStore interface {
+	LoadAgentMDCache(ownerAid, targetAid string) (*AgentMDCacheRecord, error)
+	UpsertAgentMDCache(ownerAid, targetAid string, fields AgentMDCacheUpsert) (*AgentMDCacheRecord, error)
+}
+
 // GroupState represents the current state_hash state for a group.
 type GroupState struct {
 	GroupID        string `json:"group_id"`

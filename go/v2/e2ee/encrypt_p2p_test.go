@@ -3,6 +3,7 @@ package e2ee
 import (
 	"encoding/base64"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/modelunion/aun-sdk-core/go/v2/crypto"
@@ -133,6 +134,80 @@ func TestEncryptP2PRoundtrip1DH(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decrypted, payload) {
 		t.Fatalf("payload 不一致\n期望: %v\n实际: %v", payload, decrypted)
+	}
+}
+
+func TestEncryptP2PSPKPublicKeyWithoutIDUses1DH(t *testing.T) {
+	sender := makeTestSender(t)
+	target, ikPriv, _ := makeTestRecipient(t, "peer", "peer_device_prekey", true)
+	target.SPKID = ""
+	targetSet := TargetSet{Targets: []Target{target}}
+
+	payload := map[string]any{"text": "SPK pub without SPK ID must use IK"}
+	envelope, err := EncryptP2PMessage(sender, targetSet, payload, EncryptOptions{})
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	if got := envelope["aad"].(map[string]any)["wrap_protocol"]; got != "1DH" {
+		t.Fatalf("wrap_protocol 应为 1DH，实际: %v", got)
+	}
+	rows, err := convertRecipientsToStringMatrix(envelope["recipients"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0][3] != "aid_master" || rows[0][5] != "" {
+		t.Fatalf("1DH row 应写 aid_master/空 spk_id，实际: %v", rows[0])
+	}
+	decrypted, err := DecryptMessage(envelope, target.AID, target.DeviceID, ikPriv, nil, sender.IKPubDER)
+	if err != nil {
+		t.Fatalf("1DH 解密失败: %v", err)
+	}
+	if !reflect.DeepEqual(decrypted, payload) {
+		t.Fatalf("payload 不一致\n期望: %v\n实际: %v", payload, decrypted)
+	}
+}
+
+func TestEncryptP2PPayloadTypeTopLevel(t *testing.T) {
+	sender := makeTestSender(t)
+	target, ikPriv, _ := makeTestRecipient(t, "peer", "aid_master", false)
+	payload := map[string]any{"type": "text", "text": "visible type"}
+
+	envelope, err := EncryptP2PMessage(sender, TargetSet{Targets: []Target{target}}, payload, EncryptOptions{})
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	if got := envelope["payload_type"]; got != "text" {
+		t.Fatalf("payload_type 应在信封顶层透传，实际: %#v", got)
+	}
+	headers, ok := envelope["protected_headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("protected_headers 应存在，实际: %#v", envelope["protected_headers"])
+	}
+	if got := headers["payload_type"]; got != "text" {
+		t.Fatalf("protected_headers.payload_type 应保留兼容校验，实际: %#v", got)
+	}
+	if headers["sdk_lang"] != e2eeSDKLang || headers["sdk_vesion"] != e2eeSDKVersion {
+		t.Fatalf("protected_headers SDK 元信息错误: %#v", headers)
+	}
+	decrypted, err := DecryptMessage(envelope, target.AID, target.DeviceID, ikPriv, nil, sender.IKPubDER)
+	if err != nil {
+		t.Fatalf("解密失败: %v", err)
+	}
+	if !reflect.DeepEqual(decrypted, payload) {
+		t.Fatalf("payload 不一致\n期望: %v\n实际: %v", payload, decrypted)
+	}
+}
+
+func TestDecryptP2P3DHMissingSPKReportsPreciseError(t *testing.T) {
+	sender := makeTestSender(t)
+	target, ikPriv, _ := makeTestRecipient(t, "peer", "peer_device_prekey", true)
+	envelope, err := EncryptP2PMessage(sender, TargetSet{Targets: []Target{target}}, map[string]any{"text": "missing"}, EncryptOptions{})
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+	_, err = DecryptMessage(envelope, target.AID, target.DeviceID, ikPriv, nil, sender.IKPubDER)
+	if err == nil || !strings.Contains(err.Error(), "spk_missing: spk_id=sha256:bob_spk_1") {
+		t.Fatalf("missing SPK 应报 spk_missing，实际: %v", err)
 	}
 }
 

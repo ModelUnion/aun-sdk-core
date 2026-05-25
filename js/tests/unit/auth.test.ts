@@ -1,7 +1,7 @@
 // ── auth 模块单元测试（桩测试）──────────────────────────────
 // AuthFlow 的完整测试需要 Gateway 环境（WebSocket + PKI），
 // 此处仅测试可独立验证的工具方法和构造逻辑。
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { AuthFlow } from '../../src/auth.js';
 import { CryptoProvider } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
@@ -101,6 +101,61 @@ describe('AuthFlow.loadIdentityOrNone', () => {
   });
 });
 
+describe('AuthFlow 空 device_id 实例态', () => {
+  it('空 device_id 应从 instance_state 加载实例级 token', async () => {
+    const keystore = {
+      loadInstanceState: vi.fn().mockResolvedValue({ access_token: 'tok-empty-device' }),
+      saveIdentity: vi.fn(),
+    };
+    const auth = new AuthFlow({
+      keystore: keystore as any,
+      crypto: {} as any,
+      deviceId: '',
+      verifySsl: false,
+    });
+
+    const state = await (auth as any)._loadInstanceState('alice.agentid.pub');
+
+    expect(keystore.loadInstanceState).toHaveBeenCalledWith('alice.agentid.pub', '', '');
+    expect(state.access_token).toBe('tok-empty-device');
+  });
+
+  it('空 device_id 应写入 instance_state 而不是留在共享身份元数据', async () => {
+    const updatedStates: Record<string, unknown>[] = [];
+    const keystore = {
+      saveIdentity: vi.fn().mockResolvedValue(undefined),
+      updateInstanceState: vi.fn(async (_aid: string, _deviceId: string, _slotId: string, updater: (state: Record<string, unknown>) => Record<string, unknown> | void) => {
+        const current: Record<string, unknown> = {};
+        updater(current);
+        updatedStates.push({ ...current });
+        return current;
+      }),
+    };
+    const auth = new AuthFlow({
+      keystore: keystore as any,
+      crypto: {} as any,
+      deviceId: '',
+      verifySsl: false,
+    });
+
+    await (auth as any)._persistIdentity({
+      aid: 'alice.agentid.pub',
+      private_key_pem: 'PRIVATE',
+      access_token: 'tok-empty-device',
+      refresh_token: 'ref-empty-device',
+    });
+
+    expect(keystore.saveIdentity).toHaveBeenCalledWith('alice.agentid.pub', expect.not.objectContaining({
+      access_token: expect.anything(),
+      refresh_token: expect.anything(),
+    }));
+    expect(keystore.updateInstanceState).toHaveBeenCalledWith('alice.agentid.pub', '', '', expect.any(Function));
+    expect(updatedStates[0]).toMatchObject({
+      access_token: 'tok-empty-device',
+      refresh_token: 'ref-empty-device',
+    });
+  });
+});
 describe('AuthFlow.getAccessTokenExpiry', () => {
   it('有 access_token_expires_at 时应返回时间戳', () => {
     const ks = createMockKeyStore();

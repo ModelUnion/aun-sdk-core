@@ -16,6 +16,10 @@ function b64ToUint8Array(b64: string): Uint8Array {
   return bytes;
 }
 
+function canonicalText(value: unknown): string {
+  return new TextDecoder().decode(canonicalJson(value));
+}
+
 const GOLDEN_DIR = join(__dirname, 'golden', 'canonical');
 
 describe('canonicalJson - golden vectors', () => {
@@ -58,4 +62,24 @@ describe('canonicalJson - golden vectors', () => {
       }
     });
   }
+});
+
+describe('canonicalJson - number normalization', () => {
+  it('整数值 float 与整数输出一致', () => {
+    expect(canonicalText(1.0)).toBe('1');
+  });
+
+  it('小数科学计数法展开为十进制', () => {
+    expect(canonicalText(1e-7)).toBe('0.0000001');
+  });
+
+  it('超出 JS 安全整数范围直接拒绝', () => {
+    expect(() => canonicalJson(9007199254740992)).toThrow(/outside safe range/);
+  });
+});
+
+describe('canonicalJson - key ordering', () => {
+  it('非 BMP 字符按 Unicode code point 排序，避免 JS UTF-16 默认排序分歧', () => {
+    expect(canonicalText({ '\u{10000}': 1, '\uE000': 2 })).toBe('{"\uE000":2,"𐀀":1}');
+  });
 });

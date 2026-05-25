@@ -51,10 +51,7 @@ export function encryptGroupMessage(
   // wrap_protocol_str
   const protocolSet = new Set<string>();
   for (const t of targets) {
-    const has3DH =
-      !!t.spkPkDer &&
-      (t.keySource === 'peer_device_prekey' || t.keySource === 'group_device_prekey');
-    protocolSet.add(has3DH ? '3DH' : '1DH');
+    protocolSet.add(usesSPKWrap(t) ? '3DH' : '1DH');
   }
   const wrapProtocolStr =
     protocolSet.size === 0 ? '1DH' : [...protocolSet].sort().join('+');
@@ -129,6 +126,10 @@ export function encryptGroupMessage(
     recipients: sortedRows,
     aad,
   };
+  const payloadType = payload?.type == null ? '' : String(payload.type);
+  if (payloadType) {
+    envelope.payload_type = payloadType;
+  }
 
   // protected_headers / context：HMAC 签名，不进 AAD。
   // payload_type 自动注入 + value 转 string（与 Python _normalize_headers 对齐）
@@ -163,12 +164,12 @@ function wrapForRecipient(
   const fp = `sha256:${fpHash.substring(0, 16)}`;
 
   const wrapNonce = new Uint8Array(randomBytes(12));
+  const use3DH = usesSPKWrap(target);
+  const rowKeySource = use3DH ? target.keySource : 'aid_master';
+  const rowSpkId = use3DH ? (target.spkId ?? '') : '';
 
   let wrapKey: Uint8Array;
-  if (
-    target.spkPkDer &&
-    (target.keySource === 'peer_device_prekey' || target.keySource === 'group_device_prekey')
-  ) {
+  if (use3DH) {
     wrapKey = compute3DHWrap(
       senderSessionPriv,
       senderMasterPriv,
@@ -192,10 +193,24 @@ function wrapForRecipient(
     target.aid,
     target.deviceId,
     target.role,
-    target.keySource,
+    rowKeySource,
     fp,
-    target.spkId ?? '',
+    rowSpkId,
     Buffer.from(wrapNonce).toString('base64'),
     wrappedKey.toString('base64'),
   ];
+}
+
+function usesSPKWrap(
+  target: Target,
+): target is Target & {
+  spkId: string;
+  spkPkDer: Uint8Array;
+  keySource: 'peer_device_prekey' | 'group_device_prekey';
+} {
+  return Boolean(
+    target.spkId &&
+      target.spkPkDer &&
+      (target.keySource === 'peer_device_prekey' || target.keySource === 'group_device_prekey'),
+  );
 }

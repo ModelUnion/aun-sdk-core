@@ -58,8 +58,8 @@ func (c *AUNClient) sendV2Internal(ctx context.Context, params map[string]any) (
 }
 
 // pullV2Internal 适配 client.Call("message.pull", params) → PullV2，并按
-// {"messages": [...]} 形态返回，与 V1 message.pull 返回结构对齐（少了 server_ack_seq，
-// 因为 V2 内部已经基于 SeqTracker 维护了 contiguous_seq）。
+// {"messages": [...]} 形态返回。PullV2 内部会消费服务端 server_ack_seq，
+// 即使空 pull 也会推进 SeqTracker 的 contiguous_seq。
 func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (any, error) {
 	afterSeq := toInt64(params["after_seq"])
 	limit := int(toInt64(params["limit"]))
@@ -105,12 +105,14 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	if ns != "" {
 		contig := c.seqTracker.GetContiguousSeq(ns)
 		if contig > 0 && contig != contigBefore {
+			ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", ns, int64(contig))
 			ackParams := map[string]any{
-				"up_to_seq": contig,
+				"up_to_seq": ackSeq,
 			}
 			go func() {
 				ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
+				c.signClientOperation("message.v2.ack", ackParams)
 				if _, ackErr := c.transport.Call(ackCtx, "message.v2.ack", ackParams); ackErr != nil {
 					c.log.Debug("V2 P2P auto-ack failed: %v", ackErr)
 				}
@@ -196,13 +198,15 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	}
 	contig := c.seqTracker.GetContiguousSeq(ns)
 	if contig > 0 && contig != contigBefore {
+		ackSeq := c.clampAckSeq("group.v2.ack", "up_to_seq", ns, int64(contig))
 		ackParams := map[string]any{
 			"group_id":  groupID,
-			"up_to_seq": contig,
+			"up_to_seq": ackSeq,
 		}
 		go func() {
 			ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			c.signClientOperation("group.v2.ack", ackParams)
 			if _, ackErr := c.transport.Call(ackCtx, "group.v2.ack", ackParams); ackErr != nil {
 				c.logEG.Debug("V2 group auto-ack failed: group=%s %v", groupID, ackErr)
 			}

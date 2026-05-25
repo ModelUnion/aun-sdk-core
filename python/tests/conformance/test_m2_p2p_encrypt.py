@@ -11,6 +11,8 @@ AUN E2EE V2 M2: P2P 加密引擎集成测试
 """
 import pytest
 
+from aun_core import __version__ as AUN_SDK_VERSION
+
 # ── 从 V2 实现导入 ──
 from aun_core.v2.e2ee.encrypt_p2p import encrypt_p2p_message
 from aun_core.v2.e2ee.decrypt import decrypt_message
@@ -207,6 +209,33 @@ class TestEncryptP2P:
         assert len(envelope["sender_session_pk"]) > 0
 
 
+
+    def test_payload_type_is_copied_to_top_level_envelope(self):
+        """原始 payload.type 必须复制到信封顶层 payload_type。"""
+        target_set = make_target_set_single_device()
+        envelope = encrypt_p2p_message(
+            sender=SENDER_IDENTITY,
+            target_set=target_set,
+            payload={"type": "text", "text": "visible type"},
+        )
+
+        assert envelope["payload_type"] == "text"
+        assert envelope["protected_headers"]["payload_type"] == "text"
+        assert envelope["protected_headers"]["sdk_lang"] == "python"
+        assert envelope["protected_headers"]["sdk_vesion"] == AUN_SDK_VERSION
+
+    def test_sdk_metadata_is_injected_without_payload_type(self):
+        """即使原始 payload 没有 type，protected_headers 也应携带 SDK 元信息。"""
+        target_set = make_target_set_single_device()
+        envelope = encrypt_p2p_message(
+            sender=SENDER_IDENTITY,
+            target_set=target_set,
+            payload={"text": "no visible type"},
+        )
+
+        assert "payload_type" not in envelope
+        assert envelope["protected_headers"]["sdk_lang"] == "python"
+        assert envelope["protected_headers"]["sdk_vesion"] == AUN_SDK_VERSION
 # ══════════════════════════════════════════════════════════════
 # 2. 完整 envelope 解密
 # ══════════════════════════════════════════════════════════════
@@ -290,6 +319,49 @@ class TestDecryptP2P:
 
         target = target_set["targets"][0]
         with pytest.raises(Exception):
+            decrypt_message(
+                envelope=envelope,
+                self_aid="bob.agentid.pub",
+                self_device_id="dev-b1",
+                self_ik_priv=target["ik_priv"],
+                self_spk_priv=target["spk_priv"],
+                sender_pub_der=ALICE_PUB_DER,
+            )
+
+    def test_protected_headers_use_canonical_cross_language_values(self):
+        target_set = make_target_set_single_device()
+        envelope = encrypt_p2p_message(
+            sender=SENDER_IDENTITY,
+            target_set=target_set,
+            payload={"type": "text", "text": "metadata"},
+            protected_headers={
+                " Device_ID ": "dev-b1",
+                "flag": True,
+                "ratio": 1.0,
+                "empty": None,
+                "nested": {"b": 2, "a": 1},
+            },
+        )
+        headers = envelope["protected_headers"]
+        assert headers["device_id"] == "dev-b1"
+        assert headers["flag"] == "true"
+        assert headers["ratio"] == "1"
+        assert headers["empty"] == ""
+        assert headers["nested"] == '{"a":1,"b":2}'
+        assert headers["sdk_lang"] == "python"
+        assert headers["sdk_vesion"] == AUN_SDK_VERSION
+
+    def test_tampered_protected_headers_fails_auth(self):
+        target_set = make_target_set_single_device()
+        envelope = encrypt_p2p_message(
+            sender=SENDER_IDENTITY,
+            target_set=target_set,
+            payload={"type": "text", "text": "metadata"},
+            protected_headers={"trace_id": "trace-1"},
+        )
+        envelope["protected_headers"]["trace_id"] = "trace-2"
+        target = target_set["targets"][0]
+        with pytest.raises(ValueError, match="protected_headers _auth verification failed"):
             decrypt_message(
                 envelope=envelope,
                 self_aid="bob.agentid.pub",

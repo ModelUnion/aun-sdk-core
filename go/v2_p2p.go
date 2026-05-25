@@ -55,6 +55,14 @@ type v2P2PState struct {
 	groupBootstrapCache map[string]*v2GroupBootstrapEntry
 }
 
+type v2SenderIKPendingEntry struct {
+	Msg            map[string]any
+	FromAID        string
+	SenderDeviceID string
+	GroupID        string
+	CreatedAt      time.Time
+}
+
 // V2SQLiteStore 持有底层 *sql.DB + V2KeyStore，便于 client 关闭时释放资源。
 type V2SQLiteStore struct {
 	db    *sql.DB
@@ -224,6 +232,13 @@ func v2AsString(v any) string {
 	return ""
 }
 
+func valueOrDefault(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
 func v2DefaultStr(s, d string) string {
 	if s == "" {
 		return d
@@ -345,6 +360,210 @@ func v2DecodeBase64Field(m map[string]any, key string) []byte {
 	return out
 }
 
+func (c *AUNClient) getV2SenderPubDER(ctx context.Context, state *v2P2PState, fromAID, senderDeviceID string) []byte {
+	if state == nil || state.session == nil || strings.TrimSpace(fromAID) == "" {
+		return nil
+	}
+	if senderPubDER := state.session.GetPeerIK(fromAID, senderDeviceID); len(senderPubDER) > 0 {
+		return senderPubDER
+	}
+
+	fetchCtx := ctx
+	cancel := func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		fetchCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	} else {
+		var cctx context.Context
+		cctx, cancel = context.WithTimeout(ctx, 3*time.Second)
+		fetchCtx = cctx
+	}
+	defer cancel()
+
+	certBytes, certErr := c.fetchPeerCert(fetchCtx, fromAID, "")
+	if certErr != nil {
+		c.logE2.Warn("V2 decrypt: PKI cert sender IK fallback failed for %s: %v", fromAID, certErr)
+		return nil
+	}
+	block, _ := pem.Decode(certBytes)
+	if block == nil {
+		c.logE2.Warn("V2 decrypt: PKI cert sender IK fallback failed for %s: invalid PEM", fromAID)
+		return nil
+	}
+	cert, parseErr := x509.ParseCertificate(block.Bytes)
+	if parseErr != nil {
+		c.logE2.Warn("V2 decrypt: PKI cert sender IK fallback failed for %s: %v", fromAID, parseErr)
+		return nil
+	}
+	der, marshalErr := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if marshalErr != nil {
+		c.logE2.Warn("V2 decrypt: PKI cert sender IK fallback failed for %s: %v", fromAID, marshalErr)
+		return nil
+	}
+	state.session.CachePeerIK(fromAID, senderDeviceID, der)
+	c.logE2.Debug("V2 decrypt: sender IK fallback from PKI cert for %s", fromAID)
+	return der
+}
+
+func (c *AUNClient) cacheV2PeerIKFromDevice(state *v2P2PState, dev map[string]any, fallbackAID string) {
+	if state == nil || state.session == nil || dev == nil {
+		return
+	}
+	devID, hasDeviceID := v2DeviceIDFromDevice(dev)
+	aid := strings.TrimSpace(v2AsString(dev["aid"]))
+	if aid == "" {
+		aid = strings.TrimSpace(fallbackAID)
+	}
+	ikDER := v2DecodeBase64Field(dev, "ik_pk")
+	if !hasDeviceID || aid == "" || len(ikDER) == 0 {
+		return
+	}
+	state.session.CachePeerIK(aid, devID, ikDER)
+}
+
+func (c *AUNClient) v2PendingSenderIKMessageKey(msg map[string]any, groupID string) string {
+	messageID := strings.TrimSpace(v2AsString(msg["message_id"]))
+	seqText := strings.TrimSpace(fmt.Sprint(msg["seq"]))
+	prefix := "p2p:" + c.AID()
+	if strings.TrimSpace(groupID) != "" {
+		prefix = "group:" + groupID
+	}
+	if messageID != "" {
+		return prefix + ":" + messageID
+	}
+	if seqText != "" && seqText != "<nil>" {
+		return prefix + ":" + seqText
+	}
+	return fmt.Sprintf("%s:pending:%d", prefix, time.Now().UnixNano())
+}
+
+func v2PendingSenderIKFetchKey(fromAID, senderDeviceID, groupID string) string {
+	return strings.TrimSpace(fromAID) + "#" + senderDeviceID + "#" + strings.TrimSpace(groupID)
+}
+
+func (c *AUNClient) scheduleV2SenderIKPending(msg map[string]any, fromAID, senderDeviceID, groupID string) {
+	fromAID = strings.TrimSpace(fromAID)
+	if fromAID == "" {
+		return
+	}
+	groupID = strings.TrimSpace(groupID)
+	messageKey := c.v2PendingSenderIKMessageKey(msg, groupID)
+	fetchKey := v2PendingSenderIKFetchKey(fromAID, senderDeviceID, groupID)
+	shouldFetch := false
+	c.v2SenderIKMu.Lock()
+	c.v2SenderIKPending[messageKey] = v2SenderIKPendingEntry{
+		Msg:            copyMapShallow(msg),
+		FromAID:        fromAID,
+		SenderDeviceID: senderDeviceID,
+		GroupID:        groupID,
+		CreatedAt:      time.Now(),
+	}
+	if !c.v2SenderIKFetching[fetchKey] {
+		c.v2SenderIKFetching[fetchKey] = true
+		shouldFetch = true
+	}
+	pendingCount := len(c.v2SenderIKPending)
+	c.v2SenderIKMu.Unlock()
+	c.logE2.Debug("V2 decrypt pending sender IK: key=%s from=%s device=%s group=%s pending=%d",
+		messageKey, fromAID, valueOrDefault(senderDeviceID, "-"), valueOrDefault(groupID, "<p2p>"), pendingCount)
+	if shouldFetch {
+		go c.resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey)
+	}
+}
+
+func (c *AUNClient) scheduleV2SenderIKFetch(fromAID, senderDeviceID, groupID string) {
+	fromAID = strings.TrimSpace(fromAID)
+	if fromAID == "" {
+		return
+	}
+	groupID = strings.TrimSpace(groupID)
+	fetchKey := v2PendingSenderIKFetchKey(fromAID, senderDeviceID, groupID)
+	c.v2SenderIKMu.Lock()
+	if c.v2SenderIKFetching[fetchKey] {
+		c.v2SenderIKMu.Unlock()
+		return
+	}
+	c.v2SenderIKFetching[fetchKey] = true
+	c.v2SenderIKMu.Unlock()
+	go c.resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey)
+}
+
+func (c *AUNClient) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, fetchKey string) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.logE2.Warn("V2 sender IK pending resolver panic: from=%s device=%s group=%s panic=%v", fromAID, senderDeviceID, groupID, r)
+		}
+		c.v2SenderIKMu.Lock()
+		delete(c.v2SenderIKFetching, fetchKey)
+		c.v2SenderIKMu.Unlock()
+	}()
+
+	state := c.v2GetState()
+	if state == nil || state.session == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if raw, err := c.Call(ctx, "message.v2.bootstrap", map[string]any{"peer_aid": fromAID}); err == nil {
+		if bs, _ := raw.(map[string]any); bs != nil {
+			for _, dev := range v2ToMapList(bs["peer_devices"]) {
+				c.cacheV2PeerIKFromDevice(state, dev, fromAID)
+			}
+		}
+	} else {
+		c.logE2.Warn("V2 sender IK pending bootstrap failed peer=%s: %v", fromAID, err)
+	}
+	if strings.TrimSpace(groupID) != "" {
+		if raw, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{"group_id": groupID}); err == nil {
+			if bs, _ := raw.(map[string]any); bs != nil {
+				for _, dev := range v2ToMapList(bs["devices"]) {
+					c.cacheV2PeerIKFromDevice(state, dev, "")
+				}
+				for _, dev := range v2ToMapList(bs["audit_recipients"]) {
+					c.cacheV2PeerIKFromDevice(state, dev, "")
+				}
+			}
+		} else {
+			c.logE2.Warn("V2 sender IK pending group bootstrap failed group=%s: %v", groupID, err)
+		}
+	}
+	if len(state.session.GetPeerIK(fromAID, senderDeviceID)) == 0 {
+		shortCtx, shortCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = c.getV2SenderPubDER(shortCtx, state, fromAID, senderDeviceID)
+		shortCancel()
+	}
+
+	c.v2SenderIKMu.Lock()
+	pendingItems := make(map[string]v2SenderIKPendingEntry)
+	for key, entry := range c.v2SenderIKPending {
+		if entry.FromAID == fromAID && entry.SenderDeviceID == senderDeviceID && entry.GroupID == groupID {
+			pendingItems[key] = entry
+		}
+	}
+	c.v2SenderIKMu.Unlock()
+
+	for key, entry := range pendingItems {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		plaintext := c.decryptV2MessageWithPending(retryCtx, state, entry.Msg, false)
+		retryCancel()
+		c.v2SenderIKMu.Lock()
+		delete(c.v2SenderIKPending, key)
+		c.v2SenderIKMu.Unlock()
+		if plaintext == nil {
+			c.logE2.Debug("V2 sender IK pending retry failed: key=%s", key)
+			continue
+		}
+		seq := int(toInt64(entry.Msg["seq"]))
+		if entry.GroupID != "" {
+			plaintext["group_id"] = entry.GroupID
+			c.publishPulledMessage("group.message_created", "group:"+entry.GroupID, seq, plaintext)
+		} else {
+			c.publishPulledMessage("message.received", "p2p:"+c.AID(), seq, plaintext)
+		}
+		c.logE2.Debug("V2 sender IK pending retry delivered: key=%s", key)
+	}
+}
+
 // SendV2 V2 P2P 推测性加密发送。
 //
 //   - 优先使用 bootstrap 缓存（TTL = v2BootstrapTTL）。
@@ -363,6 +582,10 @@ func (c *AUNClient) SendV2WithOpts(ctx context.Context, to string, payload map[s
 	if to == "" {
 		return nil, errors.New("send_v2: to 不能为空")
 	}
+	c.logMessageDebugWithPayload("send-plaintext", "message.send.v2", "message.send", map[string]any{
+		"to":      to,
+		"payload": payload,
+	}, payload, nil)
 
 	resp, err := c.v2SendOnce(ctx, state, to, payload, true, opts)
 	if err == nil {
@@ -380,6 +603,7 @@ func (c *AUNClient) SendV2WithOpts(ctx context.Context, to string, payload map[s
 }
 
 func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
+	c.logE2.Debug("message.v2.send attempt: to=%s use_cache=%v", to, useCache)
 	peerDevices, auditRaw, err := c.v2ResolveBootstrap(ctx, state, to, useCache)
 	if err != nil {
 		return nil, err
@@ -390,40 +614,25 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 
 	targets := make([]e2ee.Target, 0, len(peerDevices))
 	for _, dev := range peerDevices {
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
-		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
 		devID := v2AsString(dev["device_id"])
-		state.session.CachePeerIK(to, devID, ikDER)
-		targets = append(targets, e2ee.Target{
-			AID:       to,
-			DeviceID:  devID,
-			Role:      "peer",
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, to, devID, "peer", "peer_device_prekey")
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			targets = append(targets, target)
+		}
 	}
 
 	auditTargets := make([]e2ee.Target, 0, len(auditRaw))
 	for _, dev := range auditRaw {
-		ikDER := v2DecodeBase64Field(dev, "ik_pk")
-		if len(ikDER) == 0 {
-			continue
+		target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, v2AsString(dev["aid"]), v2AsString(dev["device_id"]), "audit", "peer_device_prekey")
+		if err != nil {
+			return nil, err
 		}
-		spkDER := v2DecodeBase64Field(dev, "spk_pk")
-		auditTargets = append(auditTargets, e2ee.Target{
-			AID:       v2AsString(dev["aid"]),
-			DeviceID:  v2AsString(dev["device_id"]),
-			Role:      "audit",
-			KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-			IKPkDER:   ikDER,
-			SPKPkDER:  spkDER,
-			SPKID:     v2AsString(dev["spk_id"]),
-		})
+		if ok {
+			auditTargets = append(auditTargets, target)
+		}
 	}
 
 	// self-sync：同 AID 其它设备
@@ -434,27 +643,17 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 	if myAID != "" && myAID != to {
 		selfDevices := c.v2FetchSelfDevices(ctx, state, myAID)
 		for _, dev := range selfDevices {
-			devID := v2AsString(dev["owner_device_id"])
-			if devID == "" {
-				devID = v2AsString(dev["device_id"])
-			}
-			if devID == "" || devID == myDeviceID {
+			devID, hasDeviceID := v2DeviceIDFromDevice(dev)
+			if !hasDeviceID || devID == myDeviceID {
 				continue
 			}
-			ikDER := v2DecodeBase64Field(dev, "ik_pk")
-			if len(ikDER) == 0 {
-				continue
+			target, ok, err := c.v2BuildTargetFromDevice(ctx, state, dev, myAID, devID, "self_sync", "peer_device_prekey")
+			if err != nil {
+				return nil, err
 			}
-			spkDER := v2DecodeBase64Field(dev, "spk_pk")
-			targets = append(targets, e2ee.Target{
-				AID:       myAID,
-				DeviceID:  devID,
-				Role:      "self_sync",
-				KeySource: v2DefaultStr(v2AsString(dev["key_source"]), "peer_device_prekey"),
-				IKPkDER:   ikDER,
-				SPKPkDER:  spkDER,
-				SPKID:     v2AsString(dev["spk_id"]),
-			})
+			if ok {
+				targets = append(targets, target)
+			}
 		}
 	}
 
@@ -477,6 +676,17 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 	if err != nil {
 		return nil, fmt.Errorf("send_v2: 加密失败: %w", err)
 	}
+	c.logMessageDebugWithPayload("send-envelope", "message.send.v2", "message.send", map[string]any{
+		"to":         to,
+		"message_id": envelope["message_id"],
+		"type":       envelope["type"],
+		"version":    envelope["version"],
+	}, envelope, map[string]any{
+		"plaintext_payload": payload,
+		"target_count":      len(targets),
+		"audit_count":       len(auditTargets),
+		"use_cache":         useCache,
+	})
 
 	raw, err := c.Call(ctx, "message.send", map[string]any{
 		"to":      to,
@@ -487,8 +697,10 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 		return nil, err
 	}
 	if m, ok := raw.(map[string]any); ok {
+		c.logE2.Debug("message.v2.send ok: to=%s use_cache=%v seq=%d", to, useCache, toInt64(m["seq"]))
 		return m, nil
 	}
+	c.logE2.Debug("message.v2.send ok: to=%s use_cache=%v seq=<unknown>", to, useCache)
 	return map[string]any{}, nil
 }
 
@@ -499,6 +711,7 @@ func (c *AUNClient) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, p
 		entry, ok := state.bootstrapCache[peerAID]
 		state.bootstrapCacheM.Unlock()
 		if ok && time.Since(entry.CachedAt) < v2BootstrapTTL {
+			c.logE2.Debug("message.v2.bootstrap cache hit: peer=%s devices=%d audit=%d", peerAID, len(entry.Devices), len(entry.AuditRecipients))
 			return entry.Devices, entry.AuditRecipients, nil
 		}
 	}
@@ -509,6 +722,7 @@ func (c *AUNClient) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, p
 	bs, _ := raw.(map[string]any)
 	devices := v2ToMapList(bs["peer_devices"])
 	audit := v2ToMapList(bs["audit_recipients"])
+	c.logE2.Debug("message.v2.bootstrap fetched: peer=%s devices=%d audit=%d", peerAID, len(devices), len(audit))
 	if len(devices) > 0 {
 		state.bootstrapCacheM.Lock()
 		state.bootstrapCache[peerAID] = v2BootstrapEntry{
@@ -573,6 +787,7 @@ func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 		effectiveAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 
+	c.logE2.Debug("message.v2.pull request: after_seq=%d limit=%d ns=%s", effectiveAfterSeq, limit, ns)
 	raw, err := c.Call(ctx, "message.v2.pull", map[string]any{
 		"after_seq": effectiveAfterSeq,
 		"limit":     limit,
@@ -582,6 +797,11 @@ func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 	}
 	result, _ := raw.(map[string]any)
 	messages := v2ToMapList(result["messages"])
+	serverAckSeq := toInt64(result["server_ack_seq"])
+	c.logE2.Debug("message.v2.pull response: raw_count=%d server_ack_seq=%d has_more=%v", len(messages), serverAckSeq, result["has_more"])
+	for _, msg := range messages {
+		c.logMessageDebug("pull-raw", "message.v2.pull", "message.received", msg, nil)
+	}
 
 	decrypted := make([]map[string]any, 0, len(messages))
 	contigBefore := 0
@@ -604,6 +824,7 @@ func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 	}
 	if ns != "" && firstSeq > 0 && int(firstSeq) > contigBefore {
 		c.seqTracker.ForceContiguousSeq(ns, int(firstSeq))
+		c.logE2.Debug("message.v2.pull force contiguous first_seq: ns=%s previous=%d first_seq=%d", ns, contigBefore, firstSeq)
 	}
 
 	for _, msg := range messages {
@@ -615,6 +836,7 @@ func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 		if v2AsString(msg["version"]) == "v1" {
 			if legacy, ok := v2BuildLegacyP2PMessage(msg, myAID); ok {
 				decrypted = append(decrypted, legacy)
+				c.logE2.Debug("message.v2.pull plaintext V1 decrypted: seq=%d ns=%s", seq, ns)
 			} else {
 				c.logE2.Debug("V2 pull skipped legacy V1 encrypted/empty message: seq=%d", seq)
 			}
@@ -630,6 +852,9 @@ func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 		plaintext := c.decryptV2Message(ctx, state, msg)
 		if plaintext != nil {
 			decrypted = append(decrypted, plaintext)
+			c.logMessageDebug("decrypt-ok", "message.v2.pull", "message.received", plaintext, nil)
+		} else {
+			c.logE2.Debug("message.v2.pull decrypt returned nil: seq=%d ns=%s", seq, ns)
 		}
 	}
 
@@ -642,11 +867,20 @@ func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 				c.drainOrderedMessages(ns)
 			}
 		}
+		if serverAckSeq > 0 {
+			currentContig := c.seqTracker.GetContiguousSeq(ns)
+			if int(serverAckSeq) > currentContig {
+				c.seqTracker.ForceContiguousSeq(ns, int(serverAckSeq))
+				c.logE2.Info("V2 P2P pull retention-floor advanced: ns=%s contiguous=%d -> server_ack_seq=%d", ns, currentContig, serverAckSeq)
+				c.drainOrderedMessages(ns)
+			}
+		}
 		if c.seqTracker.GetContiguousSeq(ns) != contigBefore {
 			c.saveSeqTrackerState()
 		}
 	}
 
+	c.logE2.Debug("message.v2.pull done: requested_after_seq=%d raw_count=%d decrypted=%d ns=%s", afterSeq, len(messages), len(decrypted), ns)
 	return decrypted, nil
 }
 
@@ -669,9 +903,17 @@ func (c *AUNClient) AckV2(ctx context.Context, upToSeq int64) (map[string]any, e
 		seq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 	if seq <= 0 {
+		c.logE2.Debug("message.v2.ack skipped: ns=%s up_to_seq=%d", ns, upToSeq)
 		return map[string]any{"acked": int64(0)}, nil
 	}
+	if ns != "" {
+		seq = c.clampAckSeq("message.v2.ack", "up_to_seq", ns, seq)
+		if seq <= 0 {
+			return map[string]any{"acked": int64(0)}, nil
+		}
+	}
 
+	c.logE2.Debug("message.v2.ack send: ns=%s up_to_seq=%d", ns, seq)
 	raw, err := c.Call(ctx, "message.v2.ack", map[string]any{"up_to_seq": seq})
 	if err != nil {
 		return nil, err
@@ -679,6 +921,14 @@ func (c *AUNClient) AckV2(ctx context.Context, upToSeq int64) (map[string]any, e
 	result, _ := raw.(map[string]any)
 	if result == nil {
 		result = map[string]any{}
+	}
+	actualAckSeq := seq
+	if _, ok := result["effective_ack_seq"]; ok {
+		actualAckSeq = toInt64(result["effective_ack_seq"])
+	} else if _, ok := result["ack_seq"]; ok {
+		actualAckSeq = toInt64(result["ack_seq"])
+	} else if _, ok := result["cursor"]; ok {
+		actualAckSeq = toInt64(result["cursor"])
 	}
 
 	if state != nil && state.session != nil {
@@ -688,7 +938,7 @@ func (c *AUNClient) AckV2(ctx context.Context, upToSeq int64) (map[string]any, e
 					c.logE2.Debug("V2 SPK destroy failed (non-fatal): %v", r)
 				}
 			}()
-			destroyed := state.session.MaybeDestroyOldSPKs(seq)
+			destroyed := state.session.MaybeDestroyOldSPKs(actualAckSeq)
 			if len(destroyed) > 0 {
 				limit := len(destroyed)
 				if limit > 3 {
@@ -698,11 +948,12 @@ func (c *AUNClient) AckV2(ctx context.Context, upToSeq int64) (map[string]any, e
 			}
 		}()
 	}
-	result["ack_seq"] = seq
+	result["ack_seq"] = actualAckSeq
 	result["success"] = true
-	if toInt64(result["acked"]) == 0 && seq > 0 {
-		result["acked"] = seq
+	if toInt64(result["acked"]) == 0 && actualAckSeq > 0 {
+		result["acked"] = actualAckSeq
 	}
+	c.logE2.Debug("message.v2.ack ok: ns=%s requested=%d effective=%d result=%v", ns, seq, actualAckSeq, result)
 	return result, nil
 }
 
@@ -710,8 +961,12 @@ func (c *AUNClient) AckV2(ctx context.Context, upToSeq int64) (map[string]any, e
 //
 // 返回值：
 //   - 解密成功 → 应用层消息 dict（包含 message_id / from / to / seq / payload / e2ee）
-//   - 解密失败或无 envelope_json → nil（同时发布 message.undecryptable 事件）
+//   - 解密失败或无 envelope_json → nil（必要时发布 undecryptable 事件）
 func (c *AUNClient) decryptV2Message(ctx context.Context, state *v2P2PState, msg map[string]any) map[string]any {
+	return c.decryptV2MessageWithPending(ctx, state, msg, true)
+}
+
+func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2PState, msg map[string]any, allowPending bool) map[string]any {
 	envJSON := v2AsString(msg["envelope_json"])
 	if envJSON == "" {
 		return nil
@@ -723,20 +978,81 @@ func (c *AUNClient) decryptV2Message(ctx context.Context, state *v2P2PState, msg
 		c.logE2.Warn("V2 decrypt: invalid envelope_json for msg seq=%v: %v", msg["seq"], err)
 		return nil
 	}
+	e2eeMeta := v2ThoughtE2EEMetadata(envelope)
+	c.observeAgentMDFromEnvelope(envelope)
 
 	// 确定 spk_id
 	spkID := ""
+	recipientKeySource := ""
 	if r, ok := envelope["recipient"].(map[string]any); ok {
 		spkID = v2AsString(r["spk_id"])
-	} else if _, ok := envelope["recipients"]; ok {
+		recipientKeySource = v2AsString(r["key_source"])
+	} else if rows, ok := envelope["recipients"]; ok {
 		spkID = v2AsString(msg["spk_id"])
+		if recipients, ok := rows.([]any); ok {
+			for _, row := range recipients {
+				cells, ok := row.([]any)
+				if !ok || len(cells) < 6 {
+					continue
+				}
+				if v2AsString(cells[0]) != c.aid || v2AsString(cells[1]) != c.deviceID {
+					continue
+				}
+				if spkID == "" {
+					spkID = v2AsString(cells[5])
+				}
+				if len(cells) > 3 {
+					recipientKeySource = v2AsString(cells[3])
+				}
+				break
+			}
+		}
 	}
 
-	ikPriv, spkPriv, err := state.session.GetDecryptKeys(spkID)
+	// group_id 只表示群上下文；GetGroupDecryptKeys 内部必须按 group SPK -> P2P device SPK -> IK fallback 查找。
+	groupIDForKeys := ""
+	if aad, ok := envelope["aad"].(map[string]any); ok {
+		groupIDForKeys = strings.TrimSpace(v2AsString(aad["group_id"]))
+	}
+	if groupIDForKeys == "" {
+		groupIDForKeys = strings.TrimSpace(v2AsString(msg["group_id"]))
+	}
+	undecryptableEvent := "message.undecryptable"
+	if groupIDForKeys != "" {
+		undecryptableEvent = "group.message_undecryptable"
+	}
+	c.logE2.Debug("V2 decrypt start: seq=%v message_id=%s group=%s from=%s spk_id=%s key_source=%s has_recipient=%v has_recipients=%v",
+		msg["seq"], v2AsString(msg["message_id"]), valueOrDefault(groupIDForKeys, "<p2p>"), v2AsString(msg["from_aid"]), valueOrDefault(spkID, "<empty>"), valueOrDefault(recipientKeySource, "<empty>"),
+		envelope["recipient"] != nil, envelope["recipients"] != nil)
+	var ikPriv, spkPriv []byte
+	var err error
+	if groupIDForKeys != "" {
+		ikPriv, spkPriv, err = state.session.GetGroupDecryptKeys(groupIDForKeys, spkID)
+	} else {
+		ikPriv, spkPriv, err = state.session.GetDecryptKeys(spkID)
+	}
 	if err != nil {
-		c.logE2.Warn("V2 decrypt: GetDecryptKeys 失败 seq=%v: %v", msg["seq"], err)
+		c.logE2.Warn("V2 decrypt: GetDecryptKeys 失败 seq=%v group=%s: %v", msg["seq"], groupIDForKeys, err)
+		event := map[string]any{
+			"message_id":     v2AsString(msg["message_id"]),
+			"from":           v2AsString(msg["from_aid"]),
+			"to":             v2AsString(msg["to"]),
+			"seq":            msg["seq"],
+			"timestamp":      msg["t_server"],
+			"device_id":      v2AsString(msg["device_id"]),
+			"slot_id":        v2AsString(msg["slot_id"]),
+			"_decrypt_error": err.Error(),
+			"_decrypt_stage": "spk_lookup",
+			"_envelope_type": v2AsString(envelope["type"]),
+			"_suite":         v2AsString(envelope["suite"]),
+			"_spk_id":        spkID,
+		}
+		attachV2EnvelopeMetadata(event, e2eeMeta)
+		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
+		c.events.Publish(undecryptableEvent, event)
 		return nil
 	}
+	c.logE2.Debug("V2 decrypt key lookup ok: seq=%v group=%s ik_len=%d spk_len=%d", msg["seq"], valueOrDefault(groupIDForKeys, "<p2p>"), len(ikPriv), len(spkPriv))
 
 	// sender 公钥（按 sender device_id 精确匹配）
 	fromAID := v2AsString(msg["from_aid"])
@@ -744,53 +1060,30 @@ func (c *AUNClient) decryptV2Message(ctx context.Context, state *v2P2PState, msg
 	if aad, ok := envelope["aad"].(map[string]any); ok {
 		senderDeviceID = v2AsString(aad["from_device"])
 	}
-	senderPubDER := state.session.GetPeerIK(fromAID, senderDeviceID)
-	if len(senderPubDER) == 0 && fromAID != "" {
-		// 兜底：bootstrap 拉取后再查
-		raw, bsErr := c.Call(ctx, "message.v2.bootstrap", map[string]any{"peer_aid": fromAID})
-		if bsErr == nil {
-			bs, _ := raw.(map[string]any)
-			for _, dev := range v2ToMapList(bs["peer_devices"]) {
-				devID := v2AsString(dev["device_id"])
-				if devID == "" {
-					devID = v2AsString(dev["owner_device_id"])
-				}
-				ikDER := v2DecodeBase64Field(dev, "ik_pk")
-				if len(ikDER) > 0 && devID != "" {
-					state.session.CachePeerIK(fromAID, devID, ikDER)
-				}
-			}
-			senderPubDER = state.session.GetPeerIK(fromAID, senderDeviceID)
-		} else {
-			c.logE2.Warn("V2 decrypt: bootstrap for sender %s failed: %v", fromAID, bsErr)
-		}
-	}
-	if len(senderPubDER) == 0 && fromAID != "" {
-		certBytes, certErr := c.fetchPeerCert(ctx, fromAID, "")
-		if certErr == nil && len(certBytes) > 0 {
-			if block, _ := pem.Decode(certBytes); block != nil {
-				if cert, parseErr := x509.ParseCertificate(block.Bytes); parseErr == nil {
-					if der, marshalErr := x509.MarshalPKIXPublicKey(cert.PublicKey); marshalErr == nil {
-						senderPubDER = der
-						if senderDeviceID != "" {
-							state.session.CachePeerIK(fromAID, senderDeviceID, der)
-						}
-						c.logE2.Debug("V2 decrypt: sender IK fallback from CA cert for %s", fromAID)
-					}
-				}
-			}
-		} else if certErr != nil {
-			c.logE2.Warn("V2 decrypt: CA fallback for %s failed: %v", fromAID, certErr)
-		}
-	}
+	senderPubDER := c.getV2SenderPubDER(ctx, state, fromAID, senderDeviceID)
 	if len(senderPubDER) == 0 {
-		c.logE2.Warn("V2 decrypt: no sender IK for %s, cannot verify signature", fromAID)
-		c.events.Publish("message.undecryptable", map[string]any{
-			"message_id":     v2AsString(msg["message_id"]),
-			"from":           fromAID,
-			"seq":            msg["seq"],
-			"_decrypt_error": "sender_ik_not_found",
-		})
+		c.logE2.Warn("V2 decrypt: no sender IK for %s device=%s", fromAID, senderDeviceID)
+		if allowPending {
+			c.scheduleV2SenderIKPending(msg, fromAID, senderDeviceID, groupIDForKeys)
+			return nil
+		}
+		event := map[string]any{
+			"message_id":        v2AsString(msg["message_id"]),
+			"from":              fromAID,
+			"to":                v2AsString(msg["to"]),
+			"seq":               msg["seq"],
+			"timestamp":         msg["t_server"],
+			"device_id":         v2AsString(msg["device_id"]),
+			"slot_id":           v2AsString(msg["slot_id"]),
+			"_decrypt_error":    "sender_ik_not_found",
+			"_decrypt_stage":    "sender_ik",
+			"_envelope_type":    v2AsString(envelope["type"]),
+			"_suite":            v2AsString(envelope["suite"]),
+			"_sender_device_id": senderDeviceID,
+		}
+		attachV2EnvelopeMetadata(event, e2eeMeta)
+		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
+		c.events.Publish(undecryptableEvent, event)
 		return nil
 	}
 
@@ -802,20 +1095,65 @@ func (c *AUNClient) decryptV2Message(ctx context.Context, state *v2P2PState, msg
 	plaintext, err := e2ee.DecryptMessage(envelope, selfAID, selfDeviceID, ikPriv, spkPriv, senderPubDER)
 	if err != nil {
 		c.logE2.Warn("V2 decrypt failed for msg seq=%v: %v", msg["seq"], err)
-		c.events.Publish("message.undecryptable", map[string]any{
-			"message_id":     v2AsString(msg["message_id"]),
-			"from":           fromAID,
-			"seq":            msg["seq"],
-			"_decrypt_error": err.Error(),
-		})
+		event := map[string]any{
+			"message_id":        v2AsString(msg["message_id"]),
+			"from":              fromAID,
+			"to":                v2AsString(msg["to"]),
+			"seq":               msg["seq"],
+			"timestamp":         msg["t_server"],
+			"device_id":         v2AsString(msg["device_id"]),
+			"slot_id":           v2AsString(msg["slot_id"]),
+			"_decrypt_error":    err.Error(),
+			"_decrypt_stage":    "decrypt",
+			"_envelope_type":    v2AsString(envelope["type"]),
+			"_suite":            v2AsString(envelope["suite"]),
+			"_sender_device_id": senderDeviceID,
+		}
+		attachV2EnvelopeMetadata(event, e2eeMeta)
+		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
+		c.events.Publish(undecryptableEvent, event)
 		return nil
 	}
 	if plaintext == nil {
+		c.logE2.Debug("V2 decrypt returned nil plaintext: seq=%v group=%s", msg["seq"], valueOrDefault(groupIDForKeys, "<p2p>"))
 		return nil
 	}
 
 	// SPK 轮换：当前活跃 SPK 被消费后立即轮换（后台执行，不阻塞）
-	if state.session.IsCurrentSPK(spkID) {
+	if groupIDForKeys != "" && recipientKeySource == "group_device_prekey" && state.session.IsLastUploadedGroupSPK(groupIDForKeys, spkID) {
+		// Group SPK 消费触发轮换
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.logE2.Warn("V2 group SPK rotation panic: %v", r)
+				}
+			}()
+			rotateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := state.session.RotateGroupSPK(rotateCtx, groupIDForKeys, c.v2CallFn()); err != nil {
+				c.logE2.Warn("V2 group SPK rotation failed (non-fatal): group=%s %v", groupIDForKeys, err)
+			} else {
+				c.logE2.Debug("V2 group SPK rotated after consumption: group=%s aid=%s", groupIDForKeys, selfAID)
+			}
+		}()
+	} else if groupIDForKeys != "" && recipientKeySource == "peer_device_prekey" {
+		// peer_device_prekey fallback：补注册 group SPK
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.logE2.Warn("V2 group SPK registration panic: %v", r)
+				}
+			}()
+			regCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := state.session.EnsureGroupRegistered(regCtx, groupIDForKeys, c.v2CallFn()); err != nil {
+				c.logE2.Debug("V2 group SPK registration after peer fallback failed (non-fatal): group=%s %v", groupIDForKeys, err)
+			} else {
+				c.logE2.Debug("V2 group SPK registered after peer fallback: group=%s", groupIDForKeys)
+			}
+		}()
+	} else if groupIDForKeys == "" && state.session.IsLastUploadedSPK(spkID) {
+		// P2P SPK 消费触发轮换
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -832,12 +1170,8 @@ func (c *AUNClient) decryptV2Message(ctx context.Context, state *v2P2PState, msg
 		}()
 	}
 
-	suite := v2AsString(envelope["suite"])
-	encryptionMode := "v2_unknown"
-	if suite != "" {
-		encryptionMode = "v2_" + suite
-	}
-	return map[string]any{
+	e2ee := v2ThoughtE2EEMetadata(envelope)
+	result := map[string]any{
 		"message_id": v2AsString(msg["message_id"]),
 		"from":       fromAID,
 		"to":         selfAID,
@@ -845,13 +1179,15 @@ func (c *AUNClient) decryptV2Message(ctx context.Context, state *v2P2PState, msg
 		"t_server":   msg["t_server"],
 		"payload":    plaintext,
 		"encrypted":  true,
-		"e2ee": map[string]any{
-			"version":         "v2",
-			"suite":           suite,
-			"encryption_mode": encryptionMode,
-			"forward_secrecy": true,
-		},
+		"e2ee":       e2ee,
 	}
+	attachV2EnvelopeMetadata(result, e2ee)
+	if groupIDForKeys != "" {
+		c.logMessageDebug("decrypt-ok", "v2.decrypt", "group.message_created", result, nil)
+	} else {
+		c.logMessageDebug("decrypt-ok", "v2.decrypt", "message.received", result, nil)
+	}
+	return result
 }
 
 // v2RetryableCodes 是推测性发送可重试的服务端错误码集合。

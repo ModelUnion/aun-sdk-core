@@ -22,6 +22,20 @@ function bytesToBase64(b: Uint8Array): string {
   return btoa(bin);
 }
 
+function base64ToBytes(s: string): Uint8Array {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
 async function hmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
   const hmacKey = await crypto.subtle.importKey(
     'raw',
@@ -73,4 +87,46 @@ export async function withMetadataAuth(
       tag: bytesToBase64(tag),
     },
   };
+}
+
+export async function verifyMetadataAuth(
+  metadata: unknown,
+  key: Uint8Array,
+  domain: Uint8Array,
+  fieldName: string,
+): Promise<void> {
+  if (metadata == null) return;
+  if (!isPlainObject(metadata)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  const body: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(metadata)) {
+    if (k !== '_auth') body[k] = v;
+  }
+  if (Object.keys(body).length === 0) return;
+
+  const auth = metadata._auth;
+  if (!isPlainObject(auth)) {
+    throw new Error(`${fieldName} missing _auth`);
+  }
+  if (auth.alg !== 'HMAC-SHA256') {
+    throw new Error(`${fieldName} unsupported _auth alg`);
+  }
+  if (typeof auth.tag !== 'string' || auth.tag.length === 0) {
+    throw new Error(`${fieldName} missing _auth tag`);
+  }
+
+  const actual = base64ToBytes(auth.tag);
+  const expected = await metadataAuthTag(key, domain, body);
+  if (!bytesEqual(actual, expected)) {
+    throw new Error(`${fieldName} _auth verification failed`);
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }

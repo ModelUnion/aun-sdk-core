@@ -36,7 +36,7 @@ def _parse_bool(value: str) -> bool:
 class AUNLogger:
     """AUN SDK 统一日志记录器。
 
-    格式: [yyyy-mm-dd HH:mm:ss.SSS][LEVEL][module] message
+    格式: [yyyy-mm-dd HH:mm:ss.SSS][LEVEL][module][aun_path=...][device_id=...] message
 
     优先级:
       1. ~/.aun/log.ini 存在 → 使用文件配置，日志目录强制 ~/.aun/logs/
@@ -55,6 +55,8 @@ class AUNLogger:
             self._log_dir = (Path(aun_path) if aun_path else Path.home() / ".aun") / "logs"
             level_str = "debug" if self._debug else "info"
 
+        self._aun_path = str((Path(aun_path) if aun_path else Path.home() / ".aun").expanduser())
+        self._device_id = "-"
         self._min_level = _LEVEL_ORDER.get(level_str, 1)
 
         if self._debug:
@@ -94,13 +96,16 @@ class AUNLogger:
         self._console(line)
         self._file(line)
 
+    def bind_device_id(self, device_id: str | None) -> None:
+        self._device_id = str(device_id or "-")
+
     # ------ 内部实现 ------
 
     def _format(self, level: str, module: str, msg: str, args: tuple) -> str:
         now = datetime.now()
         ts = now.strftime("%Y-%m-%d %H:%M:%S") + f".{now.microsecond // 1000:03d}"
         text = msg % args if args else msg
-        return f"[{ts}][{level}][{module}] {text}"
+        return f"[{ts}][{level}][{module}][aun_path={self._aun_path}][device_id={self._device_id}] {text}"
 
     def _console(self, line: str) -> None:
         colored = self._colorize(line)
@@ -148,6 +153,9 @@ class AUNLogger:
 
 class NullLogger:
     """静默 logger，用于不需要日志输出的场景。"""
+
+    def bind_device_id(self, device_id: str | None) -> None:
+        pass
 
     def error(self, module: str, msg: str, *args: object, err: BaseException | None = None) -> None:
         pass

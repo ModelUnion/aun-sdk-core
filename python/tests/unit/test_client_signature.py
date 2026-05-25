@@ -72,6 +72,16 @@ class TestSignedMethodsCoverage:
     """验证 _SIGNED_METHODS 包含所有群关键修改操作。"""
 
     EXPECTED_METHODS = [
+        # P2P / V2 入口
+        "message.send",
+        "message.v2.put_peer_pk", "message.v2.bootstrap",
+        "message.v2.group_bootstrap", "message.v2.pull",
+        "message.v2.ack",
+        # V2 群入口
+        "group.v2.put_group_pk", "group.v2.bootstrap",
+        "group.v2.send", "group.v2.pull", "group.v2.ack",
+        "group.v2.propose_state", "group.v2.confirm_state",
+        "group.v2.get_proposal",
         # 群管理
         "group.send", "group.kick", "group.add_member",
         "group.leave", "group.remove_member", "group.update_rules",

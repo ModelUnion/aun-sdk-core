@@ -322,13 +322,13 @@ describe('ISSUE-SDK-TS-007: max_attempts 默认值与 Python 对齐', () => {
 // ══════════════════════════════════════════════════════════════
 
 describe('ISSUE-SDK-TS-009: Logger 新格式（规范对齐）', () => {
-  it('日志行符合 [ts][LEVEL][module] 格式（无 AID）', () => {
+  it('日志行符合 [ts][LEVEL][module][aun_path][device_id] 格式（无 AID）', () => {
     const logger = new AUNLogger({ debug: false, aunPath: '/tmp/aun' });
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     logger.for('aun_core.auth').info('hello');
     const line = String(logSpy.mock.calls[0][0]);
     logSpy.mockRestore();
-    expect(line).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[INFO\]\[aun_core\.auth\] hello$/);
+    expect(line).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[INFO\]\[aun_core\.auth\]\[aun_path=\/tmp\/aun\]\[device_id=-\] hello$/);
   });
 
   it('bindAid 后 message 前缀带 [aid]', () => {
@@ -338,6 +338,6 @@ describe('ISSUE-SDK-TS-009: Logger 新格式（规范对齐）', () => {
     logger.for('aun_core.client').info('hi');
     const line = String(logSpy.mock.calls[0][0]);
     logSpy.mockRestore();
-    expect(line).toMatch(/\[aun_core\.client\] \[test\.aid\.com\] hi$/);
+    expect(line).toMatch(/\[aun_core\.client\]\[aun_path=\/tmp\/aun\]\[device_id=-\] \[test\.aid\.com\] hi$/);
   });
 });

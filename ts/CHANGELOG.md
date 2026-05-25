@@ -6,6 +6,45 @@
 
 ---
 
+## 0.3.3 — 2026-05-25
+
+### Added
+- **V2 Thought 加解密**：`group.thought.get` / `message.thought.get` 返回值自动解密；发送端自动加密；`attachV2EnvelopeMetadata` 附加 E2EE 元数据
+- **V2 Sender IK 延迟解密**：`_v2SenderIKPending` / `_v2SenderIKFetching` 机制，对端 IK 未缓存时挂起消息、异步拉取后重试解密
+- **agent.md 本地缓存体系**：`setAgentMdPath` / `publishAgentMd()` / `fetchAgentMd(aid?)`；基于文件系统的 list.json 索引 + 按 AID 存储 + etag 比对 + 自动拉取缺失
+- **KeyStore agent_md_cache 持久化**：文件系统 + SQLite 双后端支持
+- **V2 辅助函数**：`getV2DeviceId` / `_v2B64ToBytesStrict` / `_v2BytesEqual` / `_v2ConcatBytes` / `_v2LengthPrefixedTextKey` / `_v2LengthPrefixedBytes`
+- **V2 envelope 元数据**：`attachV2EnvelopeMetadata` / `attachV2EnvelopeMetadataFromSource` / `extractV2EnvelopeFromSource` / `metadataWithoutAuth`
+- **签名跳过策略**：对内部方法和系统事件跳过签名验证
+
+### Changed
+- **V2 消息处理路径重构**：统一 P2P/Group 解密入口，支持 sender IK pending 延迟模式
+- **V2 SPK rotation**：thought 解密失败时触发 group SPK rotation / registration after peer fallback
+- **消息调试日志增强**：thought.get 全链路 debug 日志
+
+### Fixed
+- **service-plane envelope 解包**：修复 Kernel trace 字段传递丢失
+- **trace 树状展示**：enter/exit 配对 + 嵌套缩进
+
+---
+
+## 0.3.1 — 2026-05-22
+
+### Added
+- **`auth.checkAid` handler**：本地证书自检（解析有效期、公钥）+ 远端注册状态查询；新增 `parseCertValidity` / `parseAsn1Time` ASN.1 时间解析
+- **RPC trace 增强**：`RPCTransport` 增加 `setTraceMode()` / `setTraceObserver()`；`sortTraceSpansForDisplay` / `formatTraceTree` / `traceDisplay` 树状展示按 ts 排序 + 嵌套缩进；`TraceObserver` 类型导出
+- **V2 群组 SPK 生命周期**：`V2KeyStore.saveGroupSPK` / `loadGroupSPK` / `loadCurrentGroupSPK`；`V2Session.ensureGroupRegistered` / `rotateGroupSPK` / `_publishGroupSPK`；`DESTROY_DELAY_MS = 7d`
+- **V2 P2P push 解密**：`AUNClient._onV2PushNotification` / `_decryptV2PushMessage` 实现带 payload 的就地解密 + 失败回退到 pull
+
+### Changed
+- **`SeqTracker.forceContiguousSeq`**：原 `contiguousSeq = minSeq` 跳过空洞（会丢消息），改为 `contiguousSeq = minSeq - 1` 由连续前缀自然推进，避免误丢
+
+### Fixed
+- **`client.ts:4026` 类型错误**：`_publishOrderedMessage` 的 `decrypted` 实参补 `as EventPayload` 断言（`Record<string, unknown>` 与 `JsonValue | Error` 不兼容）
+- short RPC 请求增加 `debug` 完整报文日志，便于跨语言诊断
+
+---
+
 ## 0.3.0 — 2026-05-21 ⚠️ BREAKING CHANGE
 
 > **V2-only 版本**：移除全部 V1 E2EE（含群组加密），新增 V2 加密原语，API 不向后兼容。

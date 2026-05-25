@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Message.ack 部分成功语义测试 — 对应 P1-9 修复。
+"""Message.ack cursor 推进与幂等语义测试。
 
 测试场景：
   1. A 发消息给 B，B ack
-  2. ack DB 更新成功但事件发布失败时返回 `{success: true, event_published: false}`
-  3. ack_seq 已推进
+  2. ack_seq 已推进
+  3. 重复 ack 保持幂等
 
 使用方法：
   docker exec kite-sdk-tester python /tests/integration_test_message_ack.py
@@ -191,20 +191,26 @@ async def _sdk_recv_push_after(client: AUNClient, from_aid: str, *, after_seq: i
 
 
 async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
-    """获取当前最大 seq，用于建立 baseline"""
+    """获取当前最大 seq，用于建立 baseline。
+
+    V2 pull 的翻页依据是 raw 行元数据，不是解密后的 messages 数量。
+    """
     after_seq = 0
     max_seq = 0
-    while True:
+    for _ in range(100):
         result = await client.call("message.pull", {"after_seq": after_seq, "limit": limit})
-        max_seq = max(max_seq, int(result.get("server_ack_seq") or 0), int(result.get("latest_seq") or 0))
+        latest_seq = int(result.get("latest_seq") or 0)
+        server_ack_seq = int(result.get("server_ack_seq") or 0)
+        raw_count = int(result.get("raw_count") or 0)
+        max_seq = max(max_seq, server_ack_seq, latest_seq)
         msgs = result.get("messages", [])
-        if not msgs:
-            return max_seq
         for msg in msgs:
             max_seq = max(max_seq, _seq_of(msg))
-        if len(msgs) < limit:
+        next_after = max(max_seq, after_seq)
+        if raw_count <= 0 or next_after <= after_seq:
             return max_seq
-        after_seq = max_seq
+        after_seq = next_after
+    return max_seq
 
 
 # ---------------------------------------------------------------------------
@@ -258,96 +264,10 @@ async def test_message_ack_basic():
         await bob.close()
 
 
-async def test_message_ack_event():
-    """测试 ack 事件发布"""
-    alice = _make_client("event-alice")
-    bob = _make_client("event-bob")
-
-    try:
-        await _ensure_connected(alice, _ALICE_AID)
-        await _ensure_connected(bob, _BOB_AID)
-
-        # 0. 获取 baseline seq
-        baseline = await _current_max_seq(bob)
-        inbox, event, sub = _subscribe_push_after(bob, _ALICE_AID, after_seq=baseline)
-
-        # 1. Alice 订阅 ack 事件
-        ack_events = []
-        ack_event = asyncio.Event()
-
-        def ack_handler(data):
-            if not isinstance(data, dict):
-                return
-            if data.get("to") != _BOB_AID:
-                return
-            print(f"  [INFO] Alice 收到 ack 事件: {data}")
-            ack_events.append(data)
-            ack_event.set()
-
-        alice.on("message.ack", ack_handler)
-
-        # 2. Alice 发送消息给 Bob
-        try:
-            await _sdk_send(alice, _BOB_AID, "test_ack_event")
-            msgs = await _wait_for_messages_after(
-                bob, _ALICE_AID, after_seq=baseline, timeout=3.0, inbox=inbox, event=event,
-            )
-        finally:
-            sub.unsubscribe()
-        if not msgs:
-            _fail("message_ack_event", "Bob 未收到消息")
-            return
-
-        msg_seq = _seq_of(msgs[0])
-        print(f"  [INFO] Bob 收到消息 seq={msg_seq}")
-
-        # 4. Bob ack 消息
-        ack_result = await bob.call("message.ack", {"seq": msg_seq})
-        print(f"  [INFO] ack 结果: {ack_result}")
-
-        # 5. 等待 Alice 收到 ack 事件
-        deadline = asyncio.get_running_loop().time() + 3.0
-        while not any(int(item.get("ack_seq") or 0) >= msg_seq for item in ack_events):
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                break
-            ack_event.clear()
-            if any(int(item.get("ack_seq") or 0) >= msg_seq for item in ack_events):
-                break
-            try:
-                await asyncio.wait_for(ack_event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
-        if not any(int(item.get("ack_seq") or 0) >= msg_seq for item in ack_events):
-            _fail("message_ack_event", "Alice 未收到 ack 事件")
-            return
-
-        # 6. 验证 ack 事件内容
-        if not ack_events:
-            _fail("message_ack_event", "ack_events 为空")
-            return
-
-        event_data = next(item for item in ack_events if int(item.get("ack_seq") or 0) >= msg_seq)
-        # ack 事件的 "to" 字段是 ack 发起方（Bob）
-        if event_data.get("to") != _BOB_AID:
-            _fail("message_ack_event", f"ack 事件 to 不匹配: 期望 {_BOB_AID}, 实际 {event_data.get('to')}")
-            return
-
-        if not (event_data.get("ack_seq") >= msg_seq):
-            _fail("message_ack_event", f"ack 事件 ack_seq 不匹配: 期望 >= {msg_seq}, 实际 {event_data.get('ack_seq')}")
-            return
-
-        _ok("message_ack_event")
-
-    finally:
-        await alice.close()
-        await bob.close()
-
-
-async def test_message_ack_partial_success():
-    """测试 ack 部分成功语义（DB 成功但事件发布失败）"""
-    alice = _make_client("partial-alice")
-    bob = _make_client("partial-bob")
+async def test_message_ack_idempotent():
+    """测试重复 ack 的幂等返回语义"""
+    alice = _make_client("idempotent-alice")
+    bob = _make_client("idempotent-bob")
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
@@ -366,7 +286,7 @@ async def test_message_ack_partial_success():
         finally:
             sub.unsubscribe()
         if not msgs:
-            _fail("message_ack_partial_success", "Bob 未收到消息")
+            _fail("message_ack_idempotent", "Bob 未收到消息")
             return
 
         msg_seq = _seq_of(msgs[0])
@@ -378,32 +298,24 @@ async def test_message_ack_partial_success():
 
         # 4. 验证 ack 结果包含必要字段
         if not ack_result.get("success"):
-            _fail("message_ack_partial_success", f"ack 失败: {ack_result}")
+            _fail("message_ack_idempotent", f"ack 失败: {ack_result}")
             return
 
         if "ack_seq" not in ack_result:
-            _fail("message_ack_partial_success", "ack 结果缺少 ack_seq 字段")
+            _fail("message_ack_idempotent", "ack 结果缺少 ack_seq 字段")
             return
 
-        # 5. 如果事件发布失败，应该有 event_published: false
-        # 注意：正常情况下 event_published 应该为 true 或不存在
-        # 这个测试主要验证接口契约，实际触发失败需要故障注入
-        if "event_published" in ack_result:
-            print(f"  [INFO] event_published: {ack_result.get('event_published')}")
-            if not ack_result.get("event_published"):
-                print(f"  [INFO] 事件发布失败，但 ack_seq 已推进: {ack_result.get('ack_seq')}")
-
-        # 6. 再次 ack 同一 seq，验证幂等性（ack_seq 是累积值，可能 >= msg_seq）
+        # 5. 再次 ack 同一 seq，验证幂等性（ack_seq 是累积值，可能 >= msg_seq）
         ack_result2 = await bob.call("message.ack", {"seq": msg_seq})
         if not ack_result2.get("success"):
-            _fail("message_ack_partial_success", f"重复 ack 失败: {ack_result2}")
+            _fail("message_ack_idempotent", f"重复 ack 失败: {ack_result2}")
             return
 
         if not (ack_result2.get("ack_seq") >= msg_seq):
-            _fail("message_ack_partial_success", f"重复 ack 的 ack_seq 不匹配: 期望 >= {msg_seq}, 实际 {ack_result2.get('ack_seq')}")
+            _fail("message_ack_idempotent", f"重复 ack 的 ack_seq 不匹配: 期望 >= {msg_seq}, 实际 {ack_result2.get('ack_seq')}")
             return
 
-        _ok("message_ack_partial_success")
+        _ok("message_ack_idempotent")
 
     finally:
         await alice.close()
@@ -473,12 +385,11 @@ async def test_message_ack_sequence():
 
 async def main():
     print("=" * 60)
-    print("Message.ack 部分成功语义测试")
+    print("Message.ack cursor 推进与幂等语义测试")
     print("=" * 60)
 
     await test_message_ack_basic()
-    await test_message_ack_event()
-    await test_message_ack_partial_success()
+    await test_message_ack_idempotent()
     await test_message_ack_sequence()
 
     print()

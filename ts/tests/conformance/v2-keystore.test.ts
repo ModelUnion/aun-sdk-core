@@ -100,4 +100,111 @@ describe('V2KeyStore', () => {
     expect(store.listRecentSPKIds('devA', 5)).toEqual(['spk-1']);
     expect(store.listRecentSPKIds('devB', 5)).toEqual(['spk-1']);
   });
+
+  it('migrates legacy nullable uploaded markers without blocking V2 init', () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec(`CREATE TABLE v2_device_keys (
+      device_id TEXT NOT NULL,
+      key_type TEXT NOT NULL,
+      key_id TEXT NOT NULL DEFAULT '',
+      private_key BLOB,
+      public_key BLOB,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (device_id, key_type, key_id)
+    )`);
+    const insert = db.prepare(
+      `INSERT INTO v2_device_keys (device_id, key_type, key_id, private_key, public_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    insert.run('dev1', 'spk', 'spk-1', Buffer.from([1]), Buffer.from([2]), 1);
+    insert.run('dev1', 'spk_uploaded', 'spk-1', null, null, 2);
+    insert.run('dev1', 'group_spk', 'group-1\0gspk-1', Buffer.from([3]), Buffer.from([4]), 3);
+    insert.run('dev1', 'group_spk_uploaded', 'group-1\0gspk-1', null, null, 4);
+
+    const store = new V2KeyStore(db);
+    expect(store.loadLatestUploadedSPKId('dev1')).toBe('spk-1');
+    expect(store.loadLatestUploadedGroupSPKId('dev1', 'group-1')).toBe('gspk-1');
+    const rows = db.prepare(
+      `SELECT group_id, key_id FROM v2_device_keys WHERE key_type IN ('group_spk', 'group_spk_uploaded')`,
+    ).all() as Array<{ group_id: string; key_id: string }>;
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.group_id).toBe('group-1');
+      expect(row.key_id).toBe('gspk-1');
+      expect(row.key_id.includes('\0')).toBe(false);
+    }
+  });
+
+  it('migrates legacy empty uploaded marker blobs to non-empty marker blobs', () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec(`CREATE TABLE v2_device_keys (
+      device_id TEXT NOT NULL,
+      key_type TEXT NOT NULL,
+      key_id TEXT NOT NULL DEFAULT '',
+      private_key BLOB NOT NULL,
+      public_key BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (device_id, key_type, key_id)
+    )`);
+    const insert = db.prepare(
+      `INSERT INTO v2_device_keys (device_id, key_type, key_id, private_key, public_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    insert.run('dev1', 'spk', 'spk-1', Buffer.from([1]), Buffer.from([2]), 1);
+    insert.run('dev1', 'spk_uploaded', 'spk-1', Buffer.alloc(0), Buffer.alloc(0), 2);
+    insert.run('dev1', 'group_spk', 'group-1\0gspk-1', Buffer.from([3]), Buffer.from([4]), 3);
+    insert.run('dev1', 'group_spk_uploaded', 'group-1\0gspk-1', Buffer.alloc(0), Buffer.alloc(0), 4);
+
+    const store = new V2KeyStore(db);
+    expect(store.loadLatestUploadedSPKId('dev1')).toBe('spk-1');
+    expect(store.loadLatestUploadedGroupSPKId('dev1', 'group-1')).toBe('gspk-1');
+    const markers = db.prepare(
+      `SELECT length(private_key) AS priv_len, length(public_key) AS pub_len
+       FROM v2_device_keys WHERE key_type IN ('spk_uploaded', 'group_spk_uploaded')`,
+    ).all() as Array<{ priv_len: number; pub_len: number }>;
+    expect(markers).toHaveLength(2);
+    for (const row of markers) {
+      expect(row.priv_len).toBeGreaterThan(0);
+      expect(row.pub_len).toBeGreaterThan(0);
+    }
+  });
+
+  it('stores new group SPK records without legacy NUL composite key', () => {
+    const { store, db } = newStore();
+    store.saveGroupSPK('dev1', 'group-1', 'gspk-1', new Uint8Array([1]), new Uint8Array([2]));
+    store.markGroupSPKUploaded('dev1', 'group-1', 'gspk-1');
+
+    const rows = db.prepare(
+      `SELECT group_id, key_id FROM v2_device_keys WHERE key_type IN ('group_spk', 'group_spk_uploaded')`,
+    ).all() as Array<{ group_id: string; key_id: string }>;
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.group_id).toBe('group-1');
+      expect(row.key_id).toBe('gspk-1');
+      expect(row.key_id.includes('\0')).toBe(false);
+    }
+  });
+
+  it('stores uploaded markers as non-empty blobs', () => {
+    const { store, db } = newStore();
+    store.saveSPK('dev1', 'spk-1', new Uint8Array([1]), new Uint8Array([2]));
+    store.markSPKUploaded('dev1', 'spk-1');
+    store.saveGroupSPK('dev1', 'group-1', 'gspk-1', new Uint8Array([3]), new Uint8Array([4]));
+    store.markGroupSPKUploaded('dev1', 'group-1', 'gspk-1');
+
+    expect(store.loadLatestUploadedSPKId('dev1')).toBe('spk-1');
+    expect(store.loadLatestUploadedGroupSPKId('dev1', 'group-1')).toBe('gspk-1');
+    const markers = db.prepare(
+      `SELECT typeof(private_key) AS priv_type, length(private_key) AS priv_len,
+              typeof(public_key) AS pub_type, length(public_key) AS pub_len
+       FROM v2_device_keys WHERE key_type IN ('spk_uploaded', 'group_spk_uploaded')`,
+    ).all() as Array<{ priv_type: string; priv_len: number; pub_type: string; pub_len: number }>;
+    expect(markers).toHaveLength(2);
+    for (const row of markers) {
+      expect(row.priv_type).toBe('blob');
+      expect(row.pub_type).toBe('blob');
+      expect(row.priv_len).toBeGreaterThan(0);
+      expect(row.pub_len).toBeGreaterThan(0);
+    }
+  });
 });

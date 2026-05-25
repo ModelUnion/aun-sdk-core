@@ -30,9 +30,9 @@ export interface Target {
   keySource: string;
   /** 接收方 IK 公钥（DER SPKI）。 */
   ikPkDer: Uint8Array;
-  /** 接收方 SPK 公钥（DER SPKI）；undefined 表示走 1DH 路径。 */
+  /** 接收方 SPK 公钥（DER SPKI）；必须和 spkId 同时存在才走 3DH。 */
   spkPkDer?: Uint8Array;
-  /** SPK 标识；3DH 时为非空字符串，1DH 时为空串/未定义。 */
+  /** SPK 标识；非空表示 3DH/SPK，空串/未定义表示 1DH/IK。 */
   spkId?: string;
 }
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -124,6 +125,50 @@ func TestDecryptInteropGroupBob(t *testing.T) {
 
 func TestDecryptInteropGroupCarol(t *testing.T) {
 	runInteropTest(t, "group_3dh_1dh.json", "decryption_inputs_carol")
+}
+
+func TestDecryptWrongSPKReportsWrapKeyDecryptFailed(t *testing.T) {
+	path := filepath.Join(goldenEnvelopeRoot, "group_3dh_1dh.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取向量文件失败: %v", err)
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var fileObj map[string]any
+	if err := dec.Decode(&fileObj); err != nil {
+		t.Fatalf("解析 JSON 失败: %v", err)
+	}
+	envelope, ok := fileObj["envelope"].(map[string]any)
+	if !ok {
+		t.Fatalf("envelope 字段缺失或类型错误")
+	}
+	inputs, ok := fileObj["decryption_inputs_bob"].(map[string]any)
+	if !ok {
+		t.Fatalf("缺少 decryption_inputs_bob 字段")
+	}
+	selfAID, _ := inputs["self_aid"].(string)
+	selfDeviceID, _ := inputs["self_device_id"].(string)
+	selfIKPriv, err := decodeB64Field(inputs, "self_ik_priv_b64")
+	if err != nil {
+		t.Fatalf("self_ik_priv_b64 解析失败: %v", err)
+	}
+	senderPubDER, err := decodeB64Field(inputs, "sender_pub_der_b64")
+	if err != nil {
+		t.Fatalf("sender_pub_der_b64 解析失败: %v", err)
+	}
+
+	_, err = DecryptMessage(envelope, selfAID, selfDeviceID, selfIKPriv, selfIKPriv, senderPubDER)
+	if err == nil {
+		t.Fatalf("错误 SPK 应返回解密错误")
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, "wrap_key_decrypt_failed") ||
+		!strings.Contains(errText, "key_source=group_device_prekey") ||
+		!strings.Contains(errText, "spk_id=") {
+		t.Fatalf("错误 SPK 应返回精确 wrap 错误，实际: %v", err)
+	}
 }
 
 func TestPerDeviceMerkleProofMismatchReturnsNil(t *testing.T) {

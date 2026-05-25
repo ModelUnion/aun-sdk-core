@@ -87,13 +87,16 @@ export async function computeStateCommitment(
   epoch: number,
   statePayload: unknown,
 ): Promise<string> {
+  if (!Number.isInteger(epoch) || epoch < 0 || epoch > 0xffffffff) {
+    throw new Error(`epoch out of uint32 range: ${epoch}`);
+  }
   const sorted = deepClone(statePayload as StatePayload);
   sortPayload(sorted);
 
   const groupBytes = new TextEncoder().encode(groupId);
   const epochBytes = new Uint8Array(4);
   // big-endian uint32
-  new DataView(epochBytes.buffer).setUint32(0, epoch >>> 0, false);
+  new DataView(epochBytes.buffer).setUint32(0, epoch, false);
 
   const payloadBytes = canonicalJson(sorted);
 

@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -233,6 +234,90 @@ func summarizeCallParams(method string, params map[string]any) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
+func messagePayloadForDebug(message any) any {
+	msg, ok := message.(map[string]any)
+	if !ok || msg == nil {
+		return message
+	}
+	if payload, exists := msg["payload"]; exists {
+		return payload
+	}
+	if content, exists := msg["content"]; exists {
+		return content
+	}
+	if raw := strings.TrimSpace(stringFromAny(msg["envelope_json"])); raw != "" {
+		var parsed any
+		if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+			return parsed
+		}
+		return raw
+	}
+	if legacy, ok := msg["legacy_v1"].(map[string]any); ok {
+		if payload, exists := legacy["payload"]; exists {
+			return payload
+		}
+		if content, exists := legacy["content"]; exists {
+			return content
+		}
+	}
+	return nil
+}
+
+func messageEnvelopeFieldsForDebug(message any) map[string]any {
+	msg, ok := message.(map[string]any)
+	if !ok || msg == nil {
+		return map[string]any{"value_type": fmt.Sprintf("%T", message)}
+	}
+	keys := []string{
+		"message_id", "id", "from", "from_aid", "sender_aid", "to", "to_aid",
+		"group_id", "seq", "msg_seq", "type", "version", "timestamp", "t_server",
+		"device_id", "slot_id", "encrypted", "dispatch_mode", "dispatch",
+		"thought_id", "key", "from_device", "to_device",
+		"e2ee", "headers", "protected_headers", "context", "status",
+		"_decrypt_error", "_decrypt_stage",
+	}
+	out := make(map[string]any)
+	for _, key := range keys {
+		if value, exists := msg[key]; exists {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func anySlice(value any) []any {
+	if rows, ok := value.([]any); ok {
+		return rows
+	}
+	return nil
+}
+
+func (c *AUNClient) logMessageDebug(stage, source, event string, message any, extra map[string]any) {
+	c.logMessageDebugWithPayload(stage, source, event, message, messagePayloadForDebug(message), extra)
+}
+
+func (c *AUNClient) logMessageDebugWithPayload(stage, source, event string, message any, payload any, extra map[string]any) {
+	if c == nil || c.log == nil {
+		return
+	}
+	record := map[string]any{
+		"stage":    stage,
+		"source":   source,
+		"event":    event,
+		"envelope": messageEnvelopeFieldsForDebug(message),
+		"payload":  payload,
+	}
+	if len(extra) > 0 {
+		record["extra"] = extra
+	}
+	data, err := jsonMarshalNoHTMLEscape(record)
+	if err != nil {
+		c.log.Debug("message.debug <marshal_error: %v>", err)
+		return
+	}
+	c.log.Debug("message.debug %s", string(data))
+}
+
 // ClientState 客户端状态
 type ClientState string
 
@@ -284,7 +369,21 @@ var internalOnlyMethods = map[string]bool{
 
 // 需要客户端签名的关键方法
 var signedMethods = map[string]bool{
+	"message.send":                    true,
+	"message.v2.put_peer_pk":          true,
+	"message.v2.bootstrap":            true,
+	"message.v2.group_bootstrap":      true,
+	"message.v2.pull":                 true,
+	"message.v2.ack":                  true,
 	"group.send":                      true,
+	"group.v2.put_group_pk":           true,
+	"group.v2.bootstrap":              true,
+	"group.v2.send":                   true,
+	"group.v2.pull":                   true,
+	"group.v2.ack":                    true,
+	"group.v2.propose_state":          true,
+	"group.v2.confirm_state":          true,
+	"group.v2.get_proposal":           true,
 	"group.kick":                      true,
 	"group.add_member":                true,
 	"group.leave":                     true,
@@ -384,6 +483,7 @@ type AUNClient struct {
 	transport *RPCTransport
 	events    *EventDispatcher
 	discovery *GatewayDiscovery
+	dnsNet    *DnsResilientNet
 
 	// 会话参数
 	sessionParams  map[string]any
@@ -431,14 +531,15 @@ type AUNClient struct {
 	// Meta 命名空间
 	Meta *namespace.MetaNamespace
 
-	// 本地 agent.md 文件路径与对应 etag（quoted sha256 hex，与服务端 _agent_md_etag 一致）。
-	// 由 PublishAgentMD() / FetchAgentMD(自身 aid) 写入；用于跟服务端 RPC envelope._meta.agent_md_etag 比对，
-	// 触发"本地未发布到服务端"或"服务端版本更新"的 UI 提示。
+	// AgentMDs 目录：{agentMDPath}/list.json 保存元数据，{agentMDPath}/{aid}/agent.md 保存正文。
 	// gateway 在 RPC envelope._meta.agent_md_etag 注入服务端 etag；纯观察，无下游依赖。
-	agentMdMu         sync.RWMutex
-	localAgentMDPath  string
-	localAgentMDEtag  string
-	remoteAgentMDEtag string
+	agentMdMu            sync.RWMutex
+	agentMDPath          string
+	localAgentMDPath     string
+	localAgentMDEtag     string
+	remoteAgentMDEtag    string
+	agentMDCache         map[string]*keystore.AgentMDCacheRecord
+	agentMDFetchInflight map[string]bool
 
 	// 测试可注入的 agent.md 底层操作；nil 时使用 c.Auth。
 	agentMDOps agentMDOps
@@ -454,6 +555,10 @@ type AUNClient struct {
 	v2State *v2P2PState
 	// V2 安全增强状态（验签缓存 + fork 检测，参见 v2_state.go）
 	v2Security *v2StateSecurityState
+	// V2 sender IK 缺失 pending 队列：解密路径不在 RPC 回调栈内同步 bootstrap。
+	v2SenderIKMu       sync.Mutex
+	v2SenderIKPending  map[string]v2SenderIKPendingEntry
+	v2SenderIKFetching map[string]bool
 
 	// V2 push 通知 → auto-pull 串行化（only-one-in-flight + drain pending）
 	v2PushPullInflight atomic.Bool
@@ -490,6 +595,9 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	}
 	var ks keystore.KeyStore = fks
 
+	// 创建 DNS 容灾网络层（需在 AuthFlow 之前，因为 AuthFlow 依赖它）
+	dnsNet := NewDnsResilientNet(cfg.AUNPath, cfg.VerifySSL)
+
 	// 创建 AuthFlow
 	initAid := ""
 	if v, ok := rawConfig["aid"].(string); ok {
@@ -501,6 +609,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		AID:        initAid,
 		VerifySSL:  cfg.VerifySSL,
 		RootCAPath: cfg.RootCAPath,
+		DnsNet:     dnsNet,
 	})
 
 	deviceID := cfg.DeviceID()
@@ -514,6 +623,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		debugFlag = debug[0]
 	}
 	aunLogger := NewAUNLogger(debugFlag, cfg.AUNPath)
+	aunLogger.BindDeviceID(deviceID)
 	clientLog := aunLogger.For("aun_core.client")
 	clientLog.Info("AUNClient initialized: debug=%v aunPath=%s aid=%s", debugFlag, cfg.AUNPath, initAidOrDash(initAid))
 
@@ -533,7 +643,8 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		keyStore:                   ks,
 		auth:                       authFlow,
 		events:                     events,
-		discovery:                  NewGatewayDiscovery(cfg.VerifySSL),
+		dnsNet:                     dnsNet,
+		discovery:                  NewGatewayDiscovery(cfg.VerifySSL, dnsNet),
 		certCache:                  make(map[string]*cachedPeerCert),
 		connectDeliveryMode:        copyMapShallow(connectDeliveryMode),
 		defaultConnectDeliveryMode: copyMapShallow(connectDeliveryMode),
@@ -542,8 +653,13 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		pushedSeqs:                 make(map[string]map[int]bool),
 		pendingOrderedMsgs:         make(map[string]map[int]pendingOrderedMessage),
 		groupSynced:                make(map[string]bool),
+		agentMDPath:                filepath.Join(cfg.AUNPath, "AgentMDs"),
+		agentMDCache:               make(map[string]*keystore.AgentMDCacheRecord),
+		agentMDFetchInflight:       make(map[string]bool),
 		v2AutoProposeLocks:         make(map[string]*sync.Mutex),
 		v2AutoProposeLastSnapshot:  make(map[string]string),
+		v2SenderIKPending:          make(map[string]v2SenderIKPendingEntry),
+		v2SenderIKFetching:         make(map[string]bool),
 		heartbeatNudge:             make(chan struct{}, 1),
 		sessionOptions: map[string]any{
 			"auto_reconnect":       true,
@@ -569,7 +685,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	// 创建 RPCTransport（使用断线回调）
 	c.transport = NewRPCTransport(events, 10*time.Second, func(err error, closeCode int) {
 		c.handleTransportDisconnect(err, closeCode)
-	}, cfg.VerifySSL)
+	}, cfg.VerifySSL, dnsNet)
 	// 注册 RPC envelope._meta 观察者（吸收 gateway 注入的 agent_md_etag 等元数据）
 	c.transport.SetMetaObserver(c.observeRPCMeta)
 
@@ -638,6 +754,7 @@ type agentMDOps interface {
 	VerifyAgentMD(ctx context.Context, content string, opts *namespace.AgentMDVerifyOptions) (map[string]any, error)
 	UploadAgentMD(ctx context.Context, content string) (map[string]any, error)
 	DownloadAgentMD(ctx context.Context, aid string) (string, error)
+	HeadAgentMD(ctx context.Context, aid string) (map[string]any, error)
 }
 
 // AgentMDInfo 描述 FetchAgentMD 的返回结构。
@@ -651,17 +768,597 @@ type AgentMDInfo struct {
 	SaveError string `json:"save_error,omitempty"`
 }
 
+// AgentMDCheckResult 描述 CheckAgentMD 的本地/云端一致性结果。
+type AgentMDCheckResult struct {
+	AID          string `json:"aid"`
+	LocalFound   bool   `json:"local_found"`
+	RemoteFound  bool   `json:"remote_found"`
+	LocalEtag    string `json:"local_etag"`
+	RemoteEtag   string `json:"remote_etag"`
+	InSync       bool   `json:"in_sync"`
+	LastModified string `json:"last_modified"`
+	Status       int    `json:"status"`
+	Cached       bool   `json:"cached"`
+	VerifyStatus string `json:"verify_status"`
+	VerifyError  string `json:"verify_error"`
+}
+
+func agentMDContentEtag(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return "\"" + hex.EncodeToString(sum[:]) + "\""
+}
+
+func agentMDStringPtr(value string) *string { return &value }
+func agentMDInt64Ptr(value int64) *int64    { return &value }
+func agentMDBoolFromAny(value any) bool {
+	if b, ok := value.(bool); ok {
+		return b
+	}
+	if s, ok := value.(string); ok {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "1", "true", "yes", "on", "found":
+			return true
+		}
+	}
+	return false
+}
+
+func agentMDCheckedAtFresh(checkedAtMs int64, maxUnsyncedDays float64) bool {
+	if maxUnsyncedDays <= 0 || checkedAtMs <= 0 {
+		return false
+	}
+	return float64(time.Now().UnixMilli()-checkedAtMs) <= maxUnsyncedDays*float64(24*60*60*1000)
+}
+
+func agentMDLastModifiedFresh(lastModified string, maxUnsyncedDays float64) bool {
+	if maxUnsyncedDays <= 0 {
+		return false
+	}
+	parsed, err := http.ParseTime(strings.TrimSpace(lastModified))
+	if err != nil {
+		return false
+	}
+	return time.Now().Before(parsed.Add(time.Duration(maxUnsyncedDays * float64(24*time.Hour))))
+}
+
+func cloneAgentMDRecord(rec *keystore.AgentMDCacheRecord) *keystore.AgentMDCacheRecord {
+	if rec == nil {
+		return nil
+	}
+	out := *rec
+	return &out
+}
+
+func applyAgentMDCacheUpsert(rec *keystore.AgentMDCacheRecord, fields keystore.AgentMDCacheUpsert) {
+	if fields.Content != nil {
+		rec.Content = *fields.Content
+	}
+	if fields.LocalEtag != nil {
+		rec.LocalEtag = *fields.LocalEtag
+	}
+	if fields.RemoteEtag != nil {
+		rec.RemoteEtag = *fields.RemoteEtag
+	}
+	if fields.LastModified != nil {
+		rec.LastModified = *fields.LastModified
+	}
+	if fields.FetchedAt != nil {
+		rec.FetchedAt = *fields.FetchedAt
+	}
+	if fields.ObservedAt != nil {
+		rec.ObservedAt = *fields.ObservedAt
+	}
+	if fields.CheckedAt != nil {
+		rec.CheckedAt = *fields.CheckedAt
+	}
+	if fields.RemoteStatus != nil {
+		rec.RemoteStatus = *fields.RemoteStatus
+	}
+	if fields.VerifyStatus != nil {
+		rec.VerifyStatus = *fields.VerifyStatus
+	}
+	if fields.VerifyError != nil {
+		rec.VerifyError = *fields.VerifyError
+	}
+	if fields.LastError != nil {
+		rec.LastError = *fields.LastError
+	}
+	rec.UpdatedAt = time.Now().UnixMilli()
+}
+
+func (c *AUNClient) agentMDOwnerAID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return strings.TrimSpace(c.aid)
+}
+
+// SetAgentMDPath 设置 agent.md 本地存储根目录；空字符串恢复默认 {aun_path}/AgentMDs。
+func (c *AUNClient) SetAgentMDPath(root string) string {
+	next := strings.TrimSpace(root)
+	if next == "" {
+		next = filepath.Join(c.configModel.AUNPath, "AgentMDs")
+	}
+	_ = os.MkdirAll(next, 0o755)
+	c.agentMdMu.Lock()
+	c.agentMDPath = next
+	c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
+	c.agentMdMu.Unlock()
+	return next
+}
+
+// SetAgentMdPath 保留 Go 以外 SDK 的大小写习惯别名。
+func (c *AUNClient) SetAgentMdPath(root string) string { return c.SetAgentMDPath(root) }
+
+func (c *AUNClient) agentMDRoot() string {
+	c.agentMdMu.RLock()
+	root := strings.TrimSpace(c.agentMDPath)
+	c.agentMdMu.RUnlock()
+	if root == "" {
+		root = filepath.Join(c.configModel.AUNPath, "AgentMDs")
+	}
+	_ = os.MkdirAll(root, 0o755)
+	return root
+}
+
+func agentMDSafeAID(aid string) (string, error) {
+	target := strings.TrimSpace(aid)
+	if target == "" || strings.ContainsAny(target, "/\\\x00") {
+		return "", fmt.Errorf("agent.md aid is empty or contains path separators")
+	}
+	return target, nil
+}
+
+func (c *AUNClient) agentMDFilePath(aid string) (string, error) {
+	safe, err := agentMDSafeAID(aid)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(c.agentMDRoot(), safe, "agent.md"), nil
+}
+
+func (c *AUNClient) agentMDListPath() string { return filepath.Join(c.agentMDRoot(), "list.json") }
+
+func atomicWriteText(path string, content []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.%d.%d.tmp", filepath.Base(path), os.Getpid(), time.Now().UnixNano()))
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+		_ = os.Remove(tmp)
+	}()
+	if _, err := f.Write(content); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
+}
+
+func (c *AUNClient) withAgentMDListLock(fn func() error) error {
+	lockPath := filepath.Join(c.agentMDRoot(), "list.json.lock")
+	deadline := time.Now().Add(5 * time.Second)
+	var f *os.File
+	for f == nil {
+		opened, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err == nil {
+			f = opened
+			_, _ = f.WriteString(fmt.Sprintf("%d\n", os.Getpid()))
+			break
+		}
+		if !os.IsExist(err) || time.Now().After(deadline) {
+			return err
+		}
+		if st, statErr := os.Stat(lockPath); statErr == nil && time.Since(st.ModTime()) > 30*time.Second {
+			_ = os.Remove(lockPath)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	defer func() {
+		_ = f.Close()
+		_ = os.Remove(lockPath)
+	}()
+	return fn()
+}
+func agentMDRecordToMap(rec *keystore.AgentMDCacheRecord) map[string]any {
+	m := map[string]any{"aid": rec.AID}
+	if rec.LocalEtag != "" {
+		m["local_etag"] = rec.LocalEtag
+	}
+	if rec.RemoteEtag != "" {
+		m["remote_etag"] = rec.RemoteEtag
+	}
+	if rec.LastModified != "" {
+		m["last_modified"] = rec.LastModified
+	}
+	if rec.FetchedAt != 0 {
+		m["fetched_at"] = rec.FetchedAt
+	}
+	if rec.ObservedAt != 0 {
+		m["observed_at"] = rec.ObservedAt
+	}
+	if rec.CheckedAt != 0 {
+		m["checked_at"] = rec.CheckedAt
+	}
+	if rec.RemoteStatus != "" {
+		m["remote_status"] = rec.RemoteStatus
+	}
+	if rec.VerifyStatus != "" {
+		m["verify_status"] = rec.VerifyStatus
+	}
+	if rec.VerifyError != "" {
+		m["verify_error"] = rec.VerifyError
+	}
+	if rec.LastError != "" {
+		m["last_error"] = rec.LastError
+	}
+	if rec.UpdatedAt != 0 {
+		m["updated_at"] = rec.UpdatedAt
+	}
+	return m
+}
+
+func agentMDMapToRecord(aid string, raw map[string]any) *keystore.AgentMDCacheRecord {
+	rec := &keystore.AgentMDCacheRecord{AID: strings.TrimSpace(stringFromAny(raw["aid"]))}
+	if rec.AID == "" {
+		rec.AID = aid
+	}
+	rec.LocalEtag = strings.TrimSpace(stringFromAny(raw["local_etag"]))
+	rec.RemoteEtag = strings.TrimSpace(stringFromAny(raw["remote_etag"]))
+	rec.LastModified = strings.TrimSpace(stringFromAny(raw["last_modified"]))
+	rec.FetchedAt = toInt64(raw["fetched_at"])
+	rec.ObservedAt = toInt64(raw["observed_at"])
+	rec.CheckedAt = toInt64(raw["checked_at"])
+	rec.RemoteStatus = strings.TrimSpace(stringFromAny(raw["remote_status"]))
+	rec.VerifyStatus = strings.TrimSpace(stringFromAny(raw["verify_status"]))
+	rec.VerifyError = strings.TrimSpace(stringFromAny(raw["verify_error"]))
+	rec.LastError = strings.TrimSpace(stringFromAny(raw["last_error"]))
+	rec.UpdatedAt = toInt64(raw["updated_at"])
+	return rec
+}
+
+func (c *AUNClient) writeAgentMDListUnlocked(records map[string]*keystore.AgentMDCacheRecord) error {
+	out := make(map[string]any)
+	for aid, rec := range records {
+		if rec != nil && strings.TrimSpace(aid) != "" {
+			out[aid] = agentMDRecordToMap(rec)
+		}
+	}
+	payload := map[string]any{"version": 1, "updated_at": time.Now().UnixMilli(), "records": out}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return atomicWriteText(c.agentMDListPath(), data)
+}
+
+func (c *AUNClient) normalizeAgentMDList(payload map[string]any) map[string]*keystore.AgentMDCacheRecord {
+	records := make(map[string]*keystore.AgentMDCacheRecord)
+	raw, _ := payload["records"].(map[string]any)
+	for aid, value := range raw {
+		m, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		rec := agentMDMapToRecord(aid, m)
+		if strings.TrimSpace(rec.AID) != "" {
+			records[rec.AID] = rec
+		}
+	}
+	return records
+}
+
+func (c *AUNClient) rebuildAgentMDListUnlocked() map[string]*keystore.AgentMDCacheRecord {
+	records := make(map[string]*keystore.AgentMDCacheRecord)
+	now := time.Now().UnixMilli()
+	entries, err := os.ReadDir(c.agentMDRoot())
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			aid := entry.Name()
+			path := filepath.Join(c.agentMDRoot(), aid, "agent.md")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			fetchedAt := now
+			if st, err := os.Stat(path); err == nil {
+				fetchedAt = st.ModTime().UnixMilli()
+			}
+			records[aid] = &keystore.AgentMDCacheRecord{AID: aid, LocalEtag: agentMDContentEtag(string(data)), FetchedAt: fetchedAt, UpdatedAt: now}
+		}
+	}
+	if err := c.writeAgentMDListUnlocked(records); err != nil {
+		c.log.Debug("agent.md list rebuild write failed: %v", err)
+	}
+	c.agentMdMu.Lock()
+	c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
+	c.agentMdMu.Unlock()
+	return records
+}
+
+func (c *AUNClient) readAgentMDListUnlocked() map[string]*keystore.AgentMDCacheRecord {
+	data, err := os.ReadFile(c.agentMDListPath())
+	if err != nil {
+		return c.rebuildAgentMDListUnlocked()
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		c.log.Warn("agent.md list.json damaged, rebuilding: %v", err)
+		return c.rebuildAgentMDListUnlocked()
+	}
+	return c.normalizeAgentMDList(payload)
+}
+func (c *AUNClient) loadAgentMDRecord(aid string) *keystore.AgentMDCacheRecord {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return nil
+	}
+	var rec *keystore.AgentMDCacheRecord
+	if err := c.withAgentMDListLock(func() error {
+		records := c.readAgentMDListUnlocked()
+		if records[target] != nil {
+			rec = cloneAgentMDRecord(records[target])
+		}
+		return nil
+	}); err != nil {
+		c.log.Debug("agent.md cache load skipped: aid=%s err=%v", target, err)
+		return nil
+	}
+	if rec == nil {
+		return nil
+	}
+	if p, err := c.agentMDFilePath(target); err == nil {
+		if data, err := os.ReadFile(p); err == nil {
+			rec.Content = string(data)
+			rec.LocalEtag = agentMDContentEtag(rec.Content)
+		} else {
+			c.log.Warn("agent.md content read failed: aid=%s err=%v", target, err)
+		}
+	}
+	c.agentMdMu.Lock()
+	if c.agentMDCache == nil {
+		c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
+	}
+	c.agentMDCache[target] = cloneAgentMDRecord(rec)
+	c.agentMdMu.Unlock()
+	return cloneAgentMDRecord(rec)
+}
+
+func (c *AUNClient) saveAgentMDRecord(aid string, fields keystore.AgentMDCacheUpsert) *keystore.AgentMDCacheRecord {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return nil
+	}
+	if fields.Content != nil {
+		p, err := c.agentMDFilePath(target)
+		if err != nil {
+			c.log.Debug("agent.md content path invalid: aid=%s err=%v", target, err)
+			return nil
+		}
+		if err := atomicWriteText(p, []byte(*fields.Content)); err != nil {
+			c.log.Debug("agent.md content save skipped: aid=%s err=%v", target, err)
+			return nil
+		}
+		if fields.LocalEtag == nil {
+			fields.LocalEtag = agentMDStringPtr(agentMDContentEtag(*fields.Content))
+		}
+		if fields.FetchedAt == nil {
+			fields.FetchedAt = agentMDInt64Ptr(time.Now().UnixMilli())
+		}
+	}
+	var rec *keystore.AgentMDCacheRecord
+	if err := c.withAgentMDListLock(func() error {
+		records := c.readAgentMDListUnlocked()
+		rec = &keystore.AgentMDCacheRecord{AID: target}
+		if existing := records[target]; existing != nil {
+			rec = cloneAgentMDRecord(existing)
+		}
+		applyAgentMDCacheUpsert(rec, fields)
+		rec.Content = ""
+		rec.UpdatedAt = time.Now().UnixMilli()
+		records[target] = cloneAgentMDRecord(rec)
+		return c.writeAgentMDListUnlocked(records)
+	}); err != nil {
+		c.log.Debug("agent.md cache save skipped: aid=%s err=%v", target, err)
+		return nil
+	}
+	loaded := cloneAgentMDRecord(rec)
+	if fields.Content != nil {
+		loaded.Content = *fields.Content
+	}
+	c.agentMdMu.Lock()
+	if c.agentMDCache == nil {
+		c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
+	}
+	c.agentMDCache[target] = cloneAgentMDRecord(loaded)
+	owner := c.agentMDOwnerAID()
+	if target == owner {
+		if loaded.LocalEtag != "" {
+			c.localAgentMDEtag = loaded.LocalEtag
+		}
+		if loaded.RemoteEtag != "" {
+			c.remoteAgentMDEtag = loaded.RemoteEtag
+		}
+	}
+	c.agentMdMu.Unlock()
+	return cloneAgentMDRecord(loaded)
+}
+
+func (c *AUNClient) agentMDHasLocalContent(aid string, rec *keystore.AgentMDCacheRecord) bool {
+	if rec != nil && strings.TrimSpace(rec.Content) != "" {
+		return true
+	}
+	p, err := c.agentMDFilePath(aid)
+	if err != nil {
+		return false
+	}
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+func (c *AUNClient) scheduleAgentMDFetchIfMissing(aid string, rec *keystore.AgentMDCacheRecord, source string) {
+	target := strings.TrimSpace(aid)
+	if target == "" || c.agentMDHasLocalContent(target, rec) {
+		return
+	}
+	c.agentMdMu.Lock()
+	if c.agentMDFetchInflight == nil {
+		c.agentMDFetchInflight = make(map[string]bool)
+	}
+	if c.agentMDFetchInflight[target] {
+		c.agentMdMu.Unlock()
+		return
+	}
+	c.agentMDFetchInflight[target] = true
+	c.agentMdMu.Unlock()
+
+	go func() {
+		defer func() {
+			c.agentMdMu.Lock()
+			delete(c.agentMDFetchInflight, target)
+			c.agentMdMu.Unlock()
+		}()
+		ctx := context.Background()
+		c.mu.RLock()
+		if c.ctx != nil {
+			ctx = c.ctx
+		}
+		c.mu.RUnlock()
+		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if _, err := c.FetchAgentMD(fetchCtx, target); err != nil {
+			c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
+				LastError:    agentMDStringPtr(err.Error()),
+				RemoteStatus: agentMDStringPtr("found"),
+			})
+			c.log.Debug("agent.md auto fetch failed: aid=%s source=%s err=%v", target, source, err)
+		}
+	}()
+}
+
+func (c *AUNClient) observeAgentMDMeta(aid, etag, lastModified, source string) {
+	target := strings.TrimSpace(aid)
+	remoteEtag := strings.TrimSpace(etag)
+	remoteLastModified := strings.TrimSpace(lastModified)
+	if target == "" || (remoteEtag == "" && remoteLastModified == "") {
+		return
+	}
+	c.agentMdMu.RLock()
+	before := cloneAgentMDRecord(c.agentMDCache[target])
+	c.agentMdMu.RUnlock()
+	if before == nil {
+		before = c.loadAgentMDRecord(target)
+	}
+	same := before != nil &&
+		(remoteEtag == "" || strings.TrimSpace(before.RemoteEtag) == remoteEtag) &&
+		(remoteLastModified == "" || strings.TrimSpace(before.LastModified) == remoteLastModified)
+	record := cloneAgentMDRecord(before)
+	if !same || before == nil {
+		fields := keystore.AgentMDCacheUpsert{
+			ObservedAt:   agentMDInt64Ptr(time.Now().UnixMilli()),
+			RemoteStatus: agentMDStringPtr("found"),
+		}
+		if remoteEtag != "" {
+			fields.RemoteEtag = agentMDStringPtr(remoteEtag)
+		}
+		if remoteLastModified != "" {
+			fields.LastModified = agentMDStringPtr(remoteLastModified)
+		}
+		record = c.saveAgentMDRecord(target, fields)
+	}
+	if target == c.agentMDOwnerAID() && remoteEtag != "" {
+		c.agentMdMu.Lock()
+		c.remoteAgentMDEtag = remoteEtag
+		c.agentMdMu.Unlock()
+	}
+	c.scheduleAgentMDFetchIfMissing(target, record, source)
+	if source != "" {
+		c.log.Debug("agent.md meta observed: aid=%s etag=%s last_modified=%s source=%s", target, remoteEtag, remoteLastModified, source)
+	}
+}
+
+func (c *AUNClient) observeAgentMDEtag(aid, etag, source string) {
+	c.observeAgentMDMeta(aid, etag, "", source)
+}
+
+func (c *AUNClient) observeAgentMDFromEnvelope(envelope map[string]any) {
+	if envelope == nil {
+		return
+	}
+	agentMD, _ := envelope["agent_md"].(map[string]any)
+	if agentMD == nil {
+		return
+	}
+	sender, _ := agentMD["sender"].(map[string]any)
+	if sender == nil {
+		return
+	}
+	senderAID := strings.TrimSpace(v2AsString(sender["aid"]))
+	if senderAID == "" {
+		if aad, ok := envelope["aad"].(map[string]any); ok {
+			senderAID = strings.TrimSpace(v2AsString(aad["from"]))
+		}
+	}
+	if senderAID == "" {
+		senderAID = strings.TrimSpace(v2AsString(envelope["from"]))
+	}
+	lastModified := strings.TrimSpace(v2AsString(sender["last_modified"]))
+	if lastModified == "" {
+		lastModified = strings.TrimSpace(v2AsString(sender["lastModified"]))
+	}
+	c.observeAgentMDMeta(senderAID, v2AsString(sender["etag"]), lastModified, "envelope")
+}
+
+func (c *AUNClient) agentMDAuthCacheMeta(aid string) (string, string) {
+	if c.Auth == nil {
+		return "", ""
+	}
+	meta := c.Auth.CachedAgentMDMeta(aid)
+	if meta == nil {
+		return "", ""
+	}
+	return strings.TrimSpace(meta["etag"]), strings.TrimSpace(meta["last_modified"])
+}
+
 // PublishAgentMD 读取本地 agent.md → 签名 → 上传到服务端，并刷新内部 localAgentMDEtag。
 //
 // path 为空 / 文件不存在时返回 error；上传失败时透传底层错误。
-func (c *AUNClient) PublishAgentMD(ctx context.Context, path string) (map[string]any, error) {
-	raw := strings.TrimSpace(path)
-	if raw == "" {
-		return nil, fmt.Errorf("PublishAgentMD requires non-empty path")
+// PublishAgentMD 读取 {agentMDPath}/{self_aid}/agent.md → 签名 → 上传到服务端，并刷新内部 localAgentMDEtag。
+func (c *AUNClient) PublishAgentMD(ctx context.Context, _legacyPath ...string) (map[string]any, error) {
+	target := c.agentMDOwnerAID()
+	if target == "" {
+		return nil, fmt.Errorf("PublishAgentMD requires local AID")
 	}
-	data, err := os.ReadFile(raw)
+	p, err := c.agentMDFilePath(target)
 	if err != nil {
-		return nil, fmt.Errorf("PublishAgentMD read file: %w", err)
+		return nil, err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, fmt.Errorf("PublishAgentMD read default agent.md: %w", err)
 	}
 	content := string(data)
 	ops := c.resolveAgentMDOps()
@@ -673,12 +1370,29 @@ func (c *AUNClient) PublishAgentMD(ctx context.Context, path string) (map[string
 	if err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256([]byte(signed))
-	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(sum[:]))
+	localEtag := agentMDContentEtag(signed)
+	remoteEtag := strings.TrimSpace(stringFromAny(result["etag"]))
+	lastModified := strings.TrimSpace(stringFromAny(result["last_modified"]))
+	remoteStatus := "unknown"
+	if remoteEtag != "" {
+		remoteStatus = "found"
+	}
 	c.agentMdMu.Lock()
-	c.localAgentMDPath = raw
-	c.localAgentMDEtag = etag
+	c.localAgentMDPath = p
+	c.localAgentMDEtag = localEtag
+	if remoteEtag != "" {
+		c.remoteAgentMDEtag = remoteEtag
+	}
 	c.agentMdMu.Unlock()
+	c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
+		Content:      agentMDStringPtr(signed),
+		LocalEtag:    agentMDStringPtr(localEtag),
+		RemoteEtag:   agentMDStringPtr(remoteEtag),
+		LastModified: agentMDStringPtr(lastModified),
+		FetchedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
+		RemoteStatus: agentMDStringPtr(remoteStatus),
+		LastError:    agentMDStringPtr(""),
+	})
 	return result, nil
 }
 
@@ -686,7 +1400,7 @@ func (c *AUNClient) PublishAgentMD(ctx context.Context, path string) (map[string
 // 若 aid 是自己则同步刷新 localAgentMDEtag 与 InSync。
 //
 // 写盘失败不影响 FetchAgentMD 整体成功，错误信息回填到 AgentMDInfo.SaveError。
-func (c *AUNClient) FetchAgentMD(ctx context.Context, aid string, savePath string) (*AgentMDInfo, error) {
+func (c *AUNClient) FetchAgentMD(ctx context.Context, aid string, _legacySavePath ...string) (*AgentMDInfo, error) {
 	target := strings.TrimSpace(aid)
 	if target == "" {
 		c.mu.RLock()
@@ -713,29 +1427,154 @@ func (c *AUNClient) FetchAgentMD(ctx context.Context, aid string, savePath strin
 	selfAid := strings.TrimSpace(c.aid)
 	c.mu.RUnlock()
 
+	localEtag := agentMDContentEtag(content)
+	remoteEtag, lastModified := c.agentMDAuthCacheMeta(target)
 	if target == selfAid {
-		sum := sha256.Sum256([]byte(content))
-		etag := "\"" + hex.EncodeToString(sum[:]) + "\""
 		c.agentMdMu.Lock()
-		c.localAgentMDEtag = etag
-		local := c.localAgentMDEtag
+		c.localAgentMDEtag = localEtag
+		if remoteEtag != "" {
+			c.remoteAgentMDEtag = remoteEtag
+		}
 		remote := c.remoteAgentMDEtag
 		c.agentMdMu.Unlock()
-		var inSync bool
-		if local != "" && remote != "" {
-			inSync = local == remote
+		inSync := false
+		if localEtag != "" && remote != "" {
+			inSync = localEtag == remote
 		}
 		info.InSync = &inSync
 	}
 
-	if savePath != "" {
-		if err := os.WriteFile(savePath, []byte(content), 0o644); err != nil {
-			info.SaveError = err.Error()
-		} else {
-			info.SavedTo = savePath
-		}
+	fields := keystore.AgentMDCacheUpsert{
+		Content:      agentMDStringPtr(content),
+		LocalEtag:    agentMDStringPtr(localEtag),
+		FetchedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
+		RemoteStatus: agentMDStringPtr("found"),
+		VerifyStatus: agentMDStringPtr(strings.TrimSpace(stringFromAny(sig["status"]))),
+		VerifyError:  agentMDStringPtr(strings.TrimSpace(stringFromAny(sig["reason"]))),
+		LastError:    agentMDStringPtr(""),
+	}
+	if remoteEtag != "" {
+		fields.RemoteEtag = agentMDStringPtr(remoteEtag)
+	}
+	if lastModified != "" {
+		fields.LastModified = agentMDStringPtr(lastModified)
+	}
+	c.saveAgentMDRecord(target, fields)
+	if p, err := c.agentMDFilePath(target); err == nil {
+		info.SavedTo = p
 	}
 	return info, nil
+}
+
+// CheckAgentMD 通过 HEAD 比较本地缓存 agent.md 与云端 agent.md ETag 是否一致。
+func (c *AUNClient) CheckAgentMD(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		target = c.agentMDOwnerAID()
+	}
+	if target == "" {
+		return nil, fmt.Errorf("CheckAgentMD requires aid (or local AID)")
+	}
+	maxDays := 0.0
+	if len(maxUnsyncedDays) > 0 {
+		maxDays = maxUnsyncedDays[0]
+	}
+	before := c.loadAgentMDRecord(target)
+	localEtag := ""
+	localFound := false
+	remoteEtagCached := ""
+	lastModifiedCached := ""
+	verifyStatus := ""
+	verifyError := ""
+	checkedAtCached := int64(0)
+	if before != nil {
+		localEtag = strings.TrimSpace(before.LocalEtag)
+		localFound = strings.TrimSpace(before.Content) != "" || localEtag != ""
+		remoteEtagCached = strings.TrimSpace(before.RemoteEtag)
+		lastModifiedCached = strings.TrimSpace(before.LastModified)
+		verifyStatus = strings.TrimSpace(before.VerifyStatus)
+		verifyError = strings.TrimSpace(before.VerifyError)
+		checkedAtCached = before.CheckedAt
+	}
+	// max_unsynced_days > 0 且距上次 HEAD 在窗口内 → 直接返回缓存；否则强制 HEAD。
+	if localFound && localEtag != "" && remoteEtagCached != "" && localEtag == remoteEtagCached && agentMDCheckedAtFresh(checkedAtCached, maxDays) {
+		return &AgentMDCheckResult{
+			AID:          target,
+			LocalFound:   true,
+			RemoteFound:  true,
+			LocalEtag:    localEtag,
+			RemoteEtag:   remoteEtagCached,
+			InSync:       true,
+			LastModified: lastModifiedCached,
+			Status:       200,
+			Cached:       true,
+			VerifyStatus: verifyStatus,
+			VerifyError:  verifyError,
+		}, nil
+	}
+
+	now := time.Now().UnixMilli()
+	remote, err := c.resolveAgentMDOps().HeadAgentMD(ctx, target)
+	if err != nil {
+		c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
+			CheckedAt:    agentMDInt64Ptr(now),
+			RemoteStatus: agentMDStringPtr("error"),
+			LastError:    agentMDStringPtr(err.Error()),
+		})
+		return nil, err
+	}
+	remoteFound := agentMDBoolFromAny(remote["found"])
+	remoteEtag := strings.TrimSpace(stringFromAny(remote["etag"]))
+	lastModified := strings.TrimSpace(stringFromAny(remote["last_modified"]))
+	if lastModified == "" {
+		lastModified = strings.TrimSpace(stringFromAny(remote["lastModified"]))
+	}
+	status := int(toInt64(remote["status"]))
+	if status == 0 {
+		if remoteFound {
+			status = 200
+		} else {
+			status = 404
+		}
+	}
+	remoteStatus := "missing"
+	if remoteFound {
+		remoteStatus = "found"
+	}
+	saved := c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
+		RemoteEtag:   agentMDStringPtr(map[bool]string{true: remoteEtag, false: ""}[remoteFound]),
+		LastModified: agentMDStringPtr(lastModified),
+		CheckedAt:    agentMDInt64Ptr(now),
+		RemoteStatus: agentMDStringPtr(remoteStatus),
+		LastError:    agentMDStringPtr(""),
+	})
+	if saved != nil {
+		verifyStatus = strings.TrimSpace(saved.VerifyStatus)
+		verifyError = strings.TrimSpace(saved.VerifyError)
+	}
+	if target == c.agentMDOwnerAID() && remoteEtag != "" {
+		c.agentMdMu.Lock()
+		c.remoteAgentMDEtag = remoteEtag
+		c.agentMdMu.Unlock()
+	}
+	return &AgentMDCheckResult{
+		AID:          target,
+		LocalFound:   localFound,
+		RemoteFound:  remoteFound,
+		LocalEtag:    localEtag,
+		RemoteEtag:   remoteEtag,
+		InSync:       localFound && remoteFound && localEtag != "" && remoteEtag != "" && localEtag == remoteEtag,
+		LastModified: lastModified,
+		Status:       status,
+		Cached:       false,
+		VerifyStatus: verifyStatus,
+		VerifyError:  verifyError,
+	}, nil
+}
+
+// CheckAgentMd 保留 Go 以外 SDK 的大小写习惯别名。
+func (c *AUNClient) CheckAgentMd(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
+	return c.CheckAgentMD(ctx, aid, maxUnsyncedDays...)
 }
 
 // resolveAgentMDOps 返回测试注入的 agentMDOps 或默认 c.Auth。
@@ -752,14 +1591,33 @@ func (c *AUNClient) observeRPCMeta(meta map[string]any) {
 	if meta == nil {
 		return
 	}
-	raw, _ := meta["agent_md_etag"].(string)
-	etag := strings.TrimSpace(raw)
-	if etag == "" {
+	if etag := strings.TrimSpace(stringFromAny(meta["agent_md_etag"])); etag != "" {
+		c.agentMdMu.Lock()
+		c.remoteAgentMDEtag = etag
+		c.agentMdMu.Unlock()
+		c.observeAgentMDMeta(c.agentMDOwnerAID(), etag, "", "rpc.self")
+	}
+	etags, _ := meta["agent_md_etags"].(map[string]any)
+	if etags == nil {
 		return
 	}
-	c.agentMdMu.Lock()
-	c.remoteAgentMDEtag = etag
-	c.agentMdMu.Unlock()
+	// role key 优先级：requester / peer 是新规范，其余是兼容旧 SDK 的别名。
+	for _, key := range []string{"requester", "peer", "receiver", "target", "to", "sender", "from"} {
+		item, _ := etags[key].(map[string]any)
+		if item == nil {
+			continue
+		}
+		lastModified := strings.TrimSpace(stringFromAny(item["last_modified"]))
+		if lastModified == "" {
+			lastModified = strings.TrimSpace(stringFromAny(item["lastModified"]))
+		}
+		c.observeAgentMDMeta(
+			strings.TrimSpace(stringFromAny(item["aid"])),
+			strings.TrimSpace(stringFromAny(item["etag"])),
+			lastModified,
+			"rpc."+key,
+		)
+	}
 }
 
 // ── namespace.ClientInterface 实现 ─────────────────────────
@@ -861,6 +1719,16 @@ func (c *AUNClient) AuthPersistGatewayURL(aid, gatewayURL string) {
 // AuthFetchPeerCert 通过 AuthFlow 获取并验证对端证书。
 func (c *AUNClient) AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error) {
 	return c.fetchPeerCert(ctx, aid, certFingerprint)
+}
+
+// AuthLoadKeyPair 加载指定 AID 的密钥对（供 CheckAID 使用）
+func (c *AUNClient) AuthLoadKeyPair(aid string) (map[string]any, error) {
+	return c.keyStore.LoadKeyPair(aid)
+}
+
+// AuthLoadCert 加载指定 AID 的证书 PEM（供 CheckAID 使用）
+func (c *AUNClient) AuthLoadCert(aid string) (string, error) {
+	return c.keyStore.LoadCert(aid)
 }
 
 // DiscoverGateway 通过 GatewayDiscovery 发现 Gateway URL
@@ -985,7 +1853,28 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 	}
 	c.mu.RUnlock()
 
-	err = c.connectOnce(ctx, normalized, false)
+	gateways := c.resolveGateways(normalized)
+	var lastErr error
+	for _, gw := range gateways {
+		gwParams := make(map[string]any)
+		for k, v := range normalized {
+			gwParams[k] = v
+		}
+		gwParams["gateway"] = gw
+		lastErr = c.connectOnce(ctx, gwParams, false)
+		if lastErr == nil {
+			return nil
+		}
+		if len(gateways) > 1 {
+			c.log.Warn("Connect: gateway %s failed, trying next: %v", gw, lastErr)
+		}
+		c.mu.Lock()
+		if c.state == StateConnecting || c.state == StateAuthenticating {
+			c.state = StateConnecting
+		}
+		c.mu.Unlock()
+	}
+	err = lastErr
 	if err != nil {
 		c.log.Error("Connect failed: err=%v", err)
 		c.mu.Lock()
@@ -1125,6 +2014,9 @@ func (c *AUNClient) Close() (err error) {
 		if closer, ok := c.keyStore.(interface{ Close() }); ok {
 			closer.Close()
 		}
+		if c.dnsNet != nil {
+			c.dnsNet.Close()
+		}
 		c.releaseV2State()
 		c.mu.Lock()
 		c.state = StateClosed
@@ -1139,6 +2031,9 @@ func (c *AUNClient) Close() (err error) {
 	}
 	if closer, ok := c.keyStore.(interface{ Close() }); ok {
 		closer.Close()
+	}
+	if c.dnsNet != nil {
+		c.dnsNet.Close()
 	}
 	c.releaseV2State()
 
@@ -1186,6 +2081,9 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		}
 		params = copied
 	}
+	if method == "message.send" || method == "group.send" {
+		c.normalizeOutboundMessagePayload(params, method)
+	}
 	if err := c.validateOutboundCall(method, params); err != nil {
 		return nil, err
 	}
@@ -1203,7 +2101,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 	}
 
 	// group.* 方法注入 device_id（服务端用于多设备消息路由）
-	if strings.HasPrefix(method, "group.") && c.deviceID != "" {
+	if strings.HasPrefix(method, "group.") {
 		if _, exists := params["device_id"]; !exists {
 			params["device_id"] = c.deviceID
 		}
@@ -1213,6 +2111,8 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			params["slot_id"] = c.slotID
 		}
 	}
+
+	c.clampAckParams(method, params)
 
 	// 自动加密：message.send 默认加密
 	if method == "message.send" {
@@ -1316,7 +2216,11 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 
 	// 关键操作自动附加客户端签名
 	if signedMethods[method] {
-		c.signClientOperation(method, params)
+		if c.shouldSkipClientSignature(method, params) {
+			delete(params, "client_signature")
+		} else {
+			c.signClientOperation(method, params)
+		}
 	}
 
 	// P1-23: 非幂等方法使用更长超时
@@ -1327,6 +2231,9 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		defer cancel()
 	}
 
+	if method == "message.thought.get" || method == "group.thought.get" {
+		c.log.Debug("thought.get transport call start: method=%s params=%s", method, summarizeCallParams(method, params))
+	}
 	result, err = c.transport.Call(callCtx, method, params)
 	if err != nil {
 		return nil, err
@@ -1334,10 +2241,16 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 
 	// V2-only thought.get：服务端只存 envelope，SDK 读取时按当前设备解密。
 	if method == "message.thought.get" && c.v2GetState() != nil {
+		if m, ok := result.(map[string]any); ok {
+			c.log.Debug("message.thought.get transport result: found=%v raw_count=%d", m["found"], len(anySlice(m["thoughts"])))
+		}
 		fromAID := strings.TrimSpace(getStr(params, "sender_aid", ""))
 		c.decryptV2ThoughtGetResult(ctx, result, fromAID, false)
 	}
 	if method == "group.thought.get" && c.v2GetState() != nil {
+		if m, ok := result.(map[string]any); ok {
+			c.log.Debug("group.thought.get transport result: found=%v raw_count=%d", m["found"], len(anySlice(m["thoughts"])))
+		}
 		fromAID := strings.TrimSpace(getStr(params, "sender_aid", ""))
 		c.decryptV2ThoughtGetResult(ctx, result, fromAID, true)
 	}
@@ -1353,6 +2266,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			c.mu.RUnlock()
 			if myAID != "" {
 				ns := "p2p:" + myAID
+				contigBefore := c.seqTracker.GetContiguousSeq(ns)
 				var pullMsgs []map[string]any
 				for _, raw := range messages {
 					if m, ok := raw.(map[string]any); ok {
@@ -1377,6 +2291,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 				}
 				c.saveSeqTrackerState()
 				// auto-ack 延迟到 publish 完成后（由 fillP2pGap 负责）
+				resultMap["_contig_before"] = contigBefore
 			}
 		}
 	}
@@ -1390,6 +2305,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 			// 更新 SeqTracker；cursor.current_seq 即使空 pull 也必须生效。
 			if gid != "" {
 				ns := "group:" + gid
+				contigBefore := c.seqTracker.GetContiguousSeq(ns)
 				var pullMsgs []map[string]any
 				for _, raw := range messages {
 					if m, ok := raw.(map[string]any); ok {
@@ -1419,6 +2335,7 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 				}
 				c.saveSeqTrackerState()
 				// auto-ack 延迟到 publish 完成后（由 fillGroupGap 负责）
+				resultMap["_contig_before"] = contigBefore
 			}
 		}
 	}
@@ -1529,6 +2446,17 @@ func (c *AUNClient) signClientOperation(method string, params map[string]any) {
 	}
 }
 
+func (c *AUNClient) shouldSkipClientSignature(method string, params map[string]any) bool {
+	if method != "message.send" && method != "group.send" {
+		return false
+	}
+	if params == nil || truthyBool(params["encrypted"]) || truthyBool(params["encrypt"]) {
+		return false
+	}
+	_, _, ok := c.isEchoPayload(params["payload"])
+	return ok
+}
+
 // ── 便利方法 ──────────────────────────────────────────────
 
 // On 订阅事件
@@ -1576,7 +2504,7 @@ func (c *AUNClient) attachCurrentInstanceContext(payload any) any {
 		return payload
 	}
 	result := copyMapShallow(message)
-	if c.deviceID != "" && strings.TrimSpace(stringFromAny(result["device_id"])) == "" {
+	if _, exists := result["device_id"]; !exists {
 		result["device_id"] = c.deviceID
 	}
 	if c.slotID != "" && strings.TrimSpace(stringFromAny(result["slot_id"])) == "" {
@@ -1598,6 +2526,10 @@ func (c *AUNClient) publishAppEvent(event string, payload any) {
 			c.maybeAppendEchoTraceReceive(msg)
 		}
 	}
+	if event == "message.received" || event == "message.undecryptable" ||
+		event == "group.message_created" || event == "group.message_undecryptable" {
+		c.logMessageDebug("publish", "direct", event, payload, nil)
+	}
 	c.injectAgentMDEtag(payload)
 	c.events.Publish(event, c.normalizePublishedMessagePayload(event, payload))
 }
@@ -1607,6 +2539,10 @@ func (c *AUNClient) publishAppEventSync(event string, payload any) {
 		if msg, ok := payload.(map[string]any); ok {
 			c.maybeAppendEchoTraceReceive(msg)
 		}
+	}
+	if event == "message.received" || event == "message.undecryptable" ||
+		event == "group.message_created" || event == "group.message_undecryptable" {
+		c.logMessageDebug("publish", "sync", event, payload, nil)
 	}
 	c.injectAgentMDEtag(payload)
 	c.events.publishSync(event, c.normalizePublishedMessagePayload(event, payload))
@@ -1708,9 +2644,11 @@ func (c *AUNClient) messageTargetsCurrentInstance(message any) bool {
 	if !ok {
 		return true
 	}
-	targetDeviceID := strings.TrimSpace(stringFromAny(msg["device_id"]))
-	if targetDeviceID != "" && c.deviceID != "" && targetDeviceID != c.deviceID {
-		return false
+	if _, exists := msg["device_id"]; exists {
+		targetDeviceID := strings.TrimSpace(stringFromAny(msg["device_id"]))
+		if targetDeviceID != c.deviceID {
+			return false
+		}
 	}
 	targetSlotID := strings.TrimSpace(stringFromAny(msg["slot_id"]))
 	if targetSlotID != "" && c.slotID != "" && targetSlotID != c.slotID {
@@ -1732,6 +2670,7 @@ func isLegacyEncryptedPayload(payload any) bool {
 func (c *AUNClient) onRawMessageReceived(data any) {
 	tStart := time.Now()
 	c.log.Debug("onRawMessageReceived enter")
+	c.logMessageDebug("server-push", "_raw.message.received", "message.received", data, nil)
 	defer func() {
 		c.log.Debug("onRawMessageReceived exit: elapsed=%dms", time.Since(tStart).Milliseconds())
 	}()
@@ -1754,6 +2693,8 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 
 	msg := copyMapShallow(dataMap)
 	if !c.messageTargetsCurrentInstance(msg) {
+		c.log.Debug("P2P push filtered by instance: message_id=%s seq=%d target_device=%s target_slot=%s local_device=%s local_slot=%s",
+			stringFromAny(msg["message_id"]), int(toInt64(msg["seq"])), stringFromAny(msg["device_id"]), stringFromAny(msg["slot_id"]), c.deviceID, c.slotID)
 		return
 	}
 
@@ -1766,6 +2707,7 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 	c.mu.RUnlock()
 	if seq > 0 && myAID != "" {
 		ns := "p2p:" + myAID
+		c.seqTracker.UpdateMaxSeen(ns, seq)
 		needPull := c.seqTracker.OnMessageSeq(ns, seq)
 		if needPull {
 			c.log.Debug("P2P seq gap detected, triggering gap fill: seq=%d", seq)
@@ -1774,15 +2716,19 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 		// auto-ack contiguous_seq
 		contig := c.seqTracker.GetContiguousSeq(ns)
 		if contig > 0 {
+			ackSeq := c.clampAckSeq("message.ack", "seq", ns, int64(contig))
+			c.log.Debug("P2P push auto-ack send: ns=%s seq=%d contiguous=%d", ns, ackSeq, contig)
 			go func() {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
 				if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-					"seq":       contig,
+					"seq":       ackSeq,
 					"device_id": c.deviceID,
 					"slot_id":   c.slotID,
 				}); ackErr != nil {
 					c.log.Warn("P2P auto-ack failed: %v", ackErr)
+				} else {
+					c.log.Debug("P2P push auto-ack ok: ns=%s seq=%d", ns, ackSeq)
 				}
 			}()
 		}
@@ -1808,6 +2754,7 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 func (c *AUNClient) onRawGroupMessageCreated(data any) {
 	tStart := time.Now()
 	c.logEG.Debug("onRawGroupMessageCreated enter")
+	c.logMessageDebug("server-push", "_raw.group.message_created", "group.message_created", data, nil)
 	defer func() {
 		c.logEG.Debug("onRawGroupMessageCreated exit: elapsed=%dms", time.Since(tStart).Milliseconds())
 	}()
@@ -1856,6 +2803,22 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 
 	if !hasPayload {
 		// 不带 payload 的通知不能先推进 seq，否则 auto-pull 会用推进后的 cursor 跳过该消息。
+		if groupID != "" && seq > 0 {
+			ns := "group:" + groupID
+			c.seqTracker.UpdateMaxSeen(ns, seq)
+			contigBefore := c.seqTracker.GetContiguousSeq(ns)
+			if contigBefore == seq {
+				c.logEG.Debug("group message notification: push seq=%d already covered by contiguous_seq=%d, ignore duplicate push",
+					seq, contigBefore)
+				return
+			}
+			if contigBefore > seq {
+				c.logEG.Warn("group message notification: contiguous_seq=%d 越界（> push_seq=%d），脏数据修复倒退至 %d",
+					contigBefore, seq, seq-1)
+				c.seqTracker.RepairContiguousSeq(ns, seq-1)
+				c.saveSeqTrackerState()
+			}
+		}
 		c.autoPullGroupMessages(msg)
 		return
 	}
@@ -1870,6 +2833,13 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 
 	if decrypted != nil && groupID != "" && seq > 0 {
 		ns := "group:" + groupID
+		c.seqTracker.UpdateMaxSeen(ns, seq)
+		contigBefore := c.seqTracker.GetContiguousSeq(ns)
+		if contigBefore == seq {
+			c.logEG.Debug("group message payload push: seq=%d already covered by contiguous_seq=%d, ignore duplicate push",
+				seq, contigBefore)
+			return
+		}
 		needPull := c.seqTracker.OnMessageSeq(ns, seq)
 		if needPull {
 			c.logEG.Debug("group message seq gap detected, triggering gap fill: group=%s seq=%d", groupID, seq)
@@ -1877,16 +2847,20 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 		}
 		contig := c.seqTracker.GetContiguousSeq(ns)
 		if contig > 0 {
+			ackSeq := c.clampAckSeq("group.ack_messages", "msg_seq", ns, int64(contig))
+			c.logEG.Debug("group push auto-ack send: group=%s ns=%s seq=%d contiguous=%d", groupID, ns, ackSeq, contig)
 			go func() {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
 				if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
 					"group_id":  groupID,
-					"msg_seq":   contig,
+					"msg_seq":   ackSeq,
 					"device_id": c.deviceID,
 					"slot_id":   c.slotID,
 				}); ackErr != nil {
 					c.logEG.Warn("group message auto-ack failed: group=%s %v", groupID, ackErr)
+				} else {
+					c.logEG.Debug("group push auto-ack ok: group=%s ns=%s seq=%d", groupID, ns, ackSeq)
 				}
 			}()
 		}
@@ -2002,18 +2976,22 @@ func (c *AUNClient) fillGroupGap(groupID string) {
 	}
 	// seq_tracker 更新已在 Call() 拦截器中完成；auto-ack 在 publish 后执行
 	nsKey := "group:" + groupID
-	contigBefore := c.seqTracker.GetContiguousSeq(nsKey)
+	contigBefore := afterSeq
+	if rawBefore, ok := resultMap["_contig_before"]; ok {
+		contigBefore = int(toInt64(rawBefore))
+	}
 	c.logEG.Debug("fillGroupGap completed: group=%s recovered %d messages", groupID, len(messages))
 	c.publishGapFillGroupMessages(nsKey, messages)
 	// publish 完成后 auto-ack
 	contig := c.seqTracker.GetContiguousSeq(nsKey)
 	if contig > 0 && contig != contigBefore {
+		ackSeq := c.clampAckSeq("group.ack_messages", "msg_seq", nsKey, int64(contig))
 		go func() {
 			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ackCancel()
 			if _, ackErr := c.transport.Call(ackCtx, "group.ack_messages", map[string]any{
 				"group_id":  groupID,
-				"msg_seq":   contig,
+				"msg_seq":   ackSeq,
 				"device_id": c.deviceID,
 				"slot_id":   c.slotID,
 			}); ackErr != nil {
@@ -2055,6 +3033,7 @@ func (c *AUNClient) lazySyncGroup(groupID string) {
 		if msg, ok := raw.(map[string]any); ok {
 			s := int(toInt64(msg["seq"]))
 			if s > 0 {
+				c.seqTracker.UpdateMaxSeen(ns, s)
 				c.seqTracker.OnMessageSeq(ns, s)
 			}
 		}
@@ -2087,62 +3066,56 @@ func (c *AUNClient) fillGroupEventGap(groupID string) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	result, err := c.Call(ctx, "group.pull_events", map[string]any{
-		"group_id":        groupID,
-		"after_event_seq": afterSeq,
-		"device_id":       c.deviceID,
-		"limit":           50,
-	})
-	if err != nil {
-		c.logEG.Warn("background gap fill failed (fillGroupEventGap group=%s): %v", groupID, err)
-		return
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return
-	}
-	events, ok := resultMap["events"].([]any)
-	if !ok {
-		return
-	}
-	var pullEvts []map[string]any
-	for _, raw := range events {
-		if e, ok := raw.(map[string]any); ok {
-			pullEvts = append(pullEvts, e)
+	nextAfterSeq := afterSeq
+	const maxPages = 100
+	pageCount := 0
+	totalEvents := 0
+	for pageCount < maxPages {
+		pageCount++
+		result, err := c.Call(ctx, "group.pull_events", map[string]any{
+			"group_id":        groupID,
+			"after_event_seq": nextAfterSeq,
+			"device_id":       c.deviceID,
+			"limit":           50,
+		})
+		if err != nil {
+			c.logEG.Warn("background gap fill failed (fillGroupEventGap group=%s): %v", groupID, err)
+			return
 		}
-	}
-	contigBefore := c.seqTracker.GetContiguousSeq(ns)
-	c.seqTracker.OnPullResult(ns, pullEvts, afterSeq)
-	serverAck := 0
-	if cursor, ok := resultMap["cursor"].(map[string]any); ok {
-		serverAck = int(toInt64(cursor["current_seq"]))
-		if serverAck > 0 {
-			contigBefore := c.seqTracker.GetContiguousSeq(ns)
-			if contigBefore < serverAck {
-				c.logEG.Info("group.pull_events retention-floor advanced: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, contigBefore, serverAck)
-				c.seqTracker.ForceContiguousSeq(ns, serverAck)
+		resultMap, ok := result.(map[string]any)
+		if !ok {
+			return
+		}
+		events, ok := resultMap["events"].([]any)
+		if !ok {
+			return
+		}
+		var pullEvts []map[string]any
+		maxEventSeq := nextAfterSeq
+		for _, raw := range events {
+			if e, ok := raw.(map[string]any); ok {
+				pullEvts = append(pullEvts, e)
+				if es := int(toInt64(e["event_seq"])); es > maxEventSeq {
+					maxEventSeq = es
+				}
 			}
 		}
-	}
-	// 持久化 cursor + ack_events（与 Python 对齐）
-	c.saveSeqTrackerState()
-	contig := c.seqTracker.GetContiguousSeq(ns)
-	if contig > 0 && contig != contigBefore {
-		go func() {
-			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer ackCancel()
-			if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
-				"group_id":  groupID,
-				"event_seq": contig,
-				"device_id": c.deviceID,
-				"slot_id":   c.slotID,
-			}); ackErr != nil {
-				c.logEG.Warn("group event auto-ack failed: group=%s %v", groupID, ackErr)
+		pageContigBefore := c.seqTracker.GetContiguousSeq(ns)
+		if len(pullEvts) > 0 {
+			c.seqTracker.OnPullResult(ns, pullEvts, nextAfterSeq)
+		}
+		serverAck := 0
+		if cursor, ok := resultMap["cursor"].(map[string]any); ok {
+			serverAck = int(toInt64(cursor["current_seq"]))
+			if serverAck > 0 {
+				contigBeforeFloor := c.seqTracker.GetContiguousSeq(ns)
+				if contigBeforeFloor < serverAck {
+					c.logEG.Info("group.pull_events retention-floor advanced: ns=%s contiguous=%d -> cursor.current_seq=%d", ns, contigBeforeFloor, serverAck)
+					c.seqTracker.ForceContiguousSeq(ns, serverAck)
+				}
 			}
-		}()
-	}
-	for _, raw := range events {
-		if evt, ok := raw.(map[string]any); ok {
+		}
+		for _, evt := range pullEvts {
 			evt["_from_gap_fill"] = true
 			et, _ := evt["event_type"].(string)
 			// 消息事件由 fillGroupGap 负责，事件补洞不重复投递
@@ -2151,13 +3124,45 @@ func (c *AUNClient) fillGroupEventGap(groupID string) {
 			}
 			// 验签：有 client_signature 就验（与实时事件路径对齐）
 			if cs, ok := evt["client_signature"].(map[string]any); ok {
-				evt["_verified"] = c.verifyEventSignature(cs)
+				if c.shouldSkipEventSignature(evt) {
+					delete(evt, "client_signature")
+				} else {
+					evt["_verified"] = c.verifyEventSignature(cs)
+				}
 			}
 			// group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
-			c.events.Publish("group.changed", evt)
+			c.events.publishSync("group.changed", evt)
 		}
+		contig := c.seqTracker.GetContiguousSeq(ns)
+		if contig != pageContigBefore {
+			c.saveSeqTrackerState()
+		}
+		if len(pullEvts) > 0 && contig > 0 && contig != pageContigBefore {
+			ackSeq := c.clampAckSeq("group.ack_events", "event_seq", ns, int64(contig))
+			go func() {
+				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer ackCancel()
+				if _, ackErr := c.transport.Call(ackCtx, "group.ack_events", map[string]any{
+					"group_id":  groupID,
+					"event_seq": ackSeq,
+					"device_id": c.deviceID,
+					"slot_id":   c.slotID,
+				}); ackErr != nil {
+					c.logEG.Warn("group event auto-ack failed: group=%s %v", groupID, ackErr)
+				}
+			}()
+		}
+		totalEvents += len(events)
+		hasMore, _ := resultMap["has_more"].(bool)
+		if len(pullEvts) == 0 || maxEventSeq <= nextAfterSeq || !hasMore {
+			break
+		}
+		nextAfterSeq = maxEventSeq
 	}
-	c.logEG.Debug("fillGroupEventGap completed: group=%s recovered %d events", groupID, len(events))
+	if pageCount >= maxPages {
+		c.logEG.Warn("fillGroupEventGap reached max_pages=%d group=%s afterSeq=%d", maxPages, groupID, nextAfterSeq)
+	}
+	c.logEG.Debug("fillGroupEventGap completed: group=%s recovered %d events", groupID, totalEvents)
 }
 
 // fillP2pGap 后台补齐 P2P 消息空洞
@@ -2206,17 +3211,21 @@ func (c *AUNClient) fillP2pGap() {
 	}
 	// seq_tracker 更新已在 Call() 拦截器中完成；auto-ack 在 publish 后执行
 	nsKey := "p2p:" + myAID
-	contigBefore := c.seqTracker.GetContiguousSeq(nsKey)
+	contigBefore := afterSeq
+	if rawBefore, ok := resultMap["_contig_before"]; ok {
+		contigBefore = int(toInt64(rawBefore))
+	}
 	c.log.Debug("fillP2pGap completed: recovered %d messages", len(messages))
 	c.publishGapFillMessages(nsKey, messages)
 	// publish 完成后 auto-ack
 	contig := c.seqTracker.GetContiguousSeq(nsKey)
 	if contig > 0 && contig != contigBefore {
+		ackSeq := c.clampAckSeq("message.ack", "seq", nsKey, int64(contig))
 		go func() {
 			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ackCancel()
 			if _, ackErr := c.transport.Call(ackCtx, "message.ack", map[string]any{
-				"seq":       contig,
+				"seq":       ackSeq,
 				"device_id": c.deviceID,
 				"slot_id":   c.slotID,
 			}); ackErr != nil {
@@ -2290,6 +3299,66 @@ func (c *AUNClient) isPushedSeq(ns string, seq int) bool {
 		return false
 	}
 	return pushed[seq]
+}
+
+// clampAckSeq 在所有 ack 出口前做本地边界保护。
+//
+// 上界来自 push/pull 维护的 maxSeenSeq；这样本地脏 contiguousSeq 不会被回传给服务端。
+// 下界固定为 0，避免负数/恶意值进入 RPC 参数。
+func (c *AUNClient) clampAckSeq(method, field, ns string, seq int64) int64 {
+	original := seq
+	if seq < 0 {
+		seq = 0
+	}
+	if ns != "" {
+		maxSeen := c.seqTracker.GetMaxSeenSeq(ns)
+		if maxSeen > 0 && seq > int64(maxSeen) {
+			if strings.HasPrefix(method, "group.") {
+				c.logEG.Warn("ack clamp: method=%s %s=%d > max_seen=%d, clamp", method, field, original, maxSeen)
+			} else {
+				c.log.Warn("ack clamp: method=%s %s=%d > max_seen=%d, clamp", method, field, original, maxSeen)
+			}
+			seq = int64(maxSeen)
+		}
+	}
+	return seq
+}
+
+func (c *AUNClient) clampAckParams(method string, params map[string]any) {
+	if params == nil {
+		return
+	}
+	switch method {
+	case "message.ack":
+		c.mu.RLock()
+		myAID := c.aid
+		c.mu.RUnlock()
+		if myAID != "" {
+			params["seq"] = c.clampAckSeq(method, "seq", "p2p:"+myAID, toInt64(params["seq"]))
+		}
+	case "message.v2.ack":
+		c.mu.RLock()
+		myAID := c.aid
+		c.mu.RUnlock()
+		if myAID != "" {
+			params["up_to_seq"] = c.clampAckSeq(method, "up_to_seq", "p2p:"+myAID, toInt64(params["up_to_seq"]))
+		}
+	case "group.ack_messages":
+		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+		if groupID != "" {
+			params["msg_seq"] = c.clampAckSeq(method, "msg_seq", "group:"+groupID, toInt64(params["msg_seq"]))
+		}
+	case "group.v2.ack":
+		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+		if groupID != "" {
+			params["up_to_seq"] = c.clampAckSeq(method, "up_to_seq", "group:"+groupID, toInt64(params["up_to_seq"]))
+		}
+	case "group.ack_events":
+		groupID := strings.TrimSpace(stringFromAny(params["group_id"]))
+		if groupID != "" {
+			params["event_seq"] = c.clampAckSeq(method, "event_seq", "group_event:"+groupID, toInt64(params["event_seq"]))
+		}
+	}
 }
 
 func (c *AUNClient) enqueueOrderedMessage(ns, event string, seq int, payload any) {
@@ -2374,34 +3443,41 @@ func (c *AUNClient) drainOrderedMessages(ns string, beforeSeq ...int) {
 	}
 	for _, ready := range c.popReadyOrderedMessages(ns, limit) {
 		if c.isPushedSeq(ns, ready.seq) {
+			c.log.Debug("publish ordered drain skipped duplicate: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
 			continue
 		}
 		c.publishAppEventSync(ready.item.event, ready.item.payload)
 		c.markPushedSeq(ns, ready.seq)
+		c.log.Debug("publish ordered drain delivered: ns=%s seq=%d event=%s", ns, ready.seq, ready.item.event)
 	}
 }
 
 func (c *AUNClient) publishOrderedMessage(event, ns string, seq int, payload any) bool {
 	if ns == "" || seq <= 0 {
+		c.log.Debug("publish ordered direct(no-seq): event=%s ns=%s seq=%d", event, ns, seq)
 		c.publishAppEvent(event, payload)
 		return true
 	}
 	if c.isPushedSeq(ns, seq) {
+		c.log.Debug("publish ordered skipped duplicate: event=%s ns=%s seq=%d", event, ns, seq)
 		c.removePendingOrderedSeq(ns, seq)
 		return false
 	}
 	contig := c.seqTracker.GetContiguousSeq(ns)
 	if seq > contig {
+		c.log.Debug("publish ordered enqueue(gap): event=%s ns=%s seq=%d contiguous=%d", event, ns, seq, contig)
 		c.enqueueOrderedMessage(ns, event, seq, payload)
 		return false
 	}
 	c.drainOrderedMessages(ns, seq)
 	if c.isPushedSeq(ns, seq) {
+		c.log.Debug("publish ordered skipped after-drain duplicate: event=%s ns=%s seq=%d", event, ns, seq)
 		return false
 	}
 	c.removePendingOrderedSeq(ns, seq)
 	c.publishAppEventSync(event, payload)
 	c.markPushedSeq(ns, seq)
+	c.log.Debug("publish ordered delivered: event=%s ns=%s seq=%d", event, ns, seq)
 	c.drainOrderedMessages(ns)
 	return true
 }
@@ -2410,16 +3486,19 @@ func (c *AUNClient) publishOrderedMessage(event, ns string, seq int, payload any
 // pull 返回的批内部空洞可能是永久空洞，不能因此阻塞批内后续消息投递。
 func (c *AUNClient) publishPulledMessage(event, ns string, seq int, payload any) bool {
 	if ns == "" || seq <= 0 {
+		c.log.Debug("publish pulled direct(no-seq): event=%s ns=%s seq=%d", event, ns, seq)
 		c.publishAppEventSync(event, payload)
 		return true
 	}
 	if c.isPushedSeq(ns, seq) {
+		c.log.Debug("publish pulled skipped duplicate: event=%s ns=%s seq=%d", event, ns, seq)
 		c.removePendingOrderedSeq(ns, seq)
 		return false
 	}
 	c.removePendingOrderedSeq(ns, seq)
 	c.publishAppEventSync(event, payload)
 	c.markPushedSeq(ns, seq)
+	c.log.Debug("publish pulled delivered: event=%s ns=%s seq=%d", event, ns, seq)
 	return true
 }
 
@@ -2487,19 +3566,25 @@ func (c *AUNClient) onRawGroupChanged(data any) {
 	action, _ := dataMap["action"].(string)
 	c.logEG.Debug("received group.changed event: group=%s action=%s", groupID, action)
 	if cs, ok := dataMap["client_signature"].(map[string]any); ok {
-		dataMap["_verified"] = c.verifyEventSignature(cs)
+		if c.shouldSkipEventSignature(dataMap) {
+			delete(dataMap, "client_signature")
+		} else {
+			dataMap["_verified"] = c.verifyEventSignature(cs)
+		}
 	}
 
 	c.events.Publish("group.changed", dataMap)
 
 	// V2 bootstrap 缓存失效 + auto_propose 触发
-	c.onRawGroupChangedV2(groupID, action)
+	c.onRawGroupChangedV2(groupID, action, dataMap)
 
 	// event_seq 空洞检测：持久化后的 group.changed 会携带 event_seq
 	needPull := false
 	if rawES, ok := dataMap["event_seq"]; ok && groupID != "" {
 		if es := toInt64(rawES); es > 0 {
-			needPull = c.seqTracker.OnMessageSeq("group_event:"+groupID, int(es))
+			ns := "group_event:" + groupID
+			c.seqTracker.UpdateMaxSeen(ns, int(es))
+			needPull = c.seqTracker.OnMessageSeq(ns, int(es))
 		}
 	}
 
@@ -2556,11 +3641,15 @@ func (c *AUNClient) onRawGroupStateCommitted(data any) {
 
 	// 提交者签名验证（兼容旧版：无签名时跳过）
 	if cs, ok := dataMap["client_signature"].(map[string]any); ok {
-		verified := c.verifyEventSignature(cs)
-		if verified == false {
-			c.logEG.Error("state_committed actor signature verification failed group=%s actor=%s",
-				groupID, stringFromAny(dataMap["actor_aid"]))
-			return
+		if c.shouldSkipEventSignature(dataMap) {
+			delete(dataMap, "client_signature")
+		} else {
+			verified := c.verifyEventSignature(cs)
+			if verified == false {
+				c.logEG.Error("state_committed actor signature verification failed group=%s actor=%s",
+					groupID, stringFromAny(dataMap["actor_aid"]))
+				return
+			}
 		}
 	}
 
@@ -2735,6 +3824,14 @@ func (c *AUNClient) verifyEventSignature(cs map[string]any) any {
 		return false
 	}
 	return true
+}
+
+func (c *AUNClient) shouldSkipEventSignature(event map[string]any) bool {
+	if event == nil || truthyBool(event["encrypted"]) || truthyBool(event["encrypt"]) {
+		return false
+	}
+	_, _, ok := c.isEchoPayload(event["payload"])
+	return ok
 }
 
 // ── 证书与信任辅助 ────────────────────────────────────────
@@ -2981,6 +4078,10 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 		err = connErr
 		return err
 	}
+	// 连接成功：刷新 DNS 缓存
+	if c.dnsNet != nil {
+		c.dnsNet.refreshDNSCacheAfterSuccess(gatewayURL)
+	}
 	c.log.Debug("WebSocket connected, starting auth: gateway=%s", gatewayURL)
 
 	c.mu.Lock()
@@ -3102,7 +4203,27 @@ func buildSeqTrackerContext(aid, deviceID, slotID string) string {
 	if aid == "" {
 		return ""
 	}
-	return aid + "\x00" + strings.TrimSpace(deviceID) + "\x00" + strings.TrimSpace(slotID)
+	return buildLengthPrefixedTextKey(aid, strings.TrimSpace(deviceID), strings.TrimSpace(slotID))
+}
+
+func buildLengthPrefixedTextKey(parts ...string) string {
+	var b strings.Builder
+	for _, part := range parts {
+		_, _ = fmt.Fprintf(&b, "%d:", len(part))
+		b.WriteString(part)
+		b.WriteByte(';')
+	}
+	return b.String()
+}
+
+func buildLengthPrefixedBytesKey(parts ...[]byte) []byte {
+	var b bytes.Buffer
+	for _, part := range parts {
+		_, _ = fmt.Fprintf(&b, "%d:", len(part))
+		b.Write(part)
+		b.WriteByte(';')
+	}
+	return b.Bytes()
 }
 
 func (c *AUNClient) resetSeqTrackingStateLocked() {
@@ -3120,6 +4241,10 @@ func (c *AUNClient) resetSeqTrackingStateLocked() {
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
+	c.v2SenderIKMu.Lock()
+	c.v2SenderIKPending = make(map[string]v2SenderIKPendingEntry)
+	c.v2SenderIKFetching = make(map[string]bool)
+	c.v2SenderIKMu.Unlock()
 }
 
 func (c *AUNClient) refreshSeqTrackerContextLocked() {
@@ -3141,17 +4266,47 @@ func (c *AUNClient) refreshSeqTrackerContextLocked() {
 	c.groupSyncedMu.Lock()
 	c.groupSynced = make(map[string]bool)
 	c.groupSyncedMu.Unlock()
+	c.v2SenderIKMu.Lock()
+	c.v2SenderIKPending = make(map[string]v2SenderIKPendingEntry)
+	c.v2SenderIKFetching = make(map[string]bool)
+	c.v2SenderIKMu.Unlock()
 }
 
 // resolveGateway 解析 Gateway URL
 func (c *AUNClient) resolveGateway(params map[string]any) string {
+	gateways := c.resolveGateways(params)
+	if len(gateways) > 0 {
+		return gateways[0]
+	}
+	return ""
+}
+
+// resolveGateways 解析所有 Gateway URL（支持 string 或 []string）
+func (c *AUNClient) resolveGateways(params map[string]any) []string {
+	if gws, ok := params["gateways"].([]string); ok && len(gws) > 0 {
+		return gws
+	}
+	if gws, ok := params["gateways"].([]any); ok && len(gws) > 0 {
+		var urls []string
+		for _, g := range gws {
+			if s, ok := g.(string); ok && s != "" {
+				urls = append(urls, s)
+			}
+		}
+		if len(urls) > 0 {
+			return urls
+		}
+	}
 	gateway, _ := params["gateway"].(string)
 	if gateway == "" {
 		c.mu.RLock()
 		gateway = c.gatewayURL
 		c.mu.RUnlock()
 	}
-	return gateway
+	if gateway != "" {
+		return []string{gateway}
+	}
+	return nil
 }
 
 // syncIdentityAfterConnect 使用 token 连接后同步本地身份
@@ -4121,6 +5276,27 @@ func stringFieldFromObject(value any, key string) string {
 	}
 }
 
+func (c *AUNClient) normalizeOutboundMessagePayload(params map[string]any, method string) {
+	if _, hasPayload := params["payload"]; !hasPayload {
+		if content, hasContent := params["content"]; hasContent {
+			params["payload"] = content
+			delete(params, "content")
+		}
+	}
+	payload, _ := params["payload"].(map[string]any)
+	if payload != nil {
+		if _, hasType := payload["type"]; !hasType {
+			if _, ok := payload["text"].(string); ok {
+				normalized := make(map[string]any, len(payload)+1)
+				normalized["type"] = "text"
+				for k, v := range payload {
+					normalized[k] = v
+				}
+				params["payload"] = normalized
+			}
+		}
+	}
+}
 func (c *AUNClient) validateOutboundCall(method string, params map[string]any) error {
 	if method == "message.send" {
 		if err := validateMessageRecipient(params["to"]); err != nil {

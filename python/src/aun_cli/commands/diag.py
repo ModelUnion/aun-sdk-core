@@ -2,11 +2,41 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Any
 
 import typer
 
 from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config
 from aun_cli.output import output_json, output_dict, output_error, is_json_mode, set_json_mode
+
+
+def _check_private_key(aun_path: Path, aid: str) -> tuple[bool, str]:
+    """通过 keystore API 检查当前身份私钥，兼容受保护的 split 存储格式。"""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from aun_core.keystore.file import FileKeyStore
+
+        keystore = FileKeyStore(aun_path)
+        try:
+            key_pair: dict[str, Any] | None = keystore.load_key_pair(aid)
+            private_key_pem = (key_pair or {}).get("private_key_pem")
+            if not private_key_pem:
+                return False, "not found"
+
+            private_key = serialization.load_pem_private_key(
+                private_key_pem.encode("utf-8"),
+                password=None,
+            )
+            if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+                return False, "not EC private key"
+            if not isinstance(private_key.curve, ec.SECP256R1):
+                return False, f"unexpected curve: {private_key.curve.name}"
+            return True, "P-256"
+        finally:
+            keystore.close()
+    except Exception as exc:
+        return False, str(exc) or type(exc).__name__
 
 
 def status(ctx: typer.Context) -> None:
@@ -90,12 +120,11 @@ def doctor(ctx: typer.Context) -> None:
                    "detail": str(aun_path)})
 
     key_ok = False
+    key_detail = "not checked"
     if aid and path_ok:
-        aids_dir = aun_path / "AIDs" / aid / "private"
-        key_file = aids_dir / f"{aid}.key"
-        key_ok = key_file.exists()
+        key_ok, key_detail = _check_private_key(aun_path, aid)
     checks.append({"name": "Private key intact", "ok": key_ok,
-                   "detail": "P-256" if key_ok else "not found"})
+                   "detail": key_detail})
 
     gateway_ok = False
     auth_ok = False
@@ -104,20 +133,13 @@ def doctor(ctx: typer.Context) -> None:
     if aid and gateway_url:
         async def _check():
             nonlocal gateway_ok, auth_ok
-            from aun_core import AUNClient
-            client = AUNClient(config={"aun_path": str(aun_path)},
-                               debug=resolved["debug"])
-            try:
+            async with CLISession(ctx, need_auth=False) as client:
                 gateway_ok = await client.check_gateway_health(
                     gateway_url, timeout=resolved["timeout"])
                 if gateway_ok:
                     auth_result = await client.auth.authenticate({"aid": aid})
                     await client.connect(auth_result)
                     auth_ok = client.state.value == "connected"
-            except Exception:
-                pass
-            finally:
-                await client.close()
 
         try:
             run_async(_check())

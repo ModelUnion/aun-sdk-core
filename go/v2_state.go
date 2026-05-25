@@ -110,15 +110,8 @@ func (c *AUNClient) v2VerifyStateSignature(ctx context.Context, groupID string, 
 		return fmt.Errorf("V2 state verify: decode signature failed: %w", err)
 	}
 
-	// 计算缓存 key
-	h := sha256.New()
-	h.Write([]byte(actorAID))
-	h.Write([]byte{0})
-	h.Write(signPayload)
-	h.Write([]byte{0})
-	h.Write(sigBytes)
-	var cacheKey [32]byte
-	copy(cacheKey[:], h.Sum(nil))
+	// 计算缓存 key：使用长度前缀，避免本地业务缓存 key 继续生成 NUL 分隔符。
+	cacheKey := sha256.Sum256(buildLengthPrefixedBytesKey([]byte(actorAID), signPayload, sigBytes))
 
 	sec := c.v2GetSecurityState()
 	nowTS := time.Now().Unix()
@@ -392,8 +385,8 @@ func (c *AUNClient) v2AutoProposeLeaderDelay(ctx context.Context, groupID string
 	candidates := make([]string, 0)
 	for _, dev := range devices {
 		aid := strings.TrimSpace(v2AsString(dev["aid"]))
-		deviceID := strings.TrimSpace(v2AsString(dev["device_id"]))
-		if aid != "" && deviceID != "" && onlineAdminSet[aid] {
+		deviceID, hasDeviceID := v2DeviceIDFromDevice(dev)
+		if aid != "" && hasDeviceID && onlineAdminSet[aid] {
 			candidates = append(candidates, aid+"\x1f"+deviceID)
 		}
 	}
@@ -421,7 +414,7 @@ func (c *AUNClient) v2AutoProposeLeaderDelay(ctx context.Context, groupID string
 		return true
 	}
 
-	sum := sha256.Sum256([]byte(groupID + "\x00" + myKey))
+	sum := sha256.Sum256([]byte(buildLengthPrefixedTextKey(groupID, myKey)))
 	delayMs := 2000 + int(uint32(sum[0])<<24|uint32(sum[1])<<16|uint32(sum[2])<<8|uint32(sum[3]))%4000
 	c.logE2.Debug("V2 auto propose non-leader delay: group=%s leader=%s self=%s delay_ms=%d", groupID, leader, myKey, delayMs)
 	timer := time.NewTimer(time.Duration(delayMs) * time.Millisecond)

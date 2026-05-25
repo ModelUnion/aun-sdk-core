@@ -75,6 +75,22 @@ class SeqTracker:
     def get_max_seen_seq(self, ns: str) -> int:
         return self._get(ns).max_seen_seq
 
+    def update_max_seen(self, ns: str, seq: int) -> None:
+        """Push 专用：只扩展上界 max_seen_seq，不动 contiguous_seq。
+
+        语义：服务端告诉 SDK"我有 seq 这条消息"，SDK 仅更新已知上界。
+        消息内容是否解密成功、是否进入连续前缀，由 pull/decrypt 路径决定。
+
+        防御：
+        - seq <= 0 直接忽略（防御负数/恶意值）
+        - 不会让 max_seen_seq 倒退（仅取 max）
+        """
+        if seq <= 0:
+            return
+        t = self._get(ns)
+        if seq > t.max_seen_seq:
+            t.max_seen_seq = seq
+
     def set_baseline(self, ns: str, baseline_seq: int) -> None:
         """S2: 从持久化（keystore 最近 ack seq）恢复 baseline，
         以便首条 push 消息能构造 [baseline+1, seq-1] 的历史 gap。
@@ -249,12 +265,29 @@ class SeqTracker:
         """导出各命名空间的 contiguous_seq，用于持久化。"""
         return {ns: t.contiguous_seq for ns, t in self._trackers.items() if t.contiguous_seq > 0}
 
-    def force_contiguous_seq(self, ns: str, seq: int) -> None:
-        """强制跳过不连续区间，将 contiguous_seq 拨到指定位置。
+    def has_pending_gaps(self, ns: str) -> bool:
+        """检查指定命名空间是否有未解决的空洞。
 
-        当服务端返回 server_ack_seq 且本地 contiguous_seq 落后时调用，
-        跳过 [contiguous_seq, server_ack_seq) 这段不连续区间。
+        用于 Pull 返回空时判断是否有 Push 通知标记的上界（双重修复机制）。
         """
+        t = self._trackers.get(ns)
+        if not t:
+            return False
+        # 检查是否有未解决的 pending_gaps 或 received_seqs 中有跳跃
+        return bool(t.pending_gaps) or bool(t.received_seqs)
+
+    def force_contiguous_seq(self, ns: str, seq: int) -> None:
+        """Pull 专用：强制推进 contiguous_seq（已连续到达的下界）。
+
+        语义：用于 pull 返回 server_ack_seq 后跳过被 GC/已 ack 的历史区间。
+        仅增不减（防御 server_ack 倒退）。
+
+        防御：
+        - seq <= 0 直接忽略（防御负数/恶意值）
+        - 仅推进，不倒退（与 max_seen_seq 共同维护不变式 contiguous_seq ≤ max_seen_seq）
+        """
+        if seq <= 0:
+            return
         t = self._get(ns)
         if seq > t.contiguous_seq:
             # 清除被跳过区间内的 pending_gaps
@@ -267,12 +300,46 @@ class SeqTracker:
             t.max_seen_seq = max(t.max_seen_seq, seq)
             self._try_advance(t)
 
+    def repair_contiguous_seq(self, ns: str, seq: int) -> None:
+        """脏数据修复：允许 contiguous_seq 倒退到指定值。
+
+        仅在以下场景使用：
+        - Push 路径检测到 contiguous_seq > push_seq（contiguous_seq 被之前的脏数据污染）
+        - 持久化恢复后发现 contiguous_seq > 服务端真实最大值
+
+        与 force_contiguous_seq 的区别：force_contiguous_seq 只增不减；本方法允许倒退修复。
+
+        防御：
+        - seq < 0 视为 0（不允许负数）
+        - 倒退后 received_seqs / pending_gaps 重置（已知状态作废）
+        """
+        if seq < 0:
+            seq = 0
+        t = self._get(ns)
+        if seq < t.contiguous_seq:
+            # 倒退修复：重置 received_seqs（之前认为已收到的 seq 可能是脏数据）
+            t.received_seqs = {s for s in t.received_seqs if s > seq}
+            # 清除所有覆盖被倒退区间的 pending_gaps
+            for gap_key in list(t.pending_gaps):
+                if gap_key[0] > seq:
+                    # 保留：此 gap 在新 contiguous_seq 之后
+                    continue
+                del t.pending_gaps[gap_key]
+            t.contiguous_seq = seq
+            # max_seen_seq 不动（push 已经告诉我们上界存在）
+
     def remove_namespace(self, ns: str) -> None:
         """移除指定命名空间的所有跟踪状态（dissolve/leave 时调用）。"""
         self._trackers.pop(ns, None)
 
     def restore_state(self, state: dict[str, int]) -> None:
-        """从持久化数据恢复各命名空间的 contiguous_seq。"""
+        """从持久化数据恢复各命名空间的 contiguous_seq。
+
+        防御：
+        - seq <= 0 跳过（防御负数/恶意值）
+        - 仅取 max（防御回退/竞态）
+        - 同步更新 max_seen_seq 保持不变式
+        """
         for ns, seq in state.items():
             if isinstance(seq, int) and seq > 0:
                 t = self._get(ns)

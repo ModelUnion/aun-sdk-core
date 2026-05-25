@@ -57,6 +57,23 @@ export class SeqTracker {
     return this._get(ns).maxSeenSeq;
   }
 
+  /** Push 专用：只扩展上界 maxSeenSeq，不动 contiguousSeq。
+   *
+   * 语义：服务端告诉 SDK"我有 seq 这条消息"，SDK 仅更新已知上界。
+   * 消息内容是否解密成功、是否进入连续前缀，由 pull/decrypt 路径决定。
+   *
+   * 防御：
+   * - seq <= 0 直接忽略（防御负数/恶意值）
+   * - 不会让 maxSeenSeq 倒退（仅取 max）
+   */
+  updateMaxSeen(ns: string, seq: number): void {
+    if (seq <= 0) return;
+    const t = this._get(ns);
+    if (seq > t.maxSeenSeq) {
+      t.maxSeenSeq = seq;
+    }
+  }
+
   /** S2: 从持久化（keystore 最近 ack seq）恢复 baseline，
    *  以便首条 push 消息能构造 [baseline+1, seq-1] 的历史 gap。
    *  必须在收到首条消息前调用。 */
@@ -200,9 +217,8 @@ export class SeqTracker {
       if (s < minSeq) minSeq = s;
     }
     if (minSeq === Infinity) return;
-    // 强制推进到 minSeq（跳过空洞）
-    t.contiguousSeq = minSeq;
-    t.receivedSeqs.delete(minSeq);
+    // 强制推进到 minSeq 前一位，再按连续前缀自然推进。
+    t.contiguousSeq = minSeq - 1;
     // 清理被跳过区间内的 pendingGaps
     for (const [key, probe] of t.pendingGaps) {
       if (probe.gapEnd <= t.contiguousSeq) {
@@ -256,10 +272,17 @@ export class SeqTracker {
     this._tryAdvance(t);
   }
 
-  /** 强制跳过不连续区间，将 contiguousSeq 拨到指定位置。
-   *  当服务端返回 server_ack_seq 且本地 contiguousSeq 落后时调用，
-   *  跳过 [contiguousSeq, server_ack_seq) 这段不连续区间。 */
+  /** Pull 专用：强制推进 contiguousSeq（已连续到达的下界）。
+   *
+   * 语义：用于 pull 返回 server_ack_seq 后跳过被 GC/已 ack 的历史区间。
+   * 仅增不减（防御 server_ack 倒退）。
+   *
+   * 防御：
+   * - seq <= 0 直接忽略（防御负数/恶意值）
+   * - 仅推进，不倒退（与 maxSeenSeq 共同维护不变式 contiguousSeq ≤ maxSeenSeq）
+   */
   forceContiguousSeq(ns: string, seq: number): void {
+    if (seq <= 0) return;
     const t = this._get(ns);
     if (seq > t.contiguousSeq) {
       // 清除被跳过区间内的 pendingGaps
@@ -275,6 +298,37 @@ export class SeqTracker {
       t.contiguousSeq = seq;
       t.maxSeenSeq = Math.max(t.maxSeenSeq, seq);
       this._tryAdvance(t);
+    }
+  }
+
+  /** 脏数据修复：允许 contiguousSeq 倒退到指定值。
+   *
+   * 仅在以下场景使用：
+   * - Push 路径检测到 contiguousSeq > pushSeq（contiguousSeq 被之前的脏数据污染）
+   * - 持久化恢复后发现 contiguousSeq > 服务端真实最大值
+   *
+   * 与 forceContiguousSeq 的区别：forceContiguousSeq 只增不减；本方法允许倒退修复。
+   *
+   * 防御：
+   * - seq < 0 视为 0（不允许负数）
+   * - 倒退后 receivedSeqs / pendingGaps 重置（已知状态作废）
+   */
+  repairContiguousSeq(ns: string, seq: number): void {
+    if (seq < 0) seq = 0;
+    const t = this._get(ns);
+    if (seq < t.contiguousSeq) {
+      // 倒退修复：重置 receivedSeqs（之前认为已收到的 seq 可能是脏数据）
+      for (const s of t.receivedSeqs) {
+        if (s <= seq) t.receivedSeqs.delete(s);
+      }
+      // 清除所有覆盖被倒退区间的 pendingGaps
+      for (const [key, probe] of t.pendingGaps) {
+        if (probe.gapStart <= seq) {
+          t.pendingGaps.delete(key);
+        }
+      }
+      t.contiguousSeq = seq;
+      // maxSeenSeq 不动（push 已经告诉我们上界存在）
     }
   }
 

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import typer
 
-from aun_cli.config import load_config, get_profile
-from aun_cli.output import output_error, is_json_mode
+from aun_cli.config import get_effective_profile_name, get_profile, load_config, set_tab_profile_name
+from aun_cli.output import output_error, is_json_mode, set_json_mode
 
 
 EXIT_OK = 0
@@ -19,6 +22,93 @@ EXIT_CONNECTION = 4
 EXIT_TIMEOUT = 5
 EXIT_PERMISSION = 6
 EXIT_NOT_FOUND = 7
+
+
+@dataclass
+class RPCCallStat:
+    method: str
+    duration_ms: int
+    status: str
+    error: str = ""
+    origin: str = "main"
+
+
+@dataclass
+class PhaseStat:
+    name: str
+    duration_ms: int
+
+
+@dataclass
+class CLIInvocationStats:
+    start: float
+    json_mode: bool = False
+    rpc_calls: list[RPCCallStat] = field(default_factory=list)
+    phases: list[PhaseStat] = field(default_factory=list)
+    printed: bool = False
+    suppress_summary: bool = False
+
+
+_CURRENT_STATS: CLIInvocationStats | None = None
+
+
+def start_cli_invocation(*, json_mode: bool = False) -> None:
+    global _CURRENT_STATS
+    _CURRENT_STATS = CLIInvocationStats(start=time.perf_counter(), json_mode=json_mode)
+    set_json_mode(json_mode)
+
+
+def record_rpc_call(method: str, duration_ms: int, status: str, error: str = "", *, origin: str = "main") -> None:
+    stats = _CURRENT_STATS
+    if stats is None:
+        return
+    if len(error) > 160:
+        error = error[:157] + "..."
+    stats.rpc_calls.append(RPCCallStat(method=method, duration_ms=duration_ms, status=status, error=error, origin=origin))
+
+
+def record_cli_phase(name: str, duration_ms: int) -> None:
+    stats = _CURRENT_STATS
+    if stats is None:
+        return
+    stats.phases.append(PhaseStat(name=name, duration_ms=duration_ms))
+
+
+def suppress_cli_summary() -> None:
+    stats = _CURRENT_STATS
+    if stats is None:
+        return
+    stats.suppress_summary = True
+
+
+def finish_cli_invocation() -> None:
+    global _CURRENT_STATS
+    stats = _CURRENT_STATS
+    try:
+        if stats is None or stats.printed:
+            return
+        stats.printed = True
+        if stats.json_mode or stats.suppress_summary or (not stats.rpc_calls and not stats.phases):
+            return
+        total_ms = int((time.perf_counter() - stats.start) * 1000)
+        print(
+            f"[aun-cli] RPC summary: count={len(stats.rpc_calls)} total={total_ms}ms",
+            file=sys.stderr,
+        )
+        for index, call in enumerate(stats.rpc_calls, 1):
+            marker = " [bg]" if call.origin == "background" else ""
+            print(
+                f"  {index}.{marker} {call.method} {call.duration_ms}ms {call.status}",
+                file=sys.stderr,
+            )
+            if call.error:
+                print(f"     error: {call.error}", file=sys.stderr)
+        if stats.phases:
+            phase_text = " ".join(f"{phase.name}={phase.duration_ms}ms" for phase in stats.phases)
+            print(f"[aun-cli] phase summary: {phase_text}", file=sys.stderr)
+    finally:
+        set_json_mode(False)
+        _CURRENT_STATS = None
 
 
 def run_async(coro) -> Any:
@@ -32,7 +122,9 @@ def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
     cfg = load_config()
     defaults = cfg.get("default", {})
 
-    profile_name = os.environ.get("AUN_PROFILE") or ctx.obj.get("profile", "default")
+    profile_name, profile_source = get_effective_profile_name(ctx.obj.get("profile"))
+    if profile_source == "default":
+        set_tab_profile_name(profile_name)
 
     try:
         profile = get_profile(profile_name)
@@ -57,53 +149,28 @@ def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
         "debug": debug,
         "timeout": timeout,
         "trace": trace,
+        "active_group": str(profile.get("active_group") or "").strip() or None,
+        "profile_source": profile_source,
     }
-
-
-def _trace_printer(trace_info: dict) -> None:
-    """将 trace spans 格式化输出到 stderr"""
-    import sys
-    from datetime import datetime
-    method = trace_info.get("method", "?")
-    status = trace_info.get("status", "ok")
-    duration_ms = trace_info.get("duration_ms")
-    trace_data = trace_info.get("trace", {})
-    trace_id = trace_data.get("trace_id", "")
-    spans = trace_data.get("spans", [])
-
-    is_tty = sys.stderr.isatty()
-    c_trace = "\033[35m" if is_tty else ""   # 紫色 — trace header
-    c_ok    = "\033[36m" if is_tty else ""   # 青色 — ok span
-    c_err   = "\033[31m" if is_tty else ""   # 红色 — error
-    c_dim   = "\033[90m" if is_tty else ""   # 灰色 — 次要信息
-    c_reset = "\033[0m"  if is_tty else ""
-
-    status_color = c_err if status == "error" else c_ok
-    total_str = f" total={duration_ms}ms" if duration_ms is not None else ""
-    header = f"{c_trace}[TRACE][{method}]{c_reset}{status_color}[{status}]{c_reset}{total_str} {c_dim}trace_id={trace_id}{c_reset}"
-    print(header, file=sys.stderr, flush=True)
-
-    for i, span in enumerate(spans):
-        node   = span.get("node", "?")
-        action = span.get("action", "?")
-        ms     = span.get("ms", "")
-        ts     = span.get("ts", 0)
-        ts_str = datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S.%f")[:-3] if ts else ""
-
-        ms_str = f"{ms}ms" if ms != "" else "0ms"
-        ts_part = f" @{ts_str}" if ts_str else ""
-        prefix = "  └─" if i == len(spans) - 1 else "  ├─"
-        line = f"{c_dim}{prefix}{c_reset} {c_ok}{node}.{action}{c_reset}  {c_dim}dur={ms_str}{ts_part}{c_reset}"
-        print(line, file=sys.stderr, flush=True)
 
 
 class CLISession:
     """管理 AUNClient 生命周期的异步上下文管理器"""
 
-    def __init__(self, ctx: typer.Context, *, need_auth: bool = True, aid: str | None = None, gateway: str | None = None):
+    def __init__(
+        self,
+        ctx: typer.Context,
+        *,
+        need_auth: bool = True,
+        aid: str | None = None,
+        gateway: str | None = None,
+        background_sync: bool = False,
+    ):
         self._ctx = ctx
         self._need_auth = need_auth
         self._client = None
+        self._foreground_task: asyncio.Task | None = None
+        self._background_sync = background_sync
         self._resolved = resolve_profile_config(ctx)
         if aid:
             self._resolved["aid"] = aid
@@ -116,39 +183,102 @@ class CLISession:
 
     async def __aenter__(self):
         from aun_core import AUNClient
+        self._foreground_task = asyncio.current_task()
         config: dict[str, Any] = {
             "aun_path": self._resolved["aun_path"],
         }
         if self._resolved["gateway"]:
             config["gateway"] = self._resolved["gateway"]
 
+        phase_started = time.perf_counter()
         self._client = AUNClient(config=config, debug=self._resolved["debug"])
+        record_cli_phase("sdk_init", int((time.perf_counter() - phase_started) * 1000))
+        self._install_rpc_stats_hooks(self._client)
         debug = self._resolved["debug"]
 
         # 启用 trace mode
         trace = self._resolved.get("trace", "off")
         if trace and trace != "off":
             self._client.set_trace_mode(trace)
-            self._client.set_trace_observer(_trace_printer)
 
         if self._need_auth and self._resolved["aid"]:
             auth_params: dict[str, Any] = {"aid": self._resolved["aid"]}
             if debug:
                 print(f"[DEBUG][cli] authenticate: aid={auth_params['aid']}")
+            phase_started = time.perf_counter()
             auth_result = await self._client.auth.authenticate(auth_params)
+            record_cli_phase("authenticate", int((time.perf_counter() - phase_started) * 1000))
             if debug:
                 print(f"[DEBUG][cli] authenticate done: gateway={auth_result.get('gateway')}")
+            connect_options = {
+                "auto_reconnect": self._background_sync,
+                "background_sync": self._background_sync,
+            }
+            if not self._background_sync:
+                connect_options["heartbeat_interval"] = 0
+            phase_started = time.perf_counter()
             await asyncio.wait_for(
-                self._client.connect(auth_result),
+                self._client.connect(auth_result, connect_options),
                 timeout=self._resolved["timeout"],
             )
+            record_cli_phase("connect", int((time.perf_counter() - phase_started) * 1000))
             if debug:
                 print(f"[DEBUG][cli] connect done: state={self._client.state}")
         return self._client
 
+    def _install_rpc_stats_hooks(self, client: Any) -> None:
+        transport = getattr(client, "_transport", None)
+        if transport is not None and callable(getattr(transport, "call", None)):
+            original_transport_call = transport.call
+
+            async def traced_transport_call(method: str, params: dict | None = None, *args: Any, **kwargs: Any) -> Any:
+                return await self._record_rpc_timing(method, original_transport_call, method, params, *args, **kwargs)
+
+            transport.call = traced_transport_call
+
+        auth_flow = getattr(client, "_auth", None)
+        if auth_flow is not None and callable(getattr(auth_flow, "_short_rpc", None)):
+            original_short_rpc = auth_flow._short_rpc
+
+            async def traced_short_rpc(gateway_url: str, method: str, params: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+                return await self._record_rpc_timing(method, original_short_rpc, gateway_url, method, params, *args, **kwargs)
+
+            auth_flow._short_rpc = traced_short_rpc
+
+    async def _record_rpc_timing(
+        self,
+        method: str,
+        call: Callable[..., Awaitable[Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        current_task = asyncio.current_task()
+        origin = "main" if current_task is self._foreground_task else "background"
+        started = time.perf_counter()
+        try:
+            result = await call(*args, **kwargs)
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            error = str(exc) or type(exc).__name__
+            if not self._is_shutdown_background_noise(origin, error):
+                record_rpc_call(method, duration_ms, "error", error, origin=origin)
+            raise
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        record_rpc_call(method, duration_ms, "ok", origin=origin)
+        return result
+
+    def _is_shutdown_background_noise(self, origin: str, error: str) -> bool:
+        if origin != "background":
+            return False
+        if "transport closed" not in str(error).lower():
+            return False
+        return bool(getattr(self._client, "_closing", False))
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self._client:
+            phase_started = time.perf_counter()
             await self._client.close()
+            record_cli_phase("close", int((time.perf_counter() - phase_started) * 1000))
         return False
 
 

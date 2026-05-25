@@ -54,6 +54,34 @@ func TestIsV2GroupThoughtEnvelope(t *testing.T) {
 	}
 }
 
+func TestV2ThoughtE2EEMetadataPayloadType(t *testing.T) {
+	meta := v2ThoughtE2EEMetadata(map[string]any{
+		"suite":        "P256_HKDF_SHA256_AES_256_GCM",
+		"payload_type": "text",
+		"protected_headers": map[string]any{
+			"payload_type": "fallback",
+			"trace_id":     "trace-1",
+			"_auth":        "secret",
+		},
+		"context": map[string]any{"type": "run", "id": "run-1", "_auth": "secret"},
+	})
+	if got := meta["payload_type"]; got != "text" {
+		t.Fatalf("payload_type 应优先来自信封顶层，实际: %#v", got)
+	}
+	wantHeaders := map[string]any{"payload_type": "fallback", "trace_id": "trace-1"}
+	if !reflect.DeepEqual(meta["protected_headers"], wantHeaders) {
+		t.Fatalf("protected_headers 不正确: %#v", meta["protected_headers"])
+	}
+
+	fallback := v2ThoughtE2EEMetadata(map[string]any{
+		"suite":             "P256_HKDF_SHA256_AES_256_GCM",
+		"protected_headers": map[string]any{"payload_type": "fallback", "_auth": "secret"},
+	})
+	if got := fallback["payload_type"]; got != "fallback" {
+		t.Fatalf("缺顶层 payload_type 时应从 protected_headers 回退，实际: %#v", got)
+	}
+}
+
 // TestSeqTrackerLegacyV2SharedNamespace 验证历史消息与 V2 共享同一 P2P/Group seq 命名空间。
 //
 // 与 Python 一致：发送方 V2 send 后调 OnMessageSeq + MarkPublishedSeq；
