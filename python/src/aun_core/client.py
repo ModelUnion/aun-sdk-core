@@ -853,7 +853,7 @@ class AUNClient:
         local_found = bool(before and (before.get("content") or local_etag))
         remote_etag_cached = str(before.get("remote_etag") or "").strip()
         last_modified_cached = str(before.get("last_modified") or "").strip()
-        checked_at_cached = int(before.get("checked_at") or 0)
+        checked_at_cached = int(before.get("checked_at") or before.get("fetched_at") or 0)
         cached_in_sync = bool(local_found and local_etag and remote_etag_cached and local_etag == remote_etag_cached)
         # max_unsynced_days > 0 时，距上次 HEAD 在窗口内则跳过 HEAD（直接返回缓存）；
         # max_unsynced_days <= 0 时，每次都强制 HEAD 确认远端状态。
@@ -870,6 +870,24 @@ class AUNClient:
                 "cached": True,
                 "verify_status": str(before.get("verify_status") or ""),
                 "verify_error": str(before.get("verify_error") or ""),
+            }
+        # 远端确认不存在 + 本地也没有 + 在时间窗口内 → 跳过 HEAD
+        remote_found_cached = bool(remote_etag_cached or str(before.get("remote_status") or "") == "found")
+        if (not local_found and not remote_found_cached
+                and str(before.get("remote_status") or "") == "missing"
+                and self._agent_md_checked_at_fresh(checked_at_cached, max_unsynced_days)):
+            return {
+                "aid": target,
+                "local_found": False,
+                "remote_found": False,
+                "local_etag": "",
+                "remote_etag": "",
+                "in_sync": False,
+                "last_modified": "",
+                "status": 404,
+                "cached": True,
+                "verify_status": "",
+                "verify_error": "",
             }
 
         now_ms = int(time.time() * 1000)
@@ -894,6 +912,9 @@ class AUNClient:
         if target == self._agent_md_owner_aid() and remote_etag:
             self._remote_agent_md_etag = remote_etag
         in_sync = bool(local_found and remote_found and local_etag and remote_etag and local_etag == remote_etag)
+        # 远端有但本地没有 → 自动触发下载，保证本地一定有 agent.md（前提是服务端有）
+        if remote_found and not local_found:
+            self._schedule_agent_md_fetch_if_missing(target, saved or before, source="check_agent_md")
         return {
             "aid": target,
             "local_found": local_found,
@@ -2785,6 +2806,205 @@ class AUNClient:
         normalized_fp = str(cert_fingerprint or "").strip().lower()
         return aid if not normalized_fp else f"{aid}#{normalized_fp}"
 
+    @staticmethod
+    def _normalize_bootstrap_ca_chain(material: Any) -> list[str]:
+        if not isinstance(material, dict):
+            return []
+        raw_chain = (
+            material.get("ca_chain")
+            or material.get("ca_chain_pems")
+            or material.get("cert_chain")
+            or material.get("chain")
+            or []
+        )
+        if not isinstance(raw_chain, list):
+            return []
+        result: list[str] = []
+        for item in raw_chain:
+            cert_type = ""
+            if isinstance(item, dict):
+                pem = str(item.get("cert_pem") or item.get("cert") or "").strip()
+                cert_type = str(item.get("cert_type") or "").strip().lower()
+                if cert_type == "agent":
+                    continue
+            else:
+                pem = str(item or "").strip()
+            if not pem:
+                continue
+            if not cert_type:
+                try:
+                    from cryptography import x509 as _x509
+                    cert_obj = _x509.load_pem_x509_certificate(pem.encode("utf-8"))
+                    try:
+                        basic_constraints = cert_obj.extensions.get_extension_for_class(
+                            _x509.BasicConstraints
+                        ).value
+                        if not basic_constraints.ca:
+                            continue
+                    except _x509.ExtensionNotFound:
+                        continue
+                except Exception:
+                    continue
+            result.append(pem)
+        return result
+
+    async def _validate_and_cache_peer_cert(
+        self,
+        aid: str,
+        cert_pem: str | bytes,
+        cert_fingerprint: str | None = None,
+        *,
+        ca_chain_pems: list[str] | None = None,
+        source: str = "fetch",
+    ) -> bytes:
+        gateway_url = self._gateway_url
+        if not gateway_url:
+            raise ValidationError("gateway url unavailable for e2ee cert verification")
+
+        cert_text = cert_pem.decode("utf-8") if isinstance(cert_pem, bytes) else str(cert_pem or "")
+        if not cert_text.strip():
+            raise ValidationError(f"empty peer cert material for {aid}")
+        cert_bytes = cert_text.encode("utf-8")
+
+        peer_gateway_url = self._resolve_peer_gateway_url(gateway_url, aid)
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives import hashes as _hashes
+        cert_obj = _x509.load_pem_x509_certificate(cert_bytes)
+
+        expected_fp = str(cert_fingerprint or "").strip().lower()
+        if expected_fp:
+            if not expected_fp.startswith("sha256:"):
+                raise ValidationError(f"unsupported cert_fingerprint format for {aid}: {expected_fp[:24]}")
+            expected_hex = expected_fp.split(":", 1)[1]
+            der_hex = cert_obj.fingerprint(_hashes.SHA256()).hex()
+            spki_hex = ""
+            try:
+                from cryptography.hazmat.primitives import serialization as _serialization
+                spki_der = cert_obj.public_key().public_bytes(
+                    encoding=_serialization.Encoding.DER,
+                    format=_serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                spki_hex = hashlib.sha256(spki_der).hexdigest()
+            except Exception:
+                spki_hex = ""
+            if expected_hex != der_hex and (not spki_hex or expected_hex != spki_hex):
+                raise ValidationError(
+                    f"peer cert fingerprint mismatch for {aid}: expected={expected_fp[:24]}..."
+                )
+
+        if ca_chain_pems:
+            try:
+                self._auth.cache_gateway_ca_chain(peer_gateway_url, ca_chain_pems, chain_aid=aid)
+            except Exception as exc:
+                self._log.debug(
+                    "client",
+                    "bootstrap CA chain cache skipped: peer=%s source=%s err=%s",
+                    aid,
+                    source,
+                    exc,
+                )
+
+        try:
+            await self._auth.verify_peer_certificate(peer_gateway_url, cert_obj, aid)
+        except Exception as exc:
+            if ca_chain_pems:
+                discard_chain = getattr(self._auth, "discard_gateway_ca_chain", None)
+                if callable(discard_chain):
+                    discard_chain(peer_gateway_url, chain_aid=aid)
+            _debug_group_e2ee(
+                "peer_cert_verify_failed",
+                aid=self._aid or "-",
+                peer=aid,
+                fp=expected_fp or "-",
+                source=source,
+                error=type(exc).__name__,
+            )
+            raise ValidationError(f"peer cert verification failed for {aid}: {exc}")
+
+        now = time.time()
+        cached = _CachedPeerCert(
+            cert_bytes=cert_bytes,
+            validated_at=now,
+            refresh_after=now + _PEER_CERT_CACHE_TTL,
+        )
+        bare_key = self._cert_cache_key(aid, None)
+        self._cert_cache[bare_key] = cached
+        if expected_fp:
+            self._cert_cache[self._cert_cache_key(aid, expected_fp)] = cached
+        _debug_group_e2ee(
+            "peer_cert_cached",
+            aid=self._aid or "-",
+            peer=aid,
+            fp=expected_fp or "-",
+            source=source,
+            cache_key=bare_key,
+        )
+        try:
+            self._keystore.save_cert(
+                aid,
+                cert_text,
+                cert_fingerprint=cert_fingerprint,
+                make_active=False,
+            )
+        except TypeError:
+            pass
+        except Exception as exc:
+            _debug_group_e2ee(
+                "peer_cert_save_failed",
+                aid=self._aid or "-",
+                peer=aid,
+                fp=expected_fp or "-",
+                source=source,
+                error=type(exc).__name__,
+            )
+            self._log.error("client", "failed to write peer cert to keystore (aid=%s, fp=%s): %s", aid, cert_fingerprint or "", exc)
+        return cert_bytes
+
+    async def _prime_bootstrap_peer_certs(self, bootstrap: dict[str, Any], peer_aid: str) -> None:
+        materials = bootstrap.get("certs") if isinstance(bootstrap, dict) else None
+        if not isinstance(materials, dict):
+            return
+        expected_aids: set[str] = set()
+        peer_aid = str(peer_aid or "").strip()
+        if peer_aid:
+            expected_aids.add(peer_aid)
+        for dev in bootstrap.get("audit_recipients", []) or []:
+            if isinstance(dev, dict):
+                aid = str(dev.get("aid") or "").strip()
+                if aid:
+                    expected_aids.add(aid)
+
+        for aid in sorted(expected_aids):
+            if self._aid and aid == self._aid:
+                continue
+            material = materials.get(aid)
+            if not isinstance(material, dict):
+                continue
+            cert_pem = material.get("cert_pem") or material.get("cert")
+            if not cert_pem:
+                continue
+            cert_fingerprint = (
+                material.get("cert_fingerprint")
+                or material.get("fingerprint")
+                or material.get("fp")
+            )
+            ca_chain_pems = self._normalize_bootstrap_ca_chain(material)
+            try:
+                await self._validate_and_cache_peer_cert(
+                    aid,
+                    cert_pem,
+                    str(cert_fingerprint or "").strip() or None,
+                    ca_chain_pems=ca_chain_pems,
+                    source="bootstrap",
+                )
+            except Exception as exc:
+                self._log.debug(
+                    "client",
+                    "bootstrap peer cert material ignored: peer=%s err=%s",
+                    aid,
+                    exc,
+                )
+
     async def _fetch_peer_cert(self, aid: str, cert_fingerprint: str | None = None) -> bytes:
         """获取对方证书（带缓存 + 完整 PKI 验证：链 + CRL + OCSP + AID 绑定）
 
@@ -2854,93 +3074,12 @@ class AUNClient:
             fp=normalized_fp or "-",
             bytes=len(cert_pem),
         )
-        cert_bytes = cert_pem.encode("utf-8")
-
-        # 完整 PKI 验证：链 + CRL + OCSP + AID 绑定
-        # 验证时也用 peer 的 Gateway URL（链/OCSP/CRL 都从 peer 域获取）
-        from cryptography import x509 as _x509
-        from cryptography.hazmat.primitives import hashes as _hashes
-        cert_obj = _x509.load_pem_x509_certificate(cert_bytes)
-
-        # H7: 严格校验指纹（DER SHA-256 或 SPKI SHA-256 任一匹配即可）
-        expected_fp = str(cert_fingerprint or "").strip().lower()
-        if expected_fp:
-            if not expected_fp.startswith("sha256:"):
-                raise ValidationError(f"unsupported cert_fingerprint format for {aid}: {expected_fp[:24]}")
-            expected_hex = expected_fp.split(":", 1)[1]
-            der_hex = cert_obj.fingerprint(_hashes.SHA256()).hex()
-            spki_hex = ""
-            try:
-                from cryptography.hazmat.primitives import serialization as _serialization
-                spki_der = cert_obj.public_key().public_bytes(
-                    encoding=_serialization.Encoding.DER,
-                    format=_serialization.PublicFormat.SubjectPublicKeyInfo,
-                )
-                spki_hex = hashlib.sha256(spki_der).hexdigest()
-            except Exception:
-                spki_hex = ""
-            if expected_hex != der_hex and (not spki_hex or expected_hex != spki_hex):
-                raise ValidationError(
-                    f"peer cert fingerprint mismatch for {aid}: expected={expected_fp[:24]}..."
-                )
-
-        try:
-            await self._auth.verify_peer_certificate(peer_gateway_url, cert_obj, aid)
-        except Exception as exc:
-            _debug_group_e2ee(
-                "peer_cert_fetch_verify_failed",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-                error=type(exc).__name__,
-            )
-            raise ValidationError(f"peer cert verification failed for {aid}: {exc}")
-
-        now = time.time()
-        self._cert_cache[cache_key] = _CachedPeerCert(
-            cert_bytes=cert_bytes,
-            validated_at=now,
-            refresh_after=now + _PEER_CERT_CACHE_TTL,
+        cert_bytes = await self._validate_and_cache_peer_cert(
+            aid,
+            cert_pem,
+            cert_fingerprint,
+            source="fetch",
         )
-        _debug_group_e2ee(
-            "peer_cert_fetch_cached",
-            aid=self._aid or "-",
-            peer=aid,
-            fp=normalized_fp or "-",
-            cache_key=cache_key,
-        )
-        # peer 证书只存到版本目录，不覆盖 cert.pem（防止破坏自身身份证书）
-        try:
-            self._keystore.save_cert(
-                aid,
-                cert_pem,
-                cert_fingerprint=cert_fingerprint,
-                make_active=False,
-            )
-            _debug_group_e2ee(
-                "peer_cert_fetch_saved",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-            )
-        except TypeError:
-            # 兼容旧 keystore 实现
-            _debug_group_e2ee(
-                "peer_cert_fetch_save_skipped_legacy",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-            )
-            pass
-        except Exception as exc:
-            _debug_group_e2ee(
-                "peer_cert_fetch_save_failed",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-                error=type(exc).__name__,
-            )
-            self._log.error("client", "failed to write peer cert to keystore (aid=%s, fp=%s): %s", aid, cert_fingerprint or "", exc)
         self._log.debug("client", "_fetch_peer_cert exit: elapsed=%.3fs peer=%s fp=%s", time.time() - _t_start, aid, normalized_fp or "-")
         return cert_bytes
 
@@ -4533,6 +4672,8 @@ class AUNClient:
 
             if peer_devices is None:
                 bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
+                if isinstance(bootstrap, dict):
+                    await self._prime_bootstrap_peer_certs(bootstrap, to)
                 peer_devices = bootstrap.get("peer_devices", [])
                 audit_recipients_raw = bootstrap.get("audit_recipients", [])
                 raw_self_devices = bootstrap.get("self_devices")
@@ -5084,6 +5225,8 @@ class AUNClient:
             self_devices_from_bootstrap = cached[3] if len(cached) > 3 and isinstance(cached[3], list) else None
         else:
             bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
+            if isinstance(bootstrap, dict):
+                await self._prime_bootstrap_peer_certs(bootstrap, to)
             peer_devices = bootstrap.get("peer_devices", [])
             audit_recipients_raw = bootstrap.get("audit_recipients", []) or []
             raw_self_devices = bootstrap.get("self_devices")
