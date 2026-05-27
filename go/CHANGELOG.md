@@ -8,6 +8,30 @@
 
 ---
 
+## 0.3.4 — 2026-05-28
+
+### Breaking Changes
+- **`CreateAID` → `RegisterAID`**：客户端 API 重命名，旧方法已移除；`AuthCreateAID` → `AuthRegisterAID`
+- **注册与认证分离**：`Authenticate()` 不再隐式注册；`EnsureAuthenticated()` 不再隐式创建身份
+
+### Added
+- **`IdentityConflictError`**：新增错误类型，AID 注册冲突时返回
+- **Pull Gate**（`pull_gate.go`）：per-key 序列化 pull 操作，防止同一 namespace 并发 pull
+- **RPC Inflight 限制**：transport 层 semaphore 控制（全局 16 + 后台 8），超时返回 `TimeoutError`
+- **`assertCertMatchesLocalKeypair`**：Authenticate 前显式校验 cert 公钥与本地 keypair 一致
+- **`authCertMatchesPubKey`**：辅助函数，比较 PEM 证书公钥与 base64 SPKI
+
+### Changed
+- **`RegisterAID` 半成品恢复**：本地有 keypair 无 cert 时，查服务端恢复；服务端无记录则用现有 keypair 注册
+- **agent.md 元数据存储**：从全局 `list.json` 改为 per-AID `agentmd.json`
+- **agent.md 下载**：改为无条件 GET；304 时本地有缓存直接用，无缓存重试
+- **`loadIdentityOrRaise`**：`authValidateLoadedIdentity` 检查 keypair 完整性
+- **`.seed` fallback 迁移**：`resolveActiveEncryptionSeed` 启动时检测旧 `.seed` 文件，自动迁移；迁移失败时 fallback 到旧 seed 内容
+- **`ChangeSeed` API**：支持运行时更换 seed（重加密私钥和 DB 加密字段）
+
+### Removed
+- **`CreateAID` / `ensureLocalIdentity` / `ensureIdentity`**：已移除
+
 ## 0.3.3 — 2026-05-25
 
 ### Added

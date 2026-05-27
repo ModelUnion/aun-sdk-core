@@ -89,7 +89,7 @@ def _make_client(tag_or_path: str, *, is_path: bool = False,
 
 
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "") -> str:
-    await client.auth.create_aid({"aid": aid})
+    await client.auth.register_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     opts: dict = {"auto_reconnect": False, "heartbeat_interval": 30.0}
     if slot_id:
@@ -191,7 +191,7 @@ async def test_aid_device_slot_quota() -> bool:
     clients: list[AUNClient] = []
     watchers: list[_DisconnectWatcher] = []
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         # 建 _QUOTA_LIMIT 个长连接（不同 slot 名）
@@ -271,7 +271,7 @@ async def test_aid_devices_quota() -> bool:
     clients: list[AUNClient] = []
     watchers: list[_DisconnectWatcher] = []
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         # 占满 _QUOTA_LIMIT 个不同 device 的长连接（同 aid，slot 任意但保持唯一以避开 slot 配额）
@@ -357,7 +357,7 @@ async def test_device_aids_quota() -> bool:
         register = _make_client(shared_path, is_path=True)
         for i in range(_QUOTA_LIMIT + 1):
             aid = f"qta-a3-{i}-{rid}.{_ISSUER}"
-            await register.auth.create_aid({"aid": aid})
+            await register.auth.register_aid({"aid": aid})
             aids.append(aid)
         await register.close()
 
@@ -429,7 +429,7 @@ async def test_short_ttl_sliding_window() -> bool:
     short = _make_client(shared_path, is_path=True)
     watcher = _DisconnectWatcher(short, "short")
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         # 短连接 ttl=2000ms

@@ -1114,15 +1114,15 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     if (!record) throw new Error(`missing agent.md storage key: ${key}`);
     return record;
   };
-  const readAgentList = async (client: AUNClient): Promise<any> => {
-    const record = await readAgentStorage(client, 'list.json');
-    return JSON.parse(record.content || '{"records":{}}');
+  const readAgentMeta = async (client: AUNClient, aid: string): Promise<any> => {
+    const record = await readAgentStorage(client, `${aid}/agentmd.json`);
+    return JSON.parse(record.content || '{}');
   };
   const writeAgentFile = async (client: AUNClient, aid: string, content: string): Promise<void> => {
     await (client as any)._writeAgentMdContent(aid, content);
   };
 
-  it('publishAgentMd 成功后应持久化自身 agent.md 正文和 list.json 元数据', async () => {
+  it('publishAgentMd 成功后应持久化自身 agent.md 正文和 agentmd.json 元数据', async () => {
     const client = makeAgentClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: alice.agentid.pub\n---\n# Alice\n';
@@ -1137,7 +1137,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     await client.publishAgentMd();
 
     const saved = await readAgentStorage(client, 'alice.agentid.pub/agent.md');
-    const record = (await readAgentList(client)).records['alice.agentid.pub'];
+    const record = await readAgentMeta(client, 'alice.agentid.pub');
     expect(saved.content).toBe(signed);
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(agentEtag(signed));
@@ -1145,7 +1145,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     expect(record.remote_status).toBe('found');
   });
 
-  it('fetchAgentMd 成功后应持久化远端 agent.md 正文和 list.json 元数据', async () => {
+  it('fetchAgentMd 成功后应持久化远端 agent.md 正文和 agentmd.json 元数据', async () => {
     const client = makeAgentClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
@@ -1163,7 +1163,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
 
     expect(info.aid).toBe('bob.agentid.pub');
     const saved = await readAgentStorage(client, 'bob.agentid.pub/agent.md');
-    const record = (await readAgentList(client)).records['bob.agentid.pub'];
+    const record = await readAgentMeta(client, 'bob.agentid.pub');
     expect(saved.content).toBe(body);
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(agentEtag(body));
@@ -1189,11 +1189,10 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     });
 
     expect(client.getRemoteAgentMdEtag()).toBe('"alice-cloud"');
-    const records = (await readAgentList(client)).records;
-    expect(records['alice.agentid.pub'].remote_etag).toBe('"alice-cloud"');
-    expect(records['bob.agentid.pub'].remote_etag).toBe('"bob-cloud"');
-    expect(records['carol.agentid.pub'].remote_etag).toBe('"carol-cloud"');
-    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
+    expect((await readAgentMeta(client, 'alice.agentid.pub')).remote_etag).toBe('"alice-cloud"');
+    expect((await readAgentMeta(client, 'bob.agentid.pub')).remote_etag).toBe('"bob-cloud"');
+    expect((await readAgentMeta(client, 'carol.agentid.pub')).remote_etag).toBe('"carol-cloud"');
+    expect((await readAgentMeta(client, 'dave.agentid.pub')).remote_etag).toBe('"dave-cloud"');
   });
 
   it('transport 事件和通知的顶层 _meta 应进入 agent.md ETag 缓存', async () => {
@@ -1214,9 +1213,8 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     });
     await new Promise(resolve => setTimeout(resolve, 20));
 
-    const records = (await readAgentList(client)).records;
-    expect(records['carol.agentid.pub'].remote_etag).toBe('"carol-cloud"');
-    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
+    expect((await readAgentMeta(client, 'carol.agentid.pub')).remote_etag).toBe('"carol-cloud"');
+    expect((await readAgentMeta(client, 'dave.agentid.pub')).remote_etag).toBe('"dave-cloud"');
   });
 
   it('V2 解密失败事件应透传 agent_md.sender 并缓存发送者 ETag', async () => {
@@ -1252,11 +1250,11 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
       protected_headers: { payload_type: 'chat.text', sdk_lang: 'js' },
       agent_md: { sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' } },
     }));
-    const record = (await readAgentList(client)).records['bob.agentid.pub'];
+    const record = await readAgentMeta(client, 'bob.agentid.pub');
     expect(record.remote_etag).toBe('"bob-cloud"');
   });
 
-  it('checkAgentMd 应使用 HEAD 返回的云端 ETag 与本地 content ETag 比较并落到 list.json', async () => {
+  it('checkAgentMd 应使用 HEAD 返回的云端 ETag 与本地 content ETag 比较并落到 agentmd.json', async () => {
     const client = makeAgentClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '# Bob\n';
@@ -1278,7 +1276,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
     expect(result.in_sync).toBe(true);
-    const record = (await readAgentList(client)).records['bob.agentid.pub'];
+    const record = await readAgentMeta(client, 'bob.agentid.pub');
     expect(record.remote_status).toBe('found');
     expect(record.remote_etag).toBe(agentEtag(body));
     expect(record.checked_at).toBeGreaterThan(0);
@@ -1300,7 +1298,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     expect(result.local_found).toBe(false);
     expect(result.remote_found).toBe(true);
     expect(result.in_sync).toBe(false);
-    const record = (await readAgentList(client)).records['carol.agentid.pub'];
+    const record = await readAgentMeta(client, 'carol.agentid.pub');
     expect(record.remote_etag).toBe('"remote"');
   });
 });

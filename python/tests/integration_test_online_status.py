@@ -81,7 +81,7 @@ def _make_client(tag: str) -> AUNClient:
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:

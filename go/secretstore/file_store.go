@@ -10,10 +10,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -38,7 +36,7 @@ type SeedBackup interface {
 //
 // 密钥派生：
 //   - 传入 encryptionSeed → 从 seed 字符串派生
-//   - 未传 → 从 {root}/.seed 文件派生（首次自动生成）
+//   - 未传 → 从空字符串派生；旧 .seed 只作为迁移源使用
 //
 // 与 Python SDK file_store.py 完全对应。
 type FileSecretStore struct {
@@ -58,17 +56,9 @@ func NewFileSecretStore(root string, encryptionSeed string, seedBackup ...SeedBa
 	if len(seedBackup) > 0 && !isNilSeedBackup(seedBackup[0]) {
 		sb = seedBackup[0]
 	}
+	_ = sb
 
-	var seedBytes []byte
-	if encryptionSeed != "" {
-		seedBytes = []byte(encryptionSeed)
-	} else {
-		var err error
-		seedBytes, err = loadOrCreateSeed(root, sb)
-		if err != nil {
-			return nil, err
-		}
-	}
+	seedBytes := []byte(encryptionSeed)
 
 	// PBKDF2-SHA256 派生主密钥
 	masterKey := pbkdf2.Key(seedBytes, []byte("aun_file_secret_store_v1"), 100000, 32, sha256.New)
@@ -207,58 +197,4 @@ func (f *FileSecretStore) deriveKey(scope, name string) []byte {
 	mac.Write([]byte(fmt.Sprintf("aun:%s:%s", scope, name)))
 	mac.Write([]byte{0x01})
 	return mac.Sum(nil)
-}
-
-// loadOrCreateSeed 三级恢复：文件 → SQLite → 新建，双写确保一致
-func loadOrCreateSeed(root string, backup SeedBackup) ([]byte, error) {
-	seedPath := filepath.Join(root, ".seed")
-	source := ""
-
-	// 1. 先读文件
-	data, err := os.ReadFile(seedPath)
-	if err == nil && len(data) > 0 {
-		source = "file"
-		// 双写：确保 SQLite 也有
-		if !isNilSeedBackup(backup) && source != "sqlite" {
-			backup.BackupSeed(data)
-		}
-		return data, nil
-	}
-
-	// 2. 文件不存在 → 读 SQLite
-	if !isNilSeedBackup(backup) {
-		restored := backup.RestoreSeed()
-		if len(restored) > 0 {
-			source = "sqlite"
-			pkgLogSecretStore().Warn("restoring .seed from SQLite")
-			// 恢复到文件系统
-			if err := os.WriteFile(seedPath, restored, 0o600); err != nil {
-				pkgLogSecretStore().Warn("restore .seed to file failed: %v", err)
-			}
-			if runtime.GOOS != "windows" {
-				_ = os.Chmod(seedPath, 0o600)
-			}
-			return restored, nil
-		}
-	}
-
-	// 3. 都没有 → 生成新 seed
-	seed := make([]byte, 32)
-	if _, err := rand.Read(seed); err != nil {
-		return nil, fmt.Errorf("生成随机 seed 失败: %w", err)
-	}
-
-	if err := os.WriteFile(seedPath, seed, 0o600); err != nil {
-		return nil, fmt.Errorf("写入 seed 文件失败: %w", err)
-	}
-	if runtime.GOOS != "windows" {
-		_ = os.Chmod(seedPath, 0o600)
-	}
-
-	// 双写：备份到 SQLite
-	if !isNilSeedBackup(backup) {
-		backup.BackupSeed(seed)
-	}
-
-	return seed, nil
 }

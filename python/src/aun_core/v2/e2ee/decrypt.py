@@ -215,7 +215,7 @@ def _envelope_context(envelope: dict, row: list) -> str:
 def _find_my_row(recipients: list, self_aid: str, self_device_id: str) -> list | None:
     """在 recipients 中找到自己的行。"""
     for row in recipients:
-        if row[0] == self_aid and row[1] == self_device_id:
+        if row[0] == self_aid and (row[1] == self_device_id or row[1] == ""):
             return row
     return None
 

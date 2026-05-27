@@ -13,7 +13,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -26,6 +26,14 @@ afterEach(() => {
 
 function setupClient(): AUNClient {
   const aunPath = mkdtempSync(join(tmpdir(), 'aun-token-gw-reuse-'));
+  return new AUNClient({ aun_path: aunPath });
+}
+
+function setupClientWithAid(aid: string): AUNClient {
+  const aunPath = mkdtempSync(join(tmpdir(), 'aun-token-gw-reuse-'));
+  // 建立 AID 目录，让 _persistGatewayUrl 能写入
+  const safe = aid.replace(/[\/\\:]/g, '_');
+  mkdirSync(join(aunPath, 'AIDs', safe), { recursive: true });
   return new AUNClient({ aun_path: aunPath });
 }
 
@@ -49,6 +57,7 @@ describe('AuthFlow.authenticate cached_token 复用', () => {
     };
 
     authFlow._loadIdentityOrRaise = vi.fn().mockReturnValue(identity);
+    authFlow._validateCachedCredentials = vi.fn().mockReturnValue('');
     const loginSpy = vi.fn();
     authFlow._login = loginSpy;
 
@@ -75,6 +84,8 @@ describe('AuthFlow.authenticate cached_token 复用', () => {
     };
 
     authFlow._loadIdentityOrRaise = vi.fn().mockReturnValue(identity);
+    authFlow._assertCertMatchesLocalKeypair = vi.fn();
+    authFlow._validateCachedCredentials = vi.fn().mockReturnValue('no certificate');
     authFlow._login = vi.fn().mockResolvedValue({
       access_token: 'new-tok',
       refresh_token: 'new-refresh',
@@ -106,6 +117,8 @@ describe('AuthFlow.authenticate cached_token 复用', () => {
     };
 
     authFlow._loadIdentityOrRaise = vi.fn().mockReturnValue(identity);
+    authFlow._assertCertMatchesLocalKeypair = vi.fn();
+    authFlow._validateCachedCredentials = vi.fn().mockReturnValue('access_token expired');
     authFlow._login = vi.fn().mockResolvedValue({
       access_token: 'fresh-tok',
       refresh_token: 'fresh-refresh',
@@ -126,7 +139,7 @@ describe('AuthFlow.authenticate cached_token 复用', () => {
 describe('AuthNamespace._resolveGateway keystore 持久化', () => {
   it('keystore metadata 命中时跳过 discovery', async () => {
     const aid = 'alice.test.com';
-    const client = setupClient();
+    const client = setupClientWithAid(aid);
     (client as any)._aid = aid;
 
     // 直接写入 keystore metadata
@@ -144,7 +157,7 @@ describe('AuthNamespace._resolveGateway keystore 持久化', () => {
 
   it('discovery 成功后 gateway_url 应被写入 keystore metadata', async () => {
     const aid = 'alice.test.com';
-    const client = setupClient();
+    const client = setupClientWithAid(aid);
     (client as any)._aid = aid;
     (client as any)._gatewayUrl = null;
 

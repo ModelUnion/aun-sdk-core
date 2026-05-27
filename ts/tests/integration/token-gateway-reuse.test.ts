@@ -137,7 +137,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     const client = makeClient(aunPath);
     clients.push(client);
 
-    await client.auth.createAid({ aid });
+    await client.auth.registerAid({ aid });
     const result = await client.auth.authenticate({ aid }) as JsonObject;
     expect(String(result.access_token ?? '')).not.toBe('');
 
@@ -178,7 +178,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次：完整流程
     const client1 = makeClient(aunPath);
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     const first = await client1.auth.authenticate({ aid }) as JsonObject;
     const firstToken = String(first.access_token ?? '');
     const firstGw = String(first.gateway ?? '');
@@ -232,7 +232,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次完整 authenticate
     const client1 = makeClient(aunPath);
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     await client1.auth.authenticate({ aid });
     await safeClose(client1);
     clients.length = 0;
@@ -261,7 +261,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次完整 authenticate
     const client1 = makeClient(aunPath);
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     const first = await client1.auth.authenticate({ aid }) as JsonObject;
     const firstToken = String(first.access_token ?? '');
     await safeClose(client1);

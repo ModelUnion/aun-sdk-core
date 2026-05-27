@@ -36,8 +36,8 @@ async function readContent(client: AUNClient, aid: string): Promise<string | nul
   return await readStorage(client, `${aid}/agent.md`);
 }
 
-async function readList(client: AUNClient): Promise<any> {
-  const raw = await readStorage(client, 'list.json');
+async function readMeta(client: AUNClient, aid: string): Promise<any> {
+  const raw = await readStorage(client, `${aid}/agentmd.json`);
   expect(raw).toBeTruthy();
   return JSON.parse(raw!);
 }
@@ -65,7 +65,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     await expect(client.publishAgentMd()).rejects.toBeInstanceOf(ValidationError);
   });
 
-  it('publishAgentMd 从 IndexedDB 的 {aid}/agent.md 读取，签名上传后写回并更新 list.json', async () => {
+  it('publishAgentMd 从 IndexedDB 的 {aid}/agent.md 读取，签名上传后写回并更新 agentmd.json', async () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const unsigned = '---\naid: alice.agentid.pub\n---\n# Alice\n';
@@ -87,7 +87,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     expect(result.aid).toBe('alice.agentid.pub');
     expect(signedInput).toBe(unsigned);
     expect(await readContent(client, 'alice.agentid.pub')).toBe(uploaded);
-    const record = (await readList(client)).records['alice.agentid.pub'];
+    const record = await readMeta(client, 'alice.agentid.pub');
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(await etag(uploaded));
     expect(record.remote_etag).toBe('"cloud"');
@@ -106,7 +106,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     expect(await readContent(client, 'alice.agentid.pub')).toContain('<!-- signed -->');
   });
 
-  it('fetchAgentMd 保存到 IndexedDB 的 {aid}/agent.md，并只把元数据放入 list.json', async () => {
+  it('fetchAgentMd 保存到 IndexedDB 的 {aid}/agent.md，并只把元数据放入 agentmd.json', async () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
@@ -121,7 +121,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     expect(info.aid).toBe('bob.agentid.pub');
     expect(info.in_sync).toBeNull();
     expect(await readContent(client, 'bob.agentid.pub')).toBe(body);
-    const record = (await readList(client)).records['bob.agentid.pub'];
+    const record = await readMeta(client, 'bob.agentid.pub');
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(await etag(body));
     expect(record.remote_etag).toBe('"bob-cloud"');
@@ -151,7 +151,8 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
     expect(result.in_sync).toBe(true);
-    expect((await readList(client)).records['bob.agentid.pub'].remote_etag).toBe(await etag(body));
+    const record = await readMeta(client, 'bob.agentid.pub');
+    expect(record.remote_etag).toBe(await etag(body));
   });
 
   it('观察 RPC meta 时保存结构化 etag/last_modified，并为缺正文的 aid 自动拉取', async () => {
@@ -179,13 +180,17 @@ describe('js client AgentMDs IndexedDB 存储', () => {
       },
     });
 
-    const records = (await readList(client)).records;
-    expect(records['alice.agentid.pub'].remote_etag).toBe('"alice-cloud-2"');
-    expect(records['alice.agentid.pub'].last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
-    expect(records['bob.agentid.pub'].remote_etag).toBe('"bob-cloud"');
-    expect(records['bob.agentid.pub'].last_modified).toBe('Sun, 24 May 2026 00:00:01 GMT');
-    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
-    expect(Object.values(records).every((record: any) => record.content === undefined)).toBe(true);
+    const aliceRecord = await readMeta(client, 'alice.agentid.pub');
+    expect(aliceRecord.remote_etag).toBe('"alice-cloud-2"');
+    expect(aliceRecord.last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
+    const bobRecord = await readMeta(client, 'bob.agentid.pub');
+    expect(bobRecord.remote_etag).toBe('"bob-cloud"');
+    expect(bobRecord.last_modified).toBe('Sun, 24 May 2026 00:00:01 GMT');
+    const daveRecord = await readMeta(client, 'dave.agentid.pub');
+    expect(daveRecord.remote_etag).toBe('"dave-cloud"');
+    expect(aliceRecord.content).toBeUndefined();
+    expect(bobRecord.content).toBeUndefined();
+    expect(daveRecord.content).toBeUndefined();
     expect(fetched).toEqual(['alice.agentid.pub', 'bob.agentid.pub', 'dave.agentid.pub']);
     expect(await readContent(client, 'bob.agentid.pub')).toBe('# bob.agentid.pub\n');
   });
@@ -200,6 +205,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
       local_etag: bodyEtag,
       remote_etag: bodyEtag,
       last_modified: new Date().toUTCString(),
+      checked_at: Date.now(),
       verify_status: 'valid',
       verify_error: '',
     });
@@ -216,24 +222,21 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     expect(result.verify_status).toBe('valid');
   });
 
-  it('list.json 损坏时按 IndexedDB 中的正文重建，并清空旧内存缓存', async () => {
+  it('agentmd.json 损坏时 _loadAgentMdRecord 仍可读取正文并返回基本记录', async () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '# Alice\n';
     await writeLocalAgentMd(client, 'alice.agentid.pub', body);
     (client as any)._agentMdCache.set('alice.agentid.pub', { aid: 'alice.agentid.pub', remote_etag: '"cloud"' });
     (client as any)._agentMdCache.set('bob.agentid.pub', { aid: 'bob.agentid.pub', remote_etag: '"stale"' });
-    await (client as any)._writeAgentMdStorage('list.json', '{bad json');
+    // 写入损坏的 agentmd.json
+    await (client as any)._writeAgentMdStorage('alice.agentid.pub/agentmd.json', '{bad json');
 
     const record = await (client as any)._loadAgentMdRecord('alice.agentid.pub');
 
     expect(record.content).toBe(body);
     expect(record.local_etag).toBe(await etag(body));
+    // 损坏的元数据被忽略，所以没有 remote_etag
     expect(record.remote_etag).toBeUndefined();
-    const rebuilt = (await readList(client)).records['alice.agentid.pub'];
-    expect(rebuilt.content).toBeUndefined();
-    expect(rebuilt.local_etag).toBe(await etag(body));
-    expect(rebuilt.remote_etag).toBeUndefined();
-    expect((client as any)._agentMdCache.has('bob.agentid.pub')).toBe(false);
   });
 });

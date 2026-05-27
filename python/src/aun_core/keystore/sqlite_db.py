@@ -47,34 +47,29 @@ def _derive_field_key(master_key: bytes, scope: str, name: str) -> bytes:
 
 
 def _decode_secret_part(value: str) -> bytes:
+    text = str(value or "")
+    if len(text) % 2 == 0 and text and all(ch in "0123456789abcdefABCDEF" for ch in text):
+        try:
+            return bytes.fromhex(text)
+        except ValueError:
+            pass
     try:
-        return base64.b64decode(value, validate=True)
+        return base64.b64decode(text, validate=True)
     except Exception:
-        return bytes.fromhex(value)
+        return bytes.fromhex(text)
 
 
 def load_or_create_seed(root: Path, *, encryption_seed: str | None = None) -> bytes:
-    """加载或生成 .seed 文件。
+    """返回 seed_password 对应的 seed bytes，并迁移旧 .seed 加密材料。"""
+    if encryption_seed is None:
+        encryption_seed = ""
+    if (root / ".seed").exists() or any(root.glob(".seed.migrated.*")):
+        from .seed_migration import migrate_seed_materials
+        result = migrate_seed_materials(root, encryption_seed)
+        if result.active_seed is not None:
+            return result.active_seed
+    return encryption_seed.encode("utf-8")
 
-    优先级：encryption_seed 参数 > .seed 文件 > 新生成。
-    """
-    if encryption_seed:
-        return encryption_seed.encode("utf-8")
-
-    seed_path = root / ".seed"
-    if seed_path.exists():
-        return seed_path.read_bytes()
-
-    # 生成新 seed
-    seed = os.urandom(32)
-    root.mkdir(parents=True, exist_ok=True)
-    seed_path.write_bytes(seed)
-    if sys.platform != "win32":
-        try:
-            os.chmod(seed_path, 0o600)
-        except OSError:
-            pass
-    return seed
 
 
 # ── Schema DDL ───────────────────────────────────────────────
@@ -447,7 +442,7 @@ class AIDDatabase:
         return self._master_key
 
     def _protect_text(self, name: str, plaintext: str) -> str:
-        if not self._seed_bytes or not plaintext:
+        if not plaintext:
             return plaintext
         try:
             master_key = self._get_master_key()
@@ -468,7 +463,7 @@ class AIDDatabase:
             return plaintext
 
     def _reveal_text(self, name: str, stored: str) -> str:
-        if not stored or not self._seed_bytes:
+        if not stored:
             return stored
         try:
             record = json.loads(stored)

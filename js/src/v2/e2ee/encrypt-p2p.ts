@@ -29,7 +29,7 @@ import {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const E2EE_SDK_LANG = 'javascript';
-const E2EE_SDK_VERSION = '0.3.2';
+const E2EE_SDK_VERSION = '0.3.4';
 
 async function sha256(data: Uint8Array): Promise<Uint8Array> {
   const buf = await crypto.subtle.digest('SHA-256', data.slice().buffer);
@@ -257,7 +257,8 @@ export function normalizeProtectedHeaders(
     normalized['payload_type'] = payloadType;
   }
   normalized.sdk_lang = E2EE_SDK_LANG;
-  normalized.sdk_vesion = E2EE_SDK_VERSION;
+  delete normalized.sdk_vesion;
+  normalized.sdk_version = E2EE_SDK_VERSION;
   return normalized;
 }
 

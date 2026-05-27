@@ -6,6 +6,30 @@
 
 ---
 
+## 0.3.4 — 2026-05-28
+
+### Breaking Changes
+- **`create_aid()` → `register_aid()`**：客户端 API 重命名，旧方法已移除（服务端 RPC 方法名 `auth.create_aid` 不变）
+- **注册与认证分离**：`authenticate()` 不再隐式注册；身份不完整时直接抛 `StateError`，应用层必须先显式调 `register_aid()`
+
+### Added
+- **`IdentityConflictError`**：新增错误类型（继承 `AuthError`），AID 注册冲突时抛出（code 4090）
+- **Pull Gate**：per-key 序列化 pull 操作（`message.pull` / `group.pull` / `group.pull_events`），防止同一 namespace 并发 pull
+- **RPC Inflight 限制**：transport 层全局最大 16 个并发 RPC + 后台 RPC 独立限制 8 个，排队超时抛 `TimeoutError`
+- **`_assert_cert_matches_local_keypair`**：authenticate 前显式校验 cert 公钥与本地 keypair 一致
+
+### Changed
+- **`register_aid` 半成品恢复**：本地有 keypair 无 cert 时，查服务端恢复（而非拒绝）；服务端无记录则用现有 keypair 注册
+- **agent.md 元数据存储**：从全局 `list.json` 改为 per-AID `agentmd.json`（与 TS/C++ 对齐）
+- **agent.md 下载**：改为无条件 GET（移除 If-None-Match/If-Modified-Since）；304 时本地有缓存直接用，无缓存重试
+- **`_load_identity_or_raise`**：增加 keypair 完整性检查（缺 private_key_pem 或 public_key_der_b64 直接抛错）
+- **`ensure_authenticated`**：移除隐式创建逻辑，无 cert 直接抛 `StateError`
+- **`.seed` fallback 迁移**：启动时检测旧 `.seed` 文件，自动迁移到 `seed_password` 派生方式；迁移失败时 fallback 到旧 seed 内容
+- **`ChangeSeed` API**：支持运行时更换 seed（重加密所有私钥和 DB 加密字段）
+
+### Removed
+- **`_ensure_local_identity` / `_ensure_identity`**：已移除，注册路径不再隐式生成密钥
+
 ## 0.3.3 — 2026-05-25
 
 ### Added

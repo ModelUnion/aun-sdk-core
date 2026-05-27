@@ -107,9 +107,9 @@ func (a *CrossSdkGoAgent) ensureConnected(ctx context.Context) error {
 	if a.gatewayURL != "" {
 		a.client.SetGatewayURL(a.gatewayURL)
 	}
-	if _, err := a.client.Auth.CreateAID(ctx, map[string]any{"aid": a.aid}); err != nil {
+	if _, err := a.client.Auth.RegisterAID(ctx, map[string]any{"aid": a.aid}); err != nil {
 		if local := a.client.AuthLoadIdentityOrNil(a.aid); local == nil {
-			return fmt.Errorf("create_aid failed and no local identity exists: %w", err)
+			return fmt.Errorf("register_aid failed and no local identity exists: %w", err)
 		}
 	}
 	authResult, err := a.client.Auth.Authenticate(ctx, map[string]any{"aid": a.aid})

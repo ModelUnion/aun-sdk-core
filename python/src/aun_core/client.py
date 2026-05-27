@@ -85,6 +85,63 @@ def _clamp_heartbeat_interval(value: Any) -> float:
     return v
 
 
+def _v2_normalize_wrap_policy(raw: Any) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    protocol = str(raw.get("protocol") or "").strip().upper()
+    scope = str(raw.get("scope") or "").strip().lower()
+    if scope not in ("aid", "device"):
+        if raw.get("per_aid_wrap") is True:
+            scope = "aid"
+        elif raw.get("per_device_wrap") is True:
+            scope = "device"
+        else:
+            scope = ""
+    if protocol not in ("1DH", "3DH"):
+        protocol = ""
+    if scope == "aid":
+        protocol = "1DH"
+    if not protocol and not scope:
+        return None
+    return {"protocol": protocol, "scope": scope}
+
+
+def _v2_wrap_capabilities() -> dict[str, Any]:
+    return {
+        "version": "v2.1",
+        "protocols": ["1DH", "3DH"],
+        "scopes": ["aid", "device"],
+        "per_aid_wrap": True,
+        "per_device_wrap": True,
+    }
+
+
+def _v2_apply_wrap_policy_to_targets(
+    targets: list[dict[str, Any]],
+    policy: dict[str, str] | None,
+) -> list[dict[str, Any]]:
+    if not policy:
+        return targets
+    normalized: list[dict[str, Any]] = []
+    for target in targets:
+        row = dict(target)
+        if policy.get("protocol") == "1DH":
+            row["key_source"] = "aid_master"
+            row["spk_pk_der"] = None
+            row["spk_id"] = ""
+        normalized.append(row)
+    if policy.get("scope") != "aid":
+        return normalized
+    collapsed: dict[tuple[str, str], dict[str, Any]] = {}
+    for target in normalized:
+        key = (str(target.get("aid") or ""), str(target.get("role") or ""))
+        if key not in collapsed:
+            row = dict(target)
+            row["device_id"] = ""
+            collapsed[key] = row
+    return list(collapsed.values())
+
+
 def _length_prefixed_bytes_key(*parts: bytes) -> bytes:
     chunks: list[bytes] = []
     for part in parts:
@@ -377,13 +434,12 @@ class AUNClient:
         self._peer_prekeys_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._prekey_replenish_inflight: bool = False
         self._prekey_pending_replenish: int = 0
-        # AgentMDs 目录：{agent_md_path}/list.json 保存元数据，{agent_md_path}/{aid}/agent.md 保存正文。
+        # AgentMDs 目录：{agent_md_path}/{aid}/agentmd.json 保存元数据，{agent_md_path}/{aid}/agent.md 保存正文。
         self._agent_md_path: str = str(Path(self._config_model.aun_path) / "AgentMDs")
         self._local_agent_md_etag: str = ""
         # gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
         self._remote_agent_md_etag: str = ""
         self._agent_md_cache: dict[str, dict[str, Any]] = {}
-        self._agent_md_last_list_rebuilt: bool = False
         # 当前活跃 prekey：只有这个 prekey 被消费时才触发 replenish 上传。
         # connect 成功后上传的 prekey 记录为活跃；历史 prekey 被消费不触发上传。
         self._active_prekey_id: str = ""
@@ -442,6 +498,9 @@ class AUNClient:
         self.meta = MetaNamespace(self)
         # V2 E2EE session（延迟初始化，connect 后才有 aid）
         self._v2_session: V2Session | None = None
+        # Pull Gate：per-key 序列化，防止同一 namespace/group 并发 pull
+        self._pull_gates: dict[str, dict] = {}
+        self._PULL_GATE_STALE_MS = 30000
         # V2 state chain 本地存储（分叉检测）：group_id -> (state_version, state_chain)
         self._v2_state_chains: dict[str, tuple[int, str]] = {}
         # 同一 group 的 V2 自动提案必须串行，避免 group.create 与后续成员变更抢同一 state_version。
@@ -525,13 +584,14 @@ class AUNClient:
     def _agent_md_file_path(self, aid: str) -> Path:
         return self._agent_md_root() / self._agent_md_safe_aid(aid) / "agent.md"
 
-    def _agent_md_list_path(self) -> Path:
-        return self._agent_md_root() / "list.json"
+    def _agent_md_meta_path(self, aid: str) -> Path:
+        return self._agent_md_root() / self._agent_md_safe_aid(aid) / "agentmd.json"
 
     @contextmanager
-    def _agent_md_list_lock(self):
-        root = self._agent_md_root()
-        lock_path = root / "list.json.lock"
+    def _agent_md_record_lock(self, aid: str):
+        meta_path = self._agent_md_meta_path(aid)
+        lock_path = meta_path.parent / "agentmd.json.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "a+b") as fp:
             try:
                 if os.name == "nt":
@@ -580,86 +640,36 @@ class AUNClient:
             except Exception:
                 pass
 
-    def _write_agent_md_list_unlocked(self, records: dict[str, dict[str, Any]]) -> None:
-        payload = {
-            "version": 1,
-            "updated_at": int(time.time() * 1000),
-            "records": {aid: rec for aid, rec in sorted(records.items())},
-        }
+    def _write_agent_md_record_unlocked(self, aid: str, record: dict[str, Any]) -> None:
+        payload = {k: v for k, v in record.items() if k != "content" and v is not None}
+        payload["aid"] = self._agent_md_safe_aid(aid)
         self._atomic_write_text(
-            self._agent_md_list_path(),
+            self._agent_md_meta_path(aid),
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
 
-    def _normalize_agent_md_list(self, data: Any) -> dict[str, dict[str, Any]]:
-        raw_records = data.get("records") if isinstance(data, dict) else None
-        if isinstance(raw_records, list):
-            iterable = raw_records
-        elif isinstance(raw_records, dict):
-            iterable = raw_records.values()
-        elif isinstance(data, list):
-            iterable = data
-        else:
-            iterable = []
-        records: dict[str, dict[str, Any]] = {}
-        for item in iterable:
-            if not isinstance(item, dict):
-                continue
-            aid = str(item.get("aid") or "").strip()
-            if not aid:
-                continue
-            record = {k: v for k, v in item.items() if k != "content"}
-            record["aid"] = aid
-            for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
-                try:
-                    record[key] = int(record.get(key) or 0)
-                except Exception:
-                    record[key] = 0
-            records[aid] = record
-        return records
-
-    def _rebuild_agent_md_list_unlocked(self) -> dict[str, dict[str, Any]]:
-        records: dict[str, dict[str, Any]] = {}
-        now = int(time.time() * 1000)
-        for child in self._agent_md_root().iterdir():
-            if not child.is_dir():
-                continue
-            aid = child.name
-            path = child / "agent.md"
-            if not path.is_file():
-                continue
+    def _normalize_agent_md_record(self, aid: str, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        record: dict[str, Any] = {k: v for k, v in data.items() if k != "content"}
+        record["aid"] = self._agent_md_safe_aid(str(record.get("aid") or aid))
+        for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
             try:
-                content = path.read_text(encoding="utf-8")
-            except Exception as exc:
-                self._log.warn("client", "agent.md rebuild skipped unreadable file aid=%s err=%s", aid, exc)
-                continue
-            record = {
-                "aid": aid,
-                "local_etag": self._agent_md_content_etag(content),
-                "updated_at": now,
-            }
-            try:
-                record["fetched_at"] = int(path.stat().st_mtime * 1000)
+                record[key] = int(record.get(key) or 0)
             except Exception:
-                record["fetched_at"] = now
-            records[aid] = record
-        self._write_agent_md_list_unlocked(records)
-        self._agent_md_cache.clear()
-        return records
+                record[key] = 0
+        return record
 
-    def _read_agent_md_list_unlocked(self) -> dict[str, dict[str, Any]]:
-        path = self._agent_md_list_path()
+    def _read_agent_md_record_unlocked(self, aid: str) -> dict[str, Any]:
+        path = self._agent_md_meta_path(aid)
         if not path.exists():
-            self._agent_md_last_list_rebuilt = True
-            return self._rebuild_agent_md_list_unlocked()
+            return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            self._agent_md_last_list_rebuilt = False
-            return self._normalize_agent_md_list(data)
+            return self._normalize_agent_md_record(aid, data)
         except Exception as exc:
-            self._log.warn("client", "agent.md list.json damaged, rebuilding: %s", exc)
-            self._agent_md_last_list_rebuilt = True
-            return self._rebuild_agent_md_list_unlocked()
+            self._log.warn("client", "agent.md metadata damaged, ignoring: aid=%s err=%s", aid, exc)
+            return {}
 
     def _read_agent_md_content(self, aid: str) -> str:
         return self._agent_md_file_path(aid).read_text(encoding="utf-8")
@@ -674,20 +684,25 @@ class AUNClient:
         if not target:
             return None
         try:
-            with self._agent_md_list_lock():
-                records = self._read_agent_md_list_unlocked()
-            record = records.get(target)
-            if isinstance(record, dict):
+            with self._agent_md_record_lock(target):
+                record = self._read_agent_md_record_unlocked(target)
+            loaded: dict[str, Any]
+            if record:
                 loaded = dict(record)
                 loaded["aid"] = target
-                try:
-                    content = self._read_agent_md_content(target)
-                    loaded["content"] = content
-                    loaded["local_etag"] = self._agent_md_content_etag(content)
-                except Exception as exc:
+            else:
+                loaded = {"aid": target}
+            try:
+                content = self._read_agent_md_content(target)
+                loaded["content"] = content
+                loaded["local_etag"] = self._agent_md_content_etag(content)
+            except Exception as exc:
+                if self._agent_md_meta_path(target).exists():
                     self._log.warn("client", "agent.md content read failed: aid=%s err=%s", target, exc)
-                self._agent_md_cache[target] = dict(loaded)
-                return dict(loaded)
+            if len(loaded) <= 1:
+                return None
+            self._agent_md_cache[target] = dict(loaded)
+            return dict(loaded)
         except Exception as exc:
             self._log.debug("client", "agent.md cache load skipped: aid=%s err=%s", target, exc)
         return None
@@ -704,16 +719,14 @@ class AUNClient:
                 saved_to = self._write_agent_md_content(target, str(content))
                 fields.setdefault("local_etag", self._agent_md_content_etag(str(content)))
                 fields.setdefault("fetched_at", int(time.time() * 1000))
-            with self._agent_md_list_lock():
-                records = self._read_agent_md_list_unlocked()
-                record = dict(records.get(target) or {})
+            with self._agent_md_record_lock(target):
+                record = dict(self._read_agent_md_record_unlocked(target) or {})
                 record["aid"] = target
                 for key, value in fields.items():
                     if value is not None:
                         record[key] = value
                 record["updated_at"] = int(time.time() * 1000)
-                records[target] = {k: v for k, v in record.items() if k != "content"}
-                self._write_agent_md_list_unlocked(records)
+                self._write_agent_md_record_unlocked(target, record)
             loaded = dict(record)
             if content is not content_marker and content is not None:
                 loaded["content"] = str(content)
@@ -1232,6 +1245,60 @@ class AUNClient:
         except Exception as exc:
             raise ClientSignatureError(f"客户端签名失败，拒绝发送无签名请求: {exc}") from exc
 
+    # ── Pull Gate ─────────────────────────────────────────────────
+
+    def _pull_gate_key_for_call(self, method: str, params: dict) -> str:
+        if method in ("message.pull", "message.v2.pull"):
+            return f"p2p:{self._aid}" if self._aid else ""
+        if method in ("group.pull", "group.v2.pull"):
+            gid = str(params.get("group_id") or "").strip()
+            return f"group:{gid}" if gid else ""
+        if method == "group.pull_events":
+            gid = str(params.get("group_id") or "").strip()
+            return f"group_event:{gid}" if gid else ""
+        return ""
+
+    def _try_acquire_pull_gate(self, key: str) -> int | None:
+        if not key:
+            return 0
+        if not hasattr(self, "_pull_gates"):
+            self._pull_gates = {}
+        now = int(time.time() * 1000)
+        gate = self._pull_gates.get(key, {"inflight": False, "started_at": 0, "token": 0})
+        if gate["inflight"] and now - gate["started_at"] <= self._PULL_GATE_STALE_MS:
+            return None
+        if gate["inflight"]:
+            self._log.warn("client", "pull in-flight stale reset: key=%s age=%dms", key, now - gate["started_at"])
+        gate["token"] += 1
+        gate["inflight"] = True
+        gate["started_at"] = now
+        self._pull_gates[key] = gate
+        return gate["token"]
+
+    def _release_pull_gate(self, key: str, token: int | None) -> None:
+        if not key or token is None:
+            return
+        gate = self._pull_gates.get(key)
+        if not gate or gate["token"] != token:
+            return
+        gate["inflight"] = False
+        gate["started_at"] = 0
+
+    async def _run_pull_serialized(self, key: str, operation):
+        """acquire gate → execute → release。gate 被占时短等待后重试。"""
+        token = self._try_acquire_pull_gate(key)
+        if token is None:
+            deadline = time.time() + (self._PULL_GATE_STALE_MS + 100) / 1000.0
+            while token is None and time.time() <= deadline:
+                await asyncio.sleep(0.025)
+                token = self._try_acquire_pull_gate(key)
+            if token is None:
+                raise StateError(f"pull already in-flight for {key}")
+        try:
+            return await operation()
+        finally:
+            self._release_pull_gate(key, token)
+
     async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
         _t_call_start = time.time()
         if self._state != "connected":
@@ -1376,21 +1443,42 @@ class AUNClient:
             call_kwargs["timeout"] = _NON_IDEMPOTENT_TIMEOUT
         if trace:
             call_kwargs["trace"] = trace
-        if method in ("group.thought.get", "message.thought.get"):
-            self._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
-        try:
-            result = await self._transport.call(method, params, **call_kwargs)
-        except TypeError as exc:
-            if call_kwargs and "unexpected keyword argument" in str(exc):
-                call_kwargs.pop("timeout", None)
-                call_kwargs.pop("trace", None)
-                result = await self._transport.call(method, params, **call_kwargs) if call_kwargs else await self._transport.call(method, params)
-            else:
+
+        # Pull Gate：序列化同一 key 的 pull 操作
+        pull_gate_key = self._pull_gate_key_for_call(method, params)
+        if pull_gate_key:
+            async def _gated_call():
+                if method in ("group.thought.get", "message.thought.get"):
+                    self._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
+                try:
+                    return await self._transport.call(method, params, **call_kwargs)
+                except TypeError as exc:
+                    if call_kwargs and "unexpected keyword argument" in str(exc):
+                        call_kwargs.pop("timeout", None)
+                        call_kwargs.pop("trace", None)
+                        return await self._transport.call(method, params, **call_kwargs) if call_kwargs else await self._transport.call(method, params)
+                    raise
+            try:
+                result = await self._run_pull_serialized(pull_gate_key, _gated_call)
+            except Exception as exc:
                 self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
                 raise
-        except Exception as exc:
-            self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
-            raise
+        else:
+            if method in ("group.thought.get", "message.thought.get"):
+                self._log.debug("client", "thought.get transport call start: method=%s params=%s", method, params)
+            try:
+                result = await self._transport.call(method, params, **call_kwargs)
+            except TypeError as exc:
+                if call_kwargs and "unexpected keyword argument" in str(exc):
+                    call_kwargs.pop("timeout", None)
+                    call_kwargs.pop("trace", None)
+                    result = await self._transport.call(method, params, **call_kwargs) if call_kwargs else await self._transport.call(method, params)
+                else:
+                    self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
+                    raise
+            except Exception as exc:
+                self._log.debug("client", "call exit (error): elapsed=%.3fs method=%s err=%s", time.time() - _t_call_start, method, exc)
+                raise
 
         if method == "group.thought.get" and isinstance(result, dict):
             self._log.debug(
@@ -2749,7 +2837,10 @@ class AUNClient:
         try:
             if self._v2_session and from_aid:
                 try:
-                    bs = await self.call("message.v2.bootstrap", {"peer_aid": from_aid})
+                    bs = await self.call("message.v2.bootstrap", {
+                        "peer_aid": from_aid,
+                        "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                    })
                     if isinstance(bs, dict):
                         for dev in bs.get("peer_devices", []) or []:
                             self._v2_cache_peer_ik_from_device(dev, from_aid)
@@ -2757,7 +2848,10 @@ class AUNClient:
                     self._log.warn("client", "V2 sender IK pending bootstrap failed peer=%s: %s", from_aid, exc)
                 if group_id:
                     try:
-                        gbs = await self.call("group.v2.bootstrap", {"group_id": group_id})
+                        gbs = await self.call("group.v2.bootstrap", {
+                            "group_id": group_id,
+                            "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                        })
                         if isinstance(gbs, dict):
                             for dev in gbs.get("devices", []) or []:
                                 self._v2_cache_peer_ik_from_device(dev)
@@ -4663,19 +4757,26 @@ class AUNClient:
                 if cached and (time.time() - cached[1]) < self._V2_BOOTSTRAP_TTL:
                     peer_devices = cached[0]
                     self_devices_from_bootstrap = cached[3] if len(cached) > 3 and isinstance(cached[3], list) else None
+                    wrap_policy = cached[4] if len(cached) > 4 else None
                 else:
                     peer_devices = None
                     self_devices_from_bootstrap = None
+                    wrap_policy = None
             else:
                 peer_devices = None
                 self_devices_from_bootstrap = None
+                wrap_policy = None
 
             if peer_devices is None:
-                bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
+                bootstrap = await self.call("message.v2.bootstrap", {
+                    "peer_aid": to,
+                    "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                })
                 if isinstance(bootstrap, dict):
                     await self._prime_bootstrap_peer_certs(bootstrap, to)
                 peer_devices = bootstrap.get("peer_devices", [])
                 audit_recipients_raw = bootstrap.get("audit_recipients", [])
+                wrap_policy = _v2_normalize_wrap_policy(bootstrap.get("e2ee_wrap_policy"))
                 raw_self_devices = bootstrap.get("self_devices")
                 self_devices_from_bootstrap = raw_self_devices if isinstance(raw_self_devices, list) else None
                 self._log.debug("client", "_send_encrypted_v2 bootstrap: to=%s peer_devices=%d spk_pks=%s",
@@ -4687,6 +4788,7 @@ class AUNClient:
                         time.time(),
                         audit_recipients_raw,
                         self_devices_from_bootstrap,
+                        wrap_policy,
                     )
                 if self._aid and self_devices_from_bootstrap:
                     self._v2_bootstrap_cache[self._aid] = (self_devices_from_bootstrap, time.time())
@@ -4733,7 +4835,10 @@ class AUNClient:
                         if self_cached and (time.time() - self_cached[1]) < self._V2_BOOTSTRAP_TTL:
                             self_devices = self_cached[0]
                         else:
-                            self_bs = await self.call("message.v2.bootstrap", {"peer_aid": self._aid})
+                            self_bs = await self.call("message.v2.bootstrap", {
+                                "peer_aid": self._aid,
+                                "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                            })
                             self_devices = self_bs.get("peer_devices", [])
                             if self_devices:
                                 self._v2_bootstrap_cache[self._aid] = (self_devices, time.time())
@@ -4753,6 +4858,8 @@ class AUNClient:
                 except Exception as exc:
                     self._log.debug("client", "V2 self-sync bootstrap failed (non-fatal): %s", exc)
 
+            target_set["targets"] = _v2_apply_wrap_policy_to_targets(target_set["targets"], wrap_policy)
+            target_set["audit_recipients"] = _v2_apply_wrap_policy_to_targets(target_set["audit_recipients"], wrap_policy)
             envelope = encrypt_p2p_message(
                 sender=sender,
                 target_set=target_set,
@@ -5054,15 +5161,22 @@ class AUNClient:
                 if cached and (time.time() - cached[1]) < self._V2_GROUP_BOOTSTRAP_TTL:
                     all_devices = cached[0]
                     epoch = cached[2] if len(cached) > 2 else 0
+                    wrap_policy = cached[7] if len(cached) > 7 else None
                 else:
                     all_devices = None
+                    wrap_policy = None
             else:
                 all_devices = None
+                wrap_policy = None
 
             if all_devices is None:
-                bootstrap = await self.call("group.v2.bootstrap", {"group_id": group_id})
+                bootstrap = await self.call("group.v2.bootstrap", {
+                    "group_id": group_id,
+                    "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                })
                 all_devices = bootstrap.get("devices", [])
                 epoch = int(bootstrap.get("epoch", 0))
+                wrap_policy = _v2_normalize_wrap_policy(bootstrap.get("e2ee_wrap_policy"))
                 pending_adds = set(bootstrap.get("pending_adds", []))
                 committed_aids = set(bootstrap.get("committed_member_aids", []))
                 # 分叉检测：比对 state_chain
@@ -5094,7 +5208,7 @@ class AUNClient:
                 if all_devices:
                     self._v2_bootstrap_cache[cache_key] = (
                         all_devices, time.time(), epoch, pending_adds, committed_aids,
-                        state_commitment, audit_recipients_raw,
+                        state_commitment, audit_recipients_raw, wrap_policy,
                     )
                 # lazy sync 触发：发现 pending members 且自己是 owner/admin 时异步发起提案
                 if pending_adds and self._v2_session:
@@ -5104,6 +5218,7 @@ class AUNClient:
                 committed_aids = cached[4] if len(cached) > 4 else set()
                 state_commitment = cached[5] if len(cached) > 5 else {"state_version": 0, "state_hash": "", "state_chain": ""}
                 audit_recipients_raw = cached[6] if len(cached) > 6 else []
+                wrap_policy = cached[7] if len(cached) > 7 else None
 
             if not all_devices:
                 raise E2EEError(f"V2 group bootstrap: no devices found for group {group_id}")
@@ -5142,6 +5257,7 @@ class AUNClient:
                     targets.append(target)
 
             sender = self._v2_session.get_sender_identity()
+            targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
             envelope = encrypt_group_message(
                 sender=sender,
                 group_id=group_id,
@@ -5223,12 +5339,17 @@ class AUNClient:
             peer_devices = cached[0]
             audit_recipients_raw = cached[2] if len(cached) > 2 and isinstance(cached[2], list) else []
             self_devices_from_bootstrap = cached[3] if len(cached) > 3 and isinstance(cached[3], list) else None
+            wrap_policy = cached[4] if len(cached) > 4 else None
         else:
-            bootstrap = await self.call("message.v2.bootstrap", {"peer_aid": to})
+            bootstrap = await self.call("message.v2.bootstrap", {
+                "peer_aid": to,
+                "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+            })
             if isinstance(bootstrap, dict):
                 await self._prime_bootstrap_peer_certs(bootstrap, to)
             peer_devices = bootstrap.get("peer_devices", [])
             audit_recipients_raw = bootstrap.get("audit_recipients", []) or []
+            wrap_policy = _v2_normalize_wrap_policy(bootstrap.get("e2ee_wrap_policy"))
             raw_self_devices = bootstrap.get("self_devices")
             self_devices_from_bootstrap = raw_self_devices if isinstance(raw_self_devices, list) else None
             if peer_devices:
@@ -5237,6 +5358,7 @@ class AUNClient:
                     time.time(),
                     audit_recipients_raw,
                     self_devices_from_bootstrap,
+                    wrap_policy,
                 )
             if self._aid and self_devices_from_bootstrap:
                 self._v2_bootstrap_cache[self._aid] = (self_devices_from_bootstrap, time.time())
@@ -5276,7 +5398,10 @@ class AUNClient:
                     if self_cached and (time.time() - self_cached[1]) < self._V2_BOOTSTRAP_TTL:
                         self_devices = self_cached[0]
                     else:
-                        self_bs = await self.call("message.v2.bootstrap", {"peer_aid": self._aid})
+                        self_bs = await self.call("message.v2.bootstrap", {
+                            "peer_aid": self._aid,
+                            "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+                        })
                         self_devices = self_bs.get("peer_devices", [])
                         if self_devices:
                             self._v2_bootstrap_cache[self._aid] = (self_devices, time.time())
@@ -5297,6 +5422,7 @@ class AUNClient:
                 self._log.debug("client", "V2 thought self-sync bootstrap failed (non-fatal): %s", exc)
 
         sender = self._v2_session.get_sender_identity()
+        targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
         target_set = {"targets": targets, "audit_recipients": []}
         envelope = encrypt_p2p_message(
             sender=sender,
@@ -5395,15 +5521,20 @@ class AUNClient:
             epoch = cached[2] if len(cached) > 2 else 0
             state_commitment = cached[5] if len(cached) > 5 else {"state_version": 0, "state_hash": "", "state_chain": ""}
             audit_recipients_raw = cached[6] if len(cached) > 6 else []
+            wrap_policy = cached[7] if len(cached) > 7 else None
             self._log.debug(
                 "client",
                 "group.v2.bootstrap cache hit: group=%s devices=%d audit=%d epoch=%s state_version=%s",
                 group_id, len(all_devices), len(audit_recipients_raw), epoch, state_commitment.get("state_version"),
             )
         else:
-            bootstrap = await self.call("group.v2.bootstrap", {"group_id": group_id})
+            bootstrap = await self.call("group.v2.bootstrap", {
+                "group_id": group_id,
+                "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+            })
             all_devices = bootstrap.get("devices", [])
             epoch = int(bootstrap.get("epoch", 0))
+            wrap_policy = _v2_normalize_wrap_policy(bootstrap.get("e2ee_wrap_policy"))
             self._log.debug(
                 "client",
                 "group.v2.bootstrap fetched: group=%s devices=%d audit=%d epoch=%s members=%d",
@@ -5427,7 +5558,7 @@ class AUNClient:
             if all_devices:
                 self._v2_bootstrap_cache[cache_key] = (
                     all_devices, time.time(), epoch, pending_adds, committed_aids,
-                    state_commitment, audit_recipients_raw,
+                    state_commitment, audit_recipients_raw, wrap_policy,
                 )
             # lazy sync 触发：发现 pending members 且自己是 owner/admin 时异步发起提案
             if pending_adds and self._v2_session:
@@ -5468,6 +5599,7 @@ class AUNClient:
             raise E2EEError(f"V2 group: no target devices for {group_id}")
 
         sender = self._v2_session.get_sender_identity()
+        targets = _v2_apply_wrap_policy_to_targets(targets, wrap_policy)
         envelope = encrypt_group_message(
             sender=sender,
             group_id=group_id,
@@ -5774,7 +5906,7 @@ class AUNClient:
         if isinstance(recipients, list):
             for row in recipients:
                 if isinstance(row, list) and len(row) >= 6:
-                    if row[0] == self._aid and row[1] == self._device_id:
+                    if row[0] == self._aid and (row[1] == self._device_id or row[1] == ""):
                         spk_id = str(row[5] or "")
                         recipient_key_source = str(row[3] or "") if len(row) > 3 else ""
                         break
@@ -6200,7 +6332,10 @@ class AUNClient:
             if my_role not in ("owner", "admin"):
                 return False
 
-            bootstrap_resp = await self.call("group.v2.bootstrap", {"group_id": group_id})
+            bootstrap_resp = await self.call("group.v2.bootstrap", {
+                "group_id": group_id,
+                "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+            })
             devices = bootstrap_resp.get("devices", []) if isinstance(bootstrap_resp, dict) else []
             online_admin_set = set(online_admin_aids)
             candidates: list[str] = []
@@ -6303,7 +6438,10 @@ class AUNClient:
                         await asyncio.sleep(wait_s)
 
             # 获取群所有成员的设备列表（V2 bootstrap）
-            bootstrap_resp = await self.call("group.v2.bootstrap", {"group_id": group_id})
+            bootstrap_resp = await self.call("group.v2.bootstrap", {
+                "group_id": group_id,
+                "e2ee_wrap_capabilities": _v2_wrap_capabilities(),
+            })
             all_devices = bootstrap_resp.get("devices", []) if isinstance(bootstrap_resp, dict) else []
             audit_recipients = bootstrap_resp.get("audit_recipients", []) if isinstance(bootstrap_resp, dict) else []
             audit_aids_list = sorted(set(
@@ -6683,7 +6821,7 @@ class AUNClient:
                             isinstance(row, list)
                             and len(row) >= 6
                             and row[0] == self._aid
-                            and row[1] == self._device_id
+                            and (row[1] == self._device_id or row[1] == "")
                         ):
                             selected_row = row
                             spk_id = str(row[5] or "")
@@ -6696,7 +6834,7 @@ class AUNClient:
                             isinstance(row, list)
                             and len(row) >= 6
                             and row[0] == self._aid
-                            and row[1] == self._device_id
+                            and (row[1] == self._device_id or row[1] == "")
                         ):
                             selected_row = row
                             break

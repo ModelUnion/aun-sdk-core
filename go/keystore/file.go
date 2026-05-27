@@ -65,9 +65,11 @@ func NewFileKeyStore(root string, ss secretstore.SecretStore, encryptionSeed str
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("创建密钥存储根目录失败: %w", err)
 	}
+	activeEncryptionSeed := encryptionSeed
 	if ss == nil {
 		var err error
-		ss, err = secretstore.NewFileSecretStore(root, encryptionSeed)
+		activeEncryptionSeed = resolveActiveEncryptionSeed(root, encryptionSeed)
+		ss, err = secretstore.NewFileSecretStore(root, activeEncryptionSeed)
 		if err != nil {
 			return nil, fmt.Errorf("创建 SecretStore 失败: %w", err)
 		}
@@ -165,6 +167,7 @@ func (f *FileKeyStore) Close() {
 	for _, db := range f.aidDBs {
 		db.close()
 	}
+	f.aidDBs = make(map[string]*AIDDatabase)
 }
 
 // ── KeyPair ──────────────────────────────────────────────────
@@ -377,13 +380,19 @@ func (f *FileKeyStore) LoadIdentity(aid string) (out map[string]any, err error) 
 	if err != nil {
 		return nil, err
 	}
-	// 直接从 DB 读取 tokens + KV
-	db, err := f.getDB(aid)
-	if err != nil {
-		return nil, err
+	tokens := map[string]string{}
+	kv := map[string]string{}
+	dbPath := filepath.Join(f.identityDir(aid), "aun.db")
+	if _, statErr := os.Stat(dbPath); statErr == nil {
+		db, err := f.getDB(aid)
+		if err != nil {
+			return nil, err
+		}
+		tokens = db.GetAllTokens()
+		kv = db.GetAllMetadata()
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, statErr
 	}
-	tokens := db.GetAllTokens()
-	kv := db.GetAllMetadata()
 	hasMeta := len(tokens) > 0 || len(kv) > 0
 	if kp == nil && cert == "" && !hasMeta {
 		return nil, nil

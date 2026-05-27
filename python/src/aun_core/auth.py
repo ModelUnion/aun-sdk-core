@@ -19,8 +19,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from .crypto import CryptoProvider
-from .errors import AuthError, ConnectionError, StateError, ValidationError, map_remote_error, AUNError
+from .errors import AuthError, ConnectionError, StateError, ValidationError, IdentityConflictError, map_remote_error, AUNError
 from .keystore.file import FileKeyStore
+from .version import __version__ as _AUN_SDK_VERSION
+
+_AUN_SDK_LANG = "python"
 
 if TYPE_CHECKING:
     from .logger import AUNLogger, NullLogger
@@ -110,49 +113,124 @@ class AuthFlow:
         self._device_id = str(device_id or "").strip()
         self._slot_id = str(slot_id or "").strip()
 
-    async def create_aid(self, gateway_url: str, aid: str) -> dict[str, Any]:
+    async def register_aid(self, gateway_url: str, aid: str) -> dict[str, Any]:
+        """严格注册新 AID（对齐 TS registerAid / Go RegisterAID）。
+
+        注册与认证彻底分离：此方法绝不被 SDK 内部自动调用，
+        必须由应用层显式调用。
+        """
         _t_start = time.time()
         self._validate_aid_name(aid)
-        self._log.debug("auth", "create_aid enter: aid=%s gateway=%s", aid, gateway_url)
+        self._log.debug("auth", "register_aid enter: aid=%s gateway=%s", aid, gateway_url)
         try:
-            identity = self._ensure_local_identity(aid)
-            if identity.get("cert"):
-                self._log.debug("auth", "local cert exists, syncing server state: aid=%s", aid)
-                identity = await self._sync_existing_identity_cert(gateway_url, identity)
-                self._persist_identity(identity)
-                self._aid = identity["aid"]
-                self._log.debug("auth", "create_aid exit (synced): elapsed=%.3fs aid=%s", time.time() - _t_start, identity["aid"])
-                return {"aid": identity["aid"], "cert": identity["cert"]}
+            # Step 1: 本地已有 keypair → 查服务端做幂等/恢复
+            existing = self._keystore.load_identity(aid)
+            if existing and existing.get("private_key_pem") and existing.get("public_key_der_b64"):
+                self._log.debug("auth", "register_aid: local keypair exists, checking server: aid=%s", aid)
+                local_pub_der = base64.b64decode(existing["public_key_der_b64"])
+                server_cert_pem = await self._download_registered_cert(gateway_url, aid)
+                if server_cert_pem:
+                    # 服务端已注册 → 比对公钥
+                    cert = x509.load_pem_x509_certificate(server_cert_pem.encode("utf-8"))
+                    cert_pub_der = cert.public_key().public_bytes(
+                        serialization.Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    if cert_pub_der != local_pub_der:
+                        raise IdentityConflictError(
+                            f"AID '{aid}' is registered by another party on server (public key mismatch). "
+                            f"Choose a different name."
+                        )
+                    # 公钥匹配 → 幂等返回；如本地缺 cert，把服务端 cert 写入
+                    self._log.info("auth", "register_aid: idempotent return for already-registered AID: aid=%s", aid)
+                    if not existing.get("cert"):
+                        existing["cert"] = server_cert_pem
+                        self._persist_identity(existing)
+                    self._aid = aid
+                    return {"aid": aid, "cert": server_cert_pem}
+                else:
+                    # 服务端无记录 → 用现有 keypair 发起注册
+                    self._log.debug("auth", "register_aid: server has no record, registering with existing keypair: aid=%s", aid)
+                    created = await self._create_aid(gateway_url, existing)
+                    cert_pem = created.get("cert", "")
+                    if not cert_pem:
+                        raise AuthError(f"register_aid: server response missing cert for {aid}")
+                    existing["cert"] = cert_pem
+                    # 校验 cert 公钥
+                    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+                    cert_pub_der = cert.public_key().public_bytes(
+                        serialization.Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    if cert_pub_der != local_pub_der:
+                        raise AuthError(
+                            f"register_aid: server returned certificate with mismatched public key for {aid}"
+                        )
+                    self._persist_identity(existing)
+                    self._aid = aid
+                    self._log.debug("auth", "register_aid exit (recovered): elapsed=%.3fs aid=%s", time.time() - _t_start, aid)
+                    return {"aid": aid, "cert": cert_pem}
 
-            # 本地有密钥但无证书 — 可能是上次 create_aid 网络失败后的残留状态，
-            # 也可能是服务端已注册但本地证书丢失。两种情况都先尝试注册。
-            try:
-                created = await self._create_aid(gateway_url, identity)
-                identity.update(created)
-            except AUNError as e:
-                if "already exists" not in str(e):
-                    self._log.warn("auth", "create_aid registration failed: aid=%s err=%s", aid, e)
-                    raise
-                # AID 已在服务端注册，本地有密钥但证书丢失。
-                # 通过 HTTP PKI 端点下载已注册的证书，验证公钥匹配后恢复。
-                self._log.debug("auth", "AID already exists, attempting cert download recovery: aid=%s", aid)
-                try:
-                    identity = await self._recover_cert_via_download(gateway_url, identity)
-                except Exception:
-                    self._log.warn("auth", "cert download recovery failed: aid=%s", aid)
-                    raise StateError(
-                        f"AID {aid} already registered on server but local certificate is missing. "
-                        f"Certificate download recovery failed. Options: "
-                        f"(1) use a different AID name, or "
-                        f"(2) restart Kite server to clear registration."
-                    ) from e
+            # Step 2: 先查服务端确认未注册
+            server_cert_pem = await self._download_registered_cert(gateway_url, aid)
+            if server_cert_pem:
+                raise IdentityConflictError(
+                    f"AID '{aid}' is already registered on server. "
+                    f"Choose a different name, or if you own the keypair use a recovery flow."
+                )
+
+            # Step 3: 生成 keypair
+            identity = self._crypto.generate_identity()
+            identity["aid"] = aid
+
+            # Step 4: RPC 注册（服务端方法名仍为 auth.create_aid）
+            created = await self._create_aid(gateway_url, identity)
+            cert_pem = created.get("cert", "")
+            if not cert_pem:
+                raise AuthError(f"register_aid: server response missing cert for {aid}")
+            identity["cert"] = cert_pem
+
+            # Step 5: 校验 cert 公钥 == 本地公钥
+            cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+            cert_pub_der = cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            local_pub_der = base64.b64decode(identity["public_key_der_b64"])
+            if cert_pub_der != local_pub_der:
+                raise AuthError(
+                    f"register_aid: server returned certificate with mismatched public key for {aid}"
+                )
+
+            # Step 6: 持久化
             self._persist_identity(identity)
-            self._aid = identity["aid"]
-            self._log.debug("auth", "create_aid exit: elapsed=%.3fs aid=%s", time.time() - _t_start, identity["aid"])
-            return {"aid": identity["aid"], "cert": identity["cert"]}
+            self._aid = aid
+            self._log.debug("auth", "register_aid exit: elapsed=%.3fs aid=%s", time.time() - _t_start, aid)
+            return {"aid": aid, "cert": cert_pem}
         except Exception as exc:
-            self._log.debug("auth", "create_aid exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, aid, exc)
+            self._log.debug("auth", "register_aid exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, aid, exc)
             raise
+
+    def _assert_cert_matches_local_keypair(self, identity: dict[str, Any]) -> None:
+        """防线 B：cert 公钥必须与本地 keypair 公钥一致，否则拒绝登录。"""
+        aid = identity.get("aid", "?")
+        cert_pem = identity.get("cert")
+        local_pub_b64 = identity.get("public_key_der_b64")
+        if not cert_pem or not local_pub_b64:
+            raise AuthError(
+                f"identity for aid {aid} missing cert or public key; refusing to start two-phase login"
+            )
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        cert_pub_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        local_pub_der = base64.b64decode(local_pub_b64)
+        if cert_pub_der != local_pub_der:
+            raise AuthError(
+                f"local certificate public key does not match local keypair for aid {aid}; "
+                f"refusing to start two-phase login. Run auth.register_aid() to repair identity."
+            )
 
     async def _sync_existing_identity_cert(self, gateway_url: str, identity: dict[str, Any]) -> dict[str, Any]:
         """本地已有 cert 时，校准服务端登记状态并必要时补签恢复。"""
@@ -258,20 +336,16 @@ class AuthFlow:
                     self._log.warn("auth", "cert recovery failed: aid=%s err=%s", identity.get("aid"), e)
                     raise StateError(
                         f"local certificate missing and recovery failed: {e}. "
-                        f"Run auth.create_aid() to register a new identity."
+                        f"Run auth.register_aid() to register a new identity."
                     ) from e
+            # 防线 B：发起两步登录前显式校验 cert 公钥与本地 keypair 公钥一致
+            self._assert_cert_matches_local_keypair(identity)
             try:
                 login = await self._login(gateway_url, identity)
             except AuthError as e:
-                if "not registered" in str(e):
-                    self._log.warn("auth", "cert not registered on server, auto re-registering: aid=%s", identity["aid"])
-                    created = await self._create_aid(gateway_url, identity)
-                    identity["cert"] = created["cert"]
-                    self._persist_identity(identity)
-                    login = await self._login(gateway_url, identity)
-                else:
-                    self._log.warn("auth", "auth failed: aid=%s err=%s", identity.get("aid"), e)
-                    raise
+                # 注册和登录彻底分离：登录失败绝不触发自动注册。
+                self._log.warn("auth", "auth failed: aid=%s err=%s", identity.get("aid"), e)
+                raise
             self._remember_tokens(identity, login)
             await self._validate_new_cert(identity, gateway_url)
             self._persist_identity(identity)
@@ -289,11 +363,15 @@ class AuthFlow:
             raise
 
     async def ensure_authenticated(self, gateway_url: str) -> dict[str, Any]:
-        identity = self._ensure_identity()
+        """注册和登录彻底分离：无身份或无 cert 直接抛错。"""
+        identity = self._load_identity_or_raise()
         if not identity.get("cert"):
-            created = await self._create_aid(gateway_url, identity)
-            identity.update(created)
-            self._persist_identity(identity)
+            raise StateError(
+                f"local identity for aid {identity.get('aid')} has no certificate; "
+                f"call auth.authenticate() to attempt cert recovery, or auth.register_aid() if this is a fresh registration."
+            )
+        # 防线 B：发起两步登录前显式校验 cert 公钥与本地 keypair 公钥一致
+        self._assert_cert_matches_local_keypair(identity)
 
         login = await self._login(gateway_url, identity)
         self._remember_tokens(identity, login)
@@ -515,7 +593,11 @@ class AuthFlow:
             "auth": {"method": "kite_token", "token": token},
             "protocol": {"min": "1.0", "max": "1.0"},
             "device": {"id": str(device_id or ""), "type": "sdk"},
-            "client": {"slot_id": str(slot_id or "")},
+            "client": {
+                "slot_id": str(slot_id or ""),
+                "sdk_lang": _AUN_SDK_LANG,
+                "sdk_version": _AUN_SDK_VERSION,
+            },
             "delivery_mode": delivery_mode or {"mode": "fanout"},
             "capabilities": (extra_info or {}).get("_capabilities") or {
                 "e2ee": True,
@@ -1219,23 +1301,8 @@ class AuthFlow:
             return ""
         return access_token
 
-    def _ensure_local_identity(self, aid: str) -> dict[str, Any]:
-        existing = self._keystore.load_identity(aid)
-        # 必须确认有 keypair（private_key_pem + public_key_der_b64）才算"已存在"
-        # 否则 keystore 可能只有 metadata（如 gateway_url）但没有真正的密钥材料
-        if existing and existing.get("private_key_pem") and existing.get("public_key_der_b64"):
-            self._aid = aid
-            return existing
-        identity = self._crypto.generate_identity()
-        identity["aid"] = aid
-        # 保留 keystore 已有的 metadata（如 gateway_url），避免覆盖
-        if existing:
-            for k, v in existing.items():
-                if k not in identity and k != "aid":
-                    identity[k] = v
-        self._persist_identity(identity)  # 立即持久化 keypair，避免服务端拒绝后丢失
-        self._aid = aid
-        return identity
+    # （_ensure_local_identity 已移除：注册和登录彻底分离，
+    # 登录路径绝不再隐式生成密钥；新身份必须由应用层显式调 register_aid）
 
     # AID name 验证正则：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
     import re as _re
@@ -1259,6 +1326,12 @@ class AuthFlow:
             existing = self._keystore.load_identity(requested_aid)
             if existing is None:
                 raise StateError(f"identity not found for aid: {requested_aid}")
+            # 防线 A：拒绝半成品 identity（缺 keypair 任一字段）
+            if not existing.get("private_key_pem") or not existing.get("public_key_der_b64"):
+                raise StateError(
+                    f"local identity for aid {requested_aid} is incomplete (missing keypair); "
+                    f"call auth.register_aid() first"
+                )
             self._aid = requested_aid
             if not existing.get("aid"):
                 existing["aid"] = requested_aid
@@ -1270,21 +1343,18 @@ class AuthFlow:
             if existing is not None:
                 loaded_aid = existing.get("aid")
                 if isinstance(loaded_aid, str) and loaded_aid:
+                    # 同样检查 keypair 完整性
+                    if not existing.get("private_key_pem") or not existing.get("public_key_der_b64"):
+                        raise StateError(
+                            f"local identity for aid {loaded_aid} is incomplete (missing keypair); "
+                            f"call auth.register_aid() first"
+                        )
                     self._aid = loaded_aid
                 return existing
 
-        raise StateError("no local identity found, call auth.create_aid() first")
+        raise StateError("no local identity found, call auth.register_aid() first")
 
-    def _ensure_identity(self) -> dict[str, Any]:
-        try:
-            return self._load_identity_or_raise()
-        except StateError:
-            if not self._aid:
-                raise StateError("no local identity found, call auth.create_aid() first")
-            identity = self._crypto.generate_identity()
-            identity["aid"] = self._aid
-            self._persist_identity(identity)  # 立即持久化，避免后续网络失败丢失密钥
-            return identity
+    # （_ensure_identity 已移除：注册和登录彻底分离）
 
     def _load_instance_state(self, aid: str) -> dict[str, Any] | None:
         loader = getattr(self._keystore, "load_instance_state", None)

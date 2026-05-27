@@ -78,12 +78,12 @@ async function resolveGatewayInto(client: AUNClient): Promise<void> {
 async function connectLong(
   client: AUNClient,
   aid: string,
-  options: { slotId?: string; createAid?: boolean } = {},
+  options: { slotId?: string; registerAid?: boolean } = {},
 ): Promise<void> {
   await resolveGatewayInto(client);
-  if (options.createAid !== false) {
+  if (options.registerAid !== false) {
     try {
-      await client.auth.createAid({ aid });
+      await client.auth.registerAid({ aid });
     } catch (err) {
       // AID 已存在不报错（共享 keystore 多次创建）
       const msg = String(err);
@@ -268,7 +268,7 @@ describe('长短连接 集成 - 短连接容量上限 → 4013', { timeout: 90_0
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.createAid({ aid });
+      await setup.auth.registerAid({ aid });
       await setup.close();
 
       // 起 10 个短连接（共享 keystore）
@@ -315,7 +315,7 @@ describe('长短连接 集成 - short_ttl_ms 兜底 → 4014', { timeout: 60_000
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.createAid({ aid });
+      await setup.auth.registerAid({ aid });
       await setup.close();
 
       await connectShort(short, aid, { slotId: 'ttl', shortTtlMs: 2000 });
@@ -354,10 +354,10 @@ describe('长短连接 集成 - 长连接互踢，短连接不受影响', { time
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.createAid({ aid });
+      await setup.auth.registerAid({ aid });
       await setup.close();
 
-      await connectLong(longOld, aid, { slotId: 'slot-x', createAid: false });
+      await connectLong(longOld, aid, { slotId: 'slot-x', registerAid: false });
       for (let i = 0; i < 3; i++) {
         const c = makeClient(sharedPath, true);
         shorts.push(c);
@@ -366,7 +366,7 @@ describe('长短连接 集成 - 长连接互踢，短连接不受影响', { time
       await sleep(500);
 
       // 新长连接同槽位进入，应踢旧长
-      await connectLong(longNew, aid, { slotId: 'slot-x', createAid: false });
+      await connectLong(longNew, aid, { slotId: 'slot-x', registerAid: false });
       await sleep(1_500);
 
       expect(longOld.state).not.toBe('connected');
@@ -400,7 +400,7 @@ describe('长短连接 集成 - 短连接不发布 client.online', { timeout: 60
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.createAid({ aid: shortAid });
+      await setup.auth.registerAid({ aid: shortAid });
       await setup.close();
 
       await connectLong(observer, observerAid, { slotId: 'obs' });
@@ -432,10 +432,10 @@ describe('长短连接 集成 - hello-ok 回包 connection.kind', { timeout: 60_
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.createAid({ aid });
+      await setup.auth.registerAid({ aid });
       await setup.close();
 
-      await connectLong(longClient, aid, { slotId: 'h7-l', createAid: false });
+      await connectLong(longClient, aid, { slotId: 'h7-l', registerAid: false });
       await longClient.close();
 
       await connectShort(shortClient, aid, { slotId: 'h7-s' });
@@ -462,7 +462,7 @@ describe('长短连接 集成 - 短连接禁用 token 刷新', { timeout: 60_000
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.createAid({ aid });
+      await setup.auth.registerAid({ aid });
       await setup.close();
 
       await connectShort(short, aid, { slotId: 'd8' });

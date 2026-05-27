@@ -37,7 +37,7 @@ func (c *AUNClient) buildV2P2PEnvelope(
 	opts e2ee.EncryptOptions,
 	useCache bool,
 ) (map[string]any, error) {
-	peerDevices, auditRaw, err := c.v2ResolveBootstrap(ctx, state, to, useCache)
+	peerDevices, auditRaw, wrapPolicy, err := c.v2ResolveBootstrap(ctx, state, to, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +96,7 @@ func (c *AUNClient) buildV2P2PEnvelope(
 		return nil, fmt.Errorf("buildV2P2PEnvelope: sender identity 失败: %w", err)
 	}
 
+	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
 	envelope, err := e2ee.EncryptP2PMessage(
 		e2ee.Sender{
 			AID:      sender.AID,
@@ -103,7 +104,7 @@ func (c *AUNClient) buildV2P2PEnvelope(
 			IKPriv:   sender.IKPriv,
 			IKPubDER: sender.IKPubDER,
 		},
-		e2ee.TargetSet{Targets: targets},
+		e2ee.TargetSet{Targets: sendTargets},
 		payload,
 		opts,
 	)
@@ -119,7 +120,7 @@ func (c *AUNClient) buildV2P2PEnvelope(
 		"timestamp":  opts.Timestamp,
 	}, envelope, map[string]any{
 		"plaintext_payload": payload,
-		"target_count":      len(targets),
+		"target_count":      len(sendTargets),
 		"audit_count":       len(auditRaw),
 		"use_cache":         useCache,
 	})
@@ -135,7 +136,7 @@ func (c *AUNClient) buildV2GroupEnvelope(
 	opts e2ee.EncryptOptions,
 	useCache bool,
 ) (map[string]any, error) {
-	allDevices, epoch, sc, auditRaw, err := c.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	allDevices, epoch, sc, auditRaw, wrapPolicy, err := c.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +189,7 @@ func (c *AUNClient) buildV2GroupEnvelope(
 		return nil, fmt.Errorf("buildV2GroupEnvelope: sender identity 失败: %w", err)
 	}
 
+	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
 	envelope, err := e2ee.EncryptGroupMessage(
 		e2ee.Sender{
 			AID:      sender.AID,
@@ -197,7 +199,7 @@ func (c *AUNClient) buildV2GroupEnvelope(
 		},
 		groupID,
 		epoch,
-		targets,
+		sendTargets,
 		payload,
 		opts,
 		sc,
@@ -215,7 +217,7 @@ func (c *AUNClient) buildV2GroupEnvelope(
 	}, envelope, map[string]any{
 		"plaintext_payload": payload,
 		"epoch":             epoch,
-		"target_count":      len(targets),
+		"target_count":      len(sendTargets),
 		"audit_count":       len(auditRaw),
 		"use_cache":         useCache,
 	})
@@ -438,7 +440,7 @@ func (c *AUNClient) decryptV2EnvelopeForThought(ctx context.Context, envelope ma
 			}
 			rowAID, _ := row[0].(string)
 			rowDevID, _ := row[1].(string)
-			if rowAID == selfAID && rowDevID == selfDeviceID {
+			if rowAID == selfAID && (rowDevID == selfDeviceID || rowDevID == "") {
 				if s, ok := row[3].(string); ok {
 					recipientKeySource = s
 				}
@@ -663,6 +665,10 @@ func v2ThoughtE2EEMetadata(envelope map[string]any) map[string]any {
 		meta["agent_md"] = agentMD
 	}
 	return meta
+}
+
+func v2MessageE2EEMetadata(envelope map[string]any) map[string]any {
+	return v2ThoughtE2EEMetadata(envelope)
 }
 
 func attachV2EnvelopeMetadata(message map[string]any, meta map[string]any) {

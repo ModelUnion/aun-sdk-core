@@ -103,7 +103,7 @@
 SDK 的核心抽象。AID 域名格式身份及本地密钥对管理；连接状态机及自动重连；认证流程（挑战-应答）；E2EE 两级离线加密流程。
 
 ### 04-连接与认证
-SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数（含自动重连、心跳、令牌刷新）；`client.call()` RPC 调用模式；`client.on()` 事件订阅。
+SDK 高层封装。`register_aid` + `authenticate` 认证流程；`connect` 参数（含自动重连、心跳、令牌刷新）；`client.call()` RPC 调用模式；`client.on()` 事件订阅。
 
 ### 05-E2EE加密通信
 E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；`protected_headers` 与可验证 `context` 元数据；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。

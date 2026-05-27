@@ -23,12 +23,12 @@ from ..crypto.ecdsa import ecdsa_sign_raw
 from ..crypto.aead import aes_gcm_encrypt
 from ..crypto.dh_path import compute_3dh_wrap, compute_1dh_wrap
 from ..crypto.recipients import sort_recipients, compute_recipients_digest
+from ...version import __version__ as _SDK_VERSION
 
 _METADATA_KEY_DOMAIN = b"aun-envelope-metadata-key-v1"
 _PROTECTED_HEADERS_DOMAIN = b"aun-protected-headers-v1"
 _PROTECTED_CONTEXT_DOMAIN = b"aun-protected-context-v1"
 _SDK_LANG = "python"
-_SDK_VERSION = "0.3.2"
 
 
 def _metadata_auth_tag(key: bytes, domain: bytes, body: dict[str, Any]) -> bytes:
@@ -78,7 +78,7 @@ def _normalize_headers(headers: dict[str, Any], payload_type: str | None = None)
     if payload_type:
         normalized.setdefault("payload_type", payload_type)
     normalized["sdk_lang"] = _SDK_LANG
-    normalized["sdk_vesion"] = _SDK_VERSION
+    normalized["sdk_version"] = _SDK_VERSION
     return normalized
 
 

@@ -1,7 +1,7 @@
 /**
  * Auth 命名空间
  *
- * 提供 auth.createAid / auth.authenticate 等高层方法，
+ * 提供 auth.registerAid / auth.authenticate 等高层方法，
  * 内部通过 AUNClient 的 transport、auth、discovery 完成实际流程。
  *
  * 与 Python SDK 的 AuthNamespace 完全对齐。
@@ -37,8 +37,9 @@ interface AgentMdVerifyResult extends JsonObject {
 }
 
 interface AuthFlowBridge {
-  createAid: (url: string, aid: string) => Promise<IdentityRecord>;
+  registerAid: (url: string, aid: string) => Promise<IdentityRecord>;
   authenticate: (url: string, opts?: { aid?: string }) => Promise<AuthNamespaceResult>;
+  loadIdentity: (aid?: string) => IdentityRecord;
   loadIdentityOrNone: (aid?: string) => IdentityRecord | null;
   getAccessTokenExpiry?: (identity: IdentityRecord) => number | null;
   refreshCachedTokens?: (gatewayUrl: string, identity: IdentityRecord) => Promise<IdentityRecord>;
@@ -201,7 +202,11 @@ async function fetchWithTimeout(
 export class AuthNamespace {
   private _client: AUNClient;
   private _log: ModuleLogger;
-  private _agentMdCache: Map<string, { text: string; etag: string; lastModified: string }> = new Map();
+  private _agentMdCache: Map<string, { text?: string; etag: string; lastModified: string }> = new Map();
+  private _agentMdDownloadInflight: Map<string, Promise<string>> = new Map();
+  private _agentMdDownloadActive = 0;
+  private _agentMdDownloadWaiters: Array<() => void> = [];
+  private static readonly AGENT_MD_DOWNLOAD_CONCURRENCY = 8;
 
   constructor(client: AUNClient) {
     this._client = client;
@@ -210,6 +215,28 @@ export class AuthNamespace {
 
   private get _internal(): ClientBridge {
     return this._client as any as ClientBridge;
+  }
+
+  private async _acquireAgentMdDownloadSlot(): Promise<() => void> {
+    if (this._agentMdDownloadActive < AuthNamespace.AGENT_MD_DOWNLOAD_CONCURRENCY) {
+      this._agentMdDownloadActive += 1;
+      return () => this._releaseAgentMdDownloadSlot();
+    }
+    await new Promise<void>((resolve) => {
+      this._agentMdDownloadWaiters.push(resolve);
+    });
+    return () => this._releaseAgentMdDownloadSlot();
+  }
+
+  private _releaseAgentMdDownloadSlot(): void {
+    const next = this._agentMdDownloadWaiters.shift();
+    if (next) {
+      next();
+      return;
+    }
+    if (this._agentMdDownloadActive > 0) {
+      this._agentMdDownloadActive -= 1;
+    }
   }
 
   /**
@@ -285,17 +312,30 @@ export class AuthNamespace {
   }
 
   /**
+  /**
    * 从 keystore metadata 读取 cached gateway_url（用于跨进程复用，避免重做 discovery）
+   *
+   * 重要：本方法**绝不**为 aid 创建空壳目录。仅当正式 AID 目录已存在
+   * （已注册）时才读取；否则返回空字符串。
    */
   _loadCachedGatewayUrl(aid: string): string {
     if (!aid) return '';
-    const keystore = this._internal._keystore;
+    const keystore = this._internal._keystore as KeyStore & {
+      _aidsRoot?: string;
+      _getDB?: (aid: string) => { getMetadata: (k: string) => string | null };
+    };
     try {
-      const db = (keystore as KeyStore & { _getDB?: (aid: string) => { getMetadata: (k: string) => string | null } })._getDB?.(aid);
+      // 仅当正式目录存在时才读
+      if (keystore._aidsRoot) {
+        const fs = require('node:fs') as typeof import('node:fs');
+        const path = require('node:path') as typeof import('node:path');
+        const safe = aid.replace(/[\/\\:]/g, '_');
+        if (!fs.existsSync(path.join(keystore._aidsRoot, safe))) return '';
+      }
+      const db = keystore._getDB?.(aid);
       if (!db || typeof db.getMetadata !== 'function') return '';
       const raw = db.getMetadata('gateway_url');
       if (!raw) return '';
-      // saveIdentity 走 JSON.stringify；这里 JSON.parse 兼容；裸字符串也兼容
       try {
         const value = JSON.parse(raw);
         if (typeof value === 'string') return value.trim();
@@ -309,49 +349,93 @@ export class AuthNamespace {
   }
 
   /**
-   * 持久化 gateway_url 到 keystore metadata，供跨进程复用
+   * 持久化 gateway_url 到 keystore metadata，供跨进程复用。
+   *
+   * 重要：本方法**绝不**为 aid 创建空壳目录。仅当正式 AID 目录已存在
+   * （已注册）时才写入；否则跳过——register_aid 完成后会重新写入。
    */
   _persistGatewayUrl(aid: string, gatewayUrl: string): void {
     if (!gatewayUrl || !aid) return;
+    const keystore = this._internal._keystore as KeyStore & {
+      _aidsRoot?: string;
+      _getDB?: (aid: string) => { setMetadata: (k: string, v: string) => void };
+    };
     try {
-      const keystore = this._internal._keystore;
-      const db = (keystore as KeyStore & { _getDB?: (aid: string) => { setMetadata: (k: string, v: string) => void } })._getDB?.(aid);
+      // 仅当正式目录存在时才写
+      if (keystore._aidsRoot) {
+        const fs = require('node:fs') as typeof import('node:fs');
+        const path = require('node:path') as typeof import('node:path');
+        const safe = aid.replace(/[\/\\:]/g, '_');
+        if (!fs.existsSync(path.join(keystore._aidsRoot, safe))) {
+          this._log.debug(`persist gateway_url skipped (no identity dir): aid=${aid}`);
+          return;
+        }
+      }
+      const db = keystore._getDB?.(aid);
       if (!db || typeof db.setMetadata !== 'function') return;
-      // 与 saveIdentity 保持一致用 JSON 编码，避免 saveIdentity 之后被覆盖时格式冲突
       db.setMetadata('gateway_url', JSON.stringify(gatewayUrl));
     } catch (exc) {
       this._log.debug(`persist gateway_url failed aid=${aid} err=${exc instanceof Error ? exc.message : String(exc)}`);
     }
   }
 
-  /** 创建新 AID */
-  async createAid(params: RpcParams): Promise<AuthNamespaceResult> {
+  /**
+   * 注册新 AID（必须显式调用，绝不会被 SDK 内部自动触发）。
+   *
+   * 与旧 `createAid` 的差异：
+   * - 不再混合 load/create 语义；本地已有该 AID → IdentityConflictError
+   * - 注册后**不**继续登录/连接；应用层需显式 authenticate / connect
+   * - 失败不留磁盘痕迹（临时目录由 AUNClient 启动时清理）
+   */
+  async registerAid(params: RpcParams): Promise<AuthNamespaceResult> {
     const tStart = Date.now();
     const aid = String(params?.aid ?? '');
-    if (!aid) throw new Error("auth.create_aid requires 'aid'");
+    if (!aid) throw new Error("auth.registerAid requires 'aid'");
 
     const client = this._internal;
-    this._log.debug(`createAid enter: aid=${aid}`);
+    this._log.debug(`registerAid enter: aid=${aid}`);
     const gatewayUrl = await this._resolveGateway(aid);
     client._gatewayUrl = gatewayUrl;
 
     const auth = client._auth;
     try {
-      const result = await auth.createAid(gatewayUrl, aid);
+      const result = await auth.registerAid(gatewayUrl, aid);
       client._aid = aid;
       client._identity = auth.loadIdentityOrNone(aid);
-      this._log.info(`createAid success: aid=${aid} gateway=${gatewayUrl}`);
-      this._log.debug(`createAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      this._log.info(`registerAid success: aid=${aid} gateway=${gatewayUrl}`);
+      this._log.debug(`registerAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
       return {
         aid: result.aid,
         cert_pem: result.cert,
         gateway: gatewayUrl,
       };
     } catch (err) {
-      this._log.error(`createAid failed: aid=${aid} err=${err instanceof Error ? err.message : String(err)}`, err instanceof Error ? err : undefined);
-      this._log.debug(`createAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      this._log.error(`registerAid failed: aid=${aid} err=${err instanceof Error ? err.message : String(err)}`, err instanceof Error ? err : undefined);
+      this._log.debug(`registerAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
+  }
+
+
+  /** 加载本地已注册身份。本地无完整身份 → 抛 StateError。 */
+  loadIdentity(params?: RpcParams): IdentityRecord {
+    const aid = String((params ?? {})?.aid ?? '').trim() || undefined;
+    return this._internal._auth.loadIdentity(aid);
+  }
+
+  /**
+   * 获取对端 AID 的证书 PEM（不要求本机有任何身份）。
+   * - 优先走本地 public/certs/ 缓存（不碰 private/）
+   * - 缓存未命中 → PKI HTTP 端点 + 链验证 + 落本地缓存
+   */
+  async fetchPeerCert(params: RpcParams): Promise<string> {
+    const aid = String(params?.aid ?? '').trim();
+    if (!aid) throw new Error("auth.fetchPeerCert requires 'aid'");
+    const fp = String((params as { cert_fingerprint?: unknown })?.cert_fingerprint ?? '').trim() || undefined;
+    if (typeof this._internal._fetchPeerCert !== 'function') {
+      throw new Error('client does not support _fetchPeerCert');
+    }
+    return String(await this._internal._fetchPeerCert(aid, fp)).trim();
   }
 
   /** 认证（登录） */
@@ -389,7 +473,7 @@ export class AuthNamespace {
     const identity = client._auth.loadIdentityOrNone(targetAid || undefined);
     if (!identity) {
       this._log.error(`signAgentMd failed: no local identity for aid=${targetAid || '-'}`);
-      throw new StateError('no local identity found, call auth.createAid() first');
+      throw new StateError('no local identity found, call auth.registerAid() first');
     }
 
     const privateKeyPem = String(identity.private_key_pem ?? '').trim();
@@ -551,7 +635,7 @@ export class AuthNamespace {
 
     let identity = auth.loadIdentityOrNone(aid);
     if (!identity) {
-      throw new StateError('no local identity found, call auth.createAid() first');
+      throw new StateError('no local identity found, call auth.registerAid() first');
     }
 
     const cachedToken = String(identity.access_token ?? '');
@@ -589,11 +673,11 @@ export class AuthNamespace {
     const auth = client._auth;
     const identity = auth.loadIdentityOrNone(client._aid ?? undefined);
     if (!identity) {
-      throw new StateError('no local identity found, call auth.createAid() first');
+      throw new StateError('no local identity found, call auth.registerAid() first');
     }
     const aid = String(identity.aid ?? client._aid ?? '').trim();
     if (!aid) {
-      throw new StateError('no local identity found, call auth.createAid() first');
+      throw new StateError('no local identity found, call auth.registerAid() first');
     }
 
     const gatewayUrl = await this._resolveGateway(aid);
@@ -641,27 +725,30 @@ export class AuthNamespace {
       const response = await fetchWithTimeout(await this._resolveAgentMdUrl(targetAid), {
         method: 'HEAD',
         headers: { Accept: 'text/markdown' },
+        redirect: 'follow',
       }, 15_000);
       const respHeaders = response.headers;
       const etag = respHeaders ? String(respHeaders.get('ETag') ?? '').trim() : '';
       const lastModified = respHeaders ? String(respHeaders.get('Last-Modified') ?? '').trim() : '';
+      const cached = this._agentMdCache.get(targetAid);
       if (response.status === 404) {
         this._log.debug(`headAgentMd exit (not_found): elapsed=${Date.now() - tStart}ms aid=${targetAid}`);
         return { aid: targetAid, found: false, etag: '', last_modified: '', status: 404 };
       }
-      if (response.status < 200 || response.status >= 300) {
+      const resultEtag = response.status === 304 ? (etag || cached?.etag || '') : etag;
+      const resultLastModified = response.status === 304 ? (lastModified || cached?.lastModified || '') : lastModified;
+      if (response.status < 200 || (response.status >= 300 && response.status !== 304)) {
         throw new AUNError(`head agent.md failed: HTTP ${response.status}`);
       }
-      if (etag || lastModified) {
-        const cached = this._agentMdCache.get(targetAid) ?? { text: '', etag: '', lastModified: '' };
+      if (resultEtag || resultLastModified) {
         this._agentMdCache.set(targetAid, {
-          text: cached.text ?? '',
-          etag,
-          lastModified,
+          ...(typeof cached?.text === 'string' ? { text: cached.text } : {}),
+          etag: resultEtag,
+          lastModified: resultLastModified,
         });
       }
-      this._log.debug(`headAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} status=${response.status} etag=${etag || '-'}`);
-      return { aid: targetAid, found: true, etag, last_modified: lastModified, status: response.status };
+      this._log.debug(`headAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} status=${response.status} etag=${resultEtag || '-'}`);
+      return { aid: targetAid, found: true, etag: resultEtag, last_modified: resultLastModified, status: response.status };
     } catch (err) {
       this._log.debug(`headAgentMd exit (error): elapsed=${Date.now() - tStart}ms aid=${targetAid} err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
@@ -669,26 +756,63 @@ export class AuthNamespace {
   }
 
   async downloadAgentMd(aid: string): Promise<string> {
-    const tStart = Date.now();
-    this._log.debug(`downloadAgentMd enter: aid=${aid}`);
-    try {
     const targetAid = String(aid ?? '').trim();
     if (!targetAid) {
       throw new ValidationError('downloadAgentMd requires non-empty aid');
     }
-    const cached = this._agentMdCache.get(targetAid);
-    const requestHeaders: Record<string, string> = { Accept: 'text/markdown' };
-    if (cached?.etag) requestHeaders['If-None-Match'] = cached.etag;
-    if (cached?.lastModified) requestHeaders['If-Modified-Since'] = cached.lastModified;
+    const existing = this._agentMdDownloadInflight.get(targetAid);
+    if (existing) {
+      return await existing;
+    }
 
-    const response = await fetchWithTimeout(await this._resolveAgentMdUrl(targetAid), {
+    const task = (async () => {
+      const tStart = Date.now();
+      this._log.debug(`downloadAgentMd enter: aid=${targetAid}`);
+      const release = await this._acquireAgentMdDownloadSlot();
+      try {
+        const text = await this._downloadAgentMdOnce(targetAid, tStart);
+        this._log.debug(`downloadAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} bytes=${text.length}`);
+        return text;
+      } catch (err) {
+        this._log.debug(`downloadAgentMd exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+        throw err;
+      } finally {
+        release();
+      }
+    })();
+    this._agentMdDownloadInflight.set(targetAid, task);
+    task.finally(() => {
+      if (this._agentMdDownloadInflight.get(targetAid) === task) {
+        this._agentMdDownloadInflight.delete(targetAid);
+      }
+    }).catch(() => undefined);
+    return await task;
+  }
+
+  private async _downloadAgentMdOnce(targetAid: string, tStart: number): Promise<string> {
+    const cached = this._agentMdCache.get(targetAid);
+    const hasCachedText = typeof cached?.text === 'string';
+    const requestHeaders: Record<string, string> = { Accept: 'text/markdown' };
+
+    const agentMdUrl = await this._resolveAgentMdUrl(targetAid);
+    let response = await fetchWithTimeout(agentMdUrl, {
       method: 'GET',
       headers: requestHeaders,
+      redirect: 'follow',
     });
 
-    if (response.status === 304 && cached) {
+    if (response.status === 304 && hasCachedText) {
       this._log.debug(`downloadAgentMd exit (not_modified): elapsed=${Date.now() - tStart}ms aid=${targetAid}`);
-      return cached.text;
+      return cached.text as string;
+    }
+    if (response.status === 304) {
+      this._log.debug(`downloadAgentMd retry unconditional GET after 304 without cached body: aid=${targetAid}`);
+      response = await fetchWithTimeout(agentMdUrl, {
+        method: 'GET',
+        headers: { Accept: 'text/markdown' },
+        cache: 'reload',
+        redirect: 'follow',
+      });
     }
     if (response.status === 404) {
       throw new NotFoundError(`agent.md not found for aid: ${targetAid}`);
@@ -700,19 +824,13 @@ export class AuthNamespace {
       );
     }
     const text = await response.text();
-    // headers 在某些 fake response（测试 mock）下可能缺失，做一次容错处理。
     const respHeaders = response.headers;
     const etag = respHeaders ? String(respHeaders.get('ETag') ?? '').trim() : '';
     const lastModified = respHeaders ? String(respHeaders.get('Last-Modified') ?? '').trim() : '';
     if (etag || lastModified) {
       this._agentMdCache.set(targetAid, { text, etag, lastModified });
     }
-    this._log.debug(`downloadAgentMd exit: elapsed=${Date.now() - tStart}ms aid=${targetAid} bytes=${text.length}`);
     return text;
-    } catch (err) {
-      this._log.debug(`downloadAgentMd exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
   }
 
   /** 下载证书 */

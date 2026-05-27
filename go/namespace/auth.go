@@ -32,7 +32,7 @@ type ClientInterface interface {
 	Call(ctx context.Context, method string, params map[string]any) (any, error)
 
 	// 认证流程所需方法
-	AuthCreateAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error)
+	AuthRegisterAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error)
 	AuthAuthenticate(ctx context.Context, gatewayURL, aid string) (map[string]any, error)
 	AuthLoadIdentityOrNil(aid string) map[string]any
 	AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error)
@@ -101,6 +101,16 @@ func NewAuthNamespace(client ClientInterface) *AuthNamespace {
 	return &AuthNamespace{client: client}
 }
 
+// CreateAIDWithName 是 RegisterAIDWithName 的兼容别名。
+func (a *AuthNamespace) CreateAIDWithName(ctx context.Context, aid string) (map[string]any, error) {
+	return a.RegisterAIDWithName(ctx, aid)
+}
+
+// CreateAID 是 RegisterAID 的兼容别名。
+func (a *AuthNamespace) CreateAID(ctx context.Context, params map[string]any) (map[string]any, error) {
+	return a.RegisterAID(ctx, params)
+}
+
 // resolveGateway 解析 gateway URL。优先使用已预置的 gatewayURL，否则基于 AID 自动发现。
 //
 // 发现流程：
@@ -165,45 +175,45 @@ func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string,
 	return gwURL, err
 }
 
-// CreateAIDWithName 类型安全的便捷方法，通过 AID 名称创建身份。
-// 内部构造 map 并调用 CreateAID。
-func (a *AuthNamespace) CreateAIDWithName(ctx context.Context, aid string) (out map[string]any, err error) {
+// RegisterAIDWithName 类型安全的便捷方法，通过 AID 名称注册身份。
+// 内部构造 map 并调用 RegisterAID。
+func (a *AuthNamespace) RegisterAIDWithName(ctx context.Context, aid string) (out map[string]any, err error) {
 	tStart := time.Now()
-	pkgLogAuth().Debug("CreateAIDWithName enter: aid=%s", aid)
+	pkgLogAuth().Debug("RegisterAIDWithName enter: aid=%s", aid)
 	defer func() {
 		if err != nil {
-			pkgLogAuth().Debug("CreateAIDWithName exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+			pkgLogAuth().Debug("RegisterAIDWithName exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
 		} else {
-			pkgLogAuth().Debug("CreateAIDWithName exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+			pkgLogAuth().Debug("RegisterAIDWithName exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
 		}
 	}()
-	return a.CreateAID(ctx, map[string]any{"aid": aid})
+	return a.RegisterAID(ctx, map[string]any{"aid": aid})
 }
 
-// CreateAID 创建新的 AID 身份
-func (a *AuthNamespace) CreateAID(ctx context.Context, params map[string]any) (out map[string]any, err error) {
+// RegisterAID 注册新的 AID 身份
+func (a *AuthNamespace) RegisterAID(ctx context.Context, params map[string]any) (out map[string]any, err error) {
 	tStart := time.Now()
 	aid, _ := params["aid"].(string)
-	pkgLogAuth().Debug("CreateAID enter: aid=%s", aid)
+	pkgLogAuth().Debug("RegisterAID enter: aid=%s", aid)
 	defer func() {
 		if err != nil {
-			pkgLogAuth().Debug("CreateAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+			pkgLogAuth().Debug("RegisterAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
 		} else {
-			pkgLogAuth().Debug("CreateAID exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+			pkgLogAuth().Debug("RegisterAID exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
 		}
 	}()
 	if aid == "" {
-		err = fmt.Errorf("auth.create_aid 需要 'aid' 参数")
+		err = fmt.Errorf("auth.register_aid 需要 'aid' 参数")
 		return nil, err
 	}
 
 	gatewayURL, err := a.resolveGateway(ctx, aid)
 	if err != nil {
-		return nil, fmt.Errorf("auth.create_aid gateway 发现失败: %w", err)
+		return nil, fmt.Errorf("auth.register_aid gateway 发现失败: %w", err)
 	}
 	a.client.SetGatewayURL(gatewayURL)
 
-	result, err := a.client.AuthCreateAID(ctx, gatewayURL, aid)
+	result, err := a.client.AuthRegisterAID(ctx, gatewayURL, aid)
 	if err != nil {
 		return nil, err
 	}
@@ -764,23 +774,17 @@ func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (conten
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.resolveAgentMDURL(ctx, targetAID), nil)
+	reqURL := a.resolveAgentMDURL(ctx, targetAID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Accept", "text/markdown")
+	// 不发送条件请求头，始终做无条件 GET（302 由 http.Client 自动跟随）
 
 	a.agentMDCacheMu.Lock()
 	cached := a.agentMDCache[targetAID]
 	a.agentMDCacheMu.Unlock()
-	if cached != nil {
-		if cached.etag != "" {
-			req.Header.Set("If-None-Match", cached.etag)
-		}
-		if cached.lastModified != "" {
-			req.Header.Set("If-Modified-Since", cached.lastModified)
-		}
-	}
 
 	resp, err := a.agentMDHTTPClient().Do(req)
 	if err != nil {
@@ -788,9 +792,39 @@ func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (conten
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotModified && cached != nil {
-		pkgLogAuth().Debug("DownloadAgentMD not_modified: aid=%s", targetAID)
-		return cached.text, nil
+	if resp.StatusCode == http.StatusNotModified {
+		// 304 不应出现（我们不发条件头），但防御性处理
+		if cached != nil && cached.text != "" {
+			pkgLogAuth().Debug("DownloadAgentMD not_modified: aid=%s", targetAID)
+			return cached.text, nil
+		}
+		// 本地缓存为空却收到 304，警告并重试无条件 GET
+		pkgLogAuth().Warn("DownloadAgentMD got 304 but no local cache, retrying unconditional GET: aid=%s", targetAID)
+		retryReq, retryErr := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if retryErr != nil {
+			return "", retryErr
+		}
+		retryReq.Header.Set("Accept", "text/markdown")
+		retryResp, retryErr := a.agentMDHTTPClient().Do(retryReq)
+		if retryErr != nil {
+			return "", retryErr
+		}
+		defer retryResp.Body.Close()
+		retryBody, retryErr := io.ReadAll(retryResp.Body)
+		if retryErr != nil {
+			return "", retryErr
+		}
+		if retryResp.StatusCode == http.StatusNotFound {
+			return "", fmt.Errorf("agent.md not found for aid: %s", targetAID)
+		}
+		if retryResp.StatusCode < 200 || retryResp.StatusCode >= 300 {
+			message := strings.TrimSpace(string(retryBody))
+			if message != "" {
+				return "", fmt.Errorf("download agent.md failed (retry): HTTP %d - %s", retryResp.StatusCode, message)
+			}
+			return "", fmt.Errorf("download agent.md failed (retry): HTTP %d", retryResp.StatusCode)
+		}
+		return string(retryBody), nil
 	}
 
 	body, err := io.ReadAll(resp.Body)

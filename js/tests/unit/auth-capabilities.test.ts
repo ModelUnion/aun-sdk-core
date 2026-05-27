@@ -6,6 +6,7 @@
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi } from 'vitest';
 import { AUNClient } from '../../src/client.js';
+import { __version__ } from '../../src/index.js';
 
 describe('auth.connect 能力声明 + extra_info', () => {
   it('默认 capabilities 含 supported_p2p_e2ee 与 supported_group_e2ee', async () => {
@@ -21,6 +22,10 @@ describe('auth.connect 能力声明 + extra_info', () => {
     });
     const args = mockTransport.call.mock.calls[0][1] as Record<string, any>;
     expect(args.capabilities).toBeDefined();
+    expect(args.client).toMatchObject({
+      sdk_lang: 'javascript',
+      sdk_version: __version__,
+    });
     expect(args.capabilities.e2ee).toBe(true);
     expect(args.capabilities.group_e2ee).toBe(true);
     expect(args.capabilities.supported_p2p_e2ee).toEqual(['e2ee_v2']);

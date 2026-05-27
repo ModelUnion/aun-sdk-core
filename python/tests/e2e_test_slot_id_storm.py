@@ -144,7 +144,7 @@ def _payload_text(message: dict) -> str:
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     connect_params = dict(auth)
     slot_id = str(getattr(client, "_test_slot_id", "") or "")

@@ -403,6 +403,63 @@ interface V2BootstrapEntry {
   cachedAt: number;
   epoch?: number;
   stateCommitment?: { state_version: number; state_hash: string; state_chain: string };
+  wrapPolicy?: V2WrapPolicy;
+}
+
+interface V2WrapPolicy {
+  protocol?: '1DH' | '3DH';
+  scope?: 'aid' | 'device';
+}
+
+function normalizeV2WrapPolicy(raw: unknown): V2WrapPolicy | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  let protocol = String(obj.protocol ?? '').trim().toUpperCase();
+  let scope = String(obj.scope ?? '').trim().toLowerCase();
+  if (scope !== 'aid' && scope !== 'device') {
+    if (obj.per_aid_wrap === true) scope = 'aid';
+    else if (obj.per_device_wrap === true) scope = 'device';
+    else scope = '';
+  }
+  if (protocol !== '1DH' && protocol !== '3DH') protocol = '';
+  if (scope === 'aid') protocol = '1DH';
+  if (!protocol && !scope) return undefined;
+  return {
+    protocol: protocol ? protocol as '1DH' | '3DH' : undefined,
+    scope: scope ? scope as 'aid' | 'device' : undefined,
+  };
+}
+
+function v2WrapCapabilities(): JsonObject {
+  return {
+    version: 'v2.1',
+    protocols: ['1DH', '3DH'],
+    scopes: ['aid', 'device'],
+    per_aid_wrap: true,
+    per_device_wrap: true,
+  };
+}
+
+function applyV2WrapPolicyToTargets(targets: Target[], policy?: V2WrapPolicy): Target[] {
+  if (!policy) return targets;
+  const normalized = targets.map((target) => {
+    const row: Target = { ...target };
+    if (policy.protocol === '1DH') {
+      row.keySource = 'aid_master';
+      row.spkPkDer = undefined;
+      row.spkId = '';
+    }
+    return row;
+  });
+  if (policy.scope !== 'aid') return normalized;
+  const collapsed = new Map<string, Target>();
+  for (const target of normalized) {
+    const key = `${target.aid}\u0000${target.role}`;
+    if (!collapsed.has(key)) {
+      collapsed.set(key, { ...target, deviceId: '' });
+    }
+  }
+  return Array.from(collapsed.values());
 }
 
 interface V2SenderIKPendingEntry {
@@ -681,7 +738,7 @@ export class AUNClient {
   private _agentMdPath: string = '';
   private _agentMdCache: Map<string, Record<string, unknown>> = new Map();
   private _agentMdFetchInflight: Set<string> = new Set();
-  private _agentMdListLock: Promise<unknown> = Promise.resolve();
+  private _agentMdLock: Promise<unknown> = Promise.resolve();
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
   private _seqTrackerContext: string | null = null;
@@ -695,6 +752,9 @@ export class AUNClient {
   private _groupSynced: Set<string> = new Set();
   /** gap fill 来源标记：true 表示当前正在补洞（pull 触发），false 表示非补洞 */
   private _gapFillActive = false;
+  // Pull Gate：序列化同一 key 的并发 pull 操作，防止重复拉取
+  private _pullGates: Map<string, { inflight: boolean; startedAt: number; token: number }> = new Map();
+  private static readonly _PULL_GATE_STALE_MS = 30000;
   // 重连相关
   private _reconnectActive = false;
   private _reconnectAbort: AbortController | null = null;
@@ -738,7 +798,7 @@ export class AUNClient {
 
     this._dispatcher = new EventDispatcher();
     this._discovery = new GatewayDiscovery();
-    this._keystore = new IndexedDBKeyStore();
+    this._keystore = new IndexedDBKeyStore({ encryptionSeed: this.configModel.seedPassword ?? undefined });
     this._slotId = '';
     this._connectDeliveryMode = normalizeDeliveryModeConfig({ mode: 'fanout' });
     this._defaultConnectDeliveryMode = { ...this._connectDeliveryMode };
@@ -857,7 +917,7 @@ export class AUNClient {
 
   /**
    * 浏览器版本 publishAgentMd。默认从 {agentMdPath}/{self_aid}/agent.md 的等价 IndexedDB 正文读取，
-   * 然后签名、上传，并刷新 list.json 元数据。
+   * 然后签名、上传，并刷新 agentmd.json 元数据。
    *
    * 兼容旧浏览器调用：传入 content 时会先写入等价正文，再从该正文发布。
    */
@@ -900,7 +960,7 @@ export class AUNClient {
 
   /**
    * 浏览器版本 fetchAgentMd。aid 缺省时取自身；下载后的正文固定写入
-   * {agentMdPath}/{aid}/agent.md 的等价 IndexedDB 正文，list.json 只保存元数据。
+   * {agentMdPath}/{aid}/agent.md 的等价 IndexedDB 正文，agentmd.json 只保存元数据。
    */
   async fetchAgentMd(aid?: string | null): Promise<{
     aid: string;
@@ -987,8 +1047,8 @@ export class AUNClient {
     return target;
   }
 
-  private _agentMdListKey(): string {
-    return 'list.json';
+  private _agentMdMetaKey(aid: string): string {
+    return `${this._agentMdSafeAid(aid)}/agentmd.json`;
   }
 
   private _agentMdContentKey(aid: string): string {
@@ -1024,19 +1084,11 @@ export class AUNClient {
     });
   }
 
-  private async _listAgentMdContentAids(): Promise<string[]> {
-    const list = this._keystore.listAgentMdContentAids;
-    if (typeof list !== 'function') {
-      throw new Error('IndexedDB agent.md storage unavailable');
-    }
-    return await list.call(this._keystore, this._agentMdRoot());
-  }
-
-  private async _withAgentMdListLock<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = this._agentMdListLock.catch(() => undefined);
+  private async _withAgentMdLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this._agentMdLock.catch(() => undefined);
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
-    this._agentMdListLock = previous.then(() => current);
+    this._agentMdLock = previous.then(() => current);
     await previous;
     try {
       return await fn();
@@ -1045,72 +1097,36 @@ export class AUNClient {
     }
   }
 
-  private _normalizeAgentMdList(data: unknown): Record<string, Record<string, unknown>> {
-    const records: Record<string, Record<string, unknown>> = {};
-    let iterable: unknown[] = [];
-    if (isJsonObject(data as JsonValue | object | null | undefined)) {
-      const payload = data as JsonObject;
-      if (Array.isArray(payload.records)) iterable = payload.records;
-      else if (isJsonObject(payload.records as JsonValue | object | null | undefined)) iterable = Object.values(payload.records as Record<string, unknown>);
-    } else if (Array.isArray(data)) {
-      iterable = data;
+  private _normalizeAgentMdRecord(aid: string, data: unknown): Record<string, unknown> {
+    if (!isJsonObject(data as JsonValue | object | null | undefined)) return {};
+    const record: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+      if (key !== 'content') record[key] = value;
     }
-    for (const item of iterable) {
-      if (!isJsonObject(item as JsonValue | object | null | undefined)) continue;
-      const raw = item as Record<string, unknown>;
-      const aid = String(raw.aid ?? '').trim();
-      if (!aid) continue;
-      const record: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(raw)) {
-        if (key !== 'content') record[key] = value;
-      }
-      record.aid = aid;
-      for (const key of ['fetched_at', 'observed_at', 'checked_at', 'updated_at']) {
-        record[key] = Number(record[key] ?? 0) || 0;
-      }
-      records[aid] = record;
+    record.aid = this._agentMdSafeAid(String(record.aid ?? aid));
+    for (const key of ['fetched_at', 'observed_at', 'checked_at', 'updated_at']) {
+      record[key] = Number(record[key] ?? 0) || 0;
     }
-    return records;
+    return record;
   }
 
-  private async _writeAgentMdListUnlocked(records: Record<string, Record<string, unknown>>): Promise<void> {
-    const sorted: Record<string, Record<string, unknown>> = {};
-    for (const aid of Object.keys(records).sort()) sorted[aid] = records[aid];
-    await this._writeAgentMdStorage(this._agentMdListKey(), `${JSON.stringify({ version: 1, updated_at: Date.now(), records: sorted }, null, 2)}\n`);
+  private async _writeAgentMdRecordUnlocked(aid: string, record: Record<string, unknown>): Promise<void> {
+    const payload: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(record)) {
+      if (key !== 'content' && value !== undefined && value !== null) payload[key] = value;
+    }
+    payload.aid = this._agentMdSafeAid(aid);
+    await this._writeAgentMdStorage(this._agentMdMetaKey(aid), `${JSON.stringify(payload, null, 2)}\n`);
   }
 
-  private async _rebuildAgentMdListUnlocked(): Promise<Record<string, Record<string, unknown>>> {
-    const records: Record<string, Record<string, unknown>> = {};
-    const now = Date.now();
-    for (const aid of await this._listAgentMdContentAids()) {
-      try {
-        const content = await this._readAgentMdStorage(this._agentMdContentKey(aid));
-        if (content === null) continue;
-        records[aid] = {
-          aid,
-          local_etag: await this._agentMdContentEtag(content),
-          fetched_at: now,
-          updated_at: now,
-        };
-      } catch (err) {
-        this._clientLog.warn(`agent.md rebuild skipped unreadable file aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    await this._writeAgentMdListUnlocked(records);
-    this._agentMdCache.clear();
-    return records;
-  }
-
-  private async _readAgentMdListUnlocked(): Promise<Record<string, Record<string, unknown>>> {
-    const raw = await this._readAgentMdStorage(this._agentMdListKey());
-    if (raw === null) {
-      return await this._rebuildAgentMdListUnlocked();
-    }
+  private async _readAgentMdRecordUnlocked(aid: string): Promise<Record<string, unknown>> {
+    const raw = await this._readAgentMdStorage(this._agentMdMetaKey(aid));
+    if (raw === null) return {};
     try {
-      return this._normalizeAgentMdList(JSON.parse(raw));
+      return this._normalizeAgentMdRecord(aid, JSON.parse(raw));
     } catch (err) {
-      this._clientLog.warn(`agent.md list.json damaged, rebuilding: ${err instanceof Error ? err.message : String(err)}`);
-      return await this._rebuildAgentMdListUnlocked();
+      this._clientLog.warn(`agent.md metadata damaged, ignoring: aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      return {};
     }
   }
 
@@ -1136,20 +1152,29 @@ export class AUNClient {
     const target = String(aid ?? '').trim();
     if (!target) return null;
     try {
-      const records = await this._withAgentMdListLock(async () => await this._readAgentMdListUnlocked());
-      const record = records[target];
-      if (record && typeof record === 'object') {
-        const loaded: Record<string, unknown> = { ...record, aid: target };
-        const content = await this._readAgentMdContent(target);
-        if (content !== null) {
-          loaded.content = content;
-          loaded.local_etag = await this._agentMdContentEtag(content);
-        } else {
-          this._clientLog.warn(`agent.md content read failed: aid=${target}`);
+      const loaded = await this._withAgentMdLock(async () => {
+        const record = await this._readAgentMdRecordUnlocked(target);
+        const next: Record<string, unknown> = Object.keys(record).length > 0 ? { ...record, aid: target } : { aid: target };
+        try {
+          const content = await this._readAgentMdContent(target);
+          if (content !== null) {
+            next.content = content;
+            next.local_etag = await this._agentMdContentEtag(content);
+          } else {
+            // 元数据存在但正文缺失
+            const metaRaw = await this._readAgentMdStorage(this._agentMdMetaKey(target));
+            if (metaRaw !== null) {
+              this._clientLog.warn(`agent.md content read failed: aid=${target}`);
+            }
+          }
+        } catch (err) {
+          this._clientLog.warn(`agent.md content read failed: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
         }
-        this._agentMdCache.set(target, { ...loaded });
-        return { ...loaded };
-      }
+        return next;
+      });
+      if (Object.keys(loaded).length <= 1) return null;
+      this._agentMdCache.set(target, { ...loaded });
+      return { ...loaded };
     } catch (err) {
       this._clientLog.debug(`agent.md cache load skipped: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1169,15 +1194,13 @@ export class AUNClient {
         if (!inputFields.fetched_at) inputFields.fetched_at = Date.now();
       }
       delete inputFields.content;
-      const record = await this._withAgentMdListLock(async () => {
-        const records = await this._readAgentMdListUnlocked();
-        const next: Record<string, unknown> = { ...(records[target] ?? {}), aid: target };
+      const record = await this._withAgentMdLock(async () => {
+        const next: Record<string, unknown> = { ...(await this._readAgentMdRecordUnlocked(target)), aid: target };
         for (const [key, value] of Object.entries(inputFields)) {
           if (value !== undefined && value !== null) next[key] = value;
         }
         next.updated_at = Date.now();
-        records[target] = { ...next };
-        await this._writeAgentMdListUnlocked(records);
+        await this._writeAgentMdRecordUnlocked(target, next);
         return next;
       });
       const loaded: Record<string, unknown> = { ...record };
@@ -1686,6 +1709,25 @@ export class AUNClient {
       }
     }
 
+    // Pull Gate：序列化同一 key 的 pull 操作，防止并发重复拉取
+    const pullGateKey = this._pullGateKeyForCall(method, p);
+    if (pullGateKey) {
+      return await this._runPullSerialized(pullGateKey, async () => {
+        return await this._callImplInner(method, p);
+      });
+    }
+
+    return await this._callImplInner(method, p);
+  }
+
+  /**
+   * _callImpl 的内层：pull gate 之后的实际 RPC 分发逻辑。
+   * 拆分出来以便 pull gate 包裹整个操作。
+   */
+  private async _callImplInner(
+    method: string,
+    p: RpcParams,
+  ): Promise<RpcResult> {
     // message.pull：V2 就绪时走 V2 pull
     if (method === 'message.pull' && this._v2Session) {
       this._clientLog.debug('call route: message.pull → V2 pull');
@@ -4560,7 +4602,10 @@ export class AUNClient {
       const session = this._v2Session;
       if (session && fromAid) {
         try {
-          const bs = await this.call('message.v2.bootstrap', { peer_aid: fromAid }) as Record<string, unknown>;
+          const bs = await this.call('message.v2.bootstrap', {
+            peer_aid: fromAid,
+            e2ee_wrap_capabilities: v2WrapCapabilities(),
+          }) as Record<string, unknown>;
           const peers = (Array.isArray(bs?.peer_devices) ? bs.peer_devices : []) as Array<Record<string, unknown>>;
           for (const dev of peers) this._cacheV2PeerIKFromDevice(dev, fromAid);
         } catch (exc) {
@@ -4568,7 +4613,10 @@ export class AUNClient {
         }
         if (groupId) {
           try {
-            const gbs = await this.call('group.v2.bootstrap', { group_id: groupId }) as Record<string, unknown>;
+            const gbs = await this.call('group.v2.bootstrap', {
+              group_id: groupId,
+              e2ee_wrap_capabilities: v2WrapCapabilities(),
+            }) as Record<string, unknown>;
             const devices = (Array.isArray(gbs?.devices) ? gbs.devices : []) as Array<Record<string, unknown>>;
             const audit = (Array.isArray(gbs?.audit_recipients) ? gbs.audit_recipients : []) as Array<Record<string, unknown>>;
             for (const dev of devices) this._cacheV2PeerIKFromDevice(dev);
@@ -4848,7 +4896,7 @@ export class AUNClient {
       // 从 recipients 数组中查找本设备的 row 以获取 key_source
       if (!spkId) {
         for (const row of envelope.recipients) {
-          if (Array.isArray(row) && row.length >= 6 && row[0] === this._aid && row[1] === this._deviceId) {
+          if (Array.isArray(row) && row.length >= 6 && row[0] === this._aid && (row[1] === this._deviceId || row[1] === '')) {
             spkId = String(row[5] ?? '');
             recipientKeySource = row.length > 3 ? String(row[3] ?? '') : '';
             break;
@@ -4856,7 +4904,7 @@ export class AUNClient {
         }
       } else {
         for (const row of envelope.recipients) {
-          if (Array.isArray(row) && row.length >= 6 && row[0] === this._aid && row[1] === this._deviceId) {
+          if (Array.isArray(row) && row.length >= 6 && row[0] === this._aid && (row[1] === this._deviceId || row[1] === '')) {
             recipientKeySource = row.length > 3 ? String(row[3] ?? '') : '';
             break;
           }
@@ -5244,19 +5292,26 @@ export class AUNClient {
 
     let peerDevices: Array<Record<string, unknown>> = [];
     let auditRaw: Array<Record<string, unknown>> = [];
+    let wrapPolicy: V2WrapPolicy | undefined;
     const cached = useCache ? this._v2BootstrapCache.get(to) : undefined;
     if (cached && (Date.now() - cached.cachedAt) < AUNClient.V2_BOOTSTRAP_TTL_MS) {
       peerDevices = cached.devices;
       auditRaw = cached.auditRecipients;
+      wrapPolicy = cached.wrapPolicy;
     } else {
-      const bs = await this.call('message.v2.bootstrap', { peer_aid: to }) as Record<string, unknown>;
+      const bs = await this.call('message.v2.bootstrap', {
+        peer_aid: to,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      }) as Record<string, unknown>;
       peerDevices = (Array.isArray(bs?.peer_devices) ? bs.peer_devices : []) as Array<Record<string, unknown>>;
       auditRaw = (Array.isArray(bs?.audit_recipients) ? bs.audit_recipients : []) as Array<Record<string, unknown>>;
+      wrapPolicy = normalizeV2WrapPolicy(bs?.e2ee_wrap_policy);
       if (peerDevices.length > 0) {
         this._v2BootstrapCache.set(to, {
           devices: peerDevices,
           auditRecipients: auditRaw,
           cachedAt: Date.now(),
+          wrapPolicy,
         });
       }
     }
@@ -5296,7 +5351,10 @@ export class AUNClient {
         if (selfCached && (Date.now() - selfCached.cachedAt) < AUNClient.V2_BOOTSTRAP_TTL_MS) {
           selfDevices = selfCached.devices;
         } else {
-          const selfBs = await this.call('message.v2.bootstrap', { peer_aid: this._aid }) as Record<string, unknown>;
+          const selfBs = await this.call('message.v2.bootstrap', {
+            peer_aid: this._aid,
+            e2ee_wrap_capabilities: v2WrapCapabilities(),
+          }) as Record<string, unknown>;
           selfDevices = (Array.isArray(selfBs?.peer_devices) ? selfBs.peer_devices : []) as Array<Record<string, unknown>>;
           if (selfDevices.length > 0) {
             this._v2BootstrapCache.set(this._aid, {
@@ -5324,9 +5382,10 @@ export class AUNClient {
     }
 
     const sender = await session.getSenderIdentity();
+    const sendTargets = applyV2WrapPolicyToTargets(targets, wrapPolicy);
     const envelope = await encryptP2PMessage(
       sender,
-      { targets, auditRecipients: [] },
+      { targets: sendTargets, auditRecipients: [] },
       opts.payload,
       { messageId: opts.messageId, timestamp: opts.timestamp, protectedHeaders: opts.protectedHeaders, context: opts.context },
     );
@@ -5413,6 +5472,7 @@ export class AUNClient {
     let epoch = 0;
     let stateCommitment: Partial<StateCommitmentAAD> = { state_version: 0, state_hash: '', state_chain: '' };
     let auditRecipientsRaw: Array<Record<string, unknown>> = [];
+    let wrapPolicy: V2WrapPolicy | undefined;
 
     const cached = useCache ? this._v2BootstrapCache.get(cacheKey) : undefined;
     if (cached && (Date.now() - cached.cachedAt) < AUNClient.V2_BOOTSTRAP_TTL_MS) {
@@ -5420,11 +5480,16 @@ export class AUNClient {
       epoch = cached.epoch ?? 0;
       stateCommitment = cached.stateCommitment ?? { state_version: 0, state_hash: '', state_chain: '' };
       auditRecipientsRaw = cached.auditRecipients;
+      wrapPolicy = cached.wrapPolicy;
     } else {
-      const bs = await this.call('group.v2.bootstrap', { group_id: groupId }) as Record<string, unknown>;
+      const bs = await this.call('group.v2.bootstrap', {
+        group_id: groupId,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      }) as Record<string, unknown>;
       allDevices = (Array.isArray(bs?.devices) ? bs.devices : []) as Array<Record<string, unknown>>;
       epoch = Number(bs?.epoch ?? 0);
       auditRecipientsRaw = (Array.isArray(bs?.audit_recipients) ? bs.audit_recipients : []) as Array<Record<string, unknown>>;
+      wrapPolicy = normalizeV2WrapPolicy(bs?.e2ee_wrap_policy);
       await this._v2CheckFork(groupId, String(bs?.state_chain ?? ''));
       await this._v2VerifyStateSignature(groupId, bs);
       await this._publishV2GroupSecurityLevel(groupId, bs);
@@ -5440,6 +5505,7 @@ export class AUNClient {
           cachedAt: Date.now(),
           epoch,
           stateCommitment: stateCommitment as { state_version: number; state_hash: string; state_chain: string },
+          wrapPolicy,
         });
       }
       // lazy sync 触发：发现 pending members 时异步发起提案
@@ -5483,11 +5549,12 @@ export class AUNClient {
     }
 
     const sender = await session.getSenderIdentity();
+    const sendTargets = applyV2WrapPolicyToTargets(targets, wrapPolicy);
     const envelope = await encryptGroupMessage(
       sender,
       groupId,
       epoch,
-      targets,
+      sendTargets,
       opts.payload,
       { messageId: opts.messageId, timestamp: opts.timestamp, protectedHeaders: opts.protectedHeaders, context: opts.context },
       stateCommitment,
@@ -5579,7 +5646,7 @@ export class AUNClient {
     if (Array.isArray(recipients)) {
       for (const row of recipients) {
         if (Array.isArray(row) && row.length >= 6) {
-          if (row[0] === this._aid && row[1] === this._deviceId) {
+          if (row[0] === this._aid && (row[1] === this._deviceId || row[1] === '')) {
             spkId = String(row[5] ?? '');
             recipientKeySource = row.length > 3 ? String(row[3] ?? '') : '';
             break;
@@ -5896,7 +5963,10 @@ export class AUNClient {
       }
       if (myRole !== 'owner' && myRole !== 'admin') return false;
 
-      const bootstrapResp = await this.call('group.v2.bootstrap', { group_id: groupId }) as Record<string, unknown>;
+      const bootstrapResp = await this.call('group.v2.bootstrap', {
+        group_id: groupId,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      }) as Record<string, unknown>;
       const devices = (Array.isArray(bootstrapResp?.devices) ? bootstrapResp.devices : []) as Array<Record<string, unknown>>;
       const candidates: string[] = [];
       for (const dev of devices) {
@@ -5995,7 +6065,10 @@ export class AUNClient {
       }
 
       // 获取群所有成员的设备列表（V2 bootstrap）
-      const bootstrapResp = await this.call('group.v2.bootstrap', { group_id: groupId }) as Record<string, unknown>;
+      const bootstrapResp = await this.call('group.v2.bootstrap', {
+        group_id: groupId,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      }) as Record<string, unknown>;
       const allDevices = (Array.isArray(bootstrapResp?.devices) ? bootstrapResp.devices : []) as Array<Record<string, unknown>>;
       const auditRecipients = (Array.isArray(bootstrapResp?.audit_recipients) ? bootstrapResp.audit_recipients : []) as Array<Record<string, unknown>>;
       const auditAidsList = [...new Set(
@@ -6354,6 +6427,67 @@ export class AUNClient {
     promise.catch((exc) => {
       this._clientLog.warn(`background task exception:${String(exc)}`)
     });
+  }
+
+  // ── Pull Gate（序列化同一 key 的并发 pull）──────────────────
+
+  private _pullGateKeyForCall(method: string, params: RpcParams): string {
+    if (method === 'message.pull' || method === 'message.v2.pull') {
+      return this._aid ? `p2p:${this._aid}` : '';
+    }
+    if (method === 'group.pull' || method === 'group.v2.pull') {
+      const gid = String(params.group_id ?? '').trim();
+      return gid ? `group:${gid}` : '';
+    }
+    if (method === 'group.pull_events') {
+      const gid = String(params.group_id ?? '').trim();
+      return gid ? `group_event:${gid}` : '';
+    }
+    return '';
+  }
+
+  private _tryAcquirePullGate(key: string): number | null {
+    if (!key) return 0;
+    const now = Date.now();
+    const gate = this._pullGates.get(key) ?? { inflight: false, startedAt: 0, token: 0 };
+    if (gate.inflight && now - gate.startedAt <= AUNClient._PULL_GATE_STALE_MS) {
+      return null;
+    }
+    if (gate.inflight) {
+      this._clientLog.warn(`pull in-flight stale reset: key=${key} age=${now - gate.startedAt}ms`);
+    }
+    gate.token += 1;
+    gate.inflight = true;
+    gate.startedAt = now;
+    this._pullGates.set(key, gate);
+    return gate.token;
+  }
+
+  private _releasePullGate(key: string, token: number | null): void {
+    if (!key || token == null) return;
+    const gate = this._pullGates.get(key);
+    if (!gate || gate.token !== token) return;
+    gate.inflight = false;
+    gate.startedAt = 0;
+  }
+
+  private async _runPullSerialized<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    let token = this._tryAcquirePullGate(key);
+    if (token === null) {
+      const deadline = Date.now() + AUNClient._PULL_GATE_STALE_MS + 100;
+      while (token === null && Date.now() <= deadline) {
+        await this._sleep(25);
+        token = this._tryAcquirePullGate(key);
+      }
+      if (token === null) {
+        throw new StateError(`pull already in-flight for ${key}`);
+      }
+    }
+    try {
+      return await operation();
+    } finally {
+      this._releasePullGate(key, token);
+    }
   }
 
   /** 可取消的 sleep */

@@ -151,8 +151,11 @@ func TestNormalizeProtectedHeadersCanonicalParity(t *testing.T) {
 	if got["sdk_lang"] != e2eeSDKLang {
 		t.Fatalf("sdk_lang 自动注入失败: %#v", got)
 	}
-	if got["sdk_vesion"] != e2eeSDKVersion {
-		t.Fatalf("sdk_vesion 自动注入失败: %#v", got)
+	if got["sdk_version"] != e2eeSDKVersion {
+		t.Fatalf("sdk_version 自动注入失败: %#v", got)
+	}
+	if _, ok := got["sdk_vesion"]; ok {
+		t.Fatalf("不应再注入历史拼写 sdk_vesion: %#v", got)
 	}
 }
 
@@ -194,7 +197,7 @@ func TestEncryptP2PWithProtectedHeaders(t *testing.T) {
 			"payload_type": "text",
 			"priority":     "normal",
 			"sdk_lang":     "spoofed",
-			"sdk_vesion":   "0.0.0",
+			"sdk_version":  "0.0.0",
 		},
 		Context: map[string]any{
 			"thread_id": "t-123",
@@ -215,8 +218,11 @@ func TestEncryptP2PWithProtectedHeaders(t *testing.T) {
 	if ph["payload_type"] != "text" {
 		t.Fatalf("protected_headers.payload_type 错误: %v", ph["payload_type"])
 	}
-	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_vesion"] != e2eeSDKVersion {
+	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_version"] != e2eeSDKVersion {
 		t.Fatalf("protected_headers SDK 元信息错误: %v", ph)
+	}
+	if _, ok := ph["sdk_vesion"]; ok {
+		t.Fatalf("protected_headers 不应包含历史拼写 sdk_vesion: %v", ph)
 	}
 	phAuth, ok := ph["_auth"].(map[string]any)
 	if !ok {
@@ -258,8 +264,11 @@ func TestEncryptP2PWithoutProtectedHeaders(t *testing.T) {
 	if !ok {
 		t.Fatalf("不传 ProtectedHeaders 时 envelope 仍应含 SDK protected_headers: %#v", envelope["protected_headers"])
 	}
-	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_vesion"] != e2eeSDKVersion {
+	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_version"] != e2eeSDKVersion {
 		t.Fatalf("protected_headers SDK 元信息错误: %#v", ph)
+	}
+	if _, ok := ph["sdk_vesion"]; ok {
+		t.Fatalf("protected_headers 不应包含历史拼写 sdk_vesion: %#v", ph)
 	}
 	if _, ok := envelope["context"]; ok {
 		t.Fatalf("不传 Context 时 envelope 不应含 context 字段")
@@ -290,8 +299,11 @@ func TestEncryptGroupWithProtectedHeaders(t *testing.T) {
 	if ph["payload_type"] != "image" {
 		t.Fatalf("protected_headers.payload_type 错误: %v", ph["payload_type"])
 	}
-	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_vesion"] != e2eeSDKVersion {
+	if ph["sdk_lang"] != e2eeSDKLang || ph["sdk_version"] != e2eeSDKVersion {
 		t.Fatalf("protected_headers SDK 元信息错误: %v", ph)
+	}
+	if _, ok := ph["sdk_vesion"]; ok {
+		t.Fatalf("protected_headers 不应包含历史拼写 sdk_vesion: %v", ph)
 	}
 	phAuth, ok := ph["_auth"].(map[string]any)
 	if !ok {

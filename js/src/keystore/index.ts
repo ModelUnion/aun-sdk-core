@@ -40,6 +40,8 @@ export interface KeyStore {
   loadKeyPair(aid: string): Promise<KeyPairRecord | null>;
   /** 保存密钥对 */
   saveKeyPair(aid: string, keyPair: KeyPairRecord): Promise<void>;
+  /** 迁移 IndexedDB 中由 seed 加密的私钥 */
+  changeSeed?(oldSeed: string, newSeed: string): Promise<{ migrated: number; privateKeysMigrated: number }>;
   /** 加载证书 PEM */
   loadCert(aid: string, certFingerprint?: string): Promise<string | null>;
   /** 保存证书 PEM */

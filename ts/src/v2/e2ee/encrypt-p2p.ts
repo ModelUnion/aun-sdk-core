@@ -38,7 +38,7 @@ import { withMetadataAuth, PROTECTED_HEADERS_DOMAIN, PROTECTED_CONTEXT_DOMAIN } 
 
 const TEXT = new TextEncoder();
 const E2EE_SDK_LANG = 'typescript';
-const E2EE_SDK_VERSION = '0.3.2';
+const E2EE_SDK_VERSION = '0.3.4';
 
 /**
  * 构造完整的 V2 P2P 加密 envelope。
@@ -185,7 +185,8 @@ export function normalizeProtectedHeaders(
     normalized['payload_type'] = payloadType;
   }
   normalized.sdk_lang = E2EE_SDK_LANG;
-  normalized.sdk_vesion = E2EE_SDK_VERSION;
+  delete normalized.sdk_vesion;
+  normalized.sdk_version = E2EE_SDK_VERSION;
   return normalized;
 }
 

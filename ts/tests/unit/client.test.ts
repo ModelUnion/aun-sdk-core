@@ -151,6 +151,61 @@ describe('AUNClient.call 状态检查', () => {
     expect(sentParams).toHaveProperty('device_id', '');
     expect(sentParams).toHaveProperty('slot_id', 'slot-empty-device');
   });
+
+  it('后台 RPC 标记只传给 transport 调度器，不进入业务 params', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+
+    await client.call('meta.ping', { _rpc_background: true, probe: 'unit' } as any);
+
+    expect((client as any)._transport.call).toHaveBeenCalledWith(
+      'meta.ping',
+      { probe: 'unit' },
+      undefined,
+      undefined,
+      true,
+    );
+  });
+
+  it('后台 pull 上下文内的 RPC 应作为 background 进入 transport', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
+
+    const started = await (client as any)._tryRunBackgroundPull(
+      'unit-background',
+      () => client.call('meta.ping', { probe: 'context' }),
+      false,
+    );
+
+    expect(started).toBe(true);
+    expect((client as any)._transport.call).toHaveBeenCalledWith(
+      'meta.ping',
+      { probe: 'context' },
+      undefined,
+      undefined,
+      true,
+    );
+  });
+
+  it('后台标记经过 V2 兼容路由时仍应进入 transport 调度器', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._v2Session = { maybeDestroyOldSPKs: vi.fn().mockReturnValue([]) };
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ acked: 7 });
+
+    await client.call('message.v2.ack', { up_to_seq: 7, _rpc_background: true } as any);
+
+    expect((client as any)._transport.call).toHaveBeenCalledWith(
+      'message.v2.ack',
+      { up_to_seq: 7 },
+      undefined,
+      undefined,
+      true,
+    );
+  });
 });
 
 describe('AUNClient.close', () => {
@@ -1155,7 +1210,44 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }]]);
+    expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true]]);
+  });
+
+  it('_fillP2pGap 在 V2 路径应跳过 pull 内部 auto-ack，并在发布后只 ack 一次', async () => {
+    const client = makeV2Client();
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'message.v2.pull') {
+        return {
+          has_more: false,
+          messages: [1, 2, 3].map((seq) => ({
+            version: 'v1',
+            seq,
+            message_id: `gap-${seq}`,
+            from_aid: 'bob.aid.com',
+            t_server: seq,
+            legacy_v1: {
+              to: 'alice.aid.com',
+              payload: { type: 'text', text: `gap-${seq}` },
+            },
+          })),
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    await (client as any)._fillP2pGap();
+
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
+    const v2AckCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
+    const v1AckCalls = transportCall.mock.calls.filter(([method]) => method === 'message.ack');
+    // 第一次 pull 拿到 [1,2,3]，第二次 pull 因 contiguous 推进到 3 触发递归补洞确认 has_more=false
+    expect(pullCalls).toEqual([
+      ['message.v2.pull', { after_seq: 0, limit: 50 }, undefined, undefined, true],
+      ['message.v2.pull', { after_seq: 3, limit: 50 }, undefined, undefined, true],
+    ]);
+    expect(v2AckCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true]]);
+    expect(v1AckCalls).toEqual([]);
   });
 
   it('group.v2.pull 批量消息只 ack 一次最终 contiguous_seq', async () => {
@@ -1184,7 +1276,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
   });
 
   it('message.v2.pull 分页时应继续拉取并每页 ack 一次 contiguous_seq', async () => {
@@ -1219,12 +1311,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
-      ['message.v2.pull', { after_seq: 0, limit: 2 }],
-      ['message.v2.pull', { after_seq: 2, limit: 2 }],
+      ['message.v2.pull', { after_seq: 0, limit: 2 }, undefined, undefined, true],
+      ['message.v2.pull', { after_seq: 2, limit: 2 }, undefined, undefined, true],
     ]);
     expect(ackCalls).toEqual([
-      ['message.v2.ack', { up_to_seq: 2 }],
-      ['message.v2.ack', { up_to_seq: 3 }],
+      ['message.v2.ack', { up_to_seq: 2 }, undefined, undefined, true],
+      ['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true],
     ]);
   });
 
@@ -1258,12 +1350,12 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
     expect(pullCalls).toEqual([
-      ['group.v2.pull', { group_id: 'g1', after_seq: 0, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }],
-      ['group.v2.pull', { group_id: 'g1', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }],
+      ['group.v2.pull', { group_id: 'g1', after_seq: 0, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.pull', { group_id: 'g1', after_seq: 2, limit: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
     expect(ackCalls).toEqual([
-      ['group.v2.ack', { group_id: 'g1', up_to_seq: 2, device_id: 'device-001', slot_id: 'slot-a' }],
-      ['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }],
+      ['group.v2.ack', { group_id: 'g1', up_to_seq: 2, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+      ['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
     ]);
   });
 
@@ -1351,7 +1443,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     expect(observedContig).toEqual([3, 3, 3]);
-    expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }]]);
+    expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true]]);
   });
 
   it('group.v2.pull 空页不应 ack 已存在的 contiguous_seq', async () => {
@@ -1433,7 +1525,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
     expect(observedContig).toEqual([3, 3, 3]);
-    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }]]);
+    expect(ackCalls).toEqual([['group.v2.ack', { group_id: 'g1', up_to_seq: 3, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true]]);
   });
 
   it('V2 target 构建应接受显式空 device_id', async () => {
@@ -1501,7 +1593,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const pub = (client as any)._v2Session.getPeerIK('bob.aid.com', '');
 
     expect(Array.from(pub ?? [])).toEqual([1, 2, 3]);
-    expect((client as any).call).toHaveBeenCalledWith('message.v2.bootstrap', { peer_aid: 'bob.aid.com' });
+    expect((client as any).call).toHaveBeenCalledWith('message.v2.bootstrap', expect.objectContaining({ peer_aid: 'bob.aid.com' }));
     expect(cachePeerIK).toHaveBeenCalledWith('bob.aid.com', '', expect.any(Uint8Array));
     expect((client as any)._fetchPeerCert).not.toHaveBeenCalled();
   });
@@ -1780,10 +1872,15 @@ describe('AUNClient E2EE V2-only 编排', () => {
       message_id: 'm-v2-pure-push',
       from_aid: 'bob.aid.com',
     });
+    await Promise.resolve();
+    await Promise.resolve();
 
     expect((client as any)._transport.call).toHaveBeenCalledWith(
       'message.v2.pull',
       expect.objectContaining({ after_seq: 0 }),
+      undefined,
+      undefined,
+      true,
     );
     expect(published).toHaveLength(1);
     expect(published[0]).toMatchObject({
@@ -1820,7 +1917,13 @@ describe('AUNClient E2EE V2-only 编排', () => {
       envelope_json: '{}',
     });
 
-    expect(transportCall).toHaveBeenCalledWith('message.v2.pull', expect.objectContaining({ after_seq: 1 }));
+    expect(transportCall).toHaveBeenCalledWith(
+      'message.v2.pull',
+      expect.objectContaining({ after_seq: 1 }),
+      undefined,
+      undefined,
+      true,
+    );
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(1);
     expect((client as any)._seqTracker.getMaxSeenSeq(ns)).toBe(3);
     expect((client as any)._pendingOrderedMsgs.get(ns)?.has(3)).toBe(true);
@@ -1852,7 +1955,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(3);
     expect(transportCall.mock.calls.some(([method]) => method === 'message.v2.pull')).toBe(false);
-    expect(transportCall).toHaveBeenCalledWith('message.v2.ack', { up_to_seq: 3 });
+    expect(transportCall).toHaveBeenCalledWith('message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true);
   });
 
   it('V2 P2P payload push 在 contiguous_seq 等于 push_seq 时应幂等忽略', async () => {
@@ -1930,6 +2033,9 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(transportCall).toHaveBeenCalledWith(
       'group.v2.pull',
       expect.objectContaining({ group_id: groupId, after_seq: 2 }),
+      undefined,
+      undefined,
+      true,
     );
   });
   it('V2 group 纯通知 push 在 contiguous_seq 等于 push_seq 时应幂等忽略', async () => {
@@ -2486,8 +2592,7 @@ describe('有序消息发布', () => {
     expect(published).toEqual([]);
     expect((client as any)._pendingOrderedMsgs.get(ns)?.has(3)).toBe(true);
 
-    (client as any)._seqTracker.onPullResult(ns, [{ seq: 2 }, { seq: 3 }]);
-    await expect((client as any)._publishOrderedMessage('message.received', ns, 2, { seq: 2 }))
+    await expect((client as any)._publishPulledMessage('message.received', ns, 2, { seq: 2 }))
       .resolves.toBe(true);
 
     expect(published).toEqual([2, 3]);
@@ -2523,9 +2628,6 @@ describe('有序消息发布', () => {
     (client as any)._slotId = 'slot-a';
     const p2pNs = 'p2p:alice.aid.com';
     const groupNs = 'group:g1';
-    (client as any)._seqTracker.onMessageSeq(p2pNs, 1);
-    (client as any)._seqTracker.onMessageSeq(groupNs, 1);
-
     const p2pEvents: any[] = [];
     const groupEvents: any[] = [];
     client.on('message.received', (payload: any) => p2pEvents.push(payload));
@@ -2644,7 +2746,8 @@ describe('有序消息发布', () => {
 describe('AUNClient agent.md ETag 缓存', () => {
   const agentRoot = (client: AUNClient): string => (client as any)._agentMdPath as string;
   const agentEtag = (content: string): string => `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
-  const readAgentList = (client: AUNClient): any => JSON.parse(readFileSync(join(agentRoot(client), 'list.json'), 'utf-8'));
+  const readAgentRecord = (client: AUNClient, aid: string): any =>
+    JSON.parse(readFileSync(join(agentRoot(client), aid, 'agentmd.json'), 'utf-8'));
   const writeAgentFile = (client: AUNClient, aid: string, content: string): void => {
     mkdirSync(join(agentRoot(client), aid), { recursive: true });
     writeFileSync(join(agentRoot(client), aid, 'agent.md'), content, 'utf-8');
@@ -2667,7 +2770,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
     await client.publishAgentMd();
 
     const saved = readFileSync(join(agentRoot(client), 'alice.agentid.pub', 'agent.md'), 'utf-8');
-    const record = readAgentList(client).records['alice.agentid.pub'];
+    const record = readAgentRecord(client, 'alice.agentid.pub');
     expect(saved).toContain('aid: alice.agentid.pub');
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(agentEtag(saved));
@@ -2691,7 +2794,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
     expect(info.aid).toBe('bob.agentid.pub');
     expect(readFileSync(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'), 'utf-8')).toBe(body);
-    const record = readAgentList(client).records['bob.agentid.pub'];
+    const record = readAgentRecord(client, 'bob.agentid.pub');
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(agentEtag(body));
     expect(record.remote_etag).toBe('"bob-cloud"');
@@ -2714,11 +2817,10 @@ describe('AUNClient agent.md ETag 缓存', () => {
     });
 
     expect(client.getRemoteAgentMdEtag()).toBe('"alice-cloud"');
-    const records = readAgentList(client).records;
-    expect(records['alice.agentid.pub'].remote_etag).toBe('"alice-cloud"');
-    expect(records['bob.agentid.pub'].remote_etag).toBe('"bob-cloud"');
-    expect(records['carol.agentid.pub'].remote_etag).toBe('"carol-cloud"');
-    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
+    expect(readAgentRecord(client, 'alice.agentid.pub').remote_etag).toBe('"alice-cloud"');
+    expect(readAgentRecord(client, 'bob.agentid.pub').remote_etag).toBe('"bob-cloud"');
+    expect(readAgentRecord(client, 'carol.agentid.pub').remote_etag).toBe('"carol-cloud"');
+    expect(readAgentRecord(client, 'dave.agentid.pub').remote_etag).toBe('"dave-cloud"');
     (client as any)._keystore.close?.();
   });
 
@@ -2738,9 +2840,8 @@ describe('AUNClient agent.md ETag 缓存', () => {
       _meta: { agent_md_etags: { sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' } } },
     });
 
-    const records = readAgentList(client).records;
-    expect(records['carol.agentid.pub'].remote_etag).toBe('"carol-cloud"');
-    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
+    expect(readAgentRecord(client, 'carol.agentid.pub').remote_etag).toBe('"carol-cloud"');
+    expect(readAgentRecord(client, 'dave.agentid.pub').remote_etag).toBe('"dave-cloud"');
     (client as any)._keystore.close?.();
   });
 
@@ -2763,7 +2864,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
     expect(event.payload_type).toBe('chat.text');
     expect(event.protected_headers).toEqual({ payload_type: 'chat.text', sdk_lang: 'ts' });
     expect(event.agent_md).toEqual({ sender: { aid: 'alice.agentid.pub', etag: '"alice-cloud"' } });
-    expect(readAgentList(client).records['alice.agentid.pub'].remote_etag).toBe('"alice-cloud"');
+    expect(readAgentRecord(client, 'alice.agentid.pub').remote_etag).toBe('"alice-cloud"');
     (client as any)._keystore.close?.();
   });
 
@@ -2787,7 +2888,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
     expect(result.remote_found).toBe(true);
     expect(result.in_sync).toBe(true);
     expect(result.remote_etag).toBe(agentEtag(body));
-    expect(readAgentList(client).records['bob.agentid.pub'].remote_etag).toBe(agentEtag(body));
+    expect(readAgentRecord(client, 'bob.agentid.pub').remote_etag).toBe(agentEtag(body));
     (client as any)._keystore.close?.();
   });
 

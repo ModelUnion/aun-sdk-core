@@ -19,6 +19,12 @@ import (
 
 const MaxWSPayloadSize = 1_000_000
 
+// RPC inflight 限制常量
+const (
+	maxRPCInflight           = 16
+	maxBackgroundRPCInflight = 8
+)
+
 // eventNameMap 协议事件名到 SDK 事件名的映射
 var eventNameMap = map[string]string{
 	"message.received":       "message.received",
@@ -116,6 +122,10 @@ type RPCTransport struct {
 	// Trace observer：observer(traceInfo) 在每次 RPC/事件携带 _trace 时调用
 	traceObserver   func(map[string]any)
 	traceObserverMu sync.RWMutex
+
+	// RPC inflight 限制信号量（buffered channel 实现）
+	rpcSem        chan struct{} // 全局并发上限 = maxRPCInflight
+	backgroundSem chan struct{} // 后台 RPC 并发上限 = maxBackgroundRPCInflight
 }
 
 // NewRPCTransport 创建 RPC 传输层
@@ -129,6 +139,8 @@ func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisco
 		verifySSL:    verifySSL,
 		pending:      make(map[string]chan map[string]any),
 		closed:       true,
+		rpcSem:       make(chan struct{}, maxRPCInflight),
+		backgroundSem: make(chan struct{}, maxBackgroundRPCInflight),
 	}
 	if len(dnsNet) > 0 {
 		t.dnsNet = dnsNet[0]
@@ -425,6 +437,36 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 			pkgLogTransport().Debug("Call exit: method=%s elapsed=%dms", method, time.Since(tStart).Milliseconds())
 		}
 	}()
+
+	// 检测 background 标记（从 params 中提取并删除，不发送到服务端）
+	background := false
+	if params != nil {
+		if bg, ok := params["_rpc_background"]; ok {
+			if bv, ok2 := bg.(bool); ok2 {
+				background = bv
+			}
+			delete(params, "_rpc_background")
+		}
+	}
+
+	// RPC inflight 限制：全局信号量
+	select {
+	case t.rpcSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, NewTimeoutError(fmt.Sprintf("rpc queue timeout before send: %s", method), WithRetryable(true))
+	}
+	defer func() { <-t.rpcSem }()
+
+	// 后台 RPC 受双重限制（全局 + 后台）
+	if background {
+		select {
+		case t.backgroundSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, NewTimeoutError(fmt.Sprintf("rpc background queue timeout before send: %s", method), WithRetryable(true))
+		}
+		defer func() { <-t.backgroundSem }()
+	}
+
 	t.closedMu.RLock()
 	ws := t.ws
 	if t.closed || ws == nil {

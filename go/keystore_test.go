@@ -785,17 +785,16 @@ func TestFileKeyStore_LoadNonExistent(t *testing.T) {
 	}
 }
 
-// TestFileSecretStore_AutoSeed 验证自动生成 seed 文件
+// TestFileSecretStore_AutoSeed 验证未传 seed 时使用空字符串派生，不再生成 .seed
 func TestFileSecretStore_AutoSeed(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := secretstore.NewFileSecretStore(dir, "")
 	if err != nil {
-		t.Fatalf("自动 seed 创建失败: %v", err)
+		t.Fatalf("空 seed SecretStore 创建失败: %v", err)
 	}
-	// 验证 seed 文件存在
 	seedPath := filepath.Join(dir, ".seed")
-	if _, err := os.Stat(seedPath); os.IsNotExist(err) {
-		t.Error(".seed 文件应自动生成")
+	if _, err := os.Stat(seedPath); !os.IsNotExist(err) {
+		t.Error(".seed 文件不应自动生成")
 	}
 	// 验证加解密正常工作
 	record, _ := ss.Protect("s", "n", []byte("data"))

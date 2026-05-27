@@ -163,11 +163,11 @@ class CrossSdkTsAgent {
       internal._gatewayUrl = await authAny._resolveGateway(this.gatewayAid);
     }
     try {
-      await this.client.auth.createAid({ aid: this.aid });
+      await this.client.auth.registerAid({ aid: this.aid });
     } catch (err) {
       const localIdentity = internal._auth?.loadIdentityOrNone?.(this.aid);
       if (!localIdentity) {
-        throw new Error(`createAid failed and no local identity exists: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(`registerAid failed and no local identity exists: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     const auth = await this.client.auth.authenticate({ aid: this.aid });

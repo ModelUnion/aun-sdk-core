@@ -21,6 +21,10 @@ export type EventPayload =
 
 export type EventHandler = (payload: EventPayload) => void | Promise<void>;
 
+function isPromiseLike<T = void>(value: unknown): value is PromiseLike<T> {
+  return Boolean(value && typeof (value as { then?: unknown }).then === 'function');
+}
+
 /**
  * 订阅句柄，调用 unsubscribe() 取消订阅。
  */
@@ -83,23 +87,51 @@ export class EventDispatcher {
     }
   }
 
-  /** 发布事件，按注册顺序调用所有处理器（支持异步） */
-  async publish(event: string, payload: EventPayload): Promise<void> {
+  private _invokeHandler(event: string, handler: EventHandler, payload: EventPayload): void | Promise<void> {
+    try {
+      const result = handler(payload);
+      if (isPromiseLike(result)) {
+        return Promise.resolve(result).catch((exc) => {
+          this._logger.warn(`event ${event} handler ${handler.name || '<anonymous>'} threw: ${exc instanceof Error ? exc.message : String(exc)}`);
+        });
+      }
+    } catch (exc) {
+      // 与 Python SDK 一致：处理器异常不阻断其他处理器
+      this._logger.warn(`event ${event} handler ${handler.name || '<anonymous>'} threw: ${exc instanceof Error ? exc.message : String(exc)}`);
+    }
+  }
+
+  /**
+   * 同步优先发布事件。
+   *
+   * 消息交付路径会在应用 handler 返回后立即推进已交付游标；同步 handler
+   * 不能被 async publish 人为延后一轮微任务，否则应用侧刚收到事件就可能读到旧游标。
+   * 若 handler 返回 Promise，仍按原语义等待它完成后再继续。
+   */
+  publishSyncAware(event: string, payload: EventPayload): void | Promise<void> {
     const handlers = this._handlers.get(event);
     if (!handlers) return;
-    // 复制列表，防止迭代期间修改
     const snapshot = [...handlers];
+    let chain: Promise<void> | undefined;
     for (const handler of snapshot) {
-      try {
-        const result = handler(payload);
-        // 如果返回了 Promise，等待其完成
-        if (result && typeof (result as Promise<void>).then === 'function') {
-          await result;
-        }
-      } catch (exc) {
-        // 与 Python SDK 一致：处理器异常不阻断其他处理器
-        this._logger.warn(`event ${event} handler ${handler.name || '<anonymous>'} threw: ${exc instanceof Error ? exc.message : String(exc)}`);
+      if (chain) {
+        chain = chain.then(() => {
+          const result = this._invokeHandler(event, handler, payload);
+          return isPromiseLike(result) ? result : undefined;
+        });
+        continue;
+      }
+      const result = this._invokeHandler(event, handler, payload);
+      if (isPromiseLike(result)) {
+        chain = Promise.resolve(result);
       }
     }
+    return chain;
+  }
+
+  /** 发布事件，按注册顺序调用所有处理器（支持异步） */
+  async publish(event: string, payload: EventPayload): Promise<void> {
+    const result = this.publishSyncAware(event, payload);
+    if (isPromiseLike(result)) await result;
   }
 }

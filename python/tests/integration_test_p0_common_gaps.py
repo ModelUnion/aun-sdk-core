@@ -113,7 +113,7 @@ def _group_id(result: dict) -> str:
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:
@@ -129,7 +129,7 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
 
 
 async def _auth_phase1(client: AUNClient, aid: str) -> tuple[str, dict, dict]:
-    await client.auth.create_aid({"aid": aid})
+    await client.auth.register_aid({"aid": aid})
     gateway_url = await client.auth._resolve_gateway(aid)
     identity = client._auth.load_identity(aid)
     client_nonce = client._auth._crypto.new_client_nonce()
@@ -220,7 +220,7 @@ async def test_p0_02_aid_creation_failure():
 
     # 1. 创建已存在的 AID — alice 应该已注册
     try:
-        await client.auth.create_aid({"aid": _ALICE_AID})
+        await client.auth.register_aid({"aid": _ALICE_AID})
         # 如果没报错，可能是幂等设计，也标记通过但记录
         _ok("创建重复AID", "未报错（可能幂等设计）")
     except Exception as exc:
@@ -232,7 +232,7 @@ async def test_p0_02_aid_creation_failure():
 
     # 2. 无效 AID 格式 — 空字符串
     try:
-        await client.auth.create_aid({"aid": ""})
+        await client.auth.register_aid({"aid": ""})
         _fail("创建空AID", "期望报错但成功了")
     except (ValidationError, ValueError) as exc:
         _ok("创建空AID", f"客户端校验: {exc}")
@@ -241,7 +241,7 @@ async def test_p0_02_aid_creation_failure():
 
     # 3. 无效 AID 格式 — 含特殊字符
     try:
-        await client.auth.create_aid({"aid": "test@#$%^&*.invalid"})
+        await client.auth.register_aid({"aid": "test@#$%^&*.invalid"})
         _fail("创建非法AID", "期望报错但成功了")
     except Exception as exc:
         _ok("创建非法AID", f"拒绝: {type(exc).__name__}: {exc}")

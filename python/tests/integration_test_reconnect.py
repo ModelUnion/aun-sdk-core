@@ -95,7 +95,7 @@ def _make_client(tag: str) -> AUNClient:
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    await client.auth.create_aid({"aid": aid})
+    await client.auth.register_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     await client.connect(auth, {
         "auto_reconnect": True,
@@ -357,7 +357,7 @@ async def test_reconnect_exhausted():
     client.on("connection.state", lambda d: state_events.append(d))
 
     try:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
         auth = await client.auth.authenticate({"aid": aid})
         await client.connect(auth, {
             "auto_reconnect": True,
@@ -420,11 +420,11 @@ async def test_message_chain_recovery_after_reconnect():
     bob_client = _make_client("bob-receiver")
 
     try:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
         auth = await client.auth.authenticate({"aid": aid})
         await client.connect(auth, {"auto_reconnect": True, "heartbeat_interval": 5})
 
-        await bob_client.auth.create_aid({"aid": bob_aid})
+        await bob_client.auth.register_aid({"aid": bob_aid})
         bob_auth = await bob_client.auth.authenticate({"aid": bob_aid})
         await bob_client.connect(bob_auth)
 
@@ -468,7 +468,7 @@ async def test_no_duplicate_background_tasks():
 
     client = _make_client("no-duplicate-tasks")
     try:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
         auth = await client.auth.authenticate({"aid": aid})
         await client.connect(auth, {"auto_reconnect": True, "heartbeat_interval": 5})
 

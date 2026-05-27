@@ -54,7 +54,7 @@ async function resolveGatewayInto(client: AUNClient): Promise<void> {
 
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
   await resolveGatewayInto(client);
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   const opts: Record<string, unknown> = {
     ...auth,

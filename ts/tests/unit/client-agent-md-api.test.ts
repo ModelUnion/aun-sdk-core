@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -30,17 +30,26 @@ function writeLocalAgentMd(client: AUNClient, aid: string, content: string): str
   return file;
 }
 
-function readList(client: AUNClient): any {
-  return JSON.parse(readFileSync(join(agentRoot(client), 'list.json'), 'utf-8'));
+function readRecords(client: AUNClient): Record<string, any> {
+  const records: Record<string, any> = {};
+  for (const aid of readdirSync(agentRoot(client))) {
+    const meta = join(agentRoot(client), aid, 'agentmd.json');
+    try {
+      records[aid] = JSON.parse(readFileSync(meta, 'utf-8'));
+    } catch {
+      // ignore directories without agent.md metadata
+    }
+  }
+  return records;
 }
 
-describe('client AgentMDs 文件存储', () => {
-  it('默认路径为 {aun_path}/AgentMDs，且 SetAgentMDPath 可切换/恢复', () => {
+describe('client AIDs agent.md 文件存储', () => {
+  it('默认路径为 {aun_path}/AIDs，且 SetAgentMDPath 可切换/恢复', () => {
     const base = mkdtempSync(join(tmpdir(), 'aun-client-agent-md-path-'));
     const client = new AUNClient({ aun_path: join(base, 'aun') });
-    expect(agentRoot(client)).toBe(join(base, 'aun', 'AgentMDs'));
+    expect(agentRoot(client)).toBe(join(base, 'aun', 'AIDs'));
     expect((client as any).setAgentMdPath(join(base, 'custom'))).toBe(join(base, 'custom'));
-    expect((client as any).SetAgentMDPath()).toBe(join(base, 'aun', 'AgentMDs'));
+    expect((client as any).SetAgentMDPath()).toBe(join(base, 'aun', 'AIDs'));
     (client as any)._keystore.close?.();
   });
 
@@ -50,7 +59,7 @@ describe('client AgentMDs 文件存储', () => {
     (client as any)._keystore.close?.();
   });
 
-  it('publishAgentMd 读取默认 agent.md → 签名上传 → 原子写回并更新 list.json', async () => {
+  it('publishAgentMd 读取默认 agent.md → 签名上传 → 原子写回并更新 agentmd.json', async () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const unsigned = '---\naid: alice.agentid.pub\n---\n# Alice\n';
@@ -72,7 +81,7 @@ describe('client AgentMDs 文件存储', () => {
     expect(result.aid).toBe('alice.agentid.pub');
     expect(signedInput).toBe(unsigned);
     expect(readFileSync(join(agentRoot(client), 'alice.agentid.pub', 'agent.md'), 'utf-8')).toBe(uploaded);
-    const record = readList(client).records['alice.agentid.pub'];
+    const record = readRecords(client)['alice.agentid.pub'];
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(etag(uploaded));
     expect(record.remote_etag).toBe('"abc"');
@@ -80,7 +89,7 @@ describe('client AgentMDs 文件存储', () => {
     (client as any)._keystore.close?.();
   });
 
-  it('fetchAgentMd 保存到默认 {aid}/agent.md，并只把元数据放入 list.json', async () => {
+  it('fetchAgentMd 保存到默认 {aid}/agent.md，并只把元数据放入 agentmd.json', async () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
@@ -96,10 +105,51 @@ describe('client AgentMDs 文件存储', () => {
     expect(info.in_sync).toBeNull();
     expect(info.saved_to).toBe(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'));
     expect(readFileSync(info.saved_to!, 'utf-8')).toBe(body);
-    const record = readList(client).records['bob.agentid.pub'];
+    const record = readRecords(client)['bob.agentid.pub'];
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(etag(body));
     expect(record.remote_etag).toBe('"bob-cloud"');
+    (client as any)._keystore.close?.();
+  });
+
+  it('手动 fetchAgentMd 会加入自动补拉同一 AID 的 singleflight', async () => {
+    const client = makeClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
+    let markStarted!: () => void;
+    let releaseDownload!: (value: string) => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const downloadResult = new Promise<string>((resolve) => {
+      releaseDownload = resolve;
+    });
+    const downloadSpy = vi.spyOn(client.auth, 'downloadAgentMd').mockImplementation(async () => {
+      markStarted();
+      return await downloadResult;
+    });
+    const verifySpy = vi.spyOn(client.auth, 'verifyAgentMd').mockResolvedValue({ status: 'verified', verified: true, payload: body } as any);
+
+    (client as any)._observeRpcMeta({
+      agent_md_etags: {
+        sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' },
+      },
+    });
+    await started;
+
+    const manual = client.fetchAgentMd('bob.agentid.pub');
+    await Promise.resolve();
+    expect(downloadSpy).toHaveBeenCalledTimes(1);
+
+    releaseDownload(body);
+    const info = await manual;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(info.content).toBe(body);
+    expect(downloadSpy).toHaveBeenCalledTimes(1);
+    expect(verifySpy).toHaveBeenCalledTimes(1);
+    expect((client as any)._agentMdFetchInflight.size).toBe(0);
+    expect(readFileSync(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'), 'utf-8')).toBe(body);
     (client as any)._keystore.close?.();
   });
 
@@ -128,7 +178,7 @@ describe('client AgentMDs 文件存储', () => {
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
     expect(result.in_sync).toBe(true);
-    expect(readList(client).records['bob.agentid.pub'].remote_etag).toBe(etag(body));
+    expect(readRecords(client)['bob.agentid.pub'].remote_etag).toBe(etag(body));
     (client as any)._keystore.close?.();
   });
 
@@ -158,7 +208,7 @@ describe('client AgentMDs 文件存储', () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const records = readList(client).records;
+    const records = readRecords(client);
     expect(records['alice.agentid.pub'].remote_etag).toBe('"alice-cloud-2"');
     expect(records['alice.agentid.pub'].last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
     expect(records['bob.agentid.pub'].remote_etag).toBe('"bob-cloud"');
@@ -197,24 +247,41 @@ describe('client AgentMDs 文件存储', () => {
     (client as any)._keystore.close?.();
   });
 
-  it('list.json 损坏时按目录重建，并清空旧内存缓存', () => {
+  it('checkAgentMd 默认使用 1 天窗口，远端 missing 缓存新鲜时不 HEAD', async () => {
+    const client = makeClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._saveAgentMdRecord('missing.agentid.pub', {
+      remote_status: 'missing',
+      checked_at: Date.now(),
+    });
+    vi.spyOn(client.auth as any, 'headAgentMd').mockImplementation(async () => {
+      throw new Error('fresh missing cache should not HEAD');
+    });
+
+    const result = await client.checkAgentMd('missing.agentid.pub');
+
+    expect(result.local_found).toBe(false);
+    expect(result.remote_found).toBe(false);
+    expect(result.cached).toBe(true);
+    expect(result.status).toBe(404);
+    (client as any)._keystore.close?.();
+  });
+
+  it('agentmd.json 损坏时只影响对应 AID', () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '# Alice\n';
     writeLocalAgentMd(client, 'alice.agentid.pub', body);
     (client as any)._agentMdCache.set('alice.agentid.pub', { aid: 'alice.agentid.pub', remote_etag: '"cloud"' });
     (client as any)._agentMdCache.set('bob.agentid.pub', { aid: 'bob.agentid.pub', remote_etag: '"stale"' });
-    writeFileSync(join(agentRoot(client), 'list.json'), '{bad json', 'utf-8');
+    writeFileSync(join(agentRoot(client), 'alice.agentid.pub', 'agentmd.json'), '{bad json', 'utf-8');
 
     const record = (client as any)._loadAgentMdRecord('alice.agentid.pub');
 
     expect(record.content).toBe(body);
     expect(record.local_etag).toBe(etag(body));
     expect(record.remote_etag).toBeUndefined();
-    const rebuilt = readList(client).records['alice.agentid.pub'];
-    expect(rebuilt.local_etag).toBe(etag(body));
-    expect(rebuilt.remote_etag).toBeUndefined();
-    expect((client as any)._agentMdCache.has('bob.agentid.pub')).toBe(false);
+    expect((client as any)._agentMdCache.has('bob.agentid.pub')).toBe(true);
     (client as any)._keystore.close?.();
   });
 });

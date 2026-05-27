@@ -17,6 +17,9 @@ import {
   chmodSync,
   renameSync,
   unlinkSync,
+  rmSync as fsRmSync,
+  renameSync as fsRenameSync,
+  statSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -29,6 +32,7 @@ import { V2KeyStore } from '../v2/session/keystore.js';
 import { getDeviceId, normalizeInstanceId } from '../config.js';
 import { certificateSha256Fingerprint } from '../crypto.js';
 import { createDefaultSecretStore } from '../secret-store/index.js';
+import { FileSecretStore, type SeedChangeResult } from '../secret-store/file-store.js';
 import {
   isJsonObject,
   type IdentityRecord,
@@ -99,6 +103,17 @@ export class FileKeyStore implements KeyStore {
     this._logger.debug(`FileKeyStore close: closing ${this._aidDBs.size} AID databases`);
     for (const db of this._aidDBs.values()) db.close();
     this._aidDBs.clear();
+  }
+
+  static ChangeSeed(root: string, oldSeed: string, newSeed: string): SeedChangeResult {
+    return FileSecretStore.changeSeed(root, oldSeed, newSeed);
+  }
+
+  changeSeed(oldSeed: string, newSeed: string): SeedChangeResult {
+    this.close();
+    const result = FileSecretStore.changeSeed(this._root, oldSeed, newSeed, { logger: this._logger });
+    this._secretStore = createDefaultSecretStore(this._root, newSeed, undefined, { logger: this._logger });
+    return result;
   }
 
   private _getDB(aid: string): AIDDatabase {
@@ -217,6 +232,12 @@ export class FileKeyStore implements KeyStore {
   // ── Identity ─────────────────────────────────────────────
 
   loadIdentity(aid: string): IdentityRecord | null {
+    // 只读语义保护：身份目录不存在时直接返回 null，绝不通过 _getDB 触发
+    // `~/.aun/AIDs/{aid}/aun.db` 的副作用 mkdir。这避免了"用对端 AID
+    // 误调 loadIdentity"导致本地落下空目录的安全事故。
+    const identityDir = join(this._aidsRoot, safeAid(aid));
+    if (!existsSync(identityDir)) return null;
+
     const kp = this.loadKeyPair(aid);
     const cert = this.loadCert(aid);
     // 直接从 DB 读取 tokens + KV
@@ -329,6 +350,8 @@ export class FileKeyStore implements KeyStore {
     const aids: string[] = [];
     for (const entry of readdirSync(this._aidsRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
+      // 跳过保留前缀的特殊目录（_pending 等）
+      if (entry.name.startsWith('_')) continue;
       aids.push(entry.name);
     }
     return aids;
@@ -476,6 +499,73 @@ export class FileKeyStore implements KeyStore {
 
   private _certVersionPath(aid: string, fp: string): string {
     return join(this._aidsRoot, safeAid(aid), 'public', 'certs', `${fp.replace(/:/g, '_')}.pem`);
+  }
+
+  /** RegisterAID 临时目录根：AIDs/_pending/ */
+  private _pendingRoot(): string {
+    return join(this._aidsRoot, '_pending');
+  }
+
+  /**
+   * 为 RegisterAID 分配一个临时目录 AIDs/_pending/{aid}-{nonce}-{ts}/。
+   * 子目录 private/ public/ 一并创建。
+   */
+  pendingIdentityDir(aid: string): string {
+    const nonce = crypto.randomBytes(4).toString('hex');
+    const ts = Math.floor(Date.now() / 1000);
+    const dir = join(this._pendingRoot(), `${safeAid(aid)}-${nonce}-${ts}`);
+    mkdirSync(join(dir, 'private'), { recursive: true });
+    mkdirSync(join(dir, 'public'), { recursive: true });
+    return dir;
+  }
+
+  /**
+   * 把临时目录原子 rename 到正式 AIDs/{aid}/。
+   * 目标已存在 → 抛错（调用方应当返回 IdentityConflictError）。
+   */
+  promotePendingIdentity(pendingDir: string, aid: string): string {
+    const target = join(this._aidsRoot, safeAid(aid));
+    if (existsSync(target)) {
+      throw new Error(`promotePendingIdentity: target exists: ${target}`);
+    }
+    // 关闭 lazy 打开的 db 句柄（如果有），避免句柄占用旧路径
+    const safe = safeAid(aid);
+    const db = this._aidDBs.get(safe);
+    if (db) {
+      try { db.close(); } catch { /* ignore */ }
+      this._aidDBs.delete(safe);
+    }
+    mkdirSync(this._aidsRoot, { recursive: true });
+    fsRenameSync(pendingDir, target);
+    return target;
+  }
+
+  /**
+   * 删除 AIDs/_pending/ 下 mtime 超过 maxAgeMs 的子目录。
+   * 失败仅记 warn，不抛错。返回被清理的目录数量。
+   */
+  cleanupPendingDirs(maxAgeMs: number = 600_000): number {
+    const root = this._pendingRoot();
+    if (!existsSync(root)) return 0;
+    let removed = 0;
+    const now = Date.now();
+    try {
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const path = join(root, entry.name);
+        try {
+          const st = statSync(path);
+          if (now - st.mtimeMs < maxAgeMs) continue;
+          fsRmSync(path, { recursive: true, force: true });
+          removed++;
+        } catch (e) {
+          this._logger.warn(`cleanupPendingDirs entry failed: ${path} err=${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    } catch (e) {
+      this._logger.warn(`cleanupPendingDirs read root failed: ${root} err=${e instanceof Error ? e.message : String(e)}`);
+    }
+    return removed;
   }
 
   /** 获取指定 AID 的 V2KeyStore（共享同一 SQLite 连接）。 */

@@ -86,7 +86,8 @@ def test_group_payload_type_is_copied_to_top_level_envelope():
     assert envelope["payload_type"] == "group-text"
     assert envelope["protected_headers"]["payload_type"] == "group-text"
     assert envelope["protected_headers"]["sdk_lang"] == "python"
-    assert envelope["protected_headers"]["sdk_vesion"] == AUN_SDK_VERSION
+    assert envelope["protected_headers"]["sdk_version"] == AUN_SDK_VERSION
+    assert "sdk_vesion" not in envelope["protected_headers"]
 
 
 def test_group_sdk_metadata_is_injected_without_payload_type():
@@ -98,7 +99,7 @@ def test_group_sdk_metadata_is_injected_without_payload_type():
 
     assert "payload_type" not in envelope
     assert envelope["protected_headers"]["sdk_lang"] == "python"
-    assert envelope["protected_headers"]["sdk_vesion"] == AUN_SDK_VERSION
+    assert envelope["protected_headers"]["sdk_version"] == AUN_SDK_VERSION
 def test_group_wrong_spk_reports_wrap_key_decrypt_failed():
     sender = _sender()
     bob_priv, bob_pub = generate_p256_keypair()

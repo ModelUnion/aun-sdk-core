@@ -97,7 +97,7 @@ async function connectLong(
   aid: string,
   slotId: string,
 ): Promise<void> {
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth, {
     auto_reconnect: false,
@@ -111,7 +111,7 @@ async function connectShort(
   aid: string,
   opts: { slot_id?: string; short_ttl_ms?: number } = {},
 ): Promise<void> {
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth, {
     connection_kind: 'short',

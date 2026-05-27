@@ -141,7 +141,7 @@ graph TD
 
 | 命名空间 | 职责 | 关键方法 |
 |----------|------|----------|
-| `auth.*` | 身份认证、JWT 签发与刷新 | create_aid / authenticate / refresh_token |
+| `auth.*` | 身份认证、JWT 签发与刷新 | register_aid / authenticate / refresh_token |
 | `peer.*` | 对等认证、证书互验 | hello / verify / establish |
 | `relay.*` | 中继注册与转发 | register / forward / unregister |
 | `message.*` | 消息收发、离线队列、P2P 思考内容 | send / pull / ack / recall / thought.put / thought.get |
@@ -212,7 +212,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> 未注册
-    未注册 --> 已注册: create_aid（生成密钥对 + 签发证书）
+    未注册 --> 已注册: register_aid（生成密钥对 + 签发证书）
     已注册 --> 已认证: authenticate（Challenge-Response）
     已认证 --> 已连接: connect（WebSocket）
     已连接 --> 已连接: call / on（业务操作）
@@ -261,7 +261,7 @@ async def create_client(aid: str) -> tuple[AUNClient, dict]:
     client = AUNClient({"aun_path": f"~/.aun/{aid}"})
     identity = client._auth.load_identity_or_none(aid)
     if not identity:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     return client, auth
 

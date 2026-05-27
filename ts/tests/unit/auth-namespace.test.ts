@@ -11,6 +11,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error('timed out waiting for condition');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe('AuthNamespace agent.md', () => {
   it('底层 AuthFlow 兼容 loadIdentityOrNull 命名', () => {
     const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
@@ -111,9 +121,193 @@ describe('AuthNamespace agent.md', () => {
       expect.objectContaining({
         method: 'GET',
         headers: { Accept: 'text/markdown' },
+        redirect: 'follow',
         signal: expect.any(AbortSignal),
       }),
     );
+  });
+
+  it('并发手动 downloadAgentMd 同一 AID 应共用同一个下载任务', async () => {
+    const client = new AUNClient({
+      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
+      discovery_port: 18443,
+    });
+    (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
+    let markStarted!: () => void;
+    let releaseFetch!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      markStarted();
+      await release;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => '# Bob\n',
+        headers: new Headers(),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const first = client.auth.downloadAgentMd('bob.agentid.pub');
+    await started;
+    const second = client.auth.downloadAgentMd('bob.agentid.pub');
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    releaseFetch();
+    await expect(Promise.all([first, second])).resolves.toEqual(['# Bob\n', '# Bob\n']);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((client.auth as any)._agentMdDownloadInflight.size).toBe(0);
+  });
+
+  it('不同 AID 的 downloadAgentMd 应受全局 8 并发上限控制', async () => {
+    const client = new AUNClient({
+      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
+      discovery_port: 18443,
+    });
+    (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
+    let active = 0;
+    let maxActive = 0;
+    let started = 0;
+    let releaseAll!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseAll = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      started += 1;
+      await gate;
+      active -= 1;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => `# ${url}\n`,
+        headers: new Headers(),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const downloads = Array.from({ length: 10 }, (_, index) =>
+      client.auth.downloadAgentMd(`aid-${index}.agentid.pub`));
+    await waitUntil(() => started === 8);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(started).toBe(8);
+    expect(maxActive).toBeLessThanOrEqual(8);
+
+    releaseAll();
+    await Promise.all(downloads);
+    expect(fetchMock).toHaveBeenCalledTimes(10);
+    expect(maxActive).toBeLessThanOrEqual(8);
+  });
+
+  it('downloadAgentMd 遇到 304 且已有正文缓存时应返回缓存正文', async () => {
+    const client = new AUNClient({
+      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
+      discovery_port: 18443,
+    });
+    (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => '# Bob v1\n',
+        headers: new Headers({
+          ETag: '"etag-v1"',
+          'Last-Modified': 'Sun, 24 May 2026 00:00:00 GMT',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 304,
+        text: async () => '',
+        headers: new Headers(),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(client.auth.downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob v1\n');
+    await expect(client.auth.downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob v1\n');
+
+    expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toEqual({ Accept: 'text/markdown' });
+  });
+
+  it('downloadAgentMd 只有 ETag 没有正文缓存时应无条件 GET', async () => {
+    const client = new AUNClient({
+      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
+      discovery_port: 18443,
+    });
+    (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => '',
+        headers: new Headers({
+          ETag: '"head-only"',
+          'Last-Modified': 'Sun, 24 May 2026 00:00:00 GMT',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 304,
+        text: async () => '',
+        headers: new Headers(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => '# Bob fresh\n',
+        headers: new Headers({ ETag: '"head-only"' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect((client.auth as any).headAgentMd('bob.agentid.pub')).resolves.toMatchObject({
+      found: true,
+      etag: '"head-only"',
+      status: 200,
+    });
+    await expect(client.auth.downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob fresh\n');
+
+    expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toEqual({ Accept: 'text/markdown' });
+    expect((fetchMock.mock.calls[2][1] as RequestInit).headers).toEqual({ Accept: 'text/markdown' });
+  });
+
+  it('headAgentMd 遇到 304 应返回 not modified 元数据而不是错误', async () => {
+    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => '',
+        headers: new Headers({
+          ETag: '"etag-v1"',
+          'Last-Modified': 'Sun, 24 May 2026 00:00:00 GMT',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 304,
+        text: async () => '',
+        headers: new Headers(),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await (client.auth as any).headAgentMd('bob.agentid.pub');
+    await expect((client.auth as any).headAgentMd('bob.agentid.pub')).resolves.toMatchObject({
+      found: true,
+      etag: '"etag-v1"',
+      last_modified: 'Sun, 24 May 2026 00:00:00 GMT',
+      status: 304,
+    });
   });
 
   it('downloadAgentMd 超时应抛明确错误', async () => {

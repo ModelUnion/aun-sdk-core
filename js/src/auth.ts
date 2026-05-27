@@ -5,10 +5,12 @@
 import type { KeyStore } from './keystore/index.js';
 import type { ModuleLogger } from './logger.js';
 import { CryptoProvider, base64ToUint8, uint8ToBase64, pemToArrayBuffer, toBufferSource } from './crypto.js';
-import { AuthError, StateError, ValidationError, mapRemoteError } from './errors.js';
+import { AuthError, IdentityConflictError, StateError, ValidationError, mapRemoteError } from './errors.js';
 import { ROOT_CA_PEM } from './certs/root.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+const AUN_SDK_LANG = 'javascript';
+const AUN_SDK_VERSION = '0.3.4';
 
 import {
   isJsonObject,
@@ -527,53 +529,102 @@ export class AuthFlow {
   }
 
   /**
-   * 注册新 AID。
+   * 严格注册新 AID（对齐 TS registerAid / Go RegisterAID）。
    *
-   * 流程：
-   *   1. 确保本地密钥对存在
-   *   2. 短连接 RPC 调用 auth.create_aid
-   *   3. 保存返回的证书
+   * 注册与认证彻底分离：此方法绝不被 SDK 内部自动调用，
+   * 必须由应用层显式调用。
    */
-  async createAid(gatewayUrl: string, aid: string): Promise<JsonObject> {
+  async registerAid(gatewayUrl: string, aid: string): Promise<JsonObject> {
     const tStart = Date.now();
-    this._log.debug(`createAid enter: aid=${aid} gateway=${gatewayUrl}`);
+    this._log.debug(`registerAid enter: aid=${aid} gateway=${gatewayUrl}`);
     AuthFlow._validateAidName(aid);
     try {
-      const identity = await this._ensureLocalIdentity(aid);
-      if (identity.cert) {
-        this._log.debug(`createAid exit: elapsed=${Date.now() - tStart}ms aid=${aid} reason=already_has_cert`);
-        return { aid: identity.aid, cert: identity.cert };
-      }
-
-      // 本地有密钥但无证书 — 尝试注册
-      try {
-        const created = await this._createAid(gatewayUrl, identity);
-        Object.assign(identity, created);
-      } catch (e) {
-        if (e instanceof Error && e.message.includes('already exists')) {
-          // AID 已在服务端注册，尝试下载证书恢复
-          try {
-            const recovered = await this._recoverCertViaDownload(gatewayUrl, identity);
-            Object.assign(identity, recovered);
-          } catch {
-            this._log.debug(`createAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=already_registered_recover_failed`);
-            throw new StateError(
-              `AID ${aid} already registered on server but local certificate is missing. ` +
-              `Certificate download recovery failed. Options: ` +
-              `(1) use a different AID name, or ` +
-              `(2) restart server to clear registration.`,
+      // Step 1: 本地已有 keypair → 查服务端做幂等/恢复
+      const existing = await this._keystore.loadIdentity(aid);
+      if (existing && existing.private_key_pem && existing.public_key_der_b64) {
+        this._log.debug(`registerAid: local keypair exists, checking server: aid=${aid}`);
+        const localPubB64 = String(existing.public_key_der_b64);
+        const serverCertPem = await this._downloadRegisteredCert(gatewayUrl, aid);
+        if (serverCertPem) {
+          // 服务端已注册 → 比对公钥
+          const serverCert = parseCertDer(serverCertPem);
+          const serverPubB64 = uint8ToBase64(serverCert.spkiBytes);
+          if (serverPubB64 !== localPubB64) {
+            throw new IdentityConflictError(
+              `AID '${aid}' is registered by another party on server (public key mismatch). ` +
+              `Choose a different name.`,
             );
           }
+          // 公钥匹配 → 幂等返回；如本地缺 cert，把服务端 cert 写入
+          this._log.info(`registerAid: idempotent return for already-registered AID: aid=${aid}`);
+          if (!existing.cert) {
+            existing.cert = serverCertPem;
+            await this._persistIdentity(existing);
+          }
+          this._aid = aid;
+          return { aid, cert: serverCertPem };
         } else {
-          throw e;
+          // 服务端无记录 → 用现有 keypair 发起注册
+          this._log.debug(`registerAid: server has no record, registering with existing keypair: aid=${aid}`);
+          const created = await this._createAid(gatewayUrl, existing);
+          const certPem = String(created.cert ?? '');
+          if (!certPem) {
+            throw new AuthError(`registerAid: server response missing cert for ${aid}`);
+          }
+          existing.cert = certPem;
+          // 校验 cert 公钥
+          const returnedCert = parseCertDer(certPem);
+          const certPubB64 = uint8ToBase64(returnedCert.spkiBytes);
+          if (certPubB64 !== localPubB64) {
+            throw new AuthError(
+              `registerAid: server returned certificate with mismatched public key for ${aid}`,
+            );
+          }
+          await this._persistIdentity(existing);
+          this._aid = aid;
+          this._log.debug(`registerAid exit (recovered): elapsed=${Date.now() - tStart}ms aid=${aid}`);
+          return { aid, cert: certPem };
         }
       }
+
+      // Step 2: 先查服务端确认未注册
+      const serverCertPem = await this._downloadRegisteredCert(gatewayUrl, aid);
+      if (serverCertPem) {
+        throw new IdentityConflictError(
+          `AID '${aid}' is already registered on server. ` +
+          `Choose a different name, or if you own the keypair use a recovery flow.`,
+        );
+      }
+
+      // Step 3: 生成 keypair
+      const identity = await this._crypto.generateIdentity() as IdentityRecord;
+      identity.aid = aid;
+
+      // Step 4: RPC 注册（服务端方法名仍为 auth.create_aid）
+      const created = await this._createAid(gatewayUrl, identity);
+      const certPem = String(created.cert ?? '');
+      if (!certPem) {
+        throw new AuthError(`registerAid: server response missing cert for ${aid}`);
+      }
+      identity.cert = certPem;
+
+      // Step 5: 校验 cert 公钥 == 本地公钥
+      const returnedCert = parseCertDer(certPem);
+      const certPubB64 = uint8ToBase64(returnedCert.spkiBytes);
+      const localPubB64 = String(identity.public_key_der_b64);
+      if (certPubB64 !== localPubB64) {
+        throw new AuthError(
+          `registerAid: server returned certificate with mismatched public key for ${aid}`,
+        );
+      }
+
+      // Step 6: 持久化
       await this._persistIdentity(identity);
-      this._aid = identity.aid as string;
-      this._log.debug(`createAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
+      this._aid = aid;
+      this._log.debug(`registerAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
       return { aid: identity.aid, cert: identity.cert };
     } catch (err) {
-      this._log.debug(`createAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      this._log.debug(`registerAid exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
   }
@@ -622,25 +673,20 @@ export class AuthFlow {
         } catch (e) {
           throw new StateError(
             `local certificate missing and recovery failed: ${e}. ` +
-            `Run auth.createAid() to register a new identity.`,
+            `Run auth.registerAid() to register a new identity.`,
           );
         }
       }
+
+      // 防线 B：发起两步登录前显式校验 cert 公钥与本地 keypair 公钥一致
+      this._assertCertMatchesLocalKeypair(identity);
 
       let login: JsonObject;
       try {
         login = await this._login(gatewayUrl, identity);
       } catch (e) {
-        // 证书未在服务端注册或公钥不匹配 — 自动重新注册
-        if (e instanceof AuthError && (String((e as Error).message).includes('not registered') || String((e as Error).message).includes('public key mismatch'))) {
-          this._log.warn(`[auth] cert not registered on server, auto re-register: aid=${identity.aid}`);
-          const created = await this._createAid(gatewayUrl, identity);
-          identity.cert = created.cert as string;
-          await this._persistIdentity(identity);
-          login = await this._login(gatewayUrl, identity);
-        } else {
-          throw e;
-        }
+        // 注册和登录彻底分离：登录失败绝不触发自动注册。
+        throw e;
       }
       this._rememberTokens(identity, login);
       await this._validateNewCert(identity, gatewayUrl);
@@ -661,18 +707,21 @@ export class AuthFlow {
   }
 
   /**
-   * 确保已认证（如无身份则先注册再登录）。
+   * 确保已认证。注册和登录彻底分离：无身份或无 cert 直接抛错。
    */
   async ensureAuthenticated(gatewayUrl: string): Promise<AuthContext> {
     const tStart = Date.now();
     this._log.debug(`ensureAuthenticated enter: gateway=${gatewayUrl}`);
     try {
-      const identity = await this._ensureIdentity();
+      const identity = await this._loadIdentityOrRaise();
       if (!identity.cert) {
-        const created = await this._createAid(gatewayUrl, identity);
-        Object.assign(identity, created);
-        await this._persistIdentity(identity);
+        throw new StateError(
+          `local identity for aid ${identity.aid} has no certificate; ` +
+          `call auth.authenticate() to attempt cert recovery, or auth.registerAid() if this is a fresh registration.`,
+        );
       }
+      // 防线 B：发起两步登录前显式校验
+      this._assertCertMatchesLocalKeypair(identity);
 
       const login = await this._login(gatewayUrl, identity);
       this._rememberTokens(identity, login);
@@ -1081,6 +1130,38 @@ export class AuthFlow {
     return { cert: response.cert };
   }
 
+  /** 下载服务端当前登记的证书；未注册返回 null */
+  private async _downloadRegisteredCert(gatewayUrl: string, aid: string): Promise<string | null> {
+    const certUrl = gatewayHttpUrl(gatewayUrl, `/pki/cert/${aid}`);
+    try {
+      const certPem = await this._fetchText(certUrl);
+      if (!certPem || !certPem.includes('BEGIN CERTIFICATE')) return null;
+      return certPem;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 防线 B：cert 公钥必须与本地 keypair 公钥一致，否则拒绝登录 */
+  private _assertCertMatchesLocalKeypair(identity: IdentityRecord): void {
+    const aid = identity.aid ?? '?';
+    const certPem = identity.cert as string | undefined;
+    const localPubB64 = identity.public_key_der_b64 as string | undefined;
+    if (!certPem || !localPubB64) {
+      throw new AuthError(
+        `identity for aid ${aid} missing cert or public key; refusing to start two-phase login`,
+      );
+    }
+    const cert = parseCertDer(certPem);
+    const certSpkiB64 = uint8ToBase64(cert.spkiBytes);
+    if (certSpkiB64 !== localPubB64) {
+      throw new AuthError(
+        `local certificate public key does not match local keypair for aid ${aid}; ` +
+        `refusing to start two-phase login. Run auth.registerAid() to repair identity.`,
+      );
+    }
+  }
+
   /** 下载已注册证书恢复本地状态 */
   private async _recoverCertViaDownload(
     gatewayUrl: string,
@@ -1185,7 +1266,11 @@ export class AuthFlow {
       auth: { method: 'kite_token', token },
       protocol: { min: '1.0', max: '1.0' },
       device: { id: String(opts?.deviceId ?? this._deviceId ?? ''), type: 'sdk' },
-      client: { slot_id: String(opts?.slotId ?? this._slotId ?? '') },
+      client: {
+        slot_id: String(opts?.slotId ?? this._slotId ?? ''),
+        sdk_lang: AUN_SDK_LANG,
+        sdk_version: AUN_SDK_VERSION,
+      },
       delivery_mode: opts?.deliveryMode ?? { mode: 'fanout' },
       capabilities,
     };
@@ -1702,30 +1787,10 @@ export class AuthFlow {
   }
 
   /** 确保本地有密钥对（没有则生成） */
-  private async _ensureLocalIdentity(aid: string): Promise<IdentityRecord> {
-    const existing = await this._keystore.loadIdentity(aid);
-    // 必须确认有 keypair（private_key_pem + public_key_der_b64）才算"已存在"
-    // 否则 keystore 可能只有 metadata（如 gateway_url）但没有真正的密钥材料
-    if (existing && existing.private_key_pem && existing.public_key_der_b64) {
-      this._aid = aid;
-      return existing;
-    }
-    const identity = await this._crypto.generateIdentity() as IdentityRecord;
-    identity.aid = aid;
-    // 保留 keystore 已有的 metadata（如 gateway_url），避免覆盖
-    if (existing) {
-      for (const [k, v] of Object.entries(existing)) {
-        if (k !== 'aid' && !(k in identity)) {
-          (identity as Record<string, JsonValue | undefined>)[k] = v as JsonValue;
-        }
-      }
-    }
-    await this._persistIdentity(identity);  // 立即持久化 keypair，避免服务端拒绝后丢失
-    this._aid = aid;
-    return identity;
-  }
+  // （_ensureLocalIdentity 已移除：注册和登录彻底分离，
+  // 登录路径绝不再隐式生成密钥；新身份必须由应用层显式调 registerAid）
 
-  /** 加载身份，不存在时抛出异常 */
+  /** 加载身份，不存在或半成品时抛出异常 */
   private async _loadIdentityOrRaise(aid?: string): Promise<IdentityRecord> {
     const requestedAid = aid ?? this._aid;
     if (requestedAid) {
@@ -1733,27 +1798,21 @@ export class AuthFlow {
       if (!existing) {
         throw new StateError(`identity not found for aid: ${requestedAid}`);
       }
+      // 防线 A：拒绝半成品 identity（缺 keypair 任一字段）
+      if (!existing.private_key_pem || !existing.public_key_der_b64) {
+        throw new StateError(
+          `local identity for aid ${requestedAid} is incomplete (missing keypair); ` +
+          `call auth.registerAid() first`,
+        );
+      }
       this._aid = requestedAid;
       if (!existing.aid) existing.aid = requestedAid;
       return existing;
     }
-    throw new StateError('no local identity found, call auth.createAid() first');
+    throw new StateError('no local identity found, call auth.registerAid() first');
   }
 
-  /** 确保有身份（无则尝试生成） */
-  private async _ensureIdentity(): Promise<IdentityRecord> {
-    try {
-      return await this._loadIdentityOrRaise();
-    } catch {
-      if (!this._aid) {
-        throw new StateError('no local identity found, call auth.createAid() first');
-      }
-      const identity = await this._crypto.generateIdentity() as IdentityRecord;
-      identity.aid = this._aid;
-      await this._persistIdentity(identity);
-      return identity;
-    }
-  }
+  // （_ensureIdentity 已移除：注册和登录彻底分离）
 
   private async _loadInstanceState(aid: string): Promise<IdentityRecord | null> {
     if (typeof this._keystore.loadInstanceState !== 'function') {

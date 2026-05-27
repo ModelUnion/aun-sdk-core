@@ -101,7 +101,7 @@ def _fail(name: str, reason: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "main") -> None:
-    await client.auth.create_aid({"aid": aid})
+    await client.auth.register_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     await client.connect(auth, {"auto_reconnect": False, "heartbeat_interval": 30.0, "slot_id": slot_id})
 

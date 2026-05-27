@@ -185,7 +185,8 @@ func locateRecipientRow(envelope map[string]any, selfAID, selfDeviceID string) (
 			return nil, fmt.Errorf("decrypt: recipients_digest 不匹配（期望 %s，实际 %s）", expectedDigest, actualDigest)
 		}
 		for _, row := range rows {
-			if safe(row, 0) == selfAID && safe(row, 1) == selfDeviceID {
+			rowDeviceID := safe(row, 1)
+			if safe(row, 0) == selfAID && (rowDeviceID == selfDeviceID || rowDeviceID == "") {
 				return row, nil
 			}
 		}

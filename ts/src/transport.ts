@@ -17,6 +17,32 @@ import type { ModuleLogger } from './logger.js';
 import { isJsonObject, type JsonObject, type JsonValue, type RpcMessage, type RpcParams, type RpcResult } from './types.js';
 
 const MAX_WS_PAYLOAD_SIZE = 1_000_000;
+const MAX_RPC_INFLIGHT = 16;
+const MAX_BACKGROUND_RPC_INFLIGHT = 8;
+
+type PendingRpc = {
+  resolve: (value: RpcMessage) => void;
+  reject: (reason: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+type QueuedRpc = {
+  rpcId: string;
+  method: string;
+  payload: string;
+  pending: PendingRpc;
+  tStart: number;
+  timeoutMs: number;
+  background: boolean;
+};
+
+type PendingRpcMeta = {
+  method: string;
+  queuedAt: number;
+  pendingSince: number;
+  deadlineAt: number;
+  background: boolean;
+};
 
 const _noopLogger: ModuleLogger = {
   error: () => {},
@@ -262,11 +288,12 @@ export class RPCTransport {
   private _ws: WebSocket | null = null;
   private _closed = true;
   private _challenge: RpcMessage | null = null;
-  private _pending: Map<string, {
-    resolve: (value: RpcMessage) => void;
-    reject: (reason: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }> = new Map();
+  private _pending: Map<string, PendingRpc> = new Map();
+  private _pendingMeta: Map<string, PendingRpcMeta> = new Map();
+  private _pendingBackground: Set<string> = new Set();
+  private _rpcQueue: QueuedRpc[] = [];
+  private _backgroundRpcQueue: QueuedRpc[] = [];
+  private _drainingRpcQueue = false;
   private _idCounter = 0;
   // Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
   // observer 抛异常会被吞掉，不影响 RPC result 返回。
@@ -469,15 +496,28 @@ export class RPCTransport {
   async close(): Promise<void> {
     const tStart = Date.now();
     const pendingCount = this._pending.size;
-    this._logger.debug(`close enter: pending_rpc=${pendingCount}`);
+    const queuedCount = this._rpcQueue.length + this._backgroundRpcQueue.length;
+    this._logger.debug(`close enter: pending_rpc=${pendingCount}, queued_rpc=${queuedCount}, background_pending=${this._pendingBackground.size}`);
     this._closed = true;
     // 取消所有待处理的 RPC
-    for (const [id, pending] of this._pending) {
+    for (const [, pending] of this._pending) {
       clearTimeout(pending.timer);
       pending.reject(new ConnectionError('transport closed'));
     }
     this._pending.clear();
-    this._logger.debug(`close: cancelled ${pendingCount} pending rpc(s)`);
+    this._pendingMeta.clear();
+    this._pendingBackground.clear();
+    for (const queued of this._rpcQueue) {
+      clearTimeout(queued.pending.timer);
+      queued.pending.reject(new ConnectionError('transport closed'));
+    }
+    this._rpcQueue = [];
+    for (const queued of this._backgroundRpcQueue) {
+      clearTimeout(queued.pending.timer);
+      queued.pending.reject(new ConnectionError('transport closed'));
+    }
+    this._backgroundRpcQueue = [];
+    this._logger.debug(`close: cancelled ${pendingCount} pending rpc(s), ${queuedCount} queued rpc(s)`);
 
     if (this._ws) {
       const ws = this._ws;
@@ -489,24 +529,25 @@ export class RPCTransport {
       try { ws.removeAllListeners('error'); } catch { /* noop */ }
       return new Promise<void>((resolve) => {
         let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
         const finish = (): void => {
           if (settled) return;
           settled = true;
-          clearTimeout(timer);
+          if (timer !== null) clearTimeout(timer);
           try { ws.removeAllListeners(); } catch { /* noop */ }
           try { ws.terminate?.(); } catch { /* noop */ }
           this._logger.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
           resolve();
         };
         ws.on('close', finish);
+        // 超时强制解析，并在定时器触发时通过 terminate() 彻底清理残留 socket。
+        timer = setTimeout(finish, 3_000);
         try {
           ws.close();
         } catch {
           finish();
           return;
         }
-        // 超时强制解析，并在定时器触发时通过 terminate() 彻底清理残留 socket
-        const timer = setTimeout(finish, 3_000);
       });
     }
     this._logger.debug(`close exit: elapsed=${Date.now() - tStart}ms (no ws)`);
@@ -520,6 +561,7 @@ export class RPCTransport {
     params?: RpcParams,
     timeout?: number,
     trace?: string,
+    background = false,
   ): Promise<RpcResult> {
     if (this._closed || !this._ws) {
       throw new ConnectionError('transport not connected');
@@ -532,26 +574,41 @@ export class RPCTransport {
     // 注入 _trace（会话级或调用级 mode 非 off 时）
     const effectiveTraceMode = (trace === 'off' || trace === 'log' || trace === 'diag') ? trace : this._traceMode;
     let traceId = '';
-    let sendParams = params ?? {};
+    const sendParams = { ...(params ?? {}) } as RpcParams;
+    const localParams = sendParams as Record<string, unknown>;
+    const backgroundRpc = background || localParams._rpc_background === true;
+    delete localParams._rpc_background;
     if (effectiveTraceMode !== 'off') {
       traceId = crypto.randomBytes(16).toString('hex');
-      sendParams = { ...(params ?? {}) };
       const tracePayload: Record<string, unknown> = { trace_id: traceId, mode: effectiveTraceMode };
       if (effectiveTraceMode === 'diag') {
         tracePayload.spans = [{ node: 'sdk', ts: tStart, action: 'send' }];
       }
-      (sendParams as Record<string, unknown>)._trace = tracePayload;
+      localParams._trace = tracePayload;
       this._logger.info(`[trace=${traceId}] rpc_send method=${method} rpc_id=${rpcId}`);
+    }
+
+    const payload = JSON.stringify({
+      jsonrpc: '2.0',
+      id: rpcId,
+      method,
+      params: sendParams,
+    });
+
+    const payloadSize = new TextEncoder().encode(payload).length;
+    if (payloadSize > MAX_WS_PAYLOAD_SIZE) {
+      throw new ValidationError('payload is too large');
     }
 
     return new Promise<RpcResult>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this._pending.delete(rpcId);
+        this._removeRpc(rpcId, pending);
         this._logger.warn(`RPC timeout: method=${method}, id=${rpcId}, elapsed=${Date.now() - tStart}ms, timeout=${effectiveTimeout}ms`);
         reject(new TimeoutError(`rpc timeout: ${method}`, { retryable: true }));
+        this._drainRpcQueue();
       }, effectiveTimeout);
 
-      this._pending.set(rpcId, {
+      const pending: PendingRpc = {
         resolve: (response) => {
           clearTimeout(timer);
           const elapsed = Date.now() - tStart;
@@ -598,36 +655,96 @@ export class RPCTransport {
           reject(err);
         },
         timer,
-      });
+      };
 
-      const payload = JSON.stringify({
-        jsonrpc: '2.0',
-        id: rpcId,
+      this._rpcQueue.push({
+        rpcId,
         method,
-        params: sendParams,
+        payload,
+        pending,
+        tStart,
+        timeoutMs: effectiveTimeout,
+        background: backgroundRpc,
       });
-
-      const payloadSize = new TextEncoder().encode(payload).length;
-      if (payloadSize > MAX_WS_PAYLOAD_SIZE) {
-        this._pending.delete(rpcId);
-        clearTimeout(timer);
-        throw new ValidationError('payload is too large');
+      if (backgroundRpc) {
+        this._rpcQueue.pop();
+        this._backgroundRpcQueue.push({
+          rpcId,
+          method,
+          payload,
+          pending,
+          tStart,
+          timeoutMs: effectiveTimeout,
+          background: true,
+        });
       }
-
-      try {
-        this._ws!.send(payload);
-        this._logger.debug(`RPC request sent: method=${method}, id=${rpcId} ${summarizeDict(sendParams, DIAG_PARAM_FIELDS)}`);
-      } catch (err) {
-        this._pending.delete(rpcId);
-        clearTimeout(timer);
-        this._logger.error(`RPC send failed: method=${method}, id=${rpcId}, error=${err instanceof Error ? err.message : String(err)}`);
-        reject(
-          new ConnectionError(
-            `failed to send rpc ${method}: ${err instanceof Error ? err.message : String(err)}`,
-          ),
-        );
-      }
+      this._drainRpcQueue();
     });
+  }
+
+  private _removeRpc(rpcId: string, pending?: PendingRpc): void {
+    const current = this._pending.get(rpcId);
+    if (current && (!pending || current === pending)) {
+      this._pending.delete(rpcId);
+      this._pendingMeta.delete(rpcId);
+      this._pendingBackground.delete(rpcId);
+    }
+    if (this._rpcQueue.length > 0) {
+      this._rpcQueue = this._rpcQueue.filter((entry) => entry.rpcId !== rpcId || (pending !== undefined && entry.pending !== pending));
+    }
+    if (this._backgroundRpcQueue.length > 0) {
+      this._backgroundRpcQueue = this._backgroundRpcQueue.filter((entry) => entry.rpcId !== rpcId || (pending !== undefined && entry.pending !== pending));
+    }
+  }
+
+  private _drainRpcQueue(): void {
+    if (this._drainingRpcQueue) return;
+    this._drainingRpcQueue = true;
+    try {
+      while (!this._closed && this._ws && this._pending.size < MAX_RPC_INFLIGHT) {
+        let entry: QueuedRpc | undefined;
+        if (this._rpcQueue.length > 0) {
+          entry = this._rpcQueue.shift()!;
+        } else if (this._backgroundRpcQueue.length > 0 && this._pendingBackground.size < MAX_BACKGROUND_RPC_INFLIGHT) {
+          entry = this._backgroundRpcQueue.shift()!;
+        } else {
+          break;
+        }
+        const elapsed = Date.now() - entry.tStart;
+        if (elapsed >= entry.timeoutMs) {
+          clearTimeout(entry.pending.timer);
+          this._logger.warn(`RPC queue timeout: method=${entry.method}, id=${entry.rpcId}, elapsed=${elapsed}ms, timeout=${entry.timeoutMs}ms`);
+          entry.pending.reject(new TimeoutError(`rpc timeout before send: ${entry.method}`, { retryable: true }));
+          continue;
+        }
+
+        this._pending.set(entry.rpcId, entry.pending);
+        this._pendingMeta.set(entry.rpcId, {
+          method: entry.method,
+          queuedAt: entry.tStart,
+          pendingSince: Date.now(),
+          deadlineAt: entry.tStart + entry.timeoutMs,
+          background: entry.background,
+        });
+        if (entry.background) {
+          this._pendingBackground.add(entry.rpcId);
+        }
+        try {
+          this._ws.send(entry.payload);
+          this._logger.debug(`RPC request sent: method=${entry.method}, id=${entry.rpcId}, background=${entry.background}`);
+        } catch (err) {
+          this._removeRpc(entry.rpcId, entry.pending);
+          this._logger.error(`RPC send failed: method=${entry.method}, id=${entry.rpcId}, error=${err instanceof Error ? err.message : String(err)}`);
+          entry.pending.reject(
+            new ConnectionError(
+              `failed to send rpc ${entry.method}: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
+        }
+      }
+    } finally {
+      this._drainingRpcQueue = false;
+    }
   }
 
   /** 处理 RPC 响应中的 _trace 字段：追加 sdk.recv span，格式化输出，通知 observer */
@@ -673,6 +790,24 @@ export class RPCTransport {
       const wasClosed = this._closed;
       this._closed = true;
       this._logger.debug(`WebSocket closed: code=${code}, intentional close=${wasClosed}`);
+      const err = new ConnectionError(`websocket closed: code=${code}`);
+      for (const [, pending] of this._pending) {
+        clearTimeout(pending.timer);
+        pending.reject(err);
+      }
+      this._pending.clear();
+      this._pendingMeta.clear();
+      this._pendingBackground.clear();
+      for (const queued of this._rpcQueue) {
+        clearTimeout(queued.pending.timer);
+        queued.pending.reject(err);
+      }
+      this._rpcQueue = [];
+      for (const queued of this._backgroundRpcQueue) {
+        clearTimeout(queued.pending.timer);
+        queued.pending.reject(err);
+      }
+      this._backgroundRpcQueue = [];
       if (!wasClosed && this._onDisconnect) {
         const cb = this._onDisconnect;
         Promise.resolve(cb(null, code)).catch(() => this._logger.warn('disconnect callback error'));
@@ -699,7 +834,10 @@ export class RPCTransport {
       const pending = this._pending.get(rpcId);
       if (pending) {
         this._pending.delete(rpcId);
+        this._pendingMeta.delete(rpcId);
+        this._pendingBackground.delete(rpcId);
         pending.resolve(message);
+        this._drainRpcQueue();
       }
       return;
     }

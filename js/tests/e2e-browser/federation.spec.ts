@@ -132,7 +132,7 @@ async function installFederationHelpers(page: any): Promise<void> {
       const gateway = gatewayForIssuer(issuer);
       client.gatewayUrl = gateway;
       try {
-        await client.auth.createAid({ aid });
+        await client.auth.registerAid({ aid });
       } catch {
         // 已存在则忽略
       }

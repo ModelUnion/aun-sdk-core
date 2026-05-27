@@ -375,7 +375,10 @@ func (c *AUNClient) v2AutoProposeLeaderDelay(ctx context.Context, groupID string
 		return false
 	}
 
-	bootstrapResp, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{"group_id": groupID})
+	bootstrapResp, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{
+		"group_id":               groupID,
+		"e2ee_wrap_capabilities": v2WrapCapabilities(),
+	})
 	if err != nil {
 		c.logE2.Debug("V2 auto propose leader bootstrap failed, fallback immediate: group=%s err=%v", groupID, err)
 		return true
@@ -520,7 +523,10 @@ func (c *AUNClient) v2AutoProposeStateLocked(ctx context.Context, groupID string
 	}
 
 	// 获取群所有成员的设备列表（V2 bootstrap）
-	bootstrapResp, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{"group_id": groupID})
+	bootstrapResp, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{
+		"group_id":               groupID,
+		"e2ee_wrap_capabilities": v2WrapCapabilities(),
+	})
 	if err != nil {
 		c.logE2.Debug("V2 auto propose_state failed (non-fatal): group=%s err=%v", groupID, err)
 		return

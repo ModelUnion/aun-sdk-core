@@ -119,21 +119,21 @@ class TestP0_02_AIDCreationValidation:
         """空 AID 应抛出错误"""
         client = AUNClient()
         with pytest.raises((ValueError, ValidationError)):
-            await client.auth.create_aid({"aid": ""})
+            await client.auth.register_aid({"aid": ""})
 
     @pytest.mark.asyncio
     async def test_empty_aid_error_message(self):
         """空 AID 错误消息应包含 'aid'"""
         client = AUNClient()
         with pytest.raises((ValueError, ValidationError), match="aid"):
-            await client.auth.create_aid({"aid": ""})
+            await client.auth.register_aid({"aid": ""})
 
     @pytest.mark.asyncio
     async def test_missing_aid_field_raises_error(self):
         """不传 aid 字段应抛出错误"""
         client = AUNClient()
         with pytest.raises((ValueError, ValidationError)):
-            await client.auth.create_aid({})
+            await client.auth.register_aid({})
 
     @pytest.mark.asyncio
     async def test_aid_too_short_rejected(self, tmp_path):
@@ -141,7 +141,7 @@ class TestP0_02_AIDCreationValidation:
         client = AUNClient({"aun_path": str(tmp_path / "aun-test")})
         client._gateway_url = "wss://localhost:9999"
         with pytest.raises((ValidationError, Exception)):
-            await client.auth.create_aid({"aid": "ab"})
+            await client.auth.register_aid({"aid": "ab"})
 
     @pytest.mark.asyncio
     async def test_aid_uppercase_rejected(self, tmp_path):
@@ -149,7 +149,7 @@ class TestP0_02_AIDCreationValidation:
         client = AUNClient({"aun_path": str(tmp_path / "aun-test")})
         client._gateway_url = "wss://localhost:9999"
         with pytest.raises((ValidationError, Exception)):
-            await client.auth.create_aid({"aid": "Alice.aid.com"})
+            await client.auth.register_aid({"aid": "Alice.aid.com"})
 
     @pytest.mark.asyncio
     async def test_aid_starts_with_dash_rejected(self, tmp_path):
@@ -157,7 +157,7 @@ class TestP0_02_AIDCreationValidation:
         client = AUNClient({"aun_path": str(tmp_path / "aun-test")})
         client._gateway_url = "wss://localhost:9999"
         with pytest.raises((ValidationError, Exception)):
-            await client.auth.create_aid({"aid": "-bad.aid.com"})
+            await client.auth.register_aid({"aid": "-bad.aid.com"})
 
     @pytest.mark.asyncio
     async def test_aid_guest_prefix_rejected(self, tmp_path):
@@ -165,4 +165,4 @@ class TestP0_02_AIDCreationValidation:
         client = AUNClient({"aun_path": str(tmp_path / "aun-test")})
         client._gateway_url = "wss://localhost:9999"
         with pytest.raises((ValidationError, Exception)):
-            await client.auth.create_aid({"aid": "guestuser.aid.com"})
+            await client.auth.register_aid({"aid": "guestuser.aid.com"})

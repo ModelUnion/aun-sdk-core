@@ -142,18 +142,82 @@ describe('FileSecretStore', () => {
     expect(revealed).toBeNull();
   });
 
-  it('不提供 seed 时自动生成 .seed 文件', () => {
+  it('不提供 seed 时使用空字符串派生 master_key，不再自动生成 .seed 文件', () => {
     const store = new FileSecretStore(tmpDir);
     const seedPath = join(tmpDir, '.seed');
-    expect(existsSync(seedPath)).toBe(true);
+    expect(existsSync(seedPath)).toBe(false);
 
-    // 同一目录再次创建应复用同一个 seed
+    // 同一目录再次创建（同样空 seed_password）应派生相同 master_key
     const plaintext = Buffer.from('auto-seed', 'utf-8');
     const record = store.protect('scope', 'key', plaintext);
 
     const store2 = new FileSecretStore(tmpDir);
     const revealed = store2.reveal('scope', 'key', record);
     expect(revealed!.toString('utf-8')).toBe('auto-seed');
+  });
+
+  it('ChangeSeed 严格验证私钥后迁移 .seed', () => {
+    const oldStore = new FileSecretStore(tmpDir, 'old-seed');
+    const aid = 'good.agentid.pub';
+    const keyDir = join(tmpDir, 'AIDs', aid, 'private');
+    mkdirSync(keyDir, { recursive: true });
+    writeFileSync(
+      join(keyDir, 'key.json'),
+      JSON.stringify({ private_key_protection: oldStore.protect(aid, 'identity/private_key', Buffer.from('GOOD_PRIVATE')) }),
+      'utf-8',
+    );
+    writeFileSync(join(tmpDir, '.seed'), 'old-seed');
+
+    const result = FileSecretStore.changeSeed(tmpDir, '.seed', '');
+    expect(result.privateKeysMigrated).toBe(1);
+    expect(existsSync(join(tmpDir, '.seed'))).toBe(false);
+
+    const migratedStore = new FileSecretStore(tmpDir, '');
+    const protection = JSON.parse(readFileSync(join(keyDir, 'key.json'), 'utf-8')).private_key_protection;
+    expect(migratedStore.reveal(aid, 'identity/private_key', protection)!.toString('utf-8')).toBe('GOOD_PRIVATE');
+  });
+
+  it('自动迁移严格验证失败时继续使用旧 .seed', () => {
+    const oldStore = new FileSecretStore(tmpDir, 'old-seed');
+    const otherStore = new FileSecretStore(tmpDir, 'other-seed');
+
+    const cases = [
+      {
+        aid: 'good.agentid.pub',
+        record: oldStore.protect('good.agentid.pub', 'identity/private_key', Buffer.from('GOOD_PRIVATE')),
+      },
+      {
+        aid: 'wrong-name.agentid.pub',
+        record: oldStore.protect('wrong-name.agentid.pub', 'other/private_key', Buffer.from('WRONG_NAME')),
+      },
+      {
+        aid: 'wrong-seed.agentid.pub',
+        record: otherStore.protect('wrong-seed.agentid.pub', 'identity/private_key', Buffer.from('WRONG_SEED')),
+      },
+    ];
+    for (const item of cases) {
+      const keyDir = join(tmpDir, 'AIDs', item.aid, 'private');
+      mkdirSync(keyDir, { recursive: true });
+      writeFileSync(join(keyDir, 'key.json'), JSON.stringify({ private_key_protection: item.record }), 'utf-8');
+    }
+    writeFileSync(join(tmpDir, '.seed'), 'old-seed');
+
+    const migratedStore = new FileSecretStore(tmpDir, '');
+    expect(existsSync(join(tmpDir, '.seed'))).toBe(true);
+
+    const readProtection = (aid: string) => JSON.parse(
+      readFileSync(join(tmpDir, 'AIDs', aid, 'private', 'key.json'), 'utf-8'),
+    ).private_key_protection;
+
+    const good = readProtection('good.agentid.pub');
+    expect(migratedStore.reveal('good.agentid.pub', 'identity/private_key', good)!.toString('utf-8')).toBe('GOOD_PRIVATE');
+
+    const wrongName = readProtection('wrong-name.agentid.pub');
+    expect(oldStore.reveal('wrong-name.agentid.pub', 'other/private_key', wrongName)!.toString('utf-8')).toBe('WRONG_NAME');
+
+    const wrongSeed = readProtection('wrong-seed.agentid.pub');
+    expect(migratedStore.reveal('wrong-seed.agentid.pub', 'identity/private_key', wrongSeed)).toBeNull();
+    expect(otherStore.reveal('wrong-seed.agentid.pub', 'identity/private_key', wrongSeed)!.toString('utf-8')).toBe('WRONG_SEED');
   });
 
 });

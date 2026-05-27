@@ -106,7 +106,7 @@ async def main():
         client = AUNClient({"aun_path": _TEST_AUN_PATH}, debug=False)
         client._config_model.require_forward_secrecy = False
         try:
-            await client.auth.create_aid({"aid": _ALICE_AID})
+            await client.auth.register_aid({"aid": _ALICE_AID})
             auth = await client.auth.authenticate({"aid": _ALICE_AID})
             connect_params = dict(auth)
             connect_params["verify_ssl"] = False

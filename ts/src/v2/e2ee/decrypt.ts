@@ -203,7 +203,7 @@ function computeWrapKey(
 
 function findMyRow(rows: string[][], aid: string, deviceId: string): string[] | null {
   for (const r of rows) {
-    if (r[0] === aid && r[1] === deviceId) return r;
+    if (r[0] === aid && (r[1] === deviceId || r[1] === '')) return r;
   }
   return null;
 }

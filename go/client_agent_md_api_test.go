@@ -104,17 +104,29 @@ func waitAgentMDFetchesIdle(t *testing.T, c *AUNClient) {
 }
 func readAgentMDListRecords(t *testing.T, c *AUNClient) map[string]map[string]any {
 	t.Helper()
-	data, err := os.ReadFile(c.agentMDListPath())
+	// 读取所有 per-AID agentmd.json 文件，模拟旧 list.json 的 records 结构
+	result := make(map[string]map[string]any)
+	entries, err := os.ReadDir(c.agentMDRoot())
 	if err != nil {
-		t.Fatal(err)
+		return result
 	}
-	var payload struct {
-		Records map[string]map[string]any `json:"records"`
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		aid := entry.Name()
+		metaPath := filepath.Join(c.agentMDRoot(), aid, "agentmd.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatalf("failed to parse agentmd.json for %s: %v", aid, err)
+		}
+		result[aid] = m
 	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		t.Fatal(err)
-	}
-	return payload.Records
+	return result
 }
 
 func TestAgentMDPathDefaultAndSet(t *testing.T) {
@@ -396,25 +408,18 @@ func TestCheckAgentMDUsesFreshCachedMatchWithoutHead(t *testing.T) {
 	}
 }
 
-func TestDamagedListJSONRebuildsFromDiskAndInvalidatesMemory(t *testing.T) {
+func TestDamagedAgentMDJsonReturnsNil(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	body := "# Alice\n"
 	writeAgentMDFile(t, c, "alice.agentid.pub", body)
-	c.agentMDCache["alice.agentid.pub"] = &keystore.AgentMDCacheRecord{AID: "alice.agentid.pub", RemoteEtag: "\"cloud\""}
-	c.agentMDCache["bob.agentid.pub"] = &keystore.AgentMDCacheRecord{AID: "bob.agentid.pub", RemoteEtag: "\"stale\""}
-	if err := os.WriteFile(c.agentMDListPath(), []byte("{bad json"), 0o644); err != nil {
+	// 写入损坏的 agentmd.json
+	metaPath := filepath.Join(c.agentMDRoot(), "alice.agentid.pub", "agentmd.json")
+	if err := os.WriteFile(metaPath, []byte("{bad json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	rec := c.loadAgentMDRecord("alice.agentid.pub")
-	if rec == nil || rec.Content != body || rec.LocalEtag != agentMDContentEtag(body) || rec.RemoteEtag != "" {
-		t.Fatalf("bad rebuilt record: %#v", rec)
-	}
-	rebuilt := readAgentMDListRecords(t, c)["alice.agentid.pub"]
-	if rebuilt["local_etag"] != agentMDContentEtag(body) {
-		t.Fatalf("bad rebuilt list: %#v", rebuilt)
-	}
-	if _, ok := c.agentMDCache["bob.agentid.pub"]; ok {
-		t.Fatalf("stale bob cache should be invalidated")
+	if rec != nil {
+		t.Fatalf("expected nil for damaged agentmd.json, got: %#v", rec)
 	}
 }

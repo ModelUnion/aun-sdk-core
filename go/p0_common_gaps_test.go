@@ -135,7 +135,7 @@ func TestP0_02_CreateAIDEmptyString(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	_, err := c.AuthCreateAID(context.Background(), "ws://localhost:9999", "")
+	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "")
 	if err == nil {
 		t.Fatal("空字符串 AID 应返回错误")
 	}
@@ -150,7 +150,7 @@ func TestP0_02_CreateAIDTooShort(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	_, err := c.AuthCreateAID(context.Background(), "ws://localhost:9999", "ab")
+	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "ab")
 	if err == nil {
 		t.Fatal("过短 AID（少于 4 字符）应返回错误")
 	}
@@ -165,7 +165,7 @@ func TestP0_02_CreateAIDInvalidChars(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	_, err := c.AuthCreateAID(context.Background(), "ws://localhost:9999", "Test_AID!")
+	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "Test_AID!")
 	if err == nil {
 		t.Fatal("含大写字母和特殊字符的 AID 应返回错误")
 	}
@@ -180,7 +180,7 @@ func TestP0_02_CreateAIDGuestPrefix(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	_, err := c.AuthCreateAID(context.Background(), "ws://localhost:9999", "guest_user")
+	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "guest_user")
 	if err == nil {
 		t.Fatal("以 guest 开头的 AID 应返回错误")
 	}
@@ -195,7 +195,7 @@ func TestP0_02_CreateAIDStartsWithDash(t *testing.T) {
 	c := NewClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	_, err := c.AuthCreateAID(context.Background(), "ws://localhost:9999", "-invalid_aid")
+	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "-invalid_aid")
 	if err == nil {
 		t.Fatal("以 - 开头的 AID 应返回错误")
 	}
@@ -211,7 +211,7 @@ func TestP0_02_CreateAIDValidFormat(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	// 用一个无法连接的地址，合法 AID 应通过本地校验，失败在网络层
-	_, err := c.AuthCreateAID(context.Background(), "ws://192.0.2.1:1", "valid_test_aid")
+	_, err := c.AuthRegisterAID(context.Background(), "ws://192.0.2.1:1", "valid_test_aid")
 	if err == nil {
 		// 没有真实服务器，应该还是会出错
 		return

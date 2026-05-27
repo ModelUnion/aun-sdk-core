@@ -91,7 +91,7 @@ async def test_first_authenticate_persists_token_and_gateway() -> bool:
 
     client = _make_client(path)
     try:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
         result = await client.auth.authenticate({"aid": aid})
 
         if not result.get("access_token"):
@@ -132,7 +132,7 @@ async def test_second_authenticate_reuses_cached_no_network() -> bool:
     # 第一次：完整流程
     client1 = _make_client(path)
     try:
-        await client1.auth.create_aid({"aid": aid})
+        await client1.auth.register_aid({"aid": aid})
         first = await client1.auth.authenticate({"aid": aid})
         first_token = first.get("access_token")
         first_gw = first.get("gateway")
@@ -200,7 +200,7 @@ async def test_reused_cached_can_connect_and_rpc() -> bool:
     # 第一次创建 + authenticate
     client1 = _make_client(path)
     try:
-        await client1.auth.create_aid({"aid": aid})
+        await client1.auth.register_aid({"aid": aid})
         await client1.auth.authenticate({"aid": aid})
     finally:
         await client1.close()
@@ -238,7 +238,7 @@ async def test_expired_cached_falls_back_to_login() -> bool:
     # 第一次完整 authenticate
     client1 = _make_client(path)
     try:
-        await client1.auth.create_aid({"aid": aid})
+        await client1.auth.register_aid({"aid": aid})
         first = await client1.auth.authenticate({"aid": aid})
         first_token = first.get("access_token")
     finally:

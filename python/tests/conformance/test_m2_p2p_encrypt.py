@@ -222,7 +222,8 @@ class TestEncryptP2P:
         assert envelope["payload_type"] == "text"
         assert envelope["protected_headers"]["payload_type"] == "text"
         assert envelope["protected_headers"]["sdk_lang"] == "python"
-        assert envelope["protected_headers"]["sdk_vesion"] == AUN_SDK_VERSION
+        assert envelope["protected_headers"]["sdk_version"] == AUN_SDK_VERSION
+        assert "sdk_vesion" not in envelope["protected_headers"]
 
     def test_sdk_metadata_is_injected_without_payload_type(self):
         """即使原始 payload 没有 type，protected_headers 也应携带 SDK 元信息。"""
@@ -235,7 +236,7 @@ class TestEncryptP2P:
 
         assert "payload_type" not in envelope
         assert envelope["protected_headers"]["sdk_lang"] == "python"
-        assert envelope["protected_headers"]["sdk_vesion"] == AUN_SDK_VERSION
+        assert envelope["protected_headers"]["sdk_version"] == AUN_SDK_VERSION
 # ══════════════════════════════════════════════════════════════
 # 2. 完整 envelope 解密
 # ══════════════════════════════════════════════════════════════
@@ -349,7 +350,7 @@ class TestDecryptP2P:
         assert headers["empty"] == ""
         assert headers["nested"] == '{"a":1,"b":2}'
         assert headers["sdk_lang"] == "python"
-        assert headers["sdk_vesion"] == AUN_SDK_VERSION
+        assert headers["sdk_version"] == AUN_SDK_VERSION
 
     def test_tampered_protected_headers_fails_auth(self):
         target_set = make_target_set_single_device()

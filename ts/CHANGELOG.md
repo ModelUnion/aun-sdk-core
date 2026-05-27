@@ -6,6 +6,27 @@
 
 ---
 
+## 0.3.4 — 2026-05-28
+
+### Breaking Changes
+- **`createAid()` 兼容别名移除**：仅保留 `registerAid()`，旧 `createAid` 已删除
+- **注册与认证分离**：`authenticate()` 不再隐式注册；身份不完整时抛 `StateError`
+
+### Added
+- **`IdentityConflictError`**：新增错误类型（继承 `AuthError`），AID 注册冲突时抛出
+
+### Changed
+- **`registerAid` 半成品恢复**：本地有 keypair 无 cert 时，查服务端恢复；服务端无记录则用现有 keypair 注册（不再直接拒绝）
+- **agent.md 下载**：改为无条件 GET（移除条件头）；304 时本地有缓存直接用，无缓存重试
+- **错误消息**：所有 `createAid` 引用更新为 `registerAid`
+- **`.seed` fallback 迁移**：`FileSecretStore` 启动时检测旧 `.seed` 文件，自动迁移到 `seed_password` 派生方式
+- **`ChangeSeed` API**：`FileKeyStore.ChangeSeed()` / `FileKeyStore.changeSeed()` 支持运行时更换 seed
+
+### Removed
+- **`namespaces/auth.ts` 中 `createAid` 兼容别名**
+
+---
+
 ## 0.3.3 — 2026-05-25
 
 ### Added

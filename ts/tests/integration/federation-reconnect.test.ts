@@ -31,7 +31,7 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
-      await client.auth.createAid({ aid });
+      await client.auth.registerAid({ aid });
       const auth = await client.auth.authenticate({ aid });
       await client.connect(auth, {
         auto_reconnect: true,

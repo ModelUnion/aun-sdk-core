@@ -55,7 +55,7 @@ async function resolveGatewayInto(client: AUNClient): Promise<void> {
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
   await resolveGatewayInto(client);
   try {
-    await client.auth.createAid({ aid });
+    await client.auth.registerAid({ aid });
   } catch (err) {
     if (!/exists|already/i.test(String(err))) throw err;
   }

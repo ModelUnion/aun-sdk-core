@@ -32,6 +32,10 @@ class AuthError(AUNError):
     pass
 
 
+class IdentityConflictError(AuthError):
+    pass
+
+
 class PermissionError(AUNError):
     pass
 

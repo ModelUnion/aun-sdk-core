@@ -43,7 +43,7 @@ function makeClient(): AUNClient {
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
   const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
   ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect({ ...auth, auto_reconnect: false });
   await client.initV2Session();

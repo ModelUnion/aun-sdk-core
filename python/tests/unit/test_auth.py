@@ -406,7 +406,11 @@ def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
     assert calls[0][0] == "auth.connect"
     params = calls[0][1]
     assert params["device"] == {"id": "device-1", "type": "sdk"}
-    assert params["client"] == {"slot_id": "slot-a"}
+    assert params["client"] == {
+        "slot_id": "slot-a",
+        "sdk_lang": "python",
+        "sdk_version": "0.3.4",
+    }
     assert params["delivery_mode"] == {"mode": "queue", "routing": "sender_affinity", "affinity_ttl_ms": 800}
 
 
@@ -592,4 +596,3 @@ def test_new_cert_rejected_key_mismatch():
     }
     asyncio.run(flow._validate_new_cert(identity))
     assert "cert" not in identity  # 被拒绝
-

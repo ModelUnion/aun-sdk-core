@@ -13,6 +13,24 @@ import { isJsonObject, type JsonObject, type JsonValue, type RpcMessage, type Rp
 
 
 const MAX_WS_PAYLOAD_SIZE = 1_000_000;
+const MAX_RPC_INFLIGHT = 16;
+const MAX_BACKGROUND_RPC_INFLIGHT = 8;
+
+type PendingRpc = {
+  resolve: (value: RpcMessage) => void;
+  reject: (reason: Error) => void;
+  timer: ReturnType<typeof globalThis.setTimeout>;
+};
+
+type QueuedRpc = {
+  rpcId: string;
+  method: string;
+  payload: string;
+  pending: PendingRpc;
+  tStart: number;
+  timeoutMs: number;
+  background: boolean;
+};
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
@@ -253,10 +271,11 @@ export class RPCTransport {
   private _ws: WebSocket | null = null;
   private _closed = true;
   private _challenge: RpcMessage | null = null;
-  private _pending: Map<string, {
-    resolve: (value: RpcMessage) => void;
-    reject: (error: Error) => void;
-  }> = new Map();
+  private _pending: Map<string, PendingRpc> = new Map();
+  private _pendingBackground: Set<string> = new Set();
+  private _rpcQueue: QueuedRpc[] = [];
+  private _backgroundRpcQueue: QueuedRpc[] = [];
+  private _drainingRpcQueue = false;
   // Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
   // 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
   private _metaObserver: ((meta: JsonObject) => void) | null = null;
@@ -378,7 +397,8 @@ export class RPCTransport {
   async close(): Promise<void> {
     const tStart = Date.now();
     const pendingCount = this._pending.size;
-    this._log.debug(`close enter: pending_rpc=${pendingCount}`);
+    const queuedCount = this._rpcQueue.length + this._backgroundRpcQueue.length;
+    this._log.debug(`close enter: pending_rpc=${pendingCount}, queued_rpc=${queuedCount}, background_pending=${this._pendingBackground.size}`);
     this._closed = true;
     if (this._ws) {
       try {
@@ -394,10 +414,22 @@ export class RPCTransport {
 
     // 拒绝所有待处理的 RPC 调用
     for (const [, pending] of this._pending) {
+      clearTimeout(pending.timer);
       pending.reject(new ConnectionError('transport closed'));
     }
     this._pending.clear();
-    this._log.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
+    this._pendingBackground.clear();
+    for (const queued of this._rpcQueue) {
+      clearTimeout(queued.pending.timer);
+      queued.pending.reject(new ConnectionError('transport closed'));
+    }
+    this._rpcQueue = [];
+    for (const queued of this._backgroundRpcQueue) {
+      clearTimeout(queued.pending.timer);
+      queued.pending.reject(new ConnectionError('transport closed'));
+    }
+    this._backgroundRpcQueue = [];
+    this._log.debug(`close exit: elapsed=${Date.now() - tStart}ms, cancelled ${pendingCount} pending, ${queuedCount} queued`);
   }
 
   /**
@@ -409,6 +441,7 @@ export class RPCTransport {
     params?: RpcParams | null,
     timeout?: number,
     trace?: string,
+    background = false,
   ): Promise<RpcResult> {
     if (this._closed || !this._ws) {
       throw new ConnectionError('transport not connected');
@@ -422,26 +455,23 @@ export class RPCTransport {
     // 注入 _trace（会话级或调用级 mode 非 off 时）
     const effectiveTraceMode = (trace === 'off' || trace === 'log' || trace === 'diag') ? trace : this._traceMode;
     let traceId = '';
-    let sendParams = params ?? {};
+    const sendParams = { ...(params ?? {}) } as RpcParams;
+    const localParams = sendParams as Record<string, unknown>;
+    const backgroundRpc = background || localParams._rpc_background === true;
+    delete localParams._rpc_background;
     if (effectiveTraceMode !== 'off') {
       // 浏览器环境使用 crypto.randomUUID 或 Math.random 生成 trace_id
       traceId = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID().replace(/-/g, '')
         : Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-      sendParams = { ...(params ?? {}) };
       const tracePayload: Record<string, unknown> = { trace_id: traceId, mode: effectiveTraceMode };
       if (effectiveTraceMode === 'diag') {
         tracePayload.spans = [{ node: 'sdk', ts: tStart, action: 'send' }];
       }
-      (sendParams as Record<string, unknown>)._trace = tracePayload;
+      localParams._trace = tracePayload;
       this._log.info(`[trace=${traceId}] rpc_send method=${method} rpc_id=${rpcId}`);
     }
 
-    const promise = new Promise<RpcMessage>((resolve, reject) => {
-      this._pending.set(rpcId, { resolve, reject });
-    });
-
-    // 发送请求
     const payload = JSON.stringify({
       jsonrpc: '2.0',
       id: rpcId,
@@ -451,73 +481,133 @@ export class RPCTransport {
 
     const payloadSize = new TextEncoder().encode(payload).length;
     if (payloadSize > MAX_WS_PAYLOAD_SIZE) {
-      this._pending.delete(rpcId);
       throw new ValidationError('payload is too large');
     }
 
-    try {
-      this._ws.send(payload);
-      this._log.debug(`RPC request sent: method=${method}, id=${rpcId} ${summarizeDict(sendParams, DIAG_PARAM_FIELDS)}`);
-    } catch (exc) {
-      this._pending.delete(rpcId);
-      this._log.error(`RPC send failed: method=${method}, id=${rpcId}, error=${String(exc)}`, exc instanceof Error ? exc : undefined);
-      throw new ConnectionError(`failed to send rpc ${method}: ${exc}`);
-    }
-
-    // 超时控制（H23 修复：成功路径必须 clearTimeout，避免定时器泄漏 + 慢响应被静默丢弃）
-    let timeoutHandle: ReturnType<typeof globalThis.setTimeout> | null = null;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutHandle = globalThis.setTimeout(() => {
-        this._pending.delete(rpcId);
+    return new Promise<RpcResult>((resolve, reject) => {
+      const timer = globalThis.setTimeout(() => {
+        this._removeRpc(rpcId, pending);
         this._log.warn(`RPC timeout: method=${method}, id=${rpcId}, elapsed=${Date.now() - tStart}ms, timeout=${effectiveTimeout}ms`);
         reject(new TimeoutError(`rpc timeout: ${method}`, { retryable: true }));
+        this._drainRpcQueue();
       }, effectiveTimeout);
-    });
 
-    try {
-      const response = await Promise.race([promise, timeoutPromise]);
-
-      const elapsed = Date.now() - tStart;
-      if (response.error !== undefined) {
-        this._log.debug(`RPC error response: method=${method}, id=${rpcId}, elapsed=${elapsed}ms, error=${JSON.stringify(response.error)}`);
-        if (traceId) {
-          this._log.info(`[trace=${traceId}] rpc_recv method=${method} rpc_id=${rpcId} duration_ms=${elapsed} status=error`);
-        }
-        // 处理 error 路径的 _trace
-        const respTrace = (response as Record<string, unknown>)._trace;
-        if (respTrace && typeof respTrace === 'object' && !Array.isArray(respTrace)) {
-          this._handleResponseTrace(method, 'error', elapsed, respTrace as Record<string, unknown>);
-        }
-        throw mapRemoteError(response.error);
-      }
-      if (response.result === undefined) {
-        throw new SerializationError(`rpc response missing result and error: ${method}`);
-      }
-      this._log.debug(`RPC response ok: method=${method}, id=${rpcId}, elapsed=${elapsed}ms ${summarizeDict(response.result, DIAG_RESULT_FIELDS)}`);
-      if (traceId) {
-        this._log.info(`[trace=${traceId}] rpc_recv method=${method} rpc_id=${rpcId} duration_ms=${elapsed} status=ok`);
-      }
-      // 透传 envelope._meta 给 observer（与业务无关，注入失败被吞，不影响 result 返回）。
-      if (this._metaObserver !== null) {
-        const meta = (response as Record<string, unknown>)._meta;
-        if (isJsonObject(meta)) {
-          try {
-            this._metaObserver(meta as JsonObject);
-          } catch (exc) {
-            this._log.debug(`meta_observer raised: ${String(exc)}`);
+      const pending: PendingRpc = {
+        resolve: (response) => {
+          clearTimeout(timer);
+          const elapsed = Date.now() - tStart;
+          if (response.error !== undefined) {
+            this._log.debug(`RPC error response: method=${method}, id=${rpcId}, elapsed=${elapsed}ms, error=${JSON.stringify(response.error)}`);
+            if (traceId) {
+              this._log.info(`[trace=${traceId}] rpc_recv method=${method} rpc_id=${rpcId} duration_ms=${elapsed} status=error`);
+            }
+            const respTrace = (response as Record<string, unknown>)._trace;
+            if (respTrace && typeof respTrace === 'object' && !Array.isArray(respTrace)) {
+              this._handleResponseTrace(method, 'error', elapsed, respTrace as Record<string, unknown>);
+            }
+            reject(mapRemoteError(response.error));
+          } else if (response.result !== undefined) {
+            this._log.debug(`RPC response ok: method=${method}, id=${rpcId}, elapsed=${elapsed}ms ${summarizeDict(response.result, DIAG_RESULT_FIELDS)}`);
+            if (traceId) {
+              this._log.info(`[trace=${traceId}] rpc_recv method=${method} rpc_id=${rpcId} duration_ms=${elapsed} status=ok`);
+            }
+            // 透传 envelope._meta 给 observer
+            if (this._metaObserver !== null) {
+              const meta = (response as Record<string, unknown>)._meta;
+              if (isJsonObject(meta)) {
+                try {
+                  this._metaObserver(meta as JsonObject);
+                } catch (exc) {
+                  this._log.debug(`meta_observer raised: ${String(exc)}`);
+                }
+              }
+            }
+            // 处理 success 路径的 _trace
+            const respTrace = (response as Record<string, unknown>)._trace;
+            if (respTrace && typeof respTrace === 'object' && !Array.isArray(respTrace)) {
+              this._handleResponseTrace(method, 'ok', elapsed, respTrace as Record<string, unknown>);
+            }
+            resolve(response.result);
+          } else {
+            this._log.warn(`RPC response missing result or error: method=${method}, id=${rpcId}, elapsed=${elapsed}ms`);
+            reject(new SerializationError(`rpc response missing result and error: ${method}`));
           }
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+        timer,
+      };
+
+      // 入队并触发 drain
+      if (backgroundRpc) {
+        this._backgroundRpcQueue.push({
+          rpcId, method, payload, pending, tStart, timeoutMs: effectiveTimeout, background: true,
+        });
+      } else {
+        this._rpcQueue.push({
+          rpcId, method, payload, pending, tStart, timeoutMs: effectiveTimeout, background: false,
+        });
+      }
+      this._drainRpcQueue();
+    });
+  }
+
+  /** 从 pending / queue 中移除指定 RPC */
+  private _removeRpc(rpcId: string, pending?: PendingRpc): void {
+    const current = this._pending.get(rpcId);
+    if (current && (!pending || current === pending)) {
+      this._pending.delete(rpcId);
+      this._pendingBackground.delete(rpcId);
+    }
+    if (this._rpcQueue.length > 0) {
+      this._rpcQueue = this._rpcQueue.filter((entry) => entry.rpcId !== rpcId || (pending !== undefined && entry.pending !== pending));
+    }
+    if (this._backgroundRpcQueue.length > 0) {
+      this._backgroundRpcQueue = this._backgroundRpcQueue.filter((entry) => entry.rpcId !== rpcId || (pending !== undefined && entry.pending !== pending));
+    }
+  }
+
+  /** 从队列中取出 RPC 并发送，直到 inflight 达到上限 */
+  private _drainRpcQueue(): void {
+    if (this._drainingRpcQueue) return;
+    this._drainingRpcQueue = true;
+    try {
+      while (!this._closed && this._ws && this._pending.size < MAX_RPC_INFLIGHT) {
+        let entry: QueuedRpc | undefined;
+        if (this._rpcQueue.length > 0) {
+          entry = this._rpcQueue.shift()!;
+        } else if (this._backgroundRpcQueue.length > 0 && this._pendingBackground.size < MAX_BACKGROUND_RPC_INFLIGHT) {
+          entry = this._backgroundRpcQueue.shift()!;
+        } else {
+          break;
+        }
+        const elapsed = Date.now() - entry.tStart;
+        if (elapsed >= entry.timeoutMs) {
+          clearTimeout(entry.pending.timer);
+          this._log.warn(`RPC queue timeout: method=${entry.method}, id=${entry.rpcId}, elapsed=${elapsed}ms, timeout=${entry.timeoutMs}ms`);
+          entry.pending.reject(new TimeoutError(`rpc timeout before send: ${entry.method}`, { retryable: true }));
+          continue;
+        }
+
+        this._pending.set(entry.rpcId, entry.pending);
+        if (entry.background) {
+          this._pendingBackground.add(entry.rpcId);
+        }
+        try {
+          this._ws.send(entry.payload);
+          this._log.debug(`RPC request sent: method=${entry.method}, id=${entry.rpcId}, background=${entry.background}`);
+        } catch (err) {
+          this._removeRpc(entry.rpcId, entry.pending);
+          this._log.error(`RPC send failed: method=${entry.method}, id=${entry.rpcId}, error=${String(err)}`, err instanceof Error ? err : undefined);
+          entry.pending.reject(
+            new ConnectionError(`failed to send rpc ${entry.method}: ${err instanceof Error ? err.message : String(err)}`),
+          );
         }
       }
-      // 处理 success 路径的 _trace
-      const respTrace = (response as Record<string, unknown>)._trace;
-      if (respTrace && typeof respTrace === 'object' && !Array.isArray(respTrace)) {
-        this._handleResponseTrace(method, 'ok', elapsed, respTrace as Record<string, unknown>);
-      }
-      return response.result;
     } finally {
-      if (timeoutHandle !== null) {
-        globalThis.clearTimeout(timeoutHandle);
-      }
+      this._drainingRpcQueue = false;
     }
   }
 
@@ -560,10 +650,23 @@ export class RPCTransport {
     this._closed = true;
 
     // 拒绝所有待处理调用
+    const err = new ConnectionError(`websocket closed: code=${event.code}`);
     for (const [, pending] of this._pending) {
-      pending.reject(new ConnectionError(`websocket closed: code=${event.code}`));
+      clearTimeout(pending.timer);
+      pending.reject(err);
     }
     this._pending.clear();
+    this._pendingBackground.clear();
+    for (const queued of this._rpcQueue) {
+      clearTimeout(queued.pending.timer);
+      queued.pending.reject(err);
+    }
+    this._rpcQueue = [];
+    for (const queued of this._backgroundRpcQueue) {
+      clearTimeout(queued.pending.timer);
+      queued.pending.reject(err);
+    }
+    this._backgroundRpcQueue = [];
 
     // 非主动关闭时触发断线回调
     if (!wasClosed) {
@@ -582,7 +685,9 @@ export class RPCTransport {
       const pending = this._pending.get(rpcId);
       if (pending) {
         this._pending.delete(rpcId);
+        this._pendingBackground.delete(rpcId);
         pending.resolve(message);
+        this._drainRpcQueue();
       } else {
         // H23: 未知 id 多数是超时后到达的慢响应；打 warn 便于排查，避免被完全吞掉
         this._log.warn('[aun_core.transport] recv unknown rpc response (maybe arrived after timeout): id=' + rpcId);

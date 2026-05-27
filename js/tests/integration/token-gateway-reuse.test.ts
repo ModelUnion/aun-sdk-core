@@ -129,7 +129,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     const client = makeClient();
     clients.push(client);
 
-    await client.auth.createAid({ aid });
+    await client.auth.registerAid({ aid });
     const result = await client.auth.authenticate({ aid });
 
     expect(result.access_token).toBeTruthy();
@@ -158,7 +158,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次：完整流程
     const client1 = makeClient();
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     const first = await client1.auth.authenticate({ aid });
     const firstToken = String(first.access_token ?? '');
     const firstGateway = String(first.gateway ?? '');
@@ -199,7 +199,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次创建 + authenticate
     const client1 = makeClient();
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     await client1.auth.authenticate({ aid });
     await client1.close();
 
@@ -225,7 +225,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次完整 authenticate
     const client1 = makeClient();
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     const first = await client1.auth.authenticate({ aid });
     const firstToken = String(first.access_token ?? '');
     expect(firstToken).toBeTruthy();

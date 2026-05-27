@@ -86,6 +86,11 @@ async def test_initialize_session_passes_options_to_auth_connect():
         short_ttl_ms=30000,
     )
     assert captured["method"] == "auth.connect"
+    assert captured["params"]["client"] == {
+        "slot_id": "slot-a",
+        "sdk_lang": "python",
+        "sdk_version": "0.3.4",
+    }
     options = captured["params"].get("options") or {}
     assert options.get("kind") == "short"
     assert options.get("short_ttl_ms") == 30000

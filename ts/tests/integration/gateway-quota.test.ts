@@ -106,13 +106,13 @@ async function resolveGatewayInto(client: AUNClient): Promise<void> {
 async function connectLong(
   client: AUNClient,
   aid: string,
-  options: { slotId?: string; createAid?: boolean; deviceId?: string } = {},
+  options: { slotId?: string; registerAid?: boolean; deviceId?: string } = {},
 ): Promise<void> {
   if (options.deviceId) setDeviceId(client, options.deviceId);
   await resolveGatewayInto(client);
-  if (options.createAid !== false) {
+  if (options.registerAid !== false) {
     try {
-      await client.auth.createAid({ aid });
+      await client.auth.registerAid({ aid });
     } catch (err) {
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
@@ -221,7 +221,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     // setup：注册 aid（共享 keystore，所有客户端复用）
     const setup = makeClient(sharedPath);
     await resolveGatewayInto(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await safeClose(setup);
 
     const longs: Array<{ client: AUNClient; slotId: string; captured: DisconnectInfo[] }> = [];
@@ -233,7 +233,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
         const c = makeClient(sharedPath);
         const captured = captureDisconnect(c);
         const slotId = `slot-${i}`;
-        await connectLong(c, aid, { slotId, createAid: false });
+        await connectLong(c, aid, { slotId, registerAid: false });
         longs.push({ client: c, slotId, captured });
       }
       await sleep(500);
@@ -244,7 +244,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
       // 第 11 个 slot 进入 — 应踢掉 slot-0
       overflow = makeClient(sharedPath);
-      await connectLong(overflow, aid, { slotId: 'slot-NEW', createAid: false });
+      await connectLong(overflow, aid, { slotId: 'slot-NEW', registerAid: false });
       expect(overflow.state).toBe('connected');
 
       // 等 long[0] 收到 4015 disconnect
@@ -283,7 +283,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     // setup：注册 aid 一次（cert/key 落到 setupPath/AIDs/<aid>/）
     const setup = makeClient(setupPath);
     await resolveGatewayInto(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await safeClose(setup);
 
     // 为 11 个 device 准备独立 aun_path（每个都有不同 .device_id），
@@ -319,7 +319,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
         const c = makeClient(dPath);
         const captured = captureDisconnect(c);
         const deviceId = `q2-dev-${i}-${r}`;
-        await connectLong(c, aid, { slotId: 'main', createAid: false, deviceId });
+        await connectLong(c, aid, { slotId: 'main', registerAid: false, deviceId });
         longs.push({ client: c, deviceId, captured });
       }
       await sleep(500);
@@ -336,7 +336,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       }
       overflow = makeClient(ovPath);
       const newDeviceId = `q2-dev-NEW-${r}`;
-      await connectLong(overflow, aid, { slotId: 'main', createAid: false, deviceId: newDeviceId });
+      await connectLong(overflow, aid, { slotId: 'main', registerAid: false, deviceId: newDeviceId });
       expect(overflow.state).toBe('connected');
 
       const evicted = longs[0];
@@ -374,7 +374,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     const aids: string[] = [];
     for (let i = 0; i <= QUOTA_LIMIT; i++) {
       const aid = `q3-a${i}-${r}.${ISSUER}`;
-      await setup.auth.createAid({ aid });
+      await setup.auth.registerAid({ aid });
       aids.push(aid);
     }
     await safeClose(setup);
@@ -387,7 +387,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       for (let i = 0; i < QUOTA_LIMIT; i++) {
         const c = makeClient(sharedPath);
         const captured = captureDisconnect(c);
-        await connectLong(c, aids[i], { slotId: 'main', createAid: false });
+        await connectLong(c, aids[i], { slotId: 'main', registerAid: false });
         longs.push({ client: c, aid: aids[i], captured });
       }
       await sleep(500);
@@ -398,7 +398,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       // 第 11 个 aid 进入 — 踢最早 aid（longs[0]）
       overflow = makeClient(sharedPath);
       const newAid = aids[QUOTA_LIMIT];
-      await connectLong(overflow, newAid, { slotId: 'main', createAid: false });
+      await connectLong(overflow, newAid, { slotId: 'main', registerAid: false });
       expect(overflow.state).toBe('connected');
 
       const evicted = longs[0];
@@ -432,7 +432,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
     const setup = makeClient(sharedPath);
     await resolveGatewayInto(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await safeClose(setup);
 
     // Phase A：保活短连接（每秒 ping），ttl=2000ms，活 5s 应不被踢

@@ -114,7 +114,7 @@ async function installP0Helpers(page: any): Promise<void> {
       const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
       (client as any)._gatewayUrl = gateway;
       try {
-        await client.auth.createAid({ aid });
+        await client.auth.registerAid({ aid });
       } catch {
         // 已存在则忽略
       }
@@ -164,7 +164,7 @@ test.describe('P2P 消息失败路径（浏览器）', () => {
         const gateway = await target.auth._resolveGateway(gatewayDiscoveryAid);
         (target as any)._gatewayUrl = gateway;
         try {
-          await target.auth.createAid({ aid: targetAid });
+          await target.auth.registerAid({ aid: targetAid });
         } catch {
           // 已存在则忽略
         }

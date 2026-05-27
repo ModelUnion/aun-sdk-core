@@ -103,6 +103,9 @@ type SessionError struct{ AUNError }
 // VersionConflictError 版本冲突错误
 type VersionConflictError struct{ AUNError }
 
+// IdentityConflictError AID 身份已存在冲突
+type IdentityConflictError struct{ AUNError }
+
 // GroupError 群组错误
 type GroupError struct{ AUNError }
 
@@ -243,6 +246,15 @@ func NewSessionError(msg string, opts ...ErrorOption) *SessionError {
 // NewVersionConflictError 创建版本冲突错误
 func NewVersionConflictError(msg string, opts ...ErrorOption) *VersionConflictError {
 	e := &VersionConflictError{AUNError{Message: msg, Code: -1}}
+	for _, opt := range opts {
+		opt(&e.AUNError)
+	}
+	return e
+}
+
+// NewIdentityConflictError 创建 AID 身份冲突错误
+func NewIdentityConflictError(msg string, opts ...ErrorOption) *IdentityConflictError {
+	e := &IdentityConflictError{AUNError{Message: msg, Code: 4090, Retryable: false}}
 	for _, opt := range opts {
 		opt(&e.AUNError)
 	}

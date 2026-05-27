@@ -562,24 +562,24 @@ def test_normalize_connect_params_includes_slot_and_delivery_mode(tmp_path):
     }
 
 
-def test_create_aid_caches_discovered_gateway(monkeypatch):
+def test_register_aid_caches_discovered_gateway(monkeypatch):
     client = AUNClient()
 
     async def fake_discover(url: str) -> str:
         assert url == "https://gateway.agentid.pub/.well-known/aun-gateway"
         return "ws://gateway.example/aun"
 
-    async def fake_create_aid(gateway_url: str, aid: str) -> dict:
+    async def fake_register_aid(gateway_url: str, aid: str) -> dict:
         assert gateway_url == "ws://gateway.example/aun"
         assert aid == "demo.agentid.pub"
         return {"aid": aid, "cert": "CERT"}
 
     monkeypatch.setattr(client._discovery, "discover", fake_discover)
-    monkeypatch.setattr(client._auth, "create_aid", fake_create_aid)
+    monkeypatch.setattr(client._auth, "register_aid", fake_register_aid)
     monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: None)
 
     result = asyncio.run(
-        client.auth.create_aid({"aid": "demo.agentid.pub"})
+        client.auth.register_aid({"aid": "demo.agentid.pub"})
     )
 
     assert result["gateway"] == "ws://gateway.example/aun"
@@ -616,11 +616,11 @@ def test_authenticate_caches_discovered_gateway(monkeypatch):
     assert client._gateway_url == "ws://gateway.example/aun"
 
 
-def test_create_aid_requires_aid_when_gateway_missing():
+def test_register_aid_requires_aid_when_gateway_missing():
     client = AUNClient()
 
-    with pytest.raises(Exception, match="auth.create_aid requires 'aid'"):
-        asyncio.run(client.auth.create_aid({}))
+    with pytest.raises(Exception, match="auth.register_aid requires 'aid'"):
+        asyncio.run(client.auth.register_aid({}))
 
 
 def test_authenticate_requires_aid_when_gateway_missing():

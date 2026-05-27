@@ -210,7 +210,7 @@ async def authenticate(aid: str) -> dict:
     try:
         client = AUNClient({"aun_path": f"~/.aun/{aid}"})
         if not client._auth.load_identity_or_none(aid):
-            await client.auth.create_aid({"aid": aid})
+            await client.auth.register_aid({"aid": aid})
         auth = await client.auth.authenticate({"aid": aid})
         return auth
     except AuthError as e:

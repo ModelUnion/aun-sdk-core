@@ -4,7 +4,7 @@ import { decryptMessage } from '../../src/v2/e2ee/decrypt.js';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
 
-const SDK_VERSION = '0.3.2';
+const SDK_VERSION = '0.3.4';
 
 /**
  * Group 加密自加密自解密回环：
@@ -67,8 +67,9 @@ describe('encryptGroupMessage roundtrip', () => {
     });
     expect(envelope.protected_headers).toMatchObject({
       sdk_lang: 'typescript',
-      sdk_vesion: SDK_VERSION,
+      sdk_version: SDK_VERSION,
     });
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBeUndefined();
 
     // Bob 3DH
     const decBob = decryptMessage(
@@ -285,7 +286,8 @@ describe('encryptGroupMessage roundtrip', () => {
     expect(envelope.payload_type).toBe('group-text');
     expect((envelope.protected_headers as Record<string, unknown>).payload_type).toBe('group-text');
     expect((envelope.protected_headers as Record<string, unknown>).sdk_lang).toBe('typescript');
-    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBe(SDK_VERSION);
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_version).toBe(SDK_VERSION);
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBeUndefined();
     expect(decryptMessage(
       envelope as Record<string, unknown>,
       'bob.aid.com',

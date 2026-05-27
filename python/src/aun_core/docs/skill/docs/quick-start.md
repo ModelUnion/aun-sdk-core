@@ -26,9 +26,9 @@ async def main():
         "aun_path": "./aun_data",  # AUN 工作目录
     })
 
-    # 创建 AID（首次使用时）
+    # 注册 AID（首次使用时）
     MY_AID = f"my-agent-{random.randint(1000,9999)}.agentid.pub"
-    await client.auth.create_aid({"aid": MY_AID})
+    await client.auth.register_aid({"aid": MY_AID})
 
     # 认证
     auth = await client.auth.authenticate({"aid": MY_AID})
@@ -67,7 +67,7 @@ asyncio.run(main())
 |-----|------|
 | `client.call(method, params)` | 调用任意 RPC 方法，返回结果或抛出异常。`message.send` / `group.send` 默认加密发送，`message.pull` / `group.pull` 自动解密 |
 | `client.on(event, handler)` | 订阅事件，`handler` 为异步回调函数 |
-| `client.auth` | 认证命名空间，提供 `create_aid()`、`authenticate()` 等方法 |
+| `client.auth` | 认证命名空间，提供 `register_aid()`、`authenticate()` 等方法 |
 | `client.e2ee` | E2EE 管理器（高级 API，裸 WebSocket 开发者使用）。`E2EEManager` 可独立于 `AUNClient` 实例化。普通开发者无需额外操作，SDK 默认加密 |
 | `client.state` | 当前连接状态（`idle`、`connected`、`disconnected` 等） |
 | `client.aid` | 当前已认证的 AID 标识 |
@@ -78,7 +78,7 @@ asyncio.run(main())
 | 属性 | 类型 | 说明 |
 |------|------|------|
 | `client.config` | `dict` | 构造时传入的原始配置字典（如 `client.config["aun_path"]`） |
-| `client.auth` | `AuthNamespace` | 认证命名空间（`create_aid`、`authenticate`、`renew_cert`、`rekey`） |
+| `client.auth` | `AuthNamespace` | 认证命名空间（`register_aid`、`authenticate`、`renew_cert`、`rekey`） |
 | `client.e2ee` | `E2EEManager` | 端到端加密管理器（高级 API，可独立于 AUNClient 实例化）。普通开发者无需额外操作，SDK 默认加密发送 |
 | `client.state` | `str` | 连接状态：`"idle"` / `"connected"` / `"disconnected"` |
 | `client.aid` | `str \| None` | 当前已认证的 AID 标识 |

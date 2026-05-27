@@ -21,7 +21,7 @@ describe('Token refresh 集成测试', () => {
     client.on('token.refreshed', (payload: unknown) => refreshEvents.push(payload));
 
     try {
-      await client.auth.createAid({ aid });
+      await client.auth.registerAid({ aid });
       const auth = await client.auth.authenticate({ aid });
       const initialToken = String(auth.access_token ?? '');
       expect(initialToken).not.toBe('');

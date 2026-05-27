@@ -6,8 +6,15 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import { AuthFlow } from '../../src/auth.js';
-import { AuthError, StateError } from '../../src/errors.js';
+import { AuthError, StateError, IdentityConflictError } from '../../src/errors.js';
+import { CryptoProvider } from '../../src/crypto.js';
+import { FileKeyStore } from '../../src/keystore/file.js';
+import { VERSION } from '../../src/index.js';
 
 describe('AuthFlow', () => {
   // 以下测试需要复杂的证书链 fixture，标记为 skip
@@ -81,6 +88,10 @@ describe('AuthFlow', () => {
 
     const args = mockTransport.call.mock.calls[0][1] as Record<string, unknown>;
     expect(args.capabilities).toBeDefined();
+    expect(args.client).toMatchObject({
+      sdk_lang: 'typescript',
+      sdk_version: VERSION,
+    });
     const capabilities = args.capabilities as Record<string, unknown>;
     expect(capabilities.supported_p2p_e2ee).toEqual(['e2ee_v2']);
     expect(capabilities.supported_group_e2ee).toEqual(['group_e2ee_v2']);
@@ -226,5 +237,105 @@ describe('AuthFlow', () => {
     const status = (auth as any)._parseOcspResponse(Buffer.from(ocspB64, 'base64'), null, null);
 
     expect(status).toBe('unknown');
+  });
+
+  // ── registerAid 查重前置 + 落盘时机修复 ─────────────────────
+  describe('registerAid: 查重前置 + 落盘时机', () => {
+    function makeAuthFlow() {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-ts-test-'));
+      const keystore = new FileKeyStore(path.join(tmpDir, 'aun'));
+      const flow = new AuthFlow({
+        keystore,
+        crypto: new CryptoProvider(),
+        verifySsl: false,
+      });
+      return { flow, tmpDir, keystore };
+    }
+
+    function makeFakeServerCert(aid: string, pubKeyDer?: Buffer): { certPem: string; pubDer: Buffer } {
+      const { generateKeyPairSync, createSign, X509Certificate } = crypto as any;
+      // 简化：生成一对 key + 自签 cert（仅用于测试 cert 解析路径）
+      const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+      const usePub = pubKeyDer ? crypto.createPublicKey({ key: pubKeyDer, format: 'der', type: 'spki' }) : publicKey;
+      // 通过 nodejs 的 selfSigned 不易直接做，这里走简化策略：
+      // 测试只关心 registerAid 在拿到非空字符串时的行为（视为已注册）
+      return { certPem: '-----BEGIN CERTIFICATE-----\nMIIB...stub...\n-----END CERTIFICATE-----', pubDer: Buffer.alloc(0) };
+    }
+
+    it('A: AID 已注册时抛 IdentityConflictError，本地不落盘', async () => {
+      const { flow, tmpDir } = makeAuthFlow();
+      const aid = 'taken.example.com';
+      // mock _downloadRegisteredCert 返回非空 cert（视为已注册）
+      (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue('-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----');
+      const createSpy = vi.fn();
+      (flow as any)._createAid = createSpy;
+
+      await expect(flow.registerAid('https://gw.example', aid)).rejects.toBeInstanceOf(IdentityConflictError);
+
+      // 没调 _createAid（连 RPC 都没发）
+      expect(createSpy).not.toHaveBeenCalled();
+      // 本地完全没该 AID 痕迹
+      const aidDir = path.join(tmpDir, 'aun', 'AIDs', aid);
+      expect(fs.existsSync(aidDir)).toBe(false);
+    });
+
+    it('B: TOCTOU race（查重 404 + RPC 拒绝）时不落盘', async () => {
+      const { flow, tmpDir } = makeAuthFlow();
+      const aid = 'race.example.com';
+      (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue(null);
+      (flow as any)._createAid = vi.fn().mockRejectedValue(new AuthError('AID already exists'));
+
+      await expect(flow.registerAid('https://gw.example', aid)).rejects.toThrow();
+
+      const aidDir = path.join(tmpDir, 'aun', 'AIDs', aid);
+      expect(fs.existsSync(aidDir)).toBe(false);
+    });
+
+    it('C: 网络失败时不落盘', async () => {
+      const { flow, tmpDir } = makeAuthFlow();
+      const aid = 'netfail.example.com';
+      (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue(null);
+      (flow as any)._createAid = vi.fn().mockRejectedValue(new Error('network down'));
+
+      await expect(flow.registerAid('https://gw.example', aid)).rejects.toThrow();
+
+      const aidDir = path.join(tmpDir, 'aun', 'AIDs', aid);
+      expect(fs.existsSync(aidDir)).toBe(false);
+    });
+
+    it('D: 查重 HTTP 失败时保守失败，不落盘', async () => {
+      const { flow, tmpDir } = makeAuthFlow();
+      const aid = 'checkfail.example.com';
+      (flow as any)._downloadRegisteredCert = vi.fn().mockRejectedValue(new AuthError('failed to fetch'));
+      const createSpy = vi.fn();
+      (flow as any)._createAid = createSpy;
+
+      await expect(flow.registerAid('https://gw.example', aid)).rejects.toThrow();
+
+      expect(createSpy).not.toHaveBeenCalled();
+      const aidDir = path.join(tmpDir, 'aun', 'AIDs', aid);
+      expect(fs.existsSync(aidDir)).toBe(false);
+    });
+
+    it('E: 全新 AID 注册成功 → keypair + cert 一次性落盘', async () => {
+      const { flow, tmpDir, keystore } = makeAuthFlow();
+      const aid = 'fresh.example.com';
+      (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue(null);
+      // 服务端"返回 cert"用 stub 字符串即可（_createAid 的契约只要求拿到 cert 字段）
+      const stubCert = '-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----';
+      (flow as any)._createAid = vi.fn().mockResolvedValue({ cert: stubCert });
+      // 测试不验证 cert 解析（stubCert 不是合法 X.509）
+      (flow as any)._assertCertMatchesLocalKeypair = vi.fn();
+
+      const result = await flow.registerAid('https://gw.example', aid);
+      expect(result.aid).toBe(aid);
+      expect(result.cert).toBe(stubCert);
+
+      // 落盘了 keypair + cert
+      const loaded = keystore.loadIdentity(aid);
+      expect(loaded?.private_key_pem).toBeTruthy();
+      expect(loaded?.public_key_der_b64).toBeTruthy();
+      expect(keystore.loadCert(aid)).toBe(stubCert);
+    });
   });
 });

@@ -99,7 +99,7 @@ def register(
 
     async def _run():
         async with CLISession(ctx, need_auth=False, gateway=gateway) as client:
-            return await client.auth.create_aid({"aid": aid})
+            return await client.auth.register_aid({"aid": aid})
 
     try:
         result = run_async(_run())

@@ -207,27 +207,27 @@ class AuthNamespace:
         except Exception as exc:
             self._client._log.debug("auth", "persist gateway_url failed aid=%s err=%s", aid, exc)
 
-    async def create_aid(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def register_aid(self, params: dict[str, Any]) -> dict[str, Any]:
         import time as _t
         _t_start = _t.time()
         aid = str((params or {}).get("aid") or "")
         if not aid:
-            raise ValueError("auth.create_aid requires 'aid'")
-        self._client._log.debug("auth", "namespace.create_aid enter: aid=%s", aid)
+            raise ValueError("auth.register_aid requires 'aid'")
+        self._client._log.debug("auth", "namespace.register_aid enter: aid=%s", aid)
         try:
             gateway_url = await self._resolve_gateway(aid)
             self._client._gateway_url = gateway_url
-            result = await self._client._auth.create_aid(gateway_url, aid)
+            result = await self._client._auth.register_aid(gateway_url, aid)
             self._client._aid = result["aid"]
             self._client._identity = self._client._auth.load_identity_or_none(result["aid"])
-            self._client._log.debug("auth", "namespace.create_aid exit: elapsed=%.3fs aid=%s gateway=%s", _t.time() - _t_start, result["aid"], gateway_url)
+            self._client._log.debug("auth", "namespace.register_aid exit: elapsed=%.3fs aid=%s gateway=%s", _t.time() - _t_start, result["aid"], gateway_url)
             return {
                 "aid": result["aid"],
                 "cert_pem": result["cert"],
                 "gateway": gateway_url,
             }
         except Exception as exc:
-            self._client._log.debug("auth", "namespace.create_aid exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, aid, exc)
+            self._client._log.debug("auth", "namespace.register_aid exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, aid, exc)
             raise
 
     async def check_aid(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -430,7 +430,7 @@ class AuthNamespace:
     async def _ensure_agent_md_upload_token(self, aid: str, gateway_url: str) -> str:
         identity = self._client._auth.load_identity_or_none(aid)
         if identity is None:
-            raise StateError("no local identity found, call auth.create_aid() first")
+            raise StateError("no local identity found, call auth.register_aid() first")
 
         token = self._get_cached_access_token(identity)
         if token:
@@ -463,10 +463,10 @@ class AuthNamespace:
         _t_start = _t.time()
         identity = self._client._auth.load_identity_or_none(self._client._aid)
         if identity is None:
-            raise StateError("no local identity found, call auth.create_aid() first")
+            raise StateError("no local identity found, call auth.register_aid() first")
         aid = str(identity.get("aid") or self._client._aid or "").strip()
         if not aid:
-            raise StateError("no local identity found, call auth.create_aid() first")
+            raise StateError("no local identity found, call auth.register_aid() first")
         self._client._log.debug("auth", "upload_agent_md enter: aid=%s content_len=%d", aid, len(content or ""))
         # HTTP trace
         trace_mode = getattr(self._client._transport, "_trace_mode", "off")
@@ -588,16 +588,13 @@ class AuthNamespace:
             cache_store = self._agent_md_cache_store()
             cached = cache_store.get(target_aid) or {}
             request_headers: dict[str, str] = {"Accept": "text/markdown"}
-            if cached.get("etag"):
-                request_headers["If-None-Match"] = cached["etag"]
-            if cached.get("last_modified"):
-                request_headers["If-Modified-Since"] = cached["last_modified"]
+            # 不发送条件请求头，始终做无条件 GET（服务端 302 由 aiohttp 自动跟随）
             if trace_id:
                 request_headers["X-AUN-Trace"] = trace_id
 
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(agent_md_url, headers=request_headers) as response:
+                async with session.get(agent_md_url, headers=request_headers, allow_redirects=True) as response:
                     duration_ms = int((_t.time() - _t_start) * 1000)
                     if trace_id:
                         self._client._log.info("auth", "[trace=%s] http_in status=%d duration_ms=%d", trace_id, response.status, duration_ms)
@@ -607,13 +604,29 @@ class AuthNamespace:
                                 observer({"type": "http", "trace_id": trace_id, "method": "GET", "url": agent_md_url, "status": response.status, "duration_ms": duration_ms})
                             except Exception:
                                 pass
-                    if response.status == 304 and cached.get("text") is not None:
-                        self._client._log.debug(
-                            "auth",
-                            "download_agent_md exit (not_modified): elapsed=%.3fs aid=%s",
-                            _t.time() - _t_start, target_aid,
-                        )
-                        return cached["text"]
+                    if response.status == 304:
+                        # 304 不应出现（我们不发条件头），但防御性处理
+                        if cached.get("text") is not None:
+                            self._client._log.debug(
+                                "auth",
+                                "download_agent_md exit (not_modified): elapsed=%.3fs aid=%s",
+                                _t.time() - _t_start, target_aid,
+                            )
+                            return cached["text"]
+                        # 本地缓存为空却收到 304，警告并重试无条件 GET
+                        self._client._log.warn("auth", "download_agent_md got 304 but no local cache, retrying unconditional GET: aid=%s", target_aid)
+                        async with session.get(agent_md_url, headers={"Accept": "text/markdown"}, allow_redirects=True) as retry_resp:
+                            if retry_resp.status == 404:
+                                raise NotFoundError(f"agent.md not found for aid: {target_aid}")
+                            if retry_resp.status < 200 or retry_resp.status >= 300:
+                                message = (await retry_resp.text()).strip()
+                                raise AUNError(
+                                    f"download agent.md failed (retry): HTTP {retry_resp.status}"
+                                    + (f" - {message}" if message else "")
+                                )
+                            text = await retry_resp.text()
+                            self._client._log.debug("auth", "download_agent_md exit (retry): elapsed=%.3fs aid=%s content_len=%d", _t.time() - _t_start, target_aid, len(text))
+                            return text
                     if response.status == 404:
                         raise NotFoundError(f"agent.md not found for aid: {target_aid}")
                     if response.status < 200 or response.status >= 300:
@@ -653,7 +666,7 @@ class AuthNamespace:
         try:
             identity = self._client._auth.load_identity_or_none(target_aid or None)
             if identity is None:
-                raise StateError("no local identity found, call auth.create_aid() first")
+                raise StateError("no local identity found, call auth.register_aid() first")
 
             private_key_pem = str(identity.get("private_key_pem") or "").strip()
             cert_pem = str(identity.get("cert") or "").strip()

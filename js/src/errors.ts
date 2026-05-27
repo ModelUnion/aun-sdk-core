@@ -51,6 +51,14 @@ export class AuthError extends AUNError {
   }
 }
 
+/** AID 身份冲突错误 */
+export class IdentityConflictError extends AuthError {
+  constructor(message: string, opts?: ConstructorParameters<typeof AUNError>[1]) {
+    super(message, opts);
+    this.name = 'IdentityConflictError';
+  }
+}
+
 /** 权限错误 */
 export class PermissionError extends AUNError {
   constructor(message: string, opts?: ConstructorParameters<typeof AUNError>[1]) {

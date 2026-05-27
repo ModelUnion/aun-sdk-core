@@ -90,6 +90,21 @@ interface EncryptedEnvelope {
   salt: string; // PBKDF2 盐值（base64）
 }
 
+export class SeedMigrationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SeedMigrationError';
+  }
+}
+
+export interface SeedChangeResult {
+  migrated: number;
+  skipped: number;
+  errors: number;
+  privateKeysVerified: number;
+  privateKeysMigrated: number;
+}
+
 /** 将 Uint8Array 编码为 base64 字符串 */
 function _uint8ToBase64(bytes: Uint8Array): string {
   let b = '';
@@ -133,6 +148,10 @@ async function _decryptPEM(enc: EncryptedEnvelope, seed: string): Promise<string
   const key = await _deriveEncKey(seed, salt);
   const pt = await crypto.subtle.decrypt({ name: _ENC_ALGO, iv: toBufferSource(iv) }, key, toBufferSource(ct));
   return new TextDecoder().decode(pt);
+}
+
+function hasEncryptionSeed(seed: string | undefined): seed is string {
+  return seed !== undefined;
 }
 
 // ── IndexedDB 工具 ──────────────────────────────────────
@@ -518,6 +537,55 @@ export class IndexedDBKeyStore implements KeyStore {
     this._encryptionSeed = opts?.encryptionSeed;
   }
 
+  static async changeSeed(oldSeed: string, newSeed: string): Promise<SeedChangeResult> {
+    if (oldSeed === '.seed') {
+      throw new SeedMigrationError('JS IndexedDB keystore does not support file .seed migration');
+    }
+    const rows = await idbGetAll<JsonObject>(STORE_KEY_PAIRS);
+    const migrations: Array<{ key: string; value: JsonObject; privateKeyPem: string }> = [];
+    for (const row of rows) {
+      if (!isRecord(row.value)) continue;
+      const envelope = row.value._encrypted_pk;
+      if (!isRecord(envelope)) continue;
+      try {
+        const privateKeyPem = await _decryptPEM(envelope as unknown as EncryptedEnvelope, oldSeed);
+        migrations.push({ key: row.key, value: deepClone(row.value), privateKeyPem });
+      } catch {
+        throw new SeedMigrationError(`seed migration refused: private key is not encrypted by old seed: aid=${row.key}`);
+      }
+    }
+    if (migrations.length === 0) {
+      throw new SeedMigrationError('seed migration refused: no encrypted private key verified with old seed');
+    }
+
+    const result: SeedChangeResult = {
+      migrated: 0,
+      skipped: 0,
+      errors: 0,
+      privateKeysVerified: migrations.length,
+      privateKeysMigrated: 0,
+    };
+    for (const item of migrations) {
+      const next = deepClone(item.value);
+      next._encrypted_pk = await _encryptPEM(item.privateKeyPem, newSeed) as unknown as JsonObject;
+      const verified = await _decryptPEM(next._encrypted_pk as unknown as EncryptedEnvelope, newSeed);
+      if (verified !== item.privateKeyPem) {
+        throw new SeedMigrationError(`new seed verification failed for private key: aid=${item.key}`);
+      }
+      delete next.private_key_pem;
+      await idbPut(STORE_KEY_PAIRS, item.key, next);
+      result.migrated += 1;
+      result.privateKeysMigrated += 1;
+    }
+    return result;
+  }
+
+  async changeSeed(oldSeed: string, newSeed: string): Promise<SeedChangeResult> {
+    const result = await IndexedDBKeyStore.changeSeed(oldSeed, newSeed);
+    this._encryptionSeed = newSeed;
+    return result;
+  }
+
   private async _withAidLock<T>(aid: string, fn: () => Promise<T>): Promise<T> {
     const key = safeAid(aid);
     const previous = IndexedDBKeyStore._aidTails.get(key) ?? Promise.resolve();
@@ -582,7 +650,7 @@ export class IndexedDBKeyStore implements KeyStore {
     const result = deepClone(data);
     // 如果存在加密私钥信封，尝试解密还原
     const epk = result._encrypted_pk;
-    if (epk && typeof epk === 'object' && !Array.isArray(epk) && this._encryptionSeed) {
+    if (epk && typeof epk === 'object' && !Array.isArray(epk) && hasEncryptionSeed(this._encryptionSeed)) {
       try {
         const envelope = epk as unknown as EncryptedEnvelope;
         result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
@@ -592,7 +660,7 @@ export class IndexedDBKeyStore implements KeyStore {
       }
     } else if (
       // 透明迁移：旧版明文数据自动加密回写
-      !epk && typeof result.private_key_pem === 'string' && this._encryptionSeed
+      !epk && typeof result.private_key_pem === 'string' && hasEncryptionSeed(this._encryptionSeed)
     ) {
       try {
         await this.saveKeyPair(aid, result);
@@ -606,7 +674,7 @@ export class IndexedDBKeyStore implements KeyStore {
   async saveKeyPair(aid: string, keyPair: KeyPairRecord): Promise<void> {
     const record = deepClone(keyPair);
     // 如果配置了加密种子且包含明文私钥，加密后再存储
-    if (this._encryptionSeed && typeof record.private_key_pem === 'string') {
+    if (hasEncryptionSeed(this._encryptionSeed) && typeof record.private_key_pem === 'string') {
       (record as JsonObject)._encrypted_pk = await _encryptPEM(record.private_key_pem, this._encryptionSeed) as unknown as JsonObject;
       delete record.private_key_pem;
     }
@@ -1071,7 +1139,7 @@ export class IndexedDBKeyStore implements KeyStore {
     if (!isRecord(data)) return null;
     const result = deepClone(data);
     // 如果存在加密私钥信封，尝试解密还原
-    if (isRecord(result._encrypted_pk) && this._encryptionSeed) {
+    if (isRecord(result._encrypted_pk) && hasEncryptionSeed(this._encryptionSeed)) {
       try {
         const envelope = result._encrypted_pk as unknown as EncryptedEnvelope;
         result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
@@ -1081,7 +1149,7 @@ export class IndexedDBKeyStore implements KeyStore {
       }
     } else if (
       // 透明迁移：旧版明文数据自动加密回写
-      !isRecord(result._encrypted_pk) && typeof result.private_key_pem === 'string' && this._encryptionSeed
+      !isRecord(result._encrypted_pk) && typeof result.private_key_pem === 'string' && hasEncryptionSeed(this._encryptionSeed)
     ) {
       try {
         await this._saveKeyPairUnlocked(aid, result);
@@ -1095,7 +1163,7 @@ export class IndexedDBKeyStore implements KeyStore {
   private async _saveKeyPairUnlocked(aid: string, keyPair: KeyPairRecord): Promise<void> {
     const record = deepClone(keyPair);
     // 如果配置了加密种子且包含明文私钥，加密后再存储
-    if (this._encryptionSeed && typeof record.private_key_pem === 'string') {
+    if (hasEncryptionSeed(this._encryptionSeed) && typeof record.private_key_pem === 'string') {
       (record as JsonObject)._encrypted_pk = await _encryptPEM(record.private_key_pem, this._encryptionSeed) as unknown as JsonObject;
       delete record.private_key_pem;
     }

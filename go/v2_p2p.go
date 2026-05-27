@@ -41,6 +41,81 @@ type v2BootstrapEntry struct {
 	Devices         []map[string]any
 	AuditRecipients []map[string]any
 	CachedAt        time.Time
+	WrapPolicy      *v2WrapPolicy
+}
+
+type v2WrapPolicy struct {
+	Protocol string
+	Scope    string
+}
+
+func v2NormalizeWrapPolicy(raw any) *v2WrapPolicy {
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	protocol := strings.ToUpper(strings.TrimSpace(v2AsString(obj["protocol"])))
+	scope := strings.ToLower(strings.TrimSpace(v2AsString(obj["scope"])))
+	if scope != "aid" && scope != "device" {
+		if b, ok := obj["per_aid_wrap"].(bool); ok && b {
+			scope = "aid"
+		} else if b, ok := obj["per_device_wrap"].(bool); ok && b {
+			scope = "device"
+		} else {
+			scope = ""
+		}
+	}
+	if protocol != "1DH" && protocol != "3DH" {
+		protocol = ""
+	}
+	if scope == "aid" {
+		protocol = "1DH"
+	}
+	if protocol == "" && scope == "" {
+		return nil
+	}
+	return &v2WrapPolicy{Protocol: protocol, Scope: scope}
+}
+
+func v2WrapCapabilities() map[string]any {
+	return map[string]any{
+		"version":         "v2.1",
+		"protocols":       []string{"1DH", "3DH"},
+		"scopes":          []string{"aid", "device"},
+		"per_aid_wrap":    true,
+		"per_device_wrap": true,
+	}
+}
+
+func v2ApplyWrapPolicyToTargets(targets []e2ee.Target, policy *v2WrapPolicy) []e2ee.Target {
+	if policy == nil {
+		return targets
+	}
+	normalized := make([]e2ee.Target, 0, len(targets))
+	for _, target := range targets {
+		row := target
+		if policy.Protocol == "1DH" {
+			row.KeySource = "aid_master"
+			row.SPKPkDER = nil
+			row.SPKID = ""
+		}
+		normalized = append(normalized, row)
+	}
+	if policy.Scope != "aid" {
+		return normalized
+	}
+	seen := make(map[string]bool, len(normalized))
+	collapsed := make([]e2ee.Target, 0, len(normalized))
+	for _, target := range normalized {
+		key := target.AID + "\x00" + target.Role
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		target.DeviceID = ""
+		collapsed = append(collapsed, target)
+	}
+	return collapsed
 }
 
 // v2P2PState 把 V2 P2P 相关状态聚合到一个嵌入字段，避免在主结构体散布字段。
@@ -504,7 +579,10 @@ func (c *AUNClient) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, f
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if raw, err := c.Call(ctx, "message.v2.bootstrap", map[string]any{"peer_aid": fromAID}); err == nil {
+	if raw, err := c.Call(ctx, "message.v2.bootstrap", map[string]any{
+		"peer_aid":               fromAID,
+		"e2ee_wrap_capabilities": v2WrapCapabilities(),
+	}); err == nil {
 		if bs, _ := raw.(map[string]any); bs != nil {
 			for _, dev := range v2ToMapList(bs["peer_devices"]) {
 				c.cacheV2PeerIKFromDevice(state, dev, fromAID)
@@ -514,7 +592,10 @@ func (c *AUNClient) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, f
 		c.logE2.Warn("V2 sender IK pending bootstrap failed peer=%s: %v", fromAID, err)
 	}
 	if strings.TrimSpace(groupID) != "" {
-		if raw, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{"group_id": groupID}); err == nil {
+		if raw, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{
+			"group_id":               groupID,
+			"e2ee_wrap_capabilities": v2WrapCapabilities(),
+		}); err == nil {
 			if bs, _ := raw.(map[string]any); bs != nil {
 				for _, dev := range v2ToMapList(bs["devices"]) {
 					c.cacheV2PeerIKFromDevice(state, dev, "")
@@ -604,7 +685,7 @@ func (c *AUNClient) SendV2WithOpts(ctx context.Context, to string, payload map[s
 
 func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
 	c.logE2.Debug("message.v2.send attempt: to=%s use_cache=%v", to, useCache)
-	peerDevices, auditRaw, err := c.v2ResolveBootstrap(ctx, state, to, useCache)
+	peerDevices, auditRaw, wrapPolicy, err := c.v2ResolveBootstrap(ctx, state, to, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -662,6 +743,8 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 		return nil, fmt.Errorf("send_v2: 获取 sender identity 失败: %w", err)
 	}
 
+	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
+	sendAuditTargets := v2ApplyWrapPolicyToTargets(auditTargets, wrapPolicy)
 	envelope, err := e2ee.EncryptP2PMessage(
 		e2ee.Sender{
 			AID:      sender.AID,
@@ -669,7 +752,7 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 			IKPriv:   sender.IKPriv,
 			IKPubDER: sender.IKPubDER,
 		},
-		e2ee.TargetSet{Targets: targets, AuditRecipients: auditTargets},
+		e2ee.TargetSet{Targets: sendTargets, AuditRecipients: sendAuditTargets},
 		payload,
 		opts,
 	)
@@ -683,8 +766,8 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 		"version":    envelope["version"],
 	}, envelope, map[string]any{
 		"plaintext_payload": payload,
-		"target_count":      len(targets),
-		"audit_count":       len(auditTargets),
+		"target_count":      len(sendTargets),
+		"audit_count":       len(sendAuditTargets),
 		"use_cache":         useCache,
 	})
 
@@ -705,23 +788,27 @@ func (c *AUNClient) v2SendOnce(ctx context.Context, state *v2P2PState, to string
 }
 
 // v2ResolveBootstrap 根据 useCache 决定是否使用缓存，未命中则调 message.v2.bootstrap。
-func (c *AUNClient) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, peerAID string, useCache bool) ([]map[string]any, []map[string]any, error) {
+func (c *AUNClient) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, peerAID string, useCache bool) ([]map[string]any, []map[string]any, *v2WrapPolicy, error) {
 	if useCache {
 		state.bootstrapCacheM.Lock()
 		entry, ok := state.bootstrapCache[peerAID]
 		state.bootstrapCacheM.Unlock()
 		if ok && time.Since(entry.CachedAt) < v2BootstrapTTL {
 			c.logE2.Debug("message.v2.bootstrap cache hit: peer=%s devices=%d audit=%d", peerAID, len(entry.Devices), len(entry.AuditRecipients))
-			return entry.Devices, entry.AuditRecipients, nil
+			return entry.Devices, entry.AuditRecipients, entry.WrapPolicy, nil
 		}
 	}
-	raw, err := c.Call(ctx, "message.v2.bootstrap", map[string]any{"peer_aid": peerAID})
+	raw, err := c.Call(ctx, "message.v2.bootstrap", map[string]any{
+		"peer_aid":               peerAID,
+		"e2ee_wrap_capabilities": v2WrapCapabilities(),
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("V2 bootstrap: %w", err)
+		return nil, nil, nil, fmt.Errorf("V2 bootstrap: %w", err)
 	}
 	bs, _ := raw.(map[string]any)
 	devices := v2ToMapList(bs["peer_devices"])
 	audit := v2ToMapList(bs["audit_recipients"])
+	wrapPolicy := v2NormalizeWrapPolicy(bs["e2ee_wrap_policy"])
 	c.logE2.Debug("message.v2.bootstrap fetched: peer=%s devices=%d audit=%d", peerAID, len(devices), len(audit))
 	if len(devices) > 0 {
 		state.bootstrapCacheM.Lock()
@@ -729,10 +816,11 @@ func (c *AUNClient) v2ResolveBootstrap(ctx context.Context, state *v2P2PState, p
 			Devices:         devices,
 			AuditRecipients: audit,
 			CachedAt:        time.Now(),
+			WrapPolicy:      wrapPolicy,
 		}
 		state.bootstrapCacheM.Unlock()
 	}
-	return devices, audit, nil
+	return devices, audit, wrapPolicy, nil
 }
 
 // v2FetchSelfDevices 缓存优先获取本 AID 其它设备列表（best-effort，错误吞掉返回空）。
@@ -743,7 +831,10 @@ func (c *AUNClient) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, m
 	if ok && time.Since(entry.CachedAt) < v2BootstrapTTL {
 		return entry.Devices
 	}
-	raw, err := c.Call(ctx, "message.v2.bootstrap", map[string]any{"peer_aid": myAID})
+	raw, err := c.Call(ctx, "message.v2.bootstrap", map[string]any{
+		"peer_aid":               myAID,
+		"e2ee_wrap_capabilities": v2WrapCapabilities(),
+	})
 	if err != nil {
 		c.logE2.Debug("V2 self-sync bootstrap failed (non-fatal): %v", err)
 		return nil
@@ -978,7 +1069,7 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 		c.logE2.Warn("V2 decrypt: invalid envelope_json for msg seq=%v: %v", msg["seq"], err)
 		return nil
 	}
-	e2eeMeta := v2ThoughtE2EEMetadata(envelope)
+	e2eeMeta := v2MessageE2EEMetadata(envelope)
 	c.observeAgentMDFromEnvelope(envelope)
 
 	// 确定 spk_id
@@ -1170,7 +1261,7 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 		}()
 	}
 
-	e2ee := v2ThoughtE2EEMetadata(envelope)
+	e2ee := v2MessageE2EEMetadata(envelope)
 	result := map[string]any{
 		"message_id": v2AsString(msg["message_id"]),
 		"from":       fromAID,

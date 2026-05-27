@@ -34,6 +34,87 @@ func TestMetaLocksBounded(t *testing.T) {
 	}
 }
 
+func writeSeedProtectedKeyJSON(t *testing.T, root, aid, seed, plaintext string) map[string]any {
+	t.Helper()
+	ss, err := secretstore.NewFileSecretStore(root, seed)
+	if err != nil {
+		t.Fatalf("创建 SecretStore 失败: %v", err)
+	}
+	rec, err := ss.Protect(aid, "identity/private_key", []byte(plaintext))
+	if err != nil {
+		t.Fatalf("加密 key.json 私钥失败: %v", err)
+	}
+	keyPath := filepath.Join(root, "AIDs", aid, "private", "key.json")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(map[string]any{"private_key_protection": rec})
+	if err := os.WriteFile(keyPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+func TestChangeSeedMigratesKeyJSONAfterPrivateKeyVerification(t *testing.T) {
+	dir := t.TempDir()
+	aid := "good.agentid.pub"
+	writeSeedProtectedKeyJSON(t, dir, aid, "old-seed", "GOOD_PRIVATE")
+	if err := os.WriteFile(filepath.Join(dir, ".seed"), []byte("old-seed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := ChangeSeed(dir, ".seed", "")
+	if err != nil {
+		t.Fatalf("ChangeSeed 失败: %v", err)
+	}
+	if result.PrivateKeysMigrated != 1 {
+		t.Fatalf("应迁移 1 个私钥，实际: %d", result.PrivateKeysMigrated)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".seed")); !os.IsNotExist(err) {
+		t.Fatalf(".seed 应在迁移成功后被 rename，stat err=%v", err)
+	}
+
+	ks, err := NewFileKeyStore(dir, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ks.Close()
+	loaded, err := ks.LoadKeyPair(aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded["private_key_pem"] != "GOOD_PRIVATE" {
+		t.Fatalf("迁移后私钥读取错误: %v", loaded["private_key_pem"])
+	}
+}
+
+func TestAutoSeedMigrationFallsBackToLegacySeedOnStrictFailure(t *testing.T) {
+	dir := t.TempDir()
+	goodAid := "good.agentid.pub"
+	wrongAid := "wrong.agentid.pub"
+	writeSeedProtectedKeyJSON(t, dir, goodAid, "old-seed", "GOOD_PRIVATE")
+	writeSeedProtectedKeyJSON(t, dir, wrongAid, "other-seed", "WRONG_PRIVATE")
+	if err := os.WriteFile(filepath.Join(dir, ".seed"), []byte("old-seed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ks, err := NewFileKeyStore(dir, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ks.Close()
+	if _, err := os.Stat(filepath.Join(dir, ".seed")); err != nil {
+		t.Fatalf("严格迁移失败时应保留 .seed: %v", err)
+	}
+	loaded, err := ks.LoadKeyPair(goodAid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded["private_key_pem"] != "GOOD_PRIVATE" {
+		t.Fatalf("自动迁移失败后应继续用旧 .seed 读取私钥: %v", loaded["private_key_pem"])
+	}
+}
+
 // ── GO-008: initSchema 版本迁移框架测试 ──────────────────────
 
 func TestInitSchema_NewDB_SetsCurrentVersion(t *testing.T) {

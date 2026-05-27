@@ -142,7 +142,7 @@ def _make_client(tag: str, rid: str | None = None) -> AUNClient:
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:
@@ -1616,7 +1616,7 @@ async def _ensure_connected_with_caps(client: AUNClient, aid: str, caps: dict) -
     """以指定 capabilities 上线（用于跨版本拦截测试）。其它行为与 _ensure_connected 一致。"""
     local = client._auth._keystore.load_identity(aid)
     if local is None:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:

@@ -116,7 +116,7 @@ async function installP0Helpers(page: any): Promise<void> {
       const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
       (client as any)._gatewayUrl = gateway;
       try {
-        await client.auth.createAid({ aid });
+        await client.auth.registerAid({ aid });
       } catch {
         // 已存在则忽略
       }
@@ -190,7 +190,7 @@ test.describe('P0-02: AID 创建失败路径（浏览器）', () => {
       const gateway = `https://gateway.${iss}`;
       (client as any)._gatewayUrl = gateway;
       try {
-        await client.auth.createAid({ aid: '' });
+        await client.auth.registerAid({ aid: '' });
         return { rejected: false, error: null };
       } catch (e: any) {
         return { rejected: true, error: e.message };
@@ -215,9 +215,9 @@ test.describe('P0-02: AID 创建失败路径（浏览器）', () => {
       (client2 as any)._gatewayUrl = gateway;
 
       try {
-        await client1.auth.createAid({ aid });
+        await client1.auth.registerAid({ aid });
         try {
-          await client2.auth.createAid({ aid });
+          await client2.auth.registerAid({ aid });
           return { behavior: 'idempotent' };
         } catch (e: any) {
           return { behavior: 'error', error: e.message };
@@ -491,7 +491,7 @@ test.describe('P0-04: Login 重放攻击（浏览器）', () => {
         const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
         (client as any)._gatewayUrl = gateway;
 
-        await client.auth.createAid({ aid });
+        await client.auth.registerAid({ aid });
 
         const auth1 = await client.auth.authenticate({ aid });
         if (!auth1?.access_token) {
@@ -685,7 +685,7 @@ test.describe('P0-03: Login 过期挑战（浏览器）', () => {
         const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
         (client as any)._gatewayUrl = gateway;
 
-        await client.auth.createAid({ aid });
+        await client.auth.registerAid({ aid });
 
         const auth1 = await client.auth.authenticate({ aid });
         if (!auth1?.access_token) {

@@ -88,41 +88,41 @@ describe('P0-14: 断线中 RPC 拒绝', () => {
 describe('P0-02: AID 创建参数校验', () => {
   it('空 AID 应抛出错误', async () => {
     const client = new AUNClient();
-    await expect(client.auth.createAid({ aid: '' })).rejects.toThrow();
+    await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow();
   });
 
   it('空 AID 错误消息应包含 requires aid', async () => {
     const client = new AUNClient();
-    await expect(client.auth.createAid({ aid: '' })).rejects.toThrow("requires 'aid'");
+    await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow("requires 'aid'");
   });
 
   it('不传 aid 字段应抛出错误', async () => {
     const client = new AUNClient();
-    await expect(client.auth.createAid({})).rejects.toThrow();
+    await expect(client.auth.registerAid({})).rejects.toThrow();
   });
 
   it('AID 名称过短（< 4 字符）应被 AuthFlow 拒绝', async () => {
     const client = new AUNClient();
     // 设置 _gatewayUrl 以跳过 discovery，触发 AuthFlow._validateAidName
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.createAid({ aid: 'ab' })).rejects.toThrow();
+    await expect(client.auth.registerAid({ aid: 'ab' })).rejects.toThrow();
   });
 
   it('AID 名称含大写应被拒绝', async () => {
     const client = new AUNClient();
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.createAid({ aid: 'Alice.aid.com' })).rejects.toThrow();
+    await expect(client.auth.registerAid({ aid: 'Alice.aid.com' })).rejects.toThrow();
   });
 
   it('AID 名称以 - 开头应被拒绝', async () => {
     const client = new AUNClient();
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.createAid({ aid: '-bad.aid.com' })).rejects.toThrow();
+    await expect(client.auth.registerAid({ aid: '-bad.aid.com' })).rejects.toThrow();
   });
 
   it('AID 名称以 guest 开头应被拒绝', async () => {
     const client = new AUNClient();
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.createAid({ aid: 'guestuser.aid.com' })).rejects.toThrow();
+    await expect(client.auth.registerAid({ aid: 'guestuser.aid.com' })).rejects.toThrow();
   });
 });

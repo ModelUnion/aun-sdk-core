@@ -48,7 +48,7 @@ function makeClient(): AUNClient {
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
   const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
   ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth);
 }
@@ -119,10 +119,10 @@ describe('P0-02: AID 创建失败路径（真实 Gateway）', () => {
       ((c1 as unknown) as { _gatewayUrl: string })._gatewayUrl = gw;
       ((c2 as unknown) as { _gatewayUrl: string })._gatewayUrl = gw;
 
-      await c1.auth.createAid({ aid });
+      await c1.auth.registerAid({ aid });
       // 第二次创建 — 要么报错要么幂等
       try {
-        await c2.auth.createAid({ aid });
+        await c2.auth.registerAid({ aid });
         // 幂等设计也可接受
       } catch (e) {
         // 报错也可接受
@@ -139,7 +139,7 @@ describe('P0-02: AID 创建失败路径（真实 Gateway）', () => {
     try {
       const gw = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
       ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gw;
-      await expect(client.auth.createAid({ aid: '' })).rejects.toThrow();
+      await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow();
     } finally {
       await client.close();
     }
@@ -441,7 +441,7 @@ describe('P0-04: Login 重放攻击（真实 Gateway）', () => {
       const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
       ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
 
-      await client.auth.createAid({ aid });
+      await client.auth.registerAid({ aid });
 
       const auth1 = await client.auth.authenticate({ aid });
       expect(auth1).toBeDefined();
@@ -530,7 +530,7 @@ describe('P0-03: Login 过期挑战（真实 Gateway）', () => {
       const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
       ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
 
-      await client.auth.createAid({ aid });
+      await client.auth.registerAid({ aid });
 
       const auth1 = await client.auth.authenticate({ aid });
       expect(auth1).toBeDefined();

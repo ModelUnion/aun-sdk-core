@@ -76,6 +76,13 @@ type pendingOrderedMessage struct {
 	payload any
 }
 
+// pullGateState Pull Gate 状态：序列化同一 key 的 pull 操作
+type pullGateState struct {
+	inflight  atomic.Bool
+	startedAt atomic.Int64
+	token     atomic.Uint64
+}
+
 func clampReconnectDelaySeconds(value float64, fallback float64, upper float64) float64 {
 	seconds := value
 	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
@@ -531,7 +538,7 @@ type AUNClient struct {
 	// Meta 命名空间
 	Meta *namespace.MetaNamespace
 
-	// AgentMDs 目录：{agentMDPath}/list.json 保存元数据，{agentMDPath}/{aid}/agent.md 保存正文。
+	// AgentMDs 目录：{agentMDPath}/{aid}/agentmd.json 保存元数据，{agentMDPath}/{aid}/agent.md 保存正文。
 	// gateway 在 RPC envelope._meta.agent_md_etag 注入服务端 etag；纯观察，无下游依赖。
 	agentMdMu            sync.RWMutex
 	agentMDPath          string
@@ -575,6 +582,10 @@ type AUNClient struct {
 	v2AutoProposeLocks        map[string]*sync.Mutex
 	v2AutoProposeLastSnapshot map[string]string
 	v2LazyProposeTriggered    map[string]int64
+
+	// Pull Gate：序列化同一 key 的 pull 操作，避免重复并发 pull
+	pullGates       sync.Map // key -> *pullGateState
+	pullGateStaleMs int64    // 默认 30000ms
 }
 
 // NewClient 创建 AUN 客户端
@@ -661,6 +672,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		v2SenderIKPending:          make(map[string]v2SenderIKPendingEntry),
 		v2SenderIKFetching:         make(map[string]bool),
 		heartbeatNudge:             make(chan struct{}, 1),
+		pullGateStaleMs:            30000,
 		sessionOptions: map[string]any{
 			"auto_reconnect":       true,
 			"heartbeat_interval":   30.0,
@@ -916,7 +928,13 @@ func (c *AUNClient) agentMDFilePath(aid string) (string, error) {
 	return filepath.Join(c.agentMDRoot(), safe, "agent.md"), nil
 }
 
-func (c *AUNClient) agentMDListPath() string { return filepath.Join(c.agentMDRoot(), "list.json") }
+func (c *AUNClient) agentMDMetaPath(aid string) (string, error) {
+	safe, err := agentMDSafeAID(aid)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(c.agentMDRoot(), safe, "agentmd.json"), nil
+}
 
 func atomicWriteText(path string, content []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -954,8 +972,15 @@ func atomicWriteText(path string, content []byte) error {
 	return nil
 }
 
-func (c *AUNClient) withAgentMDListLock(fn func() error) error {
-	lockPath := filepath.Join(c.agentMDRoot(), "list.json.lock")
+func (c *AUNClient) withAgentMDRecordLock(aid string, fn func() error) error {
+	metaPath, err := c.agentMDMetaPath(aid)
+	if err != nil {
+		return err
+	}
+	lockPath := metaPath + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return err
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	var f *os.File
 	for f == nil {
@@ -1036,80 +1061,36 @@ func agentMDMapToRecord(aid string, raw map[string]any) *keystore.AgentMDCacheRe
 	return rec
 }
 
-func (c *AUNClient) writeAgentMDListUnlocked(records map[string]*keystore.AgentMDCacheRecord) error {
-	out := make(map[string]any)
-	for aid, rec := range records {
-		if rec != nil && strings.TrimSpace(aid) != "" {
-			out[aid] = agentMDRecordToMap(rec)
-		}
+func (c *AUNClient) writeAgentMDRecordUnlocked(aid string, rec *keystore.AgentMDCacheRecord) error {
+	metaPath, err := c.agentMDMetaPath(aid)
+	if err != nil {
+		return err
 	}
-	payload := map[string]any{"version": 1, "updated_at": time.Now().UnixMilli(), "records": out}
-	data, err := json.MarshalIndent(payload, "", "  ")
+	m := agentMDRecordToMap(rec)
+	delete(m, "content")
+	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	return atomicWriteText(c.agentMDListPath(), data)
+	return atomicWriteText(metaPath, data)
 }
 
-func (c *AUNClient) normalizeAgentMDList(payload map[string]any) map[string]*keystore.AgentMDCacheRecord {
-	records := make(map[string]*keystore.AgentMDCacheRecord)
-	raw, _ := payload["records"].(map[string]any)
-	for aid, value := range raw {
-		m, ok := value.(map[string]any)
-		if !ok {
-			continue
-		}
-		rec := agentMDMapToRecord(aid, m)
-		if strings.TrimSpace(rec.AID) != "" {
-			records[rec.AID] = rec
-		}
-	}
-	return records
-}
-
-func (c *AUNClient) rebuildAgentMDListUnlocked() map[string]*keystore.AgentMDCacheRecord {
-	records := make(map[string]*keystore.AgentMDCacheRecord)
-	now := time.Now().UnixMilli()
-	entries, err := os.ReadDir(c.agentMDRoot())
-	if err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
-			aid := entry.Name()
-			path := filepath.Join(c.agentMDRoot(), aid, "agent.md")
-			data, err := os.ReadFile(path)
-			if err != nil {
-				continue
-			}
-			fetchedAt := now
-			if st, err := os.Stat(path); err == nil {
-				fetchedAt = st.ModTime().UnixMilli()
-			}
-			records[aid] = &keystore.AgentMDCacheRecord{AID: aid, LocalEtag: agentMDContentEtag(string(data)), FetchedAt: fetchedAt, UpdatedAt: now}
-		}
-	}
-	if err := c.writeAgentMDListUnlocked(records); err != nil {
-		c.log.Debug("agent.md list rebuild write failed: %v", err)
-	}
-	c.agentMdMu.Lock()
-	c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
-	c.agentMdMu.Unlock()
-	return records
-}
-
-func (c *AUNClient) readAgentMDListUnlocked() map[string]*keystore.AgentMDCacheRecord {
-	data, err := os.ReadFile(c.agentMDListPath())
+func (c *AUNClient) readAgentMDRecordUnlocked(aid string) *keystore.AgentMDCacheRecord {
+	metaPath, err := c.agentMDMetaPath(aid)
 	if err != nil {
-		return c.rebuildAgentMDListUnlocked()
+		return nil
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		c.log.Warn("agent.md list.json damaged, rebuilding: %v", err)
-		return c.rebuildAgentMDListUnlocked()
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil
 	}
-	return c.normalizeAgentMDList(payload)
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		c.log.Warn("agent.md agentmd.json damaged, ignoring: aid=%s err=%v", aid, err)
+		return nil
+	}
+	return agentMDMapToRecord(aid, raw)
 }
 func (c *AUNClient) loadAgentMDRecord(aid string) *keystore.AgentMDCacheRecord {
 	target := strings.TrimSpace(aid)
@@ -1117,11 +1098,8 @@ func (c *AUNClient) loadAgentMDRecord(aid string) *keystore.AgentMDCacheRecord {
 		return nil
 	}
 	var rec *keystore.AgentMDCacheRecord
-	if err := c.withAgentMDListLock(func() error {
-		records := c.readAgentMDListUnlocked()
-		if records[target] != nil {
-			rec = cloneAgentMDRecord(records[target])
-		}
+	if err := c.withAgentMDRecordLock(target, func() error {
+		rec = c.readAgentMDRecordUnlocked(target)
 		return nil
 	}); err != nil {
 		c.log.Debug("agent.md cache load skipped: aid=%s err=%v", target, err)
@@ -1170,17 +1148,15 @@ func (c *AUNClient) saveAgentMDRecord(aid string, fields keystore.AgentMDCacheUp
 		}
 	}
 	var rec *keystore.AgentMDCacheRecord
-	if err := c.withAgentMDListLock(func() error {
-		records := c.readAgentMDListUnlocked()
-		rec = &keystore.AgentMDCacheRecord{AID: target}
-		if existing := records[target]; existing != nil {
-			rec = cloneAgentMDRecord(existing)
+	if err := c.withAgentMDRecordLock(target, func() error {
+		rec = c.readAgentMDRecordUnlocked(target)
+		if rec == nil {
+			rec = &keystore.AgentMDCacheRecord{AID: target}
 		}
 		applyAgentMDCacheUpsert(rec, fields)
 		rec.Content = ""
 		rec.UpdatedAt = time.Now().UnixMilli()
-		records[target] = cloneAgentMDRecord(rec)
-		return c.writeAgentMDListUnlocked(records)
+		return c.writeAgentMDRecordUnlocked(target, rec)
 	}); err != nil {
 		c.log.Debug("agent.md cache save skipped: aid=%s err=%v", target, err)
 		return nil
@@ -1496,8 +1472,9 @@ func (c *AUNClient) CheckAgentMD(ctx context.Context, aid string, maxUnsyncedDay
 		verifyError = strings.TrimSpace(before.VerifyError)
 		checkedAtCached = before.CheckedAt
 	}
-	// max_unsynced_days > 0 且距上次 HEAD 在窗口内 → 直接返回缓存；否则强制 HEAD。
-	if localFound && localEtag != "" && remoteEtagCached != "" && localEtag == remoteEtagCached && agentMDCheckedAtFresh(checkedAtCached, maxDays) {
+	// max_unsynced_days > 0 且缓存仍在窗口内时直接返回，避免无意义 HEAD。
+	cacheFresh := agentMDCheckedAtFresh(checkedAtCached, maxDays) || agentMDLastModifiedFresh(lastModifiedCached, maxDays)
+	if localFound && localEtag != "" && remoteEtagCached != "" && localEtag == remoteEtagCached && cacheFresh {
 		return &AgentMDCheckResult{
 			AID:          target,
 			LocalFound:   true,
@@ -1683,9 +1660,9 @@ func (c *AUNClient) ReloadTrustedRoots() int {
 	return c.auth.ReloadTrustedRoots()
 }
 
-// AuthCreateAID 通过 AuthFlow 创建 AID
-func (c *AUNClient) AuthCreateAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
-	return c.auth.CreateAID(ctx, gatewayURL, aid)
+// AuthRegisterAID 通过 AuthFlow 注册 AID
+func (c *AUNClient) AuthRegisterAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
+	return c.auth.RegisterAID(ctx, gatewayURL, aid)
 }
 
 // AuthAuthenticate 通过 AuthFlow 认证 AID
@@ -2234,9 +2211,22 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 	if method == "message.thought.get" || method == "group.thought.get" {
 		c.log.Debug("thought.get transport call start: method=%s params=%s", method, summarizeCallParams(method, params))
 	}
-	result, err = c.transport.Call(callCtx, method, params)
-	if err != nil {
-		return nil, err
+
+	// Pull Gate：序列化同一 key 的 pull 操作
+	pullGateKey := c.pullGateKeyForCall(method, params)
+	if pullGateKey != "" {
+		gatedResult, gatedErr := c.runPullSerialized(callCtx, pullGateKey, func() (any, error) {
+			return c.transport.Call(callCtx, method, params)
+		})
+		if gatedErr != nil {
+			return nil, gatedErr
+		}
+		result = gatedResult
+	} else {
+		result, err = c.transport.Call(callCtx, method, params)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// V2-only thought.get：服务端只存 envelope，SDK 读取时按当前设备解密。

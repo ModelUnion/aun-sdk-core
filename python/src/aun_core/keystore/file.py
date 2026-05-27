@@ -177,6 +177,19 @@ class FileKeyStore(KeyStore):
             except Exception as exc:
                 self._log.error("keystore", "failed to close AID database: %s", exc, err=exc)
 
+    @staticmethod
+    def ChangeSeed(aun_path: str | Path, old_seed: str, new_seed: str) -> Any:
+        from .seed_migration import change_seed
+        return change_seed(aun_path, old_seed, new_seed)
+
+    def change_seed(self, old_seed: str, new_seed: str) -> Any:
+        from .seed_migration import change_seed
+        self.close()
+        result = change_seed(self._root, old_seed, new_seed, logger=self._log)
+        self._seed_bytes = str(new_seed).encode("utf-8")
+        self._sqlite_key = derive_sqlite_key(self._seed_bytes)
+        return result
+
     # ── 公共 API ─────────────────────────────────────────────
 
     def load_identity(self, aid: str) -> dict | None:

@@ -17,7 +17,7 @@ import (
 
 const (
 	e2eeSDKLang    = "go"
-	e2eeSDKVersion = "0.3.2"
+	e2eeSDKVersion = "0.3.4"
 )
 
 // EncryptP2PMessage 构造完整的 V2 P2P 加密 envelope（type=e2ee.p2p_encrypted）。
@@ -259,7 +259,8 @@ func normalizeProtectedHeaders(headers map[string]any, payload map[string]any) (
 		}
 	}
 	normalized["sdk_lang"] = e2eeSDKLang
-	normalized["sdk_vesion"] = e2eeSDKVersion
+	delete(normalized, "sdk_vesion")
+	normalized["sdk_version"] = e2eeSDKVersion
 	return normalized, nil
 }
 

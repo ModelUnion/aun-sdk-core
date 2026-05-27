@@ -56,7 +56,7 @@ async function connectLong(
   aid: string,
   slotId = 'main',
 ): Promise<void> {
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth, {
     auto_reconnect: false,

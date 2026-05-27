@@ -837,6 +837,12 @@ func TestConnectIncludesDeviceSlotAndDeliveryMode(t *testing.T) {
 	if clientParams["slot_id"] != "slot-a" {
 		t.Fatalf("auth.connect client.slot_id 不正确: %v", clientParams["slot_id"])
 	}
+	if clientParams["sdk_lang"] != "go" {
+		t.Fatalf("auth.connect client.sdk_lang 不正确: %v", clientParams["sdk_lang"])
+	}
+	if clientParams["sdk_version"] != Version {
+		t.Fatalf("auth.connect client.sdk_version 不正确: %v", clientParams["sdk_version"])
+	}
 	if deliveryMode["mode"] != "queue" || deliveryMode["routing"] != "sender_affinity" || toInt64(deliveryMode["affinity_ttl_ms"]) != 900 {
 		t.Fatalf("auth.connect delivery_mode 不正确: %#v", deliveryMode)
 	}

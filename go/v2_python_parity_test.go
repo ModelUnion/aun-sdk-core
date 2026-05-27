@@ -497,7 +497,7 @@ func TestDecryptV2MessageFallsBackToCACert(t *testing.T) {
 	if plaintext["payload_type"] != "text" {
 		t.Fatalf("应用层消息顶层 payload_type 应透传原始 payload.type，实际: %#v", plaintext)
 	}
-	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text"}) {
+	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text", "sdk_lang": "go", "sdk_version": "0.3.4"}) {
 		t.Fatalf("应用层消息顶层 protected_headers 应去 _auth 后透传，实际: %#v", plaintext["protected_headers"])
 	}
 	e2eeMeta, _ := plaintext["e2ee"].(map[string]any)
@@ -545,7 +545,7 @@ func TestDecryptV2MessageUndecryptableEventPreservesMetadata(t *testing.T) {
 		"recipients": []any{[]any{
 			bobAID, "dev-bob", "peer", "peer_device_prekey", "fp", "missing-spk", "n", "w",
 		}},
-		"protected_headers": map[string]any{"payload_type": "text", "trace_id": "trace-1", "_auth": "secret"},
+		"protected_headers": map[string]any{"payload_type": "text", "trace_id": "trace-1", "sdk_lang": "python", "sdk_version": "0.3.4", "_auth": "secret"},
 	}
 	envJSON, err := json.Marshal(envelope)
 	if err != nil {
@@ -568,7 +568,7 @@ func TestDecryptV2MessageUndecryptableEventPreservesMetadata(t *testing.T) {
 		if event["payload_type"] != "text" {
 			t.Fatalf("失败事件顶层 payload_type 不正确: %#v", event)
 		}
-		wantHeaders := map[string]any{"payload_type": "text", "trace_id": "trace-1"}
+		wantHeaders := map[string]any{"payload_type": "text", "trace_id": "trace-1", "sdk_lang": "python", "sdk_version": "0.3.4"}
 		if !reflect.DeepEqual(event["protected_headers"], wantHeaders) {
 			t.Fatalf("失败事件 protected_headers 应去 _auth 后透传: %#v", event["protected_headers"])
 		}
@@ -896,7 +896,7 @@ func TestV2GroupBootstrapStateSignatureFailureIsFatal(t *testing.T) {
 	c := newConnectedV2PullClientForTest(t, wsURL)
 	defer func() { _ = c.Close() }()
 	state := c.v2GetState()
-	if _, _, _, _, err := c.v2ResolveGroupBootstrap(context.Background(), state, "group.example.com/g1", false); err == nil {
+	if _, _, _, _, _, err := c.v2ResolveGroupBootstrap(context.Background(), state, "group.example.com/g1", false); err == nil {
 		t.Fatal("state_signature 无效时 group.v2.bootstrap 必须失败，不能继续信任 bootstrap")
 	}
 }

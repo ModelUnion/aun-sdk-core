@@ -38,6 +38,7 @@ type v2GroupBootstrapEntry struct {
 	Epoch           int
 	StateCommitment *e2ee.StateCommitmentAAD
 	CachedAt        time.Time
+	WrapPolicy      *v2WrapPolicy
 }
 
 // SendGroupV2 V2 Group 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。
@@ -76,7 +77,7 @@ func (c *AUNClient) SendGroupV2WithOpts(ctx context.Context, groupID string, pay
 // v2GroupSendOnce 单次 group 发送尝试。
 func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, groupID string, payload map[string]any, useCache bool, opts e2ee.EncryptOptions) (map[string]any, error) {
 	c.logE2.Debug("group.v2.send attempt: group=%s use_cache=%v", groupID, useCache)
-	allDevices, epoch, sc, auditRaw, err := c.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
+	allDevices, epoch, sc, auditRaw, wrapPolicy, err := c.v2ResolveGroupBootstrap(ctx, state, groupID, useCache)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +130,7 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 		return nil, fmt.Errorf("send_group_v2: 获取 sender identity 失败: %w", err)
 	}
 
+	sendTargets := v2ApplyWrapPolicyToTargets(targets, wrapPolicy)
 	envelope, err := e2ee.EncryptGroupMessage(
 		e2ee.Sender{
 			AID:      sender.AID,
@@ -138,7 +140,7 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 		},
 		groupID,
 		epoch,
-		targets,
+		sendTargets,
 		payload,
 		opts,
 		sc,
@@ -154,7 +156,7 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 	}, envelope, map[string]any{
 		"plaintext_payload": payload,
 		"epoch":             epoch,
-		"target_count":      len(targets),
+		"target_count":      len(sendTargets),
 		"audit_count":       len(auditRaw),
 		"use_cache":         useCache,
 	})
@@ -175,31 +177,35 @@ func (c *AUNClient) v2GroupSendOnce(ctx context.Context, state *v2P2PState, grou
 }
 
 // v2ResolveGroupBootstrap 解析群 bootstrap（缓存优先）。
-// 返回 (devices, epoch, stateCommitment, auditRecipients, error)。
-func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, error) {
+// 返回 (devices, epoch, stateCommitment, auditRecipients, wrapPolicy, error)。
+func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PState, groupID string, useCache bool) ([]map[string]any, int, *e2ee.StateCommitmentAAD, []map[string]any, *v2WrapPolicy, error) {
 	if useCache {
 		state.bootstrapCacheM.Lock()
 		entry, ok := state.groupBootstrapCache[groupID]
 		state.bootstrapCacheM.Unlock()
 		if ok && time.Since(entry.CachedAt) < v2GroupBootstrapTTL {
 			c.logE2.Debug("group.v2.bootstrap cache hit: group=%s devices=%d audit=%d epoch=%d", groupID, len(entry.Devices), len(entry.AuditRecipients), entry.Epoch)
-			return entry.Devices, entry.Epoch, entry.StateCommitment, entry.AuditRecipients, nil
+			return entry.Devices, entry.Epoch, entry.StateCommitment, entry.AuditRecipients, entry.WrapPolicy, nil
 		}
 	}
 
-	raw, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{"group_id": groupID})
+	raw, err := c.Call(ctx, "group.v2.bootstrap", map[string]any{
+		"group_id":               groupID,
+		"e2ee_wrap_capabilities": v2WrapCapabilities(),
+	})
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("V2 group bootstrap: %w", err)
+		return nil, 0, nil, nil, nil, fmt.Errorf("V2 group bootstrap: %w", err)
 	}
 	bs, _ := raw.(map[string]any)
 	devices := v2ToMapList(bs["devices"])
 	epoch := int(toInt64(bs["epoch"]))
 	auditRecipients := v2ToMapList(bs["audit_recipients"])
+	wrapPolicy := v2NormalizeWrapPolicy(bs["e2ee_wrap_policy"])
 	c.logE2.Debug("group.v2.bootstrap fetched: group=%s devices=%d audit=%d epoch=%d members=%d", groupID, len(devices), len(auditRecipients), epoch, len(v2ToStringList(bs["member_aids"])))
 
 	c.v2CheckFork(ctx, groupID, v2AsString(bs["state_chain"]))
 	if err := c.v2VerifyStateSignature(ctx, groupID, bs); err != nil {
-		return nil, 0, nil, nil, err
+		return nil, 0, nil, nil, nil, err
 	}
 
 	// 提取 state_commitment
@@ -220,6 +226,7 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 			Epoch:           epoch,
 			StateCommitment: sc,
 			CachedAt:        time.Now(),
+			WrapPolicy:      wrapPolicy,
 		}
 		state.bootstrapCacheM.Unlock()
 	}
@@ -228,7 +235,7 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 	if len(pendingAdds) > 0 {
 		c.v2MaybeTriggerAutoPropose(groupID)
 	}
-	return devices, epoch, sc, auditRecipients, nil
+	return devices, epoch, sc, auditRecipients, wrapPolicy, nil
 }
 
 // PullGroupV2 拉取并解密 V2 Group 消息。

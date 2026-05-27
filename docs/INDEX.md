@@ -10,6 +10,7 @@
 | --- | --- |
 | [aun测试运行指南](aun测试运行指南.md) | 当前 Docker 单域、双域、多语言 SDK 测试运行命令 |
 | [跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md) | 多语言 SDK 同网同服、test-runner 控制面的跨语言 E2E 方案 |
+| [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md) | SDK bootstrap 能力声明 + 服务端 policy 控制 1DH/per-AID wrap 的兼容方案 |
 | [AUN RPC Trace 增强设计](design/2026-05-22-aun-rpc-trace-enhancement.md) | RPC trace 诊断字段与 enter/exit span 设计 |
 | [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 缓存、SQLite 表、消息信封与 RPC 响应 ETag 透传方案 |
 | [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE 手册的子索引 |
@@ -44,6 +45,7 @@
 ### E2EE 与跨语言一致性
 
 - SDK E2EE API、会话管理、ProtectedHeaders → [SDK 文档索引](sdk/INDEX.md)
+- E2EE V2 1DH/per-AID wrap、bootstrap 能力声明、服务端 fanout → [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md)
 - 共享测试向量、transcript 回放、Python / TS / Go / C++ E2EE 互通 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 
 ---
@@ -57,6 +59,10 @@
 ### 跨语言容器E2E测试方案
 
 定义多语言 SDK 同时作为真实客户端运行的目标测试体系。核心模型是每个语言一个客户端容器，全连接同一 AUN server / gateway；业务消息走 AUN，test-runner 通过每个客户端暴露的 test-control HTTP API 编排动作和断言结果。当前单域落地覆盖 Python / TypeScript / Go / C++，浏览器 JavaScript 仍按宿主机 Playwright 运行。
+
+### E2EE V2 简化为 1DH + Per-AID Wrap 方案
+
+定义新 SDK 通过 bootstrap 入参声明 `e2ee_wrap_capabilities`，服务端再返回实际 `e2ee_wrap_policy`；旧 SDK 未声明时保留 legacy `3DH/device`。policy 不进入 envelope 或 AAD。方案规定 per-AID row 使用现有 8 字段结构并以 `device_id=""` 标识，服务端按真实 device fanout 但保存 `recipient_row_json` 原始 row，pull 时用原始 row 重建 recipient，确保 Merkle proof 和历史消息兼容。
 
 ### AUN RPC Trace 增强设计
 

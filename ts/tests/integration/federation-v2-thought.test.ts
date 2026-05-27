@@ -38,7 +38,7 @@ function makeClient(tag: string): AUNClient {
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth);
   // V2 session 必须显式初始化

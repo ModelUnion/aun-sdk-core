@@ -59,9 +59,9 @@ async def _connect_client(client: AUNClient, aid: str) -> None:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
         try:
-            await client.auth.create_aid({"aid": aid})
+            await client.auth.register_aid({"aid": aid})
         except Exception as e:
-            print(f"  [connect] create_aid skipped ({e.__class__.__name__}): {aid}")
+            print(f"  [connect] register_aid skipped ({e.__class__.__name__}): {aid}")
 
     last_error: Exception | None = None
     for attempt in range(4):
@@ -353,30 +353,107 @@ class V2P2PTestRunner:
         print(f"(push received: '{msg['payload']['text'][:30]}...')", end=" ")
 
     async def test_spk_rotation_on_consume(self):
-        """消费当前活跃 SPK 后自动轮换：Bob 收到用自己当前 SPK 加密的消息后，SPK 应自动 rotate"""
+        """legacy 3DH/per-device 消费当前 SPK 后自动轮换。
+
+        新 SDK 高层 send 会按服务端 policy 默认走 1DH/per-AID；SPK 轮换只应由
+        实际 3DH/per-device 消费触发，所以这里显式使用未声明能力的 legacy
+        bootstrap 构造 3DH envelope。
+        """
+        from aun_core.v2.e2ee.encrypt_p2p import encrypt_p2p_message
+
         bob = self.bob_client
+        alice = self.alice_client
+
+        # 先主动发布一代新 SPK，确保 legacy bootstrap 能拿到本进程当前 SPK。
+        await bob._v2_session.rotate_spk(bob.call)
         old_spk_id = bob._v2_session._spk_id
         assert old_spk_id, "Bob should have an active SPK"
 
-        # 清除 Alice 的 bootstrap 缓存，让她重新拉 Bob 最新 SPK
-        self.alice_client._v2_bootstrap_cache.clear()
+        alice._v2_bootstrap_cache.clear()
+        legacy = await alice.call("message.v2.bootstrap", {"peer_aid": _BOB_AID})
+        policy = legacy.get("e2ee_wrap_policy") if isinstance(legacy, dict) else {}
+        assert policy.get("protocol") == "3DH" and policy.get("scope") == "device", \
+            f"legacy bootstrap should return 3DH/device policy, got {policy}"
 
-        # Alice 发消息给 Bob（会用 Bob 当前 SPK 做 3DH wrap）
-        await self.alice_client.call("message.send", {
+        targets = []
+        current_device_target = None
+        for dev in legacy.get("peer_devices", []):
+            candidate = await alice._v2_build_target_from_device(
+                dev,
+                aid=_BOB_AID,
+                device_id=dev.get("device_id", ""),
+                role="peer",
+                default_key_source="peer_device_prekey",
+            )
+            if not candidate:
+                continue
+            targets.append(candidate)
+            if (
+                candidate.get("device_id") == bob._device_id
+                and candidate.get("spk_id") == old_spk_id
+                and candidate.get("spk_pk_der")
+            ):
+                current_device_target = candidate
+        assert current_device_target is not None, (
+            f"legacy bootstrap did not include Bob current SPK: {old_spk_id}; "
+            f"got {[d.get('spk_id') for d in legacy.get('peer_devices', [])]}"
+        )
+        assert targets, "legacy bootstrap should produce peer device targets"
+
+        text = f"spk-rotate-trigger-3dh-{int(time.time())}"
+        envelope = encrypt_p2p_message(
+            sender=alice._v2_session.get_sender_identity(),
+            target_set={"targets": targets, "audit_recipients": []},
+            payload={"text": text},
+            message_id=f"m-spk3dh-{int(time.time() * 1000)}",
+            timestamp=int(time.time() * 1000),
+        )
+        row = next(
+            (
+                r for r in envelope.get("recipients", [])
+                if r[0] == _BOB_AID and r[1] == bob._device_id
+            ),
+            None,
+        )
+        assert envelope.get("aad", {}).get("wrap_protocol") == "3DH", envelope.get("aad")
+        assert row and row[1] and row[3] == "peer_device_prekey" and row[5] == old_spk_id, row
+
+        self._bob_push_msgs.clear()
+        await alice.call("message.send", {
             "to": _BOB_AID,
-            "payload": {"text": f"spk-rotate-trigger-{int(time.time())}"},
+            "payload": envelope,
+            "encrypt": False,
         })
-        # 等待 push 触发解密 → SPK rotation（后台 task）
+
+        received = None
+        for _ in range(30):
+            await asyncio.sleep(0.2)
+            for msg in self._bob_push_msgs:
+                if isinstance(msg, dict) and msg.get("payload", {}).get("text") == text:
+                    received = msg
+                    break
+            if received:
+                break
+
+        if received is None:
+            messages = (await bob.call("message.pull", {"limit": 50, "max_pages": 5})).get("messages", [])
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("payload", {}).get("text") == text:
+                    received = msg
+                    break
+
+        assert received is not None, "Bob should decrypt legacy 3DH message"
+
+        # 等待解密消费当前 SPK 后触发后台 rotation。
         for _ in range(30):
             await asyncio.sleep(0.2)
             if bob._v2_session._spk_id != old_spk_id:
                 break
-
         new_spk_id = bob._v2_session._spk_id
         assert new_spk_id != old_spk_id, (
-            f"SPK should have rotated after consumption: old={old_spk_id} new={new_spk_id}"
+            f"SPK should have rotated after 3DH consumption: old={old_spk_id} new={new_spk_id}"
         )
-        print(f"(old={old_spk_id[:20]}... new={new_spk_id[:20]}...)", end=" ")
+        print(f"(3DH old={old_spk_id[:20]}... new={new_spk_id[:20]}...)", end=" ")
 
     async def test_old_spk_still_decryptable(self):
         """SPK 轮换后，用旧 SPK 加密的消息仍可解密（旧 SPK 私钥保留在 keystore）"""
@@ -426,7 +503,7 @@ class V2P2PTestRunner:
         new_client = _make_client(new_aid)
         try:
             # 只注册 AID（拿到证书），不 connect（不上传 SPK）
-            await new_client.auth.create_aid({"aid": new_aid})
+            await new_client.auth.register_aid({"aid": new_aid})
 
             # 清除 Alice 的 bootstrap 缓存
             self.alice_client._v2_bootstrap_cache.clear()

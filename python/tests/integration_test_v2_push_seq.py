@@ -71,9 +71,9 @@ async def _ensure_connected(client: AUNClient, aid: str) -> None:
     local = client._auth._keystore.load_identity(aid)
     if local is None:
         try:
-            await client.auth.create_aid({"aid": aid})
+            await client.auth.register_aid({"aid": aid})
         except Exception as exc:
-            print(f"  [connect] create_aid skipped: aid={aid} err={exc}")
+            print(f"  [connect] register_aid skipped: aid={aid} err={exc}")
 
     last_error: Exception | None = None
     for attempt in range(4):

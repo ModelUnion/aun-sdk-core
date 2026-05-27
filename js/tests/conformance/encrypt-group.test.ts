@@ -3,7 +3,7 @@ import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group';
 import { decryptMessage } from '../../src/v2/e2ee/decrypt';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh';
 
-const SDK_VERSION = '0.3.2';
+const SDK_VERSION = '0.3.4';
 
 describe('encryptGroupMessage - self loop', () => {
   it('group 3DH+1DH: bob 3DH, carol 1DH', async () => {
@@ -56,8 +56,9 @@ describe('encryptGroupMessage - self loop', () => {
     });
     expect((env as any).protected_headers).toMatchObject({
       sdk_lang: 'javascript',
-      sdk_vesion: SDK_VERSION,
+      sdk_version: SDK_VERSION,
     });
+    expect((env as any).protected_headers.sdk_vesion).toBeUndefined();
 
     // Bob 解密
     const decBob = await decryptMessage(
@@ -196,7 +197,8 @@ describe('encryptGroupMessage - self loop', () => {
     expect((env as any).payload_type).toBe('group-text');
     expect((env as any).protected_headers.payload_type).toBe('group-text');
     expect((env as any).protected_headers.sdk_lang).toBe('javascript');
-    expect((env as any).protected_headers.sdk_vesion).toBe(SDK_VERSION);
+    expect((env as any).protected_headers.sdk_version).toBe(SDK_VERSION);
+    expect((env as any).protected_headers.sdk_vesion).toBeUndefined();
     await expect(decryptMessage(
       env,
       'bob.aid.com',

@@ -246,66 +246,130 @@ func (a *AuthFlow) SetDeliveryMode(deliveryMode map[string]any) {
 	a.deliveryMode = copyMapShallow(deliveryMode)
 }
 
-// ── AID 创建 ────────────────────────────────────────────────
+// ── AID 注册 ────────────────────────────────────────────────
 
-// CreateAID 注册新 AID，返回 {aid, cert}。
-// 本地有密钥但无证书时，先尝试注册；若 AID 已存在则尝试下载证书恢复。
-func (a *AuthFlow) CreateAID(ctx context.Context, gatewayURL, aid string) (result map[string]any, err error) {
+// RegisterAID 严格注册新 AID：先查远端是否已存在，确认未注册后才生成并落盘本地密钥。
+func (a *AuthFlow) RegisterAID(ctx context.Context, gatewayURL, aid string) (result map[string]any, err error) {
 	tStart := time.Now()
-	pkgLogAuth().Debug("CreateAID enter: aid=%s gateway=%s", aid, gatewayURL)
+	pkgLogAuth().Debug("RegisterAID enter: aid=%s gateway=%s", aid, gatewayURL)
 	defer func() {
 		if err != nil {
-			pkgLogAuth().Debug("CreateAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
+			pkgLogAuth().Debug("RegisterAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
 		} else {
-			pkgLogAuth().Debug("CreateAID exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
+			pkgLogAuth().Debug("RegisterAID exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
 		}
 	}()
 	if err = validateAIDName(aid); err != nil {
 		return nil, err
 	}
-	identity := a.ensureLocalIdentity(aid)
-	if cert := authGetStr(identity, "cert"); cert != "" {
-		return map[string]any{"aid": identity["aid"], "cert": cert}, nil
-	}
 
-	// 本地有密钥但无证书 — 尝试服务端注册
-	created, createErr := a.createAIDRemote(ctx, gatewayURL, identity)
-	if createErr != nil {
-		// 优先检查结构化错误码：4090/409 = Conflict（AID 已存在）
-		var aunErr *AUNError
-		isConflict := false
-		if errors.As(createErr, &aunErr) {
-			isConflict = aunErr.Code == 4090 || aunErr.Code == 409
-		}
-		// 降级：兼容旧版服务端的字符串匹配
-		if !isConflict {
-			isConflict = strings.Contains(createErr.Error(), "already exists")
-		}
-		if isConflict {
-			recovered, recoverErr := a.recoverCertViaDownload(ctx, gatewayURL, identity)
-			if recoverErr != nil {
-				err = NewStateError(fmt.Sprintf(
-					"AID %s already registered on server but local certificate is missing. "+
-						"Certificate download recovery failed. Options: "+
-						"(1) use a different AID name, or "+
-						"(2) restart Kite server to clear registration.", aid))
+	// Step 1: 本地已有身份的幂等/恢复检查
+	existing, _ := a.keystore.LoadIdentity(aid)
+	if existing != nil {
+		hasPriv := authGetStr(existing, "private_key_pem") != ""
+		hasPub := authGetStr(existing, "public_key_der_b64") != ""
+		hasCert := authGetStr(existing, "cert") != ""
+		if hasPriv && hasPub {
+			localPubB64 := authGetStr(existing, "public_key_der_b64")
+			if hasCert {
+				// 本地完整身份 → 幂等校验服务端公钥匹配
+				pkgLogAuth().Debug("RegisterAID: local identity complete, checking server for idempotency: aid=%s", aid)
+				serverCertPEM, dlErr := a.downloadRegisteredCert(ctx, gatewayURL, aid)
+				if dlErr != nil {
+					return nil, dlErr
+				}
+				if serverCertPEM == "" {
+					return nil, NewIdentityConflictError(fmt.Sprintf(
+						"AID '%s' has local keypair+cert but is not registered on server. "+
+							"Remove AIDs/%s/ directory to retry registration cleanly.", aid, aid))
+				}
+				if !authCertMatchesPubKey(serverCertPEM, localPubB64) {
+					return nil, NewIdentityConflictError(fmt.Sprintf(
+						"AID '%s' is registered by another party on server (public key mismatch). "+
+							"Choose a different name.", aid))
+				}
+				pkgLogAuth().Info("RegisterAID: idempotent return for already-registered AID: aid=%s", aid)
+				a.aid = aid
+				return map[string]any{"aid": aid, "cert": authGetStr(existing, "cert")}, nil
+			}
+			// 本地有 keypair 但无 cert — 尝试从服务端恢复
+			pkgLogAuth().Debug("RegisterAID: local keypair exists without cert, attempting recovery: aid=%s", aid)
+			serverCertPEM, dlErr := a.downloadRegisteredCert(ctx, gatewayURL, aid)
+			if dlErr != nil {
+				return nil, dlErr
+			}
+			if serverCertPEM != "" {
+				// 服务端已注册，比对公钥
+				if !authCertMatchesPubKey(serverCertPEM, localPubB64) {
+					return nil, NewIdentityConflictError(fmt.Sprintf(
+						"AID '%s' is registered by another party on server (public key mismatch). "+
+							"Choose a different name.", aid))
+				}
+				// 公钥匹配 → 下载证书完成注册
+				existing["cert"] = serverCertPEM
+				if persistErr := a.persistIdentity(existing); persistErr != nil {
+					return nil, persistErr
+				}
+				pkgLogAuth().Info("RegisterAID: recovered cert from server for half-state AID: aid=%s", aid)
+				a.aid = aid
+				return map[string]any{"aid": aid, "cert": serverCertPEM}, nil
+			}
+			// 服务端未注册 → 用现有 keypair 发起注册
+			pkgLogAuth().Debug("RegisterAID: server has no record, registering with existing keypair: aid=%s", aid)
+			created, createErr := a.createAIDRemote(ctx, gatewayURL, existing)
+			if createErr != nil {
+				if authIsConflictError(createErr) {
+					return nil, NewIdentityConflictError(fmt.Sprintf("AID %s is already registered", aid))
+				}
+				return nil, createErr
+			}
+			existing["cert"] = created["cert"]
+			if err = a.assertCertMatchesLocalKeypair(existing); err != nil {
 				return nil, err
 			}
-			identity = recovered
-		} else {
-			err = createErr
-			return nil, err
+			if persistErr := a.persistIdentity(existing); persistErr != nil {
+				return nil, persistErr
+			}
+			a.aid = aid
+			return map[string]any{"aid": aid, "cert": existing["cert"]}, nil
 		}
-	} else {
-		identity["cert"] = created["cert"]
 	}
 
-	if persistErr := a.persistIdentity(identity); persistErr != nil {
-		err = persistErr
+	// Step 2: 先查服务端确认未注册
+	certPEM, err := a.downloadRegisteredCert(ctx, gatewayURL, aid)
+	if err != nil {
 		return nil, err
 	}
-	a.aid = authGetStr(identity, "aid")
-	return map[string]any{"aid": identity["aid"], "cert": identity["cert"]}, nil
+	if certPEM != "" {
+		return nil, NewIdentityConflictError(fmt.Sprintf("AID %s is already registered", aid))
+	}
+
+	crypto := a.crypto
+	if crypto == nil {
+		crypto = &CryptoProvider{}
+	}
+	identity, err := crypto.GenerateIdentity()
+	if err != nil {
+		return nil, NewAuthError(fmt.Sprintf("failed to generate identity: %v", err))
+	}
+	identity["aid"] = aid
+
+	created, err := a.createAIDRemote(ctx, gatewayURL, identity)
+	if err != nil {
+		if authIsConflictError(err) {
+			return nil, NewIdentityConflictError(fmt.Sprintf("AID %s is already registered", aid))
+		}
+		return nil, err
+	}
+	identity["cert"] = created["cert"]
+	if err = a.assertCertMatchesLocalKeypair(identity); err != nil {
+		return nil, err
+	}
+	if err = a.persistIdentity(identity); err != nil {
+		return nil, err
+	}
+	a.aid = aid
+	return map[string]any{"aid": aid, "cert": identity["cert"]}, nil
 }
 
 // ── 认证流程 ────────────────────────────────────────────────
@@ -321,7 +385,7 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 			pkgLogAuth().Debug("Authenticate exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
 		}
 	}()
-	identity, err := a.loadIdentityOrRaise(aid)
+	identity, err := a.loadIdentityRaw(aid)
 	if err != nil {
 		pkgLogAuth().Error("failed to load identity: aid=%s err=%v", aid, err)
 		return nil, err
@@ -365,6 +429,10 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 			}, nil
 		}
 	}
+	if err := authValidateLoadedIdentity(authGetStr(identity, "aid"), identity); err != nil {
+		pkgLogAuth().Error("loaded identity is incomplete: aid=%s err=%v", aid, err)
+		return nil, err
+	}
 
 	// 本地有密钥但无证书 — 尝试从 PKI 下载恢复
 	if authGetStr(identity, "cert") == "" {
@@ -374,7 +442,7 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 			pkgLogAuth().Error("certificate recovery failed: aid=%s err=%v", authGetStr(identity, "aid"), recoverErr)
 			return nil, NewStateError(fmt.Sprintf(
 				"local certificate missing and recovery failed: %v. "+
-					"Run auth.create_aid() to register a new identity.", recoverErr))
+					"Run auth.register_aid() to register a new identity.", recoverErr))
 		}
 		identity = recovered
 		if err := a.persistIdentity(identity); err != nil {
@@ -382,29 +450,15 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 		}
 	}
 
+	// 防线 B：发起两步登录前显式校验 cert 公钥与本地 keypair 公钥一致
+	if err := a.assertCertMatchesLocalKeypair(identity); err != nil {
+		return nil, err
+	}
+
 	login, err := a.login(ctx, gatewayURL, identity)
 	if err != nil {
-		// 证书未在服务端注册或公钥不匹配 — 自动重新注册
-		if strings.Contains(err.Error(), "not registered") || strings.Contains(err.Error(), "public key mismatch") {
-			pkgLogAuth().Warn("certificate not registered on server, auto re-registering: aid=%s", authGetStr(identity, "aid"))
-			created, createErr := a.createAIDRemote(ctx, gatewayURL, identity)
-			if createErr != nil {
-				pkgLogAuth().Error("auto re-registration failed: aid=%s err=%v", authGetStr(identity, "aid"), createErr)
-				return nil, err
-			}
-			identity["cert"] = created["cert"]
-			if persistErr := a.persistIdentity(identity); persistErr != nil {
-				return nil, persistErr
-			}
-			login, err = a.login(ctx, gatewayURL, identity)
-			if err != nil {
-				pkgLogAuth().Error("login still failed after re-registration: aid=%s err=%v", authGetStr(identity, "aid"), err)
-				return nil, err
-			}
-		} else {
-			pkgLogAuth().Error("login failed: aid=%s err=%v", authGetStr(identity, "aid"), err)
-			return nil, err
-		}
+		pkgLogAuth().Error("login failed: aid=%s err=%v", authGetStr(identity, "aid"), err)
+		return nil, err
 	}
 	authRememberTokens(identity, login)
 	a.validateNewCert(ctx, identity, gatewayURL)
@@ -434,17 +488,13 @@ func (a *AuthFlow) EnsureAuthenticated(ctx context.Context, gatewayURL string) (
 			pkgLogAuth().Debug("EnsureAuthenticated exit: aid=%s elapsed=%dms", a.aid, time.Since(tStart).Milliseconds())
 		}
 	}()
-	identity := a.ensureIdentity()
+	identity, err := a.loadIdentityOrRaise("")
+	if err != nil {
+		return nil, err
+	}
 
 	if authGetStr(identity, "cert") == "" {
-		created, err := a.createAIDRemote(ctx, gatewayURL, identity)
-		if err != nil {
-			return nil, err
-		}
-		identity["cert"] = created["cert"]
-		if err := a.persistIdentity(identity); err != nil {
-			return nil, err
-		}
+		return nil, NewStateError("no certificate found, call auth.register_aid() first")
 	}
 
 	login, err := a.login(ctx, gatewayURL, identity)
@@ -794,6 +844,21 @@ func (a *AuthFlow) createAIDRemote(ctx context.Context, gatewayURL string, ident
 		return nil, err
 	}
 	return map[string]any{"cert": response["cert"]}, nil
+}
+
+func authIsConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var identityConflict *IdentityConflictError
+	if errors.As(err, &identityConflict) {
+		return true
+	}
+	var aunErr *AUNError
+	if errors.As(err, &aunErr) {
+		return aunErr.Code == 4090 || aunErr.Code == 409
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
 
 // ── 内部：两阶段登录 ───────────────────────────────────────
@@ -1363,7 +1428,9 @@ func (a *AuthFlow) initializeSession(ctx context.Context, transport *RPCTranspor
 			"type": "sdk",
 		},
 		"client": map[string]any{
-			"slot_id": a.slotID,
+			"slot_id":     a.slotID,
+			"sdk_lang":    "go",
+			"sdk_version": Version,
 		},
 		"delivery_mode": copyMapShallow(a.deliveryMode),
 		"capabilities":  caps,
@@ -1525,37 +1592,99 @@ func syncActiveCert(identity map[string]any) {
 func (a *AuthFlow) recoverCertViaDownload(ctx context.Context, gatewayURL string, identity map[string]any) (map[string]any, error) {
 	aid := authGetStr(identity, "aid")
 	pkgLogAuth().Debug("recoverCertViaDownload entry: aid=%s gateway=%s", aid, gatewayURL)
-	certURL := authGatewayHTTPURL(gatewayURL, fmt.Sprintf("/pki/cert/%s", aid))
-	certPEM, err := a.fetchText(ctx, certURL)
+	certPEM, err := a.downloadRegisteredCert(ctx, gatewayURL, aid)
 	if err != nil {
 		return nil, err
 	}
-	if certPEM == "" || !strings.Contains(certPEM, "BEGIN CERTIFICATE") {
+	if certPEM == "" {
 		return nil, NewAuthError(fmt.Sprintf("failed to download certificate for %s", aid))
 	}
 
-	// 验证下载证书的公钥与本地密钥对匹配
+	identity["cert"] = certPEM
+	if err := a.assertCertMatchesLocalKeypair(identity); err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
+// downloadRegisteredCert 下载已注册 AID 的证书；404 表示未注册，返回空字符串。
+func (a *AuthFlow) downloadRegisteredCert(ctx context.Context, gatewayURL string, aid string) (string, error) {
+	certURL := authGatewayHTTPURL(gatewayURL, fmt.Sprintf("/pki/cert/%s", aid))
+	client := a.httpClient()
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, certURL, nil)
+	if err != nil {
+		return "", NewAuthError(fmt.Sprintf("failed to create certificate request for %s", aid))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", NewAuthError(fmt.Sprintf("failed to download certificate for %s: %v", aid, err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", NewAuthError(fmt.Sprintf("failed to download certificate for %s: HTTP %d", aid, resp.StatusCode))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", NewAuthError(fmt.Sprintf("failed to read certificate response for %s", aid))
+	}
+	certPEM := string(body)
+	if !strings.Contains(certPEM, "BEGIN CERTIFICATE") {
+		return "", nil
+	}
+	return certPEM, nil
+}
+
+// assertCertMatchesLocalKeypair 验证证书公钥与本地 key.json 中的公钥一致。
+func (a *AuthFlow) assertCertMatchesLocalKeypair(identity map[string]any) error {
+	aid := authGetStr(identity, "aid")
+	certPEM := authGetStr(identity, "cert")
+	if certPEM == "" {
+		return NewAuthError(fmt.Sprintf("certificate missing for %s", aid))
+	}
+	localPubB64 := authGetStr(identity, "public_key_der_b64")
+	if localPubB64 == "" {
+		return NewAuthError(fmt.Sprintf("local public key missing for %s", aid))
+	}
 	cert, err := authParsePEMCertificate(certPEM)
 	if err != nil {
-		return nil, NewAuthError(fmt.Sprintf("failed to parse downloaded certificate for %s", aid))
+		return NewAuthError(fmt.Sprintf("failed to parse downloaded certificate for %s", aid))
 	}
 	certPubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
 	if err != nil {
-		return nil, NewAuthError("failed to marshal downloaded certificate public key")
+		return NewAuthError("failed to marshal downloaded certificate public key")
 	}
-	localPubB64 := authGetStr(identity, "public_key_der_b64")
 	localPubDER, err := base64.StdEncoding.DecodeString(localPubB64)
 	if err != nil {
-		return nil, NewAuthError("failed to decode local public key")
+		return NewAuthError("failed to decode local public key")
 	}
 	if !authBytesEqual(certPubDER, localPubDER) {
-		return nil, NewAuthError(fmt.Sprintf(
+		return NewAuthError(fmt.Sprintf(
 			"downloaded certificate public key does not match local key pair for %s. "+
 				"The server has a different key registered - this AID cannot be recovered with the current key.", aid))
 	}
+	return nil
+}
 
-	identity["cert"] = certPEM
-	return identity, nil
+// authCertMatchesPubKey 比较 PEM 证书的公钥与 base64 编码的 SPKI DER 是否一致。
+func authCertMatchesPubKey(certPEM, localPubB64 string) bool {
+	cert, err := authParsePEMCertificate(certPEM)
+	if err != nil {
+		return false
+	}
+	certPubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return false
+	}
+	localPubDER, err := base64.StdEncoding.DecodeString(localPubB64)
+	if err != nil {
+		return false
+	}
+	return authBytesEqual(certPubDER, localPubDER)
 }
 
 // ── 内部：HTTP 请求 ─────────────────────────────────────────
@@ -1636,50 +1765,19 @@ func validateAIDName(aid string) error {
 	return nil
 }
 
-// ensureLocalIdentity 确保本地有指定 AID 的密钥对（无则生成）。
-//
-// 必须确认有 keypair（private_key_pem + public_key_der_b64）才算"已存在"，
-// 否则 keystore 可能只有 metadata（如 gateway_url）但没有真正的密钥材料。
-// 与 Python SDK auth.py:_ensure_local_identity 对齐。
-func (a *AuthFlow) ensureLocalIdentity(aid string) map[string]any {
-	existing, _ := a.keystore.LoadIdentity(aid)
-	if existing != nil {
-		// 必须同时有 private_key_pem 和 public_key_der_b64 才算"真已存在"
-		hasPriv := authGetStr(existing, "private_key_pem") != ""
-		hasPub := authGetStr(existing, "public_key_der_b64") != ""
-		if hasPriv && hasPub {
-			a.aid = aid
-			return existing
-		}
-	}
-	identity, err := a.crypto.GenerateIdentity()
-	if err != nil {
-		return map[string]any{"aid": aid}
-	}
-	identity["aid"] = aid
-	// 保留 keystore 已有的 metadata（如 gateway_url），避免覆盖
-	if existing != nil {
-		for k, v := range existing {
-			if k == "aid" {
-				continue
-			}
-			if _, exists := identity[k]; exists {
-				continue
-			}
-			identity[k] = v
-		}
-	}
-	// H24: 持久化失败不能静默吞
-	if perr := a.persistIdentity(identity); perr != nil {
-		pkgLogAuth().Warn("[aun_core.auth] ERROR persistIdentity failed aid=%s: %v", aid, perr)
-		a.lastPersistErr = perr
-	}
-	a.aid = aid
-	return identity
-}
-
 // loadIdentityOrRaise 加载身份，不存在时返回 StateError
 func (a *AuthFlow) loadIdentityOrRaise(aid string) (map[string]any, error) {
+	existing, err := a.loadIdentityRaw(aid)
+	if err != nil {
+		return nil, err
+	}
+	if err := authValidateLoadedIdentity(authGetStr(existing, "aid"), existing); err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
+func (a *AuthFlow) loadIdentityRaw(aid string) (map[string]any, error) {
 	requestedAID := aid
 	if requestedAID == "" {
 		requestedAID = a.aid
@@ -1692,10 +1790,10 @@ func (a *AuthFlow) loadIdentityOrRaise(aid string) (map[string]any, error) {
 		if existing == nil {
 			return nil, NewStateError(fmt.Sprintf("identity not found for aid: %s", requestedAID))
 		}
-		a.aid = requestedAID
 		if _, ok := existing["aid"].(string); !ok || existing["aid"] == "" {
 			existing["aid"] = requestedAID
 		}
+		a.aid = requestedAID
 		return existing, nil
 	}
 
@@ -1706,36 +1804,33 @@ func (a *AuthFlow) loadIdentityOrRaise(aid string) (map[string]any, error) {
 	if loader, ok := a.keystore.(anyIdentityLoader); ok {
 		existing, err := loader.LoadAnyIdentity()
 		if err == nil && existing != nil {
-			if loadedAID, ok := existing["aid"].(string); ok && loadedAID != "" {
+			loadedAID, _ := existing["aid"].(string)
+			loadedAID = strings.TrimSpace(loadedAID)
+			if loadedAID != "" {
 				a.aid = loadedAID
 			}
 			return existing, nil
 		}
 	}
 
-	return nil, NewStateError("no local identity found, call auth.create_aid() first")
+	return nil, NewStateError("no local identity found, call auth.register_aid() first")
 }
 
-// ensureIdentity 确保有可用身份（无则生成）
-func (a *AuthFlow) ensureIdentity() map[string]any {
-	identity, err := a.loadIdentityOrRaise("")
-	if err == nil {
-		return identity
+func authValidateLoadedIdentity(aid string, identity map[string]any) error {
+	if identity == nil {
+		return NewStateError(fmt.Sprintf("identity not found for aid: %s", aid))
 	}
-	if a.aid == "" {
-		return map[string]any{}
+	label := strings.TrimSpace(aid)
+	if label == "" {
+		label = strings.TrimSpace(authGetStr(identity, "aid"))
 	}
-	newIdentity, genErr := a.crypto.GenerateIdentity()
-	if genErr != nil {
-		return map[string]any{"aid": a.aid}
+	if strings.TrimSpace(authGetStr(identity, "private_key_pem")) == "" {
+		return NewStateError(fmt.Sprintf("identity is incomplete for aid %s: missing private_key_pem", label))
 	}
-	newIdentity["aid"] = a.aid
-	// H24: 持久化失败不能静默吞
-	if perr := a.persistIdentity(newIdentity); perr != nil {
-		pkgLogAuth().Warn("[aun_core.auth] ERROR persistIdentity(rekey) failed aid=%s: %v", a.aid, perr)
-		a.lastPersistErr = perr
+	if strings.TrimSpace(authGetStr(identity, "public_key_der_b64")) == "" {
+		return NewStateError(fmt.Sprintf("identity is incomplete for aid %s: missing public_key_der_b64", label))
 	}
-	return newIdentity
+	return nil
 }
 
 // GetLastPersistError H24: 暴露最近一次关键持久化（identity/token）失败错误，

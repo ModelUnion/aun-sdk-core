@@ -61,12 +61,12 @@ async function resolveGatewayInto(client: AUNClient): Promise<void> {
 async function connectLongWithExtraInfo(
   client: AUNClient,
   aid: string,
-  options: { slotId?: string; createAid?: boolean; extraInfo?: Record<string, unknown> } = {},
+  options: { slotId?: string; registerAid?: boolean; extraInfo?: Record<string, unknown> } = {},
 ): Promise<void> {
   await resolveGatewayInto(client);
-  if (options.createAid !== false) {
+  if (options.registerAid !== false) {
     try {
-      await client.auth.createAid({ aid });
+      await client.auth.registerAid({ aid });
     } catch (err) {
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
@@ -137,7 +137,7 @@ describe('extra_info - 长连接互踢带 extra_info', { timeout: 60_000 }, () =
       // c2 同槽位连接，带 extra_info={pid:2222}，应踢掉 c1
       await connectLongWithExtraInfo(c2, aid, {
         slotId: 'main',
-        createAid: false,
+        registerAid: false,
         extraInfo: { pid: 2222 },
       });
       expect(c2.state).toBe('connected');
@@ -202,7 +202,7 @@ describe('extra_info - 不传 extra_info 时向后兼容', { timeout: 60_000 }, 
       });
 
       // c2 同槽位连接，也不传 extra_info，应踢掉 c1
-      await connectLongWithExtraInfo(c2, aid, { slotId: 'main', createAid: false });
+      await connectLongWithExtraInfo(c2, aid, { slotId: 'main', registerAid: false });
       expect(c2.state).toBe('connected');
 
       // 等待 c1 收到 disconnect 事件

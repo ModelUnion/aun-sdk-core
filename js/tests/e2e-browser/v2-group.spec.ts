@@ -104,7 +104,7 @@ async function installV2GroupHelpers(page: any): Promise<void> {
       const AUN = w.AUN;
       const client = new AUN.AUNClient({ issuer }, true);
       if (deviceId) client._deviceId = deviceId;
-      try { await client.auth.createAid({ aid }); } catch {}
+      try { await client.auth.registerAid({ aid }); } catch {}
       const auth = await client.auth.authenticate({ aid });
       await client.connect(auth);
       return client;

@@ -4,7 +4,7 @@
  * 包入口：统一导出所有公开 API。
  */
 
-export const VERSION = '0.3.2';
+export const VERSION = '0.3.4';
 
 // ── 主客户端 ─────────────────────────────────────────────────
 export { AUNClient } from './client.js';
@@ -73,7 +73,7 @@ export { FileKeyStore } from './keystore/file.js';
 // ── SecretStore ──────────────────────────────────────────────
 export type { SecretStore } from './secret-store/index.js';
 export { createDefaultSecretStore } from './secret-store/index.js';
-export { FileSecretStore } from './secret-store/file-store.js';
+export { FileSecretStore, SeedMigrationError, type SeedChangeResult } from './secret-store/file-store.js';
 
 // ── 传输层 ───────────────────────────────────────────────────
 export { RPCTransport } from './transport.js';

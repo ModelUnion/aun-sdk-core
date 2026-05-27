@@ -317,7 +317,7 @@ async def test_local_gateway_full_auth_and_connect(tmp_path, local_gateway: Loca
     aid = "local-auth-full.agentid.pub"
 
     try:
-        created = await client.auth.create_aid({"aid": aid})
+        created = await client.auth.register_aid({"aid": aid})
         assert created["aid"] == aid
         assert "BEGIN CERTIFICATE" in created["cert_pem"]
 
@@ -352,13 +352,13 @@ async def test_local_gateway_full_auth_and_connect(tmp_path, local_gateway: Loca
 
 
 @pytest.mark.asyncio
-async def test_create_aid_recovers_missing_cert_via_download(tmp_path, local_gateway: LocalGateway):
+async def test_register_aid_recovers_missing_cert_via_download(tmp_path, local_gateway: LocalGateway):
     aid = "recover-cert.agentid.pub"
     client1 = _make_client(tmp_path / "source", local_gateway)
     client2 = _make_client(tmp_path / "restore", local_gateway)
 
     try:
-        await client1.auth.create_aid({"aid": aid})
+        await client1.auth.register_aid({"aid": aid})
         identity = client1._keystore.load_identity(aid)
         client2._keystore.save_key_pair(aid, {
             "private_key_pem": identity["private_key_pem"],
@@ -372,7 +372,7 @@ async def test_create_aid_recovers_missing_cert_via_download(tmp_path, local_gat
         }
         client2._keystore.save_identity(aid, remaining)
 
-        recovered = await client2.auth.create_aid({"aid": aid})
+        recovered = await client2.auth.register_aid({"aid": aid})
         restored = client2._keystore.load_identity(aid)
 
         assert recovered["aid"] == aid
@@ -389,7 +389,7 @@ async def test_reconnect_flow_refreshes_stale_access_token(tmp_path, local_gatew
     aid = "refresh-reconnect.agentid.pub"
 
     try:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
         auth = await client.auth.authenticate({"aid": aid})
         stale_token = auth["access_token"]
 

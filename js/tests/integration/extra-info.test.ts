@@ -140,7 +140,7 @@ describe('extra_info 集成测试', () => {
     // 第一个客户端连接，带 extra_info
     const client1 = makeClient(sharedPath);
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     const auth1 = await client1.auth.authenticate({ aid });
     const extraInfo1 = { pid: 1001, label: 'client-1' } as unknown as JsonObject;
     await client1.connect(auth1, {
@@ -189,7 +189,7 @@ describe('extra_info 集成测试', () => {
     // 不传 extra_info 正常连接
     const client1 = makeClient(sharedPath);
     clients.push(client1);
-    await client1.auth.createAid({ aid });
+    await client1.auth.registerAid({ aid });
     const auth1 = await client1.auth.authenticate({ aid });
     await client1.connect(auth1, {
       auto_reconnect: false,

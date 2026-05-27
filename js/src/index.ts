@@ -1,6 +1,6 @@
 // ── @agentunion/fastaun-browser 包入口 ──────────────────────────────
 
-export const __version__ = '0.3.2';
+export const __version__ = '0.3.4';
 
 // 客户端
 export { AUNClient } from './client.js';
@@ -14,6 +14,7 @@ export {
   ConnectionError,
   TimeoutError,
   AuthError,
+  IdentityConflictError,
   PermissionError,
   ValidationError,
   NotFoundError,
@@ -77,7 +78,7 @@ export { GatewayDiscovery } from './discovery.js';
 
 // 密钥存储
 export type { KeyStore } from './keystore/index.js';
-export { IndexedDBKeyStore } from './keystore/indexeddb.js';
+export { IndexedDBKeyStore, SeedMigrationError, type SeedChangeResult } from './keystore/indexeddb.js';
 
 // 密钥保护存储
 export type { SecretStore } from './secret-store/index.js';

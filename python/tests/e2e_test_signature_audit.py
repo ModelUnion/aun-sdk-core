@@ -61,7 +61,7 @@ async def _ensure_connected(client: AUNClient, aid: str, retries: int = 3) -> st
         try:
             local = client._auth._keystore.load_identity(aid)
             if local is None:
-                await client.auth.create_aid({"aid": aid})
+                await client.auth.register_aid({"aid": aid})
             auth = await client.auth.authenticate({"aid": aid})
             await client.connect(auth)
             return aid

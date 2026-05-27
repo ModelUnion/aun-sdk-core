@@ -4,7 +4,7 @@ import { decryptMessage } from '../../src/v2/e2ee/decrypt.js';
 import { generateP256Keypair, privateToPublicDer } from '../../src/v2/crypto/ecdh.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
 
-const SDK_VERSION = '0.3.2';
+const SDK_VERSION = '0.3.4';
 
 /**
  * P2P 加密自加密自解密回环：
@@ -77,8 +77,9 @@ describe('encryptP2PMessage roundtrip', () => {
     expect((envelope.aad as Record<string, unknown>).wrap_protocol).toBe('1DH');
     expect(envelope.protected_headers).toMatchObject({
       sdk_lang: 'typescript',
-      sdk_vesion: SDK_VERSION,
+      sdk_version: SDK_VERSION,
     });
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBeUndefined();
 
     const decrypted = decryptMessage(
       envelope as Record<string, unknown>,
@@ -201,6 +202,8 @@ describe('encryptP2PMessage roundtrip', () => {
           ratio: 1.0,
           empty: null,
           nested: { b: 2, a: 1 },
+          sdk_vesion: '0.0.0',
+          sdk_version: '0.0.0',
         },
         context: { type: 'run', id: 'run-1', _auth: 'ignored' },
       },
@@ -214,7 +217,10 @@ describe('encryptP2PMessage roundtrip', () => {
       empty: '',
       nested: '{"a":1,"b":2}',
       payload_type: 'text',
+      sdk_lang: 'typescript',
+      sdk_version: SDK_VERSION,
     });
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBeUndefined();
     expect((envelope.protected_headers as Record<string, unknown>)._auth).toBeDefined();
     expect(envelope.context).toMatchObject({ type: 'run', id: 'run-1' });
     expect((envelope.context as Record<string, unknown>)._auth).toBeDefined();
@@ -457,7 +463,8 @@ describe('encryptP2PMessage signature integrity', () => {
     expect(envelope.payload_type).toBe('text');
     expect((envelope.protected_headers as Record<string, unknown>).payload_type).toBe('text');
     expect((envelope.protected_headers as Record<string, unknown>).sdk_lang).toBe('typescript');
-    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBe(SDK_VERSION);
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_version).toBe(SDK_VERSION);
+    expect((envelope.protected_headers as Record<string, unknown>).sdk_vesion).toBeUndefined();
     expect(decryptMessage(
       envelope as Record<string, unknown>,
       'bob.aid.com',

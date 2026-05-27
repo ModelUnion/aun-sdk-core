@@ -20,9 +20,10 @@ import { ConnectionError } from '../../src/errors.js';
  */
 class MockWebSocket extends EventEmitter {
   readyState = 1; // OPEN
+  sent: string[] = [];
   close(): void { this.emit('close', 1000); }
   terminate(): void { /* noop */ }
-  send(_data: string): void { /* noop */ }
+  send(data: string): void { this.sent.push(data); }
 }
 
 // ── 辅助函数 ────────────────────────────────────────────────
@@ -142,5 +143,120 @@ describe('RPCTransport 连接超时', () => {
     // 推进时间超过超时值 — 不应抛出异常
     vi.advanceTimersByTime(2_000);
     // 如果定时器仍活着且未被 initialResolved 守卫，这里会报错
+  });
+});
+
+describe('RPCTransport 后台 RPC 调度', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function createReadyTransport(timeout = 10_000) {
+    const dispatcher = new EventDispatcher();
+    const transport = new RPCTransport({
+      eventDispatcher: dispatcher,
+      timeout,
+      verifySsl: false,
+    });
+    const ws = new MockWebSocket();
+    (transport as any)._ws = ws;
+    (transport as any)._closed = false;
+    return { transport, ws };
+  }
+
+  function parseSent(ws: MockWebSocket): Array<{ id: string; method: string; params?: Record<string, unknown> }> {
+    return ws.sent.map((raw) => JSON.parse(raw));
+  }
+
+  it('后台 RPC 不能占满全部 in-flight，普通 RPC 应优先发送', async () => {
+    const { transport, ws } = createReadyTransport();
+    const calls = Array.from({ length: 16 }, (_, i) =>
+      transport.call(`background.${i}`, { _rpc_background: true }).catch((err) => err),
+    );
+
+    expect(parseSent(ws).filter((msg) => msg.method.startsWith('background.'))).toHaveLength(8);
+    expect((transport as any)._backgroundRpcQueue).toHaveLength(8);
+    expect((transport as any)._pendingBackground.size).toBe(8);
+
+    const normalCall = transport.call('meta.ping', {}).catch((err) => err);
+    const sent = parseSent(ws);
+    expect(sent).toHaveLength(9);
+    expect(sent[8].method).toBe('meta.ping');
+
+    await transport.close();
+    await Promise.allSettled([...calls, normalCall]);
+  });
+
+  it('后台 RPC 成功和错误响应都应释放后台计数并继续 drain', async () => {
+    const { transport, ws } = createReadyTransport();
+    const calls = Array.from({ length: 10 }, (_, i) =>
+      transport.call(`background.${i}`, { _rpc_background: true }).catch((err) => err),
+    );
+    expect(ws.sent).toHaveLength(8);
+
+    const first = parseSent(ws)[0];
+    const firstMeta = (transport as any)._pendingMeta.get(first.id);
+    expect(firstMeta).toMatchObject({ method: first.method, background: true });
+    expect(firstMeta.pendingSince).toBeGreaterThanOrEqual(firstMeta.queuedAt);
+    expect(firstMeta.deadlineAt).toBeGreaterThan(firstMeta.pendingSince);
+    (transport as any)._routeMessage({ jsonrpc: '2.0', id: first.id, result: { ok: true } });
+    expect(ws.sent).toHaveLength(9);
+    expect((transport as any)._pendingBackground.size).toBe(8);
+    expect((transport as any)._pendingMeta.has(first.id)).toBe(false);
+
+    const second = parseSent(ws)[1];
+    (transport as any)._routeMessage({
+      jsonrpc: '2.0',
+      id: second.id,
+      error: { code: -32000, message: 'unit-error' },
+    });
+    expect(ws.sent).toHaveLength(10);
+    expect((transport as any)._pendingBackground.size).toBe(8);
+
+    await transport.close();
+    await Promise.allSettled(calls);
+  });
+
+  it('后台 RPC 超时应释放 pending 与后台队列记账', async () => {
+    vi.useFakeTimers();
+    const { transport, ws } = createReadyTransport(100);
+    const calls = Array.from({ length: 10 }, (_, i) =>
+      transport.call(`background.${i}`, { _rpc_background: true }, 100).catch((err) => err),
+    );
+    expect(ws.sent).toHaveLength(8);
+
+    vi.advanceTimersByTime(100);
+    await Promise.allSettled(calls);
+    expect((transport as any)._pending.size).toBe(0);
+    expect((transport as any)._pendingMeta.size).toBe(0);
+    expect((transport as any)._pendingBackground.size).toBe(0);
+    expect((transport as any)._backgroundRpcQueue).toHaveLength(0);
+
+    const normalCall = transport.call('meta.ping', {}, 100).catch((err) => err);
+    expect(parseSent(ws).at(-1)?.method).toBe('meta.ping');
+    await transport.close();
+    await Promise.allSettled([normalCall]);
+  });
+
+  it('close 应拒绝 pending、普通队列和后台队列并清空记账', async () => {
+    const { transport } = createReadyTransport();
+    const calls = Array.from({ length: 18 }, (_, i) =>
+      transport.call(`background.${i}`, { _rpc_background: true }).catch((err) => err),
+    );
+    const normalCalls = Array.from({ length: 10 }, (_, i) =>
+      transport.call(`normal.${i}`, {}).catch((err) => err),
+    );
+
+    expect((transport as any)._pendingBackground.size).toBe(8);
+    expect((transport as any)._backgroundRpcQueue).toHaveLength(10);
+    expect((transport as any)._rpcQueue).toHaveLength(2);
+
+    await transport.close();
+    await Promise.allSettled([...calls, ...normalCalls]);
+    expect((transport as any)._pending.size).toBe(0);
+    expect((transport as any)._pendingMeta.size).toBe(0);
+    expect((transport as any)._pendingBackground.size).toBe(0);
+    expect((transport as any)._rpcQueue).toHaveLength(0);
+    expect((transport as any)._backgroundRpcQueue).toHaveLength(0);
   });
 });

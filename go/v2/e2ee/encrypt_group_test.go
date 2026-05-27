@@ -104,8 +104,11 @@ func TestEncryptGroupPayloadTypeTopLevel(t *testing.T) {
 	if got := headers["payload_type"]; got != "group-text" {
 		t.Fatalf("protected_headers.payload_type 应保留兼容校验，实际: %#v", got)
 	}
-	if headers["sdk_lang"] != e2eeSDKLang || headers["sdk_vesion"] != e2eeSDKVersion {
+	if headers["sdk_lang"] != e2eeSDKLang || headers["sdk_version"] != e2eeSDKVersion {
 		t.Fatalf("protected_headers SDK 元信息错误: %#v", headers)
+	}
+	if _, ok := headers["sdk_vesion"]; ok {
+		t.Fatalf("protected_headers 不应包含历史拼写 sdk_vesion: %#v", headers)
 	}
 	decrypted, err := DecryptMessage(envelope, target.AID, target.DeviceID, ikPriv, nil, sender.IKPubDER)
 	if err != nil {

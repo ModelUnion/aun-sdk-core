@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config
@@ -88,3 +90,43 @@ def keys_rotate(
         output_json(result)
     else:
         output_success(f"Rotated {key_type.upper()} successfully")
+
+
+@keys_app.command("change-seed")
+def keys_change_seed(
+    ctx: typer.Context,
+    old_seed: str = typer.Option(".seed", "--old-seed", help="旧 seed_password；'.seed' 表示读取数据目录下的 .seed"),
+    new_seed: str = typer.Option(..., "--new-seed", help="新的 seed_password（空字符串有效）"),
+    aun_path: str | None = typer.Option(None, "--aun-path", help="AUN 数据目录；默认使用当前 profile"),
+) -> None:
+    """迁移本地 seed 加密材料"""
+    set_json_mode(ctx.obj.get("json", False))
+    from aun_cli.output import output_error
+    from aun_core.keystore.seed_migration import SeedMigrationError, change_seed
+
+    resolved = resolve_profile_config(ctx)
+    root = Path(aun_path or resolved["aun_path"]).expanduser()
+    try:
+        result = change_seed(root, old_seed, new_seed)
+    except SeedMigrationError as exc:
+        output_error(str(exc), code=1)
+        raise typer.Exit(1)
+    except Exception as exc:
+        output_error(f"seed migration failed: {exc}", code=1)
+        raise typer.Exit(1)
+
+    payload = {
+        "aun_path": str(root),
+        "migrated": result.migrated,
+        "skipped": result.skipped,
+        "private_keys_migrated": result.private_keys_migrated,
+        "seed_files_renamed": result.seed_files_renamed,
+    }
+    if is_json_mode():
+        output_json(payload)
+    else:
+        output_success(
+            "Seed changed: migrated={migrated} skipped={skipped} private_keys={private_keys_migrated} renamed={seed_files_renamed}".format(
+                **payload
+            )
+        )

@@ -85,12 +85,11 @@ describe('补洞 after=0 与服务端 cursor floor', () => {
     expect(getClientMethodSource('_fillGroupEventGap')).not.toContain('afterSeq === 0');
   });
 
-  it('group.pull_events 补洞应使用服务端 cursor.current_seq 推进本地 tracker', () => {
+  it('group.pull_events 补洞应使用服务端 retention_floor_event_seq 推进本地 tracker', () => {
     const methodBody = getClientMethodSource('_fillGroupEventGap');
-    expect(methodBody).toContain('cursor.current_seq');
+    expect(methodBody).toContain('retention_floor_event_seq');
     expect(methodBody).toContain('forceContiguousSeq');
     expect(methodBody).toContain('group.ack_events');
-    expect(methodBody).toContain('slot_id: this._slotId');
     expect(methodBody).toContain('this._gapFillDone.delete(dedupKey)');
   });
 });
@@ -144,12 +143,12 @@ describe('group.changed 事件补洞行为', () => {
     });
     const ackCall = transportCalls.find(({ method }) => method === 'group.ack_events');
     expect(ackCall?.params).toMatchObject({
-      group_id: 'G1',
+      group_id: 'g1',
       event_seq: 7,
       device_id: 'device-1',
       slot_id: 'slot-a',
     });
-    expect((client as any)._seqTracker.getContiguousSeq('group_event:G1')).toBe(7);
+    expect((client as any)._seqTracker.getContiguousSeq('group_event:g1')).toBe(7);
     expect((client as any)._gapFillDone.size).toBe(0);
     saveSpy.mockRestore();
   });
@@ -160,21 +159,21 @@ describe('group.changed 事件补洞行为', () => {
     (client as any)._closing = false;
     (client as any)._deviceId = 'device-1';
     (client as any)._slotId = 'slot-a';
-    (client as any)._seqTracker.restoreState({ 'group_event:G1': 5 });
+    (client as any)._seqTracker.restoreState({ 'group_event:g1': 5 });
     (client as any)._dispatcher.publish = vi.fn().mockResolvedValue(undefined);
     const saveSpy = vi.spyOn(client as any, '_saveSeqTrackerState').mockImplementation(() => {});
     const transportCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
     (client as any)._transport.call = vi.fn(async (method: string, params: Record<string, unknown>) => {
       transportCalls.push({ method, params: JSON.parse(JSON.stringify(params)) });
       if (method === 'group.pull_events') {
-        return { events: [], cursor: { current_seq: 9 } };
+        return { events: [], cursor: { current_seq: 9 }, retention_floor_event_seq: 9 };
       }
       return { ok: true };
     });
 
     await (client as any)._fillGroupEventGap('G1');
 
-    expect((client as any)._seqTracker.getContiguousSeq('group_event:G1')).toBe(9);
+    expect((client as any)._seqTracker.getContiguousSeq('group_event:g1')).toBe(9);
     expect(transportCalls.some(({ method }) => method === 'group.ack_events')).toBe(false);
     saveSpy.mockRestore();
   });
@@ -185,7 +184,7 @@ describe('group.changed 事件补洞行为', () => {
     (client as any)._closing = false;
     (client as any)._deviceId = 'device-1';
     (client as any)._slotId = 'slot-a';
-    const ns = 'group_event:G1';
+    const ns = 'group_event:g1';
     (client as any)._seqTracker.onMessageSeq(ns, 3);
     const saveSpy = vi.spyOn(client as any, '_saveSeqTrackerState').mockImplementation(() => {});
     const transportCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
@@ -215,7 +214,7 @@ describe('group.changed 事件补洞行为', () => {
     const ackCalls = transportCalls.filter(({ method }) => method === 'group.ack_events');
     expect(ackCalls).toHaveLength(1);
     expect(ackCalls[0].params).toMatchObject({
-      group_id: 'G1',
+      group_id: 'g1',
       event_seq: 4,
       device_id: 'device-1',
       slot_id: 'slot-a',

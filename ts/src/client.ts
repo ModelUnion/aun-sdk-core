@@ -63,6 +63,19 @@ import {
   type RpcResult,
 } from './types.js';
 
+type AgentMdFetchResult = {
+  aid: string;
+  content: string;
+  signature: Record<string, unknown>;
+  in_sync: boolean | null;
+  saved_to: string | null;
+  save_error: string | null;
+};
+
+function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
+  return Boolean(value && typeof (value as { then?: unknown }).then === 'function');
+}
+
 
 /**
  * 递归排序键的 JSON 序列化（Canonical JSON for AUN）
@@ -321,6 +334,66 @@ interface V2BootstrapEntry {
   cachedAt: number;
   epoch?: number;
   stateCommitment?: { state_version: number; state_hash: string; state_chain: string };
+  wrapPolicy?: V2WrapPolicy;
+}
+
+interface V2WrapPolicy {
+  explicit: boolean;
+  version: string;
+  protocol: string;
+  scope: 'aid' | 'device';
+}
+
+function normalizeV2WrapPolicy(raw: unknown): V2WrapPolicy {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { explicit: false, version: '', protocol: '', scope: 'device' };
+  }
+  const obj = raw as Record<string, unknown>;
+  let protocol = String(obj.protocol ?? '').trim().toUpperCase();
+  if (protocol !== '1DH' && protocol !== '3DH') protocol = '';
+  let scope = String(obj.scope ?? '').trim().toLowerCase();
+  if (scope !== 'aid' && scope !== 'device') {
+    scope = obj.per_aid_wrap === true ? 'aid' : 'device';
+  }
+  if (scope === 'aid') protocol = '1DH';
+  return {
+    explicit: true,
+    version: String(obj.version ?? ''),
+    protocol,
+    scope: scope as 'aid' | 'device',
+  };
+}
+
+function v2WrapCapabilities(): JsonObject {
+  return {
+    version: 'v2.1',
+    protocols: ['1DH', '3DH'],
+    scopes: ['aid', 'device'],
+    per_aid_wrap: true,
+    per_device_wrap: true,
+  };
+}
+
+function applyV2WrapPolicyToTargets(targets: Target[], policy: V2WrapPolicy): Target[] {
+  if (!policy.explicit) return targets;
+  const out: Target[] = [];
+  const seen = new Set<string>();
+  for (const target of targets) {
+    const row: Target = { ...target };
+    if (policy.protocol === '1DH') {
+      row.keySource = 'aid_master';
+      row.spkPkDer = undefined;
+      row.spkId = '';
+    }
+    if (policy.scope === 'aid') {
+      const key = `${row.aid}\x1f${row.role}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      row.deviceId = '';
+    }
+    out.push(row);
+  }
+  return out;
 }
 
 interface V2SenderIKPendingEntry {
@@ -525,15 +598,14 @@ export class AUNClient {
   /** peer 证书缓存 */
   private _certCache: Map<string, CachedPeerCert> = new Map();
 
-  // AgentMDs 目录：{agentMdPath}/list.json 保存元数据，{agentMdPath}/{aid}/agent.md 保存正文。
+  // AIDs 目录：{agentMdPath}/{aid}/agentmd.json 保存元数据，{agentMdPath}/{aid}/agent.md 保存正文。
   private _agentMdPath: string = '';
   private _localAgentMdPath: string = '';
   private _localAgentMdEtag: string = '';
   // gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
   private _remoteAgentMdEtag: string = '';
   private _agentMdCache: Map<string, Record<string, unknown>> = new Map();
-  private _agentMdFetchInflight: Set<string> = new Set();
-  private _agentMdLastListRebuilt = false;
+  private _agentMdFetchInflight: Map<string, Promise<AgentMdFetchResult>> = new Map();
 
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
@@ -544,6 +616,11 @@ export class AUNClient {
 
   /** 补洞去重：已完成/进行中的 key -> 开始时间戳，防止重复 pull 同一区间 */
   private _gapFillDone: Map<string, number> = new Map();
+  /** pull gate：按消费单元串行化 public pull / gap fill / push auto-pull。 */
+  private _pullGates: Map<string, { inflight: boolean; startedAt: number; token: number }> = new Map();
+  private _pullResponseKeys: Map<string, number> = new Map();
+  /** 当前异步调用栈是否属于通知触发的后台 RPC。 */
+  private _backgroundRpcDepth = 0;
   /** 已发布到应用层的 seq 集合（按命名空间），补洞路径 publish 前检查以避免重复分发 */
   private _pushedSeqs: Map<string, Set<number>> = new Map();
   /** 已解密但因 seq 空洞暂缓发布的应用层消息（按 namespace -> seq） */
@@ -575,10 +652,9 @@ export class AUNClient {
   /** 最近一次已成功提交的 membership_snapshot；相同快照直接跳过。 */
   private _v2AutoProposeLastSnapshot: Map<string, string> = new Map();
   private _v2LazyProposeTriggered: Map<string, number> = new Map();
-  private _v2PullInflight = false;
-  private _v2PullPending = false;
   private static readonly V2_BOOTSTRAP_TTL_MS = 60 * 60 * 1000;
   private static readonly V2_RETRYABLE_CODES = new Set([-33011, -33012, -33050, -33052, -33054]);
+  private static readonly PULL_GATE_STALE_MS = 3000;
   private static readonly V2_SIG_CACHE_TTL_MS = 60 * 60 * 1000;
   private static readonly V2_SIG_CACHE_MAX = 16_384;
 
@@ -594,7 +670,7 @@ export class AUNClient {
     const rawConfig: RpcParams = { ...(config ?? {}) };
     this._configModel = configFromMap(rawConfig);
     const initAid = String(rawConfig.aid ?? '').trim() || null;
-    this._agentMdPath = path.join(this._configModel.aunPath, 'AgentMDs');
+    this._agentMdPath = path.join(this._configModel.aunPath, 'AIDs');
     this.config = {
       aun_path: this._configModel.aunPath,
       root_ca_path: this._configModel.rootCaPath,
@@ -630,6 +706,19 @@ export class AUNClient {
       },
     );
     this._keystore = keystore;
+
+    // 启动时被动清理 registerAid 留下的孤儿临时目录（>10 分钟）
+    try {
+      const cleanup = (keystore as unknown as { cleanupPendingDirs?: (ms: number) => number }).cleanupPendingDirs;
+      if (typeof cleanup === 'function') {
+        const removed = cleanup.call(keystore, 600_000);
+        if (removed > 0) {
+          this._clientLog.info(`_pending cleanup removed=${removed}`);
+        }
+      }
+    } catch (err) {
+      this._clientLog.warn(`_pending cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     this._slotId = '';
     this._connectDeliveryMode = normalizeDeliveryModeConfig({ mode: 'fanout' });
@@ -735,7 +824,26 @@ export class AUNClient {
     if (!target) {
       throw new ValidationError('fetchAgentMd requires aid (or local AID)');
     }
+    return await this._startAgentMdFetchTask(target);
+  }
 
+  private async _startAgentMdFetchTask(target: string): Promise<AgentMdFetchResult> {
+    const existing = this._agentMdFetchInflight.get(target);
+    if (existing) {
+      return await existing;
+    }
+
+    const task = this._fetchAgentMdOnce(target);
+    this._agentMdFetchInflight.set(target, task);
+    task.finally(() => {
+      if (this._agentMdFetchInflight.get(target) === task) {
+        this._agentMdFetchInflight.delete(target);
+      }
+    }).catch(() => undefined);
+    return await task;
+  }
+
+  private async _fetchAgentMdOnce(target: string): Promise<AgentMdFetchResult> {
     const content = await this.auth.downloadAgentMd(target);
     const signature = await this.auth.verifyAgentMd(content, { aid: target });
 
@@ -776,11 +884,11 @@ export class AUNClient {
   }
 
   /**
-   * 设置 agent.md 本地存储根目录；为空时恢复默认 {aun_path}/AgentMDs。
+   * 设置 agent.md 本地存储根目录；为空时恢复默认 {aun_path}/AIDs。
    */
   setAgentMdPath(root?: string | null): string {
     const raw = String(root ?? '').trim();
-    const next = raw || path.join(this._configModel.aunPath, 'AgentMDs');
+    const next = raw || path.join(this._configModel.aunPath, 'AIDs');
     fs.mkdirSync(next, { recursive: true });
     this._agentMdPath = next;
     this._agentMdCache.clear();
@@ -861,7 +969,7 @@ export class AUNClient {
   }
 
   private _agentMdRoot(): string {
-    const root = this._agentMdPath || path.join(this._configModel.aunPath, 'AgentMDs');
+    const root = this._agentMdPath || path.join(this._configModel.aunPath, 'AIDs');
     fs.mkdirSync(root, { recursive: true });
     return root;
   }
@@ -870,8 +978,8 @@ export class AUNClient {
     return path.join(this._agentMdRoot(), this._agentMdSafeAid(aid), 'agent.md');
   }
 
-  private _agentMdListPath(): string {
-    return path.join(this._agentMdRoot(), 'list.json');
+  private _agentMdMetaPath(aid: string): string {
+    return path.join(this._agentMdRoot(), this._agentMdSafeAid(aid), 'agentmd.json');
   }
 
   private _atomicWriteText(filePath: string, content: string): void {
@@ -903,8 +1011,9 @@ export class AUNClient {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   }
 
-  private _withAgentMdListLock<T>(fn: () => T): T {
-    const lockPath = path.join(this._agentMdRoot(), 'list.json.lock');
+  private _withAgentMdRecordLock<T>(aid: string, fn: () => T): T {
+    const lockPath = path.join(path.dirname(this._agentMdMetaPath(aid)), 'agentmd.json.lock');
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
     const deadline = Date.now() + 5000;
     let fd: number | null = null;
     while (fd === null) {
@@ -930,83 +1039,36 @@ export class AUNClient {
     }
   }
 
-  private _writeAgentMdListUnlocked(records: Record<string, Record<string, unknown>>): void {
-    const sorted: Record<string, Record<string, unknown>> = {};
-    for (const aid of Object.keys(records).sort()) sorted[aid] = records[aid];
-    this._atomicWriteText(this._agentMdListPath(), `${JSON.stringify({ version: 1, updated_at: Date.now(), records: sorted }, null, 2)}\n`);
+  private _writeAgentMdRecordUnlocked(aid: string, record: Record<string, unknown>): void {
+    const payload: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(record)) {
+      if (key !== 'content' && value !== undefined && value !== null) payload[key] = value;
+    }
+    payload.aid = this._agentMdSafeAid(aid);
+    this._atomicWriteText(this._agentMdMetaPath(aid), `${JSON.stringify(payload, null, 2)}\n`);
   }
 
-  private _normalizeAgentMdList(data: unknown): Record<string, Record<string, unknown>> {
-    const records: Record<string, Record<string, unknown>> = {};
-    let iterable: unknown[] = [];
-    if (isJsonObject(data as JsonValue | object | null | undefined)) {
-      const rawRecords = (data as JsonObject).records;
-      if (Array.isArray(rawRecords)) iterable = rawRecords;
-      else if (isJsonObject(rawRecords as JsonValue | object | null | undefined)) {
-        iterable = Object.values(rawRecords as Record<string, unknown>);
-      }
-    } else if (Array.isArray(data)) {
-      iterable = data;
+  private _normalizeAgentMdRecord(aid: string, data: unknown): Record<string, unknown> {
+    if (!isJsonObject(data as JsonValue | object | null | undefined)) return {};
+    const record: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+      if (key !== 'content') record[key] = value;
     }
-    for (const item of iterable) {
-      if (!isJsonObject(item as JsonValue | object | null | undefined)) continue;
-      const aid = String((item as JsonObject).aid ?? '').trim();
-      if (!aid) continue;
-      const record: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(item as Record<string, unknown>)) {
-        if (key !== 'content') record[key] = value;
-      }
-      record.aid = aid;
-      for (const key of ['fetched_at', 'observed_at', 'checked_at', 'updated_at']) {
-        record[key] = Number(record[key] ?? 0) || 0;
-      }
-      records[aid] = record;
+    record.aid = this._agentMdSafeAid(String(record.aid ?? aid));
+    for (const key of ['fetched_at', 'observed_at', 'checked_at', 'updated_at']) {
+      record[key] = Number(record[key] ?? 0) || 0;
     }
-    return records;
+    return record;
   }
 
-  private _rebuildAgentMdListUnlocked(): Record<string, Record<string, unknown>> {
-    const records: Record<string, Record<string, unknown>> = {};
-    const root = this._agentMdRoot();
-    const now = Date.now();
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const aid = entry.name;
-      const filePath = path.join(root, aid, 'agent.md');
-      if (!fs.existsSync(filePath)) continue;
-      try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        let fetchedAt = now;
-        try { fetchedAt = Math.trunc(fs.statSync(filePath).mtimeMs); } catch { /* ignore */ }
-        records[aid] = {
-          aid,
-          local_etag: this._agentMdContentEtag(content),
-          fetched_at: fetchedAt,
-          updated_at: now,
-        };
-      } catch (err) {
-        this._clientLog.warn(`agent.md rebuild skipped unreadable file aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    this._writeAgentMdListUnlocked(records);
-    this._agentMdCache.clear();
-    return records;
-  }
-
-  private _readAgentMdListUnlocked(): Record<string, Record<string, unknown>> {
-    const filePath = this._agentMdListPath();
-    if (!fs.existsSync(filePath)) {
-      this._agentMdLastListRebuilt = true;
-      return this._rebuildAgentMdListUnlocked();
-    }
+  private _readAgentMdRecordUnlocked(aid: string): Record<string, unknown> {
+    const filePath = this._agentMdMetaPath(aid);
+    if (!fs.existsSync(filePath)) return {};
     try {
-      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      this._agentMdLastListRebuilt = false;
-      return this._normalizeAgentMdList(parsed);
+      return this._normalizeAgentMdRecord(aid, JSON.parse(fs.readFileSync(filePath, 'utf-8')));
     } catch (err) {
-      this._clientLog.warn(`agent.md list.json damaged, rebuilding: ${err instanceof Error ? err.message : String(err)}`);
-      this._agentMdLastListRebuilt = true;
-      return this._rebuildAgentMdListUnlocked();
+      this._clientLog.warn(`agent.md metadata damaged, ignoring: aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
+      return {};
     }
   }
 
@@ -1034,20 +1096,23 @@ export class AUNClient {
     const target = String(aid ?? '').trim();
     if (!target) return null;
     try {
-      const records = this._withAgentMdListLock(() => this._readAgentMdListUnlocked());
-      const record = records[target];
-      if (record && typeof record === 'object') {
-        const loaded: Record<string, unknown> = { ...record, aid: target };
+      const loaded = this._withAgentMdRecordLock(target, () => {
+        const record = this._readAgentMdRecordUnlocked(target);
+        const next: Record<string, unknown> = Object.keys(record).length > 0 ? { ...record, aid: target } : { aid: target };
         try {
           const content = this._readAgentMdContent(target);
-          loaded.content = content;
-          loaded.local_etag = this._agentMdContentEtag(content);
+          next.content = content;
+          next.local_etag = this._agentMdContentEtag(content);
         } catch (err) {
-          this._clientLog.warn(`agent.md content read failed: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
+          if (fs.existsSync(this._agentMdMetaPath(target))) {
+            this._clientLog.warn(`agent.md content read failed: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
+          }
         }
-        this._agentMdCache.set(target, { ...loaded });
-        return { ...loaded };
-      }
+        return next;
+      });
+      if (Object.keys(loaded).length <= 1) return null;
+      this._agentMdCache.set(target, { ...loaded });
+      return { ...loaded };
     } catch (err) {
       this._clientLog.debug(`agent.md cache load skipped: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1061,22 +1126,20 @@ export class AUNClient {
       const inputFields: Record<string, unknown> = { ...fields };
       const hasContent = Object.prototype.hasOwnProperty.call(inputFields, 'content') && inputFields.content !== undefined && inputFields.content !== null;
       let savedTo = '';
-      if (hasContent) {
-        const content = String(inputFields.content ?? '');
-        savedTo = this._writeAgentMdContent(target, content);
-        if (!inputFields.local_etag) inputFields.local_etag = this._agentMdContentEtag(content);
-        if (!inputFields.fetched_at) inputFields.fetched_at = Date.now();
-      }
-      delete inputFields.content;
-      const record = this._withAgentMdListLock(() => {
-        const records = this._readAgentMdListUnlocked();
-        const next: Record<string, unknown> = { ...(records[target] ?? {}), aid: target };
+      const record = this._withAgentMdRecordLock(target, () => {
+        if (hasContent) {
+          const content = String(inputFields.content ?? '');
+          savedTo = this._writeAgentMdContent(target, content);
+          if (!inputFields.local_etag) inputFields.local_etag = this._agentMdContentEtag(content);
+          if (!inputFields.fetched_at) inputFields.fetched_at = Date.now();
+        }
+        delete inputFields.content;
+        const next: Record<string, unknown> = { ...this._readAgentMdRecordUnlocked(target), aid: target };
         for (const [key, value] of Object.entries(inputFields)) {
           if (value !== undefined && value !== null) next[key] = value;
         }
         next.updated_at = Date.now();
-        records[target] = { ...next };
-        this._writeAgentMdListUnlocked(records);
+        this._writeAgentMdRecordUnlocked(target, next);
         return next;
       });
       const loaded: Record<string, unknown> = { ...record };
@@ -1127,15 +1190,12 @@ export class AUNClient {
     const target = String(aid ?? '').trim();
     if (!target || this._agentMdHasLocalContent(target, record)) return;
     if (this._agentMdFetchInflight.has(target)) return;
-    this._agentMdFetchInflight.add(target);
     void this.fetchAgentMd(target).catch((err) => {
       this._saveAgentMdRecord(target, {
         last_error: err instanceof Error ? err.message : String(err),
         remote_status: 'found',
       });
       this._clientLog.debug(`agent.md auto fetch failed: aid=${target} source=${source || '-'} err=${err instanceof Error ? err.message : String(err)}`);
-    }).finally(() => {
-      this._agentMdFetchInflight.delete(target);
     });
   }
 
@@ -1188,7 +1248,7 @@ export class AUNClient {
     );
   }
 
-  async checkAgentMd(aid?: string | null, maxUnsyncedDays = 0): Promise<Record<string, unknown>> {
+  async checkAgentMd(aid?: string | null, maxUnsyncedDays = 1): Promise<Record<string, unknown>> {
     const target = String(aid ?? this._aid ?? '').trim();
     if (!target) throw new ValidationError('checkAgentMd requires aid (or local AID)');
     const before = this._loadAgentMdRecord(target) ?? {};
@@ -1196,7 +1256,9 @@ export class AUNClient {
     const localFound = !!(Object.keys(before).length > 0 && (String(before.content ?? '') || localEtag));
     const remoteEtagCached = String(before.remote_etag ?? '').trim();
     const lastModifiedCached = String(before.last_modified ?? '').trim();
-    const checkedAtCached = Number(before.checked_at ?? 0);
+    const checkedAt = Number(before.checked_at ?? 0);
+    const fetchedAt = Number(before.fetched_at ?? 0);
+    const checkedAtCached = checkedAt > 0 ? checkedAt : fetchedAt;
     const cachedInSync = !!(localFound && localEtag && remoteEtagCached && localEtag === remoteEtagCached);
     // max_unsynced_days > 0 且距上次 HEAD 在窗口内 → 直接返回缓存；否则强制 HEAD。
     if (cachedInSync && this._agentMdCheckedAtFresh(checkedAtCached, maxUnsyncedDays)) {
@@ -1212,6 +1274,27 @@ export class AUNClient {
         cached: true,
         verify_status: String(before.verify_status ?? ''),
         verify_error: String(before.verify_error ?? ''),
+      };
+    }
+    const remoteFoundCached = !!(remoteEtagCached || String(before.remote_status ?? '') === 'found');
+    if (
+      !localFound &&
+      !remoteFoundCached &&
+      String(before.remote_status ?? '') === 'missing' &&
+      this._agentMdCheckedAtFresh(checkedAtCached, maxUnsyncedDays)
+    ) {
+      return {
+        aid: target,
+        local_found: false,
+        remote_found: false,
+        local_etag: '',
+        remote_etag: '',
+        in_sync: false,
+        last_modified: '',
+        status: 404,
+        cached: true,
+        verify_status: '',
+        verify_error: '',
       };
     }
 
@@ -1416,39 +1499,75 @@ export class AUNClient {
   }
 
   /**
-   * 列出本地所有已存储的身份摘要（仅返回有有效私钥的 AID）。
+   * 列出本地身份摘要。
+   *
+   * @param opts.all=false（默认）：仅返回严格校验通过的可用身份——
+   *   keypair 完整 + cert 公钥 == keypair 公钥 + cert 时间窗口有效
+   * @param opts.all=true：返回所有 AIDs/ 子目录（不含 _pending/）；
+   *   每项含 valid=bool 和 reason=string 字段
    */
-  listIdentities(): Array<{ aid: string; metadata?: Record<string, unknown> }> {
+  listIdentities(opts?: { all?: boolean }): Array<{ aid: string; valid: boolean; reason?: string; metadata?: Record<string, unknown> }> {
     const tStart = Date.now();
-    this._clientLog.debug(`listIdentities enter`);
+    const includeAll = !!opts?.all;
+    this._clientLog.debug(`listIdentities enter all=${includeAll}`);
     try {
-    const listFn = (this._keystore as KeyStore & {
-      listIdentities?: () => string[];
-    }).listIdentities;
-    if (typeof listFn !== 'function') {
-      this._clientLog.debug(`listIdentities exit: elapsed=${Date.now() - tStart}ms (no_list_fn)`);
-      return [];
-    }
-    const aids = listFn.call(this._keystore);
-    const summaries: Array<{ aid: string; metadata?: Record<string, unknown> }> = [];
-    for (const aid of [...aids].sort()) {
-      const identity = this._keystore.loadIdentity(aid);
-      if (!identity || !identity.private_key_pem) continue;
-      const summary: { aid: string; metadata?: Record<string, unknown> } = { aid };
-      const loadMetadata = (this._keystore as KeyStore & {
-        loadMetadata?: (aid: string) => Record<string, unknown> | null;
-      }).loadMetadata;
-      if (typeof loadMetadata === 'function') {
-        const md = loadMetadata.call(this._keystore, aid);
-        if (md) summary.metadata = md;
+      const listFn = (this._keystore as KeyStore & {
+        listIdentities?: () => string[];
+      }).listIdentities;
+      if (typeof listFn !== 'function') {
+        this._clientLog.debug(`listIdentities exit: elapsed=${Date.now() - tStart}ms (no_list_fn)`);
+        return [];
       }
-      summaries.push(summary);
-    }
-    this._clientLog.debug(`listIdentities exit: elapsed=${Date.now() - tStart}ms count=${summaries.length}`);
-    return summaries;
+      const aids = listFn.call(this._keystore);
+      const summaries: Array<{ aid: string; valid: boolean; reason?: string; metadata?: Record<string, unknown> }> = [];
+      for (const aid of [...aids].sort()) {
+        const { valid, reason } = this._validateLocalIdentity(aid);
+        if (!includeAll && !valid) continue;
+        const summary: { aid: string; valid: boolean; reason?: string; metadata?: Record<string, unknown> } = { aid, valid };
+        if (reason) summary.reason = reason;
+        const loadMetadata = (this._keystore as KeyStore & {
+          loadMetadata?: (aid: string) => Record<string, unknown> | null;
+        }).loadMetadata;
+        if (typeof loadMetadata === 'function') {
+          const md = loadMetadata.call(this._keystore, aid);
+          if (md) summary.metadata = md;
+        }
+        summaries.push(summary);
+      }
+      this._clientLog.debug(`listIdentities exit: elapsed=${Date.now() - tStart}ms all=${includeAll} count=${summaries.length}`);
+      return summaries;
     } catch (err) {
       this._clientLog.debug(`listIdentities exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
+    }
+  }
+
+  /**
+   * 严格校验本地身份的可用性。返回 {valid, reason}。
+   * 4 项校验：keypair 完整 + cert 存在 + cert 公钥 == keypair 公钥 + cert 时间窗口有效。
+   */
+  private _validateLocalIdentity(aid: string): { valid: boolean; reason: string } {
+    const identity = this._keystore.loadIdentity(aid);
+    if (!identity) return { valid: false, reason: 'no identity record' };
+    const priv = String(identity.private_key_pem ?? '');
+    const pubB64 = String(identity.public_key_der_b64 ?? '');
+    const certPem = String(identity.cert ?? '');
+    if (!priv || !pubB64) return { valid: false, reason: 'missing keypair' };
+    if (!certPem) return { valid: false, reason: 'missing certificate' };
+    try {
+      const crypto = require('node:crypto') as typeof import('node:crypto');
+      const cert = new crypto.X509Certificate(certPem);
+      const certPubDer = cert.publicKey.export({ type: 'spki', format: 'der' });
+      const localPubDer = Buffer.from(pubB64, 'base64');
+      if (!certPubDer.equals(localPubDer)) {
+        return { valid: false, reason: 'cert public key does not match keypair' };
+      }
+      const now = Date.now();
+      if (now < new Date(cert.validFrom).getTime()) return { valid: false, reason: 'cert not yet valid' };
+      if (now > new Date(cert.validTo).getTime()) return { valid: false, reason: 'cert expired' };
+      return { valid: true, reason: '' };
+    } catch (e) {
+      return { valid: false, reason: `cert parse error: ${e instanceof Error ? e.message : String(e)}` };
     }
   }
 
@@ -1473,6 +1592,12 @@ export class AUNClient {
     }
 
     const p = { ...(params ?? {}) };
+    const rpcBackground = Boolean((p as Record<string, unknown>)._rpc_background) || this._backgroundRpcDepth > 0;
+    delete (p as Record<string, unknown>)._rpc_background;
+    const runWithRpcPriority = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+      if (!rpcBackground) return await operation();
+      return await this._withBackgroundRpc(operation);
+    };
     if (method === 'message.send' || method === 'group.send') {
       this._normalizeOutboundMessagePayload(p, method);
     }
@@ -1497,17 +1622,33 @@ export class AUNClient {
       p.slot_id = this._slotId;
     }
 
+    const pullGateLocked = Boolean((p as Record<string, unknown>)._pull_gate_locked);
+    if ('_pull_gate_locked' in (p as Record<string, unknown>)) {
+      delete (p as Record<string, unknown>)._pull_gate_locked;
+    }
+    const pullGateKey = this._pullGateKeyForCall(method, p);
+    if (pullGateKey && this._isPullResponseProcessing(pullGateKey)) {
+      this._clientLog.debug(`pull skipped while processing pull response: method=${method} key=${pullGateKey}`);
+      return this._emptyPullResultForCall(method);
+    }
+    if (pullGateKey && !pullGateLocked) {
+      const lockedParams = { ...p, _pull_gate_locked: true };
+      if (rpcBackground) (lockedParams as Record<string, unknown>)._rpc_background = true;
+      const result = await this._runPullSerialized(pullGateKey, async () => this.call(method, lockedParams));
+      return result as RpcResult;
+    }
+
     // 自动加密：message.send 默认加密（encrypt 默认 true）— V2-only
     if (method === 'message.send') {
       const encrypt = p.encrypt ?? true;
       delete p.encrypt;
       if (encrypt) {
-        return await this.sendV2(String(p.to ?? ''), p.payload as Record<string, unknown>, {
+        return await runWithRpcPriority(() => this.sendV2(String(p.to ?? ''), p.payload as Record<string, unknown>, {
           messageId: String(p.message_id ?? '') || undefined,
           timestamp: p.timestamp as number | undefined,
           protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
           context: isJsonObject(p.context) ? p.context : undefined,
-        }) as RpcResult;
+        })) as RpcResult;
       }
       // encrypt=false：明文走通用 RPC 路径；protected_headers/headers 是信封元数据，加密与否都保留
       this._maybeAppendEchoTraceSend(p);
@@ -1518,12 +1659,12 @@ export class AUNClient {
       const encrypt = p.encrypt ?? true;
       delete p.encrypt;
       if (encrypt) {
-        return await this.sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown>, {
+        return await runWithRpcPriority(() => this.sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown>, {
           messageId: String(p.message_id ?? '') || undefined,
           timestamp: p.timestamp as number | undefined,
           protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
           context: isJsonObject(p.context) ? p.context : undefined,
-        }) as RpcResult;
+        })) as RpcResult;
       }
       this._maybeAppendEchoTraceSend(p);
     }
@@ -1535,7 +1676,7 @@ export class AUNClient {
         if (!this._v2Session || !String(p.group_id ?? '').trim()) {
           throw new StateError(v2Error);
         }
-        return await this._putGroupThoughtEncryptedV2(p);
+        return await runWithRpcPriority(() => this._putGroupThoughtEncryptedV2(p));
       }
     }
     if (method === 'message.thought.put') {
@@ -1546,37 +1687,55 @@ export class AUNClient {
           'message.thought.put',
           'V2 session not initialized; encrypted message.thought.put requires V2 (V1 E2EE removed)',
         );
-        return await this._putMessageThoughtEncryptedV2(p);
+        return await runWithRpcPriority(() => this._putMessageThoughtEncryptedV2(p));
       }
     }
 
-    if (method === 'message.pull' && this._clientUsesV2P2P()) {
+    // V2-only：兼容入口名只作为 SDK 内部适配层存在，底层绝不能降级发 legacy RPC。
+    if (method === 'message.pull' || method === 'message.v2.pull') {
       await this._ensureV2SessionReady('message.pull');
-      const messages = await this.pullV2(Number(p.after_seq ?? 0) || 0, Number(p.limit ?? 50) || 50);
+      const skipAutoAck = p._skip_auto_ack === true || p.skip_auto_ack === true;
+      const afterSeq = Number(p.after_seq ?? 0) || 0;
+      const limit = Number(p.limit ?? 50) || 50;
+      const messages = skipAutoAck
+        ? await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { skipAutoAck: true, gateLocked: true }))
+        : await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { gateLocked: true }));
       return { messages } as RpcResult;
     }
 
-    if (method === 'message.ack' && this._clientUsesV2P2P()) {
+    if (method === 'message.ack' || method === 'message.v2.ack') {
       await this._ensureV2SessionReady('message.ack');
-      return await this.ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined) as RpcResult;
+      return await runWithRpcPriority(() => this.ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined)) as RpcResult;
     }
 
-    if (method === 'group.pull' && this._clientUsesV2Group() && p.group_id) {
+    if (method === 'group.pull' || method === 'group.v2.pull') {
+      if (!String(p.group_id ?? '').trim()) {
+        throw new ValidationError('group.pull requires group_id');
+      }
       await this._ensureV2SessionReady('group.pull');
-      const messages = await this.pullGroupV2(
+      const messages = await runWithRpcPriority(() => this.pullGroupV2(
         String(p.group_id),
         Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
         Number(p.limit ?? 50) || 50,
-      );
+        { gateLocked: true },
+      ));
       return { messages } as RpcResult;
     }
 
-    if (method === 'group.ack_messages' && this._clientUsesV2Group() && p.group_id) {
+    if (method === 'group.ack_messages' || method === 'group.v2.ack') {
+      if (!String(p.group_id ?? '').trim()) {
+        throw new ValidationError('group.ack_messages requires group_id');
+      }
       await this._ensureV2SessionReady('group.ack_messages');
-      return await this.ackGroupV2(
+      return await runWithRpcPriority(() => this.ackGroupV2(
         String(p.group_id),
         Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
-      ) as RpcResult;
+      )) as RpcResult;
+    }
+
+    if (method === 'message.pull') {
+      delete p._skip_auto_ack;
+      delete p.skip_auto_ack;
     }
 
     // 关键操作自动附加客户端签名
@@ -1594,8 +1753,16 @@ export class AUNClient {
       this._clientLog.debug(`thought.get transport call start: method=${method}, params=${this._debugJson(this._messageEnvelopeFieldsForDebug(p))}`);
     }
     let result = callTimeout
-      ? await this._transport.call(method, p, callTimeout)
-      : await this._transport.call(method, p);
+      ? (
+        rpcBackground
+          ? await this._transport.call(method, p, callTimeout, undefined, true)
+          : await this._transport.call(method, p, callTimeout)
+      )
+      : (
+        rpcBackground
+          ? await this._transport.call(method, p, undefined, undefined, true)
+          : await this._transport.call(method, p)
+      );
 
     if (method === 'group.thought.get' && isJsonObject(result)) {
       this._clientLog.debug(`group.thought.get transport result: found=${String((result as JsonObject).found ?? '')}, raw_count=${Array.isArray((result as JsonObject).thoughts) ? ((result as JsonObject).thoughts as unknown[]).length : 0}`);
@@ -1684,6 +1851,36 @@ export class AUNClient {
     const result = this._dispatcher.subscribe(event, handler);
     this._clientLog.debug(`on exit: elapsed=${Date.now() - tStart}ms event=${event}`);
     return result;
+  }
+
+  private async _callRawV2Rpc(method: string, params?: RpcParams): Promise<RpcResult> {
+    const p: RpcParams = { ...(params ?? {}) };
+    const rpcBackground = Boolean((p as Record<string, unknown>)._rpc_background) || this._backgroundRpcDepth > 0;
+    delete (p as Record<string, unknown>)._rpc_background;
+    delete p._pull_gate_locked;
+    delete p._skip_auto_ack;
+    delete p.skip_auto_ack;
+
+    if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
+      p.group_id = normalizeGroupId(String(p.group_id)) || String(p.group_id);
+    }
+    if (method.startsWith('group.') && p.device_id === undefined) {
+      p.device_id = this._deviceId;
+    }
+    if (method.startsWith('group.') && p.slot_id === undefined) {
+      p.slot_id = this._slotId;
+    }
+
+    if (SIGNED_METHODS.has(method)) {
+      if (this._shouldSkipClientSignature(method, p)) {
+        delete p.client_signature;
+      } else {
+        this._signClientOperation(method, p);
+      }
+    }
+    return rpcBackground
+      ? await this._transport.call(method, p, undefined, undefined, true)
+      : await this._transport.call(method, p);
   }
 
   /** P2-13: 取消订阅事件（对齐 Python/JS off 方法） */
@@ -1780,7 +1977,7 @@ export class AUNClient {
           _decrypt_error: String(exc),
         };
         this._attachV2EnvelopeMetadataFromSource(safeEvent as JsonObject, data);
-        this._publishAppEvent('message.undecryptable', safeEvent).catch(() => {});
+        Promise.resolve(this._publishAppEvent('message.undecryptable', safeEvent)).catch(() => {});
       }
     });
     this._clientLog.debug(`_onRawMessageReceived exit: elapsed=${Date.now() - tStart}ms (handler dispatched)`);
@@ -1802,11 +1999,14 @@ export class AUNClient {
     const seq = msg.seq as number | undefined;
     if (seq !== undefined && seq !== null && this._aid) {
       const ns = `p2p:${this._aid}`;
-      // Push 修上界：先更新 maxSeenSeq，让上界反映服务端状态
+      // Push 只先更新 maxSeenSeq；contiguous_seq 是已交付游标，必须等应用层发布返回后再推进。
       if (seq > 0) this._seqTracker.updateMaxSeen(ns, seq);
-      const needPull = this._seqTracker.onMessageSeq(ns, seq);
+      const contigBefore = this._seqTracker.getContiguousSeq(ns);
+      const published = await this._publishOrderedMessage('message.received', ns, seq, msg);
+      const contigAfter = this._seqTracker.getContiguousSeq(ns);
+      const needPull = Number(seq) > contigAfter && !published;
       if (needPull) {
-        this._clientLog.debug(`P2P seq gap detected: ns=${ns}, seq=${seq}, contiguous=${this._seqTracker.getContiguousSeq(ns)}`);
+        this._clientLog.debug(`P2P seq gap detected: ns=${ns}, seq=${seq}, contiguous=${contigAfter}`);
         this._fillP2pGap().catch(exc => this._clientLog.warn(`background gap fill trigger failed: ${formatCaughtError(exc)}`));
       }
       // auto-ack contiguous_seq
@@ -1815,23 +2015,14 @@ export class AUNClient {
         const maxSeen = this._seqTracker.getMaxSeenSeq(ns);
         const ackSeq = maxSeen > 0 ? Math.min(contig, maxSeen) : contig;
         this._clientLog.debug(`P2P push auto-ack send: ns=${ns}, seq=${ackSeq}, contiguous=${contig}, max_seen=${maxSeen}`);
-        this._transport.call('message.ack', {
-          seq: ackSeq,
-          device_id: this._deviceId,
-          slot_id: this._slotId,
-        })
-          .then(() => { this._clientLog.debug(`P2P push auto-ack ok: ns=${ns}, seq=${ackSeq}`); })
-          .catch((e) => { this._clientLog.debug(`P2P auto-ack failed: ${formatCaughtError(e)}`); });
+          this._withBackgroundRpc(() => this.ackV2(ackSeq))
+            .then(() => { this._clientLog.debug(`P2P push auto-ack ok: ns=${ns}, seq=${ackSeq}`); })
+            .catch((e) => { this._clientLog.debug(`P2P auto-ack failed: ${formatCaughtError(e)}`); });
       }
       // 即时持久化 cursor，异常断连后不回退
-      this._saveSeqTrackerState();
-    }
-
-    // V2-only：普通 _raw.message.received 只承载明文；V2 密文由 peer.v2.message_received 通知触发 pull。
-    if (seq !== undefined && seq !== null && this._aid) {
-      const ns = `p2p:${this._aid}`;
-      await this._publishOrderedMessage('message.received', ns, seq, msg);
+      if (contigAfter !== contigBefore) this._saveSeqTrackerState();
     } else {
+      // V2-only：普通 _raw.message.received 只承载明文；V2 密文由 peer.v2.message_received 通知触发 pull。
       await this._publishAppEvent('message.received', msg, 'push');
     }
   }
@@ -1858,7 +2049,7 @@ export class AUNClient {
           _decrypt_error: String(exc),
         };
         this._attachV2EnvelopeMetadataFromSource(safeEvent as JsonObject, data);
-        this._publishAppEvent('group.message_undecryptable', safeEvent).catch(() => {});
+        Promise.resolve(this._publishAppEvent('group.message_undecryptable', safeEvent)).catch(() => {});
       }
     });
     this._clientLog.debug(`_onRawGroupMessageCreated exit: elapsed=${Date.now() - tStart}ms (handler dispatched)`);
@@ -1887,16 +2078,21 @@ export class AUNClient {
     if (payload === undefined || payload === null
       || (typeof payload === 'object' && Object.keys(payload as object).length === 0)) {
       // 不带 payload 的通知不能先推进 seq，否则 auto-pull 会用推进后的 cursor 跳过该消息。
-      await this._autoPullGroupMessages(msg);
+      void this._autoPullGroupMessages(msg).catch((exc) => {
+        this._clientLog.warn(`auto pull group message task failed: ${formatCaughtError(exc)}`);
+      });
       return;
     }
     if (groupId && seq !== undefined && seq !== null) {
       const ns = `group:${groupId}`;
-      // Push 修上界：先更新 maxSeenSeq
+      // Push 只先更新 maxSeenSeq；contiguous_seq 是已交付游标，必须等应用层发布返回后再推进。
       if (seq > 0) this._seqTracker.updateMaxSeen(ns, seq);
-      const needPull = this._seqTracker.onMessageSeq(ns, seq);
+      const contigBefore = this._seqTracker.getContiguousSeq(ns);
+      const published = await this._publishOrderedMessage('group.message_created', ns, seq, msg);
+      const contigAfter = this._seqTracker.getContiguousSeq(ns);
+      const needPull = Number(seq) > contigAfter && !published;
       if (needPull) {
-        this._clientLog.debug(`group message seq gap detected: group=${groupId}, seq=${seq}, contiguous=${this._seqTracker.getContiguousSeq(ns)}`);
+        this._clientLog.debug(`group message seq gap detected: group=${groupId}, seq=${seq}, contiguous=${contigAfter}`);
         this._fillGroupGap(groupId).catch(exc => this._clientLog.warn(`background gap fill trigger failed: ${formatCaughtError(exc)}`));
       }
       const contig = this._seqTracker.getContiguousSeq(ns);
@@ -1904,121 +2100,73 @@ export class AUNClient {
         const maxSeen = this._seqTracker.getMaxSeenSeq(ns);
         const ackSeq = maxSeen > 0 ? Math.min(contig, maxSeen) : contig;
         this._clientLog.debug(`group push auto-ack send: group=${groupId}, ns=${ns}, seq=${ackSeq}, contiguous=${contig}, max_seen=${maxSeen}`);
-        this._transport.call('group.ack_messages', {
-          group_id: groupId,
-          msg_seq: ackSeq,
-          device_id: this._deviceId,
-          slot_id: this._slotId,
-        })
-          .then(() => { this._clientLog.debug(`group push auto-ack ok: group=${groupId}, seq=${ackSeq}`); })
-          .catch((e) => { this._clientLog.debug(`group message auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
+          this._withBackgroundRpc(() => this.ackGroupV2(groupId, ackSeq))
+            .then(() => { this._clientLog.debug(`group push auto-ack ok: group=${groupId}, seq=${ackSeq}`); })
+            .catch((e) => { this._clientLog.debug(`group message auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
       }
-      this._saveSeqTrackerState();
-    }
-
-    // V2-only：普通 group.message_created 只承载明文；V2 密文由 group.v2.message_created 通知触发 pull。
-    if (groupId && seq !== undefined && seq !== null) {
-      const nsKey = `group:${groupId}`;
-      await this._publishOrderedMessage('group.message_created', nsKey, seq, msg);
+      if (contigAfter !== contigBefore) this._saveSeqTrackerState();
     } else {
+      // V2-only：普通 group.message_created 只承载明文；V2 密文由 group.v2.message_created 通知触发 pull。
       await this._publishAppEvent('group.message_created', msg, 'group-push');
     }
   }
 
   /** 收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息 */
   private async _autoPullGroupMessages(notification: Message): Promise<void> {
-    const groupId = (notification.group_id ?? '') as string;
+    let groupId = String(notification.group_id ?? '').trim();
     if (!groupId) {
       await this._publishAppEvent('group.message_created', notification);
       return;
     }
+    groupId = normalizeGroupId(groupId) || groupId;
     const ns = `group:${groupId}`;
     const afterSeq = this._seqTracker.getContiguousSeq(ns);
     this._clientLog.debug(`auto pull group messages start: group=${groupId}, after_seq=${afterSeq}, seq=${String(notification.seq ?? '')}`);
-    try {
-      // V2-only 模式：走 group.v2.pull（合并 V1 明文 + V2 密文并自动解密）
-      if (this._v2Session) {
-        await this._pullGroupV2Internal({ group_id: groupId, after_seq: afterSeq, limit: 50 });
-        this._clientLog.debug(`auto pull group messages done(v2): group=${groupId}, after_seq=${afterSeq}`);
-        return;
-      }
-      const result = await this.call('group.pull', {
-        group_id: groupId,
-        after_message_seq: afterSeq,
-        device_id: this._deviceId,
-        limit: 50,
-      });
-      if (isJsonObject(result)) {
-        const messages = result.messages;
-        if (Array.isArray(messages)) {
-          // onPullResult 已在 call() 拦截器中调用，此处不再重复
-          const pushed = this._pushedSeqs.get(ns);
-          for (const msg of messages) {
-            if (isJsonObject(msg)) {
-              const s = (msg as Record<string, unknown>).seq as number | undefined;
-              if (pushed && s !== undefined && s !== null && pushed.has(s)) {
-                this._clientLog.debug(`auto pull group message skipped duplicate: group=${groupId}, seq=${s}`);
-                continue; // 已发布到应用层，跳过
-              }
-              if (s !== undefined && s !== null) {
-                await this._publishPulledMessage('group.message_created', ns, s, msg);
-              } else {
-                await this._publishAppEvent('group.message_created', msg, 'pull');
-              }
-            }
-          }
-          this._prunePushedSeqs(ns);
-          return;
-        }
-      }
-    } catch (exc) {
-      this._clientLog.debug(`auto pull group messages failed: ${formatCaughtError(exc)}`);
+    const started = await this._tryRunBackgroundPull(ns, async () => {
+      const pullAfterSeq = this._seqTracker.getContiguousSeq(ns);
+      const messages = await this.pullGroupV2(groupId, pullAfterSeq, 50, { gateLocked: true });
+      this._prunePushedSeqs(ns);
+      return messages.length;
+    }, true);
+    if (!started) {
+      this._clientLog.debug(`auto pull group messages skipped: pull in-flight group=${groupId}`);
     }
-    await this._publishAppEvent('group.message_created', notification, 'group-push-fallback');
   }
 
   /** 后台补齐群消息空洞 */
   private async _fillGroupGap(groupId: string): Promise<void> {
+    groupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+    if (!groupId) return;
     const ns = `group:${groupId}`;
     const afterSeq = this._seqTracker.getContiguousSeq(ns);
     // 去重：同一 (group:id:after_seq) 只补一次
     const dedupKey = `group_msg:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
+    const token = this._tryAcquirePullGate(ns);
+    if (token === null) {
+      this._clientLog.debug(`group message gap fill skipped: pull in-flight group=${groupId}`);
+      return;
+    }
     this._gapFillDone.set(dedupKey, Date.now());
     this._clientLog.debug(`group message gap fill start: group=${groupId}, after_seq=${afterSeq}`);
+    let filled = 0;
     try {
-      const result = await this.call('group.pull', {
-        group_id: groupId,
-        after_message_seq: afterSeq,
-        device_id: this._deviceId,
-        limit: 50,
-      });
-      let filled = 0;
-      if (isJsonObject(result)) {
-        const messages = result.messages;
-        if (Array.isArray(messages)) {
-          // onPullResult 已在 call() 拦截器中调用，此处不再重复
-          const pushed = this._pushedSeqs.get(ns);
-          for (const msg of messages) {
-            if (isJsonObject(msg)) {
-              const s = (msg as Record<string, unknown>).seq as number | undefined;
-              if (pushed && s !== undefined && s !== null && pushed.has(s)) continue;
-              if (s !== undefined && s !== null) {
-                await this._publishPulledMessage('group.message_created', ns, s, msg);
-              } else {
-                await this._publishAppEvent('group.message_created', msg);
-              }
-              filled += 1;
-            }
-          }
-          this._prunePushedSeqs(ns);
-        }
+      const messages = await this._withBackgroundRpc(() => this.pullGroupV2(groupId, afterSeq, 50, { gateLocked: true }));
+      filled = messages.length;
+      this._prunePushedSeqs(ns);
+      if (this._seqTracker.getContiguousSeq(ns) !== afterSeq) {
+        await this._drainOrderedMessages(ns, undefined, true);
+        this._saveSeqTrackerState();
       }
       this._clientLog.debug(`group message gap fill done: group=${groupId}, after_seq=${afterSeq}, filled=${filled}`);
     } catch (exc) {
       this._clientLog.warn(`group message gap fill failed: ${formatCaughtError(exc)}`);
     } finally {
       this._gapFillDone.delete(dedupKey);
+      this._releasePullGate(ns, token);
+      if (filled > 0 && this._seqTracker.getContiguousSeq(ns) > afterSeq) {
+        void this._fillGroupGap(groupId);
+      }
     }
   }
 
@@ -2030,39 +2178,35 @@ export class AUNClient {
     // 去重：同一 (type:after_seq) 只补一次
     const dedupKey = `p2p:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
+    const token = this._tryAcquirePullGate(ns);
+    if (token === null) {
+      this._clientLog.debug(`P2P message gap fill skipped: pull in-flight ns=${ns}`);
+      return;
+    }
     this._gapFillDone.set(dedupKey, Date.now());
     this._clientLog.debug(`P2P message gap fill start: after_seq=${afterSeq}`);
+    let filled = 0;
     try {
-      const result = await this.call('message.pull', {
-        after_seq: afterSeq,
-        limit: 50,
-      });
-      let filled = 0;
-      if (isJsonObject(result)) {
-        const messages = result.messages;
-        if (Array.isArray(messages)) {
-          // onPullResult 已在 call() 拦截器中调用，此处不再重复
-          const pushed = this._pushedSeqs.get(ns);
-          for (const msg of messages) {
-            if (isJsonObject(msg)) {
-              const s = (msg as Record<string, unknown>).seq as number | undefined;
-              if (pushed && s !== undefined && s !== null && pushed.has(s)) continue;
-              if (s !== undefined && s !== null) {
-                await this._publishPulledMessage('message.received', ns, s, msg);
-              } else {
-                await this._publishAppEvent('message.received', msg);
-              }
-              filled += 1;
-            }
-          }
-          this._prunePushedSeqs(ns);
-        }
+      const messages = await this._withBackgroundRpc(() => this.pullV2(afterSeq, 50, { skipAutoAck: true, gateLocked: true }));
+      filled = messages.length;
+      this._prunePushedSeqs(ns);
+      if (this._seqTracker.getContiguousSeq(ns) !== afterSeq) {
+        await this._drainOrderedMessages(ns, undefined, true);
+        this._saveSeqTrackerState();
+      }
+      const contig = this._seqTracker.getContiguousSeq(ns);
+      if (contig > 0 && contig !== afterSeq) {
+        await this._withBackgroundRpc(() => this.ackV2(contig));
       }
       this._clientLog.debug(`P2P message gap fill done: after_seq=${afterSeq}, filled=${filled}`);
     } catch (exc) {
       this._clientLog.warn(`P2P message gap fill failed: ${formatCaughtError(exc)}`);
     } finally {
       this._gapFillDone.delete(dedupKey);
+      this._releasePullGate(ns, token);
+      if (filled > 0 && this._seqTracker.getContiguousSeq(ns) > afterSeq) {
+        void this._fillP2pGap();
+      }
     }
   }
 
@@ -2126,7 +2270,7 @@ export class AUNClient {
     return this._attachCurrentInstanceContext(payload);
   }
 
-  private async _publishAppEvent(event: string, payload: EventPayload, source = 'direct'): Promise<void> {
+  private _publishAppEvent(event: string, payload: EventPayload, source = 'direct'): void | Promise<void> {
     if ((event === 'message.received' || event === 'group.message_created') && isJsonObject(payload)) {
       this._maybeAppendEchoTraceReceive(payload as Record<string, unknown>);
     }
@@ -2149,7 +2293,7 @@ export class AUNClient {
         this._clientLog.debug(`agent_md etag inject skipped: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    await this._dispatcher.publish(event, this._normalizePublishedMessagePayload(event, payload));
+    return this._dispatcher.publishSyncAware(event, this._normalizePublishedMessagePayload(event, payload));
   }
 
   private _echoTimestamp(): string {
@@ -2301,23 +2445,253 @@ export class AUNClient {
     return true;
   }
 
-  private async _drainOrderedMessages(ns: string, beforeSeq?: number): Promise<void> {
+  private _tryAcquirePullGate(key: string): number | null {
+    if (!key) return 0;
+    const now = Date.now();
+    const gate = this._pullGates.get(key) ?? { inflight: false, startedAt: 0, token: 0 };
+    if (gate.inflight && now - gate.startedAt <= AUNClient.PULL_GATE_STALE_MS) {
+      return null;
+    }
+    if (gate.inflight) {
+      this._clientLog.warn(`pull in-flight stale reset: key=${key} age=${now - gate.startedAt}ms`);
+    }
+    gate.token += 1;
+    gate.inflight = true;
+    gate.startedAt = now;
+    this._pullGates.set(key, gate);
+    return gate.token;
+  }
+
+  private _releasePullGate(key: string, token: number | null): void {
+    if (!key || token == null) return;
+    const gate = this._pullGates.get(key);
+    if (!gate || gate.token !== token) return;
+    gate.inflight = false;
+    gate.startedAt = 0;
+  }
+
+  private _pullGateKeyForCall(method: string, params: RpcParams): string {
+    if (method === 'message.pull' || method === 'message.v2.pull') {
+      return this._aid ? `p2p:${this._aid}` : '';
+    }
+    if ((method === 'group.pull' || method === 'group.v2.pull') && String(params.group_id ?? '').trim()) {
+      return `group:${String(params.group_id ?? '').trim()}`;
+    }
+    if (method === 'group.pull_events' && String(params.group_id ?? '').trim()) {
+      return `group_event:${String(params.group_id ?? '').trim()}`;
+    }
+    return '';
+  }
+
+  private _isPullResponseProcessing(key: string): boolean {
+    if (!key) return false;
+    return (this._pullResponseKeys.get(key) ?? 0) > 0;
+  }
+
+  private _emptyPullResultForCall(method: string): RpcResult {
+    if (method === 'group.pull_events') return { events: [], count: 0 } as RpcResult;
+    if (method === 'message.pull' || method === 'message.v2.pull' || method === 'group.pull' || method === 'group.v2.pull') {
+      return { messages: [], count: 0 } as RpcResult;
+    }
+    return {} as RpcResult;
+  }
+
+  private _withPullResponseProcessing<T>(key: string, fn: () => Promise<T> | T): T | Promise<T> {
+    if (!key) return fn();
+    this._pullResponseKeys.set(key, (this._pullResponseKeys.get(key) ?? 0) + 1);
+    const release = (): void => {
+      const next = (this._pullResponseKeys.get(key) ?? 1) - 1;
+      if (next <= 0) {
+        this._pullResponseKeys.delete(key);
+      } else {
+        this._pullResponseKeys.set(key, next);
+      }
+    };
+    try {
+      const result = fn();
+      if (isPromiseLike(result)) {
+        return Promise.resolve(result).finally(release);
+      }
+      release();
+      return result;
+    } catch (exc) {
+      release();
+      throw exc;
+    }
+  }
+
+  private _pullResultCount(result: unknown): number {
+    if (Array.isArray(result)) return result.length;
+    if (!isJsonObject(result as JsonValue | object | undefined)) return 0;
+    const obj = result as Record<string, unknown>;
+    const rawCount = Number(obj.raw_count ?? 0);
+    if (Number.isFinite(rawCount) && rawCount > 0) return rawCount;
+    if (Array.isArray(obj.messages)) return obj.messages.length;
+    if (Array.isArray(obj.events)) return obj.events.length;
+    return 0;
+  }
+
+  private _nextPullParams(method: string, params: RpcParams): RpcParams | null {
+    const next: RpcParams = { ...params };
+    delete next._pull_gate_locked;
+    if (method === 'message.pull' || method === 'message.v2.pull') {
+      if (!this._aid) return null;
+      next.after_seq = this._seqTracker.getContiguousSeq(`p2p:${this._aid}`);
+      return next;
+    }
+    if (method === 'group.pull' || method === 'group.v2.pull') {
+      const groupId = normalizeGroupId(String(next.group_id ?? '').trim()) || String(next.group_id ?? '').trim();
+      if (!groupId) return null;
+      next.group_id = groupId;
+      next.after_seq = this._seqTracker.getContiguousSeq(`group:${groupId}`);
+      delete next.after_message_seq;
+      return next;
+    }
+    if (method === 'group.pull_events') {
+      const groupId = normalizeGroupId(String(next.group_id ?? '').trim()) || String(next.group_id ?? '').trim();
+      if (!groupId) return null;
+      next.group_id = groupId;
+      next.after_event_seq = this._seqTracker.getContiguousSeq(`group_event:${groupId}`);
+      return next;
+    }
+    return null;
+  }
+
+  private _pullRequestAfter(method: string, params: RpcParams): number {
+    if (method === 'message.pull' || method === 'message.v2.pull') return Number(params.after_seq ?? 0) || 0;
+    if (method === 'group.pull' || method === 'group.v2.pull') return Number(params.after_seq ?? params.after_message_seq ?? 0) || 0;
+    if (method === 'group.pull_events') return Number(params.after_event_seq ?? 0) || 0;
+    return 0;
+  }
+
+  private _pullRetentionFloor(result: JsonObject, topLevelKey: string, cursorKey: string): number {
+    const values: number[] = [Number(result[topLevelKey] ?? 0)];
+    const cursor = isJsonObject(result.cursor as JsonValue | object | null | undefined) ? result.cursor as JsonObject : null;
+    if (cursor) {
+      values.push(Number(cursor[cursorKey] ?? 0));
+      values.push(Number(cursor.retention_floor_seq ?? 0));
+    }
+    return Math.max(0, ...values.filter((value) => Number.isFinite(value)));
+  }
+
+  private _schedulePullFollowup(method: string, params: RpcParams, result: unknown): void {
+    if (method === 'message.pull') method = 'message.v2.pull';
+    else if (method === 'group.pull') method = 'group.v2.pull';
+    if (this._pullResultCount(result) <= 0) return;
+    const next = this._nextPullParams(method, params);
+    if (!next) return;
+    if (this._pullRequestAfter(method, next) <= this._pullRequestAfter(method, params)) return;
+    void (async () => {
+      try {
+        await this._withBackgroundRpc(async () => {
+          if (method === 'message.pull' || method === 'message.v2.pull') {
+            await this.pullV2(Number(next.after_seq ?? 0) || 0, Number(next.limit ?? 50) || 50);
+            return;
+          }
+          if (method === 'group.pull' || method === 'group.v2.pull') {
+            const groupId = String(next.group_id ?? '').trim();
+            if (!groupId) return;
+            await this.pullGroupV2(groupId, Number(next.after_seq ?? next.after_message_seq ?? 0) || 0, Number(next.limit ?? 50) || 50);
+            return;
+          }
+          await this.call(method, next);
+        });
+      } catch (exc) {
+        this._clientLog.debug(`pull follow-up skipped/failed: method=${method} err=${formatCaughtError(exc)}`);
+      }
+    })();
+  }
+
+  private async _withBackgroundRpc<T>(operation: () => Promise<T> | T): Promise<T> {
+    this._backgroundRpcDepth += 1;
+    try {
+      return await operation();
+    } finally {
+      this._backgroundRpcDepth = Math.max(0, this._backgroundRpcDepth - 1);
+    }
+  }
+
+  private async _runPullSerialized<T>(key: string, operation: () => Promise<T> | T): Promise<T> {
+    if (key && this._isPullResponseProcessing(key)) {
+      this._clientLog.debug(`pull skipped while processing pull response: key=${key}`);
+      return [] as unknown as T;
+    }
+    let token = this._tryAcquirePullGate(key);
+    if (token === null) {
+      // 显式 pull 可能撞上 push/gap-fill 的后台 pull。这里不并行发第二个 pull，
+      // 也不把后台 in-flight 暴露成业务错误；短等待 gate 释放后再进入连接级 RPC queue。
+      const deadline = Date.now() + AUNClient.PULL_GATE_STALE_MS + 100;
+      while (token === null && Date.now() <= deadline) {
+        await this._sleep(25);
+        token = this._tryAcquirePullGate(key);
+      }
+      if (token === null) {
+        throw new StateError(`pull already in-flight for ${key}`);
+      }
+    }
+    try {
+      return await this._withBackgroundRpc(operation);
+    } finally {
+      this._releasePullGate(key, token);
+    }
+  }
+
+  private async _tryRunBackgroundPull(
+    key: string,
+    operation: () => Promise<number> | number,
+    followupOnMessages = false,
+  ): Promise<boolean> {
+    if (key && this._isPullResponseProcessing(key)) return false;
+    const token = this._tryAcquirePullGate(key);
+    if (token === null) return false;
+    let count = 0;
+    try {
+      count = await this._withBackgroundRpc(operation);
+    } finally {
+      this._releasePullGate(key, token);
+    }
+    if (followupOnMessages && count > 0) {
+      // 后台续拉是 fire-and-forget；关闭连接时 transport 会拒绝排队 RPC，
+      // 这里必须本地收口，避免测试/宿主进程看到未处理的 Promise rejection。
+      void this._tryRunBackgroundPull(key, operation, true).catch((exc) => {
+        this._clientLog.debug(`background pull follow-up skipped/failed: key=${key} err=${formatCaughtError(exc)}`);
+      });
+    }
+    return true;
+  }
+
+  private async _drainOrderedMessages(ns: string, beforeSeq?: number, pullResponse = false): Promise<void> {
     const queue = this._pendingOrderedMsgs.get(ns);
     if (!queue || queue.size === 0) return;
-    const contig = this._seqTracker.getContiguousSeq(ns);
-    const ready = [...queue.keys()]
-      .filter((seq) => seq <= contig && (beforeSeq === undefined || seq < beforeSeq))
-      .sort((a, b) => a - b);
-    for (const seq of ready) {
+    while (true) {
+      const contig = this._seqTracker.getContiguousSeq(ns);
+      const ready = [...queue.keys()]
+        .filter((seq) => seq <= contig && (beforeSeq === undefined || seq < beforeSeq))
+        .sort((a, b) => a - b);
+      let seq: number | undefined = ready[0];
+      if (seq === undefined) {
+        const nextSeq = contig + 1;
+        if (beforeSeq !== undefined && nextSeq >= beforeSeq) break;
+        if (!queue.has(nextSeq)) break;
+        seq = nextSeq;
+      }
       const item = queue.get(seq);
       queue.delete(seq);
       if (!item) continue;
       if (this._pushedSeqs.get(ns)?.has(seq)) {
         this._clientLog.debug(`publish ordered drain skipped duplicate: ns=${ns}, seq=${seq}, event=${item.event}`);
+        this._markOrderedSeqDelivered(ns, seq);
         continue;
       }
-      await this._publishAppEvent(item.event, item.payload, 'ordered-drain');
+      if (pullResponse) {
+        const published = this._withPullResponseProcessing(ns, () => this._publishAppEvent(item.event, item.payload, 'ordered-drain'));
+        if (isPromiseLike(published)) await published;
+      } else {
+        const published = this._publishAppEvent(item.event, item.payload, 'ordered-drain');
+        if (isPromiseLike(published)) await published;
+      }
       this._markPublishedSeq(ns, seq);
+      this._markOrderedSeqDelivered(ns, seq);
       this._clientLog.debug(`publish ordered drain delivered: ns=${ns}, seq=${seq}, event=${item.event}`);
     }
     if (queue.size === 0) this._pendingOrderedMsgs.delete(ns);
@@ -2327,7 +2701,8 @@ export class AUNClient {
     const seqNum = Number(seq);
     if (!Number.isFinite(seqNum) || !Number.isInteger(seqNum) || seqNum <= 0) {
       this._clientLog.debug(`publish ordered direct(no-seq): event=${event}, ns=${ns || '<none>'}, seq=${String(seq)}`);
-      await this._publishAppEvent(event, payload, 'ordered');
+      const published = this._publishAppEvent(event, payload, 'ordered');
+      if (isPromiseLike(published)) await published;
       return true;
     }
     if (this._pushedSeqs.get(ns)?.has(seqNum)) {
@@ -2339,7 +2714,14 @@ export class AUNClient {
     }
 
     const contig = this._seqTracker.getContiguousSeq(ns);
-    if (seqNum > contig) {
+    if (seqNum <= contig) {
+      this._clientLog.debug(`publish ordered stale covered: event=${event}, ns=${ns}, seq=${seqNum}, contiguous=${contig}`);
+      const queue = this._pendingOrderedMsgs.get(ns);
+      queue?.delete(seqNum);
+      if (queue && queue.size === 0) this._pendingOrderedMsgs.delete(ns);
+      return false;
+    }
+    if (seqNum !== contig + 1) {
       this._clientLog.debug(`publish ordered enqueue(gap): event=${event}, ns=${ns}, seq=${seqNum}, contiguous=${contig}`);
       this._enqueueOrderedMessage(ns, event, seqNum, payload);
       return false;
@@ -2353,18 +2735,24 @@ export class AUNClient {
     const queue = this._pendingOrderedMsgs.get(ns);
     queue?.delete(seqNum);
     if (queue && queue.size === 0) this._pendingOrderedMsgs.delete(ns);
-    await this._publishAppEvent(event, payload, 'ordered');
+    const published = this._publishAppEvent(event, payload, 'ordered');
+    if (isPromiseLike(published)) await published;
     this._markPublishedSeq(ns, seqNum);
+    this._markOrderedSeqDelivered(ns, seqNum);
     this._clientLog.debug(`publish ordered delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
     await this._drainOrderedMessages(ns);
     return true;
   }
 
   private async _publishPulledMessage(event: string, ns: string, seq: unknown, payload: EventPayload): Promise<boolean> {
+    // Pull/gap-fill 批次是服务端对 after_seq 的可用结果集，可能跨过永久空洞。
+    // 这里只能做 namespace+seq 去重并按返回顺序发布，不能套用 push 路径的
+    // seq == contiguous_seq + 1 门控，否则会把空洞后的可用消息错误卡住。
     const seqNum = Number(seq);
     if (!Number.isFinite(seqNum) || !Number.isInteger(seqNum) || seqNum <= 0 || !ns) {
       this._clientLog.debug(`publish pulled direct(no-seq): event=${event}, ns=${ns || '<none>'}, seq=${String(seq)}`);
-      await this._publishAppEvent(event, payload, 'pull');
+      const published = this._withPullResponseProcessing(ns, () => this._publishAppEvent(event, payload, 'pull'));
+      if (isPromiseLike(published)) await published;
       return true;
     }
     const queue = this._pendingOrderedMsgs.get(ns);
@@ -2376,22 +2764,49 @@ export class AUNClient {
     }
     queue?.delete(seqNum);
     if (queue && queue.size === 0) this._pendingOrderedMsgs.delete(ns);
-    await this._publishAppEvent(event, payload, 'pull');
+    const published = this._withPullResponseProcessing(ns, () => this._publishAppEvent(event, payload, 'pull'));
+    if (isPromiseLike(published)) await published;
     this._markPublishedSeq(ns, seqNum);
+    this._markPulledSeqDelivered(ns, seqNum);
+    await this._drainOrderedMessages(ns, undefined, true);
     this._clientLog.debug(`publish pulled delivered: event=${event}, ns=${ns}, seq=${seqNum}`);
     return true;
   }
 
+  private _markPulledSeqDelivered(ns: string, seq: unknown): boolean {
+    // Pull 批次是 after_seq 之后服务端当前可用的结果集，可能跨过永久空洞。
+    // 这里仅在应用层发布返回后推进已交付游标，不能改成 push 的相邻 seq 门控。
+    const seqNum = Number(seq);
+    if (!ns || !Number.isFinite(seqNum) || !Number.isInteger(seqNum) || seqNum <= 0) return false;
+    const before = this._seqTracker.getContiguousSeq(ns);
+    this._seqTracker.forceContiguousSeq(ns, seqNum);
+    return this._seqTracker.getContiguousSeq(ns) !== before;
+  }
+
+  private _markOrderedSeqDelivered(ns: string, seq: number): boolean {
+    if (!ns || !Number.isFinite(seq) || !Number.isInteger(seq) || seq <= 0) return false;
+    const before = this._seqTracker.getContiguousSeq(ns);
+    this._seqTracker.onMessageSeq(ns, seq);
+    return this._seqTracker.getContiguousSeq(ns) !== before;
+  }
+
   /** 后台补齐群事件空洞 */
   private async _fillGroupEventGap(groupId: string): Promise<void> {
+    groupId = normalizeGroupId(groupId) || String(groupId ?? '').trim();
+    if (!groupId) return;
     const ns = `group_event:${groupId}`;
     const afterSeq = this._seqTracker.getContiguousSeq(ns);
     // 去重：同一 (group_evt:id:after_seq) 只补一次
     const dedupKey = `group_evt:${groupId}:${afterSeq}`;
     if (this._gapFillDone.has(dedupKey)) return;
+    const token = this._tryAcquirePullGate(ns);
+    if (token === null) {
+      this._clientLog.debug(`group event gap fill skipped: pull in-flight group=${groupId}`);
+      return;
+    }
     this._gapFillDone.set(dedupKey, Date.now());
+    let filled = 0;
     try {
-      let filled = 0;
       let nextAfterSeq = afterSeq;
       const maxPages = 100;
       let pageCount = 0;
@@ -2403,22 +2818,19 @@ export class AUNClient {
           after_event_seq: nextAfterSeq,
           device_id: this._deviceId,
           limit: 50,
+          _pull_gate_locked: true,
         });
         if (!isJsonObject(result)) return;
         const events = result.events;
         if (!Array.isArray(events)) return;
         const pageContigBefore = this._seqTracker.getContiguousSeq(ns);
         const eventObjects = events.filter(isJsonObject);
-        if (eventObjects.length > 0) {
-          this._seqTracker.onPullResult(ns, eventObjects, nextAfterSeq);
-        }
-        const cursor = isJsonObject(result.cursor) ? result.cursor : null;
-        const serverAck = cursor ? Number(cursor.current_seq ?? 0) : 0;
-        if (serverAck > 0) {
+        const retentionFloor = this._pullRetentionFloor(result as JsonObject, 'retention_floor_event_seq', 'retention_floor_event_seq');
+        if (retentionFloor > 0) {
           const contigBeforeFloor = this._seqTracker.getContiguousSeq(ns);
-          if (contigBeforeFloor < serverAck) {
-            this._clientLog.info(`group.pull_events retention-floor advance: ns=${ns} contiguous=${contigBeforeFloor} -> cursor.current_seq=${serverAck}`);
-            this._seqTracker.forceContiguousSeq(ns, serverAck);
+          if (contigBeforeFloor < retentionFloor) {
+            this._clientLog.info(`group.pull_events retention-floor advance: ns=${ns} contiguous=${contigBeforeFloor} -> retention_floor=${retentionFloor}`);
+            this._seqTracker.forceContiguousSeq(ns, retentionFloor);
           }
         }
         const eventSeqs: number[] = [];
@@ -2428,18 +2840,22 @@ export class AUNClient {
           evt._from_gap_fill = true;
           const et = String(evt.event_type ?? '');
           // 消息事件由 _fillGroupGap 负责，事件补洞不重复投递
-          if (et === 'group.message_created') continue;
-          // 验签：有 client_signature 就验（与实时事件路径对齐）
-          const cs = evt.client_signature;
-          if (cs && typeof cs === 'object') {
-            if (this._shouldSkipEventSignature(evt)) {
-              delete evt.client_signature;
-            } else {
-              evt._verified = await this._verifyEventSignatureAsync(evt, cs as JsonObject);
+          if (et !== 'group.message_created') {
+            // 验签：有 client_signature 就验（与实时事件路径对齐）
+            const cs = evt.client_signature;
+            if (cs && typeof cs === 'object') {
+              if (this._shouldSkipEventSignature(evt)) {
+                delete evt.client_signature;
+              } else {
+                evt._verified = await this._verifyEventSignatureAsync(evt, cs as JsonObject);
+              }
             }
+            // group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
+            await this._dispatcher.publish('group.changed', evt);
           }
-          // group.changed 或缺失/其他 → 发布到 group.changed（向后兼容）
-          await this._dispatcher.publish('group.changed', evt);
+          if (Number.isFinite(eventSeq) && eventSeq > 0) {
+            this._markPulledSeqDelivered(ns, eventSeq);
+          }
           filled += 1;
         }
         const contig = this._seqTracker.getContiguousSeq(ns);
@@ -2454,11 +2870,11 @@ export class AUNClient {
             event_seq: ackSeq,
             device_id: this._deviceId,
             slot_id: this._slotId,
-          }).catch((e) => { this._clientLog.debug(`group event auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
+          }, undefined, undefined, true).catch((e) => { this._clientLog.debug(`group event auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
         }
-        const nextAfter = Math.max(eventSeqs.length > 0 ? Math.max(...eventSeqs) : nextAfterSeq, nextAfterSeq);
-        if (eventObjects.length === 0 || nextAfter <= nextAfterSeq || result.has_more === false) break;
-        nextAfterSeq = nextAfter;
+        // pull_events 与其它 pull 一样：一次后台任务只消费一个批次。
+        // 非空批次返回后由 pull gate 的 fire-and-forget follow-up 重新排队，直到空批停止。
+        break;
       }
       if (pageCount >= maxPages) {
         this._clientLog.warn(`group event gap fill reached max_pages=${maxPages} group=${groupId} after_seq=${nextAfterSeq}`);
@@ -2468,6 +2884,10 @@ export class AUNClient {
       this._clientLog.warn(`group event gap fill failed: ${formatCaughtError(exc)}`);
     } finally {
       this._gapFillDone.delete(dedupKey);
+      this._releasePullGate(ns, token);
+      if (filled > 0 && this._seqTracker.getContiguousSeq(ns) > afterSeq) {
+        void this._fillGroupEventGap(groupId);
+      }
     }
   }
 
@@ -2554,7 +2974,7 @@ export class AUNClient {
             event_seq: contig,
             device_id: this._deviceId,
             slot_id: this._slotId,
-          }).catch((e) => { this._clientLog.debug(`group event push auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
+          }, undefined, undefined, true).catch((e) => { this._clientLog.debug(`group event push auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
         }
       }
 
@@ -2766,56 +3186,35 @@ export class AUNClient {
     }
   }
 
-  /**
-   * 获取对方证书（带缓存 + 完整 PKI 验证）。  /**
-   * 获取对方证书（带缓存 + 完整 PKI 验证）。
-   * 跨域时自动路由到 peer 所在域的 Gateway。
-   */
-  private async _fetchPeerCert(aid: string, certFingerprint?: string, timeoutMs = 30_000): Promise<string> {
-    const tStart = Date.now();
-    this._clientLog.debug(`_fetchPeerCert enter: aid=${aid}, fp=${certFingerprint ?? ''}`);
-    try {
-    const cacheKey = AUNClient._certCacheKey(aid, certFingerprint);
-    const cached = this._certCache.get(cacheKey);
-    const now = Date.now() / 1000;
-    if (cached && now < cached.refreshAfter) {
-      this._clientLog.debug(`_fetchPeerCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} (cache_hit)`);
-      return cached.certPem;
-    }
+  private async _validateAndCachePeerCert(opts: {
+    aid: string;
+    certPem: string;
+    certFingerprint?: string;
+    caChainPems?: string[];
+    source?: string;
+  }): Promise<string> {
+    const aid = String(opts.aid ?? '').trim();
+    const certPem = String(opts.certPem ?? '').trim();
+    const certFingerprint = String(opts.certFingerprint ?? '').trim() || undefined;
+    if (!aid) throw new ValidationError('peer aid is required for cert validation');
+    if (!certPem) throw new ValidationError(`peer cert is empty for ${aid}`);
 
     const gatewayUrl = this._gatewayUrl;
     if (!gatewayUrl) {
-      throw new ValidationError('gateway url unavailable for e2ee cert fetch');
+      throw new ValidationError('gateway url unavailable for e2ee cert validation');
     }
-
-    // 跨域时用 peer 所在域的 Gateway URL
     const peerGatewayUrl = AUNClient._resolvePeerGatewayUrl(gatewayUrl, aid);
-    let certPem: string;
-    try {
-      const certUrl = AUNClient._buildCertUrl(peerGatewayUrl, aid, certFingerprint);
-      certPem = await _httpGetText(certUrl, this._configModel.verifySsl, timeoutMs);
-    } catch (exc) {
-      if (!certFingerprint) {
-        throw exc;
-      }
-      const fallbackCert = await _httpGetText(
-        AUNClient._buildCertUrl(peerGatewayUrl, aid),
-        this._configModel.verifySsl,
-        timeoutMs,
-      );
-      certPem = fallbackCert;
-    }
+    const x509Cert = new crypto.X509Certificate(certPem);
 
     // H7: 严格校验指纹（DER SHA-256 或 SPKI SHA-256 任一匹配即可）
     if (certFingerprint) {
-      const expectedFP = String(certFingerprint).trim().toLowerCase();
+      const expectedFP = certFingerprint.toLowerCase();
       if (!expectedFP.startsWith('sha256:')) {
         throw new ValidationError(
           `unsupported cert_fingerprint format for ${aid}: ${expectedFP.slice(0, 24)}`,
         );
       }
       const expectedHex = expectedFP.slice('sha256:'.length);
-      const x509Cert = new crypto.X509Certificate(certPem);
       const derHex = x509Cert.fingerprint256.replace(/:/g, '').toLowerCase();
       let spkiHex = '';
       try {
@@ -2831,21 +3230,42 @@ export class AUNClient {
       }
     }
 
-    // 完整 PKI 验证
+    let cachedBootstrapChain = false;
+    const caChainPems = opts.caChainPems ?? [];
+    if (caChainPems.length > 0) {
+      try {
+        this._auth.cacheGatewayCaChain(peerGatewayUrl, caChainPems, aid);
+        cachedBootstrapChain = true;
+      } catch (exc) {
+        this._clientLog.debug(`bootstrap CA chain cache skipped: peer=${aid}, source=${opts.source ?? 'unknown'}, err=${formatCaughtError(exc)}`);
+      }
+    }
+
     try {
       await this._auth.verifyPeerCertificate(peerGatewayUrl, certPem, aid);
     } catch (exc) {
+      if (cachedBootstrapChain) {
+        this._auth.discardGatewayCaChain(peerGatewayUrl, aid);
+      }
       throw new ValidationError(
         `peer cert verification failed for ${aid}: ${exc instanceof Error ? exc.message : String(exc)}`,
       );
     }
 
     const nowSec = Date.now() / 1000;
-    this._certCache.set(cacheKey, {
+    const entry: CachedPeerCert = {
       certPem,
       validatedAt: nowSec,
       refreshAfter: nowSec + PEER_CERT_CACHE_TTL,
-    });
+    };
+    const cacheKey = AUNClient._certCacheKey(aid, certFingerprint);
+    this._certCache.set(cacheKey, entry);
+    const bareKey = AUNClient._certCacheKey(aid);
+    if (bareKey !== cacheKey) this._certCache.set(bareKey, entry);
+    if (!certFingerprint) {
+      const actualFp = `sha256:${x509Cert.fingerprint256.replace(/:/g, '').toLowerCase()}`;
+      this._certCache.set(AUNClient._certCacheKey(aid, actualFp), entry);
+    }
 
     try {
       // peer 证书只存版本目录，不覆盖 cert.pem
@@ -2854,11 +3274,123 @@ export class AUNClient {
       this._clientLog.error(`failed to write cert to keystore (aid=${aid}, fp=${certFingerprint ?? ''}): ${formatCaughtError(exc)}`, exc instanceof Error ? exc : undefined);
     }
 
-    this._clientLog.debug(`_fetchPeerCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} (fetched)`);
     return certPem;
+  }
+
+  /** 获取对方证书（带缓存 + 完整 PKI 验证），跨域时自动路由到 peer 所在域。 */
+  private async _fetchPeerCert(aid: string, certFingerprint?: string, timeoutMs = 30_000): Promise<string> {
+    const tStart = Date.now();
+    this._clientLog.debug(`_fetchPeerCert enter: aid=${aid}, fp=${certFingerprint ?? ''}`);
+    try {
+      const cacheKey = AUNClient._certCacheKey(aid, certFingerprint);
+      const cached = this._certCache.get(cacheKey);
+      const now = Date.now() / 1000;
+      if (cached && now < cached.refreshAfter) {
+        this._clientLog.debug(`_fetchPeerCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} (cache_hit)`);
+        return cached.certPem;
+      }
+
+      const gatewayUrl = this._gatewayUrl;
+      if (!gatewayUrl) {
+        throw new ValidationError('gateway url unavailable for e2ee cert fetch');
+      }
+      const peerGatewayUrl = AUNClient._resolvePeerGatewayUrl(gatewayUrl, aid);
+      let certPem: string;
+      try {
+        certPem = await _httpGetText(
+          AUNClient._buildCertUrl(peerGatewayUrl, aid, certFingerprint),
+          this._configModel.verifySsl,
+          timeoutMs,
+        );
+      } catch (exc) {
+        if (!certFingerprint) throw exc;
+        certPem = await _httpGetText(
+          AUNClient._buildCertUrl(peerGatewayUrl, aid),
+          this._configModel.verifySsl,
+          timeoutMs,
+        );
+      }
+
+      const validated = await this._validateAndCachePeerCert({
+        aid,
+        certPem,
+        certFingerprint,
+        source: 'fetch',
+      });
+      this._clientLog.debug(`_fetchPeerCert exit: elapsed=${Date.now() - tStart}ms aid=${aid} (fetched)`);
+      return validated;
     } catch (err) {
       this._clientLog.debug(`_fetchPeerCert exit (error): elapsed=${Date.now() - tStart}ms aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
+    }
+  }
+
+  private _bootstrapCaChain(material: Record<string, unknown>): string[] {
+    let raw: unknown;
+    for (const key of ['ca_chain', 'ca_chain_pems', 'cert_chain', 'chain']) {
+      if (material[key] !== undefined && material[key] !== null) {
+        raw = material[key];
+        break;
+      }
+    }
+    if (!Array.isArray(raw)) return [];
+    const result: string[] = [];
+    for (const item of raw) {
+      let certType = '';
+      let certPem = '';
+      if (isJsonObject(item)) {
+        certType = String(item.cert_type ?? '').trim().toLowerCase();
+        if (certType === 'agent') continue;
+        certPem = String(item.cert_pem ?? item.cert ?? '').trim();
+      } else {
+        certPem = String(item ?? '').trim();
+      }
+      if (!certPem) continue;
+      if (!certType) {
+        try {
+          if (!new crypto.X509Certificate(certPem).ca) continue;
+        } catch {
+          continue;
+        }
+      }
+      result.push(certPem);
+    }
+    return result;
+  }
+
+  private async _primeBootstrapPeerCerts(bootstrap: Record<string, unknown>, peerAid: string): Promise<void> {
+    const certsRaw = bootstrap.certs as JsonValue | object | null | undefined;
+    if (!isJsonObject(certsRaw)) return;
+    const materials = certsRaw;
+    const expected = new Set<string>();
+    const normalizedPeer = String(peerAid ?? '').trim();
+    if (normalizedPeer) expected.add(normalizedPeer);
+    const audit = Array.isArray(bootstrap.audit_recipients) ? bootstrap.audit_recipients : [];
+    for (const dev of audit) {
+      if (!isJsonObject(dev)) continue;
+      const aid = String(dev.aid ?? '').trim();
+      if (aid) expected.add(aid);
+    }
+    for (const aid of expected) {
+      if (aid === this._aid) continue;
+      const material = materials[aid];
+      if (!isJsonObject(material)) continue;
+      const certPem = String(material.cert_pem ?? material.cert ?? '').trim();
+      if (!certPem) continue;
+      const certFingerprint = String(
+        material.cert_fingerprint ?? material.fingerprint ?? material.fp ?? '',
+      ).trim() || undefined;
+      try {
+        await this._validateAndCachePeerCert({
+          aid,
+          certPem,
+          certFingerprint,
+          caChainPems: this._bootstrapCaChain(material),
+          source: 'bootstrap',
+        });
+      } catch (exc) {
+        this._clientLog.debug(`bootstrap peer cert material ignored: peer=${aid}, err=${formatCaughtError(exc)}`);
+      }
     }
   }
 
@@ -3330,7 +3862,7 @@ export class AUNClient {
         this._clientLog.warn(`V2 session init failed (non-fatal): ${formatCaughtError(exc)}`);
       }
 
-      // connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
+      // connect/reconnect 成功后自动触发一次 P2P message.v2.pull，补齐离线期间积压
       // 群消息按惰性触发，不在此处主动 pull
       void this._fillP2pGap().catch((exc) => {
         this._clientLog.warn(`schedule post-connect P2P gap fill failed: ${formatCaughtError(exc)}`);
@@ -3436,8 +3968,7 @@ export class AUNClient {
     this._v2Session = new V2Session(v2Store, this._deviceId, this._aid, aidPriv, aidPubDer);
     await this._v2Session.ensureRegistered(this._v2CallFn());
     this._clientLog.debug(`V2 session initialized aid=${this._aid} device=${this._deviceId}`);
-
-    this._safeAsync(this._v2AutoConfirmPendingProposals());
+    // 群 state proposal 由服务端在 client.online 时定向通知。
   }
 
   private async _v2TrustedIKPubDer(aid: string): Promise<Uint8Array> {
@@ -3632,7 +4163,11 @@ export class AUNClient {
       const session = this._v2Session;
       if (session && fromAid) {
         try {
-          const bs = await this.call('message.v2.bootstrap', { peer_aid: fromAid }) as Record<string, unknown>;
+          const bs = await this.call('message.v2.bootstrap', {
+            peer_aid: fromAid,
+            e2ee_wrap_capabilities: v2WrapCapabilities(),
+          }) as Record<string, unknown>;
+          await this._primeBootstrapPeerCerts(bs, fromAid);
           const peers = (Array.isArray(bs?.peer_devices) ? bs.peer_devices : []) as Array<Record<string, unknown>>;
           for (const dev of peers) this._cacheV2PeerIKFromDevice(dev, fromAid);
         } catch (exc) {
@@ -3640,7 +4175,10 @@ export class AUNClient {
         }
         if (groupId) {
           try {
-            const gbs = await this.call('group.v2.bootstrap', { group_id: groupId }) as Record<string, unknown>;
+            const gbs = await this.call('group.v2.bootstrap', {
+              group_id: groupId,
+              e2ee_wrap_capabilities: v2WrapCapabilities(),
+            }) as Record<string, unknown>;
             const devices = (Array.isArray(gbs?.devices) ? gbs.devices : []) as Array<Record<string, unknown>>;
             const audit = (Array.isArray(gbs?.audit_recipients) ? gbs.audit_recipients : []) as Array<Record<string, unknown>>;
             for (const dev of devices) this._cacheV2PeerIKFromDevice(dev);
@@ -3704,13 +4242,20 @@ export class AUNClient {
 
     let peerDevices: Array<Record<string, unknown>> = [];
     let auditRaw: Array<Record<string, unknown>> = [];
+    let wrapPolicy = normalizeV2WrapPolicy(undefined);
     const cached = useCache ? this._v2BootstrapCache.get(to) : undefined;
     if (cached && Date.now() - cached.cachedAt < AUNClient.V2_BOOTSTRAP_TTL_MS) {
       peerDevices = cached.devices;
       auditRaw = cached.auditRecipients;
+      wrapPolicy = cached.wrapPolicy ?? wrapPolicy;
       this._clientLog.debug(`message.v2.bootstrap cache hit: to=${to}, devices=${peerDevices.length}, audit=${auditRaw.length}`);
     } else {
-      const bs = await this.call('message.v2.bootstrap', { peer_aid: to }) as Record<string, unknown>;
+      const bs = await this.call('message.v2.bootstrap', {
+        peer_aid: to,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      }) as Record<string, unknown>;
+      await this._primeBootstrapPeerCerts(bs, to);
+      wrapPolicy = normalizeV2WrapPolicy(bs.e2ee_wrap_policy);
       peerDevices = (Array.isArray(bs?.peer_devices) ? bs.peer_devices : []) as Array<Record<string, unknown>>;
       auditRaw = (Array.isArray(bs?.audit_recipients) ? bs.audit_recipients : []) as Array<Record<string, unknown>>;
       this._clientLog.debug(`message.v2.bootstrap fetched: to=${to}, devices=${peerDevices.length}, audit=${auditRaw.length}`);
@@ -3719,6 +4264,7 @@ export class AUNClient {
           devices: peerDevices,
           auditRecipients: auditRaw,
           cachedAt: Date.now(),
+          wrapPolicy,
         });
       }
     }
@@ -3759,13 +4305,19 @@ export class AUNClient {
         if (selfCached && Date.now() - selfCached.cachedAt < AUNClient.V2_BOOTSTRAP_TTL_MS) {
           selfDevices = selfCached.devices;
         } else {
-          const selfBs = await this.call('message.v2.bootstrap', { peer_aid: this._aid }) as Record<string, unknown>;
+          const selfBs = await this.call('message.v2.bootstrap', {
+            peer_aid: this._aid,
+            e2ee_wrap_capabilities: v2WrapCapabilities(),
+          }) as Record<string, unknown>;
+          await this._primeBootstrapPeerCerts(selfBs, this._aid);
           selfDevices = (Array.isArray(selfBs?.peer_devices) ? selfBs.peer_devices : []) as Array<Record<string, unknown>>;
+          const selfWrapPolicy = normalizeV2WrapPolicy(selfBs.e2ee_wrap_policy);
           if (selfDevices.length > 0) {
             this._v2BootstrapCache.set(this._aid, {
               devices: selfDevices,
               auditRecipients: [],
               cachedAt: Date.now(),
+              wrapPolicy: selfWrapPolicy,
             });
           }
         }
@@ -3791,7 +4343,10 @@ export class AUNClient {
     }
     const envelope = encryptP2PMessage(
       session.getSenderIdentity(),
-      { targets, auditRecipients: auditTargets },
+      {
+        targets: applyV2WrapPolicyToTargets(targets, wrapPolicy),
+        auditRecipients: applyV2WrapPolicyToTargets(auditTargets, wrapPolicy),
+      },
       opts.payload,
       {
         messageId: opts.messageId,
@@ -3870,10 +4425,22 @@ export class AUNClient {
   }
 
   /** V2 P2P 拉取并解密；直接方法返回消息数组，call("message.pull") 会包装为 {messages}. */
-  async pullV2(afterSeq: number = 0, limit: number = 50): Promise<Array<Record<string, unknown>>> {
+  async pullV2(
+    afterSeq: number = 0,
+    limit: number = 50,
+    opts?: { skipAutoAck?: boolean; gateLocked?: boolean; scheduleFollowup?: boolean },
+  ): Promise<Array<Record<string, unknown>>> {
     await this._ensureV2SessionReady('message.pull');
     const ns = this._aid ? `p2p:${this._aid}` : '';
+    if (ns && !opts?.gateLocked) {
+      return await this._runPullSerialized(ns, async () => this.pullV2(afterSeq, limit, {
+        ...(opts ?? {}),
+        gateLocked: true,
+        scheduleFollowup: true,
+      }));
+    }
     const decrypted: Array<Record<string, unknown>> = [];
+    let totalRawCount = 0;
     let nextAfterSeq = afterSeq || (ns ? this._seqTracker.getContiguousSeq(ns) : 0);
     let pageCount = 0;
     const maxPages = 100;
@@ -3881,8 +4448,12 @@ export class AUNClient {
     while (pageCount < maxPages) {
       pageCount += 1;
       this._clientLog.debug(`message.v2.pull page request: page=${pageCount}, after_seq=${nextAfterSeq}, limit=${limit}, ns=${ns || '<none>'}`);
-      const result = await this.call('message.v2.pull', { after_seq: nextAfterSeq, limit }) as Record<string, unknown>;
+      const result = await this._callRawV2Rpc('message.v2.pull', {
+        after_seq: nextAfterSeq,
+        limit,
+      }) as Record<string, unknown>;
       const messages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
+      totalRawCount += messages.length;
       this._clientLog.debug(`message.v2.pull page response: page=${pageCount}, raw_count=${messages.length}, has_more=${String(result.has_more ?? '')}, server_ack_seq=${String(result.server_ack_seq ?? '')}`);
       for (const msg of messages) {
         this._logMessageDebug('pull-raw', 'message.v2.pull', 'message.received', msg);
@@ -3891,10 +4462,13 @@ export class AUNClient {
         .map((msg) => Number(msg.seq ?? 0))
         .filter((seq) => Number.isFinite(seq) && seq > 0);
       const pageContigBefore = ns ? this._seqTracker.getContiguousSeq(ns) : 0;
-      const pageMaxSeq = seqs.length > 0 ? Math.max(...seqs) : nextAfterSeq;
-      if (ns && seqs.length > 0) {
-        this._seqTracker.forceContiguousSeq(ns, pageMaxSeq);
-        this._clientLog.debug(`message.v2.pull force contiguous: ns=${ns}, page_max_seq=${pageMaxSeq}, previous=${pageContigBefore}`);
+      let pageMaxSeq = nextAfterSeq;
+      if (seqs.length > 0) {
+        pageMaxSeq = Math.max(...seqs);
+        if (ns) {
+          this._seqTracker.forceContiguousSeq(ns, pageMaxSeq);
+          this._clientLog.debug(`message.v2.pull force contiguous: ns=${ns}, page_max_seq=${pageMaxSeq}, previous=${pageContigBefore}`);
+        }
       }
 
       for (const msg of messages) {
@@ -3919,8 +4493,11 @@ export class AUNClient {
               payload: legacyPayload as JsonValue,
               encrypted: false,
             };
-          if (ns) await this._publishPulledMessage('message.received', ns, seq, v1Msg as EventPayload);
-          else await this._publishAppEvent('message.received', v1Msg as EventPayload, 'pull');
+          if (ns) {
+            await this._publishPulledMessage('message.received', ns, seq, v1Msg as EventPayload);
+          } else {
+            await this._publishAppEvent('message.received', v1Msg as EventPayload, 'pull');
+          }
           decrypted.push(v1Msg);
           this._clientLog.debug(`message.v2.pull plaintext V1 delivered: seq=${seq}, ns=${ns || '<none>'}`);
         } else {
@@ -3943,8 +4520,11 @@ export class AUNClient {
           this._clientLog.debug(`message.v2.pull decrypt returned null: seq=${seq}, ns=${ns || '<none>'}`);
           continue;
         }
-        if (ns) await this._publishPulledMessage('message.received', ns, seq, plaintext as EventPayload);
-        else await this._publishAppEvent('message.received', plaintext as EventPayload, 'pull');
+        if (ns) {
+          await this._publishPulledMessage('message.received', ns, seq, plaintext as EventPayload);
+        } else {
+          await this._publishAppEvent('message.received', plaintext as EventPayload, 'pull');
+        }
         decrypted.push(plaintext);
         this._logMessageDebug('decrypt-ok', 'message.v2.pull', 'message.received', plaintext);
       }
@@ -3962,10 +4542,10 @@ export class AUNClient {
         const ackSeq = this._seqTracker.getContiguousSeq(ns);
         const contigAdvanced = ackSeq !== pageContigBefore;
         if (contigAdvanced) {
-          await this._drainOrderedMessages(ns);
+          await this._drainOrderedMessages(ns, undefined, true);
           this._saveSeqTrackerState();
         }
-        if (messages.length > 0 && contigAdvanced && ackSeq > 0) {
+        if (messages.length > 0 && contigAdvanced && ackSeq > 0 && !opts?.skipAutoAck) {
           this._clientLog.debug(`message.v2.pull scheduling auto-ack: ns=${ns}, ack_seq=${ackSeq}, raw_count=${messages.length}`);
           this._safeAsync(this.ackV2(ackSeq).then(() => undefined));
         }
@@ -4000,7 +4580,7 @@ export class AUNClient {
       }
     }
     this._clientLog.debug(`message.v2.ack send: ns=${ns || '<none>'}, up_to_seq=${seq}`);
-    const raw = await this.call('message.v2.ack', { up_to_seq: seq });
+    const raw = await this._callRawV2Rpc('message.v2.ack', { up_to_seq: seq });
     const result: JsonObject = isJsonObject(raw as JsonValue | object | null | undefined)
       ? { ...(raw as JsonObject) }
       : { result: raw as JsonValue };
@@ -4114,6 +4694,7 @@ export class AUNClient {
     let auditRecipientsRaw: Array<Record<string, unknown>> = [];
     let epoch = 0;
     let stateCommitment: StateCommitmentAAD = { state_version: 0, state_hash: '', state_chain: '' };
+    let wrapPolicy = normalizeV2WrapPolicy(undefined);
 
     const cached = useCache ? this._v2BootstrapCache.get(cacheKey) : undefined;
     if (cached && Date.now() - cached.cachedAt < AUNClient.V2_BOOTSTRAP_TTL_MS) {
@@ -4121,12 +4702,17 @@ export class AUNClient {
       auditRecipientsRaw = cached.auditRecipients;
       epoch = cached.epoch ?? 0;
       stateCommitment = cached.stateCommitment ?? stateCommitment;
+      wrapPolicy = cached.wrapPolicy ?? wrapPolicy;
       this._clientLog.debug(`group.v2.bootstrap cache hit: group=${groupId}, devices=${allDevices.length}, audit=${auditRecipientsRaw.length}, epoch=${epoch}, state_version=${stateCommitment.state_version}`);
     } else {
-      const bs = await this.call('group.v2.bootstrap', { group_id: groupId }) as Record<string, unknown>;
+      const bs = await this.call('group.v2.bootstrap', {
+        group_id: groupId,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      }) as Record<string, unknown>;
       allDevices = (Array.isArray(bs.devices) ? bs.devices : []) as Array<Record<string, unknown>>;
       auditRecipientsRaw = (Array.isArray(bs.audit_recipients) ? bs.audit_recipients : []) as Array<Record<string, unknown>>;
       epoch = Number(bs.epoch ?? 0) || 0;
+      wrapPolicy = normalizeV2WrapPolicy(bs.e2ee_wrap_policy);
       this._clientLog.debug(`group.v2.bootstrap fetched: group=${groupId}, devices=${allDevices.length}, audit=${auditRecipientsRaw.length}, epoch=${epoch}, members=${Array.isArray(bs.member_aids) ? bs.member_aids.length : 0}`);
       const stateChain = String(bs.state_chain ?? '');
       await this._v2CheckFork(groupId, stateChain);
@@ -4144,6 +4730,7 @@ export class AUNClient {
           cachedAt: Date.now(),
           epoch,
           stateCommitment,
+          wrapPolicy,
         });
       }
       // lazy sync 触发：发现 pending members 时异步发起提案
@@ -4191,7 +4778,7 @@ export class AUNClient {
       session.getSenderIdentity(),
       groupId,
       epoch,
-      targets,
+      applyV2WrapPolicyToTargets(targets, wrapPolicy),
       opts.payload,
       {
         messageId: opts.messageId,
@@ -4223,16 +4810,29 @@ export class AUNClient {
   }
 
   private async _pullGroupV2Internal(params: { group_id: string; after_seq: number; limit: number }): Promise<void> {
-    await this.pullGroupV2(params.group_id, params.after_seq, params.limit);
+    await this.pullGroupV2(params.group_id, params.after_seq, params.limit, { gateLocked: true });
   }
 
   /** V2 Group 拉取并解密；直接方法返回消息数组，call("group.pull") 会包装为 {messages}. */
-  async pullGroupV2(groupId: string, afterSeq: number = 0, limit: number = 50): Promise<Array<Record<string, unknown>>> {
+  async pullGroupV2(
+    groupId: string,
+    afterSeq: number = 0,
+    limit: number = 50,
+    opts?: { gateLocked?: boolean; scheduleFollowup?: boolean },
+  ): Promise<Array<Record<string, unknown>>> {
     await this._ensureV2SessionReady('group.pull');
     const gid = normalizeGroupId(groupId) || String(groupId ?? '').trim();
     if (!gid) throw new ValidationError('group.pull requires group_id');
     const ns = `group:${gid}`;
+    if (!opts?.gateLocked) {
+      return await this._runPullSerialized(ns, async () => this.pullGroupV2(gid, afterSeq, limit, {
+        ...(opts ?? {}),
+        gateLocked: true,
+        scheduleFollowup: true,
+      }));
+    }
     const decrypted: Array<Record<string, unknown>> = [];
+    let totalRawCount = 0;
     let nextAfterSeq = afterSeq || this._seqTracker.getContiguousSeq(ns);
     let pageCount = 0;
     const maxPages = 100;
@@ -4240,12 +4840,13 @@ export class AUNClient {
     while (pageCount < maxPages) {
       pageCount += 1;
       this._clientLog.debug(`group.v2.pull page request: group=${gid}, page=${pageCount}, after_seq=${nextAfterSeq}, limit=${limit}, ns=${ns}`);
-      const result = await this.call('group.v2.pull', {
+      const result = await this._callRawV2Rpc('group.v2.pull', {
         group_id: gid,
         after_seq: nextAfterSeq,
         limit,
       }) as Record<string, unknown>;
       const messages = (Array.isArray(result.messages) ? result.messages : []) as Array<Record<string, unknown>>;
+      totalRawCount += messages.length;
       const cursor = isJsonObject(result.cursor as JsonValue | object | null | undefined) ? result.cursor as JsonObject : null;
       this._clientLog.debug(`group.v2.pull page response: group=${gid}, page=${pageCount}, raw_count=${messages.length}, has_more=${String(result.has_more ?? '')}, cursor_current=${String(cursor?.current_seq ?? '')}`);
       for (const msg of messages) {
@@ -4255,8 +4856,9 @@ export class AUNClient {
         .map((msg) => Number(msg.seq ?? 0))
         .filter((seq) => Number.isFinite(seq) && seq > 0);
       const pageContigBefore = this._seqTracker.getContiguousSeq(ns);
-      const pageMaxSeq = seqs.length > 0 ? Math.max(...seqs) : nextAfterSeq;
+      let pageMaxSeq = nextAfterSeq;
       if (seqs.length > 0) {
+        pageMaxSeq = Math.max(...seqs);
         this._seqTracker.forceContiguousSeq(ns, pageMaxSeq);
         this._clientLog.debug(`group.v2.pull force contiguous: group=${gid}, ns=${ns}, page_max_seq=${pageMaxSeq}, previous=${pageContigBefore}`);
       }
@@ -4323,19 +4925,19 @@ export class AUNClient {
         this._logMessageDebug('decrypt-ok', 'group.v2.pull', 'group.message_created', plaintext);
       }
 
-      const serverAckSeq = Number(cursor?.current_seq ?? 0);
-      if (Number.isFinite(serverAckSeq) && serverAckSeq > 0) {
+      const retentionFloor = this._pullRetentionFloor(result as JsonObject, 'retention_floor_message_seq', 'retention_floor_message_seq');
+      if (retentionFloor > 0) {
         const contig = this._seqTracker.getContiguousSeq(ns);
-        if (contig < serverAckSeq) {
-          this._clientLog.info(`group.v2.pull retention-floor advance: ns=${ns} contiguous=${contig} -> cursor.current_seq=${serverAckSeq}`);
-          this._seqTracker.forceContiguousSeq(ns, serverAckSeq);
+        if (contig < retentionFloor) {
+          this._clientLog.info(`group.v2.pull retention-floor advance: ns=${ns} contiguous=${contig} -> retention_floor=${retentionFloor}`);
+          this._seqTracker.forceContiguousSeq(ns, retentionFloor);
         }
       }
 
       const ackSeq = this._seqTracker.getContiguousSeq(ns);
       const contigAdvanced = ackSeq !== pageContigBefore;
       if (contigAdvanced) {
-        await this._drainOrderedMessages(ns);
+        await this._drainOrderedMessages(ns, undefined, true);
         this._saveSeqTrackerState();
       }
       if (messages.length > 0 && contigAdvanced && ackSeq > 0) {
@@ -4372,7 +4974,7 @@ export class AUNClient {
       seq = maxSeen;
     }
     this._clientLog.debug(`group.v2.ack send: group=${gid}, ns=${ns}, up_to_seq=${seq}`);
-    const result = await this.call('group.v2.ack', { group_id: gid, up_to_seq: seq });
+    const result = await this._callRawV2Rpc('group.v2.ack', { group_id: gid, up_to_seq: seq });
     this._clientLog.debug(`group.v2.ack ok: group=${gid}, ns=${ns}, requested=${seq}, result=${this._debugJson(result)}`);
     return result;
   }
@@ -4406,7 +5008,7 @@ export class AUNClient {
       for (const row of recipients) {
         if (Array.isArray(row) && row.length >= 6
           && String(row[0] ?? '') === this._aid
-          && String(row[1] ?? '') === this._deviceId) {
+          && (String(row[1] ?? '') === this._deviceId || String(row[1] ?? '') === '')) {
           if (!spkId) spkId = String(row[5] ?? '');
           if (row.length > 3) recipientKeySource = String(row[3] ?? '');
           break;
@@ -4755,7 +5357,8 @@ export class AUNClient {
     if (Array.isArray(envelope.recipients)) {
       for (const row of envelope.recipients) {
         if (!Array.isArray(row) || row.length < 6) continue;
-        if (String(row[0] ?? '') === this._aid && String(row[1] ?? '') === this._deviceId) {
+        if (String(row[0] ?? '') === this._aid
+          && (String(row[1] ?? '') === this._deviceId || String(row[1] ?? '') === '')) {
           spkId = String(row[5] ?? '');
           recipientKeySource = String(row[3] ?? '');
           break;
@@ -5030,7 +5633,10 @@ export class AUNClient {
       }
       if (myRole !== 'owner' && myRole !== 'admin') return false;
 
-      const bootstrapResp = await this.call('group.v2.bootstrap', { group_id: groupId });
+      const bootstrapResp = await this.call('group.v2.bootstrap', {
+        group_id: groupId,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      });
       const devices = isJsonObject(bootstrapResp) && Array.isArray(bootstrapResp.devices)
         ? bootstrapResp.devices.filter(isJsonObject) as JsonObject[]
         : [];
@@ -5137,7 +5743,10 @@ export class AUNClient {
         }
       }
 
-      const bootstrapResp = await this.call('group.v2.bootstrap', { group_id: groupId });
+      const bootstrapResp = await this.call('group.v2.bootstrap', {
+        group_id: groupId,
+        e2ee_wrap_capabilities: v2WrapCapabilities(),
+      });
       const allDevices = isJsonObject(bootstrapResp) && Array.isArray(bootstrapResp.devices)
         ? bootstrapResp.devices.filter(isJsonObject) as JsonObject[]
         : [];
@@ -5355,11 +5964,10 @@ export class AUNClient {
       try {
         const decrypted = await this._decryptV2PushMessage(data);
         if (decrypted) {
-          // 解密成功：把 pushSeq 加入 receivedSeqs，让 _tryAdvance 自然推进
-          // （如果 pushSeq == contiguousSeq + 1 会自动推进到 pushSeq）
-          const needPull = this._seqTracker.onMessageSeq(ns, pushSeq);
+          // 解密成功也不能先推进 contiguousSeq；必须等应用层发布返回后再推进和 ACK。
           const published = await this._publishOrderedMessage('message.received', ns, pushSeq, decrypted as EventPayload);
           const newContig = this._seqTracker.getContiguousSeq(ns);
+          const needPull = pushSeq > newContig && !published;
           if (newContig !== contigBefore) {
             this._saveSeqTrackerState();
           }
@@ -5367,7 +5975,7 @@ export class AUNClient {
             // ack clamp：永远不发送超过 maxSeenSeq 的 up_to_seq
             const maxSeen = this._seqTracker.getMaxSeenSeq(ns);
             const ackSeq = maxSeen > 0 ? Math.min(newContig, maxSeen) : newContig;
-            this.call('message.v2.ack', { up_to_seq: ackSeq })
+            this.call('message.v2.ack', { up_to_seq: ackSeq, _rpc_background: true })
               .catch(e => this._clientLog.debug(`V2 P2P push-ack failed: ${formatCaughtError(e)}`));
           }
           this._clientLog.debug(
@@ -5393,33 +6001,35 @@ export class AUNClient {
         `_onV2PushNotification: 纯通知 push_seq=${pushSeq} > contiguous_seq=${contigBefore}, 触发 pull(after_seq=${contigBefore})`
       );
     }
-    if (this._v2PullInflight) {
-      this._v2PullPending = true;
-      return;
-    }
-    this._v2PullInflight = true;
-    try {
-      do {
-        this._v2PullPending = false;
-        await this.pullV2();
-        const newContig = ns ? this._seqTracker.getContiguousSeq(ns) : -1;
+    if (!ns) return;
+    void this._tryRunBackgroundPull(ns, async () => {
+      const operationBefore = this._seqTracker.getContiguousSeq(ns);
+      const dedupKey = `p2p_pull:${ns}`;
+      if (this._gapFillDone.has(dedupKey)) return 0;
+      this._gapFillDone.set(dedupKey, Date.now());
+      try {
+        const pulled = await this.pullV2(0, 50, { gateLocked: true });
+        const newContig = this._seqTracker.getContiguousSeq(ns);
         this._clientLog.debug(
           `_onV2PushNotification pull done: contiguous_seq=${contigBefore}->${newContig} (push_seq=${pushSeq || 'null'})`
         );
-      } while (this._v2PullPending);
-    } catch (exc) {
-      const newContig = ns ? this._seqTracker.getContiguousSeq(ns) : -1;
+        if (newContig <= operationBefore) return 0;
+        return pulled.length;
+      } finally {
+        this._gapFillDone.delete(dedupKey);
+      }
+    }, true).catch((exc) => {
+      const newContig = this._seqTracker.getContiguousSeq(ns);
       this._clientLog.warn(
         `V2 push auto-pull failed: contiguous_seq=${contigBefore}->${newContig} err=${formatCaughtError(exc)}`
       );
-    } finally {
-      this._v2PullInflight = false;
-    }
+    });
   }
 
   private async _onV2StateProposed(data: EventPayload): Promise<void> {
     if (!isJsonObject(data) || !this._v2Session) return;
-    const groupId = String(data.group_id ?? '').trim();
+    const rawGroupId = String(data.group_id ?? '').trim();
+    const groupId = normalizeGroupId(rawGroupId) || rawGroupId;
     if (!groupId) return;
     await this._dispatcher.publish('group.v2.state_proposed', data);
     try {
@@ -5431,7 +6041,8 @@ export class AUNClient {
 
   private async _onV2StateRetryNeeded(data: EventPayload): Promise<void> {
     if (!isJsonObject(data) || !this._v2Session) return;
-    const groupId = String(data.group_id ?? '').trim();
+    const rawGroupId = String(data.group_id ?? '').trim();
+    const groupId = normalizeGroupId(rawGroupId) || rawGroupId;
     if (!groupId) return;
     await this._dispatcher.publish('group.v2.state_retry_needed', data);
     try {
@@ -5443,7 +6054,8 @@ export class AUNClient {
 
   private async _onV2StateConfirmed(data: EventPayload): Promise<void> {
     if (!isJsonObject(data)) return;
-    const groupId = String(data.group_id ?? '').trim();
+    const rawGroupId = String(data.group_id ?? '').trim();
+    const groupId = normalizeGroupId(rawGroupId) || rawGroupId;
     if (groupId) {
       this._v2BootstrapCache.delete(`group:${groupId}`);
       this._v2AutoProposeLastSnapshot.delete(groupId);
@@ -5457,7 +6069,8 @@ export class AUNClient {
       return;
     }
     this._logMessageDebug('server-push', '_raw.group.v2.message_created', 'group.message_created', data);
-    const groupId = String(data.group_id ?? '').trim();
+    const rawGroupId = String(data.group_id ?? '').trim();
+    const groupId = normalizeGroupId(rawGroupId) || rawGroupId;
     const seq = Number(data.seq ?? 0);
     if (!groupId || !Number.isFinite(seq) || seq <= 0) {
       this._clientLog.debug(`_onRawGroupV2MessageCreated skipped: group=${groupId || '<empty>'}, seq=${String(data.seq ?? '')}`);
@@ -5481,20 +6094,26 @@ export class AUNClient {
       '_raw.group.v2.message_created',
     );
     const dedupKey = `v2_group_push:${groupId}:${afterSeq}`;
-    if (this._gapFillDone.has(dedupKey)) {
-      this._clientLog.debug(`_onRawGroupV2MessageCreated skipped duplicate in-flight pull: group=${groupId}, dedup=${dedupKey}`);
-      return;
-    }
-    this._gapFillDone.set(dedupKey, Date.now());
-    try {
-      this._clientLog.debug(`_onRawGroupV2MessageCreated auto-pull start: group=${groupId}, after_seq=${afterSeq}, push_seq=${seq}`);
-      await this.pullGroupV2(groupId, afterSeq, 50);
-      this._clientLog.debug(`_onRawGroupV2MessageCreated auto-pull done: group=${groupId}, after_seq=${afterSeq}, push_seq=${seq}, contiguous=${this._seqTracker.getContiguousSeq(ns)}`);
-    } catch (exc) {
+    void this._tryRunBackgroundPull(ns, async () => {
+      const pullAfterSeq = this._seqTracker.getContiguousSeq(ns);
+      if (this._gapFillDone.has(dedupKey)) {
+        this._clientLog.debug(`_onRawGroupV2MessageCreated skipped duplicate in-flight pull: group=${groupId}, dedup=${dedupKey}`);
+        return 0;
+      }
+      this._gapFillDone.set(dedupKey, Date.now());
+      try {
+        this._clientLog.debug(`_onRawGroupV2MessageCreated auto-pull start: group=${groupId}, after_seq=${pullAfterSeq}, push_seq=${seq}`);
+        const pulled = await this.pullGroupV2(groupId, pullAfterSeq, 50, { gateLocked: true });
+        const newContig = this._seqTracker.getContiguousSeq(ns);
+        this._clientLog.debug(`_onRawGroupV2MessageCreated auto-pull done: group=${groupId}, after_seq=${pullAfterSeq}, push_seq=${seq}, contiguous=${newContig}`);
+        if (newContig <= pullAfterSeq) return 0;
+        return pulled.length;
+      } finally {
+        this._gapFillDone.delete(dedupKey);
+      }
+    }, true).catch((exc) => {
       this._clientLog.warn(`V2 group push auto-pull failed: group=${groupId} err=${formatCaughtError(exc)}`);
-    } finally {
-      this._gapFillDone.delete(dedupKey);
-    }
+    });
   }
 
   /** Push 通知带 payload 时的就地解密（复用 _decryptV2Message） */

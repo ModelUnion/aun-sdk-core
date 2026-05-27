@@ -55,7 +55,7 @@ async function connectLong(
   aid: string,
   slotId = 'main',
 ): Promise<void> {
-  await client.auth.createAid({ aid });
+  await client.auth.registerAid({ aid });
   const auth = await client.auth.authenticate({ aid });
   await client.connect(auth, {
     auto_reconnect: false,
@@ -278,7 +278,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await setup.close();
 
     // 起 10 个短连接
@@ -319,7 +319,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await setup.close();
 
     const short = makeClient(sharedPath);
@@ -346,7 +346,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await setup.close();
 
     const longOld = makeClient(sharedPath);
@@ -393,7 +393,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(shortPath);
     clients.push(setup);
-    await setup.auth.createAid({ aid: shortOnlyAid });
+    await setup.auth.registerAid({ aid: shortOnlyAid });
     await setup.close();
 
     const observer = makeClient(observerPath);
@@ -424,7 +424,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await setup.close();
 
     const shortClient = makeClient(sharedPath);
@@ -447,7 +447,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.createAid({ aid });
+    await setup.auth.registerAid({ aid });
     await setup.close();
 
     const short = makeClient(sharedPath);

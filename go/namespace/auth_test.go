@@ -26,6 +26,8 @@ type mockAuthClient struct {
 	identity              map[string]any
 	authResult            map[string]any
 	authAuthenticateCalls int
+	authRegisterAIDCalls  int
+	authRegisterAIDResult map[string]any
 	discoverGatewayResult string
 	discoverGatewayErr    error
 	fetchPeerCertResult   []byte
@@ -65,8 +67,12 @@ func (m *mockAuthClient) Call(ctx context.Context, method string, params map[str
 	return nil, nil
 }
 
-func (m *mockAuthClient) AuthCreateAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
-	return nil, nil
+func (m *mockAuthClient) AuthRegisterAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
+	m.authRegisterAIDCalls++
+	if m.authRegisterAIDResult != nil {
+		return m.authRegisterAIDResult, nil
+	}
+	return map[string]any{"aid": aid, "cert": "cert-pem"}, nil
 }
 
 func (m *mockAuthClient) AuthAuthenticate(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
@@ -154,6 +160,32 @@ func makeSelfSignedCert(t *testing.T, privateKey *ecdsa.PrivateKey, cn string) s
 		t.Fatalf("create certificate failed: %v", err)
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+func TestCreateAIDCompatAliasDelegatesToRegisterAID(t *testing.T) {
+	client := &mockAuthClient{
+		gatewayURL: "ws://gateway.example.com/aun",
+		authRegisterAIDResult: map[string]any{
+			"aid":  "alice.agentid.pub",
+			"cert": "cert-pem",
+		},
+		identity: map[string]any{"aid": "alice.agentid.pub"},
+	}
+	ns := NewAuthNamespace(client)
+
+	result, err := ns.CreateAID(context.Background(), map[string]any{"aid": "alice.agentid.pub"})
+	if err != nil {
+		t.Fatalf("CreateAID failed: %v", err)
+	}
+	if client.authRegisterAIDCalls != 1 {
+		t.Fatalf("expected AuthRegisterAID once, got %d", client.authRegisterAIDCalls)
+	}
+	if got, _ := result["aid"].(string); got != "alice.agentid.pub" {
+		t.Fatalf("unexpected aid: %#v", result["aid"])
+	}
+	if got, _ := result["cert_pem"].(string); got != "cert-pem" {
+		t.Fatalf("unexpected cert_pem: %#v", result["cert_pem"])
+	}
 }
 
 func TestUploadAgentMDUsesCachedAccessToken(t *testing.T) {

@@ -84,7 +84,7 @@ def _make_client(tag_or_path: str, *, is_path: bool = False) -> AUNClient:
 
 
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "") -> str:
-    await client.auth.create_aid({"aid": aid})
+    await client.auth.register_aid({"aid": aid})
     auth = await client.auth.authenticate({"aid": aid})
     opts: dict = {"auto_reconnect": False, "heartbeat_interval": 30.0}
     if slot_id:
@@ -303,7 +303,7 @@ async def test_short_capacity_exceeded() -> bool:
     shorts: list[AUNClient] = []
     overflow = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         # 起 10 个短连接（共享 keystore）
@@ -355,7 +355,7 @@ async def test_short_ttl_eviction() -> bool:
     setup = _make_client(shared_path, is_path=True)
     short = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         # 短连接传 ttl=2000ms
@@ -403,7 +403,7 @@ async def test_long_replaces_long_keeps_shorts() -> bool:
     long_new = _make_client(shared_path, is_path=True)
     shorts: list[AUNClient] = []
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         await _connect_long(long_old, aid, slot_id="slot-x")
@@ -463,7 +463,7 @@ async def test_short_does_not_publish_client_online() -> bool:
     observer = _make_client(observer_path, is_path=True)
     short = _make_client(short_path, is_path=True)
     try:
-        await setup.auth.create_aid({"aid": short_only_aid})
+        await setup.auth.register_aid({"aid": short_only_aid})
         await setup.close()
 
         await _connect_long(observer, observer_aid, slot_id="obs")
@@ -507,7 +507,7 @@ async def test_hello_ok_returns_connection_kind() -> bool:
     long_client = _make_client(shared_path, is_path=True)
     short_client = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         # 长连接：connection.kind 应为 "long"
@@ -548,7 +548,7 @@ async def test_short_disables_token_refresh() -> bool:
     setup = _make_client(shared_path, is_path=True)
     short = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.create_aid({"aid": aid})
+        await setup.auth.register_aid({"aid": aid})
         await setup.close()
 
         await _connect_short(short, aid, slot_id="d8")

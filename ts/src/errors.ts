@@ -206,6 +206,14 @@ export class CertificateRevokedError extends AuthError {
   }
 }
 
+/** AID 已被注册（查重命中 / TOCTOU race / 服务端拒绝重复注册） */
+export class IdentityConflictError extends AuthError {
+  constructor(message: string = 'AID already registered', opts: ConstructorParameters<typeof AUNError>[1] = {}) {
+    super(message, { ...opts, code: -32052 });
+    this.name = 'IdentityConflictError';
+  }
+}
+
 /** E2EE 降级（无前向保密） */
 export class E2EEDegradedError extends E2EEError {
   constructor(message: string = 'e2ee degraded: no forward secrecy', opts: ConstructorParameters<typeof E2EEError>[1] = {}) {

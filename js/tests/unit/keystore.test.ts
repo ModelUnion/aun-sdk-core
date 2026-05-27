@@ -8,8 +8,8 @@ import type { JsonObject, PrekeyMap } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 const KEYSTORE_DB_NAME = 'aun-keystore';
-const KEYSTORE_DB_VERSION = 5;
-const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'prekeys', 'group_current', 'group_old_epochs', 'e2ee_sessions', 'group_state'];
+const KEYSTORE_DB_VERSION = 6;
+const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'prekeys', 'group_current', 'group_old_epochs', 'e2ee_sessions', 'group_state', 'agent_md_cache'];
 
 async function withStore<T>(
   storeName: string,
@@ -126,6 +126,40 @@ describe('IndexedDBKeyStore', () => {
   it('加载不存在的密钥对应返回 null', async () => {
     const loaded = await ks.loadKeyPair('nonexistent');
     expect(loaded).toBeNull();
+  });
+
+  it('空字符串 seed 也应加密 IndexedDB 私钥', async () => {
+    if (!hasSubtleCrypto) return;
+    ks = new IndexedDBKeyStore({ encryptionSeed: '' });
+    await ks.saveKeyPair('empty-seed.test', {
+      private_key_pem: 'EMPTY_SEED_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+
+    const raw = await readStoreRecord('key_pairs', 'empty-seed.test');
+    expect(raw?._encrypted_pk).toBeDefined();
+    expect(raw?.private_key_pem).toBeUndefined();
+    const loaded = await ks.loadKeyPair('empty-seed.test');
+    expect(loaded?.private_key_pem).toBe('EMPTY_SEED_PRIVATE');
+  });
+
+  it('changeSeed 严格迁移 IndexedDB 加密私钥', async () => {
+    if (!hasSubtleCrypto) return;
+    const oldStore = new IndexedDBKeyStore({ encryptionSeed: 'old-seed' });
+    await oldStore.saveKeyPair('change-seed.test', {
+      private_key_pem: 'CHANGE_SEED_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+
+    const result = await oldStore.changeSeed('old-seed', '');
+    expect(result.privateKeysMigrated).toBe(1);
+
+    const newStore = new IndexedDBKeyStore({ encryptionSeed: '' });
+    const loaded = await newStore.loadKeyPair('change-seed.test');
+    expect(loaded?.private_key_pem).toBe('CHANGE_SEED_PRIVATE');
+    await expect(IndexedDBKeyStore.changeSeed('.seed', 'new-seed')).rejects.toThrow(/does not support/);
   });
 
   // ── 证书 CRUD ──────────────────────────────────────

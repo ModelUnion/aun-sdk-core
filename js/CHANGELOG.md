@@ -6,6 +6,32 @@
 
 ---
 
+## 0.3.4 — 2026-05-28
+
+### Breaking Changes
+- **`createAid()` → `registerAid()`**：客户端 API 重命名，旧方法已移除
+- **注册与认证分离**：`authenticate()` 不再隐式注册；身份不完整时抛 `StateError`
+
+### Added
+- **`IdentityConflictError`**：新增错误类型（继承 `AuthError`），AID 注册冲突时抛出
+- **Pull Gate**：per-key 序列化 pull 操作，防止同一 namespace 并发 pull
+- **RPC Inflight 限制**：transport 层全局最大 16 个并发 RPC + 后台 RPC 独立限制 8 个，排队超时抛 `TimeoutError`
+- **`_assertCertMatchesLocalKeypair`**：authenticate 前显式校验 cert 公钥与本地 keypair 一致
+- **`_downloadRegisteredCert`**：注册前查服务端证书的辅助方法
+
+### Changed
+- **`registerAid` 半成品恢复**：本地有 keypair 无 cert 时，查服务端恢复；服务端无记录则用现有 keypair 注册
+- **agent.md 元数据存储**：从全局 `list.json` key 改为 per-AID `{aid}/agentmd.json` key（IndexedDB）
+- **agent.md 下载**：改为无条件 GET；302 显式跟随；304 时本地有缓存直接用，无缓存重试
+- **`_loadIdentityOrRaise`**：增加 keypair 完整性检查
+- **`ChangeSeed` API**：`IndexedDBKeyStore.changeSeed()` 支持更换 seed（重加密私钥）
+
+### Removed
+- **`_ensureLocalIdentity` / `_ensureIdentity`**：已移除，注册路径不再隐式生成密钥
+- **`createAid` 方法**：已移除
+
+---
+
 ## 0.3.3 — 2026-05-25
 
 ### Added

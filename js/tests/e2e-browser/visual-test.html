@@ -110,7 +110,7 @@
   <div class="section">
     <h3>基础连接</h3>
     <div class="btn-row">
-      <button id="btn-createAid" onclick="stepCreateAid()">创建 AID</button>
+      <button id="btn-registerAid" onclick="stepRegisterAid()">创建 AID</button>
       <button id="btn-auth" onclick="stepAuthenticate()">认证</button>
       <button id="btn-connect" onclick="stepConnect()">连接 Gateway</button>
       <button id="btn-disconnect" onclick="stepDisconnect()" class="danger">断开</button>
@@ -274,7 +274,7 @@ generateRandomAids();
 
 // ── 手动测试步骤 ────────────────────────────────────
 
-window.stepCreateAid = async function() {
+window.stepRegisterAid = async function() {
   const aliceAidVal = document.getElementById('aliceAid').value.trim();
   const bobAidVal = document.getElementById('bobAid').value.trim();
   if (!aliceAidVal || !bobAidVal) {
@@ -284,12 +284,12 @@ window.stepCreateAid = async function() {
   alice = makeClient('Alice');
   bob = makeClient('Bob');
 
-  await runStep('btn-createAid', '创建 Alice AID: ' + aliceAidVal, async () => {
-    await alice.auth.createAid({ aid: aliceAidVal });
+  await runStep('btn-registerAid', '创建 Alice AID: ' + aliceAidVal, async () => {
+    await alice.auth.registerAid({ aid: aliceAidVal });
     return { aid: aliceAidVal };
   });
-  await runStep('btn-createAid', '创建 Bob AID: ' + bobAidVal, async () => {
-    await bob.auth.createAid({ aid: bobAidVal });
+  await runStep('btn-registerAid', '创建 Bob AID: ' + bobAidVal, async () => {
+    await bob.auth.registerAid({ aid: bobAidVal });
     return { aid: bobAidVal };
   });
 };
@@ -516,11 +516,11 @@ window.runP2PTest = async function() {
     log('info', '步骤 1: 创建 AID');
     const t1 = Date.now();
     log('dim', '  Alice AID: ' + aAid);
-    await a.auth.createAid({ aid: aAid });
+    await a.auth.registerAid({ aid: aAid });
     log('dim', '  Alice 创建耗时: ' + (Date.now() - t1) + 'ms (含 gateway 发现)');
     const t1b = Date.now();
     log('dim', '  Bob AID: ' + bAid);
-    await b.auth.createAid({ aid: bAid });
+    await b.auth.registerAid({ aid: bAid });
     log('dim', '  Bob 创建耗时: ' + (Date.now() - t1b) + 'ms');
     assert('AID 创建成功', true);
 
@@ -612,16 +612,16 @@ window.runGroupTest = async function() {
     log('info', '步骤 1: 创建、认证、连接');
     const t1 = Date.now();
     log('dim', '  Alice AID: ' + aAid);
-    await a.auth.createAid({ aid: aAid });
-    log('dim', '  Alice createAid 耗时: ' + (Date.now() - t1) + 'ms');
+    await a.auth.registerAid({ aid: aAid });
+    log('dim', '  Alice registerAid 耗时: ' + (Date.now() - t1) + 'ms');
     const aAuth = await a.auth.authenticate({ aid: aAid });
     log('dim', '  Alice 认证完成, gateway: ' + (aAuth.gateway || '未知'));
     await a.connect(aAuth);
 
     const t1b = Date.now();
     log('dim', '  Bob AID: ' + bAid);
-    await b.auth.createAid({ aid: bAid });
-    log('dim', '  Bob createAid 耗时: ' + (Date.now() - t1b) + 'ms');
+    await b.auth.registerAid({ aid: bAid });
+    log('dim', '  Bob registerAid 耗时: ' + (Date.now() - t1b) + 'ms');
     const bAuth = await b.auth.authenticate({ aid: bAid });
     await b.connect(bAuth);
     log('dim', '  步骤 1 总耗时: ' + (Date.now() - t1) + 'ms');

@@ -32,7 +32,7 @@ async def main() -> None:
     client = AUNClient({"aun_path": _aun_path()})
     client._config_model.require_forward_secrecy = False
     try:
-        await client.auth.create_aid({"aid": aid})
+        await client.auth.register_aid({"aid": aid})
         auth = await client.auth.authenticate({"aid": aid})
         initial_token = auth["access_token"]
         refresh_events: list[dict] = []

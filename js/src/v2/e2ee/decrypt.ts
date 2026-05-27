@@ -245,7 +245,7 @@ function findMyRow(
   selfDeviceId: string,
 ): string[] | null {
   for (const row of recipients) {
-    if (row[0] === selfAid && row[1] === selfDeviceId) return row;
+    if (row[0] === selfAid && (row[1] === selfDeviceId || row[1] === '')) return row;
   }
   return null;
 }

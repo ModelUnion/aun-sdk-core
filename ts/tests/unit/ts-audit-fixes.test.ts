@@ -142,14 +142,14 @@ describe('ISSUE-SDK-TS-002: listIdentities() 方法', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-list-ids-'));
     const client = new AUNClient({ aun_path: tmpDir });
     const ks = (client as any)._keystore;
-    // 保存一个身份
+    // 保存一个身份（无 cert，用 all=true 诊断模式可见）
     ks.saveIdentity('alice.example.com', {
       aid: 'alice.example.com',
       private_key_pem: 'PK',
       public_key_der_b64: 'pub',
       curve: 'P-256',
     });
-    const result = client.listIdentities();
+    const result = client.listIdentities({ all: true });
     expect(result.length).toBe(1);
     expect(result[0].aid).toBe('alice.example.com');
   });

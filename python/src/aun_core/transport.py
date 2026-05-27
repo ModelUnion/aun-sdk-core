@@ -269,6 +269,9 @@ def _trace_display(method: str, status: str, duration_ms: int, trace: dict, span
 
 
 class RPCTransport:
+    _MAX_RPC_INFLIGHT = 16
+    _MAX_BACKGROUND_RPC_INFLIGHT = 8
+
     def __init__(
         self,
         *,
@@ -294,6 +297,9 @@ class RPCTransport:
         self._trace_observer: "callable | None" = None
         from .logger import NullLogger as _NL
         self._log = logger or _NL()
+        # RPC inflight 限制
+        self._rpc_semaphore = asyncio.Semaphore(self._MAX_RPC_INFLIGHT)
+        self._background_rpc_semaphore = asyncio.Semaphore(self._MAX_BACKGROUND_RPC_INFLIGHT)
 
     def set_meta_observer(self, observer) -> None:
         """注册 RPC envelope _meta 字段观察者；observer(meta_dict) 在每次成功 RPC 时调用。
@@ -355,18 +361,49 @@ class RPCTransport:
         self._pending.clear()
         self._log.debug("transport", "close exit: elapsed=%.3fs cancelled_pending=%d", time.time() - _t_start, pending_count)
 
-    async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None, trace: str | None = None) -> Any:
+    async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None, trace: str | None = None, background: bool = False) -> Any:
         if self._closed or self._ws is None:
             self._log.warn("transport", "RPC call failed (not connected): method=%s", method)
             raise ConnectionError("transport not connected")
+
+        effective_timeout = timeout or self._timeout
+        import time as _diag_time
+        _t0 = _diag_time.time()
+
+        # RPC inflight 限制：后台 RPC 受双重限制（全局 16 + 后台 8）
+        sem = self._rpc_semaphore
+        bg_sem = self._background_rpc_semaphore if background else None
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=effective_timeout)
+        except asyncio.TimeoutError:
+            self._log.warn("transport", "RPC queue timeout (waiting for slot): method=%s elapsed=%.3fs", method, _diag_time.time() - _t0)
+            raise TimeoutError(f"rpc queue timeout before send: {method}", retryable=True)
+        try:
+            if bg_sem:
+                remaining = effective_timeout - (_diag_time.time() - _t0)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                try:
+                    await asyncio.wait_for(bg_sem.acquire(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    self._log.warn("transport", "RPC background queue timeout: method=%s elapsed=%.3fs", method, _diag_time.time() - _t0)
+                    raise TimeoutError(f"rpc background queue timeout before send: {method}", retryable=True)
+            try:
+                return await self._call_inner(method, params, effective_timeout=effective_timeout, trace=trace, t0=_t0)
+            finally:
+                if bg_sem:
+                    bg_sem.release()
+        finally:
+            sem.release()
+
+    async def _call_inner(self, method: str, params: dict[str, Any] | None = None, *, effective_timeout: float, trace: str | None = None, t0: float) -> Any:
+        import time as _diag_time
+        _t0 = t0
 
         rpc_id = f"rpc-{secrets.token_hex(8)}"
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._pending[rpc_id] = future
-
-        import time as _diag_time
-        _t0 = _diag_time.time()
 
         # 注入 _trace（会话级或调用级 mode 非 off 时）
         effective_trace_mode = trace if trace in ("off", "log", "diag") else self._trace_mode
@@ -405,7 +442,7 @@ class RPCTransport:
 
         _t_sent = _diag_time.time()
         try:
-            response = await asyncio.wait_for(future, timeout=timeout or self._timeout)
+            response = await asyncio.wait_for(future, timeout=effective_timeout)
         except asyncio.TimeoutError as exc:
             self._pending.pop(rpc_id, None)
             _elapsed = _diag_time.time() - _t0

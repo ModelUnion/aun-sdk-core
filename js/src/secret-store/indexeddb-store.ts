@@ -82,7 +82,7 @@ export class IndexedDBSecretStore implements SecretStore {
 
   private async _initMasterKey(): Promise<CryptoKey> {
     // 如果提供了 encryptionSeed，通过 PBKDF2 派生
-    if (this._encryptionSeed) {
+    if (this._encryptionSeed !== undefined) {
       return this._deriveKeyFromSeed(this._encryptionSeed);
     }
 
