@@ -53,3 +53,7 @@ docs/sdk/AUN C++ SDK与四语言SDK Gap分析.md
 python/src/aun_core/_packed_docs/
 ts/_packed_docs/
 js/_packed_docs/
+
+# 内部脚本和跨 SDK 测试（不发布到 GitHub）
+scripts/
+tests/cross-sdk/
