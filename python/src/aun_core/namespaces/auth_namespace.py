@@ -404,6 +404,27 @@ class AuthNamespace:
             self._client._log.debug("auth", "namespace.authenticate exit (error): elapsed=%.3fs aid=%s err=%s", _t.time() - _t_start, aid or "-", exc)
             raise
 
+    def load_identity(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """只读加载本地已注册身份（密钥对 + 证书 + 实例状态）。无副作用，不触发网络请求。"""
+        aid = str((params or {}).get("aid") or "").strip() or None
+        return self._client._auth.load_identity(aid)
+
+    def load_identity_or_none(self, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """只读加载本地已注册身份，不存在时返回 None。"""
+        aid = str((params or {}).get("aid") or "").strip() or None
+        return self._client._auth.load_identity_or_none(aid)
+
+    async def fetch_peer_cert(self, params: dict[str, Any]) -> str:
+        """获取对端 AID 的证书 PEM（本地缓存优先，未命中走 PKI HTTP + 链验证）。"""
+        aid = str((params or {}).get("aid") or "").strip()
+        if not aid:
+            raise ValueError("auth.fetch_peer_cert requires 'aid'")
+        cert_fingerprint = str((params or {}).get("cert_fingerprint") or "").strip() or None
+        cert_bytes = await self._client._fetch_peer_cert(aid, cert_fingerprint)
+        if isinstance(cert_bytes, bytes):
+            return cert_bytes.decode("utf-8")
+        return str(cert_bytes)
+
     async def _resolve_agent_md_url(self, aid: str) -> str:
         resolved_aid = str(aid or "").strip()
         if not resolved_aid:

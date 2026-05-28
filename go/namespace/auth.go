@@ -268,6 +268,41 @@ func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any)
 	return result, nil
 }
 
+// LoadIdentity 只读加载本地已注册身份（密钥对 + 证书 + 实例状态）。无副作用，不触发网络请求。
+func (a *AuthNamespace) LoadIdentity(aid string) (map[string]any, error) {
+	targetAID := strings.TrimSpace(aid)
+	if targetAID == "" {
+		targetAID = a.client.GetAID()
+	}
+	identity := a.client.AuthLoadIdentityOrNil(targetAID)
+	if identity == nil {
+		return nil, fmt.Errorf("identity not found for aid: %s", targetAID)
+	}
+	return identity, nil
+}
+
+// LoadIdentityOrNil 只读加载本地已注册身份，不存在时返回 nil。
+func (a *AuthNamespace) LoadIdentityOrNil(aid string) map[string]any {
+	targetAID := strings.TrimSpace(aid)
+	if targetAID == "" {
+		targetAID = a.client.GetAID()
+	}
+	return a.client.AuthLoadIdentityOrNil(targetAID)
+}
+
+// FetchPeerCert 获取对端 AID 的证书 PEM（本地缓存优先，未命中走 PKI HTTP + 链验证）。
+func (a *AuthNamespace) FetchPeerCert(ctx context.Context, aid string, certFingerprint string) (string, error) {
+	targetAID := strings.TrimSpace(aid)
+	if targetAID == "" {
+		return "", fmt.Errorf("auth.FetchPeerCert requires non-empty aid")
+	}
+	certBytes, err := a.client.AuthFetchPeerCert(ctx, targetAID, strings.TrimSpace(certFingerprint))
+	if err != nil {
+		return "", err
+	}
+	return string(certBytes), nil
+}
+
 func (a *AuthNamespace) SignAgentMD(ctx context.Context, content string, opts *AgentMDSignOptions) (signed string, err error) {
 	tStart := time.Now()
 	targetAID := strings.TrimSpace(a.client.GetAID())

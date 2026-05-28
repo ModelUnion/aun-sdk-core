@@ -8,7 +8,7 @@
 
 ---
 
-## 0.3.4 — 2026-05-28
+## 0.3.5 — 2026-05-28
 
 ### Breaking Changes
 - **`CreateAID` → `RegisterAID`**：客户端 API 重命名，旧方法已移除；`AuthCreateAID` → `AuthRegisterAID`
@@ -16,6 +16,8 @@
 
 ### Added
 - **`IdentityConflictError`**：新增错误类型，AID 注册冲突时返回
+- **`Auth.LoadIdentity()` / `Auth.LoadIdentityOrNil()`**：公开 API，只读加载本地已注册身份（密钥对 + 证书 + 实例状态），无副作用
+- **`Auth.FetchPeerCert()`**：公开 API，获取对端 AID 证书 PEM（本地缓存优先，未命中走 PKI HTTP + 链验证）
 - **Pull Gate**（`pull_gate.go`）：per-key 序列化 pull 操作，防止同一 namespace 并发 pull
 - **RPC Inflight 限制**：transport 层 semaphore 控制（全局 16 + 后台 8），超时返回 `TimeoutError`
 - **`assertCertMatchesLocalKeypair`**：Authenticate 前显式校验 cert 公钥与本地 keypair 一致

@@ -480,6 +480,33 @@ export class AuthNamespace {
     }
   }
 
+  /** 只读加载本地已注册身份（密钥对 + 证书 + 实例状态）。无副作用，不触发网络请求。 */
+  async loadIdentity(params?: RpcParams): Promise<IdentityRecord> {
+    const aid = String((params ?? {})?.aid ?? '').trim() || undefined;
+    const identity = await this._internal._auth.loadIdentityOrNone(aid);
+    if (!identity) {
+      throw new StateError(`identity not found for aid: ${aid ?? '<default>'}`);
+    }
+    return identity;
+  }
+
+  /** 只读加载本地已注册身份，不存在时返回 null。 */
+  async loadIdentityOrNull(params?: RpcParams): Promise<IdentityRecord | null> {
+    const aid = String((params ?? {})?.aid ?? '').trim() || undefined;
+    return await this._internal._auth.loadIdentityOrNone(aid);
+  }
+
+  /** 获取对端 AID 的证书 PEM（本地缓存优先，未命中走 PKI HTTP + 链验证）。 */
+  async fetchPeerCert(params: RpcParams): Promise<string> {
+    const aid = String(params?.aid ?? '').trim();
+    if (!aid) throw new Error("auth.fetchPeerCert requires 'aid'");
+    const fp = String((params as { cert_fingerprint?: unknown })?.cert_fingerprint ?? '').trim() || undefined;
+    if (typeof this._internal._fetchPeerCert !== 'function') {
+      throw new Error('client does not support _fetchPeerCert');
+    }
+    return String(await this._internal._fetchPeerCert(aid, fp)).trim();
+  }
+
   async signAgentMd(content: string, opts?: AgentMdSignOptions): Promise<string> {
     const tStart = Date.now();
     this._log.debug(`signAgentMd enter: aid=${opts?.aid ?? '<current>'} content_len=${String(content ?? '').length}`);

@@ -6,7 +6,7 @@
 
 ---
 
-## 0.3.4 — 2026-05-28
+## 0.3.5 — 2026-05-28
 
 ### Breaking Changes
 - **`createAid()` 兼容别名移除**：仅保留 `registerAid()`，旧 `createAid` 已删除
@@ -14,6 +14,8 @@
 
 ### Added
 - **`IdentityConflictError`**：新增错误类型（继承 `AuthError`），AID 注册冲突时抛出
+- **`auth.loadIdentityOrNull()`**：公开 API，只读加载本地已注册身份，不存在时返回 null（`auth.loadIdentity()` 已有）
+- **`auth.fetchPeerCert()`**：公开 API，获取对端 AID 证书 PEM（本地缓存优先，未命中走 PKI HTTP + 链验证）（已有）
 
 ### Changed
 - **`registerAid` 半成品恢复**：本地有 keypair 无 cert 时，查服务端恢复；服务端无记录则用现有 keypair 注册（不再直接拒绝）

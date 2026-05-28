@@ -409,7 +409,7 @@ def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
     assert params["client"] == {
         "slot_id": "slot-a",
         "sdk_lang": "python",
-        "sdk_version": "0.3.4",
+        "sdk_version": "0.3.5",
     }
     assert params["delivery_mode"] == {"mode": "queue", "routing": "sender_affinity", "affinity_ttl_ms": 800}
 

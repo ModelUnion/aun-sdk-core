@@ -489,6 +489,8 @@ class AUNClient:
         self._pushed_seqs: dict[str, set[int]] = {}
         # 已解密但因 seq 空洞暂缓发布的应用层消息（按 namespace -> seq）
         self._pending_ordered_msgs: dict[str, dict[int, tuple[str, Any]]] = {}
+        # P2P pull 进行中到达的纯通知 push 上界。当前 pull 结束后需要再补拉一次。
+        self._pending_p2p_pull_upper: dict[str, int] = {}
         # 群惰性同步标志：只有收到推送或主动 pull 后才标记为已同步
         # 发送消息前如果未同步，先做一次 pull
         self._group_synced: set[str] = set()
@@ -2430,6 +2432,7 @@ class AUNClient:
             self._log.warn("client", "P2P message gap fill failed: after_seq=%d error=%s", after_seq, exc)
         finally:
             self._gap_fill_done.pop(dedup_key, None)
+            self._schedule_pending_p2p_pull_if_needed(ns, reason="gap-fill-complete")
 
     def _mark_published_seq(self, ns: str, seq: int) -> None:
         """记录已发布到应用层的 seq，供 push/pull/补洞路径统一去重。"""
@@ -2450,6 +2453,61 @@ class AUNClient:
             pending = {}
             self._pending_ordered_msgs = pending
         return pending
+
+    def _record_pending_p2p_pull(self, ns: str, seq: int) -> None:
+        if not ns or seq <= 0:
+            return
+        pending = getattr(self, "_pending_p2p_pull_upper", None)
+        if pending is None:
+            pending = {}
+            self._pending_p2p_pull_upper = pending
+        previous = int(pending.get(ns, 0) or 0)
+        if seq > previous:
+            pending[ns] = seq
+        self._log.debug(
+            "client",
+            "P2P pending pull upper recorded: ns=%s seq=%d previous=%d contiguous=%d",
+            ns, seq, previous, self._seq_tracker.get_contiguous_seq(ns),
+        )
+
+    def _schedule_pending_p2p_pull_if_needed(self, ns: str, *, reason: str) -> bool:
+        if not ns:
+            return False
+        pending = getattr(self, "_pending_p2p_pull_upper", None)
+        if not pending:
+            return False
+        upper_seq = int(pending.get(ns, 0) or 0)
+        if upper_seq <= 0:
+            pending.pop(ns, None)
+            return False
+        contig = self._seq_tracker.get_contiguous_seq(ns)
+        if upper_seq <= contig:
+            pending.pop(ns, None)
+            self._log.debug(
+                "client",
+                "P2P pending pull upper already covered: ns=%s upper_seq=%d contiguous=%d reason=%s",
+                ns, upper_seq, contig, reason,
+            )
+            return False
+        if self._state != "connected" or self._closing:
+            self._log.debug(
+                "client",
+                "P2P pending pull postponed: ns=%s upper_seq=%d contiguous=%d state=%s closing=%s reason=%s",
+                ns, upper_seq, contig, self._state, self._closing, reason,
+            )
+            return False
+        dedup_key = f"p2p_pull:{ns}"
+        if dedup_key in self._gap_fill_done:
+            return False
+        pending.pop(ns, None)
+        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+        self._log.info(
+            "client",
+            "P2P pending push follow-up pull scheduled: ns=%s upper_seq=%d contiguous=%d reason=%s",
+            ns, upper_seq, contig, reason,
+        )
+        loop.create_task(self._fill_p2p_gap())
+        return True
 
     def _enqueue_ordered_message(self, ns: str, event: str, seq: int, payload: Any) -> None:
         pending = self._pending_ordered()
@@ -4092,6 +4150,8 @@ class AUNClient:
         self._gap_fill_active = False
         self._pushed_seqs.clear()
         self._pending_ordered().clear()
+        if hasattr(self, "_pending_p2p_pull_upper"):
+            self._pending_p2p_pull_upper.clear()
         if hasattr(self, "_v2_sender_ik_pending"):
             self._v2_sender_ik_pending.clear()
         if hasattr(self, "_v2_sender_ik_fetching"):
@@ -4114,6 +4174,8 @@ class AUNClient:
         self._gap_fill_active = False
         self._pushed_seqs.clear()
         self._pending_ordered().clear()
+        if hasattr(self, "_pending_p2p_pull_upper"):
+            self._pending_p2p_pull_upper.clear()
         if hasattr(self, "_v2_sender_ik_pending"):
             self._v2_sender_ik_pending.clear()
         if hasattr(self, "_v2_sender_ik_fetching"):
@@ -6740,6 +6802,7 @@ class AUNClient:
                         push_seq_int, new_contig,
                     )
                     if pull_in_flight:
+                        self._record_pending_p2p_pull(ns, push_seq_int)
                         self._log.debug(
                             "client",
                             "_on_v2_push_notification: payload push seq=%d 已挂起，复用进行中的 pull",
@@ -6763,6 +6826,7 @@ class AUNClient:
                 push_seq_int, contig_before, contig_before,
             )
             if pull_in_flight:
+                self._record_pending_p2p_pull(ns, push_seq_int)
                 self._log.debug(
                     "client",
                     "_on_v2_push_notification: pull 已在进行中，仅记录上界 push_seq=%d",
@@ -6784,6 +6848,7 @@ class AUNClient:
             self._log.warn("client", "V2 push auto-pull failed: %s", exc)
         finally:
             self._gap_fill_done.pop(dedup_key, None)
+            self._schedule_pending_p2p_pull_if_needed(ns, reason="push-auto-pull-complete")
 
     async def _decrypt_v2_message(self, msg: dict[str, Any], *, allow_pending: bool = True) -> dict[str, Any] | None:
         """解密单条 V2 消息。

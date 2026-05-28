@@ -1250,6 +1250,57 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(v1AckCalls).toEqual([]);
   });
 
+  it('V2 P2P 纯通知 push 若撞上 in-flight gap fill，结束后应补拉一次', async () => {
+    const client = makeV2Client();
+    const ns = 'p2p:alice.aid.com';
+    (client as any)._seqTracker.forceContiguousSeq(ns, 4);
+    const published: any[] = [];
+    client.on('message.received', (payload: any) => published.push(payload));
+
+    let pullCount = 0;
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'message.v2.pull') {
+        pullCount += 1;
+        if (pullCount === 1) {
+          await (client as any)._onV2PushNotification({
+            seq: 5,
+            message_id: 'm-push-5',
+            from_aid: 'bob.aid.com',
+          });
+          return { has_more: false, messages: [] };
+        }
+        return {
+          has_more: false,
+          messages: [{
+            version: 'v1',
+            seq: 5,
+            message_id: 'm-push-5',
+            from_aid: 'bob.aid.com',
+            t_server: 5,
+            legacy_v1: {
+              to: 'alice.aid.com',
+              payload: { type: 'text', text: 'pull-5' },
+            },
+          }],
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? params.seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    await (client as any)._fillP2pGap();
+    for (let i = 0; i < 20 && (pullCount < 2 || published.length === 0); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const pullAfterSeqs = transportCall.mock.calls
+      .filter(([method]) => method === 'message.v2.pull')
+      .map(([, params]) => Number((params as Record<string, unknown>).after_seq ?? -1));
+    expect(pullAfterSeqs.slice(0, 2)).toEqual([4, 4]);
+    expect(published.map((item) => item.payload?.text)).toContain('pull-5');
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
+  });
+
   it('group.v2.pull 批量消息只 ack 一次最终 contiguous_seq', async () => {
     const client = makeV2Client();
     const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {

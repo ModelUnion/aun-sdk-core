@@ -10,7 +10,7 @@ import { ROOT_CA_PEM } from './certs/root.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 const AUN_SDK_LANG = 'javascript';
-const AUN_SDK_VERSION = '0.3.4';
+const AUN_SDK_VERSION = '0.3.5';
 
 import {
   isJsonObject,

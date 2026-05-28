@@ -894,9 +894,10 @@ def test_download_agent_md_is_anonymous(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        def get(self, url, *, headers=None):
+        def get(self, url, *, headers=None, allow_redirects=None):
             assert url == "https://bob.agentid.pub:18443/agent.md"
             assert headers == {"Accept": "text/markdown"}
+            assert allow_redirects is True
             return _FakeResponse()
 
     monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
@@ -932,9 +933,10 @@ def test_download_agent_md_404_raises_not_found(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        def get(self, url, *, headers=None):
+        def get(self, url, *, headers=None, allow_redirects=None):
             assert url == "https://bob.agentid.pub/agent.md"
             assert headers == {"Accept": "text/markdown"}
+            assert allow_redirects is True
             return _FakeResponse()
 
     monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
@@ -2157,6 +2159,68 @@ async def test_v2_p2p_payload_push_inflight_gap_still_records_upper_bound_and_pe
     assert client._seq_tracker.get_contiguous_seq(ns) == 1
     assert client._seq_tracker.get_max_seen_seq(ns) == 3
     assert client._is_pending_ordered_seq(ns, 3)
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_notification_push_during_inflight_gap_triggers_followup_pull():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    ns = "p2p:alice.agentid.pub"
+    client._seq_tracker.force_contiguous_seq(ns, 4)
+    events: list[dict] = []
+    calls: list[tuple[str, dict]] = []
+    client._dispatcher.subscribe("message.received", lambda data: events.append(data))
+
+    async def fake_call(method, params):
+        calls.append((method, dict(params)))
+        if method == "message.pull":
+            if len([c for c in calls if c[0] == "message.pull"]) == 1:
+                await client._on_v2_push_notification({
+                    "seq": 5,
+                    "message_id": "m-push-5",
+                    "from_aid": "bob.agentid.pub",
+                })
+                return {"messages": [], "_contig_before": 4, "raw_count": 0}
+            client._seq_tracker.on_message_seq(ns, 5)
+            return {
+                "messages": [{
+                    "message_id": "m-push-5",
+                    "from": "bob.agentid.pub",
+                    "to": "alice.agentid.pub",
+                    "seq": 5,
+                    "payload": {"type": "text", "text": "pull-5"},
+                }],
+                "_contig_before": 4,
+                "raw_count": 1,
+            }
+        if method == "message.ack":
+            return {"acked": params.get("seq")}
+        return {"ok": True}
+
+    client.call = fake_call
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.ack":
+                return {"acked": params.get("seq")}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    await client._fill_p2p_gap()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and len([c for c in calls if c[0] == "message.pull"]) < 2:
+        await asyncio.sleep(0.01)
+
+    assert [params["after_seq"] for method, params in calls if method == "message.pull"] == [4, 4]
+    assert [event["payload"]["text"] for event in events] == ["pull-5"]
+    assert client._seq_tracker.get_contiguous_seq(ns) == 5
 
 
 @pytest.mark.asyncio

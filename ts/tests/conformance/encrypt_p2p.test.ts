@@ -4,7 +4,7 @@ import { decryptMessage } from '../../src/v2/e2ee/decrypt.js';
 import { generateP256Keypair, privateToPublicDer } from '../../src/v2/crypto/ecdh.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
 
-const SDK_VERSION = '0.3.4';
+const SDK_VERSION = '0.3.5';
 
 /**
  * P2P 加密自加密自解密回环：

@@ -6,7 +6,7 @@ import {
   privateToPublicDer,
 } from '../../src/v2/crypto/ecdh';
 
-const SDK_VERSION = '0.3.4';
+const SDK_VERSION = '0.3.5';
 
 describe('encryptP2PMessage - self loop', () => {
   it('1DH path: alice -> bob (no SPK)', async () => {

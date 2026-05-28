@@ -6,7 +6,7 @@
 
 ---
 
-## 0.3.4 — 2026-05-28
+## 0.3.5 — 2026-05-28
 
 ### Breaking Changes
 - **`createAid()` → `registerAid()`**：客户端 API 重命名，旧方法已移除
@@ -14,6 +14,8 @@
 
 ### Added
 - **`IdentityConflictError`**：新增错误类型（继承 `AuthError`），AID 注册冲突时抛出
+- **`auth.loadIdentity()` / `auth.loadIdentityOrNull()`**：公开 API，只读加载本地已注册身份（密钥对 + 证书 + 实例状态），无副作用
+- **`auth.fetchPeerCert()`**：公开 API，获取对端 AID 证书 PEM（本地缓存优先，未命中走 PKI HTTP + 链验证）
 - **Pull Gate**：per-key 序列化 pull 操作，防止同一 namespace 并发 pull
 - **RPC Inflight 限制**：transport 层全局最大 16 个并发 RPC + 后台 RPC 独立限制 8 个，排队超时抛 `TimeoutError`
 - **`_assertCertMatchesLocalKeypair`**：authenticate 前显式校验 cert 公钥与本地 keypair 一致

@@ -423,6 +423,12 @@ export class AuthNamespace {
     return this._internal._auth.loadIdentity(aid);
   }
 
+  /** 加载本地已注册身份，不存在时返回 null。 */
+  loadIdentityOrNull(params?: RpcParams): IdentityRecord | null {
+    const aid = String((params ?? {})?.aid ?? '').trim() || undefined;
+    return this._internal._auth.loadIdentityOrNone(aid);
+  }
+
   /**
    * 获取对端 AID 的证书 PEM（不要求本机有任何身份）。
    * - 优先走本地 public/certs/ 缓存（不碰 private/）

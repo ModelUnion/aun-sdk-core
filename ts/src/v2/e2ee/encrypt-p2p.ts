@@ -38,7 +38,7 @@ import { withMetadataAuth, PROTECTED_HEADERS_DOMAIN, PROTECTED_CONTEXT_DOMAIN } 
 
 const TEXT = new TextEncoder();
 const E2EE_SDK_LANG = 'typescript';
-const E2EE_SDK_VERSION = '0.3.4';
+const E2EE_SDK_VERSION = '0.3.5';
 
 /**
  * 构造完整的 V2 P2P 加密 envelope。

@@ -45,7 +45,7 @@ const _noopLogger: ModuleLogger = {
 };
 
 const AUN_SDK_LANG = 'typescript';
-const AUN_SDK_VERSION = '0.3.4';
+const AUN_SDK_VERSION = '0.3.5';
 
 // ── 签名验证辅助 ──────────────────────────────────────────────
 

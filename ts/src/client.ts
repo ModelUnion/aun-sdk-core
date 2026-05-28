@@ -625,6 +625,8 @@ export class AUNClient {
   private _pushedSeqs: Map<string, Set<number>> = new Map();
   /** 已解密但因 seq 空洞暂缓发布的应用层消息（按 namespace -> seq） */
   private _pendingOrderedMsgs: Map<string, Map<number, { event: string; payload: EventPayload }>> = new Map();
+  /** P2P pull 进行中到达的纯通知 push 上界；pull gate 释放后需要补拉一次。 */
+  private _pendingP2pPullUpper: Map<string, number> = new Map();
   /** 缺 sender IK 时暂存原始 V2 消息，后台补齐 IK 后重试解密。 */
   private _v2SenderIKPending: Map<string, V2SenderIKPendingEntry> = new Map();
   /** sender IK 后台补齐任务去重。 */
@@ -2220,6 +2222,38 @@ export class AUNClient {
     }
   }
 
+  private _recordPendingP2pPull(ns: string, seq: number): void {
+    if (!ns || seq <= 0) return;
+    const previous = this._pendingP2pPullUpper.get(ns) ?? 0;
+    if (seq > previous) {
+      this._pendingP2pPullUpper.set(ns, seq);
+    }
+    this._clientLog.debug(`P2P pending pull upper recorded: ns=${ns}, seq=${seq}, previous=${previous}, contiguous=${this._seqTracker.getContiguousSeq(ns)}`);
+  }
+
+  private _schedulePendingP2pPullIfNeeded(ns: string, reason: string): boolean {
+    if (!ns) return false;
+    const upperSeq = this._pendingP2pPullUpper.get(ns) ?? 0;
+    if (upperSeq <= 0) {
+      this._pendingP2pPullUpper.delete(ns);
+      return false;
+    }
+    const contig = this._seqTracker.getContiguousSeq(ns);
+    if (upperSeq <= contig) {
+      this._pendingP2pPullUpper.delete(ns);
+      this._clientLog.debug(`P2P pending pull upper already covered: ns=${ns}, upper_seq=${upperSeq}, contiguous=${contig}, reason=${reason}`);
+      return false;
+    }
+    if (this._state !== 'connected' || this._closing) {
+      this._clientLog.debug(`P2P pending pull postponed: ns=${ns}, upper_seq=${upperSeq}, contiguous=${contig}, state=${this._state}, closing=${this._closing}, reason=${reason}`);
+      return false;
+    }
+    this._pendingP2pPullUpper.delete(ns);
+    this._clientLog.info(`P2P pending push follow-up pull scheduled: ns=${ns}, upper_seq=${upperSeq}, contiguous=${contig}, reason=${reason}`);
+    void this._fillP2pGap();
+    return true;
+  }
+
   private _markPublishedSeq(ns: string, seq: number): void {
     let pushed = this._pushedSeqs.get(ns);
     if (!pushed) {
@@ -2468,6 +2502,9 @@ export class AUNClient {
     if (!gate || gate.token !== token) return;
     gate.inflight = false;
     gate.startedAt = 0;
+    if (key.startsWith('p2p:')) {
+      this._schedulePendingP2pPullIfNeeded(key, 'pull-gate-release');
+    }
   }
 
   private _pullGateKeyForCall(method: string, params: RpcParams): string {
@@ -2640,10 +2677,17 @@ export class AUNClient {
     key: string,
     operation: () => Promise<number> | number,
     followupOnMessages = false,
+    onBusy?: () => void,
   ): Promise<boolean> {
-    if (key && this._isPullResponseProcessing(key)) return false;
+    if (key && this._isPullResponseProcessing(key)) {
+      onBusy?.();
+      return false;
+    }
     const token = this._tryAcquirePullGate(key);
-    if (token === null) return false;
+    if (token === null) {
+      onBusy?.();
+      return false;
+    }
     let count = 0;
     try {
       count = await this._withBackgroundRpc(operation);
@@ -3623,6 +3667,7 @@ export class AUNClient {
     this._gapFillDone.clear();
     this._pushedSeqs.clear();
     this._pendingOrderedMsgs.clear();
+    this._pendingP2pPullUpper.clear();
     this._v2SenderIKPending.clear();
     this._v2SenderIKFetching.clear();
     this._groupSynced.clear();
@@ -3635,6 +3680,7 @@ export class AUNClient {
     this._gapFillDone.clear();
     this._pushedSeqs.clear();
     this._pendingOrderedMsgs.clear();
+    this._pendingP2pPullUpper.clear();
     this._v2SenderIKPending.clear();
     this._v2SenderIKFetching.clear();
     this._groupSynced.clear();
@@ -6005,7 +6051,10 @@ export class AUNClient {
     void this._tryRunBackgroundPull(ns, async () => {
       const operationBefore = this._seqTracker.getContiguousSeq(ns);
       const dedupKey = `p2p_pull:${ns}`;
-      if (this._gapFillDone.has(dedupKey)) return 0;
+      if (this._gapFillDone.has(dedupKey)) {
+        this._recordPendingP2pPull(ns, pushSeq);
+        return 0;
+      }
       this._gapFillDone.set(dedupKey, Date.now());
       try {
         const pulled = await this.pullV2(0, 50, { gateLocked: true });
@@ -6018,7 +6067,7 @@ export class AUNClient {
       } finally {
         this._gapFillDone.delete(dedupKey);
       }
-    }, true).catch((exc) => {
+    }, true, () => this._recordPendingP2pPull(ns, pushSeq)).catch((exc) => {
       const newContig = this._seqTracker.getContiguousSeq(ns);
       this._clientLog.warn(
         `V2 push auto-pull failed: contiguous_seq=${contigBefore}->${newContig} err=${formatCaughtError(exc)}`
