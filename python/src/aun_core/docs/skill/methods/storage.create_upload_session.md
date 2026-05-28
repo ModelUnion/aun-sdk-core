@@ -25,7 +25,7 @@ upload_url = result["upload_url"]
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `object_key` | string | 是 | — | 对象路径标识 |
-| `size_bytes` | integer | 否 | — | 声明的文件大小（字节）。当前实现允许省略，但建议传入用于客户端追踪与最终校验 |
+| `size_bytes` | integer | 否 | — | 声明的文件大小（字节）。**超过 `max_file_size_bytes` 时直接拒绝**，不签发 URL |
 | `content_type` | string | 否 | `"application/octet-stream"` | MIME 类型 |
 | `bucket` | string | 否 | `"default"` | 存储桶名称 |
 | `owner_aid` | string | 否 | 当前用户 | 所有者 AID |
@@ -62,9 +62,12 @@ upload_url = result["upload_url"]
 
 - 如果底层 BlobStore 返回 `127.0.0.1`、`localhost` 或其他 loopback 地址，storage 服务会把 URL 规范化为对外地址
 - 规范化优先使用 `KITE_STORAGE_EXTERNAL_URL`，否则按 `storage.{issuer}` 形式改写
-- `create_upload_session` 阶段不会强校验配额或最终文件大小；配额、`max_file_size_bytes`、SHA-256/size 校验会在 `storage.complete_upload` 阶段执行
+- `size_bytes` 超过 `max_file_size_bytes` 时直接拒绝，不签发 URL（避免客户端上传后才发现超限）
+- 配额、SHA-256/size 最终校验在 `storage.complete_upload` 阶段执行
 
 ## 相关方法
 
+- [storage.check_upload](storage.check_upload.md) — 上传预检（秒传检测 + 超限检测）
+- [storage.get_limits](storage.get_limits.md) — 查询上传限制
 - [storage.complete_upload](storage.complete_upload.md) — 确认上传完成（第三步）
 - [storage.put_object](storage.put_object.md) — 小文件直接上传（≤64KB）

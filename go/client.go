@@ -216,6 +216,7 @@ func summarizeCallParams(method string, params map[string]any) string {
 		"mode":              true,
 		"encrypt":           true,
 		"encrypted":         true,
+		"force":             true,
 	}
 	keys := make([]string, 0, len(params))
 	for k := range params {
@@ -2647,13 +2648,197 @@ func (c *AUNClient) messageTargetsCurrentInstance(message any) bool {
 	return true
 }
 
-func isLegacyEncryptedPayload(payload any) bool {
+func encryptedPushEnvelope(msg map[string]any) (map[string]any, bool) {
+	if msg == nil {
+		return nil, false
+	}
+	if pm, ok := msg["payload"].(map[string]any); ok && isEncryptedEnvelopePayload(pm) {
+		return pm, true
+	}
+	raw := strings.TrimSpace(stringFromAny(msg["envelope_json"]))
+	if raw == "" {
+		return nil, false
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var envelope map[string]any
+	if err := dec.Decode(&envelope); err != nil {
+		return nil, false
+	}
+	if !isEncryptedEnvelopePayload(envelope) {
+		return nil, false
+	}
+	return envelope, true
+}
+
+func isEncryptedPushMessage(msg map[string]any) bool {
+	if msg == nil {
+		return false
+	}
+	if truthyBool(msg["encrypted"]) {
+		return true
+	}
+	_, ok := encryptedPushEnvelope(msg)
+	return ok
+}
+
+func isEncryptedEnvelopePayload(payload any) bool {
 	pm, ok := payload.(map[string]any)
 	if !ok || pm == nil {
 		return false
 	}
 	payloadType := strings.TrimSpace(stringFromAny(pm["type"]))
-	return payloadType == "e2ee.encrypted" || payloadType == "e2ee.group_encrypted"
+	if strings.HasPrefix(payloadType, "e2ee.") {
+		return true
+	}
+	if strings.TrimSpace(stringFromAny(pm["ciphertext"])) == "" {
+		return false
+	}
+	return pm["nonce"] != nil || pm["tag"] != nil || pm["recipient"] != nil ||
+		pm["recipients"] != nil || pm["wrapped_key"] != nil || pm["recipients_digest"] != nil
+}
+
+func isV2EncryptedEnvelopePayload(envelope map[string]any) bool {
+	if envelope == nil {
+		return false
+	}
+	payloadType := strings.TrimSpace(stringFromAny(envelope["type"]))
+	if payloadType == "e2ee.p2p_encrypted" || payloadType == "e2ee.group_encrypted" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(stringFromAny(envelope["version"])), "v2") &&
+		strings.HasPrefix(payloadType, "e2ee.")
+}
+
+func safeUndecryptablePushEvent(msg map[string]any, group bool) map[string]any {
+	event := map[string]any{
+		"message_id":     msg["message_id"],
+		"from":           msg["from"],
+		"seq":            msg["seq"],
+		"timestamp":      msg["timestamp"],
+		"device_id":      msg["device_id"],
+		"slot_id":        msg["slot_id"],
+		"_decrypt_error": "encrypted push payload is not decryptable on raw push path",
+		"_decrypt_stage": "push_envelope",
+	}
+	if event["timestamp"] == nil {
+		event["timestamp"] = msg["t_server"]
+	}
+	if group {
+		event["group_id"] = msg["group_id"]
+	} else {
+		event["to"] = msg["to"]
+	}
+	if envelope, ok := encryptedPushEnvelope(msg); ok {
+		event["_envelope_type"] = stringFromAny(envelope["type"])
+		event["_suite"] = stringFromAny(envelope["suite"])
+		if isV2EncryptedEnvelopePayload(envelope) {
+			attachV2EnvelopeMetadata(event, v2MessageE2EEMetadata(envelope))
+		}
+	}
+	return event
+}
+
+func (c *AUNClient) publishEncryptedPushAsUndecryptable(eventName, ns string, seq int, msg map[string]any, group bool) bool {
+	safeEvent := safeUndecryptablePushEvent(msg, group)
+	c.logMessageDebug("decrypt-fail", "push.encrypted", eventName, safeEvent, nil)
+	if ns != "" && seq > 0 {
+		return c.publishOrderedMessage(eventName, ns, seq, safeEvent)
+	}
+	c.publishAppEvent(eventName, safeEvent)
+	return true
+}
+
+func (c *AUNClient) decryptEncryptedPushPayload(msg map[string]any, group bool) map[string]any {
+	envelope, ok := encryptedPushEnvelope(msg)
+	if !ok || !isV2EncryptedEnvelopePayload(envelope) {
+		return nil
+	}
+	fromAID := strings.TrimSpace(stringFromAny(msg["from_aid"]))
+	if fromAID == "" {
+		fromAID = strings.TrimSpace(stringFromAny(msg["from"]))
+	}
+	if fromAID == "" {
+		fromAID = strings.TrimSpace(stringFromAny(msg["sender_aid"]))
+	}
+	if fromAID == "" {
+		if aad, ok := envelope["aad"].(map[string]any); ok {
+			fromAID = strings.TrimSpace(stringFromAny(aad["from"]))
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	plaintext := c.decryptV2EnvelopeForThought(ctx, envelope, fromAID)
+	if plaintext == nil {
+		return nil
+	}
+	meta := v2MessageE2EEMetadata(envelope)
+	result := map[string]any{
+		"message_id": stringFromAny(msg["message_id"]),
+		"from":       fromAID,
+		"seq":        msg["seq"],
+		"timestamp":  msg["timestamp"],
+		"payload":    plaintext,
+		"encrypted":  true,
+		"e2ee":       meta,
+	}
+	direction := strings.TrimSpace(stringFromAny(msg["direction"]))
+	if direction == "" {
+		c.mu.RLock()
+		selfAID := c.aid
+		c.mu.RUnlock()
+		if fromAID != "" && fromAID == selfAID {
+			direction = "outbound_sync"
+		} else {
+			direction = "inbound"
+		}
+	}
+	result["direction"] = direction
+	if msg["t_server"] != nil {
+		result["t_server"] = msg["t_server"]
+		result["timestamp"] = msg["t_server"]
+	}
+	if msg["device_id"] != nil {
+		result["device_id"] = msg["device_id"]
+	}
+	if msg["slot_id"] != nil {
+		result["slot_id"] = msg["slot_id"]
+	}
+	if group {
+		groupID := msg["group_id"]
+		if groupID == nil {
+			if aad, ok := envelope["aad"].(map[string]any); ok {
+				groupID = aad["group_id"]
+			}
+		}
+		if groupID == nil {
+			groupID = envelope["group_id"]
+		}
+		result["group_id"] = groupID
+	} else {
+		to := msg["to"]
+		if to == nil {
+			c.mu.RLock()
+			to = c.aid
+			c.mu.RUnlock()
+		}
+		result["to"] = to
+	}
+	attachV2EnvelopeMetadata(result, meta)
+	c.logMessageDebug("decrypt-ok", "push.encrypted", map[bool]string{true: "group.message_created", false: "message.received"}[group], result, nil)
+	return result
+}
+
+func (c *AUNClient) publishEncryptedPushMessage(normalEvent, undecryptableEvent, ns string, seq int, msg map[string]any, group bool) bool {
+	decrypted := c.decryptEncryptedPushPayload(msg, group)
+	if decrypted != nil {
+		if ns != "" && seq > 0 {
+			return c.publishOrderedMessage(normalEvent, ns, seq, decrypted)
+		}
+		c.publishAppEvent(normalEvent, decrypted)
+		return true
+	}
+	return c.publishEncryptedPushAsUndecryptable(undecryptableEvent, ns, seq, msg, group)
 }
 
 // onRawMessageReceived 处理 transport 层推送的原始消息
@@ -2695,19 +2880,20 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 	c.mu.RLock()
 	myAID := c.aid
 	c.mu.RUnlock()
+	p2pNS := ""
 	if seq > 0 && myAID != "" {
-		ns := "p2p:" + myAID
-		c.seqTracker.UpdateMaxSeen(ns, seq)
-		needPull := c.seqTracker.OnMessageSeq(ns, seq)
+		p2pNS = "p2p:" + myAID
+		c.seqTracker.UpdateMaxSeen(p2pNS, seq)
+		needPull := c.seqTracker.OnMessageSeq(p2pNS, seq)
 		if needPull {
 			c.log.Debug("P2P seq gap detected, triggering gap fill: seq=%d", seq)
 			go c.fillP2pGap()
 		}
 		// auto-ack contiguous_seq
-		contig := c.seqTracker.GetContiguousSeq(ns)
+		contig := c.seqTracker.GetContiguousSeq(p2pNS)
 		if contig > 0 {
-			ackSeq := c.clampAckSeq("message.ack", "seq", ns, int64(contig))
-			c.log.Debug("P2P push auto-ack send: ns=%s seq=%d contiguous=%d", ns, ackSeq, contig)
+			ackSeq := c.clampAckSeq("message.ack", "seq", p2pNS, int64(contig))
+			c.log.Debug("P2P push auto-ack send: ns=%s seq=%d contiguous=%d", p2pNS, ackSeq, contig)
 			go func() {
 				ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ackCancel()
@@ -2718,7 +2904,7 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 				}); ackErr != nil {
 					c.log.Warn("P2P auto-ack failed: %v", ackErr)
 				} else {
-					c.log.Debug("P2P push auto-ack ok: ns=%s seq=%d", ns, ackSeq)
+					c.log.Debug("P2P push auto-ack ok: ns=%s seq=%d", p2pNS, ackSeq)
 				}
 			}()
 		}
@@ -2726,8 +2912,9 @@ func (c *AUNClient) processAndPublishMessage(data any) {
 		c.saveSeqTrackerState()
 	}
 
-	if isLegacyEncryptedPayload(msg["payload"]) {
-		c.log.Debug("V2-only: skipped legacy encrypted P2P push: from=%s seq=%d", fromAID, seq)
+	if isEncryptedPushMessage(msg) {
+		c.log.Debug("encrypted P2P push attempting inline decrypt: from=%s seq=%d", fromAID, seq)
+		c.publishEncryptedPushMessage("message.received", "message.undecryptable", p2pNS, seq, msg, false)
 		return
 	}
 
@@ -2813,10 +3000,7 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 		return
 	}
 
-	if isLegacyEncryptedPayload(payload) {
-		c.logEG.Debug("V2-only: skipped legacy encrypted group push: group=%s seq=%d", groupID, seq)
-		return
-	}
+	encryptedPush := isEncryptedPushMessage(msg)
 
 	// V2-only: V2 群组消息通过 V2 push 路径解密；明文/兼容消息在此处透传
 	decrypted := msg
@@ -2855,6 +3039,16 @@ func (c *AUNClient) processAndPublishGroupMessage(data any) {
 			}()
 		}
 		c.saveSeqTrackerState()
+	}
+
+	if encryptedPush {
+		c.logEG.Debug("encrypted group push attempting inline decrypt: group=%s seq=%d", groupID, seq)
+		ns := ""
+		if groupID != "" && seq > 0 {
+			ns = "group:" + groupID
+		}
+		c.publishEncryptedPushMessage("group.message_created", "group.message_undecryptable", ns, seq, msg, true)
+		return
 	}
 
 	// V2-only: 不再有 pending decrypt 队列，decrypted 始终非 nil

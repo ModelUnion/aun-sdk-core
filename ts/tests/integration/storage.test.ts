@@ -19,6 +19,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
+import * as http from 'node:http';
+import * as https from 'node:https';
+import { URL } from 'node:url';
 import { AUNClient } from '../../src/client.js';
 
 process.env.AUN_ENV ??= 'development';
@@ -49,6 +52,46 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function downloadBytes(urlText: string, redirectsLeft: number = 5): Promise<Buffer> {
+  const parsed = new URL(urlText);
+  const mod = parsed.protocol === 'https:' ? https : http;
+  const options = parsed.protocol === 'https:'
+    ? ({ rejectUnauthorized: false, timeout: 15_000 } as https.RequestOptions)
+    : ({ timeout: 15_000 } as http.RequestOptions);
+
+  return await new Promise<Buffer>((resolve, reject) => {
+    const req = mod.get(urlText, options, (res) => {
+      const statusCode = res.statusCode ?? 0;
+      if ([301, 302, 303, 307, 308].includes(statusCode)) {
+        const location = res.headers.location;
+        res.resume();
+        if (!location) {
+          reject(new Error(`HTTP ${statusCode} without Location from ${urlText}`));
+          return;
+        }
+        if (redirectsLeft <= 0) {
+          reject(new Error(`too many redirects starting from ${urlText}`));
+          return;
+        }
+        const nextUrl = new URL(location, urlText).toString();
+        downloadBytes(nextUrl, redirectsLeft - 1).then(resolve, reject);
+        return;
+      }
+      if (statusCode < 200 || statusCode >= 300) {
+        reject(new Error(`HTTP ${statusCode} from ${urlText}`));
+        res.resume();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error(`timeout fetching ${urlText}`)));
+  });
 }
 
 /** 判断错误是否为"服务未实现"，用于优雅跳过 */
@@ -188,6 +231,143 @@ describe('Storage: inline 存取与权限', () => {
       await bob.close();
     }
   }, 60_000);
+});
+
+// ── 4. Storage: 分享链接与短链接 ──────────────────────────────────
+
+describe('Storage: 分享链接与短链接', () => {
+  it('create/list/get/revoke + /s/{share_id} 下载 + allowed_aids/max_uses', async () => {
+    const rid = runId();
+    const aliceAid = `stosha${rid}.${ISSUER}`;
+    const bobAid = `stoshb${rid}.${ISSUER}`;
+    const eveAid = `stoshe${rid}.${ISSUER}`;
+    const bucket = `bkt-${rid}`;
+    const objectKey = `share-${rid}.txt`;
+    const rawContent = `share-hello-${rid}`;
+    const b64Content = Buffer.from(rawContent).toString('base64');
+
+    const alice = makeClient();
+    const bob = makeClient();
+    const eve = makeClient();
+    const shareIds: string[] = [];
+
+    try {
+      await ensureConnected(alice, aliceAid);
+      await ensureConnected(bob, bobAid);
+      await ensureConnected(eve, eveAid);
+
+      try {
+        await alice.call('storage.put_object', {
+          owner_aid: aliceAid,
+          bucket,
+          object_key: objectKey,
+          content: b64Content,
+          content_type: 'text/plain',
+          is_private: true,
+        });
+      } catch (e) {
+        if (isNotImplemented(e)) {
+          console.log('storage.put_object 未实现，跳过分享链接测试');
+          return;
+        }
+        throw e;
+      }
+
+      let publicShare: Record<string, unknown>;
+      try {
+        publicShare = await alice.call('storage.create_share_link', {
+          owner_aid: aliceAid,
+          bucket,
+          object_key: objectKey,
+          allowed_aids: ['*'],
+          expire_in_seconds: 300,
+        }) as Record<string, unknown>;
+      } catch (e) {
+        if (isNotImplemented(e)) {
+          console.log('storage.create_share_link 未实现，跳过分享链接测试');
+          return;
+        }
+        throw e;
+      }
+
+      const publicShareId = String(publicShare.share_id ?? '');
+      const publicShareUrl = String(publicShare.share_url ?? '');
+      shareIds.push(publicShareId);
+      expect(publicShareId).toMatch(/^[0-9A-Za-z]{10}$/);
+      expect(publicShareUrl).toContain(`/s/${publicShareId}`);
+      expect(publicShareUrl.startsWith('http://') || publicShareUrl.startsWith('https://')).toBe(true);
+
+      const downloaded = await downloadBytes(publicShareUrl);
+      expect(downloaded.toString('utf-8')).toBe(rawContent);
+
+      const bobPublicGet = await bob.call('storage.get_by_share', {
+        share_id: publicShareId,
+      }) as Record<string, unknown>;
+      expect(Buffer.from(String(bobPublicGet.content ?? ''), 'base64').toString('utf-8')).toBe(rawContent);
+
+      const restrictedShare = await alice.call('storage.create_share_link', {
+        owner_aid: aliceAid,
+        bucket,
+        object_key: objectKey,
+        allowed_aids: [bobAid],
+        expire_in_seconds: 300,
+      }) as Record<string, unknown>;
+      const restrictedShareId = String(restrictedShare.share_id ?? '');
+      shareIds.push(restrictedShareId);
+
+      const bobRestrictedGet = await bob.call('storage.get_by_share', {
+        share_id: restrictedShareId,
+      }) as Record<string, unknown>;
+      expect(Buffer.from(String(bobRestrictedGet.content ?? ''), 'base64').toString('utf-8')).toBe(rawContent);
+
+      await expect(eve.call('storage.get_by_share', {
+        share_id: restrictedShareId,
+      })).rejects.toThrow();
+
+      const limitedShare = await alice.call('storage.create_share_link', {
+        owner_aid: aliceAid,
+        bucket,
+        object_key: objectKey,
+        allowed_aids: ['*'],
+        expire_in_seconds: 300,
+        max_uses: 1,
+      }) as Record<string, unknown>;
+      const limitedShareId = String(limitedShare.share_id ?? '');
+      shareIds.push(limitedShareId);
+
+      await bob.call('storage.get_by_share', { share_id: limitedShareId });
+      await expect(bob.call('storage.get_by_share', { share_id: limitedShareId })).rejects.toThrow();
+
+      const listed = await alice.call('storage.list_share_links', {
+        bucket,
+        object_key: objectKey,
+      }) as Record<string, unknown>;
+      const links = Array.isArray(listed.links) ? listed.links as Record<string, unknown>[] : [];
+      expect(links.some(link => link.share_id === publicShareId)).toBe(true);
+      expect(links.some(link => link.share_id === restrictedShareId)).toBe(true);
+
+      await alice.call('storage.revoke_share_link', { share_id: restrictedShareId });
+      await expect(bob.call('storage.get_by_share', {
+        share_id: restrictedShareId,
+      })).rejects.toThrow();
+    } finally {
+      for (const share_id of shareIds) {
+        try {
+          await alice.call('storage.revoke_share_link', { share_id });
+        } catch { /* 忽略清理错误 */ }
+      }
+      try {
+        await alice.call('storage.delete_object', {
+          owner_aid: aliceAid,
+          bucket,
+          object_key: objectKey,
+        });
+      } catch { /* 忽略清理错误 */ }
+      await alice.close();
+      await bob.close();
+      await eve.close();
+    }
+  }, 90_000);
 });
 
 // ── 2. Storage: 分页与版本控制 ──────────────────────────────────────

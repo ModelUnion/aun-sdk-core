@@ -485,6 +485,8 @@ func TestDecryptV2MessageFallsBackToCACert(t *testing.T) {
 		"seq":           int64(1),
 		"spk_id":        bobSPKID,
 		"envelope_json": string(envJSON),
+		"device_id":     "dev-bob",
+		"slot_id":       "slot-a",
 	}
 	plaintext := c.decryptV2Message(context.Background(), c.v2GetState(), msg)
 	if plaintext == nil {
@@ -497,12 +499,255 @@ func TestDecryptV2MessageFallsBackToCACert(t *testing.T) {
 	if plaintext["payload_type"] != "text" {
 		t.Fatalf("应用层消息顶层 payload_type 应透传原始 payload.type，实际: %#v", plaintext)
 	}
-	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text", "sdk_lang": "go", "sdk_version": "0.3.5"}) {
+	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text", "sdk_lang": "go", "sdk_version": "0.3.6"}) {
 		t.Fatalf("应用层消息顶层 protected_headers 应去 _auth 后透传，实际: %#v", plaintext["protected_headers"])
 	}
 	e2eeMeta, _ := plaintext["e2ee"].(map[string]any)
 	if e2eeMeta["payload_type"] != "text" {
 		t.Fatalf("应用层 e2ee.payload_type 应透传原始 payload.type，实际: %#v", e2eeMeta)
+	}
+	if plaintext["direction"] != "inbound" {
+		t.Fatalf("P2P V2 pull 解密结果应补 direction=inbound，实际: %#v", plaintext["direction"])
+	}
+	if plaintext["device_id"] != "dev-bob" || plaintext["slot_id"] != "slot-a" {
+		t.Fatalf("P2P V2 pull 解密结果应透传 device_id/slot_id，实际: device=%#v slot=%#v", plaintext["device_id"], plaintext["slot_id"])
+	}
+}
+
+func TestDecryptGroupV2MessageExposesDirectionAndInstanceMetadata(t *testing.T) {
+	alicePriv, alicePubDER, err := v2crypto.GenerateP256Keypair()
+	if err != nil {
+		t.Fatalf("生成 Alice IK 失败: %v", err)
+	}
+	bobPriv, bobPubDER, err := v2crypto.GenerateP256Keypair()
+	if err != nil {
+		t.Fatalf("生成 Bob IK 失败: %v", err)
+	}
+	aliceAID := "alice.example.com"
+	bobAID := "bob.example.com"
+	groupID := "group.example.com/g1"
+
+	envelope, err := v2e2ee.EncryptGroupMessage(
+		v2e2ee.Sender{AID: aliceAID, DeviceID: "dev-alice", IKPriv: alicePriv, IKPubDER: alicePubDER},
+		groupID,
+		0,
+		[]v2e2ee.Target{{
+			AID:       bobAID,
+			DeviceID:  "dev-bob",
+			Role:      "member",
+			KeySource: "aid_master",
+			IKPkDER:   bobPubDER,
+		}},
+		map[string]any{"type": "group-text", "text": "group decrypt"},
+		v2e2ee.EncryptOptions{MessageID: "gm-direction", Timestamp: 1710504000000},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("构造 V2 group envelope 失败: %v", err)
+	}
+	envJSON, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("序列化 envelope 失败: %v", err)
+	}
+
+	store, err := openV2Keystore(t.TempDir(), bobAID)
+	if err != nil {
+		t.Fatalf("打开 V2 keystore 失败: %v", err)
+	}
+	defer store.Close()
+	sess := v2session.NewV2Session(store.store, "dev-bob", bobAID, bobPriv, bobPubDER)
+	if err := sess.EnsureKeys(); err != nil {
+		t.Fatalf("初始化测试 V2 session 失败: %v", err)
+	}
+	sess.CachePeerIK(aliceAID, "dev-alice", alicePubDER)
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = bobAID
+	c.deviceID = "dev-bob"
+	c.v2State = &v2P2PState{
+		session:             sess,
+		keystore:            store,
+		bootstrapCache:      make(map[string]v2BootstrapEntry),
+		groupBootstrapCache: make(map[string]*v2GroupBootstrapEntry),
+	}
+	c.mu.Unlock()
+
+	plaintext := c.decryptV2Message(context.Background(), c.v2GetState(), map[string]any{
+		"message_id":    "gm-direction",
+		"from_aid":      aliceAID,
+		"group_id":      groupID,
+		"seq":           int64(1),
+		"envelope_json": string(envJSON),
+		"device_id":     "dev-bob",
+		"slot_id":       "slot-a",
+	})
+	if plaintext == nil {
+		t.Fatal("Group V2 pull 解密应成功")
+	}
+	payload, _ := plaintext["payload"].(map[string]any)
+	if payload["text"] != "group decrypt" {
+		t.Fatalf("Group V2 pull payload 不正确: %#v", plaintext)
+	}
+	if plaintext["direction"] != "inbound" {
+		t.Fatalf("Group V2 pull 解密结果应补 direction=inbound，实际: %#v", plaintext["direction"])
+	}
+	if plaintext["device_id"] != "dev-bob" || plaintext["slot_id"] != "slot-a" {
+		t.Fatalf("Group V2 pull 解密结果应透传 device_id/slot_id，实际: device=%#v slot=%#v", plaintext["device_id"], plaintext["slot_id"])
+	}
+}
+
+func TestDecryptEncryptedPushPayloadExposesDirection(t *testing.T) {
+	bobPriv, bobPubDER, err := v2crypto.GenerateP256Keypair()
+	if err != nil {
+		t.Fatalf("生成 Bob IK 失败: %v", err)
+	}
+	alicePriv, alicePubDER, err := v2crypto.GenerateP256Keypair()
+	if err != nil {
+		t.Fatalf("生成 Alice IK 失败: %v", err)
+	}
+	bobAID := "bob.example.com"
+	aliceAID := "alice.example.com"
+	groupID := "group.example.com/g1"
+
+	store, err := openV2Keystore(t.TempDir(), bobAID)
+	if err != nil {
+		t.Fatalf("打开 V2 keystore 失败: %v", err)
+	}
+	defer store.Close()
+	sess := v2session.NewV2Session(store.store, "dev-bob", bobAID, bobPriv, bobPubDER)
+	if err := sess.EnsureKeys(); err != nil {
+		t.Fatalf("初始化测试 V2 session 失败: %v", err)
+	}
+	sess.CachePeerIK(aliceAID, "dev-alice", alicePubDER)
+	sess.CachePeerIK(bobAID, "dev-bob", bobPubDER)
+
+	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = bobAID
+	c.deviceID = "dev-bob"
+	c.v2State = &v2P2PState{
+		session:             sess,
+		keystore:            store,
+		bootstrapCache:      make(map[string]v2BootstrapEntry),
+		groupBootstrapCache: make(map[string]*v2GroupBootstrapEntry),
+	}
+	c.mu.Unlock()
+
+	p2pEnvelope, err := v2e2ee.EncryptP2PMessage(
+		v2e2ee.Sender{AID: aliceAID, DeviceID: "dev-alice", IKPriv: alicePriv, IKPubDER: alicePubDER},
+		v2e2ee.TargetSet{Targets: []v2e2ee.Target{{
+			AID:       bobAID,
+			DeviceID:  "dev-bob",
+			Role:      "peer",
+			KeySource: "aid_master",
+			IKPkDER:   bobPubDER,
+		}}},
+		map[string]any{"type": "text", "text": "p2p inbound"},
+		v2e2ee.EncryptOptions{MessageID: "m-p2p-inbound", Timestamp: 1710504000000},
+	)
+	if err != nil {
+		t.Fatalf("构造 P2P envelope 失败: %v", err)
+	}
+	p2p := c.decryptEncryptedPushPayload(map[string]any{
+		"message_id": "m-p2p-inbound",
+		"from":       aliceAID,
+		"to":         bobAID,
+		"seq":        int64(1),
+		"timestamp":  int64(123),
+		"payload":    p2pEnvelope,
+	}, false)
+	if p2p == nil || p2p["direction"] != "inbound" {
+		t.Fatalf("P2P raw encrypted push 应补 direction=inbound，实际: %#v", p2p)
+	}
+
+	selfEnvelope, err := v2e2ee.EncryptP2PMessage(
+		v2e2ee.Sender{AID: bobAID, DeviceID: "dev-bob", IKPriv: bobPriv, IKPubDER: bobPubDER},
+		v2e2ee.TargetSet{Targets: []v2e2ee.Target{{
+			AID:       bobAID,
+			DeviceID:  "dev-bob",
+			Role:      "self_sync",
+			KeySource: "aid_master",
+			IKPkDER:   bobPubDER,
+		}}},
+		map[string]any{"type": "text", "text": "p2p self"},
+		v2e2ee.EncryptOptions{MessageID: "m-p2p-self", Timestamp: 1710504000000},
+	)
+	if err != nil {
+		t.Fatalf("构造 P2P self envelope 失败: %v", err)
+	}
+	selfP2P := c.decryptEncryptedPushPayload(map[string]any{
+		"message_id": "m-p2p-self",
+		"from":       bobAID,
+		"to":         bobAID,
+		"seq":        int64(2),
+		"timestamp":  int64(124),
+		"payload":    selfEnvelope,
+	}, false)
+	if selfP2P == nil || selfP2P["direction"] != "outbound_sync" {
+		t.Fatalf("P2P raw encrypted self push 应补 direction=outbound_sync，实际: %#v", selfP2P)
+	}
+
+	groupEnvelope, err := v2e2ee.EncryptGroupMessage(
+		v2e2ee.Sender{AID: aliceAID, DeviceID: "dev-alice", IKPriv: alicePriv, IKPubDER: alicePubDER},
+		groupID,
+		0,
+		[]v2e2ee.Target{{
+			AID:       bobAID,
+			DeviceID:  "dev-bob",
+			Role:      "member",
+			KeySource: "aid_master",
+			IKPkDER:   bobPubDER,
+		}},
+		map[string]any{"type": "group-text", "text": "group inbound"},
+		v2e2ee.EncryptOptions{MessageID: "gm-inbound", Timestamp: 1710504000000},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("构造 group envelope 失败: %v", err)
+	}
+	groupMsg := c.decryptEncryptedPushPayload(map[string]any{
+		"message_id": "gm-inbound",
+		"group_id":   groupID,
+		"from":       aliceAID,
+		"seq":        int64(3),
+		"timestamp":  int64(125),
+		"payload":    groupEnvelope,
+	}, true)
+	if groupMsg == nil || groupMsg["direction"] != "inbound" {
+		t.Fatalf("Group raw encrypted push 应补 direction=inbound，实际: %#v", groupMsg)
+	}
+
+	selfGroupEnvelope, err := v2e2ee.EncryptGroupMessage(
+		v2e2ee.Sender{AID: bobAID, DeviceID: "dev-bob", IKPriv: bobPriv, IKPubDER: bobPubDER},
+		groupID,
+		0,
+		[]v2e2ee.Target{{
+			AID:       bobAID,
+			DeviceID:  "dev-bob",
+			Role:      "self_sync",
+			KeySource: "aid_master",
+			IKPkDER:   bobPubDER,
+		}},
+		map[string]any{"type": "group-text", "text": "group self"},
+		v2e2ee.EncryptOptions{MessageID: "gm-self", Timestamp: 1710504000000},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("构造 group self envelope 失败: %v", err)
+	}
+	selfGroup := c.decryptEncryptedPushPayload(map[string]any{
+		"message_id": "gm-self",
+		"group_id":   groupID,
+		"from":       bobAID,
+		"seq":        int64(4),
+		"timestamp":  int64(126),
+		"payload":    selfGroupEnvelope,
+	}, true)
+	if selfGroup == nil || selfGroup["direction"] != "outbound_sync" {
+		t.Fatalf("Group raw encrypted self push 应补 direction=outbound_sync，实际: %#v", selfGroup)
 	}
 }
 
@@ -626,6 +871,50 @@ func TestV2P2PPullBatchAutoAckOnceWithFinalContiguousSeq(t *testing.T) {
 	}
 	if len(ackCalls) != 1 || toInt64(ackCalls[0].Params["up_to_seq"]) != 3 {
 		t.Fatalf("message.v2.pull 应 ack 最终 contiguous_seq=3，ackCalls=%#v", ackCalls)
+	}
+}
+
+func TestV2P2PPullForceTruePassthroughKeepsExplicitAfterZero(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "message.v2.pull":
+			return map[string]any{"messages": []any{}, "has_more": false}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	ns := "p2p:" + c.aid
+	c.seqTracker.ForceContiguousSeq(ns, 9)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "message.pull", map[string]any{"after_seq": 0, "limit": 10, "force": true})
+	if err != nil {
+		t.Fatalf("message.pull(force=true) 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	messages, _ := resultMap["messages"].([]any)
+	if len(messages) != 0 {
+		t.Fatalf("空 force pull 不应返回消息: %#v", result)
+	}
+	var pullCalls []testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "message.v2.pull" {
+			pullCalls = append(pullCalls, call)
+		}
+	}
+	if len(pullCalls) != 1 {
+		t.Fatalf("message.v2.pull 调用次数不正确: %#v", pullCalls)
+	}
+	if toInt64(pullCalls[0].Params["after_seq"]) != 0 || toInt64(pullCalls[0].Params["limit"]) != 10 || pullCalls[0].Params["force"] != true {
+		t.Fatalf("message.v2.pull 应透传 after_seq=0 limit=10 force=true，实际: %#v", pullCalls[0].Params)
+	}
+	if got := c.seqTracker.GetContiguousSeq(ns); got != 9 {
+		t.Fatalf("force pull 空返回不应回退 contiguous_seq，got=%d", got)
 	}
 }
 

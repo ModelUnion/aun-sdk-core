@@ -1,12 +1,108 @@
-# Python SDK 变更清单（v0.3.3 → v0.3.5）— 跨 SDK 对齐参考
+# Python SDK 变更清单（v0.3.3 → v0.3.6）— 跨 SDK 对齐参考
 
 本文档供 Go / TypeScript / JavaScript / C++ SDK 进行功能对齐时使用，详尽列出从 v0.3.3
-到 v0.3.5 期间 Python SDK 的实际变更，定位到具体类、函数与代码行。按重要程度
+到 v0.3.6 期间 Python SDK 的实际变更，定位到具体类、函数与代码行。按重要程度
 （Breaking → 安全/认证 → API 公开面 → 内部机制 → CLI/工具 → Bug 修复）排序。
 
-涉及提交：`af5c6ed7` (v0.3.3) → `5b75e33e` (v0.3.4) → `74d4fb7a` (OCSP/CRL fail-open + check_agent_md) → `33344726` (旧 SPK 私钥内存缓存) → `fef5a6ee` (v0.3.5)。
+涉及提交：`af5c6ed7` (v0.3.3) → `5b75e33e` (v0.3.4) → `74d4fb7a` (OCSP/CRL fail-open + check_agent_md) → `33344726` (旧 SPK 私钥内存缓存) → `fef5a6ee` (v0.3.5) → 工作区 (v0.3.6)。
 
 CHANGELOG（接口级摘要）：见 `python/CHANGELOG.md`。本文档为**实现级别详尽清单**。
+
+---
+
+## 0. v0.3.5 → v0.3.6 变更（最新，优先对齐）
+
+### 0.1 Encrypted Push 解密管线（核心新功能，所有 SDK 必须对齐）
+
+收到加密推送消息时，SDK 在 push 路径即时尝试 V2 解密，而非等待应用层手动处理。
+
+#### `client.py — AUNClient`
+
+| 状态 | 符号 | 说明 |
+|---|---|---|
+| 新增 | `_is_encrypted_push_message(msg)` | 判断推送消息是否为加密消息（检查 `encrypted` 标志或 payload 结构） |
+| 新增 | `_is_encrypted_envelope_payload(payload)` | 判断 payload 是否为 E2EE 信封（`type` 以 `e2ee.` 开头，或含 `ciphertext` + 密码学字段） |
+| 新增 | `_encrypted_push_envelope(msg)` | 从 `msg.payload` 或 `msg.envelope_json` 提取加密信封 |
+| 新增 | `_is_v2_encrypted_envelope_payload(envelope)` | 判断信封是否为 V2 格式（`e2ee.p2p_encrypted` / `e2ee.group_encrypted`） |
+| 新增 | `_decrypt_encrypted_push_payload(msg, group=)` | 尝试 V2 解密，成功返回明文 dict，失败返回 None |
+| 新增 | `_safe_undecryptable_push_event(msg, group=)` | 构造 undecryptable 事件 payload（含 `_decrypt_error` / `_decrypt_stage` / `_envelope_type` / `_suite`） |
+| 新增 | `_publish_encrypted_push_message(event, undecryptable_event, ns, seq, msg, group=)` | 编排：尝试解密 → 成功发 normal event → 失败发 undecryptable event |
+| 修改 | `_handle_message_push(msg)` | P2P 推送路径：检测到加密消息时走 `_publish_encrypted_push_message` 而非直接 `_publish_ordered_message` |
+| 修改 | `_handle_raw_group_message_created(data)` | 群推送路径：同上，加密消息走新管线 |
+
+**对齐要点**：
+- 事件名：P2P 成功 `message.received`，失败 `message.undecryptable`；群成功 `group.message_created`，失败 `group.message_undecryptable`
+- undecryptable payload 必须包含：`message_id`, `from`, `seq`, `timestamp`, `_decrypt_error`, `_decrypt_stage`
+- 解密成功时 payload 中附加 `encrypted: True` + `e2ee` 元数据字典
+- 群消息的 seq tracking / ack 逻辑在加密路径中也必须正确执行
+
+### 0.2 Identity Cache 自愈（Bug 修复，所有 SDK 必须对齐）
+
+#### `client.py — _init_v2_session` 区域
+
+| 状态 | 符号 | 说明 |
+|---|---|---|
+| 新增 | V2 session init 时 `private_key_pem` 缺失检测 | 若缓存的 `self._identity` 无 `private_key_pem`，从 keystore 重新加载 |
+| 新增 | 自愈持久化 | 重新加载成功后调用 `self._auth._persist_identity(reloaded)` 清理脏 instance_state |
+| 日志 | `"V2 session init: identity cache was stale, reloaded from keystore"` | WARN 级别 |
+
+**对齐要点**：所有 SDK 的 V2 session 初始化路径必须有此 fallback，否则 instance_state 被污染后 V2 E2EE 永久不可用。
+
+### 0.3 `load_identity` 字段白名单（Bug 修复，所有 SDK 必须对齐）
+
+#### `auth.py — AuthFlow._load_identity`
+
+| 状态 | 符号 | 说明 |
+|---|---|---|
+| 修改 | `identity.update(instance_state)` → 白名单合并 | 只合并 `_INSTANCE_STATE_FIELDS` 中定义的字段，防止 instance_state 表中的脏数据覆盖 `private_key_pem` 等核心字段 |
+
+**对齐要点**：各 SDK 的 `loadIdentity` / `LoadIdentity` 必须同步此修复。白名单字段列表参考 Python `AuthFlow._INSTANCE_STATE_FIELDS`。
+
+### 0.4 Storage 新增 RPC（功能扩展）
+
+| 方法 | 说明 | 对齐要点 |
+|---|---|---|
+| `storage.get_limits` | 查询上传限制和配额 | 纯 RPC 调用，无客户端特殊逻辑 |
+| `storage.check_upload` | 上传预检（秒传 + 超限） | 纯 RPC 调用，客户端可在上传前调用优化流程 |
+
+### 0.4b `auth.fetch_peer_cert` 公开 API（所有 SDK 必须对齐）
+
+v0.3.5 新增了 `auth.load_identity` / `auth.fetch_peer_cert` 等公开 API，但 `fetch_peer_cert` 在 v0.3.6 才真正暴露为独立公开方法（之前仅作为内部 `_download_registered_cert` 存在）。
+
+| 语言 | 方法签名 | 说明 |
+|---|---|---|
+| Python | `await auth.fetch_peer_cert(gateway_url, aid) -> str | None` | 未注册返回 None |
+| TS | `await auth.fetchPeerCert(gatewayUrl, aid): Promise<string | null>` | 未注册返回 null |
+| JS | `await auth.fetchPeerCert(gatewayUrl, aid): Promise<string | null>` | 同 TS |
+| Go | `auth.FetchPeerCert(ctx, gatewayURL, aid) (string, error)` | 未注册返回空串 |
+
+**对齐要点**：纯代理到内部 `downloadRegisteredCert`，无额外逻辑。
+
+### 0.5 TS 特有变更
+
+| 模块 | 变更 | 说明 |
+|---|---|---|
+| `secret-store/file-store.ts` | `.seed.migrated.*` fallback | 解密失败时自动尝试旧 seed 文件，兼容半迁移状态 |
+| `namespaces/auth.ts` | `_persistGatewayUrl` | `registerAid` / `authenticate` 成功后持久化 gateway_url |
+
+### 0.6 Transport 诊断字段扩展
+
+#### `transport.py` / `transport.go` / `transport.ts`
+
+| 状态 | 符号 | 说明 |
+|---|---|---|
+| 修改 | `_DIAG_PARAM_FIELDS` / `diagParamFields` | 新增 `"force"` 字段到诊断参数白名单 |
+
+**对齐要点**：各 SDK transport 层的诊断参数白名单需同步添加 `force`。
+
+### 0.7 Go `PullV2` 支持 `force` 参数
+
+| 状态 | 符号 | 说明 |
+|---|---|---|
+| 新增 | `pullV2WithForce(ctx, afterSeq, limit, force)` | 内部方法，`force=true` 时跳过 SeqTracker contiguous_seq 优化 |
+| 修改 | `pullV2Internal` | 从 params 提取 `force` 字段并透传 |
+
+**对齐要点**：Python 已在 v0.3.5 支持 `force` 参数（`message.v2.pull` 的 `force` 字段），Go 在 v0.3.6 补齐。TS/JS 需确认是否已支持。
 
 ---
 

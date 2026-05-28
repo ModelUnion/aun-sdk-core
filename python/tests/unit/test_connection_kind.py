@@ -89,7 +89,7 @@ async def test_initialize_session_passes_options_to_auth_connect():
     assert captured["params"]["client"] == {
         "slot_id": "slot-a",
         "sdk_lang": "python",
-        "sdk_version": "0.3.5",
+        "sdk_version": "0.3.6",
     }
     options = captured["params"].get("options") or {}
     assert options.get("kind") == "short"

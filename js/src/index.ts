@@ -1,6 +1,6 @@
 // ── @agentunion/fastaun-browser 包入口 ──────────────────────────────
 
-export const __version__ = '0.3.5';
+export const __version__ = '0.3.6';
 
 // 客户端
 export { AUNClient } from './client.js';

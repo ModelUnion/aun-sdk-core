@@ -46,6 +46,9 @@ if not _TEST_AUN_PATH:
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip()
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
+_RUN_ID = os.environ.get("AUN_V2_MULTI_DEVICE_RUN_ID", "").strip()
+if not _RUN_ID:
+    _RUN_ID = f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
 
 # ── 多设备辅助（参照 V1 integration_test_e2ee.py） ──────────────
@@ -53,7 +56,7 @@ _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 def _single_domain_device_root(tag: str) -> Path:
     base = Path(_TEST_AUN_PATH)
     parent = base.parent if base.name else base
-    root = parent / "v2-multi-device" / tag
+    root = parent / "v2-multi-device" / _RUN_ID / tag
     root.mkdir(parents=True, exist_ok=True)
     return root
 

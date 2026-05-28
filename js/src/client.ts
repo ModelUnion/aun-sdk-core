@@ -596,6 +596,80 @@ function extractV2EnvelopeFromSource(source: unknown): Record<string, unknown> |
   }
   return null;
 }
+
+function truthyBool(value: unknown): boolean {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
+  }
+  return false;
+}
+
+function isEncryptedEnvelopePayload(payload: unknown): payload is Record<string, unknown> {
+  if (!isJsonObject(payload)) return false;
+  const payloadType = String(payload.type ?? '').trim();
+  if (payloadType.startsWith('e2ee.')) return true;
+  if (!String(payload.ciphertext ?? '').trim()) return false;
+  return payload.nonce !== undefined
+    || payload.tag !== undefined
+    || payload.recipient !== undefined
+    || payload.recipients !== undefined
+    || payload.wrapped_key !== undefined
+    || payload.recipients_digest !== undefined;
+}
+
+function encryptedPushEnvelope(msg: Record<string, unknown>): Record<string, unknown> | null {
+  if (isEncryptedEnvelopePayload(msg.payload)) return msg.payload;
+  if (typeof msg.envelope_json === 'string' && msg.envelope_json.trim()) {
+    try {
+      const parsed = JSON.parse(msg.envelope_json) as unknown;
+      if (isEncryptedEnvelopePayload(parsed)) return parsed;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function isEncryptedPushMessage(msg: Record<string, unknown>): boolean {
+  if (truthyBool(msg.encrypted)) return true;
+  return encryptedPushEnvelope(msg) !== null;
+}
+
+function isV2EncryptedEnvelopePayload(envelope: Record<string, unknown> | null): envelope is Record<string, unknown> {
+  if (!envelope) return false;
+  const payloadType = String(envelope.type ?? '').trim();
+  if (payloadType === 'e2ee.p2p_encrypted' || payloadType === 'e2ee.group_encrypted') return true;
+  return String(envelope.version ?? '').trim().toLowerCase() === 'v2' && payloadType.startsWith('e2ee.');
+}
+
+function safeUndecryptablePushEvent(msg: Record<string, unknown>, group: boolean): Record<string, unknown> {
+  const event: Record<string, unknown> = {
+    message_id: msg.message_id ?? null,
+    from: msg.from ?? null,
+    seq: msg.seq ?? null,
+    timestamp: msg.timestamp ?? msg.t_server ?? null,
+    device_id: msg.device_id ?? null,
+    slot_id: msg.slot_id ?? null,
+    _decrypt_error: 'encrypted push payload is not decryptable on raw push path',
+    _decrypt_stage: 'push_envelope',
+  };
+  if (group) {
+    event.group_id = msg.group_id ?? null;
+  } else {
+    event.to = msg.to ?? null;
+  }
+  const envelope = encryptedPushEnvelope(msg);
+  if (envelope) {
+    event._envelope_type = String(envelope.type ?? '');
+    event._suite = String(envelope.suite ?? '');
+    if (isV2EncryptedEnvelopePayload(envelope)) {
+      attachV2EnvelopeMetadata(event, v2E2eeMeta(envelope));
+    }
+  }
+  return event;
+}
 function metadataWithoutAuth(value: unknown): Record<string, unknown> | null {
   if (!isJsonObject(value)) return null;
   const body: Record<string, unknown> = {};
@@ -1731,7 +1805,7 @@ export class AUNClient {
     // message.pull：V2 就绪时走 V2 pull
     if (method === 'message.pull' && this._v2Session) {
       this._clientLog.debug('call route: message.pull → V2 pull');
-      const messages = await this.pullV2(Number(p.after_seq ?? 0) || 0, Number(p.limit ?? 50) || 50);
+      const messages = await this.pullV2(Number(p.after_seq ?? 0) || 0, Number(p.limit ?? 50) || 50, { force: p.force === true });
       return { messages } as RpcResult;
     }
 
@@ -1866,6 +1940,30 @@ export class AUNClient {
     return result;
   }
 
+  private async _callRawV2Rpc(method: string, params?: RpcParams): Promise<RpcResult> {
+    const p: RpcParams = { ...(params ?? {}) };
+    delete (p as Record<string, unknown>)._pull_gate_locked;
+    delete (p as Record<string, unknown>)._skip_auto_ack;
+    delete (p as Record<string, unknown>).skip_auto_ack;
+    if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
+      p.group_id = normalizeGroupId(String(p.group_id)) || String(p.group_id);
+    }
+    if (method.startsWith('group.') && p.device_id === undefined) {
+      p.device_id = this._deviceId;
+    }
+    if (method.startsWith('group.') && p.slot_id === undefined) {
+      p.slot_id = this._slotId;
+    }
+    if (SIGNED_METHODS.has(method)) {
+      if (this._shouldSkipClientSignature(method, p)) {
+        delete p.client_signature;
+      } else {
+        await this._signClientOperation(method, p);
+      }
+    }
+    return await this._transport.call(method, p);
+  }
+
   // ── 便利方法 ──────────────────────────────────────
 
   async ping(params?: RpcParams): Promise<RpcResult> {
@@ -1920,11 +2018,18 @@ export class AUNClient {
 
       // P2P 空洞检测
       const seq = msg.seq as number | undefined;
+      const encryptedPush = isEncryptedPushMessage(msg);
       if (seq !== undefined && seq !== null && this._aid) {
         const ns = `p2p:${this._aid}`;
         // Push 修上界：先更新 maxSeenSeq
         if (seq > 0) this._seqTracker.updateMaxSeen(ns, seq);
-        const needPull = this._seqTracker.onMessageSeq(ns, seq);
+        const contigBefore = this._seqTracker.getContiguousSeq(ns);
+        const seqNeedsPull = this._seqTracker.onMessageSeq(ns, seq);
+        const published = encryptedPush
+          ? await this._publishEncryptedPushMessage('message.received', 'message.undecryptable', ns, seq, msg, false)
+          : await this._publishOrderedMessage('message.received', ns, seq, msg);
+        const contigAfter = this._seqTracker.getContiguousSeq(ns);
+        const needPull = seqNeedsPull && !published;
         if (needPull) {
           this._safeAsync(this._fillP2pGap());
         }
@@ -1940,14 +2045,13 @@ export class AUNClient {
           }).catch((e) => { this._clientLog.warn(`P2P auto-ack failed:${String(e)}`) });
         }
         // 即时持久化 cursor，异常断连后不回退
-        this._saveSeqTrackerState();
-      }
-
-      // 明文消息直接透传
-      if (seq !== undefined && seq !== null && this._aid) {
-        const ns = `p2p:${this._aid}`;
-        await this._publishOrderedMessage('message.received', ns, seq, msg);
+        if (contigAfter !== contigBefore) this._saveSeqTrackerState();
+        if (encryptedPush) return;
       } else {
+        if (encryptedPush) {
+          await this._publishEncryptedPushMessage('message.received', 'message.undecryptable', '', seq ?? 0, msg, false);
+          return;
+        }
         await this._publishAppEvent('message.received', msg);
       }
     } catch (exc) {
@@ -2064,11 +2168,18 @@ export class AUNClient {
       }
 
       // seq 跟踪 + auto-ack
+      const encryptedPush = isEncryptedPushMessage(msg);
       if (groupId && seq !== undefined && seq !== null) {
         const ns = `group:${groupId}`;
         // Push 修上界：先更新 maxSeenSeq
         if (seq > 0) this._seqTracker.updateMaxSeen(ns, seq);
-        const needPull = this._seqTracker.onMessageSeq(ns, seq);
+        const contigBefore = this._seqTracker.getContiguousSeq(ns);
+        const seqNeedsPull = this._seqTracker.onMessageSeq(ns, seq);
+        const published = encryptedPush
+          ? await this._publishEncryptedPushMessage('group.message_created', 'group.message_undecryptable', ns, seq, msg, true)
+          : await this._publishOrderedMessage('group.message_created', ns, seq, msg);
+        const contigAfter = this._seqTracker.getContiguousSeq(ns);
+        const needPull = seqNeedsPull && !published;
         if (needPull) {
           this._safeAsync(this._fillGroupGap(groupId));
         }
@@ -2083,14 +2194,13 @@ export class AUNClient {
             slot_id: this._slotId,
           }).catch((e) => { this._clientLog.warn('group message auto-ack failed: group=' + groupId, e); });
         }
-        this._saveSeqTrackerState();
-      }
-
-      // 明文消息直接透传
-      if (groupId && seq !== undefined && seq !== null) {
-        const nsKey = `group:${groupId}`;
-        await this._publishOrderedMessage('group.message_created', nsKey, seq, msg);
+        if (contigAfter !== contigBefore) this._saveSeqTrackerState();
+        if (encryptedPush) return;
       } else {
+        if (encryptedPush) {
+          await this._publishEncryptedPushMessage('group.message_created', 'group.message_undecryptable', '', seq ?? 0, msg, true);
+          return;
+        }
         await this._publishAppEvent('group.message_created', msg);
       }
     } catch (exc) {
@@ -2109,6 +2219,68 @@ export class AUNClient {
         await this._publishAppEvent('group.message_undecryptable', safeEvent);
       }
     }
+  }
+
+  private async _decryptEncryptedPushPayload(msg: Record<string, unknown>, group: boolean): Promise<Record<string, unknown> | null> {
+    const envelope = encryptedPushEnvelope(msg);
+    if (!isV2EncryptedEnvelopePayload(envelope)) return null;
+    const aad = isJsonObject(envelope.aad) ? envelope.aad as Record<string, unknown> : {};
+    const fromAid = String(msg.from_aid ?? msg.from ?? msg.sender_aid ?? aad.from ?? '').trim();
+    const plaintext = await this._decryptV2EnvelopeForThought({ envelope, fromAid });
+    if (!plaintext) return null;
+    const e2eeMeta = v2E2eeMeta(envelope);
+    const result: Record<string, unknown> = {
+      message_id: String(msg.message_id ?? ''),
+      from: fromAid,
+      seq: msg.seq ?? null,
+      timestamp: msg.t_server ?? msg.timestamp ?? null,
+      payload: plaintext,
+      encrypted: true,
+      e2ee: e2eeMeta,
+    };
+    result.direction = fromAid && fromAid === this._aid ? 'outbound_sync' : 'inbound';
+    if (msg.t_server !== undefined) result.t_server = msg.t_server;
+    if (msg.device_id !== undefined) result.device_id = msg.device_id;
+    if (msg.slot_id !== undefined) result.slot_id = msg.slot_id;
+    if (group) {
+      result.group_id = msg.group_id ?? aad.group_id ?? envelope.group_id ?? null;
+    } else {
+      result.to = msg.to ?? this._aid ?? '';
+    }
+    attachV2EnvelopeMetadata(result, e2eeMeta);
+    return result;
+  }
+
+  private async _publishEncryptedPushAsUndecryptable(
+    event: string,
+    ns: string,
+    seq: unknown,
+    msg: Record<string, unknown>,
+    group: boolean,
+  ): Promise<boolean> {
+    const safeEvent = safeUndecryptablePushEvent(msg, group) as EventPayload;
+    if (ns) {
+      return this._publishOrderedMessage(event, ns, seq, safeEvent);
+    }
+    await this._publishAppEvent(event, safeEvent);
+    return true;
+  }
+
+  private async _publishEncryptedPushMessage(
+    normalEvent: string,
+    undecryptableEvent: string,
+    ns: string,
+    seq: unknown,
+    msg: Record<string, unknown>,
+    group: boolean,
+  ): Promise<boolean> {
+    const decrypted = await this._decryptEncryptedPushPayload(msg, group);
+    if (decrypted) {
+      if (ns) return this._publishOrderedMessage(normalEvent, ns, seq, decrypted as EventPayload);
+      await this._publishAppEvent(normalEvent, decrypted as EventPayload);
+      return true;
+    }
+    return this._publishEncryptedPushAsUndecryptable(undecryptableEvent, ns, seq, msg, group);
   }
 
   /** 收到不带 payload 的 group.message_created 通知后，自动 pull 最新消息 */
@@ -4347,7 +4519,25 @@ export class AUNClient {
    */
   async initV2Session(): Promise<void> {
     if (!this._aid) return;
-    const identity = this._identity;
+    let identity = this._identity;
+    if (!identity?.private_key_pem) {
+      // fallback：缓存的 identity 可能被 instance_state 污染，重新从 keystore 加载
+      try {
+        const reloaded = await this._keystore.loadIdentity(this._aid);
+        if (reloaded?.private_key_pem) {
+          this._identity = reloaded;
+          identity = reloaded;
+          this._clientLog.warn('V2 session init: identity cache was stale, reloaded from keystore');
+          // 自愈：重新持久化，清理 instance_state 中的脏数据
+          try {
+            const persistIdentity = (this._auth as any)._persistIdentity as ((value: any) => Promise<void>) | undefined;
+            if (typeof persistIdentity === 'function') {
+              await persistIdentity.call(this._auth, reloaded);
+            }
+          } catch { /* best-effort */ }
+        }
+      } catch { /* ignore */ }
+    }
     if (!identity?.private_key_pem) {
       this._clientLog.warn('V2 session init skipped: no AID private key');
       return;
@@ -4715,21 +4905,22 @@ export class AUNClient {
    * @param afterSeq 从此 seq 之后开始拉取（0/省略 = 从当前 contiguous 开始）
    * @param limit 最多拉取条数
    */
-  async pullV2(afterSeq: number = 0, limit: number = 50): Promise<unknown[]> {
+  async pullV2(afterSeq: number = 0, limit: number = 50, opts?: { force?: boolean }): Promise<unknown[]> {
     if (!this._v2Session) {
       throw new StateError('V2 session not initialized (not connected?)');
     }
     const ns = this._aid ? `p2p:${this._aid}` : '';
     const decrypted: unknown[] = [];
-    let nextAfterSeq = afterSeq || (ns ? this._seqTracker.getContiguousSeq(ns) : 0);
+    let nextAfterSeq = opts?.force ? afterSeq : (afterSeq || (ns ? this._seqTracker.getContiguousSeq(ns) : 0));
     let pageCount = 0;
     const maxPages = 100;
 
     while (pageCount < maxPages) {
       pageCount += 1;
-      const result = await this.call('message.v2.pull', {
+      const result = await this._callRawV2Rpc('message.v2.pull', {
         after_seq: nextAfterSeq,
         limit,
+        ...(opts?.force ? { force: true } : {}),
       }) as Record<string, unknown>;
       const messages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
       const seqs = messages
@@ -5044,6 +5235,10 @@ export class AUNClient {
       encrypted: true,
       e2ee: e2ee as JsonValue,
     };
+    const explicitDirection = String(msg.direction ?? '').trim();
+    result.direction = explicitDirection || (fromAid && fromAid === this._aid ? 'outbound_sync' : 'inbound');
+    if (msg.device_id !== undefined) result.device_id = msg.device_id as JsonValue;
+    if (msg.slot_id !== undefined) result.slot_id = msg.slot_id as JsonValue;
     attachV2EnvelopeMetadata(result, e2ee);
     return result;
   }

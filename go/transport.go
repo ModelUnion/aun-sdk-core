@@ -43,7 +43,7 @@ var diagParamFields = []string{
 	"after_seq", "after_event_seq", "seq", "event_seq", "limit", "cursor",
 	"aid", "session_id", "type", "encrypt", "encryption_mode", "suite",
 	"prekey_id", "trust_root_version", "version", "ok", "request_id",
-	"owner_aid", "rotated_by", "action",
+	"owner_aid", "rotated_by", "action", "force",
 }
 
 var diagResultFields = append(append([]string{}, diagParamFields...),
@@ -134,12 +134,12 @@ func NewRPCTransport(dispatcher *EventDispatcher, timeout time.Duration, onDisco
 		timeout = 35 * time.Second
 	}
 	t := &RPCTransport{
-		dispatcher:   dispatcher,
-		onDisconnect: onDisconnect,
-		verifySSL:    verifySSL,
-		pending:      make(map[string]chan map[string]any),
-		closed:       true,
-		rpcSem:       make(chan struct{}, maxRPCInflight),
+		dispatcher:    dispatcher,
+		onDisconnect:  onDisconnect,
+		verifySSL:     verifySSL,
+		pending:       make(map[string]chan map[string]any),
+		closed:        true,
+		rpcSem:        make(chan struct{}, maxRPCInflight),
 		backgroundSem: make(chan struct{}, maxBackgroundRPCInflight),
 	}
 	if len(dnsNet) > 0 {

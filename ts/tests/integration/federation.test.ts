@@ -75,7 +75,7 @@ async function waitFor<T>(
 }
 
 async function pullMessages(client: AUNClient, afterSeq = 0, limit = 50): Promise<Message[]> {
-  const result = await client.call('message.pull', { after_seq: afterSeq, limit }) as JsonObject;
+  const result = await client.call('message.pull', { after_seq: afterSeq, limit, force: true }) as JsonObject;
   return (result.messages ?? []) as Message[];
 }
 

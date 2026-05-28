@@ -66,6 +66,7 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	if limit <= 0 {
 		limit = 50
 	}
+	force := truthyBool(params["force"])
 	c.mu.RLock()
 	myAIDBefore := c.aid
 	c.mu.RUnlock()
@@ -77,7 +78,7 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	if nsBefore != "" {
 		contigBefore = c.seqTracker.GetContiguousSeq(nsBefore)
 	}
-	msgs, err := c.PullV2(ctx, afterSeq, limit)
+	msgs, err := c.pullV2WithForce(ctx, afterSeq, limit, force)
 	if err != nil {
 		return nil, err
 	}

@@ -320,8 +320,13 @@ async def test_group_payload_gap_fill():
         # 3. 等待服务端处理
         await asyncio.sleep(2.0)
 
-        # 4. Bob 拉取所有群消息（直接用 transport 绕过 E2EE 过滤）
-        all_group_msgs = await bob._transport.call("group.pull", {"group_id": group_id, "after_seq": 0, "limit": 50})
+        # 4. Bob 强拉当前可拉范围内的群消息（直接用 transport 绕过 E2EE 过滤）
+        all_group_msgs = await bob._transport.call("group.pull", {
+            "group_id": group_id,
+            "after_seq": 0,
+            "limit": 50,
+            "force": True,
+        })
         all_msgs = all_group_msgs.get("messages", [])
 
         # 5. 验证：应该收到至少 5 条消息

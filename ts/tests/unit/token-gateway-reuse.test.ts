@@ -205,4 +205,40 @@ describe('AuthNamespace._resolveGateway keystore 持久化', () => {
     const result = (client.auth as any)._loadCachedGatewayUrl(aid);
     expect(result).toBe('');
   });
+
+  it('registerAid 成功后应补写 discovery 得到的 gateway_url', async () => {
+    const aid = 'alice-register-cache.test.com';
+    const client = setupClient();
+    (client as any)._gatewayUrl = null;
+    (client as any)._discovery = {
+      discover: vi.fn().mockResolvedValue('wss://discovered-register.test/aun'),
+    };
+    (client as any)._auth.registerAid = vi.fn().mockImplementation(async () => {
+      const safe = aid.replace(/[\/\\:]/g, '_');
+      mkdirSync(join((client as any)._keystore._aidsRoot, safe), { recursive: true });
+      return { aid, cert: 'CERT' };
+    });
+    (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue({ aid });
+
+    await client.auth.registerAid({ aid });
+
+    expect((client.auth as any)._loadCachedGatewayUrl(aid)).toBe('wss://discovered-register.test/aun');
+  });
+
+  it('authenticate 使用内存 gateway_url 时成功后也应补写缓存', async () => {
+    const aid = 'alice-auth-cache.test.com';
+    const client = setupClientWithAid(aid);
+    (client as any)._gatewayUrl = 'wss://memory-auth.test/aun';
+    (client as any)._auth.authenticate = vi.fn().mockResolvedValue({
+      aid,
+      access_token: 'tok',
+      refresh_token: 'ref',
+      gateway: 'wss://memory-auth.test/aun',
+    });
+    (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue({ aid });
+
+    await client.auth.authenticate({ aid });
+
+    expect((client.auth as any)._loadCachedGatewayUrl(aid)).toBe('wss://memory-auth.test/aun');
+  });
 });

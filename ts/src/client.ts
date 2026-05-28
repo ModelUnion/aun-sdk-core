@@ -1697,11 +1697,12 @@ export class AUNClient {
     if (method === 'message.pull' || method === 'message.v2.pull') {
       await this._ensureV2SessionReady('message.pull');
       const skipAutoAck = p._skip_auto_ack === true || p.skip_auto_ack === true;
+      const force = p.force === true;
       const afterSeq = Number(p.after_seq ?? 0) || 0;
       const limit = Number(p.limit ?? 50) || 50;
       const messages = skipAutoAck
-        ? await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { skipAutoAck: true, gateLocked: true }))
-        : await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { gateLocked: true }));
+        ? await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { skipAutoAck: true, gateLocked: true, force }))
+        : await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { gateLocked: true, force }));
       return { messages } as RpcResult;
     }
 
@@ -1997,6 +1998,7 @@ export class AUNClient {
       return;
     }
 
+    const encryptedPush = this._isEncryptedPushMessage(msg);
     // P2P 空洞检测
     const seq = msg.seq as number | undefined;
     if (seq !== undefined && seq !== null && this._aid) {
@@ -2004,7 +2006,9 @@ export class AUNClient {
       // Push 只先更新 maxSeenSeq；contiguous_seq 是已交付游标，必须等应用层发布返回后再推进。
       if (seq > 0) this._seqTracker.updateMaxSeen(ns, seq);
       const contigBefore = this._seqTracker.getContiguousSeq(ns);
-      const published = await this._publishOrderedMessage('message.received', ns, seq, msg);
+      const published = encryptedPush
+        ? await this._publishEncryptedPushMessage('message.received', 'message.undecryptable', ns, seq, msg, false)
+        : await this._publishOrderedMessage('message.received', ns, seq, msg);
       const contigAfter = this._seqTracker.getContiguousSeq(ns);
       const needPull = Number(seq) > contigAfter && !published;
       if (needPull) {
@@ -2023,7 +2027,12 @@ export class AUNClient {
       }
       // 即时持久化 cursor，异常断连后不回退
       if (contigAfter !== contigBefore) this._saveSeqTrackerState();
+      if (encryptedPush) return;
     } else {
+      if (encryptedPush) {
+        await this._publishEncryptedPushMessage('message.received', 'message.undecryptable', '', seq ?? 0, msg, false);
+        return;
+      }
       // V2-only：普通 _raw.message.received 只承载明文；V2 密文由 peer.v2.message_received 通知触发 pull。
       await this._publishAppEvent('message.received', msg, 'push');
     }
@@ -2085,12 +2094,15 @@ export class AUNClient {
       });
       return;
     }
+    const encryptedPush = this._isEncryptedPushMessage(msg);
     if (groupId && seq !== undefined && seq !== null) {
       const ns = `group:${groupId}`;
       // Push 只先更新 maxSeenSeq；contiguous_seq 是已交付游标，必须等应用层发布返回后再推进。
       if (seq > 0) this._seqTracker.updateMaxSeen(ns, seq);
       const contigBefore = this._seqTracker.getContiguousSeq(ns);
-      const published = await this._publishOrderedMessage('group.message_created', ns, seq, msg);
+      const published = encryptedPush
+        ? await this._publishEncryptedPushMessage('group.message_created', 'group.message_undecryptable', ns, seq, msg, true)
+        : await this._publishOrderedMessage('group.message_created', ns, seq, msg);
       const contigAfter = this._seqTracker.getContiguousSeq(ns);
       const needPull = Number(seq) > contigAfter && !published;
       if (needPull) {
@@ -2107,7 +2119,12 @@ export class AUNClient {
             .catch((e) => { this._clientLog.debug(`group message auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
       }
       if (contigAfter !== contigBefore) this._saveSeqTrackerState();
+      if (encryptedPush) return;
     } else {
+      if (encryptedPush) {
+        await this._publishEncryptedPushMessage('group.message_created', 'group.message_undecryptable', '', seq ?? 0, msg, true);
+        return;
+      }
       // V2-only：普通 group.message_created 只承载明文；V2 密文由 group.v2.message_created 通知触发 pull。
       await this._publishAppEvent('group.message_created', msg, 'group-push');
     }
@@ -3985,6 +4002,23 @@ export class AUNClient {
       }
     }
     if (!identity?.private_key_pem) {
+      // fallback：缓存的 identity 可能被 instanceState 污染，重新从 keystore 加载
+      try {
+        identity = this._keystore.loadIdentity(this._aid);
+        if (identity?.private_key_pem) {
+          this._identity = identity;
+          this._clientLog.warn('V2 session init: identity cache was stale, reloaded from keystore');
+          // 重新持久化 instance_state，清理脏数据
+          const persistIdentity = (this._auth as any)._persistIdentity as ((value: IdentityRecord) => void) | undefined;
+          if (typeof persistIdentity === 'function') {
+            try { persistIdentity.call(this._auth, identity); } catch { /* best-effort */ }
+          }
+        }
+      } catch {
+        identity = null;
+      }
+    }
+    if (!identity?.private_key_pem) {
       this._clientLog.warn('V2 session init skipped: no AID private key');
       return;
     }
@@ -4474,7 +4508,7 @@ export class AUNClient {
   async pullV2(
     afterSeq: number = 0,
     limit: number = 50,
-    opts?: { skipAutoAck?: boolean; gateLocked?: boolean; scheduleFollowup?: boolean },
+    opts?: { skipAutoAck?: boolean; gateLocked?: boolean; scheduleFollowup?: boolean; force?: boolean },
   ): Promise<Array<Record<string, unknown>>> {
     await this._ensureV2SessionReady('message.pull');
     const ns = this._aid ? `p2p:${this._aid}` : '';
@@ -4487,7 +4521,7 @@ export class AUNClient {
     }
     const decrypted: Array<Record<string, unknown>> = [];
     let totalRawCount = 0;
-    let nextAfterSeq = afterSeq || (ns ? this._seqTracker.getContiguousSeq(ns) : 0);
+    let nextAfterSeq = opts?.force ? afterSeq : (afterSeq || (ns ? this._seqTracker.getContiguousSeq(ns) : 0));
     let pageCount = 0;
     const maxPages = 100;
 
@@ -4497,6 +4531,7 @@ export class AUNClient {
       const result = await this._callRawV2Rpc('message.v2.pull', {
         after_seq: nextAfterSeq,
         limit,
+        ...(opts?.force ? { force: true } : {}),
       }) as Record<string, unknown>;
       const messages = (Array.isArray(result?.messages) ? result.messages : []) as Array<Record<string, unknown>>;
       totalRawCount += messages.length;
@@ -5198,6 +5233,10 @@ export class AUNClient {
       encrypted: true,
       e2ee,
     };
+    const explicitDirection = String(msg.direction ?? '').trim();
+    result.direction = explicitDirection || (fromAid && fromAid === this._aid ? 'outbound_sync' : 'inbound');
+    if (msg.device_id !== undefined) result.device_id = msg.device_id as JsonValue;
+    if (msg.slot_id !== undefined) result.slot_id = msg.slot_id as JsonValue;
     this._attachV2EnvelopeMetadata(result, e2ee);
     this._logMessageDebug('decrypt-ok', 'v2.decrypt', groupIdForKeys ? 'group.message_created' : 'message.received', result);
     return result;
@@ -5263,6 +5302,149 @@ export class AUNClient {
     }
     return null;
   }
+
+  private _truthyBool(value: unknown): boolean {
+    if (value === true || value === 1) return true;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
+    }
+    return false;
+  }
+
+  private _encryptedPushEnvelope(msg: JsonObject): JsonObject | null {
+    const payload = msg.payload;
+    if (this._isEncryptedEnvelopePayload(payload)) return payload as JsonObject;
+    if (typeof msg.envelope_json === 'string' && msg.envelope_json.trim()) {
+      try {
+        const parsed = JSON.parse(msg.envelope_json) as unknown;
+        if (this._isEncryptedEnvelopePayload(parsed)) return parsed as JsonObject;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private _isEncryptedPushMessage(msg: JsonObject): boolean {
+    if (this._truthyBool(msg.encrypted)) return true;
+    return this._encryptedPushEnvelope(msg) !== null;
+  }
+
+  private _isEncryptedEnvelopePayload(payload: unknown): boolean {
+    if (!isJsonObject(payload as JsonValue | object | null | undefined)) return false;
+    const envelope = payload as JsonObject;
+    const payloadType = String(envelope.type ?? '').trim();
+    if (payloadType.startsWith('e2ee.')) return true;
+    if (!String(envelope.ciphertext ?? '').trim()) return false;
+    return envelope.nonce !== undefined
+      || envelope.tag !== undefined
+      || envelope.recipient !== undefined
+      || envelope.recipients !== undefined
+      || envelope.wrapped_key !== undefined
+      || envelope.recipients_digest !== undefined;
+  }
+
+  private _isV2EncryptedEnvelopePayload(envelope: JsonObject | null): envelope is JsonObject {
+    if (!envelope) return false;
+    const payloadType = String(envelope.type ?? '').trim();
+    if (payloadType === 'e2ee.p2p_encrypted' || payloadType === 'e2ee.group_encrypted') return true;
+    return String(envelope.version ?? '').trim().toLowerCase() === 'v2' && payloadType.startsWith('e2ee.');
+  }
+
+  private _safeUndecryptablePushEvent(msg: JsonObject, group: boolean): JsonObject {
+    const event: JsonObject = {
+      message_id: msg.message_id as JsonValue,
+      from: msg.from as JsonValue,
+      seq: msg.seq as JsonValue,
+      timestamp: (msg.timestamp ?? msg.t_server) as JsonValue,
+      device_id: msg.device_id as JsonValue,
+      slot_id: msg.slot_id as JsonValue,
+      _decrypt_error: 'encrypted push payload is not decryptable on raw push path',
+      _decrypt_stage: 'push_envelope',
+    };
+    if (group) {
+      event.group_id = msg.group_id as JsonValue;
+    } else {
+      event.to = msg.to as JsonValue;
+    }
+    const envelope = this._encryptedPushEnvelope(msg);
+    if (envelope) {
+      event._envelope_type = String(envelope.type ?? '');
+      event._suite = String(envelope.suite ?? '');
+      if (this._isV2EncryptedEnvelopePayload(envelope)) {
+        this._attachV2EnvelopeMetadata(event, this._v2E2eeMeta(envelope));
+      }
+    }
+    return event;
+  }
+
+  private async _decryptEncryptedPushPayload(msg: JsonObject, group: boolean): Promise<JsonObject | null> {
+    const envelope = this._encryptedPushEnvelope(msg);
+    if (!this._isV2EncryptedEnvelopePayload(envelope)) return null;
+    const aad = isJsonObject(envelope.aad as JsonValue | object | null | undefined) ? envelope.aad as JsonObject : {};
+    const fromAid = String(msg.from_aid ?? msg.from ?? msg.sender_aid ?? aad.from ?? '').trim();
+    const plaintext = await this._decryptV2EnvelopeForThought({ envelope, fromAid });
+    if (!plaintext) return null;
+    const e2ee = this._v2E2eeMeta(envelope);
+    const result: JsonObject = {
+      message_id: String(msg.message_id ?? ''),
+      from: fromAid,
+      seq: msg.seq as JsonValue,
+      timestamp: (msg.t_server ?? msg.timestamp) as JsonValue,
+      payload: plaintext as JsonValue,
+      encrypted: true,
+      e2ee,
+    };
+    result.direction = fromAid && fromAid === this._aid ? 'outbound_sync' : 'inbound';
+    if (msg.t_server !== undefined) result.t_server = msg.t_server as JsonValue;
+    if (msg.device_id !== undefined) result.device_id = msg.device_id as JsonValue;
+    if (msg.slot_id !== undefined) result.slot_id = msg.slot_id as JsonValue;
+    if (group) {
+      result.group_id = (msg.group_id ?? aad.group_id ?? envelope.group_id) as JsonValue;
+    } else {
+      result.to = (msg.to ?? this._aid ?? '') as JsonValue;
+    }
+    this._attachV2EnvelopeMetadata(result, e2ee);
+    this._logMessageDebug('decrypt-ok', 'push.encrypted', group ? 'group.message_created' : 'message.received', result);
+    return result;
+  }
+
+  private async _publishEncryptedPushAsUndecryptable(
+    event: string,
+    ns: string,
+    seq: unknown,
+    msg: JsonObject,
+    group: boolean,
+  ): Promise<boolean> {
+    const safeEvent = this._safeUndecryptablePushEvent(msg, group);
+    this._logMessageDebug('decrypt-fail', 'push.encrypted', event, safeEvent);
+    if (ns) {
+      return await this._publishOrderedMessage(event, ns, seq, safeEvent);
+    }
+    const published = this._publishAppEvent(event, safeEvent, 'push');
+    if (isPromiseLike(published)) await published;
+    return true;
+  }
+
+  private async _publishEncryptedPushMessage(
+    normalEvent: string,
+    undecryptableEvent: string,
+    ns: string,
+    seq: unknown,
+    msg: JsonObject,
+    group: boolean,
+  ): Promise<boolean> {
+    const decrypted = await this._decryptEncryptedPushPayload(msg, group);
+    if (decrypted) {
+      if (ns) return await this._publishOrderedMessage(normalEvent, ns, seq, decrypted);
+      const published = this._publishAppEvent(normalEvent, decrypted, 'push');
+      if (isPromiseLike(published)) await published;
+      return true;
+    }
+    return await this._publishEncryptedPushAsUndecryptable(undecryptableEvent, ns, seq, msg, group);
+  }
+
   private _metadataWithoutAuth(value: unknown): JsonObject | null {
     const candidate = value as JsonValue | object | null | undefined;
     if (!isJsonObject(candidate)) return null;

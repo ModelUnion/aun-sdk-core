@@ -8,6 +8,51 @@ import (
 	"time"
 )
 
+func TestEncryptedPushPayloadDetection(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  map[string]any
+		want bool
+	}{
+		{
+			name: "message_encrypted_flag",
+			msg: map[string]any{
+				"encrypted": true,
+				"payload":   map[string]any{"type": "text", "text": "secret"},
+			},
+			want: true,
+		},
+		{
+			name: "legacy_p2p_envelope",
+			msg:  map[string]any{"payload": map[string]any{"type": "e2ee.single", "ciphertext": "x"}},
+			want: true,
+		},
+		{
+			name: "v2_p2p_envelope",
+			msg:  map[string]any{"payload": map[string]any{"type": "e2ee.p2p_encrypted", "ciphertext": "x"}},
+			want: true,
+		},
+		{
+			name: "v2_group_envelope",
+			msg:  map[string]any{"payload": map[string]any{"type": "e2ee.group_encrypted", "ciphertext": "x"}},
+			want: true,
+		},
+		{
+			name: "plaintext_payload",
+			msg:  map[string]any{"encrypted": false, "payload": map[string]any{"type": "text", "text": "hello"}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isEncryptedPushMessage(tt.msg); got != tt.want {
+				t.Fatalf("isEncryptedPushMessage() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestUndecryptableEventOnly 验证解密失败时只发布 message.undecryptable 事件，不泄漏密文 payload
 func TestUndecryptableEventOnly(t *testing.T) {
 	tmpDir := t.TempDir()

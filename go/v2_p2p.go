@@ -214,6 +214,22 @@ func (c *AUNClient) InitV2Session(ctx context.Context) error {
 	}
 	privPEM, _ := identity["private_key_pem"].(string)
 	if privPEM == "" {
+		// fallback：缓存的 identity 可能被 instance_state 污染，重新从 keystore 加载
+		reloaded := c.auth.LoadIdentityOrNil(aid)
+		if reloaded != nil {
+			if p, _ := reloaded["private_key_pem"].(string); p != "" {
+				privPEM = p
+				c.mu.Lock()
+				c.identity = reloaded
+				c.mu.Unlock()
+				identity = reloaded
+				c.logE2.Warn("V2 session init: identity cache was stale, reloaded from keystore")
+				// 自愈：重新持久化，清理 instance_state 中的脏数据
+				_ = c.auth.persistIdentity(reloaded)
+			}
+		}
+	}
+	if privPEM == "" {
 		c.logE2.Warn("V2 session init skipped: no AID private key")
 		return nil
 	}
@@ -857,6 +873,10 @@ func (c *AUNClient) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, m
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（对齐 Python pull_v2）。
 // limit=0 时默认 50。
 func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
+	return c.pullV2WithForce(ctx, afterSeq, limit, false)
+}
+
+func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, error) {
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
 		return nil, errors.New("V2 session not initialized (not connected?)")
@@ -874,15 +894,19 @@ func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]ma
 	}
 
 	effectiveAfterSeq := afterSeq
-	if effectiveAfterSeq == 0 && ns != "" {
+	if !force && effectiveAfterSeq == 0 && ns != "" {
 		effectiveAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 
 	c.logE2.Debug("message.v2.pull request: after_seq=%d limit=%d ns=%s", effectiveAfterSeq, limit, ns)
-	raw, err := c.Call(ctx, "message.v2.pull", map[string]any{
+	pullParams := map[string]any{
 		"after_seq": effectiveAfterSeq,
 		"limit":     limit,
-	})
+	}
+	if force {
+		pullParams["force"] = true
+	}
+	raw, err := c.Call(ctx, "message.v2.pull", pullParams)
 	if err != nil {
 		return nil, err
 	}
@@ -1271,6 +1295,21 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 		"payload":    plaintext,
 		"encrypted":  true,
 		"e2ee":       e2ee,
+	}
+	direction := strings.TrimSpace(v2AsString(msg["direction"]))
+	if direction == "" {
+		if fromAID != "" && fromAID == selfAID {
+			direction = "outbound_sync"
+		} else {
+			direction = "inbound"
+		}
+	}
+	result["direction"] = direction
+	if v, ok := msg["device_id"]; ok {
+		result["device_id"] = v
+	}
+	if v, ok := msg["slot_id"]; ok {
+		result["slot_id"] = v
 	}
 	attachV2EnvelopeMetadata(result, e2ee)
 	if groupIDForKeys != "" {

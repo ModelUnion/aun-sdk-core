@@ -177,6 +177,25 @@ describe('FileSecretStore', () => {
     expect(migratedStore.reveal(aid, 'identity/private_key', protection)!.toString('utf-8')).toBe('GOOD_PRIVATE');
   });
 
+  it('迁移半成品可用 .seed.migrated 兜底解密旧私钥', () => {
+    const oldStore = new FileSecretStore(tmpDir, 'legacy-seed');
+    const aid = 'legacy.agentid.pub';
+    const keyDir = join(tmpDir, 'AIDs', aid, 'private');
+    mkdirSync(keyDir, { recursive: true });
+    writeFileSync(
+      join(keyDir, 'key.json'),
+      JSON.stringify({
+        private_key_protection: oldStore.protect(aid, 'identity/private_key', Buffer.from('LEGACY_PRIVATE')),
+      }),
+      'utf-8',
+    );
+    writeFileSync(join(tmpDir, '.seed.migrated.100'), 'legacy-seed');
+
+    const migratedStore = new FileSecretStore(tmpDir, '');
+    const protection = JSON.parse(readFileSync(join(keyDir, 'key.json'), 'utf-8')).private_key_protection;
+    expect(migratedStore.reveal(aid, 'identity/private_key', protection)!.toString('utf-8')).toBe('LEGACY_PRIVATE');
+  });
+
   it('自动迁移严格验证失败时继续使用旧 .seed', () => {
     const oldStore = new FileSecretStore(tmpDir, 'old-seed');
     const otherStore = new FileSecretStore(tmpDir, 'other-seed');

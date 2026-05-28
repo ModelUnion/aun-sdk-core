@@ -26,6 +26,8 @@
 - [register_aid()](#await-register_aidparams-dict---dict) - 注册新 AID
 - [check_aid()](#await-check_aidparams-dict---dict) - 检查 AID 状态（本地完整性 + 远程注册）
 - [authenticate()](#await-authenticateparams-dict--none---dict) - 认证获取令牌
+- [load_identity()](#load_identityparams-dict--none--none---dict) - 只读加载本地身份
+- [fetch_peer_cert()](#await-fetch_peer_certparams-dict---str) - 获取对端证书
 - [sign_agent_md()](#await-sign_agent_mdcontent-str-aid-str--none---str) - 为 agent.md 生成尾部签名 **（已 deprecated，建议改用 `client.publish_agent_md`）**
 - [verify_agent_md()](#await-verify_agent_mdcontent-str-aid-str--none-cert_pem-str--none---dict) - 验证 agent.md 尾部签名 **（已 deprecated，建议改用 `client.fetch_agent_md`）**
 - [upload_agent_md()](#await-upload_agent_mdcontent-str---dict) - 上传自己的 agent.md **（已 deprecated，建议改用 `client.publish_agent_md`）**
@@ -791,6 +793,69 @@ auth = await client.auth.authenticate({"aid": MY_AID})
 
 ---
 
+### `load_identity(params: dict | None = None) -> dict`
+
+只读加载本地已注册身份（密钥对 + 证书 + 实例状态）。纯本地操作，无网络请求，无副作用。
+
+**参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `aid` | `str` | 否 | 指定 AID；不传则使用当前 AID |
+
+**返回值**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `aid` | `str` | AID 标识 |
+| `private_key_pem` | `str` | 私钥 PEM |
+| `public_key_der_b64` | `str` | 公钥 DER Base64 |
+| `cert` | `str` | 证书 PEM（如已签发） |
+| `access_token` | `str` | 缓存的 access_token（如有） |
+
+**异常**：本地无完整身份时抛 `StateError`。
+
+```python
+identity = client.auth.load_identity({"aid": "alice.example.com"})
+```
+
+**OrNone 变体**：`load_identity_or_none(params)` — 不存在时返回 `None` 而非抛异常。
+
+| 语言 | 方法名 |
+|------|--------|
+| Python | `client.auth.load_identity()` / `client.auth.load_identity_or_none()` |
+| TypeScript | `client.auth.loadIdentity()` / `client.auth.loadIdentityOrNull()` |
+| JavaScript | `await client.auth.loadIdentity()` / `await client.auth.loadIdentityOrNull()` |
+| Go | `client.Auth.LoadIdentity(aid)` / `client.Auth.LoadIdentityOrNil(aid)` |
+
+---
+
+### `await fetch_peer_cert(params: dict) -> str`
+
+获取对端 AID 的证书 PEM。优先走本地 `public/certs/` 缓存，未命中时通过 PKI HTTP 端点下载并做完整链验证后落缓存。
+
+**参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `aid` | `str` | 是 | 对端 AID |
+| `cert_fingerprint` | `str` | 否 | 指定证书指纹（用于精确匹配特定版本） |
+
+**返回值**：证书 PEM 字符串。
+
+```python
+cert_pem = await client.auth.fetch_peer_cert({"aid": "bob.example.com"})
+```
+
+| 语言 | 方法名 |
+|------|--------|
+| Python | `await client.auth.fetch_peer_cert(params)` |
+| TypeScript | `await client.auth.fetchPeerCert(params)` |
+| JavaScript | `await client.auth.fetchPeerCert(params)` |
+| Go | `client.Auth.FetchPeerCert(ctx, aid, certFingerprint)` |
+
+---
+
 ### `await sign_agent_md(content: str, aid: str | None = None) -> str`
 
 > **⚠️ Deprecated。** 主要场景请改用 `client.publish_agent_md(path)`，它内部已包含读文件 + 签名 + 上传一整套流程。`sign_agent_md` 仅作为离线签名（先签名后异步发布、给非 SDK 渠道发送等）的底层工具继续保留，未来版本将移除。
@@ -1330,6 +1395,25 @@ GroupE2EEManager(
 | `token.refreshed` | 访问令牌已刷新 | `{"aid": "..."}` |
 | `token.refresh_exhausted` | Token 刷新重试耗尽 | `{"aid": "...", "consecutive_failures": N}` |
 | `notification` | 未分类推送通知 | 原始消息体 |
+
+### `message.undecryptable` / `group.message_undecryptable` 详细 payload
+
+当 SDK 收到加密推送消息但无法解密时（缺少私钥、SPK 过期、信封格式不支持等），触发此事件。payload 包含足够的元数据供应用层展示"无法解密"占位或触发密钥修复流程。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `message_id` | `str` | 消息 ID |
+| `from` | `str` | 发送方 AID |
+| `seq` | `int` | 消息序号 |
+| `timestamp` | `int` | 时间戳（优先 `t_server`） |
+| `device_id` | `str` | 发送方设备 ID |
+| `slot_id` | `str` | 发送方 slot ID |
+| `to` | `str` | 接收方 AID（仅 P2P） |
+| `group_id` | `str` | 群组 ID（仅群消息） |
+| `_decrypt_error` | `str` | 解密失败原因描述 |
+| `_decrypt_stage` | `str` | 失败阶段（`push_envelope` / `v2_decrypt`） |
+| `_envelope_type` | `str` | 信封类型（如 `e2ee.p2p_encrypted`） |
+| `_suite` | `str` | 加密套件标识 |
 
 ---
 

@@ -341,7 +341,10 @@ async def test_local_gateway_full_auth_and_connect(tmp_path, local_gateway: Loca
         assert any(token == auth["access_token"] for token in local_gateway.state.connect_tokens)
         connect_request = local_gateway.state.connect_requests[-1]
         assert connect_request["device"] == {"id": client._device_id, "type": "sdk"}
-        assert connect_request["client"] == {"slot_id": "slot-a"}
+        connect_client = connect_request["client"]
+        assert connect_client["slot_id"] == "slot-a"
+        assert connect_client["sdk_lang"] == "python"
+        assert isinstance(connect_client["sdk_version"], str) and connect_client["sdk_version"]
         assert connect_request["delivery_mode"] == {
             "mode": "queue",
             "routing": "sender_affinity",

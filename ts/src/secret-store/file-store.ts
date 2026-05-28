@@ -24,6 +24,7 @@ import {
   unlinkSync,
   renameSync,
   readdirSync,
+  statSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -265,20 +266,20 @@ export class FileSecretStore implements SecretStore {
     const tagB64 = String(record.tag ?? '');
     if (!nonceB64 || !ctB64 || !tagB64) return null;
 
-    const key = this._deriveKey(scope, name);
+    const decrypted = tryDecryptWithKey(this._masterKey, scope, name, record);
+    if (decrypted) return decrypted;
 
-    try {
-      const decipher = createDecipheriv('aes-256-gcm', key, decodeSecretPart(nonceB64));
-      decipher.setAuthTag(decodeSecretPart(tagB64));
-      const decrypted = Buffer.concat([
-        decipher.update(decodeSecretPart(ctB64)),
-        decipher.final(),
-      ]);
-      return decrypted;
-    } catch (exc) {
-      this._logger.error(`field decryption failed (scope=${scope}, name=${name}): ${exc instanceof Error ? exc.message : String(exc)}`, exc instanceof Error ? exc : undefined);
-      return null;
+    const migratedSeeds = this._loadMigratedSeedFiles();
+    for (const item of migratedSeeds) {
+      const legacy = tryDecryptWithKey(deriveMasterKey(item.seed), scope, name, record);
+      if (legacy) {
+        this._logger.warn(`field decrypted with migrated .seed fallback (scope=${scope}, name=${name}, seed_file=${item.name})`);
+        return legacy;
+      }
     }
+
+    this._logger.error(`field decryption failed (scope=${scope}, name=${name}); tried current seed and ${migratedSeeds.length} migrated seed file(s)`);
+    return null;
   }
 
   /** 使用 HMAC-SHA256 从主密钥派生子密钥 */
@@ -300,6 +301,26 @@ export class FileSecretStore implements SecretStore {
     } catch (exc) {
       this._logger.warn(`seed migration failed; continuing with legacy .seed: ${exc instanceof Error ? exc.message : String(exc)}`);
       return oldSeedBytes;
+    }
+  }
+
+  /**
+   * 兼容半迁移状态：.seed 已被重命名为 .seed.migrated.*，但 key.json
+   * 仍是旧 seed 加密。只作为解密兜底，不会主动创建新 .seed。
+   */
+  private _loadMigratedSeedFiles(): Array<{ name: string; seed: Buffer }> {
+    try {
+      return readdirSync(this._root, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.startsWith('.seed.migrated.'))
+        .map((entry) => {
+          const path = join(this._root, entry.name);
+          return { name: entry.name, path, mtimeMs: statSync(path).mtimeMs };
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .map((entry) => ({ name: entry.name, seed: readFileSync(entry.path) }))
+        .filter((entry) => entry.seed.length > 0);
+    } catch {
+      return [];
     }
   }
 

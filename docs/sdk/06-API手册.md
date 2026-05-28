@@ -1390,6 +1390,25 @@ GroupE2EEManager(
 | `token.refresh_exhausted` | Token 刷新重试耗尽 | `{"aid": "...", "consecutive_failures": N}` |
 | `notification` | 未分类推送通知 | 原始消息体 |
 
+### `message.undecryptable` / `group.message_undecryptable` 详细 payload
+
+当 SDK 收到加密推送消息但无法解密时（缺少私钥、SPK 过期、信封格式不支持等），触发此事件。payload 包含足够的元数据供应用层展示"无法解密"占位或触发密钥修复流程。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `message_id` | `str` | 消息 ID |
+| `from` | `str` | 发送方 AID |
+| `seq` | `int` | 消息序号 |
+| `timestamp` | `int` | 时间戳（优先 `t_server`） |
+| `device_id` | `str` | 发送方设备 ID |
+| `slot_id` | `str` | 发送方 slot ID |
+| `to` | `str` | 接收方 AID（仅 P2P） |
+| `group_id` | `str` | 群组 ID（仅群消息） |
+| `_decrypt_error` | `str` | 解密失败原因描述 |
+| `_decrypt_stage` | `str` | 失败阶段（`push_envelope` / `v2_decrypt`） |
+| `_envelope_type` | `str` | 信封类型（如 `e2ee.p2p_encrypted`） |
+| `_suite` | `str` | 加密套件标识 |
+
 ---
 
 ## RPC 方法参考

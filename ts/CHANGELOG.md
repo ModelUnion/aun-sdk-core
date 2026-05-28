@@ -6,6 +6,24 @@
 
 ---
 
+## 0.3.6 — 2026-05-28
+
+### Added
+- **Encrypted push 解密管线**：收到加密推送时即时尝试 V2 解密，成功则发 `message.received` / `group.message_created`（含明文 payload + e2ee 元数据），失败则发 `message.undecryptable` / `group.message_undecryptable`（含诊断字段 `_decrypt_error` / `_decrypt_stage` / `_envelope_type`）
+- **`auth.fetchPeerCert(gatewayUrl, aid)`**：公开 API 实现落地（v0.3.5 声明，v0.3.6 实现独立方法体）
+- **`storage.get_limits` RPC**：查询上传限制和配额使用情况
+- **`storage.check_upload` RPC**：上传预检（秒传检测 + 超限检测）
+
+### Fixed
+- **Identity cache 自愈**：V2 session init 时检测 `private_key_pem` 缺失，自动从 keystore 重新加载并清理脏 instance_state
+- **`loadIdentity` 字段白名单**：只合并 `_INSTANCE_STATE_FIELDS` 定义的字段，防止 instance_state 表中的脏数据覆盖核心字段
+- **`.seed.migrated` 兼容**：`FileSecretStore` 解密失败时自动尝试 `.seed.migrated.*` 文件作为 fallback（半迁移状态兼容）
+
+### Changed
+- **Auth namespace gateway_url 持久化**：`registerAid` / `authenticate` 成功后自动持久化 gateway_url 到 instance_state
+
+---
+
 ## 0.3.5 — 2026-05-28
 
 ### Breaking Changes

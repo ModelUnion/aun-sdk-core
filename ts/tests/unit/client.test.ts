@@ -14,6 +14,9 @@ import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, PermissionError, StateError, ValidationError } from '../../src/errors.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
 import { computeStateCommitment } from '../../src/v2/state/index.js';
+import { encryptP2PMessage } from '../../src/v2/e2ee/encrypt-p2p.js';
+import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group.js';
+import { generateP256Keypair } from '../../src/v2/crypto/ecdh.js';
 
 function keyIdForBytes(bytes: Uint8Array): string {
   return `sha256:${createHash('sha256').update(Buffer.from(bytes)).digest('hex').slice(0, 16)}`;
@@ -1182,6 +1185,92 @@ describe('AUNClient E2EE V2-only 编排', () => {
       protected_headers: { payload_type: 'text', trace_id: 'trace-1' },
     }));
   });
+
+  it('P2P V2 pull 解密结果应补齐方向和实例元数据', async () => {
+    const client = makeV2Client();
+    const [senderIkPriv, senderIkPubDer] = generateP256Keypair();
+    const [recipientIkPriv, recipientIkPubDer] = generateP256Keypair();
+    const sender = {
+      aid: 'bob.aid.com',
+      deviceId: 'bob-dev',
+      ikPriv: senderIkPriv,
+      ikPubDer: senderIkPubDer,
+    };
+    const target = {
+      aid: 'alice.aid.com',
+      deviceId: 'device-001',
+      role: 'peer',
+      keySource: 'aid_master',
+      ikPkDer: recipientIkPubDer,
+    };
+    const envelope = encryptP2PMessage(sender, { targets: [target] }, { type: 'text', text: 'decrypted' });
+    (client as any)._v2Session = {
+      getDecryptKeys: vi.fn(() => ({ ikPriv: recipientIkPriv, spkPriv: undefined })),
+      isLastUploadedSPK: vi.fn(() => false),
+    };
+    (client as any)._getV2SenderPubDer = vi.fn().mockResolvedValue(senderIkPubDer);
+
+    const result = await (client as any)._decryptV2Message({
+      seq: 1,
+      message_id: 'm1',
+      from_aid: 'bob.aid.com',
+      envelope_json: JSON.stringify(envelope),
+      t_server: 123,
+      device_id: 'device-001',
+      slot_id: 'slot-a',
+    });
+
+    expect(result).toMatchObject({
+      payload: { type: 'text', text: 'decrypted' },
+      direction: 'inbound',
+      device_id: 'device-001',
+      slot_id: 'slot-a',
+    });
+  });
+
+  it('Group V2 pull 解密结果应补齐方向和实例元数据', async () => {
+    const client = makeV2Client();
+    const [senderIkPriv, senderIkPubDer] = generateP256Keypair();
+    const [recipientIkPriv, recipientIkPubDer] = generateP256Keypair();
+    const sender = {
+      aid: 'bob.aid.com',
+      deviceId: 'bob-dev',
+      ikPriv: senderIkPriv,
+      ikPubDer: senderIkPubDer,
+    };
+    const target = {
+      aid: 'alice.aid.com',
+      deviceId: 'device-001',
+      role: 'member',
+      keySource: 'aid_master',
+      ikPkDer: recipientIkPubDer,
+    };
+    const envelope = encryptGroupMessage(sender, 'g1', 0, [target], { type: 'group-text', text: 'decrypted' });
+    (client as any)._v2Session = {
+      getGroupDecryptKeys: vi.fn(() => ({ ikPriv: recipientIkPriv, spkPriv: undefined })),
+      isLastUploadedGroupSPK: vi.fn(() => false),
+    };
+    (client as any)._getV2SenderPubDer = vi.fn().mockResolvedValue(senderIkPubDer);
+
+    const result = await (client as any)._decryptV2Message({
+      seq: 1,
+      message_id: 'gm1',
+      from_aid: 'bob.aid.com',
+      group_id: 'g1',
+      envelope_json: JSON.stringify(envelope),
+      t_server: 123,
+      device_id: 'device-001',
+      slot_id: 'slot-a',
+    });
+
+    expect(result).toMatchObject({
+      payload: { type: 'group-text', text: 'decrypted' },
+      direction: 'inbound',
+      device_id: 'device-001',
+      slot_id: 'slot-a',
+    });
+  });
+
   it('message.v2.pull 批量消息只 ack 一次最终 contiguous_seq', async () => {
     const client = makeV2Client();
     const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
@@ -1211,6 +1300,27 @@ describe('AUNClient E2EE V2-only 编排', () => {
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
     expect(result.map((msg) => msg.seq)).toEqual([1, 2, 3]);
     expect(ackCalls).toEqual([['message.v2.ack', { up_to_seq: 3 }, undefined, undefined, true]]);
+  });
+
+  it('message.pull(force=true) 应透传 force 且不改写显式 after_seq=0', async () => {
+    const client = makeV2Client();
+    const ns = 'p2p:alice.aid.com';
+    (client as any)._seqTracker.forceContiguousSeq(ns, 9);
+    const transportCall = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'message.v2.pull') {
+        return { has_more: false, messages: [] };
+      }
+      return { ok: true };
+    });
+    (client as any)._transport.call = transportCall;
+
+    await client.call('message.pull', { after_seq: 0, limit: 10, force: true });
+
+    const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
+    expect(pullCalls).toEqual([
+      ['message.v2.pull', { after_seq: 0, limit: 10, force: true }, undefined, undefined, true],
+    ]);
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(9);
   });
 
   it('_fillP2pGap 在 V2 路径应跳过 pull 内部 auto-ack，并在发布后只 ack 一次', async () => {
@@ -2753,6 +2863,196 @@ describe('有序消息发布', () => {
     expect(published).toEqual([]);
   });
 
+  it('P2P raw 加密 push 应先尝试就地解密，成功后发布普通消息事件', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+    (client as any)._decryptV2EnvelopeForThought = vi.fn().mockResolvedValue({ type: 'text', text: 'decrypted' });
+
+    const received: any[] = [];
+    const undecryptable: any[] = [];
+    client.on('message.received', (payload: any) => received.push(payload));
+    client.on('message.undecryptable', (payload: any) => undecryptable.push(payload));
+
+    await (client as any)._processAndPublishMessage({
+      message_id: 'm-raw-encrypted-ok',
+      from: 'bob.aid.com',
+      to: 'alice.aid.com',
+      seq: 1,
+      timestamp: 123,
+      payload: {
+        type: 'e2ee.p2p_encrypted',
+        version: 'v2',
+        suite: 'P256_HKDF_SHA256_AES_256_GCM',
+        payload_type: 'text',
+        protected_headers: { payload_type: 'text', trace_id: 'trace-1', _auth: 'secret' },
+        aad: { from: 'bob.aid.com', from_device: 'bob-dev' },
+        recipients: [['alice.aid.com', 'dev-1', 'peer', 'peer_device_prekey', 'fp', 'spk-1']],
+        ciphertext: 'ciphertext',
+      },
+    });
+
+    expect((client as any)._decryptV2EnvelopeForThought).toHaveBeenCalled();
+    expect(undecryptable).toEqual([]);
+    expect(received).toHaveLength(1);
+    expect(received[0].payload).toEqual({ type: 'text', text: 'decrypted' });
+    expect(received[0]).not.toMatchObject({ payload: expect.objectContaining({ ciphertext: 'ciphertext' }) });
+    expect(received[0].direction).toBe('inbound');
+    expect(received[0].payload_type).toBe('text');
+    expect(received[0].protected_headers).toEqual({ payload_type: 'text', trace_id: 'trace-1' });
+  });
+
+  it('P2P raw 加密 self push 应标记 outbound_sync', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+    (client as any)._decryptV2EnvelopeForThought = vi.fn().mockResolvedValue({ type: 'text', text: 'self-copy' });
+
+    const received: any[] = [];
+    client.on('message.received', (payload: any) => received.push(payload));
+
+    await (client as any)._processAndPublishMessage({
+      message_id: 'm-raw-encrypted-self',
+      from: 'alice.aid.com',
+      to: 'alice.aid.com',
+      seq: 1,
+      timestamp: 123,
+      payload: {
+        type: 'e2ee.p2p_encrypted',
+        version: 'v2',
+        suite: 'P256_HKDF_SHA256_AES_256_GCM',
+        payload_type: 'text',
+        aad: { from: 'alice.aid.com', from_device: 'alice-main' },
+        recipients: [['alice.aid.com', 'dev-1', 'self_sync', 'peer_device_prekey', 'fp', 'spk-1']],
+        ciphertext: 'ciphertext',
+      },
+    });
+
+    expect(received).toHaveLength(1);
+    expect(received[0].payload).toEqual({ type: 'text', text: 'self-copy' });
+    expect(received[0].direction).toBe('outbound_sync');
+  });
+
+  it('P2P raw 加密 push 无法就地解密时只应发布 header-only undecryptable 事件', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+
+    const received: any[] = [];
+    const undecryptable: any[] = [];
+    client.on('message.received', (payload: any) => received.push(payload));
+    client.on('message.undecryptable', (payload: any) => undecryptable.push(payload));
+
+    await (client as any)._processAndPublishMessage({
+      message_id: 'm-raw-encrypted',
+      from: 'bob.aid.com',
+      to: 'alice.aid.com',
+      seq: 1,
+      timestamp: 123,
+      encrypted: true,
+      payload: {
+        type: 'e2ee.p2p_encrypted',
+        version: 'v2',
+        suite: 'P256_HKDF_SHA256_AES_256_GCM',
+        payload_type: 'text',
+        protected_headers: { payload_type: 'text', trace_id: 'trace-1', _auth: 'secret' },
+        ciphertext: 'ciphertext',
+      },
+    });
+
+    expect(received).toEqual([]);
+    expect(undecryptable).toHaveLength(1);
+    expect(undecryptable[0]).not.toHaveProperty('payload');
+    expect(undecryptable[0]).toEqual(expect.objectContaining({
+      message_id: 'm-raw-encrypted',
+      from: 'bob.aid.com',
+      to: 'alice.aid.com',
+      seq: 1,
+      payload_type: 'text',
+      protected_headers: { payload_type: 'text', trace_id: 'trace-1' },
+      _decrypt_stage: 'push_envelope',
+    }));
+  });
+
+  it('group raw 加密 push 应先尝试就地解密，成功后发布普通群消息事件', async () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+    (client as any)._decryptV2EnvelopeForThought = vi.fn().mockResolvedValue({ type: 'text', text: 'group-decrypted' });
+
+    const created: any[] = [];
+    const undecryptable: any[] = [];
+    client.on('group.message_created', (payload: any) => created.push(payload));
+    client.on('group.message_undecryptable', (payload: any) => undecryptable.push(payload));
+
+    await (client as any)._processAndPublishGroupMessage({
+      message_id: 'gm-raw-encrypted-ok',
+      group_id: 'g1',
+      from: 'bob.aid.com',
+      seq: 1,
+      timestamp: 123,
+      payload: {
+        type: 'e2ee.group_encrypted',
+        version: 'v2',
+        suite: 'P256_HKDF_SHA256_AES_256_GCM',
+        payload_type: 'group-text',
+        protected_headers: { payload_type: 'group-text', trace_id: 'trace-g1', _auth: 'secret' },
+        aad: { from: 'bob.aid.com', from_device: 'bob-dev', group_id: 'g1' },
+        recipients: [['alice.aid.com', 'dev-1', 'peer', 'group_device_prekey', 'fp', 'spk-1']],
+        ciphertext: 'ciphertext',
+      },
+    });
+
+    expect((client as any)._decryptV2EnvelopeForThought).toHaveBeenCalled();
+    expect(undecryptable).toEqual([]);
+    expect(created).toHaveLength(1);
+    expect(created[0].payload).toEqual({ type: 'text', text: 'group-decrypted' });
+    expect(created[0]).not.toMatchObject({ payload: expect.objectContaining({ ciphertext: 'ciphertext' }) });
+    expect(created[0].direction).toBe('inbound');
+    expect(created[0].payload_type).toBe('group-text');
+    expect(created[0].protected_headers).toEqual({ payload_type: 'group-text', trace_id: 'trace-g1' });
+  });
+
+  it('group raw 加密 self push 应标记 outbound_sync', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+    (client as any)._decryptV2EnvelopeForThought = vi.fn().mockResolvedValue({ type: 'group-text', text: 'self-group' });
+
+    const created: any[] = [];
+    client.on('group.message_created', (payload: any) => created.push(payload));
+
+    await (client as any)._processAndPublishGroupMessage({
+      message_id: 'gm-raw-encrypted-self',
+      group_id: 'g1',
+      from: 'alice.aid.com',
+      seq: 1,
+      timestamp: 123,
+      payload: {
+        type: 'e2ee.group_encrypted',
+        version: 'v2',
+        suite: 'P256_HKDF_SHA256_AES_256_GCM',
+        payload_type: 'group-text',
+        aad: { from: 'alice.aid.com', from_device: 'alice-main', group_id: 'g1' },
+        recipients: [['alice.aid.com', 'dev-1', 'self_sync', 'group_device_prekey', 'fp', 'spk-1']],
+        ciphertext: 'ciphertext',
+      },
+    });
+
+    expect(created).toHaveLength(1);
+    expect(created[0].payload).toEqual({ type: 'group-text', text: 'self-group' });
+    expect(created[0].direction).toBe('outbound_sync');
+  });
+
   it('group push 明确带其它 slot 时仍应投递且不覆盖实例字段', async () => {
     const client = new AUNClient();
     (client as any)._deviceId = 'dev-1';
@@ -2774,6 +3074,47 @@ describe('有序消息发布', () => {
     expect(published).toHaveLength(1);
     expect(published[0].device_id).toBe('dev-2');
     expect(published[0].slot_id).toBe('slot-b');
+  });
+
+  it('group raw 加密 push 无法就地解密时只应发布 header-only undecryptable 事件', async () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'dev-1';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({});
+
+    const created: any[] = [];
+    const undecryptable: any[] = [];
+    client.on('group.message_created', (payload: any) => created.push(payload));
+    client.on('group.message_undecryptable', (payload: any) => undecryptable.push(payload));
+
+    await (client as any)._processAndPublishGroupMessage({
+      message_id: 'gm-raw-encrypted',
+      group_id: 'g1',
+      from: 'bob.aid.com',
+      seq: 1,
+      timestamp: 123,
+      payload: {
+        type: 'e2ee.group_encrypted',
+        version: 'v2',
+        suite: 'P256_HKDF_SHA256_AES_256_GCM',
+        payload_type: 'group-text',
+        protected_headers: { payload_type: 'group-text', trace_id: 'trace-g1', _auth: 'secret' },
+        ciphertext: 'ciphertext',
+      },
+    });
+
+    expect(created).toEqual([]);
+    expect(undecryptable).toHaveLength(1);
+    expect(undecryptable[0]).not.toHaveProperty('payload');
+    expect(undecryptable[0]).toEqual(expect.objectContaining({
+      message_id: 'gm-raw-encrypted',
+      group_id: 'g1',
+      from: 'bob.aid.com',
+      seq: 1,
+      payload_type: 'group-text',
+      protected_headers: { payload_type: 'group-text', trace_id: 'trace-g1' },
+      _decrypt_stage: 'push_envelope',
+    }));
   });
 
   it('seq tracker 上下文切换时应清空有序待发布队列', () => {

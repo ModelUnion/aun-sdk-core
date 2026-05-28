@@ -356,6 +356,8 @@ async def test_group_peer_prekey_fallback_does_not_rotate_p2p_spk(tmp_path, monk
 
     assert result["payload"] == {"text": "group fallback"}
     assert result2["payload"] == {"text": "group fallback"}
+    assert result["direction"] == "inbound"
+    assert result2["direction"] == "inbound"
     assert fake_session.rotate_called is False
     assert fake_session.register_calls == ["group.agentid.pub/1"]
 
@@ -423,12 +425,17 @@ async def test_decrypt_v2_message_exposes_payload_type_in_e2ee(tmp_path, monkeyp
         "from_aid": "bob.agentid.pub",
         "envelope_json": json.dumps(envelope),
         "t_server": 123,
+        "device_id": "dev-1",
+        "slot_id": "slot-a",
     })
 
     assert result["payload"] == {"type": "text", "text": "decrypted"}
     assert result["payload_type"] == "text"
     assert result["protected_headers"] == {"payload_type": "text"}
     assert result["e2ee"]["payload_type"] == "text"
+    assert result["direction"] == "inbound"
+    assert result["device_id"] == "dev-1"
+    assert result["slot_id"] == "slot-a"
 
 @pytest.mark.asyncio
 async def test_decrypt_v2_message_undecryptable_event_preserves_metadata(tmp_path):
@@ -1590,6 +1597,35 @@ async def test_v2_p2p_pull_batches_auto_ack_once_with_final_contiguous_seq():
     ack_calls = [(method, params) for method, params in calls if method == "message.v2.ack"]
     assert [msg["seq"] for msg in result["messages"]] == [1, 2, 3]
     assert ack_calls == [("message.v2.ack", {"up_to_seq": 3})]
+
+
+@pytest.mark.asyncio
+async def test_v2_p2p_pull_force_true_passthrough_keeps_explicit_after_zero():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._persist_seq = lambda ns: None
+    client._seq_tracker.force_contiguous_seq("p2p:alice.agentid.pub", 9)
+    calls: list[tuple[str, dict]] = []
+
+    class _Transport:
+        async def call(self, method, params, **kwargs):
+            calls.append((method, dict(params)))
+            if method == "message.v2.pull":
+                return {"has_more": False, "messages": []}
+            return {"ok": True}
+
+    client._transport = _Transport()
+
+    result = await client.call("message.pull", {"after_seq": 0, "limit": 10, "force": True})
+
+    pull_calls = [(method, params) for method, params in calls if method == "message.v2.pull"]
+    assert pull_calls == [("message.v2.pull", {"after_seq": 0, "limit": 10, "force": True})]
+    assert result["messages"] == []
+    assert client._seq_tracker.get_contiguous_seq("p2p:alice.agentid.pub") == 9
 
 
 @pytest.mark.asyncio
@@ -3785,6 +3821,272 @@ async def test_p2p_push_ignores_other_slot_context(tmp_path):
 
     assert published == []
     assert not client._decrypt_single_message.called
+
+
+@pytest.mark.asyncio
+async def test_p2p_raw_encrypted_push_attempts_inline_decrypt_first(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "p2p_raw_encrypted_ok")})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+    client._transport.call = AsyncMock(return_value={})
+    client._decrypt_v2_envelope_for_thought = AsyncMock(return_value=None)
+    client._decrypt_v2_envelope_for_thought = AsyncMock(return_value={"type": "text", "text": "decrypted"})
+
+    received: list[dict] = []
+    undecryptable: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: received.append(data))
+    client._dispatcher.subscribe("message.undecryptable", lambda data: undecryptable.append(data))
+
+    await client._process_and_publish_message({
+        "message_id": "m-raw-encrypted-ok",
+        "from": "bob.aid.com",
+        "to": "alice.aid.com",
+        "seq": 1,
+        "timestamp": 123,
+        "payload": {
+            "type": "e2ee.p2p_encrypted",
+            "version": "v2",
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "payload_type": "text",
+            "protected_headers": {"payload_type": "text", "trace_id": "trace-1", "_auth": "secret"},
+            "aad": {"from": "bob.aid.com", "from_device": "bob-dev"},
+            "recipients": [["alice.aid.com", "dev-1", "peer", "peer_device_prekey", "fp", "spk-1"]],
+            "ciphertext": "ciphertext",
+        },
+    })
+    await asyncio.sleep(0)
+
+    assert client._decrypt_v2_envelope_for_thought.called
+    assert undecryptable == []
+    assert len(received) == 1
+    assert received[0]["payload"] == {"type": "text", "text": "decrypted"}
+    assert received[0]["direction"] == "inbound"
+    assert received[0]["payload_type"] == "text"
+    assert received[0]["protected_headers"] == {"payload_type": "text", "trace_id": "trace-1"}
+
+
+@pytest.mark.asyncio
+async def test_p2p_raw_encrypted_self_push_marks_outbound_sync(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "p2p_raw_encrypted_self")})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+    client._transport.call = AsyncMock(return_value={})
+    client._decrypt_v2_envelope_for_thought = AsyncMock(return_value={"type": "text", "text": "self-copy"})
+
+    received: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: received.append(data))
+
+    await client._process_and_publish_message({
+        "message_id": "m-raw-encrypted-self",
+        "from": "alice.aid.com",
+        "to": "alice.aid.com",
+        "seq": 1,
+        "timestamp": 123,
+        "payload": {
+            "type": "e2ee.p2p_encrypted",
+            "version": "v2",
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "payload_type": "text",
+            "aad": {"from": "alice.aid.com", "from_device": "dev-main"},
+            "recipients": [["alice.aid.com", "dev-1", "self_sync", "peer_device_prekey", "fp", "spk-1"]],
+            "ciphertext": "ciphertext",
+        },
+    })
+    await asyncio.sleep(0)
+
+    assert len(received) == 1
+    assert received[0]["payload"] == {"type": "text", "text": "self-copy"}
+    assert received[0]["direction"] == "outbound_sync"
+
+
+@pytest.mark.asyncio
+async def test_p2p_raw_encrypted_push_publishes_header_only_undecryptable_when_inline_decrypt_fails(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "p2p_raw_encrypted")})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+    client._transport.call = AsyncMock(return_value={})
+
+    received: list[dict] = []
+    undecryptable: list[dict] = []
+    client._dispatcher.subscribe("message.received", lambda data: received.append(data))
+    client._dispatcher.subscribe("message.undecryptable", lambda data: undecryptable.append(data))
+
+    await client._process_and_publish_message({
+        "message_id": "m-raw-encrypted",
+        "from": "bob.aid.com",
+        "to": "alice.aid.com",
+        "seq": 1,
+        "timestamp": 123,
+        "encrypted": True,
+        "payload": {
+            "type": "e2ee.p2p_encrypted",
+            "version": "v2",
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "payload_type": "text",
+            "protected_headers": {"payload_type": "text", "trace_id": "trace-1", "_auth": "secret"},
+            "ciphertext": "ciphertext",
+        },
+    })
+    await asyncio.sleep(0)
+
+    assert received == []
+    assert len(undecryptable) == 1
+    event = undecryptable[0]
+    assert "payload" not in event
+    assert event["message_id"] == "m-raw-encrypted"
+    assert event["from"] == "bob.aid.com"
+    assert event["to"] == "alice.aid.com"
+    assert event["seq"] == 1
+    assert event["payload_type"] == "text"
+    assert event["protected_headers"] == {"payload_type": "text", "trace_id": "trace-1"}
+    assert event["_decrypt_stage"] == "push_envelope"
+
+
+@pytest.mark.asyncio
+async def test_group_raw_encrypted_push_attempts_inline_decrypt_first(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "group_raw_encrypted_ok")})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+    client._transport.call = AsyncMock(return_value={})
+    client._decrypt_v2_envelope_for_thought = AsyncMock(return_value={"type": "text", "text": "group-decrypted"})
+
+    created: list[dict] = []
+    undecryptable: list[dict] = []
+    client._dispatcher.subscribe("group.message_created", lambda data: created.append(data))
+    client._dispatcher.subscribe("group.message_undecryptable", lambda data: undecryptable.append(data))
+
+    await client._on_raw_group_message_created({
+        "message_id": "gm-raw-encrypted-ok",
+        "group_id": "g1",
+        "from": "bob.aid.com",
+        "seq": 1,
+        "timestamp": 123,
+        "payload": {
+            "type": "e2ee.group_encrypted",
+            "version": "v2",
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "payload_type": "group-text",
+            "protected_headers": {"payload_type": "group-text", "trace_id": "trace-g1", "_auth": "secret"},
+            "aad": {"from": "bob.aid.com", "from_device": "bob-dev", "group_id": "g1"},
+            "recipients": [["alice.aid.com", "dev-1", "peer", "group_device_prekey", "fp", "spk-1"]],
+            "ciphertext": "ciphertext",
+        },
+    })
+    await asyncio.sleep(0)
+
+    assert client._decrypt_v2_envelope_for_thought.called
+    assert undecryptable == []
+    assert len(created) == 1
+    assert created[0]["payload"] == {"type": "text", "text": "group-decrypted"}
+    assert created[0]["direction"] == "inbound"
+    assert created[0]["payload_type"] == "group-text"
+    assert created[0]["protected_headers"] == {"payload_type": "group-text", "trace_id": "trace-g1"}
+
+
+@pytest.mark.asyncio
+async def test_group_raw_encrypted_self_push_marks_outbound_sync(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "group_raw_encrypted_self")})
+    client._aid = "alice.aid.com"
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+    client._transport.call = AsyncMock(return_value={})
+    client._decrypt_v2_envelope_for_thought = AsyncMock(return_value={"type": "text", "text": "self-group"})
+
+    created: list[dict] = []
+    client._dispatcher.subscribe("group.message_created", lambda data: created.append(data))
+
+    await client._on_raw_group_message_created({
+        "message_id": "gm-raw-encrypted-self",
+        "group_id": "g1",
+        "from": "alice.aid.com",
+        "seq": 1,
+        "timestamp": 123,
+        "payload": {
+            "type": "e2ee.group_encrypted",
+            "version": "v2",
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "payload_type": "group-text",
+            "aad": {"from": "alice.aid.com", "from_device": "alice-main", "group_id": "g1"},
+            "recipients": [["alice.aid.com", "dev-1", "self_sync", "group_device_prekey", "fp", "spk-1"]],
+            "ciphertext": "ciphertext",
+        },
+    })
+    await asyncio.sleep(0)
+
+    assert len(created) == 1
+    assert created[0]["payload"] == {"type": "text", "text": "self-group"}
+    assert created[0]["direction"] == "outbound_sync"
+
+
+@pytest.mark.asyncio
+async def test_group_raw_encrypted_push_publishes_header_only_undecryptable_when_inline_decrypt_fails(tmp_path):
+    from unittest.mock import AsyncMock
+
+    client = AUNClient({"aun_path": str(tmp_path / "group_raw_encrypted")})
+    client._device_id = "dev-1"
+    client._slot_id = "slot-a"
+    client._state = "connected"
+    client._loop = asyncio.get_running_loop()
+    client._transport.call = AsyncMock(return_value={})
+    client._decrypt_v2_envelope_for_thought = AsyncMock(return_value=None)
+
+    created: list[dict] = []
+    undecryptable: list[dict] = []
+    client._dispatcher.subscribe("group.message_created", lambda data: created.append(data))
+    client._dispatcher.subscribe("group.message_undecryptable", lambda data: undecryptable.append(data))
+
+    await client._on_raw_group_message_created({
+        "message_id": "gm-raw-encrypted",
+        "group_id": "g1",
+        "from": "bob.aid.com",
+        "seq": 1,
+        "timestamp": 123,
+        "payload": {
+            "type": "e2ee.group_encrypted",
+            "version": "v2",
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "payload_type": "group-text",
+            "protected_headers": {"payload_type": "group-text", "trace_id": "trace-g1", "_auth": "secret"},
+            "ciphertext": "ciphertext",
+        },
+    })
+    await asyncio.sleep(0)
+
+    assert created == []
+    assert len(undecryptable) == 1
+    event = undecryptable[0]
+    assert "payload" not in event
+    assert event["message_id"] == "gm-raw-encrypted"
+    assert event["group_id"] == "g1"
+    assert event["from"] == "bob.aid.com"
+    assert event["seq"] == 1
+    assert event["payload_type"] == "group-text"
+    assert event["protected_headers"] == {"payload_type": "group-text", "trace_id": "trace-g1"}
+    assert event["_decrypt_stage"] == "push_envelope"
 
 
 def _make_disconnect_client():

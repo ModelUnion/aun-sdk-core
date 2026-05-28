@@ -10,7 +10,7 @@ import { ROOT_CA_PEM } from './certs/root.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 const AUN_SDK_LANG = 'javascript';
-const AUN_SDK_VERSION = '0.3.5';
+const AUN_SDK_VERSION = '0.3.6';
 
 import {
   isJsonObject,
@@ -493,7 +493,13 @@ export class AuthFlow {
       const cert = await this._keystore.loadCert(identity.aid as string);
       if (cert) identity.cert = cert;
       const instanceState = await this._loadInstanceState(identity.aid as string);
-      if (instanceState) Object.assign(identity, instanceState);
+      if (instanceState) {
+        for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
+          if (key in instanceState) {
+            (identity as Record<string, unknown>)[key] = instanceState[key];
+          }
+        }
+      }
       this._log.debug(`loadIdentity exit: elapsed=${Date.now() - tStart}ms aid=${identity.aid} has_cert=${!!identity.cert}`);
       return identity;
     } catch (err) {
@@ -1130,7 +1136,26 @@ export class AuthFlow {
     return { cert: response.cert };
   }
 
-  /** 下载服务端当前登记的证书；未注册返回 null */
+  /**
+   * 从服务端下载指定 AID 的证书（公开 API）。
+   *
+   * @param gatewayUrl - Gateway WebSocket URL
+   * @param aid - 目标 AID
+   * @returns 证书 PEM 字符串，如果 AID 未注册则返回 null
+   *
+   * @example
+   * ```typescript
+   * const cert = await auth.fetchPeerCert('wss://gateway.example.com', 'alice.aid.com');
+   * if (cert) {
+   *   console.log('Alice is registered');
+   * }
+   * ```
+   */
+  async fetchPeerCert(gatewayUrl: string, aid: string): Promise<string | null> {
+    return this._downloadRegisteredCert(gatewayUrl, aid);
+  }
+
+  /** 下载服务端当前登记的证书（内部实现）；未注册返回 null */
   private async _downloadRegisteredCert(gatewayUrl: string, aid: string): Promise<string | null> {
     const certUrl = gatewayHttpUrl(gatewayUrl, `/pki/cert/${aid}`);
     try {

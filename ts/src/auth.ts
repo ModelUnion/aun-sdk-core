@@ -45,7 +45,7 @@ const _noopLogger: ModuleLogger = {
 };
 
 const AUN_SDK_LANG = 'typescript';
-const AUN_SDK_VERSION = '0.3.5';
+const AUN_SDK_VERSION = '0.3.6';
 
 // ── 签名验证辅助 ──────────────────────────────────────────────
 
@@ -352,7 +352,13 @@ export class AuthFlow {
     if (cert) identity.cert = cert;
     const instanceState = this._loadInstanceState(String(identity.aid));
     if (instanceState && typeof instanceState === 'object') {
-      Object.assign(identity, instanceState);
+      // 只合并 _INSTANCE_STATE_FIELDS 定义的字段，防止 instance_state 表中的脏数据
+      // 覆盖从 key.json 加载的真实私钥（private_key_pem）等核心字段。
+      for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
+        if (key in instanceState) {
+          (identity as Record<string, unknown>)[key] = instanceState[key];
+        }
+      }
     }
     return identity;
   }
@@ -524,8 +530,6 @@ export class AuthFlow {
     gatewayUrl: string,
     aid: string,
   ): Promise<JsonObject | null> {
-    const path = require('node:path') as typeof import('node:path');
-    const fs = require('node:fs') as typeof import('node:fs');
     const aidsRoot = (this._keystore as any)._aidsRoot as string;
     const pendingRoot = path.join(aidsRoot, '_pending');
     if (!fs.existsSync(pendingRoot)) return null;
@@ -604,8 +608,6 @@ export class AuthFlow {
   }
 
   private _writePendingKeypair(pendingDir: string, identity: IdentityRecord): void {
-    const fs = require('node:fs') as typeof import('node:fs');
-    const path = require('node:path') as typeof import('node:path');
     const priv = String(identity.private_key_pem ?? '');
     const pub = String(identity.public_key_der_b64 ?? '');
     const curve = String(identity.curve ?? 'P-256');
@@ -622,8 +624,6 @@ export class AuthFlow {
   }
 
   private _writePendingCert(pendingDir: string, certPem: string): void {
-    const fs = require('node:fs') as typeof import('node:fs');
-    const path = require('node:path') as typeof import('node:path');
     const dir = path.join(pendingDir, 'public');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'cert.pem'), certPem, { encoding: 'utf-8', mode: 0o600 });
@@ -2046,7 +2046,27 @@ export class AuthFlow {
   }
 
   /**
-   * 通过 PKI HTTP 端点下载服务端登记的证书。
+   * 从服务端下载指定 AID 的证书（公开 API）。
+   *
+   * @param gatewayUrl - Gateway WebSocket URL
+   * @param aid - 目标 AID
+   * @returns 证书 PEM 字符串，如果 AID 未注册则返回 null
+   * @throws {AuthError} 网络错误或服务端错误
+   *
+   * @example
+   * ```typescript
+   * const cert = await auth.fetchPeerCert('wss://gateway.example.com', 'alice.aid.com');
+   * if (cert) {
+   *   console.log('Alice is registered');
+   * }
+   * ```
+   */
+  async fetchPeerCert(gatewayUrl: string, aid: string): Promise<string | null> {
+    return this._downloadRegisteredCert(gatewayUrl, aid);
+  }
+
+  /**
+   * 通过 PKI HTTP 端点下载服务端登记的证书（内部实现）。
    * 404 / 找不到 → 返回 null（视为未注册）；其它 HTTP 错抛 AuthError。
    * 该方法既用于 recover 路径，也用于 registerAid 全新注册前的查重前置。
    */

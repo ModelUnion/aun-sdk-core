@@ -782,6 +782,137 @@ async def test_storage_validation_ttl_and_upload_conflicts():
         await alice.close()
 
 
+async def test_storage_share_links_and_short_urls():
+    """覆盖分享链接 RPC、短链接 HTTP 下载、授权名单、次数限制和撤销。"""
+    rid = uuid.uuid4().hex[:10]
+    alice = _make_client()
+    bob = _make_client()
+    eve = _make_client()
+    eve_aid = f"eve-share-{rid}.{_ISSUER}"
+    bucket = f"storage-share-{rid}"
+    object_key = f"docs/{rid}/share.txt"
+    payload = f"share-hello-{rid}".encode("utf-8")
+    share_ids: list[str] = []
+
+    try:
+        await _ensure_connected(alice, _ALICE_AID)
+        await _ensure_connected(bob, _BOBB_AID)
+        await _ensure_connected(eve, eve_aid)
+
+        await alice.call("storage.put_object", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_key": object_key,
+            "content": _b64(payload),
+            "content_type": "text/plain",
+            "is_private": True,
+        })
+
+        public_share = await alice.call("storage.create_share_link", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_key": object_key,
+            "allowed_aids": ["*"],
+            "expire_in_seconds": 300,
+        })
+        public_share_id = str(public_share.get("share_id") or "")
+        public_share_url = str(public_share.get("share_url") or "")
+        share_ids.append(public_share_id)
+        if len(public_share_id) != 10:
+            raise AssertionError(f"share_id 长度异常: {public_share}")
+        if f"/s/{public_share_id}" not in public_share_url:
+            raise AssertionError(f"share_url 未包含短链路径: {public_share}")
+        _assert_non_loopback_url(public_share_url, "storage.create_share_link.share_url")
+
+        status, body = await _http_request(public_share_url)
+        if status < 200 or status >= 300 or body != payload:
+            raise AssertionError(f"分享短链接 HTTP 下载异常: status={status} body={body!r}")
+
+        bob_public = await bob.call("storage.get_by_share", {
+            "share_id": public_share_id,
+        })
+        if base64.b64decode(str(bob_public.get("content") or "")) != payload:
+            raise AssertionError(f"公开分享 get_by_share 内容异常: {bob_public}")
+
+        restricted_share = await alice.call("storage.create_share_link", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_key": object_key,
+            "allowed_aids": [_BOBB_AID],
+            "expire_in_seconds": 300,
+        })
+        restricted_share_id = str(restricted_share.get("share_id") or "")
+        share_ids.append(restricted_share_id)
+
+        bob_restricted = await bob.call("storage.get_by_share", {
+            "share_id": restricted_share_id,
+        })
+        if base64.b64decode(str(bob_restricted.get("content") or "")) != payload:
+            raise AssertionError(f"授权分享 get_by_share 内容异常: {bob_restricted}")
+
+        await _expect_failure(
+            lambda: eve.call("storage.get_by_share", {
+                "share_id": restricted_share_id,
+            }),
+            "未授权 AID 读取指定分享",
+        )
+
+        limited_share = await alice.call("storage.create_share_link", {
+            "owner_aid": _ALICE_AID,
+            "bucket": bucket,
+            "object_key": object_key,
+            "allowed_aids": ["*"],
+            "expire_in_seconds": 300,
+            "max_uses": 1,
+        })
+        limited_share_id = str(limited_share.get("share_id") or "")
+        share_ids.append(limited_share_id)
+        await bob.call("storage.get_by_share", {"share_id": limited_share_id})
+        await _expect_failure(
+            lambda: bob.call("storage.get_by_share", {"share_id": limited_share_id}),
+            "max_uses=1 的分享第二次读取",
+        )
+
+        listed = await alice.call("storage.list_share_links", {
+            "bucket": bucket,
+            "object_key": object_key,
+        })
+        listed_ids = {str(item.get("share_id") or "") for item in listed.get("links", [])}
+        if public_share_id not in listed_ids or restricted_share_id not in listed_ids:
+            raise AssertionError(f"list_share_links 未返回已创建分享: {listed}")
+
+        revoked = await alice.call("storage.revoke_share_link", {
+            "share_id": restricted_share_id,
+        })
+        if revoked.get("revoked") is not True:
+            raise AssertionError(f"revoke_share_link 返回异常: {revoked}")
+        await _expect_failure(
+            lambda: bob.call("storage.get_by_share", {
+                "share_id": restricted_share_id,
+            }),
+            "撤销后的分享不可读取",
+        )
+
+        _ok("storage_share_links_and_short_urls")
+    finally:
+        for share_id in share_ids:
+            try:
+                await alice.call("storage.revoke_share_link", {"share_id": share_id})
+            except Exception:
+                pass
+        try:
+            await alice.call("storage.delete_object", {
+                "owner_aid": _ALICE_AID,
+                "bucket": bucket,
+                "object_key": object_key,
+            })
+        except Exception:
+            pass
+        await eve.close()
+        await bob.close()
+        await alice.close()
+
+
 async def main():
     global _failed
 
@@ -796,6 +927,7 @@ async def main():
         test_storage_upload_session_roundtrip_and_download_ticket,
         test_storage_prefix_pagination_and_version_conflict,
         test_storage_validation_ttl_and_upload_conflicts,
+        test_storage_share_links_and_short_urls,
     ]
 
     for fn in tests:

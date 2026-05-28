@@ -1790,6 +1790,7 @@ class AUNClient:
 
             # P2P 空洞检测
             seq = msg.get("seq")
+            encrypted_push = self._is_encrypted_push_message(msg)
             if seq is not None and self._aid:
                 ns = f"p2p:{self._aid}"
                 # Push 修上界：先更新 max_seen_seq，让上界反映服务端状态（即使后续被去重/旁路）
@@ -1813,8 +1814,18 @@ class AUNClient:
                     "publish ordered: ns=%s seq=%s message_id=%s",
                     ns, seq, msg.get("message_id", "?"),
                 )
-                await self._publish_ordered_message("message.received", ns, seq, msg)
+                if encrypted_push:
+                    await self._publish_encrypted_push_message(
+                        "message.received", "message.undecryptable", ns, seq, msg, group=False,
+                    )
+                else:
+                    await self._publish_ordered_message("message.received", ns, seq, msg)
             else:
+                if encrypted_push:
+                    await self._publish_encrypted_push_message(
+                        "message.received", "message.undecryptable", "", seq, msg, group=False,
+                    )
+                    return
                 self._log.debug(
                     "client",
                     "publish app event (no seq): message_id=%s",
@@ -1865,6 +1876,45 @@ class AUNClient:
         seq = data.get("seq")
         if group_id:
             self._group_synced.add(group_id)
+        payload = data.get("payload")
+        has_payload = payload is not None and not (isinstance(payload, dict) and not payload)
+        encrypted_push = self._is_encrypted_push_message(data) if has_payload else False
+
+        if encrypted_push:
+            if group_id and seq is not None:
+                ns = f"group:{group_id}"
+                seq_i = int(seq)
+                if seq_i > 0:
+                    self._seq_tracker.update_max_seen(ns, seq_i)
+                    if self._seq_tracker.get_contiguous_seq(ns) == seq_i:
+                        self._log.debug(
+                            "client",
+                            "_raw.group.message_created encrypted push already covered: group=%s seq=%d",
+                            group_id, seq_i,
+                        )
+                        return
+                    self._repair_push_contiguous_bound(
+                        ns, seq_i, has_payload=True, label="_raw.group.message_created.encrypted",
+                    )
+                if self._is_published_seq(ns, seq_i) or self._is_pending_ordered_seq(ns, seq_i):
+                    return
+                self._seq_tracker.on_message_seq(ns, seq_i)
+                self._persist_seq(ns)
+                await self._publish_encrypted_push_message(
+                    "group.message_created", "group.message_undecryptable", ns, seq, data, group=True,
+                )
+                contig = self._seq_tracker.get_contiguous_seq(ns)
+                if contig > 0:
+                    self._fire_ack("group.ack_messages", {
+                        "group_id": group_id, "msg_seq": contig,
+                        "device_id": self._device_id,
+                        "slot_id": self._slot_id,
+                    }, f"群消息 auto-ack group={group_id}")
+            else:
+                await self._publish_encrypted_push_message(
+                    "group.message_created", "group.message_undecryptable", "", seq, data, group=True,
+                )
+            return
 
         # V2-only 模式：V1 明文推送不带 payload，需要通过 group.v2.pull 获取完整消息
         if getattr(self, "_v2_session", None) and group_id and seq is not None:
@@ -4703,6 +4753,21 @@ class AUNClient:
             return
         identity = self._identity
         if not identity or not identity.get("private_key_pem"):
+            # fallback：缓存的 identity 可能被 instance_state 污染，重新从 keystore 加载
+            try:
+                reloaded = self._keystore.load_identity(self._aid)
+            except Exception:
+                reloaded = None
+            if reloaded and reloaded.get("private_key_pem"):
+                self._identity = reloaded
+                identity = reloaded
+                self._log.warn("client", "V2 session init: identity cache was stale, reloaded from keystore")
+                # 自愈：重新持久化 identity，清理 instance_state 中的脏数据
+                try:
+                    self._auth._persist_identity(reloaded)
+                except Exception:
+                    pass
+        if not identity or not identity.get("private_key_pem"):
             self._log.warn("client", "V2 session init skipped: no AID private key")
             return
 
@@ -4972,9 +5037,10 @@ class AUNClient:
             raise StateError("V2 session not initialized (not connected?)")
         after_seq = int(params.get("after_seq", 0) or 0)
         limit = int(params.get("limit", 50) or 50)
+        force = params.get("force") is True
 
         ns = f"p2p:{self._aid}" if self._aid else ""
-        next_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
+        next_after_seq = after_seq if force else (after_seq or self._seq_tracker.get_contiguous_seq(ns))
         first_contig_before = self._seq_tracker.get_contiguous_seq(ns) if ns else 0
         response: dict[str, Any] = {}
         decrypted: list[dict[str, Any]] = []
@@ -4991,10 +5057,13 @@ class AUNClient:
                 "message.v2.pull page request: page=%d after_seq=%d limit=%d ns=%s",
                 page_count, next_after_seq, limit, ns or "<none>",
             )
-            result = await self.call("message.v2.pull", {
+            pull_params = {
                 "after_seq": next_after_seq,
                 "limit": limit,
-            })
+            }
+            if force:
+                pull_params["force"] = True
+            result = await self.call("message.v2.pull", pull_params)
             if isinstance(result, dict):
                 response.update(result)
             else:
@@ -5942,6 +6011,150 @@ class AUNClient:
         if envelope is not None:
             self._observe_agent_md_from_envelope(envelope)
             self._attach_v2_envelope_metadata(message, self._v2_thought_e2ee_metadata(envelope))
+
+    @staticmethod
+    def _truthy_bool(value: Any) -> bool:
+        if value is True or value == 1:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "on"}
+        return False
+
+    @staticmethod
+    def _is_encrypted_envelope_payload(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        payload_type = str(payload.get("type") or "").strip()
+        if payload_type.startswith("e2ee."):
+            return True
+        if not str(payload.get("ciphertext") or "").strip():
+            return False
+        return any(
+            key in payload
+            for key in ("nonce", "tag", "recipient", "recipients", "wrapped_key", "recipients_digest")
+        )
+
+    def _encrypted_push_envelope(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+        payload = msg.get("payload")
+        if self._is_encrypted_envelope_payload(payload):
+            return payload
+        envelope_json = msg.get("envelope_json")
+        if isinstance(envelope_json, str) and envelope_json.strip():
+            try:
+                parsed = json.loads(envelope_json)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            if self._is_encrypted_envelope_payload(parsed):
+                return parsed
+        return None
+
+    def _is_encrypted_push_message(self, msg: dict[str, Any]) -> bool:
+        if self._truthy_bool(msg.get("encrypted")):
+            return True
+        return self._encrypted_push_envelope(msg) is not None
+
+    @staticmethod
+    def _is_v2_encrypted_envelope_payload(envelope: dict[str, Any] | None) -> bool:
+        if not isinstance(envelope, dict):
+            return False
+        payload_type = str(envelope.get("type") or "").strip()
+        if payload_type in {"e2ee.p2p_encrypted", "e2ee.group_encrypted"}:
+            return True
+        return str(envelope.get("version") or "").strip().lower() == "v2" and payload_type.startswith("e2ee.")
+
+    def _safe_undecryptable_push_event(self, msg: dict[str, Any], *, group: bool) -> dict[str, Any]:
+        event: dict[str, Any] = {
+            "message_id": msg.get("message_id"),
+            "from": msg.get("from"),
+            "seq": msg.get("seq"),
+            "timestamp": msg.get("timestamp") if msg.get("timestamp") is not None else msg.get("t_server"),
+            "device_id": msg.get("device_id"),
+            "slot_id": msg.get("slot_id"),
+            "_decrypt_error": "encrypted push payload is not decryptable on raw push path",
+            "_decrypt_stage": "push_envelope",
+        }
+        if group:
+            event["group_id"] = msg.get("group_id")
+        else:
+            event["to"] = msg.get("to")
+        envelope = self._encrypted_push_envelope(msg)
+        if envelope is not None:
+            event["_envelope_type"] = str(envelope.get("type") or "")
+            event["_suite"] = str(envelope.get("suite") or "")
+            if self._is_v2_encrypted_envelope_payload(envelope):
+                self._attach_v2_envelope_metadata(event, self._v2_thought_e2ee_metadata(envelope))
+        return event
+
+    async def _decrypt_encrypted_push_payload(self, msg: dict[str, Any], *, group: bool) -> dict[str, Any] | None:
+        envelope = self._encrypted_push_envelope(msg)
+        if not self._is_v2_encrypted_envelope_payload(envelope):
+            return None
+        assert envelope is not None
+        aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
+        from_aid = str(msg.get("from_aid") or msg.get("from") or msg.get("sender_aid") or aad.get("from") or "").strip()
+        plaintext = await self._decrypt_v2_envelope_for_thought(envelope=envelope, from_aid=from_aid)
+        if plaintext is None:
+            return None
+        e2ee_meta = self._v2_thought_e2ee_metadata(envelope)
+        result: dict[str, Any] = {
+            "message_id": str(msg.get("message_id") or ""),
+            "from": from_aid,
+            "seq": msg.get("seq"),
+            "timestamp": msg.get("t_server") if msg.get("t_server") is not None else msg.get("timestamp"),
+            "payload": plaintext,
+            "encrypted": True,
+            "e2ee": e2ee_meta,
+        }
+        result["direction"] = "outbound_sync" if from_aid and from_aid == self._aid else "inbound"
+        if msg.get("t_server") is not None:
+            result["t_server"] = msg.get("t_server")
+        if "device_id" in msg:
+            result["device_id"] = msg.get("device_id")
+        if "slot_id" in msg:
+            result["slot_id"] = msg.get("slot_id")
+        if group:
+            result["group_id"] = msg.get("group_id") or aad.get("group_id") or envelope.get("group_id")
+        else:
+            result["to"] = msg.get("to") or self._aid or ""
+        self._attach_v2_envelope_metadata(result, e2ee_meta)
+        self._log_message_debug("decrypt-ok", "push.encrypted", "group.message_created" if group else "message.received", result)
+        return result
+
+    async def _publish_encrypted_push_as_undecryptable(
+        self,
+        event: str,
+        ns: str,
+        seq: Any,
+        msg: dict[str, Any],
+        *,
+        group: bool,
+    ) -> bool:
+        safe_event = self._safe_undecryptable_push_event(msg, group=group)
+        self._log_message_debug("decrypt-fail", "push.encrypted", event, safe_event)
+        if ns:
+            return await self._publish_ordered_message(event, ns, seq, safe_event)
+        await self._publish_app_event(event, safe_event, source="push")
+        return True
+
+    async def _publish_encrypted_push_message(
+        self,
+        normal_event: str,
+        undecryptable_event: str,
+        ns: str,
+        seq: Any,
+        msg: dict[str, Any],
+        *,
+        group: bool,
+    ) -> bool:
+        decrypted = await self._decrypt_encrypted_push_payload(msg, group=group)
+        if decrypted is not None:
+            if ns:
+                return await self._publish_ordered_message(normal_event, ns, seq, decrypted)
+            await self._publish_app_event(normal_event, decrypted, source="push")
+            return True
+        return await self._publish_encrypted_push_as_undecryptable(
+            undecryptable_event, ns, seq, msg, group=group,
+        )
 
     async def _decrypt_v2_envelope_for_thought(
         self,
@@ -7044,5 +7257,14 @@ class AUNClient:
             "encrypted": True,
             "e2ee": meta,
         }
+        direction = str(msg.get("direction") or "").strip()
+        if not direction:
+            direction = "outbound_sync" if from_aid and from_aid == self._aid else "inbound"
+        if direction:
+            result["direction"] = direction
+        if "device_id" in msg:
+            result["device_id"] = msg.get("device_id")
+        if "slot_id" in msg:
+            result["slot_id"] = msg.get("slot_id")
         self._attach_v2_envelope_metadata(result, meta)
         return result

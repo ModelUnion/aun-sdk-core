@@ -194,8 +194,10 @@ func (a *AuthFlow) LoadIdentity(aid string) (identity map[string]any, err error)
 	}
 	if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
 		instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID)
-		for k, v := range instanceState {
-			identity[k] = v
+		for _, key := range authInstanceStateFields {
+			if v, exists := instanceState[key]; exists {
+				identity[key] = v
+			}
 		}
 	}
 	return identity, nil
@@ -1607,7 +1609,31 @@ func (a *AuthFlow) recoverCertViaDownload(ctx context.Context, gatewayURL string
 	return identity, nil
 }
 
-// downloadRegisteredCert 下载已注册 AID 的证书；404 表示未注册，返回空字符串。
+// FetchPeerCert 从服务端下载指定 AID 的证书（公开 API）。
+//
+// 参数:
+//   - ctx: 上下文
+//   - gatewayURL: Gateway WebSocket URL
+//   - aid: 目标 AID
+//
+// 返回:
+//   - 证书 PEM 字符串，如果 AID 未注册则返回空字符串
+//   - 错误（网络错误或服务端错误）
+//
+// 示例:
+//
+//	cert, err := auth.FetchPeerCert(ctx, "wss://gateway.example.com", "alice.aid.com")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	if cert != "" {
+//	    fmt.Println("Alice is registered")
+//	}
+func (a *AuthFlow) FetchPeerCert(ctx context.Context, gatewayURL string, aid string) (string, error) {
+	return a.downloadRegisteredCert(ctx, gatewayURL, aid)
+}
+
+// downloadRegisteredCert 下载已注册 AID 的证书（内部实现）；404 表示未注册，返回空字符串。
 func (a *AuthFlow) downloadRegisteredCert(ctx context.Context, gatewayURL string, aid string) (string, error) {
 	certURL := authGatewayHTTPURL(gatewayURL, fmt.Sprintf("/pki/cert/%s", aid))
 	client := a.httpClient()

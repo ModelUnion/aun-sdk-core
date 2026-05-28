@@ -94,7 +94,11 @@ class AuthFlow:
             identity["cert"] = cert
         instance_state = self._load_instance_state(identity["aid"])
         if isinstance(instance_state, dict):
-            identity.update(instance_state)
+            # 只合并 _INSTANCE_STATE_FIELDS 定义的字段，防止 instance_state 表中的脏数据
+            # 覆盖从 key.json 加载的真实私钥（private_key_pem）等核心字段。
+            for key in self._INSTANCE_STATE_FIELDS:
+                if key in instance_state:
+                    identity[key] = instance_state[key]
         return identity
 
     def load_identity_or_none(self, aid: str | None = None) -> dict[str, Any] | None:
@@ -276,8 +280,29 @@ class AuthFlow:
         identity["cert"] = cert_pem
         return identity
 
+    async def fetch_peer_cert(self, gateway_url: str, aid: str) -> str | None:
+        """
+        从服务端下载指定 AID 的证书（公开 API）。
+
+        Args:
+            gateway_url: Gateway WebSocket URL
+            aid: 目标 AID
+
+        Returns:
+            证书 PEM 字符串，如果 AID 未注册则返回 None
+
+        Raises:
+            AuthError: 网络错误或服务端错误
+
+        Example:
+            cert = await auth.fetch_peer_cert('wss://gateway.example.com', 'alice.aid.com')
+            if cert:
+                print('Alice is registered')
+        """
+        return await self._download_registered_cert(gateway_url, aid)
+
     async def _download_registered_cert(self, gateway_url: str, aid: str) -> str | None:
-        """下载服务端当前登记的证书；404 视为未登记，其它错误抛异常。"""
+        """下载服务端当前登记的证书（内部实现）；404 视为未登记，其它错误抛异常。"""
         cert_url = self._gateway_http_url(gateway_url, f"/pki/cert/{aid}")
         try:
             if self._net:

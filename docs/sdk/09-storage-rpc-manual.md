@@ -13,6 +13,8 @@
 | [storage.list_objects](#storagelist_objects) | 列举对象 |
 | [storage.list_prefixes](#storagelist_prefixes) | 列举子目录 |
 | [storage.get_quota](#storageget_quota) | 查询配额 |
+| [storage.get_limits](#storageget_limits) | 查询上传限制 |
+| [storage.check_upload](#storagecheck_upload) | 上传预检（秒传检测 + 超限检测） |
 
 ### 数据面协调方法
 
@@ -394,6 +396,93 @@ for obj in result["items"]:
 | `object_key` | string | 对象路径 |
 
 > 当前实现在 `storage.put_object` 成功后推送 `action="put"`，`storage.delete_object` 返回 `deleted=true` 时推送 `action="delete"`，`storage.complete_upload` 成功后也会推送 `action="put"` 事件。
+
+---
+
+## storage.get_limits
+
+查询当前用户的上传限制和配额使用情况。客户端可在上传前调用此方法，避免超限后浪费流量。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `owner_aid` | string | 否 | 查询指定用户的配额，默认当前用户 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `max_inline_bytes` | integer | `put_object` 内联上限（当前 64KB） |
+| `max_file_size_bytes` | integer | 单文件大小上限（当前 10MB） |
+| `quota_total_bytes` | integer | 用户总配额（0 表示无限制） |
+| `quota_used_bytes` | integer | 已用配额 |
+
+### 示例
+
+```python
+limits = await client.call("storage.get_limits", {})
+print(f"单文件上限: {limits['max_file_size_bytes']} bytes")
+print(f"配额: {limits['quota_used_bytes']}/{limits['quota_total_bytes']}")
+```
+
+---
+
+## storage.check_upload
+
+上传预检：一次调用同时回答"文件是否超限"和"是否可秒传"。客户端应在计算完文件 SHA-256 后、实际上传前调用。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `sha256` | string | 是 | 文件内容的 SHA-256 hex（64 字符） |
+| `size_bytes` | integer | 是 | 文件大小（字节） |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `within_limit` | boolean | 文件大小是否在限制内 |
+| `exists` | boolean | 服务端是否已有相同内容 |
+| `skip_upload` | boolean | 是否可跳过上传（秒传） |
+
+### 使用场景
+
+```python
+import hashlib
+
+data = open("large_file.bin", "rb").read()
+sha256 = hashlib.sha256(data).hexdigest()
+
+check = await client.call("storage.check_upload", {
+    "sha256": sha256,
+    "size_bytes": len(data),
+})
+
+if not check["within_limit"]:
+    print("文件超限，无法上传")
+elif check["skip_upload"]:
+    # 秒传：服务端已有相同内容，跳过上传直接 complete
+    await client.call("storage.complete_upload", {
+        "object_key": "my/file.bin",
+        "sha256": sha256,
+        "size_bytes": len(data),
+        "skip_blob": True,
+    })
+else:
+    # 正常上传流程
+    session = await client.call("storage.create_upload_session", {
+        "object_key": "my/file.bin",
+        "size_bytes": len(data),
+    })
+    # HTTP PUT ...
+    await client.call("storage.complete_upload", {
+        "object_key": "my/file.bin",
+        "sha256": sha256,
+        "size_bytes": len(data),
+    })
+```
 
 ---
 

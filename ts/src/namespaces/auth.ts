@@ -402,6 +402,7 @@ export class AuthNamespace {
       const result = await auth.registerAid(gatewayUrl, aid);
       client._aid = aid;
       client._identity = auth.loadIdentityOrNone(aid);
+      this._persistGatewayUrl(aid, gatewayUrl);
       this._log.info(`registerAid success: aid=${aid} gateway=${gatewayUrl}`);
       this._log.debug(`registerAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
       return {
@@ -460,6 +461,7 @@ export class AuthNamespace {
       const result = await auth.authenticate(gatewayUrl, { aid });
       client._aid = result.aid ?? null;
       client._identity = auth.loadIdentityOrNone(String(result.aid));
+      this._persistGatewayUrl(String(result.aid ?? aid ?? ''), gatewayUrl);
       this._log.info(`authenticate success: aid=${result.aid} gateway=${gatewayUrl}`);
       this._log.debug(`authenticate exit: elapsed=${Date.now() - tStart}ms aid=${aid ?? '-'}`);
       return result;

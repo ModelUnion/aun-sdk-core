@@ -221,7 +221,7 @@ const DIAG_PARAM_FIELDS = [
   'after_seq', 'after_event_seq', 'seq', 'event_seq', 'limit', 'cursor',
   'aid', 'session_id', 'type', 'encrypt', 'encryption_mode', 'suite',
   'prekey_id', 'trust_root_version', 'version', 'ok', 'request_id',
-  'owner_aid', 'rotated_by', 'action',
+  'owner_aid', 'rotated_by', 'action', 'force',
 ] as const;
 
 const DIAG_RESULT_FIELDS = [
