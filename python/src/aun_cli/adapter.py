@@ -131,11 +131,20 @@ def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
     except KeyError:
         profile = {}
 
-    # 优先级：命令行 > 环境变量 > profile 级配置 > 全局默认
-    gateway = ctx.obj.get("gateway") or os.environ.get("AUN_GATEWAY") or profile.get("gateway")
+    # Gateway 只能通过 SDK discovery 发现，CLI 不接受外部覆盖。
+    gateway = None
     timeout = ctx.obj.get("timeout") or profile.get("timeout") or defaults.get("timeout", 30)
     debug = ctx.obj.get("debug") or os.environ.get("AUN_DEBUG", "").lower() in ("1", "true") or profile.get("debug", defaults.get("debug", False))
     trace = ctx.obj.get("trace") or profile.get("trace") or defaults.get("trace", "off")
+    encryption_seed = (
+        os.environ.get("AUN_ENCRYPTION_SEED")
+        or os.environ.get("AUN_SEED_PASSWORD")
+        or profile.get("encryption_seed")
+        or profile.get("seed_password")
+        or defaults.get("encryption_seed")
+        or defaults.get("seed_password")
+        or ""
+    )
 
     aun_path = os.environ.get("AUN_DATA_ROOT") or profile.get("aun_path", "")
     if not aun_path:
@@ -148,10 +157,22 @@ def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
         "aun_path": aun_path,
         "debug": debug,
         "timeout": timeout,
+        "encryption_seed": str(encryption_seed),
         "trace": trace,
+        "agentmd_path": profile.get("agentmd_path"),
         "active_group": str(profile.get("active_group") or "").strip() or None,
         "profile_source": profile_source,
     }
+
+
+def make_aid_store(resolved: dict[str, Any]):
+    from aun_core import AIDStore
+
+    return AIDStore(
+        aun_path=resolved["aun_path"],
+        encryption_seed=str(resolved.get("encryption_seed") or ""),
+        debug=bool(resolved.get("debug")),
+    )
 
 
 class CLISession:
@@ -163,19 +184,17 @@ class CLISession:
         *,
         need_auth: bool = True,
         aid: str | None = None,
-        gateway: str | None = None,
         background_sync: bool = False,
     ):
         self._ctx = ctx
         self._need_auth = need_auth
         self._client = None
+        self._store = None
         self._foreground_task: asyncio.Task | None = None
         self._background_sync = background_sync
         self._resolved = resolve_profile_config(ctx)
         if aid:
             self._resolved["aid"] = aid
-        if gateway:
-            self._resolved["gateway"] = gateway
 
     @property
     def resolved(self) -> dict[str, Any]:
@@ -183,15 +202,19 @@ class CLISession:
 
     async def __aenter__(self):
         from aun_core import AUNClient
+        from aun_core.errors import StateError
         self._foreground_task = asyncio.current_task()
-        config: dict[str, Any] = {
-            "aun_path": self._resolved["aun_path"],
-        }
-        if self._resolved["gateway"]:
-            config["gateway"] = self._resolved["gateway"]
 
         phase_started = time.perf_counter()
-        self._client = AUNClient(config=config, debug=self._resolved["debug"])
+        if self._need_auth and self._resolved["aid"]:
+            self._store = make_aid_store(self._resolved)
+            loaded = self._store.load(self._resolved["aid"])
+            if not loaded.ok or loaded.data is None:
+                message = loaded.error.message if loaded.error else "identity load failed"
+                raise StateError(message)
+            self._client = AUNClient(loaded.data["aid"], debug=self._resolved["debug"])
+        else:
+            self._client = AUNClient(debug=self._resolved["debug"])
         record_cli_phase("sdk_init", int((time.perf_counter() - phase_started) * 1000))
         self._install_rpc_stats_hooks(self._client)
         debug = self._resolved["debug"]
@@ -202,11 +225,10 @@ class CLISession:
             self._client.set_trace_mode(trace)
 
         if self._need_auth and self._resolved["aid"]:
-            auth_params: dict[str, Any] = {"aid": self._resolved["aid"]}
             if debug:
-                print(f"[DEBUG][cli] authenticate: aid={auth_params['aid']}")
+                print(f"[DEBUG][cli] authenticate: aid={self._resolved['aid']}")
             phase_started = time.perf_counter()
-            auth_result = await self._client.auth.authenticate(auth_params)
+            auth_result = await self._client.authenticate()
             record_cli_phase("authenticate", int((time.perf_counter() - phase_started) * 1000))
             if debug:
                 print(f"[DEBUG][cli] authenticate done: gateway={auth_result.get('gateway')}")
@@ -218,7 +240,7 @@ class CLISession:
                 connect_options["heartbeat_interval"] = 0
             phase_started = time.perf_counter()
             await asyncio.wait_for(
-                self._client.connect(auth_result, connect_options),
+                self._client.connect(connect_options),
                 timeout=self._resolved["timeout"],
             )
             record_cli_phase("connect", int((time.perf_counter() - phase_started) * 1000))
@@ -227,23 +249,15 @@ class CLISession:
         return self._client
 
     def _install_rpc_stats_hooks(self, client: Any) -> None:
-        transport = getattr(client, "_transport", None)
-        if transport is not None and callable(getattr(transport, "call", None)):
-            original_transport_call = transport.call
+        client_call = getattr(client, "call", None)
+        if not callable(client_call):
+            return None
 
-            async def traced_transport_call(method: str, params: dict | None = None, *args: Any, **kwargs: Any) -> Any:
-                return await self._record_rpc_timing(method, original_transport_call, method, params, *args, **kwargs)
+        async def traced_client_call(method: str, params: dict | None = None, *args: Any, **kwargs: Any) -> Any:
+            return await self._record_rpc_timing(method, client_call, method, params, *args, **kwargs)
 
-            transport.call = traced_transport_call
-
-        auth_flow = getattr(client, "_auth", None)
-        if auth_flow is not None and callable(getattr(auth_flow, "_short_rpc", None)):
-            original_short_rpc = auth_flow._short_rpc
-
-            async def traced_short_rpc(gateway_url: str, method: str, params: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-                return await self._record_rpc_timing(method, original_short_rpc, gateway_url, method, params, *args, **kwargs)
-
-            auth_flow._short_rpc = traced_short_rpc
+        client.call = traced_client_call
+        return None
 
     async def _record_rpc_timing(
         self,
@@ -272,13 +286,15 @@ class CLISession:
             return False
         if "transport closed" not in str(error).lower():
             return False
-        return bool(getattr(self._client, "_closing", False))
+        return bool(getattr(self._client, "is_closing", False) or getattr(self._client, "is_closed", False))
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self._client:
             phase_started = time.perf_counter()
             await self._client.close()
             record_cli_phase("close", int((time.perf_counter() - phase_started) * 1000))
+        if self._store:
+            self._store.close()
         return False
 
 

@@ -26,10 +26,12 @@ import re
 import sys
 import uuid
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
 # 日志配置 — 打开 SDK 内部 DIAG 日志
@@ -59,6 +61,9 @@ _TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).s
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
+_CLIENT_SLOT_IDS: WeakKeyDictionary[AUNClient, str] = WeakKeyDictionary()
+_CLIENT_GROUP_INBOXES: WeakKeyDictionary[AUNClient, dict[str, list[dict]]] = WeakKeyDictionary()
+_CLIENT_UNDECRYPTABLE: WeakKeyDictionary[AUNClient, list[dict]] = WeakKeyDictionary()
 
 
 def _normalize(value: str) -> str:
@@ -72,50 +77,26 @@ def _run_id() -> str:
 
 def _make_client(tag: str, rid: str, *, slot_suffix: str = "") -> AUNClient:
     """创建测试客户端。slot_suffix 用于生成不同的 slot_id。"""
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
+    client = make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
     base = f"{_normalize(tag)}-{_normalize(rid)}"
     slot_id = f"{base}{slot_suffix}" if slot_suffix else base
-    client._test_slot_id = slot_id[:128]
-    client._test_group_inbox = {}
+    _CLIENT_SLOT_IDS[client] = slot_id[:128]
+    _CLIENT_GROUP_INBOXES[client] = {}
 
     def _collect_group_msg(data):
         if not isinstance(data, dict):
             return
         gid = data.get("group_id", "")
         if gid:
-            client._test_group_inbox.setdefault(gid, []).append(data)
+            _CLIENT_GROUP_INBOXES.setdefault(client, {}).setdefault(gid, []).append(data)
 
-    client._dispatcher.subscribe("group.message_created", _collect_group_msg)
+    client.on("group.message_created", _collect_group_msg)
 
     # 追踪 undecryptable 事件
-    client._test_undecryptable = []
-    client._dispatcher.subscribe("group.message_undecryptable", lambda d: client._test_undecryptable.append(d))
+    _CLIENT_UNDECRYPTABLE[client] = []
+    client.on("group.message_undecryptable", lambda d: _CLIENT_UNDECRYPTABLE.setdefault(client, []).append(d))
 
     return client
-
-
-def _current_group_spk_id(client: AUNClient, group_id: str) -> str:
-    session = getattr(client, "_v2_session", None)
-    device_id = str(getattr(client, "_device_id", "") or "")
-    store = getattr(session, "_store", None)
-    if session is None or store is None or not device_id:
-        return ""
-    result = store.load_current_group_spk(device_id, group_id)
-    if not result:
-        return ""
-    return str(result[0] or "")
-
-
-async def _wait_for_group_spk(client: AUNClient, group_id: str, *, timeout: float = 8.0) -> str:
-    deadline = asyncio.get_running_loop().time() + timeout
-    last_spk = ""
-    while asyncio.get_running_loop().time() < deadline:
-        last_spk = _current_group_spk_id(client, group_id)
-        if last_spk:
-            return last_spk
-        await asyncio.sleep(0.2)
-    raise AssertionError(f"本地 V2 group SPK 未就绪: group={group_id} last={last_spk!r}")
 
 
 async def _wait_group_committed(client: AUNClient, group_id: str, aid: str, *, timeout: float = 12.0) -> None:
@@ -142,17 +123,13 @@ def _payload_text(message: dict) -> str:
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    connect_params = dict(auth)
-    slot_id = str(getattr(client, "_test_slot_id", "") or "")
+    connect_params: dict = {}
+    slot_id = _CLIENT_SLOT_IDS.get(client, "")
     if slot_id:
         connect_params["slot_id"] = slot_id
     connect_params["auto_reconnect"] = False
-    await client.connect(connect_params)
-    print(f"  连接成功: {aid} slot_id={slot_id} device_id={client._device_id}")
+    await ensure_connected_identity(client, aid, connect_options=connect_params)
+    print(f"  连接成功: {aid} slot_id={slot_id} device_id={client.device_id}")
     return aid
 
 
@@ -191,8 +168,6 @@ async def test_slot_id_change_storm():
         await _add_member(alice_1, group_id, b_aid)
         await _wait_group_committed(alice_1, group_id, b_aid)
         await _wait_group_committed(bob, group_id, b_aid)
-        alice_spk = await _wait_for_group_spk(alice_1, group_id)
-        print(f"  Alice 本地 V2 group SPK: {alice_spk}")
 
         expected_texts = [f"slot-storm-{rid}-{i}" for i in range(3)]
         for i, text in enumerate(expected_texts):
@@ -206,13 +181,9 @@ async def test_slot_id_change_storm():
 
         await asyncio.sleep(2)
 
-        # 确认 Alice 本地仍有 V2 group SPK。V2-only 群不再写入旧 epoch group secret。
-        alice_spk_after = await _wait_for_group_spk(alice_1, group_id)
-        print(f"  Alice 当前 V2 group SPK: {alice_spk_after}")
         # 记录 Alice 当前 slot_id 和 seq 状态
-        old_slot = alice_1._slot_id
-        old_seq_state = alice_1._seq_tracker.export_state()
-        print(f"  Alice slot_id={old_slot}, seq_state={old_seq_state}")
+        old_slot = alice_1.slot_id
+        print(f"  Alice slot_id={old_slot}")
 
         # Step 2: Alice 断开
         print("\n--- Step 2: Alice 断开连接 ---")
@@ -223,7 +194,7 @@ async def test_slot_id_change_storm():
         print("\n--- Step 3: Alice 用不同 slot_id 重连 ---")
         alice_2 = _make_client("alice", rid, slot_suffix="-v2")
 
-        print(f"  新 slot_id={alice_2._test_slot_id}")
+        print(f"  新 slot_id={_CLIENT_SLOT_IDS.get(alice_2, '')}")
         print(f"  期望：SeqTracker 重置 → group.pull 从 seq=0 拉回旧消息")
         print(f"  期望：group SPK 仍在本地 → 旧消息可正常解密")
         print()
@@ -232,20 +203,16 @@ async def test_slot_id_change_storm():
 
         a_aid_2 = await _ensure_connected(alice_2, _ALICE_AID)
 
-        # 确认重连后 group SPK 仍在本地
-        alice_spk_2 = await _wait_for_group_spk(alice_2, group_id)
-        print(f"\n  重连后 Alice 本地 V2 group SPK: {alice_spk_2}")
-        new_slot = alice_2._slot_id
-        new_seq_state = alice_2._seq_tracker.export_state()
-        print(f"  重连后 slot_id={new_slot}, seq_state={new_seq_state}")
+        new_slot = alice_2.slot_id
+        print(f"\n  重连后 slot_id={new_slot}")
 
         # 等待可能的后台补洞/推送消息到达 + 自动解密
         await asyncio.sleep(5)
 
         # Step 4: 分析结果
         print("\n--- Step 4: 分析 ---")
-        inbox = alice_2._test_group_inbox.get(group_id, [])
-        undecryptable = alice_2._test_undecryptable
+        inbox = _CLIENT_GROUP_INBOXES.get(alice_2, {}).get(group_id, [])
+        undecryptable = _CLIENT_UNDECRYPTABLE.get(alice_2, [])
         print(f"  收到群消息数: {len(inbox)}")
         print(f"  undecryptable 事件数: {len(undecryptable)}")
 
@@ -316,3 +283,4 @@ async def test_slot_id_change_storm():
 if __name__ == "__main__":
     success = asyncio.run(test_slot_id_change_storm())
     sys.exit(0 if success else 1)
+

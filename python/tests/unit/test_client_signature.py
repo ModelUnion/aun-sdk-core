@@ -55,7 +55,7 @@ def _generate_ecdsa_keypair():
 def _make_client_with_identity(tmp_path):
     """创建带有完整 identity（含私钥和证书）的 client。"""
     private_key_pem, cert_pem, cert_fingerprint = _generate_ecdsa_keypair()
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = AUNClient()
     client._identity = {
         "aid": "test.example.com",
         "private_key_pem": private_key_pem,
@@ -183,14 +183,14 @@ class TestSignClientOperation:
         assert cs["params_hash"] == expected_hash
 
     def test_no_identity_no_signature(self, tmp_path):
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = AUNClient()
         client._identity = None
         params = {"group_id": "g-test"}
         client._sign_client_operation("group.update", params)
         assert "client_signature" not in params
 
     def test_no_private_key_no_signature(self, tmp_path):
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = AUNClient()
         client._identity = {"aid": "test.example.com"}
         params = {"group_id": "g-test"}
         client._sign_client_operation("group.update", params)
@@ -198,7 +198,7 @@ class TestSignClientOperation:
 
     def test_sign_failure_raises_instead_of_silent_downgrade(self, tmp_path):
         """签名失败时应抛出异常，而非静默降级到无签名请求（PY-012）。"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = AUNClient()
         client._identity = {
             "aid": "test.example.com",
             "private_key_pem": "INVALID-NOT-A-PEM-KEY",  # 故意给无效私钥
@@ -213,7 +213,7 @@ class TestSignClientOperation:
     def test_no_cert_empty_fingerprint(self, tmp_path):
         """没有证书时 cert_fingerprint 为空字符串。"""
         private_key_pem, _, _ = _generate_ecdsa_keypair()
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = AUNClient()
         client._identity = {
             "aid": "test.example.com",
             "private_key_pem": private_key_pem,

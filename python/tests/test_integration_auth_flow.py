@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,7 +15,15 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509 import ocsp
 from cryptography.x509.oid import NameOID
 
-from aun_core import AUNClient
+from aun_core import AIDStore, AUNClient
+from aun_core.discovery import GatewayDiscovery
+from aun_core.keystore.file import FileKeyStore
+from aun_refactor_helpers import (
+    ensure_authenticated_identity,
+    ensure_connected_identity,
+    ensure_registered_identity,
+    make_client_for_path,
+)
 
 
 def _build_ca(subject_cn: str, issuer_cert=None, issuer_key=None):
@@ -113,6 +122,7 @@ class _GatewayState:
     refresh_to_aid: dict[str, str]
     connect_tokens: list[str]
     connect_requests: list[dict]
+    websockets: list[web.WebSocketResponse]
     refresh_calls: list[str]
     downloaded_certs: list[str]
     next_token_id: int = 0
@@ -134,7 +144,7 @@ class LocalGateway:
 
 
 @pytest_asyncio.fixture
-async def local_gateway(tmp_path) -> LocalGateway:
+async def local_gateway(tmp_path, monkeypatch) -> LocalGateway:
     root_key, root_cert, root_pem = _build_ca("local-root")
     issuer_key, issuer_cert, issuer_pem = _build_ca("local-issuer", root_cert, root_key)
     auth_key = ec.generate_private_key(ec.SECP256R1())
@@ -158,6 +168,7 @@ async def local_gateway(tmp_path) -> LocalGateway:
         refresh_to_aid={},
         connect_tokens=[],
         connect_requests=[],
+        websockets=[],
         refresh_calls=[],
         downloaded_certs=[],
     )
@@ -165,6 +176,7 @@ async def local_gateway(tmp_path) -> LocalGateway:
     async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        state.websockets.append(ws)
         await ws.send_json({"jsonrpc": "2.0", "method": "challenge", "params": {"nonce": "gateway-nonce"}})
 
         async for msg in ws:
@@ -246,6 +258,8 @@ async def local_gateway(tmp_path) -> LocalGateway:
                     "error": {"code": -32603, "message": str(exc)},
                 })
 
+        if ws in state.websockets:
+            state.websockets.remove(ws)
         return ws
 
     async def chain_handler(_request: web.Request) -> web.Response:
@@ -291,10 +305,16 @@ async def local_gateway(tmp_path) -> LocalGateway:
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
+    ws_url = f"ws://127.0.0.1:{port}/aun"
+
+    async def fake_discover(self, well_known_url: str, *, timeout: float = 5.0) -> str:
+        return ws_url
+
+    monkeypatch.setattr(GatewayDiscovery, "discover", fake_discover)
 
     try:
         yield LocalGateway(
-            ws_url=f"ws://127.0.0.1:{port}/aun",
+            ws_url=ws_url,
             root_ca_path=str(root_ca_path),
             state=state,
         )
@@ -303,12 +323,10 @@ async def local_gateway(tmp_path) -> LocalGateway:
 
 
 def _make_client(tmp_path, gateway: LocalGateway) -> AUNClient:
-    client = AUNClient({
-        "aun_path": str(tmp_path / "aun"),
-        "root_ca_path": gateway.root_ca_path,
-    })
-    client._gateway_url = gateway.ws_url
-    return client
+    return make_client_for_path(
+        str(tmp_path / "aun"),
+        root_ca_path=gateway.root_ca_path,
+    )
 
 
 @pytest.mark.asyncio
@@ -317,30 +335,31 @@ async def test_local_gateway_full_auth_and_connect(tmp_path, local_gateway: Loca
     aid = "local-auth-full.agentid.pub"
 
     try:
-        created = await client.auth.register_aid({"aid": aid})
-        assert created["aid"] == aid
-        assert "BEGIN CERTIFICATE" in created["cert_pem"]
+        aid_obj = await ensure_registered_identity(client, aid)
+        assert aid_obj.aid == aid
+        assert "BEGIN CERTIFICATE" in aid_obj.cert_pem
 
-        auth = await client.auth.authenticate({"aid": aid})
+        auth = await ensure_authenticated_identity(client, aid)
         assert auth["aid"] == aid
         assert auth["gateway"] == local_gateway.ws_url
         assert auth["access_token"].startswith("access-")
         assert auth["refresh_token"].startswith("refresh-")
 
         await client.connect({
-            **auth,
             "slot_id": "slot-a",
             "delivery_mode": "queue",
             "queue_routing": "sender_affinity",
             "affinity_ttl_ms": 600,
-        }, {"auto_reconnect": False, "heartbeat_interval": 0})
-        assert client.state == "connected"
+            "auto_reconnect": False,
+            "heartbeat_interval": 0,
+        })
+        assert client.state.value == "ready"
 
         pong = await client.call("meta.ping", {})
         assert pong["pong"] is True
         assert any(token == auth["access_token"] for token in local_gateway.state.connect_tokens)
         connect_request = local_gateway.state.connect_requests[-1]
-        assert connect_request["device"] == {"id": client._device_id, "type": "sdk"}
+        assert connect_request["device"] == {"id": client.device_id, "type": "sdk"}
         connect_client = connect_request["client"]
         assert connect_client["slot_id"] == "slot-a"
         assert connect_client["sdk_lang"] == "python"
@@ -361,25 +380,37 @@ async def test_register_aid_recovers_missing_cert_via_download(tmp_path, local_g
     client2 = _make_client(tmp_path / "restore", local_gateway)
 
     try:
-        await client1.auth.register_aid({"aid": aid})
-        identity = client1._keystore.load_identity(aid)
-        client2._keystore.save_key_pair(aid, {
-            "private_key_pem": identity["private_key_pem"],
-            "public_key_der_b64": identity["public_key_der_b64"],
-            "curve": identity["curve"],
-        })
-        remaining = {
-            key: value
-            for key, value in identity.items()
-            if key not in {"private_key_pem", "public_key_der_b64", "curve", "cert"}
-        }
-        client2._keystore.save_identity(aid, remaining)
+        await ensure_registered_identity(client1, aid)
+        source_store = FileKeyStore(tmp_path / "source" / "aun")
+        restore_store = FileKeyStore(tmp_path / "restore" / "aun")
+        try:
+            identity = source_store.load_identity(aid)
+            restore_store.save_key_pair(aid, {
+                "private_key_pem": identity["private_key_pem"],
+                "public_key_der_b64": identity["public_key_der_b64"],
+                "curve": identity["curve"],
+            })
+            remaining = {
+                key: value
+                for key, value in identity.items()
+                if key not in {"private_key_pem", "public_key_der_b64", "curve", "cert"}
+            }
+            restore_store.save_identity(aid, remaining)
+        finally:
+            source_store.close()
+            restore_store.close()
 
-        recovered = await client2.auth.register_aid({"aid": aid})
-        restored = client2._keystore.load_identity(aid)
+        recovered = await ensure_registered_identity(client2, aid)
+        check_store = AIDStore(tmp_path / "restore" / "aun", "", root_ca_path=local_gateway.root_ca_path)
+        try:
+            restored = check_store.load(aid)
+        finally:
+            check_store.close()
 
-        assert recovered["aid"] == aid
-        assert "BEGIN CERTIFICATE" in restored["cert"]
+        assert recovered.aid == aid
+        assert restored.ok
+        assert restored.data is not None
+        assert "BEGIN CERTIFICATE" in restored.data["aid"].cert_pem
         assert aid in local_gateway.state.downloaded_certs
     finally:
         await client1.close()
@@ -392,20 +423,29 @@ async def test_reconnect_flow_refreshes_stale_access_token(tmp_path, local_gatew
     aid = "refresh-reconnect.agentid.pub"
 
     try:
-        await client.auth.register_aid({"aid": aid})
-        auth = await client.auth.authenticate({"aid": aid})
+        auth = await ensure_authenticated_identity(client, aid)
         stale_token = auth["access_token"]
 
-        await client.connect(auth, {"auto_reconnect": False, "heartbeat_interval": 0})
+        await client.connect({
+            "auto_reconnect": True,
+            "heartbeat_interval": 0,
+            "retry": {"initial_delay": 0.01, "max_delay": 0.01, "max_attempts": 3},
+        })
         local_gateway.state.rejected_tokens.add(stale_token)
 
-        await client._transport.close()
-        await client._invoke_reconnect_connect_once()
+        for ws in list(local_gateway.state.websockets):
+            await ws.close()
 
-        assert client.state == "connected"
-        assert client._session_params["access_token"] != stale_token
-        assert client._identity["access_token"] == client._session_params["access_token"]
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=3)
+        while datetime.now(timezone.utc) < deadline:
+            if local_gateway.state.refresh_calls:
+                break
+            await asyncio.sleep(0.05)
+
+        assert client.state.value == "ready"
         assert local_gateway.state.refresh_calls == [auth["refresh_token"]]
         assert local_gateway.state.connect_tokens.count(stale_token) >= 2
+        assert any(token != stale_token for token in local_gateway.state.connect_tokens)
     finally:
         await client.close()
+

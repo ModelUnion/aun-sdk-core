@@ -76,7 +76,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, ConnectionState
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -143,24 +144,17 @@ def _skip(name: str, reason: str):
 
 
 def _make_client() -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
     # 如果连接状态不允许 connect，先 close
-    if client._state not in ("idle", "closed"):
+    if client.state not in {ConnectionState.NO_IDENTITY, ConnectionState.CLOSED}:
         try:
             await client.close()
         except Exception:
             pass
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth, {"auto_reconnect": True})
-    return aid
+    return await ensure_connected_identity(client, aid, connect_options={"auto_reconnect": True})
 
 
 def _mailpit_get_messages() -> list:
@@ -1752,3 +1746,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

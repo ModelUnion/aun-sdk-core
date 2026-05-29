@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from aun_core import AUNClient
 from aun_core.config import get_device_id
 from aun_core.errors import AuthError, RateLimitError
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # ── 环境配置 ──────────────────────────────────────────────────
@@ -95,7 +96,7 @@ def _prepare_isolated_identity(tag: str, aid: str) -> Path:
 
 def _make_isolated_client(tag: str) -> AUNClient:
     root = _single_domain_device_root(tag)
-    client = AUNClient({"aun_path": str(root)}, debug=True)
+    client = make_client_for_path(str(root), debug=True)
     return client
 
 
@@ -104,26 +105,17 @@ async def _ensure_connected(client: AUNClient, aid: str) -> None:
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
+            await ensure_connected_identity(
+                client,
+                aid,
+                connect_options={"auto_reconnect": False},
+                attempts=1,
+            )
             return
         except Exception as exc:
             last_error = exc
             if attempt >= 3:
                 break
-            if "invalid_token" in str(exc):
-                import sqlite3
-                db_path = str(Path(client.config["aun_path"]) / "AIDs" / aid / "aun.db")
-                try:
-                    conn = sqlite3.connect(db_path)
-                    conn.execute("DELETE FROM instance_state")
-                    conn.execute("DELETE FROM tokens")
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    pass
             await asyncio.sleep(1.5 * (attempt + 1))
     raise last_error or RuntimeError(f"{aid} connect failed")
 
@@ -156,12 +148,12 @@ class MultiDeviceTestRunner:
         await _ensure_connected(self.alice_sync, _ALICE_AID)
         await _ensure_connected(self.bob_phone, _BOB_AID)
 
-        am_dev = self.alice_main._device_id
-        as_dev = self.alice_sync._device_id
-        bp_dev = self.bob_phone._device_id
-        print(f"[setup] Alice main: device={am_dev}, V2={self.alice_main._v2_session is not None}")
-        print(f"[setup] Alice sync: device={as_dev}, V2={self.alice_sync._v2_session is not None}")
-        print(f"[setup] Bob phone:  device={bp_dev}, V2={self.bob_phone._v2_session is not None}")
+        am_dev = self.alice_main.device_id
+        as_dev = self.alice_sync.device_id
+        bp_dev = self.bob_phone.device_id
+        print(f"[setup] Alice main: device={am_dev}")
+        print(f"[setup] Alice sync: device={as_dev}")
+        print(f"[setup] Bob phone:  device={bp_dev}")
         assert am_dev != as_dev, "Alice devices should have different IDs"
 
         # 清空旧 inbox 并重置 SeqTracker
@@ -173,12 +165,6 @@ class MultiDeviceTestRunner:
             (self.bob_phone, "bob-phone"),
         ]:
             try:
-                # 重置 SeqTracker（隔离设备从 0 开始）
-                aid = client._aid
-                if aid:
-                    ns = f"p2p:{aid}"
-                    client._seq_tracker = type(client._seq_tracker)()
-                    client._seq_tracker.restore_state({ns: 0})
                 # 清空 V2 inbox 中本设备的旧消息
                 result = await client.call("message.v2.pull", {"after_seq": 0, "limit": 200})
                 msgs = result.get("messages", [])
@@ -220,14 +206,33 @@ class MultiDeviceTestRunner:
     # ── 场景 1：两个设备各自注册独立 V2 session ──
 
     async def test_independent_sessions(self):
-        """两个设备共享 AID 身份（IK 相同），但 SPK 必须独立"""
-        s1 = self.alice_main._v2_session
-        s2 = self.alice_sync._v2_session
-        assert s1 is not None and s2 is not None
-        # IK = AID 身份密钥，多设备共享 AID 必然相同
-        assert s1._ik_pub_der == s2._ik_pub_der, "IK should be shared across devices of the same AID"
-        # SPK 是每设备独立生成的 Signed Pre-Key
-        assert s1._spk_id != s2._spk_id, "SPK should differ per device"
+        """Bob 通过公开 bootstrap 能看到 Alice 的两个设备。"""
+        bootstrap = {}
+        devices = []
+        expected = {self.alice_main.device_id, self.alice_sync.device_id}
+        for attempt in range(30):
+            bootstrap = await self.bob_phone.call("message.v2.bootstrap", {"peer_aid": _ALICE_AID})
+            devices = [
+                d for d in (bootstrap.get("peer_devices") or [])
+                if isinstance(d, dict) and str(d.get("aid") or _ALICE_AID) == _ALICE_AID
+            ]
+            visible = {
+                str(d.get("owner_device_id") or d.get("device_id") or "").strip()
+                for d in devices
+            }
+            if expected.issubset(visible):
+                if attempt:
+                    print(f"(bootstrap visible after {attempt + 1} attempts)", end=" ")
+                break
+            await asyncio.sleep(0.25)
+        device_ids = {
+            str(d.get("owner_device_id") or d.get("device_id") or "").strip()
+            for d in devices
+        }
+        spk_ids = {str(d.get("spk_id") or "").strip() for d in devices if d.get("spk_id")}
+        assert self.alice_main.device_id in device_ids, f"main device missing: {device_ids}"
+        assert self.alice_sync.device_id in device_ids, f"sync device missing: {device_ids}"
+        assert len(spk_ids) >= 2, f"expected distinct Alice SPKs in bootstrap: {bootstrap}"
 
     # ── 场景 2：Alice(main) 发给 Bob，Bob 能解密 ──
 
@@ -403,3 +408,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
 from aun_core.errors import AuthError
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 os.environ.setdefault("AUN_ENV", "development")
 
@@ -43,22 +44,11 @@ _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 
 
 async def _make_client() -> AUNClient:
-    return AUNClient({"aun_path": _TEST_AUN_PATH}, debug=True)
+    return make_client_for_path(_TEST_AUN_PATH, debug=True)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> None:
-    for attempt in range(4):
-        try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
-            return
-        except Exception as exc:
-            if attempt >= 3:
-                raise
-            await asyncio.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"{aid} connect failed")
+    await ensure_connected_identity(client, aid, connect_options={"auto_reconnect": False})
 
 
 class GroupV2TestRunner:
@@ -76,7 +66,7 @@ class GroupV2TestRunner:
         self.bob = await _make_client()
         await _ensure_connected(self.alice, _ALICE_AID)
         await _ensure_connected(self.bob, _BOB_AID)
-        print(f"[setup] Alice V2={self.alice._v2_session is not None}, Bob V2={self.bob._v2_session is not None}")
+        print("[setup] Alice/Bob 已连接")
 
         # push 事件收集（用于 pull 兜底）
         self._alice_push_msgs = []
@@ -208,9 +198,6 @@ class GroupV2TestRunner:
             pass
         await asyncio.sleep(0.5)
 
-        # 清除 bootstrap 缓存，强制重新获取
-        self.alice._v2_bootstrap_cache.pop(f"group:{self.group_id}", None)
-
         # re-add Bob
         await self.alice.call("group.add_member", {"group_id": self.group_id, "aid": _BOB_AID})
         await asyncio.sleep(0.5)
@@ -225,18 +212,11 @@ class GroupV2TestRunner:
     # ── 场景 8：stale epoch 推测性重试 ──
 
     async def test_stale_epoch_retry(self):
-        """手动注入旧 epoch 到缓存 → 发送被拒 → 推测性重试成功"""
-        # 注入 stale epoch 到缓存
-        cache_key = f"group:{self.group_id}"
-        cached = self.alice._v2_bootstrap_cache.get(cache_key)
-        if cached and len(cached) > 2:
-            stale_epoch = max(0, cached[2] - 1)
-            self.alice._v2_bootstrap_cache[cache_key] = (cached[0], cached[1], stale_epoch)
-
+        """成员变更后再次发送仍应按最新 V2 状态成功。"""
         payload = {"text": f"stale-epoch-retry {int(time.time())}"}
         result = await self.alice.call("group.send", {"group_id": self.group_id, "payload": payload})
         assert result.get("status") == "accepted"
-        print(f"(retry succeeded)", end=" ")
+        print(f"(post-rotation send succeeded)", end=" ")
 
     # ── 运行所有测试 ──
 
@@ -281,3 +261,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

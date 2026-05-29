@@ -1,59 +1,53 @@
 """
-AUN E2EE V2 M1: auth.connect 协商 + 网关 V1 拦截 测试
+AUN E2EE V2 M1: auth.connect V2-only 能力声明与旧加密信封拦截测试。
 
 测试目标：
-1. auth.connect 请求中 capabilities 含 supported_p2p_e2ee / supported_group_e2ee
-2. 服务端响应中回传 server_supported_p2p_e2ee / server_supported_group_e2ee
-3. 网关 V1 加密拦截逻辑（require_e2ee_v2 / require_group_e2ee_v2 开关）
-4. groups 表 group_e2ee_protocol 字段
-5. 明文消息不受影响
+1. SDK auth.connect 请求中 supported_p2p_e2ee / supported_group_e2ee 只声明 V2。
+2. 调用方不能通过额外字段把 SDK 降级为 legacy capability。
+3. 旧 P2P / Group 加密信封被拒绝，V2 与明文路径不受影响。
+4. 群协议字段默认 V2 且不可降级。
 """
-import pytest
 
-
-# ══════════════════════════════════════════════════════════════
-# 1. auth.connect 能力协商
-# ══════════════════════════════════════════════════════════════
 
 class TestAuthConnectE2EECapabilities:
-    """auth.connect 请求/响应中的 E2EE 版本协商"""
+    """auth.connect 请求/响应中的 E2EE V2-only 能力协商。"""
 
-    def test_client_sends_supported_e2ee_in_capabilities(self):
-        """客户端 connect 时在 capabilities 中上报 supported_p2p_e2ee / supported_group_e2ee"""
-        # 模拟客户端发送的 auth.connect params
+    def test_client_sends_v2_only_capabilities(self):
         params = {
             "auth": {"method": "aid", "aid": "test.agentid.pub", "token": "..."},
             "capabilities": {
-                "supported_p2p_e2ee": ["e2ee", "e2ee_v2"],
-                "supported_group_e2ee": ["group_e2ee", "group_e2ee_v2"],
+                "supported_p2p_e2ee": ["e2ee_v2"],
+                "supported_group_e2ee": ["group_e2ee_v2"],
             },
             "protocol": {"min": "1.0", "max": "1.0"},
             "device": {"id": "dev-test"},
         }
-        # 验证 capabilities 结构正确
-        caps = params["capabilities"]
-        assert "supported_p2p_e2ee" in caps
-        assert "supported_group_e2ee" in caps
-        assert "e2ee_v2" in caps["supported_p2p_e2ee"]
-        assert "group_e2ee_v2" in caps["supported_group_e2ee"]
 
-    def test_old_client_no_e2ee_capabilities(self):
-        """老客户端不传 supported_*_e2ee → 服务端按 V1 处理（向后兼容）"""
-        params = {
-            "auth": {"method": "aid", "aid": "test.agentid.pub", "token": "..."},
-            "capabilities": {},  # 老客户端无 e2ee 字段
-            "protocol": {"min": "1.0", "max": "1.0"},
+        caps = params["capabilities"]
+        assert caps["supported_p2p_e2ee"] == ["e2ee_v2"]
+        assert caps["supported_group_e2ee"] == ["group_e2ee_v2"]
+        assert "e2ee" not in caps["supported_p2p_e2ee"]
+        assert "group_e2ee" not in caps["supported_group_e2ee"]
+
+    def test_external_legacy_capability_override_is_ignored(self):
+        requested_extra_info = {
+            "_capabilities": {
+                "supported_p2p_e2ee": ["e2ee"],
+                "supported_group_e2ee": ["group_e2ee"],
+            },
+            "note": "kept",
         }
-        caps = params["capabilities"]
-        # 缺失时服务端应默认为 ["e2ee"] / ["group_e2ee"]
-        supported_p2p = caps.get("supported_p2p_e2ee", ["e2ee"])
-        supported_group = caps.get("supported_group_e2ee", ["group_e2ee"])
-        assert supported_p2p == ["e2ee"]
-        assert supported_group == ["group_e2ee"]
+        effective_capabilities = {
+            "supported_p2p_e2ee": ["e2ee_v2"],
+            "supported_group_e2ee": ["group_e2ee_v2"],
+        }
+        sanitized_extra_info = {k: v for k, v in requested_extra_info.items() if not k.startswith("_")}
 
-    def test_server_response_includes_e2ee_capabilities(self):
-        """服务端 hello_result 中回传 server 支持的 e2ee 版本"""
-        # 模拟服务端响应
+        assert effective_capabilities["supported_p2p_e2ee"] == ["e2ee_v2"]
+        assert effective_capabilities["supported_group_e2ee"] == ["group_e2ee_v2"]
+        assert sanitized_extra_info == {"note": "kept"}
+
+    def test_server_response_may_advertise_superset_without_downgrading_client(self):
         hello_result = {
             "status": "ok",
             "capabilities": {
@@ -61,186 +55,97 @@ class TestAuthConnectE2EECapabilities:
                 "server_supported_group_e2ee": ["group_e2ee", "group_e2ee_v2"],
             },
         }
+        client_caps = {
+            "supported_p2p_e2ee": ["e2ee_v2"],
+            "supported_group_e2ee": ["group_e2ee_v2"],
+        }
+
         server_caps = hello_result["capabilities"]
         assert "e2ee_v2" in server_caps["server_supported_p2p_e2ee"]
         assert "group_e2ee_v2" in server_caps["server_supported_group_e2ee"]
+        assert client_caps["supported_p2p_e2ee"] == ["e2ee_v2"]
+        assert client_caps["supported_group_e2ee"] == ["group_e2ee_v2"]
 
 
-# ═════════════════════════════════════════════════════════════
-# 2. 网关 V1 加密拦截
-# ══════════════════════════════════════════════════════════════
+class TestGatewayLegacyRejection:
+    """网关对旧加密信封的 V2-only 拦截。"""
 
-class TestGatewayV1Rejection:
-    """网关按域独立拦截 V1 加密消息"""
-
-    def _simulate_gateway_check(self, payload_type: str, payload_version: str,
-                                 require_e2ee_v2: bool, require_group_e2ee_v2: bool,
-                                 method: str = "message.send"):
-        """模拟网关拦截逻辑"""
-        # 仅对 send / thought.put 类方法检查
+    def _simulate_gateway_check(self, payload_type: str, payload_version: str, method: str = "message.send"):
         if method not in ("message.send", "group.send", "message.thought.put", "group.thought.put"):
             return None
-        # P2P V1 加密
         if payload_type == "e2ee.encrypted":
-            if require_e2ee_v2:
-                return {"error": {"code": -33020, "message": "V1 P2P encryption rejected"}}
-
-        # Group 加密
-        if payload_type == "e2ee.group_encrypted":
-            if payload_version != "v2" and require_group_e2ee_v2:
-                return {"error": {"code": -33020, "message": "V1 group encryption rejected"}}
-
-        # 通过
+            return {"error": {"code": -33020, "message": "legacy P2P encryption rejected"}}
+        if payload_type == "e2ee.group_encrypted" and payload_version != "v2":
+            return {"error": {"code": -33020, "message": "legacy group encryption rejected"}}
         return None
 
-    def test_v1_p2p_rejected_when_switch_on(self):
-        """require_e2ee_v2=true → V1 P2P 加密被拒"""
-        result = self._simulate_gateway_check(
-            payload_type="e2ee.encrypted",
-            payload_version="",
-            require_e2ee_v2=True,
-            require_group_e2ee_v2=False,
-        )
+    def test_legacy_p2p_rejected(self):
+        result = self._simulate_gateway_check("e2ee.encrypted", "")
         assert result is not None
         assert result["error"]["code"] == -33020
 
-    def test_v1_p2p_allowed_when_switch_off(self):
-        """require_e2ee_v2=false → V1 P2P 加密放行"""
-        result = self._simulate_gateway_check(
-            payload_type="e2ee.encrypted",
-            payload_version="",
-            require_e2ee_v2=False,
-            require_group_e2ee_v2=False,
-        )
-        assert result is None
-
-    def test_v1_group_rejected_when_switch_on(self):
-        """require_group_e2ee_v2=true → V1 Group 加密被拒"""
-        result = self._simulate_gateway_check(
-            payload_type="e2ee.group_encrypted",
-            payload_version="1",  # V1 版本
-            require_e2ee_v2=True,
-            require_group_e2ee_v2=True,
-        )
+    def test_legacy_group_rejected(self):
+        result = self._simulate_gateway_check("e2ee.group_encrypted", "1", method="group.send")
         assert result is not None
         assert result["error"]["code"] == -33020
 
-    def test_v1_group_allowed_when_switch_off(self):
-        """require_group_e2ee_v2=false → V1 Group 加密放行"""
-        result = self._simulate_gateway_check(
-            payload_type="e2ee.group_encrypted",
-            payload_version="1",
-            require_e2ee_v2=True,
-            require_group_e2ee_v2=False,
-        )
+    def test_v2_group_allowed(self):
+        result = self._simulate_gateway_check("e2ee.group_encrypted", "v2", method="group.send")
         assert result is None
 
-    def test_v2_group_always_allowed(self):
-        """V2 Group 加密永远放行（无论开关状态）"""
-        result = self._simulate_gateway_check(
-            payload_type="e2ee.group_encrypted",
-            payload_version="v2",
-            require_e2ee_v2=True,
-            require_group_e2ee_v2=True,
-        )
+    def test_plaintext_allowed(self):
+        result = self._simulate_gateway_check("text", "", method="message.send")
         assert result is None
 
-    def test_plaintext_always_allowed(self):
-        """明文消息永远不受影响"""
-        result = self._simulate_gateway_check(
-            payload_type="text",
-            payload_version="",
-            require_e2ee_v2=True,
-            require_group_e2ee_v2=True,
-        )
+    def test_non_send_methods_not_intercepted(self):
+        result = self._simulate_gateway_check("e2ee.encrypted", "", method="meta.ping")
         assert result is None
 
-    def test_switches_independent(self):
-        """两个开关独立——P2P 开 + Group 关"""
-        # V1 P2P 被拒
-        r1 = self._simulate_gateway_check("e2ee.encrypted", "", True, False)
-        assert r1 is not None
-        # V1 Group 放行
-        r2 = self._simulate_gateway_check("e2ee.group_encrypted", "1", True, False)
-        assert r2 is None
-
-
-# ══════════════════════════════════════════════════════════════
-# 3. groups 表 group_e2ee_protocol 字段
-# ══════════════════════════════════════════════════════════════
 
 class TestGroupE2EEProtocolField:
-    """groups 表 group_e2ee_protocol 字段"""
+    """groups 表 group_e2ee_protocol 字段的 V2-only 语义。"""
 
-    def test_default_value_is_v1(self):
-        """默认值为 'group_e2ee'（V1），向后兼容"""
-        # 模拟旧群记录
-        group_record = {"group_id": "g-old", "group_e2ee_protocol": "group_e2ee"}
-        assert group_record["group_e2ee_protocol"] == "group_e2ee"
-
-    def test_v2_group_creation(self):
-        """V2 群创建时设置 group_e2ee_protocol='group_e2ee_v2'"""
+    def test_default_value_is_v2(self):
         group_record = {"group_id": "g-new", "group_e2ee_protocol": "group_e2ee_v2"}
         assert group_record["group_e2ee_protocol"] == "group_e2ee_v2"
 
     def test_protocol_immutable_after_creation(self):
-        """群创建后 group_e2ee_protocol 不可变更"""
         group_record = {"group_id": "g-test", "group_e2ee_protocol": "group_e2ee_v2"}
-        # 尝试变更应被拒绝（业务逻辑层保证）
         original = group_record["group_e2ee_protocol"]
-        # 模拟：不允许修改
         assert original == "group_e2ee_v2"
 
-    def test_v1_client_rejected_from_v2_group(self):
-        """V1 客户端（不支持 group_e2ee_v2）尝试加入 V2 群 → -33020"""
-        client_supported = ["group_e2ee"]  # 老客户端
+    def test_legacy_client_rejected_from_v2_group(self):
+        client_supported = ["group_e2ee"]
         group_protocol = "group_e2ee_v2"
 
         if group_protocol not in client_supported:
-            error = {"code": -33020, "message": "E2EE_VERSION_UNSUPPORTED",
-                     "data": {"required_protocol": group_protocol}}
+            error = {
+                "code": -33020,
+                "message": "E2EE_VERSION_UNSUPPORTED",
+                "data": {"required_protocol": group_protocol},
+            }
             assert error["code"] == -33020
             assert error["data"]["required_protocol"] == "group_e2ee_v2"
 
-    def test_v2_client_in_v1_group_uses_v1(self):
-        """V2 客户端加入 V1 群时按 V1 协议操作"""
-        client_supported = ["group_e2ee", "group_e2ee_v2"]
-        group_protocol = "group_e2ee"
-        # V2 客户端在 V1 群中降级到 V1
-        effective_protocol = group_protocol  # 群级决定
-        assert effective_protocol == "group_e2ee"
+    def test_v2_client_uses_v2_without_downgrade(self):
+        client_supported = ["group_e2ee_v2"]
+        group_protocol = "group_e2ee_v2"
+        effective_protocol = group_protocol if group_protocol in client_supported else None
+        assert effective_protocol == "group_e2ee_v2"
 
-
-# ══════════════════════════════════════════════════════════════
-# 4. 明文消息 smoke
-# ══════════════════════════════════════════════════════════════
 
 class TestPlaintextSmoke:
-    """明文消息不受 V2 改动影响"""
+    """明文消息不受 V2-only 加密约束影响。"""
 
     def test_plaintext_p2p_unaffected(self):
-        """明文 P2P 消息结构不含 e2ee 字段"""
-        msg = {
-            "type": "text",
-            "payload": {"text": "hello"},
-        }
+        msg = {"type": "text", "payload": {"text": "hello"}}
         assert msg["type"] == "text"
-        assert "e2ee" not in msg["type"]
 
     def test_plaintext_group_unaffected(self):
-        """明文群消息结构不含 e2ee 字段"""
-        msg = {
-            "type": "text",
-            "payload": {"text": "hello group"},
-        }
+        msg = {"type": "text", "payload": {"text": "hello group"}}
         assert msg["type"] == "text"
 
     def test_plaintext_not_intercepted_by_gateway(self):
-        """明文消息不被网关拦截（即使两个开关都开）"""
-        # 复用 gateway check 逻辑
         payload_type = "text"
-        # 明文 type 不匹配任何加密类型 → 放行
-        is_v1_p2p = payload_type == "e2ee.encrypted"
-        is_group_encrypted = payload_type == "e2ee.group_encrypted"
-        assert not is_v1_p2p
-        assert not is_group_encrypted
+        assert payload_type != "e2ee.encrypted"
+        assert payload_type != "e2ee.group_encrypted"

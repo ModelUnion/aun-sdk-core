@@ -48,12 +48,10 @@ def _default_profile_path(name: str) -> str:
     return str(Path.home() / ".aun" / "profiles" / name)
 
 
-def _new_profile_data(name: str, aid: Optional[str], gateway: Optional[str], aun_path: Optional[str]) -> dict:
+def _new_profile_data(name: str, aid: Optional[str], aun_path: Optional[str]) -> dict:
     data = {"aun_path": aun_path or _default_profile_path(name)}
     if aid:
         data["aid"] = aid
-    if gateway:
-        data["gateway"] = gateway
     return data
 
 
@@ -136,7 +134,7 @@ def profile_list(ctx: typer.Context) -> None:
         if not profiles:
             print("  (no profiles)")
             return
-        headers = ["PROFILE", "AID", "GATEWAY", "ACTIVE_GROUP", "CURRENT", "NEW_TAB_DEFAULT"]
+        headers = ["PROFILE", "AID", "ACTIVE_GROUP", "CURRENT", "NEW_TAB_DEFAULT"]
         rows = []
         for name, prof in profiles.items():
             current_mark = "*" if name == current else ""
@@ -144,7 +142,6 @@ def profile_list(ctx: typer.Context) -> None:
             rows.append([
                 name,
                 prof.get("aid", ""),
-                prof.get("gateway", ""),
                 prof.get("active_group", ""),
                 current_mark,
                 default_mark,
@@ -169,7 +166,6 @@ def profile_current(ctx: typer.Context) -> None:
         "Source": source,
         "Default for new tabs": default_profile,
         "AID": prof.get("aid", ""),
-        "Gateway": prof.get("gateway", ""),
         "Active Group": prof.get("active_group", ""),
         "Session": get_terminal_session_id(),
     }
@@ -179,7 +175,6 @@ def profile_current(ctx: typer.Context) -> None:
             "source": source,
             "default_for_new_tabs": default_profile,
             "aid": prof.get("aid", ""),
-            "gateway": prof.get("gateway", ""),
             "active_group": prof.get("active_group", ""),
             "session_id": get_terminal_session_id(),
         })
@@ -192,7 +187,6 @@ def profile_create(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="要创建的 profile 名称"),
     aid: Optional[str] = typer.Option(None, "--aid", help="绑定的默认 AID"),
-    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="默认网关地址"),
     aun_path: Optional[str] = typer.Option(None, "--aun-path", help="profile 数据目录"),
     switch: bool = typer.Option(True, "--switch/--no-switch", help="创建后切换当前终端标签页到该 profile"),
 ) -> None:
@@ -206,7 +200,7 @@ def profile_create(
         output_error(f"Profile '{name}' already exists")
         raise typer.Exit(1)
 
-    profiles[name] = _new_profile_data(name, aid, gateway, aun_path)
+    profiles[name] = _new_profile_data(name, aid, aun_path)
     if switch:
         cfg.setdefault("default", {})
         cfg["default"]["profile"] = name
@@ -231,7 +225,6 @@ def profile_switch(
     name: str = typer.Argument(..., help="要切换到的 profile 名称"),
     create: bool = typer.Option(False, "--create", help="profile 不存在时创建"),
     aid: Optional[str] = typer.Option(None, "--aid", help="创建时绑定的默认 AID"),
-    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="创建时使用的默认网关地址"),
     aun_path: Optional[str] = typer.Option(None, "--aun-path", help="创建时使用的 profile 数据目录"),
 ) -> None:
     """切换当前终端标签页 profile"""
@@ -244,7 +237,7 @@ def profile_switch(
         if not create:
             output_error(f"Profile '{name}' not found", hint=f"Create it first: aun profile create {name}")
             raise typer.Exit(1)
-        profiles[name] = _new_profile_data(name, aid, gateway, aun_path)
+        profiles[name] = _new_profile_data(name, aid, aun_path)
 
     cfg.setdefault("default", {})
     cfg["default"]["profile"] = name

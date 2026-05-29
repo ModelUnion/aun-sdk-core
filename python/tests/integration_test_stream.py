@@ -52,6 +52,7 @@ except ImportError:
     sys.exit(1)
 
 from aun_core import AUNClient, AuthError, RateLimitError
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # websockets v14+ 将 extra_headers 更名为 additional_headers
@@ -130,29 +131,11 @@ _assert_fixed_aid_layout()
 # ---------------------------------------------------------------------------
 
 def _make_client() -> AUNClient:
-    client = AUNClient({
-        "aun_path": _TEST_AUN_PATH,
-    })
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    last_error: Exception | None = None
-    for attempt in range(4):
-        try:
-            auth = await client.auth.authenticate({"aid": aid})
-            await client.connect(auth)
-            return aid
-        except (AuthError, RateLimitError) as exc:
-            last_error = exc
-            if attempt >= 3:
-                break
-            await asyncio.sleep(1.5 * (attempt + 1))
-    raise last_error or RuntimeError(f"{aid} connect failed")
+    return await ensure_connected_identity(client, aid)
 
 
 def _nossl_ctx():
@@ -1164,3 +1147,4 @@ async def run_all():
 if __name__ == "__main__":
     ok = asyncio.run(run_all())
     sys.exit(0 if ok else 1)
+

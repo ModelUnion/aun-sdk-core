@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -25,6 +26,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient, AuthError, RateLimitError
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +47,7 @@ _TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).s
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
+_CLIENT_SLOT_IDS: WeakKeyDictionary[AUNClient, str] = WeakKeyDictionary()
 
 
 # ---------------------------------------------------------------------------
@@ -56,23 +59,20 @@ def _rid() -> str:
 
 
 def _make_client(tag: str) -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH}, debug=True)
-    client._config_model.require_forward_secrecy = False
+    client = make_client_for_path(_TEST_AUN_PATH, debug=True, require_forward_secrecy=False)
     # 固定 slot_id，确保 SeqTracker cursor 持久化，避免每次从 seq=0 拉全量历史
-    client._test_slot_id = f"echo-{tag}"
+    _CLIENT_SLOT_IDS[client] = f"echo-{tag}"
     return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> None:
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            slot_id = getattr(client, "_test_slot_id", "")
+            connect_params = {"auto_reconnect": False}
+            slot_id = _CLIENT_SLOT_IDS.get(client, "")
             if slot_id:
                 connect_params["slot_id"] = slot_id
-            connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
+            await ensure_connected_identity(client, aid, connect_options=connect_params, attempts=1)
             # 清空旧 V2 inbox（ack 到最大 seq），避免历史 gap 卡住 ordered queue
             try:
                 result = await client.call("message.v2.pull", {"after_seq": 0, "limit": 200})
@@ -80,13 +80,6 @@ async def _ensure_connected(client: AUNClient, aid: str) -> None:
                 if msgs:
                     max_seq = max(m.get("seq", 0) for m in msgs)
                     await client.call("message.v2.ack", {"up_to_seq": max_seq})
-                    if aid and client._aid:
-                        ns = f"p2p:{client._aid}"
-                        tracker = client._seq_tracker._get(ns)
-                        tracker.contiguous_seq = max_seq
-                        tracker.max_seen_seq = max_seq
-                        tracker.received_seqs.clear()
-                        tracker.pending_gaps.clear()
             except Exception:
                 pass
             await asyncio.sleep(0.5)
@@ -423,3 +416,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

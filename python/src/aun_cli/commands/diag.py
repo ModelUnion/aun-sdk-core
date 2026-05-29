@@ -45,10 +45,10 @@ def status(ctx: typer.Context) -> None:
 
     async def _run():
         async with CLISession(ctx) as client:
-            result = await client.status()
+            result = await client.call("meta.status", {})
             return {
                 "aid": client.aid,
-                "gateway": client._gateway_url,
+                "gateway": client.gateway_url,
                 "state": client.state,
                 "status": result,
             }
@@ -82,7 +82,7 @@ def ping(
             results = []
             for _ in range(count):
                 t0 = time.time()
-                resp = await client.ping({"target": target})
+                resp = await client.call("meta.ping", {"target": target})
                 latency_ms = int((time.time() - t0) * 1000)
                 results.append({"response": resp, "latency_ms": latency_ms})
             return results
@@ -128,18 +128,16 @@ def doctor(ctx: typer.Context) -> None:
 
     gateway_ok = False
     auth_ok = False
-    gateway_url = resolved["gateway"] or ""
+    gateway_url = ""
 
-    if aid and gateway_url:
+    if aid:
         async def _check():
             nonlocal gateway_ok, auth_ok
-            async with CLISession(ctx, need_auth=False) as client:
-                gateway_ok = await client.check_gateway_health(
-                    gateway_url, timeout=resolved["timeout"])
-                if gateway_ok:
-                    auth_result = await client.auth.authenticate({"aid": aid})
-                    await client.connect(auth_result)
-                    auth_ok = client.state.value == "connected"
+            nonlocal gateway_url
+            async with CLISession(ctx, aid=aid) as client:
+                gateway_url = client.gateway_url or ""
+                gateway_ok = bool(client.is_ready)
+                auth_ok = client.state.value == "ready"
 
         try:
             run_async(_check())
@@ -147,7 +145,7 @@ def doctor(ctx: typer.Context) -> None:
             pass
 
     checks.append({"name": "Gateway reachable", "ok": gateway_ok,
-                   "detail": gateway_url or "(not configured)"})
+                   "detail": gateway_url or "(auto discovery pending)"})
     checks.append({"name": "Authentication", "ok": auth_ok,
                    "detail": "success" if auth_ok else "failed"})
 

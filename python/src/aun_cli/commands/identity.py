@@ -4,11 +4,58 @@ from typing import Optional
 
 import typer
 
-from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config
+from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config, make_aid_store
 from aun_cli.config import get_profile, set_profile
 from aun_cli.output import output_dict, output_success, output_json, output_table, is_json_mode, set_json_mode
 
 identity_app = typer.Typer(name="identity", help="身份管理", no_args_is_help=True)
+
+
+def _unwrap_result(result, action: str):
+    if result.ok and result.data is not None:
+        return result.data
+    message = result.error.message if result.error else f"{action} failed"
+    raise RuntimeError(message)
+
+
+def _diagnose_payload(data: dict) -> dict:
+    local_raw = data.get("local", {}) if isinstance(data, dict) else {}
+    remote_raw = data.get("remote", {}) if isinstance(data, dict) else {}
+    local_cert = bool(local_raw.get("cert") or data.get("local_valid") or data.get("localValid"))
+    local_key = bool(local_raw.get("private_key") or data.get("local_valid") or data.get("localValid"))
+    remote_exists = data.get("remote_registered", data.get("remoteRegistered", remote_raw.get("exists")))
+    status = str(data.get("status") or "")
+    suggestions = data.get("suggestions") if isinstance(data.get("suggestions"), list) else []
+    return {
+        "aid": data.get("aid"),
+        "status": status,
+        "can_register": status == "available",
+        "localValid": bool(data.get("local_valid", data.get("localValid", False))),
+        "remoteRegistered": bool(data.get("remote_registered", data.get("remoteRegistered", False))),
+        "certMatch": bool(data.get("cert_match", data.get("certMatch", False))),
+        "suggestions": suggestions,
+        "local": {
+            "exists": local_cert or local_key,
+            "complete": local_cert and local_key,
+            "private_key": local_key,
+            "public_key": local_cert,
+            "certificate": {
+                "present": local_cert,
+                "valid": local_cert,
+                "expired": False,
+                "not_after": "",
+                "fingerprint": "",
+            },
+            "issues": [local_raw["error"]["message"]] if isinstance(local_raw.get("error"), dict) else [],
+        },
+        "remote": {
+            "checked": bool(remote_raw.get("checked")),
+            "exists": remote_exists,
+            "status": "registered" if remote_exists is True else "available" if remote_exists is False else "unknown",
+            "source": "pki",
+            "error": remote_raw.get("error"),
+        },
+    }
 
 
 @identity_app.command("list")
@@ -17,8 +64,12 @@ def identity_list(ctx: typer.Context) -> None:
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=False) as client:
-            return client.list_identities()
+        resolved = resolve_profile_config(ctx)
+        store = make_aid_store(resolved)
+        try:
+            return _unwrap_result(store.list(), "list identities")["identities"]
+        finally:
+            store.close()
 
     try:
         identities = run_async(_run())
@@ -46,8 +97,12 @@ def identity_check(
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=False) as client:
-            return await client.auth.check_aid({"aid": aid})
+        resolved = resolve_profile_config(ctx)
+        store = make_aid_store(resolved)
+        try:
+            return _diagnose_payload(_unwrap_result(await store.diagnose(aid), "diagnose identity"))
+        finally:
+            store.close()
 
     try:
         result = run_async(_run())
@@ -77,6 +132,8 @@ def identity_check(
         ["Certificate Fingerprint", str(cert.get("fingerprint", ""))],
         ["Remote Status", str(remote.get("status", ""))],
         ["Remote Source", str(remote.get("source", ""))],
+        ["Cert Match", str(result.get("certMatch", False))],
+        ["Suggestions", "; ".join(str(item) for item in result.get("suggestions", []))],
     ]
     if remote.get("error"):
         rows.append(["Remote Error", str(remote.get("error"))])
@@ -89,7 +146,6 @@ def identity_check(
 def register(
     ctx: typer.Context,
     aid: str = typer.Argument(..., help="要注册的 AID (如 alice@aid.com)"),
-    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="网关地址（可选，SDK 支持自动发现）"),
 ) -> None:
     """注册新 AID"""
     set_json_mode(ctx.obj.get("json", False))
@@ -98,8 +154,12 @@ def register(
     aun_path = resolved["aun_path"]
 
     async def _run():
-        async with CLISession(ctx, need_auth=False, gateway=gateway) as client:
-            return await client.auth.register_aid({"aid": aid})
+        resolved = resolve_profile_config(ctx)
+        store = make_aid_store(resolved)
+        try:
+            return _unwrap_result(await store.register(aid), "register identity")
+        finally:
+            store.close()
 
     try:
         result = run_async(_run())
@@ -113,9 +173,6 @@ def register(
         profile_data = {}
     profile_data["aid"] = aid
     profile_data["aun_path"] = aun_path
-    discovered_gateway = result.get("gateway") or gateway
-    if discovered_gateway:
-        profile_data["gateway"] = discovered_gateway
     set_profile(profile_name, profile_data)
 
     if is_json_mode():
@@ -127,7 +184,6 @@ def register(
 def login(
     ctx: typer.Context,
     aid: Optional[str] = typer.Argument(None, help="要登录的 AID（默认使用 profile 中的 AID）"),
-    gateway: Optional[str] = typer.Option(None, "--gateway", "-g", help="网关地址（可选，SDK 支持自动发现）"),
 ) -> None:
     """登录已有 AID（验证密钥可用，刷新 token）"""
     set_json_mode(ctx.obj.get("json", False))
@@ -137,8 +193,7 @@ def login(
         login_aid = aid or resolved["aid"]
         if not login_aid:
             raise typer.BadParameter("No AID specified and no default AID in profile")
-        login_gateway = gateway or resolved["gateway"]
-        async with CLISession(ctx, aid=login_aid, gateway=login_gateway) as client:
+        async with CLISession(ctx, aid=login_aid) as client:
             return {"aid": client.aid, "state": client.state}
 
     try:
@@ -160,8 +215,6 @@ def login(
     except KeyError:
         prof = {}
     prof["aid"] = result["aid"]
-    if resolved["gateway"]:
-        prof["gateway"] = resolved["gateway"]
     if resolved["aun_path"]:
         prof["aun_path"] = resolved["aun_path"]
     _set_profile(profile_name, prof)
@@ -180,7 +233,6 @@ def whoami(ctx: typer.Context) -> None:
     info = {
         "AID": resolved["aid"] or "(not set)",
         "Profile": resolved["profile_name"],
-        "Gateway": resolved["gateway"] or "(not set)",
         "Data Path": resolved["aun_path"],
     }
 

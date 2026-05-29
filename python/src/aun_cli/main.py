@@ -23,7 +23,6 @@ def version_callback(value: bool) -> None:
 def main(
     ctx: typer.Context,
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="仅本次命令使用指定 profile"),
-    gateway: str | None = typer.Option(None, "--gateway", "-g", help="覆盖网关地址"),
     json_output: bool = typer.Option(False, "--json", help="JSON 格式输出"),
     debug: bool = typer.Option(False, "--debug", help="启用 debug 日志"),
     no_color: bool = typer.Option(False, "--no-color", help="禁用彩色输出"),
@@ -33,7 +32,6 @@ def main(
     """全局选项"""
     ctx.ensure_object(dict)
     ctx.obj["profile"] = profile
-    ctx.obj["gateway"] = gateway
     ctx.obj["json"] = json_output
     ctx.obj["debug"] = debug
     ctx.obj["no_color"] = no_color
@@ -47,10 +45,9 @@ def main(
         from aun_cli.adapter import resolve_profile_config
         resolved = resolve_profile_config(ctx)
         aid = resolved["aid"] or "(none)"
-        gw = resolved["gateway"] or "(none)"
         trace = resolved.get("trace", "off")
         active_group = resolved.get("active_group") or "(none)"
-        print(f"[aun-cli] profile={resolved['profile_name']} aid={aid} gateway={gw} active_group={active_group} trace={trace}")
+        print(f"[aun-cli] profile={resolved['profile_name']} aid={aid} active_group={active_group} trace={trace}")
 
 
 from aun_cli.commands.identity import identity_app, register, login, whoami
@@ -84,6 +81,10 @@ app.add_typer(profile_app)
 from aun_cli.commands.storage import storage_app
 
 app.add_typer(storage_app)
+
+from aun_cli.commands.agentmd import agentmd_app
+
+app.add_typer(agentmd_app)
 
 from aun_cli.commands.keys import keys_app
 

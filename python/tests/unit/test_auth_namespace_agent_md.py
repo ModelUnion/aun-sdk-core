@@ -7,8 +7,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from aun_core import AUNClient
-from aun_core.errors import NotFoundError
+from aun_core import AIDStore, result_ok
 
 
 def _make_identity(aid: str) -> dict[str, str]:
@@ -57,144 +56,158 @@ def _sample_agent_md(aid: str = "alice.agentid.pub") -> str:
     )
 
 
-def test_sign_agent_md_appends_tail_signature(monkeypatch):
-    client = AUNClient()
-    identity = _make_identity("alice.agentid.pub")
-    client._aid = identity["aid"]
-    monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: identity)
-
-    signed = asyncio.run(client.auth.sign_agent_md(_sample_agent_md()))
-
-    assert signed.startswith("---\n")
-    assert signed.count("<!-- AUN-SIGNATURE") == 1
-    assert signed.rstrip().endswith("-->")
-
-
-def test_verify_agent_md_unsigned_returns_unsigned():
-    client = AUNClient()
-    result = asyncio.run(client.auth.verify_agent_md(_sample_agent_md()))
-
-    assert result["status"] == "unsigned"
-    assert result["verified"] is False
-
-
-def test_verify_agent_md_roundtrip(monkeypatch):
-    client = AUNClient()
-    identity = _make_identity("alice.agentid.pub")
-    client._aid = identity["aid"]
-    monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: identity)
-
-    signed = asyncio.run(client.auth.sign_agent_md(_sample_agent_md()))
-    result = asyncio.run(
-        client.auth.verify_agent_md(
-            signed,
-            aid=identity["aid"],
-            cert_pem=identity["cert"],
-        )
-    )
-
-    assert result["status"] == "verified"
-    assert result["verified"] is True
-    assert result["aid"] == identity["aid"]
-    assert result["payload"] == _sample_agent_md()
-
-
-def test_check_aid_reports_local_complete(tmp_path, monkeypatch):
-    aid = "alice.agentid.pub"
-    client = AUNClient({"aun_path": str(tmp_path / "check_local")})
+def _store_with_identity(tmp_path, aid: str = "alice.agentid.pub") -> tuple[AIDStore, dict[str, str]]:
+    store = AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
     identity = _make_identity(aid)
-    client._keystore.save_identity(aid, identity)
-
-    async def fail_download(_aid: str):
-        raise AssertionError("local complete check should not download agent.md")
-
-    monkeypatch.setattr(client.auth, "download_agent_md", fail_download)
-
-    result = asyncio.run(client.auth.check_aid({"aid": aid}))
-
-    assert result["status"] == "local_ready"
-    assert result["can_register"] is False
-    assert result["local"]["exists"] is True
-    assert result["local"]["complete"] is True
-    assert result["local"]["private_key"] is True
-    assert result["local"]["certificate"]["valid"] is True
-    assert result["local"]["certificate"]["expired"] is False
-    assert result["local"]["certificate"]["not_after"]
-    assert result["remote"]["status"] == "not_checked"
-    client._keystore.close()
+    store._keystore.save_identity(aid, identity)
+    return store, identity
 
 
-def test_check_aid_available_when_agent_md_not_found(monkeypatch):
+def _load_aid(store: AIDStore, aid: str):
+    loaded = store.load(aid)
+    assert loaded.ok, loaded.error
+    assert loaded.data is not None
+    return loaded.data["aid"]
+
+
+def test_aid_sign_agent_md_appends_tail_signature(tmp_path):
+    store, identity = _store_with_identity(tmp_path, "alice.agentid.pub")
+    aid = _load_aid(store, identity["aid"])
+
+    signed = aid.sign_agent_md(_sample_agent_md())
+
+    assert signed.ok, signed.error
+    assert signed.data is not None
+    text = signed.data["signed"]
+    assert text.startswith("---\n")
+    assert text.count("<!-- AUN-SIGNATURE") == 1
+    assert text.rstrip().endswith("-->")
+    store.close()
+
+
+def test_aid_verify_agent_md_unsigned_returns_unsigned(tmp_path):
+    store, identity = _store_with_identity(tmp_path, "alice.agentid.pub")
+    aid = _load_aid(store, identity["aid"])
+
+    result = aid.verify_agent_md(_sample_agent_md())
+
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["status"] == "unsigned"
+    store.close()
+
+
+def test_aid_verify_agent_md_roundtrip(tmp_path):
+    store, identity = _store_with_identity(tmp_path, "alice.agentid.pub")
+    aid = _load_aid(store, identity["aid"])
+
+    signed = aid.sign_agent_md(_sample_agent_md())
+    assert signed.ok and signed.data is not None
+    result = aid.verify_agent_md(signed.data["signed"])
+
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["status"] == "verified"
+    assert result.data["aid"] == identity["aid"]
+    assert result.data["payload"] == _sample_agent_md()
+    store.close()
+
+
+def test_aid_store_diagnose_reports_local_ready(tmp_path, monkeypatch):
+    aid = "alice.agentid.pub"
+    store, identity = _store_with_identity(tmp_path, aid)
+
+    async def fake_exists(_aid: str):
+        return result_ok({"exists": True})
+
+    async def fake_fetch_peer_cert(_gateway_url: str, _aid: str):
+        return identity["cert"]
+
+    monkeypatch.setattr(store, "exists", fake_exists)
+    monkeypatch.setattr(store, "_resolve_gateway", lambda _aid: "wss://gateway.agentid.pub")
+    monkeypatch.setattr(store._auth, "fetch_peer_cert", fake_fetch_peer_cert)
+    result = asyncio.run(store.diagnose(aid))
+
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["status"] == "ready"
+    assert result.data["local_valid"] is True
+    assert result.data["localValid"] is True
+    assert result.data["remote_registered"] is True
+    assert result.data["remoteRegistered"] is True
+    assert result.data["cert_match"] is True
+    assert result.data["certMatch"] is True
+    assert result.data["suggestions"] == []
+    store.close()
+
+
+def test_aid_store_diagnose_available_when_remote_missing(tmp_path, monkeypatch):
     aid = "free.agentid.pub"
-    client = AUNClient()
-    called: list[str] = []
+    store = AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
 
-    async def fake_download(target_aid: str):
-        called.append(target_aid)
-        raise NotFoundError(f"agent.md not found for aid: {target_aid}")
+    async def fake_exists(_aid: str):
+        return result_ok({"exists": False})
 
-    monkeypatch.setattr(client.auth, "download_agent_md", fake_download)
+    monkeypatch.setattr(store, "exists", fake_exists)
+    result = asyncio.run(store.diagnose(aid))
 
-    result = asyncio.run(client.auth.check_aid({"aid": aid}))
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["status"] == "available"
+    assert result.data["local_valid"] is False
+    assert result.data["remote_registered"] is False
+    assert result.data["cert_match"] is False
+    assert result.data["suggestions"]
+    store.close()
 
-    assert called == [aid]
-    assert result["status"] == "available"
-    assert result["can_register"] is True
-    assert result["local"]["exists"] is False
-    assert result["remote"]["status"] == "available"
-    assert result["remote"]["source"] == "agent.md"
 
-
-def test_check_aid_registered_when_agent_md_exists(monkeypatch):
+def test_aid_store_diagnose_registered_when_remote_exists(tmp_path, monkeypatch):
     aid = "taken.agentid.pub"
-    client = AUNClient()
+    store = AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
 
-    async def fake_download(target_aid: str):
-        return _sample_agent_md(target_aid)
+    async def fake_exists(_aid: str):
+        return result_ok({"exists": True})
 
-    monkeypatch.setattr(client.auth, "download_agent_md", fake_download)
+    monkeypatch.setattr(store, "exists", fake_exists)
+    result = asyncio.run(store.diagnose(aid))
 
-    result = asyncio.run(client.auth.check_aid({"aid": aid}))
-
-    assert result["status"] == "registered_remote"
-    assert result["can_register"] is False
-    assert result["remote"]["status"] == "registered"
-    assert result["remote"]["agent_md_aid"] == aid
-
-
-def test_verify_agent_md_rejects_tamper(monkeypatch):
-    client = AUNClient()
-    identity = _make_identity("alice.agentid.pub")
-    client._aid = identity["aid"]
-    monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: identity)
-
-    signed = asyncio.run(client.auth.sign_agent_md(_sample_agent_md()))
-    tampered = signed.replace("Alice", "Mallory", 1)
-    result = asyncio.run(
-        client.auth.verify_agent_md(
-            tampered,
-            aid=identity["aid"],
-            cert_pem=identity["cert"],
-        )
-    )
-
-    assert result["status"] == "invalid"
-    assert result["verified"] is False
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["status"] == "registered_remote"
+    assert result.data["local_valid"] is False
+    assert result.data["remote_registered"] is True
+    assert result.data["cert_match"] is False
+    assert result.data["suggestions"]
+    store.close()
 
 
-def test_sign_agent_md_replaces_existing_signature(monkeypatch):
-    client = AUNClient()
-    identity = _make_identity("alice.agentid.pub")
-    client._aid = identity["aid"]
-    monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: identity)
+def test_aid_verify_agent_md_rejects_tamper(tmp_path):
+    store, identity = _store_with_identity(tmp_path, "alice.agentid.pub")
+    aid = _load_aid(store, identity["aid"])
+    signed = aid.sign_agent_md(_sample_agent_md())
+    assert signed.ok and signed.data is not None
 
-    signed_once = asyncio.run(client.auth.sign_agent_md(_sample_agent_md()))
-    signed_twice = asyncio.run(client.auth.sign_agent_md(signed_once))
+    tampered = signed.data["signed"].replace("Alice", "Mallory", 1)
+    result = aid.verify_agent_md(tampered)
 
-    assert signed_twice.count("<!-- AUN-SIGNATURE") == 1
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["status"] == "invalid"
+    store.close()
 
 
-# ── download_agent_md 条件请求缓存 ────────────────────────────────────
+def test_aid_sign_agent_md_replaces_existing_signature(tmp_path):
+    store, identity = _store_with_identity(tmp_path, "alice.agentid.pub")
+    aid = _load_aid(store, identity["aid"])
+    signed_once = aid.sign_agent_md(_sample_agent_md())
+    assert signed_once.ok and signed_once.data is not None
+
+    signed_twice = aid.sign_agent_md(signed_once.data["signed"])
+
+    assert signed_twice.ok, signed_twice.error
+    assert signed_twice.data is not None
+    assert signed_twice.data["signed"].count("<!-- AUN-SIGNATURE") == 1
+    store.close()
 
 
 class _FakeResponse:
@@ -224,74 +237,80 @@ class _FakeSession:
     async def __aexit__(self, *exc):
         return False
 
-    def get(self, url, headers=None):
+    def get(self, url, *, ssl=None, headers=None, allow_redirects=True):
         self.calls.append(dict(headers or {}))
         return self._responses.pop(0)
 
 
-def _patch_session(monkeypatch, session: _FakeSession):
-    import aun_core.namespaces.auth_namespace as mod
+def _patch_session(monkeypatch, session):
+    import aun_core.aid_store as mod
 
     monkeypatch.setattr(mod.aiohttp, "ClientSession", lambda *a, **kw: session)
 
 
-def test_download_agent_md_caches_etag_and_last_modified(monkeypatch):
-    client = AUNClient()
-    namespace = client.auth
+def test_fetch_agent_md_caches_etag_and_last_modified(monkeypatch, tmp_path):
+    aid_name = "alice.agentid.pub"
+    store, _identity = _store_with_identity(tmp_path, aid_name)
+    aid = _load_aid(store, aid_name)
+    signed = aid.sign_agent_md(_sample_agent_md(aid_name))
+    assert signed.ok and signed.data is not None
 
-    async def _fake_resolve(_self, _aid):
-        return "https://alice.agentid.pub/agent.md"
+    async def fake_gateway(_aid: str):
+        return "https://gateway.agentid.pub/aun"
 
-    monkeypatch.setattr(type(namespace), "_resolve_agent_md_url", _fake_resolve)
-
-    payload = _sample_agent_md()
+    monkeypatch.setattr(store, "_resolved_gateway", fake_gateway)
     headers = {
         "ETag": "\"abc123\"",
         "Last-Modified": "Sun, 18 May 2026 00:00:00 GMT",
     }
     session = _FakeSession([
-        _FakeResponse(200, payload, headers),
+        _FakeResponse(200, signed.data["signed"], headers),
         _FakeResponse(304, "", headers),
     ])
     _patch_session(monkeypatch, session)
 
-    first = asyncio.run(namespace.download_agent_md("alice.agentid.pub"))
-    assert first == payload
-    # 第一次没有条件头
+    first = asyncio.run(store.fetch_agent_md(aid_name))
+    assert first.ok, first.error
+    assert first.data is not None
+    assert first.data["content"] == signed.data["signed"]
     assert "If-None-Match" not in session.calls[0]
     assert "If-Modified-Since" not in session.calls[0]
 
-    # 第二次应当自动带上条件头，遇到 304 时返回上次缓存
-    second = asyncio.run(namespace.download_agent_md("alice.agentid.pub"))
-    assert second == payload
+    second = asyncio.run(store.fetch_agent_md(aid_name))
+    assert second.ok, second.error
+    assert second.data is not None
+    assert second.data["content"] == signed.data["signed"]
     assert session.calls[1].get("If-None-Match") == "\"abc123\""
     assert session.calls[1].get("If-Modified-Since") == "Sun, 18 May 2026 00:00:00 GMT"
+    store.close()
 
 
-def test_download_agent_md_updates_cache_on_change(monkeypatch):
-    client = AUNClient()
-    namespace = client.auth
+def test_fetch_agent_md_updates_cache_on_change(monkeypatch, tmp_path):
+    aid_name = "alice.agentid.pub"
+    store, _identity = _store_with_identity(tmp_path, aid_name)
+    aid = _load_aid(store, aid_name)
+    signed_v1 = aid.sign_agent_md(_sample_agent_md(aid_name))
+    signed_v2 = aid.sign_agent_md(_sample_agent_md(aid_name) + "# v2\n")
+    assert signed_v1.ok and signed_v1.data is not None
+    assert signed_v2.ok and signed_v2.data is not None
 
-    async def _fake_resolve(_self, _aid):
-        return "https://alice.agentid.pub/agent.md"
+    async def fake_gateway(_aid: str):
+        return "https://gateway.agentid.pub/aun"
 
-    monkeypatch.setattr(type(namespace), "_resolve_agent_md_url", _fake_resolve)
-
-    payload_v1 = _sample_agent_md()
-    payload_v2 = _sample_agent_md() + "# v2\n"
+    monkeypatch.setattr(store, "_resolved_gateway", fake_gateway)
     session = _FakeSession([
-        _FakeResponse(200, payload_v1, {"ETag": "\"v1\"", "Last-Modified": "Sun, 18 May 2026 00:00:00 GMT"}),
-        _FakeResponse(200, payload_v2, {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
+        _FakeResponse(200, signed_v1.data["signed"], {"ETag": "\"v1\"", "Last-Modified": "Sun, 18 May 2026 00:00:00 GMT"}),
+        _FakeResponse(200, signed_v2.data["signed"], {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
         _FakeResponse(304, "", {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
     ])
     _patch_session(monkeypatch, session)
 
-    assert asyncio.run(namespace.download_agent_md("alice.agentid.pub")) == payload_v1
-    assert asyncio.run(namespace.download_agent_md("alice.agentid.pub")) == payload_v2
-    # 第三次 304 应返回 v2
-    assert asyncio.run(namespace.download_agent_md("alice.agentid.pub")) == payload_v2
+    assert asyncio.run(store.fetch_agent_md(aid_name)).data["content"] == signed_v1.data["signed"]
+    assert asyncio.run(store.fetch_agent_md(aid_name)).data["content"] == signed_v2.data["signed"]
+    assert asyncio.run(store.fetch_agent_md(aid_name)).data["content"] == signed_v2.data["signed"]
     assert session.calls[1].get("If-None-Match") == "\"v1\""
     assert session.calls[2].get("If-None-Match") == "\"v2\""
+    store.close()
 
 
 class _FakeHeadSession:
@@ -305,47 +324,49 @@ class _FakeHeadSession:
     async def __aexit__(self, *exc):
         return False
 
-    def head(self, url, headers=None):
+    def head(self, url, *, ssl=None, headers=None, allow_redirects=True):
         self.calls.append(dict(headers or {}))
         return self._responses.pop(0)
 
 
-def test_head_agent_md_returns_etag_without_body(monkeypatch):
-    client = AUNClient()
-    namespace = client.auth
+def test_head_agent_md_returns_etag_without_body(monkeypatch, tmp_path):
+    store = AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
 
-    async def _fake_resolve(_self, _aid):
-        return "https://alice.agentid.pub/agent.md"
+    async def fake_gateway(_aid: str):
+        return "https://gateway.agentid.pub/aun"
 
-    monkeypatch.setattr(type(namespace), "_resolve_agent_md_url", _fake_resolve)
+    monkeypatch.setattr(store, "_resolved_gateway", fake_gateway)
     session = _FakeHeadSession([
         _FakeResponse(200, "should-not-read", {"ETag": '"abc123"', "Last-Modified": "Sun, 24 May 2026 00:00:00 GMT"}),
     ])
     _patch_session(monkeypatch, session)
 
-    result = asyncio.run(namespace.head_agent_md("alice.agentid.pub"))
+    result = asyncio.run(store.head_agent_md("alice.agentid.pub"))
 
-    assert result["aid"] == "alice.agentid.pub"
-    assert result["found"] is True
-    assert result["etag"] == '"abc123"'
-    assert result["last_modified"] == "Sun, 24 May 2026 00:00:00 GMT"
-    assert result["status"] == 200
-    assert session.calls[0].get("Accept") == "text/markdown"
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["aid"] == "alice.agentid.pub"
+    assert result.data["found"] is True
+    assert result.data["etag"] == '"abc123"'
+    assert result.data["last_modified"] == "Sun, 24 May 2026 00:00:00 GMT"
+    assert result.data["status"] == 200
+    assert session.calls[0].get("Accept") is None
+    store.close()
 
 
-def test_head_agent_md_404_returns_not_found(monkeypatch):
-    client = AUNClient()
-    namespace = client.auth
+def test_head_agent_md_404_returns_not_found(monkeypatch, tmp_path):
+    store = AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
 
-    async def _fake_resolve(_self, _aid):
-        return "https://missing.agentid.pub/agent.md"
+    async def fake_gateway(_aid: str):
+        return "https://gateway.agentid.pub/aun"
 
-    monkeypatch.setattr(type(namespace), "_resolve_agent_md_url", _fake_resolve)
+    monkeypatch.setattr(store, "_resolved_gateway", fake_gateway)
     session = _FakeHeadSession([_FakeResponse(404)])
     _patch_session(monkeypatch, session)
 
-    result = asyncio.run(namespace.head_agent_md("missing.agentid.pub"))
+    result = asyncio.run(store.head_agent_md("missing.agentid.pub"))
 
-    assert result["found"] is False
-    assert result["etag"] == ""
-    assert result["status"] == 404
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "AGENTMD_NOT_FOUND"
+    store.close()

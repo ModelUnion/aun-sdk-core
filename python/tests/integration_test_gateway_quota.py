@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
 from aun_core.errors import AUNError
+from aun_refactor_helpers import ensure_connected_identity, ensure_registered_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -83,26 +84,20 @@ def _make_client(tag_or_path: str, *, is_path: bool = False,
         root = tag_or_path
     else:
         root = _make_aun_path(tag_or_path, device_id=device_id)
-    client = AUNClient({"aun_path": root}, debug=False)
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(root, debug=False, require_forward_secrecy=False)
 
 
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "") -> str:
-    await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
     opts: dict = {"auto_reconnect": False, "heartbeat_interval": 30.0}
     if slot_id:
         opts["slot_id"] = slot_id
-    await client.connect(auth, opts)
-    return aid
+    return await ensure_connected_identity(client, aid, connect_options=opts)
 
 
 async def _connect_short(client: AUNClient, aid: str, *,
                          slot_id: str = "",
                          short_ttl_ms: int = 0) -> str:
     """短连接（aid 必须已注册）。"""
-    auth = await client.auth.authenticate({"aid": aid})
     opts: dict = {
         "connection_kind": "short",
         "auto_reconnect": False,
@@ -111,8 +106,7 @@ async def _connect_short(client: AUNClient, aid: str, *,
         opts["slot_id"] = slot_id
     if short_ttl_ms > 0:
         opts["short_ttl_ms"] = short_ttl_ms
-    await client.connect(auth, opts)
-    return aid
+    return await ensure_connected_identity(client, aid, connect_options=opts)
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +185,7 @@ async def test_aid_device_slot_quota() -> bool:
     clients: list[AUNClient] = []
     watchers: list[_DisconnectWatcher] = []
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         # 建 _QUOTA_LIMIT 个长连接（不同 slot 名）
@@ -271,7 +265,7 @@ async def test_aid_devices_quota() -> bool:
     clients: list[AUNClient] = []
     watchers: list[_DisconnectWatcher] = []
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         # 占满 _QUOTA_LIMIT 个不同 device 的长连接（同 aid，slot 任意但保持唯一以避开 slot 配额）
@@ -280,8 +274,8 @@ async def test_aid_devices_quota() -> bool:
             device_id_file.write_text(dev_id, encoding="utf-8")
             c = _make_client(shared_path, is_path=True)
             # 防御性校验：client 真的读到了我们写的 device_id
-            if c._device_id != dev_id:
-                _fail(name, f"client device_id mismatch: expected {dev_id}, got {c._device_id}")
+            if c.device_id != dev_id:
+                _fail(name, f"client device_id mismatch: expected {dev_id}, got {c.device_id}")
                 return False
             w = _DisconnectWatcher(c, f"dev-{i}")
             clients.append(c)
@@ -294,8 +288,8 @@ async def test_aid_devices_quota() -> bool:
         new_dev = f"qta-devNEW-{rid}"
         device_id_file.write_text(new_dev, encoding="utf-8")
         overflow = _make_client(shared_path, is_path=True)
-        if overflow._device_id != new_dev:
-            _fail(name, f"overflow device_id mismatch: expected {new_dev}, got {overflow._device_id}")
+        if overflow.device_id != new_dev:
+            _fail(name, f"overflow device_id mismatch: expected {new_dev}, got {overflow.device_id}")
             return False
         clients.append(overflow)
         watchers.append(_DisconnectWatcher(overflow, "dev-NEW"))
@@ -357,7 +351,7 @@ async def test_device_aids_quota() -> bool:
         register = _make_client(shared_path, is_path=True)
         for i in range(_QUOTA_LIMIT + 1):
             aid = f"qta-a3-{i}-{rid}.{_ISSUER}"
-            await register.auth.register_aid({"aid": aid})
+            await ensure_registered_identity(register, aid)
             aids.append(aid)
         await register.close()
 
@@ -429,7 +423,7 @@ async def test_short_ttl_sliding_window() -> bool:
     short = _make_client(shared_path, is_path=True)
     watcher = _DisconnectWatcher(short, "short")
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         # 短连接 ttl=2000ms
@@ -544,3 +538,4 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+

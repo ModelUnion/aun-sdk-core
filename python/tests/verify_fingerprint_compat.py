@@ -25,6 +25,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 # ── 配置 ──
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
@@ -103,14 +104,13 @@ async def main():
     if not cert_path.exists():
         # 如果固定身份不存在，先创建
         print(f"[INFO] 本地证书不存在，尝试用 SDK 创建身份...")
-        client = AUNClient({"aun_path": _TEST_AUN_PATH}, debug=False)
-        client._config_model.require_forward_secrecy = False
+        client = make_client_for_path(_TEST_AUN_PATH, debug=False, require_forward_secrecy=False)
         try:
-            await client.auth.register_aid({"aid": _ALICE_AID})
-            auth = await client.auth.authenticate({"aid": _ALICE_AID})
-            connect_params = dict(auth)
-            connect_params["verify_ssl"] = False
-            await client.connect(connect_params)
+            await ensure_connected_identity(
+                client,
+                _ALICE_AID,
+                connect_options={"verify_ssl": False},
+            )
             await asyncio.sleep(1)
             await client.close()
         except Exception as e:
@@ -197,3 +197,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

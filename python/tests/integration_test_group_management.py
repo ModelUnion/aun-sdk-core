@@ -25,6 +25,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient, AuthError, RateLimitError
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
 os.environ.setdefault("AUN_ENV", "development")
@@ -63,27 +64,11 @@ def _fail(name: str, reason: str):
 
 
 def _make_client() -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    last_error: Exception | None = None
-    for attempt in range(4):
-        try:
-            auth = await client.auth.authenticate({"aid": aid})
-            await client.connect(auth)
-            return aid
-        except (AuthError, RateLimitError) as exc:
-            last_error = exc
-            if attempt >= 3:
-                break
-            await asyncio.sleep(1.5 * (attempt + 1))
-    raise last_error or RuntimeError(f"{aid} connect failed")
+    return await ensure_connected_identity(client, aid)
 
 
 async def _expect_failure(factory, label: str, *, contains: str | None = None):
@@ -651,3 +636,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

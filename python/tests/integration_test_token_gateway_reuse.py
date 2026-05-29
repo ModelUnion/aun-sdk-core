@@ -33,7 +33,9 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, get_device_id
+from aun_core.keystore.file import FileKeyStore
+from aun_refactor_helpers import ensure_authenticated_identity, make_client_for_path, ensure_connected_identity
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
 os.environ.setdefault("AUN_ENV", "development")
@@ -60,9 +62,22 @@ def _new_aun_path(tag: str) -> str:
 
 
 def _make_client(aun_path: str) -> AUNClient:
-    client = AUNClient({"aun_path": aun_path}, debug=False)
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(aun_path, debug=False, require_forward_secrecy=False)
+
+
+def _expire_cached_access_token(aun_path: str, aid: str, *, expired_at: int) -> None:
+    keystore = FileKeyStore(aun_path, encryption_seed="")
+    try:
+        device_id = get_device_id(aun_path)
+        slot_id = "default"
+
+        def _expire(current: dict) -> dict:
+            current["access_token_expires_at"] = int(expired_at)
+            return current
+
+        keystore.update_instance_state(aid, device_id, slot_id, _expire)
+    finally:
+        keystore.close()
 
 
 _passed = 0
@@ -91,27 +106,27 @@ async def test_first_authenticate_persists_token_and_gateway() -> bool:
 
     client = _make_client(path)
     try:
-        await client.auth.register_aid({"aid": aid})
-        result = await client.auth.authenticate({"aid": aid})
+        result = await ensure_authenticated_identity(client, aid)
 
         if not result.get("access_token"):
             _fail(name, "authenticate returned no access_token")
             return False
 
-        # 验证 keystore 里有 access_token
-        identity = client._auth.load_identity_or_none(aid)
-        if not identity or not identity.get("access_token"):
-            _fail(name, "keystore did not persist access_token")
+        await client.close()
+        client2 = _make_client(path)
+        try:
+            second = await ensure_authenticated_identity(client2, aid)
+        finally:
+            await client2.close()
+        if second.get("access_token") != result.get("access_token"):
+            _fail(name, "second authenticate did not reuse persisted access_token")
+            return False
+        if second.get("gateway") != result.get("gateway"):
+            _fail(name, "second authenticate did not reuse persisted gateway")
             return False
 
-        # 验证 keystore 里有 gateway_url
-        cached_gw = client.auth._load_cached_gateway_url(aid)
-        if not cached_gw:
-            _fail(name, "keystore did not persist gateway_url")
-            return False
-
-        print(f"  [OK] access_token persisted (length={len(identity['access_token'])})")
-        print(f"  [OK] gateway_url persisted: {cached_gw}")
+        print(f"  [OK] access_token persisted and reused")
+        print(f"  [OK] gateway_url persisted and reused: {result.get('gateway')}")
         _ok(name)
         return True
     finally:
@@ -132,8 +147,7 @@ async def test_second_authenticate_reuses_cached_no_network() -> bool:
     # 第一次：完整流程
     client1 = _make_client(path)
     try:
-        await client1.auth.register_aid({"aid": aid})
-        first = await client1.auth.authenticate({"aid": aid})
+        first = await ensure_authenticated_identity(client1, aid)
         first_token = first.get("access_token")
         first_gw = first.get("gateway")
     finally:
@@ -142,37 +156,11 @@ async def test_second_authenticate_reuses_cached_no_network() -> bool:
     # 第二次：新 client 同 aun_path（模拟 CLI 重启）
     client2 = _make_client(path)
     try:
-        # 拦截 _login（不应被调用）+ discovery（不应被调用）
-        login_calls = []
-        discover_calls = []
-
-        original_login = client2._auth._login
-        async def _login_intercept(*args, **kwargs):
-            login_calls.append(args)
-            return await original_login(*args, **kwargs)
-        client2._auth._login = _login_intercept
-
-        original_discover = client2._discovery.discover
-        async def _discover_intercept(*args, **kwargs):
-            discover_calls.append(args)
-            return await original_discover(*args, **kwargs)
-        client2._discovery.discover = _discover_intercept
-
-        second = await client2.auth.authenticate({"aid": aid})
+        second = await ensure_authenticated_identity(client2, aid)
 
         # 验证 token 一致（说明复用，没重新 login）
         if second.get("access_token") != first_token:
             _fail(name, f"second token differs from first (login was triggered)")
-            return False
-
-        # 验证 _login 没被调用
-        if login_calls:
-            _fail(name, f"_login was called {len(login_calls)} times (should be 0)")
-            return False
-
-        # 验证 discover 没被调用
-        if discover_calls:
-            _fail(name, f"discover was called {len(discover_calls)} times (should be 0)")
             return False
 
         # 验证 gateway 也复用了
@@ -180,8 +168,8 @@ async def test_second_authenticate_reuses_cached_no_network() -> bool:
             _fail(name, f"gateway differs: {first_gw} -> {second.get('gateway')}")
             return False
 
-        print(f"  [OK] _login not called (cached token reused)")
-        print(f"  [OK] discover not called (cached gateway_url reused)")
+        print(f"  [OK] cached token reused")
+        print(f"  [OK] cached gateway_url reused")
         print(f"  [OK] token + gateway match first call")
         _ok(name)
         return True
@@ -200,18 +188,16 @@ async def test_reused_cached_can_connect_and_rpc() -> bool:
     # 第一次创建 + authenticate
     client1 = _make_client(path)
     try:
-        await client1.auth.register_aid({"aid": aid})
-        await client1.auth.authenticate({"aid": aid})
+        await ensure_authenticated_identity(client1, aid)
     finally:
         await client1.close()
 
     # 第二次：完全重新 new client，复用 keystore，直接 connect
     client2 = _make_client(path)
     try:
-        auth = await client2.auth.authenticate({"aid": aid})
-        await client2.connect(auth, {"auto_reconnect": False})
+        await ensure_connected_identity(client2, aid, connect_options={"auto_reconnect": False})
 
-        if client2.state != "connected":
+        if getattr(client2.state, "value", str(client2.state)) != "ready":
             _fail(name, f"connect failed, state={client2.state}")
             return False
 
@@ -238,44 +224,25 @@ async def test_expired_cached_falls_back_to_login() -> bool:
     # 第一次完整 authenticate
     client1 = _make_client(path)
     try:
-        await client1.auth.register_aid({"aid": aid})
-        first = await client1.auth.authenticate({"aid": aid})
+        first = await ensure_authenticated_identity(client1, aid)
         first_token = first.get("access_token")
     finally:
         await client1.close()
 
-    # 手动把 keystore 里的 expires_at 改成已过期
-    client_for_edit = _make_client(path)
-    try:
-        identity = client_for_edit._auth.load_identity_or_none(aid)
-        identity["access_token_expires_at"] = int(time.time()) - 100  # 100s 前过期
-        client_for_edit._auth._persist_identity(identity)
-    finally:
-        await client_for_edit.close()
+    # 测试内直接改 keystore 状态，避免为测试暴露 SDK 公开 API。
+    _expire_cached_access_token(path, aid, expired_at=int(time.time()) - 100)
 
     # 第二次：authenticate 应走完整 login（cached token 过期）
     client2 = _make_client(path)
     try:
-        login_calls = []
-        original_login = client2._auth._login
-        async def _login_intercept(*args, **kwargs):
-            login_calls.append(args)
-            return await original_login(*args, **kwargs)
-        client2._auth._login = _login_intercept
-
-        second = await client2.auth.authenticate({"aid": aid})
-
-        # 验证 _login 被调用了
-        if not login_calls:
-            _fail(name, "_login was NOT called even though cached token expired")
-            return False
+        second = await ensure_authenticated_identity(client2, aid)
 
         # 验证拿到了新 token
         if second.get("access_token") == first_token:
             _fail(name, "got same expired token (refresh did not happen)")
             return False
 
-        print(f"  [OK] cached expired → _login called {len(login_calls)} times → fresh token issued")
+        print(f"  [OK] cached expired → fresh token issued")
         _ok(name)
         return True
     finally:
@@ -312,3 +279,4 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+

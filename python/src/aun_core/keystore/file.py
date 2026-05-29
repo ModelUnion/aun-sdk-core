@@ -641,7 +641,14 @@ class FileKeyStore(KeyStore):
             if value is not None:
                 restored["private_key_pem"] = value.decode("utf-8")
             else:
+                # 解密失败：seed_password 不正确或 key.json 被篡改
                 restored.pop("private_key_pem", None)
+                self._log.error(
+                    "keystore",
+                    "身份 %s 的私钥解密失败：seed_password 可能不正确，或 key.json 中的加密数据已损坏。"
+                    "请检查 encryption_seed 参数是否与加密时一致。",
+                    aid,
+                )
         return restored
 
     # ── 路径辅助 ─────────────────────────────────────────────

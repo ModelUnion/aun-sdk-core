@@ -23,6 +23,7 @@ import re
 import sys
 import uuid
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -32,6 +33,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient, AuthError, RateLimitError
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,7 @@ _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 _CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
 _DAVE_AID = os.environ.get("AUN_TEST_DAVE_AID", f"dave.{_ISSUER}").strip()
+_CLIENT_SLOT_IDS: WeakKeyDictionary[AUNClient, str] = WeakKeyDictionary()
 
 
 def _normalize_slot_part(value: str) -> str:
@@ -70,29 +73,21 @@ def _build_test_slot_id(tag: str, rid: str | None = None) -> str:
 
 def _make_client(tag: str) -> AUNClient:
     """创建测试客户端"""
-    client = AUNClient({
-        "aun_path": _TEST_AUN_PATH,
-    }, debug=True)
-    client._config_model.require_forward_secrecy = False
-    client._test_slot_id = _build_test_slot_id(tag)
+    client = make_client_for_path(_TEST_AUN_PATH, debug=True, require_forward_secrecy=False)
+    _CLIENT_SLOT_IDS[client] = _build_test_slot_id(tag)
     return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            slot_id = str(getattr(client, "_test_slot_id", "") or "")
+            connect_params: dict = {}
+            slot_id = str(_CLIENT_SLOT_IDS.get(client, "") or "")
             if slot_id:
                 connect_params["slot_id"] = slot_id
             connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
-            return aid
+            return await ensure_connected_identity(client, aid, connect_options=connect_params, attempts=1)
         except (AuthError, RateLimitError) as exc:
             last_error = exc
             if attempt >= 3:
@@ -503,3 +498,4 @@ async def main():
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
+

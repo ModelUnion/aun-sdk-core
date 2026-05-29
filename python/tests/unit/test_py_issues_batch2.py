@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aun_core import AUNClient
+from aun_core import AIDStore, AUNClient
 from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL
 from aun_core.e2ee import (
     build_key_distribution,
@@ -76,9 +76,30 @@ def _get_signing_identity(aid: str):
 
 def _make_client(tmp_path, aid=_AID_BOB):
     """创建 mock 好的 AUNClient 用于测试。"""
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
-    client._aid = aid
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
     pk_pem, cert_pem = _get_signing_identity(aid)
+    cert = x509.load_pem_x509_certificate(cert_pem)
+    identity = {
+        "aid": aid,
+        "private_key_pem": pk_pem,
+        "public_key_der_b64": base64.b64encode(
+            cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).decode("ascii"),
+        "curve": "P-256",
+        "cert": cert_pem.decode("utf-8"),
+    }
+    store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
+    store._keystore.save_identity(aid, identity)
+    loaded = store.load(aid)
+    assert loaded.ok and loaded.data is not None
+    client = AUNClient(loaded.data["aid"])
+    store.close()
+    client._aid = aid
     client._identity = {"aid": aid, "private_key_pem": pk_pem, "cert": cert_pem.decode("utf-8")}
     client._state = "connected"
     client._device_id = "test-device"

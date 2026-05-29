@@ -115,34 +115,28 @@ def test_agentmd_fetch_calls_sdk_method(monkeypatch, tmp_path):
     _write_profile_config(tmp_path, monkeypatch)
     calls = []
 
-    class FakeClient:
-        async def fetch_agent_md(self, aid=None):
+    class FakeStore:
+        async def fetch_agent_md(self, aid):
             calls.append(aid)
-            return {
+            from aun_core import result_ok
+            return result_ok({
                 "aid": aid,
                 "content": "# Bob\n",
-                "signature": {"status": "verified"},
-                "saved_to": "AgentMDs/bob.agentid.pub/agent.md",
-            }
+                "verification": {"status": "verified"},
+                "cert_pem": "cert",
+            })
 
-    class FakeSession:
-        def __init__(self, ctx, **kwargs):
+        def close(self):
             pass
 
-        async def __aenter__(self):
-            return FakeClient()
+    monkeypatch.setattr(agentmd_commands, "make_aid_store", lambda resolved: FakeStore())
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(agentmd_commands, "CLISession", FakeSession)
-
-    result = CliRunner().invoke(app, ["--json", "agentmd", "fetch", "bob.agentid.pub"])
+    result = CliRunner().invoke(app, ["--json", "agentmd", "fetch", "bobb.agentid.pub"])
 
     assert result.exit_code == 0, result.output
-    assert calls == ["bob.agentid.pub"]
+    assert calls == ["bobb.agentid.pub"]
     data = json.loads(result.output)
-    assert data["aid"] == "bob.agentid.pub"
+    assert data["aid"] == "bobb.agentid.pub"
     assert data["content"] == "# Bob\n"
 
 
@@ -155,31 +149,25 @@ def test_agentmd_check_calls_sdk_method(monkeypatch, tmp_path):
     _write_profile_config(tmp_path, monkeypatch)
     calls = []
 
-    class FakeClient:
-        async def check_agent_md(self, aid=None, max_unsynced_days=0):
-            calls.append((aid, max_unsynced_days))
-            return {"aid": aid, "local_found": True, "remote_found": True, "in_sync": True}
+    class FakeStore:
+        async def check_agent_md(self, aid, ttl_days=1):
+            calls.append((aid, ttl_days))
+            from aun_core import result_ok
+            return result_ok({"aid": aid, "local_found": True, "remote_found": True, "needs_update": False})
 
-    class FakeSession:
-        def __init__(self, ctx, **kwargs):
+        def close(self):
             pass
 
-        async def __aenter__(self):
-            return FakeClient()
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(agentmd_commands, "CLISession", FakeSession)
+    monkeypatch.setattr(agentmd_commands, "make_aid_store", lambda resolved: FakeStore())
 
     result = CliRunner().invoke(
         app,
-        ["--json", "agentmd", "check_agent_md", "bob.agentid.pub", "--max-unsynced-days", "3"],
+        ["--json", "agentmd", "check_agent_md", "bobb.agentid.pub", "--max-unsynced-days", "3"],
     )
 
     assert result.exit_code == 0, result.output
-    assert calls == [("bob.agentid.pub", 3.0)]
-    assert json.loads(result.output)["in_sync"] is True
+    assert calls == [("bobb.agentid.pub", 3)]
+    assert json.loads(result.output)["needs_update"] is False
 
 
 def test_agentmd_check_defaults_to_one_day_cache_window(monkeypatch, tmp_path):
@@ -191,24 +179,18 @@ def test_agentmd_check_defaults_to_one_day_cache_window(monkeypatch, tmp_path):
     _write_profile_config(tmp_path, monkeypatch)
     calls = []
 
-    class FakeClient:
-        async def check_agent_md(self, aid=None, max_unsynced_days=0):
-            calls.append((aid, max_unsynced_days))
-            return {"aid": aid or "alice.agentid.pub", "local_found": False, "remote_found": False, "cached": True}
+    class FakeStore:
+        async def check_agent_md(self, aid, ttl_days=1):
+            calls.append((aid, ttl_days))
+            from aun_core import result_ok
+            return result_ok({"aid": aid, "local_found": False, "remote_found": False, "ttl_days": ttl_days})
 
-    class FakeSession:
-        def __init__(self, ctx, **kwargs):
+        def close(self):
             pass
 
-        async def __aenter__(self):
-            return FakeClient()
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(agentmd_commands, "CLISession", FakeSession)
+    monkeypatch.setattr(agentmd_commands, "make_aid_store", lambda resolved: FakeStore())
 
     result = CliRunner().invoke(app, ["--json", "agentmd", "check"])
 
     assert result.exit_code == 0, result.output
-    assert calls == [(None, 1.0)]
+    assert calls == [("alice.agentid.pub", 1)]

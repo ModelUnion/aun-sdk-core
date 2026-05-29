@@ -9,6 +9,7 @@
 | 文档 | 定位 |
 | --- | --- |
 | [aun测试运行指南](aun测试运行指南.md) | 当前 Docker 单域、双域、多语言 SDK 测试运行命令 |
+| [AUN SDK 重构修改清单](AUN_SDK_重构修改清单.md) | 本轮 SDK 重构的实际修改点、测试结果和遗留事项 |
 | [跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md) | 多语言 SDK 同网同服、test-runner 控制面的跨语言 E2E 方案 |
 | [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md) | SDK bootstrap 能力声明 + 服务端 policy 控制 1DH/per-AID wrap 的兼容方案 |
 | [AUN RPC Trace 增强设计](design/2026-05-22-aun-rpc-trace-enhancement.md) | RPC trace 诊断字段与 enter/exit span 设计 |
@@ -26,6 +27,7 @@
 ### 测试与 E2E
 
 - 现有测试命令、容器名、单域/双域运行入口 → [aun测试运行指南](aun测试运行指南.md)
+- 本轮 SDK 重构阶段进度、修改点和测试结果 → [AUN SDK 重构修改清单](AUN_SDK_重构修改清单.md)
 - Python / TypeScript / Go / C++ 跨语言容器 E2E、test-runner、test-control API、用例矩阵 → [aun测试运行指南](aun测试运行指南.md)、[跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md)
 - 多语言 SDK 测试缺口与补测清单 → [审查与路线图目录](audit/)
 
@@ -55,6 +57,10 @@
 ### aun测试运行指南
 
 记录当前 AUN 服务与 SDK 在 Docker 单域、双域环境中的实际测试入口。包含 Python、TypeScript、Go、JavaScript、C++ 五语言测试矩阵，Python / TypeScript / Go / C++ 跨语言容器 E2E 的 69 用例矩阵，覆盖 P2P 明文/E2EE、群聊 pairwise 明文/E2EE，以及四语言 agent 同群的明文/E2EE 矩阵，另包含固定身份目录、容器名、典型命令、浏览器 E2E、C++ Docker 测试、双域 federation 测试和数据保护规则。
+
+### AUN SDK 重构修改清单
+
+记录本轮 AUN SDK 重构执行中的阶段进度、实际修改点、测试命令、测试结果和遗留事项。它是实施过程中的工作清单，最终以 SDK 文档和 skill 同步结果为准。
 
 ### 跨语言容器E2E测试方案
 

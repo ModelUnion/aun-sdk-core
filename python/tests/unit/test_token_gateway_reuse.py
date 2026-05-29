@@ -9,18 +9,54 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
-from aun_core import AUNClient
+from aun_core import AIDStore
 
 
-def _setup_client(tmp_path):
-    """创建一个 client 并 mock 掉真实网络/login，方便测试。"""
-    client = AUNClient({"aun_path": str(tmp_path)})
-    return client
+def _setup_store(tmp_path):
+    """创建一个 AIDStore 并 mock 掉真实网络/login，方便测试。"""
+    return AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
+
+
+def _make_identity(aid: str) -> dict[str, str]:
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, aid)]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, aid)]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=365))
+        .sign(key, hashes.SHA256())
+    )
+    return {
+        "aid": aid,
+        "private_key_pem": key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8"),
+        "public_key_der_b64": base64.b64encode(
+            key.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).decode("ascii"),
+        "curve": "P-256",
+        "cert": cert.public_bytes(serialization.Encoding.PEM).decode("utf-8"),
+    }
 
 
 # ── 改进 A: authenticate() 复用 cached_token ─────────────────────────
@@ -29,8 +65,8 @@ def _setup_client(tmp_path):
 async def test_authenticate_reuses_cached_token(tmp_path):
     """keystore 里有有效 cached_token 时 authenticate 直接返回，不走 _login。"""
     aid = "alice.test.com"
-    client = _setup_client(tmp_path)
-    auth_flow = client._auth
+    store = _setup_store(tmp_path)
+    auth_flow = store._auth
 
     # 注入一个有效的 identity（含未过期 access_token + refresh_token）
     future_expiry = int(time.time()) + 3600  # 1h 后过期
@@ -62,16 +98,10 @@ async def test_authenticate_reuses_cached_token(tmp_path):
 async def test_authenticate_falls_back_to_login_when_no_cached_token(tmp_path):
     """没有 cached_token 时 authenticate 走 _login。"""
     aid = "alice.test.com"
-    client = _setup_client(tmp_path)
-    auth_flow = client._auth
+    store = _setup_store(tmp_path)
+    auth_flow = store._auth
 
-    identity = {
-        "aid": aid,
-        "private_key_pem": "fake",
-        "public_key_der_b64": "AAAA",
-        "cert": "fake-cert",
-        # 没有 access_token / refresh_token
-    }
+    identity = _make_identity(aid)
 
     auth_flow._load_identity_or_raise = MagicMock(return_value=identity)
     auth_flow._login = AsyncMock(return_value={
@@ -92,19 +122,16 @@ async def test_authenticate_falls_back_to_login_when_no_cached_token(tmp_path):
 async def test_authenticate_login_when_cached_token_expired(tmp_path):
     """cached_token 已过期时 authenticate 走 _login（_get_cached_access_token 会返回空）。"""
     aid = "alice.test.com"
-    client = _setup_client(tmp_path)
-    auth_flow = client._auth
+    store = _setup_store(tmp_path)
+    auth_flow = store._auth
 
     past_expiry = int(time.time()) - 100  # 已过期
-    identity = {
-        "aid": aid,
-        "private_key_pem": "fake",
-        "public_key_der_b64": "AAAA",
-        "cert": "fake-cert",
+    identity = _make_identity(aid)
+    identity.update({
         "access_token": "expired-tok",
         "refresh_token": "old-refresh",
         "access_token_expires_at": past_expiry,
-    }
+    })
 
     auth_flow._load_identity_or_raise = MagicMock(return_value=identity)
     auth_flow._login = AsyncMock(return_value={
@@ -127,71 +154,66 @@ async def test_authenticate_login_when_cached_token_expired(tmp_path):
 async def test_resolve_gateway_uses_keystore_cache(tmp_path):
     """_resolve_gateway 在 keystore metadata 命中时跳过 discovery。"""
     aid = "alice.test.com"
-    client = _setup_client(tmp_path)
-    client._aid = aid
+    store = _setup_store(tmp_path)
 
     # 直接写入 keystore metadata
-    client.auth._persist_gateway_url(aid, "wss://cached-gateway.test/aun")
+    store._persist_gateway_url(aid, "wss://cached-gateway.test/aun")
 
     # mock discovery —— 不应被调用
-    client._discovery = MagicMock()
-    client._discovery.discover = AsyncMock()
+    store._discovery = MagicMock()
+    store._discovery.discover = AsyncMock()
 
-    result = await client.auth._resolve_gateway(aid)
+    result = await store._resolve_gateway(aid)
 
     assert result == "wss://cached-gateway.test/aun"
-    client._discovery.discover.assert_not_called()
+    store._discovery.discover.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_resolve_gateway_persists_after_discovery(tmp_path):
     """discovery 成功后 gateway_url 应被写入 keystore metadata。"""
     aid = "alice.test.com"
-    client = _setup_client(tmp_path)
-    client._aid = aid
-    client._gateway_url = ""  # 内存缓存清空
+    store = _setup_store(tmp_path)
 
-    client._discovery = MagicMock()
-    client._discovery.discover = AsyncMock(return_value="wss://discovered.test/aun")
+    store._discovery = MagicMock()
+    store._discovery.discover = AsyncMock(return_value="wss://discovered.test/aun")
 
-    result = await client.auth._resolve_gateway(aid)
+    result = await store._resolve_gateway(aid)
     assert result == "wss://discovered.test/aun"
 
     # 验证已持久化
-    cached = client.auth._load_cached_gateway_url(aid)
+    cached = store._load_cached_gateway_url(aid)
     assert cached == "wss://discovered.test/aun"
 
 
 @pytest.mark.asyncio
-async def test_resolve_gateway_preset_in_memory_takes_priority(tmp_path):
-    """内存里的 _gateway_url 优先级最高（即使 keystore 有值）。"""
+async def test_resolve_gateway_keystore_cache_takes_priority_over_discovery(tmp_path):
+    """外部不能预置 gateway；keystore 发现缓存命中时跳过 well-known discovery。"""
     aid = "alice.test.com"
-    client = _setup_client(tmp_path)
-    client._aid = aid
+    store = _setup_store(tmp_path)
 
-    client.auth._persist_gateway_url(aid, "wss://stale.test/aun")
-    client._gateway_url = "wss://memory-fresh.test/aun"  # 内存优先
+    store._persist_gateway_url(aid, "wss://stale.test/aun")
 
-    client._discovery = MagicMock()
-    client._discovery.discover = AsyncMock()
+    store._discovery = MagicMock()
+    store._discovery.discover = AsyncMock(return_value="wss://discovered.test/aun")
 
-    result = await client.auth._resolve_gateway(aid)
-    assert result == "wss://memory-fresh.test/aun"
+    result = await store._resolve_gateway(aid)
+    assert result == "wss://stale.test/aun"
+    store._discovery.discover.assert_not_called()
 
 
 def test_persist_gateway_url_handles_empty(tmp_path):
     """空字符串不应写入 keystore（避免污染）。"""
     aid = "alice.test.com"
-    client = _setup_client(tmp_path)
-    client._aid = aid
+    store = _setup_store(tmp_path)
     # 不应抛异常
-    client.auth._persist_gateway_url(aid, "")
+    store._persist_gateway_url(aid, "")
 
 
 def test_load_cached_gateway_url_returns_empty_when_missing(tmp_path):
     """keystore 没有记录时返回空字符串。"""
     aid = "alice-no-record.test.com"
-    client = _setup_client(tmp_path)
+    store = _setup_store(tmp_path)
     # 应返回空字符串而非异常
-    result = client.auth._load_cached_gateway_url(aid)
+    result = store._load_cached_gateway_url(aid)
     assert result == ""

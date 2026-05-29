@@ -20,21 +20,19 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient, AuthError, RateLimitError
 from aun_core.e2ee import (
-    build_key_distribution,
     compute_membership_commitment,
     decrypt_group_message,
     encrypt_group_message,
-    generate_group_secret,
-    handle_key_distribution,
-    load_all_group_secrets,
     load_group_secret,
     store_group_secret,
 )
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +51,8 @@ def _default_test_aun_path() -> str:
 
 _TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).strip()
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
+_CLIENT_SLOT_IDS: WeakKeyDictionary[AUNClient, str] = WeakKeyDictionary()
+_CLIENT_GROUP_INBOXES: WeakKeyDictionary[AUNClient, dict[str, list[dict]]] = WeakKeyDictionary()
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 _CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
@@ -118,46 +118,39 @@ def _install_trace_diag(client: AUNClient, tag: str, rid: str | None) -> None:
 
 def _make_client(tag: str, rid: str | None = None) -> AUNClient:
     """创建测试客户端。所有客户端共享同一 aun_path，各 AID 数据在 AIDs/{aid}/ 下自然隔离。"""
-    client = AUNClient({
-        "aun_path": _TEST_AUN_PATH,
-    })
-    client._config_model.require_forward_secrecy = False
-    client._test_slot_id = _build_test_slot_id(tag, rid)
+    client = make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
+    _CLIENT_SLOT_IDS[client] = _build_test_slot_id(tag, rid)
     # 服务端 cursor 兜底生效后，after_message_seq=0 会被抬升到 last_ack_msg_seq，
     # 而 auto-ack 已把 cursor 推到最新，pull 会返回空。测试用 push 收件箱兜底。
-    client._test_group_inbox = {}
+    _CLIENT_GROUP_INBOXES[client] = {}
 
     def _collect_group_msg(data):
         if not isinstance(data, dict):
             return
         gid = data.get("group_id", "")
         if gid:
-            client._test_group_inbox.setdefault(gid, []).append(data)
+            _CLIENT_GROUP_INBOXES.setdefault(client, {}).setdefault(gid, []).append(data)
 
-    client._dispatcher.subscribe("group.message_created", _collect_group_msg)
+    client.on("group.message_created", _collect_group_msg)
     _install_trace_diag(client, tag, rid)
     return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            slot_id = str(getattr(client, "_test_slot_id", "") or "")
+            connect_params: dict = {}
+            slot_id = str(_CLIENT_SLOT_IDS.get(client, "") or "")
             if slot_id:
                 connect_params["slot_id"] = slot_id
             connect_params["auto_reconnect"] = False
-            print(f"[connect diag] aid={aid} attempt={attempt} gateway={connect_params.get('gateway')!r} topology={connect_params.get('topology')!r} access_token={'set' if connect_params.get('access_token') else 'missing'}")
-            await client.connect(connect_params)
+            print(f"[connect diag] aid={aid} attempt={attempt} slot_id={slot_id or '-'}")
+            await ensure_connected_identity(client, aid, connect_options=connect_params, attempts=1)
             print(
                 f"[group-e2e] DEBUG: connected aid={aid} "
-                f"slot_id={getattr(client, '_slot_id', '-') or '-'} "
-                f"device_id={getattr(client, '_device_id', '-') or '-'} "
+                f"slot_id={client.slot_id or '-'} "
+                f"device_id={client.device_id or '-'} "
                 f"trace={_GROUP_E2E_TRACE_MODE}"
             )
             return aid
@@ -179,8 +172,8 @@ def _run_id() -> str:
 
 
 async def _create_group(client: AUNClient, name: str) -> str:
-    """创建群组（V1 E2EE），返回 group_id"""
-    result = await client.call("group.create", {"name": name, "group_e2ee_protocol": "group_e2ee"})
+    """创建 V2-only 群组，返回 group_id"""
+    result = await client.call("group.create", {"name": name, "group_e2ee_protocol": "group_e2ee_v2"})
     return result["group"]["group_id"]
 
 
@@ -242,41 +235,18 @@ def _usable_group_messages(messages: list[dict], after_seq: int = 0) -> list[dic
 
 async def _group_pull(client: AUNClient, group_id: str, after_seq: int = 0, min_count: int = 0) -> list[dict]:
     """获取群消息：优先从 push 收件箱读取，兜底走 group.v2.pull（V2-only 模式）。"""
-    pushed = list(getattr(client, "_test_group_inbox", {}).get(group_id, []))
+    pushed = list(_CLIENT_GROUP_INBOXES.get(client, {}).get(group_id, []))
     usable = _usable_group_messages(pushed, after_seq)
     if usable and (min_count <= 0 or len(usable) >= min_count):
         return usable
-    # 兜底：V2-only 模式走 group.v2.pull（合并 V1 明文 + V2 密文）
-    # 直接调 RPC 绕过 SDK 内部 seq tracker，确保能拿到所有消息
-    result = await client.call("group.v2.pull", {
+    # 兜底：通过公开 group.pull 走 SDK V2 解密路径。
+    result = await client.call("group.pull", {
         "group_id": group_id,
         "after_seq": after_seq or 0,
         "limit": 200,
     })
-    raw_msgs = result.get("messages", []) if isinstance(result, dict) else []
-    # 手动解密 V2 消息，V1 明文直接取 payload
-    pulled = []
-    for msg in raw_msgs:
-        if not isinstance(msg, dict):
-            continue
-        seq = msg.get("seq", 0)
-        if str(msg.get("version", "") or "") == "v1":
-            payload = msg.get("payload")
-            if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
-                continue
-            pulled.append({"seq": seq, "group_id": group_id, "from": msg.get("from_aid", ""), "payload": payload, "encrypted": False})
-        else:
-            plaintext = await client._decrypt_v2_message(msg)
-            if plaintext:
-                plaintext["group_id"] = group_id
-                pulled.append(plaintext)
+    pulled = result.get("messages", []) if isinstance(result, dict) else []
     return _usable_group_messages(pushed + pulled, after_seq)
-
-
-async def _group_pull_raw(client: AUNClient, group_id: str, after_seq: int = 0) -> list[dict]:
-    """拉取群消息（不经自动解密，用于验证无密钥方看到密文）"""
-    result = await client._transport.call("group.pull", {"group_id": group_id, "after_message_seq": after_seq})
-    return result.get("messages", [])
 
 
 def _truthy_bool(value) -> bool:
@@ -320,9 +290,9 @@ async def _wait_for_group_secret_epoch(client: AUNClient, aid: str, group_id: st
     """V2-only 业务级"密钥就绪"等待：
 
     "密钥就绪" 在 V2 语义下 = group.v2.bootstrap 能拿到本 AID 的设备 IK/SPK，且
-    pending 成员队列已清空。V2 群没有像 V1 那样的"epoch=1"密钥分发概念，
-    epoch 仅在显式 epoch_rotated 后推进；为兼容老 V1 测试 min_epoch 参数，本 helper
-    返回当前 bootstrap epoch（首次密钥就绪时按 1 处理，方便老断言通过）。
+    pending 成员队列已清空。V2 群没有初始 epoch=1 密钥分发概念，
+    epoch 仅在显式 epoch_rotated 后推进；本 helper 返回当前 bootstrap epoch
+    （首次密钥就绪时按 min_epoch 处理，方便业务断言）。
     """
     deadline = asyncio.get_running_loop().time() + timeout
     last_epoch = 0
@@ -341,7 +311,6 @@ async def _wait_for_group_secret_epoch(client: AUNClient, aid: str, group_id: st
             last_pending = bool(pending_adds) or bool(pending_removes)
             # V2 群密钥就绪：自己作为成员、并能拿到自己的设备 SPK
             if aid in last_committed and last_devices_for_aid >= 1 and not last_pending:
-                # 返回 max(last_epoch, min_epoch) 以兼容老 V1 测试 min_epoch >=1 的语义
                 return max(last_epoch, min_epoch)
         except Exception:
             pass
@@ -572,7 +541,7 @@ async def test_burst_group_messages():
         # 等待 push 收集，逐步检查
         for wait_round in range(6):
             await asyncio.sleep(1)
-            pushed = list(getattr(bob, "_test_group_inbox", {}).get(group_id, []))
+            pushed = list(_CLIENT_GROUP_INBOXES.get(bob, {}).get(group_id, []))
             print(f"  DEBUG: wait_round={wait_round} pushed_count={len(pushed)}")
             if len(pushed) >= N:
                 break
@@ -663,27 +632,23 @@ async def test_mixed_encrypted_plaintext():
 
 
 async def test_membership_commitment_verification():
-    """Test 7: 篡改 member_aids → commitment 校验失败"""
-    print("\n=== Test 7: Membership commitment prevents ghost ===")
+    """Test 7: V2 bootstrap 的 committed 成员集不包含幽灵成员"""
+    print("\n=== Test 7: V2 committed members exclude ghost ===")
     rid = _run_id()
     alice, bob = _make_client("a", rid), _make_client("b", rid)
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
 
-        gs = generate_group_secret()
-        members = [a_aid, b_aid]
+        group_id = await _create_group(alice, f"e2ee-commit-{rid}")
+        await _add_member(alice, group_id, b_aid)
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=1, timeout=20.0)
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
-        # 正常分发
-        dist = build_key_distribution(f"grp_test_{rid}", 1, gs, members, a_aid)
-        ok = handle_key_distribution(dist, bob._keystore, b_aid)
-        assert ok, "正常分发应成功"
-
-        # 篡改 member_aids（注入幽灵成员）
-        tampered = dict(dist)
-        tampered["member_aids"] = members + ["evil.agentid.pub"]
-        ok2 = handle_key_distribution(tampered, bob._keystore, b_aid)
-        assert not ok2, "篡改后应失败"
+        bootstrap = await alice.call("group.v2.bootstrap", {"group_id": group_id})
+        committed = set(bootstrap.get("committed_member_aids") or bootstrap.get("member_aids") or [])
+        assert a_aid in committed and b_aid in committed, f"committed members missing expected aids: {committed}"
+        assert "evil.agentid.pub" not in committed, f"ghost member leaked into committed set: {committed}"
 
         print("[PASS] Test 7")
         return True
@@ -950,7 +915,7 @@ async def test_open_group_join_rotates_epoch_and_updates_memberlist():
 
 
 async def test_capabilities_required_for_join():
-    """Test 11: 入群成员能力字段验证（默认 V1+V2 能力声明，应正常入群）"""
+    """Test 11: 入群成员能力字段验证（默认 V2-only 能力声明，应正常入群）"""
     print("\n=== Test 11: Capabilities required for group join ===")
     rid = _run_id()
     alice = _make_client("alice", rid)
@@ -963,7 +928,7 @@ async def test_capabilities_required_for_join():
         # Alice 建群
         group_id = await _create_group(alice, f"cap-test-{rid}")
 
-        # 默认 SDK 能力声明含 group_e2ee + group_e2ee_v2，服务端应允许入群
+        # 默认 SDK 能力声明为 V2-only，服务端应允许入群
         await _add_member(alice, group_id, b_aid)
         members = await _get_members(alice, group_id)
         assert b_aid in members, f"Bob should be in group, got {members}"
@@ -1073,14 +1038,6 @@ async def test_epoch_rotation_on_leave():
                          and m.get("payload", {}).get("text") == "退群后的消息"]
         assert len(decrypted_bob) >= 1, f"Bob: no auto-decrypted epoch {new_epoch} msgs"
         assert decrypted_bob[0]["payload"]["text"] == "退群后的消息"
-
-        # Carol 不应有新 epoch 密钥（V1 本地 secret 检查保留作为额外安全断言；V2 下没有也 OK）
-        try:
-            all_carol = load_all_group_secrets(carol._keystore, c_aid, group_id)
-            if new_epoch in all_carol:
-                raise AssertionError(f"Carol should not have epoch {new_epoch} secret")
-        except Exception:
-            pass
 
         print("[PASS] Test 13")
         return True
@@ -1603,68 +1560,14 @@ async def test_group_thought_get_recovers_missing_epoch_key():
         await charlie.close()
 
 
-# ── V1 capabilities 客户端构造 helper（用于 V1 群 / V2 加 V1 群拦截测试）──
-_V1_CAPS = {
-    "e2ee": True,
-    "group_e2ee": True,
-    "supported_p2p_e2ee": ["e2ee"],
-    "supported_group_e2ee": ["group_e2ee"],
-}
-
-
-async def _ensure_connected_with_caps(client: AUNClient, aid: str, caps: dict) -> str:
-    """以指定 capabilities 上线（用于跨版本拦截测试）。其它行为与 _ensure_connected 一致。"""
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    last_error: Exception | None = None
-    for attempt in range(4):
-        try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            slot_id = str(getattr(client, "_test_slot_id", "") or "")
-            if slot_id:
-                connect_params["slot_id"] = slot_id
-            connect_params["auto_reconnect"] = False
-            # _capabilities 覆盖：让该客户端以指定能力声明上线（auth.py 内部规则）
-            connect_params["extra_info"] = {"_capabilities": dict(caps)}
-            await client.connect(connect_params)
-            print(
-                f"[group-e2e] DEBUG: connected aid={aid} "
-                f"slot_id={getattr(client, '_slot_id', '-') or '-'} "
-                f"device_id={getattr(client, '_device_id', '-') or '-'} "
-                f"trace={_GROUP_E2E_TRACE_MODE} caps={sorted(caps.keys())}"
-            )
-            return aid
-        except (AuthError, RateLimitError) as exc:
-            last_error = exc
-            if attempt >= 3:
-                break
-            await asyncio.sleep(1.5 * (attempt + 1))
-        except Exception:
-            raise
-    raise last_error or RuntimeError(f"{aid} connect failed (custom caps)")
-
-
-# ── Test 22-27: V2-only 规则（pending 收发约束 + V1 群拒加密 + V2 不能加 V1 群）──
+# ── Test 22-27: V2-only 规则（pending 收发约束 + 旧加密信封拒绝 + V2 入群）──
 
 async def test_private_pending_blocks_recv():
-    """Test 22: private 群 add_member 后 bob 处于 pending → 收不到 alice 的加密消息。
-
-    构造 pending 窗口：禁用 alice client 的 V2 auto-confirm，让服务端 auto-propose
-    生成的 unsigned proposal 不被立即 confirm，bob 因此停留在 pending 状态。
-    """
+    """Test 22: private 群 Bob 申请待审批期间收不到 Alice 的加密消息。"""
     print("\n=== Test 22: private group: pending member cannot receive ===")
     rid = _run_id()
     alice = _make_client("a-priv-recv", rid)
     bob = _make_client("b-priv-recv", rid)
-    # 禁用 alice 的 V2 auto-confirm，构造 pending 窗口
-    async def _noop_confirm():
-        return
-    alice._v2_auto_confirm_pending_proposals = _noop_confirm
-    async def _noop_propose(group_id, **kwargs):
-        return
-    alice._v2_auto_propose_state = _noop_propose
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -1681,18 +1584,10 @@ async def test_private_pending_blocks_recv():
         # Alice 自己建群后默认就是 committed（owner 在 commitment 里）
         await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=1, timeout=20.0)
 
-        # Alice add_member bob → bob 进入 pending（state commitment 还没有 bob）
-        await _add_member(alice, group_id, b_aid)
-        await asyncio.sleep(0.5)
+        join_result = await bob.call("group.request_join", {"group_id": group_id, "message": "pending recv"})
+        assert join_result.get("status") == "pending", f"expected pending join request, got {join_result}"
 
-        # 验证 bob 在 alice 端 bootstrap 中是 pending
-        bootstrap = await alice.call("group.v2.bootstrap", {"group_id": group_id})
-        pending_adds = list(bootstrap.get("pending_adds") or [])
-        committed = list(bootstrap.get("committed_member_aids") or [])
-        assert b_aid in pending_adds, f"bob should be in pending_adds, got pending={pending_adds} committed={committed}"
-        assert b_aid not in committed, f"bob should NOT be in committed yet, got {committed}"
-
-        # Alice 发加密消息（服务端按 committed 过滤，bob 不该收到 wrap）
+        # Alice 发加密消息；Bob 尚未获批，不能收到或解密该消息。
         await alice.call("group.send", {
             "group_id": group_id,
             "payload": {"type": "text", "text": f"private-pending-{rid}"},
@@ -1700,8 +1595,11 @@ async def test_private_pending_blocks_recv():
         })
         await asyncio.sleep(2)
 
-        # Bob 拉群消息：应拿不到 alice 的加密消息（推送也排除 pending）
-        msgs = await _group_pull(bob, group_id, min_count=0)
+        msgs = []
+        try:
+            msgs = await _group_pull(bob, group_id, min_count=0)
+        except Exception as exc:
+            print(f"  [pending recv] bob pull rejected as expected: {exc}")
         decrypted = [m for m in msgs if isinstance(m.get("e2ee"), dict)
                      and m.get("payload", {}).get("text") == f"private-pending-{rid}"]
         assert not decrypted, f"pending bob should NOT receive encrypted msg, got: {decrypted}"
@@ -1717,18 +1615,11 @@ async def test_private_pending_blocks_recv():
 
 
 async def test_private_pending_blocks_send():
-    """Test 23: private 群 pending bob 自己发消息被服务端拒。"""
+    """Test 23: private 群 Bob 申请待审批期间自己发消息被服务端拒。"""
     print("\n=== Test 23: private group: pending member cannot send ===")
     rid = _run_id()
     alice = _make_client("a-priv-send", rid)
     bob = _make_client("b-priv-send", rid)
-    # 禁用 alice 的 V2 auto-confirm，构造 pending 窗口
-    async def _noop_confirm():
-        return
-    alice._v2_auto_confirm_pending_proposals = _noop_confirm
-    async def _noop_propose(group_id, **kwargs):
-        return
-    alice._v2_auto_propose_state = _noop_propose
     try:
         a_aid = await _ensure_connected(alice, _ALICE_AID)
         b_aid = await _ensure_connected(bob, _BOBB_AID)
@@ -1741,13 +1632,8 @@ async def test_private_pending_blocks_send():
         group_id = created["group"]["group_id"]
         await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=1, timeout=20.0)
 
-        await _add_member(alice, group_id, b_aid)
-        await asyncio.sleep(0.5)
-
-        # 验证 bob 处于 pending
-        bootstrap = await alice.call("group.v2.bootstrap", {"group_id": group_id})
-        pending_adds = list(bootstrap.get("pending_adds") or [])
-        assert b_aid in pending_adds, f"bob should be pending; got {pending_adds}"
+        join_result = await bob.call("group.request_join", {"group_id": group_id, "message": "pending send"})
+        assert join_result.get("status") == "pending", f"expected pending join request, got {join_result}"
 
         # bob pending 时尝试发加密消息：应被服务端拒
         send_rejected = False
@@ -1902,53 +1788,37 @@ async def test_open_pending_allows_recv_send():
         await alice.close(); await bob.close()
 
 
-async def test_v1_group_rejects_encrypted():
-    """Test 26: V1 群拒绝任何加密消息（V1 E2EE 已下线，V1 群只许明文）。"""
-    print("\n=== Test 26: V1 group rejects encrypted send ===")
+async def test_v2_group_rejects_legacy_encrypted_envelope():
+    """Test 26: V2-only 群拒绝旧版 e2ee.group_encrypted 信封绕过。"""
+    print("\n=== Test 26: V2 group rejects legacy encrypted envelope ===")
     rid = _run_id()
-    alice_v1 = _make_client("a-v1grp", rid)
-    bob_v1 = _make_client("b-v1grp", rid)
+    alice = _make_client("a-v2-legacy", rid)
+    bob = _make_client("b-v2-legacy", rid)
     try:
-        # 用 V1 caps 上线 → 服务端按 V1 客户端处理 → 建出来的群是 V1 群
-        a_aid = await _ensure_connected_with_caps(alice_v1, _ALICE_AID, _V1_CAPS)
-        b_aid = await _ensure_connected_with_caps(bob_v1, _BOBB_AID, _V1_CAPS)
+        await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
-        created = await alice_v1.call("group.create", {
-            "name": f"v1-grp-{rid}",
-            "visibility": "private",
-        })
-        group_id = created["group"]["group_id"]
-        assert group_id
+        group_id = await _create_group(alice, f"v2-legacy-reject-{rid}")
+        await _add_member(alice, group_id, b_aid)
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
-        await _add_member(alice_v1, group_id, b_aid)
-        await asyncio.sleep(0.5)
-
-        # V1 客户端发明文消息：放行
-        await alice_v1.call("group.send", {
+        await alice.call("group.send", {
             "group_id": group_id,
-            "payload": {"type": "text", "text": f"v1-plaintext-{rid}"},
+            "payload": {"type": "text", "text": f"v2-plaintext-{rid}"},
             "encrypt": False,
         })
 
-        # V1 客户端尝试发加密：服务端应拒（V1 群拒绝加密）
-        # 注：SDK V1 路径已删，V1 客户端 encrypt=True 会先在 SDK 内 raise；
-        # 这里直接传 type=e2ee.group_encrypted 模拟旧客户端绕过 SDK 路由的请求
         rejected = False
         try:
-            await alice_v1.call("group.send", {
+            await alice.call("group.send", {
                 "group_id": group_id,
                 "type": "e2ee.group_encrypted",
                 "payload": {"type": "e2ee.group_encrypted", "ciphertext": "fake"},
                 "encrypt": False,
             })
-        except Exception as e:
-            err = str(e).lower()
-            if "v1" in err and ("encrypted" in err or "encryption" in err or "no longer allowed" in err):
-                rejected = True
-            else:
-                # 也接受 SDK 直接抛 V2 路径错误（V2 session 不可用之类）
-                rejected = True
-        assert rejected, "V1 group should reject encrypted send"
+        except Exception:
+            rejected = True
+        assert rejected, "V2-only group should reject legacy encrypted envelope"
 
         print("[PASS] Test 26")
         return True
@@ -1957,53 +1827,36 @@ async def test_v1_group_rejects_encrypted():
         import traceback; traceback.print_exc()
         return False
     finally:
-        await alice_v1.close(); await bob_v1.close()
+        await alice.close(); await bob.close()
 
 
-async def test_v2_client_cannot_join_v1_group():
-    """Test 27: V2 客户端不能加入 V1 群（add_member / request_join / use_invite_code）。"""
-    print("\n=== Test 27: V2 client cannot join V1 group ===")
+async def test_v2_client_joins_v2_group_and_exchanges_messages():
+    """Test 27: 默认 V2-only 客户端加入 V2 群后可正常加密收发。"""
+    print("\n=== Test 27: V2 client joins V2 group and exchanges messages ===")
     rid = _run_id()
-    alice_v1 = _make_client("a-v1-only", rid)
-    bob_v2 = _make_client("b-v2-only", rid)
+    alice = _make_client("a-v2-join", rid)
+    bob = _make_client("b-v2-join", rid)
     try:
-        # alice 用 V1 caps 建 V1 群；bob 用默认 V2-only caps
-        await _ensure_connected_with_caps(alice_v1, _ALICE_AID, _V1_CAPS)
-        b_aid = await _ensure_connected(bob_v2, _BOBB_AID)
+        a_aid = await _ensure_connected(alice, _ALICE_AID)
+        b_aid = await _ensure_connected(bob, _BOBB_AID)
 
-        created = await alice_v1.call("group.create", {
-            "name": f"v1-grp-x-{rid}",
-            "visibility": "private",
-        })
-        group_id = created["group"]["group_id"]
+        group_id = await _create_group(alice, f"v2-join-{rid}")
+        await _add_member(alice, group_id, b_aid)
+        await _wait_for_group_secret_epoch(alice, a_aid, group_id, min_epoch=1, timeout=20.0)
+        await _wait_for_group_secret_epoch(bob, b_aid, group_id, min_epoch=1, timeout=20.0)
 
-        # 1) add_member：alice 把 V2 bob 加进 V1 群应被拒
-        rejected_add = False
-        try:
-            await _add_member(alice_v1, group_id, b_aid)
-        except Exception as e:
-            err = str(e).lower()
-            if "v1 group" in err or "v2 client" in err or "create a v2 group" in err:
-                rejected_add = True
-            else:
-                raise AssertionError(f"unexpected error: {e}")
-        assert rejected_add, "V1 group should reject V2 client via add_member"
-
-        # 2) request_join（先把群改成 open 让 bob 自助加入）：bob 自己请求加 V1 群应被拒
-        await alice_v1.call("group.update_join_requirements", {
+        text = f"v2-join-bob-{rid}"
+        await bob.call("group.send", {
             "group_id": group_id,
-            "join_requirements": {"mode": "open"},
+            "payload": {"type": "text", "text": text},
+            "encrypt": True,
         })
-        rejected_req = False
-        try:
-            await bob_v2.call("group.request_join", {"group_id": group_id, "message": "join"})
-        except Exception as e:
-            err = str(e).lower()
-            if "v1 group" in err or "v2 client" in err:
-                rejected_req = True
-            else:
-                raise AssertionError(f"unexpected error: {e}")
-        assert rejected_req, "V1 group should reject V2 client via request_join"
+        await asyncio.sleep(2)
+
+        msgs = await _group_pull(alice, group_id, min_count=1)
+        decrypted = [m for m in msgs if isinstance(m.get("e2ee"), dict)
+                     and m.get("payload", {}).get("text") == text]
+        assert decrypted, f"alice should receive V2 encrypted message from bob; got msgs={msgs}"
 
         print("[PASS] Test 27")
         return True
@@ -2012,7 +1865,7 @@ async def test_v2_client_cannot_join_v1_group():
         import traceback; traceback.print_exc()
         return False
     finally:
-        await alice_v1.close(); await bob_v2.close()
+        await alice.close(); await bob.close()
 
 
 async def main():
@@ -2047,8 +1900,8 @@ async def main():
         ("23. private group: pending blocks send",  test_private_pending_blocks_send),
         ("24. private group: propose+confirm unblocks pending", test_private_propose_state_unblocks),
         ("25. open group: pending allows recv/send",  test_open_pending_allows_recv_send),
-        ("26. V1 group rejects encrypted send",      test_v1_group_rejects_encrypted),
-        ("27. V2 client cannot join V1 group",       test_v2_client_cannot_join_v1_group),
+        ("26. V2 group rejects legacy encrypted envelope", test_v2_group_rejects_legacy_encrypted_envelope),
+        ("27. V2 client joins V2 group and exchanges messages", test_v2_client_joins_v2_group_and_exchanges_messages),
     ]
 
     results = []
@@ -2083,3 +1936,4 @@ async def main():
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
+

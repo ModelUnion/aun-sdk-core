@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import secrets
 import time
 import uuid
 from collections.abc import Callable
@@ -19,8 +20,10 @@ from urllib.parse import quote, urlencode, urlparse, urlunparse
 import aiohttp
 import websockets
 
+from .aid import AID
+from .aid_store import AIDStore
 from .auth import AuthFlow
-from .config import AUNConfig, get_device_id, normalize_instance_id
+from .config import AUNConfig, get_device_id, normalize_instance_id, normalize_slot_id
 from .logger import AUNLogger, NullLogger
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
@@ -31,6 +34,7 @@ from .errors import (
     ClientSignatureError,
     ConnectionError,
     E2EEError,
+    NotFoundError,
     PermissionError as AUNPermissionError,
     StateError,
     ValidationError,
@@ -38,9 +42,6 @@ from .errors import (
 from .events import EventDispatcher, Subscription
 from .group_id import normalize_group_id as _normalize_group_id
 from .keystore.file import FileKeyStore
-from .namespaces.auth_namespace import AuthNamespace
-from .namespaces.custody_namespace import CustodyNamespace
-from .namespaces.meta_namespace import MetaNamespace
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
 from .types import ConnectionState
@@ -59,6 +60,22 @@ _INTERNAL_ONLY_METHODS = {
     "initialize",
 }
 
+_PROTECTED_HEADERS_METHODS = frozenset({
+    "message.send",
+    "group.send",
+    "message.thought.put",
+    "group.thought.put",
+})
+
+
+_STATE_TO_PUBLIC = {
+    "idle": "no_identity",
+    "authenticating": "connecting",
+    "connected": "ready",
+    "disconnected": "standby",
+    "terminal_failed": "connection_failed",
+}
+
 # token 刷新连续失败次数上限，超过后发布 exhausted 事件
 _TOKEN_REFRESH_MAX_FAILURES = 3
 _TOKEN_REFRESH_CHECK_INTERVAL = 30.0
@@ -68,6 +85,8 @@ _TOKEN_REFRESH_DEFAULT_LEAD = 1800.0
 # 客户端可在运行时被该值覆盖（仍受 clamp 约束）。
 _HEARTBEAT_MIN_INTERVAL = 10.0
 _HEARTBEAT_MAX_INTERVAL = 600.0
+_ONLINE_UNREAD_HINT_INITIAL_DELAY = 0.75
+_ONLINE_UNREAD_HINT_INTERVAL = 0.05
 
 
 def _clamp_heartbeat_interval(value: Any) -> float:
@@ -133,13 +152,17 @@ def _v2_apply_wrap_policy_to_targets(
     if policy.get("scope") != "aid":
         return normalized
     collapsed: dict[tuple[str, str], dict[str, Any]] = {}
+    preserved: list[dict[str, Any]] = []
     for target in normalized:
+        if str(target.get("role") or "") == "self_sync":
+            preserved.append(dict(target))
+            continue
         key = (str(target.get("aid") or ""), str(target.get("role") or ""))
         if key not in collapsed:
             row = dict(target)
             row["device_id"] = ""
             collapsed[key] = row
-    return list(collapsed.values())
+    return list(collapsed.values()) + preserved
 
 
 def _length_prefixed_bytes_key(*parts: bytes) -> bytes:
@@ -376,10 +399,21 @@ def _normalize_delivery_mode_config(
 class AUNClient:
     """AUN Core SDK — 连接、认证、密钥管理、E2EE。"""
 
-    def __init__(self, config: dict | None = None, debug: bool = False) -> None:
-        raw_config = dict(config or {})
+    def __init__(
+        self,
+        aid: AID | None = None,
+        debug: bool = False,
+        *,
+        protected_headers: dict[str, Any] | None = None,
+    ) -> None:
+        if aid is not None and not isinstance(aid, AID):
+            raise TypeError("AUNClient expects an AID instance or None")
+        initial_aid_obj = aid if aid is not None and aid.is_private_key_valid() else None
+        if aid is not None and initial_aid_obj is None:
+            raise StateError("AUNClient received an AID without a valid private key; load a complete identity first")
+        raw_config = {"aun_path": initial_aid_obj.aun_path} if initial_aid_obj else {}
         self._config_model = AUNConfig.from_dict(raw_config)
-        init_aid = str(raw_config.get("aid") or "").strip() or None
+        init_aid = initial_aid_obj.aid if initial_aid_obj else (str(raw_config.get("aid") or "").strip() or None)
         self._device_id = get_device_id(self._config_model.aun_path)
         # AUNLogger 自身已处理 debug=False：INFO/WARN/ERROR 输出 stderr，DEBUG 不输出，无文件日志
         # 不再用 NullLogger 整个静默掉，否则用户排查问题时看不到任何 SDK 异常
@@ -398,9 +432,20 @@ class AUNClient:
             "seed_password": self._config_model.seed_password,
         }
         self._aid: str | None = init_aid
+        self._current_aid: AID | None = initial_aid_obj
         self._identity: dict[str, Any] | None = None
-        self._state = "idle"
+        self._state = "standby" if initial_aid_obj is not None else "no_identity"
+        self._peer_cache: dict[str, AID] = {}
+        self._next_retry_at: float | None = None
+        self._retry_attempt = 0
+        self._retry_max_attempts = 0
+        self._last_error: BaseException | None = None
+        self._last_error_code: str | None = None
+        self._instance_protected_headers: dict[str, Any] | None = (
+            dict(protected_headers) if protected_headers else None
+        )
         self._gateway_url: str | None = None
+        self._peer_gateway_cache: dict[str, str] = {}
         self._closing = False
         self._reconnect_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -434,8 +479,8 @@ class AUNClient:
         self._peer_prekeys_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._prekey_replenish_inflight: bool = False
         self._prekey_pending_replenish: int = 0
-        # AgentMDs 目录：{agent_md_path}/{aid}/agentmd.json 保存元数据，{agent_md_path}/{aid}/agent.md 保存正文。
-        self._agent_md_path: str = str(Path(self._config_model.aun_path) / "AgentMDs")
+        # agent.md 存储路径：{aun_path}/AIDs/{aid}/agentmd.json（元数据）+ agent.md（正文）
+        self._agent_md_path: str = str(Path(self._config_model.aun_path) / "AIDs")
         self._local_agent_md_etag: str = ""
         # gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
         self._remote_agent_md_etag: str = ""
@@ -451,12 +496,9 @@ class AUNClient:
             logger=self._log,
         )
         self._keystore = keystore
-        self._slot_id = ""
+        self._slot_id = normalize_slot_id(None)
         self._connect_delivery_mode = _normalize_delivery_mode_config({"mode": "fanout"})
         self._default_connect_delivery_mode = dict(self._connect_delivery_mode)
-        # 当前连接的能力声明（来自 connect 参数 extra_info._capabilities），
-        # 用于按 V1/V2 路由 RPC 调用。None 视为"双向兼容"（同时支持 V1 与 V2）。
-        self._connect_capabilities: dict[str, Any] | None = None
         self._auth = AuthFlow(
             keystore=keystore,
             crypto=CryptoProvider(),
@@ -494,21 +536,27 @@ class AUNClient:
         # 群惰性同步标志：只有收到推送或主动 pull 后才标记为已同步
         # 发送消息前如果未同步，先做一次 pull
         self._group_synced: set[str] = set()
+        self._online_unread_hint_queue: dict[str, dict[str, Any]] = {}
+        self._online_unread_hint_task: asyncio.Task | None = None
+        self._online_unread_hint_initial_delay = _ONLINE_UNREAD_HINT_INITIAL_DELAY
+        self._online_unread_hint_interval = _ONLINE_UNREAD_HINT_INTERVAL
 
-        self.auth = AuthNamespace(self)
-        self.custody = CustodyNamespace(self)
-        self.meta = MetaNamespace(self)
         # V2 E2EE session（延迟初始化，connect 后才有 aid）
         self._v2_session: V2Session | None = None
         # Pull Gate：per-key 序列化，防止同一 namespace/group 并发 pull
         self._pull_gates: dict[str, dict] = {}
         self._PULL_GATE_STALE_MS = 30000
+        # Per-namespace 消息处理锁：同一 namespace 的 push/pull 串行执行，
+        # 防止并发 task 导致乱序投递或 seq_tracker 状态不一致。
+        # 不同 namespace 之间互不阻塞。锁只在最外层入口获取，内部方法不再获取，避免死锁。
+        self._ns_locks: dict[str, asyncio.Lock] = {}
         # V2 state chain 本地存储（分叉检测）：group_id -> (state_version, state_chain)
         self._v2_state_chains: dict[str, tuple[int, str]] = {}
         # 同一 group 的 V2 自动提案必须串行，避免 group.create 与后续成员变更抢同一 state_version。
         self._v2_auto_propose_locks: dict[str, asyncio.Lock] = {}
         self._v2_auto_propose_locks_guard = asyncio.Lock()
         self._v2_auto_propose_last_snapshot: dict[str, str] = {}
+        self._v2_auto_state_management_enabled = True
         self._v2_lazy_propose_triggered: dict[str, float] = {}
         self._group_spk_registration_inflight: set[str] = set()
         self._group_spk_rotation_inflight: set[str] = set()
@@ -517,7 +565,7 @@ class AUNClient:
         self._dispatcher.subscribe("_raw.message.received", self._on_raw_message_received)
         # V2 P2P 推送通知
         self._dispatcher.subscribe("_raw.peer.v2.message_received", self._on_v2_push_notification)
-        # 群组消息推送（明文 / 兼容）：直接透传给应用层
+        # 群组明文消息推送：直接透传给应用层
         self._dispatcher.subscribe("_raw.group.message_created", self._on_raw_group_message_created)
         # V2 群组消息推送：服务端发的 group.v2.message_created 事件，触发自动 pull + 解密
         self._dispatcher.subscribe("_raw.group.v2.message_created", self._on_raw_group_v2_message_created)
@@ -544,12 +592,272 @@ class AUNClient:
     def aid(self) -> str | None:
         return self._aid
 
-    def get_remote_agent_md_etag(self) -> str:
-        """返回 gateway 在最近一次 RPC envelope._meta 注入的服务端 agent.md etag。
+    @property
+    def current_aid(self) -> AID | None:
+        return self._current_aid if self.has_identity else None
 
-        未收到过则为空串；不阻塞调用，纯内存读。
-        """
-        return getattr(self, "_remote_agent_md_etag", "") or ""
+    @property
+    def device_id(self) -> str:
+        return self._device_id
+
+    @property
+    def slot_id(self) -> str:
+        return self._slot_id
+
+    @property
+    def gateway_url(self) -> str | None:
+        gateway_url = getattr(self, "_gateway_url", None)
+        if gateway_url:
+            return gateway_url
+        session_params = getattr(self, "_session_params", None)
+        if isinstance(session_params, dict):
+            gateway = str(session_params.get("gateway") or "").strip()
+            return gateway or None
+        return None
+
+    @property
+    def session_options(self) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {}
+        for key, value in self._session_options.items():
+            snapshot[key] = dict(value) if isinstance(value, dict) else value
+        return snapshot
+
+    async def verify_event_signature(self, event: dict[str, Any], client_signature: dict[str, Any]) -> str | bool:
+        return await self._verify_event_signature(event, client_signature)
+
+    @property
+    def has_identity(self) -> bool:
+        return self._current_aid is not None and self._state not in {"no_identity", "closed"}
+
+    @property
+    def can_sign(self) -> bool:
+        return bool(self.current_aid and self.current_aid.is_private_key_valid())
+
+    @property
+    def can_connect(self) -> bool:
+        return bool(self.has_identity and self._public_state != ConnectionState.CLOSED)
+
+    @property
+    def can_send(self) -> bool:
+        return self._public_state == ConnectionState.READY
+
+    @property
+    def is_ready(self) -> bool:
+        return self.can_send
+
+    @property
+    def is_online(self) -> bool:
+        return self._public_state in {
+            ConnectionState.READY,
+            ConnectionState.RETRY_BACKOFF,
+            ConnectionState.RECONNECTING,
+        }
+
+    @property
+    def is_closed(self) -> bool:
+        return self._public_state == ConnectionState.CLOSED
+
+    @property
+    def is_closing(self) -> bool:
+        return bool(self._closing)
+
+    @property
+    def next_retry_at(self) -> float | None:
+        return self._next_retry_at if self._public_state == ConnectionState.RETRY_BACKOFF else None
+
+    @property
+    def next_retry_in_seconds(self) -> float | None:
+        if self.next_retry_at is None:
+            return None
+        return max(0.0, self.next_retry_at - time.time())
+
+    @property
+    def retry_attempt(self) -> int:
+        return int(getattr(self, "_retry_attempt", 0) or 0)
+
+    @property
+    def retry_max_attempts(self) -> int:
+        return int(getattr(self, "_retry_max_attempts", 0) or 0)
+
+    @property
+    def last_error(self) -> BaseException | None:
+        return getattr(self, "_last_error", None)
+
+    @property
+    def last_error_code(self) -> str | None:
+        return getattr(self, "_last_error_code", None)
+
+    @property
+    def access_token(self) -> str | None:
+        identity = getattr(self, "_identity", None)
+        if isinstance(identity, dict):
+            token = str(identity.get("access_token") or "").strip()
+            if token:
+                return token
+        session_params = getattr(self, "_session_params", None)
+        if isinstance(session_params, dict):
+            token = str(session_params.get("access_token") or "").strip()
+            return token or None
+        return None
+
+    @property
+    def access_token_expires_at(self) -> float | None:
+        identity = getattr(self, "_identity", None)
+        if not isinstance(identity, dict):
+            return None
+        raw = identity.get("access_token_expires_at")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def aun_path(self) -> str | None:
+        return self.current_aid.aun_path if self.current_aid else None
+
+    @property
+    def _public_state(self) -> ConnectionState:
+        raw_state = self._state.value if isinstance(self._state, ConnectionState) else str(self._state)
+        return ConnectionState(_STATE_TO_PUBLIC.get(raw_state, raw_state))
+
+    def load_identity(self, aid: AID) -> None:
+        if self._state not in {"no_identity", "closed"}:
+            raise StateError(f"load_identity not allowed in state {self._public_state.value}")
+        if not isinstance(aid, AID) or not aid.is_private_key_valid():
+            raise StateError("load_identity requires an AID with a valid private key")
+        self._rebuild_runtime_for_identity(aid)
+        self._current_aid = aid
+        self._aid = aid.aid
+        self._auth._aid = aid.aid
+        self._state = "standby"
+        self._closing = False
+        self._identity = None
+        self._last_error = None
+        self._last_error_code = None
+        self._next_retry_at = None
+        self._retry_attempt = 0
+
+    def _require_peer_management_state(self) -> None:
+        if not self.has_identity:
+            raise StateError("peer management requires a loaded identity")
+
+    def cache_peer(self, aid: AID) -> AID:
+        self._require_peer_management_state()
+        if not isinstance(aid, AID) or not aid.is_cert_valid():
+            raise ValidationError("cache_peer requires an AID with a valid certificate")
+        self._peer_cache[aid.aid] = aid
+        return aid
+
+    def get_peer(self, aid: str) -> AID | None:
+        self._require_peer_management_state()
+        target = str(aid or "").strip()
+        if not target:
+            raise ValidationError("get_peer requires non-empty aid")
+        return self._peer_cache.get(target)
+
+    async def lookup_peer(self, aid: str) -> AID:
+        self._require_peer_management_state()
+        target = str(aid or "").strip()
+        if not target:
+            raise ValidationError("lookup_peer requires non-empty aid")
+        cached = self._peer_cache.get(target)
+        if cached is not None:
+            return cached
+        store = self._make_aid_store()
+        try:
+            resolved = await store.resolve(target, {"skip_agent_md": True})
+        finally:
+            store.close()
+        if not resolved.ok or resolved.data is None:
+            message = resolved.error.message if resolved.error else f"resolve peer failed: {target}"
+            raise AUNError(message)
+        peer = resolved.data.get("aid")
+        if not isinstance(peer, AID) or not peer.is_cert_valid():
+            raise AUNError(f"resolved peer certificate is invalid: {target}")
+        self._peer_cache[peer.aid] = peer
+        return peer
+
+    def peers(self) -> list[AID]:
+        self._require_peer_management_state()
+        return [self._peer_cache[key] for key in sorted(self._peer_cache)]
+
+    def _rebuild_runtime_for_identity(self, aid: AID) -> None:
+        """让无身份客户端加载 AID 后切到该身份所属的 aun_path。"""
+        raw_config = {"aun_path": aid.aun_path}
+        next_config = AUNConfig.from_dict(raw_config)
+        current_path = str(getattr(self._config_model, "aun_path", ""))
+        next_path = str(next_config.aun_path)
+        if current_path == next_path and self._auth._aid == aid.aid:
+            return
+
+        debug_enabled = bool(getattr(self._log, "_debug", False))
+        try:
+            self._keystore.close()
+        except Exception:
+            pass
+        try:
+            self._net.close()
+        except Exception:
+            pass
+
+        self._config_model = next_config
+        self._device_id = get_device_id(self._config_model.aun_path)
+        self._log = AUNLogger(debug=debug_enabled, aun_path=str(self._config_model.aun_path))
+        self._log.bind_device_id(self._device_id)
+        self.config = {
+            "aun_path": str(self._config_model.aun_path),
+            "root_ca_path": self._config_model.root_ca_path,
+            "seed_password": self._config_model.seed_password,
+        }
+        self._dispatcher._log = self._log
+
+        from .net import DnsResilientNet
+
+        self._net = DnsResilientNet(
+            aun_path=self._config_model.aun_path,
+            verify_ssl=self._config_model.verify_ssl,
+            logger=self._log,
+        )
+        self._discovery = GatewayDiscovery(
+            verify_ssl=self._config_model.verify_ssl,
+            logger=self._log,
+            net=self._net,
+        )
+        connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
+        self._keystore = FileKeyStore(
+            self._config_model.aun_path,
+            encryption_seed=self._config_model.seed_password,
+            logger=self._log,
+        )
+        self._auth = AuthFlow(
+            keystore=self._keystore,
+            crypto=CryptoProvider(),
+            aid=aid.aid,
+            device_id=self._device_id,
+            slot_id=self._slot_id,
+            connection_factory=connection_factory,
+            root_ca_path=self._config_model.root_ca_path,
+            verify_ssl=self._config_model.verify_ssl,
+            logger=self._log,
+            net=self._net,
+        )
+        self._transport = RPCTransport(
+            event_dispatcher=self._dispatcher,
+            connection_factory=connection_factory,
+            timeout=self._session_options.get("timeouts", {}).get("call", _DEFAULT_SESSION_OPTIONS["timeouts"]["call"]),
+            on_disconnect=self._handle_transport_disconnect,
+            logger=self._log,
+        )
+        self._transport.set_meta_observer(self._observe_rpc_meta)
+        self._agent_md_path = str(Path(self._config_model.aun_path) / "AIDs")
+        self._agent_md_cache.clear()
+        self._peer_gateway_cache.clear()
+
+    def set_protected_headers(self, headers: dict[str, Any] | None) -> None:
+        self._instance_protected_headers = dict(headers) if headers else None
+
+    def get_protected_headers(self) -> dict[str, Any] | None:
+        return dict(self._instance_protected_headers) if self._instance_protected_headers else None
 
     @staticmethod
     def _agent_md_content_etag(content: str) -> str:
@@ -559,22 +867,83 @@ class AUNClient:
     def _agent_md_owner_aid(self) -> str:
         return str(self._aid or "").strip()
 
-    def set_agent_md_path(self, path: str | None = None) -> str:
-        """设置 agent.md 本地存储根目录；为空时恢复默认 {aun_path}/AgentMDs。"""
-        raw = str(path or "").strip()
-        root = Path(raw) if raw else Path(self._config_model.aun_path) / "AgentMDs"
-        root.mkdir(parents=True, exist_ok=True)
-        self._agent_md_path = str(root)
-        self._agent_md_cache.clear()
-        return self._agent_md_path
-
-    def SetAgentMDPath(self, path: str | None = None) -> str:
-        return self.set_agent_md_path(path)
-
     def _agent_md_root(self) -> Path:
-        root = Path(getattr(self, "_agent_md_path", "") or (Path(self._config_model.aun_path) / "AgentMDs"))
+        root = Path(getattr(self, "_agent_md_path", "") or (Path(self._config_model.aun_path) / "AIDs"))
         root.mkdir(parents=True, exist_ok=True)
         return root
+
+    def _make_aid_store(self) -> AIDStore:
+        return AIDStore(
+            aun_path=self._config_model.aun_path,
+            encryption_seed=str(self._config_model.seed_password or ""),
+            device_id=self._device_id,
+            slot_id=self._slot_id or "default",
+            verify_ssl=self._config_model.verify_ssl,
+            discovery_port=self._config_model.discovery_port,
+            root_ca_path=self._config_model.root_ca_path,
+            logger=self._log,
+        )
+
+    async def _discover_gateway_for_aid(self, aid: str) -> str:
+        target = str(aid or "").strip()
+        if not target:
+            raise StateError("gateway discovery requires aid")
+        if self._gateway_url:
+            return self._gateway_url
+        store = self._make_aid_store()
+        try:
+            gateway_url = await store._resolved_gateway(target)
+            self._gateway_url = gateway_url
+            return gateway_url
+        finally:
+            store.close()
+
+    @staticmethod
+    def _issuer_domain_for_aid(aid: str) -> str:
+        target = str(aid or "").strip().lower()
+        if not target:
+            return ""
+        if "." not in target:
+            return target
+        return target.split(".", 1)[1].strip(".")
+
+    async def _discover_gateway_for_peer_aid(self, peer_aid: str) -> str:
+        target = str(peer_aid or "").strip()
+        if not target:
+            raise ValidationError("peer aid is required for gateway discovery")
+
+        peer_issuer = self._issuer_domain_for_aid(target)
+        local_issuer = self._local_issuer_domain()
+        current_gateway = self.gateway_url
+        cache_key = peer_issuer or target.lower()
+
+        if peer_issuer and local_issuer and peer_issuer == local_issuer and current_gateway:
+            return current_gateway
+
+        cached_gateway = self._peer_gateway_cache.get(cache_key)
+        if cached_gateway:
+            return cached_gateway
+
+        discovery_aid = target
+        if peer_issuer and local_issuer and peer_issuer == local_issuer and self._aid:
+            discovery_aid = self._aid
+
+        store = self._make_aid_store()
+        try:
+            gateway_url = await store._resolved_gateway(discovery_aid)
+        finally:
+            store.close()
+        if gateway_url:
+            self._peer_gateway_cache[cache_key] = gateway_url
+        return gateway_url
+
+    def _agent_md_url(self, aid: str, gateway_url: str = "") -> str:
+        raw_gateway = str(gateway_url or "").strip().lower()
+        scheme = "http" if raw_gateway.startswith("ws://") else "https"
+        host = self._agent_md_safe_aid(aid)
+        if self._config_model.discovery_port and ":" not in host:
+            host = f"{host}:{int(self._config_model.discovery_port)}"
+        return f"{scheme}://{host}/agent.md"
 
     @staticmethod
     def _agent_md_safe_aid(aid: str) -> str:
@@ -703,6 +1072,13 @@ class AUNClient:
                     self._log.warn("client", "agent.md content read failed: aid=%s err=%s", target, exc)
             if len(loaded) <= 1:
                 return None
+            if record == {} and "content" in loaded:
+                with self._agent_md_record_lock(target):
+                    self._write_agent_md_record_unlocked(target, {
+                        "aid": target,
+                        "local_etag": loaded.get("local_etag"),
+                        "updated_at": int(time.time() * 1000),
+                    })
             self._agent_md_cache[target] = dict(loaded)
             return dict(loaded)
         except Exception as exc:
@@ -786,7 +1162,7 @@ class AUNClient:
 
         async def _fetch_missing() -> None:
             try:
-                await self.fetch_agent_md(target)
+                await self._fetch_agent_md(target)
             except Exception as exc:
                 self._save_agent_md_record(target, last_error=str(exc), remote_status="found")
                 self._log.debug("client", "agent.md auto fetch failed: aid=%s source=%s err=%s", target, source or "-", exc)
@@ -859,7 +1235,7 @@ class AUNClient:
             source="envelope",
         )
 
-    async def check_agent_md(self, aid: str | None = None, max_unsynced_days: float = 0) -> dict[str, Any]:
+    async def _check_agent_md(self, aid: str | None = None, max_unsynced_days: float = 0) -> dict[str, Any]:
         target = str(aid or self._aid or "").strip()
         if not target:
             raise ValidationError("check_agent_md requires aid (or local AID)")
@@ -906,11 +1282,18 @@ class AUNClient:
             }
 
         now_ms = int(time.time() * 1000)
+        store = self._make_aid_store()
         try:
-            remote = await self.auth.head_agent_md(target)
+            remote_result = await store.head_agent_md(target)
+            if not remote_result.ok or remote_result.data is None:
+                message = remote_result.error.message if remote_result.error else "head agent.md failed"
+                raise AUNError(message)
+            remote = remote_result.data
         except Exception as exc:
             self._save_agent_md_record(target, checked_at=now_ms, remote_status="error", last_error=str(exc))
             raise
+        finally:
+            store.close()
 
         remote_found = bool(remote.get("found"))
         remote_etag = str(remote.get("etag") or "").strip()
@@ -944,14 +1327,20 @@ class AUNClient:
             "verify_error": str(saved.get("verify_error") or before.get("verify_error") or ""),
         }
 
-    async def publish_agent_md(self) -> dict[str, Any]:
-        """读取 {agent_md_path}/{self_aid}/agent.md，签名后上传，并把签名结果原子写回本地。"""
+    async def publish_agent_md(self, content: str | None = None) -> dict[str, Any]:
+        """签名并上传 agent.md；content 未传时读取 {agent_md_path}/{self_aid}/agent.md。"""
         target = self._agent_md_owner_aid()
         if not target:
             raise ValidationError("publish_agent_md requires local AID")
-        content = self._read_agent_md_content(target)
-        signed = await self.auth.sign_agent_md(content)
-        result = await self.auth.upload_agent_md(signed)
+        if self._current_aid is None or not self._current_aid.is_private_key_valid():
+            raise StateError("publish_agent_md requires loaded AID with a valid private key")
+        raw_content = self._read_agent_md_content(target) if content is None else str(content)
+        signed_result = self._current_aid.sign_agent_md(raw_content)
+        if not signed_result.ok or signed_result.data is None:
+            message = signed_result.error.message if signed_result.error else "agent.md signing failed"
+            raise ClientSignatureError(message)
+        signed = signed_result.data["signed"]
+        result = await self.upload_agent_md(signed)
         local_etag = self._agent_md_content_etag(signed)
         self._local_agent_md_etag = local_etag
         remote_etag = str(result.get("etag") or "").strip() if isinstance(result, dict) else ""
@@ -969,24 +1358,121 @@ class AUNClient:
         )
         return result
 
-    async def fetch_agent_md(self, aid: str | None = None) -> dict[str, Any]:
+    async def upload_agent_md(self, content: str) -> dict[str, Any]:
+        """上传已签名 agent.md。"""
+        if not str(content or "").strip():
+            raise ValidationError("upload_agent_md requires non-empty content")
+        target = self._agent_md_owner_aid()
+        if not target:
+            raise ValidationError("upload_agent_md requires local AID")
+        _t_start = time.time()
+        self._log.debug("client", "upload_agent_md enter: aid=%s content_len=%d", target, len(content or ""))
+        gateway_url = await self._discover_gateway_for_aid(target)
+        token = ""
+        identity = self._identity if isinstance(self._identity, dict) else {}
+        token = str(identity.get("access_token") or "").strip()
+        if not token and isinstance(self._session_params, dict):
+            token = str(self._session_params.get("access_token") or "").strip()
+        if not token:
+            auth_result = await self.authenticate()
+            token = str(auth_result.get("access_token") or "").strip()
+        if not token:
+            raise StateError("authenticate did not return access_token")
+
+        agent_md_url = self._agent_md_url(target, gateway_url)
+        trace_mode = getattr(self._transport, "_trace_mode", "off")
+        trace_id = secrets.token_hex(16) if trace_mode != "off" else ""
+        if trace_id:
+            self._log.info("client", "[trace=%s] http_out PUT agent.md aid=%s", trace_id, target)
+        timeout = aiohttp.ClientTimeout(total=30)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "text/markdown; charset=utf-8",
+        }
+        if trace_id:
+            headers["X-AUN-Trace"] = trace_id
+        ssl_param = None if self._config_model.verify_ssl else False
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.put(
+                    agent_md_url,
+                    data=str(content or "").encode("utf-8"),
+                    headers=headers,
+                    ssl=ssl_param,
+                ) as response:
+                    duration_ms = int((time.time() - _t_start) * 1000)
+                    if trace_id:
+                        self._log.info(
+                            "client",
+                            "[trace=%s] http_in status=%d duration_ms=%d",
+                            trace_id,
+                            response.status,
+                            duration_ms,
+                        )
+                        observer = getattr(self._transport, "_trace_observer", None)
+                        if observer:
+                            try:
+                                observer({
+                                    "type": "http",
+                                    "trace_id": trace_id,
+                                    "method": "PUT",
+                                    "url": agent_md_url,
+                                    "status": response.status,
+                                    "duration_ms": duration_ms,
+                                })
+                            except Exception:
+                                pass
+                    if response.status == 404:
+                        raise NotFoundError(f"agent.md endpoint not found for aid: {target}")
+                    if response.status < 200 or response.status >= 300:
+                        message = (await response.text()).strip()
+                        raise AUNError(
+                            f"upload agent.md failed: HTTP {response.status}"
+                            + (f" - {message}" if message else "")
+                        )
+                    result = await response.json()
+                    self._log.debug(
+                        "client",
+                        "upload_agent_md exit: elapsed=%.3fs aid=%s status=%d",
+                        time.time() - _t_start,
+                        target,
+                        response.status,
+                    )
+                    return result
+        except Exception as exc:
+            self._log.debug(
+                "client",
+                "upload_agent_md exit (error): elapsed=%.3fs aid=%s err=%s",
+                time.time() - _t_start,
+                target,
+                exc,
+            )
+            raise
+
+    async def _fetch_agent_md(self, aid: str | None = None) -> dict[str, Any]:
         """下载 agent.md 并自动验签；内容固定保存到 {agent_md_path}/{aid}/agent.md。"""
         target = (aid or self._aid or "").strip()
         if not target:
             raise ValidationError("fetch_agent_md requires aid (or local AID)")
+        store = self._make_aid_store()
+        try:
+            fetched = await store.fetch_agent_md(target)
+            if not fetched.ok or fetched.data is None:
+                message = fetched.error.message if fetched.error else "fetch agent.md failed"
+                if fetched.error and fetched.error.code == "AGENTMD_NOT_FOUND":
+                    raise NotFoundError(message)
+                raise AUNError(message)
+            data = fetched.data
+        finally:
+            store.close()
 
-        content = await self.auth.download_agent_md(target)
-        signature = await self.auth.verify_agent_md(content, aid=target)
+        content = str(data.get("content") or "")
+        signature = dict(data.get("signature") or {})
 
         is_self = target == (self._aid or "")
         local_etag = self._agent_md_content_etag(content)
-        cache_meta = {}
-        try:
-            cache_meta = dict(self.auth._agent_md_cache_store().get(target) or {})
-        except Exception:
-            cache_meta = {}
-        remote_etag = str(cache_meta.get("etag") or "").strip()
-        last_modified = str(cache_meta.get("last_modified") or "").strip()
+        remote_etag = str(data.get("etag") or "").strip()
+        last_modified = str(data.get("last_modified") or data.get("lastModified") or "").strip()
         if is_self:
             self._local_agent_md_etag = local_etag
             if remote_etag:
@@ -1055,7 +1541,7 @@ class AUNClient:
 
     @property
     def state(self) -> ConnectionState:
-        return ConnectionState(self._state)
+        return self._public_state
 
     # ── 生命周期 ──────────────────────────────────────────
 
@@ -1064,19 +1550,91 @@ class AUNClient:
         """最近一次 health check 结果，None 表示尚未检查。"""
         return self._discovery.last_healthy
 
-    async def check_gateway_health(self, gateway_url: str, *, timeout: float = 5.0) -> bool:
-        """向 gateway_url 的 /health 端点发送 GET 请求，检查网关可用性。"""
-        return await self._discovery.check_health(gateway_url, timeout=timeout)
-
-    async def connect(self, auth: dict[str, Any], options: dict[str, Any] | None = None) -> None:
+    async def authenticate(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        """获取访问 token，但不建立长连接。"""
         _t_start = time.time()
-        if self._state not in {"idle", "closed", "disconnected"}:
-            raise StateError(f"connect not allowed in state {self._state}")
-        self._state = "connecting"
-        params = dict(auth)
-        if options:
-            params.update(options)
+        if self._public_state != ConnectionState.STANDBY:
+            raise StateError(f"authenticate not allowed in state {self._public_state.value}")
+        if not self._aid:
+            raise StateError("authenticate requires loaded identity")
+        request = dict(options or {})
+        if "gateway" in request or "gateways" in request:
+            raise ValidationError("gateway must be resolved by discovery and cannot be supplied externally")
+        gateway_url = str(self._gateway_url or "").strip()
+        try:
+            if not gateway_url:
+                gateway_url = await self._discover_gateway_for_aid(self._aid)
+            self._gateway_url = gateway_url
+            self._log.debug("client", "authenticate enter: aid=%s gateway=%s", self._aid, gateway_url)
+            result = await self._auth.authenticate(gateway_url, aid=self._aid)
+            self._aid = str(result.get("aid") or self._aid)
+            self._auth._aid = self._aid
+            identity = self._auth.load_identity_or_none(self._aid) or {"aid": self._aid}
+            access_token = result.get("access_token")
+            if access_token:
+                identity["access_token"] = access_token
+            self._identity = identity
+            self._state = ConnectionState.AUTHENTICATED.value
+            self._last_error = None
+            self._last_error_code = None
+            self._log.debug("client", "authenticate exit: elapsed=%.3fs aid=%s", time.time() - _t_start, self._aid)
+            return result
+        except Exception as exc:
+            self._last_error = exc
+            self._last_error_code = "authenticate_failed"
+            self._log.debug("client", "authenticate exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, self._aid, exc)
+            raise
+
+    async def connect(self, options: dict[str, Any] | None = None) -> None:
+        _t_start = time.time()
+        if self._public_state not in {
+            ConnectionState.NO_IDENTITY,
+            ConnectionState.STANDBY,
+            ConnectionState.AUTHENTICATED,
+            ConnectionState.RETRY_BACKOFF,
+            ConnectionState.CONNECTION_FAILED,
+        }:
+            raise StateError(f"connect not allowed in state {self._public_state.value}")
+        params = dict(options or {})
+        if "gateway" in params or "gateways" in params:
+            raise ValidationError("gateway must be resolved by discovery and cannot be supplied externally")
+        if self._public_state == ConnectionState.NO_IDENTITY and not params.get("access_token"):
+            raise StateError("connect requires a loaded identity or an explicit access_token")
+
+        if self._public_state == ConnectionState.STANDBY and not params.get("access_token"):
+            auth_result = await self.authenticate(params)
+            params["access_token"] = auth_result.get("access_token")
+            params["gateway"] = auth_result.get("gateway") or self._gateway_url or params.get("gateway")
+        elif self._public_state in {
+            ConnectionState.AUTHENTICATED,
+            ConnectionState.RETRY_BACKOFF,
+            ConnectionState.CONNECTION_FAILED,
+        } and not params.get("access_token"):
+            identity = self._identity if isinstance(self._identity, dict) else {}
+            token = identity.get("access_token")
+            if not token and self._session_params:
+                token = self._session_params.get("access_token")
+            if token:
+                params["access_token"] = token
+            if not params.get("gateway") and self._gateway_url:
+                params["gateway"] = self._gateway_url
+
+        if self._public_state == ConnectionState.RETRY_BACKOFF and self._reconnect_task is not None:
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._reconnect_task = None
+
+        if self._public_state == ConnectionState.CONNECTION_FAILED:
+            self._retry_attempt = 0
+            self._last_error = None
+            self._last_error_code = None
+        self._next_retry_at = None
+
         normalized = self._normalize_connect_params(params)
+        self._state = ConnectionState.CONNECTING.value
         self._session_params = normalized
         self._session_options = self._build_session_options(normalized)
         self._transport.set_timeout(self._session_options["timeouts"]["call"])
@@ -1090,17 +1648,25 @@ class AUNClient:
                 gw_params = dict(normalized)
                 gw_params["gateway"] = gw
                 await self._connect_once(gw_params, allow_reauth=False)
+                if self._public_state != ConnectionState.READY:
+                    self._state = ConnectionState.READY.value
+                self._last_error = None
+                self._last_error_code = None
+                self._next_retry_at = None
                 self._log.debug("client", "connect exit: elapsed=%.3fs gateway=%s aid=%s", time.time() - _t_start, self._gateway_url, self._aid or "-")
                 return
             except BaseException as exc:
                 last_error = exc
                 if len(gateways) > 1:
                     self._log.warn("client", "connect: gateway %s failed, trying next: %s", gw, exc)
-                if self._state in ("connecting", "authenticating"):
-                    self._state = "connecting"
+                if self._public_state == ConnectionState.CONNECTING:
+                    self._state = ConnectionState.CONNECTING.value
 
-        if self._state in ("connecting", "authenticating"):
-            self._state = "disconnected"
+        if self._public_state == ConnectionState.CONNECTING:
+            self._state = ConnectionState.STANDBY.value if self.has_identity else ConnectionState.NO_IDENTITY.value
+        if last_error is not None:
+            self._last_error = last_error
+            self._last_error_code = "connect_failed"
         self._log.warn("client", "connect exit (error): elapsed=%.3fs gateways=%s err=%s", time.time() - _t_start, gateways, last_error)
         raise last_error  # type: ignore[misc]
 
@@ -1112,7 +1678,14 @@ class AUNClient:
         if self._closing:
             self._log.debug("client", "disconnect exit (close-in-progress): elapsed=%.3fs", time.time() - _t_start)
             return
-        if self._state not in {"connected", "reconnecting"}:
+        if self._public_state not in {
+            ConnectionState.AUTHENTICATED,
+            ConnectionState.CONNECTING,
+            ConnectionState.READY,
+            ConnectionState.RETRY_BACKOFF,
+            ConnectionState.RECONNECTING,
+            ConnectionState.CONNECTION_FAILED,
+        }:
             self._log.debug("client", "disconnect exit (not-connected): elapsed=%.3fs state=%s", time.time() - _t_start, self._state)
             return
         self._save_seq_tracker_state()
@@ -1126,24 +1699,14 @@ class AUNClient:
                 pass
             self._reconnect_task = None
         await self._transport.close()
-        self._state = "disconnected"
+        self._identity = None
+        self._next_retry_at = None
+        self._retry_attempt = 0
+        self._last_error = None
+        self._last_error_code = None
+        self._state = ConnectionState.STANDBY.value if self._current_aid is not None or self._aid else ConnectionState.NO_IDENTITY.value
         await self._dispatcher.publish("connection.state", {"state": self._state})
         self._log.debug("client", "disconnect exit: elapsed=%.3fs state=%s", time.time() - _t_start, self._state)
-
-    def list_identities(self) -> list[dict[str, Any]]:
-        """列出本地所有已存储的身份摘要（仅返回有有效私钥的 AID）"""
-        aids = self._keystore.list_identities()
-        summaries: list[dict[str, Any]] = []
-        for aid in sorted(aids):
-            identity = self._keystore.load_identity(aid)
-            if not identity or not identity.get("private_key_pem"):
-                continue
-            summary: dict[str, Any] = {"aid": aid}
-            md = self._keystore.load_metadata(aid)
-            if md:
-                summary["metadata"] = md
-            summaries.append(summary)
-        return summaries
 
     async def close(self) -> None:
         _t_start = time.time()
@@ -1162,11 +1725,31 @@ class AUNClient:
                 self._reconnect_task = None
             if self._state in {"idle", "closed"}:
                 self._state = "closed"
+                self._current_aid = None
+                self._aid = None
+                self._identity = None
+                self._gateway_url = None
+                self._peer_gateway_cache.clear()
+                self._session_params = None
+                self._next_retry_at = None
+                self._retry_attempt = 0
+                self._last_error = None
+                self._last_error_code = None
                 self._reset_seq_tracking_state()
                 self._log.debug("client", "close exit (was idle/closed): elapsed=%.3fs state=%s", time.time() - _t_start, self._state)
                 return
             await self._transport.close()
             self._state = "closed"
+            self._current_aid = None
+            self._aid = None
+            self._identity = None
+            self._gateway_url = None
+            self._peer_gateway_cache.clear()
+            self._session_params = None
+            self._next_retry_at = None
+            self._retry_attempt = 0
+            self._last_error = None
+            self._last_error_code = None
             await self._dispatcher.publish("connection.state", {"state": self._state})
             self._reset_seq_tracking_state()
             self._log.debug("client", "close exit: elapsed=%.3fs state=%s", time.time() - _t_start, self._state)
@@ -1303,12 +1886,15 @@ class AUNClient:
 
     async def call(self, method: str, params: dict | None = None, *, trace: str | None = None) -> Any:
         _t_call_start = time.time()
-        if self._state != "connected":
+        if not isinstance(method, str) or not method.strip():
+            raise ValidationError("call() requires a non-empty method string")
+        if self._public_state != ConnectionState.READY:
             raise ConnectionError("client is not connected")
         if self._is_internal_only_method(method):
             raise AUNPermissionError(f"method is internal_only: {method}")
 
         params = dict(params) if params else {}
+        params = self._merge_instance_protected_headers(method, params)
         self._log.debug("client", "call enter: method=%s", method)
         if method in {"message.send", "group.send"}:
             self._normalize_outbound_message_payload(params, method=method)
@@ -1384,7 +1970,7 @@ class AUNClient:
             # encrypt=false：明文走通用 RPC 路径，不受 group epoch 轮换/恢复约束
             self._maybe_append_echo_trace_send(params)
 
-        # message.pull：V2 就绪时走 V2 pull（V2-only：跳过 V1 envelope）
+        # message.pull：V2 就绪时走 V2 pull（V2-only：跳过旧加密 envelope）
         if method == "message.pull" and getattr(self, "_v2_session", None):
             self._log.debug("client", "call route: message.pull → V2 pull")
             return await self._pull_v2_internal(params)
@@ -1498,6 +2084,11 @@ class AUNClient:
                 len(result.get("thoughts", [])) if isinstance(result.get("thoughts"), list) else 0,
             )
             result = await self._decrypt_message_thoughts(result)
+        if method in {"message.v2.bootstrap", "group.v2.bootstrap"} and isinstance(result, dict):
+            try:
+                await self._v2_observe_bootstrap_material(method, params, result)
+            except Exception as exc:
+                self._log.debug("client", "V2 bootstrap material observe skipped: method=%s err=%s", method, exc)
         # 自动解密：message.pull 返回的消息（V2 路径已在 call() 开头路由，此处为 plaintext pull 的 seq 跟踪）
         if method == "message.pull" and isinstance(result, dict):
             ns = f"p2p:{self._aid}" if self._aid else ""
@@ -1580,8 +2171,6 @@ class AUNClient:
         self._log.debug("client", "call exit: elapsed=%.3fs method=%s", time.time() - _t_call_start, method)
         return result
 
-
-
     @staticmethod
     def _protected_headers_from_params(params: dict[str, Any]) -> dict[str, Any] | ProtectedHeaders | None:
         headers = params.get("protected_headers")
@@ -1594,6 +2183,20 @@ class AUNClient:
             value = to_dict()
             return value if isinstance(value, dict) else None
         return None
+
+    def _merge_instance_protected_headers(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        instance_headers = getattr(self, "_instance_protected_headers", None)
+        if method not in _PROTECTED_HEADERS_METHODS or not instance_headers:
+            return params
+        existing = self._protected_headers_from_params(params)
+        merged = dict(instance_headers)
+        if existing:
+            to_dict = getattr(existing, "to_dict", None)
+            existing_dict = to_dict() if callable(to_dict) else dict(existing)
+            if isinstance(existing_dict, dict):
+                merged.update(existing_dict)
+        params["protected_headers"] = merged
+        return params
 
     def _cert_sha256_fingerprint(cert_pem: bytes | str | None) -> str:
         if not cert_pem:
@@ -1658,23 +2261,39 @@ class AUNClient:
             return False
         return True
 
-    async def ping(self, params: dict | None = None) -> Any:
-        return await self.meta.ping(params or {})
-
-    async def status(self, params: dict | None = None) -> Any:
-        return await self.meta.status(params or {})
-
-    async def trust_roots(self, params: dict | None = None) -> Any:
-        return await self.meta.trust_roots(params or {})
-
     # ── 事件 ──────────────────────────────────────────────
 
     def on(self, event: str, handler: Callable[[Any], Any]) -> Subscription:
+        if not isinstance(event, str) or not event.strip():
+            raise ValidationError("on() requires a non-empty event name")
+        if not callable(handler):
+            raise ValidationError("on() requires a callable handler")
         return self._dispatcher.subscribe(event, handler)
 
     def off(self, event: str, handler: Callable[[Any], Any]) -> None:
         """注销事件处理器（对齐 C++ RemoveEventHandler / JS off）。"""
+        if not isinstance(event, str) or not event.strip():
+            raise ValidationError("off() requires a non-empty event name")
+        if not callable(handler):
+            raise ValidationError("off() requires a callable handler")
         self._dispatcher.unsubscribe(event, handler)
+
+    # ── per-namespace 消息处理锁 ──────────────────────────────
+    def _get_ns_lock(self, ns: str) -> asyncio.Lock:
+        """获取指定 namespace 的消息处理锁（懒创建）。
+
+        同一 namespace 的 push/pull 必须串行，防止乱序投递。
+        不同 namespace 之间互不阻塞。asyncio 单线程中 dict 操作是原子的，无需额外 guard。
+        """
+        locks = getattr(self, "_ns_locks", None)
+        if locks is None:
+            locks = {}
+            self._ns_locks = locks
+        lock = locks.get(ns)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[ns] = lock
+        return lock
 
     # ── P1-17: auto-ack fire-and-forget 辅助 ──────────────────
     def _fire_ack(self, method: str, params: dict[str, Any], label: str = "") -> None:
@@ -1766,6 +2385,18 @@ class AUNClient:
 
     async def _process_and_publish_message(self, data: Any) -> None:
         """实际处理推送消息的异步任务。"""
+        # P2P namespace 锁：同一 namespace 的 push/pull 串行执行
+        ns_key = ""
+        if isinstance(data, dict) and data.get("seq") is not None and self._aid:
+            ns_key = f"p2p:{self._aid}"
+        if ns_key:
+            async with self._get_ns_lock(ns_key):
+                await self._process_and_publish_message_inner(data)
+        else:
+            await self._process_and_publish_message_inner(data)
+
+    async def _process_and_publish_message_inner(self, data: Any) -> None:
+        """P2P push 处理内部实现（在 ns lock 保护下调用）。"""
         _t_start = time.time()
         try:
             if not isinstance(data, dict):
@@ -1866,11 +2497,22 @@ class AUNClient:
     async def _on_raw_group_message_created(self, data: Any) -> None:
         """处理 group.message_created 推送。
         V2-only 模式：推送不带 payload，触发 group.v2.pull 获取完整消息。
-        V1 兼容模式：直接透传（payload 已在推送中）。
+        明文推送：payload 已在推送中时直接透传。
         """
         if not isinstance(data, dict):
             await self._publish_app_event("group.message_created", data, source="group-push")
             return
+        group_id = str(data.get("group_id") or "").strip()
+        # 群消息 namespace 锁：同一 group 的 push/pull 串行
+        if group_id:
+            ns_key = f"group:{group_id}"
+            async with self._get_ns_lock(ns_key):
+                await self._on_raw_group_message_created_inner(data)
+        else:
+            await self._on_raw_group_message_created_inner(data)
+
+    async def _on_raw_group_message_created_inner(self, data: Any) -> None:
+        """群消息 push 内部实现（在 ns lock 保护下调用）。"""
         self._log_message_debug("server-push", "_raw.group.message_created", "group.message_created", data)
         group_id = data.get("group_id", "")
         seq = data.get("seq")
@@ -1916,7 +2558,7 @@ class AUNClient:
                 )
             return
 
-        # V2-only 模式：V1 明文推送不带 payload，需要通过 group.v2.pull 获取完整消息
+        # V2-only 模式：明文历史推送不带 payload 时，也通过 group.v2.pull 获取完整消息
         if getattr(self, "_v2_session", None) and group_id and seq is not None:
             ns = f"group:{group_id}"
             seq_i = int(seq)
@@ -1936,25 +2578,27 @@ class AUNClient:
             if self._is_published_seq(ns, seq_i) or self._is_pending_ordered_seq(ns, seq_i):
                 return
             # 复用 V2 push 的 pull 逻辑
-            async def _v1_pull_and_publish() -> None:
-                try:
-                    dedup_key = f"group_pull:{ns}"
-                    if dedup_key in self._gap_fill_done:
-                        return
-                    self._gap_fill_done[dedup_key] = time.time()
+            async def _pull_and_publish() -> None:
+                # 群消息 namespace 锁：create_task 出去的独立 task 需自行持锁
+                async with self._get_ns_lock(ns):
                     try:
-                        contig = self._seq_tracker.get_contiguous_seq(ns)
-                        after_seq = max(0, contig)
-                        await self._pull_group_v2_internal({"group_id": group_id, "after_seq": after_seq, "limit": 50})
-                    finally:
-                        self._gap_fill_done.pop(dedup_key, None)
-                except Exception as exc:
-                    self._log.warn("client", "_on_raw_group_message_created v2 pull failed group=%s: %s", group_id, exc)
+                        dedup_key = f"group_pull:{ns}"
+                        if dedup_key in self._gap_fill_done:
+                            return
+                        self._gap_fill_done[dedup_key] = time.time()
+                        try:
+                            contig = self._seq_tracker.get_contiguous_seq(ns)
+                            after_seq = max(0, contig)
+                            await self._pull_group_v2_internal({"group_id": group_id, "after_seq": after_seq, "limit": 50})
+                        finally:
+                            self._gap_fill_done.pop(dedup_key, None)
+                    except Exception as exc:
+                        self._log.warn("client", "_on_raw_group_message_created v2 pull failed group=%s: %s", group_id, exc)
             loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-            loop.create_task(_v1_pull_and_publish())
+            loop.create_task(_pull_and_publish())
             return
 
-        # V1 兼容路径（非 V2-only 模式）
+        # 明文 payload 推送路径
         if group_id and seq is not None:
             ns = f"group:{group_id}"
             seq_i = int(seq)
@@ -1989,7 +2633,7 @@ class AUNClient:
     async def _on_raw_group_v2_message_created(self, data: Any) -> None:
         """处理 V2 群消息推送：服务端 push 仅携带 seq + message_id + sender_aid + group_id，
         SDK 收到后主动 group.v2.pull 拉取 envelope 并自动解密，转发为 group.message_created
-        事件给应用层（与 V1 群路径对齐）。
+        事件给应用层。
         """
         _t_start = time.time()
         if not isinstance(data, dict):
@@ -2000,6 +2644,7 @@ class AUNClient:
         seq = int(data.get("seq", 0) or 0)
         message_id = str(data.get("message_id") or "").strip()
         sender_aid = str(data.get("sender_aid") or "").strip()
+        event_kind = str(data.get("kind") or "").strip()
         self._log.debug("client",
             "_on_raw_group_v2_message_created group=%s seq=%d message_id=%s sender=%s",
             group_id, seq, message_id, sender_aid,
@@ -2009,6 +2654,16 @@ class AUNClient:
             return
         if not getattr(self, "_v2_session", None):
             self._log.debug("client", "_on_raw_group_v2_message_created skipped: V2 session not initialized")
+            return
+        if event_kind == "group.online_unread_hint" and not data.get("_online_hint_drained"):
+            if not self._session_options.get("background_sync", True):
+                self._log.debug(
+                    "client",
+                    "_on_raw_group_v2_message_created skipped online unread hint: group=%s background_sync=false",
+                    group_id,
+                )
+                return
+            self._enqueue_online_unread_hint(data)
             return
 
         # Push 修上界：先更新 max_seen_seq
@@ -2026,37 +2681,77 @@ class AUNClient:
         )
 
         async def _pull_and_publish() -> None:
-            try:
-                ns = f"group:{group_id}"
-                # per-namespace 去重：同一 group namespace 只允许 1 个 in-flight pull
-                dedup_key = f"group_pull:{ns}"
-                if dedup_key in self._gap_fill_done:
-                    return
-                self._gap_fill_done[dedup_key] = time.time()
+            # 群消息 namespace 锁：与群 push 串行
+            ns = f"group:{group_id}"
+            async with self._get_ns_lock(ns):
                 try:
-                    contig = self._seq_tracker.get_contiguous_seq(ns)
-                    after_seq = max(0, contig)
-                    pull_params = {"group_id": group_id, "after_seq": after_seq, "limit": 50}
-                    self._log.debug("client",
-                        "_on_raw_group_v2_message_created -> group.v2.pull group=%s after_seq=%d",
-                        group_id, after_seq,
-                    )
-                    pulled = await self._pull_group_v2_internal(pull_params)
-                    msgs = pulled.get("messages", []) if isinstance(pulled, dict) else []
-                    self._log.debug("client",
-                        "_on_raw_group_v2_message_created pulled %d msgs for group=%s",
-                        len(msgs), group_id,
-                    )
-                finally:
-                    self._gap_fill_done.pop(dedup_key, None)
-            except Exception as exc:
-                self._log.warn("client",
+                    # per-namespace 去重：同一 group namespace 只允许 1 个 in-flight pull
+                    dedup_key = f"group_pull:{ns}"
+                    if dedup_key in self._gap_fill_done:
+                        return
+                    self._gap_fill_done[dedup_key] = time.time()
+                    try:
+                        contig = self._seq_tracker.get_contiguous_seq(ns)
+                        after_seq = max(0, contig)
+                        pull_params = {"group_id": group_id, "after_seq": after_seq, "limit": 50}
+                        self._log.debug("client",
+                            "_on_raw_group_v2_message_created -> group.v2.pull group=%s after_seq=%d",
+                            group_id, after_seq,
+                        )
+                        pulled = await self._pull_group_v2_internal(pull_params)
+                        msgs = pulled.get("messages", []) if isinstance(pulled, dict) else []
+                        self._log.debug("client",
+                            "_on_raw_group_v2_message_created pulled %d msgs for group=%s",
+                            len(msgs), group_id,
+                        )
+                    finally:
+                        self._gap_fill_done.pop(dedup_key, None)
+                except Exception as exc:
+                    self._log.warn("client",
                     "_on_raw_group_v2_message_created pull failed group=%s: %s", group_id, exc,
                 )
 
-        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
-        loop.create_task(_pull_and_publish())
+        if data.get("_online_hint_drained"):
+            await _pull_and_publish()
+        else:
+            loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+            loop.create_task(_pull_and_publish())
         self._log.debug("client", "_on_raw_group_v2_message_created exit: elapsed=%.3fs", time.time() - _t_start)
+
+    def _enqueue_online_unread_hint(self, data: dict[str, Any]) -> None:
+        group_id = str(data.get("group_id") or "").strip()
+        if not group_id:
+            return
+        self._online_unread_hint_queue[group_id] = dict(data)
+        task = self._online_unread_hint_task
+        if task is not None and not task.done():
+            return
+        loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
+        self._online_unread_hint_task = loop.create_task(self._drain_online_unread_hints())
+
+    async def _drain_online_unread_hints(self) -> None:
+        try:
+            delay = max(0.0, float(getattr(self, "_online_unread_hint_initial_delay", _ONLINE_UNREAD_HINT_INITIAL_DELAY) or 0.0))
+            if delay:
+                await asyncio.sleep(delay)
+            while self._online_unread_hint_queue:
+                if self._public_state != ConnectionState.READY:
+                    return
+                if not self._session_options.get("background_sync", True):
+                    return
+                group_id = next(iter(self._online_unread_hint_queue))
+                payload = self._online_unread_hint_queue.pop(group_id)
+                payload["_online_hint_drained"] = True
+                await self._on_raw_group_v2_message_created(payload)
+                interval = max(0.0, float(getattr(self, "_online_unread_hint_interval", _ONLINE_UNREAD_HINT_INTERVAL) or 0.0))
+                if interval:
+                    await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log.debug("client", "online unread hint drain failed: %s", exc)
+        finally:
+            self._online_unread_hint_task = None
 
     async def _on_raw_group_changed(self, data: Any) -> None:
         """处理群组变更事件：验签 → 透传给用户 → 基于 gap 检测补齐 → epoch 轮换。
@@ -2325,6 +3020,14 @@ class AUNClient:
         if self._state != "connected" or self._closing:
             return
         ns = f"group_event:{group_id}"
+        # 群事件 namespace 锁：与群事件 push 串行
+        async with self._get_ns_lock(ns):
+            await self._fill_group_event_gap_inner(group_id, ns)
+
+    async def _fill_group_event_gap_inner(self, group_id: str, ns: str) -> None:
+        """群事件 gap fill 内部实现（在 ns lock 保护下调用）。"""
+        if self._state != "connected" or self._closing:
+            return
         after_seq = self._seq_tracker.get_contiguous_seq(ns)
         dedup_key = f"group_event_pull:{ns}"
         if dedup_key in self._gap_fill_done:
@@ -2426,6 +3129,14 @@ class AUNClient:
         if not self._aid:
             return
         ns = f"p2p:{self._aid}"
+        # P2P namespace 锁：与 push 串行
+        async with self._get_ns_lock(ns):
+            await self._fill_p2p_gap_inner(ns)
+
+    async def _fill_p2p_gap_inner(self, ns: str) -> None:
+        """P2P gap fill 内部实现（在 ns lock 保护下调用）。"""
+        if self._state != "connected" or self._closing:
+            return
         after_seq = self._seq_tracker.get_contiguous_seq(ns)
         dedup_key = f"p2p_pull:{ns}"
         if dedup_key in self._gap_fill_done:
@@ -2894,6 +3605,45 @@ class AUNClient:
         except Exception as exc:
             self._log.debug("client", "V2 sender IK cache from bootstrap skipped aid=%s dev=%s: %s", aid, dev_id, exc)
 
+    async def _v2_cache_peer_ik_from_device_or_cert(self, dev: Any, fallback_aid: str = "") -> None:
+        if not self._v2_session or not isinstance(dev, dict):
+            return
+        has_dev_id, dev_id = _v2_device_id_from_device(dev)
+        aid = str(dev.get("aid") or fallback_aid or "").strip()
+        if not has_dev_id or not aid:
+            return
+        ik_b64 = str(dev.get("ik_pk") or "").strip()
+        try:
+            if ik_b64:
+                ik_der = base64.b64decode(ik_b64)
+                source = "bootstrap"
+            else:
+                ik_der = await self._v2_trusted_ik_pub_der(aid)
+                source = "cert"
+            self._v2_session.cache_peer_ik(aid, dev_id, ik_der)
+            self._log.debug("client", "V2 peer IK cached from %s: aid=%s device=%s", source, aid, dev_id or "<aid>")
+        except Exception as exc:
+            self._log.debug("client", "V2 peer IK cache skipped aid=%s dev=%s: %s", aid, dev_id, exc)
+
+    async def _v2_observe_bootstrap_material(self, method: str, params: dict[str, Any], result: dict[str, Any]) -> None:
+        if method == "message.v2.bootstrap":
+            peer_aid = str(params.get("peer_aid") or "").strip()
+            if peer_aid:
+                await self._prime_bootstrap_peer_certs(result, peer_aid)
+            for dev in result.get("peer_devices", []) or []:
+                await self._v2_cache_peer_ik_from_device_or_cert(dev, peer_aid)
+            for dev in result.get("self_devices", []) or []:
+                await self._v2_cache_peer_ik_from_device_or_cert(dev, self._aid or "")
+            for dev in result.get("audit_recipients", []) or []:
+                await self._v2_cache_peer_ik_from_device_or_cert(dev)
+            return
+
+        if method == "group.v2.bootstrap":
+            for dev in result.get("devices", []) or []:
+                await self._v2_cache_peer_ik_from_device_or_cert(dev)
+            for dev in result.get("audit_recipients", []) or []:
+                await self._v2_cache_peer_ik_from_device_or_cert(dev)
+
     def _schedule_v2_sender_ik_pending(
         self,
         *,
@@ -2951,7 +3701,7 @@ class AUNClient:
                     })
                     if isinstance(bs, dict):
                         for dev in bs.get("peer_devices", []) or []:
-                            self._v2_cache_peer_ik_from_device(dev, from_aid)
+                            await self._v2_cache_peer_ik_from_device_or_cert(dev, from_aid)
                 except Exception as exc:
                     self._log.warn("client", "V2 sender IK pending bootstrap failed peer=%s: %s", from_aid, exc)
                 if group_id:
@@ -2962,9 +3712,9 @@ class AUNClient:
                         })
                         if isinstance(gbs, dict):
                             for dev in gbs.get("devices", []) or []:
-                                self._v2_cache_peer_ik_from_device(dev)
+                                await self._v2_cache_peer_ik_from_device_or_cert(dev)
                             for dev in gbs.get("audit_recipients", []) or []:
-                                self._v2_cache_peer_ik_from_device(dev)
+                                await self._v2_cache_peer_ik_from_device_or_cert(dev)
                     except Exception as exc:
                         self._log.warn("client", "V2 sender IK pending group bootstrap failed group=%s: %s", group_id, exc)
                 if not self._v2_session.get_peer_ik(from_aid, sender_device_id):
@@ -3059,16 +3809,12 @@ class AUNClient:
         ca_chain_pems: list[str] | None = None,
         source: str = "fetch",
     ) -> bytes:
-        gateway_url = self._gateway_url
-        if not gateway_url:
-            raise ValidationError("gateway url unavailable for e2ee cert verification")
-
         cert_text = cert_pem.decode("utf-8") if isinstance(cert_pem, bytes) else str(cert_pem or "")
         if not cert_text.strip():
             raise ValidationError(f"empty peer cert material for {aid}")
         cert_bytes = cert_text.encode("utf-8")
 
-        peer_gateway_url = self._resolve_peer_gateway_url(gateway_url, aid)
+        peer_gateway_url = await self._discover_gateway_for_peer_aid(aid)
         from cryptography import x509 as _x509
         from cryptography.hazmat.primitives import hashes as _hashes
         cert_obj = _x509.load_pem_x509_certificate(cert_bytes)
@@ -3210,8 +3956,7 @@ class AUNClient:
     async def _fetch_peer_cert(self, aid: str, cert_fingerprint: str | None = None) -> bytes:
         """获取对方证书（带缓存 + 完整 PKI 验证：链 + CRL + OCSP + AID 绑定）
 
-        跨域时自动将请求路由到 peer 所在域的 Gateway（URL 替换），
-        同时 Gateway 侧也有代理 fallback。
+        跨域时按 peer AID 的 issuer 做 Gateway discovery；本域复用当前已发现 Gateway。
         """
         _t_start = time.time()
         cache_key = self._cert_cache_key(aid, cert_fingerprint)
@@ -3243,18 +3988,7 @@ class AUNClient:
                 fp=normalized_fp or "-",
                 cache_key=cache_key,
             )
-        gateway_url = self._gateway_url
-        if not gateway_url:
-            _debug_group_e2ee(
-                "peer_cert_fetch_no_gateway",
-                aid=self._aid or "-",
-                peer=aid,
-                fp=normalized_fp or "-",
-            )
-            raise ValidationError("gateway url unavailable for e2ee cert fetch")
-
-        # 跨域时用 peer 所在域的 Gateway URL
-        peer_gateway_url = self._resolve_peer_gateway_url(gateway_url, aid)
+        peer_gateway_url = await self._discover_gateway_for_peer_aid(aid)
         cert_url = self._build_cert_url(peer_gateway_url, aid, cert_fingerprint)
         _debug_group_e2ee(
             "peer_cert_fetch_http",
@@ -3263,7 +3997,6 @@ class AUNClient:
             fp=normalized_fp or "-",
             url=cert_url,
         )
-        ssl_param = None if self._config_model.verify_ssl else False
         # PY-017: 显式设置 HTTP 超时，避免 aiohttp 默认 300s 阻塞
         try:
             cert_pem = await self._net.http_get_text(cert_url, timeout=10.0)
@@ -3382,9 +4115,13 @@ class AUNClient:
         has_device_id, normalized_device_id = _v2_device_id_from_device(dev)
         device_id = normalized_device_id if has_device_id else str(device_id or "").strip()
         ik_b64 = str(dev.get("ik_pk") or "").strip()
-        if not aid or not has_device_id or not ik_b64:
+        if not aid or not has_device_id:
             return None
-        ik_pk_der = base64.b64decode(ik_b64)
+        if ik_b64:
+            ik_pk_der = base64.b64decode(ik_b64)
+        else:
+            ik_pk_der = await self._v2_trusted_ik_pub_der(aid)
+            self._log.debug("client", "V2 target IK loaded from cert: aid=%s device=%s role=%s", aid, device_id or "<aid>", role)
         spk_pk_der = base64.b64decode(dev["spk_pk"]) if dev.get("spk_pk") else None
         key_source = str(dev.get("key_source") or default_key_source).strip() or default_key_source
         await self._v2_verify_spk_device(
@@ -3414,22 +4151,12 @@ class AUNClient:
         return token in value
 
     def _client_uses_v2_p2p(self) -> bool:
-        """当前连接是否被服务端按 V2 P2P 客户端处理（与 gateway _client_p2p_version 对齐）。
-
-        gateway 口径：capabilities.supported_p2p_e2ee 含 'e2ee_v2' 即 V2，否则 V1。
-        capabilities 缺失时按 SDK 默认值（含 e2ee_v2）→ V2。
-        """
-        caps = getattr(self, "_connect_capabilities", None)
-        if not isinstance(caps, dict):
-            return True
-        return self._list_contains_token(caps.get("supported_p2p_e2ee"), "e2ee_v2")
+        """Python SDK 是 V2-only 客户端，P2P 不做 V1 降级。"""
+        return True
 
     def _client_uses_v2_group(self) -> bool:
-        """当前连接是否被服务端按 V2 Group 客户端处理（与 gateway _client_group_version 对齐）。"""
-        caps = getattr(self, "_connect_capabilities", None)
-        if not isinstance(caps, dict):
-            return True
-        return self._list_contains_token(caps.get("supported_group_e2ee"), "group_e2ee_v2")
+        """Python SDK 是 V2-only 客户端，Group 不做 V1 降级。"""
+        return True
 
     # 兼容别名：旧调用点仍可用
     async def _ensure_sender_cert_cached(self, aid: str, cert_fingerprint: str | None = None) -> bool:
@@ -3644,25 +4371,6 @@ class AUNClient:
         query = urlencode({"cert_fingerprint": normalized_fp}) if normalized_fp else ""
         return urlunparse((scheme, netloc, path, "", query, ""))
 
-    @staticmethod
-    def _resolve_peer_gateway_url(local_gateway_url: str, peer_aid: str) -> str:
-        """跨域时将 Gateway URL 替换为 peer 所在域的 Gateway URL。
-
-        例: local=wss://gateway.aid.com:20001/aun, peer=bob.aid.net
-        → wss://gateway.aid.net:20001/aun
-        """
-        if "." not in peer_aid:
-            return local_gateway_url
-        _, peer_issuer = peer_aid.split(".", 1)
-        import re
-        m = re.search(r"gateway\.([^:/]+)", local_gateway_url)
-        if not m:
-            return local_gateway_url
-        local_issuer = m.group(1)
-        if local_issuer == peer_issuer:
-            return local_gateway_url
-        return local_gateway_url.replace(f"gateway.{local_issuer}", f"gateway.{peer_issuer}")
-
     # ── 内部：连接 ────────────────────────────────────────
 
     async def _connect_once(self, params: dict[str, Any], *, allow_reauth: bool) -> None:
@@ -3670,22 +4378,11 @@ class AUNClient:
         gateway_url = self._resolve_gateway(params)
         self._gateway_url = gateway_url
         self._loop = asyncio.get_running_loop()
-        self._slot_id = str(params.get("slot_id") or "")
+        self._slot_id = normalize_slot_id(params.get("slot_id"))
         self._connect_delivery_mode = dict(params.get("delivery_mode") or self._connect_delivery_mode)
         connection_kind = str(params.get("connection_kind") or "long")
         short_ttl_ms = int(params.get("short_ttl_ms") or 0)
         extra_info = params.get("extra_info") if isinstance(params.get("extra_info"), dict) else None
-        # 记录 connect 时声明的 capabilities，供后续按 V1/V2 路由 RPC 调用
-        if extra_info and isinstance(extra_info.get("_capabilities"), dict):
-            self._connect_capabilities = dict(extra_info["_capabilities"])
-        else:
-            # 默认能力（与 auth.py initialize_with_token 中的默认值保持一致）
-            self._connect_capabilities = {
-                "e2ee": True,
-                "group_e2ee": True,
-                "supported_p2p_e2ee": ["e2ee", "e2ee_v2"],
-                "supported_group_e2ee": ["group_e2ee", "group_e2ee_v2"],
-            }
         self._auth.set_instance_context(device_id=self._device_id, slot_id=self._slot_id)
         self._state = "connecting"
         self._log.debug("client", "_connect_once enter: gateway=%s allow_reauth=%s kind=%s",
@@ -3745,9 +4442,12 @@ class AUNClient:
                 self._sync_identity_after_connect(str(params["access_token"]))
                 if isinstance(hello, dict) and "heartbeat_interval" in hello:
                     self._apply_server_heartbeat_interval(hello.get("heartbeat_interval"), source="auth")
-            self._state = "connected"
+            self._state = ConnectionState.READY.value
             self._connected_at = time.time()
-            self._log.debug("client", "auth complete, state changed to connected: gateway=%s aid=%s", gateway_url, self._aid or "-")
+            self._last_error = None
+            self._last_error_code = None
+            self._next_retry_at = None
+            self._log.debug("client", "auth complete, state changed to ready: gateway=%s aid=%s", gateway_url, self._aid or "-")
             await self._dispatcher.publish("connection.state", {"state": self._state, "gateway": gateway_url})
 
             # auth 阶段 aid 可能被 identity 覆盖（上方 self._aid = identity.get(...)）；
@@ -3830,7 +4530,7 @@ class AUNClient:
     async def _stop_background_tasks(self) -> None:
         current_task = asyncio.current_task()
         for attr in ("_heartbeat_task", "_token_refresh_task",
-                      "_cache_cleanup_task"):
+                      "_cache_cleanup_task", "_online_unread_hint_task"):
             task = getattr(self, attr, None)
             if task is None:
                 continue
@@ -3843,6 +4543,8 @@ class AUNClient:
             except asyncio.CancelledError:
                 pass
             setattr(self, attr, None)
+        if hasattr(self, "_online_unread_hint_queue"):
+            self._online_unread_hint_queue.clear()
 
     def _start_heartbeat_task(self) -> None:
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
@@ -3919,7 +4621,8 @@ class AUNClient:
             lead = _TOKEN_REFRESH_DEFAULT_LEAD
         try:
             while not self._closing:
-                if self._state != "connected" or not self._gateway_url:
+                gateway_url = self.gateway_url
+                if self._public_state != ConnectionState.READY or not gateway_url:
                     await asyncio.sleep(_TOKEN_REFRESH_CHECK_INTERVAL)
                     continue
                 identity = self._identity or self._auth.load_identity_or_none()
@@ -3935,7 +4638,11 @@ class AUNClient:
                     await asyncio.sleep(_TOKEN_REFRESH_CHECK_INTERVAL)
                     continue
                 try:
-                    identity = await self._auth.refresh_cached_tokens(self._gateway_url, identity)
+                    identity = await self._auth.refresh_cached_tokens(gateway_url, identity)
+                    # 防竞态：刷新期间可能已断线/重连，状态不再是 READY 说明 transport 已变，丢弃结果
+                    if self._public_state != ConnectionState.READY:
+                        self._log.debug("client", "token refresh succeeded but state changed, discarding result")
+                        return
                     self._identity = identity
                     if self._session_params is not None and identity.get("access_token"):
                         self._session_params["access_token"] = identity["access_token"]
@@ -3947,7 +4654,7 @@ class AUNClient:
                 except AuthError as exc:
                     self._token_refresh_failures += 1
                     if self._token_refresh_failures >= _TOKEN_REFRESH_MAX_FAILURES:
-                        self._log.warn("client", 
+                        self._log.warn("client",
                             "token 刷新连续失败 %d 次，停止刷新循环并触发重连",
                             self._token_refresh_failures,
                         )
@@ -3957,11 +4664,10 @@ class AUNClient:
                             "last_error": str(exc),
                         })
                         self._token_refresh_failures = 0
-                        # 主动触发断线重连，让 connect_session 的 fallback 链
-                        # （cached_token → refresh_token → 完整两阶段登录）接管
-                        await self._handle_transport_disconnect(
-                            ConnectionError("token refresh exhausted, triggering reconnect")
-                        )
+                        # 不直接调用 _handle_transport_disconnect（会 cancel 自身导致递归），
+                        # 而是关闭 transport 让 on_disconnect 回调自然触发重连。
+                        if self._transport and not getattr(self._transport, "_closed", True):
+                            await self._transport.close()
                         return
                     else:
                         self._log.debug("client", 
@@ -3989,6 +4695,8 @@ class AUNClient:
         return str(e2ee.get("prekey_id") or "").strip()
 
     def _validate_message_recipient(self, to_aid: Any) -> None:
+        if not str(to_aid or "").strip():
+            raise ValidationError("message.send requires a non-empty 'to' (recipient AID)")
         if _is_group_service_aid(to_aid):
             raise ValidationError("message.send receiver cannot be group.{issuer}; use group.send instead")
 
@@ -4098,7 +4806,7 @@ class AUNClient:
             return
         if "device_id" in params and str(params.get("device_id") or "").strip() != self._device_id:
             raise ValidationError("message.pull/message.ack device_id must match the current client instance")
-        slot_id = normalize_instance_id(params.get("slot_id", self._slot_id), "slot_id", allow_empty=True)
+        slot_id = normalize_slot_id(params.get("slot_id", self._slot_id))
         if slot_id != self._slot_id:
             raise ValidationError("message.pull/message.ack slot_id must match the current client instance")
         params["device_id"] = self._device_id
@@ -4208,6 +4916,8 @@ class AUNClient:
             self._v2_sender_ik_fetching.clear()
         if hasattr(self, "_group_synced"):
             self._group_synced.clear()
+        if hasattr(self, "_online_unread_hint_queue"):
+            self._online_unread_hint_queue.clear()
 
     def _refresh_seq_tracking_context(self) -> None:
         next_context = self._current_seq_tracker_context()
@@ -4232,6 +4942,8 @@ class AUNClient:
             self._v2_sender_ik_fetching.clear()
         if hasattr(self, "_group_synced"):
             self._group_synced.clear()
+        if hasattr(self, "_online_unread_hint_queue"):
+            self._online_unread_hint_queue.clear()
         self._seq_tracker_context = next_context
 
     def _persist_seq(self, ns: str, *, force_seq: int | None = None) -> None:
@@ -4408,20 +5120,28 @@ class AUNClient:
     async def _handle_transport_disconnect(self, error: Exception | None, close_code: int | None = None) -> None:
         if self._closing or self._state == "closed":
             return
-        self._state = "disconnected"
         # 断线时保存 SeqTracker 状态，防止进程崩溃后 seq 回退
         try:
             self._save_seq_tracker_state()
         except Exception as exc:
             self._log.debug("client", "failed to save SeqTracker on disconnect: %s", exc)
-        await self._dispatcher.publish("connection.state", {"state": self._state, "error": error})
         if not bool(self._session_options["auto_reconnect"]):
+            self._state = ConnectionState.STANDBY.value if self.has_identity else ConnectionState.NO_IDENTITY.value
+            self._identity = None
+            self._next_retry_at = None
+            self._retry_attempt = 0
+            self._last_error = error
+            self._last_error_code = "transport_disconnected" if error else None
+            await self._dispatcher.publish("connection.state", {"state": self._state, "error": error})
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
         # 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
         if self._server_kicked or (close_code is not None and close_code in self._NO_RECONNECT_CODES):
-            self._state = "terminal_failed"
+            self._state = ConnectionState.CONNECTION_FAILED.value
+            self._last_error = error
+            self._last_error_code = "server_kicked" if self._server_kicked else "no_reconnect_close_code"
+            self._next_retry_at = None
             reason = "server kicked" if self._server_kicked else f"close code {close_code}"
             self._log.warn("client", "suppressing auto-reconnect: %s", reason)
             disconnect_info = getattr(self, "_last_disconnect_info", None) or {}
@@ -4441,90 +5161,6 @@ class AUNClient:
         server_initiated = close_code is not None and close_code not in (1000, 1006)
         self._reconnect_task = asyncio.create_task(self._reconnect_loop(server_initiated))
 
-    # ── Named Group（命名群）高层 API ────────────────────────────
-
-    async def create_named_group(self, group_name: str, **kwargs) -> dict:
-        """创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，
-        服务端签发群 AID 证书，返回后将证书和私钥存入 keystore。
-        """
-        from cryptography.hazmat.primitives.asymmetric import ec as _ec
-        from cryptography.hazmat.primitives import serialization as _ser
-
-        # 生成 P-256 keypair
-        private_key = _ec.generate_private_key(_ec.SECP256R1())
-        public_key_der = private_key.public_key().public_bytes(
-            _ser.Encoding.X962, _ser.PublicFormat.UncompressedPoint
-        )
-        import base64
-        public_key_b64 = base64.b64encode(public_key_der).decode("ascii")
-        private_key_pem = private_key.private_bytes(
-            _ser.Encoding.PEM, _ser.PrivateFormat.PKCS8, _ser.NoEncryption()
-        ).decode("utf-8")
-
-        params = dict(kwargs)
-        params["group_name"] = group_name
-        params["public_key"] = public_key_b64
-        params["curve"] = "P-256"
-
-        result = await self.call("group.create", params)
-
-        # 存储群 AID 的私钥和证书到 keystore
-        aid_cert = result.get("aid_cert") if isinstance(result, dict) else None
-        group_info = result.get("group", {}) if isinstance(result, dict) else {}
-        group_aid = group_info.get("group_aid", "")
-        if aid_cert and group_aid:
-            self._keystore.save_identity(group_aid, {
-                "private_key_pem": private_key_pem,
-                "public_key": public_key_b64,
-                "curve": "P-256",
-                "type": "group_identity",
-            })
-            cert_pem = aid_cert.get("cert", "")
-            if cert_pem:
-                self._keystore.save_cert(group_aid, cert_pem)
-
-        return result
-
-    async def bind_group_aid(self, group_id: str, group_name: str) -> dict:
-        """为已有普通群绑定命名 AID：本地生成 keypair，调用 group.bind_aid，
-        存储证书和私钥到 keystore。
-        """
-        from cryptography.hazmat.primitives.asymmetric import ec as _ec
-        from cryptography.hazmat.primitives import serialization as _ser
-
-        private_key = _ec.generate_private_key(_ec.SECP256R1())
-        public_key_der = private_key.public_key().public_bytes(
-            _ser.Encoding.X962, _ser.PublicFormat.UncompressedPoint
-        )
-        import base64
-        public_key_b64 = base64.b64encode(public_key_der).decode("ascii")
-        private_key_pem = private_key.private_bytes(
-            _ser.Encoding.PEM, _ser.PrivateFormat.PKCS8, _ser.NoEncryption()
-        ).decode("utf-8")
-
-        result = await self.call("group.bind_aid", {
-            "group_id": group_id,
-            "group_name": group_name,
-            "public_key": public_key_b64,
-            "curve": "P-256",
-        })
-
-        aid_cert = result.get("aid_cert") if isinstance(result, dict) else None
-        group_info = result.get("group", {}) if isinstance(result, dict) else {}
-        group_aid = group_info.get("group_aid", "")
-        if aid_cert and group_aid:
-            self._keystore.save_identity(group_aid, {
-                "private_key_pem": private_key_pem,
-                "public_key": public_key_b64,
-                "curve": "P-256",
-                "type": "group_identity",
-            })
-            cert_pem = aid_cert.get("cert", "")
-            if cert_pem:
-                self._keystore.save_cert(group_aid, cert_pem)
-
-        return result
-
     async def _reconnect_loop(self, server_initiated: bool = False) -> None:
         retry = dict(self._session_options["retry"])
         max_base_delay = _clamp_reconnect_delay(
@@ -4542,59 +5178,98 @@ class AUNClient:
         )
         delay = base_delay
         attempt = 0
+        self._retry_attempt = 0
+        self._retry_max_attempts = max_attempts
         self._log.debug("client", "reconnect loop started: server_initiated=%s max_attempts=%s base_delay=%.1fs", server_initiated, max_attempts, base_delay)
 
         while not self._closing:
             attempt += 1
-            # R1 fix: max_attempts 检查在循环顶部，覆盖所有路径（含 health-fail）
-            if max_attempts > 0 and attempt > max_attempts:
-                self._state = "terminal_failed"
-                self._reconnect_task = None
-                self._log.warn("client", "reconnect max attempts reached, terminating: attempts=%d", attempt - 1)
-                await self._dispatcher.publish("connection.state", {
-                    "state": self._state,
-                    "attempt": attempt - 1,
-                    "reason": "max_attempts_exhausted",
-                })
-                return
-
-            self._state = "reconnecting"
+            self._retry_attempt = attempt
+            sleep_delay = _reconnect_sleep_delay(delay, max_base_delay)
+            self._next_retry_at = time.time() + sleep_delay
+            self._state = ConnectionState.RETRY_BACKOFF.value
             await self._dispatcher.publish("connection.state", {
                 "state": self._state,
                 "attempt": attempt,
+                "next_retry_at": self._next_retry_at,
             })
             try:
                 # 固定上限抖动：base=[1s, max_base]，delay=base+rand(0..max_base)。
-                await self._reconnect_sleep(_reconnect_sleep_delay(delay, max_base_delay))
+                await self._reconnect_sleep(sleep_delay)
+                if self._closing:
+                    self._next_retry_at = None
+                    self._reconnect_task = None
+                    return
+                self._next_retry_at = None
+                self._state = ConnectionState.RECONNECTING.value
+                await self._dispatcher.publish("connection.state", {
+                    "state": self._state,
+                    "attempt": attempt,
+                })
+                if self._closing:
+                    self._reconnect_task = None
+                    return
                 # 重连前先 GET /health 探测，不健康则跳过本轮
-                if self._gateway_url:
-                    healthy = await self._discovery.check_health(self._gateway_url)
+                gateway_url = self.gateway_url
+                if gateway_url:
+                    healthy = await self._discovery.check_health(gateway_url)
+                    if self._closing:
+                        self._reconnect_task = None
+                        return
                     if not healthy:
-                        self._log.debug("client", "reconnect health check failed, skipping this round: attempt=%d gateway=%s", attempt, self._gateway_url)
+                        self._log.debug("client", "reconnect health check failed, skipping this round: attempt=%d gateway=%s", attempt, gateway_url)
+                        self._last_error = RuntimeError("gateway health check failed")
+                        self._last_error_code = "gateway_unhealthy"
+                        if max_attempts > 0 and attempt >= max_attempts:
+                            self._state = ConnectionState.CONNECTION_FAILED.value
+                            self._reconnect_task = None
+                            await self._dispatcher.publish("connection.state", {
+                                "state": self._state,
+                                "attempt": attempt,
+                                "reason": "max_attempts_exhausted",
+                            })
+                            return
                         delay = min(delay * 2, max_base_delay)
                         continue
                 await self._transport.close()
+                if self._closing:
+                    self._reconnect_task = None
+                    return
                 self._log.debug("client", "reconnect attempting _connect_once: attempt=%d", attempt)
                 await self._invoke_reconnect_connect_once()
+                if self._closing:
+                    self._reconnect_task = None
+                    return
                 self._log.debug("client", "reconnect success: attempt=%d", attempt)
+                if self._public_state != ConnectionState.READY:
+                    self._state = ConnectionState.READY.value
+                self._last_error = None
+                self._last_error_code = None
+                self._next_retry_at = None
                 self._reconnect_task = None
                 return
             except asyncio.CancelledError:
+                self._next_retry_at = None
                 self._reconnect_task = None
                 raise
             except Exception as exc:
-                self._log.warn("client", "reconnect failed: attempt=%d error=%s retryable=%s", attempt, exc, self._should_retry_reconnect(exc))
+                retryable = self._should_retry_reconnect(exc)
+                self._last_error = exc
+                self._last_error_code = "reconnect_failed"
+                self._log.warn("client", "reconnect failed: attempt=%d error=%s retryable=%s", attempt, exc, retryable)
                 await self._dispatcher.publish("connection.error", {
                     "error": exc,
                     "attempt": attempt,
                 })
-                if not self._should_retry_reconnect(exc):
-                    self._state = "terminal_failed"
+                if not retryable or (max_attempts > 0 and attempt >= max_attempts):
+                    self._state = ConnectionState.CONNECTION_FAILED.value
+                    self._next_retry_at = None
                     self._reconnect_task = None
                     await self._dispatcher.publish("connection.state", {
                         "state": self._state,
                         "error": exc,
                         "attempt": attempt,
+                        "reason": "not_retryable" if not retryable else "max_attempts_exhausted",
                     })
                     return
                 delay = min(delay * 2, max_base_delay)
@@ -4609,7 +5284,7 @@ class AUNClient:
         access_token = str(request.get("access_token") or "")
         if not access_token:
             raise StateError("connect requires non-empty access_token")
-        gateway = str(request.get("gateway") or self._gateway_url or "")
+        gateway = str(request.get("gateway") or self.gateway_url or "")
         if not gateway:
             raise StateError("connect requires non-empty gateway")
         request["access_token"] = access_token
@@ -4622,11 +5297,7 @@ class AUNClient:
         if "timeouts" in request and not isinstance(request["timeouts"], dict):
             raise ValidationError("timeouts must be a dict")
         request["device_id"] = self._device_id
-        request["slot_id"] = normalize_instance_id(
-            request.get("slot_id", self._slot_id),
-            "slot_id",
-            allow_empty=True,
-        )
+        request["slot_id"] = normalize_slot_id(request.get("slot_id", self._slot_id))
         delivery_mode_raw = request.get("delivery_mode")
         if delivery_mode_raw is None:
             delivery_mode_raw = dict(self._default_connect_delivery_mode)
@@ -5106,7 +5777,7 @@ class AUNClient:
                 if seq <= 0:
                     continue
 
-                # V1 行（服务端 v2.pull 合并的 V1 历史）：V2-only 客户端跳过 V1 envelope，
+                # 服务端 v2.pull 合并的明文历史行：V2-only 客户端跳过旧加密 envelope，
                 # 仅明文消息照常 publish；e2ee.encrypted / e2ee.group_encrypted / 未知类型一律
                 # 推进 seq tracker 并丢弃。
                 if str(msg.get("version", "") or "") == "v1":
@@ -5115,7 +5786,7 @@ class AUNClient:
                     v1_payload_type = ""
                     if isinstance(v1_payload, dict):
                         v1_payload_type = str(v1_payload.get("type") or "").strip()
-                    # 仅放行明文（非 V1 E2EE 包装类型）
+                    # 仅放行明文（非旧 E2EE 包装类型）
                     if v1_payload_type not in ("e2ee.encrypted", "e2ee.group_encrypted") and v1_payload is not None:
                         v1_msg = {
                             "message_id": msg.get("message_id", ""),
@@ -5132,9 +5803,9 @@ class AUNClient:
                         else:
                             await self._publish_app_event("message.received", v1_msg, source="pull")
                         decrypted.append(v1_msg)
-                        self._log.debug("client", "message.v2.pull plaintext V1 delivered: ns=%s seq=%d", ns or "<none>", seq)
+                        self._log.debug("client", "message.v2.pull plaintext legacy row delivered: ns=%s seq=%d", ns or "<none>", seq)
                     else:
-                        self._log.debug("client", "v2.pull skipping V1 envelope seq=%d payload_type=%s (V1 E2EE removed)",
+                        self._log.debug("client", "v2.pull skipping legacy envelope seq=%d payload_type=%s (old E2EE removed)",
                                         seq, v1_payload_type or "<none>")
                     continue
 
@@ -5242,8 +5913,8 @@ class AUNClient:
                 actual_ack_seq = seq
             result["ack_seq"] = actual_ack_seq
             result["success"] = True
-            # V1+V2 共享 seq 空间：即使 V2 inbox 没 wrap 行（明文消息在 V1 表），
-            # V1 cursor 也被推进了，视为 ack 成功
+            # 共享 seq 空间：即使 V2 inbox 没 wrap 行（明文历史在普通消息表），
+            # 服务端 cursor 也被推进了，视为 ack 成功
             if result.get("acked", 0) == 0 and actual_ack_seq > 0:
                 result["acked"] = actual_ack_seq
         # 自检：所有旧 SPK 引用的消息都已 ack → 销毁旧 SPK 私钥（PFS）
@@ -6322,11 +6993,11 @@ class AUNClient:
                 if seq <= 0:
                     continue
 
-                # 服务端合并的 V1 明文行：version=v1 + payload 已是明文
+                # 服务端合并的明文历史行：payload 已是明文
                 if str(msg.get("version", "") or "") == "v1":
                     payload = msg.get("payload")
                     if isinstance(payload, dict) and payload.get("type") in ("e2ee.encrypted", "e2ee.group_encrypted"):
-                        # 兜底：V1 加密 envelope 在 V2-only 客户端跳过
+                        # 兜底：旧加密 envelope 在 V2-only 客户端跳过
                         continue
                     v1_msg = {
                         "message_id": msg.get("message_id", ""),
@@ -6340,7 +7011,7 @@ class AUNClient:
                     }
                     await self._publish_pulled_message("group.message_created", ns, seq, v1_msg)
                     decrypted.append(v1_msg)
-                    self._log.debug("client", "group.v2.pull plaintext V1 delivered: group=%s seq=%d", group_id, seq)
+                    self._log.debug("client", "group.v2.pull plaintext legacy row delivered: group=%s seq=%d", group_id, seq)
                     continue
 
                 # 解密失败不阻断本页 seq 下界推进和 ack。
@@ -6558,6 +7229,8 @@ class AUNClient:
 
     def _v2_maybe_trigger_auto_propose(self, group_id: str) -> None:
         """lazy sync 路径：发现 pending members 时异步触发 auto propose（fire-and-forget，去重）。"""
+        if not self._v2_auto_state_management_enabled:
+            return
         now = time.time()
         last = self._v2_lazy_propose_triggered.get(group_id, 0.0)
         if now - last < 10.0:
@@ -6567,6 +7240,8 @@ class AUNClient:
         loop.create_task(self._v2_auto_propose_state(group_id, leader_delay=True))
 
     async def _v2_auto_propose_state(self, group_id: str, *, leader_delay: bool = False) -> None:
+        if not self._v2_auto_state_management_enabled:
+            return
         normalized_group_id = _normalize_group_id(str(group_id or "").strip()) if group_id else ""
         if not normalized_group_id:
             return
@@ -6655,6 +7330,14 @@ class AUNClient:
             return False
         try:
             parsed = json.loads(membership_snapshot)
+            if isinstance(parsed, list):
+                self._log.debug(
+                    "client",
+                    "V2 committed state base uses legacy snapshot array, accepting as hash anchor: group=%s sv=%d",
+                    group_id,
+                    current_sv,
+                )
+                return True
             if not isinstance(parsed, dict):
                 self._log.warn("client", "V2 committed state base snapshot is not object: group=%s sv=%d", group_id, current_sv)
                 return False
@@ -6881,6 +7564,8 @@ class AUNClient:
 
     async def _v2_auto_confirm_pending_proposals(self) -> None:
         """Owner/admin 上线时自动检查：confirm pending proposals 或发起新 propose。"""
+        if not self._v2_auto_state_management_enabled:
+            return
         try:
             my_aid = self._aid or ""
             if not my_aid:
@@ -6911,6 +7596,8 @@ class AUNClient:
         if not group_id:
             return
         await self._dispatcher.publish("group.v2.state_proposed", data)
+        if not self._v2_auto_state_management_enabled:
+            return
         try:
             await self._v2_confirm_pending_proposal(group_id)
         except Exception as exc:
@@ -7268,3 +7955,4 @@ class AUNClient:
             result["slot_id"] = msg.get("slot_id")
         self._attach_v2_envelope_metadata(result, meta)
         return result
+

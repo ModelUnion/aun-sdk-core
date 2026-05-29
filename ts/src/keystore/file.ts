@@ -27,6 +27,7 @@ import { homedir } from 'node:os';
 import type { AgentMdCacheRecord, AgentMdCacheUpsert, KeyStore } from './index.js';
 import type { SecretStore } from '../secret-store/index.js';
 import type { ModuleLogger } from '../logger.js';
+import type { SecretRecord } from '../types.js';
 import { AIDDatabase } from './aid-db.js';
 import { V2KeyStore } from '../v2/session/keystore.js';
 import { getDeviceId, normalizeInstanceId } from '../config.js';
@@ -371,6 +372,227 @@ export class FileKeyStore implements KeyStore {
     } catch {
       return null;
     }
+  }
+
+  // ── 旧 E2EE 存储互操作 ───────────────────────────────────
+
+  private _protectText(aid: string, name: string, plaintext: string): string {
+    if (!plaintext) return plaintext;
+    try {
+      const rec = this._secretStore.protect(safeAid(aid), name, Buffer.from(plaintext, 'utf-8'));
+      return JSON.stringify(rec);
+    } catch (exc) {
+      this._logger.error(`field encryption failed (scope=${safeAid(aid)}, name=${name}): ${exc instanceof Error ? exc.message : String(exc)}`);
+      return plaintext;
+    }
+  }
+
+  private _revealText(aid: string, name: string, stored: string): string {
+    if (!stored) return stored;
+    let rec: unknown;
+    try {
+      rec = JSON.parse(stored);
+    } catch {
+      return stored;
+    }
+    if (rec === null || typeof rec !== 'object' || Array.isArray(rec)) {
+      return stored;
+    }
+    const record = rec as SecretRecord;
+    if (record.scheme !== 'file_aes' || String(record.name ?? '') !== name) {
+      return stored;
+    }
+    try {
+      const plain = this._secretStore.reveal(safeAid(aid), name, record);
+      return plain ? plain.toString('utf-8') : stored;
+    } catch (exc) {
+      this._logger.error(`field decryption failed (scope=${safeAid(aid)}, name=${name}): ${exc instanceof Error ? exc.message : String(exc)}`);
+      return stored;
+    }
+  }
+
+  async saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: Record<string, unknown>, deviceId = ''): Promise<void> {
+    const now = Date.now();
+    const privateKey = String(prekeyData.private_key_pem ?? '');
+    const extra: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(prekeyData)) {
+      if (!['private_key_pem', 'created_at', 'updated_at', 'expires_at'].includes(key)) extra[key] = value;
+    }
+    this._getDB(aid).getSqliteHandle().prepare(
+      `INSERT INTO prekeys (prekey_id, device_id, private_key_enc, data, created_at, updated_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(prekey_id, device_id) DO UPDATE SET
+         private_key_enc=excluded.private_key_enc,
+         data=excluded.data,
+         updated_at=excluded.updated_at,
+         expires_at=excluded.expires_at`,
+    ).run(
+      prekeyId,
+      String(deviceId ?? ''),
+      this._protectText(aid, `prekey/${prekeyId}`, privateKey),
+      JSON.stringify(extra),
+      Number(prekeyData.created_at ?? now),
+      now,
+      prekeyData.expires_at == null ? null : Number(prekeyData.expires_at),
+    );
+  }
+
+  async loadE2EEPrekeys(aid: string, deviceId = ''): Promise<Record<string, Record<string, unknown>>> {
+    const rows = this._getDB(aid).getSqliteHandle().prepare(
+      `SELECT prekey_id, private_key_enc, data, created_at, updated_at, expires_at
+       FROM prekeys WHERE device_id = ?`,
+    ).all(String(deviceId ?? '')) as Array<Record<string, unknown>>;
+    const result: Record<string, Record<string, unknown>> = {};
+    for (const row of rows) {
+      const id = String(row.prekey_id ?? '');
+      if (!id) continue;
+      const entry: Record<string, unknown> = {
+        private_key_pem: this._revealText(aid, `prekey/${id}`, String(row.private_key_enc ?? '')),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        expires_at: row.expires_at,
+      };
+      try {
+        const extra = JSON.parse(String(row.data ?? '{}'));
+        if (extra && typeof extra === 'object' && !Array.isArray(extra)) Object.assign(entry, extra);
+      } catch { /* ignore damaged extra payload */ }
+      result[id] = entry;
+    }
+    return result;
+  }
+
+  async listGroupSecretIds(aid: string): Promise<string[]> {
+    const db = this._getDB(aid).getSqliteHandle();
+    const ids = new Set<string>();
+    for (const row of db.prepare('SELECT group_id FROM group_current').all() as Array<Record<string, unknown>>) {
+      ids.add(String(row.group_id ?? ''));
+    }
+    for (const row of db.prepare('SELECT DISTINCT group_id FROM group_old_epochs').all() as Array<Record<string, unknown>>) {
+      ids.add(String(row.group_id ?? ''));
+    }
+    return Array.from(ids).filter(Boolean).sort();
+  }
+
+  async loadGroupSecretEpoch(aid: string, groupId: string, epoch?: number | null): Promise<Record<string, unknown> | null> {
+    const db = this._getDB(aid).getSqliteHandle();
+    const current = db.prepare(
+      'SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?',
+    ).get(groupId) as Record<string, unknown> | undefined;
+    if (current && (epoch == null || Number(current.epoch ?? 0) === Number(epoch))) {
+      const entry: Record<string, unknown> = {
+        group_id: groupId,
+        epoch: current.epoch,
+        secret: this._revealText(aid, `group/${groupId}/current`, String(current.secret_enc ?? '')),
+        updated_at: current.updated_at,
+      };
+      try {
+        const extra = JSON.parse(String(current.data ?? '{}'));
+        if (extra && typeof extra === 'object' && !Array.isArray(extra)) Object.assign(entry, extra);
+      } catch { /* ignore damaged extra payload */ }
+      return entry;
+    }
+    if (epoch == null) return null;
+    const old = db.prepare(
+      'SELECT epoch, secret_enc, data, updated_at, expires_at FROM group_old_epochs WHERE group_id = ? AND epoch = ?',
+    ).get(groupId, Number(epoch)) as Record<string, unknown> | undefined;
+    if (!old) return null;
+    const entry: Record<string, unknown> = {
+      epoch: old.epoch,
+      secret: this._revealText(aid, `group/${groupId}/epoch/${Number(old.epoch ?? 0)}`, String(old.secret_enc ?? '')),
+      updated_at: old.updated_at,
+    };
+    if (old.expires_at != null) entry.expires_at = old.expires_at;
+    try {
+      const extra = JSON.parse(String(old.data ?? '{}'));
+      if (extra && typeof extra === 'object' && !Array.isArray(extra)) Object.assign(entry, extra);
+    } catch { /* ignore damaged extra payload */ }
+    return entry;
+  }
+
+  async storeGroupSecretTransition(
+    aid: string,
+    groupId: string,
+    opts: {
+      epoch: number;
+      secret: string;
+      commitment: string;
+      memberAids?: string[];
+      oldEpochRetentionMs?: number;
+    },
+  ): Promise<boolean> {
+    const db = this._getDB(aid).getSqliteHandle();
+    const now = Date.now();
+    const epoch = Number(opts.epoch ?? 0);
+    const current = db.prepare(
+      'SELECT epoch, secret_enc, data, updated_at FROM group_current WHERE group_id = ?',
+    ).get(groupId) as Record<string, unknown> | undefined;
+    if (current && Number(current.epoch ?? 0) > epoch) return false;
+    if (current && Number(current.epoch ?? 0) !== epoch) {
+      const oldEpoch = Number(current.epoch ?? 0);
+      const oldSecret = this._revealText(aid, `group/${groupId}/current`, String(current.secret_enc ?? ''));
+      db.prepare(
+        `INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(group_id, epoch) DO UPDATE SET
+           secret_enc=excluded.secret_enc,
+           data=excluded.data,
+           updated_at=excluded.updated_at,
+           expires_at=excluded.expires_at`,
+      ).run(
+        groupId,
+        oldEpoch,
+        this._protectText(aid, `group/${groupId}/epoch/${oldEpoch}`, oldSecret),
+        String(current.data ?? '{}'),
+        Number(current.updated_at ?? now),
+        Number(current.updated_at ?? now) + Number(opts.oldEpochRetentionMs ?? 0),
+      );
+    }
+    const data = {
+      commitment: String(opts.commitment ?? ''),
+      member_aids: Array.isArray(opts.memberAids) ? [...opts.memberAids].map(String).sort() : [],
+    };
+    db.prepare(
+      `INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(group_id) DO UPDATE SET
+         epoch=excluded.epoch,
+         secret_enc=excluded.secret_enc,
+         data=excluded.data,
+         updated_at=excluded.updated_at`,
+    ).run(
+      groupId,
+      epoch,
+      this._protectText(aid, `group/${groupId}/current`, String(opts.secret ?? '')),
+      JSON.stringify(data),
+      now,
+    );
+    return true;
+  }
+
+  async saveE2EESession(aid: string, sessionId: string, data: Record<string, unknown>): Promise<void> {
+    const dataJson = JSON.stringify(data ?? {});
+    this._getDB(aid).getSqliteHandle().prepare(
+      `INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at`,
+    ).run(sessionId, this._protectText(aid, `session/${sessionId}`, dataJson), Date.now());
+  }
+
+  async loadE2EESessions(aid: string): Promise<Array<Record<string, unknown>>> {
+    const rows = this._getDB(aid).getSqliteHandle().prepare(
+      'SELECT session_id, data_enc, updated_at FROM e2ee_sessions',
+    ).all() as Array<Record<string, unknown>>;
+    const result: Array<Record<string, unknown>> = [];
+    for (const row of rows) {
+      const sessionId = String(row.session_id ?? '');
+      if (!sessionId) continue;
+      try {
+        const entry = JSON.parse(this._revealText(aid, `session/${sessionId}`, String(row.data_enc ?? '{}')));
+        if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+          result.push({ ...entry, session_id: sessionId, updated_at: row.updated_at });
+        }
+      } catch { /* ignore damaged session payload */ }
+    }
+    return result;
   }
 
 

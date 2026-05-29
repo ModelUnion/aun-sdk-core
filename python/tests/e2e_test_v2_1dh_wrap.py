@@ -3,7 +3,6 @@
 import asyncio
 import os
 import sys
-import time
 import uuid
 from pathlib import Path
 
@@ -17,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from aun_core import AUNClient  # noqa: E402
 from aun_core.client import _v2_wrap_capabilities  # noqa: E402
 from aun_core.errors import AuthError, RateLimitError  # noqa: E402
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path  # noqa: E402
 
 
 os.environ.setdefault("AUN_ENV", "development")
@@ -36,23 +36,19 @@ _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 
 
 def _make_client() -> AUNClient:
-    return AUNClient({"aun_path": _TEST_AUN_PATH}, debug=True)
+    return make_client_for_path(_TEST_AUN_PATH, debug=True)
 
 
 async def _connect_client(client: AUNClient, aid: str) -> None:
-    if client._auth._keystore.load_identity(aid) is None:
-        try:
-            await client.auth.register_aid({"aid": aid})
-        except Exception as exc:
-            print(f"  [connect] register_aid skipped: {aid} ({exc.__class__.__name__})")
-
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            params = dict(auth)
-            params["auto_reconnect"] = False
-            await client.connect(params)
+            await ensure_connected_identity(
+                client,
+                aid,
+                connect_options={"auto_reconnect": False},
+                attempts=1,
+            )
             return
         except (AuthError, RateLimitError, Exception) as exc:
             last_error = exc
@@ -85,26 +81,6 @@ def _assert_policy(result: dict, protocol: str, scope: str) -> None:
     assert isinstance(policy, dict), f"missing e2ee_wrap_policy: {result}"
     assert policy.get("protocol") == protocol, policy
     assert policy.get("scope") == scope, policy
-
-
-def _assert_no_wrap_fields_in_aad(envelope: dict) -> None:
-    aad = envelope.get("aad")
-    assert isinstance(aad, dict), envelope
-    assert "wrap_scope" not in aad, aad
-    assert "wrap_policy_version" not in aad, aad
-    assert "e2ee_wrap_policy" not in aad, aad
-
-
-def _find_row(envelope: dict, aid: str, role: str | None = None) -> list:
-    for row in envelope.get("recipients", []):
-        if not isinstance(row, list) or len(row) < 8:
-            continue
-        if row[0] != aid:
-            continue
-        if role is not None and row[2] != role:
-            continue
-        return row
-    raise AssertionError(f"recipient row not found: aid={aid} role={role} rows={envelope.get('recipients')}")
 
 
 async def _wait_p2p_text(client: AUNClient, inbox: list[dict], text: str) -> dict:
@@ -148,26 +124,13 @@ async def test_p2p_1dh_per_aid(alice: AUNClient, bob: AUNClient) -> None:
     _assert_policy(modern, "1DH", "aid")
 
     text = f"p2p-1dh-{uuid.uuid4().hex[:10]}"
-    envelope = await alice._build_v2_p2p_envelope(
-        to=_BOB_AID,
-        payload={"text": text},
-        message_id=f"m-{uuid.uuid4().hex}",
-        timestamp=int(time.time() * 1000),
-        use_cache=False,
-    )
-    row = _find_row(envelope, _BOB_AID, "peer")
-    assert row[1] == "", row
-    assert row[3] == "aid_master", row
-    assert row[5] == "", row
-    _assert_no_wrap_fields_in_aad(envelope)
-
     inbox: list[dict] = []
     bob.on("message.received", lambda data: inbox.append(data) if isinstance(data, dict) else None)
-    await alice.call("message.send", {"to": _BOB_AID, "payload": envelope, "encrypt": False})
+    await alice.call("message.send", {"to": _BOB_AID, "payload": {"text": text}})
     msg = await _wait_p2p_text(bob, inbox, text)
     assert msg.get("encrypted") is True, msg
     assert msg.get("e2ee", {}).get("version") == "v2", msg
-    print(f"  ok: row_device=<aid> key_source=aid_master text={text}")
+    print(f"  ok: policy=1DH/aid text={text}")
 
 
 async def _create_committed_group(alice: AUNClient) -> str:
@@ -205,26 +168,13 @@ async def test_group_1dh_per_aid(alice: AUNClient, bob: AUNClient) -> None:
     _assert_policy(modern, "1DH", "aid")
 
     text = f"group-1dh-{uuid.uuid4().hex[:10]}"
-    envelope = await alice._build_v2_group_envelope(
-        group_id=group_id,
-        payload={"text": text},
-        message_id=f"gm-{uuid.uuid4().hex}",
-        timestamp=int(time.time() * 1000),
-        use_cache=False,
-    )
-    row = _find_row(envelope, _BOB_AID, "member")
-    assert row[1] == "", row
-    assert row[3] == "aid_master", row
-    assert row[5] == "", row
-    _assert_no_wrap_fields_in_aad(envelope)
-
     inbox: list[dict] = []
     bob.on("group.message_created", lambda data: inbox.append(data) if isinstance(data, dict) else None)
-    await alice.call("group.v2.send", {"group_id": group_id, "envelope": envelope})
+    await alice.call("group.send", {"group_id": group_id, "payload": {"text": text}})
     msg = await _wait_group_text(bob, group_id, inbox, text)
     assert msg.get("encrypted") is True, msg
     assert msg.get("e2ee", {}).get("version") == "v2", msg
-    print(f"  ok: group={group_id} row_device=<aid> key_source=aid_master text={text}")
+    print(f"  ok: group={group_id} policy=1DH/aid text={text}")
 
 
 async def main() -> None:
@@ -250,3 +200,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

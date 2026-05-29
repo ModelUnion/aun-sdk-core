@@ -575,7 +575,7 @@ class AIDDatabase:
             conn = self._get_conn()
             now = _now_ms()
             data_json = json.dumps(extra_data or {}, ensure_ascii=False, separators=(",", ":"))
-            stored_key = self._protect_text(f"prekey/{prekey_id}", private_key_pem)
+            stored_key = private_key_pem  # SPK/prekey 明文存储（读取时兼容旧密文）
             conn.execute(
                 "INSERT INTO prekeys (prekey_id, device_id, private_key_enc, data, created_at, updated_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -688,7 +688,7 @@ class AIDDatabase:
             conn = self._get_conn()
             now = _now_ms()
             data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-            stored_secret = self._protect_text(f"group/{group_id}/current", secret)
+            stored_secret = secret  # 群密钥明文存储（读取时兼容旧密文）
             conn.execute(
                 "INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at) "
                 "VALUES (?, ?, ?, ?, ?) "
@@ -803,7 +803,7 @@ class AIDDatabase:
             conn = self._get_conn()
             now = updated_at if updated_at is not None else _now_ms()
             data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-            stored_secret = self._protect_text(f"group/{group_id}/epoch/{epoch}", secret)
+            stored_secret = secret  # 群密钥明文存储（读取时兼容旧密文）
             conn.execute(
                 "INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?) "
@@ -1219,7 +1219,7 @@ class AIDDatabase:
             (
                 group_id,
                 int(epoch),
-                self._protect_text(f"group/{group_id}/current", secret),
+                secret,  # 群密钥明文存储（读取时兼容旧密文）
                 json.dumps(data, ensure_ascii=False, separators=(",", ":")),
                 int(updated_at),
             ),
@@ -1244,7 +1244,7 @@ class AIDDatabase:
             (
                 group_id,
                 int(epoch),
-                self._protect_text(f"group/{group_id}/epoch/{int(epoch)}", secret),
+                secret,  # 群密钥明文存储（读取时兼容旧密文）
                 json.dumps(data, ensure_ascii=False, separators=(",", ":")),
                 int(updated_at),
                 expires_at,
@@ -1316,7 +1316,7 @@ class AIDDatabase:
             conn = self._get_conn()
             now = _now_ms()
             data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-            stored_data = self._protect_text(f"session/{session_id}", data_json)
+            stored_data = data_json  # session 数据明文存储（读取时兼容旧密文）
             conn.execute(
                 "INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET data_enc = excluded.data_enc, updated_at = excluded.updated_at",

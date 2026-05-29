@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
 from aun_core.errors import AUNError
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -68,9 +69,7 @@ def _new_aun_path(tag: str) -> str:
 
 
 def _make_client(aun_path: str) -> AUNClient:
-    client = AUNClient({"aun_path": aun_path}, debug=False)
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(aun_path, debug=False, require_forward_secrecy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -101,18 +100,19 @@ def _fail(name: str, reason: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "main") -> None:
-    await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth, {"auto_reconnect": False, "heartbeat_interval": 30.0, "slot_id": slot_id})
+    await ensure_connected_identity(
+        client,
+        aid,
+        connect_options={"auto_reconnect": False, "heartbeat_interval": 30.0, "slot_id": slot_id},
+    )
 
 
 async def _connect_short(client: AUNClient, aid: str, *, slot_id: str = "main",
                          short_ttl_ms: int = 0) -> None:
-    auth = await client.auth.authenticate({"aid": aid})
     opts: dict = {"connection_kind": "short", "auto_reconnect": False, "slot_id": slot_id}
     if short_ttl_ms > 0:
         opts["short_ttl_ms"] = short_ttl_ms
-    await client.connect(auth, opts)
+    await ensure_connected_identity(client, aid, connect_options=opts)
 
 
 # ---------------------------------------------------------------------------
@@ -578,3 +578,4 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+

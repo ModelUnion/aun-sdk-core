@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from aun_core import AUNClient
+from aun_core import AUNClient, ConnectionState
 
 
 @pytest.mark.asyncio
@@ -62,8 +62,8 @@ async def test_gateway_disconnect_no_detail_payload():
 
 
 @pytest.mark.asyncio
-async def test_terminal_failed_state_includes_detail_after_kick():
-    """连接进入 terminal_failed 时 connection.state 也应带服务端 detail。"""
+async def test_connection_failed_state_includes_detail_after_kick():
+    """连接进入 connection_failed 时 connection.state 也应带服务端 detail。"""
     client = AUNClient()
     states = []
     client.on("connection.state", lambda data: states.append(data))
@@ -80,7 +80,7 @@ async def test_terminal_failed_state_includes_detail_after_kick():
         },
     })
 
-    # 2. 触发 transport disconnect → 走 terminal_failed 路径
+    # 2. 触发 transport disconnect → 走 connection_failed 路径
     client._state = "connected"
     client._closing = False
     client._session_options = {
@@ -95,7 +95,7 @@ async def test_terminal_failed_state_includes_detail_after_kick():
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    terminal = [s for s in states if s.get("state") == "terminal_failed"]
+    terminal = [s for s in states if s.get("state") == ConnectionState.CONNECTION_FAILED.value]
     assert len(terminal) == 1
     assert terminal[0]["detail"]["quota_kind"] == "aid_device_slot_quota_exceeded"
     assert terminal[0]["code"] == 4015

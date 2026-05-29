@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import secrets
+import ssl
 import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -19,6 +20,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from .crypto import CryptoProvider
+from .config import normalize_device_id, normalize_slot_id
 from .errors import AuthError, ConnectionError, StateError, ValidationError, IdentityConflictError, map_remote_error, AUNError
 from .keystore.file import FileKeyStore
 from .version import __version__ as _AUN_SDK_VERSION
@@ -28,6 +30,15 @@ _AUN_SDK_LANG = "python"
 if TYPE_CHECKING:
     from .logger import AUNLogger, NullLogger
     from .net import DnsResilientNet
+
+
+def _v2_only_capabilities() -> dict[str, Any]:
+    return {
+        "e2ee": True,
+        "group_e2ee": True,
+        "supported_p2p_e2ee": ["e2ee_v2"],
+        "supported_group_e2ee": ["group_e2ee_v2"],
+    }
 
 
 def _verify_signature(public_key: Any, sig_bytes: bytes, data_bytes: bytes) -> None:
@@ -71,8 +82,8 @@ class AuthFlow:
         self._keystore = keystore
         self._crypto = crypto
         self._aid = aid
-        self._device_id = str(device_id or "").strip()
-        self._slot_id = str(slot_id or "").strip()
+        self._device_id = self._normalize_device_id(device_id)
+        self._slot_id = normalize_slot_id(slot_id)
         self._connection_factory = connection_factory or self._default_connection_factory
         self._root_ca_path = root_ca_path
         self._verify_ssl = verify_ssl
@@ -113,9 +124,12 @@ class AuthFlow:
             return float(expires_at)
         return None
 
+    def _normalize_device_id(self, value: Any) -> str:
+        return normalize_device_id(value, getattr(self._keystore, "_root", None))
+
     def set_instance_context(self, *, device_id: str, slot_id: str = "") -> None:
-        self._device_id = str(device_id or "").strip()
-        self._slot_id = str(slot_id or "").strip()
+        self._device_id = self._normalize_device_id(device_id)
+        self._slot_id = normalize_slot_id(slot_id)
 
     async def register_aid(self, gateway_url: str, aid: str) -> dict[str, Any]:
         """严格注册新 AID（对齐 TS registerAid / Go RegisterAID）。
@@ -439,10 +453,15 @@ class AuthFlow:
         short_ttl_ms: int = 0,
         extra_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(challenge, dict):
+            self._log.warn("auth", "initialize_with_token: challenge is None or not a dict")
+            raise AuthError("gateway challenge is missing or invalid")
         nonce = challenge.get("params", {}).get("nonce", "")
         if not nonce:
             self._log.warn("auth", "challenge missing nonce, cannot initialize session")
             raise AuthError("gateway challenge missing nonce")
+        device_id = self._normalize_device_id(device_id)
+        slot_id = normalize_slot_id(slot_id)
         self._log.debug("auth", "initializing session with token: device_id=%s slot_id=%s kind=%s",
                         device_id, slot_id, connection_kind)
         self.set_instance_context(device_id=device_id, slot_id=slot_id)
@@ -477,6 +496,8 @@ class AuthFlow:
         if not nonce:
             self._log.warn("auth", "connect_session: challenge missing nonce")
             raise AuthError("gateway challenge missing nonce")
+        device_id = self._normalize_device_id(device_id)
+        slot_id = normalize_slot_id(slot_id)
         self._log.debug("auth", "connect_session enter: gateway=%s device_id=%s has_token=%s",
                         gateway_url, device_id, bool(access_token))
         self.set_instance_context(device_id=device_id, slot_id=slot_id)
@@ -613,28 +634,24 @@ class AuthFlow:
     ) -> dict[str, Any]:
         # The SDK lifecycle concept is "initialize(token)"; the gateway currently
         # serves it through its internal auth.connect entrypoint.
+        device_id = self._normalize_device_id(device_id)
+        slot_id = normalize_slot_id(slot_id)
         request = {
             "nonce": nonce,
             "auth": {"method": "kite_token", "token": token},
             "protocol": {"min": "1.0", "max": "1.0"},
-            "device": {"id": str(device_id or ""), "type": "sdk"},
+            "device": {"id": device_id, "type": "sdk"},
             "client": {
-                "slot_id": str(slot_id or ""),
+                "slot_id": slot_id,
                 "sdk_lang": _AUN_SDK_LANG,
                 "sdk_version": _AUN_SDK_VERSION,
             },
             "delivery_mode": delivery_mode or {"mode": "fanout"},
-            "capabilities": (extra_info or {}).get("_capabilities") or {
-                "e2ee": True,
-                "group_e2ee": True,
-                # AUN E2EE V2: 默认仅声明 V2 能力（V2-only 客户端）
-                "supported_p2p_e2ee": ["e2ee_v2"],
-                "supported_group_e2ee": ["group_e2ee_v2"],
-            },
+            "capabilities": _v2_only_capabilities(),
         }
         # extra_info：应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
         if extra_info:
-            # _capabilities 是内部覆盖字段，不透传到服务端
+            # V2-only SDK 不接受外部 capability 覆盖；下划线键也不透传给服务端。
             ei = {k: v for k, v in extra_info.items() if not k.startswith("_")}
             if ei:
                 request["extra_info"] = ei
@@ -713,7 +730,13 @@ class AuthFlow:
 
     async def _short_rpc(self, gateway_url: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
         _SHORT_RPC_TIMEOUT = 15.0  # 单次 recv 超时（秒）
-        ws = await self._connection_factory(gateway_url)
+        _CONNECT_TIMEOUT = 10.0  # WebSocket 连接超时（秒）
+        try:
+            ws = await asyncio.wait_for(self._connection_factory(gateway_url), timeout=_CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise ConnectionError(
+                f"gateway {gateway_url} WebSocket connect timeout ({_CONNECT_TIMEOUT}s)"
+            )
         try:
             # 握手帧接收
             try:
@@ -1417,7 +1440,17 @@ class AuthFlow:
         updater(aid, self._device_id, self._slot_id, _merge)
 
     async def _default_connection_factory(self, url: str):
-        return await websockets.connect(url, open_timeout=5, close_timeout=5, ping_interval=None)
+        kwargs: dict[str, Any] = {
+            "open_timeout": 5,
+            "close_timeout": 5,
+            "ping_interval": None,
+        }
+        if not self._verify_ssl and str(url).lower().startswith("wss://"):
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            kwargs["ssl"] = ssl_ctx
+        return await websockets.connect(url, **kwargs)
 
     def clean_expired_caches(self) -> None:
         """清理过期的 gateway 缓存条目（供外部定时调用）"""

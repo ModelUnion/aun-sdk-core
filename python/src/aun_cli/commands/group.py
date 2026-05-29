@@ -162,7 +162,6 @@ def group_current(ctx: typer.Context) -> None:
         "Profile": resolved["profile_name"],
         "Active Group": resolved.get("active_group") or "(not set)",
         "AID": resolved.get("aid") or "(not set)",
-        "Gateway": resolved.get("gateway") or "(not set)",
     }
 
     if is_json_mode():

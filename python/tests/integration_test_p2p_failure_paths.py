@@ -23,6 +23,8 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient, AuthError, RateLimitError
+from aun_core.v2.crypto.recipients import compute_recipients_digest, sort_recipients
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
 os.environ.setdefault("AUN_ENV", "development")
@@ -58,21 +60,14 @@ def _fail(name: str, reason: str):
 
 
 def _make_client() -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            await client.connect(auth)
-            return aid
+            return await ensure_connected_identity(client, aid, attempts=1)
         except (AuthError, RateLimitError) as exc:
             last_error = exc
             if attempt >= 3:
@@ -102,21 +97,48 @@ async def _current_max_seq(client: AUNClient, *, limit: int = 200) -> int:
 
 async def _raw_bad_encrypted_send(alice: AUNClient, to_aid: str, text: str) -> dict:
     message_id = f"bad-{uuid.uuid4().hex}"
-    envelope = await alice._build_v2_p2p_envelope(
-        to=to_aid,
-        payload={"type": "text", "text": text},
-        message_id=message_id,
-        timestamp=int(time.time() * 1000),
-        use_cache=False,
-    )
-    sig = bytearray(base64.b64decode(str(envelope.get("sender_signature") or "")))
-    if not sig:
-        raise AssertionError("构造坏密文失败: sender_signature 为空")
-    sig[0] ^= 0x01
-    envelope["sender_signature"] = base64.b64encode(bytes(sig)).decode("ascii")
-    return await alice._transport.call("message.send", {
+    timestamp = int(time.time() * 1000)
+    nonce_b64 = base64.b64encode(os.urandom(12)).decode("ascii")
+    tag_b64 = base64.b64encode(os.urandom(16)).decode("ascii")
+    ciphertext_b64 = base64.b64encode(f"tampered:{text}".encode("utf-8")).decode("ascii")
+    sender_signature_b64 = base64.b64encode(os.urandom(64)).decode("ascii")
+    sender_session_pk_b64 = base64.b64encode(os.urandom(91)).decode("ascii")
+    wrap_nonce_b64 = base64.b64encode(os.urandom(12)).decode("ascii")
+    wrapped_key_b64 = base64.b64encode(os.urandom(48)).decode("ascii")
+    fake_fingerprint = "sha256:" + "0" * 16
+    recipients = sort_recipients([
+        [to_aid, "", "peer", "aid_master", fake_fingerprint, "", wrap_nonce_b64, wrapped_key_b64]
+    ])
+    envelope = {
+        "type": "e2ee.p2p_encrypted",
+        "version": "v2",
+        "suite": "P256_HKDF_SHA256_AES_256_GCM",
+        "msg_type": "original",
+        "t_send": timestamp,
+        "nonce": nonce_b64,
+        "ciphertext": ciphertext_b64,
+        "tag": tag_b64,
+        "sender_signature": sender_signature_b64,
+        "sender_cert_fingerprint": fake_fingerprint,
+        "sender_session_pk": sender_session_pk_b64,
+        "recipients_digest": compute_recipients_digest(recipients),
+        "recipients": recipients,
+        "aad": {
+            "from": alice.aid,
+            "from_device": alice.device_id,
+            "to": to_aid,
+            "message_id": message_id,
+            "timestamp": timestamp,
+            "suite": "P256_HKDF_SHA256_AES_256_GCM",
+            "wrap_protocol": "1DH",
+        },
+        "payload_type": "text",
+        "test_hint": text,
+    }
+    return await alice.call("message.send", {
         "to": to_aid,
         "payload": envelope,
+        "encrypt": False,
     })
 
 
@@ -258,3 +280,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

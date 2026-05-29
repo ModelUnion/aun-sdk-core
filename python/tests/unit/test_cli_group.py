@@ -385,7 +385,7 @@ def test_rpc_summary_skips_background_transport_closed_during_shutdown(capsys):
     async def _run():
         session = object.__new__(CLISession)
         session._foreground_task = asyncio.current_task()
-        session._client = SimpleNamespace(_closing=True)
+        session._client = SimpleNamespace(is_closing=True)
 
         async def failing_rpc():
             raise ConnectionError("transport closed")

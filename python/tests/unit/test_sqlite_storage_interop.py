@@ -209,19 +209,37 @@ def _assert_payload(payload: dict) -> None:
 
 
 def _assert_db_sensitive_fields_encrypted(root: Path) -> None:
+    """验证数据库中 Python 写入的字段为明文（新策略：除 IK 外不加密），
+    TS/Go 写入的旧密文仍可被正确读取（兼容性由 _assert_payload 覆盖）。
+    """
     db_path = root / "AIDs" / AID / "aun.db"
     conn = sqlite3.connect(db_path)
-    values = []
-    values += [row[0] for row in conn.execute("SELECT private_key_enc FROM prekeys")]
-    values += [row[0] for row in conn.execute("SELECT secret_enc FROM group_current")]
-    values += [row[0] for row in conn.execute("SELECT data_enc FROM e2ee_sessions")]
-    joined = "\n".join(values)
-    for secret in list(EXPECTED.values()) + list(EXPECTED_GROUPS.values()) + list(EXPECTED_SESSIONS.values()):
-        assert secret not in joined
-    for value in values:
-        record = json.loads(value)
-        assert record["scheme"] == "file_aes"
-        assert record.get("nonce") and record.get("ciphertext") and record.get("tag")
+    # Python 写入的 prekey 应为明文
+    py_prekey_rows = conn.execute(
+        "SELECT private_key_enc FROM prekeys WHERE prekey_id = 'py-prekey'"
+    ).fetchall()
+    if py_prekey_rows:
+        value = py_prekey_rows[0][0]
+        # 明文：不是 JSON 或不含 scheme
+        try:
+            record = json.loads(value)
+            assert record.get("scheme") != "file_aes", \
+                "Python prekey should be plaintext under new policy"
+        except (json.JSONDecodeError, TypeError):
+            pass  # 明文，符合预期
+    # Python 写入的 group secret 应为明文
+    py_group_rows = conn.execute(
+        "SELECT secret_enc FROM group_current WHERE group_id = 'py-group'"
+    ).fetchall()
+    if py_group_rows:
+        value = py_group_rows[0][0]
+        try:
+            record = json.loads(value)
+            assert record.get("scheme") != "file_aes", \
+                "Python group secret should be plaintext under new policy"
+        except (json.JSONDecodeError, TypeError):
+            pass  # 明文，符合预期
+    conn.close()
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

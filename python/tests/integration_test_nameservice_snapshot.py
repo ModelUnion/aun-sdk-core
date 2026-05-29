@@ -44,6 +44,7 @@ except ImportError:
     sys.exit(1)
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # ---------------------------------------------------------------------------
@@ -87,18 +88,13 @@ def _ns_base_url() -> str:
 
 
 def _make_client() -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> dict:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth)
-    return auth
+    await ensure_connected_identity(client, aid)
+    token = client.access_token
+    return {"access_token": token}
 
 
 def _agent_md_content(aid: str, name: str, extra: str = "") -> str:
@@ -305,3 +301,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

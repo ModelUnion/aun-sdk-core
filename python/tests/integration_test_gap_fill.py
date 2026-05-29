@@ -19,6 +19,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -27,7 +28,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -48,6 +50,7 @@ _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.p
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 _CHARLIE_AID = os.environ.get("AUN_TEST_CHARLIE_AID", f"charlie.{_ISSUER}").strip()
+_CLIENT_SLOT_IDS: WeakKeyDictionary[AUNClient, str] = WeakKeyDictionary()
 
 # ---------------------------------------------------------------------------
 # 计数
@@ -80,24 +83,17 @@ def _build_test_slot_id(tag: str) -> str:
 
 
 def _make_client(tag: str = "client") -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    client._test_slot_id = _build_test_slot_id(tag)
+    client = make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
+    _CLIENT_SLOT_IDS[client] = _build_test_slot_id(tag)
     return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    connect_params = dict(auth)
-    slot_id = str(getattr(client, "_test_slot_id", "") or "")
+    connect_params: dict = {"auto_reconnect": False}
+    slot_id = str(_CLIENT_SLOT_IDS.get(client, "") or "")
     if slot_id:
         connect_params["slot_id"] = slot_id
-    connect_params["auto_reconnect"] = False
-    await client.connect(connect_params)
-    return aid
+    return await ensure_connected_identity(client, aid, connect_options=connect_params)
 
 
 def _seq_of(msg: dict) -> int:
@@ -320,8 +316,8 @@ async def test_group_payload_gap_fill():
         # 3. 等待服务端处理
         await asyncio.sleep(2.0)
 
-        # 4. Bob 强拉当前可拉范围内的群消息（直接用 transport 绕过 E2EE 过滤）
-        all_group_msgs = await bob._transport.call("group.pull", {
+        # 4. Bob 强拉当前可拉范围内的群消息
+        all_group_msgs = await bob.call("group.pull", {
             "group_id": group_id,
             "after_seq": 0,
             "limit": 50,
@@ -383,3 +379,4 @@ async def main():
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
+

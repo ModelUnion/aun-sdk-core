@@ -30,6 +30,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -50,11 +51,9 @@ _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.p
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 
-_GATEWAY = os.environ.get("AUN_TEST_GATEWAY", "").strip()
-
 print(f"[TEST] 配置:")
 print(f"  AUN_PATH: {_TEST_AUN_PATH}")
-print(f"  GATEWAY: {_GATEWAY or '(auto discovery)'}")
+print("  GATEWAY: (auto discovery)")
 print(f"  ALICE: {_ALICE_AID}")
 print(f"  BOB: {_BOB_AID}")
 print()
@@ -65,27 +64,12 @@ print()
 # ---------------------------------------------------------------------------
 
 async def _ensure_connected(client: AUNClient, aid: str) -> None:
-    """按当前 SDK 语义认证并连接；显式 AUN_TEST_GATEWAY 仅作为覆盖项。"""
-    if _GATEWAY:
-        client._gateway_url = _GATEWAY
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        try:
-            await client.auth.register_aid({"aid": aid})
-        except Exception as exc:
-            print(f"  [connect] register_aid skipped: aid={aid} err={exc}")
-
+    """按当前 SDK 语义认证并连接；Gateway 必须通过发现机制解析。"""
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            if _GATEWAY:
-                client._gateway_url = _GATEWAY
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            if _GATEWAY:
-                connect_params["gateway"] = _GATEWAY
-            connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
+            connect_params = {"auto_reconnect": False}
+            await ensure_connected_identity(client, aid, connect_options=connect_params, attempts=1)
             return
         except Exception as exc:
             last_error = exc
@@ -101,8 +85,8 @@ async def test_v2_push_seq():
     print("测试：V2 推送通知 seq 字段验证")
     print("=" * 80)
 
-    alice = AUNClient({"aun_path": _TEST_AUN_PATH, "aid": _ALICE_AID, "debug": True})
-    bob = AUNClient({"aun_path": _TEST_AUN_PATH, "aid": _BOB_AID, "debug": True})
+    alice = make_client_for_path(_TEST_AUN_PATH, debug=True)
+    bob = make_client_for_path(_TEST_AUN_PATH, debug=True)
 
     # 记录 Bob 收到的推送通知
     push_notifications = []
@@ -228,7 +212,7 @@ async def test_v2_push_seq_recovery():
     print("测试：推送 seq 修复异常 contiguous_seq")
     print("=" * 80)
 
-    bob = AUNClient({"aun_path": _TEST_AUN_PATH, "aid": _BOB_AID, "debug": True})
+    bob = make_client_for_path(_TEST_AUN_PATH, debug=True)
 
     try:
         # 1. 连接
@@ -245,7 +229,7 @@ async def test_v2_push_seq_recovery():
 
         # 3. 发送一条消息触发推送
         print("\n[3] 发送消息触发推送...")
-        alice = AUNClient({"aun_path": _TEST_AUN_PATH, "aid": _ALICE_AID, "debug": True})
+        alice = make_client_for_path(_TEST_AUN_PATH, debug=True)
         await _ensure_connected(alice, _ALICE_AID)
 
         result = await alice.call("message.send", {
@@ -315,3 +299,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

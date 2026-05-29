@@ -103,16 +103,18 @@ class V2Session:
         return "sha256:" + hashlib.sha256(self._ik_pub_der).hexdigest()[:16]
 
     async def ensure_registered(self, call_fn) -> None:
-        """注册本设备 SPK 到服务端。已有本地上传成功标记时只恢复状态。"""
+        """注册本设备 SPK 到服务端。
+
+        本地上传标记只用于恢复 last_uploaded 状态；连接建立后仍幂等重传当前 SPK，
+        以修复服务端设备表丢失、隔离测试目录复制、或远端状态回滚导致的陈旧状态。
+        """
         if self._registered:
             return
         self.ensure_keys()
 
         uploaded_spk_id = self._store.load_latest_uploaded_spk_id(self._device_id)
         if uploaded_spk_id:
-            self._registered = True
             self._last_uploaded_spk_id = uploaded_spk_id
-            return
 
         # SPK 由 AID 私钥（IK）签名背书
         spk_timestamp = int(time.time())

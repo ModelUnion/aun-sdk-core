@@ -24,7 +24,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient, AuthError, RateLimitError
+
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
 os.environ.setdefault("AUN_ENV", "development")
@@ -60,27 +61,11 @@ def _fail(name: str, reason: str):
 
 
 def _make_client() -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    last_error: Exception | None = None
-    for attempt in range(4):
-        try:
-            auth = await client.auth.authenticate({"aid": aid})
-            await client.connect(auth)
-            return aid
-        except (AuthError, RateLimitError) as exc:
-            last_error = exc
-            if attempt >= 3:
-                break
-            await asyncio.sleep(1.5 * (attempt + 1))
-    raise last_error or RuntimeError(f"{aid} connect failed")
+    return await ensure_connected_identity(client, aid)
 
 
 async def _create_group_with_bobb(alice: AUNClient, name: str) -> str:
@@ -140,7 +125,7 @@ async def test_message_cursor_ack_and_device_slots():
         await asyncio.sleep(0.8)
         _ok("发送 3 条明文群消息")
 
-        first = await bobb._transport.call("group.pull", {
+        first = await bobb.call("group.pull", {
             "group_id": group_id,
             "after_message_seq": 0,
             "limit": 2,
@@ -160,7 +145,7 @@ async def test_message_cursor_ack_and_device_slots():
         _ok("group.pull 分页与 cursor 正确")
 
         ack_seq = msg_seqs[-1]
-        ack = await bobb._transport.call("group.ack_messages", {
+        ack = await bobb.call("group.ack_messages", {
             "group_id": group_id,
             "msg_seq": ack_seq,
             "device_id": device_a,
@@ -170,7 +155,7 @@ async def test_message_cursor_ack_and_device_slots():
             raise AssertionError(f"ack_messages 未推进到 {ack_seq}: {ack}")
         _ok("ack_messages 推进游标")
 
-        lower_ack = await bobb._transport.call("group.ack_messages", {
+        lower_ack = await bobb.call("group.ack_messages", {
             "group_id": group_id,
             "msg_seq": msg_seqs[0],
             "device_id": device_a,
@@ -180,7 +165,7 @@ async def test_message_cursor_ack_and_device_slots():
             raise AssertionError(f"ack_messages 不应回退: {lower_ack}")
         _ok("ack_messages 单调不回退")
 
-        cursor = await bobb._transport.call("group.get_cursor", {
+        cursor = await bobb.call("group.get_cursor", {
             "group_id": group_id,
             "device_id": device_a,
             "slot_id": slot_a,
@@ -189,7 +174,7 @@ async def test_message_cursor_ack_and_device_slots():
             raise AssertionError(f"get_cursor current_seq 异常: {cursor}")
         _ok("get_cursor 反映消息 ack")
 
-        rest = await bobb._transport.call("group.pull", {
+        rest = await bobb.call("group.pull", {
             "group_id": group_id,
             "after_message_seq": ack_seq,
             "limit": 10,
@@ -200,7 +185,7 @@ async def test_message_cursor_ack_and_device_slots():
             raise AssertionError(f"ack 后应只剩 1 条未拉消息: {rest}")
         _ok("ack 后增量 pull 正确")
 
-        await bobb._transport.call("group.pull", {
+        await bobb.call("group.pull", {
             "group_id": group_id,
             "after_message_seq": 0,
             "limit": 1,
@@ -209,7 +194,7 @@ async def test_message_cursor_ack_and_device_slots():
             "device_name": "同步测试设备 B",
             "device_type": "test",
         })
-        devices = await bobb._transport.call("group.list_devices", {"group_id": group_id})
+        devices = await bobb.call("group.list_devices", {"group_id": group_id})
         device_keys = {
             (item.get("device_id"), item.get("slot_id"))
             for item in devices.get("devices", [])
@@ -218,12 +203,12 @@ async def test_message_cursor_ack_and_device_slots():
             raise AssertionError(f"list_devices 未体现两个 slot: {devices}")
         _ok("多 device_id/slot_id 游标隔离")
 
-        await bobb._transport.call("group.unregister_device", {
+        await bobb.call("group.unregister_device", {
             "group_id": group_id,
             "device_id": device_b,
             "slot_id": slot_b,
         })
-        after_unregister = await bobb._transport.call("group.list_devices", {"group_id": group_id})
+        after_unregister = await bobb.call("group.list_devices", {"group_id": group_id})
         remaining = {
             (item.get("device_id"), item.get("slot_id"))
             for item in after_unregister.get("devices", [])
@@ -233,7 +218,7 @@ async def test_message_cursor_ack_and_device_slots():
         _ok("unregister_device 删除指定 slot")
 
         latest = int((cursor.get("msg_cursor") or {}).get("latest_seq") or 0)
-        future_ack = await bobb._transport.call("group.ack_messages", {
+        future_ack = await bobb.call("group.ack_messages", {
             "group_id": group_id,
             "msg_seq": latest + 100,
             "device_id": device_a,
@@ -270,7 +255,7 @@ async def test_event_cursor_ack_and_future_guard():
         await asyncio.sleep(0.8)
         _ok("产生 group.changed 与 message_created 事件")
 
-        pulled = await bobb._transport.call("group.pull_events", {
+        pulled = await bobb.call("group.pull_events", {
             "group_id": group_id,
             "after_event_seq": 0,
             "limit": 20,
@@ -292,7 +277,7 @@ async def test_event_cursor_ack_and_future_guard():
         _ok("group.pull_events 返回增量事件")
 
         ack_event_seq = max(event_seqs)
-        ack = await bobb._transport.call("group.ack_events", {
+        ack = await bobb.call("group.ack_events", {
             "group_id": group_id,
             "event_seq": ack_event_seq,
             "device_id": device,
@@ -302,7 +287,7 @@ async def test_event_cursor_ack_and_future_guard():
             raise AssertionError(f"ack_events 未推进: {ack}")
         _ok("ack_events 推进游标")
 
-        lower = await bobb._transport.call("group.ack_events", {
+        lower = await bobb.call("group.ack_events", {
             "group_id": group_id,
             "event_seq": min(event_seqs),
             "device_id": device,
@@ -312,7 +297,7 @@ async def test_event_cursor_ack_and_future_guard():
             raise AssertionError(f"ack_events 不应回退: {lower}")
         _ok("ack_events 单调不回退")
 
-        cursor = await bobb._transport.call("group.get_cursor", {
+        cursor = await bobb.call("group.get_cursor", {
             "group_id": group_id,
             "device_id": device,
             "slot_id": slot,
@@ -323,7 +308,7 @@ async def test_event_cursor_ack_and_future_guard():
         _ok("get_cursor 反映事件 ack")
 
         latest_event_seq = int(event_cursor.get("latest_seq") or 0)
-        future_ack = await bobb._transport.call("group.ack_events", {
+        future_ack = await bobb.call("group.ack_events", {
             "group_id": group_id,
             "event_seq": latest_event_seq + 100,
             "device_id": device,
@@ -372,3 +357,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

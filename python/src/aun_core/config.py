@@ -11,6 +11,7 @@ from typing import Any
 
 _INSTANCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _DEV_ENV_VALUES = {"development", "dev", "local"}
+DEFAULT_SLOT_ID = "default"
 
 
 def _coalesce(data: dict[str, Any], *keys: str) -> Any:
@@ -41,6 +42,18 @@ def normalize_instance_id(value: Any, field: str, *, allow_empty: bool = False) 
     if not _INSTANCE_ID_PATTERN.fullmatch(text):
         raise ValueError(f"{field} contains unsupported characters")
     return text
+
+
+def normalize_device_id(value: Any, aun_root: Path | str | None = None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return get_device_id(aun_root)
+    return normalize_instance_id(text, "device_id")
+
+
+def normalize_slot_id(value: Any) -> str:
+    text = str(value or "").strip() or DEFAULT_SLOT_ID
+    return normalize_instance_id(text, "slot_id")
 
 
 def get_device_id(aun_root: Path | str | None = None) -> str:

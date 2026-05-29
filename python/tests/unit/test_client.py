@@ -6,11 +6,10 @@ import time
 
 import pytest
 
-from aun_core import AUNClient, ProtectedHeaders
+from aun_core import AIDStore, AUNClient, ConnectionState, ProtectedHeaders
 import aun_core.client as client_module
 from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL, _PEER_PREKEYS_CACHE_TTL
-from aun_core.errors import AUNError, ClientSignatureError, NotFoundError, StateError, ValidationError
-import aun_core.namespaces.auth_namespace as auth_namespace_module
+from aun_core.errors import AUNError, ClientSignatureError, StateError, ValidationError
 
 
 def _make_test_cert(cn: str) -> tuple[str, str]:
@@ -36,6 +35,57 @@ def _make_test_cert(cn: str) -> tuple[str, str]:
     cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
     cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
     return cert_pem, cert_fp
+
+
+def _make_identity(aid: str) -> dict[str, str]:
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, aid)])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=365))
+        .sign(key, hashes.SHA256())
+    )
+    return {
+        "aid": aid,
+        "private_key_pem": key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8"),
+        "public_key_der_b64": base64.b64encode(
+            key.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).decode("ascii"),
+        "curve": "P-256",
+        "cert": cert.public_bytes(serialization.Encoding.PEM).decode("utf-8"),
+    }
+
+
+def _make_client_with_aid(aun_path, aid: str = "alice.agentid.pub", *, debug: bool = False) -> AUNClient:
+    store = AIDStore(aun_path, encryption_seed="", verify_ssl=False)
+    try:
+        store._keystore.save_identity(aid, _make_identity(aid))
+        loaded = store.load(aid)
+        assert loaded.ok, loaded.error
+        assert loaded.data is not None
+        return AUNClient(loaded.data["aid"], debug=debug)
+    finally:
+        store.close()
 
 
 def test_peer_cert_cache_ttl_is_one_hour():
@@ -75,6 +125,37 @@ async def test_v2_build_target_allows_explicit_empty_device_id():
     assert target["aid"] == "bob.aid.com"
     assert target["device_id"] == ""
     assert fake_session.cached == [("bob.aid.com", "", ik_der)]
+
+
+@pytest.mark.asyncio
+async def test_v2_build_target_loads_missing_ik_from_peer_cert(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    class FakeV2Session:
+        def __init__(self):
+            self.cached = []
+
+        def cache_peer_ik(self, aid, device_id, pub_der):
+            self.cached.append((aid, device_id, pub_der))
+
+    client = AUNClient()
+    fake_session = FakeV2Session()
+    client._v2_session = fake_session
+    client._v2_verify_spk_device = AsyncMock()
+    ik_der = b"\x04\x05\x06"
+    monkeypatch.setattr(client, "_v2_trusted_ik_pub_der", AsyncMock(return_value=ik_der))
+
+    target = await client._v2_build_target_from_device(
+        {"device_id": "bob-phone", "spk_id": "", "spk_pk": ""},
+        aid="bob.aid.com",
+        device_id="bob-phone",
+        role="peer",
+        default_key_source="peer_device_prekey",
+    )
+
+    assert target is not None
+    assert target["ik_pk_der"] == ik_der
+    assert fake_session.cached == [("bob.aid.com", "bob-phone", ik_der)]
 
 
 def test_v2_bootstrap_sender_ik_cache_allows_explicit_empty_device_id():
@@ -181,28 +262,32 @@ async def test_v2_auto_propose_leader_delay_treats_empty_device_id_as_candidate(
 def test_construct_no_args():
     client = AUNClient()
     assert client.aid is None
-    assert client.state == "idle"
-    assert hasattr(client, "auth")
+    assert client.state == ConnectionState.NO_IDENTITY
+    assert not hasattr(client, "auth")
+    assert not hasattr(client, "meta")
+    assert not hasattr(client, "custody")
     assert not hasattr(client, "message")
     assert not hasattr(client, "group")
     assert not hasattr(client, "storage")
 
 
-def test_construct_with_aun_path(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "test")})
-    assert client.state == "idle"
+def test_construct_with_aid(tmp_path):
+    client = _make_client_with_aid(tmp_path / "test")
+    assert client.state == ConnectionState.STANDBY
+    assert client.current_aid is not None
+    assert client.current_aid.aun_path == str(tmp_path / "test")
 
 
 def test_construct_default_sqlite_backup_uses_aun_path(tmp_path):
     """SQLCipher 迁移后不再使用 SQLiteBackup，改为验证 keystore 使用正确的 aun_path。"""
     root = tmp_path / "aun"
-    client = AUNClient({"aun_path": str(root)})
+    client = _make_client_with_aid(root)
     assert client._keystore._root == root
 
 
-def test_connect_requires_access_token():
+def test_connect_rejects_external_gateway_option():
     client = AUNClient()
-    with pytest.raises(StateError, match="access_token"):
+    with pytest.raises(ValidationError, match="gateway.*discovery"):
         asyncio.run(
             client.connect({"gateway": "ws://localhost/aun"})
         )
@@ -216,9 +301,10 @@ def test_connect_requires_gateway():
         )
 
 
-def test_connect_uses_cached_gateway():
+def test_connect_uses_discovered_gateway_from_session():
     client = AUNClient()
-    client._gateway_url = "ws://cached.example/aun"
+    # 模拟 SDK 内部 discovery/authenticate 已写入的会话参数；测试不从外部注入 gateway。
+    client._session_params = {"gateway": "ws://cached.example/aun"}
 
     normalized = client._normalize_connect_params({"access_token": "tok"})
     assert normalized["gateway"] == "ws://cached.example/aun"
@@ -309,7 +395,7 @@ async def test_group_peer_prekey_fallback_does_not_rotate_p2p_spk(tmp_path, monk
         lambda **_kwargs: {"text": "group fallback"},
     )
 
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = _make_client_with_aid(tmp_path / "aun")
     fake_session = FakeV2Session()
     client._aid = "alice.agentid.pub"
     client._device_id = "dev-1"
@@ -404,7 +490,7 @@ async def test_decrypt_v2_message_exposes_payload_type_in_e2ee(tmp_path, monkeyp
         lambda **_kwargs: {"type": "text", "text": "decrypted"},
     )
 
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = _make_client_with_aid(tmp_path / "aun")
     client._aid = "alice.agentid.pub"
     client._device_id = "dev-1"
     client._v2_session = FakeV2Session()
@@ -444,7 +530,7 @@ async def test_decrypt_v2_message_undecryptable_event_preserves_metadata(tmp_pat
             assert spk_id == "missing-spk"
             raise RuntimeError("spk missing")
 
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = _make_client_with_aid(tmp_path / "aun")
     client._aid = "alice.agentid.pub"
     client._device_id = "dev-1"
     client._v2_session = FakeV2Session()
@@ -547,9 +633,7 @@ async def test_apply_server_heartbeat_interval_writes_back():
 
 
 def test_normalize_connect_params_includes_slot_and_delivery_mode(tmp_path):
-    client = AUNClient({
-        "aun_path": str(tmp_path / "aun"),
-    })
+    client = _make_client_with_aid(tmp_path / "aun")
 
     normalized = client._normalize_connect_params({
         "access_token": "tok",
@@ -569,8 +653,8 @@ def test_normalize_connect_params_includes_slot_and_delivery_mode(tmp_path):
     }
 
 
-def test_register_aid_caches_discovered_gateway(monkeypatch):
-    client = AUNClient()
+def test_aid_store_register_caches_discovered_gateway(monkeypatch, tmp_path):
+    store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
 
     async def fake_discover(url: str) -> str:
         assert url == "https://gateway.agentid.pub/.well-known/aun-gateway"
@@ -581,23 +665,22 @@ def test_register_aid_caches_discovered_gateway(monkeypatch):
         assert aid == "demo.agentid.pub"
         return {"aid": aid, "cert": "CERT"}
 
-    monkeypatch.setattr(client._discovery, "discover", fake_discover)
-    monkeypatch.setattr(client._auth, "register_aid", fake_register_aid)
-    monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: None)
+    monkeypatch.setattr(store._discovery, "discover", fake_discover)
+    monkeypatch.setattr(store._auth, "register_aid", fake_register_aid)
 
-    result = asyncio.run(
-        client.auth.register_aid({"aid": "demo.agentid.pub"})
-    )
+    result = asyncio.run(store.register("demo.agentid.pub"))
 
-    assert result["gateway"] == "ws://gateway.example/aun"
-    assert client._gateway_url == "ws://gateway.example/aun"
+    assert result.ok, result.error
+    assert result.data == {"registered": True}
+    assert store._gateway_cache["agentid.pub"] == "ws://gateway.example/aun"
+    store.close()
 
 
-def test_authenticate_caches_discovered_gateway(monkeypatch):
-    client = AUNClient()
+def test_authenticate_caches_discovered_gateway(monkeypatch, tmp_path):
+    client = _make_client_with_aid(tmp_path / "aun", aid="demo.agentid.pub")
 
-    async def fake_discover(url: str) -> str:
-        assert url == "https://gateway.agentid.pub/.well-known/aun-gateway"
+    async def fake_resolve(aid: str) -> str:
+        assert aid == "demo.agentid.pub"
         return "ws://gateway.example/aun"
 
     async def fake_authenticate(gateway_url: str, *, aid=None) -> dict:
@@ -611,46 +694,42 @@ def test_authenticate_caches_discovered_gateway(monkeypatch):
             "gateway": gateway_url,
         }
 
-    monkeypatch.setattr(client._discovery, "discover", fake_discover)
+    monkeypatch.setattr(client, "_discover_gateway_for_aid", fake_resolve)
     monkeypatch.setattr(client._auth, "authenticate", fake_authenticate)
     monkeypatch.setattr(client._auth, "load_identity_or_none", lambda aid=None: None)
 
-    result = asyncio.run(
-        client.auth.authenticate({"aid": "demo.agentid.pub"})
-    )
+    result = asyncio.run(client.authenticate())
 
     assert result["gateway"] == "ws://gateway.example/aun"
-    assert client._gateway_url == "ws://gateway.example/aun"
+    assert client.gateway_url == "ws://gateway.example/aun"
 
 
-def test_register_aid_requires_aid_when_gateway_missing():
+def test_aid_store_register_requires_valid_aid(tmp_path):
+    store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
+
+    result = asyncio.run(store.register(""))
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "INVALID_AID_FORMAT"
+    store.close()
+
+
+def test_authenticate_requires_loaded_identity():
     client = AUNClient()
 
-    with pytest.raises(Exception, match="auth.register_aid requires 'aid'"):
-        asyncio.run(client.auth.register_aid({}))
-
-
-def test_authenticate_requires_aid_when_gateway_missing():
-    client = AUNClient()
-
-    with pytest.raises(Exception, match="unable to resolve gateway"):
-        asyncio.run(client.auth.authenticate({}))
+    with pytest.raises(StateError, match="no_identity"):
+        asyncio.run(client.authenticate())
 
 
 def test_upload_agent_md_uses_cached_access_token(monkeypatch):
     client = AUNClient()
     client._aid = "alice.agentid.pub"
-    client._gateway_url = "ws://gateway.agentid.pub/aun"
+    client._identity = {"aid": "alice.agentid.pub", "access_token": "cached-token"}
 
-    monkeypatch.setattr(
-        client._auth,
-        "load_identity_or_none",
-        lambda aid=None: {
-            "aid": "alice.agentid.pub",
-            "access_token": "cached-token",
-            "access_token_expires_at": time.time() + 3600,
-        },
-    )
+    async def _fake_discover(aid: str) -> str:
+        assert aid == "alice.agentid.pub"
+        return "ws://gateway.agentid.pub/aun"
 
     class _FakeResponse:
         status = 201
@@ -677,40 +756,35 @@ def test_upload_agent_md_uses_cached_access_token(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        def put(self, url, *, data=None, headers=None):
+        def put(self, url, *, data=None, headers=None, ssl=None):
             assert url == "http://alice.agentid.pub/agent.md"
             assert data == b"# Alice\n"
             assert headers["Authorization"] == "Bearer cached-token"
             assert headers["Content-Type"] == "text/markdown; charset=utf-8"
             return _FakeResponse()
 
-    monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
+    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
 
-    result = asyncio.run(client.auth.upload_agent_md("# Alice\n"))
+    result = asyncio.run(client.upload_agent_md("# Alice\n"))
 
     assert result["aid"] == "alice.agentid.pub"
 
 
-def test_upload_agent_md_falls_back_to_authenticate(monkeypatch):
-    client = AUNClient()
-    client._aid = "alice.agentid.pub"
-    client._gateway_url = "ws://gateway.agentid.pub/aun"
+def test_upload_agent_md_falls_back_to_authenticate(monkeypatch, tmp_path):
+    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
 
-    monkeypatch.setattr(
-        client._auth,
-        "load_identity_or_none",
-        lambda aid=None: {"aid": "alice.agentid.pub"},
-    )
+    async def _fake_discover(aid: str) -> str:
+        assert aid == "alice.agentid.pub"
+        return "ws://gateway.agentid.pub/aun"
 
     async def _fake_authenticate(params=None):
-        assert params == {"aid": "alice.agentid.pub"}
+        assert params is None
         return {
             "aid": "alice.agentid.pub",
             "access_token": "fresh-token",
             "gateway": "ws://gateway.agentid.pub/aun",
         }
-
-    monkeypatch.setattr(client.auth, "authenticate", _fake_authenticate)
 
     class _FakeResponse:
         status = 200
@@ -737,47 +811,28 @@ def test_upload_agent_md_falls_back_to_authenticate(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        def put(self, url, *, data=None, headers=None):
+        def put(self, url, *, data=None, headers=None, ssl=None):
             assert url == "http://alice.agentid.pub/agent.md"
             assert headers["Authorization"] == "Bearer fresh-token"
             return _FakeResponse()
 
-    monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
+    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
+    monkeypatch.setattr(client, "authenticate", _fake_authenticate)
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
 
-    result = asyncio.run(client.auth.upload_agent_md("# Alice\n"))
+    result = asyncio.run(client.upload_agent_md("# Alice\n"))
 
     assert result["etag"] == '"etag-2"'
 
 
-def test_upload_agent_md_refresh_failure_logs_and_falls_back_to_authenticate(monkeypatch):
+def test_upload_agent_md_uses_session_params_access_token(monkeypatch):
     client = AUNClient()
     client._aid = "alice.agentid.pub"
-    client._gateway_url = "ws://gateway.agentid.pub/aun"
+    client._session_params = {"access_token": "session-token"}
 
-    monkeypatch.setattr(
-        client._auth,
-        "load_identity_or_none",
-        lambda aid=None: {
-            "aid": "alice.agentid.pub",
-            "refresh_token": "stale-refresh-token",
-        },
-    )
-
-    async def _fake_refresh(gateway_url, identity):
-        assert gateway_url == "ws://gateway.agentid.pub/aun"
-        assert identity["refresh_token"] == "stale-refresh-token"
-        raise RuntimeError("refresh boom")
-
-    async def _fake_authenticate(params=None):
-        assert params == {"aid": "alice.agentid.pub"}
-        return {
-            "aid": "alice.agentid.pub",
-            "access_token": "fresh-token",
-            "gateway": "ws://gateway.agentid.pub/aun",
-        }
-
-    monkeypatch.setattr(client._auth, "refresh_cached_tokens", _fake_refresh)
-    monkeypatch.setattr(client.auth, "authenticate", _fake_authenticate)
+    async def _fake_discover(aid: str) -> str:
+        assert aid == "alice.agentid.pub"
+        return "ws://gateway.agentid.pub/aun"
 
     class _FakeResponse:
         status = 200
@@ -804,39 +859,29 @@ def test_upload_agent_md_refresh_failure_logs_and_falls_back_to_authenticate(mon
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        def put(self, url, *, data=None, headers=None):
+        def put(self, url, *, data=None, headers=None, ssl=None):
             assert url == "http://alice.agentid.pub/agent.md"
             assert data == b"# Alice\n"
-            assert headers["Authorization"] == "Bearer fresh-token"
+            assert headers["Authorization"] == "Bearer session-token"
             return _FakeResponse()
 
-    monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
+    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
 
-    from unittest.mock import MagicMock
-    mock_log = MagicMock()
-    monkeypatch.setattr(client, "_log", mock_log)
-
-    result = asyncio.run(client.auth.upload_agent_md("# Alice\n"))
+    result = asyncio.run(client.upload_agent_md("# Alice\n"))
 
     assert result["etag"] == '"etag-3"'
-    debug_calls = [str(c) for c in mock_log.debug.call_args_list]
-    assert any("agent.md upload refresh_token 失败" in c for c in debug_calls)
 
 
 def test_upload_agent_md_403_raises_aunerror(monkeypatch):
     client = AUNClient()
     client._aid = "alice.agentid.pub"
-    client._gateway_url = "ws://gateway.agentid.pub/aun"
 
-    monkeypatch.setattr(
-        client._auth,
-        "load_identity_or_none",
-        lambda aid=None: {
-            "aid": "alice.agentid.pub",
-            "access_token": "cached-token",
-            "access_token_expires_at": time.time() + 3600,
-        },
-    )
+    client._identity = {"aid": "alice.agentid.pub", "access_token": "cached-token"}
+
+    async def _fake_discover(aid: str) -> str:
+        assert aid == "alice.agentid.pub"
+        return "ws://gateway.agentid.pub/aun"
 
     class _FakeResponse:
         status = 403
@@ -863,93 +908,16 @@ def test_upload_agent_md_403_raises_aunerror(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        def put(self, url, *, data=None, headers=None):
+        def put(self, url, *, data=None, headers=None, ssl=None):
             assert url == "http://alice.agentid.pub/agent.md"
             assert headers["Authorization"] == "Bearer cached-token"
             return _FakeResponse()
 
-    monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
+    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
 
     with pytest.raises(AUNError, match="upload agent.md failed: HTTP 403 - forbidden"):
-        asyncio.run(client.auth.upload_agent_md("# Alice\n"))
-
-
-def test_download_agent_md_is_anonymous(monkeypatch):
-    client = AUNClient()
-    client._config_model.discovery_port = 18443
-    client._gateway_url = "wss://gateway.agentid.pub/aun"
-
-    class _FakeResponse:
-        status = 200
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def text(self):
-            return "# Bob\n"
-
-    class _FakeSession:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        def get(self, url, *, headers=None, allow_redirects=None):
-            assert url == "https://bob.agentid.pub:18443/agent.md"
-            assert headers == {"Accept": "text/markdown"}
-            assert allow_redirects is True
-            return _FakeResponse()
-
-    monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
-
-    result = asyncio.run(client.auth.download_agent_md("bob.agentid.pub"))
-
-    assert result == "# Bob\n"
-
-
-def test_download_agent_md_404_raises_not_found(monkeypatch):
-    client = AUNClient()
-    client._gateway_url = "wss://gateway.agentid.pub/aun"
-
-    class _FakeResponse:
-        status = 404
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def text(self):
-            return "not found"
-
-    class _FakeSession:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        def get(self, url, *, headers=None, allow_redirects=None):
-            assert url == "https://bob.agentid.pub/agent.md"
-            assert headers == {"Accept": "text/markdown"}
-            assert allow_redirects is True
-            return _FakeResponse()
-
-    monkeypatch.setattr(auth_namespace_module.aiohttp, "ClientSession", _FakeSession)
-
-    with pytest.raises(NotFoundError, match="agent.md not found for aid: bob.agentid.pub"):
-        asyncio.run(client.auth.download_agent_md("bob.agentid.pub"))
+        asyncio.run(client.upload_agent_md("# Alice\n"))
 
 
 def test_call_not_connected():
@@ -981,7 +949,7 @@ def test_e2ee_property():
 
 
 def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = _make_client_with_aid(tmp_path / "aun")
     aid = "demo.agentid.pub"
 
     client._keystore.save_identity(aid, {
@@ -999,7 +967,7 @@ def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
     client._sync_identity_after_connect("tok-connect")
 
     loaded = client._keystore.load_identity(aid)
-    slot_state = client._keystore.load_instance_state(aid, client._device_id, "")
+    slot_state = client._keystore.load_instance_state(aid, client.device_id, client.slot_id)
     assert "access_token" not in loaded
     assert slot_state["access_token"] == "tok-connect"
     prekeys = client._keystore.load_e2ee_prekeys(aid, device_id=client._device_id)
@@ -2687,6 +2655,79 @@ async def test_v2_group_notification_push_equal_contiguous_is_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_v2_group_online_unread_hint_skipped_when_background_sync_disabled():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._session_options["background_sync"] = False
+    client._persist_seq = lambda ns: None
+    group_id = "group.agentid.pub/history"
+    ns = f"group:{group_id}"
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._pull_group_v2_internal = fake_pull
+
+    await client._on_raw_group_v2_message_created({
+        "group_id": group_id,
+        "seq": 99,
+        "kind": "group.online_unread_hint",
+    })
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert pull_calls == []
+    assert client._seq_tracker.get_contiguous_seq(ns) == 0
+    assert client._seq_tracker.get_max_seen_seq(ns) == 0
+
+
+@pytest.mark.asyncio
+async def test_v2_group_online_unread_hint_is_low_priority_when_background_sync_enabled():
+    client = AUNClient()
+    client._state = "connected"
+    client._aid = "alice.agentid.pub"
+    client._device_id = "device-1"
+    client._slot_id = "slot-a"
+    client._v2_session = object()
+    client._session_options["background_sync"] = True
+    client._online_unread_hint_initial_delay = 0.01
+    client._online_unread_hint_interval = 0
+    client._persist_seq = lambda ns: None
+    group_id = "group.agentid.pub/history"
+    pull_calls: list[dict] = []
+
+    async def fake_pull(params):
+        pull_calls.append(dict(params))
+        return {"messages": []}
+
+    client._pull_group_v2_internal = fake_pull
+
+    await client._on_raw_group_v2_message_created({
+        "group_id": group_id,
+        "seq": 99,
+        "kind": "group.online_unread_hint",
+    })
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert pull_calls == []
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not pull_calls:
+        await asyncio.sleep(0.01)
+
+    assert pull_calls == [{"group_id": group_id, "after_seq": 0, "limit": 50}]
+    await client._stop_background_tasks()
+
+
+@pytest.mark.asyncio
 async def test_v2_group_notification_push_repairs_dirty_contiguous_below_push_then_pulls():
     client = AUNClient()
     client._state = "connected"
@@ -2728,7 +2769,7 @@ async def test_v2_group_notification_push_repairs_dirty_contiguous_below_push_th
     assert client._seq_tracker.get_max_seen_seq(ns) == 99999
 @pytest.mark.asyncio
 async def test_group_call_injects_empty_device_id_value(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "group_empty_device")})
+    client = _make_client_with_aid(tmp_path / "group_empty_device")
     client._state = "connected"
     client._aid = "alice.agentid.pub"
     client._device_id = ""
@@ -2755,7 +2796,7 @@ async def test_group_call_injects_empty_device_id_value(tmp_path):
 
 
 def test_attach_current_instance_context_includes_empty_device_id(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "attach_empty_device")})
+    client = _make_client_with_aid(tmp_path / "attach_empty_device")
     client._device_id = ""
     client._slot_id = "slot-a"
 
@@ -2767,7 +2808,7 @@ def test_attach_current_instance_context_includes_empty_device_id(tmp_path):
 
 
 def test_message_targets_current_instance_treats_empty_device_id_as_explicit(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "target_empty_device")})
+    client = _make_client_with_aid(tmp_path / "target_empty_device")
     client._device_id = "device-1"
     client._slot_id = "slot-a"
 
@@ -2887,7 +2928,7 @@ def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeyp
     cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
     cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
 
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = _make_client_with_aid(tmp_path / "aun")
     client._keystore.save_cert("alice.example.com", cert_pem, cert_fingerprint=cert_fp, make_active=False)
 
     called = {"fetch": 0, "last_fp": None}
@@ -2909,7 +2950,7 @@ def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeyp
 
 def test_get_verified_peer_cert_resolves_versioned_cache_without_fingerprint(tmp_path):
     cert_pem, cert_fp = _make_test_cert("bob.example.com")
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
+    client = _make_client_with_aid(tmp_path / "aun")
     now = time.time()
     client._cert_cache[client._cert_cache_key("bob.example.com", cert_fp)] = _CachedPeerCert(
         cert_bytes=cert_pem.encode("utf-8"),
@@ -2929,8 +2970,8 @@ def test_seq_tracker_state_isolated_between_slots(tmp_path):
         "public_key_der_b64": "pub",
         "curve": "P-256",
     }
-    client_a = AUNClient({"aun_path": str(root)})
-    client_b = AUNClient({"aun_path": str(root)})
+    client_a = _make_client_with_aid(root)
+    client_b = _make_client_with_aid(root)
     client_a._keystore.save_identity(aid, dict(base_identity))
     client_b._keystore.save_identity(aid, dict(base_identity))
     client_a._aid = aid
@@ -2948,7 +2989,7 @@ def test_seq_tracker_state_isolated_between_slots(tmp_path):
 
 def test_seq_tracker_same_context_refresh_keeps_in_memory_state(tmp_path):
     aid = "alice.agentid.pub"
-    client = AUNClient({"aun_path": str(tmp_path)})
+    client = _make_client_with_aid(tmp_path)
     client._aid = aid
     client._slot_id = "slot-a"
     client._refresh_seq_tracking_context()
@@ -2963,7 +3004,7 @@ def test_seq_tracker_same_context_refresh_keeps_in_memory_state(tmp_path):
 def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path):
     aid = "alice.agentid.pub"
     root = tmp_path / "aun"
-    client = AUNClient({"aun_path": str(root)})
+    client = _make_client_with_aid(root)
     identity = {
         "aid": aid,
         "access_token": "token",
@@ -3540,7 +3581,6 @@ async def test_restore_before_transport_connect():
     client._session_params = None
     client._connect_delivery_mode = {}
     client._state = "idle"
-    client._gateway_url = None
     client._loop = asyncio.get_running_loop()
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
@@ -3607,7 +3647,6 @@ async def test_restore_after_aid_change_during_auth():
     client._session_params = {"access_token": "t"}
     client._connect_delivery_mode = {}
     client._state = "idle"
-    client._gateway_url = None
     client._loop = asyncio.get_running_loop()
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
@@ -3645,6 +3684,56 @@ async def test_restore_after_aid_change_during_auth():
     assert restore_count["n"] == 2, f"expected 2 restores, got {restore_count['n']}"
 
 
+@pytest.mark.asyncio
+async def test_connect_once_sends_v2_only_capabilities_when_extra_info_requests_legacy():
+    from unittest.mock import AsyncMock, MagicMock
+
+    client = AUNClient()
+    client._aid = "alice.agentid.pub"
+    client._identity = {"aid": "alice.agentid.pub"}
+    client._resolve_gateway = lambda params: "ws://gateway.agentid.pub/aun"
+
+    class _Transport:
+        def __init__(self):
+            self.requests = []
+
+        async def connect(self, url):
+            return {"params": {"nonce": "nonce-1"}}
+
+        async def call(self, method, params):
+            self.requests.append((method, params))
+            return {"status": "ok"}
+
+    transport = _Transport()
+    client._transport = transport
+    client._sync_identity_after_connect = MagicMock()
+    client._init_v2_session = AsyncMock()
+
+    await client._connect_once(
+        {
+            "access_token": "token-1",
+            "extra_info": {
+                "_capabilities": {
+                    "e2ee": True,
+                    "group_e2ee": True,
+                    "supported_p2p_e2ee": ["e2ee"],
+                    "supported_group_e2ee": ["group_e2ee"],
+                }
+            },
+            "background_sync": False,
+        },
+        allow_reauth=False,
+    )
+
+    method, params = transport.requests[-1]
+    assert method == "auth.connect"
+    assert params["capabilities"]["supported_p2p_e2ee"] == ["e2ee_v2"]
+    assert params["capabilities"]["supported_group_e2ee"] == ["group_e2ee_v2"]
+    assert "e2ee" not in params["capabilities"]["supported_p2p_e2ee"]
+    assert "group_e2ee" not in params["capabilities"]["supported_group_e2ee"]
+    assert "extra_info" not in params
+
+
 # ── P2P push 解密失败仍应 auto-ack ────────────────────────────
 
 
@@ -3657,7 +3746,7 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
     """
     from unittest.mock import AsyncMock, MagicMock
 
-    client = AUNClient({"aun_path": "/tmp/test_ack_on_decrypt_fail"})
+    client = _make_client_with_aid("/tmp/test_ack_on_decrypt_fail")
     client._aid = "alice.aid.com"
     client._device_id = "dev-1"
     client._state = "connected"
@@ -3710,7 +3799,7 @@ async def test_p2p_push_decrypt_failure_still_auto_acks():
 
 @pytest.mark.asyncio
 async def test_published_message_events_fallback_current_instance_context(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "published_instance_context")})
+    client = _make_client_with_aid(tmp_path / "published_instance_context")
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
 
@@ -3739,7 +3828,7 @@ async def test_published_message_events_fallback_current_instance_context(tmp_pa
 
 @pytest.mark.asyncio
 async def test_pulled_batch_publishes_internal_gap(tmp_path):
-    client = AUNClient({"aun_path": str(tmp_path / "pulled_batch_gap")})
+    client = _make_client_with_aid(tmp_path / "pulled_batch_gap")
     ns = "p2p:alice.aid.com"
     client._seq_tracker.on_message_seq(ns, 1)
     client._seq_tracker.force_contiguous_seq(ns, 2)
@@ -3777,7 +3866,7 @@ async def test_published_message_logs_content(tmp_path):
         def error(self, module, msg, *args, err=None):
             pass
 
-    client = AUNClient({"aun_path": str(tmp_path / "published_content_log")})
+    client = _make_client_with_aid(tmp_path / "published_content_log")
     logger = CaptureLogger()
     client._log = logger
     ns = "p2p:alice.aid.com"
@@ -3796,7 +3885,7 @@ async def test_published_message_logs_content(tmp_path):
 async def test_p2p_push_ignores_other_slot_context(tmp_path):
     from unittest.mock import AsyncMock
 
-    client = AUNClient({"aun_path": str(tmp_path / "p2p_other_slot")})
+    client = _make_client_with_aid(tmp_path / "p2p_other_slot")
     client._aid = "alice.aid.com"
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
@@ -3827,7 +3916,7 @@ async def test_p2p_push_ignores_other_slot_context(tmp_path):
 async def test_p2p_raw_encrypted_push_attempts_inline_decrypt_first(tmp_path):
     from unittest.mock import AsyncMock
 
-    client = AUNClient({"aun_path": str(tmp_path / "p2p_raw_encrypted_ok")})
+    client = _make_client_with_aid(tmp_path / "p2p_raw_encrypted_ok")
     client._aid = "alice.aid.com"
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
@@ -3874,7 +3963,7 @@ async def test_p2p_raw_encrypted_push_attempts_inline_decrypt_first(tmp_path):
 async def test_p2p_raw_encrypted_self_push_marks_outbound_sync(tmp_path):
     from unittest.mock import AsyncMock
 
-    client = AUNClient({"aun_path": str(tmp_path / "p2p_raw_encrypted_self")})
+    client = _make_client_with_aid(tmp_path / "p2p_raw_encrypted_self")
     client._aid = "alice.aid.com"
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
@@ -3913,7 +4002,7 @@ async def test_p2p_raw_encrypted_self_push_marks_outbound_sync(tmp_path):
 async def test_p2p_raw_encrypted_push_publishes_header_only_undecryptable_when_inline_decrypt_fails(tmp_path):
     from unittest.mock import AsyncMock
 
-    client = AUNClient({"aun_path": str(tmp_path / "p2p_raw_encrypted")})
+    client = _make_client_with_aid(tmp_path / "p2p_raw_encrypted")
     client._aid = "alice.aid.com"
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
@@ -3961,7 +4050,7 @@ async def test_p2p_raw_encrypted_push_publishes_header_only_undecryptable_when_i
 async def test_group_raw_encrypted_push_attempts_inline_decrypt_first(tmp_path):
     from unittest.mock import AsyncMock
 
-    client = AUNClient({"aun_path": str(tmp_path / "group_raw_encrypted_ok")})
+    client = _make_client_with_aid(tmp_path / "group_raw_encrypted_ok")
     client._aid = "alice.aid.com"
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
@@ -4007,7 +4096,7 @@ async def test_group_raw_encrypted_push_attempts_inline_decrypt_first(tmp_path):
 async def test_group_raw_encrypted_self_push_marks_outbound_sync(tmp_path):
     from unittest.mock import AsyncMock
 
-    client = AUNClient({"aun_path": str(tmp_path / "group_raw_encrypted_self")})
+    client = _make_client_with_aid(tmp_path / "group_raw_encrypted_self")
     client._aid = "alice.aid.com"
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
@@ -4046,7 +4135,7 @@ async def test_group_raw_encrypted_self_push_marks_outbound_sync(tmp_path):
 async def test_group_raw_encrypted_push_publishes_header_only_undecryptable_when_inline_decrypt_fails(tmp_path):
     from unittest.mock import AsyncMock
 
-    client = AUNClient({"aun_path": str(tmp_path / "group_raw_encrypted")})
+    client = _make_client_with_aid(tmp_path / "group_raw_encrypted")
     client._device_id = "dev-1"
     client._slot_id = "slot-a"
     client._state = "connected"
@@ -4179,8 +4268,8 @@ async def test_close_code_none_not_server_initiated():
         "close_code=None 不应被标记为 server_initiated"
 
 
-def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch):
-    """PY-017: _fetch_peer_cert 应设置合理的 HTTP 超时，而非依赖 aiohttp 默认 300s。"""
+def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch, tmp_path):
+    """PY-017: 本域 peer cert 下载应复用已发现 gateway 并设置显式 HTTP 超时。"""
     import aiohttp
 
     captured_timeouts = []
@@ -4190,14 +4279,14 @@ def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch):
         captured_timeouts.append(kwargs.get("timeout"))
         original_init(self, *args, **kwargs)
 
-    client = AUNClient()
-    client._gateway_url = "https://gateway.example.com"
+    client = _make_client_with_aid(tmp_path / "fetch_cert_timeout", aid="alice.agentid.pub")
+    client._session_params = {"gateway": "https://gateway.agentid.pub"}
 
     # 拦截 aiohttp.ClientSession.__init__ 以捕获 timeout 参数
     monkeypatch.setattr(aiohttp.ClientSession, "__init__", patched_init)
 
     # 模拟 HTTP 响应，避免真实网络请求
-    cert_pem, cert_fp = _make_test_cert("test.aid.com")
+    cert_pem, _ = _make_test_cert("test.agentid.pub")
 
     class FakeResponse:
         status = 200
@@ -4229,7 +4318,7 @@ def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch):
         pass
     monkeypatch.setattr(client._auth, "verify_peer_certificate", fake_verify)
 
-    asyncio.run(client._fetch_peer_cert("test.aid.com"))
+    asyncio.run(client._fetch_peer_cert("test.agentid.pub"))
 
     assert len(captured_timeouts) >= 1, "应至少创建一个 ClientSession"
     timeout_obj = captured_timeouts[0]
@@ -4245,8 +4334,8 @@ def test_fetch_peer_cert_uses_explicit_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_peer_cert_net_path_does_not_reference_removed_response(tmp_path, monkeypatch):
-    client = AUNClient({"aun_path": str(tmp_path / "fetch_cert_net_path")})
-    client._gateway_url = "wss://gateway.agentid.pub:20001/aun"
+    client = _make_client_with_aid(tmp_path / "fetch_cert_net_path")
+    client._session_params = {"gateway": "wss://gateway.agentid.pub:20001/aun"}
     cert_pem, _ = _make_test_cert("bob.agentid.pub")
     calls = []
 
@@ -4341,7 +4430,7 @@ class TestSignatureFailureRaises:
 
     def test_sign_failure_raises_client_signature_error(self, tmp_path):
         """私钥损坏时签名应抛出 ClientSignatureError。"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = _make_client_with_aid(tmp_path / "aun")
         client._identity = {
             "aid": "test.example.com",
             "private_key_pem": "INVALID_KEY_DATA",
@@ -4353,7 +4442,7 @@ class TestSignatureFailureRaises:
 
     def test_sign_failure_does_not_silently_continue(self, tmp_path):
         """签名失败后 params 中不应有 client_signature 字段。"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = _make_client_with_aid(tmp_path / "aun")
         client._identity = {
             "aid": "test.example.com",
             "private_key_pem": "BROKEN_PEM",
@@ -4369,7 +4458,7 @@ class TestSignatureFailureRaises:
 
     def test_sign_failure_preserves_original_cause(self, tmp_path):
         """ClientSignatureError 应保留原始异常信息（__cause__）。"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
+        client = _make_client_with_aid(tmp_path / "aun")
         client._identity = {
             "aid": "test.example.com",
             "private_key_pem": "BAD_KEY",
@@ -4382,29 +4471,31 @@ class TestSignatureFailureRaises:
         )
 
 
-# ── PY-001: list_identities() 集成测试 ────────────────────
+# ── PY-001: AIDStore.list() 集成测试 ────────────────────
 
 
-class TestClientListIdentities:
-    """PY-001: AUNClient.list_identities() 必须能正常工作。"""
+class TestAIDStoreListIdentities:
+    """PY-001: AIDStore.list() 必须能正常工作。"""
 
     def test_list_identities_returns_list(self, tmp_path):
         """list_identities() 返回列表类型。"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
-        result = client.list_identities()
-        assert isinstance(result, list)
+        store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
+        result = store.list()
+        assert result.ok, result.error
+        assert result.data is not None
+        assert isinstance(result.data["identities"], list)
+        store.close()
 
     def test_list_identities_with_saved_identity(self, tmp_path):
         """保存身份后 list_identities() 能返回它。"""
-        client = AUNClient({"aun_path": str(tmp_path / "aun")})
-        client._keystore.save_key_pair("test.agentid.pub", {
-            "private_key_pem": "KEY",
-            "public_key_der_b64": "PUB",
-            "curve": "P-256",
-        })
-        result = client.list_identities()
-        aids = [item["aid"] for item in result]
+        store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
+        store._keystore.save_identity("test.agentid.pub", _make_identity("test.agentid.pub"))
+        result = store.list()
+        assert result.ok, result.error
+        assert result.data is not None
+        aids = [item["aid"] for item in result.data["identities"]]
         assert "test.agentid.pub" in aids
+        store.close()
 
 
 # ── R1: max_attempts 支持 + health-fail 路径约束 ────────────
@@ -4418,7 +4509,7 @@ def _make_reconnect_client():
     client._state = "connected"
     client._reconnect_task = None
     client._server_kicked = False
-    client._gateway_url = "ws://gateway.example.com/aun"
+    client._session_params = {"gateway": "ws://gateway.example.com/aun"}
     from aun_core.logger import NullLogger; client._log = NullLogger()
 
     published = []
@@ -4459,11 +4550,11 @@ async def test_max_attempts_stops_reconnect_on_health_fail():
 
     await client._reconnect_loop()
 
-    assert client._state == "terminal_failed"
-    # 应该发布 terminal_failed 事件
+    assert client.state == ConnectionState.CONNECTION_FAILED
+    # 应该发布 connection_failed 事件
     terminal_events = [
         (e, d) for e, d in published
-        if e == "connection.state" and d.get("state") == "terminal_failed"
+        if e == "connection.state" and d.get("state") == ConnectionState.CONNECTION_FAILED.value
     ]
     assert len(terminal_events) == 1
     assert terminal_events[0][1].get("reason") == "max_attempts_exhausted"
@@ -4495,7 +4586,7 @@ async def test_max_attempts_zero_means_infinite():
 
     # 应该循环了 5 次，不是因为 max_attempts 终止
     assert attempt_count[0] >= 5
-    assert client._state != "terminal_failed"
+    assert client.state != ConnectionState.CONNECTION_FAILED
 
 
 @pytest.mark.asyncio
@@ -4521,13 +4612,14 @@ async def test_max_attempts_stops_reconnect_on_connect_fail():
 
     await client._reconnect_loop()
 
-    assert client._state == "terminal_failed"
+    assert client.state == ConnectionState.CONNECTION_FAILED
     terminal_events = [
         (e, d) for e, d in published
-        if e == "connection.state" and d.get("state") == "terminal_failed"
+        if e == "connection.state" and d.get("state") == ConnectionState.CONNECTION_FAILED.value
     ]
     assert len(terminal_events) == 1
     assert terminal_events[0][1].get("reason") == "max_attempts_exhausted"
 
 
 # ── R3: 批量路径解密失败不应出现在返回结果中 ──────────────────
+

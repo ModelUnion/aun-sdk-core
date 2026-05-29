@@ -10,6 +10,7 @@ import sys
 import uuid
 from pathlib import Path
 from typing import Any
+from weakref import WeakKeyDictionary
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -18,7 +19,9 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient, AuthError, RateLimitError
+
+from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
@@ -33,6 +36,7 @@ def _default_test_aun_path() -> str:
 
 _TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).strip()
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
+_CLIENT_SLOT_IDS: WeakKeyDictionary[AUNClient, str] = WeakKeyDictionary()
 
 _passed = 0
 _failed = 0
@@ -57,33 +61,17 @@ def _run_id() -> str:
 
 
 def _make_client(tag: str) -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    client._test_slot_id = f"thought-{tag}-{uuid.uuid4().hex[:12]}"
+    client = make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
+    _CLIENT_SLOT_IDS[client] = f"thought-{tag}-{uuid.uuid4().hex[:12]}"
     return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> None:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
-    last_error: Exception | None = None
-    for attempt in range(4):
-        try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            slot_id = str(getattr(client, "_test_slot_id", "") or "")
-            if slot_id:
-                connect_params["slot_id"] = slot_id
-            connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
-            return
-        except (AuthError, RateLimitError) as exc:
-            last_error = exc
-            if attempt >= 3:
-                break
-            await asyncio.sleep(1.5 * (attempt + 1))
-    raise last_error or RuntimeError(f"{aid} connect failed")
+    connect_params: dict = {"auto_reconnect": False}
+    slot_id = str(_CLIENT_SLOT_IDS.get(client, "") or "")
+    if slot_id:
+        connect_params["slot_id"] = slot_id
+    await ensure_connected_identity(client, aid, connect_options=connect_params)
 
 
 def _payload_texts(result: dict[str, Any]) -> list[str]:
@@ -126,7 +114,7 @@ async def test_message_thought_get_keeps_decrypted_items() -> None:
                 _fail(name, f"put stored_count 异常 idx={idx}: {put}")
                 return
 
-        raw = await bob._transport.call("message.thought.get", {
+        raw = await bob.call("message.thought.get", {
             "sender_aid": alice_aid,
             "context": context,
         })
@@ -180,3 +168,4 @@ async def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
+

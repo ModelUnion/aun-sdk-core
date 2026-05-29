@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -28,6 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
@@ -44,6 +46,7 @@ _TEST_AUN_PATH = os.environ.get("AUN_TEST_AUN_PATH", _default_test_aun_path()).s
 _ISSUER = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
 _ALICE_AID = os.environ.get("AUN_TEST_ALICE_AID", f"alice.{_ISSUER}").strip()
 _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
+_CLIENT_SLOT_IDS: WeakKeyDictionary[AUNClient, str] = WeakKeyDictionary()
 
 
 # ---------------------------------------------------------------------------
@@ -51,22 +54,20 @@ _BOBB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 # ---------------------------------------------------------------------------
 
 def _make_client(tag: str) -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH}, debug=True)
-    client._config_model.require_forward_secrecy = False
-    client._test_slot_id = f"trace-{tag}"
+    client = make_client_for_path(_TEST_AUN_PATH, debug=True, require_forward_secrecy=False)
+    _CLIENT_SLOT_IDS[client] = f"trace-{tag}"
     return client
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> None:
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            slot_id = getattr(client, "_test_slot_id", "")
+            connect_params: dict = {}
+            slot_id = _CLIENT_SLOT_IDS.get(client, "")
             if slot_id:
                 connect_params["slot_id"] = slot_id
             connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
+            await ensure_connected_identity(client, aid, connect_options=connect_params, attempts=1)
             # 等待 V2 初始化后台任务完成
             await asyncio.sleep(1.0)
             return
@@ -301,3 +302,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

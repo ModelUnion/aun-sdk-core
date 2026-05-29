@@ -26,11 +26,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import ssl
 import sys
 import time
 import uuid
 from pathlib import Path
+
+import websockets
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -39,12 +43,19 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient, AuthError, RateLimitError
+from aun_core import AIDStore, AUNClient, AuthError, RateLimitError
 from aun_core.errors import (
     ConnectionError as AUNConnectionError,
     PermissionError as AUNPermissionError,
     StateError,
     ValidationError,
+)
+from aun_core.discovery import GatewayDiscovery
+from aun_refactor_helpers import (
+    ensure_authenticated_identity,
+    ensure_connected_identity,
+    ensure_registered_identity,
+    make_client_for_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -98,9 +109,82 @@ def _skip(name: str, reason: str):
 
 
 def _make_client(aun_path: str | None = None) -> AUNClient:
-    client = AUNClient({"aun_path": aun_path or _TEST_AUN_PATH})
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(
+        aun_path or _TEST_AUN_PATH,
+        require_forward_secrecy=False,
+    )
+
+
+def _make_store(client: AUNClient) -> AIDStore:
+    return AIDStore(
+        client.config["aun_path"],
+        encryption_seed=client.config.get("seed_password") or "",
+        verify_ssl=False,
+        root_ca_path=client.config.get("root_ca_path"),
+        debug=False,
+    )
+
+
+async def _resolve_gateway_url(client: AUNClient, aid: str) -> str:
+    issuer = str(aid or "").split(".", 1)[1] if "." in str(aid or "") else str(aid or "")
+    discovery = GatewayDiscovery(verify_ssl=False)
+    primary = f"https://gateway.{issuer}/.well-known/aun-gateway"
+    fallback = f"http://gateway.{issuer}/.well-known/aun-gateway"
+    try:
+        return await discovery.discover(primary)
+    except Exception:
+        return await discovery.discover(fallback)
+
+
+def _nossl_context(url: str) -> ssl.SSLContext | None:
+    if not str(url).startswith("wss://"):
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+async def _short_rpc(gateway_url: str, method: str, params: dict) -> dict:
+    async with websockets.connect(gateway_url, ssl=_nossl_context(gateway_url), max_size=1_000_000) as ws:
+        await asyncio.wait_for(ws.recv(), timeout=15)
+        await ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": f"p0-{method}",
+            "method": method,
+            "params": params,
+        }, ensure_ascii=False, separators=(",", ":")))
+        raw = await asyncio.wait_for(ws.recv(), timeout=15)
+    message = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+    if isinstance(message.get("error"), dict):
+        error = message["error"]
+        raise RuntimeError(error.get("message") or str(error))
+    result = message.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+async def _check_gateway_health(gateway_url: str, *, timeout: float) -> bool:
+    async def _probe() -> bool:
+        async with websockets.connect(
+            gateway_url,
+            ssl=_nossl_context(gateway_url),
+            max_size=1_000_000,
+            open_timeout=timeout,
+            close_timeout=1,
+            ping_interval=None,
+        ) as ws:
+            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+        message = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+        return (
+            message.get("jsonrpc") == "2.0"
+            and message.get("method") == "challenge"
+            and isinstance(message.get("params"), dict)
+        )
+
+    try:
+        return await asyncio.wait_for(_probe(), timeout=max(0.1, timeout))
+    except Exception:
+        return False
 
 
 def _group_id(result: dict) -> str:
@@ -111,15 +195,10 @@ def _group_id(result: dict) -> str:
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.register_aid({"aid": aid})
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            await client.connect(auth)
-            return aid
+            return await ensure_connected_identity(client, aid, attempts=1)
         except (AuthError, RateLimitError) as exc:
             last_error = exc
             if attempt >= 3:
@@ -129,29 +208,29 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
 
 
 async def _auth_phase1(client: AUNClient, aid: str) -> tuple[str, dict, dict]:
-    await client.auth.register_aid({"aid": aid})
-    gateway_url = await client.auth._resolve_gateway(aid)
-    identity = client._auth.load_identity(aid)
-    client_nonce = client._auth._crypto.new_client_nonce()
-    phase1 = await client._auth._short_rpc(gateway_url, "auth.aid_login1", {
+    aid_obj = await ensure_registered_identity(client, aid)
+    gateway_url = await _resolve_gateway_url(client, aid)
+    client_nonce = uuid.uuid4().hex
+    phase1 = await _short_rpc(gateway_url, "auth.aid_login1", {
         "aid": aid,
-        "cert": identity["cert"],
+        "cert": aid_obj.cert_pem,
         "client_nonce": client_nonce,
     })
-    return gateway_url, identity, phase1
+    return gateway_url, {"aid": aid, "cert": aid_obj.cert_pem, "aid_obj": aid_obj}, phase1
 
 
 async def _auth_phase2(client: AUNClient, gateway_url: str, aid: str, identity: dict, phase1: dict) -> dict:
-    signature, client_time = client._auth._crypto.sign_login_nonce(
-        identity["private_key_pem"],
-        phase1["nonce"],
-    )
-    return await client._auth._short_rpc(gateway_url, "auth.aid_login2", {
+    client_time = str(time.time())
+    signed = identity["aid_obj"].sign(f"{phase1['nonce']}:{client_time}")
+    if not signed.ok or signed.data is None:
+        message = signed.error.message if signed.error else "login nonce signing failed"
+        raise RuntimeError(message)
+    return await _short_rpc(gateway_url, "auth.aid_login2", {
         "aid": aid,
         "request_id": phase1["request_id"],
         "nonce": phase1["nonce"],
         "client_time": client_time,
-        "signature": signature,
+        "signature": signed.data["signature"],
     })
 
 
@@ -167,8 +246,8 @@ async def test_p0_01_gateway_health_check():
 
     # 1. 正常健康检查 — 使用真实 gateway
     try:
-        gateway_url = await client.auth._resolve_gateway(f"gateway.{_ISSUER}")
-        ok = await client.check_gateway_health(gateway_url, timeout=10)
+        gateway_url = await _resolve_gateway_url(client, f"gateway.{_ISSUER}")
+        ok = await _check_gateway_health(gateway_url, timeout=10)
         if ok:
             _ok("健康检查-正常", "返回 true")
         else:
@@ -179,7 +258,7 @@ async def test_p0_01_gateway_health_check():
     # 2. 超时 — 连接一个大概率无响应的地址
     try:
         t0 = time.monotonic()
-        ok = await client.check_gateway_health("wss://192.0.2.1:9999", timeout=2)
+        ok = await _check_gateway_health("wss://192.0.2.1:9999", timeout=2)
         elapsed = time.monotonic() - t0
         if not ok and elapsed < 5:
             _ok("健康检查-超时", f"返回 false，耗时 {elapsed:.1f}s")
@@ -197,7 +276,7 @@ async def test_p0_01_gateway_health_check():
 
     # 3. 连接拒绝 — 一个肯定没服务的端口
     try:
-        ok = await client.check_gateway_health("wss://127.0.0.1:1", timeout=3)
+        ok = await _check_gateway_health("wss://127.0.0.1:1", timeout=3)
         if not ok:
             _ok("健康检查-连接拒绝", "返回 false")
         else:
@@ -217,36 +296,37 @@ async def test_p0_02_aid_creation_failure():
     """P0-02: AID 创建失败 — 重复 AID / 无效参数"""
     print("\n── P0-02: AID 创建失败路径 ──")
     client = _make_client()
-
-    # 1. 创建已存在的 AID — alice 应该已注册
+    store = _make_store(client)
     try:
-        await client.auth.register_aid({"aid": _ALICE_AID})
-        # 如果没报错，可能是幂等设计，也标记通过但记录
-        _ok("创建重复AID", "未报错（可能幂等设计）")
-    except Exception as exc:
-        error_text = str(exc).lower()
-        if any(k in error_text for k in ("exist", "duplicate", "already", "conflict")):
-            _ok("创建重复AID", f"预期错误: {exc}")
+        # 1. 创建已存在的 AID — alice 应该已注册
+        result = await store.register(_ALICE_AID)
+        if result.ok:
+            _ok("创建重复AID", "未报错（可能幂等设计）")
         else:
-            _ok("创建重复AID", f"返回错误（可能是其他原因）: {exc}")
+            error_text = (result.error.message if result.error else "").lower()
+            if any(k in error_text for k in ("exist", "duplicate", "already", "conflict")):
+                _ok("创建重复AID", f"预期错误: {result.error.message if result.error else ''}")
+            else:
+                _ok("创建重复AID", f"返回错误（可能是其他原因）: {result.error.message if result.error else ''}")
 
-    # 2. 无效 AID 格式 — 空字符串
-    try:
-        await client.auth.register_aid({"aid": ""})
-        _fail("创建空AID", "期望报错但成功了")
-    except (ValidationError, ValueError) as exc:
-        _ok("创建空AID", f"客户端校验: {exc}")
+        # 2. 无效 AID 格式 — 空字符串
+        result = await store.register("")
+        if not result.ok:
+            _ok("创建空AID", f"客户端校验: {result.error.message if result.error else ''}")
+        else:
+            _fail("创建空AID", "期望报错但成功了")
+
+        # 3. 无效 AID 格式 — 含特殊字符
+        result = await store.register("test@#$%^&*.invalid")
+        if not result.ok:
+            _ok("创建非法AID", f"拒绝: {result.error.message if result.error else ''}")
+        else:
+            _fail("创建非法AID", "期望报错但成功了")
     except Exception as exc:
-        _ok("创建空AID", f"服务端拒绝: {type(exc).__name__}: {exc}")
-
-    # 3. 无效 AID 格式 — 含特殊字符
-    try:
-        await client.auth.register_aid({"aid": "test@#$%^&*.invalid"})
-        _fail("创建非法AID", "期望报错但成功了")
-    except Exception as exc:
-        _ok("创建非法AID", f"拒绝: {type(exc).__name__}: {exc}")
-
-    await client.close()
+        _fail("AID创建失败路径", str(exc))
+    finally:
+        store.close()
+        await client.close()
 
 
 # =========================================================================
@@ -283,7 +363,10 @@ async def test_p0_04_login_replay_attack():
         # 重放 — 使用相同 challenge 和签名再次 login2
         try:
             result2 = await _auth_phase2(client, gateway_url, _ALICE_AID, identity, login1_result)
-            _fail("重放-二次使用", f"期望拒绝但成功了: {list((result2 or {}).keys())}")
+            if isinstance(result2, dict) and (result2.get("success") is False or result2.get("error")):
+                _ok("重放-二次使用", f"正确拒绝: {result2.get('error') or result2}")
+            else:
+                _fail("重放-二次使用", f"期望拒绝但成功了: {list((result2 or {}).keys())}")
         except Exception as exc:
             _ok("重放-二次使用", f"正确拒绝: {type(exc).__name__}: {exc}")
 
@@ -418,8 +501,7 @@ async def test_p0_08_reconnect_gap_fill():
 
         # Bob 重连 — 应该自动补洞
         received.clear()
-        auth = await bob.auth.authenticate({"aid": _BOBB_AID})
-        await bob.connect(auth)
+        await ensure_connected_identity(bob, _BOBB_AID)
 
         try:
             await asyncio.wait_for(all_received.wait(), timeout=15)
@@ -590,8 +672,7 @@ async def test_p0_14_rpc_during_disconnect():
             _ok("断线中RPC", f"抛异常（类型可能不同）: {type(exc).__name__}: {exc}")
 
         # 重连后 RPC 应恢复
-        auth = await client.auth.authenticate({"aid": _ALICE_AID})
-        await client.connect(auth)
+        await ensure_connected_identity(client, _ALICE_AID)
 
         try:
             result = await client.call("meta.ping", {})
@@ -661,14 +742,17 @@ async def test_p0_05_token_concurrent_refresh():
     """P0-05: 多个并发 authenticate 调用 → 不应互相破坏"""
     print("\n── P0-05: Token 并发刷新 ──")
     client = _make_client()
+    auth_clients: list[AUNClient] = []
 
     try:
-        await _ensure_connected(client, _ALICE_AID)
+        await ensure_registered_identity(client, _ALICE_AID)
 
-        # 并发发起多个 authenticate 调用
+        # 新状态机不允许 READY 状态重复 authenticate；这里用多个短生命周期 client
+        # 共享同一身份目录并发认证，覆盖 token/cache 竞争写入。
+        auth_clients = [_make_client() for _ in range(5)]
         tasks = [
-            client.auth.authenticate({"aid": _ALICE_AID})
-            for _ in range(5)
+            ensure_authenticated_identity(auth_client, _ALICE_AID)
+            for auth_client in auth_clients
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -682,6 +766,7 @@ async def test_p0_05_token_concurrent_refresh():
 
         # 验证刷新后客户端仍可用
         try:
+            await _ensure_connected(client, _ALICE_AID)
             await client.call("meta.ping", {})
             _ok("并发刷新后RPC", "ping 仍正常")
         except Exception as exc:
@@ -690,7 +775,9 @@ async def test_p0_05_token_concurrent_refresh():
         # inflight 标志清理验证 — 并发完成后再单独 authenticate 应成功
         await asyncio.sleep(0.5)
         try:
-            auth_after = await client.auth.authenticate({"aid": _ALICE_AID})
+            single = _make_client()
+            auth_clients.append(single)
+            auth_after = await ensure_authenticated_identity(single, _ALICE_AID)
             if auth_after and auth_after.get("access_token"):
                 _ok("inflight清理", "并发后 authenticate 成功")
             else:
@@ -701,6 +788,11 @@ async def test_p0_05_token_concurrent_refresh():
     except Exception as exc:
         _fail("并发刷新测试", str(exc))
     finally:
+        for auth_client in auth_clients:
+            try:
+                await auth_client.close()
+            except Exception:
+                pass
         await client.close()
 
 
@@ -921,3 +1013,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

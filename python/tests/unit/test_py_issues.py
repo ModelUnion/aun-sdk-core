@@ -20,6 +20,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from datetime import datetime, timedelta, timezone
 
+from aun_core import ConnectionState
+
 
 # ── 辅助函数 ──────────────────────────────────────────────
 
@@ -193,7 +195,7 @@ class TestPY003PY005DisconnectSavesSeqTracker:
 
     def _make_client(self):
         from aun_core import AUNClient
-        client = AUNClient({"aun_path": "/tmp/test_py003"})
+        client = AUNClient()
         client._session_options = {
             "auto_reconnect": False,
             "heartbeat_interval": 0,
@@ -202,7 +204,6 @@ class TestPY003PY005DisconnectSavesSeqTracker:
             "timeouts": {"connect": 5.0, "call": 10.0, "http": 30.0},
         }
         client._state = "connected"
-        client._gateway_url = "wss://gateway.test/aun"
         client._transport = MagicMock()
         client._transport.close = AsyncMock()
         client._discovery = MagicMock()
@@ -278,7 +279,7 @@ class TestSDKPY001DisconnectCloseRace:
 
     def _make_client(self):
         from aun_core import AUNClient
-        client = AUNClient({"aun_path": "/tmp/test_sdkpy001"})
+        client = AUNClient()
         client._session_options = {
             "auto_reconnect": False,
             "heartbeat_interval": 0,
@@ -287,7 +288,6 @@ class TestSDKPY001DisconnectCloseRace:
             "timeouts": {"connect": 5.0, "call": 10.0, "http": 30.0},
         }
         client._state = "connected"
-        client._gateway_url = "wss://gateway.test/aun"
         client._transport = MagicMock()
         client._transport.close = AsyncMock()
         return client
@@ -317,7 +317,7 @@ class TestSDKPY001DisconnectCloseRace:
 
         # disconnect() 应正常执行清理
         client._transport.close.assert_called_once()
-        assert client._state == "disconnected"
+        assert client.state == ConnectionState.NO_IDENTITY
 
     @pytest.mark.asyncio
     async def test_concurrent_close_and_disconnect(self):
@@ -342,8 +342,8 @@ class TestSDKPY001DisconnectCloseRace:
         for r in results:
             assert not isinstance(r, Exception), f"并发调用产生异常: {r}"
 
-        # 最终状态应为 closed（close() 的最终状态优先）
-        assert client._state in {"closed", "disconnected"}
+        # 最终状态应为 closed；极端调度下 disconnect 可能先完成并回到无身份态
+        assert client.state in {ConnectionState.CLOSED, ConnectionState.NO_IDENTITY}
 
 
 # ── ISSUE-SDK-PY-002: discover() 异步 Task 引用 ────────────

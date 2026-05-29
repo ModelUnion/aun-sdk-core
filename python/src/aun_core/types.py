@@ -5,14 +5,15 @@ from typing import Any, Literal, TypedDict
 
 
 class ConnectionState(str, Enum):
-    """连接状态枚举（对齐 C++ ConnectionState）"""
-    IDLE = "idle"
+    """AUNClient 连接状态枚举。"""
+    NO_IDENTITY = "no_identity"
+    STANDBY = "standby"
+    AUTHENTICATED = "authenticated"
     CONNECTING = "connecting"
-    AUTHENTICATING = "authenticating"
-    CONNECTED = "connected"
-    DISCONNECTED = "disconnected"
+    READY = "ready"
+    RETRY_BACKOFF = "retry_backoff"
     RECONNECTING = "reconnecting"
-    TERMINAL_FAILED = "terminal_failed"
+    CONNECTION_FAILED = "connection_failed"
     CLOSED = "closed"
 
 

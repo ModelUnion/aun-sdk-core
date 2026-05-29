@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
 from aun_core.errors import AUNError, TimeoutError as _AunTimeout
+from aun_refactor_helpers import ensure_connected_identity, ensure_registered_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -78,26 +79,20 @@ def _make_client(tag_or_path: str, *, is_path: bool = False) -> AUNClient:
         root = tag_or_path
     else:
         root = _make_aun_path(tag_or_path)
-    client = AUNClient({"aun_path": root}, debug=False)
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(root, debug=False, require_forward_secrecy=False)
 
 
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "") -> str:
-    await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
     opts: dict = {"auto_reconnect": False, "heartbeat_interval": 30.0}
     if slot_id:
         opts["slot_id"] = slot_id
-    await client.connect(auth, opts)
-    return aid
+    return await ensure_connected_identity(client, aid, connect_options=opts)
 
 
 async def _connect_short(client: AUNClient, aid: str, *,
                          slot_id: str = "",
                          short_ttl_ms: int = 0) -> str:
     """以短连接方式建立会话。aid 必须已注册（先在长连接客户端创建过）。"""
-    auth = await client.auth.authenticate({"aid": aid})
     opts: dict = {
         "connection_kind": "short",
         "auto_reconnect": False,
@@ -106,8 +101,7 @@ async def _connect_short(client: AUNClient, aid: str, *,
         opts["slot_id"] = slot_id
     if short_ttl_ms > 0:
         opts["short_ttl_ms"] = short_ttl_ms
-    await client.connect(auth, opts)
-    return aid
+    return await ensure_connected_identity(client, aid, connect_options=opts)
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +297,7 @@ async def test_short_capacity_exceeded() -> bool:
     shorts: list[AUNClient] = []
     overflow = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         # 起 10 个短连接（共享 keystore）
@@ -355,7 +349,7 @@ async def test_short_ttl_eviction() -> bool:
     setup = _make_client(shared_path, is_path=True)
     short = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         # 短连接传 ttl=2000ms
@@ -403,7 +397,7 @@ async def test_long_replaces_long_keeps_shorts() -> bool:
     long_new = _make_client(shared_path, is_path=True)
     shorts: list[AUNClient] = []
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         await _connect_long(long_old, aid, slot_id="slot-x")
@@ -463,7 +457,7 @@ async def test_short_does_not_publish_client_online() -> bool:
     observer = _make_client(observer_path, is_path=True)
     short = _make_client(short_path, is_path=True)
     try:
-        await setup.auth.register_aid({"aid": short_only_aid})
+        await ensure_registered_identity(setup, short_only_aid)
         await setup.close()
 
         await _connect_long(observer, observer_aid, slot_id="obs")
@@ -507,7 +501,7 @@ async def test_hello_ok_returns_connection_kind() -> bool:
     long_client = _make_client(shared_path, is_path=True)
     short_client = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         # 长连接：connection.kind 应为 "long"
@@ -516,8 +510,8 @@ async def test_hello_ok_returns_connection_kind() -> bool:
 
         # 短连接：connection.kind 应为 "short"
         await _connect_short(short_client, aid, slot_id="h7-s")
-        # SDK 的 _session_options 反映了回包后 SDK 自身的判定
-        kind = short_client._session_options.get("connection_kind")
+        # SDK 的 session_options 反映了回包后 SDK 自身的判定
+        kind = short_client.session_options.get("connection_kind")
         if kind != "short":
             _fail(name, f"short client session_options.connection_kind={kind}")
             return False
@@ -548,13 +542,13 @@ async def test_short_disables_token_refresh() -> bool:
     setup = _make_client(shared_path, is_path=True)
     short = _make_client(shared_path, is_path=True)
     try:
-        await setup.auth.register_aid({"aid": aid})
+        await ensure_registered_identity(setup, aid)
         await setup.close()
 
         await _connect_short(short, aid, slot_id="d8")
 
         # session_options 应反映短连接默认值
-        opts = short._session_options
+        opts = short.session_options
 
         if opts.get("connection_kind") != "short":
             _fail(name, f"session_options.connection_kind={opts.get('connection_kind')}")
@@ -632,3 +626,4 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+

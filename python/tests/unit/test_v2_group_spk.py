@@ -148,16 +148,13 @@ def test_p2p_last_uploaded_spk_updates_only_after_upload_success(tmp_path):
         db.close()
 
 
-def test_p2p_uploaded_marker_restores_without_rpc(tmp_path):
+def test_p2p_uploaded_marker_reuploads_to_heal_remote_state(tmp_path):
     db, session = _make_session(tmp_path)
     calls = []
 
     async def call_fn(method, params):
         calls.append((method, dict(params)))
         return {"ok": True}
-
-    async def fail_if_called(method, params):
-        raise AssertionError(f"unexpected RPC: {method} {params}")
 
     try:
         asyncio.run(session.ensure_registered(call_fn))
@@ -172,9 +169,10 @@ def test_p2p_uploaded_marker_restores_without_rpc(tmp_path):
             aid_priv_der=session._aid_priv_der,
             aid_pub_der=session._aid_pub_der,
         )
-        asyncio.run(session2.ensure_registered(fail_if_called))
+        asyncio.run(session2.ensure_registered(call_fn))
 
         assert session2.is_last_uploaded_spk(uploaded_spk)
+        assert [method for method, _params in calls] == ["message.v2.put_peer_pk", "message.v2.put_peer_pk"]
     finally:
         db.close()
 

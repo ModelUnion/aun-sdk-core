@@ -6,6 +6,7 @@ PY-003 (seed TOCTOU) 和 PY-004 (SQLCipher 读操作重试) 测试已随 sqlciph
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import secrets
 import tempfile
@@ -17,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aun_core import AUNClient
+from aun_core import AIDStore, AUNClient
 from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL, _PUSHED_SEQS_LIMIT
 from aun_core.e2ee import (
     compute_membership_commitment,
@@ -74,9 +75,30 @@ def _get_signing_identity(aid: str):
 
 def _make_client(tmp_path, aid=_AID_BOB):
     """创建 mock 好的 AUNClient 用于测试。"""
-    client = AUNClient({"aun_path": str(tmp_path / "aun")})
-    client._aid = aid
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
     pk_pem, cert_pem = _get_signing_identity(aid)
+    cert = x509.load_pem_x509_certificate(cert_pem)
+    identity = {
+        "aid": aid,
+        "private_key_pem": pk_pem,
+        "public_key_der_b64": base64.b64encode(
+            cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).decode("ascii"),
+        "curve": "P-256",
+        "cert": cert_pem.decode("utf-8"),
+    }
+    store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
+    store._keystore.save_identity(aid, identity)
+    loaded = store.load(aid)
+    assert loaded.ok and loaded.data is not None
+    client = AUNClient(loaded.data["aid"])
+    store.close()
+    client._aid = aid
     client._identity = {"aid": aid, "private_key_pem": pk_pem, "cert": cert_pem.decode("utf-8")}
     client._state = "connected"
     client._device_id = "test-device"
@@ -125,5 +147,4 @@ def _make_encrypted_group_msg(gs, group_id=_GRP, from_aid=_AID_ALICE, seq=1, epo
 
 
 # ── PY-002: P2P 推送路径 pushed_seqs 应调用 _enforce_pushed_seqs_limit ──
-
 

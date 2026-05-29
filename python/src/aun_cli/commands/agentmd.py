@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import typer
+from pathlib import Path
 
-from aun_cli.adapter import CLISession, handle_error, resolve_profile_config, run_async
+from aun_cli.adapter import CLISession, handle_error, resolve_profile_config, run_async, make_aid_store
 from aun_cli.config import get_profile, set_profile
 from aun_cli.output import output_dict, output_json, output_success, is_json_mode, set_json_mode
 
@@ -22,8 +23,6 @@ def _save_agentmd_path(ctx: typer.Context, agentmd_path: str) -> str:
         prof.setdefault("aun_path", resolved["aun_path"])
     if resolved.get("aid"):
         prof.setdefault("aid", resolved["aid"])
-    if resolved.get("gateway"):
-        prof.setdefault("gateway", resolved["gateway"])
     set_profile(profile_name, prof)
     return profile_name
 
@@ -33,6 +32,13 @@ def _print_result(result: dict) -> None:
         output_json(result)
     else:
         output_dict({str(k): v for k, v in result.items() if k != "content"})
+
+
+def _unwrap_result(result, action: str) -> dict:
+    if result.ok and result.data is not None:
+        return result.data
+    message = result.error.message if result.error else f"{action} failed"
+    raise RuntimeError(message)
 
 
 @agentmd_app.command("path")
@@ -46,10 +52,11 @@ def agentmd_path(
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=False) as client:
-            if path is None:
-                return {"agentmd_path": str(getattr(client, "_agent_md_path", ""))}
-            return {"agentmd_path": client.set_agent_md_path(path)}
+        resolved = resolve_profile_config(ctx)
+        if path is None:
+            current = resolved.get("agentmd_path") or str(Path(resolved["aun_path"]) / "AgentMDs")
+            return {"agentmd_path": current}
+        return {"agentmd_path": str(Path(path))}
 
     try:
         result = run_async(_run())
@@ -76,7 +83,7 @@ def agentmd_publish(ctx: typer.Context) -> None:
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=False) as client:
+        async with CLISession(ctx, need_auth=True) as client:
             return await client.publish_agent_md()
 
     try:
@@ -104,8 +111,15 @@ def agentmd_fetch(
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=False) as client:
-            return await client.fetch_agent_md(aid)
+        resolved = resolve_profile_config(ctx)
+        target = aid or resolved.get("aid")
+        if not target:
+            raise RuntimeError("fetch agent.md requires aid or profile aid")
+        store = make_aid_store(resolved)
+        try:
+            return _unwrap_result(await store.fetch_agent_md(target), "fetch agent.md")
+        finally:
+            store.close()
 
     try:
         result = run_async(_run())
@@ -131,8 +145,16 @@ def agentmd_check(
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=False) as client:
-            return await client.check_agent_md(aid, max_unsynced_days=max_unsynced_days)
+        resolved = resolve_profile_config(ctx)
+        target = aid or resolved.get("aid")
+        if not target:
+            raise RuntimeError("check agent.md requires aid or profile aid")
+        store = make_aid_store(resolved)
+        try:
+            ttl_days = max(0, int(max_unsynced_days))
+            return _unwrap_result(await store.check_agent_md(target, ttl_days=ttl_days), "check agent.md")
+        finally:
+            store.close()
 
     try:
         result = run_async(_run())

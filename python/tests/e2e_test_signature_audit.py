@@ -27,6 +27,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # ── 环境配置 ────────────────────────────────────────────
@@ -49,22 +50,13 @@ _CHARLIE_AID = f"charlie.{_ISSUER}"
 
 
 def _make_client() -> AUNClient:
-    client = AUNClient({
-        "aun_path": _TEST_AUN_PATH,
-    })
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str, retries: int = 3) -> str:
     for attempt in range(retries):
         try:
-            local = client._auth._keystore.load_identity(aid)
-            if local is None:
-                await client.auth.register_aid({"aid": aid})
-            auth = await client.auth.authenticate({"aid": aid})
-            await client.connect(auth)
-            return aid
+            return await ensure_connected_identity(client, aid, attempts=1)
         except Exception as exc:
             if attempt < retries - 1:
                 await asyncio.sleep(2)
@@ -317,7 +309,7 @@ async def test_signature_tamper_detection():
             }
         }
 
-        result = await alice._verify_event_signature(
+        result = await alice.verify_event_signature(
             fake_event, fake_event["client_signature"]
         )
         _result("伪造签名验签不通过", result is False or result == "pending",
@@ -347,3 +339,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

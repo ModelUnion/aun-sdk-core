@@ -57,10 +57,13 @@ class EventDispatcher:
                 self._handlers.pop(event, None)
 
     async def publish(self, event: str, payload: Any) -> None:
-        """发布事件，按订阅顺序调用所有 handler。
+        """发布事件，按订阅顺序**顺序**调用所有 handler。
 
         handler 列表在调用前做快照拷贝，因此在遍历过程中新增或取消的
         订阅不影响本轮分发，下一次 ``publish`` 才生效。
+
+        顺序执行保证：同一事件的多个 handler 不会并发交错执行，
+        避免 handler 修改共享状态时产生竞态。
 
         单个 handler 抛出异常时：
         - 记录 warning 日志
@@ -71,8 +74,7 @@ class EventDispatcher:
         with self._lock:
             handlers = list(self._handlers.get(event, []))
 
-        async def _safe_call(h: EventHandler) -> None:
-            """单个 handler 的安全调用包装，异常不中断其他 handler。"""
+        for h in handlers:
             try:
                 result = h(payload)
                 if inspect.isawaitable(result):
@@ -90,6 +92,3 @@ class EventDispatcher:
                         })
                     except Exception:
                         pass  # handler.error 的 handler 也异常时静默跳过，避免无限递归
-
-        if handlers:
-            await asyncio.gather(*[_safe_call(h) for h in handlers])

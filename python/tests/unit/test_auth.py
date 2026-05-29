@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import shutil
+import ssl
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -14,6 +15,7 @@ from cryptography.x509 import ocsp
 from cryptography.x509.oid import NameOID
 
 from aun_core.auth import AuthFlow
+from aun_core.config import normalize_device_id
 from aun_core.crypto import CryptoProvider
 from aun_core.errors import AuthError
 from aun_core.keystore.file import FileKeyStore
@@ -54,6 +56,61 @@ def _make_auth_flow(root_pem: str) -> AuthFlow:
         connection_factory=lambda url: None,
         root_ca_path=str(root_path),
     )
+
+
+@pytest.mark.asyncio
+async def test_default_connection_factory_respects_verify_ssl_false(monkeypatch, tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    async def fake_connect(url: str, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("aun_core.auth.websockets.connect", fake_connect)
+    flow = AuthFlow(
+        keystore=FileKeyStore(tmp_path),
+        crypto=CryptoProvider(),
+        verify_ssl=False,
+    )
+
+    await flow._default_connection_factory("wss://gateway.agentid.pub/aun")
+
+    assert captured["url"] == "wss://gateway.agentid.pub/aun"
+    ssl_ctx = captured.get("ssl")
+    assert isinstance(ssl_ctx, ssl.SSLContext)
+    assert ssl_ctx.check_hostname is False
+    assert ssl_ctx.verify_mode == ssl.CERT_NONE
+
+
+@pytest.mark.asyncio
+async def test_initialize_with_token_normalizes_empty_instance_context(tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    class FakeTransport:
+        async def call(self, method, params):
+            captured["method"] = method
+            captured["params"] = params
+            return {"status": "ok"}
+
+    flow = AuthFlow(
+        keystore=FileKeyStore(tmp_path / "aun"),
+        crypto=CryptoProvider(),
+        verify_ssl=False,
+    )
+
+    await flow.initialize_with_token(
+        FakeTransport(),
+        {"params": {"nonce": "nonce-1"}},
+        "access-token",
+        device_id="",
+        slot_id="",
+    )
+
+    params = captured["params"]
+    assert isinstance(params, dict)
+    assert params["device"]["id"]
+    assert params["client"]["slot_id"] == "default"
 
 
 def _build_ocsp_response(cert: x509.Certificate, issuer_cert: x509.Certificate, issuer_key, *, status: str) -> str:
@@ -414,6 +471,47 @@ def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
     assert params["delivery_mode"] == {"mode": "queue", "routing": "sender_affinity", "affinity_ttl_ms": 800}
 
 
+def test_initialize_with_token_ignores_external_legacy_capability_override(tmp_path):
+    keystore = FileKeyStore(tmp_path / "aun")
+    flow = AuthFlow(
+        keystore=keystore,
+        crypto=CryptoProvider(),
+        connection_factory=lambda url: None,
+        device_id="device-1",
+        slot_id="slot-a",
+    )
+    calls = []
+
+    class _Transport:
+        async def call(self, method, params):
+            calls.append((method, params))
+            return {"status": "ok"}
+
+    asyncio.run(flow.initialize_with_token(
+        _Transport(),
+        {"params": {"nonce": "nonce-1"}},
+        "token-1",
+        device_id="device-1",
+        slot_id="slot-a",
+        extra_info={
+            "_capabilities": {
+                "e2ee": True,
+                "group_e2ee": True,
+                "supported_p2p_e2ee": ["e2ee"],
+                "supported_group_e2ee": ["group_e2ee"],
+            },
+            "note": "kept",
+        },
+    ))
+
+    params = calls[0][1]
+    assert params["capabilities"]["supported_p2p_e2ee"] == ["e2ee_v2"]
+    assert params["capabilities"]["supported_group_e2ee"] == ["group_e2ee_v2"]
+    assert "e2ee" not in params["capabilities"]["supported_p2p_e2ee"]
+    assert "group_e2ee" not in params["capabilities"]["supported_group_e2ee"]
+    assert params["extra_info"] == {"note": "kept"}
+
+
 def test_load_identity_prefers_instance_state_tokens(tmp_path):
     keystore = FileKeyStore(tmp_path / "aun")
     aid = "alice.example.aid"
@@ -445,8 +543,9 @@ def test_load_identity_prefers_instance_state_tokens(tmp_path):
     assert loaded["access_token_expires_at"] == 123456
 
 
-def test_load_identity_empty_device_id_prefers_instance_state_tokens(tmp_path):
+def test_load_identity_empty_device_id_prefers_default_device_state_tokens(tmp_path):
     keystore = FileKeyStore(tmp_path / "aun")
+    default_device_id = normalize_device_id("", tmp_path / "aun")
     aid = "alice-empty-device.example.aid"
     keystore.save_identity(aid, {
         "aid": aid,
@@ -456,7 +555,7 @@ def test_load_identity_empty_device_id_prefers_instance_state_tokens(tmp_path):
         "access_token": "shared-token",
         "refresh_token": "shared-refresh",
     })
-    keystore.save_instance_state(aid, "", "slot-a", {
+    keystore.save_instance_state(aid, default_device_id, "slot-a", {
         "access_token": "empty-device-token",
         "refresh_token": "empty-device-refresh",
         "access_token_expires_at": 234567,
@@ -476,8 +575,9 @@ def test_load_identity_empty_device_id_prefers_instance_state_tokens(tmp_path):
     assert loaded["access_token_expires_at"] == 234567
 
 
-def test_persist_identity_empty_device_id_saves_instance_state(tmp_path):
+def test_persist_identity_empty_device_id_saves_default_device_state(tmp_path):
     keystore = FileKeyStore(tmp_path / "aun")
+    default_device_id = normalize_device_id("", tmp_path / "aun")
     aid = "persist-empty-device.example.aid"
     flow = AuthFlow(
         keystore=keystore,
@@ -497,7 +597,7 @@ def test_persist_identity_empty_device_id_saves_instance_state(tmp_path):
         "access_token_expires_at": 345678,
     })
 
-    instance_state = keystore.load_instance_state(aid, "", "slot-a")
+    instance_state = keystore.load_instance_state(aid, default_device_id, "slot-a")
     assert instance_state["access_token"] == "empty-device-token"
     assert instance_state["refresh_token"] == "empty-device-refresh"
     assert instance_state["access_token_expires_at"] == 345678

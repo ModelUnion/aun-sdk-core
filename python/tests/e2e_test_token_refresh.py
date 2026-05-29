@@ -14,6 +14,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_authenticated_identity, make_client_for_path
 
 
 os.environ.setdefault("AUN_ENV", "development")
@@ -29,15 +30,13 @@ def _aun_path() -> str:
 async def main() -> None:
     issuer = os.environ.get("AUN_TEST_ISSUER", "agentid.pub").strip() or "agentid.pub"
     aid = f"py-refresh-{uuid.uuid4().hex[:12]}.{issuer}"
-    client = AUNClient({"aun_path": _aun_path()})
-    client._config_model.require_forward_secrecy = False
+    client = make_client_for_path(_aun_path(), require_forward_secrecy=False)
     try:
-        await client.auth.register_aid({"aid": aid})
-        auth = await client.auth.authenticate({"aid": aid})
+        auth = await ensure_authenticated_identity(client, aid)
         initial_token = auth["access_token"]
         refresh_events: list[dict] = []
         client.on("token.refreshed", lambda payload: refresh_events.append(payload))
-        await client.connect(auth, {
+        await client.connect({
             "auto_reconnect": False,
             "heartbeat_interval": 0,
             "token_refresh_before": 3590,
@@ -45,18 +44,18 @@ async def main() -> None:
 
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
-            current = (client._identity or {}).get("access_token")
+            current = client.access_token
             if current and current != initial_token:
                 break
             await asyncio.sleep(1)
 
-        refreshed_token = (client._identity or {}).get("access_token")
+        refreshed_token = client.access_token
         if not refreshed_token or refreshed_token == initial_token:
             raise AssertionError("Python SDK token refresh did not rotate access_token within 45 seconds")
         pong = await client.call("meta.ping", {})
         if not pong:
             raise AssertionError("Python SDK ping after token refresh returned empty result")
-        expires_at = (client._identity or {}).get("access_token_expires_at")
+        expires_at = client.access_token_expires_at
         if not isinstance(expires_at, (int, float)) or expires_at - time.time() < 3000:
             raise AssertionError(f"Python SDK refreshed token expiry is invalid: {expires_at!r}")
         print(f"Python SDK token refresh passed aid={aid} events={len(refresh_events)}")
@@ -66,3 +65,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

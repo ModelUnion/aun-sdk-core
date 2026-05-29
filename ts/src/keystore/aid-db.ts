@@ -39,6 +39,39 @@ const DDL_STATEMENTS = [
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS prekeys (
+    prekey_id TEXT NOT NULL,
+    device_id TEXT NOT NULL DEFAULT '',
+    private_key_enc TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    PRIMARY KEY (prekey_id, device_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_prekeys_device ON prekeys (device_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS group_current (
+    group_id TEXT PRIMARY KEY,
+    epoch INTEGER NOT NULL,
+    secret_enc TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS group_old_epochs (
+    group_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    secret_enc TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    PRIMARY KEY (group_id, epoch)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_group_old_expires ON group_old_epochs (group_id, expires_at)`,
+  `CREATE TABLE IF NOT EXISTS e2ee_sessions (
+    session_id TEXT PRIMARY KEY,
+    data_enc TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS instance_state (
     device_id TEXT NOT NULL,
     slot_id TEXT NOT NULL DEFAULT '_singleton',

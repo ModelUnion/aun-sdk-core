@@ -28,6 +28,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
+from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 
 # ── 配置 ──────────────────────────────────────────────────
@@ -87,17 +88,11 @@ def _run_docker(args: list[str], timeout: int) -> bool:
 
 def _make_client(tag: str) -> AUNClient:
     """创建测试客户端（通过 well-known 发现 gateway）"""
-    client = AUNClient({
-        "aun_path": _TEST_AUN_PATH,
-    })
-    client._config_model.require_forward_secrecy = False
-    return client
+    return make_client_for_path(_TEST_AUN_PATH, require_forward_secrecy=False)
 
 
 async def _ensure_connected(client: AUNClient, aid: str) -> str:
-    await client.auth.register_aid({"aid": aid})
-    auth = await client.auth.authenticate({"aid": aid})
-    await client.connect(auth, {
+    return await ensure_connected_identity(client, aid, connect_options={
         "auto_reconnect": True,
         "heartbeat_interval": 5,
         "retry": {
@@ -106,7 +101,20 @@ async def _ensure_connected(client: AUNClient, aid: str) -> str:
             "max_delay": 10.0,
         },
     })
-    return aid
+
+
+def _state_value(state) -> str:
+    return getattr(state, "value", str(state))
+
+
+def _matches_state(client: AUNClient, target_state: str) -> bool:
+    value = _state_value(client.state)
+    aliases = {
+        "connected": {"ready"},
+        "disconnected": {"standby", "retry_backoff", "reconnecting", "connection_failed"},
+        "authenticating": {"connecting"},
+    }
+    return value == target_state or value in aliases.get(target_state, set())
 
 
 def _docker_restart_gateway(timeout: int = 30) -> bool:
@@ -128,7 +136,7 @@ async def _wait_for_state(client: AUNClient, target_state: str, timeout: float =
     """等待客户端进入目标状态"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if client.state == target_state:
+        if _matches_state(client, target_state):
             return True
         await asyncio.sleep(0.5)
     return False
@@ -149,7 +157,7 @@ async def test_basic_reconnect_after_network_interrupt():
 
     try:
         await _ensure_connected(client, aid)
-        assert client.state == "connected", f"初始连接失败: {client.state}"
+        assert _matches_state(client, "connected"), f"初始连接失败: {client.state}"
         print(f"  [OK] 初始连接成功: {aid}")
 
         # 断开网络
@@ -163,7 +171,7 @@ async def test_basic_reconnect_after_network_interrupt():
         disconnected = await _wait_for_state(client, "disconnected", timeout=15.0)
         if not disconnected:
             # 也可能直接进入 reconnecting
-            disconnected = client.state in ("disconnected", "reconnecting")
+            disconnected = _matches_state(client, "disconnected") or _matches_state(client, "reconnecting")
         print(f"  [OK] 检测到断线: state={client.state}")
 
         # 恢复网络
@@ -270,10 +278,10 @@ async def test_state_events_sequence():
         print(f"  状态序列: {state_sequence}")
 
         # 验证序列包含必要状态
-        assert "disconnected" in state_sequence or "reconnecting" in state_sequence, \
+        assert any(state in {"disconnected", "standby", "retry_backoff", "reconnecting"} for state in state_sequence), \
             f"缺少断线状态，序列: {state_sequence}"
-        assert state_sequence[-1] == "connected", \
-            f"最终状态应为 connected，实际: {state_sequence[-1]}"
+        assert state_sequence[-1] in {"connected", "ready"}, \
+            f"最终状态应为 ready，实际: {state_sequence[-1]}"
 
         print(f"  [PASS] 状态序列正确")
         return True
@@ -357,9 +365,7 @@ async def test_reconnect_exhausted():
     client.on("connection.state", lambda d: state_events.append(d))
 
     try:
-        await client.auth.register_aid({"aid": aid})
-        auth = await client.auth.authenticate({"aid": aid})
-        await client.connect(auth, {
+        await ensure_connected_identity(client, aid, connect_options={
             "auto_reconnect": True,
             "retry": {
                 "initial_delay": 2.0,
@@ -383,7 +389,7 @@ async def test_reconnect_exhausted():
         await asyncio.sleep(10)
         reconnect_attempts = [e for e in state_events if e.get("state") == "reconnecting"]
         print(f"  重连尝试次数: {len(reconnect_attempts)}, 当前状态: {client.state}")
-        assert client.state in ("reconnecting", "disconnected", "connecting", "authenticating"), \
+        assert _state_value(client.state) in {"reconnecting", "retry_backoff", "standby", "connecting"}, \
             f"应在持续重连，而非 {client.state}"
         assert len(reconnect_attempts) >= 2, "应有至少 2 次重连尝试"
 
@@ -420,13 +426,12 @@ async def test_message_chain_recovery_after_reconnect():
     bob_client = _make_client("bob-receiver")
 
     try:
-        await client.auth.register_aid({"aid": aid})
-        auth = await client.auth.authenticate({"aid": aid})
-        await client.connect(auth, {"auto_reconnect": True, "heartbeat_interval": 5})
-
-        await bob_client.auth.register_aid({"aid": bob_aid})
-        bob_auth = await bob_client.auth.authenticate({"aid": bob_aid})
-        await bob_client.connect(bob_auth)
+        await ensure_connected_identity(
+            client,
+            aid,
+            connect_options={"auto_reconnect": True, "heartbeat_interval": 5},
+        )
+        await ensure_connected_identity(bob_client, bob_aid)
 
         # 发送第一条消息
         await client.call("message.send", {"to": bob_aid, "payload": "msg_before_disconnect", "encrypt": False})
@@ -468,9 +473,11 @@ async def test_no_duplicate_background_tasks():
 
     client = _make_client("no-duplicate-tasks")
     try:
-        await client.auth.register_aid({"aid": aid})
-        auth = await client.auth.authenticate({"aid": aid})
-        await client.connect(auth, {"auto_reconnect": True, "heartbeat_interval": 5})
+        await ensure_connected_identity(
+            client,
+            aid,
+            connect_options={"auto_reconnect": True, "heartbeat_interval": 5},
+        )
 
         # 记录初始后台任务数（通过心跳计数）
         initial_heartbeat_count = getattr(client, "_heartbeat_count", 0)
@@ -543,3 +550,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

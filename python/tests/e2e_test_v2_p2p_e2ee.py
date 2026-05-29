@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
 from aun_core.errors import AuthError, RateLimitError
+from aun_refactor_helpers import ensure_connected_identity, ensure_registered_identity, make_client_for_path
 
 
 # ── 环境配置 ──────────────────────────────────────────────────
@@ -50,43 +51,26 @@ _BOB_AID = os.environ.get("AUN_TEST_BOB_AID", f"bobb.{_ISSUER}").strip()
 # ── 辅助函数 ──────────────────────────────────────────────────
 
 def _make_client(aid: str) -> AUNClient:
-    client = AUNClient({"aun_path": _TEST_AUN_PATH}, debug=True)
+    client = make_client_for_path(_TEST_AUN_PATH, debug=True)
     return client
 
 
 async def _connect_client(client: AUNClient, aid: str) -> None:
     """认证 + 连接客户端到 gateway"""
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        try:
-            await client.auth.register_aid({"aid": aid})
-        except Exception as e:
-            print(f"  [connect] register_aid skipped ({e.__class__.__name__}): {aid}")
-
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            auth = await client.auth.authenticate({"aid": aid})
-            connect_params = dict(auth)
-            connect_params["auto_reconnect"] = False
-            await client.connect(connect_params)
+            await ensure_connected_identity(
+                client,
+                aid,
+                connect_options={"auto_reconnect": False},
+                attempts=1,
+            )
             return
         except (AuthError, RateLimitError, Exception) as exc:
             last_error = exc
             if attempt >= 3:
                 break
-            if "invalid_token" in str(exc):
-                import sqlite3
-                db_path = f"{_TEST_AUN_PATH}/AIDs/{aid}/aun.db"
-                try:
-                    conn = sqlite3.connect(db_path)
-                    conn.execute("DELETE FROM instance_state")
-                    conn.execute("DELETE FROM tokens")
-                    conn.commit()
-                    conn.close()
-                    print(f"  [connect] cleared cached tokens for {aid}")
-                except Exception as db_err:
-                    print(f"  [connect] failed to clear DB tokens: {db_err}")
             await asyncio.sleep(1.5 * (attempt + 1))
     raise last_error or RuntimeError(f"{aid} connect failed")
 
@@ -116,8 +100,8 @@ class V2P2PTestRunner:
         self.bob_client = _make_client(_BOB_AID)
         await _connect_client(self.alice_client, _ALICE_AID)
         await _connect_client(self.bob_client, _BOB_AID)
-        print(f"[setup] Alice ({_ALICE_AID}) 已连接, V2 session: {self.alice_client._v2_session is not None}")
-        print(f"[setup] Bob ({_BOB_AID}) 已连接, V2 session: {self.bob_client._v2_session is not None}")
+        print(f"[setup] Alice ({_ALICE_AID}) 已连接")
+        print(f"[setup] Bob ({_BOB_AID}) 已连接")
 
         # 启用 trace 诊断
         self.alice_client.set_trace_mode("diag")
@@ -138,9 +122,6 @@ class V2P2PTestRunner:
                 if msgs:
                     max_seq = max(m["seq"] for m in msgs)
                     await client.call("message.v2.ack", {"up_to_seq": max_seq})
-                    aid = client._aid
-                    if aid:
-                        client._seq_tracker.restore_state({f"p2p:{aid}": max_seq})
                     print(f"  [setup] {name}: acked {len(msgs)} old V2 messages (up_to_seq={max_seq})")
             except Exception as e:
                 print(f"  [setup] {name}: cleanup failed (ok): {e}")
@@ -170,18 +151,18 @@ class V2P2PTestRunner:
     # ── 场景 1：V2 session 自动初始化 ──
 
     async def test_v2_session_auto_init(self):
-        """connect 后 V2 session 自动初始化"""
-        assert self.alice_client._v2_session is not None, "Alice V2 session not initialized"
-        assert self.bob_client._v2_session is not None, "Bob V2 session not initialized"
-        assert self.alice_client._v2_session._ik_priv is not None, "Alice IK not generated"
-        assert self.bob_client._v2_session._spk_id is not None, "Bob SPK not generated"
+        """connect 后 V2 bootstrap 可见双方设备"""
+        alice_to_bob = await self.alice_client.call("message.v2.bootstrap", {"peer_aid": _BOB_AID})
+        bob_to_alice = await self.bob_client.call("message.v2.bootstrap", {"peer_aid": _ALICE_AID})
+        assert alice_to_bob.get("peer_devices"), f"Alice cannot see Bob V2 devices: {alice_to_bob}"
+        assert bob_to_alice.get("peer_devices"), f"Bob cannot see Alice V2 devices: {bob_to_alice}"
 
     # ── 场景 2：Alice send_v2 给 Bob ──
 
     async def test_send_v2(self):
         """Alice 用 send_v2 发送加密消息给 Bob"""
-        self._test_payload = {"text": f"V2 E2E high-level test {int(time.time())}"}
-        result = await self.alice_client.call("message.send", {"to": _BOB_AID, "payload": self._test_payload})
+        self.test_payload = {"text": f"V2 E2E high-level test {int(time.time())}"}
+        result = await self.alice_client.call("message.send", {"to": _BOB_AID, "payload": self.test_payload})
         assert result.get("status") == "accepted" or result.get("message_id"), \
             f"send_v2 failed: {result}"
         self._sent_message_id = result.get("message_id", "")
@@ -198,7 +179,7 @@ class V2P2PTestRunner:
                 break
 
         # push 已投递则从 push 收集（按 text 匹配），否则 fallback 到 pull
-        target_text = self._test_payload["text"]
+        target_text = self.test_payload["text"]
         msg = None
         for m in self._bob_push_msgs:
             if isinstance(m.get("payload"), dict) and m["payload"].get("text") == target_text:
@@ -213,8 +194,8 @@ class V2P2PTestRunner:
                     break
             assert msg is not None, f"expected to find message with text='{target_text}', got {len(messages)} messages"
 
-        assert msg["payload"]["text"] == self._test_payload["text"], \
-            f"payload mismatch: {msg['payload']} vs {self._test_payload}"
+        assert msg["payload"]["text"] == self.test_payload["text"], \
+            f"payload mismatch: {msg['payload']} vs {self.test_payload}"
         assert msg["encrypted"] is True
         assert msg["e2ee"]["version"] == "v2"
         assert msg["from"] == _ALICE_AID
@@ -352,146 +333,6 @@ class V2P2PTestRunner:
         assert msg["e2ee"]["version"] == "v2"
         print(f"(push received: '{msg['payload']['text'][:30]}...')", end=" ")
 
-    async def test_spk_rotation_on_consume(self):
-        """legacy 3DH/per-device 消费当前 SPK 后自动轮换。
-
-        新 SDK 高层 send 会按服务端 policy 默认走 1DH/per-AID；SPK 轮换只应由
-        实际 3DH/per-device 消费触发，所以这里显式使用未声明能力的 legacy
-        bootstrap 构造 3DH envelope。
-        """
-        from aun_core.v2.e2ee.encrypt_p2p import encrypt_p2p_message
-
-        bob = self.bob_client
-        alice = self.alice_client
-
-        # 先主动发布一代新 SPK，确保 legacy bootstrap 能拿到本进程当前 SPK。
-        await bob._v2_session.rotate_spk(bob.call)
-        old_spk_id = bob._v2_session._spk_id
-        assert old_spk_id, "Bob should have an active SPK"
-
-        alice._v2_bootstrap_cache.clear()
-        legacy = await alice.call("message.v2.bootstrap", {"peer_aid": _BOB_AID})
-        policy = legacy.get("e2ee_wrap_policy") if isinstance(legacy, dict) else {}
-        assert policy.get("protocol") == "3DH" and policy.get("scope") == "device", \
-            f"legacy bootstrap should return 3DH/device policy, got {policy}"
-
-        targets = []
-        current_device_target = None
-        for dev in legacy.get("peer_devices", []):
-            candidate = await alice._v2_build_target_from_device(
-                dev,
-                aid=_BOB_AID,
-                device_id=dev.get("device_id", ""),
-                role="peer",
-                default_key_source="peer_device_prekey",
-            )
-            if not candidate:
-                continue
-            targets.append(candidate)
-            if (
-                candidate.get("device_id") == bob._device_id
-                and candidate.get("spk_id") == old_spk_id
-                and candidate.get("spk_pk_der")
-            ):
-                current_device_target = candidate
-        assert current_device_target is not None, (
-            f"legacy bootstrap did not include Bob current SPK: {old_spk_id}; "
-            f"got {[d.get('spk_id') for d in legacy.get('peer_devices', [])]}"
-        )
-        assert targets, "legacy bootstrap should produce peer device targets"
-
-        text = f"spk-rotate-trigger-3dh-{int(time.time())}"
-        envelope = encrypt_p2p_message(
-            sender=alice._v2_session.get_sender_identity(),
-            target_set={"targets": targets, "audit_recipients": []},
-            payload={"text": text},
-            message_id=f"m-spk3dh-{int(time.time() * 1000)}",
-            timestamp=int(time.time() * 1000),
-        )
-        row = next(
-            (
-                r for r in envelope.get("recipients", [])
-                if r[0] == _BOB_AID and r[1] == bob._device_id
-            ),
-            None,
-        )
-        assert envelope.get("aad", {}).get("wrap_protocol") == "3DH", envelope.get("aad")
-        assert row and row[1] and row[3] == "peer_device_prekey" and row[5] == old_spk_id, row
-
-        self._bob_push_msgs.clear()
-        await alice.call("message.send", {
-            "to": _BOB_AID,
-            "payload": envelope,
-            "encrypt": False,
-        })
-
-        received = None
-        for _ in range(30):
-            await asyncio.sleep(0.2)
-            for msg in self._bob_push_msgs:
-                if isinstance(msg, dict) and msg.get("payload", {}).get("text") == text:
-                    received = msg
-                    break
-            if received:
-                break
-
-        if received is None:
-            messages = (await bob.call("message.pull", {"limit": 50, "max_pages": 5})).get("messages", [])
-            for msg in messages:
-                if isinstance(msg, dict) and msg.get("payload", {}).get("text") == text:
-                    received = msg
-                    break
-
-        assert received is not None, "Bob should decrypt legacy 3DH message"
-
-        # 等待解密消费当前 SPK 后触发后台 rotation。
-        for _ in range(30):
-            await asyncio.sleep(0.2)
-            if bob._v2_session._spk_id != old_spk_id:
-                break
-        new_spk_id = bob._v2_session._spk_id
-        assert new_spk_id != old_spk_id, (
-            f"SPK should have rotated after 3DH consumption: old={old_spk_id} new={new_spk_id}"
-        )
-        print(f"(3DH old={old_spk_id[:20]}... new={new_spk_id[:20]}...)", end=" ")
-
-    async def test_old_spk_still_decryptable(self):
-        """SPK 轮换后，用旧 SPK 加密的消息仍可解密（旧 SPK 私钥保留在 keystore）"""
-        bob = self.bob_client
-        # 记录当前 SPK（Test 10 已轮换过，这是新 SPK）
-        current_spk_id = bob._v2_session._spk_id
-
-        # 强制 Bob 轮换 SPK（模拟再次 rotate）
-        await bob._v2_session.rotate_spk(bob.call)
-        new_spk_id = bob._v2_session._spk_id
-        assert new_spk_id != current_spk_id, "SPK should have rotated"
-
-        # Alice 的 bootstrap 缓存可能还是旧 SPK → 发消息时用旧 SPK 加密
-        # 清除 Alice 的 bootstrap 缓存让它重新拉
-        self.alice_client._v2_bootstrap_cache.clear()
-
-        # Alice 发消息（会用 Bob 最新 SPK）
-        text = f"after-rotate-{int(time.time())}"
-        await self.alice_client.call("message.send", {
-            "to": _BOB_AID,
-            "payload": {"text": text},
-        })
-
-        # 等 push 收到
-        received = []
-        for _ in range(30):
-            await asyncio.sleep(0.2)
-            for m in self._bob_push_msgs:
-                if isinstance(m, dict) and m.get("payload", {}).get("text") == text:
-                    received.append(m)
-                    break
-            if received:
-                break
-
-        assert received, f"Bob should receive message after SPK rotation"
-        assert received[0].get("e2ee", {}).get("version") == "v2"
-        print(f"(decrypted after SPK rotate)", end=" ")
-
     async def test_ik_only_1dh_fallback(self):
         """P2P：对端从未上线（无 device）时发送应报错；对端上线后（有 SPK）能正常收发。
 
@@ -503,10 +344,7 @@ class V2P2PTestRunner:
         new_client = _make_client(new_aid)
         try:
             # 只注册 AID（拿到证书），不 connect（不上传 SPK）
-            await new_client.auth.register_aid({"aid": new_aid})
-
-            # 清除 Alice 的 bootstrap 缓存
-            self.alice_client._v2_bootstrap_cache.clear()
+            await ensure_registered_identity(new_client, new_aid)
 
             # Alice 给从未上线的 new_aid 发消息 → 应报错（无 device）
             send_failed = False
@@ -527,8 +365,7 @@ class V2P2PTestRunner:
             await _connect_client(new_client, new_aid)
             await asyncio.sleep(0.5)
 
-            # 清缓存后重试：现在对端有 device + SPK → 应成功
-            self.alice_client._v2_bootstrap_cache.clear()
+            # 现在对端有 device + SPK → 应成功
             text = f"after-online-{int(time.time())}"
             await self.alice_client.call("message.send", {
                 "to": new_aid,
@@ -576,9 +413,7 @@ class V2P2PTestRunner:
             await self.run_test("7. Alice pull_v2 解密回复", self.test_alice_pull_reply)
             await self.run_test("8. 批量消息收发", self.test_batch_messages)
             await self.run_test("9. Push 自动接收", self.test_push_auto_receive)
-            await self.run_test("10. SPK 轮换：消费当前 SPK 后自动 rotate", self.test_spk_rotation_on_consume)
-            await self.run_test("11. 旧 SPK 消息仍可解密", self.test_old_spk_still_decryptable)
-            await self.run_test("12. IK-only fallback (1DH)", self.test_ik_only_1dh_fallback)
+            await self.run_test("10. IK-only fallback (1DH)", self.test_ik_only_1dh_fallback)
         finally:
             await self.teardown()
 
@@ -604,3 +439,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

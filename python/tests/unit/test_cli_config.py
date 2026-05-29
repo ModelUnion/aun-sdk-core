@@ -174,27 +174,24 @@ def test_identity_check_command_registered(tmp_path, monkeypatch):
     monkeypatch.setenv("AUN_CLI_STATE_DIR", str(tmp_path / ".aun" / "cli-sessions"))
     monkeypatch.setenv("AUN_CLI_SESSION_ID", "tab-identity-check")
 
-    async def fake_check_aid(self, params):
-        return {
-            "aid": params["aid"],
-            "status": "available",
-            "can_register": True,
-            "local": {
-                "exists": False,
-                "complete": False,
-                "private_key": False,
-                "public_key": False,
-                "certificate": {"present": False, "valid": False, "expired": False},
-                "issues": ["local identity not found"],
-            },
-            "remote": {"status": "available", "source": "agent.md"},
-        }
-
     from typer.testing import CliRunner
-    from aun_core.namespaces.auth_namespace import AuthNamespace
+    from aun_core import result_ok
+    from aun_cli.commands import identity as identity_commands
     from aun_cli.main import app
 
-    monkeypatch.setattr(AuthNamespace, "check_aid", fake_check_aid)
+    class FakeStore:
+        async def diagnose(self, aid):
+            return result_ok({
+                "aid": aid,
+                "status": "available",
+                "local": {"cert": False, "private_key": False, "error": None},
+                "remote": {"checked": True, "exists": False},
+            })
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(identity_commands, "make_aid_store", lambda resolved: FakeStore())
 
     result = CliRunner().invoke(app, ["--json", "identity", "check", "free.agentid.pub"])
 
@@ -223,8 +220,6 @@ def test_profile_create_command(tmp_path, monkeypatch):
             "work",
             "--aid",
             "work.agentid.pub",
-            "--gateway",
-            "wss://gateway.example/aun",
         ],
     )
 
@@ -234,7 +229,7 @@ def test_profile_create_command(tmp_path, monkeypatch):
     assert data["switched"] is True
     cfg = load_config()
     assert cfg["profiles"]["work"]["aid"] == "work.agentid.pub"
-    assert cfg["profiles"]["work"]["gateway"] == "wss://gateway.example/aun"
+    assert "gateway" not in cfg["profiles"]["work"]
     assert cfg["default"]["profile"] == "work"
     assert get_tab_profile_name() == "work"
 
