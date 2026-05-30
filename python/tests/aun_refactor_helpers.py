@@ -78,7 +78,7 @@ def _import_configured_root_ca(store: AIDStore, root_ca_path: str | None) -> Non
         keystore.close()
 
 
-def _store_for_client(client: AUNClient) -> AIDStore:
+def _store_for_client(client: AUNClient, *, slot_id: str = "") -> AIDStore:
     store_options = _CLIENT_STORE_OPTIONS.get(client)
     if isinstance(store_options, dict):
         store = AIDStore(
@@ -86,17 +86,19 @@ def _store_for_client(client: AUNClient) -> AIDStore:
             encryption_seed=str(store_options.get("encryption_seed") or ""),
             verify_ssl=bool(store_options.get("verify_ssl", False)),
             root_ca_path=store_options.get("root_ca_path"),
+            slot_id=slot_id or "default",
         )
         _import_configured_root_ca(store, store_options.get("root_ca_path"))
         return store
     return AIDStore(
         aun_path=str(client.aun_path or client.config.get("aun_path")),
         encryption_seed=str(client.config.get("seed_password") or ""),
+        slot_id=slot_id or "default",
     )
 
 
-async def ensure_registered_identity(client: AUNClient, aid: str) -> AID:
-    store = _store_for_client(client)
+async def ensure_registered_identity(client: AUNClient, aid: str, *, slot_id: str = "") -> AID:
+    store = _store_for_client(client, slot_id=slot_id)
     try:
         loaded = store.load(aid)
         if not loaded.ok or loaded.data is None or not loaded.data["aid"].is_private_key_valid():
@@ -156,11 +158,14 @@ async def ensure_connected_identity(
     connect_options: dict[str, Any] | None = None,
     attempts: int = 4,
 ) -> str:
-    await ensure_registered_identity(client, aid)
+    # slot_id 来自 AID 对象，通过 AIDStore 注入，不从 connect_options 传给 connect()
+    slot_id = (connect_options or {}).get("slot_id", "")
+    await ensure_registered_identity(client, aid, slot_id=slot_id)
+    opts = {k: v for k, v in (connect_options or {}).items() if k != "slot_id"}
     last_error: Exception | None = None
     for attempt in range(max(1, attempts)):
         try:
-            await client.connect(dict(connect_options or {}))
+            await client.connect(opts or None)
             return aid
         except (AuthError, RateLimitError) as exc:
             last_error = exc

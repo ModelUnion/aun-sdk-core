@@ -184,7 +184,7 @@ func TestTokenGatewayReuseIntegration_SecondAuthSkipsNetwork(t *testing.T) {
 	// 如果第二步未命中，将进入 DiscoverGateway，由于我们不破坏 discovery 行为，
 	// 它仍然能跑通；为此我们用副作用断言：第二次返回的 gateway 必须等于
 	// 第一次的 gateway，且过程中不需要新发起 login。
-	client2.SetGatewayURL("")
+	client2.setGatewayURL("")
 	if cached := client2.AuthLoadCachedGatewayURL(aid); cached == "" {
 		t.Fatal("第二个 client 应能从 keystore metadata 读到 cached gateway_url")
 	}

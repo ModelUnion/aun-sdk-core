@@ -12,6 +12,9 @@ import (
 )
 
 var instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+// slotIDPattern：slot_id 允许额外包含 / : 空格作为分隔符，但不允许出现在首字符
+var slotIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-][A-Za-z0-9._/ :-]{0,127}$`)
 var devEnvValues = map[string]bool{
 	"development": true,
 	"dev":         true,
@@ -30,6 +33,31 @@ func NormalizeInstanceID(value any, field string, allowEmpty bool) (string, erro
 		return "", fmt.Errorf("%s contains unsupported characters", field)
 	}
 	return text, nil
+}
+
+// NormalizeSlotID 校验并规范化 slot_id（允许 / : 空格作为分隔符，但不允许出现在首字符）。
+func NormalizeSlotID(value any, defaultValue string) (string, error) {
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" {
+		if defaultValue == "" {
+			return "", nil
+		}
+		text = defaultValue
+	}
+	if !slotIDPattern.MatchString(text) {
+		return "", fmt.Errorf("slot_id contains unsupported characters")
+	}
+	return text, nil
+}
+
+// SlotIsolationKey 提取 slot_id 的隔离键：第一个分隔符（/ : 空格）之前的部分。
+func SlotIsolationKey(slotID string) string {
+	for i, ch := range slotID {
+		if ch == '/' || ch == ':' || ch == ' ' {
+			return slotID[:i]
+		}
+	}
+	return slotID
 }
 
 // GetDeviceID 获取或生成本设备的稳定 ID。

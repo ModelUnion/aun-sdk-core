@@ -18,7 +18,7 @@ import * as https from 'node:https';
 import * as path from 'node:path';
 import { URL } from 'node:url';
 
-import { configFromMap, getDeviceId, normalizeInstanceId, type AUNConfig } from './config.js';
+import { configFromMap, getDeviceId, normalizeInstanceId, normalizeSlotId, slotIsolationKey, type AUNConfig } from './config.js';
 import { CryptoProvider } from './crypto.js';
 import { GatewayDiscovery } from './discovery.js';
 import { DnsResilientNet } from './net.js';
@@ -184,6 +184,7 @@ interface SessionOptions extends JsonObject {
   retry: SessionRetryOptions;
   timeouts: SessionTimeoutOptions;
   connection_kind?: string;
+  background_sync?: boolean;
 }
 
 export interface ConnectionOptions {
@@ -194,6 +195,11 @@ export interface ConnectionOptions {
   retry_max_attempts?: number;
   heartbeat_interval?: number;
   call_timeout?: number;
+  connection_kind?: string;
+  short_ttl_ms?: number;
+  delivery_mode?: JsonObject;
+  extra_info?: JsonObject;
+  background_sync?: boolean;
 }
 
 interface ConnectParams extends RpcParams {
@@ -213,21 +219,6 @@ interface ConnectParams extends RpcParams {
   connection_kind?: string;
   short_ttl_ms?: number;
   extra_info?: JsonObject;
-}
-
-export interface AUNClientOptions extends Record<string, unknown> {
-  root_ca_path?: string;
-  rootCaPath?: string;
-  verify_ssl?: boolean;
-  verifySSL?: boolean;
-  verifySsl?: boolean;
-  require_forward_secrecy?: boolean;
-  requireForwardSecrecy?: boolean;
-  replay_window_seconds?: number;
-  replayWindowSeconds?: number;
-  debug?: boolean;
-  protected_headers?: Record<string, unknown> | null;
-  aid?: never;
 }
 
 interface AuthContext extends JsonObject {
@@ -603,23 +594,6 @@ async function fetchWithTimeout(
   }
 }
 
-function assertClientOptions(value: unknown, label: string): asserts value is AUNClientOptions | null | undefined {
-  if (value == null) return;
-  if (typeof value !== 'object' || Array.isArray(value) || value instanceof AID) {
-    throw new ValidationError(`${label} must be an options object`);
-  }
-}
-
-function clientOptionsConfig(options: AUNClientOptions | null | undefined): RpcParams {
-  const raw = { ...(options ?? {}) } as Record<string, unknown>;
-  if (Object.prototype.hasOwnProperty.call(raw, 'aid')) {
-    throw new ValidationError('AUNClient options must not include aid; pass an AID object as the first argument');
-  }
-  delete raw.debug;
-  delete raw.protected_headers;
-  return raw as RpcParams;
-}
-
 export class AUNClient {
   /** 原始配置 */
   readonly config: RpcParams;
@@ -766,9 +740,8 @@ export class AUNClient {
     if (typeof aid === 'string') {
       throw new ValidationError('AUNClient aid must be an AID object, not a string');
     }
-    const inputAid = aid instanceof AID ? aid : null;
-    const options: AUNClientOptions = {};
-    const rawConfig: RpcParams = clientOptionsConfig(options);
+    const inputAid = (aid !== null && aid !== undefined && typeof (aid as any).aunPath === 'string' && typeof (aid as any).isPrivateKeyValid === 'function') ? aid as AID : null;
+    const rawConfig: RpcParams = {};
     if (inputAid) {
       rawConfig.aun_path = inputAid.aunPath;
       rawConfig.verify_ssl = inputAid.verifySsl;
@@ -776,7 +749,7 @@ export class AUNClient {
       rawConfig.debug = inputAid.debug;
     }
     this._configModel = configFromMap(rawConfig);
-    const initAid = inputAid ? inputAid.aid : null;
+    const initAid = (inputAid && inputAid.isPrivateKeyValid()) ? inputAid.aid : null;
     this._agentMdPath = path.join(this._configModel.aunPath, 'AIDs');
     this.config = {
       aun_path: this._configModel.aunPath,
@@ -855,17 +828,17 @@ export class AUNClient {
     this._transport.setMetaObserver((meta) => this._observeRpcMeta(meta));
 
     if (inputAid) {
-      if (!inputAid.isPrivateKeyValid()) {
-        throw new StateError('AUNClient requires an AID with a valid private key');
+      // 与 Python 对齐：私钥无效时只用 aunPath 配置，state 保持 no_identity
+      if (inputAid.isPrivateKeyValid()) {
+        this._currentAid = inputAid;
+        this._identity = {
+          aid: inputAid.aid,
+          private_key_pem: (inputAid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
+          public_key_der_b64: inputAid.publicKey,
+          cert: inputAid.certPem,
+        };
+        this._state = 'standby';
       }
-      this._currentAid = inputAid;
-      this._identity = {
-        aid: inputAid.aid,
-        private_key_pem: (inputAid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
-        public_key_der_b64: inputAid.publicKey,
-        cert: inputAid.certPem,
-      };
-      this._state = 'standby';
     }
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => this._onRawMessageReceived(data));
@@ -978,6 +951,7 @@ export class AUNClient {
       cert: aid.certPem,
     };
     (this._auth as unknown as { _aid?: string })._aid = aid.aid;
+    this._slotId = aid.slotId || 'default';
     this._state = 'standby';
     this._closing = false;
     this._lastError = null;
@@ -1270,7 +1244,7 @@ export class AUNClient {
    */
   async publishAgentMd(): Promise<Record<string, unknown>> {
     const target = this._agentMdOwnerAid();
-    if (!target) {
+    if (!target || !this._currentAid) {
       throw new ValidationError('publishAgentMd requires local AID');
     }
     const content = this._readAgentMdContent(target);
@@ -1363,7 +1337,7 @@ export class AUNClient {
     return this._agentMdPath;
   }
 
-  /** 返回 setLocalAgentMdPath 计算的 etag；未设置或读取失败时返回空串。 */
+  /** 返回本地 agent.md 文件的 etag；未设置或读取失败时返回空串。 */
   getLocalAgentMdEtag(): string {
     return this._localAgentMdEtag;
   }
@@ -1834,11 +1808,16 @@ export class AUNClient {
   /** 连接到 Gateway；身份来自构造函数或 loadIdentity(aid)，认证由 SDK 内部自动完成。 */
   async connect(opts?: ConnectionOptions): Promise<void> {
     const tStart = Date.now();
+    // 先校验非法参数（ValidationError），再检查身份（StateError）
     if (opts !== undefined && typeof opts === 'object') {
       const raw = opts as Record<string, unknown>;
-      if ('gateway' in raw || 'access_token' in raw || 'aid' in raw || 'token' in raw) {
-        throw new ValidationError('connect options must not include gateway/access_token/aid; these are managed internally');
+      if ('access_token' in raw || 'aid' in raw || 'token' in raw) {
+        throw new ValidationError('connect options must not include access_token/aid; these are managed internally');
       }
+    }
+    const target = this._currentAid?.aid ?? this._aid ?? '';
+    if (!target || !this._currentAid?.isPrivateKeyValid()) {
+      throw new StateError('connect requires a loaded AID with a valid private key');
     }
     const options: RpcParams = {};
     if (opts?.auto_reconnect !== undefined) options.auto_reconnect = opts.auto_reconnect;
@@ -1856,10 +1835,11 @@ export class AUNClient {
         max_attempts: opts.retry_max_attempts ?? 0,
       };
     }
-    const target = this._currentAid?.aid ?? this._aid ?? '';
-    if (!target || !this._currentAid?.isPrivateKeyValid()) {
-      throw new StateError('connect requires a loaded AID with a valid private key');
-    }
+    if (opts?.connection_kind !== undefined) options.connection_kind = opts.connection_kind;
+    if (opts?.short_ttl_ms !== undefined) options.short_ttl_ms = opts.short_ttl_ms;
+    if (opts?.delivery_mode !== undefined) options.delivery_mode = opts.delivery_mode;
+    if (opts?.extra_info !== undefined) options.extra_info = opts.extra_info;
+    if (opts?.background_sync !== undefined) options.background_sync = opts.background_sync;
     const publicState = this.state;
     const allowed = new Set<ConnectionState>([
       ConnectionState.STANDBY,
@@ -2864,7 +2844,7 @@ export class AUNClient {
     }
     if ('slot_id' in message) {
       const targetSlotId = String(message.slot_id ?? '').trim();
-      if (targetSlotId !== this._slotId) {
+      if (slotIsolationKey(targetSlotId) !== slotIsolationKey(this._slotId)) {
         return false;
       }
     }
@@ -4302,9 +4282,11 @@ export class AUNClient {
 
       // connect/reconnect 成功后自动触发一次 P2P message.v2.pull，补齐离线期间积压
       // 群消息按惰性触发，不在此处主动 pull
-      void this._fillP2pGap().catch((exc) => {
-        this._clientLog.warn(`schedule post-connect P2P gap fill failed: ${formatCaughtError(exc)}`);
-      });
+      if (this._sessionOptions.background_sync !== false) {
+        void this._fillP2pGap().catch((exc) => {
+          this._clientLog.warn(`schedule post-connect P2P gap fill failed: ${formatCaughtError(exc)}`);
+        });
+      }
       this._clientLog.debug(`_connectOnce exit: elapsed=${Date.now() - tStart}ms gateway=${gatewayUrl}, aid=${this._aid ?? ''}`);
     } catch (err) {
       this._state = (prevState === 'connected' || prevState === 'ready') ? 'standby' : (this._currentAid ? 'standby' : 'no_identity');
@@ -6859,7 +6841,7 @@ export class AUNClient {
     else delete request.access_token;
     request.gateway = gateway;
     request.device_id = this._deviceId;
-    request.slot_id = normalizeInstanceId(request.slot_id ?? this._slotId, 'slot_id', { allowEmpty: true });
+    request.slot_id = normalizeSlotId(request.slot_id ?? this._slotId);
     let deliveryModeRaw: JsonValue | object | undefined = request.delivery_mode;
     if (deliveryModeRaw == null) {
       deliveryModeRaw = { ...this._defaultConnectDeliveryMode };
@@ -6918,6 +6900,7 @@ export class AUNClient {
     if ('timeouts' in params && isJsonObject(params.timeouts)) {
       Object.assign(options.timeouts, params.timeouts);
     }
+    if ('background_sync' in params) options.background_sync = Boolean(params.background_sync);
     return options;
   }
 

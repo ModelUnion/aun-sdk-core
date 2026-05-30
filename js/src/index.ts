@@ -3,7 +3,7 @@
 export { VERSION as __version__ } from './version.js';
 
 // 客户端
-export { AUNClient, type AUNClientOptions, type ConnectionOptions } from './client.js';
+export { AUNClient, type ConnectionOptions } from './client.js';
 export { AID, type VerifyResult } from './aid.js';
 export { AIDStore, type AIDInfo } from './aid-store.js';
 export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';

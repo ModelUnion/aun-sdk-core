@@ -43,7 +43,7 @@ func (m *mockAuthClient) GetGatewayURL() string {
 	return m.gatewayURL
 }
 
-func (m *mockAuthClient) SetGatewayURL(url string) {
+func (m *mockAuthClient) setGatewayURL(url string) {
 	m.gatewayURL = url
 }
 
@@ -100,6 +100,10 @@ func (m *mockAuthClient) SetIdentity(identity map[string]any) {
 func (m *mockAuthClient) AuthLoadCachedGatewayURL(aid string) string {
 	m.loadCachedGatewayCalls++
 	return m.cachedGatewayURL
+}
+
+func (m *mockAuthClient) CacheDiscoveredGatewayURL(url string) {
+	m.cachedGatewayURL = url
 }
 
 func (m *mockAuthClient) AuthPersistGatewayURL(aid, gatewayURL string) {

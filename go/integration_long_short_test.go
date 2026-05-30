@@ -53,12 +53,11 @@ func connectLong(t *testing.T, client *AUNClient, aid, slotID string, timeout ti
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	integrationLoadAIDIntoClient(t, client, aid)
+	integrationLoadAIDIntoClient(t, client, aid, slotID)
 	return client.Connect(ctx, ConnectionOptions{
 		AutoReconnect:     boolPtr(false),
 		HeartbeatInterval: 30 * time.Second,
 		ConnectionKind:    "long",
-		SlotID:            slotID,
 	})
 }
 
@@ -67,11 +66,10 @@ func connectShort(t *testing.T, client *AUNClient, aid, slotID string, shortTtlM
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	integrationLoadAIDIntoClient(t, client, aid)
+	integrationLoadAIDIntoClient(t, client, aid, slotID)
 	opts := ConnectionOptions{
 		ConnectionKind: "short",
 		ShortTtlMs:     shortTtlMs,
-		SlotID:         slotID,
 	}
 	return client.Connect(ctx, opts)
 }

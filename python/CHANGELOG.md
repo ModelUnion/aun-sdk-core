@@ -6,6 +6,18 @@
 
 ---
 
+## 0.4.3 — 2026-05-31
+
+### Added
+- **`normalize_slot_id` / `slot_isolation_key`**：新增 slot_id 校验与隔离键提取工具函数，支持 `/` `:` 空格作为分隔符（首字符不允许）。
+- **`ConnectOptions` 新增字段**：`connection_kind`、`short_ttl_ms`、`extra_info`、`delivery_mode`、`background_sync`，与 Go / TS / JS SDK 对齐。
+
+### Changed
+- **`delivery_mode` 语义简化**：移除 `queue_routing` / `affinity_ttl_ms` 便捷字段，统一走 `delivery_mode` dict。
+- **slot_id 隔离逻辑**：`connect` 时若目标 slot_id 隔离键与当前不同，自动拒绝跨 slot 连接。
+
+---
+
 ## 0.4.2 — 2026-05-30
 
 ### Added

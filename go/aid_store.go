@@ -143,13 +143,7 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 	if o.VerifySSL != nil {
 		verifySSL = *o.VerifySSL
 	}
-	c := NewAUNClient(nil, AUNClientOptions{
-		AUNPath:      aunPath,
-		SeedPassword: encryptionSeed,
-		VerifySSL:    &verifySSL,
-		RootCAPath:   o.RootCaPath,
-		Debug:        o.Debug,
-	})
+	c := newClientForStore(aunPath, encryptionSeed, verifySSL, o.RootCaPath, o.Debug)
 	return &AIDStore{
 		aunPath:        aunPath,
 		encryptionSeed: encryptionSeed,
@@ -165,12 +159,6 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 // Close 释放资源
 func (s *AIDStore) Close() {
 	_ = s.client.Close()
-}
-
-// SetGatewayURL 显式设置后续联网方法使用的 Gateway URL。
-// 主要用于测试容器或调用方已完成 discovery 的场景；未设置时仍按 AID issuer 自动发现。
-func (s *AIDStore) SetGatewayURL(gatewayURL string) {
-	s.client.SetGatewayURL(strings.TrimSpace(gatewayURL))
 }
 
 // aidStoreErr 创建带字符串错误码的 AUNError，供 Load() 内部使用。
@@ -397,7 +385,7 @@ func (s *AIDStore) Resolve(ctx context.Context, aid string, opts ...AIDStoreReso
 		if gwErr != nil {
 			return ResultErr[AIDStoreResolveResult](ErrCodeNetworkError, gwErr.Error(), gwErr)
 		}
-		s.client.SetGatewayURL(gatewayURL)
+		s.client.setGatewayURL(gatewayURL)
 		certBytes, fetchErr := s.client.AuthFetchPeerCert(resolveCtx, target, "")
 		if fetchErr != nil {
 			if errors.Is(fetchErr, errCertNotFound) {

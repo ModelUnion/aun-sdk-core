@@ -2,7 +2,7 @@
 //
 // 对齐 Python 实现（python/src/aun_core/client.py 的 _on_gateway_disconnect / _handle_transport_disconnect）：
 // 1) 服务端通过 event/gateway.disconnect 发出的 detail 字段必须透传到应用层 'gateway.disconnect' 事件
-// 2) 进入 terminal_failed 路径时，connection.state 事件也要带上 detail/code，便于业务定位被踢原因
+// 2) 进入 terminal_failed 路径时，state_change 事件也要带上 detail/code，便于业务定位被踢原因
 import 'fake-indexeddb/auto';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { AUNClient } from '../../src/client.js';
@@ -81,7 +81,7 @@ describe('gateway.disconnect detail 透传', () => {
 
   it('terminal_failed 状态变更也带 detail（如 4015 配额踢人后）', async () => {
     const states: any[] = [];
-    client.on('connection.state', (payload) => {
+    client.on('state_change', (payload) => {
       states.push(payload);
     });
 
@@ -109,7 +109,7 @@ describe('gateway.disconnect detail 透传', () => {
     const fakeError = new Error('connection closed');
     await (client as any)._handleTransportDisconnect(fakeError, 4015);
 
-    // 应该有两次 connection.state：disconnected 和 terminal_failed
+    // 应该有两次 state_change：disconnected 和 terminal_failed
     expect(states.length).toBeGreaterThanOrEqual(2);
     const terminal = states.find((s) => s.state === 'connection_failed');
     expect(terminal).toBeTruthy();
@@ -121,7 +121,7 @@ describe('gateway.disconnect detail 透传', () => {
 
   it('terminal_failed 但没有 _lastDisconnectInfo 时事件不带 detail/code 字段', async () => {
     const states: any[] = [];
-    client.on('connection.state', (payload) => {
+    client.on('state_change', (payload) => {
       states.push(payload);
     });
 

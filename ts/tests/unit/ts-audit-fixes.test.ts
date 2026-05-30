@@ -108,7 +108,7 @@ describe('ISSUE-SDK-TS-001: disconnect() 方法', () => {
     expect(client.state).toBe('ready');
   });
 
-  it('disconnect 发布 connection.state 事件', async () => {
+  it('disconnect 发布 state_change 事件', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._transport = {
@@ -116,7 +116,7 @@ describe('ISSUE-SDK-TS-001: disconnect() 方法', () => {
       call: vi.fn().mockResolvedValue({}),
     };
     const events: any[] = [];
-    client.on('connection.state', (data) => { events.push(data); });
+    client.on('state_change', (data) => { events.push(data); });
     await client.disconnect();
     expect(events.length).toBeGreaterThan(0);
     expect(events[events.length - 1].state).toBe('standby');

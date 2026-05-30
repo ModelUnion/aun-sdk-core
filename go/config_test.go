@@ -182,8 +182,17 @@ func TestNormalizeInstanceID(t *testing.T) {
 		t.Fatalf("空 slot_id 规范化结果应为空字符串: %q", empty)
 	}
 
-	if _, err := NormalizeInstanceID("slot with space", "slot_id", false); err == nil {
-		t.Fatal("非法 slot_id 应报错")
+	if _, err := NormalizeSlotID("slot with space", "default"); err != nil {
+		t.Fatalf("含空格的 slot_id 应合法: %v", err)
+	}
+	if key := SlotIsolationKey("slot with space"); key != "slot" {
+		t.Fatalf("SlotIsolationKey(\"slot with space\") 应为 \"slot\", 实际: %q", key)
+	}
+	if _, err := NormalizeSlotID("/invalid", "default"); err == nil {
+		t.Fatal("首字符为 / 的 slot_id 应报错")
+	}
+	if _, err := NormalizeSlotID(":invalid", "default"); err == nil {
+		t.Fatal("首字符为 : 的 slot_id 应报错")
 	}
 	if _, err := NormalizeInstanceID("", "device_id", false); err == nil {
 		t.Fatal("空 device_id 应报错")

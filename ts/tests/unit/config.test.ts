@@ -3,7 +3,7 @@
  */
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { defaultConfig, configFromMap, normalizeInstanceId } from '../../src/config.js';
+import { defaultConfig, configFromMap, normalizeInstanceId, normalizeSlotId, slotIsolationKey } from '../../src/config.js';
 import { ValidationError } from '../../src/errors.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -94,7 +94,25 @@ describe('configFromMap', () => {
   });
 
   it('normalizeInstanceId 校验非法字符', () => {
-    expect(() => normalizeInstanceId('slot with space', 'slot_id')).toThrow(ValidationError);
+    expect(() => normalizeInstanceId(' leading-space', 'device_id')).toThrow(ValidationError);
+  });
+
+  it('normalizeSlotId 允许分隔符', () => {
+    expect(normalizeSlotId('slot with space')).toBe('slot with space');
+    expect(normalizeSlotId('evolclaw/cli')).toBe('evolclaw/cli');
+    expect(normalizeSlotId('evolclaw:daemon')).toBe('evolclaw:daemon');
+  });
+
+  it('normalizeSlotId 拒绝首字符为分隔符', () => {
+    expect(() => normalizeSlotId(' invalid')).toThrow(ValidationError);
+    expect(() => normalizeSlotId('/invalid')).toThrow(ValidationError);
+  });
+
+  it('slotIsolationKey 提取前缀', () => {
+    expect(slotIsolationKey('evolclaw cli')).toBe('evolclaw');
+    expect(slotIsolationKey('evolclaw/cli')).toBe('evolclaw');
+    expect(slotIsolationKey('evolclaw:daemon')).toBe('evolclaw');
+    expect(slotIsolationKey('simple')).toBe('simple');
   });
 
   it('生产环境默认启用 verifySsl', () => {

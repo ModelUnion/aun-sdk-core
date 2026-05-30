@@ -24,7 +24,7 @@ import websockets
 from .aid import AID
 from .aid_store import AIDStore
 from .auth import AuthFlow
-from .config import AUNConfig, get_device_id, normalize_instance_id, normalize_slot_id
+from .config import AUNConfig, get_device_id, normalize_instance_id, normalize_slot_id, slot_isolation_key
 from .logger import AUNLogger, NullLogger
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
@@ -1622,6 +1622,16 @@ class AUNClient:
                 params["heartbeat_interval"] = opts["heartbeat_interval"]
             if "call_timeout" in opts:
                 params.setdefault("timeouts", {})["call"] = opts["call_timeout"]
+            if "connection_kind" in opts:
+                params["connection_kind"] = opts["connection_kind"]
+            if "short_ttl_ms" in opts:
+                params["short_ttl_ms"] = opts["short_ttl_ms"]
+            if "extra_info" in opts:
+                params["extra_info"] = opts["extra_info"]
+            if "delivery_mode" in opts:
+                params["delivery_mode"] = opts["delivery_mode"]
+            if "background_sync" in opts:
+                params["background_sync"] = opts["background_sync"]
         # slot_id 来自 AID，不从 opts 传入
         slot_id = getattr(self._current_aid, "slot_id", None) or self._slot_id or ""
         if slot_id:
@@ -3439,7 +3449,7 @@ class AUNClient:
             if target_device_id != self._device_id:
                 return False
         target_slot_id = str(message.get("slot_id") or "").strip()
-        if target_slot_id and self._slot_id and target_slot_id != self._slot_id:
+        if target_slot_id and self._slot_id and slot_isolation_key(target_slot_id) != slot_isolation_key(self._slot_id):
             return False
         return True
 

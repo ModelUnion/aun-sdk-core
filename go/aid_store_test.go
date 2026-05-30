@@ -313,8 +313,8 @@ func TestAIDStoreResolve_CertNotFound(t *testing.T) {
 	defer server.Close()
 
 	s := newTestAIDStore(t)
-	// 显式设置 Gateway URL 指向 mock server，跳过 discovery
-	s.SetGatewayURL(server.URL)
+	// 测试专用：直接设置内部 client 的 gateway，跳过 discovery
+	s.client.setGatewayURL(server.URL)
 
 	// 解析一个本地未缓存的 AID，强制走 PKI 拉取路径
 	r := s.Resolve(context.Background(), "ghost.aid.com", AIDStoreResolveOptions{SkipAgentMD: true})

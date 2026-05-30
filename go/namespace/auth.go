@@ -24,7 +24,7 @@ import (
 // 避免直接依赖 AUNClient 导致的循环引用
 type ClientInterface interface {
 	GetGatewayURL() string
-	SetGatewayURL(url string)
+	CacheDiscoveredGatewayURL(url string)
 	GetAID() string
 	SetAID(aid string)
 	GetConfigDiscoveryPort() int
@@ -135,7 +135,7 @@ func (a *AuthNamespace) resolveGateway(ctx context.Context, aid string) (string,
 	// 从 keystore metadata 读持久化的 gateway_url（避免每次进程启动都做 well-known discovery）
 	if cached := strings.TrimSpace(a.client.AuthLoadCachedGatewayURL(resolvedAID)); cached != "" {
 		pkgLogAuth().Debug("resolveGateway from keystore cache aid=%s gateway=%s", resolvedAID, cached)
-		a.client.SetGatewayURL(cached)
+		a.client.CacheDiscoveredGatewayURL(cached)
 		return cached, nil
 	}
 
@@ -211,7 +211,7 @@ func (a *AuthNamespace) RegisterAID(ctx context.Context, params map[string]any) 
 	if err != nil {
 		return nil, fmt.Errorf("auth.register_aid gateway 发现失败: %w", err)
 	}
-	a.client.SetGatewayURL(gatewayURL)
+	a.client.CacheDiscoveredGatewayURL(gatewayURL)
 
 	result, err := a.client.AuthRegisterAID(ctx, gatewayURL, aid)
 	if err != nil {
@@ -253,7 +253,7 @@ func (a *AuthNamespace) Authenticate(ctx context.Context, params map[string]any)
 	if err != nil {
 		return nil, fmt.Errorf("auth.authenticate gateway 发现失败: %w", err)
 	}
-	a.client.SetGatewayURL(gatewayURL)
+	a.client.CacheDiscoveredGatewayURL(gatewayURL)
 
 	result, err := a.client.AuthAuthenticate(ctx, gatewayURL, aid)
 	if err != nil {
@@ -750,7 +750,7 @@ func (a *AuthNamespace) UploadAgentMD(ctx context.Context, content string) (out 
 	if err != nil {
 		return nil, fmt.Errorf("auth.upload_agent_md gateway 发现失败: %w", err)
 	}
-	a.client.SetGatewayURL(gatewayURL)
+	a.client.CacheDiscoveredGatewayURL(gatewayURL)
 
 	token, err := a.ensureAgentMDUploadToken(ctx, aid)
 	if err != nil {

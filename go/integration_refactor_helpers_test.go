@@ -9,9 +9,13 @@ import (
 	"time"
 )
 
-func integrationStoreForPath(t *testing.T, aunPath string) *AIDStore {
+func integrationStoreForPath(t *testing.T, aunPath string, slotID ...string) *AIDStore {
 	t.Helper()
-	store := NewAIDStore(aunPath, "")
+	opts := AIDStoreOptions{}
+	if len(slotID) > 0 && slotID[0] != "" {
+		opts.SlotID = slotID[0]
+	}
+	store := NewAIDStore(aunPath, "", opts)
 	t.Cleanup(store.Close)
 	return store
 }
@@ -35,12 +39,9 @@ func integrationRegisterOrLoadAID(t *testing.T, aunPath, aid string) *AID {
 	return lr.Data.AID
 }
 
-func integrationLoadAIDIntoClient(t *testing.T, client *AUNClient, aid string) *AID {
+func integrationLoadAIDIntoClient(t *testing.T, client *AUNClient, aid string, slotID ...string) *AID {
 	t.Helper()
-	store := integrationStoreForPath(t, client.configModel.AUNPath)
-	if gatewayURL := client.GetGatewayURL(); gatewayURL != "" {
-		store.SetGatewayURL(gatewayURL)
-	}
+	store := integrationStoreForPath(t, client.configModel.AUNPath, slotID...)
 	lr := store.Load(aid)
 	if !lr.Ok {
 		t.Fatalf("加载 AID 失败: %v", lr.Error.Message)

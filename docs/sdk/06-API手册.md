@@ -12,6 +12,8 @@
 - [RPC 方法参考](#rpc-方法参考)
 - [Stream 使用指南](#stream-使用指南)
 
+> **多语言命名约定**：Python 使用 `snake_case`（如 `aun_path`、`fetch_agent_md`），TS/JS 使用 `camelCase`（如 `aunPath`、`fetchAgentMd`），Go 使用 `PascalCase` 公开方法（如 `Load`、`Register`）。本手册表格中各列对应各语言的实际命名。
+
 ---
 
 ## AIDStore
@@ -19,19 +21,40 @@
 Python：
 
 ```python
-store = AIDStore(aun_path: str, encryption_seed: str, *, device_id=None, slot_id="default", debug=False)
+store = AIDStore(
+    aun_path: str,
+    encryption_seed: str,
+    *,
+    device_id=None,
+    slot_id="default",
+    verify_ssl=None,      # None=自动（由 AUN_ENV/KITE_ENV 决定），True/False=强制
+    root_ca_path=None,    # 私有部署时指定自定义根证书路径
+    debug=False,
+)
 ```
 
 TypeScript / JavaScript：
 
 ```ts
-const store = new AIDStore({ aunPath, encryptionSeed, deviceId, slotId, debug });
+const store = new AIDStore({
+  aunPath, encryptionSeed,
+  deviceId, slotId,
+  verifySsl,    // 同 Python verify_ssl
+  rootCaPath,   // 同 Python root_ca_path
+  debug,
+});
 ```
 
 Go：
 
 ```go
 store := aun.NewAIDStore(aunPath, encryptionSeed)
+// 可选配置通过 AIDStoreOptions 传入
+store := aun.NewAIDStore(aunPath, encryptionSeed, aun.AIDStoreOptions{
+    VerifySSL:  &[]bool{true}[0],
+    RootCaPath: "/path/to/ca.crt",
+    Debug:      true,
+})
 ```
 
 ### 方法
@@ -42,15 +65,38 @@ store := aun.NewAIDStore(aunPath, encryptionSeed)
 | `register(aid)` | `register(aid)` | `Register(ctx, aid)` | 注册并落盘证书和私钥 |
 | `list()` | `list()` | `List()` | 列出本地 AID |
 | `exists(aid)` | `exists(aid)` | `Exists(ctx, aid)` | 远端存在性检查 |
-| `resolve(aid, opts=None)` | `resolve(aid, opts?)` | 当前未暴露同名完整方法 | 拉证书、缓存、拉 agent.md 并验签 |
-| `fetch_agent_md(aid)` | `fetchAgentMd(aid)` | 当前未暴露同名完整方法 | 下载 agent.md |
-| `head_agent_md(aid)` | `headAgentMd(aid)` | 当前未暴露同名完整方法 | HEAD agent.md |
-| `check_agent_md(aid, ttl_days=1)` | `checkAgentMd(aid, ttlDays?)` | 当前未暴露同名完整方法 | 缓存一致性检查 |
-| `diagnose(aid)` | `diagnose(aid)` | 当前未暴露同名完整方法 | 本地 + 远端诊断 |
-| `renew_cert(aid)` / `rekey(aid)` | `renewCert(aid)` / `rekey(aid)` | 当前未暴露同名完整方法 | 证书运维 |
+| `resolve(aid, opts=None)` | `resolve(aid, opts?)` | `Resolve(ctx, aid, opts...)` | 拉证书、缓存、拉 agent.md 并验签；`opts.timeout` / `context.WithTimeout` 控制超时 |
+| `fetch_agent_md(aid, timeout_ms=30000)` | `fetchAgentMd(aid, timeoutMs=30000)` | `FetchAgentMd(ctx, aid)` | 下载 agent.md，返回 `FetchAgentMdResult` / `AgentMDInfo` |
+| `head_agent_md(aid)` | `headAgentMd(aid)` | `HeadAgentMd(ctx, aid)` | HEAD agent.md |
+| `check_agent_md(aid, ttl_days=1)` | `checkAgentMd(aid, ttlDays?)` | `CheckAgentMd(ctx, aid, maxUnsyncedDays...)` | 缓存一致性检查 |
+| `diagnose(aid)` | `diagnose(aid)` | `Diagnose(ctx, aid)` | 本地 + 远端诊断 |
+| `renew_cert(aid)` / `rekey(aid)` | `renewCert(aid)` / `rekey(aid)` | `RenewCert(ctx, aid)` / `Rekey(ctx, aid)` | 证书运维 |
 | `change_seed(old, new)` | `changeSeed(old, new)` | `ChangeSeed(old, new)` | 本地密钥保护种子迁移 |
 
 Python / TS / JS 返回 Result 对象；Go 使用惯用 `(value, error)`。
+
+### Result 类型
+
+```python
+# ok=True 时
+{"ok": True, "data": {...}}
+
+# ok=False 时
+{"ok": False, "error": {"code": "ERROR_CODE", "message": "..."}}
+```
+
+### FetchAgentMdResult
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `aid` | str | AID 字符串 |
+| `content` | str | agent.md 原始内容 |
+| `verification` | `{status, reason?}` | 验签结果；`status` 为 `"ok"` / `"no_cert"` / `"invalid"` 等 |
+| `cert_pem` | str | 签名所用证书 PEM |
+| `etag` | str | HTTP ETag |
+| `last_modified` | str | HTTP Last-Modified |
+
+> **v0.4.2 变更**：`discoveryPort` 配置项已移除，Gateway 地址完全由 SDK 根据 AID issuer 自动发现，无需手动指定端口。
 
 ---
 
@@ -94,26 +140,26 @@ Python：
 
 ```python
 client = AUNClient()
-client = AUNClient(aid, debug=True, protected_headers={"app": "demo"})
+client = AUNClient(aid)
 ```
 
 TS/JS：
 
 ```ts
-const client = new AUNClient({ debug: true });
-const client = new AUNClient(aid, { debug: true, protected_headers: { app: "demo" } });
+const client = new AUNClient();
+const client = new AUNClient(aid);
 ```
 
 Go：
 
 ```go
-client := aun.NewAUNClient(aun.AUNClientOptions{Debug: true})
-client := aun.NewAUNClient(aid, aun.AUNClientOptions{Debug: true})
+client := aun.NewAUNClientEmpty()
+client := aun.NewAUNClient(aid)
 ```
 
 构造约束：
 
-- `aid` 必须是 AID 对象。
+- `aid` 必须是 AID 对象（由 `AIDStore.load()` 返回）。
 - 不接受字符串 AID。
 - 不接受把 aid 放进 options。
 - 不接受旧的 `(config, debug)` 或 `(config, true)` 形态。
@@ -124,6 +170,7 @@ client := aun.NewAUNClient(aid, aun.AUNClientOptions{Debug: true})
 |--------|-------|----|------|
 | `load_identity(aid)` | `loadIdentity(aid)` | `LoadIdentityFromAID(aid)` | 在 `no_identity` / `closed` 状态加载身份 |
 | `state` | `state` | `ConnectionState()` | 九态公开状态 |
+| `gateway_url` | `gatewayUrl` | `GetGatewayURL()` | 当前连接的 Gateway URL（只读，自动发现，连接前为空） |
 | `current_aid` | `currentAid` | `CurrentAID()` | 当前 AID 对象 |
 | `aid` | `aid` | `AID()` | 当前 AID 字符串 |
 | `has_identity` | `hasIdentity` | `HasIdentity()` | 是否已加载身份 |
@@ -214,7 +261,7 @@ sub.unsubscribe()
 
 | 事件 | 说明 |
 |------|------|
-| `connection.state` | 状态变化，`state` 为九态公开值 |
+| `state_change` | 状态变化，`state` 为九态公开值 |
 | `connection.error` | 连接或重连错误 |
 | `token.refreshed` | token 刷新完成 |
 | `message.received` | 收到 P2P 消息 |

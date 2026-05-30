@@ -20,7 +20,7 @@ import { AuthFlow } from './auth.js';
 import { GatewayDiscovery } from './discovery.js';
 import { DnsResilientNet } from './net.js';
 import { AUNLogger } from './logger.js';
-import { getDeviceId, normalizeInstanceId } from './config.js';
+import { getDeviceId, normalizeInstanceId, normalizeSlotId } from './config.js';
 import { IdentityConflictError, ValidationError } from './errors.js';
 
 export interface AIDInfo {
@@ -57,11 +57,6 @@ export type ListResult = { identities: AIDInfo[] };
 function resultError<T>(r: Result<T>): { code: string; message: string } | null {
   if (r.ok) return null;
   return (r as { ok: false; error: { code: string; message: string } }).error;
-}
-
-function normalizeSlotId(slotId?: string): string {
-  const v = String(slotId ?? 'default').trim();
-  return v || 'default';
 }
 
 /** 发起 HTTP HEAD 请求，返回 [status, headers] */

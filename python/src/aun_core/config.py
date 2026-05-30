@@ -10,6 +10,8 @@ from typing import Any
 
 
 _INSTANCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# slot_id 允许额外包含 / : 空格作为分隔符，但不允许出现在首字符
+_SLOT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/ :-]{0,127}$")
 _DEV_ENV_VALUES = {"development", "dev", "local"}
 DEFAULT_SLOT_ID = "default"
 
@@ -52,8 +54,21 @@ def normalize_device_id(value: Any, aun_root: Path | str | None = None) -> str:
 
 
 def normalize_slot_id(value: Any) -> str:
-    text = str(value or "").strip() or DEFAULT_SLOT_ID
-    return normalize_instance_id(text, "slot_id")
+    text = str(value or "").strip()
+    if not text:
+        text = DEFAULT_SLOT_ID
+    elif not _SLOT_ID_PATTERN.fullmatch(text):
+        raise ValueError("slot_id contains unsupported characters")
+    return text
+
+
+def slot_isolation_key(slot_id: str) -> str:
+    """提取 slot_id 的隔离键：第一个分隔符（/ : 空格）之前的部分。"""
+    for sep in ('/', ':', ' '):
+        i = slot_id.find(sep)
+        if i > 0:
+            slot_id = slot_id[:i]
+    return slot_id
 
 
 def get_device_id(aun_root: Path | str | None = None) -> str:

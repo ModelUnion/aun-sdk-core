@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from aun_core.config import AUNConfig, get_device_id
+from aun_core.config import AUNConfig, get_device_id, normalize_slot_id, slot_isolation_key
 
 
 def test_from_dict_defaults(monkeypatch):
@@ -93,6 +93,27 @@ def test_from_dict_ignores_delivery_mode_constructor_fields(tmp_path):
     assert not hasattr(cfg, "delivery_mode")
     assert not hasattr(cfg, "queue_routing")
     assert not hasattr(cfg, "affinity_ttl_ms")
+
+
+def test_normalize_slot_id_allows_separators():
+    assert normalize_slot_id("evolclaw cli") == "evolclaw cli"
+    assert normalize_slot_id("evolclaw/cli") == "evolclaw/cli"
+    assert normalize_slot_id("evolclaw:daemon") == "evolclaw:daemon"
+
+
+def test_normalize_slot_id_rejects_leading_separator():
+    import pytest
+    with pytest.raises(ValueError):
+        normalize_slot_id("/invalid")
+    with pytest.raises(ValueError):
+        normalize_slot_id(":invalid")
+
+
+def test_slot_isolation_key():
+    assert slot_isolation_key("evolclaw cli") == "evolclaw"
+    assert slot_isolation_key("evolclaw/cli") == "evolclaw"
+    assert slot_isolation_key("evolclaw:daemon") == "evolclaw"
+    assert slot_isolation_key("simple") == "simple"
 
 
 def test_from_dict_verify_ssl_follows_development_env(monkeypatch):

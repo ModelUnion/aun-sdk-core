@@ -8,8 +8,9 @@
 import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
+import { slotIsolationKey } from '../config.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 type NodeDatabaseSync = import('node:sqlite').DatabaseSync;
 type NodeDatabaseSyncOptions = import('node:sqlite').DatabaseSyncOptions;
@@ -75,6 +76,7 @@ const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS instance_state (
     device_id TEXT NOT NULL,
     slot_id TEXT NOT NULL DEFAULT '_singleton',
+    slot_id_full TEXT NOT NULL DEFAULT '',
     data TEXT NOT NULL DEFAULT '{}',
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (device_id, slot_id)
@@ -82,6 +84,7 @@ const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS seq_tracker (
     device_id TEXT NOT NULL,
     slot_id TEXT NOT NULL DEFAULT '_singleton',
+    slot_id_full TEXT NOT NULL DEFAULT '',
     namespace TEXT NOT NULL,
     contiguous_seq INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL,
@@ -175,7 +178,15 @@ export class AIDDatabase {
   private _initSchema(): void {
     for (const ddl of DDL_STATEMENTS) this._db.exec(ddl);
     const row = this._db.prepare('SELECT version FROM _schema_version WHERE id = 1').get() as { version: number } | undefined;
-    if (!row) this._db.prepare('INSERT INTO _schema_version (id, version) VALUES (1, ?)').run(SCHEMA_VERSION);
+    if (!row) {
+      this._db.prepare('INSERT INTO _schema_version (id, version) VALUES (1, ?)').run(SCHEMA_VERSION);
+    } else if (row.version < SCHEMA_VERSION) {
+      if (row.version < 2) {
+        this._db.exec("ALTER TABLE instance_state ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''");
+        this._db.exec("ALTER TABLE seq_tracker ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''");
+      }
+      this._db.prepare('UPDATE _schema_version SET version = ? WHERE id = 1').run(SCHEMA_VERSION);
+    }
   }
 
   getToken(key: string): string | null {
@@ -201,48 +212,50 @@ export class AIDDatabase {
   }
 
   saveInstanceState(deviceId: string, slotId: string, state: Record<string, unknown>): void {
-    const slot = slotId || '_singleton';
+    const slotKey = slotIsolationKey(slotId) || '_singleton';
+    const slotFull = slotId || '';
     this._db.prepare(
-      'INSERT INTO instance_state (device_id, slot_id, data, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(device_id, slot_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at',
-    ).run(deviceId, slot, JSON.stringify(state), Date.now());
+      'INSERT INTO instance_state (device_id, slot_id, slot_id_full, data, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id, slot_id) DO UPDATE SET slot_id_full=excluded.slot_id_full, data=excluded.data, updated_at=excluded.updated_at',
+    ).run(deviceId, slotKey, slotFull, JSON.stringify(state), Date.now());
   }
 
   loadInstanceState(deviceId: string, slotId = ''): Record<string, unknown> | null {
-    const slot = slotId || '_singleton';
-    const row = this._db.prepare('SELECT data FROM instance_state WHERE device_id = ? AND slot_id = ?').get(deviceId, slot) as { data: string } | undefined;
+    const slotKey = slotIsolationKey(slotId) || '_singleton';
+    const row = this._db.prepare('SELECT data FROM instance_state WHERE device_id = ? AND slot_id = ?').get(deviceId, slotKey) as { data: string } | undefined;
     return row ? jsonParseObject(row.data) : null;
   }
 
   saveSeq(deviceId: string, slotId: string, namespace: string, contiguousSeq: number): void {
-    const slot = slotId || '_singleton';
+    const slotKey = slotIsolationKey(slotId) || '_singleton';
+    const slotFull = slotId || '';
     this._db.prepare(
-      'INSERT INTO seq_tracker (device_id, slot_id, namespace, contiguous_seq, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id, slot_id, namespace) DO UPDATE SET contiguous_seq=excluded.contiguous_seq, updated_at=excluded.updated_at',
-    ).run(deviceId, slot, namespace, contiguousSeq, Date.now());
+      'INSERT INTO seq_tracker (device_id, slot_id, slot_id_full, namespace, contiguous_seq, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(device_id, slot_id, namespace) DO UPDATE SET slot_id_full=excluded.slot_id_full, contiguous_seq=excluded.contiguous_seq, updated_at=excluded.updated_at',
+    ).run(deviceId, slotKey, slotFull, namespace, contiguousSeq, Date.now());
   }
 
   loadSeq(deviceId: string, slotId: string, namespace: string): number {
-    const slot = slotId || '_singleton';
+    const slotKey = slotIsolationKey(slotId) || '_singleton';
     const row = this._db.prepare(
       'SELECT contiguous_seq FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?',
-    ).get(deviceId, slot, namespace) as { contiguous_seq: number } | undefined;
+    ).get(deviceId, slotKey, namespace) as { contiguous_seq: number } | undefined;
     return row?.contiguous_seq ?? 0;
   }
 
   loadAllSeqs(deviceId: string, slotId: string): Record<string, number> {
-    const slot = slotId || '_singleton';
+    const slotKey = slotIsolationKey(slotId) || '_singleton';
     const rows = this._db.prepare(
       'SELECT namespace, contiguous_seq FROM seq_tracker WHERE device_id = ? AND slot_id = ?',
-    ).all(deviceId, slot) as Array<{ namespace: string; contiguous_seq: number }>;
+    ).all(deviceId, slotKey) as Array<{ namespace: string; contiguous_seq: number }>;
     const result: Record<string, number> = {};
     for (const row of rows) result[row.namespace] = row.contiguous_seq;
     return result;
   }
 
   deleteSeq(deviceId: string, slotId: string, namespace: string): void {
-    const slot = slotId || '_singleton';
+    const slotKey = slotIsolationKey(slotId) || '_singleton';
     this._db.prepare(
       'DELETE FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?',
-    ).run(deviceId, slot, namespace);
+    ).run(deviceId, slotKey, namespace);
   }
 
   getMetadata(key: string): string | null {

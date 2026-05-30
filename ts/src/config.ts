@@ -14,6 +14,8 @@ import type { JsonObject } from './types.js';
 // ── 设备 ID ──────────────────────────────────────────────────
 
 const INSTANCE_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+// slot_id 允许额外包含 / : 空格作为分隔符，但不允许出现在首字符
+const SLOT_ID_PATTERN = /^[A-Za-z0-9._-][A-Za-z0-9._/ :-]{0,127}$/;
 const DEV_ENV_VALUES = new Set(['development', 'dev', 'local']);
 
 export function normalizeInstanceId(
@@ -21,8 +23,8 @@ export function normalizeInstanceId(
   field: string,
   opts: { allowEmpty?: boolean } = {},
 ): string {
-  const text = String(value ?? '').trim();
-  if (!text) {
+  const text = String(value ?? '');
+  if (!text.trim()) {
     if (opts.allowEmpty) return '';
     throw new ValidationError(`${field} must be a non-empty string`);
   }
@@ -30,6 +32,21 @@ export function normalizeInstanceId(
     throw new ValidationError(`${field} contains unsupported characters`);
   }
   return text;
+}
+
+export function normalizeSlotId(value: unknown, defaultValue = 'default'): string {
+  const raw = String(value ?? '');
+  const text = raw || defaultValue;
+  if (!SLOT_ID_PATTERN.test(text)) {
+    throw new ValidationError('slot_id contains unsupported characters');
+  }
+  return text;
+}
+
+/** 提取 slot_id 的隔离键：第一个分隔符（/ : 空格）之前的部分。 */
+export function slotIsolationKey(slotId: string): string {
+  const m = slotId.match(/^[^/ :]+/);
+  return m ? m[0] : slotId;
 }
 
 /**

@@ -258,7 +258,7 @@ func TestConnectionKind_ShortDefaultAutoReconnectTrue(t *testing.T) {
 		"access_token":    "tok",
 		"gateway":         "ws://x/aun",
 		"connection_kind": "short",
-	})
+	}, nil)
 	autoReconnect, _ := options["auto_reconnect"].(bool)
 	if !autoReconnect {
 		t.Fatal("短连接 auto_reconnect 应保持默认 true")
@@ -275,7 +275,7 @@ func TestConnectionKind_LongDefaultAutoReconnectTrue(t *testing.T) {
 		"access_token":    "tok",
 		"gateway":         "ws://x/aun",
 		"connection_kind": "long",
-	})
+	}, nil)
 	autoReconnect, _ := options["auto_reconnect"].(bool)
 	if !autoReconnect {
 		t.Fatal("长连接 auto_reconnect 应默认为 true")

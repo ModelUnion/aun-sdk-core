@@ -8,6 +8,8 @@ import type { JsonObject } from './types.js';
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
 const INSTANCE_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+// slot_id 允许额外包含 / : 空格作为分隔符，但不允许出现在首字符
+const SLOT_ID_PATTERN = /^[A-Za-z0-9._-][A-Za-z0-9._/ :-]{0,127}$/;
 
 function readString(value: JsonObject[keyof JsonObject], fallback: string): string {
   return typeof value === 'string' ? value : fallback;
@@ -41,6 +43,21 @@ export function normalizeInstanceId(
   return text;
 }
 
+export function normalizeSlotId(value: unknown, defaultValue = 'default'): string {
+  const raw = String(value ?? '');
+  const text = raw || defaultValue;
+  if (!SLOT_ID_PATTERN.test(text)) {
+    throw new ValidationError('slot_id contains unsupported characters');
+  }
+  return text;
+}
+
+/** 提取 slot_id 的隔离键：第一个分隔符（/ : 空格）之前的部分。 */
+export function slotIsolationKey(slotId: string): string {
+  const m = slotId.match(/^[^/ :]+/);
+  return m ? m[0] : slotId;
+}
+
 /**
  * 获取设备稳定 ID（浏览器环境使用 localStorage）。
  * 首次调用时自动生成 UUID 并持久化，后续返回同一值。
@@ -65,20 +82,14 @@ export function getDeviceId(): string {
 
 /** AUN SDK 配置接口 */
 export interface AUNConfig {
-  /** IndexedDB 数据库名前缀（默认 'aun'） */
   aunPath: string;
-  /** 根证书 PEM 字符串 */
   rootCaPem: string | null;
-  /** 私钥加密口令 */
   seedPassword: string | null;
-  /** 是否启用群组 E2EE（默认 true） */
   groupE2ee: boolean;
-  /** 是否验证 SSL 证书（默认 true） */
   verifySsl: boolean;
-  /** 是否要求前向保密（默认 true） */
   requireForwardSecrecy: boolean;
-  /** 防重放时间窗口（秒） */
   replayWindowSeconds: number;
+  discoveryPort: number | null;
 }
 
 /** AUN 配置默认值 */
@@ -90,6 +101,7 @@ const DEFAULTS: AUNConfig = {
   verifySsl: true,
   requireForwardSecrecy: true,
   replayWindowSeconds: 300,
+  discoveryPort: null,
 };
 
 type AUNConfigInput = Partial<AUNConfig> & JsonObject;
@@ -112,9 +124,10 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
       data.seedPassword ?? data.seed_password ?? data.encryptionSeed ?? data.encryption_seed,
       DEFAULTS.seedPassword,
     ),
-    groupE2ee: true,  // 必备能力，不可配置
+    groupE2ee: true,
     verifySsl: DEFAULTS.verifySsl,
     requireForwardSecrecy: readBoolean(data.requireForwardSecrecy ?? data.require_forward_secrecy, DEFAULTS.requireForwardSecrecy),
     replayWindowSeconds: readOptionalNumber(data.replayWindowSeconds ?? data.replay_window_seconds, DEFAULTS.replayWindowSeconds) ?? DEFAULTS.replayWindowSeconds,
+    discoveryPort: readOptionalNumber(data.discoveryPort ?? data.discovery_port, DEFAULTS.discoveryPort),
   };
 }

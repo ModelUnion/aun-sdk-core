@@ -116,3 +116,25 @@ describe('createConfig', () => {
     warnSpy.mockRestore();
   });
 });
+
+import { normalizeSlotId, slotIsolationKey } from '../../src/config.js';
+
+describe('slot_id', () => {
+  it('normalizeSlotId 允许分隔符', () => {
+    expect(normalizeSlotId('evolclaw cli')).toBe('evolclaw cli');
+    expect(normalizeSlotId('evolclaw/cli')).toBe('evolclaw/cli');
+    expect(normalizeSlotId('evolclaw:daemon')).toBe('evolclaw:daemon');
+  });
+
+  it('normalizeSlotId 拒绝首字符为分隔符', () => {
+    expect(() => normalizeSlotId(' invalid')).toThrow(ValidationError);
+    expect(() => normalizeSlotId('/invalid')).toThrow(ValidationError);
+  });
+
+  it('slotIsolationKey 提取前缀', () => {
+    expect(slotIsolationKey('evolclaw cli')).toBe('evolclaw');
+    expect(slotIsolationKey('evolclaw/cli')).toBe('evolclaw');
+    expect(slotIsolationKey('evolclaw:daemon')).toBe('evolclaw');
+    expect(slotIsolationKey('simple')).toBe('simple');
+  });
+});

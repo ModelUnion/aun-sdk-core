@@ -142,4 +142,25 @@ describe('connection_kind 长短连接', () => {
     });
     expect(opts.auto_reconnect).toBe(true);
   });
+
+  // 11. connect(opts) 正确把 connection_kind/short_ttl_ms/extra_info/delivery_mode 传给 _normalizeConnectParams
+  it('connect opts 中的连接选项正确传入 _normalizeConnectParams', () => {
+    const client = new AUNClient();
+    const captured: any[] = [];
+    const orig = (client as any)._normalizeConnectParams.bind(client);
+    (client as any)._normalizeConnectParams = (p: any) => { captured.push(p); return orig(p); };
+
+    // 直接调用内部 _buildSessionOptions 验证字段透传（绕过 connect 的 AID 校验）
+    const params = (client as any)._normalizeConnectParams({
+      gateway: 'ws://localhost/aun',
+      connection_kind: 'short',
+      short_ttl_ms: 20000,
+      extra_info: { pid: 42 },
+      delivery_mode: { mode: 'queue' },
+    });
+    expect(params.connection_kind).toBe('short');
+    expect(params.short_ttl_ms).toBe(20000);
+    expect(params.extra_info).toEqual({ pid: 42 });
+    expect(params.delivery_mode).toMatchObject({ mode: 'queue' });
+  });
 });

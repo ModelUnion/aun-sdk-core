@@ -171,7 +171,7 @@ func TestTokenGatewayReuse_InMemoryGatewayURLTakesPriority(t *testing.T) {
 	// 同时在 keystore 中放一个不同的 cached URL，确保它不会被选中。
 	c.AuthPersistGatewayURL(aid, "wss://gw.cached.example/aun")
 
-	c.SetGatewayURL("wss://gw.in-memory.example/aun")
+	c.setGatewayURL("wss://gw.in-memory.example/aun")
 	if got := c.GetGatewayURL(); got != "wss://gw.in-memory.example/aun" {
 		t.Fatalf("GetGatewayURL 应优先返回内存值，得到 %q", got)
 	}

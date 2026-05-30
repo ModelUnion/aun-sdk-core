@@ -212,7 +212,7 @@ describe('P0-retry-02: 重连循环经过 retry_backoff 状态', () => {
   it('断网后重连循环先进入 retry_backoff 再进入 reconnecting', async () => {
     const client = new AUNClient();
     const states: string[] = [];
-    client.on('connection.state', (payload: any) => {
+    client.on('state_change', (payload: any) => {
       states.push(payload.state);
     });
 

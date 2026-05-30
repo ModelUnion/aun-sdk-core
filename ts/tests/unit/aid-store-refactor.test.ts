@@ -13,7 +13,7 @@ function createStoredAid(aid = 'alice.agentid.pub'): { aid: AID; aunPath: string
   const keyStore = new FileKeyStore(aunPath, { encryptionSeed: 'test-seed' });
   keyStore.saveIdentity(aid, identity);
 
-  const store = new AIDStore({ aunPath, encryptionSeed: 'test-seed' });
+  const store = new AIDStore({ aunPath, encryptionSeed: 'test-seed', verifySsl: true });
   const loaded = store.load(aid);
   expect(loaded.ok).toBe(true);
   return { aid: loaded.ok ? loaded.data.aid : (null as never), aunPath };

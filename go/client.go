@@ -358,7 +358,6 @@ const (
 
 // ConnectOptions 连接选项（供 Authenticate 使用）
 type ConnectOptions struct {
-	GatewayURL         string         // 可选 Gateway URL；为空时按当前 AID 做 discovery
 	AutoReconnect      bool           // 是否自动重连
 	HeartbeatInterval  int            // 心跳间隔（秒）；0 表示不发，>0 时最小 30；opts 为 nil 时默认 30
 	TokenRefreshBefore int            // token 到期前多少秒刷新，默认 1800
@@ -366,17 +365,14 @@ type ConnectOptions struct {
 	Timeouts           *TimeoutConfig // 超时配置
 	ConnectionKind     string         // "long"（默认）或 "short"；短连接用于 CLI 工具发 RPC 后立即断开
 	ShortTtlMs         int            // 仅 kind=short 时有效，服务端兜底超时（毫秒）
-	SlotID             string         // 当前进程内的连接槽位，同设备最多 10 个 slot
 	ExtraInfo          map[string]any // 应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
-	DeliveryMode       map[string]any // message.send 的连接级投递模式
-	QueueRouting       any            // delivery_mode.routing 的便捷入口
-	AffinityTtlMs      int            // delivery_mode.affinity_ttl_ms 的便捷入口
+	DeliveryMode       map[string]any // message.send 的连接级投递模式（fanout/queue，路由细节由后端配置）
 	BackgroundSync     bool           // 连接后是否启动后台同步
 }
 
 // ConnectionOptions 控制连接行为（超时、重连退避等）。
 // gateway URL 和 token 来自 Authenticate 缓存，不在此传入。
-// slot_id 来自 AID，不在此传入。
+// slot_id / device_id 来自 AID，不在此传入。
 type ConnectionOptions struct {
 	AutoReconnect      *bool          // 是否自动重连，默认 true
 	ConnectTimeout     time.Duration  // 连接超时，默认 5s
@@ -388,75 +384,33 @@ type ConnectionOptions struct {
 	TokenRefreshBefore time.Duration  // token 到期前多少时间刷新，默认 1800s
 	ConnectionKind     string         // "long"（默认）或 "short"
 	ShortTtlMs         int            // 仅 kind=short 时有效，服务端兜底超时（毫秒）
-	SlotID             string         // 当前进程内的连接槽位，同设备最多 10 个 slot
 	ExtraInfo          map[string]any // 应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
-	DeliveryMode       map[string]any // message.send 的连接级投递模式
-	QueueRouting       any            // delivery_mode.routing 的便捷入口
-	AffinityTtlMs      int            // delivery_mode.affinity_ttl_ms 的便捷入口
+	DeliveryMode       map[string]any // message.send 的连接级投递模式（fanout/queue，路由细节由后端配置）
 	BackgroundSync     bool           // 连接后是否启动后台同步
 }
 
-// AUNClientOptions 是重构后的客户端构造选项。
-// 身份只能通过 *AID 传入，不允许在选项里放字符串 aid。
-type AUNClientOptions struct {
-	AUNPath               string
-	RootCAPath            string
-	SeedPassword          string
-	EncryptionSeed        string
-	VerifySSL             *bool
-	RequireForwardSecrecy *bool
-	ReplayWindowSeconds   int
-	Debug                 bool
-	ProtectedHeaders      map[string]any
-	Raw                   map[string]any
-}
-
-func (o AUNClientOptions) configMap() map[string]any {
-	raw := make(map[string]any)
-	for k, v := range o.Raw {
-		raw[k] = v
+// newClientForStore 是供 AIDStore 内部使用的非导出构造入口。
+// AIDStore 需要一个无身份客户端来承载联网 RPC（resolve/register/fetch 等），
+// 这些配置不对外暴露，只能由 AIDStore 在内部注入。
+func newClientForStore(aunPath, seedPassword string, verifySSL bool, rootCaPath string, debug bool) *AUNClient {
+	raw := map[string]any{
+		"aun_path":   aunPath,
+		"verify_ssl": verifySSL,
 	}
-	if _, ok := raw["aid"]; ok {
-		panic("AUNClientOptions must not include aid; pass *AID as the first argument")
+	if seedPassword != "" {
+		raw["seed_password"] = seedPassword
 	}
-	if o.AUNPath != "" {
-		raw["aun_path"] = o.AUNPath
+	if rootCaPath != "" {
+		raw["root_ca_path"] = rootCaPath
 	}
-	if o.RootCAPath != "" {
-		raw["root_ca_path"] = o.RootCAPath
-	}
-	if o.SeedPassword != "" {
-		raw["seed_password"] = o.SeedPassword
-	}
-	if o.EncryptionSeed != "" {
-		raw["encryption_seed"] = o.EncryptionSeed
-	}
-	if o.VerifySSL != nil {
-		raw["verify_ssl"] = *o.VerifySSL
-	}
-	if o.RequireForwardSecrecy != nil {
-		raw["require_forward_secrecy"] = *o.RequireForwardSecrecy
-	}
-	if o.ReplayWindowSeconds > 0 {
-		raw["replay_window_seconds"] = o.ReplayWindowSeconds
-	}
-	return raw
-}
-
-func singleAUNClientOptions(options []AUNClientOptions) AUNClientOptions {
-	if len(options) == 0 {
-		return AUNClientOptions{}
-	}
-	if len(options) > 1 {
-		panic("NewAUNClient accepts at most one options object")
-	}
-	return options[0]
+	return newClient(raw, debug)
 }
 
 // RetryConfig 重试配置
 type RetryConfig struct {
 	InitialDelay float64 // 初始延迟（秒）
 	MaxDelay     float64 // 最大延迟（秒）
+	MaxAttempts  int     // 最大重试次数，0=无限
 }
 
 // TimeoutConfig 超时配置
@@ -1737,10 +1691,15 @@ func (c *AUNClient) GetGatewayURL() string {
 }
 
 // SetGatewayURL 设置 Gateway URL
-func (c *AUNClient) SetGatewayURL(u string) {
+func (c *AUNClient) setGatewayURL(u string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.gatewayURL = u
+}
+
+// CacheDiscoveredGatewayURL 缓存 discovery 得到的 Gateway URL（内部使用，供 namespace 层调用）。
+func (c *AUNClient) CacheDiscoveredGatewayURL(u string) {
+	c.setGatewayURL(u)
 }
 
 // GetAID 返回当前 AID
@@ -1829,7 +1788,7 @@ func (c *AUNClient) resolveGatewayForAID(ctx context.Context, aid string) (strin
 		return "", NewStateError("gateway discovery requires a loaded AID")
 	}
 	if cached := strings.TrimSpace(c.AuthLoadCachedGatewayURL(target)); cached != "" {
-		c.SetGatewayURL(cached)
+		c.setGatewayURL(cached)
 		return cached, nil
 	}
 	issuer := target
@@ -1841,7 +1800,7 @@ func (c *AUNClient) resolveGatewayForAID(ctx context.Context, aid string) (strin
 	if err != nil {
 		return "", err
 	}
-	c.SetGatewayURL(discovered)
+	c.setGatewayURL(discovered)
 	c.AuthPersistGatewayURL(target, discovered)
 	return discovered, nil
 }
@@ -1940,29 +1899,26 @@ func connectionOptionsToConnectOptions(opt *ConnectionOptions, c *AUNClient) *Co
 			co.Timeouts.Call = opt.CallTimeout.Seconds()
 		}
 	}
-	if opt.RetryInitialDelay > 0 || opt.RetryMaxDelay > 0 {
+	if opt.RetryInitialDelay > 0 || opt.RetryMaxDelay > 0 || opt.RetryMaxAttempts > 0 {
 		co.Retry = &RetryConfig{
 			InitialDelay: opt.RetryInitialDelay.Seconds(),
 			MaxDelay:     opt.RetryMaxDelay.Seconds(),
+			MaxAttempts:  opt.RetryMaxAttempts,
 		}
 	}
 	co.ConnectionKind = opt.ConnectionKind
 	co.ShortTtlMs = opt.ShortTtlMs
 	co.ExtraInfo = opt.ExtraInfo
 	co.DeliveryMode = opt.DeliveryMode
-	co.QueueRouting = opt.QueueRouting
-	co.AffinityTtlMs = opt.AffinityTtlMs
 	co.BackgroundSync = opt.BackgroundSync
-	// slot_id：优先取 opt.SlotID，其次从 AID 对象读取
-	slotID := opt.SlotID
-	if slotID == "" && c != nil {
+	// slot_id 来自 AID，不从 ConnectionOptions 传入
+	if c != nil {
 		c.mu.RLock()
 		if aid := c.currentAIDObj; aid != nil && aid.SlotID != "" {
-			slotID = aid.SlotID
+			// slot_id 在 connectWithParams 里直接从 c.slotID 注入，无需经过 ConnectOptions
 		}
 		c.mu.RUnlock()
 	}
-	co.SlotID = slotID
 	return co
 }
 
@@ -1973,9 +1929,6 @@ func (c *AUNClient) connectWithLoadedIdentity(ctx context.Context, opts *Connect
 	c.mu.RUnlock()
 	if current == nil || !current.IsPrivateKeyValid() {
 		return NewStateError("Connect requires a loaded AID with a valid private key")
-	}
-	if opts != nil && strings.TrimSpace(opts.GatewayURL) != "" {
-		gatewayURL = strings.TrimSpace(opts.GatewayURL)
 	}
 	if gatewayURL == "" {
 		resolved, err := c.resolveGatewayForAID(ctx, current.Aid)
@@ -2000,19 +1953,12 @@ func (c *AUNClient) Authenticate(ctx context.Context, opts ...ConnectOptions) (m
 	if pubState != ConnStateStandby {
 		return nil, NewStateError(fmt.Sprintf("authenticate not allowed in state %s", pubState))
 	}
-	var opt ConnectOptions
-	if len(opts) == 1 {
-		opt = opts[0]
-	}
 	c.mu.RLock()
 	current := c.currentAIDObj
 	gatewayURL := c.gatewayURL
 	c.mu.RUnlock()
 	if current == nil || !current.IsPrivateKeyValid() {
 		return nil, NewStateError("Authenticate requires a loaded AID with a valid private key")
-	}
-	if strings.TrimSpace(opt.GatewayURL) != "" {
-		gatewayURL = strings.TrimSpace(opt.GatewayURL)
 	}
 	if gatewayURL == "" {
 		resolved, err := c.resolveGatewayForAID(ctx, current.Aid)
@@ -2094,57 +2040,23 @@ func (c *AUNClient) connectWithParams(ctx context.Context, params map[string]any
 	c.state = StateConnecting
 	c.mu.Unlock()
 
-	// 合并参数
+	// 合并参数：只放传给 gateway 的字段
 	merged := make(map[string]any)
 	for k, v := range params {
 		merged[k] = v
 	}
 	if opts != nil {
-		if opts.GatewayURL != "" {
-			merged["gateway"] = opts.GatewayURL
-		}
-		if opts.AutoReconnect {
-			merged["auto_reconnect"] = true
-		}
-		merged["heartbeat_interval"] = float64(opts.HeartbeatInterval)
-		if opts.TokenRefreshBefore > 0 {
-			merged["token_refresh_before"] = float64(opts.TokenRefreshBefore)
-		}
-		if opts.Retry != nil {
-			merged["retry"] = map[string]any{
-				"initial_delay": opts.Retry.InitialDelay,
-				"max_delay":     opts.Retry.MaxDelay,
-			}
-		}
-		if opts.Timeouts != nil {
-			merged["timeouts"] = map[string]any{
-				"connect": opts.Timeouts.Connect,
-				"call":    opts.Timeouts.Call,
-			}
-		}
 		if opts.ConnectionKind != "" {
 			merged["connection_kind"] = opts.ConnectionKind
 		}
 		if opts.ShortTtlMs > 0 {
 			merged["short_ttl_ms"] = opts.ShortTtlMs
 		}
-		if opts.SlotID != "" {
-			merged["slot_id"] = opts.SlotID
-		}
 		if len(opts.ExtraInfo) > 0 {
 			merged["extra_info"] = opts.ExtraInfo
 		}
 		if len(opts.DeliveryMode) > 0 {
 			merged["delivery_mode"] = copyMapShallow(opts.DeliveryMode)
-		}
-		if opts.QueueRouting != nil {
-			merged["queue_routing"] = opts.QueueRouting
-		}
-		if opts.AffinityTtlMs > 0 {
-			merged["affinity_ttl_ms"] = opts.AffinityTtlMs
-		}
-		if opts.BackgroundSync {
-			merged["background_sync"] = true
 		}
 	}
 
@@ -2160,7 +2072,7 @@ func (c *AUNClient) connectWithParams(ctx context.Context, params map[string]any
 
 	c.mu.Lock()
 	c.sessionParams = normalized
-	c.sessionOptions = c.buildSessionOptions(normalized)
+	c.sessionOptions = c.buildSessionOptions(normalized, opts)
 	c.closing.Store(false)
 	c.mu.Unlock()
 
@@ -2994,7 +2906,7 @@ func (c *AUNClient) messageTargetsCurrentInstance(message any) bool {
 		}
 	}
 	targetSlotID := strings.TrimSpace(stringFromAny(msg["slot_id"]))
-	if targetSlotID != "" && c.slotID != "" && targetSlotID != c.slotID {
+	if targetSlotID != "" && c.slotID != "" && SlotIsolationKey(targetSlotID) != SlotIsolationKey(c.slotID) {
 		return false
 	}
 	return true
@@ -4713,14 +4625,22 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 
 	// connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
 	// 群消息按惰性触发，不在此处主动 pull
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				c.log.Warn("post-connect P2P gap fill panic: %v", r)
-			}
+	// connect/reconnect 成功后自动触发一次 P2P gap fill，补齐离线期间积压
+	// background_sync=false 时跳过（CLI 等短命令场景）
+	bgSync := true
+	if v, ok := c.sessionOptions["background_sync"].(bool); ok {
+		bgSync = v
+	}
+	if bgSync {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.log.Warn("post-connect P2P gap fill panic: %v", r)
+				}
+			}()
+			c.fillP2pGap()
 		}()
-		c.fillP2pGap()
-	}()
+	}
 
 	// V2: 上线后自动确认 pending state proposals（后台执行）
 	c.mu.RLock()
@@ -5658,7 +5578,7 @@ func (c *AUNClient) normalizeConnectParamsWithTokenPolicy(params map[string]any,
 	if existing, ok := request["slot_id"]; ok {
 		slotSource = existing
 	}
-	slotID, err := NormalizeInstanceID(slotSource, "slot_id", true)
+	slotID, err := NormalizeSlotID(slotSource, c.slotID)
 	if err != nil {
 		return nil, NewValidationError(err.Error())
 	}
@@ -5733,7 +5653,7 @@ func (c *AUNClient) normalizeConnectParamsWithTokenPolicy(params map[string]any,
 }
 
 // buildSessionOptions 构建会话选项
-func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
+func (c *AUNClient) buildSessionOptions(params map[string]any, opts *ConnectOptions) map[string]any {
 	connectionKind := "long"
 	if v, ok := params["connection_kind"].(string); ok && v != "" {
 		connectionKind = v
@@ -5761,26 +5681,31 @@ func (c *AUNClient) buildSessionOptions(params map[string]any) map[string]any {
 		"short_ttl_ms":    shortTtlMs,
 	}
 
-	if v, ok := params["auto_reconnect"].(bool); ok {
-		options["auto_reconnect"] = v
-	}
-	if v, ok := params["heartbeat_interval"].(float64); ok {
-		options["heartbeat_interval"] = v
-	}
-	if v, ok := params["token_refresh_before"].(float64); ok {
-		options["token_refresh_before"] = v
-	}
-	if retryParams, ok := params["retry"].(map[string]any); ok {
-		retryOpts, _ := options["retry"].(map[string]any)
-		for k, v := range retryParams {
-			retryOpts[k] = v
+	// SDK 内部会话字段从 opts 读取，不经过 gateway 参数
+	if opts != nil {
+		if opts.AutoReconnect {
+			options["auto_reconnect"] = true
 		}
-	}
-	if timeoutParams, ok := params["timeouts"].(map[string]any); ok {
-		timeoutOpts, _ := options["timeouts"].(map[string]any)
-		for k, v := range timeoutParams {
-			timeoutOpts[k] = v
+		if opts.HeartbeatInterval > 0 {
+			options["heartbeat_interval"] = float64(opts.HeartbeatInterval)
 		}
+		if opts.TokenRefreshBefore > 0 {
+			options["token_refresh_before"] = float64(opts.TokenRefreshBefore)
+		}
+		if opts.Retry != nil {
+			retryOpts, _ := options["retry"].(map[string]any)
+			retryOpts["initial_delay"] = opts.Retry.InitialDelay
+			retryOpts["max_delay"] = opts.Retry.MaxDelay
+			if opts.Retry.MaxAttempts > 0 {
+				retryOpts["max_attempts"] = float64(opts.Retry.MaxAttempts)
+			}
+		}
+		if opts.Timeouts != nil {
+			timeoutOpts, _ := options["timeouts"].(map[string]any)
+			timeoutOpts["connect"] = opts.Timeouts.Connect
+			timeoutOpts["call"] = opts.Timeouts.Call
+		}
+		options["background_sync"] = opts.BackgroundSync
 	}
 
 	return options
@@ -5960,11 +5885,11 @@ func (c *AUNClient) injectMessageCursorContext(method string, params map[string]
 	if existing, ok := params["slot_id"]; ok {
 		slotSource = existing
 	}
-	slotID, err := NormalizeInstanceID(slotSource, "slot_id", true)
+	slotID, err := NormalizeSlotID(slotSource, c.slotID)
 	if err != nil {
 		return NewValidationError(err.Error())
 	}
-	if slotID != c.slotID {
+	if SlotIsolationKey(slotID) != SlotIsolationKey(c.slotID) {
 		return NewValidationError("message.pull/message.ack slot_id must match the current client instance")
 	}
 	params["device_id"] = c.deviceID
@@ -6212,44 +6137,29 @@ func (c *AUNClient) bindGroupAid(ctx context.Context, groupID string, groupName 
 
 // ── 新版 AUNClient 构造函数（重构 API）────────────────────────
 
-// NewAUNClient 是重构后的统一构造入口：
-//   - NewAUNClient(aid, options...)：aid 必须是已加载且私钥有效的 *AID
-//   - NewAUNClient(nil, options...)：无身份客户端
-func NewAUNClient(aid *AID, options ...AUNClientOptions) *AUNClient {
-	if aid != nil {
-		return newAUNClientWithAID(aid, singleAUNClientOptions(options))
+// NewAUNClient 是重构后的统一构造入口：客户端只接收一个已加载且私钥有效的 *AID，
+// 全部运行配置（aun_path / verify_ssl / root_ca_path / debug）由 AID 携带，不再接收 options。
+//   - aid 为 nil：返回无身份客户端（等价于 NewAUNClientEmpty）
+//   - aid 非 nil：必须是 AIDStore.Load() 返回的、私钥有效的 *AID
+func NewAUNClient(aid *AID) *AUNClient {
+	if aid == nil {
+		return newClient(map[string]any{})
 	}
-	opt := singleAUNClientOptions(options)
-	c := newClient(opt.configMap(), opt.Debug)
-	c.applyProtectedHeadersFromOptions(opt.ProtectedHeaders)
-	return c
+	return newAUNClientWithAID(aid)
 }
 
-// applyProtectedHeadersFromOptions 从 options.ProtectedHeaders（map[string]any）初始化实例级 headers。
-// 复用 SetProtectedHeaders 的过滤规则（剔除 _auth 和非法 key），仅接受字符串值。
-func (c *AUNClient) applyProtectedHeadersFromOptions(headers map[string]any) {
-	if len(headers) == 0 {
-		return
-	}
-	str := make(map[string]string, len(headers))
-	for k, v := range headers {
-		if s, ok := v.(string); ok {
-			str[k] = s
-		} else if v != nil {
-			str[k] = fmt.Sprintf("%v", v)
-		}
-	}
-	c.SetProtectedHeaders(str)
-}
-
-func newAUNClientWithAID(aid *AID, options AUNClientOptions) *AUNClient {
-	if aid == nil || !aid.IsPrivateKeyValid() {
+func newAUNClientWithAID(aid *AID) *AUNClient {
+	if !aid.IsPrivateKeyValid() {
 		panic("NewAUNClient: aid must have a valid private key; use AIDStore.Load() first")
 	}
-	cfg := options.configMap()
-	cfg["aun_path"] = aid.AunPath
-	c := newClient(cfg, options.Debug)
-	c.applyProtectedHeadersFromOptions(options.ProtectedHeaders)
+	cfg := map[string]any{
+		"aun_path":   aid.AunPath,
+		"verify_ssl": aid.VerifySSL,
+	}
+	if aid.RootCaPath != "" {
+		cfg["root_ca_path"] = aid.RootCaPath
+	}
+	c := newClient(cfg, aid.Debug)
 	c.mu.Lock()
 	c.currentAIDObj = aid
 	c.aid = aid.Aid
@@ -6269,8 +6179,8 @@ func newAUNClientWithAID(aid *AID, options AUNClientOptions) *AUNClient {
 }
 
 // NewAUNClientEmpty 创建无身份的客户端，初始状态为 idle。
-func NewAUNClientEmpty(options ...AUNClientOptions) *AUNClient {
-	return NewAUNClient(nil, options...)
+func NewAUNClientEmpty() *AUNClient {
+	return newClient(map[string]any{})
 }
 
 // CurrentAID 返回当前加载的 AID 对象（无身份时返回 nil）
@@ -6586,16 +6496,98 @@ func (c *AUNClient) loadIdentityFromAID(aid *AID) error {
 	if c.state != StateIdle && c.state != StateClosed {
 		return NewStateError(fmt.Sprintf("LoadIdentity not allowed in state %s", c.state))
 	}
+	// 让无身份客户端加载 AID 后切到该身份所属的 aun_path（对齐 Python _rebuild_runtime_for_identity）。
+	c.rebuildRuntimeForIdentity(aid)
 	c.currentAIDObj = aid
 	c.aid = aid.Aid
+	if aid.DeviceID != "" {
+		c.deviceID = aid.DeviceID
+	}
+	if aid.SlotID != "" {
+		c.slotID = aid.SlotID
+	}
 	if c.auth != nil {
 		c.auth.aid = aid.Aid
+		c.auth.SetInstanceContext(c.deviceID, c.slotID)
 	}
 	c.lastConnectError = nil
 	c.retryAttempt = 0
 	// Fix-05: 复位 state 到 idle，使 HasIdentity/ConnectionState 正确反映 standby
 	c.state = StateIdle
 	return nil
+}
+
+// rebuildRuntimeForIdentity 当 AID 携带的 aun_path/verify_ssl 与当前 client 不一致时，
+// 重建依赖这些配置的运行时组件（logger / keystore / dnsNet / discovery / auth）。
+// 仅在配置确实变化时重建，避免无谓开销。调用方须持有 c.mu。
+func (c *AUNClient) rebuildRuntimeForIdentity(aid *AID) {
+	nextRaw := map[string]any{
+		"aun_path":   aid.AunPath,
+		"verify_ssl": aid.VerifySSL,
+	}
+	if aid.RootCaPath != "" {
+		nextRaw["root_ca_path"] = aid.RootCaPath
+	}
+	nextCfg := ConfigFromMap(nextRaw)
+	curPath := ""
+	if c.configModel != nil {
+		curPath = c.configModel.AUNPath
+	}
+	if curPath == nextCfg.AUNPath && c.auth != nil && c.auth.aid == aid.Aid {
+		return
+	}
+
+	debugFlag := false
+	if c.logger != nil {
+		debugFlag = c.logger.Debug()
+	}
+	// 关闭旧的网络层（keystore 无显式 Close 需求）
+	if c.dnsNet != nil {
+		c.dnsNet.Close()
+	}
+
+	c.config = nextRaw
+	c.configModel = nextCfg
+	c.agentMDPath = filepath.Join(nextCfg.AUNPath, "AIDs")
+	deviceID := c.deviceID
+	if deviceID == "" {
+		deviceID = nextCfg.DeviceID()
+	}
+
+	aunLogger := NewAUNLogger(debugFlag, nextCfg.AUNPath)
+	aunLogger.BindDeviceID(deviceID)
+	c.logger = aunLogger
+	c.log = aunLogger.For("aun_core.client")
+	c.logE2 = aunLogger.For("aun_core.e2ee")
+	c.logEG = aunLogger.For("aun_core.e2ee-group")
+	c.logAuS = aunLogger.For("aun_core.auth")
+	keystore.SetLogger(aunLogger.For("aun_core.keystore"))
+	namespace.SetLogger(aunLogger.For("aun_core.auth"))
+	secretstore.SetLogger(aunLogger.For("aun_core.secret-store"))
+
+	fks, err := keystore.NewFileKeyStore(nextCfg.AUNPath, nil, nextCfg.SeedPassword)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aun_core.keystore] WARN LoadIdentity 重建 FileKeyStore 失败: %v, 使用空种子\n", err)
+		fks, _ = keystore.NewFileKeyStore(nextCfg.AUNPath, nil, "")
+	}
+	c.keyStore = fks
+
+	dnsNet := NewDnsResilientNet(nextCfg.AUNPath, nextCfg.VerifySSL)
+	c.dnsNet = dnsNet
+	c.discovery = NewGatewayDiscovery(nextCfg.VerifySSL, dnsNet)
+	c.auth = NewAuthFlow(AuthFlowConfig{
+		Keystore:   c.keyStore,
+		Crypto:     c.crypto,
+		AID:        aid.Aid,
+		VerifySSL:  nextCfg.VerifySSL,
+		RootCAPath: nextCfg.RootCAPath,
+		DnsNet:     dnsNet,
+	})
+	c.auth.SetInstanceContext(deviceID, c.slotID)
+	if c.transport != nil {
+		c.transport.SetVerifySSL(nextCfg.VerifySSL)
+		c.transport.SetDnsNet(dnsNet)
+	}
 }
 
 // LoadIdentity 加载新身份。aid 必须是 AIDStore.Load 返回的 AID 对象。

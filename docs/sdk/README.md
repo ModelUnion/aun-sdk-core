@@ -70,12 +70,12 @@ asyncio.run(main())
 
 | 语言 | options-only | AID + options |
 |------|--------------|---------------|
-| Python | `AUNClient(debug=True)` | `AUNClient(aid, debug=True)` |
-| TypeScript | `new AUNClient({ debug: true })` | `new AUNClient(aid, { debug: true })` |
-| JavaScript | `new AUNClient({ debug: true })` | `new AUNClient(aid, { debug: true })` |
-| Go | `aun.NewAUNClient(aun.AUNClientOptions{Debug: true})` | `aun.NewAUNClient(aid, aun.AUNClientOptions{Debug: true})` |
+| Python | `AUNClient()` | `AUNClient(aid)` |
+| TypeScript | `new AUNClient()` | `new AUNClient(aid)` |
+| JavaScript | `new AUNClient()` | `new AUNClient(aid)` |
+| Go | `aun.NewAUNClientEmpty()` | `aun.NewAUNClient(aid)` |
 
-`aid` 必须是 AID 对象，不是字符串。不要把 aid 放进 options，也不要使用旧的 `(config, debug)` 构造形态。
+`aid` 必须是 AIDStore.load() 返回的 AID 对象，不是字符串。debug/verify_ssl/root_ca_path 等配置由 AID 携带，不再通过构造参数传入。
 
 ---
 

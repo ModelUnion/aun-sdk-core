@@ -499,7 +499,7 @@ func TestDecryptV2MessageFallsBackToCACert(t *testing.T) {
 	if plaintext["payload_type"] != "text" {
 		t.Fatalf("应用层消息顶层 payload_type 应透传原始 payload.type，实际: %#v", plaintext)
 	}
-	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text", "sdk_lang": "go", "sdk_version": "0.4.0"}) {
+	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text", "sdk_lang": "go", "sdk_version": Version}) {
 		t.Fatalf("应用层消息顶层 protected_headers 应去 _auth 后透传，实际: %#v", plaintext["protected_headers"])
 	}
 	e2eeMeta, _ := plaintext["e2ee"].(map[string]any)

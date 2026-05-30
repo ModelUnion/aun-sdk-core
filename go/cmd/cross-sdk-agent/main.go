@@ -28,7 +28,6 @@ type CrossSdkGoAgent struct {
 	aid          string
 	issuer       string
 	gatewayAid   string
-	gatewayURL   string
 	slotID       string
 	aunPath      string
 	debug        bool
@@ -51,19 +50,13 @@ func NewCrossSdkGoAgent() *CrossSdkGoAgent {
 	slotID := strings.TrimSpace(envString("AUN_TEST_SLOT_ID", "cross-sdk-go-"+uuid.NewString()[:8]))
 	aunPath := strings.TrimSpace(envString("AUN_TEST_AUN_PATH", envString("AUN_DATA_ROOT", "/data/aun")))
 	debug := envBool("AUN_TEST_DEBUG", false)
-	requireForwardSecrecy := false
-	client := aun.NewAUNClient(nil, aun.AUNClientOptions{
-		AUNPath:               aunPath,
-		RequireForwardSecrecy: &requireForwardSecrecy,
-		Debug:                 debug,
-	})
+	client := aun.NewAUNClientEmpty()
 	agent := &CrossSdkGoAgent{
 		language:    "go",
 		sdkVersion:  aun.Version,
 		aid:         aid,
 		issuer:      issuer,
 		gatewayAid:  strings.TrimSpace(envString("AUN_GATEWAY_AID", "gateway."+issuer)),
-		gatewayURL:  strings.TrimSpace(envString("AUN_GATEWAY_URL", "")),
 		slotID:      slotID,
 		aunPath:     aunPath,
 		debug:       debug,
@@ -72,9 +65,6 @@ func NewCrossSdkGoAgent() *CrossSdkGoAgent {
 		groupInbox:  []map[string]any{},
 		traces:      map[string][]map[string]any{},
 		sendResults: map[string]map[string]any{},
-	}
-	if agent.gatewayURL != "" {
-		client.SetGatewayURL(agent.gatewayURL)
 	}
 	return agent
 }
@@ -108,10 +98,6 @@ func (a *CrossSdkGoAgent) Close() {
 func (a *CrossSdkGoAgent) ensureConnected(ctx context.Context) error {
 	store := aun.NewAIDStore(a.aunPath, "")
 	defer store.Close()
-	if a.gatewayURL != "" {
-		a.client.SetGatewayURL(a.gatewayURL)
-		store.SetGatewayURL(a.gatewayURL)
-	}
 	if rr := store.Register(ctx, a.aid); !rr.Ok {
 		if lr := store.Load(a.aid); !lr.Ok {
 			return fmt.Errorf("register_aid failed and no local identity exists: %s", rr.Error.Message)
@@ -123,9 +109,6 @@ func (a *CrossSdkGoAgent) ensureConnected(ctx context.Context) error {
 	}
 	if err := a.client.LoadIdentity(lr.Data.AID); err != nil {
 		return err
-	}
-	if a.gatewayURL != "" {
-		a.client.SetGatewayURL(a.gatewayURL)
 	}
 	return a.client.Connect(ctx)
 }
