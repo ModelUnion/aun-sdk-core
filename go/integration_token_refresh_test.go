@@ -31,10 +31,9 @@ func TestIntegration_TokenRefreshRotatesAccessToken(t *testing.T) {
 		t.Fatal("初始 access_token 为空")
 	}
 
-	if err := client.Connect(ctx, &ConnectOptions{
-		AutoReconnect:      false,
-		HeartbeatInterval:  0,
-		TokenRefreshBefore: 3590,
+	if err := client.Connect(ctx, ConnectionOptions{
+		AutoReconnect:      boolPtr(false),
+		TokenRefreshBefore: 3590 * time.Second,
 	}); err != nil {
 		t.Fatalf("连接失败: %v", err)
 	}

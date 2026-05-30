@@ -105,7 +105,7 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
     vi.spyOn(store, 'exists').mockResolvedValue({ ok: true, data: { exists: true } });
     const diagnosed = await store.diagnose('alice.agentid.pub');
     expect(diagnosed.ok && diagnosed.data.status).toBe('ready');
-    expect(diagnosed.ok && diagnosed.data.remoteRegistered).toBe(true);
+    expect(diagnosed.ok && (diagnosed.data as any).remote_registered).toBe(true);
   });
 
   it('resolve / fetchAgentMd / headAgentMd / checkAgentMd 完成证书缓存和 agent.md 验签', async () => {
@@ -141,7 +141,7 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
 
     const resolved = await store.resolve(aid, { forceRefresh: true });
     expect(resolved.ok).toBe(true);
-    expect(resolved.ok && (resolved.data.agentMd as any).verification.status).toBe('verified');
+    expect(resolved.ok && (resolved.data.agent_md as any).verification.status).toBe('verified');
     expect(resolved.ok && (resolved.data.source as any).certFromCache).toBe(false);
 
     const fetched = await store.fetchAgentMd(aid);

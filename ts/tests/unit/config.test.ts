@@ -86,11 +86,11 @@ describe('configFromMap', () => {
     });
     expect(cfg.aunPath).toBe('/tmp/test');
     // 未知键不应出现在配置中
-    expect((cfg as JsonObject).deliveryMode).toBeUndefined();
-    expect((cfg as JsonObject).queueRouting).toBeUndefined();
-    expect((cfg as JsonObject).affinityTtlMs).toBeUndefined();
-    expect((cfg as JsonObject).gateway).toBeUndefined();
-    expect((cfg as JsonObject).auto_reconnect).toBeUndefined();
+    expect((cfg as unknown as JsonObject).deliveryMode).toBeUndefined();
+    expect((cfg as unknown as JsonObject).queueRouting).toBeUndefined();
+    expect((cfg as unknown as JsonObject).affinityTtlMs).toBeUndefined();
+    expect((cfg as unknown as JsonObject).gateway).toBeUndefined();
+    expect((cfg as unknown as JsonObject).auto_reconnect).toBeUndefined();
   });
 
   it('normalizeInstanceId 校验非法字符', () => {

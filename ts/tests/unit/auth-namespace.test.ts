@@ -7,6 +7,20 @@ import { AUNClient } from '../../src/client.js';
 import { AID } from '../../src/aid.js';
 import { buildIdentity, generateECKeypair } from './helpers.js';
 
+function makeMockAid(aunPath: string): AID {
+  return {
+    aid: 'test.aid.com', aunPath, certPem: '', publicKey: '', certSubject: '',
+    certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
+    verifySsl: true, rootCaPath: null, debug: false,
+    isCertValid: () => true, isPrivateKeyValid: () => true,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+  } as unknown as AID;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -35,13 +49,13 @@ function aidFromIdentity(identity: any): AID {
 
 describe('AUNClient agent.md internals', () => {
   it('底层 AuthFlow 兼容 loadIdentityOrNull 命名', () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     const result = (client as any)._auth.loadIdentityOrNull();
     expect(result).toBeNull();
   });
 
   it('uploadAgentMd 应复用缓存 access_token', async () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'ws://gateway.agentid.pub/aun';
     (client as any)._aid = 'alice.agentid.pub';
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue({
@@ -76,7 +90,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('uploadAgentMd 在 token 缺失时应回退 authenticate', async () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'ws://gateway.agentid.pub/aun';
     (client as any)._aid = 'alice.agentid.pub';
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue({
@@ -112,10 +126,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('downloadAgentMd 应匿名下载', async () => {
-    const client = new AUNClient({
-      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
-      discovery_port: 18443,
-    });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
 
     const fetchMock = vi.fn().mockResolvedValue({
@@ -140,10 +151,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('并发手动 downloadAgentMd 同一 AID 应共用同一个下载任务', async () => {
-    const client = new AUNClient({
-      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
-      discovery_port: 18443,
-    });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
     let markStarted!: () => void;
     let releaseFetch!: () => void;
@@ -178,10 +186,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('不同 AID 的 downloadAgentMd 应受全局 8 并发上限控制', async () => {
-    const client = new AUNClient({
-      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
-      discovery_port: 18443,
-    });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
     let active = 0;
     let maxActive = 0;
@@ -219,10 +224,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('downloadAgentMd 遇到 304 且已有正文缓存时应返回缓存正文', async () => {
-    const client = new AUNClient({
-      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
-      discovery_port: 18443,
-    });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
 
     const fetchMock = vi.fn()
@@ -250,10 +252,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('downloadAgentMd 只有 ETag 没有正文缓存时应无条件 GET', async () => {
-    const client = new AUNClient({
-      aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')),
-      discovery_port: 18443,
-    });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
 
     const fetchMock = vi.fn()
@@ -292,7 +291,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('headAgentMd 遇到 304 应返回 not modified 元数据而不是错误', async () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
 
     const fetchMock = vi.fn()
@@ -324,7 +323,7 @@ describe('AUNClient agent.md internals', () => {
 
   it('downloadAgentMd 超时应抛明确错误', async () => {
     vi.useFakeTimers();
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     (client as any)._gatewayUrl = 'wss://gateway.agentid.pub/aun';
 
     const fetchMock = vi.fn().mockImplementation(async (_url, init?: RequestInit) => (
@@ -343,14 +342,15 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('signAgentMd 应在尾部追加签名块并保留原 payload', async () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     const { privateKey } = generateECKeypair();
     const identity = buildIdentity('alice.agentid.pub', privateKey);
     (client as any)._aid = identity.aid;
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
-    const signed = aidFromIdentity(identity).signAgentMd(payload).data!.signed;
+    const _r1 = aidFromIdentity(identity).signAgentMd(payload);
+    const signed = (_r1 as { ok: true; data: { signed: string } }).data.signed;
 
     expect(signed.startsWith(payload)).toBe(true);
     expect(signed).toContain('<!-- AUN-SIGNATURE');
@@ -359,14 +359,15 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('verifyAgentMd 应返回 unsigned / verified / invalid 三态', async () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     const { privateKey } = generateECKeypair();
     const identity = buildIdentity('alice.agentid.pub', privateKey);
     (client as any)._aid = identity.aid;
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
-    const signed = aidFromIdentity(identity).signAgentMd(payload).data!.signed;
+    const _r2 = aidFromIdentity(identity).signAgentMd(payload);
+    const signed = (_r2 as { ok: true; data: { signed: string } }).data.signed;
 
     const unsigned = await (client as any)._verifyAgentMd(payload, identity.aid, identity.cert);
     expect(unsigned.status).toBe('unsigned');
@@ -384,7 +385,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('verifyAgentMd 应在未传 certPem 时回退 _fetchPeerCert', async () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     const { privateKey } = generateECKeypair();
     const identity = buildIdentity('alice.agentid.pub', privateKey);
     (client as any)._aid = identity.aid;
@@ -392,7 +393,8 @@ describe('AUNClient agent.md internals', () => {
     (client as any)._fetchPeerCert = vi.fn().mockResolvedValue(identity.cert);
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
-    const signed = aidFromIdentity(identity).signAgentMd(payload).data!.signed;
+    const _r3 = aidFromIdentity(identity).signAgentMd(payload);
+    const signed = (_r3 as { ok: true; data: { signed: string } }).data.signed;
     const verified = await (client as any)._verifyAgentMd(signed, identity.aid);
 
     expect(verified.status).toBe('verified');
@@ -400,7 +402,7 @@ describe('AUNClient agent.md internals', () => {
   });
 
   it('signAgentMd 重新签名时应替换已有签名块', async () => {
-    const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
+    const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
     const { privateKey } = generateECKeypair();
     const identity = buildIdentity('alice.agentid.pub', privateKey);
     (client as any)._aid = identity.aid;
@@ -408,8 +410,8 @@ describe('AUNClient agent.md internals', () => {
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
     const aid = aidFromIdentity(identity);
-    const signedOnce = aid.signAgentMd(payload).data!.signed;
-    const signedTwice = aid.signAgentMd(signedOnce).data!.signed;
+    const signedOnce = (aid.signAgentMd(payload) as { ok: true; data: { signed: string } }).data.signed;
+    const signedTwice = (aid.signAgentMd(signedOnce) as { ok: true; data: { signed: string } }).data.signed;
 
     expect(signedTwice.match(/<!-- AUN-SIGNATURE/g)?.length).toBe(1);
     expect(signedTwice.startsWith(payload)).toBe(true);

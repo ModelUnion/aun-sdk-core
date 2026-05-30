@@ -32,16 +32,22 @@ export class AID {
   readonly certIssuer: string;
   readonly deviceId: string;
   readonly slotId: string;
+  readonly verifySsl: boolean;
+  readonly rootCaPath: string | null;
+  readonly debug: boolean;
   private readonly _privateKeyPem: string | null;
   private readonly _certValid: boolean;
   private readonly _privateKeyValid: boolean;
   private _certFingerprint = '';
 
-  private constructor(params: { aid: string; aunPath: string; certPem: string; privateKeyPem: string | null; certValid: boolean; privateKeyValid: boolean; deviceId?: string; slotId?: string }) {
+  private constructor(params: { aid: string; aunPath: string; certPem: string; privateKeyPem: string | null; certValid: boolean; privateKeyValid: boolean; deviceId?: string; slotId?: string; verifySsl?: boolean; rootCaPath?: string | null; debug?: boolean }) {
     this.aid = params.aid;
     this.aunPath = params.aunPath;
     this.deviceId = params.deviceId ?? '';
     this.slotId = params.slotId ?? 'default';
+    this.verifySsl = params.verifySsl ?? true;
+    this.rootCaPath = params.rootCaPath ?? null;
+    this.debug = params.debug ?? false;
     this.certPem = params.certPem;
     this.publicKey = publicKeyDerB64(params.certPem);
     const meta = parseCertMetadata(params.certPem);
@@ -54,7 +60,7 @@ export class AID {
     this._privateKeyValid = params.privateKeyValid;
   }
 
-  static async create(params: { aid: string; aunPath: string; certPem: string; privateKeyPem: string | null; certValid: boolean; privateKeyValid: boolean; deviceId?: string; slotId?: string }): Promise<AID> {
+  static async create(params: { aid: string; aunPath: string; certPem: string; privateKeyPem: string | null; certValid: boolean; privateKeyValid: boolean; deviceId?: string; slotId?: string; verifySsl?: boolean; rootCaPath?: string | null; debug?: boolean }): Promise<AID> {
     const aid = new AID(params);
     aid._certFingerprint = await certFingerprint(params.certPem);
     return aid;

@@ -21,18 +21,18 @@ func integrationRegisterOrLoadAID(t *testing.T, aunPath, aid string) *AID {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	store := integrationStoreForPath(t, aunPath)
-	if err := store.Register(ctx, aid); err != nil {
-		loaded, loadErr := store.Load(aid)
-		if loadErr != nil {
-			t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
+	if rr := store.Register(ctx, aid); !rr.Ok {
+		lr := store.Load(aid)
+		if !lr.Ok {
+			t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", rr.Error.Message)
 		}
-		return loaded
+		return lr.Data.AID
 	}
-	loaded, err := store.Load(aid)
-	if err != nil {
-		t.Fatalf("注册后加载 AID 失败: %v", err)
+	lr := store.Load(aid)
+	if !lr.Ok {
+		t.Fatalf("注册后加载 AID 失败: %v", lr.Error.Message)
 	}
-	return loaded
+	return lr.Data.AID
 }
 
 func integrationLoadAIDIntoClient(t *testing.T, client *AUNClient, aid string) *AID {
@@ -41,10 +41,11 @@ func integrationLoadAIDIntoClient(t *testing.T, client *AUNClient, aid string) *
 	if gatewayURL := client.GetGatewayURL(); gatewayURL != "" {
 		store.SetGatewayURL(gatewayURL)
 	}
-	loaded, err := store.Load(aid)
-	if err != nil {
-		t.Fatalf("加载 AID 失败: %v", err)
+	lr := store.Load(aid)
+	if !lr.Ok {
+		t.Fatalf("加载 AID 失败: %v", lr.Error.Message)
 	}
+	loaded := lr.Data.AID
 	if current := client.CurrentAID(); current == nil || current.Aid != loaded.Aid {
 		if err := client.LoadIdentity(loaded); err != nil {
 			t.Fatalf("加载身份到客户端失败: %v", err)
@@ -53,15 +54,18 @@ func integrationLoadAIDIntoClient(t *testing.T, client *AUNClient, aid string) *
 	return loaded
 }
 
-func integrationConnectLoadedAID(t *testing.T, client *AUNClient, aid string, opts *ConnectOptions) {
+func integrationConnectLoadedAID(t *testing.T, client *AUNClient, aid string, opts *ConnectionOptions) {
 	t.Helper()
 	integrationLoadAIDIntoClient(t, client, aid)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if opts == nil {
-		opts = &ConnectOptions{}
+	var err error
+	if opts != nil {
+		err = client.Connect(ctx, *opts)
+	} else {
+		err = client.Connect(ctx)
 	}
-	if err := client.Connect(ctx, opts); err != nil {
+	if err != nil {
 		t.Fatalf("连接失败: %v", err)
 	}
 }
@@ -78,7 +82,7 @@ func integrationAuthenticateLoadedAID(t *testing.T, client *AUNClient, aid strin
 	return result
 }
 
-func integrationConnectAIDInPath(t *testing.T, client *AUNClient, aid string, opts *ConnectOptions) string {
+func integrationConnectAIDInPath(t *testing.T, client *AUNClient, aid string, opts *ConnectionOptions) string {
 	t.Helper()
 	integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
 	integrationConnectLoadedAID(t, client, aid, opts)
@@ -88,21 +92,24 @@ func integrationConnectAIDInPath(t *testing.T, client *AUNClient, aid string, op
 	return aid
 }
 
-func integrationConnectError(t *testing.T, client *AUNClient, aid string, opts *ConnectOptions, timeout time.Duration) error {
+func integrationConnectError(t *testing.T, client *AUNClient, aid string, opts *ConnectionOptions, timeout time.Duration) error {
 	t.Helper()
 	integrationLoadAIDIntoClient(t, client, aid)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if opts == nil {
-		opts = &ConnectOptions{}
+	if opts != nil {
+		return client.Connect(ctx, *opts)
 	}
-	return client.Connect(ctx, opts)
+	return client.Connect(ctx)
 }
 
 func integrationRegisterAIDInPath(t *testing.T, aunPath, aid string) {
 	t.Helper()
 	integrationRegisterOrLoadAID(t, aunPath, aid)
 }
+
+// boolPtr 返回指向 bool 值的指针（供 ConnectionOptions.AutoReconnect 使用）。
+func boolPtr(b bool) *bool { return &b }
 
 func integrationAuthenticateError(t *testing.T, client *AUNClient, aid string) error {
 	t.Helper()

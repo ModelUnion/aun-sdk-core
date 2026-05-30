@@ -6,6 +6,22 @@
 
 ---
 
+## 0.4.2 — 2026-05-30
+
+### Added
+- **`AIDStore` 新增具名返回类型**：`ResolveResult`、`FetchAgentMdResult`、`HeadAgentMdResult`、`CheckAgentMdResult`、`DiagnoseResult`、`RenewCertResult`、`RekeyResult`、`ChangeSeedResult`、`ListResult`，替代原来的 `Record<string, unknown>`。
+- **`AID` 新增 `verifySsl` 只读字段**：创建时由 `AIDStore` 注入，供内部 HTTP 请求使用。
+- **`AUNClientOptions` 新增 `rootCaPath` / `debug`**：支持私有部署自定义根证书路径，以及构造时直接传入调试开关。
+
+### Changed
+- **移除 `discoveryPort`**：`AIDStore` 构造选项删除 `discoveryPort`，gateway URL 改为纯自动发现。
+- **`fetchAgentMd` 新增 `timeoutMs` 参数**（默认 30000ms），`resolve` 内部调用时透传 `opts.timeout`（默认 10000ms）。
+- **返回字段精简**：`fetchAgentMd` / `headAgentMd` / `checkAgentMd` / `diagnose` 移除冗余的 camelCase 别名字段，统一使用 snake_case。
+- **`resolve` 返回 `source` 字段精简**：移除 `certFromCache` / `agentMdFetched` camelCase 别名，只保留 `cert_from_cache` / `agent_md_fetched`。
+- **`AID._create` 透传 `verifySsl` / `rootCaPath` / `debug`**：`AIDStore` 在 `load` / `resolve` 时自动注入这三个配置项到 `AID` 实例。
+
+---
+
 ## 0.4.0 — 2026-05-30
 
 > **破坏性重构版本。** 与 Python SDK 0.4.0 对齐：身份管理剥离为 `AID` / `AIDStore`；删除 `auth` / `custody` / `meta` 公开命名空间；引入 `Result` 与字符串错误码；连接状态机扩展为 9 态。

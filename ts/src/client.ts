@@ -186,6 +186,16 @@ interface SessionOptions extends JsonObject {
   connection_kind?: string;
 }
 
+export interface ConnectionOptions {
+  auto_reconnect?: boolean;
+  connect_timeout?: number;
+  retry_initial_delay?: number;
+  retry_max_delay?: number;
+  retry_max_attempts?: number;
+  heartbeat_interval?: number;
+  call_timeout?: number;
+}
+
 interface ConnectParams extends RpcParams {
   access_token?: string;
   gateway?: string;
@@ -206,16 +216,8 @@ interface ConnectParams extends RpcParams {
 }
 
 export interface AUNClientOptions extends Record<string, unknown> {
-  aun_path?: string;
-  aunPath?: string;
   root_ca_path?: string;
   rootCaPath?: string;
-  seed_password?: string;
-  seedPassword?: string;
-  encryption_seed?: string;
-  encryptionSeed?: string;
-  discovery_port?: number;
-  discoveryPort?: number;
   verify_ssl?: boolean;
   verifySSL?: boolean;
   verifySsl?: boolean;
@@ -760,24 +762,19 @@ export class AUNClient {
   private _logger!: AUNLogger;
   private _clientLog!: ModuleLogger;
 
-  constructor(options?: AUNClientOptions | null);
-  constructor(aid: AID, options?: AUNClientOptions | null);
-  constructor(first?: AID | AUNClientOptions | null, second?: AUNClientOptions | null) {
-    if (typeof first === 'string') {
+  constructor(aid?: AID) {
+    if (typeof aid === 'string') {
       throw new ValidationError('AUNClient aid must be an AID object, not a string');
     }
-    if (typeof second === 'boolean') {
-      throw new ValidationError('AUNClient debug must be passed as options.debug');
-    }
-    const inputAid = first instanceof AID ? first : null;
-    if (!inputAid && second !== undefined) {
-      throw new ValidationError('AUNClient options-only construction accepts a single options object');
-    }
-    const options = inputAid ? (second ?? {}) : (first ?? {});
-    assertClientOptions(options, 'AUNClient options');
+    const inputAid = aid instanceof AID ? aid : null;
+    const options: AUNClientOptions = {};
     const rawConfig: RpcParams = clientOptionsConfig(options);
-    if (inputAid) rawConfig.aun_path = inputAid.aunPath;
-    const debug = !!options?.debug;
+    if (inputAid) {
+      rawConfig.aun_path = inputAid.aunPath;
+      rawConfig.verify_ssl = inputAid.verifySsl;
+      if (inputAid.rootCaPath) rawConfig.root_ca_path = inputAid.rootCaPath;
+      rawConfig.debug = inputAid.debug;
+    }
     this._configModel = configFromMap(rawConfig);
     const initAid = inputAid ? inputAid.aid : null;
     this._agentMdPath = path.join(this._configModel.aunPath, 'AIDs');
@@ -789,7 +786,7 @@ export class AUNClient {
     this._deviceId = (inputAid?.deviceId) || getDeviceId(this._configModel.aunPath);
 
     // 初始化 Logger（per-client 单例，必须最早创建）
-    const debugFlag = this._configModel.debug || debug;
+    const debugFlag = this._configModel.debug;
     this._logger = new AUNLogger({
       debug: debugFlag,
       aunPath: this._configModel.aunPath,
@@ -869,9 +866,6 @@ export class AUNClient {
         cert: inputAid.certPem,
       };
       this._state = 'standby';
-    }
-    if (options?.protected_headers !== undefined) {
-      this.setProtectedHeaders(options.protected_headers);
     }
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => this._onRawMessageReceived(data));
@@ -1266,8 +1260,9 @@ export class AUNClient {
       });
     }
     const result = peer.verifyAgentMd(content);
-    if (!result.ok) throw new AUNError(result.error.message);
-    return { ...result.data, verified: result.data.status === 'verified' };
+    if (!result.ok) throw new AUNError((result as { ok: false; error: { message: string } }).error.message);
+    const vd = (result as { ok: true; data: { status: string; payload?: string; aid?: string } }).data;
+    return { ...vd, verified: vd.status === 'verified' };
   }
 
   /**
@@ -1281,7 +1276,7 @@ export class AUNClient {
     const content = this._readAgentMdContent(target);
     const signed = this._currentAid?.signAgentMd(content);
     if (!signed?.ok) {
-      throw new StateError(signed?.error.message ?? 'publishAgentMd requires a valid local AID private key');
+      throw new StateError((signed as { ok: false; error: { message: string } } | undefined)?.error.message ?? 'publishAgentMd requires a valid local AID private key');
     }
     const signedContent = signed.data.signed;
     const result = await this._uploadAgentMd(signedContent);
@@ -1366,44 +1361,6 @@ export class AUNClient {
     this._agentMdPath = next;
     this._agentMdCache.clear();
     return this._agentMdPath;
-  }
-
-  /**
-   * 记录本地 agent.md 文件路径并一次性计算 etag（quoted sha256，与服务端一致）。
-   *
-   * - path 为空字符串：清除本地 path 与 etag。
-   * - 文件不存在 / 读取失败：清除 etag 并返回空串，不抛异常（应用可读 getLocalAgentMdEtag()
-   *   为空判断）。
-   * - 浏览器环境无文件系统：直接返回空串，记录 warn 日志。
-   * - 文件变更后需要重新调用 setLocalAgentMdPath() 触发重算（按设计：设置时一次性计算）。
-   *
-   * 返回当前 etag（quoted hex 或空串）。
-   */
-  setLocalAgentMdPath(path: string): string {
-    const rawPath = String(path ?? '').trim();
-    if (!rawPath) {
-      this._localAgentMdPath = '';
-      this._localAgentMdEtag = '';
-      return '';
-    }
-    // 浏览器环境没有 fs，直接退回空串。Node 环境才尝试读文件。
-    const isNode = typeof process !== 'undefined' && !!process.versions?.node;
-    if (!isNode) {
-      this._clientLog.warn(`setLocalAgentMdPath skipped: not running in Node.js (path=${rawPath})`);
-      this._localAgentMdPath = rawPath;
-      this._localAgentMdEtag = '';
-      return '';
-    }
-    this._localAgentMdPath = rawPath;
-    try {
-      const data = fs.readFileSync(rawPath);
-      const digest = crypto.createHash('sha256').update(data).digest('hex');
-      this._localAgentMdEtag = `"${digest}"`;
-    } catch (err) {
-      this._clientLog.warn(`setLocalAgentMdPath 读取失败 path=${rawPath} err=${err instanceof Error ? err.message : String(err)}`);
-      this._localAgentMdEtag = '';
-    }
-    return this._localAgentMdEtag;
   }
 
   /** 返回 setLocalAgentMdPath 计算的 etag；未设置或读取失败时返回空串。 */
@@ -1848,7 +1805,7 @@ export class AUNClient {
       throw new StateError('authenticate requires a loaded AID with a valid private key');
     }
     const publicState = this.state;
-    if (publicState !== ConnectionState.STANDBY && publicState !== ConnectionState.AUTHENTICATED) {
+    if (publicState !== ConnectionState.STANDBY) {
       throw new StateError(`authenticate not allowed in state ${publicState}`);
     }
     if ('aid' in options || 'access_token' in options || 'token' in options || 'kite_token' in options) {
@@ -1875,13 +1832,29 @@ export class AUNClient {
   }
 
   /** 连接到 Gateway；身份来自构造函数或 loadIdentity(aid)，认证由 SDK 内部自动完成。 */
-  async connect(options: RpcParams = {}): Promise<void> {
+  async connect(opts?: ConnectionOptions): Promise<void> {
     const tStart = Date.now();
-    if (arguments.length > 1) {
-      throw new ValidationError('connect accepts a single options object');
+    if (opts !== undefined && typeof opts === 'object') {
+      const raw = opts as Record<string, unknown>;
+      if ('gateway' in raw || 'access_token' in raw || 'aid' in raw || 'token' in raw) {
+        throw new ValidationError('connect options must not include gateway/access_token/aid; these are managed internally');
+      }
     }
-    if ('aid' in options || 'access_token' in options || 'token' in options || 'kite_token' in options) {
-      throw new ValidationError('connect options must not include aid or token fields; load an AID object first');
+    const options: RpcParams = {};
+    if (opts?.auto_reconnect !== undefined) options.auto_reconnect = opts.auto_reconnect;
+    if (opts?.heartbeat_interval !== undefined) options.heartbeat_interval = opts.heartbeat_interval;
+    if (opts?.connect_timeout !== undefined || opts?.call_timeout !== undefined) {
+      options.timeouts = {
+        ...(opts.connect_timeout !== undefined ? { connect: opts.connect_timeout } : {}),
+        ...(opts.call_timeout !== undefined ? { call: opts.call_timeout } : {}),
+      };
+    }
+    if (opts?.retry_initial_delay !== undefined || opts?.retry_max_delay !== undefined || opts?.retry_max_attempts !== undefined) {
+      options.retry = {
+        initial_delay: opts.retry_initial_delay ?? 1,
+        max_delay: opts.retry_max_delay ?? 64,
+        max_attempts: opts.retry_max_attempts ?? 0,
+      };
     }
     const target = this._currentAid?.aid ?? this._aid ?? '';
     if (!target || !this._currentAid?.isPrivateKeyValid()) {
@@ -1900,8 +1873,12 @@ export class AUNClient {
     if (publicState === ConnectionState.RETRY_BACKOFF) {
       this._stopReconnect();
     }
+    // gateway 来自 authenticate() 缓存的 this._gatewayUrl；未认证则自动 authenticate()
+    if (!this._gatewayUrl) {
+      await this.authenticate();
+    }
     this._state = 'connecting';
-    const gateway = String(options.gateway ?? this._gatewayUrl ?? await this._resolveGatewayForAid(target)).trim();
+    const gateway = String(this._gatewayUrl ?? '').trim();
     const params = { ...options, gateway };
     const normalized = this._normalizeConnectParams(params);
     this._captureCapabilitiesFromConnect(normalized);
@@ -1965,7 +1942,7 @@ export class AUNClient {
       closableKeyStore.close?.();
       this._state = 'closed';
       this._logger.close();
-      await this._dispatcher.publish('connection.state', { state: this._publicState(this._state) });
+      await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
       this._resetSeqTrackingState();
       this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
     } catch (err) {
@@ -2003,7 +1980,7 @@ export class AUNClient {
       this._stopReconnect();
       await this._transport.close();
       this._state = 'standby';
-      await this._dispatcher.publish('connection.state', { state: this._publicState(this._state) });
+      await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
       this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms`);
     } catch (err) {
       this._clientLog.debug(`disconnect exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
@@ -4305,7 +4282,7 @@ export class AUNClient {
       this._state = 'ready';
       this._connectedAt = Date.now();
       this._clientLog.debug(`auth complete, connection ready: aid=${this._aid ?? ''}, gateway=${gatewayUrl}`);
-      await this._dispatcher.publish('connection.state', { state: this._publicState(this._state), gateway: gatewayUrl });
+      await this._dispatcher.publish('state_change', { state: this._publicState(this._state), gateway: gatewayUrl });
 
       // auth 阶段 aid 可能被 identity 覆盖（上方 this._aid = identity.aid）；
       // 若 context 发生变化，重新 refresh + restore，保持 tracker 与真实身份一致。
@@ -7268,7 +7245,7 @@ export class AUNClient {
     this._clientLog.warn(`transport disconnected: closeCode=${closeCode ?? 'none'}, error=${error ? formatCaughtError(error) : 'none'}`);
     this._state = 'standby';
     this._stopBackgroundTasks();
-    await this._dispatcher.publish('connection.state', { state: this._publicState(this._state), error });
+    await this._dispatcher.publish('state_change', { state: this._publicState(this._state), error });
 
     if (!this._sessionOptions.auto_reconnect) return;
     if (this._reconnectActive) return;
@@ -7288,7 +7265,7 @@ export class AUNClient {
       if (disconnectInfo.code !== undefined && disconnectInfo.code !== null) {
         eventPayload.code = disconnectInfo.code;
       }
-      await this._dispatcher.publish('connection.state', eventPayload);
+      await this._dispatcher.publish('state_change', eventPayload);
       return;
     }
     // 1000 = 正常关闭, 1006 = 网络异常断开（无 close frame），其他 code = 服务端主动关闭
@@ -7328,7 +7305,7 @@ export class AUNClient {
       // max_attempts 检查在循环顶部，覆盖所有路径（含 health-fail）
       if (maxAttempts > 0 && attempt > maxAttempts) {
         this._state = 'connection_failed';
-        await this._dispatcher.publish('connection.state', {
+        await this._dispatcher.publish('state_change', {
           state: this._publicState(this._state),
           attempt: attempt - 1,
           reason: 'max_attempts_exhausted',
@@ -7339,7 +7316,7 @@ export class AUNClient {
       this._retryAttempt = attempt;
       this._nextRetryAt = Date.now() + reconnectSleepDelayMs(delay, maxBaseDelay);
       this._state = 'retry_backoff';
-      await this._dispatcher.publish('connection.state', {
+      await this._dispatcher.publish('state_change', {
         state: this._publicState(this._state),
         attempt,
         next_retry_at: this._nextRetryAt,
@@ -7350,7 +7327,7 @@ export class AUNClient {
         await this._sleep(Math.max(0, this._nextRetryAt - Date.now()));
         if (this._reconnectAbort?.signal.aborted || this._closing) break;
         this._state = 'reconnecting';
-        await this._dispatcher.publish('connection.state', {
+        await this._dispatcher.publish('state_change', {
           state: this._publicState(this._state),
           attempt,
         });
@@ -7381,7 +7358,7 @@ export class AUNClient {
         });
         if (!AUNClient._shouldRetryReconnect(exc as Error)) {
           this._state = 'connection_failed';
-          await this._dispatcher.publish('connection.state', {
+          await this._dispatcher.publish('state_change', {
             state: this._publicState(this._state),
             error: formatCaughtError(exc),
             attempt,

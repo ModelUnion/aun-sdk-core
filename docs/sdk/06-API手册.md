@@ -67,6 +67,11 @@ AID 由 `AIDStore.load()` 返回，应用层不直接构造。
 | `public_key` | `publicKey` | `PublicKey()` | 公钥 |
 | `cert_fingerprint` | `certFingerprint` | `CertFingerprint()` | 证书指纹 |
 | `aun_path` | `aunPath` | `AUNPath()` | 所属数据目录 |
+| `device_id` | `deviceId` | `DeviceID` | 设备 ID |
+| `slot_id` | `slotId` | `SlotID` | 密钥槽 ID |
+| `verify_ssl` | `verifySsl` | `VerifySSL` | 是否校验 TLS 证书 |
+| `root_ca_path` | `rootCaPath` | `RootCaPath` | 自定义根证书路径 |
+| `debug` | `debug` | `Debug` | 是否开启调试日志 |
 
 ### 方法
 

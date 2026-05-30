@@ -6,6 +6,19 @@
 
 ---
 
+## 0.4.2 — 2026-05-30
+
+### Added
+- **`AIDStore` 新增结构化返回类型**：`FetchAgentMdResult`、`HeadAgentMdResult`、`CheckAgentMdResult`、`DiagnoseResult`、`RenewCertResult`、`RekeyResult`、`ChangeSeedResult`、`ResolveResult`、`ListResult`（均为 `TypedDict`），替代原来的裸 `dict`。
+- **`AUNClientOptions` 新增 `root_ca_path`**：支持私有部署指定自定义根证书路径。
+- **`AUNClientOptions` 新增 `debug`**：可在构造时直接传入调试模式开关。
+
+### Changed
+- **移除 `discovery_port`**：`AUNClientOptions` 删除 `discovery_port` 字段，gateway URL 改为纯自动发现。
+- **`fetch_agent_md` 透传 `verify_ssl` / `root_ca_path` / `debug`**：内部创建 `AIDStore` 时自动注入这三个配置项。
+
+---
+
 ## 0.4.0 — 2026-05-30
 
 > **破坏性重构版本。** 身份管理从 `AUNClient` 中剥离为独立的 `AID` / `AIDStore`；删除 `auth` / `custody` / `meta` 三个公开命名空间；引入统一的 `Result` 与字符串错误码；连接状态机扩展为 9 态。升级前请阅读 Breaking Changes。

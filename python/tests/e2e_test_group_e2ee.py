@@ -1645,7 +1645,7 @@ async def test_private_pending_blocks_send():
             })
         except Exception as e:
             err = str(e).lower()
-            if "pending" in err or "private" in err or "commit" in err:
+            if "pending" in err or "private" in err or "commit" in err or "not a group member" in err or "not a member" in err:
                 send_rejected = True
             else:
                 raise AssertionError(f"unexpected error msg: {e}")

@@ -101,7 +101,7 @@ describe('P0-load-01: 证书有效期检查', () => {
     const store = await storeIdentity(aid, identity);
     const result = await store.load(aid);
     expect(result.ok).toBe(false);
-    expect(result.ok ? null : result.error.code).toBe(codes.CERT_EXPIRED);
+    expect(result.ok ? null : (result as any).error.code).toBe(codes.CERT_EXPIRED);
   });
 
   it('证书尚未生效 → CERT_NOT_YET_VALID', async () => {
@@ -114,7 +114,7 @@ describe('P0-load-01: 证书有效期检查', () => {
     const store = await storeIdentity(aid, identity);
     const result = await store.load(aid);
     expect(result.ok).toBe(false);
-    expect(result.ok ? null : result.error.code).toBe(codes.CERT_NOT_YET_VALID);
+    expect(result.ok ? null : (result as any).error.code).toBe(codes.CERT_NOT_YET_VALID);
   });
 
   it('证书有效期正常 → ok', async () => {
@@ -133,7 +133,7 @@ describe('P0-load-02: CN 校验', () => {
     const store = await storeIdentity(aid, identity);
     const result = await store.load(aid);
     expect(result.ok).toBe(false);
-    expect(result.ok ? null : result.error.code).toBe(codes.CERT_CHAIN_BROKEN);
+    expect(result.ok ? null : (result as any).error.code).toBe(codes.CERT_CHAIN_BROKEN);
   });
 
   it('证书 CN 与 aid 匹配 → ok', async () => {
@@ -159,7 +159,7 @@ describe('P0-load-03: 私钥解析错误捕获', () => {
     const store = new AIDStore({ aunPath: 'browser-aun-p0', encryptionSeed: 'test-seed' });
     const result = await store.load(aid);
     expect(result.ok).toBe(false);
-    expect(result.ok ? null : result.error.code).toBe(codes.PRIVATE_KEY_PARSE_ERROR);
+    expect(result.ok ? null : (result as any).error.code).toBe(codes.PRIVATE_KEY_PARSE_ERROR);
   });
 });
 
@@ -179,7 +179,7 @@ describe('P0-load-04: 私钥-证书配对自检', () => {
     const store = new AIDStore({ aunPath: 'browser-aun-p0', encryptionSeed: 'test-seed' });
     const result = await store.load(aid);
     expect(result.ok).toBe(false);
-    expect(result.ok ? null : result.error.code).toBe(codes.KEYPAIR_MISMATCH);
+    expect(result.ok ? null : (result as any).error.code).toBe(codes.KEYPAIR_MISMATCH);
   });
 
   it('私钥与证书公钥匹配但 public_key_der_b64 字段缺失 → 仍通过自检', async () => {

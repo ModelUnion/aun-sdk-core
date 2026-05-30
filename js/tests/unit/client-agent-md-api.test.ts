@@ -20,7 +20,7 @@ async function etag(content: string): Promise<string> {
 }
 
 function makeClient(): AUNClient {
-  return new AUNClient({ aun_path: '/tmp/aun-js-agent-md' });
+  return new (AUNClient as any)({ aun_path: '/tmp/aun-js-agent-md' });
 }
 
 function agentRoot(client: AUNClient): string {

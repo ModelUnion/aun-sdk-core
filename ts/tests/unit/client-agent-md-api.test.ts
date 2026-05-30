@@ -5,14 +5,29 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 
 import { AUNClient } from '../../src/client.js';
+import { AID } from '../../src/aid.js';
 import { ValidationError } from '../../src/errors.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function makeMockAid(aunPath: string): AID {
+  return {
+    aid: 'test.aid.com', aunPath, certPem: '', publicKey: '', certSubject: '',
+    certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
+    verifySsl: true, rootCaPath: null, debug: false,
+    isCertValid: () => true, isPrivateKeyValid: () => true,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+  } as unknown as AID;
+}
+
 function makeClient() {
-  return new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-client-agent-md-')) });
+  return new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-client-agent-md-'))));
 }
 
 function etag(content: string): string {
@@ -46,7 +61,7 @@ function readRecords(client: AUNClient): Record<string, any> {
 describe('client AIDs agent.md 文件存储', () => {
   it('默认路径为 {aun_path}/AIDs，内部存储根可切换/恢复', () => {
     const base = mkdtempSync(join(tmpdir(), 'aun-client-agent-md-path-'));
-    const client = new AUNClient({ aun_path: join(base, 'aun') });
+    const client = new AUNClient(makeMockAid(join(base, 'aun')));
     expect(agentRoot(client)).toBe(join(base, 'aun', 'AIDs'));
     expect((client as any).setAgentMdPath).toBeUndefined();
     expect((client as any).SetAgentMDPath).toBeUndefined();

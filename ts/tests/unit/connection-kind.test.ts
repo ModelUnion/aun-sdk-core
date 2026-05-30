@@ -1,15 +1,24 @@
-/**
- * 长短连接共存 单元测试
- *
- * 对齐 Python SDK test_connection_kind.py 的 10 个用例。
- */
-
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AUNClient } from '../../src/client.js';
+import { AID } from '../../src/aid.js';
 import { ValidationError } from '../../src/errors.js';
+
+function makeMockAid(aunPath: string): AID {
+  return {
+    aid: 'test.aid.com', aunPath, certPem: '', publicKey: '', certSubject: '',
+    certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
+    verifySsl: true, rootCaPath: null, debug: false,
+    isCertValid: () => true, isPrivateKeyValid: () => true,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+  } as unknown as AID;
+}
 
 describe('长短连接共存', () => {
   let tmpDir: string;
@@ -27,7 +36,7 @@ describe('长短连接共存', () => {
 
   // 2. _normalizeConnectParams 不传 connection_kind 默认 "long"
   it('_normalizeConnectParams 默认 connection_kind 为 long', () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const params = (client as any)._normalizeConnectParams({
       access_token: 'tok',
       gateway: 'ws://localhost/aun',
@@ -37,7 +46,7 @@ describe('长短连接共存', () => {
 
   // 3. _normalizeConnectParams 接受 kind="short" + short_ttl_ms
   it('_normalizeConnectParams 接受 kind=short + short_ttl_ms', () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const params = (client as any)._normalizeConnectParams({
       access_token: 'tok',
       gateway: 'ws://localhost/aun',
@@ -50,7 +59,7 @@ describe('长短连接共存', () => {
 
   // 4. _normalizeConnectParams 拒绝无效 kind
   it('_normalizeConnectParams 拒绝无效 connection_kind', () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     expect(() =>
       (client as any)._normalizeConnectParams({
         access_token: 'tok',
@@ -62,7 +71,7 @@ describe('长短连接共存', () => {
 
   // 5. _initializeSession kind=short 时 payload 含 options.kind="short" + short_ttl_ms
   it('auth.connect payload kind=short 含 options', async () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     // 直接测试 AuthFlow._initializeSession 的行为：
     // 通过 mock transport.call 捕获 auth.connect 的 params
     const capturedCalls: Array<{ method: string; params: any }> = [];
@@ -91,7 +100,7 @@ describe('长短连接共存', () => {
 
   // 6. _initializeSession kind=long 时 payload 不含 options（向后兼容）
   it('auth.connect payload kind=long 不含 options', async () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const capturedCalls: Array<{ method: string; params: any }> = [];
     const mockTransport = {
       call: vi.fn(async (method: string, params: any) => {
@@ -114,7 +123,7 @@ describe('长短连接共存', () => {
 
   // 7. 短连接禁用 heartbeat 与 token_refresh（短连接生命周期短，不需要长期会话维护）
   it('短连接禁用 heartbeat 与 token_refresh', () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     // 设置 _sessionOptions 为 short
     (client as any)._sessionOptions = { connection_kind: 'short' };
     const startHeartbeat = vi.spyOn(client as any, '_startHeartbeatTask');
@@ -126,7 +135,7 @@ describe('长短连接共存', () => {
 
   // 8. 长连接启动心跳和 token_refresh
   it('长连接启动后台任务', () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     (client as any)._sessionOptions = { connection_kind: 'long' };
     const startHeartbeat = vi.spyOn(client as any, '_startHeartbeatTask').mockImplementation(() => {});
     const startTokenRefresh = vi.spyOn(client as any, '_startTokenRefreshTask').mockImplementation(() => {});
@@ -139,7 +148,7 @@ describe('长短连接共存', () => {
 
   // 9. 短连接不改变 auto_reconnect 默认值
   it('短连接 auto_reconnect 保持默认 true', () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const options = (client as any)._buildSessionOptions({
       connection_kind: 'short',
     });
@@ -148,7 +157,7 @@ describe('长短连接共存', () => {
 
   // 10. 长连接保持默认 auto_reconnect=true
   it('长连接保持默认 auto_reconnect=true', () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const options = (client as any)._buildSessionOptions({
       connection_kind: 'long',
     });

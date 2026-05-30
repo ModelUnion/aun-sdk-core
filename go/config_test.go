@@ -61,9 +61,6 @@ func TestConfigFromMap(t *testing.T) {
 	if cfg.SeedPassword != "test-seed" {
 		t.Errorf("SeedPassword 不正确: %s", cfg.SeedPassword)
 	}
-	if cfg.DiscoveryPort != 20001 {
-		t.Errorf("DiscoveryPort 不正确: %d", cfg.DiscoveryPort)
-	}
 	if !cfg.GroupE2EE {
 		t.Error("GroupE2EE 是必备能力，应始终为 true")
 	}
@@ -107,9 +104,6 @@ func TestConfigFromMapSupportsCamelCaseAliases(t *testing.T) {
 	}
 	if cfg.SeedPassword != "camel-seed" {
 		t.Fatalf("SeedPassword 不正确: %s", cfg.SeedPassword)
-	}
-	if cfg.DiscoveryPort != 21001 {
-		t.Fatalf("DiscoveryPort 不正确: %d", cfg.DiscoveryPort)
 	}
 	if !cfg.GroupE2EE {
 		t.Fatal("GroupE2EE 应始终为 true（必备能力）")

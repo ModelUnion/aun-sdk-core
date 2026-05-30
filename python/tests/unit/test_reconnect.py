@@ -102,7 +102,7 @@ class TestAutoReconnectDisabled:
     async def test_state_event_published_on_disconnect(self):
         client = _make_client(auto_reconnect=False)
         events = []
-        client.on("connection.state", lambda d: events.append(d))
+        client.on("state_change", lambda d: events.append(d))
 
         await client._handle_transport_disconnect(None)
         await asyncio.sleep(0)  # 让事件循环推进
@@ -144,7 +144,7 @@ class TestBasicReconnect:
         def capture_state(data: Any) -> None:
             states.append(data.get("state", ""))
 
-        client.on("connection.state", capture_state)
+        client.on("state_change", capture_state)
 
         async def mock_reconnect():
             client._state = "connected"
@@ -459,7 +459,7 @@ class TestReconnectAttemptInfo:
             if data.get("state") == "reconnecting":
                 reconnect_events.append(data)
 
-        client.on("connection.state", capture)
+        client.on("state_change", capture)
 
         call_count = 0
 

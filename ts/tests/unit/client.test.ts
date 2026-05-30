@@ -1,15 +1,10 @@
-/**
- * AUNClient 单元测试
- *
- * 测试客户端构造、参数校验、状态管理等不需要网络连接的逻辑。
- */
-
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AUNClient } from '../../src/client.js';
+import { AID } from '../../src/aid.js';
 import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, PermissionError, StateError, ValidationError } from '../../src/errors.js';
 import { ProtectedHeaders } from '../../src/protected-headers.js';
@@ -17,6 +12,32 @@ import { computeStateCommitment } from '../../src/v2/state/index.js';
 import { encryptP2PMessage } from '../../src/v2/e2ee/encrypt-p2p.js';
 import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group.js';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh.js';
+
+function makeMockAid(aunPath: string, extra?: Partial<AID>): AID {
+  return {
+    aid: 'test.aid.com',
+    aunPath,
+    certPem: '',
+    publicKey: '',
+    certSubject: '',
+    certNotBefore: new Date(),
+    certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '',
+    certFingerprint: '',
+    deviceId: 'default',
+    slotId: 'default',
+    verifySsl: true,
+    rootCaPath: null,
+    debug: false,
+    isCertValid: () => true,
+    isPrivateKeyValid: () => true,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+    ...extra,
+  } as unknown as AID;
+}
 
 function keyIdForBytes(bytes: Uint8Array): string {
   return `sha256:${createHash('sha256').update(Buffer.from(bytes)).digest('hex').slice(0, 16)}`;
@@ -42,14 +63,14 @@ describe('AUNClient 构造', () => {
 
   it('使用自定义 aunPath 构造', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-client-test-'));
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     expect(client.state).toBe('no_identity');
     expect(client.config.aun_path).toBe(tmpDir);
   });
 
   it('构造时不再创建旧版 SQLite 备份库', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-client-sqlite-'));
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     expect(existsSync(join(tmpDir, '.aun_backup', 'aun_backup.db'))).toBe(false);
     expect(client.state).toBe('no_identity');
   });
@@ -89,14 +110,14 @@ describe('AUNClient.connect 参数校验', () => {
   it('未加载 AID 时抛出 StateError', async () => {
     const client = new AUNClient();
     await expect(
-      client.connect({ gateway: 'ws://localhost:20001/aun' }),
+      client.connect({ gateway: 'ws://localhost:20001/aun' } as any),
     ).rejects.toThrow(StateError);
   });
 
   it('不接受旧版 access_token 参数', async () => {
     const client = new AUNClient();
     await expect(
-      client.connect({ access_token: 'tok_123' }),
+      client.connect({ access_token: 'tok_123' } as any),
     ).rejects.toThrow(ValidationError);
   });
 
@@ -303,7 +324,7 @@ describe('AUNClient 事件订阅', () => {
 describe('AUNClient._syncIdentityAfterConnect', () => {
   it('同步 token 时应写入当前实例态', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-client-sync-'));
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const ks = (client as any)._keystore;
     const aid = 'sync.agentid.pub';
     const deviceId = (client as any)._deviceId;
@@ -376,7 +397,7 @@ describe('AUNClient message.send 接收者校验', () => {
       to: 'bob.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
-      protected_headers: protectedHeaders,
+      protected_headers: protectedHeaders as unknown as Record<string, string>,
       headers: { device_id: 'dev-b' },
     });
 
@@ -429,7 +450,7 @@ describe('AUNClient.connect V2 session 初始化', () => {
 
     await client.connect({
       gateway: 'ws://gateway.example.com/aun',
-    });
+    } as any);
 
     expect(initV2Spy).toHaveBeenCalledTimes(1);
     expect(client.state).toBe('ready');
@@ -3169,7 +3190,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
   it('publishAgentMd 成功后应持久化自己的正文文件和 list.json 元数据', async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-publish-'));
-    const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
+    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: alice.agentid.pub\n---\n# Alice\n';
     writeAgentFile(client, 'alice.agentid.pub', body);
@@ -3202,7 +3223,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
   it('fetchAgentMd 下载远端后应写入正文文件和 list.json 元数据', async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-fetch-'));
-    const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
+    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
     (client as any)._agentMdCache = new Map([
@@ -3225,7 +3246,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
   it('RPC _meta 应同时持久化自身和目标 AID 的云端 ETag', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-rpc-meta-'));
-    const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
+    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
     (client as any)._aid = 'alice.agentid.pub';
 
     (client as any)._observeRpcMeta({
@@ -3247,7 +3268,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
   it('transport 事件和通知的顶层 _meta 应进入 agent.md ETag 缓存', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-event-meta-'));
-    const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
+    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
     (client as any)._aid = 'alice.agentid.pub';
 
     (client as any)._transport._routeMessage({
@@ -3268,7 +3289,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
   it('V2 信封 agent_md.sender 应透传到应用层并落到 list.json', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-envelope-'));
-    const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
+    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
     (client as any)._aid = 'bob.agentid.pub';
     const event: Record<string, unknown> = {};
 
@@ -3291,7 +3312,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
   it('checkAgentMd 应用 HEAD 返回的云端 ETag 与本地正文 ETag 比较并落到 list.json', async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-check-'));
-    const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
+    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
     (client as any)._aid = 'alice.agentid.pub';
     const body = '# Bob\n';
     (client as any)._saveAgentMdRecord('bob.agentid.pub', { content: body, local_etag: agentEtag(body), remote_etag: '"old"' });
@@ -3315,7 +3336,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
   it('checkAgentMd 本地无记录时仍应 HEAD 云端并返回 local_found=false', async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-check-missing-'));
-    const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
+    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
     (client as any)._aid = 'alice.agentid.pub';
     (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
       aid,

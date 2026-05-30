@@ -1,14 +1,23 @@
-/**
- * 验证 gateway.disconnect 事件 detail 字段透传到应用层。
- *
- * 对齐 Python SDK tests/unit/test_gateway_disconnect_detail.py 的 3 个用例。
- */
-
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AUNClient } from '../../src/client.js';
+import { AID } from '../../src/aid.js';
+
+function makeMockAid(aunPath: string): AID {
+  return {
+    aid: 'test.aid.com', aunPath, certPem: '', publicKey: '', certSubject: '',
+    certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
+    verifySsl: true, rootCaPath: null, debug: false,
+    isCertValid: () => true, isPrivateKeyValid: () => true,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+  } as unknown as AID;
+}
 
 describe('gateway.disconnect detail 透传', () => {
   let tmpDir: string;
@@ -19,7 +28,7 @@ describe('gateway.disconnect detail 透传', () => {
 
   // 1. 服务端 event/gateway.disconnect 带 detail 时，应用层订阅者应能拿到。
   it('detail 字段透传到 gateway.disconnect 事件', async () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const received: any[] = [];
     client.on('gateway.disconnect', (data) => { received.push(data); });
 
@@ -51,7 +60,7 @@ describe('gateway.disconnect detail 透传', () => {
 
   // 2. 服务端不带 detail 时，detail 字段应为空对象而不是缺失。
   it('无 detail 时 detail 字段为空对象', async () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const received: any[] = [];
     client.on('gateway.disconnect', (data) => { received.push(data); });
 
@@ -64,7 +73,7 @@ describe('gateway.disconnect detail 透传', () => {
 
   // 3. 连接进入 terminal_failed 时 connection.state 事件也应带服务端 detail。
   it('terminal_failed 状态变更也带 detail', async () => {
-    const client = new AUNClient({ aun_path: tmpDir });
+    const client = new AUNClient(makeMockAid(tmpDir));
     const states: any[] = [];
     client.on('connection.state', (data) => { states.push(data); });
 

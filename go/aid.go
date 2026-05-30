@@ -28,6 +28,9 @@ type AID struct {
 	CertFingerprint string // "sha256:" + hex
 	DeviceID        string // 设备 ID，由 AIDStore 注入
 	SlotID          string // 密钥槽 ID，由 AIDStore 注入
+	VerifySSL       bool   // 是否校验 TLS 证书，由 AIDStore 注入
+	RootCaPath      string // 自定义根证书路径，由 AIDStore 注入
+	Debug           bool   // 调试模式，由 AIDStore 注入
 
 	// 私有字段
 	certObj    *x509.Certificate
@@ -43,6 +46,7 @@ func newAID(
 	privateKey crypto.PrivateKey,
 	certValid, pkValid bool,
 	deviceID, slotID string,
+	verifySSL bool, rootCaPath string, debug bool,
 ) *AID {
 	a := &AID{
 		Aid:        strings.TrimSpace(aid),
@@ -55,6 +59,9 @@ func newAID(
 	}
 	a.DeviceID = deviceID
 	a.SlotID = slotID
+	a.VerifySSL = verifySSL
+	a.RootCaPath = rootCaPath
+	a.Debug = debug
 	if certObj != nil {
 		if der, err := x509.MarshalPKIXPublicKey(certObj.PublicKey); err == nil {
 			a.PublicKey = base64.StdEncoding.EncodeToString(der)

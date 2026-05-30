@@ -1,6 +1,7 @@
 package aun
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -105,7 +106,7 @@ func TestFix03_SetProtectedHeadersFiltersInvalidKeys(t *testing.T) {
 }
 
 func TestFix03_OptionsProtectedHeadersInitialized(t *testing.T) {
-	c := NewAUNClient(AUNClientOptions{
+	c := NewAUNClient(nil, AUNClientOptions{
 		AUNPath:          t.TempDir(),
 		ProtectedHeaders: map[string]any{"x-init": "from-options"},
 	})
@@ -285,5 +286,9 @@ func generateLocalAIDForTest(t *testing.T) (*AID, error) {
 	aidStr := "testaid.aid.com"
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aidStr, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	saveTestIdentity(t, s, aidStr, certPEM, privPEM, pubB64)
-	return s.Load(aidStr)
+	r := s.Load(aidStr)
+	if !r.Ok {
+		return nil, fmt.Errorf("%s: %s", r.Error.Code, r.Error.Message)
+	}
+	return r.Data.AID, nil
 }

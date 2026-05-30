@@ -71,8 +71,6 @@ export interface AUNConfig {
   rootCaPem: string | null;
   /** 私钥加密口令 */
   seedPassword: string | null;
-  /** Gateway 发现端口 */
-  discoveryPort: number | null;
   /** 是否启用群组 E2EE（默认 true） */
   groupE2ee: boolean;
   /** 是否验证 SSL 证书（默认 true） */
@@ -88,7 +86,6 @@ const DEFAULTS: AUNConfig = {
   aunPath: 'aun',
   rootCaPem: null,
   seedPassword: null,
-  discoveryPort: null,
   groupE2ee: true,
   verifySsl: true,
   requireForwardSecrecy: true,
@@ -115,7 +112,6 @@ export function createConfig(raw?: AUNConfigInput | null): AUNConfig {
       data.seedPassword ?? data.seed_password ?? data.encryptionSeed ?? data.encryption_seed,
       DEFAULTS.seedPassword,
     ),
-    discoveryPort: readOptionalNumber(data.discoveryPort ?? data.discovery_port, DEFAULTS.discoveryPort),
     groupE2ee: true,  // 必备能力，不可配置
     verifySsl: DEFAULTS.verifySsl,
     requireForwardSecrecy: readBoolean(data.requireForwardSecrecy ?? data.require_forward_secrecy, DEFAULTS.requireForwardSecrecy),

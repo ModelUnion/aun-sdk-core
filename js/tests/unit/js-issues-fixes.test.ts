@@ -49,7 +49,7 @@ describe('JS-001: Message 类型字段声明', () => {
 describe('JS-002: IndexedDB 群组密钥操作原子性', () => {
   it('IndexedDBKeyStore 应有 row 化群组密钥方法', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js002' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js002' } as any);
     expect(typeof ks.storeGroupSecretTransition).toBe('function');
     expect(typeof ks.storeGroupSecretEpoch).toBe('function');
     expect(typeof ks.loadGroupSecretEpoch).toBe('function');
@@ -58,7 +58,7 @@ describe('JS-002: IndexedDB 群组密钥操作原子性', () => {
 
   it('storeGroupSecretTransition 后 loadGroupSecretEpoch 应返回一致的数据', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js002-rw' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js002-rw' } as any);
 
     const entry: GroupSecretRecord = {
       epoch: 3,
@@ -104,7 +104,7 @@ describe('JS-002: IndexedDB 群组密钥操作原子性', () => {
 
   it('并发写同一群组密钥不应丢失数据', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js002-concurrent' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js002-concurrent' } as any);
 
     const entry1: GroupSecretRecord = {
       epoch: 1,
@@ -182,7 +182,7 @@ describe('JS-004: V2-only group decrypt cleanup', () => {
 describe('JS-005: _isGroupEpochRecoverable 空字符串 secret 判断', () => {
   it('空字符串 secret 的 epoch 记录不应被视为可恢复', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js005' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js005' } as any);
 
     // 保存一个 secret 为空字符串的记录
     const entry: GroupSecretRecord = {
@@ -212,7 +212,7 @@ describe('JS-005: _isGroupEpochRecoverable 空字符串 secret 判断', () => {
 
   it('有效 secret 的 epoch 记录应被正常保存和加载', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js005-valid' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js005-valid' } as any);
 
     const entry: GroupSecretRecord = {
       epoch: 1,
@@ -316,13 +316,13 @@ describe('JS-007: dissolve 后清理本地状态', () => {
   // ── KeyStore.deleteGroupSecretState ──
   it('IndexedDBKeyStore 应有 deleteGroupSecretState 方法', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete' } as any);
     expect(typeof ks.deleteGroupSecretState).toBe('function');
   });
 
   it('deleteGroupSecretState 删除后 loadGroupSecretEpoch 返回 null', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete-2' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete-2' } as any);
 
     // 先保存
     await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
@@ -345,7 +345,7 @@ describe('JS-007: dissolve 后清理本地状态', () => {
 
   it('deleteGroupSecretState 不影响其他群组', async () => {
     const { IndexedDBKeyStore } = await import('../../src/keystore/indexeddb.js');
-    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete-3' });
+    const ks = new IndexedDBKeyStore({ dbName: 'test-js007-delete-3' } as any);
 
     await ks.storeGroupSecretTransition('alice.test', 'grp-1', {
       epoch: 1, secret: 'dGVzdA==', commitment: 'c1', memberAids: ['alice.test'], oldEpochRetentionMs: 7 * 24 * 3600 * 1000,
