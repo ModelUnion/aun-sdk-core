@@ -83,7 +83,7 @@ def _make_client_with_aid(aun_path, aid: str = "alice.agentid.pub", *, debug: bo
         loaded = store.load(aid)
         assert loaded.ok, loaded.error
         assert loaded.data is not None
-        return AUNClient(loaded.data["aid"], debug=debug)
+        return AUNClient(loaded.data["aid"])
     finally:
         store.close()
 
@@ -295,7 +295,7 @@ def test_connect_rejects_external_gateway_option():
 
 def test_connect_requires_gateway():
     client = AUNClient()
-    with pytest.raises(StateError, match="gateway"):
+    with pytest.raises(StateError, match="loaded identity"):
         asyncio.run(
             client.connect({"access_token": "tok"})
         )
@@ -4554,7 +4554,7 @@ async def test_max_attempts_stops_reconnect_on_health_fail():
     # 应该发布 connection_failed 事件
     terminal_events = [
         (e, d) for e, d in published
-        if e == "connection.state" and d.get("state") == ConnectionState.CONNECTION_FAILED.value
+        if e == "state_change" and d.get("state") == ConnectionState.CONNECTION_FAILED.value
     ]
     assert len(terminal_events) == 1
     assert terminal_events[0][1].get("reason") == "max_attempts_exhausted"
@@ -4615,7 +4615,7 @@ async def test_max_attempts_stops_reconnect_on_connect_fail():
     assert client.state == ConnectionState.CONNECTION_FAILED
     terminal_events = [
         (e, d) for e, d in published
-        if e == "connection.state" and d.get("state") == ConnectionState.CONNECTION_FAILED.value
+        if e == "state_change" and d.get("state") == ConnectionState.CONNECTION_FAILED.value
     ]
     assert len(terminal_events) == 1
     assert terminal_events[0][1].get("reason") == "max_attempts_exhausted"

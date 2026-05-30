@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { AUNClient } from '../../src/client.js';
+import { AID } from '../../src/aid.js';
 import {
   V2KeyStore,
   V2Session,
@@ -26,6 +27,20 @@ const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
   DatabaseSync: new (path: string, options?: NodeDatabaseSyncOptions) => NodeDatabaseSync;
 };
 
+function makeMockAid(aunPath: string): AID {
+  return {
+    aid: 'test.aid.com', aunPath, certPem: '', publicKey: '', certSubject: '',
+    certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
+    verifySsl: true, rootCaPath: null, debug: false,
+    isCertValid: () => true, isPrivateKeyValid: () => true,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+  } as unknown as AID;
+}
+
 interface ClientFixture {
   client: AUNClient;
   session: V2Session;
@@ -34,7 +49,7 @@ interface ClientFixture {
 
 function makeClientWithSession(): ClientFixture {
   const tmpDir = mkdtempSync(join(tmpdir(), 'aun-pfs-'));
-  const client = new AUNClient({ aun_path: tmpDir });
+  const client = new AUNClient(makeMockAid(tmpDir));
   const db = new DatabaseSync(':memory:');
   const store = new V2KeyStore(db);
   const [ikPriv, ikPub] = generateP256Keypair();

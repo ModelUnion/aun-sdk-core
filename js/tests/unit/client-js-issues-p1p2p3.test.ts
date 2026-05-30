@@ -84,7 +84,7 @@ describe('ISSUE-SDK-JS-003: AIDStore.list()', () => {
 
     const result = await store.list();
     expect(result.ok).toBe(true);
-    expect(result.data?.identities).toEqual([
+    expect((result as any).data?.identities).toEqual([
       { aid: 'alice.aid.com', certFingerprint: 'fp-alice.aid.com' },
       { aid: 'bob.aid.com', certFingerprint: 'fp-bob.aid.com' },
     ]);
@@ -96,7 +96,7 @@ describe('ISSUE-SDK-JS-003: AIDStore.list()', () => {
 
     const result = await store.list();
     expect(result.ok).toBe(true);
-    expect(result.data?.identities).toEqual([]);
+    expect((result as any).data?.identities).toEqual([]);
   });
 });
 

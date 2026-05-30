@@ -133,7 +133,7 @@ func TestGatewayDisconnectDetail_TerminalFailedCarriesDetail(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	var captured map[string]any
-	sub := c.events.Subscribe("connection.state", func(payload any) {
+	sub := c.events.Subscribe("state_change", func(payload any) {
 		data, _ := payload.(map[string]any)
 		if s, _ := data["state"].(string); s == string(ConnStateConnectionFailed) {
 			captured = data

@@ -1,4 +1,4 @@
-# AUN SDK 重构设计方案 v4.0
+# AUN SDK 重构设计方案 v4.2
 
 ## 一、设计原则
 
@@ -40,6 +40,9 @@ class AIDStore {
     encryptionSeed: string;    // 必传：加密种子（可为空字符串 ''）
     deviceId?: string;         // 默认 getDeviceId()，同一 AID 最多 10 个设备在线
     slotId?: string;           // 默认 'default'，同设备最多 10 个 slot 在线
+    verifySsl?: boolean;       // 默认 true，测试环境可设为 false
+    rootCaPath?: string;       // 自定义根证书路径，私有部署使用
+    debug?: boolean;           // 开启调试日志，默认 false
   });
 }
 ```
@@ -49,6 +52,9 @@ class AIDStore {
 - `encryptionSeed` 可以是空字符串 `''`，表示不加密
 - 应用层统一管理加密种子，SDK 不持久化
 - `deviceId` + `slotId` 构成消费通道，影响 V2 session 密钥存储和消息序号命名空间
+- `verifySsl: false` 仅用于测试环境，生产环境不应关闭
+- `rootCaPath` 用于私有部署时指定自定义根证书
+- `debug: true` 开启详细调试日志输出
 - 同一进程内可创建多个 AIDStore 实例（指向不同 keystore 或不同 slot）
 
 **示例**：
@@ -72,9 +78,11 @@ const store = new AIDStore({
 
 ### 2.2 AIDStore 加载与注册
 
-#### `load(aid: string): Promise<Result<{ aid: AID }>>`
+#### `load(aid: string): Result<{ aid: AID }>`
 
 从本地 keystore 加载 AID（证书 + 私钥若有）。
+
+> **注意**：JS SDK 因底层使用 IndexedDB（浏览器异步 API），保持 `Promise<Result<{ aid: AID }>>` 为平台例外。
 
 **流程**：
 1. 从 `{aunPath}/AIDs/{aid}/public/certs/` 读证书
@@ -92,7 +100,7 @@ const store = new AIDStore({
 **示例**：
 ```typescript
 const store = new AIDStore({ aunPath: '...', encryptionSeed: '...' });
-const result = await store.load('alice.aid.pub');
+const result = store.load('alice.aid.pub');
 
 if (result.ok) {
   const me = result.data.aid;
@@ -131,7 +139,7 @@ const result = await store.register('alice.aid.pub');
 
 if (result.ok) {
   // 注册成功，加载身份
-  const loadResult = await store.load('alice.aid.pub');
+  const loadResult = store.load('alice.aid.pub');
   const me = loadResult.data!.aid;
 } else {
   console.log('注册失败:', result.error.code);
@@ -140,7 +148,7 @@ if (result.ok) {
 
 ---
 
-#### `list(): Promise<Result<{ identities: AIDInfo[] }>>`
+#### `list(): Result<{ identities: AIDInfo[] }>`
 
 列出本地所有有私钥的 AID 元信息。
 
@@ -155,6 +163,7 @@ type AIDInfo = {
   aid: string;
   certNotAfter: Date;
   certIssuer: string;
+  certFingerprint: string;
 };
 
 // 成功
@@ -164,7 +173,7 @@ type AIDInfo = {
 **示例**：
 ```typescript
 const store = new AIDStore({ aunPath: '...', encryptionSeed: '...' });
-const result = await store.list();
+const result = store.list();
 
 if (result.ok) {
   console.log('本地身份:', result.data.identities.map(i => i.aid));
@@ -214,7 +223,7 @@ if (result.ok) {
 
 ### 2.3 AIDStore 解析对端
 
-#### `resolve(aid: string, opts?: ResolveOpts): Promise<Result<ResolveData>>`
+#### `resolve(aid: string, opts?: ResolveOpts): Promise<Result<ResolveResult>>`
 
 **一站式解析对端 AID**：下载证书 → 验签证书 → 缓存到本地 → 下载 agent.md → 验签 agent.md。
 
@@ -236,23 +245,24 @@ type ResolveOpts = {
 
 **返回**：
 ```typescript
-type ResolveData = {
+type ResolveResult = {
   aid: AID;                          // PeerOnly AID 对象
-  agentMd?: {
+  agent_md?: {
     content: string;
     verification: {
-      status: 'verified' | 'invalid' | 'unsigned';
+      status: string;
       reason?: string;
     };
+    cert_pem: string;
   };
   source: {
-    certFromCache: boolean;          // 证书来自本地缓存
-    agentMdFetched: boolean;         // agent.md 已下载
+    cert_from_cache: boolean;        // 证书来自本地缓存
+    agent_md_fetched: boolean;       // agent.md 已下载
   };
 };
 
 // 成功
-{ ok: true, data: ResolveData }
+{ ok: true, data: ResolveResult }
 // 失败
 { ok: false, error: { code, message } }
 ```
@@ -269,7 +279,7 @@ type ResolveData = {
 
 **关键设计原则**：
 - 网络/资源不存在 → 返回 `error`（应用层无法继续）
-- 内容验证失败（签名 invalid / unsigned）→ 仍 `ok: true`，通过 `data.agentMd.verification.status` 标记，让应用层决定
+- 内容验证失败（签名 invalid / unsigned）→ 仍 `ok: true`，通过 `data.agent_md.verification.status` 标记，让应用层决定
 
 **示例**：
 ```typescript
@@ -277,13 +287,13 @@ const store = new AIDStore({ aunPath: '...', encryptionSeed: '' });
 const result = await store.resolve('bob.aid.pub');
 
 if (result.ok) {
-  const { aid: peer, agentMd, source } = result.data;
-  console.log('证书来自:', source.certFromCache ? '本地缓存' : '网络下载');
+  const { aid: peer, agent_md, source } = result.data;
+  console.log('证书来自:', source.cert_from_cache ? '本地缓存' : '网络下载');
 
-  if (agentMd?.verification.status === 'verified') {
-    console.log('名片有效:', agentMd.content);
-  } else if (agentMd?.verification.status === 'invalid') {
-    console.log('警告：名片签名无效，原因:', agentMd.verification.reason);
+  if (agent_md?.verification.status === 'verified') {
+    console.log('名片有效:', agent_md.content);
+  } else if (agent_md?.verification.status === 'invalid') {
+    console.log('警告：名片签名无效，原因:', agent_md.verification.reason);
   } else {
     console.log('名片未签名');
   }
@@ -303,7 +313,7 @@ if (result.ok) {
 
 ---
 
-#### `fetchAgentMd(aid: string): Promise<Result<AgentMdFetchData>>`
+#### `fetchAgentMd(aid: string): Promise<Result<FetchAgentMdResult>>`
 
 下载 agent.md + 自动拉证书 + 验签。比 `resolve` 更轻量，适用于"只想拿名片"的场景。
 
@@ -315,13 +325,16 @@ if (result.ok) {
 
 **返回**：
 ```typescript
-type AgentMdFetchData = {
+type FetchAgentMdResult = {
+  aid: string;
   content: string;
   verification: {
-    status: 'verified' | 'invalid' | 'unsigned';
+    status: string;
     reason?: string;
   };
-  certPem: string;
+  cert_pem: string;
+  etag: string;
+  last_modified: string;
 };
 ```
 
@@ -329,32 +342,37 @@ type AgentMdFetchData = {
 
 ---
 
-#### `checkAgentMd(aid: string, ttlDays?: number): Promise<Result<AgentMdCheckData>>`
+#### `checkAgentMd(aid: string, ttlDays?: number): Promise<Result<CheckAgentMdResult>>`
 
 比对本地缓存与远端 etag，决定是否需要重新拉取。
 
 **返回**：
 ```typescript
-type AgentMdCheckData = {
-  needsUpdate: boolean;
-  localEtag?: string;
-  remoteEtag?: string;
-  lastModified?: string;
+type CheckAgentMdResult = {
+  aid: string;
+  local_found: boolean;
+  remote_found: boolean;
+  local_etag: string;
+  remote_etag: string;
+  needs_update: boolean;
+  ttl_days: number;
 };
 ```
 
 ---
 
-#### `headAgentMd(aid: string): Promise<Result<AgentMdHeadData>>`
+#### `headAgentMd(aid: string): Promise<Result<HeadAgentMdResult>>`
 
 HEAD 请求拿 agent.md 元数据，**判断对端是否发布了名片**。
 
 **返回**：
 ```typescript
-type AgentMdHeadData = {
+type HeadAgentMdResult = {
+  aid: string;
+  found: boolean;
   etag: string;
-  lastModified: string;
-  contentLength: number;
+  last_modified: string;
+  content_length: number;
 };
 ```
 
@@ -371,14 +389,17 @@ type AgentMdHeadData = {
 | `changeSeed(oldSeed, newSeed)` | 否 | 更换加密种子：用旧种子解密所有私钥 → 用新种子重新加密 → 落盘 |
 | `diagnose(aid)` | 是 | 本地状态 + 远端注册状态对比 |
 
-所有方法返回 `Promise<Result<T>>`：
+`renewCert` / `rekey` / `diagnose` 返回 `Promise<Result<T>>`，`changeSeed` 为同步方法返回 `Result<T>`：
 
 ```typescript
+// changeSeed 签名（同步）
+changeSeed(oldSeed: string, newSeed: string): Result<{ changed: true; count: number }>
+
 // renewCert 成功
-{ ok: true, data: { renewed: true, newCertNotAfter: Date } }
+{ ok: true, data: { renewed: true, new_cert_not_after: Date, new_fingerprint: string } }
 
 // rekey 成功
-{ ok: true, data: { rekeyed: true, newFingerprint: string } }
+{ ok: true, data: { rekeyed: true, new_cert_not_after: Date, new_fingerprint: string } }
 
 // changeSeed 成功
 { ok: true, data: { changed: true, count: number } }  // 重新加密的私钥数量
@@ -387,12 +408,40 @@ type AgentMdHeadData = {
 {
   ok: true,
   data: {
-    localValid: boolean;
-    remoteRegistered: boolean;
-    certMatch: boolean;
+    aid: string;
+    status: string;
+    local_valid: boolean;
+    remote_registered: boolean;
     suggestions: string[];
+    local: Record<string, unknown>;
+    remote: Record<string, unknown>;
   }
 }
+```
+
+**返回类型定义**：
+```typescript
+type RenewCertResult = {
+  renewed: true;
+  new_cert_not_after: Date;
+  new_fingerprint: string;
+};
+
+type RekeyResult = {
+  rekeyed: true;
+  new_cert_not_after: Date;
+  new_fingerprint: string;
+};
+
+type DiagnoseResult = {
+  aid: string;
+  status: string;
+  local_valid: boolean;
+  remote_registered: boolean;
+  suggestions: string[];
+  local: Record<string, unknown>;
+  remote: Record<string, unknown>;
+};
 ```
 
 **错误码**：
@@ -408,12 +457,12 @@ const store = new AIDStore({ aunPath, encryptionSeed: 'old-seed' });
 const renewResult = await store.renewCert('alice.aid.pub');
 if (renewResult.ok) {
   // 重新加载拿新证书
-  const me = (await store.load('alice.aid.pub')).data!.aid;
+  const me = store.load('alice.aid.pub').data!.aid;
   console.log('新证书有效期至:', me.certNotAfter);
 }
 
-// 换加密种子
-const seedResult = await store.changeSeed('old-seed', 'new-seed');
+// 换加密种子（同步）
+const seedResult = store.changeSeed('old-seed', 'new-seed');
 if (seedResult.ok) {
   console.log(`已重新加密 ${seedResult.data.count} 个私钥`);
 }
@@ -431,6 +480,11 @@ AID 是不可变的身份值对象，由 AIDStore 创建，外部不直接 `new 
 |------|------|------|
 | `aid` | string | AID 标识符（如 `'alice.aid.pub'`） |
 | `aunPath` | string | keystore 根目录（来自创建它的 store） |
+| `deviceId` | string | 来自创建它的 AIDStore 的 deviceId |
+| `slotId` | string | 来自创建它的 AIDStore 的 slotId |
+| `verifySsl` | boolean | 来自创建它的 AIDStore 的 verifySsl |
+| `rootCaPath` | string \| null | 来自创建它的 AIDStore 的 rootCaPath |
+| `debug` | boolean | 来自创建它的 AIDStore 的 debug |
 | `certPem` | string | PEM 格式证书 |
 | `publicKey` | string | DER base64 公钥 |
 | `certSubject` | string | 证书 subject |
@@ -486,7 +540,7 @@ type VerifyResult = {
 **示例**：
 ```typescript
 // 签名
-const me = (await store.load('alice.aid.pub')).data!.aid;
+const me = store.load('alice.aid.pub').data!.aid;
 const signResult = me.signAgentMd(content);
 if (signResult.ok) {
   const signed = signResult.data.signed;
@@ -520,7 +574,7 @@ type Result<T> =
 
 **TypeScript 使用模式**：
 ```typescript
-const result = await store.load('alice.aid.pub');
+const result = store.load('alice.aid.pub');
 if (!result.ok) {
   // 处理错误
   console.log(result.error.code, result.error.message);
@@ -537,10 +591,10 @@ const me = result.data.aid;
 | 场景 | 推荐方法 | 一行代码示例 |
 |------|---------|--------------|
 | 检查 AID 名字是否可注册 | `store.exists(aid)` | `(await store.exists('alice.aid.pub')).data?.exists === false` |
-| 注册新身份 | `store.register` + `store.load` | `await store.register('alice.aid.pub'); await store.load('alice.aid.pub')` |
-| 加载本地身份 | `store.load(aid)` | `(await store.load('alice.aid.pub')).data!.aid` |
-| 列出本地所有身份 | `store.list()` | `(await store.list()).data!.identities` |
-| **一站式解析对端**（推荐）| `store.resolve(aid)` | `const { aid: peer, agentMd } = (await store.resolve('bob')).data!` |
+| 注册新身份 | `store.register` + `store.load` | `await store.register('alice.aid.pub'); store.load('alice.aid.pub')` |
+| 加载本地身份 | `store.load(aid)` | `store.load('alice.aid.pub').data!.aid` |
+| 列出本地所有身份 | `store.list()` | `store.list().data!.identities` |
+| **一站式解析对端**（推荐）| `store.resolve(aid)` | `const { aid: peer, agent_md } = (await store.resolve('bob')).data!` |
 | 只想拿对端 agent.md | `store.fetchAgentMd(aid)` | `(await store.fetchAgentMd('bob.aid.pub')).data?.content` |
 | 离线签名 agent.md | `load` → `signAgentMd` | `me.signAgentMd(content).data?.signed` |
 | 离线验签 agent.md | `load`/`resolve` → `verifyAgentMd` | `peer.verifyAgentMd(signed).data?.status` |
@@ -559,8 +613,8 @@ const me = result.data.aid;
 const store = new AIDStore({ aunPath, encryptionSeed: '' });
 const result = await store.resolve('bob.aid.pub');
 
-if (result.ok && result.data.agentMd?.verification.status === 'verified') {
-  console.log('对端可信:', result.data.agentMd.content);
+if (result.ok && result.data.agent_md?.verification.status === 'verified') {
+  console.log('对端可信:', result.data.agent_md.content);
 }
 ```
 
@@ -568,7 +622,7 @@ if (result.ok && result.data.agentMd?.verification.status === 'verified') {
 
 ```typescript
 const store = new AIDStore({ aunPath, encryptionSeed: '' });
-const peer = (await store.load('bob.aid.pub')).data?.aid;
+const peer = store.load('bob.aid.pub').data?.aid;
 
 if (peer?.isCertValid()) {
   const r = peer.verifyAgentMd(content);
@@ -597,7 +651,7 @@ if (!reg.ok) {
 }
 
 // Step 3: 加载身份用于后续操作
-const load = await store.load('alice.aid.pub');
+const load = store.load('alice.aid.pub');
 const me = load.data!.aid;
 ```
 
@@ -605,13 +659,11 @@ const me = load.data!.aid;
 
 ```typescript
 const store = new AIDStore({ aunPath, encryptionSeed: '' });
-const list = await store.list();
+const list = store.list();
 if (!list.ok) return;
 
-// 并发加载多个 AID 实例
-const aids = await Promise.all(
-  list.data.identities.map(i => store.load(i.aid).then(r => r.data!.aid))
-);
+// 并发加载多个 AID 实例（load 为同步，直接 map）
+const aids = list.data.identities.map(i => store.load(i.aid).data!.aid);
 
 // 并发签名
 const signatures = aids.map(me => me.signAgentMd(content));
@@ -723,23 +775,36 @@ store.load(aid)
 class AUNClient {
   constructor(aid?: AID);
   loadIdentity(aid: AID): void;  // 加载/重载身份，aid 必须 isPrivateKeyValid()，只在 NoIdentity 或 Closed 状态可调用
+  connect(opts?: ConnectionOptions): Promise<void>;
   setProtectedHeaders(headers: Record<string, string> | null): void;  // 设置/清除实例级 protected_headers，随时可调
 }
+
+type ConnectionOptions = {
+  auto_reconnect?: boolean;        // 是否自动重连，默认 true
+  connect_timeout?: number;        // 连接超时（秒），默认 5
+  retry_initial_delay?: number;    // 最小退避间隔（秒），默认 1
+  retry_max_delay?: number;        // 最大退避间隔（秒），默认 64
+  retry_max_attempts?: number;     // 最大重试次数，0=无限，默认 0
+  heartbeat_interval?: number;     // 心跳间隔（秒），默认 30
+  call_timeout?: number;           // RPC 调用超时（秒），默认 35
+};
 ```
 
 **说明**：
 - 构造时可选传入 AID 对象
 - 传入有效本地 AID（`isPrivateKeyValid() === true`）→ 直接进入 Standby 状态
 - 传入无效 AID 或不传 → 进入 NoIdentity 状态
+- 所有配置（aunPath、verifySsl、rootCaPath、debug 等）通过 AID 对象传递，AUNClient 不单独接受配置参数，必须通过 AIDStore 创建的 AID 使用
 - `loadIdentity(aid)` 只在 NoIdentity 或 Closed 状态可调用
 - `loadIdentity` 传入的 AID 必须 `isPrivateKeyValid() === true`，否则抛 `InvalidIdentityError`
 - `deviceId` + `slotId` 由 AIDStore 管理，AUNClient 通过 AID 实例间接获取
+- `connect(opts?)` 接受可选的 `ConnectionOptions`，用于控制连接行为（超时、重连退避等）；gateway URL 和 token 来自 authenticate 缓存，不在 opts 中传入
 - `setProtectedHeaders(headers)` 随时可调，传 `null` 清除；设置后自动附加到所有 `call()`、`sendV2()`、`sendGroupV2()` 调用，无需在每次调用时传入
 
 **示例**：
 ```typescript
 const store = new AIDStore({ aunPath: '...', encryptionSeed: '...' });
-const me = (await store.load('alice.aid.pub')).data!.aid;
+const me = store.load('alice.aid.pub').data!.aid;
 const client = new AUNClient(me);
 
 // 设置实例级 protected_headers
@@ -852,7 +917,7 @@ new AUNClient()          new AUNClient(validAid)
 
 **关键说明**：
 
-- **Authenticated**：有 token，可调 `publishAgentMd()` / `uploadAgentMd()`，不需要长连接
+- **Authenticated**：有 token，可调 `publishAgentMd()`，不需要长连接
 - **Connecting**：`connect()` 在 Standby 时自动先 authenticate（内部完成），在 Authenticated 时直接建连接
 - **RetryBackoff**：`isOnline === true`，SDK 仍认为自己应该在线，只是暂时等待。可读 `nextRetryAt`
 - **ConnectionFailed**：保留身份，可调 `connect()` 重新尝试
@@ -867,10 +932,10 @@ new AUNClient()          new AUNClient(validAid)
 | **NoIdentity** | `loadIdentity(aid)` | Standby | aid 必须 `isPrivateKeyValid()` |
 | | `close()` | Closed | 幂等 |
 | **Standby** | `authenticate()` | Authenticated | 拿 token，不建长连接 |
-| | `connect({ gateway? })` | Connecting | 自动先 authenticate 再建连接 |
+| | `connect(opts?)` | Connecting | 自动先 authenticate 再建连接 |
 | | `loadIdentity(aid)` | ❌ 抛 StateError | 仅 NoIdentity / Closed 可重载 |
 | | `close()` | Closed | 清除身份 |
-| **Authenticated** | `connect({ gateway? })` | Connecting | 直接建连接（已有 token） |
+| **Authenticated** | `connect(opts?)` | Connecting | 直接建连接（已有 token） |
 | | `disconnect()` | Standby | 丢弃 token |
 | | `close()` | Closed | 清除身份 |
 | **Connecting** | 成功 | Ready | 自动推进 |
@@ -881,7 +946,7 @@ new AUNClient()          new AUNClient(validAid)
 | | 网络断开 | RetryBackoff | 自动推进，启动退避 |
 | | `close()` | Closed | 清除身份 |
 | **RetryBackoff** | 退避到期 | Reconnecting | 自动推进 |
-| | `connect()` | Reconnecting | 跳过退避，立即重连 |
+| | `connect(opts?)` | Reconnecting | 跳过退避，立即重连 |
 | | `disconnect()` | Standby | 取消重连 |
 | | `close()` | Closed | 清除身份 |
 | **Reconnecting** | 成功 | Ready | 自动推进 |
@@ -889,7 +954,7 @@ new AUNClient()          new AUNClient(validAid)
 | | 失败（重连耗尽） | ConnectionFailed | 自动推进，记录 lastError |
 | | `disconnect()` | Standby | 取消重连 |
 | | `close()` | Closed | 清除身份 |
-| **ConnectionFailed** | `connect()` | Connecting | 重新尝试 |
+| **ConnectionFailed** | `connect(opts?)` | Connecting | 重新尝试 |
 | | `disconnect()` | Standby | 放弃重试 |
 | | `close()` | Closed | 清除身份 |
 | **Closed** | `loadIdentity(aid)` | Standby | 重新激活 |
@@ -903,7 +968,7 @@ new AUNClient()          new AUNClient(validAid)
 | **状态推进** |
 | `loadIdentity(aid)` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `authenticate()` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `connect({ gateway? })` | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ |
+| `connect()` | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | `disconnect()` | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | `close()` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **状态查询** |
@@ -933,14 +998,13 @@ new AUNClient()          new AUNClient(validAid)
 | `off()` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | **agent.md 上传**（需 token） |
 | `publishAgentMd()` | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| `uploadAgentMd()` | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 
 **图例**：
 - ✅ 可调用
 - ❌ 不可调用（抛 StateError）
 
 **说明**：
-- `publishAgentMd` / `uploadAgentMd` 要求至少 Authenticated（有 token）。Standby 状态下先调 `authenticate()`
+- `publishAgentMd` 要求至少 Authenticated（有 token）。Standby 状态下先调 `authenticate()`
 - `disconnect()` 在 ConnectionFailed 状态也可调，从"放弃重试"语义回到 Standby
 - 签名/验签操作直接用 `AID` 实例（`me.signAgentMd()`、`peer.verifyAgentMd()`），不在 AUNClient 上
 
@@ -952,8 +1016,8 @@ new AUNClient()          new AUNClient(validAid)
 class AUNClient {
   // ─── 基础状态 ─────────────────────────
   get state(): ConnectionState;
-  // 'no-identity' | 'standby' | 'authenticated' | 'connecting' | 'ready'
-  // | 'retry-backoff' | 'reconnecting' | 'connection-failed' | 'closed'
+  // 'no_identity' | 'standby' | 'authenticated' | 'connecting' | 'ready'
+  // | 'retry_backoff' | 'reconnecting' | 'connection_failed' | 'closed'
   
   get currentAid(): AID | null;
   get aunPath(): string | null;
@@ -972,12 +1036,12 @@ class AUNClient {
   get gatewayHealth(): boolean | null;
   
   // ─── Capability Getters ─────────────────
-  get hasIdentity(): boolean;        // state !== 'no-identity' && state !== 'closed'
+  get hasIdentity(): boolean;        // state !== 'no_identity' && state !== 'closed'
   get canSign(): boolean;            // hasIdentity && currentAid.isPrivateKeyValid()
   get canConnect(): boolean;         // hasIdentity && state !== 'closed'
   get canSend(): boolean;            // state === 'ready'
   get isReady(): boolean;            // 同 canSend
-  get isOnline(): boolean;           // ready | retry-backoff | reconnecting
+  get isOnline(): boolean;           // ready | retry_backoff | reconnecting
   get isClosed(): boolean;           // state === 'closed'
 }
 ```
@@ -1005,9 +1069,9 @@ class AUNClient {
 │     ├─ 是 → call()
 │     └─ 否 → 看当前状态
 │        ├─ 'standby' / 'authenticated' → connect()
-│        ├─ 'retry-backoff' → connect()（跳过退避立即重连）
-│        ├─ 'connection-failed' → connect()（重新尝试）
-│        └─ 'no-identity' / 'closed' → loadIdentity() 先
+│        ├─ 'retry_backoff' → connect()（跳过退避立即重连）
+│        ├─ 'connection_failed' → connect()（重新尝试）
+│        └─ 'no_identity' / 'closed' → loadIdentity() 先
 │
 ├─ 主动断开 → disconnect()（任意连接相关状态都行）
 │
@@ -1022,7 +1086,7 @@ class AUNClient {
 
 ```typescript
 const store = new AIDStore({ aunPath: '...', encryptionSeed: '...' });
-const me = (await store.load('alice.aid.pub')).data!.aid;
+const me = store.load('alice.aid.pub').data!.aid;
 const client = new AUNClient(me);   // → Standby
 await client.connect();             // Standby → Authenticated → Connecting → Ready
 // connect() 内部自动完成 authenticate（如果还没有 token）
@@ -1032,7 +1096,7 @@ await client.connect();             // Standby → Authenticated → Connecting 
 
 ```typescript
 const store = new AIDStore({ aunPath: '...', encryptionSeed: '...' });
-const me = (await store.load('alice.aid.pub')).data!.aid;
+const me = store.load('alice.aid.pub').data!.aid;
 const client = new AUNClient(me);   // → Standby
 
 await client.authenticate();        // Standby → Authenticated
@@ -1057,15 +1121,15 @@ console.log('下次重连:', client.nextRetryInSeconds, '秒后');
 **场景 4：重连等待中应用想立即发消息**
 
 ```typescript
-// 当前 state === 'retry-backoff'
+// 当前 state === 'retry_backoff'
 // 应用想立即发消息，不想等退避
 
 if (!client.canSend) {
   await client.connect();  // 跳过退避，立即进入 Reconnecting
 }
 
-// 等待 Reconnecting → Ready，或监听 'state-change' 事件
-client.on('state-change', ({ to }) => {
+// 等待 Reconnecting → Ready，或监听 'state_change' 事件
+client.on('state_change', ({ to }) => {
   if (to === 'ready') {
     client.call('message.send', {...});
   }
@@ -1075,7 +1139,7 @@ client.on('state-change', ({ to }) => {
 **场景 5：重连耗尽后手动重试**
 
 ```typescript
-// state === 'connection-failed'
+// state === 'connection_failed'
 console.log('重连失败:', client.lastError, client.lastErrorCode);
 
 // 应用决定再试一次（身份还在）
@@ -1096,7 +1160,7 @@ await client.connect();     // Standby → Authenticated → Connecting → Read
 
 ```typescript
 await client.close();                    // → Closed（身份清除）
-const newMe = (await store.load('bob.aid.pub')).data!.aid;
+const newMe = store.load('bob.aid.pub').data!.aid;
 client.loadIdentity(newMe);              // Closed → Standby（新身份）
 await client.connect();                  // → Authenticated → Connecting → Ready
 ```
@@ -1106,7 +1170,7 @@ await client.connect();                  // → Authenticated → Connecting →
 ```typescript
 // 应用启动时，预先认证以减少后续连接延迟
 const store = new AIDStore({ aunPath: '...', encryptionSeed: '...' });
-const me = (await store.load('alice.aid.pub')).data!.aid;
+const me = store.load('alice.aid.pub').data!.aid;
 const client = new AUNClient(me);
 await client.authenticate();   // → Authenticated（提前拿好 token）
 
@@ -1134,14 +1198,14 @@ if (client.isOnline) {
 }
 
 if (!client.hasIdentity) {
-  client.loadIdentity((await store.load('alice.aid.pub')).data!.aid);
+  client.loadIdentity(store.load('alice.aid.pub').data!.aid);
 }
 ```
 
 **RetryBackoff 状态下的常见模式**：
 
 ```typescript
-if (client.state === 'retry-backoff') {
+if (client.state === 'retry_backoff') {
   console.log(`将在 ${client.nextRetryInSeconds} 秒后自动重连`);
   console.log(`已尝试 ${client.retryAttempt}/${client.retryMaxAttempts} 次`);
   
@@ -1275,6 +1339,7 @@ client.on('group.message_created', (msg) => {
 | | `rekey(aid)` | 是 | 密钥轮换并落盘 |
 | | `changeSeed(oldSeed, newSeed)` | 否 | 更换加密种子 |
 | | `diagnose(aid)` | 是 | 本地 + 远端状态对比 |
+| **资源管理** | `close()` | 否 | 释放内部 HTTP client 等资源 |
 
 ### 4.2 AID 操作表
 
@@ -1295,7 +1360,7 @@ client.on('group.message_created', (msg) => {
 | **构造** | `new AUNClient()` | 否 | — | → NoIdentity | 不传身份 |
 | | `new AUNClient(aid)` | 否 | — | → Standby | aid 必须 `isPrivateKeyValid()` |
 | **状态推进** | `loadIdentity(aid)` | 否 | NoIdentity \| Closed | → Standby | 加载/重载身份 |
-| | `connect({ gateway? })` | 是 | Standby \| Authenticated \| RetryBackoff \| ConnectionFailed | → Connecting / Reconnecting | Standby 时自动先 authenticate |
+| | `connect(opts?)` | 是 | Standby \| Authenticated \| RetryBackoff \| ConnectionFailed | → Connecting / Reconnecting | Standby 时自动先 authenticate；可选 ConnectionOptions 控制连接行为；gateway URL 和 token 来自 authenticate 缓存，不在 opts 中传入 |
 | | `authenticate()` | 是 | Standby | → Authenticated | 拿 token，不建长连接 |
 | | `disconnect()` | 是 | Authenticated \| Connecting \| Ready \| RetryBackoff \| Reconnecting \| ConnectionFailed | → Standby | 主动断开 |
 | | `close()` | 否 | * | → Closed | 清除身份 + 资源 |
@@ -1313,7 +1378,7 @@ client.on('group.message_created', (msg) => {
 | | `canConnect` (getter) | 否 | — | — | hasIdentity 且非 Closed |
 | | `canSend` (getter) | 否 | — | — | state === 'ready' |
 | | `isReady` (getter) | 否 | — | — | 同 canSend |
-| | `isOnline` (getter) | 否 | — | — | ready \| retry-backoff \| reconnecting |
+| | `isOnline` (getter) | 否 | — | — | ready \| retry_backoff \| reconnecting |
 | | `isClosed` (getter) | 否 | — | — | state === 'closed' |
 | **对端管理** | `lookupPeer(aid)` | 视缓存 | hasIdentity | — | 查缓存 → 无则解析 |
 | | `getPeer(aid)` | 否 | hasIdentity | — | 仅查缓存 |
@@ -1323,7 +1388,6 @@ client.on('group.message_created', (msg) => {
 | | `on(event, handler)` | 否 | hasIdentity | — | 事件订阅 |
 | | `off(event, handler)` | 否 | hasIdentity | — | 取消订阅 |
 | **agent.md 上传** | `publishAgentMd(content?)` | 是 | Authenticated \| Connecting \| Ready | — | 签名 + 上传 |
-| | `uploadAgentMd(content)` | 是 | Authenticated \| Connecting \| Ready | — | 直接上传已签名内容 |
 | **配置** | `setProtectedHeaders(headers)` | 否 | * | — | 设置实例级 protected_headers，传 null 清除，随时可调 |
 | | `getProtectedHeaders()` | 否 | * | — | 读取当前实例级 protected_headers |
 
@@ -1331,7 +1395,7 @@ client.on('group.message_created', (msg) => {
 
 | 事件 | 触发时机 | 数据 |
 |------|---------|------|
-| `state-change` | 状态变化 | `{ from, to }` |
+| `state_change` | 状态变化 | `{ from, to }` |
 | `message.received` | 收到 P2P 消息 | `{ from, payload, protected_headers?, context?, ... }` |
 | `group.message_created` | 收到群消息 | `{ from, group_id, payload, protected_headers?, context?, ... }` |
 | `message.recalled` | 消息被撤回 | `{ message_id, from, ... }` |
@@ -1407,7 +1471,7 @@ const store = new AIDStore({
   encryptionSeed: process.env.ENCRYPTION_SEED || ''
 });
 
-const loadResult = await store.load('alice.aid.pub');
+const loadResult = store.load('alice.aid.pub');
 if (!loadResult.ok) {
   console.log('加载失败:', loadResult.error.code);
   return;
@@ -1435,7 +1499,7 @@ const store = new AIDStore({
   encryptionSeed: process.env.ENCRYPTION_SEED || ''
 });
 
-const me = (await store.load('alice.aid.pub')).data!.aid;
+const me = store.load('alice.aid.pub').data!.aid;
 const client = new AUNClient(me);
 
 await client.connect();  // 自动完成认证 + 建立连接
@@ -1503,7 +1567,7 @@ if (verifyResult.ok && verifyResult.data.status === 'verified') {
 | `auth.fetchPeerCert({ aid })` | `AIDStore.resolve()` 内部自动完成 | ✅ |
 | `auth.signAgentMd(content, { aid })` | `aid.signAgentMd(content)` | ✅ |
 | `auth.verifyAgentMd(content, { aid, certPem })` | `aid.verifyAgentMd(content)` | ✅ |
-| `auth.uploadAgentMd(content)` | `AUNClient.uploadAgentMd(content)` | ✅ |
+| `auth.uploadAgentMd(content)` | `AUNClient._uploadAgentMd(content)`（内部私有方法） | ✅ |
 | `auth.downloadAgentMd(aid)` | `AIDStore.fetchAgentMd(aid)` | ✅ |
 | `auth.headAgentMd(aid)` | `AIDStore.headAgentMd(aid)` | ✅ |
 | `auth.checkAid({ aid })` | `AIDStore.diagnose(aid)` | ✅ |
@@ -1517,7 +1581,7 @@ if (verifyResult.ok && verifyResult.data.status === 'verified') {
 
 | 当前方法 | 新归宿 | 迁移状态 |
 |---------|--------|:--------:|
-| `client.connect(auth, opts)` | `AUNClient.connect({ gateway? })` | ✅ |
+| `client.connect(auth, opts)` | `AUNClient.connect()` | ✅ |
 | `client.disconnect()` | `AUNClient.disconnect()` | ✅ |
 | `client.close()` | `AUNClient.close()` | ✅ |
 | `client.call(method, params)` | `AUNClient.call(method, params)` | ✅ |
@@ -1628,6 +1692,6 @@ if (verifyResult.ok && verifyResult.data.status === 'verified') {
 
 ---
 
-**文档版本**：v4.0  
-**最后更新**：2026-05-28
+**文档版本**：v4.2  
+**最后更新**：2026-05-30
 

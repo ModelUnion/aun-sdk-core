@@ -16,11 +16,11 @@ func loadTestAID(t *testing.T, aid string) (*AID, string) {
 	t.Cleanup(func() { s.Close() })
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
-	loaded, err := s.Load(aid)
-	if err != nil {
-		t.Fatalf("加载测试 AID 失败: %v", err)
+	r := s.Load(aid)
+	if !r.Ok {
+		t.Fatalf("加载测试 AID 失败: %v", r.Error.Message)
 	}
-	return loaded, dir
+	return r.Data.AID, dir
 }
 
 // ── NewAUNClient / NewAUNClientEmpty ──────────────────────────
@@ -72,7 +72,7 @@ func TestNewAUNClientEmpty_NoIdentity(t *testing.T) {
 }
 
 func TestNewAUNClient_OptionsOnly(t *testing.T) {
-	c := NewAUNClient(AUNClientOptions{AUNPath: t.TempDir(), Debug: true})
+	c := NewAUNClient(nil, AUNClientOptions{AUNPath: t.TempDir(), Debug: true})
 	defer func() { _ = c.Close() }()
 
 	if c.HasIdentity() {
@@ -83,13 +83,15 @@ func TestNewAUNClient_OptionsOnly(t *testing.T) {
 	}
 }
 
-func TestNewAUNClient_RejectsStringAID(t *testing.T) {
+func TestNewAUNClient_RejectsNilAIDWithPrivKey(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Fatal("字符串 AID 构造应 panic")
+			t.Fatal("nil AID 构造应 panic")
 		}
 	}()
-	_ = NewAUNClient("alice.aid.com")
+	// newAUNClientWithAID 要求 aid 非 nil 且私钥有效
+	var aid *AID
+	_ = NewAUNClient(aid)
 }
 
 func TestNewAUNClient_OptionsRejectStringAID(t *testing.T) {
@@ -98,7 +100,7 @@ func TestNewAUNClient_OptionsRejectStringAID(t *testing.T) {
 			t.Fatal("options 中携带 aid 字符串应 panic")
 		}
 	}()
-	_ = NewAUNClient(AUNClientOptions{Raw: map[string]any{"aid": "alice.aid.com"}})
+	_ = NewAUNClient(nil, AUNClientOptions{Raw: map[string]any{"aid": "alice.aid.com"}})
 }
 
 func TestAUNClientStrictPublicAPIRemovedLegacyMethods(t *testing.T) {
@@ -168,9 +170,10 @@ func TestConnectNewAPIRequiresLoadedAID(t *testing.T) {
 	c := NewAUNClientEmpty()
 	defer func() { _ = c.Close() }()
 
-	err := c.Connect(context.Background(), &ConnectOptions{GatewayURL: "ws://127.0.0.1:1"})
+	c.SetGatewayURL("ws://127.0.0.1:1")
+	err := c.Connect(context.Background())
 	if err == nil {
-		t.Fatal("未加载 AID 时 Connect(ctx, opts) 应报错")
+		t.Fatal("未加载 AID 时 Connect(ctx) 应报错")
 	}
 	if _, ok := err.(*StateError); !ok {
 		t.Fatalf("错误类型应为 StateError, 实际: %T %v", err, err)
@@ -184,21 +187,20 @@ func TestConnectNewAPIDoesNotRequireAccessToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
-	err := c.Connect(ctx, &ConnectOptions{GatewayURL: "ws://127.0.0.1:1"})
+	c.SetGatewayURL("ws://127.0.0.1:1")
+	err := c.Connect(ctx)
 	if err == nil {
 		t.Fatal("不可达 gateway 应返回连接错误")
 	}
 	if strings.Contains(err.Error(), "access_token") {
-		t.Fatalf("新 Connect(ctx, opts) 不应要求传 access_token: %v", err)
+		t.Fatalf("新 Connect(ctx) 不应要求传 access_token: %v", err)
 	}
 }
 
 func TestConnectNewAPIRejectsUnexpectedArgument(t *testing.T) {
-	c := NewAUNClientEmpty()
-	defer func() { _ = c.Close() }()
-	if err := c.Connect(context.Background(), "alice.aid.com"); err == nil {
-		t.Fatal("Connect 不应接受字符串 AID")
-	}
+	// Connect 现在只接受 ctx，不再接受任何额外参数（编译期保证）。
+	// 该约束由方法签名 Connect(ctx context.Context) error 直接强制。
+	t.Skip("Connect 签名已收敛为仅接受 ctx，额外参数由编译期拒绝")
 }
 
 // ── ConnectionState 映射 ──────────────────────────────────────

@@ -66,7 +66,7 @@ async def test_connection_failed_state_includes_detail_after_kick():
     """连接进入 connection_failed 时 connection.state 也应带服务端 detail。"""
     client = AUNClient()
     states = []
-    client.on("connection.state", lambda data: states.append(data))
+    client.on("state_change", lambda data: states.append(data))
 
     # 1. 模拟收到 gateway.disconnect 带 detail
     await client._on_gateway_disconnect({

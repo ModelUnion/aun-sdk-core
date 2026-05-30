@@ -224,6 +224,16 @@ interface SessionOptions extends JsonObject {
   short_ttl_ms?: number;
 }
 
+export interface ConnectionOptions {
+  auto_reconnect?: boolean;
+  connect_timeout?: number;
+  retry_initial_delay?: number;
+  retry_max_delay?: number;
+  retry_max_attempts?: number;
+  heartbeat_interval?: number;
+  call_timeout?: number;
+}
+
 interface ConnectParams extends RpcParams {
   access_token?: string;
   gateway?: string;
@@ -244,17 +254,9 @@ interface ConnectParams extends RpcParams {
 }
 
 export interface AUNClientOptions extends Record<string, unknown> {
-  aun_path?: string;
-  aunPath?: string;
   root_ca_pem?: string;
   rootCaPem?: string;
   root_ca_path?: string;
-  seed_password?: string;
-  seedPassword?: string;
-  encryption_seed?: string;
-  encryptionSeed?: string;
-  discovery_port?: number;
-  discoveryPort?: number;
   verify_ssl?: boolean;
   verifySSL?: boolean;
   verifySsl?: boolean;
@@ -408,11 +410,8 @@ function agentMdHttpScheme(gatewayUrl: string): string {
   return raw.startsWith('ws://') ? 'http' : 'https';
 }
 
-function agentMdAuthority(aid: string, discoveryPort: number | null | undefined): string {
-  const host = String(aid ?? '').trim();
-  if (!host) return '';
-  if (discoveryPort && !host.includes(':')) return `${host}:${discoveryPort}`;
-  return host;
+function agentMdAuthority(aid: string): string {
+  return String(aid ?? '').trim();
 }
 
 async function fetchWithTimeout(
@@ -928,24 +927,15 @@ export class AUNClient {
   private _logDiscovery!: ModuleLogger;
   private _logEvents!: ModuleLogger;
 
-  constructor(options?: AUNClientOptions | null);
-  constructor(aid: AID, options?: AUNClientOptions | null);
-  constructor(first?: AID | AUNClientOptions | null, second?: AUNClientOptions | null) {
-    if (typeof first === 'string') {
+  constructor(aid?: AID) {
+    const inputAid = aid instanceof AID ? aid : null;
+    if (typeof aid === 'string') {
       throw new ValidationError('AUNClient aid must be an AID object, not a string');
     }
-    if (typeof second === 'boolean') {
-      throw new ValidationError('AUNClient debug must be passed as options.debug');
-    }
-    const inputAid = first instanceof AID ? first : null;
-    if (!inputAid && second !== undefined) {
-      throw new ValidationError('AUNClient options-only construction accepts a single options object');
-    }
-    const options = inputAid ? (second ?? {}) : (first ?? {});
-    assertClientOptions(options, 'AUNClient options');
+    const options: AUNClientOptions = {};
     const rawConfig: RpcParams = clientOptionsConfig(options);
     if (inputAid) rawConfig.aun_path = inputAid.aunPath;
-    const _debug = !!options?.debug;
+    const _debug = false;
     this.configModel = createConfig(rawConfig as Partial<AUNConfig>);
     const initAid = inputAid ? inputAid.aid : null;
     this.config = {
@@ -1091,7 +1081,7 @@ export class AUNClient {
         gatewayUrl = '';
       }
     }
-    const authority = agentMdAuthority(target, this.configModel.discoveryPort);
+    const authority = agentMdAuthority(target);
     return `${agentMdHttpScheme(gatewayUrl)}://${authority}/agent.md`;
   }
 
@@ -1882,7 +1872,7 @@ export class AUNClient {
       throw new StateError('authenticate requires a loaded AID with a valid private key');
     }
     const publicState = this.state;
-    if (publicState !== ConnectionState.STANDBY && publicState !== ConnectionState.AUTHENTICATED) {
+    if (publicState !== ConnectionState.STANDBY) {
       throw new StateError(`authenticate not allowed in state ${publicState}`);
     }
     if ('aid' in options || 'access_token' in options || 'token' in options || 'kite_token' in options) {
@@ -1905,15 +1895,25 @@ export class AUNClient {
   }
 
   /** 连接到 Gateway；身份来自构造函数或 loadIdentity(aid)，认证由 SDK 内部自动完成。 */
-  async connect(options: RpcParams = {}): Promise<void> {
+  async connect(opts?: ConnectionOptions): Promise<void> {
     const tStart = Date.now();
+    const options: RpcParams = {};
+    if (opts?.auto_reconnect !== undefined) options.auto_reconnect = opts.auto_reconnect;
+    if (opts?.heartbeat_interval !== undefined) options.heartbeat_interval = opts.heartbeat_interval;
+    if (opts?.connect_timeout !== undefined || opts?.call_timeout !== undefined) {
+      options.timeouts = {
+        ...(opts.connect_timeout !== undefined ? { connect: opts.connect_timeout } : {}),
+        ...(opts.call_timeout !== undefined ? { call: opts.call_timeout } : {}),
+      };
+    }
+    if (opts?.retry_initial_delay !== undefined || opts?.retry_max_delay !== undefined || opts?.retry_max_attempts !== undefined) {
+      options.retry = {
+        initial_delay: opts.retry_initial_delay ?? 1,
+        max_delay: opts.retry_max_delay ?? 64,
+        max_attempts: opts.retry_max_attempts ?? 0,
+      };
+    }
     this._clientLog.debug(`connect enter: state=${this._state} aid=${this._aid ?? '-'}`);
-    if (arguments.length > 1) {
-      throw new ValidationError('connect accepts a single options object');
-    }
-    if ('aid' in options || 'access_token' in options || 'token' in options || 'kite_token' in options) {
-      throw new ValidationError('connect options must not include aid or token fields; load an AID object first');
-    }
     const target = this._currentAid?.aid ?? this._aid ?? '';
     if (!target || !this._currentAid?.isPrivateKeyValid()) {
       throw new StateError('connect requires a loaded AID with a valid private key');
@@ -1929,9 +1929,13 @@ export class AUNClient {
       this._clientLog.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=invalid_state state=${this._state}`);
       throw new StateError(`connect not allowed in state ${publicState}`);
     }
+    // gateway 来自 authenticate() 缓存的 this._gatewayUrl；未认证则自动 authenticate()
+    if (!this._gatewayUrl) {
+      await this.authenticate();
+    }
     this._state = 'connecting';
 
-    const gateway = String(options.gateway ?? this._gatewayUrl ?? await this._resolveGatewayForAid(target)).trim();
+    const gateway = String(this._gatewayUrl ?? '').trim();
     const params = { ...options, gateway };
     const normalized = this._normalizeConnectParams(params);
     this._sessionParams = normalized;
@@ -1984,7 +1988,7 @@ export class AUNClient {
 
     await this._transport.close();
     this._state = 'disconnected';
-    await this._dispatcher.publish('connection.state', { state: this._publicState(this._state) });
+    await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
     this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms`);
   }
 
@@ -2019,7 +2023,7 @@ export class AUNClient {
 
     await this._transport.close();
     this._state = 'closed';
-    await this._dispatcher.publish('connection.state', { state: this._publicState(this._state) });
+    await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
     this._resetSeqTrackingState();
     this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
   }
@@ -3961,7 +3965,7 @@ export class AUNClient {
 
       this._state = 'connected';
       this._connectedAt = Date.now();
-      await this._dispatcher.publish('connection.state', {
+      await this._dispatcher.publish('state_change', {
         state: this._publicState(this._state),
         gateway: gatewayUrl,
       });
@@ -4017,7 +4021,7 @@ export class AUNClient {
 
     const dotIdx = target.indexOf('.');
     const issuerDomain = dotIdx >= 0 ? target.slice(dotIdx + 1) : target;
-    const portSuffix = this.configModel.discoveryPort ? `:${this.configModel.discoveryPort}` : '';
+    const portSuffix = '';
     const candidates = [
       `https://${target}${portSuffix}/.well-known/aun-gateway`,
       `https://gateway.${issuerDomain}${portSuffix}/.well-known/aun-gateway`,
@@ -4471,7 +4475,7 @@ export class AUNClient {
     this._state = 'disconnected';
     // 先停止后台任务，避免心跳/token刷新在重连期间继续触发
     this._stopBackgroundTasks();
-    await this._dispatcher.publish('connection.state', {
+    await this._dispatcher.publish('state_change', {
       state: this._publicState(this._state),
       error,
     });
@@ -4496,7 +4500,7 @@ export class AUNClient {
       if ((disconnectInfo as any).code !== undefined && (disconnectInfo as any).code !== null) {
         eventPayload.code = (disconnectInfo as any).code;
       }
-      await this._dispatcher.publish('connection.state', eventPayload);
+      await this._dispatcher.publish('state_change', eventPayload);
       return;
     }
 
@@ -4535,7 +4539,7 @@ export class AUNClient {
         this._nextRetryAt = null;
         this._reconnectActive = false;
         this._reconnectAbort = null;
-        await this._dispatcher.publish('connection.state', {
+        await this._dispatcher.publish('state_change', {
           state: this._publicState(this._state),
           attempt: attempt - 1,
           reason: 'max_attempts_exhausted',
@@ -4548,7 +4552,7 @@ export class AUNClient {
       const sleepMs = reconnectSleepDelaySeconds(delay, maxBaseDelay) * 1000;
       this._nextRetryAt = new Date(Date.now() + sleepMs);
       this._state = 'retry_backoff';
-      await this._dispatcher.publish('connection.state', {
+      await this._dispatcher.publish('state_change', {
         state: this._publicState(this._state),
         attempt,
         next_retry_at: this._nextRetryAt.getTime() / 1000,
@@ -4564,7 +4568,7 @@ export class AUNClient {
 
         // 退避结束，进入 reconnecting 状态
         this._state = 'reconnecting';
-        await this._dispatcher.publish('connection.state', {
+        await this._dispatcher.publish('state_change', {
           state: this._publicState(this._state),
           attempt,
         });
@@ -4602,7 +4606,7 @@ export class AUNClient {
           this._nextRetryAt = null;
           this._reconnectActive = false;
           this._reconnectAbort = null;
-          await this._dispatcher.publish('connection.state', {
+          await this._dispatcher.publish('state_change', {
             state: this._publicState(this._state),
             error: formatCaughtError(exc),
             attempt,

@@ -116,7 +116,6 @@ async def test_store_renew_cert_signs_server_nonce_and_persists_new_cert(monkeyp
 
     assert result.ok
     assert result.data["renewed"] is True
-    assert result.data["cert_sn"] == "02"
     assert calls[0][0] == "auth.aid_login1"
     assert calls[1][0] == "auth.renew_cert"
     loaded = store.load(aid)
@@ -314,8 +313,6 @@ async def test_store_fetch_agent_md_downloads_and_verifies_signature(monkeypatch
     assert result.data["content"] == signed
     assert result.data["verification"]["status"] == "verified"
     assert result.data["cert_pem"] == identity["cert"]
-    assert result.data["certPem"] == identity["cert"]
-    assert result.data["signature"]["status"] == "verified"
     assert result.data["etag"] == '"alice-v1"'
 
     store.close()
@@ -340,7 +337,6 @@ async def test_store_fetch_agent_md_unsigned_is_ok_with_verification_status(monk
     assert result.ok, result.error
     assert result.data["content"] == unsigned
     assert result.data["verification"]["status"] == "unsigned"
-    assert result.data["signature"]["status"] == "unsigned"
     assert result.data["cert_pem"] == identity["cert"]
 
     store.close()
@@ -368,7 +364,7 @@ async def test_store_fetch_agent_md_invalid_is_ok_with_verification_status(monke
     assert result.data["content"] == tampered
     assert result.data["verification"]["status"] == "invalid"
     assert result.data["verification"]["reason"]
-    assert result.data["certPem"] == identity["cert"]
+    assert result.data["cert_pem"] == identity["cert"]
 
     store.close()
 
@@ -416,11 +412,7 @@ async def test_store_diagnose_combines_local_and_remote(monkeypatch, tmp_path: P
     assert result.ok
     assert result.data["aid"] == aid
     assert result.data["local_valid"] is False
-    assert result.data["localValid"] is False
     assert result.data["remote_registered"] is False
-    assert result.data["remoteRegistered"] is False
-    assert result.data["cert_match"] is False
-    assert result.data["certMatch"] is False
     assert result.data["suggestions"]
     assert result.data["status"] == "available"
 

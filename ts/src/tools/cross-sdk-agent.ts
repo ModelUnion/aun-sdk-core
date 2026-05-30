@@ -119,11 +119,7 @@ class CrossSdkTsAgent {
   sendResults = new Map<string, JsonObject>();
 
   constructor() {
-    this.client = new AUNClient({
-      aun_path: this.aunPath,
-      requireForwardSecrecy: false,
-      debug: this.debug,
-    });
+    this.client = new AUNClient();
     const internal = this.client as unknown as ClientInternals;
     if (internal._configModel) internal._configModel.requireForwardSecrecy = false;
     internal._testSlotId = this.slotId;
@@ -183,13 +179,9 @@ class CrossSdkTsAgent {
       throw new Error(`load identity failed: ${loaded.error.code}: ${loaded.error.message}`);
     }
     this.client.loadIdentity(loaded.data.aid);
-    const params: RpcParams = {
-      ...(this.gatewayUrl ? { gateway: this.gatewayUrl } : {}),
-      slot_id: this.slotId,
-      auto_reconnect: envBool('AUN_TEST_AUTO_RECONNECT', false),
-      background_sync: true,
-    };
-    await this.client.connect(params);
+    const internal2 = this.client as unknown as ClientInternals;
+    if (this.gatewayUrl) internal2._gatewayUrl = this.gatewayUrl;
+    await this.client.connect();
   }
 
   identity(): JsonObject {

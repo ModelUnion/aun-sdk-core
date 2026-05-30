@@ -45,7 +45,7 @@ from .group_id import normalize_group_id as _normalize_group_id
 from .keystore.file import FileKeyStore
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
-from .types import ConnectionState
+from .types import ConnectionOptions, ConnectionState
 from .v2.session import V2Session
 from .v2.e2ee.encrypt_p2p import encrypt_p2p_message
 from .v2.e2ee.decrypt import decrypt_message as v2_decrypt_message
@@ -403,15 +403,13 @@ class AUNClient:
     def __init__(
         self,
         aid: AID | None = None,
-        debug: bool = False,
-        *,
-        protected_headers: dict[str, Any] | None = None,
     ) -> None:
         if aid is not None and not isinstance(aid, AID):
             raise TypeError("AUNClient expects an AID instance or None")
         initial_aid_obj = aid if aid is not None and aid.is_private_key_valid() else None
         if aid is not None and initial_aid_obj is None:
             raise StateError("AUNClient received an AID without a valid private key; load a complete identity first")
+        debug = initial_aid_obj.debug if initial_aid_obj is not None else False
         raw_config = {"aun_path": initial_aid_obj.aun_path} if initial_aid_obj else {}
         self._config_model = AUNConfig.from_dict(raw_config)
         init_aid = initial_aid_obj.aid if initial_aid_obj else (str(raw_config.get("aid") or "").strip() or None)
@@ -443,7 +441,6 @@ class AUNClient:
         self._last_error: BaseException | None = None
         self._last_error_code: str | None = None
         self._instance_protected_headers: dict[str, Any] | None = None
-        self.set_protected_headers(protected_headers)
         self._gateway_url: str | None = None
         self._peer_gateway_cache: dict[str, str] = {}
         self._closing = False
@@ -892,7 +889,6 @@ class AUNClient:
             device_id=self._device_id,
             slot_id=self._slot_id or "default",
             verify_ssl=self._config_model.verify_ssl,
-            discovery_port=self._config_model.discovery_port,
             root_ca_path=self._config_model.root_ca_path,
             logger=self._log,
         )
@@ -1598,7 +1594,7 @@ class AUNClient:
             self._log.debug("client", "authenticate exit (error): elapsed=%.3fs aid=%s err=%s", time.time() - _t_start, self._aid, exc)
             raise
 
-    async def connect(self, options: dict[str, Any] | None = None) -> None:
+    async def connect(self, opts: ConnectionOptions | None = None) -> None:
         _t_start = time.time()
         if self._public_state not in {
             ConnectionState.NO_IDENTITY,
@@ -1608,28 +1604,47 @@ class AUNClient:
             ConnectionState.CONNECTION_FAILED,
         }:
             raise StateError(f"connect not allowed in state {self._public_state.value}")
-        params = dict(options or {})
-        if "gateway" in params or "gateways" in params:
+        if opts and "gateway" in opts:
             raise ValidationError("gateway must be resolved by discovery and cannot be supplied externally")
-        if self._public_state == ConnectionState.NO_IDENTITY and not params.get("access_token"):
-            raise StateError("connect requires a loaded identity or an explicit access_token")
+        params: dict[str, Any] = {}
+        if opts:
+            if "auto_reconnect" in opts:
+                params["auto_reconnect"] = opts["auto_reconnect"]
+            if "connect_timeout" in opts:
+                params.setdefault("timeouts", {})["connect"] = opts["connect_timeout"]
+            if any(k in opts for k in ("retry_initial_delay", "retry_max_delay", "retry_max_attempts")):
+                params["retry"] = {
+                    "initial_delay": opts.get("retry_initial_delay", 1),
+                    "max_delay": opts.get("retry_max_delay", 64),
+                    "max_attempts": opts.get("retry_max_attempts", 0),
+                }
+            if "heartbeat_interval" in opts:
+                params["heartbeat_interval"] = opts["heartbeat_interval"]
+            if "call_timeout" in opts:
+                params.setdefault("timeouts", {})["call"] = opts["call_timeout"]
+        # slot_id 来自 AID，不从 opts 传入
+        slot_id = getattr(self._current_aid, "slot_id", None) or self._slot_id or ""
+        if slot_id:
+            params["slot_id"] = slot_id
+        if self._public_state == ConnectionState.NO_IDENTITY:
+            raise StateError("connect requires a loaded identity")
 
-        if self._public_state == ConnectionState.STANDBY and not params.get("access_token"):
-            auth_result = await self.authenticate(params)
+        if self._public_state == ConnectionState.STANDBY:
+            auth_result = await self.authenticate()
             params["access_token"] = auth_result.get("access_token")
-            params["gateway"] = auth_result.get("gateway") or self._gateway_url or params.get("gateway")
+            params["gateway"] = auth_result.get("gateway") or self._gateway_url
         elif self._public_state in {
             ConnectionState.AUTHENTICATED,
             ConnectionState.RETRY_BACKOFF,
             ConnectionState.CONNECTION_FAILED,
-        } and not params.get("access_token"):
+        }:
             identity = self._identity if isinstance(self._identity, dict) else {}
             token = identity.get("access_token")
             if not token and self._session_params:
                 token = self._session_params.get("access_token")
             if token:
                 params["access_token"] = token
-            if not params.get("gateway") and self._gateway_url:
+            if self._gateway_url:
                 params["gateway"] = self._gateway_url
 
         if self._public_state == ConnectionState.RETRY_BACKOFF and self._reconnect_task is not None:
@@ -1718,7 +1733,7 @@ class AUNClient:
         self._last_error = None
         self._last_error_code = None
         self._state = ConnectionState.STANDBY.value if self._current_aid is not None or self._aid else ConnectionState.NO_IDENTITY.value
-        await self._dispatcher.publish("connection.state", {"state": self._state})
+        await self._dispatcher.publish("state_change", {"state": self._state})
         self._log.debug("client", "disconnect exit: elapsed=%.3fs state=%s", time.time() - _t_start, self._state)
 
     async def close(self) -> None:
@@ -1763,7 +1778,7 @@ class AUNClient:
             self._retry_attempt = 0
             self._last_error = None
             self._last_error_code = None
-            await self._dispatcher.publish("connection.state", {"state": self._state})
+            await self._dispatcher.publish("state_change", {"state": self._state})
             self._reset_seq_tracking_state()
             self._log.debug("client", "close exit: elapsed=%.3fs state=%s", time.time() - _t_start, self._state)
         finally:
@@ -4461,7 +4476,7 @@ class AUNClient:
             self._last_error_code = None
             self._next_retry_at = None
             self._log.debug("client", "auth complete, state changed to ready: gateway=%s aid=%s", gateway_url, self._aid or "-")
-            await self._dispatcher.publish("connection.state", {"state": self._state, "gateway": gateway_url})
+            await self._dispatcher.publish("state_change", {"state": self._state, "gateway": gateway_url})
 
             # auth 阶段 aid 可能被 identity 覆盖（上方 self._aid = identity.get(...)）；
             # 若 context 发生变化，重新 refresh + restore，保持 tracker 与真实身份一致
@@ -5145,7 +5160,7 @@ class AUNClient:
             self._retry_attempt = 0
             self._last_error = error
             self._last_error_code = "transport_disconnected" if error else None
-            await self._dispatcher.publish("connection.state", {"state": self._state, "error": error})
+            await self._dispatcher.publish("state_change", {"state": self._state, "error": error})
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
@@ -5166,7 +5181,7 @@ class AUNClient:
                 event_payload["detail"] = disconnect_info["detail"]
             if disconnect_info.get("code") is not None:
                 event_payload["code"] = disconnect_info["code"]
-            await self._dispatcher.publish("connection.state", event_payload)
+            await self._dispatcher.publish("state_change", event_payload)
             return
         await self._stop_background_tasks()
         # 1006 = 网络异常断开（无 close frame），1000 = 正常关闭（客户端主动）
@@ -5201,7 +5216,7 @@ class AUNClient:
             sleep_delay = _reconnect_sleep_delay(delay, max_base_delay)
             self._next_retry_at = time.time() + sleep_delay
             self._state = ConnectionState.RETRY_BACKOFF.value
-            await self._dispatcher.publish("connection.state", {
+            await self._dispatcher.publish("state_change", {
                 "state": self._state,
                 "attempt": attempt,
                 "next_retry_at": self._next_retry_at,
@@ -5215,7 +5230,7 @@ class AUNClient:
                     return
                 self._next_retry_at = None
                 self._state = ConnectionState.RECONNECTING.value
-                await self._dispatcher.publish("connection.state", {
+                await self._dispatcher.publish("state_change", {
                     "state": self._state,
                     "attempt": attempt,
                 })
@@ -5236,7 +5251,7 @@ class AUNClient:
                         if max_attempts > 0 and attempt >= max_attempts:
                             self._state = ConnectionState.CONNECTION_FAILED.value
                             self._reconnect_task = None
-                            await self._dispatcher.publish("connection.state", {
+                            await self._dispatcher.publish("state_change", {
                                 "state": self._state,
                                 "attempt": attempt,
                                 "reason": "max_attempts_exhausted",
@@ -5278,7 +5293,7 @@ class AUNClient:
                     self._state = ConnectionState.CONNECTION_FAILED.value
                     self._next_retry_at = None
                     self._reconnect_task = None
-                    await self._dispatcher.publish("connection.state", {
+                    await self._dispatcher.publish("state_change", {
                         "state": self._state,
                         "error": exc,
                         "attempt": attempt,

@@ -19,7 +19,6 @@ def _make_store(tmp_path: Path, *, discovery_port: int | None = None) -> AIDStor
         tmp_path,
         encryption_seed="",
         verify_ssl=False,
-        discovery_port=discovery_port,
     )
 
 
@@ -152,7 +151,7 @@ async def test_meta_update_issuer_root_cert_verifies_against_trust_list(tmp_path
 
 
 def test_meta_issuer_pki_urls_use_trust_root_and_root_crt(tmp_path: Path):
-    store = _make_store(tmp_path, discovery_port=9443)
+    store = _make_store(tmp_path)
 
-    assert store._issuer_trust_root_url("issuer.example") == "https://pki.issuer.example:9443/trust-root.json"
-    assert store._issuer_root_cert_url("issuer.example") == "https://pki.issuer.example:9443/root.crt"
+    assert store._issuer_trust_root_url("issuer.example") == "https://pki.issuer.example/trust-root.json"
+    assert store._issuer_root_cert_url("issuer.example") == "https://pki.issuer.example/root.crt"

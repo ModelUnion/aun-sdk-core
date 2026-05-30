@@ -132,11 +132,7 @@ def test_aid_store_diagnose_reports_local_ready(tmp_path, monkeypatch):
     assert result.data is not None
     assert result.data["status"] == "ready"
     assert result.data["local_valid"] is True
-    assert result.data["localValid"] is True
     assert result.data["remote_registered"] is True
-    assert result.data["remoteRegistered"] is True
-    assert result.data["cert_match"] is True
-    assert result.data["certMatch"] is True
     assert result.data["suggestions"] == []
     store.close()
 
@@ -156,7 +152,6 @@ def test_aid_store_diagnose_available_when_remote_missing(tmp_path, monkeypatch)
     assert result.data["status"] == "available"
     assert result.data["local_valid"] is False
     assert result.data["remote_registered"] is False
-    assert result.data["cert_match"] is False
     assert result.data["suggestions"]
     store.close()
 
@@ -176,7 +171,6 @@ def test_aid_store_diagnose_registered_when_remote_exists(tmp_path, monkeypatch)
     assert result.data["status"] == "registered_remote"
     assert result.data["local_valid"] is False
     assert result.data["remote_registered"] is True
-    assert result.data["cert_match"] is False
     assert result.data["suggestions"]
     store.close()
 
@@ -349,7 +343,6 @@ def test_head_agent_md_returns_etag_without_body(monkeypatch, tmp_path):
     assert result.data["found"] is True
     assert result.data["etag"] == '"abc123"'
     assert result.data["last_modified"] == "Sun, 24 May 2026 00:00:00 GMT"
-    assert result.data["status"] == 200
     assert session.calls[0].get("Accept") is None
     store.close()
 

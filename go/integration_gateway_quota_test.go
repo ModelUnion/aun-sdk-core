@@ -59,9 +59,9 @@ func quotaConnectLong(t *testing.T, client *AUNClient, aid, slotID string, timeo
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	integrationLoadAIDIntoClient(t, client, aid)
-	return client.Connect(ctx, &ConnectOptions{
-		AutoReconnect:     false,
-		HeartbeatInterval: 30,
+	return client.Connect(ctx, ConnectionOptions{
+		AutoReconnect:     boolPtr(false),
+		HeartbeatInterval: 30 * time.Second,
 		ConnectionKind:    "long",
 		SlotID:            slotID,
 	})
@@ -73,7 +73,7 @@ func quotaConnectShort(t *testing.T, client *AUNClient, aid, slotID string, shor
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	integrationLoadAIDIntoClient(t, client, aid)
-	return client.Connect(ctx, &ConnectOptions{
+	return client.Connect(ctx, ConnectionOptions{
 		ConnectionKind: "short",
 		ShortTtlMs:     shortTtlMs,
 		SlotID:         slotID,

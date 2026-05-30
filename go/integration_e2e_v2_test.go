@@ -43,7 +43,7 @@ func v2EnsureConnected(t *testing.T, client *AUNClient, aid string) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
 		integrationLoadAIDIntoClient(t, client, aid)
-		if err := client.Connect(ctx, &ConnectOptions{AutoReconnect: false}); err != nil {
+		if err := client.Connect(ctx, ConnectionOptions{AutoReconnect: boolPtr(false)}); err != nil {
 			cancel()
 			lastErr = err
 			continue

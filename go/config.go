@@ -92,7 +92,6 @@ type AUNConfig struct {
 	AUNPath                  string // AUN 数据根目录，默认 ~/.aun
 	RootCAPath               string // 自定义根证书路径
 	SeedPassword             string // 私钥加密口令（用于本地密钥派生）
-	DiscoveryPort            int    // Gateway 发现端口
 	GroupE2EE                bool   // 启用群组 E2EE，默认 true
 	EpochAutoRotateInterval  int    // epoch 自动轮换间隔（秒），0 表示不自动轮换
 	OldEpochRetentionSeconds int    // 旧 epoch 保留时间（秒），默认 604800（7 天）
@@ -148,7 +147,7 @@ func ConfigFromMap(raw map[string]any) *AUNConfig {
 		cfg.SeedPassword = v
 	}
 	if v, ok := numberFromMap(raw, "discovery_port", "discoveryPort"); ok {
-		cfg.DiscoveryPort = int(v)
+		_ = v // discovery_port 已移除，忽略
 	}
 	// GroupE2EE 是必备能力，不再从用户配置中读取
 	if v, ok := numberFromMap(raw, "epoch_auto_rotate_interval", "epochAutoRotateInterval"); ok {

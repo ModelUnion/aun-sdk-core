@@ -33,10 +33,30 @@ export interface AIDInfo {
 export interface ResolveOpts {
   forceRefresh?: boolean;
   skipAgentMd?: boolean;
+  timeout?: number;
 }
 
+export type ResolveResult = {
+  aid: AID;
+  agent_md?: { content: string; verification: { status: string; reason?: string }; cert_pem: string };
+  source: { cert_from_cache: boolean; agent_md_fetched: boolean };
+};
+export type FetchAgentMdResult = {
+  aid: string; content: string;
+  verification: { status: string; reason?: string };
+  cert_pem: string; etag: string; last_modified: string;
+};
+export type HeadAgentMdResult = { aid: string; found: boolean; etag: string; last_modified: string; content_length: number };
+export type CheckAgentMdResult = { aid: string; local_found: boolean; remote_found: boolean; local_etag: string; remote_etag: string; needs_update: boolean; ttl_days: number };
+export type DiagnoseResult = { aid: string; status: string; local_valid: boolean; remote_registered: boolean; suggestions: string[]; local: Record<string, unknown>; remote: Record<string, unknown> };
+export type RenewCertResult = { renewed: true; new_cert_not_after: Date; new_fingerprint: string };
+export type RekeyResult = { rekeyed: true; new_cert_not_after: Date; new_fingerprint: string };
+export type ChangeSeedResult = { changed: boolean; count: number };
+export type ListResult = { identities: AIDInfo[] };
+
 function resultError<T>(r: Result<T>): { code: string; message: string } | null {
-  return r.ok ? null : r.error;
+  if (r.ok) return null;
+  return (r as { ok: false; error: { code: string; message: string } }).error;
 }
 
 function normalizeSlotId(slotId?: string): string {
@@ -97,11 +117,10 @@ function pkiCertUrl(gatewayUrl: string, aid: string): string {
   return `${scheme}//${parsed.host}/pki/cert/${encodeURIComponent(aid)}`;
 }
 
-function agentMdUrl(aid: string, gatewayUrl: string, discoveryPort?: number | null): string {
+function agentMdUrl(aid: string, gatewayUrl: string): string {
   const raw = String(gatewayUrl ?? '').trim().toLowerCase();
   const scheme = raw.startsWith('ws://') ? 'http' : 'https';
-  let host = String(aid ?? '').trim();
-  if (discoveryPort && !host.includes(':')) host = `${host}:${discoveryPort}`;
+  const host = String(aid ?? '').trim();
   return `${scheme}://${host}/agent.md`;
 }
 
@@ -117,7 +136,8 @@ export class AIDStore {
   private _net: DnsResilientNet;
   private _log: AUNLogger;
   private _verifySsl: boolean;
-  private _discoveryPort: number | null;
+  private _rootCaPath: string | null;
+  private _debug: boolean;
   private _gatewayCache: Map<string, string> = new Map();
   private _agentMdCache: Map<string, Record<string, unknown>> = new Map();
 
@@ -127,7 +147,6 @@ export class AIDStore {
     deviceId?: string;
     slotId?: string;
     verifySsl?: boolean;
-    discoveryPort?: number | null;
     rootCaPath?: string | null;
     debug?: boolean;
   }) {
@@ -136,9 +155,10 @@ export class AIDStore {
     this.deviceId = opts.deviceId ? normalizeInstanceId(opts.deviceId, 'deviceId', { allowEmpty: true }) : getDeviceId(this.aunPath);
     this.slotId = normalizeSlotId(opts.slotId);
     this._verifySsl = opts.verifySsl ?? false;
-    this._discoveryPort = opts.discoveryPort ?? null;
+    this._rootCaPath = opts.rootCaPath ?? null;
+    this._debug = opts.debug ?? false;
 
-    this._log = new AUNLogger({ debug: opts.debug ?? false, aunPath: this.aunPath });
+    this._log = new AUNLogger({ debug: this._debug, aunPath: this.aunPath });
     this._log.bindDeviceId(this.deviceId);
 
     this._keystore = new FileKeyStore(this.aunPath, {
@@ -194,7 +214,7 @@ export class AIDStore {
     const kp = this._keystore.loadKeyPair(target);
     if (!kp || !kp.private_key_pem) {
       return resultOk({
-        aid: AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false, deviceId: this.deviceId, slotId: this.slotId }),
+        aid: AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false, deviceId: this.deviceId, slotId: this.slotId, verifySsl: this._verifySsl, rootCaPath: this._rootCaPath, debug: this._debug }),
       });
     }
 
@@ -226,11 +246,11 @@ export class AIDStore {
     }
 
     return resultOk({
-      aid: AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: privPem, certValid: true, privateKeyValid: true, deviceId: this.deviceId, slotId: this.slotId }),
+      aid: AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: privPem, certValid: true, privateKeyValid: true, deviceId: this.deviceId, slotId: this.slotId, verifySsl: this._verifySsl, rootCaPath: this._rootCaPath, debug: this._debug }),
     });
   }
 
-  list(): Result<{ identities: AIDInfo[] }> {
+  list(): Result<ListResult> {
     try {
       const aids = this._keystore.listIdentities?.() ?? [];
       const identities: AIDInfo[] = [];
@@ -252,7 +272,7 @@ export class AIDStore {
     }
   }
 
-  changeSeed(oldSeed: string, newSeed: string): Result<{ changed: boolean; count: number }> {
+  changeSeed(oldSeed: string, newSeed: string): Result<ChangeSeedResult> {
     if (!oldSeed.trim()) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'changeSeed requires a non-empty oldSeed');
     if (!newSeed.trim()) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'changeSeed requires a non-empty newSeed');
     if (oldSeed === newSeed) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'newSeed must differ from oldSeed');
@@ -303,7 +323,7 @@ export class AIDStore {
     }
   }
 
-  async resolve(aid: string, opts?: ResolveOpts): Promise<Result<Record<string, unknown>>> {
+  async resolve(aid: string, opts?: ResolveOpts): Promise<Result<ResolveResult>> {
     const target = String(aid ?? '').trim();
     const forceRefresh = !!(opts?.forceRefresh);
     const skipAgentMd = !!(opts?.skipAgentMd);
@@ -325,7 +345,7 @@ export class AIDStore {
       }
       const source = { cert_from_cache: certFromCache, agent_md_fetched: false };
       if (skipAgentMd) return resultOk({ aid: peer, source });
-      const agentMd = await this.fetchAgentMd(target);
+      const agentMd = await this.fetchAgentMd(target, opts?.timeout ?? 10000);
       if (!agentMd.ok) return agentMd as Result<never>;
       source.agent_md_fetched = true;
       return resultOk({ aid: peer, agent_md: agentMd.data, source });
@@ -334,17 +354,17 @@ export class AIDStore {
     }
   }
 
-  async fetchAgentMd(aid: string): Promise<Result<Record<string, unknown>>> {
+  async fetchAgentMd(aid: string, timeoutMs = 30000): Promise<Result<FetchAgentMdResult>> {
     const target = String(aid ?? '').trim();
     try {
       const gatewayUrl = await this._resolveGateway(target);
-      const url = agentMdUrl(target, gatewayUrl, this._discoveryPort);
+      const url = agentMdUrl(target, gatewayUrl);
       const cached = (this._agentMdCache.get(target) ?? {}) as Record<string, string>;
       const reqHeaders: Record<string, string> = { Accept: 'text/markdown' };
       if (cached.etag) reqHeaders['If-None-Match'] = cached.etag;
       if (cached.last_modified) reqHeaders['If-Modified-Since'] = cached.last_modified;
 
-      let [content, respHeaders, status] = await httpGetText(url, this._verifySsl, reqHeaders, 30000);
+      let [content, respHeaders, status] = await httpGetText(url, this._verifySsl, reqHeaders, timeoutMs);
       if (status === 304 && cached.content) {
         content = String(cached.content);
       } else if (status === 404) {
@@ -368,24 +388,24 @@ export class AIDStore {
       if (!verified.ok || !verified.data) return verified as Result<never>;
       const sig = verified.data;
       const statusText = sig.status ?? 'invalid';
-      const verification: Record<string, string> = { status: statusText };
+      const verification: { status: string; reason?: string } = { status: statusText };
       if (sig.reason) verification.reason = sig.reason;
 
       const etag = String(respHeaders['etag'] ?? respHeaders['ETag'] ?? '').trim();
       const lastModified = String(respHeaders['last-modified'] ?? respHeaders['Last-Modified'] ?? '').trim();
       this._agentMdCache.set(target, { content, etag, last_modified: lastModified, updated_at: String(Date.now()) });
 
-      return resultOk({ aid: target, content, verification, signature: sig, cert_pem: peer.certPem, certPem: peer.certPem, etag, last_modified: lastModified, status });
+      return resultOk({ aid: target, content, verification, cert_pem: peer.certPem, etag, last_modified: lastModified });
     } catch (exc) {
       return resultErr(codes.NETWORK_ERROR, String(exc), exc);
     }
   }
 
-  async headAgentMd(aid: string): Promise<Result<Record<string, unknown>>> {
+  async headAgentMd(aid: string): Promise<Result<HeadAgentMdResult>> {
     const target = String(aid ?? '').trim();
     try {
       const gatewayUrl = await this._resolveGateway(target);
-      const url = agentMdUrl(target, gatewayUrl, this._discoveryPort);
+      const url = agentMdUrl(target, gatewayUrl);
       const [status, headers] = await httpHead(url, this._verifySsl, 15000);
       if (status === 404) return resultErr(codes.AGENTMD_NOT_FOUND, `agent.md not found for aid: ${target}`);
       if (status < 200 || status >= 300) return resultErr(codes.NETWORK_ERROR, `head agent.md failed: HTTP ${status}`);
@@ -394,13 +414,13 @@ export class AIDStore {
       const contentLength = parseInt(String(headers['content-length'] ?? '0'), 10) || 0;
       const cached = (this._agentMdCache.get(target) ?? {}) as Record<string, unknown>;
       this._agentMdCache.set(target, { ...cached, etag, last_modified: lastModified, remote_checked_at: Date.now() });
-      return resultOk({ aid: target, found: true, etag, last_modified: lastModified, content_length: contentLength, status });
+      return resultOk({ aid: target, found: true, etag, last_modified: lastModified, content_length: contentLength });
     } catch (exc) {
       return resultErr(codes.NETWORK_ERROR, String(exc), exc);
     }
   }
 
-  async checkAgentMd(aid: string, ttlDays = 1): Promise<Result<Record<string, unknown>>> {
+  async checkAgentMd(aid: string, ttlDays = 1): Promise<Result<CheckAgentMdResult>> {
     const target = String(aid ?? '').trim();
     const cached = (this._agentMdCache.get(target) ?? {}) as Record<string, unknown>;
     const head = await this.headAgentMd(target);
@@ -422,7 +442,7 @@ export class AIDStore {
     return resultOk({ aid: target, local_found: localFound, remote_found: remoteFound, local_etag: localEtag, remote_etag: remoteEtag, needs_update: needsUpdate, ttl_days: ttlDays });
   }
 
-  async diagnose(aid: string): Promise<Result<Record<string, unknown>>> {
+  async diagnose(aid: string): Promise<Result<DiagnoseResult>> {
     const target = String(aid ?? '').trim();
     const loaded = this.load(target);
     const existsResult = await this.exists(target);
@@ -455,15 +475,15 @@ export class AIDStore {
     else status = 'unknown';
 
     return resultOk({
-      aid: target, status, local_valid: localValid, localValid: localValid,
-      remote_registered: remoteRegistered, remoteRegistered,
+      aid: target, status, local_valid: localValid,
+      remote_registered: remoteRegistered,
       suggestions,
       local: { cert: localCert, private_key: localPrivateKey, error: localError },
       remote: { checked: remoteChecked, exists: remoteChecked ? remoteRegistered : null, error: remoteError },
     });
   }
 
-  async renewCert(aid: string): Promise<Result<Record<string, unknown>>> {
+  async renewCert(aid: string): Promise<Result<RenewCertResult>> {
     const target = String(aid ?? '').trim();
     const loaded = this.load(target);
     if (!loaded.ok || !loaded.data || !loaded.data.aid.isPrivateKeyValid()) {
@@ -496,7 +516,7 @@ export class AIDStore {
     }
   }
 
-  async rekey(aid: string): Promise<Result<Record<string, unknown>>> {
+  async rekey(aid: string): Promise<Result<RekeyResult>> {
     const target = String(aid ?? '').trim();
     const loaded = this.load(target);
     if (!loaded.ok || !loaded.data || !loaded.data.aid.isPrivateKeyValid()) {
@@ -539,8 +559,7 @@ export class AIDStore {
     const issuerDomain = dotIdx >= 0 ? aid.slice(dotIdx + 1) : aid;
     const cached = this._gatewayCache.get(issuerDomain);
     if (cached) return cached;
-    const port = this._discoveryPort ? `:${this._discoveryPort}` : '';
-    const gatewayUrl = `https://gateway.${issuerDomain}${port}/.well-known/aun-gateway`;
+    const gatewayUrl = `https://gateway.${issuerDomain}/.well-known/aun-gateway`;
     const discovered = await this._discovery.discover(gatewayUrl);
     this._gatewayCache.set(issuerDomain, discovered);
     return discovered;

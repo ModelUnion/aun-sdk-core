@@ -97,8 +97,8 @@ describe('P0-02: AID 创建参数校验', () => {
     const result = await store.register('');
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.error.code).toBe(INVALID_AID_FORMAT);
-      expect(result.error.message).toContain("requires 'aid'");
+      expect((result as any).error.code).toBe(INVALID_AID_FORMAT);
+      expect((result as any).error.message).toContain("requires 'aid'");
     }
     expect(resolveSpy).not.toHaveBeenCalled();
   });
@@ -108,7 +108,7 @@ describe('P0-02: AID 创建参数校验', () => {
     const resolveSpy = vi.spyOn(store as any, '_resolveGateway');
     const result = await (store as any).register(undefined);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
+    if (!result.ok) expect((result as any).error.code).toBe(INVALID_AID_FORMAT);
     expect(resolveSpy).not.toHaveBeenCalled();
   });
 
@@ -117,7 +117,7 @@ describe('P0-02: AID 创建参数校验', () => {
     const resolveSpy = vi.spyOn(store as any, '_resolveGateway');
     const result = await store.register('ab');
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
+    if (!result.ok) expect((result as any).error.code).toBe(INVALID_AID_FORMAT);
     expect(resolveSpy).not.toHaveBeenCalled();
   });
 
@@ -125,20 +125,20 @@ describe('P0-02: AID 创建参数校验', () => {
     const store = makeStore();
     const result = await store.register('Alice.aid.com');
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
+    if (!result.ok) expect((result as any).error.code).toBe(INVALID_AID_FORMAT);
   });
 
   it('AID 名称以 - 开头应被拒绝', async () => {
     const store = makeStore();
     const result = await store.register('-bad.aid.com');
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
+    if (!result.ok) expect((result as any).error.code).toBe(INVALID_AID_FORMAT);
   });
 
   it('AID 名称以 guest 开头应被拒绝', async () => {
     const store = makeStore();
     const result = await store.register('guestuser.aid.com');
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
+    if (!result.ok) expect((result as any).error.code).toBe(INVALID_AID_FORMAT);
   });
 });

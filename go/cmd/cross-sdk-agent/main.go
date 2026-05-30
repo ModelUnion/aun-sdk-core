@@ -52,7 +52,7 @@ func NewCrossSdkGoAgent() *CrossSdkGoAgent {
 	aunPath := strings.TrimSpace(envString("AUN_TEST_AUN_PATH", envString("AUN_DATA_ROOT", "/data/aun")))
 	debug := envBool("AUN_TEST_DEBUG", false)
 	requireForwardSecrecy := false
-	client := aun.NewAUNClient(aun.AUNClientOptions{
+	client := aun.NewAUNClient(nil, aun.AUNClientOptions{
 		AUNPath:               aunPath,
 		RequireForwardSecrecy: &requireForwardSecrecy,
 		Debug:                 debug,
@@ -112,24 +112,22 @@ func (a *CrossSdkGoAgent) ensureConnected(ctx context.Context) error {
 		a.client.SetGatewayURL(a.gatewayURL)
 		store.SetGatewayURL(a.gatewayURL)
 	}
-	if err := store.Register(ctx, a.aid); err != nil {
-		if _, loadErr := store.Load(a.aid); loadErr != nil {
-			return fmt.Errorf("register_aid failed and no local identity exists: %w", err)
+	if rr := store.Register(ctx, a.aid); !rr.Ok {
+		if lr := store.Load(a.aid); !lr.Ok {
+			return fmt.Errorf("register_aid failed and no local identity exists: %s", rr.Error.Message)
 		}
 	}
-	aid, err := store.Load(a.aid)
-	if err != nil {
+	lr := store.Load(a.aid)
+	if !lr.Ok {
+		return fmt.Errorf("%s: %s", lr.Error.Code, lr.Error.Message)
+	}
+	if err := a.client.LoadIdentity(lr.Data.AID); err != nil {
 		return err
 	}
-	if err := a.client.LoadIdentity(aid); err != nil {
-		return err
+	if a.gatewayURL != "" {
+		a.client.SetGatewayURL(a.gatewayURL)
 	}
-	return a.client.Connect(ctx, &aun.ConnectOptions{
-		GatewayURL:     a.gatewayURL,
-		SlotID:         a.slotID,
-		AutoReconnect:  envBool("AUN_TEST_AUTO_RECONNECT", false),
-		BackgroundSync: true,
-	})
+	return a.client.Connect(ctx)
 }
 
 func (a *CrossSdkGoAgent) recordTrace(traceID string, item map[string]any) {

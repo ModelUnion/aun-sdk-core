@@ -72,7 +72,8 @@ def test_client_without_identity_starts_no_identity():
 def test_client_construct_with_aid_enters_standby(tmp_path: Path):
     store, aid = _load_local_aid(tmp_path)
 
-    client = AUNClient(aid, protected_headers={"x-app": "demo"})
+    client = AUNClient(aid)
+    client.set_protected_headers({"x-app": "demo"})
 
     assert client.state == ConnectionState.STANDBY
     assert client.current_aid is aid
@@ -160,7 +161,8 @@ def test_client_peer_cache_methods_use_public_aid_objects(tmp_path: Path, monkey
 
 
 def test_client_instance_protected_headers_merge_only_for_message_methods():
-    client = AUNClient(protected_headers={"x-app": "demo", "trace": "base"})
+    client = AUNClient()
+    client.set_protected_headers({"x-app": "demo", "trace": "base"})
     client._state = "ready"
     calls: list[tuple[str, dict]] = []
 

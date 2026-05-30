@@ -4,7 +4,7 @@ from .client import AUNClient
 from .config import get_device_id
 from .e2ee import ProtectedHeaders
 from .result import ErrorInfo, Result, result_err, result_ok
-from .types import ConnectionState
+from .types import ConnectionOptions, ConnectionState
 from .errors import (
     AUNError,
     AuthError,
@@ -40,6 +40,7 @@ __all__ = [
     "result_ok",
     "result_err",
     "ProtectedHeaders",
+    "ConnectionOptions",
     "ConnectionState",
     "get_device_id",
     "AUNError",

@@ -58,19 +58,15 @@ describe('AUN SDK v4 三主体 API', () => {
     expect(client.state).toBe(ConnectionState.STANDBY);
   });
 
-  it('构造函数只接受 AID 对象或 options，不接受字符串 AID/第二参数 debug', () => {
+  it('构造函数不接受字符串 AID', () => {
     expect(() => new (AUNClient as any)('alice.agentid.pub')).toThrow(/AID object/);
-    expect(() => new (AUNClient as any)({ aid: 'alice.agentid.pub' })).toThrow(/must not include aid/);
-    expect(() => new (AUNClient as any)({ aun_path: 'tmp-aun' }, true)).toThrow(/options\.debug/);
-    expect(() => new AUNClient({ aun_path: 'tmp-aun', debug: true })).not.toThrow();
   });
 
   it('connect 只接受 options，不接受旧版 aid/token 参数', async () => {
     const { aid } = createStoredAid('erin.agentid.pub');
     const client = new AUNClient(aid);
-    await expect(client.connect({ access_token: 'tok', gateway: 'ws://localhost/aun' })).rejects.toThrow(/must not include/);
+    await expect(client.connect({ access_token: 'tok', gateway: 'ws://localhost/aun' } as any)).rejects.toThrow(/must not include/);
     await expect(client.connect({ aid: 'erin.agentid.pub' } as any)).rejects.toThrow(/must not include/);
-    await expect((client as any).connect({}, {})).rejects.toThrow(/single options object/);
   });
 
   it('gateway 发现应使用完整 issuer 域名并持久化 gateway_url', async () => {
@@ -94,7 +90,8 @@ describe('AUN SDK v4 三主体 API', () => {
 
   it('实例级 protected_headers 只合并到消息类 RPC', async () => {
     const { aid } = createStoredAid('dave.agentid.pub');
-    const client = new AUNClient(aid, { protected_headers: { app: 'sdk-test', priority: 1 } });
+    const client = new AUNClient(aid);
+    client.setProtectedHeaders({ app: 'sdk-test', priority: 1 });
     (client as unknown as { _state: string })._state = 'connected';
     const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
     (client as unknown as { _transport: { call: (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown>> } })._transport = {

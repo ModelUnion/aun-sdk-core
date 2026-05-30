@@ -7,7 +7,7 @@
 export { VERSION } from './version.js';
 
 // ── 主客户端 ─────────────────────────────────────────────────
-export { AUNClient, type AUNClientOptions } from './client.js';
+export { AUNClient, type AUNClientOptions, type ConnectionOptions } from './client.js';
 export { AID, type VerifyResult } from './aid.js';
 export { AIDStore, type AIDInfo, type ResolveOpts } from './aid-store.js';
 export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';

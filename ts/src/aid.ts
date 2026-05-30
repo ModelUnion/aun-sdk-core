@@ -33,6 +33,9 @@ export class AID {
   readonly certPem: string;
   readonly deviceId: string;
   readonly slotId: string;
+  readonly verifySsl: boolean;
+  readonly rootCaPath: string | null;
+  readonly debug: boolean;
 
   private readonly _privateKeyPem: string | null;
   private readonly _certValid: boolean;
@@ -47,12 +50,18 @@ export class AID {
     privateKeyValid: boolean;
     deviceId?: string;
     slotId?: string;
+    verifySsl?: boolean;
+    rootCaPath?: string | null;
+    debug?: boolean;
   }) {
     this.aid = params.aid;
     this.aunPath = params.aunPath;
     this.certPem = params.certPem;
     this.deviceId = params.deviceId ?? '';
     this.slotId = params.slotId ?? 'default';
+    this.verifySsl = params.verifySsl ?? false;
+    this.rootCaPath = params.rootCaPath ?? null;
+    this.debug = params.debug ?? false;
     this._privateKeyPem = params.privateKeyPem;
     this._certValid = params.certValid;
     this._privateKeyValid = params.privateKeyValid;
@@ -67,6 +76,9 @@ export class AID {
     privateKeyValid: boolean;
     deviceId?: string;
     slotId?: string;
+    verifySsl?: boolean;
+    rootCaPath?: string | null;
+    debug?: boolean;
   }): AID {
     return new AID(params);
   }

@@ -8,6 +8,20 @@
 
 ---
 
+## 0.4.2 — 2026-05-30
+
+### Added
+- **`AIDStore` 新增结构化返回类型**：`LoadResult`、`ListResult`、`RegisterResult`、`ExistsResult`、`HeadAgentMdResult`、`CheckAgentMdResult`、`ChangeSeedResult` 等，替代原来的裸字段返回。
+- **`AID` 新增 `VerifySSL` / `RootCaPath` / `Debug` 字段**：由 `AIDStore` 在创建 `AID` 实例时注入，供内部 HTTP 请求使用。
+- **`AUNClientOptions` 新增 `RootCaPath`**：支持私有部署指定自定义根证书路径。
+
+### Changed
+- **`AIDStore.Load` 返回类型变更**：`(*AID, error)` → `Result[LoadResult]`，与其他方法统一为 `Result[T]` 风格。
+- **移除 `DiscoveryPort`**：`AUNClientOptions` 删除 `DiscoveryPort` 字段，gateway URL 改为纯自动发现。
+- **`AIDStore` 内部注入 `verifySSL` / `rootCaPath` / `debug`**：创建 client 时自动透传这三个配置项。
+
+---
+
 ## 0.4.0 — 2026-05-30
 
 > **破坏性重构版本。** 与 Python SDK 0.4.0 对齐：身份管理剥离为 `AID` / `AIDStore`；删除 `Auth` / `Custody` / `Meta` 公开命名空间；引入字符串错误码；连接状态机扩展为 9 态；大量内部方法改为非导出。

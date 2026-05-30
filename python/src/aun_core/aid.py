@@ -36,6 +36,9 @@ class AID:
     _private_key_valid: bool
     device_id: str = ""
     slot_id: str = "default"
+    verify_ssl: bool = True
+    root_ca_path: str | None = None
+    debug: bool = False
 
     @classmethod
     def _create(
@@ -50,6 +53,9 @@ class AID:
         private_key_valid: bool,
         device_id: str = "",
         slot_id: str = "default",
+        verify_ssl: bool = True,
+        root_ca_path: str | None = None,
+        debug: bool = False,
     ) -> "AID":
         return cls(
             aid=str(aid),
@@ -61,6 +67,9 @@ class AID:
             _private_key_valid=bool(private_key_valid),
             device_id=str(device_id),
             slot_id=str(slot_id) if slot_id else "default",
+            verify_ssl=bool(verify_ssl),
+            root_ca_path=root_ca_path,
+            debug=bool(debug),
         )
 
     @property

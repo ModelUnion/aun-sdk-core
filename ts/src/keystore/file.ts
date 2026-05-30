@@ -320,7 +320,7 @@ export class FileKeyStore implements KeyStore {
     const db = this._getDB(aid);
     const current = (db.loadInstanceState(deviceId, slotId) ?? {}) as MetadataRecord;
     const working = deepClone(current);
-    const updated = updater(working) ?? working;
+    const updated: MetadataRecord = (updater(working) ?? working) as MetadataRecord;
     db.saveInstanceState(deviceId, slotId, updated);
     return deepClone(updated);
   }

@@ -36,7 +36,7 @@ describe('createConfig', () => {
     expect(cfg.aunPath).toBe('aun');
     expect(cfg.rootCaPem).toBeNull();
     expect(cfg.seedPassword).toBeNull();
-    expect(cfg.discoveryPort).toBeNull();
+    expect((cfg as any).discoveryPort).toBeNull();
     expect(cfg.groupE2ee).toBe(true);
     expect((cfg as any).epochAutoRotateInterval).toBeUndefined();
     expect((cfg as any).oldEpochRetentionSeconds).toBeUndefined();
@@ -64,7 +64,7 @@ describe('createConfig', () => {
     } as any);
     expect(cfg.aunPath).toBe('custom-db');
     expect(cfg.rootCaPem).toBe('ROOT-CA-PEM');
-    expect(cfg.discoveryPort).toBe(20001);
+    expect((cfg as any).discoveryPort).toBe(20001);
     expect(cfg.groupE2ee).toBe(true); // 必备能力，不可关闭
     expect((cfg as any).epochAutoRotateInterval).toBeUndefined();
     expect((cfg as any).oldEpochRetentionSeconds).toBeUndefined();

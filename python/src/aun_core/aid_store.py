@@ -7,7 +7,7 @@ import asyncio
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 import aiohttp
@@ -34,6 +34,70 @@ _AUTHORITY_ENDPOINT = "https://trust.aun.network/.well-known/aun/trust-roots.jso
 _MAX_CLOCK_SKEW = 300
 
 
+class FetchAgentMdResult(TypedDict):
+    aid: str
+    content: str
+    verification: dict  # { status: str, reason?: str }
+    cert_pem: str
+    etag: str
+    last_modified: str
+
+
+class HeadAgentMdResult(TypedDict):
+    aid: str
+    found: bool
+    etag: str
+    last_modified: str
+    content_length: int
+
+
+class CheckAgentMdResult(TypedDict):
+    aid: str
+    local_found: bool
+    remote_found: bool
+    local_etag: str
+    remote_etag: str
+    needs_update: bool
+    ttl_days: int
+
+
+class DiagnoseResult(TypedDict):
+    aid: str
+    status: str
+    local_valid: bool
+    remote_registered: bool
+    suggestions: list
+    local: dict
+    remote: dict
+
+
+class RenewCertResult(TypedDict):
+    renewed: bool
+    new_cert_not_after: object  # datetime
+    new_fingerprint: str
+
+
+class RekeyResult(TypedDict):
+    rekeyed: bool
+    new_cert_not_after: object  # datetime
+    new_fingerprint: str
+
+
+class ChangeSeedResult(TypedDict):
+    changed: bool
+    count: int
+
+
+class ResolveResult(TypedDict):
+    aid: object  # AID
+    agent_md: dict  # optional
+    source: dict  # { cert_from_cache: bool, agent_md_fetched: bool }
+
+
+class ListResult(TypedDict):
+    identities: list  # list[AIDInfo]
+
+
 class AIDStore:
     def __init__(
         self,
@@ -43,7 +107,6 @@ class AIDStore:
         device_id: str | None = None,
         slot_id: str = "default",
         verify_ssl: bool | None = None,
-        discovery_port: int | None = None,
         root_ca_path: str | None = None,
         debug: bool = False,
         logger: AUNLogger | NullLogger | None = None,
@@ -55,7 +118,6 @@ class AIDStore:
         self._gateway_cache: dict[str, str] = {}
         self._cert_op_locks: dict[str, asyncio.Lock] = {}
         self._verify_ssl = resolve_verify_ssl_from_env() if verify_ssl is None else bool(verify_ssl)
-        self._discovery_port = discovery_port
         self._root_ca_path = root_ca_path
         self._agent_md_cache: dict[str, dict[str, Any]] = {}
         self._log = logger or AUNLogger(debug=debug, aun_path=self.aun_path)
@@ -128,6 +190,9 @@ class AIDStore:
                     private_key_valid=False,
                     device_id=self.device_id,
                     slot_id=self.slot_id,
+                    verify_ssl=self._verify_ssl,
+                    root_ca_path=self._root_ca_path,
+                    debug=self._log._debug if hasattr(self._log, "_debug") else False,
                 )
             })
 
@@ -163,10 +228,13 @@ class AIDStore:
                 private_key_valid=True,
                 device_id=self.device_id,
                 slot_id=self.slot_id,
+                verify_ssl=self._verify_ssl,
+                root_ca_path=self._root_ca_path,
+                debug=self._log._debug if hasattr(self._log, "_debug") else False,
             )
         })
 
-    def list(self) -> Result[dict[str, list[dict[str, Any]]]]:
+    def list(self) -> Result[ListResult]:
         identities: list[dict[str, Any]] = []
         try:
             aids = self._keystore.list_identities()
@@ -187,7 +255,7 @@ class AIDStore:
         except Exception as exc:
             return result_err("LIST_IDENTITIES_FAILED", str(exc), cause=exc)
 
-    def change_seed(self, old_seed: str, new_seed: str) -> Result[dict[str, Any]]:
+    def change_seed(self, old_seed: str, new_seed: str) -> Result[ChangeSeedResult]:
         if not isinstance(old_seed, str) or not old_seed.strip():
             return result_err(codes.PRIVATE_KEY_PARSE_ERROR, "change_seed requires a non-empty old_seed")
         if not isinstance(new_seed, str) or not new_seed.strip():
@@ -246,11 +314,13 @@ class AIDStore:
             self._log.debug("aid_store", "exists exit (error): aid=%s err=%s", target, exc)
             return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
-    async def resolve(self, aid: str, opts: dict[str, Any] | None = None) -> Result[dict[str, Any]]:
+    async def resolve(self, aid: str, opts: dict[str, Any] | None = None) -> Result[ResolveResult]:
         options = dict(opts or {})
         target = str(aid or "").strip()
         force_refresh = bool(options.get("force_refresh") or options.get("forceRefresh"))
         skip_agent_md = bool(options.get("skip_agent_md") or options.get("skipAgentMd"))
+        timeout_ms = options.get("timeout") or options.get("timeoutMs")
+        timeout_s: float | None = float(timeout_ms) / 1000.0 if timeout_ms is not None else None
         self._log.debug(
             "aid_store",
             "resolve enter: aid=%s force_refresh=%s skip_agent_md=%s",
@@ -283,7 +353,7 @@ class AIDStore:
             if skip_agent_md:
                 return result_ok({"aid": peer, "source": source})
 
-            agent_md = await self.fetch_agent_md(target)
+            agent_md = await self.fetch_agent_md(target, timeout_s=timeout_s)
             if not agent_md.ok:
                 return agent_md
             source["agent_md_fetched"] = True
@@ -294,7 +364,7 @@ class AIDStore:
             self._log.debug("aid_store", "resolve exit (error): aid=%s err=%s", target, exc)
             return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
-    async def fetch_agent_md(self, aid: str) -> Result[dict[str, Any]]:
+    async def fetch_agent_md(self, aid: str, *, timeout_s: float | None = None) -> Result[FetchAgentMdResult]:
         target = str(aid or "").strip()
         self._log.debug("aid_store", "fetch_agent_md enter: aid=%s", target or "-")
         try:
@@ -313,7 +383,7 @@ class AIDStore:
             content, response_headers, status = await self._http_get_text_with_headers(
                 url,
                 headers=headers,
-                timeout=30.0,
+                timeout=timeout_s if timeout_s is not None else 30.0,
             )
             if status == 304 and cached.get("content") is not None:
                 content = str(cached["content"])
@@ -357,12 +427,9 @@ class AIDStore:
                 "aid": target,
                 "content": content,
                 "verification": verification,
-                "signature": signature,
                 "cert_pem": peer.cert_pem,
-                "certPem": peer.cert_pem,
                 "etag": response_etag,
                 "last_modified": response_last_modified,
-                "status": status,
             })
         except (ValidationError, ValueError) as exc:
             return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
@@ -370,7 +437,7 @@ class AIDStore:
             self._log.debug("aid_store", "fetch_agent_md exit (error): aid=%s err=%s", target, exc)
             return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
-    async def head_agent_md(self, aid: str) -> Result[dict[str, Any]]:
+    async def head_agent_md(self, aid: str) -> Result[HeadAgentMdResult]:
         target = str(aid or "").strip()
         self._log.debug("aid_store", "head_agent_md enter: aid=%s", target or "-")
         try:
@@ -393,7 +460,6 @@ class AIDStore:
                 "etag": str(headers.get("ETag") or headers.get("etag") or "").strip(),
                 "last_modified": str(headers.get("Last-Modified") or headers.get("last-modified") or "").strip(),
                 "content_length": content_length,
-                "status": status,
             }
             cached = self._agent_md_cache.get(target) or {}
             cached.update({
@@ -409,7 +475,7 @@ class AIDStore:
             self._log.debug("aid_store", "head_agent_md exit (error): aid=%s err=%s", target, exc)
             return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
-    async def check_agent_md(self, aid: str, ttl_days: int = 1) -> Result[dict[str, Any]]:
+    async def check_agent_md(self, aid: str, ttl_days: int = 1) -> Result[CheckAgentMdResult]:
         target = str(aid or "").strip()
         cached = self._agent_md_cache.get(target) or {}
         head = await self.head_agent_md(target)
@@ -442,7 +508,7 @@ class AIDStore:
             "ttl_days": int(ttl_days),
         })
 
-    async def diagnose(self, aid: str) -> Result[dict[str, Any]]:
+    async def diagnose(self, aid: str) -> Result[DiagnoseResult]:
         target = str(aid or "").strip()
         loaded = self.load(target)
         exists = await self.exists(target)
@@ -507,17 +573,13 @@ class AIDStore:
             "aid": target,
             "status": status,
             "local_valid": local_valid,
-            "localValid": local_valid,
             "remote_registered": remote_registered,
-            "remoteRegistered": remote_registered,
-            "cert_match": cert_match,
-            "certMatch": cert_match,
             "suggestions": suggestions,
             "local": local,
             "remote": remote,
         })
 
-    async def renew_cert(self, aid: str) -> Result[dict[str, Any]]:
+    async def renew_cert(self, aid: str) -> Result[RenewCertResult]:
         target = str(aid or "").strip()
         self._log.debug("aid_store", "renew_cert enter: aid=%s", target or "-")
         async with self._cert_op_lock(target):
@@ -564,7 +626,6 @@ class AIDStore:
                     "renewed": True,
                     "new_cert_not_after": refreshed_aid.cert_not_after,
                     "new_fingerprint": refreshed_aid.cert_fingerprint,
-                    "cert_sn": str(response.get("cert_sn") or response.get("serial") or cert_obj.serial_number),
                 })
             except (ValidationError, ValueError) as exc:
                 return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
@@ -572,7 +633,7 @@ class AIDStore:
                 self._log.warn("aid_store", "renew_cert failed: aid=%s err=%s", target, exc)
                 return result_err(codes.CERT_RENEWAL_FAILED, str(exc), cause=exc)
 
-    async def rekey(self, aid: str) -> Result[dict[str, Any]]:
+    async def rekey(self, aid: str) -> Result[RekeyResult]:
         target = str(aid or "").strip()
         self._log.debug("aid_store", "rekey enter: aid=%s", target or "-")
         async with self._cert_op_lock(target):
@@ -627,9 +688,8 @@ class AIDStore:
                 )
                 return result_ok({
                     "rekeyed": True,
-                    "new_fingerprint": refreshed_aid.cert_fingerprint,
                     "new_cert_not_after": refreshed_aid.cert_not_after,
-                    "cert_sn": str(response.get("cert_sn") or response.get("serial") or cert_obj.serial_number),
+                    "new_fingerprint": refreshed_aid.cert_fingerprint,
                 })
             except (ValidationError, ValueError) as exc:
                 return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
@@ -914,8 +974,7 @@ class AIDStore:
 
     def _pki_authority(self, issuer: str) -> str:
         normalized = self._validate_issuer(issuer)
-        port_suffix = f":{int(self._discovery_port)}" if self._discovery_port and ":" not in normalized else ""
-        return f"pki.{normalized}{port_suffix}"
+        return f"pki.{normalized}"
 
     @staticmethod
     def _validate_issuer(issuer: str) -> str:
@@ -1116,9 +1175,8 @@ class AIDStore:
         if issuer_domain in self._gateway_cache:
             return self._gateway_cache[issuer_domain]
 
-        port_suffix = f":{int(self._discovery_port)}" if self._discovery_port else ""
-        aid_url = f"https://{target}{port_suffix}/.well-known/aun-gateway"
-        gateway_url = f"https://gateway.{issuer_domain}{port_suffix}/.well-known/aun-gateway"
+        aid_url = f"https://{target}/.well-known/aun-gateway"
+        gateway_url = f"https://gateway.{issuer_domain}/.well-known/aun-gateway"
         primary_url, fallback_url = (aid_url, gateway_url) if self._verify_ssl else (gateway_url, aid_url)
 
         try:
@@ -1168,8 +1226,6 @@ class AIDStore:
         raw_gateway = str(gateway_url or "").strip().lower()
         scheme = "http" if raw_gateway.startswith("ws://") else "https"
         host = str(aid or "").strip()
-        if self._discovery_port and ":" not in host:
-            host = f"{host}:{int(self._discovery_port)}"
         return f"{scheme}://{host}/agent.md"
 
     async def _http_head(self, url: str, *, timeout: float = 5.0) -> tuple[int, dict[str, str]]:

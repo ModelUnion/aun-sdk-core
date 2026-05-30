@@ -81,10 +81,11 @@ func TestAIDStoreLoad_Success(t *testing.T) {
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
 
-	loaded, err := s.Load(aid)
-	if err != nil {
-		t.Fatalf("Load 失败: %v", err)
+	r := s.Load(aid)
+	if !r.Ok {
+		t.Fatalf("Load 失败: %v", r.Error.Message)
 	}
+	loaded := r.Data.AID
 	if loaded.Aid != aid {
 		t.Errorf("Aid 不匹配: 预期 %s 实际 %s", aid, loaded.Aid)
 	}
@@ -107,12 +108,12 @@ func TestAIDStoreLoad_Success(t *testing.T) {
 
 func TestAIDStoreLoad_CertNotFound(t *testing.T) {
 	s := newTestAIDStore(t)
-	_, err := s.Load("ghost.aid.com")
-	if err == nil {
+	r := s.Load("ghost.aid.com")
+	if r.Ok {
 		t.Fatal("不存在的 AID 应返回错误")
 	}
-	if !strings.Contains(err.Error(), ErrCodeCertNotFound) {
-		t.Errorf("错误码应为 CERT_NOT_FOUND: %v", err)
+	if r.Error.Code != ErrCodeCertNotFound {
+		t.Errorf("错误码应为 CERT_NOT_FOUND: %v", r.Error.Code)
 	}
 }
 
@@ -122,12 +123,12 @@ func TestAIDStoreLoad_CertExpired(t *testing.T) {
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour))
 	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
 
-	_, err := s.Load(aid)
-	if err == nil {
+	r := s.Load(aid)
+	if r.Ok {
 		t.Fatal("过期证书应返回错误")
 	}
-	if !strings.Contains(err.Error(), ErrCodeCertExpired) {
-		t.Errorf("错误码应为 CERT_EXPIRED: %v", err)
+	if r.Error.Code != ErrCodeCertExpired {
+		t.Errorf("错误码应为 CERT_EXPIRED: %v", r.Error.Code)
 	}
 }
 
@@ -137,12 +138,12 @@ func TestAIDStoreLoad_CertNotYetValid(t *testing.T) {
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(24*time.Hour), time.Now().Add(48*time.Hour))
 	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
 
-	_, err := s.Load(aid)
-	if err == nil {
+	r := s.Load(aid)
+	if r.Ok {
 		t.Fatal("尚未生效的证书应返回错误")
 	}
-	if !strings.Contains(err.Error(), ErrCodeCertNotYetValid) {
-		t.Errorf("错误码应为 CERT_NOT_YET_VALID: %v", err)
+	if r.Error.Code != ErrCodeCertNotYetValid {
+		t.Errorf("错误码应为 CERT_NOT_YET_VALID: %v", r.Error.Code)
 	}
 }
 
@@ -155,10 +156,11 @@ func TestAIDStoreLoad_CertOnly(t *testing.T) {
 		t.Fatalf("保存证书失败: %v", err)
 	}
 
-	loaded, err := s.Load(aid)
-	if err != nil {
-		t.Fatalf("Load 失败: %v", err)
+	r := s.Load(aid)
+	if !r.Ok {
+		t.Fatalf("Load 失败: %v", r.Error.Message)
 	}
+	loaded := r.Data.AID
 	if !loaded.IsCertValid() {
 		t.Error("证书应有效")
 	}
@@ -175,10 +177,11 @@ func TestAIDSignVerify_RoundTrip(t *testing.T) {
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
 
-	loaded, err := s.Load(aid)
-	if err != nil {
-		t.Fatalf("Load 失败: %v", err)
+	r := s.Load(aid)
+	if !r.Ok {
+		t.Fatalf("Load 失败: %v", r.Error.Message)
 	}
+	loaded := r.Data.AID
 
 	payload := []byte("hello aun")
 	sig, err := loaded.Sign(payload)
@@ -214,10 +217,11 @@ func TestAIDSign_NoPrivateKey(t *testing.T) {
 	if err := s.client.keyStore.SaveCert(aid, certPEM); err != nil {
 		t.Fatalf("保存证书失败: %v", err)
 	}
-	loaded, err := s.Load(aid)
-	if err != nil {
-		t.Fatalf("Load 失败: %v", err)
+	r := s.Load(aid)
+	if !r.Ok {
+		t.Fatalf("Load 失败: %v", r.Error.Message)
 	}
+	loaded := r.Data.AID
 	if _, err := loaded.Sign([]byte("x")); err == nil {
 		t.Fatal("无私钥时 Sign 应报错")
 	} else if !strings.Contains(err.Error(), ErrCodePrivateKeyNotValid) {
@@ -233,10 +237,11 @@ func TestAIDAgentMd_RoundTrip(t *testing.T) {
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
 
-	loaded, err := s.Load(aid)
-	if err != nil {
-		t.Fatalf("Load 失败: %v", err)
+	r := s.Load(aid)
+	if !r.Ok {
+		t.Fatalf("Load 失败: %v", r.Error.Message)
 	}
+	loaded := r.Data.AID
 
 	content := "---\naid: carol.aid.com\n---\n# Carol Agent\n"
 	signed, err := loaded.SignAgentMd(content)
@@ -265,7 +270,7 @@ func TestAIDVerifyAgentMd_Unsigned(t *testing.T) {
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
 
-	loaded, _ := s.Load(aid)
+	loaded := s.Load(aid).Data.AID
 	result, err := loaded.VerifyAgentMd("# plain content\n")
 	if err != nil {
 		t.Fatalf("VerifyAgentMd 失败: %v", err)
@@ -283,12 +288,12 @@ func TestAIDStoreList(t *testing.T) {
 		certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 		saveTestIdentity(t, s, aid, certPEM, privPEM, pubB64)
 	}
-	infos, err := s.List()
-	if err != nil {
-		t.Fatalf("List 失败: %v", err)
+	listR := s.List()
+	if !listR.Ok {
+		t.Fatalf("List 失败: %v", listR.Error.Message)
 	}
-	if len(infos) != 2 {
-		t.Errorf("应列出 2 个身份, 实际: %d", len(infos))
+	if len(listR.Data.Identities) != 2 {
+		t.Errorf("应列出 2 个身份, 实际: %d", len(listR.Data.Identities))
 	}
 }
 
@@ -312,12 +317,12 @@ func TestAIDStoreResolve_CertNotFound(t *testing.T) {
 	s.SetGatewayURL(server.URL)
 
 	// 解析一个本地未缓存的 AID，强制走 PKI 拉取路径
-	_, err := s.Resolve(context.Background(), "ghost.aid.com", AIDStoreResolveOptions{SkipAgentMD: true})
-	if err == nil {
+	r := s.Resolve(context.Background(), "ghost.aid.com", AIDStoreResolveOptions{SkipAgentMD: true})
+	if r.Ok {
 		t.Fatal("证书 404 时 Resolve 应返回错误")
 	}
-	if !strings.Contains(err.Error(), ErrCodeCertNotFound) {
-		t.Errorf("证书 404 应映射为 %s, 实际错误: %v", ErrCodeCertNotFound, err)
+	if r.Error.Code != ErrCodeCertNotFound {
+		t.Errorf("证书 404 应映射为 %s, 实际错误码: %s", ErrCodeCertNotFound, r.Error.Code)
 	}
 }
 

@@ -23,6 +23,24 @@ export interface ResolveOpts {
   skipAgentMd?: boolean;
 }
 
+export type ResolveResult = {
+  aid: AID;
+  agent_md?: { content: string; verification: { status: string; reason?: string }; cert_pem: string };
+  source: { cert_from_cache: boolean; agent_md_fetched: boolean };
+};
+export type FetchAgentMdResult = {
+  aid: string; content: string;
+  verification: { status: string; reason?: string };
+  cert_pem: string; etag: string; last_modified: string;
+};
+export type HeadAgentMdResult = { aid: string; found: boolean; etag: string; last_modified: string; content_length: number };
+export type CheckAgentMdResult = { aid: string; local_found: boolean; remote_found: boolean; local_etag: string; remote_etag: string; needs_update: boolean; ttl_days: number };
+export type DiagnoseResult = { aid: string; status: string; local_valid: boolean; remote_registered: boolean; suggestions: string[]; local: Record<string, unknown>; remote: Record<string, unknown> };
+export type RenewCertResult = { renewed: true; new_cert_not_after: Date; new_fingerprint: string };
+export type RekeyResult = { rekeyed: true; new_cert_not_after: Date; new_fingerprint: string };
+export type ChangeSeedResult = { changed: boolean; count: number };
+export type ListResult = { identities: AIDInfo[] };
+
 interface AgentMdCacheEntry {
   content?: string;
   etag?: string;
@@ -221,10 +239,9 @@ function pkiCertUrl(gatewayUrl: string, aid: string): string {
   return gatewayHttpUrl(gatewayUrl, `/pki/cert/${encodeURIComponent(aid)}`);
 }
 
-function agentMdUrl(aid: string, gatewayUrl: string, discoveryPort?: number | null): string {
+function agentMdUrl(aid: string, gatewayUrl: string): string {
   const scheme = String(gatewayUrl ?? '').trim().toLowerCase().startsWith('ws://') ? 'http' : 'https';
-  let host = String(aid ?? '').trim();
-  if (discoveryPort && !host.includes(':')) host = `${host}:${discoveryPort}`;
+  const host = String(aid ?? '').trim();
   return `${scheme}://${host}/agent.md`;
 }
 
@@ -253,7 +270,6 @@ export class AIDStore {
   private _crypto: CryptoProvider;
   private _discovery: GatewayDiscovery;
   private _verifySsl: boolean;
-  private _discoveryPort: number | null;
   private _gatewayCache: Map<string, string> = new Map();
   private _agentMdCache: Map<string, AgentMdCacheEntry> = new Map();
 
@@ -264,7 +280,6 @@ export class AIDStore {
     slotId?: string;
     rootCaPem?: string | null;
     verifySsl?: boolean;
-    discoveryPort?: number | null;
   }) {
     this.aunPath = String(opts.aunPath ?? '');
     this._encryptionSeed = String(opts.encryptionSeed ?? '');
@@ -273,7 +288,6 @@ export class AIDStore {
       : getDeviceId();
     this.slotId = normalizeSlotId(opts.slotId);
     this._verifySsl = opts.verifySsl ?? true;
-    this._discoveryPort = opts.discoveryPort ?? null;
     this._keystore = new IndexedDBKeyStore({ encryptionSeed: this._encryptionSeed || undefined });
     this._crypto = new CryptoProvider();
     this._discovery = new GatewayDiscovery();
@@ -343,6 +357,9 @@ export class AIDStore {
           privateKeyValid: false,
           deviceId: this.deviceId,
           slotId: this.slotId,
+          verifySsl: this._verifySsl,
+          rootCaPath: null,
+          debug: false,
         }),
       });
     }
@@ -376,11 +393,14 @@ export class AIDStore {
         privateKeyValid: true,
         deviceId: this.deviceId,
         slotId: this.slotId,
+        verifySsl: this._verifySsl,
+        rootCaPath: null,
+        debug: false,
       }),
     });
   }
 
-  async list(): Promise<Result<{ identities: AIDInfo[] }>> {
+  async list(): Promise<Result<ListResult>> {
     try {
       const aids = await this._keystore.listIdentities();
       const identities: AIDInfo[] = [];
@@ -401,7 +421,7 @@ export class AIDStore {
     }
   }
 
-  async changeSeed(oldSeed: string, newSeed: string): Promise<Result<{ changed: boolean; count: number }>> {
+  async changeSeed(oldSeed: string, newSeed: string): Promise<Result<ChangeSeedResult>> {
     try {
       const changed = await this._keystore.changeSeed?.(oldSeed, newSeed);
       this._encryptionSeed = String(newSeed ?? '');
@@ -446,7 +466,7 @@ export class AIDStore {
     }
   }
 
-  async resolve(aid: string, opts?: ResolveOpts): Promise<Result<Record<string, unknown>>> {
+  async resolve(aid: string, opts?: ResolveOpts): Promise<Result<ResolveResult>> {
     const target = String(aid ?? '').trim();
     const forceRefresh = !!opts?.forceRefresh;
     const skipAgentMd = !!opts?.skipAgentMd;
@@ -467,20 +487,19 @@ export class AIDStore {
         peer = reloaded.data.aid;
       }
 
-      const source = { certFromCache, cert_from_cache: certFromCache, agentMdFetched: false, agent_md_fetched: false };
+      const source = { cert_from_cache: certFromCache, agent_md_fetched: false };
       if (skipAgentMd) return resultOk({ aid: peer, source });
 
-      const agentMd = await this.fetchAgentMd(target);
+      const agentMd = await this.fetchAgentMd(target, opts?.timeout);
       if (!agentMd.ok) return agentMd as Result<never>;
-      source.agentMdFetched = true;
       source.agent_md_fetched = true;
-      return resultOk({ aid: peer, agentMd: agentMd.data, agent_md: agentMd.data, source });
+      return resultOk({ aid: peer, agent_md: agentMd.data, source });
     } catch (exc) {
       return resultErr(codes.NETWORK_ERROR, String(exc), exc);
     }
   }
 
-  async fetchAgentMd(aid: string): Promise<Result<Record<string, unknown>>> {
+  async fetchAgentMd(aid: string, timeoutMs = 30000): Promise<Result<FetchAgentMdResult>> {
     const target = String(aid ?? '').trim();
     try {
       const gatewayUrl = await this._resolveGateway(target);
@@ -489,10 +508,10 @@ export class AIDStore {
       if (cached.etag) headers['If-None-Match'] = cached.etag;
       if (cached.lastModified) headers['If-Modified-Since'] = cached.lastModified;
 
-      const response = await fetchWithTimeout(agentMdUrl(target, gatewayUrl, this._discoveryPort), {
+      const response = await fetchWithTimeout(agentMdUrl(target, gatewayUrl), {
         method: 'GET',
         headers,
-      }, 30000);
+      }, timeoutMs);
 
       let content = '';
       if (response.status === 304 && cached.content) {
@@ -518,7 +537,7 @@ export class AIDStore {
       const verified = await peer.verifyAgentMd(content);
       if (!verified.ok) return verified as Result<never>;
       const signature = verified.data;
-      const verification: Record<string, string> = { status: signature.status };
+      const verification: { status: string; reason?: string } = { status: signature.status };
       if (signature.reason) verification.reason = signature.reason;
 
       const etag = String(response.headers?.get('ETag') ?? response.headers?.get('etag') ?? cached.etag ?? '').trim();
@@ -528,24 +547,20 @@ export class AIDStore {
         aid: target,
         content,
         verification,
-        signature,
-        certPem: peer.certPem,
         cert_pem: peer.certPem,
         etag,
-        lastModified,
         last_modified: lastModified,
-        status: response.status,
       });
     } catch (exc) {
       return resultErr(codes.NETWORK_ERROR, String(exc), exc);
     }
   }
 
-  async headAgentMd(aid: string): Promise<Result<Record<string, unknown>>> {
+  async headAgentMd(aid: string): Promise<Result<HeadAgentMdResult>> {
     const target = String(aid ?? '').trim();
     try {
       const gatewayUrl = await this._resolveGateway(target);
-      const response = await fetchWithTimeout(agentMdUrl(target, gatewayUrl, this._discoveryPort), {
+      const response = await fetchWithTimeout(agentMdUrl(target, gatewayUrl), {
         method: 'HEAD',
         headers: { Accept: 'text/markdown' },
       }, 15000);
@@ -564,18 +579,15 @@ export class AIDStore {
         aid: target,
         found: true,
         etag,
-        lastModified,
         last_modified: lastModified,
-        contentLength,
         content_length: contentLength,
-        status: response.status,
       });
     } catch (exc) {
       return resultErr(codes.NETWORK_ERROR, String(exc), exc);
     }
   }
 
-  async checkAgentMd(aid: string, ttlDays = 1): Promise<Result<Record<string, unknown>>> {
+  async checkAgentMd(aid: string, ttlDays = 1): Promise<Result<CheckAgentMdResult>> {
     const target = String(aid ?? '').trim();
     const cached = this._agentMdCache.get(target) ?? {};
     const head = await this.headAgentMd(target);
@@ -597,24 +609,16 @@ export class AIDStore {
     const needsUpdate = remoteFound && (!localFound || (!!remoteEtag && remoteEtag !== localEtag));
     return resultOk({
       aid: target,
-      localFound,
       local_found: localFound,
-      remoteFound,
       remote_found: remoteFound,
-      localEtag,
       local_etag: localEtag,
-      remoteEtag,
       remote_etag: remoteEtag,
-      lastModified: String(remote.lastModified ?? remote.last_modified ?? ''),
-      last_modified: String(remote.last_modified ?? remote.lastModified ?? ''),
-      needsUpdate,
       needs_update: needsUpdate,
-      ttlDays,
       ttl_days: ttlDays,
     });
   }
 
-  async diagnose(aid: string): Promise<Result<Record<string, unknown>>> {
+  async diagnose(aid: string): Promise<Result<DiagnoseResult>> {
     const target = String(aid ?? '').trim();
     const loaded = await this.load(target);
     const remote = await this.exists(target);
@@ -649,7 +653,7 @@ export class AIDStore {
     });
   }
 
-  async renewCert(aid: string): Promise<Result<Record<string, unknown>>> {
+  async renewCert(aid: string): Promise<Result<RenewCertResult>> {
     const target = String(aid ?? '').trim();
     const loaded = await this.load(target);
     if (!loaded.ok || !loaded.data.aid.isPrivateKeyValid()) {
@@ -683,8 +687,8 @@ export class AIDStore {
       const refreshed = await this.load(target);
       if (!refreshed.ok) return resultErr(codes.CERT_RENEWAL_FAILED, 'renewed certificate reload failed');
       return resultOk({
-        renewed: true,
-        newFingerprint: refreshed.data.aid.certFingerprint,
+        renewed: true as const,
+        new_cert_not_after: refreshed.data.aid.certNotAfter,
         new_fingerprint: refreshed.data.aid.certFingerprint,
       });
     } catch (exc) {
@@ -692,7 +696,7 @@ export class AIDStore {
     }
   }
 
-  async rekey(aid: string): Promise<Result<Record<string, unknown>>> {
+  async rekey(aid: string): Promise<Result<RekeyResult>> {
     const target = String(aid ?? '').trim();
     const loaded = await this.load(target);
     if (!loaded.ok || !loaded.data.aid.isPrivateKeyValid()) {
@@ -736,8 +740,8 @@ export class AIDStore {
       const refreshed = await this.load(target);
       if (!refreshed.ok) return resultErr(codes.REKEY_FAILED, 'rekeyed identity reload failed');
       return resultOk({
-        rekeyed: true,
-        newFingerprint: refreshed.data.aid.certFingerprint,
+        rekeyed: true as const,
+        new_cert_not_after: refreshed.data.aid.certNotAfter,
         new_fingerprint: refreshed.data.aid.certFingerprint,
       });
     } catch (exc) {
@@ -757,7 +761,7 @@ export class AIDStore {
       return persisted;
     }
 
-    const port = this._discoveryPort ? `:${this._discoveryPort}` : '';
+    const port = '';
     const candidates = [
       `https://${target}${port}/.well-known/aun-gateway`,
       `https://gateway.${issuerDomain}${port}/.well-known/aun-gateway`,

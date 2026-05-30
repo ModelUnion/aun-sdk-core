@@ -15,13 +15,11 @@ import (
 func ensureFederationReconnectConnected(t *testing.T, client *AUNClient, aid string) string {
 	t.Helper()
 	integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
-	integrationConnectLoadedAID(t, client, aid, &ConnectOptions{
-		AutoReconnect:     true,
-		HeartbeatInterval: 3,
-		Retry: &RetryConfig{
-			InitialDelay: 1,
-			MaxDelay:     5,
-		},
+	integrationConnectLoadedAID(t, client, aid, &ConnectionOptions{
+		AutoReconnect:     boolPtr(true),
+		HeartbeatInterval: 3 * time.Second,
+		RetryInitialDelay: 1 * time.Second,
+		RetryMaxDelay:     5 * time.Second,
 	})
 	return aid
 }
@@ -129,7 +127,7 @@ func TestFederationReconnectAfterRemoteGatewayRestart(t *testing.T) {
 	var bobStatesMu sync.Mutex
 	var bobStates []string
 
-	bobSub := bob.On("connection.state", func(payload any) {
+	bobSub := bob.On("state_change", func(payload any) {
 		data, ok := payload.(map[string]any)
 		if !ok {
 			return

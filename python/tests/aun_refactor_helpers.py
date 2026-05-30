@@ -24,7 +24,9 @@ def make_client_for_path(
 ) -> AUNClient:
     if "gateway" in config_overrides or "gateway_url" in config_overrides:
         raise TypeError("gateway must be discovered and cannot be supplied to make_client_for_path")
-    client = AUNClient(debug=debug, protected_headers=protected_headers)
+    client = AUNClient()
+    if protected_headers:
+        client.set_protected_headers(protected_headers)
     overrides = dict(config_overrides)
     overrides["aun_path"] = str(aun_path)
     options = {
@@ -83,16 +85,13 @@ def _store_for_client(client: AUNClient) -> AIDStore:
             aun_path=str(store_options.get("aun_path") or client.config.get("aun_path")),
             encryption_seed=str(store_options.get("encryption_seed") or ""),
             verify_ssl=bool(store_options.get("verify_ssl", False)),
-            discovery_port=store_options.get("discovery_port"),
             root_ca_path=store_options.get("root_ca_path"),
-            debug=False,
         )
         _import_configured_root_ca(store, store_options.get("root_ca_path"))
         return store
     return AIDStore(
         aun_path=str(client.aun_path or client.config.get("aun_path")),
         encryption_seed=str(client.config.get("seed_password") or ""),
-        debug=False,
     )
 
 

@@ -255,9 +255,9 @@ func TestTokenGatewayReuseIntegration_ReusedCachedConnects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("第二次 Authenticate 失败: %v", err)
 	}
-	if err := client2.Connect(ctx2, &ConnectOptions{
-		AutoReconnect:     false,
-		HeartbeatInterval: 30,
+	if err := client2.Connect(ctx2, ConnectionOptions{
+		AutoReconnect:     boolPtr(false),
+		HeartbeatInterval: 30 * time.Second,
 	}); err != nil {
 		t.Fatalf("Connect 失败: %v", err)
 	}

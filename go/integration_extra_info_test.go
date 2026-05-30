@@ -42,9 +42,9 @@ func TestExtraInfo_KickCarriesBothInfos(t *testing.T) {
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
 	integrationLoadAIDIntoClient(t, c1, aid)
-	if err := c1.Connect(ctx1, &ConnectOptions{
-		AutoReconnect:     false,
-		HeartbeatInterval: 30,
+	if err := c1.Connect(ctx1, ConnectionOptions{
+		AutoReconnect:     boolPtr(false),
+		HeartbeatInterval: 30 * time.Second,
 		ConnectionKind:    "long",
 		SlotID:            "extra-slot",
 		ExtraInfo:         map[string]any{"pid": "1111"},
@@ -63,9 +63,9 @@ func TestExtraInfo_KickCarriesBothInfos(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
 	integrationLoadAIDIntoClient(t, c2, aid)
-	if err := c2.Connect(ctx2, &ConnectOptions{
-		AutoReconnect:     false,
-		HeartbeatInterval: 30,
+	if err := c2.Connect(ctx2, ConnectionOptions{
+		AutoReconnect:     boolPtr(false),
+		HeartbeatInterval: 30 * time.Second,
 		ConnectionKind:    "long",
 		SlotID:            "extra-slot",
 		ExtraInfo:         map[string]any{"pid": "2222"},
@@ -132,9 +132,9 @@ func TestExtraInfo_EmptyWhenNotProvided(t *testing.T) {
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
 	integrationLoadAIDIntoClient(t, c1, aid)
-	if err := c1.Connect(ctx1, &ConnectOptions{
-		AutoReconnect:     false,
-		HeartbeatInterval: 30,
+	if err := c1.Connect(ctx1, ConnectionOptions{
+		AutoReconnect:     boolPtr(false),
+		HeartbeatInterval: 30 * time.Second,
 		ConnectionKind:    "long",
 		SlotID:            "no-extra-slot",
 	}); err != nil {
@@ -151,9 +151,9 @@ func TestExtraInfo_EmptyWhenNotProvided(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
 	integrationLoadAIDIntoClient(t, c2, aid)
-	if err := c2.Connect(ctx2, &ConnectOptions{
-		AutoReconnect:     false,
-		HeartbeatInterval: 30,
+	if err := c2.Connect(ctx2, ConnectionOptions{
+		AutoReconnect:     boolPtr(false),
+		HeartbeatInterval: 30 * time.Second,
 		ConnectionKind:    "long",
 		SlotID:            "no-extra-slot",
 	}); err != nil {

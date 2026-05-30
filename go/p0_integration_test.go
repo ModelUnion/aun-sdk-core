@@ -50,9 +50,9 @@ func TestP0Integration_02_CreateDuplicateAID(t *testing.T) {
 	// 首次创建 — 应成功
 	ctx := context.Background()
 	store1 := integrationStoreForPath(t, c1.configModel.AUNPath)
-	err := store1.Register(ctx, aid)
-	if err != nil {
-		t.Skipf("Docker 环境不可用: %v", err)
+	r1 := store1.Register(ctx, aid)
+	if !r1.Ok {
+		t.Skipf("Docker 环境不可用: %v", r1.Error.Message)
 	}
 
 	// 第二次用新客户端创建同一 AID — 应报错或幂等
@@ -60,10 +60,10 @@ func TestP0Integration_02_CreateDuplicateAID(t *testing.T) {
 	defer func() { _ = c2.Close() }()
 
 	store2 := integrationStoreForPath(t, c2.configModel.AUNPath)
-	err = store2.Register(ctx, aid)
+	r2 := store2.Register(ctx, aid)
 	// 不管是报错还是幂等成功，记录行为
-	if err != nil {
-		t.Logf("重复 AID 创建正确返回错误: %v", err)
+	if !r2.Ok {
+		t.Logf("重复 AID 创建正确返回错误: %v", r2.Error.Message)
 	} else {
 		t.Logf("重复 AID 创建无报错（幂等设计）")
 	}

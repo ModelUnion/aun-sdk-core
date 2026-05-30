@@ -36,7 +36,7 @@ describe('AUNClient 构造', () => {
   });
 
   it('自定义配置应正确传递', () => {
-    const client = new AUNClient({
+    const client = new (AUNClient as any)({
       aunPath: 'custom',
       seedPassword: 'seed-001',
     });
@@ -48,7 +48,7 @@ describe('AUNClient 构造', () => {
 
   it('verify_ssl=false 应记录警告但不抛错（浏览器环境）', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const client = new AUNClient({ verify_ssl: false });
+    const client = new (AUNClient as any)({ verify_ssl: false });
     // 浏览器环境不支持跳过 SSL，verifySsl 始终为 true
     expect(client.configModel.verifySsl).toBe(true);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('verify_ssl'));
@@ -82,13 +82,13 @@ describe('AUNClient 初始状态', () => {
 describe('AUNClient.connect 参数校验', () => {
   it('未加载 AID 时抛 StateError', async () => {
     const client = new AUNClient();
-    await expect(client.connect({ gateway: 'wss://localhost/aun' }))
+    await expect(client.connect({ gateway: 'wss://localhost/aun' } as any))
       .rejects.toThrow(StateError);
   });
 
   it('不接受旧版 access_token 参数', async () => {
     const client = new AUNClient();
-    await expect(client.connect({ access_token: 'token-123' }))
+    await expect(client.connect({ access_token: 'token-123' } as any))
       .rejects.toThrow(ValidationError);
   });
 
@@ -281,7 +281,7 @@ describe('AUNClient.disconnect', () => {
 
     await client.connect({
       gateway: 'ws://gateway.example.com/aun',
-    });
+    } as any);
 
     expect((client as any)._connectOnce).toHaveBeenCalledTimes(1);
   });
@@ -370,7 +370,7 @@ describe('AUNClient message.send 接收者校验', () => {
       to: 'bob.example.com',
       payload: { type: 'text', text: 'hello' },
       encrypt: false,
-      protected_headers: protectedHeaders,
+      protected_headers: protectedHeaders as unknown as import('../../src/types.js').JsonValue,
       headers: { device_id: 'dev-b' },
     });
 
@@ -1266,7 +1266,7 @@ describe('AUNClient V2 e2ee payload_type 元数据', () => {
 });
 describe('AUNClient agent.md ETag 缓存与透传', () => {
   let agentMdCounter = 0;
-  const makeAgentClient = (): AUNClient => new AUNClient({ aunPath: `aun-agent-md-${++agentMdCounter}` });
+  const makeAgentClient = (): AUNClient => new (AUNClient as any)({ aunPath: `aun-agent-md-${++agentMdCounter}` });
   const agentRoot = (client: AUNClient): string => (client as any)._agentMdPath as string;
   const agentEtag = (content: string): string => `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
   const readAgentStorage = async (client: AUNClient, key: string): Promise<any> => {

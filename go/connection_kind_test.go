@@ -341,7 +341,7 @@ func TestConnectionKind_NoReconnectOn4012And4013(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(1)
 		var capturedState ConnectionState
-		unsub := c.events.Subscribe("connection.state", func(payload any) {
+		unsub := c.events.Subscribe("state_change", func(payload any) {
 			data, _ := payload.(map[string]any)
 			if s, ok := data["state"].(string); ok && s == string(ConnStateConnectionFailed) {
 				capturedState = ConnStateConnectionFailed

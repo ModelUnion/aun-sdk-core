@@ -18,15 +18,30 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { AUNClient } from '../../src/client.js';
+import { AID } from '../../src/aid.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
+function makeMockAid(aunPath: string): AID {
+  return {
+    aid: 'test.aid.com', aunPath, certPem: '', publicKey: '', certSubject: '',
+    certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
+    verifySsl: true, rootCaPath: null, debug: false,
+    isCertValid: () => true, isPrivateKeyValid: () => true,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+  } as unknown as AID;
+}
+
 function setupClient(): AUNClient {
   const aunPath = mkdtempSync(join(tmpdir(), 'aun-token-gw-reuse-'));
-  return new AUNClient({ aun_path: aunPath });
+  return new AUNClient(makeMockAid(aunPath));
 }
 
 function setupClientWithAid(aid: string): AUNClient {
@@ -34,7 +49,7 @@ function setupClientWithAid(aid: string): AUNClient {
   // 建立 AID 目录，让 _persistGatewayUrl 能写入
   const safe = aid.replace(/[\/\\:]/g, '_');
   mkdirSync(join(aunPath, 'AIDs', safe), { recursive: true });
-  return new AUNClient({ aun_path: aunPath });
+  return new AUNClient(makeMockAid(aunPath));
 }
 
 function loadGatewayMetadata(client: AUNClient, aid: string): string {
