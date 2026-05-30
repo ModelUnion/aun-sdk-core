@@ -29,7 +29,7 @@ function clientEncryptionSeed(client: AUNClient): string {
   );
 }
 
-export function createAIDStoreForClient(client: AUNClient): AIDStore {
+export function createAIDStoreForClient(client: AUNClient, slotId?: string): AIDStore {
   const model = (client as any)._configModel ?? {};
   return new AIDStore({
     aunPath: clientAunPath(client),
@@ -37,6 +37,7 @@ export function createAIDStoreForClient(client: AUNClient): AIDStore {
     verifySsl: Boolean(model.verifySsl ?? false),
     discoveryPort: model.discoveryPort ?? null,
     rootCaPath: model.rootCaPath ?? null,
+    ...(slotId ? { slotId } : {}),
   });
 }
 
@@ -48,8 +49,8 @@ export async function registerIdentity(client: AUNClient, aid: string): Promise<
   }
 }
 
-export async function registerAndLoadIdentity(client: AUNClient, aid: string): Promise<AID> {
-  const store = createAIDStoreForClient(client);
+export async function registerAndLoadIdentity(client: AUNClient, aid: string, slotId?: string): Promise<AID> {
+  const store = createAIDStoreForClient(client, slotId);
   const registered = await store.register(aid);
   if (!registered.ok) {
     const existing = store.load(aid);
@@ -59,11 +60,11 @@ export async function registerAndLoadIdentity(client: AUNClient, aid: string): P
     }
     throw new Error(`${registered.error.code}: ${registered.error.message}`);
   }
-  return loadIdentityFromStore(client, aid);
+  return loadIdentityFromStore(client, aid, slotId);
 }
 
-export function loadIdentityFromStore(client: AUNClient, aid: string): AID {
-  const store = createAIDStoreForClient(client);
+export function loadIdentityFromStore(client: AUNClient, aid: string, slotId?: string): AID {
+  const store = createAIDStoreForClient(client, slotId);
   const loaded = store.load(aid);
   if (!loaded.ok || !loaded.data) {
     throw new Error(`load identity failed for ${aid}`);

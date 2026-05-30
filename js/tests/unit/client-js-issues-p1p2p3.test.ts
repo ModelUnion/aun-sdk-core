@@ -210,17 +210,9 @@ describe('ISSUE-SDK-JS-008: _gapFillActive 来源标记', () => {
 describe('ISSUE-SDK-JS-004: verify_ssl=false 浏览器兼容', () => {
   it('verify_ssl=false 应记录警告但不抛错', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    // 浏览器 SDK 中 verify_ssl=false 应发出警告而非直接抛错
-    // 注：当前实现直接抛错，修复后应改为仅警告
-    let errorThrown = false;
-    try {
-      new AUNClient({ verify_ssl: false } as any);
-    } catch {
-      errorThrown = true;
-    }
-    // 修复后应不抛错
-    expect(errorThrown).toBe(false);
-    // 应有警告日志
+    // 浏览器 SDK 中 verify_ssl=false 在 AIDStore 构造时应发出警告而非抛错
+    const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '', verifySsl: false });
+    expect((store as any)._verifySsl).toBe(true);
     const warningFound = warnSpy.mock.calls.some(
       c => typeof c[0] === 'string' && c[0].includes('verify_ssl')
     );

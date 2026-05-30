@@ -66,3 +66,8 @@ class ConnectionOptions(TypedDict, total=False):
     retry_max_attempts: int       # 最大重试次数，0=无限，默认 0
     heartbeat_interval: float     # 心跳间隔（秒），默认 30
     call_timeout: float           # RPC 调用超时（秒），默认 35
+    connection_kind: str          # 连接类型：'long'（默认）或 'short'
+    short_ttl_ms: int             # short 连接的 TTL（毫秒），仅 connection_kind='short' 时有效
+    extra_info: dict              # 附加信息，透传给 gateway
+    delivery_mode: dict           # 消息投递模式配置，含 mode（fanout/queue）
+    background_sync: bool         # 是否启用后台同步，默认 True

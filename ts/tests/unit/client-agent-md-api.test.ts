@@ -18,7 +18,7 @@ function makeMockAid(aunPath: string): AID {
     certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
     certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
     verifySsl: true, rootCaPath: null, debug: false,
-    isCertValid: () => true, isPrivateKeyValid: () => true,
+    isCertValid: () => true, isPrivateKeyValid: () => false,
     sign: () => ({ ok: true, data: { signature: '' } }),
     verify: () => ({ ok: true, data: { valid: true } }),
     signAgentMd: () => ({ ok: true, data: { signed: '' } }),

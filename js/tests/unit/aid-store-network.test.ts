@@ -142,7 +142,7 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
     const resolved = await store.resolve(aid, { forceRefresh: true });
     expect(resolved.ok).toBe(true);
     expect(resolved.ok && (resolved.data.agent_md as any).verification.status).toBe('verified');
-    expect(resolved.ok && (resolved.data.source as any).certFromCache).toBe(false);
+    expect(resolved.ok && (resolved.data.source as any).cert_from_cache).toBe(false);
 
     const fetched = await store.fetchAgentMd(aid);
     expect(fetched.ok && (fetched.data.verification as any).status).toBe('verified');

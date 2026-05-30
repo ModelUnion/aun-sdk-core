@@ -8,6 +8,24 @@
 
 ---
 
+## 0.4.3 — 2026-05-31
+
+### Added
+- **`NormalizeSlotID` / `SlotIsolationKey`**：新增 slot_id 校验与隔离键提取工具函数，支持 `/` `:` 空格作为分隔符（首字符不允许）。
+- **`AUNLogger.Debug()`**：新增方法，返回 logger 当前 debug 开关状态。
+- **`RPCTransport.SetVerifySSL` / `SetDnsNet`**：新增 setter，支持在未连接状态下动态更新 TLS 校验开关和 DNS 容灾网络层。
+- **`NewAUNClient(aid)` 重构**：统一构造入口，`aid=nil` 等价于 `NewAUNClientEmpty()`；内部新增 `newClientForStore` 供 `AIDStore` 注入无身份客户端。
+- **`CacheDiscoveredGatewayURL`**：新增公开方法，供 `namespace/auth` 层缓存 discovery 得到的 Gateway URL。
+- **`buildSessionOptions`**：新增内部方法，统一合并 session 级参数（`connection_kind` / `short_ttl_ms` / `extra_info` / `delivery_mode` / `background_sync`）。
+- **`rebuildRuntimeForIdentity`**：加载新 AID 时若 `aun_path` / `verify_ssl` 发生变化，自动重建 logger / keystore / dnsNet / discovery / auth 运行时组件。
+- **keystore `columnExists`**：新增辅助函数，支持 schema 迁移时安全检测列是否存在。
+
+### Changed
+- **`ConnectOptions.DeliveryMode`**：注释更新，明确 fanout/queue 语义由后端配置决定；移除 `QueueRouting` / `AffinityTtlMs` 便捷字段（统一走 `DeliveryMode` map）。
+- **`background_sync` 传参方式**：改为从 `sessionOptions` 读取，不再直接从 `opts.BackgroundSync` 注入，与 Python SDK 对齐。
+
+---
+
 ## 0.4.2 — 2026-05-30
 
 ### Added

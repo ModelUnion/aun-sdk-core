@@ -6,7 +6,7 @@ import { AuthFlow } from './auth.js';
 import { GatewayDiscovery } from './discovery.js';
 import { IdentityConflictError, ValidationError } from './errors.js';
 import { IndexedDBKeyStore } from './keystore/indexeddb.js';
-import { getDeviceId, normalizeInstanceId } from './config.js';
+import { getDeviceId, normalizeInstanceId, normalizeSlotId } from './config.js';
 import type { IdentityRecord, JsonObject } from './types.js';
 import { resultErr, resultOk, type Result } from './result.js';
 
@@ -202,11 +202,6 @@ function parseCertCN(certPem: string): string | null {
   }
 }
 
-function normalizeSlotId(slotId?: string): string {
-  const value = String(slotId ?? 'default').trim();
-  return value || 'default';
-}
-
 function issuerFromAid(aid: string): string {
   const target = String(aid ?? '').trim();
   const dotIdx = target.indexOf('.');
@@ -287,7 +282,10 @@ export class AIDStore {
       ? normalizeInstanceId(opts.deviceId, 'deviceId', { allowEmpty: true })
       : getDeviceId();
     this.slotId = normalizeSlotId(opts.slotId);
-    this._verifySsl = opts.verifySsl ?? true;
+    if (opts.verifySsl === false) {
+      console.warn('[aun_core.config] verify_ssl=false 在浏览器环境中不受支持，SSL 证书验证将保持启用。');
+    }
+    this._verifySsl = opts.verifySsl === false ? true : (opts.verifySsl ?? true);
     this._keystore = new IndexedDBKeyStore({ encryptionSeed: this._encryptionSeed || undefined });
     this._crypto = new CryptoProvider();
     this._discovery = new GatewayDiscovery();

@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 if TYPE_CHECKING:
     from ..logger import AUNLogger, NullLogger
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5000
 
 
@@ -129,6 +129,7 @@ _DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS instance_state (
         device_id TEXT NOT NULL,
         slot_id TEXT NOT NULL DEFAULT '_singleton',
+        slot_id_full TEXT NOT NULL DEFAULT '',
         data TEXT NOT NULL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (device_id, slot_id)
@@ -136,6 +137,7 @@ _DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS seq_tracker (
         device_id TEXT NOT NULL,
         slot_id TEXT NOT NULL DEFAULT '_singleton',
+        slot_id_full TEXT NOT NULL DEFAULT '',
         namespace TEXT NOT NULL,
         contiguous_seq INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL,
@@ -357,7 +359,7 @@ class AIDDatabase:
         for ddl in _DDL_STATEMENTS:
             conn.execute(ddl)
         self._migrate_legacy_columns(conn)
-        # 初始化 schema version
+        # 初始化或迁移 schema version
         cur = conn.execute("SELECT version FROM _schema_version WHERE id = 1")
         row = cur.fetchone()
         if row is None:
@@ -365,7 +367,23 @@ class AIDDatabase:
                 "INSERT INTO _schema_version (id, version) VALUES (1, ?)",
                 (_SCHEMA_VERSION,),
             )
+        else:
+            ver = int(row[0])
+            if ver < _SCHEMA_VERSION:
+                self._migrate_schema(conn, ver, _SCHEMA_VERSION)
+                conn.execute("UPDATE _schema_version SET version = ? WHERE id = 1", (_SCHEMA_VERSION,))
         conn.commit()
+
+    @staticmethod
+    def _migrate_schema(conn: Any, from_ver: int, to_ver: int) -> None:
+        for v in range(from_ver, to_ver):
+            if v == 1:
+                # v1 → v2：instance_state / seq_tracker 加 slot_id_full 列
+                for stmt in (
+                    "ALTER TABLE instance_state ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE seq_tracker ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''",
+                ):
+                    conn.execute(stmt)
 
     def _migrate_legacy_columns(self, conn: Any) -> None:
         self._rename_column_if_exists(conn, "prekeys", "private_key_pem", "private_key_enc")
@@ -1359,15 +1377,17 @@ class AIDDatabase:
     def save_instance_state(
         self, device_id: str, slot_id: str, state: dict[str, Any]
     ) -> None:
+        from ..config import slot_isolation_key
         def _do():
             conn = self._get_conn()
             now = _now_ms()
-            slot = slot_id or "_singleton"
+            slot_key = slot_isolation_key(slot_id) if slot_id else "_singleton"
+            slot_full = slot_id or ""
             data_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
             conn.execute(
-                "INSERT INTO instance_state (device_id, slot_id, data, updated_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(device_id, slot_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-                (device_id, slot, data_json, now),
+                "INSERT INTO instance_state (device_id, slot_id, slot_id_full, data, updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id, slot_id) DO UPDATE SET slot_id_full = excluded.slot_id_full, data = excluded.data, updated_at = excluded.updated_at",
+                (device_id, slot_key, slot_full, data_json, now),
             )
             conn.commit()
         self._retry_on_locked(_do)
@@ -1375,11 +1395,12 @@ class AIDDatabase:
     def load_instance_state(
         self, device_id: str, slot_id: str = ""
     ) -> dict[str, Any] | None:
+        from ..config import slot_isolation_key
         conn = self._get_conn()
-        slot = slot_id or "_singleton"
+        slot_key = slot_isolation_key(slot_id) if slot_id else "_singleton"
         cur = conn.execute(
             "SELECT data, updated_at FROM instance_state WHERE device_id = ? AND slot_id = ?",
-            (device_id, slot),
+            (device_id, slot_key),
         )
         row = cur.fetchone()
         if row is None:
@@ -1389,45 +1410,50 @@ class AIDDatabase:
     # ── Seq Tracker ─────────────────────────────────────────
 
     def save_seq(self, device_id: str, slot_id: str, namespace: str, contiguous_seq: int) -> None:
+        from ..config import slot_isolation_key
         def _do():
             conn = self._get_conn()
             now = _now_ms()
-            slot = slot_id or "_singleton"
+            slot_key = slot_isolation_key(slot_id) if slot_id else "_singleton"
+            slot_full = slot_id or ""
             conn.execute(
-                "INSERT INTO seq_tracker (device_id, slot_id, namespace, contiguous_seq, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id, slot_id, namespace) "
-                "DO UPDATE SET contiguous_seq = excluded.contiguous_seq, updated_at = excluded.updated_at",
-                (device_id, slot, namespace, contiguous_seq, now),
+                "INSERT INTO seq_tracker (device_id, slot_id, slot_id_full, namespace, contiguous_seq, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(device_id, slot_id, namespace) "
+                "DO UPDATE SET slot_id_full = excluded.slot_id_full, contiguous_seq = excluded.contiguous_seq, updated_at = excluded.updated_at",
+                (device_id, slot_key, slot_full, namespace, contiguous_seq, now),
             )
             conn.commit()
         self._retry_on_locked(_do)
 
     def load_seq(self, device_id: str, slot_id: str, namespace: str) -> int:
+        from ..config import slot_isolation_key
         conn = self._get_conn()
-        slot = slot_id or "_singleton"
+        slot_key = slot_isolation_key(slot_id) if slot_id else "_singleton"
         cur = conn.execute(
             "SELECT contiguous_seq FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?",
-            (device_id, slot, namespace),
+            (device_id, slot_key, namespace),
         )
         row = cur.fetchone()
         return int(row[0]) if row else 0
 
     def load_all_seqs(self, device_id: str, slot_id: str) -> dict[str, int]:
+        from ..config import slot_isolation_key
         conn = self._get_conn()
-        slot = slot_id or "_singleton"
+        slot_key = slot_isolation_key(slot_id) if slot_id else "_singleton"
         cur = conn.execute(
             "SELECT namespace, contiguous_seq FROM seq_tracker WHERE device_id = ? AND slot_id = ?",
-            (device_id, slot),
+            (device_id, slot_key),
         )
         return {row[0]: int(row[1]) for row in cur.fetchall()}
 
     def delete_seq(self, device_id: str, slot_id: str, namespace: str) -> None:
+        from ..config import slot_isolation_key
         def _do():
             conn = self._get_conn()
-            slot = slot_id or "_singleton"
+            slot_key = slot_isolation_key(slot_id) if slot_id else "_singleton"
             conn.execute(
                 "DELETE FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?",
-                (device_id, slot, namespace),
+                (device_id, slot_key, namespace),
             )
             conn.commit()
         self._retry_on_locked(_do)

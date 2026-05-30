@@ -106,15 +106,13 @@ func TestFix03_SetProtectedHeadersFiltersInvalidKeys(t *testing.T) {
 }
 
 func TestFix03_OptionsProtectedHeadersInitialized(t *testing.T) {
-	c := NewAUNClient(nil, AUNClientOptions{
-		AUNPath:          t.TempDir(),
-		ProtectedHeaders: map[string]any{"x-init": "from-options"},
-	})
+	c := NewAUNClientEmpty()
 	defer c.Close()
+	c.SetProtectedHeaders(map[string]string{"x-init": "from-options"})
 
 	got := c.GetProtectedHeaders()
 	if got["x-init"] != "from-options" {
-		t.Fatalf("options.ProtectedHeaders 应在构造时初始化: %v", got)
+		t.Fatalf("SetProtectedHeaders 应正确初始化: %v", got)
 	}
 }
 
@@ -190,6 +188,8 @@ func TestFix05_LoadIdentityResetsState(t *testing.T) {
 	if err := c.LoadIdentity(aid); err != nil {
 		t.Fatalf("LoadIdentity 失败: %v", err)
 	}
+	defer func() { _ = c.Close() }() // 确保 rebuildRuntimeForIdentity 创建的资源被释放
+
 	if !c.HasIdentity() {
 		t.Fatal("LoadIdentity 后 HasIdentity 应为 true")
 	}

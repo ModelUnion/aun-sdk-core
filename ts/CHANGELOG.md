@@ -6,6 +6,18 @@
 
 ---
 
+## 0.4.3 — 2026-05-31
+
+### Added
+- **`normalizeSlotId` / `slotIsolationKey`**：新增 slot_id 校验与隔离键提取工具函数，支持 `/` `:` 空格作为分隔符（首字符不允许）。
+- **keystore schema 迁移至 v2**：`instance_state` / `seq_tracker` 表新增 `slot_id_full` 列，保存完整 slot_id（隔离键仅用于索引）；首次启动自动 `ALTER TABLE` 升级。
+
+### Changed
+- **slot_id 存储策略**：keystore 读写统一使用 `slotIsolationKey` 作为索引键，`slot_id_full` 保存原始完整值，与 Python / Go SDK 对齐。
+- **`AUNClient` 构造**：传入 `aid` 参数时增加类型守卫（检查 `aunPath` 字段与 `isPrivateKeyValid` 方法），避免误传非 AID 对象。
+
+---
+
 ## 0.4.2 — 2026-05-30
 
 ### Added

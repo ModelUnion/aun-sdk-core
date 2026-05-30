@@ -30,7 +30,7 @@ function makeMockAid(aunPath: string, extra?: Partial<AID>): AID {
     rootCaPath: null,
     debug: false,
     isCertValid: () => true,
-    isPrivateKeyValid: () => true,
+    isPrivateKeyValid: () => false,
     sign: () => ({ ok: true, data: { signature: '' } }),
     verify: () => ({ ok: true, data: { valid: true } }),
     signAgentMd: () => ({ ok: true, data: { signed: '' } }),
@@ -445,6 +445,8 @@ describe('AUNClient.connect V2 session 初始化', () => {
     (client as any)._state = 'standby';
     (client as any)._transport.connect = vi.fn().mockResolvedValue({ nonce: 'challenge' });
     (client as any)._auth.connectSession = vi.fn().mockResolvedValue({ token: 'tok-1', identity: { aid: 'alice.agentid.pub' }, hello: {} });
+    (client as any)._auth.authenticate = vi.fn().mockResolvedValue({ access_token: 'tok-1', gateway_url: 'ws://gateway.example.com/aun' });
+    (client as any)._gatewayUrl = 'ws://gateway.example.com/aun';
     (client as any)._startBackgroundTasks = vi.fn();
     const initV2Spy = vi.spyOn(client as any, '_initV2Session').mockResolvedValue(undefined);
 
@@ -502,7 +504,7 @@ describe('AUNClient M25 重连行为', () => {
 
       expect((client as any)._connectOnce).toHaveBeenCalledTimes(2);
       expect(client.state).toBe('connection_failed');
-      expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
+      expect(publish).toHaveBeenCalledWith('state_change', expect.objectContaining({
         state: 'connection_failed',
         reason: 'max_attempts_exhausted',
         attempt: 2,
@@ -1023,7 +1025,7 @@ describe('R1: health-fail 路径 max_attempts 检查', () => {
 
       // health-fail 路径应计入 attempt，3 次后应终止
       expect(client.state).toBe('connection_failed');
-      expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
+      expect(publish).toHaveBeenCalledWith('state_change', expect.objectContaining({
         state: 'connection_failed',
         reason: 'max_attempts_exhausted',
       }));

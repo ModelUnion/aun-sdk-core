@@ -20,7 +20,18 @@ async function etag(content: string): Promise<string> {
 }
 
 function makeClient(): AUNClient {
-  return new (AUNClient as any)({ aun_path: '/tmp/aun-js-agent-md' });
+  const mockAid = {
+    aid: 'test.aid.com', aunPath: '/tmp/aun-js-agent-md', certPem: '', publicKey: '',
+    certSubject: '', certNotBefore: new Date(), certNotAfter: new Date(Date.now() + 86400000),
+    certIssuer: '', certFingerprint: '', deviceId: 'default', slotId: 'default',
+    verifySsl: true, rootCaPath: null, debug: false,
+    isCertValid: () => true, isPrivateKeyValid: () => false,
+    sign: () => ({ ok: true, data: { signature: '' } }),
+    verify: () => ({ ok: true, data: { valid: true } }),
+    signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+    verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+  } as any;
+  return new AUNClient(mockAid);
 }
 
 function agentRoot(client: AUNClient): string {

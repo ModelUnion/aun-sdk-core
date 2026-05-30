@@ -154,6 +154,12 @@ func (t *RPCTransport) SetTimeout(timeout time.Duration) {
 	t.timeout.Store(int64(timeout))
 }
 
+// SetVerifySSL 更新 TLS 校验开关（仅在未连接状态调用）。
+func (t *RPCTransport) SetVerifySSL(v bool) { t.verifySSL = v }
+
+// SetDnsNet 更新 DNS 容灾网络层（仅在未连接状态调用）。
+func (t *RPCTransport) SetDnsNet(n *DnsResilientNet) { t.dnsNet = n }
+
 // SetMetaObserver 注册 RPC envelope _meta 字段观察者；observer(meta) 在每次成功 RPC 时调用。
 //
 // Gateway 注入的 _meta 与业务无关（如 agent_md_etag），observer panic 会被 recover 吞掉，

@@ -2,7 +2,7 @@
 
 import { pemToArrayBuffer } from '../crypto.js';
 import type { ModuleLogger } from '../logger.js';
-import { normalizeInstanceId } from '../config.js';
+import { normalizeInstanceId, slotIsolationKey } from '../config.js';
 import type { AgentMdCacheRecord, AgentMdCacheUpsert, KeyStore, GroupStateRecord } from './index.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
@@ -206,8 +206,8 @@ function certStoreKey(aid: string, certFingerprint?: string): string {
 
 function instanceStateStoreKey(aid: string, deviceId: string, slotId = ''): string {
   const normalizedDevice = normalizeInstanceId(deviceId, 'device_id');
-  const normalizedSlot = normalizeInstanceId(slotId, 'slot_id', { allowEmpty: true }) || '_singleton';
-  return `${safeAid(aid)}|${encodePart(normalizedDevice)}|${encodePart(normalizedSlot)}`;
+  const slotKey = slotIsolationKey(slotId) || '_singleton';
+  return `${safeAid(aid)}|${encodePart(normalizedDevice)}|${encodePart(slotKey)}`;
 }
 
 function prekeyPrefix(aid: string): string {
@@ -250,8 +250,8 @@ function sessionStoreKey(aid: string, sessionId: string): string {
 
 function seqTrackerPrefix(aid: string, deviceId: string, slotId: string): string {
   const normalizedDevice = normalizeInstanceId(deviceId, 'device_id');
-  const normalizedSlot = normalizeInstanceId(slotId, 'slot_id', { allowEmpty: true }) || '_singleton';
-  return `_seq_|${safeAid(aid)}|${encodePart(normalizedDevice)}|${encodePart(normalizedSlot)}|`;
+  const slotKey = slotIsolationKey(slotId) || '_singleton';
+  return `_seq_|${safeAid(aid)}|${encodePart(normalizedDevice)}|${encodePart(slotKey)}|`;
 }
 
 function seqTrackerStoreKey(aid: string, deviceId: string, slotId: string, namespace: string): string {

@@ -71,11 +71,11 @@ describe('gateway.disconnect detail 透传', () => {
     expect(received[0].detail).toEqual({});
   });
 
-  // 3. 连接进入 terminal_failed 时 connection.state 事件也应带服务端 detail。
+  // 3. 连接进入 terminal_failed 时 state_change 事件也应带服务端 detail。
   it('terminal_failed 状态变更也带 detail', async () => {
     const client = new AUNClient(makeMockAid(tmpDir));
     const states: any[] = [];
-    client.on('connection.state', (data) => { states.push(data); });
+    client.on('state_change', (data) => { states.push(data); });
 
     // 1. 模拟收到 gateway.disconnect 带 detail
     await (client as any)._onGatewayDisconnect({

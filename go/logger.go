@@ -129,6 +129,11 @@ func (l *AUNLogger) For(module string) *ModuleLogger {
 	return &ModuleLogger{owner: l, module: module}
 }
 
+// Debug 返回 logger 的 debug 开关状态。
+func (l *AUNLogger) Debug() bool {
+	return l.debug
+}
+
 // BindAID 将 AID 附加到所有日志行末尾，便于多实例区分。
 func (l *AUNLogger) BindAID(aid string) {
 	l.mu.Lock()

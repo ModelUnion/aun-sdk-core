@@ -20,9 +20,19 @@ import (
 )
 
 const (
-	aidDBSchemaVersion = 1
+	aidDBSchemaVersion = 2
 	aidDBBusyTimeout   = 5000
 )
+
+// slotIsolationKey 提取 slot_id 的隔离键：第一个分隔符（/ : 空格）之前的部分。
+func slotIsolationKey(slotID string) string {
+	for i, ch := range slotID {
+		if ch == '/' || ch == ':' || ch == ' ' {
+			return slotID[:i]
+		}
+	}
+	return slotID
+}
 
 var aidDBDDL = []string{
 	`CREATE TABLE IF NOT EXISTS _schema_version (
@@ -70,6 +80,7 @@ var aidDBDDL = []string{
 	`CREATE TABLE IF NOT EXISTS instance_state (
 		device_id TEXT NOT NULL,
 		slot_id TEXT NOT NULL DEFAULT '_singleton',
+		slot_id_full TEXT NOT NULL DEFAULT '',
 		data TEXT NOT NULL DEFAULT '{}',
 		updated_at INTEGER NOT NULL,
 		PRIMARY KEY (device_id, slot_id)
@@ -77,6 +88,7 @@ var aidDBDDL = []string{
 	`CREATE TABLE IF NOT EXISTS seq_tracker (
 		device_id TEXT NOT NULL,
 		slot_id TEXT NOT NULL DEFAULT '_singleton',
+		slot_id_full TEXT NOT NULL DEFAULT '',
 		namespace TEXT NOT NULL,
 		contiguous_seq INTEGER NOT NULL DEFAULT 0,
 		updated_at INTEGER NOT NULL,
@@ -194,18 +206,45 @@ func (a *AIDDatabase) initSchema() error {
 }
 
 // migrateSchema 按版本顺序执行增量迁移。
-// 当前版本为 1，无需实际迁移操作；预留此函数作为未来版本升级的扩展点。
 func migrateSchema(tx *sql.Tx, fromVer, toVer int) error {
 	for v := fromVer; v < toVer; v++ {
 		switch v {
-		// case 1:
-		//     // v1 → v2 迁移逻辑（未来添加）
-		//     if _, err := tx.Exec("ALTER TABLE ..."); err != nil { return err }
-		default:
-			// 当前无需迁移操作，仅升级版本号
+		case 0:
+			// v0 → v1：无需操作
+		case 1:
+			// v1 → v2：instance_state / seq_tracker 加 slot_id_full 列（幂等）
+			for _, stmt := range []struct{ table, col string }{
+				{"instance_state", "slot_id_full"},
+				{"seq_tracker", "slot_id_full"},
+			} {
+				if !columnExists(tx, stmt.table, stmt.col) {
+					if _, err := tx.Exec("ALTER TABLE " + stmt.table + " ADD COLUMN " + stmt.col + " TEXT NOT NULL DEFAULT ''"); err != nil {
+						return err
+					}
+				}
+			}
 		}
 	}
 	return nil
+}
+
+func columnExists(tx *sql.Tx, table, col string) bool {
+	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dflt interface{}
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err == nil && name == col {
+			return true
+		}
+	}
+	return false
 }
 
 func min(a, b int) int {
@@ -1334,8 +1373,9 @@ func (a *AIDDatabase) decryptText(name, enc, label string) string {
 func (a *AIDDatabase) SaveInstanceState(deviceID, slotID string, state map[string]any) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if slotID == "" {
-		slotID = "_singleton"
+	slotKey := slotIsolationKey(slotID)
+	if slotKey == "" {
+		slotKey = "_singleton"
 	}
 	dataJSON, err := json.Marshal(state)
 	if err != nil {
@@ -1343,9 +1383,9 @@ func (a *AIDDatabase) SaveInstanceState(deviceID, slotID string, state map[strin
 		dataJSON = []byte("{}")
 	}
 	if _, err := a.db.Exec(
-		`INSERT INTO instance_state (device_id, slot_id, data, updated_at) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(device_id, slot_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`,
-		deviceID, slotID, string(dataJSON), nowMs(),
+		`INSERT INTO instance_state (device_id, slot_id, slot_id_full, data, updated_at) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(device_id, slot_id) DO UPDATE SET slot_id_full=excluded.slot_id_full, data=excluded.data, updated_at=excluded.updated_at`,
+		deviceID, slotKey, slotID, string(dataJSON), nowMs(),
 	); err != nil {
 		pkgLogKeystore().Warn("SaveInstanceState failed (device=%s, slot=%s): %v", deviceID, slotID, err)
 	}
@@ -1354,11 +1394,12 @@ func (a *AIDDatabase) SaveInstanceState(deviceID, slotID string, state map[strin
 func (a *AIDDatabase) LoadInstanceState(deviceID, slotID string) map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if slotID == "" {
-		slotID = "_singleton"
+	slotKey := slotIsolationKey(slotID)
+	if slotKey == "" {
+		slotKey = "_singleton"
 	}
 	var dataStr string
-	row := a.db.QueryRow("SELECT data FROM instance_state WHERE device_id = ? AND slot_id = ?", deviceID, slotID)
+	row := a.db.QueryRow("SELECT data FROM instance_state WHERE device_id = ? AND slot_id = ?", deviceID, slotKey)
 	if err := row.Scan(&dataStr); err != nil {
 		return nil
 	}
@@ -1374,15 +1415,16 @@ func (a *AIDDatabase) LoadInstanceState(deviceID, slotID string) map[string]any 
 func (a *AIDDatabase) SaveSeq(deviceID, slotID, namespace string, contiguousSeq int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if slotID == "" {
-		slotID = "_singleton"
+	slotKey := slotIsolationKey(slotID)
+	if slotKey == "" {
+		slotKey = "_singleton"
 	}
 	if _, err := a.db.Exec(
-		`INSERT INTO seq_tracker (device_id, slot_id, namespace, contiguous_seq, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO seq_tracker (device_id, slot_id, slot_id_full, namespace, contiguous_seq, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(device_id, slot_id, namespace)
-		 DO UPDATE SET contiguous_seq=excluded.contiguous_seq, updated_at=excluded.updated_at`,
-		deviceID, slotID, namespace, contiguousSeq, nowMs(),
+		 DO UPDATE SET slot_id_full=excluded.slot_id_full, contiguous_seq=excluded.contiguous_seq, updated_at=excluded.updated_at`,
+		deviceID, slotKey, slotID, namespace, contiguousSeq, nowMs(),
 	); err != nil {
 		pkgLogKeystore().Warn("SaveSeq failed (device=%s, ns=%s): %v", deviceID, namespace, err)
 	}
@@ -1391,13 +1433,14 @@ func (a *AIDDatabase) SaveSeq(deviceID, slotID, namespace string, contiguousSeq 
 func (a *AIDDatabase) LoadSeq(deviceID, slotID, namespace string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if slotID == "" {
-		slotID = "_singleton"
+	slotKey := slotIsolationKey(slotID)
+	if slotKey == "" {
+		slotKey = "_singleton"
 	}
 	var seq int
 	row := a.db.QueryRow(
 		"SELECT contiguous_seq FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?",
-		deviceID, slotID, namespace,
+		deviceID, slotKey, namespace,
 	)
 	if err := row.Scan(&seq); err != nil {
 		return 0
@@ -1408,12 +1451,13 @@ func (a *AIDDatabase) LoadSeq(deviceID, slotID, namespace string) int {
 func (a *AIDDatabase) LoadAllSeqs(deviceID, slotID string) map[string]int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if slotID == "" {
-		slotID = "_singleton"
+	slotKey := slotIsolationKey(slotID)
+	if slotKey == "" {
+		slotKey = "_singleton"
 	}
 	rows, err := a.db.Query(
 		"SELECT namespace, contiguous_seq FROM seq_tracker WHERE device_id = ? AND slot_id = ?",
-		deviceID, slotID,
+		deviceID, slotKey,
 	)
 	if err != nil {
 		return nil
@@ -1434,12 +1478,13 @@ func (a *AIDDatabase) LoadAllSeqs(deviceID, slotID string) map[string]int {
 func (a *AIDDatabase) DeleteSeq(deviceID, slotID, namespace string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if slotID == "" {
-		slotID = "_singleton"
+	slotKey := slotIsolationKey(slotID)
+	if slotKey == "" {
+		slotKey = "_singleton"
 	}
 	_, err := a.db.Exec(
 		"DELETE FROM seq_tracker WHERE device_id = ? AND slot_id = ? AND namespace = ?",
-		deviceID, slotID, namespace,
+		deviceID, slotKey, namespace,
 	)
 	return err
 }

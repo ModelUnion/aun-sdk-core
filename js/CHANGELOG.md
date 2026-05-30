@@ -6,6 +6,20 @@
 
 ---
 
+## 0.4.3 — 2026-05-31
+
+### Added
+- **`normalizeSlotId` / `slotIsolationKey`**：新增 slot_id 校验与隔离键提取工具函数，支持 `/` `:` 空格作为分隔符（首字符不允许）。
+- **`ConnectOptions` 新增字段**：`connection_kind`、`short_ttl_ms`、`delivery_mode`、`extra_info`、`background_sync`，与 Python / Go / TS SDK 对齐。
+
+### Changed
+- **`AUNClient` 构造**：传入 `aid` 参数时增加类型守卫（检查 `aunPath` 字段与 `isPrivateKeyValid` 方法），避免误传非 AID 对象。
+- **slot_id 隔离逻辑**：`connect` 时若目标 slot_id 隔离键与当前不同，自动拒绝跨 slot 连接。
+- **`background_sync` 触发时机**：连接成功后仅在 `sessionOptions.background_sync !== false` 时触发 P2P gap fill。
+- **`verify_ssl=false` 浏览器警告**：浏览器环境不支持关闭 SSL 校验，传入时输出 warn 并强制保持启用。
+
+---
+
 ## 0.4.2 — 2026-05-30
 
 ### Added

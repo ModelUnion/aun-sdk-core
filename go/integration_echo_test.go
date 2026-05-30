@@ -41,7 +41,6 @@ func echoCreateAndConnect(t *testing.T, c *AUNClient, aid string, slotID string)
 	t.Helper()
 	integrationRegisterOrLoadAID(t, c.configModel.AUNPath, aid)
 	integrationConnectLoadedAID(t, c, aid, &ConnectionOptions{
-		SlotID:        slotID,
 		AutoReconnect: boolPtr(false),
 	})
 }

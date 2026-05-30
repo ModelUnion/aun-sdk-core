@@ -140,7 +140,7 @@ describe('AUNClient agent.md internals', () => {
 
     expect(result).toBe('# Bob\n');
     expect(fetchMock).toHaveBeenCalledWith(
-      'https://bob.agentid.pub:18443/agent.md',
+      'https://bob.agentid.pub/agent.md',
       expect.objectContaining({
         method: 'GET',
         headers: { Accept: 'text/markdown' },

@@ -72,35 +72,30 @@ func TestNewAUNClientEmpty_NoIdentity(t *testing.T) {
 }
 
 func TestNewAUNClient_OptionsOnly(t *testing.T) {
-	c := NewAUNClient(nil, AUNClientOptions{AUNPath: t.TempDir(), Debug: true})
+	c := NewAUNClientEmpty()
 	defer func() { _ = c.Close() }()
 
 	if c.HasIdentity() {
-		t.Error("options-only 构造不应加载身份")
+		t.Error("无身份构造不应加载身份")
 	}
 	if c.ConnectionState() != ConnStateNoIdentity {
-		t.Errorf("options-only 状态应为 no_identity, 实际: %s", c.ConnectionState())
+		t.Errorf("无身份状态应为 no_identity, 实际: %s", c.ConnectionState())
 	}
 }
 
 func TestNewAUNClient_RejectsNilAIDWithPrivKey(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("nil AID 构造应 panic")
-		}
-	}()
-	// newAUNClientWithAID 要求 aid 非 nil 且私钥有效
-	var aid *AID
-	_ = NewAUNClient(aid)
+	// 新设计：NewAUNClient(nil) 合法，返回无身份客户端（等价于 NewAUNClientEmpty）。
+	// 私钥无效的 AID 才应 panic。
+	c := NewAUNClient(nil)
+	defer func() { _ = c.Close() }()
+	if c.HasIdentity() {
+		t.Error("nil AID 构造不应加载身份")
+	}
 }
 
 func TestNewAUNClient_OptionsRejectStringAID(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("options 中携带 aid 字符串应 panic")
-		}
-	}()
-	_ = NewAUNClient(nil, AUNClientOptions{Raw: map[string]any{"aid": "alice.aid.com"}})
+	// AUNClientOptions 已删除，字符串 AID 的防护由 NewAUNClient 签名（只接受 *AID）在编译期保证。
+	// 此测试保留为文档，不再需要运行时 panic 检查。
 }
 
 func TestAUNClientStrictPublicAPIRemovedLegacyMethods(t *testing.T) {
@@ -170,7 +165,7 @@ func TestConnectNewAPIRequiresLoadedAID(t *testing.T) {
 	c := NewAUNClientEmpty()
 	defer func() { _ = c.Close() }()
 
-	c.SetGatewayURL("ws://127.0.0.1:1")
+	c.setGatewayURL("ws://127.0.0.1:1")
 	err := c.Connect(context.Background())
 	if err == nil {
 		t.Fatal("未加载 AID 时 Connect(ctx) 应报错")
@@ -187,7 +182,7 @@ func TestConnectNewAPIDoesNotRequireAccessToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
-	c.SetGatewayURL("ws://127.0.0.1:1")
+	c.setGatewayURL("ws://127.0.0.1:1")
 	err := c.Connect(ctx)
 	if err == nil {
 		t.Fatal("不可达 gateway 应返回连接错误")

@@ -29,7 +29,7 @@ function clientEncryptionSeed(client: AUNClient): string {
   );
 }
 
-export function createAIDStoreForClient(client: AUNClient): AIDStore {
+export function createAIDStoreForClient(client: AUNClient, slotId?: string): AIDStore {
   const model = (client as unknown as {
     configModel?: {
       rootCaPem?: string | null;
@@ -43,6 +43,7 @@ export function createAIDStoreForClient(client: AUNClient): AIDStore {
     rootCaPem: model.rootCaPem ?? null,
     verifySsl: Boolean(model.verifySsl ?? true),
     discoveryPort: model.discoveryPort ?? null,
+    ...(slotId ? { slotId } : {}),
   });
 }
 
@@ -54,8 +55,8 @@ export async function registerIdentity(client: AUNClient, aid: string): Promise<
   }
 }
 
-export async function loadIdentityFromStore(client: AUNClient, aid: string): Promise<AID> {
-  const store = createAIDStoreForClient(client);
+export async function loadIdentityFromStore(client: AUNClient, aid: string, slotId?: string): Promise<AID> {
+  const store = createAIDStoreForClient(client, slotId);
   const loaded = await store.load(aid);
   if (!loaded.ok || !loaded.data) {
     throw new Error(`load identity failed for ${aid}: ${loaded.ok ? 'empty result' : loaded.error.message}`);
@@ -64,8 +65,8 @@ export async function loadIdentityFromStore(client: AUNClient, aid: string): Pro
   return loaded.data.aid;
 }
 
-export async function registerAndLoadIdentity(client: AUNClient, aid: string): Promise<AID> {
-  const store = createAIDStoreForClient(client);
+export async function registerAndLoadIdentity(client: AUNClient, aid: string, slotId?: string): Promise<AID> {
+  const store = createAIDStoreForClient(client, slotId);
   const registered = await store.register(aid);
   if (!registered.ok) {
     const existing = await store.load(aid);
@@ -75,7 +76,7 @@ export async function registerAndLoadIdentity(client: AUNClient, aid: string): P
     }
     throw new Error(`${registered.error.code}: ${registered.error.message}`);
   }
-  return await loadIdentityFromStore(client, aid);
+  return await loadIdentityFromStore(client, aid, slotId);
 }
 
 function issuerFromAid(aid: string): string {

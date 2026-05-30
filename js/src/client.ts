@@ -5,7 +5,7 @@
 //   - 无文件系统（IndexedDB via keystore）
 //   - 后台任务使用 setTimeout/setInterval
 
-import { createConfig, getDeviceId, normalizeInstanceId, type AUNConfig } from './config.js';
+import { createConfig, getDeviceId, normalizeInstanceId, normalizeSlotId, slotIsolationKey, type AUNConfig } from './config.js';
 import { EventDispatcher, type EventPayload, type EventHandler, type Subscription } from './events.js';
 import { normalizeGroupId } from './group-id.js';
 import { GatewayDiscovery } from './discovery.js';
@@ -222,6 +222,7 @@ interface SessionOptions extends JsonObject {
   timeouts: SessionTimeoutOptions;
   connection_kind?: string;
   short_ttl_ms?: number;
+  background_sync?: boolean;
 }
 
 export interface ConnectionOptions {
@@ -232,6 +233,11 @@ export interface ConnectionOptions {
   retry_max_attempts?: number;
   heartbeat_interval?: number;
   call_timeout?: number;
+  connection_kind?: string;
+  short_ttl_ms?: number;
+  delivery_mode?: JsonObject;
+  extra_info?: JsonObject;
+  background_sync?: boolean;
 }
 
 interface ConnectParams extends RpcParams {
@@ -251,22 +257,6 @@ interface ConnectParams extends RpcParams {
   connection_kind?: string;
   short_ttl_ms?: number;
   extra_info?: JsonObject;
-}
-
-export interface AUNClientOptions extends Record<string, unknown> {
-  root_ca_pem?: string;
-  rootCaPem?: string;
-  root_ca_path?: string;
-  verify_ssl?: boolean;
-  verifySSL?: boolean;
-  verifySsl?: boolean;
-  require_forward_secrecy?: boolean;
-  requireForwardSecrecy?: boolean;
-  replay_window_seconds?: number;
-  replayWindowSeconds?: number;
-  debug?: boolean;
-  protected_headers?: Record<string, unknown> | null;
-  aid?: never;
 }
 
 interface AuthContext extends JsonObject {
@@ -782,23 +772,6 @@ function normalizeDeliveryModeConfig(
   };
 }
 
-function assertClientOptions(value: unknown, label: string): asserts value is AUNClientOptions | null | undefined {
-  if (value == null) return;
-  if (typeof value !== 'object' || Array.isArray(value) || value instanceof AID) {
-    throw new ValidationError(`${label} must be an options object`);
-  }
-}
-
-function clientOptionsConfig(options: AUNClientOptions | null | undefined): RpcParams {
-  const raw = { ...(options ?? {}) } as Record<string, unknown>;
-  if (Object.prototype.hasOwnProperty.call(raw, 'aid')) {
-    throw new ValidationError('AUNClient options must not include aid; pass an AID object as the first argument');
-  }
-  delete raw.debug;
-  delete raw.protected_headers;
-  return raw as RpcParams;
-}
-
 /**
  * AUN Core SDK 客户端 — 浏览器版本。
  *
@@ -928,16 +901,15 @@ export class AUNClient {
   private _logEvents!: ModuleLogger;
 
   constructor(aid?: AID) {
-    const inputAid = aid instanceof AID ? aid : null;
+    const inputAid = (aid !== null && aid !== undefined && typeof (aid as any).aunPath === 'string' && typeof (aid as any).isPrivateKeyValid === 'function') ? aid as AID : null;
     if (typeof aid === 'string') {
       throw new ValidationError('AUNClient aid must be an AID object, not a string');
     }
-    const options: AUNClientOptions = {};
-    const rawConfig: RpcParams = clientOptionsConfig(options);
+    const rawConfig: RpcParams = {};
     if (inputAid) rawConfig.aun_path = inputAid.aunPath;
-    const _debug = false;
+    const _debug = inputAid ? inputAid.debug : false;
     this.configModel = createConfig(rawConfig as Partial<AUNConfig>);
-    const initAid = inputAid ? inputAid.aid : null;
+    const initAid = (inputAid && inputAid.isPrivateKeyValid()) ? inputAid.aid : null;
     this.config = {
       aun_path: this.configModel.aunPath,
       root_ca_path: this.configModel.rootCaPem,
@@ -985,18 +957,16 @@ export class AUNClient {
     });
 
     if (inputAid) {
-      if (!inputAid.isPrivateKeyValid()) throw new StateError('AUNClient requires an AID with a valid private key');
-      this._currentAid = inputAid;
-      this._identity = {
-        aid: inputAid.aid,
-        private_key_pem: (inputAid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
-        public_key_der_b64: inputAid.publicKey,
-        cert: inputAid.certPem,
-      };
-      this._state = 'disconnected';
-    }
-    if (options?.protected_headers !== undefined) {
-      this.setProtectedHeaders(options.protected_headers);
+      if (inputAid.isPrivateKeyValid()) {
+        this._currentAid = inputAid;
+        this._identity = {
+          aid: inputAid.aid,
+          private_key_pem: (inputAid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
+          public_key_der_b64: inputAid.publicKey,
+          cert: inputAid.certPem,
+        };
+        this._state = 'disconnected';
+      }
     }
 
     // 注入 logger 到各子模块（构造时未传 logger，构造后通过 setLogger 注入）
@@ -1247,7 +1217,7 @@ export class AUNClient {
    */
   async publishAgentMd(content?: string | null): Promise<Record<string, unknown>> {
     const target = this._agentMdOwnerAid();
-    if (!target) {
+    if (!target || !this._currentAid) {
       throw new ValidationError('publishAgentMd requires local AID');
     }
     if (content !== undefined && content !== null) {
@@ -1798,6 +1768,7 @@ export class AUNClient {
       cert: aid.certPem,
     };
     (this._auth as unknown as { _aid?: string })._aid = aid.aid;
+    this._slotId = aid.slotId || 'default';
     this._state = 'disconnected';
     this._closing = false;
   }
@@ -1897,6 +1868,16 @@ export class AUNClient {
   /** 连接到 Gateway；身份来自构造函数或 loadIdentity(aid)，认证由 SDK 内部自动完成。 */
   async connect(opts?: ConnectionOptions): Promise<void> {
     const tStart = Date.now();
+    if (opts !== undefined && typeof opts === 'object') {
+      const raw = opts as Record<string, unknown>;
+      if ('access_token' in raw || 'aid' in raw || 'token' in raw) {
+        throw new ValidationError('connect options must not include access_token/aid; these are managed internally');
+      }
+    }
+    const target = this._currentAid?.aid ?? this._aid ?? '';
+    if (!target || !this._currentAid?.isPrivateKeyValid()) {
+      throw new StateError('connect requires a loaded AID with a valid private key');
+    }
     const options: RpcParams = {};
     if (opts?.auto_reconnect !== undefined) options.auto_reconnect = opts.auto_reconnect;
     if (opts?.heartbeat_interval !== undefined) options.heartbeat_interval = opts.heartbeat_interval;
@@ -1913,11 +1894,12 @@ export class AUNClient {
         max_attempts: opts.retry_max_attempts ?? 0,
       };
     }
+    if (opts?.connection_kind !== undefined) options.connection_kind = opts.connection_kind;
+    if (opts?.short_ttl_ms !== undefined) options.short_ttl_ms = opts.short_ttl_ms;
+    if (opts?.delivery_mode !== undefined) options.delivery_mode = opts.delivery_mode;
+    if (opts?.extra_info !== undefined) options.extra_info = opts.extra_info;
+    if (opts?.background_sync !== undefined) options.background_sync = opts.background_sync;
     this._clientLog.debug(`connect enter: state=${this._state} aid=${this._aid ?? '-'}`);
-    const target = this._currentAid?.aid ?? this._aid ?? '';
-    if (!target || !this._currentAid?.isPrivateKeyValid()) {
-      throw new StateError('connect requires a loaded AID with a valid private key');
-    }
     const publicState = this.state;
     const allowed = new Set<ConnectionState>([
       ConnectionState.STANDBY,
@@ -3031,7 +3013,7 @@ export class AUNClient {
     }
     if ('slot_id' in message) {
       const targetSlotId = String(message.slot_id ?? '').trim();
-      if (targetSlotId !== this._slotId) {
+      if (slotIsolationKey(targetSlotId) !== slotIsolationKey(this._slotId)) {
         return false;
       }
     }
@@ -3984,8 +3966,9 @@ export class AUNClient {
       }
 
       // connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
-      // 群消息按惰性触发，不在此处主动 pull
-      this._safeAsync(this._fillP2pGap());
+      if (this._sessionOptions?.background_sync !== false) {
+        this._safeAsync(this._fillP2pGap());
+      }
       this._clientLog.debug(`_connectOnce exit: elapsed=${Date.now() - tStart}ms aid=${this._aid ?? '-'}`);
     } catch (err) {
       this._clientLog.debug(`_connectOnce exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
@@ -4103,7 +4086,7 @@ export class AUNClient {
     else delete request.access_token;
     request.gateway = gateway;
     request.device_id = this._deviceId;
-    request.slot_id = normalizeInstanceId(request.slot_id ?? this._slotId, 'slot_id', { allowEmpty: true });
+    request.slot_id = normalizeSlotId(request.slot_id ?? this._slotId, this._slotId || 'default');
     let deliveryModeRaw: JsonValue | object | undefined = request.delivery_mode;
     if (deliveryModeRaw == null) {
       deliveryModeRaw = { ...this._defaultConnectDeliveryMode };
@@ -4178,6 +4161,7 @@ export class AUNClient {
     if (isJsonObject(params.timeouts)) {
       Object.assign(options.timeouts, params.timeouts);
     }
+    if ('background_sync' in params) options.background_sync = Boolean(params.background_sync);
     return options;
   }
 
