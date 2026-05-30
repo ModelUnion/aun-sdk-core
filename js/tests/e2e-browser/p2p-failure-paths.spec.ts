@@ -98,7 +98,8 @@ async function installP0Helpers(page: any): Promise<void> {
       const client = new AUN.AUNClient({
         instanceId,
         issuer,
-      }, true);
+        debug: true,
+      });
       // 禁用 forward secrecy 以简化测试
       if (client._configModel) {
         client._configModel.requireForwardSecrecy = false;
@@ -109,17 +110,8 @@ async function installP0Helpers(page: any): Promise<void> {
     /**
      * 确保 AID 已创建、认证并连接。
      */
-    const ensureConnected = async (client: any, aid: string): Promise<void> => {
-      const gatewayDiscoveryAid = `gateway.${issuer}`;
-      const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
-      (client as any)._gatewayUrl = gateway;
-      try {
-        await client.auth.registerAid({ aid });
-      } catch {
-        // 已存在则忽略
-      }
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
     const runId = () => {
@@ -160,14 +152,7 @@ test.describe('P2P 消息失败路径（浏览器）', () => {
         await ensureConnected(alice, aliceAid);
 
         // target 仅创建 AID，不连接（模拟没有 prekey 的场景）
-        const gatewayDiscoveryAid = `gateway.${iss}`;
-        const gateway = await target.auth._resolveGateway(gatewayDiscoveryAid);
-        (target as any)._gatewayUrl = gateway;
-        try {
-          await target.auth.registerAid({ aid: targetAid });
-        } catch {
-          // 已存在则忽略
-        }
+        await (window as any).AUN_TEST_HELPERS.registerAndLoadIdentity(target, targetAid);
 
         // Alice 明文发送到 target（encrypt: false）
         const sendResult = await alice.call('message.send', {

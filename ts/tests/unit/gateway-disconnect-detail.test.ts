@@ -94,7 +94,7 @@ describe('gateway.disconnect detail 透传', () => {
     };
     await (client as any)._handleTransportDisconnect(null, 4015);
 
-    const terminal = states.filter((s) => s.state === 'terminal_failed');
+    const terminal = states.filter((s) => s.state === 'connection_failed');
     expect(terminal.length).toBe(1);
     expect(terminal[0].detail.quota_kind).toBe('aid_device_slot_quota_exceeded');
     expect(terminal[0].code).toBe(4015);

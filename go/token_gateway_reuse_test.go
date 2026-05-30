@@ -164,7 +164,7 @@ func TestTokenGatewayReuse_PersistGatewayURLRoundTrip(t *testing.T) {
 // 只要 GetGatewayURL 非空即直接返回，不会触碰 keystore。
 func TestTokenGatewayReuse_InMemoryGatewayURLTakesPriority(t *testing.T) {
 	dir := t.TempDir()
-	c := NewClient(map[string]any{"aun_path": dir})
+	c := newClient(map[string]any{"aun_path": dir})
 	defer func() { _ = c.Close() }()
 
 	const aid = "frank.test.local"

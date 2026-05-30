@@ -374,6 +374,18 @@ export class FileKeyStore implements KeyStore {
     }
   }
 
+  /** 保存指定 AID 的元数据；只覆盖传入字段，不清理其它 metadata。 */
+  saveMetadata(aid: string, metadata: Record<string, unknown>): void {
+    const db = this._getDB(aid);
+    for (const [k, v] of Object.entries(metadata)) {
+      if (v === undefined) {
+        db.deleteMetadata(k);
+        continue;
+      }
+      db.setMetadata(k, JSON.stringify(v));
+    }
+  }
+
   // ── 旧 E2EE 存储互操作 ───────────────────────────────────
 
   private _protectText(aid: string, name: string, plaintext: string): string {
@@ -429,7 +441,7 @@ export class FileKeyStore implements KeyStore {
     ).run(
       prekeyId,
       String(deviceId ?? ''),
-      this._protectText(aid, `prekey/${prekeyId}`, privateKey),
+      privateKey, // 阶段6：明文写入，IK 私钥除外
       JSON.stringify(extra),
       Number(prekeyData.created_at ?? now),
       now,
@@ -562,7 +574,7 @@ export class FileKeyStore implements KeyStore {
     ).run(
       groupId,
       epoch,
-      this._protectText(aid, `group/${groupId}/current`, String(opts.secret ?? '')),
+      String(opts.secret ?? ''), // 阶段6：明文写入
       JSON.stringify(data),
       now,
     );
@@ -574,7 +586,7 @@ export class FileKeyStore implements KeyStore {
     this._getDB(aid).getSqliteHandle().prepare(
       `INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at`,
-    ).run(sessionId, this._protectText(aid, `session/${sessionId}`, dataJson), Date.now());
+    ).run(sessionId, dataJson, Date.now()); // 阶段6：明文写入
   }
 
   async loadE2EESessions(aid: string): Promise<Array<Record<string, unknown>>> {

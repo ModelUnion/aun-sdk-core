@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import re
 import secrets
 import time
 import uuid
@@ -414,7 +415,7 @@ class AUNClient:
         raw_config = {"aun_path": initial_aid_obj.aun_path} if initial_aid_obj else {}
         self._config_model = AUNConfig.from_dict(raw_config)
         init_aid = initial_aid_obj.aid if initial_aid_obj else (str(raw_config.get("aid") or "").strip() or None)
-        self._device_id = get_device_id(self._config_model.aun_path)
+        self._device_id = (initial_aid_obj.device_id if initial_aid_obj else None) or get_device_id(self._config_model.aun_path)
         # AUNLogger 自身已处理 debug=False：INFO/WARN/ERROR 输出 stderr，DEBUG 不输出，无文件日志
         # 不再用 NullLogger 整个静默掉，否则用户排查问题时看不到任何 SDK 异常
         self._log: AUNLogger | NullLogger = AUNLogger(
@@ -441,9 +442,8 @@ class AUNClient:
         self._retry_max_attempts = 0
         self._last_error: BaseException | None = None
         self._last_error_code: str | None = None
-        self._instance_protected_headers: dict[str, Any] | None = (
-            dict(protected_headers) if protected_headers else None
-        )
+        self._instance_protected_headers: dict[str, Any] | None = None
+        self.set_protected_headers(protected_headers)
         self._gateway_url: str | None = None
         self._peer_gateway_cache: dict[str, str] = {}
         self._closing = False
@@ -496,7 +496,7 @@ class AUNClient:
             logger=self._log,
         )
         self._keystore = keystore
-        self._slot_id = normalize_slot_id(None)
+        self._slot_id = normalize_slot_id(initial_aid_obj.slot_id if initial_aid_obj else None)
         self._connect_delivery_mode = _normalize_delivery_mode_config({"mode": "fanout"})
         self._default_connect_delivery_mode = dict(self._connect_delivery_mode)
         self._auth = AuthFlow(
@@ -801,7 +801,7 @@ class AUNClient:
             pass
 
         self._config_model = next_config
-        self._device_id = get_device_id(self._config_model.aun_path)
+        self._device_id = (aid.device_id or None) or get_device_id(self._config_model.aun_path)
         self._log = AUNLogger(debug=debug_enabled, aun_path=str(self._config_model.aun_path))
         self._log.bind_device_id(self._device_id)
         self.config = {
@@ -854,7 +854,20 @@ class AUNClient:
         self._peer_gateway_cache.clear()
 
     def set_protected_headers(self, headers: dict[str, Any] | None) -> None:
-        self._instance_protected_headers = dict(headers) if headers else None
+        if not headers:
+            self._instance_protected_headers = None
+            return
+        # 字段规范：key 限 [a-z0-9_-]，_auth 为保留键不可设置。
+        # 非法 key 静默跳过（不报错），值强转 str。
+        cleaned: dict[str, str] = {}
+        for key, value in headers.items():
+            key_str = str(key)
+            if key_str == "_auth":
+                continue
+            if not re.fullmatch(r"[a-z0-9_-]+", key_str):
+                continue
+            cleaned[key_str] = "" if value is None else str(value)
+        self._instance_protected_headers = cleaned if cleaned else None
 
     def get_protected_headers(self) -> dict[str, Any] | None:
         return dict(self._instance_protected_headers) if self._instance_protected_headers else None

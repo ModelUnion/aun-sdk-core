@@ -10,6 +10,78 @@
 import * as AUN from '../../dist/bundle.js';
 // 暴露给 Playwright 的 page.evaluate() 使用
 window.AUN = AUN;
+window.AUN_TEST_HELPERS = {
+  createStore(client) {
+    const model = client.configModel || {};
+    const config = client.config || {};
+    return new AUN.AIDStore({
+      aunPath: model.aunPath || config.aun_path || config.aunPath || 'aun',
+      encryptionSeed: model.encryptionSeed || model.seedPassword || config.encryption_seed || config.seed_password || '',
+      rootCaPem: model.rootCaPem || null,
+      verifySsl: model.verifySsl !== false,
+      discoveryPort: model.discoveryPort || null,
+    });
+  },
+
+  issuerFromAid(aid) {
+    const target = String(aid || '').trim();
+    if (target.startsWith('gateway.')) return target.slice('gateway.'.length);
+    const firstDot = target.indexOf('.');
+    return firstDot >= 0 ? target.slice(firstDot + 1) : target;
+  },
+
+  async resolveGateway(client, aidOrIssuer) {
+    const issuer = this.issuerFromAid(aidOrIssuer);
+    const port = client.configModel?.discoveryPort ? `:${client.configModel.discoveryPort}` : '';
+    let lastError = null;
+    for (const scheme of ['https', 'http']) {
+      try {
+        return await client.discovery.discover(`${scheme}://${issuer}${port}/.well-known/aun-gateway`);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError || new Error(`gateway discovery failed for ${issuer}`);
+  },
+
+  async registerIdentity(client, aid) {
+    const store = this.createStore(client);
+    const result = await store.register(aid);
+    if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
+    return result.data;
+  },
+
+  async loadIdentity(client, aid) {
+    const store = this.createStore(client);
+    const loaded = await store.load(aid);
+    if (!loaded.ok || !loaded.data?.aid) {
+      throw new Error(`load identity failed for ${aid}: ${loaded.ok ? 'empty result' : loaded.error.message}`);
+    }
+    client.loadIdentity(loaded.data.aid);
+    return loaded.data.aid;
+  },
+
+  async registerAndLoadIdentity(client, aid) {
+    const store = this.createStore(client);
+    const registered = await store.register(aid);
+    if (!registered.ok) {
+      const existing = await store.load(aid);
+      if (existing.ok && existing.data?.aid?.isPrivateKeyValid()) {
+        client.loadIdentity(existing.data.aid);
+        return existing.data.aid;
+      }
+      throw new Error(`${registered.error.code}: ${registered.error.message}`);
+    }
+    return await this.loadIdentity(client, aid);
+  },
+
+  async connectIdentity(client, aid, options = {}) {
+    const gateway = options.gateway || client.gatewayUrl || await this.resolveGateway(client, aid);
+    client.gatewayUrl = gateway;
+    await this.registerAndLoadIdentity(client, aid);
+    await client.connect({ ...options, gateway });
+  },
+};
 window.testReady = true;
 </script>
 </body>

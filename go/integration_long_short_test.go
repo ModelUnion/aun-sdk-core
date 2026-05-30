@@ -41,7 +41,7 @@ import (
 func makeSharedClient(t *testing.T, sharedPath string) *AUNClient {
 	t.Helper()
 	t.Setenv("AUN_ENV", "development")
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": sharedPath,
 	}, true)
 	client.configModel.RequireForwardSecrecy = false
@@ -53,18 +53,12 @@ func connectLong(t *testing.T, client *AUNClient, aid, slotID string, timeout ti
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		return fmt.Errorf("authenticate failed: %w", err)
-	}
-	if slotID != "" {
-		authResult["slot_id"] = slotID
-	}
-	authResult["connection_kind"] = "long"
-	return client.Connect(ctx, authResult, &ConnectOptions{
+	integrationLoadAIDIntoClient(t, client, aid)
+	return client.Connect(ctx, &ConnectOptions{
 		AutoReconnect:     false,
 		HeartbeatInterval: 30,
 		ConnectionKind:    "long",
+		SlotID:            slotID,
 	})
 }
 
@@ -73,34 +67,19 @@ func connectShort(t *testing.T, client *AUNClient, aid, slotID string, shortTtlM
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		return fmt.Errorf("authenticate failed: %w", err)
-	}
-	if slotID != "" {
-		authResult["slot_id"] = slotID
-	}
-	authResult["connection_kind"] = "short"
-	if shortTtlMs > 0 {
-		authResult["short_ttl_ms"] = shortTtlMs
-	}
+	integrationLoadAIDIntoClient(t, client, aid)
 	opts := &ConnectOptions{
 		ConnectionKind: "short",
 		ShortTtlMs:     shortTtlMs,
+		SlotID:         slotID,
 	}
-	return client.Connect(ctx, authResult, opts)
+	return client.Connect(ctx, opts)
 }
 
 // createAIDOnce 仅注册 AID（不连接），用于多 client 共享一个身份的场景。
 func createAIDOnce(t *testing.T, sharedPath, aid string) {
 	t.Helper()
-	setup := makeSharedClient(t, sharedPath)
-	defer func() { _ = setup.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, err := setup.Auth.CreateAID(ctx, map[string]any{"aid": aid}); err != nil {
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
-	}
+	integrationRegisterAIDInPath(t, sharedPath, aid)
 }
 
 // rid8 生成 8 位随机 ID（避免 AID 碰撞）
@@ -196,7 +175,7 @@ func TestLongShort_SameIdentitySendMessage(t *testing.T) {
 	if err := connectShort(t, aliceShort, aliceAID, "main", 0, 20*time.Second); err != nil {
 		t.Fatalf("alice 短连接失败: %v", err)
 	}
-	if aliceShort.State() != StateConnected {
+	if aliceShort.State() != ConnStateReady {
 		t.Fatalf("alice 短连接状态异常: %s", aliceShort.State())
 	}
 
@@ -275,10 +254,10 @@ func TestLongShort_ShortDoesNotKickLong(t *testing.T) {
 	}
 	time.Sleep(1 * time.Second)
 
-	if longClient.State() != StateConnected {
+	if longClient.State() != ConnStateReady {
 		t.Fatalf("长连接被短连接踢了: state=%s", longClient.State())
 	}
-	t.Log("[OK] 短连接进入后长连接仍 connected")
+	t.Log("[OK] 短连接进入后长连接仍 ready")
 
 	// 短连接 ping
 	ctxPingShort, cancelPS := context.WithTimeout(context.Background(), 5*time.Second)
@@ -290,7 +269,7 @@ func TestLongShort_ShortDoesNotKickLong(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// 长连接仍存活并能 ping
-	if longClient.State() != StateConnected {
+	if longClient.State() != ConnStateReady {
 		t.Fatalf("短连接关闭后长连接异常: state=%s", longClient.State())
 	}
 	ctxPing, cancelP := context.WithTimeout(context.Background(), 5*time.Second)
@@ -361,21 +340,21 @@ func TestLongShort_ShortTtlEviction(t *testing.T) {
 	if err := connectShort(t, short, aid, "ttl", 2000, 20*time.Second); err != nil {
 		t.Fatalf("短连接失败: %v", err)
 	}
-	if short.State() != StateConnected {
+	if short.State() != ConnStateReady {
 		t.Fatalf("短连接初始状态异常: %s", short.State())
 	}
 
-	// 等待 ~5s，期望状态变为 disconnected/closed/terminal_failed
+	// 等待 ~5s，期望状态变为 standby/closed/connection_failed
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		s := short.State()
-		if s == StateDisconnected || s == StateClosed || s == StateTerminalFailed {
+		if s == ConnStateStandby || s == ConnStateClosed || s == ConnStateConnectionFailed {
 			t.Logf("[OK] 短连接被 ttl 兜底关闭: state=%s", s)
 			return
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	t.Fatalf("ttl 到期后短连接仍 connected: state=%s", short.State())
+	t.Fatalf("ttl 到期后短连接仍 ready: state=%s", short.State())
 }
 
 // ---------------------------------------------------------------------------
@@ -420,19 +399,19 @@ func TestLongShort_LongReplacesLongShortsUnaffected(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second) // 给服务端发 4009 + SDK 状态切换的时间
 
-	// 旧长连接应被踢（state != connected）
-	if oldLong.State() == StateConnected {
+	// 旧长连接应被踢（state != ready）
+	if oldLong.State() == ConnStateReady {
 		t.Fatalf("旧长连接未被踢: state=%s", oldLong.State())
 	}
 	t.Logf("[OK] 旧长连接被踢: state=%s", oldLong.State())
 
-	if newLong.State() != StateConnected {
+	if newLong.State() != ConnStateReady {
 		t.Fatalf("新长连接异常: state=%s", newLong.State())
 	}
 
 	// 3 个短连接仍能 ping
 	for i, c := range shorts {
-		if c.State() != StateConnected {
+		if c.State() != ConnStateReady {
 			t.Fatalf("短连接 %d 被踢: state=%s", i, c.State())
 		}
 		ctxPing, cancelP := context.WithTimeout(context.Background(), 5*time.Second)
@@ -927,7 +906,7 @@ func TestLongShortE2E_CliCrashTtl(t *testing.T) {
 	if err := connectShort(t, cliCrash, aliceAID, "main", 2000, 20*time.Second); err != nil {
 		t.Fatalf("CLI 短连接失败: %v", err)
 	}
-	if cliCrash.State() != StateConnected {
+	if cliCrash.State() != ConnStateReady {
 		t.Fatalf("CLI 短连接初始状态异常: %s", cliCrash.State())
 	}
 	t.Log("[OK] CLI 短连接 ttl=2000ms 已建立")
@@ -936,13 +915,13 @@ func TestLongShortE2E_CliCrashTtl(t *testing.T) {
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
 		s := cliCrash.State()
-		if s == StateDisconnected || s == StateClosed || s == StateTerminalFailed {
+		if s == ConnStateStandby || s == ConnStateClosed || s == ConnStateConnectionFailed {
 			break
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	if cliCrash.State() == StateConnected {
-		t.Fatalf("ttl 到期后 CLI 短连接仍 connected")
+	if cliCrash.State() == ConnStateReady {
+		t.Fatalf("ttl 到期后 CLI 短连接仍 ready")
 	}
 	t.Logf("[OK] CLI 短连接被 ttl 兜底: state=%s", cliCrash.State())
 
@@ -1089,4 +1068,3 @@ func TestLongShortE2E_LongSurvivesShortLifecycle(t *testing.T) {
 		t.Fatalf("alice 长连接等待 bob 回复超时")
 	}
 }
-

@@ -20,6 +20,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { AUNClient } from '../../src/index.js';
+import { registerAndLoadIdentity } from '../test-support.js';
 
 const DOCKER_COMPOSE_DIR = path.resolve(__dirname, '../../../../docker-deploy');
 const execFileAsync = promisify(execFile);
@@ -35,9 +36,8 @@ function makeClient(): AUNClient {
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await registerAndLoadIdentity(client, aid);
+  await client.connect({
     auto_reconnect: true,
     heartbeat_interval: 5,
     retry: { max_attempts: 10, initial_delay: 1.0, max_delay: 10.0 },
@@ -168,7 +168,7 @@ describe('后台任务管理集成测试', () => {
     clients.push(client);
 
     await ensureConnected(client, `bg-t1-${r}.agentid.pub`);
-    expect(client.state).toBe('connected');
+    expect(client.state).toBe('ready');
     const initialHeartbeatInterval = Number((client as any)._sessionOptions?.heartbeat_interval ?? 0);
     if (!Number.isFinite(initialHeartbeatInterval) || initialHeartbeatInterval <= 0) {
       console.log('SKIP: 当前服务端未下发长连接业务心跳（heartbeat_interval=0），跳过心跳重复创建校验');
@@ -186,7 +186,7 @@ describe('后台任务管理集成测试', () => {
     }
     await sleep(15000);
 
-    const reconnected = await waitForState(client, 'connected', 60000);
+    const reconnected = await waitForState(client, 'ready', 60000);
     expect(reconnected).toBe(true);
 
     // 等待至少一次心跳实际发生，再判断增量，避免把固定 sleep 卡在重连时序边界上
@@ -243,8 +243,8 @@ describe('后台任务管理集成测试', () => {
     }
     await sleep(15000);
 
-    expect(await waitForState(alice, 'connected', 60000)).toBe(true);
-    expect(await waitForState(bob, 'connected', 60000)).toBe(true);
+    expect(await waitForState(alice, 'ready', 60000)).toBe(true);
+    expect(await waitForState(bob, 'ready', 60000)).toBe(true);
     await sleep(3000);
 
     // 发送第二条消息（验证消息链恢复）

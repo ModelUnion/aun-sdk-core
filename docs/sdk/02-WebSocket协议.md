@@ -185,7 +185,7 @@ sequenceDiagram
 ```python
 import asyncio, json, random, secrets
 from datetime import datetime
-from aun_core import AUNClient
+from aun_core import AIDStore, AUNClient
 from aun_core.errors import AUNError, ConnectionError, AuthError
 import websockets
 
@@ -206,13 +206,17 @@ def make_rpc(method: str, params: dict) -> tuple[str, str]:
 
 
 async def authenticate(aid: str) -> dict:
-    """用 SDK 完成 AID 创建和认证，返回 auth 结果（含 access_token + gateway）"""
+    """用 SDK 完成 AID 注册/加载和认证，返回 access_token + gateway。"""
     try:
-        client = AUNClient({"aun_path": f"~/.aun/{aid}"})
-        if not client._auth.load_identity_or_none(aid):
-            await client.auth.register_aid({"aid": aid})
-        auth = await client.auth.authenticate({"aid": aid})
-        return auth
+        store = AIDStore(aun_path="~/.aun/ws-demo", encryption_seed="")
+        loaded = store.load(aid)
+        if not loaded["ok"]:
+            registered = await store.register(aid)
+            if not registered["ok"]:
+                raise AuthError(registered["error"]["message"])
+            loaded = store.load(aid)
+        client = AUNClient(loaded["data"]["aid"])
+        return await client.authenticate()
     except AuthError as e:
         print(f"[错误] 认证失败 ({aid}): {e}")
         raise

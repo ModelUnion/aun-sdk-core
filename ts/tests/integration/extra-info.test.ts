@@ -22,6 +22,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
+import { loadIdentityFromStore, registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -46,7 +47,7 @@ function makeAunPath(tag: string): string {
 
 function makeClient(tagOrPath: string, isPath: boolean = false): AUNClient {
   const root = isPath ? tagOrPath : makeAunPath(tagOrPath);
-  const client = new AUNClient({ aun_path: root }, false);
+  const client = new AUNClient({ aun_path: root, debug: false });
   ((client as unknown) as {
     _configModel: { requireForwardSecrecy: boolean };
   })._configModel.requireForwardSecrecy = false;
@@ -54,8 +55,7 @@ function makeClient(tagOrPath: string, isPath: boolean = false): AUNClient {
 }
 
 async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
 }
 
 async function connectLongWithExtraInfo(
@@ -66,20 +66,21 @@ async function connectLongWithExtraInfo(
   await resolveGatewayInto(client);
   if (options.registerAid !== false) {
     try {
-      await client.auth.registerAid({ aid });
+      await registerAndLoadIdentity(client, aid);
     } catch (err) {
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
     }
+  } else if (!(client as any)._currentAid) {
+    loadIdentityFromStore(client, aid);
   }
-  const auth = await client.auth.authenticate({ aid });
   const opts: Record<string, unknown> = {
     auto_reconnect: false,
     heartbeat_interval: 30,
   };
   if (options.slotId !== undefined) opts.slot_id = options.slotId;
   if (options.extraInfo !== undefined) opts.extra_info = options.extraInfo;
-  await client.connect(auth, opts);
+  await client.connect(opts);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -112,7 +113,7 @@ describe('extra_info - 长连接互踢带 extra_info', { timeout: 60_000 }, () =
         slotId: 'main',
         extraInfo: { pid: 1111 },
       });
-      expect(c1.state).toBe('connected');
+      expect(c1.state).toBe('ready');
 
       // 监听 c1 的 gateway.disconnect 事件
       interface DisconnectDetail {
@@ -140,7 +141,7 @@ describe('extra_info - 长连接互踢带 extra_info', { timeout: 60_000 }, () =
         registerAid: false,
         extraInfo: { pid: 2222 },
       });
-      expect(c2.state).toBe('connected');
+      expect(c2.state).toBe('ready');
 
       // 等待 c1 收到 disconnect 事件
       await Promise.race([
@@ -179,7 +180,7 @@ describe('extra_info - 不传 extra_info 时向后兼容', { timeout: 60_000 }, 
     try {
       // c1 连接，不传 extra_info
       await connectLongWithExtraInfo(c1, aid, { slotId: 'main' });
-      expect(c1.state).toBe('connected');
+      expect(c1.state).toBe('ready');
 
       // 监听 c1 的 gateway.disconnect 事件
       interface DisconnectDetail {
@@ -203,7 +204,7 @@ describe('extra_info - 不传 extra_info 时向后兼容', { timeout: 60_000 }, 
 
       // c2 同槽位连接，也不传 extra_info，应踢掉 c1
       await connectLongWithExtraInfo(c2, aid, { slotId: 'main', registerAid: false });
-      expect(c2.state).toBe('connected');
+      expect(c2.state).toBe('ready');
 
       // 等待 c1 收到 disconnect 事件
       await Promise.race([

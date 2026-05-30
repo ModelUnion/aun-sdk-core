@@ -7,15 +7,19 @@ import "fmt"
 
 // AUNError 基础错误，所有 AUN 错误的根类型
 type AUNError struct {
-	Message   string // 错误描述
-	Code      int    // JSON-RPC 错误码
-	Data      any    // 附加数据
-	Retryable bool   // 是否可重试
-	TraceID   string // 链路追踪 ID
-	Cause     error  // 原始错误（用于 errors.Unwrap 链）
+	Message    string // 错误描述
+	Code       int    // JSON-RPC 错误码（数字，用于 RPC 层）
+	StringCode string // 业务错误码（字符串，与 Python/JS SDK error_codes 对齐）
+	Data       any    // 附加数据
+	Retryable  bool   // 是否可重试
+	TraceID    string // 链路追踪 ID
+	Cause      error  // 原始错误（用于 errors.Unwrap 链）
 }
 
 func (e *AUNError) Error() string {
+	if e.StringCode != "" {
+		return fmt.Sprintf("[%s] %s", e.StringCode, e.Message)
+	}
 	if e.Code != 0 && e.Code != -1 {
 		return fmt.Sprintf("[%d] %s", e.Code, e.Message)
 	}
@@ -48,9 +52,14 @@ func WrapError(cause error, message string, opts ...ErrorOption) *AUNError {
 // ErrorOption 错误构建选项
 type ErrorOption func(*AUNError)
 
-// WithCode 设置错误码
+// WithCode 设置 JSON-RPC 数字错误码
 func WithCode(code int) ErrorOption {
 	return func(e *AUNError) { e.Code = code }
+}
+
+// WithStringCode 设置业务字符串错误码（与 Python/JS SDK error_codes 对齐）
+func WithStringCode(code string) ErrorOption {
+	return func(e *AUNError) { e.StringCode = code }
 }
 
 // WithData 设置附加数据

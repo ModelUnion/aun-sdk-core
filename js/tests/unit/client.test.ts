@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AUNClient } from '../../src/client.js';
+import { AIDStore } from '../../src/aid-store.js';
 import { RPCTransport } from '../../src/transport.js';
 import { AuthError, ConnectionError, StateError, PermissionError, ValidationError } from '../../src/errors.js';
 import { ProtectedHeaders } from '../../src/e2ee.js';
@@ -58,7 +59,7 @@ describe('AUNClient 构造', () => {
 describe('AUNClient 初始状态', () => {
   it('初始状态应为 idle', () => {
     const client = new AUNClient();
-    expect(client.state).toBe('idle');
+    expect(client.state).toBe('no_identity');
   });
 
   it('初始 AID 应为 null', () => {
@@ -79,22 +80,22 @@ describe('AUNClient 初始状态', () => {
 });
 
 describe('AUNClient.connect 参数校验', () => {
-  it('缺少 access_token 应抛 StateError', async () => {
+  it('未加载 AID 时抛 StateError', async () => {
     const client = new AUNClient();
     await expect(client.connect({ gateway: 'wss://localhost/aun' }))
       .rejects.toThrow(StateError);
   });
 
-  it('缺少 gateway 应抛 StateError', async () => {
+  it('不接受旧版 access_token 参数', async () => {
     const client = new AUNClient();
     await expect(client.connect({ access_token: 'token-123' }))
-      .rejects.toThrow(StateError);
+      .rejects.toThrow(ValidationError);
   });
 
-  it('空 access_token 应抛 StateError', async () => {
+  it('不接受旧版 aid/token 混入 connect options', async () => {
     const client = new AUNClient();
-    await expect(client.connect({ access_token: '', gateway: 'wss://localhost/aun' }))
-      .rejects.toThrow(StateError);
+    await expect(client.connect({ aid: 'alice.agentid.pub' } as any))
+      .rejects.toThrow(ValidationError);
   });
 });
 
@@ -110,7 +111,7 @@ describe('AUNClient.call 状态检查', () => {
     const client = new AUNClient();
     // 需要先将状态设为 connected 才能触发内部方法检查
     // 但无法在单元测试中模拟完整连接，此处跳过
-    expect(client.state).toBe('idle');
+    expect(client.state).toBe('no_identity');
   });
 });
 
@@ -189,9 +190,24 @@ describe('AUNClient.on', () => {
 });
 
 describe('AUNClient 子模块可访问', () => {
-  it('auth 命名空间应可用', () => {
+  it('不再公开 auth/meta/custody 命名空间和旧 convenience 方法', () => {
     const client = new AUNClient();
-    expect(client.auth).toBeDefined();
+    expect((client as any).auth).toBeUndefined();
+    expect((client as any).meta).toBeUndefined();
+    expect((client as any).custody).toBeUndefined();
+    for (const name of [
+      'fetchAgentMd',
+      'checkAgentMd',
+      'listIdentities',
+      'checkGatewayHealth',
+      'setAgentMdPath',
+      'SetAgentMDPath',
+      'ping',
+      'status',
+      'trustRoots',
+    ]) {
+      expect((client as any)[name]).toBeUndefined();
+    }
   });
 
   it('V1 e2ee 管理器不再公开', () => {
@@ -249,17 +265,21 @@ describe('AUNClient.disconnect', () => {
     await client.disconnect();
 
     expect((client as any)._transport.close).toHaveBeenCalledTimes(1);
-    expect(client.state).toBe('disconnected');
+    expect(client.state).toBe('standby');
   });
 
   it('disconnected 后应允许再次 connect', async () => {
     const client = new AUNClient();
     (client as any)._state = 'disconnected';
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
     (client as any)._connectOnce = vi.fn().mockResolvedValue(undefined);
     (client as any)._transport.setTimeout = vi.fn();
 
     await client.connect({
-      access_token: 'tok-1',
       gateway: 'ws://gateway.example.com/aun',
     });
 
@@ -267,27 +287,35 @@ describe('AUNClient.disconnect', () => {
   });
 });
 
-describe('AUNClient.listIdentities', () => {
-  it('应返回本地身份摘要', async () => {
+describe('AIDStore.list', () => {
+  it('替代旧 AUNClient.listIdentities 返回本地 AID 摘要', async () => {
     const client = new AUNClient();
-    const ks = (client as any)._keystore;
+    expect((client as any).listIdentities).toBeUndefined();
 
-    await ks.saveIdentity('alice.agentid.pub', {
-      aid: 'alice.agentid.pub',
-      private_key_pem: 'PRIVATE_KEY',
-      access_token: 'tok-1',
-      refresh_token: 'ref-1',
-    });
-
-    await expect(client.listIdentities()).resolves.toEqual([
-      {
-        aid: 'alice.agentid.pub',
-        metadata: {
-          access_token: 'tok-1',
-          refresh_token: 'ref-1',
+    const store = new AIDStore({ aunPath: 'aun-list-test', encryptionSeed: 'seed-list-test' });
+    (store as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.agentid.pub']);
+    (store as any).load = vi.fn().mockResolvedValue({
+      ok: true,
+      data: {
+        aid: {
+          aid: 'alice.agentid.pub',
+          certFingerprint: 'sha256:abc',
+          isPrivateKeyValid: () => true,
         },
       },
-    ]);
+    });
+
+    await expect(store.list()).resolves.toEqual({
+      ok: true,
+      data: {
+        identities: [
+          {
+            aid: 'alice.agentid.pub',
+            certFingerprint: 'sha256:abc',
+          },
+        ],
+      },
+    });
   });
 });
 
@@ -431,9 +459,9 @@ describe('AUNClient M25 重连行为', () => {
       await reconnectLoop;
 
       expect((client as any)._connectOnce).toHaveBeenCalledTimes(2);
-      expect(client.state).toBe('terminal_failed');
+      expect(client.state).toBe('connection_failed');
       expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
-        state: 'terminal_failed',
+        state: 'connection_failed',
         reason: 'max_attempts_exhausted',
         attempt: 2,
       }));
@@ -470,9 +498,9 @@ describe('AUNClient M25 重连行为', () => {
       await vi.advanceTimersByTimeAsync(4_000);
       await reconnectLoop;
 
-      expect(client.state).toBe('terminal_failed');
+      expect(client.state).toBe('connection_failed');
       expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
-        state: 'terminal_failed',
+        state: 'connection_failed',
         reason: 'max_attempts_exhausted',
       }));
       // _connectOnce 不应被调用（health 一直失败）
@@ -898,11 +926,13 @@ describe('_connectOnce 应等待 _restoreSeqTrackerState 完成后再调用 tran
     (client as any)._auth.initializeWithToken = vi.fn().mockResolvedValue(undefined);
     (client as any)._syncIdentityAfterConnect = vi.fn().mockResolvedValue(undefined);
     (client as any)._startBackgroundTasks = vi.fn();
+    vi.spyOn(client as any, '_initV2Session').mockResolvedValue(undefined);
+    (client as any)._safeAsync = vi.fn();
 
-    await client.connect({
+    await (client as any)._connectOnce({
       access_token: 'tok-1',
       gateway: 'ws://gateway.example.com/aun',
-    });
+    }, false);
 
     // restore 必须在 connect 之前完成
     const restoreIdx = callOrder.indexOf('restore');
@@ -988,7 +1018,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     async (code) => {
       const { client, safeAsyncSpy } = makeDisconnectClient();
       await (client as any)._handleTransportDisconnect(new Error('test'), code);
-      expect(client.state).toBe('terminal_failed');
+      expect(client.state).toBe('connection_failed');
       expect(safeAsyncSpy).not.toHaveBeenCalled();
     },
   );
@@ -999,7 +1029,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
       const { client, safeAsyncSpy } = makeDisconnectClient();
       await (client as any)._handleTransportDisconnect(new Error('test'), code);
       expect(safeAsyncSpy).toHaveBeenCalled();
-      expect(client.state).not.toBe('terminal_failed');
+      expect(client.state).not.toBe('connection_failed');
     },
   );
 
@@ -1009,7 +1039,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     expect((client as any)._serverKicked).toBe(true);
 
     await (client as any)._handleTransportDisconnect(new Error('test'), 4009);
-    expect(client.state).toBe('terminal_failed');
+    expect(client.state).toBe('connection_failed');
     expect(safeAsyncSpy).not.toHaveBeenCalled();
   });
 
@@ -1018,7 +1048,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     (client as any)._serverKicked = true;
 
     await (client as any)._handleTransportDisconnect(new Error('test'), 1006);
-    expect(client.state).toBe('terminal_failed');
+    expect(client.state).toBe('connection_failed');
     expect(safeAsyncSpy).not.toHaveBeenCalled();
   });
 });
@@ -1258,8 +1288,15 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     const body = '---\naid: alice.agentid.pub\n---\n# Alice\n';
     const signed = `${body}\n<!-- AUN-SIGNATURE\nsignature: x\n-->\n`;
     await writeAgentFile(client, 'alice.agentid.pub', body);
-    (client.auth as any).signAgentMd = vi.fn(async () => signed);
-    (client.auth as any).uploadAgentMd = vi.fn(async () => ({
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+      signAgentMd: vi.fn(() => ({
+        ok: true,
+        data: { signed },
+      })),
+    };
+    (client as any)._uploadAgentMd = vi.fn(async () => ({
       etag: '"alice-cloud"',
       last_modified: 'Sun, 24 May 2026 13:00:00 GMT',
     }));
@@ -1279,9 +1316,9 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     const client = makeAgentClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    (client.auth as any).downloadAgentMd = vi.fn(async () => body);
-    (client.auth as any).verifyAgentMd = vi.fn(async () => ({ status: 'verified', verified: true }));
-    (client.auth as any)._agentMdCache = new Map([
+    (client as any)._downloadAgentMd = vi.fn(async () => body);
+    (client as any)._verifyAgentMd = vi.fn(async () => ({ status: 'verified', verified: true }));
+    (client as any)._agentMdCache = new Map([
       ['bob.agentid.pub', {
         text: body,
         etag: '"bob-cloud"',
@@ -1289,7 +1326,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
       }],
     ]);
 
-    const info = await client.fetchAgentMd('bob.agentid.pub');
+    const info = await (client as any)._fetchAgentMdCache('bob.agentid.pub');
 
     expect(info.aid).toBe('bob.agentid.pub');
     const saved = await readAgentStorage(client, 'bob.agentid.pub/agent.md');
@@ -1393,7 +1430,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
       local_etag: agentEtag(body),
       remote_etag: '"old"',
     });
-    (client.auth as any).headAgentMd = vi.fn(async (aid: string) => ({
+    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
       aid,
       found: true,
       etag: agentEtag(body),
@@ -1401,7 +1438,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
       status: 200,
     }));
 
-    const result = await client.checkAgentMd('bob.agentid.pub');
+    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub');
 
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
@@ -1415,7 +1452,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
   it('checkAgentMd 本地无记录时仍应 HEAD 云端并返回 local_found=false', async () => {
     const client = makeAgentClient();
     (client as any)._aid = 'alice.agentid.pub';
-    (client.auth as any).headAgentMd = vi.fn(async (aid: string) => ({
+    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
       aid,
       found: true,
       etag: '"remote"',
@@ -1423,7 +1460,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
       status: 200,
     }));
 
-    const result = await client.checkAgentMd('carol.agentid.pub');
+    const result = await (client as any)._checkAgentMdCache('carol.agentid.pub');
 
     expect(result.local_found).toBe(false);
     expect(result.remote_found).toBe(true);

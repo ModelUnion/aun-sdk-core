@@ -103,8 +103,8 @@ func (d *EventDispatcher) unsubscribeByID(event string, id uint64) {
 	}
 }
 
-// Publish 发布事件，每个 handler 在独立 goroutine 中异步执行。
-// ISSUE-SDK-GO-006: handler 异步化，避免用户注册的外部 handler 阻塞事件循环。
+// Publish 发布事件，按注册顺序同步执行所有 handler。
+// 与 Python/TS/JS SDK 行为一致：handler 阻塞会阻塞事件循环，由调用方负责异步化。
 // 处理函数中的 panic 会被 recover，不会导致其他 handler 或调用方崩溃。
 func (d *EventDispatcher) Publish(event string, payload any) {
 	d.mu.RLock()
@@ -113,7 +113,7 @@ func (d *EventDispatcher) Publish(event string, payload any) {
 	d.mu.RUnlock()
 
 	for _, entry := range entries {
-		go func(e handlerEntry) {
+		func(e handlerEntry) {
 			defer func() {
 				if r := recover(); r != nil {
 					pkgLogClient().Error("event %s handler panic: %v", event, r)

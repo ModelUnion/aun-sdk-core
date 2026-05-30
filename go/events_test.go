@@ -4,11 +4,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // TestSubscribeAndPublish 验证订阅后能收到发布的事件
-// ISSUE-SDK-GO-006: Publish 改为异步执行，需等待 handler 完成
+// Fix-02: Publish 改为顺序同步执行，返回时 handler 已完成
 func TestSubscribeAndPublish(t *testing.T) {
 	d := NewEventDispatcher()
 	var received atomic.Value
@@ -16,8 +15,6 @@ func TestSubscribeAndPublish(t *testing.T) {
 		received.Store(payload)
 	})
 	d.Publish("test.event", "hello")
-	// 等待异步 handler 完成
-	time.Sleep(50 * time.Millisecond)
 	if received.Load() != "hello" {
 		t.Errorf("收到的 payload 不正确: %v", received.Load())
 	}
@@ -31,20 +28,18 @@ func TestUnsubscribe(t *testing.T) {
 		callCount.Add(1)
 	})
 	d.Publish("test.event", nil)
-	time.Sleep(50 * time.Millisecond)
 	if callCount.Load() != 1 {
 		t.Fatalf("取消订阅前应被调用 1 次, 实际: %d", callCount.Load())
 	}
 	sub.Unsubscribe()
 	d.Publish("test.event", nil)
-	time.Sleep(50 * time.Millisecond)
 	if callCount.Load() != 1 {
 		t.Errorf("取消订阅后不应再被调用, 调用次数: %d", callCount.Load())
 	}
 }
 
-// TestMultipleHandlers 验证同一事件的多个处理器都会执行
-// ISSUE-SDK-GO-006: 异步化后不再保证执行顺序，改为验证全部执行完成
+// TestMultipleHandlers 验证同一事件的多个处理器按注册顺序全部执行
+// Fix-02: 顺序同步执行，保证执行顺序与注册顺序一致
 func TestMultipleHandlers(t *testing.T) {
 	d := NewEventDispatcher()
 	var count atomic.Int64
@@ -58,7 +53,6 @@ func TestMultipleHandlers(t *testing.T) {
 		count.Add(1)
 	})
 	d.Publish("test.event", nil)
-	time.Sleep(100 * time.Millisecond)
 	if count.Load() != 3 {
 		t.Fatalf("应有 3 个处理器执行, 实际: %d", count.Load())
 	}
@@ -72,7 +66,7 @@ func TestPublishNoHandlers(t *testing.T) {
 }
 
 // TestPublishPanicRecovery 验证处理器 panic 不影响后续处理器
-// ISSUE-SDK-GO-006: 异步化后每个 handler 在独立 goroutine 中执行，panic 隔离更彻底
+// Fix-02: 顺序执行下 panic 被 recover，不影响后续 handler 与调用方
 func TestPublishPanicRecovery(t *testing.T) {
 	d := NewEventDispatcher()
 	var secondCalled atomic.Bool
@@ -83,7 +77,6 @@ func TestPublishPanicRecovery(t *testing.T) {
 		secondCalled.Store(true)
 	})
 	d.Publish("test.event", nil)
-	time.Sleep(100 * time.Millisecond)
 	if !secondCalled.Load() {
 		t.Error("第一个处理器 panic 后，第二个处理器应仍被执行")
 	}
@@ -113,8 +106,6 @@ func TestConcurrentPublish(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	// 等待所有异步 handler 完成
-	time.Sleep(200 * time.Millisecond)
 	if count.Load() != 100 {
 		t.Errorf("并发发布计数不正确: %d", count.Load())
 	}

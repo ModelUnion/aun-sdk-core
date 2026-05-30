@@ -130,7 +130,7 @@ func (c *AUNClient) ackV2Internal(ctx context.Context, params map[string]any) (a
 	if upTo == 0 {
 		upTo = toInt64(params["up_to_seq"])
 	}
-	return c.AckV2(ctx, upTo)
+	return c.ackV2(ctx, upTo)
 }
 
 // sendGroupV2Internal 适配 client.Call("group.send", params) → SendGroupV2。
@@ -183,7 +183,7 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	}
 	ns := "group:" + groupID
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
-	msgs, err := c.PullGroupV2(ctx, groupID, afterSeq, limit)
+	msgs, err := c.pullGroupV2(ctx, groupID, afterSeq, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +226,7 @@ func (c *AUNClient) ackGroupV2Internal(ctx context.Context, params map[string]an
 	if upTo == 0 {
 		upTo = toInt64(params["up_to_seq"])
 	}
-	return c.AckGroupV2(ctx, groupID, upTo)
+	return c.ackGroupV2(ctx, groupID, upTo)
 }
 
 // 占位 import 防止 fmt 被去掉；实际使用见错误格式化扩展

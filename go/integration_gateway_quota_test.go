@@ -46,7 +46,7 @@ const gatewayQuotaLimit = 10 // 服务端默认值；与三层配额常量一致
 func quotaTestClient(t *testing.T, aunPath string) *AUNClient {
 	t.Helper()
 	t.Setenv("AUN_ENV", "development")
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": aunPath,
 	}, true)
 	client.configModel.RequireForwardSecrecy = false
@@ -58,18 +58,12 @@ func quotaConnectLong(t *testing.T, client *AUNClient, aid, slotID string, timeo
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		return fmt.Errorf("authenticate failed: %w", err)
-	}
-	if slotID != "" {
-		authResult["slot_id"] = slotID
-	}
-	authResult["connection_kind"] = "long"
-	return client.Connect(ctx, authResult, &ConnectOptions{
+	integrationLoadAIDIntoClient(t, client, aid)
+	return client.Connect(ctx, &ConnectOptions{
 		AutoReconnect:     false,
 		HeartbeatInterval: 30,
 		ConnectionKind:    "long",
+		SlotID:            slotID,
 	})
 }
 
@@ -78,33 +72,18 @@ func quotaConnectShort(t *testing.T, client *AUNClient, aid, slotID string, shor
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		return fmt.Errorf("authenticate failed: %w", err)
-	}
-	if slotID != "" {
-		authResult["slot_id"] = slotID
-	}
-	authResult["connection_kind"] = "short"
-	if shortTtlMs > 0 {
-		authResult["short_ttl_ms"] = shortTtlMs
-	}
-	return client.Connect(ctx, authResult, &ConnectOptions{
+	integrationLoadAIDIntoClient(t, client, aid)
+	return client.Connect(ctx, &ConnectOptions{
 		ConnectionKind: "short",
 		ShortTtlMs:     shortTtlMs,
+		SlotID:         slotID,
 	})
 }
 
 // createAIDInPath 在指定目录创建 AID（不连接）
 func createAIDInPath(t *testing.T, aunPath, aid string) {
 	t.Helper()
-	setup := quotaTestClient(t, aunPath)
-	defer func() { _ = setup.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, err := setup.Auth.CreateAID(ctx, map[string]any{"aid": aid}); err != nil {
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
-	}
+	integrationRegisterAIDInPath(t, aunPath, aid)
 }
 
 // quotaDisconnectInfo 一次 gateway.disconnect 通知的关键信息
@@ -252,10 +231,10 @@ func TestGatewayQuota_AidDeviceSlot(t *testing.T) {
 	t.Logf("[OK] 第 %d 个 client 收到 4015 + %s（kicked slot=%q, evicted_by=%v）",
 		idx, quotaKind, kickedSlot, evictedBy)
 
-	// 等待状态切换到 terminal_failed
+	// 等待状态切换到 connection_failed / closed / standby
 	time.Sleep(500 * time.Millisecond)
-	if state := clients[idx].State(); state != StateTerminalFailed && state != StateClosed && state != StateDisconnected {
-		t.Fatalf("被踢的 client[%d] 状态应为 terminal_failed/closed/disconnected, got=%s", idx, state)
+	if state := clients[idx].State(); state != ConnStateConnectionFailed && state != ConnStateClosed && state != ConnStateStandby {
+		t.Fatalf("被踢的 client[%d] 状态应为 connection_failed/closed/standby, got=%s", idx, state)
 	}
 	t.Logf("[OK] 被踢 client[%d] 状态=%s（4015 不重连）", idx, clients[idx].State())
 }
@@ -356,8 +335,8 @@ func TestGatewayQuota_AidDevices(t *testing.T) {
 	t.Logf("[OK] 第 %d 个 client 收到 4015 + %s", idx, quotaKind)
 
 	time.Sleep(500 * time.Millisecond)
-	if state := clients[idx].State(); state != StateTerminalFailed && state != StateClosed && state != StateDisconnected {
-		t.Fatalf("被踢的 client[%d] 状态应为 terminal_failed/closed/disconnected, got=%s", idx, state)
+	if state := clients[idx].State(); state != ConnStateConnectionFailed && state != ConnStateClosed && state != ConnStateStandby {
+		t.Fatalf("被踢的 client[%d] 状态应为 connection_failed/closed/standby, got=%s", idx, state)
 	}
 }
 
@@ -434,8 +413,8 @@ func TestGatewayQuota_DeviceAids(t *testing.T) {
 	t.Logf("[OK] 第 %d 个 client 收到 4015 + %s（aid=%s）", idx, quotaKind, aids[idx])
 
 	time.Sleep(500 * time.Millisecond)
-	if state := clients[idx].State(); state != StateTerminalFailed && state != StateClosed && state != StateDisconnected {
-		t.Fatalf("被踢的 client[%d] 状态应为 terminal_failed/closed/disconnected, got=%s", idx, state)
+	if state := clients[idx].State(); state != ConnStateConnectionFailed && state != ConnStateClosed && state != ConnStateStandby {
+		t.Fatalf("被踢的 client[%d] 状态应为 connection_failed/closed/standby, got=%s", idx, state)
 	}
 }
 
@@ -480,10 +459,10 @@ func TestGatewayQuota_ShortIdleSliding(t *testing.T) {
 		case <-time.After(time.Duration(ttlMs)*time.Millisecond + 5*time.Second):
 			t.Fatalf("超时未被服务端 idle ttl 关闭")
 		}
-		// 状态应已切到 disconnected/terminal_failed
+		// 状态应已切到非 ready
 		time.Sleep(300 * time.Millisecond)
-		if state := c.State(); state == StateConnected {
-			t.Fatalf("idle 关闭后状态仍为 connected: %s", state)
+		if state := c.State(); state == ConnStateReady {
+			t.Fatalf("idle 关闭后状态仍为 ready: %s", state)
 		}
 	})
 
@@ -538,8 +517,8 @@ func TestGatewayQuota_ShortIdleSliding(t *testing.T) {
 		if got := disconnects.Load(); got != 0 {
 			t.Fatalf("保活期间不应收到 gateway.disconnect, got=%d", got)
 		}
-		if state := c.State(); state != StateConnected {
-			t.Fatalf("保活期间状态应为 connected, got=%s", state)
+		if state := c.State(); state != ConnStateReady {
+			t.Fatalf("保活期间状态应为 ready, got=%s", state)
 		}
 		t.Logf("[OK] 保活短连接（ping 间隔 700ms < ttl=%dms）在 %d ms 内未被踢", ttlMs, ttlMs*3)
 	})

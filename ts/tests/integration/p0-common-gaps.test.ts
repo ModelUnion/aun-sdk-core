@@ -25,6 +25,13 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
 import { ConnectionError, StateError } from '../../src/errors.js';
+import {
+  createAIDStoreForClient,
+  registerAndLoadIdentity,
+  registerIdentity,
+  resolveGateway,
+  setGatewayForClient,
+} from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -40,17 +47,15 @@ function runId(): string {
 
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-p0-'));
-  const client = new AUNClient({ aun_path: tmpDir }, true);
+  const client = new AUNClient({ aun_path: tmpDir, debug: true });
   ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
   return client;
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth);
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+  await registerAndLoadIdentity(client, aid);
+  await client.connect();
 }
 
 function sleep(ms: number): Promise<void> {
@@ -73,8 +78,8 @@ describe('P0-01: 网关健康检查（真实 Gateway）', () => {
   it('正常健康检查 — 真实 Gateway 应返回 true', async () => {
     const client = makeClient();
     try {
-      const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-      const ok = await client.checkGatewayHealth(gateway, 10_000);
+      const gateway = await resolveGateway(client, GATEWAY_DISCOVERY_AID);
+      const ok = await (client as any)._discovery.checkHealth(gateway, 10_000);
       expect(ok).toBe(true);
     } finally {
       await client.close();
@@ -85,7 +90,7 @@ describe('P0-01: 网关健康检查（真实 Gateway）', () => {
     const client = makeClient();
     try {
       const start = Date.now();
-      const ok = await client.checkGatewayHealth('https://192.0.2.1:9999', 2_000);
+      const ok = await (client as any)._discovery.checkHealth('https://192.0.2.1:9999', 2_000);
       const elapsed = Date.now() - start;
       expect(ok).toBe(false);
       expect(elapsed).toBeLessThan(5_000);
@@ -97,7 +102,7 @@ describe('P0-01: 网关健康检查（真实 Gateway）', () => {
   it('连接拒绝 — 无服务端口应返回 false', async () => {
     const client = makeClient();
     try {
-      const ok = await client.checkGatewayHealth('https://127.0.0.1:1', 3_000);
+      const ok = await (client as any)._discovery.checkHealth('https://127.0.0.1:1', 3_000);
       expect(ok).toBe(false);
     } finally {
       await client.close();
@@ -115,14 +120,13 @@ describe('P0-02: AID 创建失败路径（真实 Gateway）', () => {
     const c2 = makeClient();
 
     try {
-      const gw = await c1.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-      ((c1 as unknown) as { _gatewayUrl: string })._gatewayUrl = gw;
+      const gw = await setGatewayForClient(c1, GATEWAY_DISCOVERY_AID);
       ((c2 as unknown) as { _gatewayUrl: string })._gatewayUrl = gw;
 
-      await c1.auth.registerAid({ aid });
+      await registerIdentity(c1, aid);
       // 第二次创建 — 要么报错要么幂等
       try {
-        await c2.auth.registerAid({ aid });
+        await registerIdentity(c2, aid);
         // 幂等设计也可接受
       } catch (e) {
         // 报错也可接受
@@ -136,11 +140,12 @@ describe('P0-02: AID 创建失败路径（真实 Gateway）', () => {
 
   it('空 AID 应被拒绝', async () => {
     const client = makeClient();
+    const store = createAIDStoreForClient(client);
     try {
-      const gw = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-      ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gw;
-      await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow();
+      const result = await store.register('');
+      expect(result.ok).toBe(false);
     } finally {
+      store.close();
       await client.close();
     }
   }, TEST_TIMEOUT);
@@ -284,8 +289,8 @@ describe('P0-08: 重连中补洞（真实 Gateway）', () => {
 
       // 清空收集，重连
       received.length = 0;
-      const auth = await bob.auth.authenticate({ aid: bobAid });
-      await bob.connect(auth);
+      await bob.authenticate();
+      await bob.connect();
 
       // 等待补洞
       const timeout = new Promise<void>((_, reject) =>
@@ -438,16 +443,14 @@ describe('P0-04: Login 重放攻击（真实 Gateway）', () => {
     const client = makeClient();
 
     try {
-      const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-      ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
+      await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+      await registerAndLoadIdentity(client, aid);
 
-      await client.auth.registerAid({ aid });
-
-      const auth1 = await client.auth.authenticate({ aid });
+      const auth1 = await client.authenticate();
       expect(auth1).toBeDefined();
       expect(auth1.access_token).toBeDefined();
 
-      const auth2 = await client.auth.authenticate({ aid });
+      const auth2 = await client.authenticate();
       expect(auth2).toBeDefined();
       expect(auth2.access_token).toBeDefined();
 
@@ -527,18 +530,16 @@ describe('P0-03: Login 过期挑战（真实 Gateway）', () => {
     const client = makeClient();
 
     try {
-      const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-      ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
+      await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+      await registerAndLoadIdentity(client, aid);
 
-      await client.auth.registerAid({ aid });
-
-      const auth1 = await client.auth.authenticate({ aid });
+      const auth1 = await client.authenticate();
       expect(auth1).toBeDefined();
       expect(auth1.access_token).toBeDefined();
 
       await sleep(2_000);
 
-      const auth2 = await client.auth.authenticate({ aid });
+      const auth2 = await client.authenticate();
       expect(auth2).toBeDefined();
       expect(auth2.access_token).toBeDefined();
 
@@ -562,11 +563,12 @@ describe('P0-05: Token 并发刷新（真实 Gateway）', () => {
     const client = makeClient();
 
     try {
-      await ensureConnected(client, aid);
+      await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+      await registerAndLoadIdentity(client, aid);
 
       // 并发发起 5 个 authenticate — inflight 限流应让它们复用同一次调用
       const promises = Array.from({ length: 5 }, () =>
-        client.auth.authenticate({ aid }).catch((e: Error) => e),
+        client.authenticate().catch((e: Error) => e),
       );
       const results = await Promise.all(promises);
 
@@ -586,7 +588,7 @@ describe('P0-05: Token 并发刷新（真实 Gateway）', () => {
 
       // inflight 标志应在成功/出错/超时后清理 — 后续 authenticate 应正常
       await sleep(500);
-      const authAfter = await client.auth.authenticate({ aid });
+      const authAfter = await client.authenticate();
       expect(authAfter.access_token).toBeDefined();
       console.log('inflight 清理正常: 后续 authenticate 成功');
     } finally {
@@ -704,8 +706,8 @@ describe('P0-14: 断线后 RPC + 重连恢复（真实 Gateway）', () => {
       await expect(client.call('meta.ping')).rejects.toThrow();
 
       // 重连
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+      await client.authenticate();
+      await client.connect();
 
       // 重连后 RPC — 应恢复
       await expect(client.call('meta.ping')).resolves.toBeDefined();

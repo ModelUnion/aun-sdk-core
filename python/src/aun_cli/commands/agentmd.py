@@ -54,7 +54,7 @@ def agentmd_path(
     async def _run():
         resolved = resolve_profile_config(ctx)
         if path is None:
-            current = resolved.get("agentmd_path") or str(Path(resolved["aun_path"]) / "AgentMDs")
+            current = resolved.get("agentmd_path") or str(Path(resolved["aun_path"]) / "AIDs")
             return {"agentmd_path": current}
         return {"agentmd_path": str(Path(path))}
 

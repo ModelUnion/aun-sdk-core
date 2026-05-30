@@ -14,16 +14,28 @@ export interface JsonArray extends Array<JsonValue> {}
 /** JSON 值类型 */
 export type JsonValue = JsonPrimitive | JsonObject | JsonArray;
 
-/** 连接状态 */
-export type ConnectionState =
-  | 'idle'
-  | 'connecting'
-  | 'authenticating'
-  | 'connected'
-  | 'disconnected'
-  | 'reconnecting'
-  | 'terminal_failed'
-  | 'closed';
+/** AUNClient 连接状态枚举 — 对齐 Python/TS SDK */
+export enum ConnectionState {
+  NO_IDENTITY = 'no_identity',
+  STANDBY = 'standby',
+  AUTHENTICATED = 'authenticated',
+  CONNECTING = 'connecting',
+  READY = 'ready',
+  RETRY_BACKOFF = 'retry_backoff',
+  RECONNECTING = 'reconnecting',
+  CONNECTION_FAILED = 'connection_failed',
+  CLOSED = 'closed',
+}
+
+export const STATE_TO_PUBLIC: Record<string, ConnectionState> = {
+  idle: ConnectionState.NO_IDENTITY,
+  authenticating: ConnectionState.CONNECTING,
+  connected: ConnectionState.READY,
+  disconnected: ConnectionState.STANDBY,
+  terminal_failed: ConnectionState.CONNECTION_FAILED,
+  retry_backoff: ConnectionState.RETRY_BACKOFF,
+  reconnecting: ConnectionState.RECONNECTING,
+};
 
 /** 判断值是否为普通 JSON 对象 */
 export function isJsonObject(value: unknown): value is JsonObject {

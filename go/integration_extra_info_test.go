@@ -41,16 +41,12 @@ func TestExtraInfo_KickCarriesBothInfos(t *testing.T) {
 
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
-	authResult1, err := c1.Auth.Authenticate(ctx1, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("无法认证（Docker 环境可能未运行）: %v", err)
-	}
-	authResult1["slot_id"] = "extra-slot"
-	authResult1["connection_kind"] = "long"
-	if err := c1.Connect(ctx1, authResult1, &ConnectOptions{
+	integrationLoadAIDIntoClient(t, c1, aid)
+	if err := c1.Connect(ctx1, &ConnectOptions{
 		AutoReconnect:     false,
 		HeartbeatInterval: 30,
 		ConnectionKind:    "long",
+		SlotID:            "extra-slot",
 		ExtraInfo:         map[string]any{"pid": "1111"},
 	}); err != nil {
 		t.Fatalf("c1 连接失败: %v", err)
@@ -66,16 +62,12 @@ func TestExtraInfo_KickCarriesBothInfos(t *testing.T) {
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
-	authResult2, err := c2.Auth.Authenticate(ctx2, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("c2 认证失败: %v", err)
-	}
-	authResult2["slot_id"] = "extra-slot"
-	authResult2["connection_kind"] = "long"
-	if err := c2.Connect(ctx2, authResult2, &ConnectOptions{
+	integrationLoadAIDIntoClient(t, c2, aid)
+	if err := c2.Connect(ctx2, &ConnectOptions{
 		AutoReconnect:     false,
 		HeartbeatInterval: 30,
 		ConnectionKind:    "long",
+		SlotID:            "extra-slot",
 		ExtraInfo:         map[string]any{"pid": "2222"},
 	}); err != nil {
 		t.Fatalf("c2 连接失败: %v", err)
@@ -139,16 +131,12 @@ func TestExtraInfo_EmptyWhenNotProvided(t *testing.T) {
 
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
-	authResult1, err := c1.Auth.Authenticate(ctx1, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("无法认证（Docker 环境可能未运行）: %v", err)
-	}
-	authResult1["slot_id"] = "no-extra-slot"
-	authResult1["connection_kind"] = "long"
-	if err := c1.Connect(ctx1, authResult1, &ConnectOptions{
+	integrationLoadAIDIntoClient(t, c1, aid)
+	if err := c1.Connect(ctx1, &ConnectOptions{
 		AutoReconnect:     false,
 		HeartbeatInterval: 30,
 		ConnectionKind:    "long",
+		SlotID:            "no-extra-slot",
 	}); err != nil {
 		t.Fatalf("c1 连接失败: %v", err)
 	}
@@ -162,16 +150,12 @@ func TestExtraInfo_EmptyWhenNotProvided(t *testing.T) {
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
-	authResult2, err := c2.Auth.Authenticate(ctx2, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("c2 认证失败: %v", err)
-	}
-	authResult2["slot_id"] = "no-extra-slot"
-	authResult2["connection_kind"] = "long"
-	if err := c2.Connect(ctx2, authResult2, &ConnectOptions{
+	integrationLoadAIDIntoClient(t, c2, aid)
+	if err := c2.Connect(ctx2, &ConnectOptions{
 		AutoReconnect:     false,
 		HeartbeatInterval: 30,
 		ConnectionKind:    "long",
+		SlotID:            "no-extra-slot",
 	}); err != nil {
 		t.Fatalf("c2 连接失败: %v", err)
 	}

@@ -72,11 +72,9 @@ async function installV2P2PHelpers(page: any): Promise<void> {
     /** 创建 AUNClient 并连接到 gateway */
     const makeAndConnect = async (aid: string, deviceId?: string): Promise<any> => {
       const AUN = w.AUN;
-      const client = new AUN.AUNClient({ issuer }, true);
+      const client = new AUN.AUNClient({ issuer, debug: true });
       if (deviceId) client._deviceId = deviceId;
-      try { await client.auth.registerAid({ aid }); } catch {}
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
       return client;
     };
 
@@ -161,8 +159,8 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
 
       // 清空旧消息
       try {
-        const old = await bob.pullV2(0, 200);
-        if (old.length > 0) await bob.ackV2();
+        const old = await (bob as any)._pullV2(0, 200);
+        if (old.length > 0) await (bob as any)._ackV2();
       } catch {}
 
       const testText = `v2-p2p-test-${Date.now()}`;
@@ -170,7 +168,7 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
         msg?.payload?.text === testText,
       );
 
-      const sendResult = await alice.sendV2(bobAid, { text: testText });
+      const sendResult = await (alice as any)._sendV2(bobAid, { text: testText });
 
       // 等待 push 或 fallback 到 pull
       let pushed = await pushPromise;
@@ -180,7 +178,7 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
       }
       if (!msg) {
         await sleep(1000);
-        const pulled = await bob.pullV2();
+        const pulled = await (bob as any)._pullV2();
         msg = (pulled as any[]).find((m: any) => m?.payload?.text === testText);
       }
 
@@ -222,20 +220,20 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
         msg?.payload?.text === testText,
       );
 
-      await alice.sendV2(bobAid, { text: testText });
+      await (alice as any)._sendV2(bobAid, { text: testText });
 
       // 等待收到
       let pushed = await pushPromise;
       if (pushed.length === 0) {
         await sleep(1000);
-        pushed = await bob.pullV2();
+        pushed = await (bob as any)._pullV2();
       }
 
       const pushedSeq = Number(pushed[0]?.seq ?? 0);
       const contiguousSeq = bob._seqTracker.getContiguousSeq(ns);
 
       // 应用层不调用 ackV2；SDK 已基于本地 contiguous_seq 避免重复拉取。
-      const afterReceivePull = await bob.pullV2();
+      const afterReceivePull = await (bob as any)._pullV2();
 
       await alice.close();
       await bob.close();
@@ -270,12 +268,12 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
       const pushBob = waitForPush(bob, aliceAid, 1, 15000, (msg: any) =>
         msg?.payload?.text === textA2B,
       );
-      await alice.sendV2(bobAid, { text: textA2B });
+      await (alice as any)._sendV2(bobAid, { text: textA2B });
       let bobMsgs = await pushBob;
       let bobMsg: any = bobMsgs.find((m: any) => m?.payload?.text === textA2B);
       if (!bobMsg) {
         await sleep(1000);
-        const pulled = await bob.pullV2();
+        const pulled = await (bob as any)._pullV2();
         bobMsg = (pulled as any[]).find((m: any) => m?.payload?.text === textA2B);
       }
 
@@ -284,12 +282,12 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
       const pushAlice = waitForPush(alice, bobAid, 1, 15000, (msg: any) =>
         msg?.payload?.text === textB2A,
       );
-      await bob.sendV2(aliceAid, { text: textB2A });
+      await (bob as any)._sendV2(aliceAid, { text: textB2A });
       let aliceMsgs = await pushAlice;
       let aliceMsg: any = aliceMsgs.find((m: any) => m?.payload?.text === textB2A);
       if (!aliceMsg) {
         await sleep(1000);
-        const pulled = await alice.pullV2();
+        const pulled = await (alice as any)._pullV2();
         aliceMsg = (pulled as any[]).find((m: any) => m?.payload?.text === textB2A);
       }
 
@@ -323,7 +321,7 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
       const bob = await makeAndConnect(bobAid);
 
       // 清空旧消息
-      try { await bob.ackV2(); } catch {}
+      try { await (bob as any)._ackV2(); } catch {}
 
       const N = 3;
       const texts = Array.from({ length: N }, (_, i) => `batch-${i}-${Date.now()}`);
@@ -335,7 +333,7 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
       });
 
       for (const text of texts) {
-        await alice.sendV2(bobAid, { text });
+        await (alice as any)._sendV2(bobAid, { text });
       }
 
       // 等待 push 投递（与 Python 对齐：30 × 200ms = 6s）
@@ -348,7 +346,7 @@ test.describe('V2 P2P E2EE 端到端测试', () => {
       if (pushMsgs.length >= N) {
         receivedTexts = pushMsgs.map((m: any) => m?.payload?.text).filter(Boolean);
       } else {
-        const pulled = await bob.pullV2();
+        const pulled = await (bob as any)._pullV2();
         const allMsgs = [...pushMsgs, ...(Array.isArray(pulled) ? pulled : [])];
         receivedTexts = allMsgs.map((m: any) => m?.payload?.text).filter(Boolean);
       }

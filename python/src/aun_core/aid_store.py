@@ -126,6 +126,8 @@ class AIDStore:
                     private_key_obj=None,
                     cert_valid=True,
                     private_key_valid=False,
+                    device_id=self.device_id,
+                    slot_id=self.slot_id,
                 )
             })
 
@@ -159,6 +161,8 @@ class AIDStore:
                 private_key_obj=private_key,
                 cert_valid=True,
                 private_key_valid=True,
+                device_id=self.device_id,
+                slot_id=self.slot_id,
             )
         })
 

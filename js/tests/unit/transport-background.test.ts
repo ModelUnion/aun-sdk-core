@@ -28,6 +28,17 @@ describe('RPCTransport 后台 RPC 调度', () => {
     vi.useRealTimers();
   });
 
+  it('transport 已关闭时应在错误中保留最近 WebSocket close code', async () => {
+    const { transport } = createReadyTransport();
+
+    (transport as any)._lastCloseCode = 4013;
+    (transport as any)._lastCloseReason = 'short_connection_capacity_exceeded';
+    (transport as any)._closed = true;
+
+    await expect(transport.call('auth.connect', {})).rejects.toThrow(/4013/);
+    await expect(transport.call('auth.connect', {})).rejects.toThrow(/short_connection_capacity_exceeded/);
+  });
+
   it('后台 RPC 不能占满全部 in-flight，普通 RPC 应优先发送', async () => {
     const { transport, ws } = createReadyTransport();
     const calls = Array.from({ length: 16 }, (_, i) =>

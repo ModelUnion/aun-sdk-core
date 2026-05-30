@@ -49,6 +49,7 @@ js/codex_test_runs/
 pytest-tmp-local/
 pytest-tmp-local-escalated/
 ts/tmp-e2e/
+ts/tmp-aun/
 *.patch
 codex_*.txt
 go/**/*.go.[0-9]*
@@ -64,6 +65,7 @@ docs/sdk/AUN C++ SDK与四语言SDK Gap分析.md
 docs/AUN_SDK_重构修改清单.md
 docs/AUN_SDK_重构实施计划.md
 docs/AUN_SDK_重构设计方案_v3.md
+docs/AUN_SDK_重构审查报告_v4.md
 
 # 打包临时目录（由 scripts/sync_packed_docs.py 生成，发包前生成、发包后保留亦可）
 python/src/aun_core/_packed_docs/

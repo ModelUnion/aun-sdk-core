@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/index.js';
+import { registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -21,12 +22,12 @@ describe('Token refresh 集成测试', () => {
     client.on('token.refreshed', (payload: unknown) => refreshEvents.push(payload));
 
     try {
-      await client.auth.registerAid({ aid });
-      const auth = await client.auth.authenticate({ aid });
+      await registerAndLoadIdentity(client, aid);
+      const auth = await client.authenticate();
       const initialToken = String(auth.access_token ?? '');
       expect(initialToken).not.toBe('');
 
-      await client.connect(auth, {
+      await client.connect({
         auto_reconnect: false,
         heartbeat_interval: 0,
         token_refresh_before: 3590,

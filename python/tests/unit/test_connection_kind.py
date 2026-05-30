@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from aun_core import AUNClient
+from aun_core import __version__ as _aun_version
 
 
 # ── 1. _NO_RECONNECT_CODES 必须包含 4012 / 4013 ────────────────────
@@ -89,7 +90,7 @@ async def test_initialize_session_passes_options_to_auth_connect():
     assert captured["params"]["client"] == {
         "slot_id": "slot-a",
         "sdk_lang": "python",
-        "sdk_version": "0.3.6",
+        "sdk_version": _aun_version,
     }
     options = captured["params"].get("options") or {}
     assert options.get("kind") == "short"

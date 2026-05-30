@@ -274,23 +274,8 @@ func (a *AIDDatabase) SavePrekey(prekeyID, privateKeyPEM, deviceID string, creat
 	defer a.mu.Unlock()
 	now := nowMs()
 
-	// 字段级加密：如果 secretStore 可用且私钥非空，加密后存储
+	// 阶段6：prekey 私钥明文写入（IK 私钥仍由 file.go 加密保护）
 	storedKey := privateKeyPEM
-	if a.secretStore != nil && privateKeyPEM != "" {
-		scope := safeAID(a.aid)
-		rec, err := a.secretStore.Protect(scope, "prekey/"+prekeyID, []byte(privateKeyPEM))
-		if err != nil {
-			// 加密失败降级为明文，记录日志
-			pkgLogKeystore().Warn("SavePrekey encryption failed (id=%s), fallback to plaintext storage: %v", prekeyID, err)
-		} else {
-			encJSON, err2 := json.Marshal(rec)
-			if err2 != nil {
-				pkgLogKeystore().Warn("SavePrekey serialize encrypted record failed (id=%s), fallback to plaintext storage: %v", prekeyID, err2)
-			} else {
-				storedKey = string(encJSON)
-			}
-		}
-	}
 
 	dataJSON, err := json.Marshal(extraData)
 	if err != nil {
@@ -1253,22 +1238,8 @@ func (a *AIDDatabase) SaveSession(sessionID string, data map[string]any) {
 		dataJSON = []byte("{}")
 	}
 
-	// 字段级加密：如果 secretStore 可用，加密整个 session 数据
+	// 阶段6：session 数据明文写入
 	stored := string(dataJSON)
-	if a.secretStore != nil {
-		scope := safeAID(a.aid)
-		rec, err := a.secretStore.Protect(scope, "session/"+sessionID, dataJSON)
-		if err != nil {
-			pkgLogKeystore().Warn("SaveSession encryption failed (id=%s), fallback to plaintext storage: %v", sessionID, err)
-		} else {
-			encJSON, err2 := json.Marshal(rec)
-			if err2 != nil {
-				pkgLogKeystore().Warn("SaveSession serialize encrypted record failed (id=%s), fallback to plaintext storage: %v", sessionID, err2)
-			} else {
-				stored = string(encJSON)
-			}
-		}
-	}
 
 	if _, err := a.db.Exec(
 		`INSERT INTO e2ee_sessions (session_id, data_enc, updated_at) VALUES (?, ?, ?)
@@ -1338,21 +1309,9 @@ func (a *AIDDatabase) decryptSessionData(sessionID, enc string) string {
 	return a.decryptText("session/"+sessionID, enc, "LoadSession")
 }
 
+// encryptText 阶段6：group secret 改为明文写入，直接返回原文
 func (a *AIDDatabase) encryptText(name, plaintext, label string) string {
-	if a.secretStore == nil || plaintext == "" {
-		return plaintext
-	}
-	rec, err := a.secretStore.Protect(safeAID(a.aid), name, []byte(plaintext))
-	if err != nil {
-		pkgLogKeystore().Warn("%s encryption failed (name=%s), fallback to plaintext storage: %v", label, name, err)
-		return plaintext
-	}
-	encJSON, err := json.Marshal(rec)
-	if err != nil {
-		pkgLogKeystore().Warn("%s serialize encrypted record failed (name=%s), fallback to plaintext storage: %v", label, name, err)
-		return plaintext
-	}
-	return string(encJSON)
+	return plaintext
 }
 
 func (a *AIDDatabase) decryptText(name, enc, label string) string {

@@ -16,6 +16,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
+import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -41,27 +42,20 @@ function rid(): string {
 }
 
 function makeClient(tag: string): AUNClient {
-  const client = new AUNClient({ aun_path: TEST_AUN_PATH }, false);
+  const client = new AUNClient({ aun_path: TEST_AUN_PATH, debug: false });
   (client as any).configModel.requireForwardSecrecy = false;
   (client as any)._testSlotId = `echo-${tag}-${rid()}`;
   return client;
 }
 
 async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  const gateway = await (client as any).auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  (client as any)._gatewayUrl = gateway;
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
 }
 
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
   await resolveGatewayInto(client);
-  try {
-    await client.auth.registerAid({ aid });
-  } catch (err) {
-    if (!/exists|already/i.test(String(err))) throw err;
-  }
-  const auth = await client.auth.authenticate({ aid });
+  await registerAndLoadIdentity(client, aid);
   const opts: Record<string, unknown> = {
-    ...auth,
     auto_reconnect: false,
     slot_id: (client as any)._testSlotId ?? `echo-${rid()}`,
   };

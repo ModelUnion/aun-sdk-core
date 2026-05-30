@@ -8,6 +8,41 @@
 
 ---
 
+## 0.4.0 — 2026-05-30
+
+> **破坏性重构版本。** 与 Python SDK 0.4.0 对齐：身份管理剥离为 `AID` / `AIDStore`；删除 `Auth` / `Custody` / `Meta` 公开命名空间；引入字符串错误码；连接状态机扩展为 9 态；大量内部方法改为非导出。
+
+### Breaking Changes
+- **删除公开命名空间字段**：移除 `c.Auth`（公开访问）、`c.Custody`（`namespace/custody.go` 删除）、`c.Meta`（`namespace/meta.go` 删除）。
+- **大量方法改为非导出**：`NewClient → newClient`、`SendV2 / PullV2 / AckV2 / SendGroupV2 / PullGroupV2 / AckGroupV2 → sendV2 / ...`、`FetchAgentMD / CheckAgentMD / Ping / Status / TrustRoots / ListIdentities / CheckGatewayHealth → fetchAgentMD / ...`。这些功能现通过 `AIDStore` 或 `client.Call()` 访问。
+- **构造函数变更**：新增 `NewAUNClient(aid, opts)` / `NewAUNClientEmpty(opts)` 作为统一入口；`NewClient()` 改为非导出。
+- **`Connect` 签名变更**：`Connect(ctx, auth, opts)` → `Connect(ctx, ...args)`；身份须先通过 `NewAUNClient(aid)` 或 `LoadIdentity(aid)` 加载。
+- **连接状态类型变更**：对外 API 改为 9 态 `ConnectionState`（`ConnStateNoIdentity` / `ConnStateStandby` / `ConnStateAuthenticated` / `ConnStateConnecting` / `ConnStateReady` / `ConnStateRetryBackoff` / `ConnStateReconnecting` / `ConnStateConnectionFailed` / `ConnStateClosed`）；旧 `ClientState` 仅内部使用。
+- **目录约定变更**：`{aun_path}/AgentMDs/` → `{aun_path}/AIDs/`。
+
+### Added
+- **`AID` 值对象**（`go/aid.go`）：封装证书 + 可选私钥，提供 `IsCertValid` / `IsPrivateKeyValid` / `Sign` / `Verify` / `SignAgentMd` / `VerifyAgentMd`。
+- **`AIDStore` 身份管理器**（`go/aid_store.go`）：离线 `Load` / `List` / `Exists`，联网 `Register` / `Resolve` / `FetchAgentMD` / `Diagnose` / `RenewCert` / `Rekey` / `ChangeSeed`。
+- **字符串错误码**（`go/error_codes.go`）：与 Python SDK 对齐的常量（`CERT_NOT_FOUND`、`IDENTITY_CONFLICT`、`KEYPAIR_MISMATCH` 等）；`AUNError` 新增 `StringCode` 字段，错误消息带 `[CODE]` 前缀。
+- **`Authenticate(ctx, opts?)`**：完成两阶段认证并缓存 token，不建立长连接。
+- **身份管理方法**：`LoadIdentity` / `CurrentAID` / `HasIdentity` / `CanSign` / `CanConnect`。
+- **实例级 `protected_headers`**：`SetProtectedHeaders` / `GetProtectedHeaders`，自动合并到 `message.send` / `group.send` / `*.thought.put`。
+- **对端 AID 缓存**：`CachePeer` / `GetPeer` / `LookupPeer` / `Peers`。
+- **重连状态可观测**：`nextRetryAt` 字段，事件中携带 `next_retry_at` 时间戳。
+
+### Fixed
+- **事件 handler 执行顺序**：改为按注册顺序同步执行（原为独立 goroutine 异步，ISSUE-GO-006），与 Python / TS / JS SDK 对齐。
+- **重连延迟随机数**：改用 `crypto/rand`（原 `math/rand`，ISSUE-GO-007，并发安全）。
+- **手动重连恢复**：允许从 `reconnecting` / `disconnected` / `terminal_failed` 状态手动调 `Connect()` 恢复（ISSUE-GO-009）。
+- **V2 session 初始化顺序**：提前到补拉前执行，避免 `message.pull` 提前 ack V2 设备副本。
+- **移除 `PullV2` / `PullGroupV2` 强制 contiguous 逻辑**：不再强制推进 firstSeq，与 Python SDK 对齐。
+- **Token 刷新竞态**：刷新期间检查连接状态，避免写回 stale identity。
+
+### Removed
+- 删除 `go/namespace/custody.go`、`go/namespace/meta.go`、`go/namespace/meta_test.go`。
+
+---
+
 ## 0.3.6 — 2026-05-28
 
 ### Added

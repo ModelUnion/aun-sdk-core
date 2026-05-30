@@ -11,11 +11,14 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import { AUNClient } from '../../src/client.js';
+import { AIDStore } from '../../src/aid-store.js';
 import { RPCTransport } from '../../src/transport.js';
 import { EventDispatcher } from '../../src/events.js';
 import { AUNLogger } from '../../src/logger.js';
+import { FileKeyStore } from '../../src/keystore/file.js';
 import { ConnectionError, StateError } from '../../src/errors.js';
 import { certificateSha256Fingerprint } from '../../src/crypto.js';
+import { buildIdentity, generateECKeypair } from './helpers.js';
 
 // ── Mock WebSocket ────────────────────────────────────────
 
@@ -53,7 +56,7 @@ describe('ISSUE-SDK-TS-001: disconnect() 方法', () => {
     // idle 状态，disconnect 应静默返回
     await expect(client.disconnect()).resolves.toBeUndefined();
     // 状态保持 idle（不是 disconnected，因为从未连接过）
-    expect(client.state).toBe('idle');
+    expect(client.state).toBe('no_identity');
   });
 
   it('disconnect 设置状态为 disconnected（非 closed）', async () => {
@@ -66,7 +69,7 @@ describe('ISSUE-SDK-TS-001: disconnect() 方法', () => {
       call: vi.fn().mockResolvedValue({}),
     };
     await client.disconnect();
-    expect(client.state).toBe('disconnected');
+    expect(client.state).toBe('standby');
   });
 
   it('disconnect 后可重新 connect（状态可恢复）', async () => {
@@ -78,7 +81,7 @@ describe('ISSUE-SDK-TS-001: disconnect() 方法', () => {
       call: vi.fn().mockResolvedValue({}),
     };
     await client.disconnect();
-    expect(client.state).toBe('disconnected');
+    expect(client.state).toBe('standby');
     // disconnected 状态不应阻止后续的状态检查，但 connect 需要 idle/closed
     // 验证 disconnect 不是终态
     expect(client.state).not.toBe('closed');
@@ -102,7 +105,7 @@ describe('ISSUE-SDK-TS-001: disconnect() 方法', () => {
     (client as any)._closing = true;
     await client.disconnect();
     // 状态不应变为 disconnected
-    expect(client.state).toBe('connected');
+    expect(client.state).toBe('ready');
   });
 
   it('disconnect 发布 connection.state 事件', async () => {
@@ -116,42 +119,39 @@ describe('ISSUE-SDK-TS-001: disconnect() 方法', () => {
     client.on('connection.state', (data) => { events.push(data); });
     await client.disconnect();
     expect(events.length).toBeGreaterThan(0);
-    expect(events[events.length - 1].state).toBe('disconnected');
+    expect(events[events.length - 1].state).toBe('standby');
   });
 });
 
 // ══════════════════════════════════════════════════════════════
-// P1-002: listIdentities() 方法
+// P1-002: AIDStore.list() 方法
 // ══════════════════════════════════════════════════════════════
 
-describe('ISSUE-SDK-TS-002: listIdentities() 方法', () => {
-  it('listIdentities 存在且可调用', () => {
+describe('ISSUE-SDK-TS-002: AIDStore.list() 方法', () => {
+  it('AUNClient 不再公开 listIdentities', () => {
     const client = new AUNClient();
-    expect(typeof client.listIdentities).toBe('function');
+    expect((client as any).listIdentities).toBeUndefined();
   });
 
   it('无身份时返回空数组', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-list-ids-'));
-    const client = new AUNClient({ aun_path: tmpDir });
-    const result = client.listIdentities();
-    expect(Array.isArray(result)).toBe(true);
-    expect(result.length).toBe(0);
+    const store = new AIDStore({ aunPath: tmpDir, encryptionSeed: '' });
+    const result = store.list();
+    expect(result.ok).toBe(true);
+    expect(result.ok ? result.data.identities : []).toHaveLength(0);
+    store.close();
   });
 
   it('有身份时返回身份摘要', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-list-ids-'));
-    const client = new AUNClient({ aun_path: tmpDir });
-    const ks = (client as any)._keystore;
-    // 保存一个身份（无 cert，用 all=true 诊断模式可见）
-    ks.saveIdentity('alice.example.com', {
-      aid: 'alice.example.com',
-      private_key_pem: 'PK',
-      public_key_der_b64: 'pub',
-      curve: 'P-256',
-    });
-    const result = client.listIdentities({ all: true });
-    expect(result.length).toBe(1);
-    expect(result[0].aid).toBe('alice.example.com');
+    const aid = 'alice.example.com';
+    const ks = new FileKeyStore(tmpDir);
+    ks.saveIdentity(aid, buildIdentity(aid, generateECKeypair().privateKey));
+    const store = new AIDStore({ aunPath: tmpDir, encryptionSeed: '' });
+    const result = store.list();
+    expect(result.ok).toBe(true);
+    expect(result.ok ? result.data.identities.map((i) => i.aid) : []).toEqual([aid]);
+    store.close();
   });
 });
 

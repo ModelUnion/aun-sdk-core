@@ -37,6 +37,10 @@ function setupClientWithAid(aid: string): AUNClient {
   return new AUNClient({ aun_path: aunPath });
 }
 
+function loadGatewayMetadata(client: AUNClient, aid: string): string {
+  return String((client as any)._keystore.loadMetadata(aid)?.gateway_url ?? '').trim();
+}
+
 // ── 改进 A: authenticate() 复用 cached_token ─────────────────────────
 
 describe('AuthFlow.authenticate cached_token 复用', () => {
@@ -136,20 +140,19 @@ describe('AuthFlow.authenticate cached_token 复用', () => {
 
 // ── 改进 B: gateway_url 持久化 ───────────────────────────────────────
 
-describe('AuthNamespace._resolveGateway keystore 持久化', () => {
+describe('AUNClient._resolveGatewayForAid keystore 持久化', () => {
   it('keystore metadata 命中时跳过 discovery', async () => {
     const aid = 'alice.test.com';
     const client = setupClientWithAid(aid);
     (client as any)._aid = aid;
 
-    // 直接写入 keystore metadata
-    (client.auth as any)._persistGatewayUrl(aid, 'wss://cached-gateway.test/aun');
+    (client as any)._keystore.saveMetadata(aid, { gateway_url: 'wss://cached-gateway.test/aun' });
 
     // mock discovery —— 不应被调用
     const discoverSpy = vi.fn();
     (client as any)._discovery = { discover: discoverSpy };
 
-    const result = await (client.auth as any)._resolveGateway(aid);
+    const result = await (client as any)._resolveGatewayForAid(aid);
 
     expect(result).toBe('wss://cached-gateway.test/aun');
     expect(discoverSpy).not.toHaveBeenCalled();
@@ -164,11 +167,10 @@ describe('AuthNamespace._resolveGateway keystore 持久化', () => {
     const discoverSpy = vi.fn().mockResolvedValue('wss://discovered.test/aun');
     (client as any)._discovery = { discover: discoverSpy };
 
-    const result = await (client.auth as any)._resolveGateway(aid);
+    const result = await (client as any)._resolveGatewayForAid(aid);
     expect(result).toBe('wss://discovered.test/aun');
 
-    const cached = (client.auth as any)._loadCachedGatewayUrl(aid);
-    expect(cached).toBe('wss://discovered.test/aun');
+    expect(loadGatewayMetadata(client, aid)).toBe('wss://discovered.test/aun');
   });
 
   it('内存里的 _gatewayUrl 优先级最高（即使 keystore 有值）', async () => {
@@ -176,69 +178,45 @@ describe('AuthNamespace._resolveGateway keystore 持久化', () => {
     const client = setupClient();
     (client as any)._aid = aid;
 
-    (client.auth as any)._persistGatewayUrl(aid, 'wss://stale.test/aun');
+    (client as any)._keystore.saveMetadata(aid, { gateway_url: 'wss://stale.test/aun' });
     (client as any)._gatewayUrl = 'wss://memory-fresh.test/aun';
 
     const discoverSpy = vi.fn();
     (client as any)._discovery = { discover: discoverSpy };
 
-    const result = await (client.auth as any)._resolveGateway(aid);
+    const result = await (client as any)._resolveGatewayForAid(aid);
     expect(result).toBe('wss://memory-fresh.test/aun');
     expect(discoverSpy).not.toHaveBeenCalled();
-  });
-
-  it('空字符串不应写入 keystore（避免污染）', () => {
-    const aid = 'alice.test.com';
-    const client = setupClient();
-    (client as any)._aid = aid;
-
-    // 不应抛异常，且后续读取应为空
-    (client.auth as any)._persistGatewayUrl(aid, '');
-    const cached = (client.auth as any)._loadCachedGatewayUrl(aid);
-    expect(cached).toBe('');
   });
 
   it('keystore 没有记录时返回空字符串', () => {
     const aid = 'alice-no-record.test.com';
     const client = setupClient();
 
-    const result = (client.auth as any)._loadCachedGatewayUrl(aid);
-    expect(result).toBe('');
+    expect(loadGatewayMetadata(client, aid)).toBe('');
   });
 
-  it('registerAid 成功后应补写 discovery 得到的 gateway_url', async () => {
-    const aid = 'alice-register-cache.test.com';
-    const client = setupClient();
+  it('authenticate discovery 成功后应补写 gateway_url 缓存', async () => {
+    const aid = 'alice.test.com';
+    const client = setupClientWithAid(aid);
+    (client as any)._aid = aid;
+    (client as any)._currentAid = { aid, isPrivateKeyValid: () => true };
+    (client as any)._state = 'standby';
     (client as any)._gatewayUrl = null;
     (client as any)._discovery = {
-      discover: vi.fn().mockResolvedValue('wss://discovered-register.test/aun'),
+      discover: vi.fn().mockResolvedValue('wss://discovered-auth.test/aun'),
     };
-    (client as any)._auth.registerAid = vi.fn().mockImplementation(async () => {
-      const safe = aid.replace(/[\/\\:]/g, '_');
-      mkdirSync(join((client as any)._keystore._aidsRoot, safe), { recursive: true });
-      return { aid, cert: 'CERT' };
-    });
-    (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue({ aid });
-
-    await client.auth.registerAid({ aid });
-
-    expect((client.auth as any)._loadCachedGatewayUrl(aid)).toBe('wss://discovered-register.test/aun');
-  });
-
-  it('authenticate 使用内存 gateway_url 时成功后也应补写缓存', async () => {
-    const aid = 'alice-auth-cache.test.com';
-    const client = setupClientWithAid(aid);
-    (client as any)._gatewayUrl = 'wss://memory-auth.test/aun';
     (client as any)._auth.authenticate = vi.fn().mockResolvedValue({
       aid,
       access_token: 'tok',
       refresh_token: 'ref',
-      gateway: 'wss://memory-auth.test/aun',
+      gateway: 'wss://discovered-auth.test/aun',
     });
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue({ aid });
 
-    await client.auth.authenticate({ aid });
+    await client.authenticate();
 
-    expect((client.auth as any)._loadCachedGatewayUrl(aid)).toBe('wss://memory-auth.test/aun');
+    expect(loadGatewayMetadata(client, aid)).toBe('wss://discovered-auth.test/aun');
   });
 });
+

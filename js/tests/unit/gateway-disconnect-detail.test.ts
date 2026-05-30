@@ -111,7 +111,7 @@ describe('gateway.disconnect detail 透传', () => {
 
     // 应该有两次 connection.state：disconnected 和 terminal_failed
     expect(states.length).toBeGreaterThanOrEqual(2);
-    const terminal = states.find((s) => s.state === 'terminal_failed');
+    const terminal = states.find((s) => s.state === 'connection_failed');
     expect(terminal).toBeTruthy();
     expect(terminal.reason).toBeTruthy();
     // detail 必须透传到 terminal_failed 事件
@@ -130,7 +130,7 @@ describe('gateway.disconnect detail 透传', () => {
     (client as any)._sessionOptions = { ...(client as any)._sessionOptions, auto_reconnect: true };
     await (client as any)._handleTransportDisconnect(new Error('boom'), 4015);
 
-    const terminal = states.find((s) => s.state === 'terminal_failed');
+    const terminal = states.find((s) => s.state === 'connection_failed');
     expect(terminal).toBeTruthy();
     expect(terminal.detail).toBeUndefined();
     expect(terminal.code).toBeUndefined();

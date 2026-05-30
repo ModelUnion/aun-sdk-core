@@ -13,20 +13,29 @@ import {
   PermissionError,
 } from '../../src/errors.js';
 
+async function registerAidForValidation(client: AUNClient, aid: string): Promise<unknown> {
+  return await (client as any)._auth.registerAid('wss://localhost:9999/aun', aid);
+}
+
 // ── P0-01: 网关健康检查 ──────────────────────────────────────
 
 describe('P0-01: 网关健康检查', () => {
+  it('AUNClient 不再公开 checkGatewayHealth convenience 方法', () => {
+    const client = new AUNClient();
+    expect((client as any).checkGatewayHealth).toBeUndefined();
+  });
+
   it('超时 — 不可达地址应在 timeout 内返回 false', async () => {
     const client = new AUNClient();
     // 192.0.2.0/24 是 RFC 5737 文档专用地址段，不可达
-    const ok = await client.checkGatewayHealth('https://192.0.2.1:9999', 2000);
+    const ok = await (client as any)._discovery.checkHealth('https://192.0.2.1:9999', 2000);
     expect(ok).toBe(false);
   }, 10_000);
 
   it('连接拒绝 — 无服务端口应返回 false', async () => {
     const client = new AUNClient();
     // 端口 1 几乎不会有服务监听，应被系统立即拒绝
-    const ok = await client.checkGatewayHealth('https://127.0.0.1:1', 3000);
+    const ok = await (client as any)._discovery.checkHealth('https://127.0.0.1:1', 3000);
     expect(ok).toBe(false);
   }, 10_000);
 
@@ -37,7 +46,7 @@ describe('P0-01: 网关健康检查', () => {
 
   it('健康检查后 gatewayHealth 应被更新', async () => {
     const client = new AUNClient();
-    await client.checkGatewayHealth('https://127.0.0.1:1', 2000);
+    await (client as any)._discovery.checkHealth('https://127.0.0.1:1', 2000);
     // 检查完毕后 gatewayHealth 不再是 null，应为 false（无服务）
     expect(client.gatewayHealth).toBe(false);
   }, 10_000);
@@ -87,42 +96,42 @@ describe('P0-14: 断线中 RPC 拒绝', () => {
 describe('P0-02: AID 创建参数校验', () => {
   it('空 AID 应抛出错误', async () => {
     const client = new AUNClient();
-    // AuthNamespace.registerAid 对空 aid 直接抛 Error
-    await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow();
+    await expect(registerAidForValidation(client, '')).rejects.toThrow();
   });
 
-  it('空 AID 错误消息应包含 requires aid', async () => {
+  it('空 AID 错误消息应包含 Invalid AID name', async () => {
     const client = new AUNClient();
-    await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow("requires 'aid'");
+    await expect(registerAidForValidation(client, '')).rejects.toThrow('Invalid AID name');
   });
 
   it('不传 aid 字段应抛出错误', async () => {
     const client = new AUNClient();
-    await expect(client.auth.registerAid({})).rejects.toThrow();
+    await expect(registerAidForValidation(client, undefined as unknown as string)).rejects.toThrow();
   });
 
   it('AID 名称过短（< 4 字符）应被 AuthFlow 拒绝', async () => {
     const client = new AUNClient();
     // 设置 _gatewayUrl 以跳过 discovery，触发 AuthFlow._validateAidName
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: 'ab' })).rejects.toThrow();
+    await expect(registerAidForValidation(client, 'ab')).rejects.toThrow();
   });
 
   it('AID 名称含大写应被拒绝', async () => {
     const client = new AUNClient();
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: 'Alice.aid.com' })).rejects.toThrow();
+    await expect(registerAidForValidation(client, 'Alice.aid.com')).rejects.toThrow();
   });
 
   it('AID 名称以 - 开头应被拒绝', async () => {
     const client = new AUNClient();
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: '-bad.aid.com' })).rejects.toThrow();
+    await expect(registerAidForValidation(client, '-bad.aid.com')).rejects.toThrow();
   });
 
   it('AID 名称以 guest 开头应被拒绝', async () => {
     const client = new AUNClient();
     (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: 'guestuser.aid.com' })).rejects.toThrow();
+    await expect(registerAidForValidation(client, 'guestuser.aid.com')).rejects.toThrow();
   });
 });
+

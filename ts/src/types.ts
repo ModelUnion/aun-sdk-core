@@ -28,6 +28,37 @@ export function isJsonObject(value: JsonValue | object | null | undefined): valu
   return proto === Object.prototype || proto === null;
 }
 
+/** AUNClient 连接状态枚举 — 对齐 Python SDK types.py */
+export enum ConnectionState {
+  NO_IDENTITY = 'no_identity',
+  STANDBY = 'standby',
+  AUTHENTICATED = 'authenticated',
+  CONNECTING = 'connecting',
+  READY = 'ready',
+  RETRY_BACKOFF = 'retry_backoff',
+  RECONNECTING = 'reconnecting',
+  CONNECTION_FAILED = 'connection_failed',
+  CLOSED = 'closed',
+}
+
+/** 内部状态 → 公开状态映射 */
+export const STATE_TO_PUBLIC: Record<string, ConnectionState> = {
+  no_identity: ConnectionState.NO_IDENTITY,
+  standby: ConnectionState.STANDBY,
+  authenticated: ConnectionState.AUTHENTICATED,
+  connecting: ConnectionState.CONNECTING,
+  ready: ConnectionState.READY,
+  retry_backoff: ConnectionState.RETRY_BACKOFF,
+  reconnecting: ConnectionState.RECONNECTING,
+  connection_failed: ConnectionState.CONNECTION_FAILED,
+  closed: ConnectionState.CLOSED,
+  idle: ConnectionState.NO_IDENTITY,
+  authenticating: ConnectionState.CONNECTING,
+  connected: ConnectionState.READY,
+  disconnected: ConnectionState.STANDBY,
+  terminal_failed: ConnectionState.CONNECTION_FAILED,
+};
+
 /** RPC 参数 */
 export interface RpcParams extends JsonObject {}
 

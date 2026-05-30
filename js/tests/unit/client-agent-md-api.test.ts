@@ -1,4 +1,4 @@
-// JS（浏览器）SDK agent.md API：AgentMDs 逻辑目录映射到 IndexedDB。
+// JS（浏览器）SDK agent.md API：AIDs 逻辑目录映射到 IndexedDB。
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -46,12 +46,14 @@ async function writeLocalAgentMd(client: AUNClient, aid: string, content: string
   await (client as any)._writeAgentMdContent(aid, content);
 }
 
-describe('js client AgentMDs IndexedDB 存储', () => {
-  it('默认路径为 {aun_path}/AgentMDs，且 SetAgentMDPath 可切换/恢复', () => {
+describe('js client AIDs IndexedDB 存储', () => {
+  it('默认路径为 {aun_path}/AIDs，内部存储根可切换/恢复', () => {
     const client = makeClient();
-    expect(agentRoot(client)).toBe('/tmp/aun-js-agent-md/AgentMDs');
-    expect((client as any).setAgentMdPath('/tmp/custom-agentmd')).toBe('/tmp/custom-agentmd');
-    expect((client as any).SetAgentMDPath()).toBe('/tmp/aun-js-agent-md/AgentMDs');
+    expect(agentRoot(client)).toBe('/tmp/aun-js-agent-md/AIDs');
+    expect((client as any).setAgentMdPath).toBeUndefined();
+    expect((client as any).SetAgentMDPath).toBeUndefined();
+    expect((client as any)._setAgentMdRoot('/tmp/custom-agentmd')).toBe('/tmp/custom-agentmd');
+    expect((client as any)._setAgentMdRoot()).toBe('/tmp/aun-js-agent-md/AIDs');
   });
 
   it('publishAgentMd 无本地 AID 时拒绝', async () => {
@@ -73,11 +75,18 @@ describe('js client AgentMDs IndexedDB 存储', () => {
 
     let signedInput = '';
     let uploaded = '';
-    vi.spyOn(client.auth, 'signAgentMd').mockImplementation(async (c: string) => {
-      signedInput = c;
-      return `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`;
-    });
-    vi.spyOn(client.auth, 'uploadAgentMd').mockImplementation(async (c: string) => {
+    (client as any)._currentAid = {
+      signAgentMd: vi.fn((c: string) => {
+        signedInput = c;
+        return {
+          ok: true,
+          data: {
+            signed: `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`,
+          },
+        };
+      }),
+    };
+    vi.spyOn(client as any, '_uploadAgentMd').mockImplementation(async (c: string) => {
       uploaded = c;
       return { aid: 'alice.agentid.pub', etag: '"cloud"', last_modified: 'Sun, 24 May 2026 00:00:00 GMT' };
     });
@@ -98,8 +107,13 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const unsigned = '# Alice\n';
-    vi.spyOn(client.auth, 'signAgentMd').mockImplementation(async (c: string) => `${c}\n<!-- signed -->\n`);
-    vi.spyOn(client.auth, 'uploadAgentMd').mockResolvedValue({ aid: 'alice.agentid.pub' });
+    (client as any)._currentAid = {
+      signAgentMd: vi.fn((c: string) => ({
+        ok: true,
+        data: { signed: `${c}\n<!-- signed -->\n` },
+      })),
+    };
+    vi.spyOn(client as any, '_uploadAgentMd').mockResolvedValue({ aid: 'alice.agentid.pub' });
 
     await client.publishAgentMd(unsigned);
 
@@ -110,13 +124,13 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    (client.auth as any)._agentMdCache = new Map([
+    (client as any)._agentMdCache = new Map([
       ['bob.agentid.pub', { text: body, etag: '"bob-cloud"', lastModified: 'Sun, 24 May 2026 00:00:00 GMT' }],
     ]);
-    vi.spyOn(client.auth, 'downloadAgentMd').mockResolvedValue(body);
-    vi.spyOn(client.auth, 'verifyAgentMd').mockResolvedValue({ status: 'unsigned', verified: false, payload: body } as any);
+    vi.spyOn(client as any, '_downloadAgentMd').mockResolvedValue(body);
+    vi.spyOn(client as any, '_verifyAgentMd').mockResolvedValue({ status: 'unsigned', verified: false, payload: body } as any);
 
-    const info = await client.fetchAgentMd('bob.agentid.pub');
+    const info = await (client as any)._fetchAgentMdCache('bob.agentid.pub');
 
     expect(info.aid).toBe('bob.agentid.pub');
     expect(info.in_sync).toBeNull();
@@ -130,7 +144,8 @@ describe('js client AgentMDs IndexedDB 存储', () => {
   it('fetchAgentMd 无 aid 且无 self aid 时拒绝', async () => {
     const client = makeClient();
     (client as any)._aid = null;
-    await expect(client.fetchAgentMd()).rejects.toBeInstanceOf(ValidationError);
+    expect((client as any).fetchAgentMd).toBeUndefined();
+    await expect((client as any)._fetchAgentMdCache()).rejects.toBeInstanceOf(ValidationError);
   });
 
   it('checkAgentMd 使用 IndexedDB 正文 etag 与 HEAD etag 比较', async () => {
@@ -138,7 +153,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     (client as any)._aid = 'alice.agentid.pub';
     const body = '# Bob\n';
     await (client as any)._saveAgentMdRecord('bob.agentid.pub', { content: body, local_etag: await etag(body), remote_etag: '"old"' });
-    vi.spyOn(client.auth as any, 'headAgentMd').mockResolvedValue({
+    vi.spyOn(client as any, '_headAgentMd').mockResolvedValue({
       aid: 'bob.agentid.pub',
       found: true,
       etag: await etag(body),
@@ -146,7 +161,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
       status: 200,
     });
 
-    const result = await client.checkAgentMd('bob.agentid.pub');
+    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub');
 
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
@@ -159,7 +174,7 @@ describe('js client AgentMDs IndexedDB 存储', () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const fetched: string[] = [];
-    vi.spyOn(client, 'fetchAgentMd').mockImplementation(async (aid?: string | null) => {
+    vi.spyOn(client as any, '_fetchAgentMdCache').mockImplementation(async (aid?: string | null) => {
       const target = String(aid ?? '');
       fetched.push(target);
       const content = `# ${target}\n`;
@@ -209,11 +224,11 @@ describe('js client AgentMDs IndexedDB 存储', () => {
       verify_status: 'valid',
       verify_error: '',
     });
-    vi.spyOn(client.auth as any, 'headAgentMd').mockImplementation(async () => {
+    vi.spyOn(client as any, '_headAgentMd').mockImplementation(async () => {
       throw new Error('fresh cached checkAgentMd should not HEAD');
     });
 
-    const result = await client.checkAgentMd('bob.agentid.pub', 7);
+    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub', 7);
 
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { AUNClient } from '../../src/client.js';
+import { AID } from '../../src/aid.js';
 import { buildIdentity, generateECKeypair } from './helpers.js';
 
 afterEach(() => {
@@ -21,7 +22,18 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<vo
   }
 }
 
-describe('AuthNamespace agent.md', () => {
+function aidFromIdentity(identity: any): AID {
+  return AID._create({
+    aid: String(identity.aid),
+    aunPath: mkdtempSync(join(tmpdir(), 'aun-aid-agent-md-')),
+    certPem: String(identity.cert ?? identity.cert_pem ?? ''),
+    privateKeyPem: String(identity.private_key_pem ?? ''),
+    certValid: true,
+    privateKeyValid: true,
+  });
+}
+
+describe('AUNClient agent.md internals', () => {
   it('底层 AuthFlow 兼容 loadIdentityOrNull 命名', () => {
     const client = new AUNClient({ aun_path: mkdtempSync(join(tmpdir(), 'aun-auth-ns-')) });
     const result = (client as any)._auth.loadIdentityOrNull();
@@ -46,7 +58,7 @@ describe('AuthNamespace agent.md', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const result = await client.auth.uploadAgentMd('# Alice\n');
+    const result = await (client as any)._uploadAgentMd('# Alice\n');
 
     expect(result).toEqual({ aid: 'alice.agentid.pub', etag: '"etag-1"' });
     expect(fetchMock).toHaveBeenCalledWith(
@@ -71,7 +83,7 @@ describe('AuthNamespace agent.md', () => {
       aid: 'alice.agentid.pub',
     });
 
-    const authSpy = vi.spyOn(client.auth, 'authenticate').mockResolvedValue({
+    const authSpy = vi.spyOn((client as any)._auth, 'authenticate').mockResolvedValue({
       aid: 'alice.agentid.pub',
       access_token: 'fresh-token',
       gateway: 'ws://gateway.agentid.pub/aun',
@@ -84,10 +96,10 @@ describe('AuthNamespace agent.md', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const result = await client.auth.uploadAgentMd('# Alice\n');
+    const result = await (client as any)._uploadAgentMd('# Alice\n');
 
     expect(result).toEqual({ aid: 'alice.agentid.pub', etag: '"etag-2"' });
-    expect(authSpy).toHaveBeenCalledWith({ aid: 'alice.agentid.pub' });
+    expect(authSpy).toHaveBeenCalledWith('ws://gateway.agentid.pub/aun', { aid: 'alice.agentid.pub' });
     expect(fetchMock).toHaveBeenCalledWith(
       'http://alice.agentid.pub/agent.md',
       expect.objectContaining({
@@ -113,7 +125,7 @@ describe('AuthNamespace agent.md', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const result = await client.auth.downloadAgentMd('bob.agentid.pub');
+    const result = await (client as any)._downloadAgentMd('bob.agentid.pub');
 
     expect(result).toBe('# Bob\n');
     expect(fetchMock).toHaveBeenCalledWith(
@@ -153,16 +165,16 @@ describe('AuthNamespace agent.md', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const first = client.auth.downloadAgentMd('bob.agentid.pub');
+    const first = (client as any)._downloadAgentMd('bob.agentid.pub');
     await started;
-    const second = client.auth.downloadAgentMd('bob.agentid.pub');
+    const second = (client as any)._downloadAgentMd('bob.agentid.pub');
     await Promise.resolve();
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     releaseFetch();
     await expect(Promise.all([first, second])).resolves.toEqual(['# Bob\n', '# Bob\n']);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect((client.auth as any)._agentMdDownloadInflight.size).toBe(0);
+    expect((client as any)._agentMdDownloadInflight.size).toBe(0);
   });
 
   it('不同 AID 的 downloadAgentMd 应受全局 8 并发上限控制', async () => {
@@ -194,7 +206,7 @@ describe('AuthNamespace agent.md', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const downloads = Array.from({ length: 10 }, (_, index) =>
-      client.auth.downloadAgentMd(`aid-${index}.agentid.pub`));
+      (client as any)._downloadAgentMd(`aid-${index}.agentid.pub`));
     await waitUntil(() => started === 8);
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(started).toBe(8);
@@ -231,8 +243,8 @@ describe('AuthNamespace agent.md', () => {
       });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(client.auth.downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob v1\n');
-    await expect(client.auth.downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob v1\n');
+    await expect((client as any)._downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob v1\n');
+    await expect((client as any)._downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob v1\n');
 
     expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toEqual({ Accept: 'text/markdown' });
   });
@@ -268,12 +280,12 @@ describe('AuthNamespace agent.md', () => {
       });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect((client.auth as any).headAgentMd('bob.agentid.pub')).resolves.toMatchObject({
+    await expect((client as any)._headAgentMd('bob.agentid.pub')).resolves.toMatchObject({
       found: true,
       etag: '"head-only"',
       status: 200,
     });
-    await expect(client.auth.downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob fresh\n');
+    await expect((client as any)._downloadAgentMd('bob.agentid.pub')).resolves.toBe('# Bob fresh\n');
 
     expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toEqual({ Accept: 'text/markdown' });
     expect((fetchMock.mock.calls[2][1] as RequestInit).headers).toEqual({ Accept: 'text/markdown' });
@@ -301,8 +313,8 @@ describe('AuthNamespace agent.md', () => {
       });
     vi.stubGlobal('fetch', fetchMock);
 
-    await (client.auth as any).headAgentMd('bob.agentid.pub');
-    await expect((client.auth as any).headAgentMd('bob.agentid.pub')).resolves.toMatchObject({
+    await (client as any)._headAgentMd('bob.agentid.pub');
+    await expect((client as any)._headAgentMd('bob.agentid.pub')).resolves.toMatchObject({
       found: true,
       etag: '"etag-v1"',
       last_modified: 'Sun, 24 May 2026 00:00:00 GMT',
@@ -322,7 +334,7 @@ describe('AuthNamespace agent.md', () => {
     ));
     vi.stubGlobal('fetch', fetchMock);
 
-    const promise = client.auth.downloadAgentMd('bob.agentid.pub');
+    const promise = (client as any)._downloadAgentMd('bob.agentid.pub');
     const assertion = expect(promise).rejects.toThrow('agent.md request timed out');
     await vi.advanceTimersByTimeAsync(30_000);
 
@@ -338,7 +350,7 @@ describe('AuthNamespace agent.md', () => {
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
-    const signed = await client.auth.signAgentMd(payload);
+    const signed = aidFromIdentity(identity).signAgentMd(payload).data!.signed;
 
     expect(signed.startsWith(payload)).toBe(true);
     expect(signed).toContain('<!-- AUN-SIGNATURE');
@@ -354,25 +366,19 @@ describe('AuthNamespace agent.md', () => {
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
-    const signed = await client.auth.signAgentMd(payload);
+    const signed = aidFromIdentity(identity).signAgentMd(payload).data!.signed;
 
-    const unsigned = await client.auth.verifyAgentMd(payload);
+    const unsigned = await (client as any)._verifyAgentMd(payload, identity.aid, identity.cert);
     expect(unsigned.status).toBe('unsigned');
     expect(unsigned.verified).toBe(false);
 
-    const verified = await client.auth.verifyAgentMd(signed, {
-      aid: identity.aid,
-      certPem: identity.cert,
-    });
+    const verified = await (client as any)._verifyAgentMd(signed, identity.aid, identity.cert);
     expect(verified.status).toBe('verified');
     expect(verified.verified).toBe(true);
     expect(verified.payload).toBe(payload);
 
     const tampered = signed.replace('Alice', 'Mallory');
-    const invalid = await client.auth.verifyAgentMd(tampered, {
-      aid: identity.aid,
-      certPem: identity.cert,
-    });
+    const invalid = await (client as any)._verifyAgentMd(tampered, identity.aid, identity.cert);
     expect(invalid.status).toBe('invalid');
     expect(invalid.verified).toBe(false);
   });
@@ -386,8 +392,8 @@ describe('AuthNamespace agent.md', () => {
     (client as any)._fetchPeerCert = vi.fn().mockResolvedValue(identity.cert);
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
-    const signed = await client.auth.signAgentMd(payload);
-    const verified = await client.auth.verifyAgentMd(signed, { aid: identity.aid });
+    const signed = aidFromIdentity(identity).signAgentMd(payload).data!.signed;
+    const verified = await (client as any)._verifyAgentMd(signed, identity.aid);
 
     expect(verified.status).toBe('verified');
     expect((client as any)._fetchPeerCert).toHaveBeenCalledTimes(1);
@@ -401,10 +407,12 @@ describe('AuthNamespace agent.md', () => {
     (client as any)._auth.loadIdentityOrNone = vi.fn().mockReturnValue(identity);
 
     const payload = '---\naid: "alice.agentid.pub"\nname: "Alice"\n---\n\n# Alice\n';
-    const signedOnce = await client.auth.signAgentMd(payload);
-    const signedTwice = await client.auth.signAgentMd(signedOnce);
+    const aid = aidFromIdentity(identity);
+    const signedOnce = aid.signAgentMd(payload).data!.signed;
+    const signedTwice = aid.signAgentMd(signedOnce).data!.signed;
 
     expect(signedTwice.match(/<!-- AUN-SIGNATURE/g)?.length).toBe(1);
     expect(signedTwice.startsWith(payload)).toBe(true);
   });
 });
+

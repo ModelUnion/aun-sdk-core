@@ -74,7 +74,7 @@ print(f"模式: {status['mode']}")
 
 该 RPC 适合已连接客户端查询。首次信任根更新应优先使用公开 HTTP 端点 `GET https://trust.aun.network/.well-known/aun/trust-roots.json`，不可达时可使用 Issuer PKI 泛域名端点 `GET https://pki.{issuer}/trust-root.json` 或 Gateway 镜像 `GET https://gateway.{issuer}/pki/trust-roots.json`。无论来源是 RPC 还是 HTTP，客户端导入前都必须验证 `authority_signature`。
 
-Issuer PKI 泛域名服务还必须公开 `GET https://pki.{issuer}/root.crt`，用于下载该 issuer 证书链锚定的 Root CA PEM。客户端通过 `client.meta.update_issuer_root_cert(issuer)` 更新指定 issuer 的根证书时，必须先确认该证书指纹存在于已验签的受信根列表中。
+Issuer PKI 泛域名服务还必须公开 `GET https://pki.{issuer}/root.crt`，用于下载该 issuer 证书链锚定的 Root CA PEM。SDK 在 `AIDStore.load()` / `resolve()` 的证书链验证流程中按需更新指定 issuer 的根证书；写入本地信任锚前必须确认该证书指纹存在于已验签的受信根列表中。
 
 ### 参数
 
@@ -120,23 +120,22 @@ Issuer PKI 泛域名服务还必须公开 `GET https://pki.{issuer}/root.crt`，
 ### 示例
 
 ```python
-trust_list = await client.meta.trust_roots()
-client.meta.import_trust_roots(trust_list, authority_cert_pem=authority_cert_pem)
+trust_list = await client.call("meta.trust_roots", {})
+# 信任根验证、导入和 issuer root 更新由 AIDStore 内部证书链验证流程按需处理。
 ```
 
 ---
 
-## Python SDK `MetaNamespace` 辅助方法
+## SDK 信任根辅助能力
 
-以下方法属于 SDK 本地辅助能力，不是新的服务端 RPC；底层只在需要时调用 `meta.trust_roots` 或公开 HTTP 端点。
+以下能力属于 SDK 本地证书链验证流程，不是新的服务端 RPC；底层只在需要时调用 `meta.trust_roots` 或公开 HTTP 端点。
 
-| 方法 | 说明 |
+| 能力 | 说明 |
 |------|------|
-| `await client.meta.download_trust_roots(...)` | 从管理局权威端点、`pki.{issuer}` 或 Gateway 镜像下载受信根列表 |
-| `client.meta.verify_trust_roots(...)` | 验证受信根列表结构、签名、证书 CA 约束、有效期和 SHA-256 指纹 |
-| `client.meta.import_trust_roots(...)` | 验证后写入本地 `trust-roots.json` / `trust-roots.pem` 并刷新信任根缓存 |
-| `await client.meta.refresh_trust_roots(...)` | 下载、验证并导入受信根列表 |
-| `await client.meta.download_issuer_root_cert(issuer, ...)` | 从 `https://pki.{issuer}/root.crt` 下载指定 issuer 的 Root CA PEM |
-| `await client.meta.update_issuer_root_cert(issuer, ...)` | 校验证书为自签 Root CA，且指纹存在于已验签受信根列表后导入本地 |
+| 下载受信根列表 | 从管理局权威端点、`pki.{issuer}` 或 Gateway 镜像下载 |
+| 验证受信根列表 | 校验结构、签名、证书 CA 约束、有效期和 SHA-256 指纹 |
+| 导入受信根列表 | 验证后写入本地 `trust-roots.json` / `trust-roots.pem` 并刷新缓存 |
+| 下载 issuer root | 从 `https://pki.{issuer}/root.crt` 下载指定 issuer 的 Root CA PEM |
+| 更新 issuer root | 校验证书为自签 Root CA，且指纹存在于已验签受信根列表后导入本地 |
 
-`update_issuer_root_cert()` 不信任下载来源本身；它必须以已验签的受信根列表为准，确认 `root.crt` 的 SHA-256 指纹已列入 `root_cas` 后才能写入本地信任锚。
+更新 issuer root 时不信任下载来源本身；必须以已验签的受信根列表为准，确认 `root.crt` 的 SHA-256 指纹已列入 `root_cas` 后才能写入本地信任锚。

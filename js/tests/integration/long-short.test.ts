@@ -26,6 +26,7 @@ import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
 import type { JsonObject } from '../../src/types.js';
+import { loadIdentityFromStore, registerAndLoadIdentity } from '../test-support.js';
 
 const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
@@ -55,9 +56,8 @@ async function connectLong(
   aid: string,
   slotId = 'main',
 ): Promise<void> {
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await registerAndLoadIdentity(client, aid);
+  await client.connect({
     auto_reconnect: false,
     heartbeat_interval: 30,
     slot_id: slotId,
@@ -69,8 +69,8 @@ async function connectShort(
   aid: string,
   opts: { slot_id?: string; short_ttl_ms?: number } = {},
 ): Promise<void> {
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await loadIdentityFromStore(client, aid);
+  await client.connect({
     connection_kind: 'short',
     auto_reconnect: false,
     slot_id: opts.slot_id ?? 'main',
@@ -207,7 +207,7 @@ describe('长短连接共存集成测试', () => {
 
     // alice 短连接（同 aid/device/slot）发消息给 bob
     await connectShort(aliceShort, aliceAid, { slot_id: 'main' });
-    expect(aliceShort.state).toBe('connected');
+    expect(aliceShort.state).toBe('ready');
 
     const result = await aliceShort.call('message.send', {
       to: bobAid,
@@ -255,7 +255,7 @@ describe('长短连接共存集成测试', () => {
     await connectShort(shortClient, aid, { slot_id: 'main' });
     await sleep(1000);
 
-    expect(longClient.state).toBe('connected');
+    expect(longClient.state).toBe('ready');
 
     // 短连接能用
     await shortClient.call('meta.ping');
@@ -263,7 +263,7 @@ describe('长短连接共存集成测试', () => {
     await sleep(500);
 
     // 长连接仍存活
-    expect(longClient.state).toBe('connected');
+    expect(longClient.state).toBe('ready');
     await longClient.call('meta.ping');
   }, 20000);
 
@@ -278,7 +278,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.registerAid({ aid });
+    await registerAndLoadIdentity(setup, aid);
     await setup.close();
 
     // 起 10 个短连接
@@ -319,17 +319,17 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.registerAid({ aid });
+    await registerAndLoadIdentity(setup, aid);
     await setup.close();
 
     const short = makeClient(sharedPath);
     clients.push(short);
     await connectShort(short, aid, { slot_id: 'ttl', short_ttl_ms: 2000 });
-    expect(short.state).toBe('connected');
+    expect(short.state).toBe('ready');
 
     // 等待服务端主动关闭
     const evicted = await waitFor(
-      () => short.state !== 'connected',
+      () => short.state !== 'ready',
       6000,
     );
     expect(evicted).toBe(true);
@@ -346,7 +346,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.registerAid({ aid });
+    await registerAndLoadIdentity(setup, aid);
     await setup.close();
 
     const longOld = makeClient(sharedPath);
@@ -369,12 +369,12 @@ describe('长短连接共存集成测试', () => {
     await connectLong(longNew, aid, 'slot-x');
     await sleep(1500);
 
-    expect(longOld.state).not.toBe('connected');
-    expect(longNew.state).toBe('connected');
+    expect(longOld.state).not.toBe('ready');
+    expect(longNew.state).toBe('ready');
 
     // 短连接全部仍在线
     for (const c of shorts) {
-      expect(c.state).toBe('connected');
+      expect(c.state).toBe('ready');
       await c.call('meta.ping');
     }
   }, 25000);
@@ -393,7 +393,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(shortPath);
     clients.push(setup);
-    await setup.auth.registerAid({ aid: shortOnlyAid });
+    await registerAndLoadIdentity(setup, shortOnlyAid);
     await setup.close();
 
     const observer = makeClient(observerPath);
@@ -424,7 +424,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.registerAid({ aid });
+    await registerAndLoadIdentity(setup, aid);
     await setup.close();
 
     const shortClient = makeClient(sharedPath);
@@ -447,7 +447,7 @@ describe('长短连接共存集成测试', () => {
 
     const setup = makeClient(sharedPath);
     clients.push(setup);
-    await setup.auth.registerAid({ aid });
+    await registerAndLoadIdentity(setup, aid);
     await setup.close();
 
     const short = makeClient(sharedPath);

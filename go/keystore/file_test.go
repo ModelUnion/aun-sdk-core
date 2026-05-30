@@ -207,10 +207,10 @@ func TestInitSchema_SameVersion_NoOp(t *testing.T) {
 	}
 }
 
-// ── ISSUE-GO-002: session 私钥加密存储测试 ──────────────────────
+// ── 阶段6: session 数据明文写入测试 ──────────────────────
 
 func TestSaveSessionEncryptsDataInDB(t *testing.T) {
-	// ISSUE-GO-002: session 数据应通过 SecretStore 加密后存入 DB
+	// 阶段6: session 数据改为明文写入，LoadSession 仍能正常读取
 	dir := t.TempDir()
 	ss, err := secretstore.NewFileSecretStore(dir, "test-seed")
 	if err != nil {
@@ -223,7 +223,6 @@ func TestSaveSessionEncryptsDataInDB(t *testing.T) {
 	}
 	defer adb.close()
 
-	// 保存包含敏感私钥的 session 数据
 	sessionData := map[string]any{
 		"private_key_pem": "-----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----",
 		"peer_aid":        "peer.aid.com",
@@ -231,25 +230,23 @@ func TestSaveSessionEncryptsDataInDB(t *testing.T) {
 	}
 	adb.SaveSession("sess-001", sessionData)
 
-	// 直接读取 DB 中的 data_enc 字段，验证不是明文
+	// 阶段6: DB 中应为明文 JSON
 	var rawEnc string
 	row := adb.db.QueryRow("SELECT data_enc FROM e2ee_sessions WHERE session_id = ?", "sess-001")
 	if err := row.Scan(&rawEnc); err != nil {
 		t.Fatalf("读取 DB 中 session 数据失败: %v", err)
 	}
-
-	// 如果 data_enc 中包含明文私钥，说明没有加密
-	if strings.Contains(rawEnc, "SECRET") || strings.Contains(rawEnc, "PRIVATE KEY") {
-		t.Fatal("ISSUE-GO-002: session 数据在 DB 中应加密存储，但发现明文私钥")
+	if !strings.Contains(rawEnc, "super-secret-session-key") {
+		t.Fatalf("阶段6: session 数据应明文写入 DB，实际: %s", rawEnc)
 	}
 
-	// 通过正常接口加载，应能解密还原
+	// LoadSession 应能正常读取
 	loaded := adb.LoadSession("sess-001")
 	if loaded == nil {
 		t.Fatal("LoadSession 返回 nil")
 	}
 	if loaded["session_key"] != "super-secret-session-key" {
-		t.Fatalf("LoadSession 解密后数据不正确: %v", loaded["session_key"])
+		t.Fatalf("LoadSession 数据不正确: %v", loaded["session_key"])
 	}
 }
 

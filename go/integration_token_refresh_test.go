@@ -18,10 +18,11 @@ func TestIntegration_TokenRefreshRotatesAccessToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := client.Auth.CreateAID(ctx, map[string]any{"aid": aid}); err != nil {
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
+	loaded := integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
+	if err := client.LoadIdentity(loaded); err != nil {
+		t.Fatalf("加载身份失败: %v", err)
 	}
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+	authResult, err := client.Authenticate(ctx)
 	if err != nil {
 		t.Fatalf("认证失败: %v", err)
 	}
@@ -30,7 +31,7 @@ func TestIntegration_TokenRefreshRotatesAccessToken(t *testing.T) {
 		t.Fatal("初始 access_token 为空")
 	}
 
-	if err := client.Connect(ctx, authResult, &ConnectOptions{
+	if err := client.Connect(ctx, &ConnectOptions{
 		AutoReconnect:      false,
 		HeartbeatInterval:  0,
 		TokenRefreshBefore: 3590,

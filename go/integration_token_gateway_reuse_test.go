@@ -33,7 +33,7 @@ import (
 func makeReuseClient(t *testing.T, sharedPath string) *AUNClient {
 	t.Helper()
 	t.Setenv("AUN_ENV", "development")
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": sharedPath,
 	}, true)
 	client.configModel.RequireForwardSecrecy = false
@@ -93,10 +93,11 @@ func TestTokenGatewayReuseIntegration_FirstAuthPersists(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := client.Auth.CreateAID(ctx, map[string]any{"aid": aid}); err != nil {
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
+	loaded := integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
+	if err := client.LoadIdentity(loaded); err != nil {
+		t.Fatalf("加载身份失败: %v", err)
 	}
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+	authResult, err := client.Authenticate(ctx)
 	if err != nil {
 		t.Fatalf("首次 Authenticate 失败: %v", err)
 	}
@@ -145,11 +146,12 @@ func TestTokenGatewayReuseIntegration_SecondAuthSkipsNetwork(t *testing.T) {
 	client1 := makeReuseClient(t, sharedPath)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
-	if _, err := client1.Auth.CreateAID(ctx1, map[string]any{"aid": aid}); err != nil {
+	loaded := integrationRegisterOrLoadAID(t, client1.configModel.AUNPath, aid)
+	if err := client1.LoadIdentity(loaded); err != nil {
 		_ = client1.Close()
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
+		t.Fatalf("加载身份失败: %v", err)
 	}
-	first, err := client1.Auth.Authenticate(ctx1, map[string]any{"aid": aid})
+	first, err := client1.Authenticate(ctx1)
 	if err != nil {
 		_ = client1.Close()
 		t.Fatalf("第一次 Authenticate 失败: %v", err)
@@ -186,10 +188,11 @@ func TestTokenGatewayReuseIntegration_SecondAuthSkipsNetwork(t *testing.T) {
 	if cached := client2.AuthLoadCachedGatewayURL(aid); cached == "" {
 		t.Fatal("第二个 client 应能从 keystore metadata 读到 cached gateway_url")
 	}
+	integrationLoadAIDIntoClient(t, client2, aid)
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
-	second, err := client2.Auth.Authenticate(ctx2, map[string]any{"aid": aid})
+	second, err := client2.Authenticate(ctx2)
 	if err != nil {
 		t.Fatalf("第二次 Authenticate 失败（预期走 cached 不报错）: %v", err)
 	}
@@ -230,11 +233,12 @@ func TestTokenGatewayReuseIntegration_ReusedCachedConnects(t *testing.T) {
 	client1 := makeReuseClient(t, sharedPath)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
-	if _, err := client1.Auth.CreateAID(ctx1, map[string]any{"aid": aid}); err != nil {
+	loaded := integrationRegisterOrLoadAID(t, client1.configModel.AUNPath, aid)
+	if err := client1.LoadIdentity(loaded); err != nil {
 		_ = client1.Close()
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
+		t.Fatalf("加载身份失败: %v", err)
 	}
-	if _, err := client1.Auth.Authenticate(ctx1, map[string]any{"aid": aid}); err != nil {
+	if _, err := client1.Authenticate(ctx1); err != nil {
 		_ = client1.Close()
 		t.Fatalf("第一次 Authenticate 失败: %v", err)
 	}
@@ -246,18 +250,19 @@ func TestTokenGatewayReuseIntegration_ReusedCachedConnects(t *testing.T) {
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
-	authResult, err := client2.Auth.Authenticate(ctx2, map[string]any{"aid": aid})
+	integrationLoadAIDIntoClient(t, client2, aid)
+	_, err := client2.Authenticate(ctx2)
 	if err != nil {
 		t.Fatalf("第二次 Authenticate 失败: %v", err)
 	}
-	if err := client2.Connect(ctx2, authResult, &ConnectOptions{
+	if err := client2.Connect(ctx2, &ConnectOptions{
 		AutoReconnect:     false,
 		HeartbeatInterval: 30,
 	}); err != nil {
 		t.Fatalf("Connect 失败: %v", err)
 	}
-	if client2.State() != StateConnected {
-		t.Fatalf("client2 连接状态异常: %s", client2.State())
+	if client2.ConnectionState() != ConnStateReady {
+		t.Fatalf("client2 连接状态异常: %s", client2.ConnectionState())
 	}
 
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -285,11 +290,12 @@ func TestTokenGatewayReuseIntegration_ExpiredFallsBackToLogin(t *testing.T) {
 	client1 := makeReuseClient(t, sharedPath)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel1()
-	if _, err := client1.Auth.CreateAID(ctx1, map[string]any{"aid": aid}); err != nil {
+	loaded := integrationRegisterOrLoadAID(t, client1.configModel.AUNPath, aid)
+	if err := client1.LoadIdentity(loaded); err != nil {
 		_ = client1.Close()
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
+		t.Fatalf("加载身份失败: %v", err)
 	}
-	first, err := client1.Auth.Authenticate(ctx1, map[string]any{"aid": aid})
+	first, err := client1.Authenticate(ctx1)
 	if err != nil {
 		_ = client1.Close()
 		t.Fatalf("第一次 Authenticate 失败: %v", err)
@@ -320,7 +326,8 @@ func TestTokenGatewayReuseIntegration_ExpiredFallsBackToLogin(t *testing.T) {
 	defer func() { _ = client2.Close() }()
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
-	second, err := client2.Auth.Authenticate(ctx2, map[string]any{"aid": aid})
+	integrationLoadAIDIntoClient(t, client2, aid)
+	second, err := client2.Authenticate(ctx2)
 	if err != nil {
 		t.Fatalf("第二次 Authenticate 失败: %v", err)
 	}

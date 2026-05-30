@@ -16,6 +16,7 @@ import { promisify } from 'node:util';
 
 import { AUNClient } from '../../src/index.js';
 import type { JsonObject, Message } from '../../src/types.js';
+import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 const DOCKER_COMPOSE_DIR = path.resolve(__dirname, '../../../../docker-deploy');
 const execFileAsync = promisify(execFile);
@@ -31,9 +32,9 @@ function makeClient(): AUNClient {
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await setGatewayForClient(client, aid);
+  await registerAndLoadIdentity(client, aid);
+  await client.connect({
     auto_reconnect: true,
     heartbeat_interval: 3,
     retry: { max_attempts: 10, initial_delay: 1.0, max_delay: 10.0 },
@@ -142,7 +143,7 @@ async function canRunLocalReconnectTest(): Promise<boolean> {
 }
 
 function eventsIncludeDisconnect(states: string[]): boolean {
-  return states.includes('disconnected') || states.includes('reconnecting');
+  return states.includes('standby') || states.includes('reconnecting');
 }
 
 async function waitForDisconnectEvent(states: string[], timeoutMs: number): Promise<boolean> {
@@ -179,7 +180,7 @@ describe('断线重连集成测试', () => {
     const client = makeClient();
     clients.push(client);
     await ensureConnected(client, `rc-t1-${r}.agentid.pub`);
-    expect(client.state).toBe('connected');
+    expect(client.state).toBe('ready');
 
     const ok = await dockerRestart();
     if (!ok) {
@@ -188,14 +189,14 @@ describe('断线重连集成测试', () => {
     }
     await sleep(15000);
 
-    const reconnected = await waitForState(client, 'connected', 60000);
+    const reconnected = await waitForState(client, 'ready', 60000);
     expect(reconnected).toBe(true);
 
     const result = await client.call('meta.ping') as JsonObject;
     expect(result).toBeTruthy();
   }, 120000);
 
-  it('状态事件序列：Gateway 重启后至少出现一次断线/重连事件并最终恢复 connected', async () => {
+  it('状态事件序列：Gateway 重启后至少出现一次断线/重连事件并最终恢复 ready', async () => {
     if (shouldSkipLocalReconnect()) return;
 
     const r = rid();
@@ -216,10 +217,10 @@ describe('断线重连集成测试', () => {
     }
     await sleep(15000);
 
-    const reconnected = await waitForState(client, 'connected', 60000);
+    const reconnected = await waitForState(client, 'ready', 60000);
     expect(reconnected).toBe(true);
     expect(eventsIncludeDisconnect(states)).toBe(true);
-    expect(states[states.length - 1]).toBe('connected');
+    expect(states[states.length - 1]).toBe('ready');
   }, 120000);
 
   it('重连后消息收发正常', async () => {
@@ -242,8 +243,8 @@ describe('断线重连集成测试', () => {
     }
     await sleep(15000);
 
-    expect(await waitForState(alice, 'connected', 60000)).toBe(true);
-    expect(await waitForState(bob, 'connected', 60000)).toBe(true);
+    expect(await waitForState(alice, 'ready', 60000)).toBe(true);
+    expect(await waitForState(bob, 'ready', 60000)).toBe(true);
     await sleep(3000);
 
     const sendResult = await alice.call('message.send', {
@@ -259,7 +260,7 @@ describe('断线重连集成测试', () => {
     expect(messages.length).toBeGreaterThan(0);
   }, 120000);
 
-  it('停止 Gateway 后保持自动重连，恢复后重新 connected', async () => {
+  it('停止 Gateway 后保持自动重连，恢复后重新 ready', async () => {
     if (shouldSkipLocalReconnect()) return;
 
     const r = rid();
@@ -285,13 +286,13 @@ describe('断线重连集成测试', () => {
       const sawDisconnectEvent = await waitForDisconnectEvent(states, 20000);
       expect(sawDisconnectEvent).toBe(true);
       expect(eventsIncludeDisconnect(states)).toBe(true);
-      expect(['disconnected', 'reconnecting', 'connecting', 'authenticating']).toContain(client.state);
+      expect(['standby', 'reconnecting', 'connecting', 'connecting']).toContain(client.state);
 
       const started = await dockerStart();
       expect(started).toBe(true);
       stopped = false;
 
-      const reconnected = await waitForState(client, 'connected', 60000);
+      const reconnected = await waitForState(client, 'ready', 60000);
       expect(reconnected).toBe(true);
     } finally {
       if (stopped) {

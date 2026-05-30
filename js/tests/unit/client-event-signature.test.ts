@@ -173,7 +173,7 @@ describe('浏览器群事件验签', () => {
   it('有缓存证书且签名正确时应返回 true', async () => {
     const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const certPem = makeSelfSignedCert(privateKey, 'alice.agentid.pub');
-    const client = new AUNClient({ aun_path: '/tmp/aun-js-signature' }, true);
+    const client = new AUNClient({ aun_path: '/tmp/aun-js-signature', debug: true });
     const { event, cs } = buildSignedEvent({
       aid: 'alice.agentid.pub',
       certPem,
@@ -192,7 +192,7 @@ describe('浏览器群事件验签', () => {
   it('签名被篡改时应返回 false', async () => {
     const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const certPem = makeSelfSignedCert(privateKey, 'alice.agentid.pub');
-    const client = new AUNClient({ aun_path: '/tmp/aun-js-signature' }, true);
+    const client = new AUNClient({ aun_path: '/tmp/aun-js-signature', debug: true });
     const { event, cs } = buildSignedEvent({
       aid: 'alice.agentid.pub',
       certPem,
@@ -210,7 +210,7 @@ describe('浏览器群事件验签', () => {
   });
 
   it('没有缓存证书时应返回 pending', async () => {
-    const client = new AUNClient({ aun_path: '/tmp/aun-js-signature' }, true);
+    const client = new AUNClient({ aun_path: '/tmp/aun-js-signature', debug: true });
     (client as any)._fetchPeerCert = async () => '';
     const result = await (client as any)._verifyEventSignature(
       { group_id: 'g-1', action: 'member_added' },

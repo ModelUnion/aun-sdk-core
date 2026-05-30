@@ -27,7 +27,7 @@ func TestConnectionKind_NoReconnectCodesInclude4012And4013(t *testing.T) {
 // ── 2. normalizeConnectParams 不传 connection_kind 默认 "long" ───────
 
 func TestConnectionKind_DefaultIsLong(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	params, err := c.normalizeConnectParams(map[string]any{
@@ -46,7 +46,7 @@ func TestConnectionKind_DefaultIsLong(t *testing.T) {
 // ── 3. normalizeConnectParams 接受 kind=short + short_ttl_ms ────────
 
 func TestConnectionKind_AcceptsShortWithTtl(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	params, err := c.normalizeConnectParams(map[string]any{
@@ -71,7 +71,7 @@ func TestConnectionKind_AcceptsShortWithTtl(t *testing.T) {
 // ── 4. normalizeConnectParams 拒绝无效 kind ─────────────────────────
 
 func TestConnectionKind_RejectsInvalidKind(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	_, err := c.normalizeConnectParams(map[string]any{
@@ -101,12 +101,12 @@ func TestConnectionKind_AuthPayloadShortContainsOptions(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token":    "tok",
 		"gateway":         wsURL,
 		"connection_kind": "short",
@@ -153,12 +153,12 @@ func TestConnectionKind_AuthPayloadLongOmitsOptions(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token":    "tok",
 		"gateway":         wsURL,
 		"connection_kind": "long",
@@ -186,7 +186,7 @@ func TestConnectionKind_AuthPayloadLongOmitsOptions(t *testing.T) {
 // ── 7. 短连接禁用 token 自动刷新（心跳保留） ──────────────────────────────
 
 func TestConnectionKind_ShortDisablesTokenRefresh(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.mu.Lock()
@@ -215,7 +215,7 @@ func TestConnectionKind_ShortDisablesTokenRefresh(t *testing.T) {
 // ── 8. 长连接启动心跳和 token_refresh ───────────────────────────────
 
 func TestConnectionKind_LongStartsBackgroundTasks(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.mu.Lock()
@@ -251,7 +251,7 @@ func TestConnectionKind_LongStartsBackgroundTasks(t *testing.T) {
 // ── 9. 短连接不改变 auto_reconnect 默认值 ─────────────────────────────
 
 func TestConnectionKind_ShortDefaultAutoReconnectTrue(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	options := c.buildSessionOptions(map[string]any{
@@ -268,7 +268,7 @@ func TestConnectionKind_ShortDefaultAutoReconnectTrue(t *testing.T) {
 // ── 10. 长连接保持默认 auto_reconnect=true ──────────────────────────
 
 func TestConnectionKind_LongDefaultAutoReconnectTrue(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	options := c.buildSessionOptions(map[string]any{
@@ -295,12 +295,12 @@ func TestConnectionKind_ShortConnectSetsSessionOptions(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token":    "tok",
 		"gateway":         wsURL,
 		"connection_kind": "short",
@@ -326,7 +326,7 @@ func TestConnectionKind_ShortConnectSetsSessionOptions(t *testing.T) {
 // ── 辅助：验证 handleTransportDisconnect 对 4012/4013/4015 不重连 ───
 
 func TestConnectionKind_NoReconnectOn4012And4013(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	for _, code := range []int{4012, 4013, 4015} {
@@ -340,11 +340,11 @@ func TestConnectionKind_NoReconnectOn4012And4013(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(1)
-		var capturedState ClientState
+		var capturedState ConnectionState
 		unsub := c.events.Subscribe("connection.state", func(payload any) {
 			data, _ := payload.(map[string]any)
-			if s, ok := data["state"].(string); ok && s == "terminal_failed" {
-				capturedState = StateTerminalFailed
+			if s, ok := data["state"].(string); ok && s == string(ConnStateConnectionFailed) {
+				capturedState = ConnStateConnectionFailed
 				wg.Done()
 			}
 		})
@@ -356,11 +356,11 @@ func TestConnectionKind_NoReconnectOn4012And4013(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
-			t.Fatalf("code=%d: 未收到 terminal_failed 事件", code)
+			t.Fatalf("code=%d: 未收到 connection_failed 事件", code)
 		}
 
-		if capturedState != StateTerminalFailed {
-			t.Fatalf("code=%d: 应进入 terminal_failed 状态", code)
+		if capturedState != ConnStateConnectionFailed {
+			t.Fatalf("code=%d: 应进入 connection_failed 状态", code)
 		}
 		unsub.Unsubscribe()
 	}

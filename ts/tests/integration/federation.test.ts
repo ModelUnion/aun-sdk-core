@@ -16,6 +16,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { AUNClient } from '../../src/client.js';
 import type { JsonObject, Message } from '../../src/types.js';
+import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 const TEST_TIMEOUT = 90_000;
 process.env.AUN_ENV ??= 'development';
@@ -33,9 +34,9 @@ function makeClient(tag: string): AUNClient {
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth);
+  await setGatewayForClient(client, aid);
+  await registerAndLoadIdentity(client, aid);
+  await client.connect();
 }
 
 function msgText(msg: Message): string {

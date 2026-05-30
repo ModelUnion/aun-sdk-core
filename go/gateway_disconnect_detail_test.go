@@ -15,7 +15,7 @@ import (
 
 // 用例 1：detail 透传到 'gateway.disconnect'
 func TestGatewayDisconnectDetail_PassThrough(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	var wg sync.WaitGroup
@@ -76,7 +76,7 @@ func TestGatewayDisconnectDetail_PassThrough(t *testing.T) {
 
 // 用例 2：服务端未带 detail 时，detail 应为空 map（非 nil）
 func TestGatewayDisconnectDetail_EmptyDetail(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	var wg sync.WaitGroup
@@ -114,7 +114,7 @@ func TestGatewayDisconnectDetail_EmptyDetail(t *testing.T) {
 
 // 用例 3：terminal_failed 状态变更带 detail（缓存路径）
 func TestGatewayDisconnectDetail_TerminalFailedCarriesDetail(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 1. 先模拟服务端发 gateway.disconnect（缓存 lastDisconnectInfo + 标记 serverKicked）
@@ -129,20 +129,20 @@ func TestGatewayDisconnectDetail_TerminalFailedCarriesDetail(t *testing.T) {
 		},
 	})
 
-	// 2. 准备订阅 connection.state(terminal_failed)
+	// 2. 准备订阅 connection.state(connection_failed)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	var captured map[string]any
 	sub := c.events.Subscribe("connection.state", func(payload any) {
 		data, _ := payload.(map[string]any)
-		if s, _ := data["state"].(string); s == "terminal_failed" {
+		if s, _ := data["state"].(string); s == string(ConnStateConnectionFailed) {
 			captured = data
 			wg.Done()
 		}
 	})
 	defer sub.Unsubscribe()
 
-	// 3. 触发传输断线（auto_reconnect=true 才会走到 terminal_failed 抑制分支）
+	// 3. 触发传输断线（auto_reconnect=true 才会走到 connection_failed 抑制分支）
 	c.mu.Lock()
 	c.state = StateConnected
 	c.sessionOptions = map[string]any{"auto_reconnect": true}
@@ -158,11 +158,11 @@ func TestGatewayDisconnectDetail_TerminalFailedCarriesDetail(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("未收到 connection.state(terminal_failed) 事件")
+		t.Fatal("未收到 connection.state(connection_failed) 事件")
 	}
 
 	if captured == nil {
-		t.Fatal("terminal_failed payload 为 nil")
+		t.Fatal("connection_failed payload 为 nil")
 	}
 	// reason 字段
 	if reason, _ := captured["reason"].(string); reason != "server kicked" {

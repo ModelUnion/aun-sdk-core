@@ -2,13 +2,14 @@
 //
 // 覆盖两组改进：
 //   A. AuthFlow.authenticate() 优先复用 cached access_token（未过期且有 refresh_token）
-//   B. AuthNamespace._resolveGateway 命中 keystore 缓存时跳过 well-known discovery，
+//   B. AUNClient/AIDStore gateway 解析命中 keystore 缓存时跳过 well-known discovery，
 //      discovery 成功后写入 keystore metadata（key='gateway_url'）
 
 import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AUNClient } from '../../src/client.js';
+import { AIDStore } from '../../src/aid-store.js';
 import { AuthFlow } from '../../src/auth.js';
 import { CryptoProvider } from '../../src/crypto.js';
 import type { KeyStore } from '../../src/keystore/index.js';
@@ -80,6 +81,8 @@ describe('AuthFlow.authenticate cached token reuse', () => {
     await ks.saveIdentity(aid, {
       aid,
       private_key_pem: 'PEM',
+      public_key_der_b64: 'PUB',
+      curve: 'P-256',
       cert: 'CERT',
       access_token: 'cached-access',
       refresh_token: 'cached-refresh',
@@ -107,6 +110,8 @@ describe('AuthFlow.authenticate cached token reuse', () => {
     await ks.saveIdentity(aid, {
       aid,
       private_key_pem: 'PEM',
+      public_key_der_b64: 'PUB',
+      curve: 'P-256',
       cert: 'CERT',
       // 没有 access_token，也没有 refresh_token
     });
@@ -117,6 +122,7 @@ describe('AuthFlow.authenticate cached token reuse', () => {
       refresh_token: 'fresh-refresh',
       expires_in: 3600,
     });
+    vi.spyOn(auth as any, '_assertCertMatchesLocalKeypair').mockReturnValue(undefined);
     // 跳过 new_cert 验证
     vi.spyOn(auth as any, '_validateNewCert').mockResolvedValue(undefined);
 
@@ -134,6 +140,8 @@ describe('AuthFlow.authenticate cached token reuse', () => {
     await ks.saveIdentity(aid, {
       aid,
       private_key_pem: 'PEM',
+      public_key_der_b64: 'PUB',
+      curve: 'P-256',
       cert: 'CERT',
       access_token: 'expired-access',
       refresh_token: 'cached-refresh',
@@ -146,6 +154,7 @@ describe('AuthFlow.authenticate cached token reuse', () => {
       refresh_token: 'fresh-refresh',
       expires_in: 3600,
     });
+    vi.spyOn(auth as any, '_assertCertMatchesLocalKeypair').mockReturnValue(undefined);
     vi.spyOn(auth as any, '_validateNewCert').mockResolvedValue(undefined);
 
     const result = await auth.authenticate('ws://gateway/aun', aid);
@@ -161,6 +170,8 @@ describe('AuthFlow.authenticate cached token reuse', () => {
     await ks.saveIdentity(aid, {
       aid,
       private_key_pem: 'PEM',
+      public_key_der_b64: 'PUB',
+      curve: 'P-256',
       cert: 'CERT',
       access_token: 'cached-access',
       access_token_expires_at: futureExpiry,
@@ -173,6 +184,7 @@ describe('AuthFlow.authenticate cached token reuse', () => {
       refresh_token: 'fresh-refresh',
       expires_in: 3600,
     });
+    vi.spyOn(auth as any, '_assertCertMatchesLocalKeypair').mockReturnValue(undefined);
     vi.spyOn(auth as any, '_validateNewCert').mockResolvedValue(undefined);
 
     await auth.authenticate('ws://gateway/aun', aid);
@@ -182,7 +194,7 @@ describe('AuthFlow.authenticate cached token reuse', () => {
 
 // ── B. _resolveGateway IndexedDB 缓存与持久化 ────────────────────────
 
-describe('AuthNamespace._resolveGateway cache + persist', () => {
+describe('gateway_url cache + persist', () => {
   it('4) keystore 命中 gateway_url 缓存时跳过 discovery', async () => {
     const client = new AUNClient();
     (client as any)._aid = 'alice.agentid.pub';
@@ -193,7 +205,7 @@ describe('AuthNamespace._resolveGateway cache + persist', () => {
       .spyOn((client as any)._discovery, 'discover')
       .mockRejectedValue(new Error('discovery should not be called'));
 
-    const url = await (client.auth as any)._resolveGateway('alice.agentid.pub');
+    const url = await (client as any)._resolveGatewayForAid('alice.agentid.pub');
 
     expect(url).toBe('ws://cached-gateway/aun');
     expect(discoverSpy).not.toHaveBeenCalled();
@@ -209,7 +221,7 @@ describe('AuthNamespace._resolveGateway cache + persist', () => {
       .spyOn((client as any)._discovery, 'discover')
       .mockResolvedValue('ws://discovered-gateway/aun');
 
-    const url = await (client.auth as any)._resolveGateway('bob.agentid.pub');
+    const url = await (client as any)._resolveGatewayForAid('bob.agentid.pub');
 
     expect(url).toBe('ws://discovered-gateway/aun');
     expect(discoverSpy).toHaveBeenCalled();
@@ -228,7 +240,7 @@ describe('AuthNamespace._resolveGateway cache + persist', () => {
       .mockRejectedValueOnce(new Error('primary not reachable'))
       .mockResolvedValueOnce('ws://fallback-gateway/aun');
 
-    const url = await (client.auth as any)._resolveGateway('charlie.agentid.pub');
+    const url = await (client as any)._resolveGatewayForAid('charlie.agentid.pub');
 
     expect(url).toBe('ws://fallback-gateway/aun');
     expect(discoverSpy).toHaveBeenCalledTimes(2);
@@ -249,7 +261,7 @@ describe('AuthNamespace._resolveGateway cache + persist', () => {
     const discoverSpy = vi.spyOn((client as any)._discovery, 'discover');
     const getMetaSpy = vi.spyOn(ks, 'getMetadata');
 
-    const url = await (client.auth as any)._resolveGateway('dave.agentid.pub');
+    const url = await (client as any)._resolveGatewayForAid('dave.agentid.pub');
 
     expect(url).toBe('ws://memory-gateway/aun');
     expect(discoverSpy).not.toHaveBeenCalled();
@@ -257,18 +269,20 @@ describe('AuthNamespace._resolveGateway cache + persist', () => {
   });
 
   it('7) 空字符串不写入 keystore（_persistGatewayUrl 防御性检查）', async () => {
-    const client = new AUNClient();
-    const ks = (client as any)._keystore;
+    const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '' });
+    const ks = createMockKeyStore();
+    (store as any)._keystore = ks;
     const setSpy = vi.spyOn(ks, 'setMetadata');
 
-    await (client.auth as any)._persistGatewayUrl('eve.agentid.pub', '');
+    await (store as any)._persistGatewayUrl('eve.agentid.pub', '');
 
     expect(setSpy).not.toHaveBeenCalled();
   });
 
   it('8) keystore 无 gateway_url 记录时返回空（不阻塞 discovery）', async () => {
-    const client = new AUNClient();
-    const cached = await (client.auth as any)._loadCachedGatewayUrl('frank.agentid.pub');
+    const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '' });
+    (store as any)._keystore = createMockKeyStore();
+    const cached = await (store as any)._loadCachedGatewayUrl('frank.agentid.pub');
     expect(cached).toBe('');
   });
 });

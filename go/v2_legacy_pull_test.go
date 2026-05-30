@@ -10,7 +10,7 @@ import (
 
 func newConnectedV2PullClientForTest(t *testing.T, wsURL string) *AUNClient {
 	t.Helper()
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	c.mu.Lock()
 	c.aid = "alice.example.com"
 	c.deviceID = "dev-1"
@@ -77,7 +77,7 @@ func TestPullV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	msgs, err := c.PullV2(ctx, 0, 10)
+	msgs, err := c.pullV2(ctx, 0, 10)
 	if err != nil {
 		t.Fatalf("PullV2 失败: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestPullGroupV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	msgs, err := c.PullGroupV2(ctx, groupID, 0, 10)
+	msgs, err := c.pullGroupV2(ctx, groupID, 0, 10)
 	if err != nil {
 		t.Fatalf("PullGroupV2 失败: %v", err)
 	}

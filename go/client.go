@@ -340,8 +340,25 @@ const (
 	StateClosed         ClientState = "closed"          // 已关闭
 )
 
+// ConnectionState 新版 9 态状态机，与 Python SDK types.py ConnectionState 对应。
+// 注意：常量用 ConnState 前缀，避免与旧 ClientState 的 State* 常量冲突。
+type ConnectionState string
+
+const (
+	ConnStateNoIdentity       ConnectionState = "no_identity"       // 无身份
+	ConnStateStandby          ConnectionState = "standby"           // 有身份，未连接
+	ConnStateAuthenticated    ConnectionState = "authenticated"     // 已认证，未建立长连接
+	ConnStateConnecting       ConnectionState = "connecting"        // 正在连接
+	ConnStateReady            ConnectionState = "ready"             // 已就绪，可发消息
+	ConnStateRetryBackoff     ConnectionState = "retry_backoff"     // 退避等待重连
+	ConnStateReconnecting     ConnectionState = "reconnecting"      // 正在重连
+	ConnStateConnectionFailed ConnectionState = "connection_failed" // 不可恢复失败
+	ConnStateClosed           ConnectionState = "closed"            // 已关闭
+)
+
 // ConnectOptions 连接选项
 type ConnectOptions struct {
+	GatewayURL         string         // 可选 Gateway URL；为空时按当前 AID 做 discovery
 	AutoReconnect      bool           // 是否自动重连
 	HeartbeatInterval  int            // 心跳间隔（秒）；0 表示不发，>0 时最小 30；opts 为 nil 时默认 30
 	TokenRefreshBefore int            // token 到期前多少秒刷新，默认 1800
@@ -349,7 +366,73 @@ type ConnectOptions struct {
 	Timeouts           *TimeoutConfig // 超时配置
 	ConnectionKind     string         // "long"（默认）或 "short"；短连接用于 CLI 工具发 RPC 后立即断开
 	ShortTtlMs         int            // 仅 kind=short 时有效，服务端兜底超时（毫秒）
+	SlotID             string         // 当前进程内的连接槽位，同设备最多 10 个 slot
 	ExtraInfo          map[string]any // 应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
+	DeliveryMode       map[string]any // message.send 的连接级投递模式
+	QueueRouting       any            // delivery_mode.routing 的便捷入口
+	AffinityTtlMs      int            // delivery_mode.affinity_ttl_ms 的便捷入口
+	BackgroundSync     bool           // 连接后是否启动后台同步
+}
+
+// AUNClientOptions 是重构后的客户端构造选项。
+// 身份只能通过 *AID 传入，不允许在选项里放字符串 aid。
+type AUNClientOptions struct {
+	AUNPath               string
+	RootCAPath            string
+	SeedPassword          string
+	EncryptionSeed        string
+	DiscoveryPort         int
+	VerifySSL             *bool
+	RequireForwardSecrecy *bool
+	ReplayWindowSeconds   int
+	Debug                 bool
+	ProtectedHeaders      map[string]any
+	Raw                   map[string]any
+}
+
+func (o AUNClientOptions) configMap() map[string]any {
+	raw := make(map[string]any)
+	for k, v := range o.Raw {
+		raw[k] = v
+	}
+	if _, ok := raw["aid"]; ok {
+		panic("AUNClientOptions must not include aid; pass *AID as the first argument")
+	}
+	if o.AUNPath != "" {
+		raw["aun_path"] = o.AUNPath
+	}
+	if o.RootCAPath != "" {
+		raw["root_ca_path"] = o.RootCAPath
+	}
+	if o.SeedPassword != "" {
+		raw["seed_password"] = o.SeedPassword
+	}
+	if o.EncryptionSeed != "" {
+		raw["encryption_seed"] = o.EncryptionSeed
+	}
+	if o.DiscoveryPort > 0 {
+		raw["discovery_port"] = o.DiscoveryPort
+	}
+	if o.VerifySSL != nil {
+		raw["verify_ssl"] = *o.VerifySSL
+	}
+	if o.RequireForwardSecrecy != nil {
+		raw["require_forward_secrecy"] = *o.RequireForwardSecrecy
+	}
+	if o.ReplayWindowSeconds > 0 {
+		raw["replay_window_seconds"] = o.ReplayWindowSeconds
+	}
+	return raw
+}
+
+func singleAUNClientOptions(options []AUNClientOptions) AUNClientOptions {
+	if len(options) == 0 {
+		return AUNClientOptions{}
+	}
+	if len(options) > 1 {
+		panic("NewAUNClient accepts at most one options object")
+	}
+	return options[0]
 }
 
 // RetryConfig 重试配置
@@ -479,8 +562,21 @@ type AUNClient struct {
 	serverKicked         atomic.Bool
 	tokenRefreshFailures atomic.Int32
 
+	// 重连 loop 取消函数：手动 connect 从 reconnecting/terminal_failed 恢复时用于停止旧 loop
+	reconnectCancel context.CancelFunc
+
+	// 新版 API 字段（重构）
+	currentAIDObj    *AID      // 当前加载的 AID 值对象
+	authenticated    bool      // 已完成短认证但未必建立长连接
+	nextRetryAt      time.Time // 下次重连时间
+	retryAttempt     int       // 当前重连尝试次数
+	lastConnectError error     // 最近一次连接错误
+
+	// 实例级 protected_headers，自动合并到 message.send/group.send/thought.put 调用
+	instanceProtectedHeaders map[string]string
+
 	// 缓存最近一次服务端 gateway.disconnect 信息（含 code/reason/detail），
-	// 让后续 connection.state(terminal_failed) 也能携带 detail（如配额超限信息）。
+	// 让后续 connection.state(connection_failed) 也能携带 detail（如配额超限信息）。
 	lastDisconnectMu   sync.Mutex
 	lastDisconnectInfo map[string]any
 
@@ -532,14 +628,10 @@ type AUNClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// Auth 命名空间
-	Auth *namespace.AuthNamespace
-	// AID 托管命名空间
-	Custody *namespace.CustodyNamespace
-	// Meta 命名空间
-	Meta *namespace.MetaNamespace
+	// 旧 namespace 仅作为内部适配实现，不再作为 AUNClient 公开字段暴露。
+	authNamespace *namespace.AuthNamespace
 
-	// AgentMDs 目录：{agentMDPath}/{aid}/agentmd.json 保存元数据，{agentMDPath}/{aid}/agent.md 保存正文。
+	// AIDs 目录：{agentMDPath}/{aid}/agentmd.json 保存元数据，{agentMDPath}/{aid}/agent.md 保存正文。
 	// gateway 在 RPC envelope._meta.agent_md_etag 注入服务端 etag；纯观察，无下游依赖。
 	agentMdMu            sync.RWMutex
 	agentMDPath          string
@@ -549,7 +641,7 @@ type AUNClient struct {
 	agentMDCache         map[string]*keystore.AgentMDCacheRecord
 	agentMDFetchInflight map[string]bool
 
-	// 测试可注入的 agent.md 底层操作；nil 时使用 c.Auth。
+	// 测试可注入的 agent.md 底层操作；nil 时使用内部 authNamespace。
 	agentMDOps agentMDOps
 
 	// 日志
@@ -587,10 +679,14 @@ type AUNClient struct {
 	// Pull Gate：序列化同一 key 的 pull 操作，避免重复并发 pull
 	pullGates       sync.Map // key -> *pullGateState
 	pullGateStaleMs int64    // 默认 30000ms
+
+	// 对端 AID 缓存（CachePeer / GetPeer / LookupPeer / Peers）
+	peerCache   map[string]*AID
+	peerCacheMu sync.RWMutex
 }
 
 // NewClient 创建 AUN 客户端
-func NewClient(config map[string]any, debug ...bool) *AUNClient {
+func newClient(config map[string]any, debug ...bool) *AUNClient {
 	rawConfig := make(map[string]any)
 	for k, v := range config {
 		rawConfig[k] = v
@@ -658,6 +754,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		dnsNet:                     dnsNet,
 		discovery:                  NewGatewayDiscovery(cfg.VerifySSL, dnsNet),
 		certCache:                  make(map[string]*cachedPeerCert),
+		peerCache:                  make(map[string]*AID),
 		connectDeliveryMode:        copyMapShallow(connectDeliveryMode),
 		defaultConnectDeliveryMode: copyMapShallow(connectDeliveryMode),
 		seqTracker:                 NewSeqTracker(),
@@ -665,7 +762,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 		pushedSeqs:                 make(map[string]map[int]bool),
 		pendingOrderedMsgs:         make(map[string]map[int]pendingOrderedMessage),
 		groupSynced:                make(map[string]bool),
-		agentMDPath:                filepath.Join(cfg.AUNPath, "AgentMDs"),
+		agentMDPath:                filepath.Join(cfg.AUNPath, "AIDs"),
 		agentMDCache:               make(map[string]*keystore.AgentMDCacheRecord),
 		agentMDFetchInflight:       make(map[string]bool),
 		v2AutoProposeLocks:         make(map[string]*sync.Mutex),
@@ -702,10 +799,7 @@ func NewClient(config map[string]any, debug ...bool) *AUNClient {
 	// 注册 RPC envelope._meta 观察者（吸收 gateway 注入的 agent_md_etag 等元数据）
 	c.transport.SetMetaObserver(c.observeRPCMeta)
 
-	// Auth 命名空间
-	c.Auth = namespace.NewAuthNamespace(c)
-	c.Custody = namespace.NewCustodyNamespace(c)
-	c.Meta = namespace.NewMetaNamespace(c)
+	c.authNamespace = namespace.NewAuthNamespace(c)
 
 	// 订阅内部事件：推送消息自动解密后 re-publish
 	events.Subscribe("_raw.message.received", func(payload any) {
@@ -753,15 +847,15 @@ func (c *AUNClient) AID() string {
 	return c.aid
 }
 
-// State 返回当前连接状态
-func (c *AUNClient) State() ClientState {
+// State 返回对外的 9 态连接状态。
+func (c *AUNClient) State() ConnectionState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.state
+	return mapPublicConnectionState(c.state, c.currentAIDObj != nil, c.authenticated, c.nextRetryAt)
 }
 
 // agentMDOps 是 PublishAgentMD / FetchAgentMD 调用底层 sign/verify/upload/download 的接口。
-// 默认指向 c.Auth；测试可替换以隔离 HTTP/签名逻辑，专门验证主 API 编排。
+// 默认指向内部 authNamespace；测试可替换以隔离 HTTP/签名逻辑，专门验证主 API 编排。
 type agentMDOps interface {
 	SignAgentMD(ctx context.Context, content string, opts *namespace.AgentMDSignOptions) (string, error)
 	VerifyAgentMD(ctx context.Context, content string, opts *namespace.AgentMDVerifyOptions) (map[string]any, error)
@@ -772,9 +866,11 @@ type agentMDOps interface {
 
 // AgentMDInfo 描述 FetchAgentMD 的返回结构。
 type AgentMDInfo struct {
-	AID       string         `json:"aid"`
-	Content   string         `json:"content"`
-	Signature map[string]any `json:"signature"`
+	AID          string         `json:"aid"`
+	Content      string         `json:"content"`
+	Signature    map[string]any `json:"signature"`
+	Verification map[string]any `json:"verification,omitempty"` // 与 Python/TS/JS 对齐：{status, reason}
+	CertPem      string         `json:"cert_pem,omitempty"`     // 与 Python/TS/JS 对齐
 	// InSync 仅在 aid 是自身时给出指针；外部 aid 时为 nil（语义上不适用）。
 	InSync    *bool  `json:"in_sync,omitempty"`
 	SavedTo   string `json:"saved_to,omitempty"`
@@ -885,11 +981,11 @@ func (c *AUNClient) agentMDOwnerAID() string {
 	return strings.TrimSpace(c.aid)
 }
 
-// SetAgentMDPath 设置 agent.md 本地存储根目录；空字符串恢复默认 {aun_path}/AgentMDs。
-func (c *AUNClient) SetAgentMDPath(root string) string {
+// setAgentMDPath 设置 agent.md 本地存储根目录；空字符串恢复默认 {aun_path}/AIDs。
+func (c *AUNClient) setAgentMDPath(root string) string {
 	next := strings.TrimSpace(root)
 	if next == "" {
-		next = filepath.Join(c.configModel.AUNPath, "AgentMDs")
+		next = filepath.Join(c.configModel.AUNPath, "AIDs")
 	}
 	_ = os.MkdirAll(next, 0o755)
 	c.agentMdMu.Lock()
@@ -899,15 +995,14 @@ func (c *AUNClient) SetAgentMDPath(root string) string {
 	return next
 }
 
-// SetAgentMdPath 保留 Go 以外 SDK 的大小写习惯别名。
-func (c *AUNClient) SetAgentMdPath(root string) string { return c.SetAgentMDPath(root) }
+func (c *AUNClient) setAgentMdPath(root string) string { return c.setAgentMDPath(root) }
 
 func (c *AUNClient) agentMDRoot() string {
 	c.agentMdMu.RLock()
 	root := strings.TrimSpace(c.agentMDPath)
 	c.agentMdMu.RUnlock()
 	if root == "" {
-		root = filepath.Join(c.configModel.AUNPath, "AgentMDs")
+		root = filepath.Join(c.configModel.AUNPath, "AIDs")
 	}
 	_ = os.MkdirAll(root, 0o755)
 	return root
@@ -1226,7 +1321,7 @@ func (c *AUNClient) scheduleAgentMDFetchIfMissing(aid string, rec *keystore.Agen
 		c.mu.RUnlock()
 		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		if _, err := c.FetchAgentMD(fetchCtx, target); err != nil {
+		if _, err := c.fetchAgentMD(fetchCtx, target); err != nil {
 			c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
 				LastError:    agentMDStringPtr(err.Error()),
 				RemoteStatus: agentMDStringPtr("found"),
@@ -1310,10 +1405,10 @@ func (c *AUNClient) observeAgentMDFromEnvelope(envelope map[string]any) {
 }
 
 func (c *AUNClient) agentMDAuthCacheMeta(aid string) (string, string) {
-	if c.Auth == nil {
+	if c.authNamespace == nil {
 		return "", ""
 	}
-	meta := c.Auth.CachedAgentMDMeta(aid)
+	meta := c.authNamespace.CachedAgentMDMeta(aid)
 	if meta == nil {
 		return "", ""
 	}
@@ -1373,11 +1468,11 @@ func (c *AUNClient) PublishAgentMD(ctx context.Context, _legacyPath ...string) (
 	return result, nil
 }
 
-// FetchAgentMD 下载 agent.md 并自动验签；aid 为空时取自身 AID；可选 savePath 写盘；
+// fetchAgentMD 下载 agent.md 并自动验签；aid 为空时取自身 AID；可选 savePath 写盘；
 // 若 aid 是自己则同步刷新 localAgentMDEtag 与 InSync。
 //
-// 写盘失败不影响 FetchAgentMD 整体成功，错误信息回填到 AgentMDInfo.SaveError。
-func (c *AUNClient) FetchAgentMD(ctx context.Context, aid string, _legacySavePath ...string) (*AgentMDInfo, error) {
+// 写盘失败不影响 fetchAgentMD 整体成功，错误信息回填到 AgentMDInfo.SaveError。
+func (c *AUNClient) fetchAgentMD(ctx context.Context, aid string, _legacySavePath ...string) (*AgentMDInfo, error) {
 	target := strings.TrimSpace(aid)
 	if target == "" {
 		c.mu.RLock()
@@ -1399,6 +1494,18 @@ func (c *AUNClient) FetchAgentMD(ctx context.Context, aid string, _legacySavePat
 	}
 
 	info := &AgentMDInfo{AID: target, Content: content, Signature: sig}
+	// 填充 Verification（与 Python/TS/JS 对齐）
+	if status, ok := sig["status"].(string); ok {
+		verification := map[string]any{"status": status}
+		if reason, ok := sig["reason"].(string); ok && reason != "" {
+			verification["reason"] = reason
+		}
+		info.Verification = verification
+	}
+	// 填充 CertPem（从 sig 中提取，VerifyAgentMD 会返回 cert_pem）
+	if certPem, ok := sig["cert_pem"].(string); ok && certPem != "" {
+		info.CertPem = certPem
+	}
 
 	c.mu.RLock()
 	selfAid := strings.TrimSpace(c.aid)
@@ -1443,8 +1550,8 @@ func (c *AUNClient) FetchAgentMD(ctx context.Context, aid string, _legacySavePat
 	return info, nil
 }
 
-// CheckAgentMD 通过 HEAD 比较本地缓存 agent.md 与云端 agent.md ETag 是否一致。
-func (c *AUNClient) CheckAgentMD(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
+// checkAgentMD 通过 HEAD 比较本地缓存 agent.md 与云端 agent.md ETag 是否一致。
+func (c *AUNClient) checkAgentMD(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
 	target := strings.TrimSpace(aid)
 	if target == "" {
 		target = c.agentMDOwnerAID()
@@ -1550,17 +1657,16 @@ func (c *AUNClient) CheckAgentMD(ctx context.Context, aid string, maxUnsyncedDay
 	}, nil
 }
 
-// CheckAgentMd 保留 Go 以外 SDK 的大小写习惯别名。
-func (c *AUNClient) CheckAgentMd(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
-	return c.CheckAgentMD(ctx, aid, maxUnsyncedDays...)
+func (c *AUNClient) checkAgentMd(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
+	return c.checkAgentMD(ctx, aid, maxUnsyncedDays...)
 }
 
-// resolveAgentMDOps 返回测试注入的 agentMDOps 或默认 c.Auth。
+// resolveAgentMDOps 返回测试注入的 agentMDOps 或默认内部 authNamespace。
 func (c *AUNClient) resolveAgentMDOps() agentMDOps {
 	if c.agentMDOps != nil {
 		return c.agentMDOps
 	}
-	return c.Auth
+	return c.authNamespace
 }
 
 // observeRPCMeta transport 的 _meta observer：吸收 gateway 注入的 agent_md_etag 等元数据。
@@ -1694,6 +1800,34 @@ func (c *AUNClient) AuthPersistGatewayURL(aid, gatewayURL string) {
 	c.auth.PersistGatewayURL(aid, gatewayURL)
 }
 
+func (c *AUNClient) resolveGatewayForAID(ctx context.Context, aid string) (string, error) {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return "", NewStateError("gateway discovery requires a loaded AID")
+	}
+	if cached := strings.TrimSpace(c.AuthLoadCachedGatewayURL(target)); cached != "" {
+		c.SetGatewayURL(cached)
+		return cached, nil
+	}
+	issuer := target
+	if parts := strings.SplitN(target, ".", 2); len(parts) > 1 {
+		issuer = parts[1]
+	}
+	port := c.GetConfigDiscoveryPort()
+	portSuffix := ""
+	if port > 0 {
+		portSuffix = fmt.Sprintf(":%d", port)
+	}
+	wellKnownURL := fmt.Sprintf("https://gateway.%s%s/.well-known/aun-gateway", issuer, portSuffix)
+	discovered, err := c.discovery.Discover(ctx, wellKnownURL, 0)
+	if err != nil {
+		return "", err
+	}
+	c.SetGatewayURL(discovered)
+	c.AuthPersistGatewayURL(target, discovered)
+	return discovered, nil
+}
+
 // AuthFetchPeerCert 通过 AuthFlow 获取并验证对端证书。
 func (c *AUNClient) AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error) {
 	return c.fetchPeerCert(ctx, aid, certFingerprint)
@@ -1714,8 +1848,8 @@ func (c *AUNClient) DiscoverGateway(ctx context.Context, wellKnownURL string, ti
 	return c.discovery.Discover(ctx, wellKnownURL, timeout)
 }
 
-// CheckGatewayHealth 向 gatewayURL 的 /health 端点发送 GET 请求，检查网关可用性。
-func (c *AUNClient) CheckGatewayHealth(ctx context.Context, gatewayURL string, timeout time.Duration) bool {
+// checkGatewayHealth 向 gatewayURL 的 /health 端点发送 GET 请求，检查网关可用性。
+func (c *AUNClient) checkGatewayHealth(ctx context.Context, gatewayURL string, timeout time.Duration) bool {
 	return c.discovery.CheckHealth(ctx, gatewayURL, timeout)
 }
 
@@ -1740,14 +1874,116 @@ func (c *AUNClient) GetIdentity() map[string]any {
 
 // ── 生命周期 ──────────────────────────────────────────────
 
-// Connect 连接到 AUN Gateway
-func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *ConnectOptions) (err error) {
+// Connect 连接到 AUN Gateway。
+//
+// 新 API：Connect(ctx, opts?)，身份必须先通过 NewAUNClient(aid) 或 LoadIdentity(aid) 加载。
+func (c *AUNClient) Connect(ctx context.Context, args ...any) error {
+	if len(args) > 1 {
+		return NewValidationError("Connect accepts at most one options object")
+	}
+	if len(args) == 0 {
+		return c.connectWithLoadedIdentity(ctx, nil)
+	}
+	switch first := args[0].(type) {
+	case nil:
+		if len(args) > 1 {
+			return NewValidationError("Connect(ctx, nil) does not accept extra arguments")
+		}
+		return c.connectWithLoadedIdentity(ctx, nil)
+	case *ConnectOptions:
+		if len(args) > 1 {
+			return NewValidationError("Connect(ctx, opts) does not accept extra arguments")
+		}
+		return c.connectWithLoadedIdentity(ctx, first)
+	case ConnectOptions:
+		if len(args) > 1 {
+			return NewValidationError("Connect(ctx, opts) does not accept extra arguments")
+		}
+		opt := first
+		return c.connectWithLoadedIdentity(ctx, &opt)
+	default:
+		return NewValidationError("Connect first argument must be *ConnectOptions")
+	}
+}
+
+func (c *AUNClient) connectWithLoadedIdentity(ctx context.Context, opts *ConnectOptions) error {
+	c.mu.RLock()
+	current := c.currentAIDObj
+	gatewayURL := c.gatewayURL
+	c.mu.RUnlock()
+	if current == nil || !current.IsPrivateKeyValid() {
+		return NewStateError("Connect requires a loaded AID with a valid private key")
+	}
+	if opts != nil && strings.TrimSpace(opts.GatewayURL) != "" {
+		gatewayURL = strings.TrimSpace(opts.GatewayURL)
+	}
+	if gatewayURL == "" {
+		resolved, err := c.resolveGatewayForAID(ctx, current.Aid)
+		if err != nil {
+			return fmt.Errorf("connect gateway discovery failed: %w", err)
+		}
+		gatewayURL = resolved
+	}
+	params := map[string]any{
+		"gateway": gatewayURL,
+	}
+	return c.connectWithParams(ctx, params, opts, true, false)
+}
+
+// Authenticate 使用当前加载的 AID 完成两阶段认证并缓存 token，不建立长连接。
+func (c *AUNClient) Authenticate(ctx context.Context, opts ...ConnectOptions) (map[string]any, error) {
+	if len(opts) > 1 {
+		return nil, NewValidationError("Authenticate accepts at most one options object")
+	}
+	var opt ConnectOptions
+	if len(opts) == 1 {
+		opt = opts[0]
+	}
+	c.mu.RLock()
+	current := c.currentAIDObj
+	gatewayURL := c.gatewayURL
+	c.mu.RUnlock()
+	if current == nil || !current.IsPrivateKeyValid() {
+		return nil, NewStateError("Authenticate requires a loaded AID with a valid private key")
+	}
+	if strings.TrimSpace(opt.GatewayURL) != "" {
+		gatewayURL = strings.TrimSpace(opt.GatewayURL)
+	}
+	if gatewayURL == "" {
+		resolved, err := c.resolveGatewayForAID(ctx, current.Aid)
+		if err != nil {
+			return nil, fmt.Errorf("authenticate gateway discovery failed: %w", err)
+		}
+		gatewayURL = resolved
+	}
+	result, err := c.auth.Authenticate(ctx, gatewayURL, current.Aid)
+	if err != nil {
+		c.mu.Lock()
+		c.lastConnectError = err
+		c.authenticated = false
+		c.mu.Unlock()
+		return nil, err
+	}
+	c.mu.Lock()
+	c.identity = c.auth.LoadIdentityOrNil(current.Aid)
+	c.aid = current.Aid
+	c.gatewayURL = gatewayURL
+	c.authenticated = true
+	if c.state == StateIdle {
+		c.state = StateDisconnected
+	}
+	c.lastConnectError = nil
+	c.mu.Unlock()
+	return result, nil
+}
+
+func (c *AUNClient) connectWithParams(ctx context.Context, params map[string]any, opts *ConnectOptions, allowReauth bool, requireAccessToken bool) (err error) {
 	tStart := time.Now()
 	gatewayURL := ""
-	if auth != nil {
-		gatewayURL, _ = auth["gateway"].(string)
+	if params != nil {
+		gatewayURL, _ = params["gateway"].(string)
 		if gatewayURL == "" {
-			gatewayURL, _ = auth["gateway_url"].(string)
+			gatewayURL, _ = params["gateway_url"].(string)
 		}
 	}
 	c.log.Debug("Connect enter: gateway=%s", gatewayURL)
@@ -1761,53 +1997,94 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 
 	// 原子检查+状态转换，避免 TOCTOU 竞态
 	// ISSUE-SDK-GO-009: 允许从 disconnected 状态重新连接
+	// Fix-04: 同时放行 reconnecting(retry_backoff) 与 terminal_failed(connection_failed)，
+	// 与 Python SDK connect() 守卫对齐。从 reconnecting 恢复时需先停止旧重连 loop。
 	c.mu.Lock()
-	if c.state != StateIdle && c.state != StateClosed && c.state != StateDisconnected {
+	switch c.state {
+	case StateIdle, StateClosed, StateDisconnected, StateReconnecting, StateTerminalFailed:
+		// 放行
+	default:
 		st := c.state
 		c.mu.Unlock()
 		return NewStateError(fmt.Sprintf("connect 不允许在状态 %s 下调用", st))
 	}
+	// 从 reconnecting 状态进入：取消正在运行的重连 loop，避免与本次手动 connect 抢占
+	if c.state == StateReconnecting && c.reconnectCancel != nil {
+		cancel := c.reconnectCancel
+		c.reconnectCancel = nil
+		c.mu.Unlock()
+		cancel()
+		// 等待旧 loop 让出 reconnecting 标志（loop 收到 ctx.Done 后会 Store(false)）
+		for i := 0; i < 200 && c.reconnecting.Load(); i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		c.mu.Lock()
+	}
+	// 从 terminal_failed 恢复：复位重试计数与错误状态
+	if c.state == StateTerminalFailed {
+		c.retryAttempt = 0
+		c.lastConnectError = nil
+	}
+	c.nextRetryAt = time.Time{}
 	c.state = StateConnecting
 	c.mu.Unlock()
 
 	// 合并参数
-	params := make(map[string]any)
-	for k, v := range auth {
-		params[k] = v
+	merged := make(map[string]any)
+	for k, v := range params {
+		merged[k] = v
 	}
 	if opts != nil {
-		if opts.AutoReconnect {
-			params["auto_reconnect"] = true
+		if opts.GatewayURL != "" {
+			merged["gateway"] = opts.GatewayURL
 		}
-		params["heartbeat_interval"] = float64(opts.HeartbeatInterval)
+		if opts.AutoReconnect {
+			merged["auto_reconnect"] = true
+		}
+		merged["heartbeat_interval"] = float64(opts.HeartbeatInterval)
 		if opts.TokenRefreshBefore > 0 {
-			params["token_refresh_before"] = float64(opts.TokenRefreshBefore)
+			merged["token_refresh_before"] = float64(opts.TokenRefreshBefore)
 		}
 		if opts.Retry != nil {
-			params["retry"] = map[string]any{
+			merged["retry"] = map[string]any{
 				"initial_delay": opts.Retry.InitialDelay,
 				"max_delay":     opts.Retry.MaxDelay,
 			}
 		}
 		if opts.Timeouts != nil {
-			params["timeouts"] = map[string]any{
+			merged["timeouts"] = map[string]any{
 				"connect": opts.Timeouts.Connect,
 				"call":    opts.Timeouts.Call,
 			}
 		}
 		if opts.ConnectionKind != "" {
-			params["connection_kind"] = opts.ConnectionKind
+			merged["connection_kind"] = opts.ConnectionKind
 		}
 		if opts.ShortTtlMs > 0 {
-			params["short_ttl_ms"] = opts.ShortTtlMs
+			merged["short_ttl_ms"] = opts.ShortTtlMs
+		}
+		if opts.SlotID != "" {
+			merged["slot_id"] = opts.SlotID
 		}
 		if len(opts.ExtraInfo) > 0 {
-			params["extra_info"] = opts.ExtraInfo
+			merged["extra_info"] = opts.ExtraInfo
+		}
+		if len(opts.DeliveryMode) > 0 {
+			merged["delivery_mode"] = copyMapShallow(opts.DeliveryMode)
+		}
+		if opts.QueueRouting != nil {
+			merged["queue_routing"] = opts.QueueRouting
+		}
+		if opts.AffinityTtlMs > 0 {
+			merged["affinity_ttl_ms"] = opts.AffinityTtlMs
+		}
+		if opts.BackgroundSync {
+			merged["background_sync"] = true
 		}
 	}
 
 	// 规范化参数
-	normalized, normErr := c.normalizeConnectParams(params)
+	normalized, normErr := c.normalizeConnectParamsWithTokenPolicy(merged, requireAccessToken)
 	if normErr != nil {
 		c.mu.Lock()
 		c.state = StateDisconnected
@@ -1839,8 +2116,12 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 			gwParams[k] = v
 		}
 		gwParams["gateway"] = gw
-		lastErr = c.connectOnce(ctx, gwParams, false)
+		lastErr = c.connectOnce(ctx, gwParams, allowReauth)
 		if lastErr == nil {
+			c.mu.Lock()
+			c.authenticated = true
+			c.lastConnectError = nil
+			c.mu.Unlock()
 			return nil
 		}
 		if len(gateways) > 1 {
@@ -1856,6 +2137,7 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 	if err != nil {
 		c.log.Error("Connect failed: err=%v", err)
 		c.mu.Lock()
+		c.lastConnectError = err
 		if c.state == StateConnecting || c.state == StateAuthenticating {
 			c.state = StateDisconnected
 		}
@@ -1864,8 +2146,8 @@ func (c *AUNClient) Connect(ctx context.Context, auth map[string]any, opts *Conn
 	return err
 }
 
-// ListIdentities 列出本地所有具有有效私钥的身份摘要（对齐 Python list_identities）。
-func (c *AUNClient) ListIdentities() (summaries []map[string]any, err error) {
+// listIdentities 列出本地所有具有有效私钥的身份摘要。
+func (c *AUNClient) listIdentities() (summaries []map[string]any, err error) {
 	tStart := time.Now()
 	c.log.Debug("ListIdentities enter")
 	defer func() {
@@ -1927,9 +2209,10 @@ func (c *AUNClient) Disconnect() (err error) {
 
 	c.mu.Lock()
 	c.state = StateDisconnected
+	c.authenticated = false
 	c.mu.Unlock()
 
-	c.events.Publish("connection.state", map[string]any{"state": string(StateDisconnected)})
+	c.events.Publish("connection.state", map[string]any{"state": string(c.ConnectionState())})
 	return nil
 }
 
@@ -1998,6 +2281,7 @@ func (c *AUNClient) Close() (err error) {
 		c.releaseV2State()
 		c.mu.Lock()
 		c.state = StateClosed
+		c.authenticated = false
 		c.resetSeqTrackingStateLocked()
 		c.mu.Unlock()
 		return nil
@@ -2017,10 +2301,11 @@ func (c *AUNClient) Close() (err error) {
 
 	c.mu.Lock()
 	c.state = StateClosed
+	c.authenticated = false
 	c.resetSeqTrackingStateLocked()
 	c.mu.Unlock()
 
-	c.events.Publish("connection.state", map[string]any{"state": string(StateClosed)})
+	c.events.Publish("connection.state", map[string]any{"state": string(c.ConnectionState())})
 	return nil
 }
 
@@ -2059,6 +2344,11 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 		}
 		params = copied
 	}
+
+	// Fix-03: 对 message.send/group.send/message.thought.put/group.thought.put 自动合并实例级 protected_headers。
+	// 调用方在 params["protected_headers"] 显式传的键优先，实例级仅补充缺失键。
+	c.mergeInstanceProtectedHeaders(method, params)
+
 	if method == "message.send" || method == "group.send" {
 		c.normalizeOutboundMessagePayload(params, method)
 	}
@@ -2462,18 +2752,15 @@ func (c *AUNClient) Off(event string, handler EventHandler) {
 	c.events.Unsubscribe(event, handler)
 }
 
-// Ping 发送心跳
-func (c *AUNClient) Ping(ctx context.Context) (any, error) {
+func (c *AUNClient) ping(ctx context.Context) (any, error) {
 	return c.Call(ctx, "meta.ping", nil)
 }
 
-// Status 查询服务状态
-func (c *AUNClient) Status(ctx context.Context) (any, error) {
+func (c *AUNClient) status(ctx context.Context) (any, error) {
 	return c.Call(ctx, "meta.status", nil)
 }
 
-// TrustRoots 获取信任根
-func (c *AUNClient) TrustRoots(ctx context.Context) (any, error) {
+func (c *AUNClient) trustRoots(ctx context.Context) (any, error) {
 	return c.Call(ctx, "meta.trust_roots", nil)
 }
 
@@ -4338,19 +4625,26 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 	c.mu.Lock()
 	c.state = StateConnected
 	c.connectedAt = time.Now()
+	c.nextRetryAt = time.Time{}
 	prevContext := c.seqTrackerContext
 	c.refreshSeqTrackerContextLocked()
 	contextChanged := c.seqTrackerContext != prevContext
 	c.mu.Unlock()
 
 	c.log.Debug("connection auth completed, state switched to connected: gateway=%s aid=%s", gatewayURL, c.AID())
-	c.events.Publish("connection.state", map[string]any{"state": "connected", "gateway": gatewayURL})
+	c.events.Publish("connection.state", map[string]any{"state": string(c.ConnectionState()), "gateway": gatewayURL})
 
 	// 启动后台任务
 	if contextChanged {
 		c.restoreSeqTrackerState()
 	}
 	c.startBackgroundTasks(ctx)
+
+	// V2 E2EE 必须先初始化，再触发 post-connect 补拉；否则 message.pull 会走旧路径，
+	// 对 V2 设备副本提前 ack，导致后续 message.v2.pull 跳过尚未解密发布的消息。
+	if v2Err := c.initV2Session(ctx); v2Err != nil {
+		c.logE2.Warn("V2 session init failed (non-fatal): %v", v2Err)
+	}
 
 	// connect/reconnect 成功后自动触发一次 P2P message.pull，补齐离线期间积压
 	// 群消息按惰性触发，不在此处主动 pull
@@ -4362,11 +4656,6 @@ func (c *AUNClient) connectOnce(ctx context.Context, params map[string]any, allo
 		}()
 		c.fillP2pGap()
 	}()
-
-	// V2 E2EE: 初始化 session 并注册设备 SPK（best-effort，失败不阻塞 connect）
-	if v2Err := c.InitV2Session(ctx); v2Err != nil {
-		c.logE2.Warn("V2 session init failed (non-fatal): %v", v2Err)
-	}
 
 	// V2: 上线后自动确认 pending state proposals（后台执行）
 	c.mu.RLock()
@@ -4767,6 +5056,12 @@ func (c *AUNClient) tokenRefreshLoop(ctx context.Context) {
 		c.tokenRefreshFailures.Store(0)
 
 		c.mu.Lock()
+		// 刷新期间可能已断线，复检状态，避免写回 stale identity
+		if c.state != StateConnected {
+			c.mu.Unlock()
+			sleepWithCancel(ctx, checkInterval)
+			continue
+		}
 		c.identity = refreshedIdentity
 		if c.sessionParams != nil {
 			if at, ok := refreshedIdentity["access_token"].(string); ok {
@@ -4987,7 +5282,7 @@ func (c *AUNClient) onGatewayDisconnect(payload any) {
 	}
 	c.log.Warn("server initiated disconnect: code=%v, reason=%v, detail=%v", code, reason, detail)
 	c.serverKicked.Store(true)
-	// 缓存最近一次 disconnect 信息，让后续 connection.state(terminal_failed) 也能带 detail
+	// 缓存最近一次 disconnect 信息，让后续 connection.state(connection_failed) 也能带 detail
 	c.lastDisconnectMu.Lock()
 	c.lastDisconnectInfo = map[string]any{
 		"code":   code,
@@ -5015,10 +5310,12 @@ func (c *AUNClient) handleTransportDisconnect(err error, closeCode int) {
 		return
 	}
 	c.state = StateDisconnected
+	c.authenticated = false
+	c.nextRetryAt = time.Time{}
 	c.mu.Unlock()
 
 	c.events.Publish("connection.state", map[string]any{
-		"state": "disconnected",
+		"state": string(c.ConnectionState()),
 		"error": err,
 	})
 
@@ -5039,6 +5336,7 @@ func (c *AUNClient) handleTransportDisconnect(err error, closeCode int) {
 	if c.serverKicked.Load() || noReconnectCodes[closeCode] {
 		c.mu.Lock()
 		c.state = StateTerminalFailed
+		c.nextRetryAt = time.Time{}
 		c.mu.Unlock()
 		reason := "server kicked"
 		if !c.serverKicked.Load() {
@@ -5046,7 +5344,7 @@ func (c *AUNClient) handleTransportDisconnect(err error, closeCode int) {
 		}
 		c.log.Warn("suppressing auto-reconnect: %s", reason)
 		eventPayload := map[string]any{
-			"state":  "terminal_failed",
+			"state":  string(c.ConnectionState()),
 			"error":  err,
 			"reason": reason,
 		}
@@ -5070,12 +5368,17 @@ func (c *AUNClient) handleTransportDisconnect(err error, closeCode int) {
 		// closeCode == -1 表示网络异常断开（无 close frame），其他 code = 服务端主动关闭
 		serverInitiated := closeCode != -1
 		c.log.Info("triggering auto-reconnect: serverInitiated=%v closeCode=%d", serverInitiated, closeCode)
-		go c.reconnectLoop(serverInitiated)
+		// 创建可取消的 context，供手动 connect 从 reconnecting 状态停止旧 loop
+		reconnCtx, reconnCancel := context.WithCancel(context.Background())
+		c.mu.Lock()
+		c.reconnectCancel = reconnCancel
+		c.mu.Unlock()
+		go c.reconnectLoop(reconnCtx, serverInitiated)
 	}
 }
 
-// reconnectLoop 重连循环（指数退避 + 固定上限抖动，在不可重试错误、close()、或超过最大重试次数时终止）
-func (c *AUNClient) reconnectLoop(serverInitiated bool) {
+// reconnectLoop 重连循环（指数退避 + 固定上限抖动，在不可重试错误、close()、ctx 取消、或超过最大重试次数时终止）
+func (c *AUNClient) reconnectLoop(ctx context.Context, serverInitiated bool) {
 	c.mu.RLock()
 	opts := c.sessionOptions
 	c.mu.RUnlock()
@@ -5105,15 +5408,16 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 		delayFallback = 16.0
 	}
 	delay = clampReconnectDelaySeconds(delay, delayFallback, maxBaseDelay)
-	for attempt := 1; !c.closing.Load(); attempt++ {
+	for attempt := 1; !c.closing.Load() && ctx.Err() == nil; attempt++ {
 		// 超过最大重试次数时停止
 		if maxAttempts > 0 && attempt > maxAttempts {
 			c.log.Warn("reconnect exceeded max attempts %d, stopping retry", maxAttempts)
 			c.mu.Lock()
 			c.state = StateTerminalFailed
+			c.nextRetryAt = time.Time{}
 			c.mu.Unlock()
 			c.events.Publish("connection.state", map[string]any{
-				"state":   "terminal_failed",
+				"state":   string(c.ConnectionState()),
 				"error":   fmt.Errorf("超过最大重连次数 %d", maxAttempts),
 				"attempt": attempt - 1,
 			})
@@ -5121,25 +5425,44 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 			return
 		}
 
-		c.mu.Lock()
-		c.state = StateReconnecting
-		c.mu.Unlock()
-
-		c.events.Publish("connection.state", map[string]any{
-			"state":   "reconnecting",
-			"attempt": attempt,
-		})
-
 		// 固定上限抖动：base=[1s, max_base]，delay=base+rand(0..max_base)。
 		// ISSUE-SDK-GO-007: 使用 crypto/rand 代替 math/rand，确保并发安全。
 		jitteredDelay := reconnectSleepDelaySeconds(delay, maxBaseDelay)
-		time.Sleep(time.Duration(jitteredDelay * float64(time.Second)))
+		sleepDuration := time.Duration(jitteredDelay * float64(time.Second))
+		nextRetryAt := time.Now().Add(sleepDuration)
+		c.mu.Lock()
+		c.state = StateReconnecting
+		c.retryAttempt = attempt
+		c.nextRetryAt = nextRetryAt
+		c.mu.Unlock()
 
-		// close() 可能在 sleep 期间被调用
-		if c.closing.Load() {
+		c.events.Publish("connection.state", map[string]any{
+			"state":         string(c.ConnectionState()),
+			"attempt":       attempt,
+			"next_retry_at": nextRetryAt,
+		})
+
+		// 可中断 sleep：close() 或手动 connect 取消 ctx 时立即退出
+		select {
+		case <-time.After(sleepDuration):
+		case <-ctx.Done():
 			c.reconnecting.Store(false)
 			return
 		}
+
+		// close() 可能在 sleep 期间被调用
+		if c.closing.Load() || ctx.Err() != nil {
+			c.reconnecting.Store(false)
+			return
+		}
+		c.mu.Lock()
+		c.nextRetryAt = time.Time{}
+		c.state = StateReconnecting
+		c.mu.Unlock()
+		c.events.Publish("connection.state", map[string]any{
+			"state":   string(c.ConnectionState()),
+			"attempt": attempt,
+		})
 
 		// 重连前先 GET /health 探测，不健康则跳过本轮
 		c.mu.RLock()
@@ -5166,8 +5489,9 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 		if params == nil {
 			c.mu.Lock()
 			c.state = StateTerminalFailed
+			c.nextRetryAt = time.Time{}
 			c.mu.Unlock()
-			c.events.Publish("connection.state", map[string]any{"state": "terminal_failed"})
+			c.events.Publish("connection.state", map[string]any{"state": string(c.ConnectionState())})
 			c.reconnecting.Store(false)
 			return
 		}
@@ -5188,9 +5512,10 @@ func (c *AUNClient) reconnectLoop(serverInitiated bool) {
 		if !shouldRetryReconnect(err) {
 			c.mu.Lock()
 			c.state = StateTerminalFailed
+			c.nextRetryAt = time.Time{}
 			c.mu.Unlock()
 			c.events.Publish("connection.state", map[string]any{
-				"state":   "terminal_failed",
+				"state":   string(c.ConnectionState()),
 				"error":   err,
 				"attempt": attempt,
 			})
@@ -5236,10 +5561,14 @@ func shouldRetryReconnect(err error) bool {
 
 // normalizeConnectParams 规范化连接参数
 func (c *AUNClient) normalizeConnectParams(params map[string]any) (map[string]any, error) {
+	return c.normalizeConnectParamsWithTokenPolicy(params, true)
+}
+
+func (c *AUNClient) normalizeConnectParamsWithTokenPolicy(params map[string]any, requireAccessToken bool) (map[string]any, error) {
 	request := copyMapShallow(params)
 
 	accessToken, _ := request["access_token"].(string)
-	if accessToken == "" {
+	if requireAccessToken && accessToken == "" {
 		return nil, NewStateError("connect 需要非空 access_token")
 	}
 
@@ -5253,7 +5582,11 @@ func (c *AUNClient) normalizeConnectParams(params map[string]any) (map[string]an
 		return nil, NewStateError("connect 需要非空 gateway")
 	}
 
-	request["access_token"] = accessToken
+	if accessToken != "" {
+		request["access_token"] = accessToken
+	} else {
+		delete(request, "access_token")
+	}
 	request["gateway"] = gateway
 	request["device_id"] = c.deviceID
 	slotSource := any(c.slotID)
@@ -5617,6 +5950,10 @@ func resolvePeerGatewayURL(localGatewayURL, peerAID string) string {
 	return strings.Replace(localGatewayURL, "gateway."+localIssuer, "gateway."+peerIssuer, 1)
 }
 
+// errCertNotFound 哨兵错误：PKI 证书端点返回 404 时使用，
+// 供上层（如 AIDStore.Resolve）通过 errors.Is 区分"证书不存在"与"网络错误"。
+var errCertNotFound = errors.New(ErrCodeCertNotFound)
+
 func (c *AUNClient) fetchCertHTTP(ctx context.Context, certURL string, aid string) ([]byte, error) {
 	transport := &http.Transport{}
 	if !c.configModel.VerifySSL {
@@ -5632,6 +5969,10 @@ func (c *AUNClient) fetchCertHTTP(ctx context.Context, certURL string, aid strin
 		return nil, NewAuthError(fmt.Sprintf("获取证书失败 (%s): %v", aid, err))
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// 404 表示证书不存在，包装哨兵错误供上层映射为 CERT_NOT_FOUND
+		return nil, fmt.Errorf("%w: 证书不存在 (%s)", errCertNotFound, aid)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, NewAuthError(fmt.Sprintf("获取证书失败 (%s): HTTP %d", aid, resp.StatusCode))
 	}
@@ -5697,16 +6038,16 @@ func sleepWithCancel(ctx context.Context, d time.Duration) {
 	}
 }
 
-// CreateNamedGroup 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，
+// createNamedGroup 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，
 // 服务端签发群 AID 证书，返回后将证书和私钥存入 keystore。
-func (c *AUNClient) CreateNamedGroup(ctx context.Context, groupName string, opts map[string]any) (result map[string]any, err error) {
+func (c *AUNClient) createNamedGroup(ctx context.Context, groupName string, opts map[string]any) (result map[string]any, err error) {
 	tStart := time.Now()
-	c.logEG.Debug("CreateNamedGroup enter: name=%s", groupName)
+	c.logEG.Debug("createNamedGroup enter: name=%s", groupName)
 	defer func() {
 		if err != nil {
-			c.logEG.Debug("CreateNamedGroup exit (error): name=%s elapsed=%dms err=%v", groupName, time.Since(tStart).Milliseconds(), err)
+			c.logEG.Debug("createNamedGroup exit (error): name=%s elapsed=%dms err=%v", groupName, time.Since(tStart).Milliseconds(), err)
 		} else {
-			c.logEG.Debug("CreateNamedGroup exit: name=%s elapsed=%dms", groupName, time.Since(tStart).Milliseconds())
+			c.logEG.Debug("createNamedGroup exit: name=%s elapsed=%dms", groupName, time.Since(tStart).Milliseconds())
 		}
 	}()
 	identity, err := c.crypto.GenerateIdentity()
@@ -5752,15 +6093,15 @@ func (c *AUNClient) CreateNamedGroup(ctx context.Context, groupName string, opts
 	return result, nil
 }
 
-// BindGroupAid 为已有普通群绑定命名 AID（升级为命名群）。
-func (c *AUNClient) BindGroupAid(ctx context.Context, groupID string, groupName string) (result map[string]any, err error) {
+// bindGroupAid 为已有普通群绑定命名 AID（升级为命名群）。
+func (c *AUNClient) bindGroupAid(ctx context.Context, groupID string, groupName string) (result map[string]any, err error) {
 	tStart := time.Now()
-	c.logEG.Debug("BindGroupAid enter: group=%s name=%s", groupID, groupName)
+	c.logEG.Debug("bindGroupAid enter: group=%s name=%s", groupID, groupName)
 	defer func() {
 		if err != nil {
-			c.logEG.Debug("BindGroupAid exit (error): group=%s elapsed=%dms err=%v", groupID, time.Since(tStart).Milliseconds(), err)
+			c.logEG.Debug("bindGroupAid exit (error): group=%s elapsed=%dms err=%v", groupID, time.Since(tStart).Milliseconds(), err)
 		} else {
-			c.logEG.Debug("BindGroupAid exit: group=%s elapsed=%dms", groupID, time.Since(tStart).Milliseconds())
+			c.logEG.Debug("bindGroupAid exit: group=%s elapsed=%dms", groupID, time.Since(tStart).Milliseconds())
 		}
 	}()
 	identity, err := c.crypto.GenerateIdentity()
@@ -5802,4 +6143,463 @@ func (c *AUNClient) BindGroupAid(ctx context.Context, groupID string, groupName 
 	}
 
 	return result, nil
+}
+
+// ── 新版 AUNClient 构造函数（重构 API）────────────────────────
+
+// NewAUNClient 是重构后的统一构造入口：
+//   - NewAUNClient(aid, options...)：aid 必须是已加载且私钥有效的 *AID
+//   - NewAUNClient(options)：无身份客户端
+func NewAUNClient(first any, options ...AUNClientOptions) *AUNClient {
+	switch v := first.(type) {
+	case *AID:
+		return newAUNClientWithAID(v, singleAUNClientOptions(options))
+	case AUNClientOptions:
+		if len(options) > 0 {
+			panic("NewAUNClient(options) does not accept a second options object")
+		}
+		c := newClient(v.configMap(), v.Debug)
+		c.applyProtectedHeadersFromOptions(v.ProtectedHeaders)
+		return c
+	case *AUNClientOptions:
+		if len(options) > 0 {
+			panic("NewAUNClient(options) does not accept a second options object")
+		}
+		if v == nil {
+			return newClient(map[string]any{}, false)
+		}
+		c := newClient(v.configMap(), v.Debug)
+		c.applyProtectedHeadersFromOptions(v.ProtectedHeaders)
+		return c
+	case nil:
+		opt := singleAUNClientOptions(options)
+		c := newClient(opt.configMap(), opt.Debug)
+		c.applyProtectedHeadersFromOptions(opt.ProtectedHeaders)
+		return c
+	default:
+		panic("NewAUNClient first argument must be *AID or AUNClientOptions")
+	}
+}
+
+// applyProtectedHeadersFromOptions 从 options.ProtectedHeaders（map[string]any）初始化实例级 headers。
+// 复用 SetProtectedHeaders 的过滤规则（剔除 _auth 和非法 key），仅接受字符串值。
+func (c *AUNClient) applyProtectedHeadersFromOptions(headers map[string]any) {
+	if len(headers) == 0 {
+		return
+	}
+	str := make(map[string]string, len(headers))
+	for k, v := range headers {
+		if s, ok := v.(string); ok {
+			str[k] = s
+		} else if v != nil {
+			str[k] = fmt.Sprintf("%v", v)
+		}
+	}
+	c.SetProtectedHeaders(str)
+}
+
+func newAUNClientWithAID(aid *AID, options AUNClientOptions) *AUNClient {
+	if aid == nil || !aid.IsPrivateKeyValid() {
+		panic("NewAUNClient: aid must have a valid private key; use AIDStore.Load() first")
+	}
+	cfg := options.configMap()
+	cfg["aun_path"] = aid.AunPath
+	c := newClient(cfg, options.Debug)
+	c.applyProtectedHeadersFromOptions(options.ProtectedHeaders)
+	c.mu.Lock()
+	c.currentAIDObj = aid
+	c.aid = aid.Aid
+	c.authenticated = false
+	if aid.DeviceID != "" {
+		c.deviceID = aid.DeviceID
+	}
+	if aid.SlotID != "" {
+		c.slotID = aid.SlotID
+	}
+	if c.auth != nil {
+		c.auth.aid = aid.Aid
+		c.auth.SetInstanceContext(c.deviceID, c.slotID)
+	}
+	c.mu.Unlock()
+	return c
+}
+
+// NewAUNClientEmpty 创建无身份的客户端，初始状态为 idle。
+func NewAUNClientEmpty(options ...AUNClientOptions) *AUNClient {
+	return NewAUNClient(nil, options...)
+}
+
+// CurrentAID 返回当前加载的 AID 对象（无身份时返回 nil）
+func (c *AUNClient) CurrentAID() *AID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.currentAIDObj
+}
+
+// HasIdentity 是否已加载身份
+func (c *AUNClient) HasIdentity() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.currentAIDObj != nil && c.state != StateClosed
+}
+
+// CanSign 是否可以签名
+func (c *AUNClient) CanSign() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.currentAIDObj != nil && c.currentAIDObj.IsPrivateKeyValid() && c.state != StateClosed
+}
+
+// CanConnect 是否可以连接
+func (c *AUNClient) CanConnect() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.currentAIDObj != nil && c.state != StateClosed
+}
+
+// CanSend 是否可以发送消息（已就绪）
+func (c *AUNClient) CanSend() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state == StateConnected
+}
+
+// IsReady 是否已就绪（等同 CanSend）
+func (c *AUNClient) IsReady() bool { return c.CanSend() }
+
+// IsOnline 是否在线（connected / reconnecting）
+func (c *AUNClient) IsOnline() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state == StateConnected || c.state == StateReconnecting
+}
+
+// IsClosed 是否已关闭
+func (c *AUNClient) IsClosed() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state == StateClosed
+}
+
+// AunPath 返回 AUN 数据目录路径
+func (c *AUNClient) AunPath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.currentAIDObj != nil {
+		return c.currentAIDObj.AunPath
+	}
+	return c.configModel.AUNPath
+}
+
+// NextRetryAt 返回下次重试时间（仅重连退避状态下有值）
+func (c *AUNClient) NextRetryAt() *time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.state != StateReconnecting {
+		return nil
+	}
+	if c.nextRetryAt.IsZero() {
+		return nil
+	}
+	t := c.nextRetryAt
+	return &t
+}
+
+// RetryAttempt 返回当前重试次数
+func (c *AUNClient) RetryAttempt() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.retryAttempt
+}
+
+// LastConnectError 返回最近一次连接错误
+func (c *AUNClient) LastConnectError() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastConnectError
+}
+
+// LastError 返回最近一次连接错误（LastConnectError 的别名，与 Python SDK 对齐）
+func (c *AUNClient) LastError() error {
+	return c.LastConnectError()
+}
+
+// LastErrorCode 返回最近一次连接错误的错误码字符串（无错误时返回空字符串）。
+// 按错误类型映射为稳定的语义码，与 Python SDK last_error_code 的字符串语义对齐。
+func (c *AUNClient) LastErrorCode() string {
+	c.mu.RLock()
+	err := c.lastConnectError
+	c.mu.RUnlock()
+	if err == nil {
+		return ""
+	}
+	switch err.(type) {
+	case *ConnectionError:
+		return "connection_error"
+	case *TimeoutError:
+		return "timeout_error"
+	case *AuthError:
+		return "auth_error"
+	case *PermissionError:
+		return "permission_error"
+	case *ValidationError:
+		return "validation_error"
+	case *StateError:
+		return "state_error"
+	case *SessionError:
+		return "session_error"
+	case *RateLimitError:
+		return "rate_limit_error"
+	case *NotFoundError:
+		return "not_found_error"
+	default:
+		// 回退：取错误类型名，保证非空
+		return fmt.Sprintf("%T", err)
+	}
+}
+
+// NextRetryInSeconds 返回距下次重连的剩余秒数（非重连退避状态返回 0）
+func (c *AUNClient) NextRetryInSeconds() float64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.state != StateReconnecting || c.nextRetryAt.IsZero() {
+		return 0
+	}
+	secs := time.Until(c.nextRetryAt).Seconds()
+	if secs < 0 {
+		return 0
+	}
+	return secs
+}
+
+// RetryMaxAttempts 返回重连最大次数配置（0 表示无限重试）
+func (c *AUNClient) RetryMaxAttempts() int {
+	c.mu.RLock()
+	opts := c.sessionOptions
+	c.mu.RUnlock()
+	if opts == nil {
+		return 0
+	}
+	retry, _ := opts["retry"].(map[string]any)
+	if retry == nil {
+		return 0
+	}
+	if v, ok := retry["max_attempts"].(float64); ok && v > 0 {
+		return int(v)
+	}
+	return 0
+}
+
+// protectedHeaderKeyRe 合法 protected_headers key 规则：仅小写字母、数字、下划线、连字符
+var protectedHeaderKeyRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
+
+// SetProtectedHeaders 设置实例级 protected_headers，自动合并到 message.send/group.send/thought.put。
+// 过滤 _auth 保留键及不符合 [a-z0-9_-] 规则的 key（静默跳过）。
+func (c *AUNClient) SetProtectedHeaders(headers map[string]string) {
+	filtered := make(map[string]string, len(headers))
+	for k, v := range headers {
+		if k == "_auth" {
+			continue
+		}
+		if !protectedHeaderKeyRe.MatchString(k) {
+			continue
+		}
+		filtered[k] = v
+	}
+	c.mu.Lock()
+	c.instanceProtectedHeaders = filtered
+	c.mu.Unlock()
+}
+
+// CachePeer 缓存对端 AID（要求证书有效）。
+func (c *AUNClient) CachePeer(aid *AID) (*AID, error) {
+	if !c.HasIdentity() {
+		return nil, NewStateError("CachePeer requires a loaded identity")
+	}
+	if aid == nil || !aid.IsCertValid() {
+		return nil, NewValidationError("CachePeer requires an AID with a valid certificate")
+	}
+	c.peerCacheMu.Lock()
+	c.peerCache[aid.Aid] = aid
+	c.peerCacheMu.Unlock()
+	return aid, nil
+}
+
+// GetPeer 从缓存读取对端 AID。
+func (c *AUNClient) GetPeer(aid string) *AID {
+	if !c.HasIdentity() {
+		return nil
+	}
+	c.peerCacheMu.RLock()
+	defer c.peerCacheMu.RUnlock()
+	return c.peerCache[strings.TrimSpace(aid)]
+}
+
+// LookupPeer 先查缓存，未命中则通过 AIDStore 解析。
+func (c *AUNClient) LookupPeer(ctx context.Context, aid string) (*AID, error) {
+	if !c.HasIdentity() {
+		return nil, NewStateError("LookupPeer requires a loaded identity")
+	}
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return nil, NewValidationError("LookupPeer requires non-empty aid")
+	}
+	if cached := c.GetPeer(target); cached != nil {
+		return cached, nil
+	}
+	store := NewAIDStore(c.configModel.AUNPath, c.configModel.SeedPassword)
+	defer store.Close()
+	result, err := store.Resolve(ctx, target, AIDStoreResolveOptions{SkipAgentMD: true})
+	if err != nil {
+		return nil, err
+	}
+	peer := result.AID
+	if !peer.IsCertValid() {
+		return nil, NewAUNError(fmt.Sprintf("resolved peer certificate is invalid: %s", target))
+	}
+	c.peerCacheMu.Lock()
+	c.peerCache[peer.Aid] = peer
+	c.peerCacheMu.Unlock()
+	return peer, nil
+}
+
+// Peers 返回所有缓存的对端 AID（按 aid 排序）。
+func (c *AUNClient) Peers() []*AID {
+	c.peerCacheMu.RLock()
+	defer c.peerCacheMu.RUnlock()
+	result := make([]*AID, 0, len(c.peerCache))
+	for _, v := range c.peerCache {
+		result = append(result, v)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Aid < result[j].Aid })
+	return result
+}
+
+// GetProtectedHeaders 返回实例级 protected_headers 的副本
+func (c *AUNClient) GetProtectedHeaders() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.instanceProtectedHeaders) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(c.instanceProtectedHeaders))
+	for k, v := range c.instanceProtectedHeaders {
+		out[k] = v
+	}
+	return out
+}
+
+// protectedHeadersMergeMethods 需要自动合并实例级 protected_headers 的方法集合
+var protectedHeadersMergeMethods = map[string]bool{
+	"message.send":        true,
+	"group.send":          true,
+	"message.thought.put": true,
+	"group.thought.put":   true,
+}
+
+// mergeInstanceProtectedHeaders 将实例级 protected_headers 合并到 params["protected_headers"]。
+// 仅对指定方法生效；调用方显式传入的同名 key 优先保留。
+func (c *AUNClient) mergeInstanceProtectedHeaders(method string, params map[string]any) {
+	if !protectedHeadersMergeMethods[method] {
+		return
+	}
+	c.mu.RLock()
+	instance := c.instanceProtectedHeaders
+	c.mu.RUnlock()
+	if len(instance) == 0 {
+		return
+	}
+
+	// 读取调用方已有的 protected_headers（支持 map[string]any / map[string]string）
+	merged := make(map[string]any)
+	switch existing := params["protected_headers"].(type) {
+	case map[string]any:
+		for k, v := range existing {
+			merged[k] = v
+		}
+	case map[string]string:
+		for k, v := range existing {
+			merged[k] = v
+		}
+	}
+
+	// 实例级仅补充缺失键，不覆盖调用方显式传入的值
+	for k, v := range instance {
+		if _, exists := merged[k]; !exists {
+			merged[k] = v
+		}
+	}
+	params["protected_headers"] = merged
+}
+
+// loadIdentityFromAID 是 LoadIdentity 的内部实现（仅允许在 idle/closed 状态调用）。
+func (c *AUNClient) loadIdentityFromAID(aid *AID) error {
+	if aid == nil || !aid.IsPrivateKeyValid() {
+		return NewStateError("LoadIdentity requires an AID with a valid private key")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != StateIdle && c.state != StateClosed {
+		return NewStateError(fmt.Sprintf("LoadIdentity not allowed in state %s", c.state))
+	}
+	c.currentAIDObj = aid
+	c.aid = aid.Aid
+	if c.auth != nil {
+		c.auth.aid = aid.Aid
+	}
+	c.lastConnectError = nil
+	c.retryAttempt = 0
+	// Fix-05: 复位 state 到 idle，使 HasIdentity/ConnectionState 正确反映 standby
+	c.state = StateIdle
+	return nil
+}
+
+// LoadIdentity 加载新身份。aid 必须是 AIDStore.Load 返回的 AID 对象。
+func (c *AUNClient) LoadIdentity(aid *AID) error {
+	return c.loadIdentityFromAID(aid)
+}
+
+// ConnectionState 返回对外的 9 态连接状态（由内部 ClientState 映射）。
+// 与 Python SDK client.py 的 _public_state 对应。
+func (c *AUNClient) ConnectionState() ConnectionState {
+	c.mu.RLock()
+	st := mapPublicConnectionState(c.state, c.currentAIDObj != nil, c.authenticated, c.nextRetryAt)
+	c.mu.RUnlock()
+	return st
+}
+
+func mapPublicConnectionState(st ClientState, hasIdentity bool, authenticated bool, nextRetryAt time.Time) ConnectionState {
+	switch st {
+	case StateIdle:
+		if hasIdentity && authenticated {
+			return ConnStateAuthenticated
+		}
+		if hasIdentity {
+			return ConnStateStandby
+		}
+		return ConnStateNoIdentity
+	case StateConnecting, StateAuthenticating:
+		return ConnStateConnecting
+	case StateConnected:
+		return ConnStateReady
+	case StateDisconnected:
+		if !hasIdentity {
+			return ConnStateNoIdentity
+		}
+		if hasIdentity && authenticated {
+			return ConnStateAuthenticated
+		}
+		return ConnStateStandby
+	case StateReconnecting:
+		if !nextRetryAt.IsZero() && time.Now().Before(nextRetryAt) {
+			return ConnStateRetryBackoff
+		}
+		return ConnStateReconnecting
+	case StateTerminalFailed:
+		return ConnStateConnectionFailed
+	case StateClosed:
+		return ConnStateClosed
+	default:
+		return ConnectionState(st)
+	}
 }

@@ -78,6 +78,8 @@ export interface KeyStore {
   listIdentities?(): string[];
   /** 加载指定 AID 的元数据（对齐 Python load_metadata） */
   loadMetadata?(aid: string): Record<string, unknown> | null;
+  /** 保存指定 AID 的元数据（对齐 Python save_metadata，增量覆盖字段） */
+  saveMetadata?(aid: string, metadata: Record<string, unknown>): void;
 
   /** 加载本地持久化的某个远端/自身 agent.md 缓存记录 */
   loadAgentMdCache?(ownerAid: string, targetAid: string): AgentMdCacheRecord | null;

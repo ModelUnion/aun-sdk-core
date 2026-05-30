@@ -33,6 +33,7 @@ import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
 import type { JsonObject } from '../../src/types.js';
+import { registerAndLoadIdentity } from '../test-support.js';
 
 const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
@@ -97,9 +98,8 @@ async function connectLong(
   aid: string,
   slotId: string,
 ): Promise<void> {
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await registerAndLoadIdentity(client, aid);
+  await client.connect({
     auto_reconnect: false,
     heartbeat_interval: 30,
     slot_id: slotId,
@@ -111,9 +111,8 @@ async function connectShort(
   aid: string,
   opts: { slot_id?: string; short_ttl_ms?: number } = {},
 ): Promise<void> {
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await registerAndLoadIdentity(client, aid);
+  await client.connect({
     connection_kind: 'short',
     auto_reconnect: false,
     slot_id: opts.slot_id ?? 'main',
@@ -242,7 +241,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     clients.push(overflow);
     await connectLong(overflow, aid, `slot-new-${r}`);
 
-    // 等待最早连接收到 4015；auto_reconnect=false 时状态可能停在 disconnected
+    // 等待最早连接收到 4015；auto_reconnect=false 时状态可能停在 standby
     const kicked = await waitFor(() => disconnectedWithCode(captured, 4015), 10000);
     expect(kicked).toBe(true);
 
@@ -259,8 +258,8 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     expect(evictedBy).toBeDefined();
     expect(evictedBy!.slot_id).toBe(`slot-new-${r}`);
 
-    // 如果 SDK 进入 terminal_failed，connection.state 也应带 detail；auto_reconnect=false 时不会进入该状态。
-    const terminal = captured.states.find(s => s.state === 'terminal_failed');
+    // 如果 SDK 进入 connection_failed，connection.state 也应带 detail；auto_reconnect=false 时不会进入该状态。
+    const terminal = captured.states.find(s => s.state === 'connection_failed');
     if (terminal) {
       expect(terminal.code).toBe(4015);
       expect(terminal.detail).toBeDefined();
@@ -268,7 +267,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     }
 
     // 新连接和其他未被踢的连接仍正常
-    expect(overflow.state).toBe('connected');
+    expect(overflow.state).toBe('ready');
     await overflow.call('meta.ping');
   }, 60000);
 
@@ -315,7 +314,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     expect(evictedBy!.device_id).toBe(`q-d2-dev-new-${r}`);
 
     // 新连接仍正常
-    expect(newDeviceClient.state).toBe('connected');
+    expect(newDeviceClient.state).toBe('ready');
     await newDeviceClient.call('meta.ping');
   }, 60000);
 
@@ -364,7 +363,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     const evictedBy = evt.detail!.evicted_by as JsonObject | undefined;
     expect(evictedBy!.aid).toBe(newAid);
 
-    expect(newAidClient.state).toBe('connected');
+    expect(newAidClient.state).toBe('ready');
     await newAidClient.call('meta.ping');
   }, 60000);
 
@@ -385,10 +384,10 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
       const captured = captureDisconnect(idleClient);
       await connectShort(idleClient, aid, { slot_id: 'idle', short_ttl_ms: ttl });
-      expect(idleClient.state).toBe('connected');
+      expect(idleClient.state).toBe('ready');
 
       // 空闲等待超过 ttl
-      const closed = await waitFor(() => idleClient.state !== 'connected', ttl + 4000);
+      const closed = await waitFor(() => idleClient.state !== 'ready', ttl + 4000);
       expect(closed).toBe(true);
       // 关闭原因为 short_idle_ttl
       const evt = captured.events.find(e => e.code === 4014);
@@ -407,7 +406,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
       const captured = captureDisconnect(aliveClient);
       await connectShort(aliveClient, aid, { slot_id: 'alive', short_ttl_ms: ttl });
-      expect(aliveClient.state).toBe('connected');
+      expect(aliveClient.state).toBe('ready');
 
       // 持续 ~3 倍 ttl，每 ttl/3 发一次 ping 保活
       const total = ttl * 3;
@@ -419,7 +418,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       }
 
       // 期间不应被服务端关闭
-      expect(aliveClient.state).toBe('connected');
+      expect(aliveClient.state).toBe('ready');
       const idleEvt = captured.events.find(e => e.code === 4014);
       expect(idleEvt).toBeUndefined();
     }

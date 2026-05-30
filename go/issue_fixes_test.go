@@ -15,7 +15,7 @@ import (
 // TestBackgroundTasksUseIndependentContext 验证 startBackgroundTasks 使用独立 context，
 // 而非继承用户传入的 context。用户 context 取消后，后台任务的 context 不应被取消。
 func TestBackgroundTasksUseIndependentContext(t *testing.T) {
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
@@ -66,10 +66,11 @@ func TestBackgroundTasksUseIndependentContext(t *testing.T) {
 	}
 }
 
-// ── P1: ISSUE-SDK-GO-006 Publish 异步化 ────────────────────
+// ── Publish 顺序同步执行（与 Python/TS/JS SDK 对齐）────────────────────
 
-// TestPublishRunsHandlersAsync 验证 Publish 异步执行 handler，不阻塞调用者
-func TestPublishRunsHandlersAsync(t *testing.T) {
+// TestPublishRunsHandlersSync 验证 Publish 同步执行 handler，返回前 handler 已完成。
+// Fix-02: 撤销原 ISSUE-SDK-GO-006 的异步化，改为顺序执行，使行为与其它 SDK 一致。
+func TestPublishRunsHandlersSync(t *testing.T) {
 	d := NewEventDispatcher()
 
 	var handlerDone atomic.Bool
@@ -82,62 +83,14 @@ func TestPublishRunsHandlersAsync(t *testing.T) {
 	d.Publish("test.slow", "data")
 	elapsed := time.Since(start)
 
-	// 异步化后，Publish 应立即返回，不等待 handler 完成
-	if elapsed > 50*time.Millisecond {
-		t.Errorf("ISSUE-SDK-GO-006: Publish 应异步执行 handler，但耗时 %v（阈值 50ms）", elapsed)
+	// 顺序执行后，Publish 应等待 handler 完成才返回（至少耗时 handler 的 sleep 时长）
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("Fix-02: Publish 应同步执行 handler，但仅耗时 %v（应 >= 100ms）", elapsed)
 	}
 
-	// 等待 handler 完成
-	time.Sleep(200 * time.Millisecond)
+	// Publish 返回后 handler 必定已完成
 	if !handlerDone.Load() {
-		t.Error("ISSUE-SDK-GO-006: handler 应在后台执行完毕")
-	}
-}
-
-// TestPublishAsyncPanicRecovery 验证异步 handler panic 不影响其他 handler
-func TestPublishAsyncPanicRecovery(t *testing.T) {
-	d := NewEventDispatcher()
-
-	var secondCalled atomic.Bool
-	d.Subscribe("test.panic", func(payload any) {
-		panic("测试 panic")
-	})
-	d.Subscribe("test.panic", func(payload any) {
-		secondCalled.Store(true)
-	})
-
-	d.Publish("test.panic", nil)
-	// 等待异步 handler 完成
-	time.Sleep(100 * time.Millisecond)
-
-	if !secondCalled.Load() {
-		t.Error("ISSUE-SDK-GO-006: 第一个 handler panic 后，第二个 handler 应仍被执行")
-	}
-}
-
-// TestPublishAsyncConcurrency 验证异步 Publish 的并发安全性
-func TestPublishAsyncConcurrency(t *testing.T) {
-	d := NewEventDispatcher()
-
-	var count atomic.Int64
-	d.Subscribe("test.concurrent", func(payload any) {
-		count.Add(1)
-	})
-
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			d.Publish("test.concurrent", nil)
-		}()
-	}
-	wg.Wait()
-	// 等待所有异步 handler 完成
-	time.Sleep(200 * time.Millisecond)
-
-	if count.Load() != 100 {
-		t.Errorf("ISSUE-SDK-GO-006: 并发发布计数不正确: %d，期望 100", count.Load())
+		t.Error("Fix-02: Publish 返回后 handler 应已执行完毕")
 	}
 }
 
@@ -207,7 +160,7 @@ func TestMapRemoteError_32004_PermissionDenied(t *testing.T) {
 
 // TestConnectFromDisconnectedState 验证断开后可以重新连接
 func TestConnectFromDisconnectedState(t *testing.T) {
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
@@ -219,7 +172,7 @@ func TestConnectFromDisconnectedState(t *testing.T) {
 
 	// 验证 Connect 允许在 disconnected 状态调用
 	// 注意：实际不会成功连接（无 gateway），但不应返回 StateError
-	err := c.Connect(context.Background(), map[string]any{
+	err := connectWithTestAuth(t, c, context.Background(), map[string]any{
 		"access_token": "test-token",
 		"gateway":      "ws://localhost:9999/ws",
 	}, nil)

@@ -30,7 +30,7 @@ func waitForParityCondition(timeout time.Duration, fn func() bool) bool {
 }
 
 func TestV2BuildTargetAllowsExplicitEmptyDeviceID(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ikDER := []byte{1, 2, 3}
@@ -62,7 +62,7 @@ func TestV2BuildTargetAllowsExplicitEmptyDeviceID(t *testing.T) {
 }
 
 func TestCacheV2PeerIKFromDeviceAllowsExplicitEmptyDeviceID(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ikDER := []byte{1, 2, 3}
@@ -82,7 +82,7 @@ func TestCacheV2PeerIKFromDeviceAllowsExplicitEmptyDeviceID(t *testing.T) {
 }
 
 func TestV2BuildTargetAllowsIKInSPKFields(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ikPriv, ikDER, err := v2crypto.GenerateP256Keypair()
@@ -458,7 +458,7 @@ func TestDecryptV2MessageFallsBackToCACert(t *testing.T) {
 		t.Fatalf("初始化测试 V2 session 失败: %v", err)
 	}
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.aid = bobAID
@@ -499,7 +499,7 @@ func TestDecryptV2MessageFallsBackToCACert(t *testing.T) {
 	if plaintext["payload_type"] != "text" {
 		t.Fatalf("应用层消息顶层 payload_type 应透传原始 payload.type，实际: %#v", plaintext)
 	}
-	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text", "sdk_lang": "go", "sdk_version": "0.3.6"}) {
+	if !reflect.DeepEqual(plaintext["protected_headers"], map[string]any{"payload_type": "text", "sdk_lang": "go", "sdk_version": "0.4.0"}) {
 		t.Fatalf("应用层消息顶层 protected_headers 应去 _auth 后透传，实际: %#v", plaintext["protected_headers"])
 	}
 	e2eeMeta, _ := plaintext["e2ee"].(map[string]any)
@@ -561,7 +561,7 @@ func TestDecryptGroupV2MessageExposesDirectionAndInstanceMetadata(t *testing.T) 
 	}
 	sess.CachePeerIK(aliceAID, "dev-alice", alicePubDER)
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.aid = bobAID
@@ -623,7 +623,7 @@ func TestDecryptEncryptedPushPayloadExposesDirection(t *testing.T) {
 	sess.CachePeerIK(aliceAID, "dev-alice", alicePubDER)
 	sess.CachePeerIK(bobAID, "dev-bob", bobPubDER)
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.aid = bobAID
@@ -767,7 +767,7 @@ func TestDecryptV2MessageUndecryptableEventPreservesMetadata(t *testing.T) {
 		t.Fatalf("初始化测试 V2 session 失败: %v", err)
 	}
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.aid = bobAID
@@ -816,6 +816,97 @@ func TestDecryptV2MessageUndecryptableEventPreservesMetadata(t *testing.T) {
 		wantHeaders := map[string]any{"payload_type": "text", "trace_id": "trace-1", "sdk_lang": "python", "sdk_version": "0.3.4"}
 		if !reflect.DeepEqual(event["protected_headers"], wantHeaders) {
 			t.Fatalf("失败事件 protected_headers 应去 _auth 后透传: %#v", event["protected_headers"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("未收到 message.undecryptable 事件")
+	}
+}
+
+func TestV2P2PPullPublishesUndecryptableBeforeContiguousAdvance(t *testing.T) {
+	aliceAID := "alice.example.com"
+	alicePriv, alicePubDER, err := v2crypto.GenerateP256Keypair()
+	if err != nil {
+		t.Fatalf("生成 IK 失败: %v", err)
+	}
+	store, err := openV2Keystore(t.TempDir(), aliceAID)
+	if err != nil {
+		t.Fatalf("打开 V2 keystore 失败: %v", err)
+	}
+	defer store.Close()
+	sess := v2session.NewV2Session(store.store, "dev-alice", aliceAID, alicePriv, alicePubDER)
+	if err := sess.EnsureKeys(); err != nil {
+		t.Fatalf("初始化测试 V2 session 失败: %v", err)
+	}
+
+	envelope := map[string]any{
+		"type":         "e2ee.p2p_encrypted",
+		"version":      "v2",
+		"suite":        "P256_HKDF_SHA256_AES_256_GCM",
+		"payload_type": "text",
+		"aad":          map[string]any{"from": "bob.example.com", "from_device": "dev-bob"},
+		"recipients": []any{[]any{
+			aliceAID, "dev-alice", "peer", "peer_device_prekey", "fp", "missing-spk", "n", "w",
+		}},
+	}
+	envJSON, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("序列化 envelope 失败: %v", err)
+	}
+
+	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "message.v2.pull":
+			return map[string]any{"messages": []any{
+				map[string]any{
+					"version":       "v2",
+					"seq":           int64(1),
+					"message_id":    "m-missing-spk",
+					"from_aid":      "bob.example.com",
+					"to":            aliceAID,
+					"spk_id":        "missing-spk",
+					"envelope_json": string(envJSON),
+				},
+			}}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
+	defer func() { _ = c.Close() }()
+	c.mu.Lock()
+	c.aid = aliceAID
+	c.deviceID = "dev-alice"
+	c.slotID = "slot-1"
+	c.state = StateConnected
+	c.v2State = &v2P2PState{
+		session:             sess,
+		keystore:            store,
+		bootstrapCache:      make(map[string]v2BootstrapEntry),
+		groupBootstrapCache: make(map[string]*v2GroupBootstrapEntry),
+	}
+	c.mu.Unlock()
+	c.transport = NewRPCTransport(c.events, 2*time.Second, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.transport.Connect(ctx, wsURL); err != nil {
+		t.Fatalf("transport.Connect 失败: %v", err)
+	}
+
+	ns := "p2p:" + aliceAID
+	observed := make(chan int, 1)
+	c.On("message.undecryptable", func(payload any) {
+		observed <- c.seqTracker.GetContiguousSeq(ns)
+	})
+
+	if _, err := c.pullV2(ctx, 0, 10); err != nil {
+		t.Fatalf("PullV2 失败: %v", err)
+	}
+	select {
+	case got := <-observed:
+		if got != 0 {
+			t.Fatalf("undecryptable 发布前不应提前推进 contiguous_seq，got=%d", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("未收到 message.undecryptable 事件")
@@ -999,7 +1090,7 @@ func TestV2P2PPullEmptyResultConsumesServerAckFloor(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	msgs, err := c.PullV2(ctx, 0, 10)
+	msgs, err := c.pullV2(ctx, 0, 10)
 	if err != nil {
 		t.Fatalf("PullV2 失败: %v", err)
 	}
@@ -1150,7 +1241,7 @@ func TestV2GroupPullEmptyResultConsumesCursorFloor(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	msgs, err := c.PullGroupV2(ctx, groupID, 0, 10)
+	msgs, err := c.pullGroupV2(ctx, groupID, 0, 10)
 	if err != nil {
 		t.Fatalf("PullGroupV2 失败: %v", err)
 	}
@@ -1204,7 +1295,7 @@ func TestAckV2AddsPythonCompatibilityFields(t *testing.T) {
 	c.mu.Lock()
 	c.v2State = nil
 	c.mu.Unlock()
-	result, err := c.AckV2(context.Background(), 7)
+	result, err := c.ackV2(context.Background(), 7)
 	if err != nil {
 		t.Fatalf("AckV2 失败: %v", err)
 	}

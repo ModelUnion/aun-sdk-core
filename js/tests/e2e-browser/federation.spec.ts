@@ -116,7 +116,8 @@ async function installFederationHelpers(page: any): Promise<void> {
       const client = new AUN.AUNClient({
         instanceId,
         issuer,
-      }, true);
+        debug: true,
+      });
       // 禁用 forward secrecy 以简化测试
       if (client._configModel) {
         client._configModel.requireForwardSecrecy = false;
@@ -130,14 +131,7 @@ async function installFederationHelpers(page: any): Promise<void> {
      */
     const ensureConnected = async (client: any, aid: string, issuer: string): Promise<void> => {
       const gateway = gatewayForIssuer(issuer);
-      client.gatewayUrl = gateway;
-      try {
-        await client.auth.registerAid({ aid });
-      } catch {
-        // 已存在则忽略
-      }
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid, { gateway });
     };
 
     const messageText = (message: any): string => {

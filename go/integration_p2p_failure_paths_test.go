@@ -41,14 +41,11 @@ func TestIntegration_PlaintextSendNoPrekey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	_, err := target.Auth.CreateAID(ctx, map[string]any{"aid": targetAID})
-	if err != nil {
-		t.Skipf("无法创建目标 AID（Docker 环境可能未运行）: %v", err)
-	}
+	integrationRegisterAIDInPath(t, target.configModel.AUNPath, targetAID)
 
 	// Alice 发送明文消息给目标（encrypt: false）
 	// multi-device 架构下，接收方无注册设备时服务端拒绝投递
-	_, err = alice.Call(ctx, "message.send", map[string]any{
+	_, err := alice.Call(ctx, "message.send", map[string]any{
 		"to":      targetAID,
 		"payload": map[string]any{"type": "text", "text": fmt.Sprintf("plain-no-prekey-%s", rid)},
 		"encrypt": false,

@@ -20,6 +20,7 @@ import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
 import type { JsonObject } from '../../src/types.js';
+import { loadIdentityFromStore, registerAndLoadIdentity } from '../test-support.js';
 
 const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
@@ -140,10 +141,9 @@ describe('extra_info 集成测试', () => {
     // 第一个客户端连接，带 extra_info
     const client1 = makeClient(sharedPath);
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    const auth1 = await client1.auth.authenticate({ aid });
+    await registerAndLoadIdentity(client1, aid);
     const extraInfo1 = { pid: 1001, label: 'client-1' } as unknown as JsonObject;
-    await client1.connect(auth1, {
+    await client1.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
       slot_id: 'main',
@@ -159,9 +159,9 @@ describe('extra_info 集成测试', () => {
     // 第二个客端用同 AID + 同 slot_id 连接 → 踢掉第一个
     const client2 = makeClient(sharedPath);
     clients.push(client2);
-    const auth2 = await client2.auth.authenticate({ aid });
+    await loadIdentityFromStore(client2, aid);
     const extraInfo2 = { pid: 2002, label: 'client-2' } as unknown as JsonObject;
-    await client2.connect(auth2, {
+    await client2.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
       slot_id: 'main',
@@ -189,16 +189,15 @@ describe('extra_info 集成测试', () => {
     // 不传 extra_info 正常连接
     const client1 = makeClient(sharedPath);
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    const auth1 = await client1.auth.authenticate({ aid });
-    await client1.connect(auth1, {
+    await registerAndLoadIdentity(client1, aid);
+    await client1.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
       slot_id: 'main',
     });
 
     // 验证连接成功
-    expect(client1.state).toBe('connected');
+    expect(client1.state).toBe('ready');
 
     // 第二个客户端也不传 extra_info，踢掉第一个
     let disconnectDetail: JsonObject | null = null;
@@ -208,8 +207,8 @@ describe('extra_info 集成测试', () => {
 
     const client2 = makeClient(sharedPath);
     clients.push(client2);
-    const auth2 = await client2.auth.authenticate({ aid });
-    await client2.connect(auth2, {
+    await loadIdentityFromStore(client2, aid);
+    await client2.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
       slot_id: 'main',

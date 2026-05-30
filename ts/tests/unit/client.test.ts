@@ -31,7 +31,7 @@ describe('AUNClient peer 证书缓存', () => {
 describe('AUNClient 构造', () => {
   it('无参数构造使用默认配置', () => {
     const client = new AUNClient();
-    expect(client.state).toBe('idle');
+    expect(client.state).toBe('no_identity');
     expect(client.aid).toBeNull();
     expect(client.config).toEqual({
       aun_path: expect.any(String),
@@ -43,7 +43,7 @@ describe('AUNClient 构造', () => {
   it('使用自定义 aunPath 构造', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-client-test-'));
     const client = new AUNClient({ aun_path: tmpDir });
-    expect(client.state).toBe('idle');
+    expect(client.state).toBe('no_identity');
     expect(client.config.aun_path).toBe(tmpDir);
   });
 
@@ -51,44 +51,60 @@ describe('AUNClient 构造', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-client-sqlite-'));
     const client = new AUNClient({ aun_path: tmpDir });
     expect(existsSync(join(tmpDir, '.aun_backup', 'aun_backup.db'))).toBe(false);
-    expect(client.state).toBe('idle');
+    expect(client.state).toBe('no_identity');
   });
 
-  it('V2 E2EE API 可访问且不暴露旧版 manager', () => {
+  it('V2 E2EE API 已私有化且不暴露旧版 manager', () => {
     const client = new AUNClient();
-    expect(typeof client.initV2Session).toBe('function');
-    expect(typeof client.sendV2).toBe('function');
-    expect(typeof client.sendGroupV2).toBe('function');
+    // 方法已私有，通过 (client as any) 访问验证存在
+    expect(typeof (client as any)._initV2Session).toBe('function');
+    expect(typeof (client as any)._sendV2).toBe('function');
+    expect(typeof (client as any)._sendGroupV2).toBe('function');
     expect((client as any).e2ee).toBeUndefined();
     expect((client as any).groupE2ee).toBeUndefined();
   });
 
-  it('auth 命名空间可访问', () => {
+  it('不再公开 auth/meta/custody 命名空间', () => {
     const client = new AUNClient();
-    expect(client.auth).toBeDefined();
+    expect((client as any).auth).toBeUndefined();
+    expect((client as any).meta).toBeUndefined();
+    expect((client as any).custody).toBeUndefined();
+    for (const name of [
+      'fetchAgentMd',
+      'checkAgentMd',
+      'listIdentities',
+      'checkGatewayHealth',
+      'setAgentMdPath',
+      'SetAgentMDPath',
+      'ping',
+      'status',
+      'trustRoots',
+    ]) {
+      expect((client as any)[name]).toBeUndefined();
+    }
   });
 });
 
 describe('AUNClient.connect 参数校验', () => {
-  it('缺少 access_token 时抛出 StateError', async () => {
+  it('未加载 AID 时抛出 StateError', async () => {
     const client = new AUNClient();
     await expect(
       client.connect({ gateway: 'ws://localhost:20001/aun' }),
     ).rejects.toThrow(StateError);
   });
 
-  it('缺少 gateway 时抛出 StateError', async () => {
+  it('不接受旧版 access_token 参数', async () => {
     const client = new AUNClient();
     await expect(
       client.connect({ access_token: 'tok_123' }),
-    ).rejects.toThrow(StateError);
+    ).rejects.toThrow(ValidationError);
   });
 
-  it('空 access_token 时抛出 StateError', async () => {
+  it('不接受旧版 aid/token 混入 connect options', async () => {
     const client = new AUNClient();
     await expect(
-      client.connect({ access_token: '', gateway: 'ws://localhost:20001/aun' }),
-    ).rejects.toThrow(StateError);
+      client.connect({ aid: 'alice.agentid.pub' } as any),
+    ).rejects.toThrow(ValidationError);
   });
 });
 
@@ -302,8 +318,10 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
     (client as any)._aid = aid;
     (client as any)._syncIdentityAfterConnect('tok-connect');
 
-    const instanceState = ks.loadInstanceState(aid, deviceId, '');
-    expect(instanceState.access_token).toBe('tok-connect');
+    const authDeviceId = (client as any)._auth._deviceId;
+    const authSlotId = (client as any)._auth._slotId ?? '';
+    const instanceState = ks.loadInstanceState(aid, authDeviceId, authSlotId);
+    expect(instanceState?.access_token).toBe('tok-connect');
   });
 });
 
@@ -398,19 +416,23 @@ describe('AUNClient 证书 URL 编排', () => {
 describe('AUNClient.connect V2 session 初始化', () => {
   it('连接成功后应初始化 V2 session', async () => {
     const client = new AUNClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
+    (client as any)._state = 'standby';
     (client as any)._transport.connect = vi.fn().mockResolvedValue({ nonce: 'challenge' });
-    (client as any)._auth.initializeWithToken = vi.fn().mockResolvedValue(undefined);
-    (client as any)._syncIdentityAfterConnect = vi.fn();
+    (client as any)._auth.connectSession = vi.fn().mockResolvedValue({ token: 'tok-1', identity: { aid: 'alice.agentid.pub' }, hello: {} });
     (client as any)._startBackgroundTasks = vi.fn();
-    const initV2Spy = vi.spyOn(client, 'initV2Session').mockResolvedValue(undefined);
+    const initV2Spy = vi.spyOn(client as any, '_initV2Session').mockResolvedValue(undefined);
 
     await client.connect({
-      access_token: 'tok-1',
       gateway: 'ws://gateway.example.com/aun',
     });
 
     expect(initV2Spy).toHaveBeenCalledTimes(1);
-    expect(client.state).toBe('connected');
+    expect(client.state).toBe('ready');
   });
 });
 
@@ -458,9 +480,9 @@ describe('AUNClient M25 重连行为', () => {
       await Promise.resolve();
 
       expect((client as any)._connectOnce).toHaveBeenCalledTimes(2);
-      expect(client.state).toBe('terminal_failed');
+      expect(client.state).toBe('connection_failed');
       expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
-        state: 'terminal_failed',
+        state: 'connection_failed',
         reason: 'max_attempts_exhausted',
         attempt: 2,
       }));
@@ -979,9 +1001,9 @@ describe('R1: health-fail 路径 max_attempts 检查', () => {
       await vi.advanceTimersByTimeAsync(4_000);
 
       // health-fail 路径应计入 attempt，3 次后应终止
-      expect(client.state).toBe('terminal_failed');
+      expect(client.state).toBe('connection_failed');
       expect(publish).toHaveBeenCalledWith('connection.state', expect.objectContaining({
-        state: 'terminal_failed',
+        state: 'connection_failed',
         reason: 'max_attempts_exhausted',
       }));
       // _connectOnce 不应被调用（health 一直失败）
@@ -1079,7 +1101,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     async (code) => {
       const { client, startReconnectSpy } = makeDisconnectClient();
       await (client as any)._handleTransportDisconnect(new Error('test'), code);
-      expect(client.state).toBe('terminal_failed');
+      expect(client.state).toBe('connection_failed');
       expect(startReconnectSpy).not.toHaveBeenCalled();
     },
   );
@@ -1090,7 +1112,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
       const { client, startReconnectSpy } = makeDisconnectClient();
       await (client as any)._handleTransportDisconnect(new Error('test'), code);
       expect(startReconnectSpy).toHaveBeenCalled();
-      expect(client.state).not.toBe('terminal_failed');
+      expect(client.state).not.toBe('connection_failed');
     },
   );
 
@@ -1101,7 +1123,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     expect((client as any)._serverKicked).toBe(true);
 
     await (client as any)._handleTransportDisconnect(new Error('test'), 4009);
-    expect(client.state).toBe('terminal_failed');
+    expect(client.state).toBe('connection_failed');
     expect(startReconnectSpy).not.toHaveBeenCalled();
   });
 
@@ -1110,7 +1132,7 @@ describe('NO_RECONNECT_CODES 抑制重连', () => {
     (client as any)._serverKicked = true;
 
     await (client as any)._handleTransportDisconnect(new Error('test'), 1006);
-    expect(client.state).toBe('terminal_failed');
+    expect(client.state).toBe('connection_failed');
     expect(startReconnectSpy).not.toHaveBeenCalled();
   });
 });
@@ -1294,7 +1316,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(0, 10);
+    const result = await (client as any)._pullV2(0, 10);
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
@@ -1432,7 +1454,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('g1', 0, 10);
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
@@ -1465,7 +1487,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(0, 2);
+    const result = await (client as any)._pullV2(0, 2);
     await Promise.resolve();
 
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
@@ -1504,7 +1526,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 0, 2);
+    const result = await (client as any)._pullGroupV2('g1', 0, 2);
     await Promise.resolve();
 
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull');
@@ -1532,7 +1554,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(5, 10);
+    const result = await (client as any)._pullV2(5, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
@@ -1563,7 +1585,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(5, 10);
+    const result = await (client as any)._pullV2(5, 10);
     await Promise.resolve();
 
     expect(result.map((msg) => msg.seq)).toEqual([5]);
@@ -1599,7 +1621,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    await client.pullV2(0, 10);
+    await (client as any)._pullV2(0, 10);
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
@@ -1619,7 +1641,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('g1', 5, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
@@ -1647,7 +1669,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('g1', 5, 10);
     await Promise.resolve();
 
     expect(result.map((msg) => msg.seq)).toEqual([5]);
@@ -1681,7 +1703,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    await client.pullGroupV2('g1', 0, 10);
+    await (client as any)._pullGroupV2('g1', 0, 10);
     await Promise.resolve();
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
@@ -1779,7 +1801,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullV2(0, 10);
+    const result = await (client as any)._pullV2(0, 10);
 
     expect(result).toEqual([]);
   });
@@ -1990,7 +2012,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullV2(0, 10);
+    const result = await (client as any)._pullV2(0, 10);
 
     expect(result).toEqual([expect.objectContaining({
       message_id: 'm-plain',
@@ -2249,14 +2271,14 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullV2(0, 10);
+    const result = await (client as any)._pullV2(0, 10);
 
     expect(result).toEqual([decrypted]);
   });
 
   it('message.send content 别名和裸 text payload 应在发送入口归一化', async () => {
     const encrypted = makeV2Client();
-    const sendSpy = vi.spyOn(encrypted, 'sendV2').mockResolvedValue({ ok: true } as any);
+    const sendSpy = vi.spyOn(encrypted as any, '_sendV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('message.send', {
       to: 'bob.aid.com',
@@ -2282,7 +2304,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
 
   it('group.send content 别名和裸 text payload 应在发送入口归一化', async () => {
     const encrypted = makeV2Client();
-    const sendSpy = vi.spyOn(encrypted, 'sendGroupV2').mockResolvedValue({ ok: true } as any);
+    const sendSpy = vi.spyOn(encrypted as any, '_sendGroupV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('group.send', {
       group_id: 'g1',
@@ -2338,7 +2360,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('g1', 0, 10);
 
     expect(result).toEqual([]);
   });
@@ -2372,7 +2394,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('g1', 0, 10);
 
     expect(result).toEqual([expect.objectContaining({
       message_id: 'gm-plain',
@@ -2429,7 +2451,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('g1', 0, 10);
 
     expect(result).toEqual([{ ...decrypted, group_id: 'g1' }]);
   });
@@ -2456,7 +2478,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullV2(0, 10);
+    const result = await (client as any)._pullV2(0, 10);
 
     expect(result).toEqual([]);
     expect(fillSpy).not.toHaveBeenCalled();
@@ -2485,7 +2507,7 @@ describe('AUNClient E2EE V2-only 编排', () => {
       return { ok: true };
     });
 
-    const result = await client.pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('g1', 0, 10);
 
     expect(result).toEqual([]);
     expect(fillSpy).not.toHaveBeenCalled();
@@ -3152,8 +3174,15 @@ describe('AUNClient agent.md ETag 缓存', () => {
     const body = '---\naid: alice.agentid.pub\n---\n# Alice\n';
     writeAgentFile(client, 'alice.agentid.pub', body);
 
-    (client.auth as any).signAgentMd = vi.fn(async (content: string) => `${content}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`);
-    (client.auth as any).uploadAgentMd = vi.fn(async () => ({
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+      signAgentMd: vi.fn((content: string) => ({
+        ok: true,
+        data: { signed: `${content}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n` },
+      })),
+    };
+    (client as any)._uploadAgentMd = vi.fn(async () => ({
       aid: 'alice.agentid.pub',
       etag: '"alice-cloud"',
       last_modified: 'Sun, 24 May 2026 00:00:00 GMT',
@@ -3176,13 +3205,13 @@ describe('AUNClient agent.md ETag 缓存', () => {
     const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    (client.auth as any)._agentMdCache = new Map([
+    (client as any)._agentMdCache = new Map([
       ['bob.agentid.pub', { text: body, etag: '"bob-cloud"', lastModified: 'Sun, 24 May 2026 00:00:00 GMT' }],
     ]);
-    (client.auth as any).downloadAgentMd = vi.fn(async () => body);
-    (client.auth as any).verifyAgentMd = vi.fn(async () => ({ status: 'unsigned', verified: false }));
+    (client as any)._downloadAgentMd = vi.fn(async () => body);
+    (client as any)._verifyAgentMd = vi.fn(async () => ({ status: 'unsigned', verified: false }));
 
-    const info = await client.fetchAgentMd('bob.agentid.pub');
+    const info = await (client as any)._startAgentMdFetchTask('bob.agentid.pub');
 
     expect(info.aid).toBe('bob.agentid.pub');
     expect(readFileSync(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'), 'utf-8')).toBe(body);
@@ -3266,7 +3295,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
     (client as any)._aid = 'alice.agentid.pub';
     const body = '# Bob\n';
     (client as any)._saveAgentMdRecord('bob.agentid.pub', { content: body, local_etag: agentEtag(body), remote_etag: '"old"' });
-    (client.auth as any).headAgentMd = vi.fn(async (aid: string) => ({
+    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
       aid,
       found: true,
       etag: agentEtag(body),
@@ -3274,7 +3303,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
       status: 200,
     }));
 
-    const result = await client.checkAgentMd('bob.agentid.pub');
+    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub');
 
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
@@ -3288,7 +3317,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-check-missing-'));
     const client = new AUNClient({ aun_path: join(tmpDir, 'aun') });
     (client as any)._aid = 'alice.agentid.pub';
-    (client.auth as any).headAgentMd = vi.fn(async (aid: string) => ({
+    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
       aid,
       found: true,
       etag: '"remote"',
@@ -3296,12 +3325,65 @@ describe('AUNClient agent.md ETag 缓存', () => {
       status: 200,
     }));
 
-    const result = await client.checkAgentMd('carol.agentid.pub');
+    const result = await (client as any)._checkAgentMdCache('carol.agentid.pub');
 
     expect(result.local_found).toBe(false);
     expect(result.remote_found).toBe(true);
     expect(result.in_sync).toBe(false);
     expect(result.remote_etag).toBe('"remote"');
     (client as any)._keystore.close?.();
+  });
+});
+
+describe('AUNClient setProtectedHeaders 校验', () => {
+  it('_auth 保留键应被过滤', () => {
+    const client = new AUNClient();
+    client.setProtectedHeaders({ _auth: 'secret', trace_id: 'abc' });
+    const result = client.getProtectedHeaders();
+    expect(result).not.toHaveProperty('_auth');
+    expect(result?.trace_id).toBe('abc');
+  });
+
+  it('大写字母 key（X-App）应被静默过滤', () => {
+    const client = new AUNClient();
+    client.setProtectedHeaders({ 'X-App': 'val', trace_id: 'abc' });
+    const result = client.getProtectedHeaders();
+    expect(result).not.toHaveProperty('X-App');
+    expect(result?.trace_id).toBe('abc');
+  });
+
+  it('含空格的 key 应被静默过滤', () => {
+    const client = new AUNClient();
+    client.setProtectedHeaders({ 'a b': 'val', ok_key: '1' });
+    const result = client.getProtectedHeaders();
+    expect(result).not.toHaveProperty('a b');
+    expect(result?.ok_key).toBe('1');
+  });
+
+  it('合法 key（小写字母、数字、_、-）全部保留', () => {
+    const client = new AUNClient();
+    client.setProtectedHeaders({ 'trace-id': 't1', app_name: 'x', v2: 'yes' });
+    expect(client.getProtectedHeaders()).toEqual({ 'trace-id': 't1', app_name: 'x', v2: 'yes' });
+  });
+
+  it('值应强转为 str', () => {
+    const client = new AUNClient();
+    client.setProtectedHeaders({ count: 42, flag: true } as Record<string, unknown>);
+    const result = client.getProtectedHeaders();
+    expect(result?.count).toBe('42');
+    expect(result?.flag).toBe('true');
+  });
+
+  it('全部 key 非法时应返回 null', () => {
+    const client = new AUNClient();
+    client.setProtectedHeaders({ _auth: 'x', 'Bad-Key': 'y' });
+    expect(client.getProtectedHeaders()).toBeNull();
+  });
+
+  it('传 null 应清空', () => {
+    const client = new AUNClient();
+    client.setProtectedHeaders({ trace_id: 'abc' });
+    client.setProtectedHeaders(null);
+    expect(client.getProtectedHeaders()).toBeNull();
   });
 });

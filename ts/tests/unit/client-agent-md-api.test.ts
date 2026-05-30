@@ -44,12 +44,14 @@ function readRecords(client: AUNClient): Record<string, any> {
 }
 
 describe('client AIDs agent.md 文件存储', () => {
-  it('默认路径为 {aun_path}/AIDs，且 SetAgentMDPath 可切换/恢复', () => {
+  it('默认路径为 {aun_path}/AIDs，内部存储根可切换/恢复', () => {
     const base = mkdtempSync(join(tmpdir(), 'aun-client-agent-md-path-'));
     const client = new AUNClient({ aun_path: join(base, 'aun') });
     expect(agentRoot(client)).toBe(join(base, 'aun', 'AIDs'));
-    expect((client as any).setAgentMdPath(join(base, 'custom'))).toBe(join(base, 'custom'));
-    expect((client as any).SetAgentMDPath()).toBe(join(base, 'aun', 'AIDs'));
+    expect((client as any).setAgentMdPath).toBeUndefined();
+    expect((client as any).SetAgentMDPath).toBeUndefined();
+    expect((client as any)._setAgentMdRoot(join(base, 'custom'))).toBe(join(base, 'custom'));
+    expect((client as any)._setAgentMdRoot()).toBe(join(base, 'aun', 'AIDs'));
     (client as any)._keystore.close?.();
   });
 
@@ -67,11 +69,18 @@ describe('client AIDs agent.md 文件存储', () => {
 
     let signedInput = '';
     let uploaded = '';
-    vi.spyOn(client.auth, 'signAgentMd').mockImplementation(async (c: string) => {
-      signedInput = c;
-      return `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`;
-    });
-    vi.spyOn(client.auth, 'uploadAgentMd').mockImplementation(async (c: string) => {
+    (client as any)._currentAid = {
+      signAgentMd: vi.fn((c: string) => {
+        signedInput = c;
+        return {
+          ok: true,
+          data: {
+            signed: `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`,
+          },
+        };
+      }),
+    };
+    vi.spyOn(client as any, '_uploadAgentMd').mockImplementation(async (c: string) => {
       uploaded = c;
       return { aid: 'alice.agentid.pub', etag: '"abc"', last_modified: 'Sun, 24 May 2026 00:00:00 GMT' };
     });
@@ -93,13 +102,13 @@ describe('client AIDs agent.md 文件存储', () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    (client.auth as any)._agentMdCache = new Map([
+    (client as any)._agentMdCache = new Map([
       ['bob.agentid.pub', { text: body, etag: '"bob-cloud"', lastModified: 'Sun, 24 May 2026 00:00:00 GMT' }],
     ]);
-    vi.spyOn(client.auth, 'downloadAgentMd').mockResolvedValue(body);
-    vi.spyOn(client.auth, 'verifyAgentMd').mockResolvedValue({ status: 'unsigned', verified: false, payload: body } as any);
+    vi.spyOn(client as any, '_downloadAgentMd').mockResolvedValue(body);
+    vi.spyOn(client as any, '_verifyAgentMd').mockResolvedValue({ status: 'unsigned', verified: false, payload: body } as any);
 
-    const info = await client.fetchAgentMd('bob.agentid.pub');
+    const info = await (client as any)._startAgentMdFetchTask('bob.agentid.pub');
 
     expect(info.aid).toBe('bob.agentid.pub');
     expect(info.in_sync).toBeNull();
@@ -124,11 +133,11 @@ describe('client AIDs agent.md 文件存储', () => {
     const downloadResult = new Promise<string>((resolve) => {
       releaseDownload = resolve;
     });
-    const downloadSpy = vi.spyOn(client.auth, 'downloadAgentMd').mockImplementation(async () => {
+    const downloadSpy = vi.spyOn(client as any, '_downloadAgentMd').mockImplementation(async () => {
       markStarted();
       return await downloadResult;
     });
-    const verifySpy = vi.spyOn(client.auth, 'verifyAgentMd').mockResolvedValue({ status: 'verified', verified: true, payload: body } as any);
+    const verifySpy = vi.spyOn(client as any, '_verifyAgentMd').mockResolvedValue({ status: 'verified', verified: true, payload: body } as any);
 
     (client as any)._observeRpcMeta({
       agent_md_etags: {
@@ -137,7 +146,7 @@ describe('client AIDs agent.md 文件存储', () => {
     });
     await started;
 
-    const manual = client.fetchAgentMd('bob.agentid.pub');
+    const manual = (client as any)._startAgentMdFetchTask('bob.agentid.pub');
     await Promise.resolve();
     expect(downloadSpy).toHaveBeenCalledTimes(1);
 
@@ -153,10 +162,9 @@ describe('client AIDs agent.md 文件存储', () => {
     (client as any)._keystore.close?.();
   });
 
-  it('fetchAgentMd 无 aid 且无 self aid 时拒绝', async () => {
+  it('fetchAgentMd 旧公开入口已移除', async () => {
     const client = makeClient();
-    (client as any)._aid = null;
-    await expect(client.fetchAgentMd()).rejects.toBeInstanceOf(ValidationError);
+    expect((client as any).fetchAgentMd).toBeUndefined();
     (client as any)._keystore.close?.();
   });
 
@@ -165,7 +173,7 @@ describe('client AIDs agent.md 文件存储', () => {
     (client as any)._aid = 'alice.agentid.pub';
     const body = '# Bob\n';
     (client as any)._saveAgentMdRecord('bob.agentid.pub', { content: body, local_etag: etag(body), remote_etag: '"old"' });
-    vi.spyOn(client.auth as any, 'headAgentMd').mockResolvedValue({
+    vi.spyOn(client as any, '_headAgentMd').mockResolvedValue({
       aid: 'bob.agentid.pub',
       found: true,
       etag: etag(body),
@@ -173,7 +181,7 @@ describe('client AIDs agent.md 文件存储', () => {
       status: 200,
     });
 
-    const result = await client.checkAgentMd('bob.agentid.pub');
+    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub');
 
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
@@ -186,7 +194,7 @@ describe('client AIDs agent.md 文件存储', () => {
     const client = makeClient();
     (client as any)._aid = 'alice.agentid.pub';
     const fetched: string[] = [];
-    vi.spyOn(client, 'fetchAgentMd').mockImplementation(async (aid?: string | null) => {
+    vi.spyOn(client as any, '_startAgentMdFetchTask').mockImplementation(async (aid: string) => {
       const target = String(aid ?? '');
       fetched.push(target);
       const content = `# ${target}\n`;
@@ -233,11 +241,11 @@ describe('client AIDs agent.md 文件存储', () => {
       verify_status: 'valid',
       verify_error: '',
     });
-    vi.spyOn(client.auth as any, 'headAgentMd').mockImplementation(async () => {
+    vi.spyOn(client as any, '_headAgentMd').mockImplementation(async () => {
       throw new Error('fresh cached checkAgentMd should not HEAD');
     });
 
-    const result = await client.checkAgentMd('bob.agentid.pub', 7);
+    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub', 7);
 
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
@@ -254,11 +262,11 @@ describe('client AIDs agent.md 文件存储', () => {
       remote_status: 'missing',
       checked_at: Date.now(),
     });
-    vi.spyOn(client.auth as any, 'headAgentMd').mockImplementation(async () => {
+    vi.spyOn(client as any, '_headAgentMd').mockImplementation(async () => {
       throw new Error('fresh missing cache should not HEAD');
     });
 
-    const result = await client.checkAgentMd('missing.agentid.pub');
+    const result = await (client as any)._checkAgentMdCache('missing.agentid.pub');
 
     expect(result.local_found).toBe(false);
     expect(result.remote_found).toBe(false);
@@ -285,4 +293,5 @@ describe('client AIDs agent.md 文件存储', () => {
     (client as any)._keystore.close?.();
   });
 });
+
 

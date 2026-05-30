@@ -29,10 +29,10 @@ func TestP0_01_HealthCheckSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	ok := c.CheckGatewayHealth(context.Background(), srv.URL, 5*time.Second)
+	ok := c.checkGatewayHealth(context.Background(), srv.URL, 5*time.Second)
 	if !ok {
 		t.Fatal("正常 200 响应时 health check 应返回 true")
 	}
@@ -53,11 +53,11 @@ func TestP0_01_HealthCheckTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	start := time.Now()
-	ok := c.CheckGatewayHealth(context.Background(), srv.URL, 500*time.Millisecond)
+	ok := c.checkGatewayHealth(context.Background(), srv.URL, 500*time.Millisecond)
 	elapsed := time.Since(start)
 
 	if ok {
@@ -79,10 +79,10 @@ func TestP0_01_HealthCheckRefused(t *testing.T) {
 	addr := ln.Addr().String()
 	ln.Close()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	ok := c.CheckGatewayHealth(context.Background(), "http://"+addr, 2*time.Second)
+	ok := c.checkGatewayHealth(context.Background(), "http://"+addr, 2*time.Second)
 	if ok {
 		t.Fatal("连接被拒绝时 health check 应返回 false")
 	}
@@ -95,10 +95,10 @@ func TestP0_01_HealthCheckNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	ok := c.CheckGatewayHealth(context.Background(), srv.URL, 2*time.Second)
+	ok := c.checkGatewayHealth(context.Background(), srv.URL, 2*time.Second)
 	if ok {
 		t.Fatal("503 响应时 health check 应返回 false")
 	}
@@ -114,12 +114,12 @@ func TestP0_01_HealthCheckWSSchemeConversion(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 将 http:// 替换为 ws://，CheckHealth 内部应将其转回 http:// 并追加 /health
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c.CheckGatewayHealth(context.Background(), wsURL, 2*time.Second)
+	c.checkGatewayHealth(context.Background(), wsURL, 2*time.Second)
 
 	if receivedPath != "/health" {
 		t.Fatalf("期望请求路径为 /health，实际为 %s", receivedPath)
@@ -132,7 +132,7 @@ func TestP0_01_HealthCheckWSSchemeConversion(t *testing.T) {
 
 // TestP0_02_CreateAIDEmptyString 验证空字符串 AID 返回 ValidationError
 func TestP0_02_CreateAIDEmptyString(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "")
@@ -147,7 +147,7 @@ func TestP0_02_CreateAIDEmptyString(t *testing.T) {
 
 // TestP0_02_CreateAIDTooShort 验证过短的 AID 返回 ValidationError
 func TestP0_02_CreateAIDTooShort(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "ab")
@@ -162,7 +162,7 @@ func TestP0_02_CreateAIDTooShort(t *testing.T) {
 
 // TestP0_02_CreateAIDInvalidChars 验证含非法字符的 AID 返回 ValidationError
 func TestP0_02_CreateAIDInvalidChars(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "Test_AID!")
@@ -177,7 +177,7 @@ func TestP0_02_CreateAIDInvalidChars(t *testing.T) {
 
 // TestP0_02_CreateAIDGuestPrefix 验证以 guest 开头的 AID 返回 ValidationError
 func TestP0_02_CreateAIDGuestPrefix(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "guest_user")
@@ -192,7 +192,7 @@ func TestP0_02_CreateAIDGuestPrefix(t *testing.T) {
 
 // TestP0_02_CreateAIDStartsWithDash 验证以 - 开头的 AID 返回 ValidationError
 func TestP0_02_CreateAIDStartsWithDash(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "-invalid_aid")
@@ -207,7 +207,7 @@ func TestP0_02_CreateAIDStartsWithDash(t *testing.T) {
 
 // TestP0_02_CreateAIDValidFormat 验证合法格式的 AID 通过本地校验（网络层面会失败但不应是 ValidationError）
 func TestP0_02_CreateAIDValidFormat(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 用一个无法连接的地址，合法 AID 应通过本地校验，失败在网络层
@@ -229,7 +229,7 @@ func TestP0_02_CreateAIDValidFormat(t *testing.T) {
 
 // TestP0_14_RPCWhenNotConnected 验证未连接时调用 RPC 返回 ConnectionError
 func TestP0_14_RPCWhenNotConnected(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 客户端处于 idle 状态，调用 Call 应返回错误
@@ -256,7 +256,7 @@ func TestP0_14_RPCAfterDisconnect(t *testing.T) {
 	})
 	defer cleanup()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 手动将客户端设为 connected 状态（模拟已建立连接）
@@ -267,9 +267,9 @@ func TestP0_14_RPCAfterDisconnect(t *testing.T) {
 	// 断开连接
 	_ = c.Disconnect()
 
-	// 确认状态已变为 disconnected
-	if c.State() != StateDisconnected {
-		t.Fatalf("Disconnect 后状态应为 disconnected，实际: %s", c.State())
+	// 确认无身份场景下公开状态回到 no_identity
+	if c.State() != ConnStateNoIdentity {
+		t.Fatalf("Disconnect 后公开状态应为 no_identity，实际: %s", c.State())
 	}
 
 	// 断开后调用 RPC 应返回 ConnectionError
@@ -288,7 +288,7 @@ func TestP0_14_RPCAfterDisconnect(t *testing.T) {
 
 // TestP0_14_RPCAfterClose 验证 Close 后调用 RPC 返回错误
 func TestP0_14_RPCAfterClose(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 
 	// 关闭客户端
 	_ = c.Close()
@@ -302,10 +302,10 @@ func TestP0_14_RPCAfterClose(t *testing.T) {
 
 // TestP0_14_ConnectAfterClose 验证 Close 后无法再次 Connect
 func TestP0_14_ConnectAfterClose(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	_ = c.Close()
 
-	err := c.Connect(context.Background(), map[string]any{
+	err := connectWithTestAuth(t, c, context.Background(), map[string]any{
 		"gateway":      "ws://localhost:9999",
 		"access_token": "test-token",
 	}, nil)
@@ -317,7 +317,7 @@ func TestP0_14_ConnectAfterClose(t *testing.T) {
 
 // TestP0_14_InternalMethodBlocked 验证内部专用方法被阻止调用
 func TestP0_14_InternalMethodBlocked(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 手动设为 connected 以通过连接检查
@@ -338,7 +338,7 @@ func TestP0_14_InternalMethodBlocked(t *testing.T) {
 
 // TestP0_14_ConcurrentCallsDuringDisconnect 验证断开过程中并发 RPC 调用不会 panic
 func TestP0_14_ConcurrentCallsDuringDisconnect(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.mu.Lock()
@@ -379,10 +379,10 @@ func TestP0_14_ConcurrentCallsDuringDisconnect(t *testing.T) {
 
 // TestP0_ConnectMissingAccessToken 验证缺少 access_token 时 Connect 返回错误
 func TestP0_ConnectMissingAccessToken(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	err := c.Connect(context.Background(), map[string]any{
+	err := connectWithTestAuth(t, c, context.Background(), map[string]any{
 		"gateway": "ws://localhost:9999",
 	}, nil)
 	if err == nil {
@@ -392,10 +392,10 @@ func TestP0_ConnectMissingAccessToken(t *testing.T) {
 
 // TestP0_ConnectMissingGateway 验证缺少 gateway 时 Connect 返回错误
 func TestP0_ConnectMissingGateway(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
-	err := c.Connect(context.Background(), map[string]any{
+	err := connectWithTestAuth(t, c, context.Background(), map[string]any{
 		"access_token": "test-token",
 	}, nil)
 	if err == nil {
@@ -405,7 +405,7 @@ func TestP0_ConnectMissingGateway(t *testing.T) {
 
 // TestP0_DisconnectIdempotent 验证重复 Disconnect 不报错
 func TestP0_DisconnectIdempotent(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 在 idle 状态下 Disconnect 应无操作、不报错
@@ -420,7 +420,7 @@ func TestP0_DisconnectIdempotent(t *testing.T) {
 
 // TestP0_CloseIdempotent 验证重复 Close 不报错
 func TestP0_CloseIdempotent(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 
 	if err := c.Close(); err != nil {
 		t.Fatalf("第一次 Close 不应报错: %v", err)

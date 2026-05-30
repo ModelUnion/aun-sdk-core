@@ -12,6 +12,7 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
 import type { JsonObject } from '../../src/types.js';
+import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -32,11 +33,9 @@ function makeClient(): AUNClient {
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth);
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+  await registerAndLoadIdentity(client, aid);
+  await client.connect();
 }
 
 function payloadTexts(result: JsonObject): string[] {

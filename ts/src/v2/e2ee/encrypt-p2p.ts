@@ -35,10 +35,10 @@ import {
   SUITE_NAME,
 } from './types.js';
 import { withMetadataAuth, PROTECTED_HEADERS_DOMAIN, PROTECTED_CONTEXT_DOMAIN } from './metadata-auth.js';
+import { VERSION as E2EE_SDK_VERSION } from '../../version.js';
 
 const TEXT = new TextEncoder();
 const E2EE_SDK_LANG = 'typescript';
-const E2EE_SDK_VERSION = '0.3.6';
 
 /**
  * 构造完整的 V2 P2P 加密 envelope。

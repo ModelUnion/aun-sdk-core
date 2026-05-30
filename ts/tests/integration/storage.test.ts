@@ -23,6 +23,7 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import { URL } from 'node:url';
 import { AUNClient } from '../../src/client.js';
+import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -37,17 +38,15 @@ function runId(): string {
 
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-sto-'));
-  const client = new AUNClient({ aun_path: tmpDir }, true);
+  const client = new AUNClient({ aun_path: tmpDir, debug: true });
   ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
   return client;
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth);
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+  await registerAndLoadIdentity(client, aid);
+  await client.connect();
 }
 
 function sleep(ms: number): Promise<void> {

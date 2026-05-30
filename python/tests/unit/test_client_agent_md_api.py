@@ -1,7 +1,7 @@
 """client agent.md 文件型本地存储单测。
 
 覆盖：
-- 默认 {aun_path}/AgentMDs
+- 默认 {aun_path}/AIDs
 - publish_agent_md(content?) 可直接接收内容；不传时读取 {root}/{aid}/agent.md
 - fetch_agent_md() 固定保存到 {root}/{aid}/agent.md
 - {aid}/agentmd.json 只保存元数据，不保存正文
@@ -97,7 +97,7 @@ def _read_record(client: AUNClient, aid: str) -> dict:
 
 def test_agent_md_path_defaults_to_agentmds(tmp_path: Path):
     client = _make_client(tmp_path)
-    assert Path(client._agent_md_path) == tmp_path / "aun" / "AgentMDs"
+    assert Path(client._agent_md_path) == tmp_path / "aun" / "AIDs"
     client._keystore.close()
 
 

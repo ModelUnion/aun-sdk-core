@@ -6,6 +6,7 @@ import * as path from 'node:path';
 
 import { AUNClient } from '../../src/client.js';
 import type { JsonObject, Message } from '../../src/types.js';
+import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 const TEST_TIMEOUT = 150_000;
 const MARKER_PATH = String(process.env.AUN_RECONNECT_MARKER ?? '').trim();
@@ -31,9 +32,9 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
-      await client.auth.registerAid({ aid });
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth, {
+      await setGatewayForClient(client, aid);
+      await registerAndLoadIdentity(client, aid);
+      await client.connect({
         auto_reconnect: true,
         heartbeat_interval: 3,
         retry: { initial_delay: 1, max_delay: 5 },
@@ -187,27 +188,27 @@ describe('双域 Federation Reconnect 测试', () => {
     await ensureConnected(alice, aliceAid);
     await ensureConnected(bob, bobAid);
 
-    expect(alice.state).toBe('connected');
-    expect(bob.state).toBe('connected');
+    expect(alice.state).toBe('ready');
+    expect(bob.state).toBe('ready');
 
     touchReconnectMarker();
 
     await waitFor(
-      () => bobStates.includes('disconnected') || bobStates.includes('reconnecting') || bob.state !== 'connected',
+      () => bobStates.includes('standby') || bobStates.includes('reconnecting') || bob.state !== 'ready',
       45_000,
       500,
       '等待 Bob 进入断线/重连状态',
     );
 
     await waitFor(
-      () => bob.state === 'connected' && (bobStates.includes('disconnected') || bobStates.includes('reconnecting')),
+      () => bob.state === 'ready' && (bobStates.includes('standby') || bobStates.includes('reconnecting')),
       90_000,
       500,
       '等待 Bob 重连完成',
     );
 
-    expect(alice.state).toBe('connected');
-    expect(bobStates.some(state => state === 'disconnected' || state === 'reconnecting')).toBe(true);
+    expect(alice.state).toBe('ready');
+    expect(bobStates.some(state => state === 'standby' || state === 'reconnecting')).toBe(true);
 
     await waitForFederationDelivery(alice, bob, aliceAid, bobAid, rid);
   }, TEST_TIMEOUT);

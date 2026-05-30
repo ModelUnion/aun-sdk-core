@@ -3,6 +3,7 @@
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AUNClient } from '../../src/client.js';
+import { AIDStore } from '../../src/aid-store.js';
 
 // ── P1: ISSUE-SDK-JS-006: V2-only 后旧 group epoch 预检已退役 ────
 describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
@@ -60,33 +61,42 @@ describe('ISSUE-SDK-JS-006: V2-only group E2EE 编排', () => {
   });
 });
 
-// ── P2: ISSUE-SDK-JS-003: listIdentities() ──────────────────
-describe('ISSUE-SDK-JS-003: listIdentities()', () => {
-  it('AUNClient 应有 listIdentities 方法', () => {
+// ── P2: ISSUE-SDK-JS-003: AIDStore.list() ──────────────────
+describe('ISSUE-SDK-JS-003: AIDStore.list()', () => {
+  it('AUNClient 不再公开 listIdentities 方法', () => {
     const client = new AUNClient();
-    expect(typeof (client as any).listIdentities).toBe('function');
+    expect((client as any).listIdentities).toBeUndefined();
   });
 
-  it('listIdentities 应返回已存储身份摘要列表', async () => {
-    const client = new AUNClient();
-    // mock keystore.listIdentities
-    (client as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.aid.com', 'bob.aid.com']);
-    (client as any)._keystore.loadIdentity = vi.fn().mockResolvedValue({ private_key_pem: 'PEM' });
-    (client as any)._keystore.loadMetadata = vi.fn().mockResolvedValue(null);
+  it('AIDStore.list 应返回已存储身份摘要列表', async () => {
+    const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '' });
+    (store as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.aid.com', 'bob.aid.com']);
+    (store as any).load = vi.fn(async (aid: string) => ({
+      ok: true,
+      data: {
+        aid: {
+          aid,
+          certFingerprint: `fp-${aid}`,
+          isPrivateKeyValid: () => true,
+        },
+      },
+    }));
 
-    const result = await (client as any).listIdentities();
-    expect(Array.isArray(result)).toBe(true);
-    expect(result.length).toBe(2);
-    expect(result[0]).toHaveProperty('aid', 'alice.aid.com');
-    expect(result[1]).toHaveProperty('aid', 'bob.aid.com');
+    const result = await store.list();
+    expect(result.ok).toBe(true);
+    expect(result.data?.identities).toEqual([
+      { aid: 'alice.aid.com', certFingerprint: 'fp-alice.aid.com' },
+      { aid: 'bob.aid.com', certFingerprint: 'fp-bob.aid.com' },
+    ]);
   });
 
-  it('listIdentities 无存储身份时应返回空数组', async () => {
-    const client = new AUNClient();
-    (client as any)._keystore.listIdentities = vi.fn().mockResolvedValue([]);
+  it('AIDStore.list 无存储身份时应返回空数组', async () => {
+    const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '' });
+    (store as any)._keystore.listIdentities = vi.fn().mockResolvedValue([]);
 
-    const result = await (client as any).listIdentities();
-    expect(result).toEqual([]);
+    const result = await store.list();
+    expect(result.ok).toBe(true);
+    expect(result.data?.identities).toEqual([]);
   });
 });
 

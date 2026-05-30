@@ -98,7 +98,8 @@ async function installP0Helpers(page: any): Promise<void> {
       const client = new AUN.AUNClient({
         instanceId,
         issuer,
-      }, true);
+        debug: true,
+      });
       // 禁用 forward secrecy 以简化测试
       if (client._configModel) {
         client._configModel.requireForwardSecrecy = false;
@@ -109,17 +110,8 @@ async function installP0Helpers(page: any): Promise<void> {
     /**
      * 确保 AID 已创建、认证并连接。
      */
-    const ensureConnected = async (client: any, aid: string): Promise<void> => {
-      const gatewayDiscoveryAid = `gateway.${issuer}`;
-      const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
-      (client as any)._gatewayUrl = gateway;
-      try {
-        await client.auth.registerAid({ aid });
-      } catch {
-        // 已存在则忽略
-      }
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
     const runId = () => {
@@ -169,9 +161,8 @@ test.describe('基本断线重连（浏览器）', () => {
 
         const disconnected = true;
 
-        // 重新认证并连接
-        const auth = await client.auth.authenticate({ aid });
-        await client.connect(auth);
+        // 重新连接
+        await client.connect();
 
         // 重连后 ping
         let pingAfter = false;
@@ -235,9 +226,8 @@ test.describe('重连后消息收发（浏览器）', () => {
         await alice.disconnect();
         await sleep(1000);
 
-        // Alice 重新认证并连接
-        const auth = await alice.auth.authenticate({ aid: aliceAid });
-        await alice.connect(auth);
+        // Alice 重新连接
+        await alice.connect();
 
         // Alice 发送 msg2（重连后）
         let msg2Sent = false;
@@ -308,9 +298,8 @@ test.describe('多次断连循环（浏览器）', () => {
           await client.disconnect();
           await sleep(500);
 
-          // 重新认证并连接
-          const auth = await client.auth.authenticate({ aid });
-          await client.connect(auth);
+          // 重新连接
+          await client.connect();
 
           // ping 验证
           let pingOk = false;
@@ -383,8 +372,7 @@ test.describe('断线后 RPC 报错（浏览器）', () => {
         }
 
         // 重连
-        const auth = await client.auth.authenticate({ aid });
-        await client.connect(auth);
+        await client.connect();
 
         // 重连后 ping — 应恢复
         let reconnectPingOk = false;

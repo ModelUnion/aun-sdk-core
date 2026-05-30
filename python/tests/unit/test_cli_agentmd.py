@@ -61,7 +61,7 @@ def test_agentmd_path_sets_profile(monkeypatch, tmp_path):
             return False
 
     monkeypatch.setattr(agentmd_commands, "CLISession", FakeSession)
-    new_path = tmp_path / "AgentMDs"
+    new_path = tmp_path / "AIDs"
 
     result = CliRunner().invoke(app, ["--json", "agentmd", "path", str(new_path)])
 

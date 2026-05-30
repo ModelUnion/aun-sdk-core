@@ -33,6 +33,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
+import { loadIdentityFromStore, registerAndLoadIdentity, registerIdentity, setGatewayForClient } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -63,7 +64,7 @@ function makeAunPath(tag: string): string {
  */
 function makeClient(tagOrPath: string, isPath: boolean = false): AUNClient {
   const root = isPath ? tagOrPath : makeAunPath(tagOrPath);
-  const client = new AUNClient({ aun_path: root }, false);
+  const client = new AUNClient({ aun_path: root, debug: false });
   ((client as unknown) as {
     _configModel: { requireForwardSecrecy: boolean };
   })._configModel.requireForwardSecrecy = false;
@@ -71,8 +72,7 @@ function makeClient(tagOrPath: string, isPath: boolean = false): AUNClient {
 }
 
 async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
 }
 
 async function connectLong(
@@ -83,20 +83,21 @@ async function connectLong(
   await resolveGatewayInto(client);
   if (options.registerAid !== false) {
     try {
-      await client.auth.registerAid({ aid });
+      await registerAndLoadIdentity(client, aid);
     } catch (err) {
       // AID 已存在不报错（共享 keystore 多次创建）
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
     }
+  } else if (!(client as any)._currentAid) {
+    loadIdentityFromStore(client, aid);
   }
-  const auth = await client.auth.authenticate({ aid });
   const opts: Record<string, unknown> = {
     auto_reconnect: false,
     heartbeat_interval: 30,
   };
   if (options.slotId !== undefined) opts.slot_id = options.slotId;
-  await client.connect(auth, opts);
+  await client.connect(opts);
 }
 
 async function connectShort(
@@ -105,7 +106,9 @@ async function connectShort(
   options: { slotId?: string; shortTtlMs?: number } = {},
 ): Promise<void> {
   await resolveGatewayInto(client);
-  const auth = await client.auth.authenticate({ aid });
+  if (!(client as any)._currentAid) {
+    loadIdentityFromStore(client, aid);
+  }
   const opts: Record<string, unknown> = {
     connection_kind: 'short',
     auto_reconnect: false,
@@ -114,7 +117,7 @@ async function connectShort(
   if (options.shortTtlMs !== undefined && options.shortTtlMs > 0) {
     opts.short_ttl_ms = options.shortTtlMs;
   }
-  await client.connect(auth, opts);
+  await client.connect(opts);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -182,7 +185,7 @@ describe('长短连接 集成 - 同身份短连接发消息', { timeout: 90_000 
 
       // alice 短连接（同 device, 同 slot）
       await connectShort(aliceShort, aliceAid, { slotId: 'main' });
-      expect(aliceShort.state).toBe('connected');
+      expect(aliceShort.state).toBe('ready');
 
       const result = await aliceShort.call('message.send', {
         to: bobAid,
@@ -219,7 +222,7 @@ describe('长短连接 集成 - 同身份短连接发消息', { timeout: 90_000 
 });
 
 describe('长短连接 集成 - 短连接不踢长连接', { timeout: 60_000 }, () => {
-  it('同 aid/device/slot 短连接进入后，长连接仍 connected', async () => {
+  it('同 aid/device/slot 短连接进入后，长连接仍 ready', async () => {
     const r = rid();
     const longAid = `lst-l2-${r}.${ISSUER}`;
 
@@ -240,14 +243,14 @@ describe('长短连接 集成 - 短连接不踢长连接', { timeout: 60_000 }, 
       await connectShort(shortClient, longAid, { slotId: 'main' });
       await sleep(1_000);
 
-      expect(longClient.state).toBe('connected');
+      expect(longClient.state).toBe('ready');
 
       // 短连接 ping 一次再关
       await shortClient.call('meta.ping');
       await shortClient.close();
       await sleep(500);
 
-      expect(longClient.state).toBe('connected');
+      expect(longClient.state).toBe('ready');
       await longClient.call('meta.ping');
     } finally {
       await safeClose(longClient);
@@ -268,7 +271,7 @@ describe('长短连接 集成 - 短连接容量上限 → 4013', { timeout: 90_0
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.registerAid({ aid });
+      await registerIdentity(setup, aid);
       await setup.close();
 
       // 起 10 个短连接（共享 keystore）
@@ -315,25 +318,25 @@ describe('长短连接 集成 - short_ttl_ms 兜底 → 4014', { timeout: 60_000
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.registerAid({ aid });
+      await registerIdentity(setup, aid);
       await setup.close();
 
       await connectShort(short, aid, { slotId: 'ttl', shortTtlMs: 2000 });
-      expect(short.state).toBe('connected');
+      expect(short.state).toBe('ready');
 
       // 等 ~5s，服务端应主动关闭
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
         if (
-          short.state === 'disconnected' ||
+          short.state === 'standby' ||
           short.state === 'closed' ||
-          short.state === 'terminal_failed'
+          short.state === 'connection_failed'
         ) {
           break;
         }
         await sleep(300);
       }
-      expect(short.state).not.toBe('connected');
+      expect(short.state).not.toBe('ready');
     } finally {
       await safeClose(setup);
       await safeClose(short);
@@ -354,7 +357,7 @@ describe('长短连接 集成 - 长连接互踢，短连接不受影响', { time
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.registerAid({ aid });
+      await registerIdentity(setup, aid);
       await setup.close();
 
       await connectLong(longOld, aid, { slotId: 'slot-x', registerAid: false });
@@ -369,12 +372,12 @@ describe('长短连接 集成 - 长连接互踢，短连接不受影响', { time
       await connectLong(longNew, aid, { slotId: 'slot-x', registerAid: false });
       await sleep(1_500);
 
-      expect(longOld.state).not.toBe('connected');
-      expect(longNew.state).toBe('connected');
+      expect(longOld.state).not.toBe('ready');
+      expect(longNew.state).toBe('ready');
 
       // 短连接仍在
       for (let i = 0; i < shorts.length; i++) {
-        expect(shorts[i].state, `short[${i}] should be connected`).toBe('connected');
+        expect(shorts[i].state, `short[${i}] should be ready`).toBe('ready');
         await shorts[i].call('meta.ping');
       }
     } finally {
@@ -400,7 +403,7 @@ describe('长短连接 集成 - 短连接不发布 client.online', { timeout: 60
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.registerAid({ aid: shortAid });
+      await registerIdentity(setup, shortAid);
       await setup.close();
 
       await connectLong(observer, observerAid, { slotId: 'obs' });
@@ -432,7 +435,7 @@ describe('长短连接 集成 - hello-ok 回包 connection.kind', { timeout: 60_
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.registerAid({ aid });
+      await registerIdentity(setup, aid);
       await setup.close();
 
       await connectLong(longClient, aid, { slotId: 'h7-l', registerAid: false });
@@ -462,7 +465,7 @@ describe('长短连接 集成 - 短连接禁用 token 刷新', { timeout: 60_000
 
     try {
       await resolveGatewayInto(setup);
-      await setup.auth.registerAid({ aid });
+      await registerIdentity(setup, aid);
       await setup.close();
 
       await connectShort(short, aid, { slotId: 'd8' });
@@ -706,21 +709,21 @@ describe('长短连接 E2E - CLI 崩溃 + ttl 兜底', { timeout: 90_000 }, () =
       // CLI 短连接：建立但不 close（模拟崩溃），ttl=2s
       cliCrash = makeClient(alicePath, true);
       await connectShort(cliCrash, aliceAid, { shortTtlMs: 2000 });
-      expect(cliCrash.state).toBe('connected');
+      expect(cliCrash.state).toBe('ready');
 
       // 等 ttl 触发
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
         if (
-          cliCrash.state === 'disconnected' ||
+          cliCrash.state === 'standby' ||
           cliCrash.state === 'closed' ||
-          cliCrash.state === 'terminal_failed'
+          cliCrash.state === 'connection_failed'
         ) {
           break;
         }
         await sleep(300);
       }
-      expect(cliCrash.state).not.toBe('connected');
+      expect(cliCrash.state).not.toBe('ready');
 
       // alice 长连接仍活
       await aliceLong.call('meta.ping');

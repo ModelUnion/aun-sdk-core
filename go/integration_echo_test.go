@@ -32,28 +32,18 @@ func echoIssuer() string {
 func echoMakeClient(t *testing.T, aunPath string) *AUNClient {
 	t.Helper()
 	os.Setenv("AUN_ENV", "development")
-	c := NewClient(map[string]any{"aun_path": aunPath, "debug": true})
+	c := newClient(map[string]any{"aun_path": aunPath, "debug": true})
 	c.configModel.RequireForwardSecrecy = false
 	return c
 }
 
 func echoCreateAndConnect(t *testing.T, c *AUNClient, aid string, slotID string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	if _, err := c.Auth.CreateAID(ctx, map[string]any{"aid": aid}); err != nil {
-		t.Fatalf("createAid %s failed: %v", aid, err)
-	}
-	authResult, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("authenticate %s failed: %v", aid, err)
-	}
-	authResult["slot_id"] = slotID
-	authResult["auto_reconnect"] = false
-	if err := c.Connect(ctx, authResult, nil); err != nil {
-		t.Fatalf("connect %s failed: %v", aid, err)
-	}
+	integrationRegisterOrLoadAID(t, c.configModel.AUNPath, aid)
+	integrationConnectLoadedAID(t, c, aid, &ConnectOptions{
+		SlotID:        slotID,
+		AutoReconnect: false,
+	})
 }
 
 func echoTruncate(s string, n int) string {

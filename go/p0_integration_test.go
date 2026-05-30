@@ -32,7 +32,7 @@ func TestP0Integration_01_HealthCheckRealGateway(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	ok := c.CheckGatewayHealth(ctx, fmt.Sprintf("https://gateway.%s", testIssuer()), 8*time.Second)
+	ok := c.checkGatewayHealth(ctx, fmt.Sprintf("https://gateway.%s", testIssuer()), 8*time.Second)
 	if !ok {
 		t.Skip("真实 Gateway 不可达（Docker 可能未运行）")
 	}
@@ -49,7 +49,8 @@ func TestP0Integration_02_CreateDuplicateAID(t *testing.T) {
 
 	// 首次创建 — 应成功
 	ctx := context.Background()
-	_, err := c1.Auth.CreateAID(ctx, map[string]any{"aid": aid})
+	store1 := integrationStoreForPath(t, c1.configModel.AUNPath)
+	err := store1.Register(ctx, aid)
 	if err != nil {
 		t.Skipf("Docker 环境不可用: %v", err)
 	}
@@ -58,7 +59,8 @@ func TestP0Integration_02_CreateDuplicateAID(t *testing.T) {
 	c2 := makeClient(t)
 	defer func() { _ = c2.Close() }()
 
-	_, err = c2.Auth.CreateAID(ctx, map[string]any{"aid": aid})
+	store2 := integrationStoreForPath(t, c2.configModel.AUNPath)
+	err = store2.Register(ctx, aid)
 	// 不管是报错还是幂等成功，记录行为
 	if err != nil {
 		t.Logf("重复 AID 创建正确返回错误: %v", err)
@@ -80,13 +82,13 @@ func TestP0Integration_04_LoginReplayAttack(t *testing.T) {
 	defer cancel()
 
 	// 创建 AID
-	_, err := c.Auth.CreateAID(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("Docker 环境不可用: %v", err)
+	loaded := integrationRegisterOrLoadAID(t, c.configModel.AUNPath, aid)
+	if err := c.LoadIdentity(loaded); err != nil {
+		t.Fatalf("加载身份失败: %v", err)
 	}
 
 	// 首次正常认证 — 获取 token
-	auth1, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+	auth1, err := c.Authenticate(ctx)
 	if err != nil {
 		t.Fatalf("首次认证失败: %v", err)
 	}
@@ -97,7 +99,7 @@ func TestP0Integration_04_LoginReplayAttack(t *testing.T) {
 
 	// 再次用同一 AID 认证 — 这里不是重放同一 challenge，
 	// 而是验证服务端每次颁发新 challenge
-	auth2, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+	auth2, err := c.Authenticate(ctx)
 	if err != nil {
 		t.Fatalf("第二次认证失败: %v", err)
 	}
@@ -255,11 +257,7 @@ func TestP0Integration_08_ReconnectGapFill(t *testing.T) {
 	received = nil
 	mu.Unlock()
 
-	auth, err := bob.Auth.Authenticate(ctx, map[string]any{"aid": bobAID})
-	if err != nil {
-		t.Fatalf("Bob 重新认证失败: %v", err)
-	}
-	if err := bob.Connect(ctx, auth, nil); err != nil {
+	if err := bob.Connect(ctx); err != nil {
 		t.Fatalf("Bob 重连失败: %v", err)
 	}
 
@@ -423,11 +421,7 @@ func TestP0Integration_14_RPCAfterDisconnectAndReconnect(t *testing.T) {
 	}
 
 	// 重连
-	auth, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("重新认证失败: %v", err)
-	}
-	if err := c.Connect(ctx, auth, nil); err != nil {
+	if err := c.Connect(ctx); err != nil {
 		t.Fatalf("重连失败: %v", err)
 	}
 
@@ -453,13 +447,13 @@ func TestP0Integration_03_LoginExpiredChallenge(t *testing.T) {
 	defer cancel()
 
 	// 创建 AID
-	_, err := c.Auth.CreateAID(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("Docker 环境不可用: %v", err)
+	loaded := integrationRegisterOrLoadAID(t, c.configModel.AUNPath, aid)
+	if err := c.LoadIdentity(loaded); err != nil {
+		t.Fatalf("加载身份失败: %v", err)
 	}
 
 	// 首次认证 — 获取第一次 token
-	auth1, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+	auth1, err := c.Authenticate(ctx)
 	if err != nil {
 		t.Fatalf("首次认证失败: %v", err)
 	}
@@ -471,7 +465,7 @@ func TestP0Integration_03_LoginExpiredChallenge(t *testing.T) {
 	// 等待一段时间后再次认证 — 验证 challenge 不可重用
 	time.Sleep(2 * time.Second)
 
-	auth2, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+	auth2, err := c.Authenticate(ctx)
 	if err != nil {
 		t.Fatalf("第二次认证失败: %v", err)
 	}
@@ -493,11 +487,6 @@ func TestP0Integration_05_TokenConcurrentRefresh(t *testing.T) {
 
 	ctx := context.Background()
 
-	_, err := c.Auth.CreateAID(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("Docker 环境不可用: %v", err)
-	}
-
 	// 先正常连接
 	ensureConnected(t, c, aid)
 
@@ -511,7 +500,7 @@ func TestP0Integration_05_TokenConcurrentRefresh(t *testing.T) {
 
 	for i := 0; i < concurrency; i++ {
 		go func() {
-			auth, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+			auth, err := c.Authenticate(ctx)
 			results <- authResult{auth, err}
 		}()
 	}
@@ -531,7 +520,7 @@ func TestP0Integration_05_TokenConcurrentRefresh(t *testing.T) {
 	}
 
 	// 验证并发刷新后客户端仍可用
-	_, err = c.Call(ctx, "meta.ping", nil)
+	_, err := c.Call(ctx, "meta.ping", nil)
 	if err != nil {
 		t.Logf("并发刷新后 ping 失败（可能需重连）: %v", err)
 	} else {
@@ -540,7 +529,7 @@ func TestP0Integration_05_TokenConcurrentRefresh(t *testing.T) {
 
 	// inflight 标志清理验证 — 并发完成后再单独 authenticate 应成功
 	time.Sleep(500 * time.Millisecond)
-	authAfter, err := c.Auth.Authenticate(ctx, map[string]any{"aid": aid})
+	authAfter, err := c.Authenticate(ctx)
 	if err != nil {
 		t.Errorf("inflight 清理异常: 并发后 authenticate 失败: %v", err)
 	} else if authAfter["access_token"] == nil {

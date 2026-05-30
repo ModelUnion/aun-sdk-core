@@ -95,24 +95,16 @@ async function installP0Helpers(page: any): Promise<void> {
       const client = new AUN.AUNClient({
         instanceId,
         issuer,
-      }, true);
+        debug: true,
+      });
       if (client._configModel) {
         client._configModel.requireForwardSecrecy = false;
       }
       return client;
     };
 
-    const ensureConnected = async (client: any, aid: string): Promise<void> => {
-      const gatewayDiscoveryAid = `gateway.${issuer}`;
-      const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
-      (client as any)._gatewayUrl = gateway;
-      try {
-        await client.auth.registerAid({ aid });
-      } catch {
-        // 已存在则忽略
-      }
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
     w.__aunP0 = { sleep, makeAndConnect, ensureConnected, runId, ISSUER: issuer };

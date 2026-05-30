@@ -27,6 +27,7 @@ import * as crypto from 'node:crypto';
 import * as dns from 'node:dns/promises';
 import * as net from 'node:net';
 import { AUNClient } from '../../src/client.js';
+import { loadIdentityFromStore, registerAndLoadIdentity, registerIdentity, setGatewayForClient } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -87,7 +88,7 @@ function makeAunPath(tag: string): string {
 }
 
 function makeClient(aunPath: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath }, false);
+  const client = new AUNClient({ aun_path: aunPath, debug: false });
   ((client as unknown) as {
     _configModel: { requireForwardSecrecy: boolean };
   })._configModel.requireForwardSecrecy = false;
@@ -99,8 +100,7 @@ function setDeviceId(client: AUNClient, deviceId: string): void {
 }
 
 async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  ((client as unknown) as { _gatewayUrl: string })._gatewayUrl = gateway;
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
 }
 
 async function connectLong(
@@ -112,19 +112,20 @@ async function connectLong(
   await resolveGatewayInto(client);
   if (options.registerAid !== false) {
     try {
-      await client.auth.registerAid({ aid });
+      await registerAndLoadIdentity(client, aid);
     } catch (err) {
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
     }
+  } else if (!(client as any)._currentAid) {
+    loadIdentityFromStore(client, aid);
   }
-  const auth = await client.auth.authenticate({ aid });
   const opts: Record<string, unknown> = {
     auto_reconnect: false,
     heartbeat_interval: 30,
   };
   if (options.slotId !== undefined) opts.slot_id = options.slotId;
-  await client.connect(auth, opts);
+  await client.connect(opts);
 }
 
 async function connectShort(
@@ -134,7 +135,9 @@ async function connectShort(
 ): Promise<void> {
   if (options.deviceId) setDeviceId(client, options.deviceId);
   await resolveGatewayInto(client);
-  const auth = await client.auth.authenticate({ aid });
+  if (!(client as any)._currentAid) {
+    loadIdentityFromStore(client, aid);
+  }
   const opts: Record<string, unknown> = {
     connection_kind: 'short',
     auto_reconnect: false,
@@ -143,7 +146,7 @@ async function connectShort(
   if (options.shortTtlMs !== undefined && options.shortTtlMs > 0) {
     opts.short_ttl_ms = options.shortTtlMs;
   }
-  await client.connect(auth, opts);
+  await client.connect(opts);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -221,7 +224,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     // setup：注册 aid（共享 keystore，所有客户端复用）
     const setup = makeClient(sharedPath);
     await resolveGatewayInto(setup);
-    await setup.auth.registerAid({ aid });
+    await registerIdentity(setup, aid);
     await safeClose(setup);
 
     const longs: Array<{ client: AUNClient; slotId: string; captured: DisconnectInfo[] }> = [];
@@ -237,15 +240,15 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
         longs.push({ client: c, slotId, captured });
       }
       await sleep(500);
-      // 此时全部应为 connected
+      // 此时全部应为 ready
       for (let i = 0; i < longs.length; i++) {
-        expect(longs[i].client.state, `setup long[${i}] state`).toBe('connected');
+        expect(longs[i].client.state, `setup long[${i}] state`).toBe('ready');
       }
 
       // 第 11 个 slot 进入 — 应踢掉 slot-0
       overflow = makeClient(sharedPath);
       await connectLong(overflow, aid, { slotId: 'slot-NEW', registerAid: false });
-      expect(overflow.state).toBe('connected');
+      expect(overflow.state).toBe('ready');
 
       // 等 long[0] 收到 4015 disconnect
       const evicted = longs[0];
@@ -261,12 +264,12 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
       // 验证不重连（4015 在 _NO_RECONNECT_CODES 中）
       await sleep(800);
-      expect(evicted.client.state).not.toBe('connected');
+      expect(evicted.client.state).not.toBe('ready');
       expect(evicted.client.state).not.toBe('reconnecting');
 
       // 其他 slot 不受影响
       for (let i = 1; i < longs.length; i++) {
-        expect(longs[i].client.state, `long[${i}] should remain connected`).toBe('connected');
+        expect(longs[i].client.state, `long[${i}] should remain ready`).toBe('ready');
       }
     } finally {
       for (const e of longs) await safeClose(e.client);
@@ -283,7 +286,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     // setup：注册 aid 一次（cert/key 落到 setupPath/AIDs/<aid>/）
     const setup = makeClient(setupPath);
     await resolveGatewayInto(setup);
-    await setup.auth.registerAid({ aid });
+    await registerIdentity(setup, aid);
     await safeClose(setup);
 
     // 为 11 个 device 准备独立 aun_path（每个都有不同 .device_id），
@@ -324,7 +327,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       }
       await sleep(500);
       for (let i = 0; i < longs.length; i++) {
-        expect(longs[i].client.state, `setup device[${i}] state`).toBe('connected');
+        expect(longs[i].client.state, `setup device[${i}] state`).toBe('ready');
       }
 
       // 第 11 个 device 进入 — 踢最早 device (longs[0])
@@ -337,7 +340,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       overflow = makeClient(ovPath);
       const newDeviceId = `q2-dev-NEW-${r}`;
       await connectLong(overflow, aid, { slotId: 'main', registerAid: false, deviceId: newDeviceId });
-      expect(overflow.state).toBe('connected');
+      expect(overflow.state).toBe('ready');
 
       const evicted = longs[0];
       const ok = await waitFor(() => evicted.captured.length > 0, 5000);
@@ -351,11 +354,11 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       expect(evictedBy?.device_id).toBe(newDeviceId);
 
       await sleep(800);
-      expect(evicted.client.state).not.toBe('connected');
+      expect(evicted.client.state).not.toBe('ready');
       expect(evicted.client.state).not.toBe('reconnecting');
 
       for (let i = 1; i < longs.length; i++) {
-        expect(longs[i].client.state, `device[${i}] should remain connected`).toBe('connected');
+        expect(longs[i].client.state, `device[${i}] should remain ready`).toBe('ready');
       }
     } finally {
       for (const e of longs) await safeClose(e.client);
@@ -374,7 +377,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     const aids: string[] = [];
     for (let i = 0; i <= QUOTA_LIMIT; i++) {
       const aid = `q3-a${i}-${r}.${ISSUER}`;
-      await setup.auth.registerAid({ aid });
+      await registerIdentity(setup, aid);
       aids.push(aid);
     }
     await safeClose(setup);
@@ -392,14 +395,14 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       }
       await sleep(500);
       for (let i = 0; i < longs.length; i++) {
-        expect(longs[i].client.state, `setup aid[${i}] state`).toBe('connected');
+        expect(longs[i].client.state, `setup aid[${i}] state`).toBe('ready');
       }
 
       // 第 11 个 aid 进入 — 踢最早 aid（longs[0]）
       overflow = makeClient(sharedPath);
       const newAid = aids[QUOTA_LIMIT];
       await connectLong(overflow, newAid, { slotId: 'main', registerAid: false });
-      expect(overflow.state).toBe('connected');
+      expect(overflow.state).toBe('ready');
 
       const evicted = longs[0];
       const ok = await waitFor(() => evicted.captured.length > 0, 5000);
@@ -412,11 +415,11 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       expect(evictedBy?.aid).toBe(newAid);
 
       await sleep(800);
-      expect(evicted.client.state).not.toBe('connected');
+      expect(evicted.client.state).not.toBe('ready');
       expect(evicted.client.state).not.toBe('reconnecting');
 
       for (let i = 1; i < longs.length; i++) {
-        expect(longs[i].client.state, `aid[${i}] should remain connected`).toBe('connected');
+        expect(longs[i].client.state, `aid[${i}] should remain ready`).toBe('ready');
       }
     } finally {
       for (const e of longs) await safeClose(e.client);
@@ -432,7 +435,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
     const setup = makeClient(sharedPath);
     await resolveGatewayInto(setup);
-    await setup.auth.registerAid({ aid });
+    await registerIdentity(setup, aid);
     await safeClose(setup);
 
     // Phase A：保活短连接（每秒 ping），ttl=2000ms，活 5s 应不被踢
@@ -443,11 +446,11 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
     try {
       await connectShort(aliveClient, aid, { slotId: 'q4-keep', shortTtlMs: 2000 });
-      expect(aliveClient.state).toBe('connected');
+      expect(aliveClient.state).toBe('ready');
 
       // 后台每秒 ping 保活
       pingTask = (async () => {
-        while (!stopPinging && aliveClient.state === 'connected') {
+        while (!stopPinging && aliveClient.state === 'ready') {
           try {
             await aliveClient.call('meta.ping');
           } catch {
@@ -461,7 +464,7 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
       // 保活 5s（ttl=2s 的 2.5 倍）期间不应被踢
       await sleep(5000);
       expect(aliveCapture.length, `保活期间不应收到 disconnect: got ${JSON.stringify(aliveCapture)}`).toBe(0);
-      expect(aliveClient.state).toBe('connected');
+      expect(aliveClient.state).toBe('ready');
 
       // 停止 ping，等待 ttl 触发
       stopPinging = true;

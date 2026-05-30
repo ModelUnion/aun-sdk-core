@@ -34,6 +34,8 @@ class AID:
     _private_key_obj: Any | None
     _cert_valid: bool
     _private_key_valid: bool
+    device_id: str = ""
+    slot_id: str = "default"
 
     @classmethod
     def _create(
@@ -46,6 +48,8 @@ class AID:
         private_key_obj: Any | None,
         cert_valid: bool,
         private_key_valid: bool,
+        device_id: str = "",
+        slot_id: str = "default",
     ) -> "AID":
         return cls(
             aid=str(aid),
@@ -55,6 +59,8 @@ class AID:
             _private_key_obj=private_key_obj,
             _cert_valid=bool(cert_valid),
             _private_key_valid=bool(private_key_valid),
+            device_id=str(device_id),
+            slot_id=str(slot_id) if slot_id else "default",
         )
 
     @property

@@ -4,7 +4,10 @@ import { isJsonObject, type JsonObject, type JsonValue, type RpcErrorObject } fr
 
 /** AUN 基础错误类型 */
 export class AUNError extends Error {
+  /** JSON-RPC 错误码（数字，用于 RPC 层） */
   readonly code: number;
+  /** 业务字符串错误码（与 Python/TS SDK error_codes 对齐） */
+  readonly stringCode: string;
   readonly data: JsonValue | null;
   readonly retryable: boolean;
   readonly traceId: string | null;
@@ -13,6 +16,7 @@ export class AUNError extends Error {
     message: string,
     opts?: {
       code?: number;
+      stringCode?: string;
       data?: JsonValue | null;
       retryable?: boolean;
       traceId?: string | null;
@@ -21,6 +25,7 @@ export class AUNError extends Error {
     super(message);
     this.name = 'AUNError';
     this.code = opts?.code ?? -1;
+    this.stringCode = opts?.stringCode ?? '';
     this.data = opts?.data ?? null;
     this.retryable = opts?.retryable ?? false;
     this.traceId = opts?.traceId ?? null;

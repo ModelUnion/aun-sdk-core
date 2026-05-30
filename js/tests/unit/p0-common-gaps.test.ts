@@ -4,30 +4,35 @@
  * 纯单元测试，无需真实服务端。
  * 注意：JS SDK 运行在浏览器环境（jsdom），setup.ts 已注入 fake-indexeddb。
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { AIDStore } from '../../src/aid-store.js';
 import { AUNClient } from '../../src/client.js';
-import {
-  ConnectionError,
-  StateError,
-  ValidationError,
-  AuthError,
-  PermissionError,
-} from '../../src/errors.js';
+import { INVALID_AID_FORMAT } from '../../src/error-codes.js';
+import { ConnectionError, PermissionError } from '../../src/errors.js';
+
+function makeStore(): AIDStore {
+  return new AIDStore({ aunPath: 'browser-aun-p0-common-gaps', encryptionSeed: 'p0-seed' });
+}
 
 // ── P0-01: 网关健康检查 ──────────────────────────────────────
 
 describe('P0-01: 网关健康检查', () => {
+  it('AUNClient 不再公开 checkGatewayHealth convenience 方法', () => {
+    const client = new AUNClient();
+    expect((client as any).checkGatewayHealth).toBeUndefined();
+  });
+
   it('超时 — 不可达地址应在 timeout 内返回 false', async () => {
     const client = new AUNClient();
     // 192.0.2.0/24 是 RFC 5737 文档专用地址段，不可达
-    const ok = await client.checkGatewayHealth('https://192.0.2.1:9999', 2000);
+    const ok = await (client as any)._discovery.checkHealth('https://192.0.2.1:9999', 2000);
     expect(ok).toBe(false);
   }, 10_000);
 
   it('连接拒绝 — 无服务端口应返回 false', async () => {
     const client = new AUNClient();
     // 端口 1 几乎不会有服务监听，应被系统立即拒绝
-    const ok = await client.checkGatewayHealth('https://127.0.0.1:1', 3000);
+    const ok = await (client as any)._discovery.checkHealth('https://127.0.0.1:1', 3000);
     expect(ok).toBe(false);
   }, 10_000);
 
@@ -38,7 +43,7 @@ describe('P0-01: 网关健康检查', () => {
 
   it('健康检查后 gatewayHealth 应被更新', async () => {
     const client = new AUNClient();
-    await client.checkGatewayHealth('https://127.0.0.1:1', 2000);
+    await (client as any)._discovery.checkHealth('https://127.0.0.1:1', 2000);
     // 检查完毕后 gatewayHealth 不再是 null，应为 false（无服务）
     expect(client.gatewayHealth).toBe(false);
   }, 10_000);
@@ -86,43 +91,54 @@ describe('P0-14: 断线中 RPC 拒绝', () => {
 // ── P0-02: AID 创建参数校验 ─────────────────────────────────
 
 describe('P0-02: AID 创建参数校验', () => {
-  it('空 AID 应抛出错误', async () => {
-    const client = new AUNClient();
-    await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow();
+  it('空 AID 应返回 INVALID_AID_FORMAT', async () => {
+    const store = makeStore();
+    const resolveSpy = vi.spyOn(store as any, '_resolveGateway');
+    const result = await store.register('');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe(INVALID_AID_FORMAT);
+      expect(result.error.message).toContain("requires 'aid'");
+    }
+    expect(resolveSpy).not.toHaveBeenCalled();
   });
 
-  it('空 AID 错误消息应包含 requires aid', async () => {
-    const client = new AUNClient();
-    await expect(client.auth.registerAid({ aid: '' })).rejects.toThrow("requires 'aid'");
+  it('不传 aid 字段应返回 INVALID_AID_FORMAT', async () => {
+    const store = makeStore();
+    const resolveSpy = vi.spyOn(store as any, '_resolveGateway');
+    const result = await (store as any).register(undefined);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
+    expect(resolveSpy).not.toHaveBeenCalled();
   });
 
-  it('不传 aid 字段应抛出错误', async () => {
-    const client = new AUNClient();
-    await expect(client.auth.registerAid({})).rejects.toThrow();
-  });
-
-  it('AID 名称过短（< 4 字符）应被 AuthFlow 拒绝', async () => {
-    const client = new AUNClient();
-    // 设置 _gatewayUrl 以跳过 discovery，触发 AuthFlow._validateAidName
-    (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: 'ab' })).rejects.toThrow();
+  it('AID 名称过短（< 4 字符）应在联网前被拒绝', async () => {
+    const store = makeStore();
+    const resolveSpy = vi.spyOn(store as any, '_resolveGateway');
+    const result = await store.register('ab');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
+    expect(resolveSpy).not.toHaveBeenCalled();
   });
 
   it('AID 名称含大写应被拒绝', async () => {
-    const client = new AUNClient();
-    (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: 'Alice.aid.com' })).rejects.toThrow();
+    const store = makeStore();
+    const result = await store.register('Alice.aid.com');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
   });
 
   it('AID 名称以 - 开头应被拒绝', async () => {
-    const client = new AUNClient();
-    (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: '-bad.aid.com' })).rejects.toThrow();
+    const store = makeStore();
+    const result = await store.register('-bad.aid.com');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
   });
 
   it('AID 名称以 guest 开头应被拒绝', async () => {
-    const client = new AUNClient();
-    (client as any)._gatewayUrl = 'wss://localhost:9999';
-    await expect(client.auth.registerAid({ aid: 'guestuser.aid.com' })).rejects.toThrow();
+    const store = makeStore();
+    const result = await store.register('guestuser.aid.com');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe(INVALID_AID_FORMAT);
   });
 });

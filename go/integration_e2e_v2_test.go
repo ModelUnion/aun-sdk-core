@@ -24,7 +24,7 @@ import (
 func makeV2Client(t *testing.T) *AUNClient {
 	t.Helper()
 	t.Setenv("AUN_ENV", "development")
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	}, true)
 	client.configModel.RequireForwardSecrecy = false
@@ -41,25 +41,9 @@ func v2EnsureConnected(t *testing.T, client *AUNClient, aid string) string {
 			time.Sleep(time.Duration(attempt) * 2 * time.Second)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-
-		_, err := client.Auth.CreateAID(ctx, map[string]any{"aid": aid})
-		if err != nil {
-			cancel()
-			if attempt == 0 {
-				t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
-			}
-			lastErr = err
-			continue
-		}
-
-		authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-		if err != nil {
-			cancel()
-			lastErr = err
-			continue
-		}
-
-		if err := client.Connect(ctx, authResult, &ConnectOptions{AutoReconnect: false}); err != nil {
+		integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
+		integrationLoadAIDIntoClient(t, client, aid)
+		if err := client.Connect(ctx, &ConnectOptions{AutoReconnect: false}); err != nil {
 			cancel()
 			lastErr = err
 			continue
@@ -78,7 +62,7 @@ func v2DrainInbox(t *testing.T, client *AUNClient) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	msgs, err := client.PullV2(ctx, 0, 200)
+	msgs, err := client.pullV2(ctx, 0, 200)
 	if err != nil {
 		t.Logf("v2DrainInbox: pull 失败 (可忽略): %v", err)
 		return
@@ -91,7 +75,7 @@ func v2DrainInbox(t *testing.T, client *AUNClient) {
 			}
 		}
 		if maxSeq > 0 {
-			_, _ = client.AckV2(ctx, maxSeq)
+			_, _ = client.ackV2(ctx, maxSeq)
 			t.Logf("v2DrainInbox: acked %d msgs (up_to_seq=%d)", len(msgs), maxSeq)
 		}
 	}
@@ -102,7 +86,7 @@ func v2DrainGroupInbox(t *testing.T, client *AUNClient, groupID string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	msgs, err := client.PullGroupV2(ctx, groupID, 0, 200)
+	msgs, err := client.pullGroupV2(ctx, groupID, 0, 200)
 	if err != nil {
 		return
 	}
@@ -114,7 +98,7 @@ func v2DrainGroupInbox(t *testing.T, client *AUNClient, groupID string) {
 			}
 		}
 		if maxSeq > 0 {
-			_, _ = client.AckGroupV2(ctx, groupID, maxSeq)
+			_, _ = client.ackGroupV2(ctx, groupID, maxSeq)
 		}
 	}
 }
@@ -126,7 +110,7 @@ func v2WaitForMessage(t *testing.T, client *AUNClient, fromAID, expectedText str
 
 	// 先检查 push 是否已经到达（通过 pull 检查）
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	msgs, _ := client.PullV2(ctx, 0, 50)
+	msgs, _ := client.pullV2(ctx, 0, 50)
 	cancel()
 	for _, m := range msgs {
 		from, _ := m["from"].(string)
@@ -169,7 +153,7 @@ func v2WaitForMessage(t *testing.T, client *AUNClient, fromAID, expectedText str
 
 		// pull 轮询
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-		msgs2, _ := client.PullV2(ctx2, 0, 50)
+		msgs2, _ := client.pullV2(ctx2, 0, 50)
 		cancel2()
 		for _, m := range msgs2 {
 			from, _ := m["from"].(string)
@@ -187,7 +171,7 @@ func v2WaitForMessage(t *testing.T, client *AUNClient, fromAID, expectedText str
 }
 
 // v2SubscribeAndWait 先订阅 push 事件，返回一个等待函数。
-// 用法：wait := v2SubscribeAndWait(t, bob, aliceAID, text); alice.SendV2(...); msg := wait(20s)
+// 用法：wait := v2SubscribeAndWait(t, bob, aliceAID, text); alice.sendV2(...); msg := wait(20s)
 func v2SubscribeAndWait(t *testing.T, client *AUNClient, fromAID, expectedText string) func(time.Duration) map[string]any {
 	t.Helper()
 	found := make(chan map[string]any, 1)
@@ -219,7 +203,7 @@ func v2SubscribeAndWait(t *testing.T, client *AUNClient, fromAID, expectedText s
 			}
 			// pull 兜底
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			msgs, _ := client.PullV2(ctx, 0, 50)
+			msgs, _ := client.pullV2(ctx, 0, 50)
 			cancel()
 			for _, m := range msgs {
 				from, _ := m["from"].(string)
@@ -243,7 +227,7 @@ func v2WaitForGroupMessage(t *testing.T, client *AUNClient, groupID, fromAID, ex
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		msgs, err := client.PullGroupV2(ctx, groupID, 0, 50)
+		msgs, err := client.pullGroupV2(ctx, groupID, 0, 50)
 		cancel()
 		if err == nil {
 			for _, m := range msgs {
@@ -382,7 +366,7 @@ func v2SendWithRetry(t *testing.T, client *AUNClient, to string, payload map[str
 			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		result, err := client.SendV2(ctx, to, payload)
+		result, err := client.sendV2(ctx, to, payload)
 		cancel()
 		if err == nil {
 			return result
@@ -403,7 +387,7 @@ func v2SendGroupWithRetry(t *testing.T, client *AUNClient, groupID string, paylo
 			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		result, err := client.SendGroupV2(ctx, groupID, payload)
+		result, err := client.sendGroupV2(ctx, groupID, payload)
 		cancel()
 		if err == nil {
 			return result
@@ -531,7 +515,7 @@ func TestV2P2PAck(t *testing.T) {
 
 	// Bob ack
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-	ackResult, err := bob.AckV2(ctx2, 0)
+	ackResult, err := bob.ackV2(ctx2, 0)
 	cancel2()
 	if err != nil {
 		t.Fatalf("AckV2 失败: %v", err)
@@ -540,7 +524,7 @@ func TestV2P2PAck(t *testing.T) {
 
 	// pull 应为空
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
-	msgs, err := bob.PullV2(ctx3, 0, 50)
+	msgs, err := bob.pullV2(ctx3, 0, 50)
 	cancel3()
 	if err != nil {
 		t.Fatalf("PullV2 失败: %v", err)
@@ -651,7 +635,7 @@ func TestV2P2PBatch(t *testing.T) {
 	case <-timer.C:
 		// push 未收齐，fallback pull
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		msgs, _ := bob.PullV2(ctx, 0, 50)
+		msgs, _ := bob.pullV2(ctx, 0, 50)
 		cancel()
 		mu.Lock()
 		for _, m := range msgs {
@@ -794,14 +778,14 @@ func TestV2GroupAck(t *testing.T) {
 	_ = v2WaitForGroupMessage(t, bob, groupID, aliceAID, payload["text"].(string), 20*time.Second)
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-	_, err := bob.AckGroupV2(ctx2, groupID, 0)
+	_, err := bob.ackGroupV2(ctx2, groupID, 0)
 	cancel2()
 	if err != nil {
 		t.Fatalf("AckGroupV2 失败: %v", err)
 	}
 
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
-	msgs, err := bob.PullGroupV2(ctx3, groupID, 0, 50)
+	msgs, err := bob.pullGroupV2(ctx3, groupID, 0, 50)
 	cancel3()
 	if err != nil {
 		t.Fatalf("PullGroupV2 失败: %v", err)
@@ -838,7 +822,7 @@ func TestV2GroupBidirectional(t *testing.T) {
 
 	// ack + drain
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-	_, _ = bob.AckGroupV2(ctx2, groupID, 0)
+	_, _ = bob.ackGroupV2(ctx2, groupID, 0)
 	cancel2()
 	v2DrainGroupInbox(t, alice, groupID)
 

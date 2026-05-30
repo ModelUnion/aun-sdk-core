@@ -32,10 +32,18 @@ async function cacheStateSignature(client: AUNClient, args: {
     state_version: args.stateVersion,
   });
   const sigBytes = Uint8Array.from(atob(args.signatureB64), (ch) => ch.charCodeAt(0));
-  const cachePrefix = encoder.encode(`${args.actorAid}\x00${signPayload}\x00`);
-  const cacheInput = new Uint8Array(cachePrefix.length + sigBytes.length);
-  cacheInput.set(cachePrefix, 0);
-  cacheInput.set(sigBytes, cachePrefix.length);
+  const actorBytes = encoder.encode(args.actorAid);
+  const payloadBytes = encoder.encode(signPayload);
+  const frames: Uint8Array[] = [];
+  for (const part of [actorBytes, payloadBytes, sigBytes]) {
+    frames.push(encoder.encode(`${part.length}:`), part, encoder.encode(';'));
+  }
+  const cacheInput = new Uint8Array(frames.reduce((total, frame) => total + frame.length, 0));
+  let offset = 0;
+  for (const frame of frames) {
+    cacheInput.set(frame, offset);
+    offset += frame.length;
+  }
   const cacheKey = await sha256Hex(cacheInput);
   (client as any)._v2SigCache.set(cacheKey, Date.now() + 60_000);
 }
@@ -120,23 +128,23 @@ describe('AUNClient V2-only parity', () => {
     (client as any)._v2Session = {};
     const p2pMessages = [{ seq: 1, payload: { type: 'text', text: 'p2p' } }];
     const groupMessages = [{ seq: 7, payload: { type: 'text', text: 'group' } }];
-    const pullV2 = vi.spyOn(client, 'pullV2').mockResolvedValue(p2pMessages);
-    const pullGroupV2 = vi.spyOn(client, 'pullGroupV2').mockResolvedValue(groupMessages);
+    const pullV2 = vi.spyOn(client as any, '_pullV2').mockResolvedValue(p2pMessages);
+    const pullGroupV2 = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue(groupMessages);
 
     await expect(client.call('message.pull', { after_seq: 3, limit: 10 }))
       .resolves.toEqual({ messages: p2pMessages });
     await expect(client.call('group.pull', { group_id: 'g1', after_message_seq: 7, limit: 11 }))
       .resolves.toEqual({ messages: groupMessages });
 
-    expect(pullV2).toHaveBeenCalledWith(3, 10);
+    expect(pullV2).toHaveBeenCalledWith(3, 10, { force: false });
     expect(pullGroupV2).toHaveBeenCalledWith('g1', 7, 11);
   });
 
   it('call(message.ack/group.ack_messages) 走 V2 时应兼容 Python 参数别名', async () => {
     const client = connectedClient();
     (client as any)._v2Session = {};
-    const ackV2 = vi.spyOn(client, 'ackV2').mockResolvedValue({ acked: 9 });
-    const ackGroupV2 = vi.spyOn(client, 'ackGroupV2').mockResolvedValue({ acked: 12 });
+    const ackV2 = vi.spyOn(client as any, '_ackV2').mockResolvedValue({ acked: 9 });
+    const ackGroupV2 = vi.spyOn(client as any, '_ackGroupV2').mockResolvedValue({ acked: 12 });
 
     await expect(client.call('message.ack', { up_to_seq: 9 }))
       .resolves.toEqual({ acked: 9 });
@@ -445,7 +453,7 @@ describe('AUNClient V2-only parity', () => {
       return { ok: true };
     });
 
-    await expect(client.pullV2(0, 10)).resolves.toEqual([expect.objectContaining({
+    await expect((client as any)._pullV2(0, 10)).resolves.toEqual([expect.objectContaining({
       message_id: 'm-plain',
       from: 'bob.aid.com',
       to: 'alice.aid.com',
@@ -480,7 +488,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(0, 10);
+    const result = await (client as any)._pullV2(0, 10);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack');
@@ -510,7 +518,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 0, 10);
+    const result = await (client as any)._pullGroupV2('g1', 0, 10);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     const ackCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack');
@@ -544,7 +552,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(0, 2);
+    const result = await (client as any)._pullV2(0, 2);
     await Promise.resolve();
 
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'message.v2.pull');
@@ -584,7 +592,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 0, 2);
+    const result = await (client as any)._pullGroupV2('g1', 0, 2);
     await Promise.resolve();
 
     const pullCalls = transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull');
@@ -610,7 +618,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(5, 10);
+    const result = await (client as any)._pullV2(5, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
@@ -641,7 +649,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullV2(5, 10);
+    const result = await (client as any)._pullV2(5, 10);
     await Promise.resolve();
 
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([5]);
@@ -675,7 +683,7 @@ describe('AUNClient V2-only parity', () => {
       return { ok: true };
     });
 
-    await client.pullV2(0, 10);
+    await (client as any)._pullV2(0, 10);
 
     expect(observedContig).toEqual([1]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(1);
@@ -691,7 +699,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('g1', 5, 10);
     await Promise.resolve();
 
     expect(result).toEqual([]);
@@ -719,7 +727,7 @@ describe('AUNClient V2-only parity', () => {
     });
     (client as any)._transport.call = transportCall;
 
-    const result = await client.pullGroupV2('g1', 5, 10);
+    const result = await (client as any)._pullGroupV2('g1', 5, 10);
     await Promise.resolve();
 
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([5]);
@@ -751,7 +759,7 @@ describe('AUNClient V2-only parity', () => {
       return { ok: true };
     });
 
-    await client.pullGroupV2('g1', 0, 10);
+    await (client as any)._pullGroupV2('g1', 0, 10);
 
     expect(observedContig).toEqual([1]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(1);
@@ -984,14 +992,14 @@ describe('AUNClient V2-only parity', () => {
       return { ok: true };
     });
 
-    await expect(client.pullV2(0, 10)).resolves.toEqual([decrypted]);
+    await expect((client as any)._pullV2(0, 10)).resolves.toEqual([decrypted]);
   });
 
   it('ackV2 应补齐 Python 兼容字段并在 acked=0 时推进到请求 seq', async () => {
     const client = connectedV2Client();
     (client as any)._transport.call = vi.fn().mockResolvedValue({ acked: 0 });
 
-    await expect(client.ackV2(9)).resolves.toMatchObject({
+    await expect((client as any)._ackV2(9)).resolves.toMatchObject({
       acked: 9,
       ack_seq: 9,
       success: true,
@@ -1046,7 +1054,7 @@ describe('AUNClient V2-only parity', () => {
       return { ok: true };
     });
 
-    await expect(client.pullGroupV2('g1', 0, 10)).resolves.toEqual([
+    await expect((client as any)._pullGroupV2('g1', 0, 10)).resolves.toEqual([
       expect.objectContaining({
         message_id: 'gm-plain',
         from: 'bob.aid.com',
@@ -1061,7 +1069,7 @@ describe('AUNClient V2-only parity', () => {
 
   it('message.send content 别名和裸 text payload 应在发送入口归一化', async () => {
     const encrypted = connectedV2Client();
-    const sendSpy = vi.spyOn(encrypted, 'sendV2').mockResolvedValue({ ok: true } as any);
+    const sendSpy = vi.spyOn(encrypted as any, '_sendV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('message.send', {
       to: 'bob.aid.com',
@@ -1087,7 +1095,7 @@ describe('AUNClient V2-only parity', () => {
 
   it('group.send content 别名和裸 text payload 应在发送入口归一化', async () => {
     const encrypted = connectedV2Client();
-    const sendSpy = vi.spyOn(encrypted, 'sendGroupV2').mockResolvedValue({ ok: true } as any);
+    const sendSpy = vi.spyOn(encrypted as any, '_sendGroupV2').mockResolvedValue({ ok: true } as any);
 
     await encrypted.call('group.send', {
       group_id: 'g1',

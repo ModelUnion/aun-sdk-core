@@ -6,6 +6,30 @@
 
 ---
 
+## 0.4.0 — 2026-05-30
+
+> **破坏性重构版本。** 与 Python SDK 0.4.0 对齐：身份管理剥离为 `AID` / `AIDStore`；删除 `auth` / `custody` / `meta` 公开命名空间；引入 `Result` 与字符串错误码；连接状态机扩展为 9 态。浏览器环境下 `AID` 创建和签名/验证均为异步。
+
+### Breaking Changes
+- **删除公开命名空间**：移除 `client.auth` / `client.custody` / `client.meta`。身份相关功能迁移到 `AIDStore` 与 `AID`，其余 RPC 走 `client.call()`。
+- **`AID` 创建改为异步**：使用 `await AID.create(...)` 工厂方法（浏览器 Web Crypto API 限制）；`sign` / `verify` / `signAgentMd` / `verifyAgentMd` 均为 `async`。
+- **目录约定变更**：`{aun_path}/AgentMDs/` → `{aun_path}/AIDs/`（IndexedDB key 前缀同步变更）。
+
+### Added
+- **`AID` 类**（异步）：`AID.create()` 工厂方法；`sign` / `verify` / `signAgentMd` / `verifyAgentMd` 均返回 Promise；`isCertValid` / `isPrivateKeyValid` 同步。
+- **`AIDStore` 类**：离线 `load` / `list` / `exists`，联网 `register` / `resolve` / `fetchAgentMd` / `checkAgentMd` / `diagnose` / `renewCert` / `rekey` / `changeSeed`；存储后端为 IndexedDB。
+- **`Result<T>` 类型**：统一结果类型（`{ ok: true; data: T }` 或 `{ ok: false; error: ErrorInfo }`）。
+- **新增错误类**：`NotFoundError` / `IdentityConflictError` / `E2EEGroupSecretMissingError` / `E2EEGroupEpochMismatchError`。
+- **`ConnectionState` 枚举**：9 态（`NO_IDENTITY` / `STANDBY` / `CONNECTING` / `READY` / `RETRY_BACKOFF` / `RECONNECTING` / `CONNECTION_FAILED` / `CLOSED`）。
+- **实例级 `protected_headers`**：`setProtectedHeaders()` 自动合并到 `message.send` / `group.send` / `*.thought.put`。
+- **重连状态可观测**：`nextRetryAt` / `retryAttempt` / `retryMaxAttempts` / `lastError` / `lastErrorCode` 属性。
+- **导出**：`__version__` 常量、`STATE_TO_PUBLIC` 映射表、`ROOT_CA_PEM` 根证书。
+
+### Removed
+- 删除 `js/src/namespaces/auth.ts`、`js/src/namespaces/custody.ts`、`js/src/namespaces/meta.ts`。
+
+---
+
 ## 0.3.6 — 2026-05-28
 
 ### Added

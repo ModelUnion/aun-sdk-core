@@ -51,10 +51,12 @@ func NewCrossSdkGoAgent() *CrossSdkGoAgent {
 	slotID := strings.TrimSpace(envString("AUN_TEST_SLOT_ID", "cross-sdk-go-"+uuid.NewString()[:8]))
 	aunPath := strings.TrimSpace(envString("AUN_TEST_AUN_PATH", envString("AUN_DATA_ROOT", "/data/aun")))
 	debug := envBool("AUN_TEST_DEBUG", false)
-	client := aun.NewClient(map[string]any{
-		"aun_path":                aunPath,
-		"require_forward_secrecy": false,
-	}, debug)
+	requireForwardSecrecy := false
+	client := aun.NewAUNClient(aun.AUNClientOptions{
+		AUNPath:               aunPath,
+		RequireForwardSecrecy: &requireForwardSecrecy,
+		Debug:                 debug,
+	})
 	agent := &CrossSdkGoAgent{
 		language:    "go",
 		sdkVersion:  aun.Version,
@@ -104,22 +106,30 @@ func (a *CrossSdkGoAgent) Close() {
 }
 
 func (a *CrossSdkGoAgent) ensureConnected(ctx context.Context) error {
+	store := aun.NewAIDStore(a.aunPath, "")
+	defer store.Close()
 	if a.gatewayURL != "" {
 		a.client.SetGatewayURL(a.gatewayURL)
+		store.SetGatewayURL(a.gatewayURL)
 	}
-	if _, err := a.client.Auth.RegisterAID(ctx, map[string]any{"aid": a.aid}); err != nil {
-		if local := a.client.AuthLoadIdentityOrNil(a.aid); local == nil {
+	if err := store.Register(ctx, a.aid); err != nil {
+		if _, loadErr := store.Load(a.aid); loadErr != nil {
 			return fmt.Errorf("register_aid failed and no local identity exists: %w", err)
 		}
 	}
-	authResult, err := a.client.Auth.Authenticate(ctx, map[string]any{"aid": a.aid})
+	aid, err := store.Load(a.aid)
 	if err != nil {
 		return err
 	}
-	authResult["slot_id"] = a.slotID
-	authResult["auto_reconnect"] = envBool("AUN_TEST_AUTO_RECONNECT", false)
-	authResult["background_sync"] = true
-	return a.client.Connect(ctx, authResult, &aun.ConnectOptions{AutoReconnect: false})
+	if err := a.client.LoadIdentity(aid); err != nil {
+		return err
+	}
+	return a.client.Connect(ctx, &aun.ConnectOptions{
+		GatewayURL:     a.gatewayURL,
+		SlotID:         a.slotID,
+		AutoReconnect:  envBool("AUN_TEST_AUTO_RECONNECT", false),
+		BackgroundSync: true,
+	})
 }
 
 func (a *CrossSdkGoAgent) recordTrace(traceID string, item map[string]any) {
@@ -318,10 +328,10 @@ func (a *CrossSdkGoAgent) handleHealth(res http.ResponseWriter) {
 	if startupError != "" {
 		status = http.StatusServiceUnavailable
 	}
-	state := string(a.client.State())
+	state := string(a.client.ConnectionState())
 	writeJSON(res, status, map[string]any{
 		"ok":            startupError == "",
-		"agent_ready":   ready && state == string(aun.StateConnected),
+		"agent_ready":   ready && (state == string(aun.ConnStateReady) || state == string(aun.StateConnected)),
 		"state":         state,
 		"aid":           a.aid,
 		"language":      a.language,

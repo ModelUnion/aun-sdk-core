@@ -18,6 +18,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
+import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -40,19 +41,17 @@ function sleep(ms: number): Promise<void> {
 
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-v2-p2p-'));
-  const client = new AUNClient({ aun_path: tmpDir }, true);
+  const client = new AUNClient({ aun_path: tmpDir, debug: true });
   (client as any)._configModel.requireForwardSecrecy = false;
   return client;
 }
 
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
-  const gateway = await client.auth._resolveGateway(GATEWAY_DISCOVERY_AID);
-  (client as any)._gatewayUrl = gateway;
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect({ ...auth, auto_reconnect: false });
+  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+  await registerAndLoadIdentity(client, aid);
+  await client.connect({ auto_reconnect: false });
   // V2 session 需要手动初始化
-  await client.initV2Session();
+  await (client as any)._initV2Session();
 }
 
 /** 通用 send：通过 call("message.send")，V2 ready 时自动走 V2 路径。 */

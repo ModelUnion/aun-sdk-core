@@ -21,7 +21,7 @@ import (
 func makeClient(t *testing.T) *AUNClient {
 	t.Helper()
 	t.Setenv("AUN_ENV", "development")
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	}, true)
 	client.configModel.RequireForwardSecrecy = false
@@ -32,27 +32,7 @@ func makeClient(t *testing.T) *AUNClient {
 // 通过 well-known 发现机制自动解析 Gateway URL。
 func ensureConnected(t *testing.T, client *AUNClient, aid string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// 创建 AID（触发 well-known 发现 + 服务端注册）
-	_, err := client.Auth.CreateAID(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("无法创建 AID（Docker 环境可能未运行）: %v", err)
-	}
-
-	// 认证（两阶段登录，获取 access_token）
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("认证失败: %v", err)
-	}
-
-	// 连接 WebSocket
-	if err := client.Connect(ctx, authResult, nil); err != nil {
-		t.Fatalf("连接失败: %v", err)
-	}
-
-	return aid
+	return integrationConnectAIDInPath(t, client, aid, nil)
 }
 
 // runID 生成唯一运行标识（UUID 前 12 位，避免 AID 碰撞）
@@ -292,7 +272,7 @@ func waitForSDKPullMessage(
 func makeIsolatedClient(t *testing.T, root string, slotID string) *AUNClient {
 	t.Helper()
 	t.Setenv("AUN_ENV", "development")
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": root,
 	})
 	client.configModel.RequireForwardSecrecy = false
@@ -428,13 +408,10 @@ func TestIntegrationSDKLongTermFallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	_, err := receiver.Auth.CreateAID(ctx, map[string]any{"aid": rAID})
-	if err != nil {
-		t.Skipf("无法创建 AID: %v", err)
-	}
+	integrationRegisterAIDInPath(t, receiver.configModel.AUNPath, rAID)
 
 	// multi-device 架构下，对方无 prekey 时 SDK 应报错
-	_, err = sender.Call(ctx, "message.send", map[string]any{
+	_, err := sender.Call(ctx, "message.send", map[string]any{
 		"to":      rAID,
 		"payload": map[string]any{"type": "text", "text": "fallback"},
 		"encrypt": true,
@@ -862,8 +839,19 @@ func TestIntegrationMultiDeviceOfflinePull(t *testing.T) {
 
 	bobLaptop = makeIsolatedClient(t, bobLaptopRoot, "")
 	defer bobLaptop.Close()
+	waitOffline := collectSDKPushMessages(bobLaptop, aliceAID, 1, func(msg map[string]any) bool {
+		p, _ := msg["payload"].(map[string]any)
+		return p != nil && p["text"] == text
+	})
 	ensureConnected(t, bobLaptop, bobAID)
-	offlineMsg := waitForSDKPullMessage(t, bobLaptop, aliceAID, offlineBase, text, 15*time.Second)
+	offlineMsgs := waitOffline(15 * time.Second)
+	var offlineMsg map[string]any
+	if len(offlineMsgs) > 0 {
+		offlineMsg = offlineMsgs[0]
+	} else {
+		t.Log("离线设备重连后未收到自动补拉事件，改用显式 pull 兜底")
+		offlineMsg = waitForSDKPullMessage(t, bobLaptop, aliceAID, offlineBase, text, 15*time.Second)
+	}
 	assertDecrypted(t, offlineMsg, map[string]any{"type": "text", "text": text, "kind": "offline-pull"}, "bob-laptop-offline")
 	assertDirectionIfPresent(t, offlineMsg, "inbound", "bob-laptop-offline")
 }

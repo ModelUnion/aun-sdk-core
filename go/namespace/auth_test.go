@@ -476,3 +476,30 @@ func TestVerifyAgentMDFetchesPeerCert(t *testing.T) {
 		t.Fatalf("expected fetchPeerCert to be called once, got %d", client.fetchPeerCertCalls)
 	}
 }
+
+// TestDownloadAgentMD_NotFound 验证：agent.md 端点返回 404 时，
+// 错误消息应包含 "AGENTMD_NOT_FOUND"，而非裸 fmt.Errorf 字符串。
+// 对齐 go/error_codes.go 中已定义的 ErrCodeAgentMdNotFound 常量。
+func TestDownloadAgentMD_NotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	// gatewayURL 以 ws:// 开头，agentMDSchemeFromGateway 返回 "http"，
+	// 与 httptest.NewServer（plain HTTP）匹配。
+	client := &mockAuthClient{
+		gatewayURL: "ws://gateway.example.com/aun",
+		verifySSL:  false,
+	}
+	ns := NewAuthNamespace(client)
+
+	// AID 直接传 server 的 host:port，resolveAgentMDURL 会拼成 http://<host:port>/agent.md
+	_, err := ns.DownloadAgentMD(context.Background(), strings.TrimPrefix(server.URL, "http://"))
+	if err == nil {
+		t.Fatal("agent.md 404 时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "AGENTMD_NOT_FOUND") {
+		t.Errorf("agent.md 404 应包含 AGENTMD_NOT_FOUND, 实际: %v", err)
+	}
+}

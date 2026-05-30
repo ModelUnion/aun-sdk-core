@@ -1,9 +1,12 @@
 // ── @agentunion/fastaun-browser 包入口 ──────────────────────────────
 
-export const __version__ = '0.3.6';
+export { VERSION as __version__ } from './version.js';
 
 // 客户端
-export { AUNClient } from './client.js';
+export { AUNClient, type AUNClientOptions } from './client.js';
+export { AID, type VerifyResult } from './aid.js';
+export { AIDStore, type AIDInfo } from './aid-store.js';
+export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';
 
 // 配置
 export { getDeviceId, createConfig, type AUNConfig } from './config.js';
@@ -40,9 +43,9 @@ export {
 
 // 类型
 export {
+  ConnectionState,
   type JsonValue,
   type JsonObject,
-  type ConnectionState,
   type RpcParams,
   type RpcResult,
   type RpcErrorObject,
@@ -87,9 +90,6 @@ export { IndexedDBSecretStore } from './secret-store/indexeddb-store.js';
 
 // 认证
 export { AuthFlow } from './auth.js';
-export { AuthNamespace } from './namespaces/auth.js';
-export { CustodyNamespace } from './namespaces/custody.js';
-export { MetaNamespace } from './namespaces/meta.js';
 
 // E2EE V2-only 公开 API
 export { ProtectedHeaders } from './protected-headers.js';

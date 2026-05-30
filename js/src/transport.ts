@@ -270,6 +270,8 @@ export class RPCTransport {
   private _onDisconnect: ((error: Error | null, closeCode?: number) => Promise<void>) | null;
   private _ws: WebSocket | null = null;
   private _closed = true;
+  private _lastCloseCode: number | null = null;
+  private _lastCloseReason = '';
   private _challenge: RpcMessage | null = null;
   private _pending: Map<string, PendingRpc> = new Map();
   private _pendingBackground: Set<string> = new Set();
@@ -334,6 +336,8 @@ export class RPCTransport {
   async connect(url: string): Promise<RpcMessage | null> {
     const tStart = Date.now();
     this._log.debug(`connect enter: url=${url}`);
+    this._lastCloseCode = null;
+    this._lastCloseReason = '';
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url);
       this._ws = ws;
@@ -384,6 +388,8 @@ export class RPCTransport {
       };
 
       ws.onclose = (event) => {
+        this._lastCloseCode = event.code;
+        this._lastCloseReason = event.reason ?? '';
         if (!initialResolved) {
           initialResolved = true;
           this._log.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=closed_before_initial code=${event.code}`);
@@ -444,7 +450,7 @@ export class RPCTransport {
     background = false,
   ): Promise<RpcResult> {
     if (this._closed || !this._ws) {
-      throw new ConnectionError('transport not connected');
+      throw this._notConnectedError();
     }
 
     // 生成唯一 RPC ID（递增计数器，避免高并发碰撞）
@@ -648,6 +654,8 @@ export class RPCTransport {
   private _handleClose(event: CloseEvent): void {
     const wasClosed = this._closed;
     this._closed = true;
+    this._lastCloseCode = event.code;
+    this._lastCloseReason = event.reason ?? '';
 
     // 拒绝所有待处理调用
     const err = new ConnectionError(`websocket closed: code=${event.code}`);
@@ -676,6 +684,14 @@ export class RPCTransport {
         this._onDisconnect(error, event.code).catch(exc => this._log.warn('[aun_core.transport] disconnect callback exception:', exc));
       }
     }
+  }
+
+  private _notConnectedError(): ConnectionError {
+    if (this._lastCloseCode !== null) {
+      const reason = this._lastCloseReason ? ` reason=${this._lastCloseReason}` : '';
+      return new ConnectionError(`transport not connected: last websocket close code=${this._lastCloseCode}${reason}`);
+    }
+    return new ConnectionError('transport not connected');
   }
 
   private _routeMessage(message: RpcMessage): void {

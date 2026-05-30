@@ -6,6 +6,41 @@
 
 ---
 
+## 0.4.0 — 2026-05-30
+
+> **破坏性重构版本。** 身份管理从 `AUNClient` 中剥离为独立的 `AID` / `AIDStore`；删除 `auth` / `custody` / `meta` 三个公开命名空间；引入统一的 `Result` 与字符串错误码；连接状态机扩展为 9 态。升级前请阅读 Breaking Changes。
+
+### Breaking Changes
+- **删除公开命名空间**：移除 `client.auth` / `client.custody` / `client.meta`。身份相关功能迁移到 `AIDStore` 与 `AID`，其余 RPC 走 `client.call()`。
+- **构造函数签名变更**：`AUNClient.__init__(config)` → `AUNClient(aid: AID | None)`。身份先由 `AIDStore.load()` 离线加载，再传入 client。
+- **`connect()` 签名变更**：移除 `auth` 参数，改为 `connect(options)`；身份与认证在 connect 之前完成。
+- **连接状态枚举重命名**：`IDLE → NO_IDENTITY`、`CONNECTED → READY`、`TERMINAL_FAILED → CONNECTION_FAILED`，并区分内部状态 `_state` 与对外状态 `_public_state`。
+- **目录约定变更**：`{aun_path}/AgentMDs/` → `{aun_path}/AIDs/`。
+
+### Added
+- **`AID` 值对象**（`aid.py`）：封装证书 + 可选私钥，提供 `sign` / `verify` / `sign_agent_md` / `verify_agent_md` / `is_cert_valid` / `is_private_key_valid`。
+- **`AIDStore` 身份管理器**（`aid_store.py`）：离线 `load` / `list` / `exists`，联网 `register` / `resolve` / `fetch_agent_md` / `diagnose` / `renew_cert` / `rekey` / `change_seed`。
+- **`Result[T]` / `ErrorInfo`**（`result.py`）：统一结果类型（`ok` / `data` 或 `error`）。
+- **字符串错误码**（`error_codes.py`）：标准化常量（`CERT_NOT_FOUND`、`IDENTITY_CONFLICT`、`KEYPAIR_MISMATCH` 等），跨语言一致。
+- **`client.authenticate()`**：完成两阶段认证并缓存 token，但不建立长连接。
+- **`client.call()`**：统一 RPC 调用入口（替代已删除命名空间的方法）。
+- **实例级 `protected_headers`**：`set_protected_headers()` 设置后自动合并到 `message.send` / `group.send` / `*.thought.put`，调用方显式传参优先。
+- **对端 AID 缓存**：peer cache 减少重复 PKI 解析。
+- **9 态连接状态机**：`NO_IDENTITY → STANDBY → AUTHENTICATED → CONNECTING → READY`，外加 `RETRY_BACKOFF` / `RECONNECTING` / `CONNECTION_FAILED` / `CLOSED`，重连状态可观测。
+
+### Changed
+- **CLI 适配**：`identity list/check/register` 改用 `AIDStore`；移除 `--gateway`（改为自动发现）；新增 `encryption_seed` 配置项。
+- **WebSocket 连接超时**：新增 10s 连接超时；`verify_ssl=False` 时跳过 WSS 证书校验。
+- **新增 `_cert_utils.py`**：抽取证书签名 / 验证 / 指纹等工具函数。
+
+### Fixed
+- **per-namespace 消息处理锁**：防止同一 namespace 并发处理导致的乱序。
+
+### Removed
+- 删除 `namespaces/auth_namespace.py`、`namespaces/custody_namespace.py`、`namespaces/meta_namespace.py`（合计约 1763 行）。
+
+---
+
 ## 0.3.6 — 2026-05-28
 
 ### Added

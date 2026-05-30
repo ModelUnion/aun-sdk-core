@@ -72,7 +72,7 @@ async function installThoughtHelpers(page: any): Promise<void> {
 
     const makeAndConnect = async (instanceId: string): Promise<any> => {
       const AUN = w.AUN;
-      const client = new AUN.AUNClient({ instanceId, issuer }, true);
+      const client = new AUN.AUNClient({ instanceId, issuer, debug: true });
       if (client._configModel) {
         client._configModel.requireForwardSecrecy = false;
       }
@@ -80,15 +80,7 @@ async function installThoughtHelpers(page: any): Promise<void> {
     };
 
     const ensureConnected = async (client: any, aid: string): Promise<void> => {
-      const gateway = await client.auth._resolveGateway(`gateway.${issuer}`);
-      client._gatewayUrl = gateway;
-      try {
-        await client.auth.registerAid({ aid });
-      } catch {
-        // 已存在则忽略。
-      }
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
     const payloadTexts = (result: any): string[] => {

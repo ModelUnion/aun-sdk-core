@@ -47,7 +47,7 @@ func cloneRPCParamsForTest(t *testing.T, params map[string]any) map[string]any {
 }
 
 func TestOrderedP2PPublishWaitsForGapFill(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ns := "p2p:alice.example.com"
@@ -76,7 +76,7 @@ func TestOrderedP2PPublishWaitsForGapFill(t *testing.T) {
 }
 
 func TestOrderedGroupPublishWaitsForGapFill(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ns := "group:g1"
@@ -101,7 +101,7 @@ func TestOrderedGroupPublishWaitsForGapFill(t *testing.T) {
 }
 
 func TestPulledBatchPublishesInternalGap(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ns := "p2p:alice.example.com"
@@ -136,7 +136,7 @@ func TestPulledBatchPublishesInternalGap(t *testing.T) {
 }
 
 func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.deviceID = "dev-1"
@@ -170,7 +170,7 @@ func TestPublishedMessageEventsFallbackCurrentInstanceContext(t *testing.T) {
 }
 
 func TestPublishedMessageEventsAttachEmptyDeviceID(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.deviceID = ""
@@ -185,7 +185,7 @@ func TestPublishedMessageEventsAttachEmptyDeviceID(t *testing.T) {
 }
 
 func TestMessageTargetsCurrentInstanceTreatsEmptyDeviceIDAsExplicit(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.deviceID = "device-1"
@@ -206,7 +206,7 @@ func TestMessageTargetsCurrentInstanceTreatsEmptyDeviceIDAsExplicit(t *testing.T
 	}
 }
 func TestP2PPushIgnoresOtherSlotContext(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.deviceID = "dev-1"
@@ -231,7 +231,7 @@ func TestP2PPushIgnoresOtherSlotContext(t *testing.T) {
 }
 
 func TestGroupPushAcceptsOtherSlotContext(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.deviceID = "dev-1"
@@ -264,7 +264,7 @@ func TestGroupPushAcceptsOtherSlotContext(t *testing.T) {
 }
 
 func TestOrderedQueueClearedOnSeqTrackerContextSwitch(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	c.mu.Lock()
@@ -390,17 +390,26 @@ func startTestRPCServer(
 	return wsURL, getCalls, server.Close
 }
 
+func connectWithTestAuth(t *testing.T, c *AUNClient, ctx context.Context, params map[string]any, opts ...*ConnectOptions) error {
+	t.Helper()
+	var opt *ConnectOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	return c.connectWithParams(ctx, params, opt, false, true)
+}
+
 // ── 客户端构造测试 ───────────────────────────────────────
 
 // TestConstructNoArgs 验证使用空配置创建客户端
 func TestConstructNoArgs(t *testing.T) {
-	c := NewClient(map[string]any{})
+	c := newClient(map[string]any{})
 	defer func() { _ = c.Close() }()
 	if c == nil {
 		t.Fatal("NewClient 不应返回 nil")
 	}
-	if c.State() != StateIdle {
-		t.Errorf("初始状态应为 idle: %s", c.State())
+	if c.State() != ConnStateNoIdentity {
+		t.Errorf("初始公开状态应为 no_identity: %s", c.State())
 	}
 	if c.AID() != "" {
 		t.Errorf("初始 AID 应为空: %s", c.AID())
@@ -410,7 +419,7 @@ func TestConstructNoArgs(t *testing.T) {
 // TestConstructWithAunPath 验证使用自定义 AUNPath 创建客户端
 func TestConstructWithAunPath(t *testing.T) {
 	tmpDir := t.TempDir()
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": tmpDir,
 	})
 	defer func() { _ = c.Close() }()
@@ -424,7 +433,7 @@ func TestConstructWithAunPath(t *testing.T) {
 
 func TestConstructDefaultSQLiteBackupUsesAUNPath(t *testing.T) {
 	tmpDir := t.TempDir()
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": tmpDir,
 	})
 	defer func() { _ = c.Close() }()
@@ -446,11 +455,11 @@ func TestConstructDefaultSQLiteBackupUsesAUNPath(t *testing.T) {
 
 // TestConnectRequiresAccessToken 验证连接需要 access_token
 func TestConnectRequiresAccessToken(t *testing.T) {
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
-	err := c.Connect(context.Background(), map[string]any{
+	err := connectWithTestAuth(t, c, context.Background(), map[string]any{
 		"gateway": "ws://localhost:20001",
 	}, nil)
 	if err == nil {
@@ -464,11 +473,11 @@ func TestConnectRequiresAccessToken(t *testing.T) {
 
 // TestConnectRequiresGateway 验证连接需要 gateway
 func TestConnectRequiresGateway(t *testing.T) {
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
-	err := c.Connect(context.Background(), map[string]any{
+	err := connectWithTestAuth(t, c, context.Background(), map[string]any{
 		"access_token": "test-token",
 	}, nil)
 	if err == nil {
@@ -480,10 +489,10 @@ func TestConnectRequiresGateway(t *testing.T) {
 
 // TestClientState 验证客户端初始状态
 func TestClientState(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
-	if c.State() != StateIdle {
-		t.Errorf("初始状态应为 idle: %s", c.State())
+	if c.State() != ConnStateNoIdentity {
+		t.Errorf("初始公开状态应为 no_identity: %s", c.State())
 	}
 }
 
@@ -538,7 +547,7 @@ func TestClampHeartbeatInterval(t *testing.T) {
 
 // TestApplyServerHeartbeatInterval 验证 applyServerHeartbeatInterval 写回 sessionOptions。
 func TestApplyServerHeartbeatInterval(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.sessionOptions["heartbeat_interval"] = float64(30)
 
@@ -564,7 +573,7 @@ func TestApplyServerHeartbeatInterval(t *testing.T) {
 
 // TestCallNotConnected 验证未连接时调用 RPC 返回错误
 func TestCallNotConnected(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	_, err := c.Call(context.Background(), "meta.ping", nil)
 	if err == nil {
@@ -579,7 +588,7 @@ func TestCallNotConnected(t *testing.T) {
 func TestCallInternalOnlyBlocked(t *testing.T) {
 	// 需要先让状态变为 Connected 才能测到 internalOnly 检查
 	// 由于无法真正连接，我们创建一个假连接状态
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.state = StateConnected
@@ -609,7 +618,7 @@ func TestCallInternalOnlyBlocked(t *testing.T) {
 }
 
 func TestCallRejectsMessageSendToGroupService(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.state = StateConnected
@@ -629,7 +638,7 @@ func TestCallRejectsMessageSendToGroupService(t *testing.T) {
 }
 
 func TestCallRejectsMessageSendDeliveryModeOverride(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	c.mu.Lock()
 	c.state = StateConnected
@@ -717,7 +726,7 @@ func TestAuthFlowEmptyDeviceIDPersistsInstanceState(t *testing.T) {
 	}
 }
 func TestNormalizeConnectParamsIncludesSlotAndDeliveryMode(t *testing.T) {
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
@@ -757,11 +766,11 @@ func TestGroupCallInjectsEmptyDeviceIDValue(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{"access_token": "tok", "gateway": wsURL, "slot_id": "slot-a"}, nil); err != nil {
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{"access_token": "tok", "gateway": wsURL, "slot_id": "slot-a"}, nil); err != nil {
 		t.Fatalf("Connect 失败: %v", err)
 	}
 	c.deviceID = ""
@@ -795,14 +804,14 @@ func TestConnectIncludesDeviceSlotAndDeliveryMode(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token":    "tok",
 		"gateway":         wsURL,
 		"slot_id":         "slot-a",
@@ -863,14 +872,14 @@ func TestCallInjectsMessageSlotContext(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 		"slot_id":      "slot-a",
@@ -950,12 +959,12 @@ func TestPullEmptyResultAppliesRetentionFloor(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 		"slot_id":      "slot-a",
@@ -1021,12 +1030,12 @@ func TestP2PGapFillEmptyResultAcksRetentionFloor(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 		"slot_id":      "slot-a",
@@ -1074,12 +1083,12 @@ func TestGroupGapFillEmptyResultAcksRetentionFloor(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 		"slot_id":      "slot-a",
@@ -1129,12 +1138,12 @@ func TestOnRawGroupChangedTriggersGroupEventGapFill(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 		"slot_id":      "slot-a",
@@ -1248,12 +1257,12 @@ func TestGroupEventGapFillAcksFinalContiguousAfterPublish(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 		"slot_id":      "slot-a",
@@ -1303,14 +1312,14 @@ func TestCallDoesNotForwardMessageSendDeliveryMode(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token":    "tok",
 		"gateway":         wsURL,
 		"delivery_mode":   "queue",
@@ -1352,12 +1361,12 @@ func TestCallNormalizesOutboundMessagePayload(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 	}, nil); err != nil {
@@ -1416,14 +1425,14 @@ func TestCallDoesNotForwardPlaintextMessageProtectedHeaders(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 	}, nil); err != nil {
@@ -1472,12 +1481,12 @@ func TestCallPlaintextMessageThoughtPutPassesThrough(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 	}, nil); err != nil {
@@ -1528,12 +1537,12 @@ func TestCallPlaintextGroupSendPreservesProtectedHeaders(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 	}, nil); err != nil {
@@ -1583,14 +1592,14 @@ func TestCallRejectsMessageSlotContextOverride(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx, map[string]any{
+	if err := connectWithTestAuth(t, c, ctx, map[string]any{
 		"access_token": "tok",
 		"gateway":      wsURL,
 		"slot_id":      "slot-a",
@@ -1622,19 +1631,19 @@ func TestCallRejectsMessageSlotContextOverride(t *testing.T) {
 
 // TestCloseIdleClient 验证关闭空闲客户端
 func TestCloseIdleClient(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	err := c.Close()
 	if err != nil {
 		t.Errorf("关闭空闲客户端不应报错: %v", err)
 	}
-	if c.State() != StateClosed {
+	if c.State() != ConnStateClosed {
 		t.Errorf("关闭后状态应为 closed: %s", c.State())
 	}
 }
 
 // TestCloseIdempotent 验证重复关闭不报错
 func TestCloseIdempotent(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	_ = c.Close()
 	err := c.Close()
 	if err != nil {
@@ -1645,21 +1654,21 @@ func TestCloseIdempotent(t *testing.T) {
 // ── ISSUE-GO-005: Disconnect / Logout 测试 ──────────────────
 
 func TestDisconnectFromIdleIsNoop(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// idle 状态下 Disconnect 应无错误返回
 	if err := c.Disconnect(); err != nil {
 		t.Fatalf("idle 状态 Disconnect 不应报错: %v", err)
 	}
-	// 状态应保持 idle（未连接过，无需变为 disconnected）
-	if c.State() != StateIdle {
-		t.Fatalf("idle 状态 Disconnect 后应保持 idle，实际: %s", c.State())
+	// 公开状态应保持 no_identity（未连接过，无需变为 standby）
+	if c.State() != ConnStateNoIdentity {
+		t.Fatalf("no_identity 状态 Disconnect 后应保持 no_identity，实际: %s", c.State())
 	}
 }
 
 func TestDisconnectSetsStateDisconnected(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// 模拟已连接状态
@@ -1670,14 +1679,14 @@ func TestDisconnectSetsStateDisconnected(t *testing.T) {
 	if err := c.Disconnect(); err != nil {
 		t.Fatalf("Disconnect 不应报错: %v", err)
 	}
-	if c.State() != StateDisconnected {
-		t.Fatalf("Disconnect 后状态应为 disconnected，实际: %s", c.State())
+	if c.State() != ConnStateNoIdentity {
+		t.Fatalf("无身份模拟连接 Disconnect 后公开状态应为 no_identity，实际: %s", c.State())
 	}
 }
 
 func TestLogoutClearsTokens(t *testing.T) {
 	dir := t.TempDir()
-	c := NewClient(map[string]any{"aun_path": dir})
+	c := newClient(map[string]any{"aun_path": dir})
 	defer func() { _ = c.Close() }()
 
 	// 设置身份和 token
@@ -1700,7 +1709,7 @@ func TestLogoutClearsTokens(t *testing.T) {
 	}
 
 	// 状态应为 closed
-	if c.State() != StateClosed {
+	if c.State() != ConnStateClosed {
 		t.Fatalf("Logout 后状态应为 closed，实际: %s", c.State())
 	}
 
@@ -1724,7 +1733,7 @@ func TestLogoutClearsTokens(t *testing.T) {
 // TestOnEventSubscription 验证通过客户端订阅事件
 // ISSUE-SDK-GO-006: Publish 异步化后需等待 handler 完成
 func TestOnEventSubscription(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 	var received atomic.Value
 	sub := c.On("test.event", func(payload any) {
@@ -1743,7 +1752,7 @@ func TestOnEventSubscription(t *testing.T) {
 
 // TestOff 验证 Off/Unsubscribe 取消事件订阅
 func TestOff(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	var count atomic.Int32
@@ -1773,7 +1782,7 @@ func TestOff(t *testing.T) {
 }
 
 func TestOnReregisterSubscriptionUsesActualPublishDispatcher(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	dispatcher := c.events
@@ -1810,7 +1819,7 @@ func TestOnReregisterSubscriptionUsesActualPublishDispatcher(t *testing.T) {
 
 // TestClientGroupE2EEAlwaysEnabled 验证群组 E2EE 是必备能力，不可关闭
 func TestClientGroupE2EEAlwaysEnabled(t *testing.T) {
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path":   t.TempDir(),
 		"group_e2ee": false, // 尝试关闭应被忽略
 	})
@@ -1823,7 +1832,7 @@ func TestClientGroupE2EEAlwaysEnabled(t *testing.T) {
 // TestClientVerifySSLConfig 验证 SSL 验证配置传递
 func TestClientVerifySSLConfig(t *testing.T) {
 	t.Setenv("AUN_ENV", "development")
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
@@ -1870,7 +1879,7 @@ func TestOnRawGroupChanged_MemberDoesNotRotateEpoch(t *testing.T) {
 	})
 	defer closeServer()
 
-	c := NewClient(map[string]any{
+	c := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	defer func() { _ = c.Close() }()
@@ -1902,7 +1911,7 @@ func TestOnRawGroupChanged_MemberDoesNotRotateEpoch(t *testing.T) {
 }
 
 func TestThoughtSelectorValidation(t *testing.T) {
-	c := NewClient(nil)
+	c := newClient(nil)
 	valid := map[string]any{
 		"to":      "bob.example.com",
 		"context": map[string]any{"type": "run", "id": "run-1"},
@@ -1966,7 +1975,7 @@ func TestGroupDispatchModeDefaultsToBroadcast(t *testing.T) {
 // TestPushedSeqsNoDuplicateOnGapFill 验证：推送路径已分发的 seq，
 // 补洞路径不得重复投递（功能正确性测试）。
 func TestPushedSeqsNoDuplicateOnGapFill(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ns := "p2p:alice.example.com"
@@ -2020,7 +2029,7 @@ func TestPushedSeqsNoDuplicateOnGapFill(t *testing.T) {
 // TestPushedSeqsGroupNoDuplicateOnGapFill 验证：群消息推送路径已分发的 seq，
 // 补洞路径不得重复投递（群消息功能正确性测试）。
 func TestPushedSeqsGroupNoDuplicateOnGapFill(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	groupID := "g-test.example.com"
@@ -2071,7 +2080,7 @@ func TestPushedSeqsGroupNoDuplicateOnGapFill(t *testing.T) {
 // 完成 pushedSeqs 预标记，否则补洞路径可能在预标记前读取到空 map 而重复投递。
 // 此测试通过 markPushedSeq 方法验证预标记的原子性。
 func TestPushedSeqsPreMarkBeforeGapFill(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ns := "p2p:premark.example.com"
@@ -2117,7 +2126,7 @@ func TestPushedSeqsPreMarkBeforeGapFill(t *testing.T) {
 // 修复后通过锁内逐条查询避免锁外持有 map 引用；在支持 -race 的环境下应干净通过。
 // 注：Windows 环境无 gcc，-race 不可用；此测试作为逻辑正确性验证。
 func TestPushedSeqsConcurrentMarkAndRead(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	ns := "p2p:concurrent.example.com"
@@ -2163,7 +2172,7 @@ func TestPushedSeqsConcurrentMarkAndRead(t *testing.T) {
 
 func makeDisconnectClient(t *testing.T) *AUNClient {
 	t.Helper()
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	c.mu.Lock()
 	c.state = StateConnected
 	c.sessionOptions = map[string]any{

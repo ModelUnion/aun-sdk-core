@@ -99,7 +99,8 @@ async function installP0Helpers(page: any): Promise<void> {
       const client = new AUN.AUNClient({
         instanceId,
         issuer,
-      }, true);
+        debug: true,
+      });
       // 禁用 forward secrecy 以简化测试
       if (client._configModel) {
         client._configModel.requireForwardSecrecy = false;
@@ -110,17 +111,8 @@ async function installP0Helpers(page: any): Promise<void> {
     /**
      * 确保 AID 已创建、认证并连接。
      */
-    const ensureConnected = async (client: any, aid: string): Promise<void> => {
-      const gatewayDiscoveryAid = `gateway.${issuer}`;
-      const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
-      (client as any)._gatewayUrl = gateway;
-      try {
-        await client.auth.registerAid({ aid });
-      } catch {
-        // 已存在则忽略
-      }
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
     /** 生成短唯一 ID */

@@ -36,6 +36,7 @@ import {
 } from './types.js';
 
 import type { ModuleLogger } from './logger.js';
+import { VERSION as AUN_SDK_VERSION } from './version.js';
 
 const _noopLogger: ModuleLogger = {
   error: () => {},
@@ -45,7 +46,6 @@ const _noopLogger: ModuleLogger = {
 };
 
 const AUN_SDK_LANG = 'typescript';
-const AUN_SDK_VERSION = '0.3.6';
 
 // ── 签名验证辅助 ──────────────────────────────────────────────
 

@@ -5,6 +5,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import { URL } from 'node:url';
 import { AUNClient } from '../client.js';
+import { AIDStore } from '../aid-store.js';
 import { certificateSha256Fingerprint } from '../crypto.js';
 import type { JsonObject, RpcParams } from '../types.js';
 
@@ -122,7 +123,7 @@ class CrossSdkTsAgent {
       aun_path: this.aunPath,
       requireForwardSecrecy: false,
       debug: this.debug,
-    }, this.debug);
+    });
     const internal = this.client as unknown as ClientInternals;
     if (internal._configModel) internal._configModel.requireForwardSecrecy = false;
     internal._testSlotId = this.slotId;
@@ -156,23 +157,34 @@ class CrossSdkTsAgent {
 
   async ensureConnected(): Promise<void> {
     const internal = this.client as unknown as ClientInternals;
-    if (this.gatewayUrl) {
-      internal._gatewayUrl = this.gatewayUrl;
-    } else {
-      const authAny = this.client.auth as unknown as { _resolveGateway: (aid?: string) => Promise<string> };
-      internal._gatewayUrl = await authAny._resolveGateway(this.gatewayAid);
-    }
+    if (this.gatewayUrl) internal._gatewayUrl = this.gatewayUrl;
+    const store = new AIDStore({
+      aunPath: this.aunPath,
+      encryptionSeed: '',
+      slotId: this.slotId,
+      debug: this.debug,
+    });
     try {
-      await this.client.auth.registerAid({ aid: this.aid });
+      const registered = await store.register(this.aid);
+      if (!registered.ok) {
+        const loaded = store.load(this.aid);
+        if (!loaded.ok) {
+          throw new Error(`${registered.error.code}: ${registered.error.message}`);
+        }
+      }
     } catch (err) {
       const localIdentity = internal._auth?.loadIdentityOrNone?.(this.aid);
       if (!localIdentity) {
         throw new Error(`registerAid failed and no local identity exists: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    const auth = await this.client.auth.authenticate({ aid: this.aid });
+    const loaded = store.load(this.aid);
+    if (!loaded.ok) {
+      throw new Error(`load identity failed: ${loaded.error.code}: ${loaded.error.message}`);
+    }
+    this.client.loadIdentity(loaded.data.aid);
     const params: RpcParams = {
-      ...(auth as RpcParams),
+      ...(this.gatewayUrl ? { gateway: this.gatewayUrl } : {}),
       slot_id: this.slotId,
       auto_reconnect: envBool('AUN_TEST_AUTO_RECONNECT', false),
       background_sync: true,
@@ -264,10 +276,10 @@ class CrossSdkTsAgent {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     try {
       if (req.method === 'GET' && url.pathname === '/health') {
-        const state = textOf((this.client as unknown as ClientInternals)._state ?? '');
+        const state = textOf(this.client.state ?? (this.client as unknown as ClientInternals)._state ?? '');
         sendJson(res, this.startupError ? 503 : 200, {
           ok: !this.startupError,
-          agent_ready: this.ready && state === 'connected',
+          agent_ready: this.ready && (state === 'ready' || state === 'connected'),
           state,
           aid: this.aid,
           language: this.language,

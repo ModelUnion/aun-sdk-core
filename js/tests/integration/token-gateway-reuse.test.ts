@@ -26,6 +26,7 @@ import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
 import type { IdentityRecord } from '../../src/types.js';
+import { loadIdentityFromStore, registerAndLoadIdentity } from '../test-support.js';
 
 const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
@@ -129,8 +130,8 @@ describe('Token + gateway_url 复用集成测试', () => {
     const client = makeClient();
     clients.push(client);
 
-    await client.auth.registerAid({ aid });
-    const result = await client.auth.authenticate({ aid });
+    await registerAndLoadIdentity(client, aid);
+    const result = await client.authenticate();
 
     expect(result.access_token).toBeTruthy();
     expect(result.refresh_token).toBeTruthy();
@@ -143,7 +144,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     expect(identity?.refresh_token).toBeTruthy();
 
     // 验证 keystore 里持久化了 gateway_url
-    const cachedGw = await (client.auth as any)._loadCachedGatewayUrl(aid);
+    const cachedGw = await (client as any)._keystore.getMetadata(aid, 'gateway_url');
     expect(cachedGw).toBeTruthy();
     expect(String(cachedGw)).toMatch(/^wss?:\/\//);
   }, 30000);
@@ -158,8 +159,8 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次：完整流程
     const client1 = makeClient();
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    const first = await client1.auth.authenticate({ aid });
+    await registerAndLoadIdentity(client1, aid);
+    const first = await client1.authenticate();
     const firstToken = String(first.access_token ?? '');
     const firstGateway = String(first.gateway ?? '');
     expect(firstToken).toBeTruthy();
@@ -169,12 +170,13 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第二次：新 client 复用同一 IndexedDB 数据库（模拟 CLI 重启）
     const client2 = makeClient();
     clients.push(client2);
+    await loadIdentityFromStore(client2, aid);
 
     // 拦截 _login（不应被调用）+ discovery（不应被调用）
     const loginSpy = vi.spyOn((client2 as any)._auth, '_login');
     const discoverSpy = vi.spyOn((client2 as any)._discovery, 'discover');
 
-    const second = await client2.auth.authenticate({ aid });
+    const second = await client2.authenticate();
 
     // 验证 token 一致（说明复用，没重新 login）
     expect(second.access_token).toBe(firstToken);
@@ -199,17 +201,17 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次创建 + authenticate
     const client1 = makeClient();
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    await client1.auth.authenticate({ aid });
+    await registerAndLoadIdentity(client1, aid);
+    await client1.authenticate();
     await client1.close();
 
     // 第二次：完全重新 new client，复用 keystore，直接 connect
     const client2 = makeClient();
     clients.push(client2);
-    const auth = await client2.auth.authenticate({ aid });
-    await client2.connect(auth, { auto_reconnect: false });
+    await loadIdentityFromStore(client2, aid);
+    await client2.connect({ auto_reconnect: false });
 
-    expect(client2.state).toBe('connected');
+    expect(client2.state).toBe('ready');
 
     const pingResult = await client2.call('meta.ping') as Record<string, unknown>;
     expect(pingResult).toBeTypeOf('object');
@@ -225,8 +227,8 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次完整 authenticate
     const client1 = makeClient();
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    const first = await client1.auth.authenticate({ aid });
+    await registerAndLoadIdentity(client1, aid);
+    const first = await client1.authenticate();
     const firstToken = String(first.access_token ?? '');
     expect(firstToken).toBeTruthy();
     await client1.close();
@@ -246,9 +248,10 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第二次：authenticate 应走完整 _login（cached token 已过期）
     const client2 = makeClient();
     clients.push(client2);
+    await loadIdentityFromStore(client2, aid);
     const loginSpy = vi.spyOn((client2 as any)._auth, '_login');
 
-    const second = await client2.auth.authenticate({ aid });
+    const second = await client2.authenticate();
 
     // 验证 _login 被调用了
     expect(loginSpy).toHaveBeenCalled();

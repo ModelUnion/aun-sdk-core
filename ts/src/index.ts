@@ -4,10 +4,13 @@
  * 包入口：统一导出所有公开 API。
  */
 
-export const VERSION = '0.3.6';
+export { VERSION } from './version.js';
 
 // ── 主客户端 ─────────────────────────────────────────────────
-export { AUNClient } from './client.js';
+export { AUNClient, type AUNClientOptions } from './client.js';
+export { AID, type VerifyResult } from './aid.js';
+export { AIDStore, type AIDInfo, type ResolveOpts } from './aid-store.js';
+export { type Result, type ErrorInfo, resultOk, resultErr } from './result.js';
 
 // ── 配置 ─────────────────────────────────────────────────────
 export { getDeviceId, type AUNConfig, defaultConfig, configFromMap } from './config.js';
@@ -44,6 +47,7 @@ export { EventDispatcher, Subscription, type EventHandler } from './events.js';
 
 // ── 类型 ─────────────────────────────────────────────────────
 export {
+  ConnectionState,
   type JsonValue,
   type JsonObject,
   type RpcParams,
@@ -83,8 +87,6 @@ export { GatewayDiscovery } from './discovery.js';
 
 // ── 认证流程 ─────────────────────────────────────────────────
 export { AuthFlow } from './auth.js';
-export { CustodyNamespace } from './namespaces/custody.js';
-export { MetaNamespace } from './namespaces/meta.js';
 
 // ── E2EE ─────────────────────────────────────────────────────
 export { ProtectedHeaders } from './protected-headers.js';

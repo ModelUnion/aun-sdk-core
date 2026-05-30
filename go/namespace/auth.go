@@ -850,7 +850,7 @@ func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (conten
 			return "", retryErr
 		}
 		if retryResp.StatusCode == http.StatusNotFound {
-			return "", fmt.Errorf("agent.md not found for aid: %s", targetAID)
+			return "", fmt.Errorf("AGENTMD_NOT_FOUND: agent.md not found for aid: %s", targetAID)
 		}
 		if retryResp.StatusCode < 200 || retryResp.StatusCode >= 300 {
 			message := strings.TrimSpace(string(retryBody))
@@ -867,7 +867,7 @@ func (a *AuthNamespace) DownloadAgentMD(ctx context.Context, aid string) (conten
 		return "", err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("agent.md not found for aid: %s", targetAID)
+		return "", fmt.Errorf("AGENTMD_NOT_FOUND: agent.md not found for aid: %s", targetAID)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message := strings.TrimSpace(string(body))

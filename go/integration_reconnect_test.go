@@ -54,15 +54,8 @@ func TestIntegration_ReconnectBasicDisconnectReconnect(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	// 重新认证
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("重新认证失败: %v", err)
-	}
-	t.Logf("状态: 重新认证成功")
-
 	// 重新连接
-	if err := client.Connect(ctx, authResult, nil); err != nil {
+	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("重新连接失败: %v", err)
 	}
 	t.Logf("状态: 重新连接成功")
@@ -145,12 +138,8 @@ func TestIntegration_ReconnectMessageAfterReconnect(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	// Alice 重新认证并连接
-	authResult, err := alice.Auth.Authenticate(ctx, map[string]any{"aid": aliceAID})
-	if err != nil {
-		t.Fatalf("Alice 重新认证失败: %v", err)
-	}
-	if err := alice.Connect(ctx, authResult, nil); err != nil {
+	// Alice 重新连接（Connect 内部自动完成认证）
+	if err := alice.Connect(ctx); err != nil {
 		t.Fatalf("Alice 重新连接失败: %v", err)
 	}
 	t.Logf("Alice 已重连")
@@ -235,21 +224,14 @@ func TestIntegration_ReconnectMultipleDisconnects(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-		// 重新认证
-		authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-		if err != nil {
-			cancel()
-			t.Fatalf("第 %d 次重新认证失败: %v", i+1, err)
-		}
-
 		// 重新连接
-		if err := client.Connect(ctx, authResult, nil); err != nil {
+		if err := client.Connect(ctx); err != nil {
 			cancel()
 			t.Fatalf("第 %d 次重新连接失败: %v", i+1, err)
 		}
 
 		// 验证 ping
-		_, err = client.Call(ctx, "meta.ping", nil)
+		_, err := client.Call(ctx, "meta.ping", nil)
 		cancel()
 		if err != nil {
 			t.Fatalf("第 %d 次重连后 ping 失败: %v", i+1, err)
@@ -305,11 +287,7 @@ func TestIntegration_ReconnectDisconnectedRPCFails(t *testing.T) {
 	}
 
 	// 重连
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("重新认证失败: %v", err)
-	}
-	if err := client.Connect(ctx, authResult, nil); err != nil {
+	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("重新连接失败: %v", err)
 	}
 	t.Logf("已重连")

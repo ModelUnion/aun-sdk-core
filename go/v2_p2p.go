@@ -198,7 +198,7 @@ func openV2Keystore(aunPath, aid string) (*V2SQLiteStore, error) {
 //   - 若 AID 缺失或 identity 无私钥，跳过（返回 nil）。
 //   - IK = AID 长期密钥，从 identity["private_key_pem"] 解析为 raw scalar (32B P-256) + DER 公钥。
 //   - 调用 V2Session.EnsureKeys 加载或生成 SPK；EnsureRegistered 上传 message.v2.put_peer_pk。
-func (c *AUNClient) InitV2Session(ctx context.Context) error {
+func (c *AUNClient) initV2Session(ctx context.Context) error {
 	c.mu.RLock()
 	aid := c.aid
 	identity := c.identity
@@ -666,7 +666,7 @@ func (c *AUNClient) resolveV2SenderIKPending(fromAID, senderDeviceID, groupID, f
 //   - 优先使用 bootstrap 缓存（TTL = v2BootstrapTTL）。
 //   - 缓存命中则直接发送；命中失败时刷新缓存重试 1 次。
 //   - 同时携带 audit_recipients（监管方）和 self_sync（本 AID 其它设备）。
-func (c *AUNClient) SendV2(ctx context.Context, to string, payload map[string]any) (map[string]any, error) {
+func (c *AUNClient) sendV2(ctx context.Context, to string, payload map[string]any) (map[string]any, error) {
 	return c.SendV2WithOpts(ctx, to, payload, e2ee.EncryptOptions{})
 }
 
@@ -872,7 +872,7 @@ func (c *AUNClient) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, m
 //
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（对齐 Python pull_v2）。
 // limit=0 时默认 50。
-func (c *AUNClient) PullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
+func (c *AUNClient) pullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
 	return c.pullV2WithForce(ctx, afterSeq, limit, false)
 }
 
@@ -923,23 +923,15 @@ func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit i
 	if ns != "" {
 		contigBefore = c.seqTracker.GetContiguousSeq(ns)
 	}
-	firstSeq := int64(0)
 	maxSeq := int64(0)
 	for _, msg := range messages {
 		seq := toInt64(msg["seq"])
 		if seq <= 0 {
 			continue
 		}
-		if firstSeq == 0 {
-			firstSeq = seq
-		}
 		if seq > maxSeq {
 			maxSeq = seq
 		}
-	}
-	if ns != "" && firstSeq > 0 && int(firstSeq) > contigBefore {
-		c.seqTracker.ForceContiguousSeq(ns, int(firstSeq))
-		c.logE2.Debug("message.v2.pull force contiguous first_seq: ns=%s previous=%d first_seq=%d", ns, contigBefore, firstSeq)
 	}
 
 	for _, msg := range messages {
@@ -1002,7 +994,7 @@ func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit i
 // AckV2 确认 V2 消息已消费 + 自检销毁旧 SPK。
 //
 // upToSeq=0 时使用本地 SeqTracker 的 contiguous_seq。返回 {"acked": int64} 兜底。
-func (c *AUNClient) AckV2(ctx context.Context, upToSeq int64) (map[string]any, error) {
+func (c *AUNClient) ackV2(ctx context.Context, upToSeq int64) (map[string]any, error) {
 	state := c.v2GetState()
 
 	c.mu.RLock()
@@ -1164,7 +1156,7 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 		}
 		attachV2EnvelopeMetadata(event, e2eeMeta)
 		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
-		c.events.Publish(undecryptableEvent, event)
+		c.publishAppEventSync(undecryptableEvent, event)
 		return nil
 	}
 	c.logE2.Debug("V2 decrypt key lookup ok: seq=%v group=%s ik_len=%d spk_len=%d", msg["seq"], valueOrDefault(groupIDForKeys, "<p2p>"), len(ikPriv), len(spkPriv))
@@ -1198,7 +1190,7 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 		}
 		attachV2EnvelopeMetadata(event, e2eeMeta)
 		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
-		c.events.Publish(undecryptableEvent, event)
+		c.publishAppEventSync(undecryptableEvent, event)
 		return nil
 	}
 
@@ -1226,7 +1218,7 @@ func (c *AUNClient) decryptV2MessageWithPending(ctx context.Context, state *v2P2
 		}
 		attachV2EnvelopeMetadata(event, e2eeMeta)
 		c.logMessageDebug("decrypt-fail", "v2.decrypt", undecryptableEvent, event, nil)
-		c.events.Publish(undecryptableEvent, event)
+		c.publishAppEventSync(undecryptableEvent, event)
 		return nil
 	}
 	if plaintext == nil {

@@ -100,7 +100,8 @@ async function installP0Helpers(page: any): Promise<void> {
       const client = new AUN.AUNClient({
         instanceId,
         issuer,
-      }, true);
+        debug: true,
+      });
       // 禁用 forward secrecy 以简化测试
       if (client._configModel) {
         client._configModel.requireForwardSecrecy = false;
@@ -111,17 +112,8 @@ async function installP0Helpers(page: any): Promise<void> {
     /**
      * 确保 AID 已创建、认证并连接。
      */
-    const ensureConnected = async (client: any, aid: string): Promise<void> => {
-      const gatewayDiscoveryAid = `gateway.${issuer}`;
-      const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
-      (client as any)._gatewayUrl = gateway;
-      try {
-        await client.auth.registerAid({ aid });
-      } catch {
-        // 已存在则忽略
-      }
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
     w.__aunP0 = { sleep, makeAndConnect, ensureConnected };
@@ -140,7 +132,7 @@ test.describe('P0-01: 网关健康检查（浏览器）', () => {
   test('正常健康检查 — 真实 Gateway 应返回 true', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const AUN = (window as any).AUN;
-      const client = new AUN.AUNClient({ instanceId: 'p0-01-health' }, true);
+      const client = new AUN.AUNClient({ instanceId: 'p0-01-health', debug: true });
       try {
         const ok = await client.checkGatewayHealth(`https://gateway.${iss}`, 10000);
         return { ok, error: null };
@@ -157,7 +149,7 @@ test.describe('P0-01: 网关健康检查（浏览器）', () => {
   test('超时 — 不可达地址应返回 false', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const AUN = (window as any).AUN;
-      const client = new AUN.AUNClient({ instanceId: 'p0-01-timeout' }, true);
+      const client = new AUN.AUNClient({ instanceId: 'p0-01-timeout', debug: true });
       try {
         const start = Date.now();
         const ok = await client.checkGatewayHealth('https://192.0.2.1:9999', 2000);
@@ -186,14 +178,12 @@ test.describe('P0-02: AID 创建失败路径（浏览器）', () => {
   test('空 AID 应被拒绝', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const AUN = (window as any).AUN;
-      const client = new AUN.AUNClient({ instanceId: 'p0-02-empty' }, true);
-      const gateway = `https://gateway.${iss}`;
-      (client as any)._gatewayUrl = gateway;
+      const helpers = (window as any).AUN_TEST_HELPERS;
+      const client = new AUN.AUNClient({ instanceId: 'p0-02-empty', debug: true });
       try {
-        await client.auth.registerAid({ aid: '' });
-        return { rejected: false, error: null };
-      } catch (e: any) {
-        return { rejected: true, error: e.message };
+        const store = helpers.createStore(client);
+        const result = await store.register('');
+        return { rejected: !result.ok, error: result.ok ? null : result.error.message };
       } finally {
         await client.close();
       }
@@ -207,21 +197,18 @@ test.describe('P0-02: AID 创建失败路径（浏览器）', () => {
       const AUN = (window as any).AUN;
       const rid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
       const aid = `p0dup${rid}.${iss}`;
-      const client1 = new AUN.AUNClient({ instanceId: 'p0-02-dup1' }, true);
-      const client2 = new AUN.AUNClient({ instanceId: 'p0-02-dup2' }, true);
-      const gatewayDiscoveryAid = `gateway.${iss}`;
-      const gateway = await client1.auth._resolveGateway(gatewayDiscoveryAid);
-      (client1 as any)._gatewayUrl = gateway;
-      (client2 as any)._gatewayUrl = gateway;
+      const client1 = new AUN.AUNClient({ instanceId: 'p0-02-dup1', debug: true });
+      const client2 = new AUN.AUNClient({ instanceId: 'p0-02-dup2', debug: true });
+      const helpers = (window as any).AUN_TEST_HELPERS;
 
       try {
-        await client1.auth.registerAid({ aid });
-        try {
-          await client2.auth.registerAid({ aid });
+        const first = await helpers.createStore(client1).register(aid);
+        if (!first.ok) return { behavior: 'first_failed', error: first.error.message };
+        const second = await helpers.createStore(client2).register(aid);
+        if (second.ok) {
           return { behavior: 'idempotent' };
-        } catch (e: any) {
-          return { behavior: 'error', error: e.message };
         }
+        return { behavior: 'error', error: second.error.message };
       } catch (e: any) {
         return { behavior: 'first_failed', error: e.message };
       } finally {
@@ -487,18 +474,15 @@ test.describe('P0-04: Login 重放攻击（浏览器）', () => {
 
       const client = await makeAndConnect(`p0-04-rpl-${rid}`);
       try {
-        const gatewayDiscoveryAid = `gateway.${iss}`;
-        const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
-        (client as any)._gatewayUrl = gateway;
+        const helpers = (window as any).AUN_TEST_HELPERS;
+        await helpers.registerAndLoadIdentity(client, aid);
 
-        await client.auth.registerAid({ aid });
-
-        const auth1 = await client.auth.authenticate({ aid });
+        const auth1 = await client.authenticate();
         if (!auth1?.access_token) {
           return { error: '首次认证未返回 access_token' };
         }
 
-        const auth2 = await client.auth.authenticate({ aid });
+        const auth2 = await client.authenticate();
         if (!auth2?.access_token) {
           return { error: '第二次认证未返回 access_token' };
         }
@@ -636,8 +620,7 @@ test.describe('P0-08: 重连中补洞（浏览器）', () => {
 
         // 清空收集，重连
         received.length = 0;
-        const auth = await bob.auth.authenticate({ aid: bobAid });
-        await bob.connect(auth);
+        await bob.connect();
 
         // 等待补洞
         const timeout = new Promise<void>((_, reject) =>
@@ -681,20 +664,17 @@ test.describe('P0-03: Login 过期挑战（浏览器）', () => {
 
       const client = await makeAndConnect(`p0-03-exp-${rid}`);
       try {
-        const gatewayDiscoveryAid = `gateway.${iss}`;
-        const gateway = await client.auth._resolveGateway(gatewayDiscoveryAid);
-        (client as any)._gatewayUrl = gateway;
+        const helpers = (window as any).AUN_TEST_HELPERS;
+        await helpers.registerAndLoadIdentity(client, aid);
 
-        await client.auth.registerAid({ aid });
-
-        const auth1 = await client.auth.authenticate({ aid });
+        const auth1 = await client.authenticate();
         if (!auth1?.access_token) {
           return { error: '首次认证未返回 access_token' };
         }
 
         await sleep(2000);
 
-        const auth2 = await client.auth.authenticate({ aid });
+        const auth2 = await client.authenticate();
         if (!auth2?.access_token) {
           return { error: '第二次认证未返回 access_token' };
         }
@@ -736,11 +716,12 @@ test.describe('P0-05: Token 并发刷新（浏览器）', () => {
 
       const client = await makeAndConnect(`p0-05-tkn-${rid}`);
       try {
-        await ensureConnected(client, aid);
+        const helpers = (window as any).AUN_TEST_HELPERS;
+        await helpers.registerAndLoadIdentity(client, aid);
 
         // 并发发起 5 个 authenticate
         const promises = Array.from({ length: 5 }, () =>
-          client.auth.authenticate({ aid }).catch((e: Error) => e),
+          client.authenticate().catch((e: Error) => e),
         );
         const results = await Promise.all(promises);
 
@@ -755,7 +736,7 @@ test.describe('P0-05: Token 并发刷新（浏览器）', () => {
         await sleep(500);
         let cleanupOk = false;
         try {
-          const authAfter = await client.auth.authenticate({ aid });
+          const authAfter = await client.authenticate();
           cleanupOk = !!authAfter?.access_token;
         } catch {
           cleanupOk = false;
@@ -967,8 +948,7 @@ test.describe('P0-14: 断线后 RPC + 重连恢复（浏览器）', () => {
         }
 
         // 重连
-        const auth = await client.auth.authenticate({ aid });
-        await client.connect(auth);
+        await client.connect();
 
         // 重连后 RPC — 应恢复
         try {

@@ -25,11 +25,11 @@ import {
   PROTECTED_HEADERS_DOMAIN,
   PROTECTED_CONTEXT_DOMAIN,
 } from './metadata-auth';
+import { VERSION as E2EE_SDK_VERSION } from '../../version';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const E2EE_SDK_LANG = 'javascript';
-const E2EE_SDK_VERSION = '0.3.6';
 
 async function sha256(data: Uint8Array): Promise<Uint8Array> {
   const buf = await crypto.subtle.digest('SHA-256', data.slice().buffer);

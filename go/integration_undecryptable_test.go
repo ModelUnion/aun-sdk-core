@@ -56,7 +56,7 @@ func TestEncryptedPushPayloadDetection(t *testing.T) {
 // TestUndecryptableEventOnly 验证解密失败时只发布 message.undecryptable 事件，不泄漏密文 payload
 func TestUndecryptableEventOnly(t *testing.T) {
 	tmpDir := t.TempDir()
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": tmpDir,
 	})
 	defer client.Close()
@@ -153,7 +153,7 @@ func TestUndecryptableEventOnly(t *testing.T) {
 // TestPushFillGapNoDuplicateDelivery 验证 pushedSeqs 去重：push 路径 + fill-gap 路径不重复投递同一 seq
 func TestPushFillGapNoDuplicateDelivery(t *testing.T) {
 	tmpDir := t.TempDir()
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": tmpDir,
 	})
 	defer client.Close()
@@ -293,7 +293,7 @@ func TestPushFillGapNoDuplicateDelivery(t *testing.T) {
 // TestGroupUndecryptableEventOnly 验证群消息解密失败时只发布 group.message_undecryptable 事件
 func TestGroupUndecryptableEventOnly(t *testing.T) {
 	tmpDir := t.TempDir()
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": tmpDir,
 	})
 	defer client.Close()

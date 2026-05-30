@@ -28,7 +28,7 @@ from .errors import (
     E2EEGroupDecryptFailedError,
 )
 
-__version__ = "0.3.6"
+from .version import __version__
 
 __all__ = [
     "__version__",

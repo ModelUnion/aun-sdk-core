@@ -13,7 +13,7 @@ import (
 func makeFederationClient(t *testing.T) *AUNClient {
 	t.Helper()
 	t.Setenv("AUN_ENV", "development")
-	client := NewClient(map[string]any{
+	client := newClient(map[string]any{
 		"aun_path": t.TempDir(),
 	})
 	client.configModel.RequireForwardSecrecy = false
@@ -22,21 +22,8 @@ func makeFederationClient(t *testing.T) *AUNClient {
 
 func ensureFederationConnected(t *testing.T, client *AUNClient, aid string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	_, err := client.Auth.CreateAID(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("无法创建双域 AID（federation Docker 环境可能未运行）: %v", err)
-	}
-
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("双域认证失败: %v", err)
-	}
-	if err := client.Connect(ctx, authResult, nil); err != nil {
-		t.Fatalf("双域连接失败: %v", err)
-	}
+	integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
+	integrationConnectLoadedAID(t, client, aid, nil)
 	return aid
 }
 

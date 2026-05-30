@@ -42,7 +42,7 @@ type v2GroupBootstrapEntry struct {
 }
 
 // SendGroupV2 V2 Group 加密发送（推测性：用缓存 bootstrap 直接发，失败刷新重试一次）。
-func (c *AUNClient) SendGroupV2(ctx context.Context, groupID string, payload map[string]any) (map[string]any, error) {
+func (c *AUNClient) sendGroupV2(ctx context.Context, groupID string, payload map[string]any) (map[string]any, error) {
 	return c.SendGroupV2WithOpts(ctx, groupID, payload, e2ee.EncryptOptions{})
 }
 
@@ -242,7 +242,7 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 //
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（ns = "group:" + groupID）。
 // limit<=0 时默认 50。
-func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {
+func (c *AUNClient) pullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
 		return nil, errors.New("V2 session not initialized (not connected?)")
@@ -282,23 +282,15 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 
 	decrypted := make([]map[string]any, 0, len(messages))
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
-	firstSeq := int64(0)
 	maxSeq := int64(0)
 	for _, msg := range messages {
 		seq := toInt64(msg["seq"])
 		if seq <= 0 {
 			continue
 		}
-		if firstSeq == 0 {
-			firstSeq = seq
-		}
 		if seq > maxSeq {
 			maxSeq = seq
 		}
-	}
-	if firstSeq > 0 && int(firstSeq) > contigBefore {
-		c.seqTracker.ForceContiguousSeq(ns, int(firstSeq))
-		c.logE2.Debug("group.v2.pull force contiguous first_seq: group=%s ns=%s previous=%d first_seq=%d", groupID, ns, contigBefore, firstSeq)
 	}
 
 	for _, msg := range messages {
@@ -356,7 +348,7 @@ func (c *AUNClient) PullGroupV2(ctx context.Context, groupID string, afterSeq in
 //
 // upToSeq=0 时使用本地 SeqTracker 的 contiguous_seq（ns = "group:" + groupID）。
 // Group 不触发 PFS SPK 销毁。
-func (c *AUNClient) AckGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {
+func (c *AUNClient) ackGroupV2(ctx context.Context, groupID string, upToSeq int64) (map[string]any, error) {
 	if groupID == "" {
 		return nil, errors.New("ack_group_v2: group_id 不能为空")
 	}

@@ -65,10 +65,8 @@ async function installHelpers(page: any): Promise<void> {
 
     const makeAndConnect = async (aid: string): Promise<any> => {
       const AUN = w.AUN;
-      const client = new AUN.AUNClient({ issuer }, true);
-      try { await client.auth.registerAid({ aid }); } catch {}
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+      const client = new AUN.AUNClient({ issuer, debug: true });
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
       return client;
     };
 

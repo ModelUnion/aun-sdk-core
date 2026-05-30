@@ -159,7 +159,7 @@ export interface KeyStore {
   loadAgentMdCache?(ownerAid: string, targetAid: string): Promise<AgentMdCacheRecord | null>;
   /** 更新本地持久化的某个远端/自身 agent.md 缓存记录 */
   upsertAgentMdCache?(ownerAid: string, targetAid: string, fields: AgentMdCacheUpsert): Promise<AgentMdCacheRecord>;
-  /** 列出指定 AgentMDs 逻辑根目录下已有正文文件对应的 aid */
+  /** 列出指定 AIDs 逻辑根目录下已有正文文件对应的 aid */
   listAgentMdContentAids?(agentMdPath: string): Promise<string[]>;
   /** 保存群组状态快照 */
   saveGroupState?(groupId: string, state: GroupStateRecord): Promise<void>;

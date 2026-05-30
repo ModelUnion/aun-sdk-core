@@ -27,6 +27,7 @@ import * as crypto from 'node:crypto';
 
 import { AUNClient } from '../../src/index.js';
 import type { JsonObject } from '../../src/types.js';
+import { loadIdentityFromStore, registerAndLoadIdentity } from '../test-support.js';
 
 const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
@@ -56,9 +57,8 @@ async function connectLong(
   aid: string,
   slotId = 'main',
 ): Promise<void> {
-  await client.auth.registerAid({ aid });
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await registerAndLoadIdentity(client, aid);
+  await client.connect({
     auto_reconnect: false,
     heartbeat_interval: 30,
     slot_id: slotId,
@@ -70,8 +70,8 @@ async function connectShort(
   aid: string,
   opts: { slot_id?: string; short_ttl_ms?: number } = {},
 ): Promise<void> {
-  const auth = await client.auth.authenticate({ aid });
-  await client.connect(auth, {
+  await loadIdentityFromStore(client, aid);
+  await client.connect({
     connection_kind: 'short',
     auto_reconnect: false,
     slot_id: opts.slot_id ?? 'main',
@@ -379,11 +379,11 @@ describe('长短连接 E2E 测试 — 同身份 (aid, device, slot) 共存', () 
     const cliCrash = makeClient(alicePath);
     clients.push(cliCrash);
     await connectShort(cliCrash, aliceAid, { short_ttl_ms: 2000 });
-    expect(cliCrash.state).toBe('connected');
+    expect(cliCrash.state).toBe('ready');
 
     // 等 ttl 触发
     const evicted = await waitFor(
-      () => cliCrash.state !== 'connected',
+      () => cliCrash.state !== 'ready',
       6000,
     );
     expect(evicted).toBe(true);

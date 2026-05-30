@@ -6,6 +6,37 @@
 
 ---
 
+## 0.4.0 — 2026-05-30
+
+> **破坏性重构版本。** 与 Python SDK 0.4.0 对齐：身份管理剥离为 `AID` / `AIDStore`；删除 `auth` / `custody` / `meta` 公开命名空间；引入 `Result` 与字符串错误码；连接状态机扩展为 9 态。
+
+### Breaking Changes
+- **删除公开命名空间**：移除 `client.auth` / `client.custody` / `client.meta`。身份相关功能迁移到 `AIDStore` 与 `AID`，其余 RPC 走 `client.call()`。
+- **构造函数签名变更**：`constructor(config?, debug?)` → `constructor(aid?: AID, options?: AUNClientOptions)`；移除 `debug` 布尔参数。
+- **初始连接状态变更**：`'idle'` → `'no_identity'`。
+- **目录约定变更**：`{aun_path}/AgentMDs/` → `{aun_path}/AIDs/`。
+
+### Added
+- **`AID` 类**：封装证书 + 可选私钥，提供 `sign` / `verify` / `signAgentMd` / `verifyAgentMd` / `isCertValid` / `isPrivateKeyValid`。
+- **`AIDStore` 类**：离线 `load` / `list` / `exists`，联网 `register` / `resolve` / `fetchAgentMd` / `checkAgentMd` / `diagnose` / `renewCert` / `rekey` / `changeSeed`。
+- **`Result<T>` 类型**：统一结果类型（`{ ok: true; data: T }` 或 `{ ok: false; error: ErrorInfo }`）。
+- **新增错误类**：`NotFoundError` / `IdentityConflictError` / `VersionConflictError` / `ClientSignatureError`。
+- **`ConnectionState` 枚举**：9 态（`NO_IDENTITY` / `STANDBY` / `CONNECTING` / `READY` / `RETRY_BACKOFF` / `RECONNECTING` / `CONNECTION_FAILED` / `CLOSED`）。
+- **实例级 `protected_headers`**：`setProtectedHeaders()` 自动合并到 `message.send` / `group.send` / `*.thought.put`。
+- **重连状态可观测**：`nextRetryAt` / `retryAttempt` / `retryMaxAttempts` / `lastError` / `lastErrorCode` 属性。
+- **客户端属性**：`currentAid` / `hasIdentity` / `canSign` / `canConnect` / `canSend`。
+- **导出**：`VERSION` 常量、`STATE_TO_PUBLIC` 映射表。
+- **keystore 扩展**：新增 `prekeys` / `group_current` / `group_old_epochs` / `e2ee_sessions` 表及相关读写方法；新增字段级加解密（旧 E2EE 互操作）。
+
+### Fixed
+- **agent.md 请求超时**：新增 `fetchWithTimeout()` 防止挂起。
+- **agent.md 下载并发控制**：新增 `AGENT_MD_DOWNLOAD_CONCURRENCY` 限制。
+
+### Removed
+- 删除 `ts/src/namespaces/auth.ts`、`ts/src/namespaces/custody.ts`、`ts/src/namespaces/meta.ts`。
+
+---
+
 ## 0.3.6 — 2026-05-28
 
 ### Added

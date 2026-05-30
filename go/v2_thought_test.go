@@ -87,7 +87,7 @@ func TestV2ThoughtE2EEMetadataPayloadType(t *testing.T) {
 // 与 Python 一致：发送方 V2 send 后调 OnMessageSeq + MarkPublishedSeq；
 // 历史推送/补拉再次见到同一 seq 时被 isPushedSeq 去重。
 func TestSeqTrackerLegacyV2SharedNamespace(t *testing.T) {
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	defer func() { _ = c.Close() }()
 
 	// P2P 命名空间共享：V2 send 推进 contig，历史消息同 seq 被去重

@@ -1,0 +1,548 @@
+/**
+ * AIDStore — AID 管理器，对齐 Python SDK aid_store.py
+ * 持有 keystore 配置，提供 AID 加载/注册/联网管理。
+ */
+
+import * as http from 'node:http';
+import * as https from 'node:https';
+import { X509Certificate, createPrivateKey, createPublicKey } from 'node:crypto';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+import { AID } from './aid.js';
+import * as codes from './error-codes.js';
+import { certCommonName, certTimeError, signBytes, verifySignatureWithCert } from './cert-utils.js';
+import { certFingerprint as _certFingerprint } from './cert-utils.js';
+import { type Result, resultErr, resultOk } from './result.js';
+import { FileKeyStore } from './keystore/file.js';
+import { CryptoProvider } from './crypto.js';
+import { AuthFlow } from './auth.js';
+import { GatewayDiscovery } from './discovery.js';
+import { DnsResilientNet } from './net.js';
+import { AUNLogger } from './logger.js';
+import { getDeviceId, normalizeInstanceId } from './config.js';
+import { IdentityConflictError, ValidationError } from './errors.js';
+
+export interface AIDInfo {
+  aid: string;
+  certNotAfter: Date;
+  certIssuer: string;
+  certFingerprint: string;
+}
+
+export interface ResolveOpts {
+  forceRefresh?: boolean;
+  skipAgentMd?: boolean;
+}
+
+function resultError<T>(r: Result<T>): { code: string; message: string } | null {
+  return r.ok ? null : r.error;
+}
+
+function normalizeSlotId(slotId?: string): string {
+  const v = String(slotId ?? 'default').trim();
+  return v || 'default';
+}
+
+/** 发起 HTTP HEAD 请求，返回 [status, headers] */
+function httpHead(url: string, verifySsl: boolean, timeoutMs = 5000): Promise<[number, Record<string, string>]> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const opts: https.RequestOptions = { method: 'HEAD', timeout: timeoutMs };
+    if (!verifySsl) opts.rejectUnauthorized = false;
+    const req = mod.request(url, opts, (res) => {
+      res.resume();
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(res.headers)) {
+        if (typeof v === 'string') headers[k] = v;
+        else if (Array.isArray(v)) headers[k] = v[0] ?? '';
+      }
+      resolve([res.statusCode ?? 0, headers]);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`timeout HEAD ${url}`)); });
+    req.end();
+  });
+}
+
+/** 发起 HTTP GET 请求，返回 [text, headers, status] */
+function httpGetText(url: string, verifySsl: boolean, headers?: Record<string, string>, timeoutMs = 30000): Promise<[string, Record<string, string>, number]> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const opts: https.RequestOptions = { timeout: timeoutMs, headers };
+    if (!verifySsl) opts.rejectUnauthorized = false;
+    const req = mod.get(url, opts, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        const respHeaders: Record<string, string> = {};
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (typeof v === 'string') respHeaders[k] = v;
+          else if (Array.isArray(v)) respHeaders[k] = v[0] ?? '';
+        }
+        resolve([Buffer.concat(chunks).toString('utf-8'), respHeaders, res.statusCode ?? 0]);
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`timeout GET ${url}`)); });
+  });
+}
+
+function pkiCertUrl(gatewayUrl: string, aid: string): string {
+  const parsed = new URL(gatewayUrl);
+  const scheme = parsed.protocol === 'wss:' ? 'https:' : 'http:';
+  return `${scheme}//${parsed.host}/pki/cert/${encodeURIComponent(aid)}`;
+}
+
+function agentMdUrl(aid: string, gatewayUrl: string, discoveryPort?: number | null): string {
+  const raw = String(gatewayUrl ?? '').trim().toLowerCase();
+  const scheme = raw.startsWith('ws://') ? 'http' : 'https';
+  let host = String(aid ?? '').trim();
+  if (discoveryPort && !host.includes(':')) host = `${host}:${discoveryPort}`;
+  return `${scheme}://${host}/agent.md`;
+}
+
+export class AIDStore {
+  readonly aunPath: string;
+  private _encryptionSeed: string;
+  readonly deviceId: string;
+  readonly slotId: string;
+
+  private _keystore: FileKeyStore;
+  private _auth: AuthFlow;
+  private _discovery: GatewayDiscovery;
+  private _net: DnsResilientNet;
+  private _log: AUNLogger;
+  private _verifySsl: boolean;
+  private _discoveryPort: number | null;
+  private _gatewayCache: Map<string, string> = new Map();
+  private _agentMdCache: Map<string, Record<string, unknown>> = new Map();
+
+  constructor(opts: {
+    aunPath: string;
+    encryptionSeed: string;
+    deviceId?: string;
+    slotId?: string;
+    verifySsl?: boolean;
+    discoveryPort?: number | null;
+    rootCaPath?: string | null;
+    debug?: boolean;
+  }) {
+    this.aunPath = String(opts.aunPath ?? join(homedir(), '.aun'));
+    this._encryptionSeed = String(opts.encryptionSeed ?? '');
+    this.deviceId = opts.deviceId ? normalizeInstanceId(opts.deviceId, 'deviceId', { allowEmpty: true }) : getDeviceId(this.aunPath);
+    this.slotId = normalizeSlotId(opts.slotId);
+    this._verifySsl = opts.verifySsl ?? false;
+    this._discoveryPort = opts.discoveryPort ?? null;
+
+    this._log = new AUNLogger({ debug: opts.debug ?? false, aunPath: this.aunPath });
+    this._log.bindDeviceId(this.deviceId);
+
+    this._keystore = new FileKeyStore(this.aunPath, {
+      encryptionSeed: this._encryptionSeed || undefined,
+      logger: this._log.for('aun_core.keystore'),
+    });
+
+    this._net = new DnsResilientNet({ verifySsl: this._verifySsl, logger: this._log.for('aun_core.net') });
+    this._discovery = new GatewayDiscovery({ verifySsl: this._verifySsl, logger: this._log.for('aun_core.discovery'), net: this._net });
+
+    this._auth = new AuthFlow({
+      keystore: this._keystore,
+      crypto: new CryptoProvider(),
+      deviceId: this.deviceId,
+      slotId: this.slotId,
+      rootCaPath: opts.rootCaPath ?? null,
+      verifySsl: this._verifySsl,
+      logger: this._log.for('aun_core.auth'),
+      net: this._net,
+    });
+  }
+
+  close(): void {
+    this._keystore.close();
+    const net = this._net as unknown as { close?: () => void };
+    if (typeof net.close === 'function') net.close();
+  }
+
+  // ── 离线方法 ──────────────────────────────────────────────────
+
+  load(aid: string): Result<{ aid: AID }> {
+    const target = String(aid ?? '').trim();
+    const certPem = this._keystore.loadCert(target);
+    if (!certPem) {
+      return resultErr(codes.CERT_NOT_FOUND, `certificate not found for aid: ${target}`);
+    }
+    let cert: X509Certificate;
+    try {
+      cert = new X509Certificate(certPem);
+    } catch (exc) {
+      return resultErr(codes.CERT_PARSE_ERROR, `certificate parse failed for aid: ${target}`, exc);
+    }
+
+    const timeErr = certTimeError(certPem);
+    if (timeErr === 'expired') return resultErr(codes.CERT_EXPIRED, `certificate expired for aid: ${target}`);
+    if (timeErr === 'not_yet_valid') return resultErr(codes.CERT_NOT_YET_VALID, `certificate not yet valid for aid: ${target}`);
+
+    const cn = certCommonName(certPem);
+    if (cn && cn !== target) {
+      return resultErr(codes.CERT_CHAIN_BROKEN, `certificate CN mismatch: expected ${target}, got ${cn}`);
+    }
+
+    const kp = this._keystore.loadKeyPair(target);
+    if (!kp || !kp.private_key_pem) {
+      return resultOk({
+        aid: AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false, deviceId: this.deviceId, slotId: this.slotId }),
+      });
+    }
+
+    const privPem = String(kp.private_key_pem);
+    let privKey: ReturnType<typeof createPrivateKey>;
+    try {
+      privKey = createPrivateKey(privPem);
+    } catch (exc) {
+      return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, `private key parse failed for aid: ${target}`, exc);
+    }
+
+    // 配对自检（对齐 Python aid_store.py:145-150）：
+    // 1) 从私钥导出公钥 DER，与证书公钥 DER 直接比对（不依赖 key.json 的 public_key_der_b64 字段，
+    //    防止该字段缺失时错配私钥蒙混过关）
+    // 2) DER 比对通过后，再做 sign/verify 探针：私钥签名固定 payload，证书公钥验签
+    try {
+      const certPubDer = cert.publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+      const privPubDer = createPublicKey(privKey).export({ type: 'spki', format: 'der' }) as Buffer;
+      if (!privPubDer.equals(certPubDer)) {
+        return resultErr(codes.KEYPAIR_MISMATCH, `private key does not match certificate for aid: ${target}`);
+      }
+      const probe = Buffer.from('aun-aidstore-private-key-self-test', 'utf-8');
+      const signature = signBytes(privPem, probe);
+      if (!verifySignatureWithCert(certPem, signature, probe)) {
+        return resultErr(codes.KEYPAIR_MISMATCH, `keypair self-test failed for aid: ${target}`);
+      }
+    } catch (exc) {
+      return resultErr(codes.KEYPAIR_MISMATCH, `keypair self-test failed for aid: ${target}`, exc);
+    }
+
+    return resultOk({
+      aid: AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: privPem, certValid: true, privateKeyValid: true, deviceId: this.deviceId, slotId: this.slotId }),
+    });
+  }
+
+  list(): Result<{ identities: AIDInfo[] }> {
+    try {
+      const aids = this._keystore.listIdentities?.() ?? [];
+      const identities: AIDInfo[] = [];
+      for (const aid of [...aids].sort()) {
+        const loaded = this.load(aid);
+        if (!loaded.ok || !loaded.data) continue;
+        const item = loaded.data.aid;
+        if (!item.isPrivateKeyValid()) continue;
+        identities.push({
+          aid: item.aid,
+          certNotAfter: item.certNotAfter,
+          certIssuer: item.certIssuer,
+          certFingerprint: item.certFingerprint,
+        });
+      }
+      return resultOk({ identities });
+    } catch (exc) {
+      return resultErr('LIST_IDENTITIES_FAILED', String(exc), exc);
+    }
+  }
+
+  changeSeed(oldSeed: string, newSeed: string): Result<{ changed: boolean; count: number }> {
+    if (!oldSeed.trim()) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'changeSeed requires a non-empty oldSeed');
+    if (!newSeed.trim()) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'changeSeed requires a non-empty newSeed');
+    if (oldSeed === newSeed) return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, 'newSeed must differ from oldSeed');
+    try {
+      const result = this._keystore.changeSeed(oldSeed, newSeed);
+      this._encryptionSeed = newSeed;
+      return resultOk({ changed: true, count: result.migrated ?? 0 });
+    } catch (exc) {
+      return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, String(exc), exc);
+    }
+  }
+
+  // ── 联网方法 ──────────────────────────────────────────────────
+
+  async register(aid: string): Promise<Result<{ registered: true }>> {
+    const target = String(aid ?? '').trim();
+    this._log.for('aun_core.aid_store').debug(`register enter: aid=${target || '-'}`);
+    try {
+      const gatewayUrl = await this._resolveGateway(target);
+      await this._auth.registerAid(gatewayUrl, target);
+      return resultOk({ registered: true as const });
+    } catch (exc) {
+      if (exc instanceof IdentityConflictError) {
+        return resultErr(codes.IDENTITY_CONFLICT, String(exc), exc);
+      }
+      if (exc instanceof ValidationError) {
+        return resultErr(codes.INVALID_AID_FORMAT, String(exc), exc);
+      }
+      const msg = exc instanceof Error ? exc.message : String(exc);
+      if (msg.includes('network') || msg.includes('connect') || msg.includes('timeout')) {
+        return resultErr(codes.NETWORK_ERROR, msg, exc);
+      }
+      return resultErr(codes.SERVER_ERROR, msg, exc);
+    }
+  }
+
+  async exists(aid: string): Promise<Result<{ exists: boolean }>> {
+    const target = String(aid ?? '').trim();
+    try {
+      const gatewayUrl = await this._resolveGateway(target);
+      const url = pkiCertUrl(gatewayUrl, target);
+      const [status] = await httpHead(url, this._verifySsl, 5000);
+      if (status === 200) return resultOk({ exists: true });
+      if (status === 404) return resultOk({ exists: false });
+      return resultErr(codes.NETWORK_ERROR, `unexpected PKI HEAD status ${status}`);
+    } catch (exc) {
+      return resultErr(codes.NETWORK_ERROR, String(exc), exc);
+    }
+  }
+
+  async resolve(aid: string, opts?: ResolveOpts): Promise<Result<Record<string, unknown>>> {
+    const target = String(aid ?? '').trim();
+    const forceRefresh = !!(opts?.forceRefresh);
+    const skipAgentMd = !!(opts?.skipAgentMd);
+    try {
+      let peer: AID;
+      let certFromCache = false;
+      const loaded = this.load(target);
+      if (loaded.ok && loaded.data && !forceRefresh) {
+        peer = loaded.data.aid;
+        certFromCache = true;
+      } else {
+        const gatewayUrl = await this._resolveGateway(target);
+        const certPem = await this._auth.fetchPeerCert(gatewayUrl, target);
+        if (!certPem) return resultErr(codes.CERT_NOT_FOUND, `certificate not found for aid: ${target}`);
+        this._keystore.saveCert(target, certPem);
+        const reloaded = this.load(target);
+        if (!reloaded.ok || !reloaded.data) return reloaded as Result<never>;
+        peer = reloaded.data.aid;
+      }
+      const source = { cert_from_cache: certFromCache, agent_md_fetched: false };
+      if (skipAgentMd) return resultOk({ aid: peer, source });
+      const agentMd = await this.fetchAgentMd(target);
+      if (!agentMd.ok) return agentMd as Result<never>;
+      source.agent_md_fetched = true;
+      return resultOk({ aid: peer, agent_md: agentMd.data, source });
+    } catch (exc) {
+      return resultErr(codes.NETWORK_ERROR, String(exc), exc);
+    }
+  }
+
+  async fetchAgentMd(aid: string): Promise<Result<Record<string, unknown>>> {
+    const target = String(aid ?? '').trim();
+    try {
+      const gatewayUrl = await this._resolveGateway(target);
+      const url = agentMdUrl(target, gatewayUrl, this._discoveryPort);
+      const cached = (this._agentMdCache.get(target) ?? {}) as Record<string, string>;
+      const reqHeaders: Record<string, string> = { Accept: 'text/markdown' };
+      if (cached.etag) reqHeaders['If-None-Match'] = cached.etag;
+      if (cached.last_modified) reqHeaders['If-Modified-Since'] = cached.last_modified;
+
+      let [content, respHeaders, status] = await httpGetText(url, this._verifySsl, reqHeaders, 30000);
+      if (status === 304 && cached.content) {
+        content = String(cached.content);
+      } else if (status === 404) {
+        return resultErr(codes.AGENTMD_NOT_FOUND, `agent.md not found for aid: ${target}`);
+      } else if (status < 200 || status >= 300) {
+        return resultErr(codes.NETWORK_ERROR, `download agent.md failed: HTTP ${status}`);
+      }
+
+      // 加载对端证书用于验签
+      let peer: AID;
+      const loaded = this.load(target);
+      if (loaded.ok && loaded.data) {
+        peer = loaded.data.aid;
+      } else {
+        const resolved = await this.resolve(target, { skipAgentMd: true });
+        if (!resolved.ok || !resolved.data) return resolved as Result<never>;
+        peer = resolved.data.aid as AID;
+      }
+
+      const verified = peer.verifyAgentMd(content);
+      if (!verified.ok || !verified.data) return verified as Result<never>;
+      const sig = verified.data;
+      const statusText = sig.status ?? 'invalid';
+      const verification: Record<string, string> = { status: statusText };
+      if (sig.reason) verification.reason = sig.reason;
+
+      const etag = String(respHeaders['etag'] ?? respHeaders['ETag'] ?? '').trim();
+      const lastModified = String(respHeaders['last-modified'] ?? respHeaders['Last-Modified'] ?? '').trim();
+      this._agentMdCache.set(target, { content, etag, last_modified: lastModified, updated_at: String(Date.now()) });
+
+      return resultOk({ aid: target, content, verification, signature: sig, cert_pem: peer.certPem, certPem: peer.certPem, etag, last_modified: lastModified, status });
+    } catch (exc) {
+      return resultErr(codes.NETWORK_ERROR, String(exc), exc);
+    }
+  }
+
+  async headAgentMd(aid: string): Promise<Result<Record<string, unknown>>> {
+    const target = String(aid ?? '').trim();
+    try {
+      const gatewayUrl = await this._resolveGateway(target);
+      const url = agentMdUrl(target, gatewayUrl, this._discoveryPort);
+      const [status, headers] = await httpHead(url, this._verifySsl, 15000);
+      if (status === 404) return resultErr(codes.AGENTMD_NOT_FOUND, `agent.md not found for aid: ${target}`);
+      if (status < 200 || status >= 300) return resultErr(codes.NETWORK_ERROR, `head agent.md failed: HTTP ${status}`);
+      const etag = String(headers['etag'] ?? headers['ETag'] ?? '').trim();
+      const lastModified = String(headers['last-modified'] ?? headers['Last-Modified'] ?? '').trim();
+      const contentLength = parseInt(String(headers['content-length'] ?? '0'), 10) || 0;
+      const cached = (this._agentMdCache.get(target) ?? {}) as Record<string, unknown>;
+      this._agentMdCache.set(target, { ...cached, etag, last_modified: lastModified, remote_checked_at: Date.now() });
+      return resultOk({ aid: target, found: true, etag, last_modified: lastModified, content_length: contentLength, status });
+    } catch (exc) {
+      return resultErr(codes.NETWORK_ERROR, String(exc), exc);
+    }
+  }
+
+  async checkAgentMd(aid: string, ttlDays = 1): Promise<Result<Record<string, unknown>>> {
+    const target = String(aid ?? '').trim();
+    const cached = (this._agentMdCache.get(target) ?? {}) as Record<string, unknown>;
+    const head = await this.headAgentMd(target);
+    let remote: Record<string, unknown>;
+    if (!head.ok || !head.data) {
+      if (resultError(head)?.code === codes.AGENTMD_NOT_FOUND) {
+        remote = { aid: target, found: false, etag: '', last_modified: '', content_length: 0, status: 404 };
+      } else {
+        return head as Result<never>;
+      }
+    } else {
+      remote = head.data;
+    }
+    const localEtag = String(cached.etag ?? '').trim();
+    const localFound = !!(cached.content);
+    const remoteFound = !!(remote.found);
+    const remoteEtag = String(remote.etag ?? '').trim();
+    const needsUpdate = remoteFound && (!localFound || (!!remoteEtag && remoteEtag !== localEtag));
+    return resultOk({ aid: target, local_found: localFound, remote_found: remoteFound, local_etag: localEtag, remote_etag: remoteEtag, needs_update: needsUpdate, ttl_days: ttlDays });
+  }
+
+  async diagnose(aid: string): Promise<Result<Record<string, unknown>>> {
+    const target = String(aid ?? '').trim();
+    const loaded = this.load(target);
+    const existsResult = await this.exists(target);
+    const remoteError = resultError(existsResult);
+    const remoteRegistered = !!(existsResult.ok && existsResult.data?.exists);
+    const remoteChecked = !!(existsResult.ok && existsResult.data != null);
+
+    let localCert = false;
+    let localPrivateKey = false;
+    let localError: unknown = null;
+    let localAid: AID | null = null;
+    if (loaded.ok && loaded.data) {
+      localAid = loaded.data.aid;
+      localCert = localAid.isCertValid();
+      localPrivateKey = localAid.isPrivateKeyValid();
+    } else {
+      localError = resultError(loaded);
+    }
+
+    const localValid = localCert && localPrivateKey;
+    const suggestions: string[] = [];
+    if (!localValid) suggestions.push('load or register a local identity with a valid private key');
+    if (!remoteRegistered) suggestions.push('register the AID before using it on the network');
+    if (remoteError) suggestions.push(`remote registration check failed: ${remoteError.message}`);
+
+    let status: string;
+    if (localPrivateKey && remoteRegistered) status = 'ready';
+    else if (!localPrivateKey && remoteChecked && !remoteRegistered) status = 'available';
+    else if (remoteRegistered) status = 'registered_remote';
+    else status = 'unknown';
+
+    return resultOk({
+      aid: target, status, local_valid: localValid, localValid: localValid,
+      remote_registered: remoteRegistered, remoteRegistered,
+      suggestions,
+      local: { cert: localCert, private_key: localPrivateKey, error: localError },
+      remote: { checked: remoteChecked, exists: remoteChecked ? remoteRegistered : null, error: remoteError },
+    });
+  }
+
+  async renewCert(aid: string): Promise<Result<Record<string, unknown>>> {
+    const target = String(aid ?? '').trim();
+    const loaded = this.load(target);
+    if (!loaded.ok || !loaded.data || !loaded.data.aid.isPrivateKeyValid()) {
+      return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
+    }
+    try {
+      const gatewayUrl = await this._resolveGateway(target);
+      // 通过 AuthFlow 短连接 RPC 完成续签
+      const aidObj = loaded.data.aid;
+      const clientNonce = new CryptoProvider().newClientNonce();
+      const phase1 = await (this._auth as any)._shortRpc(gatewayUrl, 'auth.aid_login1', {
+        aid: target, cert: aidObj.certPem, client_nonce: clientNonce,
+      });
+      const signResult = aidObj.sign(String(phase1.nonce));
+      if (!signResult.ok || !signResult.data) {
+        return resultErr(codes.CERT_RENEWAL_FAILED, resultError(signResult)?.message ?? 'sign failed');
+      }
+      const response = await (this._auth as any)._shortRpc(gatewayUrl, 'auth.renew_cert', {
+        aid: target, request_id: String(phase1.request_id), nonce: String(phase1.nonce), signature: signResult.data.signature,
+      });
+      const certPem = String(response.cert ?? response.cert_pem ?? '').trim();
+      if (!certPem) return resultErr(codes.CERT_RENEWAL_FAILED, 'server response missing certificate');
+      this._keystore.saveCert(target, certPem);
+      const refreshed = this.load(target);
+      if (!refreshed.ok || !refreshed.data) return resultErr(codes.CERT_RENEWAL_FAILED, 'renewed certificate reload failed');
+      const refreshedAid = refreshed.data.aid;
+      return resultOk({ renewed: true, new_cert_not_after: refreshedAid.certNotAfter, new_fingerprint: refreshedAid.certFingerprint });
+    } catch (exc) {
+      return resultErr(codes.CERT_RENEWAL_FAILED, String(exc), exc);
+    }
+  }
+
+  async rekey(aid: string): Promise<Result<Record<string, unknown>>> {
+    const target = String(aid ?? '').trim();
+    const loaded = this.load(target);
+    if (!loaded.ok || !loaded.data || !loaded.data.aid.isPrivateKeyValid()) {
+      return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
+    }
+    try {
+      const oldAid = loaded.data.aid;
+      const crypto = new CryptoProvider();
+      const newIdentity = crypto.generateIdentity();
+      const gatewayUrl = await this._resolveGateway(target);
+      const clientNonce = crypto.newClientNonce();
+      const phase1 = await (this._auth as any)._shortRpc(gatewayUrl, 'auth.aid_login1', {
+        aid: target, cert: oldAid.certPem, client_nonce: clientNonce,
+      });
+      const signPayload = Buffer.from(`${phase1.nonce}${newIdentity.public_key_der_b64}`, 'utf-8');
+      const signResult = oldAid.sign(signPayload);
+      if (!signResult.ok || !signResult.data) {
+        return resultErr(codes.REKEY_FAILED, resultError(signResult)?.message ?? 'sign failed');
+      }
+      const response = await (this._auth as any)._shortRpc(gatewayUrl, 'auth.rekey', {
+        aid: target, request_id: String(phase1.request_id), nonce: String(phase1.nonce),
+        new_public_key: newIdentity.public_key_der_b64, signature: signResult.data.signature,
+      });
+      const certPem = String(response.cert ?? response.cert_pem ?? '').trim();
+      if (!certPem) return resultErr(codes.REKEY_FAILED, 'server response missing certificate');
+      this._keystore.saveIdentity(target, { aid: target, ...newIdentity, cert: certPem });
+      const refreshed = this.load(target);
+      if (!refreshed.ok || !refreshed.data) return resultErr(codes.REKEY_FAILED, 'rekeyed identity reload failed');
+      const refreshedAid = refreshed.data.aid;
+      return resultOk({ rekeyed: true, new_fingerprint: refreshedAid.certFingerprint, new_cert_not_after: refreshedAid.certNotAfter });
+    } catch (exc) {
+      return resultErr(codes.REKEY_FAILED, String(exc), exc);
+    }
+  }
+
+  // ── 内部辅助 ──────────────────────────────────────────────────
+
+  private async _resolveGateway(aid: string): Promise<string> {
+    const dotIdx = aid.indexOf('.');
+    const issuerDomain = dotIdx >= 0 ? aid.slice(dotIdx + 1) : aid;
+    const cached = this._gatewayCache.get(issuerDomain);
+    if (cached) return cached;
+    const port = this._discoveryPort ? `:${this._discoveryPort}` : '';
+    const gatewayUrl = `https://gateway.${issuerDomain}${port}/.well-known/aun-gateway`;
+    const discovered = await this._discovery.discover(gatewayUrl);
+    this._gatewayCache.set(issuerDomain, discovered);
+    return discovered;
+  }
+}

@@ -93,7 +93,7 @@ describe('ISSUE-JS-004: disconnect() 别名方法', () => {
     (client as any)._transport.close = vi.fn().mockResolvedValue(undefined);
 
     await client.disconnect();
-    expect(client.state).toBe('disconnected');
+    expect(client.state).toBe('standby');
   });
 
   it('disconnect() 后应可重新 connect()', async () => {
@@ -111,6 +111,6 @@ describe('ISSUE-JS-004: disconnect() 别名方法', () => {
     const client = new AUNClient();
     await client.disconnect();
     // idle 状态不变
-    expect(client.state).toBe('idle');
+    expect(client.state).toBe('no_identity');
   });
 });

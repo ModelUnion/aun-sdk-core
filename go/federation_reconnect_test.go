@@ -14,28 +14,15 @@ import (
 
 func ensureFederationReconnectConnected(t *testing.T, client *AUNClient, aid string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	_, err := client.Auth.CreateAID(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Skipf("无法创建双域 AID（federation Docker 环境可能未运行）: %v", err)
-	}
-
-	authResult, err := client.Auth.Authenticate(ctx, map[string]any{"aid": aid})
-	if err != nil {
-		t.Fatalf("双域认证失败: %v", err)
-	}
-	if err := client.Connect(ctx, authResult, &ConnectOptions{
+	integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
+	integrationConnectLoadedAID(t, client, aid, &ConnectOptions{
 		AutoReconnect:     true,
 		HeartbeatInterval: 3,
 		Retry: &RetryConfig{
 			InitialDelay: 1,
 			MaxDelay:     5,
 		},
-	}); err != nil {
-		t.Fatalf("双域连接失败: %v", err)
-	}
+	})
 	return aid
 }
 
@@ -157,10 +144,10 @@ func TestFederationReconnectAfterRemoteGatewayRestart(t *testing.T) {
 	})
 	defer bobSub.Unsubscribe()
 
-	if alice.State() != StateConnected {
+	if alice.State() != ConnStateReady {
 		t.Fatalf("Alice 初始状态异常: %s", alice.State())
 	}
-	if bob.State() != StateConnected {
+	if bob.State() != ConnStateReady {
 		t.Fatalf("Bob 初始状态异常: %s", bob.State())
 	}
 
@@ -170,11 +157,11 @@ func TestFederationReconnectAfterRemoteGatewayRestart(t *testing.T) {
 		bobStatesMu.Lock()
 		defer bobStatesMu.Unlock()
 		for _, state := range bobStates {
-			if state == string(StateDisconnected) || state == string(StateReconnecting) {
+			if state == string(ConnStateStandby) || state == string(ConnStateRetryBackoff) || state == string(ConnStateReconnecting) {
 				return true
 			}
 		}
-		return bob.State() != StateConnected
+		return bob.State() != ConnStateReady
 	})
 	if !sawDisconnect {
 		bobStatesMu.Lock()
@@ -184,13 +171,13 @@ func TestFederationReconnectAfterRemoteGatewayRestart(t *testing.T) {
 	}
 
 	reconnected := waitForFederationCondition(90*time.Second, 500*time.Millisecond, func() bool {
-		if bob.State() != StateConnected {
+		if bob.State() != ConnStateReady {
 			return false
 		}
 		bobStatesMu.Lock()
 		defer bobStatesMu.Unlock()
 		for _, state := range bobStates {
-			if state == string(StateDisconnected) || state == string(StateReconnecting) {
+			if state == string(ConnStateStandby) || state == string(ConnStateRetryBackoff) || state == string(ConnStateReconnecting) {
 				return true
 			}
 		}
@@ -203,7 +190,7 @@ func TestFederationReconnectAfterRemoteGatewayRestart(t *testing.T) {
 		t.Fatalf("Bob 重连超时: current=%s states=%v", bob.State(), snapshot)
 	}
 
-	if alice.State() != StateConnected {
+	if alice.State() != ConnStateReady {
 		t.Fatalf("Alice 在远端域重启后不应断开: %s", alice.State())
 	}
 

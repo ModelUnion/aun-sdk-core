@@ -2,7 +2,7 @@
 
 AID Custody 是 AUN AP 可选提供的 AID 备份、恢复与跨设备复制服务，不属于 AUN 核心协议强制能力。当前阶段定义两条主流程：通过手机号和验证码上传、下载 AID 证书以及客户端加密后的私钥文件；以及旧设备通过 AID token 授权，新设备凭一次性复制码领取 OTP 加密材料的跨设备复制流程。
 
-用户也可以部署自己的 AID 托管服务。只要服务地址发现格式和本手册定义的 HTTP 接口、请求响应语义保持一致，SDK 即可通过 `client.custody.set_url(...)` 或 well-known 自动发现接入自部署服务。
+用户也可以部署自己的 AID 托管服务。只要服务地址发现格式和本手册定义的 HTTP 接口、请求响应语义保持一致，SDK 即可通过 custody 辅助客户端或 well-known 自动发现接入自部署服务。
 
 核心原则：
 
@@ -19,8 +19,9 @@ https://aid_custody.{issuer_domain}:{port}
 SDK 使用约束：
 
 - `custody_url` 不作为 `AUNClient` 构造配置参数传入。
-- 客户端通过 `client.custody.set_url(...)` 显式配置托管服务地址。
-- 也可以通过 `client.custody.discover_url(aid=...)` 从 `https://{aid}/.well-known/aun-custody` 自动发现官方托管服务地址；发现结果会缓存在当前 `client.custody` 实例中。
+- Python SDK 不在 `AUNClient` 上挂载 custody namespace；需要时使用独立 custody 辅助客户端或直接按本手册 HTTP API 调用。
+- TS / JS / Go 仍保留历史 custody namespace 兼容层；新代码应避免把 custody 当作 AUNClient 核心会话能力。
+- 可通过 `https://{aid}/.well-known/aun-custody` 自动发现官方托管服务地址，并缓存发现结果。
 
 ## 手机号验证码备份/恢复时序
 
@@ -94,9 +95,9 @@ SDK 方法：
 
 | 语言 | 发起复制 | 上传复制材料 | 领取复制材料 |
 |------|----------|--------------|--------------|
-| Python | `client.custody.create_device_copy(...)` | `client.custody.upload_device_copy_materials(...)` | `client.custody.claim_device_copy(...)` |
-| JS/TS | `client.custody.createDeviceCopy(...)` | `client.custody.uploadDeviceCopyMaterials(...)` | `client.custody.claimDeviceCopy(...)` |
-| Go | `client.Custody.CreateDeviceCopy(...)` | `client.Custody.UploadDeviceCopyMaterials(...)` | `client.Custody.ClaimDeviceCopy(...)` |
+| Python | 独立 custody 辅助客户端或 HTTP API | 独立 custody 辅助客户端或 HTTP API | 独立 custody 辅助客户端或 HTTP API |
+| JS/TS | 历史 custody namespace 兼容层或 HTTP API | 历史 custody namespace 兼容层或 HTTP API | 历史 custody namespace 兼容层或 HTTP API |
+| Go | 历史 custody namespace 兼容层或 HTTP API | 历史 custody namespace 兼容层或 HTTP API | 历史 custody namespace 兼容层或 HTTP API |
 
 复制请求：
 

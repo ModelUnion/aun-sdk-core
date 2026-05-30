@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509 import ocsp
 from cryptography.x509.oid import NameOID
 
+from aun_core import __version__ as _aun_version
 from aun_core.auth import AuthFlow
 from aun_core.config import normalize_device_id
 from aun_core.crypto import CryptoProvider
@@ -466,7 +467,7 @@ def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
     assert params["client"] == {
         "slot_id": "slot-a",
         "sdk_lang": "python",
-        "sdk_version": "0.3.6",
+        "sdk_version": _aun_version,
     }
     assert params["delivery_mode"] == {"mode": "queue", "routing": "sender_affinity", "affinity_ttl_ms": 800}
 

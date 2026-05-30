@@ -1,4 +1,4 @@
-// Package aun: client.PublishAgentMD / client.FetchAgentMD 主 API 单测。
+// Package aun: AUNClient agent.md 运行时内部逻辑与 PublishAgentMD 单测。
 package aun
 
 import (
@@ -56,7 +56,7 @@ func (f *fakeAgentMDOps) HeadAgentMD(ctx context.Context, aid string) (map[strin
 
 func newClientForTest(t *testing.T, aid string) *AUNClient {
 	t.Helper()
-	c := NewClient(map[string]any{"aun_path": t.TempDir()})
+	c := newClient(map[string]any{"aun_path": t.TempDir()})
 	c.aid = aid
 	t.Cleanup(func() { _ = c.Close() })
 	return c
@@ -131,15 +131,15 @@ func readAgentMDListRecords(t *testing.T, c *AUNClient) map[string]map[string]an
 
 func TestAgentMDPathDefaultAndSet(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	want := filepath.Join(c.configModel.AUNPath, "AgentMDs")
+	want := filepath.Join(c.configModel.AUNPath, "AIDs")
 	if c.agentMDRoot() != want {
 		t.Fatalf("root=%s want=%s", c.agentMDRoot(), want)
 	}
 	custom := filepath.Join(t.TempDir(), "custom")
-	if got := c.SetAgentMDPath(custom); got != custom {
+	if got := c.setAgentMDPath(custom); got != custom {
 		t.Fatalf("custom root=%s", got)
 	}
-	if got := c.SetAgentMdPath(""); got != want {
+	if got := c.setAgentMdPath(""); got != want {
 		t.Fatalf("default root=%s want=%s", got, want)
 	}
 }
@@ -212,7 +212,7 @@ func TestPublishAgentMDUploadErrorPropagates(t *testing.T) {
 
 func TestFetchAgentMDNoAidErrors(t *testing.T) {
 	c := newClientForTest(t, "")
-	if _, err := c.FetchAgentMD(context.Background(), ""); err == nil {
+	if _, err := c.fetchAgentMD(context.Background(), ""); err == nil {
 		t.Fatal("expected error when no aid")
 	}
 }
@@ -229,7 +229,7 @@ func TestFetchAgentMDSelfAidUpdatesEtagAndSavesFile(t *testing.T) {
 		},
 	}
 
-	info, err := c.FetchAgentMD(context.Background(), "")
+	info, err := c.fetchAgentMD(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestFetchAgentMDOtherAidDoesNotUpdateLocalEtag(t *testing.T) {
 		},
 	}
 
-	info, err := c.FetchAgentMD(context.Background(), "bob.agentid.pub")
+	info, err := c.fetchAgentMD(context.Background(), "bob.agentid.pub")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestCheckAgentMDComparesHeadAndPersistsToList(t *testing.T) {
 		return map[string]any{"aid": aid, "found": true, "etag": etag, "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT", "status": 200}, nil
 	}}
 
-	checked, err := c.CheckAgentMD(context.Background(), "")
+	checked, err := c.checkAgentMD(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +399,7 @@ func TestCheckAgentMDUsesFreshCachedMatchWithoutHead(t *testing.T) {
 		return nil, nil
 	}}
 
-	checked, err := c.CheckAgentMD(context.Background(), "bob.agentid.pub", 7)
+	checked, err := c.checkAgentMD(context.Background(), "bob.agentid.pub", 7)
 	if err != nil {
 		t.Fatal(err)
 	}

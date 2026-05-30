@@ -7,10 +7,10 @@ import type { ModuleLogger } from './logger.js';
 import { CryptoProvider, base64ToUint8, uint8ToBase64, pemToArrayBuffer, toBufferSource } from './crypto.js';
 import { AuthError, IdentityConflictError, StateError, ValidationError, mapRemoteError } from './errors.js';
 import { ROOT_CA_PEM } from './certs/root.js';
+import { VERSION as AUN_SDK_VERSION } from './version.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 const AUN_SDK_LANG = 'javascript';
-const AUN_SDK_VERSION = '0.3.6';
 
 import {
   isJsonObject,

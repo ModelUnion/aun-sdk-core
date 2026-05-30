@@ -28,6 +28,7 @@ import * as path from 'node:path';
 
 import { AUNClient } from '../../src/client.js';
 import type { IdentityRecord, JsonObject } from '../../src/types.js';
+import { loadIdentityFromStore, registerIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -88,7 +89,7 @@ function makeAunPath(tag: string): string {
 }
 
 function makeClient(aunPath: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath }, false);
+  const client = new AUNClient({ aun_path: aunPath, debug: false });
   ((client as unknown) as {
     _configModel: { requireForwardSecrecy: boolean };
   })._configModel.requireForwardSecrecy = false;
@@ -137,8 +138,9 @@ describe('Token + gateway_url 复用集成测试', () => {
     const client = makeClient(aunPath);
     clients.push(client);
 
-    await client.auth.registerAid({ aid });
-    const result = await client.auth.authenticate({ aid }) as JsonObject;
+    await registerIdentity(client, aid);
+    loadIdentityFromStore(client, aid);
+    const result = await client.authenticate() as JsonObject;
     expect(String(result.access_token ?? '')).not.toBe('');
 
     // keystore 持久化了 access_token（注意：access_token 在 instance_state 表里，loadIdentity 会合并）
@@ -152,7 +154,9 @@ describe('Token + gateway_url 复用集成测试', () => {
     expect(String(fullIdentity.refresh_token ?? '')).not.toBe('');
 
     // keystore 持久化了 gateway_url
-    const cachedGw = client.auth._loadCachedGatewayUrl(aid);
+    const cachedGw = String((((client as unknown) as {
+      _keystore: { loadMetadata: (aid: string) => Record<string, unknown> | null };
+    })._keystore.loadMetadata(aid)?.gateway_url) ?? '');
     expect(cachedGw).not.toBe('');
 
     // 校验编码格式：DB 里存的是 JSON 编码（带引号）
@@ -178,8 +182,9 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次：完整流程
     const client1 = makeClient(aunPath);
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    const first = await client1.auth.authenticate({ aid }) as JsonObject;
+    await registerIdentity(client1, aid);
+    loadIdentityFromStore(client1, aid);
+    const first = await client1.authenticate() as JsonObject;
     const firstToken = String(first.access_token ?? '');
     const firstGw = String(first.gateway ?? '');
     await safeClose(client1);
@@ -188,6 +193,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第二次：新 client 同 aun_path
     const client2 = makeClient(aunPath);
     clients.push(client2);
+    loadIdentityFromStore(client2, aid);
 
     const internal2 = (client2 as unknown) as {
       _auth: {
@@ -213,7 +219,7 @@ describe('Token + gateway_url 复用集成测试', () => {
       return originalDiscover(url);
     };
 
-    const second = await client2.auth.authenticate({ aid }) as JsonObject;
+    const second = await client2.authenticate() as JsonObject;
 
     expect(String(second.access_token ?? '')).toBe(firstToken);
     expect(loginCalls).toBe(0);
@@ -232,19 +238,20 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次完整 authenticate
     const client1 = makeClient(aunPath);
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    await client1.auth.authenticate({ aid });
+    await registerIdentity(client1, aid);
+    loadIdentityFromStore(client1, aid);
+    await client1.authenticate();
     await safeClose(client1);
     clients.length = 0;
 
     // 第二次：完全重新 new client，复用 keystore
     const client2 = makeClient(aunPath);
     clients.push(client2);
+    loadIdentityFromStore(client2, aid);
 
-    const auth = await client2.auth.authenticate({ aid }) as JsonObject;
-    await client2.connect(auth, { auto_reconnect: false });
+    await client2.connect({ auto_reconnect: false });
 
-    expect(client2.state).toBe('connected');
+    expect(client2.state).toBe('ready');
 
     const pingResult = await client2.call('meta.ping', {});
     expect(pingResult).toBeTruthy();
@@ -261,8 +268,9 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第一次完整 authenticate
     const client1 = makeClient(aunPath);
     clients.push(client1);
-    await client1.auth.registerAid({ aid });
-    const first = await client1.auth.authenticate({ aid }) as JsonObject;
+    await registerIdentity(client1, aid);
+    loadIdentityFromStore(client1, aid);
+    const first = await client1.authenticate() as JsonObject;
     const firstToken = String(first.access_token ?? '');
     await safeClose(client1);
     clients.length = 0;
@@ -285,6 +293,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 第二次：authenticate 应走完整 _login
     const client2 = makeClient(aunPath);
     clients.push(client2);
+    loadIdentityFromStore(client2, aid);
 
     let loginCalls = 0;
     const internal2 = (client2 as unknown) as {
@@ -298,7 +307,7 @@ describe('Token + gateway_url 复用集成测试', () => {
       return originalLogin(gatewayUrl, identity);
     };
 
-    const second = await client2.auth.authenticate({ aid }) as JsonObject;
+    const second = await client2.authenticate() as JsonObject;
 
     expect(loginCalls).toBeGreaterThanOrEqual(1);
     expect(String(second.access_token ?? '')).not.toBe(firstToken);

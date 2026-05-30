@@ -94,7 +94,7 @@ async function installV2GroupHelpers(page: any): Promise<void> {
       timeoutMs = 6000,
     ): Promise<{ found: any; pulled: any[]; all: any[] }> => {
       await waitFor(() => !!findText(pushed, text), timeoutMs, 300);
-      const pulled = await client.pullGroupV2(groupId);
+      const pulled = await (client as any)._pullGroupV2(groupId);
       const all = pushed.concat(pulled as any[]);
       return { found: findText(all, text), pulled: pulled as any[], all };
     };
@@ -102,11 +102,9 @@ async function installV2GroupHelpers(page: any): Promise<void> {
     /** 创建 AUNClient 并连接到 gateway */
     const makeAndConnect = async (aid: string, deviceId?: string): Promise<any> => {
       const AUN = w.AUN;
-      const client = new AUN.AUNClient({ issuer }, true);
+      const client = new AUN.AUNClient({ issuer, debug: true });
       if (deviceId) client._deviceId = deviceId;
-      try { await client.auth.registerAid({ aid }); } catch {}
-      const auth = await client.auth.authenticate({ aid });
-      await client.connect(auth);
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
       return client;
     };
 
@@ -179,7 +177,7 @@ test.describe('V2 Group E2EE 端到端测试', () => {
 
       // Alice 发送 V2 群消息
       const testText = `v2-group-test-${Date.now()}`;
-      const sendResult = await alice.sendGroupV2(groupId, { text: testText });
+      const sendResult = await (alice as any)._sendGroupV2(groupId, { text: testText });
 
       // Bob 可能已经通过 push 自动 pull 并 ack，手动 pull 只作兜底。
       const { found, all } = await waitForGroupText(bob, groupId, bobPush, testText);
@@ -221,17 +219,17 @@ test.describe('V2 Group E2EE 端到端测试', () => {
 
       // Alice 发送
       const testText = `v2-group-ack-${Date.now()}`;
-      await alice.sendGroupV2(groupId, { text: testText });
+      await (alice as any)._sendGroupV2(groupId, { text: testText });
 
       // Bob 可能已经通过 push 自动 pull 并 ack，手动 pull 只作兜底。
       const { found } = await waitForGroupText(bob, groupId, bobPush, testText);
       const hasMsg = !!found;
 
       // Bob ack
-      const ackResult = await bob.ackGroupV2(groupId);
+      const ackResult = await (bob as any)._ackGroupV2(groupId);
 
       // ack 后再 pull 应为空
-      const afterAck = await bob.pullGroupV2(groupId);
+      const afterAck = await (bob as any)._pullGroupV2(groupId);
 
       await alice.close();
       await bob.close();
@@ -267,16 +265,16 @@ test.describe('V2 Group E2EE 端到端测试', () => {
 
       // Alice → 群
       const textAlice = `alice-group-${Date.now()}`;
-      await alice.sendGroupV2(groupId, { text: textAlice });
+      await (alice as any)._sendGroupV2(groupId, { text: textAlice });
 
       // Bob 可能已经通过 push 自动 pull 并 ack，手动 pull 只作兜底。
       const { found: aliceMsg } = await waitForGroupText(bob, groupId, bobPush, textAlice);
 
       // Bob ack 后回复
-      await bob.ackGroupV2(groupId);
+      await (bob as any)._ackGroupV2(groupId);
 
       const textBob = `bob-group-${Date.now()}`;
-      await bob.sendGroupV2(groupId, { text: textBob });
+      await (bob as any)._sendGroupV2(groupId, { text: textBob });
 
       // Alice 可能已经通过 push 自动 pull 并 ack，手动 pull 只作兜底。
       const { found: bobMsg } = await waitForGroupText(alice, groupId, alicePush, textBob);

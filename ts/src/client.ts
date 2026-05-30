@@ -28,6 +28,7 @@ import {
   AuthError,
   ConnectionError,
   E2EEError,
+  NotFoundError,
   PermissionError,
   StateError,
   TimeoutError,
@@ -39,9 +40,6 @@ import type { KeyStore } from './keystore/index.js';
 import { AUNLogger, type ModuleLogger } from './logger.js';
 import { normalizeGroupId } from './group-id.js';
 
-import { AuthNamespace } from './namespaces/auth.js';
-import { CustodyNamespace } from './namespaces/custody.js';
-import { MetaNamespace } from './namespaces/meta.js';
 import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
 import { SeqTracker } from './seq-tracker.js';
@@ -61,7 +59,10 @@ import {
   type MetadataRecord,
   type RpcParams,
   type RpcResult,
+  ConnectionState,
+  STATE_TO_PUBLIC,
 } from './types.js';
+import { AID } from './aid.js';
 
 type AgentMdFetchResult = {
   aid: string;
@@ -204,6 +205,29 @@ interface ConnectParams extends RpcParams {
   extra_info?: JsonObject;
 }
 
+export interface AUNClientOptions extends Record<string, unknown> {
+  aun_path?: string;
+  aunPath?: string;
+  root_ca_path?: string;
+  rootCaPath?: string;
+  seed_password?: string;
+  seedPassword?: string;
+  encryption_seed?: string;
+  encryptionSeed?: string;
+  discovery_port?: number;
+  discoveryPort?: number;
+  verify_ssl?: boolean;
+  verifySSL?: boolean;
+  verifySsl?: boolean;
+  require_forward_secrecy?: boolean;
+  requireForwardSecrecy?: boolean;
+  replay_window_seconds?: number;
+  replayWindowSeconds?: number;
+  debug?: boolean;
+  protected_headers?: Record<string, unknown> | null;
+  aid?: never;
+}
+
 interface AuthContext extends JsonObject {
   identity?: IdentityRecord;
   token?: string;
@@ -240,6 +264,13 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
     http: 30.0,
   },
 };
+
+const PROTECTED_HEADERS_METHODS = new Set([
+  'message.send',
+  'group.send',
+  'message.thought.put',
+  'group.thought.put',
+]);
 
 const RECONNECT_MIN_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_BASE_DELAY_MS = 64_000;
@@ -319,6 +350,7 @@ const SIGNED_METHODS = new Set([
 
 /** peer 证书缓存 TTL（1 小时） */
 const PEER_CERT_CACHE_TTL = 3600;
+const AGENT_MD_HTTP_TIMEOUT_MS = 30_000;
 
 // ── 内部类型 ──────────────────────────────────────────────────
 
@@ -538,6 +570,54 @@ function lengthPrefixedBytesKey(...parts: Uint8Array[]): Buffer {
   return Buffer.concat(chunks);
 }
 
+function agentMdHttpScheme(gatewayUrl: string): string {
+  const raw = String(gatewayUrl ?? '').trim().toLowerCase();
+  return raw.startsWith('ws://') ? 'http' : 'https';
+}
+
+function agentMdAuthority(aid: string, discoveryPort: number | null | undefined): string {
+  const host = String(aid ?? '').trim();
+  if (!host) return '';
+  if (discoveryPort && !host.includes(':')) return `${host}:${discoveryPort}`;
+  return host;
+}
+
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit,
+  timeoutMs = AGENT_MD_HTTP_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new AUNError(`agent.md request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function assertClientOptions(value: unknown, label: string): asserts value is AUNClientOptions | null | undefined {
+  if (value == null) return;
+  if (typeof value !== 'object' || Array.isArray(value) || value instanceof AID) {
+    throw new ValidationError(`${label} must be an options object`);
+  }
+}
+
+function clientOptionsConfig(options: AUNClientOptions | null | undefined): RpcParams {
+  const raw = { ...(options ?? {}) } as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(raw, 'aid')) {
+    throw new ValidationError('AUNClient options must not include aid; pass an AID object as the first argument');
+  }
+  delete raw.debug;
+  delete raw.protected_headers;
+  return raw as RpcParams;
+}
+
 export class AUNClient {
   /** 原始配置 */
   readonly config: RpcParams;
@@ -552,7 +632,20 @@ export class AUNClient {
   private _identity: IdentityRecord | null = null;
 
   /** 连接状态 */
-  private _state: string = 'idle';
+  private _state: string = 'no_identity';
+
+  /** 当前 AID 值对象（新 API） */
+  private _currentAid: AID | null = null;
+
+  /** 实例级 protected_headers */
+  private _instanceProtectedHeaders: Record<string, string> | null = null;
+
+  /** 重连退避时间戳（ms） */
+  private _nextRetryAt: number | null = null;
+  private _retryAttempt = 0;
+  private _retryMaxAttempts = 0;
+  private _lastError: Error | null = null;
+  private _lastErrorCode: string | null = null;
 
   /** Gateway URL */
   private _gatewayUrl: string | null = null;
@@ -574,13 +667,6 @@ export class AUNClient {
 
   /** 密钥存储 */
   private _keystore: KeyStore;
-
-  /** Auth 命名空间 */
-  readonly auth: AuthNamespace;
-  /** AID 托管命名空间 */
-  readonly custody: CustodyNamespace;
-  /** Meta 命名空间（心跳、状态、信任根管理） */
-  readonly meta: MetaNamespace;
 
   /** 会话参数（重连用） */
   private _sessionParams: ConnectParams | null = null;
@@ -606,6 +692,9 @@ export class AUNClient {
   private _remoteAgentMdEtag: string = '';
   private _agentMdCache: Map<string, Record<string, unknown>> = new Map();
   private _agentMdFetchInflight: Map<string, Promise<AgentMdFetchResult>> = new Map();
+  private _agentMdDownloadInflight: Map<string, Promise<string>> = new Map();
+  private _agentMdDownloadActive = 0;
+  private _agentMdDownloadWaiters: Array<() => void> = [];
 
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
@@ -657,8 +746,11 @@ export class AUNClient {
   private static readonly V2_BOOTSTRAP_TTL_MS = 60 * 60 * 1000;
   private static readonly V2_RETRYABLE_CODES = new Set([-33011, -33012, -33050, -33052, -33054]);
   private static readonly PULL_GATE_STALE_MS = 3000;
+  /** 对端 AID 缓存（aid string → AID 对象） */
+  private _peerCache = new Map<string, AID>();
   private static readonly V2_SIG_CACHE_TTL_MS = 60 * 60 * 1000;
   private static readonly V2_SIG_CACHE_MAX = 16_384;
+  private static readonly AGENT_MD_DOWNLOAD_CONCURRENCY = 8;
 
   private _reconnectActive = false;
   private _reconnectAbort: AbortController | null = null;
@@ -668,17 +760,33 @@ export class AUNClient {
   private _logger!: AUNLogger;
   private _clientLog!: ModuleLogger;
 
-  constructor(config?: RpcParams, debug = false) {
-    const rawConfig: RpcParams = { ...(config ?? {}) };
+  constructor(options?: AUNClientOptions | null);
+  constructor(aid: AID, options?: AUNClientOptions | null);
+  constructor(first?: AID | AUNClientOptions | null, second?: AUNClientOptions | null) {
+    if (typeof first === 'string') {
+      throw new ValidationError('AUNClient aid must be an AID object, not a string');
+    }
+    if (typeof second === 'boolean') {
+      throw new ValidationError('AUNClient debug must be passed as options.debug');
+    }
+    const inputAid = first instanceof AID ? first : null;
+    if (!inputAid && second !== undefined) {
+      throw new ValidationError('AUNClient options-only construction accepts a single options object');
+    }
+    const options = inputAid ? (second ?? {}) : (first ?? {});
+    assertClientOptions(options, 'AUNClient options');
+    const rawConfig: RpcParams = clientOptionsConfig(options);
+    if (inputAid) rawConfig.aun_path = inputAid.aunPath;
+    const debug = !!options?.debug;
     this._configModel = configFromMap(rawConfig);
-    const initAid = String(rawConfig.aid ?? '').trim() || null;
+    const initAid = inputAid ? inputAid.aid : null;
     this._agentMdPath = path.join(this._configModel.aunPath, 'AIDs');
     this.config = {
       aun_path: this._configModel.aunPath,
       root_ca_path: this._configModel.rootCaPath,
       seed_password: this._configModel.seedPassword,
     };
-    this._deviceId = getDeviceId(this._configModel.aunPath);
+    this._deviceId = (inputAid?.deviceId) || getDeviceId(this._configModel.aunPath);
 
     // 初始化 Logger（per-client 单例，必须最早创建）
     const debugFlag = this._configModel.debug || debug;
@@ -722,7 +830,7 @@ export class AUNClient {
       this._clientLog.warn(`_pending cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    this._slotId = '';
+    this._slotId = inputAid?.slotId || 'default';
     this._connectDeliveryMode = normalizeDeliveryModeConfig({ mode: 'fanout' });
     this._defaultConnectDeliveryMode = { ...this._connectDeliveryMode };
 
@@ -749,9 +857,22 @@ export class AUNClient {
     });
     this._transport.setMetaObserver((meta) => this._observeRpcMeta(meta));
 
-    this.auth = new AuthNamespace(this);
-    this.custody = new CustodyNamespace(this);
-    this.meta = new MetaNamespace(this);
+    if (inputAid) {
+      if (!inputAid.isPrivateKeyValid()) {
+        throw new StateError('AUNClient requires an AID with a valid private key');
+      }
+      this._currentAid = inputAid;
+      this._identity = {
+        aid: inputAid.aid,
+        private_key_pem: (inputAid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
+        public_key_der_b64: inputAid.publicKey,
+        cert: inputAid.certPem,
+      };
+      this._state = 'standby';
+    }
+    if (options?.protected_headers !== undefined) {
+      this.setProtectedHeaders(options.protected_headers);
+    }
     // 内部订阅：推送消息自动解密后 re-publish 给用户
     this._dispatcher.subscribe('_raw.message.received', (data) => this._onRawMessageReceived(data));
     // V2 P2P 推送通知：收到通知后自动走 message.v2.pull 拉取并解密
@@ -785,6 +906,370 @@ export class AUNClient {
     return this._aid;
   }
 
+  /** 当前 AID 值对象 */
+  get currentAid(): AID | null {
+    return this._currentAid;
+  }
+
+  get hasIdentity(): boolean {
+    return this._currentAid !== null && this.state !== ConnectionState.CLOSED;
+  }
+
+  get canSign(): boolean {
+    return this.hasIdentity && !!this._currentAid?.isPrivateKeyValid();
+  }
+
+  get canConnect(): boolean {
+    return this.hasIdentity && this.state !== ConnectionState.CLOSED;
+  }
+
+  get canSend(): boolean {
+    return this.state === ConnectionState.READY;
+  }
+
+  get isReady(): boolean {
+    return this.canSend;
+  }
+
+  get isOnline(): boolean {
+    return this.state === ConnectionState.READY || this.state === ConnectionState.RETRY_BACKOFF || this.state === ConnectionState.RECONNECTING;
+  }
+
+  get isClosed(): boolean {
+    return this.state === ConnectionState.CLOSED;
+  }
+
+  get aunPath(): string | null {
+    return this.hasIdentity ? this._currentAid?.aunPath ?? this._configModel.aunPath : null;
+  }
+
+  get nextRetryAt(): Date | null {
+    return this.state === ConnectionState.RETRY_BACKOFF && this._nextRetryAt ? new Date(this._nextRetryAt) : null;
+  }
+
+  get nextRetryInSeconds(): number | null {
+    return this.state === ConnectionState.RETRY_BACKOFF && this._nextRetryAt ? Math.max(0, Math.ceil((this._nextRetryAt - Date.now()) / 1000)) : null;
+  }
+
+  get retryAttempt(): number {
+    return this._retryAttempt;
+  }
+
+  get retryMaxAttempts(): number {
+    return this._retryMaxAttempts;
+  }
+
+  get lastError(): Error | null {
+    return this._lastError;
+  }
+
+  get lastErrorCode(): string | null {
+    return this._lastErrorCode;
+  }
+
+  loadIdentity(aid: AID): void {
+    if (!aid?.isPrivateKeyValid()) {
+      throw new StateError('loadIdentity requires an AID with a valid private key');
+    }
+    const publicState = this.state;
+    if (publicState !== ConnectionState.NO_IDENTITY && publicState !== ConnectionState.CLOSED) {
+      throw new StateError(`loadIdentity not allowed in state ${publicState}`);
+    }
+    this._currentAid = aid;
+    this._aid = aid.aid;
+    this._identity = {
+      aid: aid.aid,
+      private_key_pem: (aid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
+      public_key_der_b64: aid.publicKey,
+      cert: aid.certPem,
+    };
+    (this._auth as unknown as { _aid?: string })._aid = aid.aid;
+    this._state = 'standby';
+    this._closing = false;
+    this._lastError = null;
+    this._lastErrorCode = null;
+    this._retryAttempt = 0;
+    this._nextRetryAt = null;
+  }
+
+  setProtectedHeaders(headers: Record<string, unknown> | null): void {
+    if (!headers) {
+      this._instanceProtectedHeaders = null;
+      return;
+    }
+    // 字段规范：key 限 [a-z0-9_-]，_auth 为保留键不可设置。
+    // 非法 key 静默跳过（不报错），值强转 str。
+    const cleaned: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      const keyStr = String(key);
+      if (keyStr === '_auth') continue;
+      if (!/^[a-z0-9_-]+$/.test(keyStr)) continue;
+      cleaned[keyStr] = value == null ? '' : String(value);
+    }
+    this._instanceProtectedHeaders = Object.keys(cleaned).length ? cleaned : null;
+  }
+
+  getProtectedHeaders(): Record<string, string> | null {
+    return this._instanceProtectedHeaders ? { ...this._instanceProtectedHeaders } : null;
+  }
+
+  cachePeer(aid: AID): AID {
+    if (!this.hasIdentity) throw new StateError('cachePeer requires a loaded identity');
+    if (!aid.isCertValid()) throw new ValidationError('cachePeer requires an AID with a valid certificate');
+    this._peerCache.set(aid.aid, aid);
+    return aid;
+  }
+
+  getPeer(aid: string): AID | null {
+    if (!this.hasIdentity) throw new StateError('getPeer requires a loaded identity');
+    return this._peerCache.get(String(aid ?? '').trim()) ?? null;
+  }
+
+  async lookupPeer(aid: string): Promise<AID> {
+    if (!this.hasIdentity) throw new StateError('lookupPeer requires a loaded identity');
+    const target = String(aid ?? '').trim();
+    if (!target) throw new ValidationError('lookupPeer requires non-empty aid');
+    const cached = this._peerCache.get(target);
+    if (cached) return cached;
+    throw new NotFoundError(`peer not found in cache: ${target}`);
+  }
+
+  peers(): AID[] {
+    if (!this.hasIdentity) throw new StateError('peers requires a loaded identity');
+    return [...this._peerCache.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, v]) => v);
+  }
+
+  private async _resolveAgentMdUrl(aid: string): Promise<string> {
+    const target = String(aid ?? '').trim();
+    if (!target) throw new ValidationError('agent.md requires non-empty aid');
+    let gatewayUrl = String(this._gatewayUrl ?? '').trim();
+    if (!gatewayUrl) {
+      try {
+        gatewayUrl = await this._resolveGatewayForAid(target);
+      } catch {
+        gatewayUrl = '';
+      }
+    }
+    return `${agentMdHttpScheme(gatewayUrl)}://${agentMdAuthority(target, this._configModel.discoveryPort)}/agent.md`;
+  }
+
+  private async _ensureAgentMdUploadToken(aid: string, gatewayUrl: string): Promise<string> {
+    let identity = this._auth.loadIdentityOrNone(aid);
+    if (!identity && this._identity && String(this._identity.aid ?? '') === aid) {
+      identity = this._identity;
+    }
+    if (!identity) {
+      throw new StateError('no local identity found, register or load an AID first');
+    }
+
+    const cachedToken = String(identity.access_token ?? '');
+    const expiresAt = this._auth.getAccessTokenExpiry(identity);
+    if (cachedToken && (expiresAt === null || expiresAt > Date.now() / 1000 + 30)) {
+      return cachedToken;
+    }
+
+    if (identity.refresh_token) {
+      try {
+        const refreshed = await this._auth.refreshCachedTokens(gatewayUrl, identity);
+        const refreshedToken = String(refreshed.access_token ?? '');
+        const refreshedExpiry = this._auth.getAccessTokenExpiry(refreshed);
+        if (refreshedToken && (refreshedExpiry === null || refreshedExpiry > Date.now() / 1000 + 30)) {
+          this._identity = refreshed;
+          return refreshedToken;
+        }
+      } catch {
+        // refresh 失败时回退到完整 authenticate。
+      }
+    }
+
+    const result = await this._auth.authenticate(gatewayUrl, { aid });
+    const token = String(result.access_token ?? '');
+    if (!token) throw new StateError('authenticate did not return access_token');
+    this._identity = this._auth.loadIdentityOrNone(aid) ?? {
+      ...identity,
+      access_token: token,
+      refresh_token: String(result.refresh_token ?? identity.refresh_token ?? ''),
+      access_token_expires_at: typeof result.expires_at === 'number' ? result.expires_at : identity.access_token_expires_at,
+      token_exp: typeof result.expires_at === 'number' ? result.expires_at : identity.token_exp,
+      expires_at: typeof result.expires_at === 'number' ? result.expires_at : identity.expires_at,
+    };
+    return token;
+  }
+
+  private async _uploadAgentMd(content: string): Promise<Record<string, unknown>> {
+    const target = String(this._aid ?? this._currentAid?.aid ?? '').trim();
+    if (!target) throw new StateError('uploadAgentMd requires local AID');
+    const gatewayUrl = await this._resolveGatewayForAid(target);
+    this._gatewayUrl = gatewayUrl;
+    const token = await this._ensureAgentMdUploadToken(target, gatewayUrl);
+    const response = await fetchWithTimeout(await this._resolveAgentMdUrl(target), {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'text/markdown; charset=utf-8',
+      },
+      body: content,
+    });
+
+    if (response.status === 404) {
+      throw new NotFoundError(`agent.md endpoint not found for aid: ${target}`);
+    }
+    if (!response.ok) {
+      const message = (await response.text()).trim();
+      throw new AUNError(`upload agent.md failed: HTTP ${response.status}${message ? ` - ${message}` : ''}`);
+    }
+    const payload = await response.json() as JsonValue;
+    if (!isJsonObject(payload)) throw new AUNError('upload agent.md returned invalid JSON payload');
+    return payload as Record<string, unknown>;
+  }
+
+  private async _acquireAgentMdDownloadSlot(): Promise<() => void> {
+    if (this._agentMdDownloadActive < AUNClient.AGENT_MD_DOWNLOAD_CONCURRENCY) {
+      this._agentMdDownloadActive += 1;
+      return () => this._releaseAgentMdDownloadSlot();
+    }
+    await new Promise<void>((resolve) => {
+      this._agentMdDownloadWaiters.push(resolve);
+    });
+    return () => this._releaseAgentMdDownloadSlot();
+  }
+
+  private _releaseAgentMdDownloadSlot(): void {
+    const next = this._agentMdDownloadWaiters.shift();
+    if (next) {
+      next();
+      return;
+    }
+    if (this._agentMdDownloadActive > 0) this._agentMdDownloadActive -= 1;
+  }
+
+  private async _downloadAgentMd(aid: string): Promise<string> {
+    const target = String(aid ?? '').trim();
+    if (!target) throw new ValidationError('downloadAgentMd requires non-empty aid');
+    const existing = this._agentMdDownloadInflight.get(target);
+    if (existing) return await existing;
+
+    const task = (async () => {
+      const release = await this._acquireAgentMdDownloadSlot();
+      try {
+        return await this._downloadAgentMdOnce(target);
+      } finally {
+        release();
+      }
+    })();
+    this._agentMdDownloadInflight.set(target, task);
+    task.finally(() => {
+      if (this._agentMdDownloadInflight.get(target) === task) {
+        this._agentMdDownloadInflight.delete(target);
+      }
+    }).catch(() => undefined);
+    return await task;
+  }
+
+  private async _downloadAgentMdOnce(target: string): Promise<string> {
+    const cached = this._agentMdCache.get(target);
+    const url = await this._resolveAgentMdUrl(target);
+    let response = await fetchWithTimeout(url, {
+      method: 'GET',
+      headers: { Accept: 'text/markdown' },
+      redirect: 'follow',
+    });
+
+    if (response.status === 304 && typeof cached?.text === 'string') {
+      return String(cached.text);
+    }
+    if (response.status === 304) {
+      response = await fetchWithTimeout(url, {
+        method: 'GET',
+        headers: { Accept: 'text/markdown' },
+        cache: 'reload',
+        redirect: 'follow',
+      });
+    }
+    if (response.status === 404) {
+      throw new NotFoundError(`agent.md not found for aid: ${target}`);
+    }
+    if (!response.ok) {
+      const message = (await response.text()).trim();
+      throw new AUNError(`download agent.md failed: HTTP ${response.status}${message ? ` - ${message}` : ''}`);
+    }
+    const text = await response.text();
+    const etag = String(response.headers?.get('ETag') ?? response.headers?.get('etag') ?? '').trim();
+    const lastModified = String(response.headers?.get('Last-Modified') ?? response.headers?.get('last-modified') ?? '').trim();
+    this._agentMdCache.set(target, {
+      ...(cached ?? {}),
+      text,
+      etag,
+      lastModified,
+      remote_etag: etag,
+      last_modified: lastModified,
+    });
+    return text;
+  }
+
+  private async _headAgentMd(aid: string): Promise<Record<string, unknown>> {
+    const target = String(aid ?? '').trim();
+    if (!target) throw new ValidationError('headAgentMd requires non-empty aid');
+    const response = await fetchWithTimeout(await this._resolveAgentMdUrl(target), {
+      method: 'HEAD',
+      headers: { Accept: 'text/markdown' },
+      redirect: 'follow',
+    }, 15_000);
+    const cached = this._agentMdCache.get(target) ?? {};
+    const etag = String(response.headers?.get('ETag') ?? response.headers?.get('etag') ?? '').trim();
+    const lastModified = String(response.headers?.get('Last-Modified') ?? response.headers?.get('last-modified') ?? '').trim();
+    if (response.status === 404) {
+      return { aid: target, found: false, etag: '', last_modified: '', status: 404 };
+    }
+    const resultEtag = response.status === 304 ? (etag || String(cached.etag ?? cached.remote_etag ?? '')) : etag;
+    const resultLastModified = response.status === 304 ? (lastModified || String(cached.lastModified ?? cached.last_modified ?? '')) : lastModified;
+    if (response.status < 200 || (response.status >= 300 && response.status !== 304)) {
+      throw new AUNError(`head agent.md failed: HTTP ${response.status}`);
+    }
+    this._agentMdCache.set(target, {
+      ...cached,
+      etag: resultEtag,
+      lastModified: resultLastModified,
+      remote_etag: resultEtag,
+      last_modified: resultLastModified,
+    });
+    return { aid: target, found: true, etag: resultEtag, last_modified: resultLastModified, status: response.status };
+  }
+
+  private async _verifyAgentMd(content: string, aid: string, certPem?: string | null): Promise<Record<string, unknown>> {
+    const target = String(aid ?? '').trim();
+    if (!target) throw new ValidationError('verifyAgentMd requires non-empty aid');
+    let peer = target === this._currentAid?.aid ? this._currentAid : null;
+    if (!peer) {
+      let resolvedCert = String(certPem ?? '').trim();
+      if (!resolvedCert) {
+        try {
+          resolvedCert = String(this._keystore.loadCert(target) ?? '').trim();
+        } catch {
+          resolvedCert = '';
+        }
+      }
+      if (!resolvedCert) {
+        if (!this._gatewayUrl) {
+          try { this._gatewayUrl = await this._resolveGatewayForAid(target); } catch { /* best-effort before cert fetch */ }
+        }
+        resolvedCert = String(await this._fetchPeerCert(target) ?? '').trim();
+      }
+      if (!resolvedCert) throw new NotFoundError(`certificate not found for aid: ${target}`);
+      peer = AID._create({
+        aid: target,
+        aunPath: this._configModel.aunPath,
+        certPem: resolvedCert,
+        privateKeyPem: null,
+        certValid: true,
+        privateKeyValid: false,
+      });
+    }
+    const result = peer.verifyAgentMd(content);
+    if (!result.ok) throw new AUNError(result.error.message);
+    return { ...result.data, verified: result.data.status === 'verified' };
+  }
+
   /**
    * 读取 {agentMdPath}/{self_aid}/agent.md，签名后上传，并把签名结果原子写回本地。
    */
@@ -794,13 +1279,17 @@ export class AUNClient {
       throw new ValidationError('publishAgentMd requires local AID');
     }
     const content = this._readAgentMdContent(target);
-    const signed = await this.auth.signAgentMd(content);
-    const result = await this.auth.uploadAgentMd(signed);
-    this._localAgentMdEtag = this._agentMdContentEtag(signed);
+    const signed = this._currentAid?.signAgentMd(content);
+    if (!signed?.ok) {
+      throw new StateError(signed?.error.message ?? 'publishAgentMd requires a valid local AID private key');
+    }
+    const signedContent = signed.data.signed;
+    const result = await this._uploadAgentMd(signedContent);
+    this._localAgentMdEtag = this._agentMdContentEtag(signedContent);
     const remoteEtag = isJsonObject(result) ? String(result.etag ?? '').trim() : '';
     if (remoteEtag) this._remoteAgentMdEtag = remoteEtag;
     this._saveAgentMdRecord(target, {
-      content: signed,
+      content: signedContent,
       local_etag: this._localAgentMdEtag,
       remote_etag: remoteEtag || undefined,
       last_modified: isJsonObject(result) ? String(result.last_modified ?? '').trim() : '',
@@ -809,24 +1298,6 @@ export class AUNClient {
       last_error: '',
     });
     return result as Record<string, unknown>;
-  }
-
-  /**
-   * 下载 agent.md 并自动验签；内容固定保存到 {agentMdPath}/{aid}/agent.md。
-   */
-  async fetchAgentMd(aid?: string | null): Promise<{
-    aid: string;
-    content: string;
-    signature: Record<string, unknown>;
-    in_sync: boolean | null;
-    saved_to: string | null;
-    save_error: string | null;
-  }> {
-    const target = String(aid ?? this._aid ?? '').trim();
-    if (!target) {
-      throw new ValidationError('fetchAgentMd requires aid (or local AID)');
-    }
-    return await this._startAgentMdFetchTask(target);
   }
 
   private async _startAgentMdFetchTask(target: string): Promise<AgentMdFetchResult> {
@@ -846,8 +1317,8 @@ export class AUNClient {
   }
 
   private async _fetchAgentMdOnce(target: string): Promise<AgentMdFetchResult> {
-    const content = await this.auth.downloadAgentMd(target);
-    const signature = await this.auth.verifyAgentMd(content, { aid: target });
+    const content = await this._downloadAgentMd(target);
+    const signature = await this._verifyAgentMd(content, target);
 
     const isSelf = target === (this._aid ?? '');
     const localEtag = this._agentMdContentEtag(content);
@@ -888,17 +1359,13 @@ export class AUNClient {
   /**
    * 设置 agent.md 本地存储根目录；为空时恢复默认 {aun_path}/AIDs。
    */
-  setAgentMdPath(root?: string | null): string {
+  private _setAgentMdRoot(root?: string | null): string {
     const raw = String(root ?? '').trim();
     const next = raw || path.join(this._configModel.aunPath, 'AIDs');
     fs.mkdirSync(next, { recursive: true });
     this._agentMdPath = next;
     this._agentMdCache.clear();
     return this._agentMdPath;
-  }
-
-  SetAgentMDPath(root?: string | null): string {
-    return this.setAgentMdPath(root);
   }
 
   /**
@@ -1086,8 +1553,7 @@ export class AUNClient {
 
   private _agentMdAuthCacheMeta(aid: string): Record<string, unknown> {
     try {
-      const store = (this.auth as unknown as { _agentMdCache?: Map<string, Record<string, unknown>> })._agentMdCache;
-      const record = store?.get(String(aid ?? '').trim());
+      const record = this._agentMdCache.get(String(aid ?? '').trim());
       return record && typeof record === 'object' ? { ...record } : {};
     } catch {
       return {};
@@ -1192,7 +1658,7 @@ export class AUNClient {
     const target = String(aid ?? '').trim();
     if (!target || this._agentMdHasLocalContent(target, record)) return;
     if (this._agentMdFetchInflight.has(target)) return;
-    void this.fetchAgentMd(target).catch((err) => {
+    void this._startAgentMdFetchTask(target).catch((err) => {
       this._saveAgentMdRecord(target, {
         last_error: err instanceof Error ? err.message : String(err),
         remote_status: 'found',
@@ -1250,7 +1716,7 @@ export class AUNClient {
     );
   }
 
-  async checkAgentMd(aid?: string | null, maxUnsyncedDays = 1): Promise<Record<string, unknown>> {
+  private async _checkAgentMdCache(aid?: string | null, maxUnsyncedDays = 1): Promise<Record<string, unknown>> {
     const target = String(aid ?? this._aid ?? '').trim();
     if (!target) throw new ValidationError('checkAgentMd requires aid (or local AID)');
     const before = this._loadAgentMdRecord(target) ?? {};
@@ -1303,7 +1769,7 @@ export class AUNClient {
     const now = Date.now();
     let remote: Record<string, unknown>;
     try {
-      remote = await (this.auth as unknown as { headAgentMd: (aid: string) => Promise<Record<string, unknown>> }).headAgentMd(target);
+      remote = await this._headAgentMd(target);
     } catch (err) {
       this._saveAgentMdRecord(target, { checked_at: now, remote_status: 'error', last_error: err instanceof Error ? err.message : String(err) });
       throw err;
@@ -1359,8 +1825,12 @@ export class AUNClient {
     }
   }
   /** 连接状态 */
-  get state(): string {
-    return this._state;
+  get state(): ConnectionState {
+    return this._publicState(this._state);
+  }
+
+  private _publicState(state: string): ConnectionState {
+    return STATE_TO_PUBLIC[state] ?? (state as ConnectionState);
   }
 
   /** 最近一次 gateway health check 结果，null 表示尚未检查 */
@@ -1368,39 +1838,71 @@ export class AUNClient {
     return this._discovery.lastHealthy;
   }
 
-  /** 向 gatewayUrl 的 /health 端点发送 GET 请求，检查网关可用性 */
-  async checkGatewayHealth(gatewayUrl: string, timeout = 5_000): Promise<boolean> {
+  // ── 生命周期 ──────────────────────────────────────────────
+
+  /** 仅认证当前身份，获取/刷新 token，但不建立长连接。 */
+  async authenticate(options: RpcParams = {}): Promise<Record<string, unknown>> {
     const tStart = Date.now();
-    this._clientLog.debug(`checkGatewayHealth enter: gatewayUrl=${gatewayUrl}`);
+    const target = this._currentAid?.aid ?? this._aid ?? '';
+    if (!target || !this._currentAid?.isPrivateKeyValid()) {
+      throw new StateError('authenticate requires a loaded AID with a valid private key');
+    }
+    const publicState = this.state;
+    if (publicState !== ConnectionState.STANDBY && publicState !== ConnectionState.AUTHENTICATED) {
+      throw new StateError(`authenticate not allowed in state ${publicState}`);
+    }
+    if ('aid' in options || 'access_token' in options || 'token' in options || 'kite_token' in options) {
+      throw new ValidationError('authenticate options must not include aid or token fields; load an AID object first');
+    }
+    this._state = 'connecting';
     try {
-      const result = await this._discovery.checkHealth(gatewayUrl, timeout);
-      this._clientLog.debug(`checkGatewayHealth exit: elapsed=${Date.now() - tStart}ms healthy=${result}`);
-      return result;
+      const gateway = String(options.gateway ?? this._gatewayUrl ?? await this._resolveGatewayForAid(target)).trim();
+      const result = await this._auth.authenticate(gateway, { aid: target });
+      this._gatewayUrl = String(result.gateway ?? gateway);
+      this._identity = this._auth.loadIdentityOrNone(target);
+      this._state = 'authenticated';
+      this._lastError = null;
+      this._lastErrorCode = null;
+      this._clientLog.debug(`authenticate exit: elapsed=${Date.now() - tStart}ms aid=${target}`);
+      return result as Record<string, unknown>;
     } catch (err) {
-      this._clientLog.debug(`checkGatewayHealth exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
+      this._state = 'standby';
+      this._lastError = err instanceof Error ? err : new Error(String(err));
+      this._lastErrorCode = 'AUTHENTICATE_FAILED';
+      this._clientLog.debug(`authenticate exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
   }
 
-  // ── 生命周期 ──────────────────────────────────────────────
-
-  /**
-   * 连接到 Gateway。
-   *
-   * @param auth - 认证参数（必须包含 access_token 和 gateway）
-   * @param options - 会话选项（auto_reconnect、heartbeat_interval 等）
-   */
-  async connect(
-    auth: RpcParams,
-    options?: RpcParams,
-  ): Promise<void> {
+  /** 连接到 Gateway；身份来自构造函数或 loadIdentity(aid)，认证由 SDK 内部自动完成。 */
+  async connect(options: RpcParams = {}): Promise<void> {
     const tStart = Date.now();
-    if (this._state !== 'idle' && this._state !== 'closed' && this._state !== 'disconnected') {
-      throw new StateError(`connect not allowed in state ${this._state}`);
+    if (arguments.length > 1) {
+      throw new ValidationError('connect accepts a single options object');
+    }
+    if ('aid' in options || 'access_token' in options || 'token' in options || 'kite_token' in options) {
+      throw new ValidationError('connect options must not include aid or token fields; load an AID object first');
+    }
+    const target = this._currentAid?.aid ?? this._aid ?? '';
+    if (!target || !this._currentAid?.isPrivateKeyValid()) {
+      throw new StateError('connect requires a loaded AID with a valid private key');
+    }
+    const publicState = this.state;
+    const allowed = new Set<ConnectionState>([
+      ConnectionState.STANDBY,
+      ConnectionState.AUTHENTICATED,
+      ConnectionState.RETRY_BACKOFF,
+      ConnectionState.CONNECTION_FAILED,
+    ]);
+    if (!allowed.has(publicState)) {
+      throw new StateError(`connect not allowed in state ${publicState}`);
+    }
+    if (publicState === ConnectionState.RETRY_BACKOFF) {
+      this._stopReconnect();
     }
     this._state = 'connecting';
-    const params = { ...auth };
-    if (options) Object.assign(params, options);
+    const gateway = String(options.gateway ?? this._gatewayUrl ?? await this._resolveGatewayForAid(target)).trim();
+    const params = { ...options, gateway };
     const normalized = this._normalizeConnectParams(params);
     this._captureCapabilitiesFromConnect(normalized);
     this._sessionParams = normalized;
@@ -1417,7 +1919,9 @@ export class AUNClient {
     for (const gw of gateways) {
       try {
         const gwParams = { ...normalized, gateway: gw };
-        await this._connectOnce(gwParams, false);
+        await this._connectOnce(gwParams, true);
+        this._lastError = null;
+        this._lastErrorCode = null;
         this._clientLog.debug(`connect exit: elapsed=${Date.now() - tStart}ms aid=${this._aid ?? ''}, state=${this._state}`);
         return;
       } catch (err) {
@@ -1425,14 +1929,14 @@ export class AUNClient {
         if (gateways.length > 1) {
           this._clientLog.warn(`connect: gateway ${gw} failed, trying next: ${formatCaughtError(err)}`);
         }
-        if (this._state === 'connecting' || this._state === 'authenticating') {
-          this._state = 'connecting';
-        }
+        if (this._state !== 'closed') this._state = 'connecting';
       }
     }
     if (this._state === 'connecting' || this._state === 'authenticating') {
-      this._state = 'disconnected';
+      this._state = 'connection_failed';
     }
+    this._lastError = lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    this._lastErrorCode = 'CONNECT_FAILED';
     this._clientLog.error(`connect failed: ${formatCaughtError(lastErr)}`, lastErr instanceof Error ? lastErr : undefined);
     this._clientLog.debug(`connect exit (error): elapsed=${Date.now() - tStart}ms err=${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
     throw lastErr;
@@ -1447,13 +1951,13 @@ export class AUNClient {
       this._saveSeqTrackerState();
       this._stopBackgroundTasks();
       this._stopReconnect();
-      if (this._state === 'idle' || this._state === 'closed') {
+      if (this.state === ConnectionState.NO_IDENTITY || this.state === ConnectionState.CLOSED) {
         const closableKeyStore = this._keystore as KeyStore & { close?: () => void };
         closableKeyStore.close?.();
         this._state = 'closed';
         this._logger.close();
         this._resetSeqTrackingState();
-        this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms (was idle/closed)`);
+        this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms (was no_identity/closed)`);
         return;
       }
       await this._transport.close();
@@ -1461,7 +1965,7 @@ export class AUNClient {
       closableKeyStore.close?.();
       this._state = 'closed';
       this._logger.close();
-      await this._dispatcher.publish('connection.state', { state: this._state });
+      await this._dispatcher.publish('connection.state', { state: this._publicState(this._state) });
       this._resetSeqTrackingState();
       this._clientLog.debug(`close exit: elapsed=${Date.now() - tStart}ms`);
     } catch (err) {
@@ -1483,7 +1987,14 @@ export class AUNClient {
         this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms (closing)`);
         return;
       }
-      if (this._state !== 'connected' && this._state !== 'reconnecting') {
+      if (![
+        ConnectionState.AUTHENTICATED,
+        ConnectionState.CONNECTING,
+        ConnectionState.READY,
+        ConnectionState.RETRY_BACKOFF,
+        ConnectionState.RECONNECTING,
+        ConnectionState.CONNECTION_FAILED,
+      ].includes(this.state)) {
         this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms (state=${this._state})`);
         return;
       }
@@ -1491,85 +2002,12 @@ export class AUNClient {
       this._stopBackgroundTasks();
       this._stopReconnect();
       await this._transport.close();
-      this._state = 'disconnected';
-      await this._dispatcher.publish('connection.state', { state: this._state });
+      this._state = 'standby';
+      await this._dispatcher.publish('connection.state', { state: this._publicState(this._state) });
       this._clientLog.debug(`disconnect exit: elapsed=${Date.now() - tStart}ms`);
     } catch (err) {
       this._clientLog.debug(`disconnect exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
-    }
-  }
-
-  /**
-   * 列出本地身份摘要。
-   *
-   * @param opts.all=false（默认）：仅返回严格校验通过的可用身份——
-   *   keypair 完整 + cert 公钥 == keypair 公钥 + cert 时间窗口有效
-   * @param opts.all=true：返回所有 AIDs/ 子目录（不含 _pending/）；
-   *   每项含 valid=bool 和 reason=string 字段
-   */
-  listIdentities(opts?: { all?: boolean }): Array<{ aid: string; valid: boolean; reason?: string; metadata?: Record<string, unknown> }> {
-    const tStart = Date.now();
-    const includeAll = !!opts?.all;
-    this._clientLog.debug(`listIdentities enter all=${includeAll}`);
-    try {
-      const listFn = (this._keystore as KeyStore & {
-        listIdentities?: () => string[];
-      }).listIdentities;
-      if (typeof listFn !== 'function') {
-        this._clientLog.debug(`listIdentities exit: elapsed=${Date.now() - tStart}ms (no_list_fn)`);
-        return [];
-      }
-      const aids = listFn.call(this._keystore);
-      const summaries: Array<{ aid: string; valid: boolean; reason?: string; metadata?: Record<string, unknown> }> = [];
-      for (const aid of [...aids].sort()) {
-        const { valid, reason } = this._validateLocalIdentity(aid);
-        if (!includeAll && !valid) continue;
-        const summary: { aid: string; valid: boolean; reason?: string; metadata?: Record<string, unknown> } = { aid, valid };
-        if (reason) summary.reason = reason;
-        const loadMetadata = (this._keystore as KeyStore & {
-          loadMetadata?: (aid: string) => Record<string, unknown> | null;
-        }).loadMetadata;
-        if (typeof loadMetadata === 'function') {
-          const md = loadMetadata.call(this._keystore, aid);
-          if (md) summary.metadata = md;
-        }
-        summaries.push(summary);
-      }
-      this._clientLog.debug(`listIdentities exit: elapsed=${Date.now() - tStart}ms all=${includeAll} count=${summaries.length}`);
-      return summaries;
-    } catch (err) {
-      this._clientLog.debug(`listIdentities exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
-  }
-
-  /**
-   * 严格校验本地身份的可用性。返回 {valid, reason}。
-   * 4 项校验：keypair 完整 + cert 存在 + cert 公钥 == keypair 公钥 + cert 时间窗口有效。
-   */
-  private _validateLocalIdentity(aid: string): { valid: boolean; reason: string } {
-    const identity = this._keystore.loadIdentity(aid);
-    if (!identity) return { valid: false, reason: 'no identity record' };
-    const priv = String(identity.private_key_pem ?? '');
-    const pubB64 = String(identity.public_key_der_b64 ?? '');
-    const certPem = String(identity.cert ?? '');
-    if (!priv || !pubB64) return { valid: false, reason: 'missing keypair' };
-    if (!certPem) return { valid: false, reason: 'missing certificate' };
-    try {
-      const crypto = require('node:crypto') as typeof import('node:crypto');
-      const cert = new crypto.X509Certificate(certPem);
-      const certPubDer = cert.publicKey.export({ type: 'spki', format: 'der' });
-      const localPubDer = Buffer.from(pubB64, 'base64');
-      if (!certPubDer.equals(localPubDer)) {
-        return { valid: false, reason: 'cert public key does not match keypair' };
-      }
-      const now = Date.now();
-      if (now < new Date(cert.validFrom).getTime()) return { valid: false, reason: 'cert not yet valid' };
-      if (now > new Date(cert.validTo).getTime()) return { valid: false, reason: 'cert expired' };
-      return { valid: true, reason: '' };
-    } catch (e) {
-      return { valid: false, reason: `cert parse error: ${e instanceof Error ? e.message : String(e)}` };
     }
   }
 
@@ -1583,7 +2021,7 @@ export class AUNClient {
     const tStart = Date.now();
     this._clientLog.debug(`call enter: method=${method}`);
     try {
-    if (this._state !== 'connected') {
+    if (this.state !== ConnectionState.READY) {
       throw new ConnectionError('client is not connected');
     }
     if (INTERNAL_ONLY_METHODS.has(method)) {
@@ -1594,6 +2032,10 @@ export class AUNClient {
     }
 
     const p = { ...(params ?? {}) };
+    if (this._instanceProtectedHeaders && PROTECTED_HEADERS_METHODS.has(method)) {
+      const existing = isJsonObject(p.protected_headers) ? p.protected_headers : {};
+      p.protected_headers = { ...this._instanceProtectedHeaders, ...existing };
+    }
     const rpcBackground = Boolean((p as Record<string, unknown>)._rpc_background) || this._backgroundRpcDepth > 0;
     delete (p as Record<string, unknown>)._rpc_background;
     const runWithRpcPriority = async <T>(operation: () => Promise<T> | T): Promise<T> => {
@@ -1645,7 +2087,7 @@ export class AUNClient {
       const encrypt = p.encrypt ?? true;
       delete p.encrypt;
       if (encrypt) {
-        return await runWithRpcPriority(() => this.sendV2(String(p.to ?? ''), p.payload as Record<string, unknown>, {
+        return await runWithRpcPriority(() => this._sendV2(String(p.to ?? ''), p.payload as Record<string, unknown>, {
           messageId: String(p.message_id ?? '') || undefined,
           timestamp: p.timestamp as number | undefined,
           protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
@@ -1661,7 +2103,7 @@ export class AUNClient {
       const encrypt = p.encrypt ?? true;
       delete p.encrypt;
       if (encrypt) {
-        return await runWithRpcPriority(() => this.sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown>, {
+        return await runWithRpcPriority(() => this._sendGroupV2(String(p.group_id ?? ''), p.payload as Record<string, unknown>, {
           messageId: String(p.message_id ?? '') || undefined,
           timestamp: p.timestamp as number | undefined,
           protectedHeaders: this._protectedHeadersFromParams(p) as Record<string, unknown> | undefined,
@@ -1701,14 +2143,14 @@ export class AUNClient {
       const afterSeq = Number(p.after_seq ?? 0) || 0;
       const limit = Number(p.limit ?? 50) || 50;
       const messages = skipAutoAck
-        ? await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { skipAutoAck: true, gateLocked: true, force }))
-        : await runWithRpcPriority(() => this.pullV2(afterSeq, limit, { gateLocked: true, force }));
+        ? await runWithRpcPriority(() => this._pullV2(afterSeq, limit, { skipAutoAck: true, gateLocked: true, force }))
+        : await runWithRpcPriority(() => this._pullV2(afterSeq, limit, { gateLocked: true, force }));
       return { messages } as RpcResult;
     }
 
     if (method === 'message.ack' || method === 'message.v2.ack') {
       await this._ensureV2SessionReady('message.ack');
-      return await runWithRpcPriority(() => this.ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined)) as RpcResult;
+      return await runWithRpcPriority(() => this._ackV2(Number(p.seq ?? p.up_to_seq ?? 0) || undefined)) as RpcResult;
     }
 
     if (method === 'group.pull' || method === 'group.v2.pull') {
@@ -1716,7 +2158,7 @@ export class AUNClient {
         throw new ValidationError('group.pull requires group_id');
       }
       await this._ensureV2SessionReady('group.pull');
-      const messages = await runWithRpcPriority(() => this.pullGroupV2(
+      const messages = await runWithRpcPriority(() => this._pullGroupV2(
         String(p.group_id),
         Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
         Number(p.limit ?? 50) || 50,
@@ -1730,7 +2172,7 @@ export class AUNClient {
         throw new ValidationError('group.ack_messages requires group_id');
       }
       await this._ensureV2SessionReady('group.ack_messages');
-      return await runWithRpcPriority(() => this.ackGroupV2(
+      return await runWithRpcPriority(() => this._ackGroupV2(
         String(p.group_id),
         Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
       )) as RpcResult;
@@ -1797,50 +2239,6 @@ export class AUNClient {
     return result;
     } catch (err) {
       this._clientLog.debug(`call exit (error): method=${method} elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
-  }
-
-  // ── 便利方法 ──────────────────────────────────────────────
-
-  /** 心跳检测 */
-  async ping(params?: RpcParams): Promise<RpcResult> {
-    const tStart = Date.now();
-    this._clientLog.debug(`ping enter`);
-    try {
-      const result = await this.call('meta.ping', params ?? {});
-      this._clientLog.debug(`ping exit: elapsed=${Date.now() - tStart}ms`);
-      return result;
-    } catch (err) {
-      this._clientLog.debug(`ping exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
-  }
-
-  /** 获取服务端状态 */
-  async status(params?: RpcParams): Promise<RpcResult> {
-    const tStart = Date.now();
-    this._clientLog.debug(`status enter`);
-    try {
-      const result = await this.call('meta.status', params ?? {});
-      this._clientLog.debug(`status exit: elapsed=${Date.now() - tStart}ms`);
-      return result;
-    } catch (err) {
-      this._clientLog.debug(`status exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
-  }
-
-  /** 获取信任根证书列表 */
-  async trustRoots(params?: RpcParams): Promise<RpcResult> {
-    const tStart = Date.now();
-    this._clientLog.debug(`trustRoots enter`);
-    try {
-      const result = await this.call('meta.trust_roots', params ?? {});
-      this._clientLog.debug(`trustRoots exit: elapsed=${Date.now() - tStart}ms`);
-      return result;
-    } catch (err) {
-      this._clientLog.debug(`trustRoots exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
   }
@@ -2021,7 +2419,7 @@ export class AUNClient {
         const maxSeen = this._seqTracker.getMaxSeenSeq(ns);
         const ackSeq = maxSeen > 0 ? Math.min(contig, maxSeen) : contig;
         this._clientLog.debug(`P2P push auto-ack send: ns=${ns}, seq=${ackSeq}, contiguous=${contig}, max_seen=${maxSeen}`);
-          this._withBackgroundRpc(() => this.ackV2(ackSeq))
+          this._withBackgroundRpc(() => this._ackV2(ackSeq))
             .then(() => { this._clientLog.debug(`P2P push auto-ack ok: ns=${ns}, seq=${ackSeq}`); })
             .catch((e) => { this._clientLog.debug(`P2P auto-ack failed: ${formatCaughtError(e)}`); });
       }
@@ -2114,7 +2512,7 @@ export class AUNClient {
         const maxSeen = this._seqTracker.getMaxSeenSeq(ns);
         const ackSeq = maxSeen > 0 ? Math.min(contig, maxSeen) : contig;
         this._clientLog.debug(`group push auto-ack send: group=${groupId}, ns=${ns}, seq=${ackSeq}, contiguous=${contig}, max_seen=${maxSeen}`);
-          this._withBackgroundRpc(() => this.ackGroupV2(groupId, ackSeq))
+          this._withBackgroundRpc(() => this._ackGroupV2(groupId, ackSeq))
             .then(() => { this._clientLog.debug(`group push auto-ack ok: group=${groupId}, seq=${ackSeq}`); })
             .catch((e) => { this._clientLog.debug(`group message auto-ack failed: group=${groupId} ${formatCaughtError(e)}`); });
       }
@@ -2143,7 +2541,7 @@ export class AUNClient {
     this._clientLog.debug(`auto pull group messages start: group=${groupId}, after_seq=${afterSeq}, seq=${String(notification.seq ?? '')}`);
     const started = await this._tryRunBackgroundPull(ns, async () => {
       const pullAfterSeq = this._seqTracker.getContiguousSeq(ns);
-      const messages = await this.pullGroupV2(groupId, pullAfterSeq, 50, { gateLocked: true });
+      const messages = await this._pullGroupV2(groupId, pullAfterSeq, 50, { gateLocked: true });
       this._prunePushedSeqs(ns);
       return messages.length;
     }, true);
@@ -2170,7 +2568,7 @@ export class AUNClient {
     this._clientLog.debug(`group message gap fill start: group=${groupId}, after_seq=${afterSeq}`);
     let filled = 0;
     try {
-      const messages = await this._withBackgroundRpc(() => this.pullGroupV2(groupId, afterSeq, 50, { gateLocked: true }));
+      const messages = await this._withBackgroundRpc(() => this._pullGroupV2(groupId, afterSeq, 50, { gateLocked: true }));
       filled = messages.length;
       this._prunePushedSeqs(ns);
       if (this._seqTracker.getContiguousSeq(ns) !== afterSeq) {
@@ -2206,7 +2604,7 @@ export class AUNClient {
     this._clientLog.debug(`P2P message gap fill start: after_seq=${afterSeq}`);
     let filled = 0;
     try {
-      const messages = await this._withBackgroundRpc(() => this.pullV2(afterSeq, 50, { skipAutoAck: true, gateLocked: true }));
+      const messages = await this._withBackgroundRpc(() => this._pullV2(afterSeq, 50, { skipAutoAck: true, gateLocked: true }));
       filled = messages.length;
       this._prunePushedSeqs(ns);
       if (this._seqTracker.getContiguousSeq(ns) !== afterSeq) {
@@ -2215,7 +2613,7 @@ export class AUNClient {
       }
       const contig = this._seqTracker.getContiguousSeq(ns);
       if (contig > 0 && contig !== afterSeq) {
-        await this._withBackgroundRpc(() => this.ackV2(contig));
+        await this._withBackgroundRpc(() => this._ackV2(contig));
       }
       this._clientLog.debug(`P2P message gap fill done: after_seq=${afterSeq}, filled=${filled}`);
     } catch (exc) {
@@ -2261,7 +2659,7 @@ export class AUNClient {
       this._clientLog.debug(`P2P pending pull upper already covered: ns=${ns}, upper_seq=${upperSeq}, contiguous=${contig}, reason=${reason}`);
       return false;
     }
-    if (this._state !== 'connected' || this._closing) {
+    if (this.state !== ConnectionState.READY || this._closing) {
       this._clientLog.debug(`P2P pending pull postponed: ns=${ns}, upper_seq=${upperSeq}, contiguous=${contig}, state=${this._state}, closing=${this._closing}, reason=${reason}`);
       return false;
     }
@@ -2639,13 +3037,13 @@ export class AUNClient {
       try {
         await this._withBackgroundRpc(async () => {
           if (method === 'message.pull' || method === 'message.v2.pull') {
-            await this.pullV2(Number(next.after_seq ?? 0) || 0, Number(next.limit ?? 50) || 50);
+            await this._pullV2(Number(next.after_seq ?? 0) || 0, Number(next.limit ?? 50) || 50);
             return;
           }
           if (method === 'group.pull' || method === 'group.v2.pull') {
             const groupId = String(next.group_id ?? '').trim();
             if (!groupId) return;
-            await this.pullGroupV2(groupId, Number(next.after_seq ?? next.after_message_seq ?? 0) || 0, Number(next.limit ?? 50) || 50);
+            await this._pullGroupV2(groupId, Number(next.after_seq ?? next.after_message_seq ?? 0) || 0, Number(next.limit ?? 50) || 50);
             return;
           }
           await this.call(method, next);
@@ -3904,10 +4302,10 @@ export class AUNClient {
         }
       }
 
-      this._state = 'connected';
+      this._state = 'ready';
       this._connectedAt = Date.now();
       this._clientLog.debug(`auth complete, connection ready: aid=${this._aid ?? ''}, gateway=${gatewayUrl}`);
-      await this._dispatcher.publish('connection.state', { state: this._state, gateway: gatewayUrl });
+      await this._dispatcher.publish('connection.state', { state: this._publicState(this._state), gateway: gatewayUrl });
 
       // auth 阶段 aid 可能被 identity 覆盖（上方 this._aid = identity.aid）；
       // 若 context 发生变化，重新 refresh + restore，保持 tracker 与真实身份一致。
@@ -3920,7 +4318,7 @@ export class AUNClient {
 
       // V2 E2EE：初始化 session 并注册本设备 SPK。
       try {
-        await this.initV2Session();
+        await this._initV2Session();
       } catch (exc) {
         this._clientLog.warn(`V2 session init failed (non-fatal): ${formatCaughtError(exc)}`);
       }
@@ -3932,7 +4330,7 @@ export class AUNClient {
       });
       this._clientLog.debug(`_connectOnce exit: elapsed=${Date.now() - tStart}ms gateway=${gatewayUrl}, aid=${this._aid ?? ''}`);
     } catch (err) {
-      this._state = prevState === 'connected' ? 'disconnected' : 'idle';
+      this._state = (prevState === 'connected' || prevState === 'ready') ? 'standby' : (this._currentAid ? 'standby' : 'no_identity');
       this._clientLog.debug(`_connectOnce exit (error): elapsed=${Date.now() - tStart}ms gateway=${gatewayUrl} err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
@@ -3982,7 +4380,7 @@ export class AUNClient {
    * 初始化 V2 session：IK 使用 AID 长期私钥，SPK 存储在 per-AID SQLite 的 v2_device_keys 表。
    * connect 成功后会自动调用；重复调用幂等。
    */
-  async initV2Session(): Promise<void> {
+  private async _initV2Session(): Promise<void> {
     if (!this._aid) return;
     const existing = this._v2Session;
     if (existing && existing.aid === this._aid && existing.deviceId === this._deviceId) {
@@ -4455,7 +4853,7 @@ export class AUNClient {
   }
 
   /** V2 P2P 加密发送，推测性缓存失败后刷新 bootstrap 重试一次。 */
-  async sendV2(
+  private async _sendV2(
     to: string,
     payload: Record<string, unknown>,
     opts?: { messageId?: string; timestamp?: number; protectedHeaders?: ProtectedHeadersInput; context?: Record<string, unknown> },
@@ -4505,7 +4903,7 @@ export class AUNClient {
   }
 
   /** V2 P2P 拉取并解密；直接方法返回消息数组，call("message.pull") 会包装为 {messages}. */
-  async pullV2(
+  private async _pullV2(
     afterSeq: number = 0,
     limit: number = 50,
     opts?: { skipAutoAck?: boolean; gateLocked?: boolean; scheduleFollowup?: boolean; force?: boolean },
@@ -4513,7 +4911,7 @@ export class AUNClient {
     await this._ensureV2SessionReady('message.pull');
     const ns = this._aid ? `p2p:${this._aid}` : '';
     if (ns && !opts?.gateLocked) {
-      return await this._runPullSerialized(ns, async () => this.pullV2(afterSeq, limit, {
+      return await this._runPullSerialized(ns, async () => this._pullV2(afterSeq, limit, {
         ...(opts ?? {}),
         gateLocked: true,
         scheduleFollowup: true,
@@ -4628,7 +5026,7 @@ export class AUNClient {
         }
         if (messages.length > 0 && contigAdvanced && ackSeq > 0 && !opts?.skipAutoAck) {
           this._clientLog.debug(`message.v2.pull scheduling auto-ack: ns=${ns}, ack_seq=${ackSeq}, raw_count=${messages.length}`);
-          this._safeAsync(this.ackV2(ackSeq).then(() => undefined));
+          this._safeAsync(this._ackV2(ackSeq).then(() => undefined));
         }
       }
 
@@ -4645,7 +5043,7 @@ export class AUNClient {
   }
 
   /** V2 P2P ack，并触发旧 SPK 销毁自检。 */
-  async ackV2(upToSeq?: number): Promise<unknown> {
+  private async _ackV2(upToSeq?: number): Promise<unknown> {
     const ns = this._aid ? `p2p:${this._aid}` : '';
     let seq = Number(upToSeq ?? (ns ? this._seqTracker.getContiguousSeq(ns) : 0));
     if (!Number.isFinite(seq) || seq <= 0) {
@@ -4688,7 +5086,7 @@ export class AUNClient {
   }
 
   /** V2 Group 加密发送，推测性缓存失败后刷新 bootstrap 重试一次。 */
-  async sendGroupV2(
+  private async _sendGroupV2(
     groupId: string,
     payload: Record<string, unknown>,
     opts?: { messageId?: string; timestamp?: number; protectedHeaders?: ProtectedHeadersInput; context?: Record<string, unknown> },
@@ -4891,11 +5289,11 @@ export class AUNClient {
   }
 
   private async _pullGroupV2Internal(params: { group_id: string; after_seq: number; limit: number }): Promise<void> {
-    await this.pullGroupV2(params.group_id, params.after_seq, params.limit, { gateLocked: true });
+    await this._pullGroupV2(params.group_id, params.after_seq, params.limit, { gateLocked: true });
   }
 
   /** V2 Group 拉取并解密；直接方法返回消息数组，call("group.pull") 会包装为 {messages}. */
-  async pullGroupV2(
+  private async _pullGroupV2(
     groupId: string,
     afterSeq: number = 0,
     limit: number = 50,
@@ -4906,7 +5304,7 @@ export class AUNClient {
     if (!gid) throw new ValidationError('group.pull requires group_id');
     const ns = `group:${gid}`;
     if (!opts?.gateLocked) {
-      return await this._runPullSerialized(ns, async () => this.pullGroupV2(gid, afterSeq, limit, {
+      return await this._runPullSerialized(ns, async () => this._pullGroupV2(gid, afterSeq, limit, {
         ...(opts ?? {}),
         gateLocked: true,
         scheduleFollowup: true,
@@ -5023,7 +5421,7 @@ export class AUNClient {
       }
       if (messages.length > 0 && contigAdvanced && ackSeq > 0) {
         this._clientLog.debug(`group.v2.pull scheduling auto-ack: group=${gid}, ns=${ns}, ack_seq=${ackSeq}, raw_count=${messages.length}`);
-        this._safeAsync(this.ackGroupV2(gid, ackSeq).then(() => undefined));
+        this._safeAsync(this._ackGroupV2(gid, ackSeq).then(() => undefined));
       }
 
       const nextAfter = Math.max(pageMaxSeq, nextAfterSeq);
@@ -5039,7 +5437,7 @@ export class AUNClient {
   }
 
   /** V2 Group ack。 */
-  async ackGroupV2(groupId: string, upToSeq?: number): Promise<unknown> {
+  private async _ackGroupV2(groupId: string, upToSeq?: number): Promise<unknown> {
     const gid = normalizeGroupId(groupId) || String(groupId ?? '').trim();
     if (!gid) throw new ValidationError('group.ack_messages requires group_id');
     const ns = `group:${gid}`;
@@ -6239,7 +6637,7 @@ export class AUNClient {
       }
       this._gapFillDone.set(dedupKey, Date.now());
       try {
-        const pulled = await this.pullV2(0, 50, { gateLocked: true });
+        const pulled = await this._pullV2(0, 50, { gateLocked: true });
         const newContig = this._seqTracker.getContiguousSeq(ns);
         this._clientLog.debug(
           `_onV2PushNotification pull done: contiguous_seq=${contigBefore}->${newContig} (push_seq=${pushSeq || 'null'})`
@@ -6334,7 +6732,7 @@ export class AUNClient {
       this._gapFillDone.set(dedupKey, Date.now());
       try {
         this._clientLog.debug(`_onRawGroupV2MessageCreated auto-pull start: group=${groupId}, after_seq=${pullAfterSeq}, push_seq=${seq}`);
-        const pulled = await this.pullGroupV2(groupId, pullAfterSeq, 50, { gateLocked: true });
+        const pulled = await this._pullGroupV2(groupId, pullAfterSeq, 50, { gateLocked: true });
         const newContig = this._seqTracker.getContiguousSeq(ns);
         this._clientLog.debug(`_onRawGroupV2MessageCreated auto-pull done: group=${groupId}, after_seq=${pullAfterSeq}, push_seq=${seq}, contiguous=${newContig}`);
         if (newContig <= pullAfterSeq) return 0;
@@ -6365,6 +6763,59 @@ export class AUNClient {
     } catch (exc) {
       this._clientLog.debug(`SPK rotation after V2 epoch change failed (non-fatal): ${formatCaughtError(exc)}`);
     }
+  }
+
+  /** 按当前 AID 发现 Gateway；用于 authenticate()/connect() 的新入口。 */
+  private async _resolveGatewayForAid(aid: string): Promise<string> {
+    const resolvedAid = String(aid ?? this._aid ?? '').trim();
+    if (!resolvedAid) {
+      throw new StateError('gateway discovery requires a loaded AID');
+    }
+    if (this._gatewayUrl) return this._gatewayUrl;
+
+    try {
+      const loadMetadata = (this._keystore as KeyStore & {
+        loadMetadata?: (aid: string) => Record<string, unknown> | null;
+      }).loadMetadata;
+      const cachedGateway = typeof loadMetadata === 'function'
+        ? String(loadMetadata.call(this._keystore, resolvedAid)?.gateway_url ?? '').trim()
+        : '';
+      if (cachedGateway) {
+        this._gatewayUrl = cachedGateway;
+        return cachedGateway;
+      }
+    } catch {
+      // 缓存读取失败不影响发现流程。
+    }
+
+    const dotIdx = resolvedAid.indexOf('.');
+    const issuerDomain = dotIdx >= 0 ? resolvedAid.slice(dotIdx + 1) : resolvedAid;
+    const portSuffix = this._configModel.discoveryPort ? `:${this._configModel.discoveryPort}` : '';
+    const aidUrl = `https://${resolvedAid}${portSuffix}/.well-known/aun-gateway`;
+    const gatewayDomainUrl = `https://gateway.${issuerDomain}${portSuffix}/.well-known/aun-gateway`;
+    const candidates = this._configModel.verifySsl ? [aidUrl, gatewayDomainUrl] : [gatewayDomainUrl, aidUrl];
+    let lastErr: unknown = null;
+    for (const url of candidates) {
+      try {
+        const gateway = await this._discovery.discover(url);
+        this._gatewayUrl = gateway;
+        try {
+          const saveMetadata = (this._keystore as KeyStore & {
+            saveMetadata?: (aid: string, metadata: Record<string, unknown>) => void;
+          }).saveMetadata;
+          if (typeof saveMetadata === 'function') {
+            saveMetadata.call(this._keystore, resolvedAid, { gateway_url: gateway, gateway_cached_at: Date.now() });
+          }
+        } catch {
+          // 缓存写入失败不影响连接。
+        }
+        return gateway;
+      } catch (err) {
+        lastErr = err;
+        this._clientLog.warn(`gateway discovery failed: aid=${resolvedAid} url=${url} err=${formatCaughtError(err)}`);
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new ConnectionError(`gateway discovery failed for ${resolvedAid}`);
   }
 
   /** 从参数中解析 Gateway URL */
@@ -6419,13 +6870,16 @@ export class AUNClient {
   // ── 内部：参数处理 ────────────────────────────────────────
 
   /** 规范化连接参数 */
-  private _normalizeConnectParams(params: RpcParams): ConnectParams {
+  private _normalizeConnectParams(params: RpcParams, opts: { requireAccessToken?: boolean } = {}): ConnectParams {
     const request: ConnectParams = { ...params };
     const accessToken = String(request.access_token ?? '');
-    if (!accessToken) throw new StateError('connect requires non-empty access_token');
+    if (!accessToken && opts.requireAccessToken === true) {
+      throw new StateError('connect requires non-empty access_token');
+    }
     const gateway = String(request.gateway ?? this._gatewayUrl ?? '');
     if (!gateway) throw new StateError('connect requires non-empty gateway');
-    request.access_token = accessToken;
+    if (accessToken) request.access_token = accessToken;
+    else delete request.access_token;
     request.gateway = gateway;
     request.device_id = this._deviceId;
     request.slot_id = normalizeInstanceId(request.slot_id ?? this._slotId, 'slot_id', { allowEmpty: true });
@@ -6535,7 +6989,7 @@ export class AUNClient {
     const maxFailures = 2;
 
     this._heartbeatTimer = setInterval(() => {
-      if (this._closing || this._state !== 'connected') return;
+      if (this._closing || this.state !== ConnectionState.READY) return;
       this._transport.call('meta.ping', {}).then((pong) => {
         consecutiveFailures = 0;
         // 服务端可在 pong 中下发新的 heartbeat_interval（秒，0=关闭）
@@ -6569,7 +7023,7 @@ export class AUNClient {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;
     }
-    if (newInterval > 0 && this._state === 'connected' && !this._closing) {
+    if (newInterval > 0 && this.state === ConnectionState.READY && !this._closing) {
       this._startHeartbeatTask();
     }
   }
@@ -6587,7 +7041,7 @@ export class AUNClient {
       this._tokenRefreshTimer = setTimeout(async () => {
         if (this._closing) return;
         this._tokenRefreshTimer = null;
-        if (this._state !== 'connected' || !this._gatewayUrl) {
+        if (this.state !== ConnectionState.READY || !this._gatewayUrl) {
           scheduleNext();
           return;
         }
@@ -6609,12 +7063,14 @@ export class AUNClient {
           return;
         }
 
-        if (this._closing || this._state !== 'connected' || !this._gatewayUrl) {
+        if (this._closing || this.state !== ConnectionState.READY || !this._gatewayUrl) {
           scheduleNext();
           return;
         }
         try {
           identity = await this._auth.refreshCachedTokens(this._gatewayUrl!, identity!);
+          // 刷新期间可能已断线，复检状态，避免写回 stale identity
+          if (this.state !== ConnectionState.READY) { scheduleNext(); return; }
           this._identity = identity;
           if (this._sessionParams !== null && identity.access_token) {
             this._sessionParams.access_token = identity.access_token;
@@ -6788,7 +7244,7 @@ export class AUNClient {
       `server initiated disconnect: code=${code}, reason=${reason}, detail=${JSON.stringify(detail)}`,
     );
     this._serverKicked = true;
-    // 缓存最近一次 disconnect 信息，让后续 connection.state(terminal_failed) 也能带 detail
+    // 缓存最近一次 disconnect 信息，让后续 connection.state(connection_failed) 也能带 detail
     this._lastDisconnectInfo = { code, reason, detail };
     // 透传给应用层订阅者
     try {
@@ -6806,24 +7262,24 @@ export class AUNClient {
 
   /** 传输层断线回调 */
   private async _handleTransportDisconnect(error: Error | null, closeCode?: number): Promise<void> {
-    if (this._closing || this._state === 'closed') return;
+    if (this._closing || this.state === ConnectionState.CLOSED) return;
     // 已在重连中则跳过，避免心跳超时和 transport 断线回调重复触发
     if (this._reconnectActive) return;
     this._clientLog.warn(`transport disconnected: closeCode=${closeCode ?? 'none'}, error=${error ? formatCaughtError(error) : 'none'}`);
-    this._state = 'disconnected';
+    this._state = 'standby';
     this._stopBackgroundTasks();
-    await this._dispatcher.publish('connection.state', { state: this._state, error });
+    await this._dispatcher.publish('connection.state', { state: this._publicState(this._state), error });
 
     if (!this._sessionOptions.auto_reconnect) return;
     if (this._reconnectActive) return;
     // 不重连 close code（认证失败/权限错误/被踢等）或服务端通知断开：抑制重连
     if (this._serverKicked || (closeCode !== undefined && AUNClient._NO_RECONNECT_CODES.has(closeCode))) {
-      this._state = 'terminal_failed';
+      this._state = 'connection_failed';
       const reason = this._serverKicked ? 'server kicked' : `close code ${closeCode}`;
       this._clientLog.warn(`suppressing auto-reconnect: ${reason}`);
       const disconnectInfo = this._lastDisconnectInfo ?? {};
       const eventPayload: Record<string, any> = {
-        state: this._state, error, reason,
+        state: this._publicState(this._state), error, reason,
       };
       // 把服务端附带的结构化 detail（如配额超限信息）也带给应用层
       if (disconnectInfo.detail && Object.keys(disconnectInfo.detail).length > 0) {
@@ -6860,6 +7316,7 @@ export class AUNClient {
     );
     const maxAttemptsRaw = Number(retry.max_attempts ?? 0);
     const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? Math.floor(maxAttemptsRaw) : 0;
+    this._retryMaxAttempts = maxAttempts;
     let delay = clampReconnectDelayMs(
       serverInitiated ? 16_000 : Number(retry.initial_delay ?? 1.0) * 1000,
       serverInitiated ? 16_000 : RECONNECT_MIN_BASE_DELAY_MS,
@@ -6870,25 +7327,33 @@ export class AUNClient {
       if (this._closing) break;
       // max_attempts 检查在循环顶部，覆盖所有路径（含 health-fail）
       if (maxAttempts > 0 && attempt > maxAttempts) {
-        this._state = 'terminal_failed';
+        this._state = 'connection_failed';
         await this._dispatcher.publish('connection.state', {
-          state: this._state,
+          state: this._publicState(this._state),
           attempt: attempt - 1,
           reason: 'max_attempts_exhausted',
         });
         break;
       }
 
-      this._state = 'reconnecting';
+      this._retryAttempt = attempt;
+      this._nextRetryAt = Date.now() + reconnectSleepDelayMs(delay, maxBaseDelay);
+      this._state = 'retry_backoff';
       await this._dispatcher.publish('connection.state', {
-        state: this._state,
+        state: this._publicState(this._state),
         attempt,
+        next_retry_at: this._nextRetryAt,
       });
 
       try {
         // 固定上限抖动：base=[1s, max_base]，delay=base+rand(0..max_base)。
-        await this._sleep(reconnectSleepDelayMs(delay, maxBaseDelay));
+        await this._sleep(Math.max(0, this._nextRetryAt - Date.now()));
         if (this._reconnectAbort?.signal.aborted || this._closing) break;
+        this._state = 'reconnecting';
+        await this._dispatcher.publish('connection.state', {
+          state: this._publicState(this._state),
+          attempt,
+        });
 
         // 重连前先 GET /health 探测，不健康则跳过本轮
         if (this._gatewayUrl) {
@@ -6905,6 +7370,7 @@ export class AUNClient {
         await this._connectOnce(this._sessionParams, true);
         // 重连成功，退出循环
         this._clientLog.debug(`reconnect success: attempt=${attempt}, aid=${this._aid ?? ''}`);
+        this._nextRetryAt = null;
         this._reconnectActive = false;
         this._reconnectAbort = null;
         return;
@@ -6914,9 +7380,9 @@ export class AUNClient {
           attempt,
         });
         if (!AUNClient._shouldRetryReconnect(exc as Error)) {
-          this._state = 'terminal_failed';
+          this._state = 'connection_failed';
           await this._dispatcher.publish('connection.state', {
-            state: this._state,
+            state: this._publicState(this._state),
             error: formatCaughtError(exc),
             attempt,
           });
@@ -6953,7 +7419,7 @@ export class AUNClient {
    * 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，
    * 服务端签发群 AID 证书，返回后将证书和私钥存入 keystore。
    */
-  async createNamedGroup(groupName: string, opts: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  private async createNamedGroup(groupName: string, opts: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const tStart = Date.now();
     this._clientLog.debug(`createNamedGroup enter: groupName=${groupName}`);
     try {
@@ -6995,7 +7461,7 @@ export class AUNClient {
   /**
    * 为已有普通群绑定命名 AID（升级为命名群）。
    */
-  async bindGroupAid(groupId: string, groupName: string): Promise<Record<string, unknown>> {
+  private async bindGroupAid(groupId: string, groupName: string): Promise<Record<string, unknown>> {
     const tStart = Date.now();
     this._clientLog.debug(`bindGroupAid enter: groupId=${groupId}, groupName=${groupName}`);
     try {
