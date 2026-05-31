@@ -1,8 +1,20 @@
 package keystore
 
-// KeyStore 密钥存储接口
+import "time"
+
+// TokenStore 不含私钥操作的存储接口，AuthFlow / AUNClient 持有此类型。
+// 包含：证书、token/实例状态、seq、群组状态、E2EE prekey、group secret、
+// metadata、agent.md 缓存、信任根等所有非私钥操作。
+type TokenStore interface {
+	// LoadCert 加载证书（PEM 字符串）
+	LoadCert(aid string) (string, error)
+
+	// SaveCert 保存证书（PEM 字符串）
+	SaveCert(aid string, certPEM string) error
+}
+
+// KeyStore 私钥/完整身份存储接口，仅 AIDStore / RegisterFlow 持有。
 // 定义了身份密钥、证书、元数据的增删查改操作。
-// 与 Python SDK keystore/base.py 的 KeyStore 抽象基类对应。
 type KeyStore interface {
 	// LoadKeyPair 加载指定 AID 的密钥对
 	LoadKeyPair(aid string) (map[string]any, error)
@@ -10,20 +22,34 @@ type KeyStore interface {
 	// SaveKeyPair 保存密钥对
 	SaveKeyPair(aid string, keyPair map[string]any) error
 
-	// LoadCert 加载证书（PEM 字符串）
-	LoadCert(aid string) (string, error)
-
-	// SaveCert 保存证书（PEM 字符串）
-	SaveCert(aid string, certPEM string) error
-
 	// LoadIdentity 加载完整身份信息（密钥对 + 证书 + 元数据合并）
 	LoadIdentity(aid string) (map[string]any, error)
 
-	// SaveIdentity 保存完整身份信息（自动拆分到密钥对、证书、元数据）
+	// SaveIdentity 保存完整身份信息（允许写入私钥字段）
 	SaveIdentity(aid string, identity map[string]any) error
 
 	// ListIdentities 列出所有具有有效私钥的 AID
 	ListIdentities() ([]string, error)
+}
+
+// FullKeyStore 物理 keystore 通常同时实现 TokenStore 与 KeyStore；
+// 注册流程显式使用组合类型。
+type FullKeyStore interface {
+	TokenStore
+	KeyStore
+}
+
+// PendingIdentityKeyStore 提供 RegisterAID pending 身份的崩溃恢复能力。
+// pending key.json 必须使用加密私钥字段，不能落盘 private_key_pem 明文。
+type PendingIdentityKeyStore interface {
+	PendingIdentityDir(aid string) (string, error)
+	ListPendingIdentityDirs(aid string) ([]string, error)
+	SavePendingKeyPair(pendingDir, aid string, keyPair map[string]any) error
+	LoadPendingKeyPair(pendingDir, aid string) (map[string]any, error)
+	SavePendingCert(pendingDir, certPEM string) error
+	PromotePendingIdentity(pendingDir, aid string) (string, error)
+	DiscardPendingIdentity(pendingDir string) error
+	CleanupPendingDirs(maxAge time.Duration) int
 }
 
 // AgentMDCacheRecord 是单个 owner AID 本地缓存的某个 target AID 的 agent.md 状态。
@@ -59,12 +85,6 @@ type AgentMDCacheUpsert struct {
 	LastError    *string
 }
 
-// AgentMDCacheStore 提供按 owner AID 隔离的 agent.md 缓存持久化能力。
-type AgentMDCacheStore interface {
-	LoadAgentMDCache(ownerAid, targetAid string) (*AgentMDCacheRecord, error)
-	UpsertAgentMDCache(ownerAid, targetAid string, fields AgentMDCacheUpsert) (*AgentMDCacheRecord, error)
-}
-
 // GroupState represents the current state_hash state for a group.
 type GroupState struct {
 	GroupID        string `json:"group_id"`
@@ -83,8 +103,6 @@ type GroupState struct {
 // - KeyStore 仍保持向后兼容，不强制所有实现立刻支持这些方法。
 // - 业务层（E2EE / group）会优先探测并使用该扩展接口，避免继续依赖整块 metadata 的读改写。
 type StructuredKeyStore interface {
-	KeyStore
-
 	// LoadE2EEPrekeys 加载某个 AID 指定设备的全部 prekey 私钥状态；deviceID 为空时加载默认设备
 	LoadE2EEPrekeys(aid, deviceID string) (map[string]map[string]any, error)
 
@@ -145,8 +163,6 @@ type GroupSecretTransitionOptions struct {
 
 // VersionedCertKeyStore 提供按证书指纹加载/保存版本化证书的能力。
 type VersionedCertKeyStore interface {
-	KeyStore
-
 	// LoadCertVersion 按 cert_fingerprint 加载证书版本
 	LoadCertVersion(aid, certFingerprint string) (string, error)
 
@@ -156,8 +172,6 @@ type VersionedCertKeyStore interface {
 
 // InstanceStateStore 提供 device_id / slot_id 维度的实例态持久化能力。
 type InstanceStateStore interface {
-	KeyStore
-
 	// LoadInstanceState 加载实例级状态
 	LoadInstanceState(aid, deviceID, slotID string) (map[string]any, error)
 
@@ -173,8 +187,6 @@ type InstanceStateStore interface {
 
 // SessionKeyStore 提供 E2EE session 独立存储能力（对标 Python AIDDatabase.e2ee_sessions 表）。
 type SessionKeyStore interface {
-	KeyStore
-
 	// LoadE2EESessions 加载某个 AID 的全部 E2EE session
 	LoadE2EESessions(aid string) ([]map[string]any, error)
 
@@ -184,8 +196,6 @@ type SessionKeyStore interface {
 
 // SeqTrackerStore 提供 seq tracker 结构化存储能力（对标 Python AIDDatabase.seq_tracker 表）。
 type SeqTrackerStore interface {
-	KeyStore
-
 	// SaveSeq 保存单个 namespace 的 contiguous_seq
 	SaveSeq(aid, deviceID, slotID, namespace string, contiguousSeq int) error
 

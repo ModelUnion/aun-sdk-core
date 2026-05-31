@@ -1,4 +1,9 @@
-// ── KeyStore 接口定义 ──────────────────────────────────────
+/**
+ * KeyStore / TokenStore 接口定义（浏览器版本 — 所有方法均为异步）。
+ *
+ * TokenStore — 不含私钥操作，AuthFlow / AUNClient 持有此类型。
+ * KeyStore   — 仅包含私钥/完整身份操作，AIDStore / RegisterFlow 持有。
+ */
 
 import type {
   GroupSecretRecord,
@@ -9,13 +14,6 @@ import type {
   PrekeyRecord,
   SessionRecord,
 } from '../types.js';
-
-/**
- * 密钥存储接口（浏览器版本 — 所有方法均为异步）。
- *
- * 与 Python SDK 的 KeyStore Protocol 等价，但由于 IndexedDB
- * 的异步特性，所有方法返回 Promise。
- */
 export interface AgentMdCacheRecord {
   aid: string;
   content: string;
@@ -33,15 +31,12 @@ export interface AgentMdCacheRecord {
 }
 
 export type AgentMdCacheUpsert = Partial<Omit<AgentMdCacheRecord, 'aid' | 'updated_at'>>;
-export interface KeyStore {
-  /** 列出本地已有身份 */
-  listIdentities?(): Promise<string[]>;
-  /** 加载密钥对 */
-  loadKeyPair(aid: string): Promise<KeyPairRecord | null>;
-  /** 保存密钥对 */
-  saveKeyPair(aid: string, keyPair: KeyPairRecord): Promise<void>;
-  /** 迁移 IndexedDB 中由 seed 加密的私钥 */
-  changeSeed?(oldSeed: string, newSeed: string): Promise<{ migrated: number; privateKeysMigrated: number }>;
+
+/**
+ * 不含私钥操作的存储接口（浏览器版本 — 所有方法均为异步）。
+ * AuthFlow / AUNClient 持有此类型。
+ */
+export interface TokenStore {
   /** 加载证书 PEM */
   loadCert(aid: string, certFingerprint?: string): Promise<string | null>;
   /** 保存证书 PEM */
@@ -51,10 +46,6 @@ export interface KeyStore {
     certFingerprint?: string,
     opts?: { makeActive?: boolean },
   ): Promise<void>;
-  /** 加载完整身份信息 */
-  loadIdentity(aid: string): Promise<IdentityRecord | null>;
-  /** 保存完整身份信息 */
-  saveIdentity(aid: string, identity: IdentityRecord): Promise<void>;
   /** 加载实例级状态 */
   loadInstanceState?(aid: string, deviceId: string, slotId?: string): Promise<MetadataRecord | null>;
   /** 保存实例级状态 */
@@ -139,8 +130,6 @@ export interface KeyStore {
   loadAllSeqs?(aid: string, deviceId: string, slotId: string): Promise<Record<string, number>>;
   /** 删除单个 namespace 的 contiguous_seq 行 */
   deleteSeq?(aid: string, deviceId: string, slotId: string, namespace: string): Promise<void>;
-  /** 列出已存储的所有身份 AID（可选） */
-  listIdentities?(): Promise<string[]>;
   /** 加载身份元数据（可选） */
   loadMetadata?(aid: string): Promise<Record<string, unknown> | null>;
   /** 读取单个 metadata KV（可选） */
@@ -177,3 +166,38 @@ export interface GroupStateRecord {
   policy_json: string;
   updated_at: number;
 }
+
+/** 私钥/完整身份存储接口，仅 AIDStore / RegisterFlow 持有。 */
+export interface KeyStore {
+  /** 加载密钥对 */
+  loadKeyPair(aid: string): Promise<KeyPairRecord | null>;
+  /** 保存密钥对 */
+  saveKeyPair(aid: string, keyPair: KeyPairRecord): Promise<void>;
+  /** 创建注册 pending 身份记录（返回 pending handle） */
+  pendingIdentityDir?(aid: string): Promise<string>;
+  /** 列出指定 AID 的注册 pending 记录 */
+  listPendingIdentityDirs?(aid: string): Promise<string[]>;
+  /** 保存 pending 密钥对；实现必须加密私钥字段 */
+  savePendingKeyPair?(handle: string, aid: string, keyPair: KeyPairRecord): Promise<void>;
+  /** 加载 pending 密钥对（返回时在内存中还原私钥） */
+  loadPendingKeyPair?(handle: string, aid: string): Promise<KeyPairRecord | null>;
+  /** 保存 pending 证书 */
+  savePendingCert?(handle: string, certPem: string): Promise<void>;
+  /** 将 pending 身份转正 */
+  promotePendingIdentity?(handle: string, aid: string): Promise<string>;
+  /** 删除指定 pending 身份 */
+  discardPendingIdentity?(handle: string): Promise<void>;
+  /** 清理超龄 pending 身份 */
+  cleanupPendingDirs?(maxAgeMs?: number): Promise<number>;
+  /** 加载完整身份信息（含私钥） */
+  loadIdentity(aid: string): Promise<IdentityRecord | null>;
+  /** 保存完整身份信息（允许写入私钥字段） */
+  saveIdentity(aid: string, identity: IdentityRecord): Promise<void>;
+  /** 列出所有已存储的 AID */
+  listIdentities?(): Promise<string[]>;
+  /** 迁移 IndexedDB 中由 seed 加密的私钥 */
+  changeSeed?(oldSeed: string, newSeed: string): Promise<{ migrated: number; privateKeysMigrated: number }>;
+}
+
+/** 物理实现通常同时实现 TokenStore 与 KeyStore；注册流程显式要求组合类型。 */
+export type FullKeyStore = TokenStore & KeyStore;

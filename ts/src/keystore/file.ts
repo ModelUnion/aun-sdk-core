@@ -24,7 +24,7 @@ import {
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
-import type { AgentMdCacheRecord, AgentMdCacheUpsert, KeyStore } from './index.js';
+import type { KeyStore } from './index.js';
 import type { SecretStore } from '../secret-store/index.js';
 import type { ModuleLogger } from '../logger.js';
 import { AIDDatabase } from './aid-db.js';
@@ -48,6 +48,22 @@ const TOKEN_FIELDS = new Set(['access_token', 'refresh_token', 'kite_token']);
 function secureFilePermissions(path: string): void {
   if (process.platform !== 'win32') {
     try { chmodSync(path, 0o600); } catch { /* ignore */ }
+  }
+}
+
+function replaceFileSync(tmpPath: string, targetPath: string): void {
+  try {
+    renameSync(tmpPath, targetPath);
+    return;
+  } catch (renameErr) {
+    try {
+      unlinkSync(targetPath);
+    } catch (unlinkErr) {
+      if ((unlinkErr as { code?: string }).code !== 'ENOENT') {
+        throw new Error(`replace target cleanup failed: ${unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr)}; original rename error: ${renameErr instanceof Error ? renameErr.message : String(renameErr)}`);
+      }
+    }
+    renameSync(tmpPath, targetPath);
   }
 }
 
@@ -159,17 +175,22 @@ export class FileKeyStore implements KeyStore {
   loadKeyPair(aid: string): KeyPairRecord | null {
     const path = this._keyPairPath(aid);
     if (!existsSync(path)) return null;
+    let raw: JsonObject;
     try {
-      const raw = JSON.parse(readFileSync(path, 'utf-8'));
-      return this._restoreKeyPair(aid, raw);
+      raw = JSON.parse(readFileSync(path, 'utf-8')) as JsonObject;
     } catch (exc) {
       this._logger.warn('key.json read or parse failed, treating as non-existent');
       return null;
     }
+    return this._restoreKeyPair(aid, raw, path);
   }
 
   saveKeyPair(aid: string, keyPair: KeyPairRecord): void {
     const path = this._keyPairPath(aid);
+    this._saveKeyPairAtPath(aid, path, keyPair);
+  }
+
+  private _saveKeyPairAtPath(aid: string, path: string, keyPair: KeyPairRecord): void {
     mkdirSync(dirname(path), { recursive: true });
     const protected_ = deepClone(keyPair);
     const pem = protected_.private_key_pem;
@@ -178,16 +199,32 @@ export class FileKeyStore implements KeyStore {
       const rec = this._secretStore.protect(safeAid(aid), 'identity/private_key', Buffer.from(pem, 'utf-8'));
       protected_.private_key_protection = rec;
     }
-    writeFileSync(path, JSON.stringify(protected_, null, 2), { mode: 0o600 });
+    const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    writeFileSync(tmpPath, JSON.stringify(protected_, null, 2), { mode: 0o600 });
+    secureFilePermissions(tmpPath);
+    try {
+      replaceFileSync(tmpPath, path);
+    } catch (exc) {
+      try { unlinkSync(tmpPath); } catch { /* ignore tmp cleanup failure */ }
+      throw exc;
+    }
     secureFilePermissions(path);
   }
 
-  private _restoreKeyPair(aid: string, kp: JsonObject): KeyPairRecord {
+  private _restoreKeyPair(aid: string, kp: JsonObject, persistPath?: string): KeyPairRecord {
     const out = deepClone(kp);
     const rec = out.private_key_protection;
     if (isJsonObject(rec)) {
       const plain = this._secretStore.reveal(safeAid(aid), 'identity/private_key', rec as any);
-      if (plain) out.private_key_pem = plain.toString('utf-8');
+      if (!plain) {
+        throw new Error(`private key decrypt failed for aid ${aid}: seed_password mismatch or key.json corrupted`);
+      }
+      out.private_key_pem = plain.toString('utf-8');
+      return out;
+    }
+    if (persistPath && typeof out.private_key_pem === 'string' && out.private_key_pem) {
+      // 兼容历史明文 key.json：首次加载成功后立即用当前 seed_password 加密回写。
+      this._saveKeyPairAtPath(aid, persistPath, out as KeyPairRecord);
     }
     return out;
   }
@@ -299,6 +336,7 @@ export class FileKeyStore implements KeyStore {
     if (!existsSync(this._aidsRoot)) return null;
     for (const entry of readdirSync(this._aidsRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('_')) continue;
       const identity = this.loadIdentity(entry.name);
       if (identity) return identity;
     }
@@ -572,25 +610,6 @@ export class FileKeyStore implements KeyStore {
   }
 
 
-  // ── agent.md Cache ───────────────────────────────────────
-
-  loadAgentMdCache(ownerAid: string, targetAid: string): AgentMdCacheRecord | null {
-    const owner = String(ownerAid ?? '').trim();
-    const target = String(targetAid ?? '').trim();
-    if (!owner || !target) return null;
-    const record = this._getDB(owner).loadAgentMdCache(target);
-    return record ? deepClone(record) as unknown as AgentMdCacheRecord : null;
-  }
-
-  upsertAgentMdCache(ownerAid: string, targetAid: string, fields: AgentMdCacheUpsert): AgentMdCacheRecord {
-    const owner = String(ownerAid ?? '').trim();
-    const target = String(targetAid ?? '').trim();
-    if (!owner || !target) {
-      throw new Error('upsertAgentMdCache requires ownerAid and targetAid');
-    }
-    const record = this._getDB(owner).upsertAgentMdCache(target, fields as Record<string, unknown>);
-    return deepClone(record) as unknown as AgentMdCacheRecord;
-  }
   // ── 信任根管理 ─────────────────────────────────────────────
 
   trustRootDir(): string {
@@ -717,11 +736,49 @@ export class FileKeyStore implements KeyStore {
     return dir;
   }
 
+  listPendingIdentityDirs(aid: string): string[] {
+    const root = this._pendingRoot();
+    if (!existsSync(root)) return [];
+    const prefix = `${safeAid(aid)}-`;
+    const items: Array<{ path: string; mtimeMs: number }> = [];
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+      const path = join(root, entry.name);
+      try {
+        items.push({ path, mtimeMs: statSync(path).mtimeMs });
+      } catch { /* ignore unreadable pending entry */ }
+    }
+    return items.sort((a, b) => b.mtimeMs - a.mtimeMs).map((item) => item.path);
+  }
+
+  savePendingKeyPair(pendingDir: string, aid: string, keyPair: KeyPairRecord): void {
+    this._saveKeyPairAtPath(aid, join(pendingDir, 'private', 'key.json'), keyPair);
+  }
+
+  loadPendingKeyPair(pendingDir: string, aid: string): KeyPairRecord | null {
+    const keyPath = join(pendingDir, 'private', 'key.json');
+    if (!existsSync(keyPath)) return null;
+    let raw: JsonObject;
+    try {
+      raw = JSON.parse(readFileSync(keyPath, 'utf-8')) as JsonObject;
+    } catch {
+      return null;
+    }
+    return this._restoreKeyPair(aid, raw, keyPath);
+  }
+
+  savePendingCert(pendingDir: string, certPem: string): void {
+    const certPath = join(pendingDir, 'public', 'cert.pem');
+    mkdirSync(dirname(certPath), { recursive: true });
+    writeFileSync(certPath, certPem, { encoding: 'utf-8', mode: 0o600 });
+  }
+
   /**
    * 把临时目录原子 rename 到正式 AIDs/{aid}/。
    * 目标已存在 → 抛错（调用方应当返回 IdentityConflictError）。
    */
   promotePendingIdentity(pendingDir: string, aid: string): string {
+    this._ensurePendingKeyPairProtected(pendingDir, aid);
     const target = join(this._aidsRoot, safeAid(aid));
     if (existsSync(target)) {
       throw new Error(`promotePendingIdentity: target exists: ${target}`);
@@ -736,6 +793,20 @@ export class FileKeyStore implements KeyStore {
     mkdirSync(this._aidsRoot, { recursive: true });
     fsRenameSync(pendingDir, target);
     return target;
+  }
+
+  private _ensurePendingKeyPairProtected(pendingDir: string, aid: string): void {
+    const keyPath = join(pendingDir, 'private', 'key.json');
+    if (!existsSync(keyPath)) {
+      throw new Error(`pending identity missing key pair for ${aid}`);
+    }
+    const raw = JSON.parse(readFileSync(keyPath, 'utf-8')) as JsonObject;
+    if (typeof raw.private_key_pem === 'string' && raw.private_key_pem) {
+      throw new Error(`pending identity private key is plaintext for ${aid}`);
+    }
+    if (!isJsonObject(raw.private_key_protection)) {
+      throw new Error(`pending identity private key is not encrypted for ${aid}`);
+    }
   }
 
   /**
@@ -764,6 +835,10 @@ export class FileKeyStore implements KeyStore {
       this._logger.warn(`cleanupPendingDirs read root failed: ${root} err=${e instanceof Error ? e.message : String(e)}`);
     }
     return removed;
+  }
+
+  discardPendingIdentity(pendingDir: string): void {
+    fsRmSync(pendingDir, { recursive: true, force: true });
   }
 
   /** 获取指定 AID 的 V2KeyStore（共享同一 SQLite 连接）。 */

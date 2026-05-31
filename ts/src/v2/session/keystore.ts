@@ -319,6 +319,29 @@ export class V2KeyStore {
     };
   }
 
+  saveGroupIdentity(deviceId: string, groupAid: string, privateKeyPem: string, pubDer: Uint8Array): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO v2_device_keys (device_id, key_type, group_id, key_id, private_key, public_key, created_at)
+         VALUES (?, 'group_identity', ?, '', ?, ?, ?)`,
+      )
+      .run(deviceId, groupAid, Buffer.from(privateKeyPem, 'utf-8'), toSqliteBlob(pubDer), Date.now());
+  }
+
+  loadGroupIdentity(deviceId: string, groupAid: string): { privateKeyPem: string; pubDer: Uint8Array } | null {
+    const row = this.db
+      .prepare(
+        `SELECT private_key, public_key FROM v2_device_keys
+         WHERE device_id=? AND key_type='group_identity' AND group_id=? AND key_id=''`,
+      )
+      .get(deviceId, groupAid) as { private_key: unknown; public_key: unknown } | undefined;
+    if (!row) return null;
+    return {
+      privateKeyPem: Buffer.from(asBuffer(row.private_key)).toString('utf-8'),
+      pubDer: asBuffer(row.public_key),
+    };
+  }
+
   markGroupSPKUploaded(deviceId: string, groupId: string, spkId: string): void {
     this.db
       .prepare(

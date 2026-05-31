@@ -6,6 +6,20 @@
 
 ---
 
+## 0.4.5 — 2026-05-31
+
+### Added
+- **`RegisterFlow` 独立模块**（`register_flow.py`）：将 AID 注册流程从 `AuthFlow` 中剥离为独立类，负责 keypair 生成、服务端 RPC、pending 目录原子提交、崩溃恢复。
+- **`KeyStore` 接口扩展**：新增 pending 目录操作协议（`pending_identity_dir` / `save_pending_key_pair` / `promote_pending_identity` / `discard_pending_identity` 等），支持注册原子性。
+- **`FullKeyStore` 组合类型**：`TokenStore + KeyStore` 的组合 Protocol，供注册流程显式使用。
+
+### Changed
+- **`AuthFlow` 改用 `TokenStore`**：构造参数 `keystore` 重命名为 `token_store`，类型收窄为 `TokenStore`（不含私钥读写），私钥操作全部移出 `AuthFlow`。
+- **`AuthFlow.set_identity()`**：新增方法，由 `AUNClient.load_identity` 注入内存私钥；`AuthFlow` 内部不再从 `token_store` 解密私钥。
+- **`AIDStore.register()` 私钥写入职责转移**：注册结果由 `AIDStore` 负责调用 `keystore.save_cert` / `save_key_pair` 写入，`RegisterFlow` 不再直接写 key.json。
+
+---
+
 ## 0.4.4 — 2026-05-31
 
 ### Added

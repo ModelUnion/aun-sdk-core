@@ -403,9 +403,6 @@ func newClientForStore(aunPath, seedPassword string, verifySSL bool, rootCaPath 
 		raw["root_ca_path"] = rootCaPath
 	}
 	c := newClient(raw, debug)
-	if c.auth != nil {
-		c.auth.persistKeyMaterial = true
-	}
 	return c
 }
 
@@ -557,7 +554,7 @@ type AUNClient struct {
 
 	// 组件
 	crypto    *CryptoProvider
-	keyStore  keystore.KeyStore
+	tokenStore keystore.TokenStore // 仅 AIDStore 内部传完整 KeyStore
 	auth      *AuthFlow
 	transport *RPCTransport
 	events    *EventDispatcher
@@ -676,7 +673,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		fmt.Fprintf(os.Stderr, "[aun_core.keystore] WARN 创建默认 FileKeyStore 失败: %v, 使用空路径\n", err)
 		fks, _ = keystore.NewFileKeyStore(cfg.AUNPath, nil, "")
 	}
-	var ks keystore.KeyStore = fks
+	var ks keystore.TokenStore = fks
 
 	// 创建 DNS 容灾网络层（需在 AuthFlow 之前，因为 AuthFlow 依赖它）
 	dnsNet := NewDnsResilientNet(cfg.AUNPath, cfg.VerifySSL)
@@ -687,7 +684,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		initAid = strings.TrimSpace(v)
 	}
 	authFlow := NewAuthFlow(AuthFlowConfig{
-		Keystore:   ks,
+		TokenStore: ks,
 		Crypto:     crypto,
 		AID:        initAid,
 		VerifySSL:  cfg.VerifySSL,
@@ -723,7 +720,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		slotID:                     slotID,
 		aid:                        initAid,
 		crypto:                     crypto,
-		keyStore:                   ks,
+		tokenStore:                   ks,
 		auth:                       authFlow,
 		events:                     events,
 		dnsNet:                     dnsNet,
@@ -1737,7 +1734,7 @@ func (c *AUNClient) GetKeyStoreRootPath() string {
 
 // GetTrustRootStore 返回支持信任根持久化的 keystore 扩展。
 func (c *AUNClient) GetTrustRootStore() keystore.TrustRootStore {
-	store, ok := c.keyStore.(keystore.TrustRootStore)
+	store, ok := c.tokenStore.(keystore.TrustRootStore)
 	if !ok {
 		return nil
 	}
@@ -1752,9 +1749,10 @@ func (c *AUNClient) ReloadTrustedRoots() int {
 	return c.auth.ReloadTrustedRoots()
 }
 
-// AuthRegisterAID 通过 AuthFlow 注册 AID
+// AuthRegisterAID 是兼容保留入口；AUNClient 不再注册或保存 AID 身份私钥。
+// 新注册流程必须通过 AIDStore.Register，由 AIDStore 持有 KeyStore。
 func (c *AUNClient) AuthRegisterAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error) {
-	return c.auth.RegisterAID(ctx, gatewayURL, aid)
+	return nil, NewStateError("AUNClient cannot register AID; use AIDStore.Register")
 }
 
 // AuthAuthenticate 通过 AuthFlow 认证 AID
@@ -1813,14 +1811,14 @@ func (c *AUNClient) AuthFetchPeerCert(ctx context.Context, aid, certFingerprint 
 	return c.fetchPeerCert(ctx, aid, certFingerprint)
 }
 
-// AuthLoadKeyPair 加载指定 AID 的密钥对（供 CheckAID 使用）
+// AuthLoadKeyPair 是兼容保留入口；AUNClient 不再从持久化存储读取 AID 身份私钥。
 func (c *AUNClient) AuthLoadKeyPair(aid string) (map[string]any, error) {
-	return c.keyStore.LoadKeyPair(aid)
+	return nil, NewStateError("AUNClient cannot load AID private keys; use AIDStore.Load")
 }
 
 // AuthLoadCert 加载指定 AID 的证书 PEM（供 CheckAID 使用）
 func (c *AUNClient) AuthLoadCert(aid string) (string, error) {
-	return c.keyStore.LoadCert(aid)
+	return c.tokenStore.LoadCert(aid)
 }
 
 // DiscoverGateway 通过 GatewayDiscovery 发现 Gateway URL
@@ -2137,7 +2135,7 @@ func (c *AUNClient) listIdentities() (summaries []map[string]any, err error) {
 	type lister interface {
 		ListIdentities() ([]string, error)
 	}
-	ks, ok := c.keyStore.(lister)
+	ks, ok := c.tokenStore.(lister)
 	if !ok {
 		return nil, nil
 	}
@@ -2213,12 +2211,17 @@ func (c *AUNClient) Logout() (err error) {
 	c.mu.RUnlock()
 
 	if aid != "" {
-		// 用空 token 覆盖保存，清除持久化的 token
-		_ = c.keyStore.SaveIdentity(aid, map[string]any{
-			"access_token":  "",
-			"refresh_token": "",
-			"kite_token":    "",
-		})
+		if store, ok := c.tokenStore.(keystore.InstanceStateStore); ok {
+			_, _ = store.UpdateInstanceState(aid, c.deviceID, c.slotID, func(current map[string]any) (map[string]any, error) {
+				if current == nil {
+					current = make(map[string]any)
+				}
+				current["access_token"] = ""
+				current["refresh_token"] = ""
+				current["kite_token"] = ""
+				return current, nil
+			})
+		}
 	}
 
 	return c.Close()
@@ -2249,7 +2252,7 @@ func (c *AUNClient) Close() (err error) {
 	}
 
 	if state == StateIdle || state == StateClosed {
-		if closer, ok := c.keyStore.(interface{ Close() }); ok {
+		if closer, ok := c.tokenStore.(interface{ Close() }); ok {
 			closer.Close()
 		}
 		if c.dnsNet != nil {
@@ -2268,7 +2271,7 @@ func (c *AUNClient) Close() (err error) {
 	if err := c.transport.Close(); err != nil {
 		c.log.Warn("failed to close transport: %v", err)
 	}
-	if closer, ok := c.keyStore.(interface{ Close() }); ok {
+	if closer, ok := c.tokenStore.(interface{ Close() }); ok {
 		closer.Close()
 	}
 	if c.dnsNet != nil {
@@ -4100,7 +4103,7 @@ func (c *AUNClient) onRawGroupStateCommitted(data any) {
 		}
 	}
 
-	structured, ok := c.keyStore.(keystore.StructuredKeyStore)
+	structured, ok := c.tokenStore.(keystore.StructuredKeyStore)
 	if !ok {
 		c.logEG.Warn("keystore does not support StructuredKeyStore, skipping group state committed handling group=%s", groupID)
 		return
@@ -4368,13 +4371,13 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	}
 	c.certCacheMu.Unlock()
 
-	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok {
+	if versioned, ok := c.tokenStore.(keystore.VersionedCertKeyStore); ok {
 		// peer 证书只存版本目录，不覆盖 cert.pem
 		if err := versioned.SaveCertVersion(aid, string(certBytes), certFingerprint, false); err != nil {
 			c.log.Warn("failed to write versioned cert (aid=%s): %v", aid, err)
 		}
 	} else if strings.TrimSpace(certFingerprint) == "" {
-		if err := c.keyStore.SaveCert(aid, string(certBytes)); err != nil {
+		if err := c.tokenStore.SaveCert(aid, string(certBytes)); err != nil {
 			c.log.Warn("failed to write cert to keystore (aid=%s): %v", aid, err)
 		}
 	}
@@ -4397,7 +4400,7 @@ func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string, cert
 		return true
 	}
 
-	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok && strings.TrimSpace(requestedFingerprint) != "" {
+	if versioned, ok := c.tokenStore.(keystore.VersionedCertKeyStore); ok && strings.TrimSpace(requestedFingerprint) != "" {
 		if certPEM, err := versioned.LoadCertVersion(aid, requestedFingerprint); err == nil && certPEM != "" {
 			now := float64(time.Now().Unix())
 			c.certCacheMu.Lock()
@@ -4406,7 +4409,7 @@ func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string, cert
 			return true
 		}
 	}
-	if certPEM, err := c.keyStore.LoadCert(aid); err == nil && certPEM != "" {
+	if certPEM, err := c.tokenStore.LoadCert(aid); err == nil && certPEM != "" {
 		if strings.TrimSpace(requestedFingerprint) == "" {
 			now := float64(time.Now().Unix())
 			c.certCacheMu.Lock()
@@ -4435,12 +4438,12 @@ func (c *AUNClient) ensureSenderCertCached(ctx context.Context, aid string, cert
 		return false
 	}
 	certPEM := string(certBytes)
-	if versioned, ok := c.keyStore.(keystore.VersionedCertKeyStore); ok {
+	if versioned, ok := c.tokenStore.(keystore.VersionedCertKeyStore); ok {
 		// peer 证书只存版本目录，不覆盖 cert.pem
 		if err := versioned.SaveCertVersion(aid, certPEM, requestedFingerprint, false); err != nil {
 			c.log.Warn("failed to save versioned cert (aid=%s): %v", aid, err)
 		}
-	} else if err := c.keyStore.SaveCert(aid, certPEM); err != nil {
+	} else if err := c.tokenStore.SaveCert(aid, certPEM); err != nil {
 		c.log.Warn("failed to save cert (aid=%s): %v", aid, err)
 	}
 	return true
@@ -4768,32 +4771,22 @@ func (c *AUNClient) resolveGateways(params map[string]any) []string {
 
 // syncIdentityAfterConnect 使用 token 连接后同步本地身份
 func (c *AUNClient) syncIdentityAfterConnect(accessToken string) {
-	c.mu.RLock()
-	aidStr := c.aid
-	c.mu.RUnlock()
-
-	identity := c.auth.LoadIdentityOrNil(aidStr)
-	if identity == nil {
-		c.mu.Lock()
-		c.identity = nil
-		c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.identity == nil {
 		return
 	}
-	identity["access_token"] = accessToken
-
-	c.mu.Lock()
-	c.identity = identity
-	if loadedAID, ok := identity["aid"].(string); ok {
+	c.identity["access_token"] = accessToken
+	if loadedAID, ok := c.identity["aid"].(string); ok && loadedAID != "" {
 		c.aid = loadedAID
 		if c.logger != nil {
 			c.logger.BindAID(loadedAID)
 		}
 	}
-	c.mu.Unlock()
 
-	if aidVal, ok := identity["aid"].(string); ok {
-		if err := c.auth.persistIdentity(identity); err != nil {
-			_ = c.keyStore.SaveIdentity(aidVal, identity)
+	if _, ok := c.identity["aid"].(string); ok {
+		if err := c.auth.persistIdentity(c.identity); err != nil {
+			c.auth.lastPersistErr = err
 		}
 	}
 }
@@ -5122,7 +5115,7 @@ func (c *AUNClient) restoreSeqTrackerState() {
 	if aid == "" {
 		return
 	}
-	if store, ok := c.keyStore.(keystore.SeqTrackerStore); ok {
+	if store, ok := c.tokenStore.(keystore.SeqTrackerStore); ok {
 		seqs, err := store.LoadAllSeqs(aid, deviceID, slotID)
 		if err != nil || len(seqs) == 0 {
 			return
@@ -5132,7 +5125,7 @@ func (c *AUNClient) restoreSeqTrackerState() {
 		return
 	}
 	// 降级：从 instance_state JSON 读取（兼容旧数据）
-	if store, ok := c.keyStore.(keystore.InstanceStateStore); ok {
+	if store, ok := c.tokenStore.(keystore.InstanceStateStore); ok {
 		holder, _ := store.LoadInstanceState(aid, deviceID, slotID)
 		if holder == nil {
 			return
@@ -5191,8 +5184,8 @@ func (c *AUNClient) migrateSeqStateGroupIDs(aid, deviceID, slotID string, state 
 		}
 	}
 	c.logEG.Warn("SeqTracker group_id migration: %d namespaces rewritten", len(rename))
-	if saver, ok := c.keyStore.(keystore.SeqTrackerStore); ok {
-		deleter, _ := c.keyStore.(keystore.SeqTrackerDeleter)
+	if saver, ok := c.tokenStore.(keystore.SeqTrackerStore); ok {
+		deleter, _ := c.tokenStore.(keystore.SeqTrackerDeleter)
 		for oldNs, newNs := range rename {
 			if deleter != nil {
 				if err := deleter.DeleteSeq(aid, deviceID, slotID, oldNs); err != nil {
@@ -5221,7 +5214,7 @@ func (c *AUNClient) saveSeqTrackerState() {
 	if len(state) == 0 {
 		return
 	}
-	if store, ok := c.keyStore.(keystore.SeqTrackerStore); ok {
+	if store, ok := c.tokenStore.(keystore.SeqTrackerStore); ok {
 		for ns, seq := range state {
 			_ = store.SaveSeq(aid, deviceID, slotID, ns, seq)
 		}
@@ -6027,8 +6020,54 @@ func sleepWithCancel(ctx context.Context, d time.Duration) {
 	}
 }
 
-// createNamedGroup 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，
-// 服务端签发群 AID 证书，返回后将证书和私钥存入 keystore。
+func (c *AUNClient) saveGroupIdentityToV2(groupAID string, identity map[string]any) error {
+	groupAID = strings.TrimSpace(groupAID)
+	privateKeyPEM := strings.TrimSpace(stringFromAny(identity["private_key_pem"]))
+	publicKeyB64 := strings.TrimSpace(stringFromAny(identity["public_key_der_b64"]))
+	if groupAID == "" || privateKeyPEM == "" || publicKeyB64 == "" {
+		return NewStateError("group identity is incomplete")
+	}
+	publicKeyDER, err := base64.StdEncoding.DecodeString(publicKeyB64)
+	if err != nil || len(publicKeyDER) == 0 {
+		return NewStateError(fmt.Sprintf("group identity public key is invalid: %v", err))
+	}
+
+	c.mu.RLock()
+	ownerAID := c.aid
+	deviceID := c.deviceID
+	aunPath := ""
+	if c.configModel != nil {
+		aunPath = c.configModel.AUNPath
+	}
+	if c.currentAIDObj != nil {
+		if ownerAID == "" {
+			ownerAID = c.currentAIDObj.Aid
+		}
+		if deviceID == "" {
+			deviceID = c.currentAIDObj.DeviceID
+		}
+		if aunPath == "" {
+			aunPath = c.currentAIDObj.AunPath
+		}
+	}
+	c.mu.RUnlock()
+
+	if ownerAID == "" {
+		return NewStateError("group identity storage requires a loaded owner AID")
+	}
+	if deviceID == "" {
+		return NewStateError("group identity storage requires a device_id")
+	}
+	store, err := openV2Keystore(aunPath, ownerAID)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return store.store.SaveGroupIdentity(deviceID, groupAID, privateKeyPEM, publicKeyDER)
+}
+
+// createNamedGroup 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key。
+// 群身份私钥不是 AID 身份私钥，写入 V2 设备密钥库，不写入 AID KeyStore。
 func (c *AUNClient) createNamedGroup(ctx context.Context, groupName string, opts map[string]any) (result map[string]any, err error) {
 	tStart := time.Now()
 	c.logEG.Debug("createNamedGroup enter: name=%s", groupName)
@@ -6062,20 +6101,17 @@ func (c *AUNClient) createNamedGroup(ctx context.Context, groupName string, opts
 		return nil, err
 	}
 
-	// 存储群 AID 的私钥和证书
+	// 存储群 AID 证书和群身份私钥；群身份私钥走 V2 库，不走 AID KeyStore。
 	groupInfo, _ := result["group"].(map[string]any)
 	aidCert, _ := result["aid_cert"].(map[string]any)
 	groupAid := stringFromAny(groupInfo["group_aid"])
 	if groupAid != "" && aidCert != nil {
-		_ = c.keyStore.SaveIdentity(groupAid, map[string]any{
-			"private_key_pem": identity["private_key_pem"],
-			"public_key":      identity["public_key_der_b64"],
-			"curve":           "P-256",
-			"type":            "group_identity",
-		})
+		if saveErr := c.saveGroupIdentityToV2(groupAid, identity); saveErr != nil {
+			return nil, saveErr
+		}
 		certPEM := stringFromAny(aidCert["cert"])
 		if certPEM != "" {
-			_ = c.keyStore.SaveCert(groupAid, certPEM)
+			_ = c.tokenStore.SaveCert(groupAid, certPEM)
 		}
 	}
 
@@ -6119,15 +6155,12 @@ func (c *AUNClient) bindGroupAid(ctx context.Context, groupID string, groupName 
 	aidCert, _ := result["aid_cert"].(map[string]any)
 	groupAid := stringFromAny(groupInfo["group_aid"])
 	if groupAid != "" && aidCert != nil {
-		_ = c.keyStore.SaveIdentity(groupAid, map[string]any{
-			"private_key_pem": identity["private_key_pem"],
-			"public_key":      identity["public_key_der_b64"],
-			"curve":           "P-256",
-			"type":            "group_identity",
-		})
+		if saveErr := c.saveGroupIdentityToV2(groupAid, identity); saveErr != nil {
+			return nil, saveErr
+		}
 		certPEM := stringFromAny(aidCert["cert"])
 		if certPEM != "" {
-			_ = c.keyStore.SaveCert(groupAid, certPEM)
+			_ = c.tokenStore.SaveCert(groupAid, certPEM)
 		}
 	}
 
@@ -6172,6 +6205,18 @@ func newAUNClientWithAID(aid *AID) *AUNClient {
 	if c.auth != nil {
 		c.auth.aid = aid.Aid
 		c.auth.SetInstanceContext(c.deviceID, c.slotID)
+		c.auth.SetIdentity(map[string]any{
+			"aid":                aid.Aid,
+			"private_key_pem":    aid.PrivateKeyPem,
+			"public_key_der_b64": aid.PublicKey,
+			"cert":               aid.CertPem,
+		})
+	}
+	c.identity = map[string]any{
+		"aid":                aid.Aid,
+		"private_key_pem":    aid.PrivateKeyPem,
+		"public_key_der_b64": aid.PublicKey,
+		"cert":               aid.CertPem,
 	}
 	c.mu.Unlock()
 	return c
@@ -6508,6 +6553,19 @@ func (c *AUNClient) loadIdentityFromAID(aid *AID) error {
 	if c.auth != nil {
 		c.auth.aid = aid.Aid
 		c.auth.SetInstanceContext(c.deviceID, c.slotID)
+		// 注入内存私钥到 AuthFlow，禁止 AuthFlow 内部再走 keystore 解密
+		c.auth.SetIdentity(map[string]any{
+			"aid":                aid.Aid,
+			"private_key_pem":    aid.PrivateKeyPem,
+			"public_key_der_b64": aid.PublicKey,
+			"cert":               aid.CertPem,
+		})
+	}
+	c.identity = map[string]any{
+		"aid":                aid.Aid,
+		"private_key_pem":    aid.PrivateKeyPem,
+		"public_key_der_b64": aid.PublicKey,
+		"cert":               aid.CertPem,
 	}
 	c.lastConnectError = nil
 	c.retryAttempt = 0
@@ -6569,13 +6627,13 @@ func (c *AUNClient) rebuildRuntimeForIdentity(aid *AID) {
 		fmt.Fprintf(os.Stderr, "[aun_core.keystore] WARN LoadIdentity 重建 FileKeyStore 失败: %v, 使用空种子\n", err)
 		fks, _ = keystore.NewFileKeyStore(nextCfg.AUNPath, nil, "")
 	}
-	c.keyStore = fks
+	c.tokenStore = fks
 
 	dnsNet := NewDnsResilientNet(nextCfg.AUNPath, nextCfg.VerifySSL)
 	c.dnsNet = dnsNet
 	c.discovery = NewGatewayDiscovery(nextCfg.VerifySSL, dnsNet)
 	c.auth = NewAuthFlow(AuthFlowConfig{
-		Keystore:   c.keyStore,
+		TokenStore: c.tokenStore,
 		Crypto:     c.crypto,
 		AID:        aid.Aid,
 		VerifySSL:  nextCfg.VerifySSL,

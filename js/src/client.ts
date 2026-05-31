@@ -26,7 +26,7 @@ import {
 } from './crypto.js';
 import type { ProtectedHeadersInput } from './protected-headers.js';
 import { IndexedDBKeyStore } from './keystore/indexeddb.js';
-import type { KeyStore, GroupStateRecord } from './keystore/index.js';
+import type { TokenStore, GroupStateRecord } from './keystore/index.js';
 import { V2Session, V2KeyStore, type CallFn } from './v2/session/index.js';
 import {
   encryptP2PMessage, encryptGroupMessage, decryptMessage,
@@ -833,7 +833,7 @@ export class AUNClient {
 
   private _dispatcher: EventDispatcher;
   private _discovery: GatewayDiscovery;
-  private _keystore: KeyStore;
+  private _tokenStore: TokenStore;
   private _auth: AuthFlow;
   private _transport: RPCTransport;
 
@@ -923,7 +923,7 @@ export class AUNClient {
   private _clientLog!: ModuleLogger;
   private _logAuth!: ModuleLogger;
   private _logTransport!: ModuleLogger;
-  private _logKeystore!: ModuleLogger;
+  private _tokenStoreLog!: ModuleLogger;
   private _logDiscovery!: ModuleLogger;
   private _logEvents!: ModuleLogger;
 
@@ -951,19 +951,19 @@ export class AUNClient {
     this._clientLog = this._logger.for('aun_core.client');
     this._logAuth = this._logger.for('aun_core.auth');
     this._logTransport = this._logger.for('aun_core.transport');
-    this._logKeystore = this._logger.for('aun_core.keystore');
+    this._tokenStoreLog = this._logger.for('aun_core.keystore');
     this._logDiscovery = this._logger.for('aun_core.discovery');
     this._logEvents = this._logger.for('aun_core.events');
     this._clientLog.info(`AUNClient initialized: debug=${_debug} aunPath=${this.configModel.aunPath} aid=${initAid ?? '-'}`);
 
     this._dispatcher = new EventDispatcher();
     this._discovery = new GatewayDiscovery();
-    this._keystore = new IndexedDBKeyStore({});
+    this._tokenStore = new IndexedDBKeyStore({});
     this._slotId = inputAid?.slotId || 'default';
     this._connectDeliveryMode = normalizeDeliveryModeConfig({ mode: 'fanout' });
     this._defaultConnectDeliveryMode = { ...this._connectDeliveryMode };
     this._auth = new AuthFlow({
-      keystore: this._keystore,
+      tokenStore: this._tokenStore,
       crypto: new CryptoProvider(),
       aid: initAid,
       deviceId: this._deviceId,
@@ -992,6 +992,7 @@ export class AUNClient {
           public_key_der_b64: inputAid.publicKey,
           cert: inputAid.certPem,
         };
+        this._auth.setIdentity(this._identity);
         this._state = 'disconnected';
       }
     }
@@ -1003,8 +1004,8 @@ export class AUNClient {
     if (typeof (this._discovery as any).setLogger === 'function') {
       (this._discovery as any).setLogger(this._logger.for('aun_core.discovery'));
     }
-    if (typeof (this._keystore as any).setLogger === 'function') {
-      (this._keystore as any).setLogger(this._logKeystore);
+    if (typeof (this._tokenStore as any).setLogger === 'function') {
+      (this._tokenStore as any).setLogger(this._tokenStoreLog);
     }
 
     // 内部订阅：推送消息 re-publish 给用户（V2 加密消息走 _raw.peer.v2.message_received）
@@ -1217,7 +1218,7 @@ export class AUNClient {
     if (!target) throw new ValidationError('verifyAgentMd requires non-empty aid');
     let peer = target === this._currentAid?.aid ? this._currentAid : null;
     if (!peer) {
-      let certPem = String(await this._keystore.loadCert(target) ?? '').trim();
+      let certPem = String(await this._tokenStore.loadCert(target) ?? '').trim();
       if (!certPem) {
         certPem = String(await this._fetchPeerCert(target) ?? '').trim();
       }
@@ -1383,11 +1384,11 @@ export class AUNClient {
   private async _readAgentMdStorage(logicalKey: string): Promise<string | null> {
     const key = String(logicalKey ?? '').trim();
     if (!key) return null;
-    const load = this._keystore.loadAgentMdCache;
+    const load = this._tokenStore.loadAgentMdCache;
     if (typeof load !== 'function') {
       throw new Error('IndexedDB agent.md storage unavailable');
     }
-    const record = await load.call(this._keystore, this._agentMdRoot(), key);
+    const record = await load.call(this._tokenStore, this._agentMdRoot(), key);
     if (record && Object.prototype.hasOwnProperty.call(record, 'content')) {
       return String(record.content ?? '');
     }
@@ -1397,12 +1398,12 @@ export class AUNClient {
   private async _writeAgentMdStorage(logicalKey: string, content: string): Promise<void> {
     const key = String(logicalKey ?? '').trim();
     if (!key) return;
-    const save = this._keystore.upsertAgentMdCache;
+    const save = this._tokenStore.upsertAgentMdCache;
     if (typeof save !== 'function') {
       throw new Error('IndexedDB agent.md storage unavailable');
     }
     const text = String(content ?? '');
-    await save.call(this._keystore, this._agentMdRoot(), key, {
+    await save.call(this._tokenStore, this._agentMdRoot(), key, {
       content: text,
       local_etag: await this._agentMdContentEtag(text),
       fetched_at: Date.now(),
@@ -1805,14 +1806,14 @@ export class AUNClient {
     this._clientLog = this._logger.for('aun_core.client');
     this._logAuth = this._logger.for('aun_core.auth');
     this._logTransport = this._logger.for('aun_core.transport');
-    this._logKeystore = this._logger.for('aun_core.keystore');
+    this._tokenStoreLog = this._logger.for('aun_core.keystore');
     this._logDiscovery = this._logger.for('aun_core.discovery');
     this._logEvents = this._logger.for('aun_core.events');
 
     this._discovery = new GatewayDiscovery();
-    this._keystore = new IndexedDBKeyStore({});
+    this._tokenStore = new IndexedDBKeyStore({});
     this._auth = new AuthFlow({
-      keystore: this._keystore,
+      tokenStore: this._tokenStore,
       crypto: new CryptoProvider(),
       aid: aid.aid,
       deviceId: this._deviceId,
@@ -1836,8 +1837,8 @@ export class AUNClient {
     if (typeof (this._discovery as any).setLogger === 'function') {
       (this._discovery as any).setLogger(this._logDiscovery);
     }
-    if (typeof (this._keystore as any).setLogger === 'function') {
-      (this._keystore as any).setLogger(this._logKeystore);
+    if (typeof (this._tokenStore as any).setLogger === 'function') {
+      (this._tokenStore as any).setLogger(this._tokenStoreLog);
     }
   }
 
@@ -1856,6 +1857,8 @@ export class AUNClient {
       public_key_der_b64: aid.publicKey,
       cert: aid.certPem,
     };
+    // 注入内存私钥到 AuthFlow，禁止 AuthFlow 内部再走 keystore 解密
+    this._auth.setIdentity(this._identity);
     this._state = 'disconnected';
     this._closing = false;
   }
@@ -3299,9 +3302,9 @@ export class AUNClient {
     const policySnapshot = String(d.policy_snapshot ?? '').trim();
 
     // 1. 验证 prev_state_hash 连续性
-    const loadFn = (this._keystore as any).loadGroupState;
+    const loadFn = (this._tokenStore as any).loadGroupState;
     const localState: GroupStateRecord | null = loadFn
-      ? await loadFn.call(this._keystore, groupId)
+      ? await loadFn.call(this._tokenStore, groupId)
       : null;
 
     if (localState && localState.state_hash && localState.state_hash !== prevStateHash) {
@@ -3337,9 +3340,9 @@ export class AUNClient {
             }
           }
 
-          const saveFn = (this._keystore as any).saveGroupState;
+          const saveFn = (this._tokenStore as any).saveGroupState;
           if (saveFn) {
-            await saveFn.call(this._keystore, groupId, {
+            await saveFn.call(this._tokenStore, groupId, {
               group_id: groupId,
               state_version: sv,
               state_hash: sHash,
@@ -3372,9 +3375,9 @@ export class AUNClient {
     }
 
     // 3. 更新本地存储
-    const saveFn = (this._keystore as any).saveGroupState;
+    const saveFn = (this._tokenStore as any).saveGroupState;
     if (saveFn) {
-      await saveFn.call(this._keystore, groupId, {
+      await saveFn.call(this._tokenStore, groupId, {
         group_id: groupId,
         state_version: stateVersion,
         state_hash: stateHash,
@@ -3785,7 +3788,7 @@ export class AUNClient {
 
       try {
         // peer 证书只存版本目录，不覆盖 cert.pem
-        await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
+        await this._tokenStore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
       } catch (exc) {
         this._clientLog.error(`write cert to keystore failed (aid=${aid}): ${String(exc)}`, exc instanceof Error ? exc : undefined);
       }
@@ -3804,7 +3807,7 @@ export class AUNClient {
     const cached = this._certCache.get(cacheKey);
     const now = Date.now() / 1000;
     if (cached && now < cached.refreshAfter) return true;
-    const localCert = await this._keystore.loadCert(aid, certFingerprint);
+    const localCert = await this._tokenStore.loadCert(aid, certFingerprint);
     if (localCert) {
       if (certFingerprint) {
         const actualFingerprint = await this._certFingerprint(localCert);
@@ -3828,7 +3831,7 @@ export class AUNClient {
     try {
       const certPem = await this._fetchPeerCert(aid, certFingerprint);
       // peer 证书只存版本目录，不覆盖 cert.pem
-      await this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
+      await this._tokenStore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
       return true;
     } catch (exc) {
       // 刷新失败时：若缓存有 PKI 验证过的证书（2 倍 TTL 内）则继续用
@@ -4057,9 +4060,9 @@ export class AUNClient {
     if (this._gatewayUrl) return this._gatewayUrl;
 
     try {
-      const getMetadata = (this._keystore as unknown as { getMetadata?: (aid: string, key: string) => Promise<string> }).getMetadata;
+      const getMetadata = (this._tokenStore as unknown as { getMetadata?: (aid: string, key: string) => Promise<string> }).getMetadata;
       const raw = typeof getMetadata === 'function'
-        ? String(await getMetadata.call(this._keystore, target, 'gateway_url') ?? '').trim()
+        ? String(await getMetadata.call(this._tokenStore, target, 'gateway_url') ?? '').trim()
         : '';
       if (raw) {
         const gateway = raw.startsWith('"') && raw.endsWith('"') ? String(JSON.parse(raw)).trim() : raw;
@@ -4085,9 +4088,9 @@ export class AUNClient {
         const gateway = await this._discovery.discover(url);
         this._gatewayUrl = gateway;
         try {
-          const setMetadata = (this._keystore as unknown as { setMetadata?: (aid: string, key: string, value: string) => Promise<void> }).setMetadata;
+          const setMetadata = (this._tokenStore as unknown as { setMetadata?: (aid: string, key: string, value: string) => Promise<void> }).setMetadata;
           if (typeof setMetadata === 'function') {
-            await setMetadata.call(this._keystore, target, 'gateway_url', gateway);
+            await setMetadata.call(this._tokenStore, target, 'gateway_url', gateway);
           }
         } catch {
           // 缓存写入失败不影响连接。
@@ -4122,12 +4125,8 @@ export class AUNClient {
   }
 
   private async _syncIdentityAfterConnect(accessToken: string): Promise<void> {
-    let identity: IdentityRecord | null = null;
-    try {
-      identity = await this._auth.loadIdentityOrNone(this._aid ?? undefined);
-    } catch { /* 忽略 */ }
+    const identity = this._identity;
     if (!identity) {
-      this._identity = null;
       return;
     }
     identity.access_token = accessToken;
@@ -4139,8 +4138,6 @@ export class AUNClient {
       })._persistIdentity;
       if (typeof persistIdentity === 'function') {
         await persistIdentity.call(this._auth, identity);
-      } else {
-        await this._keystore.saveIdentity(String(identity.aid), identity);
       }
     }
   }
@@ -4678,8 +4675,7 @@ export class AUNClient {
   // ── Named Group（命名群）高层 API ────────────────────────────
 
   /**
-   * 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，
-   * 服务端签发群 AID 证书，返回后将证书和私钥存入 keystore。
+   * 创建命名群：群/P2P 私钥由 V2 数据库存储，不写入 AID 身份私钥存储。
    */
   private async createNamedGroup(groupName: string, opts: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const tStart = Date.now();
@@ -4701,15 +4697,10 @@ export class AUNClient {
       const aidCert = result?.aid_cert as Record<string, unknown> | undefined;
       const groupAid = String(groupInfo?.group_aid ?? '');
       if (groupAid && aidCert) {
-        await this._keystore.saveIdentity(groupAid, {
-          private_key_pem: identity.private_key_pem,
-          public_key: identity.public_key_der_b64,
-          curve: 'P-256',
-          type: 'group_identity',
-        });
+        await this._saveGroupIdentityToV2(groupAid, identity);
         const certPem = String(aidCert.cert ?? '');
         if (certPem) {
-          await this._keystore.saveCert(groupAid, certPem);
+          await this._tokenStore.saveCert(groupAid, certPem);
         }
       }
       this._clientLog.debug(`createNamedGroup exit: elapsed=${Date.now() - tStart}ms group_aid=${groupAid}`);
@@ -4742,15 +4733,10 @@ export class AUNClient {
       const aidCert = result?.aid_cert as Record<string, unknown> | undefined;
       const groupAid = String(groupInfo?.group_aid ?? '');
       if (groupAid && aidCert) {
-        await this._keystore.saveIdentity(groupAid, {
-          private_key_pem: identity.private_key_pem,
-          public_key: identity.public_key_der_b64,
-          curve: 'P-256',
-          type: 'group_identity',
-        });
+        await this._saveGroupIdentityToV2(groupAid, identity);
         const certPem = String(aidCert.cert ?? '');
         if (certPem) {
-          await this._keystore.saveCert(groupAid, certPem);
+          await this._tokenStore.saveCert(groupAid, certPem);
         }
       }
       this._clientLog.debug(`bindGroupAid exit: elapsed=${Date.now() - tStart}ms group_aid=${groupAid}`);
@@ -4792,7 +4778,7 @@ export class AUNClient {
     const slotId = this._slotId;
     try {
       // 优先从 seq_tracker 表按行读取
-      const loadAll = this._keystore.loadAllSeqs?.bind(this._keystore);
+      const loadAll = this._tokenStore.loadAllSeqs?.bind(this._tokenStore);
       if (typeof loadAll === 'function') {
         let state = await loadAll(aid, deviceId, slotId);
         if (this._seqTrackerContext !== context) return;
@@ -4803,7 +4789,7 @@ export class AUNClient {
         return;
       }
       // fallback: 从旧 instance_state JSON blob 恢复
-      const loader = this._keystore.loadInstanceState?.bind(this._keystore);
+      const loader = this._tokenStore.loadInstanceState?.bind(this._tokenStore);
       if (typeof loader !== 'function') return;
       const stateHolder = await loader(aid, deviceId, slotId);
       if (this._seqTrackerContext !== context) return;
@@ -4856,10 +4842,8 @@ export class AUNClient {
     const aid = this._aid;
     const deviceId = this._deviceId;
     const slotId = this._slotId;
-    const saver = this._keystore.saveSeq?.bind(this._keystore);
-    const deleter = (this._keystore as KeyStore & {
-      deleteSeq?: (aid: string, deviceId: string, slotId: string, namespace: string) => void | Promise<void>;
-    }).deleteSeq?.bind(this._keystore);
+    const saver = this._tokenStore.saveSeq?.bind(this._tokenStore);
+    const deleter = this._tokenStore.deleteSeq?.bind(this._tokenStore);
     if (typeof saver === 'function') {
       for (const [oldNs, newNs] of Object.entries(renameMap)) {
         if (typeof deleter === 'function') {
@@ -4917,7 +4901,7 @@ export class AUNClient {
     if (Object.keys(state).length === 0) return;
     try {
       // 优先按行写入 seq_tracker 表
-      const saveFn = this._keystore.saveSeq?.bind(this._keystore);
+      const saveFn = this._tokenStore.saveSeq?.bind(this._tokenStore);
       if (typeof saveFn === 'function') {
         for (const [ns, seq] of Object.entries(state)) {
           saveFn(this._aid, this._deviceId, this._slotId, ns, seq).catch((exc) => {
@@ -4933,8 +4917,8 @@ export class AUNClient {
         return;
       }
       // fallback: 旧版 updateInstanceState JSON blob
-      if (typeof this._keystore.updateInstanceState === 'function') {
-        this._keystore.updateInstanceState(this._aid, this._deviceId, this._slotId, (current) => {
+      if (typeof this._tokenStore.updateInstanceState === 'function') {
+        this._tokenStore.updateInstanceState(this._aid, this._deviceId, this._slotId, (current) => {
           (current as Record<string, JsonValue>).seq_tracker_state = state as unknown as JsonValue;
           return current;
         }).catch((exc) => {
@@ -4962,15 +4946,15 @@ export class AUNClient {
     if (!this._aid || !ns) return;
     const seq = this._seqTracker.getContiguousSeq(ns);
     try {
-      if (seq > 0 && typeof this._keystore.saveSeq === 'function') {
-        this._keystore.saveSeq(this._aid, this._deviceId, this._slotId, ns, seq).catch((exc) => {
+      if (seq > 0 && typeof this._tokenStore.saveSeq === 'function') {
+        this._tokenStore.saveSeq(this._aid, this._deviceId, this._slotId, ns, seq).catch((exc) => {
           this._clientLog.debug(`persist repaired seq failed: ns=${ns} err=${formatCaughtError(exc)}`);
         });
         return;
       }
-      const deleteSeq = this._keystore.deleteSeq;
+      const deleteSeq = this._tokenStore.deleteSeq;
       if (seq <= 0 && typeof deleteSeq === 'function') {
-        deleteSeq.call(this._keystore, this._aid, this._deviceId, this._slotId, ns).catch((exc) => {
+        deleteSeq.call(this._tokenStore, this._aid, this._deviceId, this._slotId, ns).catch((exc) => {
           this._clientLog.debug(`delete repaired seq failed: ns=${ns} err=${formatCaughtError(exc)}`);
         });
         return;
@@ -5090,6 +5074,30 @@ export class AUNClient {
 
     // 上线时自动确认 pending state proposals
     this._safeAsync(this._v2AutoConfirmPendingProposals());
+  }
+
+  private _v2StoreDeviceId(): string {
+    return `aid:${encodeURIComponent(String(this._aid ?? ''))}|device:${encodeURIComponent(String(this._deviceId ?? ''))}`;
+  }
+
+  private async _saveGroupIdentityToV2(
+    groupAid: string,
+    identity: { private_key_pem: string; public_key_der_b64: string },
+  ): Promise<void> {
+    const privateKeyPem = String(identity.private_key_pem ?? '').trim();
+    const publicKeyDerB64 = String(identity.public_key_der_b64 ?? '').trim();
+    if (!groupAid || !privateKeyPem || !publicKeyDerB64) {
+      throw new StateError('group identity is incomplete');
+    }
+    if (!this._v2KeyStore) {
+      this._v2KeyStore = await V2KeyStore.open();
+    }
+    await this._v2KeyStore.saveGroupIdentity(
+      this._v2StoreDeviceId(),
+      groupAid,
+      privateKeyPem,
+      base64ToUint8(publicKeyDerB64),
+    );
   }
 
   private async _v2TrustedIKPubDer(aid: string): Promise<Uint8Array> {

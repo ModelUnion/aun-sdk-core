@@ -88,6 +88,62 @@ func TestChangeSeedMigratesKeyJSONAfterPrivateKeyVerification(t *testing.T) {
 	}
 }
 
+func TestChangeSeedMigratesPlaintextKeyJSON(t *testing.T) {
+	dir := t.TempDir()
+	aid := "plaintext-change-seed.agentid.pub"
+	keyPath := filepath.Join(dir, "AIDs", aid, "private", "key.json")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(`{"private_key_pem":"PLAINTEXT_PRIVATE","public_key_der_b64":"pub","curve":"P-256"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := ChangeSeed(dir, "legacy-unused", "new-seed")
+	if err != nil {
+		t.Fatalf("ChangeSeed 失败: %v", err)
+	}
+	if result.PrivateKeysMigrated != 1 {
+		t.Fatalf("应迁移 1 个明文私钥，实际: %d", result.PrivateKeysMigrated)
+	}
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "PLAINTEXT_PRIVATE") {
+		t.Fatal("迁移后 key.json 不应包含明文私钥")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := decoded["private_key_pem"]; ok {
+		t.Fatal("迁移后 key.json 不应保留 private_key_pem")
+	}
+}
+
+func TestChangeSeedWrongOldSeedDoesNotModifyKeyJSON(t *testing.T) {
+	dir := t.TempDir()
+	aid := "wrong-old-seed.agentid.pub"
+	writeSeedProtectedKeyJSON(t, dir, aid, "old-seed", "KEEP_OLD_PRIVATE")
+	keyPath := filepath.Join(dir, "AIDs", aid, "private", "key.json")
+	before, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ChangeSeed(dir, "wrong-seed", "new-seed"); err == nil {
+		t.Fatal("ChangeSeed 应因旧 seed 不匹配而失败")
+	}
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != string(before) {
+		t.Fatal("旧 seed 不匹配时不应修改原 key.json")
+	}
+}
+
 // ── GO-008: initSchema 版本迁移框架测试 ──────────────────────
 
 func TestInitSchema_NewDB_SetsCurrentVersion(t *testing.T) {
@@ -342,5 +398,134 @@ func TestSaveCertOverwriteExisting(t *testing.T) {
 	}
 	if loaded != "cert-v2" {
 		t.Fatalf("覆盖写入后应读到 cert-v2，实际: %v", loaded)
+	}
+}
+
+func TestLoadKeyPairMigratesPlaintextAndWrongSeedPreservesFile(t *testing.T) {
+	dir := t.TempDir()
+	aid := "legacy-plaintext.agentid.pub"
+	keyPath := filepath.Join(dir, "AIDs", aid, "private", "key.json")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(`{"private_key_pem":"LEGACY_PLAINTEXT_PRIVATE","public_key_der_b64":"pub","curve":"P-256"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ks, err := NewFileKeyStore(dir, nil, "new-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ks.LoadKeyPair(aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded["private_key_pem"] != "LEGACY_PLAINTEXT_PRIVATE" {
+		t.Fatalf("应读取到历史明文私钥，实际: %v", loaded["private_key_pem"])
+	}
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "LEGACY_PLAINTEXT_PRIVATE") {
+		t.Fatal("load 后 key.json 不应保留明文私钥")
+	}
+
+	encryptedDir := t.TempDir()
+	ks2, err := NewFileKeyStore(encryptedDir, nil, "correct-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ks2.SaveKeyPair("wrong-load-seed.agentid.pub", map[string]any{
+		"private_key_pem":    "CORRECT_SEED_PRIVATE",
+		"public_key_der_b64": "pub",
+		"curve":              "P-256",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loadPath := filepath.Join(encryptedDir, "AIDs", "wrong-load-seed.agentid.pub", "private", "key.json")
+	before, err := os.ReadFile(loadPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ksWrong, err := NewFileKeyStore(encryptedDir, nil, "wrong-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ksWrong.LoadKeyPair("wrong-load-seed.agentid.pub"); err == nil {
+		t.Fatal("错误 seed 应返回错误")
+	}
+	after, err := os.ReadFile(loadPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("错误 seed 不应修改 key.json")
+	}
+}
+
+func TestLoadPendingKeyPairMigratesPlaintextAndWrongSeedPreservesPending(t *testing.T) {
+	dir := t.TempDir()
+	aid := "pending-plaintext.agentid.pub"
+	ks, err := NewFileKeyStore(dir, nil, "pending-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingDir, err := ks.PendingIdentityDir(aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(pendingDir, "private", "key.json")
+	if err := os.WriteFile(keyPath, []byte(`{"private_key_pem":"PENDING_PLAINTEXT_PRIVATE","public_key_der_b64":"pub","curve":"P-256"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ks.LoadPendingKeyPair(pendingDir, aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded["private_key_pem"] != "PENDING_PLAINTEXT_PRIVATE" {
+		t.Fatalf("应读取到 pending 明文私钥，实际: %v", loaded["private_key_pem"])
+	}
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "PENDING_PLAINTEXT_PRIVATE") {
+		t.Fatal("pending 读取后不应保留明文私钥")
+	}
+
+	wrongDir := t.TempDir()
+	ks2, err := NewFileKeyStore(wrongDir, nil, "correct-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingDir2, err := ks2.PendingIdentityDir("pending-wrong-seed.agentid.pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ks2.SavePendingKeyPair(pendingDir2, "pending-wrong-seed.agentid.pub", map[string]any{
+		"private_key_pem":    "PENDING_CORRECT_PRIVATE",
+		"public_key_der_b64": "pub",
+		"curve":              "P-256",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pendingPath := filepath.Join(pendingDir2, "private", "key.json")
+	before, err := os.ReadFile(pendingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ksWrong, err := NewFileKeyStore(wrongDir, nil, "wrong-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ksWrong.LoadPendingKeyPair(pendingDir2, "pending-wrong-seed.agentid.pub"); err == nil {
+		t.Fatal("错误 seed 应返回错误")
+	}
+	after, err := os.ReadFile(pendingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("错误 seed 不应修改 pending key.json")
 	}
 }

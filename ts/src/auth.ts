@@ -22,7 +22,7 @@ import WebSocket from 'ws';
 
 import { AuthError, StateError, ValidationError, AUNError, IdentityConflictError, mapRemoteError } from './errors.js';
 import type { CryptoProvider } from './crypto.js';
-import type { KeyStore } from './keystore/index.js';
+import type { TokenStore } from './keystore/index.js';
 import type { RPCTransport } from './transport.js';
 import type { DnsResilientNet } from './net.js';
 import {
@@ -291,7 +291,7 @@ export class AuthFlow {
   ] as const;
 
   private _logger: ModuleLogger;
-  private _keystore: KeyStore;
+  private _tokenStore: TokenStore;
   private _crypto: CryptoProvider;
   private _aid: string | null;
   private _deviceId: string;
@@ -315,9 +315,11 @@ export class AuthFlow {
   private _chainVerifiedCache: Map<string, number> = new Map();
   // Gateway CA 链预验证标记：cache_key -> verified
   private _gatewayCaVerified: Map<string, boolean> = new Map();
+  // 调用方注入的内存私钥（由 AUNClient.loadIdentity 传入，不走 tokenStore 解密）
+  private _memIdentity: IdentityRecord | null = null;
 
   constructor(opts: {
-    keystore: KeyStore;
+    tokenStore: TokenStore;
     crypto: CryptoProvider;
     aid?: string | null;
     deviceId?: string;
@@ -330,7 +332,7 @@ export class AuthFlow {
     net?: DnsResilientNet | null;
   }) {
     this._logger = opts.logger ?? _noopLogger;
-    this._keystore = opts.keystore;
+    this._tokenStore = opts.tokenStore;
     this._crypto = opts.crypto;
     this._aid = opts.aid ?? null;
     this._deviceId = String(opts.deviceId ?? '').trim();
@@ -345,10 +347,19 @@ export class AuthFlow {
 
   // ── 公开方法 ────────────────────────────────────────────────
 
+  /**
+   * 注入内存私钥（由 AUNClient.loadIdentity 调用）。
+   * AuthFlow 内部不再从 tokenStore 解密私钥，只使用此处注入的明文。
+   */
+  setIdentity(identity: IdentityRecord | null): void {
+    this._memIdentity = identity;
+    if (identity?.aid) this._aid = String(identity.aid);
+  }
+
   /** 加载身份信息（密钥对 + 证书 + 元数据） */
   loadIdentity(aid?: string): IdentityRecord {
     const identity = this._loadIdentityOrRaise(aid);
-    const cert = this._keystore.loadCert(String(identity.aid));
+    const cert = this._tokenStore.loadCert(String(identity.aid));
     if (cert) identity.cert = cert;
     const instanceState = this._loadInstanceState(String(identity.aid));
     if (instanceState && typeof instanceState === 'object') {
@@ -391,245 +402,6 @@ export class AuthFlow {
   }
 
   /**
-   * 注册新 AID（原子流程，必须由应用层显式调用）。
-   *
-   * 安全约束（与 Python register_aid 对齐）：
-   *   - **绝不**被 SDK 内部任何路径自动调用（authenticate / connect / 等）
-   *   - 本地已有任何痕迹 → 抛 IdentityConflictError，应用层应改用 loadIdentity
-   *   - 服务端已注册同名 AID → 抛 IdentityConflictError
-   *
-   * 异常分支与恢复：
-   *   A. 全新流程：临时目录生成 keypair → RPC → cert → 原子 rename
-   *   B. 恢复流程：上次 RPC 没收到响应就崩溃；扫描 _pending，公钥匹配
-   *      则下载 cert 完成 promote（防止"已注册但本地没保存"）
-   */
-  async registerAid(gatewayUrl: string, aid: string): Promise<JsonObject> {
-    const tStart = Date.now();
-    AuthFlow._validateAidName(aid);
-    this._logger.debug(`registerAid enter: aid=${aid}, gateway=${gatewayUrl}`);
-    try {
-      // Step 1: 本地完整身份的幂等处理
-      // - 服务端 cert 公钥匹配 → 视为已注册成功，幂等返回
-      // - 服务端 cert 公钥不匹配 → IdentityConflictError（被别人占）
-      // - 服务端无记录 → IdentityConflictError（要求清理本地）
-      const existing = this._keystore.loadIdentity(aid);
-      if (existing !== null && existing.public_key_der_b64) {
-        this._logger.debug(`registerAid: local keypair exists, checking server for idempotency: aid=${aid}`);
-        const localPubB64 = String(existing.public_key_der_b64);
-        const serverCertPem = await this._downloadRegisteredCert(gatewayUrl, aid);
-        if (!serverCertPem) {
-          // 服务端无记录 → 用现有 keypair 发起注册
-          this._logger.debug(`registerAid: server has no record, registering with existing keypair: aid=${aid}`);
-          const pendingDir = (this._keystore as any).pendingIdentityDir?.(aid) as string | undefined;
-          let created: JsonObject;
-          try {
-            created = await this._createAid(gatewayUrl, existing as any);
-          } catch (e) {
-            this._logger.warn(`registerAid RPC failed (existing keypair): aid=${aid}, error=${e instanceof Error ? e.message : String(e)}`);
-            throw e;
-          }
-          const certPem = String((created as JsonObject).cert ?? '');
-          if (!certPem) {
-            throw new AuthError(`registerAid: server response missing cert for ${aid}`);
-          }
-          existing.cert = certPem;
-          this._assertCertMatchesLocalKeypair(existing);
-          this._persistIdentity(existing);
-          this._aid = aid;
-          this._logger.debug(`registerAid exit (recovered): elapsed=${Date.now() - tStart}ms aid=${aid}`);
-          return { aid, cert: certPem };
-        }
-        // 比对公钥
-        const cert = _loadX509(serverCertPem);
-        const serverPubDer = _extractPublicKey(cert).export({ type: 'spki', format: 'der' });
-        const localPubDer = Buffer.from(localPubB64, 'base64');
-        if (!serverPubDer.equals(localPubDer)) {
-          throw new IdentityConflictError(
-            `AID '${aid}' is registered by another party on server (public key mismatch). ` +
-            `Choose a different name.`,
-          );
-        }
-        // 公钥匹配 → 幂等返回；如本地缺 cert，把服务端 cert 写入
-        this._logger.info(`registerAid: idempotent return for already-registered AID: aid=${aid}`);
-        if (!existing.cert) {
-          existing.cert = serverCertPem;
-          this._persistIdentity(existing);
-        }
-        this._aid = aid;
-        return { aid, cert: serverCertPem };
-      }
-
-      // Step 2: 检查 _pending/ 残留临时目录（崩溃恢复）
-      const recovered = await this._tryRecoverPendingRegistration(gatewayUrl, aid);
-      if (recovered !== null) {
-        this._logger.info(`registerAid recovered from pending: aid=${aid}`);
-        return recovered;
-      }
-
-      // Step 3: 服务端查重
-      const existingCert = await this._downloadRegisteredCert(gatewayUrl, aid);
-      if (existingCert) {
-        this._logger.warn(`registerAid aborted: AID already registered on server: aid=${aid}`);
-        throw new IdentityConflictError(
-          `AID '${aid}' is already registered on server. Choose a different name, or if you own the keypair use a recovery flow.`,
-        );
-      }
-
-      // Step 4: 创建临时目录 + 生成 keypair + 写 priv
-      const identity = this._crypto.generateIdentity() as IdentityRecord;
-      identity.aid = aid;
-      const pendingDir = (this._keystore as any).pendingIdentityDir(aid) as string;
-      this._writePendingKeypair(pendingDir, identity);
-
-      // Step 5: 服务端注册拿 cert
-      let created: JsonObject;
-      try {
-        created = await this._createAid(gatewayUrl, identity);
-      } catch (e) {
-        this._logger.warn(`registerAid RPC failed (pending kept for recovery): aid=${aid}, pending=${pendingDir}, error=${e instanceof Error ? e.message : String(e)}`);
-        throw e;
-      }
-      const certPem = String((created as JsonObject).cert ?? '');
-      if (!certPem) {
-        throw new AuthError(`registerAid: server response missing cert for ${aid}`);
-      }
-      identity.cert = certPem;
-
-      // Step 6: 校验 cert 公钥 == 本地公钥
-      this._assertCertMatchesLocalKeypair(identity);
-
-      // Step 7: 写 cert.pem 到临时目录
-      this._writePendingCert(pendingDir, certPem);
-
-      // Step 8: 原子 rename
-      try {
-        (this._keystore as any).promotePendingIdentity(pendingDir, aid);
-      } catch (e) {
-        this._logger.warn(`registerAid promote failed: aid=${aid}, error=${e instanceof Error ? e.message : String(e)}`);
-        throw new IdentityConflictError(
-          `AID '${aid}' was created by another process during registration; pending dir kept for cleanup.`,
-        );
-      }
-
-      // Step 9: 标准持久化
-      this._persistIdentity(identity);
-      this._aid = aid;
-      this._logger.debug(`registerAid exit: elapsed=${Date.now() - tStart}ms aid=${aid}`);
-      return { aid: identity.aid, cert: identity.cert };
-    } catch (err) {
-      this._logger.debug(`registerAid exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
-  }
-
-  /**
-   * 检查 AIDs/_pending/ 下是否有该 aid 的残留，尝试恢复（崩溃恢复）。
-   * 返回 dict 表示恢复成功；null 表示无残留 / 残留已清理；抛错表示明确失败。
-   */
-  private async _tryRecoverPendingRegistration(
-    gatewayUrl: string,
-    aid: string,
-  ): Promise<JsonObject | null> {
-    const aidsRoot = (this._keystore as any)._aidsRoot as string;
-    const pendingRoot = path.join(aidsRoot, '_pending');
-    if (!fs.existsSync(pendingRoot)) return null;
-    const safe = (this._keystore as any).constructor === undefined ? aid : aid;
-    const safeAid = aid.replace(/\//g, '_').replace(/\\/g, '_').replace(/:/g, '_');
-    const prefix = safeAid + '-';
-    const candidates = fs.readdirSync(pendingRoot, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && e.name.startsWith(prefix))
-      .map((e) => path.join(pendingRoot, e.name))
-      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-    if (candidates.length === 0) return null;
-
-    for (const pendingDir of candidates) {
-      const privPath = path.join(pendingDir, 'private', 'key.json');
-      if (!fs.existsSync(privPath)) {
-        try { fs.rmSync(pendingDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        continue;
-      }
-      let privData: { private_key_pem?: string; public_key_der_b64?: string; curve?: string };
-      try {
-        privData = JSON.parse(fs.readFileSync(privPath, 'utf-8'));
-      } catch {
-        try { fs.rmSync(pendingDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        continue;
-      }
-      const localPriv = privData.private_key_pem ?? '';
-      const localPubB64 = privData.public_key_der_b64 ?? '';
-      if (!localPriv || !localPubB64) {
-        try { fs.rmSync(pendingDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        continue;
-      }
-
-      const serverCert = await this._downloadRegisteredCert(gatewayUrl, aid);
-      if (!serverCert) {
-        // 上次 RPC 没生效 → 清理临时目录，由调用方走全新注册流程
-        this._logger.info(`pending dir found but server has no registration; cleaning up: ${pendingDir}`);
-        try { fs.rmSync(pendingDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        return null;
-      }
-
-      // 比对公钥
-      const cert = _loadX509(serverCert);
-      const certPubKey = _extractPublicKey(cert);
-      const certPubDer = certPubKey.export({ type: 'spki', format: 'der' });
-      const localPubDer = Buffer.from(localPubB64, 'base64');
-      if (!certPubDer.equals(localPubDer)) {
-        this._logger.warn(`pending dir public key does not match server cert; AID '${aid}' was taken`);
-        try { fs.rmSync(pendingDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        throw new IdentityConflictError(
-          `AID '${aid}' has been registered by another party while local pending registration was incomplete; local pending key discarded.`,
-        );
-      }
-
-      // 公钥匹配 → 上次 RPC 成功，补 cert + promote
-      this._logger.info(`pending recovery: cert public key matches; finalizing registration: aid=${aid}`);
-      this._writePendingCert(pendingDir, serverCert);
-      const identity: IdentityRecord = {
-        aid,
-        private_key_pem: localPriv,
-        public_key_der_b64: localPubB64,
-        curve: privData.curve ?? 'P-256',
-        cert: serverCert,
-      };
-      try {
-        (this._keystore as any).promotePendingIdentity(pendingDir, aid);
-      } catch (e) {
-        throw new IdentityConflictError(
-          `AID '${aid}' was created by another process during recovery; pending dir kept for cleanup.`,
-        );
-      }
-      this._persistIdentity(identity);
-      this._aid = aid;
-      return { aid, cert: serverCert };
-    }
-    return null;
-  }
-
-  private _writePendingKeypair(pendingDir: string, identity: IdentityRecord): void {
-    const priv = String(identity.private_key_pem ?? '');
-    const pub = String(identity.public_key_der_b64 ?? '');
-    const curve = String(identity.curve ?? 'P-256');
-    if (!priv || !pub) {
-      throw new AuthError('registerAid: generated identity missing keypair fields');
-    }
-    const dir = path.join(pendingDir, 'private');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(
-      path.join(dir, 'key.json'),
-      JSON.stringify({ private_key_pem: priv, public_key_der_b64: pub, curve }, null, 2),
-      { encoding: 'utf-8', mode: 0o600 },
-    );
-  }
-
-  private _writePendingCert(pendingDir: string, certPem: string): void {
-    const dir = path.join(pendingDir, 'public');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'cert.pem'), certPem, { encoding: 'utf-8', mode: 0o600 });
-  }
-
-  /**
    * 认证（登录）到 Gateway。
    * 执行两阶段挑战-应答认证，返回 token 信息。
    */
@@ -641,7 +413,7 @@ export class AuthFlow {
     let identity = this._loadIdentityOrRaise(opts?.aid);
     this._logger.debug(`authenticate enter: aid=${identity.aid}, gateway=${gatewayUrl}`);
     try {
-      // 优先复用 keystore 里的 cached access_token（未过期且有 refresh_token）
+      // 优先复用 tokenStore 里的 cached access_token（未过期且有 refresh_token）
       // 避免每次调 authenticate 都走两阶段重登的网络往返
       // 注意：_loadIdentityOrRaise 不带 instance_state（access_token 等），
       // 这里需要主动走 _loadInstanceState 拿到 token
@@ -1031,7 +803,7 @@ export class AuthFlow {
    * 通过临时 WebSocket 发送单次 JSON-RPC 请求。
    * 流程：连接 → 接收 challenge → 发送请求 → 接收响应 → 关闭。
    */
-  private async _shortRpc(
+  protected async _shortRpc(
     gatewayUrl: string,
     method: string,
     params: RpcParams,
@@ -1109,19 +881,6 @@ export class AuthFlow {
   }
 
   // ── 内部方法：认证流程 ──────────────────────────────────────
-
-  /** 注册 AID 到 Gateway */
-  private async _createAid(
-    gatewayUrl: string,
-    identity: IdentityRecord,
-  ): Promise<JsonObject> {
-    const response = await this._shortRpc(gatewayUrl, 'auth.create_aid', {
-      aid: identity.aid,
-      public_key: identity.public_key_der_b64,
-      curve: identity.curve || 'P-256',
-    });
-    return { cert: response.cert };
-  }
 
   /** 两阶段登录 */
   private async _login(
@@ -2016,7 +1775,7 @@ export class AuthFlow {
    * 防线 B：authenticate 在调 _login 前显式校验 cert 与本地 keypair 公钥一致。
    * 命中即抛 AuthError，绝不发起两步登录。
    */
-  private _assertCertMatchesLocalKeypair(identity: IdentityRecord): void {
+  protected _assertCertMatchesLocalKeypair(identity: IdentityRecord): void {
     const aid = identity.aid ?? '?';
     const certPem = identity.cert as string | undefined;
     const localPubB64 = identity.public_key_der_b64 as string | undefined;
@@ -2237,7 +1996,7 @@ export class AuthFlow {
   // AID name 验证：4-64 字符，仅 [a-z0-9_-]，首字符不为 -，不以 guest 开头
   private static readonly _AID_NAME_RE = /^[a-z0-9_][a-z0-9_-]{3,63}$/;
 
-  private static _validateAidName(aid: string): void {
+  static _validateAidName(aid: string): void {
     const name = aid.includes('.') ? aid.split('.')[0] : aid;
     if (!AuthFlow._AID_NAME_RE.test(name)) {
       throw new ValidationError(
@@ -2252,61 +2011,46 @@ export class AuthFlow {
   // （_ensureLocalIdentity 已硬移除：注册和登录彻底分离，登录路径绝不再
   // 隐式生成密钥；新身份必须由应用层显式调 registerAid）
 
-  /** 加载身份信息，不存在或半成品时抛出 StateError */
+  /** 加载身份信息，不存在或半成品时抛出 StateError。
+   *  优先使用调用方注入的内存私钥（_memIdentity），不从 tokenStore 解密私钥。
+   */
   private _loadIdentityOrRaise(aid?: string): IdentityRecord {
     const requestedAid = aid ?? this._aid;
-    if (requestedAid) {
-      const existing = this._keystore.loadIdentity(requestedAid);
-      if (existing === null) {
-        throw new StateError(`identity not found for aid: ${requestedAid}`);
+
+    // 优先路径：使用注入的内存 identity（私钥已由 AIDStore 解密并传入）
+    if (this._memIdentity) {
+      const mem = this._memIdentity;
+      if (requestedAid && String(mem.aid ?? '') !== requestedAid) {
+        throw new StateError(`identity mismatch: requested ${requestedAid}, loaded ${mem.aid}`);
       }
-      // 防线 A：拒绝半成品 identity（缺 keypair 任一字段）。
-      // 这是上次 registerAid 半完成 / keystore 损坏的常见症状；如果让它流到
-      // _login，签名一定失败，且服务端可能记录一次无效登录尝试。
-      if (!existing.private_key_pem || !existing.public_key_der_b64) {
+      if (!mem.private_key_pem || !mem.public_key_der_b64) {
         throw new StateError(
-          `local identity for aid ${requestedAid} is incomplete (missing keypair); ` +
-          `call auth.registerAid() first`,
+          `injected identity for aid ${mem.aid} is incomplete (missing keypair)`,
         );
       }
-      this._aid = requestedAid;
-      if (!existing.aid) existing.aid = requestedAid;
-      return existing;
+      if (requestedAid) this._aid = requestedAid;
+      return { ...mem };
     }
-    // 尝试加载任意身份
-    const ks = this._keystore as AnyIdentityKeyStore;
-    if (typeof ks.loadAnyIdentity === 'function') {
-      const existing = ks.loadAnyIdentity();
-      if (existing !== null && existing !== undefined) {
-        if (!existing.private_key_pem || !existing.public_key_der_b64) {
-          throw new StateError(
-            `local identity is incomplete (missing keypair); call auth.registerAid() first`,
-          );
-        }
-        const loadedAid = existing.aid;
-        if (typeof loadedAid === 'string' && loadedAid) {
-          this._aid = loadedAid;
-        }
-        return existing;
-      }
+
+    if (requestedAid) {
+      throw new StateError(
+        `no injected identity for aid ${requestedAid}; call AUNClient.loadIdentity(aid) first`,
+      );
     }
-    throw new StateError('no local identity found, call auth.registerAid() first');
+    throw new StateError('no local identity found, call AUNClient.loadIdentity(aid) first');
   }
 
   // （_ensureIdentity 已硬移除：注册和登录彻底分离，登录路径绝不再隐式
   // 生成密钥；调用方应改用 _loadIdentityOrRaise 获取已注册身份）
 
   private _loadInstanceState(aid: string): IdentityRecord | null {
-    const loader = (this._keystore as KeyStore & {
-      loadInstanceState?: (aid: string, deviceId: string, slotId?: string) => IdentityRecord | null;
-    }).loadInstanceState;
-    if (typeof loader !== 'function') {
+    if (typeof this._tokenStore.loadInstanceState !== 'function') {
       return null;
     }
-    return loader.call(this._keystore, aid, this._deviceId, this._slotId);
+    return this._tokenStore.loadInstanceState(aid, this._deviceId, this._slotId) as IdentityRecord | null;
   }
 
-  private _persistIdentity(identity: IdentityRecord): void {
+  protected _persistIdentity(identity: IdentityRecord): void {
     const aid = String(identity.aid ?? '');
     if (!aid) {
       throw new StateError('identity missing aid');
@@ -2320,36 +2064,18 @@ export class AuthFlow {
         delete persisted[key];
       }
     }
-    // 私钥由 AIDStore 管理，AUNClient 不写 key.json
-    for (const key of ['private_key_pem', 'public_key_der_b64', 'curve'] as const) {
-      delete persisted[key];
+    delete persisted.private_key_pem;
+    delete persisted.public_key_der_b64;
+    delete persisted.curve;
+
+    if (typeof persisted.cert === 'string' && persisted.cert) {
+      this._tokenStore.saveCert(aid, persisted.cert);
     }
 
-    this._keystore.saveIdentity(aid, persisted);
-
-    // 从共享 metadata_kv 中移除实例级字段（它们已保存到 instance_state）
-    const db = (this._keystore as any)._getDB?.(aid);
-    if (db && typeof db.deleteMetadata === 'function') {
-      for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
-        db.deleteMetadata(key);
-        db.deleteMetadata(`${key}_protection`);
-      }
-    }
-    if (Object.keys(instanceState).length === 0) {
+    if (Object.keys(instanceState).length === 0 || typeof this._tokenStore.updateInstanceState !== 'function') {
       return;
     }
-    const updater = (this._keystore as KeyStore & {
-      updateInstanceState?: (
-        aid: string,
-        deviceId: string,
-        slotId: string,
-        updater: (state: IdentityRecord) => IdentityRecord | void,
-      ) => IdentityRecord;
-    }).updateInstanceState;
-    if (typeof updater !== 'function') {
-      return;
-    }
-    updater.call(this._keystore, aid, this._deviceId, this._slotId, (current) => {
+    this._tokenStore.updateInstanceState(aid, this._deviceId, this._slotId, (current) => {
       Object.assign(current, instanceState);
       return current;
     });
@@ -2482,6 +2208,3 @@ interface AuthContext extends JsonObject {
   hello?: JsonObject;
 }
 
-interface AnyIdentityKeyStore extends KeyStore {
-  loadAnyIdentity?: () => IdentityRecord | null;
-}

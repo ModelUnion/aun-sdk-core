@@ -11,6 +11,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { AuthFlow } from '../../src/auth.js';
+import { RegisterFlow } from '../../src/register-flow.js';
 import { AuthError, StateError, IdentityConflictError } from '../../src/errors.js';
 import { CryptoProvider } from '../../src/crypto.js';
 import { FileKeyStore } from '../../src/keystore/file.js';
@@ -64,7 +65,7 @@ describe('AuthFlow', () => {
 
   it('默认 capabilities 仅声明 E2EE V2 能力', async () => {
     const auth = new AuthFlow({
-      keystore: {} as any,
+      tokenStore: {} as any,
       crypto: {} as any,
       verifySsl: false,
       logger: {
@@ -101,7 +102,7 @@ describe('AuthFlow', () => {
 
   it('覆盖 capabilities 也会被规范化为 V2-only', async () => {
     const auth = new AuthFlow({
-      keystore: {} as any,
+      tokenStore: {} as any,
       crypto: {} as any,
       verifySsl: false,
       logger: {
@@ -146,7 +147,7 @@ describe('AuthFlow', () => {
       saveIdentity: vi.fn(),
     };
     const auth = new AuthFlow({
-      keystore: keystore as any,
+      tokenStore: keystore as any,
       crypto: {} as any,
       deviceId: '',
       verifySsl: false,
@@ -159,13 +160,8 @@ describe('AuthFlow', () => {
   });
 
   it('空 device_id 应写入 instance_state 而不是留在共享身份元数据', () => {
-    const deletedKeys: string[] = [];
     const updatedStates: Record<string, unknown>[] = [];
     const keystore = {
-      saveIdentity: vi.fn(),
-      _getDB: vi.fn().mockReturnValue({
-        deleteMetadata: vi.fn((key: string) => deletedKeys.push(key)),
-      }),
       updateInstanceState: vi.fn((_aid: string, _deviceId: string, _slotId: string, updater: (state: Record<string, unknown>) => Record<string, unknown> | void) => {
         const current: Record<string, unknown> = {};
         updater(current);
@@ -174,7 +170,7 @@ describe('AuthFlow', () => {
       }),
     };
     const auth = new AuthFlow({
-      keystore: keystore as any,
+      tokenStore: keystore as any,
       crypto: {} as any,
       deviceId: '',
       verifySsl: false,
@@ -187,21 +183,16 @@ describe('AuthFlow', () => {
       refresh_token: 'ref-empty-device',
     });
 
-    expect(keystore.saveIdentity).toHaveBeenCalledWith('alice.agentid.pub', expect.not.objectContaining({
-      access_token: expect.anything(),
-      refresh_token: expect.anything(),
-    }));
     expect(keystore.updateInstanceState).toHaveBeenCalledWith('alice.agentid.pub', '', '', expect.any(Function));
     expect(updatedStates[0]).toMatchObject({
       access_token: 'tok-empty-device',
       refresh_token: 'ref-empty-device',
     });
-    expect(deletedKeys).toContain('access_token');
   });
 
   it('OCSP DER 解析应支持 responderID byKey ([2]) 响应', () => {
     const auth = new AuthFlow({
-      keystore: {} as any,
+      tokenStore: {} as any,
       crypto: {} as any,
       verifySsl: false,
     });
@@ -216,7 +207,7 @@ describe('AuthFlow', () => {
 
   it('OCSP 非成功响应应回退到 JSON status 而不是误报结构缺失', () => {
     const auth = new AuthFlow({
-      keystore: {} as any,
+      tokenStore: {} as any,
       crypto: {} as any,
       verifySsl: false,
     });
@@ -228,7 +219,7 @@ describe('AuthFlow', () => {
 
   it('OCSP DER 解析应支持 certStatus unknown 响应', () => {
     const auth = new AuthFlow({
-      keystore: {} as any,
+      tokenStore: {} as any,
       crypto: {} as any,
       verifySsl: false,
     });
@@ -241,10 +232,10 @@ describe('AuthFlow', () => {
 
   // ── registerAid 查重前置 + 落盘时机修复 ─────────────────────
   describe('registerAid: 查重前置 + 落盘时机', () => {
-    function makeAuthFlow() {
+    function makeRegisterFlow() {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-ts-test-'));
       const keystore = new FileKeyStore(path.join(tmpDir, 'aun'));
-      const flow = new AuthFlow({
+      const flow = new RegisterFlow({
         keystore,
         crypto: new CryptoProvider(),
         verifySsl: false,
@@ -263,7 +254,7 @@ describe('AuthFlow', () => {
     }
 
     it('A: AID 已注册时抛 IdentityConflictError，本地不落盘', async () => {
-      const { flow, tmpDir } = makeAuthFlow();
+      const { flow, tmpDir } = makeRegisterFlow();
       const aid = 'taken.example.com';
       // mock _downloadRegisteredCert 返回非空 cert（视为已注册）
       (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue('-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----');
@@ -280,7 +271,7 @@ describe('AuthFlow', () => {
     });
 
     it('B: TOCTOU race（查重 404 + RPC 拒绝）时不落盘', async () => {
-      const { flow, tmpDir } = makeAuthFlow();
+      const { flow, tmpDir } = makeRegisterFlow();
       const aid = 'race.example.com';
       (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue(null);
       (flow as any)._createAid = vi.fn().mockRejectedValue(new AuthError('AID already exists'));
@@ -292,7 +283,7 @@ describe('AuthFlow', () => {
     });
 
     it('C: 网络失败时不落盘', async () => {
-      const { flow, tmpDir } = makeAuthFlow();
+      const { flow, tmpDir } = makeRegisterFlow();
       const aid = 'netfail.example.com';
       (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue(null);
       (flow as any)._createAid = vi.fn().mockRejectedValue(new Error('network down'));
@@ -304,7 +295,7 @@ describe('AuthFlow', () => {
     });
 
     it('D: 查重 HTTP 失败时保守失败，不落盘', async () => {
-      const { flow, tmpDir } = makeAuthFlow();
+      const { flow, tmpDir } = makeRegisterFlow();
       const aid = 'checkfail.example.com';
       (flow as any)._downloadRegisteredCert = vi.fn().mockRejectedValue(new AuthError('failed to fetch'));
       const createSpy = vi.fn();
@@ -318,7 +309,7 @@ describe('AuthFlow', () => {
     });
 
     it('E: 全新 AID 注册成功 → keypair + cert 一次性落盘', async () => {
-      const { flow, tmpDir, keystore } = makeAuthFlow();
+      const { flow, tmpDir, keystore } = makeRegisterFlow();
       const aid = 'fresh.example.com';
       (flow as any)._downloadRegisteredCert = vi.fn().mockResolvedValue(null);
       // 服务端"返回 cert"用 stub 字符串即可（_createAid 的契约只要求拿到 cert 字段）

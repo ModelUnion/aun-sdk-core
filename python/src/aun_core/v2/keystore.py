@@ -176,6 +176,26 @@ class V2KeyStore:
             return None
         return (str(row[0]), bytes(row[1]), bytes(row[2]))
 
+    def save_group_identity(self, device_id: str, group_aid: str, private_key_pem: str, public_key_der: bytes) -> None:
+        conn = self._db._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO v2_device_keys (device_id, key_type, group_id, key_id, private_key, public_key, created_at) "
+            "VALUES (?, 'group_identity', ?, '', ?, ?, ?)",
+            (device_id, group_aid, private_key_pem.encode("utf-8"), public_key_der, int(time.time() * 1000)),
+        )
+        conn.commit()
+
+    def load_group_identity(self, device_id: str, group_aid: str) -> tuple[str, bytes] | None:
+        conn = self._db._get_conn()
+        row = conn.execute(
+            "SELECT private_key, public_key FROM v2_device_keys "
+            "WHERE device_id=? AND key_type='group_identity' AND group_id=? AND key_id=''",
+            (device_id, group_aid),
+        ).fetchone()
+        if row is None:
+            return None
+        return (bytes(row[0]).decode("utf-8"), bytes(row[1]))
+
     def load_current_spk(self, device_id: str) -> tuple[str, bytes, bytes] | None:
         """加载最新的 SPK（按 created_at 降序）。返回 (spk_id, priv, pub) 或 None。"""
         conn = self._db._get_conn()

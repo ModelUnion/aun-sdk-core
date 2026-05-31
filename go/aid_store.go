@@ -116,7 +116,9 @@ type AIDStore struct {
 	rootCaPath     string
 	debug          bool
 	// 内部组件（复用 AUNClient 的基础设施）
-	client *AUNClient
+	client       *AUNClient
+	keyStore     keystore.FullKeyStore
+	registerFlow *RegisterFlow
 }
 
 // AIDStoreOptions 创建 AIDStore 的可选参数，与 Python/JS SDK 对齐。
@@ -144,6 +146,11 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 		verifySSL = *o.VerifySSL
 	}
 	c := newClientForStore(aunPath, encryptionSeed, verifySSL, o.RootCaPath, o.Debug)
+	ks := c.tokenStore.(keystore.FullKeyStore)
+	rf := NewRegisterFlow(RegisterFlowConfig{
+		Keystore:  ks,
+		VerifySSL: verifySSL,
+	})
 	return &AIDStore{
 		aunPath:        aunPath,
 		encryptionSeed: encryptionSeed,
@@ -153,6 +160,8 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 		rootCaPath:     o.RootCaPath,
 		debug:          o.Debug,
 		client:         c,
+		keyStore:       ks,
+		registerFlow:   rf,
 	}
 }
 
@@ -179,7 +188,7 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 	}
 
 	// 加载证书
-	certPEM, err := s.client.keyStore.LoadCert(target)
+	certPEM, err := s.keyStore.LoadCert(target)
 	if err != nil || certPEM == "" {
 		return ResultErr[LoadResult](ErrCodeCertNotFound, fmt.Sprintf("certificate not found for aid: %s", target))
 	}
@@ -202,10 +211,16 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 		return ResultErr[LoadResult](ErrCodeCertChainBroken, fmt.Sprintf("certificate CN mismatch: expected %s, got %s", target, cn))
 	}
 
-	// 加载密钥对
-	keyPair, err := s.client.keyStore.LoadKeyPair(target)
-	if err != nil {
-		return ResultErr[LoadResult](ErrCodePrivateKeyParseError, fmt.Sprintf("private key load failed for aid: %s", target), err)
+	// 加载密钥对（AIDStore 持有完整 KeyStore，类型断言访问）
+	type keyPairLoaderFull interface {
+		LoadKeyPair(aid string) (map[string]any, error)
+	}
+	var keyPair map[string]any
+	if loader, ok := s.keyStore.(keyPairLoaderFull); ok {
+		keyPair, err = loader.LoadKeyPair(target)
+		if err != nil {
+			return ResultErr[LoadResult](ErrCodePrivateKeyParseError, fmt.Sprintf("private key load failed for aid: %s", target), err)
+		}
 	}
 
 	// 无私钥：仅证书有效
@@ -259,7 +274,7 @@ func (s *AIDStore) List() Result[ListResult] {
 	type lister interface {
 		ListIdentities() ([]string, error)
 	}
-	ks, ok := s.client.keyStore.(lister)
+	ks, ok := s.keyStore.(lister)
 	if !ok {
 		return ResultOk(ListResult{})
 	}
@@ -298,7 +313,7 @@ func (s *AIDStore) ChangeSeed(oldSeed, newSeed string) Result[ChangeSeedResult] 
 	type seedChanger interface {
 		ChangeSeed(oldSeed, newSeed string) (keystore.SeedChangeResult, error)
 	}
-	changer, ok := s.client.keyStore.(seedChanger)
+	changer, ok := s.keyStore.(seedChanger)
 	if !ok {
 		return ResultErr[ChangeSeedResult]("NOT_SUPPORTED", "keystore does not support seed migration")
 	}
@@ -320,9 +335,21 @@ func (s *AIDStore) Register(ctx context.Context, aid string) Result[RegisterResu
 	if err != nil {
 		return ResultErr[RegisterResult](ErrCodeNetworkError, err.Error(), err)
 	}
-	_, err = s.client.auth.RegisterAID(ctx, gatewayURL, target)
+	result, err := s.registerFlow.RegisterAID(ctx, gatewayURL, target)
 	if err != nil {
 		return ResultErr[RegisterResult](ErrCodeNetworkError, err.Error(), err)
+	}
+	if result.Cert != "" {
+		if saveErr := s.keyStore.SaveCert(target, result.Cert); saveErr != nil {
+			return ResultErr[RegisterResult](ErrCodeNetworkError, saveErr.Error(), saveErr)
+		}
+	}
+	if saveErr := s.keyStore.SaveKeyPair(target, map[string]any{
+		"private_key_pem":   result.PrivateKeyPEM,
+		"public_key_der_b64": result.PublicKeyDerB64,
+		"curve":             result.Curve,
+	}); saveErr != nil {
+		return ResultErr[RegisterResult](ErrCodeNetworkError, saveErr.Error(), saveErr)
 	}
 	return ResultOk(RegisterResult{Registered: true})
 }
@@ -396,7 +423,7 @@ func (s *AIDStore) Resolve(ctx context.Context, aid string, opts ...AIDStoreReso
 		if strings.TrimSpace(string(certBytes)) == "" {
 			return ResultErr[AIDStoreResolveResult](ErrCodeCertNotFound, fmt.Sprintf("certificate not found for aid: %s", target))
 		}
-		if saveErr := s.client.keyStore.SaveCert(target, string(certBytes)); saveErr != nil {
+		if saveErr := s.keyStore.SaveCert(target, string(certBytes)); saveErr != nil {
 			return ResultErr[AIDStoreResolveResult](ErrCodeServerError, fmt.Sprintf("save peer certificate failed: %v", saveErr), saveErr)
 		}
 		r2 := s.Load(target)
@@ -569,9 +596,9 @@ func (s *AIDStore) RenewCert(ctx context.Context, aid string) Result[AIDStoreRen
 	if !loadR.Ok || !loadR.Data.AID.IsPrivateKeyValid() {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodePrivateKeyRequired, fmt.Sprintf("private key required for aid: %s", target))
 	}
-	identity := s.client.AuthLoadIdentityOrNil(target)
-	privateKeyPEM := strings.TrimSpace(authGetStr(identity, "private_key_pem"))
-	certPEM := strings.TrimSpace(authGetStr(identity, "cert"))
+	loaded := loadR.Data.AID
+	privateKeyPEM := strings.TrimSpace(loaded.PrivateKeyPem)
+	certPEM := strings.TrimSpace(loaded.CertPem)
 	if privateKeyPEM == "" || certPEM == "" {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodePrivateKeyRequired, fmt.Sprintf("private key required for aid: %s", target))
 	}
@@ -613,7 +640,7 @@ func (s *AIDStore) RenewCert(ctx context.Context, aid string) Result[AIDStoreRen
 	if newCert == "" {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, "server response missing certificate")
 	}
-	if err := s.client.keyStore.SaveCert(target, newCert); err != nil {
+	if err := s.keyStore.SaveCert(target, newCert); err != nil {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, fmt.Sprintf("save renewed certificate failed: %v", err), err)
 	}
 	r2 := s.Load(target)
@@ -636,8 +663,7 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 		return ResultErr[AIDStoreRekeyResult](ErrCodePrivateKeyRequired, fmt.Sprintf("private key required for aid: %s", target))
 	}
 	loaded := loadR.Data.AID
-	identity := s.client.AuthLoadIdentityOrNil(target)
-	certPEM := strings.TrimSpace(authGetStr(identity, "cert"))
+	certPEM := strings.TrimSpace(loaded.CertPem)
 	if certPEM == "" {
 		return ResultErr[AIDStoreRekeyResult](ErrCodePrivateKeyRequired, fmt.Sprintf("private key required for aid: %s", target))
 	}
@@ -689,7 +715,7 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 	}
 	newIdentity["aid"] = target
 	newIdentity["cert"] = newCert
-	if err := s.client.keyStore.SaveIdentity(target, newIdentity); err != nil {
+	if err := s.keyStore.SaveIdentity(target, newIdentity); err != nil {
 		return ResultErr[AIDStoreRekeyResult](ErrCodeRekeyFailed, fmt.Sprintf("save rekeyed identity failed: %v", err), err)
 	}
 	r2 := s.Load(target)

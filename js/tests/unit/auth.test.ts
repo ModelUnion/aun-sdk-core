@@ -44,7 +44,7 @@ describe('AuthFlow 构造', () => {
   it('应正确创建实例', () => {
     const ks = createMockKeyStore();
     const auth = new AuthFlow({
-      keystore: ks,
+      tokenStore: ks,
       crypto: new CryptoProvider(),
     });
     expect(auth).toBeDefined();
@@ -54,25 +54,21 @@ describe('AuthFlow 构造', () => {
 describe('AuthFlow.loadIdentity', () => {
   it('无身份时应抛出 StateError', async () => {
     const ks = createMockKeyStore();
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider() });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider() });
 
     await expect(auth.loadIdentity()).rejects.toThrow(StateError);
   });
 
   it.skipIf(!hasSubtleCrypto)(
-    '有身份时应正确加载',
+    '注入身份后应正确加载',
     async () => {
       const ks = createMockKeyStore();
       const crypto = new CryptoProvider();
       const identity = await crypto.generateIdentity();
       const aid = 'test-user.example.com';
 
-      await ks.saveIdentity(aid, {
-        ...(identity as IdentityRecord),
-        aid,
-      });
-
-      const auth = new AuthFlow({ keystore: ks, crypto, aid });
+      const auth = new AuthFlow({ tokenStore: ks, crypto, aid });
+      auth.setIdentity({ ...(identity as IdentityRecord), aid });
       const loaded = await auth.loadIdentity(aid);
       expect(loaded).not.toBeNull();
       expect(loaded.aid).toBe(aid);
@@ -84,7 +80,7 @@ describe('AuthFlow.loadIdentity', () => {
 describe('AuthFlow.loadIdentityOrNull', () => {
   it('无身份时应返回 null 而非抛异常', async () => {
     const ks = createMockKeyStore();
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider() });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider() });
 
     const result = await auth.loadIdentityOrNull();
     expect(result).toBeNull();
@@ -94,7 +90,7 @@ describe('AuthFlow.loadIdentityOrNull', () => {
 describe('AuthFlow.loadIdentityOrNone', () => {
   it('应作为 loadIdentityOrNull 的兼容别名返回 null', async () => {
     const ks = createMockKeyStore();
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider() });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider() });
 
     const result = await auth.loadIdentityOrNone();
     expect(result).toBeNull();
@@ -108,7 +104,7 @@ describe('AuthFlow 空 device_id 实例态', () => {
       saveIdentity: vi.fn(),
     };
     const auth = new AuthFlow({
-      keystore: keystore as any,
+      tokenStore: keystore as any,
       crypto: {} as any,
       deviceId: '',
       verifySsl: false,
@@ -132,7 +128,7 @@ describe('AuthFlow 空 device_id 实例态', () => {
       }),
     };
     const auth = new AuthFlow({
-      keystore: keystore as any,
+      tokenStore: keystore as any,
       crypto: {} as any,
       deviceId: '',
       verifySsl: false,
@@ -145,10 +141,6 @@ describe('AuthFlow 空 device_id 实例态', () => {
       refresh_token: 'ref-empty-device',
     });
 
-    expect(keystore.saveIdentity).toHaveBeenCalledWith('alice.agentid.pub', expect.not.objectContaining({
-      access_token: expect.anything(),
-      refresh_token: expect.anything(),
-    }));
     expect(keystore.updateInstanceState).toHaveBeenCalledWith('alice.agentid.pub', '', '', expect.any(Function));
     expect(updatedStates[0]).toMatchObject({
       access_token: 'tok-empty-device',
@@ -159,7 +151,7 @@ describe('AuthFlow 空 device_id 实例态', () => {
 describe('AuthFlow.getAccessTokenExpiry', () => {
   it('有 access_token_expires_at 时应返回时间戳', () => {
     const ks = createMockKeyStore();
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider() });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider() });
 
     const identity = { access_token_expires_at: 1700000000 };
     expect(auth.getAccessTokenExpiry(identity)).toBe(1700000000);
@@ -167,7 +159,7 @@ describe('AuthFlow.getAccessTokenExpiry', () => {
 
   it('无 access_token_expires_at 时应返回 null', () => {
     const ks = createMockKeyStore();
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider() });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider() });
 
     expect(auth.getAccessTokenExpiry({})).toBeNull();
   });

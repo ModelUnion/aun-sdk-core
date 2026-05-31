@@ -41,6 +41,26 @@ def test_change_seed_migrates_key_json_after_private_key_verification(tmp_path):
     assert decrypt_record(new_master, aid, "identity/private_key", good) == b"GOOD_PRIVATE"
 
 
+def test_change_seed_supports_plaintext_key_json_to_encrypted(tmp_path):
+    aid = "plaintext-change-seed.agentid.pub"
+    path = tmp_path / "AIDs" / aid / "private" / "key.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "private_key_pem": "PLAINTEXT_PRIVATE",
+            "public_key_der_b64": "pub",
+            "curve": "P-256",
+        }),
+        encoding="utf-8",
+    )
+
+    result = change_seed(tmp_path, "legacy-unused", "new-seed")
+    assert result.private_keys_migrated == 1
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "private_key_pem" not in raw
+    assert decrypt_record(derive_master_key(b"new-seed"), aid, "identity/private_key", raw["private_key_protection"]) == b"PLAINTEXT_PRIVATE"
+
+
 def test_change_seed_refuses_when_private_key_is_not_old_seed(tmp_path):
     old_seed = b"old-seed"
     other_seed = b"other-seed"
@@ -66,6 +86,22 @@ def test_change_seed_refuses_when_private_key_is_not_old_seed(tmp_path):
 
     wrong_seed = _key_json_record(tmp_path, "wrong-seed.agentid.pub")
     assert decrypt_record(other_master, "wrong-seed.agentid.pub", "identity/private_key", wrong_seed) == b"WRONG_SEED"
+
+
+def test_change_seed_wrong_old_seed_does_not_modify_key_json(tmp_path):
+    aid = "wrong-old-seed.agentid.pub"
+    path = tmp_path / "AIDs" / aid / "private" / "key.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"private_key_protection": encrypt_record(b"old-seed", aid, "identity/private_key", b"KEEP_OLD_PRIVATE")}),
+        encoding="utf-8",
+    )
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(SeedMigrationError):
+        change_seed(tmp_path, "wrong-seed", "new-seed")
+
+    assert path.read_text(encoding="utf-8") == before
 
 
 def test_auto_migration_falls_back_to_legacy_seed_when_strict_verification_fails(tmp_path):

@@ -73,23 +73,14 @@ async def _ensure_connected(client: AUNClient, aid: str) -> None:
             if slot_id:
                 connect_params["slot_id"] = slot_id
             await ensure_connected_identity(client, aid, connect_options=connect_params, attempts=1)
-            # 清空旧 V2 inbox，并同步本地 SeqTracker cursor，避免历史 gap 卡住 ordered queue。
+            # 静默同步历史消息，推进本地 SeqTracker cursor，避免固定 slot 的历史 gap 卡住新 push。
             try:
-                max_seq = 0
-                after_seq = 0
-                for _ in range(100):
-                    result = await client.call("message.v2.pull", {"after_seq": after_seq, "limit": 200})
-                    msgs = result.get("messages", []) if isinstance(result, dict) else []
-                    latest_seq = int(result.get("latest_seq") or 0) if isinstance(result, dict) else 0
-                    server_ack_seq = int(result.get("server_ack_seq") or 0) if isinstance(result, dict) else 0
-                    raw_max = max((int(m.get("seq") or 0) for m in msgs if isinstance(m, dict)), default=0)
-                    max_seq = max(max_seq, latest_seq, server_ack_seq, raw_max)
-                    next_after = max(after_seq, latest_seq, raw_max)
-                    if not msgs or next_after <= after_seq:
-                        break
-                    after_seq = next_after
-                if max_seq > 0:
-                    await client.call("message.v2.ack", {"up_to_seq": max_seq})
+                await client.call("message.pull", {
+                    "after_seq": 0,
+                    "limit": 200,
+                    "max_pages": 100,
+                    "force": True,
+                })
             except Exception:
                 pass
             await asyncio.sleep(0.5)
@@ -146,8 +137,8 @@ async def test_p2p_echo_trace() -> None:
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
-        bob.on("message.received", on_msg)
         await _ensure_connected(bob, _BOBB_AID)
+        bob.on("message.received", on_msg)
 
         await alice.call("message.send", {
             "to": _BOBB_AID,
@@ -251,8 +242,8 @@ async def test_non_echo_no_trace() -> None:
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
-        bob.on("message.received", on_msg)
         await _ensure_connected(bob, _BOBB_AID)
+        bob.on("message.received", on_msg)
 
         await alice.call("message.send", {
             "to": _BOBB_AID,
@@ -298,8 +289,8 @@ async def test_echo_trace_order() -> None:
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
-        bob.on("message.received", on_msg)
         await _ensure_connected(bob, _BOBB_AID)
+        bob.on("message.received", on_msg)
 
         await alice.call("message.send", {
             "to": _BOBB_AID,
@@ -358,8 +349,8 @@ async def test_echo_conn_uptime() -> None:
 
     try:
         await _ensure_connected(alice, _ALICE_AID)
-        bob.on("message.received", on_msg)
         await _ensure_connected(bob, _BOBB_AID)
+        bob.on("message.received", on_msg)
 
         await alice.call("message.send", {
             "to": _BOBB_AID,

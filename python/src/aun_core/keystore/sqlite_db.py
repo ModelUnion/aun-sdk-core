@@ -18,7 +18,7 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from ..logger import AUNLogger, NullLogger
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = 5000
 
 
@@ -96,21 +96,6 @@ _DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS metadata_kv (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS agent_md_cache (
-        aid TEXT PRIMARY KEY,
-        content TEXT NOT NULL DEFAULT '',
-        local_etag TEXT NOT NULL DEFAULT '',
-        remote_etag TEXT NOT NULL DEFAULT '',
-        last_modified TEXT NOT NULL DEFAULT '',
-        fetched_at INTEGER NOT NULL DEFAULT 0,
-        observed_at INTEGER NOT NULL DEFAULT 0,
-        checked_at INTEGER NOT NULL DEFAULT 0,
-        remote_status TEXT NOT NULL DEFAULT 'unknown',
-        verify_status TEXT NOT NULL DEFAULT '',
-        verify_error TEXT NOT NULL DEFAULT '',
-        last_error TEXT NOT NULL DEFAULT '',
         updated_at INTEGER NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS v2_device_keys (
@@ -328,6 +313,9 @@ class AIDDatabase:
                     "ALTER TABLE seq_tracker ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''",
                 ):
                     conn.execute(stmt)
+            elif v == 2:
+                # v2 → v3：删除废弃的 agent_md_cache 表
+                conn.execute("DROP TABLE IF EXISTS agent_md_cache")
 
     def _migrate_legacy_columns(self, conn: Any) -> None:
         self._rename_column_if_exists(conn, "prekeys", "private_key_pem", "private_key_enc")
@@ -1353,132 +1341,6 @@ class AIDDatabase:
             )
             conn.commit()
         self._retry_on_locked(_do)
-
-    # ── agent.md Cache ───────────────────────────────────────
-
-    @staticmethod
-    def _agent_md_cache_columns() -> list[str]:
-        return [
-            "aid",
-            "content",
-            "local_etag",
-            "remote_etag",
-            "last_modified",
-            "fetched_at",
-            "observed_at",
-            "checked_at",
-            "remote_status",
-            "verify_status",
-            "verify_error",
-            "last_error",
-            "updated_at",
-        ]
-
-    def load_agent_md_cache(self, aid: str) -> dict[str, Any] | None:
-        target = str(aid or "").strip()
-        if not target:
-            return None
-        columns = self._agent_md_cache_columns()
-        conn = self._get_conn()
-        cur = conn.execute(
-            "SELECT " + ", ".join(columns) + " FROM agent_md_cache WHERE aid = ?",
-            (target,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        record = {columns[i]: row[i] for i in range(len(columns))}
-        for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
-            record[key] = int(record.get(key) or 0)
-        return record
-
-    def upsert_agent_md_cache(
-        self,
-        aid: str,
-        *,
-        content: str | None = None,
-        local_etag: str | None = None,
-        remote_etag: str | None = None,
-        last_modified: str | None = None,
-        fetched_at: int | None = None,
-        observed_at: int | None = None,
-        checked_at: int | None = None,
-        remote_status: str | None = None,
-        verify_status: str | None = None,
-        verify_error: str | None = None,
-        last_error: str | None = None,
-    ) -> dict[str, Any]:
-        target = str(aid or "").strip()
-        if not target:
-            return {}
-
-        def _do():
-            columns = self._agent_md_cache_columns()
-            conn = self._get_conn()
-            row = conn.execute(
-                "SELECT " + ", ".join(columns) + " FROM agent_md_cache WHERE aid = ?",
-                (target,),
-            ).fetchone()
-            if row is None:
-                record: dict[str, Any] = {
-                    "aid": target,
-                    "content": "",
-                    "local_etag": "",
-                    "remote_etag": "",
-                    "last_modified": "",
-                    "fetched_at": 0,
-                    "observed_at": 0,
-                    "checked_at": 0,
-                    "remote_status": "unknown",
-                    "verify_status": "",
-                    "verify_error": "",
-                    "last_error": "",
-                    "updated_at": 0,
-                }
-            else:
-                record = {columns[i]: row[i] for i in range(len(columns))}
-
-            string_updates = {
-                "content": content,
-                "local_etag": local_etag,
-                "remote_etag": remote_etag,
-                "last_modified": last_modified,
-                "remote_status": remote_status,
-                "verify_status": verify_status,
-                "verify_error": verify_error,
-                "last_error": last_error,
-            }
-            for key, value in string_updates.items():
-                if value is not None:
-                    record[key] = str(value or "")
-
-            int_updates = {
-                "fetched_at": fetched_at,
-                "observed_at": observed_at,
-                "checked_at": checked_at,
-            }
-            for key, value in int_updates.items():
-                if value is not None:
-                    record[key] = int(value or 0)
-
-            record["aid"] = target
-            record["updated_at"] = _now_ms()
-            conn.execute(
-                "INSERT INTO agent_md_cache ("
-                + ", ".join(columns)
-                + ") VALUES ("
-                + ", ".join("?" for _ in columns)
-                + ") ON CONFLICT(aid) DO UPDATE SET "
-                + ", ".join(f"{col} = excluded.{col}" for col in columns if col != "aid"),
-                tuple(record.get(col, "") for col in columns),
-            )
-            conn.commit()
-            for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
-                record[key] = int(record.get(key) or 0)
-            return record
-
-        return self._retry_on_locked(_do)
-
 
     # ── Metadata KV ──────────────────────────────────────────
 

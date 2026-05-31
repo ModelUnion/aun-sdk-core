@@ -17,6 +17,7 @@ import { type Result, resultErr, resultOk } from './result.js';
 import { FileKeyStore } from './keystore/file.js';
 import { CryptoProvider } from './crypto.js';
 import { AuthFlow } from './auth.js';
+import { RegisterFlow } from './register-flow.js';
 import { GatewayDiscovery } from './discovery.js';
 import { DnsResilientNet } from './net.js';
 import { AUNLogger } from './logger.js';
@@ -127,6 +128,7 @@ export class AIDStore {
 
   private _keystore: FileKeyStore;
   private _auth: AuthFlow;
+  private _registerFlow: RegisterFlow;
   private _discovery: GatewayDiscovery;
   private _net: DnsResilientNet;
   private _log: AUNLogger;
@@ -164,8 +166,16 @@ export class AIDStore {
     this._net = new DnsResilientNet({ verifySsl: this._verifySsl, logger: this._log.for('aun_core.net') });
     this._discovery = new GatewayDiscovery({ verifySsl: this._verifySsl, logger: this._log.for('aun_core.discovery'), net: this._net });
 
-    this._auth = new AuthFlow({
+    this._registerFlow = new RegisterFlow({
       keystore: this._keystore,
+      crypto: new CryptoProvider(),
+      verifySsl: this._verifySsl,
+      logger: this._log.for('aun_core.register'),
+      net: this._net,
+    });
+
+    this._auth = new AuthFlow({
+      tokenStore: this._keystore,
       crypto: new CryptoProvider(),
       deviceId: this.deviceId,
       slotId: this.slotId,
@@ -206,7 +216,12 @@ export class AIDStore {
       return resultErr(codes.CERT_CHAIN_BROKEN, `certificate CN mismatch: expected ${target}, got ${cn}`);
     }
 
-    const kp = this._keystore.loadKeyPair(target);
+    let kp: ReturnType<FileKeyStore['loadKeyPair']>;
+    try {
+      kp = this._keystore.loadKeyPair(target);
+    } catch (exc) {
+      return resultErr(codes.PRIVATE_KEY_PARSE_ERROR, `private key load failed for aid: ${target}`, exc);
+    }
     if (!kp || !kp.private_key_pem) {
       return resultOk({
         aid: AID._create({ aid: target, aunPath: this.aunPath, certPem, privateKeyPem: null, certValid: true, privateKeyValid: false, deviceId: this.deviceId, slotId: this.slotId, verifySsl: this._verifySsl, rootCaPath: this._rootCaPath, debug: this._debug }),
@@ -287,7 +302,15 @@ export class AIDStore {
     this._log.for('aun_core.aid_store').debug(`register enter: aid=${target || '-'}`);
     try {
       const gatewayUrl = await this._resolveGateway(target);
-      await this._auth.registerAid(gatewayUrl, target);
+      const result = await this._registerFlow.registerAid(gatewayUrl, target);
+      if (result.cert) {
+        this._keystore.saveCert(target, result.cert);
+      }
+      this._keystore.saveKeyPair(target, {
+        private_key_pem: result.private_key_pem,
+        public_key_der_b64: result.public_key_der_b64,
+        curve: result.curve,
+      });
       return resultOk({ registered: true as const });
     } catch (exc) {
       if (exc instanceof IdentityConflictError) {

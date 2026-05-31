@@ -32,7 +32,6 @@ type ClientInterface interface {
 	Call(ctx context.Context, method string, params map[string]any) (any, error)
 
 	// 认证流程所需方法
-	AuthRegisterAID(ctx context.Context, gatewayURL, aid string) (map[string]any, error)
 	AuthAuthenticate(ctx context.Context, gatewayURL, aid string) (map[string]any, error)
 	AuthLoadIdentityOrNil(aid string) map[string]any
 	AuthFetchPeerCert(ctx context.Context, aid, certFingerprint string) ([]byte, error)
@@ -45,7 +44,6 @@ type ClientInterface interface {
 	AuthPersistGatewayURL(aid, gatewayURL string)
 
 	// CheckAID 所需的 keystore 访问方法
-	AuthLoadKeyPair(aid string) (map[string]any, error)
 	AuthLoadCert(aid string) (string, error)
 }
 
@@ -190,7 +188,7 @@ func (a *AuthNamespace) RegisterAIDWithName(ctx context.Context, aid string) (ou
 	return a.RegisterAID(ctx, map[string]any{"aid": aid})
 }
 
-// RegisterAID 注册新的 AID 身份
+// RegisterAID 已从 AUNClient/AuthNamespace 移除；新注册流程必须通过 AIDStore.Register。
 func (a *AuthNamespace) RegisterAID(ctx context.Context, params map[string]any) (out map[string]any, err error) {
 	tStart := time.Now()
 	aid, _ := params["aid"].(string)
@@ -206,28 +204,7 @@ func (a *AuthNamespace) RegisterAID(ctx context.Context, params map[string]any) 
 		err = fmt.Errorf("auth.register_aid 需要 'aid' 参数")
 		return nil, err
 	}
-
-	gatewayURL, err := a.resolveGateway(ctx, aid)
-	if err != nil {
-		return nil, fmt.Errorf("auth.register_aid gateway 发现失败: %w", err)
-	}
-	a.client.CacheDiscoveredGatewayURL(gatewayURL)
-
-	result, err := a.client.AuthRegisterAID(ctx, gatewayURL, aid)
-	if err != nil {
-		return nil, err
-	}
-
-	resultAID, _ := result["aid"].(string)
-	a.client.SetAID(resultAID)
-	identity := a.client.AuthLoadIdentityOrNil(resultAID)
-	a.client.SetIdentity(identity)
-
-	return map[string]any{
-		"aid":      resultAID,
-		"cert_pem": result["cert"],
-		"gateway":  gatewayURL,
-	}, nil
+	return nil, fmt.Errorf("auth.register_aid is not available on AUNClient; use AIDStore.Register")
 }
 
 // Authenticate 认证已有的 AID
@@ -1027,16 +1004,15 @@ func (a *AuthNamespace) CheckAID(ctx context.Context, params map[string]any) (ou
 func (a *AuthNamespace) checkLocalAID(aid string) map[string]any {
 	identity := a.client.AuthLoadIdentityOrNil(aid)
 
-	keyPair, keyErr := a.client.AuthLoadKeyPair(aid)
 	certPEM, certErr := a.client.AuthLoadCert(aid)
 
 	privateKeyPresent := false
 	publicKeyPresent := false
-	if keyPair != nil {
-		if pkPem, _ := keyPair["private_key_pem"].(string); pkPem != "" {
+	if identity != nil {
+		if pkPem, _ := identity["private_key_pem"].(string); strings.TrimSpace(pkPem) != "" {
 			privateKeyPresent = true
 		}
-		if pubDer, _ := keyPair["public_key_der_b64"].(string); pubDer != "" {
+		if pubDer, _ := identity["public_key_der_b64"].(string); strings.TrimSpace(pubDer) != "" {
 			publicKeyPresent = true
 		}
 	}
@@ -1072,9 +1048,6 @@ func (a *AuthNamespace) checkLocalAID(aid string) map[string]any {
 		issues = append(issues, "certificate expired")
 	} else if !certValid {
 		issues = append(issues, "certificate not currently valid")
-	}
-	if keyErr != nil {
-		issues = append(issues, "key load error: "+keyErr.Error())
 	}
 	if certErr != nil {
 		issues = append(issues, "certificate load error: "+certErr.Error())

@@ -82,7 +82,7 @@ type ocspCacheEntry struct {
 
 // AuthFlowConfig AuthFlow 配置
 type AuthFlowConfig struct {
-	Keystore          keystore.KeyStore // 密钥存储后端
+	TokenStore        keystore.TokenStore // 不含私钥操作的认证状态存储
 	Crypto            *CryptoProvider   // 加密操作提供者
 	AID               string            // 当前 Agent ID
 	ConnectionFactory ConnectionFactory // 可选的 WebSocket 连接工厂
@@ -97,7 +97,7 @@ type AuthFlowConfig struct {
 // AuthFlow 处理 AID 注册、两阶段认证、证书验证和 token 刷新。
 // 与 Python SDK auth.py 的 AuthFlow 完全对应。
 type AuthFlow struct {
-	keystore           keystore.KeyStore
+	tokenStore         keystore.TokenStore
 	crypto             *CryptoProvider
 	aid                string
 	deviceID           string
@@ -106,9 +106,8 @@ type AuthFlow struct {
 	connectionFactory  ConnectionFactory
 	rootCAPath         string
 	chainCacheTTL      int
-	verifySSL          bool
-	dnsNet             *DnsResilientNet
-	persistKeyMaterial bool
+	verifySSL bool
+	dnsNet    *DnsResilientNet
 
 	// H24: 记录最近一次关键持久化失败，调用方可通过 GetLastPersistError 主动轮询
 	lastPersistErr error
@@ -126,6 +125,8 @@ type AuthFlow struct {
 	chainVerifiedCache map[string]float64
 	// Gateway CA 链预验证标记：cacheKey -> verified
 	gatewayCAVerified map[string]bool
+	// 调用方注入的内存私钥（由 AUNClient.LoadIdentity 传入，不走 tokenStore 解密）
+	memIdentity map[string]any
 
 	mu sync.RWMutex // 保护所有缓存字段
 }
@@ -144,7 +145,7 @@ func NewAuthFlow(cfg AuthFlowConfig) *AuthFlow {
 		ttl = 86400
 	}
 	a := &AuthFlow{
-		keystore:           cfg.Keystore,
+		tokenStore:         cfg.TokenStore,
 		crypto:             cfg.Crypto,
 		aid:                cfg.AID,
 		deviceID:           "",
@@ -166,6 +167,17 @@ func NewAuthFlow(cfg AuthFlowConfig) *AuthFlow {
 }
 
 // ── 身份加载 ────────────────────────────────────────────────
+
+// SetIdentity 注入内存私钥（由 AUNClient.LoadIdentity 调用）。
+// AuthFlow 内部不再从 tokenStore 解密私钥，只使用此处注入的明文。
+func (a *AuthFlow) SetIdentity(identity map[string]any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.memIdentity = identity
+	if aid, _ := identity["aid"].(string); aid != "" {
+		a.aid = aid
+	}
+}
 
 // LoadIdentity 加载本地身份信息（密钥 + 证书 + 元数据合并）
 func (a *AuthFlow) LoadIdentity(aid string) (identity map[string]any, err error) {
@@ -189,11 +201,11 @@ func (a *AuthFlow) LoadIdentity(aid string) (identity map[string]any, err error)
 			resolvedAID = a.aid
 		}
 	}
-	cert, _ := a.keystore.LoadCert(resolvedAID)
+	cert, _ := a.tokenStore.LoadCert(resolvedAID)
 	if cert != "" {
 		identity["cert"] = cert
 	}
-	if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+	if store, ok := a.tokenStore.(keystore.InstanceStateStore); ok {
 		instanceState, _ := store.LoadInstanceState(resolvedAID, a.deviceID, a.slotID)
 		for _, key := range authInstanceStateFields {
 			if v, exists := instanceState[key]; exists {
@@ -249,132 +261,6 @@ func (a *AuthFlow) SetDeliveryMode(deliveryMode map[string]any) {
 	a.deliveryMode = copyMapShallow(deliveryMode)
 }
 
-// ── AID 注册 ────────────────────────────────────────────────
-
-// RegisterAID 严格注册新 AID：先查远端是否已存在，确认未注册后才生成并落盘本地密钥。
-func (a *AuthFlow) RegisterAID(ctx context.Context, gatewayURL, aid string) (result map[string]any, err error) {
-	tStart := time.Now()
-	pkgLogAuth().Debug("RegisterAID enter: aid=%s gateway=%s", aid, gatewayURL)
-	defer func() {
-		if err != nil {
-			pkgLogAuth().Debug("RegisterAID exit (error): aid=%s elapsed=%dms err=%v", aid, time.Since(tStart).Milliseconds(), err)
-		} else {
-			pkgLogAuth().Debug("RegisterAID exit: aid=%s elapsed=%dms", aid, time.Since(tStart).Milliseconds())
-		}
-	}()
-	if err = validateAIDName(aid); err != nil {
-		return nil, err
-	}
-
-	// Step 1: 本地已有身份的幂等/恢复检查
-	existing, _ := a.keystore.LoadIdentity(aid)
-	if existing != nil {
-		hasPriv := authGetStr(existing, "private_key_pem") != ""
-		hasPub := authGetStr(existing, "public_key_der_b64") != ""
-		hasCert := authGetStr(existing, "cert") != ""
-		if hasPriv && hasPub {
-			localPubB64 := authGetStr(existing, "public_key_der_b64")
-			if hasCert {
-				// 本地完整身份 → 幂等校验服务端公钥匹配
-				pkgLogAuth().Debug("RegisterAID: local identity complete, checking server for idempotency: aid=%s", aid)
-				serverCertPEM, dlErr := a.downloadRegisteredCert(ctx, gatewayURL, aid)
-				if dlErr != nil {
-					return nil, dlErr
-				}
-				if serverCertPEM == "" {
-					return nil, NewIdentityConflictError(fmt.Sprintf(
-						"AID '%s' has local keypair+cert but is not registered on server. "+
-							"Remove AIDs/%s/ directory to retry registration cleanly.", aid, aid))
-				}
-				if !authCertMatchesPubKey(serverCertPEM, localPubB64) {
-					return nil, NewIdentityConflictError(fmt.Sprintf(
-						"AID '%s' is registered by another party on server (public key mismatch). "+
-							"Choose a different name.", aid))
-				}
-				pkgLogAuth().Info("RegisterAID: idempotent return for already-registered AID: aid=%s", aid)
-				a.aid = aid
-				return map[string]any{"aid": aid, "cert": authGetStr(existing, "cert")}, nil
-			}
-			// 本地有 keypair 但无 cert — 尝试从服务端恢复
-			pkgLogAuth().Debug("RegisterAID: local keypair exists without cert, attempting recovery: aid=%s", aid)
-			serverCertPEM, dlErr := a.downloadRegisteredCert(ctx, gatewayURL, aid)
-			if dlErr != nil {
-				return nil, dlErr
-			}
-			if serverCertPEM != "" {
-				// 服务端已注册，比对公钥
-				if !authCertMatchesPubKey(serverCertPEM, localPubB64) {
-					return nil, NewIdentityConflictError(fmt.Sprintf(
-						"AID '%s' is registered by another party on server (public key mismatch). "+
-							"Choose a different name.", aid))
-				}
-				// 公钥匹配 → 下载证书完成注册
-				existing["cert"] = serverCertPEM
-				if persistErr := a.persistIdentity(existing); persistErr != nil {
-					return nil, persistErr
-				}
-				pkgLogAuth().Info("RegisterAID: recovered cert from server for half-state AID: aid=%s", aid)
-				a.aid = aid
-				return map[string]any{"aid": aid, "cert": serverCertPEM}, nil
-			}
-			// 服务端未注册 → 用现有 keypair 发起注册
-			pkgLogAuth().Debug("RegisterAID: server has no record, registering with existing keypair: aid=%s", aid)
-			created, createErr := a.createAIDRemote(ctx, gatewayURL, existing)
-			if createErr != nil {
-				if authIsConflictError(createErr) {
-					return nil, NewIdentityConflictError(fmt.Sprintf("AID %s is already registered", aid))
-				}
-				return nil, createErr
-			}
-			existing["cert"] = created["cert"]
-			if err = a.assertCertMatchesLocalKeypair(existing); err != nil {
-				return nil, err
-			}
-			if persistErr := a.persistIdentity(existing); persistErr != nil {
-				return nil, persistErr
-			}
-			a.aid = aid
-			return map[string]any{"aid": aid, "cert": existing["cert"]}, nil
-		}
-	}
-
-	// Step 2: 先查服务端确认未注册
-	certPEM, err := a.downloadRegisteredCert(ctx, gatewayURL, aid)
-	if err != nil {
-		return nil, err
-	}
-	if certPEM != "" {
-		return nil, NewIdentityConflictError(fmt.Sprintf("AID %s is already registered", aid))
-	}
-
-	crypto := a.crypto
-	if crypto == nil {
-		crypto = &CryptoProvider{}
-	}
-	identity, err := crypto.GenerateIdentity()
-	if err != nil {
-		return nil, NewAuthError(fmt.Sprintf("failed to generate identity: %v", err))
-	}
-	identity["aid"] = aid
-
-	created, err := a.createAIDRemote(ctx, gatewayURL, identity)
-	if err != nil {
-		if authIsConflictError(err) {
-			return nil, NewIdentityConflictError(fmt.Sprintf("AID %s is already registered", aid))
-		}
-		return nil, err
-	}
-	identity["cert"] = created["cert"]
-	if err = a.assertCertMatchesLocalKeypair(identity); err != nil {
-		return nil, err
-	}
-	if err = a.persistIdentity(identity); err != nil {
-		return nil, err
-	}
-	a.aid = aid
-	return map[string]any{"aid": aid, "cert": identity["cert"]}, nil
-}
-
 // ── 认证流程 ────────────────────────────────────────────────
 
 // Authenticate 两阶段认证（login1 + login2），返回 {aid, access_token, refresh_token, expires_at, gateway}
@@ -394,15 +280,14 @@ func (a *AuthFlow) Authenticate(ctx context.Context, gatewayURL string, aid stri
 		return nil, err
 	}
 
-	// 优先复用 keystore 里的 cached access_token（未过期且有 refresh_token）
+	// 优先复用 tokenStore 里的 cached access_token（未过期且有 refresh_token）
 	// 避免每次调 Authenticate 都走两阶段重登的网络往返；与 Python SDK
 	// auth.py:authenticate 的快速路径对齐。
 	//
-	// 注意：loadIdentityOrRaise 走的是 keystore.LoadIdentity → tokens 表，
-	// 但 persistIdentity 会把 token 写到 instance_state
-	// （不是 tokens 表）。所以这里需要主动加载 instance_state 才能拿到 token。
+	// loadIdentityRaw 只使用注入的内存私钥；persistIdentity 会把 token 写到
+	// instance_state，所以这里需要主动加载 instance_state 才能复用 cached token。
 	identityWithState := identity
-	if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+	if store, ok := a.tokenStore.(keystore.InstanceStateStore); ok {
 		resolvedAID := authGetStr(identity, "aid")
 		if resolvedAID == "" {
 			resolvedAID = aid
@@ -832,21 +717,6 @@ func (a *AuthFlow) dialWebSocket(ctx context.Context, gatewayURL string) (*webso
 		return nil, err
 	}
 	return conn, nil
-}
-
-// ── 内部：AID 注册远程调用 ──────────────────────────────────
-
-// createAIDRemote 通过 shortRPC 在服务端注册 AID
-func (a *AuthFlow) createAIDRemote(ctx context.Context, gatewayURL string, identity map[string]any) (map[string]any, error) {
-	response, err := a.shortRPC(ctx, gatewayURL, "auth.create_aid", map[string]any{
-		"aid":        identity["aid"],
-		"public_key": identity["public_key_der_b64"],
-		"curve":      authGetStrDefault(identity, "curve", "P-256"),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"cert": response["cert"]}, nil
 }
 
 func authIsConflictError(err error) bool {
@@ -1809,38 +1679,35 @@ func (a *AuthFlow) loadIdentityRaw(aid string) (map[string]any, error) {
 	if requestedAID == "" {
 		requestedAID = a.aid
 	}
+
+	// 优先路径：使用注入的内存 identity（私钥已由 AIDStore 解密并传入）
+	a.mu.RLock()
+	mem := a.memIdentity
+	a.mu.RUnlock()
+	if mem != nil {
+		memAID, _ := mem["aid"].(string)
+		if requestedAID != "" && memAID != requestedAID {
+			return nil, NewStateError(fmt.Sprintf("identity mismatch: requested %s, loaded %s", requestedAID, memAID))
+		}
+		if authGetStr(mem, "private_key_pem") == "" || authGetStr(mem, "public_key_der_b64") == "" {
+			return nil, NewStateError(fmt.Sprintf("injected identity for aid %s is incomplete (missing keypair)", memAID))
+		}
+		if requestedAID != "" {
+			a.aid = requestedAID
+		}
+		// 返回副本，防止调用方修改内存 identity
+		out := make(map[string]any, len(mem))
+		for k, v := range mem {
+			out[k] = v
+		}
+		return out, nil
+	}
+
 	if requestedAID != "" {
-		existing, err := a.keystore.LoadIdentity(requestedAID)
-		if err != nil {
-			return nil, err
-		}
-		if existing == nil {
-			return nil, NewStateError(fmt.Sprintf("identity not found for aid: %s", requestedAID))
-		}
-		if _, ok := existing["aid"].(string); !ok || existing["aid"] == "" {
-			existing["aid"] = requestedAID
-		}
-		a.aid = requestedAID
-		return existing, nil
+		return nil, NewStateError(fmt.Sprintf("no injected identity for aid %s; call AUNClient.LoadIdentity(aid) first", requestedAID))
 	}
 
-	// 尝试加载任意已存在的身份（FileKeyStore 特有方法）
-	type anyIdentityLoader interface {
-		LoadAnyIdentity() (map[string]any, error)
-	}
-	if loader, ok := a.keystore.(anyIdentityLoader); ok {
-		existing, err := loader.LoadAnyIdentity()
-		if err == nil && existing != nil {
-			loadedAID, _ := existing["aid"].(string)
-			loadedAID = strings.TrimSpace(loadedAID)
-			if loadedAID != "" {
-				a.aid = loadedAID
-			}
-			return existing, nil
-		}
-	}
-
-	return nil, NewStateError("no local identity found, call auth.register_aid() first")
+	return nil, NewStateError("no local identity found, call AUNClient.LoadIdentity(aid) first")
 }
 
 func authValidateLoadedIdentity(aid string, identity map[string]any) error {
@@ -1885,22 +1752,16 @@ func (a *AuthFlow) persistIdentity(identity map[string]any) error {
 			delete(persisted, key)
 		}
 	}
-	// 私钥由 AIDStore 管理。普通 AUNClient 认证/刷新路径不写 key.json；
-	// AIDStore 内部注册路径需要保留 keypair，供后续 AIDStore.Load() 返回可签名 AID。
-	if !a.persistKeyMaterial {
-		for _, key := range []string{"private_key_pem", "public_key_der_b64", "curve"} {
-			delete(persisted, key)
+	if certPEM := authGetStr(persisted, "cert"); certPEM != "" {
+		if err := a.tokenStore.SaveCert(aid, certPEM); err != nil {
+			return err
 		}
-	}
-
-	if err := a.keystore.SaveIdentity(aid, persisted); err != nil {
-		return err
 	}
 	// 实例级字段已拆分到 instance_state，无需从共享 metadata 清理
 	if len(instanceState) == 0 {
 		return nil
 	}
-	if store, ok := a.keystore.(keystore.InstanceStateStore); ok {
+	if store, ok := a.tokenStore.(keystore.InstanceStateStore); ok {
 		_, err := store.UpdateInstanceState(aid, a.deviceID, a.slotID, func(current map[string]any) (map[string]any, error) {
 			if current == nil {
 				current = make(map[string]any)
@@ -1925,7 +1786,7 @@ func (a *AuthFlow) LoadCachedGatewayURL(aid string) string {
 	if aid == "" {
 		return ""
 	}
-	store, ok := a.keystore.(keystore.MetadataKeyStore)
+	store, ok := a.tokenStore.(keystore.MetadataKeyStore)
 	if !ok {
 		return ""
 	}
@@ -1939,7 +1800,7 @@ func (a *AuthFlow) PersistGatewayURL(aid, gatewayURL string) {
 	if aid == "" || strings.TrimSpace(gatewayURL) == "" {
 		return
 	}
-	store, ok := a.keystore.(keystore.MetadataKeyStore)
+	store, ok := a.tokenStore.(keystore.MetadataKeyStore)
 	if !ok {
 		return
 	}

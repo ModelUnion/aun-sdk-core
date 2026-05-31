@@ -87,6 +87,7 @@ export { GatewayDiscovery } from './discovery.js';
 
 // ── 认证流程 ─────────────────────────────────────────────────
 export { AuthFlow } from './auth.js';
+export { RegisterFlow, type RegisterResult } from './register-flow.js';
 
 // ── E2EE ─────────────────────────────────────────────────────
 export { ProtectedHeaders } from './protected-headers.js';

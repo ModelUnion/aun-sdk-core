@@ -68,7 +68,7 @@ describe('AUN SDK v4 三主体 API', () => {
     expect((client as any)._configModel.aunPath).toBe(aunPath);
     expect((client as any)._deviceId).toBe(aid.deviceId);
     expect((client as any)._slotId).toBe(aid.slotId);
-    expect((client as any)._keystore._root).toBe(aunPath);
+    expect((client as any)._tokenStore._root).toBe(aunPath);
     expect((client as any)._auth._deviceId).toBe(aid.deviceId);
     expect((client as any)._auth._slotId).toBe(aid.slotId);
   });
@@ -97,7 +97,7 @@ describe('AUN SDK v4 三主体 API', () => {
 
     expect(gateway).toBe('wss://gateway.agentid.pub/aun');
     expect(discover).toHaveBeenCalledWith('https://frank.agentid.pub/.well-known/aun-gateway');
-    expect(((client as any)._keystore.loadMetadata(aid.aid) ?? {}).gateway_url).toBe('wss://gateway.agentid.pub/aun');
+    expect(((client as any)._tokenStore.loadMetadata(aid.aid) ?? {}).gateway_url).toBe('wss://gateway.agentid.pub/aun');
 
     const store = new AIDStore({ aunPath: aid.aunPath, encryptionSeed: 'test-seed' });
     const storeDiscover = vi.fn(async () => 'wss://gateway.agentid.pub/aun');

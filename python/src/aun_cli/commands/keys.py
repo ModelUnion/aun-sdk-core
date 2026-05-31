@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from aun_cli.adapter import CLISession, run_async, handle_error, resolve_profile_config
+from aun_cli.adapter import run_async, handle_error, resolve_profile_config, make_aid_store
 from aun_cli.output import output_json, output_success, output_table, is_json_mode, set_json_mode
 
 keys_app = typer.Typer(name="keys", help="密钥管理", no_args_is_help=True)
@@ -16,28 +16,23 @@ def keys_list(ctx: typer.Context) -> None:
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=False) as client:
-            resolved = resolve_profile_config(ctx)
-            aid = resolved["aid"]
-            if not aid:
-                raise typer.BadParameter("No AID configured in current profile")
-            identity = client._keystore.load_identity(aid)
+        resolved = resolve_profile_config(ctx)
+        aid = resolved["aid"]
+        if not aid:
+            raise typer.BadParameter("No AID configured in current profile")
+        store = make_aid_store(resolved)
+        try:
+            loaded = store.load(aid)
             keys_info: list[dict] = []
-            if identity:
-                if identity.get("private_key_pem"):
-                    keys_info.append({
-                        "type": "IK",
-                        "id": aid,
-                        "status": "active",
-                    })
-            prekeys = client._keystore.list_prekeys(aid) if hasattr(client._keystore, "list_prekeys") else []
-            for pk in prekeys:
+            if loaded.ok and loaded.data and loaded.data["aid"].is_private_key_valid():
                 keys_info.append({
-                    "type": "SPK",
-                    "id": pk.get("id", "?"),
-                    "status": pk.get("status", "active"),
+                    "type": "IK",
+                    "id": aid,
+                    "status": "active",
                 })
             return keys_info
+        finally:
+            store.close()
 
     try:
         keys_info = run_async(_run())

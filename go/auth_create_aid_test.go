@@ -30,7 +30,7 @@ func newCreateAIDTestFlow(t *testing.T) (*AuthFlow, *keystore.FileKeyStore, stri
 	}
 	t.Cleanup(func() { ks.Close() })
 	flow := NewAuthFlow(AuthFlowConfig{
-		Keystore:  ks,
+		TokenStore: ks,
 		Crypto:    &CryptoProvider{},
 		VerifySSL: false,
 	})
@@ -77,12 +77,13 @@ func aidDirExists(t *testing.T, dataRoot, aid string) bool {
 
 // 场景 A：AID 已注册时查重命中 → 抛 IdentityConflictError，本地不落盘
 func TestRegisterAID_AbortsWhenAIDAlreadyRegistered(t *testing.T) {
-	flow, _, dataRoot := newCreateAIDTestFlow(t)
+	_, ks, dataRoot := newCreateAIDTestFlow(t)
 	aid := "taken-create-aid.example.com"
 
 	server := startGatewayWithCert(t, map[string]string{aid: _stubServerCertPEM})
 
-	_, err := flow.RegisterAID(context.Background(), gatewayWSURL(server), aid)
+	rf := NewRegisterFlow(RegisterFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
+	_, err := rf.RegisterAID(context.Background(), gatewayWSURL(server), aid)
 	if err == nil {
 		t.Fatal("expected IdentityConflictError, got nil")
 	}
@@ -97,7 +98,7 @@ func TestRegisterAID_AbortsWhenAIDAlreadyRegistered(t *testing.T) {
 
 // 场景 D：查重 HTTP 失败（非 404，非 200）时保守失败，不生成密钥
 func TestRegisterAID_CheckHTTPFailureDoesNotPersist(t *testing.T) {
-	flow, _, dataRoot := newCreateAIDTestFlow(t)
+	_, ks, dataRoot := newCreateAIDTestFlow(t)
 	aid := "checkfail-create-aid.example.com"
 
 	// 服务端永远 500
@@ -108,7 +109,8 @@ func TestRegisterAID_CheckHTTPFailureDoesNotPersist(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	_, err := flow.RegisterAID(context.Background(), strings.Replace(server.URL, "http://", "ws://", 1)+"/aun", aid)
+	rf := NewRegisterFlow(RegisterFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
+	_, err := rf.RegisterAID(context.Background(), strings.Replace(server.URL, "http://", "ws://", 1)+"/aun", aid)
 	if err == nil {
 		t.Fatal("expected error when /pki/cert/ returns 500")
 	}

@@ -8,8 +8,8 @@ import type { JsonObject, PrekeyMap } from '../../src/types.js';
 
 const hasSubtleCrypto = typeof globalThis.crypto?.subtle?.generateKey === 'function';
 const KEYSTORE_DB_NAME = 'aun-keystore';
-const KEYSTORE_DB_VERSION = 6;
-const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'prekeys', 'group_current', 'group_old_epochs', 'e2ee_sessions', 'group_state', 'agent_md_cache'];
+const KEYSTORE_DB_VERSION = 7;
+const KEYSTORE_STORES = ['key_pairs', 'certs', 'metadata', 'instance_state', 'prekeys', 'group_current', 'group_old_epochs', 'e2ee_sessions', 'group_state', 'agent_md_cache', 'pending_identities'];
 
 async function withStore<T>(
   storeName: string,
@@ -96,6 +96,15 @@ async function resetKeystoreDb(): Promise<void> {
   }
 }
 
+async function deleteAndReopenDb(): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const req = indexedDB.deleteDatabase(KEYSTORE_DB_NAME);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error ?? new Error('deleteDatabase failed'));
+    req.onblocked = () => resolve(); // 继续，不阻塞
+  });
+}
+
 // ── IndexedDBKeyStore 测试 ──────────────────────────────
 
 describe('IndexedDBKeyStore', () => {
@@ -130,6 +139,7 @@ describe('IndexedDBKeyStore', () => {
 
   it('空字符串 seed 也应加密 IndexedDB 私钥', async () => {
     if (!hasSubtleCrypto) return;
+    await deleteAndReopenDb();
     ks = new IndexedDBKeyStore({ encryptionSeed: '' });
     await ks.saveKeyPair('empty-seed.test', {
       private_key_pem: 'EMPTY_SEED_PRIVATE',
@@ -159,7 +169,110 @@ describe('IndexedDBKeyStore', () => {
     const newStore = new IndexedDBKeyStore({ encryptionSeed: '' });
     const loaded = await newStore.loadKeyPair('change-seed.test');
     expect(loaded?.private_key_pem).toBe('CHANGE_SEED_PRIVATE');
+    await expect(new IndexedDBKeyStore({ encryptionSeed: 'old-seed' }).loadKeyPair('change-seed.test')).rejects.toThrow(/decrypt failed/);
     await expect(IndexedDBKeyStore.changeSeed('.seed', 'new-seed')).rejects.toThrow(/does not support/);
+  });
+
+  it('loadKeyPair 会把历史明文 IndexedDB 私钥迁移为加密字段', async () => {
+    if (!hasSubtleCrypto) return;
+    await writeStoreRecord('key_pairs', 'legacy-plaintext.test', {
+      private_key_pem: 'LEGACY_INDEXEDDB_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+
+    const seeded = new IndexedDBKeyStore({ encryptionSeed: 'new-seed' });
+    const loaded = await seeded.loadKeyPair('legacy-plaintext.test');
+    expect(loaded?.private_key_pem).toBe('LEGACY_INDEXEDDB_PRIVATE');
+
+    const raw = await readStoreRecord('key_pairs', 'legacy-plaintext.test');
+    expect(raw?.private_key_pem).toBeUndefined();
+    expect(raw?._encrypted_pk).toBeDefined();
+  });
+
+  it('loadKeyPair seed 不匹配时抛错且不改写 IndexedDB 记录', async () => {
+    if (!hasSubtleCrypto) return;
+    const seeded = new IndexedDBKeyStore({ encryptionSeed: 'correct-seed' });
+    await seeded.saveKeyPair('wrong-load-seed.test', {
+      private_key_pem: 'CORRECT_SEED_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+    const before = await readStoreRecord('key_pairs', 'wrong-load-seed.test');
+
+    await expect(new IndexedDBKeyStore({ encryptionSeed: 'wrong-seed' }).loadKeyPair('wrong-load-seed.test')).rejects.toThrow(/decrypt failed/);
+    expect(await readStoreRecord('key_pairs', 'wrong-load-seed.test')).toEqual(before);
+    expect((await seeded.loadKeyPair('wrong-load-seed.test'))?.private_key_pem).toBe('CORRECT_SEED_PRIVATE');
+  });
+
+  it('changeSeed 支持历史明文 IndexedDB 私钥迁移为加密字段', async () => {
+    if (!hasSubtleCrypto) return;
+    await writeStoreRecord('key_pairs', 'plaintext-change-seed.test', {
+      private_key_pem: 'PLAINTEXT_CHANGE_SEED_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+
+    const result = await IndexedDBKeyStore.changeSeed('legacy-unused', 'new-seed');
+    expect(result.privateKeysMigrated).toBe(1);
+    const raw = await readStoreRecord('key_pairs', 'plaintext-change-seed.test');
+    expect(raw?.private_key_pem).toBeUndefined();
+    expect(raw?._encrypted_pk).toBeDefined();
+    expect((await new IndexedDBKeyStore({ encryptionSeed: 'new-seed' }).loadKeyPair('plaintext-change-seed.test'))?.private_key_pem).toBe('PLAINTEXT_CHANGE_SEED_PRIVATE');
+  });
+
+  it('changeSeed 旧 seed 不匹配时不破坏 IndexedDB 记录', async () => {
+    if (!hasSubtleCrypto) return;
+    const oldStore = new IndexedDBKeyStore({ encryptionSeed: 'old-seed' });
+    await oldStore.saveKeyPair('wrong-change-seed.test', {
+      private_key_pem: 'KEEP_OLD_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+    const before = await readStoreRecord('key_pairs', 'wrong-change-seed.test');
+
+    await expect(IndexedDBKeyStore.changeSeed('wrong-seed', 'new-seed')).rejects.toThrow(/seed migration refused/);
+    expect(await readStoreRecord('key_pairs', 'wrong-change-seed.test')).toEqual(before);
+    expect((await oldStore.loadKeyPair('wrong-change-seed.test'))?.private_key_pem).toBe('KEEP_OLD_PRIVATE');
+  });
+
+  it('loadPendingKeyPair 会把历史明文 pending 私钥迁移为加密字段', async () => {
+    if (!hasSubtleCrypto) return;
+    const aid = 'pending-legacy.test';
+    const seeded = new IndexedDBKeyStore({ encryptionSeed: 'pending-seed' });
+    const handle = await seeded.pendingIdentityDir(aid);
+    await writeStoreRecord('pending_identities', handle, {
+      aid,
+      key_pair: {
+        private_key_pem: 'PENDING_LEGACY_PRIVATE',
+        public_key_der_b64: 'pub',
+        curve: 'P-256',
+      },
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    });
+
+    const loaded = await seeded.loadPendingKeyPair(handle, aid);
+    expect(loaded?.private_key_pem).toBe('PENDING_LEGACY_PRIVATE');
+    const raw = await readStoreRecord('pending_identities', handle);
+    expect((raw?.key_pair as JsonObject | undefined)?.private_key_pem).toBeUndefined();
+    expect((raw?.key_pair as JsonObject | undefined)?._encrypted_pk).toBeDefined();
+  });
+
+  it('loadPendingKeyPair seed 不匹配时抛错且保留 pending 记录', async () => {
+    if (!hasSubtleCrypto) return;
+    const aid = 'pending-wrong-seed.test';
+    const correct = new IndexedDBKeyStore({ encryptionSeed: 'correct-seed' });
+    const handle = await correct.pendingIdentityDir(aid);
+    await correct.savePendingKeyPair(handle, aid, {
+      private_key_pem: 'PENDING_CORRECT_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+    const before = await readStoreRecord('pending_identities', handle);
+
+    await expect(new IndexedDBKeyStore({ encryptionSeed: 'wrong-seed' }).loadPendingKeyPair(handle, aid)).rejects.toThrow(/pending identity private key decrypt failed/);
+    expect(await readStoreRecord('pending_identities', handle)).toEqual(before);
   });
 
   // ── 证书 CRUD ──────────────────────────────────────
@@ -256,6 +369,8 @@ describe('IndexedDBKeyStore', () => {
   });
 
   it('device-scoped prekey 应允许同一 prekey_id 并存且 cleanup 只影响目标 device', async () => {
+    await deleteAndReopenDb();
+    ks = new IndexedDBKeyStore();
     const now = Date.now();
     const cutoffMs = now - (7 * 24 * 3600 * 1000);
 

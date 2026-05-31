@@ -1,8 +1,10 @@
 package keystore
 
 import (
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -106,6 +108,26 @@ func (f *FileKeyStore) certVersionPath(aid, fp string) string {
 	return filepath.Join(f.identityDir(aid), "public", "certs", strings.ReplaceAll(fp, ":", "_")+".pem")
 }
 
+func (f *FileKeyStore) pendingRoot() string {
+	return filepath.Join(f.aidsRoot, "_pending")
+}
+
+func (f *FileKeyStore) cleanPendingDir(pendingDir string) (string, error) {
+	rootAbs, err := filepath.Abs(f.pendingRoot())
+	if err != nil {
+		return "", err
+	}
+	dirAbs, err := filepath.Abs(pendingDir)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootAbs, dirAbs)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("pending dir outside pending root: %s", pendingDir)
+	}
+	return dirAbs, nil
+}
+
 func normalizeCertFingerprint(fp string) string {
 	v := strings.TrimSpace(strings.ToLower(fp))
 	if !strings.HasPrefix(v, "sha256:") || len(v) != 71 {
@@ -195,7 +217,7 @@ func (f *FileKeyStore) LoadKeyPair(aid string) (out map[string]any, err error) {
 	if err = json.Unmarshal(data, &kp); err != nil {
 		return nil, err
 	}
-	return f.restoreKeyPair(aid, kp), nil
+	return f.restoreKeyPair(aid, kp, path)
 }
 
 func (f *FileKeyStore) SaveKeyPair(aid string, keyPair map[string]any) (err error) {
@@ -215,7 +237,10 @@ func (f *FileKeyStore) SaveKeyPair(aid string, keyPair map[string]any) (err erro
 }
 
 func (f *FileKeyStore) saveKeyPairLocked(aid string, keyPair map[string]any) error {
-	path := f.keyPairPath(aid)
+	return f.saveKeyPairAtPath(aid, f.keyPairPath(aid), keyPair)
+}
+
+func (f *FileKeyStore) saveKeyPairAtPath(aid, path string, keyPair map[string]any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -242,14 +267,221 @@ func (f *FileKeyStore) saveKeyPairLocked(aid string, keyPair map[string]any) err
 	return nil
 }
 
-func (f *FileKeyStore) restoreKeyPair(aid string, kp map[string]any) map[string]any {
+func (f *FileKeyStore) restoreKeyPair(aid string, kp map[string]any, persistPath ...string) (map[string]any, error) {
 	out := copyMap(kp)
 	if rec, ok := out["private_key_protection"].(map[string]any); ok {
-		if plain, err := f.secretStore.Reveal(safeAID(aid), "identity/private_key", rec); err == nil && plain != nil {
-			out["private_key_pem"] = string(plain)
+		plain, err := f.secretStore.Reveal(safeAID(aid), "identity/private_key", rec)
+		if err != nil || plain == nil {
+			if err == nil {
+				err = fmt.Errorf("secretstore returned no plaintext")
+			}
+			return nil, fmt.Errorf("private key decrypt failed for aid %s: seed_password mismatch or key.json corrupted: %w", aid, err)
+		}
+		out["private_key_pem"] = string(plain)
+		return out, nil
+	}
+	if pem, _ := out["private_key_pem"].(string); len(persistPath) > 0 && strings.TrimSpace(pem) != "" {
+		if err := f.saveKeyPairAtPath(aid, persistPath[0], out); err != nil {
+			return nil, err
 		}
 	}
-	return out
+	return out, nil
+}
+
+// ── RegisterAID pending 身份 ─────────────────────────────────
+
+// PendingIdentityDir 创建注册临时目录 AIDs/_pending/{aid}-{nonce}-{ts}/。
+func (f *FileKeyStore) PendingIdentityDir(aid string) (string, error) {
+	nonce := make([]byte, 4)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(f.pendingRoot(), fmt.Sprintf("%s-%s-%d", safeAID(aid), hex.EncodeToString(nonce), time.Now().Unix()))
+	if err := os.MkdirAll(filepath.Join(dir, "private"), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "public"), 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// ListPendingIdentityDirs 按 mtime 从新到旧列出指定 AID 的 pending 目录。
+func (f *FileKeyStore) ListPendingIdentityDirs(aid string) ([]string, error) {
+	root := f.pendingRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	prefix := safeAID(aid) + "-"
+	type item struct {
+		path  string
+		mtime time.Time
+	}
+	items := make([]item, 0)
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		info, statErr := entry.Info()
+		if statErr != nil {
+			continue
+		}
+		items = append(items, item{path: path, mtime: info.ModTime()})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].mtime.After(items[j].mtime) })
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		result = append(result, item.path)
+	}
+	return result, nil
+}
+
+// SavePendingKeyPair 将 pending key.json 写为加密私钥格式，绝不保留 private_key_pem 明文字段。
+func (f *FileKeyStore) SavePendingKeyPair(pendingDir, aid string, keyPair map[string]any) error {
+	dir, err := f.cleanPendingDir(pendingDir)
+	if err != nil {
+		return err
+	}
+	l := f.getLock(aid)
+	l.Lock()
+	defer l.Unlock()
+	return f.saveKeyPairAtPath(aid, filepath.Join(dir, "private", "key.json"), keyPair)
+}
+
+// LoadPendingKeyPair 读取 pending key.json，并在内存中还原私钥。
+func (f *FileKeyStore) LoadPendingKeyPair(pendingDir, aid string) (map[string]any, error) {
+	dir, err := f.cleanPendingDir(pendingDir)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "private", "key.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var kp map[string]any
+	if err := json.Unmarshal(data, &kp); err != nil {
+		return nil, err
+	}
+	return f.restoreKeyPair(aid, kp, filepath.Join(dir, "private", "key.json"))
+}
+
+// SavePendingCert 写入 pending cert.pem。
+func (f *FileKeyStore) SavePendingCert(pendingDir, certPEM string) error {
+	dir, err := f.cleanPendingDir(pendingDir)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "public", "cert.pem")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(certPEM), 0o644); err != nil {
+		return err
+	}
+	if err := safeRename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// PromotePendingIdentity 将 pending 目录转正为 AIDs/{aid}/，目标已存在时失败。
+func (f *FileKeyStore) PromotePendingIdentity(pendingDir, aid string) (string, error) {
+	dir, err := f.cleanPendingDir(pendingDir)
+	if err != nil {
+		return "", err
+	}
+	if err := f.ensurePendingKeyPairProtected(dir, aid); err != nil {
+		return "", err
+	}
+	target := f.identityDir(aid)
+	if _, err := os.Stat(target); err == nil {
+		return "", os.ErrExist
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	safe := safeAID(aid)
+	f.aidDBsLock.Lock()
+	if db, ok := f.aidDBs[safe]; ok {
+		db.close()
+		delete(f.aidDBs, safe)
+	}
+	f.aidDBsLock.Unlock()
+	if err := os.MkdirAll(f.aidsRoot, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Rename(dir, target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func (f *FileKeyStore) ensurePendingKeyPairProtected(pendingDir, aid string) error {
+	keyPath := filepath.Join(pendingDir, "private", "key.json")
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("pending identity missing key pair for %s", aid)
+		}
+		return err
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	privateKeyPEM, _ := raw["private_key_pem"].(string)
+	if strings.TrimSpace(privateKeyPEM) != "" {
+		return fmt.Errorf("pending identity private key is plaintext for %s", aid)
+	}
+	if _, ok := raw["private_key_protection"].(map[string]any); !ok {
+		return fmt.Errorf("pending identity private key is not encrypted for %s", aid)
+	}
+	return nil
+}
+
+// DiscardPendingIdentity 删除指定 pending 目录。
+func (f *FileKeyStore) DiscardPendingIdentity(pendingDir string) error {
+	dir, err := f.cleanPendingDir(pendingDir)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
+// CleanupPendingDirs 清理超过 maxAge 的 pending 目录，返回清理数量。
+func (f *FileKeyStore) CleanupPendingDirs(maxAge time.Duration) int {
+	root := f.pendingRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0
+	}
+	now := time.Now()
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) < maxAge {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 // ── Cert ─────────────────────────────────────────────────────
@@ -514,7 +746,7 @@ func (f *FileKeyStore) loadKeyPairUnlocked(aid string) (map[string]any, error) {
 	if err := json.Unmarshal(data, &kp); err != nil {
 		return nil, err
 	}
-	return f.restoreKeyPair(aid, kp), nil
+	return f.restoreKeyPair(aid, kp, f.keyPairPath(aid))
 }
 
 func (f *FileKeyStore) loadCertUnlocked(aid string) (string, error) {
@@ -793,6 +1025,9 @@ func (f *FileKeyStore) ListIdentities() (aids []string, err error) {
 			continue
 		}
 		aid := entry.Name()
+		if strings.HasPrefix(aid, "_") {
+			continue
+		}
 		identity, err := f.LoadIdentity(aid)
 		if err != nil || identity == nil {
 			continue
@@ -817,6 +1052,9 @@ func (f *FileKeyStore) LoadAnyIdentity() (map[string]any, error) {
 		if !entry.IsDir() {
 			continue
 		}
+		if strings.HasPrefix(entry.Name(), "_") {
+			continue
+		}
 		identity, err := f.LoadIdentity(entry.Name())
 		if err != nil || identity == nil {
 			continue
@@ -824,40 +1062,6 @@ func (f *FileKeyStore) LoadAnyIdentity() (map[string]any, error) {
 		return identity, nil
 	}
 	return nil, nil
-}
-
-// ── Agent.md Cache（AgentMDCacheStore 实现）────────────────────
-
-func (f *FileKeyStore) LoadAgentMDCache(ownerAid, targetAid string) (*AgentMDCacheRecord, error) {
-	owner := strings.TrimSpace(ownerAid)
-	target := strings.TrimSpace(targetAid)
-	if owner == "" || target == "" {
-		return nil, nil
-	}
-	l := f.getLock(owner)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(owner)
-	if err != nil {
-		return nil, err
-	}
-	return db.LoadAgentMDCache(target)
-}
-
-func (f *FileKeyStore) UpsertAgentMDCache(ownerAid, targetAid string, fields AgentMDCacheUpsert) (*AgentMDCacheRecord, error) {
-	owner := strings.TrimSpace(ownerAid)
-	target := strings.TrimSpace(targetAid)
-	if owner == "" || target == "" {
-		return nil, fmt.Errorf("UpsertAgentMDCache requires non-empty ownerAid and targetAid")
-	}
-	l := f.getLock(owner)
-	l.Lock()
-	defer l.Unlock()
-	db, err := f.getDB(owner)
-	if err != nil {
-		return nil, err
-	}
-	return db.UpsertAgentMDCache(target, fields)
 }
 
 // ── Metadata 公共接口（MetadataKeyStore 实现）─────────────────

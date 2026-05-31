@@ -62,7 +62,8 @@ func newTestAIDStore(t *testing.T) *AIDStore {
 // saveTestIdentity 将身份保存到 AIDStore 的 keystore。
 func saveTestIdentity(t *testing.T, s *AIDStore, aid, certPEM, privPEM, pubB64 string) {
 	t.Helper()
-	if err := s.client.keyStore.SaveIdentity(aid, map[string]any{
+	ks := s.keyStore
+	if err := ks.SaveIdentity(aid, map[string]any{
 		"aid":                aid,
 		"private_key_pem":    privPEM,
 		"public_key_der_b64": pubB64,
@@ -78,12 +79,18 @@ func TestAIDStoreRegisterPersistenceKeepsPrivateKeyMaterial(t *testing.T) {
 	aid := "register-persist.aid.com"
 	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 
-	if err := s.client.auth.persistIdentity(map[string]any{
-		"aid":                aid,
+	// 注册路径：私钥由 AIDStore 通过 SaveKeyPair 单独保存，persistIdentity 不写私钥
+	ks := s.keyStore
+	if err := ks.SaveKeyPair(aid, map[string]any{
 		"private_key_pem":    privPEM,
 		"public_key_der_b64": pubB64,
 		"curve":              "P-256",
-		"cert":               certPEM,
+	}); err != nil {
+		t.Fatalf("SaveKeyPair 失败: %v", err)
+	}
+	if err := s.client.auth.persistIdentity(map[string]any{
+		"aid":  aid,
+		"cert": certPEM,
 	}); err != nil {
 		t.Fatalf("AIDStore 注册持久化失败: %v", err)
 	}
@@ -176,7 +183,7 @@ func TestAIDStoreLoad_CertOnly(t *testing.T) {
 	aid := "certonly.aid.com"
 	certPEM, _, _ := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	// 仅保存证书，不保存私钥
-	if err := s.client.keyStore.SaveCert(aid, certPEM); err != nil {
+	if err := s.keyStore.SaveCert(aid, certPEM); err != nil {
 		t.Fatalf("保存证书失败: %v", err)
 	}
 
@@ -238,7 +245,7 @@ func TestAIDSign_NoPrivateKey(t *testing.T) {
 	s := newTestAIDStore(t)
 	aid := "nopk.aid.com"
 	certPEM, _, _ := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
-	if err := s.client.keyStore.SaveCert(aid, certPEM); err != nil {
+	if err := s.keyStore.SaveCert(aid, certPEM); err != nil {
 		t.Fatalf("保存证书失败: %v", err)
 	}
 	r := s.Load(aid)

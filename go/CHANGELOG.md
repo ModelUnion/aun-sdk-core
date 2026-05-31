@@ -8,6 +8,21 @@
 
 ---
 
+## 0.4.5 — 2026-05-31
+
+### Added
+- **`RegisterFlow` 独立结构体**（`register_flow.go`）：将 AID 注册流程从 `AuthFlow` 中剥离，负责 keypair 生成、服务端 RPC、pending 目录原子提交、崩溃恢复（`_pending` 目录扫描）。
+- **`FileKeyStore` pending 目录 API**：`PendingIdentityDir` / `ListPendingIdentityDirs` / `SavePendingKeyPair` / `LoadPendingKeyPair` / `SavePendingCert` / `PromotePendingIdentity` / `DiscardPendingIdentity` / `CleanupPendingDirs`，支持注册原子性。
+- **`keystore.FullKeyStore` 接口**：`TokenStore + KeyStore` 组合接口，供注册流程显式使用。
+
+### Changed
+- **`AuthFlow` 改用 `TokenStore`**：构造参数 `Keystore` 重命名为 `TokenStore`，类型收窄为不含私钥读写的接口；私钥操作全部移出 `AuthFlow`。
+- **`AuthFlow.SetIdentity()`**：新增方法，由 `AUNClient` 注入内存私钥；`AuthFlow` 内部不再从 `tokenStore` 解密私钥。
+- **`AIDStore` 持有独立 `keyStore` 和 `registerFlow`**：注册结果由 `AIDStore` 负责调用 `keyStore.SaveCert` / `SaveKeyPair` 写入，`RegisterFlow` 不直接写磁盘。
+- **`FileKeyStore.restoreKeyPair`**：签名变更，新增 `persistPath` 可选参数，支持 pending 目录写入。
+
+---
+
 ## 0.4.4 — 2026-05-31
 
 ### Added

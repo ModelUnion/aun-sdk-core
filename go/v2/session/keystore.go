@@ -348,6 +348,35 @@ func (s *V2KeyStore) LoadCurrentGroupSPK(deviceID, groupID string) (string, []by
 	return spkID, priv, pub, nil
 }
 
+// SaveGroupIdentity 保存命名群身份私钥。该私钥不是 AID 身份私钥，存放在 V2 设备密钥表。
+func (s *V2KeyStore) SaveGroupIdentity(deviceID, groupAID string, privateKeyPEM string, publicKeyDER []byte) error {
+	_, err := s.db.Exec(
+		`INSERT OR REPLACE INTO v2_device_keys (device_id, key_type, group_id, key_id, private_key, public_key, created_at)
+		 VALUES (?, 'group_identity', ?, '', ?, ?, ?)`,
+		deviceID, groupAID, []byte(privateKeyPEM), publicKeyDER, time.Now().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("V2KeyStore.SaveGroupIdentity: %w", err)
+	}
+	return nil
+}
+
+// LoadGroupIdentity 加载命名群身份私钥；不存在时返回 ("", nil, nil)。
+func (s *V2KeyStore) LoadGroupIdentity(deviceID, groupAID string) (string, []byte, error) {
+	row := s.db.QueryRow(
+		`SELECT private_key, public_key FROM v2_device_keys
+		 WHERE device_id=? AND key_type='group_identity' AND group_id=? AND key_id=''`,
+		deviceID, groupAID)
+	var priv, pub []byte
+	err := row.Scan(&priv, &pub)
+	if err == sql.ErrNoRows {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("V2KeyStore.LoadGroupIdentity: %w", err)
+	}
+	return string(priv), pub, nil
+}
+
 // DeleteSPK 销毁指定 SPK 私钥（用于 PFS）。
 func (s *V2KeyStore) DeleteSPK(deviceID, spkID string) error {
 	_, err := s.db.Exec(

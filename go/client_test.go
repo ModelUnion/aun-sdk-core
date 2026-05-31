@@ -437,9 +437,9 @@ func TestConstructDefaultSQLiteBackupUsesAUNPath(t *testing.T) {
 		"aun_path": tmpDir,
 	})
 	defer func() { _ = c.Close() }()
-	fks, ok := c.keyStore.(*keystore.FileKeyStore)
+	fks, ok := c.tokenStore.(*keystore.FileKeyStore)
 	if !ok {
-		t.Fatalf("默认 keystore 类型不正确: %T", c.keyStore)
+		t.Fatalf("默认 tokenStore 类型不正确: %T", c.tokenStore)
 	}
 	if fks == nil {
 		t.Fatal("默认 FileKeyStore 不应为 nil")
@@ -666,15 +666,11 @@ func TestAuthFlowEmptyDeviceIDLoadsInstanceState(t *testing.T) {
 	t.Cleanup(func() { ks.Close() })
 	aid := "auth-empty-device.example"
 
-	if err := ks.SaveIdentity(aid, map[string]any{
+	identity := map[string]any{
 		"aid":                aid,
 		"private_key_pem":    "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
 		"public_key_der_b64": "pub",
 		"curve":              "P-256",
-		"access_token":       "shared-token",
-		"refresh_token":      "shared-refresh",
-	}); err != nil {
-		t.Fatalf("保存身份失败: %v", err)
 	}
 	if err := ks.SaveInstanceState(aid, "", "slot-a", map[string]any{
 		"access_token":            "empty-device-token",
@@ -684,8 +680,9 @@ func TestAuthFlowEmptyDeviceIDLoadsInstanceState(t *testing.T) {
 		t.Fatalf("保存空 device instance_state 失败: %v", err)
 	}
 
-	flow := NewAuthFlow(AuthFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
+	flow := NewAuthFlow(AuthFlowConfig{TokenStore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
 	flow.SetInstanceContext("", "slot-a")
+	flow.SetIdentity(identity)
 	loaded, err := flow.LoadIdentity(aid)
 	if err != nil {
 		t.Fatalf("LoadIdentity 失败: %v", err)
@@ -703,7 +700,7 @@ func TestAuthFlowEmptyDeviceIDPersistsInstanceState(t *testing.T) {
 	t.Cleanup(func() { ks.Close() })
 	aid := "persist-empty-device.example"
 
-	flow := NewAuthFlow(AuthFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
+	flow := NewAuthFlow(AuthFlowConfig{TokenStore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
 	flow.SetInstanceContext("", "slot-a")
 	if err := flow.persistIdentity(map[string]any{
 		"aid":                     aid,
@@ -1697,12 +1694,12 @@ func TestLogoutClearsTokens(t *testing.T) {
 		"access_token":  "tok-123",
 		"refresh_token": "ref-456",
 	})
-	// 保存到 keystore
-	_ = c.keyStore.SaveIdentity(aid, map[string]any{
-		"aid":           aid,
-		"access_token":  "tok-123",
-		"refresh_token": "ref-456",
-	})
+	if store, ok := c.tokenStore.(keystore.InstanceStateStore); ok {
+		_ = store.SaveInstanceState(aid, c.deviceID, c.slotID, map[string]any{
+			"access_token":  "tok-123",
+			"refresh_token": "ref-456",
+		})
+	}
 
 	if err := c.Logout(); err != nil {
 		t.Fatalf("Logout 不应报错: %v", err)
@@ -1713,10 +1710,14 @@ func TestLogoutClearsTokens(t *testing.T) {
 		t.Fatalf("Logout 后状态应为 closed，实际: %s", c.State())
 	}
 
-	// 重新加载身份，token 应已清除
-	loaded, err := c.keyStore.LoadIdentity(aid)
+	// 重新加载实例态，token 应已清除；AUNClient 不再读取 AID 身份私钥。
+	store, ok := c.tokenStore.(keystore.InstanceStateStore)
+	if !ok {
+		t.Fatal("tokenStore 不支持 InstanceStateStore 接口")
+	}
+	loaded, err := store.LoadInstanceState(aid, c.deviceID, c.slotID)
 	if err != nil {
-		t.Fatalf("LoadIdentity 失败: %v", err)
+		t.Fatalf("LoadInstanceState 失败: %v", err)
 	}
 	if loaded != nil {
 		if tok, ok := loaded["access_token"].(string); ok && tok != "" {

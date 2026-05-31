@@ -13,7 +13,7 @@ export const V2_DB_VERSION = 3;
 export const V2_STORE_NAME = 'v2_device_keys';
 export const V2_INDEX_BY_DEVICE_TYPE_CREATED = 'by_device_type_created';
 
-type KeyType = 'ik' | 'spk' | 'group_spk' | 'spk_uploaded' | 'group_spk_uploaded';
+type KeyType = 'ik' | 'spk' | 'group_spk' | 'group_identity' | 'spk_uploaded' | 'group_spk_uploaded';
 
 interface V2KeyRecord {
   device_id: string;
@@ -367,6 +367,45 @@ export class V2KeyStore {
           priv: new Uint8Array(r.private_key),
           pubDer: new Uint8Array(r.public_key),
         });
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async saveGroupIdentity(
+    deviceId: string,
+    groupAid: string,
+    privateKeyPem: string,
+    pubDer: Uint8Array,
+  ): Promise<void> {
+    const record: V2KeyRecord = {
+      device_id: deviceId,
+      key_type: 'group_identity',
+      group_id: groupAid,
+      key_id: '',
+      private_key: new TextEncoder().encode(privateKeyPem),
+      public_key: pubDer,
+      created_at: Date.now(),
+    };
+    return new Promise((resolve, reject) => {
+      const req = this.store('readwrite').put(record);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async loadGroupIdentity(
+    deviceId: string,
+    groupAid: string,
+  ): Promise<{ privateKeyPem: string; pubDer: Uint8Array } | null> {
+    return new Promise((resolve, reject) => {
+      const req = this.store('readonly').get([deviceId, 'group_identity', groupAid, '']);
+      req.onsuccess = () => {
+        const r = req.result as V2KeyRecord | undefined;
+        resolve(r ? {
+          privateKeyPem: new TextDecoder().decode(r.private_key),
+          pubDer: new Uint8Array(r.public_key),
+        } : null);
       };
       req.onerror = () => reject(req.error);
     });

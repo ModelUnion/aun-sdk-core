@@ -22,6 +22,14 @@ import {
 
 type LegacyGroupSecretMap = Record<string, GroupSecretRecord>;
 
+type PendingIdentityRecord = {
+  aid: string;
+  key_pair?: JsonObject;
+  cert?: string;
+  created_at: number;
+  updated_at: number;
+};
+
 /** AID 安全化（替换路径分隔符） */
 function safeAid(aid: string): string {
   return aid.replace(/[/\\:]/g, '_');
@@ -157,7 +165,7 @@ function hasEncryptionSeed(seed: string | undefined): seed is string {
 // ── IndexedDB 工具 ──────────────────────────────────────
 
 const DB_NAME = 'aun-keystore';
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 
 /** 对象仓库名称 */
 const STORE_KEY_PAIRS = 'key_pairs';
@@ -170,12 +178,22 @@ const STORE_GROUP_OLD_EPOCHS = 'group_old_epochs';
 const STORE_SESSIONS = 'e2ee_sessions';
 const STORE_GROUP_STATE = 'group_state';
 const STORE_AGENT_MD_CACHE = 'agent_md_cache';
+const STORE_PENDING_IDENTITIES = 'pending_identities';
 
 const STRUCTURED_RECOVERY_RETENTION_MS = 7 * 24 * 3600 * 1000;
 const CRITICAL_METADATA_KEYS = [] as const;
 
 function metadataStoreKey(aid: string): string {
   return safeAid(aid);
+}
+
+function randomHex(byteLength: number): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function pendingIdentityPrefix(aid: string): string {
+  return `${safeAid(aid)}-`;
 }
 
 function normalizeCertFingerprint(certFingerprint?: string): string {
@@ -369,6 +387,9 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_AGENT_MD_CACHE)) {
         db.createObjectStore(STORE_AGENT_MD_CACHE);
       }
+      if (!db.objectStoreNames.contains(STORE_PENDING_IDENTITIES)) {
+        db.createObjectStore(STORE_PENDING_IDENTITIES);
+      }
     };
 
     request.onsuccess = () => {
@@ -530,11 +551,11 @@ export class IndexedDBKeyStore implements KeyStore {
 
   private static _aidTails = new Map<string, Promise<void>>();
 
-  /** 私钥加密种子；为空时降级为明文存储（向后兼容） */
+  /** 私钥加密种子；空字符串也是有效 seed，默认不再写入明文私钥。 */
   private _encryptionSeed: string | undefined;
 
   constructor(opts?: { encryptionSeed?: string }) {
-    this._encryptionSeed = opts?.encryptionSeed;
+    this._encryptionSeed = opts?.encryptionSeed ?? '';
   }
 
   static async changeSeed(oldSeed: string, newSeed: string): Promise<SeedChangeResult> {
@@ -546,7 +567,13 @@ export class IndexedDBKeyStore implements KeyStore {
     for (const row of rows) {
       if (!isRecord(row.value)) continue;
       const envelope = row.value._encrypted_pk;
-      if (!isRecord(envelope)) continue;
+      if (!isRecord(envelope)) {
+        const plain = row.value.private_key_pem;
+        if (typeof plain === 'string' && plain) {
+          migrations.push({ key: row.key, value: deepClone(row.value), privateKeyPem: plain });
+        }
+        continue;
+      }
       try {
         const privateKeyPem = await _decryptPEM(envelope as unknown as EncryptedEnvelope, oldSeed);
         migrations.push({ key: row.key, value: deepClone(row.value), privateKeyPem });
@@ -656,17 +683,14 @@ export class IndexedDBKeyStore implements KeyStore {
         result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
         delete result._encrypted_pk;
       } catch {
-        this._log.error(`[keystore] decrypt ${aid} private keyfailed, maybe encryptionSeed mismatch`);
+        this._log.error(`[keystore] decrypt ${aid} private key failed, maybe encryptionSeed mismatch`);
+        throw new Error(`private key decrypt failed for aid ${aid}: seed_password mismatch or IndexedDB record corrupted`);
       }
     } else if (
       // 透明迁移：旧版明文数据自动加密回写
       !epk && typeof result.private_key_pem === 'string' && hasEncryptionSeed(this._encryptionSeed)
     ) {
-      try {
-        await this.saveKeyPair(aid, result);
-      } catch {
-        // 迁移失败不影响读取
-      }
+      await this.saveKeyPair(aid, result);
     }
     return result;
   }
@@ -679,6 +703,137 @@ export class IndexedDBKeyStore implements KeyStore {
       delete record.private_key_pem;
     }
     await idbPut(STORE_KEY_PAIRS, metadataStoreKey(aid), record);
+  }
+
+  // ── RegisterAID pending 身份 ─────────────────────────
+
+  async pendingIdentityDir(aid: string): Promise<string> {
+    const handle = `${pendingIdentityPrefix(aid)}${randomHex(4)}-${Math.floor(Date.now() / 1000)}`;
+    const now = Date.now();
+    await idbPut<PendingIdentityRecord>(STORE_PENDING_IDENTITIES, handle, {
+      aid,
+      created_at: now,
+      updated_at: now,
+    });
+    return handle;
+  }
+
+  async listPendingIdentityDirs(aid: string): Promise<string[]> {
+    const prefix = pendingIdentityPrefix(aid);
+    const rows = await idbGetAllByPrefix<PendingIdentityRecord>(STORE_PENDING_IDENTITIES, prefix);
+    return rows
+      .filter((row) => row.key.startsWith(prefix) && isRecord(row.value) && String(row.value.aid ?? '') === aid)
+      .sort((a, b) => Number(b.value.updated_at ?? 0) - Number(a.value.updated_at ?? 0))
+      .map((row) => row.key);
+  }
+
+  async savePendingKeyPair(handle: string, aid: string, keyPair: KeyPairRecord): Promise<void> {
+    const current = await this._loadPendingRecord(handle, aid);
+    if (!current) throw new Error(`pending identity not found: ${handle}`);
+    const record = deepClone(keyPair);
+    const privateKeyPem = record.private_key_pem;
+    if (typeof privateKeyPem !== 'string' || !privateKeyPem) {
+      throw new Error('savePendingKeyPair requires private_key_pem');
+    }
+    record._encrypted_pk = await _encryptPEM(privateKeyPem, this._encryptionSeed ?? '') as unknown as JsonObject;
+    delete record.private_key_pem;
+    await idbPut<PendingIdentityRecord>(STORE_PENDING_IDENTITIES, handle, {
+      ...current,
+      aid,
+      key_pair: record,
+      updated_at: Date.now(),
+    });
+  }
+
+  async loadPendingKeyPair(handle: string, aid: string): Promise<KeyPairRecord | null> {
+    const current = await this._loadPendingRecord(handle, aid, false);
+    if (!current || !isRecord(current.key_pair)) return null;
+    const result = deepClone(current.key_pair) as KeyPairRecord;
+    const encrypted = (result as JsonObject)._encrypted_pk;
+    if (isRecord(encrypted)) {
+      try {
+        const envelope = encrypted as unknown as EncryptedEnvelope;
+        result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed ?? '');
+        delete (result as JsonObject)._encrypted_pk;
+        return result;
+      } catch {
+        this._log.error(`[keystore] decrypt pending ${aid} private key failed, maybe encryptionSeed mismatch`);
+        throw new Error(`pending identity private key decrypt failed for aid ${aid}: seed_password mismatch or IndexedDB record corrupted`);
+      }
+    }
+    if (typeof result.private_key_pem === 'string' && result.private_key_pem) {
+      // 兼容历史 pending 明文记录：首次加载成功后立即加密回写，避免 pending 私钥继续明文落盘。
+      await this.savePendingKeyPair(handle, aid, result);
+      return result;
+    }
+    return result;
+  }
+
+  async savePendingCert(handle: string, certPem: string): Promise<void> {
+    const current = await this._loadPendingRecord(handle, undefined);
+    if (!current) throw new Error(`pending identity not found: ${handle}`);
+    await idbPut<PendingIdentityRecord>(STORE_PENDING_IDENTITIES, handle, {
+      ...current,
+      cert: certPem,
+      updated_at: Date.now(),
+    });
+  }
+
+  async promotePendingIdentity(handle: string, aid: string): Promise<string> {
+    const current = await this._loadPendingRecord(handle, aid);
+    if (!current) throw new Error(`pending identity not found: ${handle}`);
+    if (!isRecord(current.key_pair)) {
+      throw new Error(`promotePendingIdentity: missing pending key pair: ${handle}`);
+    }
+    const targetKey = metadataStoreKey(aid);
+    const [existingKeyPair, existingCert, existingMetadata] = await Promise.all([
+      idbGet<JsonObject>(STORE_KEY_PAIRS, targetKey),
+      idbGet<string>(STORE_CERTS, certStoreKey(aid)),
+      idbGet<JsonObject>(STORE_METADATA, targetKey),
+    ]);
+    if (existingKeyPair || existingCert || existingMetadata) {
+      throw new Error(`promotePendingIdentity: target exists: ${targetKey}`);
+    }
+    const keyPair = await this._protectedPendingKeyPair(current, aid);
+    await idbPut(STORE_KEY_PAIRS, targetKey, keyPair);
+    if (typeof current.cert === 'string' && current.cert) {
+      await idbPut(STORE_CERTS, certStoreKey(aid), current.cert);
+    }
+    await idbDelete(STORE_PENDING_IDENTITIES, handle);
+    return targetKey;
+  }
+
+  private async _protectedPendingKeyPair(current: PendingIdentityRecord, aid: string): Promise<JsonObject> {
+    if (!isRecord(current.key_pair)) {
+      throw new Error(`pending identity missing key pair for ${aid}`);
+    }
+    const keyPair = deepClone(current.key_pair);
+    const privateKeyPem = keyPair.private_key_pem;
+    if (typeof privateKeyPem === 'string' && privateKeyPem) {
+      throw new Error(`pending identity private key is plaintext for ${aid}`);
+    }
+    if (!isRecord(keyPair._encrypted_pk)) {
+      throw new Error(`pending identity private key is not encrypted for ${aid}`);
+    }
+    return keyPair;
+  }
+
+  async cleanupPendingDirs(maxAgeMs: number = 600_000): Promise<number> {
+    const rows = await idbGetAll<PendingIdentityRecord>(STORE_PENDING_IDENTITIES);
+    const now = Date.now();
+    let removed = 0;
+    for (const row of rows) {
+      if (!isRecord(row.value)) continue;
+      const updatedAt = Number(row.value.updated_at ?? row.value.created_at ?? 0);
+      if (updatedAt && now - updatedAt < maxAgeMs) continue;
+      await idbDelete(STORE_PENDING_IDENTITIES, row.key);
+      removed++;
+    }
+    return removed;
+  }
+
+  async discardPendingIdentity(handle: string): Promise<void> {
+    await idbDelete(STORE_PENDING_IDENTITIES, handle);
   }
 
   // ── 证书 ──────────────────────────────────────────
@@ -1134,6 +1289,19 @@ export class IndexedDBKeyStore implements KeyStore {
 
   // ── 内部辅助 ─────────────────────────────────────────
 
+  private async _loadPendingRecord(handle: string, aid?: string, required = true): Promise<PendingIdentityRecord | null> {
+    const data = await idbGet<PendingIdentityRecord>(STORE_PENDING_IDENTITIES, handle);
+    if (!isRecord(data)) {
+      if (required) throw new Error(`pending identity not found: ${handle}`);
+      return null;
+    }
+    const record = deepClone(data) as unknown as PendingIdentityRecord;
+    if (aid !== undefined && String(record.aid ?? '') !== aid) {
+      throw new Error(`pending identity aid mismatch: ${handle}`);
+    }
+    return record;
+  }
+
   private async _loadKeyPairUnlocked(aid: string): Promise<KeyPairRecord | null> {
     const data = await idbGet<JsonObject>(STORE_KEY_PAIRS, metadataStoreKey(aid));
     if (!isRecord(data)) return null;
@@ -1145,17 +1313,14 @@ export class IndexedDBKeyStore implements KeyStore {
         result.private_key_pem = await _decryptPEM(envelope, this._encryptionSeed);
         delete result._encrypted_pk;
       } catch {
-        this._log.error(`[keystore] decrypt ${aid} private keyfailed, maybe encryptionSeed mismatch`);
+        this._log.error(`[keystore] decrypt ${aid} private key failed, maybe encryptionSeed mismatch`);
+        throw new Error(`private key decrypt failed for aid ${aid}: seed_password mismatch or IndexedDB record corrupted`);
       }
     } else if (
       // 透明迁移：旧版明文数据自动加密回写
       !isRecord(result._encrypted_pk) && typeof result.private_key_pem === 'string' && hasEncryptionSeed(this._encryptionSeed)
     ) {
-      try {
-        await this._saveKeyPairUnlocked(aid, result);
-      } catch {
-        // 迁移失败不影响读取
-      }
+      await this._saveKeyPairUnlocked(aid, result);
     }
     return result;
   }

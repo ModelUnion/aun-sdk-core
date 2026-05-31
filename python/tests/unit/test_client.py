@@ -282,7 +282,7 @@ def test_construct_default_sqlite_backup_uses_aun_path(tmp_path):
     """SQLCipher 迁移后不再使用 SQLiteBackup，改为验证 keystore 使用正确的 aun_path。"""
     root = tmp_path / "aun"
     client = _make_client_with_aid(root)
-    assert client._keystore._root == root
+    assert client._token_store._root == root
 
 
 def test_connect_rejects_external_gateway_option():
@@ -663,10 +663,17 @@ def test_aid_store_register_caches_discovered_gateway(monkeypatch, tmp_path):
     async def fake_register_aid(gateway_url: str, aid: str) -> dict:
         assert gateway_url == "ws://gateway.example/aun"
         assert aid == "demo.agentid.pub"
-        return {"aid": aid, "cert": "CERT"}
+        identity = _make_identity(aid)
+        return {
+            "aid": aid,
+            "cert": identity["cert"],
+            "private_key_pem": identity["private_key_pem"],
+            "public_key_der_b64": identity["public_key_der_b64"],
+            "curve": identity.get("curve", "P-256"),
+        }
 
     monkeypatch.setattr(store._discovery, "discover", fake_discover)
-    monkeypatch.setattr(store._auth, "register_aid", fake_register_aid)
+    monkeypatch.setattr(store._register_flow, "register_aid", fake_register_aid)
 
     result = asyncio.run(store.register("demo.agentid.pub"))
 
@@ -702,6 +709,9 @@ def test_authenticate_caches_discovered_gateway(monkeypatch, tmp_path):
 
     assert result["gateway"] == "ws://gateway.example/aun"
     assert client.gateway_url == "ws://gateway.example/aun"
+    assert client.access_token == "tok"
+    assert client._identity["refresh_token"] == "refresh"
+    assert client.access_token_expires_at == 123.0
 
 
 def test_aid_store_register_requires_valid_aid(tmp_path):
@@ -952,25 +962,26 @@ def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
     client = _make_client_with_aid(tmp_path / "aun")
     aid = "demo.agentid.pub"
 
-    client._keystore.save_identity(aid, {
+    client._token_store.save_identity(aid, {
         "aid": aid,
         "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
         "public_key_der_b64": "pub",
         "curve": "P-256",
     })
-    client._keystore.save_e2ee_prekey(aid, "pk1", {
+    client._token_store.save_e2ee_prekey(aid, "pk1", {
         "private_key_pem": "KEEP_ME",
         "created_at": 1,
     }, device_id=client._device_id)
     client._aid = aid
+    client._identity = {"aid": aid}
 
     client._sync_identity_after_connect("tok-connect")
 
-    loaded = client._keystore.load_identity(aid)
-    slot_state = client._keystore.load_instance_state(aid, client.device_id, client.slot_id)
+    loaded = client._token_store.load_identity(aid)
+    slot_state = client._token_store.load_instance_state(aid, client._device_id, client._slot_id)
     assert "access_token" not in loaded
     assert slot_state["access_token"] == "tok-connect"
-    prekeys = client._keystore.load_e2ee_prekeys(aid, device_id=client._device_id)
+    prekeys = client._token_store.load_e2ee_prekeys(aid, device_id=client._device_id)
     assert prekeys["pk1"]["private_key_pem"] == "KEEP_ME"
 
 
@@ -3146,7 +3157,7 @@ def test_ensure_sender_cert_cached_uses_local_fingerprint_cert(tmp_path, monkeyp
     cert_fp = "sha256:" + cert.fingerprint(hashes.SHA256()).hex()
 
     client = _make_client_with_aid(tmp_path / "aun")
-    client._keystore.save_cert("alice.example.com", cert_pem, cert_fingerprint=cert_fp, make_active=False)
+    client._token_store.save_cert("alice.example.com", cert_pem, cert_fingerprint=cert_fp, make_active=False)
 
     called = {"fetch": 0, "last_fp": None}
 
@@ -3189,8 +3200,8 @@ def test_seq_tracker_state_isolated_between_slots(tmp_path):
     }
     client_a = _make_client_with_aid(root)
     client_b = _make_client_with_aid(root)
-    client_a._keystore.save_identity(aid, dict(base_identity))
-    client_b._keystore.save_identity(aid, dict(base_identity))
+    client_a._token_store.save_identity(aid, dict(base_identity))
+    client_b._token_store.save_identity(aid, dict(base_identity))
     client_a._aid = aid
     client_b._aid = aid
     client_a._slot_id = "slot-a"
@@ -3229,7 +3240,7 @@ def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path)
         "public_key_der_b64": "pub",
         "curve": "P-256",
     }
-    client._keystore.save_identity(aid, identity)
+    client._token_store.save_identity(aid, identity)
     client._aid = aid
     client._slot_id = "slot-a"
     client._seq_tracker.restore_state({"p2p:demo": 5})
@@ -3801,8 +3812,8 @@ async def test_restore_before_transport_connect():
     client._loop = asyncio.get_running_loop()
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
-    client._keystore = MagicMock()
-    client._keystore.load_all_seqs = MagicMock(return_value={})
+    client._token_store = MagicMock()
+    client._token_store.load_all_seqs = MagicMock(return_value={})
     client._auth = MagicMock()
     client._auth.set_instance_context = MagicMock()
     client._auth.connect_session = AsyncMock(
@@ -3867,8 +3878,8 @@ async def test_restore_after_aid_change_during_auth():
     client._loop = asyncio.get_running_loop()
     client._dispatcher = MagicMock()
     client._dispatcher.publish = AsyncMock()
-    client._keystore = MagicMock()
-    client._keystore.load_all_seqs = MagicMock(return_value={})
+    client._token_store = MagicMock()
+    client._token_store.load_all_seqs = MagicMock(return_value={})
     client._auth = MagicMock()
     client._auth.set_instance_context = MagicMock()
 

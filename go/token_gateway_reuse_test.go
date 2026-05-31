@@ -27,26 +27,29 @@ func newTestAuthFlow(t *testing.T) (*AuthFlow, *keystore.FileKeyStore) {
 	}
 	t.Cleanup(func() { ks.Close() })
 	flow := NewAuthFlow(AuthFlowConfig{
-		Keystore:  ks,
-		Crypto:    &CryptoProvider{},
-		VerifySSL: false,
+		TokenStore: ks,
+		Crypto:     &CryptoProvider{},
+		VerifySSL:  false,
 	})
 	return flow, ks
 }
 
-// seedIdentityWithCachedToken 写入一份带 cached access_token 的身份。
-func seedIdentityWithCachedToken(t *testing.T, ks keystore.KeyStore, aid, accessToken, refreshToken string, expiresAt int64) {
+// seedInjectedIdentityWithCachedToken 注入内存身份，并把 cached token 写入 instance_state。
+func seedInjectedIdentityWithCachedToken(t *testing.T, flow *AuthFlow, ks keystore.InstanceStateStore, aid, accessToken, refreshToken string, expiresAt int64) {
 	t.Helper()
-	// 直接构造一个最小 identity（无证书）— 走 cached 路径不需要解析证书。
 	identity := map[string]any{
-		"aid":                      aid,
-		"private_key_pem":          "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
-		"access_token":             accessToken,
-		"refresh_token":            refreshToken,
-		"access_token_expires_at":  expiresAt,
+		"aid":                aid,
+		"private_key_pem":    "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
+		"public_key_der_b64": "pub",
+		"curve":              "P-256",
 	}
-	if err := ks.SaveIdentity(aid, identity); err != nil {
-		t.Fatalf("SaveIdentity 失败: %v", err)
+	flow.SetIdentity(identity)
+	if err := ks.SaveInstanceState(aid, "", "", map[string]any{
+		"access_token":            accessToken,
+		"refresh_token":           refreshToken,
+		"access_token_expires_at": expiresAt,
+	}); err != nil {
+		t.Fatalf("SaveInstanceState 失败: %v", err)
 	}
 }
 
@@ -58,7 +61,7 @@ func TestTokenGatewayReuse_AuthenticateUsesCachedToken(t *testing.T) {
 	flow, ks := newTestAuthFlow(t)
 	const aid = "alice.test.local"
 	expiresAt := time.Now().Unix() + 3600
-	seedIdentityWithCachedToken(t, ks, aid, "cached-access", "cached-refresh", expiresAt)
+	seedInjectedIdentityWithCachedToken(t, flow, ks, aid, "cached-access", "cached-refresh", expiresAt)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -85,16 +88,16 @@ func TestTokenGatewayReuse_AuthenticateUsesCachedToken(t *testing.T) {
 // 用例 2：identity 没有 access_token 时不会走 cache，会进入 login 路径并因
 // 不可达而报错（验证 cache 检查没有错误地短路非缓存场景）。
 func TestTokenGatewayReuse_AuthenticateFallsThroughWhenNoCachedToken(t *testing.T) {
-	flow, ks := newTestAuthFlow(t)
+	flow, _ := newTestAuthFlow(t)
 	const aid = "bob.test.local"
 	identity := map[string]any{
-		"aid":             aid,
-		"private_key_pem": "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
-		"cert":            "", // 无证书 → 进入 cert 恢复路径，依然会触网失败
+		"aid":                aid,
+		"private_key_pem":    "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
+		"public_key_der_b64": "pub",
+		"curve":              "P-256",
+		"cert":               "", // 无证书 → 进入 cert 恢复路径，依然会触网失败
 	}
-	if err := ks.SaveIdentity(aid, identity); err != nil {
-		t.Fatalf("SaveIdentity 失败: %v", err)
-	}
+	flow.SetIdentity(identity)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -112,7 +115,7 @@ func TestTokenGatewayReuse_AuthenticateFallsThroughWhenTokenExpired(t *testing.T
 	const aid = "carol.test.local"
 	// expires_at 设为已经过去 → authGetCachedAccessToken 返回 ""
 	expiresAt := time.Now().Unix() - 60
-	seedIdentityWithCachedToken(t, ks, aid, "stale-access", "stale-refresh", expiresAt)
+	seedInjectedIdentityWithCachedToken(t, flow, ks, aid, "stale-access", "stale-refresh", expiresAt)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

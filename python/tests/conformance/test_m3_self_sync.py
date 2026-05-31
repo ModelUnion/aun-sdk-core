@@ -23,6 +23,17 @@ from aun_core.v2.e2ee.encrypt_p2p import encrypt_p2p_message
 from aun_core.v2.e2ee.decrypt import decrypt_message
 
 
+def _session(db, device_id: str, aid: str, aid_keypair: tuple[bytes, bytes] | None = None) -> V2Session:
+    aid_priv, aid_pub = aid_keypair or generate_p256_keypair()
+    return V2Session(
+        db,
+        device_id,
+        aid,
+        aid_priv_der=aid_priv,
+        aid_pub_der=aid_pub,
+    )
+
+
 @pytest.fixture
 def tmp_db(tmp_path):
     """创建临时 SQLite 数据库。"""
@@ -75,13 +86,14 @@ class TestSelfSyncEncrypt:
     def test_self_sync_target_set_includes_other_device(self, tmp_db, bob_db):
         """send_v2 的 target_set 应包含自己的其他设备"""
         # Alice 有两个设备
-        alice_dev1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
-        alice_dev2 = V2Session(tmp_db, "dev-2", "alice.agentid.pub")
+        alice_keypair = generate_p256_keypair()
+        alice_dev1 = _session(tmp_db, "dev-1", "alice.agentid.pub", alice_keypair)
+        alice_dev2 = _session(tmp_db, "dev-2", "alice.agentid.pub", alice_keypair)
         alice_dev1.ensure_keys()
         alice_dev2.ensure_keys()
 
         # Bob 有一个设备
-        bob = V2Session(bob_db, "dev-bob", "bobb.agentid.pub")
+        bob = _session(bob_db, "dev-bob", "bobb.agentid.pub")
         bob.ensure_keys()
 
         # 构造 target_set（模拟 send_v2 逻辑）
@@ -121,12 +133,13 @@ class TestSelfSyncEncrypt:
 
     def test_self_sync_device_can_decrypt(self, tmp_db, bob_db):
         """Alice(dev-2) 能解密 Alice(dev-1) 发出的消息"""
-        alice_dev1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
-        alice_dev2 = V2Session(tmp_db, "dev-2", "alice.agentid.pub")
+        alice_keypair = generate_p256_keypair()
+        alice_dev1 = _session(tmp_db, "dev-1", "alice.agentid.pub", alice_keypair)
+        alice_dev2 = _session(tmp_db, "dev-2", "alice.agentid.pub", alice_keypair)
         alice_dev1.ensure_keys()
         alice_dev2.ensure_keys()
 
-        bob = V2Session(bob_db, "dev-bob", "bobb.agentid.pub")
+        bob = _session(bob_db, "dev-bob", "bobb.agentid.pub")
         bob.ensure_keys()
 
         targets = [
@@ -172,10 +185,10 @@ class TestSelfSyncEncrypt:
 
     def test_self_sync_skip_current_device(self, tmp_db, bob_db):
         """self-sync 不应包含发送方当前设备"""
-        alice_dev1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
+        alice_dev1 = _session(tmp_db, "dev-1", "alice.agentid.pub")
         alice_dev1.ensure_keys()
 
-        bob = V2Session(bob_db, "dev-bob", "bobb.agentid.pub")
+        bob = _session(bob_db, "dev-bob", "bobb.agentid.pub")
         bob.ensure_keys()
 
         # 只有一个设备时，target_set 只有 Bob
@@ -203,12 +216,13 @@ class TestSelfSyncEncrypt:
 
     def test_bob_can_still_decrypt_with_self_sync(self, tmp_db, bob_db):
         """加了 self-sync 行后 Bob 仍能正常解密"""
-        alice_dev1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
-        alice_dev2 = V2Session(tmp_db, "dev-2", "alice.agentid.pub")
+        alice_keypair = generate_p256_keypair()
+        alice_dev1 = _session(tmp_db, "dev-1", "alice.agentid.pub", alice_keypair)
+        alice_dev2 = _session(tmp_db, "dev-2", "alice.agentid.pub", alice_keypair)
         alice_dev1.ensure_keys()
         alice_dev2.ensure_keys()
 
-        bob = V2Session(bob_db, "dev-bob", "bobb.agentid.pub")
+        bob = _session(bob_db, "dev-bob", "bobb.agentid.pub")
         bob.ensure_keys()
 
         targets = [
@@ -254,8 +268,9 @@ class TestSelfSyncEncrypt:
 
     def test_per_device_envelope_self_sync_decrypt(self, tmp_db, bob_db):
         """per-device envelope 格式下 self-sync 设备也能解密"""
-        alice_dev1 = V2Session(tmp_db, "dev-1", "alice.agentid.pub")
-        alice_dev2 = V2Session(tmp_db, "dev-2", "alice.agentid.pub")
+        alice_keypair = generate_p256_keypair()
+        alice_dev1 = _session(tmp_db, "dev-1", "alice.agentid.pub", alice_keypair)
+        alice_dev2 = _session(tmp_db, "dev-2", "alice.agentid.pub", alice_keypair)
         alice_dev1.ensure_keys()
         alice_dev2.ensure_keys()
 

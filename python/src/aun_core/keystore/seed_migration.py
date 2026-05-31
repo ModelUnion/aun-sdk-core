@@ -379,6 +379,9 @@ def _verify_private_keys(root: Path, old_master: bytes, *, raise_on_empty: bool 
             raise SeedMigrationError(f"seed migration refused: key.json is not an object for {aid}")
         record = data.get("private_key_protection")
         if record is None:
+            private_key_pem = data.get("private_key_pem")
+            if isinstance(private_key_pem, str) and private_key_pem:
+                migrations.append(_PrivateKeyMigration(aid=aid, path=path, plaintext=private_key_pem.encode("utf-8")))
             continue
         if not isinstance(record, dict) or record.get("scheme") != "file_aes":
             continue
@@ -427,6 +430,7 @@ def _rewrite_key_json(item: _PrivateKeyMigration, new_seed: bytes, new_master: b
     if verified != item.plaintext:
         raise SeedMigrationError(f"new seed verification failed for private key: aid={item.aid}")
     data["private_key_protection"] = record
+    data.pop("private_key_pem", None)
 
     # 原子写入新内容
     try:

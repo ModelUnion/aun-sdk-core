@@ -177,6 +177,63 @@ describe('FileSecretStore', () => {
     expect(migratedStore.reveal(aid, 'identity/private_key', protection)!.toString('utf-8')).toBe('GOOD_PRIVATE');
   });
 
+  it('ChangeSeed 支持旧 seed 到新 seed 且旧 seed 不再可读', () => {
+    const aid = 'old-to-new.agentid.pub';
+    const oldStore = new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' });
+    oldStore.saveKeyPair(aid, {
+      private_key_pem: 'OLD_TO_NEW_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+
+    const result = oldStore.changeSeed('old-seed', 'new-seed');
+    expect(result.privateKeysMigrated).toBe(1);
+
+    const loaded = new FileKeyStore(tmpDir, { encryptionSeed: 'new-seed' }).loadKeyPair(aid);
+    expect(loaded?.private_key_pem).toBe('OLD_TO_NEW_PRIVATE');
+    expect(() => new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' }).loadKeyPair(aid)).toThrow(/decrypt failed/);
+  });
+
+  it('ChangeSeed 支持历史明文 key.json 到加密 key.json', () => {
+    const aid = 'plaintext-change-seed.agentid.pub';
+    const keyDir = join(tmpDir, 'AIDs', aid, 'private');
+    mkdirSync(keyDir, { recursive: true });
+    const keyPath = join(keyDir, 'key.json');
+    writeFileSync(keyPath, JSON.stringify({
+      private_key_pem: 'PLAINTEXT_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    }), 'utf-8');
+
+    const result = FileSecretStore.changeSeed(tmpDir, 'legacy-unused', 'new-seed');
+    expect(result.privateKeysMigrated).toBe(1);
+
+    const rawText = readFileSync(keyPath, 'utf-8');
+    const raw = JSON.parse(rawText);
+    expect(raw.private_key_pem).toBeUndefined();
+    expect(rawText).not.toContain('PLAINTEXT_PRIVATE');
+    expect(raw.private_key_protection).toMatchObject({ scheme: 'file_aes', name: 'identity/private_key' });
+    const loaded = new FileKeyStore(tmpDir, { encryptionSeed: 'new-seed' }).loadKeyPair(aid);
+    expect(loaded?.private_key_pem).toBe('PLAINTEXT_PRIVATE');
+  });
+
+  it('ChangeSeed 旧 seed 不匹配时不改写原 key.json', () => {
+    const aid = 'wrong-seed-no-destroy.agentid.pub';
+    const oldStore = new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' });
+    oldStore.saveKeyPair(aid, {
+      private_key_pem: 'KEEP_OLD_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+    const keyPath = join(tmpDir, 'AIDs', aid, 'private', 'key.json');
+    const before = readFileSync(keyPath, 'utf-8');
+
+    expect(() => FileSecretStore.changeSeed(tmpDir, 'wrong-seed', 'new-seed')).toThrow(/seed migration refused/);
+    expect(readFileSync(keyPath, 'utf-8')).toBe(before);
+    const loaded = new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' }).loadKeyPair(aid);
+    expect(loaded?.private_key_pem).toBe('KEEP_OLD_PRIVATE');
+  });
+
   it('迁移半成品可用 .seed.migrated 兜底解密旧私钥', () => {
     const oldStore = new FileSecretStore(tmpDir, 'legacy-seed');
     const aid = 'legacy.agentid.pub';
@@ -359,6 +416,64 @@ describe('FileKeyStore', () => {
     // 但通过 API 加载应能恢复
     const loaded = ks.loadKeyPair('secure.aid');
     expect(loaded!.private_key_pem).toBe(privPem);
+  });
+
+  it('loadKeyPair 会把历史明文 key.json 迁移为加密存储', () => {
+    const aid = 'legacy-plaintext.agentid.pub';
+    const keyDir = join(tmpDir, 'AIDs', aid, 'private');
+    mkdirSync(keyDir, { recursive: true });
+    const keyPath = join(keyDir, 'key.json');
+    writeFileSync(keyPath, JSON.stringify({
+      private_key_pem: 'LEGACY_PLAINTEXT_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    }), 'utf-8');
+
+    const ks = new FileKeyStore(tmpDir, { encryptionSeed: 'new-seed' });
+    const loaded = ks.loadKeyPair(aid);
+    expect(loaded?.private_key_pem).toBe('LEGACY_PLAINTEXT_PRIVATE');
+
+    const rawText = readFileSync(keyPath, 'utf-8');
+    const raw = JSON.parse(rawText);
+    expect(raw.private_key_pem).toBeUndefined();
+    expect(rawText).not.toContain('LEGACY_PLAINTEXT_PRIVATE');
+    expect(raw.private_key_protection).toMatchObject({ scheme: 'file_aes', name: 'identity/private_key' });
+  });
+
+  it('loadKeyPair seed 不匹配时抛错且不破坏 key.json', () => {
+    const aid = 'wrong-load-seed.agentid.pub';
+    const ks = new FileKeyStore(tmpDir, { encryptionSeed: 'correct-seed' });
+    ks.saveKeyPair(aid, {
+      private_key_pem: 'CORRECT_SEED_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+    const keyPath = join(tmpDir, 'AIDs', aid, 'private', 'key.json');
+    const before = readFileSync(keyPath, 'utf-8');
+
+    const wrong = new FileKeyStore(tmpDir, { encryptionSeed: 'wrong-seed' });
+    expect(() => wrong.loadKeyPair(aid)).toThrow(/decrypt failed/);
+    expect(readFileSync(keyPath, 'utf-8')).toBe(before);
+  });
+
+  it('loadPendingKeyPair 会把历史明文 pending key.json 迁移为加密存储', () => {
+    const aid = 'pending-legacy.agentid.pub';
+    const ks = new FileKeyStore(tmpDir, { encryptionSeed: 'pending-seed' });
+    const pendingDir = ks.pendingIdentityDir(aid);
+    const keyPath = join(pendingDir, 'private', 'key.json');
+    writeFileSync(keyPath, JSON.stringify({
+      private_key_pem: 'PENDING_PLAINTEXT_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    }), 'utf-8');
+
+    const loaded = ks.loadPendingKeyPair(pendingDir, aid);
+    expect(loaded?.private_key_pem).toBe('PENDING_PLAINTEXT_PRIVATE');
+    const rawText = readFileSync(keyPath, 'utf-8');
+    const raw = JSON.parse(rawText);
+    expect(raw.private_key_pem).toBeUndefined();
+    expect(rawText).not.toContain('PENDING_PLAINTEXT_PRIVATE');
+    expect(raw.private_key_protection).toMatchObject({ scheme: 'file_aes', name: 'identity/private_key' });
   });
 
   it('token 存取往返正确（存 SQLite）', () => {

@@ -129,7 +129,12 @@ function verifyPrivateKeys(root: string, oldMasterKey: Buffer): PrivateKeyMigrat
       throw new SeedMigrationError(`seed migration refused: invalid key.json for ${aid}: ${exc instanceof Error ? exc.message : String(exc)}`);
     }
     const protection = data?.private_key_protection;
-    if (!protection) continue;
+    if (!protection) {
+      if (typeof data?.private_key_pem === 'string' && data.private_key_pem) {
+        migrations.push({ aid, path: keyPath, plaintext: Buffer.from(data.private_key_pem, 'utf-8') });
+      }
+      continue;
+    }
     if (protection.scheme !== 'file_aes') continue;
     const name = 'identity/private_key';
     if (String(protection.name ?? name) !== name) {
@@ -182,6 +187,7 @@ function changeSeedBytes(
     }
     const data = JSON.parse(readFileSync(item.path, 'utf-8'));
     data.private_key_protection = record;
+    delete data.private_key_pem;
     writeFileSync(item.path, JSON.stringify(data, null, 2), 'utf-8');
     result.migrated += 1;
     result.privateKeysMigrated += 1;

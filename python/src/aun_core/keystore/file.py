@@ -6,8 +6,10 @@ import hmac
 import json
 import os
 import re
+import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -32,6 +34,21 @@ def _secure_file_permissions(path: Path, logger: "AUNLogger | NullLogger | None"
         except OSError as exc:
             if logger:
                 logger.warn("keystore", "chmod 0600 failed (path=%s): %s", path, exc)
+
+
+def _write_key_json_atomic(path: Path, data: dict[str, Any], logger: "AUNLogger | NullLogger | None" = None) -> None:
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _secure_file_permissions(tmp, logger)
+        os.replace(tmp, path)
+        _secure_file_permissions(path, logger)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _prekey_created_marker(record: dict[str, Any]) -> int:
@@ -266,12 +283,12 @@ class FileKeyStore(KeyStore):
             path = self._key_pair_path(aid)
             if path.exists():
                 key_pair = json.loads(path.read_text(encoding="utf-8"))
-                return self._restore_key_pair(aid, key_pair)
+                return self._restore_key_pair(aid, key_pair, path)
             # 旧格式 fallback
             legacy_path = self._load_legacy_split_file(aid, ".key.json")
             if legacy_path is not None:
                 key_pair = json.loads(legacy_path.read_text(encoding="utf-8"))
-                return self._restore_key_pair(aid, key_pair)
+                return self._restore_key_pair(aid, key_pair, legacy_path)
             identity = self._load_legacy_identity(aid)
             if identity is not None:
                 return {k: identity[k] for k in ("private_key_pem", "public_key_der_b64", "curve") if k in identity} or None
@@ -284,16 +301,19 @@ class FileKeyStore(KeyStore):
         lock = self._get_metadata_lock(aid)
         with lock:
             path = self._key_pair_path(aid)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            protected = copy.deepcopy(key_pair)
-            private_key_pem = protected.pop("private_key_pem", None)
-            if isinstance(private_key_pem, str) and private_key_pem:
-                scope = self._safe_aid(aid)
-                protection = _protect_field(self._seed_bytes, scope, "identity/private_key", private_key_pem.encode("utf-8"))
-                protected["private_key_protection"] = protection
-            path.write_text(json.dumps(protected, ensure_ascii=False, indent=2), encoding="utf-8")
-            _secure_file_permissions(path, self._log)
+            private_key_pem = self._save_key_pair_at_path(aid, path, key_pair)
             self._log.debug("keystore", "save_key_pair exit: elapsed=%.3fs aid=%s curve=%s has_private=%s", _t.time() - _t_start, aid, key_pair.get("curve", "-"), bool(private_key_pem))
+
+    def _save_key_pair_at_path(self, aid: str, path: Path, key_pair: dict) -> str | None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        protected = copy.deepcopy(key_pair)
+        private_key_pem = protected.pop("private_key_pem", None)
+        if isinstance(private_key_pem, str) and private_key_pem:
+            scope = self._safe_aid(aid)
+            protection = _protect_field(self._seed_bytes, scope, "identity/private_key", private_key_pem.encode("utf-8"))
+            protected["private_key_protection"] = protection
+        _write_key_json_atomic(path, protected, self._log)
+        return private_key_pem if isinstance(private_key_pem, str) else None
 
     def load_cert(self, aid: str, cert_fingerprint: str | None = None) -> str | None:
         lock = self._get_metadata_lock(aid)
@@ -346,7 +366,7 @@ class FileKeyStore(KeyStore):
             return None
         if self._aids_root.exists():
             for path in self._aids_root.iterdir():
-                if path.is_dir():
+                if path.is_dir() and not path.name.startswith("_"):
                     candidates.add(path.name)
         for legacy_root in self._legacy_roots:
             if not legacy_root.exists():
@@ -371,7 +391,7 @@ class FileKeyStore(KeyStore):
         result: list[str] = []
         if self._aids_root.exists():
             for path in sorted(self._aids_root.iterdir()):
-                if path.is_dir():
+                if path.is_dir() and not path.name.startswith("_"):
                     result.append(path.name)
         return result
 
@@ -583,28 +603,6 @@ class FileKeyStore(KeyStore):
             self._get_db(aid).save_instance_state(device_id, slot_id, updated)
             return copy.deepcopy(updated)
 
-    # ── agent.md Cache ───────────────────────────────────────
-
-    def load_agent_md_cache(self, owner_aid: str, target_aid: str) -> dict[str, Any] | None:
-        owner = str(owner_aid or "").strip()
-        target = str(target_aid or "").strip()
-        if not owner or not target:
-            return None
-        lock = self._get_metadata_lock(owner)
-        with lock:
-            record = self._get_db(owner).load_agent_md_cache(target)
-            return copy.deepcopy(record) if record is not None else None
-
-    def upsert_agent_md_cache(self, owner_aid: str, target_aid: str, **fields: Any) -> dict[str, Any]:
-        owner = str(owner_aid or "").strip()
-        target = str(target_aid or "").strip()
-        if not owner or not target:
-            return {}
-        lock = self._get_metadata_lock(owner)
-        with lock:
-            record = self._get_db(owner).upsert_agent_md_cache(target, **fields)
-            return copy.deepcopy(record)
-
     # ── Seq Tracker ───────────────────────────────────────────
 
     def save_seq(self, aid: str, device_id: str, slot_id: str, namespace: str, contiguous_seq: int) -> None:
@@ -629,23 +627,22 @@ class FileKeyStore(KeyStore):
 
     # ── key.json 解密 ────────────────────────────────────────
 
-    def _restore_key_pair(self, aid: str, key_pair: dict[str, Any]) -> dict[str, Any]:
+    def _restore_key_pair(self, aid: str, key_pair: dict[str, Any], persist_path: Path | None = None) -> dict[str, Any]:
         restored = copy.deepcopy(key_pair)
         scope = self._safe_aid(aid)
         record = restored.get("private_key_protection")
         if isinstance(record, dict):
             value = _reveal_field(self._seed_bytes, scope, "identity/private_key", record, self._log)
-            if value is not None:
-                restored["private_key_pem"] = value.decode("utf-8")
-            else:
-                # 解密失败：seed_password 不正确或 key.json 被篡改
-                restored.pop("private_key_pem", None)
-                self._log.error(
-                    "keystore",
-                    "身份 %s 的私钥解密失败：seed_password 可能不正确，或 key.json 中的加密数据已损坏。"
-                    "请检查 encryption_seed 参数是否与加密时一致。",
-                    aid,
+            if value is None:
+                raise ValueError(
+                    f"private key decrypt failed for aid {aid}: "
+                    "seed_password mismatch or key.json corrupted"
                 )
+            restored["private_key_pem"] = value.decode("utf-8")
+            return restored
+        if persist_path is not None and isinstance(restored.get("private_key_pem"), str) and restored["private_key_pem"]:
+            # 兼容历史明文 key.json：首次加载成功后立即用当前 seed_password 加密回写。
+            self._save_key_pair_at_path(aid, persist_path, restored)
         return restored
 
     # ── 路径辅助 ─────────────────────────────────────────────
@@ -661,6 +658,111 @@ class FileKeyStore(KeyStore):
 
     def _cert_version_path(self, aid: str, cert_fingerprint: str) -> Path:
         return self._identity_dir(aid) / "public" / "certs" / f"{self._safe_cert_fingerprint(cert_fingerprint)}.pem"
+
+    def _pending_root(self) -> Path:
+        return self._aids_root / "_pending"
+
+    def _clean_pending_path(self, pending_dir: str | Path) -> Path:
+        root = self._pending_root().resolve(strict=False)
+        path = Path(pending_dir).resolve(strict=False)
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"pending dir outside pending root: {pending_dir}") from exc
+        return path
+
+    def pending_identity_dir(self, aid: str) -> Path:
+        nonce = os.urandom(4).hex()
+        ts = int(time.time())
+        path = self._pending_root() / f"{self._safe_aid(aid)}-{nonce}-{ts}"
+        (path / "private").mkdir(parents=True, exist_ok=True)
+        (path / "public").mkdir(parents=True, exist_ok=True)
+        return path
+
+    def list_pending_identity_dirs(self, aid: str) -> list[Path]:
+        root = self._pending_root()
+        if not root.exists():
+            return []
+        prefix = f"{self._safe_aid(aid)}-"
+        candidates = [p for p in root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates
+
+    def save_pending_key_pair(self, pending_dir: str | Path, aid: str, key_pair: dict) -> None:
+        pending_path = self._clean_pending_path(pending_dir)
+        lock = self._get_metadata_lock(aid)
+        with lock:
+            self._save_key_pair_at_path(aid, pending_path / "private" / "key.json", key_pair)
+
+    def load_pending_key_pair(self, pending_dir: str | Path, aid: str) -> dict | None:
+        pending_path = self._clean_pending_path(pending_dir)
+        key_path = pending_path / "private" / "key.json"
+        if not key_path.exists():
+            return None
+        try:
+            data = json.loads(key_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return self._restore_key_pair(aid, data, key_path)
+
+    def save_pending_cert(self, pending_dir: str | Path, cert_pem: str) -> None:
+        pending_path = self._clean_pending_path(pending_dir)
+        cert_path = pending_path / "public" / "cert.pem"
+        cert_path.parent.mkdir(parents=True, exist_ok=True)
+        cert_path.write_text(cert_pem, encoding="utf-8")
+
+    def promote_pending_identity(self, pending_dir: str | Path, aid: str) -> Path:
+        pending_path = self._clean_pending_path(pending_dir)
+        self._ensure_pending_key_pair_protected(pending_path, aid)
+        target = self._identity_dir(aid)
+        if target.exists():
+            raise FileExistsError(f"promote_pending_identity target exists: {target}")
+
+        safe = self._safe_aid(aid)
+        with self._aid_dbs_lock:
+            db = self._aid_dbs.pop(safe, None)
+        if db is not None:
+            db.close()
+
+        self._aids_root.mkdir(parents=True, exist_ok=True)
+        pending_path.rename(target)
+        return target
+
+    def discard_pending_identity(self, pending_dir: str | Path) -> None:
+        pending_path = self._clean_pending_path(pending_dir)
+        shutil.rmtree(pending_path, ignore_errors=True)
+
+    def _ensure_pending_key_pair_protected(self, pending_path: Path, aid: str) -> None:
+        key_path = pending_path / "private" / "key.json"
+        if not key_path.exists():
+            raise FileNotFoundError(f"pending identity missing key pair for {aid}")
+        data = json.loads(key_path.read_text(encoding="utf-8"))
+        private_key_pem = data.get("private_key_pem")
+        if isinstance(private_key_pem, str) and private_key_pem:
+            raise ValueError(f"pending identity private key is plaintext for {aid}")
+        if not isinstance(data.get("private_key_protection"), dict):
+            raise ValueError(f"pending identity private key is not encrypted for {aid}")
+
+    def cleanup_pending_dirs(self, max_age_ms: int = 600_000) -> int:
+        root = self._pending_root()
+        if not root.exists():
+            return 0
+        now_ms = time.time() * 1000
+        removed = 0
+        for path in root.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                age_ms = now_ms - (path.stat().st_mtime * 1000)
+                if age_ms < max_age_ms:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+            except OSError as exc:
+                self._log.warn("keystore", "cleanup pending dir failed (path=%s): %s", path, exc)
+        return removed
 
     def _identity_path(self, aid: str) -> Path:
         return self._legacy_file_path(self._root, aid, ".json")
@@ -685,10 +787,14 @@ class FileKeyStore(KeyStore):
     def _load_identity_from_split_files(self, aid: str) -> dict | None:
         key_pair = self.load_key_pair(aid)
         cert = self.load_cert(aid)
-        # 直接从 DB 读取 tokens + KV
-        db = self._get_db(aid)
-        tokens = db.get_all_tokens()
-        kv = db.get_all_metadata()
+        db_path = self._identity_dir(aid) / "aun.db"
+        if db_path.exists():
+            db = self._get_db(aid)
+            tokens = db.get_all_tokens()
+            kv = db.get_all_metadata()
+        else:
+            tokens = {}
+            kv = {}
         has_meta = bool(tokens or kv)
         if key_pair is None and cert is None and not has_meta:
             return None

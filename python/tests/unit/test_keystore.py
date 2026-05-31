@@ -195,6 +195,84 @@ class TestFileKeyStore:
         assert "private_key_protection" in raw
         assert raw["private_key_protection"]["persisted"] is True
 
+    def test_load_key_pair_migrates_legacy_plaintext_key_json(self, tmp_path):
+        """历史明文 key.json 首次加载后应立即加密回写。"""
+        aid = "legacy-plaintext.agentid.pub"
+        key_file = tmp_path / "AIDs" / aid / "private" / "key.json"
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text(json.dumps({
+            "private_key_pem": "LEGACY_PLAINTEXT_PRIVATE",
+            "public_key_der_b64": "pub",
+            "curve": "P-256",
+        }), encoding="utf-8")
+
+        ks = FileKeyStore(tmp_path, encryption_seed="new-seed")
+        loaded = ks.load_key_pair(aid)
+        assert loaded["private_key_pem"] == "LEGACY_PLAINTEXT_PRIVATE"
+
+        raw_text = key_file.read_text(encoding="utf-8")
+        raw = json.loads(raw_text)
+        assert "private_key_pem" not in raw
+        assert "LEGACY_PLAINTEXT_PRIVATE" not in raw_text
+        assert raw["private_key_protection"]["scheme"] == "file_aes"
+
+    def test_load_key_pair_wrong_seed_preserves_key_json(self, tmp_path):
+        """seed_password 不匹配可报错，但不能破坏原 key.json。"""
+        aid = "wrong-load-seed.agentid.pub"
+        ks = FileKeyStore(tmp_path, encryption_seed="correct-seed")
+        ks.save_key_pair(aid, {
+            "private_key_pem": "CORRECT_SEED_PRIVATE",
+            "public_key_der_b64": "pub",
+            "curve": "P-256",
+        })
+        key_file = tmp_path / "AIDs" / aid / "private" / "key.json"
+        before = key_file.read_text(encoding="utf-8")
+
+        wrong = FileKeyStore(tmp_path, encryption_seed="wrong-seed")
+        with pytest.raises(ValueError, match="private key decrypt failed"):
+            wrong.load_key_pair(aid)
+        assert key_file.read_text(encoding="utf-8") == before
+        assert ks.load_key_pair(aid)["private_key_pem"] == "CORRECT_SEED_PRIVATE"
+
+    def test_load_pending_key_pair_migrates_legacy_plaintext(self, tmp_path):
+        """pending key.json 即使是历史明文，也应在读取时加密回写。"""
+        aid = "pending-legacy.agentid.pub"
+        ks = FileKeyStore(tmp_path, encryption_seed="pending-seed")
+        pending_dir = ks.pending_identity_dir(aid)
+        key_file = pending_dir / "private" / "key.json"
+        key_file.write_text(json.dumps({
+            "private_key_pem": "PENDING_PLAINTEXT_PRIVATE",
+            "public_key_der_b64": "pub",
+            "curve": "P-256",
+        }), encoding="utf-8")
+
+        loaded = ks.load_pending_key_pair(pending_dir, aid)
+        assert loaded["private_key_pem"] == "PENDING_PLAINTEXT_PRIVATE"
+        raw_text = key_file.read_text(encoding="utf-8")
+        raw = json.loads(raw_text)
+        assert "private_key_pem" not in raw
+        assert "PENDING_PLAINTEXT_PRIVATE" not in raw_text
+        assert raw["private_key_protection"]["scheme"] == "file_aes"
+
+    def test_load_pending_key_pair_wrong_seed_preserves_pending(self, tmp_path):
+        """pending 私钥 seed 不匹配时保留 pending 数据，供正确 seed 后续恢复。"""
+        aid = "pending-wrong-seed.agentid.pub"
+        correct = FileKeyStore(tmp_path, encryption_seed="correct-seed")
+        pending_dir = correct.pending_identity_dir(aid)
+        correct.save_pending_key_pair(pending_dir, aid, {
+            "private_key_pem": "PENDING_CORRECT_PRIVATE",
+            "public_key_der_b64": "pub",
+            "curve": "P-256",
+        })
+        key_file = pending_dir / "private" / "key.json"
+        before = key_file.read_text(encoding="utf-8")
+
+        wrong = FileKeyStore(tmp_path, encryption_seed="wrong-seed")
+        with pytest.raises(ValueError, match="private key decrypt failed"):
+            wrong.load_pending_key_pair(pending_dir, aid)
+        assert key_file.exists()
+        assert key_file.read_text(encoding="utf-8") == before
+
     def test_load_nonexistent_aid(self, tmp_path):
         ks = FileKeyStore(tmp_path, encryption_seed="seed")
         assert ks.load_key_pair("nonexistent.agentid.pub") is None

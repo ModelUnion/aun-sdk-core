@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives import serialization
 from . import error_codes as codes
 from ._cert_utils import cert_common_name, cert_time_error, public_key_der, sign_bytes, verify_signature
 from .auth import AuthFlow
+from .register_flow import RegisterFlow
 from .aid import AID
 from .config import normalize_device_id, normalize_slot_id, resolve_verify_ssl_from_env
 from .crypto import CryptoProvider
@@ -138,11 +139,18 @@ class AIDStore:
             net=self._net,
         )
         self._auth = AuthFlow(
-            keystore=self._keystore,
+            token_store=self._keystore,
             crypto=CryptoProvider(),
             device_id=self.device_id,
             slot_id=self.slot_id,
             root_ca_path=self._root_ca_path,
+            verify_ssl=self._verify_ssl,
+            logger=self._log,
+            net=self._net,
+        )
+        self._register_flow = RegisterFlow(
+            keystore=self._keystore,
+            crypto=CryptoProvider(),
             verify_ssl=self._verify_ssl,
             logger=self._log,
             net=self._net,
@@ -277,7 +285,14 @@ class AIDStore:
         try:
             self._auth._validate_aid_name(target)
             gateway_url = await self._resolved_gateway(target)
-            await self._auth.register_aid(gateway_url, target)
+            result = await self._register_flow.register_aid(gateway_url, target)
+            # 私钥由 AIDStore 写入，RegisterFlow 不写 key.json
+            cert_pem = str(result.get("cert") or "")
+            if cert_pem:
+                self._keystore.save_cert(target, cert_pem)
+            key_pair = {k: result[k] for k in ("private_key_pem", "public_key_der_b64", "curve") if result.get(k)}
+            if key_pair:
+                self._keystore.save_key_pair(target, key_pair)
             self._log.debug("aid_store", "register exit: aid=%s gateway=%s", target, gateway_url)
             return result_ok({"registered": True})
         except IdentityConflictError as exc:

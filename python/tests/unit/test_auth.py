@@ -52,7 +52,7 @@ def _make_auth_flow(root_pem: str) -> AuthFlow:
     root_path.write_text(root_pem, encoding="utf-8")
     keystore = FileKeyStore(temp_root / "aun")
     return AuthFlow(
-        keystore=keystore,
+        token_store=keystore,
         crypto=CryptoProvider(),
         connection_factory=lambda url: None,
         root_ca_path=str(root_path),
@@ -70,7 +70,7 @@ async def test_default_connection_factory_respects_verify_ssl_false(monkeypatch,
 
     monkeypatch.setattr("aun_core.auth.websockets.connect", fake_connect)
     flow = AuthFlow(
-        keystore=FileKeyStore(tmp_path),
+        token_store=FileKeyStore(tmp_path),
         crypto=CryptoProvider(),
         verify_ssl=False,
     )
@@ -95,7 +95,7 @@ async def test_initialize_with_token_normalizes_empty_instance_context(tmp_path:
             return {"status": "ok"}
 
     flow = AuthFlow(
-        keystore=FileKeyStore(tmp_path / "aun"),
+        token_store=FileKeyStore(tmp_path / "aun"),
         crypto=CryptoProvider(),
         verify_ssl=False,
     )
@@ -439,7 +439,7 @@ def test_verify_peer_cert_revoked():
 def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
     keystore = FileKeyStore(tmp_path / "aun")
     flow = AuthFlow(
-        keystore=keystore,
+        token_store=keystore,
         crypto=CryptoProvider(),
         connection_factory=lambda url: None,
         device_id="device-1",
@@ -475,7 +475,7 @@ def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
 def test_initialize_with_token_ignores_external_legacy_capability_override(tmp_path):
     keystore = FileKeyStore(tmp_path / "aun")
     flow = AuthFlow(
-        keystore=keystore,
+        token_store=keystore,
         crypto=CryptoProvider(),
         connection_factory=lambda url: None,
         device_id="device-1",
@@ -530,12 +530,18 @@ def test_load_identity_prefers_instance_state_tokens(tmp_path):
         "access_token_expires_at": 123456,
     })
     flow = AuthFlow(
-        keystore=keystore,
+        token_store=keystore,
         crypto=CryptoProvider(),
         connection_factory=lambda url: None,
         device_id="device-1",
         slot_id="slot-a",
     )
+    flow.set_identity({
+        "aid": aid,
+        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+        "public_key_der_b64": "pub",
+        "curve": "P-256",
+    })
 
     loaded = flow.load_identity(aid)
 
@@ -562,12 +568,18 @@ def test_load_identity_empty_device_id_prefers_default_device_state_tokens(tmp_p
         "access_token_expires_at": 234567,
     })
     flow = AuthFlow(
-        keystore=keystore,
+        token_store=keystore,
         crypto=CryptoProvider(),
         connection_factory=lambda url: None,
         device_id="",
         slot_id="slot-a",
     )
+    flow.set_identity({
+        "aid": aid,
+        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+        "public_key_der_b64": "pub",
+        "curve": "P-256",
+    })
 
     loaded = flow.load_identity(aid)
 
@@ -581,7 +593,7 @@ def test_persist_identity_empty_device_id_saves_default_device_state(tmp_path):
     default_device_id = normalize_device_id("", tmp_path / "aun")
     aid = "persist-empty-device.example.aid"
     flow = AuthFlow(
-        keystore=keystore,
+        token_store=keystore,
         crypto=CryptoProvider(),
         connection_factory=lambda url: None,
         device_id="",

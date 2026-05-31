@@ -1052,16 +1052,8 @@ class E2EEManager:
                                       message.get("from", "?"))
                 raise E2EEError(f"prekey not found: {prekey_id}")
 
-            # 加载接收方自己的 identity 私钥
-            my_aid = self._current_aid()
-            key_pair = keystore.load_key_pair(my_aid)
-            if not key_pair or "private_key_pem" not in key_pair:
-                raise E2EEError("Identity private key not found")
-            my_identity_private = serialization.load_pem_private_key(
-                key_pair["private_key_pem"].encode("utf-8"), password=None
-            )
-            if not isinstance(my_identity_private, ec.EllipticCurvePrivateKey):
-                raise E2EEError("Identity private key is not EC key")
+            # AID 身份私钥只能来自调用方注入的内存身份，不能从 KeyStore 读取。
+            my_identity_private = self._load_local_identity_private("identity")
 
             # 获取发送方公钥（四路 ECDH 需要）
             from_aid = message.get("from") or (payload.get("aad") or {}).get("from")
@@ -1143,15 +1135,8 @@ class E2EEManager:
             keystore = self._keystore()
             if not keystore:
                 raise E2EEError("Keystore unavailable")
-            my_aid = self._current_aid()
-            key_pair = keystore.load_key_pair(my_aid)
-            if not key_pair or "private_key_pem" not in key_pair:
-                raise E2EEError("Private key not found")
-            private_key = serialization.load_pem_private_key(
-                key_pair["private_key_pem"].encode("utf-8"), password=None
-            )
-            if not isinstance(private_key, ec.EllipticCurvePrivateKey):
-                raise E2EEError("Private key is not EC key")
+            # AID 身份私钥只能来自调用方注入的内存身份，不能从 KeyStore 读取。
+            private_key = self._load_local_identity_private("identity")
 
             # 获取发送方公钥（2DH 需要）
             from_aid = message.get("from") or (payload.get("aad") or {}).get("from")
@@ -1432,13 +1417,17 @@ class E2EEManager:
 
     def _load_sender_identity_private(self) -> ec.EllipticCurvePrivateKey:
         """加载发送方自己的 identity 私钥（用于四路 ECDH）"""
+        return self._load_local_identity_private("sender identity")
+
+    def _load_local_identity_private(self, label: str) -> ec.EllipticCurvePrivateKey:
+        """从注入的内存身份加载 AID 身份私钥，不访问 KeyStore。"""
         identity = self._identity_fn()
-        private_key_pem = identity.get("private_key_pem")
+        private_key_pem = identity.get("private_key_pem") if isinstance(identity, dict) else None
         if not private_key_pem:
-            raise E2EEError("sender identity private key unavailable")
+            raise E2EEError(f"{label} private key unavailable")
         pk = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
         if not isinstance(pk, ec.EllipticCurvePrivateKey):
-            raise E2EEError("sender identity key is not EC key")
+            raise E2EEError(f"{label} key is not EC key")
         return pk
 
     def _local_identity_fingerprint(self) -> str:

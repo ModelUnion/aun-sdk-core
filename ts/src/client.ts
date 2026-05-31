@@ -36,7 +36,7 @@ import {
 } from './errors.js';
 import { EventDispatcher, type EventPayload, type Subscription, type EventHandler } from './events.js';
 import { FileKeyStore } from './keystore/file.js';
-import type { KeyStore } from './keystore/index.js';
+import type { TokenStore } from './keystore/index.js';
 import { AUNLogger, type ModuleLogger } from './logger.js';
 import { normalizeGroupId } from './group-id.js';
 
@@ -668,7 +668,7 @@ export class AUNClient {
   private _auth: AuthFlow;
 
   /** 密钥存储 */
-  private _keystore: KeyStore;
+  private _tokenStore: TokenStore;
 
   /** 会话参数（重连用） */
   private _sessionParams: ConnectParams | null = null;
@@ -804,34 +804,21 @@ export class AUNClient {
     });
     this._discovery = new GatewayDiscovery({ verifySsl: this._configModel.verifySsl, logger: this._clientLog, net: dnsNet });
 
-    const keystore = new FileKeyStore(
+    const tokenStore = new FileKeyStore(
       this._configModel.aunPath,
       {
         logger: this._logger.for('aun_core.keystore'),
         secretStoreLogger: this._logger.for('aun_core.secret-store'),
       },
     );
-    this._keystore = keystore;
-
-    // 启动时被动清理 registerAid 留下的孤儿临时目录（>10 分钟）
-    try {
-      const cleanup = (keystore as unknown as { cleanupPendingDirs?: (ms: number) => number }).cleanupPendingDirs;
-      if (typeof cleanup === 'function') {
-        const removed = cleanup.call(keystore, 600_000);
-        if (removed > 0) {
-          this._clientLog.info(`_pending cleanup removed=${removed}`);
-        }
-      }
-    } catch (err) {
-      this._clientLog.warn(`_pending cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    this._tokenStore = tokenStore;
 
     this._slotId = inputAid?.slotId || 'default';
     this._connectDeliveryMode = normalizeDeliveryModeConfig({ mode: 'fanout' });
     this._defaultConnectDeliveryMode = { ...this._connectDeliveryMode };
 
     this._auth = new AuthFlow({
-      keystore,
+      tokenStore,
       crypto: new CryptoProvider(),
       aid: initAid,
       deviceId: this._deviceId,
@@ -863,6 +850,7 @@ export class AUNClient {
           public_key_der_b64: inputAid.publicKey,
           cert: inputAid.certPem,
         };
+        this._auth.setIdentity(this._identity);
         this._state = 'standby';
       }
     }
@@ -970,10 +958,10 @@ export class AUNClient {
     const nextConfig = configFromMap(rawConfig);
 
     try {
-      const close = (this._keystore as unknown as { close?: () => void }).close;
-      if (typeof close === 'function') close.call(this._keystore);
+      const close = (this._tokenStore as unknown as { close?: () => void }).close;
+      if (typeof close === 'function') close.call(this._tokenStore);
     } catch {
-      // best-effort cleanup before switching keystore roots
+      // best-effort cleanup before switching tokenStore roots
     }
 
     this._configModel = nextConfig;
@@ -1002,16 +990,16 @@ export class AUNClient {
     });
     this._discovery = new GatewayDiscovery({ verifySsl: nextConfig.verifySsl, logger: this._clientLog, net: dnsNet });
 
-    const keystore = new FileKeyStore(
+    const tokenStore = new FileKeyStore(
       nextConfig.aunPath,
       {
         logger: this._logger.for('aun_core.keystore'),
         secretStoreLogger: this._logger.for('aun_core.secret-store'),
       },
     );
-    this._keystore = keystore;
+    this._tokenStore = tokenStore;
     this._auth = new AuthFlow({
-      keystore,
+      tokenStore,
       crypto: new CryptoProvider(),
       aid: aid.aid,
       deviceId: this._deviceId,
@@ -1050,6 +1038,8 @@ export class AUNClient {
       public_key_der_b64: aid.publicKey,
       cert: aid.certPem,
     };
+    // 注入内存私钥到 AuthFlow，禁止 AuthFlow 内部再走 keystore 解密
+    this._auth.setIdentity(this._identity);
     this._state = 'standby';
     this._closing = false;
     this._lastError = null;
@@ -1120,10 +1110,7 @@ export class AUNClient {
   }
 
   private async _ensureAgentMdUploadToken(aid: string, gatewayUrl: string): Promise<string> {
-    let identity = this._auth.loadIdentityOrNone(aid);
-    if (!identity && this._identity && String(this._identity.aid ?? '') === aid) {
-      identity = this._identity;
-    }
+    let identity = this._identity && String(this._identity.aid ?? '') === aid ? this._identity : null;
     if (!identity) {
       throw new StateError('no local identity found, register or load an AID first');
     }
@@ -1310,7 +1297,7 @@ export class AUNClient {
       let resolvedCert = String(certPem ?? '').trim();
       if (!resolvedCert) {
         try {
-          resolvedCert = String(this._keystore.loadCert(target) ?? '').trim();
+          resolvedCert = String(this._tokenStore.loadCert(target) ?? '').trim();
         } catch {
           resolvedCert = '';
         }
@@ -2008,8 +1995,8 @@ export class AUNClient {
       this._stopBackgroundTasks();
       this._stopReconnect();
       if (this.state === ConnectionState.NO_IDENTITY || this.state === ConnectionState.CLOSED) {
-        const closableKeyStore = this._keystore as KeyStore & { close?: () => void };
-        closableKeyStore.close?.();
+        const closableStore = this._tokenStore as TokenStore & { close?: () => void };
+        closableStore.close?.();
         this._state = 'closed';
         this._logger.close();
         this._resetSeqTrackingState();
@@ -2017,8 +2004,8 @@ export class AUNClient {
         return;
       }
       await this._transport.close();
-      const closableKeyStore = this._keystore as KeyStore & { close?: () => void };
-      closableKeyStore.close?.();
+      const closableStore = this._tokenStore as TokenStore & { close?: () => void };
+      closableStore.close?.();
       this._state = 'closed';
       this._logger.close();
       await this._dispatcher.publish('state_change', { state: this._publicState(this._state) });
@@ -3599,8 +3586,8 @@ export class AUNClient {
     const policySnapshot = String(d.policy_snapshot ?? '').trim();
 
     // 1. 验证 prev_state_hash 连续性
-    const loadFn = this._keystore.loadGroupState;
-    const localState = loadFn ? loadFn.call(this._keystore, groupId) : null;
+    const loadFn = this._tokenStore.loadGroupState;
+    const localState = loadFn ? loadFn.call(this._tokenStore, groupId) : null;
     if (localState && localState.state_hash && localState.state_hash !== prevStateHash) {
       this._clientLog.warn(`state_hash chain discontinuous group=${groupId} local_sv=${localState.state_version} event_sv=${stateVersion}`);
       // 回源同步
@@ -3626,9 +3613,9 @@ export class AUNClient {
               return;
             }
           }
-          const saveFn = this._keystore.saveGroupState;
+          const saveFn = this._tokenStore.saveGroupState;
           if (saveFn) {
-            saveFn.call(this._keystore, groupId, sv, sHash, sEpoch, sMembersJson || membershipSnapshot, sPolicyJson || policySnapshot);
+            saveFn.call(this._tokenStore, groupId, sv, sHash, sEpoch, sMembersJson || membershipSnapshot, sPolicyJson || policySnapshot);
           }
         }
       } catch (exc) {
@@ -3650,9 +3637,9 @@ export class AUNClient {
     }
 
     // 3. 更新本地存储
-    const saveFn = this._keystore.saveGroupState;
+    const saveFn = this._tokenStore.saveGroupState;
     if (saveFn) {
-      saveFn.call(this._keystore, groupId, stateVersion, stateHash, keyEpoch, membershipSnapshot, policySnapshot);
+      saveFn.call(this._tokenStore, groupId, stateVersion, stateHash, keyEpoch, membershipSnapshot, policySnapshot);
     }
     this._clientLog.debug(`_onGroupStateCommitted exit: elapsed=${Date.now() - tStart}ms group=${groupId}`);
     } catch (err) {
@@ -3827,7 +3814,7 @@ export class AUNClient {
 
     try {
       // peer 证书只存版本目录，不覆盖 cert.pem
-      this._keystore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
+      this._tokenStore.saveCert(aid, certPem, certFingerprint, { makeActive: false });
     } catch (exc) {
       this._clientLog.error(`failed to write cert to keystore (aid=${aid}, fp=${certFingerprint ?? ''}): ${formatCaughtError(exc)}`, exc instanceof Error ? exc : undefined);
     }
@@ -4088,9 +4075,9 @@ export class AUNClient {
     if (!this._aid) return;
     try {
       // 优先从 seq_tracker 表按行读取
-      const loadAll = this._keystore.loadAllSeqs;
+      const loadAll = this._tokenStore.loadAllSeqs;
       if (typeof loadAll === 'function') {
-        let state = loadAll.call(this._keystore, this._aid, this._deviceId, this._slotId);
+        let state = loadAll.call(this._tokenStore, this._aid, this._deviceId, this._slotId);
         if (state && Object.keys(state).length > 0) {
           state = this._migrateSeqStateGroupIds(state);
           this._seqTracker.restoreState(state);
@@ -4098,11 +4085,9 @@ export class AUNClient {
         }
       }
       // fallback: 从旧 instance_state JSON blob 恢复
-      const loader = (this._keystore as KeyStore & {
-        loadInstanceState?: (aid: string, deviceId: string, slotId?: string) => MetadataRecord | null;
-      }).loadInstanceState;
+      const loader = this._tokenStore.loadInstanceState;
       if (typeof loader === 'function') {
-        const instanceState = loader.call(this._keystore, this._aid, this._deviceId, this._slotId);
+        const instanceState = loader.call(this._tokenStore, this._aid, this._deviceId, this._slotId);
         if (instanceState && typeof instanceState.seq_tracker_state === 'object') {
           let state = instanceState.seq_tracker_state as Record<string, number>;
           state = this._migrateSeqStateGroupIds(state);
@@ -4151,18 +4136,16 @@ export class AUNClient {
     }
     this._clientLog.info(`SeqTracker group_id migration: ${Object.keys(renameMap).length} namespaces rewritten`);
     // 落盘
-    const saver = this._keystore.saveSeq;
-    const deleter = (this._keystore as KeyStore & {
-      deleteSeq?: (aid: string, deviceId: string, slotId: string, namespace: string) => void;
-    }).deleteSeq;
+    const saver = this._tokenStore.saveSeq;
+    const deleter = this._tokenStore.deleteSeq;
     if (typeof saver === 'function' && this._aid) {
       for (const [oldNs, newNs] of Object.entries(renameMap)) {
         if (typeof deleter === 'function') {
-          try { deleter.call(this._keystore, this._aid, this._deviceId, this._slotId, oldNs); } catch (e) {
+          try { deleter.call(this._tokenStore, this._aid, this._deviceId, this._slotId, oldNs); } catch (e) {
             this._clientLog.debug(`delete old seq ns failed: ns=${oldNs} err=${formatCaughtError(e)}`);
           }
         }
-        try { saver.call(this._keystore, this._aid, this._deviceId, this._slotId, newNs, newState[newNs]); } catch (e) {
+        try { saver.call(this._tokenStore, this._aid, this._deviceId, this._slotId, newNs, newState[newNs]); } catch (e) {
           this._clientLog.debug(`write new seq ns failed: ns=${newNs} err=${formatCaughtError(e)}`);
         }
       }
@@ -4208,24 +4191,17 @@ export class AUNClient {
     if (Object.keys(state).length === 0) return;
     try {
       // 优先按行写入 seq_tracker 表
-      const saveFn = this._keystore.saveSeq;
+      const saveFn = this._tokenStore.saveSeq;
       if (typeof saveFn === 'function') {
         for (const [ns, seq] of Object.entries(state)) {
-          saveFn.call(this._keystore, this._aid, this._deviceId, this._slotId, ns, seq);
+          saveFn.call(this._tokenStore, this._aid, this._deviceId, this._slotId, ns, seq);
         }
         return;
       }
       // fallback: 旧版 updateInstanceState JSON blob
-      const updater = (this._keystore as KeyStore & {
-        updateInstanceState?: (
-          aid: string,
-          deviceId: string,
-          slotId: string,
-          updater: (metadata: MetadataRecord) => MetadataRecord | void,
-        ) => MetadataRecord;
-      }).updateInstanceState;
+      const updater = this._tokenStore.updateInstanceState;
       if (typeof updater === 'function') {
-        updater.call(this._keystore, this._aid, this._deviceId, this._slotId, (metadata) => {
+        updater.call(this._tokenStore, this._aid, this._deviceId, this._slotId, (metadata) => {
           metadata.seq_tracker_state = state;
           return metadata;
         });
@@ -4247,13 +4223,13 @@ export class AUNClient {
     if (!this._aid || !ns) return;
     const seq = this._seqTracker.getContiguousSeq(ns);
     try {
-      if (seq > 0 && typeof this._keystore.saveSeq === 'function') {
-        this._keystore.saveSeq(this._aid, this._deviceId, this._slotId, ns, seq);
+      if (seq > 0 && typeof this._tokenStore.saveSeq === 'function') {
+        this._tokenStore.saveSeq(this._aid, this._deviceId, this._slotId, ns, seq);
         return;
       }
-      const deleteSeq = this._keystore.deleteSeq;
+      const deleteSeq = this._tokenStore.deleteSeq;
       if (seq <= 0 && typeof deleteSeq === 'function') {
-        deleteSeq.call(this._keystore, this._aid, this._deviceId, this._slotId, ns);
+        deleteSeq.call(this._tokenStore, this._aid, this._deviceId, this._slotId, ns);
         return;
       }
       if (seq > 0) {
@@ -4510,14 +4486,6 @@ export class AUNClient {
     }
 
     let identity = this._identity;
-    if (!identity) {
-      try {
-        identity = this._keystore.loadIdentity(this._aid);
-        if (identity) this._identity = identity;
-      } catch {
-        identity = null;
-      }
-    }
     // 私钥由 AIDStore 管理，直接从 _currentAid 读取明文私钥
     const currentAid = this._currentAid;
     if (!currentAid?.privateKeyPem) {
@@ -4538,10 +4506,10 @@ export class AUNClient {
     const pubDer = crypto.createPublicKey(privateKey).export({ format: 'der', type: 'spki' }) as Buffer;
     const aidPubDer = new Uint8Array(pubDer);
 
-    const storeProvider = this._keystore as KeyStore & {
+    const storeProvider = this._tokenStore as TokenStore & {
       getV2KeyStore?: (aid: string) => V2KeyStore;
     };
-    const v2Store = storeProvider.getV2KeyStore?.call(this._keystore, this._aid);
+    const v2Store = storeProvider.getV2KeyStore?.call(this._tokenStore, this._aid);
     if (!v2Store) {
       throw new StateError('V2 key store is unavailable for current keystore');
     }
@@ -4551,6 +4519,33 @@ export class AUNClient {
     await this._v2Session.ensureRegistered(this._v2CallFn());
     this._clientLog.debug(`V2 session initialized aid=${this._aid} device=${this._deviceId}`);
     // 群 state proposal 由服务端在 client.online 时定向通知。
+  }
+
+  private _currentV2KeyStore(): V2KeyStore {
+    if (this._v2KeyStore) return this._v2KeyStore;
+    if (!this._aid) throw new StateError('V2 key store requires a loaded AID');
+    const storeProvider = this._tokenStore as TokenStore & {
+      getV2KeyStore?: (aid: string) => V2KeyStore;
+    };
+    const v2Store = storeProvider.getV2KeyStore?.call(this._tokenStore, this._aid);
+    if (!v2Store) {
+      throw new StateError('V2 key store is unavailable for current identity');
+    }
+    this._v2KeyStore = v2Store;
+    return v2Store;
+  }
+
+  private _saveGroupIdentityToV2(
+    groupAid: string,
+    identity: { private_key_pem: string; public_key_der_b64: string },
+  ): void {
+    const privateKeyPem = String(identity.private_key_pem ?? '').trim();
+    const publicKeyDerB64 = String(identity.public_key_der_b64 ?? '').trim();
+    if (!groupAid || !privateKeyPem || !publicKeyDerB64) {
+      throw new StateError('group identity is incomplete');
+    }
+    const pubDer = new Uint8Array(Buffer.from(publicKeyDerB64, 'base64'));
+    this._currentV2KeyStore().saveGroupIdentity(this._deviceId, groupAid, privateKeyPem, pubDer);
   }
 
   private async _v2TrustedIKPubDer(aid: string): Promise<Uint8Array> {
@@ -6907,11 +6902,9 @@ export class AUNClient {
     if (this._gatewayUrl) return this._gatewayUrl;
 
     try {
-      const loadMetadata = (this._keystore as KeyStore & {
-        loadMetadata?: (aid: string) => Record<string, unknown> | null;
-      }).loadMetadata;
+      const loadMetadata = this._tokenStore.loadMetadata;
       const cachedGateway = typeof loadMetadata === 'function'
-        ? String(loadMetadata.call(this._keystore, resolvedAid)?.gateway_url ?? '').trim()
+        ? String(loadMetadata.call(this._tokenStore, resolvedAid)?.gateway_url ?? '').trim()
         : '';
       if (cachedGateway) {
         this._gatewayUrl = cachedGateway;
@@ -6933,11 +6926,9 @@ export class AUNClient {
         const gateway = await this._discovery.discover(url);
         this._gatewayUrl = gateway;
         try {
-          const saveMetadata = (this._keystore as KeyStore & {
-            saveMetadata?: (aid: string, metadata: Record<string, unknown>) => void;
-          }).saveMetadata;
+          const saveMetadata = this._tokenStore.saveMetadata;
           if (typeof saveMetadata === 'function') {
-            saveMetadata.call(this._keystore, resolvedAid, { gateway_url: gateway, gateway_cached_at: Date.now() });
+            saveMetadata.call(this._tokenStore, resolvedAid, { gateway_url: gateway, gateway_cached_at: Date.now() });
           }
         } catch {
           // 缓存写入失败不影响连接。
@@ -6983,9 +6974,8 @@ export class AUNClient {
 
   /** 连接后同步身份信息 */
   private _syncIdentityAfterConnect(accessToken: string): void {
-    const identity = this._auth.loadIdentityOrNone(this._aid ?? undefined);
+    const identity = this._identity;
     if (identity === null) {
-      this._identity = null;
       return;
     }
     identity.access_token = accessToken;
@@ -6995,9 +6985,7 @@ export class AUNClient {
     const persistIdentity = (this._auth as any)._persistIdentity as ((value: IdentityRecord) => void) | undefined;
     if (typeof persistIdentity === 'function') {
       persistIdentity.call(this._auth, identity);
-      return;
     }
-    this._keystore.saveIdentity(String(identity.aid), identity);
   }
 
   // ── 内部：参数处理 ────────────────────────────────────────
@@ -7180,7 +7168,7 @@ export class AUNClient {
           return;
         }
 
-        let identity = this._identity ?? this._auth.loadIdentityOrNone() ?? null;
+        let identity = this._identity;
         if (identity === null) {
           scheduleNext();
           return;
@@ -7550,42 +7538,36 @@ export class AUNClient {
   // ── Named Group（命名群）高层 API ────────────────────────────
 
   /**
-   * 创建命名群：本地生成 P-256 keypair，调用 group.create 传入 public_key，
-   * 服务端签发群 AID 证书，返回后将证书和私钥存入 keystore。
+   * 创建命名群：群/P2P 私钥由 V2 数据库存储，不写入 AID 身份私钥存储。
    */
   private async createNamedGroup(groupName: string, opts: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const tStart = Date.now();
     this._clientLog.debug(`createNamedGroup enter: groupName=${groupName}`);
     try {
-    const cp = new CryptoProvider();
-    const identity = cp.generateIdentity();
-    const params: Record<string, JsonValue> = {};
-    for (const [k, v] of Object.entries(opts)) {
-      params[k] = v as JsonValue;
-    }
-    params.group_name = groupName;
-    params.public_key = identity.public_key_der_b64;
-    params.curve = 'P-256';
-
-    const result = await this.call('group.create', params) as Record<string, unknown>;
-
-    const groupInfo = result?.group as Record<string, unknown> | undefined;
-    const aidCert = result?.aid_cert as Record<string, unknown> | undefined;
-    const groupAid = String(groupInfo?.group_aid ?? '');
-    if (groupAid && aidCert) {
-      this._keystore.saveIdentity(groupAid, {
-        private_key_pem: identity.private_key_pem,
-        public_key: identity.public_key_der_b64,
-        curve: 'P-256',
-        type: 'group_identity',
-      });
-      const certPem = String(aidCert.cert ?? '');
-      if (certPem) {
-        this._keystore.saveCert(groupAid, certPem);
+      const cp = new CryptoProvider();
+      const identity = cp.generateIdentity();
+      const params: Record<string, JsonValue> = {};
+      for (const [k, v] of Object.entries(opts)) {
+        params[k] = v as JsonValue;
       }
-    }
-    this._clientLog.debug(`createNamedGroup exit: elapsed=${Date.now() - tStart}ms groupAid=${groupAid}`);
-    return result;
+      params.group_name = groupName;
+      params.public_key = identity.public_key_der_b64;
+      params.curve = 'P-256';
+
+      const result = await this.call('group.create', params) as Record<string, unknown>;
+
+      const groupInfo = result?.group as Record<string, unknown> | undefined;
+      const aidCert = result?.aid_cert as Record<string, unknown> | undefined;
+      const groupAid = String(groupInfo?.group_aid ?? '');
+      if (groupAid && aidCert) {
+        this._saveGroupIdentityToV2(groupAid, identity);
+        const certPem = String(aidCert.cert ?? '');
+        if (certPem) {
+          this._tokenStore.saveCert(groupAid, certPem);
+        }
+      }
+      this._clientLog.debug(`createNamedGroup exit: elapsed=${Date.now() - tStart}ms groupAid=${groupAid}`);
+      return result;
     } catch (err) {
       this._clientLog.debug(`createNamedGroup exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;
@@ -7599,34 +7581,29 @@ export class AUNClient {
     const tStart = Date.now();
     this._clientLog.debug(`bindGroupAid enter: groupId=${groupId}, groupName=${groupName}`);
     try {
-    const cp = new CryptoProvider();
-    const identity = cp.generateIdentity();
-    const params: Record<string, JsonValue> = {
-      group_id: groupId,
-      group_name: groupName,
-      public_key: identity.public_key_der_b64,
-      curve: 'P-256',
-    };
-
-    const result = await this.call('group.bind_aid', params) as Record<string, unknown>;
-
-    const groupInfo = result?.group as Record<string, unknown> | undefined;
-    const aidCert = result?.aid_cert as Record<string, unknown> | undefined;
-    const groupAid = String(groupInfo?.group_aid ?? '');
-    if (groupAid && aidCert) {
-      this._keystore.saveIdentity(groupAid, {
-        private_key_pem: identity.private_key_pem,
+      const cp = new CryptoProvider();
+      const identity = cp.generateIdentity();
+      const params: Record<string, JsonValue> = {
+        group_id: groupId,
+        group_name: groupName,
         public_key: identity.public_key_der_b64,
         curve: 'P-256',
-        type: 'group_identity',
-      });
-      const certPem = String(aidCert.cert ?? '');
-      if (certPem) {
-        this._keystore.saveCert(groupAid, certPem);
+      };
+
+      const result = await this.call('group.bind_aid', params) as Record<string, unknown>;
+
+      const groupInfo = result?.group as Record<string, unknown> | undefined;
+      const aidCert = result?.aid_cert as Record<string, unknown> | undefined;
+      const groupAid = String(groupInfo?.group_aid ?? '');
+      if (groupAid && aidCert) {
+        this._saveGroupIdentityToV2(groupAid, identity);
+        const certPem = String(aidCert.cert ?? '');
+        if (certPem) {
+          this._tokenStore.saveCert(groupAid, certPem);
+        }
       }
-    }
-    this._clientLog.debug(`bindGroupAid exit: elapsed=${Date.now() - tStart}ms groupAid=${groupAid}`);
-    return result;
+      this._clientLog.debug(`bindGroupAid exit: elapsed=${Date.now() - tStart}ms groupAid=${groupAid}`);
+      return result;
     } catch (err) {
       this._clientLog.debug(`bindGroupAid exit (error): elapsed=${Date.now() - tStart}ms err=${err instanceof Error ? err.message : String(err)}`);
       throw err;

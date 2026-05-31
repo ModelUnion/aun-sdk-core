@@ -17,23 +17,6 @@ import (
 
 // 防线 A 测试：loadIdentityOrRaise 严格化
 
-// stubKeystoreReturning 让 LoadIdentity 返回固定 map（半成品场景）。
-type stubKeystoreReturning struct {
-	keystore.KeyStore
-	stub map[string]any
-}
-
-func (s *stubKeystoreReturning) LoadIdentity(aid string) (map[string]any, error) {
-	if s.stub == nil {
-		return nil, nil
-	}
-	out := make(map[string]any, len(s.stub))
-	for k, v := range s.stub {
-		out[k] = v
-	}
-	return out, nil
-}
-
 func newStubAuthFlow(t *testing.T, stub map[string]any) *AuthFlow {
 	t.Helper()
 	dir := t.TempDir()
@@ -42,12 +25,15 @@ func newStubAuthFlow(t *testing.T, stub map[string]any) *AuthFlow {
 		t.Fatalf("NewFileKeyStore: %v", err)
 	}
 	t.Cleanup(func() { base.Close() })
-	ks := &stubKeystoreReturning{KeyStore: base, stub: stub}
-	return NewAuthFlow(AuthFlowConfig{
-		Keystore:  ks,
-		Crypto:    &CryptoProvider{},
-		VerifySSL: false,
+	flow := NewAuthFlow(AuthFlowConfig{
+		TokenStore: base,
+		Crypto:     &CryptoProvider{},
+		VerifySSL:  false,
 	})
+	if stub != nil {
+		flow.SetIdentity(stub)
+	}
+	return flow
 }
 
 func TestLoadIdentityOrRaise_RejectsMissingPrivateKey(t *testing.T) {

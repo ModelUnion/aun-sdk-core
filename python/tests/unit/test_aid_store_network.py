@@ -246,15 +246,47 @@ async def test_store_register_persists_identity_and_returns_registered(monkeypat
     async def fake_register(gateway_url: str, target: str):
         assert gateway_url == "wss://gateway.agentid.pub"
         assert target == aid
-        store._keystore.save_identity(target, identity)
-        return {"aid": target, "cert": identity["cert"]}
+        return dict(identity)
 
-    monkeypatch.setattr(store._auth, "register_aid", fake_register)
+    monkeypatch.setattr(store._register_flow, "register_aid", fake_register)
 
     result = await store.register(aid)
 
     assert result.ok
     assert result.data == {"registered": True}
+    loaded = store.load(aid)
+    assert loaded.ok
+    assert loaded.data["aid"].is_private_key_valid()
+
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_register_authflow_persists_generated_keypair(monkeypatch, tmp_path: Path):
+    aid = "new-user.agentid.pub"
+    store = AIDStore(tmp_path, "seed")
+    monkeypatch.setattr(store, "_resolve_gateway", lambda target: "wss://gateway.agentid.pub")
+
+    async def fake_download_registered_cert(gateway_url: str, target: str):
+        assert gateway_url == "wss://gateway.agentid.pub"
+        assert target == aid
+        return None
+
+    async def fake_create_aid(gateway_url: str, identity: dict):
+        assert gateway_url == "wss://gateway.agentid.pub"
+        assert identity["aid"] == aid
+        private_key = serialization.load_pem_private_key(
+            identity["private_key_pem"].encode("utf-8"),
+            password=None,
+        )
+        return {"cert": _identity(aid, key=private_key)["cert"]}
+
+    monkeypatch.setattr(store._register_flow, "_download_registered_cert", fake_download_registered_cert)
+    monkeypatch.setattr(store._register_flow, "_create_aid", fake_create_aid)
+
+    result = await store.register(aid)
+
+    assert result.ok
     loaded = store.load(aid)
     assert loaded.ok
     assert loaded.data["aid"].is_private_key_valid()

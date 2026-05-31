@@ -1,6 +1,6 @@
 {
   "name": "@agentunion/fastaun",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "AUN Protocol Core SDK for Node.js",
   "type": "module",
   "main": "dist/index.js",

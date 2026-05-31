@@ -115,9 +115,14 @@ describe('浏览器 SDK v4 三主体 API', () => {
   it('AIDStore 注册持久化路径应保留私钥材料', async () => {
     const aidStr = 'reg-persist.agentid.pub';
     const identity = makeIdentity(aidStr);
-    const store = new AIDStore({ aunPath: 'browser-aun-reg', encryptionSeed: 'reg-persist-seed' });
+    const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'reg-persist-seed' });
+    await keyStore.saveKeyPair(aidStr, {
+      private_key_pem: identity.private_key_pem,
+      public_key_der_b64: identity.public_key_der_b64,
+    });
+    await keyStore.saveCert(aidStr, identity.cert);
 
-    await (store as any)._auth._persistIdentity(identity);
+    const store = new AIDStore({ aunPath: 'browser-aun-reg', encryptionSeed: 'reg-persist-seed' });
     const loaded = await store.load(aidStr);
 
     expect(loaded.ok).toBe(true);

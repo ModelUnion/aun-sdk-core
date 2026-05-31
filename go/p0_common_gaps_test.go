@@ -132,10 +132,7 @@ func TestP0_01_HealthCheckWSSchemeConversion(t *testing.T) {
 
 // TestP0_02_CreateAIDEmptyString 验证空字符串 AID 返回 ValidationError
 func TestP0_02_CreateAIDEmptyString(t *testing.T) {
-	c := newClient(map[string]any{"aun_path": t.TempDir()})
-	defer func() { _ = c.Close() }()
-
-	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "")
+	err := validateAIDName("")
 	if err == nil {
 		t.Fatal("空字符串 AID 应返回错误")
 	}
@@ -147,10 +144,7 @@ func TestP0_02_CreateAIDEmptyString(t *testing.T) {
 
 // TestP0_02_CreateAIDTooShort 验证过短的 AID 返回 ValidationError
 func TestP0_02_CreateAIDTooShort(t *testing.T) {
-	c := newClient(map[string]any{"aun_path": t.TempDir()})
-	defer func() { _ = c.Close() }()
-
-	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "ab")
+	err := validateAIDName("ab")
 	if err == nil {
 		t.Fatal("过短 AID（少于 4 字符）应返回错误")
 	}
@@ -162,10 +156,7 @@ func TestP0_02_CreateAIDTooShort(t *testing.T) {
 
 // TestP0_02_CreateAIDInvalidChars 验证含非法字符的 AID 返回 ValidationError
 func TestP0_02_CreateAIDInvalidChars(t *testing.T) {
-	c := newClient(map[string]any{"aun_path": t.TempDir()})
-	defer func() { _ = c.Close() }()
-
-	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "Test_AID!")
+	err := validateAIDName("Test_AID!")
 	if err == nil {
 		t.Fatal("含大写字母和特殊字符的 AID 应返回错误")
 	}
@@ -177,10 +168,7 @@ func TestP0_02_CreateAIDInvalidChars(t *testing.T) {
 
 // TestP0_02_CreateAIDGuestPrefix 验证以 guest 开头的 AID 返回 ValidationError
 func TestP0_02_CreateAIDGuestPrefix(t *testing.T) {
-	c := newClient(map[string]any{"aun_path": t.TempDir()})
-	defer func() { _ = c.Close() }()
-
-	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "guest_user")
+	err := validateAIDName("guest_user")
 	if err == nil {
 		t.Fatal("以 guest 开头的 AID 应返回错误")
 	}
@@ -192,10 +180,7 @@ func TestP0_02_CreateAIDGuestPrefix(t *testing.T) {
 
 // TestP0_02_CreateAIDStartsWithDash 验证以 - 开头的 AID 返回 ValidationError
 func TestP0_02_CreateAIDStartsWithDash(t *testing.T) {
-	c := newClient(map[string]any{"aun_path": t.TempDir()})
-	defer func() { _ = c.Close() }()
-
-	_, err := c.AuthRegisterAID(context.Background(), "ws://localhost:9999", "-invalid_aid")
+	err := validateAIDName("-invalid_aid")
 	if err == nil {
 		t.Fatal("以 - 开头的 AID 应返回错误")
 	}
@@ -207,18 +192,7 @@ func TestP0_02_CreateAIDStartsWithDash(t *testing.T) {
 
 // TestP0_02_CreateAIDValidFormat 验证合法格式的 AID 通过本地校验（网络层面会失败但不应是 ValidationError）
 func TestP0_02_CreateAIDValidFormat(t *testing.T) {
-	c := newClient(map[string]any{"aun_path": t.TempDir()})
-	defer func() { _ = c.Close() }()
-
-	// 用一个无法连接的地址，合法 AID 应通过本地校验，失败在网络层
-	_, err := c.AuthRegisterAID(context.Background(), "ws://192.0.2.1:1", "valid_test_aid")
-	if err == nil {
-		// 没有真实服务器，应该还是会出错
-		return
-	}
-	// 关键：错误不应是 ValidationError（本地格式校验应该通过）
-	var valErr *ValidationError
-	if isValidationError(err, &valErr) {
+	if err := validateAIDName("valid_test_aid"); err != nil {
 		t.Fatalf("合法格式的 AID 不应触发 ValidationError: %v", err)
 	}
 }

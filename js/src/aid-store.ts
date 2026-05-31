@@ -3,6 +3,7 @@ import { CryptoProvider, pemToArrayBuffer, importPrivateKeyEcdsa, importCertPubl
 import * as codes from './error-codes.js';
 import { publicKeyDerB64 } from './cert-utils.js';
 import { AuthFlow } from './auth.js';
+import { RegisterFlow } from './register-flow.js';
 import { GatewayDiscovery } from './discovery.js';
 import { IdentityConflictError, ValidationError } from './errors.js';
 import { IndexedDBKeyStore } from './keystore/indexeddb.js';
@@ -262,6 +263,7 @@ export class AIDStore {
   private _encryptionSeed: string;
   private _keystore: IndexedDBKeyStore;
   private _auth: AuthFlow;
+  private _registerFlow: RegisterFlow;
   private _crypto: CryptoProvider;
   private _discovery: GatewayDiscovery;
   private _verifySsl: boolean;
@@ -290,14 +292,18 @@ export class AIDStore {
     this._crypto = new CryptoProvider();
     this._discovery = new GatewayDiscovery();
     this._auth = new AuthFlow({
-      keystore: this._keystore,
+      tokenStore: this._keystore,
       crypto: this._crypto,
       deviceId: this.deviceId,
       slotId: this.slotId,
       rootCaPem: opts.rootCaPem ?? null,
       verifySsl: this._verifySsl,
     });
-    (this._auth as unknown as { _persistKeyMaterial: boolean })._persistKeyMaterial = true;
+    this._registerFlow = new RegisterFlow({
+      keystore: this._keystore,
+      crypto: this._crypto,
+      verifySsl: this._verifySsl,
+    });
   }
 
   close(): void {
@@ -435,7 +441,17 @@ export class AIDStore {
     try {
       validateRegisterAidName(target);
       const gatewayUrl = await this._resolveGateway(target);
-      await this._auth.registerAid(gatewayUrl, target);
+      const result = await this._registerFlow.registerAid(gatewayUrl, target);
+      if (result.cert) {
+        await this._keystore.saveCert(target, result.cert);
+      }
+      if (result.private_key_pem || result.public_key_der_b64) {
+        await this._keystore.saveKeyPair(target, {
+          private_key_pem: result.private_key_pem,
+          public_key_der_b64: result.public_key_der_b64,
+          curve: result.curve,
+        });
+      }
       return resultOk({ registered: true as const });
     } catch (exc) {
       if (exc instanceof IdentityConflictError) {
@@ -659,8 +675,8 @@ export class AIDStore {
       return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
     }
     try {
-      const identity = await this._auth.loadIdentityOrNone(target);
-      if (!identity?.cert || !identity.private_key_pem) {
+      const aidObj = loaded.data.aid;
+      if (!aidObj.certPem || !aidObj.privateKeyPem) {
         return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
       }
       const gatewayUrl = await this._resolveGateway(target);
@@ -668,10 +684,10 @@ export class AIDStore {
       const phase1 = await (this._auth as unknown as { _shortRpc: (url: string, method: string, params: JsonObject) => Promise<JsonObject> })
         ._shortRpc(gatewayUrl, 'auth.aid_login1', {
           aid: target,
-          cert: identity.cert,
+          cert: aidObj.certPem,
           client_nonce: clientNonce,
         });
-      const [signature, clientTime] = await this._crypto.signLoginNonce(identity.private_key_pem, String(phase1.nonce ?? ''));
+      const [signature, clientTime] = await this._crypto.signLoginNonce(aidObj.privateKeyPem, String(phase1.nonce ?? ''));
       const response = await (this._auth as unknown as { _shortRpc: (url: string, method: string, params: JsonObject) => Promise<JsonObject> })
         ._shortRpc(gatewayUrl, 'auth.renew_cert', {
           aid: target,
@@ -702,8 +718,8 @@ export class AIDStore {
       return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
     }
     try {
-      const identity = await this._auth.loadIdentityOrNone(target);
-      if (!identity?.cert || !identity.private_key_pem) {
+      const oldAid = loaded.data.aid;
+      if (!oldAid.certPem || !oldAid.privateKeyPem) {
         return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
       }
       const gatewayUrl = await this._resolveGateway(target);
@@ -712,7 +728,7 @@ export class AIDStore {
       const phase1 = await (this._auth as unknown as { _shortRpc: (url: string, method: string, params: JsonObject) => Promise<JsonObject> })
         ._shortRpc(gatewayUrl, 'auth.aid_login1', {
           aid: target,
-          cert: identity.cert,
+          cert: oldAid.certPem,
           client_nonce: clientNonce,
         });
       const signPayload = `${String(phase1.nonce ?? '')}${newIdentity.public_key_der_b64}`;

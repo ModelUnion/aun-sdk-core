@@ -90,6 +90,7 @@ export { IndexedDBSecretStore } from './secret-store/indexeddb-store.js';
 
 // 认证
 export { AuthFlow } from './auth.js';
+export { RegisterFlow, type RegisterResult } from './register-flow.js';
 
 // E2EE V2-only 公开 API
 export { ProtectedHeaders } from './protected-headers.js';

@@ -45,9 +45,9 @@ func makeReuseClient(t *testing.T, sharedPath string) *AUNClient {
 // access_token_expires_at 保存到 instance_state 表（不在 tokens 表）。
 func loadInstanceTokens(t *testing.T, c *AUNClient, aid string) map[string]any {
 	t.Helper()
-	store, ok := c.keyStore.(keystore.InstanceStateStore)
+	store, ok := c.tokenStore.(keystore.InstanceStateStore)
 	if !ok {
-		t.Fatalf("keystore 未实现 InstanceStateStore: %T", c.keyStore)
+		t.Fatalf("tokenStore 未实现 InstanceStateStore: %T", c.tokenStore)
 	}
 	state, err := store.LoadInstanceState(aid, c.deviceID, c.slotID)
 	if err != nil {

@@ -120,7 +120,7 @@ func TestFileSecretStore_DifferentScopes(t *testing.T) {
 // ── FileKeyStore 测试 ────────────────────────────────────
 
 // testNewFileKeyStore 创建测试用 FileKeyStore
-func testNewFileKeyStore(t *testing.T) keystore.KeyStore {
+func testNewFileKeyStore(t *testing.T) *keystore.FileKeyStore {
 	t.Helper()
 	dir := t.TempDir()
 	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")

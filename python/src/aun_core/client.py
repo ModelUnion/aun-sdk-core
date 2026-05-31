@@ -502,16 +502,16 @@ class AUNClient:
         self._active_prekey_id: str = ""
 
         connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
-        keystore = FileKeyStore(
+        token_store = FileKeyStore(
             self._config_model.aun_path,
             logger=self._log,
         )
-        self._keystore = keystore
+        self._token_store = token_store
         self._slot_id = normalize_slot_id(initial_aid_obj.slot_id if initial_aid_obj else None)
         self._connect_delivery_mode = _normalize_delivery_mode_config({"mode": "fanout"})
         self._default_connect_delivery_mode = dict(self._connect_delivery_mode)
         self._auth = AuthFlow(
-            keystore=keystore,
+            token_store=token_store,
             crypto=CryptoProvider(),
             aid=init_aid,
             device_id=self._device_id,
@@ -522,6 +522,14 @@ class AUNClient:
             logger=self._log,
             net=self._net,
         )
+        if initial_aid_obj is not None:
+            self._identity = {
+                "aid": initial_aid_obj.aid,
+                "private_key_pem": initial_aid_obj.private_key_pem,
+                "public_key_der_b64": initial_aid_obj.public_key,
+                "cert": initial_aid_obj.cert_pem,
+            }
+            self._auth.set_identity(self._identity)
         self._transport = RPCTransport(
             event_dispatcher=self._dispatcher,
             connection_factory=connection_factory,
@@ -742,7 +750,14 @@ class AUNClient:
         self._auth._aid = aid.aid
         self._state = "standby"
         self._closing = False
-        self._identity = None
+        self._identity = {
+            "aid": aid.aid,
+            "private_key_pem": aid.private_key_pem,
+            "public_key_der_b64": aid.public_key,
+            "cert": aid.cert_pem,
+        }
+        # 注入内存私钥到 AuthFlow，禁止 AuthFlow 内部再走 keystore 解密
+        self._auth.set_identity(self._identity)
         self._last_error = None
         self._last_error_code = None
         self._next_retry_at = None
@@ -803,7 +818,7 @@ class AUNClient:
 
         debug_enabled = bool(getattr(self._log, "_debug", False))
         try:
-            self._keystore.close()
+            self._token_store.close()
         except Exception:
             pass
         try:
@@ -835,12 +850,12 @@ class AUNClient:
             net=self._net,
         )
         connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
-        self._keystore = FileKeyStore(
+        self._token_store = FileKeyStore(
             self._config_model.aun_path,
             logger=self._log,
         )
         self._auth = AuthFlow(
-            keystore=self._keystore,
+            token_store=self._token_store,
             crypto=CryptoProvider(),
             aid=aid.aid,
             device_id=self._device_id,
@@ -1591,10 +1606,16 @@ class AUNClient:
             result = await self._auth.authenticate(gateway_url, aid=self._aid)
             self._aid = str(result.get("aid") or self._aid)
             self._auth._aid = self._aid
-            identity = self._auth.load_identity_or_none(self._aid) or {"aid": self._aid}
+            identity = dict(self._identity) if self._identity else {"aid": self._aid}
             access_token = result.get("access_token")
             if access_token:
                 identity["access_token"] = access_token
+            refresh_token = result.get("refresh_token")
+            if refresh_token:
+                identity["refresh_token"] = refresh_token
+            expires_at = result.get("access_token_expires_at", result.get("expires_at"))
+            if expires_at is not None:
+                identity["access_token_expires_at"] = expires_at
             self._identity = identity
             self._state = ConnectionState.AUTHENTICATED.value
             self._last_error = None
@@ -1807,9 +1828,9 @@ class AUNClient:
             self._reset_seq_tracking_state()
             self._log.debug("client", "close exit: elapsed=%.3fs state=%s", time.time() - _t_start, self._state)
         finally:
-            close_keystore = getattr(self._keystore, "close", None)
-            if callable(close_keystore):
-                close_keystore()
+            close_token_store = getattr(self._token_store, "close", None)
+            if callable(close_token_store):
+                close_token_store()
 
     # ── RPC ───────────────────────────────────────────────
 
@@ -2957,7 +2978,7 @@ class AUNClient:
         policy_snapshot = str(data.get("policy_snapshot") or "").strip()
 
         # 1. 验证 prev_state_hash 连续性
-        local_state = self._keystore.load_group_state(self._aid, group_id)
+        local_state = self._token_store.load_group_state(self._aid, group_id)
         if local_state and local_state["state_hash"] and local_state["state_hash"] != prev_state_hash:
             self._log.warn("client", 
                 "state_hash 链不连续 group=%s local_sv=%d event_sv=%d",
@@ -2989,7 +3010,7 @@ class AUNClient:
                                 group_id, sv, s_hash, computed,
                             )
                             return
-                    self._keystore.save_group_state(
+                    self._token_store.save_group_state(
                         self._aid,
                         group_id=group_id,
                         state_version=sv,
@@ -3019,7 +3040,7 @@ class AUNClient:
             return
 
         # 3. 更新本地存储
-        self._keystore.save_group_state(
+        self._token_store.save_group_state(
             self._aid,
             group_id=group_id, state_version=state_version, state_hash=state_hash,
             key_epoch=key_epoch, membership_json=membership_snapshot, policy_json=policy_snapshot,
@@ -3517,7 +3538,7 @@ class AUNClient:
             # 如果同 seq 也曾挂起，顺手清理，避免后续 drain 重复处理。
             self._log.debug(
                 "client",
-                "DIAG publish_ordered already published: ns=%s seq=%d (republish guard hit)",
+                "publish ordered skipped already published: ns=%s seq=%d",
                 ns, seq_i,
             )
             pending = self._pending_ordered().get(ns)
@@ -3531,7 +3552,7 @@ class AUNClient:
         if seq_i > contig:
             self._log.debug(
                 "client",
-                "DIAG publish_ordered enqueue (gap): ns=%s seq=%d contig=%d",
+                "publish ordered enqueue gap: ns=%s seq=%d contig=%d",
                 ns, seq_i, contig,
             )
             self._enqueue_ordered_message(ns, event, seq_i, payload)
@@ -3950,7 +3971,7 @@ class AUNClient:
             cache_key=bare_key,
         )
         try:
-            self._keystore.save_cert(
+            self._token_store.save_cert(
                 aid,
                 cert_text,
                 cert_fingerprint=cert_fingerprint,
@@ -4258,12 +4279,12 @@ class AUNClient:
                 cache_key=cache_key,
             )
         try:
-            local_cert = self._keystore.load_cert(aid, cert_fingerprint)
+            local_cert = self._token_store.load_cert(aid, cert_fingerprint)
         except TypeError:
-            local_cert = self._keystore.load_cert(aid)
+            local_cert = self._token_store.load_cert(aid)
         except Exception as _lc_exc:
             _debug_group_e2ee(
-                "ensure_sender_cert_keystore_error",
+                "ensure_sender_cert_token_store_error",
                 aid=self._aid or "-",
                 peer=aid,
                 fp=normalized_fp or "-",
@@ -4273,7 +4294,7 @@ class AUNClient:
             local_cert = None
         if local_cert:
             _debug_group_e2ee(
-                "ensure_sender_cert_keystore_hit",
+                "ensure_sender_cert_token_store_hit",
                 aid=self._aid or "-",
                 peer=aid,
                 fp=normalized_fp or "-",
@@ -4283,7 +4304,7 @@ class AUNClient:
             pass
         else:
             _debug_group_e2ee(
-                "ensure_sender_cert_keystore_miss",
+                "ensure_sender_cert_token_store_miss",
                 aid=self._aid or "-",
                 peer=aid,
                 fp=normalized_fp or "-",
@@ -4687,7 +4708,7 @@ class AUNClient:
                 if self._public_state != ConnectionState.READY or not gateway_url:
                     await asyncio.sleep(_TOKEN_REFRESH_CHECK_INTERVAL)
                     continue
-                identity = self._identity or self._auth.load_identity_or_none()
+                identity = self._identity
                 if identity is None:
                     await asyncio.sleep(_TOKEN_REFRESH_CHECK_INTERVAL)
                     continue
@@ -4891,7 +4912,7 @@ class AUNClient:
         if not self._aid:
             return
         try:
-            loader = getattr(self._keystore, "load_all_seqs", None)
+            loader = getattr(self._token_store, "load_all_seqs", None)
             if callable(loader):
                 state = loader(self._aid, self._device_id, self._slot_id)
                 if state:
@@ -4902,7 +4923,7 @@ class AUNClient:
                     self._log.info("client", "SeqTracker no persisted state, starting from zero")
             else:
                 # 旧版 fallback：从 instance_state 的 seq_tracker_state 字段读
-                inst_loader = getattr(self._keystore, "load_instance_state", None)
+                inst_loader = getattr(self._token_store, "load_instance_state", None)
                 if callable(inst_loader):
                     instance_state = inst_loader(self._aid, self._device_id, self._slot_id)
                     if isinstance(instance_state, dict):
@@ -4950,8 +4971,8 @@ class AUNClient:
         )
 
         # 落盘：删老 ns，写新 ns。删除接口缺失时只写新不删老（下次启动仍会再跑一次，幂等）
-        deleter = getattr(self._keystore, "delete_seq", None)
-        saver = getattr(self._keystore, "save_seq", None)
+        deleter = getattr(self._token_store, "delete_seq", None)
+        saver = getattr(self._token_store, "save_seq", None)
         if callable(saver):
             for old_ns, new_ns in rename_map.items():
                 if callable(deleter):
@@ -5029,7 +5050,7 @@ class AUNClient:
             # 同时更新内存中的 SeqTracker
             self._seq_tracker.restore_state({ns: seq})
         try:
-            saver = getattr(self._keystore, "save_seq", None)
+            saver = getattr(self._token_store, "save_seq", None)
             if callable(saver):
                 saver(self._aid, self._device_id, self._slot_id, ns, seq)
         except Exception as _seq_exc:
@@ -5043,7 +5064,7 @@ class AUNClient:
         if seq > 0:
             self._persist_seq(ns)
             return
-        deleter = getattr(self._keystore, "delete_seq", None)
+        deleter = getattr(self._token_store, "delete_seq", None)
         if callable(deleter):
             try:
                 deleter(self._aid, self._device_id, self._slot_id, ns)
@@ -5077,14 +5098,14 @@ class AUNClient:
         if not state:
             return
         try:
-            saver = getattr(self._keystore, "save_seq", None)
+            saver = getattr(self._token_store, "save_seq", None)
             if callable(saver):
                 for ns, seq in state.items():
                     if isinstance(seq, int) and seq > 0:
                         saver(self._aid, self._device_id, self._slot_id, ns, seq)
             else:
                 # 旧版 fallback
-                updater = getattr(self._keystore, "update_instance_state", None)
+                updater = getattr(self._token_store, "update_instance_state", None)
                 if callable(updater):
                     def _merge_seq(m: dict) -> dict:
                         m["seq_tracker_state"] = state
@@ -5423,24 +5444,33 @@ class AUNClient:
         return options
 
     def _sync_identity_after_connect(self, access_token: str) -> None:
-        identity = self._auth.load_identity_or_none(self._aid)
-        if identity is None:
-            self._identity = None
-            return
-        identity["access_token"] = access_token
-        self._identity = identity
-        self._aid = identity.get("aid", self._aid)
-        persist_identity = getattr(self._auth, "_persist_identity", None)
-        if callable(persist_identity):
-            persist_identity(identity)
+        aid = ""
+        identity = self._identity if isinstance(self._identity, dict) else None
+        if identity is not None:
+            aid = str(identity.get("aid") or self._aid or "")
+            identity["access_token"] = access_token
+            identity["aid"] = aid
+            self._identity = identity
         else:
-            self._auth._keystore.save_identity(identity["aid"], identity)
+            aid = str(self._aid or "")
+        if not aid:
+            return
+        self._aid = aid
+        updater = getattr(self._token_store, "update_instance_state", None)
+        if not callable(updater):
+            return
+
+        def _merge(current: dict[str, Any]) -> dict[str, Any]:
+            current["access_token"] = access_token
+            return current
+
+        updater(aid, self._device_id, self._slot_id, _merge)
 
     async def _invoke_reconnect_connect_once(self) -> None:
         if self._session_params is None:
             raise StateError("missing connect params for reconnect")
-        # 从持久化 identity 刷新 token，避免用过期/失败的旧 token 反复重试
-        fresh_identity = self._auth.load_identity_or_none(self._aid)
+        # 从内存 identity 刷新 token，避免用过期/失败的旧 token 反复重试
+        fresh_identity = self._identity
         if fresh_identity:
             fresh_token = self._auth._get_cached_access_token(fresh_identity)
             if fresh_token:
@@ -5511,7 +5541,7 @@ class AUNClient:
             format=_ser.PublicFormat.SubjectPublicKeyInfo,
         )
 
-        db = self._keystore._get_db(self._aid)
+        db = self._token_store._get_db(self._aid)
         self._v2_session = V2Session(
             db, self._device_id, self._aid,
             aid_priv_der=aid_priv_der, aid_pub_der=aid_pub_der,

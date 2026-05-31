@@ -143,6 +143,9 @@ func verifyPrivateKeysForSeedChange(root string, oldMaster []byte) ([]privateKey
 		}
 		record, ok := raw["private_key_protection"].(map[string]any)
 		if !ok {
+			if privateKeyPEM, ok := raw["private_key_pem"].(string); ok && strings.TrimSpace(privateKeyPEM) != "" {
+				out = append(out, privateKeyMigration{aid: aid, path: keyPath, plaintext: []byte(privateKeyPEM)})
+			}
 			continue
 		}
 		plaintext, ok := decryptSeedRecord(oldMaster, aid, "identity/private_key", record)
@@ -171,6 +174,7 @@ func rewriteKeyJSONPrivateKey(path, aid string, plaintext []byte, newSeed, newMa
 		return fmt.Errorf("seed migration refused: new seed verification failed for %s", aid)
 	}
 	raw["private_key_protection"] = record
+	delete(raw, "private_key_pem")
 	encoded, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return err
