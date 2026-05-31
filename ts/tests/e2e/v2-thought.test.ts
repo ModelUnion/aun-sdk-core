@@ -22,12 +22,11 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
 import type { JsonObject } from '../../src/types.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 const TEST_TIMEOUT = 90_000;
 
 function runId(): string {
@@ -36,13 +35,10 @@ function runId(): string {
 
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-v2-thought-'));
-  const client = new AUNClient({ aun_path: tmpDir, debug: true });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
+  return createTestClient({ aunPath: tmpDir, debug: true, requireForwardSecrecy: false });
 }
 
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
   await registerAndLoadIdentity(client, aid);
   await client.connect({ auto_reconnect: false });
   await (client as any)._initV2Session();

@@ -227,6 +227,21 @@ _DEFAULT_SESSION_OPTIONS: dict[str, Any] = {
     },
 }
 
+_PUBLIC_CONNECTION_OPTION_KEYS = frozenset({
+    "auto_reconnect",
+    "connect_timeout",
+    "retry_initial_delay",
+    "retry_max_delay",
+    "retry_max_attempts",
+    "heartbeat_interval",
+    "call_timeout",
+    "connection_kind",
+    "short_ttl_ms",
+    "extra_info",
+    "delivery_mode",
+    "background_sync",
+})
+
 
 def _clamp_reconnect_delay(value: Any, fallback: float, upper: float = _RECONNECT_MAX_BASE_DELAY) -> float:
     try:
@@ -489,7 +504,6 @@ class AUNClient:
         connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
         keystore = FileKeyStore(
             self._config_model.aun_path,
-            encryption_seed=self._config_model.seed_password,
             logger=self._log,
         )
         self._keystore = keystore
@@ -823,7 +837,6 @@ class AUNClient:
         connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
         self._keystore = FileKeyStore(
             self._config_model.aun_path,
-            encryption_seed=self._config_model.seed_password,
             logger=self._log,
         )
         self._auth = AuthFlow(
@@ -1604,10 +1617,12 @@ class AUNClient:
             ConnectionState.CONNECTION_FAILED,
         }:
             raise StateError(f"connect not allowed in state {self._public_state.value}")
-        if opts and "gateway" in opts:
-            raise ValidationError("gateway must be resolved by discovery and cannot be supplied externally")
         params: dict[str, Any] = {}
         if opts:
+            invalid_keys = set(opts) - _PUBLIC_CONNECTION_OPTION_KEYS
+            if invalid_keys:
+                invalid = ", ".join(sorted(invalid_keys))
+                raise ValidationError(f"connect options contain unsupported field(s): {invalid}")
             if "auto_reconnect" in opts:
                 params["auto_reconnect"] = opts["auto_reconnect"]
             if "connect_timeout" in opts:
@@ -1832,28 +1847,26 @@ class AUNClient:
 
     def _sign_client_operation(self, method: str, params: dict[str, Any]) -> None:
         """为关键操作附加客户端 ECDSA 签名（_client_signature 字段）。"""
-        identity = self._identity
-        if not identity or not identity.get("private_key_pem"):
+        current_aid = self._current_aid
+        if not current_aid or not current_aid.private_key_pem:
             return
         try:
             from cryptography.hazmat.primitives.asymmetric import ec as _ec
             from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
-            aid = identity.get("aid", "")
+            aid = current_aid.aid
             ts = str(int(time.time()))
-            # 计算 params hash
-            # 约定：签名覆盖所有非 _ 前缀且非 client_signature 的业务字段
             params_for_hash = {k: v for k, v in params.items()
                                if k != "client_signature" and not k.startswith("_")}
             params_json = json.dumps(params_for_hash, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             params_hash = hashlib.sha256(params_json.encode("utf-8")).hexdigest()
             sign_data = f"{method}|{aid}|{ts}|{params_hash}".encode("utf-8")
             pk = _ser.load_pem_private_key(
-                identity["private_key_pem"].encode("utf-8"), password=None,
+                current_aid.private_key_pem.encode("utf-8"), password=None,
             )
             sig = pk.sign(sign_data, _ec.ECDSA(_hashes.SHA256()))
             # 证书指纹：用于锁定签名时使用的证书版本
             cert_fingerprint = ""
-            cert_pem = identity.get("cert", "")
+            cert_pem = current_aid.cert_pem
             if cert_pem:
                 from cryptography import x509 as _x509
                 cert_obj = _x509.load_pem_x509_certificate(cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem)
@@ -2025,8 +2038,14 @@ class AUNClient:
 
         # group.ack_messages：V2 就绪时走 V2 ack
         if method == "group.ack_messages" and self._v2_session and params.get("group_id"):
-            self._log.debug("client", "call route: group.ack_messages → V2 ack")
-            return await self._ack_group_v2_internal(params)
+            if self._group_cursor_targets_current_instance(params):
+                self._log.debug("client", "call route: group.ack_messages → V2 ack")
+                return await self._ack_group_v2_internal(params)
+            self._log.debug(
+                "client",
+                "call route: group.ack_messages 外部 cursor → 原始 ack device_id=%s slot_id=%s",
+                params.get("device_id"), params.get("slot_id"),
+            )
         if method == "group.thought.put":
             encrypt = params.pop("encrypt", True)
             if encrypt:
@@ -2343,6 +2362,11 @@ class AUNClient:
         params = self._clamp_ack_params(method, params) if isinstance(params, dict) else params
         loop = getattr(self, "_loop", None) or asyncio.get_running_loop()
         loop.create_task(self._safe_ack(method, params, label))
+
+    async def _await_ack(self, method: str, params: dict[str, Any], label: str = "") -> None:
+        """等待 ack RPC 完成，用于显式 pull 返回前收敛服务端游标。"""
+        params = self._clamp_ack_params(method, params) if isinstance(params, dict) else params
+        await self._safe_ack(method, params, label)
 
     def _clamp_ack_params(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """ack 参数边界保护：clamp 到 [0, max_seen_seq]。
@@ -4850,6 +4874,14 @@ class AUNClient:
         params["device_id"] = self._device_id
         params["slot_id"] = self._slot_id
 
+    def _group_cursor_targets_current_instance(self, params: dict[str, Any]) -> bool:
+        device_id = str(params.get("device_id") or "").strip()
+        slot_id = str(params.get("slot_id") or "").strip()
+        return (
+            (not device_id or device_id == (self._device_id or ""))
+            and (not slot_id or slot_id == (self._slot_id or ""))
+        )
+
     def _restore_seq_tracker_state(self) -> None:
         """从 keystore seq_tracker 表按行恢复 SeqTracker 状态。
 
@@ -5460,30 +5492,16 @@ class AUNClient:
         """connect 成功后初始化 V2 session 并注册设备 SPK。IK = AID 长期密钥（无需独立注册）。"""
         if not self._aid:
             return
-        identity = self._identity
-        if not identity or not identity.get("private_key_pem"):
-            # fallback：缓存的 identity 可能被 instance_state 污染，重新从 keystore 加载
-            try:
-                reloaded = self._keystore.load_identity(self._aid)
-            except Exception:
-                reloaded = None
-            if reloaded and reloaded.get("private_key_pem"):
-                self._identity = reloaded
-                identity = reloaded
-                self._log.warn("client", "V2 session init: identity cache was stale, reloaded from keystore")
-                # 自愈：重新持久化 identity，清理 instance_state 中的脏数据
-                try:
-                    self._auth._persist_identity(reloaded)
-                except Exception:
-                    pass
-        if not identity or not identity.get("private_key_pem"):
+        # 私钥由 AIDStore 管理，AUNClient 直接从 _current_aid 读取明文私钥
+        current_aid = self._current_aid
+        if not current_aid or not current_aid.private_key_pem:
             self._log.warn("client", "V2 session init skipped: no AID private key")
             return
 
         # 把 AID PEM 私钥转为 raw scalar (32 bytes) + DER 公钥
         from cryptography.hazmat.primitives.asymmetric import ec as _ec
         from cryptography.hazmat.primitives import serialization as _ser
-        pk = _ser.load_pem_private_key(identity["private_key_pem"].encode("utf-8"), password=None)
+        pk = _ser.load_pem_private_key(current_aid.private_key_pem.encode("utf-8"), password=None)
         if not isinstance(pk, _ec.EllipticCurvePrivateKey):
             raise RuntimeError("AID private key must be EC P-256")
         priv_int = pk.private_numbers().private_value
@@ -5867,6 +5885,7 @@ class AUNClient:
                 self._log_message_debug("decrypt-ok", "message.v2.pull", "message.received", plaintext)
 
             if ns:
+                has_page_server_ack = "server_ack_seq" in result
                 page_server_ack = int(result.get("server_ack_seq") or 0)
                 server_ack_seq = max(server_ack_seq, page_server_ack)
                 if page_server_ack > 0:
@@ -5891,9 +5910,17 @@ class AUNClient:
                 if contig_advanced:
                     await self._drain_ordered_messages(ns)
                     self._persist_seq(ns)
-                if raw_messages and contig_advanced and contig > 0:
-                    self._log.debug("client", "message.v2.pull scheduling auto-ack: ns=%s ack_seq=%d raw_count=%d", ns, contig, len(raw_messages))
-                    self._fire_ack("message.v2.ack", {"up_to_seq": contig}, "V2 P2P page auto-ack")
+                ack_needed = (
+                    bool(raw_messages)
+                    and contig > 0
+                    and (
+                        contig_advanced
+                        or (has_page_server_ack and contig > page_server_ack)
+                    )
+                )
+                if ack_needed:
+                    self._log.debug("client", "message.v2.pull sending auto-ack: ns=%s ack_seq=%d raw_count=%d", ns, contig, len(raw_messages))
+                    await self._await_ack("message.v2.ack", {"up_to_seq": contig}, "V2 P2P page auto-ack")
 
             next_after = max(page_max_seq, next_after_seq)
             if not raw_messages or next_after <= next_after_seq or result.get("has_more") is False:
@@ -6964,11 +6991,30 @@ class AUNClient:
             raise StateError("V2 session not initialized (not connected?)")
 
         group_id = str(params.get("group_id") or "").strip()
-        after_seq = int(params.get("after_seq", 0) or 0)
+        if "after_seq" in params:
+            after_seq = int(params.get("after_seq") or 0)
+            has_explicit_after_seq = True
+        elif "after_message_seq" in params:
+            after_seq = int(params.get("after_message_seq") or 0)
+            has_explicit_after_seq = True
+        else:
+            after_seq = 0
+            has_explicit_after_seq = False
         limit = int(params.get("limit", 50) or 50)
+        cursor_params = {
+            key: params[key]
+            for key in ("device_id", "slot_id", "device_name", "device_type")
+            if key in params and params[key] is not None
+        }
+        request_device_id = str(cursor_params.get("device_id") or "")
+        request_slot_id = str(cursor_params.get("slot_id") or "")
+        owns_cursor = (
+            (not request_device_id or request_device_id == (self._device_id or ""))
+            and (not request_slot_id or request_slot_id == (self._slot_id or ""))
+        )
 
         ns = f"group:{group_id}"
-        next_after_seq = after_seq or self._seq_tracker.get_contiguous_seq(ns)
+        next_after_seq = after_seq if has_explicit_after_seq else self._seq_tracker.get_contiguous_seq(ns)
         first_contig_before = self._seq_tracker.get_contiguous_seq(ns)
         response: dict[str, Any] = {}
         decrypted: list[dict[str, Any]] = []
@@ -6988,6 +7034,7 @@ class AUNClient:
                 "group_id": group_id,
                 "after_seq": next_after_seq,
                 "limit": limit,
+                **cursor_params,
             })
             if isinstance(result, dict):
                 response.update(result)
@@ -7063,6 +7110,8 @@ class AUNClient:
                 self._log_message_debug("decrypt-ok", "group.v2.pull", "group.message_created", plaintext)
 
             cursor = result.get("cursor")
+            has_server_cursor = isinstance(cursor, dict) and "current_seq" in cursor
+            server_ack = 0
             if isinstance(cursor, dict):
                 server_ack = int(cursor.get("current_seq") or 0)
                 if server_ack > 0:
@@ -7080,13 +7129,30 @@ class AUNClient:
             if contig_advanced:
                 await self._drain_ordered_messages(ns)
                 self._persist_seq(ns)
-            if raw_messages and contig_advanced and contig > 0:
-                self._log.debug("client", "group.v2.pull scheduling auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d", group_id, ns, contig, len(raw_messages))
-                self._fire_ack("group.v2.ack", {
+            ack_needed = (
+                bool(raw_messages)
+                and contig > 0
+                and owns_cursor
+                and (
+                    contig_advanced
+                    or (has_server_cursor and contig > server_ack)
+                )
+            )
+            if ack_needed:
+                self._log.debug("client", "group.v2.pull sending auto-ack: group=%s ns=%s ack_seq=%d raw_count=%d", group_id, ns, contig, len(raw_messages))
+                await self._await_ack("group.v2.ack", {
                     "group_id": group_id, "up_to_seq": contig,
                 }, f"V2 群消息 page auto-ack group={group_id}")
+            elif raw_messages and contig_advanced and contig > 0 and not owns_cursor:
+                self._log.debug(
+                    "client",
+                    "group.v2.pull 跳过外部 cursor 自动 ack: group=%s ns=%s device_id=%s slot_id=%s ack_seq=%d",
+                    group_id, ns, request_device_id, request_slot_id, contig,
+                )
 
             next_after = max(page_max_seq, next_after_seq)
+            if not owns_cursor:
+                break
             if not raw_messages or next_after <= next_after_seq or result.get("has_more") is False:
                 break
             next_after_seq = next_after
@@ -7097,6 +7163,13 @@ class AUNClient:
         response["messages"] = decrypted
         response["_contig_before"] = first_contig_before
         response["raw_count"] = total_raw_count
+        latest_available = max(
+            int(response.get("latest_seq") or 0),
+            int(response.get("latest_message_seq") or 0),
+            int((response.get("cursor") or {}).get("latest_seq") or 0) if isinstance(response.get("cursor"), dict) else 0,
+        )
+        if "has_more" not in response:
+            response["has_more"] = bool(total_raw_count and latest_available > latest_seq)
         if latest_seq:
             response["latest_seq"] = max(int(response.get("latest_seq") or 0), latest_seq)
         self._log.debug(
@@ -7125,7 +7198,12 @@ class AUNClient:
             )
             seq = max_seen
         self._log.debug("client", "group.v2.ack send: group=%s ns=%s up_to_seq=%d", group_id, ns, seq)
-        result = await self.call("group.v2.ack", {"group_id": group_id, "up_to_seq": seq})
+        cursor_params = {
+            key: params[key]
+            for key in ("device_id", "slot_id")
+            if key in params and params[key] is not None
+        }
+        result = await self.call("group.v2.ack", {"group_id": group_id, "up_to_seq": seq, **cursor_params})
         self._log.debug("client", "group.v2.ack ok: group=%s ns=%s requested=%d result=%s", group_id, ns, seq, result)
         return result
 
@@ -7494,8 +7572,8 @@ class AUNClient:
                 self._v2_auto_propose_last_snapshot[group_id] = membership_snapshot
                 return
             signature = ""
-            identity = self._identity
-            if identity and identity.get("private_key_pem"):
+            current_aid = self._current_aid
+            if current_aid and current_aid.private_key_pem:
                 try:
                     from cryptography.hazmat.primitives.asymmetric import ec as _ec
                     from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
@@ -7505,7 +7583,7 @@ class AUNClient:
                         "state_hash": state_hash,
                         "membership_snapshot": membership_snapshot,
                     }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-                    pk = _ser.load_pem_private_key(identity["private_key_pem"].encode("utf-8"), password=None)
+                    pk = _ser.load_pem_private_key(current_aid.private_key_pem.encode("utf-8"), password=None)
                     sig = pk.sign(sign_payload, _ec.ECDSA(_hashes.SHA256()))
                     signature = base64.b64encode(sig).decode("ascii")
                 except Exception as _sig_exc:

@@ -98,8 +98,37 @@ describe('浏览器 SDK v4 三主体 API', () => {
     expect(client.canSend).toBe(false);
   });
 
-  it('构造函数只接受 AID 对象或无参，不接受字符串 AID', () => {
+  it('loadIdentity 使用 AIDStore 写入的运行上下文重绑定 client 内部组件', async () => {
+    const aid = await createStoredAid('ctx.agentid.pub');
+    const client = new AUNClient();
+
+    client.loadIdentity(aid);
+
+    expect(client.aunPath).toBe(aid.aunPath);
+    expect((client as any).configModel.aunPath).toBe(aid.aunPath);
+    expect((client as any)._deviceId).toBe(aid.deviceId);
+    expect((client as any)._slotId).toBe(aid.slotId);
+    expect((client as any)._auth._deviceId).toBe(aid.deviceId);
+    expect((client as any)._auth._slotId).toBe(aid.slotId);
+  });
+
+  it('AIDStore 注册持久化路径应保留私钥材料', async () => {
+    const aidStr = 'reg-persist.agentid.pub';
+    const identity = makeIdentity(aidStr);
+    const store = new AIDStore({ aunPath: 'browser-aun-reg', encryptionSeed: 'reg-persist-seed' });
+
+    await (store as any)._auth._persistIdentity(identity);
+    const loaded = await store.load(aidStr);
+
+    expect(loaded.ok).toBe(true);
+    expect(loaded.ok ? loaded.data.aid.isPrivateKeyValid() : false).toBe(true);
+  });
+
+  it('构造函数只接受 AID 对象或无参，不接受旧配置对象', () => {
     expect(() => new (AUNClient as any)('alice.agentid.pub')).toThrow(/AID object/);
+    expect(() => new (AUNClient as any)({})).toThrow(/AID object/);
+    expect(() => new (AUNClient as any)({ aun_path: '/tmp/aun' })).toThrow(/AID object/);
+    expect(() => new (AUNClient as any)({ aid: 'alice.agentid.pub' })).toThrow(/AID object/);
   });
 
   it('实例级 protected_headers 只合并到消息类 RPC', async () => {

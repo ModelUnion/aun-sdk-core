@@ -309,6 +309,7 @@ func TestTokenGatewayReuseIntegration_ExpiredFallsBackToLogin(t *testing.T) {
 
 	// 手动把 instance_state 里的 access_token_expires_at 改成已过期
 	clientForEdit := makeReuseClient(t, sharedPath)
+	integrationLoadAIDIntoClient(t, clientForEdit, aid)
 	identity := clientForEdit.auth.LoadIdentityOrNil(aid)
 	if identity == nil {
 		_ = clientForEdit.Close()

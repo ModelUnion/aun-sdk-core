@@ -468,7 +468,7 @@ func (c *AUNClient) v2AutoProposeStateLocked(ctx context.Context, groupID string
 
 	c.mu.RLock()
 	myAID := c.aid
-	identity := c.identity
+	currentAID := c.currentAIDObj
 	c.mu.RUnlock()
 
 	myRole := ""
@@ -626,7 +626,10 @@ func (c *AUNClient) v2AutoProposeStateLocked(ctx context.Context, groupID string
 	}
 
 	signature := ""
-	privPEM, _ := identity["private_key_pem"].(string)
+	privPEM := ""
+	if currentAID != nil {
+		privPEM = currentAID.PrivateKeyPem
+	}
 	if privPEM != "" {
 		signPayloadMap := map[string]any{
 			"group_id":            groupID,

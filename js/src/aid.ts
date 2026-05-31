@@ -35,7 +35,8 @@ export class AID {
   readonly verifySsl: boolean;
   readonly rootCaPath: string | null;
   readonly debug: boolean;
-  private readonly _privateKeyPem: string | null;
+  /** AIDStore 加载时注入的明文私钥 PEM，供 AUNClient 直接使用（无需 seed）。*/
+  readonly privateKeyPem: string;
   private readonly _certValid: boolean;
   private readonly _privateKeyValid: boolean;
   private _certFingerprint = '';
@@ -55,7 +56,7 @@ export class AID {
     this.certIssuer = meta.issuer;
     this.certNotBefore = meta.notBefore;
     this.certNotAfter = meta.notAfter;
-    this._privateKeyPem = params.privateKeyPem;
+    this.privateKeyPem = params.privateKeyPem ?? '';
     this._certValid = params.certValid;
     this._privateKeyValid = params.privateKeyValid;
   }
@@ -79,10 +80,10 @@ export class AID {
   }
 
   async sign(payload: Uint8Array | string): Promise<Result<{ signature: string }>> {
-    if (!this._privateKeyValid || !this._privateKeyPem) return resultErr(codes.PRIVATE_KEY_NOT_VALID, 'private key is not valid');
+    if (!this._privateKeyValid || !this.privateKeyPem) return resultErr(codes.PRIVATE_KEY_NOT_VALID, 'private key is not valid');
     try {
       const data = typeof payload === 'string' ? new TextEncoder().encode(payload) : payload;
-      return resultOk({ signature: await signBytes(this._privateKeyPem, data) });
+      return resultOk({ signature: await signBytes(this.privateKeyPem, data) });
     } catch (exc) {
       return resultErr(codes.SIGNATURE_OPERATION_ERROR, String(exc), exc);
     }
@@ -99,10 +100,10 @@ export class AID {
   }
 
   async signAgentMd(content: string): Promise<Result<{ signed: string }>> {
-    if (!this._privateKeyValid || !this._privateKeyPem) return resultErr(codes.PRIVATE_KEY_NOT_VALID, 'private key is not valid');
+    if (!this._privateKeyValid || !this.privateKeyPem) return resultErr(codes.PRIVATE_KEY_NOT_VALID, 'private key is not valid');
     try {
       const payload = normalizeAgentMdPayload(content);
-      const signature = await signBytes(this._privateKeyPem, new TextEncoder().encode(payload));
+      const signature = await signBytes(this.privateKeyPem, new TextEncoder().encode(payload));
       return resultOk({ signed: payload + buildAgentMdSignatureBlock(this.certFingerprint, Date.now() / 1000, signature) });
     } catch (exc) {
       return resultErr(codes.SIGNATURE_OPERATION_ERROR, String(exc), exc);

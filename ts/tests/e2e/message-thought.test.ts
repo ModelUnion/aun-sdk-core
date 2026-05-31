@@ -12,28 +12,25 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
 import type { JsonObject } from '../../src/types.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const TEST_TIMEOUT = 90_000;
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 
 function runId(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
 function makeClient(): AUNClient {
-  const client = new AUNClient({
-    aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-message-thought-')),
+  return createTestClient({
+    aunPath: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-message-thought-')),
+    requireForwardSecrecy: false,
   });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
   await registerAndLoadIdentity(client, aid);
   await client.connect();
 }

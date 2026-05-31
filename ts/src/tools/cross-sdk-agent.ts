@@ -10,7 +10,6 @@ import { certificateSha256Fingerprint } from '../crypto.js';
 import type { JsonObject, RpcParams } from '../types.js';
 
 interface ClientInternals {
-  _gatewayUrl?: string | null;
   _configModel?: { requireForwardSecrecy?: boolean };
   _testSlotId?: string;
   _deviceId?: string;
@@ -106,7 +105,6 @@ class CrossSdkTsAgent {
   readonly aid = textOf(process.env.AUN_TEST_AID || 'cross-ts.agentid.pub').trim();
   readonly issuer = textOf(process.env.AUN_TEST_ISSUER || 'agentid.pub').trim() || 'agentid.pub';
   readonly gatewayAid = textOf(process.env.AUN_GATEWAY_AID || `gateway.${this.issuer}`).trim();
-  readonly gatewayUrl = textOf(process.env.AUN_GATEWAY_URL || '').trim();
   readonly slotId = textOf(process.env.AUN_TEST_SLOT_ID || `cross-sdk-ts-${crypto.randomUUID().slice(0, 8)}`).trim();
   readonly aunPath = textOf(process.env.AUN_TEST_AUN_PATH || process.env.AUN_DATA_ROOT || '/data/aun').trim();
   readonly debug = envBool('AUN_TEST_DEBUG', false);
@@ -123,7 +121,6 @@ class CrossSdkTsAgent {
     const internal = this.client as unknown as ClientInternals;
     if (internal._configModel) internal._configModel.requireForwardSecrecy = false;
     internal._testSlotId = this.slotId;
-    if (this.gatewayUrl) internal._gatewayUrl = this.gatewayUrl;
   }
 
   async start(): Promise<void> {
@@ -153,7 +150,6 @@ class CrossSdkTsAgent {
 
   async ensureConnected(): Promise<void> {
     const internal = this.client as unknown as ClientInternals;
-    if (this.gatewayUrl) internal._gatewayUrl = this.gatewayUrl;
     const store = new AIDStore({
       aunPath: this.aunPath,
       encryptionSeed: '',
@@ -179,8 +175,6 @@ class CrossSdkTsAgent {
       throw new Error(`load identity failed: ${loaded.error.code}: ${loaded.error.message}`);
     }
     this.client.loadIdentity(loaded.data.aid);
-    const internal2 = this.client as unknown as ClientInternals;
-    if (this.gatewayUrl) internal2._gatewayUrl = this.gatewayUrl;
     await this.client.connect();
   }
 
@@ -276,7 +270,6 @@ class CrossSdkTsAgent {
           aid: this.aid,
           language: this.language,
           sdk_version: this.sdkVersion,
-          gateway_url: textOf((this.client as unknown as ClientInternals)._gatewayUrl ?? ''),
           startup_error: this.startupError,
         });
         return;

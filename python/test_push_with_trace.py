@@ -7,13 +7,25 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
-from aun_core.client import AUNClient
+from aun_core import AIDStore, AUNClient
+
+
+def load_client(aun_path: str, aid: str) -> AUNClient:
+    store = AIDStore(aun_path, "", debug=True)
+    try:
+        loaded = store.load(aid)
+        if not loaded.ok or not loaded.data:
+            message = loaded.error.message if loaded.error else f"{aid} identity load failed"
+            raise RuntimeError(message)
+        return AUNClient(loaded.data["aid"])
+    finally:
+        store.close()
 
 async def main():
     # 初始化客户端
     aun_path = os.environ.get("AUN_DATA_ROOT", "/data/aun/single-domain/persistent")
-    alice = AUNClient(path=aun_path, aid="alice.agentid.pub", debug=True)
-    bob = AUNClient(path=aun_path, aid="bobb.agentid.pub", debug=True)
+    alice = load_client(aun_path, "alice.agentid.pub")
+    bob = load_client(aun_path, "bobb.agentid.pub")
     
     print("\n[SETUP] 连接 Alice 和 Bob...")
     await alice.connect()

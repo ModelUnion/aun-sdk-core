@@ -105,14 +105,17 @@ def help_cmd(ctx: typer.Context, commands: list[str] = typer.Argument(None, help
 
     import click
 
-    current_ctx = parent
-    current_command = parent.command
+    from typer.main import get_command
+
+    current_command = get_command(app)
+    current_ctx = click.Context(current_command, info_name="aun", parent=parent.parent if parent else None)
     for command_name in commands:
-        if not isinstance(current_command, click.Group):
+        get_command_func = getattr(current_command, "get_command", None)
+        if not callable(get_command_func):
             from aun_cli.output import output_error
             output_error(f"Command '{current_ctx.info_name}' has no subcommands")
             raise typer.Exit(2)
-        target = current_command.get_command(current_ctx, command_name)
+        target = get_command_func(current_ctx, command_name)
         if target is None:
             from aun_cli.output import output_error
             output_error(f"Unknown command: {' '.join(commands)}")

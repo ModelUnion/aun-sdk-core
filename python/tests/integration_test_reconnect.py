@@ -153,7 +153,7 @@ async def test_basic_reconnect_after_network_interrupt():
 
     client = _make_client("t1")
     state_events: list[dict] = []
-    client.on("connection.state", lambda d: state_events.append(d))
+    client.on("state_change", lambda d: state_events.append(d))
 
     try:
         await _ensure_connected(client, aid)
@@ -208,7 +208,7 @@ async def test_reconnect_after_gateway_restart():
 
     client = _make_client("t2")
     state_events: list[dict] = []
-    client.on("connection.state", lambda d: state_events.append(d))
+    client.on("state_change", lambda d: state_events.append(d))
 
     try:
         await _ensure_connected(client, aid)
@@ -256,7 +256,7 @@ async def test_state_events_sequence():
 
     client = _make_client("t3")
     state_sequence: list[str] = []
-    client.on("connection.state", lambda d: state_sequence.append(d.get("state", "")))
+    client.on("state_change", lambda d: state_sequence.append(d.get("state", "")))
 
     try:
         await _ensure_connected(client, aid)
@@ -362,7 +362,7 @@ async def test_reconnect_exhausted():
 
     client = _make_client("reconnect-exhausted")
     state_events: list[dict] = []
-    client.on("connection.state", lambda d: state_events.append(d))
+    client.on("state_change", lambda d: state_events.append(d))
 
     try:
         await ensure_connected_identity(client, aid, connect_options={

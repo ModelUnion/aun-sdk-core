@@ -18,28 +18,28 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { registerAndLoadIdentity, loadIdentityFromStore, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity, loadIdentityFromStore } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 
 function rid(): string { return crypto.randomUUID().replace(/-/g, '').slice(0, 8); }
 function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
 
-function makeClient(tag: string): AUNClient {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `aun-sep-${tag}-`));
-  const c = new AUNClient({ aun_path: dir, debug: false });
-  (c as any)._configModel.requireForwardSecrecy = false;
-  return c;
+function makeAunPath(tag: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), `aun-sep-${tag}-`));
+}
+
+function makeClient(tagOrPath: string, isPath: boolean = false): AUNClient {
+  const dir = isPath ? tagOrPath : makeAunPath(tagOrPath);
+  return createTestClient({ aunPath: dir, debug: false, requireForwardSecrecy: false });
 }
 
 async function connect(client: AUNClient, aid: string, slotId: string, register = false): Promise<void> {
   let lastErr: unknown;
   for (let i = 0; i < 3; i++) {
     try {
-      await setGatewayForClient(client, GATEWAY_AID);
       if (register) {
         await registerAndLoadIdentity(client, aid, slotId);
       } else {
@@ -67,8 +67,9 @@ describe('slot_id E2E — P2P 明文', { timeout: 60_000 }, () => {
     const aliceAid = `sep-ts-ea-${r}.${ISSUER}`;
     const bobAid = `sep-ts-eb-${r}.${ISSUER}`;
 
-    const c1 = makeClient('c1');
-    const c2 = makeClient('c2');
+    const alicePath = makeAunPath('alice-p2p-plain');
+    const c1 = makeClient(alicePath, true);
+    const c2 = makeClient(alicePath, true);
     const bob = makeClient('bob');
 
     try {
@@ -110,8 +111,9 @@ describe('slot_id E2E — P2P 加密', { timeout: 60_000 }, () => {
     const aliceAid = `sep-ts-fa-${r}.${ISSUER}`;
     const bobAid = `sep-ts-fb-${r}.${ISSUER}`;
 
-    const c1 = makeClient('c1');
-    const c2 = makeClient('c2');
+    const alicePath = makeAunPath('alice-p2p-enc');
+    const c1 = makeClient(alicePath, true);
+    const c2 = makeClient(alicePath, true);
     const bob = makeClient('bob');
 
     try {
@@ -151,8 +153,9 @@ describe('slot_id E2E — Group 明文', { timeout: 60_000 }, () => {
     const aliceAid = `sep-ts-ga-${r}.${ISSUER}`;
     const bobAid = `sep-ts-gb-${r}.${ISSUER}`;
 
-    const c1 = makeClient('c1');
-    const c2 = makeClient('c2');
+    const alicePath = makeAunPath('alice-group-plain');
+    const c1 = makeClient(alicePath, true);
+    const c2 = makeClient(alicePath, true);
     const bob = makeClient('bob');
 
     try {
@@ -203,8 +206,9 @@ describe('slot_id E2E — Group 加密', { timeout: 90_000 }, () => {
     const aliceAid = `sep-ts-gea-${r}.${ISSUER}`;
     const bobAid = `sep-ts-geb-${r}.${ISSUER}`;
 
-    const c1 = makeClient('c1');
-    const c2 = makeClient('c2');
+    const alicePath = makeAunPath('alice-group-enc');
+    const c1 = makeClient(alicePath, true);
+    const c2 = makeClient(alicePath, true);
     const bob = makeClient('bob');
 
     try {

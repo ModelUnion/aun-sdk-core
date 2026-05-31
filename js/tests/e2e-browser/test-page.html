@@ -11,16 +11,43 @@ import * as AUN from '../../dist/bundle.js';
 // 暴露给 Playwright 的 page.evaluate() 使用
 window.AUN = AUN;
 window.AUN_TEST_HELPERS = {
-  createStore(client) {
-    const model = client.configModel || {};
-    const config = client.config || {};
+  storeOptions(source = {}) {
+    const test = source.__testAunOptions || {};
+    const aid = source.currentAid || source;
+    const model = source.configModel || {};
+    const config = source.config || {};
+    const out = {
+      aunPath: test.aunPath || aid.aunPath || model.aunPath || config.aun_path || config.aunPath || 'aun',
+      encryptionSeed: test.encryptionSeed || model.encryptionSeed || model.seedPassword || config.encryption_seed || config.seed_password || '',
+      rootCaPem: test.rootCaPem || aid.rootCaPath || model.rootCaPem || null,
+      verifySsl: test.verifySsl ?? aid.verifySsl ?? (model.verifySsl !== false),
+    };
+    const deviceId = test.deviceId || aid.deviceId || '';
+    const slotId = test.slotId || aid.slotId || '';
+    if (deviceId) out.deviceId = deviceId;
+    if (slotId) out.slotId = slotId;
+    return out;
+  },
+
+  createStore(source = {}) {
+    const opts = this.storeOptions(source);
     return new AUN.AIDStore({
-      aunPath: model.aunPath || config.aun_path || config.aunPath || 'aun',
-      encryptionSeed: model.encryptionSeed || model.seedPassword || config.encryption_seed || config.seed_password || '',
-      rootCaPem: model.rootCaPem || null,
-      verifySsl: model.verifySsl !== false,
-      discoveryPort: model.discoveryPort || null,
+      aunPath: opts.aunPath,
+      encryptionSeed: opts.encryptionSeed,
+      rootCaPem: opts.rootCaPem,
+      verifySsl: opts.verifySsl,
+      ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
+      ...(opts.slotId ? { slotId: opts.slotId } : {}),
     });
+  },
+
+  createClient(options = {}) {
+    const client = new AUN.AUNClient();
+    client.__testAunOptions = { ...options };
+    if (client.configModel && options.requireForwardSecrecy !== undefined) {
+      client.configModel.requireForwardSecrecy = options.requireForwardSecrecy;
+    }
+    return client;
   },
 
   issuerFromAid(aid) {
@@ -44,42 +71,70 @@ window.AUN_TEST_HELPERS = {
     throw lastError || new Error(`gateway discovery failed for ${issuer}`);
   },
 
-  async registerIdentity(client, aid) {
-    const store = this.createStore(client);
+  async registerIdentity(clientOrOptions, aid) {
+    const store = this.createStore(clientOrOptions);
     const result = await store.register(aid);
     if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
     return result.data;
   },
 
-  async loadIdentity(client, aid) {
-    const store = this.createStore(client);
+  async loadPreparedIdentity(aid, options = {}) {
+    const store = this.createStore(options);
     const loaded = await store.load(aid);
     if (!loaded.ok || !loaded.data?.aid) {
       throw new Error(`load identity failed for ${aid}: ${loaded.ok ? 'empty result' : loaded.error.message}`);
     }
-    client.loadIdentity(loaded.data.aid);
     return loaded.data.aid;
   },
 
-  async registerAndLoadIdentity(client, aid) {
-    const store = this.createStore(client);
+  async prepareIdentity(aid, options = {}) {
+    const store = this.createStore(options);
     const registered = await store.register(aid);
     if (!registered.ok) {
       const existing = await store.load(aid);
       if (existing.ok && existing.data?.aid?.isPrivateKeyValid()) {
-        client.loadIdentity(existing.data.aid);
         return existing.data.aid;
       }
       throw new Error(`${registered.error.code}: ${registered.error.message}`);
     }
-    return await this.loadIdentity(client, aid);
+    return await this.loadPreparedIdentity(aid, options);
+  },
+
+  async loadIdentity(client, aid, options = {}) {
+    const aidObj = await this.loadPreparedIdentity(aid, { ...(client.__testAunOptions || {}), ...options });
+    client.loadIdentity(aidObj);
+    return aidObj;
+  },
+
+  async registerAndLoadIdentity(client, aid, options = {}) {
+    const aidObj = await this.prepareIdentity(aid, { ...(client.__testAunOptions || {}), ...options });
+    client.loadIdentity(aidObj);
+    return aidObj;
+  },
+
+  async createClientWithIdentity(aid, options = {}) {
+    const aidObj = await this.prepareIdentity(aid, options);
+    const client = new AUN.AUNClient(aidObj);
+    client.__testAunOptions = { ...options };
+    if (client.configModel && options.requireForwardSecrecy !== undefined) {
+      client.configModel.requireForwardSecrecy = options.requireForwardSecrecy;
+    }
+    return client;
   },
 
   async connectIdentity(client, aid, options = {}) {
-    const gateway = options.gateway || client.gatewayUrl || await this.resolveGateway(client, aid);
-    client.gatewayUrl = gateway;
-    await this.registerAndLoadIdentity(client, aid);
-    await client.connect({ ...options, gateway });
+    const connectOptions = { ...options };
+    delete connectOptions.gateway;
+    const identityOptions = {
+      ...(client.__testAunOptions || {}),
+      ...(connectOptions.identity || {}),
+    };
+    delete connectOptions.identity;
+    if (!client.hasIdentity) {
+      await this.registerAndLoadIdentity(client, aid, identityOptions);
+    }
+    await client.connect(connectOptions);
+    return client;
   },
 };
 window.testReady = true;

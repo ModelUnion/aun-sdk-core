@@ -54,8 +54,24 @@ def _generate_ecdsa_keypair():
 
 def _make_client_with_identity(tmp_path):
     """创建带有完整 identity（含私钥和证书）的 client。"""
+    import dataclasses
+    from aun_core.aid import AID
+    from cryptography import x509 as _x509
     private_key_pem, cert_pem, cert_fingerprint = _generate_ecdsa_keypair()
-    client = AUNClient()
+    cert_obj = _x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    from cryptography.hazmat.primitives import serialization
+    private_key_obj = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+    aid_obj = AID._create(
+        aid="test.example.com",
+        aun_path=str(tmp_path),
+        cert_pem=cert_pem,
+        cert_obj=cert_obj,
+        private_key_obj=private_key_obj,
+        cert_valid=True,
+        private_key_valid=True,
+        private_key_pem=private_key_pem,
+    )
+    client = AUNClient(aid_obj)
     client._identity = {
         "aid": "test.example.com",
         "private_key_pem": private_key_pem,
@@ -184,26 +200,23 @@ class TestSignClientOperation:
 
     def test_no_identity_no_signature(self, tmp_path):
         client = AUNClient()
-        client._identity = None
         params = {"group_id": "g-test"}
         client._sign_client_operation("group.update", params)
         assert "client_signature" not in params
 
     def test_no_private_key_no_signature(self, tmp_path):
+        # 无 AID（无私钥）时不应生成签名
         client = AUNClient()
-        client._identity = {"aid": "test.example.com"}
         params = {"group_id": "g-test"}
         client._sign_client_operation("group.update", params)
         assert "client_signature" not in params
 
     def test_sign_failure_raises_instead_of_silent_downgrade(self, tmp_path):
         """签名失败时应抛出异常，而非静默降级到无签名请求（PY-012）。"""
-        client = AUNClient()
-        client._identity = {
-            "aid": "test.example.com",
-            "private_key_pem": "INVALID-NOT-A-PEM-KEY",  # 故意给无效私钥
-            "cert": "also-invalid",
-        }
+        import dataclasses
+        client, _ = _make_client_with_identity(tmp_path)
+        # 注入无效私钥到 _current_aid，触发签名失败
+        client._current_aid = dataclasses.replace(client._current_aid, private_key_pem="INVALID-NOT-A-PEM-KEY")
         params = {"group_id": "g-test"}
         with pytest.raises(Exception):
             client._sign_client_operation("group.update", params)
@@ -212,13 +225,10 @@ class TestSignClientOperation:
 
     def test_no_cert_empty_fingerprint(self, tmp_path):
         """没有证书时 cert_fingerprint 为空字符串。"""
-        private_key_pem, _, _ = _generate_ecdsa_keypair()
-        client = AUNClient()
-        client._identity = {
-            "aid": "test.example.com",
-            "private_key_pem": private_key_pem,
-            # 不设 cert
-        }
+        import dataclasses
+        client, _ = _make_client_with_identity(tmp_path)
+        # 清空证书，保留私钥
+        client._current_aid = dataclasses.replace(client._current_aid, cert_pem="")
         params = {"group_id": "g-test"}
         client._sign_client_operation("group.update", params)
         cs = params["client_signature"]

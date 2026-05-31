@@ -73,6 +73,30 @@ func saveTestIdentity(t *testing.T, s *AIDStore, aid, certPEM, privPEM, pubB64 s
 	}
 }
 
+func TestAIDStoreRegisterPersistenceKeepsPrivateKeyMaterial(t *testing.T) {
+	s := newTestAIDStore(t)
+	aid := "register-persist.aid.com"
+	certPEM, privPEM, pubB64 := genAIDIdentity(t, aid, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	if err := s.client.auth.persistIdentity(map[string]any{
+		"aid":                aid,
+		"private_key_pem":    privPEM,
+		"public_key_der_b64": pubB64,
+		"curve":              "P-256",
+		"cert":               certPEM,
+	}); err != nil {
+		t.Fatalf("AIDStore 注册持久化失败: %v", err)
+	}
+
+	r := s.Load(aid)
+	if !r.Ok {
+		t.Fatalf("持久化后 Load 失败: %v", r.Error.Message)
+	}
+	if !r.Data.AID.IsPrivateKeyValid() {
+		t.Fatal("AIDStore 注册路径必须保留私钥材料，供 AUNClient(AID) 后续连接使用")
+	}
+}
+
 // ── AIDStore.Load ─────────────────────────────────────────────
 
 func TestAIDStoreLoad_Success(t *testing.T) {

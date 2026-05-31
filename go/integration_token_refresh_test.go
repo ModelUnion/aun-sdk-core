@@ -31,15 +31,29 @@ func TestIntegration_TokenRefreshRotatesAccessToken(t *testing.T) {
 		t.Fatal("初始 access_token 为空")
 	}
 
+	forcedExpiresAt := time.Now().Unix() + 60
+	client.mu.Lock()
+	if client.identity == nil {
+		client.mu.Unlock()
+		t.Fatal("认证后 client.identity 为空")
+	}
+	client.identity["access_token_expires_at"] = forcedExpiresAt
+	identityForPersist := copyMapShallow(client.identity)
+	client.mu.Unlock()
+	if err := client.auth.persistIdentity(identityForPersist); err != nil {
+		t.Fatalf("调整 access_token_expires_at 失败: %v", err)
+	}
+	t.Logf("token refresh prepared: aid=%s forced_expires_at=%d", aid, forcedExpiresAt)
+
 	if err := client.Connect(ctx, ConnectionOptions{
-		AutoReconnect:      boolPtr(false),
-		TokenRefreshBefore: 3590 * time.Second,
+		AutoReconnect: boolPtr(false),
 	}); err != nil {
 		t.Fatalf("连接失败: %v", err)
 	}
 
 	deadline := time.Now().Add(45 * time.Second)
 	var refreshedToken string
+	nextLog := time.Now()
 	for time.Now().Before(deadline) {
 		client.mu.RLock()
 		if client.identity != nil {
@@ -48,6 +62,10 @@ func TestIntegration_TokenRefreshRotatesAccessToken(t *testing.T) {
 		client.mu.RUnlock()
 		if refreshedToken != "" && refreshedToken != initialToken {
 			break
+		}
+		if !time.Now().Before(nextLog) {
+			t.Logf("waiting token refresh: aid=%s refreshed=%t", aid, refreshedToken != "")
+			nextLog = time.Now().Add(5 * time.Second)
 		}
 		time.Sleep(time.Second)
 	}

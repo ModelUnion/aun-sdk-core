@@ -64,8 +64,10 @@ async function installHelpers(page: any): Promise<void> {
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
     const makeAndConnect = async (aid: string): Promise<any> => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({ issuer, debug: true });
+      const cleanAid = String(aid).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const client = w.AUN_TEST_HELPERS.createClient({
+        aunPath: `js-v2-thought-${cleanAid}`,
+      });
       await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
       return client;
     };

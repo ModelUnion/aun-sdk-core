@@ -1,25 +1,89 @@
-import { AID, AIDStore, AUNClient } from '../src/index.js';
+import { AID, AIDStore, AUNClient, GatewayDiscovery } from '../src/index.js';
+
+export type TestAIDStoreOptions = {
+  aunPath: string;
+  encryptionSeed?: string;
+  verifySsl?: boolean;
+  rootCaPath?: string | null;
+  debug?: boolean;
+  deviceId?: string;
+  slotId?: string;
+};
+
+export type TestClientOptions = TestAIDStoreOptions & {
+  requireForwardSecrecy?: boolean;
+};
+
+export function createAIDStore(opts: TestAIDStoreOptions): AIDStore {
+  return new AIDStore({
+    aunPath: opts.aunPath,
+    encryptionSeed: opts.encryptionSeed ?? '',
+    verifySsl: opts.verifySsl ?? false,
+    rootCaPath: opts.rootCaPath ?? null,
+    debug: opts.debug ?? false,
+    ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
+    ...(opts.slotId ? { slotId: opts.slotId } : {}),
+  });
+}
+
+export async function prepareIdentity(opts: TestAIDStoreOptions & { aid: string }): Promise<AID> {
+  const store = createAIDStore(opts);
+  const registered = await store.register(opts.aid);
+  if (!registered.ok) {
+    const existing = store.load(opts.aid);
+    if (existing.ok && existing.data?.aid.isPrivateKeyValid()) {
+      return existing.data.aid;
+    }
+    throw new Error(`${registered.error.code}: ${registered.error.message}`);
+  }
+  const loaded = store.load(opts.aid);
+  if (!loaded.ok || !loaded.data) {
+    throw new Error(`load identity failed for ${opts.aid}: ${loaded.ok ? 'empty result' : loaded.error.message}`);
+  }
+  return loaded.data.aid;
+}
+
+export function loadPreparedIdentity(opts: TestAIDStoreOptions & { aid: string }): AID {
+  const store = createAIDStore(opts);
+  const loaded = store.load(opts.aid);
+  if (!loaded.ok || !loaded.data) {
+    throw new Error(`load identity failed for ${opts.aid}: ${loaded.ok ? 'empty result' : loaded.error.message}`);
+  }
+  return loaded.data.aid;
+}
+
+export async function createClientWithIdentity(opts: TestAIDStoreOptions & { aid: string }): Promise<AUNClient> {
+  return new AUNClient(await prepareIdentity(opts));
+}
+
+export function createClientFromStore(opts: TestAIDStoreOptions & { aid: string }): AUNClient {
+  return new AUNClient(loadPreparedIdentity(opts));
+}
 
 function clientAunPath(client: AUNClient): string {
   const config = (client as unknown as {
+    __testAunPath?: string;
     config: Record<string, unknown>;
     _configModel?: { aunPath?: string };
   });
   return String(
-    config._configModel?.aunPath
+    config.__testAunPath
+      ?? config._configModel?.aunPath
       ?? config.config.aun_path
       ?? config.config.aunPath
-      ?? '',
+      ?? 'aun',
   );
 }
 
 function clientEncryptionSeed(client: AUNClient): string {
   const config = (client as unknown as {
+    __testEncryptionSeed?: string;
     config: Record<string, unknown>;
     _configModel?: { seedPassword?: string; encryptionSeed?: string };
   });
   return String(
-    config._configModel?.encryptionSeed
+    config.__testEncryptionSeed
+      ?? config._configModel?.encryptionSeed
       ?? config._configModel?.seedPassword
       ?? config.config.encryption_seed
       ?? config.config.encryptionSeed
@@ -29,16 +93,52 @@ function clientEncryptionSeed(client: AUNClient): string {
   );
 }
 
+function clientVerifySsl(client: AUNClient): boolean {
+  const raw = client as unknown as {
+    __testVerifySsl?: boolean;
+    _configModel?: { verifySsl?: boolean };
+  };
+  return Boolean(raw.__testVerifySsl ?? raw._configModel?.verifySsl ?? false);
+}
+
+function clientDiscoveryPort(client: AUNClient): string {
+  const raw = client as unknown as {
+    _configModel?: { discoveryPort?: number | null };
+  };
+  const port = raw._configModel?.discoveryPort;
+  return port ? `:${port}` : '';
+}
+
 export function createAIDStoreForClient(client: AUNClient, slotId?: string): AIDStore {
-  const model = (client as any)._configModel ?? {};
+  const raw = client as any;
+  const model = raw._configModel ?? {};
   return new AIDStore({
     aunPath: clientAunPath(client),
     encryptionSeed: clientEncryptionSeed(client),
-    verifySsl: Boolean(model.verifySsl ?? false),
-    discoveryPort: model.discoveryPort ?? null,
-    rootCaPath: model.rootCaPath ?? null,
+    verifySsl: Boolean(raw.__testVerifySsl ?? model.verifySsl ?? false),
+    rootCaPath: raw.__testRootCaPath ?? model.rootCaPath ?? null,
+    debug: Boolean(raw.__testDebug ?? model.debug ?? false),
+    ...(raw.__testDeviceId ?? raw._deviceId ? { deviceId: raw.__testDeviceId ?? raw._deviceId } : {}),
     ...(slotId ? { slotId } : {}),
   });
+}
+
+export function configureTestClient(client: AUNClient, opts: TestClientOptions): AUNClient {
+  const raw = client as any;
+  raw.__testAunPath = opts.aunPath;
+  if (opts.encryptionSeed !== undefined) raw.__testEncryptionSeed = opts.encryptionSeed;
+  if (opts.verifySsl !== undefined) raw.__testVerifySsl = opts.verifySsl;
+  if (opts.rootCaPath !== undefined) raw.__testRootCaPath = opts.rootCaPath;
+  if (opts.debug !== undefined) raw.__testDebug = opts.debug;
+  if (opts.deviceId) raw.__testDeviceId = opts.deviceId;
+  if (raw._configModel && opts.requireForwardSecrecy !== undefined) {
+    raw._configModel.requireForwardSecrecy = opts.requireForwardSecrecy;
+  }
+  return client;
+}
+
+export function createTestClient(opts: TestClientOptions): AUNClient {
+  return configureTestClient(new AUNClient(), opts);
 }
 
 export async function registerIdentity(client: AUNClient, aid: string): Promise<void> {
@@ -73,12 +173,58 @@ export function loadIdentityFromStore(client: AUNClient, aid: string, slotId?: s
   return loaded.data.aid;
 }
 
+export function moveAccessTokenExpiryIntoRefreshWindow(client: AUNClient, secondsFromNow = 60): number {
+  const raw = client as any;
+  const aid = String(raw._currentAid?.aid ?? client.currentAid?.aid ?? raw._aid ?? '').trim();
+  if (!aid) throw new Error('moveAccessTokenExpiryIntoRefreshWindow requires loaded AID');
+  const deviceId = String(raw._deviceId ?? raw._currentAid?.deviceId ?? client.currentAid?.deviceId ?? '');
+  const slotId = String(raw._slotId ?? raw._currentAid?.slotId ?? client.currentAid?.slotId ?? 'default');
+  const expiresAt = Math.floor(Date.now() / 1000) + secondsFromNow;
+  const store = createAIDStoreForClient(client, slotId);
+  try {
+    const keystore = (store as any)._keystore;
+    if (typeof keystore?.updateInstanceState !== 'function') {
+      throw new Error('test keystore does not support updateInstanceState');
+    }
+    keystore.updateInstanceState(aid, deviceId, slotId, (state: Record<string, unknown>) => {
+      state.access_token_expires_at = expiresAt;
+      return state;
+    });
+  } finally {
+    store.close();
+  }
+  if (raw._identity && String(raw._identity.aid ?? '') === aid) {
+    raw._identity.access_token_expires_at = expiresAt;
+  }
+  return expiresAt;
+}
+
 export async function resolveGateway(client: AUNClient, aid?: string): Promise<string> {
-  return await (client as any)._resolveGatewayForAid(aid ?? client.currentAid?.aid ?? '');
+  const target = String(aid ?? client.currentAid?.aid ?? '').trim();
+  const dotIdx = target.indexOf('.');
+  const issuerDomain = dotIdx >= 0 ? target.slice(dotIdx + 1) : target;
+  const discoveryPort = clientDiscoveryPort(client);
+  const candidates = [
+    `https://${target}${discoveryPort}/.well-known/aun-gateway`,
+    `https://gateway.${issuerDomain}${discoveryPort}/.well-known/aun-gateway`,
+  ];
+  const discovery = new GatewayDiscovery({ verifySsl: clientVerifySsl(client) });
+  let lastError: unknown = null;
+  for (const url of candidates) {
+    try {
+      return await discovery.discover(url);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`gateway discovery failed for ${target}`);
 }
 
 export async function setGatewayForClient(client: AUNClient, aid?: string): Promise<string> {
-  const gateway = await resolveGateway(client, aid);
-  (client as any)._gatewayUrl = gateway;
-  return gateway;
+  return await resolveGateway(client, aid);
+}
+
+export async function checkGatewayHealth(client: AUNClient, gateway: string, timeoutMs = 5_000): Promise<boolean> {
+  const discovery = new GatewayDiscovery({ verifySsl: clientVerifySsl(client) });
+  return await discovery.checkHealth(gateway, timeoutMs);
 }

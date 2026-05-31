@@ -110,22 +110,29 @@ describe('AUNClient.connect 参数校验', () => {
   it('未加载 AID 时抛出 StateError', async () => {
     const client = new AUNClient();
     await expect(
-      client.connect({ gateway: 'ws://localhost:20001/aun' } as any),
+      client.connect({}),
     ).rejects.toThrow(StateError);
+  });
+
+  it('不接受外部 gateway 参数', async () => {
+    const client = new AUNClient();
+    await expect(
+      client.connect({ gateway: 'ws://localhost:20001/aun' } as any),
+    ).rejects.toThrow(/unsupported field\(s\): gateway/);
   });
 
   it('不接受旧版 access_token 参数', async () => {
     const client = new AUNClient();
     await expect(
       client.connect({ access_token: 'tok_123' } as any),
-    ).rejects.toThrow(ValidationError);
+    ).rejects.toThrow(/unsupported field\(s\): access_token/);
   });
 
   it('不接受旧版 aid/token 混入 connect options', async () => {
     const client = new AUNClient();
     await expect(
       client.connect({ aid: 'alice.agentid.pub' } as any),
-    ).rejects.toThrow(ValidationError);
+    ).rejects.toThrow(/unsupported field\(s\): aid/);
   });
 });
 
@@ -451,11 +458,72 @@ describe('AUNClient.connect V2 session 初始化', () => {
     const initV2Spy = vi.spyOn(client as any, '_initV2Session').mockResolvedValue(undefined);
 
     await client.connect({
-      gateway: 'ws://gateway.example.com/aun',
-    } as any);
+      background_sync: false,
+    });
 
     expect(initV2Spy).toHaveBeenCalledTimes(1);
     expect(client.state).toBe('ready');
+  });
+
+  it('短连接 connect 不应同步等待 V2 session 初始化', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
+    (client as any)._state = 'standby';
+    (client as any)._transport.connect = vi.fn().mockResolvedValue({ nonce: 'challenge' });
+    (client as any)._auth.connectSession = vi.fn().mockResolvedValue({ token: 'tok-1', identity: { aid: 'alice.agentid.pub' }, hello: {} });
+    (client as any)._gatewayUrl = 'ws://gateway.example.com/aun';
+    (client as any)._startBackgroundTasks = vi.fn();
+    const initV2Spy = vi.spyOn(client as any, '_initV2Session').mockImplementation(
+      () => new Promise<void>(() => {}),
+    );
+
+    await client.connect({
+      connection_kind: 'short',
+      auto_reconnect: false,
+    });
+
+    expect(initV2Spy).not.toHaveBeenCalled();
+    expect(client.state).toBe('ready');
+  });
+
+  it('业务入口需要 V2 时应按需初始化 session', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
+    const initV2Spy = vi.spyOn(client as any, '_initV2Session').mockImplementation(async () => {
+      (client as any)._v2Session = { aid: 'alice.agentid.pub', deviceId: 'default' };
+    });
+
+    await (client as any)._ensureV2SessionReady('message.send');
+
+    expect(initV2Spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('connect 拒绝非规范 token_refresh_before 字段', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'standby';
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
+    (client as any)._gatewayUrl = 'ws://gateway.example.com/aun';
+    (client as any)._connectOnce = vi.fn().mockResolvedValue(undefined);
+    (client as any)._transport.setTimeout = vi.fn();
+
+    await expect(client.connect({
+      auto_reconnect: false,
+      heartbeat_interval: 0,
+      token_refresh_before: 3590,
+      background_sync: false,
+    } as any)).rejects.toThrow(/unsupported field\(s\): token_refresh_before/);
   });
 });
 
@@ -1177,6 +1245,79 @@ describe('AUNClient E2EE V2-only 编排', () => {
     return client;
   }
 
+  it('group.pull 使用外部 cursor 时应保留 after_message_seq=0、透传设备槽位且不自动 ack', async () => {
+    const client = makeV2Client();
+    (client as any)._seqTracker.forceContiguousSeq('group:g1', 3);
+    const transportCall = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.v2.pull') {
+        return {
+          messages: [
+            {
+              version: 'v1',
+              seq: 1,
+              message_id: 'gm-sync-1',
+              from_aid: 'bob.aid.com',
+              payload: { type: 'text', text: 'sync-1' },
+            },
+          ],
+          cursor: { latest_seq: 3 },
+        };
+      }
+      return { ok: true };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await client.call('group.pull', {
+      group_id: 'g1',
+      after_message_seq: 0,
+      limit: 2,
+      device_id: 'sync-dev-a',
+      slot_id: 'sync-slot-a',
+      device_name: '同步测试设备 A',
+      device_type: 'test',
+    });
+    await Promise.resolve();
+
+    expect((result.messages as Array<Record<string, unknown>>).map((msg) => msg.seq)).toEqual([1]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull')).toEqual([
+      ['group.v2.pull', {
+        group_id: 'g1',
+        after_seq: 0,
+        limit: 2,
+        device_id: 'sync-dev-a',
+        slot_id: 'sync-slot-a',
+        device_name: '同步测试设备 A',
+        device_type: 'test',
+      }, undefined, undefined, true],
+    ]);
+    expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.ack')).toBe(false);
+  });
+
+  it('group.ack_messages 使用外部 cursor 时应走原始 RPC 而不是 group.v2.ack', async () => {
+    const client = makeV2Client();
+    (client as any)._seqTracker.forceContiguousSeq('group:g1', 3);
+    const transportCall = vi.fn().mockResolvedValue({ ok: true, acked: 1 });
+    (client as any)._transport.call = transportCall;
+
+    await client.call('group.ack_messages', {
+      group_id: 'g1',
+      msg_seq: 1,
+      device_id: 'sync-dev-a',
+      slot_id: 'sync-slot-a',
+    });
+
+    expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.ack')).toBe(false);
+    expect(transportCall.mock.calls).toContainEqual([
+      'group.ack_messages',
+      expect.objectContaining({
+        group_id: 'g1',
+        msg_seq: 1,
+        device_id: 'sync-dev-a',
+        slot_id: 'sync-slot-a',
+      }),
+    ]);
+  });
+
 
 
   it('V2 e2ee 元数据应暴露 payload_type 并支持 protected_headers 回退', () => {
@@ -1616,6 +1757,39 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([]);
   });
 
+  it('message.v2.pull 服务端 ack 落后于本地 contiguous_seq 时应补 ack', async () => {
+    const client = makeV2Client();
+    const ns = 'p2p:alice.aid.com';
+    (client as any)._seqTracker.forceContiguousSeq(ns, 5);
+    (client as any)._decryptV2Message = vi.fn().mockResolvedValue(null);
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'message.v2.pull') {
+        return {
+          has_more: false,
+          server_ack_seq: 4,
+          messages: [{
+            version: 'v2',
+            seq: 5,
+            message_id: 'm-lag-5',
+            from_aid: 'bob.aid.com',
+            envelope_json: '{}',
+          }],
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await (client as any)._pullV2(5, 10);
+    await Promise.resolve();
+
+    expect(result).toEqual([]);
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([
+      ['message.v2.ack', { up_to_seq: 5 }, undefined, undefined, true],
+    ]);
+  });
+
   it('message.v2.pull 发布事件时应已推进 contiguous_seq，且本页只 ack 一次', async () => {
     const client = makeV2Client();
     const ns = 'p2p:alice.aid.com';
@@ -1698,6 +1872,39 @@ describe('AUNClient E2EE V2-only 编排', () => {
     expect(result.map((msg) => msg.seq)).toEqual([5]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([]);
+  });
+
+  it('group.v2.pull 服务端 cursor 落后于本地 contiguous_seq 时应补 ack', async () => {
+    const client = makeV2Client();
+    const ns = 'group:g1';
+    (client as any)._seqTracker.forceContiguousSeq(ns, 5);
+    (client as any)._decryptV2Message = vi.fn().mockResolvedValue(null);
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'group.v2.pull') {
+        return {
+          has_more: false,
+          cursor: { current_seq: 4, latest_seq: 5 },
+          messages: [{
+            version: 'v2',
+            seq: 5,
+            message_id: 'gm-lag-5',
+            from_aid: 'bob.aid.com',
+            envelope_json: '{}',
+          }],
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    await Promise.resolve();
+
+    expect(result).toEqual([]);
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
+      ['group.v2.ack', { group_id: 'g1', up_to_seq: 5, device_id: 'device-001', slot_id: 'slot-a' }, undefined, undefined, true],
+    ]);
   });
 
   it('group.v2.pull 发布事件时应已推进 contiguous_seq，且本页只 ack 一次', async () => {

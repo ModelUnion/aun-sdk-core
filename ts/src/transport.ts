@@ -287,6 +287,7 @@ export class RPCTransport {
   private _dnsNet: import('./net.js').DnsResilientNet | null = null;
   private _ws: WebSocket | null = null;
   private _closed = true;
+  private _lastCloseCode: number | null = null;
   private _challenge: RpcMessage | null = null;
   private _pending: Map<string, PendingRpc> = new Map();
   private _pendingMeta: Map<string, PendingRpcMeta> = new Map();
@@ -441,6 +442,7 @@ export class RPCTransport {
         if (initialResolved) return;
         this._ws = ws;
         this._closed = false;
+        this._lastCloseCode = null;
         this._logger.debug('WebSocket open, waiting for challenge');
         // 等待第一条消息作为 challenge
       };
@@ -564,7 +566,10 @@ export class RPCTransport {
     background = false,
   ): Promise<RpcResult> {
     if (this._closed || !this._ws) {
-      throw new ConnectionError('transport not connected');
+      const suffix = this._lastCloseCode !== null ? `: close code ${this._lastCloseCode}` : '';
+      throw new ConnectionError(`transport not connected${suffix}`, {
+        ...(this._lastCloseCode !== null ? { code: this._lastCloseCode } : {}),
+      });
     }
 
     const rpcId = `rpc-${crypto.randomBytes(8).toString('hex')}`;
@@ -789,6 +794,7 @@ export class RPCTransport {
     ws.on('close', (code: number) => {
       const wasClosed = this._closed;
       this._closed = true;
+      this._lastCloseCode = Number.isFinite(code) ? code : null;
       this._logger.debug(`WebSocket closed: code=${code}, intentional close=${wasClosed}`);
       const err = new ConnectionError(`websocket closed: code=${code}`);
       for (const [, pending] of this._pending) {

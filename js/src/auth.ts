@@ -452,6 +452,7 @@ export class AuthFlow {
   private _slotId: string;
   private _rootCaPem: string | null;
   private _verifySsl: boolean;
+  private _persistKeyMaterial = false;
 
   // 缓存
   private _rootCerts: ParsedCert[] | null = null;
@@ -1859,6 +1860,12 @@ export class AuthFlow {
     for (const key of AuthFlow._INSTANCE_STATE_FIELDS) {
       if (key in persisted) {
         instanceStateRecord[key] = persistedRecord[key];
+        delete persistedRecord[key];
+      }
+    }
+    // 普通 AUNClient 认证/刷新路径不写密钥材料；AIDStore 注册路径需要保留 keypair。
+    if (!this._persistKeyMaterial) {
+      for (const key of ['private_key_pem', 'public_key_der_b64', 'curve']) {
         delete persistedRecord[key];
       }
     }

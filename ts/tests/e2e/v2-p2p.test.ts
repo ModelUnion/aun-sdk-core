@@ -18,14 +18,13 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 // ── 环境配置 ──────────────────────────────────────────────────
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 
 const TEST_TIMEOUT = 60_000;
 
@@ -41,13 +40,10 @@ function sleep(ms: number): Promise<void> {
 
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-v2-p2p-'));
-  const client = new AUNClient({ aun_path: tmpDir, debug: true });
-  (client as any)._configModel.requireForwardSecrecy = false;
-  return client;
+  return createTestClient({ aunPath: tmpDir, debug: true, requireForwardSecrecy: false });
 }
 
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
   await registerAndLoadIdentity(client, aid);
   await client.connect({ auto_reconnect: false });
   // V2 session 需要手动初始化

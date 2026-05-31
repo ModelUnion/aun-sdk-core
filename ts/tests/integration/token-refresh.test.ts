@@ -4,7 +4,11 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { AUNClient } from '../../src/index.js';
-import { registerAndLoadIdentity } from '../test-support.js';
+import {
+  createTestClient,
+  moveAccessTokenExpiryIntoRefreshWindow,
+  registerAndLoadIdentity,
+} from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -13,11 +17,10 @@ function runId(): string {
 }
 
 function makeClient(): AUNClient {
-  const client = new AUNClient({
-    aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-refresh-ts-')),
+  return createTestClient({
+    aunPath: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-refresh-ts-')),
+    requireForwardSecrecy: false,
   });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -37,18 +40,24 @@ describe('Token refresh 集成测试', () => {
       const auth = await client.authenticate();
       const initialToken = String(auth.access_token ?? '');
       expect(initialToken).not.toBe('');
+      const forcedExpiresAt = moveAccessTokenExpiryIntoRefreshWindow(client, 60);
+      console.log(`token-refresh ts aid=${aid} forced_expires_at=${forcedExpiresAt}`);
 
       await client.connect({
         auto_reconnect: false,
         heartbeat_interval: 0,
-        token_refresh_before: 3590,
       });
 
       const deadline = Date.now() + 45_000;
       let refreshedToken = '';
+      let lastLogAt = 0;
       while (Date.now() < deadline) {
         refreshedToken = String(((client as any)._identity?.access_token) ?? '');
         if (refreshedToken && refreshedToken !== initialToken) break;
+        if (Date.now() - lastLogAt >= 5_000) {
+          lastLogAt = Date.now();
+          console.log(`token-refresh ts waiting aid=${aid} events=${refreshEvents.length}`);
+        }
         await sleep(1000);
       }
 

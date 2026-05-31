@@ -33,12 +33,11 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { loadIdentityFromStore, registerAndLoadIdentity, registerIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, loadIdentityFromStore, registerAndLoadIdentity, registerIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 const AUN_DATA_ROOT = (process.env.AUN_DATA_ROOT ?? '').trim();
 
 // ── 辅助函数 ──────────────────────────────────────────────────────
@@ -64,15 +63,7 @@ function makeAunPath(tag: string): string {
  */
 function makeClient(tagOrPath: string, isPath: boolean = false): AUNClient {
   const root = isPath ? tagOrPath : makeAunPath(tagOrPath);
-  const client = new AUNClient({ aun_path: root, debug: false });
-  ((client as unknown) as {
-    _configModel: { requireForwardSecrecy: boolean };
-  })._configModel.requireForwardSecrecy = false;
-  return client;
-}
-
-async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+  return createTestClient({ aunPath: root, debug: false, requireForwardSecrecy: false });
 }
 
 async function connectLong(
@@ -80,23 +71,21 @@ async function connectLong(
   aid: string,
   options: { slotId?: string; registerAid?: boolean } = {},
 ): Promise<void> {
-  await resolveGatewayInto(client);
   if (options.registerAid !== false) {
     try {
-      await registerAndLoadIdentity(client, aid);
+      await registerAndLoadIdentity(client, aid, options.slotId);
     } catch (err) {
       // AID 已存在不报错（共享 keystore 多次创建）
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
     }
   } else if (!(client as any)._currentAid) {
-    loadIdentityFromStore(client, aid);
+    loadIdentityFromStore(client, aid, options.slotId);
   }
   const opts: Record<string, unknown> = {
     auto_reconnect: false,
     heartbeat_interval: 30,
   };
-  if (options.slotId !== undefined) opts.slot_id = options.slotId;
   await client.connect(opts);
 }
 
@@ -105,15 +94,13 @@ async function connectShort(
   aid: string,
   options: { slotId?: string; shortTtlMs?: number } = {},
 ): Promise<void> {
-  await resolveGatewayInto(client);
   if (!(client as any)._currentAid) {
-    loadIdentityFromStore(client, aid);
+    loadIdentityFromStore(client, aid, options.slotId);
   }
   const opts: Record<string, unknown> = {
     connection_kind: 'short',
     auto_reconnect: false,
   };
-  if (options.slotId !== undefined) opts.slot_id = options.slotId;
   if (options.shortTtlMs !== undefined && options.shortTtlMs > 0) {
     opts.short_ttl_ms = options.shortTtlMs;
   }
@@ -234,7 +221,7 @@ describe('长短连接 集成 - 短连接不踢长连接', { timeout: 60_000 }, 
       await connectLong(longClient, longAid, { slotId: 'main' });
 
       const longStates: string[] = [];
-      longClient.on('connection.state', (data: unknown) => {
+      longClient.on('state_change', (data: unknown) => {
         if (typeof data === 'object' && data !== null) {
           longStates.push(String((data as { state?: string }).state ?? ''));
         }
@@ -270,7 +257,6 @@ describe('长短连接 集成 - 短连接容量上限 → 4013', { timeout: 90_0
     const overflow = makeClient(sharedPath, true);
 
     try {
-      await resolveGatewayInto(setup);
       await registerIdentity(setup, aid);
       await setup.close();
 
@@ -317,7 +303,6 @@ describe('长短连接 集成 - short_ttl_ms 兜底 → 4014', { timeout: 60_000
     const short = makeClient(sharedPath, true);
 
     try {
-      await resolveGatewayInto(setup);
       await registerIdentity(setup, aid);
       await setup.close();
 
@@ -356,7 +341,6 @@ describe('长短连接 集成 - 长连接互踢，短连接不受影响', { time
     const shorts: AUNClient[] = [];
 
     try {
-      await resolveGatewayInto(setup);
       await registerIdentity(setup, aid);
       await setup.close();
 
@@ -402,7 +386,6 @@ describe('长短连接 集成 - 短连接不发布 client.online', { timeout: 60
     const short = makeClient(shortPath, true);
 
     try {
-      await resolveGatewayInto(setup);
       await registerIdentity(setup, shortAid);
       await setup.close();
 
@@ -434,7 +417,6 @@ describe('长短连接 集成 - hello-ok 回包 connection.kind', { timeout: 60_
     const shortClient = makeClient(sharedPath, true);
 
     try {
-      await resolveGatewayInto(setup);
       await registerIdentity(setup, aid);
       await setup.close();
 
@@ -464,7 +446,6 @@ describe('长短连接 集成 - 短连接禁用 token 刷新', { timeout: 60_000
     const short = makeClient(sharedPath, true);
 
     try {
-      await resolveGatewayInto(setup);
       await registerIdentity(setup, aid);
       await setup.close();
 

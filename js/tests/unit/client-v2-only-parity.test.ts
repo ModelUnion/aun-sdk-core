@@ -137,7 +137,9 @@ describe('AUNClient V2-only parity', () => {
       .resolves.toEqual({ messages: groupMessages });
 
     expect(pullV2).toHaveBeenCalledWith(3, 10, { force: false });
-    expect(pullGroupV2).toHaveBeenCalledWith('g1', 7, 11);
+    expect(pullGroupV2).toHaveBeenCalledWith('g1', 7, 11, expect.objectContaining({
+      explicitAfterSeq: true,
+    }));
   });
 
   it('call(message.ack/group.ack_messages) 走 V2 时应兼容 Python 参数别名', async () => {
@@ -657,6 +659,40 @@ describe('AUNClient V2-only parity', () => {
     expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([]);
   });
 
+  it('message.v2.pull 服务端 ack 落后于本地 contiguous_seq 时应补 ack', async () => {
+    const client = connectedV2Client();
+    (client as any)._safeAsync = (promise: Promise<unknown>) => { promise.catch(() => {}); };
+    const ns = 'p2p:alice.aid.com';
+    (client as any)._seqTracker.forceContiguousSeq(ns, 5);
+    (client as any)._decryptV2Message = vi.fn().mockResolvedValue(null);
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'message.v2.pull') {
+        return {
+          has_more: false,
+          server_ack_seq: 4,
+          messages: [{
+            version: 'v2',
+            seq: 5,
+            message_id: 'm-lag-5',
+            from_aid: 'bob.aid.com',
+            envelope_json: '{}',
+          }],
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await (client as any)._pullV2(5, 10);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(result).toEqual([]);
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'message.v2.ack')).toEqual([
+      ['message.v2.ack', { up_to_seq: 5 }],
+    ]);
+  });
+
   it('message.v2.pull 发布消息前应先推进 contiguous_seq，避免事件处理器 ack 拉到旧边界', async () => {
     const client = connectedV2Client();
     const ns = 'p2p:alice.aid.com';
@@ -733,6 +769,40 @@ describe('AUNClient V2-only parity', () => {
     expect(result.map((msg) => (msg as Record<string, unknown>).seq)).toEqual([5]);
     expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
     expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([]);
+  });
+
+  it('group.v2.pull 服务端 cursor 落后于本地 contiguous_seq 时应补 ack', async () => {
+    const client = connectedV2Client();
+    (client as any)._safeAsync = (promise: Promise<unknown>) => { promise.catch(() => {}); };
+    const ns = 'group:g1';
+    (client as any)._seqTracker.forceContiguousSeq(ns, 5);
+    (client as any)._decryptV2Message = vi.fn().mockResolvedValue(null);
+    const transportCall = vi.fn().mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'group.v2.pull') {
+        return {
+          has_more: false,
+          cursor: { current_seq: 4, latest_seq: 5 },
+          messages: [{
+            version: 'v2',
+            seq: 5,
+            message_id: 'gm-lag-5',
+            from_aid: 'bob.aid.com',
+            envelope_json: '{}',
+          }],
+        };
+      }
+      return { ok: true, acked: params.up_to_seq ?? 0 };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await (client as any)._pullGroupV2('g1', 5, 10);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(result).toEqual([]);
+    expect((client as any)._seqTracker.getContiguousSeq(ns)).toBe(5);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.ack')).toEqual([
+      ['group.v2.ack', { group_id: 'g1', up_to_seq: 5, device_id: 'dev-alice', slot_id: 'slot-a' }],
+    ]);
   });
 
   it('group.v2.pull 发布消息前应先推进 contiguous_seq，避免事件处理器 ack 拉到旧边界', async () => {

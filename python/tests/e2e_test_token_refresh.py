@@ -14,7 +14,11 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient
-from aun_refactor_helpers import ensure_authenticated_identity, make_client_for_path
+from aun_refactor_helpers import (
+    ensure_authenticated_identity,
+    make_client_for_path,
+    move_access_token_expiry_into_refresh_window,
+)
 
 
 os.environ.setdefault("AUN_ENV", "development")
@@ -34,19 +38,24 @@ async def main() -> None:
     try:
         auth = await ensure_authenticated_identity(client, aid)
         initial_token = auth["access_token"]
+        move_access_token_expiry_into_refresh_window(client, seconds_from_now=60)
         refresh_events: list[dict] = []
         client.on("token.refreshed", lambda payload: refresh_events.append(payload))
         await client.connect({
             "auto_reconnect": False,
             "heartbeat_interval": 0,
-            "token_refresh_before": 3590,
         })
 
         deadline = time.monotonic() + 45
+        last_report = 0.0
         while time.monotonic() < deadline:
             current = client.access_token
             if current and current != initial_token:
                 break
+            now = time.monotonic()
+            if now - last_report >= 5:
+                print(f"waiting token refresh aid={aid} events={len(refresh_events)}")
+                last_report = now
             await asyncio.sleep(1)
 
         refreshed_token = client.access_token

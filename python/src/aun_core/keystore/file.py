@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .base import KeyStore
-from .sqlite_db import AIDDatabase, derive_sqlite_key, load_or_create_seed
+from .sqlite_db import AIDDatabase
 from ..config import normalize_instance_id
 
 if TYPE_CHECKING:
@@ -141,8 +141,7 @@ class FileKeyStore(KeyStore):
         self._aids_root = self._root / "AIDs"
         self._aids_root.mkdir(parents=True, exist_ok=True)
 
-        self._seed_bytes = load_or_create_seed(self._root, encryption_seed=encryption_seed)
-        self._sqlite_key = derive_sqlite_key(self._seed_bytes)
+        self._seed_bytes = str(encryption_seed or "").encode("utf-8")
 
         # 每 AID 一个 AIDDatabase，lazy 初始化
         self._aid_dbs: dict[str, AIDDatabase] = {}
@@ -162,7 +161,7 @@ class FileKeyStore(KeyStore):
         with self._aid_dbs_lock:
             if safe not in self._aid_dbs:
                 db_path = self._identity_dir(aid) / "aun.db"
-                self._aid_dbs[safe] = AIDDatabase(db_path, self._sqlite_key, logger=self._log)
+                self._aid_dbs[safe] = AIDDatabase(db_path, logger=self._log)
             return self._aid_dbs[safe]
 
     def close(self) -> None:
@@ -186,8 +185,6 @@ class FileKeyStore(KeyStore):
         from .seed_migration import change_seed
         self.close()
         result = change_seed(self._root, old_seed, new_seed, logger=self._log)
-        self._seed_bytes = str(new_seed).encode("utf-8")
-        self._sqlite_key = derive_sqlite_key(self._seed_bytes)
         return result
 
     # ── 公共 API ─────────────────────────────────────────────

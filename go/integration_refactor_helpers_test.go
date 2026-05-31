@@ -20,11 +20,11 @@ func integrationStoreForPath(t *testing.T, aunPath string, slotID ...string) *AI
 	return store
 }
 
-func integrationRegisterOrLoadAID(t *testing.T, aunPath, aid string) *AID {
+func integrationRegisterOrLoadAID(t *testing.T, aunPath, aid string, slotID ...string) *AID {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store := integrationStoreForPath(t, aunPath)
+	store := integrationStoreForPath(t, aunPath, slotID...)
 	if rr := store.Register(ctx, aid); !rr.Ok {
 		lr := store.Load(aid)
 		if !lr.Ok {
@@ -39,15 +39,33 @@ func integrationRegisterOrLoadAID(t *testing.T, aunPath, aid string) *AID {
 	return lr.Data.AID
 }
 
+func integrationClientSlotID(client *AUNClient) string {
+	if client == nil {
+		return ""
+	}
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+	return client.slotID
+}
+
 func integrationLoadAIDIntoClient(t *testing.T, client *AUNClient, aid string, slotID ...string) *AID {
 	t.Helper()
-	store := integrationStoreForPath(t, client.configModel.AUNPath, slotID...)
+	effectiveSlotID := ""
+	if len(slotID) > 0 {
+		effectiveSlotID = slotID[0]
+	} else {
+		effectiveSlotID = integrationClientSlotID(client)
+	}
+	store := integrationStoreForPath(t, client.configModel.AUNPath, effectiveSlotID)
 	lr := store.Load(aid)
 	if !lr.Ok {
 		t.Fatalf("加载 AID 失败: %v", lr.Error.Message)
 	}
 	loaded := lr.Data.AID
-	if current := client.CurrentAID(); current == nil || current.Aid != loaded.Aid {
+	if current := client.CurrentAID(); current == nil ||
+		current.Aid != loaded.Aid ||
+		current.DeviceID != loaded.DeviceID ||
+		current.SlotID != loaded.SlotID {
 		if err := client.LoadIdentity(loaded); err != nil {
 			t.Fatalf("加载身份到客户端失败: %v", err)
 		}
@@ -85,7 +103,7 @@ func integrationAuthenticateLoadedAID(t *testing.T, client *AUNClient, aid strin
 
 func integrationConnectAIDInPath(t *testing.T, client *AUNClient, aid string, opts *ConnectionOptions) string {
 	t.Helper()
-	integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid)
+	integrationRegisterOrLoadAID(t, client.configModel.AUNPath, aid, integrationClientSlotID(client))
 	integrationConnectLoadedAID(t, client, aid, opts)
 	if client.ConnectionState() != ConnStateReady {
 		t.Fatalf("连接后状态异常: %s", client.ConnectionState())

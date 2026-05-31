@@ -39,6 +39,8 @@ class AID:
     verify_ssl: bool = True
     root_ca_path: str | None = None
     debug: bool = False
+    # AIDStore 加载时注入的明文私钥 PEM，供 AUNClient 直接使用（无需 seed）
+    private_key_pem: str = ""
 
     @classmethod
     def _create(
@@ -56,6 +58,7 @@ class AID:
         verify_ssl: bool = True,
         root_ca_path: str | None = None,
         debug: bool = False,
+        private_key_pem: str = "",
     ) -> "AID":
         return cls(
             aid=str(aid),
@@ -70,6 +73,7 @@ class AID:
             verify_ssl=bool(verify_ssl),
             root_ca_path=root_ca_path,
             debug=bool(debug),
+            private_key_pem=str(private_key_pem),
         )
 
     @property

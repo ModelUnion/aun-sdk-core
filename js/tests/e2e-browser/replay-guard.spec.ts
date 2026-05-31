@@ -89,19 +89,14 @@ async function installP0Helpers(page: any): Promise<void> {
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
     const makeAndConnect = async (instanceId: string): Promise<any> => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({
-        instanceId,
-        issuer,
-        debug: true,
+      return w.AUN_TEST_HELPERS.createClient({
+        aunPath: `js-${instanceId}`,
+        deviceId: instanceId,
+        requireForwardSecrecy: false,
       });
-      if (client._configModel) {
-        client._configModel.requireForwardSecrecy = false;
-      }
-      return client;
     };
 
-        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+    const ensureConnected = async (client: any, aid: string): Promise<void> => {
       await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 

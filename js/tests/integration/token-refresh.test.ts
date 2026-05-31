@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { AUNClient } from '../../src/index.js';
-import { registerAndLoadIdentity } from '../test-support.js';
+import {
+  moveAccessTokenExpiryIntoRefreshWindow,
+  registerAndLoadIdentity,
+} from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -17,7 +23,8 @@ describe('Token refresh 集成测试', () => {
   it('真实 Gateway 上会刷新并换发 access_token', async () => {
     const issuer = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
     const aid = `js-refresh-${runId()}.${issuer}`;
-    const client = new AUNClient({});
+    const client = new AUNClient();
+    (client as any).__testAunPath = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-js-refresh-'));
     const refreshEvents: unknown[] = [];
     client.on('token.refreshed', (payload: unknown) => refreshEvents.push(payload));
 
@@ -26,18 +33,24 @@ describe('Token refresh 集成测试', () => {
       const auth = await client.authenticate();
       const initialToken = String(auth.access_token ?? '');
       expect(initialToken).not.toBe('');
+      const forcedExpiresAt = await moveAccessTokenExpiryIntoRefreshWindow(client, 60);
+      console.log(`token-refresh js aid=${aid} forced_expires_at=${forcedExpiresAt}`);
 
       await client.connect({
         auto_reconnect: false,
         heartbeat_interval: 0,
-        token_refresh_before: 3590,
       });
 
       const deadline = Date.now() + 45_000;
       let refreshedToken = '';
+      let lastLogAt = 0;
       while (Date.now() < deadline) {
         refreshedToken = String(((client as any)._identity?.access_token) ?? '');
         if (refreshedToken && refreshedToken !== initialToken) break;
+        if (Date.now() - lastLogAt >= 5_000) {
+          lastLogAt = Date.now();
+          console.log(`token-refresh js waiting aid=${aid} events=${refreshEvents.length}`);
+        }
         await sleep(1000);
       }
 

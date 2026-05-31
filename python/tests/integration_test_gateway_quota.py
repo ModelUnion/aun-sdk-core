@@ -35,7 +35,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, ConnectionState
 from aun_core.errors import AUNError
 from aun_refactor_helpers import ensure_connected_identity, ensure_registered_identity, make_client_for_path
 
@@ -87,6 +87,11 @@ def _make_client(tag_or_path: str, *, is_path: bool = False,
     return make_client_for_path(root, debug=False, require_forward_secrecy=False)
 
 
+def _is_ready(client: AUNClient) -> bool:
+    state = client.state
+    return state == ConnectionState.READY or state == "connected"
+
+
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "") -> str:
     opts: dict = {"auto_reconnect": False, "heartbeat_interval": 30.0}
     if slot_id:
@@ -101,6 +106,9 @@ async def _connect_short(client: AUNClient, aid: str, *,
     opts: dict = {
         "connection_kind": "short",
         "auto_reconnect": False,
+        # 短连接 TTL 测试只验证前台 RPC 刷新 idle 窗口。
+        # 禁用后台同步，避免秒级 TTL 断言受 V2 初始化后的自动补洞/状态同步影响。
+        "background_sync": False,
     }
     if slot_id:
         opts["slot_id"] = slot_id
@@ -223,11 +231,11 @@ async def test_aid_device_slot_quota() -> bool:
 
         # slot-1..slot-9 应仍然在线
         for i in range(1, _QUOTA_LIMIT):
-            if clients[i].state != "connected":
+            if not _is_ready(clients[i]):
                 _fail(name, f"slot-{i} unexpectedly kicked, state={clients[i].state}, events={watchers[i].events}")
                 return False
         # overflow 应连接成功
-        if overflow.state != "connected":
+        if not _is_ready(overflow):
             _fail(name, f"overflow new slot not connected, state={overflow.state}")
             return False
         print(f"  [OK] all other slots survive, overflow connected")
@@ -273,14 +281,14 @@ async def test_aid_devices_quota() -> bool:
             dev_id = f"qta-dev{i}-{rid}"
             device_id_file.write_text(dev_id, encoding="utf-8")
             c = _make_client(shared_path, is_path=True)
-            # 防御性校验：client 真的读到了我们写的 device_id
-            if c.device_id != dev_id:
-                _fail(name, f"client device_id mismatch: expected {dev_id}, got {c.device_id}")
-                return False
             w = _DisconnectWatcher(c, f"dev-{i}")
             clients.append(c)
             watchers.append(w)
             await _connect_long(c, aid, slot_id=f"dev{i}-main")
+            # 重构后 device_id 来自 AIDStore.load() 返回的 AID，连接后才绑定到 client。
+            if c.device_id != dev_id:
+                _fail(name, f"client device_id mismatch: expected {dev_id}, got {c.device_id}")
+                return False
             await asyncio.sleep(0.15)
         print(f"  [OK] {_QUOTA_LIMIT} devices established for aid={aid}")
 
@@ -288,12 +296,12 @@ async def test_aid_devices_quota() -> bool:
         new_dev = f"qta-devNEW-{rid}"
         device_id_file.write_text(new_dev, encoding="utf-8")
         overflow = _make_client(shared_path, is_path=True)
-        if overflow.device_id != new_dev:
-            _fail(name, f"overflow device_id mismatch: expected {new_dev}, got {overflow.device_id}")
-            return False
         clients.append(overflow)
         watchers.append(_DisconnectWatcher(overflow, "dev-NEW"))
         await _connect_long(overflow, aid, slot_id="devNEW-main")
+        if overflow.device_id != new_dev:
+            _fail(name, f"overflow device_id mismatch: expected {new_dev}, got {overflow.device_id}")
+            return False
 
         try:
             await asyncio.wait_for(watchers[0].kicked.wait(), timeout=5.0)
@@ -312,10 +320,10 @@ async def test_aid_devices_quota() -> bool:
 
         # dev-1 .. dev-(N-1) 仍在线
         for i in range(1, _QUOTA_LIMIT):
-            if clients[i].state != "connected":
+            if not _is_ready(clients[i]):
                 _fail(name, f"dev-{i} unexpectedly kicked, state={clients[i].state}, events={watchers[i].events}")
                 return False
-        if overflow.state != "connected":
+        if not _is_ready(overflow):
             _fail(name, f"overflow not connected, state={overflow.state}")
             return False
         print(f"  [OK] other devices survive, overflow connected")
@@ -348,12 +356,12 @@ async def test_device_aids_quota() -> bool:
     watchers: list[_DisconnectWatcher] = []
     try:
         # 注册 _QUOTA_LIMIT+1 个 AID（共享 keystore）
-        register = _make_client(shared_path, is_path=True)
         for i in range(_QUOTA_LIMIT + 1):
             aid = f"qta-a3-{i}-{rid}.{_ISSUER}"
+            register = _make_client(shared_path, is_path=True)
             await ensure_registered_identity(register, aid)
+            await register.close()
             aids.append(aid)
-        await register.close()
 
         # 占满 _QUOTA_LIMIT 个 aid 的长连接（同 device，每 aid 1 个 slot）
         for i in range(_QUOTA_LIMIT):
@@ -388,10 +396,10 @@ async def test_device_aids_quota() -> bool:
 
         # aid-1 .. aid-(N-1) 仍在线
         for i in range(1, _QUOTA_LIMIT):
-            if clients[i].state != "connected":
+            if not _is_ready(clients[i]):
                 _fail(name, f"aid-{i} unexpectedly kicked, state={clients[i].state}, events={watchers[i].events}")
                 return False
-        if overflow.state != "connected":
+        if not _is_ready(overflow):
             _fail(name, f"overflow not connected, state={overflow.state}")
             return False
         print(f"  [OK] other aids survive, overflow connected")
@@ -426,22 +434,27 @@ async def test_short_ttl_sliding_window() -> bool:
         await ensure_registered_identity(setup, aid)
         await setup.close()
 
-        # 短连接 ttl=2000ms
-        await _connect_short(short, aid, slot_id="t4-cli", short_ttl_ms=2000)
-        if short.state != "connected":
+        ttl_ms = 3000
+        ping_interval = 0.5
+
+        # 短连接 ttl=3000ms，前台 RPC 间隔显著小于 ttl，用来验证滑动窗口续期。
+        await _connect_short(short, aid, slot_id="t4-cli", short_ttl_ms=ttl_ms)
+        if not _is_ready(short):
             _fail(name, f"short connect failed, state={short.state}")
             return False
-        print(f"  [OK] short connection established with ttl=2000ms")
+        print(f"  [OK] short connection established with ttl={ttl_ms}ms")
 
-        # 第一阶段：每 1s 发 1 个 RPC，共 5s（ttl=2s 内有活动 → 不应被踢）
+        # 第一阶段：持续发前台 RPC，共 5s（ttl 内有活动 → 不应被踢）
         keepalive_window = 5.0
+        started_at = time.time()
         deadline = time.time() + keepalive_window
         ping_count = 0
         while time.time() < deadline:
             await short.call("meta.ping")
             ping_count += 1
-            await asyncio.sleep(1.0)
-        if short.state != "connected":
+            print(f"  [PING] keepalive #{ping_count} at +{time.time() - started_at:.2f}s")
+            await asyncio.sleep(ping_interval)
+        if not _is_ready(short):
             _fail(name, f"short kicked despite keepalive, state={short.state}, events={watcher.events}")
             return False
         if watcher.events:
@@ -450,8 +463,8 @@ async def test_short_ttl_sliding_window() -> bool:
         print(f"  [OK] survived {keepalive_window}s keepalive ({ping_count} pings)")
 
         # 第二阶段：停止 RPC，等待 idle TTL 触发关闭
-        # 服务端 poll 间隔 max(0.2, min(ttl_ms/1000/4, 5)) = max(0.2, 0.5) = 0.5s
-        # 所以最多 ttl(2s) + poll(0.5s) + 网络 + notify_and_close(0.2s 延迟) ≈ 3.5s
+        # 服务端 poll 间隔 max(0.2, min(ttl_ms/1000/4, 5))。
+        # 所以最多 ttl + poll + 网络 + notify_and_close 延迟，8s 超时足够覆盖调度抖动。
         try:
             await asyncio.wait_for(watcher.kicked.wait(), timeout=8.0)
         except asyncio.TimeoutError:
@@ -462,8 +475,8 @@ async def test_short_ttl_sliding_window() -> bool:
             _fail(name, f"close code != 4014, got {watcher.last_code}; detail={watcher.last_detail}")
             return False
         det = watcher.last_detail
-        if int(det.get("ttl_ms") or 0) != 2000:
-            _fail(name, f"detail.ttl_ms != 2000, detail={det}")
+        if int(det.get("ttl_ms") or 0) != ttl_ms:
+            _fail(name, f"detail.ttl_ms != {ttl_ms}, detail={det}")
             return False
         if int(det.get("idle_ms") or 0) <= 0:
             _fail(name, f"detail.idle_ms not positive, detail={det}")
@@ -475,10 +488,10 @@ async def test_short_ttl_sliding_window() -> bool:
         # 给 transport 几秒时间处理关闭并触发状态迁移
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if short.state in ("disconnected", "closed", "terminal_failed"):
+            if not _is_ready(short):
                 break
             await asyncio.sleep(0.1)
-        if short.state not in ("disconnected", "closed", "terminal_failed"):
+        if _is_ready(short):
             _fail(name, f"unexpected state after eviction: {short.state}")
             return False
         _ok(name)

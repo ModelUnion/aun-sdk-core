@@ -27,14 +27,13 @@ import * as crypto from 'node:crypto';
 import * as dns from 'node:dns/promises';
 import * as net from 'node:net';
 import { AUNClient } from '../../src/client.js';
-import { loadIdentityFromStore, registerAndLoadIdentity, registerIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, loadIdentityFromStore, registerAndLoadIdentity, registerIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 const AUN_DATA_ROOT = (process.env.AUN_DATA_ROOT ?? '').trim();
-const REQUIRED_HOSTS = [ISSUER, GATEWAY_DISCOVERY_AID];
+const REQUIRED_HOSTS = [ISSUER, `gateway.${ISSUER}`];
 
 // ── 网络可达性探测：DNS 能解析 + 端口能连即可 ────────────────────────
 
@@ -88,19 +87,11 @@ function makeAunPath(tag: string): string {
 }
 
 function makeClient(aunPath: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath, debug: false });
-  ((client as unknown) as {
-    _configModel: { requireForwardSecrecy: boolean };
-  })._configModel.requireForwardSecrecy = false;
-  return client;
+  return createTestClient({ aunPath, debug: false, requireForwardSecrecy: false });
 }
 
 function setDeviceId(client: AUNClient, deviceId: string): void {
-  ((client as unknown) as { _deviceId: string })._deviceId = deviceId;
-}
-
-async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+  ((client as unknown) as { __testDeviceId: string }).__testDeviceId = deviceId;
 }
 
 async function connectLong(
@@ -109,22 +100,20 @@ async function connectLong(
   options: { slotId?: string; registerAid?: boolean; deviceId?: string } = {},
 ): Promise<void> {
   if (options.deviceId) setDeviceId(client, options.deviceId);
-  await resolveGatewayInto(client);
   if (options.registerAid !== false) {
     try {
-      await registerAndLoadIdentity(client, aid);
+      await registerAndLoadIdentity(client, aid, options.slotId);
     } catch (err) {
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
     }
   } else if (!(client as any)._currentAid) {
-    loadIdentityFromStore(client, aid);
+    loadIdentityFromStore(client, aid, options.slotId);
   }
   const opts: Record<string, unknown> = {
     auto_reconnect: false,
     heartbeat_interval: 30,
   };
-  if (options.slotId !== undefined) opts.slot_id = options.slotId;
   await client.connect(opts);
 }
 
@@ -134,15 +123,13 @@ async function connectShort(
   options: { slotId?: string; shortTtlMs?: number; deviceId?: string } = {},
 ): Promise<void> {
   if (options.deviceId) setDeviceId(client, options.deviceId);
-  await resolveGatewayInto(client);
   if (!(client as any)._currentAid) {
-    loadIdentityFromStore(client, aid);
+    loadIdentityFromStore(client, aid, options.slotId);
   }
   const opts: Record<string, unknown> = {
     connection_kind: 'short',
     auto_reconnect: false,
   };
-  if (options.slotId !== undefined) opts.slot_id = options.slotId;
   if (options.shortTtlMs !== undefined && options.shortTtlMs > 0) {
     opts.short_ttl_ms = options.shortTtlMs;
   }
@@ -223,7 +210,6 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
     // setup：注册 aid（共享 keystore，所有客户端复用）
     const setup = makeClient(sharedPath);
-    await resolveGatewayInto(setup);
     await registerIdentity(setup, aid);
     await safeClose(setup);
 
@@ -285,7 +271,6 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
     // setup：注册 aid 一次（cert/key 落到 setupPath/AIDs/<aid>/）
     const setup = makeClient(setupPath);
-    await resolveGatewayInto(setup);
     await registerIdentity(setup, aid);
     await safeClose(setup);
 
@@ -373,7 +358,6 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
 
     // setup：在同一 path（同一 device）下注册 11 个不同 aid
     const setup = makeClient(sharedPath);
-    await resolveGatewayInto(setup);
     const aids: string[] = [];
     for (let i = 0; i <= QUOTA_LIMIT; i++) {
       const aid = `q3-a${i}-${r}.${ISSUER}`;
@@ -434,7 +418,6 @@ describe('Gateway 长连接配额 + 短连接空闲 TTL 集成测试', () => {
     const sharedPath = makeAunPath('q4');
 
     const setup = makeClient(sharedPath);
-    await resolveGatewayInto(setup);
     await registerIdentity(setup, aid);
     await safeClose(setup);
 

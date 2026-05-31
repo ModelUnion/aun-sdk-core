@@ -28,9 +28,8 @@ const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
 
 function makeClient(): AUNClient {
-  const client = new AUNClient({
-    aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-bg-')),
-  });
+  const client = new AUNClient();
+  (client as any).__testAunPath = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-bg-'));
   ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }

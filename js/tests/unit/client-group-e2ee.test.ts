@@ -10,16 +10,16 @@ describe('AUNClient 群组 E2EE 配置', () => {
     expect(client.configModel.groupE2ee).toBe(true);
   });
 
-  it('构造期 groupE2ee 配置应被忽略并保持启用', () => {
-    const client = new AUNClient({ groupE2ee: false } as any);
-    expect(client.configModel.groupE2ee).toBe(true);
+  it('构造期旧配置对象应被拒绝，不能通过 groupE2ee 关闭 V2-only 群加密', () => {
+    expect(() => new AUNClient({ groupE2ee: false } as any)).toThrow(/AID object/);
   });
 
-  it('构造期 V1 epoch 配置应被忽略', () => {
-    const client = new AUNClient({
+  it('构造期 V1 epoch 配置应被拒绝', () => {
+    expect(() => new AUNClient({
       epochAutoRotateInterval: 30,
       oldEpochRetentionSeconds: 60,
-    } as any);
+    } as any)).toThrow(/AID object/);
+    const client = new AUNClient();
     expect((client.configModel as any).epochAutoRotateInterval).toBeUndefined();
     expect((client.configModel as any).oldEpochRetentionSeconds).toBeUndefined();
   });

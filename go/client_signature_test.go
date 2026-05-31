@@ -53,6 +53,40 @@ func genTestIdentity(t *testing.T) (privPEM string, certPEM string, privKey *ecd
 	return privPEM, certPEM, pk
 }
 
+func newClientSignatureTestClient(t *testing.T, aid, privPEM, certPEM string, privKey *ecdsa.PrivateKey) *AUNClient {
+	t.Helper()
+	certObj, err := parsePEMCertificate(certPEM)
+	if err != nil {
+		t.Fatalf("解析测试证书失败: %v", err)
+	}
+	c := NewAUNClient(newAID(
+		aid,
+		t.TempDir(),
+		certPEM,
+		certObj,
+		privKey,
+		true,
+		true,
+		"test-device",
+		"default",
+		false,
+		"",
+		false,
+		privPEM,
+	))
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+func requireClientSignature(t *testing.T, params map[string]any) map[string]any {
+	t.Helper()
+	sig, ok := params["client_signature"].(map[string]any)
+	if !ok {
+		t.Fatalf("client_signature 未生成或类型错误: %#v", params["client_signature"])
+	}
+	return sig
+}
+
 // ── 1. signedMethods 覆盖测试 ─────────────────────────────
 
 func TestSignedMethodsCoverage(t *testing.T) {
@@ -118,16 +152,9 @@ func TestSignedMethodsCoverage(t *testing.T) {
 // ── 2. signClientOperation 产生 cert_fingerprint ──────────
 
 func TestSignClientOperation_ContainsCertFingerprint(t *testing.T) {
-	privPEM, certPEM, _ := genTestIdentity(t)
+	privPEM, certPEM, privKey := genTestIdentity(t)
 
-	c := &AUNClient{
-		identity: map[string]any{
-			"aid":             "test-aid@example.com",
-			"private_key_pem": privPEM,
-			"cert":            certPEM,
-		},
-		certCache: make(map[string]*cachedPeerCert),
-	}
+	c := newClientSignatureTestClient(t, "test-aid@example.com", privPEM, certPEM, privKey)
 
 	params := map[string]any{
 		"group_id": "g1",
@@ -135,10 +162,7 @@ func TestSignClientOperation_ContainsCertFingerprint(t *testing.T) {
 	}
 	c.signClientOperation("group.send", params)
 
-	sig, ok := params["client_signature"].(map[string]any)
-	if !ok {
-		t.Fatal("client_signature 未生成或类型错误")
-	}
+	sig := requireClientSignature(t, params)
 
 	fp, ok := sig["cert_fingerprint"].(string)
 	if !ok || fp == "" {
@@ -164,16 +188,9 @@ func TestSignClientOperation_ContainsCertFingerprint(t *testing.T) {
 // ── 3. signClientOperation 排除内部字段 ───────────────────
 
 func TestSignClientOperation_ExcludesInternalFields(t *testing.T) {
-	privPEM, certPEM, _ := genTestIdentity(t)
+	privPEM, certPEM, privKey := genTestIdentity(t)
 
-	c := &AUNClient{
-		identity: map[string]any{
-			"aid":             "test-aid@example.com",
-			"private_key_pem": privPEM,
-			"cert":            certPEM,
-		},
-		certCache: make(map[string]*cachedPeerCert),
-	}
+	c := newClientSignatureTestClient(t, "test-aid@example.com", privPEM, certPEM, privKey)
 
 	// 带内部字段的参数
 	params1 := map[string]any{
@@ -191,8 +208,8 @@ func TestSignClientOperation_ExcludesInternalFields(t *testing.T) {
 	}
 	c.signClientOperation("group.send", params2)
 
-	sig1 := params1["client_signature"].(map[string]any)
-	sig2 := params2["client_signature"].(map[string]any)
+	sig1 := requireClientSignature(t, params1)
+	sig2 := requireClientSignature(t, params2)
 
 	hash1 := sig1["params_hash"].(string)
 	hash2 := sig2["params_hash"].(string)
@@ -223,17 +240,10 @@ func TestSignClientOperation_NilIdentity(t *testing.T) {
 // ── 5. verifyEventSignature 有效签名 ──────────────────────
 
 func TestVerifyEventSignature_ValidSignature(t *testing.T) {
-	privPEM, certPEM, _ := genTestIdentity(t)
+	privPEM, certPEM, privKey := genTestIdentity(t)
 	aid := "test-aid@example.com"
 
-	c := &AUNClient{
-		identity: map[string]any{
-			"aid":             aid,
-			"private_key_pem": privPEM,
-			"cert":            certPEM,
-		},
-		certCache: make(map[string]*cachedPeerCert),
-	}
+	c := newClientSignatureTestClient(t, aid, privPEM, certPEM, privKey)
 
 	// 使用 signClientOperation 生成真实签名
 	params := map[string]any{
@@ -242,7 +252,7 @@ func TestVerifyEventSignature_ValidSignature(t *testing.T) {
 	}
 	c.signClientOperation("group.send", params)
 
-	sig := params["client_signature"].(map[string]any)
+	sig := requireClientSignature(t, params)
 	expectedFP, _ := sig["cert_fingerprint"].(string)
 
 	// 将证书缓存到 certCache
@@ -273,24 +283,17 @@ func TestVerifyEventSignature_ValidSignature(t *testing.T) {
 // ── 6. verifyEventSignature 篡改 params_hash ─────────────
 
 func TestVerifyEventSignature_TamperedHash(t *testing.T) {
-	privPEM, certPEM, _ := genTestIdentity(t)
+	privPEM, certPEM, privKey := genTestIdentity(t)
 	aid := "test-aid@example.com"
 
-	c := &AUNClient{
-		identity: map[string]any{
-			"aid":             aid,
-			"private_key_pem": privPEM,
-			"cert":            certPEM,
-		},
-		certCache: make(map[string]*cachedPeerCert),
-	}
+	c := newClientSignatureTestClient(t, aid, privPEM, certPEM, privKey)
 
 	params := map[string]any{
 		"group_id": "g1",
 		"content":  "hello",
 	}
 	c.signClientOperation("group.send", params)
-	sig := params["client_signature"].(map[string]any)
+	sig := requireClientSignature(t, params)
 	expectedFP, _ := sig["cert_fingerprint"].(string)
 
 	// 缓存证书
@@ -321,24 +324,17 @@ func TestVerifyEventSignature_TamperedHash(t *testing.T) {
 // ── 7. verifyEventSignature 错误 cert_fingerprint ────────
 
 func TestVerifyEventSignature_WrongFingerprint(t *testing.T) {
-	privPEM, certPEM, _ := genTestIdentity(t)
+	privPEM, certPEM, privKey := genTestIdentity(t)
 	aid := "test-aid@example.com"
 
-	c := &AUNClient{
-		identity: map[string]any{
-			"aid":             aid,
-			"private_key_pem": privPEM,
-			"cert":            certPEM,
-		},
-		certCache: make(map[string]*cachedPeerCert),
-	}
+	c := newClientSignatureTestClient(t, aid, privPEM, certPEM, privKey)
 
 	params := map[string]any{
 		"group_id": "g1",
 		"content":  "hello",
 	}
 	c.signClientOperation("group.send", params)
-	sig := params["client_signature"].(map[string]any)
+	sig := requireClientSignature(t, params)
 	wrongFP := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	// 缓存证书

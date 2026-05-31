@@ -46,7 +46,8 @@ function makeSharedPath(tag: string): string {
 }
 
 function makeClient(aunPath: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath });
+  const client = new AUNClient();
+  (client as any).__testAunPath = aunPath;
   ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }
@@ -246,7 +247,7 @@ describe('长短连接共存集成测试', () => {
     await connectLong(longClient, aid, 'main');
 
     const longStates: string[] = [];
-    longClient.on('connection.state', (d: unknown) => {
+    longClient.on('state_change', (d: unknown) => {
       const data = d as JsonObject;
       longStates.push(String(data.state ?? ''));
     });

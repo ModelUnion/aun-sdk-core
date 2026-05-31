@@ -28,9 +28,8 @@ const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
 
 function makeClient(): AUNClient {
-  const client = new AUNClient({
-    aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-')),
-  });
+  const client = new AUNClient();
+  (client as any).__testAunPath = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-'));
   ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }
@@ -206,7 +205,7 @@ describe('断线重连集成测试', () => {
     const client = makeClient();
     clients.push(client);
     const states: string[] = [];
-    client.on('connection.state', (data: unknown) => {
+    client.on('state_change', (data: unknown) => {
       const payload = data as JsonObject;
       states.push(String(payload.state ?? ''));
     });
@@ -279,7 +278,7 @@ describe('断线重连集成测试', () => {
     const client = makeClient();
     clients.push(client);
     const states: string[] = [];
-    client.on('connection.state', (data: unknown) => {
+    client.on('state_change', (data: unknown) => {
       const payload = data as JsonObject;
       states.push(String(payload.state ?? ''));
     });

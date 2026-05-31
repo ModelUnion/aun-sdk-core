@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,30 @@ async def ensure_authenticated_identity(
                 break
             await asyncio.sleep(1.5 * (attempt + 1))
     raise last_error or RuntimeError(f"{aid} authenticate failed")
+
+
+def move_access_token_expiry_into_refresh_window(client: AUNClient, seconds_from_now: int = 60) -> None:
+    aid_obj = client.current_aid
+    if aid_obj is None:
+        raise RuntimeError("client has no loaded AID")
+    store_options = _CLIENT_STORE_OPTIONS.get(client) or {}
+    keystore = FileKeyStore(
+        aid_obj.aun_path,
+        encryption_seed=str(store_options.get("encryption_seed") or ""),
+    )
+    try:
+        expires_at = int(time.time()) + int(seconds_from_now)
+
+        def _merge(current: dict[str, Any]) -> dict[str, Any]:
+            current["access_token_expires_at"] = expires_at
+            return current
+
+        keystore.update_instance_state(aid_obj.aid, aid_obj.device_id, aid_obj.slot_id, _merge)
+    finally:
+        keystore.close()
+    identity = getattr(client, "_identity", None)
+    if isinstance(identity, dict) and str(identity.get("aid") or "") == aid_obj.aid:
+        identity["access_token_expires_at"] = expires_at
 
 
 async def ensure_connected_identity(

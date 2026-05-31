@@ -36,7 +36,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, ConnectionState
 from aun_core.errors import AUNError, TimeoutError as _AunTimeout
 from aun_refactor_helpers import ensure_connected_identity, ensure_registered_identity, make_client_for_path
 
@@ -80,6 +80,11 @@ def _make_client(tag_or_path: str, *, is_path: bool = False) -> AUNClient:
     else:
         root = _make_aun_path(tag_or_path)
     return make_client_for_path(root, debug=False, require_forward_secrecy=False)
+
+
+def _is_ready(client: AUNClient) -> bool:
+    state = client.state
+    return state == ConnectionState.READY or state == "connected"
 
 
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "") -> str:
@@ -177,7 +182,7 @@ async def test_same_identity_short_send() -> bool:
 
         # alice 短连接（同 aid, 同 device, 同 slot）发消息给 bob
         await _connect_short(alice_short, alice_aid, slot_id="main")
-        if alice_short.state != "connected":
+        if not _is_ready(alice_short):
             _fail(name, f"short connect failed, state={alice_short.state}")
             return False
 
@@ -248,13 +253,13 @@ async def test_short_does_not_kick_long() -> bool:
 
         # 监听长连接是否被服务端断开
         long_state = []
-        long_client.on("connection.state", lambda d: long_state.append(d.get("state")))
+        long_client.on("state_change", lambda d: long_state.append(d.get("state")))
 
         # 同 AID 同 slot 起短连接
         await _connect_short(short_client, long_aid, slot_id="main")
         await asyncio.sleep(1.0)
 
-        if long_client.state != "connected":
+        if not _is_ready(long_client):
             _fail(name, f"long was kicked by short: state={long_client.state}, events={long_state}")
             return False
 
@@ -264,7 +269,7 @@ async def test_short_does_not_kick_long() -> bool:
         await asyncio.sleep(0.5)
 
         # 长连接仍存活
-        if long_client.state != "connected":
+        if not _is_ready(long_client):
             _fail(name, f"long died after short closed: state={long_client.state}")
             return False
         await long_client.call("meta.ping")
@@ -354,18 +359,18 @@ async def test_short_ttl_eviction() -> bool:
 
         # 短连接传 ttl=2000ms
         await _connect_short(short, aid, slot_id="ttl", short_ttl_ms=2000)
-        if short.state != "connected":
+        if not _is_ready(short):
             _fail(name, f"short connect failed: state={short.state}")
             return False
 
         # 等待 ~3s，服务端应主动关闭
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if short.state in ("disconnected", "closed", "terminal_failed"):
+            if not _is_ready(short):
                 break
             await asyncio.sleep(0.3)
 
-        if short.state == "connected":
+        if _is_ready(short):
             _fail(name, "short still connected after ttl expired")
             return False
         _ok(name)
@@ -411,17 +416,17 @@ async def test_long_replaces_long_keeps_shorts() -> bool:
         await _connect_long(long_new, aid, slot_id="slot-x")
         await asyncio.sleep(1.5)  # 给服务端发 4009 的时间
 
-        if long_old.state == "connected":
+        if _is_ready(long_old):
             _fail(name, "old long not kicked")
             return False
 
-        if long_new.state != "connected":
+        if not _is_ready(long_new):
             _fail(name, f"new long not connected: state={long_new.state}")
             return False
 
         # 短连接应全部仍在线
         for i, c in enumerate(shorts):
-            if c.state != "connected":
+            if not _is_ready(c):
                 _fail(name, f"short[{i}] was kicked: state={c.state}")
                 return False
             await c.call("meta.ping")

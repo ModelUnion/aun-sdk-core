@@ -36,6 +36,12 @@ import (
 // v2BootstrapTTL bootstrap 缓存有效期（与 Python `_V2_BOOTSTRAP_TTL = 3600` 对齐）。
 const v2BootstrapTTL = time.Hour
 
+type v2PullPageMeta struct {
+	rawCount     int
+	serverAckSeq int64
+	hasServerAck bool
+}
+
 // v2BootstrapEntry 单条 peer_aid 缓存项。
 type v2BootstrapEntry struct {
 	Devices         []map[string]any
@@ -201,7 +207,7 @@ func openV2Keystore(aunPath, aid string) (*V2SQLiteStore, error) {
 func (c *AUNClient) initV2Session(ctx context.Context) error {
 	c.mu.RLock()
 	aid := c.aid
-	identity := c.identity
+	currentAID := c.currentAIDObj
 	deviceID := c.deviceID
 	aunPath := ""
 	if c.configModel != nil {
@@ -212,22 +218,10 @@ func (c *AUNClient) initV2Session(ctx context.Context) error {
 	if aid == "" {
 		return nil
 	}
-	privPEM, _ := identity["private_key_pem"].(string)
-	if privPEM == "" {
-		// fallback：缓存的 identity 可能被 instance_state 污染，重新从 keystore 加载
-		reloaded := c.auth.LoadIdentityOrNil(aid)
-		if reloaded != nil {
-			if p, _ := reloaded["private_key_pem"].(string); p != "" {
-				privPEM = p
-				c.mu.Lock()
-				c.identity = reloaded
-				c.mu.Unlock()
-				identity = reloaded
-				c.logE2.Warn("V2 session init: identity cache was stale, reloaded from keystore")
-				// 自愈：重新持久化，清理 instance_state 中的脏数据
-				_ = c.auth.persistIdentity(reloaded)
-			}
-		}
+	// 私钥由 AIDStore 管理，直接从 currentAID 读取明文私钥
+	privPEM := ""
+	if currentAID != nil {
+		privPEM = currentAID.PrivateKeyPem
 	}
 	if privPEM == "" {
 		c.logE2.Warn("V2 session init skipped: no AID private key")
@@ -873,13 +867,15 @@ func (c *AUNClient) v2FetchSelfDevices(ctx context.Context, state *v2P2PState, m
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（对齐 Python pull_v2）。
 // limit=0 时默认 50。
 func (c *AUNClient) pullV2(ctx context.Context, afterSeq int64, limit int) ([]map[string]any, error) {
-	return c.pullV2WithForce(ctx, afterSeq, limit, false)
+	msgs, _, err := c.pullV2WithForce(ctx, afterSeq, limit, false)
+	return msgs, err
 }
 
-func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, error) {
+func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit int, force bool) ([]map[string]any, v2PullPageMeta, error) {
+	meta := v2PullPageMeta{}
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
-		return nil, errors.New("V2 session not initialized (not connected?)")
+		return nil, meta, errors.New("V2 session not initialized (not connected?)")
 	}
 	if limit <= 0 {
 		limit = 50
@@ -908,11 +904,17 @@ func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit i
 	}
 	raw, err := c.Call(ctx, "message.v2.pull", pullParams)
 	if err != nil {
-		return nil, err
+		return nil, meta, err
 	}
 	result, _ := raw.(map[string]any)
 	messages := v2ToMapList(result["messages"])
+	_, hasServerAckSeq := result["server_ack_seq"]
 	serverAckSeq := toInt64(result["server_ack_seq"])
+	meta = v2PullPageMeta{
+		rawCount:     len(messages),
+		serverAckSeq: serverAckSeq,
+		hasServerAck: hasServerAckSeq,
+	}
 	c.logE2.Debug("message.v2.pull response: raw_count=%d server_ack_seq=%d has_more=%v", len(messages), serverAckSeq, result["has_more"])
 	for _, msg := range messages {
 		c.logMessageDebug("pull-raw", "message.v2.pull", "message.received", msg, nil)
@@ -988,7 +990,7 @@ func (c *AUNClient) pullV2WithForce(ctx context.Context, afterSeq int64, limit i
 	}
 
 	c.logE2.Debug("message.v2.pull done: requested_after_seq=%d raw_count=%d decrypted=%d ns=%s", afterSeq, len(messages), len(decrypted), ns)
-	return decrypted, nil
+	return decrypted, meta, nil
 }
 
 // AckV2 确认 V2 消息已消费 + 自检销毁旧 SPK。

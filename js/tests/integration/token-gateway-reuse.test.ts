@@ -42,7 +42,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function makeClient(): AUNClient {
-  const client = new AUNClient({});
+  const client = new AUNClient();
   ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }

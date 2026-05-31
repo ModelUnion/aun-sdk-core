@@ -1074,6 +1074,62 @@ func TestV2P2PPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 	}
 }
 
+func TestV2P2PPullReacksWhenServerAckLagsExistingContiguousSeq(t *testing.T) {
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "message.v2.pull":
+			return map[string]any{
+				"server_ack_seq": int64(4),
+				"messages": []any{
+					map[string]any{
+						"version":    "v1",
+						"seq":        int64(5),
+						"message_id": "m-lag-5",
+						"from_aid":   "bob.example.com",
+						"legacy_v1": map[string]any{
+							"payload": map[string]any{"type": "e2ee.encrypted", "ciphertext": "bad"},
+						},
+					},
+				},
+			}
+		case "message.v2.ack":
+			return map[string]any{"acked": params["up_to_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	ns := "p2p:" + c.aid
+	c.seqTracker.ForceContiguousSeq(ns, 5)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "message.pull", map[string]any{"after_seq": int64(5), "limit": int64(10)})
+	if err != nil {
+		t.Fatalf("message.pull 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if len(v2ToMapList(resultMap["messages"])) != 0 {
+		t.Fatalf("坏密文不应返回业务消息: %#v", result)
+	}
+	if got := c.seqTracker.GetContiguousSeq(ns); got != 5 {
+		t.Fatalf("contiguous_seq 应保持 5，got=%d", got)
+	}
+	if !waitForParityCondition(time.Second, func() bool {
+		for _, call := range getCalls() {
+			if call.Method == "message.v2.ack" && toInt64(call.Params["up_to_seq"]) == 5 {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("server_ack_seq 落后时应补 message.v2.ack 到 5，calls=%#v", getCalls())
+	}
+}
+
 func TestV2P2PPullEmptyResultConsumesServerAckFloor(t *testing.T) {
 	wsURL, _, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
 		switch method {
@@ -1218,6 +1274,63 @@ func TestV2GroupPullPublishesAfterContiguousAdvanceAndAcksOnce(t *testing.T) {
 	}
 	if ackCount != 1 {
 		t.Fatalf("group.v2.pull 本页应只 ack 一次，calls=%#v", getCalls())
+	}
+}
+
+func TestV2GroupPullReacksWhenServerCursorLagsExistingContiguousSeq(t *testing.T) {
+	groupID := "group.example.com/g1"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "group.v2.pull":
+			return map[string]any{
+				"cursor": map[string]any{"current_seq": int64(4), "latest_seq": int64(5)},
+				"messages": []any{
+					map[string]any{
+						"version":    "v1",
+						"seq":        int64(5),
+						"message_id": "gm-lag-5",
+						"from_aid":   "bob.example.com",
+						"payload":    map[string]any{"type": "e2ee.group_encrypted", "ciphertext": "bad"},
+					},
+				},
+			}
+		case "group.v2.ack":
+			return map[string]any{"acked": params["up_to_seq"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	ns := "group:" + groupID
+	c.seqTracker.ForceContiguousSeq(ns, 5)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "group.pull", map[string]any{"group_id": groupID, "after_seq": int64(5), "limit": int64(10)})
+	if err != nil {
+		t.Fatalf("group.pull 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if len(v2ToMapList(resultMap["messages"])) != 0 {
+		t.Fatalf("坏密文不应返回业务群消息: %#v", result)
+	}
+	if got := c.seqTracker.GetContiguousSeq(ns); got != 5 {
+		t.Fatalf("contiguous_seq 应保持 5，got=%d", got)
+	}
+	if !waitForParityCondition(time.Second, func() bool {
+		for _, call := range getCalls() {
+			if call.Method == "group.v2.ack" &&
+				strings.TrimSpace(v2AsString(call.Params["group_id"])) == groupID &&
+				toInt64(call.Params["up_to_seq"]) == 5 {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("cursor.current_seq 落后时应补 group.v2.ack 到 5，calls=%#v", getCalls())
 	}
 }
 

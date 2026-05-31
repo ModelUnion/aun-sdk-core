@@ -265,7 +265,7 @@ async def test_connect_normalizes_empty_slot_id_to_default(tmp_path: Path):
     client.authenticate = fake_authenticate
     client._connect_once = fake_connect_once
 
-    await client.connect({"slot_id": "", "background_sync": False})
+    await client.connect({"background_sync": False})
 
     assert observed == ["default"]
     assert client.slot_id == "default"

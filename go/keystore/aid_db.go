@@ -1,7 +1,6 @@
-// aid_db.go — 单个 AID 的 SQLite 数据库（对标 Python sqlcipher_db.py）
+// aid_db.go — 单个 AID 的 SQLite 数据库（对标 Python sqlite_db.py）
 //
-// 加密方案：Go 无 SQLCipher，敏感字段（private_key_pem、secret、session data）
-// 通过 SecretStore.Protect/Reveal 字段级加密后存入 DB。
+// 所有字段明文存储，不再使用字段级加密。
 package keystore
 
 import (
@@ -15,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/modelunion/aun-sdk-core/go/secretstore"
 	_ "modernc.org/sqlite"
 )
 
@@ -129,13 +127,12 @@ type AIDDatabase struct {
 	mu          sync.Mutex
 	db          *sql.DB
 	dbPath      string
-	secretStore secretstore.SecretStore // 字段级加密，nil 时降级为明文
 	aid         string                  // 当前 AID 标识，用于 SecretStore scope
 }
 
 // newAIDDatabase 创建或打开 AID 数据库。
 // ss 和 aid 用于 prekey 私钥字段级加密；ss 为 nil 时降级为明文存储。
-func newAIDDatabase(dbPath string, ss secretstore.SecretStore, aid string) (*AIDDatabase, error) {
+func newAIDDatabase(dbPath string, aid string) (*AIDDatabase, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, fmt.Errorf("创建 AID DB 目录失败: %w", err)
 	}
@@ -146,7 +143,7 @@ func newAIDDatabase(dbPath string, ss secretstore.SecretStore, aid string) (*AID
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	adb := &AIDDatabase{db: db, dbPath: dbPath, secretStore: ss, aid: aid}
+	adb := &AIDDatabase{db: db, dbPath: dbPath, aid: aid}
 	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
 		pkgLogKeystore().Warn("AIDDatabase WAL setup failed: %v", err)
 		if _, lockErr := db.Exec("PRAGMA locking_mode = EXCLUSIVE"); lockErr != nil {
@@ -354,23 +351,8 @@ func (a *AIDDatabase) LoadPrekeys(deviceID string) map[string]map[string]any {
 			continue
 		}
 
-		// 字段级解密：尝试将 enc 解析为加密记录并解密
+		// 字段级解密：明文存储，直接使用
 		privateKeyPEM := enc
-		if a.secretStore != nil && enc != "" {
-			var rec map[string]any
-			if err := json.Unmarshal([]byte(enc), &rec); err == nil {
-				// 成功解析为 JSON → 尝试解密
-				scope := safeAID(a.aid)
-				if plain, err2 := a.secretStore.Reveal(scope, "prekey/"+id, rec); err2 != nil {
-					pkgLogKeystore().Error("LoadPrekeys decryption failed (id=%s): %v", id, err2)
-					// 解密失败保留原始值（可能是旧的明文 PEM）
-				} else if plain != nil {
-					privateKeyPEM = string(plain)
-				}
-				// plain == nil 表示 scheme/name 不匹配，保留原始值（明文兼容）
-			}
-			// JSON 解析失败 → 原始值就是明文 PEM，直接使用
-		}
 
 		entry := map[string]any{
 			"private_key_pem": privateKeyPEM,
@@ -418,18 +400,6 @@ func (a *AIDDatabase) LoadPrekeyByID(prekeyID string) map[string]any {
 
 	// 字段级解密：与 LoadPrekeys 保持一致
 	privateKeyPEM := enc
-	if a.secretStore != nil && enc != "" {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(enc), &rec); err == nil {
-			scope := safeAID(a.aid)
-			if plain, err2 := a.secretStore.Reveal(scope, "prekey/"+id, rec); err2 != nil {
-				pkgLogKeystore().Error("LoadPrekeyByID decryption failed (id=%s): %v", id, err2)
-			} else if plain != nil {
-				privateKeyPEM = string(plain)
-			}
-		}
-	}
-
 	entry := map[string]any{
 		"private_key_pem": privateKeyPEM,
 	}
@@ -520,7 +490,7 @@ func (a *AIDDatabase) SaveGroupCurrent(groupID string, epoch int64, secret strin
 		pkgLogKeystore().Warn("SaveGroupCurrent json.Marshal failed: %v", err)
 		dataJSON = []byte("{}")
 	}
-	storedSecret := a.encryptText("group/"+groupID+"/current", secret, "SaveGroupCurrent")
+	storedSecret := secret
 	if _, err := a.db.Exec(
 		`INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
 		 VALUES (?, ?, ?, ?, ?)
@@ -553,7 +523,7 @@ func (a *AIDDatabase) LoadGroupCurrent(groupID string) map[string]any {
 	result := map[string]any{
 		"group_id":   groupID,
 		"epoch":      epoch,
-		"secret":     a.decryptText("group/"+groupID+"/current", enc, "LoadGroupCurrent"),
+		"secret":     enc,
 		"updated_at": updatedAt,
 	}
 	var extra map[string]any
@@ -593,7 +563,7 @@ func (a *AIDDatabase) LoadGroupSecretEpoch(groupID string, epoch *int) (map[stri
 	}
 	entry := map[string]any{
 		"epoch":      oldEpoch,
-		"secret":     a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, oldEpoch), enc, "LoadGroupSecretEpoch"),
+		"secret":     enc,
 		"updated_at": updatedAt,
 	}
 	var extra map[string]any
@@ -636,7 +606,7 @@ func (a *AIDDatabase) LoadGroupSecretEpochs(groupID string) ([]map[string]any, e
 		}
 		entry := map[string]any{
 			"epoch":      oldEpoch,
-			"secret":     a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, oldEpoch), enc, "LoadGroupSecretEpochs"),
+			"secret":     enc,
 			"updated_at": updatedAt,
 		}
 		var extra map[string]any
@@ -669,7 +639,7 @@ func (a *AIDDatabase) loadGroupCurrentLocked(groupID string) (map[string]any, er
 	result := map[string]any{
 		"group_id":   groupID,
 		"epoch":      epoch,
-		"secret":     a.decryptText("group/"+groupID+"/current", enc, "LoadGroupCurrent"),
+		"secret":     enc,
 		"updated_at": updatedAt,
 	}
 	var extra map[string]any
@@ -700,7 +670,7 @@ func (a *AIDDatabase) LoadAllGroupCurrent() map[string]map[string]any {
 		entry := map[string]any{
 			"group_id":   gid,
 			"epoch":      epoch,
-			"secret":     a.decryptText("group/"+gid+"/current", enc, "LoadAllGroupCurrent"),
+			"secret":     enc,
 			"updated_at": updatedAt,
 		}
 		var extra map[string]any
@@ -736,7 +706,7 @@ func (a *AIDDatabase) SaveGroupOldEpoch(groupID string, epoch int64, secret stri
 		pkgLogKeystore().Warn("SaveGroupOldEpoch json.Marshal failed: %v", err)
 		dataJSON = []byte("{}")
 	}
-	storedSecret := a.encryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), secret, "SaveGroupOldEpoch")
+	storedSecret := secret
 	if _, err := a.db.Exec(
 		`INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
@@ -770,7 +740,7 @@ func (a *AIDDatabase) LoadGroupOldEpochs(groupID string) []map[string]any {
 		}
 		entry := map[string]any{
 			"epoch":      epoch,
-			"secret":     a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), enc, "LoadGroupOldEpochs"),
+			"secret":     enc,
 			"updated_at": updatedAt,
 		}
 		if expiresAt.Valid {
@@ -873,7 +843,7 @@ func (a *AIDDatabase) StoreGroupSecretTransition(groupID string, opts GroupSecre
 	}
 
 	if hasCurrent {
-		currentSecret := a.decryptText("group/"+groupID+"/current", currentEnc, "StoreGroupSecretTransition")
+		currentSecret := currentEnc
 		currentData := jsonObjectLocal(currentDataStr)
 		if epoch < currentEpoch {
 			if err := tx.Commit(); err != nil {
@@ -1039,7 +1009,7 @@ func (a *AIDDatabase) StoreGroupSecretEpoch(groupID string, opts GroupSecretTran
 
 	if epoch > currentEpoch {
 		// 归档旧 epoch 到 old_epochs，然后用新 epoch 更新 current
-		oldSecret := a.decryptText("group/"+groupID+"/current", currentEnc, "StoreGroupSecretEpoch")
+		oldSecret := currentEnc
 		oldData := jsonObjectLocal(currentDataStr)
 		expiresAt := now + opts.OldEpochRetentionMillis
 		if err := a.upsertGroupOldEpochTx(tx, groupID, currentEpoch, oldSecret, oldData, currentUpdatedAt, &expiresAt); err != nil {
@@ -1056,7 +1026,7 @@ func (a *AIDDatabase) StoreGroupSecretEpoch(groupID string, opts GroupSecretTran
 	}
 
 	if epoch == currentEpoch {
-		currentSecret := a.decryptText("group/"+groupID+"/current", currentEnc, "StoreGroupSecretEpoch")
+		currentSecret := currentEnc
 		currentData := jsonObjectLocal(currentDataStr)
 		if currentSecret != "" && currentSecret != opts.Secret {
 			if strings.TrimSpace(fmt.Sprint(currentData["pending_rotation_id"])) == "" {
@@ -1132,7 +1102,7 @@ func (a *AIDDatabase) StoreGroupSecretEpoch(groupID string, opts GroupSecretTran
 	if err := oldRow.Scan(&oldEnc); err != nil && err != sql.ErrNoRows {
 		return false, err
 	} else if err == nil {
-		oldSecret := a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), oldEnc, "StoreGroupSecretEpoch")
+		oldSecret := oldEnc
 		if oldSecret != "" && oldSecret != opts.Secret {
 			if err := tx.Commit(); err != nil {
 				return false, err
@@ -1218,7 +1188,7 @@ func (a *AIDDatabase) DiscardPendingGroupSecretState(groupID string, epoch int, 
 		committed = true
 		return true, nil
 	}
-	secret := a.decryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, oldEpoch), oldEnc, "DiscardPendingGroupSecretState")
+	secret := oldEnc
 	if err := a.upsertGroupCurrentTx(tx, groupID, oldEpoch, secret, jsonObjectLocal(oldData), nowMs()); err != nil {
 		return false, err
 	}
@@ -1237,7 +1207,7 @@ func (a *AIDDatabase) upsertGroupCurrentTx(tx *sql.Tx, groupID string, epoch int
 	if err != nil {
 		dataJSON = []byte("{}")
 	}
-	storedSecret := a.encryptText("group/"+groupID+"/current", secret, "StoreGroupSecretTransition")
+	storedSecret := secret
 	_, err = tx.Exec(
 		`INSERT INTO group_current (group_id, epoch, secret_enc, data, updated_at)
 		 VALUES (?, ?, ?, ?, ?)
@@ -1254,7 +1224,7 @@ func (a *AIDDatabase) upsertGroupOldEpochTx(tx *sql.Tx, groupID string, epoch in
 	if err != nil {
 		dataJSON = []byte("{}")
 	}
-	storedSecret := a.encryptText(fmt.Sprintf("group/%s/epoch/%d", groupID, epoch), secret, "StoreGroupSecretTransition")
+	storedSecret := secret
 	_, err = tx.Exec(
 		`INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
@@ -1345,28 +1315,9 @@ func (a *AIDDatabase) DeleteSession(sessionID string) {
 
 // decryptSessionData 尝试解密 session 数据，兼容旧明文格式
 func (a *AIDDatabase) decryptSessionData(sessionID, enc string) string {
-	return a.decryptText("session/"+sessionID, enc, "LoadSession")
-}
-
-// encryptText 阶段6：group secret 改为明文写入，直接返回原文
-func (a *AIDDatabase) encryptText(name, plaintext, label string) string {
-	return plaintext
-}
-
-func (a *AIDDatabase) decryptText(name, enc, label string) string {
-	if a.secretStore == nil || enc == "" {
-		return enc
-	}
-	var rec map[string]any
-	if err := json.Unmarshal([]byte(enc), &rec); err == nil {
-		if plain, err2 := a.secretStore.Reveal(safeAID(a.aid), name, rec); err2 != nil {
-			pkgLogKeystore().Error("%s decryption failed (name=%s): %v", label, name, err2)
-		} else if plain != nil {
-			return string(plain)
-		}
-	}
 	return enc
 }
+
 
 // ── Instance State ───────────────────────────────────────────
 

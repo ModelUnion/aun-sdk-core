@@ -96,23 +96,17 @@ async function installP0Helpers(page: any): Promise<void> {
      * 浏览器 SDK 使用 IndexedDB 存储，每个实例需要独立的 instanceId。
      */
     const makeAndConnect = async (instanceId: string): Promise<any> => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({
-        instanceId,
-        issuer,
-        debug: true,
+      return w.AUN_TEST_HELPERS.createClient({
+        aunPath: `js-${instanceId}`,
+        deviceId: instanceId,
+        requireForwardSecrecy: false,
       });
-      // 禁用 forward secrecy 以简化测试
-      if (client._configModel) {
-        client._configModel.requireForwardSecrecy = false;
-      }
-      return client;
     };
 
     /**
      * 确保 AID 已创建、认证并连接。
      */
-        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+    const ensureConnected = async (client: any, aid: string): Promise<void> => {
       await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
@@ -132,7 +126,7 @@ test.describe('P0-01: 网关健康检查（浏览器）', () => {
   test('正常健康检查 — 真实 Gateway 应返回 true', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
       const AUN = (window as any).AUN;
-      const client = new AUN.AUNClient({ instanceId: 'p0-01-health', debug: true });
+      const client = new AUN.AUNClient();
       try {
         const ok = await client.checkGatewayHealth(`https://gateway.${iss}`, 10000);
         return { ok, error: null };
@@ -149,7 +143,7 @@ test.describe('P0-01: 网关健康检查（浏览器）', () => {
   test('超时 — 不可达地址应返回 false', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const AUN = (window as any).AUN;
-      const client = new AUN.AUNClient({ instanceId: 'p0-01-timeout', debug: true });
+      const client = new AUN.AUNClient();
       try {
         const start = Date.now();
         const ok = await client.checkGatewayHealth('https://192.0.2.1:9999', 2000);
@@ -177,16 +171,10 @@ test.describe('P0-02: AID 创建失败路径（浏览器）', () => {
 
   test('空 AID 应被拒绝', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
-      const AUN = (window as any).AUN;
       const helpers = (window as any).AUN_TEST_HELPERS;
-      const client = new AUN.AUNClient({ instanceId: 'p0-02-empty', debug: true });
-      try {
-        const store = helpers.createStore(client);
-        const result = await store.register('');
-        return { rejected: !result.ok, error: result.ok ? null : result.error.message };
-      } finally {
-        await client.close();
-      }
+      const store = helpers.createStore({ aunPath: `js-p0-02-empty-${iss}`, deviceId: 'p0-02-empty' });
+      const result = await store.register('');
+      return { rejected: !result.ok, error: result.ok ? null : result.error.message };
     }, ISSUER);
 
     expect(result.rejected).toBe(true);
@@ -194,26 +182,20 @@ test.describe('P0-02: AID 创建失败路径（浏览器）', () => {
 
   test('创建已存在的 AID — 应报错或幂等', async ({ page }) => {
     const result = await page.evaluate(async (iss: string) => {
-      const AUN = (window as any).AUN;
       const rid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
       const aid = `p0dup${rid}.${iss}`;
-      const client1 = new AUN.AUNClient({ instanceId: 'p0-02-dup1', debug: true });
-      const client2 = new AUN.AUNClient({ instanceId: 'p0-02-dup2', debug: true });
       const helpers = (window as any).AUN_TEST_HELPERS;
 
       try {
-        const first = await helpers.createStore(client1).register(aid);
+        const first = await helpers.createStore({ aunPath: `js-p0-02-dup1-${rid}`, deviceId: `p0-02-dup1-${rid}` }).register(aid);
         if (!first.ok) return { behavior: 'first_failed', error: first.error.message };
-        const second = await helpers.createStore(client2).register(aid);
+        const second = await helpers.createStore({ aunPath: `js-p0-02-dup2-${rid}`, deviceId: `p0-02-dup2-${rid}` }).register(aid);
         if (second.ok) {
           return { behavior: 'idempotent' };
         }
         return { behavior: 'error', error: second.error.message };
       } catch (e: any) {
         return { behavior: 'first_failed', error: e.message };
-      } finally {
-        await client1.close();
-        await client2.close();
       }
     }, ISSUER);
 

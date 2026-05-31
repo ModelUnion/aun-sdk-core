@@ -88,40 +88,13 @@ func TestChangeSeedMigratesKeyJSONAfterPrivateKeyVerification(t *testing.T) {
 	}
 }
 
-func TestAutoSeedMigrationFallsBackToLegacySeedOnStrictFailure(t *testing.T) {
-	dir := t.TempDir()
-	goodAid := "good.agentid.pub"
-	wrongAid := "wrong.agentid.pub"
-	writeSeedProtectedKeyJSON(t, dir, goodAid, "old-seed", "GOOD_PRIVATE")
-	writeSeedProtectedKeyJSON(t, dir, wrongAid, "other-seed", "WRONG_PRIVATE")
-	if err := os.WriteFile(filepath.Join(dir, ".seed"), []byte("old-seed"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	ks, err := NewFileKeyStore(dir, nil, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ks.Close()
-	if _, err := os.Stat(filepath.Join(dir, ".seed")); err != nil {
-		t.Fatalf("严格迁移失败时应保留 .seed: %v", err)
-	}
-	loaded, err := ks.LoadKeyPair(goodAid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded["private_key_pem"] != "GOOD_PRIVATE" {
-		t.Fatalf("自动迁移失败后应继续用旧 .seed 读取私钥: %v", loaded["private_key_pem"])
-	}
-}
-
 // ── GO-008: initSchema 版本迁移框架测试 ──────────────────────
 
 func TestInitSchema_NewDB_SetsCurrentVersion(t *testing.T) {
 	// 新建的数据库应记录当前 schema 版本
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	adb, err := newAIDDatabase(dbPath, nil, "")
+	adb, err := newAIDDatabase(dbPath, "")
 	if err != nil {
 		t.Fatalf("创建 AIDDatabase 失败: %v", err)
 	}
@@ -163,7 +136,7 @@ func TestInitSchema_OldVersion_TriggersUpgrade(t *testing.T) {
 	db.Close()
 
 	// 重新打开 → initSchema 应检测到旧版本并升级
-	adb, err := newAIDDatabase(dbPath, nil, "")
+	adb, err := newAIDDatabase(dbPath, "")
 	if err != nil {
 		t.Fatalf("打开旧版本 DB 失败: %v", err)
 	}
@@ -185,7 +158,7 @@ func TestInitSchema_SameVersion_NoOp(t *testing.T) {
 	dbPath := filepath.Join(dir, "same.db")
 
 	// 第一次创建
-	adb1, err := newAIDDatabase(dbPath, nil, "")
+	adb1, err := newAIDDatabase(dbPath, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +167,7 @@ func TestInitSchema_SameVersion_NoOp(t *testing.T) {
 	adb1.close()
 
 	// 第二次打开（同版本）
-	adb2, err := newAIDDatabase(dbPath, nil, "")
+	adb2, err := newAIDDatabase(dbPath, "")
 	if err != nil {
 		t.Fatalf("同版本重新打开失败: %v", err)
 	}
@@ -212,12 +185,8 @@ func TestInitSchema_SameVersion_NoOp(t *testing.T) {
 func TestSaveSessionEncryptsDataInDB(t *testing.T) {
 	// 阶段6: session 数据改为明文写入，LoadSession 仍能正常读取
 	dir := t.TempDir()
-	ss, err := secretstore.NewFileSecretStore(dir, "test-seed")
-	if err != nil {
-		t.Fatalf("创建 SecretStore 失败: %v", err)
-	}
 	dbPath := filepath.Join(dir, "test.db")
-	adb, err := newAIDDatabase(dbPath, ss, "test.aid.com")
+	adb, err := newAIDDatabase(dbPath, "test.aid.com")
 	if err != nil {
 		t.Fatalf("创建 AIDDatabase 失败: %v", err)
 	}
@@ -254,7 +223,7 @@ func TestSaveSessionWithoutSecretStoreFallsBackToPlaintext(t *testing.T) {
 	// 无 SecretStore 时应降级为明文存储（向后兼容）
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	adb, err := newAIDDatabase(dbPath, nil, "test.aid.com")
+	adb, err := newAIDDatabase(dbPath, "test.aid.com")
 	if err != nil {
 		t.Fatalf("创建 AIDDatabase 失败: %v", err)
 	}
@@ -277,14 +246,10 @@ func TestSaveSessionWithoutSecretStoreFallsBackToPlaintext(t *testing.T) {
 func TestLoadSessionDecryptsLegacyPlaintext(t *testing.T) {
 	// 已有明文 session 数据应能正常加载（向后兼容）
 	dir := t.TempDir()
-	ss, err := secretstore.NewFileSecretStore(dir, "test-seed")
-	if err != nil {
-		t.Fatalf("创建 SecretStore 失败: %v", err)
-	}
 	dbPath := filepath.Join(dir, "test.db")
 
 	// 先用无加密的 DB 写入明文数据
-	adbPlain, err := newAIDDatabase(dbPath, nil, "test.aid.com")
+	adbPlain, err := newAIDDatabase(dbPath, "test.aid.com")
 	if err != nil {
 		t.Fatalf("创建 AIDDatabase 失败: %v", err)
 	}
@@ -297,7 +262,7 @@ func TestLoadSessionDecryptsLegacyPlaintext(t *testing.T) {
 	adbPlain.close()
 
 	// 用带 SecretStore 的 DB 重新打开，应能读取旧明文数据
-	adbEnc, err := newAIDDatabase(dbPath, ss, "test.aid.com")
+	adbEnc, err := newAIDDatabase(dbPath, "test.aid.com")
 	if err != nil {
 		t.Fatalf("重新打开 AIDDatabase 失败: %v", err)
 	}

@@ -63,6 +63,11 @@ describe('ISSUE-JS-002: 签名失败应抛错而非静默降级', () => {
       private_key_pem: 'INVALID_PEM_KEY',
       cert: '',
     };
+    (client as any)._currentAid = {
+      aid: 'test.aid.com',
+      privateKeyPem: 'INVALID_PEM_KEY',
+      certPem: '',
+    };
     (client as any)._transport.call = vi.fn().mockResolvedValue({ ok: true });
   });
 

@@ -38,7 +38,7 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 1000): Pro
   throw new Error('等待条件超时');
 }
 
-describe('P2-5: group.pull 应喂原始消息给 onPullResult', () => {
+describe('P2-5: group.pull V2-only 路由', () => {
   let client: AUNClient;
 
   beforeEach(() => {
@@ -49,18 +49,12 @@ describe('P2-5: group.pull 应喂原始消息给 onPullResult', () => {
     (client as any)._deviceId = 'device-001';
   });
 
-  it('group.pull 应使用原始消息（解密前）喂 SeqTracker', async () => {
-    const rawMessages = [
+  it('group.pull 应路由到内部 V2 pull', async () => {
+    (client as any)._v2Session = {};
+    const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue([
       { seq: 1, content: 'encrypted-payload-1' },
       { seq: 2, content: 'encrypted-payload-2' },
-    ];
-
-    (client as any)._transport.call.mockResolvedValue({
-      messages: rawMessages,
-      cursor: { current_seq: 2 },
-    });
-
-    const onPullResultSpy = vi.spyOn((client as any)._seqTracker, 'onPullResult');
+    ]);
 
     await client.call('group.pull', {
       group_id: 'group-123',
@@ -68,14 +62,16 @@ describe('P2-5: group.pull 应喂原始消息给 onPullResult', () => {
       device_id: 'device-001',
     });
 
-    // 验证 onPullResult 收到的是原始消息（含原始 content），不是解密后的
-    expect(onPullResultSpy).toHaveBeenCalledWith(
-      'group:group-123',
-      expect.arrayContaining([
-        expect.objectContaining({ seq: 1, content: 'encrypted-payload-1' }),
-        expect.objectContaining({ seq: 2, content: 'encrypted-payload-2' }),
-      ]),
+    expect(pullGroupV2Spy).toHaveBeenCalledWith(
+      'group-123',
       0,
+      50,
+      expect.objectContaining({
+        explicitAfterSeq: true,
+        cursorParams: expect.objectContaining({
+          device_id: 'device-001',
+        }),
+      }),
     );
   });
 });
@@ -96,20 +92,16 @@ describe('P2-6: 补洞路径不应重复调用 onPullResult', () => {
       { seq: 3, content: 'msg-3' },
       { seq: 4, content: 'msg-4' },
     ];
-
-    (client as any)._transport.call.mockResolvedValue({ messages });
-
-    const onPullResultSpy = vi.spyOn((client as any)._seqTracker, 'onPullResult');
+    (client as any)._v2Session = {};
+    const pullV2Spy = vi.spyOn(client as any, '_pullV2').mockResolvedValue(messages);
 
     // 模拟已有 seq 1-2 的状态，设置 contiguous_seq > 0 以通过 afterSeq === 0 守卫
     (client as any)._seqTracker.onPullResult('p2p:test.aid.com', [{ seq: 1 }, { seq: 2 }]);
-    onPullResultSpy.mockClear();
 
     await (client as any)._fillP2pGap();
 
-    // call('message.pull') 拦截器内部会调用一次 onPullResult
-    // _fillP2pGap 内不应再重复调用
-    expect(onPullResultSpy).toHaveBeenCalledTimes(1);
+    expect(pullV2Spy).toHaveBeenCalledTimes(1);
+    expect(pullV2Spy).toHaveBeenCalledWith(2, 50);
   });
 
   it('_fillGroupGap 不应重复调用 onPullResult', async () => {
@@ -118,22 +110,16 @@ describe('P2-6: 补洞路径不应重复调用 onPullResult', () => {
       { seq: 4, content: 'msg-4' },
     ];
 
-    (client as any)._transport.call.mockResolvedValue({
-      messages,
-      cursor: { current_seq: 4 },
-    });
-
-    const onPullResultSpy = vi.spyOn((client as any)._seqTracker, 'onPullResult');
+    (client as any)._v2Session = {};
+    const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue(messages);
 
     // 模拟已有 seq 1-2 的状态
     (client as any)._seqTracker.onPullResult('group:group-123', [{ seq: 1 }, { seq: 2 }]);
-    onPullResultSpy.mockClear();
 
     await (client as any)._fillGroupGap('group-123');
 
-    // call('group.pull') 拦截器内部会调用一次 onPullResult
-    // _fillGroupGap 内不应再重复调用
-    expect(onPullResultSpy).toHaveBeenCalledTimes(1);
+    expect(pullGroupV2Spy).toHaveBeenCalledTimes(1);
+    expect(pullGroupV2Spy).toHaveBeenCalledWith('group-123', 2, 50);
   });
 });
 

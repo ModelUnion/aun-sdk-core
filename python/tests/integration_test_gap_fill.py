@@ -29,6 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
+from aun_core import AUNClient
 from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
 # ---------------------------------------------------------------------------
@@ -135,6 +136,36 @@ def _subscribe_push_after(client: AUNClient, from_aid: str, *, after_seq: int = 
     return inbox, event, sub
 
 
+def _message_sender(msg: dict) -> str:
+    return str(msg.get("sender_aid") or msg.get("from") or msg.get("from_aid") or "")
+
+
+def _subscribe_group_after(
+    client: AUNClient,
+    group_id: str,
+    sender_aid: str,
+    *,
+    after_seq: int = 0,
+):
+    inbox = []
+    event = asyncio.Event()
+
+    def handler(data):
+        if not isinstance(data, dict):
+            return
+        if data.get("group_id") != group_id:
+            return
+        if _message_sender(data) != sender_aid:
+            return
+        if _seq_of(data) <= after_seq:
+            return
+        inbox.append(data)
+        event.set()
+
+    sub = client.on("group.message_created", handler)
+    return inbox, event, sub
+
+
 async def _wait_for_messages_after(
     client: AUNClient,
     from_aid: str,
@@ -170,6 +201,60 @@ async def _wait_for_messages_after(
     if len(all_msgs) < min_count:
         result = await client.call("message.pull", {"after_seq": after_seq, "limit": 50})
         all_msgs.extend(m for m in result.get("messages", []) if m.get("from") == from_aid)
+
+    by_seq = {}
+    for msg in all_msgs:
+        seq = _seq_of(msg)
+        if seq > after_seq:
+            by_seq[seq] = msg
+    return [by_seq[seq] for seq in sorted(by_seq)]
+
+
+async def _wait_for_group_messages_after(
+    client: AUNClient,
+    group_id: str,
+    sender_aid: str,
+    *,
+    after_seq: int = 0,
+    min_count: int = 1,
+    timeout: float = 5.0,
+    inbox: list[dict] | None = None,
+    event: asyncio.Event | None = None,
+):
+    """等待群消息应用事件，数量不足时用 group.pull 兜底。"""
+    own_sub = None
+    if inbox is None or event is None:
+        inbox, event, own_sub = _subscribe_group_after(
+            client, group_id, sender_aid, after_seq=after_seq,
+        )
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while len(inbox) < min_count:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        event.clear()
+        if len(inbox) >= min_count:
+            break
+        try:
+            await asyncio.wait_for(event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+
+    if own_sub is not None:
+        own_sub.unsubscribe()
+
+    all_msgs = list(inbox)
+    if len(all_msgs) < min_count:
+        result = await client.call("group.pull", {
+            "group_id": group_id,
+            "after_seq": after_seq,
+            "limit": 50,
+        })
+        all_msgs.extend(
+            m for m in result.get("messages", [])
+            if m.get("group_id") == group_id and _message_sender(m) == sender_aid
+        )
 
     by_seq = {}
     for msg in all_msgs:
@@ -304,39 +389,37 @@ async def test_group_payload_gap_fill():
 
         await asyncio.sleep(2.0)  # 等待成员同步 + E2EE 密钥分发
 
+        inbox, event, sub = _subscribe_group_after(bob, group_id, _ALICE_AID)
+
         # 2. Alice 发送 5 条群消息（不加密，避免 E2EE epoch 分发延迟问题）
-        for i in range(1, 6):
-            await alice.call("group.send", {
-                "group_id": group_id,
-                "payload": f"group_msg{i}",
-                "encrypt": False
-            })
-            await asyncio.sleep(0.3)
+        try:
+            for i in range(1, 6):
+                await alice.call("group.send", {
+                    "group_id": group_id,
+                    "payload": f"group_msg{i}",
+                    "encrypt": False
+                })
+                await asyncio.sleep(0.3)
 
-        # 3. 等待服务端处理
-        await asyncio.sleep(2.0)
+            # 3. Bob 在线时优先通过 SDK 发布的 group.message_created 收集。
+            alice_msgs = await _wait_for_group_messages_after(
+                bob,
+                group_id,
+                _ALICE_AID,
+                min_count=5,
+                timeout=6.0,
+                inbox=inbox,
+                event=event,
+            )
+        finally:
+            sub.unsubscribe()
 
-        # 4. Bob 强拉当前可拉范围内的群消息
-        all_group_msgs = await bob.call("group.pull", {
-            "group_id": group_id,
-            "after_seq": 0,
-            "limit": 50,
-            "force": True,
-        })
-        all_msgs = all_group_msgs.get("messages", [])
-
-        # 5. 验证：应该收到至少 5 条消息
-        if len(all_msgs) < 5:
-            _fail("group_payload_gap_fill", f"期望至少 5 条消息，实际 {len(all_msgs)} 条")
-            return
-
-        # 过滤出 Alice 发送的消息（群消息用 sender_aid 字段）
-        alice_msgs = [m for m in all_msgs if m.get("sender_aid") == _ALICE_AID or m.get("from") == _ALICE_AID]
+        # 4. 验证：应该收到 Alice 至少 5 条消息
         if len(alice_msgs) < 5:
             _fail("group_payload_gap_fill", f"期望 Alice 至少 5 条消息，实际 {len(alice_msgs)} 条")
             return
 
-        # 取最后 5 条
+        # 取最后 5 条（本次发送的）
         recent_msgs = alice_msgs[-5:]
         seqs = [_seq_of(m) for m in recent_msgs]
         first_seq = seqs[0]

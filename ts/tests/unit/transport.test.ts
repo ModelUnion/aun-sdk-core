@@ -164,6 +164,12 @@ describe('RPCTransport 后台 RPC 调度', () => {
     return { transport, ws };
   }
 
+  function createReadyTransportWithListeners(timeout = 10_000) {
+    const ready = createReadyTransport(timeout);
+    (ready.transport as any)._setupListeners(ready.ws);
+    return ready;
+  }
+
   function parseSent(ws: MockWebSocket): Array<{ id: string; method: string; params?: Record<string, unknown> }> {
     return ws.sent.map((raw) => JSON.parse(raw));
   }
@@ -258,5 +264,13 @@ describe('RPCTransport 后台 RPC 调度', () => {
     expect((transport as any)._pendingBackground.size).toBe(0);
     expect((transport as any)._rpcQueue).toHaveLength(0);
     expect((transport as any)._backgroundRpcQueue).toHaveLength(0);
+  });
+
+  it('连接关闭后再次调用应在错误信息中保留 close code', async () => {
+    const { transport, ws } = createReadyTransportWithListeners();
+
+    ws.emit('close', 4013);
+
+    await expect(transport.call('auth.connect', {})).rejects.toThrow(/4013/);
   });
 });

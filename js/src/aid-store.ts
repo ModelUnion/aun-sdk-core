@@ -297,6 +297,7 @@ export class AIDStore {
       rootCaPem: opts.rootCaPem ?? null,
       verifySsl: this._verifySsl,
     });
+    (this._auth as unknown as { _persistKeyMaterial: boolean })._persistKeyMaterial = true;
   }
 
   close(): void {

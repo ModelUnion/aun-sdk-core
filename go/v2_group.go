@@ -238,17 +238,28 @@ func (c *AUNClient) v2ResolveGroupBootstrap(ctx context.Context, state *v2P2PSta
 	return devices, epoch, sc, auditRecipients, wrapPolicy, nil
 }
 
+type groupV2PullOptions struct {
+	explicitAfterSeq bool
+	cursorParams     map[string]any
+}
+
 // PullGroupV2 拉取并解密 V2 Group 消息。
 //
 // afterSeq=0 时使用本地 SeqTracker 的 contiguous_seq（ns = "group:" + groupID）。
 // limit<=0 时默认 50。
 func (c *AUNClient) pullGroupV2(ctx context.Context, groupID string, afterSeq int64, limit int) ([]map[string]any, error) {
+	msgs, _, err := c.pullGroupV2WithOptions(ctx, groupID, afterSeq, limit, groupV2PullOptions{})
+	return msgs, err
+}
+
+func (c *AUNClient) pullGroupV2WithOptions(ctx context.Context, groupID string, afterSeq int64, limit int, opts groupV2PullOptions) ([]map[string]any, v2PullPageMeta, error) {
+	meta := v2PullPageMeta{}
 	state := c.v2GetState()
 	if state == nil || state.session == nil {
-		return nil, errors.New("V2 session not initialized (not connected?)")
+		return nil, meta, errors.New("V2 session not initialized (not connected?)")
 	}
 	if groupID == "" {
-		return nil, errors.New("pull_group_v2: group_id 不能为空")
+		return nil, meta, errors.New("pull_group_v2: group_id 不能为空")
 	}
 	if limit <= 0 {
 		limit = 50
@@ -256,24 +267,27 @@ func (c *AUNClient) pullGroupV2(ctx context.Context, groupID string, afterSeq in
 
 	ns := "group:" + groupID
 	effectiveAfterSeq := afterSeq
-	if effectiveAfterSeq == 0 {
+	if !opts.explicitAfterSeq && effectiveAfterSeq == 0 {
 		effectiveAfterSeq = int64(c.seqTracker.GetContiguousSeq(ns))
 	}
 
 	c.logE2.Debug("group.v2.pull request: group=%s after_seq=%d limit=%d ns=%s", groupID, effectiveAfterSeq, limit, ns)
-	raw, err := c.Call(ctx, "group.v2.pull", map[string]any{
-		"group_id":  groupID,
-		"after_seq": effectiveAfterSeq,
-		"limit":     limit,
-	})
+	raw, err := c.rawGroupV2Pull(ctx, groupID, effectiveAfterSeq, limit, opts.cursorParams)
 	if err != nil {
-		return nil, err
+		return nil, meta, err
 	}
 	result, _ := raw.(map[string]any)
 	messages := v2ToMapList(result["messages"])
 	serverAckSeq := int64(0)
+	hasServerAckSeq := false
 	if cursor, ok := result["cursor"].(map[string]any); ok {
+		_, hasServerAckSeq = cursor["current_seq"]
 		serverAckSeq = toInt64(cursor["current_seq"])
+	}
+	meta = v2PullPageMeta{
+		rawCount:     len(messages),
+		serverAckSeq: serverAckSeq,
+		hasServerAck: hasServerAckSeq,
 	}
 	c.logE2.Debug("group.v2.pull response: group=%s raw_count=%d cursor_current=%d has_more=%v", groupID, len(messages), serverAckSeq, result["has_more"])
 	for _, msg := range messages {
@@ -341,7 +355,28 @@ func (c *AUNClient) pullGroupV2(ctx context.Context, groupID string, afterSeq in
 	}
 
 	c.logE2.Debug("group.v2.pull done: group=%s requested_after_seq=%d raw_count=%d decrypted=%d ns=%s", groupID, afterSeq, len(messages), len(decrypted), ns)
-	return decrypted, nil
+	return decrypted, meta, nil
+}
+
+func (c *AUNClient) rawGroupV2Pull(ctx context.Context, groupID string, afterSeq int64, limit int, cursorParams map[string]any) (any, error) {
+	params := map[string]any{
+		"group_id":  groupID,
+		"after_seq": afterSeq,
+		"limit":     limit,
+	}
+	for k, v := range cursorParams {
+		if v != nil {
+			params[k] = v
+		}
+	}
+	if _, exists := params["device_id"]; !exists {
+		params["device_id"] = c.deviceID
+	}
+	if _, exists := params["slot_id"]; !exists {
+		params["slot_id"] = c.slotID
+	}
+	c.signClientOperation("group.v2.pull", params)
+	return c.transport.Call(ctx, "group.v2.pull", params)
 }
 
 // AckGroupV2 确认 V2 群消息已消费。

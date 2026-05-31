@@ -37,7 +37,8 @@ export class AID {
   readonly rootCaPath: string | null;
   readonly debug: boolean;
 
-  private readonly _privateKeyPem: string | null;
+  /** AIDStore 加载时注入的明文私钥 PEM，供 AUNClient 直接使用（无需 seed）。*/
+  readonly privateKeyPem: string;
   private readonly _certValid: boolean;
   private readonly _privateKeyValid: boolean;
 
@@ -62,9 +63,9 @@ export class AID {
     this.verifySsl = params.verifySsl ?? false;
     this.rootCaPath = params.rootCaPath ?? null;
     this.debug = params.debug ?? false;
-    this._privateKeyPem = params.privateKeyPem;
     this._certValid = params.certValid;
     this._privateKeyValid = params.privateKeyValid;
+    this.privateKeyPem = params.privateKeyPem ?? '';
   }
 
   static _create(params: {
@@ -116,12 +117,12 @@ export class AID {
   }
 
   sign(payload: Buffer | string): Result<{ signature: string }> {
-    if (!this._privateKeyValid || !this._privateKeyPem) {
+    if (!this._privateKeyValid || !this.privateKeyPem) {
       return resultErr(codes.PRIVATE_KEY_NOT_VALID, 'private key is not valid');
     }
     try {
       const data = typeof payload === 'string' ? Buffer.from(payload, 'utf-8') : payload;
-      const sig = signBytes(this._privateKeyPem, data);
+      const sig = signBytes(this.privateKeyPem, data);
       return resultOk({ signature: sig.toString('base64') });
     } catch (exc) {
       return resultErr(codes.SIGNATURE_OPERATION_ERROR, String(exc), exc);
@@ -143,12 +144,12 @@ export class AID {
   }
 
   signAgentMd(content: string): Result<{ signed: string }> {
-    if (!this._privateKeyValid || !this._privateKeyPem) {
+    if (!this._privateKeyValid || !this.privateKeyPem) {
       return resultErr(codes.PRIVATE_KEY_NOT_VALID, 'private key is not valid');
     }
     try {
       const payload = normalizeAgentMdPayload(content);
-      const sig = signBytes(this._privateKeyPem, Buffer.from(payload, 'utf-8'));
+      const sig = signBytes(this.privateKeyPem, Buffer.from(payload, 'utf-8'));
       const block = buildAgentMdSignatureBlock(
         this.certFingerprint,
         Math.trunc(Date.now() / 1000),

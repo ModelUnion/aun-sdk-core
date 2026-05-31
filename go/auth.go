@@ -97,17 +97,18 @@ type AuthFlowConfig struct {
 // AuthFlow 处理 AID 注册、两阶段认证、证书验证和 token 刷新。
 // 与 Python SDK auth.py 的 AuthFlow 完全对应。
 type AuthFlow struct {
-	keystore          keystore.KeyStore
-	crypto            *CryptoProvider
-	aid               string
-	deviceID          string
-	slotID            string
-	deliveryMode      map[string]any
-	connectionFactory ConnectionFactory
-	rootCAPath        string
-	chainCacheTTL     int
-	verifySSL         bool
-	dnsNet            *DnsResilientNet
+	keystore           keystore.KeyStore
+	crypto             *CryptoProvider
+	aid                string
+	deviceID           string
+	slotID             string
+	deliveryMode       map[string]any
+	connectionFactory  ConnectionFactory
+	rootCAPath         string
+	chainCacheTTL      int
+	verifySSL          bool
+	dnsNet             *DnsResilientNet
+	persistKeyMaterial bool
 
 	// H24: 记录最近一次关键持久化失败，调用方可通过 GetLastPersistError 主动轮询
 	lastPersistErr error
@@ -1881,6 +1882,13 @@ func (a *AuthFlow) persistIdentity(identity map[string]any) error {
 	for _, key := range authInstanceStateFields {
 		if value, ok := persisted[key]; ok {
 			instanceState[key] = value
+			delete(persisted, key)
+		}
+	}
+	// 私钥由 AIDStore 管理。普通 AUNClient 认证/刷新路径不写 key.json；
+	// AIDStore 内部注册路径需要保留 keypair，供后续 AIDStore.Load() 返回可签名 AID。
+	if !a.persistKeyMaterial {
+		for _, key := range []string{"private_key_pem", "public_key_der_b64", "curve"} {
 			delete(persisted, key)
 		}
 	}

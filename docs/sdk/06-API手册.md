@@ -118,6 +118,7 @@ AID 由 `AIDStore.load()` 返回，应用层不直接构造。
 | `verify_ssl` | `verifySsl` | `VerifySSL` | 是否校验 TLS 证书 |
 | `root_ca_path` | `rootCaPath` | `RootCaPath` | 自定义根证书路径 |
 | `debug` | `debug` | `Debug` | 是否开启调试日志 |
+| `private_key_pem` | `privateKeyPem` | `PrivateKeyPem` | 明文私钥 PEM（由 `AIDStore.load()` 注入，空字符串表示无私钥）|
 
 ### 方法
 

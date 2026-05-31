@@ -21,7 +21,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { AUNClient } from '../../src/client.js';
 import type { JsonObject } from '../../src/types.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 const TEST_TIMEOUT = 120_000;
 process.env.AUN_ENV ??= 'development';
@@ -31,15 +31,13 @@ function runId(): string {
 }
 
 function makeClient(tag: string): AUNClient {
-  const client = new AUNClient({
-    aun_path: fs.mkdtempSync(path.join(os.tmpdir(), `aun-fed-v2t-${tag}-`)),
+  return createTestClient({
+    aunPath: fs.mkdtempSync(path.join(os.tmpdir(), `aun-fed-v2t-${tag}-`)),
+    requireForwardSecrecy: false,
   });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await setGatewayForClient(client, aid);
   await registerAndLoadIdentity(client, aid);
   await client.connect();
   // V2 session 必须显式初始化

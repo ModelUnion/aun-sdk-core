@@ -10,7 +10,7 @@ from aun_core.v2.session import V2Session
 
 
 def _make_session(tmp_path):
-    db = AIDDatabase(tmp_path / "aun.db", b"test_seed_key_32bytes_padding!!")
+    db = AIDDatabase(tmp_path / "aun.db")
     aid_priv, aid_pub = generate_p256_keypair()
     session = V2Session(
         db,
@@ -236,7 +236,7 @@ def test_legacy_v2_device_keys_migration_accepts_null_uploaded_markers(tmp_path)
     conn.commit()
     conn.close()
 
-    db = AIDDatabase(db_path, b"test_seed_key_32bytes_padding!!")
+    db = AIDDatabase(db_path)
     try:
         store = V2KeyStore(db)
         assert store.load_latest_uploaded_spk_id("dev-1") == "spk-1"
@@ -252,7 +252,7 @@ def test_legacy_v2_device_keys_migration_accepts_null_uploaded_markers(tmp_path)
 
 
 def test_group_spk_new_records_do_not_use_legacy_nul_composite_key(tmp_path):
-    db = AIDDatabase(tmp_path / "aun.db", b"test_seed_key_32bytes_padding!!")
+    db = AIDDatabase(tmp_path / "aun.db")
     try:
         store = V2KeyStore(db)
         store.save_group_spk("dev-1", "group.agentid.pub/new", "sha256:new_group", b"gpriv", b"gpub")

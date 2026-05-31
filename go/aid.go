@@ -31,6 +31,8 @@ type AID struct {
 	VerifySSL       bool   // 是否校验 TLS 证书，由 AIDStore 注入
 	RootCaPath      string // 自定义根证书路径，由 AIDStore 注入
 	Debug           bool   // 调试模式，由 AIDStore 注入
+	// PrivateKeyPem 是 AIDStore 加载时注入的明文私钥 PEM，供 AUNClient 直接使用（无需 seed）
+	PrivateKeyPem string
 
 	// 私有字段
 	certObj    *x509.Certificate
@@ -47,15 +49,17 @@ func newAID(
 	certValid, pkValid bool,
 	deviceID, slotID string,
 	verifySSL bool, rootCaPath string, debug bool,
+	privateKeyPem string,
 ) *AID {
 	a := &AID{
-		Aid:        strings.TrimSpace(aid),
-		AunPath:    strings.TrimSpace(aunPath),
-		CertPem:    certPem,
-		certObj:    certObj,
-		privateKey: privateKey,
-		certValid:  certValid,
-		pkValid:    pkValid,
+		Aid:           strings.TrimSpace(aid),
+		AunPath:       strings.TrimSpace(aunPath),
+		CertPem:       certPem,
+		PrivateKeyPem: privateKeyPem,
+		certObj:       certObj,
+		privateKey:    privateKey,
+		certValid:     certValid,
+		pkValid:       pkValid,
 	}
 	a.DeviceID = deviceID
 	a.SlotID = slotID

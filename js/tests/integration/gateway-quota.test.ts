@@ -58,12 +58,13 @@ function makeSharedPath(tag: string): string {
 }
 
 function makeClient(aunPath: string, deviceId?: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath });
+  const client = new AUNClient();
+  (client as any).__testAunPath = aunPath;
   ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   if (deviceId) {
     // jsdom 下所有 client 共享 localStorage，默认 _deviceId 相同；
-    // 这里直接覆写 _deviceId，模拟不同设备。
-    (client as unknown as { _deviceId: string })._deviceId = deviceId;
+    // 通过测试上下文字段让 AIDStore 写入对应 device_id，避免 loadIdentity 后被重置。
+    (client as unknown as { __testDeviceId: string }).__testDeviceId = deviceId;
   }
   return client;
 }
@@ -84,7 +85,7 @@ function captureDisconnect(client: AUNClient): {
     const d = (data ?? {}) as CapturedDisconnect;
     events.push(d);
   });
-  client.on('connection.state', (data: unknown) => {
+  client.on('state_change', (data: unknown) => {
     const d = (data ?? {}) as { state?: string; code?: number; detail?: Record<string, unknown> };
     if (d.state) {
       states.push({ state: String(d.state), code: d.code, detail: d.detail });

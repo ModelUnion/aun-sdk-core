@@ -22,8 +22,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const JS_ROOT = path.resolve(__dirname, '..', '..');
 const ISSUER_A = process.env.AUN_TEST_ISSUER_A ?? 'aid.com';
 const ISSUER_B = process.env.AUN_TEST_ISSUER_B ?? 'aid.net';
-const GATEWAY_A = process.env.AUN_TEST_GATEWAY_A ?? 'wss://127.0.0.1:21001/aun';
-const GATEWAY_B = process.env.AUN_TEST_GATEWAY_B ?? 'wss://127.0.0.1:22001/aun';
 
 // ── 本地 HTTP 服务器 ──────────────────────────────────────────
 
@@ -88,41 +86,25 @@ async function installFederationHelpers(page: any): Promise<void> {
   await page.evaluate(({
     issuerA,
     issuerB,
-    gatewayA,
-    gatewayB,
   }: {
     issuerA: string;
     issuerB: string;
-    gatewayA: string;
-    gatewayB: string;
   }) => {
     const w = window as any;
     if (w.__aunFed) return;
 
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-    const gatewayForIssuer = (issuer: string): string => {
-      if (issuer === issuerA) return gatewayA;
-      if (issuer === issuerB) return gatewayB;
-      throw new Error(`unknown federation issuer: ${issuer}`);
-    };
-
     /**
      * 创建客户端实例。
      * 浏览器 SDK 使用 IndexedDB 存储，每个实例需要独立的 instanceId。
      */
     const makeAndConnect = async (instanceId: string, issuer: string): Promise<any> => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({
-        instanceId,
-        issuer,
-        debug: true,
+      return w.AUN_TEST_HELPERS.createClient({
+        aunPath: `js-${instanceId}`,
+        deviceId: instanceId,
+        requireForwardSecrecy: false,
       });
-      // 禁用 forward secrecy 以简化测试
-      if (client._configModel) {
-        client._configModel.requireForwardSecrecy = false;
-      }
-      return client;
     };
 
     /**
@@ -130,8 +112,7 @@ async function installFederationHelpers(page: any): Promise<void> {
      * issuer 用于网关发现。
      */
     const ensureConnected = async (client: any, aid: string, issuer: string): Promise<void> => {
-      const gateway = gatewayForIssuer(issuer);
-      await w.AUN_TEST_HELPERS.connectIdentity(client, aid, { gateway });
+      await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 
     const messageText = (message: any): string => {
@@ -194,7 +175,7 @@ async function installFederationHelpers(page: any): Promise<void> {
       ISSUER_A: issuerA,
       ISSUER_B: issuerB,
     };
-  }, { issuerA: ISSUER_A, issuerB: ISSUER_B, gatewayA: GATEWAY_A, gatewayB: GATEWAY_B });
+  }, { issuerA: ISSUER_A, issuerB: ISSUER_B });
 }
 
 // ── 1. 跨域明文消息 ──────────────────────────────────────────

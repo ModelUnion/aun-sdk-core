@@ -28,7 +28,7 @@ import * as path from 'node:path';
 
 import { AUNClient } from '../../src/client.js';
 import type { IdentityRecord, JsonObject } from '../../src/types.js';
-import { loadIdentityFromStore, registerIdentity } from '../test-support.js';
+import { createTestClient, loadIdentityFromStore, registerIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -89,11 +89,7 @@ function makeAunPath(tag: string): string {
 }
 
 function makeClient(aunPath: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath, debug: false });
-  ((client as unknown) as {
-    _configModel: { requireForwardSecrecy: boolean };
-  })._configModel.requireForwardSecrecy = false;
-  return client;
+  return createTestClient({ aunPath, debug: false, requireForwardSecrecy: false });
 }
 
 async function safeClose(client: AUNClient | null | undefined): Promise<void> {
@@ -278,6 +274,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 手动把 expires_at 改成已过期
     const editor = makeClient(aunPath);
     clients.push(editor);
+    loadIdentityFromStore(editor, aid);
     const editorAuth = ((editor as unknown) as {
       _auth: {
         loadIdentity: (aid?: string) => IdentityRecord;

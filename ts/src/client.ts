@@ -77,6 +77,17 @@ function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
   return Boolean(value && typeof (value as { then?: unknown }).then === 'function');
 }
 
+function isAIDObject(value: unknown): value is AID {
+  const candidate = value as Partial<AID> | null;
+  return Boolean(
+    candidate
+      && typeof candidate === 'object'
+      && typeof candidate.aid === 'string'
+      && typeof candidate.aunPath === 'string'
+      && typeof candidate.isPrivateKeyValid === 'function',
+  );
+}
+
 
 /**
  * 递归排序键的 JSON 序列化（Canonical JSON for AUN）
@@ -257,6 +268,21 @@ const DEFAULT_SESSION_OPTIONS: SessionOptions = {
     http: 30.0,
   },
 };
+
+const PUBLIC_CONNECTION_OPTION_KEYS = new Set([
+  'auto_reconnect',
+  'connect_timeout',
+  'retry_initial_delay',
+  'retry_max_delay',
+  'retry_max_attempts',
+  'heartbeat_interval',
+  'call_timeout',
+  'connection_kind',
+  'short_ttl_ms',
+  'delivery_mode',
+  'extra_info',
+  'background_sync',
+]);
 
 const PROTECTED_HEADERS_METHODS = new Set([
   'message.send',
@@ -706,6 +732,7 @@ export class AUNClient {
   // ── V2 E2EE 状态 ──────────────────────────────────────────────
   private _v2Session?: V2Session;
   private _v2KeyStore?: V2KeyStore;
+  private _v2SessionInitInFlight: Promise<void> | null = null;
   /** V2 bootstrap 缓存：aid/group:id → 设备列表 + 时间戳 */
   private _v2BootstrapCache: Map<string, V2BootstrapEntry> = new Map();
   private _connectCapabilities: JsonObject | null = null;
@@ -737,10 +764,10 @@ export class AUNClient {
   private _clientLog!: ModuleLogger;
 
   constructor(aid?: AID) {
-    if (typeof aid === 'string') {
-      throw new ValidationError('AUNClient aid must be an AID object, not a string');
+    if (aid !== null && aid !== undefined && !isAIDObject(aid)) {
+      throw new ValidationError('AUNClient only accepts an AID object or no argument');
     }
-    const inputAid = (aid !== null && aid !== undefined && typeof (aid as any).aunPath === 'string' && typeof (aid as any).isPrivateKeyValid === 'function') ? aid as AID : null;
+    const inputAid = aid ?? null;
     const rawConfig: RpcParams = {};
     if (inputAid) {
       rawConfig.aun_path = inputAid.aunPath;
@@ -780,7 +807,6 @@ export class AUNClient {
     const keystore = new FileKeyStore(
       this._configModel.aunPath,
       {
-        encryptionSeed: this._configModel.seedPassword ?? undefined,
         logger: this._logger.for('aun_core.keystore'),
         secretStoreLogger: this._logger.for('aun_core.secret-store'),
       },
@@ -833,7 +859,7 @@ export class AUNClient {
         this._currentAid = inputAid;
         this._identity = {
           aid: inputAid.aid,
-          private_key_pem: (inputAid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
+          private_key_pem: inputAid.privateKeyPem,
           public_key_der_b64: inputAid.publicKey,
           cert: inputAid.certPem,
         };
@@ -934,6 +960,79 @@ export class AUNClient {
     return this._lastErrorCode;
   }
 
+  private _applyAidRuntimeContext(aid: AID): void {
+    const rawConfig: RpcParams = {
+      aun_path: aid.aunPath,
+      verify_ssl: aid.verifySsl,
+      debug: aid.debug,
+    };
+    if (aid.rootCaPath) rawConfig.root_ca_path = aid.rootCaPath;
+    const nextConfig = configFromMap(rawConfig);
+
+    try {
+      const close = (this._keystore as unknown as { close?: () => void }).close;
+      if (typeof close === 'function') close.call(this._keystore);
+    } catch {
+      // best-effort cleanup before switching keystore roots
+    }
+
+    this._configModel = nextConfig;
+    this.config.aun_path = nextConfig.aunPath;
+    this.config.root_ca_path = nextConfig.rootCaPath;
+    this.config.seed_password = nextConfig.seedPassword;
+    this._agentMdPath = path.join(nextConfig.aunPath, 'AIDs');
+    this._agentMdCache.clear();
+    this._agentMdFetchInflight.clear();
+    this._agentMdDownloadInflight.clear();
+    this._peerCache.clear();
+    this._certCache.clear();
+    this._gatewayUrl = null;
+
+    this._deviceId = aid.deviceId || getDeviceId(nextConfig.aunPath);
+    this._slotId = aid.slotId || 'default';
+
+    const debugFlag = nextConfig.debug;
+    this._logger = new AUNLogger({ debug: debugFlag, aunPath: nextConfig.aunPath });
+    this._logger.bindDeviceId(this._deviceId);
+    this._clientLog = this._logger.for('aun_core.client');
+
+    const dnsNet = new DnsResilientNet({
+      verifySsl: nextConfig.verifySsl,
+      logger: this._clientLog,
+    });
+    this._discovery = new GatewayDiscovery({ verifySsl: nextConfig.verifySsl, logger: this._clientLog, net: dnsNet });
+
+    const keystore = new FileKeyStore(
+      nextConfig.aunPath,
+      {
+        logger: this._logger.for('aun_core.keystore'),
+        secretStoreLogger: this._logger.for('aun_core.secret-store'),
+      },
+    );
+    this._keystore = keystore;
+    this._auth = new AuthFlow({
+      keystore,
+      crypto: new CryptoProvider(),
+      aid: aid.aid,
+      deviceId: this._deviceId,
+      slotId: this._slotId,
+      rootCaPath: nextConfig.rootCaPath ?? undefined,
+      verifySsl: nextConfig.verifySsl,
+      logger: this._logger.for('aun_core.auth'),
+      net: dnsNet,
+    });
+
+    this._transport = new RPCTransport({
+      eventDispatcher: this._dispatcher,
+      timeout: 10_000,
+      onDisconnect: (err, closeCode) => this._handleTransportDisconnect(err, closeCode),
+      verifySsl: nextConfig.verifySsl,
+      logger: this._logger.for('aun_core.transport'),
+      dnsNet,
+    });
+    this._transport.setMetaObserver((meta) => this._observeRpcMeta(meta));
+  }
+
   loadIdentity(aid: AID): void {
     if (!aid?.isPrivateKeyValid()) {
       throw new StateError('loadIdentity requires an AID with a valid private key');
@@ -942,16 +1041,15 @@ export class AUNClient {
     if (publicState !== ConnectionState.NO_IDENTITY && publicState !== ConnectionState.CLOSED) {
       throw new StateError(`loadIdentity not allowed in state ${publicState}`);
     }
+    this._applyAidRuntimeContext(aid);
     this._currentAid = aid;
     this._aid = aid.aid;
     this._identity = {
       aid: aid.aid,
-      private_key_pem: (aid as unknown as { _privateKeyPem?: string | null })._privateKeyPem ?? '',
+      private_key_pem: aid.privateKeyPem,
       public_key_der_b64: aid.publicKey,
       cert: aid.certPem,
     };
-    (this._auth as unknown as { _aid?: string })._aid = aid.aid;
-    this._slotId = aid.slotId || 'default';
     this._state = 'standby';
     this._closing = false;
     this._lastError = null;
@@ -1809,10 +1907,11 @@ export class AUNClient {
   async connect(opts?: ConnectionOptions): Promise<void> {
     const tStart = Date.now();
     // 先校验非法参数（ValidationError），再检查身份（StateError）
-    if (opts !== undefined && typeof opts === 'object') {
+    if (opts !== undefined && opts !== null && typeof opts === 'object') {
       const raw = opts as Record<string, unknown>;
-      if ('access_token' in raw || 'aid' in raw || 'token' in raw) {
-        throw new ValidationError('connect options must not include access_token/aid; these are managed internally');
+      const invalid = Object.keys(raw).filter((key) => !PUBLIC_CONNECTION_OPTION_KEYS.has(key)).sort();
+      if (invalid.length > 0) {
+        throw new ValidationError(`connect options contain unsupported field(s): ${invalid.join(', ')}`);
       }
     }
     const target = this._currentAid?.aid ?? this._aid ?? '';
@@ -2004,6 +2103,14 @@ export class AUNClient {
     }
     this._validateOutboundCall(method, p);
     this._injectMessageCursorContext(method, p);
+    if (method.startsWith('group.')
+      && !('_group_cursor_params' in (p as Record<string, unknown>))
+      && !Boolean((p as Record<string, unknown>)._pull_gate_locked)) {
+      const explicitCursorParams = this._groupCursorParams(p);
+      if (Object.keys(explicitCursorParams).length > 0) {
+        (p as Record<string, unknown>)._group_cursor_params = explicitCursorParams;
+      }
+    }
 
     // group.* 方法的 group_id 归一化为 canonical 格式（兼容老/污染数据）
     if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
@@ -2115,11 +2222,18 @@ export class AUNClient {
         throw new ValidationError('group.pull requires group_id');
       }
       await this._ensureV2SessionReady('group.pull');
+      const hasExplicitAfterSeq = 'after_seq' in p || 'after_message_seq' in p;
+      const cursorParams = this._explicitGroupCursorParams(p);
+      const ownsCursor = Object.keys(cursorParams).length === 0 || this._groupCursorTargetsCurrentInstance(cursorParams);
+      const pullOpts: { gateLocked: boolean; explicitAfterSeq?: boolean; cursorParams?: RpcParams; ownsCursor?: boolean } = { gateLocked: true };
+      if (hasExplicitAfterSeq) pullOpts.explicitAfterSeq = true;
+      if (Object.keys(cursorParams).length > 0) pullOpts.cursorParams = cursorParams;
+      if (!ownsCursor) pullOpts.ownsCursor = false;
       const messages = await runWithRpcPriority(() => this._pullGroupV2(
         String(p.group_id),
         Number(p.after_seq ?? p.after_message_seq ?? 0) || 0,
         Number(p.limit ?? 50) || 50,
-        { gateLocked: true },
+        pullOpts,
       ));
       return { messages } as RpcResult;
     }
@@ -2129,6 +2243,11 @@ export class AUNClient {
         throw new ValidationError('group.ack_messages requires group_id');
       }
       await this._ensureV2SessionReady('group.ack_messages');
+      const cursorParams = this._explicitGroupCursorParams(p);
+      const ownsCursor = Object.keys(cursorParams).length === 0 || this._groupCursorTargetsCurrentInstance(cursorParams);
+      if (method === 'group.ack_messages' && !ownsCursor) {
+        return await runWithRpcPriority(() => this._rawGroupAckMessages(p)) as RpcResult;
+      }
       return await runWithRpcPriority(() => this._ackGroupV2(
         String(p.group_id),
         Number(p.seq ?? p.msg_seq ?? p.up_to_seq ?? 0) || undefined,
@@ -2139,6 +2258,7 @@ export class AUNClient {
       delete p._skip_auto_ack;
       delete p.skip_auto_ack;
     }
+    delete (p as Record<string, unknown>)._group_cursor_params;
 
     // 关键操作自动附加客户端签名
     if (SIGNED_METHODS.has(method)) {
@@ -2218,6 +2338,7 @@ export class AUNClient {
     delete p._pull_gate_locked;
     delete p._skip_auto_ack;
     delete p.skip_auto_ack;
+    delete (p as Record<string, unknown>)._group_cursor_params;
 
     if (method.startsWith('group.') && p.group_id !== undefined && p.group_id !== null) {
       p.group_id = normalizeGroupId(String(p.group_id)) || String(p.group_id);
@@ -2269,14 +2390,13 @@ export class AUNClient {
    * 签名覆盖所有非 _ 前缀且非 client_signature 的业务字段。
    */
   private _signClientOperation(method: string, params: RpcParams): void {
-    const identity = this._identity;
-    if (!identity || !identity.private_key_pem) return;
+    const currentAid = this._currentAid;
+    if (!currentAid?.privateKeyPem) return;
 
     try {
-      const aid = String(identity.aid ?? '');
+      const aid = currentAid.aid;
       const ts = String(Math.floor(Date.now() / 1000));
 
-      // 计算 params hash — 必须递归排序所有键（与 Python json.dumps(sort_keys=True, separators=(",",":")) 一致）
       const paramsForHash: RpcParams = {};
       for (const [k, v] of Object.entries(params)) {
         if (k !== 'client_signature' && !k.startsWith('_')) {
@@ -2287,12 +2407,12 @@ export class AUNClient {
       const paramsHash = crypto.createHash('sha256').update(paramsJson, 'utf-8').digest('hex');
 
       const signData = Buffer.from(`${method}|${aid}|${ts}|${paramsHash}`, 'utf-8');
-      const privateKey = crypto.createPrivateKey(String(identity.private_key_pem));
+      const privateKey = crypto.createPrivateKey(currentAid.privateKeyPem);
       const signature = crypto.sign('SHA256', signData, privateKey);
 
       // 证书指纹
       let certFingerprint = '';
-      const certPem = String(identity.cert ?? '');
+      const certPem = currentAid.certPem;
       if (certPem) {
         const certObj = new crypto.X509Certificate(certPem);
         certFingerprint = 'sha256:' + certObj.fingerprint256.replace(/:/g, '').toLowerCase();
@@ -2981,6 +3101,28 @@ export class AUNClient {
       values.push(Number(cursor.retention_floor_seq ?? 0));
     }
     return Math.max(0, ...values.filter((value) => Number.isFinite(value)));
+  }
+
+  private _groupCursorParams(params: RpcParams): RpcParams {
+    const cursorParams: RpcParams = {};
+    for (const key of ['device_id', 'slot_id', 'device_name', 'device_type']) {
+      const value = params[key];
+      if (value !== undefined && value !== null) cursorParams[key] = value as JsonValue;
+    }
+    return cursorParams;
+  }
+
+  private _explicitGroupCursorParams(params: RpcParams): RpcParams {
+    const value = (params as Record<string, unknown>)._group_cursor_params;
+    if (!isJsonObject(value as JsonValue | object | null | undefined)) return {};
+    return { ...(value as RpcParams) };
+  }
+
+  private _groupCursorTargetsCurrentInstance(params: RpcParams): boolean {
+    const deviceId = String(params.device_id ?? '').trim();
+    const slotId = String(params.slot_id ?? '').trim();
+    return (!deviceId || deviceId === (this._deviceId ?? ''))
+      && (!slotId || slotId === (this._slotId ?? ''));
   }
 
   private _schedulePullFollowup(method: string, params: RpcParams, result: unknown): void {
@@ -4273,16 +4415,25 @@ export class AUNClient {
 
       this._startBackgroundTasks();
 
-      // V2 E2EE：初始化 session 并注册本设备 SPK。
-      try {
-        await this._initV2Session();
-      } catch (exc) {
-        this._clientLog.warn(`V2 session init failed (non-fatal): ${formatCaughtError(exc)}`);
+      const connectionKind = String(params.connection_kind ?? 'long');
+      const isShortConnection = connectionKind === 'short';
+      if (!isShortConnection) {
+        // V2 E2EE：长连接上线时初始化 session 并注册本设备 SPK。
+        try {
+          await this._initV2Session();
+        } catch (exc) {
+          this._clientLog.warn(`V2 session init failed (non-fatal): ${formatCaughtError(exc)}`);
+        }
+      } else {
+        this._clientLog.debug('V2 session init deferred for short connection');
       }
 
       // connect/reconnect 成功后自动触发一次 P2P message.v2.pull，补齐离线期间积压
       // 群消息按惰性触发，不在此处主动 pull
-      if (this._sessionOptions.background_sync !== false) {
+      const hasExplicitBackgroundSync = Object.prototype.hasOwnProperty.call(params, 'background_sync');
+      const backgroundSyncEnabled = this._sessionOptions.background_sync !== false
+        && (!isShortConnection || hasExplicitBackgroundSync);
+      if (backgroundSyncEnabled) {
         void this._fillP2pGap().catch((exc) => {
           this._clientLog.warn(`schedule post-connect P2P gap fill failed: ${formatCaughtError(exc)}`);
         });
@@ -4326,6 +4477,15 @@ export class AUNClient {
   /** V2-only：所有加密入口都必须有 V2 session。 */
   private async _ensureV2SessionReady(method: string, errorMessage?: string): Promise<void> {
     if (!this._v2Session) {
+      if (!this._v2SessionInitInFlight) {
+        this._v2SessionInitInFlight = this._initV2Session()
+          .finally(() => {
+            this._v2SessionInitInFlight = null;
+          });
+      }
+      await this._v2SessionInitInFlight;
+    }
+    if (!this._v2Session) {
       throw new StateError(errorMessage ?? `V2 session not initialized; encrypted ${method} requires E2EE V2`);
     }
   }
@@ -4358,29 +4518,14 @@ export class AUNClient {
         identity = null;
       }
     }
-    if (!identity?.private_key_pem) {
-      // fallback：缓存的 identity 可能被 instanceState 污染，重新从 keystore 加载
-      try {
-        identity = this._keystore.loadIdentity(this._aid);
-        if (identity?.private_key_pem) {
-          this._identity = identity;
-          this._clientLog.warn('V2 session init: identity cache was stale, reloaded from keystore');
-          // 重新持久化 instance_state，清理脏数据
-          const persistIdentity = (this._auth as any)._persistIdentity as ((value: IdentityRecord) => void) | undefined;
-          if (typeof persistIdentity === 'function') {
-            try { persistIdentity.call(this._auth, identity); } catch { /* best-effort */ }
-          }
-        }
-      } catch {
-        identity = null;
-      }
-    }
-    if (!identity?.private_key_pem) {
+    // 私钥由 AIDStore 管理，直接从 _currentAid 读取明文私钥
+    const currentAid = this._currentAid;
+    if (!currentAid?.privateKeyPem) {
       this._clientLog.warn('V2 session init skipped: no AID private key');
       return;
     }
 
-    const privateKey = crypto.createPrivateKey(String(identity.private_key_pem));
+    const privateKey = crypto.createPrivateKey(currentAid.privateKeyPem);
     const jwk = privateKey.export({ format: 'jwk' }) as unknown as {
       kty?: string;
       crv?: string;
@@ -4967,6 +5112,7 @@ export class AUNClient {
         this._logMessageDebug('decrypt-ok', 'message.v2.pull', 'message.received', plaintext);
       }
 
+      const hasServerAckSeq = Object.prototype.hasOwnProperty.call(result, 'server_ack_seq');
       const serverAckSeq = Number(result.server_ack_seq ?? 0);
       if (ns && Number.isFinite(serverAckSeq) && serverAckSeq > 0) {
         const contig = this._seqTracker.getContiguousSeq(ns);
@@ -4983,7 +5129,11 @@ export class AUNClient {
           await this._drainOrderedMessages(ns, undefined, true);
           this._saveSeqTrackerState();
         }
-        if (messages.length > 0 && contigAdvanced && ackSeq > 0 && !opts?.skipAutoAck) {
+        const ackNeeded = messages.length > 0
+          && ackSeq > 0
+          && !opts?.skipAutoAck
+          && (contigAdvanced || (hasServerAckSeq && ackSeq > serverAckSeq));
+        if (ackNeeded) {
           this._clientLog.debug(`message.v2.pull scheduling auto-ack: ns=${ns}, ack_seq=${ackSeq}, raw_count=${messages.length}`);
           this._safeAsync(this._ackV2(ackSeq).then(() => undefined));
         }
@@ -5256,7 +5406,13 @@ export class AUNClient {
     groupId: string,
     afterSeq: number = 0,
     limit: number = 50,
-    opts?: { gateLocked?: boolean; scheduleFollowup?: boolean },
+    opts?: {
+      gateLocked?: boolean;
+      scheduleFollowup?: boolean;
+      explicitAfterSeq?: boolean;
+      cursorParams?: RpcParams;
+      ownsCursor?: boolean;
+    },
   ): Promise<Array<Record<string, unknown>>> {
     await this._ensureV2SessionReady('group.pull');
     const gid = normalizeGroupId(groupId) || String(groupId ?? '').trim();
@@ -5271,7 +5427,9 @@ export class AUNClient {
     }
     const decrypted: Array<Record<string, unknown>> = [];
     let totalRawCount = 0;
-    let nextAfterSeq = afterSeq || this._seqTracker.getContiguousSeq(ns);
+    const cursorParams = opts?.cursorParams ?? {};
+    const ownsCursor = opts?.ownsCursor !== false;
+    let nextAfterSeq = opts?.explicitAfterSeq ? afterSeq : (afterSeq || this._seqTracker.getContiguousSeq(ns));
     let pageCount = 0;
     const maxPages = 100;
 
@@ -5282,6 +5440,7 @@ export class AUNClient {
         group_id: gid,
         after_seq: nextAfterSeq,
         limit,
+        ...cursorParams,
       }) as Record<string, unknown>;
       const messages = (Array.isArray(result.messages) ? result.messages : []) as Array<Record<string, unknown>>;
       totalRawCount += messages.length;
@@ -5363,7 +5522,12 @@ export class AUNClient {
         this._logMessageDebug('decrypt-ok', 'group.v2.pull', 'group.message_created', plaintext);
       }
 
-      const retentionFloor = this._pullRetentionFloor(result as JsonObject, 'retention_floor_message_seq', 'retention_floor_message_seq');
+      const cursorCurrentSeq = Number(cursor?.current_seq ?? 0);
+      const hasServerCursor = cursor !== null && Object.prototype.hasOwnProperty.call(cursor, 'current_seq');
+      const retentionFloor = Math.max(
+        this._pullRetentionFloor(result as JsonObject, 'retention_floor_message_seq', 'retention_floor_message_seq'),
+        Number.isFinite(cursorCurrentSeq) ? cursorCurrentSeq : 0,
+      );
       if (retentionFloor > 0) {
         const contig = this._seqTracker.getContiguousSeq(ns);
         if (contig < retentionFloor) {
@@ -5378,12 +5542,17 @@ export class AUNClient {
         await this._drainOrderedMessages(ns, undefined, true);
         this._saveSeqTrackerState();
       }
-      if (messages.length > 0 && contigAdvanced && ackSeq > 0) {
+      const ackNeeded = messages.length > 0
+        && ackSeq > 0
+        && ownsCursor
+        && (contigAdvanced || (hasServerCursor && ackSeq > cursorCurrentSeq));
+      if (ackNeeded) {
         this._clientLog.debug(`group.v2.pull scheduling auto-ack: group=${gid}, ns=${ns}, ack_seq=${ackSeq}, raw_count=${messages.length}`);
         this._safeAsync(this._ackGroupV2(gid, ackSeq).then(() => undefined));
       }
 
       const nextAfter = Math.max(pageMaxSeq, nextAfterSeq);
+      if (!ownsCursor) break;
       if (messages.length === 0 || nextAfter <= nextAfterSeq || result.has_more === false) break;
       nextAfterSeq = nextAfter;
     }
@@ -5393,6 +5562,11 @@ export class AUNClient {
     }
     this._clientLog.debug(`group.v2.pull done: group=${gid}, requested_after_seq=${afterSeq}, pages=${pageCount}, decrypted=${decrypted.length}, ns=${ns}`);
     return decrypted;
+  }
+
+  private async _rawGroupAckMessages(params: RpcParams): Promise<RpcResult> {
+    const p: RpcParams = { ...params };
+    return await this._callRawV2Rpc('group.ack_messages', p);
   }
 
   /** V2 Group ack。 */
@@ -6385,7 +6559,7 @@ export class AUNClient {
       }
 
       let signature = '';
-      const privateKeyPem = String(this._identity?.private_key_pem ?? '');
+      const privateKeyPem = this._currentAid?.privateKeyPem ?? '';
       if (privateKeyPem) {
         try {
           const signPayload = stableStringify({

@@ -22,12 +22,11 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { loadIdentityFromStore, registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, loadIdentityFromStore, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 const AUN_DATA_ROOT = (process.env.AUN_DATA_ROOT ?? '').trim();
 
 // ── 辅助函数 ──────────────────────────────────────────────────────
@@ -47,15 +46,7 @@ function makeAunPath(tag: string): string {
 
 function makeClient(tagOrPath: string, isPath: boolean = false): AUNClient {
   const root = isPath ? tagOrPath : makeAunPath(tagOrPath);
-  const client = new AUNClient({ aun_path: root, debug: false });
-  ((client as unknown) as {
-    _configModel: { requireForwardSecrecy: boolean };
-  })._configModel.requireForwardSecrecy = false;
-  return client;
-}
-
-async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
+  return createTestClient({ aunPath: root, debug: false, requireForwardSecrecy: false });
 }
 
 async function connectLongWithExtraInfo(
@@ -63,7 +54,6 @@ async function connectLongWithExtraInfo(
   aid: string,
   options: { slotId?: string; registerAid?: boolean; extraInfo?: Record<string, unknown> } = {},
 ): Promise<void> {
-  await resolveGatewayInto(client);
   if (options.registerAid !== false) {
     try {
       await registerAndLoadIdentity(client, aid);

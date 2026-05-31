@@ -231,6 +231,7 @@ class AIDStore:
                 verify_ssl=self._verify_ssl,
                 root_ca_path=self._root_ca_path,
                 debug=self._log._debug if hasattr(self._log, "_debug") else False,
+                private_key_pem=str(key_pair.get("private_key_pem") or ""),
             )
         })
 

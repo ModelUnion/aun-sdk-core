@@ -84,21 +84,6 @@ func ChangeSeed(root, oldSeed, newSeed string) (SeedChangeResult, error) {
 	return result, nil
 }
 
-func resolveActiveEncryptionSeed(root, encryptionSeed string) string {
-	seedPath := filepath.Join(root, ".seed")
-	if _, err := os.Stat(seedPath); err != nil {
-		return encryptionSeed
-	}
-	if _, err := ChangeSeed(root, ".seed", encryptionSeed); err == nil {
-		return encryptionSeed
-	}
-	data, readErr := os.ReadFile(seedPath)
-	if readErr != nil || len(data) == 0 {
-		return encryptionSeed
-	}
-	pkgLogKeystore().Warn("seed migration failed; continuing with legacy .seed")
-	return string(data)
-}
 
 func (f *FileKeyStore) ChangeSeed(oldSeed, newSeed string) (SeedChangeResult, error) {
 	f.Close()

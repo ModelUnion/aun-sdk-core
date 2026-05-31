@@ -78,7 +78,7 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	if nsBefore != "" {
 		contigBefore = c.seqTracker.GetContiguousSeq(nsBefore)
 	}
-	msgs, err := c.pullV2WithForce(ctx, afterSeq, limit, force)
+	msgs, pullMeta, err := c.pullV2WithForce(ctx, afterSeq, limit, force)
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +105,9 @@ func (c *AUNClient) pullV2Internal(ctx context.Context, params map[string]any) (
 	}
 	if ns != "" {
 		contig := c.seqTracker.GetContiguousSeq(ns)
-		if contig > 0 && contig != contigBefore {
+		ackNeeded := contig > 0 && (contig != contigBefore ||
+			(pullMeta.rawCount > 0 && pullMeta.hasServerAck && int64(contig) > pullMeta.serverAckSeq))
+		if ackNeeded {
 			ackSeq := c.clampAckSeq("message.v2.ack", "up_to_seq", ns, int64(contig))
 			ackParams := map[string]any{
 				"up_to_seq": ackSeq,
@@ -173,9 +175,14 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	if groupID == "" {
 		return nil, NewValidationError("group.pull requires 'group_id'")
 	}
-	afterSeq := toInt64(params["after_seq"])
-	if afterSeq == 0 {
+	afterSeq := int64(0)
+	explicitAfterSeq := false
+	if _, exists := params["after_seq"]; exists {
+		afterSeq = toInt64(params["after_seq"])
+		explicitAfterSeq = true
+	} else if _, exists := params["after_message_seq"]; exists {
 		afterSeq = toInt64(params["after_message_seq"])
+		explicitAfterSeq = true
 	}
 	limit := int(toInt64(params["limit"]))
 	if limit <= 0 {
@@ -183,7 +190,11 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 	}
 	ns := "group:" + groupID
 	contigBefore := c.seqTracker.GetContiguousSeq(ns)
-	msgs, err := c.pullGroupV2(ctx, groupID, afterSeq, limit)
+	ownsCursor := c.groupCursorTargetsCurrentInstance(params)
+	msgs, pullMeta, err := c.pullGroupV2WithOptions(ctx, groupID, afterSeq, limit, groupV2PullOptions{
+		explicitAfterSeq: explicitAfterSeq,
+		cursorParams:     groupCursorParams(params),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +209,9 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 		c.publishPulledMessage("group.message_created", ns, int(seq), m)
 	}
 	contig := c.seqTracker.GetContiguousSeq(ns)
-	if contig > 0 && contig != contigBefore {
+	ackNeeded := contig > 0 && ownsCursor && (contig != contigBefore ||
+		(pullMeta.rawCount > 0 && pullMeta.hasServerAck && int64(contig) > pullMeta.serverAckSeq))
+	if ackNeeded {
 		ackSeq := c.clampAckSeq("group.v2.ack", "up_to_seq", ns, int64(contig))
 		ackParams := map[string]any{
 			"group_id":  groupID,
@@ -214,6 +227,27 @@ func (c *AUNClient) pullGroupV2Internal(ctx context.Context, params map[string]a
 		}()
 	}
 	return map[string]any{"messages": out}, nil
+}
+
+func groupCursorParams(params map[string]any) map[string]any {
+	out := make(map[string]any)
+	for _, key := range []string{"device_id", "slot_id", "device_name", "device_type"} {
+		if value, exists := params[key]; exists && value != nil {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func (c *AUNClient) groupCursorTargetsCurrentInstance(params map[string]any) bool {
+	deviceID := strings.TrimSpace(stringFromAny(params["device_id"]))
+	slotID := strings.TrimSpace(stringFromAny(params["slot_id"]))
+	c.mu.RLock()
+	currentDeviceID := c.deviceID
+	currentSlotID := c.slotID
+	c.mu.RUnlock()
+	return (deviceID == "" || deviceID == currentDeviceID) &&
+		(slotID == "" || slotID == currentSlotID)
 }
 
 // ackGroupV2Internal 适配 client.Call("group.ack_messages", params) → AckGroupV2。

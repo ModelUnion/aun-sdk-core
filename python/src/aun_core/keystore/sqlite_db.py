@@ -6,9 +6,6 @@
 from __future__ import annotations
 
 import gc
-import base64
-import hashlib
-import hmac
 import json
 import os
 import sqlite3 as _sqlite_mod
@@ -18,58 +15,11 @@ import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 if TYPE_CHECKING:
     from ..logger import AUNLogger, NullLogger
 
 _SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5000
-
-
-# ── Seed 管理 ─────────────────────────────────────────────────
-
-
-def derive_sqlite_key(seed_bytes: bytes) -> bytes:
-    """保留旧调用点的 seed 传递语义；SQLite3 不再使用数据库加密密钥。"""
-    return seed_bytes
-
-
-def _derive_master_key(seed_bytes: bytes) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", seed_bytes, b"aun_file_secret_store_v1", 100_000)
-
-
-def _derive_field_key(master_key: bytes, scope: str, name: str) -> bytes:
-    if ":" in scope or ":" in name:
-        raise ValueError(f"scope/name 不能包含 ':'（scope={scope!r}, name={name!r}）")
-    msg = f"aun:{scope}:{name}\x01".encode("utf-8")
-    return hmac.new(master_key, msg, hashlib.sha256).digest()
-
-
-def _decode_secret_part(value: str) -> bytes:
-    text = str(value or "")
-    if len(text) % 2 == 0 and text and all(ch in "0123456789abcdefABCDEF" for ch in text):
-        try:
-            return bytes.fromhex(text)
-        except ValueError:
-            pass
-    try:
-        return base64.b64decode(text, validate=True)
-    except Exception:
-        return bytes.fromhex(text)
-
-
-def load_or_create_seed(root: Path, *, encryption_seed: str | None = None) -> bytes:
-    """返回 seed_password 对应的 seed bytes，并迁移旧 .seed 加密材料。"""
-    if encryption_seed is None:
-        encryption_seed = ""
-    if (root / ".seed").exists() or any(root.glob(".seed.migrated.*")):
-        from .seed_migration import migrate_seed_materials
-        result = migrate_seed_materials(root, encryption_seed)
-        if result.active_seed is not None:
-            return result.active_seed
-    return encryption_seed.encode("utf-8")
-
 
 
 # ── Schema DDL ───────────────────────────────────────────────
@@ -187,20 +137,14 @@ class AIDDatabase:
     线程安全由外部 RLock 保证。
     """
 
-    def __init__(self, db_path: Path, sqlite_key: bytes | str | None = None, logger=None) -> None:
+    def __init__(self, db_path: Path, logger=None) -> None:
         from ..logger import NullLogger as _NL
         self._log = logger or _NL()
         self._db_path = db_path
-        if isinstance(sqlite_key, str):
-            self._seed_bytes = sqlite_key.encode("utf-8")
-        else:
-            self._seed_bytes = sqlite_key or b""
         self._scope = db_path.parent.name
         self._conn: Any | None = None
         self._lock = threading.RLock()
         self._use_exclusive_locking = False
-        # 缓存 PBKDF2 派生的 master_key，避免每次加解密都重复 100K 次迭代
-        self._master_key: bytes | None = None
 
     _MAX_CONNECT_RETRIES = 3
     _RETRY_DELAY_S = 0.1
@@ -453,54 +397,6 @@ class AIDDatabase:
         if old_name in columns and new_name not in columns:
             conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}")
 
-    def _get_master_key(self) -> bytes:
-        """获取缓存的 master_key，避免每次都重复 100K 次 PBKDF2 迭代。"""
-        if self._master_key is None:
-            self._master_key = _derive_master_key(self._seed_bytes)
-        return self._master_key
-
-    def _protect_text(self, name: str, plaintext: str) -> str:
-        if not plaintext:
-            return plaintext
-        try:
-            master_key = self._get_master_key()
-            field_key = _derive_field_key(master_key, self._scope, name)
-            nonce = os.urandom(12)
-            sealed = AESGCM(field_key).encrypt(nonce, plaintext.encode("utf-8"), None)
-            record = {
-                "scheme": "file_aes",
-                "name": name,
-                "persisted": True,
-                "nonce": base64.b64encode(nonce).decode("ascii"),
-                "ciphertext": base64.b64encode(sealed[:-16]).decode("ascii"),
-                "tag": base64.b64encode(sealed[-16:]).decode("ascii"),
-            }
-            return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-        except Exception as exc:
-            self._log.error("keystore", "field encryption failed (scope=%s, name=%s), degrading to plaintext: %s", self._scope, name, exc, err=exc)
-            return plaintext
-
-    def _reveal_text(self, name: str, stored: str) -> str:
-        if not stored:
-            return stored
-        try:
-            record = json.loads(stored)
-        except (json.JSONDecodeError, TypeError):
-            return stored
-        if not isinstance(record, dict) or record.get("scheme") != "file_aes":
-            return stored
-        if str(record.get("name") or "") != name:
-            return stored
-        try:
-            master_key = self._get_master_key()
-            field_key = _derive_field_key(master_key, self._scope, name)
-            nonce = _decode_secret_part(str(record.get("nonce") or ""))
-            ciphertext = _decode_secret_part(str(record.get("ciphertext") or ""))
-            tag = _decode_secret_part(str(record.get("tag") or ""))
-            return AESGCM(field_key).decrypt(nonce, ciphertext + tag, None).decode("utf-8")
-        except Exception as exc:
-            self._log.error("keystore", "field decryption failed (scope=%s, name=%s): %s", self._scope, name, exc, err=exc)
-            return stored
 
     def close(self) -> None:
         with self._lock:
@@ -616,7 +512,7 @@ class AIDDatabase:
         for row in cur.fetchall():
             prekey_id = str(row[0])
             entry: dict[str, Any] = {
-                "private_key_pem": self._reveal_text(f"prekey/{prekey_id}", str(row[1] or "")),
+                "private_key_pem": str(row[1] or ""),
                 "created_at": row[3],
                 "updated_at": row[4],
                 "expires_at": row[5],
@@ -643,7 +539,7 @@ class AIDDatabase:
         if not row:
             return None
         entry: dict[str, Any] = {
-            "private_key_pem": self._reveal_text(f"prekey/{prekey_id}", str(row[1] or "")),
+            "private_key_pem": str(row[1] or ""),
             "created_at": row[3],
             "updated_at": row[4],
             "expires_at": row[5],
@@ -730,7 +626,7 @@ class AIDDatabase:
         return {
             "group_id": group_id,
             "epoch": row[0],
-            "secret": self._reveal_text(f"group/{group_id}/current", str(row[1] or "")),
+            "secret": str(row[1] or ""),
             **json.loads(row[2]),
             "updated_at": row[3],
         }
@@ -753,7 +649,7 @@ class AIDDatabase:
             return None
         result = {
             "epoch": row[0],
-            "secret": self._reveal_text(f"group/{group_id}/epoch/{row[0]}", str(row[1] or "")),
+            "secret": str(row[1] or ""),
             **json.loads(row[2]),
             "updated_at": row[3],
         }
@@ -776,7 +672,7 @@ class AIDDatabase:
         for row in cur.fetchall():
             entry = {
                 "epoch": row[0],
-                "secret": self._reveal_text(f"group/{group_id}/epoch/{row[0]}", str(row[1] or "")),
+                "secret": str(row[1] or ""),
                 **json.loads(row[2]),
                 "updated_at": row[3],
             }
@@ -794,7 +690,7 @@ class AIDDatabase:
             result[row[0]] = {
                 "group_id": group_id,
                 "epoch": row[1],
-                "secret": self._reveal_text(f"group/{group_id}/current", str(row[2] or "")),
+                "secret": str(row[2] or ""),
                 **json.loads(row[3]),
                 "updated_at": row[4],
             }
@@ -844,7 +740,7 @@ class AIDDatabase:
         for row in cur.fetchall():
             result.append({
                 "epoch": row[0],
-                "secret": self._reveal_text(f"group/{group_id}/epoch/{row[0]}", str(row[1] or "")),
+                "secret": str(row[1] or ""),
                 **json.loads(row[2]),
                 "updated_at": row[3],
                 "expires_at": row[4],
@@ -898,7 +794,7 @@ class AIDDatabase:
                 current_updated_at = now
                 if row is not None:
                     current_epoch = int(row[0])
-                    current_secret = self._reveal_text(f"group/{group_id}/current", str(row[1] or ""))
+                    current_secret = str(row[1] or "")
                     current_data = json.loads(row[2] or "{}")
                     current_updated_at = int(row[3] or now)
                     if epoch_i < current_epoch:
@@ -1058,7 +954,7 @@ class AIDDatabase:
                     return True
 
                 current_epoch = int(row[0])
-                current_secret = self._reveal_text(f"group/{group_id}/current", str(row[1] or ""))
+                current_secret = str(row[1] or "")
                 current_data = json.loads(row[2] or "{}")
 
                 if epoch_i > current_epoch:
@@ -1122,7 +1018,7 @@ class AIDDatabase:
                     (group_id, epoch_i),
                 ).fetchone()
                 if old is not None:
-                    old_secret = self._reveal_text(f"group/{group_id}/epoch/{epoch_i}", str(old[0] or ""))
+                    old_secret = str(old[0] or "")
                     if old_secret and old_secret != incoming_secret:
                         conn.commit()
                         return False
@@ -1178,7 +1074,7 @@ class AIDDatabase:
                     return True
 
                 old_epoch = int(old[0])
-                secret = self._reveal_text(f"group/{group_id}/epoch/{old_epoch}", str(old[1] or ""))
+                secret = str(old[1] or "")
                 restored_data = json.loads(old[2] or "{}")
                 self._upsert_group_current(conn, group_id, old_epoch, secret, restored_data, _now_ms())
                 conn.execute(
@@ -1352,7 +1248,7 @@ class AIDDatabase:
         row = cur.fetchone()
         if row is None:
             return None
-        data_json = self._reveal_text(f"session/{session_id}", str(row[0] or "{}"))
+        data_json = str(row[0] or "{}")
         return {**json.loads(data_json), "session_id": session_id, "updated_at": row[1]}
 
     def load_all_sessions(self) -> list[dict[str, Any]]:
@@ -1361,7 +1257,7 @@ class AIDDatabase:
         result: list[dict[str, Any]] = []
         for row in cur.fetchall():
             session_id = str(row[0])
-            data_json = self._reveal_text(f"session/{session_id}", str(row[1] or "{}"))
+            data_json = str(row[1] or "{}")
             result.append({**json.loads(data_json), "session_id": session_id, "updated_at": row[2]})
         return result
 

@@ -6,6 +6,19 @@
 
 ---
 
+## 0.4.4 — 2026-05-31
+
+### Added
+- **`AID` 新增 `private_key_pem` 只读字段**：`AIDStore.load()` 加载时注入明文私钥，`AUNClient` 直接从 `AID` 读取，无需再经 keystore 解密。
+
+### Changed
+- **`AUNClient` 剥离私钥读写**：V2 session 初始化、`_sign_client_operation`、`propose_state` 签名均改从 `_current_aid.private_key_pem` 读取，删除 keystore fallback 重解密路径。
+- **`auth._persist_identity` 不再写私钥**：写入前剥离 `private_key_pem` / `public_key_der_b64` / `curve`，AUNClient 的 keystore 只持久化 token / cert / instance_state，彻底避免用空 seed 覆盖写入 key.json。
+- **`AUNClient` keystore 构造不再传 `encryption_seed`**：seed 作用域收窄至 AIDStore，不外漏。
+- **SQLite 明文化清理**：删除 `_reveal_text` / `_protect_text` 等加密兼容残留代码，所有 SQLite 字段（prekey / group secret / session）直接明文读写。
+
+---
+
 ## 0.4.3 — 2026-05-31
 
 ### Added

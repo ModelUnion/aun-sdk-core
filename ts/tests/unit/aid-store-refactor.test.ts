@@ -58,15 +58,33 @@ describe('AUN SDK v4 三主体 API', () => {
     expect(client.state).toBe(ConnectionState.STANDBY);
   });
 
-  it('构造函数不接受字符串 AID', () => {
+  it('loadIdentity 使用 AIDStore 写入的运行上下文重绑定 client 内部组件', () => {
+    const { aid, aunPath } = createStoredAid('ctx.agentid.pub');
+    const client = new AUNClient();
+
+    client.loadIdentity(aid);
+
+    expect(client.aunPath).toBe(aunPath);
+    expect((client as any)._configModel.aunPath).toBe(aunPath);
+    expect((client as any)._deviceId).toBe(aid.deviceId);
+    expect((client as any)._slotId).toBe(aid.slotId);
+    expect((client as any)._keystore._root).toBe(aunPath);
+    expect((client as any)._auth._deviceId).toBe(aid.deviceId);
+    expect((client as any)._auth._slotId).toBe(aid.slotId);
+  });
+
+  it('构造函数只接受 AID 对象或无参，不接受旧配置对象', () => {
     expect(() => new (AUNClient as any)('alice.agentid.pub')).toThrow(/AID object/);
+    expect(() => new (AUNClient as any)({})).toThrow(/AID object/);
+    expect(() => new (AUNClient as any)({ aun_path: '/tmp/aun' })).toThrow(/AID object/);
+    expect(() => new (AUNClient as any)({ aid: 'alice.agentid.pub' })).toThrow(/AID object/);
   });
 
   it('connect 只接受 options，不接受旧版 aid/token 参数', async () => {
     const { aid } = createStoredAid('erin.agentid.pub');
     const client = new AUNClient(aid);
-    await expect(client.connect({ access_token: 'tok', gateway: 'ws://localhost/aun' } as any)).rejects.toThrow(/must not include/);
-    await expect(client.connect({ aid: 'erin.agentid.pub' } as any)).rejects.toThrow(/must not include/);
+    await expect(client.connect({ access_token: 'tok', gateway: 'ws://localhost/aun' } as any)).rejects.toThrow(/unsupported field\(s\): access_token, gateway/);
+    await expect(client.connect({ aid: 'erin.agentid.pub' } as any)).rejects.toThrow(/unsupported field\(s\): aid/);
   });
 
   it('gateway 发现应使用完整 issuer 域名并持久化 gateway_url', async () => {

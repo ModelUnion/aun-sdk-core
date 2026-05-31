@@ -71,12 +71,11 @@ async function installThoughtHelpers(page: any): Promise<void> {
     if (w.__aunThought) return;
 
     const makeAndConnect = async (instanceId: string): Promise<any> => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({ instanceId, issuer, debug: true });
-      if (client._configModel) {
-        client._configModel.requireForwardSecrecy = false;
-      }
-      return client;
+      return w.AUN_TEST_HELPERS.createClient({
+        aunPath: `js-${instanceId}`,
+        deviceId: instanceId,
+        requireForwardSecrecy: false,
+      });
     };
 
     const ensureConnected = async (client: any, aid: string): Promise<void> => {

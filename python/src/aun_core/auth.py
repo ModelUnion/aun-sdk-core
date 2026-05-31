@@ -1419,6 +1419,9 @@ class AuthFlow:
         for key in self._INSTANCE_STATE_FIELDS:
             if key in persisted:
                 instance_state[key] = persisted.pop(key)
+        # 私钥由 AIDStore 管理，AUNClient 不写 key.json
+        for key in ("private_key_pem", "public_key_der_b64", "curve"):
+            persisted.pop(key, None)
         self._keystore.save_identity(aid, persisted)
         # 从共享 metadata 中移除实例级字段（它们已保存到 instance_state）
         db = getattr(self._keystore, "_get_db", None)

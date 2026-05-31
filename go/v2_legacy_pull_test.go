@@ -157,3 +157,111 @@ func TestPullGroupV2LegacyV1PlaintextAndEncryptedSkip(t *testing.T) {
 		t.Fatalf("V1 群加密/空 payload 跳过后仍应推进 contiguous seq 到 3，got=%d", got)
 	}
 }
+
+func TestGroupPullExternalCursorPreservesExplicitZeroAndDeviceSlot(t *testing.T) {
+	groupID := "g1"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		switch method {
+		case "group.v2.pull":
+			return map[string]any{
+				"messages": []any{
+					map[string]any{
+						"version":    "v1",
+						"seq":        1,
+						"message_id": "gm-sync-1",
+						"from_aid":   "bob.example.com",
+						"payload":    map[string]any{"type": "text", "text": "sync-1"},
+					},
+				},
+				"cursor": map[string]any{"latest_seq": 3},
+			}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	c.seqTracker.ForceContiguousSeq("group:"+groupID, 3)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := c.Call(ctx, "group.pull", map[string]any{
+		"group_id":          groupID,
+		"after_message_seq": int64(0),
+		"limit":             int64(2),
+		"device_id":         "sync-dev-a",
+		"slot_id":           "sync-slot-a",
+		"device_name":       "同步测试设备 A",
+		"device_type":       "test",
+	})
+	if err != nil {
+		t.Fatalf("group.pull 失败: %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if len(v2ToMapList(resultMap["messages"])) != 1 {
+		t.Fatalf("group.pull 应返回外部 cursor 的消息: %#v", result)
+	}
+
+	var pullCalls []testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "group.v2.pull" {
+			pullCalls = append(pullCalls, call)
+		}
+		if call.Method == "group.v2.ack" {
+			t.Fatalf("外部 cursor 的 group.pull 不应自动 group.v2.ack: %#v", getCalls())
+		}
+	}
+	if len(pullCalls) != 1 {
+		t.Fatalf("应只调用一次 group.v2.pull，实际: %#v", getCalls())
+	}
+	params := pullCalls[0].Params
+	if toInt64(params["after_seq"]) != 0 {
+		t.Fatalf("group.v2.pull 应保留显式 after_message_seq=0，实际参数: %#v", params)
+	}
+	if params["device_id"] != "sync-dev-a" || params["slot_id"] != "sync-slot-a" ||
+		params["device_name"] != "同步测试设备 A" || params["device_type"] != "test" {
+		t.Fatalf("group.v2.pull 应透传外部 cursor 元信息，实际参数: %#v", params)
+	}
+}
+
+func TestGroupAckMessagesExternalCursorUsesRawRPC(t *testing.T) {
+	groupID := "g1"
+	wsURL, getCalls, closeServer := startTestRPCServer(t, func(method string, params map[string]any) any {
+		return map[string]any{"ok": true, "acked": params["msg_seq"]}
+	})
+	defer closeServer()
+
+	c := newConnectedV2PullClientForTest(t, wsURL)
+	defer func() { _ = c.Close() }()
+	c.seqTracker.ForceContiguousSeq("group:"+groupID, 3)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.Call(ctx, "group.ack_messages", map[string]any{
+		"group_id":  groupID,
+		"msg_seq":   int64(1),
+		"device_id": "sync-dev-a",
+		"slot_id":   "sync-slot-a",
+	}); err != nil {
+		t.Fatalf("group.ack_messages 失败: %v", err)
+	}
+
+	var rawAck *testRPCCall
+	for _, call := range getCalls() {
+		if call.Method == "group.v2.ack" {
+			t.Fatalf("外部 cursor 的 group.ack_messages 不应路由到 group.v2.ack: %#v", getCalls())
+		}
+		if call.Method == "group.ack_messages" {
+			callCopy := call
+			rawAck = &callCopy
+		}
+	}
+	if rawAck == nil {
+		t.Fatalf("外部 cursor 的 group.ack_messages 应走原始 RPC，实际调用: %#v", getCalls())
+	}
+	if toInt64(rawAck.Params["msg_seq"]) != 1 || rawAck.Params["device_id"] != "sync-dev-a" || rawAck.Params["slot_id"] != "sync-slot-a" {
+		t.Fatalf("group.ack_messages 原始 RPC 参数不正确: %#v", rawAck.Params)
+	}
+}

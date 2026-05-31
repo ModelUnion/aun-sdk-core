@@ -65,11 +65,9 @@ func NewFileKeyStore(root string, ss secretstore.SecretStore, encryptionSeed str
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("创建密钥存储根目录失败: %w", err)
 	}
-	activeEncryptionSeed := encryptionSeed
 	if ss == nil {
 		var err error
-		activeEncryptionSeed = resolveActiveEncryptionSeed(root, encryptionSeed)
-		ss, err = secretstore.NewFileSecretStore(root, activeEncryptionSeed)
+		ss, err = secretstore.NewFileSecretStore(root, encryptionSeed)
 		if err != nil {
 			return nil, fmt.Errorf("创建 SecretStore 失败: %w", err)
 		}
@@ -129,7 +127,7 @@ func (f *FileKeyStore) getDB(aid string) (*AIDDatabase, error) {
 		return db, nil
 	}
 	dbPath := filepath.Join(f.identityDir(aid), "aun.db")
-	db, err := newAIDDatabase(dbPath, f.secretStore, aid)
+	db, err := newAIDDatabase(dbPath, aid)
 	if err != nil {
 		return nil, err
 	}

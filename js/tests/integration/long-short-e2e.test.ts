@@ -47,7 +47,8 @@ function makeSharedPath(tag: string): string {
 }
 
 function makeClient(aunPath: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath });
+  const client = new AUNClient();
+  (client as any).__testAunPath = aunPath;
   ((client as unknown) as { configModel: { requireForwardSecrecy: boolean } }).configModel.requireForwardSecrecy = false;
   return client;
 }

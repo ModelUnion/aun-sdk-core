@@ -156,11 +156,10 @@ describe('ISSUE-SDK-JS-007: gap fill 状态保护', () => {
   it('connected 状态 _fillGroupGap 应正常执行', async () => {
     (client as any)._state = 'connected';
     (client as any)._closing = false;
-    const callSpy = vi.fn().mockResolvedValue({ messages: [] });
-    vi.spyOn(client, 'call').mockImplementation(callSpy);
+    const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue([]);
 
     await (client as any)._fillGroupGap('g1');
-    expect(callSpy).toHaveBeenCalled();
+    expect(pullGroupV2Spy).toHaveBeenCalledWith('g1', 5, 50);
   });
 });
 
@@ -185,9 +184,9 @@ describe('ISSUE-SDK-JS-008: _gapFillActive 来源标记', () => {
     };
 
     let captured = false;
-    vi.spyOn(client, 'call').mockImplementation(async () => {
+    vi.spyOn(client as any, '_pullGroupV2').mockImplementation(async () => {
       captured = (client as any)._gapFillActive;
-      return { messages: [] };
+      return [];
     });
 
     await (client as any)._fillGroupGap('g1');

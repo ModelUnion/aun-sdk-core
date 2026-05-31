@@ -26,11 +26,12 @@ import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
 import { ConnectionError, StateError } from '../../src/errors.js';
 import {
+  createTestClient,
   createAIDStoreForClient,
   registerAndLoadIdentity,
   registerIdentity,
   resolveGateway,
-  setGatewayForClient,
+  checkGatewayHealth,
 } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
@@ -47,13 +48,10 @@ function runId(): string {
 
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-p0-'));
-  const client = new AUNClient({ aun_path: tmpDir, debug: true });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
+  return createTestClient({ aunPath: tmpDir, debug: true, requireForwardSecrecy: false });
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
   await registerAndLoadIdentity(client, aid);
   await client.connect();
 }
@@ -79,7 +77,7 @@ describe('P0-01: 网关健康检查（真实 Gateway）', () => {
     const client = makeClient();
     try {
       const gateway = await resolveGateway(client, GATEWAY_DISCOVERY_AID);
-      const ok = await (client as any)._discovery.checkHealth(gateway, 10_000);
+      const ok = await checkGatewayHealth(client, gateway, 10_000);
       expect(ok).toBe(true);
     } finally {
       await client.close();
@@ -90,7 +88,7 @@ describe('P0-01: 网关健康检查（真实 Gateway）', () => {
     const client = makeClient();
     try {
       const start = Date.now();
-      const ok = await (client as any)._discovery.checkHealth('https://192.0.2.1:9999', 2_000);
+      const ok = await checkGatewayHealth(client, 'https://192.0.2.1:9999', 2_000);
       const elapsed = Date.now() - start;
       expect(ok).toBe(false);
       expect(elapsed).toBeLessThan(5_000);
@@ -102,7 +100,7 @@ describe('P0-01: 网关健康检查（真实 Gateway）', () => {
   it('连接拒绝 — 无服务端口应返回 false', async () => {
     const client = makeClient();
     try {
-      const ok = await (client as any)._discovery.checkHealth('https://127.0.0.1:1', 3_000);
+      const ok = await checkGatewayHealth(client, 'https://127.0.0.1:1', 3_000);
       expect(ok).toBe(false);
     } finally {
       await client.close();
@@ -120,9 +118,6 @@ describe('P0-02: AID 创建失败路径（真实 Gateway）', () => {
     const c2 = makeClient();
 
     try {
-      const gw = await setGatewayForClient(c1, GATEWAY_DISCOVERY_AID);
-      ((c2 as unknown) as { _gatewayUrl: string })._gatewayUrl = gw;
-
       await registerIdentity(c1, aid);
       // 第二次创建 — 要么报错要么幂等
       try {
@@ -437,28 +432,19 @@ describe('P0-10: 非成员发送群消息（真实 Gateway）', () => {
 // ── P0-04: Login 重放攻击 ──────────────────────────────────────
 
 describe('P0-04: Login 重放攻击（真实 Gateway）', () => {
-  it('两次认证 token 不同 — 服务端每次颁发新 challenge', async () => {
+  it('同一 client 在 authenticated 状态重复 authenticate 应被状态机拒绝', async () => {
     const rid = runId();
     const aid = `p0rpl${rid}.${ISSUER}`;
     const client = makeClient();
 
     try {
-      await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
       await registerAndLoadIdentity(client, aid);
 
       const auth1 = await client.authenticate();
       expect(auth1).toBeDefined();
       expect(auth1.access_token).toBeDefined();
 
-      const auth2 = await client.authenticate();
-      expect(auth2).toBeDefined();
-      expect(auth2.access_token).toBeDefined();
-
-      if (auth1.access_token !== auth2.access_token) {
-        console.log('两次认证返回不同 token（正确 — challenge 不可重用）');
-      } else {
-        console.log('警告: 两次认证返回了相同的 token');
-      }
+      await expect(client.authenticate()).rejects.toBeInstanceOf(StateError);
     } finally {
       await client.close();
     }
@@ -524,13 +510,12 @@ describe('P0-07: 临时消息 TTL（真实 Gateway）', () => {
 // ── P0-03: Login 过期挑战 ──────────────────────────────────────
 
 describe('P0-03: Login 过期挑战（真实 Gateway）', () => {
-  it('两次认证应返回不同 token', async () => {
+  it('回到 standby 后再次 authenticate 应复用未过期 cached token', async () => {
     const rid = runId();
     const aid = `p0exp${rid}.${ISSUER}`;
     const client = makeClient();
 
     try {
-      await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
       await registerAndLoadIdentity(client, aid);
 
       const auth1 = await client.authenticate();
@@ -538,16 +523,12 @@ describe('P0-03: Login 过期挑战（真实 Gateway）', () => {
       expect(auth1.access_token).toBeDefined();
 
       await sleep(2_000);
+      await client.disconnect();
 
       const auth2 = await client.authenticate();
       expect(auth2).toBeDefined();
       expect(auth2.access_token).toBeDefined();
-
-      if (auth1.access_token !== auth2.access_token) {
-        console.log('两次认证返回不同 token（正确）');
-      } else {
-        console.log('警告: 两次认证返回了相同的 token');
-      }
+      expect(auth2.access_token).toBe(auth1.access_token);
     } finally {
       await client.close();
     }
@@ -563,7 +544,6 @@ describe('P0-05: Token 并发刷新（真实 Gateway）', () => {
     const client = makeClient();
 
     try {
-      await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
       await registerAndLoadIdentity(client, aid);
 
       // 并发发起 5 个 authenticate — inflight 限流应让它们复用同一次调用
@@ -588,6 +568,7 @@ describe('P0-05: Token 并发刷新（真实 Gateway）', () => {
 
       // inflight 标志应在成功/出错/超时后清理 — 后续 authenticate 应正常
       await sleep(500);
+      await client.disconnect();
       const authAfter = await client.authenticate();
       expect(authAfter.access_token).toBeDefined();
       console.log('inflight 清理正常: 后续 authenticate 成功');

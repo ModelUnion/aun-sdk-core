@@ -20,12 +20,11 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { registerAndLoadIdentity, loadIdentityFromStore, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity, loadIdentityFromStore } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 const AUN_DATA_ROOT = (process.env.AUN_DATA_ROOT ?? '').trim();
 
 // ── 辅助 ──────────────────────────────────────────────────────────────────────
@@ -44,9 +43,7 @@ function makeAunPath(tag: string): string {
 }
 
 function makeClient(aunPath: string): AUNClient {
-  const client = new AUNClient({ aun_path: aunPath, debug: false });
-  (client as any)._configModel.requireForwardSecrecy = false;
-  return client;
+  return createTestClient({ aunPath, debug: false, requireForwardSecrecy: false });
 }
 
 async function setupAndConnect(
@@ -55,7 +52,6 @@ async function setupAndConnect(
   slotId: string,
   opts: { register?: boolean } = {},
 ): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
   if (opts.register !== false) {
     try {
       await registerAndLoadIdentity(client, aid, slotId);
@@ -97,7 +93,7 @@ describe('slot_id 同前缀互踢', { timeout: 60_000 }, () => {
       // 监听 c1 断开事件
       let c1DisconnectCode: number | undefined;
       const c1Kicked = new Promise<void>(resolve => {
-        c1.on('connection.state', (data: unknown) => {
+        c1.on('state_change', (data: unknown) => {
           const d = data as { state?: string; close_code?: number };
           if (d?.state === 'disconnected' || d?.state === 'closed') {
             c1DisconnectCode = d.close_code;
@@ -141,7 +137,7 @@ describe('slot_id 不同前缀共存', { timeout: 60_000 }, () => {
 
       // 监听 c1 是否意外断开
       let c1Disconnected = false;
-      c1.on('connection.state', (data: unknown) => {
+      c1.on('state_change', (data: unknown) => {
         const d = data as { state?: string };
         if (d?.state === 'disconnected' || d?.state === 'closed') {
           c1Disconnected = true;

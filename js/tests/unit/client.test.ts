@@ -79,30 +79,39 @@ describe('AUNClient 初始状态', () => {
     expect(client.gatewayUrl).toBeNull();
   });
 
-  it('gatewayUrl 可手动设置', () => {
+  it('gatewayUrl 只能读取自动发现结果，不能手动设置', () => {
     const client = new AUNClient();
-    client.gatewayUrl = 'wss://gateway.example.com/aun';
-    expect(client.gatewayUrl).toBe('wss://gateway.example.com/aun');
+    expect(Object.getOwnPropertyDescriptor(AUNClient.prototype, 'gatewayUrl')?.set).toBeUndefined();
+    expect(() => {
+      (client as any).gatewayUrl = 'wss://gateway.example.com/aun';
+    }).toThrow();
+    expect(client.gatewayUrl).toBeNull();
   });
 });
 
 describe('AUNClient.connect 参数校验', () => {
   it('未加载 AID 时抛 StateError', async () => {
     const client = new AUNClient();
-    await expect(client.connect({ gateway: 'wss://localhost/aun' } as any))
+    await expect(client.connect({}))
       .rejects.toThrow(StateError);
+  });
+
+  it('不接受外部 gateway 参数', async () => {
+    const client = new AUNClient();
+    await expect(client.connect({ gateway: 'wss://localhost/aun' } as any))
+      .rejects.toThrow(/unsupported field\(s\): gateway/);
   });
 
   it('不接受旧版 access_token 参数', async () => {
     const client = new AUNClient();
     await expect(client.connect({ access_token: 'token-123' } as any))
-      .rejects.toThrow(ValidationError);
+      .rejects.toThrow(/unsupported field\(s\): access_token/);
   });
 
   it('不接受旧版 aid/token 混入 connect options', async () => {
     const client = new AUNClient();
     await expect(client.connect({ aid: 'alice.agentid.pub' } as any))
-      .rejects.toThrow(ValidationError);
+      .rejects.toThrow(/unsupported field\(s\): aid/);
   });
 });
 
@@ -288,11 +297,74 @@ describe('AUNClient.disconnect', () => {
     (client as any)._connectOnce = vi.fn().mockResolvedValue(undefined);
     (client as any)._transport.setTimeout = vi.fn();
 
-    await client.connect({
-      gateway: 'ws://gateway.example.com/aun',
-    } as any);
+    await client.connect();
 
     expect((client as any)._connectOnce).toHaveBeenCalledTimes(1);
+  });
+
+  it('短连接 connect 不应同步等待 V2 session 初始化', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'disconnected';
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
+    (client as any)._gatewayUrl = 'ws://gateway.example.com/aun';
+    (client as any)._transport.connect = vi.fn().mockResolvedValue({ nonce: 'challenge' });
+    (client as any)._auth.connectSession = vi.fn().mockResolvedValue({
+      token: 'tok-1',
+      identity: { aid: 'alice.agentid.pub' },
+      hello: {},
+    });
+    (client as any)._startBackgroundTasks = vi.fn();
+    const initV2Spy = vi.spyOn(client as any, '_initV2Session').mockImplementation(
+      () => new Promise<void>(() => {}),
+    );
+
+    await client.connect({
+      connection_kind: 'short',
+      auto_reconnect: false,
+    });
+
+    expect(initV2Spy).not.toHaveBeenCalled();
+    expect(client.state).toBe('ready');
+  });
+
+  it('业务入口需要 V2 时应按需初始化 session', async () => {
+    const client = new AUNClient();
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
+    const initV2Spy = vi.spyOn(client as any, '_initV2Session').mockImplementation(async () => {
+      (client as any)._v2Session = { aid: 'alice.agentid.pub', deviceId: 'default' };
+    });
+
+    await (client as any)._ensureV2SessionReady('message.send');
+
+    expect(initV2Spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('connect 拒绝非规范 token_refresh_before 字段', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'standby';
+    (client as any)._aid = 'alice.agentid.pub';
+    (client as any)._currentAid = {
+      aid: 'alice.agentid.pub',
+      isPrivateKeyValid: () => true,
+    };
+    (client as any)._gatewayUrl = 'ws://gateway.example.com/aun';
+    (client as any)._connectOnce = vi.fn().mockResolvedValue(undefined);
+    (client as any)._transport.setTimeout = vi.fn();
+
+    await expect(client.connect({
+      auto_reconnect: false,
+      heartbeat_interval: 0,
+      token_refresh_before: 3590,
+      background_sync: false,
+    } as any)).rejects.toThrow(/unsupported field\(s\): token_refresh_before/);
   });
 });
 
@@ -391,15 +463,14 @@ describe('AUNClient message.send 接收者校验', () => {
     expect(sentParams.headers).toBeDefined();
   });
 
-  it('message.pull 自动注入当前实例 device_id/slot_id', async () => {
+  it('message.pull cursor 上下文自动注入当前实例 device_id/slot_id', () => {
     const client = new AUNClient();
-    (client as any)._state = 'connected';
     (client as any)._slotId = 'slot-a';
-    (client as any)._transport.call = vi.fn().mockResolvedValue({ messages: [] });
+    const params = { after_seq: 0, limit: 10 };
 
-    await client.call('message.pull', { after_seq: 0, limit: 10 });
+    (client as any)._injectMessageCursorContext('message.pull', params);
 
-    expect((client as any)._transport.call).toHaveBeenCalledWith('message.pull', expect.objectContaining({
+    expect(params).toEqual(expect.objectContaining({
       device_id: (client as any)._deviceId,
       slot_id: 'slot-a',
     }));
@@ -801,14 +872,30 @@ describe('AUNClient 群补拉实例上下文', () => {
     (client as any)._state = 'connected';
     (client as any)._closing = false;
     (client as any)._seqTracker.getContiguousSeq = vi.fn().mockReturnValue(12);
-    (client as any).call = vi.fn().mockResolvedValue({ messages: [] });
+    const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue([]);
 
     await (client as any)._fillGroupGap('group-1');
 
-    expect((client as any).call).toHaveBeenCalledWith('group.pull', expect.objectContaining({
+    expect(pullGroupV2Spy).toHaveBeenCalledWith('group-1', 12, 50);
+  });
+
+  it('_callRawV2Rpc 应给 group.v2.pull 注入当前实例 device_id/slot_id', async () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'dev-current';
+    (client as any)._slotId = 'slot-current';
+    (client as any)._transport.call = vi.fn().mockResolvedValue({ messages: [] });
+
+    await (client as any)._callRawV2Rpc('group.v2.pull', {
       group_id: 'group-1',
-      after_message_seq: 12,
-      device_id: (client as any)._deviceId,
+      after_seq: 12,
+      limit: 50,
+    });
+
+    expect((client as any)._transport.call).toHaveBeenCalledWith('group.v2.pull', expect.objectContaining({
+      group_id: 'group-1',
+      after_seq: 12,
+      device_id: 'dev-current',
+      slot_id: 'slot-current',
       limit: 50,
     }));
   });
@@ -833,55 +920,126 @@ describe('AUNClient 群补拉实例上下文', () => {
 
 // ── Task 1 针对性测试 ──────────────────────────────────────────
 
-describe('group.pull 拦截器：onPullResult 应消费返回消息', () => {
-  it('onPullResult 应在 group.pull 后被调用（只传入 transport 返回的消息推进 contig）', async () => {
+describe('group.pull V2-only 路由', () => {
+  it('group.pull 应路由到内部 _pullGroupV2 并返回消息', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._aid = 'alice.aid.com';
+    (client as any)._v2Session = {};
+    (client as any)._transport.call = vi.fn();
 
-    const rawMsg = { seq: 5, group_id: 'g1', payload: { type: 'text', text: 'hello' } };
+    const messages = [{ seq: 5, group_id: 'g1', payload: { type: 'text', text: 'hello' } }];
+    const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue(messages);
 
-    (client as any)._transport.call = vi.fn().mockResolvedValue({
-      messages: [rawMsg],
-      cursor: { current_seq: 5 },
+    await expect(client.call('group.pull', { group_id: 'g1', after_message_seq: 0 }))
+      .resolves.toEqual({ messages });
+
+    expect(pullGroupV2Spy).toHaveBeenCalledWith('g1', 0, 50, expect.objectContaining({
+      explicitAfterSeq: true,
+    }));
+    expect((client as any)._transport.call).not.toHaveBeenCalled();
+  });
+
+  it('group.pull 使用外部 cursor 时应保留 after_message_seq=0、透传设备槽位且不自动 ack', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'device-001';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._v2Session = {};
+    (client as any)._seqTracker.forceContiguousSeq('group:g1', 3);
+    const transportCall = vi.fn().mockImplementation(async (method: string) => {
+      if (method === 'group.v2.pull') {
+        return {
+          messages: [
+            {
+              version: 'v1',
+              seq: 1,
+              message_id: 'gm-sync-1',
+              from_aid: 'bob.aid.com',
+              payload: { type: 'text', text: 'sync-1' },
+            },
+          ],
+          cursor: { latest_seq: 3 },
+        };
+      }
+      return { ok: true };
+    });
+    (client as any)._transport.call = transportCall;
+
+    const result = await client.call('group.pull', {
+      group_id: 'g1',
+      after_message_seq: 0,
+      limit: 2,
+      device_id: 'sync-dev-a',
+      slot_id: 'sync-slot-a',
+      device_name: '同步测试设备 A',
+      device_type: 'test',
+    });
+    await Promise.resolve();
+
+    expect((result.messages as Array<Record<string, unknown>>).map((msg) => msg.seq)).toEqual([1]);
+    expect(transportCall.mock.calls.filter(([method]) => method === 'group.v2.pull')).toEqual([
+      ['group.v2.pull', {
+        group_id: 'g1',
+        after_seq: 0,
+        limit: 2,
+        device_id: 'sync-dev-a',
+        slot_id: 'sync-slot-a',
+        device_name: '同步测试设备 A',
+        device_type: 'test',
+      }],
+    ]);
+    expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.ack')).toBe(false);
+  });
+
+  it('group.ack_messages 使用外部 cursor 时应走原始 RPC 而不是 group.v2.ack', async () => {
+    const client = new AUNClient();
+    (client as any)._state = 'connected';
+    (client as any)._aid = 'alice.aid.com';
+    (client as any)._deviceId = 'device-001';
+    (client as any)._slotId = 'slot-a';
+    (client as any)._v2Session = {};
+    (client as any)._seqTracker.forceContiguousSeq('group:g1', 3);
+    const transportCall = vi.fn().mockResolvedValue({ ok: true, acked: 1 });
+    (client as any)._transport.call = transportCall;
+
+    await client.call('group.ack_messages', {
+      group_id: 'g1',
+      msg_seq: 1,
+      device_id: 'sync-dev-a',
+      slot_id: 'sync-slot-a',
     });
 
-    // 捕获 onPullResult 的调用参数
-    const onPullResultSpy = vi.spyOn((client as any)._seqTracker, 'onPullResult');
-
-    await client.call('group.pull', { group_id: 'g1', after_message_seq: 0 });
-
-    expect(onPullResultSpy).toHaveBeenCalledWith(
-      'group:g1',
-      expect.arrayContaining([expect.objectContaining({ payload: rawMsg.payload })]),
-      0,
-    );
-    const callArgs = onPullResultSpy.mock.calls[0];
-    const passedMessages = callArgs[1] as any[];
-    expect(passedMessages[0].payload).toEqual(rawMsg.payload);
+    expect(transportCall.mock.calls.some(([method]) => method === 'group.v2.ack')).toBe(false);
+    expect(transportCall.mock.calls).toContainEqual([
+      'group.ack_messages',
+      expect.objectContaining({
+        group_id: 'g1',
+        msg_seq: 1,
+        device_id: 'sync-dev-a',
+        slot_id: 'sync-slot-a',
+      }),
+    ]);
   });
 });
 
 describe('_fillGroupGap 不应重复调用 onPullResult', () => {
-  it('_fillGroupGap 调用 call(group.pull) 后不应再次调用 onPullResult', async () => {
+  it('_fillGroupGap 调用内部 V2 pull 后不应重复调用 onPullResult', async () => {
     const client = new AUNClient();
     (client as any)._state = 'connected';
     (client as any)._aid = 'alice.aid.com';
 
-    const rawMsg = { seq: 3, group_id: 'g2', payload: { type: 'text', text: 'hi' } };
-
-    (client as any)._transport.call = vi.fn().mockResolvedValue({
-      messages: [rawMsg],
-      cursor: { current_seq: 3 },
-    });
-
     const onPullResultSpy = vi.spyOn((client as any)._seqTracker, 'onPullResult');
     (client as any)._seqTracker.getContiguousSeq = vi.fn().mockReturnValue(2);
+    const pullGroupV2Spy = vi.spyOn(client as any, '_pullGroupV2').mockResolvedValue([
+      { seq: 3, group_id: 'g2', payload: { type: 'text', text: 'hi' } },
+    ]);
 
     await (client as any)._fillGroupGap('g2');
 
-    // onPullResult 只能被调用一次（来自 call() 拦截器），不能被 _fillGroupGap 再调用一次
-    expect(onPullResultSpy).toHaveBeenCalledTimes(1);
+    expect(pullGroupV2Spy).toHaveBeenCalledTimes(1);
+    expect(onPullResultSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -1275,7 +1433,32 @@ describe('AUNClient V2 e2ee payload_type 元数据', () => {
 });
 describe('AUNClient agent.md ETag 缓存与透传', () => {
   let agentMdCounter = 0;
-  const makeAgentClient = (): AUNClient => new (AUNClient as any)({ aunPath: `aun-agent-md-${++agentMdCounter}` });
+  const makeAgentClient = (): AUNClient => {
+    const id = ++agentMdCounter;
+    const mockAid = {
+      aid: `agent-md-${id}.agentid.pub`,
+      aunPath: `aun-agent-md-${id}`,
+      certPem: '',
+      publicKey: '',
+      certSubject: '',
+      certNotBefore: new Date(),
+      certNotAfter: new Date(Date.now() + 86400000),
+      certIssuer: '',
+      certFingerprint: '',
+      deviceId: 'default',
+      slotId: 'default',
+      verifySsl: true,
+      rootCaPath: null,
+      debug: false,
+      isCertValid: () => true,
+      isPrivateKeyValid: () => false,
+      sign: () => ({ ok: true, data: { signature: '' } }),
+      verify: () => ({ ok: true, data: { valid: true } }),
+      signAgentMd: () => ({ ok: true, data: { signed: '' } }),
+      verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+    };
+    return new AUNClient(mockAid as any);
+  };
   const agentRoot = (client: AUNClient): string => (client as any)._agentMdPath as string;
   const agentEtag = (content: string): string => `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
   const readAgentStorage = async (client: AUNClient, key: string): Promise<any> => {

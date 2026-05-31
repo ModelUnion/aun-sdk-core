@@ -16,7 +16,7 @@ import { promisify } from 'node:util';
 
 import { AUNClient } from '../../src/index.js';
 import type { JsonObject, Message } from '../../src/types.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 const DOCKER_COMPOSE_DIR = path.resolve(__dirname, '../../../../docker-deploy');
 const execFileAsync = promisify(execFile);
@@ -24,20 +24,20 @@ const REQUIRED_LOCAL_HOSTS = ['agentid.pub', 'gateway.agentid.pub'];
 process.env.AUN_ENV ??= 'development';
 
 function makeClient(): AUNClient {
-  const client = new AUNClient({
-    aun_path: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-')),
+  return createTestClient({
+    aunPath: fs.mkdtempSync(path.join(os.tmpdir(), 'aun-rc-')),
+    requireForwardSecrecy: false,
   });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
 }
 
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await setGatewayForClient(client, aid);
   await registerAndLoadIdentity(client, aid);
   await client.connect({
     auto_reconnect: true,
     heartbeat_interval: 3,
-    retry: { max_attempts: 10, initial_delay: 1.0, max_delay: 10.0 },
+    retry_max_attempts: 10,
+    retry_initial_delay: 1.0,
+    retry_max_delay: 10.0,
   });
 }
 
@@ -203,7 +203,7 @@ describe('断线重连集成测试', () => {
     const client = makeClient();
     clients.push(client);
     const states: string[] = [];
-    client.on('connection.state', (data: unknown) => {
+    client.on('state_change', (data: unknown) => {
       const payload = data as JsonObject;
       states.push(String(payload.state ?? ''));
     });
@@ -267,7 +267,7 @@ describe('断线重连集成测试', () => {
     const client = makeClient();
     clients.push(client);
     const states: string[] = [];
-    client.on('connection.state', (data: unknown) => {
+    client.on('state_change', (data: unknown) => {
       const payload = data as JsonObject;
       states.push(String(payload.state ?? ''));
     });

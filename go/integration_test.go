@@ -278,6 +278,9 @@ func makeIsolatedClient(t *testing.T, root string, slotID string) *AUNClient {
 	client.configModel.RequireForwardSecrecy = false
 	if slotID != "" {
 		client.slotID = slotID
+		if client.auth != nil {
+			client.auth.SetInstanceContext(client.deviceID, client.slotID)
+		}
 	}
 	return client
 }

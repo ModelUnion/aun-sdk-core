@@ -210,7 +210,7 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 
 	// 无私钥：仅证书有效
 	if keyPair == nil || authGetStr(keyPair, "private_key_pem") == "" {
-		return ResultOk(LoadResult{AID: newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug)})
+		return ResultOk(LoadResult{AID: newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, "")})
 	}
 
 	// 解析私钥
@@ -251,7 +251,7 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 		return ResultErr[LoadResult](ErrCodeKeypairMismatch, fmt.Sprintf("keypair self-test failed for aid: %s: %v", target, verifyErr))
 	}
 
-	return ResultOk(LoadResult{AID: newAID(target, s.aunPath, certPEM, certObj, privKey, true, true, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug)})
+	return ResultOk(LoadResult{AID: newAID(target, s.aunPath, certPEM, certObj, privKey, true, true, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, privPEM)})
 }
 
 // List 列出本地所有具有有效私钥的身份摘要（离线操作）。

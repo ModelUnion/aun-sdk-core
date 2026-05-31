@@ -212,9 +212,9 @@ class CLISession:
             if not loaded.ok or loaded.data is None:
                 message = loaded.error.message if loaded.error else "identity load failed"
                 raise StateError(message)
-            self._client = AUNClient(loaded.data["aid"], debug=self._resolved["debug"])
+            self._client = AUNClient(loaded.data["aid"])
         else:
-            self._client = AUNClient(debug=self._resolved["debug"])
+            self._client = AUNClient()
         record_cli_phase("sdk_init", int((time.perf_counter() - phase_started) * 1000))
         self._install_rpc_stats_hooks(self._client)
         debug = self._resolved["debug"]

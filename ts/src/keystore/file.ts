@@ -27,7 +27,6 @@ import { homedir } from 'node:os';
 import type { AgentMdCacheRecord, AgentMdCacheUpsert, KeyStore } from './index.js';
 import type { SecretStore } from '../secret-store/index.js';
 import type { ModuleLogger } from '../logger.js';
-import type { SecretRecord } from '../types.js';
 import { AIDDatabase } from './aid-db.js';
 import { V2KeyStore } from '../v2/session/keystore.js';
 import { getDeviceId, normalizeInstanceId } from '../config.js';
@@ -388,41 +387,6 @@ export class FileKeyStore implements KeyStore {
 
   // ── 旧 E2EE 存储互操作 ───────────────────────────────────
 
-  private _protectText(aid: string, name: string, plaintext: string): string {
-    if (!plaintext) return plaintext;
-    try {
-      const rec = this._secretStore.protect(safeAid(aid), name, Buffer.from(plaintext, 'utf-8'));
-      return JSON.stringify(rec);
-    } catch (exc) {
-      this._logger.error(`field encryption failed (scope=${safeAid(aid)}, name=${name}): ${exc instanceof Error ? exc.message : String(exc)}`);
-      return plaintext;
-    }
-  }
-
-  private _revealText(aid: string, name: string, stored: string): string {
-    if (!stored) return stored;
-    let rec: unknown;
-    try {
-      rec = JSON.parse(stored);
-    } catch {
-      return stored;
-    }
-    if (rec === null || typeof rec !== 'object' || Array.isArray(rec)) {
-      return stored;
-    }
-    const record = rec as SecretRecord;
-    if (record.scheme !== 'file_aes' || String(record.name ?? '') !== name) {
-      return stored;
-    }
-    try {
-      const plain = this._secretStore.reveal(safeAid(aid), name, record);
-      return plain ? plain.toString('utf-8') : stored;
-    } catch (exc) {
-      this._logger.error(`field decryption failed (scope=${safeAid(aid)}, name=${name}): ${exc instanceof Error ? exc.message : String(exc)}`);
-      return stored;
-    }
-  }
-
   async saveE2EEPrekey(aid: string, prekeyId: string, prekeyData: Record<string, unknown>, deviceId = ''): Promise<void> {
     const now = Date.now();
     const privateKey = String(prekeyData.private_key_pem ?? '');
@@ -459,7 +423,7 @@ export class FileKeyStore implements KeyStore {
       const id = String(row.prekey_id ?? '');
       if (!id) continue;
       const entry: Record<string, unknown> = {
-        private_key_pem: this._revealText(aid, `prekey/${id}`, String(row.private_key_enc ?? '')),
+        private_key_pem: String(row.private_key_enc ?? ''),
         created_at: row.created_at,
         updated_at: row.updated_at,
         expires_at: row.expires_at,
@@ -494,7 +458,7 @@ export class FileKeyStore implements KeyStore {
       const entry: Record<string, unknown> = {
         group_id: groupId,
         epoch: current.epoch,
-        secret: this._revealText(aid, `group/${groupId}/current`, String(current.secret_enc ?? '')),
+        secret: String(current.secret_enc ?? ''),
         updated_at: current.updated_at,
       };
       try {
@@ -510,7 +474,7 @@ export class FileKeyStore implements KeyStore {
     if (!old) return null;
     const entry: Record<string, unknown> = {
       epoch: old.epoch,
-      secret: this._revealText(aid, `group/${groupId}/epoch/${Number(old.epoch ?? 0)}`, String(old.secret_enc ?? '')),
+      secret: String(old.secret_enc ?? ''),
       updated_at: old.updated_at,
     };
     if (old.expires_at != null) entry.expires_at = old.expires_at;
@@ -541,7 +505,7 @@ export class FileKeyStore implements KeyStore {
     if (current && Number(current.epoch ?? 0) > epoch) return false;
     if (current && Number(current.epoch ?? 0) !== epoch) {
       const oldEpoch = Number(current.epoch ?? 0);
-      const oldSecret = this._revealText(aid, `group/${groupId}/current`, String(current.secret_enc ?? ''));
+      const oldSecret = String(current.secret_enc ?? '');
       db.prepare(
         `INSERT INTO group_old_epochs (group_id, epoch, secret_enc, data, updated_at, expires_at)
          VALUES (?, ?, ?, ?, ?, ?)
@@ -553,7 +517,7 @@ export class FileKeyStore implements KeyStore {
       ).run(
         groupId,
         oldEpoch,
-        this._protectText(aid, `group/${groupId}/epoch/${oldEpoch}`, oldSecret),
+        oldSecret,
         String(current.data ?? '{}'),
         Number(current.updated_at ?? now),
         Number(current.updated_at ?? now) + Number(opts.oldEpochRetentionMs ?? 0),
@@ -598,7 +562,7 @@ export class FileKeyStore implements KeyStore {
       const sessionId = String(row.session_id ?? '');
       if (!sessionId) continue;
       try {
-        const entry = JSON.parse(this._revealText(aid, `session/${sessionId}`, String(row.data_enc ?? '{}')));
+        const entry = JSON.parse(String(row.data_enc ?? '{}'));
         if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
           result.push({ ...entry, session_id: sessionId, updated_at: row.updated_at });
         }

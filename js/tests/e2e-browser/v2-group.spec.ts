@@ -101,9 +101,11 @@ async function installV2GroupHelpers(page: any): Promise<void> {
 
     /** 创建 AUNClient 并连接到 gateway */
     const makeAndConnect = async (aid: string, deviceId?: string): Promise<any> => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({ issuer, debug: true });
-      if (deviceId) client._deviceId = deviceId;
+      const cleanAid = String(aid).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const client = w.AUN_TEST_HELPERS.createClient({
+        aunPath: `js-v2-group-${cleanAid}`,
+        ...(deviceId ? { deviceId } : {}),
+      });
       await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
       return client;
     };

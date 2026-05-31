@@ -374,19 +374,18 @@ type ConnectOptions struct {
 // gateway URL 和 token 来自 Authenticate 缓存，不在此传入。
 // slot_id / device_id 来自 AID，不在此传入。
 type ConnectionOptions struct {
-	AutoReconnect      *bool          // 是否自动重连，默认 true
-	ConnectTimeout     time.Duration  // 连接超时，默认 5s
-	RetryInitialDelay  time.Duration  // 最小退避间隔，默认 1s
-	RetryMaxDelay      time.Duration  // 最大退避间隔，默认 64s
-	RetryMaxAttempts   int            // 最大重试次数，0=无限，默认 0
-	HeartbeatInterval  time.Duration  // 心跳间隔，默认 30s
-	CallTimeout        time.Duration  // RPC 调用超时，默认 35s
-	TokenRefreshBefore time.Duration  // token 到期前多少时间刷新，默认 1800s
-	ConnectionKind     string         // "long"（默认）或 "short"
-	ShortTtlMs         int            // 仅 kind=short 时有效，服务端兜底超时（毫秒）
-	ExtraInfo          map[string]any // 应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
-	DeliveryMode       map[string]any // message.send 的连接级投递模式（fanout/queue，路由细节由后端配置）
-	BackgroundSync     bool           // 连接后是否启动后台同步
+	AutoReconnect     *bool          // 是否自动重连，默认 true
+	ConnectTimeout    time.Duration  // 连接超时，默认 5s
+	RetryInitialDelay time.Duration  // 最小退避间隔，默认 1s
+	RetryMaxDelay     time.Duration  // 最大退避间隔，默认 64s
+	RetryMaxAttempts  int            // 最大重试次数，0=无限，默认 0
+	HeartbeatInterval time.Duration  // 心跳间隔，默认 30s
+	CallTimeout       time.Duration  // RPC 调用超时，默认 35s
+	ConnectionKind    string         // "long"（默认）或 "short"
+	ShortTtlMs        int            // 仅 kind=short 时有效，服务端兜底超时（毫秒）
+	ExtraInfo         map[string]any // 应用层自定义信息（PID/HOME/备注等），踢人时透传给被踢方
+	DeliveryMode      map[string]any // message.send 的连接级投递模式（fanout/queue，路由细节由后端配置）
+	BackgroundSync    bool           // 连接后是否启动后台同步
 }
 
 // newClientForStore 是供 AIDStore 内部使用的非导出构造入口。
@@ -403,7 +402,11 @@ func newClientForStore(aunPath, seedPassword string, verifySSL bool, rootCaPath 
 	if rootCaPath != "" {
 		raw["root_ca_path"] = rootCaPath
 	}
-	return newClient(raw, debug)
+	c := newClient(raw, debug)
+	if c.auth != nil {
+		c.auth.persistKeyMaterial = true
+	}
+	return c
 }
 
 // RetryConfig 重试配置
@@ -1887,9 +1890,6 @@ func connectionOptionsToConnectOptions(opt *ConnectionOptions, c *AUNClient) *Co
 	if opt.HeartbeatInterval > 0 {
 		co.HeartbeatInterval = int(opt.HeartbeatInterval.Seconds())
 	}
-	if opt.TokenRefreshBefore > 0 {
-		co.TokenRefreshBefore = int(opt.TokenRefreshBefore.Seconds())
-	}
 	if opt.ConnectTimeout > 0 || opt.CallTimeout > 0 {
 		co.Timeouts = &TimeoutConfig{}
 		if opt.ConnectTimeout > 0 {
@@ -2419,8 +2419,11 @@ func (c *AUNClient) Call(ctx context.Context, method string, params map[string]a
 	if method == "group.ack_messages" {
 		gid, _ := params["group_id"].(string)
 		if c.v2GetState() != nil && gid != "" {
-			c.logEG.Debug("call route: group.ack_messages → V2 ack group=%s", gid)
-			return c.ackGroupV2Internal(ctx, params)
+			if c.groupCursorTargetsCurrentInstance(params) {
+				c.logEG.Debug("call route: group.ack_messages → V2 ack group=%s", gid)
+				return c.ackGroupV2Internal(ctx, params)
+			}
+			c.logEG.Debug("call route: group.ack_messages external cursor → raw ack group=%s device_id=%s slot_id=%s", gid, stringFromAny(params["device_id"]), stringFromAny(params["slot_id"]))
 		}
 	}
 
@@ -2648,17 +2651,13 @@ func extractGroupIDFromMutationResult(result any, params map[string]any) string 
 // signClientOperation 为关键操作附加客户端 ECDSA 签名
 func (c *AUNClient) signClientOperation(method string, params map[string]any) {
 	c.mu.RLock()
-	identity := c.identity
+	currentAID := c.currentAIDObj
 	c.mu.RUnlock()
-	if identity == nil {
+	if currentAID == nil || currentAID.PrivateKeyPem == "" {
 		return
 	}
-	privPEM, _ := identity["private_key_pem"].(string)
-	if privPEM == "" {
-		return
-	}
-
-	aidStr, _ := identity["aid"].(string)
+	privPEM := currentAID.PrivateKeyPem
+	aidStr := currentAID.Aid
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 
 	// 计算 params hash：签名覆盖所有非 _ 前缀且非 client_signature 的业务字段
@@ -2687,7 +2686,7 @@ func (c *AUNClient) signClientOperation(method string, params map[string]any) {
 
 	// 证书指纹
 	certFingerprint := ""
-	if certPEM, ok := identity["cert"].(string); ok && certPEM != "" {
+	if certPEM := currentAID.CertPem; certPEM != "" {
 		block, _ := pem.Decode([]byte(certPEM))
 		if block != nil {
 			fp := sha256.Sum256(block.Bytes)

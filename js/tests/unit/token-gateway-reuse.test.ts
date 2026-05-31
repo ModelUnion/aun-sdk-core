@@ -253,7 +253,7 @@ describe('gateway_url cache + persist', () => {
   it('6) 内存 _gatewayUrl 优先于 keystore 缓存和 discovery', async () => {
     const client = new AUNClient();
     (client as any)._aid = 'dave.agentid.pub';
-    client.gatewayUrl = 'ws://memory-gateway/aun';
+    (client as any)._gatewayUrl = 'ws://memory-gateway/aun';
 
     const ks = (client as any)._keystore;
     await ks.setMetadata('dave.agentid.pub', 'gateway_url', 'ws://stale-cache/aun');

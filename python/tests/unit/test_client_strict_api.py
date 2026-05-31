@@ -12,6 +12,22 @@ from aun_core.errors import ValidationError
 from test_client_state_machine import _load_local_aid
 
 
+def _federation_tests_dir() -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / "docker-deploy" / "federation-test" / "tests"
+        if candidate.exists():
+            return candidate
+        candidate = parent.parent / "docker-deploy" / "federation-test" / "tests"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _existing(paths: list[Path]) -> list[Path]:
+    return [path for path in paths if path.exists()]
+
+
 def test_client_rejects_legacy_config_constructor():
     with pytest.raises(TypeError, match="AID"):
         AUNClient({"aun_path": "/tmp/aun"})
@@ -38,7 +54,7 @@ async def test_client_connect_rejects_external_gateway_option(tmp_path):
     store, aid = _load_local_aid(tmp_path)
     client = AUNClient(aid)
 
-    with pytest.raises(ValidationError, match="gateway.*discovery"):
+    with pytest.raises(ValidationError, match=r"unsupported field\(s\): gateway"):
         await client.connect({"gateway": "ws://gateway.example/aun"})
 
     store.close()
@@ -101,6 +117,7 @@ def test_cli_does_not_define_external_gateway_options():
 
 def test_migrated_code_does_not_touch_private_gateway_state():
     root = Path(__file__).resolve().parents[2]
+    federation_tests = _federation_tests_dir()
     checked = [
         root / "tests" / "aun_refactor_helpers.py",
         root / "tests" / "test_integration_auth_flow.py",
@@ -112,8 +129,10 @@ def test_migrated_code_does_not_touch_private_gateway_state():
         root / "tests" / "integration_test_v2_push_seq.py",
         root / "src" / "aun_cli" / "adapter.py",
         root / "src" / "aun_cli" / "commands" / "diag.py",
-        root.parents[1] / "docker-deploy" / "federation-test" / "tests" / "sdk_client_helper.py",
     ]
+    if federation_tests is not None:
+        checked.append(federation_tests / "sdk_client_helper.py")
+    checked = _existing(checked)
 
     violations: list[str] = []
     for path in checked:
@@ -126,7 +145,9 @@ def test_migrated_code_does_not_touch_private_gateway_state():
 
 
 def test_federation_tests_use_discovery_only_gateway_flow():
-    root = Path(__file__).resolve().parents[4] / "docker-deploy" / "federation-test" / "tests"
+    root = _federation_tests_dir()
+    if root is None:
+        return
 
     violations: list[str] = []
     for path in sorted(root.glob("*.py")):
@@ -148,10 +169,13 @@ def test_federation_tests_use_discovery_only_gateway_flow():
 
 def test_migrated_helpers_do_not_pass_legacy_auth_dict():
     root = Path(__file__).resolve().parents[2]
+    federation_tests = _federation_tests_dir()
     checked = [
         root / "tests" / "aun_refactor_helpers.py",
-        root.parents[1] / "docker-deploy" / "federation-test" / "tests" / "sdk_client_helper.py",
     ]
+    if federation_tests is not None:
+        checked.append(federation_tests / "sdk_client_helper.py")
+    checked = _existing(checked)
 
     violations: list[str] = []
     for path in checked:
@@ -221,15 +245,16 @@ def test_migrated_tests_do_not_attach_private_test_fields_to_clients():
 
 def test_migrated_integration_tests_do_not_call_removed_client_methods():
     python_tests = Path(__file__).resolve().parents[2] / "tests"
-    federation_tests = Path(__file__).resolve().parents[4] / "docker-deploy" / "federation-test" / "tests"
+    federation_tests = _federation_tests_dir()
     checked = [
         *[
             path
             for pattern in ("integration_test_*.py", "e2e_test_*.py", "test_integration_*.py")
             for path in python_tests.glob(pattern)
         ],
-        *sorted(federation_tests.glob("*.py")),
     ]
+    if federation_tests is not None:
+        checked.extend(sorted(federation_tests.glob("*.py")))
     removed_methods = {
         "check_gateway_health",
         "list_identities",
@@ -273,15 +298,16 @@ def test_migrated_integration_tests_do_not_call_removed_client_methods():
 
 def test_migrated_integration_tests_do_not_touch_client_private_members():
     python_tests = Path(__file__).resolve().parents[2] / "tests"
-    federation_tests = Path(__file__).resolve().parents[4] / "docker-deploy" / "federation-test" / "tests"
+    federation_tests = _federation_tests_dir()
     checked = [
         *[
             path
             for pattern in ("integration_test_*.py", "e2e_test_*.py", "test_integration_*.py")
             for path in python_tests.glob(pattern)
         ],
-        *sorted(federation_tests.glob("*.py")),
     ]
+    if federation_tests is not None:
+        checked.extend(sorted(federation_tests.glob("*.py")))
     client_like_names = {
         "client",
         "client1",

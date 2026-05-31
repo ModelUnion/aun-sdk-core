@@ -68,18 +68,23 @@ async function installHelpers(page: any): Promise<void> {
 
     const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-    const makeClient = (slotId?: string) => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({ issuer, debug: false });
-      (client as any).configModel.requireForwardSecrecy = false;
-      return { client, slotId };
+    const makeClient = (aunPath: string, deviceId: string) => {
+      const H = w.AUN_TEST_HELPERS;
+      return H.createClient({
+        aunPath,
+        deviceId,
+        requireForwardSecrecy: false,
+      });
     };
 
-    const connect = async (client: any, aid: string, slotId: string) => {
+    const connect = async (client: any, aid: string, slotId: string, register = false) => {
       const H = w.AUN_TEST_HELPERS;
-      const gateway = await H.resolveGateway(client, aid);
-      await H.registerAndLoadIdentity(client, aid);
-      await client.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: slotId });
+      if (register) {
+        await H.registerAndLoadIdentity(client, aid, { slotId });
+      } else {
+        await H.loadIdentity(client, aid, { slotId });
+      }
+      await client.connect({ auto_reconnect: false, heartbeat_interval: 30 });
     };
 
     const waitForEvent = (client: any, event: string, predicate: (d: any) => boolean, timeoutMs = 15000): Promise<any> =>
@@ -110,31 +115,24 @@ test.describe('slot_id 分隔符语义 E2E', () => {
   test('P2P 明文 — 同前缀 c2 踢掉 c1 后收到消息', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (params: { rid: string; issuer: string }) => {
-      const { sleep, connect, waitForEvent, ISSUER } = (window as any).__slotSep;
-      const AUN = (window as any).AUN;
+      const { connect, makeClient, waitForEvent, ISSUER } = (window as any).__slotSep;
       const aliceAid = `sep-js-a-${params.rid}.${ISSUER}`;
       const bobAid = `sep-js-b-${params.rid}.${ISSUER}`;
 
-      const c1 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const c2 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const bob = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      c1.configModel.requireForwardSecrecy = false;
-      c2.configModel.requireForwardSecrecy = false;
-      bob.configModel.requireForwardSecrecy = false;
-
-      const H = (window as any).AUN_TEST_HELPERS;
+      const alicePath = `js-slot-alice-${params.rid}`;
+      const aliceDevice = `sep-js-alice-${params.rid}`;
+      const c1 = makeClient(alicePath, aliceDevice);
+      const c2 = makeClient(alicePath, aliceDevice);
+      const bob = makeClient(`js-slot-bob-${params.rid}`, `sep-js-bob-${params.rid}`);
 
       // c1 以 "evolclaw cli" 连接
-      await H.registerAndLoadIdentity(c1, aliceAid);
-      await c1.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw cli-${params.rid}` });
+      await connect(c1, aliceAid, `evolclaw cli-${params.rid}`, true);
 
       // c2 以 "evolclaw daemon" 连接（踢掉 c1）
-      await H.loadIdentity(c2, aliceAid);
-      await c2.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw daemon-${params.rid}` });
+      await connect(c2, aliceAid, `evolclaw daemon-${params.rid}`);
 
       // bob 连接
-      await H.registerAndLoadIdentity(bob, bobAid);
-      await bob.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: 'main' });
+      await connect(bob, bobAid, 'main', true);
 
       // c2 监听消息
       const text = `slot-sep-plain-${params.rid}`;
@@ -161,28 +159,21 @@ test.describe('slot_id 分隔符语义 E2E', () => {
   test('P2P 加密 — 同前缀 c2 踢掉 c1 后收到并解密消息', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (params: { rid: string; issuer: string }) => {
-      const { waitForEvent, ISSUER } = (window as any).__slotSep;
-      const AUN = (window as any).AUN;
+      const { connect, makeClient, waitForEvent, ISSUER } = (window as any).__slotSep;
       const aliceAid = `sep-js-ea-${params.rid}.${ISSUER}`;
       const bobAid = `sep-js-eb-${params.rid}.${ISSUER}`;
 
-      const c1 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const c2 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const bob = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      c1.configModel.requireForwardSecrecy = false;
-      c2.configModel.requireForwardSecrecy = false;
-      bob.configModel.requireForwardSecrecy = false;
+      const alicePath = `js-slot-alice-${params.rid}`;
+      const aliceDevice = `sep-js-alice-${params.rid}`;
+      const c1 = makeClient(alicePath, aliceDevice);
+      const c2 = makeClient(alicePath, aliceDevice);
+      const bob = makeClient(`js-slot-bob-${params.rid}`, `sep-js-bob-${params.rid}`);
 
-      const H = (window as any).AUN_TEST_HELPERS;
+      await connect(c1, aliceAid, `evolclaw cli-${params.rid}`, true);
 
-      await H.registerAndLoadIdentity(c1, aliceAid);
-      await c1.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw cli-${params.rid}` });
+      await connect(c2, aliceAid, `evolclaw daemon-${params.rid}`);
 
-      await H.loadIdentity(c2, aliceAid);
-      await c2.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw daemon-${params.rid}` });
-
-      await H.registerAndLoadIdentity(bob, bobAid);
-      await bob.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: 'main' });
+      await connect(bob, bobAid, 'main', true);
 
       const text = `slot-sep-enc-${params.rid}`;
       const msgPromise = waitForEvent(c2, 'message.received', (d: any) => d?.payload?.text === text, 20000);
@@ -211,28 +202,21 @@ test.describe('slot_id 分隔符语义 E2E', () => {
   test('Group 明文 — 同前缀 c2 踢掉 c1 后收到群消息', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (params: { rid: string; issuer: string }) => {
-      const { waitForEvent, ISSUER } = (window as any).__slotSep;
-      const AUN = (window as any).AUN;
+      const { connect, makeClient, waitForEvent, ISSUER } = (window as any).__slotSep;
       const aliceAid = `sep-js-ga-${params.rid}.${ISSUER}`;
       const bobAid = `sep-js-gb-${params.rid}.${ISSUER}`;
 
-      const c1 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const c2 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const bob = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      c1.configModel.requireForwardSecrecy = false;
-      c2.configModel.requireForwardSecrecy = false;
-      bob.configModel.requireForwardSecrecy = false;
+      const alicePath = `js-slot-alice-${params.rid}`;
+      const aliceDevice = `sep-js-alice-${params.rid}`;
+      const c1 = makeClient(alicePath, aliceDevice);
+      const c2 = makeClient(alicePath, aliceDevice);
+      const bob = makeClient(`js-slot-bob-${params.rid}`, `sep-js-bob-${params.rid}`);
 
-      const H = (window as any).AUN_TEST_HELPERS;
+      await connect(c1, aliceAid, `evolclaw cli-${params.rid}`, true);
 
-      await H.registerAndLoadIdentity(c1, aliceAid);
-      await c1.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw cli-${params.rid}` });
+      await connect(c2, aliceAid, `evolclaw daemon-${params.rid}`);
 
-      await H.loadIdentity(c2, aliceAid);
-      await c2.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw daemon-${params.rid}` });
-
-      await H.registerAndLoadIdentity(bob, bobAid);
-      await bob.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: 'main' });
+      await connect(bob, bobAid, 'main', true);
 
       // bob 建群，加 alice
       const grpResult = await bob.call('group.create', { name: `sep-grp-${params.rid}`, visibility: 'private' });
@@ -267,28 +251,21 @@ test.describe('slot_id 分隔符语义 E2E', () => {
   test('Group 加密 — 同前缀 c2 踢掉 c1 后收到并解密群消息', async ({ page }) => {
     const rid = Math.random().toString(36).slice(2, 8);
     const result = await page.evaluate(async (params: { rid: string; issuer: string }) => {
-      const { waitForEvent, ISSUER } = (window as any).__slotSep;
-      const AUN = (window as any).AUN;
+      const { connect, makeClient, waitForEvent, ISSUER } = (window as any).__slotSep;
       const aliceAid = `sep-js-gea-${params.rid}.${ISSUER}`;
       const bobAid = `sep-js-geb-${params.rid}.${ISSUER}`;
 
-      const c1 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const c2 = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      const bob = new AUN.AUNClient({ issuer: ISSUER, debug: false });
-      c1.configModel.requireForwardSecrecy = false;
-      c2.configModel.requireForwardSecrecy = false;
-      bob.configModel.requireForwardSecrecy = false;
+      const alicePath = `js-slot-alice-${params.rid}`;
+      const aliceDevice = `sep-js-alice-${params.rid}`;
+      const c1 = makeClient(alicePath, aliceDevice);
+      const c2 = makeClient(alicePath, aliceDevice);
+      const bob = makeClient(`js-slot-bob-${params.rid}`, `sep-js-bob-${params.rid}`);
 
-      const H = (window as any).AUN_TEST_HELPERS;
+      await connect(c1, aliceAid, `evolclaw cli-${params.rid}`, true);
 
-      await H.registerAndLoadIdentity(c1, aliceAid);
-      await c1.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw cli-${params.rid}` });
+      await connect(c2, aliceAid, `evolclaw daemon-${params.rid}`);
 
-      await H.loadIdentity(c2, aliceAid);
-      await c2.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: `evolclaw daemon-${params.rid}` });
-
-      await H.registerAndLoadIdentity(bob, bobAid);
-      await bob.connect({ auto_reconnect: false, heartbeat_interval: 30, slot_id: 'main' });
+      await connect(bob, bobAid, 'main', true);
 
       const grpResult2 = await bob.call('group.create', { name: `sep-egrp-${params.rid}`, visibility: 'private' });
       const grp2 = (grpResult2 as any)?.group ?? grpResult2;

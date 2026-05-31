@@ -6,7 +6,7 @@ import * as path from 'node:path';
 
 import { AUNClient } from '../../src/client.js';
 import type { JsonObject, Message } from '../../src/types.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 const TEST_TIMEOUT = 150_000;
 const MARKER_PATH = String(process.env.AUN_RECONNECT_MARKER ?? '').trim();
@@ -17,11 +17,10 @@ function runId(): string {
 }
 
 function makeClient(tag: string): AUNClient {
-  const client = new AUNClient({
-    aun_path: fs.mkdtempSync(path.join(os.tmpdir(), `aun-fed-rc-${tag}-`)),
+  return createTestClient({
+    aunPath: fs.mkdtempSync(path.join(os.tmpdir(), `aun-fed-rc-${tag}-`)),
+    requireForwardSecrecy: false,
   });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -32,12 +31,12 @@ async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
-      await setGatewayForClient(client, aid);
       await registerAndLoadIdentity(client, aid);
       await client.connect({
         auto_reconnect: true,
         heartbeat_interval: 3,
-        retry: { initial_delay: 1, max_delay: 5 },
+        retry_initial_delay: 1,
+        retry_max_delay: 5,
       });
       return;
     } catch (error) {
@@ -181,7 +180,7 @@ describe('双域 Federation Reconnect 测试', () => {
     const bobAid = `ts-fed-rc-b-${rid}.aid.net`;
     const bobStates: string[] = [];
 
-    bob.on('connection.state', (data) => {
+    bob.on('state_change', (data) => {
       bobStates.push(String(((data as JsonObject).state ?? '')));
     });
 

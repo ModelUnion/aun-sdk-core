@@ -36,7 +36,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from aun_core import AUNClient
+from aun_core import AUNClient, ConnectionState
 from aun_core.errors import AUNError
 from aun_refactor_helpers import ensure_connected_identity, make_client_for_path
 
@@ -99,6 +99,11 @@ def _fail(name: str, reason: str) -> None:
 # 辅助
 # ---------------------------------------------------------------------------
 
+def _is_ready(client: AUNClient) -> bool:
+    state = client.state
+    return state == ConnectionState.READY or state == "connected"
+
+
 async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "main") -> None:
     await ensure_connected_identity(
         client,
@@ -109,7 +114,12 @@ async def _connect_long(client: AUNClient, aid: str, *, slot_id: str = "main") -
 
 async def _connect_short(client: AUNClient, aid: str, *, slot_id: str = "main",
                          short_ttl_ms: int = 0) -> None:
-    opts: dict = {"connection_kind": "short", "auto_reconnect": False, "slot_id": slot_id}
+    opts: dict = {
+        "connection_kind": "short",
+        "auto_reconnect": False,
+        "slot_id": slot_id,
+        "background_sync": False,
+    }
     if short_ttl_ms > 0:
         opts["short_ttl_ms"] = short_ttl_ms
     await ensure_connected_identity(client, aid, connect_options=opts)
@@ -391,7 +401,7 @@ async def e2e_cli_crash_long_unaffected() -> bool:
         # CLI 短连接：建立但不 close（模拟崩溃），ttl=2s
         cli_crash = _make_client(alice_path)
         await _connect_short(cli_crash, alice_aid, short_ttl_ms=2000)
-        if cli_crash.state != "connected":
+        if not _is_ready(cli_crash):
             _fail(name, f"short connect failed: {cli_crash.state}")
             return False
         print(f"  [OK] CLI short connected with ttl=2000ms")
@@ -399,10 +409,10 @@ async def e2e_cli_crash_long_unaffected() -> bool:
         # 等 ttl 触发
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if cli_crash.state in ("disconnected", "closed", "terminal_failed"):
+            if not _is_ready(cli_crash):
                 break
             await asyncio.sleep(0.3)
-        if cli_crash.state == "connected":
+        if _is_ready(cli_crash):
             _fail(name, "CLI short still connected after ttl")
             return False
         print(f"  [OK] CLI short evicted by ttl (state={cli_crash.state})")

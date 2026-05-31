@@ -90,10 +90,6 @@
   <div class="section">
     <h3>AID 配置</h3>
     <div class="row">
-      <label>Gateway:</label>
-      <input type="text" id="gatewayInput" value="" placeholder="留空则自动发现">
-    </div>
-    <div class="row">
       <label>Alice AID:</label>
       <input type="text" id="aliceAid" value="">
     </div>
@@ -256,10 +252,8 @@ async function runStep(btnId, name, fn) {
 
 // ── 客户端工厂 ──────────────────────────────────────
 function makeClient(tag) {
-  const gw = document.getElementById('gatewayInput').value.trim();
-  const opts = {};
-  log('dim', '创建客户端 [' + tag + ']', { gateway: gw || '(自动发现)' });
-  return new AUN.AUNClient(opts);
+  log('dim', '创建客户端 [' + tag + ']', { gateway: '(自动发现)' });
+  return new AUN.AUNClient();
 }
 
 function createStore(client) {
@@ -345,19 +339,11 @@ window.stepConnect = async function() {
   if (!aliceAuth || !bobAuth) { log('error', '请先完成认证'); return; }
 
   await runStep('btn-connect', 'Alice 连接 Gateway', async () => {
-    const params = { ...aliceAuth };
-    if (document.getElementById('gatewayInput').value.trim()) {
-      params.gateway = document.getElementById('gatewayInput').value.trim();
-    }
-    await alice.connect(params.gateway ? { gateway: params.gateway } : {});
+    await alice.connect();
     return { state: alice.state, gateway: alice.gatewayUrl };
   });
   await runStep('btn-connect', 'Bob 连接 Gateway', async () => {
-    const params = { ...bobAuth };
-    if (document.getElementById('gatewayInput').value.trim()) {
-      params.gateway = document.getElementById('gatewayInput').value.trim();
-    }
-    await bob.connect(params.gateway ? { gateway: params.gateway } : {});
+    await bob.connect();
     return { state: bob.state, gateway: bob.gatewayUrl };
   });
   setStatus('已连接 | Alice: ' + alice.aid + ' | Bob: ' + bob.aid);

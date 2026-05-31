@@ -2320,6 +2320,10 @@ export class AuthFlow {
         delete persisted[key];
       }
     }
+    // 私钥由 AIDStore 管理，AUNClient 不写 key.json
+    for (const key of ['private_key_pem', 'public_key_der_b64', 'curve'] as const) {
+      delete persisted[key];
+    }
 
     this._keystore.saveIdentity(aid, persisted);
 

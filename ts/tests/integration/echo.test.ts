@@ -14,12 +14,11 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 const AUN_DATA_ROOT = (process.env.AUN_DATA_ROOT ?? '').trim();
 
 const TEST_AUN_PATH = (process.env.AUN_TEST_AUN_PATH ?? (() => {
@@ -42,18 +41,12 @@ function makeAunPath(tag: string): string {
 
 function makeClient(tag: string): AUNClient {
   const aunPath = makeAunPath(tag);
-  const client = new AUNClient({ aun_path: aunPath, debug: false });
-  (client as any)._configModel.requireForwardSecrecy = false;
+  const client = createTestClient({ aunPath, debug: false, requireForwardSecrecy: false });
   (client as any)._testSlotId = `echo-${tag}-${rid()}`;
   return client;
 }
 
-async function resolveGatewayInto(client: AUNClient): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
-}
-
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
-  await resolveGatewayInto(client);
   await registerAndLoadIdentity(client, aid);
   const opts: Record<string, unknown> = {
     auto_reconnect: false,

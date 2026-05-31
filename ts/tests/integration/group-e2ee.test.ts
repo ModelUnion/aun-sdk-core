@@ -20,7 +20,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { AUNClient } from '../../src/client.js';
-import { registerAndLoadIdentity, setGatewayForClient } from '../test-support.js';
+import { createTestClient, registerAndLoadIdentity } from '../test-support.js';
 
 process.env.AUN_ENV ??= 'development';
 
@@ -28,7 +28,6 @@ process.env.AUN_ENV ??= 'development';
 
 const TEST_TIMEOUT = 60_000;
 const ISSUER = process.env.AUN_TEST_ISSUER ?? 'agentid.pub';
-const GATEWAY_DISCOVERY_AID = process.env.AUN_TEST_GATEWAY_AID ?? `gateway.${ISSUER}`;
 
 // ── 类型别名 ──────────────────────────────────────────────────
 
@@ -44,14 +43,11 @@ function runId(): string {
 /** 创建测试客户端（Gateway 通过 well-known 自动发现） */
 function makeClient(): AUNClient {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-ge2ee-'));
-  const client = new AUNClient({ aun_path: tmpDir, debug: true });
-  ((client as unknown) as { _configModel: { requireForwardSecrecy: boolean } })._configModel.requireForwardSecrecy = false;
-  return client;
+  return createTestClient({ aunPath: tmpDir, debug: true, requireForwardSecrecy: false });
 }
 
 /** 注册 AID 并连接到 Gateway */
 async function ensureConnected(client: AUNClient, aid: string): Promise<void> {
-  await setGatewayForClient(client, GATEWAY_DISCOVERY_AID);
   await registerAndLoadIdentity(client, aid);
   await client.connect();
 }

@@ -95,23 +95,17 @@ async function installP0Helpers(page: any): Promise<void> {
      * 浏览器 SDK 使用 IndexedDB 存储，每个实例需要独立的 instanceId。
      */
     const makeAndConnect = async (instanceId: string): Promise<any> => {
-      const AUN = w.AUN;
-      const client = new AUN.AUNClient({
-        instanceId,
-        issuer,
-        debug: true,
+      return w.AUN_TEST_HELPERS.createClient({
+        aunPath: `js-${instanceId}`,
+        deviceId: instanceId,
+        requireForwardSecrecy: false,
       });
-      // 禁用 forward secrecy 以简化测试
-      if (client._configModel) {
-        client._configModel.requireForwardSecrecy = false;
-      }
-      return client;
     };
 
     /**
      * 确保 AID 已创建、认证并连接。
      */
-        const ensureConnected = async (client: any, aid: string): Promise<void> => {
+    const ensureConnected = async (client: any, aid: string): Promise<void> => {
       await w.AUN_TEST_HELPERS.connectIdentity(client, aid);
     };
 

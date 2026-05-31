@@ -97,17 +97,14 @@ func TestP0Integration_04_LoginReplayAttack(t *testing.T) {
 	}
 	t.Logf("首次认证成功，获取 token")
 
-	// 再次用同一 AID 认证 — 这里不是重放同一 challenge，
-	// 而是验证服务端每次颁发新 challenge
-	auth2, err := c.Authenticate(ctx)
-	if err != nil {
-		t.Fatalf("第二次认证失败: %v", err)
-	}
-	// 两次的 token 应不同
-	if auth1["access_token"] == auth2["access_token"] {
-		t.Logf("警告: 两次认证返回了相同的 access_token")
+	// 重构后 Authenticate 是 standby-only API。已认证客户端再次调用应被
+	// 状态机拒绝，避免应用层误把同一连接生命周期里的认证结果当成重放流程。
+	if _, err := c.Authenticate(ctx); err == nil {
+		t.Fatalf("已认证状态下重复 Authenticate 应失败")
+	} else if !strings.Contains(err.Error(), "authenticate not allowed") {
+		t.Fatalf("重复 Authenticate 返回了非预期错误: %v", err)
 	} else {
-		t.Logf("两次认证返回不同 token（正确）")
+		t.Logf("重复 Authenticate 正确被状态机拒绝: %v", err)
 	}
 }
 
@@ -462,17 +459,16 @@ func TestP0Integration_03_LoginExpiredChallenge(t *testing.T) {
 	}
 	t.Logf("认证成功，获取到 token")
 
-	// 等待一段时间后再次认证 — 验证 challenge 不可重用
+	// 等待一段时间后再次认证。重构后高层 API 不允许在 authenticated
+	// 状态重复认证，过期 challenge 不能通过同一 client 生命周期被复用。
 	time.Sleep(2 * time.Second)
 
-	auth2, err := c.Authenticate(ctx)
-	if err != nil {
-		t.Fatalf("第二次认证失败: %v", err)
-	}
-	if auth1["access_token"] == auth2["access_token"] {
-		t.Logf("警告: 两次认证返回了相同的 access_token")
+	if _, err := c.Authenticate(ctx); err == nil {
+		t.Fatalf("authenticated 状态下重复 Authenticate 应失败")
+	} else if !strings.Contains(err.Error(), "authenticate not allowed") {
+		t.Fatalf("重复 Authenticate 返回了非预期错误: %v", err)
 	} else {
-		t.Logf("两次认证返回不同 token（正确）")
+		t.Logf("重复 Authenticate 正确被状态机拒绝: %v", err)
 	}
 }
 
@@ -490,7 +486,8 @@ func TestP0Integration_05_TokenConcurrentRefresh(t *testing.T) {
 	// 先正常连接
 	ensureConnected(t, c, aid)
 
-	// 并发认证 5 次
+	// 已连接状态下 Authenticate 不再承担 token 刷新职责；刷新由连接
+	// 生命周期后台逻辑覆盖。并发调用应全部被状态机拒绝，且不影响现有连接。
 	const concurrency = 5
 	type authResult struct {
 		auth map[string]any
@@ -506,36 +503,34 @@ func TestP0Integration_05_TokenConcurrentRefresh(t *testing.T) {
 	}
 
 	successes := 0
+	failures := 0
 	for i := 0; i < concurrency; i++ {
 		r := <-results
 		if r.err == nil && r.auth["access_token"] != nil {
 			successes++
+		} else if r.err != nil {
+			failures++
+			if !strings.Contains(r.err.Error(), "authenticate not allowed") {
+				t.Errorf("并发 Authenticate 返回非预期错误: %v", r.err)
+			}
 		}
 	}
 
-	if successes == 0 {
-		t.Error("所有并发认证全部失败")
+	if successes != 0 {
+		t.Errorf("ready 状态下并发 Authenticate 不应成功，实际成功 %d/%d", successes, concurrency)
+	}
+	if failures != concurrency {
+		t.Errorf("ready 状态下并发 Authenticate 应全部失败，实际失败 %d/%d", failures, concurrency)
 	} else {
-		t.Logf("并发认证 %d/%d 成功", successes, concurrency)
+		t.Logf("ready 状态下并发 Authenticate 全部被拒绝: %d/%d", failures, concurrency)
 	}
 
-	// 验证并发刷新后客户端仍可用
+	// 验证并发拒绝后客户端仍可用
 	_, err := c.Call(ctx, "meta.ping", nil)
 	if err != nil {
-		t.Logf("并发刷新后 ping 失败（可能需重连）: %v", err)
+		t.Errorf("并发 Authenticate 被拒绝后 ping 失败: %v", err)
 	} else {
-		t.Logf("并发刷新后 ping 正常")
-	}
-
-	// inflight 标志清理验证 — 并发完成后再单独 authenticate 应成功
-	time.Sleep(500 * time.Millisecond)
-	authAfter, err := c.Authenticate(ctx)
-	if err != nil {
-		t.Errorf("inflight 清理异常: 并发后 authenticate 失败: %v", err)
-	} else if authAfter["access_token"] == nil {
-		t.Errorf("inflight 清理异常: 并发后 authenticate 未返回 token")
-	} else {
-		t.Logf("inflight 清理正常: 并发后 authenticate 成功")
+		t.Logf("并发 Authenticate 被拒绝后 ping 正常")
 	}
 }
 
