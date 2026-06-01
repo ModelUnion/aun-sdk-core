@@ -50,10 +50,10 @@ function makeClient(tag: string): AUNClient {
 }
 
 async function connectClient(client: AUNClient, aid: string): Promise<void> {
-  await registerAndLoadIdentity(client, aid);
+  const slotId = (client as any)._testSlotId ?? `echo-${rid()}`;
+  await registerAndLoadIdentity(client, aid, slotId);
   const opts: Record<string, unknown> = {
     auto_reconnect: false,
-    slot_id: (client as any)._testSlotId ?? `echo-${rid()}`,
   };
   await client.connect(opts);
 }

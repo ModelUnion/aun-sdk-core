@@ -6,6 +6,19 @@
 
 ---
 
+## 0.4.7 — 2026-06-01
+
+### Added
+- **`AIDStore.upload_agent_md(aid, content=None)`**：将 `upload_agent_md` 从 `AUNClient` 迁移到 `AIDStore`，支持指定任意本地 AID 上传 agent.md；内部独立创建 `LocalTokenStore` 和 `AuthFlow` 完成认证，不依赖 `AUNClient` 实例。
+- **`UploadAgentMdResult` TypedDict**：新增上传结果类型（`aid`、`etag`、`last_modified`、`agent_md_url`）。
+
+### Changed
+- **`AUNClient.upload_agent_md()`**：移除，功能迁移至 `AIDStore.upload_agent_md(aid)`。
+- **CLI `agentmd upload` 命令**：不再通过 `CLISession`（`AUNClient`）执行，改为直接调用 `AIDStore.upload_agent_md()`。
+- **`sqlite_db.py`**：`slot_id_full` 列补齐逻辑提取为独立函数，供多处复用。
+
+---
+
 ## 0.4.6 — 2026-06-01
 
 ### Added

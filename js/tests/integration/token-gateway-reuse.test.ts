@@ -144,7 +144,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     expect(identity?.refresh_token).toBeTruthy();
 
     // 验证 keystore 里持久化了 gateway_url
-    const cachedGw = await (client as any)._keystore.getMetadata(aid, 'gateway_url');
+    const cachedGw = await (client as any)._tokenStore.getMetadata(aid, 'gateway_url');
     expect(cachedGw).toBeTruthy();
     expect(String(cachedGw)).toMatch(/^wss?:\/\//);
   }, 30000);
@@ -236,6 +236,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     // 手动把 keystore 里的 expires_at 改成已过期
     const editor = makeClient();
     clients.push(editor);
+    await loadIdentityFromStore(editor, aid);
     const editorAuth = (editor as any)._auth;
     const identity = await editorAuth.loadIdentityOrNone(aid) as IdentityRecord | null;
     expect(identity).not.toBeNull();

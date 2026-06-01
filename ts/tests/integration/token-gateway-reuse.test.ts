@@ -1,8 +1,8 @@
 /**
- * Token + gateway_url 复用集成测试（同 keystore 跨实例场景）。
+ * Token + gateway_url 复用集成测试（同 tokenStore 跨实例场景）。
  *
  * 与 Python integration_test_token_gateway_reuse.py 对齐：
- *   Test 1: 首次 authenticate 后 keystore 持久化 access_token + refresh_token + gateway_url
+ *   Test 1: 首次 authenticate 后 tokenStore 持久化 access_token + refresh_token + gateway_url
  *   Test 2: 同 aun_path 新建第二个 client，authenticate 不调 _login + 不调 discover
  *   Test 3: 第二个 client 用 cached 直接 connect + meta.ping 成功
  *   Test 4: 手动把 expires_at 改成已过期，第二次 authenticate 应走 _login
@@ -124,7 +124,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     return false;
   }
 
-  // ── Test 1: 首次 authenticate 后 keystore 持久化 token + gateway_url ──
+  // ── Test 1: 首次 authenticate 后 tokenStore 持久化 token + gateway_url ──
 
   it('Test 1: first authenticate persists token + gateway_url', async () => {
     if (shouldSkip()) return;
@@ -139,7 +139,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     const result = await client.authenticate() as JsonObject;
     expect(String(result.access_token ?? '')).not.toBe('');
 
-    // keystore 持久化了 access_token（注意：access_token 在 instance_state 表里，loadIdentity 会合并）
+    // tokenStore 持久化了 access_token（注意：access_token 在 instance_state 表里，loadIdentity 会合并）
     const internalAuth = ((client as unknown) as {
       _auth: {
         loadIdentity: (aid?: string) => IdentityRecord;
@@ -149,16 +149,16 @@ describe('Token + gateway_url 复用集成测试', () => {
     expect(String(fullIdentity.access_token ?? '')).not.toBe('');
     expect(String(fullIdentity.refresh_token ?? '')).not.toBe('');
 
-    // keystore 持久化了 gateway_url
+    // tokenStore 持久化了 gateway_url
     const cachedGw = String((((client as unknown) as {
-      _keystore: { loadMetadata: (aid: string) => Record<string, unknown> | null };
-    })._keystore.loadMetadata(aid)?.gateway_url) ?? '');
+      _tokenStore: { loadMetadata: (aid: string) => Record<string, unknown> | null };
+    })._tokenStore.loadMetadata(aid)?.gateway_url) ?? '');
     expect(cachedGw).not.toBe('');
 
     // 校验编码格式：DB 里存的是 JSON 编码（带引号）
     const dbInternal = ((client as unknown) as {
-      _keystore: { _getDB?: (aid: string) => { getMetadata: (k: string) => string | null } };
-    })._keystore._getDB?.(aid);
+      _tokenStore: { _getDB?: (aid: string) => { getMetadata: (k: string) => string | null } };
+    })._tokenStore._getDB?.(aid);
     expect(dbInternal).toBeTruthy();
     const rawGw = dbInternal!.getMetadata('gateway_url');
     expect(rawGw).not.toBeNull();
@@ -240,7 +240,7 @@ describe('Token + gateway_url 复用集成测试', () => {
     await safeClose(client1);
     clients.length = 0;
 
-    // 第二次：完全重新 new client，复用 keystore
+    // 第二次：完全重新 new client，复用 tokenStore
     const client2 = makeClient(aunPath);
     clients.push(client2);
     loadIdentityFromStore(client2, aid);

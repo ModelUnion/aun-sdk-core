@@ -6,6 +6,7 @@
 """
 
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -425,6 +426,53 @@ class TestTokenPersistence:
         assert slot_b["access_token"] == "token-b"
         assert slot_a["seq_tracker_state"]["p2p:alice"]["next_expected"] == 3
         assert slot_b["seq_tracker_state"]["p2p:alice"]["next_expected"] == 7
+
+    def test_legacy_instance_state_schema_without_slot_id_full_is_migrated(self, tmp_path):
+        aid = "legacy-slot-schema.agentid.pub"
+        aid_dir = tmp_path / "AIDs" / aid
+        aid_dir.mkdir(parents=True)
+        db_path = aid_dir / "aun.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                """CREATE TABLE instance_state (
+                    device_id TEXT NOT NULL,
+                    slot_id TEXT NOT NULL DEFAULT '_singleton',
+                    data TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (device_id, slot_id)
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE seq_tracker (
+                    device_id TEXT NOT NULL,
+                    slot_id TEXT NOT NULL DEFAULT '_singleton',
+                    namespace TEXT NOT NULL,
+                    contiguous_seq INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (device_id, slot_id, namespace)
+                )"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ks = LocalTokenStore(tmp_path)
+        try:
+            ks.save_instance_state(aid, "device-1", "slot-a", {"access_token": "token-a"})
+            assert ks.load_instance_state(aid, "device-1", "slot-a")["access_token"] == "token-a"
+        finally:
+            ks.close()
+
+        conn = sqlite3.connect(db_path)
+        try:
+            instance_columns = {row[1] for row in conn.execute("PRAGMA table_info(instance_state)").fetchall()}
+            seq_columns = {row[1] for row in conn.execute("PRAGMA table_info(seq_tracker)").fetchall()}
+        finally:
+            conn.close()
+
+        assert "slot_id_full" in instance_columns
+        assert "slot_id_full" in seq_columns
 
 
 # ── Prekey 持久化测试 ─────────────────────────────────────

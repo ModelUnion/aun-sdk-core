@@ -282,27 +282,28 @@ export class IndexedDBIdentityStore implements KeyStore {
   }
 
   async promotePendingIdentity(handle: string, aid: string): Promise<string> {
-    const current = await this._loadPendingRecord(handle, aid);
-    if (!current) throw new Error(`pending identity not found: ${handle}`);
-    if (!isRecord(current.key_pair)) {
-      throw new Error(`promotePendingIdentity: missing pending key pair: ${handle}`);
-    }
-    const targetKey = metadataStoreKey(aid);
-    const [existingKeyPair, existingCert, existingMetadata] = await Promise.all([
-      idbGet<JsonObject>(STORE_KEY_PAIRS, targetKey),
-      idbGet<string>(STORE_CERTS, certStoreKey(aid)),
-      idbGet<JsonObject>(STORE_METADATA, targetKey),
-    ]);
-    if (existingKeyPair || existingCert || existingMetadata) {
-      throw new Error(`promotePendingIdentity: target exists: ${targetKey}`);
-    }
-    const keyPair = await this._protectedPendingKeyPair(current, aid);
-    await idbPut(STORE_KEY_PAIRS, targetKey, keyPair);
-    if (typeof current.cert === 'string' && current.cert) {
-      await idbPut(STORE_CERTS, certStoreKey(aid), current.cert);
-    }
-    await idbDelete(STORE_PENDING_IDENTITIES, handle);
-    return targetKey;
+    return this._withAidLock(aid, async () => {
+      const current = await this._loadPendingRecord(handle, aid);
+      if (!current) throw new Error(`pending identity not found: ${handle}`);
+      if (!isRecord(current.key_pair)) {
+        throw new Error(`promotePendingIdentity: missing pending key pair: ${handle}`);
+      }
+      const targetKey = metadataStoreKey(aid);
+      const [existingKeyPair, existingCert] = await Promise.all([
+        idbGet<JsonObject>(STORE_KEY_PAIRS, targetKey),
+        idbGet<string>(STORE_CERTS, certStoreKey(aid)),
+      ]);
+      if (existingKeyPair || existingCert) {
+        throw new Error(`promotePendingIdentity: target exists: ${targetKey}`);
+      }
+      const keyPair = await this._protectedPendingKeyPair(current, aid);
+      await idbPut(STORE_KEY_PAIRS, targetKey, keyPair);
+      if (typeof current.cert === 'string' && current.cert) {
+        await idbPut(STORE_CERTS, certStoreKey(aid), current.cert);
+      }
+      await idbDelete(STORE_PENDING_IDENTITIES, handle);
+      return targetKey;
+    });
   }
 
   async discardPendingIdentity(handle: string): Promise<void> {

@@ -1062,10 +1062,6 @@ class AUNClient:
             debug=bool(getattr(self._log, "_debug", False)),
         )
 
-    async def upload_agent_md(self, content: str | None = None) -> dict[str, Any]:
-        """签名并上传当前 AID 的 agent.md。"""
-        return await self._agent_md_manager.upload(content)
-
     def _observe_rpc_meta(self, meta: dict) -> None:
         """transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。"""
         self._agent_md_manager.observe_rpc_meta(meta, owner_aid=self._aid or "")

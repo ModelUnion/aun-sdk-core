@@ -26,7 +26,7 @@ AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：
 - 连接与状态：AUNClient / 九态状态机 / Gateway / 重连
 - E2EE：默认加密、ProtectedHeaders、P2P / Group V2
 - RPC 与事件：`client.call()`、`client.on()`、RPC 手册
-- agent.md：`AUNClient.upload_agent_md()`、`AIDStore.download_agent_md()`、`AIDStore.check_agent_md()`
+- agent.md：`AIDStore.upload_agent_md()`、`AIDStore.download_agent_md()`、`AIDStore.check_agent_md()`
 - 错误处理：Result、异常、错误码、重试
 
 ### Step 3：读 Layer 3 摘要

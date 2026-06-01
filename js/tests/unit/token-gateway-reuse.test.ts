@@ -282,6 +282,25 @@ describe('gateway_url cache + persist', () => {
     expect(setSpy).not.toHaveBeenCalled();
   });
 
+  it('7b) 无本地身份材料时不写入 gateway_url，有 keypair 后才持久化', async () => {
+    const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '' });
+    const ks = createMockKeyStore();
+    (store as any)._keystore = ks;
+    const setSpy = vi.spyOn(ks, 'setMetadata');
+
+    await (store as any)._persistGatewayUrl('pre-register.agentid.pub', 'ws://gateway/aun');
+    expect(setSpy).not.toHaveBeenCalled();
+
+    await ks.saveKeyPair('pre-register.agentid.pub', {
+      private_key_pem: 'PEM',
+      public_key_der_b64: 'PUB',
+      curve: 'P-256',
+    });
+    await (store as any)._persistGatewayUrl('pre-register.agentid.pub', 'ws://gateway/aun');
+
+    expect(setSpy).toHaveBeenCalledWith('pre-register.agentid.pub', 'gateway_url', 'ws://gateway/aun');
+  });
+
   it('8) keystore 无 gateway_url 记录时返回空（不阻塞 discovery）', async () => {
     const store = new AIDStore({ aunPath: 'aun', encryptionSeed: '' });
     (store as any)._keystore = createMockKeyStore();

@@ -149,19 +149,14 @@ export async function moveAccessTokenExpiryIntoRefreshWindow(client: AUNClient, 
   const deviceId = String(raw._deviceId ?? raw._currentAid?.deviceId ?? client.currentAid?.deviceId ?? '');
   const slotId = String(raw._slotId ?? raw._currentAid?.slotId ?? client.currentAid?.slotId ?? 'default');
   const expiresAt = Math.floor(Date.now() / 1000) + secondsFromNow;
-  const store = createAIDStoreForClient(client, slotId);
-  try {
-    const keystore = (store as any)._keystore;
-    if (typeof keystore?.updateInstanceState !== 'function') {
-      throw new Error('test keystore does not support updateInstanceState');
-    }
-    await keystore.updateInstanceState(aid, deviceId, slotId, (state: Record<string, unknown>) => {
-      state.access_token_expires_at = expiresAt;
-      return state;
-    });
-  } finally {
-    store.close();
+  const tokenStore = raw._tokenStore;
+  if (typeof tokenStore?.updateInstanceState !== 'function') {
+    throw new Error('test token store does not support updateInstanceState');
   }
+  await tokenStore.updateInstanceState(aid, deviceId, slotId, (state: Record<string, unknown>) => {
+    state.access_token_expires_at = expiresAt;
+    return state;
+  });
   if (raw._identity && String(raw._identity.aid ?? '') === aid) {
     raw._identity.access_token_expires_at = expiresAt;
   }

@@ -111,7 +111,7 @@ def _make_client(tmp_path, aid=_AID_BOB):
             cert_bytes=peer_cert, validated_at=now, refresh_after=now + _PEER_CERT_CACHE_TTL,
         )
         cert_str = peer_cert.decode("utf-8") if isinstance(peer_cert, bytes) else peer_cert
-        client._keystore.save_cert(peer_aid, cert_str)
+        client._token_store.save_cert(peer_aid, cert_str)
     return client
 
 
@@ -119,7 +119,7 @@ def _store_secret(client, group_id=_GRP, epoch=1, gs=None, members=None):
     gs = gs or secrets.token_bytes(32)
     members = members or _MEMBERS
     commitment = compute_membership_commitment(members, epoch, group_id, gs)
-    store_group_secret(client._keystore, client._aid, group_id, epoch, gs, commitment, members)
+    store_group_secret(client._token_store, client._aid, group_id, epoch, gs, commitment, members)
     return gs
 
 

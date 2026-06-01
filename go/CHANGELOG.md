@@ -8,6 +8,20 @@
 
 ---
 
+## 0.4.7 — 2026-06-01
+
+### Added
+- **`AIDStore.UploadAgentMD(ctx, aid, content...)`**：将 `UploadAgentMD` 从 `AUNClient` 迁移到 `AIDStore`，支持指定任意本地 AID 上传 agent.md；内部独立创建 `LocalTokenStore` 和 `AuthFlow` 完成认证，不依赖 `AUNClient` 实例。
+- **`LocalIdentityStore.promotePendingIntoMetadataOnlyDir()`**：新增私有方法，支持将 pending 目录合并到仅含 metadata（无私钥/证书文件）的目标目录，修复特定场景下 pending 提升失败问题。
+
+### Changed
+- **`AUNClient.UploadAgentMD()`**：移除，功能迁移至 `AIDStore.UploadAgentMD(ctx, aid)`。
+- **`AIDStore`**：新增内部 `tokenStore`（`*keystore.LocalTokenStore`）字段，供 upload 认证流程使用；`Close()` 时同步释放。
+- **`keystore/aid_db.go`**：`slot_id_full` 列补齐逻辑提取为 `ensureSlotIDFullColumns()` 函数，供 `LocalIdentityStore` 和 `LocalTokenStore` 共用。
+- **`transport.go`**：重连逻辑优化，补充测试覆盖。
+
+---
+
 ## 0.4.6 — 2026-06-01
 
 ### Added

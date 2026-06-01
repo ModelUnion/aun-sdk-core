@@ -1135,10 +1135,6 @@ export class AUNClient {
     return this._aid;
   }
 
-  async uploadAgentMd(content?: string | null): Promise<Record<string, unknown>> {
-    return await this._agentMdManager.upload(content);
-  }
-
   private async _observeAgentMdFromEnvelope(envelope: unknown): Promise<void> {
     await this._agentMdManager.observeEnvelope(envelope);
   }

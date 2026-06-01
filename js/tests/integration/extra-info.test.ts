@@ -142,12 +142,11 @@ describe('extra_info 集成测试', () => {
     // 第一个客户端连接，带 extra_info
     const client1 = makeClient(sharedPath);
     clients.push(client1);
-    await registerAndLoadIdentity(client1, aid);
+    await registerAndLoadIdentity(client1, aid, 'main');
     const extraInfo1 = { pid: 1001, label: 'client-1' } as unknown as JsonObject;
     await client1.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
-      slot_id: 'main',
       extra_info: extraInfo1,
     });
 
@@ -160,12 +159,11 @@ describe('extra_info 集成测试', () => {
     // 第二个客端用同 AID + 同 slot_id 连接 → 踢掉第一个
     const client2 = makeClient(sharedPath);
     clients.push(client2);
-    await loadIdentityFromStore(client2, aid);
+    await loadIdentityFromStore(client2, aid, 'main');
     const extraInfo2 = { pid: 2002, label: 'client-2' } as unknown as JsonObject;
     await client2.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
-      slot_id: 'main',
       extra_info: extraInfo2,
     });
 
@@ -190,11 +188,10 @@ describe('extra_info 集成测试', () => {
     // 不传 extra_info 正常连接
     const client1 = makeClient(sharedPath);
     clients.push(client1);
-    await registerAndLoadIdentity(client1, aid);
+    await registerAndLoadIdentity(client1, aid, 'main');
     await client1.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
-      slot_id: 'main',
     });
 
     // 验证连接成功
@@ -208,11 +205,10 @@ describe('extra_info 集成测试', () => {
 
     const client2 = makeClient(sharedPath);
     clients.push(client2);
-    await loadIdentityFromStore(client2, aid);
+    await loadIdentityFromStore(client2, aid, 'main');
     await client2.connect({
       auto_reconnect: false,
       heartbeat_interval: 30,
-      slot_id: 'main',
     });
 
     // 等待踢人事件

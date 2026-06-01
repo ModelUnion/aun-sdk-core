@@ -801,16 +801,6 @@ func (c *AUNClient) agentMD() *AgentMdManager {
 	return c.agentMDManager
 }
 
-// UploadAgentMD 签名并上传当前 AID 的 agent.md。
-func (c *AUNClient) UploadAgentMD(ctx context.Context, content ...string) (map[string]any, error) {
-	return c.agentMD().Upload(ctx, content...)
-}
-
-// UploadAgentMd 是 UploadAgentMD 的跨语言命名别名。
-func (c *AUNClient) UploadAgentMd(ctx context.Context, content ...string) (map[string]any, error) {
-	return c.UploadAgentMD(ctx, content...)
-}
-
 func (c *AUNClient) observeRPCMeta(meta map[string]any) {
 	c.agentMD().ObserveRPCMeta(meta)
 }

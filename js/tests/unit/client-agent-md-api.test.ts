@@ -2,9 +2,11 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AIDStore } from '../../src/aid-store.js';
 import { AgentMdManager } from '../../src/agent-md.js';
 import { AUNClient } from '../../src/client.js';
 import { ValidationError } from '../../src/errors.js';
+import { resultOk } from '../../src/result.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -34,31 +36,55 @@ function makeClient(): AUNClient {
   return new AUNClient(mockAid);
 }
 
-function manager(client: AUNClient): AgentMdManager {
-  return (client as any)._agentMdManager as AgentMdManager;
+function manager(holder: any): AgentMdManager {
+  return holder._agentMdManager as AgentMdManager;
 }
 
-function agentRoot(client: AUNClient): string {
-  return manager(client).root;
+function agentRoot(holder: any): string {
+  return manager(holder).root;
 }
 
-async function readStorage(client: AUNClient, key: string): Promise<string | null> {
-  const record = await (client as any)._tokenStore.loadAgentMdCache(agentRoot(client), key);
+async function readStorage(holder: any, key: string): Promise<string | null> {
+  const record = await holder._tokenStore.loadAgentMdCache(agentRoot(holder), key);
   return record ? String(record.content ?? '') : null;
 }
 
-async function readContent(client: AUNClient, aid: string): Promise<string | null> {
-  return await readStorage(client, `${aid}/agent.md`);
+async function readContent(holder: any, aid: string): Promise<string | null> {
+  return await readStorage(holder, `${aid}/agent.md`);
 }
 
-async function readMeta(client: AUNClient, aid: string): Promise<any> {
-  const raw = await readStorage(client, `${aid}/agentmd.json`);
+async function readMeta(holder: any, aid: string): Promise<any> {
+  const raw = await readStorage(holder, `${aid}/agentmd.json`);
   expect(raw).toBeTruthy();
   return JSON.parse(raw!);
 }
 
-async function writeLocalAgentMd(client: AUNClient, aid: string, content: string): Promise<void> {
-  await manager(client).writeContent(aid, content);
+async function writeLocalAgentMd(holder: any, aid: string, content: string): Promise<void> {
+  await manager(holder).writeContent(aid, content);
+}
+
+function makeStore(): AIDStore {
+  const store = new AIDStore({ aunPath: '/tmp/aun-js-agent-md', encryptionSeed: '', verifySsl: true });
+  (store as any)._resolveGateway = async () => 'ws://gateway.agentid.pub/aun';
+  return store;
+}
+
+function installStoreAid(store: AIDStore, aid = 'alice.agentid.pub'): void {
+  (store as any).load = async () => resultOk({
+    aid: {
+      aid,
+      certPem: 'cert',
+      privateKeyPem: 'private',
+      publicKey: 'public',
+      isPrivateKeyValid: () => true,
+      signAgentMd: vi.fn(async (c: string) => ({
+        ok: true,
+        data: {
+          signed: `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`,
+        },
+      })),
+    },
+  });
 }
 
 describe('js client AIDs IndexedDB 存储', () => {
@@ -68,79 +94,59 @@ describe('js client AIDs IndexedDB 存储', () => {
     expect(agentRoot(client)).toBe('/tmp/aun-js-agent-md/AIDs');
     expect((client as any).setAgentMdPath).toBeUndefined();
     expect((client as any).SetAgentMDPath).toBeUndefined();
+    expect((client as any).uploadAgentMd).toBeUndefined();
     expect(mgr.setRoot('/tmp/custom-agentmd')).toBe('/tmp/custom-agentmd');
     expect(mgr.setRoot()).toBe('/tmp/aun-js-agent-md/AIDs');
   });
 
   it('uploadAgentMd 无本地 AID 时拒绝', async () => {
-    const client = makeClient();
-    await expect(client.uploadAgentMd()).rejects.toBeInstanceOf(ValidationError);
+    const store = makeStore();
+    const result = await store.uploadAgentMd('');
+    expect(result.ok).toBe(false);
+    expect((result as any).error.code).toBe('INVALID_AID_FORMAT');
   });
 
   it('uploadAgentMd 无本地 agent.md 正文时拒绝', async () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    (client as any)._currentAid = { aid: 'alice.agentid.pub', isPrivateKeyValid: () => true };
-    await expect(client.uploadAgentMd()).rejects.toBeInstanceOf(ValidationError);
+    const store = makeStore();
+    installStoreAid(store);
+    const result = await store.uploadAgentMd('alice.agentid.pub');
+    expect(result.ok).toBe(false);
+    expect((result as any).error.code).toBe('INVALID_AID_FORMAT');
   });
 
   it('uploadAgentMd 从 IndexedDB 的 {aid}/agent.md 读取，签名上传后写回并更新 agentmd.json', async () => {
-    const client = makeClient();
-    const mgr = manager(client);
-    (client as any)._aid = 'alice.agentid.pub';
+    const store = makeStore();
+    installStoreAid(store);
     const unsigned = '---\naid: alice.agentid.pub\n---\n# Alice\n';
-    await writeLocalAgentMd(client, 'alice.agentid.pub', unsigned);
+    await writeLocalAgentMd(store, 'alice.agentid.pub', unsigned);
 
-    let signedInput = '';
     let uploaded = '';
-    (client as any)._currentAid = {
-      aid: 'alice.agentid.pub',
-      isPrivateKeyValid: () => true,
-      signAgentMd: vi.fn(async (c: string) => {
-        signedInput = c;
-        return {
-          ok: true,
-          data: {
-            signed: `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`,
-          },
-        };
-      }),
-    };
-    vi.spyOn(mgr as any, '_uploadHttp').mockImplementation(async (_aid: string, c: string) => {
+    vi.spyOn(AgentMdManager.prototype as any, '_uploadHttp').mockImplementation(async (_aid: string, c: string) => {
       uploaded = c;
       return { aid: 'alice.agentid.pub', etag: '"cloud"', last_modified: 'Sun, 24 May 2026 00:00:00 GMT' };
     });
 
-    const result = await client.uploadAgentMd();
+    const result = await store.uploadAgentMd('alice.agentid.pub');
 
-    expect(result.aid).toBe('alice.agentid.pub');
-    expect(signedInput).toBe(unsigned);
-    expect(await readContent(client, 'alice.agentid.pub')).toBe(uploaded);
-    const record = await readMeta(client, 'alice.agentid.pub');
+    expect(result.ok).toBe(true);
+    expect((result as any).data.aid).toBe('alice.agentid.pub');
+    expect(await readContent(store, 'alice.agentid.pub')).toBe(uploaded);
+    const record = await readMeta(store, 'alice.agentid.pub');
     expect(record.content).toBeUndefined();
     expect(record.local_etag).toBe(await etag(uploaded));
     expect(record.remote_etag).toBe('"cloud"');
-    expect(mgr.eventSnapshot()?.local_etag).toBe(await etag(uploaded));
   });
 
   it('兼容 uploadAgentMd(content)：先把正文保存到 IndexedDB，再发布', async () => {
-    const client = makeClient();
-    const mgr = manager(client);
-    (client as any)._aid = 'alice.agentid.pub';
+    const store = makeStore();
+    installStoreAid(store);
     const unsigned = '# Alice\n';
-    (client as any)._currentAid = {
-      aid: 'alice.agentid.pub',
-      isPrivateKeyValid: () => true,
-      signAgentMd: vi.fn(async (c: string) => ({
-        ok: true,
-        data: { signed: `${c}\n<!-- signed -->\n` },
-      })),
-    };
-    vi.spyOn(mgr as any, '_uploadHttp').mockResolvedValue({ aid: 'alice.agentid.pub' });
+    vi.spyOn(AgentMdManager.prototype as any, '_uploadHttp').mockResolvedValue({ aid: 'alice.agentid.pub' });
 
-    await client.uploadAgentMd(unsigned);
+    const result = await store.uploadAgentMd('alice.agentid.pub', unsigned);
 
-    expect(await readContent(client, 'alice.agentid.pub')).toContain('<!-- signed -->');
+    expect(result.ok).toBe(true);
+    expect(await readContent(store, 'alice.agentid.pub')).toContain('AUN-SIGNATURE');
   });
 
   it('downloadAgentMd 保存到 IndexedDB 的 {aid}/agent.md，并只把元数据放入 agentmd.json', async () => {

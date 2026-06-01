@@ -95,20 +95,22 @@ func summarizeDict(payload any, fields []string) string {
 // RPCTransport WebSocket JSON-RPC 2.0 传输层
 // 与 Python SDK transport.py 对应。
 type RPCTransport struct {
-	dispatcher   *EventDispatcher
-	timeout      atomic.Int64 // 纳秒，使用 atomic 保证跨 goroutine 安全
-	onDisconnect func(error, int)
-	verifySSL    bool
-	dnsNet       *DnsResilientNet
-	ws           *websocket.Conn
-	pending      map[string]chan map[string]any
-	pendingMu    sync.Mutex
-	closed       bool
-	closedMu     sync.RWMutex
-	challenge    map[string]any
-	challengeMu  sync.RWMutex
-	cancelReader context.CancelFunc
-	readerDone   chan struct{}
+	dispatcher    *EventDispatcher
+	timeout       atomic.Int64 // 纳秒，使用 atomic 保证跨 goroutine 安全
+	onDisconnect  func(error, int)
+	verifySSL     bool
+	dnsNet        *DnsResilientNet
+	ws            *websocket.Conn
+	pending       map[string]chan map[string]any
+	pendingMu     sync.Mutex
+	closed        bool
+	closedMu      sync.RWMutex
+	lastCloseErr  error
+	lastCloseCode int
+	challenge     map[string]any
+	challengeMu   sync.RWMutex
+	cancelReader  context.CancelFunc
+	readerDone    chan struct{}
 
 	// Gateway 在 RPC envelope 注入 _meta 字段（与 result 同级），由 client 层 observer 接收。
 	// 注入失败 / 字段缺失时 observer 不会被调用，不影响业务路径。
@@ -355,6 +357,8 @@ func (t *RPCTransport) Connect(ctx context.Context, url string) (challenge map[s
 	t.closedMu.Lock()
 	t.ws = conn
 	t.closed = false
+	t.lastCloseErr = nil
+	t.lastCloseCode = 0
 	t.closedMu.Unlock()
 
 	// 接收初始消息（challenge）
@@ -401,6 +405,8 @@ func (t *RPCTransport) Close() (err error) {
 	t.closed = true
 	ws := t.ws
 	t.ws = nil
+	t.lastCloseErr = nil
+	t.lastCloseCode = 0
 	cancelFn := t.cancelReader
 	doneCh := t.readerDone
 	t.closedMu.Unlock()
@@ -476,9 +482,10 @@ func (t *RPCTransport) Call(ctx context.Context, method string, params map[strin
 	t.closedMu.RLock()
 	ws := t.ws
 	if t.closed || ws == nil {
+		err := t.lastDisconnectErrorLocked()
 		t.closedMu.RUnlock()
 		pkgLogTransport().Error("RPC call failed, transport not connected: method=%s", method)
-		return nil, NewConnectionError("transport not connected")
+		return nil, err
 	}
 	t.closedMu.RUnlock()
 
@@ -652,13 +659,16 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 		t.closedMu.Lock()
 		wasClosed := t.closed
 		t.closed = true
+		if unexpectedDisconnect {
+			t.lastCloseErr = disconnectErr
+			t.lastCloseCode = int(websocket.CloseStatus(disconnectErr))
+		}
 		t.closedMu.Unlock()
 
 		if unexpectedDisconnect && !wasClosed && t.onDisconnect != nil {
 			pkgLogTransport().Warn("unexpected disconnect: err=%v", disconnectErr)
 			// 从 nhooyr.io/websocket 错误中提取 close code（-1 表示无 close frame）
-			closeCode := int(websocket.CloseStatus(disconnectErr))
-			t.onDisconnect(disconnectErr, closeCode)
+			t.onDisconnect(disconnectErr, int(websocket.CloseStatus(disconnectErr)))
 		}
 	}()
 
@@ -703,6 +713,19 @@ func (t *RPCTransport) readerLoop(ctx context.Context) {
 		}
 		t.routeMessage(message)
 	}
+}
+
+func (t *RPCTransport) lastDisconnectErrorLocked() error {
+	if t.lastCloseCode > 0 {
+		if t.lastCloseErr != nil {
+			return NewConnectionError(fmt.Sprintf("transport not connected: last close code %d: %v", t.lastCloseCode, t.lastCloseErr))
+		}
+		return NewConnectionError(fmt.Sprintf("transport not connected: last close code %d", t.lastCloseCode))
+	}
+	if t.lastCloseErr != nil {
+		return NewConnectionError(fmt.Sprintf("transport not connected: %v", t.lastCloseErr))
+	}
+	return NewConnectionError("transport not connected")
 }
 
 // routeMessage 路由消息到对应的处理器

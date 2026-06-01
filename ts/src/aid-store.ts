@@ -23,6 +23,9 @@ import { AUNLogger } from './logger.js';
 import { getDeviceId, normalizeInstanceId, normalizeSlotId } from './config.js';
 import { IdentityConflictError, NotFoundError, ValidationError } from './errors.js';
 import { AgentMdManager, type AgentMdCheckResult, type AgentMdDownloadResult } from './agent-md.js';
+import { LocalTokenStore } from './keystore/local-token-store.js';
+import { AuthFlow } from './auth.js';
+import type { IdentityRecord } from './types.js';
 
 export interface AIDInfo {
   aid: string;
@@ -44,6 +47,7 @@ export type ResolveResult = {
 };
 export type DownloadAgentMdResult = AgentMdDownloadResult;
 export type CheckAgentMdResult = AgentMdCheckResult;
+export type UploadAgentMdResult = Record<string, unknown>;
 export type DiagnoseResult = { aid: string; status: string; local_valid: boolean; remote_registered: boolean; suggestions: string[]; local: Record<string, unknown>; remote: Record<string, unknown> };
 export type RenewCertResult = { renewed: true; new_cert_not_after: Date; new_fingerprint: string };
 export type RekeyResult = { rekeyed: true; new_cert_not_after: Date; new_fingerprint: string };
@@ -100,10 +104,12 @@ export class AIDStore {
   readonly slotId: string;
 
   private _keystore: LocalIdentityStore;
+  private _tokenStore: LocalTokenStore;
   private _registerFlow: RegisterFlow;
   private _discovery: GatewayDiscovery;
   private _net: DnsResilientNet;
   private _log: AUNLogger;
+  private _crypto: CryptoProvider;
   private _verifySsl: boolean;
   private _rootCaPath: string | null;
   private _debug: boolean;
@@ -134,13 +140,18 @@ export class AIDStore {
       encryptionSeed: this._encryptionSeed || undefined,
       logger: this._log.for('aun_core.keystore'),
     });
+    this._tokenStore = new LocalTokenStore(this.aunPath, {
+      encryptionSeed: this._encryptionSeed || undefined,
+      logger: this._log.for('aun_core.keystore'),
+    });
 
     this._net = new DnsResilientNet({ verifySsl: this._verifySsl, logger: this._log.for('aun_core.net') });
     this._discovery = new GatewayDiscovery({ verifySsl: this._verifySsl, logger: this._log.for('aun_core.discovery'), net: this._net });
+    this._crypto = new CryptoProvider();
 
     this._registerFlow = new RegisterFlow({
       keystore: this._keystore,
-      crypto: new CryptoProvider(),
+      crypto: this._crypto,
       verifySsl: this._verifySsl,
       logger: this._log.for('aun_core.register'),
       net: this._net,
@@ -167,6 +178,7 @@ export class AIDStore {
 
   close(): void {
     this._keystore.close();
+    this._tokenStore.close();
     const net = this._net as unknown as { close?: () => void };
     if (typeof net.close === 'function') net.close();
   }
@@ -367,6 +379,63 @@ export class AIDStore {
       return resultOk(await this._agentMdManager.check(aid, ttlDays));
     } catch (exc) {
       return agentMdFailure<CheckAgentMdResult>(exc);
+    }
+  }
+
+  private _authIdentityFromAid(aid: AID): IdentityRecord {
+    return {
+      aid: aid.aid,
+      private_key_pem: aid.privateKeyPem,
+      public_key_der_b64: aid.publicKey,
+      cert: aid.certPem,
+    };
+  }
+
+  private async _uploadAgentMdToken(aid: AID, gatewayUrl: string): Promise<string> {
+    const auth = new AuthFlow({
+      tokenStore: this._tokenStore,
+      crypto: this._crypto,
+      aid: aid.aid,
+      deviceId: this.deviceId,
+      slotId: this.slotId,
+      rootCaPath: this._rootCaPath,
+      verifySsl: this._verifySsl,
+      logger: this._log.for('aun_core.auth'),
+      net: this._net,
+    });
+    auth.setIdentity(this._authIdentityFromAid(aid));
+    const result = await auth.authenticate(gatewayUrl, { aid: aid.aid });
+    const token = String(result.access_token ?? result.token ?? result.kite_token ?? '').trim();
+    if (!token) throw new Error('authenticate did not return access_token');
+    return token;
+  }
+
+  async uploadAgentMd(aid: string, content?: string | null): Promise<Result<UploadAgentMdResult>> {
+    const target = String(aid ?? '').trim();
+    try {
+      this._registerFlow.validateAidName(target);
+      const loaded = this.load(target);
+      if (!loaded.ok || !loaded.data) {
+        const err = resultError(loaded);
+        return resultErr(err?.code ?? codes.CERT_NOT_FOUND, err?.message ?? `certificate not found for aid: ${target}`);
+      }
+      const current = loaded.data.aid;
+      if (!current.isPrivateKeyValid() || !current.privateKeyPem) {
+        return resultErr(codes.PRIVATE_KEY_NOT_VALID, `uploadAgentMd requires local AID with a valid private key: ${target}`);
+      }
+      const manager = new AgentMdManager({
+        aunPath: this.aunPath,
+        verifySsl: this._verifySsl,
+        logger: this._log.for('aun_core.agent_md'),
+        ownerAidGetter: () => target,
+        currentAidGetter: () => current,
+        gatewayResolver: (value) => this._resolveGateway(value),
+        accessTokenResolver: (_value, gatewayUrl) => this._uploadAgentMdToken(current, gatewayUrl),
+        aidValidator: (value) => this._registerFlow.validateAidName(value),
+      });
+      return resultOk(await manager.upload(content));
+    } catch (exc) {
+      return agentMdFailure<UploadAgentMdResult>(exc);
     }
   }
 

@@ -308,11 +308,8 @@ class AIDDatabase:
         for v in range(from_ver, to_ver):
             if v == 1:
                 # v1 → v2：instance_state / seq_tracker 加 slot_id_full 列
-                for stmt in (
-                    "ALTER TABLE instance_state ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''",
-                    "ALTER TABLE seq_tracker ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''",
-                ):
-                    conn.execute(stmt)
+                AIDDatabase._add_column_if_missing(conn, "instance_state", "slot_id_full", "TEXT NOT NULL DEFAULT ''")
+                AIDDatabase._add_column_if_missing(conn, "seq_tracker", "slot_id_full", "TEXT NOT NULL DEFAULT ''")
             elif v == 2:
                 # v2 → v3：删除废弃的 agent_md_cache 表
                 conn.execute("DROP TABLE IF EXISTS agent_md_cache")
@@ -322,6 +319,8 @@ class AIDDatabase:
         self._rename_column_if_exists(conn, "group_current", "secret", "secret_enc")
         self._rename_column_if_exists(conn, "group_old_epochs", "secret", "secret_enc")
         self._rename_column_if_exists(conn, "e2ee_sessions", "data", "data_enc")
+        self._add_column_if_missing(conn, "instance_state", "slot_id_full", "TEXT NOT NULL DEFAULT ''")
+        self._add_column_if_missing(conn, "seq_tracker", "slot_id_full", "TEXT NOT NULL DEFAULT ''")
         self._migrate_v2_device_keys(conn)
 
     @staticmethod
@@ -384,6 +383,13 @@ class AIDDatabase:
         columns = {str(row[1]) for row in rows}
         if old_name in columns and new_name not in columns:
             conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}")
+
+    @staticmethod
+    def _add_column_if_missing(conn: Any, table: str, column: str, definition: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if rows and column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
     def close(self) -> None:

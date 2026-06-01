@@ -167,6 +167,9 @@ func (a *AIDDatabase) initSchema() error {
 			return fmt.Errorf("DDL 执行失败 (%s...): %w", ddl[:min(40, len(ddl))], err)
 		}
 	}
+	if err := ensureSlotIDFullColumns(tx); err != nil {
+		return fmt.Errorf("补齐 slot_id_full schema 失败: %w", err)
+	}
 	var ver int
 	row := tx.QueryRow("SELECT version FROM _schema_version WHERE id = 1")
 	if err := row.Scan(&ver); err != nil {
@@ -196,19 +199,26 @@ func migrateSchema(tx *sql.Tx, fromVer, toVer int) error {
 			// v0 → v1：无需操作
 		case 1:
 			// v1 → v2：instance_state / seq_tracker 加 slot_id_full 列（幂等）
-			for _, stmt := range []struct{ table, col string }{
-				{"instance_state", "slot_id_full"},
-				{"seq_tracker", "slot_id_full"},
-			} {
-				if !columnExists(tx, stmt.table, stmt.col) {
-					if _, err := tx.Exec("ALTER TABLE " + stmt.table + " ADD COLUMN " + stmt.col + " TEXT NOT NULL DEFAULT ''"); err != nil {
-						return err
-					}
-				}
+			if err := ensureSlotIDFullColumns(tx); err != nil {
+				return err
 			}
 		case 2:
 			// v2 → v3：移除已废弃的 agent_md_cache 表（agent.md 改由文件系统 + 内存缓存承载）
 			if _, err := tx.Exec("DROP TABLE IF EXISTS agent_md_cache"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func ensureSlotIDFullColumns(tx *sql.Tx) error {
+	for _, stmt := range []struct{ table, col string }{
+		{"instance_state", "slot_id_full"},
+		{"seq_tracker", "slot_id_full"},
+	} {
+		if !columnExists(tx, stmt.table, stmt.col) {
+			if _, err := tx.Exec("ALTER TABLE " + stmt.table + " ADD COLUMN " + stmt.col + " TEXT NOT NULL DEFAULT ''"); err != nil {
 				return err
 			}
 		}

@@ -38,27 +38,21 @@ def test_agentmd_upload_calls_sdk_method(monkeypatch, tmp_path):
     _write_profile_config(tmp_path, monkeypatch)
     calls = []
 
-    class FakeClient:
-        async def upload_agent_md(self):
-            calls.append("upload_agent_md")
-            return {"aid": "alice.agentid.pub", "etag": '"v1"', "agent_md_url": "https://alice.agentid.pub/agent.md"}
+    class FakeStore:
+        async def upload_agent_md(self, aid):
+            calls.append(aid)
+            from aun_core import result_ok
+            return result_ok({"aid": aid, "etag": '"v1"', "agent_md_url": "https://alice.agentid.pub/agent.md"})
 
-    class FakeSession:
-        def __init__(self, ctx, **kwargs):
+        def close(self):
             pass
 
-        async def __aenter__(self):
-            return FakeClient()
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(agentmd_commands, "CLISession", FakeSession)
+    monkeypatch.setattr(agentmd_commands, "make_aid_store", lambda resolved: FakeStore())
 
     result = CliRunner().invoke(app, ["--json", "agentmd", "upload_agent_md"])
 
     assert result.exit_code == 0, result.output
-    assert calls == ["upload_agent_md"]
+    assert calls == ["alice.agentid.pub"]
     assert json.loads(result.output)["etag"] == '"v1"'
 
 

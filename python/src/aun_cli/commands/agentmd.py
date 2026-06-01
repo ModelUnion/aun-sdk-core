@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import typer
 
-from aun_cli.adapter import CLISession, handle_error, resolve_profile_config, run_async, make_aid_store
+from aun_cli.adapter import handle_error, resolve_profile_config, run_async, make_aid_store
 from aun_cli.output import output_dict, output_json, output_success, is_json_mode, set_json_mode
 
 agentmd_app = typer.Typer(name="agentmd", help="agent.md 管理", no_args_is_help=True)
@@ -30,8 +30,15 @@ def agentmd_upload(ctx: typer.Context) -> None:
     set_json_mode(ctx.obj.get("json", False))
 
     async def _run():
-        async with CLISession(ctx, need_auth=True) as client:
-            return await client.upload_agent_md()
+        resolved = resolve_profile_config(ctx)
+        target = resolved.get("aid")
+        if not target:
+            raise RuntimeError("upload agent.md requires profile aid")
+        store = make_aid_store(resolved)
+        try:
+            return _unwrap_result(await store.upload_agent_md(target), "upload agent.md")
+        finally:
+            store.close()
 
     try:
         result = run_async(_run())

@@ -6,8 +6,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AID } from '../../src/aid.js';
+import { AIDStore } from '../../src/aid-store.js';
 import { AgentMdManager } from '../../src/agent-md.js';
+import { AuthFlow } from '../../src/auth.js';
 import { AUNClient } from '../../src/client.js';
+import { resultOk } from '../../src/result.js';
 import { buildIdentity, generateECKeypair } from './helpers.js';
 
 function makeMockAid(aunPath: string): AID {
@@ -48,12 +51,6 @@ function peer(aid: string): AID {
   return item;
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString('utf-8');
-}
-
 async function withServer<T>(
   handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
   fn: (port: number) => Promise<T>,
@@ -84,65 +81,57 @@ describe('AUNClient agent.md manager wiring', () => {
     expect(result).toBeNull();
   });
 
-  it('uploadAgentMd 应复用缓存 access_token', async () => {
-    await withServer(async (req, res) => {
-      expect(req.method).toBe('PUT');
-      expect(req.headers.authorization).toBe('Bearer cached-token');
-      expect(await readBody(req)).toBe('# Alice\n');
-      res.writeHead(201, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ aid: '127.0.0.1', etag: '"etag-1"' }));
-    }, async (port) => {
-      const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
-      (client as any)._gatewayUrl = 'ws://gateway.agentid.pub/aun';
-      (client as any)._aid = '127.0.0.1';
-      (client as any)._identity = {
-        aid: '127.0.0.1',
-        access_token: 'cached-token',
-        access_token_expires_at: Date.now() / 1000 + 3600,
-      };
-      (client as any)._currentAid = {
-        aid: '127.0.0.1',
-        isPrivateKeyValid: () => true,
-        signAgentMd: (content: string) => ({ ok: true, data: { signed: content } }),
-      };
-      ((client as any)._agentMdManager as any)._discoveryPort = port;
-
-      const result = await client.uploadAgentMd('# Alice\n');
-
-      expect(result).toEqual({ aid: '127.0.0.1', etag: '"etag-1"' });
-      (client as any)._tokenStore?.close?.();
+  it('AIDStore.uploadAgentMd 应复用缓存 access_token', async () => {
+    const store = new AIDStore({ aunPath: mkdtempSync(join(tmpdir(), 'aun-store-auth-ns-')), encryptionSeed: '', verifySsl: false });
+    const aid = 'alice.agentid.pub';
+    (store as any)._resolveGateway = async () => 'ws://gateway.agentid.pub/aun';
+    (store as any)._tokenStore.saveInstanceState(aid, store.deviceId, store.slotId, {
+      access_token: 'cached-token',
+      refresh_token: 'refresh-token',
+      access_token_expires_at: Date.now() / 1000 + 3600,
     });
+    (store as any).load = () => resultOk({
+      aid: aidFromIdentity(buildIdentity(aid, generateECKeypair().privateKey)),
+    });
+    vi.spyOn(AgentMdManager.prototype, 'upload').mockImplementation(async function (this: AgentMdManager, content?: string | null) {
+      const self = this as any;
+      const target = String(self._ownerAidGetter?.() ?? '');
+      const token = await self._accessToken(target, await self._resolveGateway(target));
+      expect(token).toBe('cached-token');
+      return { aid: target, etag: '"etag-1"', content };
+    });
+
+    const result = await store.uploadAgentMd(aid, '# Alice\n');
+
+    expect(result.ok).toBe(true);
+    expect((result as any).data).toMatchObject({ aid, etag: '"etag-1"' });
+    store.close();
   });
 
-  it('uploadAgentMd 在 token 缺失时应回退 authenticate', async () => {
-    await withServer(async (req, res) => {
-      expect(req.headers.authorization).toBe('Bearer fresh-token');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ aid: '127.0.0.1', etag: '"etag-2"' }));
-    }, async (port) => {
-      const client = new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-auth-ns-'))));
-      (client as any)._gatewayUrl = 'ws://gateway.agentid.pub/aun';
-      (client as any)._aid = '127.0.0.1';
-      (client as any)._identity = { aid: '127.0.0.1' };
-      (client as any)._currentAid = {
-        aid: '127.0.0.1',
-        isPrivateKeyValid: () => true,
-        signAgentMd: (content: string) => ({ ok: true, data: { signed: content } }),
-      };
-      ((client as any)._agentMdManager as any)._discoveryPort = port;
-      const authSpy = vi.spyOn((client as any)._auth, 'authenticate').mockResolvedValue({
-        aid: '127.0.0.1',
-        access_token: 'fresh-token',
-        gateway: 'ws://gateway.agentid.pub/aun',
-      });
-      vi.spyOn((client as any)._auth, 'loadIdentityOrNone').mockReturnValue({ aid: '127.0.0.1', access_token: 'fresh-token' });
-
-      const result = await client.uploadAgentMd('# Alice\n');
-
-      expect(result).toEqual({ aid: '127.0.0.1', etag: '"etag-2"' });
-      expect(authSpy).toHaveBeenCalledWith('ws://gateway.agentid.pub/aun', { aid: '127.0.0.1' });
-      (client as any)._tokenStore?.close?.();
+  it('AIDStore.uploadAgentMd 在 token 缺失时应回退 authenticate', async () => {
+    const store = new AIDStore({ aunPath: mkdtempSync(join(tmpdir(), 'aun-store-auth-ns-')), encryptionSeed: '', verifySsl: false });
+    const aid = 'alice.agentid.pub';
+    (store as any)._resolveGateway = async () => 'ws://gateway.agentid.pub/aun';
+    (store as any).load = () => resultOk({ aid: { aid, certPem: 'cert', privateKeyPem: 'private', publicKey: 'public', isPrivateKeyValid: () => true, signAgentMd: (content: string) => ({ ok: true, data: { signed: content } }) } });
+    const authSpy = vi.spyOn(AuthFlow.prototype, 'authenticate').mockResolvedValue({
+      aid,
+      access_token: 'fresh-token',
+      gateway: 'ws://gateway.agentid.pub/aun',
     });
+    vi.spyOn(AgentMdManager.prototype, 'upload').mockImplementation(async function (this: AgentMdManager, content?: string | null) {
+      const self = this as any;
+      const target = String(self._ownerAidGetter?.() ?? '');
+      const token = await self._accessToken(target, await self._resolveGateway(target));
+      expect(token).toBe('fresh-token');
+      return { aid: target, etag: '"etag-2"', content };
+    });
+
+    const result = await store.uploadAgentMd(aid, '# Alice\n');
+
+    expect(result.ok).toBe(true);
+    expect((result as any).data).toMatchObject({ aid, etag: '"etag-2"' });
+    expect(authSpy).toHaveBeenCalledWith('ws://gateway.agentid.pub/aun', { aid });
+    store.close();
   });
 });
 

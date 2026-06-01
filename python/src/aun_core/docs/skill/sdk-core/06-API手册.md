@@ -66,6 +66,7 @@ store := aun.NewAIDStore(aunPath, encryptionSeed, aun.AIDStoreOptions{
 | `list()` | `list()` | `List()` | 列出本地 AID |
 | `exists(aid)` | `exists(aid)` | `Exists(ctx, aid)` | 远端存在性检查 |
 | `resolve(aid, opts=None)` | `resolve(aid, opts?)` | `Resolve(ctx, aid, opts...)` | 拉证书并缓存；默认下载 agent.md，可用 `skip_agent_md` / `skipAgentMd` 跳过 |
+| `upload_agent_md(aid, content=None)` | `uploadAgentMd(aid, content?)` | `UploadAgentMD(ctx, aid, content...)` | 发布本地 AID 的 agent.md；签名后使用该 AID 的 access_token 上传 |
 | `download_agent_md(aid, timeout_s=None)` | `downloadAgentMd(aid, timeoutMs=30000)` | `DownloadAgentMD(ctx, aid)` | 下载 agent.md，返回 `DownloadAgentMdResult` / `AgentMDInfo` |
 | `check_agent_md(aid, ttl_days=1)` | `checkAgentMd(aid, ttlDays=1)` | `CheckAgentMD(ctx, aid, maxUnsyncedDays...)` | 通过 HEAD 和本地记录检查一致性 |
 | `diagnose(aid)` | `diagnose(aid)` | `Diagnose(ctx, aid)` | 本地 + 远端诊断 |
@@ -248,7 +249,7 @@ await client.call("meta.trust_roots", {})
 ### protected_headers
 
 ```python
-client = AUNClient(aid, protected_headers={"sdk": "python"})
+client = AUNClient(aid)
 client.set_protected_headers({"sdk": "python", "trace": "abc"})
 headers = client.get_protected_headers()
 ```
@@ -264,13 +265,14 @@ headers = client.get_protected_headers()
 
 | Python | TS/JS | Go | 说明 |
 |--------|-------|----|------|
-| `upload_agent_md(content=None)` | `uploadAgentMd(content?)` | `UploadAgentMD(ctx, content...)` | 发布当前 AID 的 agent.md |
+| `AIDStore.upload_agent_md(aid, content=None)` | `store.uploadAgentMd(aid, content?)` | `store.UploadAgentMD(ctx, aid, content...)` | 发布指定本地 AID 的 agent.md |
 | `AIDStore.download_agent_md(aid)` | `store.downloadAgentMd(aid)` | `store.DownloadAgentMD(ctx, aid)` | 下载并验签 |
 | `AIDStore.check_agent_md(aid)` | `store.checkAgentMd(aid)` | `store.CheckAgentMD(ctx, aid, maxUnsyncedDays...)` | 检查一致性 |
 
 说明：
 
-- `AUNClient` 只保留上传入口；下载和检查入口在 `AIDStore`。
+- agent.md 上传、下载和检查入口都在 `AIDStore`；`AUNClient` 不再暴露上传入口。
+- 上传要求目标 AID 已在本地加载且私钥有效；SDK 会对正文签名，并通过 `AuthFlow` 获取或复用该 AID 的 access_token。
 - SDK 发起 GET 时只发送 `Accept: text/markdown`，不主动发送 `If-None-Match` / `If-Modified-Since`。如果服务端异常返回 304，本地有内容则复用；无内容时再发一次无条件 GET。
 - `Accept: text/markdown` 与 agent.md 的 YAML frontmatter + Markdown 格式兼容；agent.md 仍是 Markdown 媒体类型上的结构化约定。
 

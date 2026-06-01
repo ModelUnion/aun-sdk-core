@@ -110,6 +110,7 @@ type AIDStore struct {
 	rootCaPath     string
 	debug          bool
 	keyStore       *keystore.LocalIdentityStore
+	tokenStore     *keystore.LocalTokenStore
 	registerFlow   *RegisterFlow
 	discovery      *GatewayDiscovery
 	dnsNet         *DnsResilientNet
@@ -146,6 +147,11 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 		pkgLogKeystore().Warn("创建 LocalIdentityStore 失败: %v, 使用空种子", err)
 		ks, _ = keystore.NewLocalIdentityStore(aunPath, nil, "")
 	}
+	ts, err := keystore.NewLocalTokenStore(aunPath, nil, encryptionSeed)
+	if err != nil {
+		pkgLogKeystore().Warn("创建 LocalTokenStore 失败: %v, 使用空种子", err)
+		ts, _ = keystore.NewLocalTokenStore(aunPath, nil, "")
+	}
 	rf := NewRegisterFlow(RegisterFlowConfig{
 		Keystore:  ks,
 		VerifySSL: verifySSL,
@@ -160,6 +166,7 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 		rootCaPath:     o.RootCaPath,
 		debug:          o.Debug,
 		keyStore:       ks,
+		tokenStore:     ts,
 		registerFlow:   rf,
 		discovery:      NewGatewayDiscovery(verifySSL, dnsNet),
 		dnsNet:         dnsNet,
@@ -171,6 +178,9 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 func (s *AIDStore) Close() {
 	if s.keyStore != nil {
 		s.keyStore.Close()
+	}
+	if s.tokenStore != nil {
+		s.tokenStore.Close()
 	}
 	if s.dnsNet != nil {
 		s.dnsNet.Close()
@@ -338,6 +348,7 @@ func (s *AIDStore) Register(ctx context.Context, aid string) Result[RegisterResu
 	}); saveErr != nil {
 		return ResultErr[RegisterResult](ErrCodeNetworkError, saveErr.Error(), saveErr)
 	}
+	_ = s.keyStore.SetMetadataValue(target, "gateway_url", gatewayURL)
 	return ResultOk(RegisterResult{Registered: true})
 }
 
@@ -593,6 +604,122 @@ func (s *AIDStore) resolveAgentMDPeer(ctx context.Context, aid string) (*AID, er
 		}
 	}
 	return s.publicAIDFromCert(target, certPEM)
+}
+
+func (s *AIDStore) authIdentityFromAID(aid *AID) map[string]any {
+	return map[string]any{
+		"aid":                aid.Aid,
+		"private_key_pem":    aid.PrivateKeyPem,
+		"public_key_der_b64": aid.PublicKey,
+		"cert":               aid.CertPem,
+	}
+}
+
+func (s *AIDStore) uploadAgentMDToken(ctx context.Context, aid *AID, gatewayURL string) (string, error) {
+	auth := NewAuthFlow(AuthFlowConfig{
+		TokenStore: s.tokenStore,
+		Crypto:     &CryptoProvider{},
+		AID:        aid.Aid,
+		VerifySSL:  s.verifySSL,
+		RootCAPath: s.rootCaPath,
+		DnsNet:     s.dnsNet,
+	})
+	auth.SetInstanceContext(s.deviceID, s.slotID)
+	auth.SetIdentity(s.authIdentityFromAID(aid))
+	result, err := auth.Authenticate(ctx, gatewayURL, aid.Aid)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(stringFromAny(result["access_token"]))
+	if token == "" {
+		token = strings.TrimSpace(stringFromAny(result["token"]))
+	}
+	if token == "" {
+		token = strings.TrimSpace(stringFromAny(result["kite_token"]))
+	}
+	if token == "" {
+		return "", fmt.Errorf("authenticate did not return access_token")
+	}
+	return token, nil
+}
+
+// UploadAgentMD 读取本地 agent.md 或使用传入正文，签名后上传到服务端。
+func (s *AIDStore) UploadAgentMD(ctx context.Context, aid string, contentArg ...string) Result[map[string]any] {
+	target := strings.TrimSpace(aid)
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
+		return ResultErr[map[string]any](ErrCodeInvalidAIDFormat, err.Error(), err)
+	}
+	loadR := s.Load(target)
+	if !loadR.Ok {
+		return ResultErr[map[string]any](loadR.Error.Code, loadR.Error.Message, loadR.Error.Cause)
+	}
+	current := loadR.Data.AID
+	if current == nil || !current.IsPrivateKeyValid() || strings.TrimSpace(current.PrivateKeyPem) == "" {
+		return ResultErr[map[string]any](ErrCodePrivateKeyNotValid, fmt.Sprintf("UploadAgentMD requires local AID with a valid private key: %s", target))
+	}
+
+	content := ""
+	if len(contentArg) > 0 {
+		content = contentArg[0]
+	} else {
+		p, err := s.agentMDFilePath(target)
+		if err != nil {
+			return ResultErr[map[string]any](ErrCodeInvalidAIDFormat, err.Error(), err)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return ResultErr[map[string]any](ErrCodeNetworkError, fmt.Sprintf("UploadAgentMD read default agent.md: %v", err), err)
+		}
+		content = string(data)
+	}
+	if strings.TrimSpace(content) == "" {
+		return ResultErr[map[string]any](ErrCodeInvalidAIDFormat, "UploadAgentMD requires non-empty content")
+	}
+	signed, err := current.SignAgentMd(content)
+	if err != nil {
+		return ResultErr[map[string]any](ErrCodeSignatureOperationError, err.Error(), err)
+	}
+	gatewayURL, err := s.resolveGateway(ctx, target)
+	if err != nil {
+		return ResultErr[map[string]any](ErrCodeNetworkError, err.Error(), err)
+	}
+	token, err := s.uploadAgentMDToken(ctx, current, gatewayURL)
+	if err != nil {
+		return ResultErr[map[string]any](ErrCodeNetworkError, err.Error(), err)
+	}
+	result, err := agentMDUploadHTTP(ctx, s.httpClient(), agentMDURLFromGateway(gatewayURL, target, 0), token, signed)
+	if err != nil {
+		code := ErrCodeNetworkError
+		if strings.Contains(err.Error(), "agent.md endpoint not found") {
+			code = ErrCodeAgentMdNotFound
+		}
+		return ResultErr[map[string]any](code, err.Error(), err)
+	}
+	remoteEtag := strings.TrimSpace(stringFromAny(result["etag"]))
+	lastModified := strings.TrimSpace(stringFromAny(result["last_modified"]))
+	if lastModified == "" {
+		lastModified = strings.TrimSpace(stringFromAny(result["lastModified"]))
+	}
+	remoteStatus := "unknown"
+	if remoteEtag != "" {
+		remoteStatus = "found"
+	}
+	s.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
+		Content:      agentMDStringPtr(signed),
+		LocalEtag:    agentMDStringPtr(agentMDContentEtag(signed)),
+		RemoteEtag:   agentMDStringPtr(remoteEtag),
+		LastModified: agentMDStringPtr(lastModified),
+		FetchedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
+		CheckedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
+		RemoteStatus: agentMDStringPtr(remoteStatus),
+		LastError:    agentMDStringPtr(""),
+	})
+	return ResultOk(result)
+}
+
+// UploadAgentMd 是 UploadAgentMD 的跨语言命名别名。
+func (s *AIDStore) UploadAgentMd(ctx context.Context, aid string, contentArg ...string) Result[map[string]any] {
+	return s.UploadAgentMD(ctx, aid, contentArg...)
 }
 
 // DownloadAgentMD 下载 agent.md 并自动验签。
@@ -972,6 +1099,20 @@ func (s *AIDStore) resolveGateway(ctx context.Context, aid string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	_ = s.keyStore.SetMetadataValue(aid, "gateway_url", discovered)
+	if s.hasLocalIdentityMaterial(aid) {
+		_ = s.keyStore.SetMetadataValue(aid, "gateway_url", discovered)
+	}
 	return discovered, nil
+}
+
+func (s *AIDStore) hasLocalIdentityMaterial(aid string) bool {
+	if cert, err := s.keyStore.LoadCert(aid); err == nil && strings.TrimSpace(cert) != "" {
+		return true
+	}
+	keyPair, err := s.keyStore.LoadKeyPair(aid)
+	if err != nil || keyPair == nil {
+		return false
+	}
+	return strings.TrimSpace(authGetStr(keyPair, "private_key_pem")) != "" ||
+		strings.TrimSpace(authGetStr(keyPair, "public_key_der_b64")) != ""
 }

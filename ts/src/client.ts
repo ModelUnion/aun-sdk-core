@@ -1171,10 +1171,6 @@ export class AUNClient {
     return [...this._peerCache.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, v]) => v);
   }
 
-  async uploadAgentMd(content?: string | null): Promise<Record<string, unknown>> {
-    return await this._agentMdManager.upload(content);
-  }
-
   /** transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。 */
   private _observeRpcMeta(meta: Record<string, unknown>): void {
     this._agentMdManager.observeRpcMeta(meta, this._aid);

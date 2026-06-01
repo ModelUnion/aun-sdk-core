@@ -554,6 +554,13 @@ func (f *LocalIdentityStore) PromotePendingIdentity(pendingDir, aid string) (str
 	}
 	target := f.identityDir(aid)
 	if _, err := os.Stat(target); err == nil {
+		merged, mergeErr := f.promotePendingIntoMetadataOnlyDir(dir, target)
+		if mergeErr != nil {
+			return "", mergeErr
+		}
+		if merged {
+			return target, nil
+		}
 		return "", os.ErrExist
 	} else if err != nil && !os.IsNotExist(err) {
 		return "", err
@@ -572,6 +579,56 @@ func (f *LocalIdentityStore) PromotePendingIdentity(pendingDir, aid string) (str
 		return "", err
 	}
 	return target, nil
+}
+
+func (f *LocalIdentityStore) promotePendingIntoMetadataOnlyDir(pendingDir, target string) (bool, error) {
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		switch name {
+		case "aun.db", "aun.db-shm", "aun.db-wal":
+			continue
+		case "private", "public":
+			nested, readErr := os.ReadDir(filepath.Join(target, name))
+			if readErr != nil {
+				return false, readErr
+			}
+			if len(nested) > 0 {
+				return false, nil
+			}
+		default:
+			return false, nil
+		}
+	}
+	moves := []string{
+		filepath.Join("private", "key.json"),
+		filepath.Join("public", "cert.pem"),
+	}
+	for _, rel := range moves {
+		src := filepath.Join(pendingDir, rel)
+		dst := filepath.Join(target, rel)
+		if _, err := os.Stat(src); err != nil {
+			return false, err
+		}
+		if _, err := os.Stat(dst); err == nil {
+			return false, nil
+		} else if err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			return false, err
+		}
+		if err := safeRename(src, dst); err != nil {
+			return false, err
+		}
+	}
+	if err := os.RemoveAll(pendingDir); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (f *LocalIdentityStore) ensurePendingKeyPairProtected(pendingDir, aid string) error {

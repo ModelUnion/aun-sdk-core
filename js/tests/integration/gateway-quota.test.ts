@@ -99,11 +99,10 @@ async function connectLong(
   aid: string,
   slotId: string,
 ): Promise<void> {
-  await registerAndLoadIdentity(client, aid);
+  await registerAndLoadIdentity(client, aid, slotId);
   await client.connect({
     auto_reconnect: false,
     heartbeat_interval: 30,
-    slot_id: slotId,
   });
 }
 
@@ -112,11 +111,10 @@ async function connectShort(
   aid: string,
   opts: { slot_id?: string; short_ttl_ms?: number } = {},
 ): Promise<void> {
-  await registerAndLoadIdentity(client, aid);
+  await registerAndLoadIdentity(client, aid, opts.slot_id ?? 'main');
   await client.connect({
     connection_kind: 'short',
     auto_reconnect: false,
-    slot_id: opts.slot_id ?? 'main',
     ...(opts.short_ttl_ms ? { short_ttl_ms: opts.short_ttl_ms } : {}),
   });
 }

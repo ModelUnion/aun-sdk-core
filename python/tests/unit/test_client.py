@@ -9,7 +9,7 @@ import pytest
 from aun_core import AIDStore, AUNClient, ConnectionState, ProtectedHeaders
 import aun_core.client as client_module
 from aun_core.client import _CachedPeerCert, _PEER_CERT_CACHE_TTL, _PEER_PREKEYS_CACHE_TTL
-from aun_core.errors import AUNError, ClientSignatureError, StateError, ValidationError
+from aun_core.errors import ClientSignatureError, StateError, ValidationError
 
 
 def _make_test_cert(cn: str) -> tuple[str, str]:
@@ -86,6 +86,26 @@ def _make_client_with_aid(aun_path, aid: str = "alice.agentid.pub", *, debug: bo
         return AUNClient(loaded.data["aid"])
     finally:
         store.close()
+
+
+def _make_store_with_aid(aun_path, aid: str = "alice.agentid.pub", *, access_token: str = "cached-token") -> AIDStore:
+    store = AIDStore(aun_path, encryption_seed="", verify_ssl=False)
+    store._keystore.save_identity(aid, _make_identity(aid))
+    if access_token:
+        store._token_store.save_instance_state(
+            aid,
+            store.device_id,
+            store.slot_id,
+            {
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+                "access_token_expires_at": time.time() + 3600,
+            },
+        )
+    store._resolve_gateway = lambda _aid: "ws://gateway.agentid.pub/aun"
+    loaded = store.load(aid)
+    assert loaded.ok, loaded.error
+    return store
 
 
 def test_peer_cert_cache_ttl_is_one_hour():
@@ -732,171 +752,114 @@ def test_authenticate_requires_loaded_identity():
         asyncio.run(client.authenticate())
 
 
-def test_upload_agent_md_uses_cached_access_token(monkeypatch, tmp_path):
-    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
-    client._identity = {"aid": "alice.agentid.pub", "access_token": "cached-token"}
+def test_aid_store_upload_agent_md_uses_cached_access_token(monkeypatch, tmp_path):
+    store = _make_store_with_aid(tmp_path / "aun", aid="alice.agentid.pub", access_token="cached-token")
 
-    async def _fake_discover(aid: str) -> str:
+    try:
+        class _FakeResponse:
+            status = 201
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self):
+                return {"aid": "alice.agentid.pub", "etag": '"etag"'}
+
+            async def text(self):
+                return ""
+
+        class _FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def put(self, url, *, data=None, headers=None, ssl=None):
+                assert url == "http://alice.agentid.pub/agent.md"
+                assert data.startswith(b"# Alice\n")
+                assert b"<!-- AUN-SIGNATURE" in data
+                assert headers["Authorization"] == "Bearer cached-token"
+                assert headers["Content-Type"] == "text/markdown; charset=utf-8"
+                return _FakeResponse()
+
+        import aun_core.agent_md as agent_md_module
+
+        monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
+
+        result = asyncio.run(store.upload_agent_md("alice.agentid.pub", "# Alice\n"))
+
+        assert result.ok, result.error
+        assert result.data["aid"] == "alice.agentid.pub"
+    finally:
+        store.close()
+
+
+def test_aid_store_upload_agent_md_falls_back_to_authenticate(monkeypatch, tmp_path):
+    store = _make_store_with_aid(tmp_path / "aun", aid="alice.agentid.pub", access_token="")
+
+    async def _fake_authenticate(self, gateway_url, aid=None):
+        assert gateway_url == "ws://gateway.agentid.pub/aun"
         assert aid == "alice.agentid.pub"
-        return "ws://gateway.agentid.pub/aun"
-
-    class _FakeResponse:
-        status = 201
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def json(self):
-            return {"aid": "alice.agentid.pub", "etag": '"etag"'}
-
-        async def text(self):
-            return ""
-
-    class _FakeSession:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        def put(self, url, *, data=None, headers=None, ssl=None):
-            assert url == "http://alice.agentid.pub/agent.md"
-            assert data.startswith(b"# Alice\n")
-            assert b"<!-- AUN-SIGNATURE" in data
-            assert headers["Authorization"] == "Bearer cached-token"
-            assert headers["Content-Type"] == "text/markdown; charset=utf-8"
-            return _FakeResponse()
-
-    import aun_core.agent_md as agent_md_module
-
-    client._agent_md_manager._gateway_resolver = _fake_discover
-    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
-
-    result = asyncio.run(client.upload_agent_md("# Alice\n"))
-
-    assert result["aid"] == "alice.agentid.pub"
-
-
-def test_upload_agent_md_falls_back_to_authenticate(monkeypatch, tmp_path):
-    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
-
-    async def _fake_discover(aid: str) -> str:
-        assert aid == "alice.agentid.pub"
-        return "ws://gateway.agentid.pub/aun"
-
-    async def _fake_authenticate(params=None):
-        assert params is None
         return {
             "aid": "alice.agentid.pub",
             "access_token": "fresh-token",
             "gateway": "ws://gateway.agentid.pub/aun",
         }
 
-    class _FakeResponse:
-        status = 200
+    try:
+        class _FakeResponse:
+            status = 200
 
-        async def __aenter__(self):
-            return self
+            async def __aenter__(self):
+                return self
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
 
-        async def json(self):
-            return {"aid": "alice.agentid.pub", "etag": '"etag-2"'}
+            async def json(self):
+                return {"aid": "alice.agentid.pub", "etag": '"etag-2"'}
 
-        async def text(self):
-            return ""
+            async def text(self):
+                return ""
 
-    class _FakeSession:
-        def __init__(self, *args, **kwargs):
-            pass
+        class _FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
 
-        async def __aenter__(self):
-            return self
+            async def __aenter__(self):
+                return self
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
 
-        def put(self, url, *, data=None, headers=None, ssl=None):
-            assert url == "http://alice.agentid.pub/agent.md"
-            assert headers["Authorization"] == "Bearer fresh-token"
-            return _FakeResponse()
+            def put(self, url, *, data=None, headers=None, ssl=None):
+                assert url == "http://alice.agentid.pub/agent.md"
+                assert headers["Authorization"] == "Bearer fresh-token"
+                return _FakeResponse()
 
-    client._agent_md_manager._gateway_resolver = _fake_discover
-    monkeypatch.setattr(client, "authenticate", _fake_authenticate)
-    client._agent_md_manager._authenticator = _fake_authenticate
-    import aun_core.agent_md as agent_md_module
+        import aun_core.aid_store as aid_store_module
+        import aun_core.agent_md as agent_md_module
 
-    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
+        monkeypatch.setattr(aid_store_module.AuthFlow, "authenticate", _fake_authenticate)
+        monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
 
-    result = asyncio.run(client.upload_agent_md("# Alice\n"))
+        result = asyncio.run(store.upload_agent_md("alice.agentid.pub", "# Alice\n"))
 
-    assert result["etag"] == '"etag-2"'
-
-
-def test_upload_agent_md_uses_session_params_access_token(monkeypatch, tmp_path):
-    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
-    client._session_params = {"access_token": "session-token"}
-
-    async def _fake_discover(aid: str) -> str:
-        assert aid == "alice.agentid.pub"
-        return "ws://gateway.agentid.pub/aun"
-
-    class _FakeResponse:
-        status = 200
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def json(self):
-            return {"aid": "alice.agentid.pub", "etag": '"etag-3"'}
-
-        async def text(self):
-            return ""
-
-    class _FakeSession:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        def put(self, url, *, data=None, headers=None, ssl=None):
-            assert url == "http://alice.agentid.pub/agent.md"
-            assert data.startswith(b"# Alice\n")
-            assert b"<!-- AUN-SIGNATURE" in data
-            assert headers["Authorization"] == "Bearer session-token"
-            return _FakeResponse()
-
-    import aun_core.agent_md as agent_md_module
-
-    client._agent_md_manager._gateway_resolver = _fake_discover
-    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
-
-    result = asyncio.run(client.upload_agent_md("# Alice\n"))
-
-    assert result["etag"] == '"etag-3"'
+        assert result.ok, result.error
+        assert result.data["etag"] == '"etag-2"'
+    finally:
+        store.close()
 
 
-def test_upload_agent_md_403_raises_aunerror(monkeypatch, tmp_path):
-    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
-    client._identity = {"aid": "alice.agentid.pub", "access_token": "cached-token"}
-
-    async def _fake_discover(aid: str) -> str:
-        assert aid == "alice.agentid.pub"
-        return "ws://gateway.agentid.pub/aun"
+def test_aid_store_upload_agent_md_403_returns_error(monkeypatch, tmp_path):
+    store = _make_store_with_aid(tmp_path / "aun", aid="alice.agentid.pub", access_token="cached-token")
 
     class _FakeResponse:
         status = 403
@@ -930,11 +893,17 @@ def test_upload_agent_md_403_raises_aunerror(monkeypatch, tmp_path):
 
     import aun_core.agent_md as agent_md_module
 
-    client._agent_md_manager._gateway_resolver = _fake_discover
-    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
+    try:
+        monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
 
-    with pytest.raises(AUNError, match="upload agent.md failed: HTTP 403 - forbidden"):
-        asyncio.run(client.upload_agent_md("# Alice\n"))
+        result = asyncio.run(store.upload_agent_md("alice.agentid.pub", "# Alice\n"))
+
+        assert not result.ok
+        assert result.error is not None
+        assert result.error.code == "NETWORK_ERROR"
+        assert "upload agent.md failed: HTTP 403 - forbidden" in result.error.message
+    finally:
+        store.close()
 
 
 def test_call_not_connected():

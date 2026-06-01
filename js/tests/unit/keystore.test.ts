@@ -312,6 +312,51 @@ describe('IndexedDB split stores', () => {
     expect(await readStoreRecord('pending_identities', handle)).toEqual(before);
   });
 
+  it('promotePendingIdentity 应允许目标仅存在 gateway_url metadata 并保留 metadata', async () => {
+    if (!hasSubtleCrypto) return;
+    const aid = 'pending-metadata-only.test';
+    const seeded = new TestIndexedDBStore({ encryptionSeed: 'promote-seed' });
+
+    await seeded.setMetadata(aid, 'gateway_url', 'ws://gateway.agentid.pub/aun');
+    const handle = await seeded.pendingIdentityDir(aid);
+    await seeded.savePendingKeyPair(handle, aid, {
+      private_key_pem: 'PENDING_METADATA_PRIVATE',
+      public_key_der_b64: 'pub',
+      curve: 'P-256',
+    });
+    await seeded.savePendingCert(handle, 'PENDING_METADATA_CERT');
+
+    await expect(seeded.promotePendingIdentity(handle, aid)).resolves.toBe(aid);
+
+    const loadedKey = await seeded.loadKeyPair(aid);
+    expect(loadedKey?.private_key_pem).toBe('PENDING_METADATA_PRIVATE');
+    expect(await seeded.loadCert(aid)).toBe('PENDING_METADATA_CERT');
+    expect(await seeded.getMetadata(aid, 'gateway_url')).toBe('ws://gateway.agentid.pub/aun');
+    expect(await seeded.listPendingIdentityDirs(aid)).toEqual([]);
+  });
+
+  it('promotePendingIdentity 应在目标已有 keypair 时继续拒绝覆盖', async () => {
+    if (!hasSubtleCrypto) return;
+    const aid = 'pending-existing-key.test';
+    const seeded = new TestIndexedDBStore({ encryptionSeed: 'promote-conflict-seed' });
+
+    await seeded.setMetadata(aid, 'gateway_url', 'ws://gateway.agentid.pub/aun');
+    await seeded.saveKeyPair(aid, {
+      private_key_pem: 'EXISTING_PRIVATE',
+      public_key_der_b64: 'existing-pub',
+      curve: 'P-256',
+    });
+    const handle = await seeded.pendingIdentityDir(aid);
+    await seeded.savePendingKeyPair(handle, aid, {
+      private_key_pem: 'PENDING_PRIVATE',
+      public_key_der_b64: 'pending-pub',
+      curve: 'P-256',
+    });
+
+    await expect(seeded.promotePendingIdentity(handle, aid)).rejects.toThrow(/target exists/);
+    expect((await seeded.loadKeyPair(aid))?.private_key_pem).toBe('EXISTING_PRIVATE');
+  });
+
   // ── 证书 CRUD ──────────────────────────────────────
 
   it('保存和加载证书 PEM', async () => {

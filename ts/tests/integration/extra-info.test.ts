@@ -56,19 +56,18 @@ async function connectLongWithExtraInfo(
 ): Promise<void> {
   if (options.registerAid !== false) {
     try {
-      await registerAndLoadIdentity(client, aid);
+      await registerAndLoadIdentity(client, aid, options.slotId);
     } catch (err) {
       const msg = String(err);
       if (!/exists|already/i.test(msg)) throw err;
     }
   } else if (!(client as any)._currentAid) {
-    loadIdentityFromStore(client, aid);
+    loadIdentityFromStore(client, aid, options.slotId);
   }
   const opts: Record<string, unknown> = {
     auto_reconnect: false,
     heartbeat_interval: 30,
   };
-  if (options.slotId !== undefined) opts.slot_id = options.slotId;
   if (options.extraInfo !== undefined) opts.extra_info = options.extraInfo;
   await client.connect(opts);
 }

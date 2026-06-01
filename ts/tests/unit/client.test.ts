@@ -3435,10 +3435,9 @@ describe('AUNClient agent.md ETag 缓存', () => {
   const readAgentRecord = (client: AUNClient, aid: string): any =>
     JSON.parse(readFileSync(join(agentRoot(client), aid, 'agentmd.json'), 'utf-8'));
 
-  it('仅保留 uploadAgentMd 公开入口，旧 agent.md client 入口已移除', () => {
+  it('agent.md client 上传入口已移除', () => {
     const client = new AUNClient();
-    expect(typeof client.uploadAgentMd).toBe('function');
-    for (const name of ['publishAgentMd', 'fetchAgentMd', 'checkAgentMd', 'getLocalAgentMdEtag', 'getRemoteAgentMdEtag']) {
+    for (const name of ['uploadAgentMd', 'publishAgentMd', 'fetchAgentMd', 'checkAgentMd', 'getLocalAgentMdEtag', 'getRemoteAgentMdEtag']) {
       expect((client as any)[name]).toBeUndefined();
     }
   });

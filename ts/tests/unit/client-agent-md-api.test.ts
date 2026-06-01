@@ -7,9 +7,11 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 
 import { AID } from '../../src/aid.js';
+import { AIDStore } from '../../src/aid-store.js';
 import { AgentMdManager } from '../../src/agent-md.js';
 import { AUNClient } from '../../src/client.js';
-import { ValidationError } from '../../src/errors.js';
+import { resultOk } from '../../src/result.js';
+import { buildIdentity, generateECKeypair } from './helpers.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -46,6 +48,18 @@ function makePeer(aid: string): AID {
   return item;
 }
 
+function makePrivateAid(aid: string, aunPath: string): AID {
+  const identity = buildIdentity(aid, generateECKeypair().privateKey);
+  return AID._create({
+    aid,
+    aunPath,
+    certPem: String(identity.cert ?? ''),
+    privateKeyPem: String(identity.private_key_pem ?? ''),
+    certValid: true,
+    privateKeyValid: true,
+  });
+}
+
 function makeClient(aunPath = mkdtempSync(join(tmpdir(), 'aun-client-agent-md-'))): AUNClient {
   return new AUNClient(makeMockAid(aunPath));
 }
@@ -56,12 +70,6 @@ function manager(client: AUNClient): AgentMdManager {
 
 function readRecord(root: string, aid: string): any {
   return JSON.parse(readFileSync(join(root, aid, 'agentmd.json'), 'utf-8'));
-}
-
-async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString('utf-8');
 }
 
 async function withServer<T>(
@@ -92,48 +100,59 @@ describe('client AIDs agent.md 文件存储', () => {
   });
 
   it('uploadAgentMd 无本地 AID 时拒绝', async () => {
-    const client = makeClient();
-    await expect(client.uploadAgentMd()).rejects.toBeInstanceOf(ValidationError);
-    (client as any)._tokenStore?.close?.();
+    const store = new AIDStore({ aunPath: mkdtempSync(join(tmpdir(), 'aun-store-agent-md-empty-')), encryptionSeed: '', verifySsl: false });
+    const result = await store.uploadAgentMd('');
+    expect(result.ok).toBe(false);
+    expect((result as any).error.code).toBe('INVALID_AID_FORMAT');
+    store.close();
   });
 
   it('uploadAgentMd 签名上传后写回 agent.md 与 agentmd.json', async () => {
-    await withServer(async (req, res) => {
-      expect(req.method).toBe('PUT');
-      expect(req.url).toBe('/agent.md');
-      expect(req.headers.authorization).toBe('Bearer cached-token');
-      const body = await readBody(req);
-      expect(body).toContain('AUN-SIGNATURE');
-      res.writeHead(201, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ aid: '127.0.0.1', etag: etag(body), last_modified: 'Sun, 24 May 2026 00:00:00 GMT' }));
-    }, async (port) => {
-      const client = makeClient();
-      const mgr = manager(client);
-      (mgr as any)._discoveryPort = port;
-      (client as any)._gatewayUrl = 'ws://gateway.agentid.pub/aun';
-      (client as any)._aid = '127.0.0.1';
-      (client as any)._identity = {
-        aid: '127.0.0.1',
-        access_token: 'cached-token',
-        access_token_expires_at: Date.now() / 1000 + 3600,
-      };
-      (client as any)._currentAid = {
-        aid: '127.0.0.1',
-        isPrivateKeyValid: () => true,
-        signAgentMd: vi.fn((content: string) => ({ ok: true, data: { signed: `${content}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n` } })),
-      };
-
-      const result = await client.uploadAgentMd('---\naid: 127.0.0.1\n---\n# Local\n');
-
-      const saved = readFileSync(join(mgr.root, '127.0.0.1', 'agent.md'), 'utf-8');
-      const record = readRecord(mgr.root, '127.0.0.1');
-      expect(result.aid).toBe('127.0.0.1');
-      expect(record.content).toBeUndefined();
-      expect(record.local_etag).toBe(etag(saved));
-      expect(record.remote_etag).toBe(etag(saved));
-      expect(record.last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
-      (client as any)._tokenStore?.close?.();
+    const store = new AIDStore({ aunPath: mkdtempSync(join(tmpdir(), 'aun-store-agent-md-upload-')), encryptionSeed: '', verifySsl: false });
+    const mgr = (store as any)._agentMdManager as AgentMdManager;
+    const aid = 'alice.agentid.pub';
+    (store as any)._resolveGateway = async () => 'ws://gateway.agentid.pub/aun';
+    (store as any)._tokenStore.saveInstanceState(aid, store.deviceId, store.slotId, {
+      access_token: 'cached-token',
+      refresh_token: 'refresh-token',
+      access_token_expires_at: Date.now() / 1000 + 3600,
     });
+    (store as any).load = () => resultOk({ aid: makePrivateAid(aid, store.aunPath) });
+    vi.spyOn(AgentMdManager.prototype, 'upload').mockImplementation(async function (this: AgentMdManager, content?: string | null) {
+      const self = this as any;
+      const target = String(self._ownerAidGetter?.() ?? '');
+      const gatewayUrl = await self._resolveGateway(target);
+      const token = await self._accessToken(target, gatewayUrl);
+      expect(token).toBe('cached-token');
+      const current = self._currentAidGetter();
+      const signed = current.signAgentMd(String(content ?? '')).data.signed;
+      this.saveRecord(target, {
+        content: signed,
+        local_etag: etag(signed),
+        remote_etag: etag(signed),
+        last_modified: 'Sun, 24 May 2026 00:00:00 GMT',
+      });
+      return { aid: target, etag: etag(signed), last_modified: 'Sun, 24 May 2026 00:00:00 GMT' };
+    });
+
+    const result = await store.uploadAgentMd(aid, '---\naid: alice.agentid.pub\n---\n# Local\n');
+
+    expect(result.ok).toBe(true);
+    const data = (result as any).data;
+    const saved = readFileSync(join(mgr.root, aid, 'agent.md'), 'utf-8');
+    const record = readRecord(mgr.root, aid);
+    expect(data.aid).toBe(aid);
+    expect(record.content).toBeUndefined();
+    expect(record.local_etag).toBe(etag(saved));
+    expect(record.remote_etag).toBe(etag(saved));
+    expect(record.last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
+    store.close();
+  });
+
+  it('AUNClient 不再暴露 uploadAgentMd', () => {
+    const client = makeClient();
+    expect((client as any).uploadAgentMd).toBeUndefined();
+    (client as any)._tokenStore?.close?.();
   });
 
   it('downloadAgentMd 由 AgentMdManager 下载、验签并持久化', async () => {
@@ -261,7 +280,7 @@ describe('client AIDs agent.md 文件存储', () => {
     ]) {
       expect((client as any)[name]).toBeUndefined();
     }
-    expect(typeof client.uploadAgentMd).toBe('function');
+    expect((client as any).uploadAgentMd).toBeUndefined();
     (client as any)._tokenStore?.close?.();
   });
 

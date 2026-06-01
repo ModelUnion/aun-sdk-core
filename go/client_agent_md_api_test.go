@@ -1,4 +1,4 @@
-// Package aun: AUNClient agent.md 运行时内部逻辑与 UploadAgentMD 单测。
+// Package aun: AUNClient agent.md 运行时内部逻辑与上传单测。
 package aun
 
 import (
@@ -234,14 +234,14 @@ func TestAgentMDPathDefaultAndSet(t *testing.T) {
 
 func TestUploadAgentMDWithoutAidErrors(t *testing.T) {
 	c := newClientForTest(t, "")
-	if _, err := c.UploadAgentMD(context.Background()); err == nil {
+	if _, err := c.agentMD().Upload(context.Background()); err == nil {
 		t.Fatal("expected error without local aid")
 	}
 }
 
 func TestUploadAgentMDMissingDefaultFile(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	if _, err := c.UploadAgentMD(context.Background()); err == nil {
+	if _, err := c.agentMD().Upload(context.Background()); err == nil {
 		t.Fatal("expected error for missing default agent.md")
 	}
 }
@@ -263,7 +263,7 @@ func TestUploadAgentMDSignsUploadsAndPersistsFileList(t *testing.T) {
 		},
 	}
 
-	res, err := c.UploadAgentMD(context.Background())
+	res, err := c.agentMD().Upload(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestUploadAgentMDUploadErrorPropagates(t *testing.T) {
 		},
 		uploadFn: func(_ context.Context, _ string) (map[string]any, error) { return nil, errors.New("boom") },
 	}
-	if _, err := c.UploadAgentMD(context.Background()); err == nil {
+	if _, err := c.agentMD().Upload(context.Background()); err == nil {
 		t.Fatal("expected error to propagate from upload")
 	}
 }

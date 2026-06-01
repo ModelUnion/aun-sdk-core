@@ -1,8 +1,8 @@
-"""client agent.md 文件型本地存储单测。
+"""agent.md 文件型本地存储单测。
 
 覆盖：
 - 默认 {aun_path}/AIDs
-- upload_agent_md(content?) 负责签名、上传并持久化
+- AIDStore.upload_agent_md(aid, content?) 负责签名、上传并持久化
 - RPC/envelope 观察到的远端 etag 落盘到 agentmd.json
 - {aid}/agentmd.json 只保存元数据，不保存正文
 - {aid}/agentmd.json 损坏时从同目录 agent.md 重建
@@ -13,9 +13,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from pathlib import Path
-
-import pytest
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -23,7 +22,6 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from aun_core import AIDStore, AUNClient
-from aun_core.errors import ValidationError
 from aun_core.events import EventDispatcher
 from aun_core.transport import RPCTransport
 
@@ -82,15 +80,34 @@ def _make_client(tmp_path: Path, aid: str = "alice.agentid.pub") -> AUNClient:
         store.close()
 
 
-def _write_local_agent_md(client: AUNClient, aid: str, content: str) -> Path:
-    path = client._agent_md_manager.file_path(aid)
+def _make_store(tmp_path: Path, aid: str = "alice.agentid.pub") -> AIDStore:
+    store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
+    store._keystore.save_identity(aid, _make_identity(aid))
+    store._token_store.save_instance_state(
+        aid,
+        store.device_id,
+        store.slot_id,
+        {
+            "access_token": "token",
+            "refresh_token": "refresh",
+            "access_token_expires_at": time.time() + 3600,
+        },
+    )
+    store._resolve_gateway = lambda _aid: "ws://gateway.agentid.pub/aun"
+    loaded = store.load(aid)
+    assert loaded.ok, loaded.error
+    return store
+
+
+def _write_local_agent_md(holder, aid: str, content: str) -> Path:
+    path = holder._agent_md_manager.file_path(aid)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
 
 
-def _read_record(client: AUNClient, aid: str) -> dict:
-    return json.loads(client._agent_md_manager.meta_path(aid).read_text(encoding="utf-8"))
+def _read_record(holder, aid: str) -> dict:
+    return json.loads(holder._agent_md_manager.meta_path(aid).read_text(encoding="utf-8"))
 
 
 class _FakePutResponse:
@@ -139,63 +156,74 @@ def _patch_put(monkeypatch, captured: dict[str, object], etag: str = '"cloud"') 
 def test_agent_md_path_defaults_to_aids(tmp_path: Path):
     client = _make_client(tmp_path)
     assert client._agent_md_manager.root == tmp_path / "aun" / "AIDs"
+    assert not hasattr(client, "upload_agent_md")
     client._token_store.close()
 
 
-def test_upload_agent_md_without_aid_raises(tmp_path: Path):
-    client = AUNClient()
-    with pytest.raises(ValidationError):
-        asyncio.run(client.upload_agent_md())
-    client._token_store.close()
+def test_upload_agent_md_without_aid_returns_error(tmp_path: Path):
+    store = AIDStore(tmp_path / "aun", encryption_seed="", verify_ssl=False)
+    try:
+        result = asyncio.run(store.upload_agent_md(""))
+        assert not result.ok
+        assert result.error is not None
+        assert result.error.code == "INVALID_AID_FORMAT"
+    finally:
+        store.close()
 
 
-def test_upload_agent_md_missing_default_file_raises(tmp_path: Path):
-    client = _make_client(tmp_path)
-    with pytest.raises(FileNotFoundError):
-        asyncio.run(client.upload_agent_md())
-    client._token_store.close()
+def test_upload_agent_md_missing_default_file_returns_error(tmp_path: Path):
+    store = _make_store(tmp_path)
+    try:
+        result = asyncio.run(store.upload_agent_md("alice.agentid.pub"))
+        assert not result.ok
+        assert result.error is not None
+        assert result.error.code == "NETWORK_ERROR"
+    finally:
+        store.close()
 
 
 def test_upload_agent_md_reads_default_file_uploads_and_persists(monkeypatch, tmp_path: Path):
-    client = _make_client(tmp_path)
+    store = _make_store(tmp_path)
     unsigned = "---\naid: alice.agentid.pub\n---\n# Alice\n"
-    _write_local_agent_md(client, "alice.agentid.pub", unsigned)
+    _write_local_agent_md(store, "alice.agentid.pub", unsigned)
     captured: dict[str, object] = {}
     _patch_put(monkeypatch, captured, '"alice-cloud"')
 
-    result = asyncio.run(client.upload_agent_md())
+    result = asyncio.run(store.upload_agent_md("alice.agentid.pub"))
+    assert result.ok, result.error
 
     uploaded = bytes(captured["data"]).decode("utf-8")
-    assert result["etag"] == '"alice-cloud"'
+    assert result.data["etag"] == '"alice-cloud"'
     assert captured["url"] == "http://alice.agentid.pub/agent.md"
     assert captured["headers"]["Authorization"] == "Bearer token"
     assert uploaded.startswith(unsigned)
     assert "<!-- AUN-SIGNATURE" in uploaded
-    signed_path = client._agent_md_manager.file_path("alice.agentid.pub")
+    signed_path = store._agent_md_manager.file_path("alice.agentid.pub")
     assert signed_path.read_text(encoding="utf-8") == uploaded
-    rec = _read_record(client, "alice.agentid.pub")
+    rec = _read_record(store, "alice.agentid.pub")
     assert "content" not in rec
     assert rec["local_etag"] == _etag(uploaded)
     assert rec["remote_etag"] == '"alice-cloud"'
-    client._token_store.close()
+    store.close()
 
 
 def test_upload_agent_md_accepts_content_uploads_and_persists(monkeypatch, tmp_path: Path):
-    client = _make_client(tmp_path)
+    store = _make_store(tmp_path)
     unsigned = "---\naid: alice.agentid.pub\n---\n# Alice From Memory\n"
     captured: dict[str, object] = {}
     _patch_put(monkeypatch, captured, '"alice-memory"')
 
-    result = asyncio.run(client.upload_agent_md(unsigned))
+    result = asyncio.run(store.upload_agent_md("alice.agentid.pub", unsigned))
+    assert result.ok, result.error
 
     uploaded = bytes(captured["data"]).decode("utf-8")
-    assert result["etag"] == '"alice-memory"'
+    assert result.data["etag"] == '"alice-memory"'
     assert uploaded.startswith(unsigned)
     assert "<!-- AUN-SIGNATURE" in uploaded
-    rec = _read_record(client, "alice.agentid.pub")
+    rec = _read_record(store, "alice.agentid.pub")
     assert rec["local_etag"] == _etag(uploaded)
     assert rec["remote_etag"] == '"alice-memory"'
-    client._token_store.close()
+    store.close()
 
 
 def test_observe_rpc_meta_persists_structured_meta_and_downloads_missing_local(monkeypatch, tmp_path: Path):

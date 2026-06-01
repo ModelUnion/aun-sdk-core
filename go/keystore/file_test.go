@@ -208,6 +208,54 @@ func TestInitSchema_OldVersion_TriggersUpgrade(t *testing.T) {
 	}
 }
 
+func TestInitSchema_LegacyTablesWithoutVersionGetSlotIDFullColumns(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "legacy-no-version.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE instance_state (
+		device_id TEXT NOT NULL,
+		slot_id TEXT NOT NULL DEFAULT '_singleton',
+		data TEXT NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (device_id, slot_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE seq_tracker (
+		device_id TEXT NOT NULL,
+		slot_id TEXT NOT NULL DEFAULT '_singleton',
+		namespace TEXT NOT NULL,
+		contiguous_seq INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (device_id, slot_id, namespace)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adb, err := newAIDDatabase(dbPath, "")
+	if err != nil {
+		t.Fatalf("打开旧 schema DB 失败: %v", err)
+	}
+	defer adb.close()
+
+	adb.SaveInstanceState("device-1", "slot-a", map[string]any{"access_token": "token-a"})
+	state := adb.LoadInstanceState("device-1", "slot-a")
+	if state["access_token"] != "token-a" {
+		t.Fatalf("旧 schema 迁移后应可写入 instance_state，实际: %#v", state)
+	}
+	adb.SaveSeq("device-1", "slot-a", "inbox", 7)
+	if got := adb.LoadSeq("device-1", "slot-a", "inbox"); got != 7 {
+		t.Fatalf("旧 schema 迁移后应可写入 seq_tracker，got=%d", got)
+	}
+}
+
 func TestInitSchema_SameVersion_NoOp(t *testing.T) {
 	// 版本相同时不应出错
 	dir := t.TempDir()
@@ -527,5 +575,80 @@ func TestLoadPendingKeyPairMigratesPlaintextAndWrongSeedPreservesPending(t *test
 	}
 	if string(after) != string(before) {
 		t.Fatal("错误 seed 不应修改 pending key.json")
+	}
+}
+
+func TestPromotePendingIdentityAfterPendingKeyAndCertSaved(t *testing.T) {
+	dir := t.TempDir()
+	aid := "pending-promote.agentid.pub"
+	ks, err := NewLocalIdentityStore(dir, nil, "pending-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ks.Close()
+
+	pendingDir, err := ks.PendingIdentityDir(aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.SavePendingKeyPair(pendingDir, aid, map[string]any{
+		"private_key_pem":    "PENDING_PRIVATE",
+		"public_key_der_b64": "PENDING_PUBLIC",
+		"curve":              "P-256",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.SavePendingCert(pendingDir, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := ks.PromotePendingIdentity(pendingDir, aid)
+	if err != nil {
+		t.Fatalf("PromotePendingIdentity failed: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("promoted identity dir missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AIDs", "_pending")); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("stat pending root failed: %v", err)
+	}
+}
+
+func TestPromotePendingIdentityPreservesPreexistingMetadataDB(t *testing.T) {
+	dir := t.TempDir()
+	aid := "pending-metadata.agentid.pub"
+	ks, err := NewLocalIdentityStore(dir, nil, "pending-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ks.Close()
+
+	if err := ks.SetMetadataValue(aid, "gateway_url", "wss://gateway.agentid.pub/aun"); err != nil {
+		t.Fatal(err)
+	}
+	pendingDir, err := ks.PendingIdentityDir(aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.SavePendingKeyPair(pendingDir, aid, map[string]any{
+		"private_key_pem":    "PENDING_PRIVATE",
+		"public_key_der_b64": "PENDING_PUBLIC",
+		"curve":              "P-256",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.SavePendingCert(pendingDir, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := ks.PromotePendingIdentity(pendingDir, aid)
+	if err != nil {
+		t.Fatalf("PromotePendingIdentity should merge into metadata-only dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "private", "key.json")); err != nil {
+		t.Fatalf("promoted key missing: %v", err)
+	}
+	if got := ks.GetMetadataValue(aid, "gateway_url"); got != "wss://gateway.agentid.pub/aun" {
+		t.Fatalf("gateway_url metadata lost: %q", got)
 	}
 }

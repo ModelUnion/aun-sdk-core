@@ -6,6 +6,19 @@
 
 ---
 
+## 0.4.7 — 2026-06-01
+
+### Added
+- **`AIDStore.uploadAgentMd(aid, content?)`**：将 `uploadAgentMd` 从 `AUNClient` 迁移到 `AIDStore`，支持指定任意本地 AID 上传 agent.md；内部独立创建 `IndexedDBTokenStore` 和 `AuthFlow` 完成认证，不依赖 `AUNClient` 实例。
+- **`UploadAgentMdResult` 类型**：新增上传结果类型导出。
+
+### Changed
+- **`AUNClient.uploadAgentMd()`**：移除，功能迁移至 `AIDStore.uploadAgentMd(aid)`。
+- **`AIDStore`**：新增内部 `_tokenStore`（`IndexedDBTokenStore`）和 `_crypto`（`CryptoProvider`）字段，供 upload 认证流程使用；`connect()` 时同步初始化，`close()` 时释放。
+- **`AIDStore._hasLocalAidMaterial()`**：新增私有方法，通过检查证书或密钥对判断 AID 是否有本地身份材料，用于 `connect()` 前置校验。
+
+---
+
 ## 0.4.6 — 2026-06-01
 
 ### Added

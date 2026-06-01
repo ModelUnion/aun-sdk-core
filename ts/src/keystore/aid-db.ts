@@ -162,18 +162,30 @@ export class AIDDatabase {
 
   private _initSchema(): void {
     for (const ddl of DDL_STATEMENTS) this._db.exec(ddl);
+    this._ensureSlotIdFullColumns();
     const row = this._db.prepare('SELECT version FROM _schema_version WHERE id = 1').get() as { version: number } | undefined;
     if (!row) {
       this._db.prepare('INSERT INTO _schema_version (id, version) VALUES (1, ?)').run(SCHEMA_VERSION);
     } else if (row.version < SCHEMA_VERSION) {
       if (row.version < 2) {
-        this._db.exec("ALTER TABLE instance_state ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''");
-        this._db.exec("ALTER TABLE seq_tracker ADD COLUMN slot_id_full TEXT NOT NULL DEFAULT ''");
+        this._ensureSlotIdFullColumns();
       }
       if (row.version < 3) {
         this._db.exec('DROP TABLE IF EXISTS agent_md_cache');
       }
       this._db.prepare('UPDATE _schema_version SET version = ? WHERE id = 1').run(SCHEMA_VERSION);
+    }
+  }
+
+  private _ensureSlotIdFullColumns(): void {
+    this._addColumnIfMissing('instance_state', 'slot_id_full', "TEXT NOT NULL DEFAULT ''");
+    this._addColumnIfMissing('seq_tracker', 'slot_id_full', "TEXT NOT NULL DEFAULT ''");
+  }
+
+  private _addColumnIfMissing(table: string, column: string, definition: string): void {
+    const rows = this._db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (rows.length > 0 && !rows.some((row) => row.name === column)) {
+      this._db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
   }
 

@@ -19,13 +19,15 @@ from cryptography.hazmat.primitives import serialization
 from . import error_codes as codes
 from ._cert_utils import cert_common_name, cert_time_error, public_key_der, sign_bytes, verify_signature
 from .agent_md import AgentMdManager
+from .auth import AuthFlow
 from .register_flow import RegisterFlow
 from .aid import AID
 from .config import normalize_device_id, normalize_slot_id, resolve_verify_ssl_from_env
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
-from .errors import AUNError, ConnectionError, IdentityConflictError, NotFoundError, ValidationError
+from .errors import AUNError, ClientSignatureError, ConnectionError, IdentityConflictError, NotFoundError, StateError, ValidationError
 from .keystore.local_identity_store import LocalIdentityStore
+from .keystore.local_token_store import LocalTokenStore
 from .logger import AUNLogger, NullLogger
 from .net import DnsResilientNet
 from .result import Result, result_err, result_ok
@@ -52,6 +54,13 @@ class CheckAgentMdResult(TypedDict):
     remote_etag: str
     needs_update: bool
     ttl_days: int
+
+
+class UploadAgentMdResult(TypedDict, total=False):
+    aid: str
+    etag: str
+    last_modified: str
+    agent_md_url: str
 
 
 class DiagnoseResult(TypedDict):
@@ -119,6 +128,10 @@ class AIDStore:
             encryption_seed=self.encryption_seed,
             logger=self._log,
         )
+        self._token_store = LocalTokenStore(
+            self.aun_path,
+            logger=self._log,
+        )
         self._net = DnsResilientNet(
             self.aun_path,
             verify_ssl=self._verify_ssl,
@@ -165,6 +178,7 @@ class AIDStore:
 
     def close(self) -> None:
         self._keystore.close()
+        self._token_store.close()
         self._net.close()
 
     def load(self, aid: str) -> Result[dict[str, AID]]:
@@ -418,6 +432,78 @@ class AIDStore:
             return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
         except Exception as exc:
             self._log.debug("aid_store", "check_agent_md exit (error): aid=%s err=%s", target, exc)
+            return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
+
+    def _auth_identity_from_aid(self, aid: AID) -> dict[str, Any]:
+        return {
+            "aid": aid.aid,
+            "private_key_pem": aid.private_key_pem,
+            "public_key_der_b64": aid.public_key,
+            "cert": aid.cert_pem,
+        }
+
+    async def _upload_agent_md_token(self, aid: AID, gateway_url: str) -> str:
+        auth = AuthFlow(
+            token_store=self._token_store,
+            crypto=CryptoProvider(),
+            aid=aid.aid,
+            device_id=self.device_id,
+            slot_id=self.slot_id,
+            root_ca_path=self._root_ca_path,
+            verify_ssl=self._verify_ssl,
+            logger=self._log,
+            net=self._net,
+        )
+        auth.set_identity(self._auth_identity_from_aid(aid))
+        result = await auth.authenticate(gateway_url, aid=aid.aid)
+        token = str(result.get("access_token") or result.get("token") or result.get("kite_token") or "").strip()
+        if not token:
+            raise StateError("authenticate did not return access_token")
+        return token
+
+    async def upload_agent_md(self, aid: str, content: str | None = None) -> Result[UploadAgentMdResult]:
+        target = str(aid or "").strip()
+        self._log.debug("aid_store", "upload_agent_md enter: aid=%s", target or "-")
+        try:
+            self._register_flow.validate_aid_name(target)
+            loaded = self.load(target)
+            if not loaded.ok or loaded.data is None:
+                return result_err(
+                    loaded.error.code if loaded.error else codes.CERT_NOT_FOUND,
+                    loaded.error.message if loaded.error else f"certificate not found for aid: {target}",
+                    cause=loaded.error.cause if loaded.error else None,
+                )
+            current = loaded.data["aid"]
+            if not current.is_private_key_valid() or not current.private_key_pem:
+                return result_err(codes.PRIVATE_KEY_NOT_VALID, f"upload_agent_md requires local AID with a valid private key: {target}")
+
+            async def token_provider() -> str:
+                gateway_url = await self._resolved_gateway(target)
+                return await self._upload_agent_md_token(current, gateway_url)
+
+            manager = AgentMdManager(
+                self.aun_path,
+                verify_ssl=self._verify_ssl,
+                logger=self._log,
+                owner_aid_getter=lambda: target,
+                current_aid_getter=lambda: current,
+                gateway_resolver=lambda value: self._resolved_gateway(value),
+                token_provider=token_provider,
+                aid_validator=self._register_flow.validate_aid_name,
+            )
+            data = await manager.upload(content)
+            self._log.debug("aid_store", "upload_agent_md exit: aid=%s", target)
+            return result_ok(data)
+        except NotFoundError as exc:
+            return result_err(codes.AGENTMD_NOT_FOUND, str(exc), cause=exc)
+        except ClientSignatureError as exc:
+            return result_err(codes.SIGNATURE_OPERATION_ERROR, str(exc), cause=exc)
+        except (ValidationError, ValueError) as exc:
+            return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
+        except StateError as exc:
+            return result_err(codes.PRIVATE_KEY_NOT_VALID, str(exc), cause=exc)
+        except Exception as exc:
+            self._log.debug("aid_store", "upload_agent_md exit (error): aid=%s err=%s", target, exc)
             return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
     async def diagnose(self, aid: str) -> Result[DiagnoseResult]:

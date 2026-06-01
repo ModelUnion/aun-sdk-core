@@ -4,6 +4,7 @@
 
 import { execFile } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -16,6 +17,15 @@ import { LocalIdentityStore } from '../../src/keystore/local-identity-store.js';
 import { LocalTokenStore } from '../../src/keystore/local-token-store.js';
 
 const execFileAsync = promisify(execFile);
+const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+  DatabaseSync: new (path: string) => {
+    exec(sql: string): void;
+    prepare(sql: string): {
+      all(...params: unknown[]): unknown[];
+    };
+    close(): void;
+  };
+};
 
 type KeystoreWorkerPayload = {
   root: string;
@@ -488,6 +498,53 @@ describe('LocalIdentityStore', () => {
     expect(loaded!.access_token).toBe('secret-token-123');
     expect(loaded!.refresh_token).toBe('refresh-token-456');
     ks.close();
+  });
+
+  it('旧 instance_state/seq_tracker schema 无版本记录时应自动补 slot_id_full 列', () => {
+    const aid = 'legacy-slot-schema.agentid.pub';
+    const aidDir = join(tmpDir, 'AIDs', aid);
+    mkdirSync(aidDir, { recursive: true });
+    const dbPath = join(aidDir, 'aun.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`CREATE TABLE instance_state (
+        device_id TEXT NOT NULL,
+        slot_id TEXT NOT NULL DEFAULT '_singleton',
+        data TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (device_id, slot_id)
+      )`);
+      db.exec(`CREATE TABLE seq_tracker (
+        device_id TEXT NOT NULL,
+        slot_id TEXT NOT NULL DEFAULT '_singleton',
+        namespace TEXT NOT NULL,
+        contiguous_seq INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (device_id, slot_id, namespace)
+      )`);
+    } finally {
+      db.close();
+    }
+
+    const ks = new LocalTokenStore(tmpDir);
+    try {
+      ks.saveInstanceState(aid, 'device-1', 'slot-a', { access_token: 'token-a' });
+      expect(ks.loadInstanceState(aid, 'device-1', 'slot-a')!.access_token).toBe('token-a');
+      ks.saveSeq(aid, 'device-1', 'slot-a', 'inbox', 7);
+      expect(ks.loadSeq(aid, 'device-1', 'slot-a', 'inbox')).toBe(7);
+    } finally {
+      ks.close();
+    }
+
+    const verify = new DatabaseSync(dbPath);
+    try {
+      const instanceColumns = new Set((verify.prepare('PRAGMA table_info(instance_state)').all() as Array<{ name: string }>).map((row) => row.name));
+      const seqColumns = new Set((verify.prepare('PRAGMA table_info(seq_tracker)').all() as Array<{ name: string }>).map((row) => row.name));
+      expect(instanceColumns.has('slot_id_full')).toBe(true);
+      expect(seqColumns.has('slot_id_full')).toBe(true);
+    } finally {
+      verify.close();
+    }
   });
 
   it('loadKeyPair 不存在的 AID 返回 null', () => {

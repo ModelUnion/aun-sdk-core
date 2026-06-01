@@ -145,6 +145,26 @@ func TestCallOnClosedTransportReturnsError(t *testing.T) {
 		t.Fatalf("应返回 ConnectionError，实际: %T", err)
 	}
 }
+
+func TestCallOnClosedTransportIncludesLastCloseCode(t *testing.T) {
+	dispatcher := NewEventDispatcher()
+	tr := NewRPCTransport(dispatcher, 5*time.Second, nil, false)
+
+	tr.closedMu.Lock()
+	tr.closed = true
+	tr.lastCloseCode = 4013
+	tr.lastCloseErr = websocket.CloseError{Code: 4013, Reason: "short_connection_capacity_exceeded"}
+	tr.closedMu.Unlock()
+
+	_, err := tr.Call(context.Background(), "auth.connect", map[string]any{})
+	if err == nil {
+		t.Fatal("关闭后的 transport 调用应返回错误")
+	}
+	if !strings.Contains(err.Error(), "4013") {
+		t.Fatalf("错误信息应包含最近一次 close code，实际: %v", err)
+	}
+}
+
 func TestSetTimeoutConcurrentSafety(t *testing.T) {
 	dispatcher := NewEventDispatcher()
 	tr := NewRPCTransport(dispatcher, 10*time.Second, nil, false)

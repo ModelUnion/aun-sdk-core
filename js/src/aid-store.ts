@@ -6,10 +6,12 @@ import { RegisterFlow } from './register-flow.js';
 import { GatewayDiscovery } from './discovery.js';
 import { IdentityConflictError, NotFoundError, ValidationError } from './errors.js';
 import { IndexedDBIdentityStore } from './keystore/indexeddb-identity-store.js';
+import { IndexedDBTokenStore } from './keystore/indexeddb-token-store.js';
 import { getDeviceId, normalizeInstanceId, normalizeSlotId } from './config.js';
 import type { IdentityRecord } from './types.js';
 import { resultErr, resultOk, type Result } from './result.js';
 import { AgentMdManager, type AgentMdCheckResult, type AgentMdDownloadResult } from './agent-md.js';
+import { AuthFlow } from './auth.js';
 
 export interface AIDInfo {
   aid: string;
@@ -31,6 +33,7 @@ export type ResolveResult = {
 };
 export type DownloadAgentMdResult = AgentMdDownloadResult;
 export type CheckAgentMdResult = AgentMdCheckResult;
+export type UploadAgentMdResult = Record<string, unknown>;
 export type DiagnoseResult = { aid: string; status: string; local_valid: boolean; remote_registered: boolean; suggestions: string[]; local: Record<string, unknown>; remote: Record<string, unknown> };
 export type RenewCertResult = { renewed: true; new_cert_not_after: Date; new_fingerprint: string };
 export type RekeyResult = { rekeyed: true; new_cert_not_after: Date; new_fingerprint: string };
@@ -241,8 +244,11 @@ export class AIDStore {
 
   private _encryptionSeed: string;
   private _keystore: IndexedDBIdentityStore;
+  private _tokenStore: IndexedDBTokenStore;
   private _registerFlow: RegisterFlow;
   private _discovery: GatewayDiscovery;
+  private _crypto: CryptoProvider;
+  private _rootCaPem: string | null;
   private _verifySsl: boolean;
   private _gatewayCache: Map<string, string> = new Map();
   private _agentMdManager: AgentMdManager;
@@ -265,16 +271,19 @@ export class AIDStore {
       console.warn('[aun_core.config] verify_ssl=false 在浏览器环境中不受支持，SSL 证书验证将保持启用。');
     }
     this._verifySsl = opts.verifySsl === false ? true : (opts.verifySsl ?? true);
+    this._rootCaPem = opts.rootCaPem ?? null;
     this._keystore = new IndexedDBIdentityStore({ encryptionSeed: this._encryptionSeed || undefined });
-    const crypto = new CryptoProvider();
+    this._tokenStore = new IndexedDBTokenStore();
+    this._crypto = new CryptoProvider();
     this._discovery = new GatewayDiscovery();
     this._registerFlow = new RegisterFlow({
       keystore: this._keystore,
-      crypto,
+      crypto: this._crypto,
       verifySsl: this._verifySsl,
     });
     this._agentMdManager = new AgentMdManager({
       aunPath: this.aunPath,
+      tokenStore: this._tokenStore,
       aidValidator: (target) => this._registerFlow.validateAidName(target),
       gatewayResolver: (target) => this._resolveGateway(target),
       peerResolver: async (target) => {
@@ -290,6 +299,8 @@ export class AIDStore {
   close(): void {
     const close = (this._keystore as unknown as { close?: () => void }).close;
     if (typeof close === 'function') close.call(this._keystore);
+    const closeTokens = (this._tokenStore as unknown as { close?: () => void }).close;
+    if (typeof closeTokens === 'function') closeTokens.call(this._tokenStore);
   }
 
   async load(aid: string): Promise<Result<{ aid: AID }>> {
@@ -434,6 +445,7 @@ export class AIDStore {
           curve: result.curve,
         });
       }
+      await this._persistGatewayUrl(target, gatewayUrl);
       return resultOk({ registered: true as const });
     } catch (exc) {
       if (exc instanceof IdentityConflictError) {
@@ -481,6 +493,7 @@ export class AIDStore {
         const certPem = await this._registerFlow.fetchPeerCert(gatewayUrl, target);
         if (!certPem) return resultErr(codes.CERT_NOT_FOUND, `certificate not found for aid: ${target}`);
         await this._keystore.saveCert(target, certPem);
+        await this._persistGatewayUrl(target, gatewayUrl);
         const reloaded = await this.load(target);
         if (!reloaded.ok) return reloaded as Result<never>;
         peer = reloaded.data.aid;
@@ -511,6 +524,59 @@ export class AIDStore {
       return resultOk(await this._agentMdManager.check(aid, ttlDays));
     } catch (exc) {
       return agentMdFailure<CheckAgentMdResult>(exc);
+    }
+  }
+
+  private _authIdentityFromAid(aid: AID): IdentityRecord {
+    return {
+      aid: aid.aid,
+      private_key_pem: aid.privateKeyPem,
+      public_key_der_b64: aid.publicKey,
+      cert: aid.certPem,
+    };
+  }
+
+  private async _uploadAgentMdToken(aid: AID, gatewayUrl: string): Promise<string> {
+    const auth = new AuthFlow({
+      tokenStore: this._tokenStore,
+      crypto: this._crypto,
+      aid: aid.aid,
+      deviceId: this.deviceId,
+      slotId: this.slotId,
+      rootCaPem: this._rootCaPem,
+      verifySsl: this._verifySsl,
+    });
+    auth.setIdentity(this._authIdentityFromAid(aid));
+    const result = await auth.authenticate(gatewayUrl, aid.aid);
+    const token = String(result.access_token ?? result.token ?? result.kite_token ?? '').trim();
+    if (!token) throw new Error('authenticate did not return access_token');
+    return token;
+  }
+
+  async uploadAgentMd(aid: string, content?: string | null): Promise<Result<UploadAgentMdResult>> {
+    const target = String(aid ?? '').trim();
+    try {
+      this._registerFlow.validateAidName(target);
+      const loaded = await this.load(target);
+      if (!loaded.ok) {
+        return resultErr(loaded.error.code, loaded.error.message);
+      }
+      const current = loaded.data.aid;
+      if (!current.isPrivateKeyValid() || !current.privateKeyPem) {
+        return resultErr(codes.PRIVATE_KEY_NOT_VALID, `uploadAgentMd requires local AID with a valid private key: ${target}`);
+      }
+      const manager = new AgentMdManager({
+        aunPath: this.aunPath,
+        tokenStore: this._tokenStore,
+        ownerAidGetter: () => target,
+        currentAidGetter: () => current,
+        gatewayResolver: (value) => this._resolveGateway(value),
+        accessTokenResolver: (_value, gatewayUrl) => this._uploadAgentMdToken(current, gatewayUrl),
+        aidValidator: (value) => this._registerFlow.validateAidName(value),
+      });
+      return resultOk(await manager.upload(content));
+    } catch (exc) {
+      return agentMdFailure<UploadAgentMdResult>(exc);
     }
   }
 
@@ -705,9 +771,20 @@ export class AIDStore {
     const setMetadata = (this._keystore as unknown as { setMetadata?: (aid: string, key: string, value: string) => Promise<void> }).setMetadata;
     if (typeof setMetadata !== 'function' || !gatewayUrl) return;
     try {
+      if (!await this._hasLocalAidMaterial(aid)) return;
       await setMetadata.call(this._keystore, aid, 'gateway_url', gatewayUrl);
     } catch {
       // 缓存失败不影响主流程。
+    }
+  }
+
+  private async _hasLocalAidMaterial(aid: string): Promise<boolean> {
+    try {
+      const cert = await this._keystore.loadCert(aid);
+      if (cert) return true;
+      return !!await this._keystore.loadKeyPair(aid);
+    } catch {
+      return false;
     }
   }
 }
