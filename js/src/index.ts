@@ -80,8 +80,9 @@ export { RPCTransport } from './transport.js';
 export { GatewayDiscovery } from './discovery.js';
 
 // 密钥存储
-export type { KeyStore } from './keystore/index.js';
-export { IndexedDBKeyStore, SeedMigrationError, type SeedChangeResult } from './keystore/indexeddb.js';
+export type { KeyStore, TokenStore } from './keystore/index.js';
+export { IndexedDBIdentityStore, SeedMigrationError, type SeedChangeResult } from './keystore/indexeddb-identity-store.js';
+export { IndexedDBTokenStore } from './keystore/indexeddb-token-store.js';
 
 // 密钥保护存储
 export type { SecretStore } from './secret-store/index.js';

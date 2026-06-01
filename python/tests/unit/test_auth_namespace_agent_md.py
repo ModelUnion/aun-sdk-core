@@ -125,7 +125,7 @@ def test_aid_store_diagnose_reports_local_ready(tmp_path, monkeypatch):
 
     monkeypatch.setattr(store, "exists", fake_exists)
     monkeypatch.setattr(store, "_resolve_gateway", lambda _aid: "wss://gateway.agentid.pub")
-    monkeypatch.setattr(store._auth, "fetch_peer_cert", fake_fetch_peer_cert)
+    monkeypatch.setattr(store._register_flow, "fetch_peer_cert", fake_fetch_peer_cert)
     result = asyncio.run(store.diagnose(aid))
 
     assert result.ok, result.error
@@ -242,7 +242,7 @@ def _patch_session(monkeypatch, session):
     monkeypatch.setattr(mod.aiohttp, "ClientSession", lambda *a, **kw: session)
 
 
-def test_fetch_agent_md_caches_etag_and_last_modified(monkeypatch, tmp_path):
+def test_download_agent_md_always_uses_unconditional_get(monkeypatch, tmp_path):
     aid_name = "alice.agentid.pub"
     store, _identity = _store_with_identity(tmp_path, aid_name)
     aid = _load_aid(store, aid_name)
@@ -263,23 +263,54 @@ def test_fetch_agent_md_caches_etag_and_last_modified(monkeypatch, tmp_path):
     ])
     _patch_session(monkeypatch, session)
 
-    first = asyncio.run(store.fetch_agent_md(aid_name))
+    first = asyncio.run(store.download_agent_md(aid_name))
     assert first.ok, first.error
     assert first.data is not None
     assert first.data["content"] == signed.data["signed"]
     assert "If-None-Match" not in session.calls[0]
     assert "If-Modified-Since" not in session.calls[0]
 
-    second = asyncio.run(store.fetch_agent_md(aid_name))
+    second = asyncio.run(store.download_agent_md(aid_name))
     assert second.ok, second.error
     assert second.data is not None
     assert second.data["content"] == signed.data["signed"]
-    assert session.calls[1].get("If-None-Match") == "\"abc123\""
-    assert session.calls[1].get("If-Modified-Since") == "Sun, 18 May 2026 00:00:00 GMT"
+    assert "If-None-Match" not in session.calls[1]
+    assert "If-Modified-Since" not in session.calls[1]
     store.close()
 
 
-def test_fetch_agent_md_updates_cache_on_change(monkeypatch, tmp_path):
+def test_download_agent_md_retries_unconditional_get_when_304_without_content(monkeypatch, tmp_path):
+    aid_name = "alice.agentid.pub"
+    store, _identity = _store_with_identity(tmp_path, aid_name)
+    aid = _load_aid(store, aid_name)
+    signed = aid.sign_agent_md(_sample_agent_md(aid_name))
+    assert signed.ok and signed.data is not None
+
+    async def fake_gateway(_aid: str):
+        return "https://gateway.agentid.pub/aun"
+
+    monkeypatch.setattr(store, "_resolved_gateway", fake_gateway)
+    manager = store._agent_md_manager
+    manager.save_record(aid_name, remote_etag="\"head-only\"", remote_status="found")
+    session = _FakeSession([
+        _FakeResponse(304, "", {"ETag": "\"head-only\""}),
+        _FakeResponse(200, signed.data["signed"], {"ETag": "\"head-only\""}),
+    ])
+    _patch_session(monkeypatch, session)
+
+    result = asyncio.run(store.download_agent_md(aid_name))
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["content"] == signed.data["signed"]
+    assert len(session.calls) == 2
+    assert "If-None-Match" not in session.calls[0]
+    assert "If-Modified-Since" not in session.calls[0]
+    assert "If-None-Match" not in session.calls[1]
+    assert "If-Modified-Since" not in session.calls[1]
+    store.close()
+
+
+def test_download_agent_md_updates_cache_on_change(monkeypatch, tmp_path):
     aid_name = "alice.agentid.pub"
     store, _identity = _store_with_identity(tmp_path, aid_name)
     aid = _load_aid(store, aid_name)
@@ -295,15 +326,17 @@ def test_fetch_agent_md_updates_cache_on_change(monkeypatch, tmp_path):
     session = _FakeSession([
         _FakeResponse(200, signed_v1.data["signed"], {"ETag": "\"v1\"", "Last-Modified": "Sun, 18 May 2026 00:00:00 GMT"}),
         _FakeResponse(200, signed_v2.data["signed"], {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
-        _FakeResponse(304, "", {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
+        _FakeResponse(200, signed_v2.data["signed"], {"ETag": "\"v2\"", "Last-Modified": "Sun, 18 May 2026 01:00:00 GMT"}),
     ])
     _patch_session(monkeypatch, session)
 
-    assert asyncio.run(store.fetch_agent_md(aid_name)).data["content"] == signed_v1.data["signed"]
-    assert asyncio.run(store.fetch_agent_md(aid_name)).data["content"] == signed_v2.data["signed"]
-    assert asyncio.run(store.fetch_agent_md(aid_name)).data["content"] == signed_v2.data["signed"]
-    assert session.calls[1].get("If-None-Match") == "\"v1\""
-    assert session.calls[2].get("If-None-Match") == "\"v2\""
+    assert asyncio.run(store.download_agent_md(aid_name)).data["content"] == signed_v1.data["signed"]
+    assert asyncio.run(store.download_agent_md(aid_name)).data["content"] == signed_v2.data["signed"]
+    assert asyncio.run(store.download_agent_md(aid_name)).data["content"] == signed_v2.data["signed"]
+    assert "If-None-Match" not in session.calls[1]
+    assert "If-Modified-Since" not in session.calls[1]
+    assert "If-None-Match" not in session.calls[2]
+    assert "If-Modified-Since" not in session.calls[2]
     store.close()
 
 
@@ -323,7 +356,7 @@ class _FakeHeadSession:
         return self._responses.pop(0)
 
 
-def test_head_agent_md_returns_etag_without_body(monkeypatch, tmp_path):
+def test_check_agent_md_uses_head_etag_without_body(monkeypatch, tmp_path):
     store = AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
 
     async def fake_gateway(_aid: str):
@@ -335,19 +368,21 @@ def test_head_agent_md_returns_etag_without_body(monkeypatch, tmp_path):
     ])
     _patch_session(monkeypatch, session)
 
-    result = asyncio.run(store.head_agent_md("alice.agentid.pub"))
+    result = asyncio.run(store.check_agent_md("alice.agentid.pub", ttl_days=0))
 
     assert result.ok, result.error
     assert result.data is not None
     assert result.data["aid"] == "alice.agentid.pub"
-    assert result.data["found"] is True
-    assert result.data["etag"] == '"abc123"'
+    assert result.data["local_found"] is False
+    assert result.data["remote_found"] is True
+    assert result.data["remote_etag"] == '"abc123"'
     assert result.data["last_modified"] == "Sun, 24 May 2026 00:00:00 GMT"
+    assert result.data["needs_update"] is True
     assert session.calls[0].get("Accept") is None
     store.close()
 
 
-def test_head_agent_md_404_returns_not_found(monkeypatch, tmp_path):
+def test_check_agent_md_404_returns_missing_state(monkeypatch, tmp_path):
     store = AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
 
     async def fake_gateway(_aid: str):
@@ -357,9 +392,12 @@ def test_head_agent_md_404_returns_not_found(monkeypatch, tmp_path):
     session = _FakeHeadSession([_FakeResponse(404)])
     _patch_session(monkeypatch, session)
 
-    result = asyncio.run(store.head_agent_md("missing.agentid.pub"))
+    result = asyncio.run(store.check_agent_md("missing.agentid.pub", ttl_days=0))
 
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "AGENTMD_NOT_FOUND"
+    assert result.ok, result.error
+    assert result.data is not None
+    assert result.data["remote_found"] is False
+    assert result.data["status"] == 404
+    assert result.data["needs_update"] is False
     store.close()
+

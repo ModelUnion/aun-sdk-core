@@ -169,6 +169,15 @@ export interface GroupStateRecord {
 
 /** 私钥/完整身份存储接口，仅 AIDStore / RegisterFlow 持有。 */
 export interface KeyStore {
+  /** 加载证书 PEM */
+  loadCert(aid: string, certFingerprint?: string): Promise<string | null>;
+  /** 保存证书 PEM */
+  saveCert(
+    aid: string,
+    certPem: string,
+    certFingerprint?: string,
+    opts?: { makeActive?: boolean },
+  ): Promise<void>;
   /** 加载密钥对 */
   loadKeyPair(aid: string): Promise<KeyPairRecord | null>;
   /** 保存密钥对 */
@@ -198,6 +207,3 @@ export interface KeyStore {
   /** 迁移 IndexedDB 中由 seed 加密的私钥 */
   changeSeed?(oldSeed: string, newSeed: string): Promise<{ migrated: number; privateKeysMigrated: number }>;
 }
-
-/** 物理实现通常同时实现 TokenStore 与 KeyStore；注册流程显式要求组合类型。 */
-export type FullKeyStore = TokenStore & KeyStore;

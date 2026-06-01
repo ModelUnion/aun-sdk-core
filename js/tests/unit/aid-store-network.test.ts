@@ -2,7 +2,7 @@ import 'fake-indexeddb/auto';
 import crypto from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { AIDStore, CryptoProvider, IndexedDBKeyStore } from '../../src/index.js';
+import { AIDStore, IndexedDBIdentityStore } from '../../src/index.js';
 
 function derLength(len: number): Buffer {
   if (len < 0x80) return Buffer.from([len]);
@@ -71,7 +71,7 @@ function makeIdentity(aid: string): { aid: string; private_key_pem: string; publ
 
 async function storeWithIdentity(aid: string): Promise<{ store: AIDStore; identity: ReturnType<typeof makeIdentity> }> {
   const identity = makeIdentity(aid);
-  const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'network-seed' });
+  const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'network-seed' });
   await keyStore.saveIdentity(aid, identity);
   return { store: new AIDStore({ aunPath: 'browser-aun-network', encryptionSeed: 'network-seed' }), identity };
 }
@@ -88,7 +88,7 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
   it('register / exists / diagnose 使用 gateway discovery 和 PKI HEAD', async () => {
     const { store } = await storeWithIdentity('alice.agentid.pub');
     vi.spyOn(store as any, '_resolveGateway').mockResolvedValue('wss://gateway.agentid.pub/aun');
-    const registerSpy = vi.spyOn((store as any)._auth, 'registerAid').mockResolvedValue({ aid: 'alice.agentid.pub' });
+    const registerSpy = vi.spyOn((store as any)._registerFlow, 'registerAid').mockResolvedValue({ aid: 'alice.agentid.pub' });
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response('', { status: 200 }));
 
     const registered = await store.register('alice.agentid.pub');
@@ -108,23 +108,26 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
     expect(diagnosed.ok && (diagnosed.data as any).remote_registered).toBe(true);
   });
 
-  it('resolve / fetchAgentMd / headAgentMd / checkAgentMd 完成证书缓存和 agent.md 验签', async () => {
-    const aid = 'bob.agentid.pub';
+  it('resolve / downloadAgentMd / checkAgentMd 完成证书缓存和 agent.md 验签', async () => {
+    const aid = 'boba.agentid.pub';
     const { store, identity } = await storeWithIdentity(aid);
     const loaded = await store.load(aid);
     expect(loaded.ok).toBe(true);
     const signed = loaded.ok ? await loaded.data.aid.signAgentMd(`---\naid: "${aid}"\n---\n# Bob\n`) : null;
     expect(signed?.ok).toBe(true);
+    const remoteEtag = signed?.ok
+      ? `"${crypto.createHash('sha256').update(signed.data.signed, 'utf8').digest('hex')}"`
+      : '"bob-etag"';
 
     vi.spyOn(store as any, '_resolveGateway').mockResolvedValue('wss://gateway.agentid.pub/aun');
-    vi.spyOn((store as any)._auth, 'fetchPeerCert').mockResolvedValue(identity.cert);
+    vi.spyOn((store as any)._registerFlow, 'fetchPeerCert').mockResolvedValue(identity.cert);
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init?: RequestInit) => {
       const method = String(init?.method ?? 'GET').toUpperCase();
       if (method === 'HEAD') {
         return response('', {
           status: 200,
           headers: {
-            ETag: '"bob-etag"',
+            ETag: remoteEtag,
             'Last-Modified': 'Fri, 29 May 2026 10:00:00 GMT',
             'Content-Length': String(signed?.ok ? signed.data.signed.length : 0),
           },
@@ -133,7 +136,7 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
       return response(signed?.ok ? signed.data.signed : '', {
         status: 200,
         headers: {
-          ETag: '"bob-etag"',
+          ETag: remoteEtag,
           'Last-Modified': 'Fri, 29 May 2026 10:00:00 GMT',
         },
       });
@@ -144,16 +147,40 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
     expect(resolved.ok && (resolved.data.agent_md as any).verification.status).toBe('verified');
     expect(resolved.ok && (resolved.data.source as any).cert_from_cache).toBe(false);
 
-    const fetched = await store.fetchAgentMd(aid);
+    const fetched = await store.downloadAgentMd(aid);
     expect(fetched.ok && (fetched.data.verification as any).status).toBe('verified');
-    expect(fetched.ok && fetched.data.etag).toBe('"bob-etag"');
-
-    const head = await store.headAgentMd(aid);
-    expect(head.ok && head.data.content_length).toBe(signed?.ok ? signed.data.signed.length : 0);
+    expect(fetched.ok && fetched.data.etag).toBe(remoteEtag);
 
     const checked = await store.checkAgentMd(aid);
     expect(checked.ok && checked.data.needs_update).toBe(false);
     expect(checked.ok && checked.data.local_found).toBe(true);
+  });
+
+  it('downloadAgentMd 收到 304 且无正文缓存时应无条件 GET 重试', async () => {
+    const aid = 'bobb.agentid.pub';
+    const { store } = await storeWithIdentity(aid);
+    const loaded = await store.load(aid);
+    expect(loaded.ok).toBe(true);
+    const signed = loaded.ok ? await loaded.data.aid.signAgentMd(`---\naid: "${aid}"\n---\n# Bob\n`) : null;
+    expect(signed?.ok).toBe(true);
+
+    vi.spyOn(store as any, '_resolveGateway').mockResolvedValue('wss://gateway.agentid.pub/aun');
+    await (store as any)._agentMdManager.saveRecord(aid, { remote_etag: '"head-only"' });
+    const calls: Array<Record<string, string>> = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init?: RequestInit) => {
+      calls.push(Object.fromEntries(new Headers(init?.headers).entries()));
+      if (calls.length === 1) return response(null, { status: 304, headers: { ETag: '"head-only"' } });
+      return response(signed?.ok ? signed.data.signed : '', { status: 200, headers: { ETag: '"head-only"' } });
+    });
+
+    const fetched = await store.downloadAgentMd(aid);
+
+    expect(fetched.ok && fetched.data.content).toBe(signed?.ok ? signed.data.signed : '');
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.['if-none-match']).toBeUndefined();
+    expect(calls[0]?.['if-modified-since']).toBeUndefined();
+    expect(calls[1]?.['if-none-match']).toBeUndefined();
+    expect(calls[1]?.['if-modified-since']).toBeUndefined();
   });
 
   it('renewCert / rekey 使用私钥签名挑战并写回新证书材料', async () => {
@@ -165,7 +192,8 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
       if (method === 'auth.aid_login1') return { request_id: 'renew-1', nonce: 'nonce-renew' };
       return { cert: identity.cert };
     });
-    (store as any)._auth._shortRpc = renewRpc;
+    vi.spyOn((store as any)._registerFlow, 'shortRpc').mockImplementation(renewRpc as any);
+    vi.spyOn((store as any)._registerFlow, 'verifyPhase1Response').mockResolvedValue(undefined);
 
     const renewed = await store.renewCert(aid);
     expect(renewed.ok && renewed.data.renewed).toBe(true);
@@ -176,12 +204,12 @@ describe('浏览器 AIDStore 阶段2联网方法', () => {
     );
 
     const nextIdentity = makeIdentity(aid);
-    vi.spyOn(CryptoProvider.prototype, 'generateIdentity').mockResolvedValue(nextIdentity);
+    vi.spyOn((store as any)._registerFlow, 'generateIdentity').mockResolvedValue(nextIdentity);
     const rekeyRpc = vi.fn(async (_url: string, method: string) => {
       if (method === 'auth.aid_login1') return { request_id: 'rekey-1', nonce: 'nonce-rekey' };
       return { cert: nextIdentity.cert };
     });
-    (store as any)._auth._shortRpc = rekeyRpc;
+    vi.spyOn((store as any)._registerFlow, 'shortRpc').mockImplementation(rekeyRpc as any);
 
     const rekeyed = await store.rekey(aid);
     expect(rekeyed.ok && rekeyed.data.rekeyed).toBe(true);

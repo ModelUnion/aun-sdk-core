@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/modelunion/aun-sdk-core/go/secretstore"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -81,21 +80,6 @@ func ChangeSeed(root, oldSeed, newSeed string) (SeedChangeResult, error) {
 	if renameSeedFile {
 		result.SeedFileRenamed = renameSeedPath(filepath.Join(root, ".seed"))
 	}
-	return result, nil
-}
-
-
-func (f *FileKeyStore) ChangeSeed(oldSeed, newSeed string) (SeedChangeResult, error) {
-	f.Close()
-	result, err := ChangeSeed(f.root, oldSeed, newSeed)
-	if err != nil {
-		return result, err
-	}
-	ss, err := secretstore.NewFileSecretStore(f.root, newSeed)
-	if err != nil {
-		return result, err
-	}
-	f.secretStore = ss
 	return result, nil
 }
 

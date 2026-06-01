@@ -1,5 +1,5 @@
 /**
- * KeyStore 单元测试 — 覆盖 FileSecretStore、FileKeyStore
+ * KeyStore 单元测试 — 覆盖 FileSecretStore、LocalIdentityStore
  */
 
 import { execFile } from 'node:child_process';
@@ -12,7 +12,8 @@ import { promisify } from 'node:util';
 import { describe, it, expect, beforeEach } from 'vitest';
 
 import { FileSecretStore } from '../../src/secret-store/file-store.js';
-import { FileKeyStore } from '../../src/keystore/file.js';
+import { LocalIdentityStore } from '../../src/keystore/local-identity-store.js';
+import { LocalTokenStore } from '../../src/keystore/local-token-store.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -26,9 +27,9 @@ type KeystoreWorkerPayload = {
 
 function writeKeystoreStressWorker(root: string): string {
   const workerPath = join(root, 'keystore-multiprocess-worker.ts');
-  const fileKeyStoreUrl = pathToFileURL(join(process.cwd(), 'src', 'keystore', 'file.ts')).href;
+  const LocalIdentityStoreUrl = pathToFileURL(join(process.cwd(), 'src', 'keystore', 'local-identity-store.ts')).href;
   writeFileSync(workerPath, `
-import { FileKeyStore } from ${JSON.stringify(fileKeyStoreUrl)};
+import { LocalIdentityStore } from ${JSON.stringify(LocalIdentityStoreUrl)};
 
 const payload = JSON.parse(process.argv[2] ?? '{}');
 const root = String(payload.root);
@@ -38,7 +39,7 @@ const worker = Number(payload.worker);
 const rounds = Number(payload.rounds);
 const deviceId = 'device-shared';
 const slotId = \`slot-\${worker}\`;
-const ks = new FileKeyStore(root, { encryptionSeed: seed });
+const ks = new LocalIdentityStore(root, { encryptionSeed: seed });
 
 try {
   const db = (ks as any)._getDB(aid);
@@ -179,7 +180,7 @@ describe('FileSecretStore', () => {
 
   it('ChangeSeed 支持旧 seed 到新 seed 且旧 seed 不再可读', () => {
     const aid = 'old-to-new.agentid.pub';
-    const oldStore = new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' });
+    const oldStore = new LocalIdentityStore(tmpDir, { encryptionSeed: 'old-seed' });
     oldStore.saveKeyPair(aid, {
       private_key_pem: 'OLD_TO_NEW_PRIVATE',
       public_key_der_b64: 'pub',
@@ -189,9 +190,9 @@ describe('FileSecretStore', () => {
     const result = oldStore.changeSeed('old-seed', 'new-seed');
     expect(result.privateKeysMigrated).toBe(1);
 
-    const loaded = new FileKeyStore(tmpDir, { encryptionSeed: 'new-seed' }).loadKeyPair(aid);
+    const loaded = new LocalIdentityStore(tmpDir, { encryptionSeed: 'new-seed' }).loadKeyPair(aid);
     expect(loaded?.private_key_pem).toBe('OLD_TO_NEW_PRIVATE');
-    expect(() => new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' }).loadKeyPair(aid)).toThrow(/decrypt failed/);
+    expect(() => new LocalIdentityStore(tmpDir, { encryptionSeed: 'old-seed' }).loadKeyPair(aid)).toThrow(/decrypt failed/);
   });
 
   it('ChangeSeed 支持历史明文 key.json 到加密 key.json', () => {
@@ -213,13 +214,13 @@ describe('FileSecretStore', () => {
     expect(raw.private_key_pem).toBeUndefined();
     expect(rawText).not.toContain('PLAINTEXT_PRIVATE');
     expect(raw.private_key_protection).toMatchObject({ scheme: 'file_aes', name: 'identity/private_key' });
-    const loaded = new FileKeyStore(tmpDir, { encryptionSeed: 'new-seed' }).loadKeyPair(aid);
+    const loaded = new LocalIdentityStore(tmpDir, { encryptionSeed: 'new-seed' }).loadKeyPair(aid);
     expect(loaded?.private_key_pem).toBe('PLAINTEXT_PRIVATE');
   });
 
   it('ChangeSeed 旧 seed 不匹配时不改写原 key.json', () => {
     const aid = 'wrong-seed-no-destroy.agentid.pub';
-    const oldStore = new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' });
+    const oldStore = new LocalIdentityStore(tmpDir, { encryptionSeed: 'old-seed' });
     oldStore.saveKeyPair(aid, {
       private_key_pem: 'KEEP_OLD_PRIVATE',
       public_key_der_b64: 'pub',
@@ -230,7 +231,7 @@ describe('FileSecretStore', () => {
 
     expect(() => FileSecretStore.changeSeed(tmpDir, 'wrong-seed', 'new-seed')).toThrow(/seed migration refused/);
     expect(readFileSync(keyPath, 'utf-8')).toBe(before);
-    const loaded = new FileKeyStore(tmpDir, { encryptionSeed: 'old-seed' }).loadKeyPair(aid);
+    const loaded = new LocalIdentityStore(tmpDir, { encryptionSeed: 'old-seed' }).loadKeyPair(aid);
     expect(loaded?.private_key_pem).toBe('KEEP_OLD_PRIVATE');
   });
 
@@ -298,9 +299,9 @@ describe('FileSecretStore', () => {
 
 });
 
-// ── FileKeyStore 测试 ────────────────────────────────────────
+// ── LocalIdentityStore 测试 ────────────────────────────────────────
 
-describe('FileKeyStore', () => {
+describe('LocalIdentityStore', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -308,7 +309,7 @@ describe('FileKeyStore', () => {
   });
 
   it('保存和加载密钥对', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const keyPair = {
       private_key_pem: '-----BEGIN PRIVATE KEY-----\ntest-key\n-----END PRIVATE KEY-----',
       public_key_der_b64: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE',
@@ -323,7 +324,7 @@ describe('FileKeyStore', () => {
   });
 
   it('保存和加载证书', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const certPem = '-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n';
     ks.saveCert('test.aid', certPem);
 
@@ -332,7 +333,7 @@ describe('FileKeyStore', () => {
   });
 
   it('支持按证书指纹保存和加载证书版本', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const certPem = '-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n';
     ks.saveCert(
       'test.aid',
@@ -350,7 +351,7 @@ describe('FileKeyStore', () => {
   });
 
   it('保存和加载身份信息', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const identity = {
       aid: 'test.aid',
       private_key_pem: '-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----',
@@ -369,7 +370,7 @@ describe('FileKeyStore', () => {
   });
 
   it('重启后仍能加载身份信息', () => {
-    const ks1 = new FileKeyStore(tmpDir);
+    const ks1 = new LocalIdentityStore(tmpDir);
     const identity = {
       private_key_pem: '-----BEGIN PRIVATE KEY-----\npersistent\n-----END PRIVATE KEY-----',
       public_key_der_b64: 'base64pub',
@@ -378,14 +379,14 @@ describe('FileKeyStore', () => {
     ks1.saveKeyPair('persist.aid', identity);
 
     // 用相同路径创建新实例
-    const ks2 = new FileKeyStore(tmpDir);
+    const ks2 = new LocalIdentityStore(tmpDir);
     const loaded = ks2.loadKeyPair('persist.aid');
     expect(loaded).not.toBeNull();
     expect(loaded!.private_key_pem).toBe(identity.private_key_pem);
   });
 
   it('多个 AID 互不干扰', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     ks.saveKeyPair('aid1', { private_key_pem: 'key1', public_key_der_b64: 'pub1' });
     ks.saveKeyPair('aid2', { private_key_pem: 'key2', public_key_der_b64: 'pub2' });
 
@@ -396,7 +397,7 @@ describe('FileKeyStore', () => {
   });
 
   it('私钥不以明文保存在磁盘上', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const privPem = '-----BEGIN PRIVATE KEY-----\nSECRET_DATA\n-----END PRIVATE KEY-----';
     ks.saveIdentity('secure.aid', {
       private_key_pem: privPem,
@@ -429,7 +430,7 @@ describe('FileKeyStore', () => {
       curve: 'P-256',
     }), 'utf-8');
 
-    const ks = new FileKeyStore(tmpDir, { encryptionSeed: 'new-seed' });
+    const ks = new LocalIdentityStore(tmpDir, { encryptionSeed: 'new-seed' });
     const loaded = ks.loadKeyPair(aid);
     expect(loaded?.private_key_pem).toBe('LEGACY_PLAINTEXT_PRIVATE');
 
@@ -442,7 +443,7 @@ describe('FileKeyStore', () => {
 
   it('loadKeyPair seed 不匹配时抛错且不破坏 key.json', () => {
     const aid = 'wrong-load-seed.agentid.pub';
-    const ks = new FileKeyStore(tmpDir, { encryptionSeed: 'correct-seed' });
+    const ks = new LocalIdentityStore(tmpDir, { encryptionSeed: 'correct-seed' });
     ks.saveKeyPair(aid, {
       private_key_pem: 'CORRECT_SEED_PRIVATE',
       public_key_der_b64: 'pub',
@@ -451,14 +452,14 @@ describe('FileKeyStore', () => {
     const keyPath = join(tmpDir, 'AIDs', aid, 'private', 'key.json');
     const before = readFileSync(keyPath, 'utf-8');
 
-    const wrong = new FileKeyStore(tmpDir, { encryptionSeed: 'wrong-seed' });
+    const wrong = new LocalIdentityStore(tmpDir, { encryptionSeed: 'wrong-seed' });
     expect(() => wrong.loadKeyPair(aid)).toThrow(/decrypt failed/);
     expect(readFileSync(keyPath, 'utf-8')).toBe(before);
   });
 
   it('loadPendingKeyPair 会把历史明文 pending key.json 迁移为加密存储', () => {
     const aid = 'pending-legacy.agentid.pub';
-    const ks = new FileKeyStore(tmpDir, { encryptionSeed: 'pending-seed' });
+    const ks = new LocalIdentityStore(tmpDir, { encryptionSeed: 'pending-seed' });
     const pendingDir = ks.pendingIdentityDir(aid);
     const keyPath = join(pendingDir, 'private', 'key.json');
     writeFileSync(keyPath, JSON.stringify({
@@ -476,41 +477,42 @@ describe('FileKeyStore', () => {
     expect(raw.private_key_protection).toMatchObject({ scheme: 'file_aes', name: 'identity/private_key' });
   });
 
-  it('token 存取往返正确（存 SQLite）', () => {
-    const ks = new FileKeyStore(tmpDir);
-    const db = (ks as any)._getDB('token.aid');
-    db.setToken('access_token', 'secret-token-123');
-    db.setToken('refresh_token', 'refresh-token-456');
+  it('token 实例态由 LocalTokenStore 持久化', () => {
+    const ks = new LocalTokenStore(tmpDir);
+    ks.saveInstanceState('token.aid', 'device-1', 'slot-1', {
+      access_token: 'secret-token-123',
+      refresh_token: 'refresh-token-456',
+    });
 
-    const loaded = ks.loadIdentity('token.aid');
+    const loaded = ks.loadInstanceState('token.aid', 'device-1', 'slot-1');
     expect(loaded!.access_token).toBe('secret-token-123');
     expect(loaded!.refresh_token).toBe('refresh-token-456');
     ks.close();
   });
 
   it('loadKeyPair 不存在的 AID 返回 null', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     expect(ks.loadKeyPair('nonexistent')).toBeNull();
   });
 
   it('loadCert 不存在的 AID 返回 null', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     expect(ks.loadCert('nonexistent')).toBeNull();
   });
 
   it('loadIdentity 不存在的 AID 返回 null（原 loadMetadata）', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     expect(ks.loadIdentity('nonexistent')).toBeNull();
   });
 
   it('loadIdentity 不存在的 AID 返回 null', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     expect(ks.loadIdentity('nonexistent')).toBeNull();
   });
 
   it('safeAid 替换特殊字符', () => {
     // user/domain, user\domain, user:domain 都映射到同一个 safe AID: user_domain
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const db1 = (ks as any)._getDB('normal.aid');
     db1.setMetadata('custom', 'normal');
     const db2 = (ks as any)._getDB('user/domain');
@@ -527,7 +529,7 @@ describe('FileKeyStore', () => {
   });
 
   it('saveIdentity 更新 token 时不应覆盖已有 metadata', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const db = (ks as any)._getDB('identity.aid');
     db.setMetadata('custom', JSON.stringify({ keep: true }));
 
@@ -544,7 +546,7 @@ describe('FileKeyStore', () => {
   });
 
   it('实例态应按 device_id/slot_id 隔离保存', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     ks.saveInstanceState!('instance.aid', 'device-a', '', {
       access_token: 'tok-a',
     });
@@ -559,12 +561,12 @@ describe('FileKeyStore', () => {
     expect(slot2!.access_token).toBe('tok-b');
   });
 
-  it('同进程多 FileKeyStore 实例共享同一 AID DB 时应隔离 slot/seq 并共享 token/metadata', () => {
+  it('同进程多 LocalIdentityStore 实例共享同一 AID DB 时应隔离 slot/seq 并共享 token/metadata', () => {
     const seed = 'same-process-shared-seed';
     const aid = 'same-process.agentid.pub';
     const deviceId = 'device-shared';
-    const ks1 = new FileKeyStore(tmpDir, { encryptionSeed: seed });
-    const ks2 = new FileKeyStore(tmpDir, { encryptionSeed: seed });
+    const ks1 = new LocalIdentityStore(tmpDir, { encryptionSeed: seed });
+    const ks2 = new LocalIdentityStore(tmpDir, { encryptionSeed: seed });
 
     try {
       ks1.saveInstanceState(aid, deviceId, 'slot-a', { owner: 'a', cursor: 1 });
@@ -604,7 +606,7 @@ describe('FileKeyStore', () => {
       rounds,
     })));
 
-    const ks = new FileKeyStore(tmpDir, { encryptionSeed: seed });
+    const ks = new LocalIdentityStore(tmpDir, { encryptionSeed: seed });
     try {
       const db = (ks as any)._getDB(aid);
 
@@ -639,7 +641,7 @@ describe('FileKeyStore', () => {
   // ── ISSUE-SDK-TS-010: loadKeyPair 对损坏的 key.json 的健壮性 ──
 
   it('loadKeyPair 在 key.json 内容损坏时应返回 null', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     // 先创建目录结构
     const keyDir = join(tmpDir, 'AIDs', 'corrupt.aid', 'private');
     mkdirSync(keyDir, { recursive: true });
@@ -652,7 +654,7 @@ describe('FileKeyStore', () => {
   });
 
   it('loadKeyPair 在 key.json 为空文件时应返回 null', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const keyDir = join(tmpDir, 'AIDs', 'empty.aid', 'private');
     mkdirSync(keyDir, { recursive: true });
     writeFileSync(join(keyDir, 'key.json'), '');
@@ -665,7 +667,7 @@ describe('FileKeyStore', () => {
   // ── ISSUE-SDK-TS-020: loadCert readFileSync 异常处理 ──
 
   it('loadCert 在 cert.pem 内容不可读时应返回 null（文件目录冲突模拟）', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     // 用目录替代文件来模拟 readFileSync 抛异常的场景
     const certDir = join(tmpDir, 'AIDs', 'badcert.aid', 'public');
     mkdirSync(certDir, { recursive: true });
@@ -678,7 +680,7 @@ describe('FileKeyStore', () => {
   });
 
   it('loadCert 按指纹加载时 readFileSync 失败应返回 null', () => {
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     const fp = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
     // 用目录替代文件来模拟 readFileSync 失败
     const certVerDir = join(tmpDir, 'AIDs', 'badcert2.aid', 'public', 'certs');

@@ -2017,7 +2017,7 @@ export class AuthFlow {
   private _loadIdentityOrRaise(aid?: string): IdentityRecord {
     const requestedAid = aid ?? this._aid;
 
-    // 优先路径：使用注入的内存 identity（私钥已由 AIDStore 解密并传入）
+    // 优先路径：使用注入的内存 identity（私钥已由上层身份存储加载后传入）
     if (this._memIdentity) {
       const mem = this._memIdentity;
       if (requestedAid && String(mem.aid ?? '') !== requestedAid) {

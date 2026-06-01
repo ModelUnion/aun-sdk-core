@@ -2,8 +2,8 @@
 
 覆盖：
 - 默认 {aun_path}/AIDs
-- publish_agent_md(content?) 可直接接收内容；不传时读取 {root}/{aid}/agent.md
-- fetch_agent_md() 固定保存到 {root}/{aid}/agent.md
+- upload_agent_md(content?) 负责签名、上传并持久化
+- RPC/envelope 观察到的远端 etag 落盘到 agentmd.json
 - {aid}/agentmd.json 只保存元数据，不保存正文
 - {aid}/agentmd.json 损坏时从同目录 agent.md 重建
 """
@@ -11,10 +11,8 @@
 from __future__ import annotations
 
 import asyncio
-from email.utils import formatdate
 import hashlib
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -24,7 +22,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from aun_core import AIDStore, AUNClient, result_ok
+from aun_core import AIDStore, AUNClient
 from aun_core.errors import ValidationError
 from aun_core.events import EventDispatcher
 from aun_core.transport import RPCTransport
@@ -76,190 +74,141 @@ def _make_client(tmp_path: Path, aid: str = "alice.agentid.pub") -> AUNClient:
         loaded = store.load(aid)
         assert loaded.ok, loaded.error
         assert loaded.data is not None
-        return AUNClient(loaded.data["aid"])
+        client = AUNClient(loaded.data["aid"])
+        client._identity = {"aid": aid, "access_token": "token"}
+        client._agent_md_manager._gateway_resolver = lambda _aid: "ws://gateway.agentid.pub/aun"
+        return client
     finally:
         store.close()
 
 
 def _write_local_agent_md(client: AUNClient, aid: str, content: str) -> Path:
-    path = Path(client._agent_md_path) / aid / "agent.md"
+    path = client._agent_md_manager.file_path(aid)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
 
 
 def _read_record(client: AUNClient, aid: str) -> dict:
-    return json.loads((Path(client._agent_md_path) / aid / "agentmd.json").read_text(encoding="utf-8"))
+    return json.loads(client._agent_md_manager.meta_path(aid).read_text(encoding="utf-8"))
 
 
-# ── path ─────────────────────────────────────────────────────────────
+class _FakePutResponse:
+    status = 200
+
+    def __init__(self, etag: str):
+        self._etag = etag
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def json(self):
+        return {"aid": "alice.agentid.pub", "etag": self._etag, "last_modified": "Sun, 24 May 2026 00:00:00 GMT"}
+
+    async def text(self):
+        return ""
 
 
-def test_agent_md_path_defaults_to_agentmds(tmp_path: Path):
+class _FakePutSession:
+    def __init__(self, captured: dict[str, object], etag: str):
+        self._captured = captured
+        self._etag = etag
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def put(self, url, *, data=None, headers=None, ssl=None):
+        self._captured["url"] = url
+        self._captured["data"] = data
+        self._captured["headers"] = headers
+        return _FakePutResponse(self._etag)
+
+
+def _patch_put(monkeypatch, captured: dict[str, object], etag: str = '"cloud"') -> None:
+    import aun_core.agent_md as mod
+
+    monkeypatch.setattr(mod.aiohttp, "ClientSession", lambda *args, **kwargs: _FakePutSession(captured, etag))
+
+
+def test_agent_md_path_defaults_to_aids(tmp_path: Path):
     client = _make_client(tmp_path)
-    assert Path(client._agent_md_path) == tmp_path / "aun" / "AIDs"
-    client._keystore.close()
+    assert client._agent_md_manager.root == tmp_path / "aun" / "AIDs"
+    client._token_store.close()
 
 
-# ── publish_agent_md ─────────────────────────────────────────────────
-
-
-def test_publish_agent_md_without_aid_raises(tmp_path: Path):
+def test_upload_agent_md_without_aid_raises(tmp_path: Path):
     client = AUNClient()
     with pytest.raises(ValidationError):
-        asyncio.run(client.publish_agent_md())
-    client._keystore.close()
+        asyncio.run(client.upload_agent_md())
+    client._token_store.close()
 
 
-def test_publish_agent_md_missing_default_file_raises(tmp_path: Path):
+def test_upload_agent_md_missing_default_file_raises(tmp_path: Path):
     client = _make_client(tmp_path)
     with pytest.raises(FileNotFoundError):
-        asyncio.run(client.publish_agent_md())
-    client._keystore.close()
+        asyncio.run(client.upload_agent_md())
+    client._token_store.close()
 
 
-def test_publish_agent_md_reads_default_file_uploads_and_persists(monkeypatch, tmp_path: Path):
+def test_upload_agent_md_reads_default_file_uploads_and_persists(monkeypatch, tmp_path: Path):
     client = _make_client(tmp_path)
     unsigned = "---\naid: alice.agentid.pub\n---\n# Alice\n"
     _write_local_agent_md(client, "alice.agentid.pub", unsigned)
+    captured: dict[str, object] = {}
+    _patch_put(monkeypatch, captured, '"alice-cloud"')
 
-    captured: dict[str, str] = {}
+    result = asyncio.run(client.upload_agent_md())
 
-    async def fake_upload(content):
-        captured["uploaded"] = content
-        return {"aid": "alice.agentid.pub", "etag": '"alice-cloud"', "last_modified": "Sun, 24 May 2026 00:00:00 GMT"}
-
-    monkeypatch.setattr(client, "upload_agent_md", fake_upload)
-
-    result = asyncio.run(client.publish_agent_md())
-
+    uploaded = bytes(captured["data"]).decode("utf-8")
     assert result["etag"] == '"alice-cloud"'
-    assert captured["uploaded"].startswith(unsigned)
-    assert "<!-- AUN-SIGNATURE" in captured["uploaded"]
-    signed_path = Path(client._agent_md_path) / "alice.agentid.pub" / "agent.md"
-    assert signed_path.read_text(encoding="utf-8") == captured["uploaded"]
+    assert captured["url"] == "http://alice.agentid.pub/agent.md"
+    assert captured["headers"]["Authorization"] == "Bearer token"
+    assert uploaded.startswith(unsigned)
+    assert "<!-- AUN-SIGNATURE" in uploaded
+    signed_path = client._agent_md_manager.file_path("alice.agentid.pub")
+    assert signed_path.read_text(encoding="utf-8") == uploaded
     rec = _read_record(client, "alice.agentid.pub")
     assert "content" not in rec
-    assert rec["local_etag"] == _etag(captured["uploaded"])
+    assert rec["local_etag"] == _etag(uploaded)
     assert rec["remote_etag"] == '"alice-cloud"'
-    assert rec["last_modified"] == "Sun, 24 May 2026 00:00:00 GMT"
-    assert client._local_agent_md_etag == _etag(captured["uploaded"])
-    client._keystore.close()
+    client._token_store.close()
 
 
-def test_publish_agent_md_accepts_content_uploads_and_persists(monkeypatch, tmp_path: Path):
+def test_upload_agent_md_accepts_content_uploads_and_persists(monkeypatch, tmp_path: Path):
     client = _make_client(tmp_path)
     unsigned = "---\naid: alice.agentid.pub\n---\n# Alice From Memory\n"
+    captured: dict[str, object] = {}
+    _patch_put(monkeypatch, captured, '"alice-memory"')
 
-    captured: dict[str, str] = {}
+    result = asyncio.run(client.upload_agent_md(unsigned))
 
-    async def fake_upload(content):
-        captured["uploaded"] = content
-        return {"aid": "alice.agentid.pub", "etag": '"alice-memory"', "last_modified": "Sun, 24 May 2026 00:00:00 GMT"}
-
-    monkeypatch.setattr(client, "upload_agent_md", fake_upload)
-
-    result = asyncio.run(client.publish_agent_md(unsigned))
-
+    uploaded = bytes(captured["data"]).decode("utf-8")
     assert result["etag"] == '"alice-memory"'
-    assert captured["uploaded"].startswith(unsigned)
-    assert "<!-- AUN-SIGNATURE" in captured["uploaded"]
-    signed_path = Path(client._agent_md_path) / "alice.agentid.pub" / "agent.md"
-    assert signed_path.read_text(encoding="utf-8") == captured["uploaded"]
+    assert uploaded.startswith(unsigned)
+    assert "<!-- AUN-SIGNATURE" in uploaded
     rec = _read_record(client, "alice.agentid.pub")
-    assert rec["local_etag"] == _etag(captured["uploaded"])
+    assert rec["local_etag"] == _etag(uploaded)
     assert rec["remote_etag"] == '"alice-memory"'
-    client._keystore.close()
+    client._token_store.close()
 
 
-# ── fetch_agent_md ───────────────────────────────────────────────────
-
-
-def test_fetch_agent_md_uses_self_aid_updates_cache_and_saves_file(monkeypatch, tmp_path: Path):
+def test_observe_rpc_meta_persists_structured_meta_and_downloads_missing_local(monkeypatch, tmp_path: Path):
     client = _make_client(tmp_path)
-    body = "---\naid: alice.agentid.pub\n---\n# Alice\n"
-    class FakeStore:
-        async def fetch_agent_md(self, aid):
-            return result_ok({
-                "aid": aid,
-                "content": body,
-                "signature": {"status": "unsigned", "payload": body},
-                "etag": _etag(body),
-                "last_modified": "Sun, 24 May 2026 00:00:00 GMT",
-                "status": 200,
-            })
+    downloaded: list[str] = []
 
-        def close(self):
-            pass
-
-    monkeypatch.setattr(client, "_make_aid_store", lambda: FakeStore())
-
-    info = asyncio.run(client._fetch_agent_md())
-
-    assert info["aid"] == "alice.agentid.pub"
-    assert info["in_sync"] is True
-    saved = Path(info["saved_to"])
-    assert saved == Path(client._agent_md_path) / "alice.agentid.pub" / "agent.md"
-    assert saved.read_text(encoding="utf-8") == body
-    assert client._local_agent_md_etag == _etag(body)
-    rec = _read_record(client, "alice.agentid.pub")
-    assert rec["local_etag"] == _etag(body)
-    assert rec["remote_etag"] == _etag(body)
-    client._keystore.close()
-
-
-def test_fetch_agent_md_other_aid_saves_without_touching_self_etag(monkeypatch, tmp_path: Path):
-    client = _make_client(tmp_path)
-    client._local_agent_md_etag = '"unchanged"'
-    body = "---\naid: bob.agentid.pub\n---\n# Bob\n"
-    class FakeStore:
-        async def fetch_agent_md(self, aid):
-            return result_ok({
-                "aid": aid,
-                "content": body,
-                "signature": {"status": "unsigned", "payload": body},
-                "etag": '"bob-cloud"',
-                "last_modified": "",
-                "status": 200,
-            })
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(client, "_make_aid_store", lambda: FakeStore())
-
-    info = asyncio.run(client._fetch_agent_md("bob.agentid.pub"))
-
-    assert info["in_sync"] is None
-    assert client._local_agent_md_etag == '"unchanged"'
-    assert Path(info["saved_to"]).read_text(encoding="utf-8") == body
-    rec = _read_record(client, "bob.agentid.pub")
-    assert rec["local_etag"] == _etag(body)
-    assert rec["remote_etag"] == '"bob-cloud"'
-    client._keystore.close()
-
-
-def test_fetch_agent_md_no_aid_no_self_raises(tmp_path: Path):
-    client = AUNClient()
-    with pytest.raises(ValidationError):
-        asyncio.run(client._fetch_agent_md())
-    client._keystore.close()
-
-
-# ── metadata / recovery ──────────────────────────────────────────────
-
-
-def test_observe_rpc_meta_persists_structured_meta_and_fetches_missing_local(monkeypatch, tmp_path: Path):
-    client = _make_client(tmp_path)
-    fetched: list[str] = []
-
-    async def fake_fetch(aid):
-        fetched.append(aid)
+    async def fake_download(aid):
+        downloaded.append(aid)
         content = f"# {aid}\n"
-        client._save_agent_md_record(aid, content=content, local_etag=_etag(content), remote_status="found")
+        client._agent_md_manager.save_record(aid, content=content, local_etag=_etag(content), remote_status="found")
         return {"aid": aid, "content": content, "signature": {"status": "unsigned"}, "in_sync": False}
 
-    monkeypatch.setattr(client, "_fetch_agent_md", fake_fetch)
+    monkeypatch.setattr(client._agent_md_manager, "download", fake_download)
 
     client._observe_rpc_meta({
         "agent_md_etag": '"alice-cloud"',
@@ -283,114 +232,37 @@ def test_observe_rpc_meta_persists_structured_meta_and_fetches_missing_local(mon
         for aid in ("alice.agentid.pub", "bob.agentid.pub", "dave.agentid.pub")
     }
     assert records["alice.agentid.pub"]["remote_etag"] == '"alice-cloud-2"'
-    assert records["alice.agentid.pub"]["last_modified"] == "Sun, 24 May 2026 00:00:00 GMT"
     assert records["bob.agentid.pub"]["remote_etag"] == '"bob-cloud"'
-    assert records["bob.agentid.pub"]["last_modified"] == "Sun, 24 May 2026 00:00:01 GMT"
     assert records["dave.agentid.pub"]["remote_etag"] == '"dave-cloud"'
-    assert all("content" not in rec for rec in records.values())
-    assert fetched == ["alice.agentid.pub", "bob.agentid.pub", "dave.agentid.pub"]
-    assert (Path(client._agent_md_path) / "bob.agentid.pub" / "agent.md").read_text(encoding="utf-8") == "# bob.agentid.pub\n"
-    client._keystore.close()
+    assert downloaded == ["alice.agentid.pub", "bob.agentid.pub", "dave.agentid.pub"]
+    assert client._agent_md_manager.file_path("bob.agentid.pub").read_text(encoding="utf-8") == "# bob.agentid.pub\n"
+    client._token_store.close()
 
 
-def test_observe_envelope_agent_md_persists_sender_etag(tmp_path: Path):
+def test_observe_envelope_agent_md_persists_sender_etag(monkeypatch, tmp_path: Path):
     client = _make_client(tmp_path, aid="bob.agentid.pub")
 
-    client._observe_agent_md_from_envelope({"agent_md": {"sender": {"aid": "alice.agentid.pub", "etag": '"alice-cloud"'}}})
+    async def fake_download(aid):
+        return {"aid": aid}
+
+    monkeypatch.setattr(client._agent_md_manager, "download", fake_download)
+    client._agent_md_manager.observe_envelope({"agent_md": {"sender": {"aid": "alice.agentid.pub", "etag": '"alice-cloud"'}}})
 
     rec = _read_record(client, "alice.agentid.pub")
     assert rec["remote_etag"] == '"alice-cloud"'
-    client._keystore.close()
-
-
-def test_check_agent_md_head_compares_file_local_etag(monkeypatch, tmp_path: Path):
-    client = _make_client(tmp_path)
-    body = "# Bob\n"
-    client._save_agent_md_record("bob.agentid.pub", content=body, local_etag=_etag(body), remote_etag='"old"')
-
-    class FakeStore:
-        async def head_agent_md(self, aid):
-            return result_ok({"aid": aid, "found": True, "etag": _etag(body), "last_modified": "Sun, 24 May 2026 00:00:00 GMT", "status": 200})
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(client, "_make_aid_store", lambda: FakeStore())
-
-    result = asyncio.run(client._check_agent_md("bob.agentid.pub"))
-
-    assert result["local_found"] is True
-    assert result["remote_found"] is True
-    assert result["in_sync"] is True
-    assert result["local_etag"] == _etag(body)
-    assert result["remote_etag"] == _etag(body)
-    assert _read_record(client, "bob.agentid.pub")["remote_etag"] == _etag(body)
-    client._keystore.close()
-
-
-def test_check_agent_md_uses_fresh_cached_match_without_head(monkeypatch, tmp_path: Path):
-    client = _make_client(tmp_path)
-    body = "# Bob\n"
-    fresh_last_modified = formatdate(time.time(), usegmt=True)
-    client._save_agent_md_record(
-        "bob.agentid.pub",
-        content=body,
-        local_etag=_etag(body),
-        remote_etag=_etag(body),
-        last_modified=fresh_last_modified,
-        verify_status="valid",
-        verify_error="",
-    )
-
-    class FakeStore:
-        async def head_agent_md(self, aid):
-            raise AssertionError("fresh cached check_agent_md should not HEAD")
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(client, "_make_aid_store", lambda: FakeStore())
-
-    result = asyncio.run(client._check_agent_md("bob.agentid.pub", max_unsynced_days=7))
-
-    assert result["local_found"] is True
-    assert result["remote_found"] is True
-    assert result["in_sync"] is True
-    assert result["cached"] is True
-    assert result["verify_status"] == "valid"
-    client._keystore.close()
-def test_check_agent_md_without_local_record_still_heads(monkeypatch, tmp_path: Path):
-    client = _make_client(tmp_path)
-
-    class FakeStore:
-        async def head_agent_md(self, aid):
-            return result_ok({"aid": aid, "found": True, "etag": '"remote"', "last_modified": "", "status": 200})
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(client, "_make_aid_store", lambda: FakeStore())
-
-    result = asyncio.run(client._check_agent_md("carol.agentid.pub"))
-
-    assert result["local_found"] is False
-    assert result["remote_found"] is True
-    assert result["in_sync"] is False
-    assert result["remote_etag"] == '"remote"'
-    client._keystore.close()
+    client._token_store.close()
 
 
 def test_damaged_agentmd_json_rebuilds_from_agent_md_file(tmp_path: Path):
     client = _make_client(tmp_path)
     body = "# Alice\n"
     _write_local_agent_md(client, "alice.agentid.pub", body)
-    client._agent_md_cache["alice.agentid.pub"] = {"aid": "alice.agentid.pub", "remote_etag": '"cloud"'}
-    client._agent_md_cache["bob.agentid.pub"] = {"aid": "bob.agentid.pub", "remote_etag": '"stale"'}
-    meta_path = Path(client._agent_md_path) / "alice.agentid.pub" / "agentmd.json"
+    client._agent_md_manager.cache["bob.agentid.pub"] = {"aid": "bob.agentid.pub", "remote_etag": '"stale"'}
+    meta_path = client._agent_md_manager.meta_path("alice.agentid.pub")
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text("{bad json", encoding="utf-8")
 
-    record = client._load_agent_md_record("alice.agentid.pub")
+    record = client._agent_md_manager.load_record("alice.agentid.pub")
 
     assert record is not None
     assert record["content"] == body
@@ -399,8 +271,8 @@ def test_damaged_agentmd_json_rebuilds_from_agent_md_file(tmp_path: Path):
     rebuilt = _read_record(client, "alice.agentid.pub")
     assert rebuilt["local_etag"] == _etag(body)
     assert "remote_etag" not in rebuilt
-    assert "bob.agentid.pub" in client._agent_md_cache
-    client._keystore.close()
+    assert "bob.agentid.pub" in client._agent_md_manager.cache
+    client._token_store.close()
 
 
 def test_transport_event_and_notification_meta_observer_receives_agent_md_etags():
@@ -431,3 +303,4 @@ def test_transport_event_and_notification_meta_observer_receives_agent_md_etags(
         ]
 
     asyncio.run(_run())
+

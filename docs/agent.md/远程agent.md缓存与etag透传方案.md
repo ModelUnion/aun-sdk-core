@@ -8,8 +8,8 @@
 
 核心目标：
 
-- 每个远程 AID 在 SDK 本地内存中维护一条 `agent.md` 记录，包含 `remote_etag`、`local_etag`、`content`、`last_modified` 等字段。
-- 同一条远程缓存记录持久化到本地 SQLite 表，SDK 启动或内存 miss 时按需加载。
+- 每个远程 AID 在 SDK 本地维护一条 `agent.md` 记录，包含 `remote_etag`、`local_etag`、`content`、`last_modified` 等字段。
+- Python / TypeScript / Go 将正文和元数据持久化到 `{aun_path}/AIDs/{aid}/agent.md` 与 `agentmd.json`；浏览器 JavaScript 使用 IndexedDB 等价 key，存储不可用时退化为内存缓存。
 - `message.send` 的 RPC 响应携带接收方 `agent.md` ETag，让发送方更新 `to` 的云端版本。
 - 接收端收到消息信封时携带发送方 `agent.md` ETag，让接收方更新 `from` 的云端版本。
 - ETag 只作为版本提示，不替代 `agent.md` 内容下载和验签。
@@ -21,7 +21,7 @@
 1. `message.send` / V2 P2P send：把 `from` 的 `agent.md` ETag 注入消息信封，随消息到达接收端。
 2. `message.send` RPC response：把 `to` 的 `agent.md` ETag 注入响应 `_meta`，返回发送端。
 
-注意：服务端注入的 ETag 只能代表云端版本。SDK 本地必须区分“观察到的远端云端 ETag”和“当前本地内容对应的 ETag”。字段命名固定为 `remote_etag` 和 `local_etag`，其中 `remote_etag` 表示远端云端版本，`local_etag` 表示本地 `content` 对应版本。不能在只有远端 ETag、没有内容的情况下直接覆盖 `local_etag`，否则后续 `If-None-Match` 命中 304 时本地可能没有可用内容。
+注意：服务端注入的 ETag 只能代表云端版本。SDK 本地必须区分“观察到的远端云端 ETag”和“当前本地内容对应的 ETag”。字段命名固定为 `remote_etag` 和 `local_etag`，其中 `remote_etag` 表示远端云端版本，`local_etag` 表示本地 `content` 对应版本。下载必须始终使用无条件 GET，不能把 `remote_etag` 或 `local_etag` 放进 `If-None-Match` / `If-Modified-Since`，否则会把版本提示误用成 HTTP 缓存状态。
 
 ## 字段建议
 
@@ -63,26 +63,29 @@
 
 ## SDK 缓存模型
 
-每个远程 AID 在内存和 SQLite 表中都维护一条缓存记录。内存记录与 SQLite 表记录字段语义一致，SQLite 用于 SDK 重启或内存 miss 时按需加载。
+每个远程 AID 在内存和本地持久化记录中都维护一条 agent.md 状态。Python / TypeScript / Go 的持久化记录是 `{aun_path}/AIDs/{aid}/agentmd.json`；浏览器 JavaScript 是 IndexedDB 中的 `{aid}/agentmd.json` logical key。SDK 启动或内存 miss 时按需加载该记录。
 
 | 字段 | 含义 |
 | --- | --- |
 | `aid` | 远程 AID |
 | `content` | 本地缓存的完整 `agent.md` 内容，可为空 |
-| `local_etag` | 当前 `content` 对应的 ETag，只能由 GET 200/304 确认 |
+| `local_etag` | 当前 `content` 对应的 ETag，由成功 GET 200 内容确认；304 复用本地内容时沿用原值 |
 | `remote_etag` | 从消息信封或 RPC `_meta` 观察到的远端云端 ETag |
 | `last_modified` | GET 响应的 `Last-Modified` |
 | `fetched_at` | 最近一次成功确认内容的本机时间 |
+| `checked_at` | 最近一次 HEAD / GET 确认远端状态的本机时间 |
 | `observed_at` | 最近一次观察到远端 ETag 的本机时间 |
-| `stale` | `remote_etag` 与 `local_etag` 不一致，或有远端 ETag 但无内容 |
-| `verify_status` | 最近一次 `verify_agent_md` 结果：`verified` / `unsigned` / `invalid` |
+| `remote_status` | `found` / `missing` / `error` |
+| `verify_status` | 最近一次 agent.md 验签结果：`ok` / `unsigned` / `invalid` 等 |
+| `verify_error` | 最近一次验签失败原因 |
+| `last_error` | 最近一次网络或 HTTP 错误 |
 
 状态规则：
 
 - 收到远端 ETag 时，只更新 `remote_etag` 和 `observed_at`。
 - 只有下载到内容并完成验签后，才能更新 `content`、`local_etag`、`last_modified`、`fetched_at`。
-- `remote_etag == local_etag` 时，`stale=false`。
-- `remote_etag != local_etag` 或 `content` 为空时，`stale=true`。
+- `remote_etag == local_etag` 时视为同步。
+- `remote_etag != local_etag` 或 `content` 为空时视为需要更新；该状态可由字段推导，不要求单独存储 `stale` 字段。
 - `verify_status=invalid` 时内容可以缓存但应用层应能看到无效状态；是否拒绝展示由上层策略决定。
 
 ## 时序图
@@ -107,7 +110,7 @@ sequenceDiagram
     GW->>NS: HEAD https://B/agent.md<br/>取 to ETag（缓存命中则不请求）
     NS-->>GW: ETag(B)
     GW-->>A: RPC response + _meta.agent_md_etags.to
-    A->>A: observeRemoteAgentMdEtag(B, etag)<br/>更新内存 + SQLite remote_etag
+    A->>A: observeRemoteAgentMdEtag(B, etag)<br/>更新内存 + agentmd.json/IndexedDB remote_etag
 ```
 
 ### 接收消息时，接收端获得 from 的 agent.md ETag
@@ -127,11 +130,11 @@ sequenceDiagram
     alt 本地 local_etag == remote_etag
         Cache-->>B: 只刷新 observed_at，不下载
     else 本地无内容或 ETag 不一致
-        Cache->>Cache: 标记 stale，按需或后台拉取
-        B->>NS: GET https://A/agent.md<br/>If-None-Match=local_etag
-        NS-->>B: 200 content + ETag 或 304
+        Cache->>Cache: 标记需要更新，按需或后台拉取
+        B->>NS: GET https://A/agent.md<br/>不带条件请求头
+        NS-->>B: 200 content + ETag，或异常 304/404/error
         B->>B: verify_agent_md(content, aid=A)
-        B->>Cache: 写内存 + SQLite
+        B->>Cache: 写内存 + agentmd.json/IndexedDB
     end
 ```
 
@@ -142,25 +145,25 @@ sequenceDiagram
     participant App
     participant SDK
     participant Mem as Memory Cache
-    participant SQL as SQLite
+    participant Store as agentmd.json / IndexedDB
     participant NS as NameService
 
-    App->>SDK: fetchAgentMd(A) / getRemoteAgentMd(A)
+    App->>SDK: downloadAgentMd(A)
     SDK->>Mem: 查 A
     alt 内存有可用 content
         Mem-->>SDK: content, local_etag
     else 内存缺失
-        SDK->>SQL: load remote_agent_md_cache where aid=A
-        SQL-->>SDK: content/remote_etag/local_etag/last_modified
+        SDK->>Store: load {aid}/agentmd.json
+        Store-->>SDK: content/remote_etag/local_etag/last_modified
         SDK->>Mem: 回填内存
     end
 
     alt 内容缺失或 remote_etag != local_etag
-        SDK->>NS: GET /agent.md<br/>If-None-Match=local_etag
+        SDK->>NS: GET /agent.md<br/>不带条件请求头
         NS-->>SDK: 200/304/404/error
-        SDK->>SDK: 200 时验签；304 时复用旧 content
+        SDK->>SDK: 200 时验签；304 时有本地 content 则复用，无 content 则再无条件 GET 一次
         SDK->>Mem: upsert
-        SDK->>SQL: upsert
+        SDK->>Store: upsert agent.md + agentmd.json
     end
 
     SDK-->>App: agent.md content + signature + sync 状态
@@ -251,67 +254,53 @@ observe_remote_agent_md_etag(aid, etag, source)
 
 - aid 或 etag 为空时忽略。
 - etag 与当前 `remote_etag` 相同：只刷新 `observed_at`。
-- etag 变化：更新 `remote_etag`、`observed_at`，并根据 `local_etag` 设置 `stale`。
-- 变更需要同时写入内存和 SQLite。
+- etag 变化：更新 `remote_etag`、`observed_at`，并根据 `local_etag` 推导是否需要更新。
+- 变更需要同时写入内存和 agentmd.json / IndexedDB。
 
 ### 按需下载
 
-当应用调用 `fetchAgentMd(aid)` 或 SDK 需要展示远程 agent 信息时：
+当应用调用 `downloadAgentMd(aid)` 或 SDK 需要展示远程 agent 信息时：
 
-- 先查内存，miss 时查 SQLite 表。
-- 如果 `content` 存在且 `local_etag == remote_etag`，可直接返回缓存。
-- 如果 `content` 缺失或 stale，则发起 GET。
-- GET 时优先带 `If-None-Match=local_etag`，其次带 `If-Modified-Since=last_modified`。
+- 可先查内存，miss 时查 agentmd.json / IndexedDB，用于展示本地已有状态。
+- `downloadAgentMd(aid)` 的远端下载请求一律发起无条件 GET，不用本地 ETag 决定请求头。
+- GET 请求不得发送 `If-None-Match` / `If-Modified-Since`。
 - 200：验签，更新内容和 `local_etag`。
-- 304：只有本地已有 content 时才能复用；如果本地没有 content 却收到 304，应清空条件头重试一次 GET。
+- 304：本地已有 content 时复用该 content；本地没有 content 时再发起一次无条件 GET。第二次仍非 2xx 时按错误返回。
 - 404：标记远端未发布 `agent.md`，不要删除已有内容，除非产品要求严格同步。
 - 网络错误：保留旧内容，记录 `fetch_error` 或更新失败时间。
 
-### SQLite 持久化
+### 本地文件 / 浏览器持久化
 
-新增结构化表 `remote_agent_md_cache`，每个远程 AID 一行：
+agent.md 不写入 SQLite。当前 SDK 使用以下持久化位置：
 
-| 列 | 类型 |
+| SDK | 正文 | 元数据 |
+| --- | --- | --- |
+| Python | `{aun_path}/AIDs/{aid}/agent.md` | `{aun_path}/AIDs/{aid}/agentmd.json` |
+| TypeScript / Node | `{aun_path}/AIDs/{aid}/agent.md` | `{aun_path}/AIDs/{aid}/agentmd.json` |
+| Go | `{aun_path}/AIDs/{aid}/agent.md` | `{aun_path}/AIDs/{aid}/agentmd.json` |
+| JavaScript / 浏览器 | IndexedDB logical key `{root}/{aid}/agent.md` | IndexedDB logical key `{root}/{aid}/agentmd.json` |
+
+`agentmd.json` 至少承载以下语义字段：
+
+| 字段 | 说明 |
 | --- | --- |
-| `aid` | TEXT PRIMARY KEY |
-| `content` | TEXT NOT NULL DEFAULT '' |
-| `local_etag` | TEXT NOT NULL DEFAULT '' |
-| `remote_etag` | TEXT NOT NULL DEFAULT '' |
-| `last_modified` | TEXT NOT NULL DEFAULT '' |
-| `fetched_at` | INTEGER NOT NULL DEFAULT 0 |
-| `observed_at` | INTEGER NOT NULL DEFAULT 0 |
-| `verify_status` | TEXT NOT NULL DEFAULT '' |
-| `verify_error` | TEXT NOT NULL DEFAULT '' |
-| `updated_at` | INTEGER NOT NULL DEFAULT 0 |
+| `aid` | AID |
+| `content` | 正文副本；文件系统 SDK 也会单独写 `agent.md` |
+| `local_etag` / `remote_etag` | 本地内容版本 / 远端观察版本 |
+| `last_modified` | 远端 Last-Modified |
+| `fetched_at` / `checked_at` / `observed_at` / `updated_at` | 本机时间戳 |
+| `remote_status` | `found` / `missing` / `error` |
+| `verify_status` / `verify_error` | 最近一次验签状态 |
+| `last_error` | 最近一次错误 |
 
-建议 SQL：
-
-```sql
-CREATE TABLE IF NOT EXISTS remote_agent_md_cache (
-  aid TEXT PRIMARY KEY,
-  content TEXT NOT NULL DEFAULT '',
-  local_etag TEXT NOT NULL DEFAULT '',
-  remote_etag TEXT NOT NULL DEFAULT '',
-  last_modified TEXT NOT NULL DEFAULT '',
-  fetched_at INTEGER NOT NULL DEFAULT 0,
-  observed_at INTEGER NOT NULL DEFAULT 0,
-  verify_status TEXT NOT NULL DEFAULT '',
-  verify_error TEXT NOT NULL DEFAULT '',
-  updated_at INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_remote_agent_md_cache_observed_at
-ON remote_agent_md_cache(observed_at);
-```
-
-五个 SDK 应保持字段语义一致。浏览器 JS 可落 IndexedDB；Node TS、Python、Go、C++ 落各自现有本地存储。
+四个已实现 SDK 应保持字段语义一致。旧 `agent_md_cache` / `remote_agent_md_cache` SQLite 表不再作为 agent.md 缓存来源；迁移逻辑可清理旧表，但不得把新 agent.md 写回 SQLite。
 
 ## 异常与竞态处理
 
 - 多个消息同时观察同一 AID 的新 ETag：按 ETag 值幂等 upsert。
 - 多个协程同时触发同一 AID 下载：需要 per-AID in-flight 去重。
-- 观察到 ETag A 后开始下载，期间又观察到 ETag B：下载完成时只更新 `local_etag=A`，随后仍保持 stale，下一轮继续拉 B。
-- 304 但本地 content 缺失：不能返回空内容，必须无条件 GET 重试。
+- 观察到 ETag A 后开始下载，期间又观察到 ETag B：下载完成时只更新 `local_etag=A`，随后仍可由 `remote_etag != local_etag` 推导为需要更新，下一轮继续拉 B。
+- 304 但本地 content 缺失：不能返回空内容，必须再无条件 GET 一次。
 - 信封里的 ETag 不参与 AAD，不作为安全声明；安全性仍依赖 `agent.md` 签名和证书校验。
 - HEAD/GET 超时不影响 message send 和 message pull。
 - 跨域场景中，目标域 Message Service 注入 sender ETag 时可能需要跨域 HEAD；失败时允许缺字段。
@@ -320,9 +309,9 @@ ON remote_agent_md_cache(observed_at);
 
 - 发送方收到 `message.send` 响应后，能把 `to` 的 ETag 写入本地缓存 `remote_etag`。
 - 接收方 `message.v2.pull` 后，能从 `envelope.agent_md.sender` 写入 `from` 的 `remote_etag`。
-- ETag 变化但内容未下载时，缓存状态为 stale。
-- 本地 SQLite 有缓存、内存为空时，SDK 能按需加载。
-- 304 且本地有内容时复用内容；304 但本地无内容时强制重拉。
+- ETag 变化但内容未下载时，可由 `remote_etag != local_etag` 推导为需要更新。
+- 本地文件 / IndexedDB 有缓存、内存为空时，SDK 能按需加载。
+- 304 且本地有内容时复用内容；304 但本地无内容时再无条件 GET 一次。
 - `agent.md` 上传后，Gateway 缓存失效，后续消息能看到新 ETag。
 - HEAD/GET 404、超时、网络错误不影响消息收发主链路。
-- Python / TS / JS / Go / C++ 五个 SDK 对 `remote_etag`、`local_etag`、`content`、`stale` 语义一致。
+- Python / TS / JS / Go 四个 SDK 对 `remote_etag`、`local_etag`、`content`、`remote_status`、`verify_status` 语义一致。

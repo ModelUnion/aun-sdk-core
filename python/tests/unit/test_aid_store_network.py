@@ -109,8 +109,8 @@ async def test_store_renew_cert_signs_server_nonce_and_persists_new_cert(monkeyp
             return {"status": "renewed", "cert": renewed_identity["cert"], "serial": "02"}
         raise AssertionError(method)
 
-    monkeypatch.setattr(store._auth, "_verify_phase1_response", fake_verify_phase1)
-    monkeypatch.setattr(store._auth, "_short_rpc", fake_short_rpc)
+    monkeypatch.setattr(store._register_flow, "verify_phase1_response", fake_verify_phase1)
+    monkeypatch.setattr(store._register_flow, "short_rpc", fake_short_rpc)
 
     result = await store.renew_cert(aid)
 
@@ -145,7 +145,7 @@ async def test_store_rekey_signs_nonce_and_new_public_key_then_persists_new_keyp
     store = AIDStore(tmp_path, "")
     store._keystore.save_identity(aid, old_identity)
     monkeypatch.setattr(store, "_resolve_gateway", lambda target: "wss://gateway.agentid.pub")
-    monkeypatch.setattr(store._auth._crypto, "generate_identity", lambda: dict(generated_identity))
+    monkeypatch.setattr(store._register_flow, "generate_identity", lambda: dict(generated_identity))
 
     async def fake_verify_phase1(gateway_url: str, phase1: dict, client_nonce: str):
         assert phase1["request_id"] == "rekey-rid"
@@ -172,8 +172,8 @@ async def test_store_rekey_signs_nonce_and_new_public_key_then_persists_new_keyp
             return {"status": "rekeyed", "cert": new_identity["cert"], "serial": "03"}
         raise AssertionError(method)
 
-    monkeypatch.setattr(store._auth, "_verify_phase1_response", fake_verify_phase1)
-    monkeypatch.setattr(store._auth, "_short_rpc", fake_short_rpc)
+    monkeypatch.setattr(store._register_flow, "verify_phase1_response", fake_verify_phase1)
+    monkeypatch.setattr(store._register_flow, "short_rpc", fake_short_rpc)
 
     result = await store.rekey(aid)
 
@@ -222,8 +222,8 @@ async def test_store_renew_and_rekey_map_rpc_failures(monkeypatch, tmp_path: Pat
             return {"request_id": f"{params['aid']}-rid", "nonce": "nonce"}
         raise RuntimeError(f"{method} failed")
 
-    monkeypatch.setattr(store._auth, "_verify_phase1_response", fake_verify_phase1)
-    monkeypatch.setattr(store._auth, "_short_rpc", fake_short_rpc)
+    monkeypatch.setattr(store._register_flow, "verify_phase1_response", fake_verify_phase1)
+    monkeypatch.setattr(store._register_flow, "short_rpc", fake_short_rpc)
 
     renewed = await store.renew_cert(aid)
     rekeyed = await store.rekey(aid)
@@ -262,7 +262,7 @@ async def test_store_register_persists_identity_and_returns_registered(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_store_register_authflow_persists_generated_keypair(monkeypatch, tmp_path: Path):
+async def test_store_register_flow_persists_generated_keypair(monkeypatch, tmp_path: Path):
     aid = "new-user.agentid.pub"
     store = AIDStore(tmp_path, "seed")
     monkeypatch.setattr(store, "_resolve_gateway", lambda target: "wss://gateway.agentid.pub")
@@ -306,7 +306,7 @@ async def test_store_resolve_downloads_cert_and_can_skip_agent_md(monkeypatch, t
         assert target == aid
         return identity["cert"]
 
-    monkeypatch.setattr(store._auth, "fetch_peer_cert", fake_fetch_peer_cert)
+    monkeypatch.setattr(store._register_flow, "fetch_peer_cert", fake_fetch_peer_cert)
 
     result = await store.resolve(aid, {"skip_agent_md": True})
 
@@ -323,7 +323,7 @@ async def test_store_resolve_downloads_cert_and_can_skip_agent_md(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_store_fetch_agent_md_downloads_and_verifies_signature(monkeypatch, tmp_path: Path):
+async def test_store_download_agent_md_downloads_and_verifies_signature(monkeypatch, tmp_path: Path):
     aid = "alice.agentid.pub"
     store = AIDStore(tmp_path, "")
     identity = _identity(aid)
@@ -338,7 +338,7 @@ async def test_store_fetch_agent_md_downloads_and_verifies_signature(monkeypatch
 
     monkeypatch.setattr(store, "_http_get_text_with_headers", fake_get)
 
-    result = await store.fetch_agent_md(aid)
+    result = await store.download_agent_md(aid)
 
     assert result.ok
     assert result.data["aid"] == aid
@@ -351,7 +351,7 @@ async def test_store_fetch_agent_md_downloads_and_verifies_signature(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_store_fetch_agent_md_unsigned_is_ok_with_verification_status(monkeypatch, tmp_path: Path):
+async def test_store_download_agent_md_unsigned_is_ok_with_verification_status(monkeypatch, tmp_path: Path):
     aid = "alice.agentid.pub"
     store = AIDStore(tmp_path, "")
     identity = _identity(aid)
@@ -364,7 +364,7 @@ async def test_store_fetch_agent_md_unsigned_is_ok_with_verification_status(monk
 
     monkeypatch.setattr(store, "_http_get_text_with_headers", fake_get)
 
-    result = await store.fetch_agent_md(aid)
+    result = await store.download_agent_md(aid)
 
     assert result.ok, result.error
     assert result.data["content"] == unsigned
@@ -375,7 +375,7 @@ async def test_store_fetch_agent_md_unsigned_is_ok_with_verification_status(monk
 
 
 @pytest.mark.asyncio
-async def test_store_fetch_agent_md_invalid_is_ok_with_verification_status(monkeypatch, tmp_path: Path):
+async def test_store_download_agent_md_invalid_is_ok_with_verification_status(monkeypatch, tmp_path: Path):
     aid = "alice.agentid.pub"
     store = AIDStore(tmp_path, "")
     identity = _identity(aid)
@@ -390,7 +390,7 @@ async def test_store_fetch_agent_md_invalid_is_ok_with_verification_status(monke
 
     monkeypatch.setattr(store, "_http_get_text_with_headers", fake_get)
 
-    result = await store.fetch_agent_md(aid)
+    result = await store.download_agent_md(aid)
 
     assert result.ok, result.error
     assert result.data["content"] == tampered
@@ -402,7 +402,7 @@ async def test_store_fetch_agent_md_invalid_is_ok_with_verification_status(monke
 
 
 @pytest.mark.asyncio
-async def test_store_head_agent_md_maps_status(monkeypatch, tmp_path: Path):
+async def test_store_check_agent_md_maps_head_status(monkeypatch, tmp_path: Path):
     store = AIDStore(tmp_path, "")
     monkeypatch.setattr(store, "_resolve_gateway", lambda aid: "wss://gateway.agentid.pub")
 
@@ -413,15 +413,16 @@ async def test_store_head_agent_md_maps_status(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(store, "_http_head", fake_head)
 
-    found = await store.head_agent_md("alice.agentid.pub")
-    missing = await store.head_agent_md("bobb.agentid.pub")
+    found = await store.check_agent_md("alice.agentid.pub", ttl_days=0)
+    missing = await store.check_agent_md("bobb.agentid.pub", ttl_days=0)
 
     assert found.ok
-    assert found.data["found"] is True
-    assert found.data["etag"] == '"a"'
-    assert found.data["content_length"] == 12
-    assert not missing.ok
-    assert missing.error.code == "AGENTMD_NOT_FOUND"
+    assert found.data["remote_found"] is True
+    assert found.data["remote_etag"] == '"a"'
+    assert found.data["needs_update"] is True
+    assert missing.ok
+    assert missing.data["remote_found"] is False
+    assert missing.data["status"] == 404
 
     store.close()
 
@@ -479,3 +480,4 @@ async def test_store_gateway_resolution_isolated_by_issuer(monkeypatch, tmp_path
     ]
 
     store.close()
+

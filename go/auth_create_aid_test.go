@@ -21,19 +21,15 @@ import (
 
 const _stubServerCertPEM = "-----BEGIN CERTIFICATE-----\nstub-server-cert\n-----END CERTIFICATE-----\n"
 
-func newCreateAIDTestFlow(t *testing.T) (*AuthFlow, *keystore.FileKeyStore, string) {
+func newCreateAIDTestFlow(t *testing.T) (*RegisterFlow, *keystore.LocalIdentityStore, string) {
 	t.Helper()
 	dir := t.TempDir()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	ks, err := keystore.NewLocalIdentityStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("NewFileKeyStore failed: %v", err)
+		t.Fatalf("NewLocalIdentityStore failed: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
-	flow := NewAuthFlow(AuthFlowConfig{
-		TokenStore: ks,
-		Crypto:    &CryptoProvider{},
-		VerifySSL: false,
-	})
+	flow := NewRegisterFlow(RegisterFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
 	return flow, ks, dir
 }
 
@@ -77,13 +73,12 @@ func aidDirExists(t *testing.T, dataRoot, aid string) bool {
 
 // 场景 A：AID 已注册时查重命中 → 抛 IdentityConflictError，本地不落盘
 func TestRegisterAID_AbortsWhenAIDAlreadyRegistered(t *testing.T) {
-	_, ks, dataRoot := newCreateAIDTestFlow(t)
+	flow, _, dataRoot := newCreateAIDTestFlow(t)
 	aid := "taken-create-aid.example.com"
 
 	server := startGatewayWithCert(t, map[string]string{aid: _stubServerCertPEM})
 
-	rf := NewRegisterFlow(RegisterFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
-	_, err := rf.RegisterAID(context.Background(), gatewayWSURL(server), aid)
+	_, err := flow.RegisterAID(context.Background(), gatewayWSURL(server), aid)
 	if err == nil {
 		t.Fatal("expected IdentityConflictError, got nil")
 	}
@@ -98,7 +93,7 @@ func TestRegisterAID_AbortsWhenAIDAlreadyRegistered(t *testing.T) {
 
 // 场景 D：查重 HTTP 失败（非 404，非 200）时保守失败，不生成密钥
 func TestRegisterAID_CheckHTTPFailureDoesNotPersist(t *testing.T) {
-	_, ks, dataRoot := newCreateAIDTestFlow(t)
+	flow, _, dataRoot := newCreateAIDTestFlow(t)
 	aid := "checkfail-create-aid.example.com"
 
 	// 服务端永远 500
@@ -109,8 +104,7 @@ func TestRegisterAID_CheckHTTPFailureDoesNotPersist(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	rf := NewRegisterFlow(RegisterFlowConfig{Keystore: ks, Crypto: &CryptoProvider{}, VerifySSL: false})
-	_, err := rf.RegisterAID(context.Background(), strings.Replace(server.URL, "http://", "ws://", 1)+"/aun", aid)
+	_, err := flow.RegisterAID(context.Background(), strings.Replace(server.URL, "http://", "ws://", 1)+"/aun", aid)
 	if err == nil {
 		t.Fatal("expected error when /pki/cert/ returns 500")
 	}
@@ -147,7 +141,7 @@ func TestDownloadRegisteredCert_Behavior(t *testing.T) {
 			server := httptest.NewServer(mux)
 			defer server.Close()
 
-			cert, err := flow.downloadRegisteredCert(context.Background(),
+			cert, err := flow.FetchPeerCert(context.Background(),
 				strings.Replace(server.URL, "http://", "ws://", 1)+"/aun", "any.example.com")
 			if tc.wantErr {
 				if err == nil {
@@ -171,9 +165,9 @@ func TestDownloadRegisteredCert_Behavior(t *testing.T) {
 // LoadIdentity 对从未注册的 AID 调用时，不应在本地建目录（只读保护）
 func TestLoadIdentity_DoesNotCreateDirectoryForMissingAID(t *testing.T) {
 	dir := t.TempDir()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	ks, err := keystore.NewLocalIdentityStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("NewFileKeyStore failed: %v", err)
+		t.Fatalf("NewLocalIdentityStore failed: %v", err)
 	}
 	defer ks.Close()
 	aid := "never-existed.example.com"

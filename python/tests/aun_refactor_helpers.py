@@ -11,7 +11,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from aun_core import AID, AIDStore, AUNClient, ConnectionState
 from aun_core.errors import AuthError, RateLimitError
-from aun_core.keystore.file import FileKeyStore
+from aun_core.keystore.local_identity_store import LocalIdentityStore
+from aun_core.keystore.local_token_store import LocalTokenStore
 
 _CLIENT_STORE_OPTIONS: WeakKeyDictionary[AUNClient, dict[str, Any]] = WeakKeyDictionary()
 
@@ -65,7 +66,7 @@ def _import_configured_root_ca(store: AIDStore, root_ca_path: str | None) -> Non
             "status": "active",
         }],
     }
-    keystore = FileKeyStore(store.aun_path, encryption_seed=store.encryption_seed)
+    keystore = LocalIdentityStore(store.aun_path, encryption_seed=store.encryption_seed)
     try:
         keystore.save_trust_roots(
             trust_list,
@@ -157,9 +158,8 @@ def move_access_token_expiry_into_refresh_window(client: AUNClient, seconds_from
     if aid_obj is None:
         raise RuntimeError("client has no loaded AID")
     store_options = _CLIENT_STORE_OPTIONS.get(client) or {}
-    keystore = FileKeyStore(
+    keystore = LocalTokenStore(
         aid_obj.aun_path,
-        encryption_seed=str(store_options.get("encryption_seed") or ""),
     )
     try:
         expires_at = int(time.time()) + int(seconds_from_now)

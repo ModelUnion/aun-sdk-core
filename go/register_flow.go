@@ -18,7 +18,7 @@ import (
 )
 
 type pendingIdentityKeyStore interface {
-	keystore.FullKeyStore
+	keystore.KeyStore
 	keystore.PendingIdentityKeyStore
 }
 
@@ -33,16 +33,16 @@ type AIDRegisterResult struct {
 
 // RegisterFlowConfig RegisterFlow 配置
 type RegisterFlowConfig struct {
-	Keystore  keystore.FullKeyStore
+	Keystore  pendingIdentityKeyStore
 	Crypto    *CryptoProvider
 	VerifySSL bool
 	DnsNet    *DnsResilientNet
 }
 
-// RegisterFlow 处理 AID 注册流程，独立于 AuthFlow。
+// RegisterFlow 处理 AID 注册流程。
 // 与 TS SDK RegisterFlow 对应。
 type RegisterFlow struct {
-	keystore          keystore.FullKeyStore
+	keystore          pendingIdentityKeyStore
 	crypto            *CryptoProvider
 	verifySsl         bool
 	dnsNet            *DnsResilientNet
@@ -51,12 +51,72 @@ type RegisterFlow struct {
 
 // NewRegisterFlow 创建 RegisterFlow 实例
 func NewRegisterFlow(cfg RegisterFlowConfig) *RegisterFlow {
+	crypto := cfg.Crypto
+	if crypto == nil {
+		crypto = &CryptoProvider{}
+	}
 	return &RegisterFlow{
 		keystore:  cfg.Keystore,
-		crypto:    cfg.Crypto,
+		crypto:    crypto,
 		verifySsl: cfg.VerifySSL,
 		dnsNet:    cfg.DnsNet,
 	}
+}
+
+func (r *RegisterFlow) ValidateAIDName(aid string) error {
+	return validateAIDName(aid)
+}
+
+func (r *RegisterFlow) FetchPeerCert(ctx context.Context, gatewayURL, aid string) (string, error) {
+	return r.downloadRegisteredCert(ctx, gatewayURL, aid)
+}
+
+func (r *RegisterFlow) ShortRPC(ctx context.Context, gatewayURL, method string, params map[string]any) (map[string]any, error) {
+	return r.shortRPC(ctx, gatewayURL, method, params)
+}
+
+func (r *RegisterFlow) GenerateIdentity() (map[string]any, error) {
+	return r.crypto.GenerateIdentity()
+}
+
+func (r *RegisterFlow) NewClientNonce() string {
+	return r.crypto.NewClientNonce()
+}
+
+func (r *RegisterFlow) SignLoginNonce(privateKeyPEM, nonce, alg string) (string, string, error) {
+	return r.crypto.SignLoginNonce(privateKeyPEM, nonce, alg)
+}
+
+func (r *RegisterFlow) VerifyPhase1Response(ctx context.Context, gatewayURL string, result map[string]any, clientNonce string) error {
+	_ = ctx
+	_ = gatewayURL
+	authCertPEM := authGetStr(result, "auth_cert")
+	signatureB64 := authGetStr(result, "client_nonce_signature")
+	if authCertPEM == "" {
+		return NewAuthError("aid_login1 missing auth_cert")
+	}
+	if signatureB64 == "" {
+		return NewAuthError("aid_login1 missing client_nonce_signature")
+	}
+	authCert, err := authParsePEMCertificate(authCertPEM)
+	if err != nil {
+		return NewAuthError("aid_login1 returned invalid auth_cert")
+	}
+	if tErr := certTimeError(authCert); tErr != "" {
+		return NewAuthError(fmt.Sprintf("aid_login1 auth certificate is %s", tErr))
+	}
+	sigBytes, err := base64.StdEncoding.DecodeString(signatureB64)
+	if err != nil {
+		return NewAuthError("aid_login1 server auth signature decode failed")
+	}
+	if err := verifySignature(authCert.PublicKey, sigBytes, []byte(clientNonce)); err != nil {
+		return NewAuthError("aid_login1 server auth signature verification failed")
+	}
+	return nil
+}
+
+func (r *RegisterFlow) ReloadTrustedRoots() int {
+	return 0
 }
 
 // RegisterAID 注册新 AID，返回完整密钥材料（私钥由调用方通过 SaveKeyPair 保存）。
@@ -75,8 +135,8 @@ func (r *RegisterFlow) RegisterAID(ctx context.Context, gatewayURL, aid string) 
 		return AIDRegisterResult{}, err
 	}
 
-	pendingStore, pendingOK := r.keystore.(pendingIdentityKeyStore)
-	if !pendingOK {
+	pendingStore := r.keystore
+	if pendingStore == nil {
 		return AIDRegisterResult{}, NewAuthError("keystore does not support pending registration")
 	}
 

@@ -6,6 +6,34 @@
 
 ---
 
+## 0.4.6 — 2026-06-01
+
+### Added
+- **`LocalIdentityStore` 类**（`keystore/local_identity_store.py`）：`KeyStore` Protocol 的文件系统 + SQLite 实现，支持私钥加密存储、证书管理、信任根管理、pending 原子注册。替代 `FileKeyStore`。
+- **`LocalTokenStore` 类**（`keystore/local_token_store.py`）：`TokenStore` Protocol 的文件系统实现，不含私钥操作，供 `AuthFlow` / `AUNClient` 持有。
+- **`AgentMdManager` 类**（`agent_md.py`）：独立的 agent.md 管理器，负责下载、验证、ETag 缓存、TTL 检查、签名验证，通过回调获取 token/gateway/AID，避免反向依赖 `AUNClient`。
+- **`GatewayCertificateVerifier` 类**（`cert_verifier.py`）：独立的网关证书验证器，支持证书链缓存、CRL/OCSP 撤销检查、信任根管理。
+- **`KeyStore` 接口新增方法**：`load_cert` / `save_cert`（证书管理）、`change_seed`（种子变更）、`trust_root_dir` / `save_trust_roots` / `save_issuer_root_cert`（信任根管理）。
+- **`TokenStore` 接口新增方法**：`get_metadata_value` / `set_metadata_value`（元数据 KV 操作）。
+- **`RegisterFlow` 新增公开方法**：`validate_aid_name`、`fetch_peer_cert`、`short_rpc`、`generate_identity`、`new_client_nonce`、`verify_phase1_response`、`reload_trusted_roots`。
+- **`AuthFlow` 新增方法**：`cache_gateway_ca_chain` / `discard_gateway_ca_chain`（网关 CA 链缓存管理）。
+- **`AIDStore` 新增方法**：`download_agent_md`（替代 `fetch_agent_md`）、`check_agent_md`（替代 `head_agent_md`）。
+- **`AUNClient.upload_agent_md()`**：`content` 参数改为可选（`str | None = None`）。
+
+### Changed
+- **Keystore 架构重构**：`FileKeyStore` 拆分为 `LocalIdentityStore`（含私钥）和 `LocalTokenStore`（仅 token）；`__all__` 同步更新。
+- **Agent.md 管理重构**：缓存、同步逻辑从 `AUNClient` / `AIDStore` 提取到 `AgentMdManager`；`AUNClient` 移除 `_agent_md_path`、`_local_agent_md_etag`、`_remote_agent_md_etag`、`_agent_md_cache` 等内部字段。
+- **`AIDStore.fetch_agent_md()`** 重命名为 `download_agent_md()`，返回类型 `FetchAgentMdResult` 重命名为 `DownloadAgentMdResult`。
+- **证书验证职责分离**：`AuthFlow` 中的证书验证逻辑提取到 `GatewayCertificateVerifier`；`RegisterFlow` 持有该实例。
+- **`AID` 验证、短连接 RPC、身份生成**：从 `AuthFlow` 内部方法迁移到 `RegisterFlow` 公开方法，`AIDStore` 内部调用同步更新。
+
+### Removed
+- **`FileKeyStore` 类**：拆分为 `LocalIdentityStore` 和 `LocalTokenStore`，不再导出。
+- **`AIDStore.head_agent_md()`**：功能并入 `check_agent_md()`。
+- **`AIDStore._agent_md_url()`、`_agent_md_cache`**：由 `AgentMdManager` 接管。
+
+---
+
 ## 0.4.5 — 2026-05-31
 
 ### Added

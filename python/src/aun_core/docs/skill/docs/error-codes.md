@@ -32,7 +32,7 @@
 | `StateError` | 状态不正确，如未连接时调用 `call()`、缺少本地身份等 |
 | `SerializationError` | 收到无效 JSON 或不可解析的 WebSocket 消息 |
 
-`RateLimitError` 和 `5xxx` 错误会带 `retryable=True`。
+`RateLimitError` 和 `5xxx` 错误会带 `retryable=True`。身份管理类方法返回 `Result`，错误形态为 `{"ok": false, "error": {"code": "...", "message": "..."}}`。
 
 ## 错误处理
 
@@ -52,7 +52,7 @@ from aun_core import (
     ValidationError,
 )
 
-client = AUNClient({"aun_path": "./aun_data"})
+# client 已通过 AUNClient(aid) 构造并完成 connect()
 
 try:
     result = await client.call("message.send", {

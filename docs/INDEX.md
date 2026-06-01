@@ -13,7 +13,7 @@
 | [跨语言容器E2E测试方案](design/跨语言容器E2E测试方案.md) | 多语言 SDK 同网同服、test-runner 控制面的跨语言 E2E 方案 |
 | [E2EE V2 简化为 1DH + Per-AID Wrap 方案](design/E2EE_V2简化为1DH加Per-AID_Wrap方案.md) | SDK bootstrap 能力声明 + 服务端 policy 控制 1DH/per-AID wrap 的兼容方案 |
 | [AUN RPC Trace 增强设计](design/2026-05-22-aun-rpc-trace-enhancement.md) | RPC trace 诊断字段与 enter/exit span 设计 |
-| [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 缓存、SQLite 表、消息信封与 RPC 响应 ETag 透传方案 |
+| [远程 agent.md 缓存与 ETag 透传方案](agent.md/远程agent.md缓存与etag透传方案.md) | 远程 agent.md per-AID 本地文件/IndexedDB 缓存、消息信封与 RPC 响应 ETag 透传方案 |
 | [SDK 文档索引](sdk/INDEX.md) | SDK 使用手册、RPC 手册、E2EE 手册的子索引 |
 | [SDK 查阅指南](sdk/AUN_DOCS_GUIDE.md) | SDK 文档按行区间渐进式查阅方法 |
 | [协议文档目录](protocol/) | AUN 协议相关文档 |
@@ -76,7 +76,7 @@
 
 ### 远程 agent.md 缓存与 ETag 透传方案
 
-定义每个远程 AID 在 SDK 内存和 SQLite 中维护一条 `remote_agent_md_cache` 记录，字段包含 `remote_etag`、`local_etag`、`content`、`last_modified`、`fetched_at`、`observed_at` 等。方案同时规定 `message.send` 响应向发送端透传 `to` 的 agent.md ETag，消息信封向接收端透传 `from` 的 agent.md ETag，并给出按需下载、304 处理、竞态和跨 SDK 一致性规则。
+定义每个远程 AID 在 SDK 内存和本地持久化记录中维护一条 agent.md 状态：Python / TypeScript / Go 使用 `{aun_path}/AIDs/{aid}/agent.md` 与 `agentmd.json`，浏览器 JavaScript 使用 IndexedDB logical key。方案同时规定 `message.send` 响应向发送端透传 `to` 的 agent.md ETag，消息信封向接收端透传 `from` 的 agent.md ETag，并给出按需下载、无条件 GET、304 兼容、竞态和跨 SDK 一致性规则。
 
 ### SDK 文档索引
 

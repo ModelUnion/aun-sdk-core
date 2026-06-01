@@ -39,7 +39,7 @@ async def create_client(aid: str) -> AUNClient:
             raise RuntimeError(registered["error"]["message"])
         loaded = store.load(aid)
 
-    client = AUNClient(loaded["data"]["aid"], debug=True)
+    client = AUNClient(loaded["data"]["aid"])
     await client.connect({"slot_id": "main", "auto_reconnect": True})
     return client
 
@@ -68,14 +68,14 @@ asyncio.run(main())
 
 ## 多语言构造约束
 
-| 语言 | options-only | AID + options |
+| 语言 | 无身份构造 | 带身份构造 |
 |------|--------------|---------------|
 | Python | `AUNClient()` | `AUNClient(aid)` |
 | TypeScript | `new AUNClient()` | `new AUNClient(aid)` |
 | JavaScript | `new AUNClient()` | `new AUNClient(aid)` |
 | Go | `aun.NewAUNClientEmpty()` | `aun.NewAUNClient(aid)` |
 
-`aid` 必须是 AIDStore.load() 返回的 AID 对象，不是字符串。debug/verify_ssl/root_ca_path 等配置由 AID 携带，不再通过构造参数传入。
+`aid` 必须是 `AIDStore.load()` 返回的 AID 对象，不是字符串。debug / verify_ssl / root_ca_path 等配置由 AID 携带，不再通过 `AUNClient` 构造参数传入。
 
 ---
 

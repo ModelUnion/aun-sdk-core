@@ -53,7 +53,7 @@ function setupClientWithAid(aid: string): AUNClient {
 }
 
 function loadGatewayMetadata(client: AUNClient, aid: string): string {
-  return String((client as any)._keystore.loadMetadata(aid)?.gateway_url ?? '').trim();
+  return String((client as any)._tokenStore.loadMetadata(aid)?.gateway_url ?? '').trim();
 }
 
 // ── 改进 A: authenticate() 复用 cached_token ─────────────────────────
@@ -161,7 +161,7 @@ describe('AUNClient._resolveGatewayForAid keystore 持久化', () => {
     const client = setupClientWithAid(aid);
     (client as any)._aid = aid;
 
-    (client as any)._keystore.saveMetadata(aid, { gateway_url: 'wss://cached-gateway.test/aun' });
+    (client as any)._tokenStore.saveMetadata(aid, { gateway_url: 'wss://cached-gateway.test/aun' });
 
     // mock discovery —— 不应被调用
     const discoverSpy = vi.fn();
@@ -193,7 +193,7 @@ describe('AUNClient._resolveGatewayForAid keystore 持久化', () => {
     const client = setupClient();
     (client as any)._aid = aid;
 
-    (client as any)._keystore.saveMetadata(aid, { gateway_url: 'wss://stale.test/aun' });
+    (client as any)._tokenStore.saveMetadata(aid, { gateway_url: 'wss://stale.test/aun' });
     (client as any)._gatewayUrl = 'wss://memory-fresh.test/aun';
 
     const discoverSpy = vi.fn();

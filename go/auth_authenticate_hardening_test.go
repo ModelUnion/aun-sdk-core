@@ -20,9 +20,9 @@ import (
 func newStubAuthFlow(t *testing.T, stub map[string]any) *AuthFlow {
 	t.Helper()
 	dir := t.TempDir()
-	base, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	base, err := keystore.NewLocalTokenStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("NewFileKeyStore: %v", err)
+		t.Fatalf("NewLocalTokenStore: %v", err)
 	}
 	t.Cleanup(func() { base.Close() })
 	flow := NewAuthFlow(AuthFlowConfig{

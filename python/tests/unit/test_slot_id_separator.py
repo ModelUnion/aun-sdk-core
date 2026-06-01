@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 from aun_core.config import normalize_slot_id, slot_isolation_key
 from aun_core.client import AUNClient
+from aun_core.errors import ValidationError
 
 
 # --- slot_isolation_key ---
@@ -69,3 +70,35 @@ def test_different_prefix_does_not_receive():
 def test_no_slot_id_field_receives():
     client = _make_client("evolclaw cli")
     assert client._message_targets_current_instance({"content": "hello"}) is True
+
+
+# --- _inject_message_cursor_context ---
+
+@pytest.mark.parametrize("slot_id", ["evolclaw cli", "evolclaw/cli", "evolclaw:cli"])
+def test_message_cursor_context_accepts_slot_separators(slot_id):
+    client = _make_client(slot_id)
+    params = {"after_seq": 0, "limit": 10}
+
+    client._inject_message_cursor_context("message.pull", params)
+
+    assert params["device_id"] == "test-device"
+    assert params["slot_id"] == slot_id
+
+
+def test_message_cursor_context_matches_slot_isolation_key():
+    client = _make_client("evolclaw cli")
+    params = {"seq": 1, "slot_id": "evolclaw daemon"}
+
+    client._inject_message_cursor_context("message.ack", params)
+
+    assert params["device_id"] == "test-device"
+    assert params["slot_id"] == "evolclaw cli"
+
+
+def test_message_cursor_context_rejects_different_slot_isolation_key():
+    client = _make_client("evolclaw cli")
+    with pytest.raises(ValidationError, match="slot_id must match"):
+        client._inject_message_cursor_context("message.pull", {
+            "after_seq": 0,
+            "slot_id": "other daemon",
+        })

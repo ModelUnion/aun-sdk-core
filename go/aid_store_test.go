@@ -88,10 +88,7 @@ func TestAIDStoreRegisterPersistenceKeepsPrivateKeyMaterial(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SaveKeyPair 失败: %v", err)
 	}
-	if err := s.client.auth.persistIdentity(map[string]any{
-		"aid":  aid,
-		"cert": certPEM,
-	}); err != nil {
+	if err := s.keyStore.SaveCert(aid, certPEM); err != nil {
 		t.Fatalf("AIDStore 注册持久化失败: %v", err)
 	}
 
@@ -344,8 +341,8 @@ func TestAIDStoreResolve_CertNotFound(t *testing.T) {
 	defer server.Close()
 
 	s := newTestAIDStore(t)
-	// 测试专用：直接设置内部 client 的 gateway，跳过 discovery
-	s.client.setGatewayURL(server.URL)
+	// 测试专用：直接设置内部 gateway，跳过 discovery
+	s.gatewayURL = server.URL
 
 	// 解析一个本地未缓存的 AID，强制走 PKI 拉取路径
 	r := s.Resolve(context.Background(), "ghost.aid.com", AIDStoreResolveOptions{SkipAgentMD: true})

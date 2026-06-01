@@ -792,6 +792,16 @@ class AuthFlow:
             # 信任标记只能在 _verify_auth_cert_chain 完整验证（含受信根锚定）通过后设置。
         return self._load_cert_bundle(cached)
 
+    def cache_gateway_ca_chain(self, gateway_url: str, chain_pems: list[str], chain_aid: str = "") -> None:
+        cache_key = f"{gateway_url}:{chain_aid}" if chain_aid else gateway_url
+        self._gateway_chain_cache[cache_key] = list(chain_pems)
+        self._gateway_ca_verified.pop(cache_key, None)
+
+    def discard_gateway_ca_chain(self, gateway_url: str, chain_aid: str = "") -> None:
+        cache_key = f"{gateway_url}:{chain_aid}" if chain_aid else gateway_url
+        self._gateway_chain_cache.pop(cache_key, None)
+        self._gateway_ca_verified.pop(cache_key, None)
+
     async def _verify_auth_cert_revocation(self, gateway_url: str, auth_cert: x509.Certificate, chain_aid: str = "") -> None:
         chain = await self._load_gateway_ca_chain(gateway_url, chain_aid)
         if not chain:
@@ -1121,8 +1131,8 @@ class AuthFlow:
                 dynamic_bundle = token_store.trust_root_bundle_path()
                 if dynamic_bundle.exists():
                     candidate_paths.append(dynamic_bundle)
-            except Exception as exc:
-                self._log.warn("auth", "trust root bundle path resolve failed: %s", exc)
+            except Exception:
+                pass
         bundled_dir = Path(__file__).resolve().parent / "certs"
         if bundled_dir.exists():
             candidate_paths.extend(sorted(bundled_dir.glob("*.crt")))
@@ -1279,7 +1289,7 @@ class AuthFlow:
     def _load_identity_or_raise(self, aid: str | None = None) -> dict[str, Any]:
         requested_aid = aid or self._aid
 
-        # 优先路径：使用注入的内存 identity（私钥已由 AIDStore 解密并传入）
+        # 优先路径：使用注入的内存 identity（私钥已由上层身份存储加载后传入）
         if self._mem_identity is not None:
             mem = self._mem_identity
             if requested_aid and str(mem.get("aid") or "") != requested_aid:

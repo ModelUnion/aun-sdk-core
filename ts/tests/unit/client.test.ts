@@ -11,6 +11,7 @@ import { ProtectedHeaders } from '../../src/protected-headers.js';
 import { computeStateCommitment } from '../../src/v2/state/index.js';
 import { encryptP2PMessage } from '../../src/v2/e2ee/encrypt-p2p.js';
 import { encryptGroupMessage } from '../../src/v2/e2ee/encrypt-group.js';
+import { LocalIdentityStore } from '../../src/keystore/local-identity-store.js';
 import { generateP256Keypair } from '../../src/v2/crypto/ecdh.js';
 
 function makeMockAid(aunPath: string, extra?: Partial<AID>): AID {
@@ -332,11 +333,11 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
   it('同步 token 时应写入当前实例态', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-client-sync-'));
     const client = new AUNClient(makeMockAid(tmpDir));
-    const ks = (client as any)._keystore;
+    const idStore = new LocalIdentityStore(tmpDir);
     const aid = 'sync.agentid.pub';
     const deviceId = (client as any)._deviceId;
 
-    ks.saveIdentity(aid, {
+    idStore.saveIdentity(aid, {
       aid,
       private_key_pem: 'PRIVATE_KEY',
       public_key_der_b64: 'pub',
@@ -344,11 +345,12 @@ describe('AUNClient._syncIdentityAfterConnect', () => {
     });
 
     (client as any)._aid = aid;
+    (client as any)._identity = { aid, private_key_pem: 'PRIVATE_KEY', public_key_der_b64: 'pub', curve: 'P-256' };
     (client as any)._syncIdentityAfterConnect('tok-connect');
 
     const authDeviceId = (client as any)._auth._deviceId;
     const authSlotId = (client as any)._auth._slotId ?? '';
-    const instanceState = ks.loadInstanceState(aid, authDeviceId, authSlotId);
+    const instanceState = (client as any)._tokenStore.loadInstanceState(aid, authDeviceId, authSlotId);
     expect(instanceState?.access_token).toBe('tok-connect');
   });
 });
@@ -428,6 +430,47 @@ describe('AUNClient message.send 接收者校验', () => {
       after_seq: 0,
       limit: 10,
     });
+  });
+
+  it.each(['evolclaw cli', 'evolclaw/cli', 'evolclaw:cli'])(
+    'message.pull/ack cursor 接受含分隔符的 slot_id: %s',
+    (slotId) => {
+      const client = new AUNClient();
+      (client as any)._deviceId = 'device-1';
+      (client as any)._slotId = slotId;
+      const pullParams = { after_seq: 0, limit: 10 };
+      const ackParams = { seq: 1 };
+
+      (client as any)._injectMessageCursorContext('message.pull', pullParams);
+      (client as any)._injectMessageCursorContext('message.ack', ackParams);
+
+      expect(pullParams).toEqual(expect.objectContaining({
+        device_id: 'device-1',
+        slot_id: slotId,
+      }));
+      expect(ackParams).toEqual(expect.objectContaining({
+        device_id: 'device-1',
+        slot_id: slotId,
+      }));
+    },
+  );
+
+  it('message.pull/ack cursor 显式 slot_id 按隔离键匹配', () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'device-1';
+    (client as any)._slotId = 'evolclaw cli';
+    const params = { after_seq: 0, limit: 10, slot_id: 'evolclaw daemon' };
+
+    (client as any)._injectMessageCursorContext('message.pull', params);
+
+    expect(params).toEqual(expect.objectContaining({
+      device_id: 'device-1',
+      slot_id: 'evolclaw cli',
+    }));
+    expect(() => (client as any)._injectMessageCursorContext('message.ack', {
+      seq: 1,
+      slot_id: 'other daemon',
+    })).toThrow('slot_id must match');
   });
 });
 
@@ -770,7 +813,7 @@ describe('AUNClient SeqTracker 持久化错误事件', () => {
     (client as any)._seqTracker.onMessageSeq('p2p:test.aid.com', 2);
 
     // 让 keystore.saveSeq 抛出异常
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     if (typeof ks.saveSeq === 'function') {
       vi.spyOn(ks, 'saveSeq').mockImplementation(() => { throw new Error('disk full'); });
     } else {
@@ -798,7 +841,7 @@ describe('AUNClient SeqTracker 持久化错误事件', () => {
     (client as any)._slotId = 'slot-1';
 
     // 让 keystore 的读取方法抛出异常
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     if (typeof ks.loadAllSeqs === 'function') {
       vi.spyOn(ks, 'loadAllSeqs').mockImplementation(() => { throw new Error('db corrupted'); });
     } else {
@@ -3388,69 +3431,16 @@ describe('有序消息发布', () => {
 });
 
 describe('AUNClient agent.md ETag 缓存', () => {
-  const agentRoot = (client: AUNClient): string => (client as any)._agentMdPath as string;
-  const agentEtag = (content: string): string => `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
+  const agentRoot = (client: AUNClient): string => (client as any)._agentMdManager.root as string;
   const readAgentRecord = (client: AUNClient, aid: string): any =>
     JSON.parse(readFileSync(join(agentRoot(client), aid, 'agentmd.json'), 'utf-8'));
-  const writeAgentFile = (client: AUNClient, aid: string, content: string): void => {
-    mkdirSync(join(agentRoot(client), aid), { recursive: true });
-    writeFileSync(join(agentRoot(client), aid, 'agent.md'), content, 'utf-8');
-  };
 
-  it('publishAgentMd 成功后应持久化自己的正文文件和 list.json 元数据', async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-publish-'));
-    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '---\naid: alice.agentid.pub\n---\n# Alice\n';
-    writeAgentFile(client, 'alice.agentid.pub', body);
-
-    (client as any)._currentAid = {
-      aid: 'alice.agentid.pub',
-      isPrivateKeyValid: () => true,
-      signAgentMd: vi.fn((content: string) => ({
-        ok: true,
-        data: { signed: `${content}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n` },
-      })),
-    };
-    (client as any)._uploadAgentMd = vi.fn(async () => ({
-      aid: 'alice.agentid.pub',
-      etag: '"alice-cloud"',
-      last_modified: 'Sun, 24 May 2026 00:00:00 GMT',
-    }));
-
-    await client.publishAgentMd();
-
-    const saved = readFileSync(join(agentRoot(client), 'alice.agentid.pub', 'agent.md'), 'utf-8');
-    const record = readAgentRecord(client, 'alice.agentid.pub');
-    expect(saved).toContain('aid: alice.agentid.pub');
-    expect(record.content).toBeUndefined();
-    expect(record.local_etag).toBe(agentEtag(saved));
-    expect(record.remote_etag).toBe('"alice-cloud"');
-    expect(record.last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
-    (client as any)._keystore.close?.();
-  });
-
-  it('fetchAgentMd 下载远端后应写入正文文件和 list.json 元数据', async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-fetch-'));
-    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    (client as any)._agentMdCache = new Map([
-      ['bob.agentid.pub', { text: body, etag: '"bob-cloud"', lastModified: 'Sun, 24 May 2026 00:00:00 GMT' }],
-    ]);
-    (client as any)._downloadAgentMd = vi.fn(async () => body);
-    (client as any)._verifyAgentMd = vi.fn(async () => ({ status: 'unsigned', verified: false }));
-
-    const info = await (client as any)._startAgentMdFetchTask('bob.agentid.pub');
-
-    expect(info.aid).toBe('bob.agentid.pub');
-    expect(readFileSync(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'), 'utf-8')).toBe(body);
-    const record = readAgentRecord(client, 'bob.agentid.pub');
-    expect(record.content).toBeUndefined();
-    expect(record.local_etag).toBe(agentEtag(body));
-    expect(record.remote_etag).toBe('"bob-cloud"');
-    expect(record.verify_status).toBe('unsigned');
-    (client as any)._keystore.close?.();
+  it('仅保留 uploadAgentMd 公开入口，旧 agent.md client 入口已移除', () => {
+    const client = new AUNClient();
+    expect(typeof client.uploadAgentMd).toBe('function');
+    for (const name of ['publishAgentMd', 'fetchAgentMd', 'checkAgentMd', 'getLocalAgentMdEtag', 'getRemoteAgentMdEtag']) {
+      expect((client as any)[name]).toBeUndefined();
+    }
   });
 
   it('RPC _meta 应同时持久化自身和目标 AID 的云端 ETag', () => {
@@ -3467,12 +3457,11 @@ describe('AUNClient agent.md ETag 缓存', () => {
       },
     });
 
-    expect(client.getRemoteAgentMdEtag()).toBe('"alice-cloud"');
     expect(readAgentRecord(client, 'alice.agentid.pub').remote_etag).toBe('"alice-cloud"');
     expect(readAgentRecord(client, 'bob.agentid.pub').remote_etag).toBe('"bob-cloud"');
     expect(readAgentRecord(client, 'carol.agentid.pub').remote_etag).toBe('"carol-cloud"');
     expect(readAgentRecord(client, 'dave.agentid.pub').remote_etag).toBe('"dave-cloud"');
-    (client as any)._keystore.close?.();
+    (client as any)._tokenStore?.close?.();
   });
 
   it('transport 事件和通知的顶层 _meta 应进入 agent.md ETag 缓存', () => {
@@ -3493,7 +3482,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
 
     expect(readAgentRecord(client, 'carol.agentid.pub').remote_etag).toBe('"carol-cloud"');
     expect(readAgentRecord(client, 'dave.agentid.pub').remote_etag).toBe('"dave-cloud"');
-    (client as any)._keystore.close?.();
+    (client as any)._tokenStore?.close?.();
   });
 
   it('V2 信封 agent_md.sender 应透传到应用层并落到 list.json', () => {
@@ -3516,52 +3505,7 @@ describe('AUNClient agent.md ETag 缓存', () => {
     expect(event.protected_headers).toEqual({ payload_type: 'chat.text', sdk_lang: 'ts' });
     expect(event.agent_md).toEqual({ sender: { aid: 'alice.agentid.pub', etag: '"alice-cloud"' } });
     expect(readAgentRecord(client, 'alice.agentid.pub').remote_etag).toBe('"alice-cloud"');
-    (client as any)._keystore.close?.();
-  });
-
-  it('checkAgentMd 应用 HEAD 返回的云端 ETag 与本地正文 ETag 比较并落到 list.json', async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-check-'));
-    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '# Bob\n';
-    (client as any)._saveAgentMdRecord('bob.agentid.pub', { content: body, local_etag: agentEtag(body), remote_etag: '"old"' });
-    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
-      aid,
-      found: true,
-      etag: agentEtag(body),
-      last_modified: 'Sun, 24 May 2026 00:00:00 GMT',
-      status: 200,
-    }));
-
-    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub');
-
-    expect(result.local_found).toBe(true);
-    expect(result.remote_found).toBe(true);
-    expect(result.in_sync).toBe(true);
-    expect(result.remote_etag).toBe(agentEtag(body));
-    expect(readAgentRecord(client, 'bob.agentid.pub').remote_etag).toBe(agentEtag(body));
-    (client as any)._keystore.close?.();
-  });
-
-  it('checkAgentMd 本地无记录时仍应 HEAD 云端并返回 local_found=false', async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'aun-agent-md-check-missing-'));
-    const client = new AUNClient(makeMockAid(join(tmpDir, 'aun')));
-    (client as any)._aid = 'alice.agentid.pub';
-    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
-      aid,
-      found: true,
-      etag: '"remote"',
-      last_modified: '',
-      status: 200,
-    }));
-
-    const result = await (client as any)._checkAgentMdCache('carol.agentid.pub');
-
-    expect(result.local_found).toBe(false);
-    expect(result.remote_found).toBe(true);
-    expect(result.in_sync).toBe(false);
-    expect(result.remote_etag).toBe('"remote"');
-    (client as any)._keystore.close?.();
+    (client as any)._tokenStore?.close?.();
   });
 });
 

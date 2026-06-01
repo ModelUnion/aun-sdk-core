@@ -1,5 +1,7 @@
 package keystore
 
+import "github.com/modelunion/aun-sdk-core/go/secretstore"
+
 type ModuleLogger interface {
 	Error(format string, args ...any)
 	Warn(format string, args ...any)
@@ -20,9 +22,11 @@ var pkgLogger ModuleLogger = nullLogger{}
 func SetLogger(l ModuleLogger) {
 	if l == nil {
 		pkgLogger = nullLogger{}
+		secretstore.SetLogger(nil)
 		return
 	}
 	pkgLogger = l
+	secretstore.SetLogger(l)
 }
 
 func pkgLogKeystore() ModuleLogger {

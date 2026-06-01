@@ -6,6 +6,32 @@
 
 ---
 
+## 0.4.6 — 2026-06-01
+
+### Added
+- **`LocalIdentityStore` 类**（`keystore/local-identity-store.ts`）：基于文件系统 + SQLite 的 `KeyStore` 实现，支持私钥加密存储、证书管理、pending 身份崩溃恢复、信任根管理。替代 `FileKeyStore`。
+- **`LocalTokenStore` 类**（`keystore/local-token-store.ts`）：基于 SQLite 的 `TokenStore` 实现，不含私钥操作，支持证书管理、实例状态、seq 跟踪、E2EE prekey/session/群组密钥存储。
+- **`AgentMdManager` 类**（`agent-md.ts`）：独立的 agent.md 管理器，支持并发下载控制、ETag 缓存、本地/远程同步状态追踪、内容签名验证。
+- **`KeyStore` 接口新增方法**：`loadCert(aid, certFingerprint?)` / `saveCert(aid, certPem, certFingerprint?, opts?)`。
+- **`RegisterFlow` 新增公开方法**：`validateAidName`、`fetchPeerCert`、`shortRpc`、`generateIdentity`、`newClientNonce`、`verifyPhase1Response`。
+- **`AIDStore` 新增方法**：`downloadAgentMd`（替代 `fetchAgentMd`）、`checkAgentMd`（替代 `headAgentMd`）。
+- **`AUNClient.uploadAgentMd()`**：新增方法，签名并上传当前 AID 的 agent.md。
+- **导出新增**：`LocalIdentityStore`、`LocalTokenStore`、`TokenStore` 接口。
+
+### Changed
+- **`AIDStore`**：内部存储从 `FileKeyStore` 改为 `LocalIdentityStore`；证书获取和续签/重钥流程改为调用 `RegisterFlow` 公开方法。
+- **`AUNClient` 架构**：移除 agent.md 内部字段（`_agentMdPath`、`_agentMdCache` 等），改由 `AgentMdManager` 统一管理；新增 `createAgentMdManagerForRuntime()` 工厂函数。
+- **`AIDStore.fetchAgentMd()`** 重命名为 `downloadAgentMd()`，返回类型更新为 `DownloadAgentMdResult`。
+- **`RegisterFlow` 类型签名**：`PendingKeyStore` 从 `FullKeyStore & {...}` 改为 `KeyStore & {...}`。
+
+### Removed
+- **`FileKeyStore` 类**（`keystore/file.ts`）：完整移除，功能分解为 `LocalIdentityStore` 和 `LocalTokenStore`。
+- **`FullKeyStore` 类型别名**：不再需要。
+- **`AIDStore.headAgentMd()`**：功能整合到 `AgentMdManager`。
+- **`AUNClient` 中的 agent.md 内部方法**：`_saveAgentMdRecord`、`_observeAgentMdMeta`、`_observeAgentMdEtag` 等。
+
+---
+
 ## 0.4.5 — 2026-05-31
 
 ### Added

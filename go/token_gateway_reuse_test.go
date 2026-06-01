@@ -17,13 +17,13 @@ import (
 
 // ── 测试公共 helper ─────────────────────────────────────────
 
-// newTestAuthFlow 使用真实 FileKeyStore + 临时目录构造 AuthFlow，避免触网。
-func newTestAuthFlow(t *testing.T) (*AuthFlow, *keystore.FileKeyStore) {
+// newTestAuthFlow 使用真实 LocalTokenStore + 临时目录构造 AuthFlow，避免触网。
+func newTestAuthFlow(t *testing.T) (*AuthFlow, *keystore.LocalTokenStore) {
 	t.Helper()
 	dir := t.TempDir()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	ks, err := keystore.NewLocalTokenStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("NewFileKeyStore 失败: %v", err)
+		t.Fatalf("NewLocalTokenStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	flow := NewAuthFlow(AuthFlowConfig{
@@ -137,7 +137,7 @@ func TestTokenGatewayReuse_LoadCachedGatewayURLHitsKeystore(t *testing.T) {
 	// 直接通过 MetadataKeyStore 接口预置缓存值。
 	mks, ok := any(ks).(keystore.MetadataKeyStore)
 	if !ok {
-		t.Fatal("FileKeyStore 应实现 MetadataKeyStore")
+		t.Fatal("LocalTokenStore 应实现 MetadataKeyStore")
 	}
 	if err := mks.SetMetadataValue(aid, "gateway_url", "wss://gw.cached.example/aun"); err != nil {
 		t.Fatalf("SetMetadataValue 失败: %v", err)

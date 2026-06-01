@@ -1,47 +1,42 @@
-# auth.check_aid
+# AIDStore.diagnose
 
-检查 AID 的本地密钥/证书完整性和远程注册状态。
+0.4.x 已移除公开 `client.auth` 命名空间。AID 本地/远端状态检查通过 `AIDStore.diagnose(aid)` 完成。
 
 ## 调用方式
 
 ```python
-result = await client.auth.check_aid({"aid": "alice.agentid.pub"})
+result = await store.diagnose("alice.agentid.pub")
 ```
 
-## 参数
+TypeScript / JavaScript：
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| aid | string | 是 | 要检查的 AID |
+```ts
+const result = await store.diagnose("alice.agentid.pub");
+```
+
+Go：
+
+```go
+result := store.Diagnose(ctx, "alice.agentid.pub")
+```
 
 ## 返回值
 
 ```json
 {
   "aid": "alice.agentid.pub",
-  "status": "local_ready",
-  "can_register": false,
+  "status": "ready",
+  "local_valid": true,
+  "remote_registered": true,
+  "suggestions": [],
   "local": {
-    "exists": true,
-    "complete": true,
+    "cert": true,
     "private_key": true,
-    "public_key": true,
-    "certificate": {
-      "present": true,
-      "valid": true,
-      "expired": false,
-      "not_before": "2025-01-01T00:00:00+00:00",
-      "not_after": "2026-01-01T00:00:00+00:00",
-      "expires_at": 1767225600,
-      "seconds_until_expiry": 31536000,
-      "fingerprint": "sha256:abcdef...",
-      "subject_cn": "alice.agentid.pub",
-      "aid_matches": true
-    },
-    "issues": []
+    "error": null
   },
   "remote": {
-    "status": "not_checked"
+    "checked": true,
+    "exists": true
   }
 }
 ```
@@ -50,36 +45,13 @@ result = await client.auth.check_aid({"aid": "alice.agentid.pub"})
 
 | 值 | 含义 |
 |----|------|
-| `local_ready` | 本地密钥和证书完整，可直接连接 |
-| `local_incomplete` | 本地缺少私钥/公钥/证书，需要检查远程 |
-| `available` | 本地不完整且远程未注册，可以注册 |
-| `registered_remote` | 本地不完整但远程已注册（需要恢复或重新导入） |
-| `unknown` | 无法确定状态（网络错误等） |
-
-## can_register 取值
-
-| 值 | 含义 |
-|----|------|
-| `true` | AID 可注册（远程未占用） |
-| `false` | AID 不可注册（本地已就绪或远程已占用） |
-| `null` | 无法确定（本地已就绪时不检查远程） |
+| `ready` | 本地私钥有效且远端已注册 |
+| `available` | 本地没有可用身份且远端未注册 |
+| `registered_remote` | 远端已注册，但本地身份不可用或不匹配 |
+| `unknown` | 网络或本地状态不足，无法确定 |
 
 ## 使用场景
 
-1. **首次启动**：检查 AID 是否已存在，决定是创建还是恢复
-2. **连接前检查**：确认本地密钥完整性，避免连接失败
-3. **证书续期提醒**：检查 `seconds_until_expiry` 判断是否需要续期
-4. **多设备同步**：检查远程注册状态，判断是否需要导入密钥
-
-## 跨语言调用
-
-```typescript
-// TypeScript / JavaScript
-const result = await client.auth.checkAid({ aid: 'alice.agentid.pub' });
-
-// Go
-result, err := client.Auth.CheckAID(ctx, map[string]any{"aid": "alice.agentid.pub"})
-
-// C++
-client->Auth()->CheckAID("alice.agentid.pub", [](Result r, json result) { ... });
-```
+1. 首次启动前判断应加载还是注册。
+2. 连接失败时确认本地证书、私钥和远端注册状态。
+3. 换机、迁移目录或证书损坏后定位是否需要恢复、续签或换钥。

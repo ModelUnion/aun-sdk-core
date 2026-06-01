@@ -10,7 +10,7 @@ from cryptography.x509.oid import NameOID
 
 from aun_core import AIDStore
 from aun_core.config import get_device_id
-from aun_core.keystore.file import FileKeyStore
+from aun_core.keystore.local_identity_store import LocalIdentityStore
 
 
 def _identity(aid: str, *, key=None, not_after: datetime | None = None) -> dict[str, str]:
@@ -46,7 +46,7 @@ def _identity(aid: str, *, key=None, not_after: datetime | None = None) -> dict[
 
 def test_store_load_local_identity_with_private_key(tmp_path):
     aid = "alice.agentid.pub"
-    keystore = FileKeyStore(tmp_path, encryption_seed="seed")
+    keystore = LocalIdentityStore(tmp_path, encryption_seed="seed")
     keystore.save_identity(aid, _identity(aid))
 
     result = AIDStore(str(tmp_path), "seed").load(aid)
@@ -77,7 +77,7 @@ def test_store_normalizes_empty_instance_context_to_defaults(tmp_path):
 def test_store_load_peer_only_certificate(tmp_path):
     aid = "bob.agentid.pub"
     identity = _identity(aid)
-    keystore = FileKeyStore(tmp_path, encryption_seed="")
+    keystore = LocalIdentityStore(tmp_path, encryption_seed="")
     keystore.save_cert(aid, identity["cert"])
 
     result = AIDStore(str(tmp_path), "").load(aid)
@@ -106,7 +106,7 @@ def test_store_load_keypair_mismatch_returns_result_error(tmp_path):
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     ).decode("utf-8")
-    keystore = FileKeyStore(tmp_path, encryption_seed="seed")
+    keystore = LocalIdentityStore(tmp_path, encryption_seed="seed")
     keystore.save_identity(aid, mismatched)
 
     result = AIDStore(str(tmp_path), "seed").load(aid)
@@ -116,7 +116,7 @@ def test_store_load_keypair_mismatch_returns_result_error(tmp_path):
 
 
 def test_store_list_only_returns_identities_with_private_key(tmp_path):
-    keystore = FileKeyStore(tmp_path, encryption_seed="")
+    keystore = LocalIdentityStore(tmp_path, encryption_seed="")
     keystore.save_identity("alice.agentid.pub", _identity("alice.agentid.pub"))
     keystore.save_cert("bob.agentid.pub", _identity("bob.agentid.pub")["cert"])
 

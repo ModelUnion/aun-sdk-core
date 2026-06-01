@@ -16,6 +16,12 @@ type TokenStore interface {
 // KeyStore 私钥/完整身份存储接口，仅 AIDStore / RegisterFlow 持有。
 // 定义了身份密钥、证书、元数据的增删查改操作。
 type KeyStore interface {
+	// LoadCert 加载证书（PEM 字符串）
+	LoadCert(aid string) (string, error)
+
+	// SaveCert 保存证书（PEM 字符串）
+	SaveCert(aid string, certPEM string) error
+
 	// LoadKeyPair 加载指定 AID 的密钥对
 	LoadKeyPair(aid string) (map[string]any, error)
 
@@ -30,13 +36,6 @@ type KeyStore interface {
 
 	// ListIdentities 列出所有具有有效私钥的 AID
 	ListIdentities() ([]string, error)
-}
-
-// FullKeyStore 物理 keystore 通常同时实现 TokenStore 与 KeyStore；
-// 注册流程显式使用组合类型。
-type FullKeyStore interface {
-	TokenStore
-	KeyStore
 }
 
 // PendingIdentityKeyStore 提供 RegisterAID pending 身份的崩溃恢复能力。
@@ -97,7 +96,7 @@ type GroupState struct {
 }
 
 // StructuredKeyStore 提供结构化主存能力。
-// 与 Python FileKeyStore 的 prekeys / group secret state 语义对齐。
+// 与 Python SDK 结构化 prekeys / group secret state 语义对齐。
 //
 // 说明：
 // - KeyStore 仍保持向后兼容，不强制所有实现立刻支持这些方法。
@@ -215,7 +214,7 @@ type SeqTrackerDeleter interface {
 // MetadataKeyStore 提供按 AID 隔离的轻量级 KV 元数据读写能力。
 // 用于缓存非身份核心字段（如 gateway_url 等）以跨进程复用。
 //
-// 与 Python SDK keystore.file.FileKeyStore._get_db(aid).get_metadata/set_metadata 对应。
+// 与 Python SDK 本地存储的 get_metadata/set_metadata 语义对齐。
 type MetadataKeyStore interface {
 	// GetMetadataValue 读取指定 AID 下 key 对应的字符串值；不存在或读取失败返回空字符串。
 	GetMetadataValue(aid, key string) string

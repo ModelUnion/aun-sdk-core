@@ -21,11 +21,25 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from aun_core import AIDStore
+from aun_core.auth import AuthFlow
+from aun_core.crypto import CryptoProvider
+from aun_core.keystore.local_token_store import LocalTokenStore
 
 
 def _setup_store(tmp_path):
     """创建一个 AIDStore 并 mock 掉真实网络/login，方便测试。"""
     return AIDStore(tmp_path, encryption_seed="", verify_ssl=False)
+
+
+def _make_auth_flow(tmp_path):
+    return AuthFlow(
+        token_store=LocalTokenStore(tmp_path),
+        crypto=CryptoProvider(),
+        aid=None,
+        device_id="test-device",
+        slot_id="default",
+        verify_ssl=False,
+    )
 
 
 def _make_identity(aid: str) -> dict[str, str]:
@@ -59,14 +73,17 @@ def _make_identity(aid: str) -> dict[str, str]:
     }
 
 
+def _save_local_cert(store: AIDStore, aid: str) -> None:
+    store._keystore.save_cert(aid, _make_identity(aid)["cert"])
+
+
 # ── 改进 A: authenticate() 复用 cached_token ─────────────────────────
 
 @pytest.mark.asyncio
 async def test_authenticate_reuses_cached_token(tmp_path):
     """keystore 里有有效 cached_token 时 authenticate 直接返回，不走 _login。"""
     aid = "alice.test.com"
-    store = _setup_store(tmp_path)
-    auth_flow = store._auth
+    auth_flow = _make_auth_flow(tmp_path)
 
     # 注入一个有效的 identity（含未过期 access_token + refresh_token）
     future_expiry = int(time.time()) + 3600  # 1h 后过期
@@ -98,8 +115,7 @@ async def test_authenticate_reuses_cached_token(tmp_path):
 async def test_authenticate_falls_back_to_login_when_no_cached_token(tmp_path):
     """没有 cached_token 时 authenticate 走 _login。"""
     aid = "alice.test.com"
-    store = _setup_store(tmp_path)
-    auth_flow = store._auth
+    auth_flow = _make_auth_flow(tmp_path)
 
     identity = _make_identity(aid)
 
@@ -122,8 +138,7 @@ async def test_authenticate_falls_back_to_login_when_no_cached_token(tmp_path):
 async def test_authenticate_login_when_cached_token_expired(tmp_path):
     """cached_token 已过期时 authenticate 走 _login（_get_cached_access_token 会返回空）。"""
     aid = "alice.test.com"
-    store = _setup_store(tmp_path)
-    auth_flow = store._auth
+    auth_flow = _make_auth_flow(tmp_path)
 
     past_expiry = int(time.time()) - 100  # 已过期
     identity = _make_identity(aid)
@@ -155,6 +170,7 @@ async def test_resolve_gateway_uses_keystore_cache(tmp_path):
     """_resolve_gateway 在 keystore metadata 命中时跳过 discovery。"""
     aid = "alice.test.com"
     store = _setup_store(tmp_path)
+    _save_local_cert(store, aid)
 
     # 直接写入 keystore metadata
     store._persist_gateway_url(aid, "wss://cached-gateway.test/aun")
@@ -174,6 +190,7 @@ async def test_resolve_gateway_persists_after_discovery(tmp_path):
     """discovery 成功后 gateway_url 应被写入 keystore metadata。"""
     aid = "alice.test.com"
     store = _setup_store(tmp_path)
+    _save_local_cert(store, aid)
 
     store._discovery = MagicMock()
     store._discovery.discover = AsyncMock(return_value="wss://discovered.test/aun")
@@ -191,6 +208,7 @@ async def test_resolve_gateway_keystore_cache_takes_priority_over_discovery(tmp_
     """外部不能预置 gateway；keystore 发现缓存命中时跳过 well-known discovery。"""
     aid = "alice.test.com"
     store = _setup_store(tmp_path)
+    _save_local_cert(store, aid)
 
     store._persist_gateway_url(aid, "wss://stale.test/aun")
 

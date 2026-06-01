@@ -1,5 +1,5 @@
 /**
- * RegisterFlow — AID 注册流程（独立类，不继承 AuthFlow）
+ * RegisterFlow — AID 注册流程。
  * 与 Python SDK register_aid 对齐。
  */
 
@@ -9,8 +9,7 @@ import * as https from 'node:https';
 
 import WebSocket from 'ws';
 
-import { AuthFlow } from './auth.js';
-import type { FullKeyStore } from './keystore/index.js';
+import type { KeyStore } from './keystore/index.js';
 import { AuthError, IdentityConflictError, ValidationError, mapRemoteError } from './errors.js';
 import { isJsonObject, type IdentityRecord, type KeyPairRecord, type JsonObject, type RpcParams } from './types.js';
 import type { CryptoProvider } from './crypto.js';
@@ -19,7 +18,9 @@ import type { DnsResilientNet } from './net.js';
 
 const _noopLogger: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
 
-type PendingKeyStore = FullKeyStore & {
+const AID_NAME_RE = /^[a-z0-9_][a-z0-9_-]{3,63}$/;
+
+type PendingKeyStore = KeyStore & {
   pendingIdentityDir(aid: string): string;
   listPendingIdentityDirs(aid: string): string[];
   savePendingKeyPair(handle: string, aid: string, keyPair: KeyPairRecord): void;
@@ -37,6 +38,18 @@ function _extractPublicKey(cert: crypto.X509Certificate): crypto.KeyObject {
   const pk = cert.publicKey;
   if (pk && typeof pk === 'object' && 'type' in pk) return pk as crypto.KeyObject;
   return crypto.createPublicKey(cert.toString());
+}
+
+function _verifySignature(pubKey: crypto.KeyObject, signature: Buffer, data: Buffer): void {
+  const candidates = [null, 'sha256', 'RSA-SHA256'];
+  for (const alg of candidates) {
+    try {
+      if (crypto.verify(alg, data, pubKey, signature)) return;
+    } catch {
+      // try next algorithm
+    }
+  }
+  throw new AuthError('signature verification failed');
 }
 
 function _gatewayHttpUrl(gatewayUrl: string, urlPath: string): string {
@@ -104,9 +117,67 @@ export class RegisterFlow {
     this._net = opts.net ?? null;
   }
 
+  validateAidName(aid: string): void {
+    RegisterFlow.validateAidName(aid);
+  }
+
+  static validateAidName(aid: string): void {
+    const name = aid.includes('.') ? aid.split('.')[0]! : aid;
+    if (!AID_NAME_RE.test(name)) {
+      throw new ValidationError(
+        `Invalid AID name '${name}': must be 4-64 characters, only [a-z0-9_-], cannot start with '-'`,
+      );
+    }
+    if (name.startsWith('guest')) {
+      throw new ValidationError("AID name must not start with 'guest'");
+    }
+  }
+
+  async fetchPeerCert(gatewayUrl: string, aid: string): Promise<string | null> {
+    return this._downloadRegisteredCert(gatewayUrl, aid);
+  }
+
+  async shortRpc(gatewayUrl: string, method: string, params: RpcParams): Promise<JsonObject> {
+    return this._shortRpc(gatewayUrl, method, params);
+  }
+
+  generateIdentity(): KeyPairRecord {
+    return this._crypto.generateIdentity() as unknown as KeyPairRecord;
+  }
+
+  newClientNonce(): string {
+    return this._crypto.newClientNonce();
+  }
+
+  async verifyPhase1Response(gatewayUrl: string, result: JsonObject, clientNonce: string): Promise<void> {
+    void gatewayUrl;
+    const authCertPem = String(result.auth_cert || '');
+    const signatureB64 = String(result.client_nonce_signature || '');
+    if (!authCertPem) throw new AuthError('aid_login1 missing auth_cert');
+    if (!signatureB64) throw new AuthError('aid_login1 missing client_nonce_signature');
+    let authCert: crypto.X509Certificate;
+    try {
+      authCert = _loadX509(authCertPem);
+    } catch {
+      throw new AuthError('aid_login1 returned invalid auth_cert');
+    }
+    const now = Date.now();
+    if (authCert.validFromDate.getTime() > now) throw new AuthError('aid_login1 auth certificate is not_yet_valid');
+    if (authCert.validToDate.getTime() < now) throw new AuthError('aid_login1 auth certificate is expired');
+    try {
+      _verifySignature(_extractPublicKey(authCert), Buffer.from(signatureB64, 'base64'), Buffer.from(clientNonce, 'utf-8'));
+    } catch {
+      throw new AuthError('aid_login1 server auth signature verification failed');
+    }
+  }
+
+  reloadTrustedRoots(): number {
+    return 0;
+  }
+
   async registerAid(gatewayUrl: string, aid: string): Promise<RegisterResult> {
     const tStart = Date.now();
-    AuthFlow._validateAidName(aid);
+    this.validateAidName(aid);
     this._logger.debug(`registerAid enter: aid=${aid}, gateway=${gatewayUrl}`);
     try {
       const pendingStore = this._pendingStore();

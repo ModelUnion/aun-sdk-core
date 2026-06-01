@@ -781,15 +781,15 @@ class TestDecryptMessage:
 
 
 # ---------------------------------------------------------------------------
-# FileKeyStore 存储保护
+# 本地存储保护
 # ---------------------------------------------------------------------------
 
-class TestFileKeyStoreProtection:
+class TestLocalStoreProtection:
     def test_identity_private_key_not_plaintext(self, tmp_path):
         import json
-        from aun_core.keystore.file import FileKeyStore
+        from aun_core.keystore.local_identity_store import LocalIdentityStore
 
-        ks = FileKeyStore(root=tmp_path)
+        ks = LocalIdentityStore(root=tmp_path)
         identity = {
             "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
             "public_key_der_b64": "MFkw...",
@@ -808,10 +808,9 @@ class TestFileKeyStoreProtection:
         assert loaded["private_key_pem"] == identity["private_key_pem"]
 
     def test_prekey_private_key_not_plaintext(self, tmp_path):
-        import json
-        from aun_core.keystore.file import FileKeyStore
+        from aun_core.keystore.local_token_store import LocalTokenStore
 
-        ks = FileKeyStore(root=tmp_path)
+        ks = LocalTokenStore(root=tmp_path)
         ks.save_e2ee_prekey("test.aid", "prekey-123", {
             "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
             "public_key": "MFkw...",
@@ -972,6 +971,7 @@ class TestPrekeyV2:
             serialization.NoEncryption(),
         ).decode("utf-8")
         receiver_ks._key_pairs["receiver.test"]["private_key_pem"] = wrong_pem
+        receiver_mgr._identity_fn()["private_key_pem"] = wrong_pem
 
         mid = str(uuid.uuid4())
         ts = int(time.time() * 1000)

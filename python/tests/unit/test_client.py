@@ -732,9 +732,8 @@ def test_authenticate_requires_loaded_identity():
         asyncio.run(client.authenticate())
 
 
-def test_upload_agent_md_uses_cached_access_token(monkeypatch):
-    client = AUNClient()
-    client._aid = "alice.agentid.pub"
+def test_upload_agent_md_uses_cached_access_token(monkeypatch, tmp_path):
+    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
     client._identity = {"aid": "alice.agentid.pub", "access_token": "cached-token"}
 
     async def _fake_discover(aid: str) -> str:
@@ -768,13 +767,16 @@ def test_upload_agent_md_uses_cached_access_token(monkeypatch):
 
         def put(self, url, *, data=None, headers=None, ssl=None):
             assert url == "http://alice.agentid.pub/agent.md"
-            assert data == b"# Alice\n"
+            assert data.startswith(b"# Alice\n")
+            assert b"<!-- AUN-SIGNATURE" in data
             assert headers["Authorization"] == "Bearer cached-token"
             assert headers["Content-Type"] == "text/markdown; charset=utf-8"
             return _FakeResponse()
 
-    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
-    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
+    import aun_core.agent_md as agent_md_module
+
+    client._agent_md_manager._gateway_resolver = _fake_discover
+    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
 
     result = asyncio.run(client.upload_agent_md("# Alice\n"))
 
@@ -826,18 +828,20 @@ def test_upload_agent_md_falls_back_to_authenticate(monkeypatch, tmp_path):
             assert headers["Authorization"] == "Bearer fresh-token"
             return _FakeResponse()
 
-    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
+    client._agent_md_manager._gateway_resolver = _fake_discover
     monkeypatch.setattr(client, "authenticate", _fake_authenticate)
-    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
+    client._agent_md_manager._authenticator = _fake_authenticate
+    import aun_core.agent_md as agent_md_module
+
+    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
 
     result = asyncio.run(client.upload_agent_md("# Alice\n"))
 
     assert result["etag"] == '"etag-2"'
 
 
-def test_upload_agent_md_uses_session_params_access_token(monkeypatch):
-    client = AUNClient()
-    client._aid = "alice.agentid.pub"
+def test_upload_agent_md_uses_session_params_access_token(monkeypatch, tmp_path):
+    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
     client._session_params = {"access_token": "session-token"}
 
     async def _fake_discover(aid: str) -> str:
@@ -871,22 +875,23 @@ def test_upload_agent_md_uses_session_params_access_token(monkeypatch):
 
         def put(self, url, *, data=None, headers=None, ssl=None):
             assert url == "http://alice.agentid.pub/agent.md"
-            assert data == b"# Alice\n"
+            assert data.startswith(b"# Alice\n")
+            assert b"<!-- AUN-SIGNATURE" in data
             assert headers["Authorization"] == "Bearer session-token"
             return _FakeResponse()
 
-    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
-    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
+    import aun_core.agent_md as agent_md_module
+
+    client._agent_md_manager._gateway_resolver = _fake_discover
+    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
 
     result = asyncio.run(client.upload_agent_md("# Alice\n"))
 
     assert result["etag"] == '"etag-3"'
 
 
-def test_upload_agent_md_403_raises_aunerror(monkeypatch):
-    client = AUNClient()
-    client._aid = "alice.agentid.pub"
-
+def test_upload_agent_md_403_raises_aunerror(monkeypatch, tmp_path):
+    client = _make_client_with_aid(tmp_path / "aun", aid="alice.agentid.pub")
     client._identity = {"aid": "alice.agentid.pub", "access_token": "cached-token"}
 
     async def _fake_discover(aid: str) -> str:
@@ -923,8 +928,10 @@ def test_upload_agent_md_403_raises_aunerror(monkeypatch):
             assert headers["Authorization"] == "Bearer cached-token"
             return _FakeResponse()
 
-    monkeypatch.setattr(client, "_discover_gateway_for_aid", _fake_discover)
-    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _FakeSession)
+    import aun_core.agent_md as agent_md_module
+
+    client._agent_md_manager._gateway_resolver = _fake_discover
+    monkeypatch.setattr(agent_md_module.aiohttp, "ClientSession", _FakeSession)
 
     with pytest.raises(AUNError, match="upload agent.md failed: HTTP 403 - forbidden"):
         asyncio.run(client.upload_agent_md("# Alice\n"))
@@ -962,12 +969,6 @@ def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
     client = _make_client_with_aid(tmp_path / "aun")
     aid = "demo.agentid.pub"
 
-    client._token_store.save_identity(aid, {
-        "aid": aid,
-        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
-        "public_key_der_b64": "pub",
-        "curve": "P-256",
-    })
     client._token_store.save_e2ee_prekey(aid, "pk1", {
         "private_key_pem": "KEEP_ME",
         "created_at": 1,
@@ -977,9 +978,9 @@ def test_sync_identity_after_connect_preserves_prekeys(tmp_path):
 
     client._sync_identity_after_connect("tok-connect")
 
-    loaded = client._token_store.load_identity(aid)
     slot_state = client._token_store.load_instance_state(aid, client._device_id, client._slot_id)
-    assert "access_token" not in loaded
+    metadata = client._token_store.load_metadata(aid) or {}
+    assert "access_token" not in (metadata.get("fields") or {})
     assert slot_state["access_token"] == "tok-connect"
     prekeys = client._token_store.load_e2ee_prekeys(aid, device_id=client._device_id)
     assert prekeys["pk1"]["private_key_pem"] == "KEEP_ME"
@@ -3192,16 +3193,8 @@ def test_get_verified_peer_cert_resolves_versioned_cache_without_fingerprint(tmp
 def test_seq_tracker_state_isolated_between_slots(tmp_path):
     root = tmp_path / "aun"
     aid = "demo.agentid.pub"
-    base_identity = {
-        "aid": aid,
-        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
-        "public_key_der_b64": "pub",
-        "curve": "P-256",
-    }
     client_a = _make_client_with_aid(root)
     client_b = _make_client_with_aid(root)
-    client_a._token_store.save_identity(aid, dict(base_identity))
-    client_b._token_store.save_identity(aid, dict(base_identity))
     client_a._aid = aid
     client_b._aid = aid
     client_a._slot_id = "slot-a"
@@ -3233,14 +3226,6 @@ def test_seq_tracker_slot_change_resets_in_memory_state_before_restore(tmp_path)
     aid = "alice.agentid.pub"
     root = tmp_path / "aun"
     client = _make_client_with_aid(root)
-    identity = {
-        "aid": aid,
-        "access_token": "token",
-        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
-        "public_key_der_b64": "pub",
-        "curve": "P-256",
-    }
-    client._token_store.save_identity(aid, identity)
     client._aid = aid
     client._slot_id = "slot-a"
     client._seq_tracker.restore_state({"p2p:demo": 5})

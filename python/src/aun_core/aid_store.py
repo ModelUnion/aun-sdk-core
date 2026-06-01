@@ -18,14 +18,14 @@ from cryptography.hazmat.primitives import serialization
 
 from . import error_codes as codes
 from ._cert_utils import cert_common_name, cert_time_error, public_key_der, sign_bytes, verify_signature
-from .auth import AuthFlow
+from .agent_md import AgentMdManager
 from .register_flow import RegisterFlow
 from .aid import AID
 from .config import normalize_device_id, normalize_slot_id, resolve_verify_ssl_from_env
 from .crypto import CryptoProvider
 from .discovery import GatewayDiscovery
-from .errors import ConnectionError, IdentityConflictError, ValidationError
-from .keystore.file import FileKeyStore
+from .errors import AUNError, ConnectionError, IdentityConflictError, NotFoundError, ValidationError
+from .keystore.local_identity_store import LocalIdentityStore
 from .logger import AUNLogger, NullLogger
 from .net import DnsResilientNet
 from .result import Result, result_err, result_ok
@@ -35,21 +35,13 @@ _AUTHORITY_ENDPOINT = "https://trust.aun.network/.well-known/aun/trust-roots.jso
 _MAX_CLOCK_SKEW = 300
 
 
-class FetchAgentMdResult(TypedDict):
+class DownloadAgentMdResult(TypedDict):
     aid: str
     content: str
     verification: dict  # { status: str, reason?: str }
     cert_pem: str
     etag: str
     last_modified: str
-
-
-class HeadAgentMdResult(TypedDict):
-    aid: str
-    found: bool
-    etag: str
-    last_modified: str
-    content_length: int
 
 
 class CheckAgentMdResult(TypedDict):
@@ -120,10 +112,9 @@ class AIDStore:
         self._cert_op_locks: dict[str, asyncio.Lock] = {}
         self._verify_ssl = resolve_verify_ssl_from_env() if verify_ssl is None else bool(verify_ssl)
         self._root_ca_path = root_ca_path
-        self._agent_md_cache: dict[str, dict[str, Any]] = {}
         self._log = logger or AUNLogger(debug=debug, aun_path=self.aun_path)
         self._log.bind_device_id(self.device_id)
-        self._keystore = FileKeyStore(
+        self._keystore = LocalIdentityStore(
             self.aun_path,
             encryption_seed=self.encryption_seed,
             logger=self._log,
@@ -138,22 +129,38 @@ class AIDStore:
             logger=self._log,
             net=self._net,
         )
-        self._auth = AuthFlow(
-            token_store=self._keystore,
-            crypto=CryptoProvider(),
-            device_id=self.device_id,
-            slot_id=self.slot_id,
-            root_ca_path=self._root_ca_path,
-            verify_ssl=self._verify_ssl,
-            logger=self._log,
-            net=self._net,
-        )
         self._register_flow = RegisterFlow(
             keystore=self._keystore,
             crypto=CryptoProvider(),
             verify_ssl=self._verify_ssl,
+            root_ca_path=self._root_ca_path,
             logger=self._log,
             net=self._net,
+        )
+        async def resolve_peer(aid: str) -> AID:
+            target = str(aid or "").strip()
+            loaded = self.load(target)
+            if loaded.ok and loaded.data is not None:
+                return loaded.data["aid"]
+            resolved = await self.resolve(target, {"skip_agent_md": True})
+            if not resolved.ok or resolved.data is None:
+                message = resolved.error.message if resolved.error else f"failed to resolve AID for agent.md: {target}"
+                raise AUNError(message)
+            return resolved.data["aid"]
+
+        self._agent_md_manager = AgentMdManager(
+            self.aun_path,
+            verify_ssl=self._verify_ssl,
+            logger=self._log,
+            gateway_resolver=lambda aid: self._resolved_gateway(aid),
+            peer_resolver=resolve_peer,
+            aid_validator=self._register_flow.validate_aid_name,
+            http_head=lambda url, *, timeout=15.0: self._http_head(url, timeout=timeout),
+            http_get_text_with_headers=lambda url, *, headers=None, timeout=30.0: self._http_get_text_with_headers(
+                url,
+                headers=headers,
+                timeout=timeout,
+            ),
         )
 
     def close(self) -> None:
@@ -283,7 +290,7 @@ class AIDStore:
         target = str(aid or "").strip()
         self._log.debug("aid_store", "register enter: aid=%s", target or "-")
         try:
-            self._auth._validate_aid_name(target)
+            self._register_flow.validate_aid_name(target)
             gateway_url = await self._resolved_gateway(target)
             result = await self._register_flow.register_aid(gateway_url, target)
             # 私钥由 AIDStore 写入，RegisterFlow 不写 key.json
@@ -293,6 +300,7 @@ class AIDStore:
             key_pair = {k: result[k] for k in ("private_key_pem", "public_key_der_b64", "curve") if result.get(k)}
             if key_pair:
                 self._keystore.save_key_pair(target, key_pair)
+            self._persist_gateway_url(target, gateway_url)
             self._log.debug("aid_store", "register exit: aid=%s gateway=%s", target, gateway_url)
             return result_ok({"registered": True})
         except IdentityConflictError as exc:
@@ -312,7 +320,7 @@ class AIDStore:
         target = str(aid or "").strip()
         self._log.debug("aid_store", "exists enter: aid=%s", target or "-")
         try:
-            self._auth._validate_aid_name(target)
+            self._register_flow.validate_aid_name(target)
             gateway_url = await self._resolved_gateway(target)
             url = self._pki_cert_url(gateway_url, target)
             status, _headers = await self._http_head(url, timeout=5.0)
@@ -345,7 +353,7 @@ class AIDStore:
             skip_agent_md,
         )
         try:
-            self._auth._validate_aid_name(target)
+            self._register_flow.validate_aid_name(target)
             cert_from_cache = False
             loaded = self.load(target)
             if loaded.ok and loaded.data is not None and not force_refresh:
@@ -353,10 +361,11 @@ class AIDStore:
                 peer = loaded.data["aid"]
             else:
                 gateway_url = await self._resolved_gateway(target)
-                cert_pem = await self._auth.fetch_peer_cert(gateway_url, target)
+                cert_pem = await self._register_flow.fetch_peer_cert(gateway_url, target)
                 if not cert_pem:
                     return result_err(codes.CERT_NOT_FOUND, f"certificate not found for aid: {target}")
                 self._keystore.save_cert(target, cert_pem)
+                self._persist_gateway_url(target, gateway_url)
                 loaded = self.load(target)
                 if not loaded.ok or loaded.data is None:
                     return loaded
@@ -369,7 +378,7 @@ class AIDStore:
             if skip_agent_md:
                 return result_ok({"aid": peer, "source": source})
 
-            agent_md = await self.fetch_agent_md(target, timeout_s=timeout_s)
+            agent_md = await self.download_agent_md(target, timeout_s=timeout_s)
             if not agent_md.ok:
                 return agent_md
             source["agent_md_fetched"] = True
@@ -380,149 +389,36 @@ class AIDStore:
             self._log.debug("aid_store", "resolve exit (error): aid=%s err=%s", target, exc)
             return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
-    async def fetch_agent_md(self, aid: str, *, timeout_s: float | None = None) -> Result[FetchAgentMdResult]:
+    async def download_agent_md(self, aid: str, *, timeout_s: float | None = None) -> Result[DownloadAgentMdResult]:
         target = str(aid or "").strip()
-        self._log.debug("aid_store", "fetch_agent_md enter: aid=%s", target or "-")
+        self._log.debug("aid_store", "download_agent_md enter: aid=%s", target or "-")
         try:
-            self._auth._validate_aid_name(target)
-            gateway_url = await self._resolved_gateway(target)
-            url = self._agent_md_url(target, gateway_url)
-            cached = self._agent_md_cache.get(target) or {}
-            headers: dict[str, str] = {"Accept": "text/markdown"}
-            etag = str(cached.get("etag") or "").strip()
-            last_modified = str(cached.get("last_modified") or "").strip()
-            if etag:
-                headers["If-None-Match"] = etag
-            if last_modified:
-                headers["If-Modified-Since"] = last_modified
-
-            content, response_headers, status = await self._http_get_text_with_headers(
-                url,
-                headers=headers,
-                timeout=timeout_s if timeout_s is not None else 30.0,
+            data = await self._agent_md_manager.download(target, timeout_s=timeout_s)
+            self._log.debug(
+                "aid_store",
+                "download_agent_md exit: aid=%s status=%s",
+                target,
+                (data.get("verification") or {}).get("status") if isinstance(data, dict) else "-",
             )
-            if status == 304 and cached.get("content") is not None:
-                content = str(cached["content"])
-                response_headers = dict(cached)
-            elif status == 404:
-                return result_err(codes.AGENTMD_NOT_FOUND, f"agent.md not found for aid: {target}")
-            elif status < 200 or status >= 300:
-                return result_err(codes.NETWORK_ERROR, f"download agent.md failed: HTTP {status}")
-
-            loaded = self.load(target)
-            if not loaded.ok:
-                resolved = await self.resolve(target, {"skip_agent_md": True})
-                if not resolved.ok or resolved.data is None:
-                    return resolved
-                peer = resolved.data["aid"]
-            else:
-                peer = loaded.data["aid"]
-
-            verified = peer.verify_agent_md(content)
-            if not verified.ok or verified.data is None:
-                return verified
-            signature = dict(verified.data)
-            status_text = str(signature.get("status") or "invalid")
-            verification: dict[str, str] = {"status": status_text}
-            reason = str(signature.get("reason") or "").strip()
-            if reason:
-                verification["reason"] = reason
-
-            response_etag = str(response_headers.get("ETag") or response_headers.get("etag") or "").strip()
-            response_last_modified = str(
-                response_headers.get("Last-Modified") or response_headers.get("last_modified") or ""
-            ).strip()
-            self._agent_md_cache[target] = {
-                "content": content,
-                "etag": response_etag,
-                "last_modified": response_last_modified,
-                "updated_at": int(time.time()),
-            }
-            self._log.debug("aid_store", "fetch_agent_md exit: aid=%s status=%s", target, status_text)
-            return result_ok({
-                "aid": target,
-                "content": content,
-                "verification": verification,
-                "cert_pem": peer.cert_pem,
-                "etag": response_etag,
-                "last_modified": response_last_modified,
-            })
-        except (ValidationError, ValueError) as exc:
-            return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
-        except Exception as exc:
-            self._log.debug("aid_store", "fetch_agent_md exit (error): aid=%s err=%s", target, exc)
-            return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
-
-    async def head_agent_md(self, aid: str) -> Result[HeadAgentMdResult]:
-        target = str(aid or "").strip()
-        self._log.debug("aid_store", "head_agent_md enter: aid=%s", target or "-")
-        try:
-            self._auth._validate_aid_name(target)
-            gateway_url = await self._resolved_gateway(target)
-            url = self._agent_md_url(target, gateway_url)
-            status, headers = await self._http_head(url, timeout=15.0)
-            if status == 404:
-                return result_err(codes.AGENTMD_NOT_FOUND, f"agent.md not found for aid: {target}")
-            if status < 200 or status >= 300:
-                return result_err(codes.NETWORK_ERROR, f"head agent.md failed: HTTP {status}")
-            content_length = 0
-            try:
-                content_length = int(str(headers.get("Content-Length") or headers.get("content-length") or "0"))
-            except ValueError:
-                content_length = 0
-            data = {
-                "aid": target,
-                "found": True,
-                "etag": str(headers.get("ETag") or headers.get("etag") or "").strip(),
-                "last_modified": str(headers.get("Last-Modified") or headers.get("last-modified") or "").strip(),
-                "content_length": content_length,
-            }
-            cached = self._agent_md_cache.get(target) or {}
-            cached.update({
-                "etag": data["etag"],
-                "last_modified": data["last_modified"],
-                "remote_checked_at": int(time.time()),
-            })
-            self._agent_md_cache[target] = cached
             return result_ok(data)
+        except NotFoundError as exc:
+            return result_err(codes.AGENTMD_NOT_FOUND, str(exc), cause=exc)
         except (ValidationError, ValueError) as exc:
             return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
         except Exception as exc:
-            self._log.debug("aid_store", "head_agent_md exit (error): aid=%s err=%s", target, exc)
+            self._log.debug("aid_store", "download_agent_md exit (error): aid=%s err=%s", target, exc)
             return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
     async def check_agent_md(self, aid: str, ttl_days: int = 1) -> Result[CheckAgentMdResult]:
         target = str(aid or "").strip()
-        cached = self._agent_md_cache.get(target) or {}
-        head = await self.head_agent_md(target)
-        if not head.ok or head.data is None:
-            if head.error is not None and head.error.code == codes.AGENTMD_NOT_FOUND:
-                remote = {
-                    "aid": target,
-                    "found": False,
-                    "etag": "",
-                    "last_modified": "",
-                    "content_length": 0,
-                    "status": 404,
-                }
-            else:
-                return head
-        else:
-            remote = head.data
-        local_etag = str(cached.get("etag") or "").strip()
-        local_found = bool(cached.get("content"))
-        remote_found = bool(remote.get("found"))
-        remote_etag = str(remote.get("etag") or "").strip()
-        needs_update = remote_found and (not local_found or (bool(remote_etag) and remote_etag != local_etag))
-        return result_ok({
-            "aid": target,
-            "local_found": local_found,
-            "remote_found": remote_found,
-            "local_etag": local_etag,
-            "remote_etag": remote_etag,
-            "needs_update": needs_update,
-            "ttl_days": int(ttl_days),
-        })
+        self._log.debug("aid_store", "check_agent_md enter: aid=%s ttl_days=%s", target or "-", ttl_days)
+        try:
+            return result_ok(await self._agent_md_manager.check(target, ttl_days=ttl_days))
+        except (ValidationError, ValueError) as exc:
+            return result_err(codes.INVALID_AID_FORMAT, str(exc), cause=exc)
+        except Exception as exc:
+            self._log.debug("aid_store", "check_agent_md exit (error): aid=%s err=%s", target, exc)
+            return result_err(codes.NETWORK_ERROR, str(exc), cause=exc)
 
     async def diagnose(self, aid: str) -> Result[DiagnoseResult]:
         target = str(aid or "").strip()
@@ -549,7 +445,7 @@ class AIDStore:
         if local_aid is not None and remote_registered:
             try:
                 gateway_url = await self._resolved_gateway(target)
-                remote_cert_pem = await self._auth.fetch_peer_cert(gateway_url, target)
+                remote_cert_pem = await self._register_flow.fetch_peer_cert(gateway_url, target)
                 remote_cert = x509.load_pem_x509_certificate(str(remote_cert_pem or "").encode("utf-8"))
                 remote_fingerprint = "sha256:" + remote_cert.fingerprint(hashes.SHA256()).hex()
                 cert_match = remote_fingerprint.lower() == local_aid.cert_fingerprint.lower()
@@ -605,7 +501,7 @@ class AIDStore:
                 return result_err(codes.PRIVATE_KEY_REQUIRED, f"private key required for aid: {target}")
             aid_obj = loaded.data["aid"]
             try:
-                self._auth._validate_aid_name(target)
+                self._register_flow.validate_aid_name(target)
                 gateway_url = await self._resolved_gateway(target)
                 phase1 = await self._begin_aid_operation(gateway_url, aid_obj)
                 signature = aid_obj.sign(str(phase1["nonce"]))
@@ -613,7 +509,7 @@ class AIDStore:
                     message = signature.error.message if signature.error else "failed to sign renew_cert nonce"
                     return result_err(codes.CERT_RENEWAL_FAILED, message)
 
-                response = await self._auth._short_rpc(gateway_url, "auth.renew_cert", {
+                response = await self._register_flow.short_rpc(gateway_url, "auth.renew_cert", {
                     "aid": target,
                     "request_id": str(phase1["request_id"]),
                     "nonce": str(phase1["nonce"]),
@@ -659,8 +555,8 @@ class AIDStore:
                 return result_err(codes.PRIVATE_KEY_REQUIRED, f"private key required for aid: {target}")
             old_aid = loaded.data["aid"]
             try:
-                self._auth._validate_aid_name(target)
-                new_identity = self._auth._crypto.generate_identity()
+                self._register_flow.validate_aid_name(target)
+                new_identity = self._register_flow.generate_identity()
                 new_public_key = str(new_identity.get("public_key_der_b64") or "").strip()
                 if not new_identity.get("private_key_pem") or not new_public_key:
                     return result_err(codes.REKEY_FAILED, "generated keypair is incomplete")
@@ -673,7 +569,7 @@ class AIDStore:
                     message = signature.error.message if signature.error else "failed to sign rekey payload"
                     return result_err(codes.REKEY_FAILED, message)
 
-                response = await self._auth._short_rpc(gateway_url, "auth.rekey", {
+                response = await self._register_flow.short_rpc(gateway_url, "auth.rekey", {
                     "aid": target,
                     "request_id": str(phase1["request_id"]),
                     "nonce": str(phase1["nonce"]),
@@ -722,14 +618,14 @@ class AIDStore:
         return lock
 
     async def _begin_aid_operation(self, gateway_url: str, aid_obj: AID) -> dict[str, str]:
-        client_nonce = self._auth._crypto.new_client_nonce()
+        client_nonce = self._register_flow.new_client_nonce()
         self._log.debug("aid_store", "aid operation login1 start: aid=%s gateway=%s", aid_obj.aid, gateway_url)
-        phase1 = await self._auth._short_rpc(gateway_url, "auth.aid_login1", {
+        phase1 = await self._register_flow.short_rpc(gateway_url, "auth.aid_login1", {
             "aid": aid_obj.aid,
             "cert": aid_obj.cert_pem,
             "client_nonce": client_nonce,
         })
-        await self._auth._verify_phase1_response(gateway_url, phase1, client_nonce)
+        await self._register_flow.verify_phase1_response(gateway_url, phase1, client_nonce)
         request_id = str(phase1.get("request_id") or "").strip()
         nonce = str(phase1.get("nonce") or "").strip()
         if not request_id:
@@ -879,7 +775,7 @@ class AIDStore:
         )
         self._enforce_monotonic_version(trust_list)
         bundle_path = self._keystore.save_trust_roots(trust_list, verified["imported"])
-        reloaded = self._auth.reload_trusted_roots()
+        reloaded = self._register_flow.reload_trusted_roots()
         self._log.info(
             "aid_store",
             "trust roots imported: count=%d skipped=%d reloaded=%d",
@@ -946,7 +842,7 @@ class AIDStore:
             root_pem,
             fingerprint,
         )
-        reloaded = self._auth.reload_trusted_roots()
+        reloaded = self._register_flow.reload_trusted_roots()
         self._log.info(
             "aid_store",
             "issuer root cert updated: issuer=%s fingerprint=%s reloaded=%d trust_source=%s",
@@ -1208,17 +1104,7 @@ class AIDStore:
         if not aid:
             return ""
         try:
-            db = self._keystore._get_db(aid)
-            raw = db.get_metadata("gateway_url")
-            if not raw:
-                return ""
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, str):
-                    return parsed.strip()
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
-            return str(raw).strip()
+            return self._keystore.get_metadata_value(aid, "gateway_url")
         except Exception:
             return ""
 
@@ -1226,10 +1112,19 @@ class AIDStore:
         if not aid or not gateway_url:
             return
         try:
-            db = self._keystore._get_db(aid)
-            db.set_metadata("gateway_url", json.dumps(gateway_url, ensure_ascii=False))
+            if not self._has_local_aid_material(aid):
+                return
+            self._keystore.set_metadata_value(aid, "gateway_url", gateway_url)
         except Exception as exc:
             self._log.debug("aid_store", "persist gateway_url failed: aid=%s err=%s", aid, exc)
+
+    def _has_local_aid_material(self, aid: str) -> bool:
+        try:
+            if self._keystore.load_cert(aid):
+                return True
+            return bool(self._keystore.load_key_pair(aid))
+        except Exception:
+            return False
 
     @staticmethod
     def _pki_cert_url(gateway_url: str, aid: str, cert_fingerprint: str | None = None) -> str:
@@ -1237,12 +1132,6 @@ class AIDStore:
         scheme = "https" if parsed.scheme == "wss" else "http"
         query = urlencode({"cert_fingerprint": cert_fingerprint}) if cert_fingerprint else ""
         return urlunparse((scheme, parsed.netloc, f"/pki/cert/{quote(aid, safe='')}", "", query, ""))
-
-    def _agent_md_url(self, aid: str, gateway_url: str = "") -> str:
-        raw_gateway = str(gateway_url or "").strip().lower()
-        scheme = "http" if raw_gateway.startswith("ws://") else "https"
-        host = str(aid or "").strip()
-        return f"{scheme}://{host}/agent.md"
 
     async def _http_head(self, url: str, *, timeout: float = 5.0) -> tuple[int, dict[str, str]]:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
@@ -1264,3 +1153,4 @@ class AIDStore:
             async with session.get(url, ssl=ssl_param, headers=headers, allow_redirects=True) as response:
                 text = await response.text()
                 return text, dict(response.headers), int(response.status)
+

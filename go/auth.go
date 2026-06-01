@@ -1680,7 +1680,7 @@ func (a *AuthFlow) loadIdentityRaw(aid string) (map[string]any, error) {
 		requestedAID = a.aid
 	}
 
-	// 优先路径：使用注入的内存 identity（私钥已由 AIDStore 解密并传入）
+	// 优先路径：使用注入的内存 identity（私钥已由上层身份存储加载后传入）
 	a.mu.RLock()
 	mem := a.memIdentity
 	a.mu.RUnlock()

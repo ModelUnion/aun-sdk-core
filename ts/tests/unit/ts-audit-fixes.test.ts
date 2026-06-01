@@ -15,7 +15,7 @@ import { AIDStore } from '../../src/aid-store.js';
 import { RPCTransport } from '../../src/transport.js';
 import { EventDispatcher } from '../../src/events.js';
 import { AUNLogger } from '../../src/logger.js';
-import { FileKeyStore } from '../../src/keystore/file.js';
+import { LocalIdentityStore } from '../../src/keystore/local-identity-store.js';
 import { ConnectionError, StateError } from '../../src/errors.js';
 import { certificateSha256Fingerprint } from '../../src/crypto.js';
 import { buildIdentity, generateECKeypair } from './helpers.js';
@@ -145,7 +145,7 @@ describe('ISSUE-SDK-TS-002: AIDStore.list() 方法', () => {
   it('有身份时返回身份摘要', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'aun-list-ids-'));
     const aid = 'alice.example.com';
-    const ks = new FileKeyStore(tmpDir);
+    const ks = new LocalIdentityStore(tmpDir);
     ks.saveIdentity(aid, buildIdentity(aid, generateECKeypair().privateKey));
     const store = new AIDStore({ aunPath: tmpDir, encryptionSeed: '' });
     const result = store.list();
@@ -160,7 +160,7 @@ describe('ISSUE-SDK-TS-002: AIDStore.list() 方法', () => {
 // ══════════════════════════════════════════════════════════════
 
 describe('ISSUE-SDK-TS-008: 证书指纹计算统一', () => {
-  it('keystore/file.ts 使用统一的指纹计算（通过 certificateSha256Fingerprint）', () => {
+  it('keystore/local-identity-store.ts 使用统一的指纹计算（通过 certificateSha256Fingerprint）', () => {
     // 验证 crypto.ts 中存在并导出了 certificateSha256Fingerprint
     expect(typeof certificateSha256Fingerprint).toBe('function');
   });

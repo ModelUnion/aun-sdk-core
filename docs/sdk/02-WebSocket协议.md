@@ -73,9 +73,9 @@ sequenceDiagram
 
 - `protocol.min/max` 在 `auth.connect` 阶段完成 Gateway 会话版本协商；详细规则见协议文档 `03-Gateway-连接模式.md`。
 - `device.id` 是设备级稳定标识，Python SDK 默认从 `~/.aun/.device_id` 读取。
-- `client.slot_id` 由应用层显式传入，用于区分同设备上的多个实例槽位。
+- `client.slot_id` 由应用层显式传入，用于区分同设备上的多个实例槽位。SDK 允许 `/`、`:`、空格作为隔离键分隔符，例如 `evolclaw cli`、`evolclaw/cli`、`evolclaw:cli` 的隔离键都是 `evolclaw`。
 - `delivery_mode` 决定该 AID 当前连接的投递语义；同一 AID 的所有在线连接必须保持一致。
-- `options.kind` 声明连接类型：`"long"`（默认）= 长连接，承担服务端推送 / 事件订阅；`"short"` = 短连接，仅用于发送 RPC 并等待响应即断开。同 `(aid, device.id, client.slot_id)` 槽位下，长连接最多 1 条，短连接最多 10 条；短连接不会顶掉长连接。
+- `options.kind` 声明连接类型：`"long"`（默认）= 长连接，承担服务端推送 / 事件订阅；`"short"` = 短连接，仅用于发送 RPC 并等待响应即断开。同 `(aid, device.id, slotIsolationKey(client.slot_id))` 隔离槽下，长连接最多 1 条，短连接最多 10 条；短连接不会顶掉长连接。
 - `options.short_ttl_ms` 仅在 `kind="short"` 时有效，可选；服务端兜底超时后主动关闭短连接，防止占名额。
 - `capabilities` 是客户端能力声明；`hello-ok.result.capabilities` 是服务端能力公告，不是双方能力交集。
 

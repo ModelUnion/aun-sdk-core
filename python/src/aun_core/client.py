@@ -5,24 +5,22 @@ import base64
 import hashlib
 import json
 import math
-import os
 import random
 import re
-import secrets
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 
-import aiohttp
 import websockets
+from cryptography import x509
 
+from ._cert_utils import cert_common_name, cert_time_error
 from .aid import AID
-from .aid_store import AIDStore
+from .agent_md import AgentMdManager
 from .auth import AuthFlow
 from .config import AUNConfig, get_device_id, normalize_instance_id, normalize_slot_id, slot_isolation_key
 from .logger import AUNLogger, NullLogger
@@ -42,7 +40,7 @@ from .errors import (
 )
 from .events import EventDispatcher, Subscription
 from .group_id import normalize_group_id as _normalize_group_id
-from .keystore.file import FileKeyStore
+from .keystore.local_token_store import LocalTokenStore
 from .transport import RPCTransport
 from .seq_tracker import SeqTracker
 from .types import ConnectionOptions, ConnectionState
@@ -344,6 +342,41 @@ async def _default_connection_factory(url: str) -> Any:
     return await websockets.connect(url, **kw)
 
 
+def _build_client_runtime_manager(client: Any) -> AgentMdManager:
+    def access_token() -> str:
+        identity = client._identity if isinstance(client._identity, dict) else {}
+        token = str(identity.get("access_token") or "").strip()
+        if token:
+            return token
+        if isinstance(client._session_params, dict):
+            return str(client._session_params.get("access_token") or "").strip()
+        return ""
+
+    def trace_context() -> dict[str, Any]:
+        return {
+            "mode": getattr(client._transport, "_trace_mode", "off"),
+            "observer": getattr(client._transport, "_trace_observer", None),
+        }
+
+    async def resolve_peer(aid: str) -> AID:
+        target = str(aid or "").strip()
+        return await client._resolve_peer_aid(target)
+
+    return AgentMdManager(
+        client._config_model.aun_path,
+        verify_ssl=client._config_model.verify_ssl,
+        logger=client._log,
+        owner_aid_getter=lambda: client._aid,
+        current_aid_getter=lambda: client._current_aid,
+        gateway_resolver=lambda aid: client._discover_gateway_for_aid(aid),
+        peer_resolver=resolve_peer,
+        token_provider=access_token,
+        authenticator=client.authenticate,
+        trace_context_provider=trace_context,
+        discovery_port=client._config_model.discovery_port,
+    )
+
+
 _PEER_CERT_CACHE_TTL = 3600  # 1 小时
 _PEER_PREKEYS_CACHE_TTL = 3600  # 1 小时
 
@@ -491,18 +524,14 @@ class AUNClient:
         self._peer_prekeys_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._prekey_replenish_inflight: bool = False
         self._prekey_pending_replenish: int = 0
-        # agent.md 存储路径：{aun_path}/AIDs/{aid}/agentmd.json（元数据）+ agent.md（正文）
-        self._agent_md_path: str = str(Path(self._config_model.aun_path) / "AIDs")
-        self._local_agent_md_etag: str = ""
-        # gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
-        self._remote_agent_md_etag: str = ""
-        self._agent_md_cache: dict[str, dict[str, Any]] = {}
+        # agent.md 存储路径由 AgentMdManager 固定管理为 {aun_path}/AIDs/{aid}/。
+        self._agent_md_manager = _build_client_runtime_manager(self)
         # 当前活跃 prekey：只有这个 prekey 被消费时才触发 replenish 上传。
         # connect 成功后上传的 prekey 记录为活跃；历史 prekey 被消费不触发上传。
         self._active_prekey_id: str = ""
 
         connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
-        token_store = FileKeyStore(
+        token_store = LocalTokenStore(
             self._config_model.aun_path,
             logger=self._log,
         )
@@ -789,19 +818,7 @@ class AUNClient:
         cached = self._peer_cache.get(target)
         if cached is not None:
             return cached
-        store = self._make_aid_store()
-        try:
-            resolved = await store.resolve(target, {"skip_agent_md": True})
-        finally:
-            store.close()
-        if not resolved.ok or resolved.data is None:
-            message = resolved.error.message if resolved.error else f"resolve peer failed: {target}"
-            raise AUNError(message)
-        peer = resolved.data.get("aid")
-        if not isinstance(peer, AID) or not peer.is_cert_valid():
-            raise AUNError(f"resolved peer certificate is invalid: {target}")
-        self._peer_cache[peer.aid] = peer
-        return peer
+        return await self._resolve_peer_aid(target)
 
     def peers(self) -> list[AID]:
         self._require_peer_management_state()
@@ -850,7 +867,7 @@ class AUNClient:
             net=self._net,
         )
         connection_factory = _make_connection_factory(self._config_model.verify_ssl, self._log, net=self._net)
-        self._token_store = FileKeyStore(
+        self._token_store = LocalTokenStore(
             self._config_model.aun_path,
             logger=self._log,
         )
@@ -874,8 +891,7 @@ class AUNClient:
             logger=self._log,
         )
         self._transport.set_meta_observer(self._observe_rpc_meta)
-        self._agent_md_path = str(Path(self._config_model.aun_path) / "AIDs")
-        self._agent_md_cache.clear()
+        self._agent_md_manager = _build_client_runtime_manager(self)
         self._peer_gateway_cache.clear()
 
     def set_protected_headers(self, headers: dict[str, Any] | None) -> None:
@@ -897,43 +913,20 @@ class AUNClient:
     def get_protected_headers(self) -> dict[str, Any] | None:
         return dict(self._instance_protected_headers) if self._instance_protected_headers else None
 
-    @staticmethod
-    def _agent_md_content_etag(content: str) -> str:
-        digest = hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
-        return f'"{digest}"'
-
-    def _agent_md_owner_aid(self) -> str:
-        return str(self._aid or "").strip()
-
-    def _agent_md_root(self) -> Path:
-        root = Path(getattr(self, "_agent_md_path", "") or (Path(self._config_model.aun_path) / "AIDs"))
-        root.mkdir(parents=True, exist_ok=True)
-        return root
-
-    def _make_aid_store(self) -> AIDStore:
-        return AIDStore(
-            aun_path=self._config_model.aun_path,
-            encryption_seed=str(self._config_model.seed_password or ""),
-            device_id=self._device_id,
-            slot_id=self._slot_id or "default",
-            verify_ssl=self._config_model.verify_ssl,
-            root_ca_path=self._config_model.root_ca_path,
-            logger=self._log,
-        )
-
     async def _discover_gateway_for_aid(self, aid: str) -> str:
         target = str(aid or "").strip()
         if not target:
             raise StateError("gateway discovery requires aid")
         if self._gateway_url:
             return self._gateway_url
-        store = self._make_aid_store()
-        try:
-            gateway_url = await store._resolved_gateway(target)
-            self._gateway_url = gateway_url
-            return gateway_url
-        finally:
-            store.close()
+        cached_gateway = self._load_cached_gateway_url(target)
+        if cached_gateway:
+            self._gateway_url = cached_gateway
+            return cached_gateway
+        gateway_url = await self._discover_gateway_url(target)
+        self._gateway_url = gateway_url
+        self._persist_gateway_url(target, gateway_url)
+        return gateway_url
 
     @staticmethod
     def _issuer_domain_for_aid(aid: str) -> str:
@@ -965,602 +958,118 @@ class AUNClient:
         if peer_issuer and local_issuer and peer_issuer == local_issuer and self._aid:
             discovery_aid = self._aid
 
-        store = self._make_aid_store()
-        try:
-            gateway_url = await store._resolved_gateway(discovery_aid)
-        finally:
-            store.close()
+        cached_gateway = self._load_cached_gateway_url(discovery_aid)
+        if cached_gateway:
+            self._peer_gateway_cache[cache_key] = cached_gateway
+            return cached_gateway
+
+        gateway_url = await self._discover_gateway_url(discovery_aid)
+        self._persist_gateway_url(discovery_aid, gateway_url)
+        if discovery_aid != target:
+            self._persist_gateway_url(target, gateway_url)
         if gateway_url:
             self._peer_gateway_cache[cache_key] = gateway_url
         return gateway_url
 
-    def _agent_md_url(self, aid: str, gateway_url: str = "") -> str:
-        raw_gateway = str(gateway_url or "").strip().lower()
-        scheme = "http" if raw_gateway.startswith("ws://") else "https"
-        host = self._agent_md_safe_aid(aid)
-        if self._config_model.discovery_port and ":" not in host:
-            host = f"{host}:{int(self._config_model.discovery_port)}"
-        return f"{scheme}://{host}/agent.md"
-
-    @staticmethod
-    def _agent_md_safe_aid(aid: str) -> str:
-        target = str(aid or "").strip()
-        if not target or any(ch in target for ch in ("/", "\\", "\x00")):
-            raise ValidationError("agent.md aid is empty or contains path separators")
-        return target
-
-    def _agent_md_file_path(self, aid: str) -> Path:
-        return self._agent_md_root() / self._agent_md_safe_aid(aid) / "agent.md"
-
-    def _agent_md_meta_path(self, aid: str) -> Path:
-        return self._agent_md_root() / self._agent_md_safe_aid(aid) / "agentmd.json"
-
-    @contextmanager
-    def _agent_md_record_lock(self, aid: str):
-        meta_path = self._agent_md_meta_path(aid)
-        lock_path = meta_path.parent / "agentmd.json.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "a+b") as fp:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    fp.seek(0)
-                    msvcrt.locking(fp.fileno(), msvcrt.LK_LOCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
-                yield
-            finally:
-                try:
-                    if os.name == "nt":
-                        import msvcrt
-                        fp.seek(0)
-                        msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
-                except Exception:
-                    pass
-
-    @staticmethod
-    def _atomic_write_text(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        try:
-            with open(tmp, "w", encoding="utf-8", newline="\n") as fp:
-                fp.write(content)
-                fp.flush()
-                os.fsync(fp.fileno())
-            os.replace(tmp, path)
-            if os.name != "nt":
-                try:
-                    dir_fd = os.open(str(path.parent), os.O_RDONLY)
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-                except Exception:
-                    pass
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-
-    def _write_agent_md_record_unlocked(self, aid: str, record: dict[str, Any]) -> None:
-        payload = {k: v for k, v in record.items() if k != "content" and v is not None}
-        payload["aid"] = self._agent_md_safe_aid(aid)
-        self._atomic_write_text(
-            self._agent_md_meta_path(aid),
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        )
-
-    def _normalize_agent_md_record(self, aid: str, data: Any) -> dict[str, Any]:
-        if not isinstance(data, dict):
-            return {}
-        record: dict[str, Any] = {k: v for k, v in data.items() if k != "content"}
-        record["aid"] = self._agent_md_safe_aid(str(record.get("aid") or aid))
-        for key in ("fetched_at", "observed_at", "checked_at", "updated_at"):
-            try:
-                record[key] = int(record.get(key) or 0)
-            except Exception:
-                record[key] = 0
-        return record
-
-    def _read_agent_md_record_unlocked(self, aid: str) -> dict[str, Any]:
-        path = self._agent_md_meta_path(aid)
-        if not path.exists():
-            return {}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return self._normalize_agent_md_record(aid, data)
-        except Exception as exc:
-            self._log.warn("client", "agent.md metadata damaged, ignoring: aid=%s err=%s", aid, exc)
-            return {}
-
-    def _read_agent_md_content(self, aid: str) -> str:
-        return self._agent_md_file_path(aid).read_text(encoding="utf-8")
-
-    def _write_agent_md_content(self, aid: str, content: str) -> str:
-        path = self._agent_md_file_path(aid)
-        self._atomic_write_text(path, str(content or ""))
-        return str(path)
-
-    def _load_agent_md_record(self, aid: str) -> dict[str, Any] | None:
+    async def _discover_gateway_url(self, aid: str) -> str:
         target = str(aid or "").strip()
         if not target:
-            return None
+            raise StateError("gateway discovery requires aid")
+        issuer_domain = self._issuer_domain_for_aid(target)
+        aid_url = f"https://{target}/.well-known/aun-gateway"
+        gateway_url = f"https://gateway.{issuer_domain}/.well-known/aun-gateway"
+        primary_url, fallback_url = (aid_url, gateway_url) if self._config_model.verify_ssl else (gateway_url, aid_url)
         try:
-            with self._agent_md_record_lock(target):
-                record = self._read_agent_md_record_unlocked(target)
-            loaded: dict[str, Any]
-            if record:
-                loaded = dict(record)
-                loaded["aid"] = target
-            else:
-                loaded = {"aid": target}
-            try:
-                content = self._read_agent_md_content(target)
-                loaded["content"] = content
-                loaded["local_etag"] = self._agent_md_content_etag(content)
-            except Exception as exc:
-                if self._agent_md_meta_path(target).exists():
-                    self._log.warn("client", "agent.md content read failed: aid=%s err=%s", target, exc)
-            if len(loaded) <= 1:
-                return None
-            if record == {} and "content" in loaded:
-                with self._agent_md_record_lock(target):
-                    self._write_agent_md_record_unlocked(target, {
-                        "aid": target,
-                        "local_etag": loaded.get("local_etag"),
-                        "updated_at": int(time.time() * 1000),
-                    })
-            self._agent_md_cache[target] = dict(loaded)
-            return dict(loaded)
+            return await self._discovery.discover(primary_url)
         except Exception as exc:
-            self._log.debug("client", "agent.md cache load skipped: aid=%s err=%s", target, exc)
-        return None
+            self._log.debug("client", "gateway discovery primary failed: aid=%s err=%s", target, exc)
+            return await self._discovery.discover(fallback_url)
 
-    def _save_agent_md_record(self, aid: str, **fields: Any) -> dict[str, Any]:
-        target = str(aid or "").strip()
-        if not target:
-            return {}
+    def _load_cached_gateway_url(self, aid: str) -> str:
+        if not aid:
+            return ""
         try:
-            content_marker = object()
-            content = fields.pop("content", content_marker)
-            saved_to = ""
-            if content is not content_marker and content is not None:
-                saved_to = self._write_agent_md_content(target, str(content))
-                fields.setdefault("local_etag", self._agent_md_content_etag(str(content)))
-                fields.setdefault("fetched_at", int(time.time() * 1000))
-            with self._agent_md_record_lock(target):
-                record = dict(self._read_agent_md_record_unlocked(target) or {})
-                record["aid"] = target
-                for key, value in fields.items():
-                    if value is not None:
-                        record[key] = value
-                record["updated_at"] = int(time.time() * 1000)
-                self._write_agent_md_record_unlocked(target, record)
-            loaded = dict(record)
-            if content is not content_marker and content is not None:
-                loaded["content"] = str(content)
-                if saved_to:
-                    loaded["saved_to"] = saved_to
-            else:
-                cached = self._agent_md_cache.get(target)
-                if isinstance(cached, dict) and "content" in cached:
-                    loaded["content"] = cached["content"]
-            self._agent_md_cache[target] = dict(loaded)
-            owner = self._agent_md_owner_aid()
-            if target == owner:
-                local_etag = str(loaded.get("local_etag") or "").strip()
-                remote_etag = str(loaded.get("remote_etag") or "").strip()
-                if local_etag:
-                    self._local_agent_md_etag = local_etag
-                if remote_etag:
-                    self._remote_agent_md_etag = remote_etag
-            return dict(loaded)
-        except Exception as exc:
-            self._log.debug("client", "agent.md cache save skipped: aid=%s err=%s", target, exc)
-        return {}
-
-    def _agent_md_has_local_content(self, aid: str, record: dict[str, Any] | None = None) -> bool:
-        if isinstance(record, dict) and record.get("content"):
-            return True
-        try:
-            return self._agent_md_file_path(aid).is_file()
+            getter = getattr(self._token_store, "get_metadata_value", None)
+            if callable(getter):
+                return str(getter(aid, "gateway_url") or "").strip()
+            metadata = self._token_store.load_metadata(aid) or {}
+            fields = metadata.get("fields") if isinstance(metadata, dict) else None
+            return str((fields or {}).get("gateway_url") or "").strip()
         except Exception:
-            return False
+            return ""
 
-    @staticmethod
-    def _agent_md_checked_at_fresh(checked_at_ms: int, max_unsynced_days: float) -> bool:
-        """判断上次 HEAD 时间距今是否在允许窗口内。
-
-        - max_unsynced_days <= 0：每次都强制 HEAD（返回 False）
-        - checked_at_ms 无效：视为从未 HEAD（返回 False）
-        """
+    def _persist_gateway_url(self, aid: str, gateway_url: str) -> None:
+        if not aid or not gateway_url:
+            return
         try:
-            days = float(max_unsynced_days or 0)
-        except (TypeError, ValueError):
-            return False
-        if days <= 0 or checked_at_ms <= 0:
-            return False
-        return (time.time() * 1000 - float(checked_at_ms)) <= days * 86400_000
-
-    def _schedule_agent_md_fetch_if_missing(self, aid: str, record: dict[str, Any] | None, *, source: str = "") -> None:
-        target = str(aid or "").strip()
-        if not target or self._agent_md_has_local_content(target, record):
-            return
-        inflight = getattr(self, "_agent_md_fetch_inflight", set())
-        self._agent_md_fetch_inflight = inflight
-        if target in inflight:
-            return
-
-        async def _fetch_missing() -> None:
-            try:
-                await self._fetch_agent_md(target)
-            except Exception as exc:
-                self._save_agent_md_record(target, last_error=str(exc), remote_status="found")
-                self._log.debug("client", "agent.md auto fetch failed: aid=%s source=%s err=%s", target, source or "-", exc)
-            finally:
-                inflight.discard(target)
-
-        inflight.add(target)
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_fetch_missing())
-        except RuntimeError:
-            asyncio.run(_fetch_missing())
-
-    def _observe_agent_md_meta(self, aid: str, etag: str = "", last_modified: str = "", *, source: str = "") -> None:
-        target = str(aid or "").strip()
-        remote_etag = str(etag or "").strip()
-        remote_last_modified = str(last_modified or "").strip()
-        if not target or not (remote_etag or remote_last_modified):
-            return
-        before = self._agent_md_cache.get(target)
-        if not isinstance(before, dict):
-            before = self._load_agent_md_record(target) or {}
-        same = (
-            (not remote_etag or str(before.get("remote_etag") or "").strip() == remote_etag)
-            and (not remote_last_modified or str(before.get("last_modified") or "").strip() == remote_last_modified)
-        )
-        record = dict(before)
-        if not same or not before:
-            fields: dict[str, Any] = {
-                "observed_at": int(time.time() * 1000),
-                "remote_status": "found",
-            }
-            if remote_etag:
-                fields["remote_etag"] = remote_etag
-            if remote_last_modified:
-                fields["last_modified"] = remote_last_modified
-            record = self._save_agent_md_record(target, **fields) or record
-        if target == self._agent_md_owner_aid() and remote_etag:
-            self._remote_agent_md_etag = remote_etag
-        self._schedule_agent_md_fetch_if_missing(target, record, source=source)
-        self._log.debug(
-            "client",
-            "agent.md meta observed: aid=%s etag=%s last_modified=%s source=%s",
-            target,
-            remote_etag or "-",
-            remote_last_modified or "-",
-            source or "-",
-        )
-
-    def _observe_agent_md_etag(self, aid: str, etag: str, *, source: str = "") -> None:
-        self._observe_agent_md_meta(aid, etag, "", source=source)
-
-    def _observe_agent_md_from_envelope(self, envelope: Any) -> None:
-        if not isinstance(envelope, dict):
-            return
-        agent_md = envelope.get("agent_md")
-        if not isinstance(agent_md, dict):
-            return
-        sender = agent_md.get("sender")
-        if not isinstance(sender, dict):
-            return
-        sender_aid = str(sender.get("aid") or "").strip()
-        if not sender_aid:
-            aad = envelope.get("aad") if isinstance(envelope.get("aad"), dict) else {}
-            sender_aid = str(aad.get("from") or envelope.get("from") or "").strip()
-        self._observe_agent_md_meta(
-            sender_aid,
-            str(sender.get("etag") or ""),
-            str(sender.get("last_modified") or sender.get("lastModified") or ""),
-            source="envelope",
-        )
-
-    async def _check_agent_md(self, aid: str | None = None, max_unsynced_days: float = 0) -> dict[str, Any]:
-        target = str(aid or self._aid or "").strip()
-        if not target:
-            raise ValidationError("check_agent_md requires aid (or local AID)")
-        before = self._load_agent_md_record(target) or {}
-        local_etag = str(before.get("local_etag") or "").strip()
-        local_found = bool(before and (before.get("content") or local_etag))
-        remote_etag_cached = str(before.get("remote_etag") or "").strip()
-        last_modified_cached = str(before.get("last_modified") or "").strip()
-        checked_at_cached = int(before.get("checked_at") or before.get("fetched_at") or 0)
-        cached_in_sync = bool(local_found and local_etag and remote_etag_cached and local_etag == remote_etag_cached)
-        # max_unsynced_days > 0 时，距上次 HEAD 在窗口内则跳过 HEAD（直接返回缓存）；
-        # max_unsynced_days <= 0 时，每次都强制 HEAD 确认远端状态。
-        if cached_in_sync and self._agent_md_checked_at_fresh(checked_at_cached, max_unsynced_days):
-            return {
-                "aid": target,
-                "local_found": True,
-                "remote_found": True,
-                "local_etag": local_etag,
-                "remote_etag": remote_etag_cached,
-                "in_sync": True,
-                "last_modified": last_modified_cached,
-                "status": 200,
-                "cached": True,
-                "verify_status": str(before.get("verify_status") or ""),
-                "verify_error": str(before.get("verify_error") or ""),
-            }
-        # 远端确认不存在 + 本地也没有 + 在时间窗口内 → 跳过 HEAD
-        remote_found_cached = bool(remote_etag_cached or str(before.get("remote_status") or "") == "found")
-        if (not local_found and not remote_found_cached
-                and str(before.get("remote_status") or "") == "missing"
-                and self._agent_md_checked_at_fresh(checked_at_cached, max_unsynced_days)):
-            return {
-                "aid": target,
-                "local_found": False,
-                "remote_found": False,
-                "local_etag": "",
-                "remote_etag": "",
-                "in_sync": False,
-                "last_modified": "",
-                "status": 404,
-                "cached": True,
-                "verify_status": "",
-                "verify_error": "",
-            }
-
-        now_ms = int(time.time() * 1000)
-        store = self._make_aid_store()
-        try:
-            remote_result = await store.head_agent_md(target)
-            if not remote_result.ok or remote_result.data is None:
-                message = remote_result.error.message if remote_result.error else "head agent.md failed"
-                raise AUNError(message)
-            remote = remote_result.data
+            setter = getattr(self._token_store, "set_metadata_value", None)
+            if callable(setter):
+                setter(aid, "gateway_url", gateway_url)
         except Exception as exc:
-            self._save_agent_md_record(target, checked_at=now_ms, remote_status="error", last_error=str(exc))
-            raise
-        finally:
-            store.close()
+            self._log.debug("client", "persist gateway_url failed: aid=%s err=%s", aid, exc)
 
-        remote_found = bool(remote.get("found"))
-        remote_etag = str(remote.get("etag") or "").strip()
-        last_modified = str(remote.get("last_modified") or remote.get("lastModified") or "").strip()
-        remote_status = "found" if remote_found else "missing"
-        saved = self._save_agent_md_record(
-            target,
-            remote_etag=remote_etag if remote_found else "",
-            last_modified=last_modified,
-            checked_at=now_ms,
-            remote_status=remote_status,
-            last_error="",
-        )
-        if target == self._agent_md_owner_aid() and remote_etag:
-            self._remote_agent_md_etag = remote_etag
-        in_sync = bool(local_found and remote_found and local_etag and remote_etag and local_etag == remote_etag)
-        # 远端有但本地没有 → 自动触发下载，保证本地一定有 agent.md（前提是服务端有）
-        if remote_found and not local_found:
-            self._schedule_agent_md_fetch_if_missing(target, saved or before, source="check_agent_md")
-        return {
-            "aid": target,
-            "local_found": local_found,
-            "remote_found": remote_found,
-            "local_etag": local_etag,
-            "remote_etag": remote_etag,
-            "in_sync": in_sync,
-            "last_modified": last_modified,
-            "status": int(remote.get("status") or (200 if remote_found else 404)),
-            "cached": False,
-            "verify_status": str(saved.get("verify_status") or before.get("verify_status") or ""),
-            "verify_error": str(saved.get("verify_error") or before.get("verify_error") or ""),
-        }
-
-    async def publish_agent_md(self, content: str | None = None) -> dict[str, Any]:
-        """签名并上传 agent.md；content 未传时读取 {agent_md_path}/{self_aid}/agent.md。"""
-        target = self._agent_md_owner_aid()
+    async def _resolve_peer_aid(self, aid: str) -> AID:
+        target = str(aid or "").strip()
         if not target:
-            raise ValidationError("publish_agent_md requires local AID")
-        if self._current_aid is None or not self._current_aid.is_private_key_valid():
-            raise StateError("publish_agent_md requires loaded AID with a valid private key")
-        raw_content = self._read_agent_md_content(target) if content is None else str(content)
-        signed_result = self._current_aid.sign_agent_md(raw_content)
-        if not signed_result.ok or signed_result.data is None:
-            message = signed_result.error.message if signed_result.error else "agent.md signing failed"
-            raise ClientSignatureError(message)
-        signed = signed_result.data["signed"]
-        result = await self.upload_agent_md(signed)
-        local_etag = self._agent_md_content_etag(signed)
-        self._local_agent_md_etag = local_etag
-        remote_etag = str(result.get("etag") or "").strip() if isinstance(result, dict) else ""
-        if remote_etag:
-            self._remote_agent_md_etag = remote_etag
-        self._save_agent_md_record(
-            target,
-            content=signed,
-            local_etag=local_etag,
-            remote_etag=remote_etag,
-            last_modified=str(result.get("last_modified") or "").strip() if isinstance(result, dict) else "",
-            fetched_at=int(time.time() * 1000),
-            remote_status="found" if remote_etag else "unknown",
-            last_error="",
-        )
-        return result
+            raise ValidationError("peer aid is required")
+        if self._current_aid is not None and self._current_aid.aid == target:
+            return self._current_aid
+        cached = self._peer_cache.get(target)
+        if cached is not None:
+            return cached
 
-    async def upload_agent_md(self, content: str) -> dict[str, Any]:
-        """上传已签名 agent.md。"""
-        if not str(content or "").strip():
-            raise ValidationError("upload_agent_md requires non-empty content")
-        target = self._agent_md_owner_aid()
-        if not target:
-            raise ValidationError("upload_agent_md requires local AID")
-        _t_start = time.time()
-        self._log.debug("client", "upload_agent_md enter: aid=%s content_len=%d", target, len(content or ""))
-        gateway_url = await self._discover_gateway_for_aid(target)
-        token = ""
-        identity = self._identity if isinstance(self._identity, dict) else {}
-        token = str(identity.get("access_token") or "").strip()
-        if not token and isinstance(self._session_params, dict):
-            token = str(self._session_params.get("access_token") or "").strip()
-        if not token:
-            auth_result = await self.authenticate()
-            token = str(auth_result.get("access_token") or "").strip()
-        if not token:
-            raise StateError("authenticate did not return access_token")
-
-        agent_md_url = self._agent_md_url(target, gateway_url)
-        trace_mode = getattr(self._transport, "_trace_mode", "off")
-        trace_id = secrets.token_hex(16) if trace_mode != "off" else ""
-        if trace_id:
-            self._log.info("client", "[trace=%s] http_out PUT agent.md aid=%s", trace_id, target)
-        timeout = aiohttp.ClientTimeout(total=30)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "text/markdown; charset=utf-8",
-        }
-        if trace_id:
-            headers["X-AUN-Trace"] = trace_id
-        ssl_param = None if self._config_model.verify_ssl else False
+        cert_pem = ""
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.put(
-                    agent_md_url,
-                    data=str(content or "").encode("utf-8"),
-                    headers=headers,
-                    ssl=ssl_param,
-                ) as response:
-                    duration_ms = int((time.time() - _t_start) * 1000)
-                    if trace_id:
-                        self._log.info(
-                            "client",
-                            "[trace=%s] http_in status=%d duration_ms=%d",
-                            trace_id,
-                            response.status,
-                            duration_ms,
-                        )
-                        observer = getattr(self._transport, "_trace_observer", None)
-                        if observer:
-                            try:
-                                observer({
-                                    "type": "http",
-                                    "trace_id": trace_id,
-                                    "method": "PUT",
-                                    "url": agent_md_url,
-                                    "status": response.status,
-                                    "duration_ms": duration_ms,
-                                })
-                            except Exception:
-                                pass
-                    if response.status == 404:
-                        raise NotFoundError(f"agent.md endpoint not found for aid: {target}")
-                    if response.status < 200 or response.status >= 300:
-                        message = (await response.text()).strip()
-                        raise AUNError(
-                            f"upload agent.md failed: HTTP {response.status}"
-                            + (f" - {message}" if message else "")
-                        )
-                    result = await response.json()
-                    self._log.debug(
-                        "client",
-                        "upload_agent_md exit: elapsed=%.3fs aid=%s status=%d",
-                        time.time() - _t_start,
-                        target,
-                        response.status,
-                    )
-                    return result
+            cert_pem = str(self._token_store.load_cert(target) or "").strip()
+            if cert_pem:
+                peer = self._public_aid_from_cert(target, cert_pem)
+                self._peer_cache[peer.aid] = peer
+                return peer
         except Exception as exc:
-            self._log.debug(
-                "client",
-                "upload_agent_md exit (error): elapsed=%.3fs aid=%s err=%s",
-                time.time() - _t_start,
-                target,
-                exc,
-            )
-            raise
+            self._log.debug("client", "cached peer cert ignored: aid=%s err=%s", target, exc)
 
-    async def _fetch_agent_md(self, aid: str | None = None) -> dict[str, Any]:
-        """下载 agent.md 并自动验签；内容固定保存到 {agent_md_path}/{aid}/agent.md。"""
-        target = (aid or self._aid or "").strip()
-        if not target:
-            raise ValidationError("fetch_agent_md requires aid (or local AID)")
-        store = self._make_aid_store()
+        cert_bytes = await self._fetch_peer_cert(target)
+        peer = self._public_aid_from_cert(target, cert_bytes.decode("utf-8"))
+        self._peer_cache[peer.aid] = peer
+        return peer
+
+    def _public_aid_from_cert(self, aid: str, cert_pem: str) -> AID:
+        target = str(aid or "").strip()
         try:
-            fetched = await store.fetch_agent_md(target)
-            if not fetched.ok or fetched.data is None:
-                message = fetched.error.message if fetched.error else "fetch agent.md failed"
-                if fetched.error and fetched.error.code == "AGENTMD_NOT_FOUND":
-                    raise NotFoundError(message)
-                raise AUNError(message)
-            data = fetched.data
-        finally:
-            store.close()
-
-        content = str(data.get("content") or "")
-        signature = dict(data.get("signature") or {})
-
-        is_self = target == (self._aid or "")
-        local_etag = self._agent_md_content_etag(content)
-        remote_etag = str(data.get("etag") or "").strip()
-        last_modified = str(data.get("last_modified") or data.get("lastModified") or "").strip()
-        if is_self:
-            self._local_agent_md_etag = local_etag
-            if remote_etag:
-                self._remote_agent_md_etag = remote_etag
-        saved = self._save_agent_md_record(
-            target,
-            content=content,
-            local_etag=local_etag,
-            remote_etag=remote_etag if remote_etag else None,
-            last_modified=last_modified if last_modified else None,
-            fetched_at=int(time.time() * 1000),
-            remote_status="found",
-            verify_status=str(signature.get("status") or "") if isinstance(signature, dict) else "",
-            verify_error=str(signature.get("reason") or "") if isinstance(signature, dict) else "",
-            last_error="",
+            cert_obj = x509.load_pem_x509_certificate(str(cert_pem or "").encode("utf-8"))
+        except Exception as exc:
+            raise AUNError(f"peer certificate parse failed: {target}") from exc
+        time_error = cert_time_error(cert_obj)
+        if time_error == "expired":
+            raise AUNError(f"peer certificate expired: {target}")
+        if time_error == "not_yet_valid":
+            raise AUNError(f"peer certificate not yet valid: {target}")
+        cert_cn = cert_common_name(cert_obj)
+        if cert_cn and cert_cn != target:
+            raise AUNError(f"peer certificate CN mismatch: expected {target}, got {cert_cn}")
+        return AID._create(
+            aid=target,
+            aun_path=self._config_model.aun_path,
+            cert_pem=cert_pem,
+            cert_obj=cert_obj,
+            private_key_obj=None,
+            cert_valid=True,
+            private_key_valid=False,
+            device_id=self._device_id,
+            slot_id=self._slot_id or "default",
+            verify_ssl=self._config_model.verify_ssl,
+            root_ca_path=self._config_model.root_ca_path,
+            debug=bool(getattr(self._log, "_debug", False)),
         )
-        in_sync: bool | None = None
-        if is_self:
-            remote = remote_etag or self._remote_agent_md_etag or ""
-            in_sync = (local_etag == remote) if (local_etag and remote) else False
 
-        return {
-            "aid": target,
-            "content": content,
-            "signature": signature,
-            "in_sync": in_sync,
-            "saved_to": saved.get("saved_to") or str(self._agent_md_file_path(target)),
-            "save_error": None,
-        }
+    async def upload_agent_md(self, content: str | None = None) -> dict[str, Any]:
+        """签名并上传当前 AID 的 agent.md。"""
+        return await self._agent_md_manager.upload(content)
+
     def _observe_rpc_meta(self, meta: dict) -> None:
         """transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。"""
-        if not isinstance(meta, dict):
-            return
-        etag = str(meta.get("agent_md_etag") or "").strip()
-        if etag:
-            self._remote_agent_md_etag = etag
-            self._observe_agent_md_meta(self._aid or "", etag, "", source="rpc.self")
-        etags = meta.get("agent_md_etags")
-        if isinstance(etags, dict):
-            # role key 优先级：requester / peer 是新规范，其余是兼容旧 SDK 的别名。
-            # 同一 AID 在多个 role 下出现时，set_default 自动去重（首次写入即生效）。
-            for key in ("requester", "peer", "receiver", "target", "to", "sender", "from"):
-                item = etags.get(key)
-                if not isinstance(item, dict):
-                    continue
-                self._observe_agent_md_meta(
-                    str(item.get("aid") or ""),
-                    str(item.get("etag") or ""),
-                    str(item.get("last_modified") or item.get("lastModified") or ""),
-                    source=f"rpc.{key}",
-                )
+        self._agent_md_manager.observe_rpc_meta(meta, owner_aid=self._aid or "")
+
     def set_trace_mode(self, mode: str) -> None:
         """设置会话级 trace mode（off/log/diag），影响后续所有 RPC 调用。"""
         self._transport.set_trace_mode(mode)
@@ -3472,13 +2981,9 @@ class AUNClient:
         # 注入本地/远端 agent.md etag，让应用层判断版本一致性；失败不影响业务。
         if isinstance(payload, dict):
             try:
-                local_etag = self._local_agent_md_etag or ""
-                remote_etag = self._remote_agent_md_etag or ""
-                if local_etag or remote_etag:
-                    payload.setdefault("_agent_md", {
-                        "local_etag": local_etag,
-                        "remote_etag": remote_etag,
-                    })
+                snapshot = self._agent_md_manager.event_snapshot()
+                if snapshot:
+                    payload.setdefault("_agent_md", snapshot)
             except Exception as exc:
                 self._log.debug("client", "agent_md etag inject skipped: %s", exc)
         await self._dispatcher.publish(
@@ -4890,7 +4395,7 @@ class AUNClient:
         if "device_id" in params and str(params.get("device_id") or "").strip() != self._device_id:
             raise ValidationError("message.pull/message.ack device_id must match the current client instance")
         slot_id = normalize_slot_id(params.get("slot_id", self._slot_id))
-        if slot_id != self._slot_id:
+        if slot_isolation_key(slot_id) != slot_isolation_key(self._slot_id):
             raise ValidationError("message.pull/message.ack slot_id must match the current client instance")
         params["device_id"] = self._device_id
         params["slot_id"] = self._slot_id
@@ -5522,7 +5027,7 @@ class AUNClient:
         """connect 成功后初始化 V2 session 并注册设备 SPK。IK = AID 长期密钥（无需独立注册）。"""
         if not self._aid:
             return
-        # 私钥由 AIDStore 管理，AUNClient 直接从 _current_aid 读取明文私钥
+        # 私钥由 AID 值对象提供，AUNClient 不从持久化存储读取私钥。
         current_aid = self._current_aid
         if not current_aid or not current_aid.private_key_pem:
             self._log.warn("client", "V2 session init skipped: no AID private key")
@@ -6775,7 +6280,7 @@ class AUNClient:
                     if isinstance(parsed, dict):
                         envelope = parsed
         if envelope is not None:
-            self._observe_agent_md_from_envelope(envelope)
+            self._agent_md_manager.observe_envelope(envelope)
             self._attach_v2_envelope_metadata(message, self._v2_thought_e2ee_metadata(envelope))
 
     @staticmethod
@@ -6938,7 +6443,7 @@ class AUNClient:
 
         if not self._v2_session or not isinstance(envelope, dict):
             return None
-        self._observe_agent_md_from_envelope(envelope)
+        self._agent_md_manager.observe_envelope(envelope)
 
         # 确定接收方 SPK：根据 envelope.recipients 中本设备所引用的 spk_id
         spk_id = ""
@@ -7913,7 +7418,7 @@ class AUNClient:
         except (json.JSONDecodeError, TypeError):
             self._log.warn("client", "V2 decrypt: invalid envelope_json for msg seq=%s", msg.get("seq"))
             return None
-        self._observe_agent_md_from_envelope(envelope)
+        self._agent_md_manager.observe_envelope(envelope)
 
         # 确定 spk_id
         recipient_key_source = ""
@@ -8101,4 +7606,5 @@ class AUNClient:
             result["slot_id"] = msg.get("slot_id")
         self._attach_v2_envelope_metadata(result, meta)
         return result
+
 

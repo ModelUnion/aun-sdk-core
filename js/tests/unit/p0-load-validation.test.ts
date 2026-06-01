@@ -7,7 +7,7 @@
 import 'fake-indexeddb/auto';
 import crypto from 'node:crypto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AIDStore, AUNClient, ConnectionState, IndexedDBKeyStore } from '../../src/index.js';
+import { AIDStore, AUNClient, ConnectionState, IndexedDBIdentityStore } from '../../src/index.js';
 import * as codes from '../../src/error-codes.js';
 
 // ── DER 构建工具（与 aid-store-refactor.test.ts 相同） ──────────
@@ -83,7 +83,7 @@ function makeCert(opts: {
 }
 
 async function storeIdentity(aid: string, identity: { cert: string; private_key_pem: string; public_key_der_b64: string }): Promise<AIDStore> {
-  const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'test-seed' });
+  const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'test-seed' });
   await keyStore.saveIdentity(aid, { ...identity, aid });
   return new AIDStore({ aunPath: 'browser-aun-p0', encryptionSeed: 'test-seed' });
 }
@@ -149,7 +149,7 @@ describe('P0-load-03: 私钥解析错误捕获', () => {
   it('私钥 PEM 损坏 → PRIVATE_KEY_PARSE_ERROR', async () => {
     const aid = 'frank.aid.com';
     const identity = makeCert({ aid });
-    const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'test-seed' });
+    const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'test-seed' });
     // 存入损坏的私钥
     await keyStore.saveIdentity(aid, {
       ...identity,
@@ -168,7 +168,7 @@ describe('P0-load-04: 私钥-证书配对自检', () => {
     const aid = 'grace.aid.com';
     const identity1 = makeCert({ aid });
     const identity2 = makeCert({ aid }); // 另一对密钥
-    const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'test-seed' });
+    const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'test-seed' });
     // 存入 identity1 的证书 + identity2 的私钥（不匹配）
     await keyStore.saveIdentity(aid, {
       aid,
@@ -185,7 +185,7 @@ describe('P0-load-04: 私钥-证书配对自检', () => {
   it('私钥与证书公钥匹配但 public_key_der_b64 字段缺失 → 仍通过自检', async () => {
     const aid = 'henry.aid.com';
     const identity = makeCert({ aid });
-    const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'test-seed' });
+    const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'test-seed' });
     // 不存 public_key_der_b64，只存私钥和证书
     await keyStore.saveIdentity(aid, {
       aid,

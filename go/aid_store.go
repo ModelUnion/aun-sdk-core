@@ -5,9 +5,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -40,15 +43,6 @@ type RegisterResult struct{ Registered bool }
 
 // ExistsResult Exists 方法的返回结构。
 type ExistsResult struct{ Exists bool }
-
-// HeadAgentMdResult HeadAgentMD 方法的返回结构。
-type HeadAgentMdResult struct {
-	AID           string
-	Found         bool
-	Etag          string
-	LastModified  string
-	ContentLength int
-}
 
 // CheckAgentMdResult CheckAgentMD 方法的返回结构。
 type CheckAgentMdResult struct {
@@ -115,10 +109,11 @@ type AIDStore struct {
 	verifySSL      bool
 	rootCaPath     string
 	debug          bool
-	// 内部组件（复用 AUNClient 的基础设施）
-	client       *AUNClient
-	keyStore     keystore.FullKeyStore
-	registerFlow *RegisterFlow
+	keyStore       *keystore.LocalIdentityStore
+	registerFlow   *RegisterFlow
+	discovery      *GatewayDiscovery
+	dnsNet         *DnsResilientNet
+	gatewayURL     string
 }
 
 // AIDStoreOptions 创建 AIDStore 的可选参数，与 Python/JS SDK 对齐。
@@ -145,13 +140,18 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 	if o.VerifySSL != nil {
 		verifySSL = *o.VerifySSL
 	}
-	c := newClientForStore(aunPath, encryptionSeed, verifySSL, o.RootCaPath, o.Debug)
-	ks := c.tokenStore.(keystore.FullKeyStore)
+	dnsNet := NewDnsResilientNet(aunPath, verifySSL)
+	ks, err := keystore.NewLocalIdentityStore(aunPath, nil, encryptionSeed)
+	if err != nil {
+		pkgLogKeystore().Warn("创建 LocalIdentityStore 失败: %v, 使用空种子", err)
+		ks, _ = keystore.NewLocalIdentityStore(aunPath, nil, "")
+	}
 	rf := NewRegisterFlow(RegisterFlowConfig{
 		Keystore:  ks,
 		VerifySSL: verifySSL,
+		DnsNet:    dnsNet,
 	})
-	return &AIDStore{
+	store := &AIDStore{
 		aunPath:        aunPath,
 		encryptionSeed: encryptionSeed,
 		deviceID:       o.DeviceID,
@@ -159,15 +159,22 @@ func NewAIDStore(aunPath, encryptionSeed string, opts ...AIDStoreOptions) *AIDSt
 		verifySSL:      verifySSL,
 		rootCaPath:     o.RootCaPath,
 		debug:          o.Debug,
-		client:         c,
 		keyStore:       ks,
 		registerFlow:   rf,
+		discovery:      NewGatewayDiscovery(verifySSL, dnsNet),
+		dnsNet:         dnsNet,
 	}
+	return store
 }
 
 // Close 释放资源
 func (s *AIDStore) Close() {
-	_ = s.client.Close()
+	if s.keyStore != nil {
+		s.keyStore.Close()
+	}
+	if s.dnsNet != nil {
+		s.dnsNet.Close()
+	}
 }
 
 // aidStoreErr 创建带字符串错误码的 AUNError，供 Load() 内部使用。
@@ -211,16 +218,10 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 		return ResultErr[LoadResult](ErrCodeCertChainBroken, fmt.Sprintf("certificate CN mismatch: expected %s, got %s", target, cn))
 	}
 
-	// 加载密钥对（AIDStore 持有完整 KeyStore，类型断言访问）
-	type keyPairLoaderFull interface {
-		LoadKeyPair(aid string) (map[string]any, error)
-	}
-	var keyPair map[string]any
-	if loader, ok := s.keyStore.(keyPairLoaderFull); ok {
-		keyPair, err = loader.LoadKeyPair(target)
-		if err != nil {
-			return ResultErr[LoadResult](ErrCodePrivateKeyParseError, fmt.Sprintf("private key load failed for aid: %s", target), err)
-		}
+	// 加载密钥对
+	keyPair, err := s.keyStore.LoadKeyPair(target)
+	if err != nil {
+		return ResultErr[LoadResult](ErrCodePrivateKeyParseError, fmt.Sprintf("private key load failed for aid: %s", target), err)
 	}
 
 	// 无私钥：仅证书有效
@@ -271,14 +272,7 @@ func (s *AIDStore) Load(aid string) Result[LoadResult] {
 
 // List 列出本地所有具有有效私钥的身份摘要（离线操作）。
 func (s *AIDStore) List() Result[ListResult] {
-	type lister interface {
-		ListIdentities() ([]string, error)
-	}
-	ks, ok := s.keyStore.(lister)
-	if !ok {
-		return ResultOk(ListResult{})
-	}
-	aids, err := ks.ListIdentities()
+	aids, err := s.keyStore.ListIdentities()
 	if err != nil {
 		return ResultErr[ListResult]("LIST_FAILED", fmt.Sprintf("list identities failed: %v", err), err)
 	}
@@ -310,14 +304,7 @@ func (s *AIDStore) ChangeSeed(oldSeed, newSeed string) Result[ChangeSeedResult] 
 	if oldSeed == newSeed {
 		return ResultErr[ChangeSeedResult](ErrCodePrivateKeyParseError, "new_seed must differ from old_seed")
 	}
-	type seedChanger interface {
-		ChangeSeed(oldSeed, newSeed string) (keystore.SeedChangeResult, error)
-	}
-	changer, ok := s.keyStore.(seedChanger)
-	if !ok {
-		return ResultErr[ChangeSeedResult]("NOT_SUPPORTED", "keystore does not support seed migration")
-	}
-	result, err := changer.ChangeSeed(oldSeed, newSeed)
+	result, err := s.keyStore.ChangeSeed(oldSeed, newSeed)
 	if err != nil {
 		return ResultErr[ChangeSeedResult](ErrCodePrivateKeyParseError, err.Error(), err)
 	}
@@ -328,7 +315,7 @@ func (s *AIDStore) ChangeSeed(oldSeed, newSeed string) Result[ChangeSeedResult] 
 // Register 在服务端注册新 AID（联网操作）。
 func (s *AIDStore) Register(ctx context.Context, aid string) Result[RegisterResult] {
 	target := strings.TrimSpace(aid)
-	if err := validateAIDName(target); err != nil {
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
 		return ResultErr[RegisterResult](ErrCodeInvalidAIDFormat, err.Error(), err)
 	}
 	gatewayURL, err := s.resolveGateway(ctx, target)
@@ -345,9 +332,9 @@ func (s *AIDStore) Register(ctx context.Context, aid string) Result[RegisterResu
 		}
 	}
 	if saveErr := s.keyStore.SaveKeyPair(target, map[string]any{
-		"private_key_pem":   result.PrivateKeyPEM,
+		"private_key_pem":    result.PrivateKeyPEM,
 		"public_key_der_b64": result.PublicKeyDerB64,
-		"curve":             result.Curve,
+		"curve":              result.Curve,
 	}); saveErr != nil {
 		return ResultErr[RegisterResult](ErrCodeNetworkError, saveErr.Error(), saveErr)
 	}
@@ -357,7 +344,7 @@ func (s *AIDStore) Register(ctx context.Context, aid string) Result[RegisterResu
 // Exists 检查 AID 是否已在服务端注册（联网操作）。
 func (s *AIDStore) Exists(ctx context.Context, aid string) Result[ExistsResult] {
 	target := strings.TrimSpace(aid)
-	if err := validateAIDName(target); err != nil {
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
 		return ResultErr[ExistsResult](ErrCodeInvalidAIDFormat, err.Error(), err)
 	}
 	gatewayURL, err := s.resolveGateway(ctx, target)
@@ -386,7 +373,7 @@ func (s *AIDStore) Exists(ctx context.Context, aid string) Result[ExistsResult] 
 // Resolve 一站式解析对端 AID：本地缓存/PKI 证书 + 可选 agent.md。
 func (s *AIDStore) Resolve(ctx context.Context, aid string, opts ...AIDStoreResolveOptions) Result[AIDStoreResolveResult] {
 	target := strings.TrimSpace(aid)
-	if err := validateAIDName(target); err != nil {
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
 		return ResultErr[AIDStoreResolveResult](ErrCodeInvalidAIDFormat, err.Error(), err)
 	}
 	var opt AIDStoreResolveOptions
@@ -412,18 +399,17 @@ func (s *AIDStore) Resolve(ctx context.Context, aid string, opts ...AIDStoreReso
 		if gwErr != nil {
 			return ResultErr[AIDStoreResolveResult](ErrCodeNetworkError, gwErr.Error(), gwErr)
 		}
-		s.client.setGatewayURL(gatewayURL)
-		certBytes, fetchErr := s.client.AuthFetchPeerCert(resolveCtx, target, "")
+		certPEM, fetchErr := s.registerFlow.FetchPeerCert(resolveCtx, gatewayURL, target)
 		if fetchErr != nil {
 			if errors.Is(fetchErr, errCertNotFound) {
 				return ResultErr[AIDStoreResolveResult](ErrCodeCertNotFound, fmt.Sprintf("certificate not found for aid: %s", target))
 			}
 			return ResultErr[AIDStoreResolveResult](ErrCodeNetworkError, fetchErr.Error(), fetchErr)
 		}
-		if strings.TrimSpace(string(certBytes)) == "" {
+		if strings.TrimSpace(certPEM) == "" {
 			return ResultErr[AIDStoreResolveResult](ErrCodeCertNotFound, fmt.Sprintf("certificate not found for aid: %s", target))
 		}
-		if saveErr := s.keyStore.SaveCert(target, string(certBytes)); saveErr != nil {
+		if saveErr := s.keyStore.SaveCert(target, certPEM); saveErr != nil {
 			return ResultErr[AIDStoreResolveResult](ErrCodeServerError, fmt.Sprintf("save peer certificate failed: %v", saveErr), saveErr)
 		}
 		r2 := s.Load(target)
@@ -442,7 +428,7 @@ func (s *AIDStore) Resolve(ctx context.Context, aid string, opts ...AIDStoreReso
 	if opt.SkipAgentMD {
 		return ResultOk(result)
 	}
-	mdR := s.FetchAgentMD(resolveCtx, target)
+	mdR := s.DownloadAgentMD(resolveCtx, target)
 	if !mdR.Ok {
 		return ResultErr[AIDStoreResolveResult](mdR.Error.Code, mdR.Error.Message, mdR.Error.Cause)
 	}
@@ -451,68 +437,290 @@ func (s *AIDStore) Resolve(ctx context.Context, aid string, opts ...AIDStoreReso
 	return ResultOk(result)
 }
 
-// FetchAgentMD 下载 agent.md 并自动验签。
-func (s *AIDStore) FetchAgentMD(ctx context.Context, aid string) Result[AgentMDInfo] {
+func (s *AIDStore) agentMDRoot() string {
+	root := filepath.Join(s.aunPath, "AIDs")
+	_ = os.MkdirAll(root, 0o755)
+	return root
+}
+
+func (s *AIDStore) agentMDFilePath(aid string) (string, error) {
+	safe, err := agentMDSafeAID(aid)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(s.agentMDRoot(), safe, "agent.md"), nil
+}
+
+func (s *AIDStore) agentMDMetaPath(aid string) (string, error) {
+	safe, err := agentMDSafeAID(aid)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(s.agentMDRoot(), safe, "agentmd.json"), nil
+}
+
+func (s *AIDStore) readAgentMDRecord(aid string) *keystore.AgentMDCacheRecord {
+	metaPath, err := s.agentMDMetaPath(aid)
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	return agentMDMapToRecord(aid, raw)
+}
+
+func (s *AIDStore) writeAgentMDRecord(aid string, rec *keystore.AgentMDCacheRecord) error {
+	metaPath, err := s.agentMDMetaPath(aid)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(agentMDRecordToMap(rec), "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return atomicWriteText(metaPath, data)
+}
+
+func (s *AIDStore) loadAgentMDRecord(aid string) *keystore.AgentMDCacheRecord {
 	target := strings.TrimSpace(aid)
 	if target == "" {
-		return ResultErr[AgentMDInfo](ErrCodeInvalidAIDFormat, "fetch agent.md requires aid")
+		return nil
 	}
-	info, err := s.client.fetchAgentMD(ctx, target)
+	rec := s.readAgentMDRecord(target)
+	p, err := s.agentMDFilePath(target)
+	if err != nil {
+		return rec
+	}
+	data, readErr := os.ReadFile(p)
+	if readErr != nil {
+		return rec
+	}
+	if rec == nil {
+		rec = &keystore.AgentMDCacheRecord{AID: target}
+	}
+	rec.Content = string(data)
+	rec.LocalEtag = agentMDContentEtag(rec.Content)
+	return rec
+}
+
+func (s *AIDStore) saveAgentMDRecord(aid string, fields keystore.AgentMDCacheUpsert) *keystore.AgentMDCacheRecord {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return nil
+	}
+	if fields.Content != nil {
+		p, err := s.agentMDFilePath(target)
+		if err != nil {
+			return nil
+		}
+		if err := atomicWriteText(p, []byte(*fields.Content)); err != nil {
+			return nil
+		}
+		if fields.LocalEtag == nil {
+			fields.LocalEtag = agentMDStringPtr(agentMDContentEtag(*fields.Content))
+		}
+		if fields.FetchedAt == nil {
+			fields.FetchedAt = agentMDInt64Ptr(time.Now().UnixMilli())
+		}
+	}
+	rec := s.readAgentMDRecord(target)
+	if rec == nil {
+		rec = &keystore.AgentMDCacheRecord{AID: target}
+	}
+	applyAgentMDCacheUpsert(rec, fields)
+	rec.Content = ""
+	rec.UpdatedAt = time.Now().UnixMilli()
+	if err := s.writeAgentMDRecord(target, rec); err != nil {
+		return nil
+	}
+	loaded := cloneAgentMDRecord(rec)
+	if fields.Content != nil {
+		loaded.Content = *fields.Content
+	}
+	return loaded
+}
+
+func (s *AIDStore) resolveAgentMDURL(ctx context.Context, aid string) (string, error) {
+	gatewayURL, err := s.resolveGateway(ctx, aid)
+	if err != nil {
+		return "", err
+	}
+	return agentMDURLFromGateway(gatewayURL, aid, 0), nil
+}
+
+func (s *AIDStore) publicAIDFromCert(aid, certPEM string) (*AID, error) {
+	target := strings.TrimSpace(aid)
+	certObj, err := parsePEMCertificate(certPEM)
+	if err != nil {
+		return nil, err
+	}
+	if tErr := certTimeError(certObj); tErr != "" {
+		return nil, fmt.Errorf("certificate is %s for aid: %s", tErr, target)
+	}
+	if cn := strings.TrimSpace(certObj.Subject.CommonName); cn != "" && cn != target {
+		return nil, fmt.Errorf("certificate CN mismatch: expected %s, got %s", target, cn)
+	}
+	return newAID(target, s.aunPath, certPEM, certObj, nil, true, false, s.deviceID, s.slotID, s.verifySSL, s.rootCaPath, s.debug, ""), nil
+}
+
+func (s *AIDStore) resolveAgentMDPeer(ctx context.Context, aid string) (*AID, error) {
+	target := strings.TrimSpace(aid)
+	certPEM, err := s.keyStore.LoadCert(target)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(certPEM) == "" {
+		gatewayURL, err := s.resolveGateway(ctx, target)
+		if err != nil {
+			return nil, err
+		}
+		certPEM, err = s.registerFlow.FetchPeerCert(ctx, gatewayURL, target)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(certPEM) == "" {
+			return nil, errCertNotFound
+		}
+		if err := s.keyStore.SaveCert(target, certPEM); err != nil {
+			return nil, err
+		}
+	}
+	return s.publicAIDFromCert(target, certPEM)
+}
+
+// DownloadAgentMD 下载 agent.md 并自动验签。
+func (s *AIDStore) DownloadAgentMD(ctx context.Context, aid string) Result[AgentMDInfo] {
+	target := strings.TrimSpace(aid)
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
+		return ResultErr[AgentMDInfo](ErrCodeInvalidAIDFormat, err.Error(), err)
+	}
+	url, err := s.resolveAgentMDURL(ctx, target)
 	if err != nil {
 		return ResultErr[AgentMDInfo](ErrCodeNetworkError, err.Error(), err)
 	}
-	return ResultOk(*info)
-}
-
-// FetchAgentMd 是 FetchAgentMD 的跨语言命名别名。
-func (s *AIDStore) FetchAgentMd(ctx context.Context, aid string) Result[AgentMDInfo] {
-	return s.FetchAgentMD(ctx, aid)
-}
-
-// HeadAgentMD 通过 HEAD 获取 agent.md 元数据。
-func (s *AIDStore) HeadAgentMD(ctx context.Context, aid string) Result[HeadAgentMdResult] {
-	target := strings.TrimSpace(aid)
-	if target == "" {
-		return ResultErr[HeadAgentMdResult](ErrCodeInvalidAIDFormat, "head agent.md requires aid")
+	var downloaded agentMDDownloadResult
+	if rec := s.loadAgentMDRecord(target); rec != nil && rec.Content != "" {
+		cachedEtag := strings.TrimSpace(rec.RemoteEtag)
+		if cachedEtag == "" {
+			cachedEtag = strings.TrimSpace(rec.LocalEtag)
+		}
+		downloaded, err = agentMDDownloadHTTP(ctx, s.httpClient(), url, target, agentMDDownloadCache{
+			Content:      rec.Content,
+			Etag:         cachedEtag,
+			LastModified: rec.LastModified,
+		})
+	} else {
+		downloaded, err = agentMDDownloadHTTP(ctx, s.httpClient(), url, target)
 	}
-	raw, err := s.client.authNamespace.HeadAgentMD(ctx, target)
 	if err != nil {
-		return ResultErr[HeadAgentMdResult](ErrCodeNetworkError, err.Error(), err)
+		code := ErrCodeNetworkError
+		if strings.Contains(err.Error(), ErrCodeAgentMdNotFound) {
+			code = ErrCodeAgentMdNotFound
+		}
+		return ResultErr[AgentMDInfo](code, err.Error(), err)
 	}
-	found, _ := raw["found"].(bool)
-	etag, _ := raw["etag"].(string)
-	lastModified, _ := raw["last_modified"].(string)
-	contentLength := 0
-	if v, ok := raw["content_length"].(float64); ok {
-		contentLength = int(v)
+	peer, err := s.resolveAgentMDPeer(ctx, target)
+	if err != nil {
+		return ResultErr[AgentMDInfo](ErrCodeNetworkError, err.Error(), err)
 	}
-	return ResultOk(HeadAgentMdResult{
-		AID:           target,
-		Found:         found,
-		Etag:          etag,
-		LastModified:  lastModified,
-		ContentLength: contentLength,
+	verifyResult, err := peer.VerifyAgentMd(downloaded.Content)
+	if err != nil {
+		return ResultErr[AgentMDInfo](ErrCodeNetworkError, err.Error(), err)
+	}
+	sig := verifyAgentMDResultToMap(verifyResult, peer.CertPem)
+	info := AgentMDInfo{
+		AID:          target,
+		Content:      downloaded.Content,
+		Signature:    sig,
+		CertPem:      peer.CertPem,
+		Etag:         strings.TrimSpace(downloaded.Etag),
+		LastModified: strings.TrimSpace(downloaded.LastModified),
+	}
+	if status, ok := sig["status"].(string); ok {
+		verification := map[string]any{"status": status}
+		if reason, ok := sig["reason"].(string); ok && reason != "" {
+			verification["reason"] = reason
+		}
+		info.Verification = verification
+	}
+	localEtag := agentMDContentEtag(downloaded.Content)
+	s.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
+		Content:      agentMDStringPtr(downloaded.Content),
+		LocalEtag:    agentMDStringPtr(localEtag),
+		RemoteEtag:   agentMDStringPtr(info.Etag),
+		LastModified: agentMDStringPtr(info.LastModified),
+		FetchedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
+		RemoteStatus: agentMDStringPtr("found"),
+		VerifyStatus: agentMDStringPtr(strings.TrimSpace(stringFromAny(sig["status"]))),
+		VerifyError:  agentMDStringPtr(strings.TrimSpace(stringFromAny(sig["reason"]))),
+		LastError:    agentMDStringPtr(""),
 	})
+	if p, err := s.agentMDFilePath(target); err == nil {
+		info.SavedTo = p
+	}
+	return ResultOk(info)
 }
 
-// HeadAgentMd 是 HeadAgentMD 的跨语言命名别名。
-func (s *AIDStore) HeadAgentMd(ctx context.Context, aid string) Result[HeadAgentMdResult] {
-	return s.HeadAgentMD(ctx, aid)
+// DownloadAgentMd 是 DownloadAgentMD 的跨语言命名别名。
+func (s *AIDStore) DownloadAgentMd(ctx context.Context, aid string) Result[AgentMDInfo] {
+	return s.DownloadAgentMD(ctx, aid)
 }
 
 // CheckAgentMD 比对本地缓存与远端 agent.md ETag。
 func (s *AIDStore) CheckAgentMD(ctx context.Context, aid string, maxUnsyncedDays ...float64) Result[CheckAgentMdResult] {
-	r, err := s.client.checkAgentMD(ctx, aid, maxUnsyncedDays...)
+	target := strings.TrimSpace(aid)
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
+		return ResultErr[CheckAgentMdResult](ErrCodeInvalidAIDFormat, err.Error(), err)
+	}
+	before := s.loadAgentMDRecord(target)
+	localFound := false
+	localEtag := ""
+	if before != nil {
+		localEtag = strings.TrimSpace(before.LocalEtag)
+		localFound = strings.TrimSpace(before.Content) != "" || localEtag != ""
+	}
+	url, err := s.resolveAgentMDURL(ctx, target)
 	if err != nil {
 		return ResultErr[CheckAgentMdResult](ErrCodeNetworkError, err.Error(), err)
 	}
+	r, err := agentMDHeadHTTP(ctx, s.httpClient(), url, target)
+	if err != nil {
+		return ResultErr[CheckAgentMdResult](ErrCodeNetworkError, err.Error(), err)
+	}
+	remoteFound, _ := r["found"].(bool)
+	remoteEtag := strings.TrimSpace(stringFromAny(r["etag"]))
+	lastModified := strings.TrimSpace(stringFromAny(r["last_modified"]))
+	remoteStatus := "missing"
+	if remoteFound {
+		remoteStatus = "found"
+	}
+	s.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
+		RemoteEtag:   agentMDStringPtr(map[bool]string{true: remoteEtag, false: ""}[remoteFound]),
+		LastModified: agentMDStringPtr(lastModified),
+		CheckedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
+		RemoteStatus: agentMDStringPtr(remoteStatus),
+		LastError:    agentMDStringPtr(""),
+	})
+	ttlDays := 0
+	if len(maxUnsyncedDays) > 0 && maxUnsyncedDays[0] > 0 {
+		ttlDays = int(maxUnsyncedDays[0])
+	}
+	needsUpdate := remoteFound && (!localFound || localEtag == "" || remoteEtag == "" || localEtag != remoteEtag)
 	return ResultOk(CheckAgentMdResult{
-		AID:         r.AID,
-		LocalFound:  r.LocalFound,
-		RemoteFound: r.RemoteFound,
-		LocalEtag:   r.LocalEtag,
-		RemoteEtag:  r.RemoteEtag,
-		NeedsUpdate: !r.InSync,
+		AID:         target,
+		LocalFound:  localFound,
+		RemoteFound: remoteFound,
+		LocalEtag:   localEtag,
+		RemoteEtag:  remoteEtag,
+		NeedsUpdate: needsUpdate,
+		TtlDays:     ttlDays,
 	})
 }
 
@@ -524,7 +732,7 @@ func (s *AIDStore) CheckAgentMd(ctx context.Context, aid string, maxUnsyncedDays
 // Diagnose 汇总本地身份有效性与远端注册状态。
 func (s *AIDStore) Diagnose(ctx context.Context, aid string) Result[AIDStoreDiagnoseResult] {
 	target := strings.TrimSpace(aid)
-	if err := validateAIDName(target); err != nil {
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
 		return ResultErr[AIDStoreDiagnoseResult](ErrCodeInvalidAIDFormat, err.Error(), err)
 	}
 	loadR := s.Load(target)
@@ -592,6 +800,9 @@ func (s *AIDStore) Diagnose(ctx context.Context, aid string) Result[AIDStoreDiag
 // RenewCert 续签本地 AID 证书并写回 keystore。
 func (s *AIDStore) RenewCert(ctx context.Context, aid string) Result[AIDStoreRenewCertResult] {
 	target := strings.TrimSpace(aid)
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
+		return ResultErr[AIDStoreRenewCertResult](ErrCodeInvalidAIDFormat, err.Error(), err)
+	}
 	loadR := s.Load(target)
 	if !loadR.Ok || !loadR.Data.AID.IsPrivateKeyValid() {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodePrivateKeyRequired, fmt.Sprintf("private key required for aid: %s", target))
@@ -606,8 +817,8 @@ func (s *AIDStore) RenewCert(ctx context.Context, aid string) Result[AIDStoreRen
 	if err != nil {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeNetworkError, err.Error(), err)
 	}
-	clientNonce := s.client.auth.crypto.NewClientNonce()
-	phase1, err := s.client.auth.shortRPC(ctx, gatewayURL, "auth.aid_login1", map[string]any{
+	clientNonce := s.registerFlow.NewClientNonce()
+	phase1, err := s.registerFlow.ShortRPC(ctx, gatewayURL, "auth.aid_login1", map[string]any{
 		"aid":          target,
 		"cert":         certPEM,
 		"client_nonce": clientNonce,
@@ -615,15 +826,15 @@ func (s *AIDStore) RenewCert(ctx context.Context, aid string) Result[AIDStoreRen
 	if err != nil {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, err.Error(), err)
 	}
-	if err := s.client.auth.verifyPhase1Response(ctx, gatewayURL, phase1, clientNonce); err != nil {
+	if err := s.registerFlow.VerifyPhase1Response(ctx, gatewayURL, phase1, clientNonce); err != nil {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, err.Error(), err)
 	}
 	nonce := authGetStr(phase1, "nonce")
-	signature, clientTime, err := s.client.auth.crypto.SignLoginNonce(privateKeyPEM, nonce, "")
+	signature, clientTime, err := s.registerFlow.SignLoginNonce(privateKeyPEM, nonce, "")
 	if err != nil {
 		return ResultErr[AIDStoreRenewCertResult](ErrCodeCertRenewalFailed, err.Error(), err)
 	}
-	response, err := s.client.auth.shortRPC(ctx, gatewayURL, "auth.renew_cert", map[string]any{
+	response, err := s.registerFlow.ShortRPC(ctx, gatewayURL, "auth.renew_cert", map[string]any{
 		"aid":         target,
 		"request_id":  phase1["request_id"],
 		"nonce":       nonce,
@@ -658,6 +869,9 @@ func (s *AIDStore) RenewCert(ctx context.Context, aid string) Result[AIDStoreRen
 // Rekey 生成新密钥对并请求服务端换发证书，然后写回 keystore。
 func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyResult] {
 	target := strings.TrimSpace(aid)
+	if err := s.registerFlow.ValidateAIDName(target); err != nil {
+		return ResultErr[AIDStoreRekeyResult](ErrCodeInvalidAIDFormat, err.Error(), err)
+	}
 	loadR := s.Load(target)
 	if !loadR.Ok || !loadR.Data.AID.IsPrivateKeyValid() {
 		return ResultErr[AIDStoreRekeyResult](ErrCodePrivateKeyRequired, fmt.Sprintf("private key required for aid: %s", target))
@@ -667,7 +881,7 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 	if certPEM == "" {
 		return ResultErr[AIDStoreRekeyResult](ErrCodePrivateKeyRequired, fmt.Sprintf("private key required for aid: %s", target))
 	}
-	newIdentity, err := s.client.auth.crypto.GenerateIdentity()
+	newIdentity, err := s.registerFlow.GenerateIdentity()
 	if err != nil {
 		return ResultErr[AIDStoreRekeyResult](ErrCodeRekeyFailed, err.Error(), err)
 	}
@@ -679,8 +893,8 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 	if err != nil {
 		return ResultErr[AIDStoreRekeyResult](ErrCodeNetworkError, err.Error(), err)
 	}
-	clientNonce := s.client.auth.crypto.NewClientNonce()
-	phase1, err := s.client.auth.shortRPC(ctx, gatewayURL, "auth.aid_login1", map[string]any{
+	clientNonce := s.registerFlow.NewClientNonce()
+	phase1, err := s.registerFlow.ShortRPC(ctx, gatewayURL, "auth.aid_login1", map[string]any{
 		"aid":          target,
 		"cert":         certPEM,
 		"client_nonce": clientNonce,
@@ -688,7 +902,7 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 	if err != nil {
 		return ResultErr[AIDStoreRekeyResult](ErrCodeRekeyFailed, err.Error(), err)
 	}
-	if err := s.client.auth.verifyPhase1Response(ctx, gatewayURL, phase1, clientNonce); err != nil {
+	if err := s.registerFlow.VerifyPhase1Response(ctx, gatewayURL, phase1, clientNonce); err != nil {
 		return ResultErr[AIDStoreRekeyResult](ErrCodeRekeyFailed, err.Error(), err)
 	}
 	nonce := authGetStr(phase1, "nonce")
@@ -696,7 +910,7 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 	if err != nil {
 		return ResultErr[AIDStoreRekeyResult](ErrCodeRekeyFailed, err.Error(), err)
 	}
-	response, err := s.client.auth.shortRPC(ctx, gatewayURL, "auth.rekey", map[string]any{
+	response, err := s.registerFlow.ShortRPC(ctx, gatewayURL, "auth.rekey", map[string]any{
 		"aid":            target,
 		"request_id":     phase1["request_id"],
 		"nonce":          nonce,
@@ -732,7 +946,7 @@ func (s *AIDStore) Rekey(ctx context.Context, aid string) Result[AIDStoreRekeyRe
 
 func (s *AIDStore) httpClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if s.client.configModel != nil && !s.client.configModel.VerifySSL {
+	if !s.verifySSL {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	return &http.Client{Transport: transport, Timeout: 10 * time.Second}
@@ -740,11 +954,11 @@ func (s *AIDStore) httpClient() *http.Client {
 
 // resolveGateway 解析 AID 对应的 Gateway URL
 func (s *AIDStore) resolveGateway(ctx context.Context, aid string) (string, error) {
-	if explicit := strings.TrimSpace(s.client.GetGatewayURL()); explicit != "" {
+	if explicit := strings.TrimSpace(s.gatewayURL); explicit != "" {
 		return explicit, nil
 	}
 	// 先查缓存
-	if cached := s.client.auth.LoadCachedGatewayURL(aid); cached != "" {
+	if cached := strings.TrimSpace(s.keyStore.GetMetadataValue(aid, "gateway_url")); cached != "" {
 		return cached, nil
 	}
 	// 通过 well-known 发现
@@ -754,10 +968,10 @@ func (s *AIDStore) resolveGateway(ctx context.Context, aid string) (string, erro
 		issuer = parts[1]
 	}
 	wellKnownURL := fmt.Sprintf("https://gateway.%s/.well-known/aun-gateway", issuer)
-	discovered, err := s.client.discovery.Discover(ctx, wellKnownURL, 0)
+	discovered, err := s.discovery.Discover(ctx, wellKnownURL, 0)
 	if err != nil {
 		return "", err
 	}
-	s.client.auth.PersistGatewayURL(aid, discovered)
+	_ = s.keyStore.SetMetadataValue(aid, "gateway_url", discovered)
 	return discovered, nil
 }

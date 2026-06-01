@@ -1,64 +1,64 @@
-# AUN SDK Python 文档查阅指南
+# AUN SDK 文档查阅指南
 
-AUN SDK 文档在 `sdk-core/` 下，索引文件 `sdk-core/INDEX.md` 分三层，**严格按需逐层加载，禁止一次性读取整个索引**。
-
-行区间格式：`L43-49` 表示用 Read 工具读取时读取第 43 行到 49 行。
+AUN SDK 文档位于 `docs/sdk/`，索引文件 `docs/sdk/INDEX.md` 分三层：Layer 1 地图、Layer 2 主题索引、Layer 3 单篇摘要。按需逐层读取，避免一次性加载整套文档。
 
 ## SDK 文档定位
 
-SDK 文档聚焦核心封装：**认证（`client.auth`）**、**元信息与信任根（`client.meta`）** 和 **E2EE（`client.e2ee`）**。
+当前 SDK 聚焦三主体模型：
 
-其他业务操作（消息、群组、存储等）通过 `client.call(method, params)` 调用 RPC 方法，参数和响应格式见 `rpc-manual/`；`message.send` / `group.send` 的业务 payload 共用格式见 `sdk-core/消息Payload参考约定.md`。
+- `AIDStore`：注册、加载、列举、解析和证书运维。
+- `AID`：不可变身份值对象，负责签名、验签和 agent.md 签验。
+- `AUNClient`：认证、连接、状态机、事件和 RPC。
+
+业务操作统一通过 `client.call(method, params)` 调用；消息、群组、存储、meta、stream 的参数见 `09-*-rpc-manual.md`。`message.send`、`message.thought.put`、`group.send`、`group.thought.put` 的业务 payload 见 `09-payload-reference.md`。
 
 ## 渐进式查阅流程
 
-### Step 1：只读 Layer 1（L7-29）
+### Step 1：读 Layer 1
 
-列出所有文档名和章节行区间。能直接定位目标 → 跳 Step 4。
+查看文档地图，能定位目标就直接读目标文档。
 
-### Step 2：按需读 Layer 2 对应小节
+### Step 2：按主题读 Layer 2
 
-仅当 Step 1 不够时，按关键词读：
+常见主题：
 
-身份与认证 L35-39 · 连接与状态 L41-46 · E2EE L48-54 · RPC与事件 L56-67 · 配置与存储 L69-75 · 错误处理 L77-80
+- 身份与认证：AIDStore / AID / 注册 / 加载 / 证书
+- 连接与状态：AUNClient / 九态状态机 / Gateway / 重连
+- E2EE：默认加密、ProtectedHeaders、P2P / Group V2
+- RPC 与事件：`client.call()`、`client.on()`、RPC 手册
+- agent.md：`AUNClient.upload_agent_md()`、`AIDStore.download_agent_md()`、`AIDStore.check_agent_md()`
+- 错误处理：Result、异常、错误码、重试
 
-### Step 3：按需读 Layer 3 单篇摘要
+### Step 3：读 Layer 3 摘要
 
-仅当需要某篇详情但不确定读哪个章节时：
-
-快速开始 L86-87 · WebSocket协议 L89-90 · 核心概念 L92-93 · 连接与认证 L95-96 · E2EE加密通信 L98-99 · API参考 L101-102 · 错误处理 L104-105 · 最佳实践 L107-108 · 消息Payload L110-111
-
-大多数问题在摘要层就能解答。
-
-### Step 4：读原文目标章节
-
-根据前面获得的文档路径和行区间，精确读取对应章节。**只有需要完整分析时才读整篇原文。**
+不确定哪篇文档包含细节时，先看单篇摘要，再打开原文目标章节。
 
 ## 文档总览
 
 | 编号 | 文档 | 定位 |
 |------|------|------|
-| 01 | [快速开始](01-快速开始.md) | 安装、配置、最小示例 |
-| 02 | [WebSocket协议](02-WebSocket协议.md) | 握手流程、消息格式、裸 WebSocket 示例 |
+| 01 | [快速开始](01-快速开始.md) | 安装、三主体模型、最小示例 |
+| 02 | [WebSocket协议](02-WebSocket协议.md) | 握手流程、消息格式、裸 WebSocket |
 | 03 | [核心概念](03-核心概念.md) | AID、状态机、认证、E2EE |
-| 04 | [连接与认证](04-连接与认证.md) | 认证封装、call()、on()、连接 |
-| 05 | [E2EE加密通信](05-E2EE加密通信.md) | E2EE封装、ProtectedHeaders、自定义存储 |
-| 06 | [API手册](06-API手册.md) | AUNClient / AuthNamespace / MetaNamespace（信任根列表与 issuer root 更新） / E2EEManager |
-| 07 | [错误处理](07-错误处理.md) | 错误类层级、错误码、重试 |
-| 08 | [最佳实践](08-最佳实践.md) | 幂等、隔离、资源清理 |
-| - | [消息Payload参考约定](消息Payload参考约定.md) | `message.send` / `group.send` 共用业务负载格式、类型总览、附件引用 |
+| 04 | [连接与认证](04-连接与认证.md) | AIDStore、连接、网关发现、事件 |
+| 05 | [E2EE加密通信](05-E2EE加密通信.md) | E2EE、ProtectedHeaders、密钥管理 |
+| 06 | [API手册](06-API手册.md) | AIDStore / AID / AUNClient / 事件 / RPC |
+| 07 | [错误处理](07-错误处理.md) | Result、异常、错误码、重试 |
+| 08 | [最佳实践](08-最佳实践.md) | 幂等、多 AID、资源清理、测试数据 |
+| 09 | `09-*-rpc-manual.md` | 各服务 RPC 参数和响应 |
+| 09 | [AID托管API手册](09-custody-api-manual.md) | 可选 custody HTTP 服务 |
 
 ## 常见查阅场景
 
 | 场景 | 推荐路径 |
 |------|----------|
-| 首次使用 SDK | 01-快速开始 全文 |
-| 裸 WebSocket 或其他语言实现 | 02-WebSocket协议 |
-| 理解 AID / E2EE 原理 | 03-核心概念 对应章节 |
-| 认证 + 连接 + call/on 用法 | 04-连接与认证 |
-| 需要加密通信 | 05-E2EE加密通信 |
-| 查消息 payload 类型和格式 | [消息Payload参考约定](消息Payload参考约定.md) |
-| 查某个方法的签名 | 06-API手册 |
-| 遇到报错需排查 | 07-错误处理 |
-| 部署前检查 | 08-最佳实践 |
-| 查 RPC 方法参数 | `rpc-manual/` |
+| 首次使用 SDK | [01-快速开始](01-快速开始.md) |
+| 理解新构造入口 | [01-快速开始](01-快速开始.md)、[06-API手册](06-API手册.md) |
+| 注册或加载 AID | [04-连接与认证](04-连接与认证.md) |
+| 发布、下载或检查 agent.md | [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md) |
+| 状态机和重连 | [03-核心概念](03-核心概念.md)、[04-连接与认证](04-连接与认证.md) |
+| 查方法签名 | [06-API手册](06-API手册.md) |
+| 查消息或群组 RPC | 对应 `09-*-rpc-manual.md` |
+| 查 payload 格式 | [09-payload-reference.md](09-payload-reference.md) |
+| 排查错误 | [07-错误处理](07-错误处理.md) |
+| 写测试或 demo | [08-最佳实践](08-最佳实践.md) |

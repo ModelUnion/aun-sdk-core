@@ -76,7 +76,7 @@ def test_meta_import_trust_roots_verifies_and_reloads(tmp_path: Path):
     assert "BEGIN CERTIFICATE" in bundle_path.read_text(encoding="utf-8")
     imported_fp = root_cert.fingerprint(hashes.SHA256()).hex()
     assert imported_fp in data["fingerprints"]
-    assert any(cert.fingerprint(hashes.SHA256()).hex() == imported_fp for cert in store._auth._root_certs)
+    assert any(cert.fingerprint(hashes.SHA256()).hex() == imported_fp for cert in store._register_flow._certs.root_certs)
 
 
 def test_meta_import_trust_roots_rejects_unsigned_by_default(tmp_path: Path):
@@ -147,7 +147,7 @@ async def test_meta_update_issuer_root_cert_verifies_against_trust_list(tmp_path
     assert data["issuer"] == "issuer.example"
     assert data["fingerprint_sha256"] == imported_fp
     assert Path(data["cert_path"]).exists()
-    assert any(cert.fingerprint(hashes.SHA256()).hex() == imported_fp for cert in store._auth._root_certs)
+    assert any(cert.fingerprint(hashes.SHA256()).hex() == imported_fp for cert in store._register_flow._certs.root_certs)
 
 
 def test_meta_issuer_pki_urls_use_trust_root_and_root_crt(tmp_path: Path):

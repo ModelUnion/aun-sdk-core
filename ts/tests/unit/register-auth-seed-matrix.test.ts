@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { AIDStore, AUNClient, AuthFlow, CryptoProvider, FileKeyStore, RegisterFlow } from '../../src/index.js';
+import { AIDStore, AUNClient, AuthFlow, CryptoProvider, LocalIdentityStore, RegisterFlow } from '../../src/index.js';
 import { makeSelfSignedCert } from './helpers.js';
 import type { IdentityRecord, KeyPairRecord } from '../../src/types.js';
 
@@ -13,10 +13,10 @@ const SEED_CASES: Array<{ label: string; seed?: string }> = [
   { label: '带 seed_password', seed: 'matrix-seed' },
 ];
 
-function makeKeyStore(root: string, seed?: string): FileKeyStore {
+function makeKeyStore(root: string, seed?: string): LocalIdentityStore {
   return seed === undefined
-    ? new FileKeyStore(root)
-    : new FileKeyStore(root, { encryptionSeed: seed });
+    ? new LocalIdentityStore(root)
+    : new LocalIdentityStore(root, { encryptionSeed: seed });
 }
 
 function keyJsonPath(root: string, aid: string): string {
@@ -90,7 +90,7 @@ describe('注册/认证 seed_password 矩阵', () => {
     expect((client as any)._identity.private_key_pem).toBe(registered.private_key_pem);
 
     const expiresAt = Math.floor(Date.now() / 1000) + 3600;
-    keystore.saveInstanceState(aid, loadedAid!.deviceId, loadedAid!.slotId, {
+    (client as any)._tokenStore.saveInstanceState(aid, loadedAid!.deviceId, loadedAid!.slotId, {
       access_token: 'cached-access',
       refresh_token: 'cached-refresh',
       access_token_expires_at: expiresAt,

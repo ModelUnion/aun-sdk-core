@@ -8,6 +8,34 @@
 
 ---
 
+## 0.4.6 — 2026-06-01
+
+### Added
+- **`LocalIdentityStore` 类型**（`keystore/local_identity_store.go`）：基于文件（key.json/cert.pem）+ SQLite 的身份存储，实现 `KeyStore` + `PendingIdentityKeyStore` + `MetadataKeyStore` + `TrustRootStore` 接口，支持 pending 崩溃恢复。替代 `FileKeyStore`。
+- **`LocalTokenStore` 类型**（`keystore/local_token_store.go`）：基于文件 + SQLite 的 token/状态存储，实现 `TokenStore` + `StructuredKeyStore` + `InstanceStateStore` + `SeqTrackerStore` 接口，供 `AUNClient` / `AuthFlow` 使用。
+- **`shared_utils.go`**（`keystore/shared_utils.go`）：提取公共工具函数（`safeRename`、`safeAID`、`normalizeCertFingerprint` 等），供两个 store 复用。
+- **`AgentMdManager` 结构体**（`agent_md_manager.go`）：独立的 agent.md 管理器，提供 `Upload()`、`Download()`、`Check()` 方法，支持 ETag 缓存、后台自动拉取。
+- **`agent_md_http.go`**：底层 HTTP 操作（`agentMDDownloadHTTP`、`agentMDHeadHTTP`、`agentMDUploadHTTP`），支持条件请求（304 Not Modified）。
+- **`KeyStore` 接口新增方法**：`LoadCert(aid string)` / `SaveCert(aid string, certPEM string)`。
+- **`RegisterFlow` 新增公开方法**：`ValidateAIDName`、`FetchPeerCert`、`ShortRPC`、`GenerateIdentity`、`NewClientNonce`、`SignLoginNonce`、`VerifyPhase1Response`、`ReloadTrustedRoots`。
+
+### Changed
+- **`AIDStore` 独立化**：移除对 `AUNClient` 的依赖，直接持有 `LocalIdentityStore`、`GatewayDiscovery`、`DnsResilientNet`；`NewAIDStore()` 不再创建完整客户端。
+- **`AUNClient` 简化**：移除 agent.md 内部字段（`agentMdMu`、`agentMDPath` 等），改由 `AgentMdManager` 统一管理；keystore 初始化从 `NewFileKeyStore()` 改为 `NewLocalTokenStore()`。
+- **`namespace.AuthNamespace` 瘦身**：移除 `SignAgentMD`、`VerifyAgentMD`、`UploadAgentMD`、`DownloadAgentMD` 等方法（约 650 行），相关类型一并移除。
+- **`RegisterFlow` 配置**：`RegisterFlowConfig.Keystore` 类型从 `FullKeyStore` 改为 `pendingIdentityKeyStore`（`KeyStore + PendingIdentityKeyStore`）。
+- **`keystore.SetLogger()`**：同时设置 `secretstore` 的 logger，确保日志一致性。
+
+### Removed
+- **`go/keystore/file.go`**（1323 行）：`FileKeyStore` 完整移除，功能分解为 `LocalIdentityStore` 和 `LocalTokenStore`。
+- **`newClientForStore()` 函数**：`AIDStore` 不再依赖此内部构造函数。
+- **`HeadAgentMdResult` 结构体**：HEAD 操作结果改由 `AgentMdManager` 内部处理。
+
+### Fixed
+- **Windows 文件重命名**（`keystore/shared_utils.go`）：`safeRename()` 在目标文件已存在时先删除再重命名，修复 Windows 下 `os.Rename()` 失败问题。
+
+---
+
 ## 0.4.5 — 2026-05-31
 
 ### Added

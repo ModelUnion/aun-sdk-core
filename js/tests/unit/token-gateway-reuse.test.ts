@@ -89,7 +89,8 @@ describe('AuthFlow.authenticate cached token reuse', () => {
       access_token_expires_at: futureExpiry,
     });
 
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider(), aid });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider(), aid });
+    auth.setIdentity({ aid, private_key_pem: 'PEM', public_key_der_b64: 'PUB', curve: 'P-256', cert: 'CERT', access_token: 'cached-access', refresh_token: 'cached-refresh', access_token_expires_at: futureExpiry });
     const loginSpy = vi.spyOn(auth as any, '_login').mockRejectedValue(new Error('should not be called'));
 
     const result = await auth.authenticate('ws://gateway/aun', aid);
@@ -116,14 +117,14 @@ describe('AuthFlow.authenticate cached token reuse', () => {
       // 没有 access_token，也没有 refresh_token
     });
 
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider(), aid });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider(), aid });
+    auth.setIdentity({ aid, private_key_pem: 'PEM', public_key_der_b64: 'PUB', curve: 'P-256', cert: 'CERT' });
     const loginSpy = vi.spyOn(auth as any, '_login').mockResolvedValue({
       access_token: 'fresh-access',
       refresh_token: 'fresh-refresh',
       expires_in: 3600,
     });
     vi.spyOn(auth as any, '_assertCertMatchesLocalKeypair').mockReturnValue(undefined);
-    // 跳过 new_cert 验证
     vi.spyOn(auth as any, '_validateNewCert').mockResolvedValue(undefined);
 
     const result = await auth.authenticate('ws://gateway/aun', aid);
@@ -148,7 +149,8 @@ describe('AuthFlow.authenticate cached token reuse', () => {
       access_token_expires_at: pastExpiry,
     });
 
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider(), aid });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider(), aid });
+    auth.setIdentity({ aid, private_key_pem: 'PEM', public_key_der_b64: 'PUB', curve: 'P-256', cert: 'CERT' });
     const loginSpy = vi.spyOn(auth as any, '_login').mockResolvedValue({
       access_token: 'fresh-access',
       refresh_token: 'fresh-refresh',
@@ -178,7 +180,8 @@ describe('AuthFlow.authenticate cached token reuse', () => {
       // 没有 refresh_token
     });
 
-    const auth = new AuthFlow({ keystore: ks, crypto: new CryptoProvider(), aid });
+    const auth = new AuthFlow({ tokenStore: ks, crypto: new CryptoProvider(), aid });
+    auth.setIdentity({ aid, private_key_pem: 'PEM', public_key_der_b64: 'PUB', curve: 'P-256', cert: 'CERT' });
     const loginSpy = vi.spyOn(auth as any, '_login').mockResolvedValue({
       access_token: 'fresh-access',
       refresh_token: 'fresh-refresh',
@@ -198,7 +201,7 @@ describe('gateway_url cache + persist', () => {
   it('4) keystore 命中 gateway_url 缓存时跳过 discovery', async () => {
     const client = new AUNClient();
     (client as any)._aid = 'alice.agentid.pub';
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     await ks.setMetadata('alice.agentid.pub', 'gateway_url', 'ws://cached-gateway/aun');
 
     const discoverSpy = vi
@@ -226,7 +229,7 @@ describe('gateway_url cache + persist', () => {
     expect(url).toBe('ws://discovered-gateway/aun');
     expect(discoverSpy).toHaveBeenCalled();
 
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     const persisted = await ks.getMetadata('bob.agentid.pub', 'gateway_url');
     expect(persisted).toBe('ws://discovered-gateway/aun');
   });
@@ -245,7 +248,7 @@ describe('gateway_url cache + persist', () => {
     expect(url).toBe('ws://fallback-gateway/aun');
     expect(discoverSpy).toHaveBeenCalledTimes(2);
 
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     const persisted = await ks.getMetadata('charlie.agentid.pub', 'gateway_url');
     expect(persisted).toBe('ws://fallback-gateway/aun');
   });
@@ -255,7 +258,7 @@ describe('gateway_url cache + persist', () => {
     (client as any)._aid = 'dave.agentid.pub';
     (client as any)._gatewayUrl = 'ws://memory-gateway/aun';
 
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     await ks.setMetadata('dave.agentid.pub', 'gateway_url', 'ws://stale-cache/aun');
 
     const discoverSpy = vi.spyOn((client as any)._discovery, 'discover');

@@ -77,7 +77,7 @@ export class CryptoProvider {
 /**
  * 统一的证书 SHA-256 指纹计算（对齐 Python certificate_sha256_fingerprint）。
  * 返回 "sha256:{hex}" 格式的指纹。
- * e2ee.ts 与 keystore/file.ts 共用此函数，避免两套实现不一致。
+ * e2ee.ts 与本地存储实现共用此函数，避免两套实现不一致。
  */
 export function certificateSha256Fingerprint(certPem: string | Buffer): string {
   const raw = Buffer.isBuffer(certPem) ? certPem : Buffer.from(certPem, 'utf-8');

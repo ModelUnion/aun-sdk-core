@@ -6,6 +6,34 @@
 
 ---
 
+## 0.4.6 — 2026-06-01
+
+### Added
+- **IndexedDB 存储拆分**：将单一 `IndexedDBKeyStore` 拆分为两个专职类：
+  - `IndexedDBIdentityStore`（`keystore/indexeddb-identity-store.ts`）：负责私钥、密钥对、完整身份、pending 注册、证书、metadata KV。
+  - `IndexedDBTokenStore`（`keystore/indexeddb-token-store.ts`）：负责 prekeys、群组密钥、sessions、seq 跟踪、agent.md 缓存、群组状态、信任根。
+  - 共享基础设施提取到 `keystore/indexeddb-shared.ts`。
+- **`AgentMdManager` 类**（`agent-md.ts`）：独立的 agent.md 管理器，支持 ETag/Last-Modified 缓存验证、TTL 策略、内容签名验证、信任根存储（虚拟路径 `indexeddb://trust-roots/...`）。
+- **`KeyStore` 接口新增方法**：`loadCert(aid, certFingerprint?)` / `saveCert(aid, certPem, certFingerprint?, opts?)`。
+- **`RegisterFlow` 新增公开方法**：`validateAidName`、`fetchPeerCert`、`shortRpc`、`generateIdentity`、`newClientNonce`、`verifyPhase1Response`。
+- **`AIDStore` 新增方法**：`downloadAgentMd`（替代 `fetchAgentMd`）、`checkAgentMd`（替代 `headAgentMd`）。
+- **`AUNClient.uploadAgentMd()`**：新增方法，签名并上传当前 AID 的 agent.md。
+- **IndexedDB 新增对象仓库**：`agent_md_cache`、`group_state`、`pending_identities`、`e2ee_sessions`；数据库版本升级至 v7。
+- **导出新增**：`IndexedDBIdentityStore`、`IndexedDBTokenStore`、`TokenStore` 类型。
+
+### Changed
+- **`AUNClient` 架构**：移除内部 agent.md 缓存字段（`_agentMdCache`、`_agentMdFetchInflight` 等），改由 `AgentMdManager` 统一管理。
+- **`AIDStore`**：使用 `IndexedDBIdentityStore` 替代 `IndexedDBKeyStore`；移除内部 `AuthFlow` 实例，改为按需创建。
+- **`AIDStore.fetchAgentMd()`** 重命名为 `downloadAgentMd()`，返回类型同步更新为 `DownloadAgentMdResult`。
+- **私钥加密**：默认启用 AES-256-GCM + PBKDF2（100,000 迭代）；支持 `changeSeed()` 密码迁移。
+
+### Removed
+- **`IndexedDBKeyStore` 类**（`keystore/indexeddb.ts`，2280 行）：完整移除，功能分解为 `IndexedDBIdentityStore` 和 `IndexedDBTokenStore`。
+- **`FullKeyStore` 类型别名**：不再需要。
+- **`AIDStore.headAgentMd()`**：功能整合到 `AgentMdManager.check()`。
+
+---
+
 ## 0.4.5 — 2026-05-31
 
 ### Added

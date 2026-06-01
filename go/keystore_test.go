@@ -11,18 +11,18 @@ import (
 	"github.com/modelunion/aun-sdk-core/go/secretstore"
 )
 
-func testNewFileKeyStoreWithSQLite(t *testing.T) *keystore.FileKeyStore {
+func testNewLocalTokenStore(t *testing.T) *keystore.LocalTokenStore {
 	t.Helper()
 	dir := t.TempDir()
-	ks, _ := testNewFileKeyStoreWithSQLiteAndDir(t, dir)
+	ks, _ := testNewLocalTokenStoreWithDir(t, dir)
 	return ks
 }
 
-func testNewFileKeyStoreWithSQLiteAndDir(t *testing.T, dir string) (*keystore.FileKeyStore, string) {
+func testNewLocalTokenStoreWithDir(t *testing.T, dir string) (*keystore.LocalTokenStore, string) {
 	t.Helper()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	ks, err := keystore.NewLocalTokenStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalTokenStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	return ks, dir
@@ -117,23 +117,23 @@ func TestFileSecretStore_DifferentScopes(t *testing.T) {
 	}
 }
 
-// ── FileKeyStore 测试 ────────────────────────────────────
+// ── LocalIdentityStore 测试 ────────────────────────────────────
 
-// testNewFileKeyStore 创建测试用 FileKeyStore
-func testNewFileKeyStore(t *testing.T) *keystore.FileKeyStore {
+// testNewLocalIdentityStore 创建测试用 LocalIdentityStore
+func testNewLocalIdentityStore(t *testing.T) *keystore.LocalIdentityStore {
 	t.Helper()
 	dir := t.TempDir()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	ks, err := keystore.NewLocalIdentityStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalIdentityStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	return ks
 }
 
-// TestFileKeyStore_SaveLoadKeyPair 验证密钥对保存和加载
-func TestFileKeyStore_SaveLoadKeyPair(t *testing.T) {
-	ks := testNewFileKeyStore(t)
+// TestLocalStore_SaveLoadKeyPair 验证密钥对保存和加载
+func TestLocalStore_SaveLoadKeyPair(t *testing.T) {
+	ks := testNewLocalIdentityStore(t)
 	aid := "test-agent.example"
 
 	kp := map[string]any{
@@ -157,12 +157,12 @@ func TestFileKeyStore_SaveLoadKeyPair(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_KeyPairSurvivesRestart 验证密钥对在重建 KeyStore 后仍可读取
-func TestFileKeyStore_KeyPairSurvivesRestart(t *testing.T) {
+// TestLocalStore_KeyPairSurvivesRestart 验证密钥对在重建 KeyStore 后仍可读取
+func TestLocalStore_KeyPairSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	aid := "test-agent.example"
 
-	ks1, _ := keystore.NewFileKeyStore(dir, nil, "seed")
+	ks1, _ := keystore.NewLocalIdentityStore(dir, nil, "seed")
 	_, privPEM, pubB64 := testGenerateECKeypair(t)
 	kp := map[string]any{
 		"private_key_pem":    privPEM,
@@ -173,7 +173,7 @@ func TestFileKeyStore_KeyPairSurvivesRestart(t *testing.T) {
 	ks1.Close()
 
 	// 模拟重启
-	ks2, _ := keystore.NewFileKeyStore(dir, nil, "seed")
+	ks2, _ := keystore.NewLocalIdentityStore(dir, nil, "seed")
 	t.Cleanup(func() { ks2.Close() })
 	loaded, err := ks2.LoadKeyPair(aid)
 	if err != nil {
@@ -187,9 +187,9 @@ func TestFileKeyStore_KeyPairSurvivesRestart(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_SaveLoadCert 验证证书保存和加载
-func TestFileKeyStore_SaveLoadCert(t *testing.T) {
-	ks := testNewFileKeyStore(t)
+// TestLocalStore_SaveLoadCert 验证证书保存和加载
+func TestLocalStore_SaveLoadCert(t *testing.T) {
+	ks := testNewLocalIdentityStore(t)
 	aid := "test-agent.example"
 	certPEM := "-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----"
 
@@ -205,11 +205,11 @@ func TestFileKeyStore_SaveLoadCert(t *testing.T) {
 	}
 }
 
-func TestFileKeyStore_SaveLoadCertVersion(t *testing.T) {
+func TestLocalStore_SaveLoadCertVersion(t *testing.T) {
 	dir := t.TempDir()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "seed")
+	ks, err := keystore.NewLocalTokenStore(dir, nil, "seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalTokenStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	aid := "versioned-cert.example"
@@ -265,9 +265,9 @@ func TestFileKeyStore_SaveLoadCertVersion(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_SaveLoadIdentity 验证完整身份保存和加载
-func TestFileKeyStore_SaveLoadIdentity(t *testing.T) {
-	ks := testNewFileKeyStore(t)
+// TestLocalStore_SaveLoadIdentity 验证完整身份保存和加载
+func TestLocalStore_SaveLoadIdentity(t *testing.T) {
+	ks := testNewLocalIdentityStore(t)
 	aid := "test-agent.example"
 	_, privPEM, pubB64 := testGenerateECKeypair(t)
 
@@ -297,12 +297,12 @@ func TestFileKeyStore_SaveLoadIdentity(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_UpdateInstanceStateSerializesConcurrentWriters 验证原子 instance state 更新不会互相覆盖
-func TestFileKeyStore_UpdateInstanceStateSerializesConcurrentWriters(t *testing.T) {
+// TestLocalStore_UpdateInstanceStateSerializesConcurrentWriters 验证原子 instance state 更新不会互相覆盖
+func TestLocalStore_UpdateInstanceStateSerializesConcurrentWriters(t *testing.T) {
 	dir := t.TempDir()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "atomic-seed")
+	ks, err := keystore.NewLocalTokenStore(dir, nil, "atomic-seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalTokenStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	aid := "atomic.agent.example"
@@ -361,39 +361,36 @@ func TestFileKeyStore_UpdateInstanceStateSerializesConcurrentWriters(t *testing.
 	}
 }
 
-// TestFileKeyStore_SaveIdentityPreservesExistingPrekeys 验证 SaveIdentity 不覆盖已有 prekey
-func TestFileKeyStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+// TestLocalStore_SaveIdentityPreservesExistingPrekeys 验证保存身份不覆盖已有 prekey
+func TestLocalStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
+	tokenStore, dir := testNewLocalTokenStoreWithDir(t, t.TempDir())
+	identityStore, err := keystore.NewLocalIdentityStore(dir, nil, "test-seed")
+	if err != nil {
+		t.Fatalf("创建 LocalIdentityStore 失败: %v", err)
+	}
+	t.Cleanup(func() { identityStore.Close() })
 	aid := "identity-preserve.example"
 
 	// 通过 StructuredKeyStore 接口写入 prekey
-	if err := ks.SaveE2EEPrekey(aid, "pk1", "", map[string]any{
+	if err := tokenStore.SaveE2EEPrekey(aid, "pk1", "", map[string]any{
 		"private_key_pem": "KEEP_ME",
 		"created_at":      time.Now().UnixMilli(),
 	}); err != nil {
 		t.Fatalf("SaveE2EEPrekey 失败: %v", err)
 	}
 
-	// SaveIdentity 写入 token
-	if err := ks.SaveIdentity(aid, map[string]any{
-		"aid":           aid,
-		"access_token":  "tok-new",
-		"refresh_token": "rt-new",
+	// IdentityStore 写入身份材料，不应影响 TokenStore 的结构化 prekey 表。
+	if err := identityStore.SaveIdentity(aid, map[string]any{
+		"aid":                aid,
+		"private_key_pem":    "identity-private",
+		"public_key_der_b64": "identity-public",
+		"curve":              "P-256",
 	}); err != nil {
 		t.Fatalf("SaveIdentity 失败: %v", err)
 	}
 
-	// 验证 token 通过 LoadIdentity 可读
-	loaded, err := ks.LoadIdentity(aid)
-	if err != nil {
-		t.Fatalf("LoadIdentity 失败: %v", err)
-	}
-	if loaded["access_token"] != "tok-new" {
-		t.Fatalf("access_token 未更新: %v", loaded["access_token"])
-	}
-
 	// 验证 prekey 未被覆盖
-	prekeys, err := ks.LoadE2EEPrekeys(aid, "")
+	prekeys, err := tokenStore.LoadE2EEPrekeys(aid, "")
 	if err != nil {
 		t.Fatalf("LoadE2EEPrekeys 失败: %v", err)
 	}
@@ -403,9 +400,9 @@ func TestFileKeyStore_SaveIdentityPreservesExistingPrekeys(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_MultipleAids 验证多个 AID 互不干扰
-func TestFileKeyStore_MultipleAids(t *testing.T) {
-	ks := testNewFileKeyStore(t)
+// TestLocalStore_MultipleAids 验证多个 AID 互不干扰
+func TestLocalStore_MultipleAids(t *testing.T) {
+	ks := testNewLocalIdentityStore(t)
 	aid1 := "agent-1.example"
 	aid2 := "agent-2.example"
 
@@ -422,10 +419,10 @@ func TestFileKeyStore_MultipleAids(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_PrivateKeyNotPlaintext 验证私钥不以明文存储在文件中
-func TestFileKeyStore_PrivateKeyNotPlaintext(t *testing.T) {
+// TestLocalStore_PrivateKeyNotPlaintext 验证私钥不以明文存储在文件中
+func TestLocalStore_PrivateKeyNotPlaintext(t *testing.T) {
 	dir := t.TempDir()
-	ks, _ := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	ks, _ := keystore.NewLocalIdentityStore(dir, nil, "test-seed")
 	t.Cleanup(func() { ks.Close() })
 	aid := "test-agent.example"
 	_, privPEM, pubB64 := testGenerateECKeypair(t)
@@ -454,25 +451,24 @@ func TestFileKeyStore_PrivateKeyNotPlaintext(t *testing.T) {
 
 // ── Token 持久化测试 ─────────────────────────────────────
 
-// TestTokenPersistence 验证 token 通过 SaveIdentity 持久化
+// TestTokenPersistence 验证 token 通过实例态持久化
 func TestTokenPersistence(t *testing.T) {
 	dir := t.TempDir()
-	ks, _ := keystore.NewFileKeyStore(dir, nil, "seed")
+	ks, _ := keystore.NewLocalTokenStore(dir, nil, "seed")
 	t.Cleanup(func() { ks.Close() })
 	aid := "test-agent.example"
 
-	identity := map[string]any{
-		"aid":           aid,
+	state := map[string]any{
 		"access_token":  "at-12345",
 		"refresh_token": "rt-67890",
 	}
-	if err := ks.SaveIdentity(aid, identity); err != nil {
-		t.Fatalf("SaveIdentity 失败: %v", err)
+	if err := ks.SaveInstanceState(aid, "", "", state); err != nil {
+		t.Fatalf("SaveInstanceState 失败: %v", err)
 	}
 
-	loaded, err := ks.LoadIdentity(aid)
+	loaded, err := ks.LoadInstanceState(aid, "", "")
 	if err != nil {
-		t.Fatalf("LoadIdentity 失败: %v", err)
+		t.Fatalf("LoadInstanceState 失败: %v", err)
 	}
 	if loaded["access_token"] != "at-12345" {
 		t.Errorf("access_token 不匹配: %v", loaded["access_token"])
@@ -493,7 +489,7 @@ func TestTokenPersistence(t *testing.T) {
 
 // TestPrekeyPersistence 验证 prekey 私钥持久化（通过 StructuredKeyStore 接口）
 func TestPrekeyPersistence(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+	ks := testNewLocalTokenStore(t)
 	aid := "test-agent.example"
 
 	if err := ks.SaveE2EEPrekey(aid, "pk-001", "", map[string]any{
@@ -518,7 +514,7 @@ func TestPrekeyPersistence(t *testing.T) {
 
 // TestLoadE2EEPrekeyByID 验证按 prekey_id 单点查询（与 Python load_e2ee_prekey_by_id 对齐）
 func TestLoadE2EEPrekeyByID(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+	ks := testNewLocalTokenStore(t)
 	aid := "by-id-test.example"
 
 	// 写入两条 prekey，分属不同 device
@@ -569,7 +565,7 @@ func TestLoadE2EEPrekeyByID(t *testing.T) {
 
 // TestGroupSecretPersistence 验证 group secret 持久化
 func TestGroupSecretPersistence(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+	ks := testNewLocalTokenStore(t)
 	aid := "test-agent.example"
 
 	ok, err := ks.StoreGroupSecretTransition(aid, "group-1", keystore.GroupSecretTransitionOptions{
@@ -596,7 +592,7 @@ func TestGroupSecretPersistence(t *testing.T) {
 }
 
 func TestStructuredPrekeysPrimaryAndRecoverUnexpiredMeta(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+	ks := testNewLocalTokenStore(t)
 	aid := "structured-prekeys.example"
 	nowMs := time.Now().UnixMilli()
 
@@ -624,7 +620,7 @@ func TestStructuredPrekeysPrimaryAndRecoverUnexpiredMeta(t *testing.T) {
 }
 
 func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+	ks := testNewLocalTokenStore(t)
 	aid := "structured-prekeys-preserve.example"
 	nowMs := time.Now().UnixMilli()
 
@@ -657,7 +653,7 @@ func TestSaveStructuredPrekeyPreservesRecoverableMetaOnlyRecords(t *testing.T) {
 }
 
 func TestStructuredGroupSecretsPrimaryAndRecoverMetaEpochs(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+	ks := testNewLocalTokenStore(t)
 	aid := "structured-group.example"
 
 	// 写入 current 和 old epoch rows
@@ -700,7 +696,7 @@ func TestStructuredGroupSecretsPrimaryAndRecoverMetaEpochs(t *testing.T) {
 }
 
 func TestDeviceScopedPrekeysAllowSamePrekeyAcrossDevices(t *testing.T) {
-	ks := testNewFileKeyStoreWithSQLite(t)
+	ks := testNewLocalTokenStore(t)
 	aid := "device-prekeys.example"
 	cutoffMs := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
 
@@ -757,9 +753,9 @@ func TestDeviceScopedPrekeysAllowSamePrekeyAcrossDevices(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_LoadNonExistent 验证加载不存在的 AID 返回 nil
-func TestFileKeyStore_LoadNonExistent(t *testing.T) {
-	ks := testNewFileKeyStore(t)
+// TestLocalStore_LoadNonExistent 验证加载不存在的 AID 返回 nil
+func TestLocalStore_LoadNonExistent(t *testing.T) {
+	ks := testNewLocalIdentityStore(t)
 	kp, err := ks.LoadKeyPair("nonexistent.example")
 	if err != nil {
 		t.Fatalf("加载不存在的密钥对不应返回错误: %v", err)
@@ -804,10 +800,10 @@ func TestFileSecretStore_AutoSeed(t *testing.T) {
 	}
 }
 
-// TestFileKeyStore_SaveIdentity_Roundtrip_WithRealKeys 验证真实密钥的完整往返
-func TestFileKeyStore_SaveIdentity_Roundtrip_WithRealKeys(t *testing.T) {
+// TestLocalStore_SaveIdentity_Roundtrip_WithRealKeys 验证真实密钥的完整往返
+func TestLocalStore_SaveIdentity_Roundtrip_WithRealKeys(t *testing.T) {
 	dir := t.TempDir()
-	ks, _ := keystore.NewFileKeyStore(dir, nil, "test-seed")
+	ks, _ := keystore.NewLocalIdentityStore(dir, nil, "test-seed")
 	t.Cleanup(func() { ks.Close() })
 	aid := "real-agent.example"
 	priv, privPEM, pubB64 := testGenerateECKeypair(t)
@@ -845,11 +841,11 @@ func TestFileKeyStore_SaveIdentity_Roundtrip_WithRealKeys(t *testing.T) {
 	ks.Close()
 }
 
-func TestFileKeyStore_InstanceStateIsolationAndProtection(t *testing.T) {
+func TestLocalStore_InstanceStateIsolationAndProtection(t *testing.T) {
 	dir := t.TempDir()
-	ks, err := keystore.NewFileKeyStore(dir, nil, "seed")
+	ks, err := keystore.NewLocalTokenStore(dir, nil, "seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalTokenStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	aid := "instance-state.example"

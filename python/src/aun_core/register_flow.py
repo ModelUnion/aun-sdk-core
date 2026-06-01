@@ -14,9 +14,10 @@ import websockets
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
+from .cert_verifier import GatewayCertificateVerifier
 from .crypto import CryptoProvider
 from .errors import AuthError, ConnectionError, IdentityConflictError, ValidationError, map_remote_error
-from .keystore.file import FileKeyStore
+from .keystore.base import KeyStore
 
 
 _AID_NAME_RE = re.compile(r'^[a-z0-9_][a-z0-9_-]{3,63}$')
@@ -25,10 +26,11 @@ _AID_NAME_RE = re.compile(r'^[a-z0-9_][a-z0-9_-]{3,63}$')
 class RegisterFlow:
     def __init__(
         self,
-        keystore: FileKeyStore,
+        keystore: KeyStore,
         crypto: CryptoProvider,
         *,
         verify_ssl: bool = False,
+        root_ca_path: str | None = None,
         logger=None,
         net=None,
     ) -> None:
@@ -37,6 +39,35 @@ class RegisterFlow:
         self._verify_ssl = verify_ssl
         self._log = logger
         self._net = net
+        self._certs = GatewayCertificateVerifier(
+            root_ca_path=root_ca_path,
+            store=keystore,
+            verify_ssl=verify_ssl,
+            logger=logger,
+            net=net,
+            module="register_flow",
+        )
+
+    def validate_aid_name(self, aid: str) -> None:
+        self._validate_aid_name(aid)
+
+    async def fetch_peer_cert(self, gateway_url: str, aid: str) -> str | None:
+        return await self._download_registered_cert(gateway_url, aid)
+
+    async def short_rpc(self, gateway_url: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._short_rpc(gateway_url, method, params)
+
+    def generate_identity(self) -> dict[str, Any]:
+        return self._crypto.generate_identity()
+
+    def new_client_nonce(self) -> str:
+        return self._crypto.new_client_nonce()
+
+    async def verify_phase1_response(self, gateway_url: str, result: dict[str, Any], client_nonce: str) -> None:
+        await self._certs.verify_phase1_response(gateway_url, result, client_nonce)
+
+    def reload_trusted_roots(self) -> int:
+        return self._certs.reload_trusted_roots()
 
     async def register_aid(self, gateway_url: str, aid: str) -> dict[str, Any]:
         """注册新 AID，返回含私钥字段的完整 dict，私钥由调用方（AIDStore）写入。"""

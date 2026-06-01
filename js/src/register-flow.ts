@@ -1,23 +1,24 @@
 /**
- * RegisterFlow — AID 注册流程（独立类，不继承 AuthFlow）
+ * RegisterFlow — AID 注册流程。
  * 与 TS SDK register-flow.ts 对齐。浏览器环境使用原生 WebSocket + fetch。
  */
 
-import type { FullKeyStore } from './keystore/index.js';
+import type { KeyStore } from './keystore/index.js';
 import type { CryptoProvider } from './crypto.js';
 import type { ModuleLogger } from './logger.js';
-import { AuthFlow } from './auth.js';
 import { AuthError, IdentityConflictError, ValidationError, mapRemoteError } from './errors.js';
-import { isJsonObject, type IdentityRecord, type JsonObject, type RpcParams } from './types.js';
+import { isJsonObject, type IdentityRecord, type KeyPairRecord, type JsonObject, type RpcParams } from './types.js';
 import { uint8ToBase64, pemToArrayBuffer } from './crypto.js';
+import { parseCertMetadata, verifySignatureWithCert } from './cert-utils.js';
 
 const _noopLog: ModuleLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} };
+const AID_NAME_RE = /^[a-z0-9_][a-z0-9_-]{3,63}$/;
 
-type PendingKeyStore = FullKeyStore & {
+type PendingKeyStore = KeyStore & {
   pendingIdentityDir(aid: string): Promise<string>;
   listPendingIdentityDirs(aid: string): Promise<string[]>;
-  savePendingKeyPair(handle: string, aid: string, keyPair: IdentityRecord): Promise<void>;
-  loadPendingKeyPair(handle: string, aid: string): Promise<IdentityRecord | null>;
+  savePendingKeyPair(handle: string, aid: string, keyPair: KeyPairRecord): Promise<void>;
+  loadPendingKeyPair(handle: string, aid: string): Promise<KeyPairRecord | null>;
   savePendingCert(handle: string, certPem: string): Promise<void>;
   promotePendingIdentity(handle: string, aid: string): Promise<string>;
   discardPendingIdentity?(handle: string): Promise<void>;
@@ -80,12 +81,12 @@ function _extractSpkiB64FromPem(certPem: string): string {
 }
 
 export class RegisterFlow {
-  private _keystore: FullKeyStore;
+  private _keystore: PendingKeyStore;
   private _crypto: CryptoProvider;
   private _logger: ModuleLogger;
 
   constructor(opts: {
-    keystore: FullKeyStore;
+    keystore: PendingKeyStore;
     crypto: CryptoProvider;
     verifySsl?: boolean;
     logger?: ModuleLogger;
@@ -96,9 +97,65 @@ export class RegisterFlow {
     // verifySsl 在浏览器环境不可控，忽略
   }
 
+  validateAidName(aid: string): void {
+    RegisterFlow.validateAidName(aid);
+  }
+
+  static validateAidName(aid: string): void {
+    const name = aid.includes('.') ? aid.split('.')[0]! : aid;
+    if (!AID_NAME_RE.test(name)) {
+      throw new ValidationError(
+        `Invalid AID name '${name}': must be 4-64 characters, only [a-z0-9_-], cannot start with '-'`,
+      );
+    }
+    if (name.startsWith('guest')) {
+      throw new ValidationError("AID name must not start with 'guest'");
+    }
+  }
+
+  async fetchPeerCert(gatewayUrl: string, aid: string): Promise<string | null> {
+    return this._downloadRegisteredCert(gatewayUrl, aid);
+  }
+
+  async shortRpc(gatewayUrl: string, method: string, params: RpcParams): Promise<JsonObject> {
+    return this._shortRpc(gatewayUrl, method, params);
+  }
+
+  async generateIdentity(): Promise<KeyPairRecord> {
+    return await this._crypto.generateIdentity() as KeyPairRecord;
+  }
+
+  newClientNonce(): string {
+    return this._crypto.newClientNonce();
+  }
+
+  async verifyPhase1Response(gatewayUrl: string, result: JsonObject, clientNonce: string): Promise<void> {
+    void gatewayUrl;
+    const authCertPem = String(result.auth_cert ?? '');
+    const signatureB64 = String(result.client_nonce_signature ?? '');
+    if (!authCertPem) throw new AuthError('aid_login1 missing auth_cert');
+    if (!signatureB64) throw new AuthError('aid_login1 missing client_nonce_signature');
+
+    const metadata = parseCertMetadata(authCertPem);
+    const now = Date.now();
+    if (metadata.notBefore.getTime() > now) throw new AuthError('aid_login1 auth certificate is not_yet_valid');
+    if (metadata.notAfter.getTime() < now) throw new AuthError('aid_login1 auth certificate is expired');
+
+    const valid = await verifySignatureWithCert(
+      authCertPem,
+      signatureB64,
+      new TextEncoder().encode(clientNonce),
+    );
+    if (!valid) throw new AuthError('aid_login1 server auth signature verification failed');
+  }
+
+  reloadTrustedRoots(): number {
+    return 0;
+  }
+
   async registerAid(gatewayUrl: string, aid: string): Promise<RegisterResult> {
     const tStart = Date.now();
-    AuthFlow._validateAidName(aid);
+    this.validateAidName(aid);
     this._logger.debug(`registerAid enter: aid=${aid}, gateway=${gatewayUrl}`);
     try {
       // Step 1: 本地已有 keypair → 幂等/恢复

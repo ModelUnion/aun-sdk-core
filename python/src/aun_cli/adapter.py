@@ -159,7 +159,6 @@ def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
         "timeout": timeout,
         "encryption_seed": str(encryption_seed),
         "trace": trace,
-        "agentmd_path": profile.get("agentmd_path"),
         "active_group": str(profile.get("active_group") or "").strip() or None,
         "profile_source": profile_source,
     }
@@ -167,6 +166,9 @@ def resolve_profile_config(ctx: typer.Context) -> dict[str, Any]:
 
 def make_aid_store(resolved: dict[str, Any]):
     from aun_core import AIDStore
+
+    if not isinstance(resolved, dict):
+        resolved = {"aun_path": str(resolved)}
 
     return AIDStore(
         aun_path=resolved["aun_path"],

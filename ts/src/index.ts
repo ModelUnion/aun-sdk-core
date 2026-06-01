@@ -71,8 +71,9 @@ export {
 export { CryptoProvider, type IdentityKeyPair } from './crypto.js';
 
 // ── KeyStore ─────────────────────────────────────────────────
-export type { KeyStore } from './keystore/index.js';
-export { FileKeyStore } from './keystore/file.js';
+export type { KeyStore, TokenStore } from './keystore/index.js';
+export { LocalIdentityStore } from './keystore/local-identity-store.js';
+export { LocalTokenStore } from './keystore/local-token-store.js';
 
 // ── SecretStore ──────────────────────────────────────────────
 export type { SecretStore } from './secret-store/index.js';

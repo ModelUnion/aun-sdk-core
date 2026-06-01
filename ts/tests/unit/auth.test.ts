@@ -14,7 +14,7 @@ import { AuthFlow } from '../../src/auth.js';
 import { RegisterFlow } from '../../src/register-flow.js';
 import { AuthError, StateError, IdentityConflictError } from '../../src/errors.js';
 import { CryptoProvider } from '../../src/crypto.js';
-import { FileKeyStore } from '../../src/keystore/file.js';
+import { LocalIdentityStore } from '../../src/keystore/local-identity-store.js';
 import { VERSION } from '../../src/index.js';
 
 describe('AuthFlow', () => {
@@ -234,7 +234,7 @@ describe('AuthFlow', () => {
   describe('registerAid: 查重前置 + 落盘时机', () => {
     function makeRegisterFlow() {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aun-ts-test-'));
-      const keystore = new FileKeyStore(path.join(tmpDir, 'aun'));
+      const keystore = new LocalIdentityStore(path.join(tmpDir, 'aun'));
       const flow = new RegisterFlow({
         keystore,
         crypto: new CryptoProvider(),

@@ -437,12 +437,12 @@ func TestConstructDefaultSQLiteBackupUsesAUNPath(t *testing.T) {
 		"aun_path": tmpDir,
 	})
 	defer func() { _ = c.Close() }()
-	fks, ok := c.tokenStore.(*keystore.FileKeyStore)
+	tokenStore, ok := c.tokenStore.(*keystore.LocalTokenStore)
 	if !ok {
 		t.Fatalf("默认 tokenStore 类型不正确: %T", c.tokenStore)
 	}
-	if fks == nil {
-		t.Fatal("默认 FileKeyStore 不应为 nil")
+	if tokenStore == nil {
+		t.Fatal("默认 LocalTokenStore 不应为 nil")
 	}
 	// 新架构：SQLite DB 按 AID 懒初始化，不再预创建 .aun_backup
 	aidsDir := filepath.Join(tmpDir, "AIDs")
@@ -659,9 +659,9 @@ func TestCallRejectsMessageSendDeliveryModeOverride(t *testing.T) {
 }
 
 func TestAuthFlowEmptyDeviceIDLoadsInstanceState(t *testing.T) {
-	ks, err := keystore.NewFileKeyStore(t.TempDir(), nil, "seed")
+	ks, err := keystore.NewLocalTokenStore(t.TempDir(), nil, "seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalTokenStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	aid := "auth-empty-device.example"
@@ -693,9 +693,9 @@ func TestAuthFlowEmptyDeviceIDLoadsInstanceState(t *testing.T) {
 }
 
 func TestAuthFlowEmptyDeviceIDPersistsInstanceState(t *testing.T) {
-	ks, err := keystore.NewFileKeyStore(t.TempDir(), nil, "seed")
+	ks, err := keystore.NewLocalTokenStore(t.TempDir(), nil, "seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalTokenStore 失败: %v", err)
 	}
 	t.Cleanup(func() { ks.Close() })
 	aid := "persist-empty-device.example"

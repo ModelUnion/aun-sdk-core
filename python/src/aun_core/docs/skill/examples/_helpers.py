@@ -24,7 +24,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-from aun_core import AUNClient, get_device_id
+from aun_core import AIDStore, AUNClient, get_device_id
 
 _DATA_ROOT = Path(os.environ.get("AUN_DATA_ROOT", "") or str(Path.home() / ".aun"))
 
@@ -35,34 +35,45 @@ DEVICE_SHORT = DEVICE_ID[:8]
 
 
 def make_client(label: str | None = None) -> AUNClient:
-    """创建一个 AUNClient 实例。
+    """创建一个无身份 AUNClient，并绑定示例用 AIDStore。
 
     label 用于区分同一台机器上的不同角色（如 sender/receiver）。
     不传 label 时使用默认 aun_path（~/.aun）。
     """
-    if label:
-        storage = _DATA_ROOT / label
-        storage.mkdir(parents=True, exist_ok=True)
-        return AUNClient({"aun_path": str(storage)})
-    return AUNClient({"aun_path": str(_DATA_ROOT)})
+    storage = _DATA_ROOT / label if label else _DATA_ROOT
+    storage.mkdir(parents=True, exist_ok=True)
+    store = AIDStore(aun_path=str(storage), encryption_seed="")
+    client = AUNClient()
+    setattr(client, "_example_store", store)
+    return client
 
 
 async def ensure_connected(client: AUNClient, aid: str) -> str:
-    """检查本地 identity → 按需 create_aid → 认证 → 连接。返回 AID。
+    """检查本地 identity，按需注册，然后加载身份并连接。返回 AID。
 
-    先检查本地存储是否有完整 identity（含 cert），有则直接 authenticate；
-    无则 create_aid 注册新 AID 再 authenticate。避免对已注册的 AID 重复调 create。
+    先通过 AIDStore.load() 检查本地身份；不存在时 register()；
+    成功加载 AID 后交给 AUNClient.connect() 自动认证并连接。
     """
-    local = client._auth._keystore.load_identity(aid)
-    if local is None:
-        await client.auth.create_aid({"aid": aid})
+    store = getattr(client, "_example_store", None)
+    if store is None:
+        raise RuntimeError("client was not created by make_client()")
 
-    auth = await client.auth.authenticate({"aid": aid})
-    await client.connect({
-        "access_token": auth["access_token"],
-        "gateway": auth["gateway"],
-        "auto_reconnect": True,
-    })
+    loaded = store.load(aid)
+    if not loaded.ok:
+        registered = await store.register(aid)
+        if not registered.ok:
+            message = registered.error.message if registered.error else "register failed"
+            raise RuntimeError(message)
+        loaded = store.load(aid)
+
+    if not loaded.ok or loaded.data is None:
+        message = loaded.error.message if loaded.error else "load identity failed"
+        raise RuntimeError(message)
+
+    if not client.has_identity:
+        client.load_identity(loaded.data["aid"])
+
+    await client.connect({"auto_reconnect": True})
     return aid
 
 

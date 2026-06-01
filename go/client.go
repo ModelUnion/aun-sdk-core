@@ -10,7 +10,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -30,7 +29,6 @@ import (
 
 	"github.com/modelunion/aun-sdk-core/go/keystore"
 	"github.com/modelunion/aun-sdk-core/go/namespace"
-	"github.com/modelunion/aun-sdk-core/go/secretstore"
 )
 
 // stableStringify 递归排序键的 JSON 序列化（Canonical JSON for AUN）
@@ -388,24 +386,6 @@ type ConnectionOptions struct {
 	BackgroundSync    bool           // 连接后是否启动后台同步
 }
 
-// newClientForStore 是供 AIDStore 内部使用的非导出构造入口。
-// AIDStore 需要一个无身份客户端来承载联网 RPC（resolve/register/fetch 等），
-// 这些配置不对外暴露，只能由 AIDStore 在内部注入。
-func newClientForStore(aunPath, seedPassword string, verifySSL bool, rootCaPath string, debug bool) *AUNClient {
-	raw := map[string]any{
-		"aun_path":   aunPath,
-		"verify_ssl": verifySSL,
-	}
-	if seedPassword != "" {
-		raw["seed_password"] = seedPassword
-	}
-	if rootCaPath != "" {
-		raw["root_ca_path"] = rootCaPath
-	}
-	c := newClient(raw, debug)
-	return c
-}
-
 // RetryConfig 重试配置
 type RetryConfig struct {
 	InitialDelay float64 // 初始延迟（秒）
@@ -553,13 +533,13 @@ type AUNClient struct {
 	lastDisconnectInfo map[string]any
 
 	// 组件
-	crypto    *CryptoProvider
-	tokenStore keystore.TokenStore // 仅 AIDStore 内部传完整 KeyStore
-	auth      *AuthFlow
-	transport *RPCTransport
-	events    *EventDispatcher
-	discovery *GatewayDiscovery
-	dnsNet    *DnsResilientNet
+	crypto     *CryptoProvider
+	tokenStore keystore.TokenStore
+	auth       *AuthFlow
+	transport  *RPCTransport
+	events     *EventDispatcher
+	discovery  *GatewayDiscovery
+	dnsNet     *DnsResilientNet
 
 	// 会话参数
 	sessionParams  map[string]any
@@ -603,18 +583,7 @@ type AUNClient struct {
 	// 旧 namespace 仅作为内部适配实现，不再作为 AUNClient 公开字段暴露。
 	authNamespace *namespace.AuthNamespace
 
-	// AIDs 目录：{agentMDPath}/{aid}/agentmd.json 保存元数据，{agentMDPath}/{aid}/agent.md 保存正文。
-	// gateway 在 RPC envelope._meta.agent_md_etag 注入服务端 etag；纯观察，无下游依赖。
-	agentMdMu            sync.RWMutex
-	agentMDPath          string
-	localAgentMDPath     string
-	localAgentMDEtag     string
-	remoteAgentMDEtag    string
-	agentMDCache         map[string]*keystore.AgentMDCacheRecord
-	agentMDFetchInflight map[string]bool
-
-	// 测试可注入的 agent.md 底层操作；nil 时使用内部 authNamespace。
-	agentMDOps agentMDOps
+	agentMDManager *AgentMdManager
 
 	// 日志
 	logger *AUNLogger
@@ -667,13 +636,13 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 	events := NewEventDispatcher()
 	crypto := &CryptoProvider{}
 
-	fks, err := keystore.NewFileKeyStore(cfg.AUNPath, nil, cfg.SeedPassword)
+	tokenStore, err := keystore.NewLocalTokenStore(cfg.AUNPath, nil, cfg.SeedPassword)
 	if err != nil {
 		// logger 尚未初始化，临时输出到 stderr
-		fmt.Fprintf(os.Stderr, "[aun_core.keystore] WARN 创建默认 FileKeyStore 失败: %v, 使用空路径\n", err)
-		fks, _ = keystore.NewFileKeyStore(cfg.AUNPath, nil, "")
+		fmt.Fprintf(os.Stderr, "[aun_core.keystore] WARN 创建默认 LocalTokenStore 失败: %v, 使用空种子\n", err)
+		tokenStore, _ = keystore.NewLocalTokenStore(cfg.AUNPath, nil, "")
 	}
-	var ks keystore.TokenStore = fks
+	var ks keystore.TokenStore = tokenStore
 
 	// 创建 DNS 容灾网络层（需在 AuthFlow 之前，因为 AuthFlow 依赖它）
 	dnsNet := NewDnsResilientNet(cfg.AUNPath, cfg.VerifySSL)
@@ -710,7 +679,6 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 	// 注入子包 logger
 	keystore.SetLogger(aunLogger.For("aun_core.keystore"))
 	namespace.SetLogger(aunLogger.For("aun_core.auth"))
-	secretstore.SetLogger(aunLogger.For("aun_core.secret-store"))
 
 	c := &AUNClient{
 		config:                     rawConfig,
@@ -720,7 +688,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		slotID:                     slotID,
 		aid:                        initAid,
 		crypto:                     crypto,
-		tokenStore:                   ks,
+		tokenStore:                 ks,
 		auth:                       authFlow,
 		events:                     events,
 		dnsNet:                     dnsNet,
@@ -734,9 +702,6 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		pushedSeqs:                 make(map[string]map[int]bool),
 		pendingOrderedMsgs:         make(map[string]map[int]pendingOrderedMessage),
 		groupSynced:                make(map[string]bool),
-		agentMDPath:                filepath.Join(cfg.AUNPath, "AIDs"),
-		agentMDCache:               make(map[string]*keystore.AgentMDCacheRecord),
-		agentMDFetchInflight:       make(map[string]bool),
 		v2AutoProposeLocks:         make(map[string]*sync.Mutex),
 		v2AutoProposeLastSnapshot:  make(map[string]string),
 		v2SenderIKPending:          make(map[string]v2SenderIKPendingEntry),
@@ -763,6 +728,7 @@ func newClient(config map[string]any, debug ...bool) *AUNClient {
 		logEG:  aunLogger.For("aun_core.e2ee-group"),
 		logAuS: aunLogger.For("aun_core.auth"),
 	}
+	c.agentMDManager = newAgentMdManager(c, filepath.Join(cfg.AUNPath, "AIDs"))
 
 	// 创建 RPCTransport（使用断线回调）
 	c.transport = NewRPCTransport(events, 10*time.Second, func(err error, closeCode int) {
@@ -826,859 +792,31 @@ func (c *AUNClient) State() ConnectionState {
 	return mapPublicConnectionState(c.state, c.currentAIDObj != nil, c.authenticated, c.nextRetryAt)
 }
 
-// agentMDOps 是 PublishAgentMD / FetchAgentMD 调用底层 sign/verify/upload/download 的接口。
-// 默认指向内部 authNamespace；测试可替换以隔离 HTTP/签名逻辑，专门验证主 API 编排。
-type agentMDOps interface {
-	SignAgentMD(ctx context.Context, content string, opts *namespace.AgentMDSignOptions) (string, error)
-	VerifyAgentMD(ctx context.Context, content string, opts *namespace.AgentMDVerifyOptions) (map[string]any, error)
-	UploadAgentMD(ctx context.Context, content string) (map[string]any, error)
-	DownloadAgentMD(ctx context.Context, aid string) (string, error)
-	HeadAgentMD(ctx context.Context, aid string) (map[string]any, error)
+// agentMD 返回 agent.md 运行时管理器。
+func (c *AUNClient) agentMD() *AgentMdManager {
+	if c.agentMDManager == nil {
+		root := filepath.Join(c.configModel.AUNPath, "AIDs")
+		c.agentMDManager = newAgentMdManager(c, root)
+	}
+	return c.agentMDManager
 }
 
-// AgentMDInfo 描述 FetchAgentMD 的返回结构。
-type AgentMDInfo struct {
-	AID          string         `json:"aid"`
-	Content      string         `json:"content"`
-	Signature    map[string]any `json:"signature"`
-	Verification map[string]any `json:"verification,omitempty"` // 与 Python/TS/JS 对齐：{status, reason}
-	CertPem      string         `json:"cert_pem,omitempty"`     // 与 Python/TS/JS 对齐
-	Etag         string         `json:"etag,omitempty"`
-	LastModified string         `json:"last_modified,omitempty"`
-	// InSync 仅在 aid 是自身时给出指针；外部 aid 时为 nil（语义上不适用）。
-	InSync    *bool  `json:"in_sync,omitempty"`
-	SavedTo   string `json:"saved_to,omitempty"`
-	SaveError string `json:"save_error,omitempty"`
+// UploadAgentMD 签名并上传当前 AID 的 agent.md。
+func (c *AUNClient) UploadAgentMD(ctx context.Context, content ...string) (map[string]any, error) {
+	return c.agentMD().Upload(ctx, content...)
 }
 
-// AgentMDCheckResult 描述 CheckAgentMD 的本地/云端一致性结果。
-type AgentMDCheckResult struct {
-	AID          string `json:"aid"`
-	LocalFound   bool   `json:"local_found"`
-	RemoteFound  bool   `json:"remote_found"`
-	LocalEtag    string `json:"local_etag"`
-	RemoteEtag   string `json:"remote_etag"`
-	InSync       bool   `json:"in_sync"`
-	LastModified string `json:"last_modified"`
-	Status       int    `json:"status"`
-	Cached       bool   `json:"cached"`
-	VerifyStatus string `json:"verify_status"`
-	VerifyError  string `json:"verify_error"`
+// UploadAgentMd 是 UploadAgentMD 的跨语言命名别名。
+func (c *AUNClient) UploadAgentMd(ctx context.Context, content ...string) (map[string]any, error) {
+	return c.UploadAgentMD(ctx, content...)
 }
 
-func agentMDContentEtag(content string) string {
-	sum := sha256.Sum256([]byte(content))
-	return "\"" + hex.EncodeToString(sum[:]) + "\""
-}
-
-func agentMDStringPtr(value string) *string { return &value }
-func agentMDInt64Ptr(value int64) *int64    { return &value }
-func agentMDBoolFromAny(value any) bool {
-	if b, ok := value.(bool); ok {
-		return b
-	}
-	if s, ok := value.(string); ok {
-		switch strings.ToLower(strings.TrimSpace(s)) {
-		case "1", "true", "yes", "on", "found":
-			return true
-		}
-	}
-	return false
-}
-
-func agentMDCheckedAtFresh(checkedAtMs int64, maxUnsyncedDays float64) bool {
-	if maxUnsyncedDays <= 0 || checkedAtMs <= 0 {
-		return false
-	}
-	return float64(time.Now().UnixMilli()-checkedAtMs) <= maxUnsyncedDays*float64(24*60*60*1000)
-}
-
-func agentMDLastModifiedFresh(lastModified string, maxUnsyncedDays float64) bool {
-	if maxUnsyncedDays <= 0 {
-		return false
-	}
-	parsed, err := http.ParseTime(strings.TrimSpace(lastModified))
-	if err != nil {
-		return false
-	}
-	return time.Now().Before(parsed.Add(time.Duration(maxUnsyncedDays * float64(24*time.Hour))))
-}
-
-func cloneAgentMDRecord(rec *keystore.AgentMDCacheRecord) *keystore.AgentMDCacheRecord {
-	if rec == nil {
-		return nil
-	}
-	out := *rec
-	return &out
-}
-
-func applyAgentMDCacheUpsert(rec *keystore.AgentMDCacheRecord, fields keystore.AgentMDCacheUpsert) {
-	if fields.Content != nil {
-		rec.Content = *fields.Content
-	}
-	if fields.LocalEtag != nil {
-		rec.LocalEtag = *fields.LocalEtag
-	}
-	if fields.RemoteEtag != nil {
-		rec.RemoteEtag = *fields.RemoteEtag
-	}
-	if fields.LastModified != nil {
-		rec.LastModified = *fields.LastModified
-	}
-	if fields.FetchedAt != nil {
-		rec.FetchedAt = *fields.FetchedAt
-	}
-	if fields.ObservedAt != nil {
-		rec.ObservedAt = *fields.ObservedAt
-	}
-	if fields.CheckedAt != nil {
-		rec.CheckedAt = *fields.CheckedAt
-	}
-	if fields.RemoteStatus != nil {
-		rec.RemoteStatus = *fields.RemoteStatus
-	}
-	if fields.VerifyStatus != nil {
-		rec.VerifyStatus = *fields.VerifyStatus
-	}
-	if fields.VerifyError != nil {
-		rec.VerifyError = *fields.VerifyError
-	}
-	if fields.LastError != nil {
-		rec.LastError = *fields.LastError
-	}
-	rec.UpdatedAt = time.Now().UnixMilli()
-}
-
-func (c *AUNClient) agentMDOwnerAID() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return strings.TrimSpace(c.aid)
-}
-
-// setAgentMDPath 设置 agent.md 本地存储根目录；空字符串恢复默认 {aun_path}/AIDs。
-func (c *AUNClient) setAgentMDPath(root string) string {
-	next := strings.TrimSpace(root)
-	if next == "" {
-		next = filepath.Join(c.configModel.AUNPath, "AIDs")
-	}
-	_ = os.MkdirAll(next, 0o755)
-	c.agentMdMu.Lock()
-	c.agentMDPath = next
-	c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
-	c.agentMdMu.Unlock()
-	return next
-}
-
-func (c *AUNClient) setAgentMdPath(root string) string { return c.setAgentMDPath(root) }
-
-func (c *AUNClient) agentMDRoot() string {
-	c.agentMdMu.RLock()
-	root := strings.TrimSpace(c.agentMDPath)
-	c.agentMdMu.RUnlock()
-	if root == "" {
-		root = filepath.Join(c.configModel.AUNPath, "AIDs")
-	}
-	_ = os.MkdirAll(root, 0o755)
-	return root
-}
-
-func agentMDSafeAID(aid string) (string, error) {
-	target := strings.TrimSpace(aid)
-	if target == "" || strings.ContainsAny(target, "/\\\x00") {
-		return "", fmt.Errorf("agent.md aid is empty or contains path separators")
-	}
-	return target, nil
-}
-
-func (c *AUNClient) agentMDFilePath(aid string) (string, error) {
-	safe, err := agentMDSafeAID(aid)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(c.agentMDRoot(), safe, "agent.md"), nil
-}
-
-func (c *AUNClient) agentMDMetaPath(aid string) (string, error) {
-	safe, err := agentMDSafeAID(aid)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(c.agentMDRoot(), safe, "agentmd.json"), nil
-}
-
-func atomicWriteText(path string, content []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.%d.%d.tmp", filepath.Base(path), os.Getpid(), time.Now().UnixNano()))
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	closed := false
-	defer func() {
-		if !closed {
-			_ = f.Close()
-		}
-		_ = os.Remove(tmp)
-	}()
-	if _, err := f.Write(content); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	closed = true
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
-}
-
-func (c *AUNClient) withAgentMDRecordLock(aid string, fn func() error) error {
-	metaPath, err := c.agentMDMetaPath(aid)
-	if err != nil {
-		return err
-	}
-	lockPath := metaPath + ".lock"
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		return err
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	var f *os.File
-	for f == nil {
-		opened, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
-		if err == nil {
-			f = opened
-			_, _ = f.WriteString(fmt.Sprintf("%d\n", os.Getpid()))
-			break
-		}
-		if !os.IsExist(err) || time.Now().After(deadline) {
-			return err
-		}
-		if st, statErr := os.Stat(lockPath); statErr == nil && time.Since(st.ModTime()) > 30*time.Second {
-			_ = os.Remove(lockPath)
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	defer func() {
-		_ = f.Close()
-		_ = os.Remove(lockPath)
-	}()
-	return fn()
-}
-func agentMDRecordToMap(rec *keystore.AgentMDCacheRecord) map[string]any {
-	m := map[string]any{"aid": rec.AID}
-	if rec.LocalEtag != "" {
-		m["local_etag"] = rec.LocalEtag
-	}
-	if rec.RemoteEtag != "" {
-		m["remote_etag"] = rec.RemoteEtag
-	}
-	if rec.LastModified != "" {
-		m["last_modified"] = rec.LastModified
-	}
-	if rec.FetchedAt != 0 {
-		m["fetched_at"] = rec.FetchedAt
-	}
-	if rec.ObservedAt != 0 {
-		m["observed_at"] = rec.ObservedAt
-	}
-	if rec.CheckedAt != 0 {
-		m["checked_at"] = rec.CheckedAt
-	}
-	if rec.RemoteStatus != "" {
-		m["remote_status"] = rec.RemoteStatus
-	}
-	if rec.VerifyStatus != "" {
-		m["verify_status"] = rec.VerifyStatus
-	}
-	if rec.VerifyError != "" {
-		m["verify_error"] = rec.VerifyError
-	}
-	if rec.LastError != "" {
-		m["last_error"] = rec.LastError
-	}
-	if rec.UpdatedAt != 0 {
-		m["updated_at"] = rec.UpdatedAt
-	}
-	return m
-}
-
-func agentMDMapToRecord(aid string, raw map[string]any) *keystore.AgentMDCacheRecord {
-	rec := &keystore.AgentMDCacheRecord{AID: strings.TrimSpace(stringFromAny(raw["aid"]))}
-	if rec.AID == "" {
-		rec.AID = aid
-	}
-	rec.LocalEtag = strings.TrimSpace(stringFromAny(raw["local_etag"]))
-	rec.RemoteEtag = strings.TrimSpace(stringFromAny(raw["remote_etag"]))
-	rec.LastModified = strings.TrimSpace(stringFromAny(raw["last_modified"]))
-	rec.FetchedAt = toInt64(raw["fetched_at"])
-	rec.ObservedAt = toInt64(raw["observed_at"])
-	rec.CheckedAt = toInt64(raw["checked_at"])
-	rec.RemoteStatus = strings.TrimSpace(stringFromAny(raw["remote_status"]))
-	rec.VerifyStatus = strings.TrimSpace(stringFromAny(raw["verify_status"]))
-	rec.VerifyError = strings.TrimSpace(stringFromAny(raw["verify_error"]))
-	rec.LastError = strings.TrimSpace(stringFromAny(raw["last_error"]))
-	rec.UpdatedAt = toInt64(raw["updated_at"])
-	return rec
-}
-
-func (c *AUNClient) writeAgentMDRecordUnlocked(aid string, rec *keystore.AgentMDCacheRecord) error {
-	metaPath, err := c.agentMDMetaPath(aid)
-	if err != nil {
-		return err
-	}
-	m := agentMDRecordToMap(rec)
-	delete(m, "content")
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return atomicWriteText(metaPath, data)
-}
-
-func (c *AUNClient) readAgentMDRecordUnlocked(aid string) *keystore.AgentMDCacheRecord {
-	metaPath, err := c.agentMDMetaPath(aid)
-	if err != nil {
-		return nil
-	}
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		return nil
-	}
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		c.log.Warn("agent.md agentmd.json damaged, ignoring: aid=%s err=%v", aid, err)
-		return nil
-	}
-	return agentMDMapToRecord(aid, raw)
-}
-func (c *AUNClient) loadAgentMDRecord(aid string) *keystore.AgentMDCacheRecord {
-	target := strings.TrimSpace(aid)
-	if target == "" {
-		return nil
-	}
-	var rec *keystore.AgentMDCacheRecord
-	if err := c.withAgentMDRecordLock(target, func() error {
-		rec = c.readAgentMDRecordUnlocked(target)
-		return nil
-	}); err != nil {
-		c.log.Debug("agent.md cache load skipped: aid=%s err=%v", target, err)
-		return nil
-	}
-	if rec == nil {
-		return nil
-	}
-	if p, err := c.agentMDFilePath(target); err == nil {
-		if data, err := os.ReadFile(p); err == nil {
-			rec.Content = string(data)
-			rec.LocalEtag = agentMDContentEtag(rec.Content)
-		} else {
-			c.log.Warn("agent.md content read failed: aid=%s err=%v", target, err)
-		}
-	}
-	c.agentMdMu.Lock()
-	if c.agentMDCache == nil {
-		c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
-	}
-	c.agentMDCache[target] = cloneAgentMDRecord(rec)
-	c.agentMdMu.Unlock()
-	return cloneAgentMDRecord(rec)
-}
-
-func (c *AUNClient) saveAgentMDRecord(aid string, fields keystore.AgentMDCacheUpsert) *keystore.AgentMDCacheRecord {
-	target := strings.TrimSpace(aid)
-	if target == "" {
-		return nil
-	}
-	if fields.Content != nil {
-		p, err := c.agentMDFilePath(target)
-		if err != nil {
-			c.log.Debug("agent.md content path invalid: aid=%s err=%v", target, err)
-			return nil
-		}
-		if err := atomicWriteText(p, []byte(*fields.Content)); err != nil {
-			c.log.Debug("agent.md content save skipped: aid=%s err=%v", target, err)
-			return nil
-		}
-		if fields.LocalEtag == nil {
-			fields.LocalEtag = agentMDStringPtr(agentMDContentEtag(*fields.Content))
-		}
-		if fields.FetchedAt == nil {
-			fields.FetchedAt = agentMDInt64Ptr(time.Now().UnixMilli())
-		}
-	}
-	var rec *keystore.AgentMDCacheRecord
-	if err := c.withAgentMDRecordLock(target, func() error {
-		rec = c.readAgentMDRecordUnlocked(target)
-		if rec == nil {
-			rec = &keystore.AgentMDCacheRecord{AID: target}
-		}
-		applyAgentMDCacheUpsert(rec, fields)
-		rec.Content = ""
-		rec.UpdatedAt = time.Now().UnixMilli()
-		return c.writeAgentMDRecordUnlocked(target, rec)
-	}); err != nil {
-		c.log.Debug("agent.md cache save skipped: aid=%s err=%v", target, err)
-		return nil
-	}
-	loaded := cloneAgentMDRecord(rec)
-	if fields.Content != nil {
-		loaded.Content = *fields.Content
-	}
-	c.agentMdMu.Lock()
-	if c.agentMDCache == nil {
-		c.agentMDCache = make(map[string]*keystore.AgentMDCacheRecord)
-	}
-	c.agentMDCache[target] = cloneAgentMDRecord(loaded)
-	owner := c.agentMDOwnerAID()
-	if target == owner {
-		if loaded.LocalEtag != "" {
-			c.localAgentMDEtag = loaded.LocalEtag
-		}
-		if loaded.RemoteEtag != "" {
-			c.remoteAgentMDEtag = loaded.RemoteEtag
-		}
-	}
-	c.agentMdMu.Unlock()
-	return cloneAgentMDRecord(loaded)
-}
-
-func (c *AUNClient) agentMDHasLocalContent(aid string, rec *keystore.AgentMDCacheRecord) bool {
-	if rec != nil && strings.TrimSpace(rec.Content) != "" {
-		return true
-	}
-	p, err := c.agentMDFilePath(aid)
-	if err != nil {
-		return false
-	}
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
-}
-
-func (c *AUNClient) scheduleAgentMDFetchIfMissing(aid string, rec *keystore.AgentMDCacheRecord, source string) {
-	target := strings.TrimSpace(aid)
-	if target == "" || c.agentMDHasLocalContent(target, rec) {
-		return
-	}
-	c.agentMdMu.Lock()
-	if c.agentMDFetchInflight == nil {
-		c.agentMDFetchInflight = make(map[string]bool)
-	}
-	if c.agentMDFetchInflight[target] {
-		c.agentMdMu.Unlock()
-		return
-	}
-	c.agentMDFetchInflight[target] = true
-	c.agentMdMu.Unlock()
-
-	go func() {
-		defer func() {
-			c.agentMdMu.Lock()
-			delete(c.agentMDFetchInflight, target)
-			c.agentMdMu.Unlock()
-		}()
-		ctx := context.Background()
-		c.mu.RLock()
-		if c.ctx != nil {
-			ctx = c.ctx
-		}
-		c.mu.RUnlock()
-		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if _, err := c.fetchAgentMD(fetchCtx, target); err != nil {
-			c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
-				LastError:    agentMDStringPtr(err.Error()),
-				RemoteStatus: agentMDStringPtr("found"),
-			})
-			c.log.Debug("agent.md auto fetch failed: aid=%s source=%s err=%v", target, source, err)
-		}
-	}()
-}
-
-func (c *AUNClient) observeAgentMDMeta(aid, etag, lastModified, source string) {
-	target := strings.TrimSpace(aid)
-	remoteEtag := strings.TrimSpace(etag)
-	remoteLastModified := strings.TrimSpace(lastModified)
-	if target == "" || (remoteEtag == "" && remoteLastModified == "") {
-		return
-	}
-	c.agentMdMu.RLock()
-	before := cloneAgentMDRecord(c.agentMDCache[target])
-	c.agentMdMu.RUnlock()
-	if before == nil {
-		before = c.loadAgentMDRecord(target)
-	}
-	same := before != nil &&
-		(remoteEtag == "" || strings.TrimSpace(before.RemoteEtag) == remoteEtag) &&
-		(remoteLastModified == "" || strings.TrimSpace(before.LastModified) == remoteLastModified)
-	record := cloneAgentMDRecord(before)
-	if !same || before == nil {
-		fields := keystore.AgentMDCacheUpsert{
-			ObservedAt:   agentMDInt64Ptr(time.Now().UnixMilli()),
-			RemoteStatus: agentMDStringPtr("found"),
-		}
-		if remoteEtag != "" {
-			fields.RemoteEtag = agentMDStringPtr(remoteEtag)
-		}
-		if remoteLastModified != "" {
-			fields.LastModified = agentMDStringPtr(remoteLastModified)
-		}
-		record = c.saveAgentMDRecord(target, fields)
-	}
-	if target == c.agentMDOwnerAID() && remoteEtag != "" {
-		c.agentMdMu.Lock()
-		c.remoteAgentMDEtag = remoteEtag
-		c.agentMdMu.Unlock()
-	}
-	c.scheduleAgentMDFetchIfMissing(target, record, source)
-	if source != "" {
-		c.log.Debug("agent.md meta observed: aid=%s etag=%s last_modified=%s source=%s", target, remoteEtag, remoteLastModified, source)
-	}
-}
-
-func (c *AUNClient) observeAgentMDEtag(aid, etag, source string) {
-	c.observeAgentMDMeta(aid, etag, "", source)
+func (c *AUNClient) observeRPCMeta(meta map[string]any) {
+	c.agentMD().ObserveRPCMeta(meta)
 }
 
 func (c *AUNClient) observeAgentMDFromEnvelope(envelope map[string]any) {
-	if envelope == nil {
-		return
-	}
-	agentMD, _ := envelope["agent_md"].(map[string]any)
-	if agentMD == nil {
-		return
-	}
-	sender, _ := agentMD["sender"].(map[string]any)
-	if sender == nil {
-		return
-	}
-	senderAID := strings.TrimSpace(v2AsString(sender["aid"]))
-	if senderAID == "" {
-		if aad, ok := envelope["aad"].(map[string]any); ok {
-			senderAID = strings.TrimSpace(v2AsString(aad["from"]))
-		}
-	}
-	if senderAID == "" {
-		senderAID = strings.TrimSpace(v2AsString(envelope["from"]))
-	}
-	lastModified := strings.TrimSpace(v2AsString(sender["last_modified"]))
-	if lastModified == "" {
-		lastModified = strings.TrimSpace(v2AsString(sender["lastModified"]))
-	}
-	c.observeAgentMDMeta(senderAID, v2AsString(sender["etag"]), lastModified, "envelope")
-}
-
-func (c *AUNClient) agentMDAuthCacheMeta(aid string) (string, string) {
-	if c.authNamespace == nil {
-		return "", ""
-	}
-	meta := c.authNamespace.CachedAgentMDMeta(aid)
-	if meta == nil {
-		return "", ""
-	}
-	return strings.TrimSpace(meta["etag"]), strings.TrimSpace(meta["last_modified"])
-}
-
-// PublishAgentMD 读取本地 agent.md → 签名 → 上传到服务端，并刷新内部 localAgentMDEtag。
-//
-// path 为空 / 文件不存在时返回 error；上传失败时透传底层错误。
-// PublishAgentMD 读取 {agentMDPath}/{self_aid}/agent.md → 签名 → 上传到服务端，并刷新内部 localAgentMDEtag。
-func (c *AUNClient) PublishAgentMD(ctx context.Context, _legacyPath ...string) (map[string]any, error) {
-	target := c.agentMDOwnerAID()
-	if target == "" {
-		return nil, fmt.Errorf("PublishAgentMD requires local AID")
-	}
-	p, err := c.agentMDFilePath(target)
-	if err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return nil, fmt.Errorf("PublishAgentMD read default agent.md: %w", err)
-	}
-	content := string(data)
-	ops := c.resolveAgentMDOps()
-	signed, err := ops.SignAgentMD(ctx, content, nil)
-	if err != nil {
-		return nil, err
-	}
-	result, err := ops.UploadAgentMD(ctx, signed)
-	if err != nil {
-		return nil, err
-	}
-	localEtag := agentMDContentEtag(signed)
-	remoteEtag := strings.TrimSpace(stringFromAny(result["etag"]))
-	lastModified := strings.TrimSpace(stringFromAny(result["last_modified"]))
-	remoteStatus := "unknown"
-	if remoteEtag != "" {
-		remoteStatus = "found"
-	}
-	c.agentMdMu.Lock()
-	c.localAgentMDPath = p
-	c.localAgentMDEtag = localEtag
-	if remoteEtag != "" {
-		c.remoteAgentMDEtag = remoteEtag
-	}
-	c.agentMdMu.Unlock()
-	c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
-		Content:      agentMDStringPtr(signed),
-		LocalEtag:    agentMDStringPtr(localEtag),
-		RemoteEtag:   agentMDStringPtr(remoteEtag),
-		LastModified: agentMDStringPtr(lastModified),
-		FetchedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
-		RemoteStatus: agentMDStringPtr(remoteStatus),
-		LastError:    agentMDStringPtr(""),
-	})
-	return result, nil
-}
-
-// fetchAgentMD 下载 agent.md 并自动验签；aid 为空时取自身 AID；可选 savePath 写盘；
-// 若 aid 是自己则同步刷新 localAgentMDEtag 与 InSync。
-//
-// 写盘失败不影响 fetchAgentMD 整体成功，错误信息回填到 AgentMDInfo.SaveError。
-func (c *AUNClient) fetchAgentMD(ctx context.Context, aid string, _legacySavePath ...string) (*AgentMDInfo, error) {
-	target := strings.TrimSpace(aid)
-	if target == "" {
-		c.mu.RLock()
-		target = strings.TrimSpace(c.aid)
-		c.mu.RUnlock()
-	}
-	if target == "" {
-		return nil, fmt.Errorf("FetchAgentMD requires aid (or local AID)")
-	}
-
-	ops := c.resolveAgentMDOps()
-	content, err := ops.DownloadAgentMD(ctx, target)
-	if err != nil {
-		return nil, err
-	}
-	sig, err := ops.VerifyAgentMD(ctx, content, &namespace.AgentMDVerifyOptions{AID: target})
-	if err != nil {
-		return nil, err
-	}
-
-	info := &AgentMDInfo{AID: target, Content: content, Signature: sig}
-	// 填充 Verification（与 Python/TS/JS 对齐）
-	if status, ok := sig["status"].(string); ok {
-		verification := map[string]any{"status": status}
-		if reason, ok := sig["reason"].(string); ok && reason != "" {
-			verification["reason"] = reason
-		}
-		info.Verification = verification
-	}
-	// 填充 CertPem（从 sig 中提取，VerifyAgentMD 会返回 cert_pem）
-	if certPem, ok := sig["cert_pem"].(string); ok && certPem != "" {
-		info.CertPem = certPem
-	}
-
-	c.mu.RLock()
-	selfAid := strings.TrimSpace(c.aid)
-	c.mu.RUnlock()
-
-	localEtag := agentMDContentEtag(content)
-	remoteEtag, lastModified := c.agentMDAuthCacheMeta(target)
-	if target == selfAid {
-		c.agentMdMu.Lock()
-		c.localAgentMDEtag = localEtag
-		if remoteEtag != "" {
-			c.remoteAgentMDEtag = remoteEtag
-		}
-		remote := c.remoteAgentMDEtag
-		c.agentMdMu.Unlock()
-		inSync := false
-		if localEtag != "" && remote != "" {
-			inSync = localEtag == remote
-		}
-		info.InSync = &inSync
-	}
-
-	fields := keystore.AgentMDCacheUpsert{
-		Content:      agentMDStringPtr(content),
-		LocalEtag:    agentMDStringPtr(localEtag),
-		FetchedAt:    agentMDInt64Ptr(time.Now().UnixMilli()),
-		RemoteStatus: agentMDStringPtr("found"),
-		VerifyStatus: agentMDStringPtr(strings.TrimSpace(stringFromAny(sig["status"]))),
-		VerifyError:  agentMDStringPtr(strings.TrimSpace(stringFromAny(sig["reason"]))),
-		LastError:    agentMDStringPtr(""),
-	}
-	if remoteEtag != "" {
-		fields.RemoteEtag = agentMDStringPtr(remoteEtag)
-	}
-	if lastModified != "" {
-		fields.LastModified = agentMDStringPtr(lastModified)
-	}
-	c.saveAgentMDRecord(target, fields)
-	if p, err := c.agentMDFilePath(target); err == nil {
-		info.SavedTo = p
-	}
-	// 填充 Etag / LastModified（与 Python/TS/JS 对齐）
-	info.Etag = remoteEtag
-	info.LastModified = lastModified
-	return info, nil
-}
-
-// checkAgentMD 通过 HEAD 比较本地缓存 agent.md 与云端 agent.md ETag 是否一致。
-func (c *AUNClient) checkAgentMD(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
-	target := strings.TrimSpace(aid)
-	if target == "" {
-		target = c.agentMDOwnerAID()
-	}
-	if target == "" {
-		return nil, fmt.Errorf("CheckAgentMD requires aid (or local AID)")
-	}
-	maxDays := 0.0
-	if len(maxUnsyncedDays) > 0 {
-		maxDays = maxUnsyncedDays[0]
-	}
-	before := c.loadAgentMDRecord(target)
-	localEtag := ""
-	localFound := false
-	remoteEtagCached := ""
-	lastModifiedCached := ""
-	verifyStatus := ""
-	verifyError := ""
-	checkedAtCached := int64(0)
-	if before != nil {
-		localEtag = strings.TrimSpace(before.LocalEtag)
-		localFound = strings.TrimSpace(before.Content) != "" || localEtag != ""
-		remoteEtagCached = strings.TrimSpace(before.RemoteEtag)
-		lastModifiedCached = strings.TrimSpace(before.LastModified)
-		verifyStatus = strings.TrimSpace(before.VerifyStatus)
-		verifyError = strings.TrimSpace(before.VerifyError)
-		checkedAtCached = before.CheckedAt
-	}
-	// max_unsynced_days > 0 且缓存仍在窗口内时直接返回，避免无意义 HEAD。
-	cacheFresh := agentMDCheckedAtFresh(checkedAtCached, maxDays) || agentMDLastModifiedFresh(lastModifiedCached, maxDays)
-	if localFound && localEtag != "" && remoteEtagCached != "" && localEtag == remoteEtagCached && cacheFresh {
-		return &AgentMDCheckResult{
-			AID:          target,
-			LocalFound:   true,
-			RemoteFound:  true,
-			LocalEtag:    localEtag,
-			RemoteEtag:   remoteEtagCached,
-			InSync:       true,
-			LastModified: lastModifiedCached,
-			Status:       200,
-			Cached:       true,
-			VerifyStatus: verifyStatus,
-			VerifyError:  verifyError,
-		}, nil
-	}
-
-	now := time.Now().UnixMilli()
-	remote, err := c.resolveAgentMDOps().HeadAgentMD(ctx, target)
-	if err != nil {
-		c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
-			CheckedAt:    agentMDInt64Ptr(now),
-			RemoteStatus: agentMDStringPtr("error"),
-			LastError:    agentMDStringPtr(err.Error()),
-		})
-		return nil, err
-	}
-	remoteFound := agentMDBoolFromAny(remote["found"])
-	remoteEtag := strings.TrimSpace(stringFromAny(remote["etag"]))
-	lastModified := strings.TrimSpace(stringFromAny(remote["last_modified"]))
-	if lastModified == "" {
-		lastModified = strings.TrimSpace(stringFromAny(remote["lastModified"]))
-	}
-	status := int(toInt64(remote["status"]))
-	if status == 0 {
-		if remoteFound {
-			status = 200
-		} else {
-			status = 404
-		}
-	}
-	remoteStatus := "missing"
-	if remoteFound {
-		remoteStatus = "found"
-	}
-	saved := c.saveAgentMDRecord(target, keystore.AgentMDCacheUpsert{
-		RemoteEtag:   agentMDStringPtr(map[bool]string{true: remoteEtag, false: ""}[remoteFound]),
-		LastModified: agentMDStringPtr(lastModified),
-		CheckedAt:    agentMDInt64Ptr(now),
-		RemoteStatus: agentMDStringPtr(remoteStatus),
-		LastError:    agentMDStringPtr(""),
-	})
-	if saved != nil {
-		verifyStatus = strings.TrimSpace(saved.VerifyStatus)
-		verifyError = strings.TrimSpace(saved.VerifyError)
-	}
-	if target == c.agentMDOwnerAID() && remoteEtag != "" {
-		c.agentMdMu.Lock()
-		c.remoteAgentMDEtag = remoteEtag
-		c.agentMdMu.Unlock()
-	}
-	return &AgentMDCheckResult{
-		AID:          target,
-		LocalFound:   localFound,
-		RemoteFound:  remoteFound,
-		LocalEtag:    localEtag,
-		RemoteEtag:   remoteEtag,
-		InSync:       localFound && remoteFound && localEtag != "" && remoteEtag != "" && localEtag == remoteEtag,
-		LastModified: lastModified,
-		Status:       status,
-		Cached:       false,
-		VerifyStatus: verifyStatus,
-		VerifyError:  verifyError,
-	}, nil
-}
-
-func (c *AUNClient) checkAgentMd(ctx context.Context, aid string, maxUnsyncedDays ...float64) (*AgentMDCheckResult, error) {
-	return c.checkAgentMD(ctx, aid, maxUnsyncedDays...)
-}
-
-// resolveAgentMDOps 返回测试注入的 agentMDOps 或默认内部 authNamespace。
-func (c *AUNClient) resolveAgentMDOps() agentMDOps {
-	if c.agentMDOps != nil {
-		return c.agentMDOps
-	}
-	return c.authNamespace
-}
-
-// observeRPCMeta transport 的 _meta observer：吸收 gateway 注入的 agent_md_etag 等元数据。
-// observer 失败 / 字段缺失时不影响业务路径。
-func (c *AUNClient) observeRPCMeta(meta map[string]any) {
-	if meta == nil {
-		return
-	}
-	if etag := strings.TrimSpace(stringFromAny(meta["agent_md_etag"])); etag != "" {
-		c.agentMdMu.Lock()
-		c.remoteAgentMDEtag = etag
-		c.agentMdMu.Unlock()
-		c.observeAgentMDMeta(c.agentMDOwnerAID(), etag, "", "rpc.self")
-	}
-	etags, _ := meta["agent_md_etags"].(map[string]any)
-	if etags == nil {
-		return
-	}
-	// role key 优先级：requester / peer 是新规范，其余是兼容旧 SDK 的别名。
-	for _, key := range []string{"requester", "peer", "receiver", "target", "to", "sender", "from"} {
-		item, _ := etags[key].(map[string]any)
-		if item == nil {
-			continue
-		}
-		lastModified := strings.TrimSpace(stringFromAny(item["last_modified"]))
-		if lastModified == "" {
-			lastModified = strings.TrimSpace(stringFromAny(item["lastModified"]))
-		}
-		c.observeAgentMDMeta(
-			strings.TrimSpace(stringFromAny(item["aid"])),
-			strings.TrimSpace(stringFromAny(item["etag"])),
-			lastModified,
-			"rpc."+key,
-		)
-	}
+	c.agentMD().observeAgentMDFromEnvelope(envelope)
 }
 
 // ── namespace.ClientInterface 实现 ─────────────────────────
@@ -1796,12 +934,39 @@ func (c *AUNClient) resolveGatewayForAID(ctx context.Context, aid string) (strin
 	if parts := strings.SplitN(target, ".", 2); len(parts) > 1 {
 		issuer = parts[1]
 	}
+	if c.discovery == nil {
+		return "", NewValidationError("gateway discovery unavailable")
+	}
 	wellKnownURL := fmt.Sprintf("https://gateway.%s/.well-known/aun-gateway", issuer)
 	discovered, err := c.discovery.Discover(ctx, wellKnownURL, 0)
 	if err != nil {
 		return "", err
 	}
 	c.setGatewayURL(discovered)
+	c.AuthPersistGatewayURL(target, discovered)
+	return discovered, nil
+}
+
+func (c *AUNClient) resolveGatewayForPeerAID(ctx context.Context, aid string) (string, error) {
+	target := strings.TrimSpace(aid)
+	if target == "" {
+		return "", NewValidationError("peer aid is required for gateway discovery")
+	}
+	if cached := strings.TrimSpace(c.AuthLoadCachedGatewayURL(target)); cached != "" {
+		return cached, nil
+	}
+	issuer := target
+	if parts := strings.SplitN(target, ".", 2); len(parts) > 1 {
+		issuer = parts[1]
+	}
+	if c.discovery == nil {
+		return "", NewValidationError("gateway discovery unavailable")
+	}
+	wellKnownURL := fmt.Sprintf("https://gateway.%s/.well-known/aun-gateway", issuer)
+	discovered, err := c.discovery.Discover(ctx, wellKnownURL, 0)
+	if err != nil {
+		return "", err
+	}
 	c.AuthPersistGatewayURL(target, discovered)
 	return discovered, nil
 }
@@ -2815,10 +1980,7 @@ func (c *AUNClient) injectAgentMDEtag(payload any) {
 	if _, exists := m["_agent_md"]; exists {
 		return
 	}
-	c.agentMdMu.RLock()
-	localEtag := c.localAgentMDEtag
-	remoteEtag := c.remoteAgentMDEtag
-	c.agentMdMu.RUnlock()
+	localEtag, remoteEtag := c.agentMD().eventSnapshot()
 	if localEtag == "" && remoteEtag == "" {
 		return
 	}
@@ -4316,12 +3478,16 @@ func (c *AUNClient) fetchPeerCert(ctx context.Context, aid string, certFingerpri
 	c.mu.RLock()
 	gatewayURL := c.gatewayURL
 	c.mu.RUnlock()
+	var peerGatewayURL string
 	if gatewayURL == "" {
-		return nil, NewValidationError("gateway url 不可用，无法获取证书")
+		peerGatewayURL, err = c.resolveGatewayForPeerAID(ctx, aid)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// 跨域时用 peer 所在域的 Gateway URL
+		peerGatewayURL = resolvePeerGatewayURL(gatewayURL, aid)
 	}
-
-	// 跨域时用 peer 所在域的 Gateway URL
-	peerGatewayURL := resolvePeerGatewayURL(gatewayURL, aid)
 	cb, fetchErr := c.fetchCertHTTP(ctx, buildCertURL(peerGatewayURL, aid, certFingerprint), aid)
 	if fetchErr != nil {
 		if strings.TrimSpace(certFingerprint) == "" {
@@ -6433,7 +5599,7 @@ func (c *AUNClient) GetPeer(aid string) *AID {
 	return c.peerCache[strings.TrimSpace(aid)]
 }
 
-// LookupPeer 先查缓存，未命中则通过 AIDStore 解析。
+// LookupPeer 先查缓存，未命中则通过当前客户端的 TokenStore/AuthFlow 解析。
 func (c *AUNClient) LookupPeer(ctx context.Context, aid string) (*AID, error) {
 	if !c.HasIdentity() {
 		return nil, NewStateError("LookupPeer requires a loaded identity")
@@ -6445,13 +5611,21 @@ func (c *AUNClient) LookupPeer(ctx context.Context, aid string) (*AID, error) {
 	if cached := c.GetPeer(target); cached != nil {
 		return cached, nil
 	}
-	store := NewAIDStore(c.configModel.AUNPath, c.configModel.SeedPassword)
-	defer store.Close()
-	r := store.Resolve(ctx, target, AIDStoreResolveOptions{SkipAgentMD: true})
-	if !r.Ok {
-		return nil, fmt.Errorf("%s: %s", r.Error.Code, r.Error.Message)
+	var certPEM string
+	if localCert, loadErr := c.tokenStore.LoadCert(target); loadErr == nil {
+		certPEM = strings.TrimSpace(localCert)
 	}
-	peer := r.Data.AID
+	if certPEM == "" {
+		certBytes, fetchErr := c.fetchPeerCert(ctx, target, "")
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		certPEM = string(certBytes)
+	}
+	peer, err := c.publicAIDFromCert(target, certPEM)
+	if err != nil {
+		return nil, err
+	}
 	if !peer.IsCertValid() {
 		return nil, NewAUNError(fmt.Sprintf("resolved peer certificate is invalid: %s", target))
 	}
@@ -6459,6 +5633,39 @@ func (c *AUNClient) LookupPeer(ctx context.Context, aid string) (*AID, error) {
 	c.peerCache[peer.Aid] = peer
 	c.peerCacheMu.Unlock()
 	return peer, nil
+}
+
+func (c *AUNClient) publicAIDFromCert(aid, certPEM string) (*AID, error) {
+	target := strings.TrimSpace(aid)
+	cert, err := parsePEMCertificate(certPEM)
+	if err != nil {
+		return nil, NewAUNError(fmt.Sprintf("peer certificate parse failed: %s", target))
+	}
+	if tErr := certTimeError(cert); tErr != "" {
+		return nil, NewAUNError(fmt.Sprintf("peer certificate is %s: %s", tErr, target))
+	}
+	if cn := strings.TrimSpace(cert.Subject.CommonName); cn != "" && cn != target {
+		return nil, NewAUNError(fmt.Sprintf("peer certificate CN mismatch: expected %s, got %s", target, cn))
+	}
+	debug := false
+	if c.logger != nil {
+		debug = c.logger.Debug()
+	}
+	return newAID(
+		target,
+		c.configModel.AUNPath,
+		certPEM,
+		cert,
+		nil,
+		true,
+		false,
+		c.deviceID,
+		c.slotID,
+		c.configModel.VerifySSL,
+		c.configModel.RootCAPath,
+		debug,
+		"",
+	), nil
 }
 
 // Peers 返回所有缓存的对端 AID（按 aid 排序）。
@@ -6605,7 +5812,7 @@ func (c *AUNClient) rebuildRuntimeForIdentity(aid *AID) {
 
 	c.config = nextRaw
 	c.configModel = nextCfg
-	c.agentMDPath = filepath.Join(nextCfg.AUNPath, "AIDs")
+	c.agentMD().setAgentMDPath(filepath.Join(nextCfg.AUNPath, "AIDs"))
 	deviceID := c.deviceID
 	if deviceID == "" {
 		deviceID = nextCfg.DeviceID()
@@ -6620,14 +5827,13 @@ func (c *AUNClient) rebuildRuntimeForIdentity(aid *AID) {
 	c.logAuS = aunLogger.For("aun_core.auth")
 	keystore.SetLogger(aunLogger.For("aun_core.keystore"))
 	namespace.SetLogger(aunLogger.For("aun_core.auth"))
-	secretstore.SetLogger(aunLogger.For("aun_core.secret-store"))
 
-	fks, err := keystore.NewFileKeyStore(nextCfg.AUNPath, nil, nextCfg.SeedPassword)
+	tokenStore, err := keystore.NewLocalTokenStore(nextCfg.AUNPath, nil, nextCfg.SeedPassword)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[aun_core.keystore] WARN LoadIdentity 重建 FileKeyStore 失败: %v, 使用空种子\n", err)
-		fks, _ = keystore.NewFileKeyStore(nextCfg.AUNPath, nil, "")
+		fmt.Fprintf(os.Stderr, "[aun_core.keystore] WARN LoadIdentity 重建 LocalTokenStore 失败: %v, 使用空种子\n", err)
+		tokenStore, _ = keystore.NewLocalTokenStore(nextCfg.AUNPath, nil, "")
 	}
-	c.tokenStore = fks
+	c.tokenStore = tokenStore
 
 	dnsNet := NewDnsResilientNet(nextCfg.AUNPath, nextCfg.VerifySSL)
 	c.dnsNet = dnsNet

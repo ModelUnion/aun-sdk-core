@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from aun_core.keystore.file import FileKeyStore
+from aun_core.keystore.local_token_store import LocalTokenStore
 
 AID = "interop.aid.test"
 SEED = "interop-seed"
@@ -64,7 +64,7 @@ def _run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str
 
 
 def _write_python(root: Path) -> None:
-    ks = FileKeyStore(root, encryption_seed=SEED)
+    ks = LocalTokenStore(root)
     ks.save_e2ee_prekey(AID, "python-prekey", {"private_key_pem": EXPECTED["python-prekey"], "created_at": 1}, device_id="")
     ks.store_group_secret_transition(
         AID,
@@ -82,7 +82,7 @@ def _write_python(root: Path) -> None:
 
 
 def _read_python(root: Path) -> dict:
-    ks = FileKeyStore(root, encryption_seed=SEED)
+    ks = LocalTokenStore(root)
     db = ks._get_db(AID)
     groups = {
         group_id: ks.load_group_secret_epoch(AID, group_id)
@@ -103,10 +103,10 @@ def _ts_script(root: Path, action: str) -> str:
     import_path = (repo / "ts" / "dist" / "index.js").resolve().as_uri()
     root_js = root.as_posix()
     return f"""
-import {{ FileKeyStore }} from '{import_path}';
+import {{ LocalTokenStore }} from '{import_path}';
 const root = {json.dumps(root_js)};
 const aid = {json.dumps(AID)};
-const ks = new FileKeyStore(root, {{ encryptionSeed: {json.dumps(SEED)} }});
+const ks = new LocalTokenStore(root, {{ encryptionSeed: {json.dumps(SEED)} }});
 if ({json.dumps(action)} === 'write') {{
   await ks.saveE2EEPrekey(aid, 'ts-prekey', {{ private_key_pem: 'TS-PREKEY-SECRET', created_at: 1 }});
   await ks.storeGroupSecretTransition(aid, 'ts-group', {{

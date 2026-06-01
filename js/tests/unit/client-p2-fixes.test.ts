@@ -338,7 +338,7 @@ describe('P2-8: _restoreSeqTrackerState 应真正 await', () => {
     let resolveLoad: (v: any) => void;
     const loadPromise = new Promise((resolve) => { resolveLoad = resolve; });
 
-    (client as any)._keystore = {
+    (client as any)._tokenStore = {
       loadAllSeqs: vi.fn().mockImplementation(() => loadPromise),
     };
 

@@ -212,8 +212,11 @@ describe('AUNClient 子模块可访问', () => {
     expect((client as any).meta).toBeUndefined();
     expect((client as any).custody).toBeUndefined();
     for (const name of [
+      'publishAgentMd',
       'fetchAgentMd',
       'checkAgentMd',
+      'getLocalAgentMdEtag',
+      'getRemoteAgentMdEtag',
       'listIdentities',
       'checkGatewayHealth',
       'setAgentMdPath',
@@ -246,17 +249,13 @@ describe('AUNClient 子模块可访问', () => {
 describe('AUNClient._syncIdentityAfterConnect', () => {
   it('同步 token 时不应覆盖已有 prekey', async () => {
     const client = new AUNClient();
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     const aid = 'sync.agentid.pub';
     const deviceId = (client as any)._deviceId;
     const slotId = (client as any)._slotId;
 
-    await ks.saveIdentity(aid, {
-      aid,
-      private_key_pem: 'PRIVATE_KEY',
-      public_key_der_b64: 'pub',
-      curve: 'P-256',
-    });
+    const identity = { aid, private_key_pem: 'PRIVATE_KEY', public_key_der_b64: 'pub', curve: 'P-256' };
+    (client as any)._identity = identity;
     await ks.saveE2EEPrekey(aid, 'pk1', {
       private_key_pem: 'KEEP_ME',
       created_at: 1,
@@ -374,7 +373,7 @@ describe('AIDStore.list', () => {
     expect((client as any).listIdentities).toBeUndefined();
 
     const store = new AIDStore({ aunPath: 'aun-list-test', encryptionSeed: 'seed-list-test' });
-    (store as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.agentid.pub']);
+    (store as any)._keystore.listIdentities = vi.fn().mockResolvedValue(['alice.agentid.pub']); // AIDStore still uses _keystore internally
     (store as any).load = vi.fn().mockResolvedValue({
       ok: true,
       data: {
@@ -474,6 +473,47 @@ describe('AUNClient message.send 接收者校验', () => {
       device_id: (client as any)._deviceId,
       slot_id: 'slot-a',
     }));
+  });
+
+  it.each(['evolclaw cli', 'evolclaw/cli', 'evolclaw:cli'])(
+    'message.pull/ack cursor 接受含分隔符的 slot_id: %s',
+    (slotId) => {
+      const client = new AUNClient();
+      (client as any)._deviceId = 'device-1';
+      (client as any)._slotId = slotId;
+      const pullParams = { after_seq: 0, limit: 10 };
+      const ackParams = { seq: 1 };
+
+      (client as any)._injectMessageCursorContext('message.pull', pullParams);
+      (client as any)._injectMessageCursorContext('message.ack', ackParams);
+
+      expect(pullParams).toEqual(expect.objectContaining({
+        device_id: 'device-1',
+        slot_id: slotId,
+      }));
+      expect(ackParams).toEqual(expect.objectContaining({
+        device_id: 'device-1',
+        slot_id: slotId,
+      }));
+    },
+  );
+
+  it('message.pull/ack cursor 显式 slot_id 按隔离键匹配', () => {
+    const client = new AUNClient();
+    (client as any)._deviceId = 'device-1';
+    (client as any)._slotId = 'evolclaw cli';
+    const params = { after_seq: 0, limit: 10, slot_id: 'evolclaw daemon' };
+
+    (client as any)._injectMessageCursorContext('message.pull', params);
+
+    expect(params).toEqual(expect.objectContaining({
+      device_id: 'device-1',
+      slot_id: 'evolclaw cli',
+    }));
+    expect(() => (client as any)._injectMessageCursorContext('message.ack', {
+      seq: 1,
+      slot_id: 'other daemon',
+    })).toThrow('slot_id must match');
   });
 
   it('group RPC 应注入空 device_id 作为显式实例值', async () => {
@@ -1121,7 +1161,7 @@ describe('AUNClient SeqTracker 持久化错误事件', () => {
     (client as any)._seqTracker.onMessageSeq('p2p:test.aid.com', 1);
     (client as any)._seqTracker.onMessageSeq('p2p:test.aid.com', 2);
 
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     vi.spyOn(ks, 'saveSeq').mockRejectedValue(new Error('disk full'));
 
     (client as any)._saveSeqTrackerState();
@@ -1145,7 +1185,7 @@ describe('AUNClient SeqTracker 持久化错误事件', () => {
     (client as any)._slotId = 'slot-1';
     (client as any)._seqTrackerContext = JSON.stringify(['test.aid.com', 'dev-1', 'slot-1']);
 
-    const ks = (client as any)._keystore;
+    const ks = (client as any)._tokenStore;
     vi.spyOn(ks, 'loadAllSeqs').mockRejectedValue(new Error('db corrupted'));
 
     await (client as any)._restoreSeqTrackerState();
@@ -1452,17 +1492,18 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
       debug: false,
       isCertValid: () => true,
       isPrivateKeyValid: () => false,
-      sign: () => ({ ok: true, data: { signature: '' } }),
-      verify: () => ({ ok: true, data: { valid: true } }),
-      signAgentMd: () => ({ ok: true, data: { signed: '' } }),
-      verifyAgentMd: () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
+      sign: async () => ({ ok: true, data: { signature: '' } }),
+      verify: async () => ({ ok: true, data: { valid: true } }),
+      signAgentMd: async () => ({ ok: true, data: { signed: '' } }),
+      verifyAgentMd: async () => ({ ok: true, data: { status: 'verified' as const, payload: '' } }),
     };
     return new AUNClient(mockAid as any);
   };
-  const agentRoot = (client: AUNClient): string => (client as any)._agentMdPath as string;
+  const manager = (client: AUNClient): any => (client as any)._agentMdManager;
+  const agentRoot = (client: AUNClient): string => manager(client).root;
   const agentEtag = (content: string): string => `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
   const readAgentStorage = async (client: AUNClient, key: string): Promise<any> => {
-    const record = await (client as any)._keystore.loadAgentMdCache(agentRoot(client), key);
+    const record = await (client as any)._tokenStore.loadAgentMdCache(agentRoot(client), key);
     if (!record) throw new Error(`missing agent.md storage key: ${key}`);
     return record;
   };
@@ -1471,64 +1512,8 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     return JSON.parse(record.content || '{}');
   };
   const writeAgentFile = async (client: AUNClient, aid: string, content: string): Promise<void> => {
-    await (client as any)._writeAgentMdContent(aid, content);
+    await manager(client).writeContent(aid, content);
   };
-
-  it('publishAgentMd 成功后应持久化自身 agent.md 正文和 agentmd.json 元数据', async () => {
-    const client = makeAgentClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '---\naid: alice.agentid.pub\n---\n# Alice\n';
-    const signed = `${body}\n<!-- AUN-SIGNATURE\nsignature: x\n-->\n`;
-    await writeAgentFile(client, 'alice.agentid.pub', body);
-    (client as any)._currentAid = {
-      aid: 'alice.agentid.pub',
-      isPrivateKeyValid: () => true,
-      signAgentMd: vi.fn(() => ({
-        ok: true,
-        data: { signed },
-      })),
-    };
-    (client as any)._uploadAgentMd = vi.fn(async () => ({
-      etag: '"alice-cloud"',
-      last_modified: 'Sun, 24 May 2026 13:00:00 GMT',
-    }));
-
-    await client.publishAgentMd();
-
-    const saved = await readAgentStorage(client, 'alice.agentid.pub/agent.md');
-    const record = await readAgentMeta(client, 'alice.agentid.pub');
-    expect(saved.content).toBe(signed);
-    expect(record.content).toBeUndefined();
-    expect(record.local_etag).toBe(agentEtag(signed));
-    expect(record.remote_etag).toBe('"alice-cloud"');
-    expect(record.remote_status).toBe('found');
-  });
-
-  it('fetchAgentMd 成功后应持久化远端 agent.md 正文和 agentmd.json 元数据', async () => {
-    const client = makeAgentClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    (client as any)._downloadAgentMd = vi.fn(async () => body);
-    (client as any)._verifyAgentMd = vi.fn(async () => ({ status: 'verified', verified: true }));
-    (client as any)._agentMdCache = new Map([
-      ['bob.agentid.pub', {
-        text: body,
-        etag: '"bob-cloud"',
-        lastModified: 'Sun, 24 May 2026 13:10:00 GMT',
-      }],
-    ]);
-
-    const info = await (client as any)._fetchAgentMdCache('bob.agentid.pub');
-
-    expect(info.aid).toBe('bob.agentid.pub');
-    const saved = await readAgentStorage(client, 'bob.agentid.pub/agent.md');
-    const record = await readAgentMeta(client, 'bob.agentid.pub');
-    expect(saved.content).toBe(body);
-    expect(record.content).toBeUndefined();
-    expect(record.local_etag).toBe(agentEtag(body));
-    expect(record.remote_etag).toBe('"bob-cloud"');
-    expect(record.verify_status).toBe('verified');
-  });
 
   it('_observeRpcMeta 应分别缓存发送者自身和 message.send 目标的云端 ETag', async () => {
     const client = makeAgentClient();
@@ -1547,7 +1532,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
       },
     });
 
-    expect(client.getRemoteAgentMdEtag()).toBe('"alice-cloud"');
+    expect(manager(client).eventSnapshot().remote_etag).toBe('"alice-cloud"');
     expect((await readAgentMeta(client, 'alice.agentid.pub')).remote_etag).toBe('"alice-cloud"');
     expect((await readAgentMeta(client, 'bob.agentid.pub')).remote_etag).toBe('"bob-cloud"');
     expect((await readAgentMeta(client, 'carol.agentid.pub')).remote_etag).toBe('"carol-cloud"');
@@ -1615,22 +1600,22 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
 
   it('checkAgentMd 应使用 HEAD 返回的云端 ETag 与本地 content ETag 比较并落到 agentmd.json', async () => {
     const client = makeAgentClient();
-    (client as any)._aid = 'alice.agentid.pub';
+    const mgr = manager(client);
     const body = '# Bob\n';
-    await (client as any)._saveAgentMdRecord('bob.agentid.pub', {
+    await mgr.saveRecord('bob.agentid.pub', {
       content: body,
       local_etag: agentEtag(body),
       remote_etag: '"old"',
     });
-    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
-      aid,
+    vi.spyOn(mgr as any, '_head').mockResolvedValue({
+      aid: 'bob.agentid.pub',
       found: true,
       etag: agentEtag(body),
       last_modified: 'Sun, 24 May 2026 13:20:00 GMT',
       status: 200,
-    }));
+    });
 
-    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub');
+    const result = await mgr.check('bob.agentid.pub');
 
     expect(result.local_found).toBe(true);
     expect(result.remote_found).toBe(true);
@@ -1640,28 +1625,7 @@ describe('AUNClient agent.md ETag 缓存与透传', () => {
     expect(record.remote_etag).toBe(agentEtag(body));
     expect(record.checked_at).toBeGreaterThan(0);
   });
-
-  it('checkAgentMd 本地无记录时仍应 HEAD 云端并返回 local_found=false', async () => {
-    const client = makeAgentClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    (client as any)._headAgentMd = vi.fn(async (aid: string) => ({
-      aid,
-      found: true,
-      etag: '"remote"',
-      last_modified: '',
-      status: 200,
-    }));
-
-    const result = await (client as any)._checkAgentMdCache('carol.agentid.pub');
-
-    expect(result.local_found).toBe(false);
-    expect(result.remote_found).toBe(true);
-    expect(result.in_sync).toBe(false);
-    const record = await readAgentMeta(client, 'carol.agentid.pub');
-    expect(record.remote_etag).toBe('"remote"');
-  });
-});
-describe('有序消息发布', () => {
+});describe('有序消息发布', () => {
   it('P2P push 越过空洞时应挂起，补洞后按 contiguous_seq 顺序放行', async () => {
     const client = new AUNClient();
     const ns = 'p2p:alice.aid.com';

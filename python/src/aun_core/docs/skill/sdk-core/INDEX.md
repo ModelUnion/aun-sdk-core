@@ -1,6 +1,6 @@
 # AUN SDK 文档索引
 
-> 渐进式三层结构。Layer 1 极简地图，总是加载；Layer 2 概念交叉索引，按主题查找时加载；Layer 3 每篇文档的详细摘要，需要深入时加载。
+> 三层索引：Layer 1 文档地图，Layer 2 主题交叉索引，Layer 3 单篇摘要。
 
 ---
 
@@ -8,104 +8,103 @@
 
 | 文档 | 说明 |
 |------|------|
-| [01-快速开始](01-快速开始.md) | 最小示例 · 安装 · 配置 · 核心流程 |
-| [02-WebSocket协议](02-WebSocket协议.md) | 握手流程 · 消息格式 · 裸 WebSocket 示例 |
-| [03-核心概念](03-核心概念.md) | AID · 连接状态机 · 认证流程 · E2EE |
-| [04-连接与认证](04-连接与认证.md) | 创建AID · 连接网关 · 网关发现 · 调用RPC · 事件订阅 |
-| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE加密消息 · ProtectedHeaders · 会话管理 · 自定义密钥存储 |
-| [06-API手册](06-API手册.md) | AUNClient · AuthNamespace · MetaNamespace（信任根列表 / issuer root 更新） · E2EEManager · 内置事件 · RPC手册索引 |
-| [07-错误处理](07-错误处理.md) | 错误类层级 · 错误码速查 · 重试策略 |
-| [08-最佳实践](08-最佳实践.md) | 幂等初始化 · 多AID隔离 · 环境变量 · 资源清理 |
-
-### RPC 手册
-
-| 文档 | 说明 |
-|------|------|
-| [消息Payload参考约定](消息Payload参考约定.md) | `message.send` / `group.send` 共用业务负载格式 · `payload.type` 类型总览 · 附件引用 |
-| [group-rpc-manual](group-rpc-manual.md) | Group 服务 RPC 接口 · 群组创建/加入/成员管理/消息收发 · `payload.type` 负载类型 |
-| [message-rpc-manual](message-rpc-manual.md) | Message 服务 RPC 接口 · 点对点消息发送/拉取/确认 · `payload.type` 负载类型 |
-| [meta-rpc-manual](meta-rpc-manual.md) | Meta 服务 RPC 接口 · ping/status/信任根列表与 PKI 下载端点 |
-| [storage-rpc-manual](storage-rpc-manual.md) | Storage 服务 RPC 接口 · 文件上传/下载/对象管理 |
-| [stream-rpc-manual](stream-rpc-manual.md) | Stream 服务 RPC 接口 · 流式数据传输 |
+| [01-快速开始](01-快速开始.md) | 安装 · 三主体模型 · 最小示例 · 多语言构造 |
+| [02-WebSocket协议](02-WebSocket协议.md) | 握手流程 · JSON-RPC 消息格式 · 裸 WebSocket 示例 |
+| [03-核心概念](03-核心概念.md) | AID · AIDStore · AUNClient · 九态状态机 · E2EE |
+| [04-连接与认证](04-连接与认证.md) | 注册加载 · 认证连接 · 网关发现 · 事件 · agent.md |
+| [05-E2EE加密通信](05-E2EE加密通信.md) | E2EE 消息 · ProtectedHeaders · 密钥管理 · 高级存储 |
+| [E2EE_V2消息通信时序图](E2EE_V2消息通信时序图.md) | V2 P2P/GROUP 明文与加密主链路 |
+| [06-API手册](06-API手册.md) | AIDStore · AID · AUNClient · 事件 · E2EE 高级 API · RPC 索引 |
+| [07-错误处理](07-错误处理.md) | Result · 错误类层级 · 错误码 · 重试 |
+| [08-最佳实践](08-最佳实践.md) | 幂等连接 · 多 AID · 资源清理 · 测试数据保护 |
+| [09-payload-reference](09-payload-reference.md) | message / group / thought payload 格式 |
+| [09-message-rpc-manual](09-message-rpc-manual.md) | P2P 消息 RPC |
+| [09-group-rpc-manual](09-group-rpc-manual.md) | 群组 RPC |
+| [09-storage-rpc-manual](09-storage-rpc-manual.md) | 存储 RPC |
+| [09-meta-rpc-manual](09-meta-rpc-manual.md) | meta RPC 和信任根 |
+| [09-stream-rpc-manual](09-stream-rpc-manual.md) | stream RPC |
+| [09-custody-api-manual](09-custody-api-manual.md) | 可选 AID 托管 HTTP API |
 
 ---
 
 ## Layer 2：概念交叉索引
 
 ### 身份与认证
-- **AID 格式与结构** → [03-核心概念](03-核心概念.md)
-- **创建 AID** → [04-连接与认证](04-连接与认证.md) · [06-API手册](06-API手册.md)
-- **认证流程（挑战-应答）** → [03-核心概念](03-核心概念.md)
-- **认证失败处理** → [07-错误处理](07-错误处理.md)
 
-### 连接与协议
-- **WebSocket 握手协议** → [02-WebSocket协议](02-WebSocket协议.md)
-- **状态机（4 状态）** → [03-核心概念](03-核心概念.md)
-- **连接网关** → [04-连接与认证](04-连接与认证.md)
-- **网关自动发现** → [04-连接与认证](04-连接与认证.md)
-- **连接状态事件** → [06-API手册](06-API手册.md)
+- AID 格式、证书、不可变值对象 → [03-核心概念](03-核心概念.md)
+- `AIDStore.register()` / `load()` / `exists()` / `resolve()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
+- AID 构造约束与多语言入口 → [01-快速开始](01-快速开始.md)、[06-API手册](06-API手册.md)
+- 认证链路和 token → [03-核心概念](03-核心概念.md)、[04-连接与认证](04-连接与认证.md)
+- AID 托管恢复 / 跨设备复制 → [09-custody-api-manual](09-custody-api-manual.md)
 
-### E2EE 端到端加密
-- **E2EE 机制概述** → [03-核心概念](03-核心概念.md)
-- **加密消息收发** → [05-E2EE加密通信](05-E2EE加密通信.md)
-- **会话管理** → [05-E2EE加密通信](05-E2EE加密通信.md)
-- **E2EEManager API** → [06-API手册](06-API手册.md)
-- **E2EE 错误类** → [07-错误处理](07-错误处理.md)
-- **E2EE 幂等运行** → [08-最佳实践](08-最佳实践.md)
+### 连接与状态
 
-### RPC 调用与事件
-- **`client.call()` 模式** → [04-连接与认证](04-连接与认证.md)
-- **`client.on()` 事件订阅** → [04-连接与认证](04-连接与认证.md)
-- **裸 WebSocket RPC 调用** → [02-WebSocket协议](02-WebSocket协议.md)
-- **内置事件列表** → [06-API手册](06-API手册.md)
-- **RPC 手册索引** → [06-API手册](06-API手册.md)
-- **消息 payload 类型总览与格式约定** → [消息Payload参考约定](消息Payload参考约定.md)
-- **Group RPC 与群消息收发** → [group-rpc-manual](group-rpc-manual.md)
-- **Message RPC 与 P2P 消息收发** → [message-rpc-manual](message-rpc-manual.md)
-- **Meta RPC** → [meta-rpc-manual](meta-rpc-manual.md)
-- **Storage RPC** → [storage-rpc-manual](storage-rpc-manual.md)
-- **Stream RPC** → [stream-rpc-manual](stream-rpc-manual.md)
+- 九态状态机、device_id / slot_id 隔离键 → [03-核心概念](03-核心概念.md)
+- `connect()` 选项、长短连接、网关发现 → [04-连接与认证](04-连接与认证.md)
+- capability getter、事件、生命周期 API → [06-API手册](06-API手册.md)
+- 裸 WebSocket 握手 → [02-WebSocket协议](02-WebSocket协议.md)
 
-### 配置与存储
-- **构造参数** → [01-快速开始](01-快速开始.md)
-- **数据目录布局** → [01-快速开始](01-快速开始.md)
-- **自定义 KeyStore** → [05-E2EE加密通信](05-E2EE加密通信.md)
-- **自定义 SecretStore** → [05-E2EE加密通信](05-E2EE加密通信.md)
-- **多 AID 隔离** → [08-最佳实践](08-最佳实践.md)
-- **环境变量配置** → [08-最佳实践](08-最佳实践.md)
+### E2EE
 
-### 错误处理
-- **错误类层级** → [07-错误处理](07-错误处理.md)
-- **错误码对照表** → [07-错误处理](07-错误处理.md)
-- **重试策略** → [07-错误处理](07-错误处理.md)
+- E2EE 原理和默认行为 → [03-核心概念](03-核心概念.md)
+- ProtectedHeaders、prekey、replay guard → [05-E2EE加密通信](05-E2EE加密通信.md)
+- V2 P2P/GROUP 时序 → [E2EE_V2消息通信时序图](E2EE_V2消息通信时序图.md)
+- 高级 E2EE API → [06-API手册](06-API手册.md)
+- 解密失败排查 → [07-错误处理](07-错误处理.md)
+
+### RPC 与事件
+
+- `client.call()` / `client.on()` → [04-连接与认证](04-连接与认证.md)、[06-API手册](06-API手册.md)
+- Message RPC → [09-message-rpc-manual](09-message-rpc-manual.md)
+- Group RPC → [09-group-rpc-manual](09-group-rpc-manual.md)
+- Storage RPC → [09-storage-rpc-manual](09-storage-rpc-manual.md)
+- Meta RPC → [09-meta-rpc-manual](09-meta-rpc-manual.md)
+- Stream RPC → [09-stream-rpc-manual](09-stream-rpc-manual.md)
+- Payload 格式 → [09-payload-reference](09-payload-reference.md)
+
+### 错误与测试
+
+- Result 与异常层级 → [07-错误处理](07-错误处理.md)
+- 重试策略 → [07-错误处理](07-错误处理.md)
+- 幂等连接、多 AID、资源清理 → [08-最佳实践](08-最佳实践.md)
+- 集成 / E2E 运行顺序 → [../aun测试运行指南.md](../aun测试运行指南.md)
 
 ---
 
-## Layer 3：文档详细摘要
+## Layer 3：文档摘要
 
 ### 01-快速开始
-入门文档。双客户端最小可运行示例（创建 AID → 认证 → 连接 → 消息收发 → 关闭），pip 安装命令，AUNClient 构造参数，数据目录布局。
+
+说明安装、三主体模型、Python 最小消息收发示例、`AIDStore` / `AID` / `AUNClient` 的职责和 TS/JS/Go 构造约束。
 
 ### 02-WebSocket协议
-底层协议细节。连接握手流程（challenge → auth.connect → hello-ok），消息格式（RPC 请求/响应/事件通知），裸 WebSocket 完整示例。适合在其他语言中实现客户端。
+
+说明 Gateway WebSocket 握手、JSON-RPC 请求/响应/通知格式，以及裸 WebSocket 客户端如何借助 SDK 完成 token 获取。
 
 ### 03-核心概念
-SDK 的核心抽象。AID 域名格式身份及本地密钥对管理；连接状态机及自动重连；认证流程（挑战-应答）；E2EE 两级离线加密流程。
+
+解释 AID 身份、三主体职责、device_id / slot_id 隔离键、九态状态机、认证挑战-响应、默认 E2EE 行为和 RPC/事件模型。
 
 ### 04-连接与认证
-SDK 高层封装。`create_aid` + `authenticate` 认证流程；`connect` 参数（含自动重连、心跳、令牌刷新）；`client.call()` RPC 调用模式；`client.on()` 事件订阅。
+
+描述 `AIDStore` 注册加载、`AUNClient` 身份加载、显式认证、连接选项、长短连接共存、网关发现、agent.md 和 RPC 调用。
 
 ### 05-E2EE加密通信
-E2EE 完整收发流程（加密发送 + 监听解密 + 后台消息循环）；`protected_headers` 与可验证 `context` 元数据；密钥管理（prekey 缓存 / replay guard / group epoch）；自定义 `KeyStore` / `SecretStore` Protocol。
+
+覆盖默认加密发送、接收自动解密、ProtectedHeaders、prekey、群 E2EE、replay guard 和高级存储扩展边界。
 
 ### 06-API手册
-完整 API 文档。AUNClient 构造函数/属性/方法；AuthNamespace 方法；E2EEManager 方法；内置事件列表；RPC 手册索引。
+
+列出 AIDStore、AID、AUNClient、事件、E2EE 高级 API 和 RPC 手册索引，包含 Python / TS / JS / Go 的主要命名差异。
 
 ### 07-错误处理
-`AUNError` 基类及子类层级；错误属性；错误码速查表；指数退避重试策略；常见错误场景。
+
+说明 Result 字典、AUNError 异常层级、错误码映射、重试策略和常见错误场景。
 
 ### 08-最佳实践
-幂等连接初始化；安全关闭；E2EE 幂等运行；多 AID 隔离；环境变量驱动配置；资源清理。
 
-### 消息Payload参考约定
-`message.send` 和 `group.send` 共用的业务 payload 约定。包含 `payload.type` 类型总览、信封字段边界、公共辅助字段、提及语义、各类型字段格式、附件引用规范和降级处理建议。
+给出幂等加载身份、连接、关闭、多 AID 管理、protected_headers、Flow Control 和测试数据保护建议。
+
+### 09-*-rpc-manual
+
+各业务服务的 RPC 参数、响应和错误语义。SDK 不为每个 RPC 提供一层业务 wrapper，应用直接通过 `client.call()` 调用。

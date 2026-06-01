@@ -85,10 +85,10 @@ def test_resolve_profile_initializes_current_tab(tmp_path, monkeypatch):
 def test_doctor_private_key_check_uses_keystore_split_format(tmp_path):
     from aun_cli.commands.diag import _check_private_key
     from aun_core.crypto import CryptoProvider
-    from aun_core.keystore.file import FileKeyStore
+    from aun_core.keystore.local_identity_store import LocalIdentityStore
 
     aid = "alice.agentid.pub"
-    keystore = FileKeyStore(tmp_path)
+    keystore = LocalIdentityStore(tmp_path)
     try:
         keystore.save_key_pair(aid, CryptoProvider().generate_identity())
     finally:

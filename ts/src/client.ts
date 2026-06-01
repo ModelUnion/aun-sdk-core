@@ -12,10 +12,8 @@
  */
 
 import * as crypto from 'node:crypto';
-import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
-import * as path from 'node:path';
 import { URL } from 'node:url';
 
 import { configFromMap, getDeviceId, normalizeInstanceId, normalizeSlotId, slotIsolationKey, type AUNConfig } from './config.js';
@@ -35,13 +33,14 @@ import {
   ValidationError,
 } from './errors.js';
 import { EventDispatcher, type EventPayload, type Subscription, type EventHandler } from './events.js';
-import { FileKeyStore } from './keystore/file.js';
+import { LocalTokenStore } from './keystore/local-token-store.js';
 import type { TokenStore } from './keystore/index.js';
 import { AUNLogger, type ModuleLogger } from './logger.js';
 import { normalizeGroupId } from './group-id.js';
 
 import { RPCTransport } from './transport.js';
 import { AuthFlow } from './auth.js';
+import { AgentMdManager } from './agent-md.js';
 import { SeqTracker } from './seq-tracker.js';
 import { V2Session, V2KeyStore, type CallFn } from './v2/session/index.js';
 import {
@@ -63,15 +62,6 @@ import {
   STATE_TO_PUBLIC,
 } from './types.js';
 import { AID } from './aid.js';
-
-type AgentMdFetchResult = {
-  aid: string;
-  content: string;
-  signature: Record<string, unknown>;
-  in_sync: boolean | null;
-  saved_to: string | null;
-  save_error: string | null;
-};
 
 function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
   return Boolean(value && typeof (value as { then?: unknown }).then === 'function');
@@ -369,7 +359,6 @@ const SIGNED_METHODS = new Set([
 
 /** peer 证书缓存 TTL（1 小时） */
 const PEER_CERT_CACHE_TTL = 3600;
-const AGENT_MD_HTTP_TIMEOUT_MS = 30_000;
 
 // ── 内部类型 ──────────────────────────────────────────────────
 
@@ -589,35 +578,105 @@ function lengthPrefixedBytesKey(...parts: Uint8Array[]): Buffer {
   return Buffer.concat(chunks);
 }
 
-function agentMdHttpScheme(gatewayUrl: string): string {
-  const raw = String(gatewayUrl ?? '').trim().toLowerCase();
-  return raw.startsWith('ws://') ? 'http' : 'https';
-}
+function createAgentMdManagerForRuntime(opts: {
+  config: () => AUNConfig;
+  logger: () => ModuleLogger;
+  ownerAid: () => string | null;
+  currentAid: () => AID | null;
+  gateway: {
+    resolve: (aid: string) => Promise<string>;
+    set: (gatewayUrl: string) => void;
+    get: () => string | null;
+  };
+  identity: {
+    get: () => IdentityRecord | null;
+    set: (identity: IdentityRecord | null) => void;
+  };
+  auth: () => AuthFlow;
+  tokenStore: () => TokenStore;
+  fetchPeerCert: (aid: string) => Promise<string>;
+}): AgentMdManager {
+  return new AgentMdManager({
+    aunPath: opts.config().aunPath,
+    verifySsl: opts.config().verifySsl,
+    discoveryPort: opts.config().discoveryPort,
+    logger: opts.logger(),
+    ownerAidGetter: opts.ownerAid,
+    currentAidGetter: opts.currentAid,
+    gatewayResolver: async (aid) => {
+      const gatewayUrl = await opts.gateway.resolve(aid);
+      opts.gateway.set(gatewayUrl);
+      return gatewayUrl;
+    },
+    accessTokenResolver: async (aid, gatewayUrl) => {
+      const target = String(aid ?? '').trim();
+      let identity = opts.identity.get();
+      if (!identity || String(identity.aid ?? '') !== target) {
+        throw new StateError('no local identity found, register or load an AID first');
+      }
 
-function agentMdAuthority(aid: string, discoveryPort: number | null | undefined): string {
-  const host = String(aid ?? '').trim();
-  if (!host) return '';
-  if (discoveryPort && !host.includes(':')) return `${host}:${discoveryPort}`;
-  return host;
-}
+      const auth = opts.auth();
+      const cachedToken = String(identity.access_token ?? '');
+      const expiresAt = auth.getAccessTokenExpiry(identity);
+      if (cachedToken && (expiresAt === null || expiresAt > Date.now() / 1000 + 30)) {
+        return cachedToken;
+      }
 
-async function fetchWithTimeout(
-  input: string,
-  init: RequestInit,
-  timeoutMs = AGENT_MD_HTTP_TIMEOUT_MS,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(input, { ...init, signal: controller.signal });
-  } catch (error) {
-    if (controller.signal.aborted) {
-      throw new AUNError(`agent.md request timed out after ${timeoutMs}ms`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+      if (identity.refresh_token) {
+        try {
+          const refreshed = await auth.refreshCachedTokens(gatewayUrl, identity);
+          const refreshedToken = String(refreshed.access_token ?? '');
+          const refreshedExpiry = auth.getAccessTokenExpiry(refreshed);
+          if (refreshedToken && (refreshedExpiry === null || refreshedExpiry > Date.now() / 1000 + 30)) {
+            opts.identity.set(refreshed);
+            return refreshedToken;
+          }
+        } catch {
+          // refresh 失败时回退到完整 authenticate。
+        }
+      }
+
+      const result = await auth.authenticate(gatewayUrl, { aid: target });
+      const token = String(result.access_token ?? '');
+      if (!token) throw new StateError('authenticate did not return access_token');
+      identity = auth.loadIdentityOrNone(target) ?? {
+        ...identity,
+        access_token: token,
+        refresh_token: String(result.refresh_token ?? identity.refresh_token ?? ''),
+        access_token_expires_at: typeof result.expires_at === 'number' ? result.expires_at : identity.access_token_expires_at,
+        token_exp: typeof result.expires_at === 'number' ? result.expires_at : identity.token_exp,
+        expires_at: typeof result.expires_at === 'number' ? result.expires_at : identity.expires_at,
+      };
+      opts.identity.set(identity);
+      return token;
+    },
+    peerResolver: async (aid) => {
+      const target = String(aid ?? '').trim();
+      const current = opts.currentAid();
+      if (current?.aid === target) return current;
+      let certPem = '';
+      try {
+        certPem = String(opts.tokenStore().loadCert(target) ?? '').trim();
+      } catch {
+        certPem = '';
+      }
+      if (!certPem) {
+        if (!opts.gateway.get()) {
+          try { opts.gateway.set(await opts.gateway.resolve(target)); } catch { /* best effort before cert fetch */ }
+        }
+        certPem = String(await opts.fetchPeerCert(target) ?? '').trim();
+      }
+      if (!certPem) throw new NotFoundError(`certificate not found for aid: ${target}`);
+      return AID._create({
+        aid: target,
+        aunPath: opts.config().aunPath,
+        certPem,
+        privateKeyPem: null,
+        certValid: true,
+        privateKeyValid: false,
+      });
+    },
+  });
 }
 
 export class AUNClient {
@@ -686,17 +745,7 @@ export class AUNClient {
   /** peer 证书缓存 */
   private _certCache: Map<string, CachedPeerCert> = new Map();
 
-  // AIDs 目录：{agentMdPath}/{aid}/agentmd.json 保存元数据，{agentMdPath}/{aid}/agent.md 保存正文。
-  private _agentMdPath: string = '';
-  private _localAgentMdPath: string = '';
-  private _localAgentMdEtag: string = '';
-  // gateway 在 RPC envelope._meta.agent_md_etag 注入的服务端 etag；纯观察，无下游依赖。
-  private _remoteAgentMdEtag: string = '';
-  private _agentMdCache: Map<string, Record<string, unknown>> = new Map();
-  private _agentMdFetchInflight: Map<string, Promise<AgentMdFetchResult>> = new Map();
-  private _agentMdDownloadInflight: Map<string, Promise<string>> = new Map();
-  private _agentMdDownloadActive = 0;
-  private _agentMdDownloadWaiters: Array<() => void> = [];
+  private _agentMdManager!: AgentMdManager;
 
   /** 消息序列号跟踪器（群消息 + P2P 空洞检测） */
   private _seqTracker: SeqTracker = new SeqTracker();
@@ -753,8 +802,6 @@ export class AUNClient {
   private _peerCache = new Map<string, AID>();
   private static readonly V2_SIG_CACHE_TTL_MS = 60 * 60 * 1000;
   private static readonly V2_SIG_CACHE_MAX = 16_384;
-  private static readonly AGENT_MD_DOWNLOAD_CONCURRENCY = 8;
-
   private _reconnectActive = false;
   private _reconnectAbort: AbortController | null = null;
   private _serverKicked = false;
@@ -777,7 +824,6 @@ export class AUNClient {
     }
     this._configModel = configFromMap(rawConfig);
     const initAid = (inputAid && inputAid.isPrivateKeyValid()) ? inputAid.aid : null;
-    this._agentMdPath = path.join(this._configModel.aunPath, 'AIDs');
     this.config = {
       aun_path: this._configModel.aunPath,
       root_ca_path: this._configModel.rootCaPath,
@@ -804,11 +850,10 @@ export class AUNClient {
     });
     this._discovery = new GatewayDiscovery({ verifySsl: this._configModel.verifySsl, logger: this._clientLog, net: dnsNet });
 
-    const tokenStore = new FileKeyStore(
+    const tokenStore = new LocalTokenStore(
       this._configModel.aunPath,
       {
         logger: this._logger.for('aun_core.keystore'),
-        secretStoreLogger: this._logger.for('aun_core.secret-store'),
       },
     );
     this._tokenStore = tokenStore;
@@ -829,6 +874,24 @@ export class AUNClient {
       net: dnsNet,
     });
     this._aid = initAid;
+    this._agentMdManager = createAgentMdManagerForRuntime({
+      config: () => this._configModel,
+      logger: () => this._logger.for('aun_core.agent_md'),
+      ownerAid: () => this._aid,
+      currentAid: () => this._currentAid,
+      gateway: {
+        resolve: (target) => this._resolveGatewayForAid(target),
+        get: () => this._gatewayUrl,
+        set: (gatewayUrl) => { this._gatewayUrl = gatewayUrl; },
+      },
+      identity: {
+        get: () => this._identity,
+        set: (identity) => { this._identity = identity; },
+      },
+      auth: () => this._auth,
+      tokenStore: () => this._tokenStore,
+      fetchPeerCert: (target) => this._fetchPeerCert(target),
+    });
 
     this._transport = new RPCTransport({
       eventDispatcher: this._dispatcher,
@@ -968,10 +1031,6 @@ export class AUNClient {
     this.config.aun_path = nextConfig.aunPath;
     this.config.root_ca_path = nextConfig.rootCaPath;
     this.config.seed_password = nextConfig.seedPassword;
-    this._agentMdPath = path.join(nextConfig.aunPath, 'AIDs');
-    this._agentMdCache.clear();
-    this._agentMdFetchInflight.clear();
-    this._agentMdDownloadInflight.clear();
     this._peerCache.clear();
     this._certCache.clear();
     this._gatewayUrl = null;
@@ -990,11 +1049,10 @@ export class AUNClient {
     });
     this._discovery = new GatewayDiscovery({ verifySsl: nextConfig.verifySsl, logger: this._clientLog, net: dnsNet });
 
-    const tokenStore = new FileKeyStore(
+    const tokenStore = new LocalTokenStore(
       nextConfig.aunPath,
       {
         logger: this._logger.for('aun_core.keystore'),
-        secretStoreLogger: this._logger.for('aun_core.secret-store'),
       },
     );
     this._tokenStore = tokenStore;
@@ -1008,6 +1066,24 @@ export class AUNClient {
       verifySsl: nextConfig.verifySsl,
       logger: this._logger.for('aun_core.auth'),
       net: dnsNet,
+    });
+    this._agentMdManager = createAgentMdManagerForRuntime({
+      config: () => this._configModel,
+      logger: () => this._logger.for('aun_core.agent_md'),
+      ownerAid: () => this._aid,
+      currentAid: () => this._currentAid,
+      gateway: {
+        resolve: (target) => this._resolveGatewayForAid(target),
+        get: () => this._gatewayUrl,
+        set: (gatewayUrl) => { this._gatewayUrl = gatewayUrl; },
+      },
+      identity: {
+        get: () => this._identity,
+        set: (identity) => { this._identity = identity; },
+      },
+      auth: () => this._auth,
+      tokenStore: () => this._tokenStore,
+      fetchPeerCert: (target) => this._fetchPeerCert(target),
     });
 
     this._transport = new RPCTransport({
@@ -1095,750 +1171,13 @@ export class AUNClient {
     return [...this._peerCache.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, v]) => v);
   }
 
-  private async _resolveAgentMdUrl(aid: string): Promise<string> {
-    const target = String(aid ?? '').trim();
-    if (!target) throw new ValidationError('agent.md requires non-empty aid');
-    let gatewayUrl = String(this._gatewayUrl ?? '').trim();
-    if (!gatewayUrl) {
-      try {
-        gatewayUrl = await this._resolveGatewayForAid(target);
-      } catch {
-        gatewayUrl = '';
-      }
-    }
-    return `${agentMdHttpScheme(gatewayUrl)}://${agentMdAuthority(target, this._configModel.discoveryPort)}/agent.md`;
-  }
-
-  private async _ensureAgentMdUploadToken(aid: string, gatewayUrl: string): Promise<string> {
-    let identity = this._identity && String(this._identity.aid ?? '') === aid ? this._identity : null;
-    if (!identity) {
-      throw new StateError('no local identity found, register or load an AID first');
-    }
-
-    const cachedToken = String(identity.access_token ?? '');
-    const expiresAt = this._auth.getAccessTokenExpiry(identity);
-    if (cachedToken && (expiresAt === null || expiresAt > Date.now() / 1000 + 30)) {
-      return cachedToken;
-    }
-
-    if (identity.refresh_token) {
-      try {
-        const refreshed = await this._auth.refreshCachedTokens(gatewayUrl, identity);
-        const refreshedToken = String(refreshed.access_token ?? '');
-        const refreshedExpiry = this._auth.getAccessTokenExpiry(refreshed);
-        if (refreshedToken && (refreshedExpiry === null || refreshedExpiry > Date.now() / 1000 + 30)) {
-          this._identity = refreshed;
-          return refreshedToken;
-        }
-      } catch {
-        // refresh 失败时回退到完整 authenticate。
-      }
-    }
-
-    const result = await this._auth.authenticate(gatewayUrl, { aid });
-    const token = String(result.access_token ?? '');
-    if (!token) throw new StateError('authenticate did not return access_token');
-    this._identity = this._auth.loadIdentityOrNone(aid) ?? {
-      ...identity,
-      access_token: token,
-      refresh_token: String(result.refresh_token ?? identity.refresh_token ?? ''),
-      access_token_expires_at: typeof result.expires_at === 'number' ? result.expires_at : identity.access_token_expires_at,
-      token_exp: typeof result.expires_at === 'number' ? result.expires_at : identity.token_exp,
-      expires_at: typeof result.expires_at === 'number' ? result.expires_at : identity.expires_at,
-    };
-    return token;
-  }
-
-  private async _uploadAgentMd(content: string): Promise<Record<string, unknown>> {
-    const target = String(this._aid ?? this._currentAid?.aid ?? '').trim();
-    if (!target) throw new StateError('uploadAgentMd requires local AID');
-    const gatewayUrl = await this._resolveGatewayForAid(target);
-    this._gatewayUrl = gatewayUrl;
-    const token = await this._ensureAgentMdUploadToken(target, gatewayUrl);
-    const response = await fetchWithTimeout(await this._resolveAgentMdUrl(target), {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'text/markdown; charset=utf-8',
-      },
-      body: content,
-    });
-
-    if (response.status === 404) {
-      throw new NotFoundError(`agent.md endpoint not found for aid: ${target}`);
-    }
-    if (!response.ok) {
-      const message = (await response.text()).trim();
-      throw new AUNError(`upload agent.md failed: HTTP ${response.status}${message ? ` - ${message}` : ''}`);
-    }
-    const payload = await response.json() as JsonValue;
-    if (!isJsonObject(payload)) throw new AUNError('upload agent.md returned invalid JSON payload');
-    return payload as Record<string, unknown>;
-  }
-
-  private async _acquireAgentMdDownloadSlot(): Promise<() => void> {
-    if (this._agentMdDownloadActive < AUNClient.AGENT_MD_DOWNLOAD_CONCURRENCY) {
-      this._agentMdDownloadActive += 1;
-      return () => this._releaseAgentMdDownloadSlot();
-    }
-    await new Promise<void>((resolve) => {
-      this._agentMdDownloadWaiters.push(resolve);
-    });
-    return () => this._releaseAgentMdDownloadSlot();
-  }
-
-  private _releaseAgentMdDownloadSlot(): void {
-    const next = this._agentMdDownloadWaiters.shift();
-    if (next) {
-      next();
-      return;
-    }
-    if (this._agentMdDownloadActive > 0) this._agentMdDownloadActive -= 1;
-  }
-
-  private async _downloadAgentMd(aid: string): Promise<string> {
-    const target = String(aid ?? '').trim();
-    if (!target) throw new ValidationError('downloadAgentMd requires non-empty aid');
-    const existing = this._agentMdDownloadInflight.get(target);
-    if (existing) return await existing;
-
-    const task = (async () => {
-      const release = await this._acquireAgentMdDownloadSlot();
-      try {
-        return await this._downloadAgentMdOnce(target);
-      } finally {
-        release();
-      }
-    })();
-    this._agentMdDownloadInflight.set(target, task);
-    task.finally(() => {
-      if (this._agentMdDownloadInflight.get(target) === task) {
-        this._agentMdDownloadInflight.delete(target);
-      }
-    }).catch(() => undefined);
-    return await task;
-  }
-
-  private async _downloadAgentMdOnce(target: string): Promise<string> {
-    const cached = this._agentMdCache.get(target);
-    const url = await this._resolveAgentMdUrl(target);
-    let response = await fetchWithTimeout(url, {
-      method: 'GET',
-      headers: { Accept: 'text/markdown' },
-      redirect: 'follow',
-    });
-
-    if (response.status === 304 && typeof cached?.text === 'string') {
-      return String(cached.text);
-    }
-    if (response.status === 304) {
-      response = await fetchWithTimeout(url, {
-        method: 'GET',
-        headers: { Accept: 'text/markdown' },
-        cache: 'reload',
-        redirect: 'follow',
-      });
-    }
-    if (response.status === 404) {
-      throw new NotFoundError(`agent.md not found for aid: ${target}`);
-    }
-    if (!response.ok) {
-      const message = (await response.text()).trim();
-      throw new AUNError(`download agent.md failed: HTTP ${response.status}${message ? ` - ${message}` : ''}`);
-    }
-    const text = await response.text();
-    const etag = String(response.headers?.get('ETag') ?? response.headers?.get('etag') ?? '').trim();
-    const lastModified = String(response.headers?.get('Last-Modified') ?? response.headers?.get('last-modified') ?? '').trim();
-    this._agentMdCache.set(target, {
-      ...(cached ?? {}),
-      text,
-      etag,
-      lastModified,
-      remote_etag: etag,
-      last_modified: lastModified,
-    });
-    return text;
-  }
-
-  private async _headAgentMd(aid: string): Promise<Record<string, unknown>> {
-    const target = String(aid ?? '').trim();
-    if (!target) throw new ValidationError('headAgentMd requires non-empty aid');
-    const response = await fetchWithTimeout(await this._resolveAgentMdUrl(target), {
-      method: 'HEAD',
-      headers: { Accept: 'text/markdown' },
-      redirect: 'follow',
-    }, 15_000);
-    const cached = this._agentMdCache.get(target) ?? {};
-    const etag = String(response.headers?.get('ETag') ?? response.headers?.get('etag') ?? '').trim();
-    const lastModified = String(response.headers?.get('Last-Modified') ?? response.headers?.get('last-modified') ?? '').trim();
-    if (response.status === 404) {
-      return { aid: target, found: false, etag: '', last_modified: '', status: 404 };
-    }
-    const resultEtag = response.status === 304 ? (etag || String(cached.etag ?? cached.remote_etag ?? '')) : etag;
-    const resultLastModified = response.status === 304 ? (lastModified || String(cached.lastModified ?? cached.last_modified ?? '')) : lastModified;
-    if (response.status < 200 || (response.status >= 300 && response.status !== 304)) {
-      throw new AUNError(`head agent.md failed: HTTP ${response.status}`);
-    }
-    this._agentMdCache.set(target, {
-      ...cached,
-      etag: resultEtag,
-      lastModified: resultLastModified,
-      remote_etag: resultEtag,
-      last_modified: resultLastModified,
-    });
-    return { aid: target, found: true, etag: resultEtag, last_modified: resultLastModified, status: response.status };
-  }
-
-  private async _verifyAgentMd(content: string, aid: string, certPem?: string | null): Promise<Record<string, unknown>> {
-    const target = String(aid ?? '').trim();
-    if (!target) throw new ValidationError('verifyAgentMd requires non-empty aid');
-    let peer = target === this._currentAid?.aid ? this._currentAid : null;
-    if (!peer) {
-      let resolvedCert = String(certPem ?? '').trim();
-      if (!resolvedCert) {
-        try {
-          resolvedCert = String(this._tokenStore.loadCert(target) ?? '').trim();
-        } catch {
-          resolvedCert = '';
-        }
-      }
-      if (!resolvedCert) {
-        if (!this._gatewayUrl) {
-          try { this._gatewayUrl = await this._resolveGatewayForAid(target); } catch { /* best-effort before cert fetch */ }
-        }
-        resolvedCert = String(await this._fetchPeerCert(target) ?? '').trim();
-      }
-      if (!resolvedCert) throw new NotFoundError(`certificate not found for aid: ${target}`);
-      peer = AID._create({
-        aid: target,
-        aunPath: this._configModel.aunPath,
-        certPem: resolvedCert,
-        privateKeyPem: null,
-        certValid: true,
-        privateKeyValid: false,
-      });
-    }
-    const result = peer.verifyAgentMd(content);
-    if (!result.ok) throw new AUNError((result as { ok: false; error: { message: string } }).error.message);
-    const vd = (result as { ok: true; data: { status: string; payload?: string; aid?: string } }).data;
-    return { ...vd, verified: vd.status === 'verified' };
-  }
-
-  /**
-   * 读取 {agentMdPath}/{self_aid}/agent.md，签名后上传，并把签名结果原子写回本地。
-   */
-  async publishAgentMd(): Promise<Record<string, unknown>> {
-    const target = this._agentMdOwnerAid();
-    if (!target || !this._currentAid) {
-      throw new ValidationError('publishAgentMd requires local AID');
-    }
-    const content = this._readAgentMdContent(target);
-    const signed = this._currentAid?.signAgentMd(content);
-    if (!signed?.ok) {
-      throw new StateError((signed as { ok: false; error: { message: string } } | undefined)?.error.message ?? 'publishAgentMd requires a valid local AID private key');
-    }
-    const signedContent = signed.data.signed;
-    const result = await this._uploadAgentMd(signedContent);
-    this._localAgentMdEtag = this._agentMdContentEtag(signedContent);
-    const remoteEtag = isJsonObject(result) ? String(result.etag ?? '').trim() : '';
-    if (remoteEtag) this._remoteAgentMdEtag = remoteEtag;
-    this._saveAgentMdRecord(target, {
-      content: signedContent,
-      local_etag: this._localAgentMdEtag,
-      remote_etag: remoteEtag || undefined,
-      last_modified: isJsonObject(result) ? String(result.last_modified ?? '').trim() : '',
-      fetched_at: Date.now(),
-      remote_status: remoteEtag ? 'found' : 'unknown',
-      last_error: '',
-    });
-    return result as Record<string, unknown>;
-  }
-
-  private async _startAgentMdFetchTask(target: string): Promise<AgentMdFetchResult> {
-    const existing = this._agentMdFetchInflight.get(target);
-    if (existing) {
-      return await existing;
-    }
-
-    const task = this._fetchAgentMdOnce(target);
-    this._agentMdFetchInflight.set(target, task);
-    task.finally(() => {
-      if (this._agentMdFetchInflight.get(target) === task) {
-        this._agentMdFetchInflight.delete(target);
-      }
-    }).catch(() => undefined);
-    return await task;
-  }
-
-  private async _fetchAgentMdOnce(target: string): Promise<AgentMdFetchResult> {
-    const content = await this._downloadAgentMd(target);
-    const signature = await this._verifyAgentMd(content, target);
-
-    const isSelf = target === (this._aid ?? '');
-    const localEtag = this._agentMdContentEtag(content);
-    const cacheMeta = this._agentMdAuthCacheMeta(target);
-    const remoteEtag = String(cacheMeta.etag ?? '').trim();
-    const lastModified = String(cacheMeta.lastModified ?? cacheMeta.last_modified ?? '').trim();
-    if (isSelf) {
-      this._localAgentMdEtag = localEtag;
-      if (remoteEtag) this._remoteAgentMdEtag = remoteEtag;
-    }
-    const saved = this._saveAgentMdRecord(target, {
-      content,
-      local_etag: localEtag,
-      remote_etag: remoteEtag || undefined,
-      last_modified: lastModified || undefined,
-      fetched_at: Date.now(),
-      remote_status: 'found',
-      verify_status: isJsonObject(signature) ? String(signature.status ?? '') : '',
-      verify_error: isJsonObject(signature) ? String(signature.reason ?? '') : '',
-      last_error: '',
-    });
-    let inSync: boolean | null = null;
-    if (isSelf) {
-      const remote = remoteEtag || this._remoteAgentMdEtag || '';
-      inSync = localEtag && remote ? localEtag === remote : false;
-    }
-
-    return {
-      aid: target,
-      content,
-      signature: signature as Record<string, unknown>,
-      in_sync: inSync,
-      saved_to: String(saved.saved_to ?? this._agentMdFilePath(target)),
-      save_error: null,
-    };
-  }
-
-  /**
-   * 设置 agent.md 本地存储根目录；为空时恢复默认 {aun_path}/AIDs。
-   */
-  private _setAgentMdRoot(root?: string | null): string {
-    const raw = String(root ?? '').trim();
-    const next = raw || path.join(this._configModel.aunPath, 'AIDs');
-    fs.mkdirSync(next, { recursive: true });
-    this._agentMdPath = next;
-    this._agentMdCache.clear();
-    return this._agentMdPath;
-  }
-
-  /** 返回本地 agent.md 文件的 etag；未设置或读取失败时返回空串。 */
-  getLocalAgentMdEtag(): string {
-    return this._localAgentMdEtag;
-  }
-
-  /**
-   * 返回 gateway 在最近一次 RPC envelope._meta 注入的服务端 agent.md etag。
-   *
-   * 未收到过则为空串；不阻塞调用，纯内存读。
-   */
-  getRemoteAgentMdEtag(): string {
-    return this._remoteAgentMdEtag;
-  }
-
-
-  private _agentMdContentEtag(content: string): string {
-    return `"${crypto.createHash('sha256').update(String(content ?? ''), 'utf-8').digest('hex')}"`;
-  }
-
-  private _agentMdOwnerAid(): string {
-    return String(this._aid ?? '').trim();
-  }
-
-  private _agentMdSafeAid(aid: string): string {
-    const target = String(aid ?? '').trim();
-    if (!target || target.includes('/') || target.includes('\\') || target.includes('\0')) {
-      throw new ValidationError('agent.md aid is empty or contains path separators');
-    }
-    return target;
-  }
-
-  private _agentMdRoot(): string {
-    const root = this._agentMdPath || path.join(this._configModel.aunPath, 'AIDs');
-    fs.mkdirSync(root, { recursive: true });
-    return root;
-  }
-
-  private _agentMdFilePath(aid: string): string {
-    return path.join(this._agentMdRoot(), this._agentMdSafeAid(aid), 'agent.md');
-  }
-
-  private _agentMdMetaPath(aid: string): string {
-    return path.join(this._agentMdRoot(), this._agentMdSafeAid(aid), 'agentmd.json');
-  }
-
-  private _atomicWriteText(filePath: string, content: string): void {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const tmp = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
-    let fd: number | null = null;
-    try {
-      fd = fs.openSync(tmp, 'w');
-      fs.writeFileSync(fd, content, 'utf-8');
-      fs.fsyncSync(fd);
-      fs.closeSync(fd);
-      fd = null;
-      fs.renameSync(tmp, filePath);
-      try {
-        const dirFd = fs.openSync(path.dirname(filePath), 'r');
-        try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
-      } catch { /* best effort */ }
-    } finally {
-      if (fd !== null) {
-        try { fs.closeSync(fd); } catch { /* ignore */ }
-      }
-      if (fs.existsSync(tmp)) {
-        try { fs.unlinkSync(tmp); } catch { /* ignore */ }
-      }
-    }
-  }
-
-  private _sleepSync(ms: number): void {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  }
-
-  private _withAgentMdRecordLock<T>(aid: string, fn: () => T): T {
-    const lockPath = path.join(path.dirname(this._agentMdMetaPath(aid)), 'agentmd.json.lock');
-    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-    const deadline = Date.now() + 5000;
-    let fd: number | null = null;
-    while (fd === null) {
-      try {
-        fd = fs.openSync(lockPath, 'wx');
-        fs.writeFileSync(fd, `${process.pid}\n`, 'utf-8');
-      } catch (err: any) {
-        if (err?.code !== 'EEXIST' || Date.now() >= deadline) throw err;
-        try {
-          const st = fs.statSync(lockPath);
-          if (Date.now() - st.mtimeMs > 30000) fs.unlinkSync(lockPath);
-        } catch { /* ignore */ }
-        this._sleepSync(25);
-      }
-    }
-    try {
-      return fn();
-    } finally {
-      if (fd !== null) {
-        try { fs.closeSync(fd); } catch { /* ignore */ }
-      }
-      try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
-    }
-  }
-
-  private _writeAgentMdRecordUnlocked(aid: string, record: Record<string, unknown>): void {
-    const payload: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(record)) {
-      if (key !== 'content' && value !== undefined && value !== null) payload[key] = value;
-    }
-    payload.aid = this._agentMdSafeAid(aid);
-    this._atomicWriteText(this._agentMdMetaPath(aid), `${JSON.stringify(payload, null, 2)}\n`);
-  }
-
-  private _normalizeAgentMdRecord(aid: string, data: unknown): Record<string, unknown> {
-    if (!isJsonObject(data as JsonValue | object | null | undefined)) return {};
-    const record: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
-      if (key !== 'content') record[key] = value;
-    }
-    record.aid = this._agentMdSafeAid(String(record.aid ?? aid));
-    for (const key of ['fetched_at', 'observed_at', 'checked_at', 'updated_at']) {
-      record[key] = Number(record[key] ?? 0) || 0;
-    }
-    return record;
-  }
-
-  private _readAgentMdRecordUnlocked(aid: string): Record<string, unknown> {
-    const filePath = this._agentMdMetaPath(aid);
-    if (!fs.existsSync(filePath)) return {};
-    try {
-      return this._normalizeAgentMdRecord(aid, JSON.parse(fs.readFileSync(filePath, 'utf-8')));
-    } catch (err) {
-      this._clientLog.warn(`agent.md metadata damaged, ignoring: aid=${aid} err=${err instanceof Error ? err.message : String(err)}`);
-      return {};
-    }
-  }
-
-  private _readAgentMdContent(aid: string): string {
-    return fs.readFileSync(this._agentMdFilePath(aid), 'utf-8');
-  }
-
-  private _writeAgentMdContent(aid: string, content: string): string {
-    const filePath = this._agentMdFilePath(aid);
-    this._atomicWriteText(filePath, String(content ?? ''));
-    return filePath;
-  }
-
-  private _agentMdAuthCacheMeta(aid: string): Record<string, unknown> {
-    try {
-      const record = this._agentMdCache.get(String(aid ?? '').trim());
-      return record && typeof record === 'object' ? { ...record } : {};
-    } catch {
-      return {};
-    }
-  }
-
-  private _loadAgentMdRecord(aid: string): Record<string, unknown> | null {
-    const target = String(aid ?? '').trim();
-    if (!target) return null;
-    try {
-      const loaded = this._withAgentMdRecordLock(target, () => {
-        const record = this._readAgentMdRecordUnlocked(target);
-        const next: Record<string, unknown> = Object.keys(record).length > 0 ? { ...record, aid: target } : { aid: target };
-        try {
-          const content = this._readAgentMdContent(target);
-          next.content = content;
-          next.local_etag = this._agentMdContentEtag(content);
-        } catch (err) {
-          if (fs.existsSync(this._agentMdMetaPath(target))) {
-            this._clientLog.warn(`agent.md content read failed: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-        return next;
-      });
-      if (Object.keys(loaded).length <= 1) return null;
-      this._agentMdCache.set(target, { ...loaded });
-      return { ...loaded };
-    } catch (err) {
-      this._clientLog.debug(`agent.md cache load skipped: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
-    }
-    return null;
-  }
-
-  private _saveAgentMdRecord(aid: string, fields: Record<string, unknown>): Record<string, unknown> {
-    const target = String(aid ?? '').trim();
-    if (!target) return {};
-    try {
-      const inputFields: Record<string, unknown> = { ...fields };
-      const hasContent = Object.prototype.hasOwnProperty.call(inputFields, 'content') && inputFields.content !== undefined && inputFields.content !== null;
-      let savedTo = '';
-      const record = this._withAgentMdRecordLock(target, () => {
-        if (hasContent) {
-          const content = String(inputFields.content ?? '');
-          savedTo = this._writeAgentMdContent(target, content);
-          if (!inputFields.local_etag) inputFields.local_etag = this._agentMdContentEtag(content);
-          if (!inputFields.fetched_at) inputFields.fetched_at = Date.now();
-        }
-        delete inputFields.content;
-        const next: Record<string, unknown> = { ...this._readAgentMdRecordUnlocked(target), aid: target };
-        for (const [key, value] of Object.entries(inputFields)) {
-          if (value !== undefined && value !== null) next[key] = value;
-        }
-        next.updated_at = Date.now();
-        this._writeAgentMdRecordUnlocked(target, next);
-        return next;
-      });
-      const loaded: Record<string, unknown> = { ...record };
-      if (hasContent) {
-        loaded.content = String(fields.content ?? '');
-        if (savedTo) loaded.saved_to = savedTo;
-      }
-      this._agentMdCache.set(target, { ...loaded });
-      const owner = this._agentMdOwnerAid();
-      if (target === owner) {
-        const localEtag = String(loaded.local_etag ?? '').trim();
-        const remoteEtag = String(loaded.remote_etag ?? '').trim();
-        if (localEtag) this._localAgentMdEtag = localEtag;
-        if (remoteEtag) this._remoteAgentMdEtag = remoteEtag;
-      }
-      return { ...loaded };
-    } catch (err) {
-      this._clientLog.debug(`agent.md cache save skipped: aid=${target} err=${err instanceof Error ? err.message : String(err)}`);
-    }
-    return {};
-  }
-
-  private _agentMdHasLocalContent(aid: string, record?: Record<string, unknown> | null): boolean {
-    if (record && typeof record.content === 'string' && record.content.length > 0) return true;
-    try {
-      return fs.existsSync(this._agentMdFilePath(aid));
-    } catch {
-      return false;
-    }
-  }
-
-  private _agentMdCheckedAtFresh(checkedAtMs: number, maxUnsyncedDays: number): boolean {
-    const days = Number(maxUnsyncedDays || 0);
-    if (!Number.isFinite(days) || days <= 0) return false;
-    if (!Number.isFinite(checkedAtMs) || checkedAtMs <= 0) return false;
-    return Date.now() - checkedAtMs <= days * 86400000;
-  }
-
-  private _agentMdLastModifiedFresh(lastModified: string, maxUnsyncedDays: number): boolean {
-    const days = Number(maxUnsyncedDays || 0);
-    if (!Number.isFinite(days) || days <= 0) return false;
-    const ts = Date.parse(String(lastModified ?? '').trim());
-    if (!Number.isFinite(ts)) return false;
-    return Date.now() <= ts + days * 86400000;
-  }
-
-  private _scheduleAgentMdFetchIfMissing(aid: string, record?: Record<string, unknown> | null, source = ''): void {
-    const target = String(aid ?? '').trim();
-    if (!target || this._agentMdHasLocalContent(target, record)) return;
-    if (this._agentMdFetchInflight.has(target)) return;
-    void this._startAgentMdFetchTask(target).catch((err) => {
-      this._saveAgentMdRecord(target, {
-        last_error: err instanceof Error ? err.message : String(err),
-        remote_status: 'found',
-      });
-      this._clientLog.debug(`agent.md auto fetch failed: aid=${target} source=${source || '-'} err=${err instanceof Error ? err.message : String(err)}`);
-    });
-  }
-
-  private _observeAgentMdMeta(aid: string, etag = '', lastModified = '', source = ''): void {
-    const target = String(aid ?? '').trim();
-    const remoteEtag = String(etag ?? '').trim();
-    const remoteLastModified = String(lastModified ?? '').trim();
-    if (!target || (!remoteEtag && !remoteLastModified)) return;
-    let before = this._agentMdCache.get(target);
-    if (!before || typeof before !== 'object') before = this._loadAgentMdRecord(target) ?? {};
-    const same =
-      (!remoteEtag || String(before.remote_etag ?? '').trim() === remoteEtag) &&
-      (!remoteLastModified || String(before.last_modified ?? '').trim() === remoteLastModified);
-    let record: Record<string, unknown> = { ...before };
-    if (!same || Object.keys(before).length === 0) {
-      const fields: Record<string, unknown> = {
-        observed_at: Date.now(),
-        remote_status: 'found',
-      };
-      if (remoteEtag) fields.remote_etag = remoteEtag;
-      if (remoteLastModified) fields.last_modified = remoteLastModified;
-      record = this._saveAgentMdRecord(target, fields) || record;
-    }
-    if (target === this._agentMdOwnerAid() && remoteEtag) this._remoteAgentMdEtag = remoteEtag;
-    this._scheduleAgentMdFetchIfMissing(target, record, source);
-    this._clientLog.debug(`agent.md meta observed: aid=${target} etag=${remoteEtag || '-'} last_modified=${remoteLastModified || '-'} source=${source || '-'}`);
-  }
-
-  private _observeAgentMdEtag(aid: string, etag: string, source = ''): void {
-    this._observeAgentMdMeta(aid, etag, '', source);
-  }
-
-  private _observeAgentMdFromEnvelope(envelope: unknown): void {
-    if (!isJsonObject(envelope as JsonValue | object | null | undefined)) return;
-    const env = envelope as JsonObject;
-    if (!isJsonObject(env.agent_md as JsonValue | object | null | undefined)) return;
-    const agentMd = env.agent_md as JsonObject;
-    if (!isJsonObject(agentMd.sender as JsonValue | object | null | undefined)) return;
-    const sender = agentMd.sender as JsonObject;
-    let senderAid = String(sender.aid ?? '').trim();
-    if (!senderAid) {
-      const aad = isJsonObject(env.aad as JsonValue | object | null | undefined) ? env.aad as JsonObject : {};
-      senderAid = String(aad.from ?? env.from ?? '').trim();
-    }
-    this._observeAgentMdMeta(
-      senderAid,
-      String(sender.etag ?? '').trim(),
-      String(sender.last_modified ?? sender.lastModified ?? '').trim(),
-      'envelope',
-    );
-  }
-
-  private async _checkAgentMdCache(aid?: string | null, maxUnsyncedDays = 1): Promise<Record<string, unknown>> {
-    const target = String(aid ?? this._aid ?? '').trim();
-    if (!target) throw new ValidationError('checkAgentMd requires aid (or local AID)');
-    const before = this._loadAgentMdRecord(target) ?? {};
-    const localEtag = String(before.local_etag ?? '').trim();
-    const localFound = !!(Object.keys(before).length > 0 && (String(before.content ?? '') || localEtag));
-    const remoteEtagCached = String(before.remote_etag ?? '').trim();
-    const lastModifiedCached = String(before.last_modified ?? '').trim();
-    const checkedAt = Number(before.checked_at ?? 0);
-    const fetchedAt = Number(before.fetched_at ?? 0);
-    const checkedAtCached = checkedAt > 0 ? checkedAt : fetchedAt;
-    const cachedInSync = !!(localFound && localEtag && remoteEtagCached && localEtag === remoteEtagCached);
-    // max_unsynced_days > 0 且距上次 HEAD 在窗口内 → 直接返回缓存；否则强制 HEAD。
-    if (cachedInSync && this._agentMdCheckedAtFresh(checkedAtCached, maxUnsyncedDays)) {
-      return {
-        aid: target,
-        local_found: true,
-        remote_found: true,
-        local_etag: localEtag,
-        remote_etag: remoteEtagCached,
-        in_sync: true,
-        last_modified: lastModifiedCached,
-        status: 200,
-        cached: true,
-        verify_status: String(before.verify_status ?? ''),
-        verify_error: String(before.verify_error ?? ''),
-      };
-    }
-    const remoteFoundCached = !!(remoteEtagCached || String(before.remote_status ?? '') === 'found');
-    if (
-      !localFound &&
-      !remoteFoundCached &&
-      String(before.remote_status ?? '') === 'missing' &&
-      this._agentMdCheckedAtFresh(checkedAtCached, maxUnsyncedDays)
-    ) {
-      return {
-        aid: target,
-        local_found: false,
-        remote_found: false,
-        local_etag: '',
-        remote_etag: '',
-        in_sync: false,
-        last_modified: '',
-        status: 404,
-        cached: true,
-        verify_status: '',
-        verify_error: '',
-      };
-    }
-
-    const now = Date.now();
-    let remote: Record<string, unknown>;
-    try {
-      remote = await this._headAgentMd(target);
-    } catch (err) {
-      this._saveAgentMdRecord(target, { checked_at: now, remote_status: 'error', last_error: err instanceof Error ? err.message : String(err) });
-      throw err;
-    }
-    const remoteFound = !!remote.found;
-    const remoteEtag = String(remote.etag ?? '').trim();
-    const lastModified = String(remote.last_modified ?? remote.lastModified ?? '').trim();
-    const saved = this._saveAgentMdRecord(target, {
-      remote_etag: remoteFound ? remoteEtag : '',
-      last_modified: lastModified,
-      checked_at: now,
-      remote_status: remoteFound ? 'found' : 'missing',
-      last_error: '',
-    });
-    if (target === this._agentMdOwnerAid() && remoteEtag) this._remoteAgentMdEtag = remoteEtag;
-    const inSync = !!(localFound && remoteFound && localEtag && remoteEtag && localEtag === remoteEtag);
-    return {
-      aid: target,
-      local_found: localFound,
-      remote_found: remoteFound,
-      local_etag: localEtag,
-      remote_etag: remoteEtag,
-      in_sync: inSync,
-      last_modified: lastModified,
-      status: Number(remote.status ?? (remoteFound ? 200 : 404)),
-      cached: false,
-      verify_status: String(saved.verify_status ?? before.verify_status ?? ''),
-      verify_error: String(saved.verify_error ?? before.verify_error ?? ''),
-    };
+  async uploadAgentMd(content?: string | null): Promise<Record<string, unknown>> {
+    return await this._agentMdManager.upload(content);
   }
 
   /** transport 的 meta observer：吸收 gateway 注入的 _meta 字段。失败不影响业务。 */
   private _observeRpcMeta(meta: Record<string, unknown>): void {
-    if (!meta || typeof meta !== 'object') return;
-    const etag = String(meta.agent_md_etag ?? '').trim();
-    if (etag) {
-      this._remoteAgentMdEtag = etag;
-      this._observeAgentMdMeta(this._aid ?? '', etag, '', 'rpc.self');
-    }
-    const etags = meta.agent_md_etags;
-    if (isJsonObject(etags as JsonValue | object | null | undefined)) {
-      // role key 优先级：requester / peer 是新规范，其余是兼容旧 SDK 的别名。
-      for (const key of ['requester', 'peer', 'receiver', 'target', 'to', 'sender', 'from']) {
-        const item = (etags as JsonObject)[key];
-        if (!isJsonObject(item as JsonValue | object | null | undefined)) continue;
-        this._observeAgentMdMeta(
-          String((item as JsonObject).aid ?? ''),
-          String((item as JsonObject).etag ?? ''),
-          String((item as JsonObject).last_modified ?? (item as JsonObject).lastModified ?? ''),
-          `rpc.${key}`,
-        );
-      }
-    }
+    this._agentMdManager.observeRpcMeta(meta, this._aid);
   }
   /** 连接状态 */
   get state(): ConnectionState {
@@ -2791,15 +2130,11 @@ export class AUNClient {
     // 注入本地/远端 agent.md etag，让应用层判断版本一致性；失败不影响业务。
     if (isJsonObject(payload)) {
       try {
-        const localEtag = this._localAgentMdEtag || '';
-        const remoteEtag = this._remoteAgentMdEtag || '';
-        if (localEtag || remoteEtag) {
+        const snapshot = this._agentMdManager.eventSnapshot();
+        if (snapshot) {
           const obj = payload as Record<string, unknown>;
           if (!('_agent_md' in obj)) {
-            obj._agent_md = {
-              local_etag: localEtag,
-              remote_etag: remoteEtag,
-            };
+            obj._agent_md = snapshot;
           }
         }
       } catch (err) {
@@ -4486,7 +3821,7 @@ export class AUNClient {
     }
 
     let identity = this._identity;
-    // 私钥由 AIDStore 管理，直接从 _currentAid 读取明文私钥
+    // 私钥来自当前 AID 值对象，AUNClient 不从持久化存储读取私钥。
     const currentAid = this._currentAid;
     if (!currentAid?.privateKeyPem) {
       this._clientLog.warn('V2 session init skipped: no AID private key');
@@ -5600,7 +4935,7 @@ export class AUNClient {
       return null;
     }
     const e2eeMeta = this._v2E2eeMeta(envelope);
-    this._observeAgentMdFromEnvelope(envelope);
+    this._agentMdManager.observeEnvelope(envelope);
 
     let spkId = '';
     let recipientKeySource = '';
@@ -5809,7 +5144,7 @@ export class AUNClient {
   private _attachV2EnvelopeMetadataFromSource(message: JsonObject, source: unknown): void {
     const envelope = this._extractV2EnvelopeFromSource(source);
     if (envelope) {
-      this._observeAgentMdFromEnvelope(envelope);
+      this._agentMdManager.observeEnvelope(envelope);
       this._attachV2EnvelopeMetadata(message, this._v2E2eeMeta(envelope));
     }
   }
@@ -7300,8 +6635,8 @@ export class AUNClient {
     if ('device_id' in params && String(params.device_id ?? '').trim() !== this._deviceId) {
       throw new ValidationError('message.pull/message.ack device_id must match the current client instance');
     }
-    const slotId = normalizeInstanceId(params.slot_id ?? this._slotId, 'slot_id', { allowEmpty: true });
-    if (slotId !== this._slotId) {
+    const slotId = normalizeSlotId(params.slot_id ?? this._slotId, this._slotId);
+    if (slotIsolationKey(slotId) !== slotIsolationKey(this._slotId)) {
       throw new ValidationError('message.pull/message.ack slot_id must match the current client instance');
     }
     params.device_id = this._deviceId;

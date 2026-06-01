@@ -2,7 +2,7 @@ import 'fake-indexeddb/auto';
 import crypto from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 
-import { AID, AIDStore, AUNClient, ConnectionState, IndexedDBKeyStore, resultErr, resultOk } from '../../src/index.js';
+import { AID, AIDStore, AUNClient, ConnectionState, IndexedDBIdentityStore, resultErr, resultOk } from '../../src/index.js';
 
 function derLength(len: number): Buffer {
   if (len < 0x80) return Buffer.from([len]);
@@ -68,7 +68,7 @@ function makeIdentity(aid: string): { aid: string; private_key_pem: string; publ
 
 async function createStoredAid(aid = 'alice.agentid.pub'): Promise<AID> {
   const identity = makeIdentity(aid);
-  const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'test-seed' });
+  const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'test-seed' });
   await keyStore.saveIdentity(aid, identity);
   const store = new AIDStore({ aunPath: 'browser-aun', encryptionSeed: 'test-seed' });
   const loaded = await store.load(aid);
@@ -115,7 +115,7 @@ describe('浏览器 SDK v4 三主体 API', () => {
   it('AIDStore 注册持久化路径应保留私钥材料', async () => {
     const aidStr = 'reg-persist.agentid.pub';
     const identity = makeIdentity(aidStr);
-    const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'reg-persist-seed' });
+    const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'reg-persist-seed' });
     await keyStore.saveKeyPair(aidStr, {
       private_key_pem: identity.private_key_pem,
       public_key_der_b64: identity.public_key_der_b64,
@@ -187,7 +187,7 @@ describe('AIDStore.list() AIDInfo 元数据字段', () => {
   it('list() 返回的 AIDInfo 包含 certNotAfter 和 certIssuer', async () => {
     const aidStr = 'list-meta.agentid.pub';
     const identity = makeIdentity(aidStr);
-    const keyStore = new IndexedDBKeyStore({ encryptionSeed: 'list-meta-seed' });
+    const keyStore = new IndexedDBIdentityStore({ encryptionSeed: 'list-meta-seed' });
     await keyStore.saveIdentity(aidStr, identity);
     const store = new AIDStore({ aunPath: 'browser-aun-list', encryptionSeed: 'list-meta-seed' });
     const result = await store.list();

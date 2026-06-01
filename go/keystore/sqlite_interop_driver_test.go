@@ -16,9 +16,9 @@ func TestSQLiteInteropDriver(t *testing.T) {
 	if root == "" || aid == "" || action == "" {
 		t.Fatal("missing interop env")
 	}
-	ks, err := NewFileKeyStore(root, nil, "interop-seed")
+	ks, err := NewLocalTokenStore(root, nil, "interop-seed")
 	if err != nil {
-		t.Fatalf("NewFileKeyStore: %v", err)
+		t.Fatalf("NewLocalTokenStore: %v", err)
 	}
 	defer ks.Close()
 	switch action {

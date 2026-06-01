@@ -71,6 +71,15 @@ export interface TokenStore {
 
 /** 私钥/完整身份存储接口，仅 AIDStore / RegisterFlow 持有。 */
 export interface KeyStore {
+  /** 加载证书 */
+  loadCert(aid: string, certFingerprint?: string): string | null;
+  /** 保存证书 */
+  saveCert(
+    aid: string,
+    certPem: string,
+    certFingerprint?: string,
+    opts?: { makeActive?: boolean },
+  ): void;
   /** 加载密钥对 */
   loadKeyPair(aid: string): KeyPairRecord | null;
   /** 保存密钥对 */
@@ -99,5 +108,3 @@ export interface KeyStore {
   listIdentities?(): string[];
 }
 
-/** 物理实现通常同时实现 TokenStore 与 KeyStore；注册流程显式要求组合类型。 */
-export type FullKeyStore = TokenStore & KeyStore;

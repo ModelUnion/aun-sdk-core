@@ -1,4 +1,4 @@
-// Package aun: AUNClient agent.md 运行时内部逻辑与 PublishAgentMD 单测。
+// Package aun: AUNClient agent.md 运行时内部逻辑与 UploadAgentMD 单测。
 package aun
 
 import (
@@ -6,34 +6,34 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/modelunion/aun-sdk-core/go/keystore"
-	"github.com/modelunion/aun-sdk-core/go/namespace"
 )
 
 type fakeAgentMDOps struct {
-	signFn     func(ctx context.Context, content string, opts *namespace.AgentMDSignOptions) (string, error)
-	verifyFn   func(ctx context.Context, content string, opts *namespace.AgentMDVerifyOptions) (map[string]any, error)
+	signFn     func(ctx context.Context, content string) (string, error)
+	verifyFn   func(ctx context.Context, content string, aid string) (map[string]any, error)
 	uploadFn   func(ctx context.Context, content string) (map[string]any, error)
-	downloadFn func(ctx context.Context, aid string) (string, error)
+	downloadFn func(ctx context.Context, aid string) (agentMDDownloadResult, error)
 	headFn     func(ctx context.Context, aid string) (map[string]any, error)
 }
 
-func (f *fakeAgentMDOps) SignAgentMD(ctx context.Context, content string, opts *namespace.AgentMDSignOptions) (string, error) {
+func (f *fakeAgentMDOps) SignAgentMD(ctx context.Context, content string) (string, error) {
 	if f.signFn == nil {
 		return "", errors.New("signFn not configured")
 	}
-	return f.signFn(ctx, content, opts)
+	return f.signFn(ctx, content)
 }
-func (f *fakeAgentMDOps) VerifyAgentMD(ctx context.Context, content string, opts *namespace.AgentMDVerifyOptions) (map[string]any, error) {
+func (f *fakeAgentMDOps) VerifyAgentMD(ctx context.Context, content string, aid string) (map[string]any, error) {
 	if f.verifyFn == nil {
 		return nil, errors.New("verifyFn not configured")
 	}
-	return f.verifyFn(ctx, content, opts)
+	return f.verifyFn(ctx, content, aid)
 }
 func (f *fakeAgentMDOps) UploadAgentMD(ctx context.Context, content string) (map[string]any, error) {
 	if f.uploadFn == nil {
@@ -41,9 +41,9 @@ func (f *fakeAgentMDOps) UploadAgentMD(ctx context.Context, content string) (map
 	}
 	return f.uploadFn(ctx, content)
 }
-func (f *fakeAgentMDOps) DownloadAgentMD(ctx context.Context, aid string) (string, error) {
+func (f *fakeAgentMDOps) DownloadAgentMD(ctx context.Context, aid string) (agentMDDownloadResult, error) {
 	if f.downloadFn == nil {
-		return "", errors.New("downloadFn not configured")
+		return agentMDDownloadResult{}, errors.New("downloadFn not configured")
 	}
 	return f.downloadFn(ctx, aid)
 }
@@ -64,7 +64,7 @@ func newClientForTest(t *testing.T, aid string) *AUNClient {
 
 func writeAgentMDFile(t *testing.T, c *AUNClient, aid string, content string) string {
 	t.Helper()
-	p, err := c.agentMDFilePath(aid)
+	p, err := c.agentMD().agentMDFilePath(aid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func seedAgentMDLocalContent(t *testing.T, c *AUNClient, aids ...string) {
 	t.Helper()
 	for _, aid := range aids {
 		content := "# " + aid + "\n"
-		if rec := c.saveAgentMDRecord(aid, keystore.AgentMDCacheUpsert{Content: agentMDStringPtr(content)}); rec == nil {
+		if rec := c.agentMD().saveAgentMDRecord(aid, keystore.AgentMDCacheUpsert{Content: agentMDStringPtr(content)}); rec == nil {
 			t.Fatalf("failed to seed local agent.md for %s", aid)
 		}
 	}
@@ -90,14 +90,14 @@ func waitAgentMDFetchesIdle(t *testing.T, c *AUNClient) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		c.agentMdMu.RLock()
-		inflight := len(c.agentMDFetchInflight)
-		c.agentMdMu.RUnlock()
+		c.agentMD().agentMdMu.RLock()
+		inflight := len(c.agentMD().agentMDFetchInflight)
+		c.agentMD().agentMdMu.RUnlock()
 		if inflight == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for agent.md fetches to finish, inflight=%d", inflight)
+			t.Fatalf("timed out waiting for agent.md downloads to finish, inflight=%d", inflight)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -106,7 +106,7 @@ func readAgentMDListRecords(t *testing.T, c *AUNClient) map[string]map[string]an
 	t.Helper()
 	// 读取所有 per-AID agentmd.json 文件，模拟旧 list.json 的 records 结构
 	result := make(map[string]map[string]any)
-	entries, err := os.ReadDir(c.agentMDRoot())
+	entries, err := os.ReadDir(c.agentMD().agentMDRoot())
 	if err != nil {
 		return result
 	}
@@ -115,7 +115,7 @@ func readAgentMDListRecords(t *testing.T, c *AUNClient) map[string]map[string]an
 			continue
 		}
 		aid := entry.Name()
-		metaPath := filepath.Join(c.agentMDRoot(), aid, "agentmd.json")
+		metaPath := filepath.Join(c.agentMD().agentMDRoot(), aid, "agentmd.json")
 		data, err := os.ReadFile(metaPath)
 		if err != nil {
 			continue
@@ -129,43 +129,131 @@ func readAgentMDListRecords(t *testing.T, c *AUNClient) map[string]map[string]an
 	return result
 }
 
+func TestAgentMDDownloadHTTPUsesUnconditionalGET(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		if got := r.Header.Get("Accept"); got != "text/markdown" {
+			t.Fatalf("unexpected accept header: %s", got)
+		}
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Fatalf("download must not send If-None-Match, got %q", got)
+		}
+		if got := r.Header.Get("If-Modified-Since"); got != "" {
+			t.Fatalf("download must not send If-Modified-Since, got %q", got)
+		}
+		w.Header().Set("ETag", "\"etag-1\"")
+		_, _ = w.Write([]byte("# Bob\n"))
+	}))
+	defer server.Close()
+
+	res, err := agentMDDownloadHTTP(context.Background(), server.Client(), server.URL+"/agent.md", "bob.agentid.pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits != 1 || res.Content != "# Bob\n" || res.Etag != "\"etag-1\"" {
+		t.Fatalf("unexpected result hits=%d res=%#v", hits, res)
+	}
+}
+
+func TestAgentMDDownloadHTTPRetriesUnconditionalGETOn304WithoutCache(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Fatalf("download must not send If-None-Match, got %q", got)
+		}
+		if got := r.Header.Get("If-Modified-Since"); got != "" {
+			t.Fatalf("download must not send If-Modified-Since, got %q", got)
+		}
+		if hits == 1 {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", "\"fresh\"")
+		_, _ = w.Write([]byte("# Bob fresh\n"))
+	}))
+	defer server.Close()
+
+	res, err := agentMDDownloadHTTP(context.Background(), server.Client(), server.URL+"/agent.md", "bob.agentid.pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits != 2 || res.Content != "# Bob fresh\n" || res.Etag != "\"fresh\"" {
+		t.Fatalf("unexpected result hits=%d res=%#v", hits, res)
+	}
+}
+
+func TestAgentMDDownloadHTTPUsesCachedContentOn304(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Fatalf("download must not send If-None-Match, got %q", got)
+		}
+		if got := r.Header.Get("If-Modified-Since"); got != "" {
+			t.Fatalf("download must not send If-Modified-Since, got %q", got)
+		}
+		w.Header().Set("ETag", "\"cached\"")
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer server.Close()
+
+	res, err := agentMDDownloadHTTP(
+		context.Background(),
+		server.Client(),
+		server.URL+"/agent.md",
+		"bob.agentid.pub",
+		agentMDDownloadCache{Content: "# Bob cached\n", Etag: "\"cached\""},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits != 1 || res.Content != "# Bob cached\n" || res.Etag != "\"cached\"" || res.Status != http.StatusNotModified {
+		t.Fatalf("unexpected result hits=%d res=%#v", hits, res)
+	}
+}
+
 func TestAgentMDPathDefaultAndSet(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	want := filepath.Join(c.configModel.AUNPath, "AIDs")
-	if c.agentMDRoot() != want {
-		t.Fatalf("root=%s want=%s", c.agentMDRoot(), want)
+	if c.agentMD().agentMDRoot() != want {
+		t.Fatalf("root=%s want=%s", c.agentMD().agentMDRoot(), want)
 	}
 	custom := filepath.Join(t.TempDir(), "custom")
-	if got := c.setAgentMDPath(custom); got != custom {
+	if got := c.agentMD().setAgentMDPath(custom); got != custom {
 		t.Fatalf("custom root=%s", got)
 	}
-	if got := c.setAgentMdPath(""); got != want {
+	if got := c.agentMD().setAgentMDPath(""); got != want {
 		t.Fatalf("default root=%s want=%s", got, want)
 	}
 }
 
-func TestPublishAgentMDWithoutAidErrors(t *testing.T) {
+func TestUploadAgentMDWithoutAidErrors(t *testing.T) {
 	c := newClientForTest(t, "")
-	if _, err := c.PublishAgentMD(context.Background()); err == nil {
+	if _, err := c.UploadAgentMD(context.Background()); err == nil {
 		t.Fatal("expected error without local aid")
 	}
 }
 
-func TestPublishAgentMDMissingDefaultFile(t *testing.T) {
+func TestUploadAgentMDMissingDefaultFile(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	if _, err := c.PublishAgentMD(context.Background()); err == nil {
+	if _, err := c.UploadAgentMD(context.Background()); err == nil {
 		t.Fatal("expected error for missing default agent.md")
 	}
 }
 
-func TestPublishAgentMDSignsUploadsAndPersistsFileList(t *testing.T) {
+func TestUploadAgentMDSignsUploadsAndPersistsFileList(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	body := "---\naid: alice.agentid.pub\n---\n# Alice\n"
 	writeAgentMDFile(t, c, "alice.agentid.pub", body)
 	var signedInput, uploaded string
 	remoteUploadEtag := "\"cloud-etag\""
-	c.agentMDOps = &fakeAgentMDOps{
-		signFn: func(_ context.Context, content string, _ *namespace.AgentMDSignOptions) (string, error) {
+	c.agentMD().agentMDOps = &fakeAgentMDOps{
+		signFn: func(_ context.Context, content string) (string, error) {
 			signedInput = content
 			return content + "\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n", nil
 		},
@@ -175,14 +263,14 @@ func TestPublishAgentMDSignsUploadsAndPersistsFileList(t *testing.T) {
 		},
 	}
 
-	res, err := c.PublishAgentMD(context.Background())
+	res, err := c.UploadAgentMD(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res["aid"] != "alice.agentid.pub" || signedInput != body {
-		t.Fatalf("unexpected publish result=%v signed=%q", res, signedInput)
+		t.Fatalf("unexpected upload result=%v signed=%q", res, signedInput)
 	}
-	saved, err := os.ReadFile(filepath.Join(c.agentMDRoot(), "alice.agentid.pub", "agent.md"))
+	saved, err := os.ReadFile(filepath.Join(c.agentMD().agentMDRoot(), "alice.agentid.pub", "agent.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,40 +284,42 @@ func TestPublishAgentMDSignsUploadsAndPersistsFileList(t *testing.T) {
 	}
 }
 
-func TestPublishAgentMDUploadErrorPropagates(t *testing.T) {
+func TestUploadAgentMDUploadErrorPropagates(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	writeAgentMDFile(t, c, "alice.agentid.pub", "# A\n")
-	c.agentMDOps = &fakeAgentMDOps{
-		signFn: func(_ context.Context, content string, _ *namespace.AgentMDSignOptions) (string, error) {
+	c.agentMD().agentMDOps = &fakeAgentMDOps{
+		signFn: func(_ context.Context, content string) (string, error) {
 			return content, nil
 		},
 		uploadFn: func(_ context.Context, _ string) (map[string]any, error) { return nil, errors.New("boom") },
 	}
-	if _, err := c.PublishAgentMD(context.Background()); err == nil {
+	if _, err := c.UploadAgentMD(context.Background()); err == nil {
 		t.Fatal("expected error to propagate from upload")
 	}
 }
 
-func TestFetchAgentMDNoAidErrors(t *testing.T) {
+func TestDownloadAgentMDNoAidErrors(t *testing.T) {
 	c := newClientForTest(t, "")
-	if _, err := c.fetchAgentMD(context.Background(), ""); err == nil {
+	if _, err := c.agentMD().Download(context.Background(), ""); err == nil {
 		t.Fatal("expected error when no aid")
 	}
 }
 
-func TestFetchAgentMDSelfAidUpdatesEtagAndSavesFile(t *testing.T) {
+func TestDownloadAgentMDSelfAidUpdatesEtagAndSavesFile(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	body := "---\naid: alice.agentid.pub\n---\n# Alice\n"
 	etag := agentMDContentEtag(body)
-	c.remoteAgentMDEtag = etag
-	c.agentMDOps = &fakeAgentMDOps{
-		downloadFn: func(_ context.Context, _ string) (string, error) { return body, nil },
-		verifyFn: func(_ context.Context, _ string, _ *namespace.AgentMDVerifyOptions) (map[string]any, error) {
+	c.agentMD().remoteAgentMDEtag = etag
+	c.agentMD().agentMDOps = &fakeAgentMDOps{
+		downloadFn: func(_ context.Context, aid string) (agentMDDownloadResult, error) {
+			return agentMDDownloadResult{AID: aid, Content: body, Etag: etag}, nil
+		},
+		verifyFn: func(_ context.Context, _ string, _ string) (map[string]any, error) {
 			return map[string]any{"status": "unsigned"}, nil
 		},
 	}
 
-	info, err := c.fetchAgentMD(context.Background(), "")
+	info, err := c.agentMD().Download(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,23 +334,25 @@ func TestFetchAgentMDSelfAidUpdatesEtagAndSavesFile(t *testing.T) {
 	}
 }
 
-func TestFetchAgentMDOtherAidDoesNotUpdateLocalEtag(t *testing.T) {
+func TestDownloadAgentMDOtherAidDoesNotUpdateLocalEtag(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	c.localAgentMDEtag = "\"unchanged\""
+	c.agentMD().localAgentMDEtag = "\"unchanged\""
 	body := "---\naid: bob.agentid.pub\n---\n# Bob\n"
-	c.agentMDOps = &fakeAgentMDOps{
-		downloadFn: func(_ context.Context, _ string) (string, error) { return body, nil },
-		verifyFn: func(_ context.Context, _ string, _ *namespace.AgentMDVerifyOptions) (map[string]any, error) {
+	c.agentMD().agentMDOps = &fakeAgentMDOps{
+		downloadFn: func(_ context.Context, aid string) (agentMDDownloadResult, error) {
+			return agentMDDownloadResult{AID: aid, Content: body}, nil
+		},
+		verifyFn: func(_ context.Context, _ string, _ string) (map[string]any, error) {
 			return map[string]any{"status": "verified"}, nil
 		},
 	}
 
-	info, err := c.fetchAgentMD(context.Background(), "bob.agentid.pub")
+	info, err := c.agentMD().Download(context.Background(), "bob.agentid.pub")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.InSync != nil || c.localAgentMDEtag != "\"unchanged\"" {
-		t.Fatalf("unexpected local state info=%#v local=%s", info, c.localAgentMDEtag)
+	if info.InSync != nil || c.agentMD().localAgentMDEtag != "\"unchanged\"" {
+		t.Fatalf("unexpected local state info=%#v local=%s", info, c.agentMD().localAgentMDEtag)
 	}
 	if rec := readAgentMDListRecords(t, c)["bob.agentid.pub"]; rec["local_etag"] != agentMDContentEtag(body) || rec["verify_status"] != "verified" {
 		t.Fatalf("bad bob record: %#v", rec)
@@ -279,13 +371,13 @@ func TestObserveRPCMetaAgentMDEtagsPersistToList(t *testing.T) {
 
 func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
-	fetched := make(chan string, 4)
-	c.agentMDOps = &fakeAgentMDOps{
-		downloadFn: func(_ context.Context, aid string) (string, error) {
-			fetched <- aid
-			return "# " + aid + "\n", nil
+	downloaded := make(chan string, 4)
+	c.agentMD().agentMDOps = &fakeAgentMDOps{
+		downloadFn: func(_ context.Context, aid string) (agentMDDownloadResult, error) {
+			downloaded <- aid
+			return agentMDDownloadResult{AID: aid, Content: "# " + aid + "\n"}, nil
 		},
-		verifyFn: func(_ context.Context, _ string, _ *namespace.AgentMDVerifyOptions) (map[string]any, error) {
+		verifyFn: func(_ context.Context, _ string, _ string) (map[string]any, error) {
 			return map[string]any{"status": "unsigned"}, nil
 		},
 	}
@@ -303,15 +395,15 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for len(got) < 3 {
 		select {
-		case aid := <-fetched:
+		case aid := <-downloaded:
 			got[aid] = true
 		case <-deadline:
-			t.Fatalf("timed out waiting for auto fetch, got=%v", got)
+			t.Fatalf("timed out waiting for auto download, got=%v", got)
 		}
 	}
 	for _, aid := range []string{"alice.agentid.pub", "bob.agentid.pub", "dave.agentid.pub"} {
 		if !got[aid] {
-			t.Fatalf("missing fetched aid %s, got=%v", aid, got)
+			t.Fatalf("missing downloaded aid %s, got=%v", aid, got)
 		}
 	}
 
@@ -341,7 +433,7 @@ func TestObserveRPCMetaAgentMDStructuredEtagsFetchesMissingLocal(t *testing.T) {
 			t.Fatalf("content leaked into list for %s: %#v", aid, rec)
 		}
 	}
-	p, err := c.agentMDFilePath("bob.agentid.pub")
+	p, err := c.agentMD().agentMDFilePath("bob.agentid.pub")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,12 +457,12 @@ func TestCheckAgentMDComparesHeadAndPersistsToList(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	content := "---\naid: alice.agentid.pub\n---\n# Alice\n"
 	etag := agentMDContentEtag(content)
-	c.saveAgentMDRecord("alice.agentid.pub", keystore.AgentMDCacheUpsert{Content: agentMDStringPtr(content), LocalEtag: agentMDStringPtr(etag)})
-	c.agentMDOps = &fakeAgentMDOps{headFn: func(_ context.Context, aid string) (map[string]any, error) {
+	c.agentMD().saveAgentMDRecord("alice.agentid.pub", keystore.AgentMDCacheUpsert{Content: agentMDStringPtr(content), LocalEtag: agentMDStringPtr(etag)})
+	c.agentMD().agentMDOps = &fakeAgentMDOps{headFn: func(_ context.Context, aid string) (map[string]any, error) {
 		return map[string]any{"aid": aid, "found": true, "etag": etag, "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT", "status": 200}, nil
 	}}
 
-	checked, err := c.checkAgentMD(context.Background(), "")
+	checked, err := c.agentMD().Check(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +478,7 @@ func TestCheckAgentMDUsesFreshCachedMatchWithoutHead(t *testing.T) {
 	c := newClientForTest(t, "alice.agentid.pub")
 	content := "---\naid: bob.agentid.pub\n---\n# Bob\n"
 	etag := agentMDContentEtag(content)
-	c.saveAgentMDRecord("bob.agentid.pub", keystore.AgentMDCacheUpsert{
+	c.agentMD().saveAgentMDRecord("bob.agentid.pub", keystore.AgentMDCacheUpsert{
 		Content:      agentMDStringPtr(content),
 		LocalEtag:    agentMDStringPtr(etag),
 		RemoteEtag:   agentMDStringPtr(etag),
@@ -394,12 +486,12 @@ func TestCheckAgentMDUsesFreshCachedMatchWithoutHead(t *testing.T) {
 		VerifyStatus: agentMDStringPtr("valid"),
 		VerifyError:  agentMDStringPtr(""),
 	})
-	c.agentMDOps = &fakeAgentMDOps{headFn: func(_ context.Context, _ string) (map[string]any, error) {
+	c.agentMD().agentMDOps = &fakeAgentMDOps{headFn: func(_ context.Context, _ string) (map[string]any, error) {
 		t.Fatal("fresh cached CheckAgentMD should not HEAD")
 		return nil, nil
 	}}
 
-	checked, err := c.checkAgentMD(context.Background(), "bob.agentid.pub", 7)
+	checked, err := c.agentMD().Check(context.Background(), "bob.agentid.pub", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,12 +505,12 @@ func TestDamagedAgentMDJsonReturnsNil(t *testing.T) {
 	body := "# Alice\n"
 	writeAgentMDFile(t, c, "alice.agentid.pub", body)
 	// 写入损坏的 agentmd.json
-	metaPath := filepath.Join(c.agentMDRoot(), "alice.agentid.pub", "agentmd.json")
+	metaPath := filepath.Join(c.agentMD().agentMDRoot(), "alice.agentid.pub", "agentmd.json")
 	if err := os.WriteFile(metaPath, []byte("{bad json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	rec := c.loadAgentMDRecord("alice.agentid.pub")
+	rec := c.agentMD().loadAgentMDRecord("alice.agentid.pub")
 	if rec != nil {
 		t.Fatalf("expected nil for damaged agentmd.json, got: %#v", rec)
 	}

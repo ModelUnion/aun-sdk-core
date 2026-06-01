@@ -1,7 +1,7 @@
 """KeyStore 完备测试。
 
 覆盖场景：
-- FileKeyStore: 身份完整生命周期（创建→保存→重启→加载）
+- _CompositeLocalStore: 身份完整生命周期（创建→保存→重启→加载）
 - 数据持久化: Token、Prekey、Group Secret（通过各自的 CRUD API）
 """
 
@@ -12,15 +12,45 @@ from pathlib import Path
 
 import pytest
 
-from aun_core.keystore.file import FileKeyStore
+from aun_core.keystore.local_identity_store import LocalIdentityStore, _METADATA_LOCKS_LIMIT
+from aun_core.keystore.local_token_store import LocalTokenStore
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 
+class _CompositeLocalStore:
+    """测试专用组合器：生产代码不再暴露混合 KeyStore。"""
+
+    def __init__(self, root=None, *, encryption_seed=None, logger=None) -> None:
+        self.identity = LocalIdentityStore(root, encryption_seed=encryption_seed, logger=logger)
+        self.token = LocalTokenStore(root, logger=logger)
+        self._root = self.identity._root
+        self._aids_root = self.identity._aids_root
+        self._metadata_locks = self.identity._metadata_locks
+
+    def close(self) -> None:
+        self.identity.close()
+        self.token.close()
+
+    def _get_metadata_lock(self, aid: str):
+        return self.identity._get_metadata_lock(aid)
+
+    def save_cert(self, aid: str, cert_pem: str, cert_fingerprint: str | None = None, *, make_active: bool = True) -> None:
+        self.token.save_cert(aid, cert_pem, cert_fingerprint, make_active=make_active)
+
+    def load_cert(self, aid: str, cert_fingerprint: str | None = None) -> str | None:
+        return self.token.load_cert(aid, cert_fingerprint)
+
+    def __getattr__(self, name: str):
+        if hasattr(self.identity, name):
+            return getattr(self.identity, name)
+        return getattr(self.token, name)
+
+
 def _store_group_current(
-    ks: FileKeyStore,
+    ks: _CompositeLocalStore,
     aid: str,
     group_id: str,
     *,
@@ -42,7 +72,7 @@ def _store_group_current(
 
 
 def _store_group_epoch(
-    ks: FileKeyStore,
+    ks: _CompositeLocalStore,
     aid: str,
     group_id: str,
     *,
@@ -67,11 +97,11 @@ def _store_group_epoch(
 # secret_store 模块已在 Phase 3 中删除，相关测试随之移除。
 
 
-# ── FileKeyStore 测试 ─────────────────────────────────────
+# ── _CompositeLocalStore 测试 ─────────────────────────────────────
 
 
-class TestFileKeyStore:
-    """测试 FileKeyStore 完整的身份生命周期。"""
+class Test_CompositeLocalStore:
+    """测试 _CompositeLocalStore 完整的身份生命周期。"""
 
     SAMPLE_KEY_PAIR = {
         "private_key_pem": "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEE...\n-----END EC PRIVATE KEY-----",
@@ -82,7 +112,7 @@ class TestFileKeyStore:
     SAMPLE_AID = "test-user.agentid.pub"
 
     def test_save_and_load_key_pair(self, tmp_path):
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks.save_key_pair(self.SAMPLE_AID, self.SAMPLE_KEY_PAIR.copy())
 
         loaded = ks.load_key_pair(self.SAMPLE_AID)
@@ -93,27 +123,27 @@ class TestFileKeyStore:
 
     def test_key_pair_survives_restart(self, tmp_path):
         """模拟进程重启：新实例能恢复私钥。"""
-        ks1 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks1 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks1.save_key_pair(self.SAMPLE_AID, self.SAMPLE_KEY_PAIR.copy())
 
         # 新实例（模拟重启）
-        ks2 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks2 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         loaded = ks2.load_key_pair(self.SAMPLE_AID)
         assert loaded is not None
         assert loaded["private_key_pem"] == self.SAMPLE_KEY_PAIR["private_key_pem"]
 
     def test_key_pair_survives_restart_auto_seed(self, tmp_path):
         """不提供 encryption_seed，自动生成种子，重启后仍可恢复。"""
-        ks1 = FileKeyStore(tmp_path)
+        ks1 = _CompositeLocalStore(tmp_path)
         ks1.save_key_pair(self.SAMPLE_AID, self.SAMPLE_KEY_PAIR.copy())
 
-        ks2 = FileKeyStore(tmp_path)
+        ks2 = _CompositeLocalStore(tmp_path)
         loaded = ks2.load_key_pair(self.SAMPLE_AID)
         assert loaded is not None
         assert loaded["private_key_pem"] == self.SAMPLE_KEY_PAIR["private_key_pem"]
 
     def test_save_and_load_cert(self, tmp_path):
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks.save_cert(self.SAMPLE_AID, self.SAMPLE_CERT)
 
         loaded = ks.load_cert(self.SAMPLE_AID)
@@ -121,7 +151,7 @@ class TestFileKeyStore:
 
     def test_save_and_load_identity(self, tmp_path):
         """save_identity 拆分保存 key_pair + cert + tokens，均能恢复。"""
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         identity = {
             **self.SAMPLE_KEY_PAIR,
             "cert": self.SAMPLE_CERT,
@@ -148,10 +178,10 @@ class TestFileKeyStore:
             "access_token": "tok_abc",
         }
 
-        ks1 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks1 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks1.save_identity(self.SAMPLE_AID, identity)
 
-        ks2 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks2 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         loaded_kp = ks2.load_key_pair(self.SAMPLE_AID)
         assert loaded_kp is not None
         assert loaded_kp["private_key_pem"] == self.SAMPLE_KEY_PAIR["private_key_pem"]
@@ -161,7 +191,7 @@ class TestFileKeyStore:
 
     def test_multiple_aids(self, tmp_path):
         """多个 AID 互不干扰。"""
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         kp_alice = {**self.SAMPLE_KEY_PAIR, "private_key_pem": "ALICE_KEY"}
         kp_bob = {**self.SAMPLE_KEY_PAIR, "private_key_pem": "BOB_KEY"}
 
@@ -175,14 +205,14 @@ class TestFileKeyStore:
         """SQLCipher 迁移后 secret_store 参数被忽略，不再需要检查 persisted。
         改为验证无 seed 时自动生成 .seed，仍可正常保存和读取私钥。
         """
-        ks = FileKeyStore(tmp_path)
+        ks = _CompositeLocalStore(tmp_path)
         ks.save_key_pair(self.SAMPLE_AID, self.SAMPLE_KEY_PAIR.copy())
         loaded = ks.load_key_pair(self.SAMPLE_AID)
         assert loaded["private_key_pem"] == self.SAMPLE_KEY_PAIR["private_key_pem"]
 
     def test_key_pair_file_does_not_contain_plaintext_private_key(self, tmp_path):
         """key.json 文件中不应出现明文私钥。"""
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks.save_key_pair(self.SAMPLE_AID, self.SAMPLE_KEY_PAIR.copy())
 
         # 读取磁盘上的 key.json
@@ -206,7 +236,7 @@ class TestFileKeyStore:
             "curve": "P-256",
         }), encoding="utf-8")
 
-        ks = FileKeyStore(tmp_path, encryption_seed="new-seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="new-seed")
         loaded = ks.load_key_pair(aid)
         assert loaded["private_key_pem"] == "LEGACY_PLAINTEXT_PRIVATE"
 
@@ -219,7 +249,7 @@ class TestFileKeyStore:
     def test_load_key_pair_wrong_seed_preserves_key_json(self, tmp_path):
         """seed_password 不匹配可报错，但不能破坏原 key.json。"""
         aid = "wrong-load-seed.agentid.pub"
-        ks = FileKeyStore(tmp_path, encryption_seed="correct-seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="correct-seed")
         ks.save_key_pair(aid, {
             "private_key_pem": "CORRECT_SEED_PRIVATE",
             "public_key_der_b64": "pub",
@@ -228,7 +258,7 @@ class TestFileKeyStore:
         key_file = tmp_path / "AIDs" / aid / "private" / "key.json"
         before = key_file.read_text(encoding="utf-8")
 
-        wrong = FileKeyStore(tmp_path, encryption_seed="wrong-seed")
+        wrong = _CompositeLocalStore(tmp_path, encryption_seed="wrong-seed")
         with pytest.raises(ValueError, match="private key decrypt failed"):
             wrong.load_key_pair(aid)
         assert key_file.read_text(encoding="utf-8") == before
@@ -237,7 +267,7 @@ class TestFileKeyStore:
     def test_load_pending_key_pair_migrates_legacy_plaintext(self, tmp_path):
         """pending key.json 即使是历史明文，也应在读取时加密回写。"""
         aid = "pending-legacy.agentid.pub"
-        ks = FileKeyStore(tmp_path, encryption_seed="pending-seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="pending-seed")
         pending_dir = ks.pending_identity_dir(aid)
         key_file = pending_dir / "private" / "key.json"
         key_file.write_text(json.dumps({
@@ -257,7 +287,7 @@ class TestFileKeyStore:
     def test_load_pending_key_pair_wrong_seed_preserves_pending(self, tmp_path):
         """pending 私钥 seed 不匹配时保留 pending 数据，供正确 seed 后续恢复。"""
         aid = "pending-wrong-seed.agentid.pub"
-        correct = FileKeyStore(tmp_path, encryption_seed="correct-seed")
+        correct = _CompositeLocalStore(tmp_path, encryption_seed="correct-seed")
         pending_dir = correct.pending_identity_dir(aid)
         correct.save_pending_key_pair(pending_dir, aid, {
             "private_key_pem": "PENDING_CORRECT_PRIVATE",
@@ -267,21 +297,21 @@ class TestFileKeyStore:
         key_file = pending_dir / "private" / "key.json"
         before = key_file.read_text(encoding="utf-8")
 
-        wrong = FileKeyStore(tmp_path, encryption_seed="wrong-seed")
+        wrong = _CompositeLocalStore(tmp_path, encryption_seed="wrong-seed")
         with pytest.raises(ValueError, match="private key decrypt failed"):
             wrong.load_pending_key_pair(pending_dir, aid)
         assert key_file.exists()
         assert key_file.read_text(encoding="utf-8") == before
 
     def test_load_nonexistent_aid(self, tmp_path):
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         assert ks.load_key_pair("nonexistent.agentid.pub") is None
         assert ks.load_cert("nonexistent.agentid.pub") is None
         assert ks.load_identity("nonexistent.agentid.pub") is None
 
     def test_identity_merge_not_overwrite(self, tmp_path):
         """save_identity 应合并 KV 字段，不覆盖已有字段。"""
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
 
         # 第一次保存
         ks.save_identity(self.SAMPLE_AID, {
@@ -311,7 +341,7 @@ class TestTokenPersistence:
     AID = "token-test.agentid.pub"
 
     def _make_ks(self, tmp_path, seed="seed"):
-        return FileKeyStore(tmp_path, encryption_seed=seed)
+        return _CompositeLocalStore(tmp_path, encryption_seed=seed)
 
     def test_tokens_saved_and_restored(self, tmp_path):
         ks = self._make_ks(tmp_path)
@@ -406,7 +436,7 @@ class TestPrekeyPersistence:
     AID = "prekey-test.agentid.pub"
 
     def _make_ks(self, tmp_path, seed="seed"):
-        return FileKeyStore(tmp_path, encryption_seed=seed)
+        return _CompositeLocalStore(tmp_path, encryption_seed=seed)
 
     def test_prekey_saved_and_restored(self, tmp_path):
         ks = self._make_ks(tmp_path)
@@ -502,7 +532,7 @@ class TestGroupSecretPersistence:
     GRP = "grp_test1"
 
     def _make_ks(self, tmp_path, seed="seed"):
-        return FileKeyStore(tmp_path, encryption_seed=seed)
+        return _CompositeLocalStore(tmp_path, encryption_seed=seed)
 
     def test_group_secret_saved_and_restored(self, tmp_path):
         ks = self._make_ks(tmp_path)
@@ -606,7 +636,7 @@ class TestPeerCertPersistence:
 
     def test_peer_cert_saved_and_loaded(self, tmp_path):
         """通过 save_cert/load_cert 存储和读取对方证书。"""
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         peer_cert = "-----BEGIN CERTIFICATE-----\nPEER_CERT_DATA\n-----END CERTIFICATE-----"
         ks.save_cert("peer.agentid.pub", peer_cert)
 
@@ -614,14 +644,14 @@ class TestPeerCertPersistence:
         assert loaded == peer_cert
 
     def test_peer_cert_survives_restart(self, tmp_path):
-        ks1 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks1 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks1.save_cert("peer.agentid.pub", "PEER_CERT")
 
-        ks2 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks2 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         assert ks2.load_cert("peer.agentid.pub") == "PEER_CERT"
 
     def test_multiple_peer_certs(self, tmp_path):
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks.save_cert("alice.agentid.pub", "CERT_ALICE")
         ks.save_cert("bob.agentid.pub", "CERT_BOB")
 
@@ -630,7 +660,7 @@ class TestPeerCertPersistence:
 
     def test_own_cert_and_peer_cert_coexist(self, tmp_path):
         """自己的证书和对方的证书可以共存。"""
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         ks.save_cert("myself.agentid.pub", "MY_CERT")
         ks.save_cert("peer.agentid.pub", "PEER_CERT")
 
@@ -638,7 +668,7 @@ class TestPeerCertPersistence:
         assert ks.load_cert("peer.agentid.pub") == "PEER_CERT"
 
     def test_peer_cert_versions_saved_by_fingerprint(self, tmp_path):
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         old_cert = _make_real_cert("peer.agentid.pub")
         new_cert = _make_real_cert("peer.agentid.pub")
         old_fp = _fingerprint_of_cert(old_cert)
@@ -652,7 +682,7 @@ class TestPeerCertPersistence:
         assert ks.load_cert("peer.agentid.pub", new_fp) == new_cert
 
     def test_peer_cert_versions_survive_restart(self, tmp_path):
-        ks1 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks1 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         old_cert = _make_real_cert("peer.agentid.pub")
         new_cert = _make_real_cert("peer.agentid.pub")
         old_fp = _fingerprint_of_cert(old_cert)
@@ -661,12 +691,12 @@ class TestPeerCertPersistence:
         ks1.save_cert("peer.agentid.pub", old_cert, cert_fingerprint=old_fp, make_active=False)
         ks1.save_cert("peer.agentid.pub", new_cert)
 
-        ks2 = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks2 = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         assert ks2.load_cert("peer.agentid.pub", old_fp) == old_cert
         assert ks2.load_cert("peer.agentid.pub", new_fp) == new_cert
 
     def test_peer_cert_fingerprint_mismatch_does_not_fallback_to_active(self, tmp_path):
-        ks = FileKeyStore(tmp_path, encryption_seed="seed")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="seed")
         active_cert = _make_real_cert("peer.agentid.pub")
         other_cert = _make_real_cert("peer.agentid.pub")
         other_fp = _fingerprint_of_cert(other_cert)
@@ -710,7 +740,7 @@ class TestFullIdentityLifecycle:
     PEER = "peer-lc.agentid.pub"
 
     def test_full_lifecycle(self, tmp_path):
-        ks1 = FileKeyStore(tmp_path, encryption_seed="lifecycle_seed")
+        ks1 = _CompositeLocalStore(tmp_path, encryption_seed="lifecycle_seed")
 
         # === 阶段 1: 创建 AID，保存身份 ===
         ks1.save_identity(self.AID, {
@@ -757,7 +787,7 @@ class TestFullIdentityLifecycle:
         ks1.save_cert(self.PEER, "PEER_CERT_PEM")
 
         # === 阶段 3: 模拟进程重启 ===
-        ks2 = FileKeyStore(tmp_path, encryption_seed="lifecycle_seed")
+        ks2 = _CompositeLocalStore(tmp_path, encryption_seed="lifecycle_seed")
 
         # 验证私钥
         kp = ks2.load_key_pair(self.AID)
@@ -796,7 +826,7 @@ class TestFullIdentityLifecycle:
 
     def test_split_files_do_not_contain_plaintext_secrets(self, tmp_path):
         """验证非 DB 拆分文件不暴露明文敏感数据。"""
-        ks = FileKeyStore(tmp_path, encryption_seed="disk_check")
+        ks = _CompositeLocalStore(tmp_path, encryption_seed="disk_check")
         ks.save_identity(self.AID, {
             "private_key_pem": "IDENTITY_SECRET_KEY",
             "public_key_der_b64": "pub",
@@ -832,7 +862,7 @@ class TestDataIndependence:
     AID = "independence-test.agentid.pub"
 
     def _make_ks(self, tmp_path, seed="seed"):
-        return FileKeyStore(tmp_path, encryption_seed=seed)
+        return _CompositeLocalStore(tmp_path, encryption_seed=seed)
 
     def test_save_prekeys_does_not_lose_tokens(self, tmp_path):
         """先保存 token，再保存 prekey，token 不应丢失。"""
@@ -977,13 +1007,13 @@ class TestDataIndependence:
 
 
 class TestListIdentitiesAndLoadMetadata:
-    """PY-001: FileKeyStore 必须实现 list_identities() 和 load_metadata()。"""
+    """PY-001: _CompositeLocalStore 必须实现 list_identities() 和 load_metadata()。"""
 
     AID_1 = "alice.agentid.pub"
     AID_2 = "bob.agentid.pub"
 
     def _make_ks(self, tmp_path, seed="seed"):
-        return FileKeyStore(tmp_path, encryption_seed=seed)
+        return _CompositeLocalStore(tmp_path, encryption_seed=seed)
 
     def test_list_identities_empty(self, tmp_path):
         """无身份时返回空列表。"""
@@ -1071,9 +1101,9 @@ class TestMetadataLocksBounded:
 
     def test_metadata_locks_bounded(self, tmp_path):
         """大量不同 AID 访问后，_metadata_locks 应有上限。"""
-        from aun_core.keystore.file import _METADATA_LOCKS_LIMIT
+        
 
-        ks = FileKeyStore(root=str(tmp_path))
+        ks = _CompositeLocalStore(root=str(tmp_path))
         # 触发大量不同 AID 的锁创建
         for i in range(_METADATA_LOCKS_LIMIT + 100):
             ks._get_metadata_lock(f"aid-{i}.test")
@@ -1084,8 +1114,8 @@ class TestMetadataLocksBounded:
         """不同 aun_path 的实例拥有独立的 _metadata_locks，互不竞争。"""
         dir_a = tmp_path / "store_a"
         dir_b = tmp_path / "store_b"
-        ks_a = FileKeyStore(root=str(dir_a), encryption_seed="seed_a")
-        ks_b = FileKeyStore(root=str(dir_b), encryption_seed="seed_b")
+        ks_a = _CompositeLocalStore(root=str(dir_a), encryption_seed="seed_a")
+        ks_b = _CompositeLocalStore(root=str(dir_b), encryption_seed="seed_b")
 
         # 在实例 A 中获取锁
         lock_a = ks_a._get_metadata_lock("shared.aid")
@@ -1102,13 +1132,14 @@ class TestMetadataLocksBounded:
 
     def test_metadata_locks_no_class_level_dict(self, tmp_path):
         """确保 _metadata_locks 不再是类变量（不通过类访问）。"""
-        ks = FileKeyStore(root=str(tmp_path))
+        ks = _CompositeLocalStore(root=str(tmp_path))
         # 实例应有自己的 _metadata_locks
         assert hasattr(ks, '_metadata_locks')
         assert isinstance(ks._metadata_locks, dict)
         # _get_metadata_lock 应该是实例方法，不是类方法
         import inspect
         assert not isinstance(
-            inspect.getattr_static(FileKeyStore, '_get_metadata_lock'),
+            inspect.getattr_static(_CompositeLocalStore, '_get_metadata_lock'),
             classmethod
         ), "_get_metadata_lock 不应再是 classmethod"
+

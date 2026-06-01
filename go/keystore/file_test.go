@@ -14,9 +14,9 @@ import (
 )
 
 func TestMetaLocksBounded(t *testing.T) {
-	ks, err := NewFileKeyStore(t.TempDir(), nil, "")
+	ks, err := NewLocalIdentityStore(t.TempDir(), nil, "")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalIdentityStore 失败: %v", err)
 	}
 	defer ks.Close()
 
@@ -74,7 +74,7 @@ func TestChangeSeedMigratesKeyJSONAfterPrivateKeyVerification(t *testing.T) {
 		t.Fatalf(".seed 应在迁移成功后被 rename，stat err=%v", err)
 	}
 
-	ks, err := NewFileKeyStore(dir, nil, "")
+	ks, err := NewLocalIdentityStore(dir, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,9 +338,9 @@ func TestLoadSessionDecryptsLegacyPlaintext(t *testing.T) {
 func TestSaveKeyPairOverwriteExisting(t *testing.T) {
 	// ISSUE-GO-003: 目标文件已存在时 SaveKeyPair 应成功覆盖
 	dir := t.TempDir()
-	ks, err := NewFileKeyStore(dir, nil, "test-seed")
+	ks, err := NewLocalIdentityStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalIdentityStore 失败: %v", err)
 	}
 	defer ks.Close()
 
@@ -378,9 +378,9 @@ func TestSaveKeyPairOverwriteExisting(t *testing.T) {
 func TestSaveCertOverwriteExisting(t *testing.T) {
 	// ISSUE-GO-003: 目标文件已存在时 SaveCert 应成功覆盖
 	dir := t.TempDir()
-	ks, err := NewFileKeyStore(dir, nil, "test-seed")
+	ks, err := NewLocalIdentityStore(dir, nil, "test-seed")
 	if err != nil {
-		t.Fatalf("创建 FileKeyStore 失败: %v", err)
+		t.Fatalf("创建 LocalIdentityStore 失败: %v", err)
 	}
 	defer ks.Close()
 
@@ -411,7 +411,7 @@ func TestLoadKeyPairMigratesPlaintextAndWrongSeedPreservesFile(t *testing.T) {
 	if err := os.WriteFile(keyPath, []byte(`{"private_key_pem":"LEGACY_PLAINTEXT_PRIVATE","public_key_der_b64":"pub","curve":"P-256"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ks, err := NewFileKeyStore(dir, nil, "new-seed")
+	ks, err := NewLocalIdentityStore(dir, nil, "new-seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestLoadKeyPairMigratesPlaintextAndWrongSeedPreservesFile(t *testing.T) {
 	}
 
 	encryptedDir := t.TempDir()
-	ks2, err := NewFileKeyStore(encryptedDir, nil, "correct-seed")
+	ks2, err := NewLocalIdentityStore(encryptedDir, nil, "correct-seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +447,7 @@ func TestLoadKeyPairMigratesPlaintextAndWrongSeedPreservesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ksWrong, err := NewFileKeyStore(encryptedDir, nil, "wrong-seed")
+	ksWrong, err := NewLocalIdentityStore(encryptedDir, nil, "wrong-seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +466,7 @@ func TestLoadKeyPairMigratesPlaintextAndWrongSeedPreservesFile(t *testing.T) {
 func TestLoadPendingKeyPairMigratesPlaintextAndWrongSeedPreservesPending(t *testing.T) {
 	dir := t.TempDir()
 	aid := "pending-plaintext.agentid.pub"
-	ks, err := NewFileKeyStore(dir, nil, "pending-seed")
+	ks, err := NewLocalIdentityStore(dir, nil, "pending-seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestLoadPendingKeyPairMigratesPlaintextAndWrongSeedPreservesPending(t *test
 	}
 
 	wrongDir := t.TempDir()
-	ks2, err := NewFileKeyStore(wrongDir, nil, "correct-seed")
+	ks2, err := NewLocalIdentityStore(wrongDir, nil, "correct-seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func TestLoadPendingKeyPairMigratesPlaintextAndWrongSeedPreservesPending(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	ksWrong, err := NewFileKeyStore(wrongDir, nil, "wrong-seed")
+	ksWrong, err := NewLocalIdentityStore(wrongDir, nil, "wrong-seed")
 	if err != nil {
 		t.Fatal(err)
 	}

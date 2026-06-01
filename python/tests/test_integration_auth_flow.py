@@ -17,7 +17,7 @@ from cryptography.x509.oid import NameOID
 
 from aun_core import AIDStore, AUNClient
 from aun_core.discovery import GatewayDiscovery
-from aun_core.keystore.file import FileKeyStore
+from aun_core.keystore.local_identity_store import LocalIdentityStore
 from aun_refactor_helpers import (
     ensure_authenticated_identity,
     ensure_connected_identity,
@@ -293,12 +293,16 @@ async def local_gateway(tmp_path, monkeypatch) -> LocalGateway:
         state.downloaded_certs.append(aid)
         return web.Response(text=registration["cert_pem"], content_type="text/plain")
 
+    async def health_handler(_request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
     app = web.Application()
     app.router.add_get("/aun", ws_handler)
     app.router.add_get("/pki/chain", chain_handler)
     app.router.add_get("/pki/crl.json", crl_handler)
     app.router.add_get("/pki/ocsp/{serial}", ocsp_handler)
     app.router.add_get("/pki/cert/{aid}", cert_handler)
+    app.router.add_get("/health", health_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -335,7 +339,7 @@ async def test_local_gateway_full_auth_and_connect(tmp_path, local_gateway: Loca
     aid = "local-auth-full.agentid.pub"
 
     try:
-        aid_obj = await ensure_registered_identity(client, aid)
+        aid_obj = await ensure_registered_identity(client, aid, slot_id="slot-a")
         assert aid_obj.aid == aid
         assert "BEGIN CERTIFICATE" in aid_obj.cert_pem
 
@@ -346,10 +350,7 @@ async def test_local_gateway_full_auth_and_connect(tmp_path, local_gateway: Loca
         assert auth["refresh_token"].startswith("refresh-")
 
         await client.connect({
-            "slot_id": "slot-a",
-            "delivery_mode": "queue",
-            "queue_routing": "sender_affinity",
-            "affinity_ttl_ms": 600,
+            "delivery_mode": {"mode": "queue", "routing": "sender_affinity", "affinity_ttl_ms": 600},
             "auto_reconnect": False,
             "heartbeat_interval": 0,
         })
@@ -381,8 +382,8 @@ async def test_register_aid_recovers_missing_cert_via_download(tmp_path, local_g
 
     try:
         await ensure_registered_identity(client1, aid)
-        source_store = FileKeyStore(tmp_path / "source" / "aun")
-        restore_store = FileKeyStore(tmp_path / "restore" / "aun")
+        source_store = LocalIdentityStore(tmp_path / "source" / "aun")
+        restore_store = LocalIdentityStore(tmp_path / "restore" / "aun")
         try:
             identity = source_store.load_identity(aid)
             restore_store.save_key_pair(aid, {
@@ -429,7 +430,9 @@ async def test_reconnect_flow_refreshes_stale_access_token(tmp_path, local_gatew
         await client.connect({
             "auto_reconnect": True,
             "heartbeat_interval": 0,
-            "retry": {"initial_delay": 0.01, "max_delay": 0.01, "max_attempts": 3},
+            "retry_initial_delay": 0.01,
+            "retry_max_delay": 0.01,
+            "retry_max_attempts": 3,
         })
         local_gateway.state.rejected_tokens.add(stale_token)
 

@@ -19,7 +19,7 @@ from aun_core.auth import AuthFlow
 from aun_core.config import normalize_device_id
 from aun_core.crypto import CryptoProvider
 from aun_core.errors import AuthError
-from aun_core.keystore.file import FileKeyStore
+from aun_core.keystore.local_token_store import LocalTokenStore
 
 
 _SCRATCH_ROOT = Path(__file__).resolve().parents[2] / ".tmp-tests"
@@ -50,7 +50,7 @@ def _make_auth_flow(root_pem: str) -> AuthFlow:
     temp_root.mkdir(parents=True, exist_ok=True)
     root_path = temp_root / "root.pem"
     root_path.write_text(root_pem, encoding="utf-8")
-    keystore = FileKeyStore(temp_root / "aun")
+    keystore = LocalTokenStore(temp_root / "aun")
     return AuthFlow(
         token_store=keystore,
         crypto=CryptoProvider(),
@@ -70,7 +70,7 @@ async def test_default_connection_factory_respects_verify_ssl_false(monkeypatch,
 
     monkeypatch.setattr("aun_core.auth.websockets.connect", fake_connect)
     flow = AuthFlow(
-        token_store=FileKeyStore(tmp_path),
+        token_store=LocalTokenStore(tmp_path),
         crypto=CryptoProvider(),
         verify_ssl=False,
     )
@@ -95,7 +95,7 @@ async def test_initialize_with_token_normalizes_empty_instance_context(tmp_path:
             return {"status": "ok"}
 
     flow = AuthFlow(
-        token_store=FileKeyStore(tmp_path / "aun"),
+        token_store=LocalTokenStore(tmp_path / "aun"),
         crypto=CryptoProvider(),
         verify_ssl=False,
     )
@@ -437,7 +437,7 @@ def test_verify_peer_cert_revoked():
 
 
 def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
-    keystore = FileKeyStore(tmp_path / "aun")
+    keystore = LocalTokenStore(tmp_path / "aun")
     flow = AuthFlow(
         token_store=keystore,
         crypto=CryptoProvider(),
@@ -473,7 +473,7 @@ def test_initialize_with_token_sends_device_slot_and_delivery_mode(tmp_path):
 
 
 def test_initialize_with_token_ignores_external_legacy_capability_override(tmp_path):
-    keystore = FileKeyStore(tmp_path / "aun")
+    keystore = LocalTokenStore(tmp_path / "aun")
     flow = AuthFlow(
         token_store=keystore,
         crypto=CryptoProvider(),
@@ -514,16 +514,8 @@ def test_initialize_with_token_ignores_external_legacy_capability_override(tmp_p
 
 
 def test_load_identity_prefers_instance_state_tokens(tmp_path):
-    keystore = FileKeyStore(tmp_path / "aun")
+    keystore = LocalTokenStore(tmp_path / "aun")
     aid = "alice.example.aid"
-    keystore.save_identity(aid, {
-        "aid": aid,
-        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
-        "public_key_der_b64": "pub",
-        "curve": "P-256",
-        "access_token": "shared-token",
-        "refresh_token": "shared-refresh",
-    })
     keystore.save_instance_state(aid, "device-1", "slot-a", {
         "access_token": "slot-token",
         "refresh_token": "slot-refresh",
@@ -551,17 +543,9 @@ def test_load_identity_prefers_instance_state_tokens(tmp_path):
 
 
 def test_load_identity_empty_device_id_prefers_default_device_state_tokens(tmp_path):
-    keystore = FileKeyStore(tmp_path / "aun")
+    keystore = LocalTokenStore(tmp_path / "aun")
     default_device_id = normalize_device_id("", tmp_path / "aun")
     aid = "alice-empty-device.example.aid"
-    keystore.save_identity(aid, {
-        "aid": aid,
-        "private_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
-        "public_key_der_b64": "pub",
-        "curve": "P-256",
-        "access_token": "shared-token",
-        "refresh_token": "shared-refresh",
-    })
     keystore.save_instance_state(aid, default_device_id, "slot-a", {
         "access_token": "empty-device-token",
         "refresh_token": "empty-device-refresh",
@@ -589,7 +573,7 @@ def test_load_identity_empty_device_id_prefers_default_device_state_tokens(tmp_p
 
 
 def test_persist_identity_empty_device_id_saves_default_device_state(tmp_path):
-    keystore = FileKeyStore(tmp_path / "aun")
+    keystore = LocalTokenStore(tmp_path / "aun")
     default_device_id = normalize_device_id("", tmp_path / "aun")
     aid = "persist-empty-device.example.aid"
     flow = AuthFlow(

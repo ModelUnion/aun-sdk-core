@@ -12,7 +12,7 @@
 - [RPC 方法参考](#rpc-方法参考)
 - [Stream 使用指南](#stream-使用指南)
 
-> **多语言命名约定**：Python 使用 `snake_case`（如 `aun_path`、`fetch_agent_md`），TS/JS 使用 `camelCase`（如 `aunPath`、`fetchAgentMd`），Go 使用 `PascalCase` 公开方法（如 `Load`、`Register`）。本手册表格中各列对应各语言的实际命名。
+> **多语言命名约定**：Python 使用 `snake_case`（如 `aun_path`、`download_agent_md`），TS/JS 使用 `camelCase`（如 `aunPath`、`downloadAgentMd`），Go 使用 `PascalCase` 公开方法（如 `Load`、`Register`）。本手册表格中各列对应各语言的实际命名。
 
 ---
 
@@ -65,15 +65,14 @@ store := aun.NewAIDStore(aunPath, encryptionSeed, aun.AIDStoreOptions{
 | `register(aid)` | `register(aid)` | `Register(ctx, aid)` | 注册并落盘证书和私钥 |
 | `list()` | `list()` | `List()` | 列出本地 AID |
 | `exists(aid)` | `exists(aid)` | `Exists(ctx, aid)` | 远端存在性检查 |
-| `resolve(aid, opts=None)` | `resolve(aid, opts?)` | `Resolve(ctx, aid, opts...)` | 拉证书、缓存、拉 agent.md 并验签；`opts.timeout` / `context.WithTimeout` 控制超时 |
-| `fetch_agent_md(aid, timeout_ms=30000)` | `fetchAgentMd(aid, timeoutMs=30000)` | `FetchAgentMd(ctx, aid)` | 下载 agent.md，返回 `FetchAgentMdResult` / `AgentMDInfo` |
-| `head_agent_md(aid)` | `headAgentMd(aid)` | `HeadAgentMd(ctx, aid)` | HEAD agent.md |
-| `check_agent_md(aid, ttl_days=1)` | `checkAgentMd(aid, ttlDays?)` | `CheckAgentMd(ctx, aid, maxUnsyncedDays...)` | 缓存一致性检查 |
+| `resolve(aid, opts=None)` | `resolve(aid, opts?)` | `Resolve(ctx, aid, opts...)` | 拉证书并缓存；默认下载 agent.md，可用 `skip_agent_md` / `skipAgentMd` 跳过 |
+| `download_agent_md(aid, timeout_s=None)` | `downloadAgentMd(aid, timeoutMs=30000)` | `DownloadAgentMD(ctx, aid)` | 下载 agent.md，返回 `DownloadAgentMdResult` / `AgentMDInfo` |
+| `check_agent_md(aid, ttl_days=1)` | `checkAgentMd(aid, ttlDays=1)` | `CheckAgentMD(ctx, aid, maxUnsyncedDays...)` | 通过 HEAD 和本地记录检查一致性 |
 | `diagnose(aid)` | `diagnose(aid)` | `Diagnose(ctx, aid)` | 本地 + 远端诊断 |
 | `renew_cert(aid)` / `rekey(aid)` | `renewCert(aid)` / `rekey(aid)` | `RenewCert(ctx, aid)` / `Rekey(ctx, aid)` | 证书运维 |
 | `change_seed(old, new)` | `changeSeed(old, new)` | `ChangeSeed(old, new)` | 本地密钥保护种子迁移 |
 
-Python / TS / JS 返回 Result 对象；Go 使用惯用 `(value, error)`。
+Python / TS / JS / Go 的 `AIDStore` 方法都返回 Result 包装；Go 形态为 `Result[T]`，字段为 `Ok` / `Data` / `Error`。
 
 ### Result 类型
 
@@ -85,16 +84,37 @@ Python / TS / JS 返回 Result 对象；Go 使用惯用 `(value, error)`。
 {"ok": False, "error": {"code": "ERROR_CODE", "message": "..."}}
 ```
 
-### FetchAgentMdResult
+### DownloadAgentMdResult
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `aid` | str | AID 字符串 |
 | `content` | str | agent.md 原始内容 |
 | `verification` | `{status, reason?}` | 验签结果；`status` 为 `"ok"` / `"no_cert"` / `"invalid"` 等 |
+| `signature` | dict | 低层签名解析和验签结果 |
 | `cert_pem` | str | 签名所用证书 PEM |
 | `etag` | str | HTTP ETag |
 | `last_modified` | str | HTTP Last-Modified |
+| `status` | int | HTTP 状态码；异常 304 且本地有内容时可返回 304 |
+| `in_sync` | bool\|null | 目标是当前 AID 时表示本地内容 ETag 是否等于远端 ETag；对端 AID 通常为 null |
+| `saved_to` | str | SDK 管理的本地 agent.md 位置或浏览器 logical key |
+
+### CheckAgentMdResult
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `aid` | str | AID 字符串 |
+| `local_found` | bool | 本地是否有 agent.md 内容或本地 ETag |
+| `remote_found` | bool | 远端 HEAD 是否发现 agent.md |
+| `local_etag` | str | 本地内容 SHA-256 ETag |
+| `remote_etag` | str | 远端 HTTP ETag |
+| `in_sync` / `needs_update` | bool | 是否同步 / 是否需要下载 |
+| `last_modified` | str | 远端 Last-Modified |
+| `status` | int | HEAD 状态码 |
+| `cached` | bool | 是否命中 TTL 窗口内的本地检查记录 |
+| `verify_status` / `verify_error` | str | 最近一次下载验签状态 |
+
+agent.md 本地记录不写入 SQLite。Python / TypeScript / Go 使用 `{aun_path}/AIDs/{aid}/agent.md` 与 `agentmd.json`；浏览器 JavaScript 使用 IndexedDB 等价 key，存储不可用时退化为内存缓存。
 
 > **v0.4.2 变更**：`discoveryPort` 配置项已移除，Gateway 地址完全由 SDK 根据 AID issuer 自动发现，无需手动指定端口。
 
@@ -114,7 +134,7 @@ AID 由 `AIDStore.load()` 返回，应用层不直接构造。
 | `cert_fingerprint` | `certFingerprint` | `CertFingerprint()` | 证书指纹 |
 | `aun_path` | `aunPath` | `AUNPath()` | 所属数据目录 |
 | `device_id` | `deviceId` | `DeviceID` | 设备 ID |
-| `slot_id` | `slotId` | `SlotID` | 密钥槽 ID |
+| `slot_id` | `slotId` | `SlotID` | 实例槽位 ID；允许 `/`、`:`、空格作为共享隔离键分隔符 |
 | `verify_ssl` | `verifySsl` | `VerifySSL` | 是否校验 TLS 证书 |
 | `root_ca_path` | `rootCaPath` | `RootCaPath` | 自定义根证书路径 |
 | `debug` | `debug` | `Debug` | 是否开启调试日志 |
@@ -169,7 +189,7 @@ client := aun.NewAUNClient(aid)
 
 | Python | TS/JS | Go | 说明 |
 |--------|-------|----|------|
-| `load_identity(aid)` | `loadIdentity(aid)` | `LoadIdentityFromAID(aid)` | 在 `no_identity` / `closed` 状态加载身份 |
+| `load_identity(aid)` | `loadIdentity(aid)` | `LoadIdentity(aid)` | 在 `no_identity` / `closed` 状态加载身份 |
 | `state` | `state` | `ConnectionState()` | 九态公开状态 |
 | `gateway_url` | `gatewayUrl` | `GetGatewayURL()` | 当前连接的 Gateway URL（只读，自动发现，连接前为空） |
 | `current_aid` | `currentAid` | `CurrentAID()` | 当前 AID 对象 |
@@ -206,7 +226,7 @@ await client.close()
 - `disconnect()` 断开当前传输连接，对象仍可重新连接。
 - `close()` 关闭连接和后台任务；之后只能重新加载身份再复用。
 
-TS/JS/Go 目前保留底层双参数连接形态以兼容现有调用链，但构造入口、AID 值对象、状态机和 capability getter 已与 Python 对齐。
+四个 SDK 的公开构造入口均已对齐为“无参或 AID 对象”。调试、TLS、根证书、device_id、slot_id 等配置由 `AIDStore` 传递到 AID，再由 `AUNClient` 继承；连接级选项只传给 `connect()`。
 
 ### RPC
 
@@ -228,7 +248,7 @@ await client.call("meta.trust_roots", {})
 ### protected_headers
 
 ```python
-client = AUNClient(aid, protected_headers={"sdk": "python"})
+client = AUNClient(aid)
 client.set_protected_headers({"sdk": "python", "trace": "abc"})
 headers = client.get_protected_headers()
 ```
@@ -244,9 +264,15 @@ headers = client.get_protected_headers()
 
 | Python | TS/JS | Go | 说明 |
 |--------|-------|----|------|
-| `publish_agent_md(content=None)` | `publishAgentMd(content?)` | `PublishAgentMD(ctx)` | 发布当前 AID 的 agent.md |
-| 推荐 `AIDStore.fetch_agent_md(aid)` | 推荐 `store.fetchAgentMd(aid)` | 当前用 RPC/HTTP 组合实现 | 下载并验签 |
-| 推荐 `AIDStore.check_agent_md(aid)` | 推荐 `store.checkAgentMd(aid)` | 当前用 RPC/HTTP 组合实现 | 检查一致性 |
+| `upload_agent_md(content=None)` | `uploadAgentMd(content?)` | `UploadAgentMD(ctx, content...)` | 发布当前 AID 的 agent.md |
+| `AIDStore.download_agent_md(aid)` | `store.downloadAgentMd(aid)` | `store.DownloadAgentMD(ctx, aid)` | 下载并验签 |
+| `AIDStore.check_agent_md(aid)` | `store.checkAgentMd(aid)` | `store.CheckAgentMD(ctx, aid, maxUnsyncedDays...)` | 检查一致性 |
+
+说明：
+
+- `AUNClient` 只保留上传入口；下载和检查入口在 `AIDStore`。
+- SDK 发起 GET 时只发送 `Accept: text/markdown`，不主动发送 `If-None-Match` / `If-Modified-Since`。如果服务端异常返回 304，本地有内容则复用；无内容时再发一次无条件 GET。
+- `Accept: text/markdown` 与 agent.md 的 YAML frontmatter + Markdown 格式兼容；agent.md 仍是 Markdown 媒体类型上的结构化约定。
 
 ---
 

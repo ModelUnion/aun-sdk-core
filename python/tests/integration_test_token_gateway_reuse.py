@@ -34,7 +34,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aun_core import AUNClient, get_device_id
-from aun_core.keystore.file import FileKeyStore
+from aun_core.keystore.local_token_store import LocalTokenStore
 from aun_refactor_helpers import ensure_authenticated_identity, make_client_for_path, ensure_connected_identity
 
 _AUN_DATA_ROOT = os.environ.get("AUN_DATA_ROOT", "").strip()
@@ -66,7 +66,7 @@ def _make_client(aun_path: str) -> AUNClient:
 
 
 def _expire_cached_access_token(aun_path: str, aid: str, *, expired_at: int) -> None:
-    keystore = FileKeyStore(aun_path, encryption_seed="")
+    keystore = LocalTokenStore(aun_path)
     try:
         device_id = get_device_id(aun_path)
         slot_id = "default"

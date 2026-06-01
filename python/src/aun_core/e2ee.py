@@ -3031,7 +3031,7 @@ class GroupE2EEManager:
 
         group_e2ee = GroupE2EEManager(
             identity_fn=lambda: my_identity,
-            keystore=FileKeyStore(),
+            keystore=LocalTokenStore(),
         )
         info = group_e2ee.create_epoch("grp_abc", ["alice.aid", "bob.aid"])
         for dist in info["distributions"]:

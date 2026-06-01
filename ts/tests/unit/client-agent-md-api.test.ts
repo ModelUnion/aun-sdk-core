@@ -1,16 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { AddressInfo } from 'node:net';
 
-import { AUNClient } from '../../src/client.js';
 import { AID } from '../../src/aid.js';
+import { AgentMdManager } from '../../src/agent-md.js';
+import { AUNClient } from '../../src/client.js';
 import { ValidationError } from '../../src/errors.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+function etag(content: string): string {
+  return `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
+}
 
 function makeMockAid(aunPath: string): AID {
   return {
@@ -26,287 +33,249 @@ function makeMockAid(aunPath: string): AID {
   } as unknown as AID;
 }
 
-function makeClient() {
-  return new AUNClient(makeMockAid(mkdtempSync(join(tmpdir(), 'aun-client-agent-md-'))));
+function makePeer(aid: string): AID {
+  const item = AID._create({
+    aid,
+    aunPath: '',
+    certPem: '',
+    privateKeyPem: null,
+    certValid: true,
+    privateKeyValid: false,
+  });
+  (item as any).verifyAgentMd = (content: string) => ({ ok: true, data: { status: 'unsigned' as const, payload: content } });
+  return item;
 }
 
-function etag(content: string): string {
-  return `"${createHash('sha256').update(content, 'utf-8').digest('hex')}"`;
+function makeClient(aunPath = mkdtempSync(join(tmpdir(), 'aun-client-agent-md-'))): AUNClient {
+  return new AUNClient(makeMockAid(aunPath));
 }
 
-function agentRoot(client: AUNClient): string {
-  return (client as any)._agentMdPath as string;
+function manager(client: AUNClient): AgentMdManager {
+  return (client as any)._agentMdManager as AgentMdManager;
 }
 
-function writeLocalAgentMd(client: AUNClient, aid: string, content: string): string {
-  const file = join(agentRoot(client), aid, 'agent.md');
-  mkdirSync(join(agentRoot(client), aid), { recursive: true });
-  writeFileSync(file, content, 'utf-8');
-  return file;
+function readRecord(root: string, aid: string): any {
+  return JSON.parse(readFileSync(join(root, aid, 'agentmd.json'), 'utf-8'));
 }
 
-function readRecords(client: AUNClient): Record<string, any> {
-  const records: Record<string, any> = {};
-  for (const aid of readdirSync(agentRoot(client))) {
-    const meta = join(agentRoot(client), aid, 'agentmd.json');
-    try {
-      records[aid] = JSON.parse(readFileSync(meta, 'utf-8'));
-    } catch {
-      // ignore directories without agent.md metadata
-    }
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+async function withServer<T>(
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
+  fn: (port: number) => Promise<T>,
+): Promise<T> {
+  const server = createServer((req, res) => void Promise.resolve(handler(req, res)).catch((err) => {
+    res.statusCode = 500;
+    res.end(String(err));
+  }));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    return await fn((server.address() as AddressInfo).port);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
-  return records;
 }
 
 describe('client AIDs agent.md 文件存储', () => {
-  it('默认路径为 {aun_path}/AIDs，内部存储根可切换/恢复', () => {
+  it('默认路径为 {aun_path}/AIDs，client 不再暴露路径切换入口', () => {
     const base = mkdtempSync(join(tmpdir(), 'aun-client-agent-md-path-'));
-    const client = new AUNClient(makeMockAid(join(base, 'aun')));
-    expect(agentRoot(client)).toBe(join(base, 'aun', 'AIDs'));
+    const client = makeClient(join(base, 'aun'));
+    expect(manager(client).root).toBe(join(base, 'aun', 'AIDs'));
     expect((client as any).setAgentMdPath).toBeUndefined();
     expect((client as any).SetAgentMDPath).toBeUndefined();
-    expect((client as any)._setAgentMdRoot(join(base, 'custom'))).toBe(join(base, 'custom'));
-    expect((client as any)._setAgentMdRoot()).toBe(join(base, 'aun', 'AIDs'));
-    (client as any)._keystore.close?.();
+    expect((client as any)._setAgentMdRoot).toBeUndefined();
+    (client as any)._tokenStore?.close?.();
   });
 
-  it('publishAgentMd 无本地 AID 时拒绝', async () => {
+  it('uploadAgentMd 无本地 AID 时拒绝', async () => {
     const client = makeClient();
-    await expect(client.publishAgentMd()).rejects.toBeInstanceOf(ValidationError);
-    (client as any)._keystore.close?.();
+    await expect(client.uploadAgentMd()).rejects.toBeInstanceOf(ValidationError);
+    (client as any)._tokenStore?.close?.();
   });
 
-  it('publishAgentMd 读取默认 agent.md → 签名上传 → 原子写回并更新 agentmd.json', async () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    const unsigned = '---\naid: alice.agentid.pub\n---\n# Alice\n';
-    writeLocalAgentMd(client, 'alice.agentid.pub', unsigned);
+  it('uploadAgentMd 签名上传后写回 agent.md 与 agentmd.json', async () => {
+    await withServer(async (req, res) => {
+      expect(req.method).toBe('PUT');
+      expect(req.url).toBe('/agent.md');
+      expect(req.headers.authorization).toBe('Bearer cached-token');
+      const body = await readBody(req);
+      expect(body).toContain('AUN-SIGNATURE');
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ aid: '127.0.0.1', etag: etag(body), last_modified: 'Sun, 24 May 2026 00:00:00 GMT' }));
+    }, async (port) => {
+      const client = makeClient();
+      const mgr = manager(client);
+      (mgr as any)._discoveryPort = port;
+      (client as any)._gatewayUrl = 'ws://gateway.agentid.pub/aun';
+      (client as any)._aid = '127.0.0.1';
+      (client as any)._identity = {
+        aid: '127.0.0.1',
+        access_token: 'cached-token',
+        access_token_expires_at: Date.now() / 1000 + 3600,
+      };
+      (client as any)._currentAid = {
+        aid: '127.0.0.1',
+        isPrivateKeyValid: () => true,
+        signAgentMd: vi.fn((content: string) => ({ ok: true, data: { signed: `${content}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n` } })),
+      };
 
-    let signedInput = '';
-    let uploaded = '';
-    (client as any)._currentAid = {
-      signAgentMd: vi.fn((c: string) => {
-        signedInput = c;
-        return {
-          ok: true,
-          data: {
-            signed: `${c}\n<!-- AUN-SIGNATURE\ncert_fingerprint: sha256:0\ntimestamp: 1\nsignature: x\n-->\n`,
-          },
-        };
-      }),
-    };
-    vi.spyOn(client as any, '_uploadAgentMd').mockImplementation(async (c: string) => {
-      uploaded = c;
-      return { aid: 'alice.agentid.pub', etag: '"abc"', last_modified: 'Sun, 24 May 2026 00:00:00 GMT' };
+      const result = await client.uploadAgentMd('---\naid: 127.0.0.1\n---\n# Local\n');
+
+      const saved = readFileSync(join(mgr.root, '127.0.0.1', 'agent.md'), 'utf-8');
+      const record = readRecord(mgr.root, '127.0.0.1');
+      expect(result.aid).toBe('127.0.0.1');
+      expect(record.content).toBeUndefined();
+      expect(record.local_etag).toBe(etag(saved));
+      expect(record.remote_etag).toBe(etag(saved));
+      expect(record.last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
+      (client as any)._tokenStore?.close?.();
     });
-
-    const result = await client.publishAgentMd();
-
-    expect(result.aid).toBe('alice.agentid.pub');
-    expect(signedInput).toBe(unsigned);
-    expect(readFileSync(join(agentRoot(client), 'alice.agentid.pub', 'agent.md'), 'utf-8')).toBe(uploaded);
-    const record = readRecords(client)['alice.agentid.pub'];
-    expect(record.content).toBeUndefined();
-    expect(record.local_etag).toBe(etag(uploaded));
-    expect(record.remote_etag).toBe('"abc"');
-    expect((client as any)._localAgentMdEtag).toBe(etag(uploaded));
-    (client as any)._keystore.close?.();
   });
 
-  it('fetchAgentMd 保存到默认 {aid}/agent.md，并只把元数据放入 agentmd.json', async () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    (client as any)._agentMdCache = new Map([
-      ['bob.agentid.pub', { text: body, etag: '"bob-cloud"', lastModified: 'Sun, 24 May 2026 00:00:00 GMT' }],
-    ]);
-    vi.spyOn(client as any, '_downloadAgentMd').mockResolvedValue(body);
-    vi.spyOn(client as any, '_verifyAgentMd').mockResolvedValue({ status: 'unsigned', verified: false, payload: body } as any);
+  it('downloadAgentMd 由 AgentMdManager 下载、验签并持久化', async () => {
+    const content = '---\naid: 127.0.0.1\n---\n# Peer\n';
+    await withServer((_req, res) => {
+      res.writeHead(200, {
+        ETag: etag(content),
+        'Last-Modified': 'Sun, 24 May 2026 00:00:00 GMT',
+        'Content-Type': 'text/markdown',
+      });
+      res.end(content);
+    }, async (port) => {
+      const mgr = new AgentMdManager({
+        aunPath: mkdtempSync(join(tmpdir(), 'aun-agent-md-manager-')),
+        verifySsl: false,
+        discoveryPort: port,
+        gatewayResolver: () => 'ws://gateway.agentid.pub/aun',
+        peerResolver: (aid) => makePeer(aid),
+      });
 
-    const info = await (client as any)._startAgentMdFetchTask('bob.agentid.pub');
+      const info = await mgr.download('127.0.0.1');
 
-    expect(info.aid).toBe('bob.agentid.pub');
-    expect(info.in_sync).toBeNull();
-    expect(info.saved_to).toBe(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'));
-    expect(readFileSync(info.saved_to!, 'utf-8')).toBe(body);
-    const record = readRecords(client)['bob.agentid.pub'];
-    expect(record.content).toBeUndefined();
-    expect(record.local_etag).toBe(etag(body));
-    expect(record.remote_etag).toBe('"bob-cloud"');
-    (client as any)._keystore.close?.();
+      expect(info.content).toBe(content);
+      expect(info.verification.status).toBe('unsigned');
+      expect(readFileSync(join(mgr.root, '127.0.0.1', 'agent.md'), 'utf-8')).toBe(content);
+      expect(readRecord(mgr.root, '127.0.0.1').remote_etag).toBe(etag(content));
+    });
   });
 
-  it('手动 fetchAgentMd 会加入自动补拉同一 AID 的 singleflight', async () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '---\naid: bob.agentid.pub\n---\n# Bob\n';
-    let markStarted!: () => void;
-    let releaseDownload!: (value: string) => void;
-    const started = new Promise<void>((resolve) => {
-      markStarted = resolve;
+  it('同一 AID 的 downloadAgentMd 使用 singleflight', async () => {
+    let hits = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    await withServer(async (_req, res) => {
+      hits += 1;
+      await gate;
+      res.writeHead(200, { ETag: '"same"' });
+      res.end('# Peer\n');
+    }, async (port) => {
+      const mgr = new AgentMdManager({
+        aunPath: mkdtempSync(join(tmpdir(), 'aun-agent-md-singleflight-')),
+        verifySsl: false,
+        discoveryPort: port,
+        gatewayResolver: () => 'ws://gateway.agentid.pub/aun',
+        peerResolver: (aid) => makePeer(aid),
+      });
+      const first = mgr.download('127.0.0.1');
+      const second = mgr.download('127.0.0.1');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(hits).toBe(1);
+      release();
+      await Promise.all([first, second]);
+      expect(hits).toBe(1);
     });
-    const downloadResult = new Promise<string>((resolve) => {
-      releaseDownload = resolve;
-    });
-    const downloadSpy = vi.spyOn(client as any, '_downloadAgentMd').mockImplementation(async () => {
-      markStarted();
-      return await downloadResult;
-    });
-    const verifySpy = vi.spyOn(client as any, '_verifyAgentMd').mockResolvedValue({ status: 'verified', verified: true, payload: body } as any);
-
-    (client as any)._observeRpcMeta({
-      agent_md_etags: {
-        sender: { aid: 'bob.agentid.pub', etag: '"bob-cloud"' },
-      },
-    });
-    await started;
-
-    const manual = (client as any)._startAgentMdFetchTask('bob.agentid.pub');
-    await Promise.resolve();
-    expect(downloadSpy).toHaveBeenCalledTimes(1);
-
-    releaseDownload(body);
-    const info = await manual;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(info.content).toBe(body);
-    expect(downloadSpy).toHaveBeenCalledTimes(1);
-    expect(verifySpy).toHaveBeenCalledTimes(1);
-    expect((client as any)._agentMdFetchInflight.size).toBe(0);
-    expect(readFileSync(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'), 'utf-8')).toBe(body);
-    (client as any)._keystore.close?.();
-  });
-
-  it('fetchAgentMd 旧公开入口已移除', async () => {
-    const client = makeClient();
-    expect((client as any).fetchAgentMd).toBeUndefined();
-    (client as any)._keystore.close?.();
   });
 
   it('checkAgentMd 使用本地文件 etag 与 HEAD etag 比较', async () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
     const body = '# Bob\n';
-    (client as any)._saveAgentMdRecord('bob.agentid.pub', { content: body, local_etag: etag(body), remote_etag: '"old"' });
-    vi.spyOn(client as any, '_headAgentMd').mockResolvedValue({
-      aid: 'bob.agentid.pub',
-      found: true,
-      etag: etag(body),
-      last_modified: 'Sun, 24 May 2026 00:00:00 GMT',
-      status: 200,
-    });
-
-    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub');
-
-    expect(result.local_found).toBe(true);
-    expect(result.remote_found).toBe(true);
-    expect(result.in_sync).toBe(true);
-    expect(readRecords(client)['bob.agentid.pub'].remote_etag).toBe(etag(body));
-    (client as any)._keystore.close?.();
-  });
-
-  it('观察 RPC meta 时保存结构化 etag/last_modified，并为缺正文的 aid 自动拉取', async () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    const fetched: string[] = [];
-    vi.spyOn(client as any, '_startAgentMdFetchTask').mockImplementation(async (aid: string) => {
-      const target = String(aid ?? '');
-      fetched.push(target);
-      const content = `# ${target}\n`;
-      (client as any)._saveAgentMdRecord(target, {
-        content,
-        local_etag: etag(content),
-        remote_status: 'found',
+    await withServer((_req, res) => {
+      res.writeHead(200, {
+        ETag: etag(body),
+        'Last-Modified': 'Sun, 24 May 2026 00:00:00 GMT',
+        'Content-Length': String(body.length),
       });
-      return { aid: target, content, signature: { status: 'unsigned' }, in_sync: false, saved_to: null, save_error: null } as any;
-    });
+      res.end();
+    }, async (port) => {
+      const mgr = new AgentMdManager({
+        aunPath: mkdtempSync(join(tmpdir(), 'aun-agent-md-check-')),
+        verifySsl: false,
+        discoveryPort: port,
+        gatewayResolver: () => 'ws://gateway.agentid.pub/aun',
+      });
+      mgr.saveRecord('127.0.0.1', { content: body, local_etag: etag(body), remote_etag: '"old"' });
 
-    (client as any)._observeRpcMeta({
-      agent_md_etag: '"alice-cloud"',
-      agent_md_etags: {
-        requester: { aid: 'alice.agentid.pub', etag: '"alice-cloud-2"', last_modified: 'Sun, 24 May 2026 00:00:00 GMT' },
-        receiver: { aid: 'bob.agentid.pub', etag: '"bob-cloud"', last_modified: 'Sun, 24 May 2026 00:00:01 GMT' },
-        sender: { aid: 'dave.agentid.pub', etag: '"dave-cloud"' },
-      },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+      const result = await mgr.check('127.0.0.1');
 
-    const records = readRecords(client);
-    expect(records['alice.agentid.pub'].remote_etag).toBe('"alice-cloud-2"');
-    expect(records['alice.agentid.pub'].last_modified).toBe('Sun, 24 May 2026 00:00:00 GMT');
-    expect(records['bob.agentid.pub'].remote_etag).toBe('"bob-cloud"');
-    expect(records['bob.agentid.pub'].last_modified).toBe('Sun, 24 May 2026 00:00:01 GMT');
-    expect(records['dave.agentid.pub'].remote_etag).toBe('"dave-cloud"');
-    expect(Object.values(records).every((record: any) => record.content === undefined)).toBe(true);
-    expect(fetched).toEqual(['alice.agentid.pub', 'bob.agentid.pub', 'dave.agentid.pub']);
-    expect(readFileSync(join(agentRoot(client), 'bob.agentid.pub', 'agent.md'), 'utf-8')).toBe('# bob.agentid.pub\n');
-    (client as any)._keystore.close?.();
+      expect(result.local_found).toBe(true);
+      expect(result.remote_found).toBe(true);
+      expect(result.in_sync).toBe(true);
+      expect(result.needs_update).toBe(false);
+      expect(readRecord(mgr.root, '127.0.0.1').remote_etag).toBe(etag(body));
+    });
   });
 
-  it('checkAgentMd 在本地与云端 etag 匹配且 last_modified 未过期时不 HEAD', async () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    const body = '# Bob\n';
-    const freshLastModified = new Date().toUTCString();
-    (client as any)._saveAgentMdRecord('bob.agentid.pub', {
-      content: body,
-      local_etag: etag(body),
-      remote_etag: etag(body),
-      last_modified: freshLastModified,
-      verify_status: 'valid',
-      verify_error: '',
-    });
-    vi.spyOn(client as any, '_headAgentMd').mockImplementation(async () => {
-      throw new Error('fresh cached checkAgentMd should not HEAD');
-    });
+  it('observeRpcMeta 保存结构化元数据并为缺正文 AID 自动补拉', async () => {
+    const body = '# Observed\n';
+    await withServer((_req, res) => {
+      res.writeHead(200, { ETag: etag(body), 'Last-Modified': 'Sun, 24 May 2026 00:00:01 GMT' });
+      res.end(body);
+    }, async (port) => {
+      const mgr = new AgentMdManager({
+        aunPath: mkdtempSync(join(tmpdir(), 'aun-agent-md-observe-')),
+        verifySsl: false,
+        discoveryPort: port,
+        ownerAidGetter: () => 'localhost',
+        gatewayResolver: () => 'ws://gateway.agentid.pub/aun',
+        peerResolver: (aid) => makePeer(aid),
+      });
 
-    const result = await (client as any)._checkAgentMdCache('bob.agentid.pub', 7);
-
-    expect(result.local_found).toBe(true);
-    expect(result.remote_found).toBe(true);
-    expect(result.in_sync).toBe(true);
-    expect(result.cached).toBe(true);
-    expect(result.verify_status).toBe('valid');
-    (client as any)._keystore.close?.();
+      mgr.observeRpcMeta({
+        agent_md_etags: {
+          sender: { aid: '127.0.0.1', etag: etag(body), last_modified: 'Sun, 24 May 2026 00:00:01 GMT' },
+        },
+      });
+      await vi.waitFor(() => {
+        expect(readFileSync(join(mgr.root, '127.0.0.1', 'agent.md'), 'utf-8')).toBe(body);
+      });
+      expect(readRecord(mgr.root, '127.0.0.1').remote_etag).toBe(etag(body));
+    });
   });
 
-  it('checkAgentMd 默认使用 1 天窗口，远端 missing 缓存新鲜时不 HEAD', async () => {
+  it('新边界下旧公开入口和旧私有入口已移除', () => {
     const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
-    (client as any)._saveAgentMdRecord('missing.agentid.pub', {
-      remote_status: 'missing',
-      checked_at: Date.now(),
-    });
-    vi.spyOn(client as any, '_headAgentMd').mockImplementation(async () => {
-      throw new Error('fresh missing cache should not HEAD');
-    });
-
-    const result = await (client as any)._checkAgentMdCache('missing.agentid.pub');
-
-    expect(result.local_found).toBe(false);
-    expect(result.remote_found).toBe(false);
-    expect(result.cached).toBe(true);
-    expect(result.status).toBe(404);
-    (client as any)._keystore.close?.();
+    for (const name of [
+      'publishAgentMd',
+      'fetchAgentMd',
+      'checkAgentMd',
+      '_uploadAgentMd',
+      '_downloadAgentMd',
+      '_headAgentMd',
+      '_verifyAgentMd',
+      '_saveAgentMdRecord',
+      '_loadAgentMdRecord',
+      '_checkAgentMdCache',
+    ]) {
+      expect((client as any)[name]).toBeUndefined();
+    }
+    expect(typeof client.uploadAgentMd).toBe('function');
+    (client as any)._tokenStore?.close?.();
   });
 
-  it('agentmd.json 损坏时只影响对应 AID', () => {
-    const client = makeClient();
-    (client as any)._aid = 'alice.agentid.pub';
+  it('agentmd.json 损坏时仍可按正文恢复基本记录', () => {
+    const mgr = new AgentMdManager({ aunPath: mkdtempSync(join(tmpdir(), 'aun-agent-md-damaged-')) });
     const body = '# Alice\n';
-    writeLocalAgentMd(client, 'alice.agentid.pub', body);
-    (client as any)._agentMdCache.set('alice.agentid.pub', { aid: 'alice.agentid.pub', remote_etag: '"cloud"' });
-    (client as any)._agentMdCache.set('bob.agentid.pub', { aid: 'bob.agentid.pub', remote_etag: '"stale"' });
-    writeFileSync(join(agentRoot(client), 'alice.agentid.pub', 'agentmd.json'), '{bad json', 'utf-8');
+    mkdirSync(join(mgr.root, 'alice.agentid.pub'), { recursive: true });
+    writeFileSync(join(mgr.root, 'alice.agentid.pub', 'agent.md'), body, 'utf-8');
+    writeFileSync(join(mgr.root, 'alice.agentid.pub', 'agentmd.json'), '{bad json', 'utf-8');
 
-    const record = (client as any)._loadAgentMdRecord('alice.agentid.pub');
+    const record = mgr.loadRecord('alice.agentid.pub');
 
-    expect(record.content).toBe(body);
-    expect(record.local_etag).toBe(etag(body));
-    expect(record.remote_etag).toBeUndefined();
-    expect((client as any)._agentMdCache.has('bob.agentid.pub')).toBe(true);
-    (client as any)._keystore.close?.();
+    expect(record?.content).toBe(body);
+    expect(record?.local_etag).toBe(etag(body));
+    expect(record?.remote_etag).toBeUndefined();
   });
 });
-
-

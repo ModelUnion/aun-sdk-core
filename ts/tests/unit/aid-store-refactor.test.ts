@@ -3,14 +3,14 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { AID, AIDStore, AUNClient, ConnectionState, FileKeyStore, resultErr, resultOk } from '../../src/index.js';
+import { AID, AIDStore, AUNClient, ConnectionState, LocalIdentityStore, resultErr, resultOk } from '../../src/index.js';
 import { buildIdentity, generateECKeypair, makeSelfSignedCert } from './helpers.js';
 
 function createStoredAid(aid = 'alice.agentid.pub'): { aid: AID; aunPath: string } {
   const aunPath = mkdtempSync(join(tmpdir(), 'aun-ts-refactor-'));
   const { privateKey } = generateECKeypair();
   const identity = buildIdentity(aid, privateKey);
-  const keyStore = new FileKeyStore(aunPath, { encryptionSeed: 'test-seed' });
+  const keyStore = new LocalIdentityStore(aunPath, { encryptionSeed: 'test-seed' });
   keyStore.saveIdentity(aid, identity);
 
   const store = new AIDStore({ aunPath, encryptionSeed: 'test-seed', verifySsl: true });
@@ -140,7 +140,7 @@ describe('AIDStore 私钥自检', () => {
     const privBPem = keyB.export({ type: 'pkcs8', format: 'pem' }) as string;
 
     // 故意不写 public_key_der_b64 字段：这正是死代码无法检出错配的场景
-    const keyStore = new FileKeyStore(aunPath, { encryptionSeed: 'test-seed' });
+    const keyStore = new LocalIdentityStore(aunPath, { encryptionSeed: 'test-seed' });
     keyStore.saveIdentity(aid, {
       private_key_pem: privBPem,
       cert: certPem,

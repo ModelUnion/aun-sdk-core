@@ -5,6 +5,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { AUNClient } from '../../src/client.js';
+import { AuthFlow } from '../../src/auth.js';
 import {
   ConnectionError,
   StateError,
@@ -13,8 +14,8 @@ import {
   PermissionError,
 } from '../../src/errors.js';
 
-async function registerAidForValidation(client: AUNClient, aid: string): Promise<unknown> {
-  return await (client as any)._auth.registerAid('wss://localhost:9999/aun', aid);
+function registerAidForValidation(_client: AUNClient, aid: string): Promise<unknown> {
+  return Promise.resolve().then(() => AuthFlow._validateAidName(aid));
 }
 
 // ── P0-01: 网关健康检查 ──────────────────────────────────────

@@ -2,7 +2,7 @@
  * Token + gateway_url 复用集成测试 — 与 Python integration_test_token_gateway_reuse.py 对齐
  *
  * 浏览器 SDK 模拟 CLI 跨进程场景：
- *   - JS IndexedDBKeyStore 是全局共享 DB，新建 AUNClient 即等价"重启进程"
+ *   - JS IndexedDB split stores 是全局共享 DB，新建 AUNClient 即等价"重启进程"
  *   - 第一次 authenticate 走完整 discovery + login，token 与 gateway_url 持久化
  *   - 第二次新建 client，authenticate 应直接复用 cached，无网络请求
  *   - cached 过期则回退到完整 _login

@@ -1,5 +1,5 @@
 /**
- * FileKeyStore _prepareRoot fallback 日志测试 — ISSUE-TS-003
+ * LocalIdentityStore _prepareRoot fallback 日志测试 — ISSUE-TS-003
  * 验证 preferred 路径失败回退到 fallback 时输出警告日志
  */
 import { describe, it, expect } from 'vitest';
@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 
 function getPrepareRootSource(): string {
   const src = readFileSync(
-    resolve(__dirname, '../../src/keystore/file.ts'),
+    resolve(__dirname, '../../src/keystore/local-identity-store.ts'),
     'utf-8',
   );
   const start = src.indexOf('private _prepareRoot');

@@ -2,14 +2,14 @@ import { AID } from './aid.js';
 import { CryptoProvider, pemToArrayBuffer, importPrivateKeyEcdsa, importCertPublicKeyEcdsa, ecdsaSignDer, ecdsaVerifyDer } from './crypto.js';
 import * as codes from './error-codes.js';
 import { publicKeyDerB64 } from './cert-utils.js';
-import { AuthFlow } from './auth.js';
 import { RegisterFlow } from './register-flow.js';
 import { GatewayDiscovery } from './discovery.js';
-import { IdentityConflictError, ValidationError } from './errors.js';
-import { IndexedDBKeyStore } from './keystore/indexeddb.js';
+import { IdentityConflictError, NotFoundError, ValidationError } from './errors.js';
+import { IndexedDBIdentityStore } from './keystore/indexeddb-identity-store.js';
 import { getDeviceId, normalizeInstanceId, normalizeSlotId } from './config.js';
-import type { IdentityRecord, JsonObject } from './types.js';
+import type { IdentityRecord } from './types.js';
 import { resultErr, resultOk, type Result } from './result.js';
+import { AgentMdManager, type AgentMdCheckResult, type AgentMdDownloadResult } from './agent-md.js';
 
 export interface AIDInfo {
   aid: string;
@@ -26,28 +26,16 @@ export interface ResolveOpts {
 
 export type ResolveResult = {
   aid: AID;
-  agent_md?: { content: string; verification: { status: string; reason?: string }; cert_pem: string };
+  agent_md?: DownloadAgentMdResult;
   source: { cert_from_cache: boolean; agent_md_fetched: boolean };
 };
-export type FetchAgentMdResult = {
-  aid: string; content: string;
-  verification: { status: string; reason?: string };
-  cert_pem: string; etag: string; last_modified: string;
-};
-export type HeadAgentMdResult = { aid: string; found: boolean; etag: string; last_modified: string; content_length: number };
-export type CheckAgentMdResult = { aid: string; local_found: boolean; remote_found: boolean; local_etag: string; remote_etag: string; needs_update: boolean; ttl_days: number };
+export type DownloadAgentMdResult = AgentMdDownloadResult;
+export type CheckAgentMdResult = AgentMdCheckResult;
 export type DiagnoseResult = { aid: string; status: string; local_valid: boolean; remote_registered: boolean; suggestions: string[]; local: Record<string, unknown>; remote: Record<string, unknown> };
 export type RenewCertResult = { renewed: true; new_cert_not_after: Date; new_fingerprint: string };
 export type RekeyResult = { rekeyed: true; new_cert_not_after: Date; new_fingerprint: string };
 export type ChangeSeedResult = { changed: boolean; count: number };
 export type ListResult = { identities: AIDInfo[] };
-
-interface AgentMdCacheEntry {
-  content?: string;
-  etag?: string;
-  lastModified?: string;
-  updatedAt?: number;
-}
 
 // ── 证书 DER 解析工具 ────────────────────────────────────────────
 
@@ -209,19 +197,6 @@ function issuerFromAid(aid: string): string {
   return dotIdx >= 0 ? target.slice(dotIdx + 1) : target;
 }
 
-function validateRegisterAidName(aid: string): void {
-  if (!aid) throw new ValidationError("AIDStore.register requires 'aid'");
-  const name = aid.includes('.') ? aid.split('.')[0] : aid;
-  if (!/^[a-z0-9_][a-z0-9_-]{3,63}$/.test(name)) {
-    throw new ValidationError(
-      `Invalid AID name '${name}': must be 4-64 characters, only [a-z0-9_-], cannot start with '-'`,
-    );
-  }
-  if (name.startsWith('guest')) {
-    throw new ValidationError("AID name must not start with 'guest'");
-  }
-}
-
 function gatewayHttpUrl(gatewayUrl: string, path: string): string {
   const parsed = new URL(gatewayUrl);
   parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
@@ -233,12 +208,6 @@ function gatewayHttpUrl(gatewayUrl: string, path: string): string {
 
 function pkiCertUrl(gatewayUrl: string, aid: string): string {
   return gatewayHttpUrl(gatewayUrl, `/pki/cert/${encodeURIComponent(aid)}`);
-}
-
-function agentMdUrl(aid: string, gatewayUrl: string): string {
-  const scheme = String(gatewayUrl ?? '').trim().toLowerCase().startsWith('ws://') ? 'http' : 'https';
-  const host = String(aid ?? '').trim();
-  return `${scheme}://${host}/agent.md`;
 }
 
 async function fetchWithTimeout(input: string, init: RequestInit = {}, timeoutMs = 30000): Promise<Response> {
@@ -255,20 +224,28 @@ function resultError<T>(result: Result<T>): { code: string; message: string } | 
   return result.ok ? null : result.error;
 }
 
+function agentMdFailure<T>(exc: unknown): Result<T> {
+  if (exc instanceof ValidationError) {
+    return resultErr(codes.INVALID_AID_FORMAT, exc.message, exc);
+  }
+  if (exc instanceof NotFoundError) {
+    return resultErr(codes.AGENTMD_NOT_FOUND, exc.message, exc);
+  }
+  return resultErr(codes.NETWORK_ERROR, exc instanceof Error ? exc.message : String(exc), exc);
+}
+
 export class AIDStore {
   readonly aunPath: string;
   readonly deviceId: string;
   readonly slotId: string;
 
   private _encryptionSeed: string;
-  private _keystore: IndexedDBKeyStore;
-  private _auth: AuthFlow;
+  private _keystore: IndexedDBIdentityStore;
   private _registerFlow: RegisterFlow;
-  private _crypto: CryptoProvider;
   private _discovery: GatewayDiscovery;
   private _verifySsl: boolean;
   private _gatewayCache: Map<string, string> = new Map();
-  private _agentMdCache: Map<string, AgentMdCacheEntry> = new Map();
+  private _agentMdManager: AgentMdManager;
 
   constructor(opts: {
     aunPath: string;
@@ -288,21 +265,25 @@ export class AIDStore {
       console.warn('[aun_core.config] verify_ssl=false 在浏览器环境中不受支持，SSL 证书验证将保持启用。');
     }
     this._verifySsl = opts.verifySsl === false ? true : (opts.verifySsl ?? true);
-    this._keystore = new IndexedDBKeyStore({ encryptionSeed: this._encryptionSeed || undefined });
-    this._crypto = new CryptoProvider();
+    this._keystore = new IndexedDBIdentityStore({ encryptionSeed: this._encryptionSeed || undefined });
+    const crypto = new CryptoProvider();
     this._discovery = new GatewayDiscovery();
-    this._auth = new AuthFlow({
-      tokenStore: this._keystore,
-      crypto: this._crypto,
-      deviceId: this.deviceId,
-      slotId: this.slotId,
-      rootCaPem: opts.rootCaPem ?? null,
-      verifySsl: this._verifySsl,
-    });
     this._registerFlow = new RegisterFlow({
       keystore: this._keystore,
-      crypto: this._crypto,
+      crypto,
       verifySsl: this._verifySsl,
+    });
+    this._agentMdManager = new AgentMdManager({
+      aunPath: this.aunPath,
+      aidValidator: (target) => this._registerFlow.validateAidName(target),
+      gatewayResolver: (target) => this._resolveGateway(target),
+      peerResolver: async (target) => {
+        const loaded = await this.load(target);
+        if (loaded.ok) return loaded.data.aid;
+        const resolved = await this.resolve(target, { skipAgentMd: true });
+        if (resolved.ok) return resolved.data.aid;
+        throw new Error(resolved.error.message);
+      },
     });
   }
 
@@ -439,7 +420,8 @@ export class AIDStore {
   async register(aid: string): Promise<Result<{ registered: true }>> {
     const target = String(aid ?? '').trim();
     try {
-      validateRegisterAidName(target);
+      if (!target) throw new ValidationError("AIDStore.register requires 'aid'");
+      this._registerFlow.validateAidName(target);
       const gatewayUrl = await this._resolveGateway(target);
       const result = await this._registerFlow.registerAid(gatewayUrl, target);
       if (result.cert) {
@@ -471,6 +453,7 @@ export class AIDStore {
   async exists(aid: string): Promise<Result<{ exists: boolean }>> {
     const target = String(aid ?? '').trim();
     try {
+      this._registerFlow.validateAidName(target);
       const gatewayUrl = await this._resolveGateway(target);
       const response = await fetchWithTimeout(pkiCertUrl(gatewayUrl, target), { method: 'HEAD' }, 10000);
       if (response.status === 200) return resultOk({ exists: true });
@@ -486,6 +469,7 @@ export class AIDStore {
     const forceRefresh = !!opts?.forceRefresh;
     const skipAgentMd = !!opts?.skipAgentMd;
     try {
+      this._registerFlow.validateAidName(target);
       let peer: AID;
       let certFromCache = false;
       const cached = await this.load(target);
@@ -494,7 +478,7 @@ export class AIDStore {
         certFromCache = true;
       } else {
         const gatewayUrl = await this._resolveGateway(target);
-        const certPem = await this._auth.fetchPeerCert(gatewayUrl, target);
+        const certPem = await this._registerFlow.fetchPeerCert(gatewayUrl, target);
         if (!certPem) return resultErr(codes.CERT_NOT_FOUND, `certificate not found for aid: ${target}`);
         await this._keystore.saveCert(target, certPem);
         const reloaded = await this.load(target);
@@ -505,7 +489,7 @@ export class AIDStore {
       const source = { cert_from_cache: certFromCache, agent_md_fetched: false };
       if (skipAgentMd) return resultOk({ aid: peer, source });
 
-      const agentMd = await this.fetchAgentMd(target, opts?.timeout);
+      const agentMd = await this.downloadAgentMd(target, opts?.timeout);
       if (!agentMd.ok) return agentMd as Result<never>;
       source.agent_md_fetched = true;
       return resultOk({ aid: peer, agent_md: agentMd.data, source });
@@ -514,123 +498,20 @@ export class AIDStore {
     }
   }
 
-  async fetchAgentMd(aid: string, timeoutMs = 30000): Promise<Result<FetchAgentMdResult>> {
-    const target = String(aid ?? '').trim();
+  async downloadAgentMd(aid: string, timeoutMs = 30000): Promise<Result<DownloadAgentMdResult>> {
     try {
-      const gatewayUrl = await this._resolveGateway(target);
-      const cached = this._agentMdCache.get(target) ?? {};
-      const headers: Record<string, string> = { Accept: 'text/markdown' };
-      if (cached.etag) headers['If-None-Match'] = cached.etag;
-      if (cached.lastModified) headers['If-Modified-Since'] = cached.lastModified;
-
-      const response = await fetchWithTimeout(agentMdUrl(target, gatewayUrl), {
-        method: 'GET',
-        headers,
-      }, timeoutMs);
-
-      let content = '';
-      if (response.status === 304 && cached.content) {
-        content = cached.content;
-      } else if (response.status === 404) {
-        return resultErr(codes.AGENTMD_NOT_FOUND, `agent.md not found for aid: ${target}`);
-      } else if (!response.ok) {
-        return resultErr(codes.NETWORK_ERROR, `download agent.md failed: HTTP ${response.status}`);
-      } else {
-        content = await response.text();
-      }
-
-      let peer: AID;
-      const loaded = await this.load(target);
-      if (loaded.ok) {
-        peer = loaded.data.aid;
-      } else {
-        const resolved = await this.resolve(target, { skipAgentMd: true });
-        if (!resolved.ok) return resolved as Result<never>;
-        peer = resolved.data.aid as AID;
-      }
-
-      const verified = await peer.verifyAgentMd(content);
-      if (!verified.ok) return verified as Result<never>;
-      const signature = verified.data;
-      const verification: { status: string; reason?: string } = { status: signature.status };
-      if (signature.reason) verification.reason = signature.reason;
-
-      const etag = String(response.headers?.get('ETag') ?? response.headers?.get('etag') ?? cached.etag ?? '').trim();
-      const lastModified = String(response.headers?.get('Last-Modified') ?? response.headers?.get('last-modified') ?? cached.lastModified ?? '').trim();
-      this._agentMdCache.set(target, { content, etag, lastModified, updatedAt: Date.now() });
-      return resultOk({
-        aid: target,
-        content,
-        verification,
-        cert_pem: peer.certPem,
-        etag,
-        last_modified: lastModified,
-      });
+      return resultOk(await this._agentMdManager.download(aid, timeoutMs));
     } catch (exc) {
-      return resultErr(codes.NETWORK_ERROR, String(exc), exc);
-    }
-  }
-
-  async headAgentMd(aid: string): Promise<Result<HeadAgentMdResult>> {
-    const target = String(aid ?? '').trim();
-    try {
-      const gatewayUrl = await this._resolveGateway(target);
-      const response = await fetchWithTimeout(agentMdUrl(target, gatewayUrl), {
-        method: 'HEAD',
-        headers: { Accept: 'text/markdown' },
-      }, 15000);
-      if (response.status === 404) {
-        return resultErr(codes.AGENTMD_NOT_FOUND, `agent.md not found for aid: ${target}`);
-      }
-      if (!response.ok) {
-        return resultErr(codes.NETWORK_ERROR, `head agent.md failed: HTTP ${response.status}`);
-      }
-      const etag = String(response.headers?.get('ETag') ?? response.headers?.get('etag') ?? '').trim();
-      const lastModified = String(response.headers?.get('Last-Modified') ?? response.headers?.get('last-modified') ?? '').trim();
-      const contentLength = Number.parseInt(String(response.headers?.get('Content-Length') ?? response.headers?.get('content-length') ?? '0'), 10) || 0;
-      const cached = this._agentMdCache.get(target) ?? {};
-      this._agentMdCache.set(target, { ...cached, etag, lastModified, updatedAt: Date.now() });
-      return resultOk({
-        aid: target,
-        found: true,
-        etag,
-        last_modified: lastModified,
-        content_length: contentLength,
-      });
-    } catch (exc) {
-      return resultErr(codes.NETWORK_ERROR, String(exc), exc);
+      return agentMdFailure<DownloadAgentMdResult>(exc);
     }
   }
 
   async checkAgentMd(aid: string, ttlDays = 1): Promise<Result<CheckAgentMdResult>> {
-    const target = String(aid ?? '').trim();
-    const cached = this._agentMdCache.get(target) ?? {};
-    const head = await this.headAgentMd(target);
-    let remote: Record<string, unknown>;
-    if (!head.ok) {
-      if (head.error.code === codes.AGENTMD_NOT_FOUND) {
-        remote = { aid: target, found: false, etag: '', last_modified: '', content_length: 0, status: 404 };
-      } else {
-        return head as Result<never>;
-      }
-    } else {
-      remote = head.data;
+    try {
+      return resultOk(await this._agentMdManager.check(aid, ttlDays));
+    } catch (exc) {
+      return agentMdFailure<CheckAgentMdResult>(exc);
     }
-
-    const localEtag = String(cached.etag ?? '').trim();
-    const localFound = !!cached.content;
-    const remoteFound = !!remote.found;
-    const remoteEtag = String(remote.etag ?? '').trim();
-    const needsUpdate = remoteFound && (!localFound || (!!remoteEtag && remoteEtag !== localEtag));
-    return resultOk({
-      aid: target,
-      local_found: localFound,
-      remote_found: remoteFound,
-      local_etag: localEtag,
-      remote_etag: remoteEtag,
-      needs_update: needsUpdate,
-      ttl_days: ttlDays,
-    });
   }
 
   async diagnose(aid: string): Promise<Result<DiagnoseResult>> {
@@ -675,26 +556,22 @@ export class AIDStore {
       return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
     }
     try {
+      this._registerFlow.validateAidName(target);
       const aidObj = loaded.data.aid;
       if (!aidObj.certPem || !aidObj.privateKeyPem) {
         return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
       }
       const gatewayUrl = await this._resolveGateway(target);
-      const clientNonce = this._crypto.newClientNonce();
-      const phase1 = await (this._auth as unknown as { _shortRpc: (url: string, method: string, params: JsonObject) => Promise<JsonObject> })
-        ._shortRpc(gatewayUrl, 'auth.aid_login1', {
-          aid: target,
-          cert: aidObj.certPem,
-          client_nonce: clientNonce,
-        });
-      const [signature, clientTime] = await this._crypto.signLoginNonce(aidObj.privateKeyPem, String(phase1.nonce ?? ''));
-      const response = await (this._auth as unknown as { _shortRpc: (url: string, method: string, params: JsonObject) => Promise<JsonObject> })
-        ._shortRpc(gatewayUrl, 'auth.renew_cert', {
+      const phase1 = await this._beginAidOperation(gatewayUrl, aidObj);
+      const signResult = await aidObj.sign(String(phase1.nonce));
+      if (!signResult.ok || !signResult.data) {
+        return resultErr(codes.CERT_RENEWAL_FAILED, resultError(signResult)?.message ?? 'sign failed');
+      }
+      const response = await this._registerFlow.shortRpc(gatewayUrl, 'auth.renew_cert', {
           aid: target,
           request_id: String(phase1.request_id ?? ''),
           nonce: String(phase1.nonce ?? ''),
-          client_time: clientTime,
-          signature,
+          signature: signResult.data.signature,
         });
       const certPem = String(response.cert ?? response.cert_pem ?? '').trim();
       if (!certPem) return resultErr(codes.CERT_RENEWAL_FAILED, 'server response missing certificate');
@@ -718,24 +595,18 @@ export class AIDStore {
       return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
     }
     try {
+      this._registerFlow.validateAidName(target);
       const oldAid = loaded.data.aid;
       if (!oldAid.certPem || !oldAid.privateKeyPem) {
         return resultErr(codes.PRIVATE_KEY_REQUIRED, `private key required for aid: ${target}`);
       }
       const gatewayUrl = await this._resolveGateway(target);
-      const newIdentity = await this._crypto.generateIdentity();
-      const clientNonce = this._crypto.newClientNonce();
-      const phase1 = await (this._auth as unknown as { _shortRpc: (url: string, method: string, params: JsonObject) => Promise<JsonObject> })
-        ._shortRpc(gatewayUrl, 'auth.aid_login1', {
-          aid: target,
-          cert: oldAid.certPem,
-          client_nonce: clientNonce,
-        });
+      const newIdentity = await this._registerFlow.generateIdentity();
+      const phase1 = await this._beginAidOperation(gatewayUrl, oldAid);
       const signPayload = `${String(phase1.nonce ?? '')}${newIdentity.public_key_der_b64}`;
       const signResult = await loaded.data.aid.sign(signPayload);
       if (!signResult.ok) return resultErr(codes.REKEY_FAILED, signResult.error.message);
-      const response = await (this._auth as unknown as { _shortRpc: (url: string, method: string, params: JsonObject) => Promise<JsonObject> })
-        ._shortRpc(gatewayUrl, 'auth.rekey', {
+      const response = await this._registerFlow.shortRpc(gatewayUrl, 'auth.rekey', {
           aid: target,
           request_id: String(phase1.request_id ?? ''),
           nonce: String(phase1.nonce ?? ''),
@@ -762,6 +633,21 @@ export class AIDStore {
     } catch (exc) {
       return resultErr(codes.REKEY_FAILED, String(exc), exc);
     }
+  }
+
+  private async _beginAidOperation(gatewayUrl: string, aidObj: AID): Promise<{ request_id: string; nonce: string }> {
+    const clientNonce = this._registerFlow.newClientNonce();
+    const phase1 = await this._registerFlow.shortRpc(gatewayUrl, 'auth.aid_login1', {
+      aid: aidObj.aid,
+      cert: aidObj.certPem,
+      client_nonce: clientNonce,
+    });
+    await this._registerFlow.verifyPhase1Response(gatewayUrl, phase1, clientNonce);
+    const requestId = String(phase1.request_id ?? '').trim();
+    const nonce = String(phase1.nonce ?? '').trim();
+    if (!requestId) throw new ValidationError('aid_login1 response missing request_id');
+    if (!nonce) throw new ValidationError('aid_login1 response missing nonce');
+    return { request_id: requestId, nonce };
   }
 
   private async _resolveGateway(aid: string): Promise<string> {

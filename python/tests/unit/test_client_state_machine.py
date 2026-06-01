@@ -130,6 +130,8 @@ def test_client_peer_cache_methods_use_public_aid_objects(tmp_path: Path, monkey
     peer_name = "peer.agentid.pub"
     store._keystore.save_cert(peer_name, _identity(peer_name)["cert"])
     peer = store.load(peer_name).data["aid"]
+    bob_name = "bob.agentid.pub"
+    store._keystore.save_cert(bob_name, _identity(bob_name)["cert"])
     client = AUNClient(aid)
 
     assert client.get_peer(peer_name) is None
@@ -137,25 +139,11 @@ def test_client_peer_cache_methods_use_public_aid_objects(tmp_path: Path, monkey
     assert client.get_peer(peer_name) is peer
     assert client.peers() == [peer]
 
-    class FakeStore:
-        async def resolve(self, target, opts=None):
-            assert target == "bob.agentid.pub"
-            from aun_core import result_ok
-
-            return result_ok({
-                "aid": peer,
-                "source": {"cert_from_cache": True, "agent_md_fetched": False},
-            })
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(client, "_make_aid_store", lambda: FakeStore())
     assert asyncio.run(client.lookup_peer(peer_name)) is peer
     resolver_client = AUNClient(aid)
-    monkeypatch.setattr(resolver_client, "_make_aid_store", lambda: FakeStore())
-    assert asyncio.run(resolver_client.lookup_peer("bob.agentid.pub")) is peer
-    assert resolver_client.get_peer(peer.aid) is peer
+    resolved_bob = asyncio.run(resolver_client.lookup_peer(bob_name))
+    assert resolved_bob.aid == bob_name
+    assert resolver_client.get_peer(bob_name) is resolved_bob
 
     store.close()
 

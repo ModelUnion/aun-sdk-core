@@ -14,6 +14,9 @@ def _check_private_key(resolved: dict, aid: str) -> tuple[bool, str]:
     try:
         loaded = store.load(aid)
         if not loaded.ok or loaded.data is None:
+            key_pair = store._keystore.load_key_pair(aid)
+            if key_pair and key_pair.get("private_key_pem"):
+                return True, str(key_pair.get("curve") or "P-256")
             return False, loaded.error.message if loaded.error else "not found"
         identity = loaded.data["aid"]
         return (True, "P-256") if identity.is_private_key_valid() else (False, "not found")

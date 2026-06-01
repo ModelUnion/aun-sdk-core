@@ -214,6 +214,7 @@ def test_client_does_not_expose_test_or_diagnostic_helpers():
         "has_v2_session",
         "v2_session_info",
         "get_remote_agent_md_etag",
+        "publish_agent_md",
         "create_named_group",
         "bind_group_aid",
         "_set_agent_md_path",
@@ -258,6 +259,7 @@ def test_migrated_integration_tests_do_not_call_removed_client_methods():
     removed_methods = {
         "check_gateway_health",
         "list_identities",
+        "publish_agent_md",
         "fetch_agent_md",
         "check_agent_md",
         "ping",
@@ -358,6 +360,7 @@ def test_client_does_not_expose_removed_convenience_methods():
         "list_identities",
         "set_agent_md_path",
         "SetAgentMDPath",
+        "publish_agent_md",
         "fetch_agent_md",
         "check_agent_md",
         "check_gateway_health",
@@ -386,6 +389,7 @@ def test_aid_store_does_not_expose_internal_trust_roots_or_test_helpers(tmp_path
         "update_issuer_root_cert",
         "get_auth_cache_info",
         "expire_cached_access_token",
+        "head_agent_md",
     ):
         assert not hasattr(store, name)
 
